@@ -141,13 +141,18 @@ class Chunk:
         """
         doc = {
             pk_field: self.rds_id if self.rds_id is not None else hash(self.chunk_id) & 0x7FFFFFFFFFFFFFFF,
+            "doc_id": self.doc_id,
+            "chunk_id": self.chunk_id,
             "version_no": self.version_no,
             "chunk_text": self.chunk_text,
             "chunk_type": self.chunk_type,
             "title": self.title or "",
             "owner_dept": self.owner_dept or "",
+            "permission_level": self.permission_level or "public",
             "category_l1": self.category_l1 or "",
             "category_l2": self.category_l2 or "",
+            "section_title": self.section_title or "",
+            "chunk_text_store": self.chunk_text,
             "source_url": self.source_oss_key or "",
             "is_active": 1 if self.is_active else 0,
         }

@@ -141,7 +141,7 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
     for item in results:
         fields = item.get("fields", item)
         parsed.append({
-            "chunk_text": fields.get("chunk_text", ""),
+            "chunk_text": fields.get("chunk_text_store", fields.get("chunk_text", "")),
             "title": fields.get("title", ""),
             "section_title": fields.get("section_title", ""),
             "doc_id": fields.get("doc_id", ""),
@@ -180,7 +180,7 @@ def search_chunks(
         )
 
     _output_fields = output_fields or [
-        "id", "doc_id", "chunk_text", "title", "section_title", "category_l1",
+        "id", "doc_id", "chunk_text_store", "title", "section_title", "category_l1",
     ]
 
     request = QueryRequest(
