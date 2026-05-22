@@ -1,0 +1,364 @@
+# -*- coding: utf-8 -*-
+"""
+config.py — 管线配置中心
+
+所有配置从环境变量读取，支持 .env 文件。
+本地模拟模式不需要任何外部服务。
+"""
+
+import os
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+@dataclass
+class OSSConfig:
+    """阿里云 OSS 配置。"""
+    endpoint: str = ""
+    access_key_id: str = ""
+    access_key_secret: str = ""
+    bucket_name: str = "fuling-knowledge-base"
+    # OSS 路径前缀
+    raw_prefix: str = "raw/"
+    canonical_prefix: str = "processing/canonical/"
+    redacted_prefix: str = "processing/redacted/"
+    rag_ready_prefix: str = "rag-ready/"
+    index_jobs_prefix: str = "index-jobs/opensearch/"
+    quarantine_prefix: str = "quarantine/"
+
+
+@dataclass
+class RDSConfig:
+    """阿里云 RDS MySQL 配置。"""
+    host: str = "localhost"
+    port: int = 3306
+    user: str = "root"
+    password: str = ""
+    database: str = "fuling_knowledge"
+    charset: str = "utf8mb4"
+    connect_timeout: int = 10
+    read_timeout: int = 30
+
+
+@dataclass
+class OpenSearchConfig:
+    """阿里云 OpenSearch 配置。"""
+    host: str = ""
+    port: int = 9200
+    auth_user: str = ""
+    auth_password: str = ""
+    index_name: str = "fuling_knowledge_v1"
+    use_ssl: bool = True
+    verify_certs: bool = True
+    # 工程限制
+    max_bulk_size_bytes: int = 1_500_000    # 1.5MB per bulk (safe margin under 2MB)
+    max_field_size_bytes: int = 1_000_000   # 1MB per text field
+    bulk_timeout_seconds: int = 60
+
+
+@dataclass
+class AlibabaVectorSearchConfig:
+    """阿里云 OpenSearch 向量检索版 (HA3 Engine) 配置。"""
+    endpoint: str = ""                # 实例 API 域名（不包含 http:// 前缀）
+    instance_id: str = ""             # 实例 ID
+    access_user_name: str = ""        # 用户名
+    access_pass_word: str = ""        # 密码
+    table_name: str = "fuling_knowledge_vector"
+    pk_field: str = "id"
+
+
+@dataclass
+class EmbeddingConfig:
+    """Embedding 模型配置。"""
+    api_key: str = ""
+    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    model: str = "text-embedding-004"
+    dimension: int = 1024
+    batch_size: int = 10                    # API limit (DashScope limit is 10)
+    max_retries: int = 3
+
+
+@dataclass
+class OCRConfig:
+    """Gemini Vision OCR 配置。"""
+    api_key: str = ""
+    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    model: str = "gemini-3.1-flash-lite"
+    max_ocr_pages: int = 5
+    ocr_threshold_chars: int = 100
+
+
+@dataclass
+class LLMConfig:
+    """分类/风险评估 LLM 配置。"""
+    api_key: str = ""
+    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    model: str = "gemini-3.1-flash-lite"
+    temperature: float = 0.1
+    max_retries: int = 2
+    max_tokens: int = 2048
+
+
+@dataclass
+class RAGConfig:
+    """RAG 问答 API 配置。"""
+    default_top_k: int = 5
+    max_context_chars: int = 6000
+    api_port: int = 8000
+    max_history_turns: int = 10
+
+
+@dataclass
+class ChunkStrategy:
+    """分类切分策略。"""
+    max_chunk_chars: int
+    overlap_chars: int
+
+@dataclass
+class ChunkerConfig:
+    """切分器配置。"""
+    min_chunk_chars: int = 50
+    max_token_count: int = 2000
+    
+    # 类别特定策略 (可以通过环境变量或在初始化时覆盖)
+    manual_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(500, 100))
+    sop_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(600, 100))
+    faq_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(600, 100))
+
+
+@dataclass
+class PipelineConfig:
+    """管线总配置。"""
+    # 运行模式
+    simulate: bool = True                   # 全局模拟主开关，如果未单独指定以下子配置，默认继承此值
+    simulate_db: bool = True                # 是否模拟 RDS 数据库读写
+    simulate_opensearch: bool = True        # 是否模拟 OpenSearch 读写
+    simulate_oss: bool = True               # 是否模拟 OSS 读写
+    simulate_api: bool = True               # 是否模拟外部 API（LLM, Embedding, OCR），不发送真实外部网络请求
+    environment: str = "development"        # development / staging / production
+    log_level: str = "INFO"
+
+    # 子配置
+    oss: OSSConfig = field(default_factory=OSSConfig)
+    rds: RDSConfig = field(default_factory=RDSConfig)
+    opensearch: OpenSearchConfig = field(default_factory=OpenSearchConfig)
+    alibaba_vector: AlibabaVectorSearchConfig = field(default_factory=AlibabaVectorSearchConfig)
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    ocr: OCRConfig = field(default_factory=OCRConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    chunker: ChunkerConfig = field(default_factory=ChunkerConfig)
+    rag: RAGConfig = field(default_factory=RAGConfig)
+
+    # 处理限制
+    max_concurrent_tasks: int = 5
+    max_retry_count: int = 3
+    scan_batch_size: int = 50
+
+
+def load_config() -> PipelineConfig:
+    """
+    从环境变量加载配置。
+
+    环境变数命名约定：
+      RAG_SIMULATE=true
+      RAG_SIMULATE_API=true
+      RAG_OSS_ENDPOINT=oss-cn-chengdu.aliyuncs.com
+      RAG_RDS_HOST=rm-xxx.mysql.rds.aliyuncs.com
+      RAG_OPENSEARCH_HOST=xxx.opensearch.aliyuncs.com
+      RAG_GEMINI_API_KEY=AIzaSy...
+    """
+
+    def _env(key: str, default: str = "") -> str:
+        return os.environ.get(f"RAG_{key}", default)
+
+    def _env_int(key: str, default: int = 0) -> int:
+        val = os.environ.get(f"RAG_{key}", "")
+        return int(val) if val else default
+
+    def _env_bool(key: str, default: bool = True) -> bool:
+        val = os.environ.get(f"RAG_{key}", "").lower()
+        if val in ("false", "0", "no"):
+            return False
+        if val in ("true", "1", "yes"):
+            return True
+        return default
+
+    def _env_float(key: str, default: float = 0.0) -> float:
+        val = os.environ.get(f"RAG_{key}", "")
+        return float(val) if val else default
+
+    rag_simulate = _env_bool("SIMULATE", True)
+    rag_simulate_db = _env_bool("SIMULATE_DB", rag_simulate)
+    rag_simulate_opensearch = _env_bool("SIMULATE_OPENSEARCH", rag_simulate)
+    rag_simulate_oss = _env_bool("SIMULATE_OSS", rag_simulate)
+    rag_simulate_api = _env_bool("SIMULATE_API", rag_simulate)
+
+    # 优先加载 DashScope API Key
+    dashscope_key = _env("DASHSCOPE_API_KEY") or os.environ.get("DASHSCOPE_API_KEY", "")
+    gemini_key = _env("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+
+    # DataWorks(杭州) VPC 打通至百炼(北京)，使用北京 VPC 内网域名
+    _is_prod = os.environ.get("RAG_ENVIRONMENT", "development") == "production"
+    ds_domain = os.environ.get("DASHSCOPE_VPC_DOMAIN", "vpc-cn-beijing.dashscope.aliyuncs.com") if _is_prod else "dashscope.aliyuncs.com"
+
+    # LLM 动态配置
+    llm_key = _env("LLM_API_KEY") or dashscope_key or gemini_key
+    default_llm_base = f"https://{ds_domain}/compatible-mode/v1" if dashscope_key else "https://generativelanguage.googleapis.com/v1beta"
+    llm_base_url = _env("LLM_API_BASE_URL") or default_llm_base
+    default_llm_model = "qwen3.6-plus" if dashscope_key else "gemini-3.1-flash-lite"
+    llm_model = _env("LLM_MODEL") or default_llm_model
+
+    # OCR 动态配置
+    ocr_key = _env("OCR_API_KEY") or dashscope_key or gemini_key
+    default_ocr_base = f"https://{ds_domain}/api/v1" if dashscope_key else "https://generativelanguage.googleapis.com/v1beta"
+    ocr_base_url = _env("OCR_API_BASE_URL") or default_ocr_base
+    default_ocr_model = "qwen-vl-ocr-latest" if dashscope_key else "gemini-3.1-flash-lite"
+    ocr_model = _env("OCR_MODEL") or default_ocr_model
+
+    # Embedding 动态路由配置
+    env_embedding_model = os.environ.get("RAG_EMBEDDING_MODEL")
+    default_emb_model = "text-embedding-v4" if dashscope_key else "gemini-embedding-2"
+    emb_model = env_embedding_model or default_emb_model
+
+    is_emb_dashscope = "qwen" in emb_model.lower() or "text-embedding" in emb_model.lower()
+
+    emb_key = _env("EMBEDDING_API_KEY")
+    if not emb_key:
+        emb_key = dashscope_key if is_emb_dashscope else gemini_key
+
+    emb_base = _env("EMBEDDING_API_BASE_URL")
+    if not emb_base:
+        emb_base = f"https://{ds_domain}" if is_emb_dashscope else "https://generativelanguage.googleapis.com/v1beta"
+
+    config = PipelineConfig(
+        simulate=rag_simulate,
+        simulate_db=rag_simulate_db,
+        simulate_opensearch=rag_simulate_opensearch,
+        simulate_oss=rag_simulate_oss,
+        simulate_api=rag_simulate_api,
+        environment=_env("ENVIRONMENT", "development"),
+        log_level=_env("LOG_LEVEL", "INFO"),
+        max_concurrent_tasks=_env_int("MAX_CONCURRENT_TASKS", 5),
+        max_retry_count=_env_int("MAX_RETRY_COUNT", 3),
+        scan_batch_size=_env_int("SCAN_BATCH_SIZE", 50),
+
+        oss=OSSConfig(
+            endpoint=_env("OSS_ENDPOINT"),
+            access_key_id=_env("OSS_ACCESS_KEY_ID"),
+            access_key_secret=_env("OSS_ACCESS_KEY_SECRET"),
+            bucket_name=_env("OSS_BUCKET_NAME", "fuling-knowledge-base"),
+        ),
+
+        rds=RDSConfig(
+            host=_env("RDS_HOST", "localhost"),
+            port=_env_int("RDS_PORT", 3306),
+            user=_env("RDS_USER", "root"),
+            password=_env("RDS_PASSWORD"),
+            database=_env("RDS_DATABASE", "fuling_knowledge"),
+        ),
+
+        opensearch=OpenSearchConfig(
+            host=_env("OPENSEARCH_HOST"),
+            port=_env_int("OPENSEARCH_PORT", 9200),
+            auth_user=_env("OPENSEARCH_USER"),
+            auth_password=_env("OPENSEARCH_PASSWORD"),
+            index_name=_env("OPENSEARCH_INDEX", "fuling_knowledge_v1"),
+            use_ssl=_env_bool("OPENSEARCH_USE_SSL", True),
+            verify_certs=_env_bool("OPENSEARCH_VERIFY_CERTS", True),
+        ),
+
+        alibaba_vector=AlibabaVectorSearchConfig(
+            endpoint=_env("HA3_ENDPOINT"),
+            instance_id=_env("HA3_INSTANCE_ID"),
+            access_user_name=_env("HA3_USER"),
+            access_pass_word=_env("HA3_PASSWORD"),
+            table_name=_env("HA3_TABLE_NAME", "fuling_knowledge_vector"),
+            pk_field=_env("HA3_PK_FIELD", "id"),
+        ),
+
+        embedding=EmbeddingConfig(
+            api_key=emb_key,
+            api_base_url=emb_base,
+            model=emb_model,
+            dimension=_env_int("EMBEDDING_DIMENSION", 1024),
+            batch_size=10 if is_emb_dashscope else 25,
+        ),
+
+        ocr=OCRConfig(
+            api_key=ocr_key,
+            api_base_url=ocr_base_url,
+            model=ocr_model,
+            max_ocr_pages=_env_int("OCR_MAX_PAGES", 5),
+            ocr_threshold_chars=_env_int("OCR_THRESHOLD_CHARS", 100),
+        ),
+
+        llm=LLMConfig(
+            api_key=llm_key,
+            api_base_url=llm_base_url,
+            model=llm_model,
+            max_tokens=_env_int("LLM_MAX_TOKENS", 2048),
+        ),
+        chunker=ChunkerConfig(
+            min_chunk_chars=_env_int("CHUNKER_MIN_CHARS", 50),
+            max_token_count=_env_int("CHUNKER_MAX_TOKENS", 2000),
+            manual_strategy=ChunkStrategy(
+                max_chunk_chars=_env_int("CHUNKER_MANUAL_MAX", 500),
+                overlap_chars=_env_int("CHUNKER_MANUAL_OVERLAP", 100)
+            ),
+            sop_strategy=ChunkStrategy(
+                max_chunk_chars=_env_int("CHUNKER_SOP_MAX", 600),
+                overlap_chars=_env_int("CHUNKER_SOP_OVERLAP", 100)
+            ),
+            faq_strategy=ChunkStrategy(
+                max_chunk_chars=_env_int("CHUNKER_FAQ_MAX", 600),
+                overlap_chars=_env_int("CHUNKER_FAQ_OVERLAP", 100)
+            )
+        ),
+        rag=RAGConfig(
+            default_top_k=_env_int("RAG_TOP_K", 5),
+            max_context_chars=_env_int("RAG_MAX_CONTEXT_CHARS", 6000),
+            api_port=_env_int("RAG_API_PORT", 8000),
+            max_history_turns=_env_int("RAG_MAX_HISTORY_TURNS", 10),
+        ),
+    )
+
+    # 💡 生产安全守卫：当处于 production 或 staging 环境下，坚决杜绝 fallback 到 Gemini！
+    # 强制校验所有大模型/视觉/向量 API 配置必须为阿里云 DashScope（或者是明确的非 Gemini，比如专有端点）
+    if config.environment in ("production", "staging"):
+        if not dashscope_key:
+            raise ValueError(
+                f"🚨 [PRODUCTION SECURITY GUARD] DashScope API Key is not configured under '{config.environment}' environment! "
+                f"To protect privacy & security, falling back to Google Gemini is strictly forbidden in production."
+            )
+            
+        for name, subcfg in [("LLM", config.llm), ("OCR", config.ocr), ("Embedding", config.embedding)]:
+            base_url = subcfg.api_base_url or ""
+            model_name = subcfg.model or ""
+            
+            if "google" in base_url.lower() or "gemini" in model_name.lower():
+                raise ValueError(
+                    f"🚨 [PRODUCTION SECURITY GUARD] {name} config resolved to Google Gemini "
+                    f"(base_url='{base_url}', model='{model_name}') under '{config.environment}' environment! "
+                    f"Production runs must strictly utilize Alibaba Cloud (Qwen) services."
+                )
+
+    return config
+
+
+
+# 单例
+_config: Optional[PipelineConfig] = None
+
+
+def get_config() -> PipelineConfig:
+    """获取全局配置（惰性加载）。"""
+    global _config
+    if _config is None:
+        _config = load_config()
+    return _config
