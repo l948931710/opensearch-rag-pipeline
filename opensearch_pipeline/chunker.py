@@ -10,6 +10,7 @@ chunker.py — 文档切分器
   table_chunk         — 表格块
   faq_chunk           — Q&A 对
   section_chunk       — 按标题层级切
+  clause_chunk        — 按条款边界切（第X条 / 一、 / 9.1）
 """
 
 import hashlib
@@ -506,6 +507,180 @@ class DocumentChunker:
 
         return chunks
 
+    def _chunk_by_clause(
+        self,
+        blocks: list,
+        doc_id: str,
+        version_no: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """
+        条款感知切分器。
+        按条款边界（第X条、一、二、、（一）、9.1 等）切分，
+        保持法规/制度条款完整性，避免跨条款断裂。
+        超长条款仍 fallback 到 _split_long_text。
+        """
+        meta = metadata or {}
+        chunks: List[Chunk] = []
+        chunk_index = 0
+        current_section: Optional[str] = None
+
+        # 条款边界检测 regex
+        _CLAUSE_RE = re.compile(
+            r'^(?:'
+            r'第[一二三四五六七八九十百零\d]+[章节条款部分编]|'  # 第X章/第X条
+            r'[一二三四五六七八九十]+[、\.]|'  # 一、二、
+            r'（[一二三四五六七八九十\d]+）|'  # （一）（二）
+            r'\d+\.\d+(?:\.\d+)?\s'  # 9.1 9.2 or 2.2.1
+            r')',
+            re.MULTILINE,
+        )
+
+        # 1. Collect all paragraph text and handle tables/headings
+        all_para_texts: List[str] = []
+        table_chunks: List[Chunk] = []
+
+        for block in blocks:
+            if isinstance(block, dict):
+                block_type = block.get("block_type", "paragraph")
+                text = block.get("text", "").strip()
+                page_num = block.get("page_num")
+                section_path = block.get("section_path")
+                source = block.get("source", "native")
+            else:
+                block_type = block.block_type
+                text = block.text.strip()
+                page_num = block.page_num
+                section_path = block.section_path
+                source = block.source
+
+            if not text:
+                continue
+
+            if block_type == "heading":
+                current_section = section_path or text
+                continue
+
+            if block_type == "table":
+                table_chunks.append(self._create_chunk(
+                    doc_id=doc_id,
+                    version_no=version_no,
+                    chunk_index=chunk_index,
+                    chunk_type="table_chunk",
+                    chunk_text=text,
+                    page_num=page_num,
+                    section_title=current_section,
+                    metadata=meta,
+                    source=source,
+                ))
+                chunk_index += 1
+                continue
+
+            all_para_texts.append(text)
+
+        # 2. Join all paragraphs and split by clause boundaries
+        full_text = "\n".join(all_para_texts)
+        if not full_text.strip():
+            return table_chunks
+
+        matches = list(_CLAUSE_RE.finditer(full_text))
+
+        if not matches:
+            # No clause boundaries found — fallback to standard text splitting
+            sub_texts = self._split_long_text(full_text.strip())
+            for sub in sub_texts:
+                if len(sub.strip()) < self.min_chunk_chars:
+                    continue
+                chunks.append(self._create_chunk(
+                    doc_id=doc_id,
+                    version_no=version_no,
+                    chunk_index=chunk_index,
+                    chunk_type="text_chunk",
+                    chunk_text=sub.strip(),
+                    section_title=current_section,
+                    metadata=meta,
+                ))
+                chunk_index += 1
+            return table_chunks + chunks
+
+        # 3. Build clause segments
+        clause_segments: List[str] = []
+
+        # Preamble before first clause
+        if matches[0].start() > 0:
+            preamble = full_text[:matches[0].start()].strip()
+            if preamble:
+                clause_segments.append(preamble)
+
+        for i, match in enumerate(matches):
+            start = match.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
+            segment = full_text[start:end].strip()
+            if segment:
+                clause_segments.append(segment)
+
+        # 4. Merge short clauses and split oversized ones
+        merged_segments: List[str] = []
+        buffer = ""
+
+        for seg in clause_segments:
+            if buffer:
+                candidate = buffer + "\n" + seg
+            else:
+                candidate = seg
+
+            if len(candidate) <= self.max_chunk_chars:
+                if len(seg) < self.min_chunk_chars and buffer:
+                    # Merge short clause into buffer
+                    buffer = candidate
+                elif len(seg) < self.min_chunk_chars and not buffer:
+                    buffer = seg
+                else:
+                    if buffer and buffer != candidate:
+                        merged_segments.append(buffer)
+                    buffer = seg
+            else:
+                # Current buffer is full, commit it
+                if buffer:
+                    merged_segments.append(buffer)
+                buffer = seg
+
+        if buffer:
+            merged_segments.append(buffer)
+
+        # 5. Create chunks from segments
+        for seg in merged_segments:
+            if len(seg) > self.max_chunk_chars:
+                sub_texts = self._split_long_text(seg)
+                for sub in sub_texts:
+                    if len(sub.strip()) < self.min_chunk_chars:
+                        continue
+                    chunks.append(self._create_chunk(
+                        doc_id=doc_id,
+                        version_no=version_no,
+                        chunk_index=chunk_index,
+                        chunk_type="clause_chunk",
+                        chunk_text=sub.strip(),
+                        section_title=current_section,
+                        metadata=meta,
+                    ))
+                    chunk_index += 1
+            else:
+                if len(seg.strip()) < self.min_chunk_chars:
+                    continue
+                chunks.append(self._create_chunk(
+                    doc_id=doc_id,
+                    version_no=version_no,
+                    chunk_index=chunk_index,
+                    chunk_type="clause_chunk",
+                    chunk_text=seg.strip(),
+                    section_title=current_section,
+                    metadata=meta,
+                ))
+                chunk_index += 1
+
+        return table_chunks + chunks
+
     def chunk_from_blocks(
         self,
         blocks: list,
@@ -529,6 +704,8 @@ class DocumentChunker:
         """
         if self.split_mode == "faq":
             return self._chunk_faq(blocks, doc_id, version_no, metadata)
+        if self.split_mode == "clause":
+            return self._chunk_by_clause(blocks, doc_id, version_no, metadata)
 
         meta = metadata or {}
         chunks: List[Chunk] = []

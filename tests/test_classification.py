@@ -115,8 +115,8 @@ class TestLiveClassificationPipeline:
         assert doc["classification_status"] == "CONTENT_CLASSIFIED"
 
     @mock.patch("opensearch_pipeline.pipeline_nodes.run_gemini_classification")
-    def test_low_confidence_quarantine(self, mock_gemini):
-        """测试置信度低于 0.85 时，触发隔离、降权及 review_task 注册。"""
+    def test_low_confidence_no_quarantine(self, mock_gemini):
+        """测试置信度低于 0.85 时，记录警告但继续正常入库（review 机制已关闭）。"""
         mock_gemini.return_value = {
             "category_l1": "sop",
             "category_l2": "hr",
@@ -148,29 +148,25 @@ class TestLiveClassificationPipeline:
 
         node_classify_and_risk_assess(ctx)
 
-        # 1. 验证内存状态已被隔离和降权
-        assert doc["redaction_action"] == "QUARANTINE"
-        assert doc["risk_level"] == "high"
-        assert doc["permission_level"] == "restricted"
-        assert doc["kb_type"] == "private"
-        assert doc["classification_status"] == "PENDING_AUDIT"
+        # 1. 验证正常入库，不隔离
+        assert doc["classification_status"] == "CONTENT_CLASSIFIED"
+        assert doc["category_l1"] == "sop"
+        assert doc["confidence"] == 0.72
+        assert doc["permission_level"] == "public"  # 路径判定，不降权
+        assert "redaction_action" not in doc or doc.get("redaction_action") != "QUARANTINE"
 
-        # 2. 验证 RDS 中插入了 review_task 记录
+        # 2. 验证 RDS 中未插入 review_task
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cursor:
-            cursor.execute("SELECT review_status, suggested_category_l1, suggested_permission_level, confidence_score FROM review_task WHERE doc_id='doc_low'")
-            task = cursor.fetchone()
-            assert task is not None
-            assert task[0] == "PENDING"
-            assert task[1] == "sop"
-            assert task[2] == "restricted"  # 被锁定为 restricted
-            assert float(task[3]) == 0.72
+            cursor.execute("SELECT COUNT(*) FROM review_task WHERE doc_id='doc_low'")
+            count = cursor.fetchone()[0]
+            assert count == 0
 
-            # 验证 document_version 更新为 PENDING_AUDIT
-            cursor.execute("SELECT classification_status, risk_level FROM document_version WHERE doc_id='doc_low'")
+            # 验证 document_version 状态为正常
+            cursor.execute("SELECT classification_status, classification_confidence FROM document_version WHERE doc_id='doc_low'")
             ver = cursor.fetchone()
-            assert ver[0] == "PENDING_AUDIT"
-            assert ver[1] == "high"
+            assert ver[0] == "CONTENT_CLASSIFIED"
+            assert float(ver[1]) == 0.72
         conn.close()
 
     @mock.patch("opensearch_pipeline.pipeline_nodes.run_gemini_classification")

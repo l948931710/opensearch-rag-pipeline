@@ -127,9 +127,10 @@ class ChunkerConfig:
     max_token_count: int = 2000
     
     # 类别特定策略 (可以通过环境变量或在初始化时覆盖)
-    manual_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(500, 100))
+    manual_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(600, 100))
     sop_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(600, 100))
     faq_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(600, 100))
+    clause_strategy: ChunkStrategy = field(default_factory=lambda: ChunkStrategy(800, 100))
 
 
 @dataclass
@@ -308,7 +309,7 @@ def load_config() -> PipelineConfig:
             min_chunk_chars=_env_int("CHUNKER_MIN_CHARS", 50),
             max_token_count=_env_int("CHUNKER_MAX_TOKENS", 2000),
             manual_strategy=ChunkStrategy(
-                max_chunk_chars=_env_int("CHUNKER_MANUAL_MAX", 500),
+                max_chunk_chars=_env_int("CHUNKER_MANUAL_MAX", 600),
                 overlap_chars=_env_int("CHUNKER_MANUAL_OVERLAP", 100)
             ),
             sop_strategy=ChunkStrategy(
@@ -318,6 +319,10 @@ def load_config() -> PipelineConfig:
             faq_strategy=ChunkStrategy(
                 max_chunk_chars=_env_int("CHUNKER_FAQ_MAX", 600),
                 overlap_chars=_env_int("CHUNKER_FAQ_OVERLAP", 100)
+            ),
+            clause_strategy=ChunkStrategy(
+                max_chunk_chars=_env_int("CHUNKER_CLAUSE_MAX", 800),
+                overlap_chars=_env_int("CHUNKER_CLAUSE_OVERLAP", 100)
             )
         ),
         rag=RAGConfig(

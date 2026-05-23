@@ -58,7 +58,7 @@ def _detect_heading_level(style_name: str, text: str) -> Optional[int]:
 
     # 3. Regex fallback：中文标题模式 (限制最大长度以防长正文段落被误判为标题而遗漏)
     stripped = text.strip()
-    if len(stripped) <= 60:
+    if len(stripped) <= 30:
         if _CN_HEADING_RE.match(stripped):
             if stripped.startswith("第"):
                 return 1

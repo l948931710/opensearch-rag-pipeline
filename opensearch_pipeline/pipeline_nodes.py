@@ -1030,55 +1030,47 @@ def node_classify_and_risk_assess(ctx: dict):
         api_failed = False
         api_error_reason = ""
 
-        # ─── 普通 Raw 路径内部公开文档免大模型审计绕过 ───
-        # 如果 raw key 不包含 _quarantine/ 则直接认定为公开，免除一切大语言模型 API 安全评估调用
-        # 在运行标准分类单元测试时，由于需要校验模型分类结果，故在 pytest 环境下不执行自动绕过
+        # ─── 分类与风险评估：所有文档均需 LLM 分类 ───
+        # 非隔离文档在分类完成后，风险等级固定为 "low"（跳过重度风险审计）
         source_key = doc.get("source_key", "")
-        is_public = "_quarantine/" not in source_key and not os.environ.get("PYTEST_CURRENT_TEST")
+        is_public = "_quarantine/" not in source_key
 
-        if is_public:
-            print(f"    [Bypass Guard] Document {doc['doc_id']} is internally public. Bypassing heavy LLM risk-audits & desensitization.")
+        simulate_api = ctx.get("simulate_api", ctx.get("simulate", config.simulate_api))
+        if simulate_api:
+            # 模拟 LLM 分类结果
+            classification = ctx.get("mock_classifications", {}).get(doc["doc_id"], {})
+            if not classification and "mock_classification" in ctx:
+                classification = ctx.get("mock_classification", {})
+            
+            # 填补 mock 缺失项
             classification = {
-                "category_l1": "reference",
-                "category_l2": "manual",
-                "faq_eligible": True,
-                "confidence": 1.0,
-                "llm_risk_level": "low",
-                "summary": text[:100].strip() if text else "[Bypassed Audit Summary]"
+                "category_l1": classification.get("category_l1", "reference"),
+                "category_l2": classification.get("category_l2", "manual"),
+                "faq_eligible": classification.get("faq_eligible", True),
+                "confidence": classification.get("confidence", 0.85),
+                "llm_risk_level": classification.get("risk_level", "low"),
+                "summary": classification.get("summary", text[:100])
             }
         else:
-            simulate_api = ctx.get("simulate_api", ctx.get("simulate", config.simulate_api))
-            if simulate_api:
-                # 模拟 LLM 分类结果
-                classification = ctx.get("mock_classifications", {}).get(doc["doc_id"], {})
-                if not classification and "mock_classification" in ctx:
-                    classification = ctx.get("mock_classification", {})
-                
-                # 填补 mock 缺失项
-                classification = {
-                    "category_l1": classification.get("category_l1", "reference"),
-                    "category_l2": classification.get("category_l2", "manual"),
-                    "faq_eligible": classification.get("faq_eligible", True),
-                    "confidence": classification.get("confidence", 0.85),
-                    "llm_risk_level": classification.get("risk_level", "low"),
-                    "summary": classification.get("summary", text[:100])
-                }
-            else:
-                # 真实调用 API
-                llm_cfg = config.llm
-                api_key = llm_cfg.api_key
-                model_name = llm_cfg.model
-                api_base_url = llm_cfg.api_base_url
+            # 真实调用 API
+            llm_cfg = config.llm
+            api_key = llm_cfg.api_key
+            model_name = llm_cfg.model
+            api_base_url = llm_cfg.api_base_url
 
-                if not api_key:
+            if not api_key:
+                api_failed = True
+                api_error_reason = "LLM API key is not configured in environment"
+            else:
+                try:
+                    classification = run_gemini_classification(text, model_name, api_key, api_base_url)
+                except Exception as e:
                     api_failed = True
-                    api_error_reason = "LLM API key is not configured in environment"
-                else:
-                    try:
-                        classification = run_gemini_classification(text, model_name, api_key, api_base_url)
-                    except Exception as e:
-                        api_failed = True
-                        api_error_reason = f"LLM API invocation failed: {str(e)}"
+                    api_error_reason = f"LLM API invocation failed: {str(e)}"
+
+        # 非隔离公开文档：保留 LLM 分类结果，但风险等级固定为 low（跳过重度审计）
+        if is_public and classification and not api_failed:
+            classification["llm_risk_level"] = "low"
 
         # 3. 处理分类与风险评估结果或 Fail-Safe 降级
         if api_failed:
@@ -1181,94 +1173,47 @@ def node_classify_and_risk_assess(ctx: dict):
             doc["llm_risk_level"] = classification["llm_risk_level"]
 
             if confidence < 0.85:
-                # 低置信度降级：隔离、限制权限、触发人工审查
-                print(f"    ⚠️ Low confidence ({confidence:.2f} < 0.85) for {doc['doc_id']}. Quarantining...")
-                doc["permission_level"] = "restricted"
-                doc["kb_type"] = "private"
-                doc["redaction_action"] = "QUARANTINE"
-                doc["classification_status"] = "PENDING_AUDIT"
-                doc["risk_level"] = "high"
+                # 低置信度：记录警告但不隔离，允许继续入库
+                print(f"    ⚠️ Low confidence ({confidence:.2f} < 0.85) for {doc['doc_id']}. Proceeding without quarantine.")
 
-                if not simulate_db:
-                    conn = None
-                    try:
-                        conn = _get_db_conn(select_db=True)
-                        with conn.cursor() as cursor:
-                            task_id = f"rev_{doc['doc_id']}_v{doc['version_no']}"
-                            cursor.execute("""
-                                INSERT INTO review_task (
-                                    task_id, doc_id, version_no, review_key, review_type, review_reason, review_status,
-                                    owner_dept, suggested_category_l1, suggested_category_l2, suggested_permission_level, confidence_score
-                                ) VALUES (
-                                    %s, %s, %s, %s, 'document_classification', 'Low classification confidence score', 'PENDING',
-                                    %s, %s, %s, 'restricted', %s
-                                ) ON DUPLICATE KEY UPDATE
-                                    review_reason = VALUES(review_reason),
-                                    review_status = 'PENDING',
-                                    suggested_category_l1 = VALUES(suggested_category_l1),
-                                    suggested_category_l2 = VALUES(suggested_category_l2),
-                                    suggested_permission_level = 'restricted',
-                                    confidence_score = VALUES(confidence_score)
-                            """, (task_id, doc["doc_id"], doc["version_no"], doc.get("canonical_key", ""), doc["owner_dept"],
-                                  doc["category_l1"], doc["category_l2"], confidence))
+            # 正常入库
+            doc["classification_status"] = "CONTENT_CLASSIFIED"
+            if not simulate_db:
+                conn = None
+                try:
+                    conn = _get_db_conn(select_db=True)
+                    with conn.cursor() as cursor:
+                        # 更新 document_meta 字段
+                        cursor.execute("""
+                            UPDATE document_meta
+                            SET category_l1 = %s,
+                                category_l2 = %s,
+                                owner_dept = %s,
+                                summary = %s,
+                                permission_level = %s,
+                                kb_type = %s
+                            WHERE doc_id = %s
+                        """, (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
+                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
 
-                            # 更新 document_version
-                            cursor.execute("""
-                                UPDATE document_version
-                                SET classification_method = 'LLM',
-                                    classification_confidence = %s,
-                                    risk_level = 'high',
-                                    classification_status = 'PENDING_AUDIT',
-                                    faq_eligible = %s
-                                WHERE doc_id = %s AND version_no = %s
-                            """, (confidence, doc["faq_eligible"], doc["doc_id"], doc["version_no"]))
-                            conn.commit()
-                    except Exception as db_err:
-                        if conn: conn.rollback()
-                        print(f"    ⚠️ Failed to insert low-confidence human audit task to RDS: {db_err}")
-                        raise RuntimeError(f"Database write failure in node_classify_document (low confidence): {db_err}") from db_err
-                    finally:
-                        if conn:
-                            conn.close()
-            else:
-                # 高置信度：正常入库
-                doc["classification_status"] = "CONTENT_CLASSIFIED"
-                if not simulate_db:
-                    conn = None
-                    try:
-                        conn = _get_db_conn(select_db=True)
-                        with conn.cursor() as cursor:
-                            # 更新 document_meta 字段
-                            cursor.execute("""
-                                UPDATE document_meta
-                                SET category_l1 = %s,
-                                    category_l2 = %s,
-                                    owner_dept = %s,
-                                    summary = %s,
-                                    permission_level = %s,
-                                    kb_type = %s
-                                WHERE doc_id = %s
-                            """, (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
-                                  doc["permission_level"], doc["kb_type"], doc["doc_id"]))
-
-                            # 更新 document_version 字段
-                            cursor.execute("""
-                                UPDATE document_version
-                                SET classification_method = 'LLM',
-                                    classification_confidence = %s,
-                                    risk_level = %s,
-                                    faq_eligible = %s,
-                                    classification_status = 'CONTENT_CLASSIFIED'
-                                WHERE doc_id = %s AND version_no = %s
-                            """, (confidence, doc["llm_risk_level"], doc["faq_eligible"], doc["doc_id"], doc["version_no"]))
-                            conn.commit()
-                    except Exception as db_err:
-                        if conn: conn.rollback()
-                        print(f"    ⚠️ Failed to persist metadata to RDS: {db_err}")
-                        raise RuntimeError(f"Database write failure in node_classify_document (persist metadata): {db_err}") from db_err
-                    finally:
-                        if conn:
-                            conn.close()
+                        # 更新 document_version 字段
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET classification_method = 'LLM',
+                                classification_confidence = %s,
+                                risk_level = %s,
+                                faq_eligible = %s,
+                                classification_status = 'CONTENT_CLASSIFIED'
+                            WHERE doc_id = %s AND version_no = %s
+                        """, (confidence, doc["llm_risk_level"], doc["faq_eligible"], doc["doc_id"], doc["version_no"]))
+                        conn.commit()
+                except Exception as db_err:
+                    if conn: conn.rollback()
+                    print(f"    ⚠️ Failed to persist metadata to RDS: {db_err}")
+                    raise RuntimeError(f"Database write failure in node_classify_document (persist metadata): {db_err}") from db_err
+                finally:
+                    if conn:
+                        conn.close()
 
         print(
             f"    └─ {doc['doc_id']}: "
@@ -1473,10 +1418,14 @@ def node_chunk_documents(ctx: dict):
             cat_l2 = str(doc.get("category_l2", "")).lower()
             title = str(doc.get("title", "")).lower()
             doc_id = str(doc.get("doc_id", "")).lower()
-            if "faq" in cat_l1 or "faq" in cat_l2 or "faq" in title or "faq" in doc_id:
+            if doc.get("faq_eligible") or "faq" in cat_l1 or "faq" in cat_l2 or "faq" in title or "faq" in doc_id:
                 m_chunk = ctx.get("faq_size", config.chunker.faq_strategy.max_chunk_chars)
                 m_overlap = ctx.get("faq_overlap", config.chunker.faq_strategy.overlap_chars)
                 m_mode = "faq"
+            elif any(kw in cat_l1 for kw in ["policy", "standard", "regulation"]) or any(kw in cat_l2 for kw in ["policy", "standard", "regulation"]) or "制度" in title or "规定" in title or "规范" in title:
+                m_chunk = ctx.get("clause_size", config.chunker.clause_strategy.max_chunk_chars)
+                m_overlap = ctx.get("clause_overlap", config.chunker.clause_strategy.overlap_chars)
+                m_mode = "clause"
             elif "manual" in cat_l1 or "manual" in cat_l2 or "guide" in cat_l1 or "guide" in cat_l2 or "manual" in title or "guide" in title:
                 m_chunk = ctx.get("manual_size", config.chunker.manual_strategy.max_chunk_chars)
                 m_overlap = ctx.get("manual_overlap", config.chunker.manual_strategy.overlap_chars)

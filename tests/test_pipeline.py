@@ -590,7 +590,7 @@ class TestDatabaseExceptionPropagation:
         from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
         
         monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Mock RDS quarantine write failed")))
-        # 返回低于 0.85 置信度的分类
+        # 返回低于 0.85 置信度的分类（review 已关闭，走正常入库路径）
         mock_low_conf = {
             "category_l1": "policy",
             "category_l2": "hr_policy",
@@ -609,7 +609,7 @@ class TestDatabaseExceptionPropagation:
             "simulate_api": False,
         }
         
-        with pytest.raises(RuntimeError, match="Database write failure in node_classify_document \\(low confidence\\): Mock RDS quarantine write failed"):
+        with pytest.raises(RuntimeError, match="Database write failure in node_classify_document \\(persist metadata\\): Mock RDS quarantine write failed"):
             node_classify_and_risk_assess(ctx)
 
     def test_node_classify_document_high_confidence_raises_on_db_error(self, monkeypatch):
