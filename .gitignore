@@ -8,6 +8,8 @@ build/
 .pytest_cache/
 .ruff_cache/
 .env
+.env.local
+.env.production
 *.log
 index-jobs/
 rag-ready/

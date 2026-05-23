@@ -352,7 +352,7 @@ class TestBackgroundRAGProcessing:
 
         _process_rag_query("年假几天", "https://webhook/test", "张三", "cid1")
 
-        mock_search.assert_called_once_with("年假几天", top_k=5)
+        mock_search.assert_called_once_with("年假几天", top_k=5, user_dept=None)
         mock_gen.assert_called_once()
         mock_reply.assert_called_once()
         # 验证 Markdown 内容

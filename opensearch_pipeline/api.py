@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream
 from opensearch_pipeline.retriever import search_chunks
-from opensearch_pipeline.dingtalk_bot import router as dingtalk_router
+from opensearch_pipeline.dingtalk_bot import router as dingtalk_router, _resolve_user_dept
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +79,15 @@ class AskRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
     temperature: Optional[float] = Field(0.1, ge=0.0, le=2.0, description="生成温度")
     max_tokens: Optional[int] = Field(2048, ge=100, le=8192, description="最大生成 token 数")
+    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId），用于权限过滤")
+    user_dept: Optional[str] = Field(None, description="用户部门代码，直接传入时优先使用")
 
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="搜索查询")
     top_k: int = Field(5, ge=1, le=50, description="返回结果数")
+    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId），用于权限过滤")
+    user_dept: Optional[str] = Field(None, description="用户部门代码，直接传入时优先使用")
 
 
 class SourceInfo(BaseModel):
@@ -201,7 +205,10 @@ async def search(req: SearchRequest):
     """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""
     t0 = time.time()
     try:
-        results = search_chunks(req.query, top_k=req.top_k)
+        user_dept = req.user_dept
+        if not user_dept and req.user_id:
+            user_dept = _resolve_user_dept(req.user_id)
+        results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -231,7 +238,10 @@ async def ask(req: AskRequest):
 
     # 2. 检索
     try:
-        chunks = search_chunks(req.question, top_k=req.top_k)
+        user_dept = req.user_dept
+        if not user_dept and req.user_id:
+            user_dept = _resolve_user_dept(req.user_id)
+        chunks = search_chunks(req.question, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -295,7 +305,10 @@ async def ask_stream(req: AskRequest):
 
     # 2. 检索（同步阶段，在生成器外完成）
     try:
-        chunks = search_chunks(req.question, top_k=req.top_k)
+        user_dept = req.user_dept
+        if not user_dept and req.user_id:
+            user_dept = _resolve_user_dept(req.user_id)
+        chunks = search_chunks(req.question, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         logger.error("Search failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"检索失败: {e}")

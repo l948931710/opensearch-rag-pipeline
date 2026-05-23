@@ -152,6 +152,8 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
             "chunk_index": fields.get("chunk_index", 0),
             "page_num": fields.get("page_num", 0),
             "kb_type": fields.get("kb_type", "public"),
+            "permission_level": fields.get("permission_level", "public"),
+            "owner_dept": fields.get("owner_dept", ""),
             "score": item.get("score", item.get("_score", 0)),
         })
     return parsed
@@ -164,6 +166,7 @@ def search_chunks(
     min_score: float = 0.0,
     max_distance: float = 0.0,
     output_fields: Optional[List[str]] = None,
+    user_dept: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     端到端检索：query → embedding → HA3 search → 标准化结果。
@@ -197,7 +200,24 @@ def search_chunks(
     _output_fields = output_fields or [
         "id", "doc_id", "chunk_text_store", "title", "section_title",
         "category_l1", "chunk_index", "page_num", "kb_type",
+        "permission_level", "owner_dept",
     ]
+
+    # ── 权限过滤 ──
+    # 企业内部部署，所有钉钉用户都是公司员工：
+    #   public        → 所有员工可见（默认）
+    #   dept_internal → 仅 owner_dept 匹配的部门成员可见
+    if user_dept:
+        # 用户部门已知：可以看 public + 自己部门的 dept_internal
+        filter_expr = (
+            'permission_level="public"'
+            ' OR (permission_level="dept_internal" AND owner_dept="' + user_dept + '")'
+        )
+    else:
+        # 用户部门未知（降级安全模式）：只能看 public
+        filter_expr = 'permission_level="public"'
+
+    logger.info("Permission filter: user_dept=%s, filter=%s", user_dept, filter_expr)
 
     request = QueryRequest(
         table_name=config.alibaba_vector.table_name,
@@ -206,6 +226,7 @@ def search_chunks(
         top_k=top_k,
         include_vector=False,
         output_fields=_output_fields,
+        filter=filter_expr,
     )
 
     client = _get_ha3_client()

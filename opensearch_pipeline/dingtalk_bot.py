@@ -31,10 +31,58 @@ from pydantic import BaseModel
 
 from opensearch_pipeline.retriever import search_chunks
 from opensearch_pipeline.llm_generator import generate_answer
+from opensearch_pipeline.config import get_config
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dingtalk", tags=["DingTalk"])
+
+
+# ═══════════════════════════════════════════════════════════════
+# 用户部门解析
+# ═══════════════════════════════════════════════════════════════
+
+def _resolve_user_dept(staff_id: str) -> Optional[str]:
+    """
+    从 RDS user_role 表查询用户所属部门。
+
+    查询失败或用户不存在时返回 None，调用方会降级为只返回 public + internal 文档。
+    """
+    if not staff_id:
+        return None
+
+    try:
+        import pymysql
+        config = get_config()
+        conn = pymysql.connect(
+            host=config.rds.host,
+            port=config.rds.port,
+            user=config.rds.user,
+            password=config.rds.password,
+            database=config.rds.database,
+            charset=config.rds.charset,
+            connect_timeout=5,
+            read_timeout=5,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT dept_code FROM user_role "
+                    "WHERE user_id = %s AND is_active = 1 LIMIT 1",
+                    (staff_id,),
+                )
+                row = cur.fetchone()
+                dept = row[0] if row else None
+                if dept:
+                    logger.info("用户部门解析成功: staff_id=%s → dept=%s", staff_id, dept)
+                else:
+                    logger.warning("用户未在 user_role 表中注册: staff_id=%s", staff_id)
+                return dept
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("查询用户部门失败 staff_id=%s: %s", staff_id, e)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -207,6 +255,7 @@ def _process_rag_query(
     session_webhook: str,
     sender_nick: str,
     conversation_id: str,
+    sender_staff_id: str = "",
 ):
     """
     后台线程：执行 RAG 检索 + LLM 生成，通过 sessionWebhook 回复。
@@ -216,8 +265,11 @@ def _process_rag_query(
     t0 = time.time()
 
     try:
-        # 1. 检索
-        chunks = search_chunks(question, top_k=5)
+        # 0. 解析用户部门（用于权限过滤）
+        user_dept = _resolve_user_dept(sender_staff_id) if sender_staff_id else None
+
+        # 1. 检索（带权限过滤）
+        chunks = search_chunks(question, top_k=5, user_dept=user_dept)
 
         if not chunks:
             _send_text_reply(
@@ -296,6 +348,7 @@ async def dingtalk_webhook(request: Request):
     question = _extract_question(body)
     session_webhook = body.get("sessionWebhook", "")
     sender_nick = body.get("senderNick", "用户")
+    sender_staff_id = body.get("senderStaffId", "")
     conversation_id = body.get("conversationId", "")
 
     if not question:
@@ -313,7 +366,7 @@ async def dingtalk_webhook(request: Request):
     # 5. 后台线程处理 RAG 问答
     thread = threading.Thread(
         target=_process_rag_query,
-        args=(question, session_webhook, sender_nick, conversation_id),
+        args=(question, session_webhook, sender_nick, conversation_id, sender_staff_id),
         daemon=True,
     )
     thread.start()
