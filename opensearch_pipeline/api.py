@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream
 from opensearch_pipeline.retriever import search_chunks
+from opensearch_pipeline.dingtalk_bot import router as dingtalk_router
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 钉钉机器人路由
+app.include_router(dingtalk_router)
 
 
 # ═══════════════════════════════════════════════════════════════

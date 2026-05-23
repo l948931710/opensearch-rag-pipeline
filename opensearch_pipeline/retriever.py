@@ -146,6 +146,9 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
             "section_title": fields.get("section_title", ""),
             "doc_id": fields.get("doc_id", ""),
             "category_l1": fields.get("category_l1", ""),
+            "chunk_index": fields.get("chunk_index", 0),
+            "page_num": fields.get("page_num", 0),
+            "kb_type": fields.get("kb_type", "public"),
             "score": item.get("score", item.get("_score", 0)),
         })
     return parsed
@@ -155,10 +158,17 @@ def search_chunks(
     query: str,
     *,
     top_k: int = 5,
+    min_score: float = 0.55,
     output_fields: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     端到端检索：query → embedding → HA3 search → 标准化结果。
+
+    Args:
+        query: 用户查询文本
+        top_k: HA3 返回的最大结果数
+        min_score: 最低相关度阈值，低于此分数的结果会被过滤
+        output_fields: 自定义返回字段列表
 
     Returns:
         [{"chunk_text", "title", "section_title", "doc_id", "score", ...}]
@@ -180,7 +190,8 @@ def search_chunks(
         )
 
     _output_fields = output_fields or [
-        "id", "doc_id", "chunk_text_store", "title", "section_title", "category_l1",
+        "id", "doc_id", "chunk_text_store", "title", "section_title",
+        "category_l1", "chunk_index", "page_num", "kb_type",
     ]
 
     request = QueryRequest(
@@ -197,5 +208,14 @@ def search_chunks(
 
     # 3. 解析结果
     results = _parse_ha3_response(resp)
+
+    # 4. 过滤低相关度结果
+    if min_score > 0:
+        before_count = len(results)
+        results = [r for r in results if r.get("score", 0) >= min_score]
+        filtered = before_count - len(results)
+        if filtered > 0:
+            logger.info("Filtered %d low-score results (min_score=%.2f)", filtered, min_score)
+
     logger.info("Search completed: query=%r, results=%d", query[:50], len(results))
     return results

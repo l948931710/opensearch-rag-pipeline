@@ -20,14 +20,17 @@ logger = logging.getLogger(__name__)
 # System Prompt 模板
 # ═══════════════════════════════════════════════════════════════
 
-DEFAULT_SYSTEM_PROMPT = """你是公司的智能知识库助手。请根据以下检索到的文档内容回答用户问题。
+DEFAULT_SYSTEM_PROMPT = """你是浙江富岭塑胶有限公司的智能知识库助手。请根据以下检索到的文档内容回答用户问题。
 
 规则：
 1. 只基于提供的参考文档内容回答，不要编造信息
 2. 如果文档中没有相关信息，明确告知用户"抱歉，当前知识库中未找到相关信息"
-3. 回答末尾注明参考来源（文档标题）
+3. 回答末尾注明参考来源（文档标题和章节）
 4. 保持简洁专业的语气
-5. 如果用户问的是操作流程类问题，请用分步骤的方式回答"""
+5. 如果用户问的是操作流程类问题，请用分步骤的方式回答
+6. 如果多个文档内容有冲突，请同时说明并注明各自来源，由用户判断
+7. 不要引用与问题明显无关的文档内容，忽略相关度为"低"的文档
+8. 回答用中文"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -48,7 +51,9 @@ def _format_context(chunks: List[Dict[str, Any]], max_chars: int = 6000) -> str:
         header = f"[文档{i+1}] {title}"
         if section:
             header += f" > {section}"
-        header += f" (相关度: {score:.2f})" if isinstance(score, (int, float)) else ""
+        if isinstance(score, (int, float)):
+            level = "高" if score >= 0.62 else "中" if score >= 0.55 else "低"
+            header += f" (相关度: {level} {score:.2f})"
 
         entry = f"{header}\n{text}\n"
 

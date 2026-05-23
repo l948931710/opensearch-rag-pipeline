@@ -1,0 +1,21 @@
+# ═══════════════════════════════════════════════════════════════
+# OpenSearch RAG Pipeline — SAE 代码包部署依赖
+# ═══════════════════════════════════════════════════════════════
+
+# Core
+pypdf>=4.0
+python-docx>=1.0
+openpyxl>=3.1
+requests>=2.31
+
+# API Runtime
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Alibaba Cloud Production
+pymysql>=1.1
+DBUtils>=3.0
+opensearch-py>=2.4
+oss2>=2.18
+dashscope>=1.14
+alibabacloud-ha3engine-vector>=1.1.18
