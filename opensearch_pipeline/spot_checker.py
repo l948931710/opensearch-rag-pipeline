@@ -301,25 +301,54 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                     report["errors"].append(f"RDS quarantine error for {doc_id}: {db_err}")
                     continue  # Skip OpenSearch delete if RDS failed
 
-                # d. 从 OpenSearch 索引中彻底 DELETE 这些 chunks
+                # d. 从搜索索引中彻底 DELETE 这些 chunks
                 try:
                     os_client = _get_opensearch_client()
-                    delete_query = {
-                        "query": {
-                            "bool": {
-                                "must": [
-                                    {"term": {"doc_id": doc_id}},
-                                    {"term": {"version_no": version_no}}
-                                ]
+
+                    if hasattr(os_client, "push_documents"):
+                        # HA3 Engine: 查询 chunk 主键后用 push_documents cmd=delete 删除
+                        ha3_cfg = config.alibaba_vector
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                SELECT id FROM chunk_meta
+                                WHERE doc_id = %s AND version_no = %s
+                            """, (doc_id, version_no))
+                            chunk_rows = cursor.fetchall()
+
+                        if chunk_rows:
+                            from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
+
+                            delete_docs = [
+                                {"cmd": "delete", "fields": {ha3_cfg.pk_field: row[0]}}
+                                for row in chunk_rows
+                            ]
+                            ha3_batch_size = 100
+                            for i in range(0, len(delete_docs), ha3_batch_size):
+                                batch = delete_docs[i:i + ha3_batch_size]
+                                request = PushDocumentsRequest(body=batch)
+                                resp = os_client.push_documents(ha3_cfg.table_name, ha3_cfg.pk_field, request)
+                                print(f"       └─ [HA3] Deleted batch {i//ha3_batch_size + 1} ({len(batch)} chunks). Status: {getattr(resp, 'status_code', 'OK')}")
+                        else:
+                            print(f"       └─ No chunks found in chunk_meta for {doc_id} v{version_no}")
+                    else:
+                        # Standard OpenSearch: delete_by_query
+                        delete_query = {
+                            "query": {
+                                "bool": {
+                                    "must": [
+                                        {"term": {"doc_id": doc_id}},
+                                        {"term": {"version_no": version_no}}
+                                    ]
+                                }
                             }
                         }
-                    }
-                    os_cfg = config.opensearch
-                    delete_resp = os_client.delete_by_query(index=os_cfg.index_name, body=delete_query)
-                    print(f"       └─ Deleted chunks from OpenSearch. Response: {delete_resp}")
+                        os_cfg = config.opensearch
+                        index_name = getattr(os_cfg, "index_name", "fuling_knowledge_v1")
+                        delete_resp = os_client.delete_by_query(index=index_name, body=delete_query)
+                        print(f"       └─ Deleted chunks from OpenSearch index '{index_name}'. Response: {delete_resp}")
                 except Exception as os_err:
-                    print(f"       ⚠️ Failed to delete chunks from OpenSearch for {doc_id}: {os_err}")
-                    report["errors"].append(f"OpenSearch delete error for {doc_id}: {os_err}")
+                    print(f"       ⚠️ Failed to delete chunks from search index for {doc_id}: {os_err}")
+                    report["errors"].append(f"Search index delete error for {doc_id}: {os_err}")
 
                 report["quarantined_documents"].append({
                     "doc_id": doc_id,

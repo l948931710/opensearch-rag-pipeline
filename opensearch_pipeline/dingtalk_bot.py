@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 import time
 from typing import Any, Dict, List, Optional
 
@@ -61,9 +62,8 @@ def _verify_signature(timestamp: str, sign: str) -> bool:
     """
     app_secret = _get_app_secret()
     if not app_secret:
-        # 未配置 AppSecret 时跳过验证（仅用于开发调试）
-        logger.warning("DINGTALK_APP_SECRET 未配置，跳过签名验证")
-        return True
+        logger.error("DINGTALK_APP_SECRET 未配置，拒绝请求（生产环境必须配置此密钥）")
+        return False
 
     # 校验时间戳防重放
     try:
@@ -248,13 +248,14 @@ def _process_rag_query(
         _send_reply(session_webhook, f"回答：{question[:20]}", md_text)
 
     except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
         logger.error(
-            "RAG 处理失败: question=%s, error=%s",
-            question, e, exc_info=True,
+            "RAG 处理失败 [trace=%s]: question=%s, error=%s",
+            trace_id, question, e, exc_info=True,
         )
         _send_text_reply(
             session_webhook,
-            f"❌ 处理您的问题时出错，请稍后重试。\n错误信息：{str(e)[:200]}",
+            f"❌ 处理您的问题时出错，请稍后重试。(trace: {trace_id})",
         )
 
 
@@ -274,7 +275,7 @@ async def dingtalk_webhook(request: Request):
     timestamp = request.headers.get("timestamp", "")
     sign = request.headers.get("sign", "")
 
-    if _get_app_secret() and not _verify_signature(timestamp, sign):
+    if not _verify_signature(timestamp, sign):
         logger.warning("钉钉签名验证失败: timestamp=%s", timestamp)
         raise HTTPException(status_code=403, detail="签名验证失败")
 

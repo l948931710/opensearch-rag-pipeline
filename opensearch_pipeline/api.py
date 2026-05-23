@@ -10,6 +10,7 @@ api.py — RAG 问答 FastAPI 应用
 """
 
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -35,14 +36,28 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# CORS — 开发阶段允许所有来源
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS — 通过环境变量 CORS_ALLOWED_ORIGINS 配置允许的来源（逗号分隔）
+# 生产环境示例: CORS_ALLOWED_ORIGINS=https://kb.fuling.com,https://admin.fuling.com
+# 未配置时默认允许所有来源但禁用 credentials（安全的开发默认值）
+_cors_origins_raw = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
+if _cors_origins_raw:
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # 本地开发：允许所有来源但不允许 credentials，避免 Starlette Origin 反射漏洞
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # 钉钉机器人路由
 app.include_router(dingtalk_router)
@@ -103,37 +118,72 @@ class SearchResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 内存会话存储（测试用，生产应替换为 Redis）
+# 内存会话存储（LRU 淘汰，防止无限增长导致 OOM）
+# 生产环境建议替换为 Redis
 # ═══════════════════════════════════════════════════════════════
 
-_sessions: Dict[str, List[Dict[str, str]]] = {}
+from collections import OrderedDict
 
 MAX_HISTORY_TURNS = 10  # 保留最近 N 轮对话
+MAX_SESSIONS = int(os.environ.get("RAG_MAX_SESSIONS", "500"))
+
+
+class _LRUSessionStore:
+    """简易 LRU 会话缓存，超出上限时淘汰最久未使用的会话。"""
+
+    def __init__(self, maxsize: int = MAX_SESSIONS):
+        self._store: OrderedDict[str, List[Dict[str, str]]] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, key: str) -> Optional[List[Dict[str, str]]]:
+        if key in self._store:
+            self._store.move_to_end(key)
+            return self._store[key]
+        return None
+
+    def create(self, key: str) -> List[Dict[str, str]]:
+        """创建新会话，必要时淘汰最旧的会话。"""
+        self._store[key] = []
+        self._store.move_to_end(key)
+        while len(self._store) > self._maxsize:
+            evicted_key, _ = self._store.popitem(last=False)
+            logger.debug("Session evicted (LRU): %s", evicted_key)
+        return self._store[key]
+
+    def set(self, key: str, value: List[Dict[str, str]]):
+        self._store[key] = value
+        self._store.move_to_end(key)
+        while len(self._store) > self._maxsize:
+            self._store.popitem(last=False)
+
+
+_sessions = _LRUSessionStore()
 
 
 def _get_or_create_session(session_id: Optional[str]) -> tuple[str, List[Dict[str, str]]]:
     """获取或创建会话，返回 (session_id, history)。"""
-    if session_id and session_id in _sessions:
-        return session_id, _sessions[session_id]
+    if session_id:
+        existing = _sessions.get(session_id)
+        if existing is not None:
+            return session_id, existing
 
     sid = session_id or str(uuid.uuid4())
-    _sessions[sid] = []
-    return sid, _sessions[sid]
+    return sid, _sessions.create(sid)
 
 
 def _append_to_history(session_id: str, user_msg: str, assistant_msg: str):
     """将当前轮对话追加到会话历史。"""
-    if session_id not in _sessions:
-        _sessions[session_id] = []
+    history = _sessions.get(session_id)
+    if history is None:
+        history = _sessions.create(session_id)
 
-    history = _sessions[session_id]
     history.append({"role": "user", "content": user_msg})
     history.append({"role": "assistant", "content": assistant_msg})
 
     # 裁剪超出的轮数（保留最近 N 轮 = 2N 条消息）
     max_messages = MAX_HISTORY_TURNS * 2
     if len(history) > max_messages:
-        _sessions[session_id] = history[-max_messages:]
+        _sessions.set(session_id, history[-max_messages:])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -153,8 +203,9 @@ async def search(req: SearchRequest):
     try:
         results = search_chunks(req.query, top_k=req.top_k)
     except Exception as e:
-        logger.error("Search failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"检索失败: {e}")
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
 
     latency = int((time.time() - t0) * 1000)
     return SearchResponse(
@@ -182,8 +233,9 @@ async def ask(req: AskRequest):
     try:
         chunks = search_chunks(req.question, top_k=req.top_k)
     except Exception as e:
-        logger.error("Search failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"检索失败: {e}")
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
 
     if not chunks:
         latency = int((time.time() - t0) * 1000)
@@ -206,8 +258,9 @@ async def ask(req: AskRequest):
             temperature=req.temperature or 0.1,
         )
     except Exception as e:
-        logger.error("LLM generation failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"回答生成失败: {e}")
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("LLM generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"回答生成失败，请联系管理员 (trace: {trace_id})")
 
     # 4. 更新会话历史
     _append_to_history(session_id, req.question, result["answer"])
@@ -285,8 +338,9 @@ async def ask_stream(req: AskRequest):
                     except (json.JSONDecodeError, KeyError):
                         pass
         except Exception as e:
-            logger.error("Stream generation failed: %s", e, exc_info=True)
-            error_msg = json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+            trace_id = uuid.uuid4().hex[:8]
+            logger.error("Stream generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
+            error_msg = json.dumps({"type": "error", "message": f"回答生成失败，请联系管理员 (trace: {trace_id})"}, ensure_ascii=False)
             yield f"data: {error_msg}\n\n"
             yield "data: [DONE]\n\n"
             return
