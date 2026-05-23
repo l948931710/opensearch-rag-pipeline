@@ -380,6 +380,98 @@ LARGE_EVAL_QUERIES = [
         "category": "policy",
         "old_keywords": ["电话", "电子邮件", "书信"],
         "required_keyword_groups": [["电话"], ["电子邮件"], ["书信", "来访"]]
+    },
+    # ─── FAQ 补充 Query (平衡样本分布 3→7) ───
+    {
+        "id": "Q38",
+        "old_query": "钉钉密码忘了怎么重置？",
+        "new_query": "钉钉密码忘记了应该怎么重置？",
+        "target_doc": "eval_it_faq",
+        "category": "faq",
+        "old_keywords": ["钉钉", "密码", "重置"],
+        "required_keyword_groups": [["钉钉"], ["密码", "重置"]]
+    },
+    {
+        "id": "Q39",
+        "old_query": "电脑蓝屏了找谁修？",
+        "new_query": "电脑蓝屏或者坏了应该找谁处理？",
+        "target_doc": "eval_company_faq",
+        "category": "faq",
+        "old_keywords": ["蓝屏", "系统管理员", "IT"],
+        "required_keyword_groups": [["蓝屏", "坏了"], ["系统管理员", "IT", "8088"]]
+    },
+    {
+        "id": "Q40",
+        "old_query": "宿舍热水什么时间段供应？",
+        "new_query": "宿舍热水供应是几点到几点？",
+        "target_doc": "eval_company_faq",
+        "category": "faq",
+        "old_keywords": ["热水", "供应时间"],
+        "required_keyword_groups": [["热水"], ["供应", "时间段", "时间"]]
+    },
+    {
+        "id": "Q41",
+        "old_query": "储物柜钥匙丢了怎么办？",
+        "new_query": "忘带储物柜钥匙了怎么向车间主任借备用钥匙？",
+        "target_doc": "eval_company_faq",
+        "category": "faq",
+        "old_keywords": ["储物柜", "备用钥匙", "遗失"],
+        "required_keyword_groups": [["储物柜", "钥匙"], ["备用钥匙", "车间主任", "借用"]]
+    },
+    # ─── SOP 补充 Query (平衡样本分布 2→7) ───
+    {
+        "id": "Q42",
+        "old_query": "进车间必须戴什么？头发要怎么处理？",
+        "new_query": "所有人员进入车间必须佩戴什么？头发刘海要怎么处理？",
+        "target_doc": "eval_prod_newcomer",
+        "category": "sop",
+        "old_keywords": ["发帽", "刘海", "盘在帽子里"],
+        "required_keyword_groups": [["发帽"], ["刘海", "头发"], ["盘在帽子里", "不外漏"]]
+    },
+    {
+        "id": "Q43",
+        "old_query": "车间里能带手机吗？",
+        "new_query": "车间里面可以带手机或者拍照吗？",
+        "target_doc": "eval_prod_newcomer",
+        "category": "sop",
+        "old_keywords": ["严禁", "手机", "电子设备", "拍照"],
+        "required_keyword_groups": [["严禁", "禁止"], ["手机", "电子设备"], ["拍照", "拍视频"]]
+    },
+    {
+        "id": "Q44",
+        "old_query": "酒后上班怎么处理？",
+        "new_query": "喝了酒还来车间上班会怎么处理？",
+        "target_doc": "eval_prod_newcomer",
+        "category": "sop",
+        "old_keywords": ["酒后", "劝其下班", "上报"],
+        "required_keyword_groups": [["酒后"], ["劝其下班", "下班"], ["车间主任", "上报"]]
+    },
+    {
+        "id": "Q45",
+        "old_query": "储物柜能存放食物或者危险品吗？",
+        "new_query": "员工储物柜里面可以放食物、饮料或者危险品吗？",
+        "target_doc": "eval_prod_locker",
+        "category": "sop",
+        "old_keywords": ["储物柜", "食物", "危险品"],
+        "required_keyword_groups": [["储物柜"], ["不准存放食物", "不准", "食物"], ["危险品"]]
+    },
+    {
+        "id": "Q46",
+        "old_query": "注塑机开班前要测试什么按钮？",
+        "new_query": "注塑机每班开班前操作工必须测试什么按钮？测试时间不低于几秒？",
+        "target_doc": "eval_prod_injection",
+        "category": "sop",
+        "old_keywords": ["紧急停止按钮", "3秒", "测试"],
+        "required_keyword_groups": [["紧急停止按钮", "紧急停止"], ["3秒"]]
+    },
+    {
+        "id": "Q47",
+        "old_query": "注塑机温度异常怎么办？",
+        "new_query": "注塑机运行中如果温度异常升高或螺杆发出异响，操作工应该怎么处理？",
+        "target_doc": "eval_prod_injection",
+        "category": "sop",
+        "old_keywords": ["温度异常", "紧急停止", "螺杆"],
+        "required_keyword_groups": [["温度异常", "异常升高"], ["紧急停止按钮", "红色"], ["班长", "设备维修员"]]
     }
 ]
 
@@ -687,6 +779,12 @@ def evaluate_retrieval_large_hybrid(
                 doc_filter = "eval_prod_naichabei"
             elif any(w in query_text for w in ["纸吸管", "耐热", "耐高温"]):
                 doc_filter = "eval_prod_xiguan_receshi"
+            elif any(w in query_text for w in ["发帽", "手机", "拍照", "酒后", "车间上班", "进入车间"]):
+                doc_filter = "eval_prod_newcomer"
+            elif any(w in query_text for w in ["储物柜", "更衣室"]):
+                doc_filter = "eval_prod_locker"
+            elif any(w in query_text for w in ["注塑机", "螺杆", "润滑油", "液压油"]):
+                doc_filter = "eval_prod_injection"
         elif dept_filter == "hr":
             if any(w in query_text for w in ["请假", "考勤", "旷工", "缺勤"]):
                 doc_filter = "eval_hr_attendance"
@@ -884,6 +982,14 @@ def evaluate_retrieval_large_hybrid(
         new_r10 = 1 if 0 < new_hit_rank <= 10 else 0
         new_mrr = 1.0 / new_hit_rank if new_hit_rank > 0 else 0.0
 
+        # Top-5 pollution: count how many of top 5 are from wrong documents
+        top5_wrong = 0
+        top5_total = min(5, len(new_hits))
+        for t5_i in range(top5_total):
+            if new_hits[t5_i].get("doc_id", "") != q_info["target_doc"]:
+                top5_wrong += 1
+        top5_pollution = top5_wrong / max(top5_total, 1)
+
         eval_results.append({
             "query_id": q_info["id"],
             "query": q_info["new_query"],
@@ -898,6 +1004,7 @@ def evaluate_retrieval_large_hybrid(
             "baseline_regr": 0,
             "faq_regr": 0,
             "context_pollution": 0,
+            "top5_pollution": top5_pollution,
             "top_1_preview": new_hits[0]["chunk_text"][:80].replace("\n", "") if new_hits else "",
             "top_1_score": new_hits[0]["_score"] if new_hits else 0.0,
             "top_1_doc_id": new_hits[0].get("doc_id", "") if new_hits else ""
@@ -949,6 +1056,10 @@ def main():
         {"doc_id": "eval_hr_attendance", "local_path": os.path.join(chunk_exp_dir, "hr_FL-HR-005《员工考勤与请休假管理规定》.docx"), "category": "policy"},
         {"doc_id": "eval_admin_dormitory", "local_path": os.path.join(chunk_exp_dir, "admin_宿舍管理制度.docx"), "category": "policy"},
         {"doc_id": "eval_hr_safety_report", "local_path": os.path.join(chunk_exp_dir, "hr_A09安全隐患报告和举报奖励制度.docx"), "category": "policy"},
+        # ─── SOP 补充文档 ───
+        {"doc_id": "eval_prod_newcomer", "local_path": os.path.join(chunk_exp_dir, "production_注塑事业部_新进员工告知书.docx"), "category": "sop"},
+        {"doc_id": "eval_prod_locker", "local_path": os.path.join(chunk_exp_dir, "production_注塑事业部_更衣室使用规范.docx"), "category": "sop"},
+        {"doc_id": "eval_prod_injection", "local_path": os.path.join(chunk_exp_dir, "production_注塑事业部_FL-ZS-WI-015《注塑机日常保养规范》.docx"), "category": "sop"},
     ]
 
     all_sweep_results = []
@@ -1104,7 +1215,18 @@ def main():
 
     # Generate Markdown Report
     # Sort by MRR descending to find champion
-    all_sweep_results.sort(key=lambda x: (x["mrr"], x["r1"]), reverse=True)
+    # Compute macro-average MRR (equal weight per category) and top5 pollution for each sweep
+    categories = ["manual", "sop", "faq", "policy"]
+    for s in all_sweep_results:
+        cat_mrrs = []
+        for cat in categories:
+            cat_results = [r for r in s["results"] if r.get("category") == cat]
+            if cat_results:
+                cat_mrrs.append(sum(r["new_mrr"] for r in cat_results) / len(cat_results))
+        s["macro_mrr"] = sum(cat_mrrs) / len(cat_mrrs) if cat_mrrs else 0.0
+        s["avg_top5_pollution"] = sum(r.get("top5_pollution", 0) for r in s["results"]) / len(s["results"]) if s["results"] else 0.0
+
+    all_sweep_results.sort(key=lambda x: (x["macro_mrr"], x["mrr"], x["r1"]), reverse=True)
     champion = all_sweep_results[0]
     
     report_lines = [
@@ -1115,48 +1237,74 @@ def main():
         "This report compares **text-mode (baseline)** vs **clause-mode** chunking for policy/regulation documents,",
         "alongside manual/SOP/FAQ chunk size tuning, using offline hybrid BM25+Vector search with query decomposition.",
         "",
+        f"**Sample Distribution:** Manual={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='manual')}, "
+        f"SOP={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='sop')}, "
+        f"FAQ={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='faq')}, "
+        f"Policy={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='policy')} "
+        f"(Total={len(LARGE_EVAL_QUERIES)})",
+        "",
         "## 1. Overall Sweep Summary",
         "",
-        "| # | Configuration | Split Mode (Policy) | Total Chunks | Strict R@1 | Strict R@5 | Strict MRR | Cross-Doc Confusion |",
-        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |"
+        "| # | Configuration | Policy Mode | Chunks | Micro R@1 | Micro MRR | **Macro MRR** | Avg Top5 Pollution | Cross-Doc |",
+        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     ]
     
     for i, s in enumerate(all_sweep_results):
         policy_mode = "clause" if s.get("clause_mode_active") else "text"
         marker = " 🏆" if i == 0 else ""
         report_lines.append(
-            f"| {i+1} | **{s['name']}**{marker} | `{policy_mode}` | {s['total_chunks']} | **{s['r1']:.2%}** | **{s['r5']:.2%}** | **{s['mrr']:.4f}** | {s['cross_conf']:.2%} |"
+            f"| {i+1} | **{s['name']}**{marker} | `{policy_mode}` | {s['total_chunks']} "
+            f"| {s['r1']:.2%} | {s['mrr']:.4f} | **{s['macro_mrr']:.4f}** "
+            f"| {s['avg_top5_pollution']:.2%} | {s['cross_conf']:.2%} |"
         )
     
-    # Per-category breakdown for champion
+    # Per-category breakdown for ALL sweep configs (cross-comparison table)
     def calc_cat(results, cat):
         cat_results = [r for r in results if r.get("category") == cat]
         if not cat_results:
-            return 0, 0.0, 0.0, 0.0
+            return 0, 0.0, 0.0, 0.0, 0.0
         r1 = sum(r["new_r1"] for r in cat_results) / len(cat_results)
         r5 = sum(r["new_r5"] for r in cat_results) / len(cat_results)
         mrr = sum(r["new_mrr"] for r in cat_results) / len(cat_results)
-        return len(cat_results), r1, r5, mrr
+        t5p = sum(r.get("top5_pollution", 0) for r in cat_results) / len(cat_results)
+        return len(cat_results), r1, r5, mrr, t5p
 
     report_lines.extend([
         "",
         f"## 2. Category Breakdown (Champion: {champion['name']})",
         "",
-        "| Category | Query Count | Strict R@1 | Strict R@5 | Strict MRR |",
-        "| :--- | :---: | :---: | :---: | :---: |"
+        "| Category | Count | R@1 | R@5 | MRR | Top5 Pollution |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: |"
     ])
     
     for cat_name, cat_key in [("Manual (操作手册)", "manual"), ("SOP (员工手册)", "sop"), ("FAQ (常见问题)", "faq"), ("Policy (管理制度)", "policy")]:
-        n, r1, r5, mrr = calc_cat(champion["results"], cat_key)
-        report_lines.append(f"| **{cat_name}** | {n} | {r1:.2%} | {r5:.2%} | {mrr:.4f} |")
+        n, r1, r5, mrr, t5p = calc_cat(champion["results"], cat_key)
+        report_lines.append(f"| **{cat_name}** | {n} | {r1:.2%} | {r5:.2%} | {mrr:.4f} | {t5p:.2%} |")
+    
+    # Cross-config per-category MRR comparison
+    report_lines.extend([
+        "",
+        "## 2b. Per-Category MRR Across All Configs",
+        "",
+    ])
+    cat_header = "| Configuration |" + " | ".join([f"{c} MRR" for c in ["Manual", "SOP", "FAQ", "Policy"]]) + " | Macro MRR |"
+    cat_sep = "| :--- |" + " | ".join([":---:" for _ in range(5)]) + " |"
+    report_lines.extend([cat_header, cat_sep])
+    for s in all_sweep_results:
+        row = f"| **{s['name']}** |"
+        for cat_key in categories:
+            _, _, _, cat_mrr, _ = calc_cat(s["results"], cat_key)
+            row += f" {cat_mrr:.4f} |"
+        row += f" **{s['macro_mrr']:.4f}** |"
+        report_lines.append(row)
     
     # Detailed query results for champion
     report_lines.extend([
         "",
         f"## 3. Detailed Query Results (Champion: {champion['name']})",
         "",
-        "| Query ID | Category | Business Query | Target Document | Rank | Status | Top-1 Score | Top-1 Preview |",
-        "| :---: | :---: | :--- | :--- | :---: | :---: | :---: | :--- |"
+        "| Query ID | Category | Business Query | Target Document | Rank | Status | Top-1 Score | Top5 Pollution | Top-1 Preview |",
+        "| :---: | :---: | :--- | :--- | :---: | :---: | :---: | :---: | :--- |"
     ])
     
     for r in champion["results"]:
@@ -1164,8 +1312,9 @@ def main():
         rank_str = f"#{r['new_rank']}" if r["new_rank"] > 0 else "❌"
         preview = r["top_1_preview"][:50].replace("|", "\\|") + "..."
         cat = r.get("category", "unknown")
+        t5p_str = f"{r.get('top5_pollution', 0):.0%}"
         report_lines.append(
-            f"| **{r['query_id']}** | `{cat}` | {r['query']} | `{r['target_doc']}` | {rank_str} | {status} | {r['top_1_score']:.4f} | {preview} |"
+            f"| **{r['query_id']}** | `{cat}` | {r['query']} | `{r['target_doc']}` | {rank_str} | {status} | {r['top_1_score']:.4f} | {t5p_str} | {preview} |"
         )
         
     report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hybrid_sweep_report.md")
