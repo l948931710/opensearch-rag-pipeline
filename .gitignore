@@ -16,3 +16,10 @@ fuling_chunk_exp/
 scratch/
 recovered_pipeline_nodes.py
 
+# Generated reports & assets
+work_report*.md
+work_report*.svg
+工作汇报.pdf
+convert_report.js
+node_modules/
+.DS_Store
