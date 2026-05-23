@@ -494,40 +494,56 @@ def save_embedding_cache(cache: Dict[str, List[float]]):
     except Exception as e:
         print(f"Failed to save embedding cache: {e}")
 
-def _call_embedding(batch: List[str], api_key: str, model: str, base_url: str, dim: int) -> List[List[float]]:
+def _call_embedding(batch: List[str], api_key: str, model: str, base_url: str, dim: int) -> tuple:
+    """Call embedding API. Returns (dense_list, sparse_list).
+    dense_list: List[List[float]] — one dense vector per input text.
+    sparse_list: List[Dict] — one {indices: [...], values: [...]} per input text.
+    For non-DashScope (Gemini), sparse_list entries are empty dicts.
+    """
     import requests
     is_dashscope = "dashscope.aliyuncs.com" in base_url or "qwen" in model.lower() or "text-embedding" in model.lower()
     if is_dashscope:
-        # config.embedding.api_base_url is just the domain: https://dashscope.aliyuncs.com
-        # The OpenAI-compatible embedding endpoint is /compatible-mode/v1/embeddings
-        stripped = base_url.rstrip("/")
-        if "/compatible-mode" in stripped or "/api/v1" in stripped:
-            url = f"{stripped}/embeddings"
-        else:
-            url = f"{stripped}/compatible-mode/v1/embeddings"
+        # 使用原生 DashScope API (和 pipeline_nodes.py 完全一致)
+        url = f"{base_url.rstrip('/')}/api/v1/services/embeddings/text-embedding/text-embedding"
         payload = {
             "model": model,
-            "input": batch,
-            "dimensions": dim
+            "input": {"texts": batch},
+            "parameters": {
+                "dimension": dim,
+                "output_type": "dense&sparse"
+            }
         }
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
         try:
-            resp = requests.post(url, json=payload, headers=headers)
+            resp = requests.post(url, json=payload, headers=headers, timeout=60)
             resp.raise_for_status()
             data = resp.json()
-            embeddings_data = data.get("data", [])
-            sorted_embs = [None] * len(batch)
+            # 原生 API 返回: {output: {embeddings: [{embedding, sparse_embedding, text_index}, ...]}}
+            embeddings_data = data.get("output", {}).get("embeddings", [])
+            sorted_dense = [None] * len(batch)
+            sorted_sparse = [None] * len(batch)
             for idx, item in enumerate(embeddings_data):
-                item_idx = item.get("index", idx)
+                item_idx = item.get("text_index", idx)
                 if item_idx < len(batch):
-                    sorted_embs[item_idx] = item["embedding"]
-            return [e if e is not None else [0.0] * dim for e in sorted_embs]
+                    sorted_dense[item_idx] = item["embedding"]
+                    sparse_list = item.get("sparse_embedding", [])
+                    if sparse_list:
+                        sorted_items = sorted(sparse_list, key=lambda x: x["index"])
+                        sorted_sparse[item_idx] = {
+                            "indices": [s["index"] for s in sorted_items],
+                            "values": [float(s["value"]) for s in sorted_items]
+                        }
+                    else:
+                        sorted_sparse[item_idx] = {"indices": [0], "values": [0.001]}
+            dense_out = [e if e is not None else [0.0] * dim for e in sorted_dense]
+            sparse_out = [s if s is not None else {"indices": [], "values": []} for s in sorted_sparse]
+            return dense_out, sparse_out
         except Exception as e:
-            print(f"    ⚠️ DashScope Embedding API Error: {e}")
-            return []
+            print(f"    ⚠️ DashScope Native Embedding API Error: {e}")
+            return [], []
     else:
         url = f"{base_url}/models/{model}:batchEmbedContents?key={api_key}"
         payload = {
@@ -538,13 +554,17 @@ def _call_embedding(batch: List[str], api_key: str, model: str, base_url: str, d
             resp.raise_for_status()
             data = resp.json()
             embeddings = data.get("embeddings", [])
-            return [item["values"] for item in embeddings]
+            dense_out = [item["values"] for item in embeddings]
+            sparse_out = [{"indices": [], "values": []} for _ in dense_out]
+            return dense_out, sparse_out
         except Exception as e:
             print(f"    ⚠️ Gemini API Error: {e}")
-            return []
+            return [], []
 
-def get_cached_embeddings(texts: List[str], cache: Dict[str, List[float]], config) -> List[List[float]]:
-    results = []
+def get_cached_embeddings(texts: List[str], cache: Dict[str, Any], config) -> tuple:
+    """Returns (dense_list, sparse_list). Caches dense under md5(model_text), sparse under 'sp_'+md5."""
+    dense_results = []
+    sparse_results = []
     missing_texts = []
     missing_indices = []
 
@@ -552,8 +572,10 @@ def get_cached_embeddings(texts: List[str], cache: Dict[str, List[float]], confi
     for idx, text in enumerate(texts):
         # Prevent cross-model cache corruption by prefixing model name in md5 hash
         h = hashlib.md5(f"{model}_{text}".encode("utf-8")).hexdigest()
+        sp_h = f"sp_{h}"
         if h in cache:
-            results.append((idx, cache[h]))
+            dense_results.append((idx, cache[h]))
+            sparse_results.append((idx, cache.get(sp_h, {"indices": [], "values": []})))
         else:
             missing_texts.append(text)
             missing_indices.append(idx)
@@ -566,35 +588,43 @@ def get_cached_embeddings(texts: List[str], cache: Dict[str, List[float]], confi
         
         is_dashscope = "dashscope.aliyuncs.com" in base_url or "qwen" in model.lower() or "text-embedding" in model.lower()
         if is_dashscope:
-            print(f"      Calling DashScope Embedding API for {len(missing_texts)} missing chunks...")
+            print(f"      Calling DashScope Native API for {len(missing_texts)} missing chunks (dense+sparse)...")
         else:
             print(f"      Calling Gemini Embedding API for {len(missing_texts)} missing chunks...")
 
-        fetched_embs = []
+        fetched_dense = []
+        fetched_sparse = []
         for i in range(0, len(missing_texts), batch_size):
             batch = missing_texts[i:i+batch_size]
-            embs = _call_embedding(batch, api_key, model, base_url, dim)
-            if not embs:
+            dense_batch, sparse_batch = _call_embedding(batch, api_key, model, base_url, dim)
+            if not dense_batch:
                 # Fallback: SHA-256 fake vector
+                dense_batch = []
+                sparse_batch = []
                 for text_item in batch:
                     h_item = hashlib.sha256(text_item.encode()).hexdigest()
                     fake_vector = [(int(h_item[j * 2 : j * 2 + 2], 16) - 128) / 128.0 for j in range(min(dim, 32))]
                     if len(fake_vector) < dim:
                         fake_vector.extend([0.0] * (dim - len(fake_vector)))
-                    embs.append(fake_vector)
-            fetched_embs.extend(embs)
+                    dense_batch.append(fake_vector)
+                    sparse_batch.append({"indices": [], "values": []})
+            fetched_dense.extend(dense_batch)
+            fetched_sparse.extend(sparse_batch)
 
-        for text_item, emb in zip(missing_texts, fetched_embs):
+        for text_item, emb, sp in zip(missing_texts, fetched_dense, fetched_sparse):
             h_key = hashlib.md5(f"{model}_{text_item}".encode("utf-8")).hexdigest()
             cache[h_key] = emb
+            cache[f"sp_{h_key}"] = sp
             
         save_embedding_cache(cache)
 
-        for orig_idx, emb in zip(missing_indices, fetched_embs):
-            results.append((orig_idx, emb))
+        for orig_idx, emb, sp in zip(missing_indices, fetched_dense, fetched_sparse):
+            dense_results.append((orig_idx, emb))
+            sparse_results.append((orig_idx, sp))
 
-    results.sort(key=lambda x: x[0])
-    return [r[1] for r in results]
+    dense_results.sort(key=lambda x: x[0])
+    sparse_results.sort(key=lambda x: x[0])
+    return [r[1] for r in dense_results], [r[1] for r in sparse_results]
 
 def normalize_text(text: str) -> str:
     out = []
@@ -696,6 +726,7 @@ def evaluate_retrieval_large_hybrid(
     chunks: List[Dict[str, Any]], 
     old_query_vectors: List[List[float]], 
     new_query_vectors: List[List[float]],
+    new_query_sparse: List[Dict] = None,
     baseline_ranks: Dict[str, int] = None
 ) -> List[Dict[str, Any]]:
     eval_results = []
@@ -829,13 +860,33 @@ def evaluate_retrieval_large_hybrid(
         sub_queries = list(set(expanded_sub_queries))
 
         # ─── 2. Search & Score computation ───
-        # A. Vector Scores (Cosine Similarity on Raw Query)
+        # A. Dense Vector Scores (Cosine Similarity)
         filt_chunk_vectors = np.array([c["chunk_vector"] for c in search_pool])
         norms = np.linalg.norm(filt_chunk_vectors, axis=1)
         norms[norms == 0] = 1e-10
         norm_chunk_vectors = filt_chunk_vectors / norms[:, np.newaxis]
         norm_query_vec = new_vec / np.linalg.norm(new_vec)
         vector_scores = np.dot(norm_chunk_vectors, norm_query_vec)
+
+        # A2. Sparse Vector Scores (Dot-product on sparse indices)
+        q_sparse = new_query_sparse[idx] if new_query_sparse and idx < len(new_query_sparse) else None
+        has_sparse = q_sparse and q_sparse.get("indices")
+        if has_sparse:
+            q_sp_idx = q_sparse["indices"]
+            q_sp_val = q_sparse["values"]
+            q_sp_map = dict(zip(q_sp_idx, q_sp_val))
+            sparse_scores = np.zeros(len(search_pool))
+            for ci, c in enumerate(search_pool):
+                c_sp = c.get("sparse_vector", {})
+                c_sp_idx = c_sp.get("indices", [])
+                c_sp_val = c_sp.get("values", [])
+                dot = 0.0
+                for si, sv in zip(c_sp_idx, c_sp_val):
+                    if si in q_sp_map:
+                        dot += sv * q_sp_map[si]
+                sparse_scores[ci] = dot
+        else:
+            sparse_scores = np.zeros(len(search_pool))
 
         # B. BM25 Scores (Maximum BM25 across decomposed sub-queries)
         max_bm25_scores = np.zeros(len(search_pool))
@@ -852,9 +903,13 @@ def evaluate_retrieval_large_hybrid(
             
         norm_vector = normalize(vector_scores)
         norm_bm25 = normalize(max_bm25_scores)
+        norm_sparse = normalize(sparse_scores) if has_sparse else np.zeros_like(norm_vector)
         
-        # Hybrid Fusion
-        hybrid_scores = 0.7 * norm_vector + 0.3 * norm_bm25
+        # Hybrid Fusion: dense + sparse + BM25
+        if has_sparse:
+            hybrid_scores = 0.50 * norm_vector + 0.20 * norm_sparse + 0.30 * norm_bm25
+        else:
+            hybrid_scores = 0.70 * norm_vector + 0.30 * norm_bm25
 
         # ─── 3. Soft Filter Discounting ───
         final_scores = np.zeros(len(search_pool))
@@ -1014,16 +1069,32 @@ def evaluate_retrieval_large_hybrid(
 
 
 def main():
+    import sys
     from opensearch_pipeline.config import get_config
     config = get_config()
     config.simulate = False
+    
+    refresh_sparse = "--refresh-sparse" in sys.argv
+    
     print(">>> Generating / Loading Embeddings for Queries")
     old_queries_text = [q["old_query"] for q in LARGE_EVAL_QUERIES]
     new_queries_text = [q["new_query"] for q in LARGE_EVAL_QUERIES]
     
     emb_cache = load_embedding_cache()
-    old_query_vectors = get_cached_embeddings(old_queries_text, emb_cache, config)
-    new_query_vectors = get_cached_embeddings(new_queries_text, emb_cache, config)
+    
+    if refresh_sparse:
+        # Purge entries without sparse counterpart to force re-fetch via native API
+        dense_keys = [k for k in emb_cache if not k.startswith("sp_")]
+        purged = 0
+        for dk in dense_keys:
+            if f"sp_{dk}" not in emb_cache:
+                del emb_cache[dk]
+                purged += 1
+        if purged:
+            print(f"    🔄 Purged {purged} dense-only cache entries (no sparse). Will re-fetch via native API.")
+            save_embedding_cache(emb_cache)
+    old_query_vectors, old_query_sparse = get_cached_embeddings(old_queries_text, emb_cache, config)
+    new_query_vectors, new_query_sparse = get_cached_embeddings(new_queries_text, emb_cache, config)
     
     print("\n=======================================================")
     print("   Starting Hybrid Sweep Evaluation (Offline)")
@@ -1168,7 +1239,7 @@ def main():
             chunks = chunker.chunk_from_blocks(blocks=blocks, doc_id=task["doc_id"], version_no=1, metadata=metadata)
             
             texts_to_embed = [c.chunk_text for c in chunks]
-            vectors = get_cached_embeddings(texts_to_embed, emb_cache, config)
+            vectors, sparse_vecs = get_cached_embeddings(texts_to_embed, emb_cache, config)
             
             for i, c in enumerate(chunks):
                 c_dict = {
@@ -1182,6 +1253,7 @@ def main():
                     "raw_text": c.raw_text,
                     "context_prefix": c.context_prefix,
                     "chunk_vector": vectors[i],
+                    "sparse_vector": sparse_vecs[i] if i < len(sparse_vecs) else {"indices": [], "values": []},
                     "extra": getattr(c, "extra", {})
                 }
                 all_chunks.append(c_dict)
@@ -1190,7 +1262,7 @@ def main():
         save_embedding_cache(emb_cache)
         
         # Evaluate
-        results = evaluate_retrieval_large_hybrid(all_chunks, old_query_vectors, new_query_vectors)
+        results = evaluate_retrieval_large_hybrid(all_chunks, old_query_vectors, new_query_vectors, new_query_sparse)
         
         # Calc metrics
         total = len(results)
