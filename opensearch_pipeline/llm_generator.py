@@ -52,7 +52,8 @@ def _format_context(chunks: List[Dict[str, Any]], max_chars: int = 6000) -> str:
         if section:
             header += f" > {section}"
         if isinstance(score, (int, float)):
-            level = "高" if score >= 0.62 else "中" if score >= 0.55 else "低"
+            # HA3 距离分数：越小越相关
+            level = "高" if score <= 4.5 else "中" if score <= 5.0 else "低"
             header += f" (相关度: {level} {score:.2f})"
 
         entry = f"{header}\n{text}\n"

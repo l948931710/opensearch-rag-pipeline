@@ -28,10 +28,10 @@ def get_query_embedding(
     dimension: Optional[int] = None,
 ) -> Tuple[List[float], List[int], List[float]]:
     """
-    调用 DashScope compatible-mode 获取 query 的 dense + sparse embedding。
+    调用 DashScope **native API** 获取 query 的 dense + sparse embedding。
 
-    compatible-mode 对查询场景足够（单条文本，已验证可返回 sparse）。
-    与 pipeline_nodes.py 中批量导入使用 native API 的选择互不冲突。
+    必须使用 native API 而非 compatible-mode，因为 compatible-mode 不返回 sparse embedding，
+    会导致混合检索（dense + sparse）退化为纯 dense 检索，严重影响召回质量。
 
     Returns:
         (dense_vector, sparse_indices, sparse_values)
@@ -45,21 +45,23 @@ def get_query_embedding(
     if not _api_key:
         raise RuntimeError("DashScope API Key 未配置，无法生成 embedding")
 
-    # DashScope compatible-mode endpoint
+    # DashScope native API endpoint（唯一支持 sparse 的端点）
     base_url = config.embedding.api_base_url.rstrip("/")
-    url = f"{base_url}/compatible-mode/v1/embeddings"
+    url = f"{base_url}/api/v1/services/embeddings/text-embedding/text-embedding"
 
-    # 如果 base_url 已经包含 compatible-mode，则不再拼接
-    if "compatible-mode" in base_url:
-        url = f"{base_url}/embeddings"
+    # 如果 base_url 已经包含 /api/v1，则不再重复拼接
+    if "/api/v1" in base_url:
+        url = f"{base_url}/services/embeddings/text-embedding/text-embedding"
 
     resp = requests.post(
         url,
         json={
             "model": _model,
-            "input": [query],
-            "dimensions": _dim,
-            "output_type": "dense&sparse",
+            "input": {"texts": [query]},
+            "parameters": {
+                "dimension": _dim,
+                "output_type": "dense&sparse",
+            },
         },
         headers={
             "Authorization": f"Bearer {_api_key}",
@@ -68,18 +70,19 @@ def get_query_embedding(
         timeout=30,
     )
     resp.raise_for_status()
-    data = resp.json()["data"][0]
+    result = resp.json()
 
-    dense = data["embedding"]
+    embedding_data = result["output"]["embeddings"][0]
+    dense = embedding_data["embedding"]
 
-    # sparse_embedding 为 {str_index: float_value} 的字典
-    sparse = data.get("sparse_embedding", {})
+    # native API 的 sparse_embedding 是 list[dict]，每个 dict 含 index, token, value
+    sparse_list = embedding_data.get("sparse_embedding", [])
     sparse_indices: List[int] = []
     sparse_values: List[float] = []
-    if sparse:
-        sorted_pairs = sorted(sparse.items(), key=lambda x: int(x[0]))
-        sparse_indices = [int(k) for k, _ in sorted_pairs]
-        sparse_values = [float(v) for _, v in sorted_pairs]
+    if sparse_list:
+        sorted_sparse = sorted(sparse_list, key=lambda x: x["index"])
+        sparse_indices = [s["index"] for s in sorted_sparse]
+        sparse_values = [float(s["value"]) for s in sorted_sparse]
 
     logger.debug(
         "Embedding generated: dense=%d dims, sparse=%d nonzero",
@@ -158,7 +161,8 @@ def search_chunks(
     query: str,
     *,
     top_k: int = 5,
-    min_score: float = 0.55,
+    min_score: float = 0.0,
+    max_distance: float = 0.0,
     output_fields: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -167,11 +171,12 @@ def search_chunks(
     Args:
         query: 用户查询文本
         top_k: HA3 返回的最大结果数
-        min_score: 最低相关度阈值，低于此分数的结果会被过滤
+        min_score: (保留兼容) 相似度下限，仅在 score 为 0-1 相似度时使用
+        max_distance: HA3 距离上限，score 越小越相关；设为 0 表示不过滤
         output_fields: 自定义返回字段列表
 
     Returns:
-        [{"chunk_text", "title", "section_title", "doc_id", "score", ...}]
+        [{\"chunk_text\", \"title\", \"section_title\", \"doc_id\", \"score\", ...}]
     """
     config = get_config()
 
@@ -210,12 +215,13 @@ def search_chunks(
     results = _parse_ha3_response(resp)
 
     # 4. 过滤低相关度结果
-    if min_score > 0:
+    # HA3 混合检索的 score 是距离分数（越小越相关），用 max_distance 过滤
+    if max_distance > 0:
         before_count = len(results)
-        results = [r for r in results if r.get("score", 0) >= min_score]
+        results = [r for r in results if r.get("score", 0) <= max_distance]
         filtered = before_count - len(results)
         if filtered > 0:
-            logger.info("Filtered %d low-score results (min_score=%.2f)", filtered, min_score)
+            logger.info("Filtered %d distant results (max_distance=%.2f)", filtered, max_distance)
 
     logger.info("Search completed: query=%r, results=%d", query[:50], len(results))
     return results

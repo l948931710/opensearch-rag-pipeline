@@ -98,7 +98,7 @@ def search_opensearch(dense_vector, sparse_indices, sparse_values):
         sparse_data=sparse_data,
         top_k=TOP_K,
         include_vector=False,
-        output_fields=["id", "doc_id", "chunk_text", "title", "section_title", "category_l1"],
+        output_fields=["id", "doc_id", "chunk_text_store", "title", "section_title", "category_l1", "chunk_index", "page_num", "kb_type"],
     )
 
     resp = client.query(request)
@@ -149,11 +149,14 @@ def main():
     for i, item in enumerate(results):
         fields = item.get("fields", item)
         score = item.get("score", item.get("_score", "N/A"))
-        chunk_text = fields.get("chunk_text", "")
+        chunk_text = fields.get("chunk_text_store", fields.get("chunk_text", ""))
         title = fields.get("title", "")
         section = fields.get("section_title", "")
         doc_id = fields.get("doc_id", "")
         category = fields.get("category_l1", "")
+        chunk_index = fields.get("chunk_index", "")
+        page_num = fields.get("page_num", "")
+        kb_type = fields.get("kb_type", "")
 
         print(f"  [{i+1}] Score: {score}")
         print(f"      文档: {title} ({doc_id})")
@@ -161,7 +164,11 @@ def main():
             print(f"      章节: {section}")
         if category:
             print(f"      分类: {category}")
-        print(f"      内容: {chunk_text[:200]}...")
+        if chunk_index or page_num:
+            print(f"      位置: chunk_index={chunk_index}, page_num={page_num}")
+        if kb_type:
+            print(f"      知识库: {kb_type}")
+        print(f"      内容: {chunk_text[:300]}...")
         print()
 
 
