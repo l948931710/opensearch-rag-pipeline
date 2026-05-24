@@ -71,6 +71,14 @@ class AlibabaVectorSearchConfig:
     access_pass_word: str = ""        # 密码
     table_name: str = "fuling_knowledge_vector"
     pk_field: str = "id"
+    # 混合检索配置（BM25 + Dense + Sparse 三路融合）
+    enable_hybrid: bool = True              # 启用 BM25 混合检索（False 则降级为纯向量检索）
+    hybrid_fusion: str = "rrf"              # 融合策略："rrf" 或 "weighted"
+    rrf_rank_constant: int = 60             # RRF 融合的 rankConstant 参数
+    knn_weight: float = 0.7                 # 加权模式下 kNN 权重
+    text_weight: float = 0.3               # 加权模式下 text (BM25) 权重
+    text_search_field: str = "chunk_text"   # BM25 全文检索字段名（需配置 TEXT 倒排索引）
+    hybrid_knn_top_k: int = 100             # kNN 路的候选池大小
 
 
 @dataclass
@@ -281,6 +289,13 @@ def load_config() -> PipelineConfig:
             access_pass_word=_env("HA3_PASSWORD"),
             table_name=_env("HA3_TABLE_NAME", "fuling_knowledge_vector"),
             pk_field=_env("HA3_PK_FIELD", "id"),
+            enable_hybrid=_env_bool("HA3_ENABLE_HYBRID", True),
+            hybrid_fusion=_env("HA3_HYBRID_FUSION", "rrf"),
+            rrf_rank_constant=_env_int("HA3_RRF_RANK_CONSTANT", 60),
+            knn_weight=_env_float("HA3_KNN_WEIGHT", 0.7),
+            text_weight=_env_float("HA3_TEXT_WEIGHT", 0.3),
+            text_search_field=_env("HA3_TEXT_SEARCH_FIELD", "chunk_text"),
+            hybrid_knn_top_k=_env_int("HA3_HYBRID_KNN_TOP_K", 100),
         ),
 
         embedding=EmbeddingConfig(

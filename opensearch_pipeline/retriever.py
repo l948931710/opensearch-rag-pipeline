@@ -159,6 +159,19 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
     return parsed
 
 
+def _escape_ha3_query(text: str) -> str:
+    """转义 HA3 queryString 中的特殊字符，防止查询语法注入。
+
+    HA3 query 语法中单引号 ' 用于包裹查询词，用户输入的单引号会
+    破坏语法结构。反斜杠 \\ 和双引号 " 也需转义。
+    """
+    # 移除单引号（HA3 不支持引号内转义，只能剥离）
+    text = text.replace("'", " ")
+    # 转义反斜杠和双引号
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
+    return text.strip()
+
+
 def search_chunks(
     query: str,
     *,
@@ -171,22 +184,30 @@ def search_chunks(
     """
     端到端检索：query → embedding → HA3 search → 标准化结果。
 
+    当 enable_hybrid=True（默认）时，使用 HA3 服务端三路混合检索：
+      - kNN 路: Dense + Sparse 向量检索
+      - Text 路: BM25 全文检索（基于 chunk_text 倒排索引）
+      - 融合: RRF 或加权求和
+
+    当 enable_hybrid=False 时，降级为纯向量检索（兼容旧行为）。
+
     Args:
         query: 用户查询文本
-        top_k: HA3 返回的最大结果数
+        top_k: 最终返回的结果数
         min_score: (保留兼容) 相似度下限，仅在 score 为 0-1 相似度时使用
         max_distance: HA3 距离上限，score 越小越相关；设为 0 表示不过滤
         output_fields: 自定义返回字段列表
 
     Returns:
-        [{\"chunk_text\", \"title\", \"section_title\", \"doc_id\", \"score\", ...}]
+        [{"chunk_text", "title", "section_title", "doc_id", "score", ...}]
     """
     config = get_config()
+    cfg = config.alibaba_vector
 
     # 1. 生成 query embedding
     dense, sparse_idx, sparse_val = get_query_embedding(query)
 
-    # 2. 构建 HA3 查询
+    # 2. 构建 sparse data
     from alibabacloud_ha3engine_vector.models import QueryRequest, SparseData
 
     sparse_data = None
@@ -204,45 +225,94 @@ def search_chunks(
     ]
 
     # ── 权限过滤 ──
-    # 企业内部部署，所有钉钉用户都是公司员工：
-    #   public        → 所有员工可见（默认）
-    #   dept_internal → 仅 owner_dept 匹配的部门成员可见
     if user_dept:
-        # 用户部门已知：可以看 public + 自己部门的 dept_internal
         filter_expr = (
             'permission_level="public"'
             ' OR (permission_level="dept_internal" AND owner_dept="' + user_dept + '")'
         )
     else:
-        # 用户部门未知（降级安全模式）：只能看 public
         filter_expr = 'permission_level="public"'
 
     logger.info("Permission filter: user_dept=%s, filter=%s", user_dept, filter_expr)
 
-    request = QueryRequest(
-        table_name=config.alibaba_vector.table_name,
-        vector=dense,
-        sparse_data=sparse_data,
-        top_k=top_k,
-        include_vector=False,
-        output_fields=_output_fields,
-        filter=filter_expr,
-    )
-
+    # 3. 构建请求并执行
     client = _get_ha3_client()
-    resp = client.query(request)
 
-    # 3. 解析结果
+    if cfg.enable_hybrid:
+        # ── 混合检索: Dense + Sparse + BM25 三路融合 ──
+        from alibabacloud_ha3engine_vector.models import (
+            SearchRequest, TextQuery, RankQuery,
+        )
+
+        # kNN 路（Dense + Sparse）— 复用 QueryRequest 模型
+        knn_query = QueryRequest(
+            table_name=cfg.table_name,
+            vector=dense,
+            sparse_data=sparse_data,
+            top_k=cfg.hybrid_knn_top_k,
+            include_vector=False,
+            filter=filter_expr,
+        )
+
+        # BM25 Text 路
+        escaped_query = _escape_ha3_query(query)
+        text_query = TextQuery(
+            query_string=f"{cfg.text_search_field}:'{escaped_query}'",
+            query_params={"default_op": "OR"},
+            filter=filter_expr,
+        )
+
+        # 融合策略
+        if cfg.hybrid_fusion == "rrf":
+            rank = RankQuery(rrf={"rankConstant": cfg.rrf_rank_constant})
+        else:
+            # 加权模式：通过 knn.weight 和 text.weight 控制
+            knn_query.weight = cfg.knn_weight
+            text_query.weight = cfg.text_weight
+            rank = RankQuery()  # 空 rank = 默认加权策略
+
+        request = SearchRequest(
+            table_name=cfg.table_name,
+            knn=knn_query,
+            text=text_query,
+            rank=rank,
+            size=top_k,
+            order="DESC",
+            output_fields=_output_fields,
+        )
+
+        logger.info(
+            "Hybrid search: fusion=%s, text_field=%s, knn_top_k=%d, size=%d",
+            cfg.hybrid_fusion, cfg.text_search_field, cfg.hybrid_knn_top_k, top_k,
+        )
+        resp = client.search(request)
+    else:
+        # ── 纯向量检索（降级 / 兼容旧行为）──
+        request = QueryRequest(
+            table_name=cfg.table_name,
+            vector=dense,
+            sparse_data=sparse_data,
+            top_k=top_k,
+            include_vector=False,
+            output_fields=_output_fields,
+            filter=filter_expr,
+        )
+        logger.info("Vector-only search: top_k=%d", top_k)
+        resp = client.query(request)
+
+    # 4. 解析结果
     results = _parse_ha3_response(resp)
 
-    # 4. 过滤低相关度结果
-    # HA3 混合检索的 score 是距离分数（越小越相关），用 max_distance 过滤
-    if max_distance > 0:
+    # 5. 过滤低相关度结果
+    # 注意：混合检索模式下 score 是 RRF/加权融合分（越大越相关，DESC 排序），
+    # 纯向量模式下 score 是距离分（越小越相关）。max_distance 仅适用于纯向量模式。
+    if not cfg.enable_hybrid and max_distance > 0:
         before_count = len(results)
         results = [r for r in results if r.get("score", 0) <= max_distance]
         filtered = before_count - len(results)
         if filtered > 0:
             logger.info("Filtered %d distant results (max_distance=%.2f)", filtered, max_distance)
 
-    logger.info("Search completed: query=%r, results=%d", query[:50], len(results))
+    logger.info("Search completed: query=%r, results=%d, hybrid=%s", query[:50], len(results), cfg.enable_hybrid)
     return results
+
