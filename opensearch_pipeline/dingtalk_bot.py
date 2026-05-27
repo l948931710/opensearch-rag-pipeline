@@ -29,7 +29,7 @@ import requests as http_requests
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 
-from opensearch_pipeline.retriever import search_chunks
+from opensearch_pipeline.retriever import search_chunks, expand_top_document, stitch_neighbor_chunks
 from opensearch_pipeline.llm_generator import generate_answer
 from opensearch_pipeline.config import get_config
 
@@ -140,16 +140,70 @@ def _verify_signature(timestamp: str, sign: str) -> bool:
 def _extract_question(body: Dict[str, Any]) -> str:
     """
     从钉钉回调 body 中提取用户问题文本。
-    群聊中会包含 @机器人 的前缀，需要去掉。
+
+    钉钉消息格式因客户端和版本不同而异：
+      - msgtype="text"     → body["text"]["content"] 为纯文本字符串
+      - msgtype="richText" → body["content"]["richText"] 为富文本片段数组
+                             每个片段形如 {"text": "..."} 或 {"pictureUrl": "..."}
+    群聊中会包含 @机器人 标记，需要去掉。
     """
-    text_obj = body.get("text", {})
-    content = text_obj.get("content", "").strip()
+    msgtype = body.get("msgtype", "")
+    content = ""
 
-    # 去除 @机器人 标记（群聊场景）
-    # 钉钉会在 content 开头添加 @xxx 的文本
-    content = re.sub(r"^@\S+\s*", "", content).strip()
+    if msgtype == "text":
+        # 标准文本消息：body["text"]["content"]
+        text_obj = body.get("text", {})
+        if isinstance(text_obj, dict):
+            content = text_obj.get("content", "") or ""
+        elif isinstance(text_obj, str):
+            content = text_obj
 
-    return content
+    elif msgtype == "richText":
+        # 富文本消息（iOS/部分 Android 客户端）：body["content"]["richText"]
+        content_obj = body.get("content", {})
+        if isinstance(content_obj, dict):
+            rich_parts = content_obj.get("richText", [])
+            if isinstance(rich_parts, list):
+                # 拼接所有文本片段，忽略图片等非文本片段
+                text_segments = []
+                for part in rich_parts:
+                    if isinstance(part, dict) and "text" in part:
+                        text_segments.append(str(part["text"]))
+                content = "".join(text_segments)
+
+    else:
+        # 未知 msgtype：尝试通用提取
+        text_obj = body.get("text", {})
+        if isinstance(text_obj, dict):
+            content = text_obj.get("content", "") or ""
+        elif isinstance(text_obj, str):
+            content = text_obj
+        # fallback: 顶层 content 如果是字符串
+        if not content:
+            top_content = body.get("content", "")
+            if isinstance(top_content, str):
+                content = top_content
+
+    # 确保 content 是字符串
+    if not isinstance(content, str):
+        logger.warning("[消息提取] content 类型异常: type=%s, value=%r", type(content).__name__, content)
+        content = str(content) if content else ""
+
+    content = content.strip()
+
+    logger.info("[消息提取] msgtype=%s, raw_content=%r", msgtype, content)
+    print(f"[DINGTALK] 消息提取: msgtype={msgtype}, raw_content={content!r}", flush=True)
+
+    if not content:
+        return ""
+
+    # 去除 @机器人 标记（群聊场景，可能出现在任意位置）
+    cleaned = re.sub(r"@\S+", "", content).strip()
+
+    logger.info("[消息提取] 去除@后: %r", cleaned)
+    print(f"[DINGTALK] 去除@后: {cleaned!r}", flush=True)
+
+    return cleaned
 
 
 def _get_conversation_type(body: Dict[str, Any]) -> str:
@@ -236,7 +290,7 @@ def _format_answer_markdown(
             source_line = f"- {title}"
             if section:
                 source_line += f" > {section}"
-            source_line += f"（相关度 {score:.0%}）"
+            source_line += f"（相关度 {score:.2f}）"
             lines.append(source_line)
         lines.append("")
 
@@ -269,7 +323,13 @@ def _process_rag_query(
         user_dept = _resolve_user_dept(sender_staff_id) if sender_staff_id else None
 
         # 1. 检索（带权限过滤）
-        chunks = search_chunks(question, top_k=5, user_dept=user_dept)
+        chunks = search_chunks(question, top_k=10, user_dept=user_dept)
+
+        # 同文档扩展：如果最相关文档只命中了封面/元数据，自动补充正文
+        chunks = expand_top_document(chunks, expand_size=10)
+
+        # 邻居扩展：每个 chunk 拼接 ±1 相邻 chunk，解决 chunk 边界断裂
+        chunks = stitch_neighbor_chunks(chunks, window=1)
 
         if not chunks:
             _send_text_reply(
@@ -323,6 +383,19 @@ async def dingtalk_webhook(request: Request):
     钉钉在用户 @机器人 或私聊时，POST 消息到此端点。
     立即返回 200（发送 "查询中" 提示），后台线程处理 RAG 问答。
     """
+    # 用 try/except 包裹整体逻辑，确保任何异常都有回复
+    try:
+        return await _handle_webhook(request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("webhook 处理未捕获异常: %s", e, exc_info=True)
+        print(f"[DINGTALK ERROR] webhook 未捕获异常: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="内部错误")
+
+
+async def _handle_webhook(request: Request):
+    """实际的 webhook 处理逻辑。"""
     # 1. 签名验证
     timestamp = request.headers.get("timestamp", "")
     sign = request.headers.get("sign", "")
@@ -337,12 +410,15 @@ async def dingtalk_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="无法解析请求体")
 
+    body_json = json.dumps(body, ensure_ascii=False, default=str)
     logger.info(
         "收到钉钉消息: sender=%s, conversationType=%s, msgId=%s",
         body.get("senderNick", "unknown"),
         body.get("conversationType", "?"),
         body.get("msgId", "?"),
     )
+    logger.info("钉钉完整消息体: %s", body_json)
+    print(f"[DINGTALK] 完整消息体: {body_json}", flush=True)
 
     # 3. 提取问题文本
     question = _extract_question(body)
@@ -350,6 +426,8 @@ async def dingtalk_webhook(request: Request):
     sender_nick = body.get("senderNick", "用户")
     sender_staff_id = body.get("senderStaffId", "")
     conversation_id = body.get("conversationId", "")
+
+    print(f"[DINGTALK] 提取结果: question={question!r}, has_webhook={bool(session_webhook)}", flush=True)
 
     if not question:
         if session_webhook:
