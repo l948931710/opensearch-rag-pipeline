@@ -328,7 +328,30 @@ def search_chunks(
         if filtered > 0:
             logger.info("Filtered %d distant results (max_distance=%.2f)", filtered, max_distance)
 
-    logger.info("Search completed: query=%r, results=%d, hybrid=%s", query[:50], len(results), cfg.enable_hybrid)
+    # 6. 封面/元数据 chunk 降权
+    # 短文本 + 无 section_title 的 chunk 通常是封面页或目录，
+    # 包含文档标题导致 BM25 高分，但没有实质内容。
+    # 策略：正文 chunk 优先排前面，封面 chunk 排后面（不丢弃，避免无结果）。
+    _COVER_MAX_LEN = 200  # 短于此且无 section_title 视为封面/元数据
+    content_results = []
+    cover_results = []
+    for r in results:
+        text = r.get("chunk_text", "")
+        has_section = bool(r.get("section_title"))
+        if not has_section and len(text) < _COVER_MAX_LEN:
+            cover_results.append(r)
+        else:
+            content_results.append(r)
+
+    if cover_results:
+        logger.info(
+            "封面降权: %d 个封面 chunk 被移到末尾 (共 %d 结果)",
+            len(cover_results), len(results),
+        )
+    results = content_results + cover_results
+
+    logger.info("Search completed: query=%r, results=%d (content=%d, cover=%d), hybrid=%s",
+                query[:50], len(results), len(content_results), len(cover_results), cfg.enable_hybrid)
     return results
 
 
@@ -339,7 +362,13 @@ def expand_top_document(
     min_content_ratio: float = 0.5,
 ) -> List[Dict[str, Any]]:
     """
-    同文档扩展：当检索结果中最相关文档只命中了封面/元数据 chunk 时，
+    [DEPRECATED] 同文档扩展 — 不再在生产路径中使用。
+
+    封面问题已通过 top_k over-fetch + 封面降权 + 截取前 N 策略解决。
+    概括性问题更适合 query classification → 全文摘要路径处理。
+    保留代码以备未来需要。
+
+    原始描述：当检索结果中最相关文档只命中了封面/元数据 chunk 时，
     自动补充该文档的更多正文 chunks。
 
     解决概括性问题（如"XX操作手册主要内容有哪些"）只召回封面页的问题。
@@ -556,3 +585,40 @@ def stitch_neighbor_chunks(
     except Exception as e:
         logger.warning("邻居扩展失败，回退到原始结果: %s", e, exc_info=True)
         return chunks
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. 统一检索入口
+# ═══════════════════════════════════════════════════════════════
+
+def retrieve_and_enrich(
+    query: str,
+    *,
+    top_k: int = 7,
+    user_dept: Optional[str] = None,
+    stitch_window: int = 1,
+) -> List[Dict[str, Any]]:
+    """统一检索 + 后处理入口，供 API 和 DingTalk 共用。
+
+    流程：
+      1. search_chunks: 三路混合检索（Dense + Sparse + BM25）+ 封面降权
+      2. stitch_neighbor_chunks: 邻居拼接解决 chunk 边界断裂
+
+    参数选择依据（数据驱动）：
+      - top_k=7 + window=1: 估算 context ~5,700 chars ≤ max_context_chars=6,000
+      - 避免 top_k 过大导致 context 溢出后被 _format_context 截断浪费
+      - window=1 已验证: CC +3.1pp, AC +2.1pp, 退化率 0%
+
+    Args:
+        query: 用户查询文本
+        top_k: 检索返回的 chunk 数量
+        user_dept: 用户部门（用于权限过滤）
+        stitch_window: 邻居拼接窗口大小（±N）
+
+    Returns:
+        经过检索 + 邻居拼接后的 chunks 列表
+    """
+    chunks = search_chunks(query, top_k=top_k, user_dept=user_dept)
+    if chunks and stitch_window > 0:
+        chunks = stitch_neighbor_chunks(chunks, window=stitch_window)
+    return chunks

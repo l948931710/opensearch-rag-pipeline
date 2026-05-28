@@ -413,6 +413,8 @@ class TestSpotCheckerSafetyDaemon:
         with mock.patch("opensearch_pipeline.spot_checker._get_opensearch_client") as mock_os:
             mock_client = mock.Mock()
             mock_client.delete_by_query.return_value = {"deleted": 1}
+            # 确保 mock 不暴露 push_documents，走 Standard OpenSearch 路径
+            del mock_client.push_documents
             mock_os.return_value = mock_client
 
             report = run_spot_check_pipeline(limit_or_percent=1.0, simulate=False)
@@ -431,11 +433,12 @@ class TestSpotCheckerSafetyDaemon:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cursor:
             # document_version -> QUARANTINED
-            cursor.execute("SELECT publish_status, gate_status, risk_level FROM document_version WHERE doc_id='doc_leak'")
+            cursor.execute("SELECT publish_status, gate_status, risk_level, index_status FROM document_version WHERE doc_id='doc_leak'")
             ver = cursor.fetchone()
             assert ver[0] == "QUARANTINED"
             assert ver[1] == "quarantined"
             assert ver[2] == "high"
+            assert ver[3] == "DELETED"  # 索引删除成功后标记
 
             # document_meta -> restricted
             cursor.execute("SELECT permission_level, kb_type FROM document_meta WHERE doc_id='doc_leak'")

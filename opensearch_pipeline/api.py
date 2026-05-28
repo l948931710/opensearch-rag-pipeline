@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream
-from opensearch_pipeline.retriever import search_chunks
+from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
 from opensearch_pipeline.dingtalk_bot import router as dingtalk_router, _resolve_user_dept
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.feedback_handler import handle_feedback
@@ -78,7 +78,7 @@ class ChatMessage(BaseModel):
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000, description="用户问题")
-    top_k: int = Field(5, ge=1, le=20, description="检索返回的文档数量")
+    top_k: int = Field(7, ge=1, le=20, description="检索返回的文档数量")
     history: Optional[List[ChatMessage]] = Field(None, description="对话历史")
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
     temperature: Optional[float] = Field(0.1, ge=0.0, le=2.0, description="生成温度")
@@ -239,7 +239,7 @@ async def ask(req: AskRequest):
         user_dept = req.user_dept
         if not user_dept and req.user_id:
             user_dept = _resolve_user_dept(req.user_id)
-        chunks = search_chunks(req.question, top_k=req.top_k, user_dept=user_dept)
+        chunks = retrieve_and_enrich(req.question, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -337,7 +337,7 @@ async def ask_stream(req: AskRequest):
         user_dept = req.user_dept
         if not user_dept and req.user_id:
             user_dept = _resolve_user_dept(req.user_id)
-        chunks = search_chunks(req.question, top_k=req.top_k, user_dept=user_dept)
+        chunks = retrieve_and_enrich(req.question, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)

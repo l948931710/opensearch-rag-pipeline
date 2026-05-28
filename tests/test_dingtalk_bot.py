@@ -201,7 +201,7 @@ class TestAnswerFormatting:
         assert "正式员工享有 5 天年假。" in md
         assert "员工手册" in md
         assert "> 第三章" in md
-        assert "92%" in md
+        assert "0.92" in md
         assert "考勤规定" in md
         assert "qwen-max" in md
         assert "1.2s" in md
@@ -336,7 +336,7 @@ class TestBackgroundRAGProcessing:
 
     @patch("opensearch_pipeline.dingtalk_bot._send_reply")
     @patch("opensearch_pipeline.dingtalk_bot.generate_answer")
-    @patch("opensearch_pipeline.dingtalk_bot.search_chunks")
+    @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich")
     def test_rag_success_sends_markdown_reply(self, mock_search, mock_gen, mock_reply):
         """RAG 成功 → 通过 _send_reply 发送 Markdown 回复。"""
         mock_search.return_value = [
@@ -352,7 +352,7 @@ class TestBackgroundRAGProcessing:
 
         _process_rag_query("年假几天", "https://webhook/test", "张三", "cid1")
 
-        mock_search.assert_called_once_with("年假几天", top_k=5, user_dept=None)
+        mock_search.assert_called_once_with("年假几天", user_dept=None)
         mock_gen.assert_called_once()
         mock_reply.assert_called_once()
         # 验证 Markdown 内容
@@ -361,7 +361,7 @@ class TestBackgroundRAGProcessing:
         assert "员工手册" in md_text
 
     @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
-    @patch("opensearch_pipeline.dingtalk_bot.search_chunks")
+    @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich")
     def test_rag_no_results_sends_fallback_text(self, mock_search, mock_reply):
         """检索无结果 → 发送 '未找到相关信息' 文本回复。"""
         mock_search.return_value = []
@@ -373,7 +373,7 @@ class TestBackgroundRAGProcessing:
         assert "未找到" in reply_text
 
     @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
-    @patch("opensearch_pipeline.dingtalk_bot.search_chunks")
+    @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich")
     def test_rag_exception_sends_error_with_trace_id(self, mock_search, mock_reply):
         """search_chunks 抛出异常 → 发送包含 trace ID 的错误回复。"""
         mock_search.side_effect = ConnectionError("HA3 connection refused")
@@ -388,7 +388,7 @@ class TestBackgroundRAGProcessing:
     @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
     @patch("opensearch_pipeline.dingtalk_bot._send_reply")
     @patch("opensearch_pipeline.dingtalk_bot.generate_answer")
-    @patch("opensearch_pipeline.dingtalk_bot.search_chunks")
+    @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich")
     def test_rag_llm_failure_sends_error(self, mock_search, mock_gen, mock_md_reply, mock_txt_reply):
         """LLM 生成失败 → 发送错误回复。"""
         mock_search.return_value = [{"chunk_text": "一些内容", "title": "文档", "doc_id": "d1", "score": 0.9}]

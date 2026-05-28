@@ -2,11 +2,131 @@
 """
 spot_checker.py — 定时安全抽检任务 (Spot-Check Safety Daemon)
 """
+import logging
 import random
 import requests
 import json
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.pipeline_nodes import _get_db_conn, _get_opensearch_client, _clean_llm_json_response
+
+logger = logging.getLogger(__name__)
+
+
+def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config) -> None:
+    """从搜索索引中删除指定文档的所有 chunks。
+
+    成功时静默返回，失败时抛出异常由调用方处理。
+    """
+    os_client = _get_opensearch_client()
+
+    if hasattr(os_client, "push_documents"):
+        # HA3 Engine: 查询 chunk 主键后用 push_documents cmd=delete 删除
+        ha3_cfg = config.alibaba_vector
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id FROM chunk_meta
+                WHERE doc_id = %s AND version_no = %s
+            """, (doc_id, version_no))
+            chunk_rows = cursor.fetchall()
+
+        if chunk_rows:
+            from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
+
+            delete_docs = [
+                {"cmd": "delete", "fields": {ha3_cfg.pk_field: row[0]}}
+                for row in chunk_rows
+            ]
+            ha3_batch_size = 100
+            for i in range(0, len(delete_docs), ha3_batch_size):
+                batch = delete_docs[i:i + ha3_batch_size]
+                request = PushDocumentsRequest(body=batch)
+                resp = os_client.push_documents(ha3_cfg.table_name, ha3_cfg.pk_field, request)
+                logger.info(
+                    "[HA3] Deleted batch %d (%d chunks) for %s v%s. Status: %s",
+                    i // ha3_batch_size + 1, len(batch), doc_id, version_no,
+                    getattr(resp, 'status_code', 'OK'),
+                )
+        else:
+            logger.info("No chunks found in chunk_meta for %s v%s", doc_id, version_no)
+    else:
+        # Standard OpenSearch: delete_by_query
+        delete_query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"doc_id": doc_id}},
+                        {"term": {"version_no": version_no}}
+                    ]
+                }
+            }
+        }
+        os_cfg = config.opensearch
+        index_name = getattr(os_cfg, "index_name", "fuling_knowledge_v1")
+        delete_resp = os_client.delete_by_query(index=index_name, body=delete_query)
+        logger.info(
+            "Deleted chunks from OpenSearch index '%s' for %s v%s. Response: %s",
+            index_name, doc_id, version_no, delete_resp,
+        )
+
+
+def reconcile_pending_deletes() -> dict:
+    """对账任务：重试所有 index_status='PENDING_DELETE' 的文档索引删除。
+
+    在每次 spot-check 启动时自动调用，确保之前失败的索引删除最终完成。
+    也可以独立调用（如 DataWorks 定时任务）。
+
+    Returns:
+        {"total": int, "success": int, "failed": int, "errors": [str]}
+    """
+    result = {"total": 0, "success": 0, "failed": 0, "errors": []}
+    config = get_config()
+
+    try:
+        conn = _get_db_conn(select_db=True)
+    except Exception as e:
+        result["errors"].append(f"DB connect failed: {e}")
+        return result
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT doc_id, version_no FROM document_version
+                WHERE index_status = 'PENDING_DELETE'
+            """)
+            rows = cursor.fetchall()
+
+        result["total"] = len(rows)
+        if not rows:
+            return result
+
+        logger.info("[RECONCILE] Found %d documents with PENDING_DELETE", len(rows))
+
+        for doc_id, version_no in rows:
+            try:
+                _delete_chunks_from_index(doc_id, version_no, conn, config)
+
+                # 删除成功 → 标记为 DELETED
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE document_version
+                        SET index_status = 'DELETED'
+                        WHERE doc_id = %s AND version_no = %s
+                          AND index_status = 'PENDING_DELETE'
+                    """, (doc_id, version_no))
+                conn.commit()
+                result["success"] += 1
+                logger.info("[RECONCILE] Successfully deleted index for %s v%s", doc_id, version_no)
+
+            except Exception as e:
+                conn.rollback()
+                result["failed"] += 1
+                err = f"Retry delete failed for {doc_id} v{version_no}: {e}"
+                result["errors"].append(err)
+                logger.warning("[RECONCILE] %s", err)
+    finally:
+        conn.close()
+
+    return result
 
 def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = None) -> dict:
     """
@@ -42,6 +162,13 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
         return report
 
     print("🔍 [SPOT CHECK] Starting spot-check safety checker (simulate=False)...")
+
+    # 先对账：重试之前失败的索引删除
+    reconcile_result = reconcile_pending_deletes()
+    if reconcile_result["total"] > 0:
+        print(f"    └─ [RECONCILE] Retried {reconcile_result['total']} pending deletes: "
+              f"{reconcile_result['success']} success, {reconcile_result['failed']} failed")
+        report["errors"].extend(reconcile_result["errors"])
     try:
         conn = _get_db_conn(select_db=True)
     except Exception as e:
@@ -303,52 +430,38 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
 
                 # d. 从搜索索引中彻底 DELETE 这些 chunks
                 try:
-                    os_client = _get_opensearch_client()
-
-                    if hasattr(os_client, "push_documents"):
-                        # HA3 Engine: 查询 chunk 主键后用 push_documents cmd=delete 删除
-                        ha3_cfg = config.alibaba_vector
+                    _delete_chunks_from_index(doc_id, version_no, conn, config)
+                    # 删除成功 → 标记为 DELETED
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET index_status = 'DELETED'
+                            WHERE doc_id = %s AND version_no = %s
+                        """, (doc_id, version_no))
+                    conn.commit()
+                    print(f"       └─ ✅ Chunks deleted from search index for {doc_id} v{version_no}")
+                except Exception as os_err:
+                    logger.error(
+                        "Failed to delete chunks from search index for %s v%s: %s",
+                        doc_id, version_no, os_err, exc_info=True,
+                    )
+                    report["errors"].append(f"Search index delete error for {doc_id}: {os_err}")
+                    # 关键修复：标记为 PENDING_DELETE，下次 spot-check 或对账任务会重试
+                    try:
                         with conn.cursor() as cursor:
                             cursor.execute("""
-                                SELECT id FROM chunk_meta
+                                UPDATE document_version
+                                SET index_status = 'PENDING_DELETE'
                                 WHERE doc_id = %s AND version_no = %s
                             """, (doc_id, version_no))
-                            chunk_rows = cursor.fetchall()
-
-                        if chunk_rows:
-                            from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
-
-                            delete_docs = [
-                                {"cmd": "delete", "fields": {ha3_cfg.pk_field: row[0]}}
-                                for row in chunk_rows
-                            ]
-                            ha3_batch_size = 100
-                            for i in range(0, len(delete_docs), ha3_batch_size):
-                                batch = delete_docs[i:i + ha3_batch_size]
-                                request = PushDocumentsRequest(body=batch)
-                                resp = os_client.push_documents(ha3_cfg.table_name, ha3_cfg.pk_field, request)
-                                print(f"       └─ [HA3] Deleted batch {i//ha3_batch_size + 1} ({len(batch)} chunks). Status: {getattr(resp, 'status_code', 'OK')}")
-                        else:
-                            print(f"       └─ No chunks found in chunk_meta for {doc_id} v{version_no}")
-                    else:
-                        # Standard OpenSearch: delete_by_query
-                        delete_query = {
-                            "query": {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"doc_id": doc_id}},
-                                        {"term": {"version_no": version_no}}
-                                    ]
-                                }
-                            }
-                        }
-                        os_cfg = config.opensearch
-                        index_name = getattr(os_cfg, "index_name", "fuling_knowledge_v1")
-                        delete_resp = os_client.delete_by_query(index=index_name, body=delete_query)
-                        print(f"       └─ Deleted chunks from OpenSearch index '{index_name}'. Response: {delete_resp}")
-                except Exception as os_err:
-                    print(f"       ⚠️ Failed to delete chunks from search index for {doc_id}: {os_err}")
-                    report["errors"].append(f"Search index delete error for {doc_id}: {os_err}")
+                        conn.commit()
+                        print(f"       ⚠️ Marked {doc_id} v{version_no} as PENDING_DELETE for retry")
+                    except Exception as mark_err:
+                        conn.rollback()
+                        logger.error(
+                            "Failed to mark PENDING_DELETE for %s v%s: %s",
+                            doc_id, version_no, mark_err,
+                        )
 
                 report["quarantined_documents"].append({
                     "doc_id": doc_id,

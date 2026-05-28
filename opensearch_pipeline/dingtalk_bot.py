@@ -29,7 +29,7 @@ import requests as http_requests
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 
-from opensearch_pipeline.retriever import search_chunks, expand_top_document, stitch_neighbor_chunks
+from opensearch_pipeline.retriever import retrieve_and_enrich
 from opensearch_pipeline.llm_generator import generate_answer
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import get_or_create_session, append_to_history
@@ -418,14 +418,8 @@ def _process_rag_query(
         # 0. 解析用户部门（用于权限过滤）
         user_dept = _resolve_user_dept(sender_staff_id) if sender_staff_id else None
 
-        # 1. 检索（带权限过滤）
-        chunks = search_chunks(question, top_k=10, user_dept=user_dept)
-
-        # 同文档扩展：如果最相关文档只命中了封面/元数据，自动补充正文
-        chunks = expand_top_document(chunks, expand_size=10)
-
-        # 邻居扩展：每个 chunk 拼接 ±1 相邻 chunk，解决 chunk 边界断裂
-        chunks = stitch_neighbor_chunks(chunks, window=1)
+        # 1. 统一检索 + 邻居拼接（top_k=7, stitch window=±1）
+        chunks = retrieve_and_enrich(question, user_dept=user_dept)
 
         if not chunks:
             # 无结果也要落库

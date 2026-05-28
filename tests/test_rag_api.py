@@ -21,7 +21,7 @@ class TestRetriever:
     @patch("opensearch_pipeline.retriever.requests.post")
     @patch("opensearch_pipeline.retriever.get_config")
     def test_get_query_embedding_returns_dense_and_sparse(self, mock_config, mock_post):
-        """验证 get_query_embedding 正确解析 compatible-mode 响应。"""
+        """验证 get_query_embedding 正确解析 native API 响应。"""
         from opensearch_pipeline.retriever import get_query_embedding
 
         # Mock config
@@ -32,13 +32,17 @@ class TestRetriever:
         mock_cfg.embedding.api_base_url = "https://dashscope.aliyuncs.com"
         mock_config.return_value = mock_cfg
 
-        # Mock DashScope response (compatible-mode format)
+        # Mock DashScope response (native API format)
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
-            "data": [{
+            "output": {"embeddings": [{
                 "embedding": [0.01] * 1024,
-                "sparse_embedding": {"100": 1.5, "200": 0.8, "50": 2.1},
-            }]
+                "sparse_embedding": [
+                    {"index": 100, "token": "t1", "value": 1.5},
+                    {"index": 200, "token": "t2", "value": 0.8},
+                    {"index": 50, "token": "t3", "value": 2.1},
+                ],
+            }]}
         }
         mock_resp.raise_for_status = MagicMock()
         mock_post.return_value = mock_resp
@@ -64,7 +68,7 @@ class TestRetriever:
 
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
-            "data": [{"embedding": [0.02] * 1024}]
+            "output": {"embeddings": [{"embedding": [0.02] * 1024}]}
         }
         mock_resp.raise_for_status = MagicMock()
         mock_post.return_value = mock_resp
@@ -232,6 +236,8 @@ class TestLLMGenerator:
         mock_cfg.llm.api_key = "test-key"
         mock_cfg.llm.api_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
         mock_cfg.llm.model = "qwen3.6-plus"
+        mock_cfg.rag.score_threshold_high = 8.0
+        mock_cfg.rag.score_threshold_medium = 5.0
         mock_config.return_value = mock_cfg
 
         mock_resp = MagicMock()

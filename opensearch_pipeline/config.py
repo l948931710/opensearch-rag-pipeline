@@ -120,6 +120,17 @@ class RAGConfig:
     max_context_chars: int = 6000
     api_port: int = 8000
     max_history_turns: int = 10
+    # ── 相关度分数阈值（weighted fusion score） ──────────────────
+    # 用于 _format_context 中标记 "高/中/低" 相关度，引导 LLM 忽略低分文档。
+    # 默认值基于 120-query 评测数据标定：
+    #   P25≈5.0, P50≈7.2, P75≈9.0
+    #   score_high=8.0 → 约 top 35% 标为"高"
+    #   score_medium=5.0 → 约 next 40% 标为"中"
+    #   <5.0 → 约 bottom 25% 标为"低"
+    # ⚠️ 如果切换 hybrid_fusion 从 "weighted" 到 "rrf"，score 分布
+    #    会完全不同（RRF 分数 ∈ [0, 1]），必须重新标定这两个值。
+    score_threshold_high: float = 8.0
+    score_threshold_medium: float = 5.0
 
 
 @dataclass
