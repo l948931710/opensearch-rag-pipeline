@@ -1,0 +1,107 @@
+# -*- coding: utf-8 -*-
+"""
+session_store.py — 内存会话存储（LRU 淘汰 + 超时过期）
+
+供 api.py 和 dingtalk_bot.py 共用，避免循环导入。
+生产环境可替换为 Redis 实现。
+"""
+
+import logging
+import os
+import time
+import uuid
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+MAX_HISTORY_TURNS = 10  # 保留最近 N 轮对话
+MAX_SESSIONS = int(os.environ.get("RAG_MAX_SESSIONS", "500"))
+SESSION_TIMEOUT_SECONDS = int(os.environ.get("RAG_SESSION_TIMEOUT", "1800"))  # 30 分钟
+
+
+class _SessionEntry:
+    """一个会话条目：包含对话历史和最后活动时间。"""
+    __slots__ = ("history", "last_active")
+
+    def __init__(self):
+        self.history: List[Dict[str, str]] = []
+        self.last_active: float = time.time()
+
+    def touch(self):
+        """更新最后活动时间。"""
+        self.last_active = time.time()
+
+    def is_expired(self) -> bool:
+        """检查是否已超时。"""
+        return (time.time() - self.last_active) > SESSION_TIMEOUT_SECONDS
+
+
+class _LRUSessionStore:
+    """LRU 会话缓存，支持超时过期和容量淘汰。"""
+
+    def __init__(self, maxsize: int = MAX_SESSIONS):
+        self._store: OrderedDict[str, _SessionEntry] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, key: str) -> Optional[_SessionEntry]:
+        if key in self._store:
+            entry = self._store[key]
+            if entry.is_expired():
+                # 超时：删除旧 session，返回 None（调用方会创建新的）
+                del self._store[key]
+                logger.info("Session 超时过期 (%.0f分钟未活动): %s", SESSION_TIMEOUT_SECONDS / 60, key)
+                return None
+            self._store.move_to_end(key)
+            entry.touch()
+            return entry
+        return None
+
+    def create(self, key: str) -> _SessionEntry:
+        """创建新会话，必要时淘汰最旧的会话。"""
+        entry = _SessionEntry()
+        self._store[key] = entry
+        self._store.move_to_end(key)
+        while len(self._store) > self._maxsize:
+            evicted_key, _ = self._store.popitem(last=False)
+            logger.debug("Session evicted (LRU): %s", evicted_key)
+        return entry
+
+    def set_history(self, key: str, history: List[Dict[str, str]]):
+        if key in self._store:
+            self._store[key].history = history
+            self._store[key].touch()
+            self._store.move_to_end(key)
+
+
+_sessions = _LRUSessionStore()
+
+
+def get_or_create_session(session_id: Optional[str]) -> Tuple[str, List[Dict[str, str]]]:
+    """获取或创建会话，返回 (session_id, history)。
+
+    如果 session 存在但已超时（30分钟无活动），自动创建新 session。
+    """
+    if session_id:
+        entry = _sessions.get(session_id)
+        if entry is not None:
+            return session_id, entry.history
+
+    sid = session_id or str(uuid.uuid4())
+    entry = _sessions.create(sid)
+    return sid, entry.history
+
+
+def append_to_history(session_id: str, user_msg: str, assistant_msg: str):
+    """将当前轮对话追加到会话历史。"""
+    entry = _sessions.get(session_id)
+    if entry is None:
+        entry = _sessions.create(session_id)
+
+    entry.history.append({"role": "user", "content": user_msg})
+    entry.history.append({"role": "assistant", "content": assistant_msg})
+
+    # 裁剪超出的轮数（保留最近 N 轮 = 2N 条消息）
+    max_messages = MAX_HISTORY_TURNS * 2
+    if len(entry.history) > max_messages:
+        _sessions.set_history(session_id, entry.history[-max_messages:])

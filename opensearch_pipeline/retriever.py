@@ -172,6 +172,20 @@ def _escape_ha3_query(text: str) -> str:
     return text.strip()
 
 
+def _sanitize_ha3_filter_value(value: str) -> str:
+    """清理 HA3 filter 表达式中的字段值，防止过滤条件注入。
+
+    HA3 filter 中双引号用于包裹值，攻击者可通过注入双引号闭合值边界
+    并追加额外过滤条件（如绕过 permission_level 限制）。
+
+    策略：仅保留字母、数字、下划线、连字符、中文字符，剥离所有其他字符。
+    这比转义更安全，因为 HA3 filter 语法中引号内的转义行为未明确文档化。
+    """
+    import re
+    # 白名单：部门代码通常是字母数字+下划线+连字符+中文
+    return re.sub(r'[^\w\-\u4e00-\u9fff]', '', value)
+
+
 def search_chunks(
     query: str,
     *,
@@ -226,9 +240,10 @@ def search_chunks(
 
     # ── 权限过滤 ──
     if user_dept:
+        safe_dept = _sanitize_ha3_filter_value(user_dept)
         filter_expr = (
             'permission_level="public"'
-            ' OR (permission_level="dept_internal" AND owner_dept="' + user_dept + '")'
+            ' OR (permission_level="dept_internal" AND owner_dept="' + safe_dept + '")'
         )
     else:
         filter_expr = 'permission_level="public"'

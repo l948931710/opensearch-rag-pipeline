@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field
 from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream
 from opensearch_pipeline.retriever import search_chunks
 from opensearch_pipeline.dingtalk_bot import router as dingtalk_router, _resolve_user_dept
+from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
+from opensearch_pipeline.feedback_handler import handle_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,8 @@ else:
 app.include_router(dingtalk_router)
 
 
+
+
 # ═══════════════════════════════════════════════════════════════
 # Pydantic Models
 # ═══════════════════════════════════════════════════════════════
@@ -80,14 +84,22 @@ class AskRequest(BaseModel):
     temperature: Optional[float] = Field(0.1, ge=0.0, le=2.0, description="生成温度")
     max_tokens: Optional[int] = Field(2048, ge=100, le=8192, description="最大生成 token 数")
     user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId），用于权限过滤")
-    user_dept: Optional[str] = Field(None, description="用户部门代码，直接传入时优先使用")
+    user_dept: Optional[str] = Field(
+        None,
+        description="用户部门代码，直接传入时优先使用",
+        pattern=r'^[\w\-\u4e00-\u9fff]{0,64}$',
+    )
 
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="搜索查询")
     top_k: int = Field(5, ge=1, le=50, description="返回结果数")
     user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId），用于权限过滤")
-    user_dept: Optional[str] = Field(None, description="用户部门代码，直接传入时优先使用")
+    user_dept: Optional[str] = Field(
+        None,
+        description="用户部门代码，直接传入时优先使用",
+        pattern=r'^[\w\-\u4e00-\u9fff]{0,64}$',
+    )
 
 
 class SourceInfo(BaseModel):
@@ -101,6 +113,7 @@ class AskResponse(BaseModel):
     answer: str
     sources: List[SourceInfo]
     session_id: str
+    message_id: str = ""
     model: str
     usage: Dict[str, Any] = {}
     latency_ms: int = 0
@@ -122,72 +135,14 @@ class SearchResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 内存会话存储（LRU 淘汰，防止无限增长导致 OOM）
-# 生产环境建议替换为 Redis
+# 会话存储（从 session_store 模块导入，与 dingtalk_bot 共用）
 # ═══════════════════════════════════════════════════════════════
 
-from collections import OrderedDict
+from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 
-MAX_HISTORY_TURNS = 10  # 保留最近 N 轮对话
-MAX_SESSIONS = int(os.environ.get("RAG_MAX_SESSIONS", "500"))
-
-
-class _LRUSessionStore:
-    """简易 LRU 会话缓存，超出上限时淘汰最久未使用的会话。"""
-
-    def __init__(self, maxsize: int = MAX_SESSIONS):
-        self._store: OrderedDict[str, List[Dict[str, str]]] = OrderedDict()
-        self._maxsize = maxsize
-
-    def get(self, key: str) -> Optional[List[Dict[str, str]]]:
-        if key in self._store:
-            self._store.move_to_end(key)
-            return self._store[key]
-        return None
-
-    def create(self, key: str) -> List[Dict[str, str]]:
-        """创建新会话，必要时淘汰最旧的会话。"""
-        self._store[key] = []
-        self._store.move_to_end(key)
-        while len(self._store) > self._maxsize:
-            evicted_key, _ = self._store.popitem(last=False)
-            logger.debug("Session evicted (LRU): %s", evicted_key)
-        return self._store[key]
-
-    def set(self, key: str, value: List[Dict[str, str]]):
-        self._store[key] = value
-        self._store.move_to_end(key)
-        while len(self._store) > self._maxsize:
-            self._store.popitem(last=False)
-
-
-_sessions = _LRUSessionStore()
-
-
-def _get_or_create_session(session_id: Optional[str]) -> tuple[str, List[Dict[str, str]]]:
-    """获取或创建会话，返回 (session_id, history)。"""
-    if session_id:
-        existing = _sessions.get(session_id)
-        if existing is not None:
-            return session_id, existing
-
-    sid = session_id or str(uuid.uuid4())
-    return sid, _sessions.create(sid)
-
-
-def _append_to_history(session_id: str, user_msg: str, assistant_msg: str):
-    """将当前轮对话追加到会话历史。"""
-    history = _sessions.get(session_id)
-    if history is None:
-        history = _sessions.create(session_id)
-
-    history.append({"role": "user", "content": user_msg})
-    history.append({"role": "assistant", "content": assistant_msg})
-
-    # 裁剪超出的轮数（保留最近 N 轮 = 2N 条消息）
-    max_messages = MAX_HISTORY_TURNS * 2
-    if len(history) > max_messages:
-        _sessions.set(session_id, history[-max_messages:])
+# 保持向后兼容（内部调用仍使用下划线命名）
+_get_or_create_session = get_or_create_session
+_append_to_history = append_to_history
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -198,6 +153,49 @@ def _append_to_history(session_id: str, user_msg: str, assistant_msg: str):
 async def health_check():
     """健康检查。"""
     return {"status": "ok", "service": "rag-qa-api"}
+
+
+@app.get("/api/debug/rds")
+async def debug_rds():
+    """诊断 RDS 连接（临时调试用，上线前删除）。"""
+    import socket
+    host = os.environ.get("RAG_RDS_HOST", "localhost")
+    port = int(os.environ.get("RAG_RDS_PORT", "3306"))
+    result = {"host": host, "port": port}
+
+    # 1. DNS 解析
+    try:
+        ips = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        result["dns_resolved"] = [addr[4][0] for addr in ips]
+    except Exception as e:
+        result["dns_error"] = str(e)
+        return result
+
+    # 2. TCP 连接测试
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.close()
+        result["tcp_connect"] = "OK"
+    except Exception as e:
+        result["tcp_error"] = str(e)
+
+    # 3. PyMySQL 连接测试
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=host,
+            port=port,
+            user=os.environ.get("RAG_RDS_USER", ""),
+            password=os.environ.get("RAG_RDS_PASSWORD", ""),
+            database=os.environ.get("RAG_RDS_DATABASE", ""),
+            connect_timeout=5,
+        )
+        result["mysql_connect"] = "OK"
+        conn.close()
+    except Exception as e:
+        result["mysql_error"] = str(e)
+
+    return result
 
 
 @app.post("/api/search", response_model=SearchResponse)
@@ -249,10 +247,21 @@ async def ask(req: AskRequest):
 
     if not chunks:
         latency = int((time.time() - t0) * 1000)
+        msg_id = generate_message_id()
+        log_qa_session(
+            session_id=session_id,
+            message_id=msg_id,
+            user_id=req.user_id or "",
+            query_text=req.question,
+            latency_ms=latency,
+            answer_status="NO_RESULT",
+            opensearch_hit_count=0,
+        )
         return AskResponse(
             answer="抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。",
             sources=[],
             session_id=session_id,
+            message_id=msg_id,
             model="N/A",
             usage={},
             latency_ms=latency,
@@ -276,10 +285,30 @@ async def ask(req: AskRequest):
     _append_to_history(session_id, req.question, result["answer"])
 
     latency = int((time.time() - t0) * 1000)
+    msg_id = generate_message_id()
+
+    # 5. 落库
+    top_score = max((c.get("score", 0) for c in chunks), default=None)
+    log_qa_session(
+        session_id=session_id,
+        message_id=msg_id,
+        user_id=req.user_id or "",
+        query_text=req.question,
+        answer_text=result["answer"],
+        retrieved_docs=chunks,
+        cited_docs=result.get("sources"),
+        latency_ms=latency,
+        answer_status="SUCCESS",
+        model_name=result.get("model"),
+        opensearch_hit_count=len(chunks),
+        top_score=top_score,
+    )
+
     return AskResponse(
         answer=result["answer"],
         sources=[SourceInfo(**s) for s in result["sources"]],
         session_id=session_id,
+        message_id=msg_id,
         model=result["model"],
         usage=result["usage"],
         latency_ms=latency,
@@ -310,8 +339,9 @@ async def ask_stream(req: AskRequest):
             user_dept = _resolve_user_dept(req.user_id)
         chunks = search_chunks(req.question, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
-        logger.error("Search failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"检索失败: {e}")
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
 
     if not chunks:
         import json
@@ -372,6 +402,33 @@ async def ask_stream(req: AskRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 反馈接口
+# ═══════════════════════════════════════════════════════════════
+
+class FeedbackRequest(BaseModel):
+    message_id: str = Field(..., description="关联的 qa_session_log.message_id")
+    user_id: str = Field("", description="反馈用户 ID")
+    feedback_type: str = Field(..., description="upvote / downvote / handoff")
+    feedback_reason: Optional[str] = Field(None, description="反馈原因代码")
+    feedback_comment: Optional[str] = Field(None, description="反馈备注")
+
+
+@app.post("/api/feedback")
+async def submit_feedback(req: FeedbackRequest):
+    """反馈接口 — 供前端/管理后台使用。"""
+    success = handle_feedback(
+        message_id=req.message_id,
+        user_id=req.user_id,
+        action=req.feedback_type,
+        reason=req.feedback_reason,
+        comment=req.feedback_comment,
+    )
+    if not success:
+        raise HTTPException(status_code=500, detail="反馈处理失败")
+    return {"status": "ok", "message_id": req.message_id}
 
 
 # ═══════════════════════════════════════════════════════════════

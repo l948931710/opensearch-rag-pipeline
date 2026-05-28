@@ -1089,19 +1089,16 @@ def node_classify_and_risk_assess(ctx: dict):
             doc["classification_status"] = "PENDING_AUDIT"
             doc["risk_level"] = "high"  # 直接标记高风险
 
-            # 插入 review_task
+            # 插入 review_task（best-effort，表可能不存在）
             if not simulate_db:
-                conn = None
+                # 1. review_task 插入：非关键路径，失败仅打印警告
                 try:
-                    conn = _get_db_conn(select_db=True)
-                    with conn.cursor() as cursor:
+                    conn_rt = _get_db_conn(select_db=True)
+                    with conn_rt.cursor() as cursor:
                         task_id = f"rev_{doc['doc_id']}_v{doc['version_no']}"
-                        
-                        # Defensively truncate error reason to prevent database column VARCHAR(500) limit issues
                         safe_review_reason = api_error_reason
                         if safe_review_reason and len(safe_review_reason) > 490:
                             safe_review_reason = safe_review_reason[:490] + "..."
-                            
                         cursor.execute("""
                             INSERT INTO review_task (
                                 task_id, doc_id, version_no, review_key, review_type, review_reason, review_status,
@@ -1115,8 +1112,20 @@ def node_classify_and_risk_assess(ctx: dict):
                                 suggested_permission_level = 'restricted',
                                 confidence_score = 0.0
                         """, (task_id, doc["doc_id"], doc["version_no"], doc.get("canonical_key", ""), safe_review_reason, doc["owner_dept"]))
+                        conn_rt.commit()
+                except Exception as rt_err:
+                    print(f"    ⚠️ review_task insert skipped (non-fatal): {rt_err}")
+                finally:
+                    try:
+                        conn_rt.close()
+                    except Exception:
+                        pass
 
-                        # 更新 document_version
+                # 2. document_version 状态更新：标记为 FAILED，继续处理下一个文档
+                conn_dv = None
+                try:
+                    conn_dv = _get_db_conn(select_db=True)
+                    with conn_dv.cursor() as cursor:
                         cursor.execute("""
                             UPDATE document_version
                             SET classification_method = 'LLM',
@@ -1127,14 +1136,18 @@ def node_classify_and_risk_assess(ctx: dict):
                                 content_process_error = %s
                             WHERE doc_id = %s AND version_no = %s
                         """, (api_error_reason, doc["doc_id"], doc["version_no"]))
-                        conn.commit()
-                except Exception as db_err:
-                    if conn: conn.rollback()
-                    print(f"    ⚠️ Failed to insert fail-safe human audit task to RDS: {db_err}")
-                    raise RuntimeError(f"Database write failure in node_classify_document (fail-safe): {db_err}") from db_err
+                        conn_dv.commit()
+                except Exception as dv_err:
+                    if conn_dv:
+                        try: conn_dv.rollback()
+                        except Exception: pass
+                    print(f"    ⚠️ Failed to update document_version for {doc['doc_id']}: {dv_err}")
                 finally:
-                    if conn:
-                        conn.close()
+                    if conn_dv:
+                        conn_dv.close()
+
+            # 跳过此文档，继续处理下一个
+            continue
 
         else:
             # API 调用成功，校验置信度阈值 (0.85)
@@ -1443,8 +1456,8 @@ def node_chunk_documents(ctx: dict):
             overlap_chars=m_overlap,
             split_mode=m_mode,
             prepend_dept=ctx.get("prepend_dept", False),
-            prepend_title=ctx.get("prepend_title", False),
-            prepend_section=ctx.get("prepend_section", False),
+            prepend_title=ctx.get("prepend_title", True),
+            prepend_section=ctx.get("prepend_section", True),
             prepend_for_faq=ctx.get("prepend_for_faq", False),
             max_context_chars=ctx.get("max_context_chars", 100),
             max_context_ratio=ctx.get("max_context_ratio", 0.3)
