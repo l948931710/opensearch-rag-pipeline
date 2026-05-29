@@ -420,6 +420,8 @@ def _process_rag_query(
 
         # 1. 统一检索 + 邻居拼接（top_k=7, stitch window=±1）
         chunks = retrieve_and_enrich(question, user_dept=user_dept)
+        t_retrieval = time.time()
+        retrieval_latency_ms = int((t_retrieval - t0) * 1000)
 
         if not chunks:
             # 无结果也要落库
@@ -433,6 +435,7 @@ def _process_rag_query(
                 query_text=question,
                 answer_text=None,
                 latency_ms=latency_ms,
+                retrieval_latency_ms=retrieval_latency_ms,
                 answer_status="NO_RESULT",
                 opensearch_hit_count=0,
                 conversation_type=conversation_type,
@@ -452,7 +455,9 @@ def _process_rag_query(
             temperature=0.1,
         )
 
-        latency_ms = int((time.time() - t0) * 1000)
+        t_llm = time.time()
+        llm_latency_ms = int((t_llm - t_retrieval) * 1000)
+        latency_ms = int((t_llm - t0) * 1000)
 
         # 3. 追加到会话历史（供下轮使用）
         append_to_history(session_key, question, result["answer"])
@@ -470,6 +475,8 @@ def _process_rag_query(
             retrieved_docs=chunks,
             cited_docs=result.get("sources"),
             latency_ms=latency_ms,
+            retrieval_latency_ms=retrieval_latency_ms,
+            llm_latency_ms=llm_latency_ms,
             answer_status="SUCCESS",
             model_name=result.get("model"),
             opensearch_hit_count=len(chunks),
@@ -662,6 +669,7 @@ async def card_callback(request: Request):
     params = content.get("cardPrivateData", {}).get("params", {})
     action = params.get("action", "")
     message_id = params.get("message_id", "") or out_track_id
+    reason = params.get("reason")  # ActionSheet 菜单传入的踩原因
 
     if not message_id or not action:
         logger.warning("卡片回调缺少 message_id 或 action: body=%s", body)
@@ -672,6 +680,7 @@ async def card_callback(request: Request):
         message_id=message_id,
         user_id=user_id,
         action=action,
+        reason=reason,
     )
 
     # 从数据库重建完整卡片数据（回调响应会覆盖整个 cardParamMap）

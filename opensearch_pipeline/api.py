@@ -245,6 +245,9 @@ async def ask(req: AskRequest):
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
 
+    t_retrieval = time.time()
+    retrieval_latency_ms = int((t_retrieval - t0) * 1000)
+
     if not chunks:
         latency = int((time.time() - t0) * 1000)
         msg_id = generate_message_id()
@@ -254,6 +257,7 @@ async def ask(req: AskRequest):
             user_id=req.user_id or "",
             query_text=req.question,
             latency_ms=latency,
+            retrieval_latency_ms=retrieval_latency_ms,
             answer_status="NO_RESULT",
             opensearch_hit_count=0,
         )
@@ -284,7 +288,9 @@ async def ask(req: AskRequest):
     # 4. 更新会话历史
     _append_to_history(session_id, req.question, result["answer"])
 
-    latency = int((time.time() - t0) * 1000)
+    t_llm = time.time()
+    llm_latency_ms = int((t_llm - t_retrieval) * 1000)
+    latency = int((t_llm - t0) * 1000)
     msg_id = generate_message_id()
 
     # 5. 落库
@@ -298,6 +304,8 @@ async def ask(req: AskRequest):
         retrieved_docs=chunks,
         cited_docs=result.get("sources"),
         latency_ms=latency,
+        retrieval_latency_ms=retrieval_latency_ms,
+        llm_latency_ms=llm_latency_ms,
         answer_status="SUCCESS",
         model_name=result.get("model"),
         opensearch_hit_count=len(chunks),
