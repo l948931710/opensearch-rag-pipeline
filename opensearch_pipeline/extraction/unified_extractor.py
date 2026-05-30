@@ -290,11 +290,12 @@ class UnifiedExtractor:
 
     def _process_embedded_images(self, image_assets: list, task: dict) -> tuple:
         """
-        将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗（并发模式）。
+        将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗（并发 + 去重模式）。
 
         优化策略：
           1. Funnel 1（静态启发式，<1ms/张）串行预过滤，快速丢弃装饰图
-          2. 通过 Funnel 1 的图片并发送入 Funnel 2+3（OCR + VLM），
+          2. MD5 Hash 去重：相同内容的图片只过一次 VLM，其余复用结果
+          3. 通过 Funnel 1 的唯一图片并发送入 Funnel 2+3（OCR + VLM），
              使用 ThreadPoolExecutor，并发度由 RAG_VLM_CONCURRENCY 控制（默认 8）
 
         路由结果：
@@ -313,6 +314,7 @@ class UnifiedExtractor:
         if not image_assets:
             return [], []
 
+        import hashlib
         import time
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from opensearch_pipeline.image_funnel_processor import ImageFunnelProcessor
@@ -345,7 +347,30 @@ class UnifiedExtractor:
         if not candidates:
             return [], []
 
-        # ── Phase 2: Funnel 2+3 并发处理（OCR + VLM） ──
+        # ── Phase 1.5: MD5 Hash 去重 ──
+        # 相同内容的图片（如重复 logo、水印、页眉图）只需过一次 VLM
+        hash_to_candidates = {}  # md5 -> [img_asset, ...]
+        hash_to_representative = {}  # md5 -> 第一张图片（代表）
+
+        for img_asset in candidates:
+            try:
+                with open(img_asset.local_path, "rb") as f:
+                    file_hash = hashlib.md5(f.read()).hexdigest()
+            except Exception:
+                # hash 失败则当作唯一图片处理
+                file_hash = f"fallback_{id(img_asset)}"
+
+            if file_hash not in hash_to_candidates:
+                hash_to_candidates[file_hash] = []
+                hash_to_representative[file_hash] = img_asset
+            hash_to_candidates[file_hash].append(img_asset)
+
+        unique_images = list(hash_to_representative.values())
+        dup_count = len(candidates) - len(unique_images)
+        if dup_count > 0:
+            print(f"      [Hash Dedup] {len(candidates)} candidates → {len(unique_images)} unique ({dup_count} duplicates skipped)")
+
+        # ── Phase 2: Funnel 2+3 并发处理（OCR + VLM），仅处理唯一图片 ──
         max_workers = int(os.environ.get("RAG_VLM_CONCURRENCY", "8"))
         assets = []
         ocr_blocks = []
@@ -357,25 +382,36 @@ class UnifiedExtractor:
                 img_asset.local_path, doc_id, is_public=is_public
             )
 
-        # 使用并发线程池加速 VLM 调用
-        results = []  # (img_asset, funnel_res) 保持提交顺序
+        # 并发处理唯一图片，收集 VLM 结果
+        hash_to_result = {}  # md5 -> funnel_res
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_asset = {
-                pool.submit(_process_single, img): img
-                for img in candidates
-            }
-            for future in as_completed(future_to_asset):
-                img_asset = future_to_asset[future]
+            future_to_hash = {}
+            for file_hash, representative in hash_to_representative.items():
+                future = pool.submit(_process_single, representative)
+                future_to_hash[future] = file_hash
+
+            for future in as_completed(future_to_hash):
+                file_hash = future_to_hash[future]
                 try:
                     funnel_res = future.result()
-                    results.append((img_asset, funnel_res))
+                    hash_to_result[file_hash] = funnel_res
                 except Exception as e:
-                    print(f"      ⚠️ Image funnel failed for {img_asset.original_name}: {e}")
+                    rep = hash_to_representative[file_hash]
+                    print(f"      ⚠️ Image funnel failed for {rep.original_name}: {e}")
+
+        # ── Phase 3: 扇出结果到所有图片（包括重复项） ──
+        all_results = []  # (img_asset, funnel_res)
+        for file_hash, img_assets_group in hash_to_candidates.items():
+            if file_hash not in hash_to_result:
+                continue
+            funnel_res = hash_to_result[file_hash]
+            for img_asset in img_assets_group:
+                all_results.append((img_asset, funnel_res))
 
         # 按 page_num 排序，保持文档内图片的原始顺序
-        results.sort(key=lambda x: (x[0].page_num, x[0].original_name))
+        all_results.sort(key=lambda x: (x[0].page_num, x[0].original_name))
 
-        for img_asset, funnel_res in results:
+        for img_asset, funnel_res in all_results:
             status = funnel_res["status"]
 
             # Funnel 1 结果在 process_image 内部也会触发（双重保护），跳过
@@ -412,9 +448,9 @@ class UnifiedExtractor:
             routed_counts[s] = routed_counts.get(s, 0) + 1
         if routed_counts:
             summary = ", ".join(f"{k}={v}" for k, v in routed_counts.items())
-            avg_ms = (elapsed / len(candidates) * 1000) if candidates else 0
+            avg_ms = (elapsed / len(unique_images) * 1000) if unique_images else 0
             print(f"      [img-funnel] {len(image_assets)} extracted → {len(assets)} kept ({summary})")
-            print(f"      [img-funnel] ⚡ {len(candidates)} images in {elapsed:.1f}s ({avg_ms:.0f}ms/img, workers={max_workers})")
+            print(f"      [img-funnel] ⚡ {len(unique_images)} unique images in {elapsed:.1f}s ({avg_ms:.0f}ms/img, workers={max_workers}, dedup_saved={dup_count})")
 
         return assets, ocr_blocks
 
