@@ -288,14 +288,59 @@ class UnifiedExtractor:
 
     # ── 嵌入图片通用处理 ──
 
+    # ── 跨文档 VLM 结果持久化缓存 ──
+    # 存储位置: scratch/vlm_cache.json（和 embedding_cache.json 同目录）
+    # 缓存 key: 图片文件 MD5 hash
+    # 缓存 value: funnel_result dict (status, visual_summary, reason, width, height, ...)
+    _vlm_cache = None  # lazy-load，类级别共享
+    _vlm_cache_file = None
+
+    @classmethod
+    def _load_vlm_cache(cls) -> dict:
+        """延迟加载 VLM 缓存文件。"""
+        if cls._vlm_cache is not None:
+            return cls._vlm_cache
+
+        import json
+        # __file__ = opensearch_pipeline/extraction/unified_extractor.py
+        # → dirname x3 = project root (same level as scratch/embedding_cache.json)
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        cls._vlm_cache_file = os.path.join(project_root, "scratch", "vlm_cache.json")
+
+        if os.path.exists(cls._vlm_cache_file):
+            try:
+                with open(cls._vlm_cache_file, "r", encoding="utf-8") as f:
+                    cls._vlm_cache = json.load(f)
+                print(f"      [VLM Cache] Loaded {len(cls._vlm_cache)} cached entries from {os.path.basename(cls._vlm_cache_file)}")
+            except Exception:
+                cls._vlm_cache = {}
+        else:
+            cls._vlm_cache = {}
+        return cls._vlm_cache
+
+    @classmethod
+    def _save_vlm_cache(cls):
+        """持久化 VLM 缓存到磁盘。"""
+        import json
+        if cls._vlm_cache is None or cls._vlm_cache_file is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(cls._vlm_cache_file), exist_ok=True)
+            with open(cls._vlm_cache_file, "w", encoding="utf-8") as f:
+                json.dump(cls._vlm_cache, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"      ⚠️ Failed to save VLM cache: {e}")
+
     def _process_embedded_images(self, image_assets: list, task: dict) -> tuple:
         """
-        将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗（并发 + 去重模式）。
+        将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗（并发 + 去重 + 持久缓存）。
 
         优化策略：
           1. Funnel 1（静态启发式，<1ms/张）串行预过滤，快速丢弃装饰图
-          2. MD5 Hash 去重：相同内容的图片只过一次 VLM，其余复用结果
-          3. 通过 Funnel 1 的唯一图片并发送入 Funnel 2+3（OCR + VLM），
+          2. MD5 Hash 去重 + 跨文档持久缓存：
+             - 文档内：相同 hash 图片只过一次 VLM
+             - 跨文档：命中 scratch/vlm_cache.json 的图片直接复用，无需 VLM 调用
+          3. 未命中缓存的唯一图片并发送入 Funnel 2+3（OCR + VLM），
              使用 ThreadPoolExecutor，并发度由 RAG_VLM_CONCURRENCY 控制（默认 8）
 
         路由结果：
@@ -347,30 +392,38 @@ class UnifiedExtractor:
         if not candidates:
             return [], []
 
-        # ── Phase 1.5: MD5 Hash 去重 ──
-        # 相同内容的图片（如重复 logo、水印、页眉图）只需过一次 VLM
-        hash_to_candidates = {}  # md5 -> [img_asset, ...]
+        # ── Phase 1.5: MD5 Hash 去重 + 跨文档缓存查询 ──
+        vlm_cache = self._load_vlm_cache()
+
+        hash_to_candidates = {}   # md5 -> [img_asset, ...]
         hash_to_representative = {}  # md5 -> 第一张图片（代表）
+        hash_to_cached_result = {}   # md5 -> funnel_res（来自持久缓存）
 
         for img_asset in candidates:
             try:
                 with open(img_asset.local_path, "rb") as f:
                     file_hash = hashlib.md5(f.read()).hexdigest()
             except Exception:
-                # hash 失败则当作唯一图片处理
                 file_hash = f"fallback_{id(img_asset)}"
 
             if file_hash not in hash_to_candidates:
                 hash_to_candidates[file_hash] = []
                 hash_to_representative[file_hash] = img_asset
+                # 查询跨文档持久缓存
+                if file_hash in vlm_cache:
+                    hash_to_cached_result[file_hash] = vlm_cache[file_hash]
             hash_to_candidates[file_hash].append(img_asset)
 
-        unique_images = list(hash_to_representative.values())
-        dup_count = len(candidates) - len(unique_images)
-        if dup_count > 0:
-            print(f"      [Hash Dedup] {len(candidates)} candidates → {len(unique_images)} unique ({dup_count} duplicates skipped)")
+        total_unique = len(hash_to_representative)
+        dup_count = len(candidates) - total_unique
+        cache_hit_count = len(hash_to_cached_result)
+        need_vlm_hashes = [h for h in hash_to_representative if h not in hash_to_cached_result]
 
-        # ── Phase 2: Funnel 2+3 并发处理（OCR + VLM），仅处理唯一图片 ──
+        if dup_count > 0 or cache_hit_count > 0:
+            print(f"      [Hash Dedup] {len(candidates)} candidates → {total_unique} unique, "
+                  f"{cache_hit_count} cache hits, {len(need_vlm_hashes)} need VLM")
+
+        # ── Phase 2: Funnel 2+3 并发处理，仅处理未命中缓存的唯一图片 ──
         max_workers = int(os.environ.get("RAG_VLM_CONCURRENCY", "8"))
         assets = []
         ocr_blocks = []
@@ -382,22 +435,38 @@ class UnifiedExtractor:
                 img_asset.local_path, doc_id, is_public=is_public
             )
 
-        # 并发处理唯一图片，收集 VLM 结果
-        hash_to_result = {}  # md5 -> funnel_res
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_hash = {}
-            for file_hash, representative in hash_to_representative.items():
-                future = pool.submit(_process_single, representative)
-                future_to_hash[future] = file_hash
+        # 合并结果：缓存命中 + 新处理
+        hash_to_result = dict(hash_to_cached_result)  # 先放入缓存命中的
 
-            for future in as_completed(future_to_hash):
-                file_hash = future_to_hash[future]
-                try:
-                    funnel_res = future.result()
-                    hash_to_result[file_hash] = funnel_res
-                except Exception as e:
-                    rep = hash_to_representative[file_hash]
-                    print(f"      ⚠️ Image funnel failed for {rep.original_name}: {e}")
+        if need_vlm_hashes:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_hash = {}
+                for file_hash in need_vlm_hashes:
+                    representative = hash_to_representative[file_hash]
+                    future = pool.submit(_process_single, representative)
+                    future_to_hash[future] = file_hash
+
+                for future in as_completed(future_to_hash):
+                    file_hash = future_to_hash[future]
+                    try:
+                        funnel_res = future.result()
+                        hash_to_result[file_hash] = funnel_res
+                        # 写入持久缓存（仅缓存可序列化的字段）
+                        vlm_cache[file_hash] = {
+                            "status": funnel_res.get("status", ""),
+                            "visual_summary": funnel_res.get("visual_summary", ""),
+                            "reason": funnel_res.get("reason", ""),
+                            "width": funnel_res.get("width", 0),
+                            "height": funnel_res.get("height", 0),
+                            "file_size_kb": funnel_res.get("file_size_kb", 0.0),
+                            "ocr_text": funnel_res.get("ocr_text", ""),
+                        }
+                    except Exception as e:
+                        rep = hash_to_representative[file_hash]
+                        print(f"      ⚠️ Image funnel failed for {rep.original_name}: {e}")
+
+            # 处理完本文档后持久化缓存
+            self._save_vlm_cache()
 
         # ── Phase 3: 扇出结果到所有图片（包括重复项） ──
         all_results = []  # (img_asset, funnel_res)
@@ -448,9 +517,11 @@ class UnifiedExtractor:
             routed_counts[s] = routed_counts.get(s, 0) + 1
         if routed_counts:
             summary = ", ".join(f"{k}={v}" for k, v in routed_counts.items())
-            avg_ms = (elapsed / len(unique_images) * 1000) if unique_images else 0
+            vlm_calls = len(need_vlm_hashes)
+            avg_ms = (elapsed / vlm_calls * 1000) if vlm_calls else 0
             print(f"      [img-funnel] {len(image_assets)} extracted → {len(assets)} kept ({summary})")
-            print(f"      [img-funnel] ⚡ {len(unique_images)} unique images in {elapsed:.1f}s ({avg_ms:.0f}ms/img, workers={max_workers}, dedup_saved={dup_count})")
+            print(f"      [img-funnel] ⚡ VLM calls={vlm_calls}, cache_hits={cache_hit_count}, "
+                  f"dedup={dup_count}, time={elapsed:.1f}s ({avg_ms:.0f}ms/call, workers={max_workers})")
 
         return assets, ocr_blocks
 
