@@ -332,6 +332,44 @@ def get_test_data(scenario: str = "normal") -> dict:
                 "发票金额超过多少需要总监审批？",
             ],
         },
+        "embedded_images": {
+            "raw_tasks": [
+                {
+                    "doc_id": "DOC_IMG_DOCX_001",
+                    "version_no": 1,
+                    "bucket_name": "fuling-knowledge-base",
+                    "raw_key": "raw/production/奶茶杯测水试验作业指导书.docx",
+                    "filename": "奶茶杯测水试验作业指导书.docx",
+                    "dept": "production",
+                    "file_ext": "docx",
+                    # 无 mock_text → 使用 local_path 真实文件提取
+                    "local_path": "fuling_chunk_exp/production_注塑事业部_FL-ZS-WI-002《奶茶杯测水试验》作业指导书.docx",
+                },
+                {
+                    "doc_id": "DOC_IMG_PDF_001",
+                    "version_no": 1,
+                    "bucket_name": "fuling-knowledge-base",
+                    "raw_key": "raw/it/电脑安装作业指导书.pdf",
+                    "filename": "电脑安装作业指导书.pdf",
+                    "dept": "it",
+                    "file_ext": "pdf",
+                    "local_path": "fuling_chunk_exp/it_FL-CW-XXH-003-《电脑安装》作业指导书.pdf",
+                },
+            ],
+            "mock_classification": {
+                "category_l1": "sop",
+                "category_l2": "equipment_sop",
+                "permission_level": "public",
+                "kb_type": "public",
+                "faq_eligible": False,
+                "confidence": 0.90,
+                "summary": "含嵌入图片的作业指导书，用于测试图片提取全链路。",
+            },
+            "test_queries": [
+                "奶茶杯测水试验的操作步骤",
+                "电脑安装操作步骤",
+            ],
+        },
     }
 
     return scenarios.get(scenario, scenarios["normal"])
@@ -514,7 +552,7 @@ def main():
     )
     parser.add_argument(
         "--scenario", type=str, default="normal",
-        choices=["normal", "sensitive", "multi", "version_update"],
+        choices=["normal", "sensitive", "multi", "version_update", "embedded_images"],
         help="Test scenario (default: normal)",
     )
     parser.add_argument(

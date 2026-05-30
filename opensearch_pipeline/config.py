@@ -2,19 +2,71 @@
 """
 config.py — 管线配置中心
 
-所有配置从环境变量读取，支持 .env 文件。
-本地模拟模式不需要任何外部服务。
+所有配置从环境变量读取，支持多环境 .env 文件。
+
+环境切换:
+  RAG_ENV=local       → .env + .env.local       (真实 API + 本地 MySQL/OpenSearch)
+  RAG_ENV=test        → .env + .env.test        (真实 API + 阿里云 RDS/HA3，本地测试检索)
+  RAG_ENV=production  → .env + .env.production  (阿里云生产，DataWorks/钉钉服务)
+  未设置              → .env                    (默认，向后兼容)
 """
 
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional
+from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+def _load_env_files():
+    """按 RAG_ENV 加载对应的 .env 文件。"""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    # 找到项目根目录（config.py 所在目录的上一级）
+    project_root = Path(__file__).resolve().parent.parent
+
+    # 1. 先加载 .env（共享配置：API keys, model names）
+    base_env = project_root / ".env"
+    if base_env.exists():
+        load_dotenv(base_env, override=False)
+
+    # 2. 再加载 .env.{RAG_ENV}（环境特定配置：存储层地址/凭证）
+    #    override=True → 环境文件覆盖 .env 中的同名变量
+    rag_env = os.environ.get("RAG_ENV", "").lower()
+    if rag_env:
+        env_file = project_root / f".env.{rag_env}"
+        if env_file.exists():
+            load_dotenv(env_file, override=True)
+        else:
+            print(f"  ⚠️ RAG_ENV={rag_env} 但 {env_file} 不存在，仅使用 .env")
+
+    # 3. 打印环境标识
+    _print_env_banner(rag_env)
+
+def _print_env_banner(rag_env: str):
+    """启动时打印当前环境标识，避免误操作。"""
+    rds_host = os.environ.get("RAG_RDS_HOST", "localhost")
+    ha3_host = os.environ.get("RAG_HA3_ENDPOINT", "")
+    os_host = os.environ.get("RAG_OPENSEARCH_HOST", "") or ha3_host
+    env_label = os.environ.get("RAG_ENVIRONMENT", "development")
+
+    if rag_env == "production":
+        icon = "🚀"
+        label = "PRODUCTION (阿里云生产)"
+    elif rag_env == "test":
+        icon = "🧪"
+        label = "TEST (阿里云测试)"
+    elif rag_env == "local":
+        icon = "🏠"
+        label = "LOCAL (本地开发)"
+    else:
+        icon = "⚙️"
+        label = f"DEFAULT ({env_label})"
+
+    print(f"  {icon} 环境: {label} | RDS={rds_host} | Search={os_host or 'localhost'}")
+
+_load_env_files()
 
 
 @dataclass

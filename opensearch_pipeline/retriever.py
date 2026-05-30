@@ -332,13 +332,17 @@ def search_chunks(
     # 短文本 + 无 section_title 的 chunk 通常是封面页或目录，
     # 包含文档标题导致 BM25 高分，但没有实质内容。
     # 策略：正文 chunk 优先排前面，封面 chunk 排后面（不丢弃，避免无结果）。
+    # 注意：图片 chunk 天然短文本、无 section_title，但含有 visual_summary 语义信息，不应被降权。
     _COVER_MAX_LEN = 200  # 短于此且无 section_title 视为封面/元数据
     content_results = []
     cover_results = []
     for r in results:
         text = r.get("chunk_text", "")
         has_section = bool(r.get("section_title"))
-        if not has_section and len(text) < _COVER_MAX_LEN:
+        chunk_type = r.get("chunk_type", "")
+        if chunk_type == "image":
+            content_results.append(r)
+        elif not has_section and len(text) < _COVER_MAX_LEN:
             cover_results.append(r)
         else:
             content_results.append(r)

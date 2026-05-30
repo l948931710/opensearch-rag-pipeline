@@ -126,8 +126,8 @@ class Chunk:
         if self.extra:
             if "source_image" in self.extra:
                 doc["source_image"] = self.extra["source_image"]
-            if "source_image_vector" in self.extra and self.extra["source_image_vector"] is not None:
-                doc["source_image_vector"] = self.extra["source_image_vector"]
+            if "visual_summary" in self.extra:
+                doc["visual_summary"] = self.extra["visual_summary"]
                 
         return doc
 
@@ -165,6 +165,13 @@ class Chunk:
         if self.sparse_vector_indices:
             doc["sparse_vector_indices"] = list(self.sparse_vector_indices)
             doc["sparse_vector_values"] = list(self.sparse_vector_values or [])
+
+        # 图片 chunk 的多模态 metadata
+        if self.extra:
+            if self.extra.get("source_image"):
+                doc["source_image"] = self.extra["source_image"]
+            if self.extra.get("visual_summary"):
+                doc["visual_summary"] = self.extra["visual_summary"]
 
         return doc
 

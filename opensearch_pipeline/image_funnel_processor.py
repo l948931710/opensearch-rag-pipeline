@@ -171,42 +171,71 @@ class ImageFunnelProcessor:
             # 容灾兜底：如果没有 API KEY，在公开文档下通过，在隔离文档下高风险隔离
             print("    ⚠️ VLM API Key is missing. Falling back to safe defaults.")
             if bypass_safety:
-                return "CLEAN", "[VLM Fallback Summary] Diagram or image illustration content."
+                return "CLEAN", "[VLM Fallback Summary] 图片或示意图内容。"
             else:
                 return "SENSITIVE", ""
 
         import base64
         import requests
         import json
+        import io
 
         try:
-            with open(local_path, "rb") as f:
-                b64_data = base64.b64encode(f.read()).decode("utf-8")
-            
-            ext = os.path.splitext(local_path)[1].lower()
-            mime_type = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+            # ── 大图片压缩：避免 base64 过大导致上传超时 ──
+            file_size = os.path.getsize(local_path)
+            MAX_RAW_BYTES = 500 * 1024  # 500KB 阈值
 
-            # 组装安全与语义判定的多模态 prompt
-            # 如果 bypass_safety 为 True，则不对个人指纹印章进行高敏感检验，从而专注于相关性
+            if file_size > MAX_RAW_BYTES:
+                # 压缩图片到 JPEG quality=60，限制最大边 1280px
+                try:
+                    with Image.open(local_path) as img:
+                        # 转换 RGBA/P 为 RGB（JPEG 不支持 alpha）
+                        if img.mode in ("RGBA", "P"):
+                            img = img.convert("RGB")
+                        # 限制最大边
+                        max_side = 1280
+                        if max(img.size) > max_side:
+                            img.thumbnail((max_side, max_side), Image.LANCZOS)
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=60)
+                        b64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+                        mime_type = "image/jpeg"
+                        compressed_kb = len(buf.getvalue()) / 1024
+                        print(f"    [VLM] Compressed {filename}: {file_size/1024:.0f}KB → {compressed_kb:.0f}KB")
+                except Exception as comp_err:
+                    print(f"    ⚠️ Image compression failed: {comp_err}, using raw file")
+                    with open(local_path, "rb") as f:
+                        b64_data = base64.b64encode(f.read()).decode("utf-8")
+                    ext = os.path.splitext(local_path)[1].lower()
+                    mime_type = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+            else:
+                with open(local_path, "rb") as f:
+                    b64_data = base64.b64encode(f.read()).decode("utf-8")
+                ext = os.path.splitext(local_path)[1].lower()
+                mime_type = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+
+            # ── 组装中文多模态 prompt ──
+            # 要求返回中文 summary，以便 BM25 和 Dense embedding 与中文 query 对齐
             safety_instruction = ""
             if not bypass_safety:
                 safety_instruction = (
-                    "- 'SENSITIVE': If the image contains sensitive corporate red seal stamps, "
-                    "confidential signatures, personal ID cards, passport covers, bank accounts, or safety warning seals."
+                    "- 'SENSITIVE': 如果图片包含敏感的公司红色印章、机密签名、身份证件、"
+                    "护照封面、银行账号或安全警告印章。\n"
                 )
 
             prompt = (
-                "You are an advanced document image layout auditor. Analyze the visual schema of this image page. "
-                "Classify this asset status into one of these categories:\n"
-                f"{safety_instruction}\n"
-                "- 'LOW_RELEVANCE': If the image is a decorative placeholder, margin graphic, stock photograph, or raw layout blank line.\n"
-                "- 'CLEAN': If the image contains rich corporate or business informative schematics, architecture charts, technical tables, data plots, or visual workflows.\n\n"
-                "Return a strict JSON format containing these two keys:\n"
+                "你是一名企业文档图片审核专家。分析这张图片的内容和用途，"
+                "将其归入以下类别之一：\n"
+                f"{safety_instruction}"
+                "- 'LOW_RELEVANCE': 如果图片是装饰性占位图、页边留白图、通用素材图或空白排版线条。\n"
+                "- 'CLEAN': 如果图片包含有价值的企业操作流程图、技术示意图、设备安装步骤、"
+                "数据表格、系统界面截图或工作流程图。\n\n"
+                "请用严格的 JSON 格式返回以下两个字段：\n"
                 "{\n"
                 '  "status": "SENSITIVE" | "LOW_RELEVANCE" | "CLEAN",\n'
-                '  "summary": "A highly precise 100-character description of the technical or informational semantic meaning of the image"\n'
+                '  "summary": "用中文精确描述此图片展示的技术或业务信息内容（约100字）"\n'
                 "}\n"
-                "Do not include any extra code block wrappers or explanations."
+                "不要包含任何代码块标记或多余解释。"
             )
 
             # 请求通义千问多模态端点
@@ -230,7 +259,7 @@ class ImageFunnelProcessor:
                 }
             }
 
-            resp = requests.post(url, json=payload, headers=headers, timeout=40)
+            resp = requests.post(url, json=payload, headers=headers, timeout=60)
             if resp.status_code != 200:
                 raise RuntimeError(f"Qwen-VL VLM HTTP {resp.status_code}: {resp.text[:400]}")
 
@@ -251,7 +280,7 @@ class ImageFunnelProcessor:
                 result_json = json.loads(result_str)
                 
                 status = result_json.get("status", "CLEAN")
-                summary = result_json.get("summary", "[VLM Captured Schema Summary]")
+                summary = result_json.get("summary", "[VLM 内容描述]")
 
                 # 纠合逻辑：如果 bypass_safety 为真，即便是 SENSITIVE 也强制转为 CLEAN
                 if bypass_safety and status == "SENSITIVE":
@@ -261,11 +290,12 @@ class ImageFunnelProcessor:
             except Exception as e:
                 print(f"    ⚠️ Warning failed to parse Qwen-VL response JSON: {e}. Output content: {content[:300]}")
                 # 容灾降级
-                return "CLEAN", "[VLM Analysis Timeout] Informative business asset details."
+                return "CLEAN", "[VLM 解析异常] 企业文档内图片资产。"
 
         except Exception as e:
             print(f"    ⚠️ Warning VLM API execution failed: {e}")
             if bypass_safety:
-                return "CLEAN", f"[VLM Fallback Captioned] Graphic asset {filename} parsed under degradation mode."
+                return "CLEAN", f"[VLM 降级] 图片资产 {filename} 在降级模式下解析。"
             else:
                 return "SENSITIVE", ""
+

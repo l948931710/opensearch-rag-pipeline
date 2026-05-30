@@ -114,13 +114,23 @@ class UnifiedExtractor:
     # ── PDF ──
 
     def _extract_pdf(self, task: dict) -> ExtractionResult:
-        """PDF 提取 + OCR fallback。"""
+        """PDF 提取（文本 + 嵌入图片 + OCR fallback）。"""
         from opensearch_pipeline.extraction.pdf_extractor import extract_pdf
+        from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_pdf
 
         local_path = task.get("local_path", "")
         blocks, page_count, warnings = extract_pdf(local_path)
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
+
+        # 提取嵌入图片 → 三阶段过滤漏斗
+        assets, img_blocks = self._process_embedded_images(
+            extract_images_from_pdf(local_path, task.get("_tmp_dir", ""), max_pages=20),
+            task,
+        )
+        if img_blocks:
+            blocks.extend(img_blocks)
+            flat_text = blocks_to_text(blocks)
 
         result = ExtractionResult(
             doc_id=task["doc_id"],
@@ -134,6 +144,7 @@ class UnifiedExtractor:
             blocks=blocks,
             page_count=page_count,
             warnings=warnings,
+            assets=assets,
         )
 
         # OCR fallback 判断
@@ -145,13 +156,23 @@ class UnifiedExtractor:
     # ── DOCX ──
 
     def _extract_docx(self, task: dict) -> ExtractionResult:
-        """DOCX 提取。"""
+        """DOCX 提取（文本 + 嵌入图片）。"""
         from opensearch_pipeline.extraction.docx_extractor import extract_docx
+        from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_docx
 
         local_path = task.get("local_path", "")
         blocks, warnings = extract_docx(local_path)
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
+
+        # 提取嵌入图片 → 三阶段过滤漏斗
+        assets, img_blocks = self._process_embedded_images(
+            extract_images_from_docx(local_path, task.get("_tmp_dir", "")),
+            task,
+        )
+        if img_blocks:
+            blocks.extend(img_blocks)
+            flat_text = blocks_to_text(blocks)
 
         return ExtractionResult(
             doc_id=task["doc_id"],
@@ -164,12 +185,15 @@ class UnifiedExtractor:
             text_length=len(flat_text),
             blocks=blocks,
             warnings=warnings,
+            assets=assets,
         )
 
     # ── XLSX / XLS ──
 
     def _extract_xlsx(self, task: dict) -> ExtractionResult:
-        """Excel 提取：逐 sheet 逐行读取单元格文本。"""
+        """Excel 提取（文本 + 嵌入图片）：逐 sheet 逐行读取单元格文本。"""
+        from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_xlsx
+
         local_path = task.get("local_path", "")
         file_ext = task.get("file_ext", "xlsx").lower()
         blocks = []
@@ -198,6 +222,14 @@ class UnifiedExtractor:
         except Exception as e:
             warnings.append(f"Failed to extract Excel file: {e}")
 
+        # 提取嵌入图片 → 三阶段过滤漏斗
+        assets, img_blocks = self._process_embedded_images(
+            extract_images_from_xlsx(local_path, task.get("_tmp_dir", "")),
+            task,
+        )
+        if img_blocks:
+            blocks.extend(img_blocks)
+
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
 
@@ -212,6 +244,7 @@ class UnifiedExtractor:
             text_length=len(flat_text),
             blocks=blocks,
             warnings=warnings,
+            assets=assets,
         )
 
     # ── Plain text / Markdown ──
@@ -252,6 +285,83 @@ class UnifiedExtractor:
             text_length=len(flat_text),
             blocks=blocks,
         )
+
+    # ── 嵌入图片通用处理 ──
+
+    def _process_embedded_images(self, image_assets: list, task: dict) -> tuple:
+        """
+        将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗。
+
+        与 _extract_image 的处理逻辑一致：
+          - DISCARD_DECORATIVE → 丢弃，不记录
+          - ROUTE_TO_TEXT → 记录 asset + 追加 OCR 文本块到 blocks
+          - ROUTE_TO_VECTOR → 记录 asset（downstream 自动创建 image chunk）
+          - QUARANTINE_SENSITIVE → 记录 asset + warning
+
+        Args:
+            image_assets: ImageAsset 列表（来自 image_extraction_utils）。
+            task: 当前文档的 task dict。
+
+        Returns:
+            (assets, ocr_blocks): assets 列表和 ROUTE_TO_TEXT 产生的文本块列表。
+        """
+        if not image_assets:
+            return [], []
+
+        from opensearch_pipeline.image_funnel_processor import ImageFunnelProcessor
+
+        processor = ImageFunnelProcessor(simulate=self.simulate)
+        is_public = "_quarantine/" not in task.get("raw_key", "")
+        assets = []
+        ocr_blocks = []
+
+        for img_asset in image_assets:
+            try:
+                funnel_res = processor.process_image(
+                    img_asset.local_path, task["doc_id"], is_public=is_public
+                )
+            except Exception as e:
+                print(f"      ⚠️ Image funnel failed for {img_asset.original_name}: {e}")
+                continue
+
+            status = funnel_res["status"]
+
+            # Funnel 1 淘汰的装饰图：不记录
+            if status == "DISCARD_DECORATIVE":
+                continue
+
+            asset_dict = {
+                "filename": os.path.basename(img_asset.local_path),
+                "local_path": img_asset.local_path,
+                "page_num": img_asset.page_num,
+                "status": status,
+                "width": funnel_res.get("width", 0),
+                "height": funnel_res.get("height", 0),
+                "file_size_kb": funnel_res.get("file_size_kb", 0.0),
+                "ocr_text": funnel_res.get("ocr_text", ""),
+                "visual_summary": funnel_res.get("visual_summary", ""),
+                "reason": funnel_res.get("reason", ""),
+            }
+            assets.append(asset_dict)
+
+            # ROUTE_TO_TEXT：追加 OCR 文本块（与 _extract_image 行为一致）
+            if status == "ROUTE_TO_TEXT" and funnel_res.get("ocr_text"):
+                ocr_blocks.append(ExtractedBlock(
+                    block_type="ocr_text",
+                    text=funnel_res["ocr_text"],
+                    page_num=img_asset.page_num,
+                    source="ocr",
+                ))
+
+        routed_counts = {}
+        for a in assets:
+            s = a["status"]
+            routed_counts[s] = routed_counts.get(s, 0) + 1
+        if routed_counts:
+            summary = ", ".join(f"{k}={v}" for k, v in routed_counts.items())
+            print(f"      [img-funnel] {len(image_assets)} extracted → {len(assets)} kept ({summary})")
+
+        return assets, ocr_blocks
 
     # ── Image (direct OCR) ──
 

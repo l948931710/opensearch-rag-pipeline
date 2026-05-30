@@ -503,6 +503,7 @@ def node_extract_text_with_ocr(ctx: dict):
     try:
         for task in tasks:
             doc_id = task["doc_id"]
+            task["_tmp_dir"] = tmp_dir  # 传递给 image_extraction_utils 导出嵌入图片
 
             # 生产模式：从 OSS 下载原始文件到本地
             if not simulate_oss and "mock_text" not in task:
@@ -540,6 +541,29 @@ def node_extract_text_with_ocr(ctx: dict):
                     f"{result.extract_method} [{block_summary}]"
                 )
     finally:
+        # ─── 在清理 tmp 之前，将 ROUTE_TO_VECTOR 的图片上传到 OSS ───
+        # 解决 local_path 生命周期问题：downstream 的 embedding 节点不再依赖 local_path
+        bucket_upload, is_sim_oss = _get_oss_bucket(ctx)
+        if not is_sim_oss and bucket_upload:
+            for result in extractions:
+                if not hasattr(result, 'assets') or not result.assets:
+                    continue
+                for asset in result.assets:
+                    local_img = asset.get("local_path", "")
+                    if asset.get("status") == "ROUTE_TO_VECTOR" and local_img and os.path.exists(local_img):
+                        dept = "unknown"
+                        if hasattr(result, 'source_key') and result.source_key:
+                            parts = result.source_key.split("/")
+                            if len(parts) > 1:
+                                dept = parts[1]
+                        oss_key = f"processing/assets/{dept}/{result.doc_id}/v{result.version_no}/{os.path.basename(local_img)}"
+                        try:
+                            bucket_upload.put_object_from_file(oss_key, local_img)
+                            asset["oss_key"] = oss_key
+                            print(f"    📤 Uploaded image to OSS: {oss_key}")
+                        except Exception as e:
+                            print(f"    ⚠️ Failed to upload image to OSS: {e}")
+
         # 清理临时文件
         import shutil
         try:
@@ -1514,7 +1538,10 @@ def node_chunk_documents(ctx: dict):
                     doc_id = doc["doc_id"]
                     source_image_url = f"processing/assets/{dept_code}/{doc_id}/v{version}/{filename}"
                     
-                    chunk_text = f"[Image Schematic] {visual_summary}"
+                    # 图片 chunk_text 加入文档标题前缀，与文本 chunk 一致，提升 BM25 关键词匹配
+                    doc_title = doc.get("title", "")
+                    context_prefix = f"【文档:{doc_title}】" if doc_title else ""
+                    chunk_text = f"{context_prefix} [图片描述] {visual_summary}" if context_prefix else f"[图片描述] {visual_summary}"
                     
                     from opensearch_pipeline.chunker import _generate_chunk_id, _estimate_tokens
                     chunk_id = _generate_chunk_id(doc_id, version, current_chunk_count)
@@ -1528,7 +1555,7 @@ def node_chunk_documents(ctx: dict):
                         chunk_text=chunk_text,
                         token_count=_estimate_tokens(chunk_text),
                         raw_text=chunk_text,
-                        context_prefix="",
+                        context_prefix=context_prefix,
                         embedding_text=chunk_text,
                         page_num=asset.get("page_num", 1),
                         section_title=None,
@@ -1547,8 +1574,8 @@ def node_chunk_documents(ctx: dict):
                         index_status="NOT_INDEXED",
                         extra={
                             "source_image": source_image_url,
-                            "source_image_vector": None,
-                            "local_path": asset.get("local_path", "")
+                            "visual_summary": visual_summary,
+                            "oss_key": asset.get("oss_key", ""),
                         }
                     )
                     chunks.append(img_chunk)
@@ -1784,26 +1811,33 @@ def node_write_chunk_meta(ctx: dict):
                 for chunk in valid_chunks:
                     rag_ready_key = rag_ready_map.get(chunk.doc_id, "")
                     preview = chunk.chunk_text[:200]
+
+                    # 序列化 extra dict → JSON 字符串（图片 chunk 的 source_image/visual_summary/oss_key）
+                    extra_json_val = None
+                    if chunk.extra:
+                        import json as _json
+                        extra_json_val = _json.dumps(chunk.extra, ensure_ascii=False)
+
                     cursor.execute("""
                         INSERT INTO chunk_meta (
                             chunk_id, doc_id, version_no, chunk_index, page_num, section_title,
                             chunk_text_preview, source_url, chunk_type, chunk_text, token_count,
                             source, rag_ready_key, permission_level, owner_dept, category_l1,
                             category_l2, sensitive_redacted, is_active, embedding_status,
-                            index_status, embedding_model
+                            index_status, embedding_model, extra_json
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s,
                             %s, %s, %s, %s,
-                            %s, %s
+                            %s, %s, %s
                         )
                     """, (
                         chunk.chunk_id, chunk.doc_id, chunk.version_no, chunk.chunk_index, chunk.page_num, chunk.section_title,
                         preview, chunk.source_oss_key, chunk.chunk_type, chunk.chunk_text, chunk.token_count,
                         chunk.source, rag_ready_key, chunk.permission_level, chunk.owner_dept, chunk.category_l1,
                         chunk.category_l2, chunk.sensitive_redacted, chunk.is_active, chunk.embedding_status,
-                        chunk.index_status, chunk.embedding_model
+                        chunk.index_status, chunk.embedding_model, extra_json_val
                     ))
                     written += 1
                 conn.commit()
@@ -2245,16 +2279,8 @@ def node_generate_embeddings(ctx: dict):
             chunk.embedding_model = embedding_model
             chunk.embedding_status = "DONE"
 
-            # ─── 图像多模态向量仿真 (One-Peace 768 维) ───
-            if chunk.chunk_type == "image":
-                h_img = hashlib.sha256((chunk.chunk_text + "_multimodal").encode()).hexdigest()
-                fake_img_vector = [
-                    (int(h_img[i * 2 : i * 2 + 2], 16) - 128) / 128.0
-                    for i in range(min(768, 32))
-                ]
-                if len(fake_img_vector) < 768:
-                    fake_img_vector.extend([0.0] * (768 - len(fake_img_vector)))
-                chunk.extra["source_image_vector"] = fake_img_vector
+            # 图像 chunk 已通过 chunk_text 走统一 text-embedding-v4 路径
+            # 不再需要独立的多模态向量（实验证明 text-embedding-v4 + visual_summary 效果最优）
             
         print(f"    └─ Generated {len(chunks)} embeddings (model={embedding_model}, dim={embedding_dim})")
         print(f"       ⚡ Note: using simulated vectors (hash-based) for local testing")
@@ -2277,12 +2303,57 @@ def node_generate_embeddings(ctx: dict):
         max_retries = config.embedding.max_retries  # default: 3
         request_timeout = 60  # seconds per HTTP request
 
-        if is_dashscope:
-            print(f"    └─ Calling DashScope API for {len(chunks)} chunks (batch_size={batch_size}, model={embedding_model}, dense+sparse, max_retries={max_retries})...")
+        # ── 本地 embedding 缓存（与 tests/eval 共享同一份 cache 文件）──
+        _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _cache_file = os.path.join(_project_root, "scratch", "embedding_cache.json")
+        _cache = {}
+        if os.path.exists(_cache_file):
+            try:
+                with open(_cache_file, "r", encoding="utf-8") as _cf:
+                    _cache = json.load(_cf)
+            except Exception:
+                _cache = {}
+
+        def _cache_key(text):
+            return hashlib.md5(f"{embedding_model}_{text}".encode("utf-8")).hexdigest()
+
+        def _save_cache():
+            try:
+                os.makedirs(os.path.dirname(_cache_file), exist_ok=True)
+                with open(_cache_file, "w", encoding="utf-8") as _cf:
+                    json.dump(_cache, _cf, ensure_ascii=False)
+            except Exception as e:
+                print(f"    ⚠️ Failed to save embedding cache: {e}")
+
+        # 分离 cache hit / miss
+        cache_hits = 0
+        miss_chunks = []
+        for chunk in chunks:
+            ck = _cache_key(chunk.chunk_text)
+            sp_ck = f"sp_{ck}"
+            if ck in _cache:
+                chunk.embedding_vector = _cache[ck]
+                chunk.embedding_model = embedding_model
+                chunk.embedding_status = "DONE"
+                sp_data = _cache.get(sp_ck, {})
+                if sp_data:
+                    chunk.sparse_vector_indices = sp_data.get("indices", [])
+                    chunk.sparse_vector_values = sp_data.get("values", [])
+                cache_hits += 1
+            else:
+                miss_chunks.append(chunk)
+
+        if cache_hits > 0:
+            print(f"    └─ Embedding cache hit: {cache_hits}/{len(chunks)} chunks (from {os.path.basename(_cache_file)})")
+
+        if not miss_chunks:
+            print(f"    └─ All {len(chunks)} chunks served from cache, no API calls needed")
+        elif is_dashscope:
+            print(f"    └─ Calling DashScope API for {len(miss_chunks)} cache-miss chunks (batch_size={batch_size}, model={embedding_model}, dense+sparse, max_retries={max_retries})...")
             # 使用原生 DashScope API (非 compatible-mode) 以获取 sparse embedding
             url = f"{base_url.rstrip('/')}/api/v1/services/embeddings/text-embedding/text-embedding"
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i:i+batch_size]
+            for i in range(0, len(miss_chunks), batch_size):
+                batch = miss_chunks[i:i+batch_size]
                 payload = {
                     "model": embedding_model,
                     "input": {"texts": [c.chunk_text for c in batch]},
@@ -2328,6 +2399,16 @@ def node_generate_embeddings(ctx: dict):
                                     # 保底: 提供默认 sparse 以免 HA3 索引排除该文档
                                     batch[item_idx].sparse_vector_indices = [0]
                                     batch[item_idx].sparse_vector_values = [0.001]
+                        # 写入缓存
+                        for c in batch:
+                            if c.embedding_status == "DONE":
+                                ck = _cache_key(c.chunk_text)
+                                _cache[ck] = c.embedding_vector
+                                sp_data = {}
+                                if hasattr(c, 'sparse_vector_indices') and c.sparse_vector_indices:
+                                    sp_data = {"indices": c.sparse_vector_indices, "values": c.sparse_vector_values}
+                                if sp_data:
+                                    _cache[f"sp_{ck}"] = sp_data
                         last_error = None
                         break  # success
                     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -2365,10 +2446,12 @@ def node_generate_embeddings(ctx: dict):
                         c.embedding_status = "FAILED"
 
                 time.sleep(1)
-        else:
-            print(f"    └─ Calling Gemini API for {len(chunks)} chunks (batch_size={batch_size}, model={embedding_model}, max_retries={max_retries})...")
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i:i+batch_size]
+            _save_cache()
+            print(f"    └─ Embedding cache updated: {len(_cache)} total entries")
+        elif not is_dashscope and miss_chunks:
+            print(f"    └─ Calling Gemini API for {len(miss_chunks)} cache-miss chunks (batch_size={batch_size}, model={embedding_model}, max_retries={max_retries})...")
+            for i in range(0, len(miss_chunks), batch_size):
+                batch = miss_chunks[i:i+batch_size]
                 url = f"{base_url}/models/{embedding_model}:batchEmbedContents"
                 payload = {
                     "requests": [
@@ -2393,6 +2476,11 @@ def node_generate_embeddings(ctx: dict):
                             batch[idx].embedding_vector = item["values"]
                             batch[idx].embedding_model = embedding_model
                             batch[idx].embedding_status = "DONE"
+                        # 写入缓存
+                        for c in batch:
+                            if c.embedding_status == "DONE":
+                                ck = _cache_key(c.chunk_text)
+                                _cache[ck] = c.embedding_vector
                         last_error = None
                         break  # success
                     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -2419,61 +2507,15 @@ def node_generate_embeddings(ctx: dict):
                     raise RuntimeError(f"Gemini API invocation failed during embedding generation: {last_error}")
 
                 time.sleep(1)
-            
-        # ─── 生产环境调用 Aliyun One-Peace 多模态模型 ───
+            _save_cache()
+            print(f"    └─ Embedding cache updated: {len(_cache)} total entries")
+        # ─── 图片 chunk embedding 说明 ───
+        # 实验证明 text-embedding-v4 + visual_summary 文本描述 = 最优检索效果
+        # 图片 chunk 已通过 chunk_text ("[Image Schematic] {visual_summary}") 走统一批量 text-embedding-v4 路径
+        # 不再需要独立的多模态 embedding 模型（One-Peace 已废弃）
         image_chunks = [c for c in chunks if c.chunk_type == "image"]
         if image_chunks:
-            print(f"    └─ Generating Multimodal Embeddings for {len(image_chunks)} image chunks using Aliyun One-Peace...")
-            one_peace_model = "multimodal-embedding-one-peace-v1"
-            for img_chunk in image_chunks:
-                local_img_path = img_chunk.extra.get("local_path", "")
-                if os.path.exists(local_img_path):
-                    try:
-                        with open(local_img_path, "rb") as f:
-                            b64_img = base64.b64encode(f.read()).decode("utf-8")
-                        ext = os.path.splitext(local_img_path)[1].lower()
-                        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
-                        
-                        headers = {
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json"
-                        }
-                        payload = {
-                            "model": one_peace_model,
-                            "input": {
-                                "contents": [
-                                    {"image": f"data:{mime};base64,{b64_img}"},
-                                    {"text": img_chunk.chunk_text}
-                                ]
-                            }
-                        }
-                        dashscope_v1 = base_url.rstrip('/')
-                        if not dashscope_v1.endswith("api/v1") and "dashscope" in dashscope_v1:
-                            # 从 base_url 提取域名，保持 VPC/公网一致
-                            import re as _re
-                            _m = _re.search(r'https?://([^/]+)', dashscope_v1)
-                            _host = _m.group(1) if _m else "dashscope.aliyuncs.com"
-                            dashscope_v1 = f"https://{_host}/api/v1"
-                        op_url = f"{dashscope_v1}/services/aigc/multimodal-embedding/generation"
-                        
-                        resp = requests.post(op_url, json=payload, headers=headers, timeout=30)
-                        resp.raise_for_status()
-                        op_data = resp.json()
-                        vector = op_data.get("output", {}).get("embedding")
-                        if vector:
-                            img_chunk.extra["source_image_vector"] = vector
-                            print(f"       ✅ Successfully generated multimodal embedding for {os.path.basename(local_img_path)}")
-                        else:
-                            raise ValueError(f"No embedding found in output: {op_data}")
-                    except Exception as e:
-                        print(f"    ⚠️ Warning: One-Peace Multimodal embedding generation failed for {os.path.basename(local_img_path)}: {e}")
-                        is_public = img_chunk.risk_level == "low"
-                        if not is_public:
-                            raise RuntimeError(f"Multimodal embedding failure on quarantined image asset: {e}")
-                        else:
-                            img_chunk.extra["source_image_vector"] = None
-                else:
-                    print(f"    ⚠️ Local image file {local_img_path} not found for multimodal embedding. Skipping.")
+            print(f"    └─ {len(image_chunks)} image chunks embedded via text-embedding-v4 (visual_summary text, unified path)")
 
         print(f"    └─ Completed real embeddings (model={embedding_model}, dim={embedding_dim}).")
 

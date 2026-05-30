@@ -9,7 +9,6 @@ build/
 .ruff_cache/
 .env
 .env.local
-.env.production
 *.log
 index-jobs/
 rag-ready/
@@ -25,3 +24,5 @@ work_report*.svg
 convert_report.js
 node_modules/
 .DS_Store
+.env.test
+.env.production
