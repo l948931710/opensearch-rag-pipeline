@@ -290,9 +290,14 @@ class UnifiedExtractor:
 
     def _process_embedded_images(self, image_assets: list, task: dict) -> tuple:
         """
-        将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗。
+        将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗（并发模式）。
 
-        与 _extract_image 的处理逻辑一致：
+        优化策略：
+          1. Funnel 1（静态启发式，<1ms/张）串行预过滤，快速丢弃装饰图
+          2. 通过 Funnel 1 的图片并发送入 Funnel 2+3（OCR + VLM），
+             使用 ThreadPoolExecutor，并发度由 RAG_VLM_CONCURRENCY 控制（默认 8）
+
+        路由结果：
           - DISCARD_DECORATIVE → 丢弃，不记录
           - ROUTE_TO_TEXT → 记录 asset + 追加 OCR 文本块到 blocks
           - ROUTE_TO_VECTOR → 记录 asset（downstream 自动创建 image chunk）
@@ -308,25 +313,72 @@ class UnifiedExtractor:
         if not image_assets:
             return [], []
 
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from opensearch_pipeline.image_funnel_processor import ImageFunnelProcessor
 
         processor = ImageFunnelProcessor(simulate=self.simulate)
         is_public = "_quarantine/" not in task.get("raw_key", "")
-        assets = []
-        ocr_blocks = []
+        doc_id = task["doc_id"]
+
+        # ── Phase 1: Funnel 1 串行预过滤（<1ms/张，无需并发） ──
+        candidates = []  # 通过 Funnel 1 的图片
+        discard_count = 0
 
         for img_asset in image_assets:
             try:
-                funnel_res = processor.process_image(
-                    img_asset.local_path, task["doc_id"], is_public=is_public
-                )
+                w, h, kb = processor._static_heuristics(img_asset.local_path)
+                aspect = max(w / max(h, 1), h / max(w, 1))
+                if w < 50 or h < 50 or kb < 3.0 or aspect > 8.0:
+                    fname = os.path.basename(img_asset.local_path)
+                    print(f"    [Funnel 1] Discarded decorative image: {fname} ({w}x{h}, {kb:.1f}KB, ratio={aspect:.1f})")
+                    discard_count += 1
+                    continue
+                candidates.append(img_asset)
             except Exception as e:
-                print(f"      ⚠️ Image funnel failed for {img_asset.original_name}: {e}")
+                print(f"      ⚠️ Funnel 1 heuristic failed for {img_asset.original_name}: {e}")
                 continue
 
+        if discard_count:
+            print(f"      [Funnel 1] Pre-filtered: {discard_count} decorative, {len(candidates)} remaining")
+
+        if not candidates:
+            return [], []
+
+        # ── Phase 2: Funnel 2+3 并发处理（OCR + VLM） ──
+        max_workers = int(os.environ.get("RAG_VLM_CONCURRENCY", "8"))
+        assets = []
+        ocr_blocks = []
+        t0 = time.time()
+
+        def _process_single(img_asset):
+            """单张图片的 Funnel 2+3 处理（线程安全）。"""
+            return processor.process_image(
+                img_asset.local_path, doc_id, is_public=is_public
+            )
+
+        # 使用并发线程池加速 VLM 调用
+        results = []  # (img_asset, funnel_res) 保持提交顺序
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_asset = {
+                pool.submit(_process_single, img): img
+                for img in candidates
+            }
+            for future in as_completed(future_to_asset):
+                img_asset = future_to_asset[future]
+                try:
+                    funnel_res = future.result()
+                    results.append((img_asset, funnel_res))
+                except Exception as e:
+                    print(f"      ⚠️ Image funnel failed for {img_asset.original_name}: {e}")
+
+        # 按 page_num 排序，保持文档内图片的原始顺序
+        results.sort(key=lambda x: (x[0].page_num, x[0].original_name))
+
+        for img_asset, funnel_res in results:
             status = funnel_res["status"]
 
-            # Funnel 1 淘汰的装饰图：不记录
+            # Funnel 1 结果在 process_image 内部也会触发（双重保护），跳过
             if status == "DISCARD_DECORATIVE":
                 continue
 
@@ -353,13 +405,16 @@ class UnifiedExtractor:
                     source="ocr",
                 ))
 
+        elapsed = time.time() - t0
         routed_counts = {}
         for a in assets:
             s = a["status"]
             routed_counts[s] = routed_counts.get(s, 0) + 1
         if routed_counts:
             summary = ", ".join(f"{k}={v}" for k, v in routed_counts.items())
+            avg_ms = (elapsed / len(candidates) * 1000) if candidates else 0
             print(f"      [img-funnel] {len(image_assets)} extracted → {len(assets)} kept ({summary})")
+            print(f"      [img-funnel] ⚡ {len(candidates)} images in {elapsed:.1f}s ({avg_ms:.0f}ms/img, workers={max_workers})")
 
         return assets, ocr_blocks
 
