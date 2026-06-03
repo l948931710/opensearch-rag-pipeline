@@ -33,7 +33,8 @@ class ImageFunnelProcessor:
             simulate=self.simulate or self.simulate_api
         )
 
-    def process_image(self, local_path: str, doc_id: str, is_public: bool = True) -> Dict[str, Any]:
+    def process_image(self, local_path: str, doc_id: str, is_public: bool = True,
+                       doc_title: str = "") -> Dict[str, Any]:
         """
         三阶段级联过滤单张图像。
         
@@ -42,12 +43,16 @@ class ImageFunnelProcessor:
             doc_id: 关联的文档ID。
             is_public: 该图片对应的原始文档是否在普通 raw 目录下（无 _quarantine/ 路径标记）。
                        若为 True，则表示内部公开文档，完全绕过 VLM 敏感内容审计 (Funnel 3)。
+            doc_title: 文档标题，为 VLM 提供业务上下文。
                        
         返回:
             Dict[str, Any]: 包含路由决策结果的元数据字典。
                 - "status": "DISCARD_DECORATIVE" | "ROUTE_TO_TEXT" | "ROUTE_TO_VECTOR" | "QUARANTINE_SENSITIVE"
                 - "ocr_text": OCR 提取的文本（仅在 ROUTE_TO_TEXT 或有效时存在）
-                - "visual_summary": VLM 语义摘要（仅在 ROUTE_TO_VECTOR 时存在）
+                - "visual_summary": VLM caption（仅在 ROUTE_TO_VECTOR 时存在）
+                - "image_category": VLM 判断的图片类别（仅在 ROUTE_TO_VECTOR 时存在）
+
+                - "vlm_annotation_map": VLM 识别的标注映射（仅在 ROUTE_TO_VECTOR 时存在）
                 - "width": 像素宽
                 - "height": 像素高
                 - "file_size_kb": 文件大小 (KB)
@@ -89,11 +94,14 @@ class ImageFunnelProcessor:
         # 如果是普通 raw 目录下的内部公开文档，强制 bypass 安全性及敏感印章审计，不向 VLM 传递敏感内容检验需求
         bypass_safety = is_public
         
-        vlm_status, visual_summary = self._vlm_audit_and_summary(
+        vlm_result = self._vlm_audit_and_summary(
             local_path=local_path,
             doc_id=doc_id,
-            bypass_safety=bypass_safety
+            bypass_safety=bypass_safety,
+            doc_title=doc_title,
+            ocr_text=ocr_text.strip(),
         )
+        vlm_status = vlm_result["status"]
 
         if vlm_status == "SENSITIVE":
             print(f"    [Funnel 3] 🚨 Sensitive content detected in non-public asset: {filename}")
@@ -115,10 +123,15 @@ class ImageFunnelProcessor:
             }
         else:
             # ROUTE_TO_VECTOR
-            print(f"    [Funnel 3] Routed image to vector queue: {filename} -> Summary: {visual_summary}")
+            caption = vlm_result.get("caption", "")
+            img_cat = vlm_result.get("image_category", "unknown")
+            anno_map = vlm_result.get("annotation_map", {})
+            print(f"    [Funnel 3] Routed to vector: {filename} -> [{img_cat}] {caption[:80]}")
             return {
                 "status": "ROUTE_TO_VECTOR",
-                "visual_summary": visual_summary,
+                "visual_summary": caption,
+                "image_category": img_cat,
+                "vlm_annotation_map": anno_map,
                 "ocr_text": ocr_text.strip(),
                 "width": width,
                 "height": height,
@@ -138,13 +151,18 @@ class ImageFunnelProcessor:
             print(f"    ⚠️ Warning failed to read image heuristics: {e}")
             return 0, 0, 0.0
 
-    def _vlm_audit_and_summary(self, local_path: str, doc_id: str, bypass_safety: bool) -> Tuple[str, str]:
+    def _vlm_audit_and_summary(self, local_path: str, doc_id: str, bypass_safety: bool,
+                                doc_title: str = "", ocr_text: str = "") -> Dict[str, Any]:
         """
-        调用通义千问多模态大模型进行安全与语义审计。
+        调用通义千问多模态大模型进行安全与语义审计 + 结构化语义提取。
         
         返回:
-            Tuple[str, str]: (safety_and_relevance_status, summary_text)
-                status 可以为: "CLEAN", "SENSITIVE", "LOW_RELEVANCE"
+            Dict[str, Any]: {
+                "status": "CLEAN" | "SENSITIVE" | "LOW_RELEVANCE",
+                "caption": str,
+                "image_category": str,
+                "annotation_map": Dict[str, str],
+            }
         """
         filename = os.path.basename(local_path).lower()
 
@@ -152,28 +170,37 @@ class ImageFunnelProcessor:
         if self.simulate or self.simulate_api:
             # 模拟审计机制：通过文件名或特定的模拟前缀测试
             if not bypass_safety and any(k in filename for k in ["seal", "stamp", "id_card", "signature", "confidential"]):
-                return "SENSITIVE", ""
+                return {"status": "SENSITIVE", "caption": "", "image_category": "decorative",
+                        "annotation_map": {}}
             
             if any(k in filename for k in ["logo", "banner", "decoration", "spacer", "background"]):
-                return "LOW_RELEVANCE", ""
+                return {"status": "LOW_RELEVANCE", "caption": "", "image_category": "decorative",
+                        "annotation_map": {}}
 
             # 正常高价值商业图表
-            summary = f"[Simulated Multimodal Caption] An informative diagram or chart found in doc {doc_id} describing system workflows."
-            return "CLEAN", summary
+            return {
+                "status": "CLEAN",
+                "caption": f"[Simulated] Informative diagram in doc {doc_id} describing system workflows.",
+                "image_category": "step_screenshot",
+                "annotation_map": {},
+            }
 
         # ── 生产模式：调用阿里云通义千问 Qwen-VL 视觉大模型 ──
         config = get_config()
         api_key = config.ocr.api_key
         api_base_url = config.ocr.api_base_url
-        model_name = config.ocr.model
+        # VLM 使用独立模型配置，fallback 到 OCR 模型
+        model_name = config.ocr.vlm_model or config.ocr.model
 
         if not api_key:
             # 容灾兜底：如果没有 API KEY，在公开文档下通过，在隔离文档下高风险隔离
             print("    ⚠️ VLM API Key is missing. Falling back to safe defaults.")
             if bypass_safety:
-                return "CLEAN", "[VLM Fallback Summary] 图片或示意图内容。"
+                return {"status": "CLEAN", "caption": "[VLM Fallback] 图片或示意图内容。",
+                        "image_category": "unknown", "annotation_map": {}}
             else:
-                return "SENSITIVE", ""
+                return {"status": "SENSITIVE", "caption": "", "image_category": "unknown",
+                        "annotation_map": {}}
 
         import base64
         import requests
@@ -189,10 +216,8 @@ class ImageFunnelProcessor:
                 # 压缩图片到 JPEG quality=60，限制最大边 1280px
                 try:
                     with Image.open(local_path) as img:
-                        # 转换 RGBA/P 为 RGB（JPEG 不支持 alpha）
                         if img.mode in ("RGBA", "P"):
                             img = img.convert("RGB")
-                        # 限制最大边
                         max_side = 1280
                         if max(img.size) > max_side:
                             img.thumbnail((max_side, max_side), Image.LANCZOS)
@@ -214,88 +239,166 @@ class ImageFunnelProcessor:
                 ext = os.path.splitext(local_path)[1].lower()
                 mime_type = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
 
-            # ── 组装中文多模态 prompt ──
-            # 要求返回中文 summary，以便 BM25 和 Dense embedding 与中文 query 对齐
+            # ── 组装结构化 prompt ──
             safety_instruction = ""
             if not bypass_safety:
                 safety_instruction = (
-                    "- 'SENSITIVE': 如果图片包含敏感的公司红色印章、机密签名、身份证件、"
+                    "- 'SENSITIVE': 图片包含公司红色印章、机密签名、身份证件、"
                     "护照封面、银行账号或安全警告印章。\n"
                 )
 
+            # 上下文信息（可选）
+            context_block = ""
+            if doc_title or ocr_text:
+                context_parts = []
+                if doc_title:
+                    context_parts.append(f"文档标题：{doc_title[:100]}")
+                if ocr_text:
+                    context_parts.append(f"图片OCR文本：{ocr_text[:300]}")
+                context_block = "\n【参考信息】\n" + "\n".join(context_parts) + "\n"
+
             prompt = (
-                "你是一名企业文档图片审核专家。分析这张图片的内容和用途，"
-                "将其归入以下类别之一：\n"
+                "你是企业工业SOP图文知识库的图片语义解析器。"
+                "分析这张图片并输出严格JSON，不要输出Markdown或多余解释。\n\n"
+                "【业务背景】\n"
+                "文档来自塑料制品企业的SOP、U8/ERP/MES操作手册、生产检验流程、"
+                "验货流程、设备点检、包装规范、质量测试说明等。\n"
+                f"{context_block}\n"
+                "【任务】\n"
+                "1. 判断 status（安全与价值过滤）：\n"
                 f"{safety_instruction}"
-                "- 'LOW_RELEVANCE': 如果图片是装饰性占位图、页边留白图、通用素材图或空白排版线条。\n"
-                "- 'CLEAN': 如果图片包含有价值的企业操作流程图、技术示意图、设备安装步骤、"
-                "数据表格、系统界面截图或工作流程图。\n\n"
-                "请用严格的 JSON 格式返回以下两个字段：\n"
+                "   - 'LOW_RELEVANCE': 装饰图、封面Logo、页边留白、空白排版线条。\n"
+                "   - 'CLEAN': 有业务价值的图片。\n\n"
+                "2. 判断 image_category（图片类别）：\n"
+                "   - step_screenshot: 系统操作截图（菜单、按钮、表单、U8/ERP界面）\n"
+                "   - test_photo: 测试/实验照片（耐热测试、称重、温度计、样品测试）\n"
+                "   - inspection_photo: 验货/检查现场照片（外方验货、包装检查）\n"
+                "   - form_image: 表单/记录单截图（交货单、检验单、入库单）\n"
+                "   - visual_knowledge: 独立知识图（字段说明、缺陷对照、流程图、规格对照表）\n"
+                "   - decorative: 封面/Logo/装饰图\n"
+                "   - unknown: 无法判断\n\n"
+                "3. 生成 caption：用一句简洁中文描述图片可见内容（50-100字）。\n"
+                "   只描述看得见的对象/动作/界面/字段，不要编造看不清的读数或结论。\n\n"
+                "4. 生成 annotation_map：如果图片有①②③标注、红框、箭头等标记，\n"
+                "   提取标注对应关系（如{\"①\":\"业务导航\"}）。没有则返回空对象{}。\n\n"
+                "【输出JSON格式】\n"
                 "{\n"
-                '  "status": "SENSITIVE" | "LOW_RELEVANCE" | "CLEAN",\n'
-                '  "summary": "用中文精确描述此图片展示的技术或业务信息内容（约100字）"\n'
-                "}\n"
-                "不要包含任何代码块标记或多余解释。"
+                '  "status": "CLEAN",\n'
+                '  "image_category": "step_screenshot",\n'
+                '  "caption": "描述文本",\n'
+                '  "annotation_map": {}\n'
+                "}"
             )
 
-            # 请求通义千问多模态端点
-            url = f"{api_base_url}/services/aigc/multimodal-generation/generation"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": model_name,
-                "input": {
+            # ── 判断端点模式 ──
+            use_compat = "qwen3" in model_name.lower() or "compatible" in api_base_url.lower()
+
+            if use_compat:
+                import re as _re
+                domain_match = _re.search(r'https?://([^/]+)', api_base_url)
+                domain = domain_match.group(1) if domain_match else "dashscope.aliyuncs.com"
+                url = f"https://{domain}/compatible-mode/v1/chat/completions"
+
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": model_name,
                     "messages": [
                         {
                             "role": "user",
                             "content": [
-                                {"image": f"data:{mime_type};base64,{b64_data}"},
-                                {"text": prompt}
+                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}},
+                                {"type": "text", "text": prompt}
                             ]
                         }
                     ]
                 }
-            }
 
-            resp = requests.post(url, json=payload, headers=headers, timeout=60)
-            if resp.status_code != 200:
-                raise RuntimeError(f"Qwen-VL VLM HTTP {resp.status_code}: {resp.text[:400]}")
+                resp = requests.post(url, json=payload, headers=headers, timeout=(10, 90))
+                if resp.status_code != 200:
+                    raise RuntimeError(f"VLM (compat) HTTP {resp.status_code}: {resp.text[:400]}")
 
-            data = resp.json()
-            try:
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+            else:
+                # DashScope 原生多模态端点（兼容旧版 qwen-vl-ocr-latest 等）
+                url = f"{api_base_url}/services/aigc/multimodal-generation/generation"
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": model_name,
+                    "input": {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"image": f"data:{mime_type};base64,{b64_data}"},
+                                    {"text": prompt}
+                                ]
+                            }
+                        ]
+                    }
+                }
+
+                resp = requests.post(url, json=payload, headers=headers, timeout=(10, 90))
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Qwen-VL VLM HTTP {resp.status_code}: {resp.text[:400]}")
+
+                data = resp.json()
                 choices = data["output"]["choices"]
                 content = choices[0]["message"]["content"]
-                
-                # 兼容可能返回的字符串或包含 text 的 list
-                result_str = ""
+
+                # 兼容旧版返回的 list 格式
                 if isinstance(content, list):
-                    result_str = "".join(item.get("text", "") for item in content if isinstance(item, dict))
-                elif isinstance(content, str):
-                    result_str = content
-                
-                # 清洗 JSON 标记
+                    content = "".join(item.get("text", "") for item in content if isinstance(item, dict))
+
+            # ── 解析 JSON 结果 ──
+            try:
+                result_str = content if isinstance(content, str) else str(content)
                 result_str = result_str.replace("```json", "").replace("```", "").strip()
                 result_json = json.loads(result_str)
-                
-                status = result_json.get("status", "CLEAN")
-                summary = result_json.get("summary", "[VLM 内容描述]")
 
-                # 纠合逻辑：如果 bypass_safety 为真，即便是 SENSITIVE 也强制转为 CLEAN
+                status = result_json.get("status", "CLEAN")
+                caption = result_json.get("caption", "[VLM 内容描述]")
+                image_category = result_json.get("image_category", "unknown")
+                annotation_map = result_json.get("annotation_map", {})
+
+                # 纠合逻辑：bypass_safety 时 SENSITIVE 强制转 CLEAN
                 if bypass_safety and status == "SENSITIVE":
                     status = "CLEAN"
 
-                return status, summary
+                # 确保 annotation_map 是 dict
+                if not isinstance(annotation_map, dict):
+                    annotation_map = {}
+
+                return {
+                    "status": status,
+                    "caption": caption,
+                    "image_category": image_category,
+                    "annotation_map": annotation_map,
+                }
             except Exception as e:
-                print(f"    ⚠️ Warning failed to parse Qwen-VL response JSON: {e}. Output content: {content[:300]}")
-                # 容灾降级
-                return "CLEAN", "[VLM 解析异常] 企业文档内图片资产。"
+                print(f"    ⚠️ Failed to parse VLM JSON: {e}. Raw: {str(content)[:300]}")
+                # 容灾降级：把原始文本当 caption 用
+                fallback_caption = str(content)[:200] if content else "[VLM 解析异常]"
+                return {
+                    "status": "CLEAN",
+                    "caption": fallback_caption,
+                    "image_category": "unknown",
+                    "annotation_map": {},
+                }
 
         except Exception as e:
-            print(f"    ⚠️ Warning VLM API execution failed: {e}")
+            print(f"    ⚠️ VLM API execution failed: {e}")
             if bypass_safety:
-                return "CLEAN", f"[VLM 降级] 图片资产 {filename} 在降级模式下解析。"
+                return {"status": "CLEAN", "caption": f"[VLM 降级] 图片资产 {filename}。",
+                        "image_category": "unknown", "annotation_map": {}}
             else:
-                return "SENSITIVE", ""
+                return {"status": "SENSITIVE", "caption": "", "image_category": "unknown",
+                        "annotation_map": {}}
+
 

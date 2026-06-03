@@ -11,6 +11,8 @@ chunker.py — 文档切分器
   faq_chunk           — Q&A 对
   section_chunk       — 按标题层级切
   clause_chunk        — 按条款边界切（第X条 / 一、 / 9.1）
+  step_card           — SOP 步骤图文绑定 chunk（步骤文字 + 图片引用 + 编号标注）
+  procedure_parent    — SOP 完整流程父 chunk（关联所有 step_card 子 chunk）
 """
 
 import hashlib
@@ -28,7 +30,7 @@ class Chunk:
     doc_id: str
     version_no: int
     chunk_index: int
-    chunk_type: str  # text_chunk / table_chunk / faq_chunk / section_chunk
+    chunk_type: str  # text_chunk / table_chunk / faq_chunk / section_chunk / step_card / procedure_parent
     chunk_text: str
     token_count: int
     raw_text: str = ""
@@ -338,6 +340,475 @@ class DocumentChunker:
             kb_type=meta.get("kb_type"),
             risk_level=meta.get("risk_level"),
         )
+
+    # ── 步骤边界检测正则 ──
+    _STEP_BOUNDARY_RE = re.compile(
+        r'^(?:'
+        r'步骤\s*([一二三四五六七八九十\d]+)|'          # 步骤1 / 步骤三 / 步骤 2
+        r'Step\s*(\d+)|'                             # Step 1 / Step2
+        r'第\s*([一二三四五六七八九十\d]+)\s*步|'     # 第一步 / 第1步
+        r'(\d+)\s*[\.．、]\s*(?![\d])|'              # 1. / 1．/ 2、（排除 1.1 条款编号）
+        r'(\d+)\s*[)）]\s*'                           # 1) / 2）
+        r')',
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def _chunk_by_step(
+        self,
+        blocks: list,
+        doc_id: str,
+        version_no: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """
+        SOP 步骤感知切分器。
+
+        按步骤边界检测（步骤1 / 1. / 第一步 等），将步骤文字与紧随其后的
+        image_ref 图片块绑定为 step_card chunk。同时生成一个 procedure_parent
+        父 chunk 关联所有子步骤。
+
+        切分策略：
+          1. 扫描 blocks 序列，检测步骤边界和 image_ref 块
+          2. 每个步骤文字 + 后续图片 = 一个 step_card
+          3. 图片的 OCR 关键词和 annotation_map 展开拼入 chunk_text
+          4. 生成 procedure_parent 总览 chunk
+          5. 设置 prev/next chunk 链表
+
+        未匹配步骤边界的前导/尾部文本退化为 text_chunk。
+        """
+        meta = metadata or {}
+        chunks: List[Chunk] = []
+        chunk_index = 0
+        current_section: Optional[str] = None
+
+        # 延迟导入 annotation_parser（避免循环依赖）
+        try:
+            from opensearch_pipeline.extraction.annotation_parser import (
+                parse_annotation_map,
+                expand_annotation_map,
+                clean_ocr_keywords,
+                extract_circled_refs,
+            )
+            from opensearch_pipeline.extraction.image_relation_classifier import (
+                classify_image_relation,
+            )
+        except ImportError:
+            # 容灾降级：如果 annotation_parser 不可用，使用空操作
+            def parse_annotation_map(s, o): return {}
+            def expand_annotation_map(m): return ""
+            def clean_ocr_keywords(t, **kw): return ""
+            def extract_circled_refs(s): return []
+            classify_image_relation = None
+
+        # ── Phase 1: 将 blocks 按步骤边界分组 ──
+        # 每个 step_group = {"step_no": N, "title": str, "text_parts": [str],
+        #                     "image_refs": [dict], "page_num": int, "section": str}
+        step_groups = []
+        preamble_texts = []       # 步骤前的前导文本
+        postamble_texts = []      # 最后一个步骤后的尾部文本
+        current_step = None
+        found_any_step = False
+
+        for block in blocks:
+            # 兼容 dict 和 dataclass
+            if isinstance(block, dict):
+                block_type = block.get("block_type", "paragraph")
+                text = block.get("text", "").strip()
+                page_num = block.get("page_num")
+                section_path = block.get("section_path")
+                source = block.get("source", "native")
+                extra = block.get("extra", {})
+            else:
+                block_type = block.block_type
+                text = block.text.strip() if block.text else ""
+                page_num = block.page_num
+                section_path = block.section_path
+                source = block.source
+                extra = block.extra if hasattr(block, "extra") else {}
+
+            # 更新 section 跟踪
+            if block_type == "heading":
+                current_section = section_path or text
+
+                # ── 编号型操作标题也可能是步骤边界 ──
+                # 财务手册模式: heading "3.2.4正常单据记账" → table → image
+                # 如果 heading 文本匹配编号格式且文档已检测到步骤，
+                # 将 heading 当做新步骤的开始，避免图片丢失。
+                heading_step_match = re.match(
+                    r'^(\d+(?:\.\d+)*)\s*[\.．、]?\s*\S', text
+                )
+                if heading_step_match and found_any_step:
+                    if current_step is not None:
+                        step_groups.append(current_step)
+                    # heading 虚拟步骤 step_no=0 表示 section 级标题
+                    # section_no 保留原始编号（如 "3.2.4"）
+                    current_step = {
+                        "step_no": 0,
+                        "section_no": heading_step_match.group(1),
+                        "title": text[:80],
+                        "text_parts": [text],
+                        "image_refs": [],
+                        "page_num": page_num,
+                        "section": current_section,
+                        "source": source,
+                    }
+                continue
+
+            # image_ref 块 → 归入当前步骤
+            if block_type == "image_ref":
+                if current_step is not None:
+                    current_step["image_refs"].append(extra)
+                elif current_section and found_any_step:
+                    # 兜底：没有步骤但有 section 上下文，创建虚拟步骤
+                    current_step = {
+                        "step_no": 0,
+                        "title": current_section[:80],
+                        "text_parts": [current_section],
+                        "image_refs": [extra],
+                        "page_num": page_num,
+                        "section": current_section,
+                        "source": source,
+                    }
+                # 如果还没有步骤，image_ref 会被忽略（前导图片很少见）
+                continue
+
+            if not text:
+                continue
+
+            # 表格 block → 独立 table_chunk
+            if block_type == "table":
+                if current_step is not None:
+                    current_step["text_parts"].append(text)
+                else:
+                    chunks.append(self._create_chunk(
+                        doc_id=doc_id,
+                        version_no=version_no,
+                        chunk_index=chunk_index,
+                        chunk_type="table_chunk",
+                        chunk_text=text,
+                        page_num=page_num,
+                        section_title=current_section,
+                        metadata=meta,
+                        source=source,
+                    ))
+                    chunk_index += 1
+                continue
+
+            # ── 检测步骤边界 ──
+            match = self._STEP_BOUNDARY_RE.match(text)
+            if match:
+                # 提取步骤编号（5 个捕获组）
+                step_no_str = (match.group(1) or match.group(2) or
+                               match.group(3) or match.group(4) or
+                               match.group(5))
+
+                # ── 过滤误判：通用编号格式（N. / N、/ N)）需要足够长的文本 ──
+                # 避免将材料清单 "4. 胶带" 误判为步骤。
+                # 明确的步骤标记（步骤N / Step N / 第N步）不受此限制。
+                is_generic_numbering = match.group(4) or match.group(5)
+                if is_generic_numbering and len(text) < 15:
+                    # 太短，当普通文本处理
+                    if current_step is not None:
+                        current_step["text_parts"].append(text)
+                    elif found_any_step:
+                        postamble_texts.append((text, page_num, current_section, source))
+                    else:
+                        preamble_texts.append((text, page_num, current_section, source))
+                    continue
+
+                found_any_step = True
+                try:
+                    # 中文数字转换（注意：不能用 dict.get(k, int(k))，
+                    # 因为 Python 会先求值 int("三") 导致 ValueError）
+                    cn_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+                    if step_no_str in cn_num:
+                        step_no = cn_num[step_no_str]
+                    else:
+                        step_no = int(step_no_str)
+                except (ValueError, TypeError):
+                    step_no = len(step_groups) + 1
+
+                # 结束上一个步骤组
+                if current_step is not None:
+                    step_groups.append(current_step)
+
+                # 开始新步骤组
+                current_step = {
+                    "step_no": step_no,
+                    "title": text[:80],
+                    "text_parts": [text],
+                    "image_refs": [],
+                    "page_num": page_num,
+                    "section": current_section,
+                    "source": source,
+                }
+            else:
+                # 非步骤边界文本
+                if current_step is not None:
+                    current_step["text_parts"].append(text)
+                elif found_any_step:
+                    postamble_texts.append((text, page_num, current_section, source))
+                else:
+                    preamble_texts.append((text, page_num, current_section, source))
+
+        # 结束最后一个步骤组
+        if current_step is not None:
+            step_groups.append(current_step)
+
+        # ── 如果没有检测到任何步骤边界，fallback 到普通文本切分 ──
+        if not step_groups:
+            return self.chunk_from_blocks.__wrapped__(self, blocks, doc_id, version_no, metadata) \
+                if hasattr(self.chunk_from_blocks, '__wrapped__') \
+                else self._chunk_text_fallback(blocks, doc_id, version_no, metadata)
+
+        # ── Phase 2: 处理前导文本（非步骤部分） ──
+        for text, pg, sect, src in preamble_texts:
+            stripped = text.strip()
+            if len(stripped) < self.min_chunk_chars:
+                continue
+            sub_texts = self._split_long_text(stripped)
+            for sub in sub_texts:
+                if len(sub.strip()) < self.min_chunk_chars:
+                    continue
+                chunks.append(self._create_chunk(
+                    doc_id=doc_id, version_no=version_no,
+                    chunk_index=chunk_index, chunk_type="text_chunk",
+                    chunk_text=sub.strip(), page_num=pg,
+                    section_title=sect, metadata=meta, source=src,
+                ))
+                chunk_index += 1
+
+        # ── Phase 2.5: 按 section 分组 step_groups ──
+        # 多 section 文档（如财务手册）每个 section 有独立步骤序列，
+        # 需要生成多个 procedure_parent，而非一个扁平 parent。
+        section_groups: Dict[str, List[dict]] = {}
+        for sg in step_groups:
+            sec_key = sg.get("section") or "__default__"
+            section_groups.setdefault(sec_key, []).append(sg)
+
+        # ── Phase 3 ~ 6: 按 section 批次生成 step_card + procedure_parent ──
+        for section_key, sec_steps in section_groups.items():
+            step_card_chunks_sec = []
+            step_card_ids_sec = []
+            vk_images_sec = []   # visual_knowledge 图片（保留引用 + 复制生成独立 chunk）
+
+            for sg in sec_steps:
+                step_text = "\n".join(sg["text_parts"])
+
+                # 收集图片的 OCR 文本和资产信息
+                image_refs_list = []
+                all_ocr_raw = []
+
+                for img_extra in sg["image_refs"]:
+                    img_ref_entry = {
+                        "image_index": img_extra.get("image_index"),
+                        "source_image": img_extra.get("source_image", ""),
+                        "oss_key": img_extra.get("oss_key", ""),
+                    }
+                    # 透传 VLM 结构化字段
+                    for vk in ("image_category", "vlm_annotation_map"):
+                        if img_extra.get(vk):
+                            img_ref_entry[vk] = img_extra[vk]
+                    image_refs_list.append(img_ref_entry)
+
+                    ocr_text = img_extra.get("ocr_text", "")
+                    if ocr_text:
+                        all_ocr_raw.append(ocr_text)
+                    visual_summary = img_extra.get("visual_summary", "")
+                    if visual_summary:
+                        all_ocr_raw.append(visual_summary)
+
+                # 解析 annotation_map
+                combined_ocr = " ".join(all_ocr_raw)
+                annotation_map = parse_annotation_map(step_text, combined_ocr)
+                annotation_text = expand_annotation_map(annotation_map)
+                ocr_keywords = clean_ocr_keywords(combined_ocr)
+
+                # ── Phase 3.5: 图片-步骤 relation 分类 ──
+                primary_captions = []
+                supporting_captions = []
+                audit_flags = []
+
+                if classify_image_relation is not None:
+                    for img_ref in image_refs_list:
+                        # 取该图片的 caption（优先 visual_summary，fallback ocr_text）
+                        img_idx = img_ref.get("image_index")
+                        img_caption = ""
+                        img_ocr = ""
+                        for ie in sg["image_refs"]:
+                            if ie.get("image_index") == img_idx:
+                                img_caption = ie.get("visual_summary", "")
+                                img_ocr = ie.get("ocr_text", "")
+                                break
+                        caption = img_caption or img_ocr
+
+                        rel = classify_image_relation(
+                            step_text=step_text,
+                            caption=caption,
+                            ocr_keywords=img_ocr,
+                            has_annotation=bool(annotation_map),
+                            position="inline",
+                        )
+                        img_ref["relation"] = rel.relation
+                        img_ref["relation_confidence"] = rel.confidence
+                        if caption:
+                            img_ref["caption"] = caption
+
+                        # 低置信度标记 audit
+                        if rel.audit_flag:
+                            audit_flags.append({
+                                "image_index": img_idx,
+                                "relation": rel.relation,
+                                "confidence": rel.confidence,
+                                "reason": rel.reason,
+                            })
+
+                        # 收集 caption 用于追加到 chunk_text
+                        if caption and not annotation_map:
+                            if rel.relation == "primary":
+                                primary_captions.append(caption)
+                            elif rel.relation == "supporting":
+                                supporting_captions.append(caption)
+                            # visual_knowledge: 保留引用在 step_card，同时记录以生成独立 chunk
+                            if rel.relation == "visual_knowledge":
+                                supporting_captions.append(caption)  # step_card 内也追加
+                                vk_images_sec.append({
+                                    "image_index": img_idx,
+                                    "source_image": img_ref.get("source_image", ""),
+                                    "oss_key": img_ref.get("oss_key", ""),
+                                    "caption": caption,
+                                    "context_step_no": sg["step_no"],
+                                    "context_section": sg["section"],
+                                })
+
+                # 组装 chunk_text
+                parts = [step_text]
+                if annotation_text:
+                    parts.append(annotation_text)
+                if primary_captions:
+                    parts.append("[图片内容] " + "；".join(c[:120] for c in primary_captions))
+                if supporting_captions:
+                    parts.append("[补充图示] " + "；".join(c[:120] for c in supporting_captions))
+                if ocr_keywords:
+                    parts.append(f"[图片关键词] {ocr_keywords}")
+
+                final_chunk_text = "\n".join(parts)
+
+                step_chunk = self._create_chunk(
+                    doc_id=doc_id, version_no=version_no,
+                    chunk_index=chunk_index, chunk_type="step_card",
+                    chunk_text=final_chunk_text, page_num=sg["page_num"],
+                    section_title=sg["section"], metadata=meta,
+                    source=sg.get("source", "native"),
+                )
+                step_chunk.extra["step_no"] = sg["step_no"]
+                if sg.get("section_no"):
+                    step_chunk.extra["section_no"] = sg["section_no"]
+                step_chunk.extra["image_refs"] = image_refs_list
+                if annotation_map:
+                    step_chunk.extra["annotation_map"] = annotation_map
+                if all_ocr_raw:
+                    step_chunk.extra["image_ocr_raw"] = combined_ocr[:2000]
+                if audit_flags:
+                    step_chunk.extra["relation_audit"] = audit_flags
+                # 记录步骤中引用的圈数字标注（①②③...）
+                circled = extract_circled_refs(step_text)
+                if circled:
+                    step_chunk.extra["circled_refs"] = circled
+
+                step_card_chunks_sec.append(step_chunk)
+                step_card_ids_sec.append(step_chunk.chunk_id)
+                chunk_index += 1
+
+            # Phase 4: 设置 prev/next 链表（section 内）
+            for i, sc in enumerate(step_card_chunks_sec):
+                sc.extra["prev_chunk_id"] = step_card_ids_sec[i - 1] if i > 0 else None
+                sc.extra["next_chunk_id"] = step_card_ids_sec[i + 1] if i < len(step_card_ids_sec) - 1 else None
+
+            # Phase 5: 生成 procedure_parent（每个 section 一个）
+            doc_title = meta.get("title", "")
+            section_label = section_key if section_key != "__default__" else ""
+            step_titles = [f"步骤{sg['step_no']}：{sg['title'][:40]}" for sg in sec_steps]
+            parent_text = f"{doc_title}"
+            if section_label:
+                parent_text += f"\n{section_label}"
+            parent_text += "\n" + "\n".join(step_titles)
+
+            parent_chunk = self._create_chunk(
+                doc_id=doc_id, version_no=version_no,
+                chunk_index=chunk_index, chunk_type="procedure_parent",
+                chunk_text=parent_text,
+                page_num=sec_steps[0]["page_num"] if sec_steps else None,
+                section_title=section_label or (sec_steps[0]["section"] if sec_steps else current_section),
+                metadata=meta,
+            )
+            parent_chunk.extra["child_chunk_ids"] = step_card_ids_sec
+            parent_chunk.extra["step_count"] = len(step_card_ids_sec)
+            parent_chunk_id = parent_chunk.chunk_id
+            chunk_index += 1
+
+            # 回填 parent_chunk_id
+            for sc in step_card_chunks_sec:
+                sc.extra["parent_chunk_id"] = parent_chunk_id
+
+            # Phase 5.5: 生成 visual_knowledge 独立 chunk（保留引用 + 复制）
+            doc_title = meta.get("title", "")
+            for vk in vk_images_sec:
+                vk_text = f"【文档:{doc_title}】\n[参考图] {vk['caption'][:300]}"
+                vk_chunk = self._create_chunk(
+                    doc_id=doc_id, version_no=version_no,
+                    chunk_index=chunk_index, chunk_type="visual_knowledge",
+                    chunk_text=vk_text, page_num=None,
+                    section_title=vk["context_section"], metadata=meta,
+                )
+                vk_chunk.extra["source_image"] = vk.get("source_image", "")
+                vk_chunk.extra["oss_key"] = vk.get("oss_key", "")
+                vk_chunk.extra["caption"] = vk["caption"]
+                vk_chunk.extra["context_step_no"] = vk["context_step_no"]
+                vk_chunk.extra["context_section"] = vk["context_section"]
+                vk_chunk.extra["image_index"] = vk["image_index"]
+                chunks.append(vk_chunk)
+                chunk_index += 1
+
+            # Phase 6: 追加到结果
+            chunks.append(parent_chunk)
+            chunks.extend(step_card_chunks_sec)
+
+        # ── Phase 7: 处理尾部文本 ──
+        for text, pg, sect, src in postamble_texts:
+            stripped = text.strip()
+            if len(stripped) < self.min_chunk_chars:
+                continue
+            sub_texts = self._split_long_text(stripped)
+            for sub in sub_texts:
+                if len(sub.strip()) < self.min_chunk_chars:
+                    continue
+                chunks.append(self._create_chunk(
+                    doc_id=doc_id, version_no=version_no,
+                    chunk_index=chunk_index, chunk_type="text_chunk",
+                    chunk_text=sub.strip(), page_num=pg,
+                    section_title=sect, metadata=meta, source=src,
+                ))
+                chunk_index += 1
+
+        return chunks
+
+    def _chunk_text_fallback(
+        self,
+        blocks: list,
+        doc_id: str,
+        version_no: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """当 step 模式未检测到步骤边界时，fallback 到标准文本切分。"""
+        saved = self.split_mode
+        self.split_mode = "text"
+        try:
+            result = self.chunk_from_blocks(blocks, doc_id, version_no, metadata)
+        finally:
+            self.split_mode = saved
+        return result
 
     def _chunk_faq(
         self,
@@ -713,6 +1184,8 @@ class DocumentChunker:
             return self._chunk_faq(blocks, doc_id, version_no, metadata)
         if self.split_mode == "clause":
             return self._chunk_by_clause(blocks, doc_id, version_no, metadata)
+        if self.split_mode == "step":
+            return self._chunk_by_step(blocks, doc_id, version_no, metadata)
 
         meta = metadata or {}
         chunks: List[Chunk] = []

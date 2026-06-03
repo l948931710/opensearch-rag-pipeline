@@ -492,7 +492,8 @@ class UnifiedExtractor:
         def _process_single(img_asset):
             """单张图片的 Funnel 2+3 处理（线程安全）。"""
             return processor.process_image(
-                img_asset.local_path, doc_id, is_public=is_public
+                img_asset.local_path, doc_id, is_public=is_public,
+                doc_title=task.get("doc_title", ""),
             )
 
         # 合并结果：缓存命中 + 新处理
@@ -557,6 +558,9 @@ class UnifiedExtractor:
                 "file_size_kb": funnel_res.get("file_size_kb", 0.0),
                 "ocr_text": funnel_res.get("ocr_text", ""),
                 "visual_summary": funnel_res.get("visual_summary", ""),
+                "image_category": funnel_res.get("image_category", ""),
+
+                "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
                 "reason": funnel_res.get("reason", ""),
             }
             assets.append(asset_dict)
@@ -595,7 +599,10 @@ class UnifiedExtractor:
         is_public = "_quarantine/" not in task.get("raw_key", "")
         
         processor = ImageFunnelProcessor(simulate=self.simulate)
-        funnel_res = processor.process_image(local_path, task["doc_id"], is_public=is_public)
+        funnel_res = processor.process_image(
+            local_path, task["doc_id"], is_public=is_public,
+            doc_title=task.get("doc_title", ""),
+        )
         
         status = funnel_res["status"]
         assets = [{
@@ -607,6 +614,9 @@ class UnifiedExtractor:
             "file_size_kb": funnel_res.get("file_size_kb", 0.0),
             "ocr_text": funnel_res.get("ocr_text", ""),
             "visual_summary": funnel_res.get("visual_summary", ""),
+            "image_category": funnel_res.get("image_category", ""),
+
+            "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
             "reason": funnel_res.get("reason", "")
         }]
 

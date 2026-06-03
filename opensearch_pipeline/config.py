@@ -146,10 +146,11 @@ class EmbeddingConfig:
 
 @dataclass
 class OCRConfig:
-    """Gemini Vision OCR 配置。"""
+    """OCR + VLM 视觉配置。"""
     api_key: str = ""
     api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    model: str = "gemini-3.1-flash-lite"
+    model: str = "gemini-3.1-flash-lite"            # OCR 专用模型
+    vlm_model: str = ""                              # VLM caption/审计模型（为空则 fallback 到 model）
     max_ocr_pages: int = 5
     ocr_threshold_chars: int = 100
 
@@ -292,6 +293,9 @@ def load_config() -> PipelineConfig:
     ocr_base_url = _env("OCR_API_BASE_URL") or default_ocr_base
     default_ocr_model = "qwen-vl-ocr-latest" if dashscope_key else "gemini-3.1-flash-lite"
     ocr_model = _env("OCR_MODEL") or default_ocr_model
+    # VLM caption/审计模型：独立于 OCR，默认 qwen3-vl-plus
+    default_vlm_model = "qwen3-vl-plus" if dashscope_key else "gemini-3.1-flash-lite"
+    vlm_model = _env("VLM_MODEL") or default_vlm_model
 
     # Embedding 动态路由配置
     env_embedding_model = os.environ.get("RAG_EMBEDDING_MODEL")
@@ -373,6 +377,7 @@ def load_config() -> PipelineConfig:
             api_key=ocr_key,
             api_base_url=ocr_base_url,
             model=ocr_model,
+            vlm_model=vlm_model,
             max_ocr_pages=_env_int("OCR_MAX_PAGES", 5),
             ocr_threshold_chars=_env_int("OCR_THRESHOLD_CHARS", 100),
         ),
