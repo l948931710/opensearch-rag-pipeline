@@ -599,6 +599,7 @@ class DocumentChunker:
                 # 收集图片的 OCR 文本和资产信息
                 image_refs_list = []
                 all_ocr_raw = []
+                all_visual_summaries = []
 
                 for img_extra in sg["image_refs"]:
                     img_ref_entry = {
@@ -616,14 +617,17 @@ class DocumentChunker:
                     if ocr_text:
                         all_ocr_raw.append(ocr_text)
                     visual_summary = img_extra.get("visual_summary", "")
+                    # visual_summary 仅用于 annotation_map 解析，不混入 ocr_keywords
+                    # 避免与 [图片内容]/[补充图示] 三重冗余
                     if visual_summary:
-                        all_ocr_raw.append(visual_summary)
+                        all_visual_summaries.append(visual_summary)
 
-                # 解析 annotation_map
-                combined_ocr = " ".join(all_ocr_raw)
-                annotation_map = parse_annotation_map(step_text, combined_ocr)
+                # 解析 annotation_map（需要 OCR + visual_summary 全量文本）
+                combined_all = " ".join(all_ocr_raw + all_visual_summaries)
+                annotation_map = parse_annotation_map(step_text, combined_all)
                 annotation_text = expand_annotation_map(annotation_map)
-                ocr_keywords = clean_ocr_keywords(combined_ocr)
+                # ocr_keywords 仅从 OCR 原始文本提取，不包含 VLM caption
+                ocr_keywords = clean_ocr_keywords(" ".join(all_ocr_raw))
 
                 # ── Phase 3.5: 图片-步骤 relation 分类 ──
                 primary_captions = []
@@ -691,7 +695,7 @@ class DocumentChunker:
                 if supporting_captions:
                     parts.append("[补充图示] " + "；".join(c[:120] for c in supporting_captions))
                 if ocr_keywords:
-                    parts.append(f"[图片关键词] {ocr_keywords}")
+                    parts.append(f"[图片OCR] {ocr_keywords}")
 
                 final_chunk_text = "\n".join(parts)
 
