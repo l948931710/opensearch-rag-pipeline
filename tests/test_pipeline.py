@@ -566,12 +566,33 @@ class TestDatabaseExceptionPropagation:
         with pytest.raises(RuntimeError, match="Database write failure in node_register_metadata: Mock RDS connection failed"):
             node_register_metadata(ctx)
 
-    def test_node_classify_document_failsafe_raises_on_db_error(self, monkeypatch):
+    def test_node_classify_document_failsafe_graceful_on_db_error(self, monkeypatch):
+        """Fail-safe 路径的 DB 写入（review_task + document_version）是 non-fatal 的。
+        当 LLM API 失败 + DB 不可用时，应该不崩溃，仅标记文档为失败。"""
         import opensearch_pipeline.pipeline_nodes
         from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
         
-        # 模拟 API 报错触发 fail-safe 分类审计持久化
-        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Mock RDS fail-safe write failed")))
+        # Mock: 第一次 _get_db_conn 成功（预占锁），后续调用失败（fail-safe 写入）
+        class MockCursor:
+            def execute(self, query, params=None): pass
+            @property
+            def rowcount(self): return 1
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        class MockConn:
+            def cursor(self): return MockCursor()
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+        
+        call_count = {"n": 0}
+        def _mock_get_db_conn(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MockConn()  # 预占锁成功
+            raise RuntimeError("Mock RDS fail-safe write failed")
+        
+        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", _mock_get_db_conn)
         monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "run_gemini_classification", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("Mock LLM API error")))
 
         ctx = {
@@ -582,14 +603,37 @@ class TestDatabaseExceptionPropagation:
             "simulate_api": False,
         }
         
-        with pytest.raises(RuntimeError, match="Database write failure in node_classify_document \\(fail-safe\\): Mock RDS fail-safe write failed"):
-            node_classify_and_risk_assess(ctx)
+        # Fail-safe 路径不应抛出异常，而是标记文档为失败并从 canonicals 中移除
+        node_classify_and_risk_assess(ctx)
+        
+        # 验证文档因 fail-safe 被移除（_classify_single_doc returns False → failed_doc_ids → 过滤掉）
+        assert len(ctx["canonicals"]) == 0, "Failed doc should be removed from canonicals after fail-safe"
 
     def test_node_classify_document_low_confidence_raises_on_db_error(self, monkeypatch):
         import opensearch_pipeline.pipeline_nodes
         from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
         
-        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Mock RDS quarantine write failed")))
+        # Mock: 第一次 _get_db_conn 成功（预占锁），后续调用失败（持久化写入）
+        class MockCursor:
+            def execute(self, query, params=None): pass
+            @property
+            def rowcount(self): return 1
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        class MockConn:
+            def cursor(self): return MockCursor()
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+        
+        call_count = {"n": 0}
+        def _mock_get_db_conn(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MockConn()  # 预占锁成功
+            raise RuntimeError("Mock RDS quarantine write failed")
+        
+        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", _mock_get_db_conn)
         # 返回低于 0.85 置信度的分类（review 已关闭，走正常入库路径）
         mock_low_conf = {
             "category_l1": "policy",
@@ -616,7 +660,27 @@ class TestDatabaseExceptionPropagation:
         import opensearch_pipeline.pipeline_nodes
         from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
         
-        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Mock RDS persist metadata failed")))
+        # Mock: 第一次 _get_db_conn 成功（预占锁），后续调用失败（持久化写入）
+        class MockCursor:
+            def execute(self, query, params=None): pass
+            @property
+            def rowcount(self): return 1
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        class MockConn:
+            def cursor(self): return MockCursor()
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+        
+        call_count = {"n": 0}
+        def _mock_get_db_conn(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MockConn()  # 预占锁成功
+            raise RuntimeError("Mock RDS persist metadata failed")
+        
+        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", _mock_get_db_conn)
         # 返回高置信度分类
         mock_high_conf = {
             "category_l1": "policy",

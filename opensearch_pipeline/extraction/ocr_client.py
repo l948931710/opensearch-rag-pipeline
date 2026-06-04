@@ -65,7 +65,7 @@ class OCRClient:
         api_key: Optional[str] = None,
         api_base_url: str = "https://dashscope.aliyuncs.com/api/v1",
         ocr_model: str = "qwen-vl-max",
-        max_ocr_pages: int = 5,
+        max_ocr_pages: int = 20,
         simulate: bool = True,
     ):
         self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY", "")

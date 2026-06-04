@@ -15,6 +15,7 @@ dingtalk_card.py — 钉钉互动卡片发送模块
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -102,6 +103,88 @@ def _format_sources_text(sources: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+import re
+
+# 匹配 LLM 在 answer 末尾追加的参考来源段落标题
+_TRAILING_SOURCES_PATTERN = re.compile(
+    r'\n\s*[-—─]{2,}\s*\n'              # --- 分隔线 + 后续内容
+    r'|'
+    r'\n\s*\*{0,2}参考(?:来源|文档|资料)\s*[:：]\s*\*{0,2}\s*\n'  # **参考来源：** 或 参考文档：
+    r'|'
+    r'\n\s*(?:参考(?:来源|文档|资料)|引用来源|来源信息)\s*[:：]\s*\n'  # 参考来源：
+    r'|'
+    r'\n\s*(?:---+|===+)\s*$'            # 文末的分隔线
+    ,
+    re.MULTILINE
+)
+
+
+def _strip_trailing_sources(answer: str) -> str:
+    """去除 LLM answer 末尾的参考来源段落（卡片有独立 sources 区域）。
+
+    LLM 有时会在回答末尾输出类似：
+      ---
+      **参考来源：**
+      - 《文档A》 > 章节1
+      - 《文档B》 > 章节2
+
+    这些内容与卡片 sources 区域重复，且占用大量空白，需要剥除。
+    """
+    if not answer:
+        return answer
+
+    match = _TRAILING_SOURCES_PATTERN.search(answer)
+    if match:
+        # 只截取匹配位置之前的内容
+        cleaned = answer[:match.start()].rstrip()
+        # 安全检查：确保不会把 answer 截没了（至少保留 5 字符）
+        if len(cleaned) >= 5:
+            return cleaned
+
+    return answer.rstrip()
+
+
+def _inline_images_to_markdown(
+    answer: str,
+    content_blocks: Optional[List[Dict[str, str]]],
+) -> str:
+    """将 content_blocks 中的图片以 Markdown 语法内联到 answer 中。
+
+    钉钉互动卡片的 Markdown 组件支持 ![alt](url) 图片语法。
+    将图片直接嵌入 answer 文本，可以不依赖卡片模板的 Loop/Image 组件。
+
+    策略：
+    - 如果 content_blocks 包含图文穿插数据（type=markdown + type=image），
+      直接拼接成一段完整的 Markdown 文本
+    - 如果没有 content_blocks 或没有图片，返回原始 answer
+    """
+    if not content_blocks:
+        return answer
+
+    # 检查是否有图片块
+    has_images = any(b.get("type") == "image" for b in content_blocks)
+    if not has_images:
+        return answer
+
+    # 将 content_blocks 拼接为 Markdown 文本
+    parts = []
+    for block in content_blocks:
+        block_type = block.get("type", "")
+        if block_type == "markdown":
+            parts.append(block.get("content", ""))
+        elif block_type == "image":
+            url = block.get("url", "")
+            caption = block.get("caption", "图片")
+            title = block.get("title", "")
+            if url:
+                # 钉钉 Markdown 图片语法
+                parts.append(f"\n\n![{title or caption}]({url})\n")
+                if caption and caption != title:
+                    parts.append(f"*{caption}*\n")
+
+    return "\n".join(parts).strip()
+
+
 def send_interactive_card(
     *,
     conversation_id: str,
@@ -113,6 +196,7 @@ def send_interactive_card(
     sources: List[Dict[str, Any]],
     latency_ms: int,
     model: str,
+    content_blocks: Optional[List[Dict[str, str]]] = None,
 ) -> bool:
     """
     发送互动卡片（带反馈按钮）。
@@ -162,10 +246,21 @@ def send_interactive_card(
     sources_text = _format_sources_text(sources)
     meta = f"模型: {model} | 耗时: {latency_ms / 1000:.1f}s"
 
+    # 防御性清理：LLM 可能仍在 answer 末尾输出参考来源，
+    # 卡片已有独立的 sources 区域，需要去重避免大片空白
+    clean_answer = _strip_trailing_sources(answer)
+    # 清理 <<IMG:N>> / <IMG:N> 占位符
+    clean_answer = re.sub(r'<{1,2}IMG:\d+>{1,2}', '', clean_answer).strip()
+
+    # 当有 content_blocks 图文穿插时，answer 置空避免内容重复显示
+    # （模板条件可见性不可靠，从代码端强制互斥）
+    display_answer = "" if content_blocks else clean_answer
+
     card_param_map = {
         "title": question[:50],
         "question": question,
-        "answer": answer,
+        "answer": display_answer,
+        "content_blocks": json.dumps(content_blocks, ensure_ascii=False) if content_blocks else "",
         "sources": sources_text,
         "sources_text": sources_text,
         "meta": meta,

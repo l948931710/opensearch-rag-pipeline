@@ -281,7 +281,7 @@ def node_scan_raw_files(ctx: dict):
                         LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
                         WHERE dv.content_process_status = 'NOT_STARTED' 
                           AND dv.canonical_json_key IS NULL
-                          AND dv.file_ext NOT IN ('doc', 'xls', 'pptx')
+                          AND dv.file_ext NOT IN ('doc')
                           AND dv.status = 'active'
                         ORDER BY dv.created_at ASC
                         LIMIT 100
@@ -1013,37 +1013,76 @@ def node_classify_and_risk_assess(ctx: dict):
 
     if not simulate_db:
         conn = None
-        try:
-            conn = _get_db_conn(select_db=True)
-            with conn.cursor() as cursor:
-                for doc in canonicals:
-                    cursor.execute("""
-                        UPDATE document_version
-                        SET content_process_status = 'PROCESSING'
-                        WHERE doc_id = %s AND version_no = %s
-                          AND content_process_status IN ('NOT_STARTED', 'LOADING', 'FAILED')
-                    """, (doc["doc_id"], doc["version_no"]))
-                    if cursor.rowcount > 0:
-                        valid_canonicals.append(doc)
-                    else:
-                        print(f"    └─ Task {doc['doc_id']} v{doc['version_no']} skipped (preempted or already processing content)")
-                conn.commit()
-        except Exception as e:
-            if conn: conn.rollback()
-            print(f"    ⚠️ Failed to preempt content processing: {e}")
-            valid_canonicals = canonicals
-        finally:
-            if conn:
-                conn.close()
+        _preempt_max_retries = 1
+        for _preempt_attempt in range(_preempt_max_retries + 1):
+            try:
+                conn = _get_db_conn(select_db=True)
+                with conn.cursor() as cursor:
+                    for doc in canonicals:
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET content_process_status = 'PROCESSING'
+                            WHERE doc_id = %s AND version_no = %s
+                              AND content_process_status IN ('NOT_STARTED', 'LOADING', 'FAILED')
+                        """, (doc["doc_id"], doc["version_no"]))
+                        if cursor.rowcount > 0:
+                            valid_canonicals.append(doc)
+                        else:
+                            print(f"    └─ Task {doc['doc_id']} v{doc['version_no']} skipped (preempted or already processing content)")
+                    conn.commit()
+                break  # 预占成功，退出重试循环
+            except Exception as e:
+                if conn:
+                    try: conn.rollback()
+                    except Exception: pass
+                if _preempt_attempt < _preempt_max_retries:
+                    import time as _time_preempt
+                    print(f"    ⚠️ Preemption DB error (attempt {_preempt_attempt + 1}), retrying in 2s: {e}")
+                    _time_preempt.sleep(2)
+                    valid_canonicals = []  # 重置，准备重试
+                else:
+                    # 重试用尽仍然失败 → 中止节点，由 DataWorks 调度下次重试
+                    raise RuntimeError(
+                        f"Content preemption failed after {_preempt_max_retries + 1} attempts. "
+                        f"Aborting to prevent duplicate processing. Last error: {e}"
+                    ) from e
+            finally:
+                if conn:
+                    conn.close()
+                    conn = None
     else:
         valid_canonicals = canonicals
         
     ctx["canonicals"] = valid_canonicals
 
-    for doc in valid_canonicals:
-        text = doc["text"]  # ← 用原始文本，不是脱敏后的
-        
-        # 1. 权限判定 (完全由路径/预配置元数据决定，绕过模型)
+
+    # ── 并发 LLM 分类（线程安全：每个 doc 独立 API 调用 + 独立 DB 连接） ──
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    simulate_api = ctx.get("simulate_api", ctx.get("simulate", config.simulate_api))
+    max_workers = int(os.environ.get("RAG_CLASSIFY_CONCURRENCY", "8"))
+
+    # 级联白名单（线程共享只读，安全）
+    ALLOWED_CATEGORY_L1 = {
+        "policy", "process", "sop", "standard", "template", "reference", "record", "others"
+    }
+    TAXONOMY_L2 = {
+        "policy":    {"hr_policy", "finance_policy", "general_policy", "safety_policy", "quality_policy", "others"},
+        "process":   {"approval_flow", "procurement_flow", "production_flow", "system_flow", "others"},
+        "sop":       {"equipment_sop", "inspection_sop", "business_sop", "safety_sop", "others"},
+        "standard":  {"inspection_std", "quality_std", "operation_std", "others"},
+        "template":  {"form", "contract", "report", "others"},
+        "reference": {"training", "product", "cert", "manual", "others"},
+        "record":    {"personnel", "asset", "business", "others"},
+        "others":    {"others"},
+    }
+
+    def _classify_single_doc(doc):
+        """单文档分类（线程安全：独立 API 调用 + 独立 DB 连接）。"""
+        text = doc["text"]
+
+        # 1. 权限判定（纯本地计算，线程安全）
         permission_level = resolve_permission_level(doc, ctx)
         kb_type = "public" if permission_level == "public" else "private"
         doc["permission_level"] = permission_level
@@ -1054,19 +1093,13 @@ def node_classify_and_risk_assess(ctx: dict):
         api_failed = False
         api_error_reason = ""
 
-        # ─── 分类与风险评估：所有文档均需 LLM 分类 ───
-        # 非隔离文档在分类完成后，风险等级固定为 "low"（跳过重度风险审计）
         source_key = doc.get("source_key", "")
         is_public = "_quarantine/" not in source_key
 
-        simulate_api = ctx.get("simulate_api", ctx.get("simulate", config.simulate_api))
         if simulate_api:
-            # 模拟 LLM 分类结果
             classification = ctx.get("mock_classifications", {}).get(doc["doc_id"], {})
             if not classification and "mock_classification" in ctx:
                 classification = ctx.get("mock_classification", {})
-            
-            # 填补 mock 缺失项
             classification = {
                 "category_l1": classification.get("category_l1", "reference"),
                 "category_l2": classification.get("category_l2", "manual"),
@@ -1076,7 +1109,6 @@ def node_classify_and_risk_assess(ctx: dict):
                 "summary": classification.get("summary", text[:100])
             }
         else:
-            # 真实调用 API
             llm_cfg = config.llm
             api_key = llm_cfg.api_key
             model_name = llm_cfg.model
@@ -1092,14 +1124,12 @@ def node_classify_and_risk_assess(ctx: dict):
                     api_failed = True
                     api_error_reason = f"LLM API invocation failed: {str(e)}"
 
-        # 非隔离公开文档：保留 LLM 分类结果，但风险等级固定为 low（跳过重度审计）
         if is_public and classification and not api_failed:
             classification["llm_risk_level"] = "low"
 
-        # 3. 处理分类与风险评估结果或 Fail-Safe 降级
+        # 3. 处理分类结果或 Fail-Safe 降级
         if api_failed:
             print(f"    ⚠️ Fail-Safe triggered for {doc['doc_id']}: {api_error_reason}")
-            # 高风险兜底策略：隔离、限制权限、置信度清零、触发人工审查
             doc["category_l1"] = "reference"
             doc["category_l2"] = "others"
             doc["owner_dept"] = doc.get("owner_dept") or "unknown"
@@ -1111,11 +1141,9 @@ def node_classify_and_risk_assess(ctx: dict):
             doc["kb_type"] = "private"
             doc["redaction_action"] = "QUARANTINE"
             doc["classification_status"] = "PENDING_AUDIT"
-            doc["risk_level"] = "high"  # 直接标记高风险
+            doc["risk_level"] = "high"
 
-            # 插入 review_task（best-effort，表可能不存在）
             if not simulate_db:
-                # 1. review_task 插入：非关键路径，失败仅打印警告
                 try:
                     conn_rt = _get_db_conn(select_db=True)
                     with conn_rt.cursor() as cursor:
@@ -1145,7 +1173,6 @@ def node_classify_and_risk_assess(ctx: dict):
                     except Exception:
                         pass
 
-                # 2. document_version 状态更新：标记为 FAILED，继续处理下一个文档
                 conn_dv = None
                 try:
                     conn_dv = _get_db_conn(select_db=True)
@@ -1170,27 +1197,10 @@ def node_classify_and_risk_assess(ctx: dict):
                     if conn_dv:
                         conn_dv.close()
 
-            # 跳过此文档，继续处理下一个
-            continue
+            return False  # 标记为失败，主循环跳过
 
         else:
-            # API 调用成功，校验置信度阈值 (0.85)
             confidence = classification["confidence"]
-            
-            # 二次过滤校验 L1 和 L2 分类（级联白名单过滤机制）
-            ALLOWED_CATEGORY_L1 = {
-                "policy", "process", "sop", "standard", "template", "reference", "record", "others"
-            }
-            TAXONOMY_L2 = {
-                "policy":    {"hr_policy", "finance_policy", "general_policy", "safety_policy", "quality_policy", "others"},
-                "process":   {"approval_flow", "procurement_flow", "production_flow", "system_flow", "others"},
-                "sop":       {"equipment_sop", "inspection_sop", "business_sop", "safety_sop", "others"},
-                "standard":  {"inspection_std", "quality_std", "operation_std", "others"},
-                "template":  {"form", "contract", "report", "others"},
-                "reference": {"training", "product", "cert", "manual", "others"},
-                "record":    {"personnel", "asset", "business", "others"},
-                "others":    {"others"},
-            }
 
             l1 = str(classification.get("category_l1", "")).strip().lower()
             l2 = str(classification.get("category_l2", "")).strip().lower()
@@ -1210,17 +1220,14 @@ def node_classify_and_risk_assess(ctx: dict):
             doc["llm_risk_level"] = classification["llm_risk_level"]
 
             if confidence < 0.85:
-                # 低置信度：记录警告但不隔离，允许继续入库
                 print(f"    ⚠️ Low confidence ({confidence:.2f} < 0.85) for {doc['doc_id']}. Proceeding without quarantine.")
 
-            # 正常入库
             doc["classification_status"] = "CONTENT_CLASSIFIED"
             if not simulate_db:
                 conn = None
                 try:
                     conn = _get_db_conn(select_db=True)
                     with conn.cursor() as cursor:
-                        # 更新 document_meta 字段
                         cursor.execute("""
                             UPDATE document_meta
                             SET category_l1 = %s,
@@ -1233,7 +1240,6 @@ def node_classify_and_risk_assess(ctx: dict):
                         """, (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
                               doc["permission_level"], doc["kb_type"], doc["doc_id"]))
 
-                        # 更新 document_version 字段
                         cursor.execute("""
                             UPDATE document_version
                             SET classification_method = 'LLM',
@@ -1252,6 +1258,44 @@ def node_classify_and_risk_assess(ctx: dict):
                     if conn:
                         conn.close()
 
+            return True  # 标记为成功
+
+    # ── 执行并发分类 ──
+    t0 = _time.time()
+    failed_doc_ids = set()
+
+    if len(valid_canonicals) <= 1:
+        # 单文档无需并发
+        for doc in valid_canonicals:
+            success = _classify_single_doc(doc)
+            if not success:
+                failed_doc_ids.add(doc["doc_id"])
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(valid_canonicals))) as pool:
+            future_to_doc = {pool.submit(_classify_single_doc, doc): doc for doc in valid_canonicals}
+            for future in as_completed(future_to_doc):
+                doc = future_to_doc[future]
+                try:
+                    success = future.result()
+                    if not success:
+                        failed_doc_ids.add(doc["doc_id"])
+                except Exception as e:
+                    print(f"    ❌ Unexpected error classifying {doc['doc_id']}: {e}")
+                    failed_doc_ids.add(doc["doc_id"])
+
+    elapsed = _time.time() - t0
+    success_count = len(valid_canonicals) - len(failed_doc_ids)
+    print(f"    [classify] ⚡ {success_count}/{len(valid_canonicals)} docs classified in {elapsed:.1f}s "
+          f"(workers={max_workers}, {elapsed/max(len(valid_canonicals),1)*1000:.0f}ms/doc avg)")
+
+    # 移除失败的文档，防止后续节点处理
+    if failed_doc_ids:
+        ctx["canonicals"] = [d for d in valid_canonicals if d["doc_id"] not in failed_doc_ids]
+    else:
+        ctx["canonicals"] = valid_canonicals
+
+    # 打印分类结果摘要
+    for doc in ctx["canonicals"]:
         print(
             f"    └─ {doc['doc_id']}: "
             f"{doc['category_l1']}/{doc['category_l2']}, "
@@ -1428,6 +1472,424 @@ def node_redact_or_quarantine(ctx: dict):
         )
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# Step Card 辅助函数
+# ═══════════════════════════════════════════════════════════════
+
+_STEP_DETECT_RE = re.compile(
+    r'(?:^|\n)\s*(?:'
+    r'步骤\s*[\d一二三四五六七八九十]+|'
+    r'Step\s*\d+|'
+    r'第\s*[一二三四五六七八九十\d]+\s*步|'
+    r'\d+\s*[\.．、]\s*(?![\d])|'
+    r'\d+\s*[)）]\s*'
+    r')',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _detect_step_patterns(doc: dict) -> bool:
+    """
+    检测文档是否包含 SOP 步骤标记。
+
+    仅在文本中出现 ≥2 个步骤边界时返回 True，避免误判。
+    同时结合分类信息：SOP / manual / guide 类文档优先检测。
+    """
+    # 如果分类不是 SOP/manual/guide 相关，不启用 step 模式
+    cat_l1 = str(doc.get("category_l1", "")).lower()
+    cat_l2 = str(doc.get("category_l2", "")).lower()
+    title = str(doc.get("title", "")).lower()
+
+    sop_keywords = ["sop", "manual", "guide", "操作", "手册", "作业指导", "流程", "规程"]
+    is_sop_like = any(kw in cat_l1 or kw in cat_l2 or kw in title for kw in sop_keywords)
+    if not is_sop_like:
+        return False
+
+    # 从 blocks 文本中检测步骤边界
+    text = doc.get("text", "")
+    if not text:
+        blocks = doc.get("blocks", [])
+        text_parts = []
+        for block in blocks[:50]:  # 只检查前 50 个 block
+            if isinstance(block, dict):
+                t = block.get("text", "")
+            else:
+                t = block.text if hasattr(block, "text") and block.text else ""
+            if t:
+                text_parts.append(t)
+        text = "\n".join(text_parts)
+
+    matches = _STEP_DETECT_RE.findall(text[:10000])  # 只检查前 10000 字符
+    return len(matches) >= 2
+
+
+def _inject_image_ref_blocks(blocks: list, assets: list, doc: dict) -> list:
+    """
+    将 funnel 处理后的图片信息作为 image_ref 块注入 block 序列。
+
+    方案 B（启发式）：利用图片在文档中的顺序与 block 中的步骤顺序对应。
+    策略：找到 blocks 中的步骤边界后，将图片按顺序分配到步骤之间。
+
+    如果 blocks 中已经包含 image_ref 块（由 docx_extractor_v2 生成），
+    则只需将 funnel 结果注入到已有的 image_ref 块中，不重复插入。
+
+    Args:
+        blocks: ExtractedBlock 列表（text blocks，可能已含 image_ref）
+        assets: funnel 处理后的 asset 列表
+        doc: 文档元数据 dict
+
+    Returns:
+        enriched blocks 列表（含 image_ref 块和 funnel 数据）
+    """
+    if not assets:
+        return blocks
+
+    # 检查是否已有 image_ref 块
+    has_image_refs = any(
+        (b.get("block_type") if isinstance(b, dict) else getattr(b, "block_type", "")) == "image_ref"
+        for b in blocks
+    )
+
+    if has_image_refs:
+        # blocks 中已有 image_ref → 将 funnel 数据注入到已有 image_ref
+        return _enrich_existing_image_refs(blocks, assets, doc)
+    else:
+        # blocks 中没有 image_ref → 按顺序追加 image_ref 到每个步骤后面
+        return _insert_image_refs_heuristic(blocks, assets, doc)
+
+
+def _enrich_existing_image_refs(blocks: list, assets: list, doc: dict) -> list:
+    """将 funnel 处理结果注入到 blocks 中已有的 image_ref 块。"""
+    # 构建 image_index → asset 映射
+    asset_map = {}
+    for asset in assets:
+        idx = asset.get("image_index", asset.get("original_index"))
+        if idx is not None:
+            asset_map[idx] = asset
+
+    dept_code = doc.get("owner_dept", "unknown")
+    source_key = doc.get("source_key", "")
+    if source_key.startswith("raw/"):
+        parts = source_key.split("/")
+        if len(parts) > 1:
+            dept_code = parts[1]
+
+    enriched = []
+    for block in blocks:
+        if isinstance(block, dict):
+            block_type = block.get("block_type", "")
+            extra = block.get("extra", {})
+        else:
+            block_type = getattr(block, "block_type", "")
+            extra = getattr(block, "extra", {})
+
+        if block_type == "image_ref":
+            img_idx = extra.get("image_index")
+            asset = asset_map.get(img_idx, {})
+
+            # 只保留 ROUTE_TO_VECTOR 和有价值的图片
+            status = asset.get("status", "")
+            if status in ("ROUTE_TO_VECTOR", "ROUTE_TO_TEXT"):
+                filename = asset.get("filename", "")
+                version = doc["version_no"]
+                doc_id = doc["doc_id"]
+                source_image_url = f"processing/assets/{dept_code}/{doc_id}/v{version}/{filename}"
+
+                enriched_extra = dict(extra)
+                enriched_extra.update({
+                    "source_image": source_image_url,
+                    "oss_key": asset.get("oss_key", ""),
+                    "ocr_text": asset.get("ocr_text", ""),
+                    "visual_summary": asset.get("visual_summary", ""),
+                    "funnel_status": status,
+                })
+
+                if isinstance(block, dict):
+                    block = dict(block)
+                    block["extra"] = enriched_extra
+                else:
+                    block.extra = enriched_extra
+
+                enriched.append(block)
+            # DISCARD 状态的 image_ref 块不加入结果
+        else:
+            enriched.append(block)
+
+    return enriched
+
+
+def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
+    """
+    启发式图片注入 — 按 page_num 匹配 → 步骤边界 fallback → 末尾追加。
+
+    策略优先级：
+      1. 如果 asset 有 page_num（PDF/PPTX），将 image_ref 插入到同一页最后一个 block 之后
+      2. 如果 asset 无 page_num 且检测到步骤边界，按步骤区间分配
+      3. 否则追加到末尾
+    """
+    from opensearch_pipeline.chunker import DocumentChunker
+
+    # ── 构建有效图片列表 ──
+    dept_code = doc.get("owner_dept", "unknown")
+    source_key = doc.get("source_key", "")
+    if source_key.startswith("raw/"):
+        parts = source_key.split("/")
+        if len(parts) > 1:
+            dept_code = parts[1]
+
+    valid_assets = []
+    for asset in assets:
+        status = asset.get("status", "")
+        if status in ("ROUTE_TO_VECTOR", "ROUTE_TO_TEXT"):
+            filename = asset.get("filename", "")
+            version = doc["version_no"]
+            doc_id = doc["doc_id"]
+            source_image_url = f"processing/assets/{dept_code}/{doc_id}/v{version}/{filename}"
+
+            valid_assets.append({
+                "image_index": asset.get("image_index", len(valid_assets)),
+                "page_num": asset.get("page_num"),
+                "anchor_row": asset.get("anchor_row"),
+                "annotation_num": asset.get("annotation_num"),
+                "annotation_label": asset.get("annotation_label"),
+                "source_image": source_image_url,
+                "oss_key": asset.get("oss_key", ""),
+                "ocr_text": asset.get("ocr_text", ""),
+                "visual_summary": asset.get("visual_summary", ""),
+                "funnel_status": status,
+                "part_labels": asset.get("part_labels", []),
+            })
+
+    if not valid_assets:
+        return blocks
+
+    # ── 策略 1: page_num 匹配（PDF / PPTX / XLSX） ──
+    has_page_assets = [va for va in valid_assets if va.get("page_num") is not None]
+    no_page_assets = [va for va in valid_assets if va.get("page_num") is None]
+
+    if has_page_assets:
+        # 分离：有 anchor_row 的 XLSX 图片 vs 无 anchor_row 的其他图片
+        anchor_row_assets = [va for va in has_page_assets if va.get("anchor_row") is not None]
+        page_only_assets = [va for va in has_page_assets if va.get("anchor_row") is None]
+
+        # 找到每页最后一个 block 的位置（PDF/PPTX fallback 用）
+        page_last_block_idx = {}
+        for i, block in enumerate(blocks):
+            pg = (block.get("page_num") if isinstance(block, dict)
+                  else getattr(block, "page_num", None))
+            if pg is not None:
+                page_last_block_idx[pg] = i
+
+        # 从后往前插入（避免索引偏移）
+        enriched = list(blocks)
+        # 收集所有插入点：(insert_position, image_ref_blocks)
+        insertions = []
+        unmatched = []
+
+        # ── 策略 1a: anchor_row 行级匹配（XLSX） ──
+        if anchor_row_assets:
+            # 建立索引：(page_num, row_num) → block_index
+            row_block_index = {}  # (page, row) → last block idx at that row
+            # 同时建立序号索引：(page, seq_num) → block_index
+            seq_block_index = {}  # (page, 序号) → block idx
+            for i, block in enumerate(blocks):
+                pg = (block.get("page_num") if isinstance(block, dict)
+                      else getattr(block, "page_num", None))
+                extra = (block.get("extra") if isinstance(block, dict)
+                         else getattr(block, "extra", None)) or {}
+                rn = extra.get("row_num")
+                if pg is not None and rn is not None:
+                    row_block_index[(pg, rn)] = i
+
+                # 提取行首的序号（如 "1\t清扫\t★三辊..." → seq_num=1）
+                # 只记录首次出现（表格可能有多区域序号重复，标注对应第一区域）
+                text = (block.get("text", "") if isinstance(block, dict)
+                        else getattr(block, "text", ""))
+                if pg is not None and text:
+                    first_cell = text.split("\t")[0].strip()
+                    if first_cell.isdigit():
+                        seq_block_index.setdefault((pg, int(first_cell)), i)
+
+            for va in anchor_row_assets:
+                pg = va["page_num"]
+                anchor = va["anchor_row"]
+                anno_num = va.get("annotation_num")
+                best_idx = None
+
+                # 优先级 1：annotation_num 精确匹配序号列
+                if anno_num is not None and (pg, anno_num) in seq_block_index:
+                    best_idx = seq_block_index[(pg, anno_num)]
+
+                # 优先级 2：anchor_row 近似匹配
+                if best_idx is None:
+                    best_row = -1
+                    for (p, rn), idx in row_block_index.items():
+                        if p == pg and rn <= anchor and rn > best_row:
+                            best_row = rn
+                            best_idx = idx
+                    # 如果没找到 <= anchor 的，找同页 row_num > anchor 中最小的
+                    if best_idx is None:
+                        best_row = 999999
+                        for (p, rn), idx in row_block_index.items():
+                            if p == pg and rn < best_row:
+                                best_row = rn
+                                best_idx = idx
+
+                if best_idx is not None:
+                    img_block = {
+                        "block_type": "image_ref",
+                        "text": "",
+                        "page_num": pg,
+                        "section_path": None,
+                        "source": "multimodal",
+                        "extra": va,
+                    }
+                    insertions.append((best_idx, [img_block]))
+                elif pg in page_last_block_idx:
+                    # fallback 到页末
+                    img_block = {
+                        "block_type": "image_ref",
+                        "text": "",
+                        "page_num": pg,
+                        "section_path": None,
+                        "source": "multimodal",
+                        "extra": va,
+                    }
+                    insertions.append((page_last_block_idx[pg], [img_block]))
+                else:
+                    unmatched.append(va)
+
+        # ── 策略 1b: page_num 页级匹配（PDF / PPTX） ──
+        if page_only_assets:
+            page_to_assets = {}
+            for va in page_only_assets:
+                pg = va["page_num"]
+                page_to_assets.setdefault(pg, []).append(va)
+
+            for pg, p_assets in sorted(page_to_assets.items()):
+                if pg in page_last_block_idx:
+                    insert_after = page_last_block_idx[pg]
+                    img_blocks = []
+                    for va in p_assets:
+                        img_blocks.append({
+                            "block_type": "image_ref",
+                            "text": "",
+                            "page_num": pg,
+                            "section_path": None,
+                            "source": "multimodal",
+                            "extra": va,
+                        })
+                    insertions.append((insert_after, img_blocks))
+                else:
+                    unmatched.extend(p_assets)
+
+        # 从后往前插入，保持前面的索引不变
+        for insert_after, img_blocks in sorted(insertions, key=lambda x: x[0], reverse=True):
+            for j, ib in enumerate(img_blocks):
+                enriched.insert(insert_after + 1 + j, ib)
+
+        # 未匹配到页面的图片：用 VLM visual_summary 生成合成 text block + image_ref
+        # 这样即使 OCR 没覆盖到的页面，也能通过 VLM 描述实现图文绑定
+        for va in unmatched + no_page_assets:
+            vlm_summary = va.get("visual_summary", "")
+            ocr_text = va.get("ocr_text", "")
+
+            # 有 VLM 描述或 OCR 文字 → 生成合成文本块，让图片跟文字绑在同一 chunk
+            synth_text = ""
+            if vlm_summary:
+                synth_text = f"[图片内容] {vlm_summary}"
+            if ocr_text:
+                synth_text = f"{synth_text}\n[图片OCR] {ocr_text}" if synth_text else f"[图片OCR] {ocr_text}"
+
+            if synth_text:
+                enriched.append({
+                    "block_type": "vlm_synth",
+                    "text": synth_text.strip(),
+                    "page_num": va.get("page_num"),
+                    "section_path": None,
+                    "source": "vlm_fallback",
+                    "extra": {},
+                })
+
+            enriched.append({
+                "block_type": "image_ref",
+                "text": "",
+                "page_num": va.get("page_num"),
+                "section_path": None,
+                "source": "multimodal",
+                "extra": va,
+            })
+
+        return enriched
+
+    # ── 策略 2: 步骤边界分配（无 page_num，如旧版 DOCX fallback） ──
+    step_boundary_indices = []
+    for i, block in enumerate(blocks):
+        text = (block.get("text", "") if isinstance(block, dict)
+                else (block.text if hasattr(block, "text") and block.text else "")).strip()
+        if text and DocumentChunker._STEP_BOUNDARY_RE.match(text):
+            step_boundary_indices.append(i)
+
+    if len(step_boundary_indices) < 2:
+        # 策略 3: 步骤边界不足，全部追加到末尾
+        enriched = list(blocks)
+        for va in valid_assets:
+            enriched.append({
+                "block_type": "image_ref",
+                "text": "",
+                "page_num": va.get("page_num"),
+                "section_path": None,
+                "source": "multimodal",
+                "extra": va,
+            })
+        return enriched
+
+    # 步骤区间分配（保留原逻辑，但保留 page_num）
+    step_ranges = []
+    for j, start_idx in enumerate(step_boundary_indices):
+        end_idx = step_boundary_indices[j + 1] - 1 if j + 1 < len(step_boundary_indices) else len(blocks) - 1
+        step_ranges.append((start_idx, end_idx))
+
+    images_per_step = max(1, len(valid_assets) // len(step_ranges))
+    enriched = []
+    img_cursor = 0
+
+    for block_idx, block in enumerate(blocks):
+        enriched.append(block)
+
+        for step_idx, (s_start, s_end) in enumerate(step_ranges):
+            if block_idx == s_end and img_cursor < len(valid_assets):
+                n_imgs = images_per_step if step_idx < len(step_ranges) - 1 else len(valid_assets) - img_cursor
+                for _ in range(n_imgs):
+                    if img_cursor >= len(valid_assets):
+                        break
+                    va = valid_assets[img_cursor]
+                    enriched.append({
+                        "block_type": "image_ref",
+                        "text": "",
+                        "page_num": va.get("page_num"),
+                        "section_path": None,
+                        "source": "multimodal",
+                        "extra": va,
+                    })
+                    img_cursor += 1
+
+    while img_cursor < len(valid_assets):
+        va = valid_assets[img_cursor]
+        enriched.append({
+            "block_type": "image_ref",
+            "text": "",
+            "page_num": va.get("page_num"),
+            "section_path": None,
+            "source": "multimodal",
+            "extra": va,
+        })
+        img_cursor += 1
+
+    return enriched
+
+
 def node_chunk_documents(ctx: dict):
     """
     切分文档为结构化 chunks。
@@ -1469,10 +1931,65 @@ def node_chunk_documents(ctx: dict):
             else:
                 m_chunk = ctx.get("sop_size", config.chunker.sop_strategy.max_chunk_chars)
                 m_overlap = ctx.get("sop_overlap", config.chunker.sop_strategy.overlap_chars)
+
+            # ─── Step Card 路由：SOP/manual/guide 类文档 + 包含步骤标记 → step 模式 ───
+            if m_mode == "text" and _detect_step_patterns(doc):
+                m_mode = "step"
+                m_chunk = ctx.get("sop_size", config.chunker.sop_strategy.max_chunk_chars)
+                m_overlap = 0  # step 模式按步骤边界切，不需要 overlap
+                print(f"    ├─ [step-detect] Detected step patterns in {doc['doc_id']}, routing to step mode")
+
+            # ─── XLSX Layout Classifier：统一路由（替代旧 is_equipment_standard） ───
+            from opensearch_pipeline.extraction.xlsx_classifier import classify_xlsx_layout
+
+            file_ext = str(doc.get("file_ext", "")).lower()
+            xlsx_layout_type = "normal_spreadsheet"
+
+            if file_ext in ("xlsx", "xls"):
+                # 从 blocks 中提取 sheet_names（heading blocks with sheet_idx=0,1,...）
+                _blocks = doc.get("blocks", [])
+                _sheet_names = []
+                for _b in _blocks:
+                    _extra = _b.get("extra", {}) if isinstance(_b, dict) else (getattr(_b, "extra", {}) or {})
+                    if (isinstance(_b, dict) and _b.get("block_type") == "heading") or \
+                       (hasattr(_b, "block_type") and _b.block_type == "heading"):
+                        _sec_type = _extra.get("section_type", "")
+                        _text = _b.get("text", "") if isinstance(_b, dict) else _b.text
+                        if _sec_type in ("cleaning_items", ""):
+                            if _text and _text not in _sheet_names:
+                                _sheet_names.append(_text)
+
+                xlsx_layout_type, _layout_debug = classify_xlsx_layout(
+                    filename=doc.get("filename", ""),
+                    sheet_names=_sheet_names,
+                    flat_text=text[:5000],  # 前 5000 字足够分类
+                )
+                print(f"    ├─ [xlsx-layout] {xlsx_layout_type} "
+                      f"(scores={_layout_debug['scores']}, "
+                      f"signals={_layout_debug['matched_signals'][:2]})")
+
+                if xlsx_layout_type == "equipment_cleaning_standard":
+                    m_mode = "text"
+                    m_chunk = 300
+                    m_overlap = 0
+                elif xlsx_layout_type == "procedure_image_guide":
+                    m_mode = "text"
+                    m_chunk = 500   # step card 内容更长
+                    m_overlap = 0
+                elif xlsx_layout_type == "product_spec_instruction":
+                    m_mode = "text"
+                    m_chunk = 400   # field card
+                    m_overlap = 0
+                # normal_spreadsheet → 保持已选 m_mode/m_chunk/m_overlap
+
+            # 保存 xlsx_layout_type 到 doc 供下游使用
+            doc["xlsx_layout_type"] = xlsx_layout_type
+
         else:
             m_chunk = ctx.get("max_chunk_chars", config.chunker.sop_strategy.max_chunk_chars)
             m_overlap = ctx.get("overlap_chars", config.chunker.sop_strategy.overlap_chars)
             m_mode = global_split_mode
+            xlsx_layout_type = "normal_spreadsheet"
 
         chunker = DocumentChunker(
             max_chunk_chars=m_chunk,
@@ -1484,7 +2001,9 @@ def node_chunk_documents(ctx: dict):
             prepend_section=ctx.get("prepend_section", True),
             prepend_for_faq=ctx.get("prepend_for_faq", False),
             max_context_chars=ctx.get("max_context_chars", 100),
-            max_context_ratio=ctx.get("max_context_ratio", 0.3)
+            max_context_ratio=ctx.get("max_context_ratio", 0.3),
+            row_card=(xlsx_layout_type == "equipment_cleaning_standard") if global_split_mode == "dynamic" else False,
+            xlsx_layout_type=xlsx_layout_type if global_split_mode == "dynamic" else "normal_spreadsheet",
         )
 
         metadata = {
@@ -1499,6 +2018,15 @@ def node_chunk_documents(ctx: dict):
         }
 
         blocks = doc.get("blocks", [])
+
+        # ─── Step 模式：注入 image_ref 块到 block 序列 ───
+        is_step_mode = (m_mode == "step")
+        if is_step_mode and blocks:
+            assets = doc.get("assets", [])
+            if assets:
+                blocks = _inject_image_ref_blocks(blocks, assets, doc)
+                print(f"    ├─ [step-inject] Injected image_refs into block sequence for {doc['doc_id']}")
+
         if blocks:
             chunks = chunker.chunk_from_blocks(
                 blocks=blocks,
@@ -1518,68 +2046,170 @@ def node_chunk_documents(ctx: dict):
         for chunk in chunks:
             chunk.sensitive_redacted = doc.get("redaction_action") == "REDACTED"
 
-        # ─── Visual Embedding & Image Chunking ───
-        current_chunk_count = len(chunks)
-        assets = doc.get("assets", [])
-        if assets:
-            dept_code = doc.get("owner_dept", "unknown")
-            source_key = doc.get("source_key", "")
-            if source_key.startswith("raw/"):
-                parts = source_key.split("/")
-                if len(parts) > 1:
-                    dept_code = parts[1]
+        # ─── 结构化 XLSX 图片绑定（按 anchor_row / figure_refs 绑定到 chunk）───
+        if xlsx_layout_type in ("product_spec_instruction", "procedure_image_guide") and global_split_mode == "dynamic":
+            assets = doc.get("assets", [])
+            if assets:
+                dept_code = doc.get("owner_dept", "unknown")
+                source_key = doc.get("source_key", "")
+                if source_key.startswith("raw/"):
+                    parts = source_key.split("/")
+                    if len(parts) > 1:
+                        dept_code = parts[1]
+                version = doc["version_no"]
+                d_id = doc["doc_id"]
 
-            for asset in assets:
-                if asset.get("status") == "ROUTE_TO_VECTOR":
-                    filename = asset.get("filename", "")
-                    visual_summary = asset.get("visual_summary", "")
-                    
-                    version = doc["version_no"]
-                    doc_id = doc["doc_id"]
-                    source_image_url = f"processing/assets/{dept_code}/{doc_id}/v{version}/{filename}"
-                    
-                    # 图片 chunk_text 加入文档标题前缀，与文本 chunk 一致，提升 BM25 关键词匹配
-                    doc_title = doc.get("title", "")
-                    context_prefix = f"【文档:{doc_title}】" if doc_title else ""
-                    chunk_text = f"{context_prefix} [图片描述] {visual_summary}" if context_prefix else f"[图片描述] {visual_summary}"
-                    
-                    from opensearch_pipeline.chunker import _generate_chunk_id, _estimate_tokens
-                    chunk_id = _generate_chunk_id(doc_id, version, current_chunk_count)
-                    
-                    img_chunk = Chunk(
-                        chunk_id=chunk_id,
-                        doc_id=doc_id,
-                        version_no=version,
-                        chunk_index=current_chunk_count,
-                        chunk_type="image",
-                        chunk_text=chunk_text,
-                        token_count=_estimate_tokens(chunk_text),
-                        raw_text=chunk_text,
-                        context_prefix=context_prefix,
-                        embedding_text=chunk_text,
-                        page_num=asset.get("page_num", 1),
-                        section_title=None,
-                        source_oss_key=doc.get("canonical_key", ""),
-                        source="multimodal",
-                        title=doc.get("title", ""),
-                        owner_dept=dept_code,
-                        category_l1=doc.get("category_l1", ""),
-                        category_l2=doc.get("category_l2", ""),
-                        permission_level=doc.get("permission_level", "public"),
-                        kb_type=doc.get("kb_type", "public"),
-                        risk_level=doc.get("risk_level", "low"),
-                        is_active=True,
-                        sensitive_redacted=doc.get("redaction_action") == "REDACTED",
-                        embedding_status="NOT_STARTED",
-                        index_status="NOT_INDEXED",
-                        extra={
-                            "source_image": source_image_url,
-                            "visual_summary": visual_summary,
-                            "oss_key": asset.get("oss_key", ""),
+                if xlsx_layout_type == "product_spec_instruction":
+                    # VLM image_category 驱动绑定：用模型判断图片类别，决定归属
+                    spec_chunks = [(c, c.extra.get("spec_row_start", 9999), c.extra.get("spec_row_end", 0))
+                                   for c in chunks if c.extra.get("spec_row_start") is not None]
+                    chunk_images = {id(c): [] for c, _, _ in spec_chunks}
+
+                    # 找关键 section 的 chunk id
+                    sec_chunk_map = {}  # section_type → chunk_id
+                    for c, rs, re_ in spec_chunks:
+                        sec = c.extra.get("spec_section")
+                        if sec and sec not in sec_chunk_map:
+                            sec_chunk_map[sec] = id(c)
+
+                    # image_category → section_type 映射
+                    _CAT_TO_SEC = {
+                        "logo_header": "header",
+                        "decorative": "header",
+                        "process_flow": "process_ccp",
+                        "product_photo": "product_photo",
+                        "inspection_photo": "product_photo",
+                        "test_photo": "product_photo",
+                    }
+
+                    for asset in assets:
+                        ar = asset.get("anchor_row")
+                        if ar is None or asset.get("status") != "ROUTE_TO_VECTOR":
+                            continue
+                        fn = asset.get("filename", "")
+                        cat = asset.get("image_category", "unknown")
+                        img_entry = {
+                            "filename": fn,
+                            "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                            "anchor_row": ar,
+                            "image_category": cat,
                         }
-                    )
-                    chunks.append(img_chunk)
-                    current_chunk_count += 1
+
+                        # 1) VLM category 匹配
+                        target_sec = _CAT_TO_SEC.get(cat)
+                        target_id = sec_chunk_map.get(target_sec) if target_sec else None
+
+                        if target_id is not None:
+                            chunk_images[target_id].append(img_entry)
+                        else:
+                            # 2) VLM 分类为 unknown/其他 → 按行号 fallback
+                            best_chunk = None
+                            best_dist = 9999
+                            for c, rs, re_ in spec_chunks:
+                                if rs <= ar <= re_:
+                                    best_chunk = c; best_dist = 0; break
+                                dist = min(abs(ar - rs), abs(ar - re_))
+                                if dist < best_dist:
+                                    best_dist = dist; best_chunk = c
+                            # 非 logo 的 unknown 图片优先归 product_photo
+                            if best_chunk and best_chunk.extra.get("spec_section") in ("header", "appendix"):
+                                fallback_id = sec_chunk_map.get("product_photo")
+                                if fallback_id:
+                                    chunk_images[fallback_id].append(img_entry)
+                                else:
+                                    chunk_images[id(best_chunk)].append(img_entry)
+                            elif best_chunk:
+                                chunk_images[id(best_chunk)].append(img_entry)
+
+                    for c, _, _ in spec_chunks:
+                        imgs = chunk_images[id(c)]
+                        if imgs:
+                            c.extra["image_refs"] = imgs
+
+                elif xlsx_layout_type == "procedure_image_guide":
+                    # 按 figure_refs 绑定到 step_card
+                    fig_asset_map = {}
+                    for asset in assets:
+                        fig_no = asset.get("figure_no")
+                        if fig_no and asset.get("status") == "ROUTE_TO_VECTOR":
+                            fn = asset.get("filename", "")
+                            fig_asset_map[fig_no] = {
+                                "filename": fn,
+                                "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                                "figure_no": fig_no,
+                            }
+                    for chunk in chunks:
+                        fig_refs = chunk.extra.get("figure_refs", [])
+                        if fig_refs:
+                            bound = [fig_asset_map[f] for f in fig_refs if f in fig_asset_map]
+                            if bound:
+                                chunk.extra["image_refs"] = bound
+
+        # ─── Visual Embedding & Image Chunking ───
+        # Step 模式下图片已经绑定到 step_card，不再创建独立 image chunk
+        if not is_step_mode:
+            current_chunk_count = len(chunks)
+            assets = doc.get("assets", [])
+            if assets:
+                dept_code = doc.get("owner_dept", "unknown")
+                source_key = doc.get("source_key", "")
+                if source_key.startswith("raw/"):
+                    parts = source_key.split("/")
+                    if len(parts) > 1:
+                        dept_code = parts[1]
+
+                for asset in assets:
+                    if asset.get("status") == "ROUTE_TO_VECTOR":
+                        filename = asset.get("filename", "")
+                        visual_summary = asset.get("visual_summary", "")
+                        
+                        version = doc["version_no"]
+                        doc_id = doc["doc_id"]
+                        source_image_url = f"processing/assets/{dept_code}/{doc_id}/v{version}/{filename}"
+                        
+                        # 图片 chunk_text 加入文档标题前缀，与文本 chunk 一致，提升 BM25 关键词匹配
+                        doc_title = doc.get("title", "")
+                        context_prefix = f"【文档:{doc_title}】" if doc_title else ""
+                        chunk_text = f"{context_prefix} [图片描述] {visual_summary}" if context_prefix else f"[图片描述] {visual_summary}"
+                        
+                        from opensearch_pipeline.chunker import _generate_chunk_id, _estimate_tokens
+                        chunk_id = _generate_chunk_id(doc_id, version, current_chunk_count)
+                        
+                        img_chunk = Chunk(
+                            chunk_id=chunk_id,
+                            doc_id=doc_id,
+                            version_no=version,
+                            chunk_index=current_chunk_count,
+                            chunk_type="image",
+                            chunk_text=chunk_text,
+                            token_count=_estimate_tokens(chunk_text),
+                            raw_text=chunk_text,
+                            context_prefix=context_prefix,
+                            embedding_text=chunk_text,
+                            page_num=asset.get("page_num", 1),
+                            section_title=None,
+                            source_oss_key=doc.get("canonical_key", ""),
+                            source="multimodal",
+                            title=doc.get("title", ""),
+                            owner_dept=dept_code,
+                            category_l1=doc.get("category_l1", ""),
+                            category_l2=doc.get("category_l2", ""),
+                            permission_level=doc.get("permission_level", "public"),
+                            kb_type=doc.get("kb_type", "public"),
+                            risk_level=doc.get("risk_level", "low"),
+                            is_active=True,
+                            sensitive_redacted=doc.get("redaction_action") == "REDACTED",
+                            embedding_status="NOT_STARTED",
+                            index_status="NOT_INDEXED",
+                            extra={
+                                "source_image": source_image_url,
+                                "visual_summary": visual_summary,
+                                "oss_key": asset.get("oss_key", ""),
+                            }
+                        )
+                        chunks.append(img_chunk)
+                        current_chunk_count += 1
+
 
         all_chunks.extend(chunks)
         print(f"    └─ {doc['doc_id']}: {len(chunks)} chunks generated")
@@ -1807,7 +2437,26 @@ def node_write_chunk_meta(ctx: dict):
                     format_strings = ','.join(['%s'] * len(chunk_ids))
                     cursor.execute(f"DELETE FROM chunk_meta WHERE chunk_id IN ({format_strings})", tuple(chunk_ids))
                 
-                # 2. 插入新 chunk 记录
+                # 2. 批量插入新 chunk 记录（executemany 减少 RDS 往返）
+                insert_sql = """
+                    INSERT INTO chunk_meta (
+                        chunk_id, doc_id, version_no, chunk_index, page_num, section_title,
+                        chunk_text_preview, source_url, chunk_type, chunk_text, token_count,
+                        source, rag_ready_key, permission_level, owner_dept, category_l1,
+                        category_l2, sensitive_redacted, is_active, embedding_status,
+                        index_status, embedding_model, extra_json,
+                        parent_chunk_id, step_no, image_refs_json
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s
+                    )
+                """
+                import json as _json
+                insert_rows = []
                 for chunk in valid_chunks:
                     rag_ready_key = rag_ready_map.get(chunk.doc_id, "")
                     preview = chunk.chunk_text[:200]
@@ -1815,33 +2464,28 @@ def node_write_chunk_meta(ctx: dict):
                     # 序列化 extra dict → JSON 字符串（图片 chunk 的 source_image/visual_summary/oss_key）
                     extra_json_val = None
                     if chunk.extra:
-                        import json as _json
                         extra_json_val = _json.dumps(chunk.extra, ensure_ascii=False)
 
-                    cursor.execute("""
-                        INSERT INTO chunk_meta (
-                            chunk_id, doc_id, version_no, chunk_index, page_num, section_title,
-                            chunk_text_preview, source_url, chunk_type, chunk_text, token_count,
-                            source, rag_ready_key, permission_level, owner_dept, category_l1,
-                            category_l2, sensitive_redacted, is_active, embedding_status,
-                            index_status, embedding_model, extra_json
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s
-                        )
-                    """, (
+                    # Step Card 专有字段（从 extra 中提取）
+                    parent_chunk_id = chunk.extra.get("parent_chunk_id") if chunk.extra else None
+                    step_no = chunk.extra.get("step_no") if chunk.extra else None
+                    image_refs = chunk.extra.get("image_refs") if chunk.extra else None
+                    image_refs_json_val = _json.dumps(image_refs, ensure_ascii=False) if image_refs else None
+
+                    insert_rows.append((
                         chunk.chunk_id, chunk.doc_id, chunk.version_no, chunk.chunk_index, chunk.page_num, chunk.section_title,
                         preview, chunk.source_oss_key, chunk.chunk_type, chunk.chunk_text, chunk.token_count,
                         chunk.source, rag_ready_key, chunk.permission_level, chunk.owner_dept, chunk.category_l1,
                         chunk.category_l2, chunk.sensitive_redacted, chunk.is_active, chunk.embedding_status,
-                        chunk.index_status, chunk.embedding_model, extra_json_val
+                        chunk.index_status, chunk.embedding_model, extra_json_val,
+                        parent_chunk_id, step_no, image_refs_json_val
                     ))
-                    written += 1
+
+                if insert_rows:
+                    cursor.executemany(insert_sql, insert_rows)
+                    written = len(insert_rows)
                 conn.commit()
-            print(f"    └─ Saved {written} chunk records to RDS chunk_meta")
+            print(f"    └─ Saved {written} chunk records to RDS chunk_meta (batch insert)")
         except Exception as e:
             if conn: conn.rollback()
             print(f"    ⚠️ Failed to write chunk_meta to RDS: {e}")
@@ -1955,6 +2599,16 @@ def node_acquire_index_lock(ctx: dict):
                         WHERE doc_id = %s AND version_no = %s
                           AND index_status IN ('NOT_INDEXED', 'FAILED')
                     """, (doc_id, ver))
+                    # ── 修复：如果文档已被标记 SUCCESS（前一批次处理了部分 chunk），
+                    # 仍然需要允许重新进入以处理残留的 NOT_INDEXED chunk。
+                    if cursor.rowcount == 0:
+                        # 尝试从 SUCCESS 状态重新锁定
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET index_status = 'PROCESSING'
+                            WHERE doc_id = %s AND version_no = %s
+                              AND index_status = 'SUCCESS'
+                        """, (doc_id, ver))
                     if cursor.rowcount > 0:
                         valid_doc_versions.add((doc_id, ver))
                     else:
@@ -2304,21 +2958,41 @@ def node_generate_embeddings(ctx: dict):
         request_timeout = 60  # seconds per HTTP request
 
         # ── 本地 embedding 缓存（与 tests/eval 共享同一份 cache 文件）──
+        # 容量上限：每个 dense entry ≈ 20KB JSON，每个 sparse entry ≈ 2KB
+        # 20000 entries ≈ dense 10000 + sparse 10000 ≈ 220MB（JSON 文件上限）
+        _CACHE_MAX_ENTRIES = int(os.environ.get("RAG_EMBEDDING_CACHE_MAX_ENTRIES", "20000"))
         _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         _cache_file = os.path.join(_project_root, "scratch", "embedding_cache.json")
         _cache = {}
         if os.path.exists(_cache_file):
             try:
+                _cache_size_bytes = os.path.getsize(_cache_file)
+                if _cache_size_bytes > 100 * 1024 * 1024:  # > 100MB
+                    print(f"    ⚠️ Embedding cache file is large: {_cache_size_bytes / 1024 / 1024:.0f}MB. "
+                          f"Consider lowering RAG_EMBEDDING_CACHE_MAX_ENTRIES (current: {_CACHE_MAX_ENTRIES}).")
                 with open(_cache_file, "r", encoding="utf-8") as _cf:
                     _cache = json.load(_cf)
+                print(f"    └─ Loaded embedding cache: {len(_cache)} entries from {_cache_size_bytes / 1024 / 1024:.1f}MB file")
             except Exception:
                 _cache = {}
 
         def _cache_key(text):
             return hashlib.md5(f"{embedding_model}_{text}".encode("utf-8")).hexdigest()
 
+        def _evict_oldest(cache, max_entries):
+            """淘汰最旧的条目（dict 按插入顺序迭代，Python 3.7+）。"""
+            if len(cache) <= max_entries:
+                return cache
+            evict_count = len(cache) - max_entries
+            keys_to_evict = list(cache.keys())[:evict_count]
+            for k in keys_to_evict:
+                del cache[k]
+            print(f"    └─ Evicted {evict_count} oldest cache entries (cap: {max_entries})")
+            return cache
+
         def _save_cache():
             try:
+                _evict_oldest(_cache, _CACHE_MAX_ENTRIES)
                 os.makedirs(os.path.dirname(_cache_file), exist_ok=True)
                 with open(_cache_file, "w", encoding="utf-8") as _cf:
                     json.dump(_cache, _cf, ensure_ascii=False)

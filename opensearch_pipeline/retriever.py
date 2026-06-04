@@ -7,6 +7,7 @@ retriever.py — 检索模块
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -14,6 +15,51 @@ import requests
 from opensearch_pipeline.config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 0. Step Card Query Intent Classifier
+# ═══════════════════════════════════════════════════════════════
+
+_STEP_INTENT_PATTERNS = [
+    # 匹配顺序：窄 → 宽（先精确匹配，避免宽泛模式抢占）
+    (
+        "specific_step",
+        re.compile(
+            r"第几步|第\s*\d+\s*步|步骤\s*\d+|下一步|上一步",
+        ),
+    ),
+    (
+        "locate_field",
+        re.compile(
+            r"哪里|在哪|怎么填|填写|按钮|字段|位置|菜单|选项|入口",
+        ),
+    ),
+    (
+        "full_procedure",
+        re.compile(
+            r"如何|流程|怎么操作|怎么做|怎么用|办理|整个|完整|全部步骤|所有步骤",
+        ),
+    ),
+]
+
+
+def _classify_step_query_intent(query: str) -> str:
+    """根据关键词将用户查询分类为 Step Card 检索意图。
+
+    分类结果：
+      - ``full_procedure``  — 用户想要完整流程（怎么、如何、流程 …）
+      - ``locate_field``    — 用户想定位某个 UI 元素（哪里、在哪、按钮 …）
+      - ``specific_step``   — 用户问特定步骤（第N步、下一步 …）
+      - ``general``         — 默认兜底
+
+    Returns:
+        意图字符串
+    """
+    for intent, pattern in _STEP_INTENT_PATTERNS:
+        if pattern.search(query):
+            return intent
+    return "general"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -143,6 +189,10 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
     parsed = []
     for item in results:
         fields = item.get("fields", item)
+        # HA3 的 MULTI_STRING 字段返回列表 (e.g. ['image'])，需要归一化为字符串
+        raw_chunk_type = fields.get("chunk_type", "")
+        if isinstance(raw_chunk_type, list):
+            raw_chunk_type = raw_chunk_type[0] if raw_chunk_type else ""
         parsed.append({
             "chunk_text": fields.get("chunk_text_store", fields.get("chunk_text", "")),
             "title": fields.get("title", ""),
@@ -154,6 +204,9 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
             "kb_type": fields.get("kb_type", "public"),
             "permission_level": fields.get("permission_level", "public"),
             "owner_dept": fields.get("owner_dept", ""),
+            "chunk_type": raw_chunk_type,
+            "source_image": fields.get("source_image", ""),
+            "visual_summary": fields.get("visual_summary", ""),
             "score": item.get("score", item.get("_score", 0)),
         })
     return parsed
@@ -235,7 +288,8 @@ def search_chunks(
     _output_fields = output_fields or [
         "id", "doc_id", "chunk_text_store", "title", "section_title",
         "category_l1", "chunk_index", "page_num", "kb_type",
-        "permission_level", "owner_dept",
+        "permission_level", "owner_dept", "chunk_type",
+        "source_image", "visual_summary",
     ]
 
     # ── 权限过滤 ──
@@ -340,7 +394,7 @@ def search_chunks(
         text = r.get("chunk_text", "")
         has_section = bool(r.get("section_title"))
         chunk_type = r.get("chunk_type", "")
-        if chunk_type == "image":
+        if chunk_type in ("image", "step_card", "procedure_parent"):
             content_results.append(r)
         elif not has_section and len(text) < _COVER_MAX_LEN:
             cover_results.append(r)
@@ -433,7 +487,8 @@ def expand_top_document(
         _output_fields = [
             "id", "doc_id", "chunk_text_store", "title", "section_title",
             "category_l1", "chunk_index", "page_num", "kb_type",
-            "permission_level", "owner_dept",
+            "permission_level", "owner_dept", "chunk_type",
+            "source_image", "visual_summary",
         ]
 
         escaped_doc_id = _escape_ha3_query(top_doc_id)
@@ -548,6 +603,12 @@ def stitch_neighbor_chunks(
                 expanded.append(chunk)
                 continue
 
+            # step_card / procedure_parent 已是语义完整单元，跳过邻居拼接
+            chunk_type = chunk.get("chunk_type", "")
+            if chunk_type in ("step_card", "procedure_parent"):
+                expanded.append(chunk)
+                continue
+
             # 同一个中心 chunk 已被前面的 hit 处理过（例如 hit A 的邻居 = hit B 的中心）
             if center_key in seen_centers:
                 continue
@@ -592,6 +653,301 @@ def stitch_neighbor_chunks(
 
 
 # ═══════════════════════════════════════════════════════════════
+# 4.5 Step Card 上下文扩展
+# ═══════════════════════════════════════════════════════════════
+
+def expand_step_context(
+    chunks: List[Dict[str, Any]],
+    query: str,
+    *,
+    max_steps: int = 8,
+    max_images_total: int = 8,
+) -> List[Dict[str, Any]]:
+    """对 step_card / procedure_parent 类型的检索结果进行上下文扩展。
+
+    根据用户查询意图从 RDS 查询同一流程的兄弟步骤或子步骤，
+    将语义完整的步骤序列组装后返回，让 LLM 能看到完整操作上下文。
+
+    扩展策略（按意图）：
+      - ``full_procedure``  — 包含全部兄弟步骤（上限 max_steps）
+      - ``locate_field``    — 仅保留命中步骤本身（不扩展）
+      - ``specific_step``   — 命中步骤 + 下一步
+      - ``general``         — 命中步骤 ±1 邻居
+
+    排序规则：
+      按 parent_chunk_id 分组，组间按组内最高分降序，组内按 step_no 升序。
+
+    Args:
+        chunks: 上游检索 + 邻居拼接后的结果列表
+        query: 用户原始查询文本
+        max_steps: 单个流程最多展示的步骤数
+        max_images_total: 全局图片引用上限（预留）
+
+    Returns:
+        扩展、去重、重排后的 chunks 列表
+    """
+    if not chunks:
+        return chunks
+
+    intent = _classify_step_query_intent(query)
+    logger.info("Step Card 意图分类: query=%r → intent=%s", query[:60], intent)
+
+    # 判断是否存在需要扩展的 chunk 类型，避免无意义的 RDS 连接
+    need_expand = any(
+        c.get("chunk_type") in ("step_card", "procedure_parent")
+        for c in chunks
+    )
+    if not need_expand:
+        return chunks
+
+    try:
+        import pymysql.cursors
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+        conn = _get_db_conn()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+    except Exception as e:
+        logger.warning("expand_step_context: 无法获取 RDS 连接，回退到原始结果: %s", e)
+        return chunks
+
+    try:
+        expanded_all: List[Dict[str, Any]] = []
+
+        for chunk in chunks:
+            ctype = chunk.get("chunk_type", "")
+
+            # ── step_card：查 RDS 获取 parent_chunk_id / step_no，再展开兄弟 ──
+            if ctype == "step_card":
+                chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
+                original_score = chunk.get("score", 0)
+
+                # step_card 从 HA3 返回时不带 parent_chunk_id / step_no，需查 RDS
+                cursor.execute(
+                    "SELECT parent_chunk_id, step_no, extra_json, image_refs_json "
+                    "FROM chunk_meta WHERE chunk_id = %s",
+                    (chunk_id,),
+                )
+                meta_row = cursor.fetchone()
+                if not meta_row or not meta_row.get("parent_chunk_id"):
+                    # RDS 无记录，原样保留
+                    expanded_all.append(chunk)
+                    continue
+
+                parent_id = meta_row["parent_chunk_id"]
+                hit_step_no = meta_row.get("step_no") or 0
+
+                # 查所有兄弟步骤
+                cursor.execute(
+                    "SELECT chunk_id, chunk_text, step_no, section_title, "
+                    "       extra_json, image_refs_json "
+                    "FROM chunk_meta "
+                    "WHERE parent_chunk_id = %s AND is_active = 1 "
+                    "ORDER BY step_no",
+                    (parent_id,),
+                )
+                siblings = cursor.fetchall()
+
+                # 按意图筛选
+                if intent == "full_procedure":
+                    selected = siblings[:max_steps]
+                elif intent == "locate_field":
+                    selected = [s for s in siblings if s["step_no"] == hit_step_no]
+                elif intent == "specific_step":
+                    selected = [
+                        s for s in siblings
+                        if s["step_no"] is not None
+                        and hit_step_no <= s["step_no"] <= hit_step_no + 1
+                    ]
+                else:  # general
+                    selected = [
+                        s for s in siblings
+                        if s["step_no"] is not None
+                        and hit_step_no - 1 <= s["step_no"] <= hit_step_no + 1
+                    ]
+
+                for sib in selected:
+                    is_hit = (sib["chunk_id"] == chunk_id)
+                    score = original_score if is_hit else original_score * 0.85
+
+                    # 解析 extra_json
+                    extra = {}
+                    if sib.get("extra_json"):
+                        try:
+                            extra = json.loads(sib["extra_json"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    # 解析 image_refs_json
+                    image_refs_raw: list = []
+                    if sib.get("image_refs_json"):
+                        try:
+                            image_refs_raw = json.loads(sib["image_refs_json"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    # 标准化 image_refs 格式
+                    image_refs = []
+                    for idx, ref in enumerate(image_refs_raw):
+                        if isinstance(ref, dict):
+                            image_refs.append({
+                                "oss_key": ref.get("oss_key", ""),
+                                "ocr_text": ref.get("ocr_text", ""),
+                                "caption": ref.get("caption", ""),
+                                "order": ref.get("order", idx),
+                            })
+
+                    expanded_chunk = dict(chunk)  # 继承原始 hit 的 metadata
+                    expanded_chunk.update({
+                        "chunk_id": sib["chunk_id"],
+                        "chunk_text": sib.get("chunk_text", ""),
+                        "step_no": sib.get("step_no"),
+                        "section_title": sib.get("section_title", ""),
+                        "parent_chunk_id": parent_id,
+                        "score": score,
+                        "image_refs": image_refs,
+                        "annotation_map": extra.get("annotation_map", {}),
+                        "is_expanded": not is_hit,
+                        "expanded_from": chunk_id if not is_hit else None,
+                        "expansion_reason": "sibling_step" if not is_hit else None,
+                    })
+                    expanded_all.append(expanded_chunk)
+
+            # ── procedure_parent：展开子步骤 ──
+            elif ctype == "procedure_parent":
+                original_score = chunk.get("score", 0)
+
+                # 从 extra_json 获取 child_chunk_ids
+                extra_raw = chunk.get("extra_json") or chunk.get("extra", {})
+                if isinstance(extra_raw, str):
+                    try:
+                        extra_raw = json.loads(extra_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        extra_raw = {}
+                child_ids = extra_raw.get("child_chunk_ids", []) if isinstance(extra_raw, dict) else []
+
+                if not child_ids:
+                    expanded_all.append(chunk)
+                    continue
+
+                # 查子步骤
+                format_ph = ",".join(["%s"] * len(child_ids))
+                cursor.execute(
+                    f"SELECT chunk_id, chunk_text, step_no, section_title, "
+                    f"       extra_json, image_refs_json "
+                    f"FROM chunk_meta "
+                    f"WHERE chunk_id IN ({format_ph}) AND is_active = 1 "
+                    f"ORDER BY step_no",
+                    tuple(child_ids),
+                )
+                children = cursor.fetchall()
+                total_children = len(children)
+
+                # 截断并添加提示
+                if total_children > max_steps:
+                    parent_chunk = dict(chunk)
+                    parent_chunk["chunk_text"] = (
+                        chunk.get("chunk_text", "")
+                        + f"\n（该流程共{total_children}步，以下展示前{max_steps}步）"
+                    )
+                    expanded_all.append(parent_chunk)
+                    children = children[:max_steps]
+                else:
+                    expanded_all.append(chunk)
+
+                parent_chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
+
+                for child in children:
+                    child_extra = {}
+                    if child.get("extra_json"):
+                        try:
+                            child_extra = json.loads(child["extra_json"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    image_refs_raw = []
+                    if child.get("image_refs_json"):
+                        try:
+                            image_refs_raw = json.loads(child["image_refs_json"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    image_refs = []
+                    for idx, ref in enumerate(image_refs_raw):
+                        if isinstance(ref, dict):
+                            image_refs.append({
+                                "oss_key": ref.get("oss_key", ""),
+                                "ocr_text": ref.get("ocr_text", ""),
+                                "caption": ref.get("caption", ""),
+                                "order": ref.get("order", idx),
+                            })
+
+                    expanded_chunk = dict(chunk)
+                    expanded_chunk.update({
+                        "chunk_id": child["chunk_id"],
+                        "chunk_text": child.get("chunk_text", ""),
+                        "step_no": child.get("step_no"),
+                        "section_title": child.get("section_title", ""),
+                        "parent_chunk_id": parent_chunk_id,
+                        "score": original_score * 0.8,
+                        "image_refs": image_refs,
+                        "annotation_map": child_extra.get("annotation_map", {}),
+                        "is_expanded": True,
+                        "expanded_from": parent_chunk_id,
+                        "expansion_reason": "parent_children",
+                    })
+                    expanded_all.append(expanded_chunk)
+
+            else:
+                # 非 step 类型，原样保留
+                expanded_all.append(chunk)
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        logger.warning("expand_step_context 处理异常，回退到原始结果: %s", e, exc_info=True)
+        return chunks
+
+    # ── 去重：相同 chunk_id 保留最高分 ──
+    seen: Dict[str, Dict[str, Any]] = {}
+    for c in expanded_all:
+        cid = c.get("chunk_id") or c.get("id", "")
+        if cid in seen:
+            if c.get("score", 0) > seen[cid].get("score", 0):
+                seen[cid] = c
+        else:
+            seen[cid] = c
+    deduped = list(seen.values())
+
+    # ── 排序：按 parent_chunk_id 分组 → 组间按最高分降序 → 组内按 step_no 升序 ──
+    groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
+    for c in deduped:
+        gkey = c.get("parent_chunk_id")
+        groups.setdefault(gkey, []).append(c)
+
+    # 组内按 step_no 排序
+    for members in groups.values():
+        members.sort(key=lambda x: (x.get("step_no") or 0))
+
+    # 组间按最高分降序
+    sorted_groups = sorted(
+        groups.values(),
+        key=lambda grp: max(c.get("score", 0) for c in grp),
+        reverse=True,
+    )
+
+    result: List[Dict[str, Any]] = []
+    for grp in sorted_groups:
+        result.extend(grp)
+
+    logger.info(
+        "Step Card 扩展完成: %d chunks → %d expanded (去重后 %d), intent=%s",
+        len(chunks), len(expanded_all), len(result), intent,
+    )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
 # 5. 统一检索入口
 # ═══════════════════════════════════════════════════════════════
 
@@ -625,4 +981,7 @@ def retrieve_and_enrich(
     chunks = search_chunks(query, top_k=top_k, user_dept=user_dept)
     if chunks and stitch_window > 0:
         chunks = stitch_neighbor_chunks(chunks, window=stitch_window)
+    # Step Card 上下文扩展
+    if chunks:
+        chunks = expand_step_context(chunks, query)
     return chunks

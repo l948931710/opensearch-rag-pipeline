@@ -7,6 +7,8 @@ pypdf>=4.0
 python-docx>=1.0
 openpyxl>=3.1
 requests>=2.31
+Pillow>=10.0
+PyMuPDF>=1.24
 
 # API Runtime
 fastapi>=0.115

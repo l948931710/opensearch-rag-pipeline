@@ -78,17 +78,10 @@ class ImageFunnelProcessor:
         ocr_result = self.ocr_client.ocr_image(local_path, doc_id)
         ocr_text = ocr_result.combined_text or ""
         
-        # 文本密度规则：若提取文本大于120个字符，或者高度密集的表格文字，归入正文段落
-        if len(ocr_text.strip()) > 120:
-            print(f"    [Funnel 2] Routed image to text paragraph: {filename} (text_len={len(ocr_text)})")
-            return {
-                "status": "ROUTE_TO_TEXT",
-                "ocr_text": ocr_text.strip(),
-                "width": width,
-                "height": height,
-                "file_size_kb": file_size_kb,
-                "reason": "Funnel 2: High OCR Text Density (>120 chars)"
-            }
+        # 文本密度标记：高文字量的图片不再直接 ROUTE_TO_TEXT，
+        # 而是交给 VLM 判断是否为实物照片（包装箱/合格证等虽然文字多但本质是产品照片）。
+        # 仅当 VLM 确认为纯文字内容（非实物照片）时才走文本路由。
+        is_text_heavy = len(ocr_text.strip()) > 120
 
         # ─── Funnel 3: Semantic Value & Safety Filter (VLM Verification) ───
         # 如果是普通 raw 目录下的内部公开文档，强制 bypass 安全性及敏感印章审计，不向 VLM 传递敏感内容检验需求
@@ -113,6 +106,17 @@ class ImageFunnelProcessor:
                 "reason": "Funnel 3: VLM Audit Detected Sensitive Entities (Seals, Stamps, ID Card, Signatures)"
             }
         elif vlm_status == "LOW_RELEVANCE":
+            # 低语义价值：如果文字多，仍然可以做文本路由（不浪费 OCR 结果）
+            if is_text_heavy:
+                print(f"    [Funnel 2→3] Routed text-heavy low-relevance image to text: {filename} (text_len={len(ocr_text)})")
+                return {
+                    "status": "ROUTE_TO_TEXT",
+                    "ocr_text": ocr_text.strip(),
+                    "width": width,
+                    "height": height,
+                    "file_size_kb": file_size_kb,
+                    "reason": "Funnel 2+3: High OCR Text + VLM Low Relevance → Text Paragraph"
+                }
             print(f"    [Funnel 3] Discarded low-relevance graphic: {filename}")
             return {
                 "status": "DISCARD_DECORATIVE",
@@ -122,10 +126,28 @@ class ImageFunnelProcessor:
                 "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
             }
         else:
-            # ROUTE_TO_VECTOR
+            # ROUTE_TO_VECTOR — VLM 认为有语义价值
             caption = vlm_result.get("caption", "")
             img_cat = vlm_result.get("image_category", "unknown")
             anno_map = vlm_result.get("annotation_map", {})
+
+            # 实物照片类别：即使文字多也保留为图片（包装箱/合格证/标签等）
+            _PHOTO_CATS = {"product_photo", "inspection_photo", "test_photo",
+                           "packaging_photo", "process_flow"}
+            
+            if is_text_heavy and img_cat not in _PHOTO_CATS:
+                # 文字密集 + VLM 未识别为实物照片 → 降级为文本段落
+                print(f"    [Funnel 2→3] Routed text-heavy image to text: {filename} (cat={img_cat}, text_len={len(ocr_text)})")
+                return {
+                    "status": "ROUTE_TO_TEXT",
+                    "ocr_text": ocr_text.strip(),
+                    "image_category": img_cat,
+                    "width": width,
+                    "height": height,
+                    "file_size_kb": file_size_kb,
+                    "reason": f"Funnel 2+3: High OCR Text + Non-photo category '{img_cat}' → Text Paragraph"
+                }
+
             print(f"    [Funnel 3] Routed to vector: {filename} -> [{img_cat}] {caption[:80]}")
             return {
                 "status": "ROUTE_TO_VECTOR",
@@ -274,8 +296,11 @@ class ImageFunnelProcessor:
                 "   - test_photo: 测试/实验照片（耐热测试、称重、温度计、样品测试）\n"
                 "   - inspection_photo: 验货/检查现场照片（外方验货、包装检查）\n"
                 "   - form_image: 表单/记录单截图（交货单、检验单、入库单）\n"
-                "   - visual_knowledge: 独立知识图（字段说明、缺陷对照、流程图、规格对照表）\n"
-                "   - decorative: 封面/Logo/装饰图\n"
+                "   - visual_knowledge: 独立知识图（字段说明、缺陷对照、规格对照表）\n"
+                "   - process_flow: 工艺流程图、生产流程图、CCP流程图\n"
+                "   - product_photo: 产品实物照片、包装成品照片、外箱照片、标签照片、合格证照片\n"
+                "   - logo_header: 封面Logo、公司标志、页眉装饰\n"
+                "   - decorative: 其他纯装饰图/留白/线条\n"
                 "   - unknown: 无法判断\n\n"
                 "3. 生成 caption：用一句简洁中文描述图片可见内容（50-100字）。\n"
                 "   只描述看得见的对象/动作/界面/字段，不要编造看不清的读数或结论。\n\n"

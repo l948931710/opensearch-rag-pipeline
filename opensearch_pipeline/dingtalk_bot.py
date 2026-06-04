@@ -354,6 +354,7 @@ def _format_answer_markdown(
     sources: List[Dict[str, Any]],
     latency_ms: int,
     model: str,
+    images: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """将 RAG 回答格式化为钉钉 Markdown。"""
 
@@ -380,6 +381,17 @@ def _format_answer_markdown(
                 source_line += f" > {section}"
             source_line += f"（相关度 {score:.2f}）"
             lines.append(source_line)
+        lines.append("")
+
+    # 相关图片（Markdown 降级时追加到末尾）
+    if images:
+        lines.append("---")
+        lines.append("**🖼️ 相关图片**")
+        for img in images[:3]:
+            desc = img.get("title", "图片")[:30]
+            url = img.get("url", "")
+            if url:
+                lines.append(f"![{desc}]({url})")
         lines.append("")
 
     # 元信息
@@ -462,7 +474,12 @@ def _process_rag_query(
         # 3. 追加到会话历史（供下轮使用）
         append_to_history(session_key, question, result["answer"])
 
-        # 4. 落库
+        # 4. 构建 content_blocks（图文穿插）
+        from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json
+        content_blocks = build_content_blocks(result["answer"], chunks)
+        content_blocks_json_str = content_blocks_to_json(content_blocks)
+
+        # 5. 落库（包含 content_blocks_json 供回调重建）
         top_score = max((c.get("score", 0) for c in chunks), default=None)
         log_qa_session(
             session_id=session_key,
@@ -482,10 +499,16 @@ def _process_rag_query(
             opensearch_hit_count=len(chunks),
             top_score=top_score,
             conversation_type=conversation_type,
+            content_blocks_json=content_blocks_json_str or None,
         )
 
-        # 5. 发送互动卡片（失败降级为 Markdown）
-        print(f"[DEBUG] 准备发送互动卡片: message_id={message_id}, conv_type={conversation_type}", flush=True)
+        # 6. 发送互动卡片（失败降级为 Markdown）
+        img_blocks = [b for b in content_blocks if b.get("type") == "image"] if content_blocks else []
+        print(f"[DEBUG] 准备发送互动卡片: message_id={message_id}, conv_type={conversation_type}, "
+              f"content_blocks={len(content_blocks)}, image_blocks={len(img_blocks)}", flush=True)
+        for ib in img_blocks:
+            url_preview = ib.get("url", "")[:100]
+            print(f"[DEBUG]   📸 image: title={ib.get('title','')[:40]}, url={url_preview}...", flush=True)
         try:
             card_sent = send_interactive_card(
                 conversation_id=conversation_id,
@@ -497,6 +520,7 @@ def _process_rag_query(
                 sources=result["sources"],
                 latency_ms=latency_ms,
                 model=result["model"],
+                content_blocks=content_blocks if content_blocks else None,
             )
             print(f"[DEBUG] 互动卡片结果: card_sent={card_sent}", flush=True)
         except Exception as card_err:
@@ -506,12 +530,17 @@ def _process_rag_query(
         if not card_sent:
             # 降级：使用 Markdown 回复（无反馈按钮）
             print("[DEBUG] 降级为 Markdown 回复", flush=True)
+            # 提取图片信息用于 markdown 降级显示
+            md_images = []
+            if content_blocks:
+                md_images = [b for b in content_blocks if b.get("type") == "image"]
             md_text = _format_answer_markdown(
                 question=question,
                 answer=result["answer"],
                 sources=result["sources"],
                 latency_ms=latency_ms,
                 model=result["model"],
+                images=md_images,
             )
             _send_reply(session_webhook, f"回答：{question[:20]}", md_text)
             print("[DEBUG] Markdown 回复已发送", flush=True)
@@ -671,23 +700,99 @@ async def card_callback(request: Request):
     message_id = params.get("message_id", "") or out_track_id
     reason = params.get("reason")  # ActionSheet 菜单传入的踩原因
 
+    # 提取"其他原因"表单中用户填写的详细内容
+    comment = None
+    current_form = params.get("current_form")
+    if current_form:
+        # current_form 可能是 JSON 字符串或 dict
+        if isinstance(current_form, str):
+            try:
+                current_form = json.loads(current_form)
+            except (json.JSONDecodeError, TypeError):
+                current_form = {}
+        if isinstance(current_form, dict):
+            comment = current_form.get("other_reason_detail", "") or None
+
     if not message_id or not action:
         logger.warning("卡片回调缺少 message_id 或 action: body=%s", body)
         return {"cardData": {"cardParamMap": {}}}
+
+    # ── 第一次回调：点击"其他原因"→ 只展开表单，不保存反馈 ──
+    if action == "downvote_other_start":
+        print(f"[CALLBACK DEBUG] 展开其他原因表单: message_id={message_id}", flush=True)
+        # 回写 show_other_feedback_form = "true"，卡片刷新后显示表单
+        # 同时保留其他字段不变（回调响应会覆盖整个 cardParamMap）
+        card_param_map = {
+            "feedback_status": "",                   # 保持空→按钮组仍然通过此条件判断
+            "show_other_feedback_form": "true",       # 展开表单
+            "form_status": "normal",                  # 表单可编辑
+            "form_btn_text": "提交反馈",              # 提交按钮文字
+            # 表单字段定义（回调会覆盖整个 cardParamMap，必须重新传入）
+            "other_feedback_form": json.dumps({
+                "fields": [{
+                    "name": "other_reason_detail",
+                    "label": "请填写具体原因",
+                    "type": "TEXT",
+                    "required": True,
+                    "placeholder": "请说明哪里没帮助，例如：缺少某项制度、结论不准确、希望补充来源等",
+                    "requiredMsg": "请填写具体原因后再提交",
+                }]
+            }, ensure_ascii=False),
+        }
+        # 重建其他字段（回调响应会覆盖整个 cardParamMap）
+        _rebuild_card_param_map(card_param_map, message_id, context="展开表单时")
+
+        return {"cardData": {"cardParamMap": card_param_map}}
+
+    # ── 第二次回调（表单提交）/ 普通踩 ──
+    # 归一化 action：downvote_other_submit → downvote（附带用户填写的 comment）
+    normalized_action = action
+    if action == "downvote_other_submit":
+        normalized_action = "downvote"
+        if not reason:
+            reason = "other"
 
     # 处理反馈
     success = handle_feedback(
         message_id=message_id,
         user_id=user_id,
-        action=action,
+        action=normalized_action,
         reason=reason,
+        comment=comment,
     )
 
     # 从数据库重建完整卡片数据（回调响应会覆盖整个 cardParamMap）
-    feedback_text = get_feedback_status_text(action) if success else "⚠️ 反馈处理失败"
-    print(f"[CALLBACK DEBUG] message_id={message_id}, action={action}, success={success}, text={feedback_text}", flush=True)
+    feedback_text = get_feedback_status_text(normalized_action) if success else "⚠️ 反馈处理失败"
+    if success and action == "downvote_other_submit":
+        feedback_text = "📝 已反馈：没帮助（已提交详细原因）"
+    print(f"[CALLBACK DEBUG] message_id={message_id}, action={action}, normalized={normalized_action}, success={success}, text={feedback_text}, comment={comment}", flush=True)
 
-    card_param_map = {"feedback_status": feedback_text}
+    card_param_map = {
+        "feedback_status": feedback_text,
+        # 提交后收起表单、隐藏按钮
+        "show_other_feedback_form": "",
+        "form_status": "disabled",
+    }
+    _rebuild_card_param_map(card_param_map, message_id, context="")
+
+    return {
+        "cardData": {
+            "cardParamMap": card_param_map,
+        },
+    }
+
+
+def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str = "") -> None:
+    """从 qa_session_log 重建卡片回调所需的完整字段。
+
+    钉钉互动卡片的回调响应会覆盖整个 cardParamMap，因此每次回调都必须
+    重新填充 question/answer/sources/meta/content_blocks 等字段。
+
+    Args:
+        card_param_map: 待填充的字典（就地修改）。
+        message_id: 对应 qa_session_log 的 message_id。
+        context: 日志上下文描述（用于区分调用来源）。
+    """
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn()
@@ -695,7 +800,8 @@ async def card_callback(request: Request):
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT query_text, answer_text, cited_docs_json, model_name, latency_ms
+                    SELECT query_text, answer_text, cited_docs_json, model_name, latency_ms,
+                           content_blocks_json
                     FROM fuling_operation.qa_session_log
                     WHERE message_id = %s LIMIT 1
                     """,
@@ -709,9 +815,8 @@ async def card_callback(request: Request):
                     # 重建 sources_text
                     sources_json = row[2]
                     if sources_json:
-                        import json as _json
                         try:
-                            sources_list = _json.loads(sources_json) if isinstance(sources_json, str) else sources_json
+                            sources_list = json.loads(sources_json) if isinstance(sources_json, str) else sources_json
                             sources_lines = []
                             for i, s in enumerate(sources_list, 1):
                                 if isinstance(s, dict):
@@ -730,13 +835,15 @@ async def card_callback(request: Request):
                     latency = row[4] or 0
                     card_param_map["meta"] = f"模型: {model} | 耗时: {latency / 1000:.1f}s"
                     card_param_map["message_id"] = message_id
+                    # 重建 content_blocks（图文穿插数据）
+                    content_blocks_json = row[5]
+                    if content_blocks_json:
+                        card_param_map["content_blocks"] = content_blocks_json if isinstance(content_blocks_json, str) else json.dumps(content_blocks_json, ensure_ascii=False)
+                    else:
+                        card_param_map["content_blocks"] = ""
         finally:
             conn.close()
     except Exception as e:
-        print(f"[CALLBACK DEBUG] 重建卡片数据失败: {e}", flush=True)
+        debug_ctx = f"{context}重建卡片数据失败" if context else "重建卡片数据失败"
+        print(f"[CALLBACK DEBUG] {debug_ctx}: {e}", flush=True)
 
-    return {
-        "cardData": {
-            "cardParamMap": card_param_map,
-        },
-    }

@@ -44,6 +44,7 @@ def log_qa_session(
     opensearch_hit_count: Optional[int] = None,
     top_score: Optional[float] = None,
     conversation_type: Optional[str] = None,
+    content_blocks_json: Optional[str] = None,
 ) -> None:
     """
     写入一条 qa_session_log 记录。
@@ -107,14 +108,16 @@ def log_qa_session(
                         retrieved_docs_json, cited_docs_json,
                         latency_ms, retrieval_latency_ms, llm_latency_ms,
                         answer_status, model_name, error_message,
-                        opensearch_hit_count, top_score, conversation_type
+                        opensearch_hit_count, top_score, conversation_type,
+                        content_blocks_json
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s,
+                        %s
                     )
                     """,
                     (
@@ -125,6 +128,7 @@ def log_qa_session(
                         latency_ms, retrieval_latency_ms, llm_latency_ms,
                         answer_status, model_name, error_message,
                         opensearch_hit_count, top_score, conversation_type,
+                        content_blocks_json,
                     ),
                 )
             conn.commit()

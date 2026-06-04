@@ -41,12 +41,14 @@ class UnifiedExtractor:
         self,
         oss_client=None,
         ocr_client: Optional[OCRClient] = None,
-        simulate: bool = True,
+        simulate: bool = None,
     ):
+        from opensearch_pipeline.config import get_config
+        cfg = get_config()
+        if simulate is None:
+            simulate = cfg.simulate
         self.oss_client = oss_client
         if not ocr_client:
-            from opensearch_pipeline.config import get_config
-            cfg = get_config()
             self.ocr_client = OCRClient(
                 api_key=cfg.ocr.api_key,
                 api_base_url=cfg.ocr.api_base_url,
@@ -80,6 +82,8 @@ class UnifiedExtractor:
             return self._extract_docx(task)
         elif file_ext in ("xlsx", "xls"):
             return self._extract_xlsx(task)
+        elif file_ext == "pptx":
+            return self._extract_pptx(task)
         elif file_ext in ("txt", "md", "csv", "html"):
             return self._extract_text(task)
         elif file_ext in ("png", "jpg", "jpeg", "webp"):
@@ -156,21 +160,60 @@ class UnifiedExtractor:
     # ── DOCX ──
 
     def _extract_docx(self, task: dict) -> ExtractionResult:
-        """DOCX 提取（文本 + 嵌入图片）。"""
-        from opensearch_pipeline.extraction.docx_extractor import extract_docx
+        """DOCX 提取（文本 + 嵌入图片，段落级图片位置追踪）。"""
+        from opensearch_pipeline.extraction.docx_extractor import extract_docx_with_images
         from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_docx
 
         local_path = task.get("local_path", "")
-        blocks, warnings = extract_docx(local_path)
+
+        # ── 方案 B：用 extract_docx_with_images 获得段落级 image_ref 位置 ──
+        # 这让 _inject_image_ref_blocks 走精确匹配路径而非启发式均匀分配
+        blocks, inline_image_assets = extract_docx_with_images(local_path)
+        warnings = []
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
 
-        # 提取嵌入图片 → 三阶段过滤漏斗
-        assets, img_blocks = self._process_embedded_images(
-            extract_images_from_docx(local_path, task.get("_tmp_dir", "")),
-            task,
+        # ── 提取嵌入图片到磁盘 → 三阶段过滤漏斗 ──
+        exported_images = extract_images_from_docx(
+            local_path, task.get("_tmp_dir", "")
         )
-        if img_blocks:
+
+        # ── 对齐 image_index：inline_image_assets 按文档顺序，
+        #    exported_images 按 rels 遍历顺序，需要通过 target_ref 匹配 ──
+        if inline_image_assets and exported_images:
+            # 构建 target_ref → exported asset 映射
+            export_by_ref = {}
+            for ea in exported_images:
+                ref = getattr(ea, "original_name", "") or ""
+                if ref:
+                    export_by_ref[ref] = ea
+
+            # 用 inline 顺序重建 exported 列表，确保 image_index 一致
+            aligned_exports = []
+            for ia in inline_image_assets:
+                ref = getattr(ia, "original_name", "") or ""
+                matched = export_by_ref.get(ref)
+                if matched:
+                    # 用 inline 的 image_index 覆盖 export 的 image_index
+                    matched.image_index = ia.image_index
+                    aligned_exports.append(matched)
+
+            # 如果对齐成功（大部分都能匹配），用对齐后的列表
+            if len(aligned_exports) >= len(exported_images) * 0.5:
+                exported_images = aligned_exports
+
+        assets, img_blocks = self._process_embedded_images(
+            exported_images, task,
+        )
+        # 不再 extend img_blocks — image_ref 已内联在 blocks 中
+        # img_blocks 是 _process_embedded_images 生成的冗余 image_ref，
+        # 只有当 blocks 中完全没有 image_ref 时才 fallback 追加
+        has_inline_refs = any(
+            (b.block_type if hasattr(b, "block_type") else b.get("block_type", ""))
+            == "image_ref"
+            for b in blocks
+        )
+        if not has_inline_refs and img_blocks:
             blocks.extend(img_blocks)
             flat_text = blocks_to_text(blocks)
 
@@ -190,34 +233,177 @@ class UnifiedExtractor:
 
     # ── XLSX / XLS ──
 
+    # 设备清扫基准书：通用部位关键词 fallback 白名单
+    _PART_KEYWORDS_FALLBACK = {
+        "进片口", "外侧", "电刷", "轴轮", "链条", "齿轮", "丝杆", "油位",
+        "温度", "剥离条", "电机", "烘箱", "油壸", "管路", "底盘", "配电箱",
+        "变频器", "液压站", "三辊", "涂油辊", "硅油", "粉碎机", "油缸",
+        "主机", "仪表", "标识", "外观", "送片组件", "拉伸总成", "出杯口",
+        "机顶盖", "活动件", "油路",
+    }
+
+    # 表头关键词：命中 ≥2 个则认为是表头行
+    _HEADER_KEYWORDS = {"清扫部位名称", "点检部位", "部位名称", "清扫基准",
+                        "清扫方法", "清扫工具", "清扫周期", "点检项目",
+                        "点检方法", "判定标准", "序号", "类别",
+                        "运转中", "停机时", "安全注意事项", "责任人",
+                        "所需时间", "频次", "异常处理", "点检人"}
+
+    # 部位名称列：优先匹配这些列名
+    _PART_COL_NAMES = {"清扫部位名称", "点检部位", "部位名称"}
+
     def _extract_xlsx(self, task: dict) -> ExtractionResult:
-        """Excel 提取（文本 + 嵌入图片）：逐 sheet 逐行读取单元格文本。"""
+        """Excel 提取（文本 + 嵌入图片）：逐 sheet 逐行读取单元格文本。
+
+        增强功能（设备清扫基准书类文档）：
+        - 子 section 检测："清扫时要点检的项目" 插入 heading 分隔清扫区和点检区
+        - 表头行识别 + 部位名称列自动提取 part_candidates
+        - 表头行和设备信息行标记 row_role="metadata"，不进入 row card chunk
+        - 图片 part_labels 提取（优先匹配 part_candidates，fallback 白名单）
+        """
+        import re
         from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_xlsx
 
         local_path = task.get("local_path", "")
         file_ext = task.get("file_ext", "xlsx").lower()
         blocks = []
         warnings = []
+        all_part_candidates: set = set()  # 跨 sheet 收集所有部位名称
 
         try:
             import openpyxl
             wb = openpyxl.load_workbook(local_path, read_only=True, data_only=True)
-            for sheet_name in wb.sheetnames:
+            for sheet_idx, sheet_name in enumerate(wb.sheetnames):
                 ws = wb[sheet_name]
-                rows_text = []
-                for row in ws.iter_rows(values_only=True):
+
+                # sheet 标题作为 heading block（默认 section_type=cleaning_items）
+                sheet_heading = ExtractedBlock(
+                    block_type="heading",
+                    text=sheet_name,
+                    page_num=sheet_idx + 1,
+                    section_path=sheet_name,
+                    source="openpyxl",
+                )
+                sheet_heading.extra = {"section_type": "cleaning_items"}
+                blocks.append(sheet_heading)
+
+                # ── Pass 1: 扫描所有行，识别表头 + 收集 part_candidates ──
+                all_rows = []
+                header_row_idx = None
+                part_col_idx = None
+
+                for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
                     cells = [str(c) if c is not None else "" for c in row]
+                    all_rows.append((row_idx, cells))
+
+                    # 检测表头行（命中 ≥2 个关键词）
+                    if header_row_idx is None:
+                        stripped_cells = {c.strip() for c in cells if c.strip()}
+                        hits = len(stripped_cells & self._HEADER_KEYWORDS)
+                        if hits >= 2:
+                            header_row_idx = row_idx
+                            # 找部位名称列
+                            for ci, c in enumerate(cells):
+                                if c.strip() in self._PART_COL_NAMES:
+                                    part_col_idx = ci
+                                    break
+
+                # 从数据行收集 part_candidates
+                if header_row_idx is not None and part_col_idx is not None:
+                    for row_idx, cells in all_rows:
+                        if row_idx <= header_row_idx:
+                            continue
+                        if part_col_idx < len(cells):
+                            part_name = cells[part_col_idx].strip()
+                            if part_name and len(part_name) >= 2 and not part_name.isdigit():
+                                all_part_candidates.add(part_name)
+
+                # ── Pass 2: 生成 blocks ──
+                # 签字行/备注分界正则
+                _RE_SIGNATURE = re.compile(r"编写[：:]?\s*(.*\s+)?审核")
+                _RE_SECTION_BOUNDARY = re.compile(r"清扫时[要需]点检|^点检项目$")
+
+                in_inspection_section = False
+                for row_idx, cells in all_rows:
                     line = "\t".join(cells).strip()
-                    if line:
-                        rows_text.append(line)
-                if rows_text:
-                    sheet_text = f"## {sheet_name}\n" + "\n".join(rows_text)
-                    blocks.append(ExtractedBlock(
-                        block_type="table",
-                        text=sheet_text,
-                        page_num=None,
-                        source="openpyxl"
-                    ))
+                    if not line:
+                        continue
+
+                    clean_text = line.replace("\t", "").strip()
+                    stripped_cells = {c.strip() for c in cells if c.strip()}
+
+                    # ── Bug fix 1: 子区域分界行 → 只生成 heading，跳过 paragraph ──
+                    if _RE_SECTION_BOUNDARY.match(clean_text):
+                        if not in_inspection_section:
+                            in_inspection_section = True
+                            sub_heading = ExtractedBlock(
+                                block_type="heading",
+                                text=f"{sheet_name} — 点检项目",
+                                page_num=sheet_idx + 1,
+                                section_path=f"{sheet_name} — 点检项目",
+                                source="openpyxl",
+                            )
+                            sub_heading.extra = {"section_type": "inspection_items"}
+                            blocks.append(sub_heading)
+                        continue  # 不生成 paragraph block
+
+                    # ── Bug fix 3: 签字行 → 跳过 ──
+                    if _RE_SIGNATURE.search(clean_text):
+                        continue
+
+                    # ── Bug fix 2: 二级表头检测（点检区表头等） ──
+                    header_hits = len(stripped_cells & self._HEADER_KEYWORDS)
+                    is_secondary_header = (
+                        header_row_idx is not None
+                        and row_idx > header_row_idx
+                        and header_hits >= 2
+                    )
+
+                    # ── Bug fix 4: 稀疏表头碎片行（只含表头关键词，无实质数据） ──
+                    non_empty_cells = [c.strip() for c in cells if c.strip()]
+                    is_sparse_header_fragment = (
+                        len(non_empty_cells) <= 3
+                        and header_hits >= 1
+                        and all(c in self._HEADER_KEYWORDS or len(c) <= 2 for c in non_empty_cells)
+                    )
+
+                    # ── v2 fix 2: 纯序号空行（只有 1-2 个 cell 且全是数字/空） ──
+                    is_empty_number_row = (
+                        len(non_empty_cells) <= 2
+                        and all(c.isdigit() for c in non_empty_cells)
+                    )
+
+                    # 生成 paragraph block
+                    blk = ExtractedBlock(
+                        block_type="paragraph",
+                        text=line,
+                        page_num=sheet_idx + 1,
+                        source="openpyxl",
+                    )
+                    extra = {"row_num": row_idx, "sheet_idx": sheet_idx}
+
+                    # 标记 row_role
+                    if header_row_idx is not None and row_idx <= header_row_idx:
+                        extra["row_role"] = "metadata"
+                    elif is_secondary_header or is_sparse_header_fragment:
+                        extra["row_role"] = "metadata"
+                    elif is_empty_number_row:
+                        extra["row_role"] = "metadata"  # 纯序号空行
+                    else:
+                        extra["row_role"] = "data"
+                        # 提取 part_name（如果有部位列）
+                        if part_col_idx is not None and part_col_idx < len(cells):
+                            pn = cells[part_col_idx].strip()
+                            if pn and len(pn) >= 2 and not pn.isdigit():
+                                extra["part_name"] = pn
+                        # v2 fix 5: 标记稀疏数据行（非空数据 cell ≤3）
+                        data_cells = [c for c in non_empty_cells if not c.isdigit()]
+                        if len(data_cells) <= 2 and not is_empty_number_row:
+                            extra["sparse_row"] = True
+
+                    blk.extra = extra
+                    blocks.append(blk)
+
             wb.close()
         except Exception as e:
             warnings.append(f"Failed to extract Excel file: {e}")
@@ -227,8 +413,100 @@ class UnifiedExtractor:
             extract_images_from_xlsx(local_path, task.get("_tmp_dir", "")),
             task,
         )
+
+        # ── part_labels 提取（混合策略：part_candidates 优先 + 白名单 fallback）──
+        if all_part_candidates or self._PART_KEYWORDS_FALLBACK:
+            for asset in assets:
+                ocr = asset.get("ocr_text", "")
+                vs = asset.get("visual_summary", "")
+                search_text = f"{ocr} {vs}"
+                if not search_text.strip():
+                    continue
+                # 优先匹配表格中实际出现的部位名称
+                labels = [p for p in all_part_candidates if p in search_text]
+                # Fallback：通用白名单
+                if not labels:
+                    labels = [kw for kw in self._PART_KEYWORDS_FALLBACK if kw in search_text]
+                if labels:
+                    asset["part_labels"] = sorted(set(labels))
+
         if img_blocks:
             blocks.extend(img_blocks)
+
+        # ── procedure_image_guide 后处理：步骤标注 + 图号映射 ──
+        from opensearch_pipeline.extraction.xlsx_classifier import classify_xlsx_layout
+        _sheet_names = list(dict.fromkeys(
+            b.text for b in blocks
+            if b.block_type == "heading" and b.extra.get("section_type") in ("cleaning_items", "")
+        ))
+        _layout_type, _ = classify_xlsx_layout(
+            filename=task.get("filename", ""),
+            sheet_names=_sheet_names,
+            flat_text=blocks_to_text(blocks)[:5000],
+        )
+        if _layout_type == "procedure_image_guide":
+            _RE_STEP_PREFIX = re.compile(r"^(\d+)\t")
+            # 图号引用：如图1、见左图3、4、5、如图8-9
+            _RE_FIG_REF = re.compile(
+                r"(?:如图|见.*?图)\s*(\d+(?:\s*[、,，\-~～]\s*\d+)*)"
+            )
+
+            def _parse_figure_refs(text: str) -> list:
+                """从文本中提取所有引用的图号列表，如 ['图1','图3','图4','图5']"""
+                refs = []
+                for m in _RE_FIG_REF.finditer(text):
+                    nums_str = m.group(1)
+                    # 处理范围（8-9）和列表（3、4、5）
+                    parts = re.split(r"[、,，]\s*", nums_str)
+                    for part in parts:
+                        part = part.strip()
+                        range_m = re.match(r"(\d+)\s*[\-~～]\s*(\d+)", part)
+                        if range_m:
+                            for n in range(int(range_m.group(1)), int(range_m.group(2)) + 1):
+                                refs.append(f"图{n}")
+                        elif part.isdigit():
+                            refs.append(f"图{part}")
+                return refs
+
+            # 标记步骤行
+            for blk in blocks:
+                if blk.block_type != "paragraph":
+                    continue
+                m = _RE_STEP_PREFIX.match(blk.text)
+                if m:
+                    step_no = int(m.group(1))
+                    blk.extra["step_no"] = step_no
+                    blk.extra["row_role"] = "step"
+                    fig_refs = _parse_figure_refs(blk.text)
+                    if fig_refs:
+                        blk.extra["figure_refs"] = fig_refs
+
+            # 建立图号 → asset 映射
+            # 关键：跳过 logo/表头装饰图（anchor_row 在图例区之前的图片）
+            # 优先用"图例"行号定位图片区起始；其次用 step_row-3；保底 row<5 过滤 logo
+            tu_li_rows = [b.extra.get("row_num", 999) for b in blocks
+                          if b.block_type == "paragraph" and "图例" in b.text]
+            step_rows = [b.extra.get("row_num", 999) for b in blocks if b.extra.get("step_no")]
+            if tu_li_rows:
+                figure_start_row = min(tu_li_rows)  # "图例" 行即是图片区开始
+            elif step_rows:
+                figure_start_row = max(0, min(step_rows) - 3)
+            else:
+                figure_start_row = 5  # 保底：前5行通常是标题/签署区
+
+            sorted_assets = sorted(assets, key=lambda a: a.get("filename", ""))
+            figure_map = {}
+            fig_counter = 1
+            for asset in sorted_assets:
+                anchor_row = asset.get("anchor_row")
+                # 跳过步骤区之前的图片（logo、表头装饰等）
+                if anchor_row is not None and anchor_row < figure_start_row:
+                    asset["figure_no"] = None  # 标记为非步骤图片
+                    continue
+                fig_label = f"图{fig_counter}"
+                asset["figure_no"] = fig_label
+                figure_map[fig_label] = fig_counter - 1
+                fig_counter += 1
 
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
@@ -243,6 +521,70 @@ class UnifiedExtractor:
             text=flat_text,
             text_length=len(flat_text),
             blocks=blocks,
+            warnings=warnings,
+            assets=assets,
+        )
+
+    # ── PPTX ──
+
+    def _extract_pptx(self, task: dict) -> ExtractionResult:
+        """PPTX 提取（幻灯片文本 + 表格 + 嵌入图片）。"""
+        from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_pptx
+
+        local_path = task.get("local_path", "")
+        blocks = []
+        warnings = []
+
+        try:
+            from pptx import Presentation
+            prs = Presentation(local_path)
+
+            for slide_idx, slide in enumerate(prs.slides):
+                slide_texts = []
+                for shape in slide.shapes:
+                    # 文本框 / 占位符
+                    if hasattr(shape, "text") and shape.text.strip():
+                        slide_texts.append(shape.text.strip())
+                    # 表格
+                    if shape.has_table:
+                        for row in shape.table.rows:
+                            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                            if cells:
+                                slide_texts.append("\t".join(cells))
+
+                if slide_texts:
+                    slide_text = f"## Slide {slide_idx + 1}\n" + "\n".join(slide_texts)
+                    blocks.append(ExtractedBlock(
+                        block_type="slide",
+                        text=slide_text,
+                        page_num=slide_idx + 1,
+                        source="python_pptx",
+                    ))
+        except Exception as e:
+            warnings.append(f"Failed to extract PPTX text: {e}")
+
+        # 提取嵌入图片 → 三阶段过滤漏斗
+        assets, img_blocks = self._process_embedded_images(
+            extract_images_from_pptx(local_path, task.get("_tmp_dir", "")),
+            task,
+        )
+        if img_blocks:
+            blocks.extend(img_blocks)
+
+        flat_text = blocks_to_text(blocks)
+        title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
+
+        return ExtractionResult(
+            doc_id=task["doc_id"],
+            version_no=task["version_no"],
+            source_key=task.get("raw_key", ""),
+            file_ext="pptx",
+            extract_method="python_pptx",
+            title=title,
+            text=flat_text,
+            text_length=len(flat_text),
+            blocks=blocks,
+            page_count=len(blocks),
             warnings=warnings,
             assets=assets,
         )
@@ -516,6 +858,8 @@ class UnifiedExtractor:
                         vlm_cache[file_hash] = {
                             "status": funnel_res.get("status", ""),
                             "visual_summary": funnel_res.get("visual_summary", ""),
+                            "image_category": funnel_res.get("image_category", ""),
+                            "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
                             "reason": funnel_res.get("reason", ""),
                             "width": funnel_res.get("width", 0),
                             "height": funnel_res.get("height", 0),
@@ -538,8 +882,13 @@ class UnifiedExtractor:
             for img_asset in img_assets_group:
                 all_results.append((img_asset, funnel_res))
 
-        # 按 page_num 排序，保持文档内图片的原始顺序
-        all_results.sort(key=lambda x: (x[0].page_num, x[0].original_name))
+        # 按 page_num → image_index 排序，保持文档内图片的原始顺序
+        # DOCX 的 page_num 全部是 None，需要用 image_index 作为 fallback
+        all_results.sort(key=lambda x: (
+            x[0].page_num if x[0].page_num is not None else 999999,
+            x[0].image_index if x[0].image_index is not None else 999999,
+            x[0].original_name or "",
+        ))
 
         for img_asset, funnel_res in all_results:
             status = funnel_res["status"]
@@ -552,6 +901,8 @@ class UnifiedExtractor:
                 "filename": os.path.basename(img_asset.local_path),
                 "local_path": img_asset.local_path,
                 "page_num": img_asset.page_num,
+                "image_index": img_asset.image_index,
+                "original_index": img_asset.image_index,
                 "status": status,
                 "width": funnel_res.get("width", 0),
                 "height": funnel_res.get("height", 0),
@@ -563,6 +914,14 @@ class UnifiedExtractor:
                 "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
                 "reason": funnel_res.get("reason", ""),
             }
+            # 透传 XLSX anchor_row（用于行级图片绑定）
+            if hasattr(img_asset, "anchor_row") and img_asset.anchor_row is not None:
+                asset_dict["anchor_row"] = img_asset.anchor_row
+            # 透传 XLSX annotation_num（Drawing XML 分组标注编号，如 ①②③）
+            if hasattr(img_asset, "annotation_num") and img_asset.annotation_num is not None:
+                asset_dict["annotation_num"] = img_asset.annotation_num
+            if hasattr(img_asset, "annotation_label") and img_asset.annotation_label:
+                asset_dict["annotation_label"] = img_asset.annotation_label
             assets.append(asset_dict)
 
             # ROUTE_TO_TEXT：追加 OCR 文本块（与 _extract_image 行为一致）

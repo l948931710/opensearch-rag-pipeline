@@ -209,6 +209,8 @@ class DocumentChunker:
         parent_child: bool = False,
         child_max_chars: int = 150,
         child_overlap_chars: int = 40,
+        row_card: bool = False,
+        xlsx_layout_type: str = "normal_spreadsheet",
     ):
         self.max_chunk_chars = max_chunk_chars
         self.min_chunk_chars = min_chunk_chars
@@ -223,6 +225,10 @@ class DocumentChunker:
         self.parent_child = parent_child
         self.child_max_chars = child_max_chars
         self.child_overlap_chars = child_overlap_chars
+        self.row_card_mode = row_card
+        self.xlsx_layout_type = xlsx_layout_type
+        if row_card:
+            self.min_chunk_chars = min(self.min_chunk_chars, 20)
 
     def _create_chunk(
         self,
@@ -713,7 +719,7 @@ class DocumentChunker:
                 if annotation_map:
                     step_chunk.extra["annotation_map"] = annotation_map
                 if all_ocr_raw:
-                    step_chunk.extra["image_ocr_raw"] = combined_ocr[:2000]
+                    step_chunk.extra["image_ocr_raw"] = combined_all[:2000]
                 if audit_flags:
                     step_chunk.extra["relation_audit"] = audit_flags
                 # 记录步骤中引用的圈数字标注（①②③...）
@@ -1021,6 +1027,7 @@ class DocumentChunker:
         # 1. Collect all paragraph text and handle tables/headings
         all_para_texts: List[str] = []
         table_chunks: List[Chunk] = []
+        pending_image_refs: List[dict] = []  # 暂存 image_ref 块
 
         for block in blocks:
             if isinstance(block, dict):
@@ -1029,12 +1036,20 @@ class DocumentChunker:
                 page_num = block.get("page_num")
                 section_path = block.get("section_path")
                 source = block.get("source", "native")
+                extra = block.get("extra", {})
             else:
                 block_type = block.block_type
                 text = block.text.strip()
                 page_num = block.page_num
                 section_path = block.section_path
                 source = block.source
+                extra = block.extra if hasattr(block, "extra") else {}
+
+            # image_ref 块 → 暂存图片元数据
+            if block_type == "image_ref":
+                if extra:
+                    pending_image_refs.append(dict(extra))
+                continue
 
             if not text:
                 continue
@@ -1161,7 +1176,20 @@ class DocumentChunker:
                 ))
                 chunk_index += 1
 
-        return table_chunks + chunks
+        # 将暂存的 image_refs 附加到最后一个 chunk
+        all_result = table_chunks + chunks
+        if pending_image_refs and all_result:
+            last = all_result[-1]
+            existing = last.extra.get("image_refs", [])
+            last.extra["image_refs"] = existing + pending_image_refs
+            captions = [r.get("visual_summary", "") for r in pending_image_refs if r.get("visual_summary")]
+            if captions:
+                suffix = "\n[图片内容] " + "；".join(c[:120] for c in captions)
+                last.chunk_text += suffix
+                last.embedding_text = last.chunk_text
+                last.token_count = _estimate_tokens(last.chunk_text)
+
+        return all_result
 
     def chunk_from_blocks(
         self,
@@ -1190,6 +1218,10 @@ class DocumentChunker:
             return self._chunk_by_clause(blocks, doc_id, version_no, metadata)
         if self.split_mode == "step":
             return self._chunk_by_step(blocks, doc_id, version_no, metadata)
+        if self.xlsx_layout_type == "procedure_image_guide":
+            return self._chunk_procedure_steps(blocks, doc_id, version_no, metadata)
+        if self.xlsx_layout_type == "product_spec_instruction":
+            return self._chunk_product_spec(blocks, doc_id, version_no, metadata)
 
         meta = metadata or {}
         chunks: List[Chunk] = []
@@ -1200,13 +1232,74 @@ class DocumentChunker:
         buffered_texts = []
         buffered_page_num = None
         buffered_source = "native"
+        pending_image_refs = []  # 暂存 image_ref 块，等待附加到最近的 chunk
+
+        def _attach_pending_images(target_chunk):
+            """将 pending_image_refs 附加到目标 chunk。"""
+            nonlocal pending_image_refs
+            if not pending_image_refs or target_chunk is None:
+                return
+            target_chunk.extra["image_refs"] = list(pending_image_refs)
+            suffix_parts = []
+            for pr in pending_image_refs:
+                vs = pr.get("visual_summary", "")
+                if vs:
+                    suffix_parts.append(f"[图片内容] {vs}")
+                ocr_raw = pr.get("ocr_text", "")
+                if ocr_raw:
+                    try:
+                        from opensearch_pipeline.extraction.annotation_parser import clean_ocr_keywords
+                        cleaned = clean_ocr_keywords(ocr_raw)
+                    except ImportError:
+                        cleaned = ocr_raw.strip()
+                    if cleaned:
+                        suffix_parts.append(f"[图片OCR] {cleaned}")
+            if suffix_parts:
+                suffix = "\n" + "\n".join(suffix_parts)
+                target_chunk.chunk_text += suffix
+                target_chunk.embedding_text = target_chunk.chunk_text
+                target_chunk.token_count = _estimate_tokens(target_chunk.chunk_text)
+            pending_image_refs = []
 
         def commit_buffer():
-            nonlocal chunk_index, buffered_texts
+            nonlocal chunk_index, buffered_texts, pending_image_refs
             if not buffered_texts:
                 return
+
+            # ── Row Card 模式：每行独立成 chunk，不合并 ──
+            if self.row_card_mode:
+                last_chunk = None
+                for para in buffered_texts:
+                    para_stripped = para.strip()
+                    if not para_stripped:
+                        continue
+                    chunk_type = "ocr_chunk" if buffered_source == "ocr" else "text_chunk"
+                    chunk = self._create_chunk(
+                        doc_id=doc_id,
+                        version_no=version_no,
+                        chunk_index=chunk_index,
+                        chunk_type=chunk_type,
+                        chunk_text=para_stripped,
+                        page_num=buffered_page_num,
+                        section_title=current_section,
+                        metadata=meta,
+                        source=buffered_source,
+                    )
+                    chunks.append(chunk)
+                    last_chunk = chunk
+                    chunk_index += 1
+                # v2 fix 3: 如果本批次没有创建任何 chunk（全空行），
+                # 把 pending images 挂到之前最后一个 chunk
+                if last_chunk is None and chunks:
+                    last_chunk = chunks[-1]
+                _attach_pending_images(last_chunk)
+                buffered_texts.clear()
+                return
+
+            # ── 原逻辑：合并短段落 ──
             merged_paras = self._merge_short_paragraphs(buffered_texts)
             merged_paras = self._merge_adjacent_short_chunks(merged_paras, min_chars=150)
+            last_chunk = None
             for para in merged_paras:
                 para_stripped = para.strip()
                 if len(para_stripped) < self.min_chunk_chars:
@@ -1228,7 +1321,9 @@ class DocumentChunker:
                         source=buffered_source,
                     )
                     chunks.append(chunk)
+                    last_chunk = chunk
                     chunk_index += 1
+            _attach_pending_images(last_chunk)
             buffered_texts.clear()
 
         for block in blocks:
@@ -1239,12 +1334,14 @@ class DocumentChunker:
                 page_num = block.get("page_num")
                 section_path = block.get("section_path")
                 source = block.get("source", "native")
+                extra = block.get("extra", {})
             else:
                 block_type = block.block_type
                 text = block.text
                 page_num = block.page_num
                 section_path = block.section_path
                 source = block.source
+                extra = block.extra if hasattr(block, "extra") else {}
 
             # 更新 section 跟踪
             if block_type == "heading":
@@ -1252,7 +1349,79 @@ class DocumentChunker:
                 current_section = section_path or text
                 continue  # heading 自身不生成 chunk，作为后续 chunk 的 section_title
 
+            # image_ref 块 → flush buffer 后绑定到最近的 chunk
+            # 当单个 chunk 图片过多时，溢出到新 chunk
+            MAX_IMAGES_PER_CHUNK = 3
+
+            if block_type == "image_ref":
+                if extra:
+                    img_entry = dict(extra)
+                    # 先 flush 当前 buffer（图片前的文本生成 chunk）
+                    if buffered_texts:
+                        commit_buffer()
+
+                    # 附加到最近的 chunk，但限制每 chunk 最多 MAX_IMAGES_PER_CHUNK 张
+                    target_chunk = chunks[-1] if chunks else None
+                    if target_chunk:
+                        # Row Card 模式：放宽图片上限，不生成空 spillover chunk
+                        img_limit = 8 if self.row_card_mode else MAX_IMAGES_PER_CHUNK
+                        existing = target_chunk.extra.get("image_refs", [])
+                        if len(existing) >= img_limit:
+                            # 溢出：创建新的 image-only chunk
+                            spillover = self._create_chunk(
+                                doc_id=doc_id,
+                                version_no=version_no,
+                                chunk_index=chunk_index,
+                                chunk_type="text_chunk",
+                                chunk_text="",
+                                page_num=target_chunk.page_num,
+                                section_title=current_section,
+                                metadata=meta,
+                                source=buffered_source,
+                            )
+                            chunks.append(spillover)
+                            chunk_index += 1
+                            target_chunk = spillover
+
+                        existing = target_chunk.extra.get("image_refs", [])
+                        existing.append(img_entry)
+                        target_chunk.extra["image_refs"] = existing
+
+                        suffix_parts = []
+                        vs = img_entry.get("visual_summary", "")
+                        if vs:
+                            suffix_parts.append(f"[图片内容] {vs}")
+                        ocr_raw = img_entry.get("ocr_text", "")
+                        if ocr_raw:
+                            try:
+                                from opensearch_pipeline.extraction.annotation_parser import clean_ocr_keywords
+                                cleaned = clean_ocr_keywords(ocr_raw)
+                            except ImportError:
+                                cleaned = ocr_raw.strip()
+                            if cleaned:
+                                suffix_parts.append(f"[图片OCR] {cleaned}")
+
+                        if suffix_parts:
+                            suffix = "\n" + "\n".join(suffix_parts)
+                            target_chunk.chunk_text += suffix
+                            target_chunk.embedding_text = target_chunk.chunk_text
+                            target_chunk.token_count = _estimate_tokens(target_chunk.chunk_text)
+                    else:
+                        pending_image_refs.append(img_entry)
+                continue
+
             if not text:
+                continue
+
+            # Row Card 模式：跳过表头行和设备信息行
+            if self.row_card_mode and extra.get("row_role") == "metadata":
+                continue
+
+            # v2 fix 4: Row Card 模式下，OCR 文本块（图片 OCR dump）不作为 row card
+            # 把 pending images 挂到最近的 chunk
+            if self.row_card_mode and source == "ocr":
+                if pending_image_refs and chunks:
+                    _attach_pending_images(chunks[-1])
                 continue
 
             # 表格 block → 整块作为 table_chunk
@@ -1269,6 +1438,29 @@ class DocumentChunker:
                     metadata=meta,
                     source=source,
                 )
+                # 将暂存的 image_refs 附加到 table_chunk（XLSX sheet 图片绑定）
+                if pending_image_refs:
+                    chunk.extra["image_refs"] = list(pending_image_refs)
+                    suffix_parts = []
+                    for pr in pending_image_refs:
+                        vs = pr.get("visual_summary", "")
+                        if vs:
+                            suffix_parts.append(f"[图片内容] {vs}")
+                        ocr_raw = pr.get("ocr_text", "")
+                        if ocr_raw:
+                            try:
+                                from opensearch_pipeline.extraction.annotation_parser import clean_ocr_keywords
+                                cleaned = clean_ocr_keywords(ocr_raw)
+                            except ImportError:
+                                cleaned = ocr_raw.strip()
+                            if cleaned:
+                                suffix_parts.append(f"[图片OCR] {cleaned}")
+                    if suffix_parts:
+                        suffix = "\n" + "\n".join(suffix_parts)
+                        chunk.chunk_text += suffix
+                        chunk.embedding_text = chunk.chunk_text
+                        chunk.token_count = _estimate_tokens(chunk.chunk_text)
+                    pending_image_refs = []
                 chunks.append(chunk)
                 chunk_index += 1
                 continue
@@ -1288,6 +1480,32 @@ class DocumentChunker:
             buffered_texts.append(text.strip())
 
         commit_buffer()
+
+        # 如果还有未附加的 image_refs（出现在所有文本之后），附加到最后一个 chunk
+        if pending_image_refs and chunks:
+            last = chunks[-1]
+            existing = last.extra.get("image_refs", [])
+            last.extra["image_refs"] = existing + pending_image_refs
+            suffix_parts = []
+            for pr in pending_image_refs:
+                vs = pr.get("visual_summary", "")
+                if vs:
+                    suffix_parts.append(f"[图片内容] {vs}")
+                ocr_raw = pr.get("ocr_text", "")
+                if ocr_raw:
+                    try:
+                        from opensearch_pipeline.extraction.annotation_parser import clean_ocr_keywords
+                        cleaned = clean_ocr_keywords(ocr_raw)
+                    except ImportError:
+                        cleaned = ocr_raw.strip()
+                    if cleaned:
+                        suffix_parts.append(f"[图片OCR] {cleaned}")
+            if suffix_parts:
+                suffix = "\n" + "\n".join(suffix_parts)
+                last.chunk_text += suffix
+                last.embedding_text = last.chunk_text
+                last.token_count = _estimate_tokens(last.chunk_text)
+
         if self.parent_child:
             all_chunks = []
             for parent in chunks:
@@ -1650,4 +1868,199 @@ class DocumentChunker:
             children.append(child)
 
         return children
+
+    def _chunk_procedure_steps(
+        self,
+        blocks: list,
+        doc_id: str,
+        version_no: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """按步骤切块（procedure_image_guide 模式）。
+
+        - 每个 step_no 行独立成一个 step_card chunk
+        - 非步骤行（标题、元数据、工具列表等）合并为 header chunk
+        - 步骤文本中的图号引用（figure_refs）映射到对应 image asset
+        """
+        meta = metadata or {}
+        chunks: List[Chunk] = []
+        chunk_index = 0
+
+        header_lines = []      # 非步骤行文本缓冲
+        step_blocks = []       # 步骤行列表
+
+        # 分离步骤行和非步骤行
+        for blk in blocks:
+            if blk.block_type == "heading":
+                # sheet 标题不入库
+                continue
+            extra = blk.extra or {}
+            if extra.get("step_no") is not None:
+                step_blocks.append(blk)
+            else:
+                text = blk.text.strip()
+                if text:
+                    header_lines.append(text)
+
+        # 1. Header chunk（目的范围 + 工具 + 表头等）
+        if header_lines:
+            header_text = "\n".join(header_lines)
+            chunk = self._create_chunk(
+                doc_id=doc_id,
+                version_no=version_no,
+                chunk_index=chunk_index,
+                chunk_text=header_text,
+                chunk_type="procedure_header",
+                metadata=meta,
+            )
+            chunk.extra["is_procedure_header"] = True
+            chunks.append(chunk)
+            chunk_index += 1
+
+        # 2. 每个步骤一个 step_card chunk
+        for blk in step_blocks:
+            extra = blk.extra or {}
+            step_no = extra.get("step_no", 0)
+            fig_refs = extra.get("figure_refs", [])
+
+            # 构建步骤文本
+            step_text = blk.text.strip()
+
+            chunk = self._create_chunk(
+                doc_id=doc_id,
+                version_no=version_no,
+                chunk_index=chunk_index,
+                chunk_text=step_text,
+                chunk_type="step_card",
+                metadata=meta,
+                page_num=blk.page_num,
+            )
+            chunk.extra["step_no"] = step_no
+            if fig_refs:
+                chunk.extra["figure_refs"] = fig_refs
+            chunks.append(chunk)
+            chunk_index += 1
+
+        return chunks
+
+    # ── Section 关键词 → section_type 映射（产品规格书）──
+    _SPEC_SECTION_PATTERNS = [
+        # (关键词列表, section_type, chunk_type)
+        # 顺序重要：product_photo 必须在 appendix 之前检查
+        (["物料基本信息", "物料名称", "品牌名称"], "product_info", "product_info_card"),
+        (["原材料信息", "原辅材料"], "raw_material", "raw_material_card"),
+        (["生产工艺流程", "工艺流程图", "关键工序", "关键控制点"], "process_ccp", "process_ccp_card"),
+        (["技术标准要求", "技术标准"], "tech_standard_header", "spec_header_card"),
+        (["包装规格", "外包装类型"], "packaging", "packaging_card"),
+        (["物料图片", "产品正反面图片", "产品装箱", "单条产品图片", "单个实物图片",
+          "标签信息照片", "外箱图片", "包装方式体现"], "product_photo", "product_photo_card"),
+        (["附件信息", "文件修订", "会签确认"], "appendix", "appendix_card"),
+    ]
+
+    # 技术标准子分区（在 tech_standard 内部细分）
+    _SPEC_SUB_SECTIONS = [
+        (["感官要求"], "spec_sensory", "spec_sensory_card"),
+        (["物理指标", "尺寸指标"], "spec_dimension", "spec_dimension_card"),
+        (["微生物指标"], "spec_safety", "spec_micro_card"),
+        (["理化指标"], "spec_safety", "spec_chem_card"),
+        (["其他指标", "内控要求", "使用性能"], "spec_performance", "spec_performance_card"),
+    ]
+
+    def _detect_spec_section(self, text: str):
+        """检测行文本属于哪个 section。返回 (section_type, chunk_type) 或 None。"""
+        for keywords, sec_type, chunk_type in self._SPEC_SECTION_PATTERNS:
+            for kw in keywords:
+                if kw in text:
+                    return sec_type, chunk_type
+        # 技术标准子分区
+        for keywords, sec_type, chunk_type in self._SPEC_SUB_SECTIONS:
+            for kw in keywords:
+                if kw in text:
+                    return sec_type, chunk_type
+        return None
+
+    def _chunk_product_spec(
+        self,
+        blocks: list,
+        doc_id: str,
+        version_no: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """按 section 切块（product_spec_instruction 模式）。
+
+        产品规格书结构固定：物料信息 → 原材料 → 工艺 → 技术标准(感官/尺寸/微生物/理化/性能) → 附件
+        每个 section 合并为一个 typed card chunk。
+        """
+        import re
+        meta = metadata or {}
+        chunks: List[Chunk] = []
+        chunk_index = 0
+
+        # 收集所有 paragraph blocks（跳过 heading）
+        para_blocks = [b for b in blocks if b.block_type == "paragraph"]
+
+        # 按 section 分组，同时记录行号范围
+        sections = []  # [(section_type, chunk_type, [block_texts], min_row, max_row)]
+        current_sec = ("header", "spec_header_card")
+        current_texts = []
+        current_min_row = 9999
+        current_max_row = 0
+
+        for blk in para_blocks:
+            text = blk.text.strip()
+            if not text:
+                continue
+            row_num = blk.extra.get("row_num", 0) if blk.extra else 0
+
+            detected = self._detect_spec_section(text)
+            if detected:
+                # 保存前一个 section
+                if current_texts:
+                    sections.append((current_sec[0], current_sec[1], current_texts, current_min_row, current_max_row))
+                current_sec = detected
+                current_texts = [text]
+                current_min_row = row_num
+                current_max_row = row_num
+            else:
+                current_texts.append(text)
+                if row_num < current_min_row:
+                    current_min_row = row_num
+                if row_num > current_max_row:
+                    current_max_row = row_num
+
+        # 保存最后一个 section
+        if current_texts:
+            sections.append((current_sec[0], current_sec[1], current_texts, current_min_row, current_max_row))
+
+        # 合并相同 section_type 的连续 sections
+        merged = []
+        for sec_type, chunk_type, texts, rmin, rmax in sections:
+            if merged and merged[-1][0] == sec_type:
+                prev = merged[-1]
+                merged[-1] = (sec_type, chunk_type, prev[2] + texts, min(prev[3], rmin), max(prev[4], rmax))
+            else:
+                merged.append((sec_type, chunk_type, texts, rmin, rmax))
+
+        # 生成 chunks
+        for sec_type, chunk_type, texts, rmin, rmax in merged:
+            combined = "\n".join(texts)
+            # 跳过太短的（纯标题行等）
+            if len(combined.strip()) < 10:
+                continue
+
+            chunk = self._create_chunk(
+                doc_id=doc_id,
+                version_no=version_no,
+                chunk_index=chunk_index,
+                chunk_text=combined,
+                chunk_type=chunk_type,
+                metadata=meta,
+            )
+            chunk.extra["spec_section"] = sec_type
+            chunk.extra["spec_row_start"] = rmin
+            chunk.extra["spec_row_end"] = rmax
+            chunks.append(chunk)
+            chunk_index += 1
+
+        return chunks
 
