@@ -156,6 +156,21 @@ class OCRConfig:
 
 
 @dataclass
+class RebuildConfig:
+    """VLM/OCR 版面重建（layout-rebuild）成本熔断配置：单文档 + 单次运行预算。
+
+    单价默认值为保守估计（work_report.md: 4000 页扫描 PDF ≈ 数百元 → ~0.06 RMB/页量级），
+    需用真实 DashScope 账单标定；均可经 RAG_REBUILD_* 环境变量覆盖。
+    """
+    enabled: bool = False          # 总开关；默认关（VLM rebuilder 尚未启用）→ 熔断器 no-op
+    max_pages: int = 50            # 单文档计费单元硬上限（页+图），超出即封存
+    doc_budget_rmb: float = 5.0    # 单文档预算 RMB，预估超出 → 封存 + 回退规则输出
+    run_budget_rmb: float = 200.0  # 单次运行累计预算 RMB，超出 → 熔断，后续仅规则输出
+    ocr_page_rmb: float = 0.06     # 单页 OCR-fallback 单价
+    vlm_image_rmb: float = 0.04    # 单张嵌入式图片 VLM 单价
+
+
+@dataclass
 class LLMConfig:
     """分类/风险评估 LLM 配置。"""
     api_key: str = ""
@@ -227,6 +242,7 @@ class PipelineConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     chunker: ChunkerConfig = field(default_factory=ChunkerConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
+    rebuild: RebuildConfig = field(default_factory=RebuildConfig)
 
     # 处理限制
     max_concurrent_tasks: int = 5
@@ -380,6 +396,15 @@ def load_config() -> PipelineConfig:
             vlm_model=vlm_model,
             max_ocr_pages=_env_int("OCR_MAX_PAGES", 5),
             ocr_threshold_chars=_env_int("OCR_THRESHOLD_CHARS", 100),
+        ),
+
+        rebuild=RebuildConfig(
+            enabled=_env_bool("REBUILD_ENABLED", False),                  # RAG_REBUILD_ENABLED
+            max_pages=_env_int("REBUILD_MAX_PAGES", 50),                  # RAG_REBUILD_MAX_PAGES
+            doc_budget_rmb=_env_float("REBUILD_DOC_BUDGET_RMB", 5.0),     # RAG_REBUILD_DOC_BUDGET_RMB
+            run_budget_rmb=_env_float("REBUILD_RUN_BUDGET_RMB", 200.0),   # RAG_REBUILD_RUN_BUDGET_RMB
+            ocr_page_rmb=_env_float("REBUILD_COST_PER_PAGE_RMB", 0.06),   # RAG_REBUILD_COST_PER_PAGE_RMB
+            vlm_image_rmb=_env_float("REBUILD_COST_PER_IMAGE_RMB", 0.04), # RAG_REBUILD_COST_PER_IMAGE_RMB
         ),
 
         llm=LLMConfig(
