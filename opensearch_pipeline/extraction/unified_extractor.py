@@ -179,6 +179,15 @@ class UnifiedExtractor:
         except Exception as _e:
             print(f"    ⚠️ [vlm_rebuilder] skipped (non-fatal): {_e}", flush=True)
 
+        # ── Increment 2: VLM 表格精修（结构错乱的 PDF 表格；数字保真闸把关）──
+        # 默认关闭（cfg.rebuild.refine_tables=False）→ 完全 no-op（零回归）。
+        try:
+            from opensearch_pipeline.extraction.vlm_rebuilder import maybe_refine_tables
+            result = maybe_refine_tables(task, result, self.config,
+                                         breaker=getattr(self, "cost_breaker", None))
+        except Exception as _e:
+            print(f"    ⚠️ [table_refine] skipped (non-fatal): {_e}", flush=True)
+
         return result
 
     # ── DOCX ──

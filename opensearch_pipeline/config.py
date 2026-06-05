@@ -168,6 +168,7 @@ class RebuildConfig:
     run_budget_rmb: float = 200.0  # 单次运行累计预算 RMB，超出 → 熔断，后续仅规则输出
     ocr_page_rmb: float = 0.06     # 单页 OCR-fallback 单价
     vlm_image_rmb: float = 0.04    # 单张嵌入式图片 VLM 单价
+    refine_tables: bool = False    # Increment 2: 对结构错乱的 PDF 表格做 VLM 精修（数字保真闸把关；需 enabled=True 才生效，以确保成本熔断器在线）
 
 
 @dataclass
@@ -405,6 +406,7 @@ def load_config() -> PipelineConfig:
             run_budget_rmb=_env_float("REBUILD_RUN_BUDGET_RMB", 200.0),   # RAG_REBUILD_RUN_BUDGET_RMB
             ocr_page_rmb=_env_float("REBUILD_COST_PER_PAGE_RMB", 0.06),   # RAG_REBUILD_COST_PER_PAGE_RMB
             vlm_image_rmb=_env_float("REBUILD_COST_PER_IMAGE_RMB", 0.04), # RAG_REBUILD_COST_PER_IMAGE_RMB
+            refine_tables=_env_bool("REBUILD_REFINE_TABLES", False),      # RAG_REBUILD_REFINE_TABLES
         ),
 
         llm=LLMConfig(

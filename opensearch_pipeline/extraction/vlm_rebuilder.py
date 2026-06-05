@@ -246,3 +246,157 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
     print(f"    [vlm_rebuilder] rebuilt {n_pages_rebuilt} page(s), "
           f"+{added} blocks, +{len(recovered)} chars", flush=True)
     return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Increment 2 — PDF 表格精修（结构错乱表格 → VLM 重建，数字保真闸把关）
+# ════════════════════════════════════════════════════════════════════════════
+
+def _number_multiset(text: str):
+    """文本中的数字 token → Counter（多重集；表格会重复数字，不能用 set）。
+
+    token = 连续数字串（含小数点/千分位逗号），归一化去掉千分位逗号后计数。
+    用于数字保真比对：原生表格的每个数字都必须在 VLM 表格里出现（计数 >=）。
+    """
+    import re
+    from collections import Counter
+    toks = re.findall(r"\d+(?:[.,]\d+)*", text or "")
+    return Counter(t.replace(",", "") for t in toks)
+
+
+def _table_tokens(text: str) -> set:
+    """表格的"内容指纹"：CJK 二元组 + 字母数字串 + 数字。用于判断两张表是否是同一张。"""
+    import re
+    s = text or ""
+    cjk = re.findall(r"[一-鿿]", s)
+    bigrams = {cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1)}
+    alnum = set(re.findall(r"[A-Za-z0-9]{2,}", s))
+    return bigrams | alnum
+
+
+def _content_corresponds(nat_tokens: set, vlm_tokens: set, min_overlap: float = 0.5) -> bool:
+    """内容对应闸：VLM 表必须覆盖原生表至少 min_overlap 的内容 token，
+    确保精修的是"同一张表"，而不是同页里的另一张表（如把数据表错换成文档抬头表）。
+    原生表无可判定 token → 返回 False（不精修，安全）。"""
+    if not nat_tokens:
+        return False
+    return len(nat_tokens & vlm_tokens) / len(nat_tokens) >= min_overlap
+
+
+def _native_numbers_preserved(native_text: str, vlm_text: str) -> bool:
+    """数字保真闸：VLM 表格必须包含原生表格的每一个数字（多重集 ⊆）。
+
+    返回 False（VLM 漏了/改了某个原生数字）→ 调用方应拒绝精修、保留原生表格。
+    注意：VLM 多出的数字（从借线误判/合并单元格里救回的）是允许的（正是收益）；
+    但 prompt 已强约束"严禁臆造数字"、temperature=0，且保留 fallback_text 供抽查。
+    """
+    nat = _number_multiset(native_text)
+    vlm = _number_multiset(vlm_text)
+    return all(vlm.get(tok, 0) >= cnt for tok, cnt in nat.items())
+
+
+def _table_is_mangled(text: str) -> bool:
+    """从渲染后的 pipe-markdown 判断一个 table 块是否结构错乱（值得送 VLM 精修）。
+
+    信号：退化单列（列被 lines 策略合并）、列数参差（ragged）、空单元格占比高（合并表头/借线误判）。
+    结构良好的表格返回 False → 不精修（省成本、避免动好表）。
+    """
+    rows = [r.strip() for r in (text or "").splitlines() if r.strip()]
+    if len(rows) < 2:
+        return True
+    cell_counts, empties, total = [], 0, 0
+    for r in rows:
+        cells = [c.strip() for c in r.strip("|").split("|")]
+        cell_counts.append(len(cells))
+        total += len(cells)
+        empties += sum(1 for c in cells if not c)
+    if max(cell_counts) <= 1:           # 退化单列
+        return True
+    if (max(cell_counts) - min(cell_counts)) >= 2:   # 列数参差
+        return True
+    if total and empties / total >= 0.4:             # 空单元格过多
+        return True
+    return False
+
+
+def maybe_refine_tables(task: dict, result, cfg, breaker=None):
+    """Increment 2: 对 PDF 中结构错乱(ragged/merged)的 table 块做 VLM 精修（原位覆盖 .text）。
+
+    安全契约（强制）：
+      - 受 cfg.rebuild.enabled + cfg.rebuild.refine_tables 双开关控制；任一关闭 → 完全 no-op（零回归）。
+        （要求 enabled=True：成本熔断器以 enabled 为总闸，关闭时熔断器放行一切，故必须 enabled 才上线。）
+      - **数字保真闸**：VLM 表格必须含原生表格的每个数字（多重集 ⊆），否则拒绝、保留原生表格。
+      - 只重写 table 块 .text；保留 source='native'，merge extra（fallback_text/refined_by），
+        不新增/移动 image_ref、不触碰其它块。失败 fail-open（上层 try/except）。
+    """
+    rc = getattr(cfg, "rebuild", None)
+    if not rc or not getattr(rc, "enabled", False) or not getattr(rc, "refine_tables", False):
+        return result
+    if (result.file_ext or "").lower() != "pdf":
+        return result
+    local_path = task.get("local_path", "")
+    if not local_path:
+        return result
+
+    targets = [b for b in result.blocks
+               if getattr(b, "block_type", "") == "table" and _table_is_mangled(getattr(b, "text", ""))]
+    if not targets:
+        return result
+    pages = sorted({getattr(b, "page_num", None) for b in targets if getattr(b, "page_num", None)})
+    if not pages:
+        return result
+
+    # ── 成本闸（按需精修的页数计费；breaker 缺省现造，enabled=True 时才真正限额）──
+    from opensearch_pipeline.extraction.cost_breaker import CostBreaker, gate_vlm_rebuild
+    if breaker is None:
+        breaker = CostBreaker(cfg)
+    gate_doc = {
+        "doc_id": task.get("doc_id", "?"), "version_no": task.get("version_no", 1),
+        "file_ext": "pdf", "owner_dept": task.get("owner_dept", "unknown"),
+        "unit_count": 0, "cached_count": 0, "ocr_page_count": len(pages),
+    }
+    allowed, est = gate_vlm_rebuild(breaker, gate_doc, simulate_db=bool(getattr(cfg, "simulate_db", True)))
+    if not allowed:
+        print(f"    [table_refine] cost gate DENIED ({len(pages)} page(s), "
+              f"est {est.est_cost_rmb} RMB); keeping native tables", flush=True)
+        return result
+
+    doc_title = task.get("doc_title", "") or task.get("filename", "")
+    page_tables = {}  # page_num → [vlm table markdown, ...]（每页渲染+重建一次）
+    refined = rejected = 0
+    for b in targets:
+        pg = getattr(b, "page_num", None)
+        if pg is None:
+            continue
+        if pg not in page_tables:
+            img, mime = _render_page_image(local_path, pg - 1)
+            recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime) if img else []
+            page_tables[pg] = [(rb.get("text") or "").strip() for rb in recon
+                               if rb.get("type") == "table" and (rb.get("text") or "").strip()]
+        cands = page_tables[pg]
+        if not cands:
+            continue
+        native = getattr(b, "text", "")
+        nat_tokens = _table_tokens(native)
+        # 同页多表时，选与原生表"内容"(文本 token+数字)重叠最多的 VLM 表，避免错配到同页别的表
+        best = max(cands, key=lambda t: len(nat_tokens & _table_tokens(t)))
+        # 双闸：① 数字保真（VLM 不漏原生数字）② 内容对应（确是同一张表，非同页别的表）
+        if not _native_numbers_preserved(native, best) \
+                or not _content_corresponds(nat_tokens, _table_tokens(best)):
+            rejected += 1
+            continue
+        merged_extra = dict(getattr(b, "extra", {}) or {})
+        merged_extra["fallback_text"] = native
+        merged_extra["refined_by"] = "vlm"
+        b.extra = merged_extra
+        b.text = best
+        refined += 1
+
+    if refined:
+        from opensearch_pipeline.extraction.text_extractor import blocks_to_text
+        result.text = blocks_to_text(result.blocks)
+        result.text_length = len(result.text)
+        result.extract_method = (result.extract_method or "") + "+vlm_table_refine"
+        print(f"    [table_refine] refined {refined} table(s), rejected {rejected} "
+              f"(number-fidelity), across {len(pages)} page(s)", flush=True)
+    return result
