@@ -31,8 +31,13 @@ _TYPE_A_CONTENT_KW = [
 _TYPE_B_FILENAME_KW = [
     "作业指导书", "SOP", "工艺指导书",
 ]
+# 较弱的 SOP 类文件名信号（操作规程/规范/指引等），+3
+_TYPE_B_FILENAME_KW_WEAK = [
+    "操作规程", "操作规范", "作业规程", "操作指引", "操作指导",
+]
 _TYPE_B_SCOPE_KW = ["目的和范围", "作业程序"]
-_TYPE_B_HEADER_KW = ["步骤", "作业说明"]
+# 步骤表头：「步骤/操作描述/操作示图」是图文作业指导书的标志性列头
+_TYPE_B_HEADER_KW = ["步骤", "作业说明", "操作描述", "操作示图", "操作说明", "操作步骤"]
 _RE_FIGURE_REF = re.compile(r"(?:如图|见.*?图)\s*\d+")
 _RE_FIGURE_LABEL = re.compile(r"图\s*\d+")
 
@@ -113,6 +118,11 @@ def classify_xlsx_layout(
     elif "SOP" in filename.upper():
         scores["procedure_image_guide"] += 3
         signals["procedure_image_guide"].append("文件名含 SOP")
+    elif _contains_any(filename, _TYPE_B_FILENAME_KW_WEAK):
+        scores["procedure_image_guide"] += 3
+        signals["procedure_image_guide"].append(
+            f"文件名含操作规程/指引: {[kw for kw in _TYPE_B_FILENAME_KW_WEAK if kw in filename]}"
+        )
 
     if _contains_any(combined, _TYPE_B_SCOPE_KW):
         scores["procedure_image_guide"] += 3

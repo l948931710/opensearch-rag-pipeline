@@ -2141,6 +2141,11 @@ def node_chunk_documents(ctx: dict):
             file_ext = str(doc.get("file_ext", "")).lower()
             xlsx_layout_type = "normal_spreadsheet"
 
+            # ─── PPTX：幻灯片感知切块（每页 slide → 一个 chunk）───
+            if file_ext == "pptx":
+                m_mode = "slide"
+                m_overlap = 0
+
             if file_ext in ("xlsx", "xls"):
                 # 从 blocks 中提取 sheet_names（heading blocks with sheet_idx=0,1,...）
                 _blocks = doc.get("blocks", [])
@@ -2323,27 +2328,93 @@ def node_chunk_documents(ctx: dict):
                             c.extra["image_refs"] = imgs
 
                 elif xlsx_layout_type == "procedure_image_guide":
-                    # 按 figure_refs 绑定到 step_card
-                    fig_asset_map = {}
-                    for asset in assets:
-                        fig_no = asset.get("figure_no")
-                        if fig_no and asset.get("status") == "ROUTE_TO_VECTOR":
-                            fn = asset.get("filename", "")
-                            fig_asset_map[fig_no] = {
-                                "filename": fn,
-                                "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
-                                "figure_no": fig_no,
-                            }
-                    for chunk in chunks:
-                        fig_refs = chunk.extra.get("figure_refs", [])
-                        if fig_refs:
-                            bound = [fig_asset_map[f] for f in fig_refs if f in fig_asset_map]
-                            if bound:
-                                chunk.extra["image_refs"] = bound
+                    import re as _re_fig
+                    step_cards = sorted(
+                        [c for c in chunks if c.chunk_type == "step_card"],
+                        key=lambda c: c.extra.get("step_no", 0),
+                    )
+                    step_by_no = {c.extra.get("step_no"): c for c in step_cards}
+
+                    def _img_entry(a):
+                        fn = a.get("filename", "")
+                        return {
+                            "filename": fn,
+                            "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                            "figure_no": a.get("figure_no"),
+                            "anchor_row": a.get("anchor_row"),
+                            "image_category": a.get("image_category", "unknown"),
+                            "visual_summary": a.get("visual_summary", ""),
+                            "ocr_text": a.get("ocr_text", ""),
+                        }
+
+                    vec_imgs = [a for a in assets if a.get("status") == "ROUTE_TO_VECTOR"]
+                    unbound = []
+                    for a in vec_imgs:
+                        target = None
+                        fno = str(a.get("figure_no") or "")
+                        # (a) 图号数字 == 步骤号（「操作示图」列 图N 对应步骤 N）
+                        mnum = _re_fig.search(r"(\d+)", fno)
+                        if mnum:
+                            target = step_by_no.get(int(mnum.group(1)))
+                        # (b) 步骤文本显式引用该图号（如图N）
+                        if target is None and fno:
+                            for c in step_cards:
+                                if fno in (c.extra.get("figure_refs") or []):
+                                    target = c
+                                    break
+                        if target is not None:
+                            target.extra.setdefault("image_refs", []).append(_img_entry(a))
+                        else:
+                            unbound.append(a)
+
+                    # (c) 剩余无图号图片：按 anchor_row 顺序就近补到尚无图的步骤
+                    open_steps = [c for c in step_cards if not c.extra.get("image_refs")]
+                    unbound.sort(key=lambda a: (a.get("anchor_row") or 0))
+                    if unbound and open_steps:
+                        n = len(open_steps)
+                        for idx, a in enumerate(unbound):
+                            si = idx if len(unbound) == n else min(int(idx * n / len(unbound)), n - 1)
+                            open_steps[si].extra.setdefault("image_refs", []).append(_img_entry(a))
+
+        # ─── PPTX slide 模式：按 page_num 把图片绑定到对应 slide chunk ───
+        if m_mode == "slide" and global_split_mode == "dynamic":
+            assets = doc.get("assets", [])
+            if assets:
+                dept_code = doc.get("owner_dept", "unknown")
+                source_key = doc.get("source_key", "")
+                if source_key.startswith("raw/"):
+                    _parts = source_key.split("/")
+                    if len(_parts) > 1:
+                        dept_code = _parts[1]
+                version = doc["version_no"]
+                d_id = doc["doc_id"]
+                slide_imgs = {}
+                for a in assets:
+                    if a.get("status") == "ROUTE_TO_VECTOR":
+                        slide_imgs.setdefault(a.get("page_num"), []).append(a)
+                for c in chunks:
+                    imgs = slide_imgs.get(c.page_num, [])
+                    if imgs:
+                        c.extra["image_refs"] = [{
+                            "filename": a.get("filename", ""),
+                            "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{a.get('filename', '')}",
+                            "page_num": a.get("page_num"),
+                            "image_category": a.get("image_category", "unknown"),
+                            "visual_summary": a.get("visual_summary", ""),
+                            "ocr_text": a.get("ocr_text", ""),
+                        } for a in imgs]
+                        # 含产品图/示意图的 slide → visual_knowledge
+                        c.chunk_type = "visual_knowledge"
 
         # ─── Visual Embedding & Image Chunking ───
-        # Step 模式下图片已经绑定到 step_card，不再创建独立 image chunk
-        if not is_step_mode:
+        # Step 模式下图片已经绑定到 step_card，不再创建独立 image chunk。
+        # 结构化 XLSX 版式（procedure_image_guide / product_spec）也已将图片绑定到对应卡片，
+        # slide 模式也已按 page_num 绑定；以上均跳过独立 image chunk 以避免重复。
+        _imgs_bound_in_layout = (
+            global_split_mode == "dynamic"
+            and xlsx_layout_type in ("procedure_image_guide", "product_spec_instruction")
+        )
+        if not is_step_mode and not _imgs_bound_in_layout and m_mode != "slide":
             current_chunk_count = len(chunks)
             assets = doc.get("assets", [])
             if assets:

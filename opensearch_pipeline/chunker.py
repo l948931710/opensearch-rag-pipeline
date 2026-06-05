@@ -852,6 +852,23 @@ class DocumentChunker:
                 first_step_page = sec_steps[0]["page_num"]
                 first_step_section = sec_steps[0].get("section") or current_section
 
+        # ── Phase 4.9: 前导文本（步骤前的元信息/目的/职责/检验频率等）→ 独立 text_chunk ──
+        # 这些非步骤段落既会被 procedure_parent 摘要引用，也单独成块，
+        # 以便"文档编号/职责/检验频率"等查询能精确命中（而非只匹配到 parent）。
+        if preamble_texts:
+            pre_full = "\n".join(t.strip() for t, _, _, _ in preamble_texts if t and t.strip())
+            pg0, sect0, src0 = preamble_texts[0][1], preamble_texts[0][2], preamble_texts[0][3]
+            for sub in self._split_long_text(pre_full):
+                if len(sub.strip()) < self.min_chunk_chars:
+                    continue
+                chunks.append(self._create_chunk(
+                    doc_id=doc_id, version_no=version_no,
+                    chunk_index=chunk_index, chunk_type="text_chunk",
+                    chunk_text=sub.strip(), page_num=pg0,
+                    section_title=sect0, metadata=meta, source=src0,
+                ))
+                chunk_index += 1
+
         # ── Phase 5 (unified): 生成唯一 procedure_parent ──
         # 将所有 section 的步骤合并为一个 parent，避免多 section SOP 产生冗余 parent
         if all_step_card_chunks:
@@ -914,6 +931,66 @@ class DocumentChunker:
                 ))
                 chunk_index += 1
 
+        return chunks
+
+    def _chunk_by_slide(
+        self,
+        blocks: list,
+        doc_id: str,
+        version_no: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """按幻灯片切块（PPTX）。每页 slide 合并为一个 chunk，保留 page_num 作来源定位。
+
+        - 以表格为主的 slide → table_chunk
+        - 其余 → text_chunk
+        含产品图/示意图的 slide 由 node 按 page_num 绑定图片后升级为 visual_knowledge。
+        """
+        from collections import OrderedDict
+        meta = metadata or {}
+        chunks: List[Chunk] = []
+        chunk_index = 0
+
+        by_slide: "OrderedDict[Any, dict]" = OrderedDict()
+        for block in blocks:
+            if isinstance(block, dict):
+                bt = block.get("block_type", "paragraph")
+                txt = (block.get("text") or "").strip()
+                pg = block.get("page_num")
+                sect = block.get("section_path")
+                src = block.get("source", "native")
+            else:
+                bt = block.block_type
+                txt = (block.text or "").strip()
+                pg = block.page_num
+                sect = block.section_path
+                src = block.source
+            if bt == "image_ref" or not txt:
+                continue
+            key = pg if pg is not None else 0
+            if key not in by_slide:
+                by_slide[key] = {"texts": [], "has_table": False, "section": sect, "src": src, "page": pg}
+            if bt == "table":
+                by_slide[key]["has_table"] = True
+            if bt == "heading" and not by_slide[key]["section"]:
+                by_slide[key]["section"] = txt
+            by_slide[key]["texts"].append(txt)
+
+        for sl in by_slide.values():
+            combined = "\n".join(sl["texts"]).strip()
+            if not combined:
+                continue
+            ctype = "table_chunk" if sl["has_table"] else "text_chunk"
+            for sub in self._split_long_text(combined):
+                if not sub.strip():
+                    continue
+                chunks.append(self._create_chunk(
+                    doc_id=doc_id, version_no=version_no,
+                    chunk_index=chunk_index, chunk_type=ctype,
+                    chunk_text=sub.strip(), page_num=sl["page"],
+                    section_title=sl["section"], metadata=meta, source=sl["src"],
+                ))
+                chunk_index += 1
         return chunks
 
     def _chunk_text_fallback(
@@ -1130,7 +1207,9 @@ class DocumentChunker:
             r'^(?:'
             r'第[一二三四五六七八九十百零\d]+[章节条款部分编]|'  # 第X章/第X条
             r'[一二三四五六七八九十]+[、\.]|'  # 一、二、
+            r'\d+[、]|'  # 1、2、…（阿拉伯数字+顿号，中文制度/规范常用枚举）
             r'（[一二三四五六七八九十\d]+）|'  # （一）（二）
+            r'[a-zA-Z][）)]|'  # a）b) 子条款
             r'\d+\.\d+(?:\.\d+)?\s'  # 9.1 9.2 or 2.2.1
             r')',
             re.MULTILINE,
@@ -1365,6 +1444,8 @@ class DocumentChunker:
             return self._chunk_by_clause(blocks, doc_id, version_no, metadata)
         if self.split_mode == "step":
             return self._chunk_by_step(blocks, doc_id, version_no, metadata)
+        if self.split_mode == "slide":
+            return self._chunk_by_slide(blocks, doc_id, version_no, metadata)
         if self.xlsx_layout_type == "procedure_image_guide":
             return self._chunk_procedure_steps(blocks, doc_id, version_no, metadata)
         if self.xlsx_layout_type == "product_spec_instruction":
@@ -2072,7 +2153,7 @@ class DocumentChunker:
                 version_no=version_no,
                 chunk_index=chunk_index,
                 chunk_text=header_text,
-                chunk_type="procedure_header",
+                chunk_type="text_chunk",  # 通用类型；下游检索/服务不识别 procedure_header
                 metadata=meta,
             )
             chunk.extra["is_procedure_header"] = True
@@ -2203,6 +2284,24 @@ class DocumentChunker:
             else:
                 merged.append((sec_type, chunk_type, texts, rmin, rmax))
 
+        # 专用 *_card 类型仅用于内部 section 语义，下游检索/服务只认通用类型
+        # （image / table_chunk / text_chunk / step_card / procedure_parent）。
+        # 因此对外发出通用 chunk_type，把 section 语义保留在 extra["spec_section"]。
+        # 额外收益：product_photo 现在发出 "image"，服务端才会按图片渲染（修复历史遗漏）。
+        _CARD_TO_GENERIC = {
+            "spec_header_card": "text_chunk",
+            "product_info_card": "text_chunk",
+            "raw_material_card": "table_chunk",
+            "process_ccp_card": "table_chunk",
+            "packaging_card": "text_chunk",
+            "spec_sensory_card": "table_chunk",
+            "spec_dimension_card": "table_chunk",
+            "spec_chem_card": "table_chunk",
+            "spec_performance_card": "table_chunk",
+            "appendix_card": "text_chunk",
+            "product_photo_card": "image",
+        }
+
         # 生成 chunks
         for sec_type, chunk_type, texts, rmin, rmax in merged:
             combined = "\n".join(texts)
@@ -2210,15 +2309,17 @@ class DocumentChunker:
             if len(combined.strip()) < 10:
                 continue
 
+            generic_type = _CARD_TO_GENERIC.get(chunk_type, chunk_type)
             chunk = self._create_chunk(
                 doc_id=doc_id,
                 version_no=version_no,
                 chunk_index=chunk_index,
                 chunk_text=combined,
-                chunk_type=chunk_type,
+                chunk_type=generic_type,
                 metadata=meta,
             )
             chunk.extra["spec_section"] = sec_type
+            chunk.extra["spec_card_type"] = chunk_type  # 保留原始细分类型
             chunk.extra["spec_row_start"] = rmin
             chunk.extra["spec_row_end"] = rmax
             chunks.append(chunk)
