@@ -263,4 +263,234 @@ class TestChunkerDuplicateAvoidance:
                 assert p2_text not in c.chunk_text
 
 
+class TestStepCardLengthLimit:
+    """Fix 1: step_card 超长拆分测试。"""
+
+    def test_oversized_step_card_splits(self):
+        """当步骤文字 + 图片 OCR 超过 max_chunk_chars 时应拆分。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=200,
+            min_chunk_chars=10,
+            overlap_chars=0,
+            split_mode="step",
+        )
+        blocks = [
+            ExtractedBlock(block_type="paragraph", text="步骤1. 打开阀门并检查压力表读数"),
+            ExtractedBlock(block_type="paragraph", text="确认系统正常后继续操作" * 3),
+            # image_ref with long OCR text
+            {
+                "block_type": "image_ref",
+                "text": "",
+                "page_num": 1,
+                "section_path": None,
+                "source": "multimodal",
+                "extra": {
+                    "image_index": 0,
+                    "source_image": "img.png",
+                    "oss_key": "key",
+                    "ocr_text": "阀门操作注意事项" * 10,
+                    "visual_summary": "操作面板显示压力表和控制按钮的详细视图" * 3,
+                },
+            },
+            ExtractedBlock(block_type="paragraph", text="步骤2. 关闭阀门"),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_STEP_SPLIT", 1)
+        step_cards = [c for c in chunks if c.chunk_type == "step_card"]
+        
+        # 步骤1 应该被拆分为至少 2 个 step_card
+        step1_cards = [c for c in step_cards if c.extra.get("step_no") == 1]
+        assert len(step1_cards) >= 2, f"Expected step_card split, got {len(step1_cards)} chunks"
+        
+        # 补充 chunk 应标记为 is_step_continuation
+        continuation_cards = [c for c in step1_cards if c.extra.get("is_step_continuation")]
+        assert len(continuation_cards) >= 1
+        
+        # 所有 step_card 都不应超过 max_chunk_chars（含 context_prefix）
+        for c in step_cards:
+            assert len(c.chunk_text) <= 300, f"step_card too long: {len(c.chunk_text)} chars"
+
+    def test_short_step_card_not_split(self):
+        """短步骤不应拆分。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=800,
+            min_chunk_chars=10,
+            overlap_chars=0,
+            split_mode="step",
+        )
+        blocks = [
+            ExtractedBlock(block_type="paragraph", text="步骤1. 打开系统"),
+            ExtractedBlock(block_type="paragraph", text="步骤2. 输入密码"),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_STEP_SHORT", 1)
+        step_cards = [c for c in chunks if c.chunk_type == "step_card"]
+        continuations = [c for c in step_cards if c.extra.get("is_step_continuation")]
+        assert len(continuations) == 0
+
+
+class TestRowCardContextEnrichment:
+    """Fix 2: row_card 极短 chunk 上下文丰富测试。"""
+
+    def test_row_card_prepends_section_context(self):
+        """row_card 模式下，极短行应追加设备名称前缀。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=300,
+            min_chunk_chars=5,
+            overlap_chars=0,
+            row_card=True,
+        )
+        blocks = [
+            ExtractedBlock(
+                block_type="heading", text="三辊研磨机 每班清扫",
+                level=1, section_path="三辊研磨机 每班清扫"
+            ),
+            ExtractedBlock(block_type="paragraph", text="传动部位\t目视检查\t每班"),
+            ExtractedBlock(block_type="paragraph", text="研磨辊\t清洁擦拭\t每班"),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_ROW_CTX", 1)
+        text_chunks = [c for c in chunks if c.chunk_type == "text_chunk"]
+        
+        assert len(text_chunks) == 2
+        # 每个短行应包含设备名称前缀
+        for c in text_chunks:
+            assert "三辊研磨机" in c.chunk_text, f"Missing equipment context: {c.chunk_text}"
+
+    def test_row_card_long_text_no_prefix(self):
+        """超过 200 字的行不应追加前缀（避免冗余）。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=500,
+            min_chunk_chars=5,
+            overlap_chars=0,
+            row_card=True,
+        )
+        long_text = "详细说明" * 60  # > 200 chars
+        blocks = [
+            ExtractedBlock(
+                block_type="heading", text="设备A",
+                level=1, section_path="设备A"
+            ),
+            ExtractedBlock(block_type="paragraph", text=long_text),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_ROW_LONG", 1)
+        text_chunks = [c for c in chunks if c.chunk_type == "text_chunk"]
+        assert len(text_chunks) >= 1
+        # 长文本不应有 【设备A】 前缀
+        assert not text_chunks[0].chunk_text.startswith("【设备A】")
+
+
+class TestClauseInterClauseOverlap:
+    """Fix 3: clause 模式条款间语义 overlap 测试。"""
+
+    def test_clause_chunks_have_prev_context(self):
+        """第 2 个及之后的条款 chunk 应包含上一条款标题。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=500,
+            min_chunk_chars=10,
+            overlap_chars=100,
+            split_mode="clause",
+        )
+        blocks = [
+            ExtractedBlock(
+                block_type="paragraph",
+                text="第一条 本制度适用于公司全体员工的考勤管理。" * 3
+            ),
+            ExtractedBlock(
+                block_type="paragraph",
+                text="第二条 员工应当按时打卡上下班，不得迟到早退。" * 3
+            ),
+            ExtractedBlock(
+                block_type="paragraph",
+                text="第三条 请假需提前一天提交申请，特殊情况除外。" * 3
+            ),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_CLAUSE_OVL", 1)
+        clause_chunks = [c for c in chunks if c.chunk_type == "clause_chunk"]
+        
+        assert len(clause_chunks) == 3
+        
+        # 第一个条款无上文
+        assert "[上文]" not in clause_chunks[0].chunk_text
+        
+        # 第二个条款应包含第一条的标题
+        assert "[上文]" in clause_chunks[1].chunk_text
+        assert "第一条" in clause_chunks[1].chunk_text
+        
+        # 第三个条款应包含第二条的标题
+        assert "[上文]" in clause_chunks[2].chunk_text
+        assert "第二条" in clause_chunks[2].chunk_text
+
+    def test_clause_first_chunk_no_context(self):
+        """只有一个条款时不应有 [上文] 标记。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=2000,
+            min_chunk_chars=10,
+            overlap_chars=100,
+            split_mode="clause",
+        )
+        blocks = [
+            ExtractedBlock(
+                block_type="paragraph",
+                text="第一条 本制度适用于公司全体员工。" * 5
+            ),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_CLAUSE_SINGLE", 1)
+        clause_chunks = [c for c in chunks if c.chunk_type == "clause_chunk"]
+        assert len(clause_chunks) == 1
+        assert "[上文]" not in clause_chunks[0].chunk_text
+
+
+class TestProcedureParentEnrichment:
+    """Fix 4: procedure_parent embedding 质量提升测试。"""
+
+    def test_parent_includes_preamble_summary(self):
+        """procedure_parent 应包含前导文本中的目的/范围描述。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=800,
+            min_chunk_chars=10,
+            overlap_chars=0,
+            split_mode="step",
+        )
+        blocks = [
+            ExtractedBlock(
+                block_type="paragraph",
+                text="本文档的目的是规范涂布工序的标准操作流程，适用于所有涂布车间。"
+            ),
+            ExtractedBlock(block_type="paragraph", text="步骤1. 准备涂布材料"),
+            ExtractedBlock(block_type="paragraph", text="检查涂布液浓度是否达标。"),
+            ExtractedBlock(block_type="paragraph", text="步骤2. 启动涂布机"),
+            ExtractedBlock(block_type="paragraph", text="按下启动按钮，等待机器预热。"),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_PARENT_ENR", 1)
+        parent_chunks = [c for c in chunks if c.chunk_type == "procedure_parent"]
+        
+        assert len(parent_chunks) == 1
+        parent = parent_chunks[0]
+        # 应包含目的/范围的前导文本
+        assert "目的" in parent.chunk_text or "涂布工序" in parent.chunk_text
+        # 仍应包含步骤列表
+        assert "步骤1" in parent.chunk_text
+        assert "步骤2" in parent.chunk_text
+
+    def test_parent_fallback_to_first_preamble(self):
+        """无关键词命中时，应取第一段前导文本。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=800,
+            min_chunk_chars=10,
+            overlap_chars=0,
+            split_mode="step",
+        )
+        blocks = [
+            ExtractedBlock(
+                block_type="paragraph",
+                text="涂布工序操作手册，版本号V2.3，编制日期2024年1月。"
+            ),
+            ExtractedBlock(block_type="paragraph", text="步骤1. 准备材料"),
+            ExtractedBlock(block_type="paragraph", text="步骤2. 开始涂布"),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_PARENT_FB", 1)
+        parent_chunks = [c for c in chunks if c.chunk_type == "procedure_parent"]
+        
+        assert len(parent_chunks) == 1
+        parent = parent_chunks[0]
+        # 应包含第一段前导文本作为 fallback
+        assert "涂布工序操作手册" in parent.chunk_text
 

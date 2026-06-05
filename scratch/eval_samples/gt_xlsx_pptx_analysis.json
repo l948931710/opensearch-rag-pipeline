@@ -1,0 +1,433 @@
+{
+  "xlsx_sop": {
+    "description": "电子天平操作规程 (FL-QC-005-001-3, 版号C/0)",
+    "filename": "xlsx_sop.xlsx",
+    "total_blocks": 27,
+    "total_assets": 6,
+    "structure_summary": "Single-sheet SOP document for electronic balance (梅特勒-托利多). Contains: (1) header metadata with doc number/version, (2) purpose/scope/responsibilities sections 1-3, (3) 6-step illustrated operating procedure with step_no markers and paired photos, (4) precautions section 5, (5) daily maintenance table section 6, (6) sign-off block. 6 images: water-level bubble, power plug insertion x2, zero/tare button press, balance overview, weighing demo. Sheets 2-3 are empty.",
+    "gt_chunks": [
+      {
+        "label": "文件元数据-编号版本",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [0, 1, 2, 3],
+        "keywords": ["FL-QC-005-001-3", "C/0", "电子天平", "操作规程", "富岭科技"],
+        "expected_images": [],
+        "notes": "Document header: company name, doc number, version, title. Provides retrieval anchor for 'which version of the balance SOP is current'."
+      },
+      {
+        "label": "目的-范围-职责",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [4, 5, 6, 7],
+        "keywords": ["目的", "检测仪器", "重量测试", "检验员", "质检班长", "质量副主管", "校准验证"],
+        "expected_images": [],
+        "notes": "Sections 1-3: Purpose (instrument operation norms), Scope (all product weight testing), Responsibilities (inspector operates, QC lead checks weekly, deputy QA manager calibrates). Key for queries about who is responsible for what."
+      },
+      {
+        "label": "步骤1-调水平",
+        "chunk_type": "step_card",
+        "page": 1,
+        "block_indices": [9, 10],
+        "keywords": ["调水平", "水平泡", "中心圆圈", "底角", "使用前"],
+        "expected_images": ["金属容器内部圆形传感器/水平仪"],
+        "notes": "Step 1: Level the balance by checking the bubble level at the back, adjusting the two foot screws. Image shows the bubble level indicator inside the balance. Critical first step before any measurement."
+      },
+      {
+        "label": "步骤2-仪器开启",
+        "chunk_type": "step_card",
+        "page": 1,
+        "block_indices": [11],
+        "keywords": ["电源", "on/off", "启动", "预热", "30分钟"],
+        "expected_images": ["手将电源适配器插入墙壁插座", "手握持黑色电源适配器准备插入插座"],
+        "notes": "Step 2: Connect power, press on/off, warm up 30 minutes. Two images showing power plug insertion. The 30-minute warm-up is a commonly asked detail."
+      },
+      {
+        "label": "步骤3-试样准备",
+        "chunk_type": "step_card",
+        "page": 1,
+        "block_indices": [12],
+        "keywords": ["试样", "腐蚀性", "托盘", "容器", "湿的"],
+        "expected_images": [],
+        "notes": "Step 3: Sample prep — wet or corrosive samples must not touch the pan directly, use a container first. No dedicated image paired with this step."
+      },
+      {
+        "label": "步骤4-天平调零",
+        "chunk_type": "step_card",
+        "page": 1,
+        "block_indices": [13],
+        "keywords": ["调零", "0/T", "归零", "操作面板"],
+        "expected_images": ["梅特勒-托利多天平显示屏0.00g，手指按压O/T去皮归零键"],
+        "notes": "Step 4: Press 0/T button to zero/tare the balance. Image clearly shows the tare operation on the Mettler-Toledo display showing 0.00 g. Equipment label QA--005 visible."
+      },
+      {
+        "label": "步骤5-样品称重",
+        "chunk_type": "step_card",
+        "page": 1,
+        "block_indices": [14],
+        "keywords": ["称重", "读数", "示值稳定", "托盘"],
+        "expected_images": ["UTB-313电子天平上放置蓝色口罩，显示屏读数3098g"],
+        "notes": "Step 5: Place sample on pan, wait for stable reading. Image shows a real weighing example (mask on balance, reading 3098g)."
+      },
+      {
+        "label": "步骤6-仪器关闭",
+        "chunk_type": "step_card",
+        "page": 1,
+        "block_indices": [15],
+        "keywords": ["关闭", "拔掉电源", "长时间不使用"],
+        "expected_images": ["白色电子天平，不锈钢称量盘，蓝色标签编号QA--005"],
+        "notes": "Step 6: After testing, if not used for a long time, unplug power. Image shows the balance in idle state."
+      },
+      {
+        "label": "注意事项",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [16, 17],
+        "keywords": ["稳定工作台", "避免振动", "阳光照射", "连续通电", "预热时间"],
+        "expected_images": [],
+        "notes": "Section 5 precautions: (5.1) Place on stable table, avoid vibration/sunlight/temp changes. (5.2) Keep powered on if used frequently to reduce warm-up and maintain stability. These are FAQ targets."
+      },
+      {
+        "label": "日常使用维护表",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [18, 19, 20, 21, 22],
+        "keywords": ["日常维护", "清洁", "干抹布", "每天", "每周", "检验员", "巡检", "质量副主管"],
+        "expected_images": [],
+        "notes": "Section 6 maintenance table: Use (per need, inspector), Clean (daily morning shift, dry cloth, patrol inspector), Check (weekly, QA deputy). Key for answering 'how often to clean the balance' or 'who checks the balance'."
+      },
+      {
+        "label": "编制审核签字",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [23, 24],
+        "keywords": ["编制", "丁家才", "审核", "李银花", "2025.5.21"],
+        "expected_images": [],
+        "notes": "Sign-off block: Prepared by 丁家才, Reviewed by 李银花, both dated 2025.5.21. Needed for document traceability queries."
+      }
+    ],
+    "sample_queries": [
+      "电子天平使用前要做什么？",
+      "电子天平需要预热多长时间？",
+      "腐蚀性样品怎么称量？",
+      "天平多久清洁一次？谁负责？",
+      "电子天平操作规程是哪个文件编号？",
+      "调零按哪个按钮？",
+      "天平不用时要怎么处理？",
+      "谁负责天平的校准验证？",
+      "天平应该放在什么环境？",
+      "电子天平操作规程谁编制的？什么时候？"
+    ]
+  },
+
+  "xlsx_spec": {
+    "description": "纸杯中杯-知兰-2025款 产品规格书 (茶话弄/富岭科技)",
+    "filename": "xlsx_spec.xlsx",
+    "total_blocks": 91,
+    "total_assets": 6,
+    "structure_summary": "Comprehensive product specification for a branded paper cup (知兰-2025). Single sheet with 91 blocks covering: (1) basic info (name, standard, risk level, shelf life, temp range), (2) material composition (outer/inner cup paper, PE coating, CPP film, ink), (3) supplier details with proportions, (4) packaging specs, (5) manufacturing process flow with CCP/CQP table, (6) technical standards: sensory/physical dimensions/microbiology/chemical migration/functional tests, (7) sign-off, (8) product photos, (9) appendix info and revision history. 6 images: process flow chart, product photos (cups, packaging, labels, carton).",
+    "gt_chunks": [
+      {
+        "label": "产品基本信息",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+        "keywords": ["纸杯中杯", "知兰-2025款", "茶话弄", "GB/T 27590", "风险等级高", "保质期24个月", "0℃~70℃", "不可微波"],
+        "expected_images": [],
+        "notes": "Core product identification: name, brand (茶话弄), version A/0, standard GB/T 27590, high risk, 24-month shelf life, use temp 0-70°C, no microwave. Critical for any product lookup query."
+      },
+      {
+        "label": "配料组成概览",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [8, 9, 10, 11, 12],
+        "keywords": ["配料", "外杯片", "内杯片", "底纸", "CPP薄膜", "油墨", "250g", "300g", "涂布口杯纸", "华夏太阳", "博汇", "卡洛"],
+        "expected_images": [],
+        "notes": "Bill of materials overview: outer cup (250g Bohui coated paper), inner cup (PE+300g+PE Huaxia Sun), bottom (PE+250g+PE), CPP film (37g/m², 1.2 silk), ink (Shanghai Carlo TYG 4-color). Key for material sourcing queries."
+      },
+      {
+        "label": "生产商信息与包装规格",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [13, 14, 15, 16],
+        "keywords": ["富岭科技", "温岭市", "金塘南路88号", "25个/提", "20提/箱", "500个一箱", "CPP", "堆码4层"],
+        "expected_images": [],
+        "notes": "Manufacturer (富岭科技, Wenling), packaging (25/bundle × 20/carton = 500/carton), bag size 32cm CPP 2 silk, carton 58×46×36cm, max 4-layer stacking. Answers logistics and packaging questions."
+      },
+      {
+        "label": "原料配方详细-配料比例与供应商",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [17, 18, 19, 20, 21, 22, 23],
+        "keywords": ["配料详细", "配料用量", "太阳纸业", "博汇纸业", "宁波瑞成", "前程石化", "0.4543", "0.3015", "0.1213"],
+        "expected_images": [],
+        "notes": "Detailed ingredient table: inner cup 45.43%, outer cup 30.15%, bottom 12.13%, CPP 3.6%, PE film 7.64%. Full supplier names and addresses. Critical for supply chain audit queries."
+      },
+      {
+        "label": "加工助剂与添加剂",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [24, 25, 26, 27, 28],
+        "keywords": ["胶印", "烫金", "哑膜", "白矿油", "水基胶", "油墨", "旭川新材料", "卡洛油墨", "食品级"],
+        "expected_images": [],
+        "notes": "Visual process (offset print + hot stamp + matte laminate), additives (none), processing aids: food-grade white mineral oil (0.05%), water-based glue (0.5%), ink/varnish (0.5%). Key for food safety compliance queries."
+      },
+      {
+        "label": "生产工艺流程图",
+        "chunk_type": "visual_knowledge",
+        "page": 1,
+        "block_indices": [29, 30],
+        "keywords": ["工艺流程", "CCP", "CQP", "印刷", "烫金", "覆膜", "成型", "包装"],
+        "expected_images": ["富岭科技纸制品生产工艺流程图：原纸/OPP验收→领料→印刷→烫金→覆膜→压纹→极切→湿水→成型→包装→入库→发运"],
+        "notes": "Process flow diagram showing full manufacturing chain from raw material receipt to shipping, with CCP/CQP control points marked. The image is a process_flow category asset."
+      },
+      {
+        "label": "关键控制点CCP1-原纸检测",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43],
+        "keywords": ["CCP1", "总迁移量", "4%乙酸", "50%乙醇", "重金属", "铅", "砷", "甲醛", "荧光", "大肠菌群", "沙门氏菌", "霉菌", "10mg/dm²", "1,3-二氯-2-丙醇"],
+        "expected_images": [],
+        "notes": "CCP1 raw paper critical limits table: total migration ≤10 mg/dm² (4% acetic acid & 50% ethanol, 70°C 2h), heavy metals Pb≤1.0 mg/kg, Pb≤3.0, As≤1.0, formaldehyde≤1.0 mg/dm², fluorescence negative, E.coli/Salmonella not detected, mold≤50 CFU/g. Batch inspection with corrective actions for non-conformance. Essential for food safety compliance."
+      },
+      {
+        "label": "技术标准-感官要求",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [44, 45, 46, 47],
+        "keywords": ["感官要求", "外观", "凹陷", "起皱", "淋膜", "印刷图案", "杯口15mm", "异嗅", "异味"],
+        "expected_images": [],
+        "notes": "Section 5 sensory requirements: appearance (no dents/wrinkles, uniform coating, no printing within 15mm of rim for drinking cups), odor (no abnormal smell, no smell when hot water added). Δ☆ marks = both factory and type inspection."
+      },
+      {
+        "label": "技术标准-物理尺寸指标",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59],
+        "keywords": ["杯口外径", "89.3±0.2", "杯口内径", "82.5", "卷边直径", "高度", "135.7±1", "容量", "505ml±10", "克重", "22±1.0", "挺度", "杯底"],
+        "expected_images": [],
+        "notes": "Physical dimension specs: rim OD 89.3±0.2mm, rim ID 82.5±0.3mm, horizontal curl 3.2±0.2mm, vertical curl 3.4±0.2mm, curl angle ≥420°, height 135.7±1mm, bottom thickness 0.35±0.05mm, bottom diameter 58.4±0.5mm, bottom depth 7.7±0.5mm, volume 505±10ml, weight 22±1.0g, stiffness >7N (GB/T27590). Primary target for dimension lookup queries."
+      },
+      {
+        "label": "技术标准-微生物指标",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [60, 61, 62],
+        "keywords": ["微生物", "大肠菌群", "沙门氏菌", "霉菌", "不得检出", "CFU/g", "GB4806.13", "GB14934"],
+        "expected_images": [],
+        "notes": "Microbiological limits per GB4806.13: E.coli and Salmonella not detected per 50cm², mold ≤50 CFU/g. All type-inspection items (☆)."
+      },
+      {
+        "label": "技术标准-理化指标(迁移/重金属)",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75],
+        "keywords": ["总迁移量", "重金属", "芳香族伯胺", "荧光性物质", "甲醛", "脱色试验", "1,3-二氯-2-丙醇", "3-氯-1,2-丙二醇", "GB31604"],
+        "expected_images": [],
+        "notes": "Chemical migration & safety indicators: total migration ≤10 (acetic acid & ethanol), heavy metals Pb≤1, sensory pass, aromatic primary amines ND, Pb≤3.0, As≤1.0, fluorescence negative, formaldehyde≤1.0, 1,3-DCP ND, 3-MCPD≤12, decolorization negative. All GB4806.13/GB31604 standards."
+      },
+      {
+        "label": "功能性测试(配盖/封膜/渗漏)",
+        "chunk_type": "table_chunk",
+        "page": 1,
+        "block_indices": [76, 77, 78, 79],
+        "keywords": ["配盖测试", "封膜测试", "渗漏测试", "60-65℃", "45°倾斜", "滴漏", "盖子脱落", "奶茶液"],
+        "expected_images": [],
+        "notes": "Functional performance tests: (1) No-seal lid test - 60-65°C water, tilt 45°, rotate, no leaking at seam within 5s, lid stays after 5 drop tests; (2) Film seal test - sealed edge firm, no false sealing; (3) Seal+lid combo test; (4) Leakage test with tea/milk at ice and hot temps, 30min soak, no seepage. Δ☆ items."
+      },
+      {
+        "label": "产品照片-成品与包装",
+        "chunk_type": "visual_knowledge",
+        "page": 1,
+        "block_indices": [84, 85],
+        "keywords": ["正反面", "装箱", "标签", "合格证", "茶话弄"],
+        "expected_images": [
+          "两个浅绿色'知蘭'纸杯",
+          "纸箱内塑料膜包裹纸杯",
+          "合格证标签特写",
+          "单条产品膜包",
+          "茶话弄品牌纸箱外观"
+        ],
+        "notes": "Product photo section with 5 images: cup front/back views, carton packing with protection, single bundle with QC label, dual certificate labels, branded carton with weight/production info. Answers 'what does the product/packaging look like' queries."
+      },
+      {
+        "label": "会签与版本历史",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [80, 81, 82, 83, 86, 87, 88, 89, 90],
+        "keywords": ["会签", "四方签字", "变更管理", "型检报告", "COA", "A/0", "2025-06-19"],
+        "expected_images": [],
+        "notes": "Sign-off (manufacturer, procurement, QA, quality head), revision history (initial version A/0, 2025-06-19), appendix requirements (type inspection report, COA for first batch). Key for document governance queries."
+      }
+    ],
+    "sample_queries": [
+      "纸杯中杯知兰的杯口外径是多少？",
+      "这个纸杯的容量是多少毫升？",
+      "纸杯的保质期多长？使用温度范围？",
+      "纸杯用的什么材料？内杯片是什么？",
+      "总迁移量的标准限值是多少？",
+      "这个纸杯的微生物指标要求是什么？",
+      "纸杯生产的CCP控制点是什么？",
+      "配盖测试怎么做？合格标准是什么？",
+      "纸杯的供应商是谁？生产商地址在哪？",
+      "纸杯每箱装多少个？怎么堆码？",
+      "杯口15mm内可以印刷吗？",
+      "这个产品执行什么国标？",
+      "纸杯重量要求是多少克？",
+      "油墨和胶水用的什么品牌？食品级吗？"
+    ]
+  },
+
+  "pptx_training": {
+    "description": "吸塑类培训资料 - 台州富岭塑胶有限公司 (产品介绍-吸塑产品)",
+    "filename": "pptx_training.pptx",
+    "total_blocks": 33,
+    "total_assets": 28,
+    "structure_summary": "16-slide training presentation for thermoforming (吸塑) products. Covers: (1) title slide with company info, (2) product intro header, (3) raw materials (PP/HIPS/PET/MFPP formulas), (4) sauce cups (0.75oz-5.5oz), (5) packing containers/barrels (8oz-32oz PP/PET), (6) American-style takeout containers (hinged boxes 663-993 series), (7) heavy vs light series + dual-color boxes, (8) plates (MFPP/HIPS 6\"-10.25\"), (9) PET cups (8-32oz + lids), (10) imitation-PET PP cold cups, (11) PP/HIPS cups, medicine cups, aviation cups. Rich in spec tables (10 OCR text blocks from table images) and 28 product photos. 10 images routed to text as visual_knowledge (spec tables), 18 as product photos.",
+    "gt_chunks": [
+      {
+        "label": "公司介绍与培训概述",
+        "chunk_type": "text_chunk",
+        "page": 1,
+        "block_indices": [0, 1, 2, 3, 4],
+        "keywords": ["台州富岭塑胶", "绿色环保", "国内营销部", "吸塑产品", "环保餐饮具"],
+        "expected_images": [],
+        "notes": "Title slide and intro: company name (台州富岭塑胶有限公司), mission ('green environmental protection'), department (domestic marketing), topic (thermoforming product introduction). Slide 1-2."
+      },
+      {
+        "label": "原料类-吸塑材料与配方表",
+        "chunk_type": "visual_knowledge",
+        "page": 3,
+        "block_indices": [5, 6, 23],
+        "keywords": ["PP", "HIPS", "PET", "MFPP", "碳酸钙", "配方", "吸塑车间", "吸管车间", "超细填充料"],
+        "expected_images": ["生产配方表，分吸塑车间与吸管车间，列明各成品原料配比"],
+        "notes": "Slide 3: Material types (PP, HIPS, PET, MFPP) and detailed formula table from OCR. Key data: pure PP 100%, PP black box = PP 33% + filler 67% (transitioning to direct CaCO3), PP box = PP 57% + CaCO3 43%, HIPS plate = HIPS 75% + filler 25%. Critical knowledge for material science queries."
+      },
+      {
+        "label": "酱料杯系列-规格参数",
+        "chunk_type": "visual_knowledge",
+        "page": 4,
+        "block_indices": [7, 24],
+        "keywords": ["酱料杯", "0.75OZ", "1OZ", "1.5OZ", "2OZ", "3.25OZ", "4OZ", "5.5OZ", "PET盖", "PP杯"],
+        "expected_images": ["酱料杯规格参数表", "多种规格塑料小杯及盖子实物图"],
+        "notes": "Slide 4: Sauce cup product line (PP cup + PET lid), sizes 0.75-5.5oz. OCR spec table with dimensions, unit weight, and gross weight per carton. Image shows physical products small to large."
+      },
+      {
+        "label": "吸塑打包桶系列-PP与PET",
+        "chunk_type": "visual_knowledge",
+        "page": 5,
+        "block_indices": [8, 9],
+        "keywords": ["打包桶", "PP", "PET", "注塑", "8OZ", "12OZ", "16OZ", "32OZ", "116PP盖", "117口径"],
+        "expected_images": ["透明塑料圆形餐盒及盖子", "不同尺寸透明杯与盖子", "PP杯具与平盖"],
+        "notes": "Slide 5: Packing containers (PP vs PET). Key distinction: thermoformed PP uses 116mm lid, PET uses 117mm — lids NOT interchangeable with injection-molded (115mm). Sizes 8-32oz."
+      },
+      {
+        "label": "打包桶规格详表",
+        "chunk_type": "table_chunk",
+        "page": 6,
+        "block_indices": [10, 25, 26, 27],
+        "keywords": ["PP透明桶", "PE盖", "水果沙拉碗", "吸塑打包碗", "11g", "14g", "19g", "22g", "35g"],
+        "expected_images": ["PP打包桶规格对照表", "PET沙拉碗克重表", "PP吸塑打包碗规格表"],
+        "notes": "Slide 6: Three spec tables for packing containers. PP barrels (11-35g, with PE 10.5g lids), PET salad bowls (8-32oz, 11-26g each), PP thermoformed bowls (8-11g with lid 4.3g). All with packing configs and carton weights."
+      },
+      {
+        "label": "美式打包餐盒系列-概述",
+        "chunk_type": "text_chunk",
+        "page": 7,
+        "block_indices": [11, 12],
+        "keywords": ["美式打包餐盒", "663", "963", "881", "883", "991", "993", "黑色", "白色", "透明色", "轻系列", "重系列"],
+        "expected_images": ["六组白色发泡塑料餐盒，掀盖式双层结构"],
+        "notes": "Slide 7: American hinged container series intro. Model numbers 663-993, colors (black/white/clear), light vs heavy series. Product photo shows 6 styles of white foam containers with hinged lids."
+      },
+      {
+        "label": "美式餐盒-常规与轻系列规格",
+        "chunk_type": "visual_knowledge",
+        "page": 8,
+        "block_indices": [13, 14, 28, 29],
+        "keywords": ["常规系列", "重系列", "轻系列", "PP+碳酸钙", "PF+碳酸钙", "883PP", "993PP", "663PP"],
+        "expected_images": ["PP+碳酸钙白色盒规格表(7款)", "PF+碳酸钙白色盒规格表(6款)"],
+        "notes": "Slide 8: Heavy series (PP+CaCO3, 23-60g, 150-300/carton) and light series (PF+CaCO3, 52-70g, 100-150/carton) spec tables from OCR. Model codes like 883PP1C, 993PF3C with dimensions and weights."
+      },
+      {
+        "label": "双色系列打包盒与英文规格",
+        "chunk_type": "visual_knowledge",
+        "page": 9,
+        "block_indices": [15, 30],
+        "keywords": ["双色", "PP BLACK BOTTOM", "CLEAR LID", "HINGED CONTAINER", "REUSABLE", "MICROWAVABLE"],
+        "expected_images": ["黑色长方形餐盒配透明盖", "方形餐盒含透明与黑色"],
+        "notes": "Slides 9-10: Dual-color hinged boxes (black bottom + clear lid) with English spec table (gram, packing, carton size, dimensions). Products marked 'REUSABLE MICROWAVABLE' and 'PLEASE RECYCLE'."
+      },
+      {
+        "label": "PP铰链餐盒英文规格表",
+        "chunk_type": "table_chunk",
+        "page": 10,
+        "block_indices": [30],
+        "keywords": ["9x6x3", "8x8x3", "3COMPART", "50*3", "HINGED CONTAINER"],
+        "expected_images": ["PP铰链式餐盒规格参数表+三款黑底透明盖餐盒实物"],
+        "notes": "Slide 10: English-format spec table for PP hinged containers. Combined visual_knowledge image with specs and product photos side by side."
+      },
+      {
+        "label": "盘子系列-MFPP/HIPS规格",
+        "chunk_type": "visual_knowledge",
+        "page": 11,
+        "block_indices": [16, 31],
+        "keywords": ["盘子", "MFPP", "HIPS", "6英寸", "7英寸", "9英寸", "10.25英寸", "三格", "五格", "学生方盘", "ROUND PLATE"],
+        "expected_images": ["白色分格餐盒", "圆形餐盘堆叠", "六件白色餐盘实物", "MFPP/HIPS餐盘规格参数表"],
+        "notes": "Slides 11-12: Plate series covering MFPP and HIPS round plates (6-10.25\"), compartment trays (3/5/6-grid student trays). Spec table with gram weights, packing, carton/product dimensions."
+      },
+      {
+        "label": "PET杯子系列-规格与产品照",
+        "chunk_type": "visual_knowledge",
+        "page": 13,
+        "block_indices": [17, 32],
+        "keywords": ["PET杯", "8OZ", "9OZ", "10OZ", "12OZ", "14OZ", "16OZ", "20OZ", "24OZ", "32OZ", "平盖", "拱盖", "直饮盖", "78MM", "92MM", "98MM"],
+        "expected_images": ["PET杯与LID规格对照表", "透明杯堆叠与带杯盖", "多规格透明杯及盖子陈列"],
+        "notes": "Slides 13-14: PET cup series (8-32oz, including 32oz car cup 105mm). Lid types: flat with cross hole, dome with round hole, sip lid (78/92/98mm). Full spec table with English headers."
+      },
+      {
+        "label": "仿PET杯-PP冷饮杯系列",
+        "chunk_type": "text_chunk",
+        "page": 15,
+        "block_indices": [18],
+        "keywords": ["仿PET", "PP冷饮杯", "98口径"],
+        "expected_images": ["三款饮品杯实物(奶茶/粉色冰饮/橙色冰饮)", "多只透明杯及杯盖陈列"],
+        "notes": "Slide 15: Imitation-PET series (PP cold cups, 98mm diameter primary). Lifestyle product photos showing cups with actual beverages."
+      },
+      {
+        "label": "PP/HIPS杯-医药杯/航空杯",
+        "chunk_type": "text_chunk",
+        "page": 16,
+        "block_indices": [19, 20, 21, 22],
+        "keywords": ["PP杯", "HIPS杯", "医药杯", "刻度杯", "1OZ", "横纹杯", "航空杯"],
+        "expected_images": ["spirit™ jimique™透明杯", "五个透明杯并排", "透明量杯30mL刻度"],
+        "notes": "Slide 16: PP & HIPS cups including medicine/dosing cups (1OZ with graduation marks), ribbed cups, aviation cups. Shows branded cups (spirit™/jimique™), plain cups, and graduated measuring cups."
+      }
+    ],
+    "sample_queries": [
+      "吸塑产品用什么原料？PP和HIPS配方比例是多少？",
+      "酱料杯有哪些规格？杯子和盖子分别是什么材质？",
+      "PP打包桶和PET打包桶的区别是什么？",
+      "美式打包餐盒有哪些型号？轻系列和重系列的区别？",
+      "PET杯子有哪些尺寸？盖子有几种类型？",
+      "883PP3C的规格参数是什么？",
+      "MFPP盘子有哪些尺寸？",
+      "PP黑色打包盒的配方是什么？碳酸钙含量多少？",
+      "32oz PET水果沙拉碗的克重是多少？",
+      "注塑和吸塑打包桶的盖子能通用吗？",
+      "富岭有没有医药级的杯子？刻度杯是多大的？",
+      "PP冷饮杯和PET杯有什么区别？口径一样吗？"
+    ]
+  },
+
+  "_meta": {
+    "generated_at": "2026-06-04T16:50:00-07:00",
+    "extraction_pipeline": "UnifiedExtractor (opensearch-rag-pipeline)",
+    "analysis_notes": [
+      "xlsx_sop: Clean SOP with step_no markers correctly extracted. 6 images well-matched to steps. Empty Sheet2/Sheet3 ignored.",
+      "xlsx_spec: Large single-sheet spec with 91 blocks, all paragraph type (no heading hierarchy detected beyond first). 6 images include 1 process flow chart and 5 product photos. Tab-separated table data extracted as paragraph blocks — tables not structurally parsed but content is complete.",
+      "pptx_training: 16-slide deck extracted as 33 blocks (23 text + 10 OCR from spec table images). 28 of 29 images kept (1 decorative filtered). 10 text-heavy images correctly routed to OCR text extraction. Slide section_path tracking works via slide titles.",
+      "All three documents have Chinese-primary content with some English terms (especially pptx_training product specs).",
+      "Key extraction gap: xlsx_spec table structure is flattened into paragraph blocks — column alignment is only preserved via tab characters. This affects chunk boundary precision for the standards tables."
+    ]
+  }
+}

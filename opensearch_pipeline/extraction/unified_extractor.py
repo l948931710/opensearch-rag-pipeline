@@ -136,12 +136,19 @@ class UnifiedExtractor:
             blocks.extend(img_blocks)
             flat_text = blocks_to_text(blocks)
 
+        # 判断实际使用的提取方法
+        has_layout_blocks = any(
+            b.extra.get("detected_by") in ("font_size", "bold_font", "pdfplumber_lines", "layout")
+            for b in blocks if hasattr(b, "extra") and b.extra
+        )
+        extract_method = "pdfplumber_layout" if has_layout_blocks else "pypdf"
+
         result = ExtractionResult(
             doc_id=task["doc_id"],
             version_no=task["version_no"],
             source_key=task.get("raw_key", ""),
             file_ext="pdf",
-            extract_method="pypdf",
+            extract_method=extract_method,
             title=title,
             text=flat_text,
             text_length=len(flat_text),
@@ -150,6 +157,7 @@ class UnifiedExtractor:
             warnings=warnings,
             assets=assets,
         )
+
 
         # OCR fallback 判断
         if self._needs_ocr(result):
@@ -527,39 +535,148 @@ class UnifiedExtractor:
 
     # ── PPTX ──
 
+    # 标题占位符 type 值（PP_PLACEHOLDER 枚举的整数值）
+    # TITLE=1, CENTER_TITLE=3, VERTICAL_TITLE=5
+    _PPTX_TITLE_TYPES = {1, 3, 5}
+    # SUBTITLE=4
+    _PPTX_SUBTITLE_TYPES = {4}
+
     def _extract_pptx(self, task: dict) -> ExtractionResult:
-        """PPTX 提取（幻灯片文本 + 表格 + 嵌入图片）。"""
+        """
+        PPTX 提取（Shape 级别结构化 + 表格 + Speaker Notes + 嵌入图片）。
+
+        每个 slide 的 shapes 按类型生成不同 block：
+          - Title/Center Title placeholder → heading block (level=1)
+          - Subtitle placeholder → heading block (level=2)
+          - Body/Content text → paragraph block
+          - Table → table block (markdown pipe format)
+          - Speaker notes → paragraph block (标记 source="speaker_notes")
+
+        section_path 追踪：slide 标题 → 后续 shapes 继承。
+        """
         from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_pptx
 
         local_path = task.get("local_path", "")
         blocks = []
         warnings = []
+        slide_count = 0
 
         try:
             from pptx import Presentation
             prs = Presentation(local_path)
+            slide_count = len(prs.slides)
+
+            current_section = None  # section_path 追踪
 
             for slide_idx, slide in enumerate(prs.slides):
-                slide_texts = []
-                for shape in slide.shapes:
-                    # 文本框 / 占位符
-                    if hasattr(shape, "text") and shape.text.strip():
-                        slide_texts.append(shape.text.strip())
-                    # 表格
-                    if shape.has_table:
-                        for row in shape.table.rows:
-                            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                            if cells:
-                                slide_texts.append("\t".join(cells))
+                page_num = slide_idx + 1
+                slide_title = None  # 当前 slide 的标题
 
-                if slide_texts:
-                    slide_text = f"## Slide {slide_idx + 1}\n" + "\n".join(slide_texts)
-                    blocks.append(ExtractedBlock(
-                        block_type="slide",
-                        text=slide_text,
-                        page_num=slide_idx + 1,
-                        source="python_pptx",
-                    ))
+                # ── Phase 1: 按 shape 类型生成 blocks ──
+                for shape in slide.shapes:
+
+                    # ── 表格 shape → table block ──
+                    if shape.has_table:
+                        rows_text = []
+                        for row in shape.table.rows:
+                            cells = [cell.text.strip().replace("\n", " ") if cell.text else ""
+                                     for cell in row.cells]
+                            if any(cells):
+                                rows_text.append("| " + " | ".join(cells) + " |")
+                        if rows_text:
+                            blocks.append(ExtractedBlock(
+                                block_type="table",
+                                text="\n".join(rows_text),
+                                page_num=page_num,
+                                section_path=current_section,
+                                source="python_pptx",
+                                extra={
+                                    "table_index": 0,
+                                    "row_count": len(rows_text),
+                                    "slide_num": page_num,
+                                },
+                            ))
+                        continue  # table shape 已处理，跳过文本提取
+
+                    # ── 文本类 shape ──
+                    if not hasattr(shape, "text") or not shape.text.strip():
+                        continue
+
+                    text = shape.text.strip()
+
+                    # 判断是否是标题占位符
+                    is_title = False
+                    is_subtitle = False
+                    if shape.is_placeholder:
+                        try:
+                            ph_type = shape.placeholder_format.type
+                            # ph_type 是 PP_PLACEHOLDER 枚举，int(ph_type) 获取整数值
+                            ph_type_int = int(ph_type) if ph_type is not None else -1
+                            if ph_type_int in self._PPTX_TITLE_TYPES:
+                                is_title = True
+                            elif ph_type_int in self._PPTX_SUBTITLE_TYPES:
+                                is_subtitle = True
+                        except Exception:
+                            pass
+
+                    if is_title:
+                        slide_title = text
+                        current_section = text
+                        blocks.append(ExtractedBlock(
+                            block_type="heading",
+                            text=text,
+                            level=1,
+                            page_num=page_num,
+                            section_path=current_section,
+                            source="python_pptx",
+                            extra={"placeholder": "title", "slide_num": page_num},
+                        ))
+                    elif is_subtitle:
+                        blocks.append(ExtractedBlock(
+                            block_type="heading",
+                            text=text,
+                            level=2,
+                            page_num=page_num,
+                            section_path=current_section,
+                            source="python_pptx",
+                            extra={"placeholder": "subtitle", "slide_num": page_num},
+                        ))
+                    else:
+                        # 普通文本框 / Body 占位符 → paragraph block
+                        blocks.append(ExtractedBlock(
+                            block_type="paragraph",
+                            text=text,
+                            page_num=page_num,
+                            section_path=current_section,
+                            source="python_pptx",
+                        ))
+
+                # ── Phase 2: 如果没有检测到标题占位符，用 slide 序号做 fallback heading ──
+                if slide_title is None:
+                    # 检查此 slide 是否有任何内容 block
+                    slide_blocks = [b for b in blocks if b.page_num == page_num]
+                    if slide_blocks:
+                        # 找第一个有文本的 block 作为 slide 标题
+                        first_text = slide_blocks[0].text[:50] if slide_blocks else ""
+                        fallback_title = f"Slide {page_num}" + (f": {first_text}" if first_text else "")
+                        current_section = fallback_title
+
+                # ── Phase 3: Speaker notes → paragraph block ──
+                try:
+                    if slide.has_notes_slide and slide.notes_slide:
+                        notes_text = slide.notes_slide.notes_text_frame.text.strip()
+                        if notes_text and len(notes_text) > 5:
+                            blocks.append(ExtractedBlock(
+                                block_type="paragraph",
+                                text=notes_text,
+                                page_num=page_num,
+                                section_path=current_section,
+                                source="speaker_notes",
+                                extra={"slide_num": page_num, "is_notes": True},
+                            ))
+                except Exception:
+                    pass  # notes 提取失败不影响主流程
+
         except Exception as e:
             warnings.append(f"Failed to extract PPTX text: {e}")
 
@@ -584,7 +701,7 @@ class UnifiedExtractor:
             text=flat_text,
             text_length=len(flat_text),
             blocks=blocks,
-            page_count=len(blocks),
+            page_count=slide_count,
             warnings=warnings,
             assets=assets,
         )
@@ -931,6 +1048,13 @@ class UnifiedExtractor:
                     text=funnel_res["ocr_text"],
                     page_num=img_asset.page_num,
                     source="ocr",
+                    extra={
+                        "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
+                        "visual_summary": funnel_res.get("visual_summary", ""),
+                        "image_category": funnel_res.get("image_category", ""),
+                        "source_image": os.path.basename(img_asset.local_path),
+                        "local_path": img_asset.local_path,
+                    },
                 ))
 
         elapsed = time.time() - t0
@@ -988,7 +1112,13 @@ class UnifiedExtractor:
                 block_type="ocr_text",
                 text=funnel_res["ocr_text"],
                 page_num=1,
-                source="ocr"
+                source="ocr",
+                extra={
+                    "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
+                    "visual_summary": funnel_res.get("visual_summary", ""),
+                    "image_category": funnel_res.get("image_category", ""),
+                    "local_path": local_path,
+                },
             ))
         elif status == "QUARANTINE_SENSITIVE":
             warnings.append(f"🚨 Sensitive content detected in non-public image asset: {funnel_res.get('reason')}")

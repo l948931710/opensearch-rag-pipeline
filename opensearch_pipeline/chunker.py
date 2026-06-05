@@ -346,7 +346,6 @@ class DocumentChunker:
             kb_type=meta.get("kb_type"),
             risk_level=meta.get("risk_level"),
         )
-
     # ── 步骤边界检测正则 ──
     _STEP_BOUNDARY_RE = re.compile(
         r'^(?:'
@@ -354,7 +353,8 @@ class DocumentChunker:
         r'Step\s*(\d+)|'                             # Step 1 / Step2
         r'第\s*([一二三四五六七八九十\d]+)\s*步|'     # 第一步 / 第1步
         r'(\d+)\s*[\.．、]\s*(?![\d])|'              # 1. / 1．/ 2、（排除 1.1 条款编号）
-        r'(\d+)\s*[)）]\s*'                           # 1) / 2）
+        r'(\d+)\s*[)）]\s*|'                           # 1) / 2）
+        r'(\d+\.\d+)\s+\S'                            # 1.2 / 3.2 / 4.2 条款编号步骤（后跟文字）
         r')',
         re.IGNORECASE | re.MULTILINE,
     )
@@ -414,6 +414,7 @@ class DocumentChunker:
         postamble_texts = []      # 最后一个步骤后的尾部文本
         current_step = None
         found_any_step = False
+        pending_images = []       # orphan images waiting for next step
 
         for block in blocks:
             # 兼容 dict 和 dataclass
@@ -438,54 +439,53 @@ class DocumentChunker:
 
                 # ── 编号型操作标题也可能是步骤边界 ──
                 # 财务手册模式: heading "3.2.4正常单据记账" → table → image
-                # 如果 heading 文本匹配编号格式且文档已检测到步骤，
-                # 将 heading 当做新步骤的开始，避免图片丢失。
+                # 工厂 SOP 模式: heading "1.2  若核对错误…" → 步骤
+                # heading 文本匹配编号格式就算步骤开始，不依赖 found_any_step
                 heading_step_match = re.match(
                     r'^(\d+(?:\.\d+)*)\s*[\.．、]?\s*\S', text
                 )
-                if heading_step_match and found_any_step:
+                if heading_step_match:
+                    found_any_step = True  # heading 也可以首次触发
                     if current_step is not None:
                         step_groups.append(current_step)
-                    # heading 虚拟步骤 step_no=0 表示 section 级标题
-                    # section_no 保留原始编号（如 "3.2.4"）
                     current_step = {
                         "step_no": 0,
                         "section_no": heading_step_match.group(1),
                         "title": text[:80],
                         "text_parts": [text],
-                        "image_refs": [],
+                        "image_refs": list(pending_images),
                         "page_num": page_num,
                         "section": current_section,
                         "source": source,
                     }
+                    pending_images.clear()
                 continue
 
-            # image_ref 块 → 归入当前步骤
+            # image_ref 块 → 归入当前步骤，或缓存到 pending 等待下一个步骤
             if block_type == "image_ref":
                 if current_step is not None:
                     current_step["image_refs"].append(extra)
-                elif current_section and found_any_step:
-                    # 兜底：没有步骤但有 section 上下文，创建虚拟步骤
-                    current_step = {
-                        "step_no": 0,
-                        "title": current_section[:80],
-                        "text_parts": [current_section],
-                        "image_refs": [extra],
-                        "page_num": page_num,
-                        "section": current_section,
-                        "source": source,
-                    }
-                # 如果还没有步骤，image_ref 会被忽略（前导图片很少见）
+                else:
+                    # 缓存 orphan images，等下一个步骤创建时归入
+                    # 典型场景：跨页 table 关闭了步骤，但后续 image_ref 属于下一个步骤
+                    pending_images.append(extra)
                 continue
 
             if not text:
                 continue
 
-            # 表格 block → 独立 table_chunk
+            # 表格 block → 归入当前步骤（同页），或独立 table_chunk（跨页/无步骤）
             if block_type == "table":
-                if current_step is not None:
+                # 跨页表格不应归入上一页的步骤（避免 page 2 分类表被归入 page 1 的 step 1.3）
+                same_page = (current_step is not None and
+                             current_step.get("page_num") == page_num)
+                if current_step is not None and same_page:
                     current_step["text_parts"].append(text)
                 else:
+                    # 跨页时先结束上一个步骤组
+                    if current_step is not None and not same_page:
+                        step_groups.append(current_step)
+                        current_step = None
                     chunks.append(self._create_chunk(
                         doc_id=doc_id,
                         version_no=version_no,
@@ -500,32 +500,72 @@ class DocumentChunker:
                     chunk_index += 1
                 continue
 
+            # ocr_text block → 来自图片 OCR，直接跳过
+            # 这些文本已经通过 image_ref 的 ocr_text/visual_summary 元数据保留
+            # 不应塞入步骤文本（会产生大量垃圾：重复圈号、ERP 菜单项等）
+            if block_type == "ocr_text":
+                continue
+
             # ── 检测步骤边界 ──
-            match = self._STEP_BOUNDARY_RE.match(text)
-            if match:
-                # 提取步骤编号（5 个捕获组）
+            # 用 finditer 找到文本中的 *所有* 步骤标记
+            # 然后按步骤标记位置拆分成多段，逐段处理
+            # 这修复了一个 paragraph 包含多个步骤（如 "步骤2：… 步骤3：…"）时
+            # 只识别第一个步骤标记的问题
+            all_matches = list(self._STEP_BOUNDARY_RE.finditer(text))
+
+            if not all_matches:
+                # 无步骤标记 → 归入当前上下文
+                if current_step is not None:
+                    current_step["text_parts"].append(text)
+                elif found_any_step:
+                    postamble_texts.append((text, page_num, current_section, source))
+                else:
+                    preamble_texts.append((text, page_num, current_section, source))
+                continue
+
+            # ── 按步骤标记拆分文本为多段 ──
+            segments = []  # [(match, segment_text)]
+            for mi, m in enumerate(all_matches):
+                seg_start = m.start()
+                seg_end = all_matches[mi + 1].start() if mi + 1 < len(all_matches) else len(text)
+                segments.append((m, text[seg_start:seg_end].strip()))
+
+            # 第一个步骤标记前的文本 = prefix（前言/尾部）
+            prefix_text = text[:all_matches[0].start()].strip()
+            if prefix_text:
+                if current_step is not None:
+                    current_step["text_parts"].append(prefix_text)
+                elif found_any_step:
+                    postamble_texts.append((prefix_text, page_num, current_section, source))
+                else:
+                    preamble_texts.append((prefix_text, page_num, current_section, source))
+
+            # ── 逐段创建步骤组 ──
+            for match, seg_text in segments:
+                if not seg_text:
+                    continue
+
+                # 提取步骤编号（6 个捕获组）
                 step_no_str = (match.group(1) or match.group(2) or
                                match.group(3) or match.group(4) or
-                               match.group(5))
+                               match.group(5) or match.group(6))
 
-                # ── 过滤误判：通用编号格式（N. / N、/ N)）需要足够长的文本 ──
+                # ── 过滤误判：通用编号格式（N. / N、/ N) / X.Y）需要足够长的文本 ──
                 # 避免将材料清单 "4. 胶带" 误判为步骤。
                 # 明确的步骤标记（步骤N / Step N / 第N步）不受此限制。
-                is_generic_numbering = match.group(4) or match.group(5)
-                if is_generic_numbering and len(text) < 15:
+                is_generic_numbering = match.group(4) or match.group(5) or match.group(6)
+                if is_generic_numbering and len(seg_text) < 15:
                     # 太短，当普通文本处理
                     if current_step is not None:
-                        current_step["text_parts"].append(text)
+                        current_step["text_parts"].append(seg_text)
                     elif found_any_step:
-                        postamble_texts.append((text, page_num, current_section, source))
+                        postamble_texts.append((seg_text, page_num, current_section, source))
                     else:
-                        preamble_texts.append((text, page_num, current_section, source))
+                        preamble_texts.append((seg_text, page_num, current_section, source))
                     continue
 
                 found_any_step = True
                 try:
-                    # 中文数字转换（注意：不能用 dict.get(k, int(k))，
-                    # 因为 Python 会先求值 int("三") 导致 ValueError）
                     cn_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
                               "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
                     if step_no_str in cn_num:
@@ -539,24 +579,17 @@ class DocumentChunker:
                 if current_step is not None:
                     step_groups.append(current_step)
 
-                # 开始新步骤组
+                # 开始新步骤组，并吸收 pending orphan images
                 current_step = {
                     "step_no": step_no,
-                    "title": text[:80],
-                    "text_parts": [text],
-                    "image_refs": [],
+                    "title": seg_text[:80],
+                    "text_parts": [seg_text],
+                    "image_refs": list(pending_images),
                     "page_num": page_num,
                     "section": current_section,
                     "source": source,
                 }
-            else:
-                # 非步骤边界文本
-                if current_step is not None:
-                    current_step["text_parts"].append(text)
-                elif found_any_step:
-                    postamble_texts.append((text, page_num, current_section, source))
-                else:
-                    preamble_texts.append((text, page_num, current_section, source))
+                pending_images.clear()
 
         # 结束最后一个步骤组
         if current_step is not None:
@@ -594,6 +627,11 @@ class DocumentChunker:
             section_groups.setdefault(sec_key, []).append(sg)
 
         # ── Phase 3 ~ 6: 按 section 批次生成 step_card + procedure_parent ──
+        all_step_card_chunks = []  # 跨 section 收集所有 step_card
+        all_step_card_ids = []
+        all_step_titles = []
+        first_step_page = None
+        first_step_section = None
         for section_key, sec_steps in section_groups.items():
             step_card_chunks_sec = []
             step_card_ids_sec = []
@@ -705,6 +743,46 @@ class DocumentChunker:
 
                 final_chunk_text = "\n".join(parts)
 
+                # ── step_card 超长保护：超过 max_chunk_chars 时拆分 ──
+                if len(final_chunk_text) > self.max_chunk_chars and len(parts) > 1:
+                    # 策略：主 chunk 保留 step_text + annotation，
+                    # 补充内容（图片描述、OCR）拆分为 step_card_continued
+                    core_parts = [parts[0]]  # step_text 始终保留
+                    supplement_parts = []
+                    for p in parts[1:]:
+                        candidate = "\n".join(core_parts + [p])
+                        if len(candidate) <= self.max_chunk_chars:
+                            core_parts.append(p)
+                        else:
+                            supplement_parts.append(p)
+
+                    final_chunk_text = "\n".join(core_parts)
+
+                    # 生成补充 chunks（如有溢出内容）
+                    if supplement_parts:
+                        supplement_text = "\n".join(supplement_parts)
+                        # 进一步拆分超长补充文本
+                        supp_sub_texts = self._split_long_text(supplement_text) if len(supplement_text) > self.max_chunk_chars else [supplement_text]
+                        for supp_sub in supp_sub_texts:
+                            supp_sub = supp_sub.strip()
+                            if len(supp_sub) < self.min_chunk_chars:
+                                continue
+                            supp_chunk = self._create_chunk(
+                                doc_id=doc_id, version_no=version_no,
+                                chunk_index=chunk_index, chunk_type="step_card",
+                                chunk_text=supp_sub, page_num=sg["page_num"],
+                                section_title=sg["section"], metadata=meta,
+                                source=sg.get("source", "native"),
+                            )
+                            supp_chunk.extra["step_no"] = sg["step_no"]
+                            supp_chunk.extra["is_step_continuation"] = True
+                            supp_chunk.extra["image_refs"] = image_refs_list
+                            if annotation_map:
+                                supp_chunk.extra["annotation_map"] = annotation_map
+                            step_card_chunks_sec.append(supp_chunk)
+                            step_card_ids_sec.append(supp_chunk.chunk_id)
+                            chunk_index += 1
+
                 step_chunk = self._create_chunk(
                     doc_id=doc_id, version_no=version_no,
                     chunk_index=chunk_index, chunk_type="step_card",
@@ -736,31 +814,13 @@ class DocumentChunker:
                 sc.extra["prev_chunk_id"] = step_card_ids_sec[i - 1] if i > 0 else None
                 sc.extra["next_chunk_id"] = step_card_ids_sec[i + 1] if i < len(step_card_ids_sec) - 1 else None
 
-            # Phase 5: 生成 procedure_parent（每个 section 一个）
-            doc_title = meta.get("title", "")
-            section_label = section_key if section_key != "__default__" else ""
-            step_titles = [f"步骤{sg['step_no']}：{sg['title'][:40]}" for sg in sec_steps]
-            parent_text = f"{doc_title}"
-            if section_label:
-                parent_text += f"\n{section_label}"
-            parent_text += "\n" + "\n".join(step_titles)
-
-            parent_chunk = self._create_chunk(
-                doc_id=doc_id, version_no=version_no,
-                chunk_index=chunk_index, chunk_type="procedure_parent",
-                chunk_text=parent_text,
-                page_num=sec_steps[0]["page_num"] if sec_steps else None,
-                section_title=section_label or (sec_steps[0]["section"] if sec_steps else current_section),
-                metadata=meta,
-            )
-            parent_chunk.extra["child_chunk_ids"] = step_card_ids_sec
-            parent_chunk.extra["step_count"] = len(step_card_ids_sec)
-            parent_chunk_id = parent_chunk.chunk_id
-            chunk_index += 1
-
-            # 回填 parent_chunk_id
-            for sc in step_card_chunks_sec:
-                sc.extra["parent_chunk_id"] = parent_chunk_id
+            # _step_label 用于统一 parent 中的步骤标题生成
+            def _step_label(sg):
+                """生成步骤标签：heading 派生用 section_no，普通步骤用 step_no。"""
+                sno = sg.get("section_no")
+                if sg["step_no"] == 0 and sno:
+                    return f"{sno} {sg['title'][:40]}"
+                return f"步骤{sg['step_no']}：{sg['title'][:40]}"
 
             # Phase 5.5: 生成 visual_knowledge 独立 chunk（保留引用 + 复制）
             doc_title = meta.get("title", "")
@@ -781,9 +841,61 @@ class DocumentChunker:
                 chunks.append(vk_chunk)
                 chunk_index += 1
 
-            # Phase 6: 追加到结果
+            # Phase 6: 追加 step_card 到结果（parent 在循环外统一生成）
+            all_step_card_chunks.extend(step_card_chunks_sec)
+            all_step_card_ids.extend(step_card_ids_sec)
+            all_step_titles.extend(
+                [_step_label(sg) for sg in sec_steps]
+            )
+            # 记录首个 section 的页码和 section 名
+            if first_step_page is None and sec_steps:
+                first_step_page = sec_steps[0]["page_num"]
+                first_step_section = sec_steps[0].get("section") or current_section
+
+        # ── Phase 5 (unified): 生成唯一 procedure_parent ──
+        # 将所有 section 的步骤合并为一个 parent，避免多 section SOP 产生冗余 parent
+        if all_step_card_chunks:
+            doc_title = meta.get("title", "")
+            parent_text = f"{doc_title}"
+
+            # 从前导文本中提取"目的和范围"/"适用范围"等描述，提升 embedding 质量
+            preamble_summary = ""
+            for pt_text, _, _, _ in preamble_texts:
+                pt_stripped = pt_text.strip()
+                if any(kw in pt_stripped for kw in ("目的", "范围", "适用", "概述", "简介", "用于")):
+                    preamble_summary = pt_stripped[:200]
+                    break
+            # 没有关键词命中时，取第一段非空前导文本作为上下文
+            if not preamble_summary and preamble_texts:
+                for pt_text, _, _, _ in preamble_texts:
+                    pt_stripped = pt_text.strip()
+                    if len(pt_stripped) >= 20:
+                        preamble_summary = pt_stripped[:200]
+                        break
+            if preamble_summary:
+                parent_text += f"\n{preamble_summary}"
+
+            parent_text += "\n" + "\n".join(all_step_titles)
+
+            parent_chunk = self._create_chunk(
+                doc_id=doc_id, version_no=version_no,
+                chunk_index=chunk_index, chunk_type="procedure_parent",
+                chunk_text=parent_text,
+                page_num=first_step_page,
+                section_title=first_step_section or "",
+                metadata=meta,
+            )
+            parent_chunk.extra["child_chunk_ids"] = all_step_card_ids
+            parent_chunk.extra["step_count"] = len(all_step_card_ids)
+            parent_chunk_id = parent_chunk.chunk_id
+            chunk_index += 1
+
+            # 回填 parent_chunk_id
+            for sc in all_step_card_chunks:
+                sc.extra["parent_chunk_id"] = parent_chunk_id
+
             chunks.append(parent_chunk)
-            chunks.extend(step_card_chunks_sec)
+            chunks.extend(all_step_card_chunks)
 
         # ── Phase 7: 处理尾部文本 ──
         for text, pg, sect, src in postamble_texts:
@@ -1078,7 +1190,7 @@ class DocumentChunker:
         # 2. Join all paragraphs and split by clause boundaries
         full_text = "\n".join(all_para_texts)
         if not full_text.strip():
-            return table_chunks
+            return self._dedup_table_chunks(table_chunks)
 
         matches = list(_CLAUSE_RE.finditer(full_text))
 
@@ -1098,7 +1210,7 @@ class DocumentChunker:
                     metadata=meta,
                 ))
                 chunk_index += 1
-            return table_chunks + chunks
+            return self._dedup_table_chunks(table_chunks + chunks)
 
         # 3. Build clause segments
         clause_segments: List[str] = []
@@ -1145,36 +1257,54 @@ class DocumentChunker:
         if buffer:
             merged_segments.append(buffer)
 
-        # 5. Create chunks from segments
-        for seg in merged_segments:
+        # 5. Create chunks from segments with inter-clause context
+        # 提取每个条款的标题行（第一行），追加到下一个条款作为语义 overlap
+        prev_clause_title = ""  # 上一条款标题，用于跨条款上下文
+
+        for seg_idx, seg in enumerate(merged_segments):
+            # 提取当前条款标题（第一行，截断 60 字符）
+            first_line = seg.split("\n")[0].strip()[:60]
+
             if len(seg) > self.max_chunk_chars:
                 sub_texts = self._split_long_text(seg)
                 for sub in sub_texts:
                     if len(sub.strip()) < self.min_chunk_chars:
                         continue
+                    # 仅对该条款的第一个子 chunk 追加上文前缀
+                    clause_text = sub.strip()
+                    if prev_clause_title and sub == sub_texts[0]:
+                        context_line = f"[上文] {prev_clause_title}"
+                        clause_text = f"{context_line}\n{clause_text}"
                     chunks.append(self._create_chunk(
                         doc_id=doc_id,
                         version_no=version_no,
                         chunk_index=chunk_index,
                         chunk_type="clause_chunk",
-                        chunk_text=sub.strip(),
+                        chunk_text=clause_text,
                         section_title=current_section,
                         metadata=meta,
                     ))
                     chunk_index += 1
             else:
                 if len(seg.strip()) < self.min_chunk_chars:
+                    prev_clause_title = first_line
                     continue
+                clause_text = seg.strip()
+                if prev_clause_title:
+                    context_line = f"[上文] {prev_clause_title}"
+                    clause_text = f"{context_line}\n{clause_text}"
                 chunks.append(self._create_chunk(
                     doc_id=doc_id,
                     version_no=version_no,
                     chunk_index=chunk_index,
                     chunk_type="clause_chunk",
-                    chunk_text=seg.strip(),
+                    chunk_text=clause_text,
                     section_title=current_section,
                     metadata=meta,
                 ))
                 chunk_index += 1
+
+            prev_clause_title = first_line
 
         # 将暂存的 image_refs 附加到最后一个 chunk
         all_result = table_chunks + chunks
@@ -1189,7 +1319,24 @@ class DocumentChunker:
                 last.embedding_text = last.chunk_text
                 last.token_count = _estimate_tokens(last.chunk_text)
 
-        return all_result
+        return self._dedup_table_chunks(all_result)
+
+    @staticmethod
+    def _dedup_table_chunks(chunks: List["Chunk"]) -> List["Chunk"]:
+        """去除重复的 table_chunk（DOCX 页眉表格重复问题）。
+        
+        页眉表格通常仅在"页次/总页数"等细节不同，取首行作为签名。
+        """
+        seen: set = set()
+        result: List["Chunk"] = []
+        for c in chunks:
+            if c.chunk_type == "table_chunk":
+                first_line = c.chunk_text.split("\n")[0].strip()
+                if first_line in seen:
+                    continue
+                seen.add(first_line)
+            result.append(c)
+        return result
 
     def chunk_from_blocks(
         self,
@@ -1269,17 +1416,29 @@ class DocumentChunker:
             # ── Row Card 模式：每行独立成 chunk，不合并 ──
             if self.row_card_mode:
                 last_chunk = None
+                # 提取设备/分类上下文，追加到短行文本以提升 embedding 区分度
+                row_context = ""
+                if current_section:
+                    row_context = f"【{current_section}】"
+                elif meta.get("title"):
+                    import os
+                    row_context = f"【{os.path.splitext(meta['title'])[0]}】"
+
                 for para in buffered_texts:
                     para_stripped = para.strip()
                     if not para_stripped:
                         continue
+                    # 对极短行追加设备上下文前缀，提升 embedding 区分度
+                    enriched_text = para_stripped
+                    if row_context and len(para_stripped) < 200:
+                        enriched_text = f"{row_context}{para_stripped}"
                     chunk_type = "ocr_chunk" if buffered_source == "ocr" else "text_chunk"
                     chunk = self._create_chunk(
                         doc_id=doc_id,
                         version_no=version_no,
                         chunk_index=chunk_index,
                         chunk_type=chunk_type,
-                        chunk_text=para_stripped,
+                        chunk_text=enriched_text,
                         page_num=buffered_page_num,
                         section_title=current_section,
                         metadata=meta,
@@ -1505,6 +1664,9 @@ class DocumentChunker:
                 last.chunk_text += suffix
                 last.embedding_text = last.chunk_text
                 last.token_count = _estimate_tokens(last.chunk_text)
+
+        # ── Dedup: 去除重复的 table_chunk（DOCX 页眉表格重复问题）──
+        chunks = self._dedup_table_chunks(chunks)
 
         if self.parent_child:
             all_chunks = []

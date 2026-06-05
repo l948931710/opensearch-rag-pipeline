@@ -1,0 +1,577 @@
+{
+  "per_document": {
+    "pdf_sop": {
+      "metrics": {
+        "recall_1": 1.0,
+        "recall_3": 1.0,
+        "recall_5": 1.0,
+        "mrr": 1.0,
+        "ndcg": 1.0,
+        "evidence_hit_rate": 1.0,
+        "image_table_accuracy": 0.2222222222222222,
+        "type_accuracy": 0.2727272727272727,
+        "source_location_accuracy": 1.0
+      },
+      "num_chunks": 15,
+      "num_gt": 11,
+      "matched": 11,
+      "types": {
+        "table_chunk": 3,
+        "text_chunk": 1,
+        "procedure_parent": 1,
+        "step_card": 10
+      }
+    },
+    "docx_water": {
+      "metrics": {
+        "recall_1": 0.8571428571428571,
+        "recall_3": 0.8571428571428571,
+        "recall_5": 0.8571428571428571,
+        "mrr": 0.8571428571428571,
+        "ndcg": 0.7857142857142857,
+        "evidence_hit_rate": 0.8571428571428571,
+        "image_table_accuracy": 0.5,
+        "type_accuracy": 0.2857142857142857,
+        "source_location_accuracy": 0.0
+      },
+      "num_chunks": 8,
+      "num_gt": 7,
+      "matched": 6,
+      "types": {
+        "text_chunk": 2,
+        "procedure_parent": 1,
+        "step_card": 5
+      }
+    },
+    "docx_qc": {
+      "metrics": {
+        "recall_1": 1.0,
+        "recall_3": 1.0,
+        "recall_5": 1.0,
+        "mrr": 1.0,
+        "ndcg": 0.8919312169312169,
+        "evidence_hit_rate": 1.0,
+        "image_table_accuracy": 0.0,
+        "type_accuracy": 0.16666666666666666,
+        "source_location_accuracy": 0.0
+      },
+      "num_chunks": 7,
+      "num_gt": 12,
+      "matched": 12,
+      "types": {
+        "table_chunk": 1,
+        "text_chunk": 6
+      }
+    },
+    "docx_sop": {
+      "metrics": {
+        "recall_1": 1.0,
+        "recall_3": 1.0,
+        "recall_5": 1.0,
+        "mrr": 1.0,
+        "ndcg": 0.8664965986394558,
+        "evidence_hit_rate": 1.0,
+        "image_table_accuracy": 1.0,
+        "type_accuracy": 0.6428571428571429,
+        "source_location_accuracy": 0.0
+      },
+      "num_chunks": 9,
+      "num_gt": 14,
+      "matched": 14,
+      "types": {
+        "table_chunk": 1,
+        "procedure_parent": 1,
+        "step_card": 7
+      }
+    },
+    "xlsx_sop": {
+      "metrics": {
+        "recall_1": 1.0,
+        "recall_3": 1.0,
+        "recall_5": 1.0,
+        "mrr": 1.0,
+        "ndcg": 0.8401515151515152,
+        "evidence_hit_rate": 0.9090909090909091,
+        "image_table_accuracy": 0.6,
+        "type_accuracy": 0.36363636363636365,
+        "source_location_accuracy": 1.0
+      },
+      "num_chunks": 4,
+      "num_gt": 11,
+      "matched": 11,
+      "types": {
+        "text_chunk": 4
+      }
+    },
+    "pptx_training": {
+      "metrics": {
+        "recall_1": 0.8461538461538461,
+        "recall_3": 0.8461538461538461,
+        "recall_5": 0.8461538461538461,
+        "mrr": 0.8461538461538461,
+        "ndcg": 0.608556721056721,
+        "evidence_hit_rate": 0.8461538461538461,
+        "image_table_accuracy": 0.9166666666666666,
+        "type_accuracy": 0.3076923076923077,
+        "source_location_accuracy": 0.8461538461538461
+      },
+      "num_chunks": 19,
+      "num_gt": 13,
+      "matched": 11,
+      "types": {
+        "text_chunk": 10,
+        "ocr_chunk": 9
+      }
+    }
+  },
+  "aggregate_metrics": {
+    "recall_1": 0.9505494505494506,
+    "recall_3": 0.9505494505494506,
+    "recall_5": 0.9505494505494506,
+    "mrr": 0.9505494505494506,
+    "ndcg": 0.8321417229155325,
+    "evidence_hit_rate": 0.9353979353979353,
+    "image_table_accuracy": 0.5398148148148149,
+    "type_accuracy": 0.33988233988233985,
+    "source_location_accuracy": 0.4743589743589744
+  },
+  "total_gt_match": "65/68",
+  "failure_summary": {
+    "流程步骤断裂": 17,
+    "图文错配": 17,
+    "chunk 过小": 2,
+    "parent title 缺失": 3,
+    "chunk_type_mismatch": 26,
+    "GT_NOT_MATCHED": 3,
+    "source location 缺失": 3,
+    "chunk 过大": 1
+  },
+  "all_failures": [
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤1.1 收取交货单",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤1.1 收取交货单",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤1.2 核对错误处理",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤1.2 核对错误处理",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤1.3 抄录订单信息",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤1.3 抄录订单信息",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤2 交货单分类",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤2 交货单分类",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤3.1 U8扫码报检",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤3.1 U8扫码报检",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤3.2 扫码枪扫描",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤3.2 扫码枪扫描",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤4 报检填写",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤5 群通知完成",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤5 群通知完成",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "chunk 过小",
+      "detail": "len=26: | 时间 | 机台 | 数量 | 货号（商检号） |",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "parent title 缺失",
+      "detail": "step_card without section_title",
+      "doc": "pdf_sop"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "作业准备 — 材料与时间要求",
+      "detail": "Expected procedure_parent, got text_chunk",
+      "doc": "docx_water"
+    },
+    {
+      "type": "GT_NOT_MATCHED",
+      "gt_label": "作业说明 — 测试时间与目的",
+      "best_score": 0.25,
+      "detail": "GT '作业说明 — 测试时间与目的' not matched (best score=0.25)",
+      "doc": "docx_water"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤2 — 密封吸管孔与安装盖塞",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "docx_water"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤2 — 密封吸管孔与安装盖塞",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "docx_water"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤4 — 斜放70°旋转360°漏水测试",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "docx_water"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤5 — 整理漏水记录并报告",
+      "detail": "Expected step_card, got procedure_parent",
+      "doc": "docx_water"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤5 — 整理漏水记录并报告",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "docx_water"
+    },
+    {
+      "type": "parent title 缺失",
+      "detail": "step_card without section_title",
+      "doc": "docx_water"
+    },
+    {
+      "type": "source location 缺失",
+      "detail": "All page_num=None",
+      "doc": "docx_water"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程1-4 — 标签设计→采购→到货→验收",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程5a — 纸箱标签盖章印刷",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "流程5a — 纸箱标签盖章印刷",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程5b — 不干胶标签打印机管理",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "流程5b — 不干胶标签打印机管理",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程5c — 内袋喷码管理",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "流程5c — 内袋喷码管理",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程6-8 — 万年历/日期尺寸/留样要求",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "流程6-8 — 万年历/日期尺寸/留样要求",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程9-11 — 停机/交接/入库确认",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程12-14 — 批次完工保存与数量核对",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程15-17 — 不合格标签处置与仓库安全",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "流程18-22 — 变更管理/试验/培训/百胜执行",
+      "detail": "Expected clause_chunk, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "图示 — 标签检验要点示例(图1/2/3)",
+      "detail": "Expected visual_knowledge, got text_chunk",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "图示 — 标签检验要点示例(图1/2/3)",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "source location 缺失",
+      "detail": "All page_num=None",
+      "doc": "docx_qc"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "文档基本信息 — 编号/版本/目的/范围",
+      "detail": "Expected text_chunk, got step_card",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "职责 — QC当班检验职责",
+      "detail": "Expected text_chunk, got step_card",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "检验频率",
+      "detail": "Expected text_chunk, got procedure_parent",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "异常情况及措施 — 不合格品处理",
+      "detail": "Expected text_chunk, got step_card",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "文件及记录清单",
+      "detail": "Expected text_chunk, got procedure_parent",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "chunk 过小",
+      "detail": "len=14: 4.1 检验频率: 每班4次",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "parent title 缺失",
+      "detail": "step_card without section_title",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "source location 缺失",
+      "detail": "All page_num=None",
+      "doc": "docx_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤1-调水平",
+      "detail": "Expected step_card, got text_chunk",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤2-仪器开启",
+      "detail": "Expected step_card, got text_chunk",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤2-仪器开启",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤3-试样准备",
+      "detail": "Expected step_card, got text_chunk",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤4-天平调零",
+      "detail": "Expected step_card, got text_chunk",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤5-样品称重",
+      "detail": "Expected step_card, got text_chunk",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "流程步骤断裂",
+      "gt_label": "步骤6-仪器关闭",
+      "detail": "Expected step_card, got text_chunk",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "步骤6-仪器关闭",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "日常使用维护表",
+      "detail": "Expected table_chunk, got text_chunk",
+      "doc": "xlsx_sop"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "原料类-吸塑材料与配方表",
+      "detail": "Expected visual_knowledge, got text_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "酱料杯系列-规格参数",
+      "detail": "Expected visual_knowledge, got text_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "吸塑打包桶系列-PP与PET",
+      "detail": "Expected visual_knowledge, got text_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "打包桶规格详表",
+      "detail": "Expected table_chunk, got text_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "美式餐盒-常规与轻系列规格",
+      "detail": "Expected visual_knowledge, got ocr_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "图文错配",
+      "gt_label": "美式餐盒-常规与轻系列规格",
+      "detail": "Expected images but chunk has 0 images",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "双色系列打包盒与英文规格",
+      "detail": "Expected visual_knowledge, got ocr_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "PP铰链餐盒英文规格表",
+      "detail": "Expected table_chunk, got ocr_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "盘子系列-MFPP/HIPS规格",
+      "detail": "Expected visual_knowledge, got text_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk_type_mismatch",
+      "gt_label": "PET杯子系列-规格与产品照",
+      "detail": "Expected visual_knowledge, got ocr_chunk",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "GT_NOT_MATCHED",
+      "gt_label": "仿PET杯-PP冷饮杯系列",
+      "best_score": 0.0,
+      "detail": "GT '仿PET杯-PP冷饮杯系列' not matched (best score=0.00)",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "GT_NOT_MATCHED",
+      "gt_label": "PP/HIPS杯-医药杯/航空杯",
+      "best_score": 0.14285714285714285,
+      "detail": "GT 'PP/HIPS杯-医药杯/航空杯' not matched (best score=0.14)",
+      "doc": "pptx_training"
+    },
+    {
+      "type": "chunk 过大",
+      "detail": "len=987: 5cm\n107MM FLAT\nLIDS-SLOTTED 3.2 50*10 56*23*22.5cm",
+      "doc": "pptx_training"
+    }
+  ]
+}

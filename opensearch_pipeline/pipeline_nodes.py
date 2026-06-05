@@ -1501,7 +1501,7 @@ def _detect_step_patterns(doc: dict) -> bool:
     cat_l2 = str(doc.get("category_l2", "")).lower()
     title = str(doc.get("title", "")).lower()
 
-    sop_keywords = ["sop", "manual", "guide", "操作", "手册", "作业指导", "流程", "规程"]
+    sop_keywords = ["sop", "manual", "guide", "操作", "手册", "作业指导", "作业导书", "流程", "规程", "检验", "培训"]
     is_sop_like = any(kw in cat_l1 or kw in cat_l2 or kw in title for kw in sop_keywords)
     if not is_sop_like:
         return False
@@ -1602,6 +1602,8 @@ def _enrich_existing_image_refs(blocks: list, assets: list, doc: dict) -> list:
                     "oss_key": asset.get("oss_key", ""),
                     "ocr_text": asset.get("ocr_text", ""),
                     "visual_summary": asset.get("visual_summary", ""),
+                    "image_category": asset.get("image_category", ""),
+                    "vlm_annotation_map": asset.get("vlm_annotation_map", {}),
                     "funnel_status": status,
                 })
 
@@ -1657,6 +1659,8 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 "oss_key": asset.get("oss_key", ""),
                 "ocr_text": asset.get("ocr_text", ""),
                 "visual_summary": asset.get("visual_summary", ""),
+                "image_category": asset.get("image_category", ""),
+                "vlm_annotation_map": asset.get("vlm_annotation_map", {}),
                 "funnel_status": status,
                 "part_labels": asset.get("part_labels", []),
             })
@@ -1761,28 +1765,220 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                     unmatched.append(va)
 
         # ── 策略 1b: page_num 页级匹配（PDF / PPTX） ──
+        # 优先尝试标注编号匹配（图③ → asset with ③），fallback 到页末
         if page_only_assets:
-            page_to_assets = {}
+            import re
+            # 圈号字符 → 数字映射
+            _CIRCLED_NUMS = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+            _FIG_REF_RE = re.compile(r'[图如].*?([' + _CIRCLED_NUMS + r'])')
+
+            # 重新计算 page_last_block_idx — 只统计文本 blocks（排除 ocr_text）
+            # 这确保 image_ref 插在步骤文本后面，不会跑到 OCR dump 后面
+            text_page_last = {}
+            for i, block in enumerate(blocks):
+                bt = (block.get("block_type") if isinstance(block, dict)
+                      else getattr(block, "block_type", ""))
+                if bt in ("ocr_text", "image_ref"):
+                    continue  # 跳过 OCR 和已有的 image_ref
+                pg = (block.get("page_num") if isinstance(block, dict)
+                      else getattr(block, "page_num", None))
+                if pg is not None:
+                    text_page_last[pg] = i
+
+            # 构建步骤文本中的标注引用索引：(page_num, circled_char) → block_index
+            # 限制在同一页匹配，因为圈号 ①②③ 在不同页中含义不同
+            # 例如 p1 的 "图③" = 纸箱堆码，p2 的 ③ = 供应商管理菜单
+            anno_ref_index = {}  # (page_num, circled_char) → block_idx
+            for i, block in enumerate(blocks):
+                bt = (block.get("block_type") if isinstance(block, dict)
+                      else getattr(block, "block_type", ""))
+                if bt not in ("heading", "paragraph"):
+                    continue
+                text = (block.get("text", "") if isinstance(block, dict)
+                        else getattr(block, "text", ""))
+                bpg = (block.get("page_num") if isinstance(block, dict)
+                       else getattr(block, "page_num", None))
+                for m in _FIG_REF_RE.finditer(text):
+                    circled = m.group(1)
+                    key = (bpg, circled)
+                    if key not in anno_ref_index:
+                        anno_ref_index[key] = i
+
+            # 分离：有标注号的 vs 无标注号的（同页匹配）
+            anno_matched = []  # (block_idx, va)
+            page_fallback = []  # va without annotation match
+
             for va in page_only_assets:
+                ann_map = va.get("vlm_annotation_map", {})
+                img_page = va.get("page_num")
+                matched = False
+                # 只匹配圈号字符（①②③...⑳），跳过非圈号 key（红箭头1、红框上部等）
+                for ann_key in ann_map:
+                    if ann_key not in _CIRCLED_NUMS:
+                        continue  # 非圈号 key，跳过
+                    key = (img_page, ann_key)
+                    if key in anno_ref_index:
+                        anno_matched.append((anno_ref_index[key], va))
+                        matched = True
+                        break
+                if not matched:
+                    page_fallback.append(va)
+
+            # 标注号匹配的图片 → 插到对应步骤后面
+            for block_idx, va in anno_matched:
+                pg = va["page_num"]
+                img_block = {
+                    "block_type": "image_ref",
+                    "text": "",
+                    "page_num": pg,
+                    "section_path": None,
+                    "source": "multimodal",
+                    "extra": va,
+                }
+                insertions.append((block_idx, [img_block]))
+
+            # 无标注号的图片 → 智能分配到该页各文本 block
+            # 策略：优先分配到含有图片引用（图①②等）的 block 后面
+            page_to_assets = {}
+            for va in page_fallback:
                 pg = va["page_num"]
                 page_to_assets.setdefault(pg, []).append(va)
 
             for pg, p_assets in sorted(page_to_assets.items()):
-                if pg in page_last_block_idx:
-                    insert_after = page_last_block_idx[pg]
-                    img_blocks = []
-                    for va in p_assets:
-                        img_blocks.append({
-                            "block_type": "image_ref",
-                            "text": "",
-                            "page_num": pg,
-                            "section_path": None,
-                            "source": "multimodal",
-                            "extra": va,
-                        })
-                    insertions.append((insert_after, img_blocks))
-                else:
-                    unmatched.extend(p_assets)
+                # 按 image_index 排序（提取顺序 ≈ 页面上从上到下）
+                p_assets.sort(key=lambda a: a.get("image_index", 0))
+
+                # 找出该页所有文本 block 的索引（排除 ocr_text / image_ref）
+                page_text_indices = []
+                for i, block in enumerate(blocks):
+                    bt = (block.get("block_type") if isinstance(block, dict)
+                          else getattr(block, "block_type", ""))
+                    if bt in ("ocr_text", "image_ref"):
+                        continue
+                    bpg = (block.get("page_num") if isinstance(block, dict)
+                           else getattr(block, "page_num", None))
+                    if bpg == pg:
+                        page_text_indices.append(i)
+
+                if not page_text_indices:
+                    insert_target = text_page_last.get(pg, page_last_block_idx.get(pg))
+                    if insert_target is not None:
+                        img_blocks = [{
+                            "block_type": "image_ref", "text": "",
+                            "page_num": pg, "section_path": None,
+                            "source": "multimodal", "extra": va,
+                        } for va in p_assets]
+                        insertions.append((insert_target, img_blocks))
+                    else:
+                        unmatched.extend(p_assets)
+                    continue
+
+                # 分析每个 block 是否引用了图片（图①②等）
+                # 已被 annotation 精确匹配的编号排除（仅当前页）
+                already_matched_circled = set()
+                for _, va in anno_matched:
+                    if va.get("page_num") == pg:
+                        already_matched_circled.update(va.get("vlm_annotation_map", {}).keys())
+
+                # 按 block 顺序，收集未被满足的图片引用
+                blocks_with_refs = []   # (block_idx, ref_count) — 有图片引用但未被 annotation 满足
+                blocks_without_refs = [] # block_idx — 无图片引用
+                for bidx in page_text_indices:
+                    block = blocks[bidx]
+                    text = (block.get("text", "") if isinstance(block, dict)
+                            else getattr(block, "text", ""))
+                    # 找该 block 中引用了哪些图片编号
+                    refs_in_block = set()
+                    for m in _FIG_REF_RE.finditer(text):
+                        c = m.group(1)
+                        if c not in already_matched_circled:
+                            refs_in_block.add(c)
+                    if refs_in_block:
+                        blocks_with_refs.append((bidx, len(refs_in_block)))
+                    else:
+                        blocks_without_refs.append(bidx)
+
+                # 分配策略：
+                # 1. 先满足有图片引用的 blocks（按引用数量分配图片）
+                # 2. 剩余图片分配给无引用的 blocks
+                # 图片选择：优先用 visual_summary 关键词与 block 文本匹配
+                img_queue = list(p_assets)
+
+                def _pick_best(queue, block_text, n):
+                    """从 queue 中选出与 block_text 最匹配的 n 张图片。
+                    
+                    匹配策略：用 character bigram 重叠计分。
+                    避免 jieba 分词边界导致"扫码枪" vs "扫描枪"不匹配。
+                    visual_summary 权重 3x，ocr_text 权重 1x。
+                    """
+                    if n >= len(queue):
+                        picked = list(queue)
+                        queue.clear()
+                        return picked
+                    
+                    def _bigrams(text):
+                        """提取中文 2-gram + 3-gram 字符集合"""
+                        s = set()
+                        for i in range(len(text) - 1):
+                            s.add(text[i:i+2])
+                        for i in range(len(text) - 2):
+                            s.add(text[i:i+3])
+                        return s
+                    
+                    block_bg = _bigrams(block_text)
+                    
+                    scored = []
+                    for i, va in enumerate(queue):
+                        vs = va.get("visual_summary", "") or ""
+                        ot = va.get("ocr_text", "") or ""
+                        vs_score = len(block_bg & _bigrams(vs)) * 3 if vs else 0
+                        ot_score = len(block_bg & _bigrams(ot)) if ot else 0
+                        scored.append((vs_score + ot_score, i))
+                    
+                    # 按匹配分降序，同分时保持原序
+                    scored.sort(key=lambda x: (-x[0], x[1]))
+                    pick_indices = sorted([scored[j][1] for j in range(n)])
+                    
+                    picked = [queue[i] for i in pick_indices]
+                    for i in reversed(pick_indices):
+                        queue.pop(i)
+                    return picked
+
+                for bidx, ref_count in blocks_with_refs:
+                    if not img_queue:
+                        break
+                    block_text = (blocks[bidx].get("text", "") if isinstance(blocks[bidx], dict)
+                                  else getattr(blocks[bidx], "text", ""))
+                    n_assign = min(ref_count, len(img_queue))
+                    picked = _pick_best(img_queue, block_text, n_assign)
+                    for va in picked:
+                        insertions.append((bidx, [{
+                            "block_type": "image_ref", "text": "",
+                            "page_num": pg, "section_path": None,
+                            "source": "multimodal", "extra": va,
+                        }]))
+
+                # 剩余图片分配到无引用的 blocks（均匀分配）
+                if img_queue and blocks_without_refs:
+                    n_remain = len(img_queue)
+                    n_targets = len(blocks_without_refs)
+                    for img_i, va in enumerate(img_queue):
+                        block_j = min(int(img_i * n_targets / n_remain), n_targets - 1)
+                        insertions.append((blocks_without_refs[block_j], [{
+                            "block_type": "image_ref", "text": "",
+                            "page_num": pg, "section_path": None,
+                            "source": "multimodal", "extra": va,
+                        }]))
+                elif img_queue:
+                    # 最终 fallback：全部插到页末
+                    insert_target = text_page_last.get(pg, page_last_block_idx.get(pg))
+                    if insert_target is not None:
+                        for va in img_queue:
+                            insertions.append((insert_target, [{
+                                "block_type": "image_ref", "text": "",
+                                "page_num": pg, "section_path": None,
+                                "source": "multimodal", "extra": va,
+                            }]))
 
         # 从后往前插入，保持前面的索引不变
         for insert_after, img_blocks in sorted(insertions, key=lambda x: x[0], reverse=True):

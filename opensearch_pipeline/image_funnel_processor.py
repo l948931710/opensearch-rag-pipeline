@@ -137,11 +137,14 @@ class ImageFunnelProcessor:
             
             if is_text_heavy and img_cat not in _PHOTO_CATS:
                 # 文字密集 + VLM 未识别为实物照片 → 降级为文本段落
+                # 仍保留 VLM 元数据（annotation_map / visual_summary），供下游步骤绑定使用
                 print(f"    [Funnel 2→3] Routed text-heavy image to text: {filename} (cat={img_cat}, text_len={len(ocr_text)})")
                 return {
                     "status": "ROUTE_TO_TEXT",
                     "ocr_text": ocr_text.strip(),
                     "image_category": img_cat,
+                    "visual_summary": caption,
+                    "vlm_annotation_map": anno_map,
                     "width": width,
                     "height": height,
                     "file_size_kb": file_size_kb,
