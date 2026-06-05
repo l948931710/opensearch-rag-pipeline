@@ -1625,6 +1625,46 @@ def _enrich_existing_image_refs(blocks: list, assets: list, doc: dict) -> list:
     return enriched
 
 
+def _content_match_steps(img_text: str, candidates: list) -> tuple:
+    """把图片的 visual_summary/ocr 文本匹配到最相关的候选步骤。
+
+    candidates: list of (key, text)。用 IDF 式加权——只在某个步骤里出现的稀有词
+    （如"归零"仅 step4 有）权重高，跨步骤通用词（如"天平"）权重低，避免被通用词带偏。
+    XLSX 的 anchor_row 常不可靠/聚簇，而视觉描述里的动作关键词能更准地定位步骤。
+
+    Returns: (best_key | None, best_score, second_score)
+    """
+    import re
+    from collections import Counter
+
+    def _toks(s: str) -> set:
+        s = (s or "").lower()
+        cjk = re.findall(r'[一-鿿]', s)
+        bigrams = {cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1)}
+        alnum = set(re.findall(r'[a-z0-9]{2,}', s))
+        return bigrams | alnum
+
+    cand = [(k, _toks(t)) for k, t in candidates]
+    if not cand:
+        return None, 0.0, 0.0
+    if len(cand) < 2:
+        return cand[0][0], 0.0, 0.0
+
+    df = Counter()
+    for _, toks in cand:
+        for t in toks:
+            df[t] += 1
+
+    img_toks = _toks(img_text)
+    scored = sorted(
+        ((sum(1.0 / df[t] for t in (img_toks & toks)), k) for k, toks in cand),
+        key=lambda x: x[0], reverse=True,
+    )
+    best_score, best_key = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    return best_key, best_score, second
+
+
 def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
     """
     启发式图片注入 — 按 page_num 匹配 → 步骤边界 fallback → 末尾追加。
@@ -2352,27 +2392,48 @@ def node_chunk_documents(ctx: dict):
                         }
 
                     vec_imgs = [a for a in assets if a.get("status") == "ROUTE_TO_VECTOR"]
-                    unbound = []
+                    bound_nos = set()  # step_no already assigned an image
+
+                    # 优先级 0：内容匹配（视觉描述/ocr ↔ 步骤文本）。
+                    # 「操作示图」列的 figure_no（图N）多为按提取顺序自动编号、anchor_row 也常不可靠，
+                    # 而图片描述里的动作关键词（归零/读数/电源）能更准地定位步骤。仅在强且唯一匹配时
+                    # 按内容绑定；其余回退到 figure_no / anchor 顺序（保护描述稀疏的图片不被误绑）。
+                    cms = []  # (margin, score, step_no, asset)
                     for a in vec_imgs:
+                        it = ((a.get("visual_summary") or "") + " " + (a.get("ocr_text") or "")).strip()
+                        cands = [(c.extra.get("step_no"), c.chunk_text) for c in step_cards]
+                        sno, sc, sec = _content_match_steps(it, cands)
+                        cms.append((sc - sec, sc, sno, a))
+                    cms.sort(key=lambda x: (-x[0], -x[1]))  # 置信度（分差）高的先绑
+                    remaining = list(vec_imgs)
+                    for margin, sc, sno, a in cms:
+                        if sno is not None and sc >= 0.8 and margin >= 0.5 and sno not in bound_nos:
+                            step_by_no[sno].extra.setdefault("image_refs", []).append(_img_entry(a))
+                            bound_nos.add(sno)
+                            remaining.remove(a)
+
+                    # 优先级 1：figure_no 数字 == 步骤号（图N→步骤N）/步骤文本显式引用图号；
+                    #           仅绑到尚未被内容匹配占用的步骤
+                    unbound = []
+                    for a in remaining:
                         target = None
                         fno = str(a.get("figure_no") or "")
-                        # (a) 图号数字 == 步骤号（「操作示图」列 图N 对应步骤 N）
                         mnum = _re_fig.search(r"(\d+)", fno)
-                        if mnum:
+                        if mnum and int(mnum.group(1)) not in bound_nos:
                             target = step_by_no.get(int(mnum.group(1)))
-                        # (b) 步骤文本显式引用该图号（如图N）
                         if target is None and fno:
                             for c in step_cards:
-                                if fno in (c.extra.get("figure_refs") or []):
+                                if fno in (c.extra.get("figure_refs") or []) and c.extra.get("step_no") not in bound_nos:
                                     target = c
                                     break
                         if target is not None:
                             target.extra.setdefault("image_refs", []).append(_img_entry(a))
+                            bound_nos.add(target.extra.get("step_no"))
                         else:
                             unbound.append(a)
 
-                    # (c) 剩余无图号图片：按 anchor_row 顺序就近补到尚无图的步骤
-                    open_steps = [c for c in step_cards if not c.extra.get("image_refs")]
+                    # 优先级 2：剩余图片按 anchor_row 顺序补到仍空的步骤（旧逻辑）
+                    open_steps = [c for c in step_cards if c.extra.get("step_no") not in bound_nos]
                     unbound.sort(key=lambda a: (a.get("anchor_row") or 0))
                     if unbound and open_steps:
                         n = len(open_steps)
