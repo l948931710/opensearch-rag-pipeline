@@ -89,6 +89,10 @@ class AskRequest(BaseModel):
         description="用户部门代码，直接传入时优先使用",
         pattern=r'^[\w\-\u4e00-\u9fff]{0,64}$',
     )
+    pure_text: Optional[bool] = Field(
+        None,
+        description="纯文本开关：None 取全局 RAG_PURE_TEXT；True 仅文字回答（不穿插图片）",
+    )
 
 
 class SearchRequest(BaseModel):
@@ -279,6 +283,7 @@ async def ask(req: AskRequest):
             history=merged_history if merged_history else None,
             max_tokens=req.max_tokens or 2048,
             temperature=req.temperature or 0.1,
+            pure_text=req.pure_text,
         )
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
@@ -376,6 +381,7 @@ async def ask_stream(req: AskRequest):
                 history=merged_history if merged_history else None,
                 max_tokens=req.max_tokens or 2048,
                 temperature=req.temperature or 0.1,
+                pure_text=req.pure_text,
             ):
                 yield event
 

@@ -200,6 +200,13 @@ class RAGConfig:
     #    会完全不同（RRF 分数 ∈ [0, 1]），必须重新标定这两个值。
     score_threshold_high: float = 8.0
     score_threshold_medium: float = 5.0
+    # ── 纯文本生成开关（pure-text mode） ─────────────────────────
+    # True  → 生成纯文字回答：system prompt 去掉 <<IMG:N>> 图片插入规则，
+    #         context 不再注入 <<IMG:N>> 标记，卡片只展示文字（图片语义仍以
+    #         visual_summary 文本形式保留在 context 中，不丢失信息）。
+    # False → 默认的图文穿插模式（multimodal）。
+    # 经 RAG_PURE_TEXT 环境变量覆盖；亦可在 generate_answer 调用处按请求覆盖。
+    pure_text: bool = False
 
 
 @dataclass
@@ -440,6 +447,7 @@ def load_config() -> PipelineConfig:
             max_context_chars=_env_int("RAG_MAX_CONTEXT_CHARS", 6000),
             api_port=_env_int("RAG_API_PORT", 8000),
             max_history_turns=_env_int("RAG_MAX_HISTORY_TURNS", 10),
+            pure_text=_env_bool("PURE_TEXT", False),               # RAG_PURE_TEXT
         ),
     )
 

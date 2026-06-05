@@ -459,12 +459,15 @@ def _process_rag_query(
             return
 
         # 2. LLM 生成（传入多轮对话历史）
+        #    纯文本模式（RAG_PURE_TEXT）下生成纯文字回答，下游跳过图文穿插
+        pure_text = get_config().rag.pure_text
         result = generate_answer(
             question,
             chunks,
             history=list(history),
             max_tokens=2048,
             temperature=0.1,
+            pure_text=pure_text,
         )
 
         t_llm = time.time()
@@ -474,9 +477,9 @@ def _process_rag_query(
         # 3. 追加到会话历史（供下轮使用）
         append_to_history(session_key, question, result["answer"])
 
-        # 4. 构建 content_blocks（图文穿插）
+        # 4. 构建 content_blocks（图文穿插）；纯文本模式下不展示图片
         from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json
-        content_blocks = build_content_blocks(result["answer"], chunks)
+        content_blocks = [] if pure_text else build_content_blocks(result["answer"], chunks)
         content_blocks_json_str = content_blocks_to_json(content_blocks)
 
         # 5. 落库（包含 content_blocks_json 供回调重建）
