@@ -59,6 +59,10 @@ class UnifiedExtractor:
         else:
             self.ocr_client = ocr_client
         self.simulate = simulate
+        self.config = cfg
+        # 可选：运行级成本熔断器（由 orchestrator 注入，跨文档累计运行预算）。
+        # 为空时 vlm_rebuilder 会按 cfg 现造一个做单文档闸。
+        self.cost_breaker = None
 
     def extract(self, task: dict) -> ExtractionResult:
         """
@@ -162,6 +166,15 @@ class UnifiedExtractor:
         # OCR fallback 判断
         if self._needs_ocr(result):
             result = self._apply_ocr_fallback(task, result)
+
+        # ── Increment 1: VLM 版面重建（逐页升级不可提取页）──
+        # 默认关闭（cfg.rebuild.enabled=False）→ no-op；开启后受成本熔断器约束。
+        try:
+            from opensearch_pipeline.extraction.vlm_rebuilder import maybe_rebuild_pdf
+            result = maybe_rebuild_pdf(task, result, self.config,
+                                       breaker=getattr(self, "cost_breaker", None))
+        except Exception as _e:
+            print(f"    ⚠️ [vlm_rebuilder] skipped (non-fatal): {_e}", flush=True)
 
         return result
 
