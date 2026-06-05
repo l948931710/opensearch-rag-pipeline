@@ -280,9 +280,41 @@ class UnifiedExtractor:
 
         try:
             import openpyxl
-            wb = openpyxl.load_workbook(local_path, read_only=True, data_only=True)
+            # read_only=False 才能读到合并单元格几何（merged_cells），而合并单元格常承载
+            # 分组键（清扫基准书的"类别"列、规格书的分区）。
+            # 兜底按"行数"而非文件大小判断：图文型 xlsx（清扫基准书/规格书）文件可达数十 MB，
+            # 但只有几十行，应当展开合并；真正的数据导出表（数十万~百万行）才保持 read_only 防止内存暴涨。
+            _use_ro = True
+            try:
+                _fsz = os.path.getsize(local_path)
+                _probe = openpyxl.load_workbook(local_path, read_only=True, data_only=True)
+                _maxr = max((ws.max_row or 0) for ws in _probe.worksheets) if _probe.worksheets else 0
+                _probe.close()
+                _use_ro = (_maxr > 50000) or (_fsz > 100 * 1024 * 1024)
+            except Exception:
+                _use_ro = True
+            wb = openpyxl.load_workbook(local_path, read_only=_use_ro, data_only=True)
             for sheet_idx, sheet_name in enumerate(wb.sheetnames):
                 ws = wb[sheet_name]
+
+                # 合并单元格"向下填充"：纵向合并的首格值（如"类别"列）传播到该列下方各行，
+                # 避免下游丢失分组键。横向合并不填充（标题只出现一次）。
+                merge_fill = {}
+                if not _use_ro:
+                    try:
+                        for mr in ws.merged_cells.ranges:
+                            tl = ws.cell(mr.min_row, mr.min_col).value
+                            if tl is None:
+                                continue
+                            # 只向下传播"短标签"型合并值（分组键，如类别名"设备本体"）。
+                            # 跨行合并的长正文/步骤说明若被复制，会生成重复数据行，
+                            # 破坏 step 检测与图文绑定（如过程检验 SOP 的步骤被复制两次）。
+                            if len(str(tl).strip()) > 20:
+                                continue
+                            for rr in range(mr.min_row + 1, mr.max_row + 1):
+                                merge_fill[(rr, mr.min_col)] = tl
+                    except Exception:
+                        pass
 
                 # sheet 标题作为 heading block（默认 section_type=cleaning_items）
                 sheet_heading = ExtractedBlock(
@@ -301,7 +333,11 @@ class UnifiedExtractor:
                 part_col_idx = None
 
                 for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-                    cells = [str(c) if c is not None else "" for c in row]
+                    cells = []
+                    for ci0, c in enumerate(row):
+                        if c is None and (row_idx, ci0 + 1) in merge_fill:
+                            c = merge_fill[(row_idx, ci0 + 1)]
+                        cells.append(str(c) if c is not None else "")
                     all_rows.append((row_idx, cells))
 
                     # 检测表头行（命中 ≥2 个关键词）

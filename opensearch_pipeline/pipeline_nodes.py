@@ -2406,10 +2406,50 @@ def node_chunk_documents(ctx: dict):
                         # 含产品图/示意图的 slide → visual_knowledge
                         c.chunk_type = "visual_knowledge"
 
+        # ─── 设备清扫基准书：把部位照片绑定到对应"清扫部位" chunk ───
+        # 提取阶段已为每张图片标注 part_labels（匹配清扫部位名）与 anchor_row。
+        # 用 part_labels 在 chunk 文本中找对应部位行绑定；未匹配的图片仍作独立 image chunk。
+        ce_bound_fns = set()
+        if xlsx_layout_type == "equipment_cleaning_standard" and global_split_mode == "dynamic":
+            assets = doc.get("assets", [])
+            if assets:
+                dept_code = doc.get("owner_dept", "unknown")
+                source_key = doc.get("source_key", "")
+                if source_key.startswith("raw/"):
+                    _p = source_key.split("/")
+                    if len(_p) > 1:
+                        dept_code = _p[1]
+                version = doc["version_no"]
+                d_id = doc["doc_id"]
+                for a in assets:
+                    if a.get("status") != "ROUTE_TO_VECTOR":
+                        continue
+                    labels = [l for l in (a.get("part_labels") or []) if l]
+                    if not labels:
+                        continue
+                    cands = [c for c in chunks if c.chunk_type != "image"
+                             and any(lbl in (c.chunk_text or "") for lbl in labels)]
+                    if not cands:
+                        continue
+                    target = min(cands, key=lambda c: len(c.chunk_text or ""))
+                    fn = a.get("filename", "")
+                    target.extra.setdefault("image_refs", []).append({
+                        "filename": fn,
+                        "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                        "anchor_row": a.get("anchor_row"),
+                        "part_labels": labels,
+                        "annotation_num": a.get("annotation_num"),
+                        "image_category": a.get("image_category", "unknown"),
+                        "visual_summary": a.get("visual_summary", ""),
+                        "ocr_text": a.get("ocr_text", ""),
+                    })
+                    ce_bound_fns.add(fn)
+
         # ─── Visual Embedding & Image Chunking ───
         # Step 模式下图片已经绑定到 step_card，不再创建独立 image chunk。
         # 结构化 XLSX 版式（procedure_image_guide / product_spec）也已将图片绑定到对应卡片，
         # slide 模式也已按 page_num 绑定；以上均跳过独立 image chunk 以避免重复。
+        # 设备清扫基准书：仅跳过已按部位绑定的图片，未匹配的图片仍建独立 image chunk。
         _imgs_bound_in_layout = (
             global_split_mode == "dynamic"
             and xlsx_layout_type in ("procedure_image_guide", "product_spec_instruction")
@@ -2428,6 +2468,9 @@ def node_chunk_documents(ctx: dict):
                 for asset in assets:
                     if asset.get("status") == "ROUTE_TO_VECTOR":
                         filename = asset.get("filename", "")
+                        # 设备清扫基准书中已按部位绑定的图片不再建独立 image chunk
+                        if filename in ce_bound_fns:
+                            continue
                         visual_summary = asset.get("visual_summary", "")
                         
                         version = doc["version_no"]
