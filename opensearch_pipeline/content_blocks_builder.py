@@ -71,8 +71,8 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
                 if refs_list:
                     image_map[i] = refs_list
 
-        elif chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk"):
-            # 路径 3: text/clause/ocr chunk 携带的 image_refs（text/clause 模式修复后）
+        elif chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
+            # 路径 3: text/clause/ocr/visual_knowledge chunk 携带的 image_refs
             image_refs = chunk.get("image_refs") or []
             if image_refs:
                 refs_list = []
@@ -86,6 +86,15 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
                         })
                 if refs_list:
                     image_map[i] = refs_list
+            elif chunk_type == "visual_knowledge":
+                # chunker Phase-5.5 的 visual_knowledge 变体用 source_image/oss_key 携带单图（无 image_refs）
+                source_image = chunk.get("source_image") or chunk.get("oss_key", "")
+                if source_image:
+                    image_map[i] = [{
+                        "source_image": source_image,
+                        "visual_summary": chunk.get("visual_summary", "") or chunk.get("caption", ""),
+                        "title": chunk.get("title", ""),
+                    }]
 
     return image_map
 

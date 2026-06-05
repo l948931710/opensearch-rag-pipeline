@@ -74,6 +74,11 @@ def _format_context(chunks: List[Dict[str, Any]], max_chars: int = 6000) -> str:
                 header += f" <<IMG:{i+1}>>"
         elif chunk_type == "procedure_parent":
             header += " [流程概览]"
+        elif chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
+            # 与 content_blocks_builder._extract_image_chunks 对齐：这些类型若携带图片，
+            # 也要给 LLM 一个 <<IMG:N>> 提示；否则 referenced-only 渲染（只展示被引用图）会漏图
+            if (chunk.get("image_refs") or []) or chunk.get("source_image"):
+                header += f" [📷 图片] <<IMG:{i+1}>>"
         if isinstance(score, (int, float)):
             # 混合检索融合分（weighted/RRF）：越大越相关，DESC 排序
             level = "高" if score >= threshold_high else "中" if score >= threshold_medium else "低"
