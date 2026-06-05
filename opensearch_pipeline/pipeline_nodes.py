@@ -495,6 +495,10 @@ def node_extract_text_with_ocr(ctx: dict):
         bucket, _sim = _get_oss_bucket(ctx)
 
     extractor = UnifiedExtractor(simulate=simulate_api, oss_client=bucket)
+    # 注入运行级成本熔断器（VLM 版面重建用）。一个 extractor 处理整批文档，
+    # 故跨文档共享同一 breaker → 单次运行累计预算生效。orchestrator 未注入时为 None
+    # （此时 vlm_rebuilder 退化为单文档闸；且默认 RAG_REBUILD_ENABLED=false 全程 no-op）。
+    extractor.cost_breaker = ctx.get("cost_breaker")
     extractions = []
 
     # 创建临时目录存放下载的文件

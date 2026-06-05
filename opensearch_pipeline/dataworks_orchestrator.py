@@ -39,11 +39,17 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
     print(f"[Orchestrator] Starting Stage {stage} for business date: {bizdate}")
     print(f"[Orchestrator] Operating Mode: {'SIMULATION' if simulate else 'PRODUCTION'}")
     
+    # 运行级成本熔断器（VLM 版面重建用）。一次 DataWorks 运行一个实例 → 单次运行累计预算。
+    # 默认 RAG_REBUILD_ENABLED=false 时熔断器为 no-op，不影响现有行为。
+    from opensearch_pipeline.extraction.cost_breaker import CostBreaker
+    cost_breaker = CostBreaker(config)
+
     # 构造运行上下文
     ctx = {
         "bizdate": bizdate,
         "simulate": simulate,
         "simulate_api": simulate, # 模拟 API 随 simulate 自动决定
+        "cost_breaker": cost_breaker,  # 注入抽取节点 → UnifiedExtractor.cost_breaker
     }
 
     if stage == 1:
@@ -86,6 +92,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                 "simulate": True,
                 "simulate_api": True,
                 "raw_tasks": test_data["raw_tasks"],
+                "cost_breaker": cost_breaker,
             }
             stage1_res = dag1.run(stage1_ctx)
             ctx["canonicals"] = stage1_res["canonicals"]
@@ -261,6 +268,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                 "simulate": True,
                 "simulate_api": True,
                 "raw_tasks": test_data["raw_tasks"],
+                "cost_breaker": cost_breaker,
             }
             stage1_res = dag1.run(stage1_ctx)
             
