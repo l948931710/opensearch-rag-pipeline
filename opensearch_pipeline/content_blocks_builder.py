@@ -15,7 +15,7 @@ content_blocks 是一个 JSON Array，每个元素为：
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from opensearch_pipeline.oss_url import generate_signed_url
 
@@ -99,14 +99,18 @@ def build_content_blocks(
     """
     将 LLM 回答拆分为 content_blocks（图文穿插格式）。
 
-    策略:
-    1. 扫描 answer 中的 <<IMG:N>> 占位符
-    2. 按占位符切割文本 → 文本块和图片块交替排列
-    3. 对每个图片块：从 chunks 中找到对应 image chunk，
-       调用 generate_signed_url() 生成 url
-    4. 如果 LLM 没输出占位符，但有 image chunks：
-       → 将图片追加到末尾（降级效果）
-    5. 如果完全没有图片 → 返回空 list（触发 answer 降级显示）
+    策略（只展示 LLM 主动用 <<IMG:N>> 引用的图片）:
+    1. 扫描 answer 中的 <<IMG:N>> 占位符，得到 LLM 引用的文档序号
+       （去重、保持首次引用顺序）
+    2. 只对“被引用”的图片签名，且按引用顺序签名后再受 max_images 截断
+       —— 被引用的图片永远不会被靠前 chunk 的图片挤掉（修复 cap-eviction）
+    3. 若 LLM 没有引用任何图片（纯文字答案 / 负样本）→ 返回空 list
+       —— 不再把检索到的图片无差别追加到末尾（修复 over-attachment）
+    4. 按占位符位置把被引用的图片穿插进文本
+
+    历史行为对比：旧实现会把所有携带图片的 chunk 一律签名并追加到末尾
+    （无论 LLM 是否引用），导致负样本被塞图、跨文档图片污染，以及被引用
+    图片被 max_images 截断挤掉。现在一律以 LLM 的 <<IMG:N>> 标记为准。
 
     Args:
         answer: LLM 生成的回答文本
@@ -115,27 +119,42 @@ def build_content_blocks(
         url_expires: OSS 签名 URL 有效期（秒）
 
     Returns:
-        [] → 无图片，卡片走 answer 显示
+        [] → 无（被引用的）图片，卡片走 answer 降级显示
         [{type, content/url/title/caption}, ...] → 图文穿插
     """
     if not answer:
         return []
 
-    # 1. 提取所有 image chunks
+    # 1. 提取所有携带图片的 chunk（doc_index → [img dicts]）
     image_map = _extract_image_chunks(chunks)
-
     if not image_map:
         # 没有任何图片 chunk → 返回空，走 answer 降级
         return []
 
-    # 2. 为图片生成签名 URL
-    signed_images = {}  # doc_index → [{url, title, caption}, ...]
+    # 2. 扫描 <<IMG:N>> 占位符；只保留指向真实图片的有效引用，
+    #    去重并保持首次引用顺序（截断时按此顺序定优先级）
+    placeholders = list(_IMG_PLACEHOLDER_PATTERN.finditer(answer))
+    referenced_order: List[int] = []
+    seen_refs = set()
+    for match in placeholders:
+        doc_idx = int(match.group(1))
+        if doc_idx in image_map and doc_idx not in seen_refs:
+            referenced_order.append(doc_idx)
+            seen_refs.add(doc_idx)
+
+    if not referenced_order:
+        # LLM 没有引用任何图片 → 不展示图片（走 answer 降级）
+        return []
+
+    # 3. 只为“被引用”的图片签名，按引用顺序处理后再受 max_images 截断。
+    #    因为只签名被引用的图片且按引用顺序消耗配额，被引用的图片不会被挤掉。
+    signed_images: Dict[int, List[Dict[str, str]]] = {}
     generated_count = 0
-    for doc_idx, img_list in image_map.items():
+    for doc_idx in referenced_order:
         if generated_count >= max_images:
             break
         signed_list = []
-        for img_info in img_list:
+        for img_info in image_map[doc_idx]:
             if generated_count >= max_images:
                 break
             url = generate_signed_url(img_info["source_image"], expires=url_expires)
@@ -156,18 +175,11 @@ def build_content_blocks(
             signed_images[doc_idx] = signed_list
 
     if not signed_images:
-        # 所有图片签名都失败 → 返回空，走 answer 降级
+        # 被引用图片的签名全部失败 → 返回空，走 answer 降级
         return []
 
-    # 3. 扫描 LLM 回答中的 <<IMG:N>> 占位符
-    placeholders = list(_IMG_PLACEHOLDER_PATTERN.finditer(answer))
-
-    if placeholders:
-        # ── 策略 A：LLM 输出了占位符 → 按位置穿插 ──
-        blocks = _build_interleaved(answer, placeholders, signed_images)
-    else:
-        # ── 策略 B：LLM 没输出占位符 → 图片追加到末尾 ──
-        blocks = _build_appended(answer, signed_images)
+    # 4. 按占位符位置把被引用的图片穿插进文本
+    blocks = _build_interleaved(answer, placeholders, signed_images)
 
     # 最终清理：确保所有 markdown 块不残留 <IMG:N> 占位符
     return _sanitize_blocks(blocks)
@@ -191,7 +203,11 @@ def _build_interleaved(
     placeholders: list,
     signed_images: Dict[int, List[Dict[str, str]]],
 ) -> List[Dict[str, str]]:
-    """按 <<IMG:N>> 占位符位置穿插图片。"""
+    """按 <<IMG:N>> 占位符位置穿插图片。
+
+    signed_images 只包含被 LLM 引用的 chunk，因此每个图片都会在其占位符处插入；
+    不再把未被引用的图片追加到末尾（over-attachment 修复）。
+    """
     blocks = []
     last_end = 0
     used_indices = set()
@@ -225,41 +241,6 @@ def _build_interleaved(
         remaining = _IMG_PLACEHOLDER_PATTERN.sub('', remaining).strip()
         if remaining:
             blocks.append({"type": "markdown", "content": remaining})
-
-    # 如果有未被占位符引用的图片，追加到末尾
-    for doc_idx, img_list in signed_images.items():
-        if doc_idx not in used_indices:
-            for img in img_list:
-                blocks.append({
-                    "type": "image",
-                    "title": img["title"],
-                    "url": img["url"],
-                    "caption": img["caption"],
-                })
-
-    return blocks
-
-
-def _build_appended(
-    answer: str,
-    signed_images: Dict[int, List[Dict[str, str]]],
-) -> List[Dict[str, str]]:
-    """LLM 没输出占位符时，将图片追加到回答末尾。"""
-    blocks = []
-
-    # 完整回答作为第一个文本块（清理未匹配的占位符）
-    clean_answer = _IMG_PLACEHOLDER_PATTERN.sub('', answer).strip()
-    blocks.append({"type": "markdown", "content": clean_answer})
-
-    # 图片追加到末尾
-    for doc_idx, img_list in signed_images.items():
-        for img in img_list:
-            blocks.append({
-                "type": "image",
-                "title": img["title"],
-                "url": img["url"],
-                "caption": img["caption"],
-            })
 
     return blocks
 
