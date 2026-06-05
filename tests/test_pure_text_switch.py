@@ -28,14 +28,14 @@ def test_text_only_prompt_drops_image_rule():
     # 纯文本 prompt = base（不含规则 9 / <<IMG>>）
     assert G.TEXT_ONLY_SYSTEM_PROMPT == G._SYSTEM_PROMPT_BASE
     assert G.DEFAULT_SYSTEM_PROMPT.startswith(G.TEXT_ONLY_SYSTEM_PROMPT)
-    # 规则 9（图片插入）只出现在默认 prompt
+    # 图文穿插规则（规则 10）只出现在默认 prompt
     assert "<<IMG:N>>" in G.DEFAULT_SYSTEM_PROMPT
     assert "<<IMG" not in G.TEXT_ONLY_SYSTEM_PROMPT
-    assert "9. 如果参考文档中包含图片" in G.DEFAULT_SYSTEM_PROMPT
-    assert "9. 如果参考文档中包含图片" not in G.TEXT_ONLY_SYSTEM_PROMPT
-    # 规则 1-8 在两者中都保留（关键的"不编造 / 无结果时告知 / 不附来源列表"规则不能丢）
+    assert "10. 如果参考文档中包含图片" in G.DEFAULT_SYSTEM_PROMPT
+    assert "10. 如果参考文档中包含图片" not in G.TEXT_ONLY_SYSTEM_PROMPT
+    # 基础规则在两者中都保留（关键的"不编造 / 无结果时告知 / 不列来源清单 / 数字须出自原文"规则不能丢）
     for shared in ("只基于提供的参考文档内容回答", "抱歉，当前知识库中未找到相关信息",
-                   "8. 不要在回答末尾附加参考来源或参考文档列表"):
+                   "不要在回答正文或末尾列出参考来源", "必须严格来自参考文档原文"):
         assert shared in G.DEFAULT_SYSTEM_PROMPT
         assert shared in G.TEXT_ONLY_SYSTEM_PROMPT
 
