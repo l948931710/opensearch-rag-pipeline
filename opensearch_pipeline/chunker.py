@@ -354,7 +354,8 @@ class DocumentChunker:
         r'第\s*([一二三四五六七八九十\d]+)\s*步|'     # 第一步 / 第1步
         r'(\d+)\s*[\.．、]\s*(?![\d])|'              # 1. / 1．/ 2、（排除 1.1 条款编号）
         r'(\d+)\s*[)）]\s*|'                           # 1) / 2）
-        r'(\d+\.\d+)\s+\S'                            # 1.2 / 3.2 / 4.2 条款编号步骤（后跟文字）
+        r'(\d+\.\d+)\s+\S|'                           # 1.2 / 3.2 / 4.2 条款编号步骤（后跟空格+文字）
+        r'(\d+\.\d+(?:\.\d+)+)\s*(?=[一-鿿])'  # 4.2.1 / 4.2.3.2 多级子步骤（数字后紧跟中文，无需空格）
         r')',
         re.IGNORECASE | re.MULTILINE,
     )
@@ -548,12 +549,13 @@ class DocumentChunker:
                 # 提取步骤编号（6 个捕获组）
                 step_no_str = (match.group(1) or match.group(2) or
                                match.group(3) or match.group(4) or
-                               match.group(5) or match.group(6))
+                               match.group(5) or match.group(6) or match.group(7))
 
                 # ── 过滤误判：通用编号格式（N. / N、/ N) / X.Y）需要足够长的文本 ──
                 # 避免将材料清单 "4. 胶带" 误判为步骤。
                 # 明确的步骤标记（步骤N / Step N / 第N步）不受此限制。
-                is_generic_numbering = match.group(4) or match.group(5) or match.group(6)
+                is_generic_numbering = (match.group(4) or match.group(5) or
+                                        match.group(6) or match.group(7))
                 if is_generic_numbering and len(seg_text) < 15:
                     # 太短，当普通文本处理
                     if current_step is not None:
@@ -776,7 +778,9 @@ class DocumentChunker:
                             )
                             supp_chunk.extra["step_no"] = sg["step_no"]
                             supp_chunk.extra["is_step_continuation"] = True
-                            supp_chunk.extra["image_refs"] = image_refs_list
+                            # 不复制 image_refs 到续接块：图片只绑定到主 step chunk，
+                            # 避免一张图被复制到同一步骤的多个续接块（图文重复 / over-attachment）。
+                            # 续接块通过 step_no / prev_next 链回主块的图片。
                             if annotation_map:
                                 supp_chunk.extra["annotation_map"] = annotation_map
                             step_card_chunks_sec.append(supp_chunk)
