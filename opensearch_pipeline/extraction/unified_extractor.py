@@ -9,7 +9,7 @@ DAG 层不需要知道文件类型，只调用 extract() 即可。
 """
 
 import os
-from typing import Optional
+from typing import Dict, List, Optional
 
 from opensearch_pipeline.extraction.schema import ExtractionResult, ExtractedBlock
 from opensearch_pipeline.extraction.text_extractor import (
@@ -34,8 +34,11 @@ class UnifiedExtractor:
         local_path (可选，生产模式)
     """
 
-    # 原生提取文本低于此阈值 → OCR fallback
+    # 原生提取文本低于此阈值 → OCR fallback（图片类型用整体阈值）
     OCR_THRESHOLD_CHARS = 100
+    # Increment 0b: PDF 逐页 OCR 门槛——原生文本少于此字符数的页视为扫描页/坏字体页，
+    # 单独送 OCR；取代旧的"按整文档 text_length 一刀切"（封面有字则整文档跳过 OCR）。
+    PER_PAGE_OCR_THRESHOLD = 50
 
     def __init__(
         self,
@@ -1209,40 +1212,66 @@ class UnifiedExtractor:
 
     # ── OCR fallback logic ──
 
+    def _pages_needing_ocr(self, result: ExtractionResult) -> List[int]:
+        """PDF: 返回原生文本不足的页码（1-based）——扫描页 / 坏字体页 / 空白页。
+
+        旧门槛按整文档 text_length 判断，会让"封面有文字、正文是扫描"的多页 PDF
+        一页都不 OCR（#1 语料失败模式）。这里逐页统计原生文本，挑出需要 OCR 的页。
+        图片块 / 已有 OCR 块不计入"原生文本"。
+        """
+        if result.file_ext != "pdf" or (result.page_count or 0) <= 0:
+            return []
+        per_page: Dict[int, int] = {}
+        for b in result.blocks:
+            bt = b.get("block_type", "") if isinstance(b, dict) else getattr(b, "block_type", "")
+            if bt in ("image_ref", "ocr_text"):
+                continue
+            pg = b.get("page_num") if isinstance(b, dict) else getattr(b, "page_num", None)
+            if pg is None:
+                continue
+            txt = (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")) or ""
+            per_page[pg] = per_page.get(pg, 0) + len(txt.strip())
+        return [pg for pg in range(1, result.page_count + 1)
+                if per_page.get(pg, 0) < self.PER_PAGE_OCR_THRESHOLD]
+
     def _needs_ocr(self, result: ExtractionResult) -> bool:
         """判断是否需要 OCR fallback。"""
-        if result.text_length >= self.OCR_THRESHOLD_CHARS:
-            return False
-
-        # 只有 PDF 和图片类型走 OCR
-        if result.file_ext not in ("pdf", "png", "jpg", "jpeg", "webp"):
-            return False
-
-        return True
+        if result.file_ext == "pdf":
+            # 逐页判断：任一页原生文本不足即触发（只 OCR 那些页）
+            return len(self._pages_needing_ocr(result)) > 0
+        if result.file_ext in ("png", "jpg", "jpeg", "webp"):
+            return result.text_length < self.OCR_THRESHOLD_CHARS
+        return False
 
     def _apply_ocr_fallback(self, task: dict, result: ExtractionResult) -> ExtractionResult:
-        """应用 OCR fallback，按页添加 OCR blocks。"""
+        """应用 OCR fallback。PDF 只 OCR 文本不足的页，并按 page_num 合并回正确位置。"""
         local_path = task.get("local_path", "")
 
         if result.file_ext == "pdf":
+            needy = self._pages_needing_ocr(result)
+            if not needy:
+                return result
             ocr_result = self.ocr_client.ocr_pdf(
-                local_path, task["doc_id"], self.oss_client,
+                local_path, task["doc_id"], self.oss_client, page_nums=needy,
             )
         else:
             ocr_result = self.ocr_client.ocr_image(
                 local_path, task["doc_id"], self.oss_client,
             )
 
-        # 添加 OCR blocks
         ocr_blocks = ocr_result.to_blocks()
-        result.blocks.extend(ocr_blocks)
-
-        # 更新 text
-        if ocr_result.combined_text:
-            if result.text:
-                result.text = result.text + "\n\n" + ocr_result.combined_text
+        if ocr_blocks:
+            if result.file_ext == "pdf":
+                # OCR 的是空白页（原页几乎无块），按 page_num 稳定排序合并保持文档顺序
+                merged = list(result.blocks) + list(ocr_blocks)
+                merged.sort(key=lambda b: (getattr(b, "page_num", 0) or 0))
+                result.blocks = merged
+                result.text = blocks_to_text(result.blocks)
             else:
-                result.text = ocr_result.combined_text
+                result.blocks.extend(ocr_blocks)
+                if ocr_result.combined_text:
+                    result.text = (result.text + "\n\n" + ocr_result.combined_text
+                                   if result.text else ocr_result.combined_text)
             result.text_length = len(result.text)
 
         result.ocr_required = True

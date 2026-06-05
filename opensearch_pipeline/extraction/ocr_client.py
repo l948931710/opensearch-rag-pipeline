@@ -79,17 +79,21 @@ class OCRClient:
         local_path: str,
         doc_id: str,
         oss_bucket=None,
+        page_nums: Optional[List[int]] = None,
     ) -> OCRResult:
         """
         对 PDF 做 OCR（按页）。
+
+        page_nums: 仅 OCR 这些页（1-based）；None = 前 max_ocr_pages 页（旧行为）。
+                   用于 per-page OCR gate——只 OCR 扫描页/坏字体页，不浪费在有文本的页上。
 
         生产模式：PDF → 图片 → 上传 OSS → Qwen-VL OCR
         模拟模式：返回按页模拟文本
         """
         if self.simulate:
-            return self._simulate_pdf_ocr(doc_id)
+            return self._simulate_pdf_ocr(doc_id, page_nums)
 
-        return self._real_pdf_ocr(local_path, doc_id, oss_bucket)
+        return self._real_pdf_ocr(local_path, doc_id, oss_bucket, page_nums)
 
     def ocr_image(
         self,
@@ -114,32 +118,33 @@ class OCRClient:
 
     # ── 模拟实现 ──
 
-    def _simulate_pdf_ocr(self, doc_id: str) -> OCRResult:
-        """模拟 PDF OCR（2 页）。"""
+    def _simulate_pdf_ocr(self, doc_id: str, page_nums: Optional[List[int]] = None) -> OCRResult:
+        """模拟 PDF OCR。page_nums 指定时按这些页模拟（反映 per-page 选择），否则默认 2 页。"""
+        nums = list(page_nums) if page_nums else [1, 2]
+        nums = nums[:self.max_ocr_pages]
         pages = [
             OCRPageResult(
-                page_num=1,
-                text=f"[OCR page 1: scanned content for {doc_id}]",
+                page_num=p,
+                text=f"[OCR page {p}: scanned content for {doc_id}]",
                 status="SIMULATED",
-            ),
-            OCRPageResult(
-                page_num=2,
-                text=f"[OCR page 2: continued content for {doc_id}]",
-                status="SIMULATED",
-            ),
+            )
+            for p in nums
         ]
         combined = "\n\n".join(p.text for p in pages)
         return OCRResult(pages=pages, combined_text=combined, status="SIMULATED")
 
     # ── 生产实现（基于 Gemini Vision） ──
 
-    def _real_pdf_ocr(self, local_path: str, doc_id: str, oss_bucket=None) -> OCRResult:
+    def _real_pdf_ocr(self, local_path: str, doc_id: str, oss_bucket=None,
+                      page_nums: Optional[List[int]] = None) -> OCRResult:
         """
-        真实 PDF OCR (Gemini Vision)。
+        真实 PDF OCR (Qwen-VL Vision)。
         流程：
         1. PDF → 图片（fitz）
         2. Base64 编码
-        3. Gemini API 提取文本
+        3. Qwen-VL API 提取文本
+
+        page_nums: 仅 OCR 这些页（1-based）；None = 前 max_ocr_pages 页。
         """
         if not self.api_key:
             return OCRResult(status="FAILED", error="API KEY not configured")
@@ -154,9 +159,19 @@ class OCRClient:
 
         try:
             doc = fitz.open(local_path)
-            total_pages = min(len(doc), self.max_ocr_pages)
+            n = len(doc)
+            # 选页：指定则只 OCR 这些页（去重、有序、限页内），否则前 N 页（旧行为）
+            if page_nums:
+                page_idxs = sorted({p - 1 for p in page_nums if 1 <= p <= n})
+            else:
+                page_idxs = list(range(n))
+            if len(page_idxs) > self.max_ocr_pages:
+                dropped = len(page_idxs) - self.max_ocr_pages
+                page_idxs = page_idxs[:self.max_ocr_pages]
+                print(f"    ⚠️ [ocr] capped at max_ocr_pages={self.max_ocr_pages}; "
+                      f"{dropped} low-text page(s) left un-OCR'd", flush=True)
 
-            for page_idx in range(total_pages):
+            for page_idx in page_idxs:
                 page = doc[page_idx]
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                 
