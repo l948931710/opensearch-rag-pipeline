@@ -30,11 +30,17 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 
 from opensearch_pipeline.retriever import retrieve_and_enrich
-from opensearch_pipeline.llm_generator import generate_answer
+from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream, _extract_sources
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
-from opensearch_pipeline.dingtalk_card import send_interactive_card, update_card_feedback_status
+from opensearch_pipeline.dingtalk_card import (
+    send_interactive_card,
+    update_card_feedback_status,
+    create_streaming_card,
+    streaming_update_card,
+    _strip_trailing_sources,
+)
 from opensearch_pipeline.feedback_handler import handle_feedback, get_feedback_status_text
 
 logger = logging.getLogger(__name__)
@@ -404,6 +410,137 @@ def _format_answer_markdown(
 # 后台 RAG 处理
 # ═══════════════════════════════════════════════════════════════
 
+def _stream_answer_to_card(
+    *,
+    question: str,
+    chunks: List[Dict[str, Any]],
+    history: List[Dict[str, str]],
+    session_key: str,
+    message_id: str,
+    conversation_id: str,
+    conversation_type: str,
+    sender_staff_id: str,
+    sender_nick: str,
+    user_dept: Optional[str],
+    t0: float,
+    t_retrieval: float,
+    retrieval_latency_ms: int,
+) -> bool:
+    """以流式 AI 卡片（打字机效果）输出纯文本回答。
+
+    流程：投放流式卡片占位 → 逐 token 累计并按节流间隔覆盖式更新 → 定稿 → 写历史 + 落库。
+    与非流式路径保持一致的落库/反馈语义（钉钉端纯文本，不含图文 content_blocks）。
+
+    Returns:
+        True  —— 已完整处理（投放+流式+落库），调用方应直接 return；
+        False —— 流式卡片投放失败（未配置/无 token/单聊缺 staffId 等），调用方应降级到
+                 非流式成品卡片路径（不会重复落库）。
+    """
+    cfg = get_config()
+    stream_key = os.environ.get("DINGTALK_STREAM_CARD_KEY", "content")
+    model_name = cfg.llm.model
+    sources = _extract_sources(chunks)
+
+    # 1. 先投放流式卡片占位（sources/meta/question 此时已知）
+    created = create_streaming_card(
+        conversation_id=conversation_id,
+        conversation_type=conversation_type,
+        sender_staff_id=sender_staff_id,
+        message_id=message_id,
+        question=question,
+        sources=sources,
+        model=model_name,
+        stream_key=stream_key,
+    )
+    if not created:
+        logger.warning("流式卡片投放失败，降级为非流式路径: message_id=%s", message_id)
+        return False
+
+    guid = uuid.uuid4().hex
+    interval_s = max(cfg.rag.dingtalk_stream_interval_ms, 0) / 1000.0
+    collected: List[str] = []
+    last_push = 0.0
+    answer_status = "SUCCESS"
+    error_message: Optional[str] = None
+
+    def _clean(text: str) -> str:
+        # 与成品卡片一致的清理：去除末尾参考来源段 + <<IMG:N>> 占位符（钉钉端纯文本）
+        return re.sub(r'<{1,2}IMG:\d+>{1,2}', '', _strip_trailing_sources(text)).strip()
+
+    try:
+        for event in generate_answer_stream(
+            question,
+            chunks,
+            history=history if history else None,
+            max_tokens=2048,
+            temperature=0.1,
+            pure_text=True,
+        ):
+            if '"type": "chunk"' not in event:
+                continue
+            try:
+                d = json.loads(event[6:].strip())
+            except (json.JSONDecodeError, KeyError):
+                continue
+            if d.get("type") != "chunk" or not d.get("content"):
+                continue
+            collected.append(d["content"])
+            now = time.time()
+            if now - last_push >= interval_s:
+                streaming_update_card(
+                    message_id, _clean("".join(collected)),
+                    guid=guid, key=stream_key, is_full=True,
+                )
+                last_push = now
+
+        full_answer = _clean("".join(collected))
+        # 定稿帧
+        streaming_update_card(
+            message_id, full_answer,
+            guid=guid, key=stream_key, is_full=True, is_finalize=True,
+        )
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        answer_status = "LLM_ERROR"
+        error_message = f"[trace={trace_id}] {str(e)[:500]}"
+        logger.error("流式生成失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        full_answer = _clean("".join(collected))
+        streaming_update_card(
+            message_id,
+            full_answer or f"❌ 回答生成失败，请稍后重试。(trace: {trace_id})",
+            guid=guid, key=stream_key, is_full=True, is_finalize=True, is_error=True,
+        )
+
+    # 写历史（仅成功且有内容时）+ 落库（与非流式路径一致的反馈语义）
+    if full_answer and answer_status == "SUCCESS":
+        append_to_history(session_key, question, full_answer)
+
+    llm_latency_ms = int((time.time() - t_retrieval) * 1000)
+    latency_ms = int((time.time() - t0) * 1000)
+    top_score = max((c.get("score", 0) for c in chunks), default=None)
+    log_qa_session(
+        session_id=session_key,
+        message_id=message_id,
+        user_id=sender_staff_id,
+        user_name=sender_nick,
+        user_dept=user_dept,
+        query_text=question,
+        answer_text=full_answer or None,
+        retrieved_docs=chunks,
+        cited_docs=sources,
+        latency_ms=latency_ms,
+        retrieval_latency_ms=retrieval_latency_ms,
+        llm_latency_ms=llm_latency_ms,
+        answer_status=answer_status,
+        model_name=model_name,
+        opensearch_hit_count=len(chunks),
+        top_score=top_score,
+        conversation_type=conversation_type,
+        error_message=error_message,
+    )
+    return True
+
+
 def _process_rag_query(
     question: str,
     session_webhook: str,
@@ -457,6 +594,26 @@ def _process_rag_query(
                 "🤷 抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述。",
             )
             return
+
+        # 2a. 流式 AI 卡片路径（打字机效果）：开关开启且配置了流式模板时启用；
+        #     投放失败/未配置时自动降级到下方非流式成品卡片路径（不重复落库）。
+        if get_config().rag.dingtalk_streaming and os.environ.get("DINGTALK_STREAM_CARD_TEMPLATE_ID"):
+            if _stream_answer_to_card(
+                question=question,
+                chunks=chunks,
+                history=list(history),
+                session_key=session_key,
+                message_id=message_id,
+                conversation_id=conversation_id,
+                conversation_type=conversation_type,
+                sender_staff_id=sender_staff_id,
+                sender_nick=sender_nick,
+                user_dept=user_dept,
+                t0=t0,
+                t_retrieval=t_retrieval,
+                retrieval_latency_ms=retrieval_latency_ms,
+            ):
+                return
 
         # 2. LLM 生成（传入多轮对话历史）
         #    纯文本模式（RAG_PURE_TEXT）下生成纯文字回答，下游跳过图文穿插

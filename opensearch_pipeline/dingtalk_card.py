@@ -185,6 +185,100 @@ def _inline_images_to_markdown(
     return "\n".join(parts).strip()
 
 
+def _assemble_delivery_payload(
+    *,
+    template_id: str,
+    out_track_id: str,
+    card_param_map: Dict[str, Any],
+    conversation_id: str,
+    conversation_type: str,
+    sender_staff_id: str,
+    client_id: str,
+    callback_route_key: str = "",
+) -> Optional[Dict[str, Any]]:
+    """组装 createAndDeliver 投放载荷（openSpaceId + 私有数据 message_id + 单聊/群聊投放模型）。
+
+    成品卡片与流式卡片共用此投放逻辑。返回 None 表示无法投放（如单聊缺少真实 staffId），
+    调用方应降级。注意：无真实 staffId 的调试场景会就地把 message_id 写入 card_param_map。
+    """
+    # 检测是否有真正的 staffId（加密的 senderId 以 $:LWCP 开头，不能用于卡片 API）
+    has_real_staff_id = bool(sender_staff_id) and not sender_staff_id.startswith("$:")
+
+    # 构建 openSpaceId（区分单聊/群聊，SDK 要求小写）
+    if conversation_type == "2":
+        open_space_id = f"dtv1.card//im_group.{conversation_id}"
+    else:
+        if not has_real_staff_id:
+            logger.warning("单聊模式下无真实 staffId，卡片投放跳过")
+            return None
+        open_space_id = f"dtv1.card//im_robot.{sender_staff_id}"
+
+    # message_id：有真实 staffId 放私有数据，否则放公有数据（调试模式）
+    if has_real_staff_id:
+        private_data = {sender_staff_id: {"cardParamMap": {"message_id": out_track_id}}}
+    else:
+        card_param_map["message_id"] = out_track_id
+        private_data = {}
+
+    payload: Dict[str, Any] = {
+        "cardTemplateId": template_id,
+        "outTrackId": out_track_id,
+        "callbackType": "HTTP",
+        "userIdType": 1,
+        "cardData": {"cardParamMap": card_param_map},
+        "openSpaceId": open_space_id,
+    }
+
+    if private_data:
+        payload["privateData"] = private_data
+    if callback_route_key:
+        payload["callbackRouteKey"] = callback_route_key
+
+    # 投放模型（区分单聊/群聊）
+    if conversation_type == "2":
+        payload["imGroupOpenDeliverModel"] = {"robotCode": client_id}
+        payload["imGroupOpenSpaceModel"] = {"supportForward": True}
+    else:
+        payload["userId"] = sender_staff_id
+        payload["imRobotOpenDeliverModel"] = {"spaceType": "IM_ROBOT", "robotCode": client_id}
+        payload["imRobotOpenSpaceModel"] = {"supportForward": True}
+
+    return payload
+
+
+def _post_card_deliver(token: str, payload: Dict[str, Any], message_id: str) -> bool:
+    """POST createAndDeliver 并校验投递结果（200 不代表投递成功）。"""
+    try:
+        print(f"[CARD DEBUG] openSpaceId={payload.get('openSpaceId')}", flush=True)
+        print(f"[CARD DEBUG] cardParamMap={json.dumps(payload.get('cardData', {}).get('cardParamMap', {}), ensure_ascii=False)[:800]}", flush=True)
+        resp = requests.post(
+            "https://api.dingtalk.com/v1.0/card/instances/createAndDeliver",
+            json=payload,
+            headers={
+                "x-acs-dingtalk-access-token": token,
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        print(f"[CARD DEBUG] response status={resp.status_code}, body={resp.text[:500]}", flush=True)
+        if resp.status_code == 200:
+            resp_data = resp.json()
+            deliver_results = resp_data.get("result", {}).get("deliverResults", [])
+            all_delivered = all(d.get("success", False) for d in deliver_results) if deliver_results else False
+            if all_delivered:
+                logger.info("互动卡片发送成功: message_id=%s", message_id)
+                return True
+            error_msgs = [d.get("errorMsg", "") for d in deliver_results if not d.get("success")]
+            logger.warning("互动卡片投递失败: %s", error_msgs)
+            print(f"[CARD DEBUG] 投递失败: {error_msgs}", flush=True)
+            return False
+        logger.error("互动卡片发送失败: status=%s, body=%s", resp.status_code, resp.text)
+        return False
+    except Exception as e:
+        logger.error("互动卡片发送异常: %s", e, exc_info=True)
+        return False
+
+
 def send_interactive_card(
     *,
     conversation_id: str,
@@ -228,20 +322,6 @@ def send_interactive_card(
         logger.warning("DINGTALK_CARD_TEMPLATE_ID 未配置，互动卡片发送跳过")
         return False
 
-    # 检测是否有真正的 staffId（加密的 senderId 以 $:LWCP 开头，不能用于卡片 API）
-    has_real_staff_id = bool(sender_staff_id) and not sender_staff_id.startswith("$:")
-
-    # 构建 openSpaceId（区分单聊/群聊，SDK 要求小写）
-    if conversation_type == "2":
-        # 群聊
-        open_space_id = f"dtv1.card//im_group.{conversation_id}"
-    else:
-        # 单聊（需要真实 staffId）
-        if not has_real_staff_id:
-            logger.warning("单聊模式下无真实 staffId，互动卡片发送跳过")
-            return False
-        open_space_id = f"dtv1.card//im_robot.{sender_staff_id}"
-
     # 卡片公有数据（所有值必须是 string 类型）
     sources_text = _format_sources_text(sources)
     meta = f"模型: {model} | 耗时: {latency_ms / 1000:.1f}s"
@@ -267,94 +347,19 @@ def send_interactive_card(
         "feedback_status": "",
     }
 
-    # 私有数据和 userId 处理
-    if has_real_staff_id:
-        # 有真实 staffId：message_id 放私有数据
-        private_data = {
-            sender_staff_id: {
-                "cardParamMap": {
-                    "message_id": message_id,
-                },
-            },
-        }
-    else:
-        # 无真实 staffId（调试模式）：message_id 放公有数据
-        card_param_map["message_id"] = message_id
-        private_data = {}
-
-    payload: Dict[str, Any] = {
-        "cardTemplateId": template_id,
-        "outTrackId": message_id,
-        "callbackType": "HTTP",
-        "userIdType": 1,
-        "cardData": {
-            "cardParamMap": card_param_map,
-        },
-        "openSpaceId": open_space_id,
-    }
-
-    # 有私有数据时才加入
-    if private_data:
-        payload["privateData"] = private_data
-
-    # 添加回调路由键
-    if callback_route_key:
-        payload["callbackRouteKey"] = callback_route_key
-
-    # 投放模型（区分单聊/群聊）
-    if conversation_type == "2":
-        payload["imGroupOpenDeliverModel"] = {
-            "robotCode": client_id,
-        }
-        payload["imGroupOpenSpaceModel"] = {
-            "supportForward": True,
-        }
-    else:
-        payload["userId"] = sender_staff_id
-        payload["imRobotOpenDeliverModel"] = {
-            "spaceType": "IM_ROBOT",
-            "robotCode": client_id,
-        }
-        payload["imRobotOpenSpaceModel"] = {
-            "supportForward": True,
-        }
-
-    try:
-        print(f"[CARD DEBUG] openSpaceId={payload.get('openSpaceId')}", flush=True)
-        print(f"[CARD DEBUG] cardParamMap={json.dumps(payload.get('cardData',{}).get('cardParamMap',{}), ensure_ascii=False)[:800]}", flush=True)
-        resp = requests.post(
-            "https://api.dingtalk.com/v1.0/card/instances/createAndDeliver",
-            json=payload,
-            headers={
-                "x-acs-dingtalk-access-token": token,
-                "Content-Type": "application/json",
-            },
-            timeout=10,
-        )
-        print(f"[CARD DEBUG] response status={resp.status_code}, body={resp.text[:500]}", flush=True)
-        if resp.status_code == 200:
-            # 检查投递结果（API 返回 200 不代表投递成功）
-            resp_data = resp.json()
-            deliver_results = resp_data.get("result", {}).get("deliverResults", [])
-            all_delivered = all(d.get("success", False) for d in deliver_results) if deliver_results else False
-            if all_delivered:
-                logger.info("互动卡片发送成功: message_id=%s", message_id)
-                return True
-            else:
-                error_msgs = [d.get("errorMsg", "") for d in deliver_results if not d.get("success")]
-                logger.warning("互动卡片投递失败: %s", error_msgs)
-                print(f"[CARD DEBUG] 投递失败: {error_msgs}", flush=True)
-                return False
-        else:
-            logger.error(
-                "互动卡片发送失败: status=%s, body=%s",
-                resp.status_code, resp.text,
-            )
-            return False
-
-    except Exception as e:
-        logger.error("互动卡片发送异常: %s", e, exc_info=True)
+    payload = _assemble_delivery_payload(
+        template_id=template_id,
+        out_track_id=message_id,
+        card_param_map=card_param_map,
+        conversation_id=conversation_id,
+        conversation_type=conversation_type,
+        sender_staff_id=sender_staff_id,
+        client_id=client_id,
+        callback_route_key=callback_route_key,
+    )
+    if payload is None:
         return False
+    return _post_card_deliver(token, payload, message_id)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -412,4 +417,126 @@ def update_card_feedback_status(
 
     except Exception as e:
         logger.error("卡片状态更新异常: %s", e, exc_info=True)
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# 流式 AI 卡片（打字机效果）
+# ═══════════════════════════════════════════════════════════════
+
+def create_streaming_card(
+    *,
+    conversation_id: str,
+    conversation_type: str,
+    sender_staff_id: str,
+    message_id: str,
+    question: str,
+    sources: List[Dict[str, Any]],
+    model: str,
+    stream_key: str = "content",
+) -> bool:
+    """投放一张流式 AI 卡片占位（流式变量初始为空，随后由 streaming_update_card 逐步填充）。
+
+    使用 DINGTALK_STREAM_CARD_TEMPLATE_ID 指向的流式卡片模板（需在钉钉卡片平台预先注册，
+    含一个绑定 stream_key 的流式文本组件，以及与成品卡片一致的反馈按钮 / sources / meta 变量）。
+    sources / meta / question 在生成前即已知，故一并设置。
+
+    Returns:
+        True=投放成功（可开始流式更新）, False=失败（调用方应降级为非流式成品卡片路径）。
+    """
+    token = _get_access_token()
+    if not token:
+        logger.warning("无 access_token，流式卡片发送跳过")
+        return False
+
+    template_id = os.environ.get("DINGTALK_STREAM_CARD_TEMPLATE_ID", "")
+    callback_route_key = os.environ.get("DINGTALK_CARD_CALLBACK_ROUTE_KEY", "")
+    client_id = os.environ.get("DINGTALK_CLIENT_ID", "")
+
+    if not template_id:
+        logger.warning("DINGTALK_STREAM_CARD_TEMPLATE_ID 未配置，流式卡片发送跳过")
+        return False
+
+    sources_text = _format_sources_text(sources)
+    card_param_map = {
+        "title": question[:50],
+        "question": question,
+        stream_key: "",
+        "sources": sources_text,
+        "sources_text": sources_text,
+        "meta": f"模型: {model}",
+        "feedback_status": "",
+    }
+
+    payload = _assemble_delivery_payload(
+        template_id=template_id,
+        out_track_id=message_id,
+        card_param_map=card_param_map,
+        conversation_id=conversation_id,
+        conversation_type=conversation_type,
+        sender_staff_id=sender_staff_id,
+        client_id=client_id,
+        callback_route_key=callback_route_key,
+    )
+    if payload is None:
+        return False
+    return _post_card_deliver(token, payload, message_id)
+
+
+def streaming_update_card(
+    out_track_id: str,
+    content: str,
+    *,
+    guid: str,
+    key: str = "content",
+    is_full: bool = True,
+    is_finalize: bool = False,
+    is_error: bool = False,
+) -> bool:
+    """流式更新 AI 卡片内容（打字机效果）。
+
+    PUT https://api.dingtalk.com/v1.0/card/streaming
+
+    Args:
+        out_track_id: 卡片 outTrackId（= message_id）
+        content: 本次写入的内容
+        guid: 一次流式会话的唯一标识（同一条回答的多次更新须保持一致）
+        key: 流式卡片模板中绑定的流式变量名
+        is_full: True=content 为累计全文（覆盖式，对拆分标记更稳健）；False=增量追加
+        is_finalize: True=最后一帧，结束流式
+        is_error: True=以错误态结束
+
+    Returns:
+        True=更新成功, False=更新失败（非致命，调用方可继续或降级）。
+    """
+    token = _get_access_token()
+    if not token:
+        return False
+
+    payload = {
+        "outTrackId": out_track_id,
+        "guid": guid,
+        "key": key,
+        "content": content,
+        "isFull": is_full,
+        "isFinalize": is_finalize,
+        "isError": is_error,
+    }
+
+    try:
+        resp = requests.put(
+            "https://api.dingtalk.com/v1.0/card/streaming",
+            json=payload,
+            headers={
+                "x-acs-dingtalk-access-token": token,
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return True
+        logger.error("流式卡片更新失败: status=%s, body=%s", resp.status_code, resp.text)
+        return False
+    except Exception as e:
+        logger.error("流式卡片更新异常: %s", e, exc_info=True)
         return False

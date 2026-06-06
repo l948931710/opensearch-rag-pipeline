@@ -986,18 +986,140 @@ def expand_step_context(
 # 5. 统一检索入口
 # ═══════════════════════════════════════════════════════════════
 
+def cosurface_doc_images(
+    query: str,
+    chunks: List[Dict[str, Any]],
+    *,
+    user_dept: Optional[str] = None,
+    max_docs: int = 3,
+    max_images: int = 3,
+) -> List[Dict[str, Any]]:
+    """图片召回增强：为已检索高分文档补充其最相关的 image chunk。
+
+    背景：图片以独立 ``chunk_type="image"`` chunk 存在，与正文 chunk 在同一向量排序中
+    竞争。文本类 / 流程类查询往往让正文挤掉同文档的图片，导致答案缺图（即便文档其实有图）。
+
+    做法：对 top 文档做一次按 ``doc_id + chunk_type="image"`` 过滤的 kNN 查询，取与 query
+    最相关的图片，并**插入到其同文档正文 chunk 之后**（而非追加到末尾）—— 这样 ``<<IMG:N>>``
+    提示不会被 ``_format_context`` 的 ``max_context_chars`` 截断，LLM 才能引用到正确序号，
+    ``content_blocks_builder`` 才能绑定。``source_image`` 仅存于 HA3（不在 RDS chunk_meta），
+    故必须走 HA3 查询。
+
+    - 结果已含 image chunk（如可视化查询）→ 原样返回，不打扰既有多模态路径。
+    - 任何异常都 fail-open 返回原 chunks，绝不影响回答（与本模块整体降级风格一致）。
+
+    Args:
+        query: 用户查询文本（用于按相关度挑图）
+        chunks: 已检索 + 拼接后的 chunk 列表
+        user_dept: 用户部门（沿用权限过滤）
+        max_docs: 最多为前 N 个文档补图
+        max_images: 最多补充的图片总数
+
+    Returns:
+        在同文档正文之后插入了 image chunk 的新列表（原文本 chunk 顺序不变）。
+    """
+    if not chunks:
+        return chunks
+    # 已经有图片 chunk（可视化查询）→ 不重复补充
+    if any(c.get("chunk_type") == "image" for c in chunks):
+        return chunks
+
+    # top 文档（按结果顺序 = 相关度）
+    doc_ids: List[str] = []
+    for c in chunks:
+        d = c.get("doc_id")
+        if d and d not in doc_ids:
+            doc_ids.append(d)
+        if len(doc_ids) >= max_docs:
+            break
+    if not doc_ids:
+        return chunks
+
+    try:
+        cfg = get_config().alibaba_vector
+        from alibabacloud_ha3engine_vector.models import QueryRequest, SparseData
+
+        dense, sparse_idx, sparse_val = get_query_embedding(query)
+        sparse_data = (
+            SparseData(count=[len(sparse_idx)], indices=sparse_idx, values=sparse_val)
+            if sparse_idx else None
+        )
+
+        doc_clause = " OR ".join(
+            f'doc_id="{_sanitize_ha3_filter_value(d)}"' for d in doc_ids
+        )
+        if user_dept:
+            safe_dept = _sanitize_ha3_filter_value(user_dept)
+            perm = (
+                'permission_level="public"'
+                ' OR (permission_level="dept_internal" AND owner_dept="' + safe_dept + '")'
+            )
+        else:
+            perm = 'permission_level="public"'
+        filter_expr = f'chunk_type="image" AND ({doc_clause}) AND ({perm})'
+
+        _output_fields = [
+            "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
+            "category_l1", "chunk_index", "page_num", "kb_type",
+            "permission_level", "owner_dept", "chunk_type",
+            "source_image", "visual_summary",
+        ]
+        req = QueryRequest(
+            table_name=cfg.table_name,
+            vector=dense,
+            sparse_data=sparse_data,
+            top_k=max_images * 2,
+            include_vector=False,
+            output_fields=_output_fields,
+            filter=filter_expr,
+        )
+        img_results = _parse_ha3_response(_get_ha3_client().query(req))
+    except Exception as e:
+        logger.warning("图片召回补充失败 (non-fatal): %s", e)
+        return chunks
+
+    # 每个文档取最相关（首个）的有效图片
+    best_by_doc: Dict[str, Dict[str, Any]] = {}
+    for r in img_results:
+        if r.get("chunk_type") != "image" or not r.get("source_image"):
+            continue
+        d = r.get("doc_id")
+        if d and d not in best_by_doc:
+            best_by_doc[d] = r
+    if not best_by_doc:
+        return chunks
+
+    # 插入到同文档首个正文 chunk 之后；总量 ≤ max_images
+    out: List[Dict[str, Any]] = []
+    used_docs: set = set()
+    for c in chunks:
+        out.append(c)
+        d = c.get("doc_id")
+        if d in best_by_doc and d not in used_docs and len(used_docs) < max_images:
+            out.append(best_by_doc[d])
+            used_docs.add(d)
+
+    if used_docs:
+        logger.info("图片召回补充: 为 %d 个文档插入 image chunk（共 %d 候选文档）",
+                    len(used_docs), len(doc_ids))
+    return out
+
+
 def retrieve_and_enrich(
     query: str,
     *,
     top_k: int = 7,
     user_dept: Optional[str] = None,
     stitch_window: int = 1,
+    cosurface_images: bool = False,
 ) -> List[Dict[str, Any]]:
     """统一检索 + 后处理入口，供 API 和 DingTalk 共用。
 
     流程：
       1. search_chunks: 三路混合检索（Dense + Sparse + BM25）+ 封面降权
       2. stitch_neighbor_chunks: 邻居拼接解决 chunk 边界断裂
+      3. expand_step_context: step card 上下文扩展
+      4. cosurface_doc_images: 图片召回增强（仅多模态渲染路径 opt-in）
 
     参数选择依据（数据驱动）：
       - top_k=7 + window=1: 估算 context ~5,700 chars ≤ max_context_chars=6,000
@@ -1009,9 +1131,12 @@ def retrieve_and_enrich(
         top_k: 检索返回的 chunk 数量
         user_dept: 用户部门（用于权限过滤）
         stitch_window: 邻居拼接窗口大小（±N）
+        cosurface_images: 是否为高分文档补充 image chunk（图文渲染路径传 True；
+            纯文本路径 / 不展示图片的 /api/ask 保持 False，避免无谓的 HA3 查询）。
+            另受全局开关 RAG_IMAGE_COSURFACE 控制。
 
     Returns:
-        经过检索 + 邻居拼接后的 chunks 列表
+        经过检索 + 邻居拼接（+ 可选图片召回）后的 chunks 列表
     """
     chunks = search_chunks(query, top_k=top_k, user_dept=user_dept)
     if chunks and stitch_window > 0:
@@ -1019,4 +1144,7 @@ def retrieve_and_enrich(
     # Step Card 上下文扩展
     if chunks:
         chunks = expand_step_context(chunks, query)
+    # 图片召回增强（仅多模态渲染路径 opt-in；可经 RAG_IMAGE_COSURFACE 全局关闭）
+    if chunks and cosurface_images and get_config().rag.image_cosurface:
+        chunks = cosurface_doc_images(query, chunks, user_dept=user_dept)
     return chunks
