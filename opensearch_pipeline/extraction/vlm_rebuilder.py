@@ -22,12 +22,28 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from typing import List, Optional
+from typing import List
 
 logger = logging.getLogger(__name__)
 
 # 每页文本低于此字符数 → 视为"不可提取"，升级 VLM 重建
 _REBUILD_PAGE_CHAR_THRESHOLD = 30
+
+
+def _safe_int_level(v, default: int = 0) -> int:
+    """把 VLM 返回的 level 字段安全转成 int。
+
+    模型可能回 "一" / "1." / "H1" / None 等非纯整数；直接 int() 会抛 ValueError，
+    若未捕获会丢掉整页重建。容错解析失败时回落 default。
+    """
+    try:
+        return int(str(v).strip())
+    except (ValueError, TypeError):
+        pass
+    try:
+        return int(float(str(v).strip()))
+    except (ValueError, TypeError):
+        return default
 
 
 def _page_char_counts(pdf_path: str) -> List[int]:
@@ -186,6 +202,9 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
     if not allowed:
         print(f"    [vlm_rebuilder] cost gate DENIED rebuild of {len(escalate)} pages "
               f"(est {est.est_cost_rmb} RMB); falling back to rule output", flush=True)
+        # 成本封存：标记结果，让下游 (node_redact_or_quarantine → chunk/publish) 跳过本文档，
+        # 避免"RDS 已封存 / 索引里仍有 chunk"的裂脑状态。
+        result.cost_quarantined = True
         return result
 
     from opensearch_pipeline.extraction.schema import ExtractedBlock
@@ -199,21 +218,28 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
         recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime)
         page_blocks = []
         for b in recon:
-            bt = b.get("type", "paragraph")
-            if bt not in ("heading", "paragraph", "table"):
-                bt = "paragraph"
-            blk = ExtractedBlock(
-                block_type=bt, text=(b.get("text") or "").strip(),
-                level=int(b.get("level", 0) or 0), page_num=pidx + 1,
-                source="multimodal",
-            )
-            blk.extra = {"rebuilt_by": "vlm"}
-            page_blocks.append(blk)
+            # 单块容错：一个畸形块 (如 level="一") 不应丢掉整页重建
+            try:
+                bt = b.get("type", "paragraph")
+                if bt not in ("heading", "paragraph", "table"):
+                    bt = "paragraph"
+                blk = ExtractedBlock(
+                    block_type=bt, text=(b.get("text") or "").strip(),
+                    level=_safe_int_level(b.get("level")), page_num=pidx + 1,
+                    source="multimodal",
+                )
+                blk.extra = {"rebuilt_by": "vlm"}
+                page_blocks.append(blk)
+            except Exception as _be:
+                logger.warning("[vlm_rebuilder] skip malformed VLM block on page %s: %s", pidx + 1, _be)
+                continue
         if page_blocks:
             new_blocks_by_page[pidx + 1] = page_blocks
             added += len(page_blocks)
 
     if not added:
+        # 放行但实际未产生任何重建块 (渲染/VLM 全失败) → 退还预留，勿空耗运行预算
+        breaker.refund(gate_doc["doc_id"], est)
         return result
 
     # 先算 recovered 文本（在拼回消费 new_blocks_by_page 之前）
@@ -334,6 +360,9 @@ def maybe_refine_tables(task: dict, result, cfg, breaker=None):
         return result
     if (result.file_ext or "").lower() != "pdf":
         return result
+    # 该文档已被 rebuild 阶段成本封存 → 不再花钱精修一个将被跳过的文档
+    if getattr(result, "cost_quarantined", False):
+        return result
     local_path = task.get("local_path", "")
     if not local_path:
         return result
@@ -355,7 +384,11 @@ def maybe_refine_tables(task: dict, result, cfg, breaker=None):
         "file_ext": "pdf", "owner_dept": task.get("owner_dept", "unknown"),
         "unit_count": 0, "cached_count": 0, "ocr_page_count": len(pages),
     }
-    allowed, est = gate_vlm_rebuild(breaker, gate_doc, simulate_db=bool(getattr(cfg, "simulate_db", True)))
+    # 表格精修是可选"锦上添花"：成本拒绝时只跳过精修、保留原生表格，绝不封存文档
+    # (quarantine_on_deny=False)。文档本身可用，不能因可选精修被否决而被丢出索引。
+    allowed, est = gate_vlm_rebuild(breaker, gate_doc,
+                                    simulate_db=bool(getattr(cfg, "simulate_db", True)),
+                                    quarantine_on_deny=False)
     if not allowed:
         print(f"    [table_refine] cost gate DENIED ({len(pages)} page(s), "
               f"est {est.est_cost_rmb} RMB); keeping native tables", flush=True)
@@ -399,4 +432,7 @@ def maybe_refine_tables(task: dict, result, cfg, breaker=None):
         result.extract_method = (result.extract_method or "") + "+vlm_table_refine"
         print(f"    [table_refine] refined {refined} table(s), rejected {rejected} "
               f"(number-fidelity), across {len(pages)} page(s)", flush=True)
+    else:
+        # 放行但无一张表通过数字保真闸 → 退还预留，勿空耗运行预算
+        breaker.refund(gate_doc["doc_id"], est)
     return result

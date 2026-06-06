@@ -78,6 +78,9 @@ class ExtractionResult:
     warnings: List[str] = field(default_factory=list)
     assets: List[Dict[str, Any]] = field(default_factory=list)
 
+    # 成本封存：VLM-rebuild 成本闸拒绝本文档 → 下游应跳过切块/索引 (避免裂脑状态)
+    cost_quarantined: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "doc_id": self.doc_id,
@@ -94,4 +97,5 @@ class ExtractionResult:
             "ocr_status": self.ocr_status,
             "warnings": self.warnings,
             "assets": self.assets,
+            "cost_quarantined": self.cost_quarantined,
         }

@@ -73,27 +73,95 @@ def test_per_doc_deny_max_pages_cache_independent():
     assert "hard cap" in reason
 
 
-# ── run-level circuit breaker ─────────────────────────────────────
-def test_run_budget_trip():
-    cfg = make_cfg(run_budget_rmb=1.0)
+# ── run-level circuit breaker (atomic try_reserve) ────────────────
+def test_run_budget_trips_at_cap():
+    cfg = make_cfg(run_budget_rmb=1.2)
     br = CostBreaker(cfg)
     est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=cfg)  # 0.40
-    a1, _ = br.check("d1", est); br.record("d1", est, a1)   # 0.40
-    a2, _ = br.check("d2", est); br.record("d2", est, a2)   # 0.80
-    assert a1 and a2
-    a3, r3 = br.check("d3", est)                            # 0.80+0.40=1.20 > 1.0
-    br.record("d3", est, a3)
-    assert not a3 and br.tripped
-    a4, r4 = br.check("d4", est)
+    assert br.try_reserve("d1", est)[0]   # 0.40
+    assert br.try_reserve("d2", est)[0]   # 0.80
+    a3, _ = br.try_reserve("d3", est)     # 1.20 == cap → allowed and trips
+    assert a3 and br.tripped
+    a4, r4 = br.try_reserve("d4", est)
     assert not a4 and r4.startswith("RUN budget exhausted")
 
 
-def test_run_alert_once():
-    cfg = make_cfg(run_budget_rmb=0.1)
+def test_big_doc_does_not_overtrip():
+    # #10d: a doc too big for the REMAINING budget is denied but must NOT permanently
+    # trip the breaker — a smaller later doc that still fits is allowed.
+    cfg = make_cfg(run_budget_rmb=1.0)
     br = CostBreaker(cfg)
-    est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=cfg)  # 0.40 > 0.1
-    a, _ = br.check("d", est); br.record("d", est, a)
-    assert br.tripped
+    big = estimate_doc_cost("pdf", unit_count=20, cached_count=0, cfg=cfg)  # 0.80
+    assert br.try_reserve("d1", big)[0]   # 0.80
+    too_big = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=cfg)  # 0.40 → 1.20 > 1.0
+    a2, r2 = br.try_reserve("d2", too_big)
+    assert not a2 and "exceed RUN budget" in r2
+    assert not br.tripped, "one over-remaining-budget doc must not permanently trip the breaker"
+    small = estimate_doc_cost("pdf", unit_count=0, cached_count=0, cfg=cfg, ocr_page_count=3)  # 0.18 → 0.98
+    assert br.try_reserve("d3", small)[0], "smaller later doc fitting remaining budget must still pass"
+
+
+def test_try_reserve_atomic_no_overshoot():
+    # #10b: budget admits exactly 10 docs of 0.04; 100 threads race → exactly 10 allowed,
+    # cumulative never exceeds the cap (atomic check+reserve, no TOCTOU overshoot).
+    cfg = make_cfg(run_budget_rmb=0.40)
+    br = CostBreaker(cfg)
+    est = estimate_doc_cost("pdf", unit_count=1, cached_count=0, cfg=cfg)  # 0.04
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        results = list(ex.map(lambda i: br.try_reserve(f"d{i}", est)[0], range(100)))
+    assert sum(results) == 10
+    assert br.run_total_rmb <= 0.40 + 1e-9
+
+
+def test_refund_returns_budget():
+    # #10c: a reserved-but-unspent estimate is refunded so it doesn't consume the run budget.
+    cfg = make_cfg(run_budget_rmb=1.0)
+    br = CostBreaker(cfg)
+    est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=cfg)  # 0.40
+    assert br.try_reserve("d", est)[0]
+    assert br.run_total_rmb == pytest.approx(0.40)
+    br.refund("d", est)
+    assert br.run_total_rmb == pytest.approx(0.0)
+
+
+def test_refund_untrips_when_back_under_cap():
+    cfg = make_cfg(run_budget_rmb=0.40)
+    br = CostBreaker(cfg)
+    est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=cfg)  # 0.40 == cap
+    assert br.try_reserve("d", est)[0] and br.tripped
+    br.refund("d", est)
+    assert not br.tripped
+
+
+def test_refund_of_unreserved_doc_does_not_wipe_others():
+    # hardened refund: refunding a doc_id that never reserved must be a no-op, not decrement
+    # the shared run total (which would silently wipe other docs' reservations).
+    cfg = make_cfg(run_budget_rmb=10.0)
+    br = CostBreaker(cfg)
+    est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=cfg)  # 0.40
+    assert br.try_reserve("d1", est)[0]
+    br.refund("d2_never_reserved", est)
+    assert br.run_total_rmb == pytest.approx(0.40), "orphan refund must not touch other reservations"
+    br.refund("d1", est)  # legitimate refund
+    assert br.run_total_rmb == pytest.approx(0.0)
+
+
+def test_per_doc_cumulative_across_calls():
+    # #10a: the SAME doc reserved twice (rebuild + refine) shares one per-doc budget,
+    # so combined spend can't exceed doc_budget (was: each call checked independently → 2x).
+    cfg = make_cfg(doc_budget_rmb=0.5, max_pages=1000, run_budget_rmb=100.0)
+    br = CostBreaker(cfg)
+    est = estimate_doc_cost("pdf", unit_count=0, cached_count=0, cfg=cfg, ocr_page_count=5)  # 0.30
+    a1, _ = br.try_reserve("d", est)   # 0.30 <= 0.5
+    a2, r2 = br.try_reserve("d", est)  # 0.30+0.30=0.60 > 0.5 → denied
+    assert a1 and not a2 and "per-doc" in r2
+
+
+def test_run_alert_once():
+    cfg = make_cfg(run_budget_rmb=0.30)
+    br = CostBreaker(cfg)
+    est = estimate_doc_cost("pdf", unit_count=0, cached_count=0, cfg=cfg, ocr_page_count=5)  # 0.30 == cap
+    assert br.try_reserve("d", est)[0] and br.tripped
     assert br.maybe_alert_run_tripped() is True
     assert br.maybe_alert_run_tripped() is False
 

@@ -609,6 +609,8 @@ def node_build_canonical(ctx: dict):
                 "ocr_status": result.ocr_status,
                 "warnings": result.warnings,
                 "assets": result.assets,
+                # 成本封存标记：VLM-rebuild 成本闸拒绝 → node_redact_or_quarantine 据此跳过
+                "cost_quarantined": getattr(result, "cost_quarantined", False),
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result.doc_id}"
@@ -1434,6 +1436,14 @@ def node_redact_or_quarantine(ctx: dict):
     canonicals = ctx["canonicals"]
 
     for doc in canonicals:
+        # 成本封存：VLM-rebuild 成本闸已拒绝本文档并写 RDS 封存 → 复用 QUARANTINE 跳过路径，
+        # 阻止其进入切块/索引 (否则 RDS 已封存而索引里仍写入 chunk → 裂脑)。
+        if doc.get("cost_quarantined"):
+            doc["redaction_action"] = "QUARANTINE"
+            doc["redacted_text"] = None
+            print(f"    └─ {doc['doc_id']}: QUARANTINE (cost ceiling exceeded)")
+            continue
+
         final_risk = doc.get("risk_level", "low")
 
         if final_risk == "high":
@@ -2457,19 +2467,64 @@ def node_chunk_documents(ctx: dict):
                 for a in assets:
                     if a.get("status") == "ROUTE_TO_VECTOR":
                         slide_imgs.setdefault(a.get("page_num"), []).append(a)
+                def _slide_img_refs(imgs):
+                    return [{
+                        "filename": a.get("filename", ""),
+                        "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{a.get('filename', '')}",
+                        "page_num": a.get("page_num"),
+                        "image_category": a.get("image_category", "unknown"),
+                        "visual_summary": a.get("visual_summary", ""),
+                        "ocr_text": a.get("ocr_text", ""),
+                    } for a in imgs]
+
                 for c in chunks:
                     imgs = slide_imgs.get(c.page_num, [])
                     if imgs:
-                        c.extra["image_refs"] = [{
-                            "filename": a.get("filename", ""),
-                            "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{a.get('filename', '')}",
-                            "page_num": a.get("page_num"),
-                            "image_category": a.get("image_category", "unknown"),
-                            "visual_summary": a.get("visual_summary", ""),
-                            "ocr_text": a.get("ocr_text", ""),
-                        } for a in imgs]
+                        refs = _slide_img_refs(imgs)
+                        c.extra["image_refs"] = refs
+                        # 关键：把首图提升为顶层 source_image（+visual_summary），使其被
+                        # to_ha3_doc 索引。visual_knowledge 不走 step_card 的 RDS 重建路径，
+                        # 若仅存 image_refs 则只落库 RDS、不进 HA3 → 检索期取不到图、
+                        # 幻灯片图片无法展示。
+                        c.extra["source_image"] = refs[0]["oss_key"]
+                        if refs[0].get("visual_summary"):
+                            c.extra.setdefault("visual_summary", refs[0]["visual_summary"])
                         # 含产品图/示意图的 slide → visual_knowledge
                         c.chunk_type = "visual_knowledge"
+
+                # 图片型 slide（无文字 → _chunk_by_slide 未产出 chunk）：单独建
+                # visual_knowledge chunk，否则该页图片无 chunk 可绑、在摄取期被丢弃。
+                bound_pages = {c.page_num for c in chunks}
+                from opensearch_pipeline.chunker import _generate_chunk_id, _estimate_tokens
+                _next_idx = len(chunks)
+                for pg, imgs in slide_imgs.items():
+                    if pg in bound_pages or not imgs:
+                        continue
+                    refs = _slide_img_refs(imgs)
+                    _summary = refs[0].get("visual_summary", "")
+                    _title = doc.get("title", "")
+                    _prefix = f"【文档:{_title}】" if _title else ""
+                    _ctext = (f"{_prefix} [图片描述] {_summary}").strip()
+                    slide_chunk = Chunk(
+                        chunk_id=_generate_chunk_id(d_id, version, _next_idx),
+                        doc_id=d_id, version_no=version, chunk_index=_next_idx,
+                        chunk_type="visual_knowledge", chunk_text=_ctext,
+                        token_count=_estimate_tokens(_ctext), raw_text=_ctext,
+                        page_num=pg, source_oss_key=doc.get("canonical_key", ""),
+                        source="multimodal", title=_title, owner_dept=dept_code,
+                        category_l1=doc.get("category_l1", ""), category_l2=doc.get("category_l2", ""),
+                        permission_level=doc.get("permission_level", "public"),
+                        kb_type=doc.get("kb_type", "public"), risk_level=doc.get("risk_level", "low"),
+                        sensitive_redacted=doc.get("redaction_action") == "REDACTED",
+                        is_active=True, embedding_status="NOT_STARTED", index_status="NOT_INDEXED",
+                        extra={
+                            "image_refs": refs,
+                            "source_image": refs[0]["oss_key"],
+                            "visual_summary": _summary,
+                        },
+                    )
+                    chunks.append(slide_chunk)
+                    _next_idx += 1
 
         # ─── 设备清扫基准书：把部位照片绑定到对应"清扫部位" chunk ───
         # 提取阶段已为每张图片标注 part_labels（匹配清扫部位名）与 anchor_row。

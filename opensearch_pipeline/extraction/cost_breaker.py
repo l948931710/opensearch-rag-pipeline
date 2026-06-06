@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 UNIT_OCR_PAGE = "ocr_page"     # PDF OCR-fallback：每页一次 OCR 调用
 UNIT_VLM_IMAGE = "vlm_image"   # 嵌入式图片：每张一次 VLM (+OCR) 调用
 
+# 预算比较容差：RMB 浮点累加会漂移 (0.4+0.4+0.4=1.2000…0666)，
+# 恰好等于上限的预留不应被误拒。
+_BUDGET_EPS = 1e-6
+
 
 @dataclass
 class CostEstimate:
@@ -98,58 +102,138 @@ class CostBreaker:
         self._run_alert_sent = False
         self._doc_denied = 0
         self._doc_allowed = 0
+        # 单文档累计预留 (doc_id -> reserved rmb)：让同一文档的 rebuild + refine 两次
+        # 调用共用同一份 per-doc 预算，避免一个文档花费突破 doc_budget 的两倍。
+        self._doc_reserved: dict = {}
 
-    def check(self, doc_id: str, est: CostEstimate) -> Tuple[bool, Optional[str]]:
-        """决定该文档是否允许进入 VLM-rebuild。在执行 VLM *之前* 调用 (不修改累计计数器)。
-
-        Returns (allowed, reason): allowed=False 时 reason 为人类可读封存理由。
-        """
-        if not self.enabled:
-            return True, None  # 标志关闭 → 永远放行
-
+    def _gate_estimate(self, est: CostEstimate) -> Optional[str]:
+        """纯估算闸 (闸 1/2，无共享状态)。返回拒绝理由，或 None 表示通过。"""
         rb = self.cfg.rebuild
-
-        # 闸 3：运行级熔断已触发 → 后续全拒
-        if self._run_tripped:
-            return False, (
-                f"RUN budget exhausted: cumulative {self._run_total_rmb:.2f} RMB "
-                f">= run cap {rb.run_budget_rmb:.2f} RMB; VLM rebuild disabled for remainder of run"
-            )
-
-        # 闸 1：单文档硬单元上限 (原始单元，不扣缓存)
         if est.raw_units > rb.max_pages:
-            return False, (
+            return (
                 f"unit count {est.raw_units} exceeds per-doc hard cap {rb.max_pages} "
                 f"(file_ext={est.file_ext}, breakdown={est.breakdown})"
             )
-
-        # 闸 2：单文档预算
-        if est.est_cost_rmb > rb.doc_budget_rmb:
-            return False, (
+        if est.est_cost_rmb > rb.doc_budget_rmb + _BUDGET_EPS:
+            return (
                 f"VLM rebuild est {est.est_cost_rmb:.2f} RMB > per-doc budget "
                 f"{rb.doc_budget_rmb:.2f} RMB (billable_units={est.billable_units}, "
                 f"breakdown={est.breakdown})"
             )
+        return None
 
-        # 闸 3 预判：若加上本文档会越过运行预算，现在就拒并标记 trip
+    def try_reserve(self, doc_id: str, est: CostEstimate) -> Tuple[bool, Optional[str]]:
+        """原子"检查并预留"：在单次加锁内完成全部闸判定并预留预算，杜绝 check→record
+        之间的竞态 (并发线程同时通过预判却各自记账导致越界)。
+
+        - 同一 doc_id 多次调用 (rebuild + refine) 共用 per-doc 预算 (累计计入 doc_budget)。
+        - 单个文档放不下"剩余"运行预算时只拒绝该文档，**不**永久熔断 —— 后续更小的文档仍可通过。
+        - 仅当累计实际预留达到 run 上限才置 _run_tripped。
+        若放行后该文档实际未产生 VLM 调用 (渲染失败/无重建块/表格全被拒)，调用方应 refund()。
+
+        Returns (allowed, reason)。
+        """
+        if not self.enabled:
+            return True, None  # 标志关闭 → 永远放行
+
+        # 闸 1/2：纯估算，无需锁
+        gate_reason = self._gate_estimate(est)
+        if gate_reason is not None:
+            with self._lock:
+                self._doc_denied += 1
+            return False, gate_reason
+
+        rb = self.cfg.rebuild
         with self._lock:
-            if self._run_total_rmb + est.est_cost_rmb > rb.run_budget_rmb:
-                self._run_tripped = True
+            if self._run_tripped:
+                self._doc_denied += 1
+                return False, (
+                    f"RUN budget exhausted: cumulative {self._run_total_rmb:.2f} RMB "
+                    f">= run cap {rb.run_budget_rmb:.2f} RMB; VLM rebuild disabled for remainder of run"
+                )
+            # 闸 2b：同一文档累计 (rebuild + refine) 不得突破 per-doc 预算
+            doc_prev = self._doc_reserved.get(doc_id, 0.0)
+            if doc_prev + est.est_cost_rmb > rb.doc_budget_rmb + _BUDGET_EPS:
+                self._doc_denied += 1
+                return False, (
+                    f"per-doc budget exceeded for {doc_id}: reserved {doc_prev:.2f} "
+                    f"+ {est.est_cost_rmb:.2f} > {rb.doc_budget_rmb:.2f} RMB"
+                )
+            # 闸 3：放不下剩余运行预算 → 只拒本文档，不永久熔断 (避免一个大文档误杀后续小文档)
+            if self._run_total_rmb + est.est_cost_rmb > rb.run_budget_rmb + _BUDGET_EPS:
+                self._doc_denied += 1
                 return False, (
                     f"would exceed RUN budget: cumulative {self._run_total_rmb:.2f} "
                     f"+ {est.est_cost_rmb:.2f} > run cap {rb.run_budget_rmb:.2f} RMB"
                 )
+            # 预留 (与上述判定原子)
+            self._run_total_rmb += est.est_cost_rmb
+            self._doc_reserved[doc_id] = doc_prev + est.est_cost_rmb
+            self._doc_allowed += 1
+            if self._run_total_rmb >= rb.run_budget_rmb:
+                self._run_tripped = True
+            return True, None
 
+    def refund(self, doc_id: str, est: CostEstimate) -> None:
+        """退还一笔已预留但未实际花费的预算 (渲染失败/无重建块/表格全被拒)。
+        让 run 预算不被空跑的工作消耗 (修复 charge-before-work)。线程安全。
+
+        只退还该 doc_id 实际预留过的额度 (min(est, 已预留))：避免误退一个未预留的
+        doc_id 把共享 run 计数器扣穿、连带抹掉其它文档的预留。
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            reserved = self._doc_reserved.get(doc_id, 0.0)
+            amount = min(est.est_cost_rmb, reserved)
+            if amount <= 0:
+                return
+            self._run_total_rmb = max(0.0, self._run_total_rmb - amount)
+            self._doc_reserved[doc_id] = reserved - amount
+            # 退还后回落到上限之下 → 解除熔断 (反映真实可用预算)
+            if self._run_tripped and self._run_total_rmb < self.cfg.rebuild.run_budget_rmb:
+                self._run_tripped = False
+
+    def check(self, doc_id: str, est: CostEstimate) -> Tuple[bool, Optional[str]]:
+        """只读预判 (不修改任何计数器)：判断该文档此刻是否会被放行。
+
+        ⚠️ 非原子：check() 与 record() 之间存在竞态，生产路径请用 try_reserve()。
+        保留此方法仅供只读探测与向后兼容。
+        """
+        if not self.enabled:
+            return True, None
+
+        rb = self.cfg.rebuild
+        with self._lock:
+            tripped = self._run_tripped
+            total = self._run_total_rmb
+        if tripped:
+            return False, (
+                f"RUN budget exhausted: cumulative {total:.2f} RMB "
+                f">= run cap {rb.run_budget_rmb:.2f} RMB; VLM rebuild disabled for remainder of run"
+            )
+        gate_reason = self._gate_estimate(est)
+        if gate_reason is not None:
+            return False, gate_reason
+        if total + est.est_cost_rmb > rb.run_budget_rmb + _BUDGET_EPS:
+            return False, (
+                f"would exceed RUN budget: cumulative {total:.2f} "
+                f"+ {est.est_cost_rmb:.2f} > run cap {rb.run_budget_rmb:.2f} RMB"
+            )
         return True, None
 
     def record(self, doc_id: str, est: CostEstimate, allowed: bool) -> None:
-        """记录一次决策，累加运行级花费 (仅 allowed=True 时累计)。线程安全。"""
+        """记录一次决策，累加运行级花费 (仅 allowed=True 时累计)。线程安全。
+
+        ⚠️ 非原子：与 check() 配对使用存在竞态 (见 check())。生产路径请用 try_reserve()。
+        """
         if not self.enabled:
             return
         with self._lock:
             if allowed:
                 self._doc_allowed += 1
                 self._run_total_rmb += est.est_cost_rmb
+                self._doc_reserved[doc_id] = self._doc_reserved.get(doc_id, 0.0) + est.est_cost_rmb
                 if self._run_total_rmb >= self.cfg.rebuild.run_budget_rmb:
                     self._run_tripped = True
             else:
@@ -182,7 +266,8 @@ class CostBreaker:
 
     @property
     def tripped(self) -> bool:
-        return self._run_tripped
+        with self._lock:
+            return self._run_tripped
 
 
 def quarantine_for_cost(
@@ -272,15 +357,19 @@ def quarantine_for_cost(
                 pass
 
 
-def gate_vlm_rebuild(breaker: CostBreaker, doc: dict, simulate_db: bool = True
-                     ) -> Tuple[bool, CostEstimate]:
+def gate_vlm_rebuild(breaker: CostBreaker, doc: dict, simulate_db: bool = True,
+                     *, quarantine_on_deny: bool = True) -> Tuple[bool, CostEstimate]:
     """VLM-rebuild 升级前置闸 —— 未来的 rebuilder 在做任何 OCR/VLM 之前调用此函数。
 
     doc 需含: doc_id, version_no, file_ext, owner_dept, 及预先统计好的
               unit_count / cached_count / ocr_page_count(= min(page_count, cfg.ocr.max_ocr_pages))。
 
-    Returns (allowed, est)。allowed=False → 本函数已完成封存 (quarantine_for_cost) +
-    运行级告警；调用方必须回退到确定性规则输出 (绝不丢弃文档)。
+    quarantine_on_deny:
+      True  (默认，用于 rebuild 升级) → 拒绝即封存文档 (该文档不可提取，回退规则输出近乎为空)。
+      False (用于可选的表格精修) → 拒绝只是跳过这次"锦上添花"的精修、保留原生表格，
+            **不**封存文档 (文档本身可用，绝不因可选精修被否决而丢弃)。
+
+    Returns (allowed, est)。allowed=False 时调用方必须回退到确定性规则输出 (绝不丢弃文档)。
     """
     est = estimate_doc_cost(
         file_ext=doc.get("file_ext", ""),
@@ -290,13 +379,15 @@ def gate_vlm_rebuild(breaker: CostBreaker, doc: dict, simulate_db: bool = True
         ocr_page_count=int(doc.get("ocr_page_count", 0)),
         ocr_cached_count=0,
     )
-    allowed, reason = breaker.check(doc["doc_id"], est)
-    breaker.record(doc["doc_id"], est, allowed)
+    # 原子"检查并预留"：避免 check→record 竞态与重复记账。放行后若实际未发生 VLM 调用，
+    # 调用方 (vlm_rebuilder) 须 breaker.refund(doc_id, est) 退还本次预留。
+    allowed, reason = breaker.try_reserve(doc["doc_id"], est)
     if not allowed:
-        quarantine_for_cost(
-            doc["doc_id"], int(doc.get("version_no", 1)),
-            doc.get("owner_dept", "unknown"), reason or "cost ceiling exceeded",
-            simulate_db=simulate_db,
-        )
+        if quarantine_on_deny:
+            quarantine_for_cost(
+                doc["doc_id"], int(doc.get("version_no", 1)),
+                doc.get("owner_dept", "unknown"), reason or "cost ceiling exceeded",
+                simulate_db=simulate_db,
+            )
         breaker.maybe_alert_run_tripped()
     return allowed, est
