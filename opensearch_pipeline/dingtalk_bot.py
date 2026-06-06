@@ -514,19 +514,23 @@ def _stream_answer_to_card(
             guid=guid, key=stream_key, is_full=True, is_finalize=True, is_error=True,
         )
 
-    # 流式完成后置位 is_answer_done=true：模板里反馈按钮的可见性以此为门控
-    # （流式期间为空 → 按钮隐藏；完成后置 true → 按钮出现）。仅成功时展示反馈按钮。
-    # 非致命：update_card_data 自身吞异常并返回 False。
+    llm_latency_ms = int((time.time() - t_retrieval) * 1000)
+    latency_ms = int((time.time() - t0) * 1000)
+    top_score = max((c.get("score", 0) for c in chunks), default=None)
+
+    # 流式完成后置位 is_answer_done=true（模板反馈按钮可见性以此为门控：流式期间为空→隐藏，
+    # 完成后置 true→出现），并补全 meta 的耗时（与成品卡片页脚一致：模型 + 耗时）。
+    # 仅成功时展示反馈按钮。非致命：update_card_data 自身吞异常并返回 False。
     if answer_status == "SUCCESS":
-        update_card_data(message_id, {"is_answer_done": "true"})
+        update_card_data(message_id, {
+            "is_answer_done": "true",
+            "meta": f"模型: {model_name} | 耗时: {latency_ms / 1000:.1f}s",
+        })
 
     # 写历史（仅成功且有内容时）+ 落库（与非流式路径一致的反馈语义）
     if full_answer and answer_status == "SUCCESS":
         append_to_history(session_key, question, full_answer)
 
-    llm_latency_ms = int((time.time() - t_retrieval) * 1000)
-    latency_ms = int((time.time() - t0) * 1000)
-    top_score = max((c.get("score", 0) for c in chunks), default=None)
     log_qa_session(
         session_id=session_key,
         message_id=message_id,

@@ -89,8 +89,12 @@ def test_streaming_card_happy_path(
     assert "<<IMG" not in final_content and "IMG:1" not in final_content
     assert "住宿申请" in final_content
 
-    # 4. 完成后置位 is_answer_done=true（触发反馈按钮显示）
-    mock_card_data.assert_called_once_with("msg-123", {"is_answer_done": "true"})
+    # 4. 完成后置位 is_answer_done=true（触发反馈按钮显示）+ 补全 meta 耗时
+    mock_card_data.assert_called_once()
+    cd_mid, cd_payload = mock_card_data.call_args.args
+    assert cd_mid == "msg-123"
+    assert cd_payload["is_answer_done"] == "true"
+    assert cd_payload["meta"].startswith("模型: qwen3.6-plus") and "耗时" in cd_payload["meta"]
 
     # 5. 写历史 + 落库（与非流式一致）
     mock_append.assert_called_once()

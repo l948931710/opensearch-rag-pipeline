@@ -16,22 +16,23 @@ streaming + a feedback action area.
 | Template variable | Set by | Notes |
 |---|---|---|
 | `answer` | `streaming_update_card(key="answer")` | The streamed answer. `AICardContent` renders this. **Stream key = `answer`** (code default; `DINGTALK_STREAM_CARD_KEY` overrides). |
-| `question` / `sources_text` / `meta` | `create_streaming_card` | set up front |
+| `question` / `sources_text` | `create_streaming_card` | set up front |
+| `meta` | `create_streaming_card` (model) → `update_card_data` on finalize (adds 耗时) | footer: `模型: X | 耗时: Ys` (latency filled in at finalize) |
 | `message_id` (private) | `create_streaming_card` (privateData) | feedback join key → `qa_session_log.message_id` |
 | `feedback_status` (private) | callback response / `update_card_feedback_status` | "✅ 已反馈…" after a click |
-| **`is_answer_done`** | **`update_card_data(…, {"is_answer_done":"true"})` on stream finalize** | **Feedback buttons are gated on `is_answer_done=="true"`.** Empty during streaming → buttons hidden; set `"true"` on finalize → buttons appear. ⚠️ **Must be declared as a public variable in the template** (it's referenced in visibility conditions but was not in the export's variableList — add it in 变量/公有变量 or the update is ignored and buttons never show). |
+| **`is_answer_done`** (declared public var) | **`update_card_data(…, {"is_answer_done":"true"})` on stream finalize** | **Feedback buttons are gated on `is_answer_done=="true"`.** Empty during streaming → buttons hidden; set `"true"` on finalize → buttons appear. (Declared in this template's variableList; backend sets it on finalize.) |
 
 **Feedback button actions** (what the callback handler `/dingtalk/card/callback` expects in
 `cardPrivateData.params`): `action` ∈ `upvote` · `downvote` (+ `reason` ∈ `inaccurate`/`incomplete`/
-`irrelevant`/`outdated`) · `handoff` · `downvote_other_start` · `downvote_other_submit` — plus `message_id`.
+`irrelevant`/`outdated`/`not_found`) · `handoff` · `downvote_other_start` · `downvote_other_submit` —
+plus `message_id`. (不喜欢 dropdown reasons: 答案不准确/答非所问/回答不完整/内容已过时/**未找到答案**/其他原因.)
 
-**⚠️ Native like/dislike is NOT wired.** The native `Feedback` component (`enableLikeDislike`) has no
-action/callback config (`actionType: none`) — it only feeds DingTalk's internal feedback and does **not**
-reach this backend. Backend-logged feedback comes only from the custom buttons above. Don't remove the
-custom buttons in favor of the native 👍👎 unless you wire equivalents.
+**Native like/dislike is disabled** in this template (`enableLikeDislike: false`). The native `Feedback`
+component has no action/callback config, so it only feeds DingTalk's internal feedback and does **not**
+reach this backend — backend-logged feedback comes only from the custom 喜欢/不喜欢/转人工 buttons above.
 
 ### Enable it
-1. Import this JSON in the card builder; ensure `is_answer_done` is a declared public variable; publish.
+1. Import this JSON in the card builder; `is_answer_done` is already declared; publish.
 2. Env: `RAG_DINGTALK_STREAMING=true`, `DINGTALK_STREAM_CARD_TEMPLATE_ID=<template id>`
    (optional `RAG_DINGTALK_STREAM_INTERVAL_MS=500`; `DINGTALK_STREAM_CARD_KEY` defaults to `answer`).
 3. Off by default → the bot falls back to the non-streaming finished card, so enabling is opt-in.
