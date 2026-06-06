@@ -37,6 +37,7 @@ from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_feedback_status,
+    update_card_data,
     create_streaming_card,
     streaming_update_card,
     _strip_trailing_sources,
@@ -437,7 +438,9 @@ def _stream_answer_to_card(
                  非流式成品卡片路径（不会重复落库）。
     """
     cfg = get_config()
-    stream_key = os.environ.get("DINGTALK_STREAM_CARD_KEY", "content")
+    # 默认 "answer"：本项目的流式 AI 卡片把可见答案组件（AICardContent / Markdown）绑定到
+    # answer 变量；流式更新与初始占位都写入该变量。可经 DINGTALK_STREAM_CARD_KEY 覆盖。
+    stream_key = os.environ.get("DINGTALK_STREAM_CARD_KEY", "answer")
     model_name = cfg.llm.model
     sources = _extract_sources(chunks)
 
@@ -510,6 +513,12 @@ def _stream_answer_to_card(
             full_answer or f"❌ 回答生成失败，请稍后重试。(trace: {trace_id})",
             guid=guid, key=stream_key, is_full=True, is_finalize=True, is_error=True,
         )
+
+    # 流式完成后置位 is_answer_done=true：模板里反馈按钮的可见性以此为门控
+    # （流式期间为空 → 按钮隐藏；完成后置 true → 按钮出现）。仅成功时展示反馈按钮。
+    # 非致命：update_card_data 自身吞异常并返回 False。
+    if answer_status == "SUCCESS":
+        update_card_data(message_id, {"is_answer_done": "true"})
 
     # 写历史（仅成功且有内容时）+ 落库（与非流式路径一致的反馈语义）
     if full_answer and answer_status == "SUCCESS":

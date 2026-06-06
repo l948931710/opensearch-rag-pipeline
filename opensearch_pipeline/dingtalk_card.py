@@ -366,21 +366,15 @@ def send_interactive_card(
 # 卡片更新（反馈后替换按钮）
 # ═══════════════════════════════════════════════════════════════
 
-def update_card_feedback_status(
-    message_id: str,
-    feedback_status: str,
-) -> bool:
-    """
-    更新卡片的 feedback_status 变量（将按钮替换为反馈确认文本）。
+def update_card_data(message_id: str, card_param_map: Dict[str, str]) -> bool:
+    """通用：更新卡片公有数据变量（PUT https://api.dingtalk.com/v1.0/card/instances）。
 
-    PUT https://api.dingtalk.com/v1.0/card/instances
+    用于反馈状态切换、流式完成后置位 is_answer_done（触发反馈按钮显示）等。
+    失败只记日志、返回 False，绝不抛出。
 
     Args:
         message_id: outTrackId（发送卡片时设定的）
-        feedback_status: 例如 "✅ 已反馈：有帮助"
-
-    Returns:
-        True=更新成功, False=更新失败
+        card_param_map: 要覆盖写入的公有变量，如 {"feedback_status": "..."} 或 {"is_answer_done": "true"}
     """
     token = _get_access_token()
     if not token:
@@ -388,11 +382,7 @@ def update_card_feedback_status(
 
     payload = {
         "outTrackId": message_id,
-        "cardData": {
-            "cardParamMap": {
-                "feedback_status": feedback_status,
-            },
-        },
+        "cardData": {"cardParamMap": card_param_map},
     }
 
     try:
@@ -406,18 +396,24 @@ def update_card_feedback_status(
             timeout=10,
         )
         if resp.status_code == 200:
-            logger.info("卡片状态更新成功: message_id=%s, status=%s", message_id, feedback_status)
+            logger.info("卡片数据更新成功: message_id=%s, keys=%s", message_id, list(card_param_map.keys()))
             return True
-        else:
-            logger.error(
-                "卡片状态更新失败: status=%s, body=%s",
-                resp.status_code, resp.text,
-            )
-            return False
-
-    except Exception as e:
-        logger.error("卡片状态更新异常: %s", e, exc_info=True)
+        logger.error("卡片数据更新失败: status=%s, body=%s", resp.status_code, resp.text)
         return False
+    except Exception as e:
+        logger.error("卡片数据更新异常: %s", e, exc_info=True)
+        return False
+
+
+def update_card_feedback_status(
+    message_id: str,
+    feedback_status: str,
+) -> bool:
+    """更新卡片的 feedback_status 变量（将按钮替换为反馈确认文本）。
+
+    PUT https://api.dingtalk.com/v1.0/card/instances（委托给 update_card_data）。
+    """
+    return update_card_data(message_id, {"feedback_status": feedback_status})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -433,7 +429,7 @@ def create_streaming_card(
     question: str,
     sources: List[Dict[str, Any]],
     model: str,
-    stream_key: str = "content",
+    stream_key: str = "answer",
 ) -> bool:
     """投放一张流式 AI 卡片占位（流式变量初始为空，随后由 streaming_update_card 逐步填充）。
 
@@ -466,6 +462,9 @@ def create_streaming_card(
         "sources_text": sources_text,
         "meta": f"模型: {model}",
         "feedback_status": "",
+        # 反馈按钮以 is_answer_done=="true" 为可见性门控：初始为空 → 流式期间隐藏；
+        # _stream_answer_to_card 完成后置 "true" 显示。（需模板已声明 is_answer_done 变量）
+        "is_answer_done": "",
     }
 
     payload = _assemble_delivery_payload(
@@ -488,7 +487,7 @@ def streaming_update_card(
     content: str,
     *,
     guid: str,
-    key: str = "content",
+    key: str = "answer",
     is_full: bool = True,
     is_finalize: bool = False,
     is_error: bool = False,
