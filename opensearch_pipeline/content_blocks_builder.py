@@ -65,7 +65,14 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
                     if oss_key:
                         refs_list.append({
                             "source_image": oss_key,
-                            "visual_summary": ref.get("ocr_text", ""),
+                            # step_card 的 image_refs 把图注存在 caption（chunker），
+                            # 经 retriever 重建后仍是 caption；ocr_text 在该路径恒为空。
+                            # 优先 caption，回退 visual_summary / ocr_text。
+                            "visual_summary": (
+                                ref.get("caption")
+                                or ref.get("visual_summary")
+                                or ref.get("ocr_text", "")
+                            ),
                             "title": chunk.get("title", ""),
                         })
                 if refs_list:

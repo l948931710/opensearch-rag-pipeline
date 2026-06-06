@@ -22,6 +22,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+# 分页标志（页眉/页脚表格识别）：仅含这类标志的短表格才视为可去重的重复页眉表，
+# 真实数据表不含分页短语，因此不会被误删。
+_PAGE_MARKER = re.compile(
+    r"页次|页码|页数|第\s*\d+\s*页|共\s*\d+\s*[页张]|Page\s*\d+",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class Chunk:
@@ -1406,18 +1413,35 @@ class DocumentChunker:
 
     @staticmethod
     def _dedup_table_chunks(chunks: List["Chunk"]) -> List["Chunk"]:
-        """去除重复的 table_chunk（DOCX 页眉表格重复问题）。
-        
-        页眉表格通常仅在"页次/总页数"等细节不同，取首行作为签名。
+        """去除重复的"页眉/页脚型"表格 chunk（多页文档重复页眉表问题）。
+
+        仅对同时满足以下三条的表格参与去重：
+          1. 不携带图片（无 image_refs）——保护 image_refs 载荷契约，绝不丢图；
+          2. 行数 <= 4（页眉/页脚表通常 1~3 行元数据）；
+          3. 含分页标志（页次/页码/第N页/共N页 等，见 _PAGE_MARKER）。
+
+        去重签名仅把"分页短语本身"（连同其页码数字，如「第3页」「共5页」）整体替换为
+        占位符，其余内容与数字一律原样保留——因此"仅差页码"的重复页眉表会合并，而
+        "仅数据/编号数字不同"的表（如日产量 1200 vs 3400、文件号 FL-001 vs FL-002）
+        不会被误并。
+
+        真实数据表（行多、不含分页短语、或带图）一律保留。修复了旧实现"取首行作
+        签名"导致共用表头的不同数据表被静默丢弃的数据丢失问题。
         """
         seen: set = set()
         result: List["Chunk"] = []
         for c in chunks:
-            if c.chunk_type == "table_chunk":
-                first_line = c.chunk_text.split("\n")[0].strip()
-                if first_line in seen:
-                    continue
-                seen.add(first_line)
+            has_image = bool(c.extra and c.extra.get("image_refs"))
+            if c.chunk_type == "table_chunk" and not has_image:
+                lines = [ln for ln in c.chunk_text.split("\n") if ln.strip()]
+                text = "\n".join(lines)
+                is_header_like = len(lines) <= 4 and bool(_PAGE_MARKER.search(text))
+                if is_header_like:
+                    # 仅归一"分页短语"，保留其它数字 → 只合并"仅差页码"的重复页眉表
+                    sig = re.sub(r"\s+", "", _PAGE_MARKER.sub("<PG>", text))
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
             result.append(c)
         return result
 

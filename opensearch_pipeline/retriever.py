@@ -194,6 +194,9 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
         if isinstance(raw_chunk_type, list):
             raw_chunk_type = raw_chunk_type[0] if raw_chunk_type else ""
         parsed.append({
+            # chunk_id 是 step_card/visual_knowledge 的 RDS 重建键，也是 expand_step_context
+            # 末尾去重的唯一键——必须透传，否则去重会把所有无 id 的 chunk 折叠成一个。
+            "chunk_id": fields.get("chunk_id", ""),
             "chunk_text": fields.get("chunk_text_store", fields.get("chunk_text", "")),
             "title": fields.get("title", ""),
             "section_title": fields.get("section_title", ""),
@@ -286,7 +289,7 @@ def search_chunks(
         )
 
     _output_fields = output_fields or [
-        "id", "doc_id", "chunk_text_store", "title", "section_title",
+        "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
         "category_l1", "chunk_index", "page_num", "kb_type",
         "permission_level", "owner_dept", "chunk_type",
         "source_image", "visual_summary",
@@ -394,7 +397,7 @@ def search_chunks(
         text = r.get("chunk_text", "")
         has_section = bool(r.get("section_title"))
         chunk_type = r.get("chunk_type", "")
-        if chunk_type in ("image", "step_card", "procedure_parent"):
+        if chunk_type in ("image", "step_card", "procedure_parent", "visual_knowledge"):
             content_results.append(r)
         elif not has_section and len(text) < _COVER_MAX_LEN:
             cover_results.append(r)
@@ -485,7 +488,7 @@ def expand_top_document(
         from alibabacloud_ha3engine_vector.models import SearchRequest, TextQuery, RankQuery
 
         _output_fields = [
-            "id", "doc_id", "chunk_text_store", "title", "section_title",
+            "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
             "category_l1", "chunk_index", "page_num", "kb_type",
             "permission_level", "owner_dept", "chunk_type",
             "source_image", "visual_summary",
@@ -603,9 +606,9 @@ def stitch_neighbor_chunks(
                 expanded.append(chunk)
                 continue
 
-            # step_card / procedure_parent 已是语义完整单元，跳过邻居拼接
+            # step_card / procedure_parent / visual_knowledge 已是语义完整单元，跳过邻居拼接
             chunk_type = chunk.get("chunk_type", "")
-            if chunk_type in ("step_card", "procedure_parent"):
+            if chunk_type in ("step_card", "procedure_parent", "visual_knowledge"):
                 expanded.append(chunk)
                 continue
 
@@ -693,8 +696,9 @@ def expand_step_context(
     logger.info("Step Card 意图分类: query=%r → intent=%s", query[:60], intent)
 
     # 判断是否存在需要扩展的 chunk 类型，避免无意义的 RDS 连接
+    # visual_knowledge：image_refs 仅落库 RDS（HA3 只回 source_image 首图），需按 chunk_id 补全多图。
     need_expand = any(
-        c.get("chunk_type") in ("step_card", "procedure_parent")
+        c.get("chunk_type") in ("step_card", "procedure_parent", "visual_knowledge")
         for c in chunks
     )
     if not need_expand:
@@ -896,6 +900,37 @@ def expand_step_context(
                         "expansion_reason": "parent_children",
                     })
                     expanded_all.append(expanded_chunk)
+
+            # ── visual_knowledge：按 chunk_id 从 RDS 补全全部 image_refs（多图幻灯片）──
+            elif ctype == "visual_knowledge":
+                enriched = dict(chunk)
+                chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
+                # HA3 只回 source_image（首图）；image_refs 不在索引里。仅当结果未带
+                # image_refs 时回 RDS 取全量，失败/无记录则保留 source_image 首图兜底。
+                if chunk_id and not chunk.get("image_refs"):
+                    cursor.execute(
+                        "SELECT image_refs_json FROM chunk_meta WHERE chunk_id = %s",
+                        (chunk_id,),
+                    )
+                    vk_row = cursor.fetchone()
+                    refs_raw: list = []
+                    if vk_row and vk_row.get("image_refs_json"):
+                        try:
+                            refs_raw = json.loads(vk_row["image_refs_json"])
+                        except (json.JSONDecodeError, TypeError):
+                            refs_raw = []
+                    vk_refs = []
+                    for idx, ref in enumerate(refs_raw):
+                        if isinstance(ref, dict) and (ref.get("oss_key") or ref.get("source_image")):
+                            vk_refs.append({
+                                "oss_key": ref.get("oss_key") or ref.get("source_image", ""),
+                                "visual_summary": ref.get("visual_summary", "") or ref.get("ocr_text", ""),
+                                "caption": ref.get("caption", ""),
+                                "order": ref.get("order", idx),
+                            })
+                    if vk_refs:
+                        enriched["image_refs"] = vk_refs
+                expanded_all.append(enriched)
 
             else:
                 # 非 step 类型，原样保留

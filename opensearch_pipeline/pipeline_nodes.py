@@ -2460,7 +2460,7 @@ def node_chunk_documents(ctx: dict):
                 for c in chunks:
                     imgs = slide_imgs.get(c.page_num, [])
                     if imgs:
-                        c.extra["image_refs"] = [{
+                        refs = [{
                             "filename": a.get("filename", ""),
                             "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{a.get('filename', '')}",
                             "page_num": a.get("page_num"),
@@ -2468,6 +2468,14 @@ def node_chunk_documents(ctx: dict):
                             "visual_summary": a.get("visual_summary", ""),
                             "ocr_text": a.get("ocr_text", ""),
                         } for a in imgs]
+                        c.extra["image_refs"] = refs
+                        # 关键：把首图提升为顶层 source_image（+visual_summary），使其被
+                        # to_ha3_doc 索引。visual_knowledge 不走 step_card 的 RDS 重建路径，
+                        # 若仅存 image_refs 则只落库 RDS、不进 HA3 → 检索期取不到图、
+                        # 幻灯片图片无法展示。
+                        c.extra["source_image"] = refs[0]["oss_key"]
+                        if refs[0].get("visual_summary"):
+                            c.extra.setdefault("visual_summary", refs[0]["visual_summary"])
                         # 含产品图/示意图的 slide → visual_knowledge
                         c.chunk_type = "visual_knowledge"
 
