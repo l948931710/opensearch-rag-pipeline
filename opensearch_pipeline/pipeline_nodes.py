@@ -609,6 +609,8 @@ def node_build_canonical(ctx: dict):
                 "ocr_status": result.ocr_status,
                 "warnings": result.warnings,
                 "assets": result.assets,
+                # 成本封存标记：VLM-rebuild 成本闸拒绝 → node_redact_or_quarantine 据此跳过
+                "cost_quarantined": getattr(result, "cost_quarantined", False),
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result.doc_id}"
@@ -1434,6 +1436,14 @@ def node_redact_or_quarantine(ctx: dict):
     canonicals = ctx["canonicals"]
 
     for doc in canonicals:
+        # 成本封存：VLM-rebuild 成本闸已拒绝本文档并写 RDS 封存 → 复用 QUARANTINE 跳过路径，
+        # 阻止其进入切块/索引 (否则 RDS 已封存而索引里仍写入 chunk → 裂脑)。
+        if doc.get("cost_quarantined"):
+            doc["redaction_action"] = "QUARANTINE"
+            doc["redacted_text"] = None
+            print(f"    └─ {doc['doc_id']}: QUARANTINE (cost ceiling exceeded)")
+            continue
+
         final_risk = doc.get("risk_level", "low")
 
         if final_risk == "high":

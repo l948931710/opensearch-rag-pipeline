@@ -225,6 +225,10 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                             "ocr_status": ocr_status,
                             "warnings": content_json.get("warnings", []),
                             "assets": content_json.get("assets", []),
+                            # 成本封存标记必须跨 stage 边界回读：stage-1 成本闸拒绝的文档在
+                            # canonical JSON 里带 cost_quarantined=True，stage-2 据此跳过切块/索引
+                            # (否则 RDS 已封存而索引仍写入 chunk → 裂脑)。
+                            "cost_quarantined": content_json.get("cost_quarantined", False),
                             "canonical_status": "DONE",
                             "canonical_key": canonical_json_key,
                             "canonical_md_key": canonical_md_key,
