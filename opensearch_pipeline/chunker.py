@@ -29,6 +29,17 @@ _PAGE_MARKER = re.compile(
     re.IGNORECASE,
 )
 
+# 结构性章节标题（ISO/SOP 通用）：带编号但属于文档结构，不是操作步骤。
+# 精确匹配（编号后正文等于其中之一）才排除，避免误伤以这些字开头的真步骤标题。
+_STEP_SECTION_HEADERS = frozenset({
+    "目的", "范围", "适用范围", "适用", "目的和范围", "目的与适用范围", "目的及适用范围",
+    "职责", "权责", "职责权限", "范围和职责", "职责和权限",
+    "定义", "术语", "定义和术语", "术语和定义", "术语及定义",
+    "参考文件", "参考资料", "引用文件", "引用标准", "规范性引用文件", "相关文件", "相关记录",
+    "概述", "前言", "引言", "总则", "修订记录", "修改记录", "变更记录", "版本记录",
+    "附录", "附则", "流程图",
+})
+
 
 @dataclass
 class Chunk:
@@ -452,6 +463,12 @@ class DocumentChunker:
                 heading_step_match = re.match(
                     r'^(\d+(?:\.\d+)*)\s*[\.．、]?\s*\S', text
                 )
+                # 结构性章节标题（"1 目的" / "2 范围" / "3 职责"…）带编号但不是操作步骤，
+                # 排除之，否则会生成 step_no=0 的伪步骤卡、并以无编号"步骤"渲染。
+                if heading_step_match:
+                    _rest = text[heading_step_match.end(1):].strip(" .．、:：\t　")
+                    if _rest in _STEP_SECTION_HEADERS:
+                        heading_step_match = None
                 if heading_step_match:
                     found_any_step = True  # heading 也可以首次触发
                     if current_step is not None:
@@ -603,6 +620,12 @@ class DocumentChunker:
         # 结束最后一个步骤组
         if current_step is not None:
             step_groups.append(current_step)
+
+        # 兜底：收尾时仍有未归入任何步骤的 orphan 图片（典型：跨页表格关闭了最后一个
+        # 步骤后、文末还有 image_ref）→ 归入最后一个步骤，避免图片被静默丢弃。
+        if pending_images and step_groups:
+            step_groups[-1]["image_refs"].extend(pending_images)
+            pending_images.clear()
 
         # ── 如果没有检测到任何步骤边界，fallback 到普通文本切分 ──
         if not step_groups:

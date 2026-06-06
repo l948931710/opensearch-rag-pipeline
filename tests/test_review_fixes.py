@@ -285,3 +285,88 @@ class TestVisualKnowledgeServing:
         out = retriever.expand_step_context(chunks, query="图")
         ids = {c.get("chunk_id") for c in out if c.get("chunk_type") == "visual_knowledge"}
         assert ids == {"VK1", "VK2"}, "distinct visual_knowledge chunks must not collapse in dedup"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# #6  numbered structural section headers must not become step cards
+# ─────────────────────────────────────────────────────────────────────
+class TestStepSectionHeaders:
+    def setup_method(self):
+        self.ch = DocumentChunker(split_mode="step", min_chunk_chars=5)
+
+    def test_numbered_section_headers_not_steps(self):
+        blocks = [
+            ExtractedBlock(block_type="heading", text="1 目的", level=1, section_path="1 目的"),
+            ExtractedBlock(block_type="paragraph", text="本文件规定了相关操作的目的与意义。" * 2),
+            ExtractedBlock(block_type="heading", text="2 范围", level=1, section_path="2 范围"),
+            ExtractedBlock(block_type="paragraph", text="适用于所有相关工序的操作过程。" * 2),
+            ExtractedBlock(block_type="paragraph", text="步骤1：打开设备电源开关并等待自检完成。"),
+            ExtractedBlock(block_type="paragraph", text="步骤2：核对仪表读数是否在范围内。"),
+        ]
+        step_cards = [c for c in self.ch.chunk_from_blocks(blocks, "D", 1)
+                      if c.chunk_type == "step_card"]
+        # section headers must NOT become step cards
+        assert not any(c.chunk_text.lstrip().startswith(("1 目的", "2 范围")) for c in step_cards)
+        # and none rendered with the spurious step_no=0 from a section heading
+        assert all(c.extra.get("step_no") for c in step_cards), "no step_no=0 section-header cards"
+        # real steps still detected with real numbers
+        nos = sorted(c.extra.get("step_no") for c in step_cards if c.extra.get("step_no"))
+        assert 1 in nos and 2 in nos
+
+    def test_multilevel_numbered_heading_still_a_step(self):
+        blocks = [
+            ExtractedBlock(block_type="heading", text="3.2.4 正常单据记账", level=2, section_path="3.2.4"),
+            ExtractedBlock(block_type="paragraph", text="在系统中录入单据并保存凭证信息。" * 2),
+        ]
+        step_cards = [c for c in self.ch.chunk_from_blocks(blocks, "D", 1)
+                      if c.chunk_type == "step_card"]
+        assert step_cards, "multi-level numbered operational heading must still be a step"
+        assert any("正常单据记账" in c.chunk_text for c in step_cards)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# #5  trailing orphan image after the last step must be flushed, not dropped
+# ─────────────────────────────────────────────────────────────────────
+class TestStepOrphanImageFlush:
+    def test_trailing_image_after_crosspage_table_is_bound(self):
+        ch = DocumentChunker(split_mode="step", min_chunk_chars=5)
+        blocks = [
+            ExtractedBlock(block_type="heading", text="1 准备操作", level=1, page_num=1,
+                           section_path="1 准备操作"),
+            ExtractedBlock(block_type="paragraph", text="先完成准备工作的详细描述内容。" * 2, page_num=1),
+            ExtractedBlock(block_type="table", text="| 列 |\n| 值 |", page_num=2),  # cross-page → closes step
+            ExtractedBlock(block_type="image_ref", text="", page_num=2,
+                           extra={"oss_key": "trailing.png", "source_image": "trailing.png"}),
+        ]
+        chunks = ch.chunk_from_blocks(blocks, "D", 1)
+        bound = [r.get("oss_key") or r.get("source_image")
+                 for c in chunks for r in (c.extra.get("image_refs") or [])]
+        assert "trailing.png" in bound, "trailing orphan image must be flushed into the last step"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# #3  image-only PPTX slide must still produce a chunk carrying its image
+# ─────────────────────────────────────────────────────────────────────
+class TestImageOnlySlide:
+    def test_image_only_slide_gets_visual_knowledge_chunk(self):
+        doc = {
+            "doc_id": "PPTX_IMG", "version_no": 1, "file_ext": "pptx",
+            "title": "产品手册", "category_l1": "", "category_l2": "",
+            "text": "幻灯片", "owner_dept": "sales",
+            "source_key": "raw/sales/PPTX_IMG.pptx", "canonical_key": "canonical/PPTX_IMG.json",
+            "blocks": [ExtractedBlock(block_type="paragraph",
+                                      text="第一页文字内容描述说明。" * 2, page_num=1)],
+            "assets": [
+                {"status": "ROUTE_TO_VECTOR", "page_num": 1, "filename": "s1.png",
+                 "image_category": "product", "visual_summary": "封面图", "ocr_text": ""},
+                {"status": "ROUTE_TO_VECTOR", "page_num": 2, "filename": "s2.png",
+                 "image_category": "product", "visual_summary": "产品外观图", "ocr_text": ""},
+            ],
+        }
+        ctx = {"canonicals": [doc], "split_mode": "dynamic"}
+        pn.node_chunk_documents(ctx)
+        vk = [c for c in ctx["chunks"] if c.chunk_type == "visual_knowledge"]
+        pages = {c.page_num for c in vk}
+        assert 2 in pages, "image-only slide (page 2) must produce a visual_knowledge chunk"
+        s2 = [c for c in vk if c.page_num == 2][0]
+        assert "s2.png" in (s2.extra.get("source_image") or ""), "image-only slide must carry source_image"
