@@ -25,6 +25,8 @@ from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
 from opensearch_pipeline.dingtalk_bot import router as dingtalk_router, _resolve_user_dept
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.feedback_handler import handle_feedback
+from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json
+from opensearch_pipeline.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -328,16 +330,36 @@ async def ask(req: AskRequest):
     )
 
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
 @app.post("/api/ask/stream")
 async def ask_stream(req: AskRequest):
     """SSE 流式问答接口 — 检索 + LLM 逐 token 输出。
 
     SSE 事件格式：
+        data: {"type": "session", "session_id": "...", "message_id": "..."}
         data: {"type": "sources", "sources": [...]}
         data: {"type": "chunk", "content": "..."}
         data: {"type": "done", "model": "...", "usage": {...}}
+        data: {"type": "content_blocks", "content_blocks": [...]}   # 图文模式且有被引用图片时
         data: [DONE]
+
+    说明：
+      - `session` 帧携带 `message_id` —— 流式回答现已落库（qa_session_log）且写入会话历史，
+        客户端可凭此 `message_id` 调用 /api/feedback 提交反馈（与 /api/ask 一致）。
+      - 单个 <<IMG:N>> 标记可能被拆分到多个 chunk 帧中；需要渲染图片的客户端应以结束前的
+        `content_blocks` 帧为准（权威定稿），而非从流式文本里解析标记。图片只能在全文生成
+        完成后定稿，故 `content_blocks` 帧总是在 `done` 之后、`[DONE]` 之前发出。
     """
+    import json
+
+    t0 = time.time()
+
     # 1. 会话管理
     session_id, session_history = _get_or_create_session(req.session_id)
 
@@ -345,76 +367,141 @@ async def ask_stream(req: AskRequest):
     if req.history:
         merged_history = [{"role": m.role, "content": m.content} for m in req.history]
 
+    # 图文模式才补充图片（纯文本模式不展示图片，跳过 co-surfacing 的额外 HA3 查询）
+    _pure = req.pure_text if req.pure_text is not None else get_config().rag.pure_text
+
     # 2. 检索（同步阶段，在生成器外完成）
     try:
         user_dept = req.user_dept
         if not user_dept and req.user_id:
             user_dept = _resolve_user_dept(req.user_id)
-        chunks = retrieve_and_enrich(req.question, top_k=req.top_k, user_dept=user_dept)
+        chunks = retrieve_and_enrich(
+            req.question, top_k=req.top_k, user_dept=user_dept,
+            cosurface_images=not _pure,
+        )
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
 
+    retrieval_latency_ms = int((time.time() - t0) * 1000)
+    message_id = generate_message_id()
+
+    # 无结果：仍发出 message_id 并落库（NO_RESULT），与 /api/ask 空结果分支保持一致
     if not chunks:
-        import json
 
         async def empty_gen():
-            yield f"data: {json.dumps({'type': 'chunk', 'content': '抱歉，当前知识库中未找到与您问题相关的信息。'}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            # 落库放 finally：客户端中途断开（GeneratorExit）时仍保证 NO_RESULT 落库，
+            # 与主流式路径的 finally 收尾保持一致。
+            try:
+                yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'chunk', 'content': '抱歉，当前知识库中未找到与您问题相关的信息。'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                log_qa_session(
+                    session_id=session_id,
+                    message_id=message_id,
+                    user_id=req.user_id or "",
+                    query_text=req.question,
+                    latency_ms=int((time.time() - t0) * 1000),
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    answer_status="NO_RESULT",
+                    opensearch_hit_count=0,
+                )
 
-        return StreamingResponse(empty_gen(), media_type="text/event-stream")
+        return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     # 3. SSE 流式生成
+    top_score = max((c.get("score", 0) for c in chunks), default=None)
+
     def event_generator():
-        import json
+        # 先发 session_id + message_id（反馈关联键）
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
 
-        # 先发 session_id
-        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+        collected_answer: List[str] = []
+        model_name: Optional[str] = None
+        answer_status = "SUCCESS"
+        error_message: Optional[str] = None
+        content_blocks_json_str: Optional[str] = None
 
-        collected_answer = []
         try:
-            for event in generate_answer_stream(
-                req.question,
-                chunks,
-                history=merged_history if merged_history else None,
-                max_tokens=req.max_tokens or 2048,
-                temperature=req.temperature or 0.1,
-                pure_text=req.pure_text,
-            ):
-                yield event
+            try:
+                for event in generate_answer_stream(
+                    req.question,
+                    chunks,
+                    history=merged_history if merged_history else None,
+                    max_tokens=req.max_tokens or 2048,
+                    temperature=req.temperature or 0.1,
+                    pure_text=req.pure_text,
+                ):
+                    # 截获生成器自带的 [DONE]，改由本函数在 content_blocks 之后统一收尾
+                    if event.strip() == "data: [DONE]":
+                        continue
+                    yield event
 
-                # 收集完整回答用于写入 history
-                if "chunk" in event and '"type": "chunk"' in event:
+                    # 收集完整回答 + 模型名（用于写历史 & 落库）
+                    if '"type": "chunk"' in event:
+                        try:
+                            d = json.loads(event[6:].strip())
+                            if d.get("type") == "chunk" and d.get("content"):
+                                collected_answer.append(d["content"])
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    elif '"type": "done"' in event:
+                        try:
+                            model_name = json.loads(event[6:].strip()).get("model")
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+                # 正常完成：图文模式下补发 content_blocks 帧（图片须在全文完成后定稿）
+                full_answer = "".join(collected_answer)
+                if full_answer and not _pure:
                     try:
-                        payload = event.replace("data: ", "", 1).strip()
-                        d = json.loads(payload)
-                        if d.get("type") == "chunk" and d.get("content"):
-                            collected_answer.append(d["content"])
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-        except Exception as e:
-            trace_id = uuid.uuid4().hex[:8]
-            logger.error("Stream generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
-            error_msg = json.dumps({"type": "error", "message": f"回答生成失败，请联系管理员 (trace: {trace_id})"}, ensure_ascii=False)
-            yield f"data: {error_msg}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+                        blocks = build_content_blocks(full_answer, chunks)
+                        if blocks:
+                            yield f"data: {json.dumps({'type': 'content_blocks', 'content_blocks': blocks}, ensure_ascii=False)}\n\n"
+                            content_blocks_json_str = content_blocks_to_json(blocks)
+                    except Exception:
+                        logger.warning("content_blocks 构建失败 (non-fatal)", exc_info=True)
 
-        # 写入会话历史
-        full_answer = "".join(collected_answer)
-        if full_answer:
-            _append_to_history(session_id, req.question, full_answer)
+                yield "data: [DONE]\n\n"
+
+            except Exception as e:
+                answer_status = "LLM_ERROR"
+                trace_id = uuid.uuid4().hex[:8]
+                error_message = f"[trace={trace_id}] {str(e)[:500]}"
+                logger.error("Stream generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
+                error_msg = json.dumps({"type": "error", "message": f"回答生成失败，请联系管理员 (trace: {trace_id})"}, ensure_ascii=False)
+                yield f"data: {error_msg}\n\n"
+                yield "data: [DONE]\n\n"
+        finally:
+            # 无论正常结束还是客户端中途断开（GeneratorExit），都写历史 + 落库，
+            # 保证流式回答可被反馈/分析（落库函数自身吞掉异常，绝不影响回复）
+            full_answer = "".join(collected_answer)
+            if full_answer:
+                _append_to_history(session_id, req.question, full_answer)
+            log_qa_session(
+                session_id=session_id,
+                message_id=message_id,
+                user_id=req.user_id or "",
+                query_text=req.question,
+                answer_text=full_answer or None,
+                retrieved_docs=chunks,
+                latency_ms=int((time.time() - t0) * 1000),
+                retrieval_latency_ms=retrieval_latency_ms,
+                answer_status=answer_status,
+                model_name=model_name,
+                opensearch_hit_count=len(chunks),
+                top_score=top_score,
+                error_message=error_message,
+                content_blocks_json=content_blocks_json_str,
+            )
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=_SSE_HEADERS,
     )
 
 

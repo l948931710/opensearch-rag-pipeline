@@ -207,6 +207,21 @@ class RAGConfig:
     # False → 默认的图文穿插模式（multimodal）。
     # 经 RAG_PURE_TEXT 环境变量覆盖；亦可在 generate_answer 调用处按请求覆盖。
     pure_text: bool = False
+    # ── 钉钉流式卡片（打字机效果）─────────────────────────────────
+    # True  → 钉钉机器人以流式 AI 卡片逐步输出回答（需在钉钉卡片平台注册流式卡片
+    #         模板并配置 DINGTALK_STREAM_CARD_TEMPLATE_ID）。
+    # False → 默认行为：等待 LLM 完成后一次性发送成品互动卡片。
+    # 模板缺失时自动降级为非流式路径，故开启此开关也不会破坏现有行为。
+    dingtalk_streaming: bool = False
+    # 流式卡片更新节流间隔(ms)，避免触发钉钉流式更新接口限流。
+    dingtalk_stream_interval_ms: int = 500
+    # ── 图片召回增强（image co-surfacing）─────────────────────────
+    # True  → 多模态渲染路径（SSE / 图文卡片）检索后，对 top 文档补充其最相关的
+    #         image chunk 并插入到同文档正文之后，解决"文本类查询挤掉同文档图片"
+    #         导致答案缺图的召回缺口。每次多模态检索会多一次 HA3 过滤查询。
+    # False → 全局关闭（如对延迟敏感）。仅在调用方显式 opt-in 时才生效，故纯文本
+    #         路径与 /api/ask 不受影响。
+    image_cosurface: bool = True
 
 
 @dataclass
@@ -448,6 +463,9 @@ def load_config() -> PipelineConfig:
             api_port=_env_int("RAG_API_PORT", 8000),
             max_history_turns=_env_int("RAG_MAX_HISTORY_TURNS", 10),
             pure_text=_env_bool("PURE_TEXT", False),               # RAG_PURE_TEXT
+            dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
+            dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
+            image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE
         ),
     )
 
