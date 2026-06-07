@@ -23,6 +23,12 @@ work_report*.svg
 工作汇报.pdf
 convert_report.js
 node_modules/
+
+# Deployment build artifacts (rebuilt on demand, not version-controlled)
+*.zip
+
+# Moved-aside logs (see logs/)
+logs/
 .DS_Store
 .env.test
 .env.production
