@@ -26,3 +26,6 @@ node_modules/
 .DS_Store
 .env.test
 .env.production
+
+# MCP config — contains a live Alibaba AccessKey secret; never commit
+.mcp.json

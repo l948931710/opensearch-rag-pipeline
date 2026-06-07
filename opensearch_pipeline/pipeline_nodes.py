@@ -59,6 +59,19 @@ REDACTION_MAP = {
     "secret_like": lambda m: m.group(1) + m.group(2) + "****",
 }
 
+# Per-entity severity. high → document QUARANTINE (dropped from index);
+# medium → REDACT (masked in-place via REDACTION_MAP, doc kept + indexed).
+# Internal contact numbers/emails in SOPs are masked (medium), not dropped; true
+# national identifiers and secrets remain high → quarantine.
+ENTITY_SEVERITY = {
+    "cn_id_card": "high",
+    "cn_mobile": "medium",
+    "email": "medium",
+    "access_key": "high",
+    "secret_like": "high",
+}
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
 def _get_db_conn(select_db=True):
     """从连接池获取一个数据库连接。
 
@@ -1326,14 +1339,16 @@ def node_detect_sensitive(ctx: dict):
         hits = []
         entity_risk = "low"
 
-        # 1. Regex 实体检测
+        # 1. Regex 实体检测（按实体类型分级：电话/邮箱=medium→脱敏保留；身份证/密钥=high→隔离）
         for name, pattern in ENTITY_PATTERNS.items():
             if re.search(pattern, text):
+                sev = ENTITY_SEVERITY.get(name, "high")
                 hits.append({
                     "type": "ENTITY", "category": name,
-                    "keyword": name, "source": "regex", "severity": "high",
+                    "keyword": name, "source": "regex", "severity": sev,
                 })
-                entity_risk = "high"
+                if _SEVERITY_RANK[sev] > _SEVERITY_RANK[entity_risk]:
+                    entity_risk = sev
 
         # 2. 语义关键词检测
         for category, keywords in SEMANTIC_KEYWORDS.items():
@@ -3456,8 +3471,18 @@ def node_generate_embeddings(ctx: dict):
             print(f"    └─ Calling DashScope API for {len(miss_chunks)} cache-miss chunks (batch_size={batch_size}, model={embedding_model}, dense+sparse, max_retries={max_retries})...")
             # 使用原生 DashScope API (非 compatible-mode) 以获取 sparse embedding
             url = f"{base_url.rstrip('/')}/api/v1/services/embeddings/text-embedding/text-embedding"
-            for i in range(0, len(miss_chunks), batch_size):
-                batch = miss_chunks[i:i+batch_size]
+            # ── 并发生成 embedding：每个 size-batch_size 的 batch 一个线程 ──
+            # RAG_EMBED_CONCURRENCY 控制并发度（默认 5，保守值）。DashScope text-embedding
+            # 有账户级 QPS 限制，可按配额上调/下调。每个 batch 内保留 2**attempt 指数退避以吸收
+            # 429，因此移除了原先无条件的 time.sleep(1)（对 1000 chunks ≈ 100s 纯空转）。
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import threading
+
+            embed_concurrency = max(1, int(os.environ.get("RAG_EMBED_CONCURRENCY", "5")))
+            batches = [miss_chunks[i:i + batch_size] for i in range(0, len(miss_chunks), batch_size)]
+            _cache_lock = threading.Lock()
+
+            def _embed_one_batch(batch_no, batch):
                 payload = {
                     "model": embedding_model,
                     "input": {"texts": [c.chunk_text for c in batch]},
@@ -3472,6 +3497,7 @@ def node_generate_embeddings(ctx: dict):
                 }
 
                 last_error = None
+                attempt = 0
                 for attempt in range(max_retries + 1):
                     try:
                         resp = requests.post(url, json=payload, headers=headers, timeout=request_timeout)
@@ -3503,23 +3529,23 @@ def node_generate_embeddings(ctx: dict):
                                     # 保底: 提供默认 sparse 以免 HA3 索引排除该文档
                                     batch[item_idx].sparse_vector_indices = [0]
                                     batch[item_idx].sparse_vector_values = [0.001]
-                        # 写入缓存
-                        for c in batch:
-                            if c.embedding_status == "DONE":
-                                ck = _cache_key(c.chunk_text)
-                                _cache[ck] = c.embedding_vector
-                                sp_data = {}
-                                if hasattr(c, 'sparse_vector_indices') and c.sparse_vector_indices:
-                                    sp_data = {"indices": c.sparse_vector_indices, "values": c.sparse_vector_values}
-                                if sp_data:
-                                    _cache[f"sp_{ck}"] = sp_data
-                        last_error = None
-                        break  # success
+                        # 写入缓存（多线程共享 _cache，加锁保护）
+                        with _cache_lock:
+                            for c in batch:
+                                if c.embedding_status == "DONE":
+                                    ck = _cache_key(c.chunk_text)
+                                    _cache[ck] = c.embedding_vector
+                                    sp_data = {}
+                                    if hasattr(c, 'sparse_vector_indices') and c.sparse_vector_indices:
+                                        sp_data = {"indices": c.sparse_vector_indices, "values": c.sparse_vector_values}
+                                    if sp_data:
+                                        _cache[f"sp_{ck}"] = sp_data
+                        return  # success
                     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
                         last_error = e
                         if attempt < max_retries:
                             wait = 2 ** attempt
-                            print(f"    ⚠️ DashScope batch {i//batch_size} attempt {attempt+1} failed (network): {e}. Retrying in {wait}s...")
+                            print(f"    ⚠️ DashScope batch {batch_no} attempt {attempt+1} failed (network): {e}. Retrying in {wait}s...")
                             time.sleep(wait)
                         # else: fall through to error handling below
                     except requests.exceptions.HTTPError as e:
@@ -3529,12 +3555,12 @@ def node_generate_embeddings(ctx: dict):
                         if status == 400:
                             resp_text = getattr(e.response, 'text', '')[:500]
                             chunk_lens = [len(c.chunk_text) for c in batch]
-                            print(f"    ⚠️ DashScope batch {i//batch_size} HTTP 400: {resp_text}")
+                            print(f"    ⚠️ DashScope batch {batch_no} HTTP 400: {resp_text}")
                             print(f"    ⚠️ Batch chunk text lengths: {chunk_lens}")
                             break  # non-retryable
                         if status in (429, 500, 502, 503, 504) and attempt < max_retries:
                             wait = 2 ** attempt
-                            print(f"    ⚠️ DashScope batch {i//batch_size} attempt {attempt+1} failed (HTTP {status}): {e}. Retrying in {wait}s...")
+                            print(f"    ⚠️ DashScope batch {batch_no} attempt {attempt+1} failed (HTTP {status}): {e}. Retrying in {wait}s...")
                             time.sleep(wait)
                         else:
                             break  # non-transient or retries exhausted
@@ -3542,14 +3568,21 @@ def node_generate_embeddings(ctx: dict):
                         last_error = e
                         break  # unknown error, don't retry
 
-                if last_error is not None:
-                    # 跳过失败的 batch，标记 chunks 为 FAILED，继续处理后续 batch
-                    print(f"    ⚠️ DashScope batch {i//batch_size} failed after {min(attempt+1, max_retries+1)} attempt(s): {last_error}")
-                    print(f"    ⚠️ Skipping {len(batch)} chunks in this batch, continuing...")
-                    for c in batch:
-                        c.embedding_status = "FAILED"
+                # 失败：标记该 batch 的 chunks 为 FAILED，继续处理其余 batch
+                print(f"    ⚠️ DashScope batch {batch_no} failed after {min(attempt+1, max_retries+1)} attempt(s): {last_error}")
+                print(f"    ⚠️ Skipping {len(batch)} chunks in this batch, continuing...")
+                for c in batch:
+                    c.embedding_status = "FAILED"
 
-                time.sleep(1)
+            if embed_concurrency > 1 and len(batches) > 1:
+                print(f"    └─ Embedding {len(batches)} batches with {embed_concurrency} concurrent workers...")
+                with ThreadPoolExecutor(max_workers=embed_concurrency) as _ex:
+                    _futs = [_ex.submit(_embed_one_batch, bn, b) for bn, b in enumerate(batches)]
+                    for _f in as_completed(_futs):
+                        _f.result()  # 让未预期的异常冒泡
+            else:
+                for bn, b in enumerate(batches):
+                    _embed_one_batch(bn, b)
             _save_cache()
             print(f"    └─ Embedding cache updated: {len(_cache)} total entries")
         elif not is_dashscope and miss_chunks:

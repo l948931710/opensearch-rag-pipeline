@@ -436,6 +436,90 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
         raise ValueError(f"Invalid stage number: {stage}. Must be 1, 2, or 3.")
 
 
+def _count_pending_rows(stage: int) -> int:
+    """生产模式下统计某 stage 仍待处理的行数（用于 drain-loop 的进度判定）。
+
+    各 stage 的谓词与 run_stage / node_scan_raw_files 的认领条件保持一致：
+      Stage 1: NOT_STARTED & canonical_json_key IS NULL & file_ext≠doc & active
+      Stage 2: (NOT_STARTED 或 FAILED&retry_count<3) & active & canonical_json_key IS NOT NULL
+      Stage 3: chunk_meta NOT_INDEXED/FAILED & is_active & (dv 非 PROCESSING 或 已过 2h 失效锁)
+    """
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+    queries = {
+        1: """
+            SELECT COUNT(*) FROM document_version
+            WHERE content_process_status = 'NOT_STARTED'
+              AND canonical_json_key IS NULL
+              AND file_ext NOT IN ('doc')
+              AND status = 'active'
+        """,
+        2: """
+            SELECT COUNT(*) FROM document_version
+            WHERE (content_process_status = 'NOT_STARTED'
+                   OR (content_process_status = 'FAILED' AND retry_count < 3))
+              AND status = 'active'
+              AND canonical_json_key IS NOT NULL
+        """,
+        3: """
+            SELECT COUNT(*) FROM chunk_meta cm
+            JOIN document_version dv
+              ON cm.doc_id = dv.doc_id AND cm.version_no = dv.version_no
+            WHERE cm.index_status IN ('NOT_INDEXED', 'FAILED')
+              AND cm.is_active = 1
+              AND (dv.index_status != 'PROCESSING'
+                   OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
+        """,
+    }
+    conn = None
+    try:
+        conn = _get_db_conn(select_db=True)
+        with conn.cursor() as cur:
+            cur.execute(queries[stage])
+            return int(cur.fetchone()[0])
+    finally:
+        if conn:
+            conn.close()
+
+
+def run_stage_drained(stage: int, bizdate: str, simulate: bool):
+    """排空式执行：生产模式下循环调用 run_stage，直到该 stage 没有待处理行（一次调用排空整个语料）。
+
+    - 模拟模式只跑一次：run_simulation 注入的是固定测试数据，循环会无限重复同一批。
+    - no-progress 守卫：若一整批跑完后剩余行数没有下降（例如某批文档持续失败、停留在
+      NOT_STARTED/FAILED），则停止并告警，避免死循环。Balanced 级别未加 Stage-1 原子抢占，
+      因此该守卫是必需的。
+    - run_stage 在任何批次失败时仍会 raise（沿用 fail-fast 语义），异常会冒泡到 main 退出。
+    """
+    if simulate:
+        run_stage(stage, bizdate, simulate)
+        return
+
+    max_iters = int(os.environ.get("RAG_DRAIN_MAX_ITERS", "100000"))
+    prev_remaining = None
+    iteration = 0
+    while True:
+        iteration += 1
+        if iteration > max_iters:
+            print(f"[Orchestrator] ⚠️ Drain-loop hit RAG_DRAIN_MAX_ITERS={max_iters}; stopping.", file=sys.stderr)
+            break
+        remaining = _count_pending_rows(stage)
+        if remaining == 0:
+            print(f"[Orchestrator] Stage {stage} drained: 0 pending rows after {iteration - 1} batch(es).")
+            break
+        if prev_remaining is not None and remaining >= prev_remaining:
+            print(
+                f"[Orchestrator] ⚠️ Stage {stage} made no progress "
+                f"(remaining={remaining} did not decrease from {prev_remaining}). "
+                f"Likely stuck/failing rows — stopping drain-loop; inspect FAILED rows.",
+                file=sys.stderr,
+            )
+            break
+        print(f"[Orchestrator] Stage {stage} drain batch #{iteration} — {remaining} rows pending...")
+        prev_remaining = remaining
+        run_stage(stage, bizdate, simulate)
+
+
 def main():
     parser = argparse.ArgumentParser(description="DataWorks Scheduling Orchestrator")
     parser.add_argument(
@@ -477,7 +561,7 @@ def main():
     simulate_mode = config.simulate
     
     try:
-        run_stage(args.stage, args.bizdate, simulate_mode)
+        run_stage_drained(args.stage, args.bizdate, simulate_mode)
         print(f"\n[Orchestrator] SUCCESS: Stage {args.stage} finished successfully.")
         sys.exit(0)
     except Exception as e:

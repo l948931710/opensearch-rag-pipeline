@@ -209,6 +209,20 @@ def _generate_chunk_id(doc_id: str, version_no: int, chunk_index: int) -> str:
     return f"{doc_id}_v{version_no}_c{chunk_index:04d}_{short}"
 
 
+def _blk_get(b, name, default=None):
+    """Read a block field whether `b` is an ExtractedBlock object or a dict.
+
+    Production Stage 2 loads canonical blocks from OSS as JSON (dicts), while
+    simulate mode passes ExtractedBlock objects. chunk_from_blocks() accepts both
+    (see docstring), so every block-field access must handle either shape.
+    """
+    if isinstance(b, dict):
+        v = b.get(name, default)
+    else:
+        v = getattr(b, name, default)
+    return default if v is None else v
+
+
 class DocumentChunker:
     """文档切分器。"""
 
@@ -2185,14 +2199,14 @@ class DocumentChunker:
 
         # 分离步骤行和非步骤行
         for blk in blocks:
-            if blk.block_type == "heading":
+            if _blk_get(blk, "block_type", "paragraph") == "heading":
                 # sheet 标题不入库
                 continue
-            extra = blk.extra or {}
+            extra = _blk_get(blk, "extra", {}) or {}
             if extra.get("step_no") is not None:
                 step_blocks.append(blk)
             else:
-                text = blk.text.strip()
+                text = _blk_get(blk, "text", "").strip()
                 if text:
                     header_lines.append(text)
 
@@ -2213,12 +2227,12 @@ class DocumentChunker:
 
         # 2. 每个步骤一个 step_card chunk
         for blk in step_blocks:
-            extra = blk.extra or {}
+            extra = _blk_get(blk, "extra", {}) or {}
             step_no = extra.get("step_no", 0)
             fig_refs = extra.get("figure_refs", [])
 
             # 构建步骤文本
-            step_text = blk.text.strip()
+            step_text = _blk_get(blk, "text", "").strip()
 
             chunk = self._create_chunk(
                 doc_id=doc_id,
@@ -2227,7 +2241,7 @@ class DocumentChunker:
                 chunk_text=step_text,
                 chunk_type="step_card",
                 metadata=meta,
-                page_num=blk.page_num,
+                page_num=_blk_get(blk, "page_num", None),
             )
             chunk.extra["step_no"] = step_no
             if fig_refs:
@@ -2291,7 +2305,7 @@ class DocumentChunker:
         chunk_index = 0
 
         # 收集所有 paragraph blocks（跳过 heading）
-        para_blocks = [b for b in blocks if b.block_type == "paragraph"]
+        para_blocks = [b for b in blocks if _blk_get(b, "block_type", "paragraph") == "paragraph"]
 
         # 按 section 分组，同时记录行号范围
         sections = []  # [(section_type, chunk_type, [block_texts], min_row, max_row)]
@@ -2301,10 +2315,11 @@ class DocumentChunker:
         current_max_row = 0
 
         for blk in para_blocks:
-            text = blk.text.strip()
+            text = _blk_get(blk, "text", "").strip()
             if not text:
                 continue
-            row_num = blk.extra.get("row_num", 0) if blk.extra else 0
+            _extra = _blk_get(blk, "extra", {}) or {}
+            row_num = _extra.get("row_num", 0)
 
             detected = self._detect_spec_section(text)
             if detected:
