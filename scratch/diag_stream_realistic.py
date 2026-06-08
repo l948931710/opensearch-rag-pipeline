@@ -51,6 +51,6 @@ def main():
     SRC="1. 富岭U8+成品仓库操作手册.docx > 1.1主要业务流程（相关度 0.94）"
     upd(t,o,{"title":"U8+成品仓库怎么操作","question":"U8+成品仓库怎么操作",KEY:ANSWER,
              "sources":SRC,"sources_text":SRC,"meta":"模型: qwen3.6-plus | 耗时: 9.5s","feedback_status":"","is_answer_done":""})
-    time.sleep(.3)
+    # update 与 finalize 背靠背（与真实代码一致），尽量缩短中间的重渲染闪烁
     print("finalize:",stream(t,o,ANSWER,fin=True),"帧失败:",f"{fail}/18")
 if __name__=="__main__": main()
