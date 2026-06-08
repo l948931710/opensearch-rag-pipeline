@@ -9,6 +9,68 @@
 USE fuling_operation;
 
 -- ------------------------------------------------------------
+-- Ensure the feedback tables exist in THIS database (fuling_operation).
+-- The serving code writes fully-qualified fuling_operation.user_feedback /
+-- fuling_operation.escalation_ticket (feedback_handler.py). 001 creates these
+-- under fuling_knowledge, so a deployment whose RDS hosts the live data in
+-- fuling_operation needs them here too — otherwise every 喜欢/不喜欢/转人工
+-- write fails ("Unknown table") and the card shows "反馈处理失败".
+-- CREATE TABLE IF NOT EXISTS is idempotent: no-op if the table already exists.
+-- (Definitions mirror schema/001_opensearch_pipeline.sql.)
+-- ------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS user_feedback (
+    id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    feedback_id         VARCHAR(100) NOT NULL,
+    session_id          VARCHAR(128) DEFAULT NULL,
+    message_id          VARCHAR(128) DEFAULT NULL,
+    user_id             VARCHAR(128) DEFAULT NULL,
+    user_name           VARCHAR(128) DEFAULT NULL,
+    user_dept           VARCHAR(64) DEFAULT NULL,
+    query_text          TEXT DEFAULT NULL,
+    ai_answer           MEDIUMTEXT DEFAULT NULL,
+    cited_doc_ids_json  JSON DEFAULT NULL,
+    cited_chunks_json   JSON DEFAULT NULL,
+    feedback_type       VARCHAR(32) DEFAULT NULL COMMENT 'upvote / downvote',
+    feedback_reason     VARCHAR(128) DEFAULT NULL,
+    feedback_comment    TEXT DEFAULT NULL,
+    badcase_category    VARCHAR(64) DEFAULT NULL,
+    handled_status      VARCHAR(32) DEFAULT 'PENDING',
+    handled_by          VARCHAR(128) DEFAULT NULL,
+    handled_comment     TEXT DEFAULT NULL,
+    handled_at          DATETIME DEFAULT NULL,
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_feedback_id (feedback_id),
+    INDEX idx_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS escalation_ticket (
+    id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    ticket_id           VARCHAR(100) NOT NULL,
+    session_id          VARCHAR(128) DEFAULT NULL,
+    message_id          VARCHAR(128) DEFAULT NULL,
+    user_id             VARCHAR(128) DEFAULT NULL,
+    user_name           VARCHAR(128) DEFAULT NULL,
+    user_dept           VARCHAR(64) DEFAULT NULL,
+    query_text          TEXT DEFAULT NULL,
+    ai_answer           MEDIUMTEXT DEFAULT NULL,
+    trigger_reason      VARCHAR(64) DEFAULT NULL,
+    assigned_dept       VARCHAR(64) DEFAULT NULL,
+    assigned_user_id    VARCHAR(128) DEFAULT NULL,
+    assigned_user_name  VARCHAR(128) DEFAULT NULL,
+    ticket_status       VARCHAR(32) DEFAULT 'PENDING',
+    expert_answer       MEDIUMTEXT DEFAULT NULL,
+    converted_to_faq    TINYINT(1) DEFAULT 0,
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    assigned_at         DATETIME DEFAULT NULL,
+    answered_at         DATETIME DEFAULT NULL,
+    closed_at           DATETIME DEFAULT NULL,
+    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_ticket_id (ticket_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ------------------------------------------------------------
 -- Helper stored procedures for idempotent DDL operations
 -- ------------------------------------------------------------
 
