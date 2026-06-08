@@ -499,7 +499,7 @@ def create_streaming_card(
     question: str,
     sources: List[Dict[str, Any]],
     model: str,
-    stream_key: str = "answer",
+    stream_key: str = "content",
 ) -> bool:
     """投放一张流式 AI 卡片占位（流式变量初始为空，随后由 streaming_update_card 逐步填充）。
 
@@ -556,7 +556,7 @@ def streaming_update_card(
     out_track_id: str,
     content: str,
     *,
-    key: str = "answer",
+    key: str = "content",
     is_full: bool = True,
     is_finalize: bool = False,
     is_error: bool = False,

@@ -438,9 +438,10 @@ def _stream_answer_to_card(
                  非流式成品卡片路径（不会重复落库）。
     """
     cfg = get_config()
-    # 默认 "answer"：本项目的流式 AI 卡片把可见答案组件（AICardContent / Markdown）绑定到
-    # answer 变量；流式更新与初始占位都写入该变量。可经 DINGTALK_STREAM_CARD_KEY 覆盖。
-    stream_key = os.environ.get("DINGTALK_STREAM_CARD_KEY", "answer")
+    # 默认 "content"：钉钉 AI 流式卡片的约定流式变量（AICardContent + 流式 MarkdownBlock 默认绑定
+    # content、varType=markdown）。推流 key 必须 == 模板流式组件绑定的变量，否则 500 unknownError。
+    # 可经 DINGTALK_STREAM_CARD_KEY 覆盖（须与模板里流式组件绑定的变量名一致）。
+    stream_key = os.environ.get("DINGTALK_STREAM_CARD_KEY", "content")
     model_name = cfg.llm.model
     sources = _extract_sources(chunks)
 

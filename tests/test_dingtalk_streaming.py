@@ -4,7 +4,7 @@ test_dingtalk_streaming.py — 钉钉流式 AI 卡片（打字机效果）测试
 
 验证 dingtalk_bot._stream_answer_to_card：
   - 投放流式卡片 → 流式更新 → 定稿（is_finalize）
-  - 流式变量默认 = "answer"（本项目 AI 卡片把可见答案组件绑定到 answer 变量）
+  - 流式变量默认 = "content"（钉钉 AI 流式卡片约定变量；推流 key 须 == 模板流式组件绑定变量）
   - 完成后置位 is_answer_done="true"（触发反馈按钮显示）
   - 钉钉端纯文本：清理 <<IMG:N>> 标记
   - 落库 + 写历史与非流式路径一致
@@ -73,17 +73,17 @@ def test_streaming_card_happy_path(
     handled = _call_stream()
     assert handled is True
 
-    # 1. 投放流式卡片一次；流式变量默认 = "answer"
+    # 1. 投放流式卡片一次；流式变量默认 = "content"
     mock_create.assert_called_once()
     assert mock_create.call_args.kwargs["message_id"] == "msg-123"
-    assert mock_create.call_args.kwargs["stream_key"] == "answer"
+    assert mock_create.call_args.kwargs["stream_key"] == "content"
 
-    # 2. 至少一次更新，最后一次为定稿帧（is_finalize=True, is_error 缺省 False），key=answer
+    # 2. 至少一次更新，最后一次为定稿帧（is_finalize=True, is_error 缺省 False），key=content
     assert mock_update.call_count >= 1
     final_call = mock_update.call_args
     assert final_call.kwargs["is_finalize"] is True
     assert final_call.kwargs.get("is_error", False) is False
-    assert final_call.kwargs["key"] == "answer"
+    assert final_call.kwargs["key"] == "content"
     final_content = final_call.args[1]
     # 3. 纯文本：<<IMG:1>> 标记已清理
     assert "<<IMG" not in final_content and "IMG:1" not in final_content
