@@ -523,14 +523,16 @@ def create_streaming_card(
         logger.warning("DINGTALK_STREAM_CARD_TEMPLATE_ID 未配置，流式卡片发送跳过")
         return False
 
-    sources_text = _format_sources_text(sources)
     card_param_map = {
         "title": question[:50],
         "question": question,
         stream_key: "",
-        "sources": sources_text,
-        "sources_text": sources_text,
-        "meta": f"模型: {model}",
+        # B2 版式：参考来源 + "模型 ｜ 耗时" 均由定稿帧拼进 content（答案→来源→耗时，耗时落最底下、
+        # 紧挨按钮）。故 sources/meta 页脚此处置空，避免与正文里的来源/耗时重复（用 update_card_data
+        # 写页脚会触发重渲染闪烁，故一律改走 content 流式写）。
+        "sources": "",
+        "sources_text": "",
+        "meta": "",
         "feedback_status": "",
         # 反馈按钮以 is_answer_done=="true" 为可见性门控：初始为空 → 流式期间隐藏；
         # _stream_answer_to_card 完成后置 "true" 显示。（需模板已声明 is_answer_done 变量）

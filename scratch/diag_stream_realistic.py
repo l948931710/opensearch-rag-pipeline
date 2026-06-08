@@ -22,11 +22,10 @@ ANSWER=(
 "**三、库存盘点**\n定期发起盘点任务，PDA 扫码盘点，系统自动生成盈亏调整单。")
 def token(): return requests.post(f"{BASE}/v1.0/oauth2/accessToken",json={"appKey":CID,"appSecret":SEC},timeout=10).json()["accessToken"]
 def create(t,o):
+    # B2：sources/meta 页脚置空，来源+耗时由定稿帧拼进 content（与真机代码一致）
     p={"cardTemplateId":TID,"outTrackId":o,"callbackType":"HTTP","userIdType":1,
        "cardData":{"cardParamMap":{"title":"U8+成品仓库怎么操作","question":"U8+成品仓库怎么操作",KEY:"",
-          "sources":"1. 富岭U8+成品仓库操作手册.docx > 1.1主要业务流程（相关度 0.94）",
-          "sources_text":"1. 富岭U8+成品仓库操作手册.docx > 1.1主要业务流程（相关度 0.94）",
-          "meta":"模型: qwen3.6-plus","feedback_status":"","is_answer_done":""}},
+          "sources":"","sources_text":"","meta":"","feedback_status":"","is_answer_done":""}},
        "openSpaceId":f"dtv1.card//im_robot.{STAFF}","userId":STAFF,
        "imRobotOpenDeliverModel":{"spaceType":"IM_ROBOT","robotCode":CID},
        "imRobotOpenSpaceModel":{"supportForward":True},
@@ -36,9 +35,9 @@ def create(t,o):
     except: return r.status_code, False
 def stream(t,o,c,fin=False):
     return requests.put(f"{BASE}/v1.0/card/streaming",json={"outTrackId":o,"guid":str(uuid.uuid4()),"key":KEY,"content":c,"isFull":True,"isFinalize":fin,"isError":False},headers=H(t),timeout=10).status_code
-def upd(t,o,m): return requests.put(f"{BASE}/v1.0/card/instances",json={"outTrackId":o,"cardData":{"cardParamMap":m}},headers=H(t),timeout=10).status_code
 def main():
     t=token(); o=uuid.uuid4().hex
+    t0=time.time()
     sc,ok=create(t,o); print("create:",sc,"delivered:",ok)
     if not ok: return
     time.sleep(1.0)
@@ -47,10 +46,10 @@ def main():
         i=min(n,i+step)
         if stream(t,o,ANSWER[:i])!=200: fail+=1
         time.sleep(0.5)
-    # 关键顺序：先 update_card_data（meta 页脚带耗时，全量避免覆盖）→ 再 finalize（content 写回，故不空白）
-    SRC="1. 富岭U8+成品仓库操作手册.docx > 1.1主要业务流程（相关度 0.94）"
-    upd(t,o,{"title":"U8+成品仓库怎么操作","question":"U8+成品仓库怎么操作",KEY:ANSWER,
-             "sources":SRC,"sources_text":SRC,"meta":"模型: qwen3.6-plus | 耗时: 9.5s","feedback_status":"","is_answer_done":""})
-    # update 与 finalize 背靠背（与真实代码一致），尽量缩短中间的重渲染闪烁
-    print("finalize:",stream(t,o,ANSWER,fin=True),"帧失败:",f"{fail}/18")
+    # B2（与真实代码一致）：定稿帧把 参考来源 + "模型 ｜ 耗时" 按序拼进正文末尾 →
+    # 顺序 答案→来源→耗时，耗时落最底下（紧挨按钮）、灰色缩进、不闪不空白。不调 update_card_data。
+    elapsed=time.time()-t0
+    SRC="富岭U8+成品仓库操作手册.docx > 1.1主要业务流程（相关度 0.94）"
+    final=ANSWER+f"\n\n📚 **参考来源**\n1. {SRC}\n\n> 模型: qwen3.6-plus ｜ 耗时: {elapsed:.1f}s"
+    print("finalize:",stream(t,o,final,fin=True),"帧失败:",f"{fail}/18")
 if __name__=="__main__": main()

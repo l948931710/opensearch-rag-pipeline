@@ -37,7 +37,6 @@ from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_feedback_status,
-    update_card_data,
     create_streaming_card,
     streaming_update_card,
     _strip_trailing_sources,
@@ -498,20 +497,19 @@ def _stream_answer_to_card(
                 last_push = now
 
         full_answer = _clean("".join(collected))
-        # 关键顺序：先 update_card_data（全量 cardParamMap，meta 页脚带"模型: X | 耗时: Ys"）→ 再 finalize。
-        # 完成【后】调 update_card_data 会清空整卡（已实测）；但完成【前】调、随后 finalize 把 content
-        # 重新写回，故不空白，且 meta 页脚拿到耗时（与成品卡一致的灰色页脚样式）。全量传避免覆盖其它字段。
+        # B2 版式：定稿帧把【参考来源 + "模型 ｜ 耗时"】按序拼进正文末尾 → 顺序 答案→来源→耗时，
+        # 耗时落到最底下（紧挨按钮）、渲染成灰色缩进，且【不闪不空白】。改走 content 而非 meta 页脚：
+        # 定稿前/后用 update_card_data 写页脚都会触发重渲染闪烁。create 时 sources/meta 页脚已置空，
+        # 避免重复。full_answer 保持干净（落库/写历史不含来源/耗时页脚）。
         _elapsed_s = time.time() - t0
-        _sources_text = _format_sources_text(sources)
-        update_card_data(message_id, {
-            "title": question[:50], "question": question,
-            stream_key: full_answer,
-            "sources": _sources_text, "sources_text": _sources_text,
-            "meta": f"模型: {model_name} | 耗时: {_elapsed_s:.1f}s",
-            "feedback_status": "", "is_answer_done": "",
-        })
+        _src_md = _format_sources_text(sources)
+        _footer = f"> 模型: {model_name} ｜ 耗时: {_elapsed_s:.1f}s"
+        _final = (
+            f"{full_answer}\n\n📚 **参考来源**\n{_src_md}\n\n{_footer}"
+            if _src_md else f"{full_answer}\n\n{_footer}"
+        )
         streaming_update_card(
-            message_id, full_answer,
+            message_id, _final,
             key=stream_key, is_full=True, is_finalize=True,
         )
     except Exception as e:
@@ -997,32 +995,46 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                 if row:
                     card_param_map["question"] = row[0] or ""
                     card_param_map["title"] = (row[0] or "")[:50]
-                    card_param_map["answer"] = row[1] or ""
-                    # 流式卡正文绑的是 content（成品卡是 answer）；回调响应会覆盖整个 cardParamMap，
-                    # 故两者都写回，避免反馈点击后流式卡 content 被清空 → 空白。
-                    card_param_map["content"] = row[1] or ""
-                    # 重建 sources_text
+                    _answer = row[1] or ""
+                    card_param_map["answer"] = _answer
+                    # 重建参考来源行（cited_docs_json → "1. 标题"）
+                    _src_lines = []
                     sources_json = row[2]
                     if sources_json:
                         try:
                             sources_list = json.loads(sources_json) if isinstance(sources_json, str) else sources_json
-                            sources_lines = []
                             for i, s in enumerate(sources_list, 1):
                                 if isinstance(s, dict):
-                                    sources_lines.append(f"{i}. {s.get('title', s.get('doc_name', '未知文档'))}")
+                                    _src_lines.append(f"{i}. {s.get('title', s.get('doc_name', '未知文档'))}")
                                 else:
-                                    sources_lines.append(f"{i}. {s}")
-                            card_param_map["sources_text"] = "\n".join(sources_lines)
-                            card_param_map["sources"] = card_param_map["sources_text"]
+                                    _src_lines.append(f"{i}. {s}")
                         except Exception:
-                            card_param_map["sources_text"] = ""
-                            card_param_map["sources"] = ""
-                    else:
-                        card_param_map["sources_text"] = ""
-                        card_param_map["sources"] = ""
+                            _src_lines = []
                     model = row[3] or "unknown"
                     latency = row[4] or 0
-                    card_param_map["meta"] = f"模型: {model} | 耗时: {latency / 1000:.1f}s"
+                    # 流式卡(B2)：正文绑 content，版式 答案→📚来源→"模型 ｜ 耗时"灰色引用块（耗时落最底下、
+                    # 紧挨按钮）；sources/meta 页脚置空，与 _stream_answer_to_card 定稿帧版式一致，避免反馈点击
+                    # 后版式跳变（来源回到页脚、耗时挪位）。成品卡：正文绑 answer + 页脚 sources_text/meta（原逻辑）。
+                    _streaming = bool(
+                        get_config().rag.dingtalk_streaming
+                        and os.environ.get("DINGTALK_STREAM_CARD_TEMPLATE_ID")
+                    )
+                    if _streaming:
+                        _parts = [_answer]
+                        if _src_lines:
+                            _parts.append("📚 **参考来源**\n" + "\n".join(_src_lines))
+                        _parts.append(f"> 模型: {model} ｜ 耗时: {latency / 1000:.1f}s")
+                        card_param_map["content"] = "\n\n".join(_parts)
+                        card_param_map["sources_text"] = ""
+                        card_param_map["sources"] = ""
+                        card_param_map["meta"] = ""
+                    else:
+                        # 成品卡正文绑 answer；content 兜底写回避免被回调清空
+                        card_param_map["content"] = _answer
+                        _src_text = "\n".join(_src_lines)
+                        card_param_map["sources_text"] = _src_text
+                        card_param_map["sources"] = _src_text
+                        card_param_map["meta"] = f"模型: {model} | 耗时: {latency / 1000:.1f}s"
                     card_param_map["message_id"] = message_id
                     # 重建 content_blocks（图文穿插数据）
                     content_blocks_json = row[5]
