@@ -37,7 +37,6 @@ from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_feedback_status,
-    update_card_data,
     create_streaming_card,
     streaming_update_card,
     _strip_trailing_sources,
@@ -518,14 +517,11 @@ def _stream_answer_to_card(
     latency_ms = int((time.time() - t0) * 1000)
     top_score = max((c.get("score", 0) for c in chunks), default=None)
 
-    # 流式完成后置位 is_answer_done=true（模板反馈按钮可见性以此为门控：流式期间为空→隐藏，
-    # 完成后置 true→出现），并补全 meta 的耗时（与成品卡片页脚一致：模型 + 耗时）。
-    # 仅成功时展示反馈按钮。非致命：update_card_data 自身吞异常并返回 False。
-    if answer_status == "SUCCESS":
-        update_card_data(message_id, {
-            "is_answer_done": "true",
-            "meta": f"模型: {model_name} | 耗时: {latency_ms / 1000:.1f}s",
-        })
+    # ⚠️ 不在定稿后调 update_card_data：PUT /card/instances 会用部分 cardParamMap 覆盖流式写入的
+    # content（A/B 实测：调了→定稿后卡片空白；不调→全文保留）。完成态按钮已在模板里硬化
+    # （只看 feedback_status==""，不依赖 is_answer_done），定稿帧已含全文、create 已设
+    # question/sources/meta，故完成态可直接显示，无需任何收尾更新。
+    # 代价：meta 页脚不带"耗时"（保持 create 时的"模型: X"），换取不丢正文——值得。
 
     # 写历史（仅成功且有内容时）+ 落库（与非流式路径一致的反馈语义）
     if full_answer and answer_status == "SUCCESS":
@@ -989,6 +985,9 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                     card_param_map["question"] = row[0] or ""
                     card_param_map["title"] = (row[0] or "")[:50]
                     card_param_map["answer"] = row[1] or ""
+                    # 流式卡正文绑的是 content（成品卡是 answer）；回调响应会覆盖整个 cardParamMap，
+                    # 故两者都写回，避免反馈点击后流式卡 content 被清空 → 空白。
+                    card_param_map["content"] = row[1] or ""
                     # 重建 sources_text
                     sources_json = row[2]
                     if sources_json:

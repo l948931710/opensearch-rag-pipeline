@@ -47,5 +47,6 @@ def main():
         i=min(n,i+step)
         if stream(t,o,ANSWER[:i])!=200: fail+=1
         time.sleep(0.5)
-    print("finalize:",stream(t,o,ANSWER,fin=True),"is_answer_done:",upd(t,o,{"is_answer_done":"true","meta":"模型: qwen3.6-plus | 耗时: 9.5s"}),"帧失败:",f"{fail}/18")
+    # 定稿即可——不调 update_card_data（PUT /card/instances 会覆盖流式 content → 空白；完成态按钮已硬化）
+    print("finalize:",stream(t,o,ANSWER,fin=True),"帧失败:",f"{fail}/18")
 if __name__=="__main__": main()
