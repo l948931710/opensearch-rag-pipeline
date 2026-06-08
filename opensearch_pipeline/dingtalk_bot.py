@@ -459,7 +459,6 @@ def _stream_answer_to_card(
         logger.warning("流式卡片投放失败，降级为非流式路径: message_id=%s", message_id)
         return False
 
-    guid = uuid.uuid4().hex
     interval_s = max(cfg.rag.dingtalk_stream_interval_ms, 0) / 1000.0
     collected: List[str] = []
     last_push = 0.0
@@ -492,7 +491,7 @@ def _stream_answer_to_card(
             if now - last_push >= interval_s:
                 streaming_update_card(
                     message_id, _clean("".join(collected)),
-                    guid=guid, key=stream_key, is_full=True,
+                    key=stream_key, is_full=True,
                 )
                 last_push = now
 
@@ -500,7 +499,7 @@ def _stream_answer_to_card(
         # 定稿帧
         streaming_update_card(
             message_id, full_answer,
-            guid=guid, key=stream_key, is_full=True, is_finalize=True,
+            key=stream_key, is_full=True, is_finalize=True,
         )
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
@@ -511,7 +510,7 @@ def _stream_answer_to_card(
         streaming_update_card(
             message_id,
             full_answer or f"❌ 回答生成失败，请稍后重试。(trace: {trace_id})",
-            guid=guid, key=stream_key, is_full=True, is_finalize=True, is_error=True,
+            key=stream_key, is_full=True, is_finalize=True, is_error=True,
         )
 
     llm_latency_ms = int((time.time() - t_retrieval) * 1000)

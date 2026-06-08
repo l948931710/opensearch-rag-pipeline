@@ -20,6 +20,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -555,7 +556,6 @@ def streaming_update_card(
     out_track_id: str,
     content: str,
     *,
-    guid: str,
     key: str = "answer",
     is_full: bool = True,
     is_finalize: bool = False,
@@ -565,10 +565,13 @@ def streaming_update_card(
 
     PUT https://api.dingtalk.com/v1.0/card/streaming
 
+    guid 每帧自动生成（对齐官方 dingtalk-stream SDK 的 `AICardReplier.streaming`：流式会话由
+    outTrackId 关联，guid 只是每次请求的唯一标识，须是带连字符的标准 UUID 串、且每帧不同；
+    早先版本复用同一个无连字符 uuid4().hex 会触发钉钉 500 unknownError）。
+
     Args:
         out_track_id: 卡片 outTrackId（= message_id）
         content: 本次写入的内容
-        guid: 一次流式会话的唯一标识（同一条回答的多次更新须保持一致）
         key: 流式卡片模板中绑定的流式变量名
         is_full: True=content 为累计全文（覆盖式，对拆分标记更稳健）；False=增量追加
         is_finalize: True=最后一帧，结束流式
@@ -583,7 +586,7 @@ def streaming_update_card(
 
     payload = {
         "outTrackId": out_track_id,
-        "guid": guid,
+        "guid": str(uuid.uuid4()),  # 每帧新 guid、标准 UUID 串（对齐官方 SDK；复用/无连字符会 500）
         "key": key,
         "content": content,
         "isFull": is_full,
