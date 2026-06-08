@@ -1007,6 +1007,7 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
     # 响应会覆盖整个 cardParamMap，必须在此显式恢复，否则流式卡片在用户点击反馈后这些区域折叠。
     # 对成品卡片无害（其模板不引用该变量）。回调只在答案已生成完毕后触发，故恒为 "true"。
     card_param_map["is_answer_done"] = "true"
+    _row_found = False
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn()
@@ -1023,6 +1024,7 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                 )
                 row = cursor.fetchone()
                 if row:
+                    _row_found = True
                     card_param_map["question"] = row[0] or ""
                     card_param_map["title"] = (row[0] or "")[:50]
                     _answer = row[1] or ""
@@ -1079,4 +1081,19 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
     except Exception as e:
         debug_ctx = f"{context}重建卡片数据失败" if context else "重建卡片数据失败"
         print(f"[CALLBACK DEBUG] {debug_ctx}: {e}", flush=True)
+
+    if not _row_found:
+        # 兜底：qa_session_log 查无此 message_id（演示卡未落库 / RDS 异常 / message_id 不匹配）。
+        # 钉钉回调响应会【覆盖整卡】cardParamMap → content/answer 留空就会整卡白屏。这里写入占位，
+        # 保证至少不白屏，反馈按钮与"其他原因"表单仍可用。生产中每条回答都会 log_qa_session 落库，
+        # 正常走不到这里；走到这里说明该卡未落库或 RDS 不可用。
+        _placeholder = "✅ 已收到你的反馈。（原回答内容暂时无法重新载入，不影响本次反馈记录）"
+        card_param_map.setdefault("content", _placeholder)
+        card_param_map.setdefault("answer", _placeholder)
+        card_param_map.setdefault("question", "")
+        card_param_map.setdefault("title", "")
+        card_param_map.setdefault("sources_text", "")
+        card_param_map.setdefault("sources", "")
+        card_param_map.setdefault("meta", "")
+        card_param_map.setdefault("content_blocks", "")
 

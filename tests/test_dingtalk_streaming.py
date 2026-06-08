@@ -240,6 +240,31 @@ def test_rebuild_card_param_map_sets_is_answer_done_even_when_db_fails():
         dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-x")  # 异常被吞，不抛出
 
     assert card_param_map["is_answer_done"] == "true"
+    # DB 异常 → 兜底占位，避免回调覆盖整卡→白屏
+    assert card_param_map.get("content")
+
+
+def test_rebuild_card_param_map_no_row_sets_placeholder_not_blank():
+    """qa_session_log 查无此 message_id（演示卡未落库 / message_id 不匹配）→ 兜底写非空占位 content，
+    避免钉钉回调覆盖整卡→白屏（即"点其他原因后白屏"的根因：未落库的卡重建不出正文）。"""
+    from opensearch_pipeline import dingtalk_bot
+
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None  # 查无此行
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    # 模拟"其他原因"回调已设的字段（content/answer 未设 → 不兜底就白屏）
+    card_param_map = {"feedback_status": "", "show_other_feedback_form": "true", "form_status": "normal"}
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+        dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-unlogged")
+
+    assert card_param_map["is_answer_done"] == "true"
+    assert card_param_map.get("content")   # 非空占位 → 不白屏
+    assert card_param_map.get("answer")
+    # 调用方设置的表单字段保留（"其他原因"表单仍可用）
+    assert card_param_map["show_other_feedback_form"] == "true"
+    assert card_param_map["form_status"] == "normal"
 
 
 def test_rebuild_card_param_map_streaming_folds_sources_and_latency_into_content(monkeypatch):
