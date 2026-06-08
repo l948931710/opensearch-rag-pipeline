@@ -1,0 +1,153 @@
+"""Orchestrator for the end-to-end HA3 RAG eval.
+
+Phases:
+  run    : execute layers L0-L5 live (read-only), write results.json + judge_bundle.json
+           + a preliminary report (deterministic gates only).
+  merge  : load results.json + judge_verdicts.json (authored by the Claude panel),
+           compute judge aggregates, write the FINAL report with all gates.
+
+Usage:
+  python -m eval_harness.run_eval run   [--goldset PATH] [--layers l0,l1,l2,l3,l4,l5] [--limit N]
+  python -m eval_harness.run_eval merge --results PATH --verdicts PATH
+
+Everything that touches HA3/RDS is read-only. Answer generation runs with thinking OFF.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+
+from . import envboot
+from .ha3live import install_into_retriever
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_GOLDSET = os.path.join(HERE, "goldset", "golden_50.json")
+
+
+def _ts():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _load_goldset(path):
+    cases = json.load(open(path, encoding="utf-8"))
+    return cases
+
+
+def phase_run(args):
+    install_into_retriever()  # force public-HTTP client into the production retriever
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+
+    cases = _load_goldset(args.goldset)
+    if args.limit:
+        cases = cases[: args.limit]
+    layers = set(args.layers.split(","))
+    outdir = args.outdir or os.path.join(HERE, "reports", f"run_{_ts()}")
+    os.makedirs(outdir, exist_ok=True)
+
+    meta = {
+        "run_id": os.path.basename(outdir), "timestamp": _ts(),
+        "n_cases": len(cases), "goldset": args.goldset, "layers": sorted(layers),
+        "llm_model": cfg.llm.model, "embedding_model": cfg.embedding.model,
+        **envboot.facts(),
+    }
+    results = {"meta": meta}
+    print(f"== EVAL RUN {meta['run_id']} | table={meta['ha3_table']} | n={len(cases)} ==")
+    print(json.dumps({k: meta[k] for k in ("ha3_endpoint", "llm_model", "rag_environment", "simulate")},
+                     ensure_ascii=False))
+
+    if "l0" in layers:
+        print("\n[L0] index health ...")
+        from .layers import l0_index_health
+        results["l0"] = l0_index_health.run()
+        print(f"   L0 PASS={results['l0'].get('PASS')}")
+
+    if "l1" in layers:
+        print("\n[L1] retrieval ranking ...")
+        from .layers import l1_retrieval
+        results["l1"] = l1_retrieval.run(cases, top_k=10)
+        print(f"   ranking={json.dumps(results['l1'].get('ranking'), ensure_ascii=False)}")
+
+    if "l2" in layers and "l1" in results:
+        print("\n[L2] score calibration ...")
+        from .layers import l2_calibration
+        results["l2"] = l2_calibration.run(results["l1"])
+        print(f"   thresholds_ok={results['l2'].get('thresholds_ok')}")
+
+    if "l3" in layers:
+        print("\n[L3] answer quality (thinking OFF) + judge bundle ...")
+        from .layers import l3_answer
+        results["l3"] = l3_answer.run(cases, top_k=7)
+        json.dump(results["l3"]["judge_bundle"],
+                  open(os.path.join(outdir, "judge_bundle.json"), "w"),
+                  ensure_ascii=False, indent=1)
+        print(f"   deterministic={json.dumps(results['l3']['deterministic'], ensure_ascii=False)}")
+
+    if "l4" in layers:
+        print("\n[L4] multimodal ...")
+        from .layers import l4_multimodal
+        results["l4"] = l4_multimodal.run(cases)
+        if results["l4"].get("applicable"):
+            json.dump(results["l4"]["judge_bundle_mm"],
+                      open(os.path.join(outdir, "judge_bundle_mm.json"), "w"),
+                      ensure_ascii=False, indent=1)
+        print(f"   applicable={results['l4'].get('applicable')}")
+
+    if "l5" in layers:
+        print("\n[L5] permission filtering ...")
+        from .layers import l5_permission
+        results["l5"] = l5_permission.run()
+        print(f"   {json.dumps({k: results['l5'].get(k) for k in ('applicable','PASS')}, ensure_ascii=False)}")
+
+    from . import report
+    gates = report.write(results, outdir)
+    print(f"\n== PRELIMINARY REPORT -> {outdir}/report.md ==")
+    for name, g in gates.items():
+        mark = "PASS" if g["pass"] is True else ("FAIL" if g["pass"] is False else "N/A")
+        print(f"   [{mark}] {name}: {g['value']}")
+    print(f"\nNext: judge the bundle (Claude panel) -> {outdir}/judge_verdicts.json, then:\n"
+          f"  python -m eval_harness.run_eval merge --results {outdir}/report.json "
+          f"--verdicts {outdir}/judge_verdicts.json")
+    return outdir
+
+
+def phase_merge(args):
+    results = json.load(open(args.results, encoding="utf-8"))
+    verdicts = json.load(open(args.verdicts, encoding="utf-8"))
+    bundle_path = os.path.join(os.path.dirname(args.results), "judge_bundle.json")
+    bundle = json.load(open(bundle_path, encoding="utf-8")) if os.path.exists(bundle_path) else []
+
+    from .judge import merge_panel
+    panels = verdicts["panels"] if isinstance(verdicts, dict) and "panels" in verdicts else verdicts
+    results["judge"] = merge_panel(bundle, panels)
+
+    from . import report
+    outdir = os.path.dirname(args.results)
+    gates = report.write(results, outdir)
+    print(f"== FINAL REPORT -> {outdir}/report.md ==")
+    for name, g in gates.items():
+        mark = "PASS" if g["pass"] is True else ("FAIL" if g["pass"] is False else "N/A")
+        print(f"   [{mark}] {name}: {g['value']}")
+    return outdir
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("phase", choices=["run", "merge"])
+    ap.add_argument("--goldset", default=DEFAULT_GOLDSET)
+    ap.add_argument("--layers", default="l0,l1,l2,l3,l4,l5")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--outdir", default="")
+    ap.add_argument("--results", default="")
+    ap.add_argument("--verdicts", default="")
+    args = ap.parse_args()
+    if args.phase == "run":
+        phase_run(args)
+    else:
+        phase_merge(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -35,3 +35,13 @@ logs/
 
 # MCP config — contains a live Alibaba AccessKey secret; never commit
 .mcp.json
+
+# eval_harness run artifacts (bulky/ephemeral — the harness CODE is tracked,
+# but per-run reports, bundles, shards and caches are regenerated on demand)
+eval_harness/reports/run_*/
+eval_harness/reports/shards/
+eval_harness/reports/active_bundle.json
+eval_harness/reports/rerank_ab.json
+eval_harness/reports/rerank_ab_v2.json
+eval_harness/reports/rerank_smoke.json
+eval_harness/**/__pycache__/

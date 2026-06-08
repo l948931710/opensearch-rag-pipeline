@@ -13,7 +13,7 @@ config.py — 管线配置中心
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 from pathlib import Path
 
 def _load_env_files():
@@ -131,6 +131,17 @@ class AlibabaVectorSearchConfig:
     text_weight: float = 0.3               # 加权模式下 text (BM25) 权重
     text_search_field: str = "chunk_text"   # BM25 全文检索字段名（需配置 TEXT 倒排索引）
     hybrid_knn_top_k: int = 100             # kNN 路的候选池大小
+    # ── 路由式重排序（DashScope rerank，见 reranker.py / eval_harness rerank A/B）──
+    # 默认关闭；开启后 retrieve_and_enrich 会 over-fetch rerank_pool 个候选 → 重排 → 取 top_k。
+    rerank_enable: bool = False             # RAG_RERANK_ENABLE
+    rerank_text_model: str = "qwen3-rerank"      # 纯文本候选池
+    rerank_vl_model: str = "qwen3-vl-rerank"     # 含图片候选池（图文重排）
+    # 候选池含图片时，纯文本路径也路由到 VL 重排。
+    # 数据驱动（rerank A/B，image-pool n=40）：纯文本重排即使用 visual_summary 富文本，
+    # 图片类 recall@1 仅 0.725 < baseline 0.825 < VL 0.85 → 含图片走 VL 更优。
+    rerank_route_vl: bool = True
+    rerank_pool: int = 20                   # 重排前 over-fetch 的候选池大小
+    rerank_timeout: int = 15                # 重排 API 超时（秒）；超时即降级为原始顺序
 
 
 @dataclass
@@ -193,13 +204,22 @@ class RAGConfig:
     # 用于 _format_context 中标记 "高/中/低" 相关度，引导 LLM 忽略低分文档。
     # 默认值基于 120-query 评测数据标定：
     #   P25≈5.0, P50≈7.2, P75≈9.0
-    #   score_high=8.0 → 约 top 35% 标为"高"
-    #   score_medium=5.0 → 约 next 40% 标为"中"
-    #   <5.0 → 约 bottom 25% 标为"低"
+    # 🔧 2026-06-07 重标定（eval_harness 251 题，重建后 fuling_kb_chunks 实测分布）：
+    #   正确 top-1 命中 score：mean≈7.63, P10≈5.56, P50≈7.73, P75≈8.56
+    #   旧阈值 8.0/5.0 下仅 ~38% 正确命中标为"高"；新阈值 7.7/5.8 → ~50% 标"高"，
+    #   且 ~85% 正确命中 ≥"中"。可经 RAG_SCORE_THRESHOLD_HIGH/_MEDIUM 覆盖。
+    # ⚠️ 正/负样本 score 区分度本身偏弱（Youden J≈0.46）：阈值调整只是缓解，
+    #    根因需 reranker / 调融合权重 / 按 query 归一化（见 eval_harness/recalibration.json）。
     # ⚠️ 如果切换 hybrid_fusion 从 "weighted" 到 "rrf"，score 分布
     #    会完全不同（RRF 分数 ∈ [0, 1]），必须重新标定这两个值。
-    score_threshold_high: float = 8.0
-    score_threshold_medium: float = 5.0
+    score_threshold_high: float = 7.7
+    score_threshold_medium: float = 5.8
+    # 重排序开启时，相关度标签改用 rerank 分（0~1）。
+    # 2026-06-07 标定（eval_harness 251 题 rerank-on 实测）：正确 top-1 命中 mean≈0.91
+    # (P50 0.93)，负例 mean≈0.75 (P50 0.74)。high=0.9/medium=0.8 → 正确命中 69% 高 / 92% ≥中，
+    # 负例 65% 低（仅 23% 高）；rerank 分区分度（Youden J≈0.60）远优于融合分。
+    rerank_score_threshold_high: float = 0.9    # RAG_RERANK_SCORE_THRESHOLD_HIGH
+    rerank_score_threshold_medium: float = 0.8  # RAG_RERANK_SCORE_THRESHOLD_MEDIUM
     # ── 纯文本生成开关（pure-text mode） ─────────────────────────
     # True  → 生成纯文字回答：system prompt 去掉 <<IMG:N>> 图片插入规则，
     #         context 不再注入 <<IMG:N>> 标记，卡片只展示文字（图片语义仍以
@@ -402,6 +422,12 @@ def load_config() -> PipelineConfig:
             text_weight=_env_float("HA3_TEXT_WEIGHT", 0.3),
             text_search_field=_env("HA3_TEXT_SEARCH_FIELD", "chunk_text"),
             hybrid_knn_top_k=_env_int("HA3_HYBRID_KNN_TOP_K", 100),
+            rerank_enable=_env_bool("RERANK_ENABLE", False),
+            rerank_text_model=_env("RERANK_TEXT_MODEL", "qwen3-rerank"),
+            rerank_vl_model=_env("RERANK_VL_MODEL", "qwen3-vl-rerank"),
+            rerank_route_vl=_env_bool("RERANK_ROUTE_VL", True),
+            rerank_pool=_env_int("RERANK_POOL", 20),
+            rerank_timeout=_env_int("RERANK_TIMEOUT", 15),
         ),
 
         embedding=EmbeddingConfig(
@@ -463,6 +489,11 @@ def load_config() -> PipelineConfig:
             api_port=_env_int("RAG_API_PORT", 8000),
             max_history_turns=_env_int("RAG_MAX_HISTORY_TURNS", 10),
             pure_text=_env_bool("PURE_TEXT", False),               # RAG_PURE_TEXT
+            # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
+            score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
+            score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM
+            rerank_score_threshold_high=_env_float("RERANK_SCORE_THRESHOLD_HIGH", 0.9),
+            rerank_score_threshold_medium=_env_float("RERANK_SCORE_THRESHOLD_MEDIUM", 0.8),
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE
