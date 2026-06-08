@@ -496,9 +496,12 @@ def _stream_answer_to_card(
                 last_push = now
 
         full_answer = _clean("".join(collected))
-        # 定稿帧
+        # 定稿帧：把"耗时"拼进正文末尾随定稿帧一起推。完成后【不能】用 update_card_data 改 meta 页脚
+        # （会覆盖流式 content → 整卡空白，已实测），故耗时只能走 content；模型名仍在 meta 页脚
+        # （create 时已设、定稿后保留）。full_answer 保持干净（落库/写历史不含此页脚）。
+        _elapsed_s = time.time() - t0
         streaming_update_card(
-            message_id, full_answer,
+            message_id, f"{full_answer}\n\n> ⏱ 耗时 {_elapsed_s:.1f}s",
             key=stream_key, is_full=True, is_finalize=True,
         )
     except Exception as e:

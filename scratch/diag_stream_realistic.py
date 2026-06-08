@@ -47,6 +47,6 @@ def main():
         i=min(n,i+step)
         if stream(t,o,ANSWER[:i])!=200: fail+=1
         time.sleep(0.5)
-    # 定稿即可——不调 update_card_data（PUT /card/instances 会覆盖流式 content → 空白；完成态按钮已硬化）
-    print("finalize:",stream(t,o,ANSWER,fin=True),"帧失败:",f"{fail}/18")
+    # 定稿即可——不调 update_card_data；耗时拼进正文末尾（meta 页脚定稿后不可更新，否则覆盖 content 致空白）
+    print("finalize:",stream(t,o,ANSWER+"\n\n> ⏱ 耗时 9.5s",fin=True),"帧失败:",f"{fail}/18")
 if __name__=="__main__": main()
