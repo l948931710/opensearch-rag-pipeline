@@ -171,6 +171,43 @@ def test_streaming_forces_pure_text(
     assert mock_stream.call_args.kwargs["pure_text"] is True
 
 
+def test_streaming_nonblocking_pusher_finalize_is_last():
+    """非阻塞后台推流：生成期间后台线程会推送多帧，但 finalize 必为【最后一次】调用。
+
+    回归点：推流改后台线程后，若不在 finalize 前 stop+join，推流帧可能覆盖定稿帧 → 卡片空白/掉页脚。
+    用带延时的流让后台线程真正触发多次推送，验证 (a) 后台确有推流，(b) 仅一次定稿且在最后，其后无推送。
+    """
+    import time as _t
+    from opensearch_pipeline import dingtalk_bot
+
+    calls = []
+
+    def _rec(message_id, content, *, key="content", is_full=True, is_finalize=False, is_error=False):
+        calls.append({"is_finalize": is_finalize, "is_error": is_error})
+        return True
+
+    def _slow_stream(*args, **kwargs):
+        yield 'data: {"type": "sources", "sources": []}\n\n'
+        for w in ["甲", "乙", "丙", "丁", "戊"]:
+            yield f'data: {{"type": "chunk", "content": "{w}"}}\n\n'
+            _t.sleep(0.25)  # 5×0.25=1.25s > 推流间隔 0.3s → 后台线程必触发
+        yield 'data: {"type": "done", "model": "qwen3.6-plus", "usage": {}}\n\n'
+        yield "data: [DONE]\n\n"
+
+    with patch("opensearch_pipeline.dingtalk_bot.get_config", return_value=_fake_cfg()), \
+         patch("opensearch_pipeline.dingtalk_bot.create_streaming_card", return_value=True), \
+         patch("opensearch_pipeline.dingtalk_bot.streaming_update_card", side_effect=_rec), \
+         patch("opensearch_pipeline.dingtalk_bot.append_to_history"), \
+         patch("opensearch_pipeline.dingtalk_bot.log_qa_session"), \
+         patch("opensearch_pipeline.dingtalk_bot.generate_answer_stream", side_effect=_slow_stream):
+        handled = _call_stream()
+
+    assert handled is True
+    assert len(calls) >= 2, "后台推流应至少触发一次 + 定稿"
+    assert sum(c["is_finalize"] for c in calls) == 1, "有且仅有一次定稿"
+    assert calls[-1]["is_finalize"] is True, "定稿必为最后一次调用（其后无推流帧覆盖）"
+
+
 # ── 回调重建：流式卡片反馈后必须恢复 is_answer_done="true" ────────────────────────
 # 回归测试：修复前 _rebuild_card_param_map 从不回写 is_answer_done，流式模板把
 # sources/meta/反馈按钮均门控在 is_answer_done=="true"，导致用户点击反馈后这些区域折叠。

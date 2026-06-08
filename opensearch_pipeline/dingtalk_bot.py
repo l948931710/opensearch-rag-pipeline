@@ -462,7 +462,6 @@ def _stream_answer_to_card(
 
     interval_s = max(cfg.rag.dingtalk_stream_interval_ms, 0) / 1000.0
     collected: List[str] = []
-    last_push = 0.0
     answer_status = "SUCCESS"
     error_message: Optional[str] = None
 
@@ -470,7 +469,36 @@ def _stream_answer_to_card(
         # 与成品卡片一致的清理：去除末尾参考来源段 + <<IMG:N>> 占位符（钉钉端纯文本）
         return re.sub(r'<{1,2}IMG:\d+>{1,2}', '', _strip_trailing_sources(text)).strip()
 
+    # 非阻塞推流：后台单线程每 interval 推一次"最新累计正文"，主循环只消费 LLM token、不被
+    # PUT /card/streaming 的网络往返阻塞。同步推流在推流往返慢时会把 ~6s 的生成拖成数十秒
+    # （每帧阻塞累加）。关键不变量：finalize 前必须 stop+join 推流线程，杜绝"推流帧覆盖定稿帧"
+    # → 空白/掉页脚（曾踩过的坑）。单线程顺序推流→帧不乱序；推流失败 fail open。
+    _push_interval = interval_s if interval_s > 0 else 0.3
+    _latest = {"text": ""}
+    _plock = threading.Lock()
+    _pstop = threading.Event()
+
+    def _pusher() -> None:
+        last = ""
+        while not _pstop.wait(_push_interval):
+            with _plock:
+                txt = _latest["text"]
+            if txt and txt != last:
+                try:
+                    streaming_update_card(message_id, txt, key=stream_key, is_full=True)
+                    last = txt
+                except Exception:
+                    pass  # 推流失败不影响生成/定稿
+
+    _pthread = threading.Thread(target=_pusher, name="dt-stream-push", daemon=True)
+
+    def _stop_pusher() -> None:
+        _pstop.set()
+        if _pthread.is_alive():
+            _pthread.join(timeout=5)
+
     try:
+        _pthread.start()
         for event in generate_answer_stream(
             question,
             chunks,
@@ -488,14 +516,12 @@ def _stream_answer_to_card(
             if d.get("type") != "chunk" or not d.get("content"):
                 continue
             collected.append(d["content"])
-            now = time.time()
-            if now - last_push >= interval_s:
-                streaming_update_card(
-                    message_id, _clean("".join(collected)),
-                    key=stream_key, is_full=True,
-                )
-                last_push = now
+            _txt = _clean("".join(collected))
+            with _plock:
+                _latest["text"] = _txt  # 后台线程按节流推送，主循环不阻塞
 
+        # 生成结束 → 先停推流线程（确保不与定稿竞争），再写定稿帧
+        _stop_pusher()
         full_answer = _clean("".join(collected))
         # B2 版式：定稿帧把【参考来源 + "模型 ｜ 耗时"】按序拼进正文末尾 → 顺序 答案→来源→耗时，
         # 耗时落到最底下（紧挨按钮）、渲染成灰色缩进，且【不闪不空白】。改走 content 而非 meta 页脚：
@@ -516,6 +542,7 @@ def _stream_answer_to_card(
             key=stream_key, is_full=True, is_finalize=True,
         )
     except Exception as e:
+        _stop_pusher()  # 异常路径同样先停推流线程，再写错误定稿帧（避免推流帧覆盖）
         trace_id = uuid.uuid4().hex[:8]
         answer_status = "LLM_ERROR"
         error_message = f"[trace={trace_id}] {str(e)[:500]}"
