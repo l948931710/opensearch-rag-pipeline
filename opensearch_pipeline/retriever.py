@@ -1138,7 +1138,15 @@ def retrieve_and_enrich(
     Returns:
         经过检索 + 邻居拼接（+ 可选图片召回）后的 chunks 列表
     """
-    chunks = search_chunks(query, top_k=top_k, user_dept=user_dept)
+    # 路由式重排开启时：over-fetch rerank_pool 个候选 → 重排 → 取 top_k；否则直接取 top_k。
+    _av = get_config().alibaba_vector
+    _fetch_k = max(_av.rerank_pool, top_k) if _av.rerank_enable else top_k
+    chunks = search_chunks(query, top_k=_fetch_k, user_dept=user_dept)
+    if _av.rerank_enable and chunks:
+        from .reranker import rerank_chunks
+        # multimodal 渲染路径（cosurface_images=True）用 VL 重排；纯文本/钉钉机器人用文本重排。
+        chunks = rerank_chunks(query, chunks, top_k=top_k,
+                               multimodal=bool(cosurface_images))  # 失败自动降级为原始顺序
     if chunks and stitch_window > 0:
         chunks = stitch_neighbor_chunks(chunks, window=stitch_window)
     # Step Card 上下文扩展

@@ -68,6 +68,9 @@ def _format_context(
     config = get_config()
     threshold_high = config.rag.score_threshold_high
     threshold_medium = config.rag.score_threshold_medium
+    # 重排开启时 chunk["score"] 为 rerank 分（0~1），需用 rerank 阈值标定相关度标签。
+    rr_high = config.rag.rerank_score_threshold_high
+    rr_medium = config.rag.rerank_score_threshold_medium
 
     parts = []
     total_chars = 0
@@ -107,8 +110,12 @@ def _format_context(
             if not pure_text and ((chunk.get("image_refs") or []) or chunk.get("source_image")):
                 header += f" [📷 图片] <<IMG:{i+1}>>"
         if isinstance(score, (int, float)):
-            # 混合检索融合分（weighted/RRF）：越大越相关，DESC 排序
-            level = "高" if score >= threshold_high else "中" if score >= threshold_medium else "低"
+            # 越大越相关：融合分用 fused 阈值；rerank 分（0~1）用 rerank 阈值。
+            if "rerank_score" in chunk:
+                _hi, _md = rr_high, rr_medium
+            else:
+                _hi, _md = threshold_high, threshold_medium
+            level = "高" if score >= _hi else "中" if score >= _md else "低"
             header += f" (相关度: {level} {score:.2f})"
 
         entry = f"{header}\n{text}\n"

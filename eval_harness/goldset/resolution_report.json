@@ -1,0 +1,202 @@
+{
+  "inventory_size": 396,
+  "total_cases": 251,
+  "by_source": {
+    "xlsx": 200,
+    "json_text": 51
+  },
+  "by_module": {
+    "rag_retrieval": 60,
+    "nlq": 115,
+    "source_attribution": 25,
+    "rag_retrieval_json": 51
+  },
+  "by_kind": {
+    "positive": 225,
+    "negative": 26
+  },
+  "positives": 225,
+  "positives_live_scorable": 165,
+  "positives_unresolved": 60,
+  "unresolved_examples": [
+    {
+      "qid": "RAG-18",
+      "expected_docs": [
+        "A53动火安全管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-31",
+      "expected_docs": [
+        "CWD-004预算管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-32",
+      "expected_docs": [
+        "CWD-007存货管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-33",
+      "expected_docs": [
+        "CWD-018会计档案管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-34",
+      "expected_docs": [
+        "CWD-009固定资产管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-35",
+      "expected_docs": [
+        "CWD-010成本核算管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-36",
+      "expected_docs": [
+        "CWD-003资金管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-37",
+      "expected_docs": [
+        "印花税申报操作规范"
+      ]
+    },
+    {
+      "qid": "RAG-38",
+      "expected_docs": [
+        "CWD-005销售与收款管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-39",
+      "expected_docs": [
+        "CWD-006采购与付款管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-40",
+      "expected_docs": [
+        "CWD-017出纳管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-41",
+      "expected_docs": [
+        "CWD-019发票使用审核制度"
+      ]
+    },
+    {
+      "qid": "RAG-42",
+      "expected_docs": [
+        "CWD-023编制财务报表制度"
+      ]
+    },
+    {
+      "qid": "RAG-43",
+      "expected_docs": [
+        "CWD-020对外投资管理制度"
+      ]
+    },
+    {
+      "qid": "RAG-44",
+      "expected_docs": [
+        "CWD-021重要决策法律审查管理办法"
+      ]
+    },
+    {
+      "qid": "RAG-45",
+      "expected_docs": [
+        "CWD-022发出商品验收单管理制度"
+      ]
+    },
+    {
+      "qid": "QA-07",
+      "expected_docs": [
+        "行政部联系方式"
+      ]
+    },
+    {
+      "qid": "QA-26",
+      "expected_docs": [
+        "关于2026年夏季上下班作息时间调整的通知"
+      ]
+    },
+    {
+      "qid": "QA-29",
+      "expected_docs": [
+        "FL-RL-2319新员工招聘流程"
+      ]
+    },
+    {
+      "qid": "QA-71",
+      "expected_docs": [
+        "FL-CWZD-001财务部部门职责"
+      ]
+    },
+    {
+      "qid": "QA-72",
+      "expected_docs": [
+        "FL-CW-SW-002出口退税申报操作规范"
+      ]
+    },
+    {
+      "qid": "QA-73",
+      "expected_docs": [
+        "CWD-010成本核算管理制度"
+      ]
+    },
+    {
+      "qid": "QA-74",
+      "expected_docs": [
+        "钉钉OA审批系统"
+      ]
+    },
+    {
+      "qid": "QA-75",
+      "expected_docs": [
+        "台州富岭领、付款审批制度"
+      ]
+    },
+    {
+      "qid": "QA-76",
+      "expected_docs": [
+        "7-0采购控制程序"
+      ]
+    }
+  ],
+  "selected_50": {
+    "n": 50,
+    "by_module": {
+      "rag_retrieval_json": 24,
+      "rag_retrieval": 12,
+      "source_attribution": 5,
+      "nlq": 9
+    },
+    "by_dept": {
+      "null": 24,
+      "行政部": 8,
+      "人力资源部": 9,
+      "跨部门": 3,
+      "边界控制": 6
+    },
+    "by_kind": {
+      "positive": 38,
+      "negative": 12
+    },
+    "by_difficulty": {
+      "null": 36,
+      "multi_doc": 3,
+      "cross_chunk": 3,
+      "query_robustness": 3,
+      "single_chunk": 3,
+      "disambiguation": 2
+    },
+    "image_queries": 2
+  }
+}
