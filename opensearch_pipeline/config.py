@@ -191,6 +191,10 @@ class LLMConfig:
     temperature: float = 0.1
     max_retries: int = 2
     max_tokens: int = 2048
+    # Qwen3 思考模式：默认关闭。开启时模型先生成大量 reasoning_content（被问答代码丢弃），
+    # 实测使总时长 38.5s→8.6s、首字 34s→1.3s，且 reasoning 挤占 max_tokens 预算导致答案被截断。
+    # RAG 答案有检索上下文兜底，无需思考。如需对照可设 RAG_LLM_ENABLE_THINKING=true。
+    enable_thinking: bool = False
 
 
 @dataclass
@@ -462,6 +466,7 @@ def load_config() -> PipelineConfig:
             api_base_url=llm_base_url,
             model=llm_model,
             max_tokens=_env_int("LLM_MAX_TOKENS", 2048),
+            enable_thinking=_env_bool("LLM_ENABLE_THINKING", False),  # RAG_LLM_ENABLE_THINKING
         ),
         chunker=ChunkerConfig(
             min_chunk_chars=_env_int("CHUNKER_MIN_CHARS", 50),

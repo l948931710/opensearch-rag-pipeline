@@ -245,6 +245,8 @@ def generate_answer(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
+        # 非流式同样关闭思考（默认 False）：思考拖慢且 DashScope 对 qwen3 非流式+思考支持受限。
+        "enable_thinking": llm.enable_thinking,
     }
 
     resp = requests.post(
@@ -319,6 +321,10 @@ def generate_answer_stream(
         "temperature": temperature,
         "stream": True,
         "stream_options": {"include_usage": True},
+        # 关闭 Qwen3 思考模式（默认 False）：思考会先生成大量 reasoning_content（本函数只读 content、
+        # 直接丢弃），实测拖慢 ~4.5x（38.5s→8.6s）且首字 34s→1.3s，并挤占 max_tokens 致答案截断。
+        # RAG 有检索上下文兜底，无需思考。可经 RAG_LLM_ENABLE_THINKING=true 开启对照。
+        "enable_thinking": llm.enable_thinking,
     }
 
     # 先 yield sources 信息
