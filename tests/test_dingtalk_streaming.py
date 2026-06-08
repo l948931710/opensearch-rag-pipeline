@@ -59,6 +59,7 @@ def _call_stream(**overrides):
     return dingtalk_bot._stream_answer_to_card(**kwargs)
 
 
+@patch("opensearch_pipeline.dingtalk_bot.update_card_data")
 @patch("opensearch_pipeline.dingtalk_bot.log_qa_session")
 @patch("opensearch_pipeline.dingtalk_bot.append_to_history")
 @patch("opensearch_pipeline.dingtalk_bot.streaming_update_card", return_value=True)
@@ -66,7 +67,7 @@ def _call_stream(**overrides):
 @patch("opensearch_pipeline.dingtalk_bot.generate_answer_stream", side_effect=_fake_stream)
 @patch("opensearch_pipeline.dingtalk_bot.get_config", return_value=_fake_cfg())
 def test_streaming_card_happy_path(
-    mock_cfg, mock_stream, mock_create, mock_update, mock_append, mock_log
+    mock_cfg, mock_stream, mock_create, mock_update, mock_append, mock_log, mock_card_data
 ):
     """正常流式：投放成功 → 更新 → 定稿，纯文本清理 + 落库/写历史一致，返回 True。"""
     handled = _call_stream()
@@ -88,8 +89,14 @@ def test_streaming_card_happy_path(
     assert "<<IMG" not in final_content and "IMG:1" not in final_content
     assert "住宿申请" in final_content
 
-    # 4. 写历史 + 落库（与非流式一致）。定稿后【不】再调 update_card_data
-    #    （PUT /card/instances 会覆盖流式写入的 content → 卡片空白；完成态按钮门控已硬化，无需 is_answer_done）。
+    # 4. 定稿【前】调 update_card_data：meta 页脚带"模型 | 耗时"+ content（全量，避免覆盖；顺序须在 finalize 前）。
+    #    完成【后】调会清空整卡，故必须在 finalize 之前。
+    mock_card_data.assert_called_once()
+    cd_payload = mock_card_data.call_args.args[1]
+    assert cd_payload["meta"].startswith("模型:") and "耗时" in cd_payload["meta"]
+    assert "住宿申请" in cd_payload["content"]
+
+    # 5. 写历史 + 落库（与非流式一致）
     mock_append.assert_called_once()
     assert mock_append.call_args.args[0] == "conv1:staff1"
     mock_log.assert_called_once()
@@ -100,6 +107,7 @@ def test_streaming_card_happy_path(
     assert "<<IMG" not in (log_kwargs["answer_text"] or "")
 
 
+@patch("opensearch_pipeline.dingtalk_bot.update_card_data")
 @patch("opensearch_pipeline.dingtalk_bot.log_qa_session")
 @patch("opensearch_pipeline.dingtalk_bot.append_to_history")
 @patch("opensearch_pipeline.dingtalk_bot.streaming_update_card", return_value=True)
@@ -107,7 +115,7 @@ def test_streaming_card_happy_path(
 @patch("opensearch_pipeline.dingtalk_bot.generate_answer_stream", side_effect=_fake_stream)
 @patch("opensearch_pipeline.dingtalk_bot.get_config", return_value=_fake_cfg())
 def test_streaming_card_fallback_when_create_fails(
-    mock_cfg, mock_stream, mock_create, mock_update, mock_append, mock_log
+    mock_cfg, mock_stream, mock_create, mock_update, mock_append, mock_log, mock_card_data
 ):
     """投放失败 → 返回 False（降级），不触发流式更新/落库/置位（避免重复落库）。"""
     handled = _call_stream()
@@ -118,15 +126,17 @@ def test_streaming_card_fallback_when_create_fails(
     mock_stream.assert_not_called()
     mock_append.assert_not_called()
     mock_log.assert_not_called()
+    mock_card_data.assert_not_called()
 
 
+@patch("opensearch_pipeline.dingtalk_bot.update_card_data")
 @patch("opensearch_pipeline.dingtalk_bot.log_qa_session")
 @patch("opensearch_pipeline.dingtalk_bot.append_to_history")
 @patch("opensearch_pipeline.dingtalk_bot.streaming_update_card", return_value=True)
 @patch("opensearch_pipeline.dingtalk_bot.create_streaming_card", return_value=True)
 @patch("opensearch_pipeline.dingtalk_bot.get_config", return_value=_fake_cfg())
 def test_streaming_card_llm_error_finalizes_with_error(
-    mock_cfg, mock_create, mock_update, mock_append, mock_log
+    mock_cfg, mock_create, mock_update, mock_append, mock_log, mock_card_data
 ):
     """生成阶段抛错：以 is_error 定稿并落 LLM_ERROR，不写历史，不置 is_answer_done，仍返回 True。"""
     def _boom(*args, **kwargs):
@@ -143,11 +153,13 @@ def test_streaming_card_llm_error_finalizes_with_error(
     assert final_call.kwargs["is_error"] is True
 
     mock_append.assert_not_called()      # 失败不写历史
+    mock_card_data.assert_not_called()   # 失败走 except 分支，不到 update_card_data
     mock_log.assert_called_once()
     assert mock_log.call_args.kwargs["answer_status"] == "LLM_ERROR"
     assert mock_log.call_args.kwargs["error_message"]
 
 
+@patch("opensearch_pipeline.dingtalk_bot.update_card_data")
 @patch("opensearch_pipeline.dingtalk_bot.log_qa_session")
 @patch("opensearch_pipeline.dingtalk_bot.append_to_history")
 @patch("opensearch_pipeline.dingtalk_bot.streaming_update_card", return_value=True)
@@ -155,7 +167,7 @@ def test_streaming_card_llm_error_finalizes_with_error(
 @patch("opensearch_pipeline.dingtalk_bot.generate_answer_stream", side_effect=_fake_stream)
 @patch("opensearch_pipeline.dingtalk_bot.get_config", return_value=_fake_cfg())
 def test_streaming_forces_pure_text(
-    mock_cfg, mock_stream, mock_create, mock_update, mock_append, mock_log
+    mock_cfg, mock_stream, mock_create, mock_update, mock_append, mock_log, mock_card_data
 ):
     """钉钉流式强制纯文本：传给 generate_answer_stream 的 pure_text 必须为 True。"""
     _call_stream()

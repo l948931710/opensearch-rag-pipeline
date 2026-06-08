@@ -47,6 +47,10 @@ def main():
         i=min(n,i+step)
         if stream(t,o,ANSWER[:i])!=200: fail+=1
         time.sleep(0.5)
-    # 定稿即可——不调 update_card_data；耗时拼进正文末尾（meta 页脚定稿后不可更新，否则覆盖 content 致空白）
-    print("finalize:",stream(t,o,ANSWER+"\n\n> ⏱ 耗时 9.5s",fin=True),"帧失败:",f"{fail}/18")
+    # 关键顺序：先 update_card_data（meta 页脚带耗时，全量避免覆盖）→ 再 finalize（content 写回，故不空白）
+    SRC="1. 富岭U8+成品仓库操作手册.docx > 1.1主要业务流程（相关度 0.94）"
+    upd(t,o,{"title":"U8+成品仓库怎么操作","question":"U8+成品仓库怎么操作",KEY:ANSWER,
+             "sources":SRC,"sources_text":SRC,"meta":"模型: qwen3.6-plus | 耗时: 9.5s","feedback_status":"","is_answer_done":""})
+    time.sleep(.3)
+    print("finalize:",stream(t,o,ANSWER,fin=True),"帧失败:",f"{fail}/18")
 if __name__=="__main__": main()

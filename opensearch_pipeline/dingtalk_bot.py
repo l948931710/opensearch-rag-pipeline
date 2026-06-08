@@ -37,9 +37,11 @@ from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_feedback_status,
+    update_card_data,
     create_streaming_card,
     streaming_update_card,
     _strip_trailing_sources,
+    _format_sources_text,
 )
 from opensearch_pipeline.feedback_handler import handle_feedback, get_feedback_status_text
 
@@ -496,12 +498,20 @@ def _stream_answer_to_card(
                 last_push = now
 
         full_answer = _clean("".join(collected))
-        # 定稿帧：把"耗时"拼进正文末尾随定稿帧一起推。完成后【不能】用 update_card_data 改 meta 页脚
-        # （会覆盖流式 content → 整卡空白，已实测），故耗时只能走 content；模型名仍在 meta 页脚
-        # （create 时已设、定稿后保留）。full_answer 保持干净（落库/写历史不含此页脚）。
+        # 关键顺序：先 update_card_data（全量 cardParamMap，meta 页脚带"模型: X | 耗时: Ys"）→ 再 finalize。
+        # 完成【后】调 update_card_data 会清空整卡（已实测）；但完成【前】调、随后 finalize 把 content
+        # 重新写回，故不空白，且 meta 页脚拿到耗时（与成品卡一致的灰色页脚样式）。全量传避免覆盖其它字段。
         _elapsed_s = time.time() - t0
+        _sources_text = _format_sources_text(sources)
+        update_card_data(message_id, {
+            "title": question[:50], "question": question,
+            stream_key: full_answer,
+            "sources": _sources_text, "sources_text": _sources_text,
+            "meta": f"模型: {model_name} | 耗时: {_elapsed_s:.1f}s",
+            "feedback_status": "", "is_answer_done": "",
+        })
         streaming_update_card(
-            message_id, f"{full_answer}\n\n> ⏱ 耗时 {_elapsed_s:.1f}s",
+            message_id, full_answer,
             key=stream_key, is_full=True, is_finalize=True,
         )
     except Exception as e:
