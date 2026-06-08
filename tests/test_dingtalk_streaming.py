@@ -6,8 +6,9 @@ test_dingtalk_streaming.py — 钉钉流式 AI 卡片（打字机效果）测试
   - 投放流式卡片 → 流式更新 → 定稿（is_finalize）
   - 流式变量默认 = "content"（钉钉 AI 流式卡片约定变量；推流 key 须 == 模板流式组件绑定变量）
   - 定稿后【不】调 update_card_data（会覆盖流式写入的 content → 卡片空白；完成态按钮门控已硬化）
-  - B2 版式：定稿帧把 参考来源 + "模型 ｜ 耗时" 折进 content 末尾（答案→来源→耗时，耗时落最底下），
+  - B2 版式：定稿帧把 参考来源 + "模型 ｜ 检索·生成"页脚 折进 content 末尾（答案→来源→页脚，落最底下），
     不走 sources/meta 页脚，避免写页脚触发重渲染闪烁；create 时两页脚置空避免重复
+  - 页脚显示「检索/生成」分段耗时（生成=模型输出延迟）而非总耗时
   - 钉钉端纯文本：清理 <<IMG:N>> 标记
   - 落库 + 写历史与非流式路径一致
   - 投放失败时返回 False（降级），且不重复落库
@@ -89,12 +90,12 @@ def test_streaming_card_happy_path(
     # 3. 纯文本：<<IMG:1>> 标记已清理
     assert "<<IMG" not in final_content and "IMG:1" not in final_content
     assert "住宿申请" in final_content
-    # 4. B2 版式：定稿帧 content 末尾依次含 参考来源 + "模型 ｜ 耗时"（折进正文，不调 update_card_data；
-    #    顺序 答案→来源→耗时，耗时落最底下；避免写页脚触发闪烁/空白）
+    # 4. B2 版式：定稿帧 content 末尾依次含 参考来源 + "模型 ｜ 检索·生成"页脚（折进正文，不调 update_card_data；
+    #    顺序 答案→来源→页脚，落最底下；避免写页脚触发闪烁/空白）。显示生成(模型输出)延迟而非总耗时。
     assert "参考来源" in final_content and "员工手册" in final_content
-    assert "耗时" in final_content and "模型" in final_content
+    assert "生成" in final_content and "模型" in final_content
     # 来源在前、耗时页脚在后
-    assert final_content.index("参考来源") < final_content.index("耗时")
+    assert final_content.index("参考来源") < final_content.index("生成")
 
     # 5. 写历史 + 落库（与非流式一致）
     mock_append.assert_called_once()
@@ -180,8 +181,8 @@ def test_rebuild_card_param_map_restores_is_answer_done_on_db_hit():
 
     conn = MagicMock()
     cursor = MagicMock()
-    # (query_text, answer_text, cited_docs_json, model_name, latency_ms, content_blocks_json)
-    cursor.fetchone.return_value = ("怎么申请住宿", "住宿申请见附件", None, "qwen3.6-plus", 1500, None)
+    # (query, answer, cited_docs, model, latency_ms, retrieval_latency_ms, llm_latency_ms, content_blocks)
+    cursor.fetchone.return_value = ("怎么申请住宿", "住宿申请见附件", None, "qwen3.6-plus", 1500, 800, 1200, None)
     conn.cursor.return_value.__enter__.return_value = cursor
 
     card_param_map = {"feedback_status": "👍 已反馈：有帮助"}
@@ -215,10 +216,11 @@ def test_rebuild_card_param_map_streaming_folds_sources_and_latency_into_content
     monkeypatch.setenv("DINGTALK_STREAM_CARD_TEMPLATE_ID", "tpl-x")
     conn = MagicMock()
     cursor = MagicMock()
-    # cited_docs 直接给 list（重建支持 str/list）；(query, answer, cited_docs, model, latency_ms, content_blocks)
+    # cited_docs 直接给 list（重建支持 str/list）；
+    # (query, answer, cited_docs, model, latency_ms, retrieval_latency_ms, llm_latency_ms, content_blocks)
     cursor.fetchone.return_value = (
         "怎么申请住宿", "住宿申请见附件",
-        [{"title": "员工手册"}], "qwen3.6-plus", 1500, None,
+        [{"title": "员工手册"}], "qwen3.6-plus", 1500, 800, 1200, None,
     )
     conn.cursor.return_value.__enter__.return_value = cursor
 
@@ -231,9 +233,9 @@ def test_rebuild_card_param_map_streaming_folds_sources_and_latency_into_content
         dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-s")
 
     c = card_param_map["content"]
-    # 顺序：答案 → 参考来源 → 耗时（耗时落最底下）
+    # 顺序：答案 → 参考来源 → 检索·生成页脚（落最底下）
     assert "住宿申请见附件" in c and "参考来源" in c and "员工手册" in c
-    assert "耗时" in c and c.index("参考来源") < c.index("耗时")
+    assert "生成" in c and c.index("参考来源") < c.index("生成")
     # B2：来源/耗时已折进 content，页脚置空，避免与正文重复
     assert card_param_map["sources_text"] == "" and card_param_map["meta"] == ""
     assert card_param_map["is_answer_done"] == "true"

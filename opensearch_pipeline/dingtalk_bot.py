@@ -501,9 +501,12 @@ def _stream_answer_to_card(
         # 耗时落到最底下（紧挨按钮）、渲染成灰色缩进，且【不闪不空白】。改走 content 而非 meta 页脚：
         # 定稿前/后用 update_card_data 写页脚都会触发重渲染闪烁。create 时 sources/meta 页脚已置空，
         # 避免重复。full_answer 保持干净（落库/写历史不含来源/耗时页脚）。
-        _elapsed_s = time.time() - t0
+        # 显示「检索/生成」分段耗时而非总耗时：生成(LLM 输出)是主要成本(占 ~50-75%)，检索通常 <1s，
+        # 让用户看清耗时归属（27s 是模型在写、不是系统慢）。生成 = time.time()-t_retrieval（= llm_latency_ms）。
+        _ret_s = (retrieval_latency_ms or 0) / 1000.0
+        _gen_s = time.time() - t_retrieval
         _src_md = _format_sources_text(sources)
-        _footer = f"> 模型: {model_name} ｜ 耗时: {_elapsed_s:.1f}s"
+        _footer = f"> 模型: {model_name} ｜ 检索 {_ret_s:.1f}s · 生成 {_gen_s:.1f}s"
         _final = (
             f"{full_answer}\n\n📚 **参考来源**\n{_src_md}\n\n{_footer}"
             if _src_md else f"{full_answer}\n\n{_footer}"
@@ -985,7 +988,7 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                 cursor.execute(
                     """
                     SELECT query_text, answer_text, cited_docs_json, model_name, latency_ms,
-                           content_blocks_json
+                           retrieval_latency_ms, llm_latency_ms, content_blocks_json
                     FROM fuling_operation.qa_session_log
                     WHERE message_id = %s LIMIT 1
                     """,
@@ -1012,7 +1015,9 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                             _src_lines = []
                     model = row[3] or "unknown"
                     latency = row[4] or 0
-                    # 流式卡(B2)：正文绑 content，版式 答案→📚来源→"模型 ｜ 耗时"灰色引用块（耗时落最底下、
+                    ret_ms = row[5] or 0       # 检索阶段耗时
+                    gen_ms = row[6] or 0       # LLM 生成阶段耗时（= 模型输出延迟）
+                    # 流式卡(B2)：正文绑 content，版式 答案→📚来源→"模型 ｜ 检索·生成"灰色引用块（页脚落最底下、
                     # 紧挨按钮）；sources/meta 页脚置空，与 _stream_answer_to_card 定稿帧版式一致，避免反馈点击
                     # 后版式跳变（来源回到页脚、耗时挪位）。成品卡：正文绑 answer + 页脚 sources_text/meta（原逻辑）。
                     _streaming = bool(
@@ -1023,7 +1028,7 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                         _parts = [_answer]
                         if _src_lines:
                             _parts.append("📚 **参考来源**\n" + "\n".join(_src_lines))
-                        _parts.append(f"> 模型: {model} ｜ 耗时: {latency / 1000:.1f}s")
+                        _parts.append(f"> 模型: {model} ｜ 检索 {ret_ms / 1000:.1f}s · 生成 {gen_ms / 1000:.1f}s")
                         card_param_map["content"] = "\n\n".join(_parts)
                         card_param_map["sources_text"] = ""
                         card_param_map["sources"] = ""
@@ -1037,7 +1042,7 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                         card_param_map["meta"] = f"模型: {model} | 耗时: {latency / 1000:.1f}s"
                     card_param_map["message_id"] = message_id
                     # 重建 content_blocks（图文穿插数据）
-                    content_blocks_json = row[5]
+                    content_blocks_json = row[7]
                     if content_blocks_json:
                         card_param_map["content_blocks"] = content_blocks_json if isinstance(content_blocks_json, str) else json.dumps(content_blocks_json, ensure_ascii=False)
                     else:

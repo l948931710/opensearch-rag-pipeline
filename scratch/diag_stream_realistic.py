@@ -46,10 +46,12 @@ def main():
         i=min(n,i+step)
         if stream(t,o,ANSWER[:i])!=200: fail+=1
         time.sleep(0.5)
-    # B2（与真实代码一致）：定稿帧把 参考来源 + "模型 ｜ 耗时" 按序拼进正文末尾 →
-    # 顺序 答案→来源→耗时，耗时落最底下（紧挨按钮）、灰色缩进、不闪不空白。不调 update_card_data。
+    # B2（与真实代码一致）：定稿帧把 参考来源 + "模型 ｜ 检索·生成"页脚 按序拼进正文末尾 →
+    # 顺序 答案→来源→页脚，落最底下（紧挨按钮）、灰色缩进、不闪不空白。不调 update_card_data。
+    # 页脚显示分段耗时（生成=模型输出延迟）；预览里用脚本自身的近似值。
     elapsed=time.time()-t0
+    gen=elapsed-0.8  # 模拟：检索≈0.8s，其余算作生成
     SRC="富岭U8+成品仓库操作手册.docx > 1.1主要业务流程（相关度 0.94）"
-    final=ANSWER+f"\n\n📚 **参考来源**\n1. {SRC}\n\n> 模型: qwen3.6-plus ｜ 耗时: {elapsed:.1f}s"
+    final=ANSWER+f"\n\n📚 **参考来源**\n1. {SRC}\n\n> 模型: qwen3.6-plus ｜ 检索 0.8s · 生成 {gen:.1f}s"
     print("finalize:",stream(t,o,final,fin=True),"帧失败:",f"{fail}/18")
 if __name__=="__main__": main()
