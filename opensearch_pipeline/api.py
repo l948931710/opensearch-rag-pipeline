@@ -161,49 +161,6 @@ async def health_check():
     return {"status": "ok", "service": "rag-qa-api"}
 
 
-@app.get("/api/debug/rds")
-async def debug_rds():
-    """诊断 RDS 连接（临时调试用，上线前删除）。"""
-    import socket
-    host = os.environ.get("RAG_RDS_HOST", "localhost")
-    port = int(os.environ.get("RAG_RDS_PORT", "3306"))
-    result = {"host": host, "port": port}
-
-    # 1. DNS 解析
-    try:
-        ips = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        result["dns_resolved"] = [addr[4][0] for addr in ips]
-    except Exception as e:
-        result["dns_error"] = str(e)
-        return result
-
-    # 2. TCP 连接测试
-    try:
-        sock = socket.create_connection((host, port), timeout=5)
-        sock.close()
-        result["tcp_connect"] = "OK"
-    except Exception as e:
-        result["tcp_error"] = str(e)
-
-    # 3. PyMySQL 连接测试
-    try:
-        import pymysql
-        conn = pymysql.connect(
-            host=host,
-            port=port,
-            user=os.environ.get("RAG_RDS_USER", ""),
-            password=os.environ.get("RAG_RDS_PASSWORD", ""),
-            database=os.environ.get("RAG_RDS_DATABASE", ""),
-            connect_timeout=5,
-        )
-        result["mysql_connect"] = "OK"
-        conn.close()
-    except Exception as e:
-        result["mysql_error"] = str(e)
-
-    return result
-
-
 @app.post("/api/search", response_model=SearchResponse)
 async def search(req: SearchRequest):
     """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""

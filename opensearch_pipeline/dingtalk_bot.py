@@ -966,6 +966,10 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
         message_id: 对应 qa_session_log 的 message_id。
         context: 日志上下文描述（用于区分调用来源）。
     """
+    # 流式卡片的 sources / meta / 反馈按钮均以 is_answer_done=="true" 为可见性门控；钉钉回调
+    # 响应会覆盖整个 cardParamMap，必须在此显式恢复，否则流式卡片在用户点击反馈后这些区域折叠。
+    # 对成品卡片无害（其模板不引用该变量）。回调只在答案已生成完毕后触发，故恒为 "true"。
+    card_param_map["is_answer_done"] = "true"
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn()

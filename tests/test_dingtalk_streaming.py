@@ -173,3 +173,37 @@ def test_streaming_forces_pure_text(
     _call_stream()
     mock_stream.assert_called_once()
     assert mock_stream.call_args.kwargs["pure_text"] is True
+
+
+# ── 回调重建：流式卡片反馈后必须恢复 is_answer_done="true" ────────────────────────
+# 回归测试：修复前 _rebuild_card_param_map 从不回写 is_answer_done，流式模板把
+# sources/meta/反馈按钮均门控在 is_answer_done=="true"，导致用户点击反馈后这些区域折叠。
+
+def test_rebuild_card_param_map_restores_is_answer_done_on_db_hit():
+    """命中 qa_session_log 时，重建后的 cardParamMap 同时含 is_answer_done=true 与重建的答案。"""
+    from opensearch_pipeline import dingtalk_bot
+
+    conn = MagicMock()
+    cursor = MagicMock()
+    # (query_text, answer_text, cited_docs_json, model_name, latency_ms, content_blocks_json)
+    cursor.fetchone.return_value = ("怎么申请住宿", "住宿申请见附件", None, "qwen3.6-plus", 1500, None)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    card_param_map = {"feedback_status": "👍 已反馈：有帮助"}
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+        dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-123")
+
+    assert card_param_map["is_answer_done"] == "true"   # ← 修复点
+    assert card_param_map["answer"] == "住宿申请见附件"
+    assert card_param_map["feedback_status"] == "👍 已反馈：有帮助"  # 调用方设置的字段保留
+
+
+def test_rebuild_card_param_map_sets_is_answer_done_even_when_db_fails():
+    """即使 DB 不可用（重建答案失败），仍恒置 is_answer_done=true，避免流式卡片折叠。"""
+    from opensearch_pipeline import dingtalk_bot
+
+    card_param_map = {}
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", side_effect=RuntimeError("rds down")):
+        dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-x")  # 异常被吞，不抛出
+
+    assert card_param_map["is_answer_done"] == "true"
