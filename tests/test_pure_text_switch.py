@@ -13,6 +13,7 @@ import types
 import pytest
 
 import opensearch_pipeline.llm_generator as G
+from opensearch_pipeline.config import LLMConfig, RAGConfig
 
 
 # ──────────────────────────────────────────────────────────────
@@ -48,12 +49,13 @@ def test_text_only_prompt_drops_image_rule():
 def fake_cfg(monkeypatch):
     """让 _format_context / generate_answer 用一个可控 config（不依赖 env）。"""
     cfg = types.SimpleNamespace(
-        rag=types.SimpleNamespace(
-            score_threshold_high=8.0,
-            score_threshold_medium=5.0,
-            pure_text=False,
-        ),
-        llm=types.SimpleNamespace(
+        # 用真实 RAGConfig 默认值构造 rag mock：自动带上 _format_context 读取的所有
+        # 字段（score_threshold_*, rerank_score_threshold_*, pure_text 等），
+        # 避免生产端新增配置字段后 mock 漂移再次 AttributeError。
+        rag=RAGConfig(pure_text=False),
+        # 同理用真实 LLMConfig 默认值构造 llm mock（自动带上 enable_thinking 等），
+        # 仅覆盖测试关心的 endpoint/model。
+        llm=LLMConfig(
             api_key="sk-test",
             api_base_url="https://example.invalid/v1",
             model="qwen-test",
