@@ -893,6 +893,12 @@ async def card_callback(request: Request):
         body.get("outTrackId", "?"),
         body.get("userId", "?"),
     )
+    # 全量回调体日志：用于抓取钉钉【原生赞踩 Feedback 组件】点击时的真实 payload（action/字段名），
+    # 以便把原生赞踩精确落库（自定义按钮已从模板移除，避免 cardParamMap 更新冲掉流式正文→白屏）。
+    try:
+        print(f"[CALLBACK RAW] {json.dumps(body, ensure_ascii=False)[:1500]}", flush=True)
+    except Exception:
+        pass
 
     # 解析回调数据
     out_track_id = body.get("outTrackId", "")
