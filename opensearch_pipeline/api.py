@@ -13,6 +13,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -34,10 +35,26 @@ logger = logging.getLogger(__name__)
 # FastAPI App
 # ═══════════════════════════════════════════════════════════════
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """应用生命周期：启动时注册钉钉互动卡片 HTTP 回调地址（若已配置 DINGTALK_CARD_CALLBACK_URL）。
+
+    把本服务的 /dingtalk/card/callback 注册到 callbackRouteKey，使反馈按钮点击可回调。
+    非致命：注册失败只记日志、不阻断启动。多 worker 下每个进程各注册一次（幂等）。
+    """
+    try:
+        from opensearch_pipeline.dingtalk_card import register_card_callback
+        register_card_callback()
+    except Exception:
+        logger.warning("启动时注册卡片回调失败（忽略，不影响服务）", exc_info=True)
+    yield
+
+
 app = FastAPI(
     title="RAG 知识库问答 API",
     description="基于 OpenSearch HA3 向量检索 + Qwen LLM 的 RAG 问答服务",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 
 # CORS — 通过环境变量 CORS_ALLOWED_ORIGINS 配置允许的来源（逗号分隔）

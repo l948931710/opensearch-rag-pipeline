@@ -207,3 +207,43 @@ def test_rebuild_card_param_map_sets_is_answer_done_even_when_db_fails():
         dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-x")  # 异常被吞，不抛出
 
     assert card_param_map["is_answer_done"] == "true"
+
+
+# ── 启动时自动注册互动卡片 HTTP 回调地址 ──────────────────────────────────────
+
+def test_register_card_callback_skips_without_url(monkeypatch):
+    """未配置 DINGTALK_CARD_CALLBACK_URL 时跳过：不取 token、不发请求、返回 False。"""
+    from opensearch_pipeline import dingtalk_card
+
+    monkeypatch.delenv("DINGTALK_CARD_CALLBACK_URL", raising=False)
+    monkeypatch.setenv("DINGTALK_CARD_CALLBACK_ROUTE_KEY", "rag_feedback_callback")
+    with patch("opensearch_pipeline.dingtalk_card._get_access_token") as mock_tok, \
+         patch("opensearch_pipeline.dingtalk_card.requests.post") as mock_post:
+        assert dingtalk_card.register_card_callback() is False
+        mock_tok.assert_not_called()
+        mock_post.assert_not_called()
+
+
+def test_register_card_callback_posts_when_configured(monkeypatch):
+    """配置齐全时 POST /card/callbacks/register，载荷含正确的 callbackUrl/routeKey，200→True。"""
+    from opensearch_pipeline import dingtalk_card
+
+    monkeypatch.setenv("DINGTALK_CARD_CALLBACK_URL", "https://sae.example.com/dingtalk/card/callback")
+    monkeypatch.setenv("DINGTALK_CARD_CALLBACK_ROUTE_KEY", "rag_feedback_callback")
+    monkeypatch.delenv("DINGTALK_CARD_CALLBACK_FORCE_UPDATE", raising=False)
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '{"success":true}'
+    with patch("opensearch_pipeline.dingtalk_card._get_access_token", return_value="tok-xyz"), \
+         patch("opensearch_pipeline.dingtalk_card.requests.post", return_value=resp) as mock_post:
+        assert dingtalk_card.register_card_callback() is True
+        mock_post.assert_called_once()
+        url = mock_post.call_args.args[0] if mock_post.call_args.args else mock_post.call_args.kwargs.get("url")
+        assert "card/callbacks/register" in url
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["callbackUrl"] == "https://sae.example.com/dingtalk/card/callback"
+        assert payload["callbackRouteKey"] == "rag_feedback_callback"
+        assert payload["forceUpdate"] is False
+        # access-token 走 Header
+        assert mock_post.call_args.kwargs["headers"]["x-acs-dingtalk-access-token"] == "tok-xyz"

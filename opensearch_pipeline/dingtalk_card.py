@@ -10,6 +10,8 @@ dingtalk_card.py — 钉钉互动卡片发送模块
   DINGTALK_CLIENT_SECRET          — 应用 AppSecret
   DINGTALK_CARD_TEMPLATE_ID       — 卡片模板 ID（在 card.dingtalk.com 创建）
   DINGTALK_CARD_CALLBACK_ROUTE_KEY — 回调路由键（注册回调时自定义）
+  DINGTALK_CARD_CALLBACK_URL       — 卡片回调公网地址（启动时自动注册到上面的 route key；
+                                     不配则反馈按钮点击无法回调，但不影响答案/打字机）
 """
 
 import json
@@ -75,6 +77,73 @@ def _get_access_token() -> Optional[str]:
         except Exception as e:
             logger.error("获取 access_token 异常: %s", e, exc_info=True)
             return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 互动卡片 HTTP 回调地址注册（启动时调用）
+# ═══════════════════════════════════════════════════════════════
+
+def register_card_callback(*, force_update: Optional[bool] = None) -> bool:
+    """注册互动卡片 HTTP 回调地址（callbackRouteKey → callbackUrl），供服务启动时调用。
+
+    钉钉互动卡片按钮回调需要先把服务的回调 URL 注册到 callbackRouteKey 上，否则用户点击
+    反馈按钮（有帮助/没帮助/其他）时钉钉不知道往哪发，点击无人接收。本函数把
+    DINGTALK_CARD_CALLBACK_URL 注册到 DINGTALK_CARD_CALLBACK_ROUTE_KEY。
+
+    POST https://api.dingtalk.com/v1.0/card/callbacks/register
+
+    幂等：首次插入用 forceUpdate=false；改地址时设 DINGTALK_CARD_CALLBACK_FORCE_UPDATE=true
+    （或传 force_update=True）覆盖。未配置回调 URL / 无 access_token 时跳过；失败只记日志、
+    返回 False，绝不抛出（注册失败不应阻断服务启动，仅反馈按钮回调暂不可用，答案/打字机不受影响）。
+
+    Returns:
+        True=注册成功；False=跳过或失败（非致命）。
+    """
+    callback_url = os.environ.get("DINGTALK_CARD_CALLBACK_URL", "").strip()
+    route_key = os.environ.get("DINGTALK_CARD_CALLBACK_ROUTE_KEY", "").strip()
+    if not callback_url or not route_key:
+        logger.info(
+            "未配置 DINGTALK_CARD_CALLBACK_URL/ROUTE_KEY，跳过卡片回调注册"
+            "（答案/打字机不受影响，仅反馈按钮点击暂无法回调）"
+        )
+        return False
+
+    token = _get_access_token()
+    if not token:
+        logger.warning("无 access_token，卡片回调注册跳过")
+        return False
+
+    if force_update is None:
+        force_update = os.environ.get("DINGTALK_CARD_CALLBACK_FORCE_UPDATE", "").lower() in ("true", "1", "yes")
+    # apiSecret：钉钉用它对回调请求签名；当前 /card/callback 处理器未校验来源，可自定义任意值。
+    api_secret = os.environ.get("DINGTALK_CARD_CALLBACK_API_SECRET", "fuling_card_cb")
+
+    payload = {
+        "apiSecret": api_secret,
+        "callbackUrl": callback_url,
+        "callbackRouteKey": route_key,
+        "forceUpdate": force_update,
+    }
+    try:
+        resp = requests.post(
+            "https://api.dingtalk.com/v1.0/card/callbacks/register",
+            json=payload,
+            headers={"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info("卡片回调注册成功: routeKey=%s -> %s", route_key, callback_url)
+            return True
+        # 已存在且未 forceUpdate 时钉钉会返回非 200，属正常（无需每次都改地址）。
+        logger.warning(
+            "卡片回调注册未成功（若提示已存在可忽略；改地址请设 "
+            "DINGTALK_CARD_CALLBACK_FORCE_UPDATE=true 后重启）: status=%s, body=%s",
+            resp.status_code, resp.text[:300],
+        )
+        return False
+    except Exception as e:
+        logger.error("卡片回调注册异常: %s", e, exc_info=True)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
