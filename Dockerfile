@@ -27,13 +27,16 @@ USER appuser
 EXPOSE 8000
 
 # uvicorn 启动：
-#   --workers 2  足够处理并发（I/O 密集型，非 CPU 密集型）
+#   --workers 1  必须单 worker：会话存储（session_store）与「补充原因」AWAITING_COMMENT 状态
+#                都是进程内内存，多 worker 会各持一份、互不可见，导致会话/反馈错乱。并发由
+#                FastAPI 线程池承载（处理器声明为 def，阻塞 I/O 不占事件循环）。要横向扩容请
+#                先把这些状态迁到 Redis，再上调 worker 数。
 #   --timeout-keep-alive 65  SAE SLB 默认 keep-alive 60s，服务端需略大于此值
 #   --log-level info
 CMD ["python", "-m", "uvicorn", \
      "opensearch_pipeline.api:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
-     "--workers", "2", \
+     "--workers", "1", \
      "--timeout-keep-alive", "65", \
      "--log-level", "info"]

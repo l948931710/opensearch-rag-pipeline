@@ -234,7 +234,7 @@ async def health_check():
 
 
 @app.post("/api/auth/dingtalk", response_model=DingtalkAuthResponse)
-async def auth_dingtalk(req: DingtalkAuthRequest):
+def auth_dingtalk(req: DingtalkAuthRequest):
     """钉钉小程序免登：authCode → userid → 部门/姓名 → 签发会话令牌。
 
     部门在服务端解析后写入令牌；客户端只持有短期 authCode 与签发的令牌，
@@ -254,7 +254,7 @@ async def auth_dingtalk(req: DingtalkAuthRequest):
 
 
 @app.post("/api/search", response_model=SearchResponse)
-async def search(req: SearchRequest, identity: Optional[Identity] = Depends(current_identity)):
+def search(req: SearchRequest, identity: Optional[Identity] = Depends(current_identity)):
     """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""
     t0 = time.time()
     try:
@@ -276,8 +276,12 @@ async def search(req: SearchRequest, identity: Optional[Identity] = Depends(curr
 
 
 @app.post("/api/ask", response_model=AskResponse)
-async def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
-    """非流式问答接口 — 检索 + LLM 一次性返回。"""
+def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
+    """非流式问答接口 — 检索 + LLM 一次性返回。
+
+    用 def（非 async）声明：内部全是同步阻塞 I/O（embedding HTTP、HA3、pymysql、LLM
+    requests.post），FastAPI 会把 def 处理器放进线程池执行，避免阻塞事件循环、拖垮并发请求。
+    """
     t0 = time.time()
 
     # 1. 会话管理
@@ -397,7 +401,7 @@ _SSE_HEADERS = {
 
 
 @app.post("/api/ask/stream")
-async def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
+def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
     """SSE 流式问答接口 — 检索 + LLM 逐 token 输出。
 
     SSE 事件格式：
@@ -451,9 +455,10 @@ async def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(cur
     # 无结果：仍发出 message_id 并落库（NO_RESULT），与 /api/ask 空结果分支保持一致
     if not chunks:
 
-        async def empty_gen():
-            # 落库放 finally：客户端中途断开（GeneratorExit）时仍保证 NO_RESULT 落库，
-            # 与主流式路径的 finally 收尾保持一致。
+        def empty_gen():
+            # 同步生成器：StreamingResponse 会在线程池迭代它，finally 里的阻塞 log_qa_session
+            # 不会阻塞事件循环。落库放 finally：客户端中途断开（GeneratorExit）时仍保证 NO_RESULT
+            # 落库，与主流式路径的 finally 收尾保持一致。
             try:
                 yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'type': 'chunk', 'content': '抱歉，当前知识库中未找到与您问题相关的信息。'}, ensure_ascii=False)}\n\n"
@@ -579,7 +584,7 @@ class FeedbackRequest(BaseModel):
 
 
 @app.post("/api/feedback")
-async def submit_feedback(req: FeedbackRequest, identity: Optional[Identity] = Depends(current_identity)):
+def submit_feedback(req: FeedbackRequest, identity: Optional[Identity] = Depends(current_identity)):
     """反馈接口 — 供前端/管理后台使用。"""
     # 有令牌时以令牌身份为准，避免客户端伪造 user_id（uk_message_user 去重才可信）
     uid = identity.user_id if identity else req.user_id

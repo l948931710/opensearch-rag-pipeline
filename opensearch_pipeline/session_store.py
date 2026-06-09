@@ -8,6 +8,7 @@ session_store.py — 内存会话存储（LRU 淘汰 + 超时过期）
 
 import logging
 import os
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -43,35 +44,42 @@ class _LRUSessionStore:
     def __init__(self, maxsize: int = MAX_SESSIONS):
         self._store: OrderedDict[str, _SessionEntry] = OrderedDict()
         self._maxsize = maxsize
+        # OrderedDict 的 check-then-act（in→del、create→popitem 淘汰）不是线程安全的。
+        # api.py 的 def 处理器跑在 FastAPI 线程池、dingtalk_bot 每条消息又另起线程，
+        # 多线程并发访问同一 store 必须加锁。用 RLock 以便模块级复合操作可跨多次调用持锁。
+        self._lock = threading.RLock()
 
     def get(self, key: str) -> Optional[_SessionEntry]:
-        if key in self._store:
-            entry = self._store[key]
-            if entry.is_expired():
-                # 超时：删除旧 session，返回 None（调用方会创建新的）
-                del self._store[key]
-                logger.info("Session 超时过期 (%.0f分钟未活动): %s", SESSION_TIMEOUT_SECONDS / 60, key)
-                return None
-            self._store.move_to_end(key)
-            entry.touch()
-            return entry
-        return None
+        with self._lock:
+            if key in self._store:
+                entry = self._store[key]
+                if entry.is_expired():
+                    # 超时：删除旧 session，返回 None（调用方会创建新的）
+                    del self._store[key]
+                    logger.info("Session 超时过期 (%.0f分钟未活动): %s", SESSION_TIMEOUT_SECONDS / 60, key)
+                    return None
+                self._store.move_to_end(key)
+                entry.touch()
+                return entry
+            return None
 
     def create(self, key: str) -> _SessionEntry:
         """创建新会话，必要时淘汰最旧的会话。"""
-        entry = _SessionEntry()
-        self._store[key] = entry
-        self._store.move_to_end(key)
-        while len(self._store) > self._maxsize:
-            evicted_key, _ = self._store.popitem(last=False)
-            logger.debug("Session evicted (LRU): %s", evicted_key)
-        return entry
+        with self._lock:
+            entry = _SessionEntry()
+            self._store[key] = entry
+            self._store.move_to_end(key)
+            while len(self._store) > self._maxsize:
+                evicted_key, _ = self._store.popitem(last=False)
+                logger.debug("Session evicted (LRU): %s", evicted_key)
+            return entry
 
     def set_history(self, key: str, history: List[Dict[str, str]]):
-        if key in self._store:
-            self._store[key].history = history
-            self._store[key].touch()
-            self._store.move_to_end(key)
+        with self._lock:
+            if key in self._store:
+                self._store[key].history = history
+                self._store[key].touch()
+                self._store.move_to_end(key)
 
 
 _sessions = _LRUSessionStore()
@@ -82,26 +90,30 @@ def get_or_create_session(session_id: Optional[str]) -> Tuple[str, List[Dict[str
 
     如果 session 存在但已超时（30分钟无活动），自动创建新 session。
     """
-    if session_id:
-        entry = _sessions.get(session_id)
-        if entry is not None:
-            return session_id, entry.history
+    # 跨 get→create 持锁，消除 TOCTOU（两个线程同时为同一新 session 各建一个条目）
+    with _sessions._lock:
+        if session_id:
+            entry = _sessions.get(session_id)
+            if entry is not None:
+                return session_id, entry.history
 
-    sid = session_id or str(uuid.uuid4())
-    entry = _sessions.create(sid)
-    return sid, entry.history
+        sid = session_id or str(uuid.uuid4())
+        entry = _sessions.create(sid)
+        return sid, entry.history
 
 
 def append_to_history(session_id: str, user_msg: str, assistant_msg: str):
     """将当前轮对话追加到会话历史。"""
-    entry = _sessions.get(session_id)
-    if entry is None:
-        entry = _sessions.create(session_id)
+    # 整个读-改-写序列持锁，避免与并发 get/create/淘汰 交错破坏历史
+    with _sessions._lock:
+        entry = _sessions.get(session_id)
+        if entry is None:
+            entry = _sessions.create(session_id)
 
-    entry.history.append({"role": "user", "content": user_msg})
-    entry.history.append({"role": "assistant", "content": assistant_msg})
+        entry.history.append({"role": "user", "content": user_msg})
+        entry.history.append({"role": "assistant", "content": assistant_msg})
 
-    # 裁剪超出的轮数（保留最近 N 轮 = 2N 条消息）
-    max_messages = MAX_HISTORY_TURNS * 2
-    if len(entry.history) > max_messages:
-        _sessions.set_history(session_id, entry.history[-max_messages:])
+        # 裁剪超出的轮数（保留最近 N 轮 = 2N 条消息）
+        max_messages = MAX_HISTORY_TURNS * 2
+        if len(entry.history) > max_messages:
+            _sessions.set_history(session_id, entry.history[-max_messages:])

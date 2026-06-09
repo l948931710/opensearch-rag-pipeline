@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 import requests as http_requests
 from fastapi import APIRouter, Request, HTTPException
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from opensearch_pipeline.retriever import retrieve_and_enrich
@@ -695,8 +696,12 @@ async def dingtalk_webhook(request: Request):
 
 
 async def _handle_webhook(request: Request):
-    """实际的 webhook 处理逻辑。"""
-    # 1. 签名验证
+    """实际的 webhook 处理逻辑。
+
+    签名校验与 body 读取走 async；其后的 ack 文本回复（HTTP POST）与 take_awaiting_comment（DB）
+    都是阻塞 I/O，放进线程池执行，避免阻塞共享事件循环（同一进程还服务 /api/ask 等接口）。
+    """
+    # 1. 签名验证（仅用 headers）
     timestamp = request.headers.get("timestamp", "")
     sign = request.headers.get("sign", "")
 
@@ -704,12 +709,18 @@ async def _handle_webhook(request: Request):
         logger.warning("钉钉签名验证失败: timestamp=%s", timestamp)
         raise HTTPException(status_code=403, detail="签名验证失败")
 
-    # 2. 解析消息体
+    # 2. 解析消息体（async）
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="无法解析请求体")
 
+    # 3. 其余逻辑全是阻塞 I/O → 线程池执行
+    return await run_in_threadpool(_process_webhook_body, body)
+
+
+def _process_webhook_body(body: dict):
+    """webhook 同步处理：日志、问题提取、「补充原因」回收、ack 回复、起后台 RAG 线程。"""
     body_json = json.dumps(body, ensure_ascii=False, default=str)
     logger.info(
         "收到钉钉消息: sender=%s, conversationType=%s, msgId=%s",
@@ -790,6 +801,12 @@ async def card_callback(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="无法解析请求体")
 
+    # 落库/文本回复均为阻塞 I/O → 线程池执行，避免阻塞事件循环
+    return await run_in_threadpool(_process_card_callback_body, body)
+
+
+def _process_card_callback_body(body: dict):
+    """卡片回调同步处理：解析 action/feedback → 落库 → 文本提示。一律 ACK-only（不含 cardData）。"""
     logger.info(
         "收到卡片回调: outTrackId=%s, userId=%s",
         body.get("outTrackId", "?"),
