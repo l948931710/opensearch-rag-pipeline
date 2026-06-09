@@ -2413,15 +2413,24 @@ def node_chunk_documents(ctx: dict):
 
                     def _img_entry(a):
                         fn = a.get("filename", "")
-                        return {
+                        oss_key = f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}"
+                        entry = {
                             "filename": fn,
-                            "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                            "oss_key": oss_key,
+                            # 契约键（CLAUDE.md）：source_image 与 DOCX step_card 一致，自描述、
+                            # 不依赖检索期 oss_key→source_image 折叠
+                            "source_image": oss_key,
                             "figure_no": a.get("figure_no"),
                             "anchor_row": a.get("anchor_row"),
                             "image_category": a.get("image_category", "unknown"),
                             "visual_summary": a.get("visual_summary", ""),
                             "ocr_text": a.get("ocr_text", ""),
                         }
+                        # figure_no 为整数时作为 image_index（图N 的天然序号）；否则留给检索期按位置兜底
+                        _fig = a.get("figure_no")
+                        if isinstance(_fig, int):
+                            entry["image_index"] = _fig
+                        return entry
 
                     vec_imgs = [a for a in assets if a.get("status") == "ROUTE_TO_VECTOR"]
                     bound_nos = set()  # step_no already assigned an image

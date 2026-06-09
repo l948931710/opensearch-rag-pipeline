@@ -2226,6 +2226,9 @@ class DocumentChunker:
             chunk_index += 1
 
         # 2. 每个步骤一个 step_card chunk
+        step_card_chunks: List[Chunk] = []
+        step_card_ids: List[str] = []
+        first_step_page = None
         for blk in step_blocks:
             extra = _blk_get(blk, "extra", {}) or {}
             step_no = extra.get("step_no", 0)
@@ -2233,6 +2236,9 @@ class DocumentChunker:
 
             # 构建步骤文本
             step_text = _blk_get(blk, "text", "").strip()
+            page_num = _blk_get(blk, "page_num", None)
+            if first_step_page is None:
+                first_step_page = page_num
 
             chunk = self._create_chunk(
                 doc_id=doc_id,
@@ -2241,13 +2247,42 @@ class DocumentChunker:
                 chunk_text=step_text,
                 chunk_type="step_card",
                 metadata=meta,
-                page_num=_blk_get(blk, "page_num", None),
+                page_num=page_num,
             )
             chunk.extra["step_no"] = step_no
             if fig_refs:
                 chunk.extra["figure_refs"] = fig_refs
             chunks.append(chunk)
+            step_card_chunks.append(chunk)
+            step_card_ids.append(chunk.chunk_id)
             chunk_index += 1
+
+        # 3. 生成 procedure_parent 总览 chunk + 回填 parent_chunk_id（与 _chunk_by_step 一致）。
+        #    XLSX 原先不生成 parent，使 step_card 检索时拿不到兄弟步骤扩展；补齐后与 DOCX/PDF 一致。
+        if step_card_chunks:
+            doc_title = meta.get("title", "")
+            parent_lines = [doc_title] if doc_title else []
+            if header_lines:
+                parent_lines.append("\n".join(header_lines)[:200])
+            parent_lines.extend(_blk_get(b, "text", "").strip() for b in step_blocks)
+            parent_text = "\n".join(pl for pl in parent_lines if pl)
+
+            parent_chunk = self._create_chunk(
+                doc_id=doc_id,
+                version_no=version_no,
+                chunk_index=chunk_index,
+                chunk_text=parent_text,
+                chunk_type="procedure_parent",
+                metadata=meta,
+                page_num=first_step_page,
+            )
+            parent_chunk.extra["child_chunk_ids"] = step_card_ids
+            parent_chunk.extra["step_count"] = len(step_card_ids)
+            chunks.append(parent_chunk)
+            chunk_index += 1
+
+            for sc in step_card_chunks:
+                sc.extra["parent_chunk_id"] = parent_chunk.chunk_id
 
         return chunks
 
