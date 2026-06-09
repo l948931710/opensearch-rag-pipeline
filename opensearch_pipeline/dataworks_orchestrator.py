@@ -124,6 +124,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                         WHERE (content_process_status = 'NOT_STARTED' OR (content_process_status = 'FAILED' AND retry_count < 3))
                           AND status = 'active'
                           AND canonical_json_key IS NOT NULL
+                          AND (publish_status IS NULL OR publish_status != 'QUARANTINED')
                         ORDER BY created_at ASC
                         LIMIT 100
                     """)
@@ -460,6 +461,7 @@ def _count_pending_rows(stage: int) -> int:
                    OR (content_process_status = 'FAILED' AND retry_count < 3))
               AND status = 'active'
               AND canonical_json_key IS NOT NULL
+              AND (publish_status IS NULL OR publish_status != 'QUARANTINED')
         """,
         3: """
             SELECT COUNT(*) FROM chunk_meta cm

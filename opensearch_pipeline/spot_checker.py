@@ -378,12 +378,15 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                     conn.begin()
                     # a. 更新 document_version & document_meta
                     with conn.cursor() as cursor:
+                        # ⚠️ content_process_status 必须是终态 'QUARANTINED'，不能用 'FAILED'：
+                        # 'FAILED' 正好命中 stage-2 的抢占谓词（FAILED AND retry_count<3），
+                        # 下一次日跑会重新分块/重新发布，把隔离悄悄撤销掉。
                         cursor.execute("""
                             UPDATE document_version
                             SET risk_level = 'high',
                                 publish_status = 'QUARANTINED',
                                 gate_status = 'quarantined',
-                                content_process_status = 'FAILED',
+                                content_process_status = 'QUARANTINED',
                                 content_process_error = %s
                             WHERE doc_id = %s AND version_no = %s
                         """, (f"[SPOT CHECK MISMATCH] Spot-check recommends tightening permission to {suggested_perm}", doc_id, version_no))
