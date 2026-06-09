@@ -848,10 +848,13 @@ async def _handle_webhook(request: Request):
             _send_text_reply(session_webhook, "👋 您好！请输入您想查询的问题，我会为您从知识库中检索答案。")
         return {"msgtype": "empty"}
 
-    # ── 「补充原因」回收：若该用户刚点过卡片上的「补充原因」(handled_status=AWAITING_COMMENT)，
-    #    把这条消息当作对上一条回答的补充原因收下，写进 user_feedback.feedback_comment，不走问答。
-    #    （流式卡不能弹内联表单——会冲掉流式正文白屏——故改为单独回复消息收集。）
-    if sender_staff_id and take_awaiting_comment(user_id=sender_staff_id, comment=question):
+    # ── 「补充原因」回收（仅单聊 conversationType=='1'）──
+    #    若该用户刚点过卡片上的「补充原因」(handled_status=AWAITING_COMMENT)，把这条【单聊】消息当作
+    #    对上一条回答的补充原因收下，写进 user_feedback.feedback_comment，不走问答。
+    #    为何仅单聊：「补充原因」提示本就是机器人【私信(单聊)】发的，用户在单聊里回复即可；而群聊里
+    #    @机器人 的消息一律按【新问题】处理，避免把群里的提问误判成"补充原因"。
+    if str(body.get("conversationType", "1")) == "1" and sender_staff_id \
+            and take_awaiting_comment(user_id=sender_staff_id, comment=question):
         if session_webhook:
             _send_text_reply(session_webhook, "✅ 已记录你补充的原因，谢谢反馈！")
         return {"msgtype": "feedback_comment"}
