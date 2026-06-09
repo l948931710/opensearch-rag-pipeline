@@ -636,6 +636,53 @@ class TestHA3FilterInjectionPrevention:
             f"filter 中应只有 1 个 OR（原有权限 OR），实际有 {or_count} 个: {filter_val}"
         )
 
+    @patch("opensearch_pipeline.retriever.get_query_embedding")
+    @patch("opensearch_pipeline.retriever.get_config")
+    @patch("opensearch_pipeline.retriever._get_ha3_client")
+    def test_chinese_dept_name_filter_expression(
+        self, mock_client_fn, mock_config, mock_embedding
+    ):
+        """钉钉中文部门名（如「营销中心」）必须完整保留在 HA3 权限过滤表达式中。
+
+        部门是名称字符串（与 chunk 的 owner_dept 对齐，见 dingtalk_identity），
+        若净化函数剥掉中文字符，dept_internal 文档对本部门将全部不可见。
+        """
+        mock_config.return_value = _make_config(hybrid_fusion="rrf")
+        mock_embedding.return_value = ([0.1] * 1024, [1], [0.5])
+
+        client = MagicMock()
+        client.search.return_value = _make_ha3_response()
+        mock_client_fn.return_value = client
+
+        from opensearch_pipeline.retriever import search_chunks
+        search_chunks("产品报价流程", user_dept="营销中心")
+
+        knn = _captured_knn_queries[0]
+        assert knn.filter == (
+            'permission_level="public"'
+            ' OR (permission_level="dept_internal" AND owner_dept="营销中心")'
+        ), f"实际 filter: {knn.filter}"
+
+    @patch("opensearch_pipeline.retriever.get_query_embedding")
+    @patch("opensearch_pipeline.retriever.get_config")
+    @patch("opensearch_pipeline.retriever._get_ha3_client")
+    def test_no_dept_means_public_only_filter(
+        self, mock_client_fn, mock_config, mock_embedding
+    ):
+        """user_dept=None（匿名/无令牌）→ filter 仅放行 public。"""
+        mock_config.return_value = _make_config(hybrid_fusion="rrf")
+        mock_embedding.return_value = ([0.1] * 1024, [1], [0.5])
+
+        client = MagicMock()
+        client.search.return_value = _make_ha3_response()
+        mock_client_fn.return_value = client
+
+        from opensearch_pipeline.retriever import search_chunks
+        search_chunks("测试", user_dept=None)
+
+        knn = _captured_knn_queries[0]
+        assert knn.filter == 'permission_level="public"', f"实际 filter: {knn.filter}"
+
 
 class TestHA3FilterInjectionAPIBoundary:
     """验证 Pydantic 模型在 API 边界拒绝非法 user_dept。"""

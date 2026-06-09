@@ -116,13 +116,12 @@ def test_ask_uses_token_dept_not_body(monkeypatch):
     assert j["blocks"] == [{"type": "text", "format": "plain", "text": "答案正文"}]
 
 
-def test_ask_no_token_resolves_dept_server_side(monkeypatch):
-    """无令牌时也绝不信任 user_dept；仅按 user_id 服务端解析。"""
+def test_ask_no_token_is_anonymous_public_only(monkeypatch):
+    """无令牌按匿名处理：请求体 user_id 不得反查部门（防伪造 staffId 跨部门读取）。"""
     import opensearch_pipeline.api as api
     from fastapi.testclient import TestClient
 
     captured = {}
-    monkeypatch.setattr(api, "_resolve_user_dept", lambda uid: "技术部" if uid == "EMP1" else None)
 
     def fake_retrieve(question, top_k=7, user_dept=None, **kw):
         captured["dept"] = user_dept
@@ -137,7 +136,32 @@ def test_ask_no_token_resolves_dept_server_side(monkeypatch):
     c = TestClient(api.app)
     r = c.post("/api/ask", json={"question": "q", "user_id": "EMP1", "user_dept": "财务部"})
     assert r.status_code == 200, r.text
-    assert captured["dept"] == "技术部"   # 按 user_id 服务端解析，忽略请求体 财务部
+    assert captured["dept"] is None   # 无令牌 → 匿名（仅 public）；user_id 不授予部门权限
+
+
+def test_ask_token_dept_marketing_center(monkeypatch):
+    """钉钉部门「营销中心」走令牌 → 检索收到的 user_dept 原样为「营销中心」。"""
+    import opensearch_pipeline.api as api
+    from fastapi.testclient import TestClient
+
+    captured = {}
+
+    def fake_retrieve(question, top_k=7, user_dept=None, **kw):
+        captured["dept"] = user_dept
+        return [{"doc_id": "d1", "title": "T", "section_title": "S", "score": 9.0, "chunk_text": "c"}]
+
+    monkeypatch.setattr(api, "retrieve_and_enrich", fake_retrieve)
+    monkeypatch.setattr(api, "generate_answer",
+                        lambda *a, **k: {"answer": "x", "sources": [], "model": "m", "usage": {}})
+    monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks: [])
+    monkeypatch.setattr(api, "log_qa_session", lambda **kw: None)
+
+    tok = auth_token.issue_session_token("MKT001", dept="营销中心", name="测试用户")
+    c = TestClient(api.app)
+    r = c.post("/api/ask", json={"question": "q"},
+               headers={"Authorization": "Bearer " + tok})
+    assert r.status_code == 200, r.text
+    assert captured["dept"] == "营销中心"
 
 
 def test_feedback_uses_token_user(monkeypatch):

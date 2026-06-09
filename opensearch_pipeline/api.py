@@ -26,7 +26,6 @@ from opensearch_pipeline.llm_generator import generate_answer, generate_answer_s
 from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
 from opensearch_pipeline.dingtalk_bot import router as dingtalk_router
 from opensearch_pipeline.dingtalk_identity import (
-    _resolve_user_dept,
     _exchange_authcode_for_userid,
     _resolve_user_identity,
 )
@@ -114,7 +113,7 @@ class AskRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
     temperature: Optional[float] = Field(0.1, ge=0.0, le=2.0, description="生成温度")
     max_tokens: Optional[int] = Field(2048, ge=100, le=8192, description="最大生成 token 数")
-    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；无 Bearer 令牌时用于服务端解析部门")
+    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
     user_dept: Optional[str] = Field(
         None,
         description="[已废弃·服务端忽略] 部门一律由服务端按 Bearer 令牌/user_id 解析（防越权）",
@@ -129,7 +128,7 @@ class AskRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="搜索查询")
     top_k: int = Field(5, ge=1, le=50, description="返回结果数")
-    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；无 Bearer 令牌时用于服务端解析部门")
+    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
     user_dept: Optional[str] = Field(
         None,
         description="[已废弃·服务端忽略] 部门一律由服务端按 Bearer 令牌/user_id 解析（防越权）",
@@ -259,9 +258,9 @@ async def search(req: SearchRequest, identity: Optional[Identity] = Depends(curr
     """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""
     t0 = time.time()
     try:
-        # 部门一律服务端解析（令牌优先），绝不信任请求体里的部门字段
-        uid = identity.user_id if identity else (req.user_id or "")
-        user_dept = identity.dept if identity else (_resolve_user_dept(uid) if uid else None)
+        # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
+        # 请求体里的身份字段绝不能反查部门授予 dept_internal 权限。
+        user_dept = identity.dept if identity else None
         results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
@@ -290,9 +289,10 @@ async def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_id
         # 客户端显式传了 history 则优先使用
         merged_history = [{"role": m.role, "content": m.content} for m in req.history]
 
-    # 身份与部门：部门一律服务端解析（令牌优先），绝不信任请求体里的部门字段
     uid = identity.user_id if identity else (req.user_id or "")
-    user_dept = identity.dept if identity else (_resolve_user_dept(uid) if uid else None)
+    # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
+    # 请求体里的 user_id 只用于日志归因，绝不能反查部门授予 dept_internal 权限。
+    user_dept = identity.dept if identity else None
 
     # 2. 检索
     try:
@@ -429,9 +429,10 @@ async def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(cur
     # 图文模式才补充图片（纯文本模式不展示图片，跳过 co-surfacing 的额外 HA3 查询）
     _pure = req.pure_text if req.pure_text is not None else get_config().rag.pure_text
 
-    # 身份与部门：部门一律服务端解析（令牌优先），绝不信任请求体里的部门字段
     uid = identity.user_id if identity else (req.user_id or "")
-    user_dept = identity.dept if identity else (_resolve_user_dept(uid) if uid else None)
+    # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
+    # 请求体里的 user_id 只用于日志归因，绝不能反查部门授予 dept_internal 权限。
+    user_dept = identity.dept if identity else None
 
     # 2. 检索（同步阶段，在生成器外完成）
     try:
