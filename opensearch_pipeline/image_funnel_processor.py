@@ -95,6 +95,9 @@ class ImageFunnelProcessor:
             ocr_text=ocr_text.strip(),
         )
         vlm_status = vlm_result["status"]
+        # 若 VLM 调用是降级兜底（超时/解析失败），结论不可信，向下游传递 degraded 标记，
+        # 使其不被写入跨文档持久缓存。
+        vlm_degraded = bool(vlm_result.get("degraded", False))
 
         if vlm_status == "SENSITIVE":
             print(f"    [Funnel 3] 🚨 Sensitive content detected in non-public asset: {filename}")
@@ -103,6 +106,7 @@ class ImageFunnelProcessor:
                 "width": width,
                 "height": height,
                 "file_size_kb": file_size_kb,
+                "degraded": vlm_degraded,
                 "reason": "Funnel 3: VLM Audit Detected Sensitive Entities (Seals, Stamps, ID Card, Signatures)"
             }
         elif vlm_status == "LOW_RELEVANCE":
@@ -148,6 +152,7 @@ class ImageFunnelProcessor:
                     "width": width,
                     "height": height,
                     "file_size_kb": file_size_kb,
+                    "degraded": vlm_degraded,
                     "reason": f"Funnel 2+3: High OCR Text + Non-photo category '{img_cat}' → Text Paragraph"
                 }
 
@@ -161,6 +166,7 @@ class ImageFunnelProcessor:
                 "width": width,
                 "height": height,
                 "file_size_kb": file_size_kb,
+                "degraded": vlm_degraded,
             }
 
     def _static_heuristics(self, local_path: str) -> Tuple[int, int, float]:
@@ -218,14 +224,15 @@ class ImageFunnelProcessor:
         model_name = config.ocr.vlm_model or config.ocr.model
 
         if not api_key:
-            # 容灾兜底：如果没有 API KEY，在公开文档下通过，在隔离文档下高风险隔离
+            # 容灾兜底：如果没有 API KEY，在公开文档下通过，在隔离文档下高风险隔离。
+            # degraded=True → 不缓存（没有真正审计过，下次有 key 时应重跑）。
             print("    ⚠️ VLM API Key is missing. Falling back to safe defaults.")
             if bypass_safety:
                 return {"status": "CLEAN", "caption": "[VLM Fallback] 图片或示意图内容。",
-                        "image_category": "unknown", "annotation_map": {}}
+                        "image_category": "unknown", "annotation_map": {}, "degraded": True}
             else:
                 return {"status": "SENSITIVE", "caption": "", "image_category": "unknown",
-                        "annotation_map": {}}
+                        "annotation_map": {}, "degraded": True}
 
         import base64
         import requests
@@ -411,22 +418,26 @@ class ImageFunnelProcessor:
                 }
             except Exception as e:
                 print(f"    ⚠️ Failed to parse VLM JSON: {e}. Raw: {str(content)[:300]}")
-                # 容灾降级：把原始文本当 caption 用
+                # 容灾降级：把原始文本当 caption 用。degraded=True → 调用方不得缓存此结论，
+                # 否则一次解析失败会被持久化、跨文档/跨运行永久复用。
                 fallback_caption = str(content)[:200] if content else "[VLM 解析异常]"
                 return {
                     "status": "CLEAN",
                     "caption": fallback_caption,
                     "image_category": "unknown",
                     "annotation_map": {},
+                    "degraded": True,
                 }
 
         except Exception as e:
             print(f"    ⚠️ VLM API execution failed: {e}")
+            # 兜底结论（超时/网络/HTTP 错误）必须标记 degraded：这是一次性故障，不能被缓存成
+            # 永久标签（否则一次超时会让某张图在所有文档里永远被误判为 CLEAN 或 SENSITIVE）。
             if bypass_safety:
                 return {"status": "CLEAN", "caption": f"[VLM 降级] 图片资产 {filename}。",
-                        "image_category": "unknown", "annotation_map": {}}
+                        "image_category": "unknown", "annotation_map": {}, "degraded": True}
             else:
                 return {"status": "SENSITIVE", "caption": "", "image_category": "unknown",
-                        "annotation_map": {}}
+                        "annotation_map": {}, "degraded": True}
 
 

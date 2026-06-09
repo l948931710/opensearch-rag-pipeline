@@ -151,6 +151,51 @@ class TestImageFunnelThreeStages:
         assert "[Simulated Multimodal Caption]" in result["visual_summary"]
 
 
+class TestDegradedVlmNotCached:
+    """降级的 VLM 兜底结论必须带 degraded 标记，避免被写入跨文档持久缓存。"""
+
+    def _short_ocr(self, processor):
+        return mock.patch.object(
+            processor.ocr_client, "ocr_image",
+            return_value=OCRResult(status="SUCCESS", combined_text="短文本"),
+        )
+
+    def test_degraded_clean_propagates_to_vector(self, temp_image):
+        """VLM 降级 CLEAN（如超时兜底）→ ROUTE_TO_VECTOR 仍带 degraded=True。"""
+        img_path = temp_image(100, 100, "diagram_clean.png", fill_bytes=5120)
+        processor = ImageFunnelProcessor(simulate=True)
+        with self._short_ocr(processor), mock.patch.object(
+            processor, "_vlm_audit_and_summary",
+            return_value={"status": "CLEAN", "caption": "c", "image_category": "step_screenshot",
+                          "annotation_map": {}, "degraded": True},
+        ):
+            result = processor.process_image(img_path, doc_id="d", is_public=True)
+        assert result["status"] == "ROUTE_TO_VECTOR"
+        assert result.get("degraded") is True
+
+    def test_degraded_sensitive_propagates_to_quarantine(self, temp_image):
+        """VLM 降级 SENSITIVE（隔离文档兜底）→ QUARANTINE_SENSITIVE 仍带 degraded=True。"""
+        img_path = temp_image(100, 100, "audit_fail.png", fill_bytes=5120)
+        processor = ImageFunnelProcessor(simulate=True)
+        with self._short_ocr(processor), mock.patch.object(
+            processor, "_vlm_audit_and_summary",
+            return_value={"status": "SENSITIVE", "caption": "", "image_category": "unknown",
+                          "annotation_map": {}, "degraded": True},
+        ):
+            result = processor.process_image(img_path, doc_id="d", is_public=False)
+        assert result["status"] == "QUARANTINE_SENSITIVE"
+        assert result.get("degraded") is True
+
+    def test_healthy_verdict_has_no_degraded_flag(self, temp_image):
+        """正常（非降级）VLM 结论 degraded 为假值，可被缓存。"""
+        img_path = temp_image(100, 100, "architecture_workflow.png", fill_bytes=5120)
+        processor = ImageFunnelProcessor(simulate=True)
+        with self._short_ocr(processor):
+            result = processor.process_image(img_path, doc_id="d", is_public=True)
+        assert result["status"] == "ROUTE_TO_VECTOR"
+        assert not result.get("degraded")
+
+
 class TestPlainRawBypassRule:
     """非隔离公开 raw 文档免 LLM 敏感审计与脱敏旁路测试。"""
 

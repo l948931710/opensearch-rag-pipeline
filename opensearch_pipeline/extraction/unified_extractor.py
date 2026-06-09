@@ -989,9 +989,11 @@ class UnifiedExtractor:
             if file_hash not in hash_to_candidates:
                 hash_to_candidates[file_hash] = []
                 hash_to_representative[file_hash] = img_asset
-                # 查询跨文档持久缓存
-                if file_hash in vlm_cache:
-                    hash_to_cached_result[file_hash] = vlm_cache[file_hash]
+                # 查询跨文档持久缓存（按 is_public 分命名空间）：public 文档会 bypass 安全审计，
+                # 其 CLEAN 结论绝不能被 quarantine 文档复用（否则跳过敏感审计）；反之亦然。
+                cache_key = f"{file_hash}:{'pub' if is_public else 'sec'}"
+                if cache_key in vlm_cache:
+                    hash_to_cached_result[file_hash] = vlm_cache[cache_key]
             hash_to_candidates[file_hash].append(img_asset)
 
         total_unique = len(hash_to_representative)
@@ -1032,18 +1034,22 @@ class UnifiedExtractor:
                     try:
                         funnel_res = future.result()
                         hash_to_result[file_hash] = funnel_res
-                        # 写入持久缓存（仅缓存可序列化的字段）
-                        vlm_cache[file_hash] = {
-                            "status": funnel_res.get("status", ""),
-                            "visual_summary": funnel_res.get("visual_summary", ""),
-                            "image_category": funnel_res.get("image_category", ""),
-                            "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
-                            "reason": funnel_res.get("reason", ""),
-                            "width": funnel_res.get("width", 0),
-                            "height": funnel_res.get("height", 0),
-                            "file_size_kb": funnel_res.get("file_size_kb", 0.0),
-                            "ocr_text": funnel_res.get("ocr_text", ""),
-                        }
+                        # 写入持久缓存：跳过降级结果（VLM 超时/解析失败的兜底，缓存会把一次性
+                        # 故障变成跨文档/跨运行的永久错误标签）和无法稳定取哈希的 fallback key
+                        # （基于内存地址，跨进程无意义）。缓存键按 is_public 分命名空间。
+                        if not funnel_res.get("degraded") and not file_hash.startswith("fallback_"):
+                            cache_key = f"{file_hash}:{'pub' if is_public else 'sec'}"
+                            vlm_cache[cache_key] = {
+                                "status": funnel_res.get("status", ""),
+                                "visual_summary": funnel_res.get("visual_summary", ""),
+                                "image_category": funnel_res.get("image_category", ""),
+                                "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
+                                "reason": funnel_res.get("reason", ""),
+                                "width": funnel_res.get("width", 0),
+                                "height": funnel_res.get("height", 0),
+                                "file_size_kb": funnel_res.get("file_size_kb", 0.0),
+                                "ocr_text": funnel_res.get("ocr_text", ""),
+                            }
                     except Exception as e:
                         rep = hash_to_representative[file_hash]
                         print(f"      ⚠️ Image funnel failed for {rep.original_name}: {e}")
