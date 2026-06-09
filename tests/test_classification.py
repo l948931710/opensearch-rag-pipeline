@@ -63,7 +63,15 @@ class TestPathPermissionResolution:
     def test_internal_path(self):
         doc = {"doc_id": "doc2", "source_key": "raw/dept_internal/team_sop.docx"}
         ctx = {"tasks": []}
-        assert resolve_permission_level(doc, ctx) == "internal"
+        # 与 HA3 过滤表达式对齐：permission_level="dept_internal" 才会按 owner_dept 放行
+        assert resolve_permission_level(doc, ctx) == "dept_internal"
+
+    def test_legacy_internal_alias_normalized(self):
+        """显式写入的历史值 'internal' 必须归一为 'dept_internal'，否则对所有人不可见。"""
+        doc = {"doc_id": "doc2b", "source_key": "raw/whatever/file.docx",
+               "permission_level": "internal"}
+        ctx = {"tasks": []}
+        assert resolve_permission_level(doc, ctx) == "dept_internal"
 
     def test_public_path(self):
         doc = {"doc_id": "doc3", "source_key": "raw/public/faq.txt"}

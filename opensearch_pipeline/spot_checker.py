@@ -364,7 +364,8 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
 
             # 5. 安全等级比对 (权限降级判定)
             # 权限严重等级顺序： public (0) < internal (1) < restricted (2)
-            perm_order = {"public": 0, "internal": 1, "restricted": 2}
+            # 'dept_internal' 是 'internal' 的归一化写法（与 HA3 过滤表达式对齐），同级
+            perm_order = {"public": 0, "internal": 1, "dept_internal": 1, "restricted": 2}
             suggested_rank = perm_order.get(suggested_perm, 0)
             current_rank = perm_order.get(current_permission, 0)
 

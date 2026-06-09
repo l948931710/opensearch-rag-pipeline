@@ -754,33 +754,41 @@ def node_build_canonical(ctx: dict):
 # 用原始文本做分类+风险，脱敏作为后处理。
 # ═══════════════════════════════════════════════════════════════
 
+# 权限值归一化：历史值 'internal' 统一映射为 'dept_internal'，与 HA3 检索过滤表达式对齐
+# （retriever 按 permission_level="dept_internal" AND owner_dept=<部门> 放行本部门文档；
+#  写入 'internal' 的 chunk 两个分支都不命中，会对所有人不可见）。
+_PERMISSION_ALIAS = {"internal": "dept_internal"}
+
+
 def resolve_permission_level(doc: dict, ctx: dict) -> str:
     """
-    确定文档的权限等级，完全绕过模型预测。
+    确定文档的权限等级，完全由 OSS 路径/预配置属性决定，绝不经过模型预测。
     根据以下优先级：
-    1. 查找 doc 或 task 中显式指定的 permission_level。
+    1. 查找 doc 或 task 中显式指定的 permission_level（'internal' 归一为 'dept_internal'）。
     2. 从 doc['source_key']、doc['canonical_key'] 或 task['raw_key'] 等路径中解析：
        - 如果包含 'restricted' (大小写不敏感)，返回 'restricted'
-       - 如果包含 'internal' 或 'dept_internal' (大小写不敏感)，返回 'internal'
-       - 否则默认返回 'public'
+       - 如果包含 'internal' 或 'dept_internal' (大小写不敏感)，返回 'dept_internal'
+       - 否则默认返回 'public'（raw/ 根目录除隔离/归档外约定为公开，敏感内容靠脱敏兜底）
     """
     # 1. 显式指定的权限
     if "permission_level" in doc:
-        return doc["permission_level"]
-        
+        v = doc["permission_level"]
+        return _PERMISSION_ALIAS.get(v, v)
+
     # 查找任务上下文中的显式设置
     tasks = ctx.get("tasks", [])
     for task in tasks:
         if task.get("doc_id") == doc["doc_id"]:
             if "permission_level" in task:
-                return task["permission_level"]
+                v = task["permission_level"]
+                return _PERMISSION_ALIAS.get(v, v)
             # 检查任务的 raw_key
             raw_key = task.get("raw_key", "")
             if raw_key:
                 if "restricted" in raw_key.lower():
                     return "restricted"
                 if "internal" in raw_key.lower():
-                    return "internal"
+                    return "dept_internal"
 
     # 2. 从路径特征中解析
     paths_to_check = [
@@ -795,8 +803,8 @@ def resolve_permission_level(doc: dict, ctx: dict) -> str:
         if "restricted" in p_lower:
             return "restricted"
         if "internal" in p_lower:
-            return "internal"
-            
+            return "dept_internal"
+
     # 默认值为 'public'
     return "public"
 
