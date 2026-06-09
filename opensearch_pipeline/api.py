@@ -14,20 +14,32 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream
 from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
-from opensearch_pipeline.dingtalk_bot import router as dingtalk_router, _resolve_user_dept
+from opensearch_pipeline.dingtalk_bot import router as dingtalk_router
+from opensearch_pipeline.dingtalk_identity import (
+    _resolve_user_dept,
+    _exchange_authcode_for_userid,
+    _resolve_user_identity,
+)
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.feedback_handler import handle_feedback
-from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json
+from opensearch_pipeline.content_blocks_builder import (
+    build_content_blocks,
+    content_blocks_to_json,
+    build_mini_program_blocks,
+)
+from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
 from opensearch_pipeline.config import get_config
+from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +114,10 @@ class AskRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
     temperature: Optional[float] = Field(0.1, ge=0.0, le=2.0, description="生成温度")
     max_tokens: Optional[int] = Field(2048, ge=100, le=8192, description="最大生成 token 数")
-    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId），用于权限过滤")
+    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；无 Bearer 令牌时用于服务端解析部门")
     user_dept: Optional[str] = Field(
         None,
-        description="用户部门代码，直接传入时优先使用",
+        description="[已废弃·服务端忽略] 部门一律由服务端按 Bearer 令牌/user_id 解析（防越权）",
         pattern=r'^[\w\-\u4e00-\u9fff]{0,64}$',
     )
     pure_text: Optional[bool] = Field(
@@ -117,10 +129,10 @@ class AskRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="搜索查询")
     top_k: int = Field(5, ge=1, le=50, description="返回结果数")
-    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId），用于权限过滤")
+    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；无 Bearer 令牌时用于服务端解析部门")
     user_dept: Optional[str] = Field(
         None,
-        description="用户部门代码，直接传入时优先使用",
+        description="[已废弃·服务端忽略] 部门一律由服务端按 Bearer 令牌/user_id 解析（防越权）",
         pattern=r'^[\w\-\u4e00-\u9fff]{0,64}$',
     )
 
@@ -135,6 +147,7 @@ class SourceInfo(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     sources: List[SourceInfo]
+    blocks: List[Dict[str, Any]] = []   # 小程序原生图文渲染块（图文穿插）；纯文字/无引用图片时为 []
     session_id: str
     message_id: str = ""
     model: str
@@ -157,15 +170,58 @@ class SearchResponse(BaseModel):
     latency_ms: int = 0
 
 
-# ═══════════════════════════════════════════════════════════════
-# 会话存储（从 session_store 模块导入，与 dingtalk_bot 共用）
-# ═══════════════════════════════════════════════════════════════
+class DingtalkAuthRequest(BaseModel):
+    auth_code: str = Field(
+        ..., min_length=1, max_length=512,
+        description="dd.getAuthCode 返回的免登码（5 分钟、单次有效）",
+    )
 
-from opensearch_pipeline.session_store import get_or_create_session, append_to_history
+
+class DingtalkAuthResponse(BaseModel):
+    token: str = Field(..., description="服务端签发的会话令牌，后续请求放入 Authorization: Bearer")
+    user_id: str
+    display_name: str = ""
+    dept: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 会话存储（与 dingtalk_bot 共用；import 见文件顶部）
+# ═══════════════════════════════════════════════════════════════
 
 # 保持向后兼容（内部调用仍使用下划线命名）
 _get_or_create_session = get_or_create_session
 _append_to_history = append_to_history
+
+
+# ═══════════════════════════════════════════════════════════════
+# 鉴权依赖（钉钉小程序 Bearer 令牌 → 身份）
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class Identity:
+    user_id: str
+    dept: Optional[str] = None
+    name: str = ""
+
+
+def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Identity]:
+    """从 Authorization: Bearer <token> 解析已验证身份；无/无效令牌返回 None。
+
+    部门来自服务端签发的令牌，客户端不可篡改；端点据此解析部门，绝不信任请求体里的部门字段。
+    """
+    if not authorization:
+        return None
+    parts = authorization.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    payload = verify_session_token(parts[1].strip())
+    if not payload:
+        return None
+    return Identity(
+        user_id=payload.get("uid", ""),
+        dept=(payload.get("dept") or None),
+        name=payload.get("name", ""),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -178,14 +234,34 @@ async def health_check():
     return {"status": "ok", "service": "rag-qa-api"}
 
 
+@app.post("/api/auth/dingtalk", response_model=DingtalkAuthResponse)
+async def auth_dingtalk(req: DingtalkAuthRequest):
+    """钉钉小程序免登：authCode → userid → 部门/姓名 → 签发会话令牌。
+
+    部门在服务端解析后写入令牌；客户端只持有短期 authCode 与签发的令牌，
+    AppSecret / 签名密钥永不下发到客户端。模拟模式下返回测试用户（见 _exchange_authcode_for_userid）。
+    """
+    userid = _exchange_authcode_for_userid(req.auth_code)
+    if not userid:
+        raise HTTPException(status_code=401, detail="免登失败：authCode 无效或已过期")
+    ident = _resolve_user_identity(userid)
+    token = issue_session_token(userid, dept=ident.get("dept"), name=ident.get("name"))
+    return DingtalkAuthResponse(
+        token=token,
+        user_id=userid,
+        display_name=ident.get("name") or "",
+        dept=ident.get("dept"),
+    )
+
+
 @app.post("/api/search", response_model=SearchResponse)
-async def search(req: SearchRequest):
+async def search(req: SearchRequest, identity: Optional[Identity] = Depends(current_identity)):
     """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""
     t0 = time.time()
     try:
-        user_dept = req.user_dept
-        if not user_dept and req.user_id:
-            user_dept = _resolve_user_dept(req.user_id)
+        # 部门一律服务端解析（令牌优先），绝不信任请求体里的部门字段
+        uid = identity.user_id if identity else (req.user_id or "")
+        user_dept = identity.dept if identity else (_resolve_user_dept(uid) if uid else None)
         results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
@@ -201,7 +277,7 @@ async def search(req: SearchRequest):
 
 
 @app.post("/api/ask", response_model=AskResponse)
-async def ask(req: AskRequest):
+async def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
     """非流式问答接口 — 检索 + LLM 一次性返回。"""
     t0 = time.time()
 
@@ -214,11 +290,12 @@ async def ask(req: AskRequest):
         # 客户端显式传了 history 则优先使用
         merged_history = [{"role": m.role, "content": m.content} for m in req.history]
 
+    # 身份与部门：部门一律服务端解析（令牌优先），绝不信任请求体里的部门字段
+    uid = identity.user_id if identity else (req.user_id or "")
+    user_dept = identity.dept if identity else (_resolve_user_dept(uid) if uid else None)
+
     # 2. 检索
     try:
-        user_dept = req.user_dept
-        if not user_dept and req.user_id:
-            user_dept = _resolve_user_dept(req.user_id)
         chunks = retrieve_and_enrich(req.question, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
@@ -234,7 +311,7 @@ async def ask(req: AskRequest):
         log_qa_session(
             session_id=session_id,
             message_id=msg_id,
-            user_id=req.user_id or "",
+            user_id=uid,
             query_text=req.question,
             latency_ms=latency,
             retrieval_latency_ms=retrieval_latency_ms,
@@ -293,9 +370,17 @@ async def ask(req: AskRequest):
         top_score=top_score,
     )
 
+    # 小程序图文渲染块（复用 build_content_blocks 核心；纯文字/未引用图片时为 []）
+    try:
+        blocks = build_mini_program_blocks(result["answer"], chunks)
+    except Exception:
+        logger.warning("mini-program blocks 构建失败 (non-fatal)", exc_info=True)
+        blocks = []
+
     return AskResponse(
         answer=result["answer"],
         sources=[SourceInfo(**s) for s in result["sources"]],
+        blocks=blocks,
         session_id=session_id,
         message_id=msg_id,
         model=result["model"],
@@ -312,7 +397,7 @@ _SSE_HEADERS = {
 
 
 @app.post("/api/ask/stream")
-async def ask_stream(req: AskRequest):
+async def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
     """SSE 流式问答接口 — 检索 + LLM 逐 token 输出。
 
     SSE 事件格式：
@@ -344,11 +429,12 @@ async def ask_stream(req: AskRequest):
     # 图文模式才补充图片（纯文本模式不展示图片，跳过 co-surfacing 的额外 HA3 查询）
     _pure = req.pure_text if req.pure_text is not None else get_config().rag.pure_text
 
+    # 身份与部门：部门一律服务端解析（令牌优先），绝不信任请求体里的部门字段
+    uid = identity.user_id if identity else (req.user_id or "")
+    user_dept = identity.dept if identity else (_resolve_user_dept(uid) if uid else None)
+
     # 2. 检索（同步阶段，在生成器外完成）
     try:
-        user_dept = req.user_dept
-        if not user_dept and req.user_id:
-            user_dept = _resolve_user_dept(req.user_id)
         chunks = retrieve_and_enrich(
             req.question, top_k=req.top_k, user_dept=user_dept,
             cosurface_images=not _pure,
@@ -376,7 +462,7 @@ async def ask_stream(req: AskRequest):
                 log_qa_session(
                     session_id=session_id,
                     message_id=message_id,
-                    user_id=req.user_id or "",
+                    user_id=uid,
                     query_text=req.question,
                     latency_ms=int((time.time() - t0) * 1000),
                     retrieval_latency_ms=retrieval_latency_ms,
@@ -458,7 +544,7 @@ async def ask_stream(req: AskRequest):
             log_qa_session(
                 session_id=session_id,
                 message_id=message_id,
-                user_id=req.user_id or "",
+                user_id=uid,
                 query_text=req.question,
                 answer_text=full_answer or None,
                 retrieved_docs=chunks,
@@ -492,11 +578,13 @@ class FeedbackRequest(BaseModel):
 
 
 @app.post("/api/feedback")
-async def submit_feedback(req: FeedbackRequest):
+async def submit_feedback(req: FeedbackRequest, identity: Optional[Identity] = Depends(current_identity)):
     """反馈接口 — 供前端/管理后台使用。"""
+    # 有令牌时以令牌身份为准，避免客户端伪造 user_id（uk_message_user 去重才可信）
+    uid = identity.user_id if identity else req.user_id
     success = handle_feedback(
         message_id=req.message_id,
-        user_id=req.user_id,
+        user_id=uid,
         action=req.feedback_type,
         reason=req.feedback_reason,
         comment=req.feedback_comment,

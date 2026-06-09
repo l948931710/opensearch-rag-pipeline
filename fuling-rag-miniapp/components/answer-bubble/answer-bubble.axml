@@ -1,0 +1,30 @@
+<view class="answer-bubble">
+  <block a:for="{{viewBlocks}}" a:key="key">
+    <!-- text block: typewriter-revealed content -->
+    <text
+      a:if="{{item.type === 'text' && !item.hidden}}"
+      class="ans-text"
+    >{{item.revealed}}</text>
+
+    <!-- image block: widthFix is required for unknown-size images -->
+    <view
+      a:elif="{{item.type === 'image' && !item.hidden}}"
+      class="img-wrap"
+    >
+      <image
+        class="ans-img"
+        src="{{item.url}}"
+        mode="widthFix"
+        lazy-load="{{true}}"
+        data-url="{{item.url}}"
+        data-key="{{item.key}}"
+        onTap="onPreview"
+        onError="onImgError"
+      />
+      <text class="caption" a:if="{{item.caption}}">{{item.caption}}</text>
+    </view>
+  </block>
+
+  <!-- blinking cursor while the typewriter is still running -->
+  <text class="cursor" a:if="{{typing}}">▍</text>
+</view>

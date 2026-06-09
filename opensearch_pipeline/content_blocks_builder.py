@@ -15,7 +15,7 @@ content_blocks 是一个 JSON Array，每个元素为：
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from opensearch_pipeline.oss_url import generate_signed_url
 
@@ -111,6 +111,7 @@ def build_content_blocks(
     chunks: List[Dict[str, Any]],
     max_images: int = 3,
     url_expires: int = 3600,
+    max_caption_len: Optional[int] = 100,
 ) -> List[Dict[str, str]]:
     """
     将 LLM 回答拆分为 content_blocks（图文穿插格式）。
@@ -133,6 +134,7 @@ def build_content_blocks(
         chunks: 检索返回的 chunks 列表
         max_images: 最多展示的图片数量
         url_expires: OSS 签名 URL 有效期（秒）
+        max_caption_len: caption 截断长度；None 表示不截断（小程序屏幕空间更大，可传 None 取全文）
 
     Returns:
         [] → 无（被引用的）图片，卡片走 answer 降级显示
@@ -179,7 +181,7 @@ def build_content_blocks(
                 signed_list.append({
                     "url": url,
                     "title": "",
-                    "caption": summary[:100] if summary else "",
+                    "caption": (summary[:max_caption_len] if max_caption_len else summary) if summary else "",
                 })
                 generated_count += 1
             else:
@@ -271,3 +273,38 @@ def content_blocks_to_json(blocks: List[Dict[str, str]]) -> str:
     if not blocks:
         return ""
     return json.dumps(blocks, ensure_ascii=False)
+
+
+def build_mini_program_blocks(
+    answer: str,
+    chunks: List[Dict[str, Any]],
+    max_images: int = 3,
+    url_expires: int = 3600,
+) -> List[Dict[str, Any]]:
+    """为钉钉小程序生成图文 blocks（供 <text>/<image> 原生渲染）。
+
+    复用 build_content_blocks 的「<<IMG:N>> 标记解析 / 仅展示被引用图片 / 配额截断」核心逻辑
+    （不复制不分叉），仅在最外层做字段重命名，使其更贴合小程序原生组件：
+      {"type":"markdown","content":X}        -> {"type":"text","format":"markdown","text":X}
+      {"type":"image","url":U,"caption":C}   -> {"type":"image","url":U,"caption":C,"alt":C}
+    小程序屏幕空间更大，caption 取全文（max_caption_len=None），不再像卡片那样截断到 100 字。
+    纯文字答案 / 未引用图片时返回 []（与 build_content_blocks 行为一致）。
+    """
+    raw = build_content_blocks(
+        answer, chunks, max_images=max_images, url_expires=url_expires, max_caption_len=None
+    )
+    out: List[Dict[str, Any]] = []
+    for b in raw:
+        if b.get("type") == "image":
+            cap = b.get("caption", "")
+            out.append({
+                "type": "image",
+                "url": b.get("url", ""),
+                "caption": cap,
+                "alt": cap,
+            })
+        else:  # markdown
+            text = b.get("content", "")
+            if text:
+                out.append({"type": "text", "format": "markdown", "text": text})
+    return out

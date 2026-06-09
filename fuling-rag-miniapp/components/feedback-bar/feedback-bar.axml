@@ -1,0 +1,58 @@
+<view class="feedback-bar">
+  <view class="fb-row">
+    <view
+      class="fb-btn {{picked === 'upvote' ? 'fb-btn-on' : ''}} {{submitted ? 'fb-btn-locked' : ''}}"
+      onTap="onUpvote"
+    >
+      <text class="fb-ico">👍</text>
+      <text class="fb-label">有用</text>
+    </view>
+
+    <view
+      class="fb-btn {{panelOpen || picked === 'downvote' ? 'fb-btn-on' : ''}} {{submitted ? 'fb-btn-locked' : ''}}"
+      onTap="onDownvote"
+    >
+      <text class="fb-ico">👎</text>
+      <text class="fb-label">没用</text>
+    </view>
+
+    <view
+      class="fb-btn {{picked === 'handoff' ? 'fb-btn-on' : ''}} {{submitted ? 'fb-btn-locked' : ''}}"
+      onTap="onHandoff"
+    >
+      <text class="fb-ico">🧑‍💼</text>
+      <text class="fb-label">转人工</text>
+    </view>
+  </view>
+
+  <!-- inline downvote panel: reason chips + free-text + submit -->
+  <view class="fb-panel" a:if="{{panelOpen && !submitted}}">
+    <view class="fb-chips">
+      <view
+        a:for="{{reasons}}"
+        a:key="code"
+        class="fb-chip {{reasonCode === item.code ? 'fb-chip-on' : ''}}"
+        data-code="{{item.code}}"
+        onTap="onPickReason"
+      >{{item.label}}</view>
+    </view>
+
+    <textarea
+      class="fb-textarea"
+      placeholder="其他原因（选填）"
+      value="{{comment}}"
+      maxlength="200"
+      onInput="onCommentInput"
+    />
+
+    <view class="fb-panel-actions">
+      <view class="fb-cancel" onTap="onCancelPanel">取消</view>
+      <view
+        class="fb-submit {{reasonCode || comment ? '' : 'btn-disabled'}}"
+        onTap="onSubmitDownvote"
+      >提交</view>
+    </view>
+  </view>
+
+  <text class="fb-thanks" a:if="{{submitted}}">{{thanksText}}</text>
+</view>

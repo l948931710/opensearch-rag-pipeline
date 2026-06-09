@@ -49,141 +49,14 @@ from opensearch_pipeline.feedback_handler import (
     mark_awaiting_comment,
     take_awaiting_comment,
 )
+from opensearch_pipeline.dingtalk_identity import _resolve_user_dept
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dingtalk", tags=["DingTalk"])
 
 
-# ═══════════════════════════════════════════════════════════════
-# 用户部门解析
-# ═══════════════════════════════════════════════════════════════
-
-def _resolve_user_dept(staff_id: str) -> Optional[str]:
-    """
-    从 RDS user_role 表查询用户所属部门。
-    如果 user_role 中不存在，自动通过钉钉 API 获取并缓存。
-
-    查询失败或用户不存在时返回 None，调用方会降级为只返回 public + internal 文档。
-    """
-    if not staff_id or staff_id.startswith("$:"):
-        return None
-
-    try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
-
-        conn = _get_db_conn()
-        try:
-            # 1. 先查本地缓存
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT dept_code FROM fuling_knowledge.user_role "
-                    "WHERE user_id = %s AND is_active = 1 LIMIT 1",
-                    (staff_id,),
-                )
-                row = cur.fetchone()
-                if row and row[0]:
-                    logger.info("用户部门解析成功（缓存）: staff_id=%s → dept=%s", staff_id, row[0])
-                    return row[0]
-
-            # 2. 本地没有，调钉钉 API 获取
-            user_info = _fetch_dingtalk_user_info(staff_id)
-            if user_info:
-                dept_name = user_info.get("dept_name", "")
-                user_name = user_info.get("user_name", "")
-                # 3. 缓存到 user_role 表
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            INSERT INTO fuling_knowledge.user_role (user_id, user_name, dept_code, role, is_active)
-                            VALUES (%s, %s, %s, %s, 1)
-                            ON DUPLICATE KEY UPDATE
-                                user_name = VALUES(user_name),
-                                dept_code = VALUES(dept_code),
-                                updated_at = NOW()
-                            """,
-                            (staff_id, user_name, dept_name, "employee"),
-                        )
-                    conn.commit()
-                    logger.info("用户信息已缓存: staff_id=%s, name=%s, dept=%s", staff_id, user_name, dept_name)
-                except Exception as cache_err:
-                    logger.warning("缓存用户信息失败: %s", cache_err)
-                return dept_name or None
-            else:
-                logger.warning("用户未在 user_role 表中注册且 API 查询失败: staff_id=%s", staff_id)
-                return None
-        finally:
-            conn.close()
-    except Exception as e:
-        logger.warning("查询用户部门失败 staff_id=%s: %s", staff_id, e)
-        return None
-
-
-def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
-    """
-    通过钉钉 API 获取用户信息（姓名、部门等）。
-
-    Returns:
-        {"user_name": "张三", "dept_name": "行政部"} 或 None
-    """
-    from opensearch_pipeline.dingtalk_card import _get_access_token
-
-    token = _get_access_token()
-    if not token:
-        return None
-
-    try:
-        import requests as _requests
-
-        # 使用旧版 API（更兼容）: /topapi/v2/user/get
-        resp = _requests.post(
-            f"https://oapi.dingtalk.com/topapi/v2/user/get?access_token={token}",
-            json={"userid": user_id},
-            timeout=5,
-        )
-        print(f"[USER DEBUG] 钉钉用户查询: userId={user_id}, status={resp.status_code}", flush=True)
-
-        if resp.status_code == 200:
-            data = resp.json()
-            print(f"[USER DEBUG] API 响应: errcode={data.get('errcode')}, errmsg={data.get('errmsg')}", flush=True)
-            if data.get("errcode") == 0:
-                result = data.get("result", {})
-                user_name = result.get("name", "")
-                dept_name = ""
-                # 获取部门 ID 列表，取第一个部门名称
-                dept_id_list = result.get("dept_id_list", [])
-                if dept_id_list:
-                    dept_name = _fetch_dept_name(token, dept_id_list[0])
-                print(f"[USER DEBUG] 用户信息: name={user_name}, dept={dept_name}", flush=True)
-                return {"user_name": user_name, "dept_name": dept_name}
-            else:
-                print(f"[USER DEBUG] 用户查询业务失败: {data}", flush=True)
-                return None
-        else:
-            print(f"[USER DEBUG] 用户查询HTTP失败: {resp.text[:300]}", flush=True)
-            return None
-    except Exception as e:
-        print(f"[USER DEBUG] 用户查询异常: {e}", flush=True)
-        return None
-
-
-def _fetch_dept_name(token: str, dept_id: int) -> str:
-    """通过部门 ID 获取部门名称。"""
-    try:
-        import requests as _requests
-        resp = _requests.post(
-            f"https://oapi.dingtalk.com/topapi/v2/department/get?access_token={token}",
-            json={"dept_id": dept_id},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("errcode") == 0:
-                return data.get("result", {}).get("name", "")
-    except Exception:
-        pass
-    return ""
+# 用户身份/部门解析（机器人 + 小程序共用）已抽离到 dingtalk_identity.py
 
 
 # ═══════════════════════════════════════════════════════════════

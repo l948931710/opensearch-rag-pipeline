@@ -1,0 +1,48 @@
+.answer-bubble {
+  display: flex;
+  flex-direction: column;
+  background-color: #ffffff;
+  border-radius: 16rpx;
+  padding: 24rpx;
+  box-shadow: 0 2rpx 12rpx rgba(0, 0, 0, 0.04);
+}
+
+.ans-text {
+  font-size: 30rpx;
+  line-height: 1.6;
+  color: #1f2329;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.img-wrap {
+  margin: 16rpx 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* mode="widthFix" lets the image scale to the container width; height auto. */
+.ans-img {
+  width: 100%;
+  border-radius: 12rpx;
+  background-color: #f0f1f3;
+}
+
+.caption {
+  margin-top: 8rpx;
+  font-size: 24rpx;
+  color: #8a8f99;
+  line-height: 1.4;
+}
+
+.cursor {
+  display: inline;
+  color: #1677ff;
+  font-size: 30rpx;
+  animation: blink 1s steps(1) infinite;
+}
+
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}

@@ -1,0 +1,83 @@
+<view class="chat-page">
+  <scroll-view
+    class="msg-list"
+    scroll-y="{{true}}"
+    scroll-into-view="{{scrollIntoId}}"
+    scroll-with-animation="{{true}}"
+  >
+    <view class="msg-list-inner">
+      <!-- empty-state hint -->
+      <view class="empty-hint" a:if="{{messages.length === 0}}">
+        <text class="empty-title">富岭知识助手</text>
+        <text class="empty-sub">向我提问 SOP / U8 ERP / 行政人事 等问题，我会从公司知识库为你解答。</text>
+      </view>
+
+      <block a:for="{{messages}}" a:key="id">
+        <!-- anchor for scroll-into-view -->
+        <view id="msg-{{item.id}}" class="msg-anchor"></view>
+
+        <!-- user bubble (right) -->
+        <view a:if="{{item.role === 'user'}}" class="row row-user">
+          <view class="bubble bubble-user">
+            <text class="bubble-user-text">{{item.text}}</text>
+          </view>
+        </view>
+
+        <!-- AI message (left) -->
+        <view a:else class="row row-ai">
+          <view class="ai-col">
+            <!-- loading placeholder -->
+            <view a:if="{{item.loading}}" class="ai-loading">
+              <spin a:if="{{true}}" size="small" />
+              <skeleton
+                title="{{false}}"
+                row="{{2}}"
+                avatar="{{false}}"
+                active="{{true}}"
+              />
+            </view>
+
+            <!-- error state -->
+            <view a:elif="{{item.error}}" class="ai-error">
+              <text class="ai-error-text">😞 {{item.errorText}}</text>
+            </view>
+
+            <!-- answer -->
+            <block a:else>
+              <answer-bubble
+                blocks="{{item.blocks}}"
+                instant="{{item.instant}}"
+                onGrow="onAnswerGrow"
+              />
+              <feedback-bar
+                a:if="{{item.messageId}}"
+                messageId="{{item.messageId}}"
+              />
+            </block>
+          </view>
+        </view>
+      </block>
+    </view>
+  </scroll-view>
+
+  <!-- bottom input bar -->
+  <view class="input-bar">
+    <input
+      class="input-box"
+      value="{{draft}}"
+      placeholder="输入你的问题…"
+      confirm-type="send"
+      disabled="{{sending}}"
+      onInput="onInput"
+      onConfirm="onSend"
+    />
+    <view
+      class="send-btn btn btn-primary {{(!draft || sending) ? 'btn-disabled' : ''}}"
+      onTap="onSend"
+    >
+      <text>{{sending ? '回答中' : '发送'}}</text>
+    </view>
+  </view>
+
+  <snackbar id="snackbar" />
+</view>

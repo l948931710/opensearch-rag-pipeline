@@ -1,0 +1,35 @@
+<view class="settings-page">
+  <view class="profile-card">
+    <view class="avatar">
+      <text class="avatar-text">{{avatarChar}}</text>
+    </view>
+    <view class="profile-meta">
+      <text class="profile-name">{{displayName || '未登录'}}</text>
+      <text class="profile-dept">{{dept || '部门未知'}}</text>
+    </view>
+  </view>
+
+  <view class="section">
+    <list>
+      <list-item title="部门" extra="{{dept || '—'}}" />
+      <list-item title="用户 ID" extra="{{userId || '—'}}" />
+      <list-item title="会话 ID" extra="{{sessionId || '—'}}" />
+    </list>
+  </view>
+
+  <view class="section">
+    <list>
+      <list-item title="清除会话" arrow="{{true}}" onTap="onClearSession" />
+    </list>
+    <text class="section-tip">清除后，下一次提问将开启全新会话（不影响历史问答记录）。</text>
+  </view>
+
+  <view class="section">
+    <list>
+      <list-item title="应用名称" extra="富岭知识助手" />
+      <list-item title="版本" extra="{{version}}" />
+    </list>
+  </view>
+
+  <snackbar id="snackbar" />
+</view>

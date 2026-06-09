@@ -298,10 +298,10 @@ class TestAPI:
         assert data["results"][0]["title"] == "员工手册"
 
     @patch("opensearch_pipeline.api.generate_answer")
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_ask_endpoint(self, mock_search, mock_gen, client):
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_ask_endpoint(self, mock_retrieve, mock_gen, client):
         """测试非流式问答端点。"""
-        mock_search.return_value = [
+        mock_retrieve.return_value = [
             {"chunk_text": "内容", "title": "手册", "doc_id": "D1", "score": 0.9}
         ]
         mock_gen.return_value = {
@@ -318,10 +318,10 @@ class TestAPI:
         assert data["session_id"]  # 应自动生成 session_id
 
     @patch("opensearch_pipeline.api.generate_answer")
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_ask_with_session(self, mock_search, mock_gen, client):
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_ask_with_session(self, mock_retrieve, mock_gen, client):
         """测试多轮对话 — 会话保持。"""
-        mock_search.return_value = [
+        mock_retrieve.return_value = [
             {"chunk_text": "内容", "title": "手册", "doc_id": "D1", "score": 0.9}
         ]
         mock_gen.return_value = {
@@ -344,20 +344,20 @@ class TestAPI:
         })
         assert resp2.json()["session_id"] == session_id
 
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_ask_no_results(self, mock_search, client):
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_ask_no_results(self, mock_retrieve, client):
         """检索无结果时应返回提示。"""
-        mock_search.return_value = []
+        mock_retrieve.return_value = []
 
         resp = client.post("/api/ask", json={"question": "不存在的内容"})
         assert resp.status_code == 200
         assert "未找到" in resp.json()["answer"]
 
     @patch("opensearch_pipeline.api.generate_answer_stream")
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_stream_endpoint(self, mock_search, mock_stream, client):
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_stream_endpoint(self, mock_retrieve, mock_stream, client):
         """测试 SSE 流式端点。"""
-        mock_search.return_value = [
+        mock_retrieve.return_value = [
             {"chunk_text": "内容", "title": "手册", "doc_id": "D1", "score": 0.9}
         ]
 
