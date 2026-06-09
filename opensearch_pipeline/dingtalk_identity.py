@@ -30,6 +30,43 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
+# 钉钉部门名 → OSS/owner_dept 代码 映射
+# ───────────────────────────────────────────────────────────────
+# 用户部门来自钉钉，是【中文部门名】（如「营销中心」）；而 chunk 的 owner_dept 来自
+# OSS 目录 raw/<dept>/...，是【英文代码】（如 marketing/hr）。HA3 权限过滤要求两边
+# 字符串完全相等，因此在解析用户部门时把中文名归一化为英文代码。
+#
+# ⚠️ 安全约定：未在表中的部门【原样返回】（落到 fail-closed）——匹配不到任何 chunk，
+#    用户只能看到 public 文档，绝不会误授予 dept_internal 访问。所以这张表可以先填高
+#    置信度的部分，歧义项留空由人工补；宁缺勿错。
+# ⚠️ 当前线上所有 chunk 均为 public，本表尚未产生任何实际授权效果（无 dept_internal 内容）。
+#
+# 待业务确认的歧义项（暂不映射，留作 fail-closed）：
+#   办公室 / 综合管理中心 → admin?      电子商务部 → marketing? it? 独立?
+#   杭州分公司 → （无对应 OSS 目录）
+# OSS 中已有但暂无对应钉钉部门的代码：it / finance / quality / rd / supply / production_*
+_DEPT_NAME_TO_CODE = {
+    # 高置信度（中英一一对应、无歧义）
+    "营销中心": "marketing",
+    "人力资源部": "hr",
+    "PMC部": "pmc",
+    "生产中心": "production",
+}
+
+
+def _normalize_dept_to_code(raw: Optional[str]) -> Optional[str]:
+    """把钉钉中文部门名归一化为 owner_dept 英文代码。
+
+    - 已是英文代码（marketing 等）→ 原样返回（映射表里查不到即透传，幂等）。
+    - 已知中文名 → 对应英文代码。
+    - 未知部门 → 原样返回（fail-closed：匹配不到 chunk，仅 public 可见）。
+    """
+    if not raw:
+        return raw
+    return _DEPT_NAME_TO_CODE.get(raw.strip(), raw)
+
+
+# ═══════════════════════════════════════════════════════════════
 # 用户部门解析（机器人 + 小程序共用）
 # ═══════════════════════════════════════════════════════════════
 
@@ -59,8 +96,12 @@ def _resolve_user_dept(staff_id: str) -> Optional[str]:
                 )
                 row = cur.fetchone()
                 if row and row[0]:
-                    logger.info("用户部门解析成功（缓存）: staff_id=%s → dept=%s", staff_id, row[0])
-                    return row[0]
+                    # 缓存里存的可能是中文名（历史/钉钉直采）；归一化为英文代码再返回，
+                    # 以与 chunk.owner_dept 对齐。未知部门透传 = fail-closed（仅 public）。
+                    code = _normalize_dept_to_code(row[0])
+                    logger.info("用户部门解析成功（缓存）: staff_id=%s → dept=%s（code=%s）",
+                                staff_id, row[0], code)
+                    return code
 
             # 2. 本地没有，调钉钉 API 获取
             user_info = _fetch_dingtalk_user_info(staff_id)
@@ -85,7 +126,8 @@ def _resolve_user_dept(staff_id: str) -> Optional[str]:
                     logger.info("用户信息已缓存: staff_id=%s, name=%s, dept=%s", staff_id, user_name, dept_name)
                 except Exception as cache_err:
                     logger.warning("缓存用户信息失败: %s", cache_err)
-                return dept_name or None
+                # 缓存原始中文名（便于在 DMS/钉钉侧对照），返回时归一化为英文代码
+                return _normalize_dept_to_code(dept_name) or None
             else:
                 logger.warning("用户未在 user_role 表中注册且 API 查询失败: staff_id=%s", staff_id)
                 return None
@@ -247,14 +289,15 @@ def _resolve_user_identity(userid: str) -> Dict[str, Optional[str]]:
 
     try:
         if get_config().simulate_api:
+            # 归一化，使离线联调与线上一致（RAG_SIM_USER_DEPT 可填中文名或英文代码）
             return {
-                "dept": os.environ.get("RAG_SIM_USER_DEPT") or None,
+                "dept": _normalize_dept_to_code(os.environ.get("RAG_SIM_USER_DEPT")) or None,
                 "name": userid,
             }
     except Exception:
         pass
 
-    dept = _resolve_user_dept(userid)  # 名称字符串；含缓存 + API 回退（并顺带缓存 user_name）
+    dept = _resolve_user_dept(userid)  # 已归一化为 owner_dept 英文代码（含缓存 + API 回退）
     name = ""
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
