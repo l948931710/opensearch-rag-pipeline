@@ -267,3 +267,110 @@ def _create_escalation(
         return False
     finally:
         conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 「其他原因」自由文本：标记待补充 + 回收用户回复
+# 流式卡不能弹内联表单（会冲掉流式正文→白屏），故改为：点「补充原因」→ 标记 AWAITING_COMMENT
+# + 机器人提示用户直接回复 → 用户回复的下一条消息被 take_awaiting_comment 接住，写进 feedback_comment。
+# 状态存 RDS（handled_status='AWAITING_COMMENT'），多 worker 安全。
+# ═══════════════════════════════════════════════════════════════
+
+def mark_awaiting_comment(
+    *, message_id: str, user_id: str, user_name: Optional[str] = None
+) -> bool:
+    """标记用户对某条回答「待补充文字原因」。写/覆盖一条 user_feedback
+    (downvote / reason=other / handled_status=AWAITING_COMMENT)。"""
+    if not message_id or not user_id:
+        return False
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+    conn = _get_db_conn()
+    try:
+        session_id = query_text = ai_answer = ""
+        cited_json = None
+        user_dept = None
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT session_id, query_text, answer_text, cited_docs_json, user_dept
+                   FROM fuling_operation.qa_session_log WHERE message_id = %s LIMIT 1""",
+                (message_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                session_id = row[0] or ""
+                query_text = row[1] or ""
+                ai_answer = row[2] or ""
+                cited_json = row[3]
+                user_dept = row[4]
+
+        feedback_id = str(uuid.uuid4())
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO fuling_operation.user_feedback (
+                    feedback_id, session_id, message_id, user_id, user_name, user_dept,
+                    query_text, ai_answer, cited_doc_ids_json,
+                    feedback_type, feedback_reason, handled_status
+                ) VALUES (%s,%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s)
+                ON DUPLICATE KEY UPDATE
+                    feedback_type = VALUES(feedback_type),
+                    feedback_reason = VALUES(feedback_reason),
+                    handled_status = VALUES(handled_status),
+                    updated_at = NOW()
+                """,
+                (feedback_id, session_id, message_id, user_id, user_name, user_dept,
+                 query_text, ai_answer, cited_json,
+                 "downvote", "other", "AWAITING_COMMENT"),
+            )
+        conn.commit()
+        logger.info("已标记待补充原因: message_id=%s, user_id=%s", message_id, user_id)
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error("mark_awaiting_comment 失败: message_id=%s, error=%s", message_id, e, exc_info=True)
+        return False
+    finally:
+        conn.close()
+
+
+def take_awaiting_comment(*, user_id: str, comment: str, within_seconds: int = 600) -> bool:
+    """若该用户最近 within_seconds 内有 handled_status='AWAITING_COMMENT' 的反馈，把 comment
+    写进其 feedback_comment 并置回 'PENDING'；命中返回 True（调用方据此判定「这条消息是补充原因、
+    不是新问题」）。未命中返回 False（按普通问答处理）。"""
+    if not user_id or not comment or not comment.strip():
+        return False
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id FROM fuling_operation.user_feedback
+                WHERE user_id = %s AND handled_status = 'AWAITING_COMMENT'
+                  AND created_at >= (NOW() - INTERVAL %s SECOND)
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id, int(within_seconds)),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            fid = row[0]
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE fuling_operation.user_feedback
+                   SET feedback_comment = %s, handled_status = 'PENDING', updated_at = NOW()
+                   WHERE id = %s""",
+                (comment.strip()[:1000], fid),
+            )
+        conn.commit()
+        logger.info("已收下补充原因: user_id=%s, len=%d", user_id, len(comment.strip()))
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error("take_awaiting_comment 失败: user_id=%s, error=%s", user_id, e, exc_info=True)
+        return False
+    finally:
+        conn.close()

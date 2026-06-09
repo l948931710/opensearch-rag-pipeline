@@ -613,3 +613,35 @@ def streaming_update_card(
     except Exception as e:
         logger.error("流式卡片更新异常: %s", e, exc_info=True)
         return False
+
+
+def send_text_to_user(staff_id: str, text: str) -> bool:
+    """机器人主动给某个用户发一条纯文本（1 对 1）。
+
+    用于卡片【回调】里给用户发提示（回调请求里没有 sessionWebhook，无法走 _send_text_reply）。
+    例如：点「转人工」后回「已为你转人工」、点「补充原因」后回「请直接回复本条消息」。
+    需应用具备「机器人发送单聊消息」权限（Robot.Message.Send / 单聊消息）；失败 fail open，不抛。
+    """
+    token = _get_access_token()
+    if not token or not staff_id or not text:
+        return False
+    robot_code = os.environ.get("DINGTALK_CLIENT_ID", "")
+    try:
+        resp = requests.post(
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+            json={
+                "robotCode": robot_code,
+                "userIds": [staff_id],
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": text}, ensure_ascii=False),
+            },
+            headers={"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return True
+        logger.warning("send_text_to_user 失败: status=%s, body=%s", resp.status_code, resp.text[:200])
+        return False
+    except Exception as e:
+        logger.warning("send_text_to_user 异常: %s", e)
+        return False

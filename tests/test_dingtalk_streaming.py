@@ -178,7 +178,6 @@ def test_streaming_nonblocking_pusher_finalize_is_last():
     用带延时的流让后台线程真正触发多次推送，验证 (a) 后台确有推流，(b) 仅一次定稿且在最后，其后无推送。
     """
     import time as _t
-    from opensearch_pipeline import dingtalk_bot
 
     calls = []
 
@@ -301,6 +300,61 @@ def test_rebuild_card_param_map_streaming_folds_sources_and_latency_into_content
     # B2：来源/耗时已折进 content，页脚置空，避免与正文重复
     assert card_param_map["sources_text"] == "" and card_param_map["meta"] == ""
     assert card_param_map["is_answer_done"] == "true"
+
+
+# ── ACK-only 回调（流式卡反馈不白屏）+ 「补充原因」自由文本回收 ────────────────────
+
+def test_card_callback_acks_without_carddata():
+    """关键回归：回调一律 ACK-only —— 响应【不含 cardData】→ 钉钉不重渲染卡片 → 不冲掉流式正文（白屏）。
+    覆盖 转人工/赞/踩/补充原因/未知原生动作。"""
+    import asyncio
+    import json as _json
+    from opensearch_pipeline import dingtalk_bot
+
+    def _req(action, mid="m1"):
+        body = {
+            "outTrackId": mid, "userId": "u1",
+            "content": _json.dumps({"cardPrivateData": {"params": {"action": action, "message_id": mid}}}),
+        }
+
+        class _R:
+            async def json(self):
+                return body
+
+        return _R()
+
+    with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True) as mock_hf, \
+         patch("opensearch_pipeline.dingtalk_bot.mark_awaiting_comment", return_value=True) as mock_mark, \
+         patch("opensearch_pipeline.dingtalk_bot.send_text_to_user", return_value=True):
+        for action in ("handoff", "upvote", "downvote", "add_reason", "some_native_like"):
+            resp = asyncio.run(dingtalk_bot.card_callback(_req(action)))
+            assert "cardData" not in resp, f"action={action} 不应返回 cardData（会白屏）"
+
+    assert mock_hf.called          # 转人工 + 赞踩 落库
+    assert mock_mark.called        # 补充原因 标记待补充
+
+
+def test_take_awaiting_comment_hit_and_miss():
+    """补充原因回收：命中 AWAITING_COMMENT 行 → 写 comment 返回 True；无命中/空输入 → False。"""
+    from opensearch_pipeline import feedback_handler
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchone.return_value = (42,)  # 找到一条待补充
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+        assert feedback_handler.take_awaiting_comment(user_id="u1", comment="缺少XX制度") is True
+    conn.commit.assert_called_once()
+
+    conn2 = MagicMock()
+    cur2 = MagicMock()
+    cur2.fetchone.return_value = None  # 无待补充
+    conn2.cursor.return_value.__enter__.return_value = cur2
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn2):
+        assert feedback_handler.take_awaiting_comment(user_id="u1", comment="这其实是个新问题") is False
+
+    assert feedback_handler.take_awaiting_comment(user_id="", comment="x") is False
+    assert feedback_handler.take_awaiting_comment(user_id="u1", comment="  ") is False
 
 
 # ── 启动时自动注册互动卡片 HTTP 回调地址 ──────────────────────────────────────

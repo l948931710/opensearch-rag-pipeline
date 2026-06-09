@@ -39,10 +39,15 @@ from opensearch_pipeline.dingtalk_card import (
     update_card_feedback_status,
     create_streaming_card,
     streaming_update_card,
+    send_text_to_user,
     _strip_trailing_sources,
     _format_sources_text,
 )
-from opensearch_pipeline.feedback_handler import handle_feedback, get_feedback_status_text
+from opensearch_pipeline.feedback_handler import (
+    handle_feedback,
+    mark_awaiting_comment,
+    take_awaiting_comment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -843,6 +848,14 @@ async def _handle_webhook(request: Request):
             _send_text_reply(session_webhook, "👋 您好！请输入您想查询的问题，我会为您从知识库中检索答案。")
         return {"msgtype": "empty"}
 
+    # ── 「补充原因」回收：若该用户刚点过卡片上的「补充原因」(handled_status=AWAITING_COMMENT)，
+    #    把这条消息当作对上一条回答的补充原因收下，写进 user_feedback.feedback_comment，不走问答。
+    #    （流式卡不能弹内联表单——会冲掉流式正文白屏——故改为单独回复消息收集。）
+    if sender_staff_id and take_awaiting_comment(user_id=sender_staff_id, comment=question):
+        if session_webhook:
+            _send_text_reply(session_webhook, "✅ 已记录你补充的原因，谢谢反馈！")
+        return {"msgtype": "feedback_comment"}
+
     if not session_webhook:
         logger.error("钉钉回调缺少 sessionWebhook，无法回复")
         raise HTTPException(status_code=400, detail="缺少 sessionWebhook")
@@ -916,86 +929,55 @@ async def card_callback(request: Request):
     message_id = params.get("message_id", "") or out_track_id
     reason = params.get("reason")  # ActionSheet 菜单传入的踩原因
 
-    # 提取"其他原因"表单中用户填写的详细内容
-    comment = None
-    current_form = params.get("current_form")
-    if current_form:
-        # current_form 可能是 JSON 字符串或 dict
-        if isinstance(current_form, str):
-            try:
-                current_form = json.loads(current_form)
-            except (json.JSONDecodeError, TypeError):
-                current_form = {}
-        if isinstance(current_form, dict):
-            comment = current_form.get("other_reason_detail", "") or None
+    user_name = body.get("userName") or None
 
     if not message_id or not action:
         logger.warning("卡片回调缺少 message_id 或 action: body=%s", body)
-        return {"cardData": {"cardParamMap": {}}}
+        return {}  # ACK-only（不带 cardData）→ 不更新卡片
 
-    # ── 第一次回调：点击"其他原因"→ 只展开表单，不保存反馈 ──
-    if action == "downvote_other_start":
-        print(f"[CALLBACK DEBUG] 展开其他原因表单: message_id={message_id}", flush=True)
-        # 回写 show_other_feedback_form = "true"，卡片刷新后显示表单
-        # 同时保留其他字段不变（回调响应会覆盖整个 cardParamMap）
-        card_param_map = {
-            "feedback_status": "",                   # 保持空→按钮组仍然通过此条件判断
-            "show_other_feedback_form": "true",       # 展开表单
-            "form_status": "normal",                  # 表单可编辑
-            "form_btn_text": "提交反馈",              # 提交按钮文字
-            # 表单字段定义（回调会覆盖整个 cardParamMap，必须重新传入）
-            "other_feedback_form": json.dumps({
-                "fields": [{
-                    "name": "other_reason_detail",
-                    "label": "请填写具体原因",
-                    "type": "TEXT",
-                    "required": True,
-                    "placeholder": "请说明哪里没帮助，例如：缺少某项制度、结论不准确、希望补充来源等",
-                    "requiredMsg": "请填写具体原因后再提交",
-                }]
-            }, ensure_ascii=False),
-        }
-        # 重建其他字段（回调响应会覆盖整个 cardParamMap）
-        _rebuild_card_param_map(card_param_map, message_id, context="展开表单时")
+    # ⚠️ 回调一律 ACK-only：响应里【绝不放 cardData】→ 钉钉不重渲染卡片 → 不会冲掉流式写入的正文
+    # （白屏根因，已三次实证）。赞踩的视觉由钉钉【原生 Feedback 组件】自己呈现；转人工/补充原因的
+    # 提示走机器人 1 对 1 文本消息（回调请求里没有 sessionWebhook）。落库失败 fail open，不影响 ACK。
+    _ACK: dict = {}
 
-        return {"cardData": {"cardParamMap": card_param_map}}
+    # ── 转人工 ──
+    if action == "handoff":
+        try:
+            handle_feedback(message_id=message_id, user_id=user_id, user_name=user_name, action="handoff")
+            if user_id:
+                send_text_to_user(user_id, "🙋 已为你转人工，相关同事会尽快跟进～")
+        except Exception as e:
+            logger.error("handoff 处理失败: %s", e, exc_info=True)
+        return _ACK
 
-    # ── 第二次回调（表单提交）/ 普通踩 ──
-    # 归一化 action：downvote_other_submit → downvote（附带用户填写的 comment）
-    normalized_action = action
-    if action == "downvote_other_submit":
-        normalized_action = "downvote"
-        if not reason:
-            reason = "other"
+    # ── 「补充原因」自由文本：标记待补充 + 提示用户直接回复 ──
+    #    用户回复的下一条消息由 _handle_webhook 的 take_awaiting_comment 接住，写进 feedback_comment。
+    if action in ("add_reason", "downvote_other", "downvote_other_start", "downvote_other_submit"):
+        try:
+            mark_awaiting_comment(message_id=message_id, user_id=user_id, user_name=user_name)
+            if user_id:
+                send_text_to_user(user_id, "📝 想补充具体原因？直接【回复本条消息】发给我就行，我会记录下来～")
+        except Exception as e:
+            logger.error("add_reason 处理失败: %s", e, exc_info=True)
+        return _ACK
 
-    # 处理反馈
-    success = handle_feedback(
-        message_id=message_id,
-        user_id=user_id,
-        action=normalized_action,
-        reason=reason,
-        comment=comment,
-    )
+    # ── 赞 / 踩（自定义按钮 或 钉钉原生赞踩回调）──
+    #    原生赞踩的 action/reason 字段名以 [CALLBACK RAW] 实测为准；届时把别名补进下面集合即可。
+    _UP = ("upvote", "like", "thumbs_up", "good", "helpful")
+    _DOWN = ("downvote", "dislike", "thumbs_down", "bad", "unhelpful")
+    if action in _UP or action in _DOWN:
+        norm = "upvote" if action in _UP else "downvote"
+        try:
+            handle_feedback(message_id=message_id, user_id=user_id, user_name=user_name,
+                            action=norm, reason=reason)
+            print(f"[CALLBACK DEBUG] 赞踩落库: message_id={message_id}, action={action}->{norm}, reason={reason}", flush=True)
+        except Exception as e:
+            logger.error("赞踩落库失败: %s", e, exc_info=True)
+        return _ACK
 
-    # 从数据库重建完整卡片数据（回调响应会覆盖整个 cardParamMap）
-    feedback_text = get_feedback_status_text(normalized_action) if success else "⚠️ 反馈处理失败"
-    if success and action == "downvote_other_submit":
-        feedback_text = "📝 已反馈：没帮助（已提交详细原因）"
-    print(f"[CALLBACK DEBUG] message_id={message_id}, action={action}, normalized={normalized_action}, success={success}, text={feedback_text}, comment={comment}", flush=True)
-
-    card_param_map = {
-        "feedback_status": feedback_text,
-        # 提交后收起表单、隐藏按钮
-        "show_other_feedback_form": "",
-        "form_status": "disabled",
-    }
-    _rebuild_card_param_map(card_param_map, message_id, context="")
-
-    return {
-        "cardData": {
-            "cardParamMap": card_param_map,
-        },
-    }
+    # 其它/未识别动作：已 ACK，不更新卡片（[CALLBACK RAW] 已记录原始 body 供排查 + 补别名）
+    logger.info("卡片回调未识别 action=%s（已 ACK，不更新卡片）", action)
+    return _ACK
 
 
 def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str = "") -> None:
