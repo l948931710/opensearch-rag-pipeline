@@ -561,65 +561,78 @@ def stitch_neighbor_chunks(
         return chunks
 
     try:
-        import pymysql.cursors
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
-
-        conn = _get_db_conn()
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-
-        expanded = []
-        seen_centers = set()  # 去重：同一个 (doc_id, chunk_index) 只输出一次
+        # 单次批量查询所有命中 chunk 的 ±window 邻居（消除 N+1：原先每个 hit 一次 RDS 往返）。
+        # 第一遍：分流 pass-through（无 doc_id / step·proc·visual 语义单元）与待拼接 chunk，
+        # 用占位符保留输出顺序，并按 (doc_id, center_idx) 去重（重复中心整条丢弃，与原行为一致）。
+        expanded: List[Optional[Dict[str, Any]]] = []
+        seen_centers = set()
+        pending = []          # (slot, chunk, doc_id, center_idx)
+        ranges = []           # (doc_id, lo, hi)
 
         for chunk in chunks:
             doc_id = chunk.get("doc_id", "")
             center_idx = chunk.get("chunk_index", 0)
-            center_key = (doc_id, center_idx)
-
-            if not doc_id:
-                expanded.append(chunk)
-                continue
-
-            # step_card / procedure_parent / visual_knowledge 已是语义完整单元，跳过邻居拼接
             chunk_type = chunk.get("chunk_type", "")
-            if chunk_type in ("step_card", "procedure_parent", "visual_knowledge"):
+
+            if not doc_id or chunk_type in ("step_card", "procedure_parent", "visual_knowledge"):
                 expanded.append(chunk)
                 continue
 
-            # 同一个中心 chunk 已被前面的 hit 处理过（例如 hit A 的邻居 = hit B 的中心）
+            center_key = (doc_id, center_idx)
             if center_key in seen_centers:
-                continue
+                continue  # 重复中心：丢弃（hit A 的邻居恰是 hit B 的中心）
             seen_centers.add(center_key)
 
-            # 查询 ±window 邻居
-            cursor.execute("""
-                SELECT chunk_index, chunk_text, section_title
-                FROM chunk_meta
-                WHERE doc_id = %s
-                  AND is_active = 1
-                  AND chunk_index BETWEEN %s AND %s
-                ORDER BY chunk_index
-            """, (doc_id, center_idx - window, center_idx + window))
-            neighbors = cursor.fetchall()
+            slot = len(expanded)
+            expanded.append(None)  # 占位，批量查询后回填
+            pending.append((slot, chunk, doc_id, center_idx))
+            ranges.append((doc_id, center_idx - window, center_idx + window))
 
-            if neighbors:
-                stitched_text = "\n".join(nb["chunk_text"] or "" for nb in neighbors)
+        # 只有存在待拼接 chunk 时才连库
+        neighbors_by_doc: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        if pending:
+            import pymysql.cursors
+            from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+            conn = _get_db_conn()
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
+            try:
+                where_parts = []
+                params: List[Any] = []
+                for doc_id, lo, hi in ranges:
+                    where_parts.append("(doc_id = %s AND chunk_index BETWEEN %s AND %s)")
+                    params.extend([doc_id, lo, hi])
+                cursor.execute(
+                    "SELECT doc_id, chunk_index, chunk_text, section_title "
+                    "FROM chunk_meta WHERE is_active = 1 AND (" + " OR ".join(where_parts) + ")",
+                    tuple(params),
+                )
+                for row in cursor.fetchall():
+                    neighbors_by_doc.setdefault(row["doc_id"], {})[row["chunk_index"]] = row
+            finally:
+                cursor.close()
+                conn.close()
+
+        # 第二遍：回填每个待拼接 chunk 的拼接文本（按 chunk_index 升序，含中心本身）
+        for slot, chunk, doc_id, center_idx in pending:
+            doc_neighbors = neighbors_by_doc.get(doc_id, {})
+            lo, hi = center_idx - window, center_idx + window
+            neighbor_rows = [doc_neighbors[i] for i in sorted(doc_neighbors) if lo <= i <= hi]
+            if neighbor_rows:
+                stitched_text = "\n".join(nb["chunk_text"] or "" for nb in neighbor_rows)
             else:
                 stitched_text = chunk.get("chunk_text", "")
-
-            # 构建扩展后的 chunk（保留原始 score 等字段）
             expanded_chunk = dict(chunk)
             expanded_chunk["chunk_text"] = stitched_text
             expanded_chunk["_stitched"] = True
             expanded_chunk["_stitch_window"] = window
-            expanded_chunk["_neighbor_count"] = len(neighbors)
-            expanded.append(expanded_chunk)
-
-        cursor.close()
-        conn.close()
+            expanded_chunk["_neighbor_count"] = len(neighbor_rows)
+            expanded[slot] = expanded_chunk
 
         logger.info(
-            "邻居扩展完成: %d chunks → %d expanded (去重 %d), window=±%d",
+            "邻居扩展完成: %d chunks → %d expanded (去重 %d), window=±%d, RDS 往返=%d",
             len(chunks), len(expanded), len(chunks) - len(expanded), window,
+            1 if pending else 0,
         )
         return expanded
 
