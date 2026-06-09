@@ -207,22 +207,28 @@ class TestVisualKnowledgeServing:
 
     @staticmethod
     def _mock_vk_db(monkeypatch, refs_by_id):
-        """Mock _get_db_conn so the visual_knowledge branch returns image_refs_json per chunk_id."""
+        """Mock _get_db_conn for expand_step_context's batched visual_knowledge pre-fetch
+        (SELECT chunk_id, image_refs_json ... WHERE chunk_id IN (...))."""
         import json as _json
 
         class _Cur:
             def __init__(self):
-                self._cid = None
+                self._params = ()
 
             def execute(self, sql, params=None):
-                self._cid = (params or [None])[0]
+                self._params = tuple(params or ())
 
             def fetchone(self):
-                refs = refs_by_id.get(self._cid)
-                return {"image_refs_json": _json.dumps(refs)} if refs is not None else None
+                return None
 
             def fetchall(self):
-                return []
+                # 批量化后按 chunk_id IN (...) 一次取齐，返回每个命中行
+                rows = []
+                for cid in self._params:
+                    refs = refs_by_id.get(cid)
+                    if refs is not None:
+                        rows.append({"chunk_id": cid, "image_refs_json": _json.dumps(refs)})
+                return rows
 
             def close(self):
                 pass

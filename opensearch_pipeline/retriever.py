@@ -645,6 +645,43 @@ def stitch_neighbor_chunks(
 # 4.5 Step Card 上下文扩展
 # ═══════════════════════════════════════════════════════════════
 
+def _normalize_image_refs(image_refs_json) -> List[Dict[str, Any]]:
+    """把 RDS image_refs_json 归一化为统一的 image_refs 列表（单一实现，消除三份漂移）。
+
+    保留 CLAUDE.md 标注的载荷契约键 oss_key/source_image/visual_summary/ocr_text/caption/
+    order/image_index，互相兜底（oss_key↔source_image）。下游 content_blocks_builder 读
+    ``oss_key or source_image`` 与 ``caption or visual_summary or ocr_text``，因此键越全越好；
+    原先三个分支各自只发部分键（两处丢 visual_summary、一处丢 ocr_text），导致 XLSX 绑定的
+    图注（存在 visual_summary）渲染不出来。
+
+    入参可为 JSON 字符串或已解析的 list。
+    """
+    raw: list = []
+    if image_refs_json:
+        if isinstance(image_refs_json, str):
+            try:
+                raw = json.loads(image_refs_json)
+            except (json.JSONDecodeError, TypeError):
+                raw = []
+        elif isinstance(image_refs_json, list):
+            raw = image_refs_json
+    out: List[Dict[str, Any]] = []
+    for idx, ref in enumerate(raw):
+        if not isinstance(ref, dict):
+            continue
+        oss_key = ref.get("oss_key") or ref.get("source_image", "")
+        out.append({
+            "oss_key": oss_key,
+            "source_image": ref.get("source_image") or oss_key,
+            "visual_summary": ref.get("visual_summary", ""),
+            "ocr_text": ref.get("ocr_text", ""),
+            "caption": ref.get("caption", ""),
+            "order": ref.get("order", idx),
+            "image_index": ref.get("image_index", idx),
+        })
+    return out
+
+
 def expand_step_context(
     chunks: List[Dict[str, Any]],
     query: str,
@@ -701,6 +738,61 @@ def expand_step_context(
         return chunks
 
     try:
+        # ── A2: 批量预取，消除 N+1（原先每个 step_card 2 次、每个 visual_knowledge 1 次往返）──
+        step_card_ids = [
+            cid for cid in (
+                (c.get("chunk_id") or c.get("id", ""))
+                for c in chunks if c.get("chunk_type") == "step_card"
+            ) if cid
+        ]
+        vk_ids = [
+            cid for cid in (
+                (c.get("chunk_id") or c.get("id", ""))
+                for c in chunks
+                if c.get("chunk_type") == "visual_knowledge" and not c.get("image_refs")
+            ) if cid
+        ]
+
+        # 1) step_card 元数据：parent_chunk_id / step_no / extra_json / image_refs_json
+        meta_by_id: Dict[str, Dict[str, Any]] = {}
+        if step_card_ids:
+            ph = ",".join(["%s"] * len(step_card_ids))
+            cursor.execute(
+                "SELECT chunk_id, parent_chunk_id, step_no, extra_json, image_refs_json "
+                f"FROM chunk_meta WHERE chunk_id IN ({ph})",
+                tuple(step_card_ids),
+            )
+            for row in cursor.fetchall():
+                meta_by_id[row["chunk_id"]] = row
+
+        # 2) 所有相关 parent 的兄弟步骤（一次取齐，按 parent 分组、组内按 step_no 升序）
+        parent_ids = sorted({
+            r["parent_chunk_id"] for r in meta_by_id.values() if r.get("parent_chunk_id")
+        })
+        siblings_by_parent: Dict[str, List[Dict[str, Any]]] = {}
+        if parent_ids:
+            ph = ",".join(["%s"] * len(parent_ids))
+            cursor.execute(
+                "SELECT chunk_id, chunk_text, step_no, section_title, "
+                "       extra_json, image_refs_json, parent_chunk_id "
+                f"FROM chunk_meta WHERE parent_chunk_id IN ({ph}) AND is_active = 1 "
+                "ORDER BY step_no",
+                tuple(parent_ids),
+            )
+            for row in cursor.fetchall():
+                siblings_by_parent.setdefault(row["parent_chunk_id"], []).append(row)
+
+        # 3) visual_knowledge 的 image_refs_json（一次取齐）
+        vk_refs_by_id: Dict[str, Any] = {}
+        if vk_ids:
+            ph = ",".join(["%s"] * len(vk_ids))
+            cursor.execute(
+                f"SELECT chunk_id, image_refs_json FROM chunk_meta WHERE chunk_id IN ({ph})",
+                tuple(vk_ids),
+            )
+            for row in cursor.fetchall():
+                vk_refs_by_id[row["chunk_id"]] = row.get("image_refs_json")
+
         expanded_all: List[Dict[str, Any]] = []
 
         for chunk in chunks:
@@ -711,31 +803,21 @@ def expand_step_context(
                 chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
                 original_score = chunk.get("score", 0)
 
-                # step_card 从 HA3 返回时不带 parent_chunk_id / step_no，需查 RDS
-                cursor.execute(
-                    "SELECT parent_chunk_id, step_no, extra_json, image_refs_json "
-                    "FROM chunk_meta WHERE chunk_id = %s",
-                    (chunk_id,),
-                )
-                meta_row = cursor.fetchone()
+                meta_row = meta_by_id.get(chunk_id)
                 if not meta_row or not meta_row.get("parent_chunk_id"):
-                    # RDS 无记录，原样保留
+                    # C2：无 procedure_parent（如 XLSX procedure_image_guide）。RDS 里已绑定的
+                    # image_refs（HA3 不返回）必须在此附上，否则该 step_card 的图片永远到不了答案。
+                    if meta_row and not chunk.get("image_refs"):
+                        refs = _normalize_image_refs(meta_row.get("image_refs_json"))
+                        if refs:
+                            chunk = dict(chunk)
+                            chunk["image_refs"] = refs
                     expanded_all.append(chunk)
                     continue
 
                 parent_id = meta_row["parent_chunk_id"]
                 hit_step_no = meta_row.get("step_no") or 0
-
-                # 查所有兄弟步骤
-                cursor.execute(
-                    "SELECT chunk_id, chunk_text, step_no, section_title, "
-                    "       extra_json, image_refs_json "
-                    "FROM chunk_meta "
-                    "WHERE parent_chunk_id = %s AND is_active = 1 "
-                    "ORDER BY step_no",
-                    (parent_id,),
-                )
-                siblings = cursor.fetchall()
+                siblings = siblings_by_parent.get(parent_id, [])
 
                 # 按意图筛选
                 if intent == "full_procedure":
@@ -767,25 +849,6 @@ def expand_step_context(
                         except (json.JSONDecodeError, TypeError):
                             pass
 
-                    # 解析 image_refs_json
-                    image_refs_raw: list = []
-                    if sib.get("image_refs_json"):
-                        try:
-                            image_refs_raw = json.loads(sib["image_refs_json"])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-
-                    # 标准化 image_refs 格式
-                    image_refs = []
-                    for idx, ref in enumerate(image_refs_raw):
-                        if isinstance(ref, dict):
-                            image_refs.append({
-                                "oss_key": ref.get("oss_key", ""),
-                                "ocr_text": ref.get("ocr_text", ""),
-                                "caption": ref.get("caption", ""),
-                                "order": ref.get("order", idx),
-                            })
-
                     expanded_chunk = dict(chunk)  # 继承原始 hit 的 metadata
                     expanded_chunk.update({
                         "chunk_id": sib["chunk_id"],
@@ -794,7 +857,7 @@ def expand_step_context(
                         "section_title": sib.get("section_title", ""),
                         "parent_chunk_id": parent_id,
                         "score": score,
-                        "image_refs": image_refs,
+                        "image_refs": _normalize_image_refs(sib.get("image_refs_json")),
                         "annotation_map": extra.get("annotation_map", {}),
                         "is_expanded": not is_hit,
                         "expanded_from": chunk_id if not is_hit else None,
@@ -854,23 +917,6 @@ def expand_step_context(
                         except (json.JSONDecodeError, TypeError):
                             pass
 
-                    image_refs_raw = []
-                    if child.get("image_refs_json"):
-                        try:
-                            image_refs_raw = json.loads(child["image_refs_json"])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-
-                    image_refs = []
-                    for idx, ref in enumerate(image_refs_raw):
-                        if isinstance(ref, dict):
-                            image_refs.append({
-                                "oss_key": ref.get("oss_key", ""),
-                                "ocr_text": ref.get("ocr_text", ""),
-                                "caption": ref.get("caption", ""),
-                                "order": ref.get("order", idx),
-                            })
-
                     expanded_chunk = dict(chunk)
                     expanded_chunk.update({
                         "chunk_id": child["chunk_id"],
@@ -879,7 +925,7 @@ def expand_step_context(
                         "section_title": child.get("section_title", ""),
                         "parent_chunk_id": parent_chunk_id,
                         "score": original_score * 0.8,
-                        "image_refs": image_refs,
+                        "image_refs": _normalize_image_refs(child.get("image_refs_json")),
                         "annotation_map": child_extra.get("annotation_map", {}),
                         "is_expanded": True,
                         "expanded_from": parent_chunk_id,
@@ -892,30 +938,12 @@ def expand_step_context(
                 enriched = dict(chunk)
                 chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
                 # HA3 只回 source_image（首图）；image_refs 不在索引里。仅当结果未带
-                # image_refs 时回 RDS 取全量，失败/无记录则保留 source_image 首图兜底。
+                # image_refs 时用预取的 RDS 全量补齐，失败/无记录则保留 source_image 首图兜底。
                 if chunk_id and not chunk.get("image_refs"):
-                    cursor.execute(
-                        "SELECT image_refs_json FROM chunk_meta WHERE chunk_id = %s",
-                        (chunk_id,),
-                    )
-                    vk_row = cursor.fetchone()
-                    refs_raw: list = []
-                    if vk_row and vk_row.get("image_refs_json"):
-                        try:
-                            refs_raw = json.loads(vk_row["image_refs_json"])
-                        except (json.JSONDecodeError, TypeError):
-                            refs_raw = []
-                    vk_refs = []
-                    for idx, ref in enumerate(refs_raw):
-                        if isinstance(ref, dict) and (ref.get("oss_key") or ref.get("source_image")):
-                            vk_refs.append({
-                                "oss_key": ref.get("oss_key") or ref.get("source_image", ""),
-                                "visual_summary": ref.get("visual_summary", "") or ref.get("ocr_text", ""),
-                                "caption": ref.get("caption", ""),
-                                "order": ref.get("order", idx),
-                            })
-                    if vk_refs:
-                        enriched["image_refs"] = vk_refs
+                    refs = _normalize_image_refs(vk_refs_by_id.get(chunk_id))
+                    refs = [r for r in refs if r["oss_key"]]  # 保留原 vk 语义：无图源的 ref 丢弃
+                    if refs:
+                        enriched["image_refs"] = refs
                 expanded_all.append(enriched)
 
             else:
