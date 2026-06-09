@@ -22,7 +22,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream
+from opensearch_pipeline.llm_generator import (
+    generate_answer,
+    generate_answer_stream,
+    parse_sse_data_frame,
+)
 from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
 from opensearch_pipeline.dingtalk_bot import router as dingtalk_router
 from opensearch_pipeline.dingtalk_identity import (
@@ -507,18 +511,13 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
                     yield event
 
                     # 收集完整回答 + 模型名（用于写历史 & 落库）
-                    if '"type": "chunk"' in event:
-                        try:
-                            d = json.loads(event[6:].strip())
-                            if d.get("type") == "chunk" and d.get("content"):
-                                collected_answer.append(d["content"])
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-                    elif '"type": "done"' in event:
-                        try:
-                            model_name = json.loads(event[6:].strip()).get("model")
-                        except (json.JSONDecodeError, KeyError):
-                            pass
+                    frame = parse_sse_data_frame(event)
+                    if frame is None:
+                        continue
+                    if frame.get("type") == "chunk" and frame.get("content"):
+                        collected_answer.append(frame["content"])
+                    elif frame.get("type") == "done":
+                        model_name = frame.get("model")
 
                 # 正常完成：图文模式下补发 content_blocks 帧（图片须在全文完成后定稿）
                 full_answer = "".join(collected_answer)

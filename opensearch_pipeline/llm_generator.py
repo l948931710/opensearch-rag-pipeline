@@ -278,6 +278,28 @@ def generate_answer(
 # SSE 流式生成
 # ═══════════════════════════════════════════════════════════════
 
+def parse_sse_data_frame(event: str) -> Optional[dict]:
+    """解析一行 SSE 帧 ``data: {json}`` → dict；非数据帧 / [DONE] / 解析失败返回 None。
+
+    生产者 generate_answer_stream 与消费者（api.py / dingtalk_bot.py）共用，替代原先三处
+    "子串嗅探 + json.loads(event[6:])" 的脆弱手写解析（答案正文里出现 `"type": "chunk"`
+    字面量也会被误判）。
+    """
+    if not event:
+        return None
+    s = event.strip()
+    if not s.startswith("data:"):
+        return None
+    payload = s[len("data:"):].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        d = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
 def generate_answer_stream(
     query: str,
     context_chunks: List[Dict[str, Any]],

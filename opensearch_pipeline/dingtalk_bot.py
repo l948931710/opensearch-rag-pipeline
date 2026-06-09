@@ -31,7 +31,9 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from opensearch_pipeline.retriever import retrieve_and_enrich
-from opensearch_pipeline.llm_generator import generate_answer, generate_answer_stream, _extract_sources
+from opensearch_pipeline.llm_generator import (
+    generate_answer, generate_answer_stream, parse_sse_data_frame, _extract_sources,
+)
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
@@ -387,15 +389,10 @@ def _stream_answer_to_card(
             temperature=0.1,
             pure_text=True,
         ):
-            if '"type": "chunk"' not in event:
+            frame = parse_sse_data_frame(event)
+            if not frame or frame.get("type") != "chunk" or not frame.get("content"):
                 continue
-            try:
-                d = json.loads(event[6:].strip())
-            except (json.JSONDecodeError, KeyError):
-                continue
-            if d.get("type") != "chunk" or not d.get("content"):
-                continue
-            collected.append(d["content"])
+            collected.append(frame["content"])
             _txt = _clean("".join(collected))
             with _plock:
                 _latest["text"] = _txt  # 后台线程按节流推送，主循环不阻塞
