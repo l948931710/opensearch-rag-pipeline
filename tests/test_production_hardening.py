@@ -312,3 +312,39 @@ def test_j_rollback_reads_result_ctx():
         "reading preempted_doc_versions from the original ctx is the dead-code bug"
     )
 
+
+# Test K: embedding-FAILED chunks must be excluded from the HA3 payload AND counted as
+# failures so the DAG aborts before deactivating old versions (no silent recall loss).
+def test_k_embedding_failed_chunks_excluded_and_block_deactivation():
+    from opensearch_pipeline.pipeline_nodes import (
+        node_build_opensearch_payload,
+        node_update_index_status,
+    )
+
+    def mk(cid, status, vec):
+        c = Chunk(chunk_id=cid, doc_id="docX", version_no=2, chunk_index=0,
+                  chunk_type="text_chunk", chunk_text=f"text-{cid}", token_count=1)
+        c.embedding_status = status
+        c.embedding_vector = [0.1, 0.2, 0.3] if vec else None
+        return c
+
+    ok = mk("c_ok", "DONE", True)
+    bad = mk("c_bad", "FAILED", False)
+    ctx = {"embedded_chunks": [ok, bad], "dag3_no_work": False}
+
+    node_build_opensearch_payload(ctx)
+
+    # The vectorless FAILED chunk is excluded from the payload and recorded separately.
+    assert ctx["embedding_failed_chunks"] == [bad]
+    pushed_ids = [c.chunk_id for b in ctx["bulk_batches"] for c in b["chunks"]]
+    assert pushed_ids == ["c_ok"], pushed_ids
+
+    # Even with the pushed chunk fully successful, update_index_status must raise (total_failed>0)
+    # so node_deactivate_old_chunks never runs for docX.
+    ctx["simulate_db"] = True
+    for b in ctx["bulk_batches"]:
+        b["result"] = {"failed": 0, "indexed": len(b["chunks"]), "took_ms": 1, "errors": False}
+    with pytest.raises(RuntimeError) as excinfo:
+        node_update_index_status(ctx)
+    assert "deactivat" in str(excinfo.value).lower()
+

@@ -3697,6 +3697,22 @@ def node_build_opensearch_payload(ctx: dict):
 
     import uuid
     chunks = ctx.get("embedded_chunks", [])
+
+    # ── 剔除 embedding 失败的 chunk ──
+    # 它们没有 dense/sparse 向量，若照常推到 HA3 会成为 kNN 完全不可见的"僵尸文档"，
+    # 却仍被当成已索引而触发旧版本停用 → 静默召回丢失且永不重试。这里从 payload 中排除，
+    # 单独记录到 ctx，由 node_update_index_status 计为失败（阻止停用 + 标记 FAILED 供下轮重试）。
+    embedding_failed_chunks = [
+        c for c in chunks if getattr(c, "embedding_status", None) == "FAILED"
+    ]
+    ctx["embedding_failed_chunks"] = embedding_failed_chunks
+    if embedding_failed_chunks:
+        chunks = [c for c in chunks if getattr(c, "embedding_status", None) != "FAILED"]
+        print(
+            f"    ⚠️ Excluding {len(embedding_failed_chunks)} embedding-FAILED chunk(s) from index "
+            f"payload (marked FAILED for retry; old versions will NOT be deactivated this run)"
+        )
+
     if not chunks:
         print("    ⚠️ No embedded chunks to build payload")
         ctx["bulk_payload"] = ""
@@ -4190,13 +4206,20 @@ def node_update_index_status(ctx: dict):
             if getattr(chunk, 'index_status', 'NOT_INDEXED') == 'FAILED':
                 failed_doc_versions.add((chunk.doc_id, chunk.version_no))
 
+    # embedding 失败的 chunk 未进入 batches（未推送），但必须计入失败：否则其所属 doc 会被
+    # 当作全部成功而停用旧版本，导致这些 chunk 永久丢失。计入 failed_doc_versions 阻止停用，
+    # 并把它们 chunk_meta 标记 FAILED，下轮 loader 会重新加载、重新 embedding、重新推送。
+    embedding_failed_chunks = ctx.get("embedding_failed_chunks", [])
+    for chunk in embedding_failed_chunks:
+        failed_doc_versions.add((chunk.doc_id, chunk.version_no))
+
     if simulate_db:
         print(f"    └─ [SIMULATED] Would update {chunks_count} chunk records in RDS:")
         print(f"       embedding_status=DONE, index_status=INDEXED")
         if failed_doc_versions:
             print(f"       [SIMULATED] Would update document_version status to 'FAILED' for: {list(failed_doc_versions)}")
-        
-        total_failed = sum(b.get("result", {}).get("failed", 0) for b in batches)
+
+        total_failed = sum(b.get("result", {}).get("failed", 0) for b in batches) + len(embedding_failed_chunks)
         if total_failed > 0:
             raise RuntimeError(
                 f"Index push had {total_failed} failures. "
@@ -4269,6 +4292,15 @@ def node_update_index_status(ctx: dict):
                             chunk.chunk_id
                         ))
                 
+                # 回写 embedding 失败的 chunk（不在任何 batch 中）为 FAILED：
+                # 下轮 loader 按 index_status IN ('NOT_INDEXED','FAILED') 重新加载并重试。
+                for chunk in embedding_failed_chunks:
+                    cursor.execute("""
+                        UPDATE chunk_meta
+                        SET embedding_status = 'FAILED', index_status = 'FAILED'
+                        WHERE chunk_id = %s
+                    """, (chunk.chunk_id,))
+
                 # If there are failed doc versions, update their document_version status to 'FAILED'
                 if failed_doc_versions:
                     for doc_id, ver in failed_doc_versions:
@@ -4289,10 +4321,12 @@ def node_update_index_status(ctx: dict):
             if conn:
                 conn.close()
 
-        total_failed = sum(b.get("result", {}).get("failed", 0) for b in batches)
+        total_failed = sum(b.get("result", {}).get("failed", 0) for b in batches) + len(embedding_failed_chunks)
         if total_failed > 0:
             raise RuntimeError(
-                f"Index push had {total_failed} failures. "
+                f"Index push had {total_failed} failures "
+                f"({len(embedding_failed_chunks)} embedding + "
+                f"{total_failed - len(embedding_failed_chunks)} push). "
                 f"Updated failed document versions to 'FAILED'. "
                 f"Aborting DAG execution to prevent deactivating older chunk versions."
             )
