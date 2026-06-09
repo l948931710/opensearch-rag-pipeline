@@ -409,7 +409,10 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
         
         failed_nodes = [nid for nid, node in dag.nodes.items() if node.status.name == "FAILED"]
         if failed_nodes:
-            preempted = ctx.get("preempted_doc_versions", set())
+            # ⚠️ 锁信息由节点写入 dag.run() 内部的 context 副本（dag_engine.DAG.run 第一行
+            # self.context = dict(initial_context)），必须从返回的 result_ctx 读取，
+            # 而不是传入的 ctx —— 后者永远是空集，回滚会变成死代码。
+            preempted = result_ctx.get("preempted_doc_versions", set())
             if preempted and not simulate:
                 print(f"[Orchestrator] DAG 3 failed. Rolling back PROCESSING locks for {len(preempted)} doc versions...")
                 try:
@@ -503,20 +506,22 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
     while True:
         iteration += 1
         if iteration > max_iters:
-            print(f"[Orchestrator] ⚠️ Drain-loop hit RAG_DRAIN_MAX_ITERS={max_iters}; stopping.", file=sys.stderr)
-            break
+            # 抛错而非 break：让 DataWorks 通过非零退出码识别异常，不能静默成功。
+            raise RuntimeError(
+                f"Stage {stage} drain-loop hit RAG_DRAIN_MAX_ITERS={max_iters} without draining; "
+                f"aborting so the run is marked failed."
+            )
         remaining = _count_pending_rows(stage)
         if remaining == 0:
             print(f"[Orchestrator] Stage {stage} drained: 0 pending rows after {iteration - 1} batch(es).")
             break
         if prev_remaining is not None and remaining >= prev_remaining:
-            print(
-                f"[Orchestrator] ⚠️ Stage {stage} made no progress "
-                f"(remaining={remaining} did not decrease from {prev_remaining}). "
-                f"Likely stuck/failing rows — stopping drain-loop; inspect FAILED rows.",
-                file=sys.stderr,
+            # 一整批跑完后剩余行数没有下降 = 有卡住/持续失败的行。必须抛错，让退出码非零，
+            # 否则 DataWorks 会把卡死的运行标记为成功（绿色），无人察觉语料停止入库。
+            raise RuntimeError(
+                f"Stage {stage} made no progress (remaining={remaining} did not decrease "
+                f"from {prev_remaining}). Stuck/failing rows — failing the run; inspect FAILED rows."
             )
-            break
         print(f"[Orchestrator] Stage {stage} drain batch #{iteration} — {remaining} rows pending...")
         prev_remaining = remaining
         run_stage(stage, bizdate, simulate)

@@ -267,3 +267,48 @@ def test_g_stale_recovery_failure_reset():
     assert "dv.index_status != 'PROCESSING'" in source, "Stage 3 query must filter out PROCESSING documents"
     assert "INTERVAL 2 HOUR" in source, "Stage 3 query must have 2-hour timeout lease for stale PROCESSING recovery"
 
+
+# Test H: node_acquire_index_lock must be able to TAKE OVER a stale PROCESSING lock.
+# Without this arm, the loader re-admits a >2h-stale PROCESSING doc but the lock claim
+# (NOT_INDEXED/FAILED/SUCCESS only) can never re-acquire it → permanent wedge.
+def test_h_stale_processing_lock_takeover():
+    import inspect
+    source = inspect.getsource(node_acquire_index_lock)
+    assert "index_status = 'PROCESSING'" in source, "lock claim must touch PROCESSING state"
+    assert "updated_at < NOW() - INTERVAL 2 HOUR" in source, (
+        "node_acquire_index_lock must take over stale (>2h) PROCESSING locks, "
+        "matching the orchestrator loader's admission window"
+    )
+
+
+# Test I: the drain-loop must RAISE (non-zero exit) on a stall, not silently break to success.
+def test_i_drain_loop_raises_on_no_progress():
+    import opensearch_pipeline.dataworks_orchestrator as orch
+
+    calls = {"run_stage": 0}
+
+    def fake_run_stage(stage, bizdate, simulate):
+        calls["run_stage"] += 1  # no-op: never drains the queue
+
+    # remaining stays > 0 and never decreases → no-progress guard
+    with patch.object(orch, "_count_pending_rows", lambda stage: 5), \
+         patch.object(orch, "run_stage", fake_run_stage):
+        with pytest.raises(RuntimeError) as excinfo:
+            orch.run_stage_drained(stage=3, bizdate="20260609", simulate=False)
+    assert "no progress" in str(excinfo.value).lower()
+
+
+# Test J: stage-3 rollback must read the DAG's returned context (result_ctx), not the
+# original ctx (which dag.run copies), or the PROCESSING-lock rollback is dead code.
+def test_j_rollback_reads_result_ctx():
+    import inspect
+    from opensearch_pipeline.dataworks_orchestrator import run_stage
+    source = inspect.getsource(run_stage)
+    # Exact assignment prefixes (avoids the result_ctx-contains-ctx substring overlap).
+    assert 'preempted = result_ctx.get("preempted_doc_versions"' in source, (
+        "rollback must read preempted_doc_versions from result_ctx (the dict dag.run mutates)"
+    )
+    assert 'preempted = ctx.get("preempted_doc_versions"' not in source, (
+        "reading preempted_doc_versions from the original ctx is the dead-code bug"
+    )
+

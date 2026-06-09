@@ -3062,6 +3062,18 @@ def node_acquire_index_lock(ctx: dict):
                             WHERE doc_id = %s AND version_no = %s
                               AND index_status = 'SUCCESS'
                         """, (doc_id, ver))
+                    # ── 接管失效锁：仍处于 PROCESSING 且 >2h 未更新，说明持锁的运行已崩溃。
+                    # 没有这一支，崩溃残留的 PROCESSING 文档永远无法被重新入队（loader 会反复
+                    # 加载其 chunk 再被过滤掉，整批永远排不空）。2h 阈值与 orchestrator 的
+                    # loader / _count_pending_rows 保持一致。
+                    if cursor.rowcount == 0:
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET index_status = 'PROCESSING'
+                            WHERE doc_id = %s AND version_no = %s
+                              AND index_status = 'PROCESSING'
+                              AND updated_at < NOW() - INTERVAL 2 HOUR
+                        """, (doc_id, ver))
                     if cursor.rowcount > 0:
                         valid_doc_versions.add((doc_id, ver))
                     else:
