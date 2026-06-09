@@ -334,6 +334,42 @@ def test_card_callback_acks_without_carddata():
     assert mock_mark.called        # 补充原因 标记待补充
 
 
+def test_card_callback_official_feedback_template():
+    """钉钉【官方赞踩模版】回调：用 feedback=good/bad（不是 action）、不传 message_id（用 outTrackId 兜底），
+    踩+提交带 comment。验证：good→upvote；bad+comment→downvote/reason=other/comment 落库；均 ACK-only。"""
+    import asyncio
+    import json as _json
+    from opensearch_pipeline import dingtalk_bot
+
+    def _req(params, mid="m-official"):
+        body = {"outTrackId": mid, "userId": "u9",
+                "content": _json.dumps({"cardPrivateData": {"params": params}})}
+
+        class _R:
+            async def json(self):
+                return body
+
+        return _R()
+
+    with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True) as mock_hf:
+        # 👍：feedback=good（无 action / 无 message_id）→ upvote，message_id 用 outTrackId
+        resp = asyncio.run(dingtalk_bot.card_callback(
+            _req({"feedback": "good", "content": "答案…", "query": "怎么报销"})))
+        assert "cardData" not in resp
+        _, kw = mock_hf.call_args
+        assert kw["action"] == "upvote" and kw["message_id"] == "m-official"
+
+        # 👎+提交：feedback=bad + comment → downvote / reason=other / comment 落库
+        mock_hf.reset_mock()
+        resp = asyncio.run(dingtalk_bot.card_callback(
+            _req({"feedback": "bad", "comment": "答非所问", "content": "答案…", "query": "怎么报销"})))
+        assert "cardData" not in resp
+        _, kw = mock_hf.call_args
+        assert kw["action"] == "downvote"
+        assert kw["reason"] == "other"
+        assert kw["comment"] == "答非所问"
+
+
 def test_take_awaiting_comment_hit_and_miss():
     """补充原因回收：命中 AWAITING_COMMENT 行 → 写 comment 返回 True；无命中/空输入 → False。"""
     from opensearch_pipeline import feedback_handler

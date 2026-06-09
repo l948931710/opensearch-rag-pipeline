@@ -37,6 +37,7 @@ from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_feedback_status,
+    update_card_data,
     create_streaming_card,
     streaming_update_card,
     send_text_to_user,
@@ -546,6 +547,18 @@ def _stream_answer_to_card(
             message_id, _final,
             key=stream_key, is_full=True, is_finalize=True,
         )
+        # 可选「白屏保险」：把定稿全文也写进 cardData[stream_key]，让【完成态卡片在 cardData 里自洽】。
+        # 背景：自定义「回传请求」按钮(👍/👎/转人工)被点击时，钉钉客户端可能从 cardData 重渲染卡片；
+        # 而 create 时 stream_key 置空、流式正文只在「流式通道」→ 重渲染读 cardData 就是空 → 白屏。
+        # 本模板(原生2)完成态正文绑定的恰是 stream_key(content)，故把全文持久化进 cardData 后，
+        # 重渲染即自洽、不白屏。默认【关闭】：保持"纯流式定稿、不调 update_card_data"的现状，避免对
+        # 原生反馈/无回调模板回归（历史 A/B：盲调 update_card_data 会白屏）。仅当改用自定义回传按钮
+        # 且【真机实测点击会白屏】时，置环境变量 DINGTALK_FINALIZE_PERSIST_CONTENT=true 开启。
+        if os.environ.get("DINGTALK_FINALIZE_PERSIST_CONTENT", "").strip().lower() in ("1", "true", "yes"):
+            try:
+                update_card_data(message_id, {stream_key: _final, "is_answer_done": "true"})
+            except Exception as _e:
+                logger.warning("定稿持久化 content 到 cardData 失败(忽略，不影响流式正文): %s", _e)
     except Exception as e:
         _stop_pusher()  # 异常路径同样先停推流线程，再写错误定稿帧（避免推流帧覆盖）
         trace_id = uuid.uuid4().hex[:8]
@@ -931,6 +944,14 @@ async def card_callback(request: Request):
     action = params.get("action", "")
     message_id = params.get("message_id", "") or out_track_id
     reason = params.get("reason")  # ActionSheet 菜单传入的踩原因
+    comment = params.get("comment")  # 官方赞踩模版的"踩→内联输入→提交"带的自由文本原因
+
+    # 兼容钉钉【官方赞踩模版】：它用 feedback=good/bad（不是 action），且不传 message_id（用 outTrackId 兜底）。
+    # 该模版的"踩"用本地态 setLocalState 弹【内联输入框】（纯客户端、不发回调 → 不白屏！），只有"提交"
+    # 才 request 回调，带 feedback=bad + comment。"赞"则直接 request 带 feedback=good。
+    feedback = params.get("feedback")
+    if not action and feedback:
+        action = "upvote" if feedback in ("good", "like", "up") else "downvote"
 
     user_name = body.get("userName") or None
 
@@ -970,10 +991,13 @@ async def card_callback(request: Request):
     _DOWN = ("downvote", "dislike", "thumbs_down", "bad", "unhelpful")
     if action in _UP or action in _DOWN:
         norm = "upvote" if action in _UP else "downvote"
+        # 官方赞踩模版"踩+提交"带 comment（自由文本原因）；有 comment 但没显式 reason 时记为 other。
+        _reason = reason or ("other" if (norm == "downvote" and comment) else None)
         try:
             handle_feedback(message_id=message_id, user_id=user_id, user_name=user_name,
-                            action=norm, reason=reason)
-            print(f"[CALLBACK DEBUG] 赞踩落库: message_id={message_id}, action={action}->{norm}, reason={reason}", flush=True)
+                            action=norm, reason=_reason, comment=comment)
+            print(f"[CALLBACK DEBUG] 赞踩落库: message_id={message_id}, action={action}->{norm}, "
+                  f"reason={_reason}, has_comment={bool(comment)}", flush=True)
         except Exception as e:
             logger.error("赞踩落库失败: %s", e, exc_info=True)
         return _ACK
