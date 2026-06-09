@@ -568,11 +568,8 @@ def node_extract_text_with_ocr(ctx: dict):
                 for asset in result.assets:
                     local_img = asset.get("local_path", "")
                     if asset.get("status") == "ROUTE_TO_VECTOR" and local_img and os.path.exists(local_img):
-                        dept = "unknown"
-                        if hasattr(result, 'source_key') and result.source_key:
-                            parts = result.source_key.split("/")
-                            if len(parts) > 1:
-                                dept = parts[1]
+                        # 原先此处缺 startswith("raw/") guard（漂移点），统一走 _dept_from_raw_key
+                        dept = _dept_from_raw_key(getattr(result, "source_key", "") or "", "unknown")
                         oss_key = f"processing/assets/{dept}/{result.doc_id}/v{result.version_no}/{os.path.basename(local_img)}"
                         try:
                             bucket_upload.put_object_from_file(oss_key, local_img)
@@ -758,6 +755,20 @@ def node_build_canonical(ctx: dict):
 # （retriever 按 permission_level="dept_internal" AND owner_dept=<部门> 放行本部门文档；
 #  写入 'internal' 的 chunk 两个分支都不命中，会对所有人不可见）。
 _PERMISSION_ALIAS = {"internal": "dept_internal"}
+
+
+def _dept_from_raw_key(source_key: str, default: str = "unknown") -> str:
+    """从 OSS raw/ key 解析部门代码：``raw/<dept>/...`` → ``<dept>``，否则回退 default。
+
+    owner_dept 安全相关（驱动 HA3 dept_internal 权限过滤），只认 raw/ 前缀，杜绝把
+    processing/、s3:// 等非 raw 路径的第二段误当部门——消除原先 8 处拷贝里 line 573
+    缺 startswith("raw/") guard 的漂移。
+    """
+    if source_key and source_key.startswith("raw/"):
+        parts = source_key.split("/")
+        if len(parts) > 1:
+            return parts[1]
+    return default
 
 
 def resolve_permission_level(doc: dict, ctx: dict) -> str:
@@ -1605,12 +1616,8 @@ def _enrich_existing_image_refs(blocks: list, assets: list, doc: dict) -> list:
         if idx is not None:
             asset_map[idx] = asset
 
-    dept_code = doc.get("owner_dept", "unknown")
     source_key = doc.get("source_key", "")
-    if source_key.startswith("raw/"):
-        parts = source_key.split("/")
-        if len(parts) > 1:
-            dept_code = parts[1]
+    dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
 
     enriched = []
     for block in blocks:
@@ -1710,12 +1717,8 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
     from opensearch_pipeline.chunker import DocumentChunker
 
     # ── 构建有效图片列表 ──
-    dept_code = doc.get("owner_dept", "unknown")
     source_key = doc.get("source_key", "")
-    if source_key.startswith("raw/"):
-        parts = source_key.split("/")
-        if len(parts) > 1:
-            dept_code = parts[1]
+    dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
 
     valid_assets = []
     for asset in assets:
@@ -2328,12 +2331,8 @@ def node_chunk_documents(ctx: dict):
         if xlsx_layout_type in ("product_spec_instruction", "procedure_image_guide") and global_split_mode == "dynamic":
             assets = doc.get("assets", [])
             if assets:
-                dept_code = doc.get("owner_dept", "unknown")
                 source_key = doc.get("source_key", "")
-                if source_key.startswith("raw/"):
-                    parts = source_key.split("/")
-                    if len(parts) > 1:
-                        dept_code = parts[1]
+                dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
                 version = doc["version_no"]
                 d_id = doc["doc_id"]
 
@@ -2478,12 +2477,8 @@ def node_chunk_documents(ctx: dict):
         if m_mode == "slide" and global_split_mode == "dynamic":
             assets = doc.get("assets", [])
             if assets:
-                dept_code = doc.get("owner_dept", "unknown")
                 source_key = doc.get("source_key", "")
-                if source_key.startswith("raw/"):
-                    _parts = source_key.split("/")
-                    if len(_parts) > 1:
-                        dept_code = _parts[1]
+                dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
                 version = doc["version_no"]
                 d_id = doc["doc_id"]
                 slide_imgs = {}
@@ -2556,12 +2551,8 @@ def node_chunk_documents(ctx: dict):
         if xlsx_layout_type == "equipment_cleaning_standard" and global_split_mode == "dynamic":
             assets = doc.get("assets", [])
             if assets:
-                dept_code = doc.get("owner_dept", "unknown")
                 source_key = doc.get("source_key", "")
-                if source_key.startswith("raw/"):
-                    _p = source_key.split("/")
-                    if len(_p) > 1:
-                        dept_code = _p[1]
+                dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
                 version = doc["version_no"]
                 d_id = doc["doc_id"]
                 for a in assets:
@@ -2601,12 +2592,8 @@ def node_chunk_documents(ctx: dict):
             current_chunk_count = len(chunks)
             assets = doc.get("assets", [])
             if assets:
-                dept_code = doc.get("owner_dept", "unknown")
                 source_key = doc.get("source_key", "")
-                if source_key.startswith("raw/"):
-                    parts = source_key.split("/")
-                    if len(parts) > 1:
-                        dept_code = parts[1]
+                dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
 
                 for asset in assets:
                     if asset.get("status") == "ROUTE_TO_VECTOR":
