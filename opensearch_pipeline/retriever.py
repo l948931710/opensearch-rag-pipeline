@@ -214,6 +214,31 @@ def _sanitize_ha3_filter_value(value: str) -> str:
     return re.sub(r'[^\w\-\u4e00-\u9fff]', '', value)
 
 
+# HA3 查询统一返回字段（search_chunks / cosurface_doc_images / 文档展开共用，避免漂移）
+_DEFAULT_OUTPUT_FIELDS = [
+    "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
+    "category_l1", "chunk_index", "page_num", "kb_type",
+    "permission_level", "owner_dept", "chunk_type",
+    "source_image", "visual_summary",
+]
+
+
+def _build_permission_filter(user_dept: Optional[str]) -> str:
+    """构建 HA3 权限过滤表达式（安全边界，单一实现）。
+
+    放行 public；有部门时额外放行该部门的 dept_internal。部门值经 _sanitize_ha3_filter_value
+    白名单净化，防止 filter 注入。多个调用点（search_chunks / cosurface_doc_images）共用，
+    确保权限规则只有一处、不会某处改了另一处漏改而越权或漏召回。
+    """
+    if user_dept:
+        safe_dept = _sanitize_ha3_filter_value(user_dept)
+        return (
+            'permission_level="public"'
+            ' OR (permission_level="dept_internal" AND owner_dept="' + safe_dept + '")'
+        )
+    return 'permission_level="public"'
+
+
 def search_chunks(
     query: str,
     *,
@@ -261,22 +286,10 @@ def search_chunks(
             values=sparse_val,
         )
 
-    _output_fields = output_fields or [
-        "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
-        "category_l1", "chunk_index", "page_num", "kb_type",
-        "permission_level", "owner_dept", "chunk_type",
-        "source_image", "visual_summary",
-    ]
+    _output_fields = output_fields or list(_DEFAULT_OUTPUT_FIELDS)
 
-    # ── 权限过滤 ──
-    if user_dept:
-        safe_dept = _sanitize_ha3_filter_value(user_dept)
-        filter_expr = (
-            'permission_level="public"'
-            ' OR (permission_level="dept_internal" AND owner_dept="' + safe_dept + '")'
-        )
-    else:
-        filter_expr = 'permission_level="public"'
+    # ── 权限过滤（安全边界，统一实现）──
+    filter_expr = _build_permission_filter(user_dept)
 
     logger.info("Permission filter: user_dept=%s, filter=%s", user_dept, filter_expr)
 
@@ -460,12 +473,7 @@ def expand_top_document(
 
         from alibabacloud_ha3engine_vector.models import SearchRequest, TextQuery, RankQuery
 
-        _output_fields = [
-            "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
-            "category_l1", "chunk_index", "page_num", "kb_type",
-            "permission_level", "owner_dept", "chunk_type",
-            "source_image", "visual_summary",
-        ]
+        _output_fields = list(_DEFAULT_OUTPUT_FIELDS)
 
         escaped_doc_id = _escape_ha3_query(top_doc_id)
         text_query = TextQuery(
@@ -1065,22 +1073,11 @@ def cosurface_doc_images(
         doc_clause = " OR ".join(
             f'doc_id="{_sanitize_ha3_filter_value(d)}"' for d in doc_ids
         )
-        if user_dept:
-            safe_dept = _sanitize_ha3_filter_value(user_dept)
-            perm = (
-                'permission_level="public"'
-                ' OR (permission_level="dept_internal" AND owner_dept="' + safe_dept + '")'
-            )
-        else:
-            perm = 'permission_level="public"'
+        # 权限子句与 search_chunks 共用同一实现（安全边界单一来源）
+        perm = _build_permission_filter(user_dept)
         filter_expr = f'chunk_type="image" AND ({doc_clause}) AND ({perm})'
 
-        _output_fields = [
-            "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
-            "category_l1", "chunk_index", "page_num", "kb_type",
-            "permission_level", "owner_dept", "chunk_type",
-            "source_image", "visual_summary",
-        ]
+        _output_fields = list(_DEFAULT_OUTPUT_FIELDS)
         req = QueryRequest(
             table_name=cfg.table_name,
             vector=dense,

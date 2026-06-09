@@ -715,3 +715,28 @@ class TestHA3FilterInjectionAPIBoundary:
 
         req = AskRequest(question="测试")
         assert req.user_dept is None
+
+
+class TestSharedPermissionFilter:
+    """_build_permission_filter / _DEFAULT_OUTPUT_FIELDS 抽取后必须与原内联实现逐字一致。"""
+
+    def test_filter_exact_strings(self):
+        from opensearch_pipeline.retriever import _build_permission_filter
+        assert _build_permission_filter(None) == 'permission_level="public"'
+        assert _build_permission_filter("") == 'permission_level="public"'
+        assert _build_permission_filter("营销中心") == (
+            'permission_level="public"'
+            ' OR (permission_level="dept_internal" AND owner_dept="营销中心")'
+        )
+
+    def test_filter_neutralizes_injection(self):
+        from opensearch_pipeline.retriever import _build_permission_filter
+        f = _build_permission_filter('x" OR owner_dept="y')
+        assert f.count(" OR ") == 1   # 仅合法权限 OR，注入的 OR 被净化
+        assert '"y' not in f
+
+    def test_output_fields_canonical_set(self):
+        from opensearch_pipeline.retriever import _DEFAULT_OUTPUT_FIELDS
+        assert _DEFAULT_OUTPUT_FIELDS[:3] == ["id", "chunk_id", "doc_id"]
+        assert "permission_level" in _DEFAULT_OUTPUT_FIELDS and "owner_dept" in _DEFAULT_OUTPUT_FIELDS
+        assert len(_DEFAULT_OUTPUT_FIELDS) == 15
