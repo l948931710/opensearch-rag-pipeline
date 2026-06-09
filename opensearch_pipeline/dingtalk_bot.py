@@ -253,23 +253,13 @@ def _format_answer_markdown(
     lines.append(answer)
     lines.append("")
 
-    # 参考来源
+    # 参考来源（与卡片/回调同一格式化实现；bullet 版式）
     if sources:
         lines.append("---")
         lines.append("**📚 参考来源**")
-        seen_titles = set()
-        for src in sources:
-            title = src.get("title", "未知文档")
-            if title in seen_titles:
-                continue
-            seen_titles.add(title)
-            section = src.get("section", "")
-            score = src.get("score", 0)
-            source_line = f"- {title}"
-            if section:
-                source_line += f" > {section}"
-            source_line += f"（相关度 {score:.2f}）"
-            lines.append(source_line)
+        _src = _format_sources_text(sources, style="bullet")
+        if _src:
+            lines.append(_src)
         lines.append("")
 
     # 相关图片（Markdown 降级时追加到末尾）
@@ -931,19 +921,16 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                     card_param_map["title"] = (row[0] or "")[:50]
                     _answer = row[1] or ""
                     card_param_map["answer"] = _answer
-                    # 重建参考来源行（cited_docs_json → "1. 标题"）
-                    _src_lines = []
+                    # 重建参考来源（cited_docs_json → 文本，与卡片/Markdown 同一格式化实现：
+                    # 去重 + 有 section/score 时附加，修复原回调丢失 section/score 的问题）
+                    _src_text = ""
                     sources_json = row[2]
                     if sources_json:
                         try:
                             sources_list = json.loads(sources_json) if isinstance(sources_json, str) else sources_json
-                            for i, s in enumerate(sources_list, 1):
-                                if isinstance(s, dict):
-                                    _src_lines.append(f"{i}. {s.get('title', s.get('doc_name', '未知文档'))}")
-                                else:
-                                    _src_lines.append(f"{i}. {s}")
+                            _src_text = _format_sources_text(sources_list, style="numbered")
                         except Exception:
-                            _src_lines = []
+                            _src_text = ""
                     model = row[3] or "unknown"
                     latency = row[4] or 0
                     ret_ms = row[5] or 0       # 检索阶段耗时
@@ -957,8 +944,8 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                     )
                     if _streaming:
                         _parts = [_answer]
-                        if _src_lines:
-                            _parts.append("📚 **参考来源**\n" + "\n".join(_src_lines))
+                        if _src_text:
+                            _parts.append("📚 **参考来源**\n" + _src_text)
                         _parts.append(f"> 模型: {model} ｜ 检索 {ret_ms / 1000:.1f}s · 生成 {gen_ms / 1000:.1f}s")
                         card_param_map["content"] = "\n\n".join(_parts)
                         card_param_map["sources_text"] = ""
@@ -967,7 +954,6 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                     else:
                         # 成品卡正文绑 answer；content 兜底写回避免被回调清空
                         card_param_map["content"] = _answer
-                        _src_text = "\n".join(_src_lines)
                         card_param_map["sources_text"] = _src_text
                         card_param_map["sources"] = _src_text
                         card_param_map["meta"] = f"模型: {model} | 耗时: {latency / 1000:.1f}s"

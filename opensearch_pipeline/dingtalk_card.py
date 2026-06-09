@@ -151,20 +151,28 @@ def register_card_callback(*, force_update: Optional[bool] = None) -> bool:
 # 互动卡片发送
 # ═══════════════════════════════════════════════════════════════
 
-def _format_sources_text(sources: List[Dict[str, Any]]) -> str:
-    """将 sources 列表格式化为纯文本。"""
+def _format_sources_text(sources: List[Dict[str, Any]], *, style: str = "numbered") -> str:
+    """将 sources 列表格式化为纯文本来源行（钉钉卡片 / Markdown 回答 / 回调重建共用）。
+
+    style="numbered" → "1. 标题"（编号取原列表位置，去重后可有间隔，沿用原卡片行为）；
+    style="bullet"   → "- 标题"。按标题去重；有 section/score 时附加。
+    兼容 dict（title 缺失回退 doc_name）与非 dict 元素（直接 str）。
+    """
     if not sources:
         return ""
     lines = []
     seen_titles = set()
     for i, src in enumerate(sources, 1):
-        title = src.get("title", "未知文档")
+        if isinstance(src, dict):
+            title = src.get("title") or src.get("doc_name") or "未知文档"
+            section = src.get("section", "")
+            score = src.get("score")
+        else:
+            title, section, score = str(src), "", None
         if title in seen_titles:
             continue
         seen_titles.add(title)
-        section = src.get("section", "")
-        score = src.get("score", 0)
-        line = f"{i}. {title}"
+        line = (f"{i}. {title}" if style == "numbered" else f"- {title}")
         if section:
             line += f" > {section}"
         if isinstance(score, (int, float)):
