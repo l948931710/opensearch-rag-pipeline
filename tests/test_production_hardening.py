@@ -219,6 +219,7 @@ def test_f_deactivate_failure_marks_failed(mock_get_client, mock_get_db_conn):
     ctx = {
         "valid_chunks": [chunk],
         "simulate_db": False,
+        "simulate_opensearch": False,  # 显式关掉，避免环境 RAG_SIMULATE=true 时走 SIMULATED 分支
         "dag3_no_work": False
     }
 

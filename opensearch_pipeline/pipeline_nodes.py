@@ -3158,6 +3158,9 @@ def node_deactivate_old_chunks(ctx: dict):
     # Real RDS & OpenSearch deactivation
     if current_versions:
         # 1. First, retrieve the chunk IDs of all older versions from RDS (if DB is not simulated)
+        # ⚠️ HA3 文档主键是 chunk_meta.id（INT64 自增，见 to_ha3_doc 的 rds_id），
+        # 不是字符串 chunk_id。删除必须用同一个 id，否则删除永远匹配不到已推送的文档，
+        # 旧版本 chunk 会一直留在线上索引（与 spot_checker._delete_chunks_from_index 一致）。
         old_chunk_ids_map = {}
         if not simulate_db:
             conn = None
@@ -3166,19 +3169,20 @@ def node_deactivate_old_chunks(ctx: dict):
                 with conn.cursor() as cursor:
                     for doc_id, ver in current_versions.items():
                         cursor.execute(
-                            "SELECT chunk_id FROM chunk_meta WHERE doc_id = %s AND version_no < %s AND is_active = 1",
+                            "SELECT id FROM chunk_meta WHERE doc_id = %s AND version_no < %s AND is_active = 1",
                             (doc_id, ver)
                         )
                         rows = cursor.fetchall()
                         old_chunk_ids_map[doc_id] = [r[0] for r in rows]
             except Exception as e:
-                print(f"    ⚠️ Failed to query old chunk_ids from RDS: {e}")
+                print(f"    ⚠️ Failed to query old chunk ids from RDS: {e}")
                 raise RuntimeError(f"Database query failure in pre-deactivation phase: {e}")
             finally:
                 if conn:
                     conn.close()
         else:
             # If DB is simulated, retrieve from the deactivated list if possible
+            # （模拟路径只用于打印/MOCK，不会真正下发删除；这里的字符串 chunk_id 仅作展示）
             for doc_id, ver in current_versions.items():
                 old_chunk_ids_map[doc_id] = [d["chunk_id"] for d in deactivated if d["doc_id"] == doc_id]
 
