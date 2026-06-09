@@ -112,7 +112,12 @@ Page({
     ensureLogin()
       .then(() => ask(question, this.data.sessionId))
       .then((resp) => {
-        const blocks = (resp && resp.blocks) || [];
+        let blocks = (resp && resp.blocks) || [];
+        // 纯文字答案/未引用图片时后端约定返回 blocks=[]，需降级渲染 answer 文本，
+        // 否则气泡为空白（NO_RESULT 道歉语与 RAG_PURE_TEXT 模式下 100% 触发）。
+        if (!blocks.length && resp && resp.answer) {
+          blocks = [{ type: 'text', format: 'plain', text: resp.answer }];
+        }
         this._updateMessage(aiId, {
           loading: false,
           error: false,
