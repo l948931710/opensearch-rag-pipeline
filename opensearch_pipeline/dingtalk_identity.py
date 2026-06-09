@@ -48,11 +48,13 @@ def _resolve_user_dept(staff_id: str) -> Optional[str]:
 
         conn = _get_db_conn()
         try:
-            # 1. 先查本地缓存
+            # 1. 先查本地缓存（按最新行取值：历史上 user_id 无唯一键可能产生重复行，
+            #    见 schema/003_user_role_unique.sql；显式排序保证确定性）
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT dept_code FROM fuling_knowledge.user_role "
-                    "WHERE user_id = %s AND is_active = 1 LIMIT 1",
+                    "WHERE user_id = %s AND is_active = 1 "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (staff_id,),
                 )
                 row = cur.fetchone()
@@ -260,7 +262,8 @@ def _resolve_user_identity(userid: str) -> Dict[str, Optional[str]]:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT user_name FROM fuling_knowledge.user_role WHERE user_id=%s LIMIT 1",
+                    "SELECT user_name FROM fuling_knowledge.user_role WHERE user_id=%s "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (userid,),
                 )
                 row = cur.fetchone()

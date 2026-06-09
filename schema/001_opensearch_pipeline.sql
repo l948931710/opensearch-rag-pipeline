@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS user_role (
     is_active   TINYINT(1) DEFAULT 1,
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_user_id (user_id)
+    -- user_id 必须唯一：dept_code 驱动 HA3 dept_internal 权限过滤，重复行会导致部门解析不确定；
+    -- 代码里的 INSERT ... ON DUPLICATE KEY UPDATE 也依赖此键去重（存量库见 003_user_role_unique.sql）
+    UNIQUE KEY uk_user_id (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS document_acl_rule (
