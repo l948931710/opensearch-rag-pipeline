@@ -18,7 +18,7 @@ import pytest
 class TestRetriever:
     """测试检索模块。"""
 
-    @patch("opensearch_pipeline.retriever.requests.post")
+    @patch("opensearch_pipeline.embedding_client.requests.post")
     @patch("opensearch_pipeline.retriever.get_config")
     def test_get_query_embedding_returns_dense_and_sparse(self, mock_config, mock_post):
         """验证 get_query_embedding 正确解析 native API 响应。"""
@@ -53,7 +53,7 @@ class TestRetriever:
         assert sparse_idx == [50, 100, 200]  # sorted by index
         assert sparse_val == [2.1, 1.5, 0.8]
 
-    @patch("opensearch_pipeline.retriever.requests.post")
+    @patch("opensearch_pipeline.embedding_client.requests.post")
     @patch("opensearch_pipeline.retriever.get_config")
     def test_get_query_embedding_no_sparse(self, mock_config, mock_post):
         """验证没有 sparse 时返回空列表。"""
@@ -79,7 +79,7 @@ class TestRetriever:
         assert sparse_idx == []
         assert sparse_val == []
 
-    @patch("opensearch_pipeline.retriever.requests.post")
+    @patch("opensearch_pipeline.embedding_client.requests.post")
     @patch("opensearch_pipeline.retriever.get_config")
     def test_get_query_embedding_raises_without_api_key(self, mock_config, mock_post):
         """API Key 未配置时应抛出错误。"""

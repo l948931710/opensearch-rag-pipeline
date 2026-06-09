@@ -84,15 +84,18 @@ def test_fail_open_on_error(mock_emb):
     assert out == chunks               # error swallowed, original returned
 
 
+@patch("opensearch_pipeline.retriever.get_query_embedding", return_value=([0.1] * 8, [], []))
 @patch("opensearch_pipeline.retriever.cosurface_doc_images", side_effect=lambda q, c, **k: c)
 @patch("opensearch_pipeline.retriever.expand_step_context", side_effect=lambda c, q: c)
 @patch("opensearch_pipeline.retriever.stitch_neighbor_chunks", side_effect=lambda c, window=1: c)
 @patch("opensearch_pipeline.retriever.search_chunks")
-def test_retrieve_and_enrich_opt_in_gating(mock_search, mock_stitch, mock_expand, mock_cosurf):
+def test_retrieve_and_enrich_opt_in_gating(mock_search, mock_stitch, mock_expand, mock_cosurf, mock_emb):
     mock_search.return_value = _chunks()
     # default (False) → cosurface NOT called
     retriever.retrieve_and_enrich("q")
     mock_cosurf.assert_not_called()
-    # opt-in True → cosurface called
+    # opt-in True → cosurface called, and the embedding is computed once + threaded through
     retriever.retrieve_and_enrich("q", cosurface_images=True)
     assert mock_cosurf.called
+    # search_chunks receives the pre-computed embedding (no re-embed inside)
+    assert mock_search.call_args.kwargs.get("query_embedding") is not None

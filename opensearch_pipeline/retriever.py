@@ -10,8 +10,6 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-
 from opensearch_pipeline.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -84,51 +82,25 @@ def get_query_embedding(
     """
     config = get_config()
 
-    _api_key = api_key or config.embedding.api_key
-    _model = model or config.embedding.model
-    _dim = dimension or config.embedding.dimension
+    # 与入库侧共用加固实现（URL 去重 + 429/5xx 重试 + 退避）。查询侧 sparse_fallback=False：
+    # 空 sparse 表示该查询不参与 sparse 匹配，比塞入 [0]/[0.001] 假项更准确。
+    from opensearch_pipeline.embedding_client import embed_texts_native
 
-    if not _api_key:
-        raise RuntimeError("DashScope API Key 未配置，无法生成 embedding")
-
-    # DashScope native API endpoint（唯一支持 sparse 的端点）
-    base_url = config.embedding.api_base_url.rstrip("/")
-    url = f"{base_url}/api/v1/services/embeddings/text-embedding/text-embedding"
-
-    # 如果 base_url 已经包含 /api/v1，则不再重复拼接
-    if "/api/v1" in base_url:
-        url = f"{base_url}/services/embeddings/text-embedding/text-embedding"
-
-    resp = requests.post(
-        url,
-        json={
-            "model": _model,
-            "input": {"texts": [query]},
-            "parameters": {
-                "dimension": _dim,
-                "output_type": "dense&sparse",
-            },
-        },
-        headers={
-            "Authorization": f"Bearer {_api_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=30,
+    results = embed_texts_native(
+        [query],
+        api_key=api_key or config.embedding.api_key,
+        model=model or config.embedding.model,
+        dimension=dimension or config.embedding.dimension,
+        api_base_url=config.embedding.api_base_url,
+        max_retries=getattr(config.embedding, "max_retries", 2),
+        request_timeout=30,
+        sparse_fallback=False,
+        label="query embedding",
     )
-    resp.raise_for_status()
-    result = resp.json()
-
-    embedding_data = result["output"]["embeddings"][0]
-    dense = embedding_data["embedding"]
-
-    # native API 的 sparse_embedding 是 list[dict]，每个 dict 含 index, token, value
-    sparse_list = embedding_data.get("sparse_embedding", [])
-    sparse_indices: List[int] = []
-    sparse_values: List[float] = []
-    if sparse_list:
-        sorted_sparse = sorted(sparse_list, key=lambda x: x["index"])
-        sparse_indices = [s["index"] for s in sorted_sparse]
-        sparse_values = [float(s["value"]) for s in sorted_sparse]
+    r = results[0] if results else None
+    if r is None:
+        raise RuntimeError("DashScope 未返回 query embedding")
+    dense, sparse_indices, sparse_values = r
 
     logger.debug(
         "Embedding generated: dense=%d dims, sparse=%d nonzero",
@@ -250,6 +222,7 @@ def search_chunks(
     max_distance: float = 0.0,
     output_fields: Optional[List[str]] = None,
     user_dept: Optional[str] = None,
+    query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     端到端检索：query → embedding → HA3 search → 标准化结果。
@@ -274,8 +247,8 @@ def search_chunks(
     config = get_config()
     cfg = config.alibaba_vector
 
-    # 1. 生成 query embedding
-    dense, sparse_idx, sparse_val = get_query_embedding(query)
+    # 1. 生成 query embedding（retrieve_and_enrich 会预算一次并传入，避免重复嵌入）
+    dense, sparse_idx, sparse_val = query_embedding if query_embedding is not None else get_query_embedding(query)
 
     # 2. 构建 sparse data
     from alibabacloud_ha3engine_vector.models import QueryRequest, SparseData
@@ -993,6 +966,7 @@ def cosurface_doc_images(
     user_dept: Optional[str] = None,
     max_docs: int = 3,
     max_images: int = 3,
+    query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
 ) -> List[Dict[str, Any]]:
     """图片召回增强：为已检索高分文档补充其最相关的 image chunk。
 
@@ -1039,7 +1013,9 @@ def cosurface_doc_images(
         cfg = get_config().alibaba_vector
         from alibabacloud_ha3engine_vector.models import QueryRequest, SparseData
 
-        dense, sparse_idx, sparse_val = get_query_embedding(query)
+        dense, sparse_idx, sparse_val = (
+            query_embedding if query_embedding is not None else get_query_embedding(query)
+        )
         sparse_data = (
             SparseData(count=[len(sparse_idx)], indices=sparse_idx, values=sparse_val)
             if sparse_idx else None
@@ -1141,7 +1117,9 @@ def retrieve_and_enrich(
     # 路由式重排开启时：over-fetch rerank_pool 个候选 → 重排 → 取 top_k；否则直接取 top_k。
     _av = get_config().alibaba_vector
     _fetch_k = max(_av.rerank_pool, top_k) if _av.rerank_enable else top_k
-    chunks = search_chunks(query, top_k=_fetch_k, user_dept=user_dept)
+    # query embedding 只算一次，传给 search_chunks 与 cosurface（后者原本会重复嵌入一次）
+    _emb = get_query_embedding(query)
+    chunks = search_chunks(query, top_k=_fetch_k, user_dept=user_dept, query_embedding=_emb)
     if _av.rerank_enable and chunks:
         from .reranker import rerank_chunks
         # multimodal 渲染路径（cosurface_images=True）用 VL 重排；纯文本/钉钉机器人用文本重排。
@@ -1154,5 +1132,5 @@ def retrieve_and_enrich(
         chunks = expand_step_context(chunks, query)
     # 图片召回增强（仅多模态渲染路径 opt-in；可经 RAG_IMAGE_COSURFACE 全局关闭）
     if chunks and cosurface_images and get_config().rag.image_cosurface:
-        chunks = cosurface_doc_images(query, chunks, user_dept=user_dept)
+        chunks = cosurface_doc_images(query, chunks, user_dept=user_dept, query_embedding=_emb)
     return chunks

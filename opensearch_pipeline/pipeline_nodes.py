@@ -3493,8 +3493,9 @@ def node_generate_embeddings(ctx: dict):
             print(f"    └─ All {len(chunks)} chunks served from cache, no API calls needed")
         elif is_dashscope:
             print(f"    └─ Calling DashScope API for {len(miss_chunks)} cache-miss chunks (batch_size={batch_size}, model={embedding_model}, dense+sparse, max_retries={max_retries})...")
-            # 使用原生 DashScope API (非 compatible-mode) 以获取 sparse embedding
-            url = f"{base_url.rstrip('/')}/api/v1/services/embeddings/text-embedding/text-embedding"
+            # 使用原生 DashScope API (非 compatible-mode) 以获取 sparse embedding。
+            # HTTP/URL/重试/解析与查询侧共用 embedding_client.embed_texts_native（消除漂移）。
+            from opensearch_pipeline.embedding_client import embed_texts_native
             # ── 并发生成 embedding：每个 size-batch_size 的 batch 一个线程 ──
             # RAG_EMBED_CONCURRENCY 控制并发度（默认 5，保守值）。DashScope text-embedding
             # 有账户级 QPS 限制，可按配额上调/下调。每个 batch 内保留 2**attempt 指数退避以吸收
@@ -3507,96 +3508,47 @@ def node_generate_embeddings(ctx: dict):
             _cache_lock = threading.Lock()
 
             def _embed_one_batch(batch_no, batch):
-                payload = {
-                    "model": embedding_model,
-                    "input": {"texts": [c.chunk_text for c in batch]},
-                    "parameters": {
-                        "dimension": embedding_dim,
-                        "output_type": "dense&sparse"
-                    }
-                }
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
+                try:
+                    results = embed_texts_native(
+                        [c.chunk_text for c in batch],
+                        api_key=api_key,
+                        model=embedding_model,
+                        dimension=embedding_dim,
+                        api_base_url=base_url,
+                        max_retries=max_retries,
+                        request_timeout=request_timeout,
+                        sparse_fallback=True,  # 无 sparse 用 [0]/[0.001] 兜底，避免 HA3 排除文档
+                        label=f"DashScope batch {batch_no}",
+                    )
+                except Exception as e:
+                    # 整批失败：标记 FAILED，继续处理其余 batch（FAILED chunk 由 payload 构建阶段剔除并下轮重试）
+                    print(f"    ⚠️ DashScope batch {batch_no} failed: {e}")
+                    print(f"    ⚠️ Skipping {len(batch)} chunks in this batch, continuing...")
+                    for c in batch:
+                        c.embedding_status = "FAILED"
+                    return
 
-                last_error = None
-                attempt = 0
-                for attempt in range(max_retries + 1):
-                    try:
-                        resp = requests.post(url, json=payload, headers=headers, timeout=request_timeout)
-                        # Non-transient errors: fail immediately without retry
-                        if resp.status_code in (400, 401, 403):
-                            resp.raise_for_status()
-                        # Transient errors: retry with backoff
-                        if resp.status_code in (429, 500, 502, 503, 504):
-                            resp.raise_for_status()
-                        resp.raise_for_status()
-                        data = resp.json()
+                for i, r in enumerate(results):
+                    if r is None:
+                        continue  # 响应未覆盖该 text_index（保持原状，既不标 DONE 也不标 FAILED）
+                    dense, sidx, sval = r
+                    batch[i].embedding_vector = dense
+                    batch[i].embedding_model = embedding_model
+                    batch[i].embedding_status = "DONE"
+                    batch[i].sparse_vector_indices = sidx
+                    batch[i].sparse_vector_values = sval
 
-                        # 原生 API 返回格式: {output: {embeddings: [{embedding, sparse_embedding, text_index}, ...]}}
-                        embeddings_data = data.get("output", {}).get("embeddings", [])
-                        for idx, item in enumerate(embeddings_data):
-                            item_idx = item.get("text_index", idx)
-                            if item_idx < len(batch):
-                                # Dense vector
-                                batch[item_idx].embedding_vector = item["embedding"]
-                                batch[item_idx].embedding_model = embedding_model
-                                batch[item_idx].embedding_status = "DONE"
-                                # Sparse vector: [{index, token, value}, ...]
-                                sparse_list = item.get("sparse_embedding", [])
-                                if sparse_list:
-                                    sorted_items = sorted(sparse_list, key=lambda x: x["index"])
-                                    batch[item_idx].sparse_vector_indices = [s["index"] for s in sorted_items]
-                                    batch[item_idx].sparse_vector_values = [float(s["value"]) for s in sorted_items]
-                                else:
-                                    # 保底: 提供默认 sparse 以免 HA3 索引排除该文档
-                                    batch[item_idx].sparse_vector_indices = [0]
-                                    batch[item_idx].sparse_vector_values = [0.001]
-                        # 写入缓存（多线程共享 _cache，加锁保护）
-                        with _cache_lock:
-                            for c in batch:
-                                if c.embedding_status == "DONE":
-                                    ck = _cache_key(c.chunk_text)
-                                    _cache[ck] = c.embedding_vector
-                                    sp_data = {}
-                                    if hasattr(c, 'sparse_vector_indices') and c.sparse_vector_indices:
-                                        sp_data = {"indices": c.sparse_vector_indices, "values": c.sparse_vector_values}
-                                    if sp_data:
-                                        _cache[f"sp_{ck}"] = sp_data
-                        return  # success
-                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                        last_error = e
-                        if attempt < max_retries:
-                            wait = 2 ** attempt
-                            print(f"    ⚠️ DashScope batch {batch_no} attempt {attempt+1} failed (network): {e}. Retrying in {wait}s...")
-                            time.sleep(wait)
-                        # else: fall through to error handling below
-                    except requests.exceptions.HTTPError as e:
-                        last_error = e
-                        status = getattr(e.response, 'status_code', None)
-                        # 打印 400 响应体便于调试
-                        if status == 400:
-                            resp_text = getattr(e.response, 'text', '')[:500]
-                            chunk_lens = [len(c.chunk_text) for c in batch]
-                            print(f"    ⚠️ DashScope batch {batch_no} HTTP 400: {resp_text}")
-                            print(f"    ⚠️ Batch chunk text lengths: {chunk_lens}")
-                            break  # non-retryable
-                        if status in (429, 500, 502, 503, 504) and attempt < max_retries:
-                            wait = 2 ** attempt
-                            print(f"    ⚠️ DashScope batch {batch_no} attempt {attempt+1} failed (HTTP {status}): {e}. Retrying in {wait}s...")
-                            time.sleep(wait)
-                        else:
-                            break  # non-transient or retries exhausted
-                    except Exception as e:
-                        last_error = e
-                        break  # unknown error, don't retry
-
-                # 失败：标记该 batch 的 chunks 为 FAILED，继续处理其余 batch
-                print(f"    ⚠️ DashScope batch {batch_no} failed after {min(attempt+1, max_retries+1)} attempt(s): {last_error}")
-                print(f"    ⚠️ Skipping {len(batch)} chunks in this batch, continuing...")
-                for c in batch:
-                    c.embedding_status = "FAILED"
+                # 写入缓存（多线程共享 _cache，加锁保护）
+                with _cache_lock:
+                    for c in batch:
+                        if c.embedding_status == "DONE":
+                            ck = _cache_key(c.chunk_text)
+                            _cache[ck] = c.embedding_vector
+                            sp_data = {}
+                            if getattr(c, 'sparse_vector_indices', None):
+                                sp_data = {"indices": c.sparse_vector_indices, "values": c.sparse_vector_values}
+                            if sp_data:
+                                _cache[f"sp_{ck}"] = sp_data
 
             if embed_concurrency > 1 and len(batches) > 1:
                 print(f"    └─ Embedding {len(batches)} batches with {embed_concurrency} concurrent workers...")
