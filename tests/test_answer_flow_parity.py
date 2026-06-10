@@ -163,12 +163,16 @@ class TestApiAskBookkeeping:
     def test_ask_generation_error_returns_500(
         self, mock_retrieve, mock_gen, mock_append, mock_log, client
     ):
-        """生成异常 → HTTP 500。KNOWN BUG（D4 翻转为落 LLM_ERROR 一行）：当前不落库。"""
+        """生成异常 → HTTP 500；已修复（原 KNOWN BUG）：现以 LLM_ERROR 落库一行。"""
         resp = client.post("/api/ask", json={"question": "q"})
         assert resp.status_code == 500
         assert "trace" in resp.json()["detail"]
         mock_append.assert_not_called()
-        mock_log.assert_not_called()
+        mock_log.assert_called_once()
+        kw = mock_log.call_args.kwargs
+        assert kw["answer_status"] == "LLM_ERROR"
+        assert kw["error_message"] and "trace=" in kw["error_message"]
+        assert kw["opensearch_hit_count"] == 1
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -293,15 +297,15 @@ class TestBotSyncBookkeeping:
     def test_bot_sync_error_log_kwargs(
         self, mock_retrieve, mock_gen, mock_log, mock_dept, mock_reply
     ):
-        """生成异常：LLM_ERROR 落库 + trace 回复。KNOWN BUG（D4 翻转）：
-        当前 except 落库缺 user_dept 与 retrieval_latency_ms。"""
+        """生成异常：LLM_ERROR 落库 + trace 回复；已修复（原 KNOWN BUG）：
+        except 落库现补全 user_dept 与 retrieval_latency_ms。"""
         _process_rag_query("LLM失败", "https://webhook/test", "赵六", "cid4",
                            sender_staff_id="staff9")
         kw = mock_log.call_args.kwargs
         assert kw["answer_status"] == "LLM_ERROR"
         assert kw["error_message"] and "trace=" in kw["error_message"]
-        assert "user_dept" not in kw
-        assert "retrieval_latency_ms" not in kw
+        assert kw["user_dept"] == "生产中心"
+        assert isinstance(kw["retrieval_latency_ms"], int)
         assert "trace:" in mock_reply.call_args.args[1]
 
     @patch("opensearch_pipeline.dingtalk_bot.send_interactive_card", return_value=True)

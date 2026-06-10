@@ -496,6 +496,10 @@ def _process_rag_query(
     session_key = f"{conversation_id}:{sender_staff_id}" if sender_staff_id else conversation_id
     _, history = get_or_create_session(session_key)
 
+    # except 兜底落库会引用这两个值；必须在 try 外初始化，否则部门解析/检索阶段抛错时 NameError
+    user_dept = None
+    retrieval_latency_ms = None
+
     try:
         # 0. 解析用户部门（用于权限过滤）
         user_dept = _resolve_user_dept(sender_staff_id) if sender_staff_id else None
@@ -641,18 +645,21 @@ def _process_rag_query(
             "RAG 处理失败 [trace=%s]: question=%s, error=%s",
             trace_id, question, e, exc_info=True,
         )
-        # 失败也要落库
-        log_qa_session(
+        # 失败也要落库（user_dept / retrieval_latency_ms 已在 try 外初始化，
+        # 部门解析或检索阶段抛错时取 None，不会 NameError）
+        log_qa_session(**build_qa_log_kwargs(
             session_id=session_key,
             message_id=message_id,
+            question=question,
             user_id=sender_staff_id,
             user_name=sender_nick,
-            query_text=question,
+            user_dept=user_dept,
             latency_ms=latency_ms,
+            retrieval_latency_ms=retrieval_latency_ms,
             answer_status="LLM_ERROR",
             error_message=f"[trace={trace_id}] {str(e)[:500]}",
             conversation_type=conversation_type,
-        )
+        ))
         _send_text_reply(
             session_webhook,
             f"❌ 处理您的问题时出错，请稍后重试。(trace: {trace_id})",

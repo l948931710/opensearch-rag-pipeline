@@ -360,6 +360,19 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("LLM generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
+        # 失败也落库：此前这里只回 500、不留任何记录，是四条链路中唯一的"无痕失败"
+        log_qa_session(**build_qa_log_kwargs(
+            session_id=session_id,
+            message_id=generate_message_id(),
+            question=req.question,
+            user_id=uid,
+            user_dept=user_dept,
+            chunks=chunks,
+            latency_ms=int((time.time() - t0) * 1000),
+            retrieval_latency_ms=retrieval_latency_ms,
+            answer_status="LLM_ERROR",
+            error_message=f"[trace={trace_id}] {str(e)[:500]}",
+        ))
         raise HTTPException(status_code=500, detail=f"回答生成失败，请联系管理员 (trace: {trace_id})")
 
     # 4. 更新会话历史（统一策略：仅非空 SUCCESS 回答入史）
