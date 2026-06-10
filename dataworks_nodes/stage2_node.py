@@ -8,6 +8,7 @@ DataWorks PyODPS 3 节点 — Stage 2: Canonical → Safe Chunks
 import os
 import sys
 import zipfile
+from datetime import datetime, timedelta
 
 # ═══════════════════════════════════════════════════════════════
 # 🔧 模式开关（冒烟测试 True / 生产运行 False）
@@ -57,7 +58,6 @@ if current_dir not in sys.path:
 print("=== 3. 解析调度参数 ===")
 # 兜底 bizdate = T-1（与 DataWorks ${bizdate} 语义一致）。原先硬编码 '20260521'：
 # 节点漏配调度参数时会永远跑在那个过期日期上且毫无报错。
-from datetime import datetime, timedelta
 bizdate = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
 if len(sys.argv) > 1:
     arg_val = sys.argv[1]

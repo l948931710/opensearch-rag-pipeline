@@ -10,6 +10,7 @@ import os
 import sys
 import subprocess
 import zipfile
+from datetime import datetime, timedelta
 
 # ═══════════════════════════════════════════════════════════════
 # 📦 安装 Stage 3 依赖
@@ -75,7 +76,6 @@ if current_dir not in sys.path:
 print("=== 3. 解析调度参数 ===")
 # 兜底 bizdate = T-1（与 DataWorks ${bizdate} 语义一致）。原先硬编码 '20260521'：
 # 节点漏配调度参数时会永远跑在那个过期日期上且毫无报错。
-from datetime import datetime, timedelta
 bizdate = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
 if len(sys.argv) > 1:
     arg_val = sys.argv[1]
