@@ -41,6 +41,7 @@ from opensearch_pipeline.content_blocks_builder import (
     build_mini_program_blocks,
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
+from opensearch_pipeline.answer_flow import build_qa_log_kwargs
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 
@@ -319,16 +320,16 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
     if not chunks:
         latency = int((time.time() - t0) * 1000)
         msg_id = generate_message_id()
-        log_qa_session(
+        log_qa_session(**build_qa_log_kwargs(
             session_id=session_id,
             message_id=msg_id,
+            question=req.question,
             user_id=uid,
-            query_text=req.question,
+            chunks=[],
             latency_ms=latency,
             retrieval_latency_ms=retrieval_latency_ms,
             answer_status="NO_RESULT",
-            opensearch_hit_count=0,
-        )
+        ))
         return AskResponse(
             answer="抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。",
             sources=[],
@@ -363,23 +364,19 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
     msg_id = generate_message_id()
 
     # 5. 落库
-    top_score = max((c.get("score", 0) for c in chunks), default=None)
-    log_qa_session(
+    log_qa_session(**build_qa_log_kwargs(
         session_id=session_id,
         message_id=msg_id,
+        question=req.question,
         user_id=req.user_id or "",
-        query_text=req.question,
         answer_text=result["answer"],
-        retrieved_docs=chunks,
+        chunks=chunks,
         cited_docs=result.get("sources"),
         latency_ms=latency,
         retrieval_latency_ms=retrieval_latency_ms,
         llm_latency_ms=llm_latency_ms,
-        answer_status="SUCCESS",
         model_name=result.get("model"),
-        opensearch_hit_count=len(chunks),
-        top_score=top_score,
-    )
+    ))
 
     # 小程序图文渲染块（复用 build_content_blocks 核心；纯文字/未引用图片时为 []）
     try:
@@ -472,22 +469,20 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
                 yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                log_qa_session(
+                log_qa_session(**build_qa_log_kwargs(
                     session_id=session_id,
                     message_id=message_id,
+                    question=req.question,
                     user_id=uid,
-                    query_text=req.question,
+                    chunks=[],
                     latency_ms=int((time.time() - t0) * 1000),
                     retrieval_latency_ms=retrieval_latency_ms,
                     answer_status="NO_RESULT",
-                    opensearch_hit_count=0,
-                )
+                ))
 
         return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     # 3. SSE 流式生成
-    top_score = max((c.get("score", 0) for c in chunks), default=None)
-
     def event_generator():
         # 先发 session_id + message_id（反馈关联键）
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
@@ -549,22 +544,20 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
             full_answer = "".join(collected_answer)
             if full_answer:
                 _append_to_history(session_id, req.question, full_answer)
-            log_qa_session(
+            log_qa_session(**build_qa_log_kwargs(
                 session_id=session_id,
                 message_id=message_id,
+                question=req.question,
                 user_id=uid,
-                query_text=req.question,
-                answer_text=full_answer or None,
-                retrieved_docs=chunks,
+                answer_text=full_answer,
+                chunks=chunks,
                 latency_ms=int((time.time() - t0) * 1000),
                 retrieval_latency_ms=retrieval_latency_ms,
                 answer_status=answer_status,
                 model_name=model_name,
-                opensearch_hit_count=len(chunks),
-                top_score=top_score,
                 error_message=error_message,
                 content_blocks_json=content_blocks_json_str,
-            )
+            ))
 
     return StreamingResponse(
         event_generator(),

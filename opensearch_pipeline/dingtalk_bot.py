@@ -37,6 +37,7 @@ from opensearch_pipeline.llm_generator import (
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
+from opensearch_pipeline.answer_flow import build_qa_log_kwargs, should_append_history
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_feedback_status,
@@ -435,7 +436,6 @@ def _stream_answer_to_card(
 
     llm_latency_ms = int((time.time() - t_retrieval) * 1000)
     latency_ms = int((time.time() - t0) * 1000)
-    top_score = max((c.get("score", 0) for c in chunks), default=None)
 
     # ⚠️ 不在定稿后调 update_card_data：PUT /card/instances 会用部分 cardParamMap 覆盖流式写入的
     # content（A/B 实测：调了→定稿后卡片空白；不调→全文保留）。完成态按钮已在模板里硬化
@@ -444,29 +444,27 @@ def _stream_answer_to_card(
     # 代价：meta 页脚不带"耗时"（保持 create 时的"模型: X"），换取不丢正文——值得。
 
     # 写历史（仅成功且有内容时）+ 落库（与非流式路径一致的反馈语义）
-    if full_answer and answer_status == "SUCCESS":
+    if should_append_history(full_answer, answer_status):
         append_to_history(session_key, question, full_answer)
 
-    log_qa_session(
+    log_qa_session(**build_qa_log_kwargs(
         session_id=session_key,
         message_id=message_id,
+        question=question,
         user_id=sender_staff_id,
         user_name=sender_nick,
         user_dept=user_dept,
-        query_text=question,
-        answer_text=full_answer or None,
-        retrieved_docs=chunks,
+        answer_text=full_answer,
+        chunks=chunks,
         cited_docs=sources,
         latency_ms=latency_ms,
         retrieval_latency_ms=retrieval_latency_ms,
         llm_latency_ms=llm_latency_ms,
         answer_status=answer_status,
         model_name=model_name,
-        opensearch_hit_count=len(chunks),
-        top_score=top_score,
         conversation_type=conversation_type,
         error_message=error_message,
-    )
+    ))
     return True
 
 
@@ -504,20 +502,19 @@ def _process_rag_query(
         if not chunks:
             # 无结果也要落库
             latency_ms = int((time.time() - t0) * 1000)
-            log_qa_session(
+            log_qa_session(**build_qa_log_kwargs(
                 session_id=session_key,
                 message_id=message_id,
+                question=question,
                 user_id=sender_staff_id,
                 user_name=sender_nick,
                 user_dept=user_dept,
-                query_text=question,
-                answer_text=None,
+                chunks=[],
                 latency_ms=latency_ms,
                 retrieval_latency_ms=retrieval_latency_ms,
                 answer_status="NO_RESULT",
-                opensearch_hit_count=0,
                 conversation_type=conversation_type,
-            )
+            ))
             _send_text_reply(
                 session_webhook,
                 "🤷 抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述。",
@@ -569,27 +566,23 @@ def _process_rag_query(
         content_blocks_json_str = content_blocks_to_json(content_blocks)
 
         # 5. 落库（包含 content_blocks_json 供回调重建）
-        top_score = max((c.get("score", 0) for c in chunks), default=None)
-        log_qa_session(
+        log_qa_session(**build_qa_log_kwargs(
             session_id=session_key,
             message_id=message_id,
+            question=question,
             user_id=sender_staff_id,
             user_name=sender_nick,
             user_dept=user_dept,
-            query_text=question,
             answer_text=result["answer"],
-            retrieved_docs=chunks,
+            chunks=chunks,
             cited_docs=result.get("sources"),
             latency_ms=latency_ms,
             retrieval_latency_ms=retrieval_latency_ms,
             llm_latency_ms=llm_latency_ms,
-            answer_status="SUCCESS",
             model_name=result.get("model"),
-            opensearch_hit_count=len(chunks),
-            top_score=top_score,
             conversation_type=conversation_type,
-            content_blocks_json=content_blocks_json_str or None,
-        )
+            content_blocks_json=content_blocks_json_str,
+        ))
 
         # 6. 发送互动卡片（失败降级为 Markdown）
         img_blocks = [b for b in content_blocks if b.get("type") == "image"] if content_blocks else []
