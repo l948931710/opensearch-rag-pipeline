@@ -84,6 +84,13 @@ class _LRUSessionStore:
                 self._store[key].touch()
                 self._store.move_to_end(key)
 
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            if key in self._store:
+                del self._store[key]
+                return True
+            return False
+
 
 _sessions = _LRUSessionStore()
 
@@ -103,6 +110,17 @@ def get_or_create_session(session_id: Optional[str]) -> Tuple[str, List[Dict[str
         sid = session_id or str(uuid.uuid4())
         entry = _sessions.create(sid)
         return sid, entry.history
+
+
+def clear_session(session_id: str) -> bool:
+    """删除会话历史（线程安全、幂等）。存在并删除返回 True；不存在/已过期返回 False。
+
+    服务端记忆真正清除的唯一入口（小程序「清除会话」此前只清本地 UI，服务端
+    旧上下文继续陪聊到 30 分钟 TTL）。
+    """
+    if not session_id:
+        return False
+    return _sessions.delete(session_id)
 
 
 def append_to_history(session_id: str, user_msg: str, assistant_msg: str):

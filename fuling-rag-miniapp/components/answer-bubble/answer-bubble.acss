@@ -15,6 +15,50 @@
   word-break: break-word;
 }
 
+/* Markdown-subset rendering (port of prototype .ai-card p/.step/strong).
+   Theme via var(--accent) so the pending Aurora-Forest port re-skins it. */
+.para {
+  margin-bottom: 16rpx;
+}
+
+.para:last-child {
+  margin-bottom: 0;
+}
+
+/* Step paragraph: accent left ruler (prototype .ai-card p.step::before). */
+.para.step {
+  position: relative;
+  padding-left: 26rpx;
+}
+
+.para.step::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8rpx;
+  bottom: 10rpx;
+  width: 6rpx;
+  border-radius: 4rpx;
+  background: var(--accent, #1677ff);
+}
+
+.run-b {
+  font-weight: 600;
+  color: var(--text-main, #1f2329);
+}
+
+/* First bold run of a step (**第N步**) in accent color
+   (prototype .ai-card p.step strong:first-child). */
+.para.step .run-brand {
+  color: var(--accent, #1677ff);
+}
+
+/* No heading type scale in the locked design: # headings degrade to bold. */
+.para.heading .ans-text {
+  font-weight: 600;
+  font-size: 32rpx;
+}
+
 .img-wrap {
   margin: 16rpx 0;
   display: flex;

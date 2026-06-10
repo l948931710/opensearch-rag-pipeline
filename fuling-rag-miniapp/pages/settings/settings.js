@@ -1,6 +1,7 @@
 // Settings / 我的: read-only profile + 清除会话.
 
 import { ensureLogin } from '../../utils/auth';
+import { clearSession } from '../../utils/api';
 
 const APP_VERSION = '0.1.0';
 
@@ -43,9 +44,6 @@ Page({
   },
 
   onClearSession() {
-    // Sessions are keyed by user on the backend; clearing locally simply asks
-    // the chat page to start fresh. We bump a marker the chat page can read,
-    // and clear any in-app draft state via storage.
     dd.confirm({
       title: '清除会话',
       content: '确定要开始新的会话吗？历史问答记录不受影响。',
@@ -53,13 +51,32 @@ Page({
       cancelButtonText: '取消',
       success: (res) => {
         if (res.confirm) {
-          // Signal a session reset; the chat page reads this on next onShow/onLoad.
+          // 1. Local marker first — the chat page reads it on next onShow and
+          //    resets its UI; this must work even when offline.
           dd.setStorageSync({ key: 'session_reset_at', data: Date.now() });
-          const sb = this.selectComponent('#snackbar');
-          if (sb && typeof sb.show === 'function') {
-            sb.show({ content: '已清除会话', type: 'success', duration: 2000 });
+
+          // 2. Best-effort backend clear: without it the server keeps the old
+          //    turns for the 30-min TTL and the "new" conversation inherits
+          //    stale context. Failure degrades to local-only with a hint.
+          const done = (ok) => {
+            const content = ok
+              ? '已清除会话'
+              : '已在本地清除（服务器同步失败，旧上下文 30 分钟后自动过期）';
+            const sb = this.selectComponent('#snackbar');
+            if (sb && typeof sb.show === 'function') {
+              sb.show({ content, type: ok ? 'success' : 'warning', duration: 2500 });
+            } else {
+              dd.showToast({ type: ok ? 'success' : 'none', content, duration: 2500 });
+            }
+          };
+          const sid = this.data.sessionId;
+          if (sid) {
+            ensureLogin()
+              .then(() => clearSession(sid))
+              .then(() => done(true))
+              .catch(() => done(false));
           } else {
-            dd.showToast({ type: 'success', content: '已清除会话', duration: 2000 });
+            done(true);
           }
         }
       },

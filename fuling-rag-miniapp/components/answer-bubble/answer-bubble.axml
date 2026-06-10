@@ -1,10 +1,18 @@
 <view class="answer-bubble">
   <block a:for="{{viewBlocks}}" a:key="key">
-    <!-- text block: typewriter-revealed content -->
-    <text
-      a:if="{{item.type === 'text' && !item.hidden}}"
-      class="ans-text"
-    >{{item.revealed}}</text>
+    <!-- text block: typewriter-revealed styled paragraphs (utils/markdown.js).
+         Runs are nested <text> kept on ONE line — whitespace between inline
+         <text> nodes would render as stray spaces. -->
+    <view a:if="{{item.type === 'text' && !item.hidden}}" class="ans-text-blk">
+      <view
+        a:for="{{item.revealedParas}}"
+        a:for-item="p"
+        a:key="key"
+        class="para {{p.step ? 'step' : ''}} {{p.heading ? 'heading' : ''}}"
+      >
+        <text class="ans-text"><text a:for="{{p.runs}}" a:for-item="r" a:key="key" class="run {{r.bold ? 'run-b' : ''}} {{r.brand ? 'run-brand' : ''}}">{{r.text}}</text></text>
+      </view>
+    </view>
 
     <!-- image block: widthFix is required for unknown-size images -->
     <view

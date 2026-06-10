@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,7 +52,12 @@ from opensearch_pipeline.answer_flow import (
     should_append_history,
 )
 from opensearch_pipeline.config import get_config
-from opensearch_pipeline.session_store import get_or_create_session, append_to_history
+from opensearch_pipeline.session_store import (
+    MAX_HISTORY_TURNS,
+    append_to_history,
+    clear_session,
+    get_or_create_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +121,10 @@ app.include_router(dingtalk_router)
 # ═══════════════════════════════════════════════════════════════
 
 class ChatMessage(BaseModel):
-    role: str = Field(..., description="消息角色: user / assistant")
-    content: str = Field(..., description="消息内容")
+    # 只允许 user/assistant：客户端注入 role:"system"/"tool" 会被 _build_messages 原样拼进
+    # 真实 system prompt 之后 —— 未鉴权的提示注入。非法 role 直接 422（线上无客户端传 history）。
+    role: Literal["user", "assistant"] = Field(..., description="消息角色: user / assistant")
+    content: str = Field(..., min_length=1, max_length=8000, description="消息内容")
 
 
 class AskRequest(BaseModel):
@@ -126,7 +133,9 @@ class AskRequest(BaseModel):
         default_factory=lambda: get_config().rag.default_top_k,
         ge=1, le=20, description="检索返回的文档数量（默认取 RAG_TOP_K，评测锁定 7）",
     )
-    history: Optional[List[ChatMessage]] = Field(None, description="对话历史")
+    history: Optional[List[ChatMessage]] = Field(
+        None, max_length=40, description="对话历史（最多 40 条 = 20 轮）",
+    )
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
     temperature: Optional[float] = Field(DEFAULT_TEMPERATURE, ge=0.0, le=2.0, description="生成温度")
     max_tokens: Optional[int] = Field(DEFAULT_MAX_TOKENS, ge=100, le=8192, description="最大生成 token 数")
@@ -317,6 +326,10 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_i
     merged_history = list(session_history)
     if req.history:
         merged_history = [{"role": m.role, "content": m.content} for m in req.history]
+    # 与服务端会话同一裁剪策略（保留最近 N 轮），防止客户端 history 撑爆 LLM 上下文
+    max_messages = MAX_HISTORY_TURNS * 2
+    if len(merged_history) > max_messages:
+        merged_history = merged_history[-max_messages:]
 
     uid = identity.user_id if identity else (req.user_id or "")
     # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
@@ -634,6 +647,27 @@ def submit_feedback(req: FeedbackRequest, identity: Optional[Identity] = Depends
     if not success:
         raise HTTPException(status_code=500, detail="反馈处理失败")
     return {"status": "ok", "message_id": req.message_id}
+
+
+class SessionClearRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=128, description="要清除的会话 ID")
+
+
+@app.post("/api/session/clear")
+def session_clear(req: SessionClearRequest,
+                  identity: Optional[Identity] = Depends(current_identity)):
+    """清除服务端会话历史（小程序「清除会话」/ 钉钉「新会话」）。
+
+    鉴权与 /api/ask 同为可选 Bearer；但 'miniapp:<staffId>' 是可预测的命名空间
+    （chat.js 用 'miniapp:'+userId 构造），必须校验令牌归属，防止匿名清掉他人会话上下文。
+    其余 session_id（服务端 UUID / 钉钉会话 key，不可枚举）按持有即所有处理。
+    幂等：会话不存在/已过期返回 200 + cleared=false（客户端结果一致：下一轮是全新会话）。
+    """
+    if req.session_id.startswith("miniapp:"):
+        if not identity or req.session_id != f"miniapp:{identity.user_id}":
+            raise HTTPException(status_code=403, detail="无权清除该会话")
+    cleared = clear_session(req.session_id)
+    return {"status": "ok", "cleared": cleared, "session_id": req.session_id}
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -30,13 +30,20 @@ from fastapi import APIRouter, Request, HTTPException
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from opensearch_pipeline.content_blocks_builder import strip_image_markers
+from opensearch_pipeline.content_blocks_builder import (
+    refresh_image_block_urls,
+    strip_image_markers,
+)
 from opensearch_pipeline.retriever import retrieve_and_enrich
 from opensearch_pipeline.llm_generator import (
     generate_answer, generate_answer_stream, parse_sse_data_frame, _extract_sources,
 )
 from opensearch_pipeline.config import get_config
-from opensearch_pipeline.session_store import get_or_create_session, append_to_history
+from opensearch_pipeline.session_store import (
+    append_to_history,
+    clear_session,
+    get_or_create_session,
+)
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.answer_flow import (
     DEFAULT_MAX_TOKENS,
@@ -745,11 +752,27 @@ def _process_webhook_body(body: dict):
     #    对上一条回答的补充原因收下，写进 user_feedback.feedback_comment，不走问答。
     #    为何仅单聊：「补充原因」提示本就是机器人【私信(单聊)】发的，用户在单聊里回复即可；而群聊里
     #    @机器人 的消息一律按【新问题】处理，避免把群里的提问误判成"补充原因"。
-    if str(body.get("conversationType", "1")) == "1" and sender_staff_id \
-            and take_awaiting_comment(user_id=sender_staff_id, comment=question):
+    is_supplement = False
+    if str(body.get("conversationType", "1")) == "1" and sender_staff_id:
+        try:
+            is_supplement = take_awaiting_comment(user_id=sender_staff_id, comment=question)
+        except Exception as e:
+            # RDS 故障 → 按普通问题继续，绝不把 500 回给钉钉（与本文件其余落库降级一致）
+            logger.error("take_awaiting_comment 异常（按普通问题继续）: %s", e, exc_info=True)
+    if is_supplement:
         if session_webhook:
             _send_text_reply(session_webhook, "✅ 已记录你补充的原因，谢谢反馈！")
         return {"msgtype": "feedback_comment"}
+
+    # ── 「新会话」指令：清除服务端多轮上下文（此前用户没有任何重置入口，只能等 30 分钟 TTL）──
+    #    放在「补充原因」回收之后：若用户正处于补充原因流程，这条文本优先按补充原因收下。
+    #    session key 构造必须与 _process_rag_query 完全一致，否则清不到。
+    if question.strip() in ("新会话", "重新开始"):
+        session_key = f"{conversation_id}:{sender_staff_id}" if sender_staff_id else conversation_id
+        clear_session(session_key)
+        if session_webhook:
+            _send_text_reply(session_webhook, "✅ 已开启新会话，之前的对话上下文已清除。")
+        return {"msgtype": "session_reset"}
 
     if not session_webhook:
         logger.error("钉钉回调缺少 sessionWebhook，无法回复")
@@ -966,10 +989,13 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
                         card_param_map["sources"] = _src_text
                         card_param_map["meta"] = f"模型: {model} | 耗时: {latency / 1000:.1f}s"
                     card_param_map["message_id"] = message_id
-                    # 重建 content_blocks（图文穿插数据）
+                    # 重建 content_blocks（图文穿插数据）。落库的签名 URL 默认 1h 过期，
+                    # 原样回放会渲染死图 —— 按块内 oss_key（旧行回退解析 URL path）重签。
                     content_blocks_json = row[7]
                     if content_blocks_json:
-                        card_param_map["content_blocks"] = content_blocks_json if isinstance(content_blocks_json, str) else json.dumps(content_blocks_json, ensure_ascii=False)
+                        _raw_blocks = (content_blocks_json if isinstance(content_blocks_json, str)
+                                       else json.dumps(content_blocks_json, ensure_ascii=False))
+                        card_param_map["content_blocks"] = refresh_image_block_urls(_raw_blocks)
                     else:
                         card_param_map["content_blocks"] = ""
         finally:

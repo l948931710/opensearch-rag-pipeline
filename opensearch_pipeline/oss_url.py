@@ -32,7 +32,7 @@ def _ensure_public_endpoint(endpoint: str) -> str:
 
 def generate_signed_url(
     oss_key: str,
-    expires: int = 3600,
+    expires: Optional[int] = None,
     method: str = "GET",
 ) -> str:
     """
@@ -40,7 +40,8 @@ def generate_signed_url(
 
     Args:
         oss_key: OSS 对象路径，如 'processing/assets/dept/doc_id/v1/image.jpg'
-        expires: 签名有效期（秒），默认 3600（1 小时）
+        expires: 签名有效期（秒）；None 取 config.oss.signed_url_expires
+                 （RAG_OSS_URL_EXPIRES，默认 3600 = 1 小时）
         method: HTTP 方法，默认 GET
 
     Returns:
@@ -52,6 +53,8 @@ def generate_signed_url(
     try:
         from opensearch_pipeline.config import get_config
         config = get_config()
+        if expires is None:
+            expires = config.oss.signed_url_expires
 
         access_id = config.oss.access_key_id
         access_secret = config.oss.access_key_secret
@@ -93,14 +96,14 @@ def generate_signed_url(
 
 def generate_signed_urls_batch(
     oss_keys: list,
-    expires: int = 3600,
+    expires: Optional[int] = None,
 ) -> dict:
     """
     批量生成签名 URL。
 
     Args:
         oss_keys: OSS key 列表
-        expires: 签名有效期（秒）
+        expires: 签名有效期（秒）；None 取 config.oss.signed_url_expires
 
     Returns:
         {oss_key: signed_url} 字典。生成失败的 key 值为空字符串。

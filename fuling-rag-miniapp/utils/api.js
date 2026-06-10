@@ -101,3 +101,16 @@ export function feedback(payload) {
     data: payload,
   });
 }
+
+/**
+ * clearSession(sessionId) -> Promise<{status, cleared}>
+ * Tells the backend to drop the conversation memory for this session.
+ * 'miniapp:<userId>' ids are ownership-checked server-side, so auth is required.
+ */
+export function clearSession(sessionId) {
+  return request('/api/session/clear', {
+    method: 'POST',
+    auth: true,
+    data: { session_id: sessionId },
+  });
+}

@@ -83,6 +83,9 @@ class OSSConfig:
     rag_ready_prefix: str = "rag-ready/"
     index_jobs_prefix: str = "index-jobs/opensearch/"
     quarantine_prefix: str = "quarantine/"
+    # 签名 URL 有效期（秒），RAG_OSS_URL_EXPIRES。卡片重建路径会按 oss_key 重签，
+    # 所以默认 1h 只需覆盖「活跃会话内看图」的窗口。
+    signed_url_expires: int = 3600
 
 
 @dataclass
@@ -423,6 +426,7 @@ def load_config() -> PipelineConfig:
             access_key_id=_env("OSS_ACCESS_KEY_ID"),
             access_key_secret=_env("OSS_ACCESS_KEY_SECRET"),
             bucket_name=_env("OSS_BUCKET_NAME", "fuling-knowledge-base"),
+            signed_url_expires=_env_int("OSS_URL_EXPIRES", 3600),
         ),
 
         rds=RDSConfig(

@@ -142,7 +142,7 @@ def build_content_blocks(
     answer: str,
     chunks: List[Dict[str, Any]],
     max_images: int = 3,
-    url_expires: int = 3600,
+    url_expires: Optional[int] = None,
     max_caption_len: Optional[int] = 100,
 ) -> List[Dict[str, str]]:
     """
@@ -165,7 +165,8 @@ def build_content_blocks(
         answer: LLM 生成的回答文本
         chunks: 检索返回的 chunks 列表
         max_images: 最多展示的图片数量
-        url_expires: OSS 签名 URL 有效期（秒）
+        url_expires: OSS 签名 URL 有效期（秒）；None 取 config.oss.signed_url_expires
+                     （RAG_OSS_URL_EXPIRES，默认 3600）
         max_caption_len: caption 截断长度；None 表示不截断（小程序屏幕空间更大，可传 None 取全文）
 
     Returns:
@@ -198,6 +199,7 @@ def build_content_blocks(
 
     # 3. 只为“被引用”的图片签名，按引用顺序处理后再受 max_images 截断。
     #    因为只签名被引用的图片且按引用顺序消耗配额，被引用的图片不会被挤掉。
+    #    url_expires=None 由 generate_signed_url 统一解析为 config.oss.signed_url_expires。
     signed_images: Dict[int, List[Dict[str, str]]] = {}
     generated_count = 0
     for doc_idx in referenced_order:
@@ -212,6 +214,9 @@ def build_content_blocks(
                 summary = img_info.get('visual_summary', '')
                 signed_list.append({
                     "url": url,
+                    # oss_key 随块落库：签名 URL 1h 过期，卡片回调重建时按它重签
+                    # （refresh_image_block_urls）；卡片模板/小程序只读 url，多余键无害
+                    "oss_key": img_info["source_image"],
                     "title": "",
                     "caption": (summary[:max_caption_len] if max_caption_len else summary) if summary else "",
                 })
@@ -279,6 +284,7 @@ def _build_interleaved(
                     "type": "image",
                     "title": img["title"],
                     "url": img["url"],
+                    "oss_key": img.get("oss_key", ""),
                     "caption": img["caption"],
                 })
             used_indices.add(doc_idx)
@@ -313,7 +319,7 @@ def build_mini_program_blocks(
     answer: str,
     chunks: List[Dict[str, Any]],
     max_images: int = 3,
-    url_expires: int = 3600,
+    url_expires: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """为钉钉小程序生成图文 blocks（供 <text>/<image> 原生渲染）。
 
@@ -334,6 +340,7 @@ def build_mini_program_blocks(
             out.append({
                 "type": "image",
                 "url": b.get("url", ""),
+                "oss_key": b.get("oss_key", ""),
                 "caption": cap,
                 "alt": cap,
             })
@@ -342,3 +349,48 @@ def build_mini_program_blocks(
             if text:
                 out.append({"type": "text", "format": "markdown", "text": text})
     return out
+
+
+def _oss_key_from_url(url: str) -> str:
+    """从存量签名 URL 解析 object key（兜底没有 oss_key 的旧落库行）。
+
+    形如 https://{bucket}.{region}.aliyuncs.com/{quoted_key}?Expires=...&Signature=...
+    非阿里云 OSS 域名一律不解析（防止把外部 URL 的 path 当成 key 去重签）。
+    """
+    if not url:
+        return ""
+    try:
+        from urllib.parse import unquote, urlparse
+        parsed = urlparse(url)
+        if not parsed.hostname or not parsed.hostname.endswith(".aliyuncs.com"):
+            return ""
+        return unquote(parsed.path.lstrip("/"))
+    except Exception:
+        return ""
+
+
+def refresh_image_block_urls(blocks_json: str, url_expires: Optional[int] = None) -> str:
+    """重签 content_blocks JSON 里 image 块的 OSS URL（卡片回调重建用）。
+
+    落库的签名 URL 默认 1h 过期：用户在旧卡片上点反馈触发重建时，原样回放会渲染
+    一排 403 死图。新行直接用块里的 oss_key 重签；旧行回退从存量 URL 的 path 解析
+    object key；解析/重签失败保留原 URL（优雅降级，绝不让回调白屏）。任何异常返回原串。
+    """
+    if not blocks_json:
+        return blocks_json
+    try:
+        blocks = json.loads(blocks_json)
+        if not isinstance(blocks, list):
+            return blocks_json
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "image":
+                continue
+            key = b.get("oss_key") or _oss_key_from_url(b.get("url", ""))
+            if key:
+                fresh = generate_signed_url(key, expires=url_expires)
+                if fresh:
+                    b["url"] = fresh
+        return json.dumps(blocks, ensure_ascii=False)
+    except Exception:
+        logger.warning("content_blocks URL 重签失败（保留原 JSON）", exc_info=True)
+        return blocks_json

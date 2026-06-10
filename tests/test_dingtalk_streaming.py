@@ -393,6 +393,100 @@ def test_take_awaiting_comment_hit_and_miss():
     assert feedback_handler.take_awaiting_comment(user_id="u1", comment="  ") is False
 
 
+def test_take_awaiting_comment_window_uses_updated_at_and_expires_stale():
+    """窗口必须按 updated_at 计（mark_awaiting_comment 的 upsert 只刷新 updated_at，旧投票行
+    created_at 可能远早于点击「补充原因」→ 按 created_at 会把迟到的补充静默丢弃）；
+    且超窗滞留 AWAITING_COMMENT 的行要先归位 PENDING（否则永久卡住、多日后误吞私聊）。"""
+    from opensearch_pipeline import feedback_handler
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchone.return_value = None  # miss 路径
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+        assert feedback_handler.take_awaiting_comment(user_id="u1", comment="迟到的补充") is False
+
+    sqls = [c[0][0] for c in cur.execute.call_args_list]
+    sweep_idx = next(i for i, s in enumerate(sqls)
+                     if "SET handled_status = 'PENDING'" in s and "updated_at <" in s)
+    select_idx = next(i for i, s in enumerate(sqls) if s.strip().startswith("SELECT"))
+    assert sweep_idx < select_idx, "过期回收必须先于命中查询"
+    select_sql = sqls[select_idx]
+    assert "updated_at >=" in select_sql, "窗口必须按 updated_at 计"
+    assert "created_at" not in select_sql, "created_at 窗口是被修的 bug，禁止回归"
+    conn.commit.assert_called_once()  # miss 路径也要把过期回收落地
+
+
+def test_take_awaiting_comment_db_down_returns_false():
+    """取连接失败（RDS 故障）必须按未命中返回 False —— 本函数在私聊主路径上，
+    抛出去会让每条私聊问题 500。"""
+    from opensearch_pipeline import feedback_handler
+
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn",
+               side_effect=Exception("RDS down")):
+        assert feedback_handler.take_awaiting_comment(user_id="u1", comment="补充") is False
+
+
+def test_save_feedback_odku_clears_awaiting():
+    """明确投票（卡片内联表单/小程序 /api/feedback）必须取消挂起的 AWAITING_COMMENT，
+    否则用户点过「补充原因」后又提交了表单，下一条私聊仍会被误吞成补充原因。"""
+    import inspect
+    from opensearch_pipeline import feedback_handler
+
+    source = inspect.getsource(feedback_handler._save_feedback)
+    assert "IF(handled_status = 'AWAITING_COMMENT'" in source
+
+
+def test_webhook_db_outage_degrades_to_normal_question():
+    """私聊路径上 take_awaiting_comment 抛异常（RDS 故障）→ 按普通问题继续（ack+起线程），
+    绝不向钉钉返回 500。"""
+    from opensearch_pipeline import dingtalk_bot
+
+    body = {
+        "conversationType": "1",
+        "senderStaffId": "staff1",
+        "senderNick": "张三",
+        "conversationId": "cid1",
+        "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?x=1",
+        "text": {"content": "差旅费怎么报销"},
+        "msgtype": "text",
+    }
+    with patch("opensearch_pipeline.dingtalk_bot.take_awaiting_comment",
+               side_effect=Exception("RDS down")), \
+         patch("opensearch_pipeline.dingtalk_bot._send_text_reply") as mock_reply, \
+         patch("opensearch_pipeline.dingtalk_bot.threading.Thread") as mock_thread:
+        resp = dingtalk_bot._process_webhook_body(body)
+
+    assert resp == {"msgtype": "empty"}, "DB 故障必须降级为普通问答，不能抛 500"
+    assert any("正在为您查询" in c[0][1] for c in mock_reply.call_args_list)
+    mock_thread.assert_called_once()
+
+
+def test_webhook_supplement_comment_hit():
+    """补充原因命中：单聊消息被收为 comment → 致谢回复、不起 RAG 线程。"""
+    from opensearch_pipeline import dingtalk_bot
+
+    body = {
+        "conversationType": "1",
+        "senderStaffId": "staff1",
+        "senderNick": "张三",
+        "conversationId": "cid1",
+        "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?x=1",
+        "text": {"content": "答案里缺少新版流程"},
+        "msgtype": "text",
+    }
+    with patch("opensearch_pipeline.dingtalk_bot.take_awaiting_comment",
+               return_value=True) as mock_take, \
+         patch("opensearch_pipeline.dingtalk_bot._send_text_reply") as mock_reply, \
+         patch("opensearch_pipeline.dingtalk_bot.threading.Thread") as mock_thread:
+        resp = dingtalk_bot._process_webhook_body(body)
+
+    assert resp == {"msgtype": "feedback_comment"}
+    mock_take.assert_called_once_with(user_id="staff1", comment="答案里缺少新版流程")
+    assert any("已记录你补充的原因" in c[0][1] for c in mock_reply.call_args_list)
+    mock_thread.assert_not_called()
+
+
 # ── 启动时自动注册互动卡片 HTTP 回调地址 ──────────────────────────────────────
 
 def test_register_card_callback_skips_without_url(monkeypatch):

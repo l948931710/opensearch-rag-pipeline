@@ -1,9 +1,15 @@
 // answer-bubble: renders an interleaved [text|image] block array with a
 // client-side typewriter over the text blocks, and tap-to-preview on images.
 //
+// Text blocks are parsed ONCE into styled runs (utils/markdown.js — bold /
+// step ruler / lists / headings) and the typewriter reveals plain characters
+// only, so a `**` pair can never be half-shown mid-reveal (the AXML port of
+// the prototype's typewriter-bold fix).
+//
 // Alipay-engine Component lifecycle: didMount / didUpdate / didUnmount.
 
 import { createTypewriter } from '../../utils/typewriter';
+import { parseTextBlock, plainText, sliceParas } from '../../utils/markdown';
 
 Component({
   props: {
@@ -52,8 +58,10 @@ Component({
       }
 
       const src = Array.isArray(blocks) ? blocks : [];
-      // Build the view model. Text blocks start empty (revealed by typewriter);
-      // images render immediately. `hidden` lets us drop broken images.
+      // Build the view model. Text blocks are parsed once into styled
+      // paragraphs/runs and start unrevealed; images render immediately.
+      // `hidden` lets us drop broken images.
+      const parsed = [];   // per-text-segment parsed paragraphs
       const viewBlocks = src.map((b, i) => {
         if (b.type === 'image') {
           return {
@@ -68,22 +76,26 @@ Component({
         return {
           type: 'text',
           key: 'b' + i,
-          text: b.text || '',
-          revealed: '',
+          paras: parseTextBlock(b.text || ''),
+          revealedParas: [],
           hidden: false,
         };
       });
 
       // Index map: position in viewBlocks for each text segment, so the
       // typewriter's per-segment output maps back to the right block.
+      // Segments are the PLAIN text (markers already stripped into runs),
+      // the typewriter only ever uses .length and .slice on them.
       const textPositions = [];
       const segments = [];
       viewBlocks.forEach((vb, idx) => {
         if (vb.type === 'text') {
           textPositions.push(idx);
-          segments.push(vb.text);
+          parsed.push(vb.paras);
+          segments.push(plainText(vb.paras));
         }
       });
+      this._parsed = parsed;
 
       this.setData({ viewBlocks, typing: segments.length > 0 });
 
@@ -96,7 +108,8 @@ Component({
         const patch = {};
         revealedSegments.forEach((txt, segIdx) => {
           const vbIdx = textPositions[segIdx];
-          patch['viewBlocks[' + vbIdx + '].revealed'] = txt;
+          patch['viewBlocks[' + vbIdx + '].revealedParas'] =
+            sliceParas(parsed[segIdx], txt.length);
         });
         this.setData(patch);
         if (typeof this.props.onGrow === 'function') {

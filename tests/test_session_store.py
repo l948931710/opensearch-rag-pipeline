@@ -66,3 +66,52 @@ def test_concurrent_module_level_api_no_crash(monkeypatch):
     for sid in (f"s{i}" for i in range(8)):
         _, hist = session_store.get_or_create_session(sid)
         assert len(hist) <= session_store.MAX_HISTORY_TURNS * 2
+
+
+def test_clear_session_removes_history(monkeypatch):
+    """clear_session：清除后 get_or_create 返回全新空历史；幂等；空 id 安全。"""
+    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+
+    sid, _ = session_store.get_or_create_session("sess-clear")
+    session_store.append_to_history(sid, "问题", "回答")
+    _, hist = session_store.get_or_create_session(sid)
+    assert len(hist) == 2
+
+    assert session_store.clear_session(sid) is True
+    _, hist2 = session_store.get_or_create_session(sid)
+    assert hist2 == [], "清除后必须是全新空历史"
+
+    assert session_store.clear_session("nonexistent") is False  # 幂等
+    assert session_store.clear_session("") is False
+    assert session_store.clear_session(None) is False
+
+
+def test_concurrent_clear_and_append_no_crash(monkeypatch):
+    """clear 与 append 并发交错：不抛错、不破坏结构（清除点之后历史从零重新累积）。"""
+    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+    errors = []
+
+    def appender():
+        try:
+            for _ in range(200):
+                session_store.append_to_history("race", "q", "a")
+        except Exception as ex:  # noqa: BLE001
+            errors.append(ex)
+
+    def clearer():
+        try:
+            for _ in range(100):
+                session_store.clear_session("race")
+        except Exception as ex:  # noqa: BLE001
+            errors.append(ex)
+
+    threads = [threading.Thread(target=appender) for _ in range(4)] + \
+              [threading.Thread(target=clearer) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"并发 clear/append 抛出异常: {errors[:3]}"
+    _, hist = session_store.get_or_create_session("race")
+    assert len(hist) <= session_store.MAX_HISTORY_TURNS * 2
