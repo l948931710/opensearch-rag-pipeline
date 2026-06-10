@@ -289,22 +289,21 @@ def search(req: SearchRequest, identity: Optional[Identity] = Depends(current_id
     )
 
 
-@app.post("/api/ask", response_model=AskResponse)
-def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
-    """非流式问答接口 — 检索 + LLM 一次性返回。
+def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_images: bool = False):
+    """/api/ask 与 /api/ask/stream 共用的前置段：会话管理、客户端历史合并、
+    身份/部门解析（仅信 Bearer 令牌）、检索 + 计时。
 
-    用 def（非 async）声明：内部全是同步阻塞 I/O（embedding HTTP、HA3、pymysql、LLM
-    requests.post），FastAPI 会把 def 处理器放进线程池执行，避免阻塞事件循环、拖垮并发请求。
+    检索失败统一抛 HTTPException(500)（流式端点也要求在返回 StreamingResponse 之前抛出）。
+    retrieve_and_enrich 经本模块全局名调用，保持测试 monkeypatch(api.retrieve_and_enrich) 接缝。
     """
     t0 = time.time()
 
     # 1. 会话管理
     session_id, session_history = _get_or_create_session(req.session_id)
 
-    # 合并客户端传入的 history 和服务端 session history
+    # 合并客户端传入的 history 和服务端 session history（客户端显式传了则优先）
     merged_history = list(session_history)
     if req.history:
-        # 客户端显式传了 history 则优先使用
         merged_history = [{"role": m.role, "content": m.content} for m in req.history]
 
     uid = identity.user_id if identity else (req.user_id or "")
@@ -314,7 +313,10 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
 
     # 2. 检索
     try:
-        chunks = retrieve_and_enrich(req.question, top_k=req.top_k, user_dept=user_dept)
+        chunks = retrieve_and_enrich(
+            req.question, top_k=req.top_k, user_dept=user_dept,
+            cosurface_images=cosurface_images,
+        )
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -322,6 +324,18 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
 
     t_retrieval = time.time()
     retrieval_latency_ms = int((t_retrieval - t0) * 1000)
+    return t0, session_id, merged_history, uid, user_dept, chunks, t_retrieval, retrieval_latency_ms
+
+
+@app.post("/api/ask", response_model=AskResponse)
+def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
+    """非流式问答接口 — 检索 + LLM 一次性返回。
+
+    用 def（非 async）声明：内部全是同步阻塞 I/O（embedding HTTP、HA3、pymysql、LLM
+    requests.post），FastAPI 会把 def 处理器放进线程池执行，避免阻塞事件循环、拖垮并发请求。
+    """
+    (t0, session_id, merged_history, uid, user_dept,
+     chunks, t_retrieval, retrieval_latency_ms) = _prepare_ask(req, identity)
 
     if not chunks:
         latency = int((time.time() - t0) * 1000)
@@ -449,35 +463,13 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
     """
     import json
 
-    t0 = time.time()
-
-    # 1. 会话管理
-    session_id, session_history = _get_or_create_session(req.session_id)
-
-    merged_history = list(session_history)
-    if req.history:
-        merged_history = [{"role": m.role, "content": m.content} for m in req.history]
-
     # 图文模式才补充图片（纯文本模式不展示图片，跳过 co-surfacing 的额外 HA3 查询）
     _pure = req.pure_text if req.pure_text is not None else get_config().rag.pure_text
 
-    uid = identity.user_id if identity else (req.user_id or "")
-    # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
-    # 请求体里的 user_id 只用于日志归因，绝不能反查部门授予 dept_internal 权限。
-    user_dept = identity.dept if identity else None
-
-    # 2. 检索（同步阶段，在生成器外完成）
-    try:
-        chunks = retrieve_and_enrich(
-            req.question, top_k=req.top_k, user_dept=user_dept,
-            cosurface_images=not _pure,
-        )
-    except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
-        logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
-
-    retrieval_latency_ms = int((time.time() - t0) * 1000)
+    # 前置段与 /api/ask 共用；检索失败在返回 StreamingResponse 之前即抛 500
+    (t0, session_id, merged_history, uid, user_dept,
+     chunks, _t_retrieval, retrieval_latency_ms) = _prepare_ask(
+        req, identity, cosurface_images=not _pure)
     message_id = generate_message_id()
 
     # 无结果：仍发出 message_id 并落库（NO_RESULT），与 /api/ask 空结果分支保持一致
