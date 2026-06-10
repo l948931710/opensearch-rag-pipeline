@@ -100,12 +100,10 @@ RDS note: `001_*.sql` and step-card schema use DB `fuling_knowledge`; `002_feedb
 
 ## Gotchas / things to watch
 
-- **`/api/debug/rds`** is a live, unauthenticated diagnostic endpoint (comment: "上线前删除" — delete before launch). Remove before any real launch.
-- **Streaming `/api/ask/stream` does not log to `qa_session_log`** and emits no `message_id`, so streamed answers can't receive `/api/feedback`. Only `/api/ask` and the DingTalk path log.
-- **Sessions are in-process in-memory** (`session_store.py`) — wrong under multi-worker uvicorn / restart. Swap for Redis to scale.
-- **Open reliability gaps** (acknowledged in `work_report.md`, not yet fixed): no lease/TTL on the optimistic lock (crash mid-`PROCESSING` can wedge a doc); cross-cloud split-brain on irreversible HA3 deletes (no 2-phase commit with RDS — `spot_checker.py`'s `PENDING_DELETE` reconciliation is the pattern to reuse); no per-document VLM cost ceiling.
-- **`.xls`** (legacy binary) is mis-routed to openpyxl and silently fails; HTML/CSV are treated as plain text.
-- Dead/deprecated: `retriever.py::expand_top_document` (`[DEPRECATED]`), `chunker.py` `embedding_text` field (set but never serialized).
+- **Sessions are in-process in-memory** (`session_store.py`) — Dockerfile pins `--workers 1` for this reason; restart loses sessions. Swap for Redis to scale.
+- **Open reliability gaps** (not yet fixed): no general lease/heartbeat on the optimistic locks (stage-3 has a 2h stale-`PROCESSING` takeover; stage-1/2 `content_process_status` has no age guard at all); cross-cloud split-brain on irreversible HA3 deletes (no 2-phase commit with RDS — `spot_checker.py`'s `PENDING_DELETE` reconciliation is the pattern to reuse); partial-batch failures strand fully-INDEXED docs with their old versions still active (dual versions served).
+- **`.xls`** (legacy binary) is explicitly unsupported (clear warning, no silent failure); HTML is tag-stripped and CSV csv-parsed before chunking (`unified_extractor.py`).
+- Qwen-VL endpoint routing (compat vs native) is centralized in `vlm_endpoint.py` — don't hand-build those URLs/payloads in callers.
 - `work_report.md` is management-facing and somewhat spin-flavored (`weekly_changes.json` literally instructs reframing); trust the git log + `tests/eval/*.md` for the objective record.
 
 ## Conventions
