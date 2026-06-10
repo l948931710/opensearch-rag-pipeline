@@ -132,12 +132,18 @@ def refusal_detected(answer: Optional[str]) -> bool:
 
 
 def hard_refusal(answer: Optional[str], max_chars: int = 110) -> bool:
-    """True only when the answer is DOMINATED by a refusal (short + strong decline),
-    so a comprehensive answer that merely notes one missing sub-point is not counted."""
+    """True only when the answer is DOMINATED by a refusal, so a comprehensive answer
+    that merely notes one missing sub-point is not counted. Two paths:
+      - anchored: the strong decline opens the answer (first ~30 chars) -> hard refusal
+        regardless of length (verbose refusals like '抱歉，…未找到。不过…' still decline);
+      - unanchored: strong decline elsewhere counts only when the whole answer is short."""
     if not answer:
         return False
     a = answer.strip()
-    return bool(_REFUSAL_STRONG.search(a)) and len(a) <= max_chars
+    m = _REFUSAL_STRONG.search(a)
+    if not m:
+        return False
+    return m.start() <= 30 or len(a) <= max_chars
 
 
 def source_leak_detected(answer: Optional[str]) -> bool:
