@@ -200,7 +200,8 @@ class LLMConfig:
 @dataclass
 class RAGConfig:
     """RAG 问答 API 配置。"""
-    default_top_k: int = 5
+    # RAG_TOP_K；7 为 2026-06 评测锁定值（top_k=7 + stitch ±1 ≈ 5.7k chars ≤ max_context_chars）
+    default_top_k: int = 7
     max_context_chars: int = 6000
     api_port: int = 8000
     max_history_turns: int = 10
@@ -489,10 +490,12 @@ def load_config() -> PipelineConfig:
             )
         ),
         rag=RAGConfig(
-            default_top_k=_env_int("RAG_TOP_K", 5),
-            max_context_chars=_env_int("RAG_MAX_CONTEXT_CHARS", 6000),
-            api_port=_env_int("RAG_API_PORT", 8000),
-            max_history_turns=_env_int("RAG_MAX_HISTORY_TURNS", 10),
+            # ⚠️ _env_int 自带 RAG_ 前缀：这四项原先写成 _env_int("RAG_TOP_K") 等，
+            # 实际读的是 RAG_RAG_TOP_K —— 文档名（RAG_TOP_K）永远不生效。
+            default_top_k=_env_int("TOP_K", 7),                      # RAG_TOP_K
+            max_context_chars=_env_int("MAX_CONTEXT_CHARS", 6000),   # RAG_MAX_CONTEXT_CHARS
+            api_port=_env_int("API_PORT", 8000),                     # RAG_API_PORT
+            max_history_turns=_env_int("MAX_HISTORY_TURNS", 10),     # RAG_MAX_HISTORY_TURNS
             pure_text=_env_bool("PURE_TEXT", False),               # RAG_PURE_TEXT
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH

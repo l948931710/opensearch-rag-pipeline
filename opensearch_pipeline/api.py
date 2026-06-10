@@ -112,7 +112,10 @@ class ChatMessage(BaseModel):
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000, description="用户问题")
-    top_k: int = Field(7, ge=1, le=20, description="检索返回的文档数量")
+    top_k: int = Field(
+        default_factory=lambda: get_config().rag.default_top_k,
+        ge=1, le=20, description="检索返回的文档数量（默认取 RAG_TOP_K，评测锁定 7）",
+    )
     history: Optional[List[ChatMessage]] = Field(None, description="对话历史")
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
     temperature: Optional[float] = Field(0.1, ge=0.0, le=2.0, description="生成温度")

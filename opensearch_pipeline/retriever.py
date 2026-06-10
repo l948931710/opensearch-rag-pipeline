@@ -1112,7 +1112,7 @@ def cosurface_doc_images(
 def retrieve_and_enrich(
     query: str,
     *,
-    top_k: int = 7,
+    top_k: Optional[int] = None,
     user_dept: Optional[str] = None,
     stitch_window: int = 1,
     cosurface_images: bool = False,
@@ -1132,7 +1132,7 @@ def retrieve_and_enrich(
 
     Args:
         query: 用户查询文本
-        top_k: 检索返回的 chunk 数量
+        top_k: 检索返回的 chunk 数量；None 取 RAG_TOP_K（评测锁定默认 7）
         user_dept: 用户部门（用于权限过滤）
         stitch_window: 邻居拼接窗口大小（±N）
         cosurface_images: 是否为高分文档补充 image chunk（图文渲染路径传 True；
@@ -1142,6 +1142,8 @@ def retrieve_and_enrich(
     Returns:
         经过检索 + 邻居拼接（+ 可选图片召回）后的 chunks 列表
     """
+    if top_k is None:
+        top_k = get_config().rag.default_top_k  # RAG_TOP_K（此前写死 7，环境变量是哑的）
     # 路由式重排开启时：over-fetch rerank_pool 个候选 → 重排 → 取 top_k；否则直接取 top_k。
     _av = get_config().alibaba_vector
     _fetch_k = max(_av.rerank_pool, top_k) if _av.rerank_enable else top_k

@@ -283,3 +283,40 @@ class TestProcedureParentExpansion:
         assert len(cursor.queries) == 1
         assert "parent_chunk_id IN" in cursor.queries[0][0]
         assert cursor.queries[0][1] == ("P1",)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. RAG_TOP_K / RAG_MAX_HISTORY_TURNS 接线（此前定义了但没人读）
+# ═══════════════════════════════════════════════════════════════
+
+class TestDeadConfigKnobsWired:
+    def test_rag_top_k_env_is_effective(self):
+        assert _fresh_load(RAG_TOP_K="3").rag.default_top_k == 3
+        # 默认从 5 抬到 7：与生产实际值一致（评测锁定），接线不改变现行为
+        assert _fresh_load().rag.default_top_k == 7
+
+    def test_retrieve_and_enrich_default_top_k_from_config(self, monkeypatch):
+        """top_k=None → 取 config.rag.default_top_k（穿透到 search_chunks）。"""
+        import opensearch_pipeline.retriever as retriever_mod
+        from opensearch_pipeline.config import get_config
+
+        captured = {}
+        monkeypatch.setattr(retriever_mod, "get_query_embedding", lambda q: None)
+        monkeypatch.setattr(
+            retriever_mod, "search_chunks",
+            lambda query, top_k, user_dept=None, query_embedding=None, **kw:
+                captured.update(top_k=top_k) or [],
+        )
+        monkeypatch.setattr(get_config().alibaba_vector, "rerank_enable", False)
+
+        retriever_mod.retrieve_and_enrich("测试问题")
+        assert captured["top_k"] == get_config().rag.default_top_k
+
+        retriever_mod.retrieve_and_enrich("测试问题", top_k=3)
+        assert captured["top_k"] == 3
+
+    def test_session_store_history_turns_from_config(self):
+        from opensearch_pipeline import session_store
+        from opensearch_pipeline.config import get_config
+
+        assert session_store.MAX_HISTORY_TURNS == get_config().rag.max_history_turns

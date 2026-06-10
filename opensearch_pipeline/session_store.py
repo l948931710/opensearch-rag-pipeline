@@ -14,9 +14,12 @@ import uuid
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
+from opensearch_pipeline.config import get_config
+
 logger = logging.getLogger(__name__)
 
-MAX_HISTORY_TURNS = 10  # 保留最近 N 轮对话
+# 保留最近 N 轮对话 = RAG_MAX_HISTORY_TURNS（此前写死 10，环境变量是哑的）
+MAX_HISTORY_TURNS = get_config().rag.max_history_turns
 MAX_SESSIONS = int(os.environ.get("RAG_MAX_SESSIONS", "500"))
 SESSION_TIMEOUT_SECONDS = int(os.environ.get("RAG_SESSION_TIMEOUT", "1800"))  # 30 分钟
 
