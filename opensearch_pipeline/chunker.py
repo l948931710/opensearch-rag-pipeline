@@ -41,6 +41,17 @@ _STEP_SECTION_HEADERS = frozenset({
 })
 
 
+def _stable_pk_from_chunk_id(chunk_id: str) -> int:
+    """chunk_id → 63 位确定性整数，作为缺少 rds_id 时的 HA3 主键兜底。
+
+    不能用内建 hash()：PYTHONHASHSEED 默认随机化，跨进程/跨运行结果不同——
+    同一 chunk 重推会得到新主键（索引里出现重复文档），按主键删除也永远对不上。
+    生产路径（orchestrator 从 RDS 重载）总是带 rds_id，本兜底只服务模拟/进程内推送。
+    """
+    digest = hashlib.md5(chunk_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
 @dataclass
 class Chunk:
     """单个 chunk 的数据结构。"""
@@ -161,7 +172,7 @@ class Chunk:
         - 不支持嵌套对象字段
         """
         doc = {
-            pk_field: self.rds_id if self.rds_id is not None else hash(self.chunk_id) & 0x7FFFFFFFFFFFFFFF,
+            pk_field: self.rds_id if self.rds_id is not None else _stable_pk_from_chunk_id(self.chunk_id),
             "doc_id": self.doc_id,
             "chunk_id": self.chunk_id,
             "version_no": self.version_no,
