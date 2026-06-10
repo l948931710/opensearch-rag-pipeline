@@ -59,7 +59,7 @@ Production entry: `dataworks_orchestrator.py --stage {1|2|3} --bizdate ${bizdate
 
 ### Serving — shared core, two frontends (online, runs on SAE)
 
-Shared modules consumed by **both** `api.py` (FastAPI) and `dingtalk_bot.py`: `retriever.py`, `llm_generator.py`, `session_store.py`, `qa_logger.py`, `feedback_handler.py`, `content_blocks_builder.py`.
+Shared modules consumed by **both** `api.py` (FastAPI) and `dingtalk_bot.py`: `retriever.py`, `llm_generator.py`, `session_store.py`, `qa_logger.py`, `feedback_handler.py`, `content_blocks_builder.py`, `answer_flow.py` (**pure** bookkeeping: the single source for `qa_session_log` payloads via `build_qa_log_kwargs`, the history-append policy, and the NO_RESULT message — keep it side-effect-free; `log_qa_session`/`append_to_history` calls stay at the four call sites because tests monkeypatch those module-global names).
 
 - **Retrieval** (`retriever.py`, `retrieve_and_enrich`, `top_k=7`): query-embed → HA3 **3-way hybrid** (Dense + Sparse in the kNN path, BM25 on `chunk_text`) → cover-page demotion → neighbor stitching (±1 from RDS) → step-card expansion. Fusion is **`weighted` (knn 0.7 / text 0.3)** by default — eval showed weighted > RRF. Permission filtering is **server-side in HA3** with the dept value whitelisted against filter-injection. **No learned reranker.**
 - **Query embeddings must use the DashScope *native* API** (`output_type=dense&sparse`). OpenAI compatible-mode drops the sparse vector and silently tanks recall.
