@@ -129,6 +129,7 @@
   .blk-img figure:active{transform:scale(.985);box-shadow:var(--sh-2);}
   .blk-img figure:focus-visible{outline:2px solid var(--brand);outline-offset:2px;}
   .blk-img svg{display:block;width:100%;height:auto;}
+  .blk-img figure>img{display:block;width:100%;height:auto;}   /* LIVE 实测：真实 OSS 截图与 SVG 占位同栅格 */
   .blk-img figcaption{font-size:var(--fs-sm);color:var(--text-3);padding:7px 11px;background:var(--surface);border-top:1px solid var(--line);display:flex;align-items:center;gap:6px;}
   .blk-img figcaption svg{width:13px;height:13px;flex-shrink:0;opacity:.75;}
   .blk-img .cap-text{flex:1;min-width:0;}
@@ -275,6 +276,7 @@
   .lb-close:focus-visible,.lb-arrow:focus-visible{outline:2px solid #fff;outline-offset:2px;}
   .lb-stage{width:100%;flex:1;display:flex;align-items:center;justify-content:center;padding:0 8px;}
   .lb-stage svg{max-width:92%;max-height:74vh;border-radius:var(--r-sm);background:#fff;box-shadow:0 8px 40px rgba(0,0,0,.5);}
+  .lb-stage img{max-width:92%;max-height:74vh;border-radius:var(--r-sm);background:#fff;box-shadow:0 8px 40px rgba(0,0,0,.5);}   /* LIVE 实测真图 */
   .lb-cap{color:#e6e8ec;font-size:var(--fs-sm);text-align:center;padding:12px 24px 6px;max-width:90%;}
   .lb-count{color:#9aa0a8;font-size:var(--fs-sm);padding-bottom:18px;font-variant-numeric:tabular-nums;}
   .lb-arrow{position:absolute;top:50%;transform:translateY(-50%);color:#fff;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.14);border:none;padding:0;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;user-select:none;}
@@ -811,9 +813,21 @@ function buildFigure(blk, failed){
       <figcaption>${ICON.image}<span class="cap-text"></span><span class="zoom-hint">${ICON.expand}<span>点按放大</span></span></figcaption>
     </figure>`;
   const figure = fig.querySelector('figure');
-  if(!failed) figure.insertBefore(svgEl(blk.svg), figure.firstChild);
+  if(!failed){
+    if(blk.url){
+      /* LIVE 实测：真实 OSS 签名 URL；加载失败（403 过期等）原位降级为 failed 态，不静默移除 */
+      const img = document.createElement('img');
+      img.alt = blk.alt || blk.caption || '';
+      img.addEventListener('error', ()=>{ fig.replaceWith(buildFigure(blk, true)); }, {once:true});
+      img.src = blk.url;
+      figure.insertBefore(img, figure.firstChild);
+    } else {
+      figure.insertBefore(svgEl(blk.svg), figure.firstChild);
+    }
+  }
   fig.querySelector('.cap-text').textContent = blk.caption || '';
-  figure.dataset.svg = blk.svg;
+  if(blk.svg) figure.dataset.svg = blk.svg;
+  if(blk.url) figure.dataset.url = blk.url;
   figure.dataset.caption = blk.caption || '';
   if(failed) fig.querySelector('.zoom-hint').style.display = 'none';
   return fig;
@@ -1087,11 +1101,11 @@ let lbImages = [];   // [{svg, caption}]
 let lbIdx = 0;
 let lbReturnFocus = null;   // 关闭后焦点还给来源图
 
-function openLightbox(cardEl, svgKey, originEl){
-  // 收集该回答内所有图片，定位当前
+function openLightbox(cardEl, key, originEl){
+  // 收集该回答内所有图片，定位当前（key = svg 占位键 或 LIVE 实测真图 URL）
   const figs = [...cardEl.querySelectorAll('.blk-img:not(.failed) figure')];
-  lbImages = figs.map(f=>({svg:f.dataset.svg, caption:f.dataset.caption}));
-  lbIdx = Math.max(0, lbImages.findIndex(x=>x.svg===svgKey));
+  lbImages = figs.map(f=>({svg:f.dataset.svg, url:f.dataset.url, caption:f.dataset.caption}));
+  lbIdx = Math.max(0, lbImages.findIndex(x=>(x.url||x.svg)===key));
   lbReturnFocus = originEl || null;
   renderLb();
   lightbox.classList.add('open');
@@ -1099,7 +1113,12 @@ function openLightbox(cardEl, svgKey, originEl){
 }
 function renderLb(){
   lbStage.innerHTML = '';
-  lbStage.appendChild(svgEl(lbImages[lbIdx].svg));
+  if(lbImages[lbIdx].url){
+    const img = document.createElement('img');
+    img.src = lbImages[lbIdx].url;
+    img.alt = lbImages[lbIdx].caption || '';
+    lbStage.appendChild(img);
+  } else lbStage.appendChild(svgEl(lbImages[lbIdx].svg));
   lbCap.textContent = lbImages[lbIdx].caption || '';
   lbCount.textContent = `${lbIdx+1} / ${lbImages.length}`;
   lbPrev.toggleAttribute('disabled', lbIdx===0);
@@ -1123,15 +1142,15 @@ chat.addEventListener('click', (e)=>{
   if(blkImg.classList.contains('failed')){
     const fallback = fig.querySelector('.img-fallback span');
     fallback.textContent = '正在重新加载…';
-    setTimeout(()=>{   // 真实端：刷新签名 URL 后重设 image src
-      const fresh = buildFigure({svg:fig.dataset.svg, caption:fig.dataset.caption}, false);
+    setTimeout(()=>{   // 真实端：刷新签名 URL 后重设 image src（LIVE 实测：原 URL 重试）
+      const fresh = buildFigure({svg:fig.dataset.svg, url:fig.dataset.url, caption:fig.dataset.caption}, false);
       blkImg.replaceWith(fresh);
       toast('已重新加载');
     }, 600);
     return;
   }
   const card = fig.closest('.ai-card');
-  openLightbox(card, fig.dataset.svg, fig);
+  openLightbox(card, fig.dataset.url || fig.dataset.svg, fig);
 });
 
 /* 键盘左右 / Esc */
@@ -1152,6 +1171,65 @@ lbStage.addEventListener('touchend', e=>{
   else if(dx < -40 && lbIdx<lbImages.length-1){ lbIdx++; renderLb(); }
   touchX = null;
 }, {passive:true});
+
+/* ========================= LIVE 实测桥（开发自测用，不属于设计稿） =========================
+   ?api=http://127.0.0.1:8000 时绕过 CONVERSATION 脚本，直连真实 /api/ask（RAG_ENV=test 本地后端）。
+   响应按 AskResponse 契约映射进同一套渲染管线：blocks[]（text/image-url）、sources.level、
+   guard、no_result；session_id 跨轮复用（多轮上下文）。window.LIVE_LOG 留存每轮原始响应供检查。 */
+const LIVE_API = new URLSearchParams(location.search).get('api');
+let liveSession = null;
+window.LIVE_LOG = [];
+function mapLiveAnswer(resp){
+  if(resp.no_result) return {noResult:true, rephrase:[]};
+  const blocks = (resp.blocks && resp.blocks.length)
+    ? resp.blocks.map(b => b.type==='image'
+        ? {type:'image', url:b.url, caption:b.caption||'', alt:b.alt||b.caption||''}
+        : {type:'text', text:b.text||''})
+    : [{type:'text', text: resp.answer||''}];
+  return {guard: !!resp.guard, blocks, sources: resp.sources||[]};
+}
+function askLive(question){
+  if(busy) return;
+  busy = true; updateSendState();
+  addUserMsg(question);
+  const skel = addSkeleton();
+  const t0 = performance.now();
+  fetch(LIVE_API + '/api/ask', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({question, session_id: liveSession || undefined, user_id:'miniapp-proto-live'})
+  })
+  .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+  .then(resp => {
+    liveSession = resp.session_id || liveSession;
+    window.LIVE_LOG.push({q:question, ms:Math.round(performance.now()-t0), resp});
+    console.log('[LIVE]', question, JSON.stringify(resp));
+    skel.remove();
+    const answer = mapLiveAnswer(resp);
+    if(answer.noResult){
+      const card = buildNoResultCard(answer);
+      chat.appendChild(card); wireNoResultCard(card);
+      scrollToBottom(true); setServiceState(true);
+      busy = false; updateSendState();
+    } else {
+      runAnswer(answer);
+    }
+  })
+  .catch(err => {
+    console.warn('[LIVE] 请求失败', err);
+    skel.remove();
+    const card = buildErrorCard();
+    chat.appendChild(card); scrollToBottom(true); setServiceState(false);
+    busy = false; updateSendState();
+    card.querySelector('.btn-retry').addEventListener('click', ()=>{
+      if(busy) return; card.remove(); askLive(question);
+    }, {once:true});
+  });
+}
+if(LIVE_API){
+  const _setSvc = setServiceState;
+  setServiceState = (ok)=>{ _setSvc(ok); if(ok) subtitleEl.textContent = '企业知识库 · 在线 · LIVE实测'; };
+  subtitleEl.textContent = '企业知识库 · LIVE实测';
+}
 
 /* ========================= 输入栏 / 发送 =========================
    打字中按钮变「停止」：点按即整段直出剩余内容（不是丢弃回答 —— 内容已在客户端，丢弃毫无意义） */
@@ -1174,6 +1252,7 @@ function doSend(){
   const v = input.value.trim();
   if(!v) return;
   input.value=''; input.style.height='auto'; updateSendState();
+  if(LIVE_API){ askLive(v); return; }   // LIVE 实测：一切输入直连真实后端
   // 匹配脚本问题（demo key 不参与文本匹配，仅 chip 直达）
   const hit = Object.values(CONVERSATION).find(c=>c.q===v && !c.answer.error && !c.answer.imgFailed);
   if(hit) ask(hit.q, hit.answer);
@@ -1193,6 +1272,7 @@ QUICK.forEach(q=>{
   chip.addEventListener('click', ()=>{
     if(busy) return;
     const c = CONVERSATION[q.key];
+    if(LIVE_API){ askLive(c.q); return; }   // LIVE 实测：示例问题也走真实后端
     ask(c.q, c.answer);
   });
   quick.appendChild(chip);
