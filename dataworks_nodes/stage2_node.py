@@ -55,13 +55,16 @@ if current_dir not in sys.path:
 # 2. 解析调度参数
 # ═══════════════════════════════════════════════════════════════
 print("=== 3. 解析调度参数 ===")
-bizdate = "20260521"
+# 兜底 bizdate = T-1（与 DataWorks ${bizdate} 语义一致）。原先硬编码 '20260521'：
+# 节点漏配调度参数时会永远跑在那个过期日期上且毫无报错。
+from datetime import datetime, timedelta
+bizdate = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
 if len(sys.argv) > 1:
     arg_val = sys.argv[1]
     bizdate = arg_val.split("=")[-1].strip() if "=" in arg_val else arg_val.strip()
     print(f"💡 bizdate: {bizdate}")
 else:
-    print(f"⚠️ 未获取到参数，使用默认: {bizdate}")
+    print(f"⚠️ 未获取到调度参数，按 T-1 兜底: {bizdate}")
 
 # ═══════════════════════════════════════════════════════════════
 # 3. 执行 Stage 2
