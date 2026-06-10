@@ -7,7 +7,12 @@ import random
 import requests
 import json
 from opensearch_pipeline.config import get_config
-from opensearch_pipeline.pipeline_nodes import _get_db_conn, _get_opensearch_client, _clean_llm_json_response
+from opensearch_pipeline.pipeline_nodes import (
+    _clean_llm_json_response,
+    _get_db_conn,
+    _get_opensearch_client,
+    _search_delete_old_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +23,12 @@ def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config) -> Non
     成功时静默返回，失败时抛出异常由调用方处理。
     """
     os_client = _get_opensearch_client()
+    if os_client == "MOCK_HA3_CLIENT":
+        # simulate 开关错配时绝不静默：mock 字符串会掉进 delete_by_query 分支炸出晦涩的
+        # AttributeError；这里换成明确错误，由调用方按删除失败处理（PENDING_DELETE 重试）
+        raise RuntimeError(
+            "MOCK_HA3_CLIENT in real-mode index delete; simulate flags are inconsistent."
+        )
 
     if hasattr(os_client, "push_documents"):
         # HA3 Engine: 查询 chunk 主键后用 push_documents cmd=delete 删除
@@ -128,6 +139,121 @@ def reconcile_pending_deletes() -> dict:
 
     return result
 
+
+def reconcile_stranded_versions() -> dict:
+    """搁浅版本对账：修复「新版本已全量 INDEXED、旧版本 chunk 仍 active」的双版本文档。
+
+    成因：DAG 3 部分失败时 node_update_index_status raise → node_deactivate_old_chunks
+    被跳过，orchestrator 回滚把同一跑里**全量推送成功**的文档也标成 FAILED；它们的
+    chunk_meta 已是 INDEXED，stage-3 loader（只重选 NOT_INDEXED/FAILED 的 chunk）永远
+    不会再碰它们 → 新旧两个版本同时被检索，且无任何任务能自愈。
+
+    与 reconcile_pending_deletes 同型：先删搜索索引里的旧 chunk，成功后才停用 RDS 旧
+    chunk 并把 document_version 修成 SUCCESS —— 索引删除失败时 RDS 不动，文档保持可
+    检测，下次运行重试。逐文档提交，单文档失败不影响其余。本函数绝不抛异常。
+
+    Returns:
+        {"total": int, "success": int, "failed": int, "errors": [str]}
+    """
+    result = {"total": 0, "success": 0, "failed": 0, "errors": []}
+    config = get_config()
+
+    try:
+        conn = _get_db_conn(select_db=True)
+    except Exception as e:
+        result["errors"].append(f"DB connect failed: {e}")
+        return result
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT cm_new.doc_id, cm_new.version_no
+                FROM (
+                    SELECT doc_id, MAX(version_no) AS version_no
+                    FROM chunk_meta WHERE is_active = 1
+                    GROUP BY doc_id
+                ) cm_new
+                JOIN document_version dv
+                  ON dv.doc_id = cm_new.doc_id AND dv.version_no = cm_new.version_no
+                WHERE dv.status = 'active'
+                  AND (dv.publish_status IS NULL OR dv.publish_status != 'QUARANTINED')
+                  AND (dv.index_status != 'PROCESSING'
+                       OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
+                  AND EXISTS (SELECT 1 FROM chunk_meta o
+                              WHERE o.doc_id = cm_new.doc_id
+                                AND o.version_no < cm_new.version_no AND o.is_active = 1)
+                  AND EXISTS (SELECT 1 FROM chunk_meta n
+                              WHERE n.doc_id = cm_new.doc_id
+                                AND n.version_no = cm_new.version_no
+                                AND n.is_active = 1 AND n.index_status = 'INDEXED')
+                  AND NOT EXISTS (SELECT 1 FROM chunk_meta n2
+                                  WHERE n2.doc_id = cm_new.doc_id
+                                    AND n2.version_no = cm_new.version_no
+                                    AND n2.is_active = 1 AND n2.index_status != 'INDEXED')
+                LIMIT 200
+            """)
+            # 谓词解读：最新 active 版本的 chunk【全部】INDEXED（≥1 条，"已验证索引成功"）、
+            # 旧版本仍有 active chunk（搁浅特征）、未被隔离、且不与 2h 内在跑的 stage-3 抢锁。
+            rows = cursor.fetchall()
+
+        result["total"] = len(rows)
+        if not rows:
+            return result
+
+        logger.info(
+            "[RECONCILE] Found %d stranded doc version(s) (new fully INDEXED, old still active)",
+            len(rows),
+        )
+
+        os_client = _get_opensearch_client()
+        index_name = getattr(config.opensearch, "index_name", "fuling_knowledge_v1")
+
+        for doc_id, version_no in rows:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id FROM chunk_meta
+                        WHERE doc_id = %s AND version_no < %s AND is_active = 1
+                    """, (doc_id, version_no))
+                    old_ids = [r[0] for r in cursor.fetchall()]
+
+                # 先删索引、成功后才动 RDS（与 node_deactivate_old_chunks 同序）
+                _search_delete_old_chunks(os_client, config, index_name, doc_id, version_no, old_ids)
+
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE chunk_meta
+                        SET is_active = FALSE, index_status = 'DELETED'
+                        WHERE doc_id = %s AND version_no < %s AND is_active = 1
+                    """, (doc_id, version_no))
+                    cursor.execute("""
+                        UPDATE document_version
+                        SET index_status = 'SUCCESS'
+                        WHERE doc_id = %s AND version_no = %s
+                    """, (doc_id, version_no))
+                conn.commit()
+                result["success"] += 1
+                logger.info(
+                    "[RECONCILE] Healed stranded version %s v%s (deactivated %d old chunks)",
+                    doc_id, version_no, len(old_ids),
+                )
+            except Exception as e:
+                conn.rollback()
+                result["failed"] += 1
+                err = f"Stranded-version heal failed for {doc_id} v{version_no}: {e}"
+                result["errors"].append(err)
+                logger.warning("[RECONCILE] %s", err)
+    except Exception as e:
+        # 检测查询/客户端初始化等整体失败：报告但不抛（对账失败不阻断当日入库）
+        err = f"reconcile_stranded_versions aborted: {e}"
+        result["errors"].append(err)
+        logger.error("[RECONCILE] %s", err, exc_info=True)
+    finally:
+        conn.close()
+
+    return result
+
+
 def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = None) -> dict:
     """
     安全定时抽检守护任务：
@@ -169,6 +295,13 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
         print(f"    └─ [RECONCILE] Retried {reconcile_result['total']} pending deletes: "
               f"{reconcile_result['success']} success, {reconcile_result['failed']} failed")
         report["errors"].extend(reconcile_result["errors"])
+
+    # 再对账：修复搁浅的双版本文档（orchestrator stage-3 启动前也会跑，这里是独立兜底）
+    stranded_result = reconcile_stranded_versions()
+    if stranded_result["total"] > 0:
+        print(f"    └─ [RECONCILE] Healed {stranded_result['success']}/{stranded_result['total']} "
+              f"stranded doc versions, {stranded_result['failed']} failed")
+        report["errors"].extend(stranded_result["errors"])
     try:
         conn = _get_db_conn(select_db=True)
     except Exception as e:

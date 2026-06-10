@@ -49,6 +49,13 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
         "bizdate": bizdate,
         "simulate": simulate,
         "simulate_api": simulate, # 模拟 API 随 simulate 自动决定
+        # 细粒度开关显式下传：_resolve_simulate 的优先级是 ctx 细粒度 > ctx 全局 > config。
+        # 此前 orchestrator 只设 ctx["simulate"]，RAG_SIMULATE_DB/OSS/OPENSEARCH 在调度链路下
+        # 全是死配置。`simulate or ...`：--simulate 运行必须全模拟（细粒度键优先级最高，
+        # 不强制 True 会让 production 配置在模拟跑里做真实 I/O）；生产跑则透传 config。
+        "simulate_db": simulate or config.simulate_db,
+        "simulate_oss": simulate or config.simulate_oss,
+        "simulate_opensearch": simulate or config.simulate_opensearch,
         "cost_breaker": cost_breaker,  # 注入抽取节点 → UnifiedExtractor.cost_breaker
     }
 
@@ -264,6 +271,14 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
 
     elif stage == 3:
         # ══ Stage 3 运行 ══
+        if not simulate and config.simulate_db != config.simulate_opensearch:
+            # DAG 3 同时改写 RDS 与 HA3（推送新版本 + 停用旧版本）。一真一假必然裂脑：
+            # 只删一边/只停用一边，文档双版本同时被检索或直接消失。宁可拒跑。
+            raise RuntimeError(
+                f"Refusing stage 3: simulate_db={config.simulate_db} but "
+                f"simulate_opensearch={config.simulate_opensearch}. DAG 3 writes both stores; "
+                "mixed real/mock between them causes split-brain."
+            )
         dag = build_dag3_chunk_to_opensearch()
         if simulate:
             # 模拟环境：我们需要依次运行 Stage 1 & Stage 2，以生成 valid_chunks
@@ -444,6 +459,39 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
         raise ValueError(f"Invalid stage number: {stage}. Must be 1, 2, or 3.")
 
 
+def _reset_stale_stage2_locks() -> int:
+    """Stage-2 失效锁接管：LOADING（loader 抢占后崩溃）和 PROCESSING（DAG2 节点内崩溃）
+    都没有年龄守卫，进程崩溃会让行永久卡死，且 _count_pending_rows(2) 两个状态都看不见
+    （静默 wedge）。复用 node_acquire_index_lock 的 2h 失效约定：重置为 FAILED 并
+    retry_count+1，由既有抢占谓词 (FAILED AND retry_count<3) 自然重新入队；持续把进程
+    搞崩的"毒文档"3 次后停在 FAILED 等人工检查，不会无限崩溃循环。
+    updated_at=NOW() 显式刷新：并发实例中只有第一个接管成功（changed-rows 语义）。"""
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    conn = None
+    try:
+        conn = _get_db_conn(select_db=True)
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE document_version
+                SET content_process_status = 'FAILED',
+                    content_process_error = CONCAT('[STALE_LOCK_TAKEOVER] was ',
+                        content_process_status, ' >2h without progress; reset for retry'),
+                    retry_count = retry_count + 1,
+                    updated_at = NOW()
+                WHERE content_process_status IN ('LOADING', 'PROCESSING')
+                  AND status = 'active'
+                  AND updated_at < NOW() - INTERVAL 2 HOUR
+            """)
+            n = cur.rowcount
+            conn.commit()
+        if n:
+            print(f"[Orchestrator] Stage 2: reset {n} stale LOADING/PROCESSING row(s) to FAILED")
+        return n
+    finally:
+        if conn:
+            conn.close()
+
+
 def _count_pending_rows(stage: int) -> int:
     """生产模式下统计某 stage 仍待处理的行数（用于 drain-loop 的进度判定）。
 
@@ -504,6 +552,20 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         run_stage(stage, bizdate, simulate)
         return
 
+    if stage == 3:
+        # ── 搁浅版本对账：上一次部分失败可能留下「新版本已全量 INDEXED 但旧版本仍 active」
+        # 的文档（双版本同时被检索）。必须在 drain 循环之前跑：这类文档没有待处理 chunk，
+        # _count_pending_rows(3)==0 时 run_stage 根本不会执行。失败不阻断当日入库（优雅降级）。
+        from opensearch_pipeline.spot_checker import reconcile_stranded_versions
+        try:
+            rec = reconcile_stranded_versions()
+            if rec["total"]:
+                print(f"[Orchestrator] Stranded-version reconcile: {rec['success']}/{rec['total']} "
+                      f"healed, {rec['failed']} failed")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: stranded-version reconcile failed (non-fatal): {e}",
+                  file=sys.stderr)
+
     max_iters = int(os.environ.get("RAG_DRAIN_MAX_ITERS", "100000"))
     prev_remaining = None
     iteration = 0
@@ -515,6 +577,10 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
                 f"Stage {stage} drain-loop hit RAG_DRAIN_MAX_ITERS={max_iters} without draining; "
                 f"aborting so the run is marked failed."
             )
+        if stage == 2:
+            # 失效锁接管放在计数之前：被接管的行变回 FAILED&retry<3，本轮计数即可看见，
+            # 也能恢复 drain 中途 wedge 的行
+            _reset_stale_stage2_locks()
         remaining = _count_pending_rows(stage)
         if remaining == 0:
             print(f"[Orchestrator] Stage {stage} drained: 0 pending rows after {iteration - 1} batch(es).")

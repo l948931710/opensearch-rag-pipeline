@@ -28,12 +28,13 @@ def _ensure_ha3_mock_modules():
         ha3_models = types.ModuleType("alibabacloud_ha3engine_vector.models")
         ha3_client = types.ModuleType("alibabacloud_ha3engine_vector.client")
 
-        # Mock PushDocumentsRequest
+        # Mock PushDocumentsRequest（真实 SDK 接受 body= 构造参数；mock 落后于此签名
+        # 曾让所有走 PushDocumentsRequest(body=...) 的用例在本模块导入后全部炸掉）
         class MockPushDocumentsRequest:
-            def __init__(self):
-                self._body = None
+            def __init__(self, body=None):
+                self.body = body
             def set_body(self, body):
-                self._body = body
+                self.body = body
 
         ha3_models.PushDocumentsRequest = MockPushDocumentsRequest
         ha3_models.Config = MagicMock

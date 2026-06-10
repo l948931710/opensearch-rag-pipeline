@@ -140,12 +140,17 @@ def _resolve_simulate(ctx: dict, kind: str, default=None) -> bool:
     return ctx.get(f"simulate_{kind}", ctx.get("simulate", default))
 
 
-def _get_opensearch_client():
+def _get_opensearch_client(ctx: dict = None):
     from opensearch_pipeline.config import get_config
     config = get_config()
-    
-    # 💡 如果是模拟模式，我们不需要真正的客户端，返回 Mock 字符串以允许干跑/Simulation 顺利通过
-    if config.simulate_opensearch:
+
+    # 💡 如果是模拟模式，我们不需要真正的客户端，返回 Mock 字符串以允许干跑/Simulation 顺利通过。
+    #    DAG 节点必须传 ctx：开关按 ctx 细粒度 > ctx 全局 > config 解析（与 _get_oss_bucket 一致），
+    #    否则 ctx/config 不一致时真实跑会拿到 mock、假装 INDEXED 后又真删 RDS 旧版本（裂脑）。
+    simulate_opensearch = config.simulate_opensearch
+    if ctx is not None:
+        simulate_opensearch = _resolve_simulate(ctx, "opensearch", default=simulate_opensearch)
+    if simulate_opensearch:
         return "MOCK_HA3_CLIENT"
         
     cfg = config.alibaba_vector
@@ -3111,6 +3116,77 @@ def node_acquire_index_lock(ctx: dict):
         print(f"    └─ Successfully acquired index lock for {len(valid_doc_versions)} document versions, {len(chunks)} chunks remaining.")
 
 
+def _search_delete_old_chunks(client, config, index_name: str, doc_id: str, ver: int,
+                              old_chunk_ids: list) -> None:
+    """从搜索索引删除某文档 version_no < ver 的旧 chunk（node_deactivate_old_chunks 与
+    搁浅版本对账 reconcile_stranded_versions 共用，防两份实现漂移）。
+
+    HA3 按 chunk_meta.id（INT64 主键，与 to_ha3_doc 的 rds_id 同源）delete；
+    标准 OpenSearch 用 delete_by_query。幂等：not_found/no_op 视为成功。失败抛异常。
+    """
+    if client == "MOCK_HA3_CLIENT":
+        # 真实删除路径绝不接受 mock 客户端：继续会"假装删了索引、真停用 RDS 旧版本"→ 裂脑
+        raise RuntimeError(
+            "MOCK_HA3_CLIENT surfaced in a real-mode search delete; "
+            "simulate flags are inconsistent (ctx vs config). Aborting."
+        )
+    if hasattr(client, "push_documents"):
+        if not old_chunk_ids:
+            print(f"    ├─ [HA3 Engine] No older chunks found in RDS to deactivate for '{doc_id}'")
+            return
+        from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
+        cfg = config.alibaba_vector
+        ha3_deletes = [{"cmd": "delete", "fields": {cfg.pk_field: cid}} for cid in old_chunk_ids]
+        request = PushDocumentsRequest(body=ha3_deletes)
+
+        resp = client.push_documents(cfg.table_name, cfg.pk_field, request)
+        status_code = getattr(resp, 'status_code', 200)
+        body_msg = str(getattr(resp, 'body', ''))
+        text_msg = str(getattr(resp, 'text', ''))
+        combined_msg = (body_msg + " | " + text_msg).lower()
+
+        is_success = (200 <= status_code < 300)
+        if not is_success:
+            try:
+                if hasattr(resp, "json") and callable(resp.json):
+                    resp_json = resp.json()
+                    err_code = resp_json.get("code") or resp_json.get("errors", [{}])[0].get("code")
+                    err_msg = str(resp_json).lower()
+                    if err_code in ["DocumentNotFound", "IndexNotFound", 7504, 7500] or any(ind in err_msg for ind in ["not_found", "not found", "no_op", "no-op"]):
+                        print(f"    ├─ [HA3 Engine] Idempotent success detected in parsed JSON error: {err_msg}")
+                        is_success = True
+            except Exception:
+                pass
+
+            # Fallback to text check if JSON didn't catch it
+            if not is_success:
+                idempotent_indicators = ["not_found", "not found", "no_op", "no-op"]
+                if any(ind in combined_msg for ind in idempotent_indicators):
+                    print(f"    ├─ [HA3 Engine] Idempotent success detected in response body: {combined_msg}")
+                    is_success = True
+
+        if not is_success:
+            raise RuntimeError(f"HA3 pushDocuments delete failed with status_code {status_code}, response: {combined_msg}")
+        print(f"    ├─ [HA3 Engine] Deactivated {len(old_chunk_ids)} old chunks for '{doc_id}' in table '{cfg.table_name}': status={status_code}")
+    else:
+        # Original OpenSearch DELETE BY QUERY
+        body = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"doc_id": doc_id}},
+                        {"range": {"version_no": {"lt": ver}}}
+                    ]
+                }
+            }
+        }
+        resp = client.delete_by_query(index=index_name, body=body)
+        # Check standard OpenSearch response for failures
+        if resp.get("failures"):
+            raise RuntimeError(f"OpenSearch delete_by_query failed: {resp.get('failures')}")
+        print(f"    ├─ [OpenSearch] Deactivated old versions for '{doc_id}' in index '{index_name}': deleted={resp.get('deleted', 0)}")
+
+
 def node_deactivate_old_chunks(ctx: dict):
     """
     版本更新时，停用旧版本 chunks。
@@ -3145,6 +3221,28 @@ def node_deactivate_old_chunks(ctx: dict):
         key = chunk.doc_id
         if key not in current_versions or chunk.version_no > current_versions[key]:
             current_versions[key] = chunk.version_no
+
+    # ── 防御性加固：已知失败的 (doc, ver) 一律不参与旧版本停用 ──
+    # 正常流程里 node_update_index_status 部分失败即 raise、本节点根本不会运行；此过滤器
+    # 只在异常路径（绕过 DAG 直接调用 / 未来重构）下兜底，让"按文档"维度的安全不依赖上游
+    # raise。特别地，embedding-FAILED 的 chunk 没进推送 batches、其内存 index_status 仍是
+    # NOT_INDEXED，下方 failed_counts 是看不出来的，必须从 ctx 取。
+    known_failed = set(ctx.get("failed_doc_versions") or set())
+    known_failed |= {
+        (c.doc_id, c.version_no) for c in ctx.get("embedding_failed_chunks", [])
+    }
+    known_failed |= {
+        (c.doc_id, c.version_no) for c in chunks
+        if getattr(c, "index_status", "NOT_INDEXED") == "FAILED"
+    }
+    if known_failed:
+        skipped_docs = [d for d, v in current_versions.items() if (d, v) in known_failed]
+        if skipped_docs:
+            print(f"    ├─ ⚠️ Skipping old-version deactivation for {len(skipped_docs)} "
+                  f"doc(s) with known failures: {skipped_docs[:5]}")
+            current_versions = {
+                d: v for d, v in current_versions.items() if (d, v) not in known_failed
+            }
 
     # 检查 existing_chunks（模拟已在索引中的旧版本 chunks）
     existing_index = ctx.get("existing_opensearch_chunks", [])
@@ -3220,73 +3318,13 @@ def node_deactivate_old_chunks(ctx: dict):
                     print(f"       {{ \"doc_id\": \"{doc_id}\", \"version_no\": {{ \"lt\": {ver} }} }}")
         else:
             try:
-                client = _get_opensearch_client()
+                client = _get_opensearch_client(ctx)
                 index_name = ctx.get("opensearch_index", "fuling_knowledge_v1")
-                
-                # Check if it's the HA3 Engine Client
-                if hasattr(client, "push_documents") or client == "MOCK_HA3_CLIENT":
-                    if client == "MOCK_HA3_CLIENT":
-                        print(f"    ├─ [HA3 Engine] [MOCK] Deactivated old chunks for '{index_name}' successfully")
-                    else:
-                        from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
-                        cfg = config.alibaba_vector
-                        
-                        for doc_id, ver in current_versions.items():
-                            old_chunk_ids = old_chunk_ids_map.get(doc_id, [])
-                            if old_chunk_ids:
-                                # Construct delete commands
-                                ha3_deletes = [{"cmd": "delete", "fields": {cfg.pk_field: cid}} for cid in old_chunk_ids]
-                                request = PushDocumentsRequest(body=ha3_deletes)
-                                
-                                resp = client.push_documents(cfg.table_name, cfg.pk_field, request)
-                                status_code = getattr(resp, 'status_code', 200)
-                                body_msg = str(getattr(resp, 'body', ''))
-                                text_msg = str(getattr(resp, 'text', ''))
-                                combined_msg = (body_msg + " | " + text_msg).lower()
-                                
-                                is_success = (200 <= status_code < 300)
-                                if not is_success:
-                                    try:
-                                        if hasattr(resp, "json") and callable(resp.json):
-                                            resp_json = resp.json()
-                                            err_code = resp_json.get("code") or resp_json.get("errors", [{}])[0].get("code")
-                                            err_msg = str(resp_json).lower()
-                                            if err_code in ["DocumentNotFound", "IndexNotFound", 7504, 7500] or any(ind in err_msg for ind in ["not_found", "not found", "no_op", "no-op"]):
-                                                print(f"    ├─ [HA3 Engine] Idempotent success detected in parsed JSON error: {err_msg}")
-                                                is_success = True
-                                    except Exception:
-                                        pass
-                                    
-                                    # Fallback to text check if JSON didn't catch it
-                                    if not is_success:
-                                        idempotent_indicators = ["not_found", "not found", "no_op", "no-op"]
-                                        if any(ind in combined_msg for ind in idempotent_indicators):
-                                            print(f"    ├─ [HA3 Engine] Idempotent success detected in response body: {combined_msg}")
-                                            is_success = True
-                                
-                                if not is_success:
-                                    raise RuntimeError(f"HA3 pushDocuments delete failed with status_code {status_code}, response: {combined_msg}")
-                                print(f"    ├─ [HA3 Engine] Deactivated {len(old_chunk_ids)} old chunks for '{doc_id}' in table '{cfg.table_name}': status={status_code}")
-                            else:
-                                print(f"    ├─ [HA3 Engine] No older chunks found in RDS to deactivate for '{doc_id}'")
-                else:
-                    # Original OpenSearch DELETE BY QUERY
-                    for doc_id, ver in current_versions.items():
-                        body = {
-                            "query": {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"doc_id": doc_id}},
-                                        {"range": {"version_no": {"lt": ver}}}
-                                    ]
-                                }
-                            }
-                        }
-                        resp = client.delete_by_query(index=index_name, body=body)
-                        # Check standard OpenSearch response for failures
-                        if resp.get("failures"):
-                            raise RuntimeError(f"OpenSearch delete_by_query failed: {resp.get('failures')}")
-                        print(f"    ├─ [OpenSearch] Deactivated old versions for '{doc_id}' in index '{index_name}': deleted={resp.get('deleted', 0)}")
+                for doc_id, ver in current_versions.items():
+                    _search_delete_old_chunks(
+                        client, config, index_name, doc_id, ver,
+                        old_chunk_ids_map.get(doc_id, []),
+                    )
             except Exception as e:
                 print(f"    ⚠️ Failed to deactivate old chunks in search engine: {e}")
                 # Explicit FAILED status assignment to prevent infinite hanging in NOT_INDEXED
@@ -3316,6 +3354,9 @@ def node_deactivate_old_chunks(ctx: dict):
                 raise RuntimeError(f"Failed to deactivate old chunks in search engine: {e}")
 
         # 3 & 4. Search index deactivation succeeded, now update old RDS chunks to is_active = FALSE and update document_version
+        # 注意 failed_counts 基于【未过滤】的 chunks（含被防御过滤跳过停用的文档）：
+        # 失败文档仍要写 document_version='FAILED'；known_failed 命中也一律按 FAILED 计
+        # （embedding-FAILED 的 chunk 内存 index_status 是 NOT_INDEXED，单看 fail_cnt 会误判 SUCCESS）。
         failed_counts = {}
         for chunk in chunks:
             key = (chunk.doc_id, chunk.version_no)
@@ -3332,7 +3373,7 @@ def node_deactivate_old_chunks(ctx: dict):
                     print(f"       WHERE doc_id='{doc_id}' AND version_no < {ver} AND is_active = 1")
             for (doc_id, ver), fail_cnt in failed_counts.items():
                 if (doc_id, ver) in valid_doc_versions:
-                    final_status = 'SUCCESS' if fail_cnt == 0 else 'FAILED'
+                    final_status = 'FAILED' if (fail_cnt or (doc_id, ver) in known_failed) else 'SUCCESS'
                     print(f"    ├─ [SIMULATED] RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
         else:
             conn = None
@@ -3352,7 +3393,7 @@ def node_deactivate_old_chunks(ctx: dict):
                     # Update document_version status
                     for (doc_id, ver), fail_cnt in failed_counts.items():
                         if (doc_id, ver) in valid_doc_versions:
-                            final_status = 'SUCCESS' if fail_cnt == 0 else 'FAILED'
+                            final_status = 'FAILED' if (fail_cnt or (doc_id, ver) in known_failed) else 'SUCCESS'
                             cursor.execute("""
                                 UPDATE document_version
                                 SET index_status = %s
@@ -3841,7 +3882,15 @@ def node_push_to_opensearch(ctx: dict):
     client = None
     if not simulate_opensearch:
         try:
-            client = _get_opensearch_client()
+            client = _get_opensearch_client(ctx)
+            if client == "MOCK_HA3_CLIENT":
+                # ctx/config simulate 开关不一致（或测试替桩漂移）时绝不能继续：
+                # 继续会伪造 INDEXED，随后 node_deactivate_old_chunks 真删 RDS 旧版本 → 裂脑
+                raise RuntimeError(
+                    "Simulate-flag mismatch: got MOCK_HA3_CLIENT in a real-mode push "
+                    "(simulate_opensearch resolved False but a mock client was returned). "
+                    "Refusing to fake INDEXED status."
+                )
             # HA3 向量检索版的表在控制台创建，无需 API 创建索引
             # 只有标准 OpenSearch 需要 _ensure_opensearch_index
             if hasattr(client, 'indices'):
@@ -3895,7 +3944,7 @@ def node_push_to_opensearch(ctx: dict):
 
                 start_time = time.time()
 
-                if hasattr(client, "push_documents") or client == "MOCK_HA3_CLIENT":
+                if hasattr(client, "push_documents"):
                     # 💡 HA3 Engine Vector Pushing
                     cfg = config.alibaba_vector
                     took_ms = 0
@@ -3905,109 +3954,101 @@ def node_push_to_opensearch(ctx: dict):
                     all_chunks = batch["chunks"]
                     ha3_docs = [{"cmd": "add", "fields": c.to_ha3_doc(cfg.pk_field)} for c in all_chunks]
 
-                    if client == "MOCK_HA3_CLIENT":
-                        # Dry run or mock client simulation
-                        took_ms = int((time.time() - start_time) * 1000)
-                        for chunk in all_chunks:
-                            chunk.index_status = "INDEXED"
-                            chunk.index_error_code = None
-                            chunk.index_error_message = None
-                    else:
-                        from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
+                    from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
 
-                        # 分批推送，避免超出 HA3 请求体积限制
-                        max_retries = config.embedding.max_retries  # 复用 embedding 的重试配置
-                        for sub_start in range(0, len(ha3_docs), ha3_batch_size):
-                            sub_docs = ha3_docs[sub_start:sub_start + ha3_batch_size]
-                            sub_chunks = all_chunks[sub_start:sub_start + ha3_batch_size]
+                    # 分批推送，避免超出 HA3 请求体积限制
+                    max_retries = config.embedding.max_retries  # 复用 embedding 的重试配置
+                    for sub_start in range(0, len(ha3_docs), ha3_batch_size):
+                        sub_docs = ha3_docs[sub_start:sub_start + ha3_batch_size]
+                        sub_chunks = all_chunks[sub_start:sub_start + ha3_batch_size]
 
-                            request = PushDocumentsRequest(body=sub_docs)
+                        request = PushDocumentsRequest(body=sub_docs)
 
-                            # 重试循环：瞬时错误指数退避重试
-                            last_error = None
-                            resp = None
-                            for attempt in range(max_retries + 1):
-                                try:
-                                    resp = client.push_documents(cfg.table_name, cfg.pk_field, request)
-                                    status_code = getattr(resp, "status_code", 200)
+                        # 重试循环：瞬时错误指数退避重试
+                        last_error = None
+                        resp = None
+                        for attempt in range(max_retries + 1):
+                            try:
+                                resp = client.push_documents(cfg.table_name, cfg.pk_field, request)
+                                status_code = getattr(resp, "status_code", 200)
 
-                                    # 非瞬时错误：立即失败
-                                    if status_code in (400, 401, 403):
-                                        last_error = None
-                                        break
-                                    # 瞬时错误：重试
-                                    if status_code in (429, 500, 502, 503, 504):
-                                        if attempt < max_retries:
-                                            wait = 2 ** attempt
-                                            print(f"    ⚠️ HA3 sub-batch {sub_start//ha3_batch_size + 1} attempt {attempt+1} failed (HTTP {status_code}). Retrying in {wait}s...")
-                                            time.sleep(wait)
-                                            continue
-                                    # 成功或不可重试的状态码
+                                # 非瞬时错误：立即失败
+                                if status_code in (400, 401, 403):
                                     last_error = None
                                     break
-                                except Exception as e:
-                                    last_error = e
+                                # 瞬时错误：重试
+                                if status_code in (429, 500, 502, 503, 504):
                                     if attempt < max_retries:
                                         wait = 2 ** attempt
-                                        print(f"    ⚠️ HA3 sub-batch {sub_start//ha3_batch_size + 1} attempt {attempt+1} failed (network): {e}. Retrying in {wait}s...")
+                                        print(f"    ⚠️ HA3 sub-batch {sub_start//ha3_batch_size + 1} attempt {attempt+1} failed (HTTP {status_code}). Retrying in {wait}s...")
                                         time.sleep(wait)
-                                    # else: fall through, last_error preserved
+                                        continue
+                                # 成功或不可重试的状态码
+                                last_error = None
+                                break
+                            except Exception as e:
+                                last_error = e
+                                if attempt < max_retries:
+                                    wait = 2 ** attempt
+                                    print(f"    ⚠️ HA3 sub-batch {sub_start//ha3_batch_size + 1} attempt {attempt+1} failed (network): {e}. Retrying in {wait}s...")
+                                    time.sleep(wait)
+                                # else: fall through, last_error preserved
 
-                            if last_error is not None:
-                                # 所有重试耗尽，标记 sub-batch 为失败
-                                err_msg = f"HA3 pushDocuments failed after {max_retries + 1} attempts: {last_error}"
+                        if last_error is not None:
+                            # 所有重试耗尽，标记 sub-batch 为失败
+                            err_msg = f"HA3 pushDocuments failed after {max_retries + 1} attempts: {last_error}"
+                            for sc in sub_chunks:
+                                sc.index_status = "FAILED"
+                                sc.index_error_code = "RETRY_EXHAUSTED"
+                                sc.index_error_message = err_msg
+                            print(f"    ├─ [HA3 Error] {err_msg}")
+                            continue  # 继续处理下一个 sub-batch
+
+                        status_code = getattr(resp, "status_code", 200)
+                        body = getattr(resp, "body", None)
+
+                        if 200 <= status_code < 300:
+                            # 尝试解析 per-document 结果
+                            per_doc_parsed = False
+                            if body and isinstance(body, dict):
+                                errors_list = body.get("errors", [])
+                                if isinstance(errors_list, list) and errors_list:
+                                    # HA3 返回了 per-document 错误列表
+                                    per_doc_parsed = True
+                                    error_indices = set()
+                                    for err_item in errors_list:
+                                        err_idx = err_item.get("index")
+                                        err_msg = err_item.get("message", "Unknown HA3 error")
+                                        err_code = str(err_item.get("code", "HA3_DOC_ERROR"))
+                                        if err_idx is not None and err_idx < len(sub_chunks):
+                                            sub_chunks[err_idx].index_status = "FAILED"
+                                            sub_chunks[err_idx].index_error_code = err_code
+                                            sub_chunks[err_idx].index_error_message = err_msg
+                                            error_indices.add(err_idx)
+                                            print(f"    ├─ [HA3 Error] Chunk {sub_chunks[err_idx].chunk_id} failed: {err_code} - {err_msg}")
+                                    # 标记未出错的 chunks 为成功
+                                    for ci, sc in enumerate(sub_chunks):
+                                        if ci not in error_indices:
+                                            sc.index_status = "INDEXED"
+                                            sc.index_error_code = None
+                                            sc.index_error_message = None
+
+                            if not per_doc_parsed:
+                                # 无 per-document 错误信息，整批标记成功
                                 for sc in sub_chunks:
-                                    sc.index_status = "FAILED"
-                                    sc.index_error_code = "RETRY_EXHAUSTED"
-                                    sc.index_error_message = err_msg
-                                print(f"    ├─ [HA3 Error] {err_msg}")
-                                continue  # 继续处理下一个 sub-batch
+                                    sc.index_status = "INDEXED"
+                                    sc.index_error_code = None
+                                    sc.index_error_message = None
+                        else:
+                            # HTTP 级别失败（不可重试的状态码）：整个 sub-batch 标记为失败
+                            body_message = str(body) if body else f"HTTP {status_code}"
+                            for sc in sub_chunks:
+                                sc.index_status = "FAILED"
+                                sc.index_error_code = str(status_code)
+                                sc.index_error_message = body_message
+                            print(f"    ├─ [HA3 Error] Sub-batch {sub_start//ha3_batch_size + 1} failed with HTTP {status_code}: {body_message}")
 
-                            status_code = getattr(resp, "status_code", 200)
-                            body = getattr(resp, "body", None)
-
-                            if 200 <= status_code < 300:
-                                # 尝试解析 per-document 结果
-                                per_doc_parsed = False
-                                if body and isinstance(body, dict):
-                                    errors_list = body.get("errors", [])
-                                    if isinstance(errors_list, list) and errors_list:
-                                        # HA3 返回了 per-document 错误列表
-                                        per_doc_parsed = True
-                                        error_indices = set()
-                                        for err_item in errors_list:
-                                            err_idx = err_item.get("index")
-                                            err_msg = err_item.get("message", "Unknown HA3 error")
-                                            err_code = str(err_item.get("code", "HA3_DOC_ERROR"))
-                                            if err_idx is not None and err_idx < len(sub_chunks):
-                                                sub_chunks[err_idx].index_status = "FAILED"
-                                                sub_chunks[err_idx].index_error_code = err_code
-                                                sub_chunks[err_idx].index_error_message = err_msg
-                                                error_indices.add(err_idx)
-                                                print(f"    ├─ [HA3 Error] Chunk {sub_chunks[err_idx].chunk_id} failed: {err_code} - {err_msg}")
-                                        # 标记未出错的 chunks 为成功
-                                        for ci, sc in enumerate(sub_chunks):
-                                            if ci not in error_indices:
-                                                sc.index_status = "INDEXED"
-                                                sc.index_error_code = None
-                                                sc.index_error_message = None
-
-                                if not per_doc_parsed:
-                                    # 无 per-document 错误信息，整批标记成功
-                                    for sc in sub_chunks:
-                                        sc.index_status = "INDEXED"
-                                        sc.index_error_code = None
-                                        sc.index_error_message = None
-                            else:
-                                # HTTP 级别失败（不可重试的状态码）：整个 sub-batch 标记为失败
-                                body_message = str(body) if body else f"HTTP {status_code}"
-                                for sc in sub_chunks:
-                                    sc.index_status = "FAILED"
-                                    sc.index_error_code = str(status_code)
-                                    sc.index_error_message = body_message
-                                print(f"    ├─ [HA3 Error] Sub-batch {sub_start//ha3_batch_size + 1} failed with HTTP {status_code}: {body_message}")
-
-                        took_ms = int((time.time() - start_time) * 1000)
+                    took_ms = int((time.time() - start_time) * 1000)
 
                     indexed_count = sum(1 for c in all_chunks if c.index_status == "INDEXED")
                     failed_count = chunk_count - indexed_count
@@ -4169,6 +4210,10 @@ def node_update_index_status(ctx: dict):
     embedding_failed_chunks = ctx.get("embedding_failed_chunks", [])
     for chunk in embedding_failed_chunks:
         failed_doc_versions.add((chunk.doc_id, chunk.version_no))
+
+    # 暴露给 node_deactivate_old_chunks 的防御过滤器（正常流程下方失败即 raise、
+    # 停用节点不会运行；这里是给异常路径兜底的事实源）
+    ctx["failed_doc_versions"] = failed_doc_versions
 
     if simulate_db:
         print(f"    └─ [SIMULATED] Would update {chunks_count} chunk records in RDS:")

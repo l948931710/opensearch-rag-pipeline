@@ -526,7 +526,7 @@ class TestStrictFailurePropagation:
         
         # 强行使 _get_opensearch_client 抛出异常
         import opensearch_pipeline.pipeline_nodes
-        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_opensearch_client", lambda: (_ for _ in ()).throw(ValueError("Mocked OS client connection failure")))
+        monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_opensearch_client", lambda *a, **k: (_ for _ in ()).throw(ValueError("Mocked OS client connection failure")))
         
         chunks = [
             Chunk(chunk_id="chunk_test_err2", doc_id="doc_err2", version_no=1, chunk_index=1, chunk_type="text_chunk", chunk_text="test text", token_count=2, page_num=1, permission_level="PUBLIC")

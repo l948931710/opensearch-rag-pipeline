@@ -82,10 +82,10 @@ def _ensure_ha3_mock_modules():
             _captured_search_requests.append(self)
 
     class MockPushDocumentsRequest:
-        def __init__(self):
-            self._body = None
+        def __init__(self, body=None):
+            self.body = body
         def set_body(self, body):
-            self._body = body
+            self.body = body
 
     ha3_models.QueryRequest = MockQueryRequest
     ha3_models.SparseData = MockSparseData
