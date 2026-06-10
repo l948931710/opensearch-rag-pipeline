@@ -8,6 +8,7 @@ from opensearch_pipeline.answer_flow import (
     DEFAULT_TEMPERATURE,
     NO_RESULT_MESSAGE,
     build_qa_log_kwargs,
+    is_refusal_answer,
     should_append_history,
     top_score_of,
 )
@@ -30,6 +31,32 @@ class TestHelpers:
         assert "未找到" in NO_RESULT_MESSAGE
         assert DEFAULT_MAX_TOKENS == 2048
         assert DEFAULT_TEMPERATURE == 0.1
+
+
+class TestIsRefusalAnswer:
+    """no_result 契约的拒答判定：两种「未找到」形态（检索空 / LLM 带弱来源拒答）都要命中。"""
+
+    def test_canonical_and_llm_phrases(self):
+        assert is_refusal_answer(NO_RESULT_MESSAGE) is True            # 检索空的标准文案
+        assert is_refusal_answer("抱歉，当前知识库中未找到相关信息") is True   # 规则 2 指示的 LLM 拒答
+        assert is_refusal_answer("知识库中没有该流程的相关文档。") is True
+
+    def test_anchored_long_refusal_still_counts(self):
+        long_tail = "不过您可以尝试联系行政部获取纸质版制度文件，或在钉钉工作台提交工单咨询。" * 3
+        assert is_refusal_answer("抱歉，当前知识库中未找到相关信息。" + long_tail) is True
+
+    def test_normal_answer_with_midtext_mention_not_refusal(self):
+        ans = ("U8 登录步骤如下：第一步打开客户端，第二步选择账套并输入工号密码，"
+               "第三步点击登录。若系统提示未找到相关信息或账号异常，请联系信息部（分机 8021）。"
+               "另外请注意月末结账期间系统将暂停登录维护，结账完成后方可恢复使用，"
+               "请合理安排单据录入时间，避免影响当月成本核算与出入库对账。")
+        assert len(ans) > 110
+        assert is_refusal_answer(ans) is False      # 拒答句式出现在 30 字之后且全文长 → 正常回答
+
+    def test_empty_and_none(self):
+        assert is_refusal_answer(None) is False
+        assert is_refusal_answer("") is False
+        assert is_refusal_answer("   ") is False
 
 
 class TestBuildQaLogKwargs:

@@ -795,10 +795,11 @@ function renderFeedbackBar(){
 /* ========================= 打字机逐字揭示 blocks =========================
    text 块逐字打出；image 块在其前序文本完成后整体淡入插入。
    （对应真实流式：stream var = content，图片随 content_blocks 到达插入） */
-/* 步骤段判定：第N步（含未空格的“第1步”）或 ①-⑳ 圆数字开头（可带 ** 前缀）。
+/* 步骤段判定：第N步（含未空格的“第1步”）/ ①-⑳ 圆数字开头（可带 ** 前缀）/
+   编号加粗列表项「1. **xxx**」（真实 Qwen 流程类回答的存量格式）。
    真实端优先用 step_card 元数据（step_no）驱动，此正则只是纯 markdown 兜底。
    不可用裸 ^\*\* —— 否则任何加粗开头的段落（如 **注意**）都会挂上步骤标尺。 */
-const STEP_RE = /^(?:\*\*)?(?:第\s*\d+\s*步|[①-⑳])/;
+const STEP_RE = /^(?:(?:\*\*)?(?:第\s*\d+\s*步|[①-⑳])|\d+[.、]\s*\*\*)/;
 
 /* 图片块 DOM：正常态 = 截图 + 说明行（类型图标 + 说明 + 「点按放大」提示）；
    failed 态 = 保留图框与说明，占位提示点按重载（OSS 签名 URL 1h 过期，绝不静默移除） */
@@ -840,10 +841,18 @@ function typeBlocks(bodyEl, blocks, onDone, opts){
       scrollToBottom();
       skipTyping ? nextBlock() : setTimeout(nextBlock, 320);
     } else {
-      const p = document.createElement('p');
-      if(STEP_RE.test(blk.text)) p.classList.add('step');
-      bodyEl.insertBefore(p, caret);
-      typeText(p, blk.text, nextBlock);
+      // 真实 blocks 的一个 text 块可含多段（\n\n 分隔，如「引言 + **第1步**」同块）：
+      // 逐段各成 <p>，步骤判定按段生效 —— 否则段首引言会吞掉后面步骤的样式
+      const paras = blk.text.split(/\n{2,}/).map(s=>s.trim()).filter(Boolean);
+      let pi = 0;
+      (function nextPara(){
+        if(pi >= paras.length){ nextBlock(); return; }
+        const t = paras[pi++];
+        const p = document.createElement('p');
+        if(STEP_RE.test(t)) p.classList.add('step');
+        bodyEl.insertBefore(p, caret);
+        typeText(p, t, nextPara);
+      })();
     }
   }
   nextBlock();
@@ -853,6 +862,8 @@ function typeBlocks(bodyEl, blocks, onDone, opts){
    必须整串重设 innerHTML（acc），不能 innerHTML += token：
    += 会让浏览器把半开标签自动闭合（<strong> → <strong></strong>），后续文字全部落在标签外，加粗永久丢失。 */
 function typeText(p, raw, done){
+  // 容错：行首列表星号（"*   " / 缩进 "  * "）转为干净的「· 」；(?!\*) 不误伤行首 **加粗**
+  raw = raw.replace(/^\s*\*(?!\*)\s+/gm, '· ');
   // 预处理：把 **x** 转成 <strong>x</strong>
   const html = raw.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   // 拆成 token：标签整体一次输出，文字逐字

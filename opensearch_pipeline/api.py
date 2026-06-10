@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from opensearch_pipeline.llm_generator import (
     generate_answer,
     generate_answer_stream,
+    is_low_confidence_band,
     parse_sse_data_frame,
 )
 from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
@@ -39,6 +40,7 @@ from opensearch_pipeline.content_blocks_builder import (
     build_content_blocks,
     content_blocks_to_json,
     build_mini_program_blocks,
+    strip_image_markers,
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
 from opensearch_pipeline.answer_flow import (
@@ -46,6 +48,7 @@ from opensearch_pipeline.answer_flow import (
     DEFAULT_TEMPERATURE,
     NO_RESULT_MESSAGE,
     build_qa_log_kwargs,
+    is_refusal_answer,
     should_append_history,
 )
 from opensearch_pipeline.config import get_config
@@ -155,6 +158,9 @@ class SourceInfo(BaseModel):
     title: str
     section: str = ""
     score: float = 0.0
+    # 相关度档位 'high'|'mid'|'low'（与 prompt 高/中/低 同源，见 llm_generator.score_level）。
+    # rerank 开启后 score 为 0-1 量纲，客户端必须用本字段、不可按融合阈值重算。
+    level: str = ""
 
 
 class AskResponse(BaseModel):
@@ -166,6 +172,12 @@ class AskResponse(BaseModel):
     model: str
     usage: Dict[str, Any] = {}
     latency_ms: int = 0
+    # 知识库未命中：检索为空 或 LLM 拒答（answer_flow.is_refusal_answer，可伴随弱相关来源）。
+    # 客户端据此渲染"未找到"空结果卡（隐藏来源/赞踩，保留转人工出口）。
+    no_result: bool = False
+    # 低置信带：top 检索分 < medium 阈值（llm_generator.is_low_confidence_band，
+    # 与 RAG_LOW_CONFIDENCE_GUARD 开关无关）。客户端据此渲染低匹配提示条。
+    guard: bool = False
 
 
 class SearchResult(BaseModel):
@@ -359,6 +371,7 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
             model="N/A",
             usage={},
             latency_ms=latency,
+            no_result=True,
         )
 
     # 3. LLM 生成
@@ -406,6 +419,13 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
         logger.warning("mini-program blocks 构建失败 (non-fatal)", exc_info=True)
         blocks = []
 
+    # 响应契约：blocks 必须先用【原始 answer】构建（穿插位置依赖占位符），
+    # 之后才清理客户端可见文本 —— blocks 为空时小程序把 answer 当纯文本渲染，
+    # 残留 <<IMG:N>> 会原样打给用户。qa_session_log / 会话历史仍存原始 answer（日志保真）。
+    answer_out = strip_image_markers(result["answer"])
+    resp_no_result = is_refusal_answer(answer_out)   # 拒答形态（可伴随弱相关来源）
+    resp_guard = is_low_confidence_band(chunks)      # 不依赖 RAG_LOW_CONFIDENCE_GUARD 开关
+
     # 5. 落库
     log_qa_session(**build_qa_log_kwargs(
         session_id=session_id,
@@ -424,7 +444,7 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
     ))
 
     return AskResponse(
-        answer=result["answer"],
+        answer=answer_out,
         sources=[SourceInfo(**s) for s in result["sources"]],
         blocks=blocks,
         session_id=session_id,
@@ -432,6 +452,8 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
         model=result["model"],
         usage=result["usage"],
         latency_ms=latency,
+        no_result=resp_no_result,
+        guard=resp_guard,
     )
 
 

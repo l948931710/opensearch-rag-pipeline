@@ -30,6 +30,7 @@ from fastapi import APIRouter, Request, HTTPException
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from opensearch_pipeline.content_blocks_builder import strip_image_markers
 from opensearch_pipeline.retriever import retrieve_and_enrich
 from opensearch_pipeline.llm_generator import (
     generate_answer, generate_answer_stream, parse_sse_data_frame, _extract_sources,
@@ -346,7 +347,7 @@ def _stream_answer_to_card(
 
     def _clean(text: str) -> str:
         # 与成品卡片一致的清理：去除末尾参考来源段 + <<IMG:N>> 占位符（钉钉端纯文本）
-        return re.sub(r'<{1,2}IMG:\d+>{1,2}', '', _strip_trailing_sources(text)).strip()
+        return strip_image_markers(_strip_trailing_sources(text))
 
     # 非阻塞推流：后台单线程每 interval 推一次"最新累计正文"，主循环只消费 LLM token、不被
     # PUT /card/streaming 的网络往返阻塞。同步推流在推流往返慢时会把 ~6s 的生成拖成数十秒

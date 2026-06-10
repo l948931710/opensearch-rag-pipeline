@@ -25,6 +25,38 @@ logger = logging.getLogger(__name__)
 # 兼容双尖括号 <<IMG:3>> 和单尖括号 <IMG:3>（LLM 经常简化括号）
 _IMG_PLACEHOLDER_PATTERN = re.compile(r'<{1,2}IMG:(\d+)>{1,2}')
 
+# 句末收尾标点 + 闭合括号：按占位符切分后落在片段开头时，应回挂到上一文本块末尾
+_LEADING_CLOSER_PATTERN = re.compile(r'^[。，、；：！？）】」』]+')
+
+
+def strip_image_markers(text: Optional[str]) -> str:
+    """去除 <<IMG:N>> / <IMG:N> 图片占位符（客户端可见文本的最终清理）。
+
+    占位符是服务端与渲染层之间的内部协议，绝不能泄漏给用户
+    （blocks 为空时小程序端会把 answer 原文当纯文本渲染）。
+    ⚠️ 调用顺序约束：必须先用【原始 answer】构建图文 blocks，再做本清理 ——
+    blocks 的穿插位置依赖占位符。
+    """
+    if not text:
+        return ""
+    return _IMG_PLACEHOLDER_PATTERN.sub('', text).strip()
+
+
+def _reattach_leading_punct(blocks: List[Dict[str, str]], fragment: str) -> str:
+    """把片段开头的句末标点回挂到最近一个 markdown 块末尾，返回剩余片段。
+
+    LLM 常写「…图标 <<IMG:3>>。」—— 切分后句号落到下一片段开头（或成孤立结尾块）。
+    回挂保持句子完整；若前面没有文本块（图片开头），直接丢弃这些标点。
+    """
+    m = _LEADING_CLOSER_PATTERN.match(fragment)
+    if not m:
+        return fragment
+    for blk in reversed(blocks):   # 跳过 image 块，找最近的文本块
+        if blk.get("type") == "markdown":
+            blk["content"] += m.group(0)
+            break
+    return fragment[m.end():].lstrip()
+
 
 def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
     """
@@ -233,9 +265,10 @@ def _build_interleaved(
     for match in placeholders:
         doc_idx = int(match.group(1))
 
-        # 占位符前的文本块（清理签名失败的图片残留占位符）
+        # 占位符前的文本块（清理签名失败的图片残留占位符；句首孤立标点回挂上一块）
         text_before = answer[last_end:match.start()].strip()
         text_before = _IMG_PLACEHOLDER_PATTERN.sub('', text_before).strip()
+        text_before = _reattach_leading_punct(blocks, text_before)
         if text_before:
             blocks.append({"type": "markdown", "content": text_before})
 
@@ -255,8 +288,9 @@ def _build_interleaved(
     # 占位符后剩余文本
     remaining = answer[last_end:].strip()
     if remaining:
-        # 清理可能残留的未匹配占位符
+        # 清理可能残留的未匹配占位符；句首孤立标点（如孤立的「。」尾块）回挂上一块
         remaining = _IMG_PLACEHOLDER_PATTERN.sub('', remaining).strip()
+        remaining = _reattach_leading_punct(blocks, remaining)
         if remaining:
             blocks.append({"type": "markdown", "content": remaining})
 
