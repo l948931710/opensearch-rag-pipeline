@@ -773,10 +773,20 @@ def expand_step_context(
             for row in cursor.fetchall():
                 meta_by_id[row["chunk_id"]] = row
 
-        # 2) 所有相关 parent 的兄弟步骤（一次取齐，按 parent 分组、组内按 step_no 升序）
-        parent_ids = sorted({
-            r["parent_chunk_id"] for r in meta_by_id.values() if r.get("parent_chunk_id")
-        })
+        # 2) 所有相关 parent 的兄弟/子步骤（一次取齐，按 parent 分组、组内按 step_no 升序）。
+        # procedure_parent 命中也并入：其子步骤靠 RDS 的 parent_chunk_id 反查——
+        # 旧实现读 chunk["extra_json"].child_chunk_ids，但 HA3 的 output_fields 不含
+        # extra_json，child_ids 永远为空（死分支），子步骤及其图片从未被展开过。
+        procedure_parent_ids = {
+            cid for cid in (
+                (c.get("chunk_id") or c.get("id", ""))
+                for c in chunks if c.get("chunk_type") == "procedure_parent"
+            ) if cid
+        }
+        parent_ids = sorted(
+            {r["parent_chunk_id"] for r in meta_by_id.values() if r.get("parent_chunk_id")}
+            | procedure_parent_ids
+        )
         siblings_by_parent: Dict[str, List[Dict[str, Any]]] = {}
         if parent_ids:
             ph = ",".join(["%s"] * len(parent_ids))
@@ -873,35 +883,17 @@ def expand_step_context(
                     })
                     expanded_all.append(expanded_chunk)
 
-            # ── procedure_parent：展开子步骤 ──
+            # ── procedure_parent：展开子步骤（按 RDS parent_chunk_id 反查，已随兄弟查询预取）──
             elif ctype == "procedure_parent":
                 original_score = chunk.get("score", 0)
+                parent_chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
 
-                # 从 extra_json 获取 child_chunk_ids
-                extra_raw = chunk.get("extra_json") or chunk.get("extra", {})
-                if isinstance(extra_raw, str):
-                    try:
-                        extra_raw = json.loads(extra_raw)
-                    except (json.JSONDecodeError, TypeError):
-                        extra_raw = {}
-                child_ids = extra_raw.get("child_chunk_ids", []) if isinstance(extra_raw, dict) else []
+                children = siblings_by_parent.get(parent_chunk_id, [])
+                total_children = len(children)
 
-                if not child_ids:
+                if not children:
                     expanded_all.append(chunk)
                     continue
-
-                # 查子步骤
-                format_ph = ",".join(["%s"] * len(child_ids))
-                cursor.execute(
-                    f"SELECT chunk_id, chunk_text, step_no, section_title, "
-                    f"       extra_json, image_refs_json "
-                    f"FROM chunk_meta "
-                    f"WHERE chunk_id IN ({format_ph}) AND is_active = 1 "
-                    f"ORDER BY step_no",
-                    tuple(child_ids),
-                )
-                children = cursor.fetchall()
-                total_children = len(children)
 
                 # 截断并添加提示
                 if total_children > max_steps:
@@ -914,8 +906,6 @@ def expand_step_context(
                     children = children[:max_steps]
                 else:
                     expanded_all.append(chunk)
-
-                parent_chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
 
                 for child in children:
                     child_extra = {}

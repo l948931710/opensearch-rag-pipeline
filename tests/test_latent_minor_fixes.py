@@ -194,3 +194,92 @@ class TestVlmEndpointRouting:
         assert text == "OCR文本"
         assert captured["url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
         assert captured["payload"]["messages"][0]["content"][0]["type"] == "image_url"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. procedure_parent 子步骤展开（RDS parent_chunk_id 反查）
+# ═══════════════════════════════════════════════════════════════
+
+class _FakeCursor:
+    """最小 DictCursor 假货：按 SQL 内容返回行。"""
+
+    def __init__(self, rows_for_parent_query):
+        self.queries = []
+        self._rows = []
+        self._rows_for_parent_query = rows_for_parent_query
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        self._rows = self._rows_for_parent_query if "parent_chunk_id IN" in sql else []
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
+
+
+class _FakeConn:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self, *args, **kwargs):
+        return self._cursor
+
+    def close(self):
+        pass
+
+
+class TestProcedureParentExpansion:
+    def test_children_come_from_rds_parent_chunk_id(self, monkeypatch):
+        """procedure_parent 命中必须按 RDS parent_chunk_id 展开子步骤。
+
+        旧实现读 HA3 结果里的 extra_json.child_chunk_ids —— HA3 的 output_fields
+        根本不含 extra_json，子步骤展开是永远走不到的死分支。
+        """
+        import json as _json
+
+        from opensearch_pipeline import pipeline_nodes
+        from opensearch_pipeline.retriever import expand_step_context
+
+        children_rows = [
+            {
+                "chunk_id": "P1-s1", "chunk_text": "第一步：打开业务导航", "step_no": 1,
+                "section_title": "登录", "parent_chunk_id": "P1",
+                "extra_json": _json.dumps({"annotation_map": {"①": "业务导航"}}),
+                "image_refs_json": _json.dumps([{"oss_key": "images/s1.png", "visual_summary": "登录界面"}]),
+            },
+            {
+                "chunk_id": "P1-s2", "chunk_text": "第二步：选择单据", "step_no": 2,
+                "section_title": "登录", "parent_chunk_id": "P1",
+                "extra_json": None,
+                "image_refs_json": None,
+            },
+        ]
+        cursor = _FakeCursor(children_rows)
+        monkeypatch.setattr(pipeline_nodes, "_get_db_conn", lambda *a, **k: _FakeConn(cursor))
+
+        hit = {
+            "chunk_id": "P1", "chunk_type": "procedure_parent",
+            "score": 9.0, "chunk_text": "U8 开单完整流程", "doc_id": "d1",
+        }
+        out = expand_step_context([hit], "U8 怎么开单")
+
+        ids = [c.get("chunk_id") for c in out]
+        assert ids == ["P1", "P1-s1", "P1-s2"]
+
+        s1 = out[1]
+        assert s1["is_expanded"] is True
+        assert s1["expansion_reason"] == "parent_children"
+        assert s1["parent_chunk_id"] == "P1"
+        assert s1["score"] == pytest.approx(9.0 * 0.8)
+        assert s1["annotation_map"] == {"①": "业务导航"}
+        # image_refs 走统一归一化：契约键齐备（source_image 由 oss_key 互补）
+        assert s1["image_refs"][0]["oss_key"] == "images/s1.png"
+        assert s1["image_refs"][0]["source_image"] == "images/s1.png"
+        assert s1["image_refs"][0]["visual_summary"] == "登录界面"
+
+        # 只发一次批量兄弟/子步骤查询，没有逐命中的 child 查询
+        assert len(cursor.queries) == 1
+        assert "parent_chunk_id IN" in cursor.queries[0][0]
+        assert cursor.queries[0][1] == ("P1",)
