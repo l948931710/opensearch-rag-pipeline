@@ -61,9 +61,9 @@ Production entry: `dataworks_orchestrator.py --stage {1|2|3} --bizdate ${bizdate
 
 Shared modules consumed by **both** `api.py` (FastAPI) and `dingtalk_bot.py`: `retriever.py`, `llm_generator.py`, `session_store.py`, `qa_logger.py`, `feedback_handler.py`, `content_blocks_builder.py`, `answer_flow.py` (**pure** bookkeeping: the single source for `qa_session_log` payloads via `build_qa_log_kwargs`, the history-append policy, and the NO_RESULT message — keep it side-effect-free; `log_qa_session`/`append_to_history` calls stay at the four call sites because tests monkeypatch those module-global names).
 
-- **Retrieval** (`retriever.py`, `retrieve_and_enrich`, `top_k=7`): query-embed → HA3 **3-way hybrid** (Dense + Sparse in the kNN path, BM25 on `chunk_text`) → cover-page demotion → neighbor stitching (±1 from RDS) → step-card expansion. Fusion is **`weighted` (knn 0.7 / text 0.3)** by default — eval showed weighted > RRF. Permission filtering is **server-side in HA3** with the dept value whitelisted against filter-injection. **No learned reranker.**
+- **Retrieval** (`retriever.py`, `retrieve_and_enrich`, `top_k=7`): query-embed → HA3 **3-way hybrid** (Dense + Sparse in the kNN path, BM25 on `chunk_text`) → cover-page demotion → neighbor stitching (±1 from RDS) → step-card expansion. Fusion is **`weighted` (knn 0.7 / text 0.3)** by default — eval showed weighted > RRF. Permission filtering is **server-side in HA3** with the dept value whitelisted against filter-injection. A **routed learned reranker** (`reranker.py`: DashScope `qwen3-rerank` for text pools, `qwen3-vl-rerank` for image-bearing pools) is wired into `retrieve_and_enrich` but **OFF by default** behind `RAG_RERANK_ENABLE` (pool=20 → top_k=7; +10.5pp recall@1 on the 251-q gold set, see `eval_harness/reports/rerank_findings.md`). When rerank is on, 高/中/低 labels switch to rerank scores: `RAG_RERANK_SCORE_THRESHOLD_HIGH=0.9 / MEDIUM=0.8`.
 - **Query embeddings must use the DashScope *native* API** (`output_type=dense&sparse`). OpenAI compatible-mode drops the sparse vector and silently tanks recall.
-- **Answers** (`llm_generator.py`): Qwen via OpenAI compatible-mode. Context labels chunks 高/中/低 from `score_threshold_high=8.0 / medium=5.0` — **these are calibrated to weighted-fusion scores and break under RRF.** LLM is told not to emit its own source list; images are interleaved via `<<IMG:N>>` markers.
+- **Answers** (`llm_generator.py`): Qwen via OpenAI compatible-mode. Context labels chunks 高/中/低 from `score_threshold_high=7.7 / medium=5.8` (recalibrated on the 251-q gold set) — **these are calibrated to weighted-fusion scores and break under RRF.** LLM is told not to emit its own source list; images are interleaved via `<<IMG:N>>` markers.
 
 ### Multimodal & step cards (current focus area)
 
@@ -86,6 +86,7 @@ opensearch_pipeline/
   chunker.py                # DocumentChunker; modes: text/faq/clause/step  (2228 lines)
   content_blocks_builder.py # answer → DingTalk card content_blocks
   retriever.py              # HA3 hybrid retrieval + stitching + step expansion
+  reranker.py               # routed DashScope rerank (text/VL), gated by RAG_RERANK_ENABLE
   api.py / llm_generator.py / session_store.py / qa_logger.py / feedback_handler.py   # serving
   dingtalk_bot.py / dingtalk_card.py / oss_url.py   # DingTalk integration
   image_funnel_processor.py / spot_checker.py       # VLM funnel; security re-audit
@@ -93,6 +94,7 @@ opensearch_pipeline/
 schema/                     # RDS DDL (001 + 002_feedback_system + 002_step_card_enhancement)
 dataworks_nodes/            # DataWorks stage node scripts
 fuling_chunk_exp/           # real document corpus for chunking experiments
+eval_harness/               # end-to-end HA3 RAG eval harness + reports
 tests/  scratch/  docs/
 ```
 
