@@ -3062,10 +3062,16 @@ def node_acquire_index_lock(ctx: dict):
                     # 没有这一支，崩溃残留的 PROCESSING 文档永远无法被重新入队（loader 会反复
                     # 加载其 chunk 再被过滤掉，整批永远排不空）。2h 阈值与 orchestrator 的
                     # loader / _count_pending_rows 保持一致。
+                    # SET 里的 updated_at = NOW() 不能省略：index_status 是同值更新
+                    # （PROCESSING→PROCESSING），MySQL 对未发生变化的行 changed-rows=0，
+                    # 连接池未开 CLIENT_FOUND_ROWS 时 rowcount 报告的正是 changed-rows，
+                    # 且 ON UPDATE CURRENT_TIMESTAMP 也不会触发。显式刷新 updated_at
+                    # 才会真正改变行（rowcount=1），同时重置失效时钟，保证并发运行中
+                    # 只有第一个能接管。
                     if cursor.rowcount == 0:
                         cursor.execute("""
                             UPDATE document_version
-                            SET index_status = 'PROCESSING'
+                            SET index_status = 'PROCESSING', updated_at = NOW()
                             WHERE doc_id = %s AND version_no = %s
                               AND index_status = 'PROCESSING'
                               AND updated_at < NOW() - INTERVAL 2 HOUR

@@ -281,6 +281,105 @@ def test_h_stale_processing_lock_takeover():
     )
 
 
+# Test H2 (behavioral): the stale-takeover UPDATE must actually CHANGE the row.
+# Test H only greps the source, so it kept passing while the takeover arm was a SQL
+# no-op: SET index_status='PROCESSING' on a row already in PROCESSING changes nothing,
+# MySQL reports changed-rows=0 (the pool sets no CLIENT_FOUND_ROWS, so pymysql's
+# rowcount counts changed rows), ON UPDATE CURRENT_TIMESTAMP doesn't fire, and the
+# crashed doc stays wedged forever. This fake cursor emulates exactly those semantics.
+class _FakeDocVersionCursor:
+    """One in-memory document_version row + MySQL changed-rows semantics for the
+    three lock-claim UPDATE shapes issued by node_acquire_index_lock."""
+
+    def __init__(self, row):
+        self.row = row  # {"index_status": str, "updated_at": datetime}
+        self.rowcount = -1
+
+    def execute(self, sql, params=None):
+        import datetime
+        now = datetime.datetime.now()
+        row = self.row
+
+        if "index_status IN ('NOT_INDEXED', 'FAILED')" in sql:
+            matched = row["index_status"] in ("NOT_INDEXED", "FAILED")
+        elif "index_status = 'SUCCESS'" in sql:
+            matched = row["index_status"] == "SUCCESS"
+        elif "index_status = 'PROCESSING'" in sql and "INTERVAL 2 HOUR" in sql:
+            matched = (
+                row["index_status"] == "PROCESSING"
+                and row["updated_at"] < now - datetime.timedelta(hours=2)
+            )
+        else:
+            raise AssertionError(f"unexpected SQL in lock claim: {sql}")
+
+        if not matched:
+            self.rowcount = 0
+            return
+
+        # changed-rows: the row counts only if some assigned column's value changes
+        set_clause = sql.split("SET", 1)[1].split("WHERE", 1)[0]
+        changed = False
+        if row["index_status"] != "PROCESSING":
+            row["index_status"] = "PROCESSING"
+            changed = True
+        if "updated_at" in set_clause:
+            row["updated_at"] = now  # explicit assignment always changes a stale value
+            changed = True
+        elif changed:
+            row["updated_at"] = now  # ON UPDATE CURRENT_TIMESTAMP, only on real change
+        self.rowcount = 1 if changed else 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_h2_stale_processing_takeover_changes_row():
+    import datetime
+
+    def make_chunk():
+        return Chunk(
+            chunk_id="doc_stale_v3_c0001",
+            doc_id="doc_stale",
+            version_no=3,
+            chunk_index=1,
+            chunk_type="text_chunk",
+            chunk_text="wedged chunk",
+            token_count=3,
+        )
+
+    row = {
+        "index_status": "PROCESSING",
+        "updated_at": datetime.datetime.now() - datetime.timedelta(hours=3),
+    }
+    conn = MagicMock()
+    conn.cursor.return_value = _FakeDocVersionCursor(row)
+
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+        ctx = {"valid_chunks": [make_chunk()], "simulate_db": False}
+        node_acquire_index_lock(ctx)
+
+    assert ("doc_stale", 3) in ctx["preempted_doc_versions"], (
+        "stale (>2h) PROCESSING doc must be taken over; a same-value UPDATE reports "
+        "changed-rows=0, so the SET clause must also refresh updated_at"
+    )
+    assert len(ctx["valid_chunks"]) == 1, "chunks of the taken-over doc must survive the filter"
+    assert row["updated_at"] > datetime.datetime.now() - datetime.timedelta(minutes=5), (
+        "takeover must refresh updated_at (restart the 2h staleness clock)"
+    )
+
+    # The refreshed clock makes the lock non-stale again: a second run must NOT steal it.
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+        ctx2 = {"valid_chunks": [make_chunk()], "simulate_db": False}
+        node_acquire_index_lock(ctx2)
+    assert ctx2["preempted_doc_versions"] == set(), (
+        "a freshly taken-over PROCESSING lock must not be stolen by a second run"
+    )
+    assert ctx2.get("dag3_no_work") is True
+
+
 # Test I: the drain-loop must RAISE (non-zero exit) on a stall, not silently break to success.
 def test_i_drain_loop_raises_on_no_progress():
     import opensearch_pipeline.dataworks_orchestrator as orch
