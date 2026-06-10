@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>富岭知识助手 · 钉钉小程序原型</title>
 <style>
 
@@ -14,6 +14,8 @@
   :root{
     /* brand — Aurora Forest（深林绿 + 极光绿） */
     --brand:#15604a; --brand-strong:#134f3e; --brand-press:#0e3f31; --brand-soft:#d9ebe2;
+    /* 预计算 alpha 变体（替代 color-mix —— 旧版钉钉 WebView 不支持，整条声明会被丢弃） */
+    --brand-a16:rgba(21,96,74,.16); --brand-a30:rgba(21,96,74,.30); --brand-a40:rgba(21,96,74,.40);
     --brand-grad:linear-gradient(135deg,#0f5a43 0%,#1f9d76 60%,#34d6a3 100%);
     --nav-grad:linear-gradient(125deg,#103f30 0%,#17795b 55%,#2bbf95 100%);
     /* cotton-paper 棉纸底色 */
@@ -22,8 +24,9 @@
     /* warm ink */
     --text-1:#2a2620; --text-2:#5b5347; --text-3:#6f6657;
     --line:#e3dccb; --line-2:#efe9db;
-    --success:#15795a; --success-bg:#d9ece4;
-    --warn:#9a6b12; --warn-bg:#f3e7cf;
+    --divider-bg:rgba(91,83,71,.12);
+    --success:#116449; --success-bg:#d9ece4;
+    --warn:#82590c; --warn-bg:#f3e7cf;
     --danger:#b3402f; --danger-soft:#c2503c; --danger-bg:#f6e2dc;
     --me-grad:linear-gradient(135deg,#8a7f6c,#6b6253);
     --r-xs:6px; --r-sm:10px; --r-md:14px; --r-lg:18px; --r-pill:999px; --r-bubble:16px; --r-tail:5px;
@@ -39,12 +42,14 @@
   }
   html[data-theme="dark"]{
     --brand:#34e0ad; --brand-strong:#15795a; --brand-press:#0f5f47; --brand-soft:#103127;
+    --brand-a16:rgba(52,224,173,.16); --brand-a30:rgba(52,224,173,.30); --brand-a40:rgba(52,224,173,.40);
     --brand-grad:linear-gradient(135deg,#0f6a4e 0%,#22c08e 100%);
     --nav-grad:linear-gradient(125deg,#0a2a20 0%,#115740 55%,#1f9d76 100%);
     --page:#0c1611; --page-tint:#10261c;
     --chat-bg:#0e1a14; --surface:#16271e; --surface-2:#121f18; --surface-3:#1d2f25;
     --text-1:#e9efe9; --text-2:#a7b6ac; --text-3:#8a988d;
     --line:#26352b; --line-2:#1b271f;
+    --divider-bg:rgba(167,182,172,.14);
     --success:#3dd9a0; --success-bg:#0e2a1f;
     --warn:#e0a93a; --warn-bg:#2c2310;
     --danger:#ff7a66; --danger-soft:#ff7a66; --danger-bg:#2a1714;
@@ -83,22 +88,24 @@
 
   /* ---------- nav bar ---------- */
   .navbar{background:var(--nav-grad);color:#fff;padding:30px 14px 12px;display:flex;align-items:center;gap:10px;box-shadow:var(--sh-brand);z-index:30;}
-  .navbar .brandmark{width:30px;height:30px;border-radius:9px;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;flex-shrink:0;border:1px solid rgba(255,255,255,.28);}
+  .navbar .brandmark{width:30px;height:30px;border-radius:var(--r-sm);background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;flex-shrink:0;border:1px solid rgba(255,255,255,.28);}
   .navbar .title-wrap{flex:1;text-align:center;}
   .navbar .title{font-size:var(--fs-md);font-weight:600;letter-spacing:.5px;}
-  .navbar .subtitle{font-size:10px;opacity:.85;margin-top:2px;display:flex;align-items:center;justify-content:center;gap:5px;}
+  .navbar .subtitle{font-size:var(--fs-xs);margin-top:2px;display:flex;align-items:center;justify-content:center;gap:5px;}
   .navbar .subtitle::before{content:"";width:6px;height:6px;border-radius:50%;background:#5cf08f;animation:pulse 2.4s ease-in-out infinite;}
+  /* 服务健康态：错误后降级（demo 演示；真实端由最近一次请求结果驱动） */
+  .navbar.degraded .subtitle::before{background:#e0a93a;animation:none;}
   .navbar .more{font-size:20px;width:30px;text-align:center;opacity:.95;letter-spacing:1px;}
 
   /* ---------- chat area ---------- */
   .chat{flex:1;overflow-y:auto;padding:14px 12px 8px;scroll-behavior:smooth;-webkit-overflow-scrolling:touch;}
   .chat::-webkit-scrollbar{width:0;}
   .day-divider{text-align:center;margin:4px 0 16px;}
-  .day-divider span{background:rgba(120,130,150,.14);color:var(--text-3);font-size:var(--fs-xs);padding:3px 12px;border-radius:var(--r-pill);}
+  .day-divider span{background:var(--divider-bg);color:var(--text-2);font-size:var(--fs-xs);padding:3px 12px;border-radius:var(--r-pill);}
 
   .msg{display:flex;margin-bottom:16px;align-items:flex-start;gap:8px;animation:rise var(--dur-3) var(--ease);}
   @keyframes rise{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;}}
-  .avatar{width:34px;height:34px;border-radius:10px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;color:#fff;box-shadow:var(--sh-1);}
+  .avatar{width:34px;height:34px;border-radius:var(--r-sm);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;color:#fff;box-shadow:var(--sh-1);}
   .avatar.ai{background:var(--brand-grad);box-shadow:0 0 0 1px rgba(52,214,163,.18),0 4px 12px rgba(21,96,74,.22);}
   .avatar.me{background:var(--me-grad);}
 
@@ -118,55 +125,74 @@
   /* inline image block */
   .blk-img{margin:2px 0 11px;}
   .blk-img figure{margin:0;border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden;background:var(--surface-2);cursor:zoom-in;transition:transform var(--dur-1) var(--ease),box-shadow var(--dur-2) var(--ease);}
-  .blk-img figure:hover{box-shadow:var(--sh-2);}
-  .blk-img figure:active{transform:scale(.985);}
+  .blk-img figure:hover{box-shadow:var(--sh-2);}   /* hover 仅原型桌面预览；port 时删除，:active 为准 */
+  .blk-img figure:active{transform:scale(.985);box-shadow:var(--sh-2);}
   .blk-img figure:focus-visible{outline:2px solid var(--brand);outline-offset:2px;}
   .blk-img svg{display:block;width:100%;height:auto;}
-  .blk-img figcaption{font-size:var(--fs-xs);color:var(--text-3);padding:7px 11px;background:var(--surface);border-top:1px solid var(--line);display:flex;align-items:center;gap:6px;}
-  .blk-img figcaption::before{content:"🖼";font-size:11px;opacity:.7;}
+  .blk-img figcaption{font-size:var(--fs-sm);color:var(--text-3);padding:7px 11px;background:var(--surface);border-top:1px solid var(--line);display:flex;align-items:center;gap:6px;}
+  .blk-img figcaption svg{width:13px;height:13px;flex-shrink:0;opacity:.75;}
+  .blk-img .cap-text{flex:1;min-width:0;}
+  .blk-img .zoom-hint{flex-shrink:0;display:inline-flex;align-items:center;gap:3px;color:var(--text-3);font-size:var(--fs-xs);opacity:.85;}
+  /* 图片加载失败（OSS 签名 URL 1 小时过期）：保留图框与说明，整体可点按重载 —— 绝不静默移除 */
+  .blk-img.failed .img-fallback{min-height:120px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:var(--surface-2);color:var(--text-3);font-size:var(--fs-sm);}
+  .blk-img.failed .img-fallback svg{width:22px;height:22px;opacity:.8;}
 
   /* ---------- sources (参考来源) ---------- */
   .sources{border-top:1px solid var(--line);margin-top:4px;}
-  .sources-toggle{display:flex;align-items:center;gap:7px;cursor:pointer;padding:10px 14px;font-size:var(--fs-sm);color:var(--text-2);user-select:none;min-height:40px;}
-  .sources-toggle .chev{transition:transform var(--dur-2) var(--ease);font-size:10px;color:var(--text-3);}
+  .sources-toggle{display:flex;align-items:center;gap:7px;cursor:pointer;padding:10px 14px;font-size:var(--fs-sm);color:var(--text-2);user-select:none;min-height:40px;width:100%;background:none;border:none;font-family:inherit;text-align:left;}
+  .sources-toggle:focus-visible{outline:2px solid var(--brand);outline-offset:-2px;}
+  .sources-toggle .chev{display:inline-flex;transition:transform var(--dur-2) var(--ease);color:var(--text-3);}
+  .sources-toggle .chev svg{width:12px;height:12px;}
   .sources.open .sources-toggle .chev{transform:rotate(90deg);}
   .sources-toggle .badge{background:var(--brand-soft);color:var(--brand);font-size:var(--fs-xs);font-weight:600;padding:2px 8px;border-radius:var(--r-pill);margin-left:auto;}
+  /* 生产 top_k=7（k10 评测中）：600px + 内部滚动，尾部来源不可被静默裁掉 */
   .sources-list{max-height:0;overflow:hidden;transition:max-height var(--dur-3) var(--ease);background:var(--surface-2);}
-  .sources.open .sources-list{max-height:340px;}
+  .sources.open .sources-list{max-height:600px;overflow-y:auto;}
   .src-item{padding:10px 14px;border-top:1px solid var(--line);font-size:var(--fs-sm);display:flex;align-items:flex-start;gap:9px;}
   .src-item .si-idx{flex-shrink:0;width:19px;height:19px;border-radius:var(--r-xs);background:var(--brand-soft);color:var(--brand);font-size:var(--fs-xs);font-weight:700;display:flex;align-items:center;justify-content:center;margin-top:1px;font-variant-numeric:tabular-nums;}
   .src-item .si-main{flex:1;min-width:0;}
   .src-item .si-title{color:var(--text-1);font-weight:500;line-height:var(--lh-tight);}
   .src-item .si-meta{color:var(--text-3);font-size:var(--fs-xs);margin-top:2px;}
-  .src-item .si-score{flex-shrink:0;font-size:var(--fs-xs);font-weight:600;color:var(--success);background:var(--success-bg);padding:2px 8px;border-radius:var(--r-pill);margin-top:1px;font-variant-numeric:tabular-nums;}
+  .src-item .si-score{flex-shrink:0;font-size:var(--fs-xs);font-weight:600;color:var(--success);background:var(--success-bg);padding:2px 8px;border-radius:var(--r-pill);margin-top:1px;}
   .src-item .si-score.mid{color:var(--warn);background:var(--warn-bg);}
+  .src-item .si-score.low{color:var(--text-3);background:var(--surface-3);}
 
   /* ---------- feedback bar (embedded icon buttons) ---------- */
-  .fb{border-top:1px solid var(--line);padding:5px 8px;display:flex;gap:2px;align-items:center;}
-  .fb-ico{display:flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:var(--r-sm);color:var(--text-3);background:transparent;border:none;cursor:pointer;padding:0;transition:all var(--dur-2) var(--ease);}
+  .fb{border-top:1px solid var(--line);padding:5px 8px;display:flex;gap:8px;align-items:center;}
+  .fb-ico{display:flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:var(--r-sm);color:var(--text-3);background:transparent;border:none;cursor:pointer;padding:0;transition:all var(--dur-2) var(--ease);}
   .fb-ico svg{width:18px;height:18px;}
-  .fb-ico:hover{background:var(--surface-3);color:var(--text-2);}
-  .fb-ico:active{transform:scale(.88);}
+  .fb-ico:hover{background:var(--surface-3);color:var(--text-2);}   /* hover 仅原型桌面预览 */
+  .fb-ico:active{transform:scale(.88);background:var(--surface-3);}
   .fb-ico:focus-visible{outline:2px solid var(--brand);outline-offset:2px;}
   .fb-ico.up.active{color:var(--brand);background:var(--brand-soft);}
-  .fb-ico.up.active svg{fill:color-mix(in srgb,var(--brand) 16%,transparent);}
+  .fb-ico.up.active svg{fill:var(--brand-a16);}
   .fb-ico.down.active{color:var(--danger-soft);background:var(--danger-bg);}
   .fb-ico[disabled]{opacity:.45;cursor:default;pointer-events:none;}
-  .fb-spacer{flex:1;}
-  .fb-handoff{display:flex;align-items:center;gap:5px;font-size:var(--fs-sm);color:var(--text-3);background:transparent;border:none;cursor:pointer;padding:7px 10px;border-radius:var(--r-sm);min-height:36px;transition:all var(--dur-2) var(--ease);}
-  .fb-handoff svg{width:15px;height:15px;}
-  .fb-handoff:hover{color:var(--brand);background:var(--surface-3);}
+  /* 已选中的那一票保持饱和 —— 否则 45% 透明度让“已记录”看起来像“坏了” */
+  .fb-ico.active[disabled]{opacity:1;}
+  .fb-spacer{flex:1;display:flex;align-items:center;}
+  .fb-done{font-size:var(--fs-xs);color:var(--text-3);}
+  .fb-handoff{display:flex;align-items:center;gap:5px;font-size:var(--fs-sm);color:var(--text-3);background:transparent;border:none;cursor:pointer;padding:7px 10px;border-radius:var(--r-sm);min-height:40px;transition:all var(--dur-2) var(--ease);}
+  .fb-handoff svg{width:18px;height:18px;}
+  .fb-handoff:hover{color:var(--brand);background:var(--surface-3);}   /* hover 仅原型桌面预览 */
+  .fb-handoff:active{color:var(--brand);background:var(--surface-3);}
   .fb-handoff.done{color:var(--brand);}
   .fb-handoff[disabled]{opacity:.45;cursor:default;pointer-events:none;}
+  .fb-handoff.done[disabled]{opacity:1;}
+  /* 转人工后的持久确认行（toast 1.7s 即逝，滚回来要还能看到） */
+  .handoff-note{background:var(--success-bg);color:var(--success);font-size:var(--fs-sm);padding:8px 14px;display:flex;align-items:center;gap:6px;}
+  .handoff-note svg{width:14px;height:14px;flex-shrink:0;}
 
   .fb-panel{max-height:0;overflow:hidden;transition:max-height var(--dur-3) var(--ease);}
   .fb-panel.open{max-height:340px;border-top:1px solid var(--line);}
   .fb-panel-inner{padding:12px 14px 14px;}
   .fb-panel-inner .fp-q{font-size:var(--fs-sm);color:var(--text-2);margin-bottom:10px;}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:11px;}
-  .chip{font-size:var(--fs-sm);color:var(--text-2);background:var(--surface-3);border:1px solid var(--line);border-radius:var(--r-pill);padding:8px 14px;cursor:pointer;transition:all var(--dur-1) var(--ease);min-height:36px;}
+  .chip{font-size:var(--fs-sm);color:var(--text-2);background:var(--surface-3);border:1px solid var(--line);border-radius:var(--r-pill);padding:8px 14px;cursor:pointer;transition:all var(--dur-1) var(--ease);min-height:36px;font-family:inherit;}
   .chip:active{transform:scale(.95);}
-  .chip.sel{background:var(--brand-soft);color:var(--brand);border-color:color-mix(in srgb,var(--brand) 40%,transparent);font-weight:500;}
+  .chip[disabled]{opacity:.55;pointer-events:none;}
+  .chip:focus-visible{outline:2px solid var(--brand);outline-offset:2px;}
+  .chip.sel{background:var(--brand-soft);color:var(--brand);border-color:var(--brand-a40);font-weight:500;}
   .fb-panel textarea{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);resize:none;font-size:var(--fs-sm);padding:9px 11px;font-family:inherit;color:var(--text-1);min-height:56px;outline:none;background:var(--surface-2);transition:border-color var(--dur-2) var(--ease),background var(--dur-2) var(--ease);}
   .fb-panel textarea:focus{border-color:var(--brand);background:var(--surface);}
   .fb-submit-row{display:flex;justify-content:flex-end;gap:8px;margin-top:11px;}
@@ -175,6 +201,35 @@
   .btn-primary{font-size:var(--fs-sm);color:#fff;background:var(--brand-strong);border:none;border-radius:var(--r-sm);padding:8px 20px;cursor:pointer;font-weight:500;min-height:38px;}
   .btn-primary:active{background:var(--brand-press);}
   .btn-primary[disabled]{opacity:.5;}
+
+  /* ---------- answer-card 状态变体 ---------- */
+  /* 出错卡（生产 ~11% 请求命中）：danger 左标尺 + 重试；无来源、无反馈条 */
+  .ai-card.error .body p{position:relative;padding-left:13px;color:var(--text-2);}
+  .ai-card.error .body p::before{content:"";position:absolute;left:0;top:4px;bottom:5px;width:3px;border-radius:2px;background:var(--danger);}
+  .btn-retry{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--danger-soft);color:var(--danger);background:transparent;border-radius:var(--r-pill);padding:7px 16px;min-height:36px;font-size:var(--fs-sm);cursor:pointer;font-family:inherit;margin:0 0 12px;transition:all var(--dur-1) var(--ease);white-space:nowrap;}
+  .btn-retry svg{width:14px;height:14px;flex-shrink:0;}
+  .btn-retry:active{transform:scale(.96);background:var(--danger-bg);}
+  .btn-retry:focus-visible{outline:2px solid var(--danger);outline-offset:2px;}
+  /* NO_RESULT 空结果卡：死胡同必须留出口（换说法 chips + 转人工） */
+  .ai-card.no-result .body{padding:18px 16px 14px;display:flex;flex-direction:column;align-items:center;text-align:center;}
+  .ai-card.no-result .nr-ico{color:var(--text-3);margin-bottom:8px;}
+  .ai-card.no-result .nr-ico svg{width:28px;height:28px;}
+  .ai-card.no-result .nr-title{font-size:var(--fs-base);font-weight:600;color:var(--text-1);margin:0 0 6px;}
+  .ai-card.no-result .nr-desc{font-size:var(--fs-sm);color:var(--text-3);line-height:var(--lh);margin:0 0 12px;}
+  .ai-card.no-result .chips{justify-content:center;margin-bottom:4px;}
+  .nr-handoff{display:inline-flex;align-items:center;gap:6px;background:var(--brand-soft);color:var(--brand);border:none;border-radius:var(--r-pill);padding:9px 18px;min-height:38px;font-size:var(--fs-sm);font-weight:500;cursor:pointer;font-family:inherit;margin-top:6px;transition:all var(--dur-1) var(--ease);}
+  .nr-handoff svg{width:16px;height:16px;}
+  .nr-handoff:active{transform:scale(.96);}
+  .nr-handoff[disabled]{opacity:.55;pointer-events:none;}
+  /* 低匹配 guard 提示条：guard 上线后，避免“低置信回答看起来同样权威” */
+  .guard-note{background:var(--warn-bg);color:var(--warn);font-size:var(--fs-sm);line-height:var(--lh);padding:8px 11px;border-radius:var(--r-sm);margin:0 0 10px;display:flex;align-items:flex-start;gap:6px;}
+  .guard-note svg{width:15px;height:15px;flex-shrink:0;margin-top:2px;}
+
+  /* ---------- 回到底部浮标（打字中向上翻阅时出现） ---------- */
+  .to-bottom{position:absolute;right:14px;bottom:108px;width:36px;height:36px;border-radius:50%;background:var(--surface);color:var(--brand);border:1px solid var(--line);box-shadow:var(--sh-2);display:none;align-items:center;justify-content:center;cursor:pointer;z-index:50;padding:0;}
+  .to-bottom.show{display:flex;animation:rise var(--dur-2) var(--ease);}
+  .to-bottom svg{width:16px;height:16px;}
+  .to-bottom:focus-visible{outline:2px solid var(--brand);outline-offset:2px;}
 
   /* ---------- skeleton / loading ---------- */
   .skel .body{padding:14px;}
@@ -190,17 +245,19 @@
   .quick{display:flex;gap:8px;padding:9px 12px 7px;overflow-x:auto;background:var(--chat-bg);border-top:1px solid var(--line);}
   .quick::-webkit-scrollbar{height:0;}
   .quick .ql{font-size:var(--fs-xs);color:var(--text-3);align-self:center;flex-shrink:0;}
-  .quick-chip{flex-shrink:0;font-size:var(--fs-sm);color:var(--brand);background:var(--surface);border:1px solid color-mix(in srgb,var(--brand) 30%,transparent);border-radius:var(--r-pill);padding:7px 14px;cursor:pointer;white-space:nowrap;transition:all var(--dur-1) var(--ease);min-height:36px;}
+  .quick-chip{flex-shrink:0;font-size:var(--fs-sm);color:var(--brand);background:var(--surface);border:1px solid var(--brand-a30);border-radius:var(--r-pill);padding:7px 14px;cursor:pointer;white-space:nowrap;transition:all var(--dur-1) var(--ease);min-height:36px;font-family:inherit;}
   .quick-chip:active{transform:scale(.95);background:var(--brand-soft);}
+  /* 状态演示 chips（无结果 / 出错 / 图片过期）—— 仅原型评审用 */
+  .quick-chip.demo{color:var(--text-3);border:1px dashed var(--line);background:var(--surface-2);}
 
   /* ---------- input bar ---------- */
   .inputbar{display:flex;align-items:flex-end;gap:9px;padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom,0px));background:var(--surface);border-top:1px solid var(--line);}
-  .inputbar .plus{width:36px;height:36px;border-radius:50%;background:var(--surface-3);color:var(--text-3);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;}
   .inputbar textarea{flex:1;border:1px solid var(--line);background:var(--surface-3);border-radius:var(--r-lg);resize:none;font-size:var(--fs-base);line-height:var(--lh-tight);padding:9px 14px;max-height:90px;font-family:inherit;color:var(--text-1);outline:none;transition:border-color var(--dur-2) var(--ease);}
   .inputbar textarea:focus{border-color:var(--brand);}
-  .send-btn{background:var(--brand-strong);color:#fff;border:none;border-radius:var(--r-lg);padding:0 17px;height:38px;font-size:var(--fs-base);font-weight:500;cursor:pointer;flex-shrink:0;transition:background var(--dur-2) var(--ease),opacity var(--dur-2) var(--ease);min-width:64px;}
-  .send-btn:active{background:var(--brand-press);}
-  .send-btn:not([disabled]){background:var(--brand-grad);box-shadow:var(--sh-brand);}
+  /* 白字填充一律 --brand-strong（锁定的 brand/brand-strong 分工）：渐变上白字仅 1.9:1，不可用 */
+  .send-btn{background:var(--brand-strong);color:#fff;border:none;border-radius:var(--r-lg);padding:0 17px;height:38px;font-size:var(--fs-base);font-weight:500;cursor:pointer;flex-shrink:0;transition:background var(--dur-2) var(--ease),opacity var(--dur-2) var(--ease),box-shadow var(--dur-2) var(--ease);min-width:64px;}
+  .send-btn:not([disabled]){box-shadow:var(--sh-brand);}
+  .send-btn:not([disabled]):active{background:var(--brand-press);box-shadow:none;transform:scale(.97);}
   .send-btn[disabled]{opacity:.45;cursor:default;}
 
   /* ---------- toast ---------- */
@@ -212,13 +269,16 @@
   .lightbox{position:absolute;inset:0;background:var(--scrim);z-index:100;display:none;flex-direction:column;align-items:center;justify-content:center;}
   .lightbox.open{display:flex;animation:fade var(--dur-2) var(--ease);}
   @keyframes fade{from{opacity:0}to{opacity:1}}
-  .lb-close{position:absolute;top:14px;right:16px;color:#fff;font-size:30px;cursor:pointer;width:44px;height:44px;display:flex;align-items:center;justify-content:center;z-index:2;border-radius:50%;}
+  /* 注意：小程序里右上角是钉钉胶囊按钮 —— 关闭按钮放左上，避让胶囊（port 时保持） */
+  .lb-close{position:absolute;top:14px;left:16px;color:#fff;cursor:pointer;width:44px;height:44px;display:flex;align-items:center;justify-content:center;z-index:2;border-radius:50%;background:rgba(255,255,255,.14);border:none;padding:0;}
+  .lb-close svg{width:20px;height:20px;}
   .lb-close:focus-visible,.lb-arrow:focus-visible{outline:2px solid #fff;outline-offset:2px;}
   .lb-stage{width:100%;flex:1;display:flex;align-items:center;justify-content:center;padding:0 8px;}
   .lb-stage svg{max-width:92%;max-height:74vh;border-radius:var(--r-sm);background:#fff;box-shadow:0 8px 40px rgba(0,0,0,.5);}
   .lb-cap{color:#e6e8ec;font-size:var(--fs-sm);text-align:center;padding:12px 24px 6px;max-width:90%;}
   .lb-count{color:#9aa0a8;font-size:var(--fs-sm);padding-bottom:18px;font-variant-numeric:tabular-nums;}
-  .lb-arrow{position:absolute;top:50%;transform:translateY(-50%);color:#fff;font-size:26px;width:46px;height:46px;border-radius:50%;background:rgba(255,255,255,.14);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;user-select:none;}
+  .lb-arrow{position:absolute;top:50%;transform:translateY(-50%);color:#fff;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.14);border:none;padding:0;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;user-select:none;}
+  .lb-arrow svg{width:20px;height:20px;}
   .lb-arrow.prev{left:12px;}
   .lb-arrow.next{right:12px;}
   .lb-arrow[disabled]{opacity:.25;cursor:default;}
@@ -239,7 +299,7 @@
 <body>
   <div class="page-head">
     <h1>富岭知识助手 · 钉钉小程序 UX 原型</h1>
-    <p>Claude Design Mockup — 图文穿插回答 / 打字机 / 图片放大 / 赞踩反馈（可点击）</p>
+    <p>Claude Design Mockup — 图文穿插回答 / 打字机 / 图片放大 / 赞踩反馈，含低匹配·未找到·出错·图片过期全状态（可点击）</p>
     <button class="theme-toggle" id="themeToggle" aria-label="切换深色模式">🌙 深色</button>
   </div>
 
@@ -247,12 +307,12 @@
     <div class="screen">
       <div class="notch"></div>
 
-      <!-- nav -->
-      <div class="navbar">
+      <!-- nav（真实端建议 transparentTitle 自绘；subtitle 状态由最近一次请求结果驱动） -->
+      <div class="navbar" id="navbar">
         <div class="brandmark">富</div>
         <div class="title-wrap">
           <div class="title">富岭知识助手</div>
-          <div class="subtitle">企业知识库 · 在线</div>
+          <div class="subtitle" id="subtitle">企业知识库 · 在线</div>
         </div>
         <div class="more">···</div>
       </div>
@@ -265,33 +325,35 @@
           <div class="avatar ai">富</div>
           <div class="ai-card">
             <div class="body">
-              <p>您好👋 我是<strong>富岭知识助手</strong>。我可以基于公司内部 SOP、U8+ ERP 手册、人事行政制度等文档为您解答。试试下面的示例问题，或直接输入您的疑问。</p>
+              <p>您好👋 我是<strong>富岭知识助手</strong>。作业指导书（SOP）、U8+ 系统操作、考勤请假等人事行政制度，都可以直接问我。点下面的示例问题试试，或直接输入您的问题。</p>
             </div>
           </div>
         </div>
       </div>
+
+      <!-- 回到底部浮标 -->
+      <button class="to-bottom" id="toBottom" aria-label="回到最新回答"></button>
 
       <!-- quick replies -->
       <div class="quick" id="quick">
         <span class="ql">示例：</span>
       </div>
 
-      <!-- input -->
+      <!-- input（v1 不做附件输入：不放无功能的 ＋ 占位） -->
       <div class="inputbar">
-        <div class="plus">＋</div>
         <textarea id="input" rows="1" placeholder="请输入问题…"></textarea>
         <button class="send-btn" id="send" disabled>发送</button>
       </div>
 
       <!-- toast -->
-      <div class="toast-wrap"><div class="toast" id="toast"></div></div>
+      <div class="toast-wrap"><div class="toast" id="toast" role="status" aria-live="polite"></div></div>
 
-      <!-- lightbox -->
-      <div class="lightbox" id="lightbox">
-        <div class="lb-close" id="lbClose">×</div>
-        <div class="lb-arrow prev" id="lbPrev">‹</div>
+      <!-- lightbox（port 时为 page 根级 fixed 覆盖层；关闭键在左上避让钉钉胶囊） -->
+      <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="图片预览">
+        <button class="lb-close" id="lbClose" aria-label="关闭图片预览"></button>
+        <button class="lb-arrow prev" id="lbPrev" aria-label="上一张"></button>
         <div class="lb-stage" id="lbStage"></div>
-        <div class="lb-arrow next" id="lbNext">›</div>
+        <button class="lb-arrow next" id="lbNext" aria-label="下一张"></button>
         <div class="lb-cap" id="lbCap"></div>
         <div class="lb-count" id="lbCount"></div>
       </div>
@@ -300,8 +362,10 @@
   </div>
 
   <div class="hint">
-    1:1 映射真实小程序的 <code>answer-bubble</code> 组件。AI 回答由 <code>blocks[]</code> 渲染（<code>{type:'text'}</code> / <code>{type:'image'}</code>），<br>
-    对应后端 <code>content_blocks_builder.py</code> 输出的 <code>{type:'markdown'}</code> / <code>{type:'image'}</code>。点击图片放大，点击 👎 展开原因面板。
+    1:1 映射真实小程序的 <code>answer-bubble</code> 组件。AI 回答由 <code>blocks[]</code> 渲染（<code>{type:'text'}</code> / <code>{type:'image'}</code>），
+    对应后端 <code>content_blocks_builder.py</code> 输出；真实环境经 HA3 向量检索 + Qwen 生成。点击图片放大，点击 👎 展开原因面板。<br>
+    需要 <code>/api/ask</code> 配套下发：来源 <code>level: high|mid|low</code>（rerank 开启后分数为 0-1 量纲，前端不可重算）、
+    <code>guard</code> 低匹配标志、<code>no_result</code> 标志。
   </div>
 
 <script>
@@ -417,9 +481,11 @@ const SVG = {
 
 /* ---------- 2. 脚本化对话（answer 用 blocks[]） ----------
    blocks 元素：
-     {type:'text',  text:'...'}
-     {type:'image', svg:'<key>', caption:'...', alt:'...'}   // 真实环境为 {type:'image', url, caption, alt}
-   sources 元素：{title, section, score}（对应检索 chunk 的 doc_title·section·score） */
+     {type:'text',  text:'...'}                                // 加粗统一用 **…**（与 content_blocks_builder 输出约定一致，禁混用 <strong>）
+     {type:'image', svg:'<key>', caption:'...', alt:'...'}     // 真实环境为 {type:'image', url, caption, alt}
+   sources 元素：{title, section, score, level?}（level 由服务端下发 'high'|'mid'|'low'；
+   缺省时前端按加权融合分 7.7/5.8 标定档位兜底 —— rerank 开启后分数是 0-1 量纲，必须用服务端 level）
+   answer 可选：guard:true（低匹配提示条）、noResult:true、error:true、imgFailed:true */
 const CONVERSATION = {
   'u8-login': {
     q: 'U8+ 如何登录？',
@@ -428,8 +494,8 @@ const CONVERSATION = {
         {type:'text', text:'登录用友 U8+ 系统请按以下步骤操作：'},
         {type:'text', text:'**第 1 步** 双击桌面「U8+ 企业应用平台」图标，打开登录窗口。'},
         {type:'image', svg:'u8login', caption:'U8+ 登录界面（账套 / 操作员 / 密码）', alt:'U8+ 登录界面截图'},
-        {type:'text', text:'**第 2 步** 在「账套」下拉框选择 <strong>[888] 浙江富岭塑胶</strong>；首次登录请确认账套年度正确。'},
-        {type:'text', text:'**第 3 步** 输入您的<strong>操作员工号</strong>与<strong>密码</strong>，点击「登录」。如忘记密码，请联系信息部（分机 8021）重置。'},
+        {type:'text', text:'**第 2 步** 在「账套」下拉框选择 **[888] 浙江富岭塑胶**；首次登录请确认账套年度正确。'},
+        {type:'text', text:'**第 3 步** 输入您的**操作员工号**与**密码**，点击「登录」。如忘记密码，请联系信息部（分机 8021）重置。'},
         {type:'text', text:'登录后若提示「无操作权限」，说明该模块未授权，需由系统管理员在「操作员及权限」中分配角色。'},
         {type:'image', svg:'u8setup', caption:'系统管理 → 操作员及权限分配面板', alt:'U8+ 操作员及权限面板截图'}
       ],
@@ -444,10 +510,10 @@ const CONVERSATION = {
     q: '请假流程是什么？',
     answer: {
       blocks: [
-        {type:'text', text:'富岭员工请假需通过<strong>钉钉 OA</strong>线上提交，审批流程如下：'},
+        {type:'text', text:'富岭员工请假需通过**钉钉 OA**线上提交，审批流程如下：'},
         {type:'image', svg:'leaveFlow', caption:'员工请假审批流程图', alt:'请假审批流程图'},
         {type:'text', text:'**① 发起**：钉钉「工作台 → OA 审批 → 请假」，填写请假类型、起止时间与事由。'},
-        {type:'text', text:'**② 直属主管审批** → **③ 部门负责人审批**；连续请假<strong>超过 3 天</strong>需自动加签人力资源部。'},
+        {type:'text', text:'**② 直属主管审批** → **③ 部门负责人审批**；连续请假**超过 3 天**需自动加签人力资源部。'},
         {type:'text', text:'**④ 审批通过**后系统自动归档，并由考勤系统在月底自动扣减对应假别。病假需在 3 个工作日内补传诊断证明附件。'}
       ],
       sources: [
@@ -463,26 +529,99 @@ const CONVERSATION = {
     answer: {
       blocks: [
         {type:'text', text:'富岭厂区访客无线网络：'},
-        {type:'text', text:'SSID：<strong>Fuling-Guest</strong>　密码：<strong>fuling@2025</strong>'},
-        {type:'text', text:'连接后需在弹出页用手机号接收验证码完成认证，单次有效期 24 小时。员工请使用 <strong>Fuling-Staff</strong> 内网并以工号认证。'}
+        {type:'text', text:'SSID：**Fuling-Guest**　密码：**fuling@2025**'},
+        {type:'text', text:'连接后需在弹出页用手机号接收验证码完成认证，单次有效期 24 小时。员工请使用 **Fuling-Staff** 内网并以工号认证。'}
       ],
       sources: [
         {title:'行政后勤服务手册', section:'网络与办公设备', score:7.9}
       ]
     }
+  },
+
+  /* 低匹配 guard 场景：来源全为 中/低，回答前置提示条（需 /api/ask 下发 guard 标志） */
+  'mold-maint': {
+    q: '注塑模具多久保养一次？',
+    answer: {
+      guard: true,
+      blocks: [
+        {type:'text', text:'知识库中与「注塑模具保养周期」直接相关的资料有限，以下供参考：'},
+        {type:'text', text:'《设备维护保养规程》要求注塑机**每班次**做日常点检、**每月**一级保养；模具保养周期未单独成文，多随设备一级保养同步执行。'},
+        {type:'text', text:'建议向设备部确认贵车间模具的具体保养台账要求。'}
+      ],
+      sources: [
+        {title:'设备维护保养规程', section:'第3章 · 注塑机日常点检', score:6.9},
+        {title:'生产部工作手册', section:'设备管理职责', score:4.8}
+      ]
+    }
+  },
+
+  /* NO_RESULT 场景：文案与 answer_flow.NO_RESULT_MESSAGE 严格一致（需 /api/ask 下发 no_result 标志） */
+  'no-result': {
+    q: '出差住宿报销标准是多少？',
+    answer: {
+      noResult: true,
+      rephrase: ['差旅费报销流程', '出差补贴怎么算']
+    }
+  },
+
+  /* 请求失败场景：重试成功后给出正常回答 */
+  'error': {
+    q: '车间打印机怎么连接？',
+    answer: {
+      error: true,
+      retryAnswer: {
+        blocks: [
+          {type:'text', text:'车间网络打印机连接步骤：在电脑「设置 → 打印机」中添加打印机，地址栏输入车间打印服务器 **\\\\print-fl01**，选择对应车间的打印队列即可。'},
+          {type:'text', text:'若搜索不到打印机，请确认已接入 **Fuling-Staff** 内网，或联系信息部（分机 8021）协助。'}
+        ],
+        sources: [
+          {title:'信息部 IT 服务指南', section:'办公设备接入', score:8.2}
+        ]
+      }
+    }
+  },
+
+  /* 图片过期场景：OSS 签名 URL 1 小时过期后的占位与点按重载 */
+  'img-expired': {
+    q: 'U8+ 如何登录？',
+    answer: null  // init 时从 u8-login 深拷贝并标记 imgFailed
   }
 };
+CONVERSATION['img-expired'].answer = Object.assign(
+  JSON.parse(JSON.stringify(CONVERSATION['u8-login'].answer)), {imgFailed:true});
 
-/* 示例问题快捷栏顺序 */
+/* 示例问题快捷栏顺序（demo:true = 状态演示，仅原型评审用） */
 const QUICK = [
-  {key:'u8-login', label:'U8+ 如何登录？'},
-  {key:'leave',    label:'请假流程是什么？'},
-  {key:'wifi',     label:'访客 WiFi 密码？'}
+  {key:'u8-login',  label:'U8+ 如何登录？'},
+  {key:'leave',     label:'请假流程是什么？'},
+  {key:'wifi',      label:'访客 WiFi 密码？'},
+  {key:'mold-maint',label:'模具保养周期？'},
+  {key:'no-result', label:'演示·未找到', demo:true},
+  {key:'error',     label:'演示·出错重试', demo:true},
+  {key:'img-expired', label:'演示·图片过期', demo:true}
 ];
 
-const FB_REASONS = ['内容不准确','答非所问','图片不对','信息过时'];
+/* 不满意原因：补上两大真实失败模式（检索未命中 / 答案截断），否则都被误归入“内容不准确”，污染反馈挖掘数据 */
+const FB_REASONS = ['内容不准确','答非所问','答案不完整','没找到我要的文档','图片不对','信息过时'];
 const TYPE_SPEED = (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) ? 0 : 28;
-const ICON = { up:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></svg>`, down:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></svg>`, headset:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 16 0"/><rect x="2" y="12" width="4" height="7" rx="1.5"/><rect x="18" y="12" width="4" height="7" rx="1.5"/><path d="M20 19a3 3 0 0 1-3 3h-2"/></svg>` };
+/* 统一内嵌 SVG 图标语言（24 viewBox / 1.7 描边 / currentColor）。port 时打包为 iconfont（AXML 无内联 svg）。 */
+const ICON = {
+  up:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></svg>`,
+  down:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></svg>`,
+  headset:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 16 0"/><rect x="2" y="12" width="4" height="7" rx="1.5"/><rect x="18" y="12" width="4" height="7" rx="1.5"/><path d="M20 19a3 3 0 0 1-3 3h-2"/></svg>`,
+  copy:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`,
+  image:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>`,
+  imageOff:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="2" y1="2" x2="22" y2="22"/><path d="M10.4 10.4a2 2 0 1 0 2.9 2.9"/><path d="M21 16V5a2 2 0 0 0-2-2H8"/><path d="M3.6 3.6A2 2 0 0 0 3 5v14a2 2 0 0 0 2 2h14a2 2 0 0 0 1.4-.6"/></svg>`,
+  refresh:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`,
+  search:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>`,
+  warn:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.9 18a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
+  check:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`,
+  x:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>`,
+  chevR:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>`,
+  chevL:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6"/></svg>`,
+  chevDown:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
+  expand:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`
+};
 
 /* ========================= DOM refs ========================= */
 const chat   = document.getElementById('chat');
@@ -493,9 +632,29 @@ const toastEl= document.getElementById('toast');
 
 let busy = false;          // 防止流式过程中重复发送
 let aiSeq = 0;             // AI 回答计数（生成稳定 id）
+let skipTyping = false;    // 「停止」：跳过打字机，整段直出
+let lastQuestionKey = null; // 重试用
 
 /* ========================= helpers ========================= */
-function scrollToBottom(){ chat.scrollTop = chat.scrollHeight; }
+/* 钉住才跟滚：用户上翻重读时绝不抢滚动条；force 用于用户主动发送等明确意图 */
+function isPinned(){ return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80; }
+function scrollToBottom(force){
+  if(force || isPinned()) chat.scrollTop = chat.scrollHeight;
+}
+const toBottomBtn = document.getElementById('toBottom');
+toBottomBtn.innerHTML = ICON.chevDown;
+toBottomBtn.addEventListener('click', ()=>{ scrollToBottom(true); toBottomBtn.classList.remove('show'); });
+chat.addEventListener('scroll', ()=>{
+  toBottomBtn.classList.toggle('show', chat.scrollHeight - chat.scrollTop - chat.clientHeight > 200);
+});
+
+/* 服务健康态（仅由请求结果驱动，不做无依据的“在线”承诺） */
+const subtitleEl = document.getElementById('subtitle');
+const navbarEl = document.getElementById('navbar');
+function setServiceState(ok){
+  navbarEl.classList.toggle('degraded', !ok);
+  subtitleEl.textContent = ok ? '企业知识库 · 在线' : '企业知识库 · 服务暂不可用';
+}
 let toastTimer;
 function toast(msg){
   toastEl.textContent = msg;
@@ -512,7 +671,7 @@ function addUserMsg(text){
   m.innerHTML = `<div class="avatar me">我</div><div class="bubble"></div>`;
   m.querySelector('.bubble').textContent = text;
   chat.appendChild(m);
-  scrollToBottom();
+  scrollToBottom(true);
 }
 
 /* ========================= 加载骨架气泡 ========================= */
@@ -530,7 +689,7 @@ function addSkeleton(){
       </div>
     </div>`;
   chat.appendChild(m);
-  scrollToBottom();
+  scrollToBottom(true);
   return m;
 }
 
@@ -543,12 +702,12 @@ function buildAiCard(answer){
   m.innerHTML = `
     <div class="avatar ai">富</div>
     <div class="ai-card" data-id="${id}">
-      <div class="body"></div>
+      <div class="body">${answer.guard ? renderGuardNote() : ''}</div>
       ${renderSources(answer.sources)}
       ${renderFeedbackBar()}
       <div class="fb-panel"><div class="fb-panel-inner">
         <div class="fp-q">请选择不满意的原因（可多选）：</div>
-        <div class="chips">${FB_REASONS.map(r=>`<div class="chip" data-r="${r}">${r}</div>`).join('')}</div>
+        <div class="chips">${FB_REASONS.map(r=>`<button type="button" class="chip" data-r="${r}">${r}</button>`).join('')}</div>
         <textarea placeholder="其他原因（选填）…"></textarea>
         <div class="fb-submit-row">
           <button class="btn-text fb-cancel">取消</button>
@@ -559,24 +718,66 @@ function buildAiCard(answer){
   return m;
 }
 
+/* 低匹配提示条：低置信回答不能和高置信长得一样权威 */
+function renderGuardNote(){
+  return `<div class="guard-note">${ICON.warn}<span>相关资料匹配度较低，以下回答仅供参考，请核对原文或转人工确认。</span></div>`;
+}
+
+/* 出错卡：danger 左标尺 + 重试；无来源、无反馈条 */
+function buildErrorCard(){
+  const m = document.createElement('div');
+  m.className = 'msg ai';
+  m.innerHTML = `
+    <div class="avatar ai">富</div>
+    <div class="ai-card error">
+      <div class="body">
+        <p>回答失败，请检查网络后重试。</p>
+        <button class="btn-retry">${ICON.refresh}<span>重试</span></button>
+      </div>
+    </div>`;
+  return m;
+}
+
+/* NO_RESULT 卡：文案与 answer_flow.NO_RESULT_MESSAGE 一致；死胡同留出口（换说法 + 转人工），不显示来源/赞踩 */
+function buildNoResultCard(answer){
+  const chips = (answer.rephrase||[]).map(r=>`<button type="button" class="chip nr-chip" data-q="${r}">${r}</button>`).join('');
+  const m = document.createElement('div');
+  m.className = 'msg ai';
+  m.innerHTML = `
+    <div class="avatar ai">富</div>
+    <div class="ai-card no-result">
+      <div class="body">
+        <div class="nr-ico">${ICON.search}</div>
+        <p class="nr-title">未找到相关内容</p>
+        <p class="nr-desc">抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。</p>
+        ${chips ? `<div class="chips">${chips}</div>` : ''}
+        <button class="nr-handoff">${ICON.headset}<span>转人工协助</span></button>
+      </div>
+    </div>`;
+  return m;
+}
+
 function renderSources(sources){
   if(!sources || !sources.length) return '';
+  const LVL = {high:['','高'], mid:['mid','中'], low:['low','低']};
   const items = sources.map((s,i)=>{
-    const cls = s.score>=8 ? '' : (s.score>=5 ? 'mid' : 'mid');
+    /* level 以服务端下发为准；缺省按加权融合分 7.7/5.8 标定兜底（rerank 开启后是 0-1 量纲，禁止本地重算） */
+    const lvl = s.level || (s.score>=7.7 ? 'high' : (s.score>=5.8 ? 'mid' : 'low'));
+    const [cls, label] = LVL[lvl] || LVL.mid;
     return `<div class="src-item">
       <div class="si-idx">${i+1}</div>
       <div class="si-main">
         <div class="si-title">${s.title}</div>
         <div class="si-meta">${s.section}</div>
       </div>
-      <div class="si-score ${cls}"><span class="lvl">${s.score>=8?'高':'中'}</span>${s.score.toFixed(1)}</div>
+      <div class="si-score ${cls}">相关度${label}</div>
     </div>`;
   }).join('');
   return `<div class="sources">
-    <div class="sources-toggle">
-      <span class="chev">▶</span><span>参考来源</span>
-      <span class="badge">${sources.length} 篇</span>
-    </div>
+    <button type="button" class="sources-toggle" aria-expanded="false">
+      <span class="chev">${ICON.chevR}</span><span>参考来源</span>
+      <span class="badge">${sources.length} 条</span>
+    </button>
     <div class="sources-list">${items}</div>
   </div>`;
 }
@@ -585,6 +786,7 @@ function renderFeedbackBar(){
   return `<div class="fb">
     <button class="fb-ico up" data-act="up" aria-label="有帮助" title="有帮助">${ICON.up}</button>
     <button class="fb-ico down" data-act="down" aria-label="没帮助" title="没帮助">${ICON.down}</button>
+    <button class="fb-ico copy" data-act="copy" aria-label="复制回答" title="复制回答">${ICON.copy}</button>
     <span class="fb-spacer"></span>
     <button class="fb-handoff" data-act="handoff">${ICON.headset}<span>转人工</span></button>
   </div>`;
@@ -593,8 +795,32 @@ function renderFeedbackBar(){
 /* ========================= 打字机逐字揭示 blocks =========================
    text 块逐字打出；image 块在其前序文本完成后整体淡入插入。
    （对应真实流式：stream var = content，图片随 content_blocks 到达插入） */
-function typeBlocks(bodyEl, blocks, onDone){
+/* 步骤段判定：第N步（含未空格的“第1步”）或 ①-⑳ 圆数字开头（可带 ** 前缀）。
+   真实端优先用 step_card 元数据（step_no）驱动，此正则只是纯 markdown 兜底。
+   不可用裸 ^\*\* —— 否则任何加粗开头的段落（如 **注意**）都会挂上步骤标尺。 */
+const STEP_RE = /^(?:\*\*)?(?:第\s*\d+\s*步|[①-⑳])/;
+
+/* 图片块 DOM：正常态 = 截图 + 说明行（类型图标 + 说明 + 「点按放大」提示）；
+   failed 态 = 保留图框与说明，占位提示点按重载（OSS 签名 URL 1h 过期，绝不静默移除） */
+function buildFigure(blk, failed){
+  const fig = document.createElement('div');
+  fig.className = 'blk-img' + (failed ? ' failed' : '');
+  fig.innerHTML = `<figure tabindex="0">
+      ${failed ? `<div class="img-fallback">${ICON.imageOff}<span>图片已过期 · 点按重新加载</span></div>` : ''}
+      <figcaption>${ICON.image}<span class="cap-text"></span><span class="zoom-hint">${ICON.expand}<span>点按放大</span></span></figcaption>
+    </figure>`;
+  const figure = fig.querySelector('figure');
+  if(!failed) figure.insertBefore(svgEl(blk.svg), figure.firstChild);
+  fig.querySelector('.cap-text').textContent = blk.caption || '';
+  figure.dataset.svg = blk.svg;
+  figure.dataset.caption = blk.caption || '';
+  if(failed) fig.querySelector('.zoom-hint').style.display = 'none';
+  return fig;
+}
+
+function typeBlocks(bodyEl, blocks, onDone, opts){
   let bi = 0;
+  opts = opts || {};
   // caret 始终是 bodyEl 的最后一个子节点；每个块插在它之前
   const caret = document.createElement('span');
   caret.className = 'caret';
@@ -608,23 +834,14 @@ function typeBlocks(bodyEl, blocks, onDone){
     }
     const blk = blocks[bi++];
     if(blk.type === 'image'){
-      const fig = document.createElement('div');
-      fig.className = 'blk-img';
-      fig.style.opacity = 0;
-      fig.style.transition = 'opacity .35s ease';
-      fig.innerHTML = `<figure tabindex="0"><figcaption></figcaption></figure>`;
-      const figure = fig.querySelector('figure');
-      figure.insertBefore(svgEl(blk.svg), figure.firstChild);
-      figure.querySelector('figcaption').textContent = blk.caption || '';
-      figure.dataset.svg = blk.svg;
-      figure.dataset.caption = blk.caption || '';
+      const fig = buildFigure(blk, opts.imgFailed);
+      fig.style.animation = 'fade .35s var(--ease)';   // CSS 动画淡入：不依赖 rAF 时序，后台标签页也不卡 0 透明度
       bodyEl.insertBefore(fig, caret);
       scrollToBottom();
-      requestAnimationFrame(()=>{ fig.style.opacity = 1; });
-      setTimeout(nextBlock, 320);
+      skipTyping ? nextBlock() : setTimeout(nextBlock, 320);
     } else {
       const p = document.createElement('p');
-      if(/第 \d+ 步|^①|^②|^③|^④|^\*\*/.test(blk.text)) p.classList.add('step');
+      if(STEP_RE.test(blk.text)) p.classList.add('step');
       bodyEl.insertBefore(p, caret);
       typeText(p, blk.text, nextBlock);
     }
@@ -632,23 +849,30 @@ function typeBlocks(bodyEl, blocks, onDone){
   nextBlock();
 }
 
-/* 逐字打字（支持简易 **加粗** / <strong> 标记） */
+/* 逐字打字（块数据统一 **加粗** 标记；skipTyping 时整段直出）。
+   必须整串重设 innerHTML（acc），不能 innerHTML += token：
+   += 会让浏览器把半开标签自动闭合（<strong> → <strong></strong>），后续文字全部落在标签外，加粗永久丢失。 */
 function typeText(p, raw, done){
   // 预处理：把 **x** 转成 <strong>x</strong>
   const html = raw.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   // 拆成 token：标签整体一次输出，文字逐字
   const tokens = html.match(/<[^>]+>|[^<]/g) || [];
-  let i = 0;
+  let i = 0, acc = '';
   function step(){
+    if(skipTyping){
+      p.innerHTML = html;
+      scrollToBottom();
+      done && done();
+      return;
+    }
     if(i >= tokens.length){ done && done(); return; }
     const t = tokens[i++];
+    acc += t;
+    p.innerHTML = acc;   // 重新解析整串：未闭合标签由浏览器临时补全，样式不丢
     if(t.startsWith('<')){
-      // 标签：直接拼到现有 innerHTML
-      p.innerHTML += t;
-      step();
+      step();            // 标签不占打字节拍
     } else {
-      p.innerHTML += t;
-      if(i % 2 === 0) scrollToBottom();
+      if(i % 2 === 0) scrollToBottom();   // 钉住才跟滚（见 scrollToBottom）
       setTimeout(step, TYPE_SPEED);
     }
   }
@@ -658,78 +882,140 @@ function typeText(p, raw, done){
 /* ========================= 发送 -> 骨架 -> 流式回答 ========================= */
 function ask(question, answer){
   if(busy) return;
+
+  /* NO_RESULT：直出空结果卡（无打字机、无来源、无赞踩，只留转人工出口） */
+  if(answer.noResult){
+    busy = true; updateSendState();
+    addUserMsg(question);
+    const skel = addSkeleton();
+    setTimeout(()=>{
+      skel.remove();
+      const card = buildNoResultCard(answer);
+      chat.appendChild(card);
+      wireNoResultCard(card);
+      scrollToBottom(true);
+      setServiceState(true);
+      busy = false; updateSendState();
+    }, 900);
+    return;
+  }
+
+  /* 请求失败：错误卡 + 重试（演示：重试后返回 retryAnswer） */
+  if(answer.error){
+    busy = true; updateSendState();
+    addUserMsg(question);
+    const skel = addSkeleton();
+    setTimeout(()=>{
+      skel.remove();
+      const card = buildErrorCard();
+      chat.appendChild(card);
+      scrollToBottom(true);
+      setServiceState(false);
+      busy = false; updateSendState();
+      card.querySelector('.btn-retry').addEventListener('click', ()=>{
+        if(busy) return;
+        card.remove();                      // 错误卡 → 新骨架，重答
+        runAnswer(answer.retryAnswer);
+      }, {once:true});
+    }, 1400);
+    return;
+  }
+
   busy = true; updateSendState();
   addUserMsg(question);
-
   const skel = addSkeleton();
   setTimeout(()=>{
     skel.remove();
-    const card = buildAiCard(answer);
-    chat.appendChild(card);
-    scrollToBottom();
-    const body = card.querySelector('.body');
-    wireCard(card.querySelector('.ai-card'), answer);
-    typeBlocks(body, answer.blocks, ()=>{ busy=false; updateSendState(); });
+    runAnswer(answer);
   }, 1200);
 }
 
-/* 自由提问（无脚本）兜底回答 */
+/* 渲染一张正常回答卡（ask 与「重试」共用） */
+function runAnswer(answer){
+  busy = true; skipTyping = false; updateSendState();
+  const card = buildAiCard(answer);
+  chat.appendChild(card);
+  scrollToBottom(true);
+  const body = card.querySelector('.body');
+  wireCard(card.querySelector('.ai-card'), answer);
+  setServiceState(true);
+  typeBlocks(body, answer.blocks, ()=>{ busy=false; skipTyping=false; updateSendState(); }, {imgFailed: answer.imgFailed});
+}
+
+/* 自由提问（无脚本）兜底：不再向终端用户暴露 HA3/Qwen 等实现细节（那些放页面底部 .hint 区） */
 function askFreeform(question){
   ask(question, {
     blocks:[
-      {type:'text', text:'这是一个 UX 原型，暂未接入真实检索。请点击下方<strong>示例问题</strong>体验「图文穿插 / 打字机 / 图片放大 / 赞踩反馈」效果。'},
-      {type:'text', text:'真实环境中，您的问题会经 HA3 向量检索 + Qwen 生成，返回带 <strong>&lt;&lt;IMG:N&gt;&gt;</strong> 标记的图文回答。'}
+      {type:'text', text:'这是设计原型，尚未接入真实检索。点击下方**示例问题**，体验图文穿插回答、打字机与反馈交互。'}
     ],
-    sources:[{title:'富岭知识助手 · 使用说明', section:'原型演示', score:5.0}]
+    sources: []
   });
 }
 
-/* ========================= 卡片交互（来源折叠 / 反馈） ========================= */
+/* ========================= 卡片交互（来源折叠 / 反馈） =========================
+   反馈语义：赞/踩一次性互斥锁定；复制、转人工独立可用（评价答案 ≠ 放弃升级人工）。
+   toast 文案与 feedback-bar.js 保持同一套；转人工只承诺已发生的事（写入待处理工单），不承诺回电时限。 */
 function wireCard(cardEl, answer){
   // 来源折叠
   const sources = cardEl.querySelector('.sources');
   if(sources){
-    sources.querySelector('.sources-toggle').addEventListener('click', ()=>{
-      sources.classList.toggle('open');
-      setTimeout(scrollToBottom, 260);
+    const tg = sources.querySelector('.sources-toggle');
+    tg.addEventListener('click', ()=>{
+      const open = sources.classList.toggle('open');
+      tg.setAttribute('aria-expanded', open ? 'true' : 'false');
+      setTimeout(()=>scrollToBottom(), 260);
     });
   }
 
   const fb = cardEl.querySelector('.fb');
   const panel = cardEl.querySelector('.fb-panel');
-  let submitted = false;
+  let submitted = false;   // 赞踩是否已提交（不影响复制/转人工）
   let voted = null;
   const selected = new Set();
 
-  function lockBar(){
+  function lockVotes(){
     submitted = true;
-    fb.querySelectorAll('[data-act]').forEach(b=>b.setAttribute('disabled','disabled'));
+    fb.querySelectorAll('[data-act="up"],[data-act="down"]').forEach(b=>b.setAttribute('disabled','disabled'));
+    fb.querySelector('.fb-spacer').innerHTML = '<span class="fb-done">已反馈</span>';
   }
 
   fb.addEventListener('click', (e)=>{
     const btn = e.target.closest('[data-act]');
-    if(!btn || submitted) return;
+    if(!btn) return;
     const act = btn.dataset.act;
 
     if(act === 'up'){
+      if(submitted) return;
       voted = 'up';
       fb.querySelector('.up').classList.add('active','done');
       fb.querySelector('.down').classList.remove('active');
       panel.classList.remove('open');
-      lockBar();
-      toast('已记录，感谢您的肯定');
+      lockVotes();
+      toast('感谢反馈 👍');
     }
     else if(act === 'down'){
+      if(submitted) return;
       voted = 'down';
       fb.querySelector('.down').classList.add('active');
       panel.classList.toggle('open');
-      setTimeout(scrollToBottom, 280);
+      setTimeout(()=>scrollToBottom(), 280);
+    }
+    else if(act === 'copy'){
+      const text = [...cardEl.querySelectorAll('.body p')].map(p=>p.innerText).join('\n');
+      if(navigator.clipboard) navigator.clipboard.writeText(text).catch(()=>{});
+      toast('已复制回答');
     }
     else if(act === 'handoff'){
-      lockBar();
+      btn.setAttribute('disabled','disabled');
       btn.classList.add('done');
       panel.classList.remove('open');
-      toast('已转人工，稍后联系您');
+      // 持久确认行：toast 1.7s 即逝，滚回来还要能看到
+      const note = document.createElement('div');
+      note.className = 'handoff-note';
+      note.innerHTML = `${ICON.check}<span>已转交管理员跟进，请留意钉钉消息</span>`;
+      cardEl.appendChild(note);
+      scrollToBottom();
+      toast('已转交管理员跟进，请留意钉钉消息');
     }
   });
 
@@ -744,18 +1030,35 @@ function wireCard(cardEl, answer){
 
   panel.querySelector('.fb-cancel').addEventListener('click', ()=>{
     panel.classList.remove('open');
+    fb.querySelector('.down').classList.remove('active');
   });
 
   panel.querySelector('.fb-submit').addEventListener('click', ()=>{
     const txt = panel.querySelector('textarea').value.trim();
     if(selected.size === 0 && !txt){ toast('请选择原因或填写说明'); return; }
-    lockBar();
     fb.querySelector('.down').classList.add('active','done');
     panel.classList.remove('open');
+    lockVotes();
     // 提交后禁用面板控件
     panel.querySelectorAll('.chip,.fb-submit,.fb-cancel,textarea').forEach(el=>el.setAttribute('disabled','disabled'));
     toast('感谢反馈，我们会持续改进');
   });
+}
+
+/* NO_RESULT 卡交互：换说法 chips 回填输入框（不自动发送，让用户改写）；转人工同主流程 */
+function wireNoResultCard(msgEl){
+  msgEl.querySelectorAll('.nr-chip').forEach(chip=>{
+    chip.addEventListener('click', ()=>{
+      input.value = chip.dataset.q;
+      input.dispatchEvent(new Event('input'));
+      input.focus();
+    });
+  });
+  const handoff = msgEl.querySelector('.nr-handoff');
+  handoff.addEventListener('click', ()=>{
+    handoff.setAttribute('disabled','disabled');
+    toast('已转交管理员跟进，请留意钉钉消息');
+  }, {once:true});
 }
 
 /* ========================= 图片放大 lightbox ========================= */
@@ -765,16 +1068,23 @@ const lbCap    = document.getElementById('lbCap');
 const lbCount  = document.getElementById('lbCount');
 const lbPrev   = document.getElementById('lbPrev');
 const lbNext   = document.getElementById('lbNext');
+const lbClose  = document.getElementById('lbClose');
+lbClose.innerHTML = ICON.x;
+lbPrev.innerHTML  = ICON.chevL;
+lbNext.innerHTML  = ICON.chevR;
 let lbImages = [];   // [{svg, caption}]
 let lbIdx = 0;
+let lbReturnFocus = null;   // 关闭后焦点还给来源图
 
-function openLightbox(cardEl, svgKey){
+function openLightbox(cardEl, svgKey, originEl){
   // 收集该回答内所有图片，定位当前
-  const figs = [...cardEl.querySelectorAll('.blk-img figure')];
+  const figs = [...cardEl.querySelectorAll('.blk-img:not(.failed) figure')];
   lbImages = figs.map(f=>({svg:f.dataset.svg, caption:f.dataset.caption}));
   lbIdx = Math.max(0, lbImages.findIndex(x=>x.svg===svgKey));
+  lbReturnFocus = originEl || null;
   renderLb();
   lightbox.classList.add('open');
+  lbClose.focus();
 }
 function renderLb(){
   lbStage.innerHTML = '';
@@ -784,18 +1094,33 @@ function renderLb(){
   lbPrev.toggleAttribute('disabled', lbIdx===0);
   lbNext.toggleAttribute('disabled', lbIdx===lbImages.length-1);
 }
-function closeLb(){ lightbox.classList.remove('open'); }
+function closeLb(){
+  lightbox.classList.remove('open');
+  if(lbReturnFocus){ lbReturnFocus.focus(); lbReturnFocus = null; }
+}
 lbPrev.addEventListener('click', ()=>{ if(lbIdx>0){lbIdx--; renderLb();} });
 lbNext.addEventListener('click', ()=>{ if(lbIdx<lbImages.length-1){lbIdx++; renderLb();} });
-document.getElementById('lbClose').addEventListener('click', closeLb);
-lightbox.addEventListener('click', (e)=>{ if(e.target===lightbox) closeLb(); });
+lbClose.addEventListener('click', closeLb);
+/* 点暗处即关：单手够不到左上角时的退出路径（lb-stage 占满屏幕，必须一并算作背景） */
+lightbox.addEventListener('click', (e)=>{ if(e.target===lightbox || e.target===lbStage) closeLb(); });
 
-// 事件委托：点击任意 figure 打开放大
+// 事件委托：正常图打开放大；过期图点按重载（演示 600ms 后换回真图）
 chat.addEventListener('click', (e)=>{
   const fig = e.target.closest('.blk-img figure');
   if(!fig) return;
+  const blkImg = fig.closest('.blk-img');
+  if(blkImg.classList.contains('failed')){
+    const fallback = fig.querySelector('.img-fallback span');
+    fallback.textContent = '正在重新加载…';
+    setTimeout(()=>{   // 真实端：刷新签名 URL 后重设 image src
+      const fresh = buildFigure({svg:fig.dataset.svg, caption:fig.dataset.caption}, false);
+      blkImg.replaceWith(fresh);
+      toast('已重新加载');
+    }, 600);
+    return;
+  }
   const card = fig.closest('.ai-card');
-  openLightbox(card, fig.dataset.svg);
+  openLightbox(card, fig.dataset.svg, fig);
 });
 
 /* 键盘左右 / Esc */
@@ -817,9 +1142,16 @@ lbStage.addEventListener('touchend', e=>{
   touchX = null;
 }, {passive:true});
 
-/* ========================= 输入栏 / 发送 ========================= */
+/* ========================= 输入栏 / 发送 =========================
+   打字中按钮变「停止」：点按即整段直出剩余内容（不是丢弃回答 —— 内容已在客户端，丢弃毫无意义） */
 function updateSendState(){
-  sendBtn.disabled = busy || input.value.trim()==='';
+  if(busy){
+    sendBtn.textContent = '停止';
+    sendBtn.disabled = false;
+  } else {
+    sendBtn.textContent = '发送';
+    sendBtn.disabled = input.value.trim()==='';
+  }
 }
 input.addEventListener('input', ()=>{
   input.style.height = 'auto';
@@ -827,11 +1159,12 @@ input.addEventListener('input', ()=>{
   updateSendState();
 });
 function doSend(){
+  if(busy){ skipTyping = true; return; }   // 停止 = 跳过打字机
   const v = input.value.trim();
-  if(!v || busy) return;
+  if(!v) return;
   input.value=''; input.style.height='auto'; updateSendState();
-  // 匹配脚本问题
-  const hit = Object.values(CONVERSATION).find(c=>c.q===v);
+  // 匹配脚本问题（demo key 不参与文本匹配，仅 chip 直达）
+  const hit = Object.values(CONVERSATION).find(c=>c.q===v && !c.answer.error && !c.answer.imgFailed);
   if(hit) ask(hit.q, hit.answer);
   else askFreeform(v);
 }
@@ -842,15 +1175,14 @@ input.addEventListener('keydown', e=>{
 
 /* ========================= 示例问题快捷栏 ========================= */
 QUICK.forEach(q=>{
-  const chip = document.createElement('div');
-  chip.className = 'quick-chip';
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.className = 'quick-chip' + (q.demo ? ' demo' : '');
   chip.textContent = q.label;
   chip.addEventListener('click', ()=>{
     if(busy) return;
-    // 点击 -> 填充输入 -> 发送（演示驱动）
-    input.value = q.label;
-    updateSendState();
-    setTimeout(()=>{ doSend(); }, 180);
+    const c = CONVERSATION[q.key];
+    ask(c.q, c.answer);
   });
   quick.appendChild(chip);
 });
