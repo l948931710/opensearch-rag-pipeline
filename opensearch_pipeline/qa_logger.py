@@ -140,8 +140,18 @@ def log_qa_session(
             conn.close()
 
     except Exception as e:
-        # 绝不阻断主流程
-        logger.error(
-            "qa_session_log 写入失败 (non-fatal): message_id=%s, error=%s",
-            message_id, e, exc_info=True,
-        )
+        # 绝不阻断主流程；但表结构漂移（列/表不存在）意味着**每一条**问答日志都在静默丢失、
+        # 反馈再也找不到 message_id —— 必须比普通写入失败喊得更响。pymysql 错误的 args[0] 是 errno。
+        errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
+        if errno in (1054, 1146):  # 1054=Unknown column / 1146=表不存在
+            logger.critical(
+                "qa_session_log 表结构落后于代码 (errno=%s)：请在 RDS 重跑 "
+                "schema/002_feedback_system.sql（幂等）。修复前所有问答日志静默丢失、"
+                "反馈无法按 message_id 关联。message_id=%s, error=%s",
+                errno, message_id, e,
+            )
+        else:
+            logger.error(
+                "qa_session_log 写入失败 (non-fatal): message_id=%s, error=%s",
+                message_id, e, exc_info=True,
+            )

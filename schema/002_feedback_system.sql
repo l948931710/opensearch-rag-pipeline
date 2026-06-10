@@ -6,15 +6,20 @@
 -- Idempotent: Safe to run multiple times without errors.
 -- ============================================================
 
+-- 与 001 的 fuling_knowledge 同款约定：全新安装时库本身也不存在（生产上已有，no-op）
+CREATE DATABASE IF NOT EXISTS fuling_operation;
 USE fuling_operation;
 
 -- ------------------------------------------------------------
 -- Ensure the feedback tables exist in THIS database (fuling_operation).
 -- The serving code writes fully-qualified fuling_operation.user_feedback /
--- fuling_operation.escalation_ticket (feedback_handler.py). 001 creates these
--- under fuling_knowledge, so a deployment whose RDS hosts the live data in
+-- fuling_operation.escalation_ticket / fuling_operation.qa_session_log
+-- (feedback_handler.py / qa_logger.py). 001 creates these under
+-- fuling_knowledge, so a deployment whose RDS hosts the live data in
 -- fuling_operation needs them here too — otherwise every 喜欢/不喜欢/转人工
--- write fails ("Unknown table") and the card shows "反馈处理失败".
+-- write fails ("Unknown table") and the card shows "反馈处理失败"；
+-- qa_session_log 的缺失更隐蔽：qa_logger 把写入失败按非致命吞掉，
+-- 问答日志整行静默丢失，反馈再也找不到 message_id。
 -- CREATE TABLE IF NOT EXISTS is idempotent: no-op if the table already exists.
 -- (Definitions mirror schema/001_opensearch_pipeline.sql.)
 -- ------------------------------------------------------------
@@ -68,6 +73,39 @@ CREATE TABLE IF NOT EXISTS escalation_ticket (
     closed_at           DATETIME DEFAULT NULL,
     updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_ticket_id (ticket_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 全新安装时 fuling_operation 里没有 qa_session_log（001 只在 fuling_knowledge 建过），
+-- 下方对它的 CALL/UPDATE/ALTER 会直接报 1146。这里按「001 基础形态 + 本文件追加的全部列」
+-- 一次建全（message_id 直接 NOT NULL、索引齐备），已有部署则完全跳过。
+CREATE TABLE IF NOT EXISTS qa_session_log (
+    id                   BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    session_id           VARCHAR(128) NOT NULL,
+    message_id           VARCHAR(128) NOT NULL COMMENT '消息唯一ID',
+    user_id              VARCHAR(128) DEFAULT NULL,
+    user_name            VARCHAR(128) DEFAULT NULL COMMENT '用户昵称',
+    user_dept            VARCHAR(64) DEFAULT NULL,
+    query_text           TEXT DEFAULT NULL,
+    answer_text          MEDIUMTEXT DEFAULT NULL,
+    intent_type          VARCHAR(64) DEFAULT NULL,
+    risk_level           VARCHAR(32) DEFAULT NULL,
+    risk_blocked         TINYINT(1) DEFAULT 0,
+    retrieved_docs_json  JSON DEFAULT NULL,
+    cited_docs_json      JSON DEFAULT NULL,
+    latency_ms           INT DEFAULT 0,
+    retrieval_latency_ms INT DEFAULT NULL COMMENT '检索阶段耗时(ms)',
+    llm_latency_ms       INT DEFAULT NULL COMMENT 'LLM生成阶段耗时(ms)',
+    answer_status        VARCHAR(32) DEFAULT 'SUCCESS',
+    model_name           VARCHAR(64) DEFAULT NULL COMMENT 'LLM模型名称',
+    error_message        TEXT DEFAULT NULL COMMENT '失败时的错误信息',
+    opensearch_hit_count INT DEFAULT NULL COMMENT '检索命中数',
+    top_score            DECIMAL(10,4) DEFAULT NULL COMMENT '最高检索得分',
+    conversation_type    VARCHAR(8) DEFAULT NULL COMMENT '1=单聊 2=群聊',
+    content_blocks_json  MEDIUMTEXT DEFAULT NULL COMMENT '图文渲染块 JSON 快照',
+    created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_session (session_id),
+    INDEX idx_user (user_id),
+    INDEX idx_message_id (message_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ------------------------------------------------------------
@@ -167,6 +205,13 @@ CALL _add_column_if_not_exists('qa_session_log', 'retrieval_latency_ms',
 
 CALL _add_column_if_not_exists('qa_session_log', 'llm_latency_ms',
     'INT DEFAULT NULL COMMENT ''LLM生成阶段耗时(ms)'' AFTER `retrieval_latency_ms`');
+
+-- 小程序/卡片图文穿插块快照（qa_logger.py 写入、dingtalk_bot 卡片重建回读）。
+-- 选 MEDIUMTEXT 而非 JSON/TEXT：与 answer_text 同级（16MB），小程序 caption 不截断，
+-- 超长图文块不会在 TEXT 64KB 边界把整行 INSERT 打挂（整条问答日志静默丢失正是本列要修的事故）；
+-- 也没有 JSON 校验失败这一额外丢行模式。读侧已兼容 str/parsed 两种形态。
+CALL _add_column_if_not_exists('qa_session_log', 'content_blocks_json',
+    'MEDIUMTEXT DEFAULT NULL COMMENT ''图文渲染块 JSON 快照'' AFTER `conversation_type`');
 
 -- ------------------------------------------------------------
 -- qa_session_log: make message_id NOT NULL

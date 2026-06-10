@@ -142,7 +142,9 @@ def _save_feedback(
                 cited_json = row[3]
                 user_dept = row[4]
 
-        # 写入 user_feedback（覆盖更新）
+        # 写入 user_feedback（覆盖更新）。注意 handled_status 的 IF：用户点过「补充原因」
+        # （AWAITING_COMMENT）后又通过卡片内联表单/小程序提交了明确反馈，挂起状态必须取消，
+        # 否则他的下一条私聊问题仍会被 take_awaiting_comment 误吞成补充原因。
         feedback_id = str(uuid.uuid4())
         with conn.cursor() as cursor:
             cursor.execute(
@@ -162,6 +164,8 @@ def _save_feedback(
                     feedback_type = VALUES(feedback_type),
                     feedback_reason = VALUES(feedback_reason),
                     feedback_comment = VALUES(feedback_comment),
+                    handled_status = IF(handled_status = 'AWAITING_COMMENT',
+                                        'PENDING', handled_status),
                     updated_at = NOW()
                 """,
                 (
@@ -342,20 +346,41 @@ def take_awaiting_comment(*, user_id: str, comment: str, within_seconds: int = 6
         return False
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
 
-    conn = _get_db_conn()
+    try:
+        conn = _get_db_conn()
+    except Exception as e:
+        # 取连接失败（RDS 故障/连接池初始化失败）也按「未命中」返回：调用方把这条消息
+        # 当普通问题继续处理 —— 本函数在私聊主路径上，绝不能让 DB 故障 500 掉每条私聊
+        logger.error(
+            "take_awaiting_comment 取连接失败（按普通问题处理）: user_id=%s, error=%s",
+            user_id, e,
+        )
+        return False
     try:
         with conn.cursor() as cursor:
+            # 兜底回收：超窗仍滞留 AWAITING_COMMENT 的行归位 PENDING —— 没有这步，
+            # 该用户多日后的任意私聊消息仍可能被误吞成「补充原因」，行也永远卡在挂起态
+            cursor.execute(
+                """UPDATE fuling_operation.user_feedback
+                   SET handled_status = 'PENDING'
+                   WHERE user_id = %s AND handled_status = 'AWAITING_COMMENT'
+                     AND updated_at < (NOW() - INTERVAL %s SECOND)""",
+                (user_id, int(within_seconds)),
+            )
+            # 窗口按 updated_at 计：mark_awaiting_comment 的 upsert 只刷新 updated_at，
+            # 旧投票行的 created_at 可能远早于点击「补充原因」的时刻，按 created_at 会误判超窗
             cursor.execute(
                 """
                 SELECT id FROM fuling_operation.user_feedback
                 WHERE user_id = %s AND handled_status = 'AWAITING_COMMENT'
-                  AND created_at >= (NOW() - INTERVAL %s SECOND)
-                ORDER BY created_at DESC LIMIT 1
+                  AND updated_at >= (NOW() - INTERVAL %s SECOND)
+                ORDER BY updated_at DESC LIMIT 1
                 """,
                 (user_id, int(within_seconds)),
             )
             row = cursor.fetchone()
             if not row:
+                conn.commit()  # 过期回收也要落地
                 return False
             fid = row[0]
         with conn.cursor() as cursor:

@@ -340,6 +340,7 @@ CREATE TABLE IF NOT EXISTS qa_session_log (
     cited_docs_json     JSON DEFAULT NULL,
     latency_ms          INT DEFAULT 0,
     answer_status       VARCHAR(32) DEFAULT 'SUCCESS',
+    content_blocks_json MEDIUMTEXT DEFAULT NULL COMMENT '图文渲染块 JSON 快照',
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_session (session_id),
     INDEX idx_user (user_id)
