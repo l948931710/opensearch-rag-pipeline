@@ -16,6 +16,9 @@ from typing import Dict, List, Optional
 
 from opensearch_pipeline.extraction.schema import ExtractedBlock
 
+# DashScope / Gemini 两个分支共用的 OCR 指令
+_OCR_PROMPT = "请识别图片中的所有文字，保持原文顺序输出。只输出识别文本，不要解释。"
+
 
 @dataclass
 class OCRPageResult:
@@ -229,41 +232,27 @@ class OCRClient:
         """根据配置调用相应的 OCR API (Gemini or DashScope)。"""
         import requests
 
+        from opensearch_pipeline.vlm_endpoint import (
+            auth_headers, build_image_chat_payload, extract_vlm_text,
+            resolve_vlm_url, use_compat_mode,
+        )
+
         is_dashscope = "dashscope.aliyuncs.com" in self.api_base_url
 
         if is_dashscope:
-            url = f"{self.api_base_url}/services/aigc/multimodal-generation/generation"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": self.ocr_model,
-                "input": {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"image": f"data:{mime_type};base64,{base64_image}"},
-                                {"text": "请识别图片中的所有文字，保持原文顺序输出。只输出识别文本，不要解释。"}
-                            ]
-                        }
-                    ]
-                }
-            }
-            resp = requests.post(url, json=payload, headers=headers, timeout=60)
+            # qwen3 系列只在 compatible-mode 端点提供；qwen-vl-ocr 等旧系列走原生端点。
+            # （此前这里只有原生分支：配置 qwen3-vl-* 做 OCR 会打到错误端点直接报错。）
+            use_compat = use_compat_mode(self.ocr_model, self.api_base_url)
+            url = resolve_vlm_url(self.api_base_url, use_compat)
+            payload = build_image_chat_payload(
+                self.ocr_model, _OCR_PROMPT, base64_image, mime_type, use_compat,
+            )
+            resp = requests.post(url, json=payload, headers=auth_headers(self.api_key), timeout=60)
             if resp.status_code != 200:
                 raise RuntimeError(f"DashScope OCR HTTP {resp.status_code}: {resp.text[:500]}")
-            
-            data = resp.json()
+
             try:
-                choices = data["output"]["choices"]
-                content = choices[0]["message"]["content"]
-                if isinstance(content, list):
-                    return "".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
-                elif isinstance(content, str):
-                    return content.strip()
-                return ""
+                return extract_vlm_text(resp.json(), use_compat).strip()
             except (KeyError, IndexError):
                 return ""
         else:
@@ -277,7 +266,7 @@ class OCRClient:
             payload = {
                 "contents": [{
                     "parts": [
-                        {"text": "请识别图片中的所有文字，保持原文顺序输出。只输出识别文本，不要解释。"},
+                        {"text": _OCR_PROMPT},
                         {
                             "inline_data": {
                                 "mime_type": mime_type,

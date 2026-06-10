@@ -288,13 +288,12 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
 
         try:
             if is_dashscope:
-                if "compatible-mode" not in api_base_url and "chat/completions" not in api_base_url:
-                    url = f"{api_base_url.rstrip('/')}/compatible-mode/v1/chat/completions"
-                elif "chat/completions" not in api_base_url:
-                    url = f"{api_base_url.rstrip('/')}/chat/completions"
-                else:
-                    url = api_base_url
-                    
+                # 与 funnel / ocr_client / vlm_rebuilder 共用同一 URL 构造（按域名重建路径，
+                # 原实现对 /api/v1 这类原生 base 会拼出 /api/v1/compatible-mode/... 的坏 URL）
+                from opensearch_pipeline.vlm_endpoint import compat_chat_completions_url
+                url = compat_chat_completions_url(api_base_url)
+
+
                 headers = {
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",

@@ -100,3 +100,97 @@ class TestProductionGuardCoversVlmModel:
             RAG_DASHSCOPE_API_KEY="sk-test",
         )
         assert config.ocr.vlm_model == "qwen3-vl-plus"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. Qwen-VL 端点路由单一实现
+# ═══════════════════════════════════════════════════════════════
+
+class TestVlmEndpointRouting:
+    NATIVE_BASE = "https://dashscope.aliyuncs.com/api/v1"
+    COMPAT_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    def test_use_compat_mode_rules(self):
+        from opensearch_pipeline.vlm_endpoint import use_compat_mode
+
+        assert use_compat_mode("qwen3-vl-plus", self.NATIVE_BASE) is True
+        assert use_compat_mode("qwen-vl-ocr-latest", self.NATIVE_BASE) is False
+        assert use_compat_mode("qwen-vl-plus", self.COMPAT_BASE) is True
+        assert use_compat_mode("", "") is False
+
+    def test_compat_url_rebuilds_from_domain(self):
+        """compat URL 必须按域名重建：/api/v1 原生 base 不能拼成 …/api/v1/compatible-mode/…"""
+        from opensearch_pipeline.vlm_endpoint import compat_chat_completions_url, resolve_vlm_url
+
+        assert (
+            compat_chat_completions_url(self.NATIVE_BASE)
+            == "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        )
+        assert (
+            compat_chat_completions_url(self.COMPAT_BASE)
+            == "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        )
+        # base 已是完整 chat/completions URL → 原样返回
+        full = "https://gw.example.com/llm/v1/chat/completions"
+        assert compat_chat_completions_url(full) == full
+        # native 路由
+        assert (
+            resolve_vlm_url(self.NATIVE_BASE, use_compat=False)
+            == "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+        )
+
+    def test_payload_shapes(self):
+        from opensearch_pipeline.vlm_endpoint import build_image_chat_payload
+
+        compat = build_image_chat_payload("qwen3-vl-plus", "识别", "AAA=", "image/png", True)
+        assert compat["messages"][0]["content"][0]["type"] == "image_url"
+        assert compat["messages"][0]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert "input" not in compat
+
+        native = build_image_chat_payload(
+            "qwen-vl-ocr-latest", "识别", "AAA=", "image/png", False, temperature=0)
+        assert native["input"]["messages"][0]["content"][0]["image"].startswith("data:image/png;base64,")
+        assert native["parameters"] == {"temperature": 0}
+        assert "messages" not in native
+
+    def test_extract_vlm_text_both_modes(self):
+        from opensearch_pipeline.vlm_endpoint import extract_vlm_text
+
+        compat_resp = {"choices": [{"message": {"content": "你好"}}]}
+        assert extract_vlm_text(compat_resp, True) == "你好"
+
+        native_resp = {"output": {"choices": [{"message": {"content": [{"text": "你"}, {"text": "好"}]}}]}}
+        assert extract_vlm_text(native_resp, False) == "你好"
+
+        native_str = {"output": {"choices": [{"message": {"content": "直接字符串"}}]}}
+        assert extract_vlm_text(native_str, False) == "直接字符串"
+
+    def test_ocr_client_routes_qwen3_to_compat(self, monkeypatch):
+        """qwen3-vl-* 配成 OCR 模型时必须打 compatible-mode 端点（修复前打原生端点报错）。"""
+        from opensearch_pipeline.extraction.ocr_client import OCRClient
+
+        client = OCRClient.__new__(OCRClient)  # 跳过 __init__，只测 _call_ocr_api 路由
+        client.api_key = "sk-test"
+        client.api_base_url = self.NATIVE_BASE
+        client.ocr_model = "qwen3-vl-plus"
+
+        captured = {}
+
+        class _FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"choices": [{"message": {"content": "OCR文本"}}]}
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["payload"] = json
+            return _FakeResp()
+
+        import requests
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        text = client._call_ocr_api("AAA=", "image/png")
+        assert text == "OCR文本"
+        assert captured["url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        assert captured["payload"]["messages"][0]["content"][0]["type"] == "image_url"

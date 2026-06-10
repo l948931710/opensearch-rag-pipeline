@@ -120,33 +120,19 @@ def _vlm_reconstruct_page(img_bytes: bytes, cfg, doc_title: str = "",
 
     b64 = base64.b64encode(img_bytes).decode()
     prompt = _RECON_PROMPT + (f"\n文档标题：{doc_title[:80]}" if doc_title else "")
-    use_compat = "qwen3" in model.lower() or "compatible" in (base_url or "").lower()
+    # 端点路由 / 请求体 / 响应解析与 funnel、ocr_client 共用单一实现（vlm_endpoint）
+    from opensearch_pipeline.vlm_endpoint import (
+        auth_headers, build_image_chat_payload, extract_vlm_text,
+        resolve_vlm_url, use_compat_mode,
+    )
+    use_compat = use_compat_mode(model, base_url)
+    url = resolve_vlm_url(base_url, use_compat)
+    payload = build_image_chat_payload(model, prompt, b64, mime, use_compat, temperature=0)
     try:
-        if use_compat:
-            import re as _re
-            _dm = _re.search(r'https?://([^/]+)', base_url or "")
-            domain = _dm.group(1) if _dm else "dashscope.aliyuncs.com"
-            url = f"https://{domain}/compatible-mode/v1/chat/completions"
-            payload = {"model": model, "temperature": 0,
-                       "messages": [{"role": "user", "content": [
-                           {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                           {"type": "text", "text": prompt}]}]}
-            r = requests.post(url, json=payload,
-                              headers={"Authorization": f"Bearer {api_key}",
-                                       "Content-Type": "application/json"}, timeout=(15, 150))
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-        else:
-            url = base_url.rstrip("/") + "/services/aigc/multimodal-generation/generation"
-            payload = {"model": model, "input": {"messages": [{"role": "user", "content": [
-                {"text": prompt}, {"image": f"data:{mime};base64,{b64}"}]}]},
-                "parameters": {"temperature": 0}}
-            r = requests.post(url, json=payload,
-                              headers={"Authorization": f"Bearer {api_key}"}, timeout=(10, 120))
-            r.raise_for_status()
-            content = r.json()["output"]["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        r = requests.post(url, json=payload, headers=auth_headers(api_key),
+                          timeout=(15, 150) if use_compat else (10, 120))
+        r.raise_for_status()
+        content = extract_vlm_text(r.json(), use_compat)
         # strip markdown fences
         content = content.strip()
         if content.startswith("```"):

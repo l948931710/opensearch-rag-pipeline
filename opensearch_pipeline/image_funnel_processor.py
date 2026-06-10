@@ -325,71 +325,22 @@ class ImageFunnelProcessor:
                 "}"
             )
 
-            # ── 判断端点模式 ──
-            use_compat = "qwen3" in model_name.lower() or "compatible" in api_base_url.lower()
+            # ── 端点路由（与 ocr_client / vlm_rebuilder / spot_checker 共用单一实现）──
+            from opensearch_pipeline.vlm_endpoint import (
+                auth_headers, build_image_chat_payload, extract_vlm_text,
+                resolve_vlm_url, use_compat_mode,
+            )
 
-            if use_compat:
-                import re as _re
-                domain_match = _re.search(r'https?://([^/]+)', api_base_url)
-                domain = domain_match.group(1) if domain_match else "dashscope.aliyuncs.com"
-                url = f"https://{domain}/compatible-mode/v1/chat/completions"
+            use_compat = use_compat_mode(model_name, api_base_url)
+            url = resolve_vlm_url(api_base_url, use_compat)
+            payload = build_image_chat_payload(model_name, prompt, b64_data, mime_type, use_compat)
 
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                payload = {
-                    "model": model_name,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}},
-                                {"type": "text", "text": prompt}
-                            ]
-                        }
-                    ]
-                }
+            resp = requests.post(url, json=payload, headers=auth_headers(api_key), timeout=(10, 90))
+            if resp.status_code != 200:
+                label = "VLM (compat)" if use_compat else "Qwen-VL VLM"
+                raise RuntimeError(f"{label} HTTP {resp.status_code}: {resp.text[:400]}")
 
-                resp = requests.post(url, json=payload, headers=headers, timeout=(10, 90))
-                if resp.status_code != 200:
-                    raise RuntimeError(f"VLM (compat) HTTP {resp.status_code}: {resp.text[:400]}")
-
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-            else:
-                # DashScope 原生多模态端点（兼容旧版 qwen-vl-ocr-latest 等）
-                url = f"{api_base_url}/services/aigc/multimodal-generation/generation"
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                payload = {
-                    "model": model_name,
-                    "input": {
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"image": f"data:{mime_type};base64,{b64_data}"},
-                                    {"text": prompt}
-                                ]
-                            }
-                        ]
-                    }
-                }
-
-                resp = requests.post(url, json=payload, headers=headers, timeout=(10, 90))
-                if resp.status_code != 200:
-                    raise RuntimeError(f"Qwen-VL VLM HTTP {resp.status_code}: {resp.text[:400]}")
-
-                data = resp.json()
-                choices = data["output"]["choices"]
-                content = choices[0]["message"]["content"]
-
-                # 兼容旧版返回的 list 格式
-                if isinstance(content, list):
-                    content = "".join(item.get("text", "") for item in content if isinstance(item, dict))
+            content = extract_vlm_text(resp.json(), use_compat)
 
             # ── 解析 JSON 结果 ──
             try:
