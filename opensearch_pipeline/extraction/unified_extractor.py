@@ -20,6 +20,69 @@ from opensearch_pipeline.extraction.text_extractor import (
 from opensearch_pipeline.extraction.ocr_client import OCRClient
 
 
+def _html_to_text(raw_html: str) -> str:
+    """HTML → 纯文本：剥标签、跳过 script/style、块级标签转换行；失败回退原文。"""
+    import re
+    from html.parser import HTMLParser
+
+    class _TextExtractor(HTMLParser):
+        _BLOCK_TAGS = {
+            "p", "div", "br", "li", "tr", "table", "section", "article",
+            "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6",
+        }
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts = []
+            self._skip_depth = 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"):
+                self._skip_depth += 1
+            elif tag in self._BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style"):
+                self._skip_depth = max(0, self._skip_depth - 1)
+            elif tag in self._BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            if not self._skip_depth:
+                self.parts.append(data)
+
+    try:
+        parser = _TextExtractor()
+        parser.feed(raw_html)
+        parser.close()
+        text = "\n".join(ln.strip() for ln in "".join(parser.parts).splitlines())
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text or raw_html
+    except Exception:
+        return raw_html
+
+
+def _csv_to_text(raw_csv: str) -> str:
+    """CSV → 行式文本：csv 模块处理引号/转义，单元格以 " | " 连接；失败回退原文。"""
+    import csv
+    import io
+
+    try:
+        try:
+            dialect = csv.Sniffer().sniff(raw_csv[:4096], delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        rows = csv.reader(io.StringIO(raw_csv), dialect)
+        lines = [
+            " | ".join(cell.strip() for cell in row)
+            for row in rows if any((cell or "").strip() for cell in row)
+        ]
+        return "\n".join(lines) or raw_csv
+    except Exception:
+        return raw_csv
+
+
 class UnifiedExtractor:
     """
     统一文档提取器。
@@ -87,8 +150,12 @@ class UnifiedExtractor:
             return self._extract_pdf(task)
         elif file_ext == "docx":
             return self._extract_docx(task)
-        elif file_ext in ("xlsx", "xls"):
+        elif file_ext == "xlsx":
             return self._extract_xlsx(task)
+        elif file_ext == "xls":
+            # 旧版二进制 Excel：openpyxl 无法解析。此前被误路由进 _extract_xlsx，
+            # 异常被吞掉后当"空文档"继续走（静默失败）；显式按不支持处理，错误可见。
+            return self._unsupported(task, file_ext)
         elif file_ext == "pptx":
             return self._extract_pptx(task)
         elif file_ext in ("txt", "md", "csv", "html"):
@@ -770,7 +837,7 @@ class UnifiedExtractor:
     # ── Plain text / Markdown ──
 
     def _extract_text(self, task: dict) -> ExtractionResult:
-        """纯文本/Markdown 提取。"""
+        """纯文本/Markdown/HTML/CSV 提取。"""
         local_path = task.get("local_path", "")
         file_ext = task.get("file_ext", "txt").lower()
 
@@ -790,6 +857,16 @@ class UnifiedExtractor:
                 warnings=[f"Failed to read file: {e}"],
             )
 
+        # HTML/CSV 此前被直读为纯文本：HTML 满屏标签、CSV 引号/转义糊在一起。
+        # 先转成可读文本再走统一分块；转换失败回退原文（保持优雅降级约定）。
+        extract_method = "plain_text"
+        if file_ext == "html":
+            raw_text = _html_to_text(raw_text)
+            extract_method = "html_text"
+        elif file_ext == "csv":
+            raw_text = _csv_to_text(raw_text)
+            extract_method = "csv_table"
+
         blocks = extract_text_file(raw_text, source="native")
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
@@ -799,7 +876,7 @@ class UnifiedExtractor:
             version_no=task["version_no"],
             source_key=task.get("raw_key", ""),
             file_ext=file_ext,
-            extract_method="plain_text",
+            extract_method=extract_method,
             title=title,
             text=flat_text,
             text_length=len(flat_text),

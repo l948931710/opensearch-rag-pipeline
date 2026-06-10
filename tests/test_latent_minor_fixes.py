@@ -320,3 +320,68 @@ class TestDeadConfigKnobsWired:
         from opensearch_pipeline.config import get_config
 
         assert session_store.MAX_HISTORY_TURNS == get_config().rag.max_history_turns
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. 提取器格式处理：.xls 显式不支持；HTML/CSV 真解析
+# ═══════════════════════════════════════════════════════════════
+
+class TestExtractorFormatHandling:
+    @staticmethod
+    def _task(tmp_path, name, content, ext):
+        p = tmp_path / name
+        p.write_text(content, encoding="utf-8")
+        return {
+            "doc_id": "d1", "version_no": 1, "file_ext": ext,
+            "local_path": str(p), "raw_key": f"raw/it/{name}", "filename": name,
+        }
+
+    def test_xls_routes_to_unsupported(self):
+        """旧版二进制 .xls 不再误投 openpyxl 静默失败，而是显式 unsupported。"""
+        from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+
+        extractor = UnifiedExtractor(simulate=True)
+        result = extractor.extract({
+            "doc_id": "d1", "version_no": 1, "file_ext": "xls",
+            "raw_key": "raw/it/旧表.xls", "filename": "旧表.xls",
+        })
+        assert result.extract_method == "unsupported:xls"
+        assert any("Unsupported" in w for w in result.warnings)
+
+    def test_html_is_stripped_to_text(self, tmp_path):
+        from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+
+        html = (
+            "<html><head><style>.x{color:red}</style></head><body>"
+            "<h1>差旅报销制度</h1><p>第一条 出差需提前申请。</p>"
+            "<script>var tracking = 1;</script></body></html>"
+        )
+        extractor = UnifiedExtractor(simulate=True)
+        result = extractor._extract_text(self._task(tmp_path, "policy.html", html, "html"))
+
+        assert result.extract_method == "html_text"
+        assert "差旅报销制度" in result.text
+        assert "第一条 出差需提前申请。" in result.text
+        assert "tracking" not in result.text
+        assert ".x{color:red}" not in result.text
+        assert "<p>" not in result.text
+
+    def test_csv_is_parsed_with_quoting(self, tmp_path):
+        from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+
+        csv_content = '物料,数量\n"吸管,纸质",1000\n'
+        extractor = UnifiedExtractor(simulate=True)
+        result = extractor._extract_text(self._task(tmp_path, "bom.csv", csv_content, "csv"))
+
+        assert result.extract_method == "csv_table"
+        assert "物料 | 数量" in result.text
+        # 引号内逗号是单元格内容，不是分隔符
+        assert "吸管,纸质 | 1000" in result.text
+
+    def test_plain_txt_unchanged(self, tmp_path):
+        from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+
+        extractor = UnifiedExtractor(simulate=True)
+        result = extractor._extract_text(self._task(tmp_path, "note.txt", "普通文本内容", "txt"))
+        assert result.extract_method == "plain_text"
+        assert "普通文本内容" in result.text
