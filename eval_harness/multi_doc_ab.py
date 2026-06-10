@@ -107,7 +107,7 @@ def _install_trigger_recorder():
     return book
 
 
-def run_retrieval_arm(cases, mode, label, trigger_book, doc_cap=0):
+def run_retrieval_arm(cases, mode, label, trigger_book, doc_cap=0, top_k=7):
     """一个 arm：设 multi_query_mode=mode + doc_diversity_cap=doc_cap，全 case 检索并打分。"""
     from opensearch_pipeline.config import get_config
     from opensearch_pipeline.retriever import retrieve_and_enrich
@@ -124,7 +124,7 @@ def run_retrieval_arm(cases, mode, label, trigger_book, doc_cap=0):
         chunks = []
         for attempt in (1, 2):   # 瞬时故障重试一次；仍失败则记 error（不计为检索 miss）
             try:
-                chunks = retrieve_and_enrich(q, top_k=7)
+                chunks = retrieve_and_enrich(q, top_k=top_k)
                 err = None
                 break
             except Exception as e:
@@ -148,6 +148,7 @@ def run_retrieval_arm(cases, mode, label, trigger_book, doc_cap=0):
             "latency_ms": lat,
             "triggered": len(subs) >= 2, "sub_queries": subs,
             "doc_titles": [ch.get("title", "") for ch in chunks],
+            "context_chars": sum(len(ch.get("chunk_text") or "") for ch in chunks),
             "_chunks": chunks,  # 仅在内存中供护栏阶段复用，落盘前剔除
         }
         return None
