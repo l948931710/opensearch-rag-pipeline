@@ -206,8 +206,8 @@ class TestApiStreamBookkeeping:
     def test_stream_partial_answer_on_error_history(
         self, mock_retrieve, mock_append, mock_log, client
     ):
-        """KNOWN DRIFT（D3 翻转为 assert_not_called）：生成中途抛错，当前仍把
-        部分回答写入会话历史；钉钉流式只在 SUCCESS 时写。统一后以钉钉规则为准。"""
+        """已统一（原 KNOWN DRIFT）：生成中途抛错，部分回答不再写入会话历史
+        （与钉钉流式一致：仅非空 SUCCESS 回答入史，残句不污染后续轮次）。"""
         def _boom(*args, **kwargs):
             yield 'data: {"type": "chunk", "content": "部分"}\n\n'
             raise RuntimeError("upstream down")
@@ -216,8 +216,7 @@ class TestApiStreamBookkeeping:
             resp = client.post("/api/ask/stream", json={"question": "q", "pure_text": True})
         assert resp.status_code == 200
         assert mock_log.call_args.kwargs["answer_status"] == "LLM_ERROR"
-        mock_append.assert_called_once()
-        assert mock_append.call_args.args[2] == "部分"
+        mock_append.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -273,12 +272,12 @@ class TestBotSyncBookkeeping:
     def test_bot_sync_no_result_exact_text_and_log(
         self, mock_retrieve, mock_log, mock_dept, mock_reply
     ):
-        """NO_RESULT：精确文案（KNOWN DRIFT，D3 统一为 🤷 + /api/ask 文案）+ 落库含 user_dept。"""
+        """NO_RESULT：精确文案（已统一 = 🤷 + 各端共用 NO_RESULT_MESSAGE）+ 落库含 user_dept。"""
         _process_rag_query("不存在", "https://webhook/test", "李四", "cid2",
                            sender_staff_id="staff9")
         mock_reply.assert_called_once()
         assert mock_reply.call_args.args[1] == (
-            "🤷 抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述。"
+            "🤷 抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。"
         )
         kw = mock_log.call_args.kwargs
         assert kw["answer_status"] == "NO_RESULT"

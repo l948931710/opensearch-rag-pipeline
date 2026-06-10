@@ -41,7 +41,13 @@ from opensearch_pipeline.content_blocks_builder import (
     build_mini_program_blocks,
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
-from opensearch_pipeline.answer_flow import build_qa_log_kwargs
+from opensearch_pipeline.answer_flow import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
+    NO_RESULT_MESSAGE,
+    build_qa_log_kwargs,
+    should_append_history,
+)
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 
@@ -119,8 +125,8 @@ class AskRequest(BaseModel):
     )
     history: Optional[List[ChatMessage]] = Field(None, description="对话历史")
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
-    temperature: Optional[float] = Field(0.1, ge=0.0, le=2.0, description="生成温度")
-    max_tokens: Optional[int] = Field(2048, ge=100, le=8192, description="最大生成 token 数")
+    temperature: Optional[float] = Field(DEFAULT_TEMPERATURE, ge=0.0, le=2.0, description="生成温度")
+    max_tokens: Optional[int] = Field(DEFAULT_MAX_TOKENS, ge=100, le=8192, description="最大生成 token 数")
     user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
     user_dept: Optional[str] = Field(
         None,
@@ -332,7 +338,7 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
             answer_status="NO_RESULT",
         ))
         return AskResponse(
-            answer="抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。",
+            answer=NO_RESULT_MESSAGE,
             sources=[],
             session_id=session_id,
             message_id=msg_id,
@@ -347,8 +353,8 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
             req.question,
             chunks,
             history=merged_history if merged_history else None,
-            max_tokens=req.max_tokens or 2048,
-            temperature=req.temperature or 0.1,
+            max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS,
+            temperature=req.temperature or DEFAULT_TEMPERATURE,
             pure_text=req.pure_text,
         )
     except Exception as e:
@@ -356,8 +362,9 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
         logger.error("LLM generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"回答生成失败，请联系管理员 (trace: {trace_id})")
 
-    # 4. 更新会话历史
-    _append_to_history(session_id, req.question, result["answer"])
+    # 4. 更新会话历史（统一策略：仅非空 SUCCESS 回答入史）
+    if should_append_history(result["answer"], "SUCCESS"):
+        _append_to_history(session_id, req.question, result["answer"])
 
     t_llm = time.time()
     llm_latency_ms = int((t_llm - t_retrieval) * 1000)
@@ -469,7 +476,7 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
             # 落库，与主流式路径的 finally 收尾保持一致。
             try:
                 yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'chunk', 'content': '抱歉，当前知识库中未找到与您问题相关的信息。'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'chunk', 'content': NO_RESULT_MESSAGE}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
@@ -504,8 +511,8 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
                     req.question,
                     chunks,
                     history=merged_history if merged_history else None,
-                    max_tokens=req.max_tokens or 2048,
-                    temperature=req.temperature or 0.1,
+                    max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS,
+                    temperature=req.temperature or DEFAULT_TEMPERATURE,
                     pure_text=req.pure_text,
                 ):
                     # 截获生成器自带的 [DONE]，改由本函数在 content_blocks 之后统一收尾
@@ -547,7 +554,8 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
             # 无论正常结束还是客户端中途断开（GeneratorExit），都写历史 + 落库，
             # 保证流式回答可被反馈/分析（落库函数自身吞掉异常，绝不影响回复）
             full_answer = "".join(collected_answer)
-            if full_answer:
+            # 统一策略：仅非空 SUCCESS 回答入史 —— 出错前的半截回答不再污染后续轮次上下文
+            if should_append_history(full_answer, answer_status):
                 _append_to_history(session_id, req.question, full_answer)
             log_qa_session(**build_qa_log_kwargs(
                 session_id=session_id,

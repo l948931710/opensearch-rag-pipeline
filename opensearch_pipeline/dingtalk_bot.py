@@ -37,7 +37,13 @@ from opensearch_pipeline.llm_generator import (
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import get_or_create_session, append_to_history
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
-from opensearch_pipeline.answer_flow import build_qa_log_kwargs, should_append_history
+from opensearch_pipeline.answer_flow import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
+    NO_RESULT_MESSAGE,
+    build_qa_log_kwargs,
+    should_append_history,
+)
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_feedback_status,
@@ -376,8 +382,8 @@ def _stream_answer_to_card(
             question,
             chunks,
             history=history if history else None,
-            max_tokens=2048,
-            temperature=0.1,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            temperature=DEFAULT_TEMPERATURE,
             pure_text=True,
         ):
             frame = parse_sse_data_frame(event)
@@ -517,7 +523,7 @@ def _process_rag_query(
             ))
             _send_text_reply(
                 session_webhook,
-                "🤷 抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述。",
+                f"🤷 {NO_RESULT_MESSAGE}",
             )
             return
 
@@ -548,8 +554,8 @@ def _process_rag_query(
             question,
             chunks,
             history=list(history),
-            max_tokens=2048,
-            temperature=0.1,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            temperature=DEFAULT_TEMPERATURE,
             pure_text=pure_text,
         )
 
@@ -557,8 +563,9 @@ def _process_rag_query(
         llm_latency_ms = int((t_llm - t_retrieval) * 1000)
         latency_ms = int((t_llm - t0) * 1000)
 
-        # 3. 追加到会话历史（供下轮使用）
-        append_to_history(session_key, question, result["answer"])
+        # 3. 追加到会话历史（统一策略：仅非空 SUCCESS 回答入史）
+        if should_append_history(result["answer"], "SUCCESS"):
+            append_to_history(session_key, question, result["answer"])
 
         # 4. 构建 content_blocks（图文穿插）；纯文本模式下不展示图片
         from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json
