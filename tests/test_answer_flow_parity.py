@@ -98,11 +98,10 @@ class TestApiAskBookkeeping:
         assert kw["opensearch_hit_count"] == 1
         assert kw["top_score"] == 9.0
         assert kw["retrieved_docs"] == API_CHUNKS
-        # KNOWN BUG（D1 翻转为 "U9"）：成功路径落的是请求体 user_id（此处为空），
-        # 而非已解析身份 uid；NO_RESULT/流式分支都用 uid，唯独这里漂移。
-        assert kw["user_id"] == ""
-        # KNOWN BUG（D1 翻转为 "行政部"）：API 路径从不落 user_dept。
-        assert not kw.get("user_dept")
+        # 已修复（原 KNOWN BUG）：成功路径落已解析身份 uid（令牌里的 U9），不再用请求体 user_id
+        assert kw["user_id"] == "U9"
+        # 已修复（原 KNOWN BUG）：令牌部门现已落库
+        assert kw["user_dept"] == "行政部"
         # KNOWN BUG（D2 翻转为含 "答案正文" 的 JSON）：成功路径不落 content_blocks_json。
         assert not kw.get("content_blocks_json")
 
@@ -137,8 +136,8 @@ class TestApiAskBookkeeping:
         assert kw["opensearch_hit_count"] == 0
         assert kw["message_id"] == j["message_id"]
         assert kw["user_id"] == "U9"
-        # KNOWN BUG（D1 翻转为 "行政部"）：NO_RESULT 分支同样不落 user_dept。
-        assert not kw.get("user_dept")
+        # 已修复（原 KNOWN BUG）：NO_RESULT 分支现也落 user_dept
+        assert kw["user_dept"] == "行政部"
 
     @patch("opensearch_pipeline.api.build_mini_program_blocks", return_value=[])
     @patch("opensearch_pipeline.api.log_qa_session")
@@ -191,7 +190,7 @@ class TestApiStreamBookkeeping:
     def test_stream_log_dept_with_token(
         self, mock_retrieve, mock_stream, mock_append, mock_log, client
     ):
-        """KNOWN BUG（D1 翻转为 "行政部"）：流式收尾落库缺 user_dept（user_id 正确用 uid）。"""
+        """已修复（原 KNOWN BUG）：流式收尾落库现含令牌部门（user_id 一直用 uid）。"""
         resp = client.post(
             "/api/ask/stream", json={"question": "q", "pure_text": True},
             headers={"Authorization": "Bearer " + _token()},
@@ -199,7 +198,7 @@ class TestApiStreamBookkeeping:
         assert resp.status_code == 200
         kw = mock_log.call_args.kwargs
         assert kw["user_id"] == "U9"
-        assert not kw.get("user_dept")
+        assert kw["user_dept"] == "行政部"
 
     @patch("opensearch_pipeline.api.log_qa_session")
     @patch("opensearch_pipeline.api._append_to_history")
