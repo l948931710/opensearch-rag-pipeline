@@ -1,0 +1,148 @@
+{
+ "cases": [
+  {
+   "qid": "RAG-07",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-30",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-91",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-92",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-93",
+   "n_expected": 3,
+   "attainable": 3,
+   "absent": []
+  },
+  {
+   "qid": "QA-94",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-95",
+   "n_expected": 3,
+   "attainable": 3,
+   "absent": []
+  },
+  {
+   "qid": "QA-96",
+   "n_expected": 4,
+   "attainable": 4,
+   "absent": []
+  },
+  {
+   "qid": "QA-97",
+   "n_expected": 3,
+   "attainable": 3,
+   "absent": []
+  },
+  {
+   "qid": "QA-99",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-100",
+   "n_expected": 4,
+   "attainable": 4,
+   "absent": []
+  },
+  {
+   "qid": "QA-101",
+   "n_expected": 4,
+   "attainable": 4,
+   "absent": []
+  },
+  {
+   "qid": "QA-102",
+   "n_expected": 4,
+   "attainable": 4,
+   "absent": []
+  },
+  {
+   "qid": "QA-103",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-104",
+   "n_expected": 3,
+   "attainable": 3,
+   "absent": []
+  },
+  {
+   "qid": "QA-106",
+   "n_expected": 6,
+   "attainable": 6,
+   "absent": []
+  },
+  {
+   "qid": "QA-107",
+   "n_expected": 3,
+   "attainable": 3,
+   "absent": []
+  },
+  {
+   "qid": "QA-108",
+   "n_expected": 6,
+   "attainable": 6,
+   "absent": []
+  },
+  {
+   "qid": "QA-109",
+   "n_expected": 2,
+   "attainable": 2,
+   "absent": []
+  },
+  {
+   "qid": "QA-110",
+   "n_expected": 4,
+   "attainable": 4,
+   "absent": []
+  },
+  {
+   "qid": "QA-112",
+   "n_expected": 6,
+   "attainable": 6,
+   "absent": []
+  },
+  {
+   "qid": "QA-113",
+   "n_expected": 3,
+   "attainable": 3,
+   "absent": []
+  },
+  {
+   "qid": "QA-114",
+   "n_expected": 4,
+   "attainable": 4,
+   "absent": []
+  },
+  {
+   "qid": "QA-115",
+   "n_expected": 5,
+   "attainable": 5,
+   "absent": []
+  }
+ ]
+}
