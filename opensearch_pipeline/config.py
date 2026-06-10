@@ -514,10 +514,18 @@ def load_config() -> PipelineConfig:
                 f"To protect privacy & security, falling back to Google Gemini is strictly forbidden in production."
             )
             
-        for name, subcfg in [("LLM", config.llm), ("OCR", config.ocr), ("Embedding", config.embedding)]:
-            base_url = subcfg.api_base_url or ""
-            model_name = subcfg.model or ""
-            
+        # VLM（caption/审计）模型挂在 ocr 配置上但独立解析（RAG_VLM_MODEL），必须单独纳入守卫，
+        # 否则 RAG_VLM_MODEL=gemini-* 会绕过检查直达图像通道；为空时按运行时约定回退 ocr.model。
+        checks = [
+            ("LLM", config.llm.api_base_url, config.llm.model),
+            ("OCR", config.ocr.api_base_url, config.ocr.model),
+            ("VLM", config.ocr.api_base_url, config.ocr.vlm_model or config.ocr.model),
+            ("Embedding", config.embedding.api_base_url, config.embedding.model),
+        ]
+        for name, base_url, model_name in checks:
+            base_url = base_url or ""
+            model_name = model_name or ""
+
             if "google" in base_url.lower() or "gemini" in model_name.lower():
                 raise ValueError(
                     f"🚨 [PRODUCTION SECURITY GUARD] {name} config resolved to Google Gemini "
