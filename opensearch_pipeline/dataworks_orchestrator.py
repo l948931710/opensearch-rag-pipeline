@@ -107,10 +107,14 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
             canonicals = []
             conn = None
             try:
-                from opensearch_pipeline.pipeline_nodes import _get_db_conn, _get_oss_bucket
+                from opensearch_pipeline.pipeline_nodes import (
+                    _get_db_conn, _get_oss_bucket, _resolve_simulate,
+                )
                 import json
-                
-                simulate_db = ctx.get("simulate_db", config.simulate_db)
+
+                # 与各节点同一套三层解析（此前这里漏了 ctx["simulate"] 一层：CLI --simulate
+                # 与环境变量 RAG_SIMULATE_DB 不一致时，loader 和节点会各走半真半假的分支）
+                simulate_db = _resolve_simulate(ctx, "db")
                 bucket, is_simulated_oss = _get_oss_bucket(ctx)
                 
                 conn = _get_db_conn(select_db=True)

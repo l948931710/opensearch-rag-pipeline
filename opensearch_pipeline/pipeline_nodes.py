@@ -127,6 +127,19 @@ def _reset_db_pool():
         _db_pool.close()
         _db_pool = None
 
+
+def _resolve_simulate(ctx: dict, kind: str, default=None) -> bool:
+    """统一解析 simulate 开关：ctx 细粒度键 > ctx 全局 "simulate" > 兜底值。
+
+    兜底值默认取 config.simulate_<kind>；个别调用方（如 OSS 客户端包装）用自身参数
+    兜底时显式传 default。此前这条三层取值在 ~19 处手写复制，并已出现漂移
+    （orchestrator 的 stage-2 loader 少了 ctx["simulate"] 一层）。
+    """
+    if default is None:
+        default = getattr(get_config(), f"simulate_{kind}")
+    return ctx.get(f"simulate_{kind}", ctx.get("simulate", default))
+
+
 def _get_opensearch_client():
     from opensearch_pipeline.config import get_config
     config = get_config()
@@ -178,7 +191,7 @@ def _get_oss_bucket(ctx: dict = None):
     # Resolve simulate_oss flag from context or global config
     simulate_oss = config.simulate_oss
     if ctx is not None:
-        simulate_oss = ctx.get("simulate_oss", ctx.get("simulate", simulate_oss))
+        simulate_oss = _resolve_simulate(ctx, "oss", default=simulate_oss)
         
     # Safe fallback: if credentials are dummy or empty, force simulation to prevent developer test errors
     access_id = config.oss.access_key_id
@@ -257,7 +270,7 @@ def node_scan_raw_files(ctx: dict):
     from opensearch_pipeline.config import get_config
 
     config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
 
     tasks = ctx.get("raw_tasks", [])
     if not tasks:
@@ -411,8 +424,7 @@ def node_scan_raw_files(ctx: dict):
 def node_register_metadata(ctx: dict):
     """注册文档元数据（写入 RDS）。"""
     tasks = ctx["tasks"]
-    config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
     registered = []
 
     if not simulate_db:
@@ -498,9 +510,8 @@ def node_extract_text_with_ocr(ctx: dict):
     from opensearch_pipeline.extraction import UnifiedExtractor
 
     tasks = ctx["tasks"]
-    config = get_config()
-    simulate_api = ctx.get("simulate_api", ctx.get("simulate", config.simulate_api))
-    simulate_oss = ctx.get("simulate_oss", ctx.get("simulate", config.simulate_oss))
+    simulate_api = _resolve_simulate(ctx, "api")
+    simulate_oss = _resolve_simulate(ctx, "oss")
 
     # 生产模式需要 OSS bucket 来下载原始文件
     bucket = None
@@ -654,10 +665,8 @@ def node_build_canonical(ctx: dict):
         # ─── Physical Persistence of Canonical Documents (JSON & MD) ───
         import json
         import os
-        from opensearch_pipeline.config import get_config
 
-        config = get_config()
-        simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+        simulate_db = _resolve_simulate(ctx, "db")
         bucket, is_simulated_oss = _get_oss_bucket(ctx)
 
         json_data = json.dumps(canonical, indent=2, ensure_ascii=False)
@@ -1046,7 +1055,7 @@ def node_classify_and_risk_assess(ctx: dict):
     """
     canonicals = ctx["canonicals"]
     config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
     valid_canonicals = []
 
     if not simulate_db:
@@ -1098,7 +1107,7 @@ def node_classify_and_risk_assess(ctx: dict):
     import time as _time
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    simulate_api = ctx.get("simulate_api", ctx.get("simulate", config.simulate_api))
+    simulate_api = _resolve_simulate(ctx, "api")
     max_workers = int(os.environ.get("RAG_CLASSIFY_CONCURRENCY", "8"))
 
     # 级联白名单（线程共享只读，安全）
@@ -1400,8 +1409,7 @@ def node_detect_sensitive(ctx: dict):
         doc["risk_level"] = final_risk
 
         # ─── 敏感检测结果入库 ───
-        config = get_config()
-        simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+        simulate_db = _resolve_simulate(ctx, "db")
         if not simulate_db and hits:
             conn = None
             try:
@@ -2716,8 +2724,7 @@ def node_publish_to_rag_ready(ctx: dict):
     canonicals = ctx["canonicals"]
     published = []
 
-    config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
     bucket, is_simulated_oss = _get_oss_bucket(ctx)
 
     for doc in canonicals:
@@ -2852,8 +2859,7 @@ def node_write_chunk_meta(ctx: dict):
     """
     valid_chunks = ctx.get("valid_chunks", [])
     canonicals = ctx.get("canonicals", [])
-    config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
 
     # 给 chunk 补充 rag_ready_key
     rag_ready_map = {}
@@ -3030,8 +3036,7 @@ def node_acquire_index_lock(ctx: dict):
     同时，把成功抢占的版本 (doc_id, version_no) 记录在 ctx["preempted_doc_versions"] 中。
     """
     chunks = ctx.get("valid_chunks", [])
-    config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
 
     valid_doc_versions = set()
     if not simulate_db and chunks:
@@ -3129,8 +3134,8 @@ def node_deactivate_old_chunks(ctx: dict):
 
     chunks = ctx.get("valid_chunks", []) or ctx.get("embedded_chunks", [])
     config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
-    simulate_opensearch = ctx.get("simulate_opensearch", ctx.get("simulate", config.simulate_opensearch))
+    simulate_db = _resolve_simulate(ctx, "db")
+    simulate_opensearch = _resolve_simulate(ctx, "opensearch")
 
     # 从上下文获取在第一个节点中成功抢占锁的 document versions
     valid_doc_versions = ctx.get("preempted_doc_versions", set())
@@ -3383,7 +3388,7 @@ def node_generate_embeddings(ctx: dict):
         return
 
     config = get_config()
-    simulate_api = ctx.get("simulate_api", ctx.get("simulate", config.simulate_api))
+    simulate_api = _resolve_simulate(ctx, "api")
     
     # 获取正确的模型名称和维度
     embedding_model = config.embedding.model
@@ -3770,7 +3775,7 @@ def node_build_opensearch_payload(ctx: dict):
     ctx["bulk_job_id"] = batches[0]["job_id"]
     ctx["bulk_oss_key"] = batches[0]["oss_key"]
 
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
     if not simulate_db:
         conn = None
         try:
@@ -3817,7 +3822,7 @@ def node_push_to_opensearch(ctx: dict):
     from opensearch_pipeline.config import get_config
     
     config = get_config()
-    simulate_opensearch = ctx.get("simulate_opensearch", ctx.get("simulate", config.simulate_opensearch))
+    simulate_opensearch = _resolve_simulate(ctx, "opensearch")
     batches = ctx.get("bulk_batches")
     if batches is None:
         # Fallback to single batch constructed from context for backwards compatibility
@@ -4150,8 +4155,7 @@ def node_update_index_status(ctx: dict):
 
     chunks_count = sum(len(b["chunks"]) for b in batches)
     
-    config = get_config()
-    simulate_db = ctx.get("simulate_db", ctx.get("simulate", config.simulate_db))
+    simulate_db = _resolve_simulate(ctx, "db")
     
     # Identify all (doc_id, version_no) that experienced chunk indexing failures
     failed_doc_versions = set()
