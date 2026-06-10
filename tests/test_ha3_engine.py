@@ -70,9 +70,11 @@ class TestHA3DocMapping:
         chunk = self._make_chunk()
         doc = chunk.to_ha3_doc(pk_field="custom_pk")
         assert "custom_pk" in doc
-        # rds_id 未设置时，PK 为 chunk_id 的 INT64 hash（HA3 要求 INT64 主键）
+        # rds_id 未设置时，PK 为 chunk_id 的确定性 INT64（md5 派生；内建 hash 受
+        # PYTHONHASHSEED 加盐，跨进程不稳定，重推会主键漂移）
+        from opensearch_pipeline.chunker import _stable_pk_from_chunk_id
         assert isinstance(doc["custom_pk"], int)
-        assert doc["custom_pk"] == hash("doc1_v1_c0001") & 0x7FFFFFFFFFFFFFFF
+        assert doc["custom_pk"] == _stable_pk_from_chunk_id("doc1_v1_c0001")
         assert "id" not in doc
 
     def test_vector_serialized_as_comma_string(self):
