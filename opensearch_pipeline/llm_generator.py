@@ -48,6 +48,29 @@ DEFAULT_SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE + _IMG_INTERLEAVE_RULE
 # 纯文本 system prompt — 去掉图片插入规则（规则 9）
 TEXT_ONLY_SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE
 
+# 低置信度护栏指令（soft answerability guard，RAG_LOW_CONFIDENCE_GUARD）。
+# 不做按分数硬拒答：离线标定（eval_harness/gate_calibration.json）显示 top-1 重排分
+# 的正/负分布重叠严重，硬闸门必然大量误拒可答问题；这里只在低置信带追加强化指令，
+# 由读得到文档内容的 LLM 做第二级判别。
+LOW_CONFIDENCE_RULE = """
+
+注意：本次检索结果与用户问题的相关度偏低。请先逐条核对参考文档是否真正覆盖用户问题的要点：只有文档内容能直接支撑答案时才作答；若所有文档都只是主题相近但并未回答该问题（例如讲的是另一种产品、另一个流程、另一份制度，或文档编号/名称与所问不符），必须回复"抱歉，当前知识库中未找到相关信息"，不得从相近内容推断或拼凑作答。"""
+
+
+def _is_low_confidence(chunks: List[Dict[str, Any]]) -> bool:
+    """top 检索分是否落入低置信带（重排分优先，缺失时用融合分；阈值=对应 medium）。"""
+    config = get_config()
+    if not config.rag.low_confidence_guard or not chunks:
+        return False
+    rerank_scores = [c["rerank_score"] for c in chunks
+                     if isinstance(c.get("rerank_score"), (int, float))]
+    if rerank_scores:
+        return max(rerank_scores) < config.rag.rerank_score_threshold_medium
+    fused = [c["score"] for c in chunks if isinstance(c.get("score"), (int, float))]
+    if not fused:
+        return False
+    return max(fused) < config.rag.score_threshold_medium
+
 
 # ═══════════════════════════════════════════════════════════════
 # Context 组装
@@ -231,6 +254,9 @@ def generate_answer(
     # 解析纯文本开关：显式参数优先，否则取全局 config
     _pure = config.rag.pure_text if pure_text is None else pure_text
     _system = system_prompt or (TEXT_ONLY_SYSTEM_PROMPT if _pure else DEFAULT_SYSTEM_PROMPT)
+    if _is_low_confidence(context_chunks):
+        logger.info("低置信度护栏触发（top 分低于 medium 阈值），追加强化拒答指令")
+        _system = _system + LOW_CONFIDENCE_RULE
 
     # 组装 context
     context = _format_context(context_chunks, max_chars=max_context_chars, pure_text=_pure)
@@ -330,6 +356,9 @@ def generate_answer_stream(
 
     _pure = config.rag.pure_text if pure_text is None else pure_text
     _system = system_prompt or (TEXT_ONLY_SYSTEM_PROMPT if _pure else DEFAULT_SYSTEM_PROMPT)
+    if _is_low_confidence(context_chunks):
+        logger.info("低置信度护栏触发（top 分低于 medium 阈值），追加强化拒答指令")
+        _system = _system + LOW_CONFIDENCE_RULE
 
     context = _format_context(context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)

@@ -169,6 +169,8 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
             # chunk_id 是 step_card/visual_knowledge 的 RDS 重建键，也是 expand_step_context
             # 末尾去重的唯一键——必须透传，否则去重会把所有无 id 的 chunk 折叠成一个。
             "chunk_id": fields.get("chunk_id", ""),
+            # HA3 主键：chunk_id 为空（历史 chunk）时各处 `chunk_id or id` 回退键的实体
+            "id": str(item.get("id") or fields.get("id") or ""),
             "chunk_text": fields.get("chunk_text_store", fields.get("chunk_text", "")),
             "title": fields.get("title", ""),
             "section_title": fields.get("section_title", ""),
@@ -386,6 +388,7 @@ def search_chunks(
         if chunk_type in ("image", "step_card", "procedure_parent", "visual_knowledge"):
             content_results.append(r)
         elif not has_section and len(text) < _COVER_MAX_LEN:
+            r["_is_cover"] = True  # 供 _select_with_doc_cap 识别：封面只作最后回填
             cover_results.append(r)
         else:
             content_results.append(r)
@@ -980,6 +983,126 @@ def cosurface_doc_images(
     return out
 
 
+def _select_with_doc_cap(
+    pool: List[Dict[str, Any]],
+    top_k: int,
+    cap: int,
+) -> List[Dict[str, Any]]:
+    """从（已按分排序的）候选池选 top_k，同一文档最多保留 cap 条；池有富余时回填。
+
+    跨文档问题的失败形态之一：top-k 被单一最相似文档占满（重排池 recall@10≈0.99，
+    第二目标文档挤不进 top-7）。按文档限额给次优文档让位；单文档问题几乎不受影响
+    （top_k=7、cap=4 时仅当某文档独占 ≥5 席才改变结果，且被换入的是池内次优 chunk）。
+    cap<=0 或池不大于 top_k 时为纯截断（与原行为一致）。
+    """
+    if cap <= 0 or len(pool) <= top_k:
+        return pool[:top_k]
+    out: List[Dict[str, Any]] = []
+    counts: Dict[Any, int] = {}
+    overflow: List[Dict[str, Any]] = []
+    covers: List[Dict[str, Any]] = []
+    for ch in pool:
+        if len(out) >= top_k:
+            break
+        # 封面/目录 chunk（search_chunks 已降权标记）不得借限额让位"晋升"——
+        # 它们只配作最后的回填，排在被限额挤出的正文 overflow 之后。
+        if ch.get("_is_cover"):
+            covers.append(ch)
+            continue
+        key = ch.get("doc_id") or ch.get("title") or ""
+        if counts.get(key, 0) >= cap:
+            overflow.append(ch)
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        out.append(ch)
+    for ch in overflow + covers:  # 池内多样性不足 top_k 时按原序回填（正文先、封面后）
+        if len(out) >= top_k:
+            break
+        out.append(ch)
+    return out
+
+
+def _multi_query_search(
+    query: str,
+    sub_queries: List[str],
+    *,
+    fetch_k: int,
+    top_k: int,
+    user_dept: Optional[str],
+    rerank_enable: bool,
+    multimodal: bool,
+    query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
+) -> List[Dict[str, Any]]:
+    """多意图 fan-out：原查询 + 子查询并行检索（各自重排），轮转交错合并去重。
+
+    轮转交错（原查询路优先）保证每路的 top-1/2 必进最终 top_k —— 跨文档问题的
+    失败模式正是单查询 top-k 被一个文档占满，第二个目标文档挤不进上下文。
+    单路失败只丢该路（fail-open）；但若所有路都失败（≥1 路异常且无任何结果），
+    回退原查询单路检索且**不再捕获异常**——持续性故障必须像单查询路径一样向上
+    传播为错误（500/LLM_ERROR），不能被吞成 NO_RESULT"知识库未找到"。
+    """
+    queries = [query] + [q for q in sub_queries if q and q.strip() and q != query]
+
+    def _one(idx_q):
+        idx, q = idx_q
+        try:
+            chs = search_chunks(
+                q, top_k=fetch_k, user_dept=user_dept,
+                query_embedding=query_embedding if idx == 0 else None,
+            )
+            if rerank_enable and chs:
+                from .reranker import rerank_chunks
+                chs = rerank_chunks(q, chs, top_k=top_k, multimodal=multimodal)
+            return chs[:top_k]
+        except Exception as e:
+            logger.warning("multi-query 子查询检索失败（忽略该路）: %r %s", q[:40], e)
+            return None  # None=该路异常；[]=该路正常但无结果（语义不同，勿混）
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(4, len(queries))) as ex:
+        lists = list(ex.map(_one, enumerate(queries)))
+
+    n_errored = sum(1 for lst in lists if lst is None)
+    lists = [lst or [] for lst in lists]
+    if not any(lists):
+        if not n_errored:
+            return []  # 各路都正常且都空 = 真·无结果
+        # 文档化回退：全部路由失败时按原查询单路重试，异常向上传播
+        logger.warning("multi-query 全部 %d 路无结果（%d 路异常），回退原查询单路检索",
+                       len(queries), n_errored)
+        chs = search_chunks(query, top_k=fetch_k, user_dept=user_dept,
+                            query_embedding=query_embedding)
+        if rerank_enable and chs:
+            from .reranker import rerank_chunks
+            chs = rerank_chunks(query, chs, top_k=None, multimodal=multimodal)
+        return _select_with_doc_cap(chs, top_k, get_config().rag.doc_diversity_cap)
+
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for rank in range(max(len(lst) for lst in lists)):
+        for lst in lists:
+            if rank >= len(lst):
+                continue
+            ch = lst[rank]
+            key = ch.get("chunk_id") or ch.get("id") or (ch.get("doc_id"), ch.get("chunk_index"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(ch)
+    # 某路重排失败降级时会出现 rerank 分（0~1）与融合分（~0-10）混用——下游
+    # expand 分组排序 / 相关度标签 / 低置信护栏都假定单一分制。混用时统一回退
+    # 融合分（reranker 在 _fused_score 保留了原分，可无损还原）。
+    if any("rerank_score" in c for c in merged) and any("rerank_score" not in c for c in merged):
+        logger.warning("multi-query 混合分制（部分路由重排失败/降级），统一回退融合分")
+        for c in merged:
+            if "rerank_score" in c:
+                c["score"] = c.pop("_fused_score", c["score"])
+                c.pop("rerank_score", None)
+    logger.info("multi-query fan-out: %d 路（含原查询，%d 路异常）→ 去重合并 %d → 取 top_k=%d",
+                len(queries), n_errored, len(merged), top_k)
+    return _select_with_doc_cap(merged, top_k, get_config().rag.doc_diversity_cap)
+
+
 def retrieve_and_enrich(
     query: str,
     *,
@@ -1020,12 +1143,28 @@ def retrieve_and_enrich(
     _fetch_k = max(_av.rerank_pool, top_k) if _av.rerank_enable else top_k
     # query embedding 只算一次，传给 search_chunks 与 cosurface（后者原本会重复嵌入一次）
     _emb = get_query_embedding(query)
-    chunks = search_chunks(query, top_k=_fetch_k, user_dept=user_dept, query_embedding=_emb)
-    if _av.rerank_enable and chunks:
-        from .reranker import rerank_chunks
-        # multimodal 渲染路径（cosurface_images=True）用 VL 重排；纯文本/钉钉机器人用文本重排。
-        chunks = rerank_chunks(query, chunks, top_k=top_k,
-                               multimodal=bool(cosurface_images))  # 失败自动降级为原始顺序
+    # 多意图查询分解（RAG_MULTI_QUERY_MODE，默认 off；失败/不触发即走原单查询路径）
+    _sub_queries: List[str] = []
+    if get_config().rag.multi_query_mode in ("auto", "llm"):
+        from .query_decomposer import maybe_decompose
+        _sub_queries = maybe_decompose(query)
+    if _sub_queries:
+        chunks = _multi_query_search(
+            query, _sub_queries, fetch_k=_fetch_k, top_k=top_k, user_dept=user_dept,
+            rerank_enable=_av.rerank_enable, multimodal=bool(cosurface_images),
+            query_embedding=_emb,
+        )
+    else:
+        chunks = search_chunks(query, top_k=_fetch_k, user_dept=user_dept, query_embedding=_emb)
+        _cap = get_config().rag.doc_diversity_cap
+        if _av.rerank_enable and chunks:
+            from .reranker import rerank_chunks
+            # multimodal 渲染路径（cosurface_images=True）用 VL 重排；纯文本/钉钉机器人用文本重排。
+            # 文档限额开启时不在重排内截断，先拿全池重排序，再按 cap 选 top_k。
+            chunks = rerank_chunks(query, chunks, top_k=None if _cap > 0 else top_k,
+                                   multimodal=bool(cosurface_images))  # 失败自动降级为原始顺序
+        if _cap > 0:
+            chunks = _select_with_doc_cap(chunks, top_k, _cap)
     if chunks and stitch_window > 0:
         chunks = stitch_neighbor_chunks(chunks, window=stitch_window)
     # Step Card 上下文扩展

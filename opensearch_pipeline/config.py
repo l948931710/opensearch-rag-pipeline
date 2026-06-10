@@ -225,6 +225,36 @@ class RAGConfig:
     # 负例 65% 低（仅 23% 高）；rerank 分区分度（Youden J≈0.60）远优于融合分。
     rerank_score_threshold_high: float = 0.9    # RAG_RERANK_SCORE_THRESHOLD_HIGH
     rerank_score_threshold_medium: float = 0.8  # RAG_RERANK_SCORE_THRESHOLD_MEDIUM
+    # ── 低置信度护栏（soft answerability guard）──────────────────
+    # 离线标定（eval_harness/gate_calibration.json，251 题路由重排 top-1 分）结论：
+    # 正/负分布重叠严重——任何硬闸门要拦截 >30% 负例就要误拒 ≥20% 正例，且部分
+    # 陷阱负例（问不存在的文档/型号，但库里有近似文档）分数高达 0.93+，硬性
+    # "低分即 NO_RESULT" 不可部署。改为软护栏：top 分落入低置信带（< medium 阈值）
+    # 时在 system prompt 末尾追加"逐条核对、不对题必须明确拒答"的强化指令，由能
+    # 读到内容的 LLM 做第二级判别，分数只作先验。RAG_LOW_CONFIDENCE_GUARD 控制。
+    # ✅ 实测（multi_doc_ab v2，26 负例 + 50 正例生成对照）：负例拦截 0.50→0.654
+    # （+4/0 翻转），正例误拒两臂均 0/50，关键词覆盖不变 → 建议生产置 true。
+    low_confidence_guard: bool = False
+    # ── 多意图查询分解（multi-doc retrieval，见 query_decomposer.py）──
+    # off  → 不分解（默认）；auto → 启发式触发后才调 LLM 分解；llm → 每查询都判别。
+    # 跨文档综合问题单查询 R@1 仅 ~8%（topk_window_sweep + 251 题 gold 复确认）：
+    # top-k 被单一最相似文档占满。分解后各子查询并行检索、轮转交错合并。
+    # ⏸️ 实测（multi_doc_ab v2，24 跨文档 + 50 单文档配对）：per-doc coverage 仅
+    # +1.0~1.7pp（CI 下界 0），可分解意图（如"女职工和未成年工"1→3/4 docs）真实
+    # 受益但占比小；~30% 查询触发判别调用 +~1s。单文档 0 回归。维持默认 off，
+    # 若生产 qa_session_log 多意图问题占比可观再启用。详见 reports/multi_doc_guard_findings.md。
+    multi_query_mode: str = "off"   # RAG_MULTI_QUERY_MODE
+    multi_query_max: int = 3        # RAG_MULTI_QUERY_MAX：最多拆出的子查询数
+    decompose_timeout: int = 8      # RAG_DECOMPOSE_TIMEOUT：分解调用超时（秒），失败即不分解
+    # ── 文档多样性限额（doc diversity cap）──────────────────────
+    # 跨文档问题的另一失败形态：问题本身单意图（无从分解），但答案分散在多份文档，
+    # 而 top-k 被最相似文档的 chunk 占满（rerank 池 recall@10≈0.99，第二目标文档
+    # 挤不进 top-7）。>0 时最终 top_k 内同一文档最多保留 cap 条（从重排池回填），
+    # 0 = 关闭。仅在重排开启（有 over-fetch 池）时有实际效果。
+    # ❌ 实测（multi_doc_ab v2）：本语料 cov_frac −2.8pp（CI [−8.3, 0]），未过非劣界，
+    # 单文档丢 1 个 recall@1 —— 轻度有害，保持 0。根因：近重复文档家族（告知书
+    # （新）/（松门）是不同 doc_id）使文档级限额错位换出 gold chunk。
+    doc_diversity_cap: int = 0      # RAG_DOC_DIVERSITY_CAP
     # ── 纯文本生成开关（pure-text mode） ─────────────────────────
     # True  → 生成纯文字回答：system prompt 去掉 <<IMG:N>> 图片插入规则，
     #         context 不再注入 <<IMG:N>> 标记，卡片只展示文字（图片语义仍以
@@ -502,6 +532,11 @@ def load_config() -> PipelineConfig:
             score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM
             rerank_score_threshold_high=_env_float("RERANK_SCORE_THRESHOLD_HIGH", 0.9),
             rerank_score_threshold_medium=_env_float("RERANK_SCORE_THRESHOLD_MEDIUM", 0.8),
+            low_confidence_guard=_env_bool("LOW_CONFIDENCE_GUARD", False),  # RAG_LOW_CONFIDENCE_GUARD
+            multi_query_mode=_env("MULTI_QUERY_MODE", "off").lower(),       # RAG_MULTI_QUERY_MODE
+            multi_query_max=_env_int("MULTI_QUERY_MAX", 3),                 # RAG_MULTI_QUERY_MAX
+            decompose_timeout=_env_int("DECOMPOSE_TIMEOUT", 8),             # RAG_DECOMPOSE_TIMEOUT
+            doc_diversity_cap=_env_int("DOC_DIVERSITY_CAP", 0),             # RAG_DOC_DIVERSITY_CAP
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE
