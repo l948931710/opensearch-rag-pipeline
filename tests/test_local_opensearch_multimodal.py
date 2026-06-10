@@ -264,7 +264,6 @@ def build_test_chunks() -> list:
                 token_count=_estimate_tokens(cd["text"]),
                 raw_text=cd["text"],
                 context_prefix="",
-                embedding_text=cd["text"],
                 page_num=1,
                 section_title=cd.get("section", ""),
                 source_oss_key=f"processing/canonical/{doc_id}/v{version}/content.canonical.json",

@@ -32,8 +32,13 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env.local"))
 os.environ["RAG_ENVIRONMENT"] = "development"
 
 import pymysql
-from opensearch_pipeline.retriever import search_chunks, expand_top_document
+from opensearch_pipeline.retriever import search_chunks
 from opensearch_pipeline.config import get_config
+
+try:  # expand_top_document 已从生产代码移除（deprecated 死代码）；旧版对照模式自动降级跳过
+    from opensearch_pipeline.retriever import expand_top_document
+except ImportError:
+    expand_top_document = None
 
 # ═══════════════════════════════════════════════════════════════
 # 配置
@@ -289,11 +294,11 @@ def main():
             else:
                 hits = cached_hits[:top_k]
 
-            # 旧版策略：先 expand_top_document 再 stitch
-            if use_expand and hits:
+            # 旧版策略：先 expand_top_document 再 stitch（函数已移除时跳过该对照模式）
+            if use_expand and hits and expand_top_document is not None:
                 try:
                     hits = expand_top_document(hits)
-                except Exception as e:
+                except Exception:
                     pass  # expand 失败时回退到原始结果
 
             if not hits:

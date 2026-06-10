@@ -64,7 +64,6 @@ class Chunk:
     token_count: int
     raw_text: str = ""
     context_prefix: str = ""
-    embedding_text: str = ""
 
     # 来源定位
     page_num: Optional[int] = None
@@ -376,7 +375,6 @@ class DocumentChunker:
             token_count=_estimate_tokens(final_text),
             raw_text=raw_body,
             context_prefix=prefix,
-            embedding_text=final_text,
             page_num=page_num,
             section_title=section_title,
             source_oss_key=meta.get("source_oss_key"),
@@ -1454,7 +1452,6 @@ class DocumentChunker:
             if captions:
                 suffix = "\n[图片内容] " + "；".join(c[:120] for c in captions)
                 last.chunk_text += suffix
-                last.embedding_text = last.chunk_text
                 last.token_count = _estimate_tokens(last.chunk_text)
 
         return self._dedup_table_chunks(all_result)
@@ -1561,7 +1558,6 @@ class DocumentChunker:
             if suffix_parts:
                 suffix = "\n" + "\n".join(suffix_parts)
                 target_chunk.chunk_text += suffix
-                target_chunk.embedding_text = target_chunk.chunk_text
                 target_chunk.token_count = _estimate_tokens(target_chunk.chunk_text)
             pending_image_refs = []
 
@@ -1720,7 +1716,6 @@ class DocumentChunker:
                         if suffix_parts:
                             suffix = "\n" + "\n".join(suffix_parts)
                             target_chunk.chunk_text += suffix
-                            target_chunk.embedding_text = target_chunk.chunk_text
                             target_chunk.token_count = _estimate_tokens(target_chunk.chunk_text)
                     else:
                         pending_image_refs.append(img_entry)
@@ -1774,7 +1769,6 @@ class DocumentChunker:
                     if suffix_parts:
                         suffix = "\n" + "\n".join(suffix_parts)
                         chunk.chunk_text += suffix
-                        chunk.embedding_text = chunk.chunk_text
                         chunk.token_count = _estimate_tokens(chunk.chunk_text)
                     pending_image_refs = []
                 chunks.append(chunk)
@@ -1819,7 +1813,6 @@ class DocumentChunker:
             if suffix_parts:
                 suffix = "\n" + "\n".join(suffix_parts)
                 last.chunk_text += suffix
-                last.embedding_text = last.chunk_text
                 last.token_count = _estimate_tokens(last.chunk_text)
 
         # ── Dedup: 去除重复的 table_chunk（DOCX 页眉表格重复问题）──
@@ -2116,7 +2109,6 @@ class DocumentChunker:
                 token_count=_estimate_tokens(text),
                 raw_text=parent.raw_text,
                 context_prefix=parent.context_prefix,
-                embedding_text=text,
                 page_num=parent.page_num,
                 section_title=parent.section_title,
                 source_oss_key=parent.source_oss_key,
@@ -2167,7 +2159,6 @@ class DocumentChunker:
                 token_count=_estimate_tokens(child_text),
                 raw_text="",
                 context_prefix=parent.context_prefix,
-                embedding_text=child_text,
                 page_num=parent.page_num,
                 section_title=parent.section_title,
                 source_oss_key=parent.source_oss_key,

@@ -207,7 +207,6 @@ def extract_and_chunk(file_config: dict, tmp_dir: str) -> list:
             token_count=_estimate_tokens(chunk_text),
             raw_text=chunk_text,
             context_prefix="",
-            embedding_text=chunk_text,
             page_num=page_num,
             section_title="",
             source_oss_key=f"processing/canonical/{doc_id}/v1/content.canonical.json",
@@ -259,7 +258,7 @@ def generate_embeddings(chunks: list):
         "Content-Type": "application/json",
     }
 
-    texts = [c.embedding_text for c in chunks]
+    texts = [c.chunk_text for c in chunks]
     batch_size = 10  # 较小 batch 防止超限
 
     for i in range(0, len(texts), batch_size):

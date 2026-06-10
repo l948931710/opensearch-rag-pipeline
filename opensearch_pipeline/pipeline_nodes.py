@@ -2642,7 +2642,6 @@ def node_chunk_documents(ctx: dict):
                             token_count=_estimate_tokens(chunk_text),
                             raw_text=chunk_text,
                             context_prefix=context_prefix,
-                            embedding_text=chunk_text,
                             page_num=asset.get("page_num", 1),
                             section_title=None,
                             source_oss_key=doc.get("canonical_key", ""),
