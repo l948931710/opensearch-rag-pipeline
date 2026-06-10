@@ -102,8 +102,8 @@ class TestApiAskBookkeeping:
         assert kw["user_id"] == "U9"
         # 已修复（原 KNOWN BUG）：令牌部门现已落库
         assert kw["user_dept"] == "行政部"
-        # KNOWN BUG（D2 翻转为含 "答案正文" 的 JSON）：成功路径不落 content_blocks_json。
-        assert not kw.get("content_blocks_json")
+        # 已修复（原 KNOWN BUG）：成功路径落实际下发的小程序块（序列化 JSON）
+        assert kw["content_blocks_json"] and "答案正文" in kw["content_blocks_json"]
 
     @patch("opensearch_pipeline.api.build_mini_program_blocks", return_value=[])
     @patch("opensearch_pipeline.api.log_qa_session")

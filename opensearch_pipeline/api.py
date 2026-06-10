@@ -364,6 +364,14 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
     latency = int((t_llm - t0) * 1000)
     msg_id = generate_message_id()
 
+    # 小程序图文渲染块（复用 build_content_blocks 核心；纯文字/未引用图片时为 []）。
+    # 先于落库构建：实际下发给客户端的块也要进 qa_session_log（latency 已在 t_llm 定格，不受影响）。
+    try:
+        blocks = build_mini_program_blocks(result["answer"], chunks)
+    except Exception:
+        logger.warning("mini-program blocks 构建失败 (non-fatal)", exc_info=True)
+        blocks = []
+
     # 5. 落库
     log_qa_session(**build_qa_log_kwargs(
         session_id=session_id,
@@ -378,14 +386,8 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
         retrieval_latency_ms=retrieval_latency_ms,
         llm_latency_ms=llm_latency_ms,
         model_name=result.get("model"),
+        content_blocks_json=content_blocks_to_json(blocks) if blocks else None,
     ))
-
-    # 小程序图文渲染块（复用 build_content_blocks 核心；纯文字/未引用图片时为 []）
-    try:
-        blocks = build_mini_program_blocks(result["answer"], chunks)
-    except Exception:
-        logger.warning("mini-program blocks 构建失败 (non-fatal)", exc_info=True)
-        blocks = []
 
     return AskResponse(
         answer=result["answer"],
