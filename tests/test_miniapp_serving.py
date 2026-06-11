@@ -527,6 +527,79 @@ def test_ask_sources_level_passthrough(monkeypatch):
     assert j["sources"][0]["section"] == "第3页"
 
 
+# ── [文档N] 编号引用泄漏（2026-06-10 受控盲评 残余问题 #2，J-r120_21）──
+# 此前 6aed0ca 标记泄漏轮只覆盖 <<IMG:N>>；盲评发现 LLM 会把 _format_context 的
+# 内部编号写进正文当引用（步骤后附「来源：[文档5] …」）。清洗职责在 llm_generator
+# .strip_doc_citations（源头 + /api/ask 服务层 + 流式定稿三处调用）。
+
+def test_strip_doc_citations_attribution_lines():
+    """盲评原样复现：步骤后的「来源：[文档N]…」归因行须整行删除，正文步骤保留。"""
+    from opensearch_pipeline.llm_generator import strip_doc_citations
+    answer = (
+        "**第1步**\n"
+        "进入系统路径：业务导航－>业务工作－>人力资源－>机构合并。\n"
+        "来源：[文档5] 提供了“机构设置”的路径参考，[文档3] 明确指出“机构合并”是主要功能之一。\n"
+        "\n"
+        "**第2步**\n"
+        "执行合并操作。\n"
+        "来源：[文档3]\n"
+        "\n"
+        "*注：参考文档中未提供具体按钮的截图说明。*"
+    )
+    out = strip_doc_citations(answer)
+    assert "文档5" not in out and "文档3" not in out
+    assert "来源：" not in out
+    assert "**第1步**" in out and "进入系统路径" in out
+    assert "执行合并操作" in out
+    assert "*注：参考文档中未提供具体按钮的截图说明。*" in out   # 实质内容行不受归因行规则误伤
+
+
+def test_strip_doc_citations_inline_variants():
+    from opensearch_pipeline.llm_generator import strip_doc_citations
+    # 括号变体 + 聚合形态 + 引导词连带 + markdown 链接形态
+    assert "文档" not in strip_doc_citations("路径在【文档2】中有说明")
+    assert strip_doc_citations("详见[文档3、文档5]") == ""
+    assert "（）" not in strip_doc_citations("入口路径（见[文档3]）如下")  # 不留空括号残壳
+    assert "(" not in strip_doc_citations("操作说明[文档5](oss://k/a.pdf)")  # 链接目标一并清除
+    out = strip_doc_citations("根据（文档1），先打开机构设置。")
+    assert "文档1" not in out and "先打开机构设置" in out
+
+
+def test_strip_doc_citations_preserves_legit_text():
+    from opensearch_pipeline.llm_generator import strip_doc_citations
+    # 非编号引用的正常文本不能误删
+    keep = "本文档介绍机构合并。需上传文档3份，文档编号为 A-32，存入文档管理模块。"
+    assert strip_doc_citations(keep) == keep
+    # <<IMG:N>> 占位符是图文 blocks 的依赖，绝不能被本清洗吞掉
+    assert strip_doc_citations("看图 <<IMG:2>> 说明") == "看图 <<IMG:2>> 说明"
+    assert strip_doc_citations(None) == ""
+    assert strip_doc_citations("") == ""
+
+
+def test_system_prompt_forbids_doc_index_citation():
+    """prompt 规则 8 的「文档N」禁令是第一道防线，确保不被后续 prompt 调优误删。"""
+    from opensearch_pipeline import llm_generator as G
+    assert "文档N" in G._SYSTEM_PROMPT_BASE
+
+
+def test_ask_doc_citation_stripped(monkeypatch):
+    """/api/ask 出口契约：即使 LLM（打桩绕过源头清洗）输出编号引用，响应也不带。"""
+    import opensearch_pipeline.api as api
+    from fastapi.testclient import TestClient
+    chunks = [{"doc_id": "d1", "title": "T", "section_title": "S",
+               "score": 0.92, "rerank_score": 0.92, "chunk_text": "c"}]
+    leaked = "**第1步**\n进入机构合并。\n来源：[文档5] 提供了路径参考，[文档3] 明确指出功能。\n\n**第2步**\n执行合并。\n来源：[文档3]"
+    captured = {}
+    monkeypatch.setattr(api, "_append_to_history",
+                        lambda sid, q, a: captured.setdefault("history_answer", a))
+    _wire_ask(monkeypatch, api, chunks, leaked)
+    j = TestClient(api.app).post("/api/ask", json={"question": "部门合并怎么操作"}).json()
+    assert "[文档" not in j["answer"] and "来源：" not in j["answer"]
+    assert "**第1步**" in j["answer"] and "执行合并" in j["answer"]
+    # 编号引用入史会诱导后续轮模仿 → 历史里也必须是清洗后的版本
+    assert "[文档" not in captured["history_answer"]
+
+
 # ── llm_generator：score_level / 档位标签同源 / 页码回退 / 置信带拆分 ──
 
 def test_score_level_rerank_scale():

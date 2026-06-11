@@ -27,6 +27,7 @@ from opensearch_pipeline.llm_generator import (
     generate_answer_stream,
     is_low_confidence_band,
     parse_sse_data_frame,
+    strip_doc_citations,
 )
 from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
 from opensearch_pipeline.dingtalk_bot import router as dingtalk_router
@@ -415,6 +416,11 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
         ))
         raise HTTPException(status_code=500, detail=f"回答生成失败，请联系管理员 (trace: {trace_id})")
 
+    # [文档N] 编号引用清洗：generate_answer 已在源头清过，这里再过一遍是服务层契约
+    # （/api/ask 出口绝不带内部编号）。与 <<IMG:N>> 不同：编号引用对 blocks/历史/落库
+    # 都没有下游用途，且入史会诱导后续轮模仿 → 在一切消费之前清理。
+    result["answer"] = strip_doc_citations(result["answer"])
+
     # 4. 更新会话历史（统一策略：仅非空 SUCCESS 回答入史）
     if should_append_history(result["answer"], "SUCCESS"):
         _append_to_history(session_id, req.question, result["answer"])
@@ -569,8 +575,10 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
                     elif frame.get("type") == "done":
                         model_name = frame.get("model")
 
-                # 正常完成：图文模式下补发 content_blocks 帧（图片须在全文完成后定稿）
-                full_answer = "".join(collected_answer)
+                # 正常完成：图文模式下补发 content_blocks 帧（图片须在全文完成后定稿）。
+                # [文档N] 引用清洗只能作用在定稿（chunk 帧已流出，标记可能跨帧切断）：
+                # 流中残留靠 prompt 规则 8 压制，blocks/历史/落库由这里兜底。
+                full_answer = strip_doc_citations("".join(collected_answer))
                 if full_answer and not _pure:
                     try:
                         blocks = build_content_blocks(full_answer, chunks)
@@ -593,7 +601,7 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
         finally:
             # 无论正常结束还是客户端中途断开（GeneratorExit），都写历史 + 落库，
             # 保证流式回答可被反馈/分析（落库函数自身吞掉异常，绝不影响回复）
-            full_answer = "".join(collected_answer)
+            full_answer = strip_doc_citations("".join(collected_answer))
             # 统一策略：仅非空 SUCCESS 回答入史 —— 出错前的半截回答不再污染后续轮次上下文
             if should_append_history(full_answer, answer_status):
                 _append_to_history(session_id, req.question, full_answer)
