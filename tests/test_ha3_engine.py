@@ -4,7 +4,7 @@ test_ha3_engine.py — HA3 Engine 推送/删除逻辑的单元测试
 
 无需阿里云实例。通过 Mock SDK 对象验证：
 1. HA3 请求构造 (to_ha3_doc 字段映射)
-2. pushDocuments 成功/部分失败/全部失败的响应解析
+2. push_documents 成功/部分失败/全部失败的响应解析
 3. 瞬时错误指数退避重试机制
 4. HA3 删除的幂等判断 (not_found → 视为成功)
 """
@@ -78,12 +78,21 @@ class TestHA3DocMapping:
         assert doc["custom_pk"] == _stable_pk_from_chunk_id("doc1_v1_c0001")
         assert "id" not in doc
 
-    def test_vector_serialized_as_comma_string(self):
-        """HA3 不支持 JSON 数组，向量必须序列化为逗号分隔的浮点字符串。"""
+    def test_dense_vector_serialized_as_float_list(self):
+        """稠密向量以 dense_vector 字段输出为浮点列表（SDK JSON 序列化）。"""
         chunk = self._make_chunk(embedding_vector=[0.1, -0.2, 0.33333])
         doc = chunk.to_ha3_doc()
-        assert isinstance(doc["chunk_vector"], str)
-        assert doc["chunk_vector"] == "0.1,-0.2,0.33333"
+        assert isinstance(doc["dense_vector"], list)
+        assert doc["dense_vector"] == [0.1, -0.2, 0.33333]
+
+    def test_sparse_vector_serialized_as_parallel_lists(self):
+        """稀疏向量以 indices/values 两个平行列表输出。"""
+        chunk = self._make_chunk()
+        chunk.sparse_vector_indices = [3, 17, 42]
+        chunk.sparse_vector_values = [0.9, 0.5, 0.1]
+        doc = chunk.to_ha3_doc()
+        assert doc["sparse_vector_indices"] == [3, 17, 42]
+        assert doc["sparse_vector_values"] == [0.9, 0.5, 0.1]
 
     def test_boolean_serialized_as_int(self):
         """HA3 布尔字段使用 int (0/1) 而非 JSON boolean。"""
@@ -93,10 +102,10 @@ class TestHA3DocMapping:
         assert chunk_inactive.to_ha3_doc()["is_active"] == 0
 
     def test_no_vector_field_when_embedding_is_none(self):
-        """无向量时不应包含 chunk_vector 字段。"""
+        """无向量时不应包含 dense_vector 字段。"""
         chunk = self._make_chunk(embedding_vector=None)
         doc = chunk.to_ha3_doc()
-        assert "chunk_vector" not in doc
+        assert "dense_vector" not in doc
 
     def test_null_metadata_defaults(self):
         """metadata 缺失时应使用安全默认值。"""
@@ -140,7 +149,7 @@ class TestHA3PushResponseParsing:
         mock_resp.body = {}
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(return_value=mock_resp)
+        client.push_documents = MagicMock(return_value=mock_resp)
         mock_get_client.return_value = client
 
         chunks = self._make_chunks(3)
@@ -175,7 +184,7 @@ class TestHA3PushResponseParsing:
         }
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(return_value=mock_resp)
+        client.push_documents = MagicMock(return_value=mock_resp)
         mock_get_client.return_value = client
 
         chunks = self._make_chunks(3)
@@ -208,7 +217,7 @@ class TestHA3PushResponseParsing:
         mock_resp.body = "Bad Request: invalid schema"
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(return_value=mock_resp)
+        client.push_documents = MagicMock(return_value=mock_resp)
         mock_get_client.return_value = client
 
         chunks = self._make_chunks(2)
@@ -243,7 +252,7 @@ class TestHA3PushResponseParsing:
         resp_200.body = {}
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(side_effect=[resp_429, resp_200])
+        client.push_documents = MagicMock(side_effect=[resp_429, resp_200])
         mock_get_client.return_value = client
 
         chunks = self._make_chunks(2)
@@ -259,7 +268,7 @@ class TestHA3PushResponseParsing:
 
         node_push_to_opensearch(ctx)
 
-        assert client.pushDocuments.call_count == 2
+        assert client.push_documents.call_count == 2
         mock_sleep.assert_called()
         for c in chunks:
             assert c.index_status == "INDEXED"
@@ -272,7 +281,7 @@ class TestHA3PushResponseParsing:
         from opensearch_pipeline.pipeline_nodes import node_push_to_opensearch
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(side_effect=ConnectionError("Network unreachable"))
+        client.push_documents = MagicMock(side_effect=ConnectionError("Network unreachable"))
         mock_get_client.return_value = client
 
         chunks = self._make_chunks(1)
@@ -322,7 +331,7 @@ class TestHA3DeleteIdempotency:
         mock_resp.json = MagicMock(side_effect=Exception("no json"))
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(return_value=mock_resp)
+        client.push_documents = MagicMock(return_value=mock_resp)
         mock_get_client.return_value = client
 
         new_chunk = Chunk(
@@ -351,7 +360,7 @@ class TestHA3DeleteIdempotency:
         mock_resp.json = MagicMock(return_value={"code": "DocumentNotFound", "message": "doc not exists"})
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(return_value=mock_resp)
+        client.push_documents = MagicMock(return_value=mock_resp)
         mock_get_client.return_value = client
 
         new_chunk = Chunk(
@@ -379,7 +388,7 @@ class TestHA3DeleteIdempotency:
         mock_resp.json = MagicMock(side_effect=Exception("no json"))
 
         client = MagicMock()
-        client.pushDocuments = MagicMock(return_value=mock_resp)
+        client.push_documents = MagicMock(return_value=mock_resp)
         mock_get_client.return_value = client
 
         new_chunk = Chunk(

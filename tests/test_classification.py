@@ -15,6 +15,7 @@ from opensearch_pipeline.pipeline_nodes import (
 )
 from opensearch_pipeline.spot_checker import run_spot_check_pipeline
 from opensearch_pipeline.config import get_config
+from tests.local_stack import requires_local_db
 
 @pytest.fixture(autouse=True)
 def force_gemini_config():
@@ -122,6 +123,7 @@ class TestLiveClassificationPipeline:
         assert doc["llm_risk_level"] == "low"
         assert doc["classification_status"] == "CONTENT_CLASSIFIED"
 
+    @requires_local_db
     @mock.patch("opensearch_pipeline.pipeline_nodes.run_gemini_classification")
     def test_low_confidence_no_quarantine(self, mock_gemini):
         """测试置信度低于 0.85 时，记录警告但继续正常入库（review 机制已关闭）。"""
@@ -177,6 +179,7 @@ class TestLiveClassificationPipeline:
             assert float(ver[1]) == 0.72
         conn.close()
 
+    @requires_local_db
     @mock.patch("opensearch_pipeline.pipeline_nodes.run_gemini_classification")
     def test_api_failure_failsafe(self, mock_gemini):
         """测试 Gemini API 调用超时或出错时，触发 Fail-Safe 安全保护及 review_task 注册。"""
@@ -231,6 +234,7 @@ class TestLiveClassificationPipeline:
             assert ver[2] == "high"
         conn.close()
 
+    @requires_local_db
     @mock.patch("requests.post")
     def test_gemini_classification_markdown_json_parsing(self, mock_post):
         """测试 Gemini API 返回带 Markdown 围栏的 JSON 时，能够被稳健解析且不触发隔离。"""
@@ -298,6 +302,7 @@ class TestLiveClassificationPipeline:
             assert count == 0
         conn.close()
 
+    @requires_local_db
     @mock.patch("opensearch_pipeline.pipeline_nodes.run_gemini_classification")
     def test_api_failure_exceptionally_long_error_truncation(self, mock_gemini):
         """测试 Gemini API 抛出极其庞大的错误信息（超过 1000 字符）时，
@@ -377,6 +382,7 @@ class TestLiveClassificationPipeline:
 class TestSpotCheckerSafetyDaemon:
     """定时抽检及 mismatches 隔离删除测试。"""
 
+    @requires_local_db
     @mock.patch("requests.post")
     def test_spot_check_permission_leak_quarantine(self, mock_post):
         """测试已发布文档在抽检时被识别出权限泄露时，自动触发彻底下线和删除。"""
@@ -468,6 +474,7 @@ class TestSpotCheckerSafetyDaemon:
             assert task[2] == "restricted"
         conn.close()
 
+    @requires_local_db
     def test_local_real_simulation_mode(self):
         """测试本地真实模拟模式：simulate=False, simulate_api=True。"""
         doc = {

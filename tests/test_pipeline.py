@@ -6,6 +6,8 @@ test_pipeline.py — DAG 端到端集成测试
 import pytest
 from datetime import datetime
 
+from tests.local_stack import requires_local_db, requires_local_opensearch
+
 @pytest.fixture(autouse=True)
 def reset_db_state():
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
@@ -414,8 +416,11 @@ class TestDynamicRoutingScenario:
 class TestBulkPayloadSplitting:
     """验证 OpenSearch bulk payload 自动切分与 sub-job 跟踪。"""
 
+    @requires_local_db
+    @requires_local_opensearch
     def test_bulk_payload_splitting_over_limit(self):
-        """设定非常小的 max_bulk_size_bytes 触发贪心切分，并验证多 batch 跟踪。"""
+        """设定非常小的 max_bulk_size_bytes 触发贪心切分，并验证多 batch 跟踪。
+        本地栈集成测试：真实写本地 MySQL（opensearch_bulk_job）+ 真实推送本地 OpenSearch。"""
         from opensearch_pipeline.chunker import Chunk
         from opensearch_pipeline.pipeline_nodes import (
             node_build_opensearch_payload,
@@ -775,79 +780,87 @@ class TestStage3ProductionLoaderRegression:
 
     def test_stage3_production_loader_no_crash(self, monkeypatch):
         # 1. 准备 Mock 数据库数据
+        # 列序与 run_stage(stage=3) 生产 SELECT 对齐：
+        # cm.id 在首位（HA3 主键 = chunk_meta.id → rds_id），doc_title 在末位（JOIN document_meta）
         mock_row_1 = (
-            "test_chunk_id_001",       # 0: chunk_id
-            "test_doc_id",            # 1: doc_id
-            1,                         # 2: version_no
-            0,                         # 3: chunk_index
-            2,                         # 4: page_num
-            "Section 1",               # 5: section_title
-            "http://oss.com/raw.pdf",  # 6: source_url (maps to source_url / source_oss_key)
-            "text_chunk",              # 7: chunk_type
-            "This is chunk text",      # 8: chunk_text
-            10,                        # 9: token_count
-            "native",                  # 10: source
-            "rag-ready/public/admin/policy/test_doc_id/v1/content.md", # 11: rag_ready_key
-            "PUBLIC",                  # 12: permission_level
-            "admin",                   # 13: owner_dept
-            "policy",                  # 14: category_l1
-            "hr_policy",               # 15: category_l2
-            1,                         # 16: sensitive_redacted
-            1,                         # 17: is_active
-            "NOT_STARTED",             # 18: embedding_status
-            "NOT_INDEXED",             # 19: index_status
-            "gemini-embedding-2",      # 20: embedding_model
-            '{"custom_key": "custom_val"}' # 21: extra_json
+            101,                       # 0: cm.id (rds_id → HA3 主键)
+            "test_chunk_id_001",       # 1: chunk_id
+            "test_doc_id",            # 2: doc_id
+            1,                         # 3: version_no
+            0,                         # 4: chunk_index
+            2,                         # 5: page_num
+            "Section 1",               # 6: section_title
+            "http://oss.com/raw.pdf",  # 7: source_url (maps to source_url / source_oss_key)
+            "text_chunk",              # 8: chunk_type
+            "This is chunk text",      # 9: chunk_text
+            10,                        # 10: token_count
+            "native",                  # 11: source
+            "rag-ready/public/admin/policy/test_doc_id/v1/content.md", # 12: rag_ready_key
+            "PUBLIC",                  # 13: permission_level
+            "admin",                   # 14: owner_dept
+            "policy",                  # 15: category_l1
+            "hr_policy",               # 16: category_l2
+            1,                         # 17: sensitive_redacted
+            1,                         # 18: is_active
+            "NOT_STARTED",             # 19: embedding_status
+            "NOT_INDEXED",             # 20: index_status
+            "gemini-embedding-2",      # 21: embedding_model
+            '{"custom_key": "custom_val"}', # 22: extra_json
+            "测试文档标题",              # 23: doc_title
         )
 
         mock_row_fallback = (
-            "test_chunk_id_002",       # 0: chunk_id
-            "test_doc_id",            # 1: doc_id
-            1,                         # 2: version_no
-            1,                         # 3: chunk_index
-            3,                         # 4: page_num
-            "Section 2",               # 5: section_title
-            "http://oss.com/raw2.pdf", # 6: source_url (maps to source_url / source_oss_key)
-            "text_chunk",              # 7: chunk_type
-            "This is fallback text",   # 8: chunk_text
-            12,                        # 9: token_count
-            "native",                  # 10: source
-            None,                      # 11: rag_ready_key (NULL)
-            "PUBLIC",                  # 12: permission_level
-            "admin",                   # 13: owner_dept
-            "policy",                  # 14: category_l1
-            "hr_policy",               # 15: category_l2
-            1,                         # 16: sensitive_redacted
-            1,                         # 17: is_active
-            "NOT_STARTED",             # 18: embedding_status
-            "NOT_INDEXED",             # 19: index_status
-            "gemini-embedding-2",      # 20: embedding_model
-            None                       # 21: extra_json (NULL)
+            102,                       # 0: cm.id (rds_id)
+            "test_chunk_id_002",       # 1: chunk_id
+            "test_doc_id",            # 2: doc_id
+            1,                         # 3: version_no
+            1,                         # 4: chunk_index
+            3,                         # 5: page_num
+            "Section 2",               # 6: section_title
+            "http://oss.com/raw2.pdf", # 7: source_url (maps to source_url / source_oss_key)
+            "text_chunk",              # 8: chunk_type
+            "This is fallback text",   # 9: chunk_text
+            12,                        # 10: token_count
+            "native",                  # 11: source
+            None,                      # 12: rag_ready_key (NULL)
+            "PUBLIC",                  # 13: permission_level
+            "admin",                   # 14: owner_dept
+            "policy",                  # 15: category_l1
+            "hr_policy",               # 16: category_l2
+            1,                         # 17: sensitive_redacted
+            1,                         # 18: is_active
+            "NOT_STARTED",             # 19: embedding_status
+            "NOT_INDEXED",             # 20: index_status
+            "gemini-embedding-2",      # 21: embedding_model
+            None,                      # 22: extra_json (NULL)
+            "",                        # 23: doc_title (COALESCE 空串)
         )
 
         mock_row_dict_extra = (
-            "test_chunk_id_003",       # 0: chunk_id
-            "test_doc_id",            # 1: doc_id
-            1,                         # 2: version_no
-            2,                         # 3: chunk_index
-            4,                         # 4: page_num
-            "Section 3",               # 5: section_title
-            "http://oss.com/raw3.pdf", # 6: source_url
-            "text_chunk",              # 7: chunk_type
-            "This is pre-parsed text", # 8: chunk_text
-            15,                        # 9: token_count
-            "native",                  # 10: source
-            "rag-ready/key3.md",       # 11: rag_ready_key
-            "PUBLIC",                  # 12: permission_level
-            "admin",                   # 13: owner_dept
-            "policy",                  # 14: category_l1
-            "hr_policy",               # 15: category_l2
-            1,                         # 16: sensitive_redacted
-            1,                         # 17: is_active
-            "NOT_STARTED",             # 18: embedding_status
-            "NOT_INDEXED",             # 19: index_status
-            "gemini-embedding-2",      # 20: embedding_model
-            {"pre_parsed": True}       # 21: extra_json is a DICT!
+            103,                       # 0: cm.id (rds_id)
+            "test_chunk_id_003",       # 1: chunk_id
+            "test_doc_id",            # 2: doc_id
+            1,                         # 3: version_no
+            2,                         # 4: chunk_index
+            4,                         # 5: page_num
+            "Section 3",               # 6: section_title
+            "http://oss.com/raw3.pdf", # 7: source_url
+            "text_chunk",              # 8: chunk_type
+            "This is pre-parsed text", # 9: chunk_text
+            15,                        # 10: token_count
+            "native",                  # 11: source
+            "rag-ready/key3.md",       # 12: rag_ready_key
+            "PUBLIC",                  # 13: permission_level
+            "admin",                   # 14: owner_dept
+            "policy",                  # 15: category_l1
+            "hr_policy",               # 16: category_l2
+            1,                         # 17: sensitive_redacted
+            1,                         # 18: is_active
+            "NOT_STARTED",             # 19: embedding_status
+            "NOT_INDEXED",             # 20: index_status
+            "gemini-embedding-2",      # 21: embedding_model
+            {"pre_parsed": True},      # 22: extra_json is a DICT!
+            "测试文档标题",              # 23: doc_title
         )
 
         # 2. Mock 数据库 Connection / Cursor
@@ -887,6 +900,9 @@ class TestStage3ProductionLoaderRegression:
 
                 # 验证第一个 Chunk (带有有效的 rag_ready_key)
                 c1 = chunks[0]
+                # rds_id 必须取自 cm.id —— 它是 to_ha3_doc 的主键，重推/删除都靠它对齐
+                assert c1.rds_id == 101
+                assert c1.title == "测试文档标题"
                 assert c1.chunk_id == "test_chunk_id_001"
                 assert c1.doc_id == "test_doc_id"
                 assert c1.version_no == 1
@@ -915,6 +931,7 @@ class TestStage3ProductionLoaderRegression:
 
                 # 验证第二个 Chunk (rag_ready_key 为 NULL，触发 fallback)
                 c2 = chunks[1]
+                assert c2.rds_id == 102
                 assert c2.chunk_id == "test_chunk_id_002"
                 # source_oss_key 应 fallback 映射为 source_url
                 assert c2.source_oss_key == "http://oss.com/raw2.pdf"
@@ -923,6 +940,7 @@ class TestStage3ProductionLoaderRegression:
 
                 # 验证第三个 Chunk (extra_json 已经是 dict 格式)
                 c3 = chunks[2]
+                assert c3.rds_id == 103
                 assert c3.chunk_id == "test_chunk_id_003"
                 assert c3.source_oss_key == "rag-ready/key3.md"
                 assert c3.extra["pre_parsed"] is True

@@ -151,11 +151,13 @@ class TestUnifiedExtractor:
         assert len(tables) == 1
 
     def test_unsupported_file_type(self):
+        # pptx 已有真实 extractor；.xls（旧版二进制 Excel）是按决策显式不支持的类型，
+        # 必须走 _unsupported 给出可见警告，而非静默路由进 _extract_xlsx。
         task = {
             "doc_id": "DOC_TEST_004",
             "version_no": 1,
-            "file_ext": "pptx",
-            "raw_key": "raw/admin/test.pptx",
+            "file_ext": "xls",
+            "raw_key": "raw/admin/test.xls",
         }
         result = self.extractor.extract(task)
         assert "unsupported" in result.extract_method

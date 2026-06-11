@@ -170,7 +170,7 @@ class Chunk:
 
         HA3 与标准 OpenSearch 的关键差异:
         - 主键字段名由 HA3 表结构定义决定（通过 pk_field 参数传入）
-        - 向量字段不支持 JSON 数组，需要序列化为逗号分隔的浮点字符串
+        - 稠密向量走 dense_vector 浮点列表，稀疏向量拆 indices/values 平行列表（SDK JSON 序列化）
         - 布尔字段使用 int (0/1) 而非 JSON boolean
         - 不支持嵌套对象字段
         """

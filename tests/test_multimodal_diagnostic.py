@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-test_multimodal_diagnostic.py — 多模态管线现状诊断测试
+test_multimodal_diagnostic.py — 多模态管线行为契约测试
 
-目的：修复前先验证现有管线对图片的处理行为，确认：
+最初是多模态修复前的"现状诊断"快照；多模态管线落地后升级为当前契约的回归测试：
   1. 现有 test data (normal/sensitive/multi) 确实不含图片
-  2. 含图片 asset 的 mock task 可以正确创建 image chunk
-  3. to_ha3_doc() 静默丢弃了图像相关字段
-  4. local_path 指向的文件在 embedding 阶段已不存在
-  5. 模拟模式下 source_image_vector 能正确生成
+  2. 含图片 asset 的 mock task 可以正确创建 image chunk（[图片描述] + 文档标题前缀）
+  3. to_ha3_doc() 携带 source_image / visual_summary 元数据（多模态修复后的契约）
+  4. 独立图像向量（One-Peace source_image_vector）已废弃：图片 chunk 经 chunk_text
+     走统一 text-embedding-v4 路径，不再依赖 local_path 本地文件
 """
 
 import os
@@ -117,31 +117,33 @@ class TestImageChunkCreation:
         assert len(image_chunks) == 1, f"Expected 1 image chunk, got {len(image_chunks)}"
         img = image_chunks[0]
 
-        # 验证 image chunk 的结构
-        assert "[Image Schematic]" in img.chunk_text
+        # 验证 image chunk 的结构：标题前缀 + [图片描述] + visual_summary
+        assert "[图片描述]" in img.chunk_text
+        assert "【文档:注塑车间工艺流程图.docx】" in img.chunk_text
         assert "注塑车间工艺流程图" in img.chunk_text
         assert img.extra.get("source_image") is not None
         assert "workflow_diagram.png" in img.extra["source_image"]
-        assert img.extra.get("source_image_vector") is None  # 还没做 embedding
-        assert img.extra.get("local_path") == "/tmp/nonexistent/DOC_DIAG_IMG_001_workflow_diagram.png"
+        assert img.extra.get("visual_summary") == "注塑车间工艺流程图，展示从原料到成品的完整流程"
+        # One-Peace 图像向量已废弃：extra 不再依赖 local_path / source_image_vector
+        assert img.extra.get("source_image_vector") is None
+        assert "local_path" not in img.extra
 
         print(f"\n  ✅ Image chunk created successfully:")
         print(f"     chunk_type = {img.chunk_type}")
         print(f"     chunk_text = {img.chunk_text[:80]}...")
         print(f"     source_image = {img.extra['source_image']}")
-        print(f"     local_path = {img.extra['local_path']}")
         print(f"     Text chunks: {len(text_chunks)}")
 
 
 # ═══════════════════════════════════════════════════════════════
-# 测试组 3：to_ha3_doc() 丢弃图像字段验证
+# 测试组 3：to_ha3_doc() 图像元数据字段验证（多模态修复后的契约）
 # ═══════════════════════════════════════════════════════════════
 
 class TestHA3DocFieldCoverage:
-    """验证 to_ha3_doc() 输出中缺少图像相关字段。"""
+    """验证 to_ha3_doc() 携带图像元数据、且不携带已废弃的图像向量。"""
 
-    def test_to_ha3_doc_drops_image_fields(self):
-        """to_ha3_doc() 输出不包含 source_image, visual_summary, source_image_vector。"""
+    def test_to_ha3_doc_carries_image_metadata_fields(self):
+        """to_ha3_doc() 包含 source_image / visual_summary；source_image_vector（One-Peace）已废弃。"""
         img_chunk = Chunk(
             chunk_id="DIAG_IMG_CHUNK_001",
             doc_id="DOC_DIAG_001",
@@ -154,6 +156,7 @@ class TestHA3DocFieldCoverage:
             permission_level="public",
             extra={
                 "source_image": "processing/assets/production/DOC_DIAG_001/v1/workflow.png",
+                "visual_summary": "注塑车间工艺流程图",
                 "source_image_vector": [0.1] * 768,
                 "local_path": "/tmp/fake/workflow.png",
             }
@@ -164,21 +167,25 @@ class TestHA3DocFieldCoverage:
         ha3_doc = img_chunk.to_ha3_doc(pk_field="id")
         os_doc = img_chunk.to_opensearch_doc()
 
-        # ─── HA3 doc: 验证缺失的字段 ───
+        # ─── HA3 doc: 图像元数据透传（serving 真图渲染依赖 source_image）───
         ha3_fields = set(ha3_doc.keys())
-        assert "source_image" not in ha3_fields, "to_ha3_doc() 不应该有 source_image 但可能有"
-        assert "source_image_vector" not in ha3_fields, "to_ha3_doc() 不应该有 source_image_vector"
-        assert "visual_summary" not in ha3_fields, "to_ha3_doc() 不应该有 visual_summary"
-        
-        # 但 chunk_type 字段应该存在
+        assert ha3_doc.get("source_image") == \
+            "processing/assets/production/DOC_DIAG_001/v1/workflow.png", \
+            "to_ha3_doc() 必须透传 extra.source_image（DingTalk 卡片/小程序真图渲染依赖它）"
+        assert "visual_summary" in ha3_fields, "to_ha3_doc() 应透传 visual_summary"
+        # One-Peace 独立图像向量已废弃，不应再进索引
+        assert "source_image_vector" not in ha3_fields, \
+            "source_image_vector（One-Peace）已废弃，不应出现在 HA3 doc"
+
+        # chunk_type 字段应该存在
         assert "chunk_type" in ha3_fields, "to_ha3_doc() 应包含 chunk_type"
         assert ha3_doc["chunk_type"] == "image"
 
-        print(f"\n  ✅ to_ha3_doc() 字段验证 — 确认缺少图像字段:")
+        print(f"\n  ✅ to_ha3_doc() 字段验证 — 图像元数据透传:")
         print(f"     HA3 doc fields: {sorted(ha3_fields)}")
-        print(f"     source_image: ❌ 缺失")
-        print(f"     source_image_vector: ❌ 缺失")
-        print(f"     visual_summary: ❌ 缺失")
+        print(f"     source_image: ✅ 透传")
+        print(f"     visual_summary: ✅ 透传")
+        print(f"     source_image_vector: ❌ 已废弃（One-Peace）")
         print(f"     chunk_type: ✅ 已有 (value='{ha3_doc['chunk_type']}')")
 
         # ─── OpenSearch doc: 验证有条件输出 ───
@@ -235,8 +242,9 @@ class TestLocalPathLifecycle:
 
     def test_embedding_silently_skips_missing_local_path(self):
         """
-        模拟 DAG 3 的 node_generate_embeddings 处理一个 local_path 指向不存在文件的 image chunk，
-        验证它被静默跳过（不报错，但 source_image_vector 保持 None）。
+        模拟 DAG 3 的 node_generate_embeddings 处理一个 local_path 指向不存在文件的 image chunk：
+        不报错，文本 embedding 照常生成；One-Peace 图像向量已废弃，
+        source_image_vector 保持 None（图片检索完全依赖 chunk_text 的统一文本向量）。
         """
         from opensearch_pipeline.pipeline_nodes import node_generate_embeddings
 
@@ -264,17 +272,18 @@ class TestLocalPathLifecycle:
 
         node_generate_embeddings(ctx)
 
-        # 模拟模式下应该生成 fake vector
+        # 模拟模式下文本 embedding 照常生成（统一 text-embedding 路径，维度跟随配置）
+        from opensearch_pipeline.config import get_config
         assert img_chunk.embedding_vector is not None, "文本 embedding 应该已生成"
-        assert len(img_chunk.embedding_vector) > 0
+        assert len(img_chunk.embedding_vector) == get_config().embedding.dimension
+        assert img_chunk.embedding_status == "DONE"
 
-        # 关键检查：模拟模式下 source_image_vector 应该被 fake 填充
-        sim_vector = img_chunk.extra.get("source_image_vector")
-        assert sim_vector is not None, "模拟模式下 source_image_vector 应已被 fake 填充"
-        assert len(sim_vector) == 768, f"Expected 768-dim vector, got {len(sim_vector)}"
+        # 关键检查：One-Peace 已废弃，source_image_vector 不再被填充（即使 local_path 失效也不报错）
+        assert img_chunk.extra.get("source_image_vector") is None, \
+            "One-Peace 图像向量已废弃，embedding 阶段不应再填充 source_image_vector"
 
-        print(f"\n  ✅ 模拟模式: source_image_vector 已生成 ({len(sim_vector)} 维)")
-        print(f"     embedding_vector: {len(img_chunk.embedding_vector)} 维")
+        print(f"\n  ✅ 模拟模式: 统一文本向量已生成 ({len(img_chunk.embedding_vector)} 维)")
+        print(f"     source_image_vector: None（One-Peace 已废弃）")
         print(f"     local_path: {img_chunk.extra['local_path']}")
         print(f"     local_path exists: {os.path.exists(img_chunk.extra['local_path'])}")
 
@@ -444,13 +453,12 @@ class TestFullPipelineWithImageAsset:
             print(f"     HA3 image vector: {'✅' if ha3_has_vector else '❌ 缺失'}")
             print(f"     OS source_image_vector: {'✅' if os_has_vector else '❌ 缺失'}")
 
-            # 断言验证
-            assert not ha3_has_source, "BUG CONFIRMED: to_ha3_doc() 不输出 source_image"
-            assert not ha3_has_vector, "BUG CONFIRMED: to_ha3_doc() 不输出 image vector"
+            # 断言验证（多模态修复后的契约）
+            assert ha3_has_source, "to_ha3_doc() 必须透传 source_image（serving 真图渲染依赖）"
+            assert not ha3_has_vector, "One-Peace 图像向量已废弃，不应出现在 HA3 doc"
 
-        print(f"\n  🔍 诊断结论:")
+        print(f"\n  🔍 契约结论:")
         print(f"     1. 图片 chunk 创建: ✅ 正常")
-        print(f"     2. 模拟 embedding 生成: ✅ 正常 (768维)")
-        print(f"     3. to_ha3_doc() 输出: ❌ 丢弃了 source_image 和 source_image_vector")
-        print(f"     4. local_path 生命周期: ❌ 指向已删除的 tmp_dir")
-        print(f"     5. 生产模式下 One-Peace 调用: ❌ 会被静默跳过 (os.path.exists=False)")
+        print(f"     2. 模拟 embedding 生成: ✅ 正常（统一文本向量路径）")
+        print(f"     3. to_ha3_doc() 输出: ✅ 透传 source_image / visual_summary")
+        print(f"     4. 独立图像向量: ❌ One-Peace 已废弃（检索靠 chunk_text 文本向量）")

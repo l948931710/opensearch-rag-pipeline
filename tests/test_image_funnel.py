@@ -20,6 +20,7 @@ from opensearch_pipeline.pipeline_nodes import (
     _get_db_conn
 )
 from opensearch_pipeline.extraction.ocr_client import OCRResult
+from tests.local_stack import requires_local_db
 
 
 @pytest.fixture
@@ -148,7 +149,9 @@ class TestImageFunnelThreeStages:
         
         result = processor.process_image(img_path, doc_id="doc1", is_public=True)
         assert result["status"] == "ROUTE_TO_VECTOR"
-        assert "[Simulated Multimodal Caption]" in result["visual_summary"]
+        # 模拟 VLM caption（883605c 起的文案）：必须带 [Simulated] 标记且回填 doc_id
+        assert result["visual_summary"].startswith("[Simulated]")
+        assert "doc1" in result["visual_summary"]
 
 
 class TestDegradedVlmNotCached:
@@ -266,6 +269,7 @@ class TestPlainRawBypassRule:
 class TestParentRiskPropagation:
     """测试子资产敏感风险自动向上传递给父文档的联动机制。"""
 
+    @requires_local_db
     def test_sensitive_asset_propagates_high_risk_to_parent(self):
         """测试如果子图片被审计为 QUARANTINE_SENSITIVE，父文档的 risk_level 自动被判定为 high 并标记 sensitive_detected=True。"""
         # 1. 插入临时父文档到 RDS
