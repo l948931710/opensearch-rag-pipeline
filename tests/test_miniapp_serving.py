@@ -563,6 +563,9 @@ def test_strip_doc_citations_inline_variants():
     assert "(" not in strip_doc_citations("操作说明[文档5](oss://k/a.pdf)")  # 链接目标一并清除
     out = strip_doc_citations("根据（文档1），先打开机构设置。")
     assert "文档1" not in out and "先打开机构设置" in out
+    # 引导词在括号内的形态（2026-06-11 r4 实测穿透）：「（见文档1、文档5）」
+    out2 = strip_doc_citations("仅提到佩戴黑色腕带（见文档1、文档5），但未说明型号。")
+    assert "文档" not in out2 and "黑色腕带" in out2 and "未说明型号" in out2
 
 
 def test_strip_doc_citations_preserves_legit_text():
@@ -604,6 +607,22 @@ def test_strip_doc_citations_title_source_section():
     # 行式：强标题词同行带《标题》
     out3 = strip_doc_citations("按规定执行。\n资料来源：《考勤管理办法》第3章")
     assert "资料来源" not in out3 and "按规定执行" in out3
+
+
+def test_strip_doc_citations_bare_source_reflist_line():
+    """裸「来源：」纯文档引用列表行整删（2026-06-11 实测形态）；含实质内容的不动。"""
+    from opensearch_pipeline.llm_generator import strip_doc_citations
+    ans = ("年终奖按事假分档。\n\n"
+           "来源：《员工手册202108月.docx》、《A8休假请假管理标准.docx》")
+    out = strip_doc_citations(ans)
+    assert "来源" not in out and "员工手册" not in out and "年终奖按事假分档" in out
+    # 单文档 + 句号变体
+    assert "来源" not in strip_doc_citations("规定如上。\n来源：《考勤管理办法》。")
+    # 实质内容行保留（弱词 + 非纯引用）
+    keep = "来源：内部口头通知，未见于正式文件"
+    assert strip_doc_citations(keep) == keep
+    keep2 = "数据来源：U8 系统导出报表，每日更新"
+    assert strip_doc_citations(keep2) == keep2
 
 
 def test_strip_doc_citations_title_section_no_false_positive():
