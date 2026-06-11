@@ -824,6 +824,35 @@ def expand_step_context(
                         and hit_step_no - 1 <= s["step_no"] <= hit_step_no + 1
                     ]
 
+                # ── 超大家族防洪（RAG_STEP_EXPAND_FAMILY_CAP）──────────────
+                # 意图筛选按 step_no 数值区间：正常 SOP（step_no 基本互异）选出 2-3 个；
+                # 但超大手册的 step_no 大规模平局（如 41 个小节卡全是 step_no=0）会让
+                # 区间退化成全家族（~15k 字），把真正命中的小节挤出 context 预算
+                # （2026-06-11 J-r120_23 拒答根因）。超限时收缩为：命中卡 + 同
+                # section_title 伙伴 + 文档序 ±2 窗口；≤ 上限的家族行为不变。
+                _cap = get_config().rag.step_expand_family_cap
+                if _cap > 0 and len(selected) > _cap:
+                    hit_row = next(
+                        (s for s in selected if s["chunk_id"] == chunk_id), None)
+                    hit_section = (hit_row or {}).get("section_title") or ""
+                    keep_ids = {chunk_id}
+                    if hit_section:
+                        keep_ids.update(
+                            s["chunk_id"] for s in selected
+                            if (s.get("section_title") or "") == hit_section)
+                    if hit_row is not None:
+                        hi = selected.index(hit_row)
+                        keep_ids.update(
+                            s["chunk_id"] for s in selected[max(0, hi - 2):hi + 3])
+                    else:
+                        keep_ids.update(s["chunk_id"] for s in selected[:_cap])
+                    trimmed = [s for s in selected if s["chunk_id"] in keep_ids]
+                    logger.info(
+                        "Step 扩展防洪: parent=%s 家族筛选 %d → %d (cap=%d, hit_section=%r)",
+                        parent_id, len(selected), len(trimmed), _cap, hit_section,
+                    )
+                    selected = trimmed[:_cap]
+
                 for sib in selected:
                     is_hit = (sib["chunk_id"] == chunk_id)
                     score = original_score if is_hit else original_score * 0.85

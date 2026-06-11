@@ -351,6 +351,20 @@ class RAGConfig:
     # False → 全局关闭（如对延迟敏感）。仅在调用方显式 opt-in 时才生效，故纯文本
     #         路径与 /api/ask 不受影响。
     image_cosurface: bool = True
+    # ── 答案图片数量上限（轮转配额）────────────────────────────
+    # build_content_blocks 的图片配额：每个被 <<IMG:N>> 引用的步骤/文档先各取 1 张
+    # （轮转），有余额再按引用顺序补各自剩余图。默认 6 = "每步一张 + 少量补充"，
+    # 依据 2026-06-11 语料分布（带图文档 p50=7 张图/4 个带图步骤；旧上限 3 + 顺序
+    # 整段消耗使扫码枪类后位步骤图永远被前位多图步骤挤掉）。
+    max_answer_images: int = 6      # RAG_MAX_ANSWER_IMAGES
+    # ── 步骤卡兄弟扩展的超大家族防洪上限 ─────────────────────────
+    # expand_step_context 的意图筛选按 step_no 数值区间选兄弟：正常 SOP（step_no
+    # 1..N 基本互异）窗口只取 2-3 个；但超大手册（如富岭U8+人事部操作手册，48 卡
+    # 共享一个 parent 且 41 个 step_no=0）会让区间筛选退化成全家族扩展（~15k 字），
+    # 把真正命中的小节挤出 context 预算（2026-06-11 J-r120_23 拒答根因）。
+    # 家族筛选结果超过该上限时，收缩为「命中卡 + 同 section_title 伙伴 + 文档序
+    # ±2 窗口」；≤ 上限的正常 SOP 行为逐字节不变。0 = 关闭防洪（不推荐）。
+    step_expand_family_cap: int = 12  # RAG_STEP_EXPAND_FAMILY_CAP
 
 
 @dataclass
@@ -704,6 +718,8 @@ def load_config() -> PipelineConfig:
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE
+            max_answer_images=_env_int("MAX_ANSWER_IMAGES", 6),                 # RAG_MAX_ANSWER_IMAGES
+            step_expand_family_cap=_env_int("STEP_EXPAND_FAMILY_CAP", 12),      # RAG_STEP_EXPAND_FAMILY_CAP
         ),
     )
 

@@ -336,3 +336,55 @@ def test_sources_empty_titles_not_collapsed():
         _text_chunk("DOC_2", "", 0.7),
     ]
     assert len(_extract_sources(chunks)) == 2
+
+
+# ═══════════════════════════════════════════════════════════════
+# 轮转配额（2026-06-11）：多图步骤不再整段独占名额——
+# 吸塑扫码报检 step2×2+step3×3 曾把 step4 的扫码枪图（顺位第6）永远挤出 cap。
+# ═══════════════════════════════════════════════════════════════
+
+def _step_chunk(doc_id, keys_summaries, title="某SOP.pdf"):
+    return {
+        "chunk_type": "step_card", "doc_id": doc_id, "title": title,
+        "image_refs": [{"oss_key": k, "visual_summary": s} for k, s in keys_summaries],
+    }
+
+
+def test_round_robin_each_cited_step_gets_first_image(monkeypatch):
+    """cap=4 下四个被引用步骤各得 1 张（旧顺序消耗会变成 step2×2+step3×2、step4/5 零图）。"""
+    _fake_sign(monkeypatch)
+    chunks = [
+        _step_chunk("DOC_W", [("w/s2a.png", "标识卡甲"), ("w/s2b.png", "手写单乙")]),
+        _step_chunk("DOC_W", [("w/s3a.png", "登录界面丙"), ("w/s3b.png", "搜索界面丁"), ("w/s3c.png", "报检界面戊")]),
+        _step_chunk("DOC_W", [("w/s4a.png", "扫码枪己")]),
+        _step_chunk("DOC_W", [("w/s5a.png", "已扫条码庚"), ("w/s5b.png", "人员界面辛")]),
+    ]
+    ans = "二<<IMG:1>>三<<IMG:2>>四<<IMG:3>>五<<IMG:4>>完"
+    blocks = build_content_blocks(ans, chunks, max_images=4)
+    assert _image_keys(blocks) == ["w/s2a.png", "w/s3a.png", "w/s4a.png", "w/s5a.png"]
+
+
+def test_round_robin_second_pass_keeps_doc_order(monkeypatch):
+    """cap=6：第一轮每步 1 张后，第二轮按引用顺序补余图；同步骤内保持原始顺序。"""
+    _fake_sign(monkeypatch)
+    chunks = [
+        _step_chunk("DOC_W", [("w/s2a.png", "标识卡甲"), ("w/s2b.png", "手写单乙")]),
+        _step_chunk("DOC_W", [("w/s3a.png", "登录界面丙"), ("w/s3b.png", "搜索界面丁"), ("w/s3c.png", "报检界面戊")]),
+        _step_chunk("DOC_W", [("w/s4a.png", "扫码枪己")]),
+        _step_chunk("DOC_W", [("w/s5a.png", "已扫条码庚"), ("w/s5b.png", "人员界面辛")]),
+    ]
+    ans = "二<<IMG:1>>三<<IMG:2>>四<<IMG:3>>五<<IMG:4>>完"
+    blocks = build_content_blocks(ans, chunks, max_images=6)
+    keys = _image_keys(blocks)
+    # 渲染按占位符位置（文档序）：每步骤组内仍是原始顺序；6 个名额 = 每步 1 + 步2/3 各补 1
+    assert keys == ["w/s2a.png", "w/s2b.png", "w/s3a.png", "w/s3b.png", "w/s4a.png", "w/s5a.png"]
+
+
+def test_max_images_default_from_config(monkeypatch):
+    """max_images=None 走 RAG_MAX_ANSWER_IMAGES（默认 6）。"""
+    _fake_sign(monkeypatch)
+    from opensearch_pipeline.config import get_config
+    assert get_config().rag.max_answer_images == 6
+    chunks = [_step_chunk("DOC_W", [(f"w/i{i}.png", f"图{i}") for i in range(9)])]
+    blocks = build_content_blocks("看<<IMG:1>>完", chunks)
+    assert len(_image_keys(blocks)) == 6

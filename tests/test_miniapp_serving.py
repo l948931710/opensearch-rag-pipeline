@@ -576,6 +576,50 @@ def test_strip_doc_citations_preserves_legit_text():
     assert strip_doc_citations("") == ""
 
 
+def test_strip_doc_citations_title_source_section():
+    """钉钉截图原样复现（2026-06-11）：「来源依据：」+《标题》bullets 无 文档N 编号，
+    曾同时穿透共享清洗与 bot 的 _strip_trailing_sources（词表无「来源依据」），与卡片
+    结构化来源面板形成双重引用。段式整段删，正文保留。"""
+    from opensearch_pipeline.llm_generator import strip_doc_citations
+    answer = (
+        "事假需提前一天申请，未提前申请按旷工处理。\n"
+        "\n"
+        "来源依据：\n"
+        "- 《员工手册202108月.docx》章节：三、具体规定 – 4、事假 – 4.2\n"
+        "- 《A8休假请假管理标准.docx》章节：第四条 事 假 – (二)\n"
+    )
+    out = strip_doc_citations(answer)
+    assert "来源依据" not in out and "员工手册202108月" not in out
+    assert "事假需提前一天申请" in out
+
+    # 编号列表 + 加粗标题变体
+    answer2 = (
+        "操作完成。\n\n**参考来源：**\n"
+        "1. FL-CW-SW-001《增值税纳税申报》作业指导书.pdf > 第1页\n"
+        "2. 增值税申报操作规程.docx > 四、报表生成\n"
+    )
+    out2 = strip_doc_citations(answer2)
+    assert "参考来源" not in out2 and ".pdf" not in out2 and "操作完成" in out2
+
+    # 行式：强标题词同行带《标题》
+    out3 = strip_doc_citations("按规定执行。\n资料来源：《考勤管理办法》第3章")
+    assert "资料来源" not in out3 and "按规定执行" in out3
+
+
+def test_strip_doc_citations_title_section_no_false_positive():
+    """误杀防护：正当答案里的《标题》引用、弱词「依据/来源」开头的实质内容必须保留。"""
+    from opensearch_pipeline.llm_generator import strip_doc_citations
+    # 「处罚依据：《员工手册》…」是对"凭什么处罚"类问题的正当回答（弱词不入行式）
+    keep1 = "处罚依据：《员工手册》第3条规定旷工三天解除合同。"
+    assert strip_doc_citations(keep1) == keep1
+    # 正文 прозе 中的《标题》叙述
+    keep2 = "根据《宿舍管理制度》，按职级分配宿舍。"
+    assert strip_doc_citations(keep2) == keep2
+    # 「来源」段式标题后跟的不是文档引用列表（无《》/扩展名/章节）→ 不删
+    keep3 = "来源：\n- 内部口头通知，未见于正式文件"
+    assert strip_doc_citations(keep3) == keep3
+
+
 def test_system_prompt_forbids_doc_index_citation():
     """prompt 规则 8 的「文档N」禁令是第一道防线，确保不被后续 prompt 调优误删。"""
     from opensearch_pipeline import llm_generator as G
@@ -629,6 +673,26 @@ def test_format_context_label_parity():
     assert "(相关度: 高 0.91)" in ctx
     ctx2 = G._format_context([{"title": "T", "chunk_text": "正文", "score": 6.0}])
     assert "(相关度: 中 6.00)" in ctx2
+
+
+def test_format_context_step_card_image_label_parity():
+    """带图步骤卡的 [📷 图片] 标签与 image/text_chunk 分支对齐。
+
+    2026-06-11 生产复测：step_card 仅有 <<IMG:N>> 无 📷 标签时 LLM 引用倾向偏低
+    （J-water_soak/QA-24 带图步骤卡 0 引用），补齐标签；pure_text 路径不注入标记。
+    """
+    from opensearch_pipeline import llm_generator as G
+    chunk = {"title": "T", "chunk_text": "正文", "score": 0.91, "rerank_score": 0.91,
+             "chunk_type": "step_card", "step_no": 2,
+             "image_refs": [{"oss_key": "k.jpg", "visual_summary": "图"}]}
+    ctx = G._format_context([chunk])
+    assert "[📷 图片] <<IMG:1>>" in ctx
+    # 无图步骤卡不带图片标签
+    ctx_noimg = G._format_context([{**chunk, "image_refs": []}])
+    assert "📷" not in ctx_noimg and "<<IMG:" not in ctx_noimg
+    # 纯文本模式：不注入 <<IMG:N>> 标记
+    ctx_pure = G._format_context([chunk], pure_text=True)
+    assert "<<IMG:" not in ctx_pure
 
 
 def test_extract_sources_page_fallback_and_level():

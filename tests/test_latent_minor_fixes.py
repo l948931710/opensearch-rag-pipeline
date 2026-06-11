@@ -385,3 +385,111 @@ class TestExtractorFormatHandling:
         result = extractor._extract_text(self._task(tmp_path, "note.txt", "普通文本内容", "txt"))
         assert result.extract_method == "plain_text"
         assert "普通文本内容" in result.text
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. 步骤卡兄弟扩展的超大家族防洪（RAG_STEP_EXPAND_FAMILY_CAP）
+#    2026-06-11 J-r120_23 拒答根因：超大手册 41 个 step_no=0 小节卡让
+#    意图区间筛选退化成全家族扩展（~15k 字），命中小节被挤出 context。
+# ═══════════════════════════════════════════════════════════════
+
+class _RoutingCursor:
+    """按 SQL 路由的 DictCursor 假货：meta 查询与兄弟查询各回各的行。"""
+
+    def __init__(self, meta_rows, sibling_rows):
+        self.queries = []
+        self._meta_rows = meta_rows
+        self._sibling_rows = sibling_rows
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        if "parent_chunk_id IN" in sql:
+            self._rows = self._sibling_rows
+        elif "chunk_id IN" in sql:
+            self._rows = self._meta_rows
+        else:
+            self._rows = []
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
+
+
+class TestStepExpandFamilyCap:
+    def _mega_family(self, n_zero=41, sections=14):
+        """模拟人事手册形态：n_zero 个 step_no=0 小节卡 + 目标小节的 step1 卡。"""
+        sibs = []
+        for i in range(n_zero):
+            sec = f"1.{i % sections + 1} 小节{i % sections + 1}"
+            sibs.append({
+                "chunk_id": f"M-c{i:04d}", "chunk_text": f"小节卡{i}", "step_no": 0,
+                "section_title": sec, "extra_json": None, "image_refs_json": None,
+                "parent_chunk_id": "MEGA",
+            })
+        # 目标小节：1 个 step0 概览卡（同 section）+ 3 个 step1 内容卡
+        target = [
+            {"chunk_id": "M-t0", "chunk_text": "修改人员档案概览", "step_no": 0,
+             "section_title": "1.2.2修改人员档案", "extra_json": None,
+             "image_refs_json": None, "parent_chunk_id": "MEGA"},
+            {"chunk_id": "M-t1", "chunk_text": "查询人员，可用F2模糊查询", "step_no": 1,
+             "section_title": "1.2.2修改人员档案", "extra_json": None,
+             "image_refs_json": None, "parent_chunk_id": "MEGA"},
+            {"chunk_id": "M-t2", "chunk_text": "选中人员点修改", "step_no": 1,
+             "section_title": "1.2.2修改人员档案", "extra_json": None,
+             "image_refs_json": None, "parent_chunk_id": "MEGA"},
+            {"chunk_id": "M-t3", "chunk_text": "修改后保存", "step_no": 1,
+             "section_title": "1.2.2修改人员档案", "extra_json": None,
+             "image_refs_json": None, "parent_chunk_id": "MEGA"},
+        ]
+        return sibs + target
+
+    def test_mega_family_trimmed_to_hit_section_and_window(self, monkeypatch):
+        """>cap 家族收缩为命中卡+同小节伙伴+文档序±2 窗口，命中卡必在结果内。"""
+        from opensearch_pipeline import pipeline_nodes
+        from opensearch_pipeline.retriever import expand_step_context
+
+        siblings = self._mega_family()
+        meta = [{"chunk_id": "M-t1", "parent_chunk_id": "MEGA", "step_no": 1,
+                 "extra_json": None, "image_refs_json": None}]
+        cursor = _RoutingCursor(meta, siblings)
+        monkeypatch.setattr(pipeline_nodes, "_get_db_conn", lambda *a, **k: _FakeConn(cursor))
+
+        hit = {"chunk_id": "M-t1", "chunk_type": "step_card", "score": 8.6,
+               "chunk_text": "查询人员，可用F2模糊查询", "doc_id": "d-mega",
+               "title": "富岭U8+人事部操作手册.docx"}
+        # general 意图：step_no ∈ [0, 2] → 全部 45 个兄弟都落入区间（退化形态）
+        out = expand_step_context([hit], "我要修改一个员工档案里的信息怎么弄")
+
+        ids = [c["chunk_id"] for c in out]
+        assert "M-t1" in ids, "命中卡必须保留"
+        assert {"M-t0", "M-t2", "M-t3"} <= set(ids), "同小节伙伴必须保留"
+        assert len(out) <= 12, f"超大家族必须被防洪上限收缩，实际 {len(out)}"
+        # 远端无关小节卡（文档序窗口与同小节之外）不应进入
+        assert "M-c0000" not in ids and "M-c0005" not in ids
+
+    def test_small_family_unchanged(self, monkeypatch):
+        """≤cap 的正常 SOP 行为不变：general 意图取 ±1 邻居，全员保留。"""
+        from opensearch_pipeline import pipeline_nodes
+        from opensearch_pipeline.retriever import expand_step_context
+
+        siblings = [
+            {"chunk_id": f"S-s{i}", "chunk_text": f"第{i}步", "step_no": i,
+             "section_title": "操作步骤", "extra_json": None,
+             "image_refs_json": None, "parent_chunk_id": "SMALL"}
+            for i in range(1, 6)
+        ]
+        meta = [{"chunk_id": "S-s3", "parent_chunk_id": "SMALL", "step_no": 3,
+                 "extra_json": None, "image_refs_json": None}]
+        cursor = _RoutingCursor(meta, siblings)
+        monkeypatch.setattr(pipeline_nodes, "_get_db_conn", lambda *a, **k: _FakeConn(cursor))
+
+        hit = {"chunk_id": "S-s3", "chunk_type": "step_card", "score": 9.0,
+               "chunk_text": "第3步", "doc_id": "d-small", "title": "小SOP.docx"}
+        out = expand_step_context([hit], "第三步怎么操作")
+
+        # 5 ≤ cap(12)：防洪不得介入，意图筛选选了谁就保留谁（本查询的意图取全家族）
+        ids = sorted(c["chunk_id"] for c in out)
+        assert ids == ["S-s1", "S-s2", "S-s3", "S-s4", "S-s5"], f"≤cap 家族不应被修剪: {ids}"

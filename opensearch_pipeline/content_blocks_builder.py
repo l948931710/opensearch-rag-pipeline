@@ -283,7 +283,7 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
 def build_content_blocks(
     answer: str,
     chunks: List[Dict[str, Any]],
-    max_images: int = 3,
+    max_images: Optional[int] = None,
     url_expires: Optional[int] = None,
     max_caption_len: Optional[int] = 100,
 ) -> List[Dict[str, str]]:
@@ -293,11 +293,13 @@ def build_content_blocks(
     策略（只展示 LLM 主动用 <<IMG:N>> 引用的图片）:
     1. 扫描 answer 中的 <<IMG:N>> 占位符，得到 LLM 引用的文档序号
        （去重、保持首次引用顺序）
-    2. 只对“被引用”的图片签名，且按引用顺序签名后再受 max_images 截断
-       —— 被引用的图片永远不会被靠前 chunk 的图片挤掉（修复 cap-eviction）
+    2. 只对“被引用”的图片签名，配额按**轮转**分配：第一轮每个被引用文档/步骤
+       各取 1 张，仍有余额再按引用顺序轮转补各自剩余图 —— 多图步骤不再整段
+       独占名额、把后位步骤（如扫码枪实拍）彻底挤出（2026-06-11，吸塑扫码报检
+       step2×2+step3×3 在旧顺序消耗下使 step4 的图排第 6 位永远出不来）
     3. 若 LLM 没有引用任何图片（纯文字答案 / 负样本）→ 返回空 list
        —— 不再把检索到的图片无差别追加到末尾（修复 over-attachment）
-    4. 按占位符位置把被引用的图片穿插进文本
+    4. 按占位符位置把被引用的图片穿插进文本；同一文档内的图保持原始顺序
 
     历史行为对比：旧实现会把所有携带图片的 chunk 一律签名并追加到末尾
     （无论 LLM 是否引用），导致负样本被塞图、跨文档图片污染，以及被引用
@@ -306,7 +308,8 @@ def build_content_blocks(
     Args:
         answer: LLM 生成的回答文本
         chunks: 检索返回的 chunks 列表
-        max_images: 最多展示的图片数量
+        max_images: 最多展示的图片数量；None 取 config.rag.max_answer_images
+                    （RAG_MAX_ANSWER_IMAGES，默认 6 ≈ 每步一张+少量补充）
         url_expires: OSS 签名 URL 有效期（秒）；None 取 config.oss.signed_url_expires
                      （RAG_OSS_URL_EXPIRES，默认 3600）
         max_caption_len: caption 截断长度；None 表示不截断（小程序屏幕空间更大，可传 None 取全文）
@@ -317,6 +320,10 @@ def build_content_blocks(
     """
     if not answer:
         return []
+
+    if max_images is None:
+        from opensearch_pipeline.config import get_config
+        max_images = get_config().rag.max_answer_images
 
     # 1. 提取所有携带图片的 chunk（doc_index → [img dicts]）
     image_map = _extract_image_chunks(chunks)
@@ -339,35 +346,43 @@ def build_content_blocks(
         # LLM 没有引用任何图片 → 不展示图片（走 answer 降级）
         return []
 
-    # 3. 只为“被引用”的图片签名，按引用顺序处理后再受 max_images 截断。
-    #    因为只签名被引用的图片且按引用顺序消耗配额，被引用的图片不会被挤掉。
+    # 3. 只为“被引用”的图片签名，配额**轮转**分配后再受 max_images 截断：
+    #    每轮按引用顺序给每个文档/步骤取 1 张（跳过近重与签名失败、不消耗配额），
+    #    直到配额用尽或全部取完。同一文档内出图保持原始顺序（逐轮从队首弹出）。
     #    url_expires=None 由 generate_signed_url 统一解析为 config.oss.signed_url_expires。
     signed_images: Dict[int, List[Dict[str, str]]] = {}
     generated_count = 0
     accepted: List[Dict[str, str]] = []   # 已采纳（将渲染）图片：近重抑制的比较基准
-    for doc_idx in referenced_order:
-        if generated_count >= max_images:
-            break
-        # doc_idx 由 enumerate(chunks, 1) 产生，必在界内；doc_id 用于「同文档绝不判近重」
-        chunk_doc_id = chunks[doc_idx - 1].get("doc_id", "")
-        signed_list = []
-        for img_info in image_map[doc_idx]:
+    # doc_idx 由 enumerate(chunks, 1) 产生，必在界内；doc_id 用于「同文档绝不判近重」
+    queues = [(doc_idx, list(image_map[doc_idx])) for doc_idx in referenced_order]
+    while generated_count < max_images and any(q for _, q in queues):
+        progressed = False
+        for doc_idx, q in queues:
             if generated_count >= max_images:
                 break
-            oss_key = img_info["source_image"]
-            summary = img_info.get('visual_summary', '')
-            near_dup_text = img_info.get("near_dup_text", "")
-            dup = _find_duplicate_image(accepted, chunk_doc_id, oss_key, near_dup_text)
-            if dup is not None:
-                # 被抑制的近重图不消耗 max_images 配额（continue 在计数之前）
-                logger.info(
-                    "近重图片抑制: 丢弃 '%s' (doc=%s)，与已采纳 '%s' (doc=%s) 描述同屏",
-                    oss_key, chunk_doc_id, dup["oss_key"], dup["doc_id"],
-                )
-                continue
-            url = generate_signed_url(oss_key, expires=url_expires)
-            if url:
-                signed_list.append({
+            chunk_doc_id = chunks[doc_idx - 1].get("doc_id", "")
+            # 本轮为该文档取 1 张：弹出队首直到拿到一张可用图（近重/签名失败不耗配额）
+            while q:
+                img_info = q.pop(0)
+                oss_key = img_info["source_image"]
+                summary = img_info.get('visual_summary', '')
+                near_dup_text = img_info.get("near_dup_text", "")
+                dup = _find_duplicate_image(accepted, chunk_doc_id, oss_key, near_dup_text)
+                if dup is not None:
+                    # 被抑制的近重图不消耗 max_images 配额
+                    logger.info(
+                        "近重图片抑制: 丢弃 '%s' (doc=%s)，与已采纳 '%s' (doc=%s) 描述同屏",
+                        oss_key, chunk_doc_id, dup["oss_key"], dup["doc_id"],
+                    )
+                    continue
+                url = generate_signed_url(oss_key, expires=url_expires)
+                if not url:
+                    logger.warning(
+                        "Skipping image chunk %d: signed URL generation failed for '%s'",
+                        doc_idx, oss_key,
+                    )
+                    continue
+                signed_images.setdefault(doc_idx, []).append({
                     "url": url,
                     # oss_key 随块落库：签名 URL 1h 过期，卡片回调重建时按它重签
                     # （refresh_image_block_urls）；卡片模板/小程序只读 url，多余键无害
@@ -380,13 +395,10 @@ def build_content_blocks(
                     "doc_id": chunk_doc_id, "oss_key": oss_key, "near_dup_text": near_dup_text,
                 })
                 generated_count += 1
-            else:
-                logger.warning(
-                    "Skipping image chunk %d: signed URL generation failed for '%s'",
-                    doc_idx, oss_key,
-                )
-        if signed_list:
-            signed_images[doc_idx] = signed_list
+                progressed = True
+                break
+        if not progressed:
+            break
 
     if not signed_images:
         # 被引用图片的签名全部失败 → 返回空，走 answer 降级
