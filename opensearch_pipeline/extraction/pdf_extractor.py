@@ -21,11 +21,17 @@ import re
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
-from opensearch_pipeline.extraction.schema import ExtractedBlock
+from opensearch_pipeline.extraction.schema import (
+    STEP_BOUNDARY_PATTERN, ExtractedBlock, is_pseudo_heading,
+)
 from opensearch_pipeline.extraction.text_extractor import (
     extract_text_file,
     extract_title_from_blocks,
 )
+
+# 步骤边界（行锚定）：PDF 页面常把多个步骤合并为一个视觉段落；按步骤行切开段落，
+# 每个步骤块才能携带自己的 y 区间，图片注入才能按版面位置（y 序）锚定到正确步骤。
+_STEP_LINE_RE = re.compile(STEP_BOUNDARY_PATTERN, re.IGNORECASE)
 
 # ── 中文标题正则（与 docx_extractor / text_extractor 保持一致）──
 _CN_HEADING_RE = re.compile(
@@ -275,6 +281,8 @@ def _pass2_extract_page(
                     "table_index": table_idx,
                     "row_count": len(rows_text),
                     "detected_by": "pdfplumber_lines",
+                    "y0": float(table.bbox[1]),
+                    "y1": float(table.bbox[3]),
                 },
             ))
 
@@ -315,12 +323,14 @@ def _pass2_extract_page(
     lines = _group_words_into_lines(non_table_words, y_tolerance=4)
 
     # ── Step 5: 对每行做 heading 检测 + 生成 blocks ──
-    text_buffer: List[str] = []
+    # buffer 记录 (text, top, bottom)：段落块携带 y 区间（extra.y0/y1），
+    # 供 _insert_image_refs_heuristic 按版面位置锚定图片
+    text_buffer: List[Tuple[str, float, float]] = []
 
     def _flush_paragraph():
         nonlocal text_buffer
         if text_buffer:
-            para_text = "\n".join(text_buffer).strip()
+            para_text = "\n".join(t for t, _, _ in text_buffer).strip()
             if para_text:
                 blocks.append(ExtractedBlock(
                     block_type="paragraph",
@@ -328,7 +338,11 @@ def _pass2_extract_page(
                     page_num=page_num,
                     section_path=current_section[0],
                     source="native",
-                    extra={"detected_by": "layout"},
+                    extra={
+                        "detected_by": "layout",
+                        "y0": min(top for _, top, _ in text_buffer),
+                        "y1": max(bottom for _, _, bottom in text_buffer),
+                    },
                 ))
             text_buffer = []
 
@@ -339,6 +353,16 @@ def _pass2_extract_page(
                 _flush_paragraph()
             continue
 
+        # 步骤边界行：先冲掉已缓冲段落，让每个步骤独立成块（携带自己的 y 区间）。
+        # 不影响全文 text（仍按行拼接），只改变块粒度 —— chunker 会按尺寸再合并。
+        if text_buffer and _STEP_LINE_RE.match(line_text):
+            _flush_paragraph()
+        # 大纵向间隙（>40pt ≈ 嵌入图片/图表占位）也切段：否则环绕图片的文字会被
+        # 合并成一个跨越整版的巨型段落（y0..y1 罩住所有图），图片按 y 锚定时
+        # 全部塌到同一块上（2026-06-10 pdf_sop p3 实证：1 段 y183-693 吞 3 图）
+        elif text_buffer and (line_info["top"] - text_buffer[-1][2]) > 40:
+            _flush_paragraph()
+
         line_size = line_info["dominant_size"]
         line_fontname = line_info["dominant_fontname"]
 
@@ -346,8 +370,14 @@ def _pass2_extract_page(
         heading_level = None
         detected_by = None
 
+        # 标注式 callout veto："⑤双击图标"常以标题字号/加粗排版，字号/加粗
+        # 启发会把它当 heading → section_title 污染（章节：⑤双击图标）。
+        # veto 后圈数字行成为普通段落，归入所属步骤文本。
+        looks_callout = is_pseudo_heading(line_text)
+
         # 策略 1: 字号推断（需要文本长度 ≤50 防止长段落误判）
-        if analysis.heading_size_to_level and line_size is not None and len(line_text) <= 50:
+        if (not looks_callout and analysis.heading_size_to_level
+                and line_size is not None and len(line_text) <= 50):
             # 查找匹配的 heading size（±0.5pt 容差）
             for hs, level in analysis.heading_size_to_level.items():
                 if abs(line_size - hs) < 0.6:
@@ -356,7 +386,8 @@ def _pass2_extract_page(
                     break
 
         # 策略 2: Bold 字体 + 正文字号 → 可能是次级标题
-        if heading_level is None and line_fontname and line_size is not None:
+        if (heading_level is None and not looks_callout
+                and line_fontname and line_size is not None):
             is_bold = "bold" in line_fontname.lower() or "黑体" in line_fontname
             is_body_size = abs(line_size - analysis.body_size) < 0.6
             if is_bold and is_body_size and len(line_text) <= 40:
@@ -385,10 +416,16 @@ def _pass2_extract_page(
                     "font_size": line_size,
                     "fontname": line_fontname,
                     "detected_by": detected_by,
+                    "y0": line_info["top"],
+                    "y1": line_info.get("bottom", line_info["top"]),
                 },
             ))
         else:
-            text_buffer.append(line_text)
+            text_buffer.append((
+                line_text,
+                line_info["top"],
+                line_info.get("bottom", line_info["top"]),
+            ))
 
     _flush_paragraph()
     return blocks, warnings
@@ -474,7 +511,8 @@ def _build_line(words: list) -> dict:
 
     return {
         "text": line_text,
-        "top": float(words_sorted[0]["top"]),
+        "top": min(float(w["top"]) for w in words_sorted),
+        "bottom": max(float(w.get("bottom", w["top"])) for w in words_sorted),
         "dominant_size": dominant_size,
         "dominant_fontname": dominant_fontname,
     }

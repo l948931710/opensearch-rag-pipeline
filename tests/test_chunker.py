@@ -3,7 +3,6 @@
 test_chunker.py — DocumentChunker 单元测试
 """
 
-import pytest
 from opensearch_pipeline.chunker import DocumentChunker, Chunk
 from opensearch_pipeline.extraction.schema import ExtractedBlock
 
@@ -494,3 +493,76 @@ class TestProcedureParentEnrichment:
         # 应包含第一段前导文本作为 fallback
         assert "涂布工序操作手册" in parent.chunk_text
 
+
+
+class TestDottedStepNumbers:
+    """X.Y 条款编号步骤（known-open 修复 2026-06-10）：int("4.1") 必然失败，
+    旧 fallback 乱给 step_no；现在 step_no=文档内 ordinal（检索端排序/±1 扩展
+    窗依赖紧凑稳定），原文编号存 section_no（heading 派生步骤的既有契约键）。"""
+
+    def _chunker(self):
+        return DocumentChunker(max_chunk_chars=800, min_chunk_chars=10,
+                               overlap_chars=0, split_mode="step")
+
+    def test_dotted_steps_get_ordinal_and_section_no(self):
+        blocks = [
+            ExtractedBlock(block_type="paragraph",
+                           text="4.1 检查模具表面是否清洁，确认无残留物后方可进入下一步。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="4.2 将原料倒入进料口，注意控制送料速度避免溢出堵塞。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="4.3 启动设备并观察运行状态，记录首件检验结果数据。"),
+        ]
+        chunks = self._chunker().chunk_from_blocks(blocks, "DOTTED01", 1)
+        cards = [c for c in chunks if c.chunk_type == "step_card"]
+        assert len(cards) == 3, f"应产生 3 张步骤卡，实际 {len(cards)}"
+        assert [c.extra["step_no"] for c in cards] == [1, 2, 3], (
+            "X.Y 步骤的 step_no 应为文档内 ordinal"
+            f"，实际 {[c.extra['step_no'] for c in cards]}")
+        assert [c.extra.get("section_no") for c in cards] == ["4.1", "4.2", "4.3"], \
+            "原文编号必须存 section_no 供展示层还原"
+
+    def test_sub_step_nests_under_dotted_main(self):
+        """X.Y 主步骤之后的 N) 子项：沿用该卡的 ordinal step_no + sub_step_no。"""
+        blocks = [
+            ExtractedBlock(block_type="paragraph",
+                           text="4.1 检查模具表面是否清洁，确认无残留物后方可进入下一步。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="4.2 完成进料操作前的各项准备工作，依次执行以下子项。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="1) 打开进料阀门并确认压力表读数在正常范围之内。"),
+        ]
+        chunks = self._chunker().chunk_from_blocks(blocks, "DOTTED02", 1)
+        cards = [c for c in chunks if c.chunk_type == "step_card"]
+        subs = [c for c in cards if c.extra.get("sub_step_no") is not None]
+        assert len(subs) == 1, "1) 子项应产生一张子步骤卡"
+        main_42 = [c for c in cards if c.extra.get("section_no") == "4.2"][0]
+        assert subs[0].extra["step_no"] == main_42.extra["step_no"], \
+            "子项必须沿用 4.2 卡的 ordinal step_no（否则与主步骤碰撞）"
+        assert subs[0].extra["sub_step_no"] == 1
+
+    def test_plain_steps_unaffected(self):
+        """显式 步骤N 文档：行为与修复前完全一致（无 section_no）。"""
+        blocks = [
+            ExtractedBlock(block_type="paragraph", text="步骤1. 准备涂布材料并核对清单。"),
+            ExtractedBlock(block_type="paragraph", text="步骤2. 启动涂布机并等待预热完成。"),
+        ]
+        chunks = self._chunker().chunk_from_blocks(blocks, "PLAIN01", 1)
+        cards = [c for c in chunks if c.chunk_type == "step_card"]
+        assert [c.extra["step_no"] for c in cards] == [1, 2]
+        assert all(not c.extra.get("section_no") for c in cards)
+
+    def test_format_context_prefers_section_no(self):
+        """serving 展示：section_no 存在时显示 步骤4.1 而非 ordinal 步骤5。"""
+        from opensearch_pipeline import llm_generator as G
+        ctx = G._format_context([{
+            "title": "注塑成型作业指导书", "chunk_text": "检查模具表面是否清洁。",
+            "chunk_type": "step_card", "step_no": 5, "section_no": "4.1",
+            "score": 8.0,
+        }])
+        assert "步骤4.1" in ctx and "步骤5" not in ctx
+        ctx2 = G._format_context([{
+            "title": "注塑成型作业指导书", "chunk_text": "检查模具表面是否清洁。",
+            "chunk_type": "step_card", "step_no": 5, "score": 8.0,
+        }])
+        assert "步骤5" in ctx2, "无 section_no 时行为不变"

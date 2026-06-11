@@ -1,0 +1,808 @@
+# -*- coding: utf-8 -*-
+"""摄取准入策略 + 独立图片文档泛化 —— 2026-06-10 OSS 真实分布盘点的回归测试。
+
+盘点背景（raw/ 共 3644 对象）：jpg×1404（绝大多数在 _quarantine/_archive）、
+doc×438（基本全在 _archive，docx 转换件在活跃目录）、~$ 临时文件与 Thumbs.db
+曾被注册进 document_meta；活跃语料中独立图片（申岗.jpg、磨床操作流程.png 等）
+是真实的员工告示/SOP 海报。
+"""
+
+import pytest
+
+from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+from opensearch_pipeline.ingest_policy import should_ingest_raw_key
+
+
+# ═══════════════ ingest 准入策略 ═══════════════
+
+def test_active_documents_ingested():
+    for key in (
+        "raw/admin/员工手册.docx",
+        "raw/production_injection/FL-ZS-WI-010《注塑销售出库单》-成品仓管.pdf",
+        "raw/hr/考勤管理.xlsx",
+        "raw/marketing/产品介绍.pptx",
+        "raw/admin/申岗.jpg",
+        "raw/production_mold/磨床操作流程.png",
+        "raw/admin/充值饭卡时间.jpeg",
+    ):
+        ok, reason = should_ingest_raw_key(key)
+        assert ok, f"{key} 应纳入，被拒原因: {reason}"
+
+
+def test_archive_and_quarantine_excluded():
+    for key in (
+        "raw/_archive/admin/A1员工行为管理标准.doc",
+        "raw/admin/_archive/旧版制度.docx",
+        "raw/marketing/_quarantine/FULING PPT 英文版本.pptx",
+        "raw/_quarantine/x.pdf",
+    ):
+        ok, _ = should_ingest_raw_key(key)
+        assert not ok, f"{key} 应被排除"
+
+
+def test_junk_and_temp_files_excluded():
+    for key in (
+        "raw/hr/~$1内部审计控制-改进制度和流程 .doc",
+        "raw/production/Thumbs.db",
+        "raw/marketing/Desktop.ini",
+        "raw/admin/",                      # 目录
+        "raw/admin/无扩展名文件",
+    ):
+        ok, _ = should_ingest_raw_key(key)
+        assert not ok, f"{key} 应被排除"
+
+
+def test_media_archives_and_legacy_excluded():
+    """用户决策：mp4/压缩包不进知识库；doc/xls/ppt 走一次性转换后回灌。"""
+    for key in (
+        "raw/marketing/培训.mp4",
+        "raw/admin/打包.zip",
+        "raw/it/备份.rar",
+        "raw/admin/A1员工行为管理标准.doc",
+        "raw/production_paper_cup/纸杯过程自检作业指导书.xls",
+        "raw/marketing/培训.ppt",
+    ):
+        ok, _ = should_ingest_raw_key(key)
+        assert not ok, f"{key} 应被排除"
+
+
+# ═══════════════ 独立图片文档 ═══════════════
+
+def _fake_funnel(monkeypatch, funnel_result):
+    class _FakeProcessor:
+        def __init__(self, simulate=True):
+            pass
+
+        def _static_heuristics(self, local_path):
+            # 让嵌入图路径的 Funnel-1 预过滤恒通过（真实现读文件尺寸/大小）
+            return 200, 120, 10.0
+
+        def process_image(self, local_path, doc_id, is_public=True, doc_title=""):
+            return dict(funnel_result)
+
+    import opensearch_pipeline.image_funnel_processor as ifp
+    monkeypatch.setattr(ifp, "ImageFunnelProcessor", _FakeProcessor)
+
+
+def _extract_image_doc(tmp_path):
+    img = tmp_path / "磨床操作流程.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n_fake")
+    return UnifiedExtractor(simulate=True).extract({
+        "doc_id": "IMG01", "version_no": 1, "local_path": str(img),
+        "file_ext": "png", "filename": img.name,
+        "raw_key": f"raw/production_mold/{img.name}", "_tmp_dir": str(tmp_path),
+    })
+
+
+def test_route_to_text_image_doc_keeps_renderable_ref(monkeypatch, tmp_path):
+    """ROUTE_TO_TEXT 的图片文档：OCR 文本之外必须保留 image_ref —— 图就是文档本体，
+    否则 SOP 海报原图永远无法在回答里渲染（2026-06-10 实测磨床操作流程.png）。"""
+    _fake_funnel(monkeypatch, {
+        "status": "ROUTE_TO_TEXT",
+        "ocr_text": "磨床操作规程 一、基本操作规程 机床开动前必须检查",
+        "visual_summary": "磨床操作规程文档页面照片",
+        "image_category": "step_screenshot",
+        "vlm_annotation_map": {}, "reason": "",
+        "width": 800, "height": 1200, "file_size_kb": 120.0,
+    })
+    r = _extract_image_doc(tmp_path)
+    block_types = [b.block_type for b in r.blocks]
+    assert "ocr_text" in block_types
+    assert "image_ref" in block_types, "原图引用丢失：ROUTE_TO_TEXT 图片文档必须附 image_ref"
+    assert r.assets and r.assets[0].get("image_index") == 0
+    assert r.assets[0].get("page_num") == 1
+
+
+def test_route_to_vector_image_doc_has_asset(monkeypatch, tmp_path):
+    _fake_funnel(monkeypatch, {
+        "status": "ROUTE_TO_VECTOR",
+        "ocr_text": "",
+        "visual_summary": "粉色背景告示牌，标明充值时间",
+        "image_category": "notice_photo",
+        "vlm_annotation_map": {}, "reason": "",
+        "width": 800, "height": 600, "file_size_kb": 80.0,
+    })
+    r = _extract_image_doc(tmp_path)
+    assert r.assets and r.assets[0]["status"] == "ROUTE_TO_VECTOR"
+    assert r.assets[0].get("image_index") == 0
+
+
+def test_tif_gif_routed_to_image_extractor(monkeypatch, tmp_path):
+    """tif/gif 也走图片文档路径（语料里存在零星 tif/gif）。"""
+    _fake_funnel(monkeypatch, {
+        "status": "ROUTE_TO_VECTOR", "ocr_text": "", "visual_summary": "产品图",
+        "image_category": "product_photo", "vlm_annotation_map": {}, "reason": "",
+        "width": 100, "height": 100, "file_size_kb": 10.0,
+    })
+    for ext in ("tif", "gif"):
+        f = tmp_path / f"样品.{ext}"
+        f.write_bytes(b"fake")
+        r = UnifiedExtractor(simulate=True).extract({
+            "doc_id": "IMG02", "version_no": 1, "local_path": str(f),
+            "file_ext": ext, "filename": f.name,
+            "raw_key": f"raw/marketing/{f.name}", "_tmp_dir": str(tmp_path),
+        })
+        assert r.extract_method == "image_funnel", f".{ext} 应走图片文档路径"
+
+
+def test_xls_explicitly_unsupported():
+    """.xls 按用户决策不在管线内支持（转换后回灌），且必须显式可见而非静默空文档。"""
+    r = UnifiedExtractor(simulate=True).extract({
+        "doc_id": "XLS01", "version_no": 1, "local_path": "/nonexistent/a.xls",
+        "file_ext": "xls", "filename": "a.xls", "raw_key": "raw/admin/a.xls",
+    })
+    assert r.extract_method.startswith("unsupported")
+
+
+def test_image_doc_asset_carries_raw_key_as_oss_key(monkeypatch, tmp_path):
+    """独立图片文档的 asset.oss_key = raw/ 对象本身 —— 资产上传只覆盖 ROUTE_TO_VECTOR，
+    构造出的 processing/assets/ 路径对 ROUTE_TO_TEXT 永不存在（serving 403 死图）。"""
+    _fake_funnel(monkeypatch, {
+        "status": "ROUTE_TO_TEXT",
+        "ocr_text": "磨床操作规程 一、基本操作规程 机床开动前必须检查设备状态并确认无误",
+        "visual_summary": "磨床操作规程文档页面照片",
+        "image_category": "step_screenshot",
+        "vlm_annotation_map": {}, "reason": "",
+        "width": 800, "height": 1200, "file_size_kb": 120.0,
+    })
+    r = _extract_image_doc(tmp_path)
+    assert r.assets[0].get("oss_key") == "raw/production_mold/磨床操作流程.png"
+
+
+def test_faq_eligible_does_not_hijack_step_routing():
+    """faq_eligible 是"可生成 FAQ"的下游标记，不是切块结构信号：带步骤标记的 SOP
+    即使 faq_eligible=True 也必须走 step 模式（2026-06-10 本地 E2E：123/124 SOP
+    曾被劫持进 faq 模式，全批次 0 绑定）。"""
+    from opensearch_pipeline.pipeline_nodes import node_chunk_documents
+
+    steps = [
+        "步骤1：整理《注塑发货拖柜》中的《发货单》，核对发货数量与单据是否一致无误。",
+        "步骤2：进入电脑桌面登录U8系统，双击U8快捷方式图标输入用户名和密码进行登录。",
+        "步骤3：按照系统路径点击进入销售出库单界面，录入出库日期、仓库编号与货位数据。",
+        "步骤4：确认实际发货数量后依次点击保存、审核、打印，将打印好的单子按联次分发。",
+    ]
+    doc = {
+        "doc_id": "HJACK01", "version_no": 1,
+        "title": "FL-ZS-WI-010《注塑销售出库单》-成品仓管.docx",
+        "filename": "x.docx", "file_ext": "docx",
+        "category_l1": "sop", "category_l2": "business_sop",
+        "faq_eligible": True,            # ← 真实 LLM 分类常给 SOP 标 True
+        "text": "\n".join(steps),
+        "blocks": [{"block_type": "paragraph", "text": s, "page_num": None,
+                    "section_path": None, "source": "native", "extra": {}} for s in steps],
+        "assets": [],
+        "source_key": "raw/production/x.docx", "canonical_key": "",
+        "owner_dept": "production", "permission_level": "public",
+        "kb_type": "public", "risk_level": "low", "redaction_action": "CLEAN",
+    }
+    ctx = {"canonicals": [doc], "split_mode": "dynamic",
+           "prepend_title": True, "prepend_section": True}
+    node_chunk_documents(ctx)
+    types = {getattr(c, "chunk_type", "") for c in ctx["chunks"]}
+    assert "step_card" in types, f"SOP 被 faq_eligible 劫持出 step 模式: {types}"
+
+
+def test_true_faq_doc_still_routes_faq():
+    """真 FAQ 文档（标题/分类含 faq）仍走 faq 模式。"""
+    from opensearch_pipeline.pipeline_nodes import node_chunk_documents
+
+    qa_text = ("问：员工饭卡怎么充值？\n答：充值时间为每周一、周三及周五中午10:30-12:00，"
+               "在行政楼一楼前台办理，补卡同时间办理，需当天下午上班后领取新卡。\n\n"
+               "问：新员工宿舍怎么申请？\n答：持入职单到行政部办理宿舍入住手续，"
+               "由宿管分配床位并领取门禁卡，退宿时需结清水电费用。")
+    doc = {
+        "doc_id": "FAQDOC01", "version_no": 1, "title": "人事行政常见问题FAQ.docx",
+        "filename": "faq.docx", "file_ext": "docx",
+        "category_l1": "faq", "category_l2": "hr_faq", "faq_eligible": True,
+        "text": qa_text, "blocks": [], "assets": [],
+        "source_key": "raw/hr/faq.docx", "canonical_key": "",
+        "owner_dept": "hr", "permission_level": "public",
+        "kb_type": "public", "risk_level": "low", "redaction_action": "CLEAN",
+    }
+    ctx = {"canonicals": [doc], "split_mode": "dynamic",
+           "prepend_title": True, "prepend_section": True}
+    node_chunk_documents(ctx)
+    assert ctx["chunks"], "FAQ 文档应产出 chunks"
+    assert not any(getattr(c, "chunk_type", "") == "step_card" for c in ctx["chunks"])
+
+
+# ═══════════════ XLSX TO_TEXT 截图的 serving 可渲染性 ═══════════════
+# 真实失败件：raw/it/外贸发票操作流程.xlsx —— 3 个 sheet 各 1 张全屏 U8 截图、无文本
+# 单元格，VLM 全部路由 ROUTE_TO_TEXT。OCR 文本进了 chunk，但原图没有任何 serving 可达
+# 载体（refs 被启发式注入落在 ocr_chunk 上，HA3 不携带、RDS 恢复只覆盖
+# step_card/procedure_parent/visual_knowledge）→ 覆盖评测 I5 违例（2026-06-10）。
+
+_I5_SERVING_REF_TYPES = {"step_card", "procedure_parent", "visual_knowledge"}
+
+
+def _serving_renderable_fns(chunks):
+    """收集已被 serving 可达载体携带的图片文件名（与 eval_extraction_coverage I5 同口径）。"""
+    import os as _os
+    fns = set()
+    for c in chunks:
+        cx = getattr(c, "extra", {}) or {}
+        ctype = getattr(c, "chunk_type", "")
+        if ctype in ("image", "visual_knowledge") and cx.get("source_image"):
+            fns.add(_os.path.basename(str(cx["source_image"])))
+        if ctype in _I5_SERVING_REF_TYPES:
+            for ref in (cx.get("image_refs") or []):
+                fn = ref.get("filename") or _os.path.basename(
+                    str(ref.get("source_image") or ref.get("oss_key") or ""))
+                if fn:
+                    fns.add(fn)
+    return fns
+
+
+def _chunk_doc(doc):
+    from opensearch_pipeline.pipeline_nodes import node_chunk_documents
+    ctx = {"canonicals": [doc], "split_mode": "dynamic",
+           "prepend_title": True, "prepend_section": True}
+    node_chunk_documents(ctx)
+    return ctx["chunks"]
+
+
+def _xlsx_doc(filename, blocks, assets, text=""):
+    return {
+        "doc_id": "XLSXIMG1", "version_no": 1, "title": filename,
+        "filename": filename, "file_ext": "xlsx", "text": text,
+        "blocks": blocks, "assets": assets,
+        "source_key": f"raw/it/{filename}", "canonical_key": "",
+        "owner_dept": "it", "category_l1": "", "category_l2": "",
+        "permission_level": "public", "kb_type": "public", "risk_level": "low",
+        "redaction_action": "CLEAN",
+    }
+
+
+def _totext_asset(idx, filename, visual_summary, ocr_text, anchor_row, figure_no=None,
+                  status="ROUTE_TO_TEXT"):
+    a = {
+        "filename": filename, "local_path": f"/nonexistent/{filename}",
+        "page_num": 1, "image_index": idx, "original_index": idx,
+        "status": status, "width": 1900, "height": 1000, "file_size_kb": 300.0,
+        "ocr_text": ocr_text, "visual_summary": visual_summary,
+        "image_category": "step_screenshot", "vlm_annotation_map": {}, "reason": "",
+        "anchor_row": anchor_row,
+    }
+    if figure_no is not None:
+        a["figure_no"] = figure_no
+    return a
+
+
+def test_xlsx_totext_flow_doc_gets_fallback_image_chunks():
+    """外贸发票操作流程.xlsx 形态复刻：全屏 TO_TEXT 截图 + 标题含"流程" + OCR 文本带
+    步骤标记 → step-detect 误路由 step 模式、refs 落在 ocr_chunk 上不可达。
+    兜底必须为每张截图建 chunk_type=image 的独立 chunk（chunk 级 source_image 经
+    to_ha3_doc 进 HA3 才 serving 可渲染）。"""
+    ocr1 = ("第一步 打开U8系统外贸专用档案界面录入物料的存货编码与HS编码并保存审核。\n"
+            "第二步 进入销售普通发票界面点击生成特殊发票按钮完成外销发票开具流程。")
+    ocr2 = "单证打印窗口 勾选报关合同与财务发票选项 点击确认输出打印外贸单证资料"
+    blocks = [
+        {"block_type": "heading", "text": "Sheet1", "page_num": 1,
+         "section_path": "Sheet1", "source": "openpyxl",
+         "extra": {"section_type": "cleaning_items"}},
+        {"block_type": "ocr_text", "text": ocr1, "page_num": 1, "source": "ocr",
+         "extra": {"source_image": "流程_sheet0_img0000.png"}},
+        {"block_type": "ocr_text", "text": ocr2, "page_num": 1, "source": "ocr",
+         "extra": {"source_image": "流程_sheet0_img0001.png"}},
+    ]
+    assets = [
+        _totext_asset(0, "流程_sheet0_img0000.png",
+                      "U8系统外贸发票界面截图，显示销售类型为外销", ocr1, anchor_row=1),
+        # 第二张故意无 caption —— chunk_text 必须回退 OCR 片段，不能是空描述
+        _totext_asset(1, "流程_sheet0_img0001.png", "", ocr2, anchor_row=33),
+    ]
+    doc = _xlsx_doc("外贸发票操作流程.xlsx", blocks, assets, text=ocr1 + "\n" + ocr2)
+    chunks = _chunk_doc(doc)
+
+    img_chunks = [c for c in chunks if c.chunk_type == "image"]
+    assert len(img_chunks) == 2, (
+        f"TO_TEXT 截图应各得一个兜底 image chunk，实际 {len(img_chunks)}")
+    for c in img_chunks:
+        assert c.extra.get("source_image"), "image chunk 必须带 chunk 级 source_image"
+        assert "processing/assets/it/XLSXIMG1/v1/" in c.extra["source_image"]
+    rendered = _serving_renderable_fns(chunks)
+    for a in assets:
+        assert a["filename"] in rendered, f"{a['filename']} 提取了但 serving 不可渲染（I5）"
+    # caption 缺失的截图：描述回退 OCR 片段
+    c2 = [c for c in img_chunks if "img0001" in c.extra["source_image"]][0]
+    assert "单证打印" in c2.chunk_text, f"空 caption 未回退 OCR 片段: {c2.chunk_text!r}"
+
+
+def test_xlsx_procedure_totext_bound_to_step_cards():
+    """procedure_image_guide 版式：TO_TEXT 截图必须与 TO_VECTOR 一样按
+    figure_no/anchor 绑进 step_card（refs 经 RDS image_refs_json 恢复，serving 可达），
+    且不再重复建独立 image chunk。"""
+    steps = [
+        "1\t整理注塑发货拖柜中的发货单，核对发货数量与单据是否一致无误。",
+        "2\t登录U8系统进入销售出库单界面，录入出库日期仓库编号与货位数据。",
+        "3\t确认实际发货数量后依次点击保存审核打印，将单子按联次分发存档。",
+    ]
+    blocks = [{"block_type": "heading", "text": "Sheet1", "page_num": 1,
+               "section_path": "Sheet1", "source": "openpyxl",
+               "extra": {"section_type": "cleaning_items"}}]
+    blocks += [{"block_type": "paragraph", "text": s, "page_num": 1, "source": "openpyxl",
+                "extra": {"step_no": i + 1, "row_role": "step",
+                          "row_num": 10 + i * 10, "sheet_idx": 0}}
+               for i, s in enumerate(steps)]
+    assets = [
+        _totext_asset(0, "wi_img0000.png", "", "", anchor_row=12, figure_no="图1",
+                      status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "wi_img0001.png", "", "", anchor_row=22, figure_no="图2"),
+        # 无图号、无内容匹配 → priority-2 兜到仍无图的步骤
+        _totext_asset(2, "wi_img0002.png", "", "", anchor_row=32),
+    ]
+    doc = _xlsx_doc("成品包装作业指导书.xlsx", blocks, assets, text="\n".join(steps))
+    chunks = _chunk_doc(doc)
+
+    step_cards = {c.extra.get("step_no"): c for c in chunks if c.chunk_type == "step_card"}
+    assert set(step_cards) == {1, 2, 3}, f"应产出 3 个 step_card: {sorted(step_cards)}"
+
+    refs1 = step_cards[1].extra.get("image_refs") or []
+    assert [r["filename"] for r in refs1] == ["wi_img0000.png"], "VECTOR 图1→步骤1 绑定回归"
+    refs2 = step_cards[2].extra.get("image_refs") or []
+    assert [r["filename"] for r in refs2] == ["wi_img0001.png"], (
+        f"TO_TEXT 截图未按图号绑进 step_card: {refs2}")
+    refs3 = step_cards[3].extra.get("image_refs") or []
+    assert [r["filename"] for r in refs3] == ["wi_img0002.png"], (
+        f"无图号 TO_TEXT 截图未被 priority-2 兜底绑定: {refs3}")
+    # image_refs 契约键（CLAUDE.md：extractor → chunker → builder → 卡片全链路依赖）
+    for key in ("oss_key", "source_image", "visual_summary", "ocr_text"):
+        assert key in refs2[0], f"image_refs 契约键缺失: {key}"
+    assert refs2[0]["oss_key"].startswith("processing/assets/it/XLSXIMG1/v1/")
+    # 已绑定 → 不再重复建独立 image chunk
+    assert not [c for c in chunks if c.chunk_type == "image"], "绑定后不应再建独立 image chunk"
+    assert {a["filename"] for a in assets} <= _serving_renderable_fns(chunks)
+
+
+def test_xlsx_procedure_totext_appends_as_secondary_ref():
+    """TO_TEXT 第二轮绑定不与 VECTOR 抢占：图号命中已有 VECTOR 图的步骤时按多图追加，
+    VECTOR 绑定结果保持原样。"""
+    steps = ["1\t按下设备电源开关，等待系统自检完成并确认指示灯转为绿色常亮状态。",
+             "2\t在触摸屏上选择产品对应的工艺程序号，核对模具温度与压力参数设定。"]
+    blocks = [{"block_type": "paragraph", "text": s, "page_num": 1, "source": "openpyxl",
+               "extra": {"step_no": i + 1, "row_role": "step",
+                         "row_num": 10 + i * 10, "sheet_idx": 0}}
+              for i, s in enumerate(steps)]
+    assets = [
+        _totext_asset(0, "mix_img0000.png", "", "", anchor_row=12, figure_no="图1",
+                      status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "mix_img0001.png", "", "", anchor_row=13, figure_no="图1"),
+    ]
+    doc = _xlsx_doc("设备操作作业指导书.xlsx", blocks, assets, text="\n".join(steps))
+    chunks = _chunk_doc(doc)
+
+    step_cards = {c.extra.get("step_no"): c for c in chunks if c.chunk_type == "step_card"}
+    refs1 = step_cards[1].extra.get("image_refs") or []
+    assert [r["filename"] for r in refs1] == ["mix_img0000.png", "mix_img0001.png"], (
+        f"TO_TEXT 应作为第二张图追加且不挤掉 VECTOR: {refs1}")
+
+
+def test_xlsx_procedure_unbindable_totext_falls_back_to_image_chunk():
+    """procedure 版式下绑不进任何步骤的 TO_TEXT 截图（步骤全部已带图、又无图号/内容
+    匹配）不能静默丢弃 —— 必须走独立 image chunk 兜底。"""
+    steps = ["1\t核对来料标签上的物料编码批次号与送检单信息完全一致后签收入库。"]
+    blocks = [{"block_type": "paragraph", "text": steps[0], "page_num": 1,
+               "source": "openpyxl",
+               "extra": {"step_no": 1, "row_role": "step", "row_num": 10, "sheet_idx": 0}}]
+    assets = [
+        _totext_asset(0, "q_img0000.png", "", "", anchor_row=11, figure_no="图1",
+                      status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "q_img0001.png", "", "单证打印窗口选项设置说明", anchor_row=40),
+    ]
+    doc = _xlsx_doc("来料检验作业指导书.xlsx", blocks, assets, text=steps[0])
+    chunks = _chunk_doc(doc)
+
+    step_cards = [c for c in chunks if c.chunk_type == "step_card"]
+    assert step_cards and [r["filename"] for r in
+                           (step_cards[0].extra.get("image_refs") or [])] == ["q_img0000.png"]
+    img_chunks = [c for c in chunks if c.chunk_type == "image"]
+    assert [c for c in img_chunks if "q_img0001" in (c.extra.get("source_image") or "")], (
+        "绑不进步骤的 TO_TEXT 截图应建独立 image chunk 兜底")
+    assert "q_img0001.png" in _serving_renderable_fns(chunks)
+
+
+def test_docx_totext_fallback_unchanged():
+    """非 XLSX 路径行为保持不变：非 step 的 DOCX 嵌入 TO_TEXT 图片不建独立
+    image chunk（既有 [ref-enrich] 行为，避免本修复扩大爆炸半径）。"""
+    blocks = [{"block_type": "paragraph",
+               "text": "公司差旅费报销需在出差结束后五个工作日内提交申请单并附发票原件。",
+               "page_num": None, "section_path": None, "source": "native", "extra": {}}]
+    assets = [_totext_asset(0, "d_img0000.png", "报销单样例截图", "报销流程说明", anchor_row=None)]
+    doc = _xlsx_doc("差旅费报销制度说明.docx", blocks, assets)
+    doc["file_ext"] = "docx"
+    doc["filename"] = "差旅费报销制度说明.docx"
+    chunks = _chunk_doc(doc)
+    assert not [c for c in chunks if c.chunk_type == "image"], (
+        "DOCX TO_TEXT 嵌入图的兜底行为不应被 XLSX 修复改变")
+
+
+def test_route_to_text_assets_uploaded(tmp_path):
+    """绑定会把 ROUTE_TO_TEXT 截图绑进 chunk 并构造 processing/assets/ 路径 ——
+    上传闸只传 TO_VECTOR 时这些路径永不存在，serving 签出 403 死图
+    （2026-06-10 对抗评审发现；UI 截图多数路由 TO_TEXT）。"""
+    from opensearch_pipeline.pipeline_nodes import _upload_clean_assets
+
+    img_v = tmp_path / "a_p1_img0001.png"
+    img_v.write_bytes(b"v")
+    img_t = tmp_path / "a_p1_img0002.png"
+    img_t.write_bytes(b"t")
+    img_doc = tmp_path / "poster.png"
+    img_doc.write_bytes(b"p")
+    img_d = tmp_path / "a_p1_img0003.png"
+    img_d.write_bytes(b"d")
+
+    class _R:
+        doc_id = "DOCX1"
+        version_no = 2
+        source_key = "raw/production/x.pdf"
+        assets = [
+            {"status": "ROUTE_TO_VECTOR", "local_path": str(img_v), "oss_key": ""},
+            {"status": "ROUTE_TO_TEXT", "local_path": str(img_t), "oss_key": ""},
+            # 独立图片文档：oss_key 已指向 raw/ 原对象 → 跳过重复上传
+            {"status": "ROUTE_TO_TEXT", "local_path": str(img_doc),
+             "oss_key": "raw/production/poster.png"},
+            {"status": "DISCARD_DECORATIVE", "local_path": str(img_d), "oss_key": ""},
+        ]
+
+    puts = []
+
+    class _Bucket:
+        def put_object_from_file(self, key, path):
+            puts.append(key)
+
+    n = _upload_clean_assets([_R()], _Bucket())
+    assert n == 2, f"应上传 TO_VECTOR + TO_TEXT 共 2 张，实际 {n}"
+    assert any("img0001" in k for k in puts), "TO_VECTOR 未上传"
+    assert any("img0002" in k for k in puts), "TO_TEXT 未上传（403 死图回归）"
+    assert not any("poster" in k for k in puts), "已带 oss_key 的独立图片文档不应重复上传"
+    assert not any("img0003" in k for k in puts), "DISCARD 不应上传"
+    # 上传后 oss_key 回写（绑定注入读它构造 durable 引用）
+    assert _R.assets[0]["oss_key"].startswith("processing/assets/production/DOCX1/v2/")
+    assert _R.assets[1]["oss_key"].startswith("processing/assets/production/DOCX1/v2/")
+
+
+def test_upload_occurrence_copies_share_one_put(tmp_path):
+    """同一 local_path 的出现副本（同 media 多处引用）只 PUT 一次，
+    oss_key 回写到每个副本 —— 否则同字节重复上传白耗带宽。"""
+    from opensearch_pipeline.pipeline_nodes import _upload_clean_assets
+
+    img = tmp_path / "b_img0000.png"
+    img.write_bytes(b"x")
+
+    class _R:
+        doc_id = "DOCX2"
+        version_no = 1
+        source_key = "raw/hr/y.docx"
+        assets = [
+            {"status": "ROUTE_TO_TEXT", "local_path": str(img), "oss_key": ""},
+            {"status": "ROUTE_TO_TEXT", "local_path": str(img), "oss_key": ""},
+        ]
+
+    puts = []
+
+    class _Bucket:
+        def put_object_from_file(self, key, path):
+            puts.append(key)
+
+    n = _upload_clean_assets([_R()], _Bucket())
+    assert n == 1 and len(puts) == 1, f"副本应共享 1 次上传，实际 puts={len(puts)}"
+    assert _R.assets[0]["oss_key"] == _R.assets[1]["oss_key"] != ""
+
+
+# ═══════════════ DOCX 复用 media 的出现位置保全 ═══════════════
+
+def test_docx_alias_rels_same_bytes_keep_refs(monkeypatch, tmp_path):
+    """两个不同 rId 指向字节相同的 media：第二个 rel 的 target_ref 必须以
+    别名资产保留（共享一次导出）—— 旧逻辑 md5 去重直接 continue，
+    正文第二处引用对齐不到资产、整个出现位置丢失。"""
+    docx_mod = pytest.importorskip("docx")
+    from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_docx
+
+    shared_bytes = b"\x89PNG\r\n\x1a\n_samebytes"
+
+    class _Part:
+        blob = shared_bytes
+        content_type = "image/png"
+
+    class _Rel:
+        reltype = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+        def __init__(self, ref):
+            self.target_part = _Part()
+            self.target_ref = ref
+
+    class _DocPart:
+        rels = {"rId7": _Rel("media/image1.png"), "rId9": _Rel("media/image2.png")}
+
+    class _Doc:
+        part = _DocPart()
+
+    monkeypatch.setattr(docx_mod, "Document", lambda p: _Doc())
+    assets = extract_images_from_docx(str(tmp_path / "fake.docx"), str(tmp_path))
+    assert len(assets) == 2, f"别名 rel 应保留为第 2 条资产，实际 {len(assets)}"
+    assert assets[0].local_path == assets[1].local_path, "同字节应共享一次导出"
+    assert {a.original_name for a in assets} == {"media/image1.png", "media/image2.png"}
+    assert [a.image_index for a in assets] == [0, 1]
+
+
+def test_reused_docx_media_keeps_every_occurrence(monkeypatch, tmp_path):
+    """同一张图在 DOCX 两处出现（python-docx 按内容去重 → 同 rId 复用）：
+    两个出现位置都必须保住各自的 image_index —— 旧对齐逻辑原地改共享对象的
+    image_index，last-write-wins，步骤1 的图②永远绑不上（已知问题清单 2026-06-10）。"""
+    docx_mod = pytest.importorskip("docx")
+    pil_image = pytest.importorskip("PIL.Image")
+
+    img_path = tmp_path / "shared.png"
+    pil_image.new("RGB", (200, 120), (200, 30, 30)).save(str(img_path))
+
+    d = docx_mod.Document()
+    d.add_paragraph("步骤1：打开U8登录界面，输入工号与密码，参考下图图②完成配置。")
+    d.add_picture(str(img_path))
+    d.add_paragraph("步骤2：进入销售管理模块，依次选择销售出库单功能项并打开。")
+    d.add_paragraph("步骤3：再次核对图②中的登录配置，确认服务器地址与账套无误。")
+    d.add_picture(str(img_path))
+    fp = tmp_path / "reuse.docx"
+    d.save(str(fp))
+
+    _fake_funnel(monkeypatch, {
+        "status": "ROUTE_TO_TEXT",
+        "ocr_text": "用户名 密码 登录",
+        "visual_summary": "U8登录界面截图",
+        "image_category": "step_screenshot",
+        "vlm_annotation_map": {}, "reason": "",
+        "width": 200, "height": 120, "file_size_kb": 5.0,
+    })
+    r = UnifiedExtractor(simulate=True).extract({
+        "doc_id": "REUSE01", "version_no": 1, "local_path": str(fp),
+        "file_ext": "docx", "filename": fp.name,
+        "raw_key": f"raw/production/{fp.name}", "_tmp_dir": str(tmp_path),
+    })
+
+    refs = [b for b in r.blocks if b.block_type == "image_ref"]
+    assert len(refs) == 2, f"两处出现应有 2 个 image_ref，实际 {len(refs)}"
+    assert sorted(b.extra.get("image_index") for b in refs) == [0, 1]
+
+    idx_list = sorted(a.get("image_index") for a in r.assets)
+    assert idx_list == [0, 1], (
+        f"资产 image_index 应为 [0,1]，实际 {idx_list}（共享对象 last-write-wins 回归）")
+    assert len({a.get("local_path") for a in r.assets}) == 1, "同字节 media 应共享一次导出"
+
+
+# ═══════════════ 条带切片缝合（Word 把一张照片存成 N 条窄条） ═══════════════
+
+def _strip_fixture(tmp_path, n, size, noise=False):
+    """生成 n 张 size 尺寸的 PNG + 对应 image_ref 块与 ImageAsset。"""
+    pil_image = pytest.importorskip("PIL.Image")
+    import os as _os
+
+    from opensearch_pipeline.extraction.image_extraction_utils import ImageAsset
+    from opensearch_pipeline.extraction.schema import ExtractedBlock
+
+    blocks, assets = [], []
+    for i in range(n):
+        p = tmp_path / f"slice{i:02d}.png"
+        if noise:  # 噪声图压不下去 → 文件 >3KB（模拟"现状能存活"的真图）
+            im = pil_image.frombytes("RGB", size, _os.urandom(size[0] * size[1] * 3))
+        else:
+            im = pil_image.new("RGB", size, (10 * i % 255, 80, 120))
+        im.save(str(p))
+        blocks.append(ExtractedBlock(block_type="image_ref", text="",
+                                     extra={"image_index": i}))
+        assets.append(ImageAsset(local_path=str(p), image_index=i))
+    return blocks, assets
+
+
+def _para(text="正文段落，用于隔断图片 run。"):
+    from opensearch_pipeline.extraction.schema import ExtractedBlock
+    return ExtractedBlock(block_type="paragraph", text=text)
+
+
+def test_strip_run_stitched(tmp_path):
+    """6 条 600×20 同宽窄条（逐条必被 Funnel-1 丢弃）→ 缝成一张 600×120 复合图，
+    ref 块收敛为 1 个（继承首条 image_index，标注 stitched_from）。"""
+    pil_image = pytest.importorskip("PIL.Image")
+    from opensearch_pipeline.extraction.unified_extractor import _stitch_strip_runs
+
+    refs, assets = _strip_fixture(tmp_path, 6, (600, 20))
+    blocks = [_para()] + refs + [_para("结尾段落。")]
+    out_blocks, out_assets = _stitch_strip_runs(blocks, assets)
+
+    out_refs = [b for b in out_blocks if b.block_type == "image_ref"]
+    assert len(out_refs) == 1, f"6 条应收敛为 1 个 ref，实际 {len(out_refs)}"
+    assert out_refs[0].extra.get("image_index") == 0
+    assert out_refs[0].extra.get("stitched_from") == 6
+    assert len(out_assets) == 1
+    comp = out_assets[0]
+    assert comp.image_index == 0 and "stitched" in comp.local_path
+    with pil_image.open(comp.local_path) as im:
+        assert im.size == (600, 120)
+
+
+def test_icon_row_not_stitched(tmp_path):
+    """4 个 32×32 方形小图标（工具栏/①②③枚举）：不满足条状判据 → 原样保留。"""
+    from opensearch_pipeline.extraction.unified_extractor import _stitch_strip_runs
+
+    refs, assets = _strip_fixture(tmp_path, 4, (32, 32))
+    out_blocks, out_assets = _stitch_strip_runs(list(refs), assets)
+    assert len([b for b in out_blocks if b.block_type == "image_ref"]) == 4
+    assert len(out_assets) == 4
+
+
+def test_grid_tiles_not_stitched(tmp_path):
+    """23×31 网格小块（交货单案例的真实形态）：纵向堆叠会产生无意义细长柱，
+    条状判据故意不放行 —— 行为与现状一致（丢弃），留待网格重建。"""
+    from opensearch_pipeline.extraction.unified_extractor import _stitch_strip_runs
+
+    refs, assets = _strip_fixture(tmp_path, 8, (23, 31))
+    out_blocks, out_assets = _stitch_strip_runs(list(refs), assets)
+    assert len(out_assets) == 8, "网格块不应被缝合"
+
+
+def test_surviving_images_not_stitched(tmp_path):
+    """4 张 200×60 真图（h≥50、aspect<8、>3KB，现状能通过 Funnel-1）：
+    缝合只准救回必死的切片，绝不吞并现状存活的图。"""
+    from opensearch_pipeline.extraction.unified_extractor import _stitch_strip_runs
+
+    refs, assets = _strip_fixture(tmp_path, 4, (200, 60), noise=True)
+    out_blocks, out_assets = _stitch_strip_runs(list(refs), assets)
+    assert len(out_assets) == 4, "现状存活的图被错误缝合"
+
+
+def test_stitch_missing_asset_fail_open(tmp_path):
+    """ref 找不到对应资产（对齐缺口）→ 整个 run 原样保留，不抛异常。"""
+    from opensearch_pipeline.extraction.schema import ExtractedBlock
+    from opensearch_pipeline.extraction.unified_extractor import _stitch_strip_runs
+
+    refs = [ExtractedBlock(block_type="image_ref", text="",
+                           extra={"image_index": i}) for i in range(5)]
+    out_blocks, out_assets = _stitch_strip_runs(refs, [])
+    assert len(out_blocks) == 5 and out_assets == []
+
+
+# ═══════════════ 圈数字 callout 伪标题 veto ═══════════════
+
+def test_is_pseudo_heading_cases():
+    from opensearch_pipeline.extraction.schema import is_pseudo_heading
+    for t in ("⑤双击图标", "  ⑤双击图标", "❸点击保存", "⓫输入数量"):
+        assert is_pseudo_heading(t), f"{t!r} 应判为 callout"
+    for t in ("4.1 检查模具", "第一章 总则", "一、目的", "（一）适用范围", "1. 适用范围", ""):
+        assert not is_pseudo_heading(t), f"{t!r} 不应判为 callout"
+
+
+def test_pdf_callout_demoted_heading_kept(tmp_path):
+    """同为标题字号："⑤双击图标"→ 普通段落（旧行为被字号启发判成 heading →
+    章节：⑤双击图标 污染下游所有 chunk）；"4.1 检查模具"→ 必须仍是 heading
+    （驱动切块边界，veto 故意不碰编号标题）。"""
+    fitz = pytest.importorskip("fitz")
+    pytest.importorskip("pdfplumber")
+    from opensearch_pipeline.extraction.pdf_extractor import extract_pdf
+
+    doc = fitz.open()
+    page = doc.new_page()
+    y = 60
+    page.insert_text((50, y), "FL-ZS-WI-099 测试作业指导书",
+                     fontsize=16, fontname="china-s")
+    y += 28
+    for i in range(14):
+        page.insert_text((50, y), f"正文第{i}行，常规操作说明文本，用来建立正文字号的统计分布。",
+                         fontsize=10.5, fontname="china-s")
+        y += 15
+    page.insert_text((50, y), "⑤双击图标", fontsize=16, fontname="china-s")
+    y += 28
+    page.insert_text((50, y), "4.1 检查模具", fontsize=16, fontname="china-s")
+    p = tmp_path / "callout.pdf"
+    doc.save(str(p))
+    doc.close()
+
+    blocks, _, _ = extract_pdf(str(p))
+
+    def _norm(s):
+        return "".join((s or "").split())  # pdfplumber 拼词会插双空格
+
+    callout = [b for b in blocks if "⑤双击图标" in _norm(b.text)]
+    numbered = [b for b in blocks if "4.1检查模具" in _norm(b.text)]
+    assert callout and all(b.block_type != "heading" for b in callout), \
+        "圈数字 callout 不应是 heading"
+    assert numbered and any(b.block_type == "heading" for b in numbered), \
+        "编号节标题必须仍是 heading"
+    assert all("⑤" not in (b.section_path or "") for b in blocks), \
+        "section_path 被 callout 污染"
+
+
+# ═══════════════ 准入策略 × 提取器 契约 ═══════════════
+
+def test_every_ingestable_ext_has_extractor_route():
+    """policy 放行的扩展名必须都有非 unsupported 的提取分支 —— 否则未知格式
+    会以 unsupported 空文档静默走完生命周期（0-chunk 不可见文档的复发路径）。"""
+    from opensearch_pipeline.ingest_policy import INGESTABLE_EXTS
+    # unified_extractor.extract() 的路由表（与代码同步维护；新增格式两处都要加）
+    extractor_routes = {
+        "pdf", "docx", "xlsx", "pptx",
+        "txt", "md", "csv", "html", "htm",
+        "png", "jpg", "jpeg", "webp", "tif", "tiff", "gif", "bmp",
+    }
+    missing = INGESTABLE_EXTS - extractor_routes
+    assert not missing, f"policy 放行但提取器无路由: {missing}"
+
+
+def test_stage1_sql_predicates_share_single_source():
+    """认领 SQL（node_scan_raw_files）与排空计数 SQL（_count_pending_rows stage-1）
+    必须用同一份扩展名排除清单 —— 不一致时计数器看得到、认领挑不走，
+    run_stage_drained 的无进展守卫会把 stage-1 永久判死。"""
+    import inspect
+
+    from opensearch_pipeline import dataworks_orchestrator, pipeline_nodes
+    from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
+
+    frag = "stage1_ext_exclusion_sql()"
+    scan_src = inspect.getsource(pipeline_nodes.node_scan_raw_files)
+    count_src = inspect.getsource(dataworks_orchestrator._count_pending_rows)
+    assert frag in scan_src, "node_scan_raw_files 未使用共享排除清单"
+    assert frag in count_src, "_count_pending_rows 未使用共享排除清单"
+    # 渲染结果是合法 SQL 元组
+    rendered = stage1_ext_exclusion_sql()
+    assert rendered.startswith("(") and rendered.endswith(")") and "'doc'" in rendered
+
+
+def test_register_fallback_parity_with_canonical_policy():
+    """register_new_files.py 的内联副本（PyODPS 节点上实际执行的那份）必须与
+    正本逐键同判 —— 上一次漂移（只跳 _quarantine）正是垃圾注册的来源。"""
+    import ast
+    import os as _os
+
+    from opensearch_pipeline.ingest_policy import (
+        IGNORED_EXTS,
+        INGESTABLE_EXTS,
+        UNSUPPORTED_LEGACY_EXTS,
+        should_ingest_raw_key,
+    )
+
+    src_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                             "dataworks_nodes", "register_new_files.py")
+    tree = ast.parse(open(src_path, encoding="utf-8").read())
+    fallback_body = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try):
+            for handler in node.handlers:
+                if any(isinstance(n, ast.FunctionDef) and n.name == "should_ingest_raw_key"
+                       for n in ast.walk(handler)):
+                    fallback_body = handler.body
+    assert fallback_body, "未找到内联 fallback should_ingest_raw_key"
+    ns = {"os": _os, "INGEST_POLICY_REV": "", "print": lambda *a, **k: None}
+    exec(compile(ast.Module(body=fallback_body, type_ignores=[]), src_path, "exec"), ns)
+    fallback_fn = ns["should_ingest_raw_key"]
+
+    # 全矩阵对拍：所有清单扩展名 × 路径形态 + 边角 key
+    keys = []
+    all_exts = sorted(IGNORED_EXTS | UNSUPPORTED_LEGACY_EXTS | INGESTABLE_EXTS | {"wps", "et", "bak"})
+    for ext in all_exts:
+        keys += [f"raw/admin/文件.{ext}",
+                 f"raw/_archive/admin/文件.{ext}",
+                 f"raw/admin/_quarantine/文件.{ext}"]
+    keys += ["raw/hr/~$temp.docx", "raw/x/Thumbs.db", "raw/x/.DS_Store",
+             "raw/admin/", "raw/admin/无扩展名", "raw/admin/报告.PDF",
+             "_quarantine/x.pdf", "_archive/x.pdf"]
+    for key in keys:
+        canonical_ok, _ = should_ingest_raw_key(key)
+        fallback_ok, _ = fallback_fn(key)
+        assert canonical_ok == fallback_ok, f"策略分歧 key={key}: 正本={canonical_ok} 副本={fallback_ok}"

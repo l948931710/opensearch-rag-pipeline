@@ -241,6 +241,92 @@ def _build_permission_filter(user_dept: Optional[str]) -> str:
     return 'permission_level="public"'
 
 
+def _search_chunks_opensearch(
+    query: str,
+    dense: List[float],
+    top_k: int,
+    user_dept: str = None,
+) -> List[Dict[str, Any]]:
+    """本地开发回退检索：标准 OpenSearch dense kNN(0.7) + BM25(0.3)。
+
+    仅当 HA3 endpoint 未配置且 opensearch.host 已配置时由 search_chunks 调用
+    （生产配置 HA3，本分支不可达）。返回与 _parse_ha3_response 同形的 chunk 字典，
+    权限语义与 HA3 过滤一致（public 或 dept_internal+本部门）；
+    封面降权逻辑与 HA3 路径保持同款。
+    """
+    from opensearchpy import OpenSearch
+
+    cfg = get_config().opensearch
+    client = OpenSearch(
+        hosts=[{"host": cfg.host, "port": cfg.port}],
+        http_auth=(cfg.auth_user, cfg.auth_password) if cfg.auth_user else None,
+        use_ssl=cfg.use_ssl, verify_certs=cfg.verify_certs,
+        timeout=30,
+    )
+
+    perm_should = [{"term": {"kb_type": "public"}}]
+    if user_dept:
+        perm_should.append({"bool": {"must": [
+            {"term": {"permission_level": "dept_internal"}},
+            {"term": {"owner_dept": user_dept}},
+        ]}})
+
+    fetch_k = max(top_k * 2, top_k + 5)
+    body = {
+        "size": fetch_k,
+        "_source": ["chunk_id", "id", "doc_id", "chunk_text", "chunk_type", "title",
+                    "section_title", "chunk_index", "page_num", "kb_type",
+                    "permission_level", "owner_dept", "category_l1",
+                    "source_image", "visual_summary"],
+        "query": {"bool": {
+            "should": [
+                {"knn": {"chunk_vector": {"vector": dense, "k": fetch_k, "boost": 0.7}}},
+                {"match": {"chunk_text": {"query": query, "boost": 0.3}}},
+            ],
+            "filter": [{"bool": {"should": perm_should, "minimum_should_match": 1}}],
+        }},
+    }
+    resp = client.search(index=cfg.index_name, body=body)
+
+    parsed = []
+    for hit in resp["hits"]["hits"]:
+        src = hit.get("_source", {})
+        # _source 字段可能显式为 null（与缺失不同），统一空值兜底
+        parsed.append({
+            "chunk_id": (src.get("chunk_id") or hit.get("_id") or ""),
+            "id": str(src.get("id") or hit.get("_id") or ""),
+            "chunk_text": src.get("chunk_text") or "",
+            "title": src.get("title") or "",
+            "section_title": src.get("section_title") or "",
+            "doc_id": src.get("doc_id") or "",
+            "category_l1": src.get("category_l1") or "",
+            "chunk_index": src.get("chunk_index") or 0,
+            "page_num": src.get("page_num") or 0,
+            "kb_type": src.get("kb_type") or "public",
+            "permission_level": src.get("permission_level") or "public",
+            "owner_dept": src.get("owner_dept") or "",
+            "chunk_type": src.get("chunk_type") or "",
+            "source_image": src.get("source_image") or "",
+            "visual_summary": src.get("visual_summary") or "",
+            "score": hit.get("_score", 0),
+        })
+
+    # 封面降权（与 HA3 路径同款）
+    content_results, cover_results = [], []
+    for r in parsed:
+        if r.get("chunk_type") in ("image", "step_card", "procedure_parent", "visual_knowledge"):
+            content_results.append(r)
+        elif not r.get("section_title") and len(r.get("chunk_text", "")) < 200:
+            r["_is_cover"] = True
+            cover_results.append(r)
+        else:
+            content_results.append(r)
+    results = (content_results + cover_results)[:top_k]
+    logger.info("OpenSearch fallback search: query=%r, results=%d (content=%d, cover=%d)",
+                query[:30], len(results), len(content_results), len(cover_results))
+    return results
+
+
 def search_chunks(
     query: str,
     *,
@@ -296,6 +382,13 @@ def search_chunks(
     logger.info("Permission filter: user_dept=%s, filter=%s", user_dept, filter_expr)
 
     # 3. 构建请求并执行
+    # 本地开发回退：HA3 未配置且本地 OpenSearch 可用时走标准 OpenSearch 检索
+    # （dense kNN 0.7 + BM25 0.3，与线上 weighted 融合同权重；
+    #  生产配置了 HA3 endpoint，此分支不可达 —— 2026-06-10 本地 E2E 引入）
+    _full_cfg = get_config()
+    if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
+        return _search_chunks_opensearch(query, dense, top_k, user_dept)
+
     client = _get_ha3_client()
 
     if cfg.enable_hybrid:
@@ -668,7 +761,9 @@ def expand_step_context(
                 "SELECT chunk_id, chunk_text, step_no, section_title, "
                 "       extra_json, image_refs_json, parent_chunk_id "
                 f"FROM chunk_meta WHERE parent_chunk_id IN ({ph}) AND is_active = 1 "
-                "ORDER BY step_no",
+                # chunk_id 内嵌零填充 _cNNNN_ 序号 → 字典序 = 文档顺序；
+                # 兜底 step_no 平局（N) 子步骤沿用主号、X.Y 步骤等）的展示顺序
+                "ORDER BY step_no, chunk_id",
                 tuple(parent_ids),
             )
             for row in cursor.fetchall():
@@ -751,6 +846,8 @@ def expand_step_context(
                         "score": score,
                         "image_refs": _normalize_image_refs(sib.get("image_refs_json")),
                         "annotation_map": extra.get("annotation_map", {}),
+                        # 条款编号原文（4.1 / 3.2.4），展示层用它替代 ordinal step_no
+                        "section_no": extra.get("section_no", ""),
                         "is_expanded": not is_hit,
                         "expanded_from": chunk_id if not is_hit else None,
                         "expansion_reason": "sibling_step" if not is_hit else None,
@@ -799,6 +896,7 @@ def expand_step_context(
                         "score": original_score * 0.8,
                         "image_refs": _normalize_image_refs(child.get("image_refs_json")),
                         "annotation_map": child_extra.get("annotation_map", {}),
+                        "section_no": child_extra.get("section_no", ""),
                         "is_expanded": True,
                         "expanded_from": parent_chunk_id,
                         "expansion_reason": "parent_children",

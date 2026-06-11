@@ -24,6 +24,9 @@ class ImageAsset:
     page_num: Optional[int] = None          # 所在页码（PDF 可精确提供，DOCX 为 None）
     image_index: int = 0                    # 在文档中的顺序索引
     original_name: str = ""                 # 在文档包内的原始名称（如 media/image3.jpeg）
+    # 页面显示 bbox (x0, y0, x1, y1)，页坐标、上原点（PDF/PPTX 可提供；与文本块
+    # extra.y0/y1 同坐标系，供按版面位置锚定图片→步骤）
+    bbox: Optional[tuple] = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -55,7 +58,7 @@ def extract_images_from_docx(
         return []
 
     assets: List[ImageAsset] = []
-    seen_hashes: set = set()
+    seen_hashes: dict = {}  # md5 -> 首次导出的 ImageAsset
 
     try:
         document = docx.Document(local_path)
@@ -75,11 +78,21 @@ def extract_images_from_docx(
         except Exception:
             continue
 
-        # MD5 去重
+        # MD5 去重：字节只导出一次，但不同 rId 指向同字节的"别名"关系
+        # 必须保留各自的 target_ref，否则正文里第二处引用对齐不到资产、
+        # 整个出现位置丢失（图② 同时出现在步骤1/步骤3 的场景）。
         md5 = hashlib.md5(blob).hexdigest()
-        if md5 in seen_hashes:
+        first = seen_hashes.get(md5)
+        if first is not None:
+            if rel.target_ref != first.original_name:
+                assets.append(ImageAsset(
+                    local_path=first.local_path,
+                    page_num=None,
+                    image_index=img_index,
+                    original_name=rel.target_ref,
+                ))
+                img_index += 1
             continue
-        seen_hashes.add(md5)
 
         # 确定文件扩展名
         content_type = getattr(rel.target_part, 'content_type', '')
@@ -100,17 +113,20 @@ def extract_images_from_docx(
             print(f"      ⚠️ Failed to export DOCX image {rel.target_ref}: {e}")
             continue
 
-        assets.append(ImageAsset(
+        asset = ImageAsset(
             local_path=out_path,
             page_num=None,
             image_index=img_index,
             original_name=rel.target_ref,
-        ))
+        )
+        assets.append(asset)
+        seen_hashes[md5] = asset
         img_index += 1
 
     if assets:
-        print(f"      [docx-img] Extracted {len(assets)} unique images "
-              f"(deduped from {len([r for r in document.part.rels.values() if 'image' in r.reltype])} refs)")
+        print(f"      [docx-img] Extracted {len(assets)} images "
+              f"({len(seen_hashes)} unique blobs, "
+              f"{len([r for r in document.part.rels.values() if 'image' in r.reltype])} refs)")
 
     return assets
 
@@ -118,6 +134,137 @@ def extract_images_from_docx(
 # ═══════════════════════════════════════════════════════════════
 # PDF — PyMuPDF (fitz) 逐页提取
 # ═══════════════════════════════════════════════════════════════
+
+# PIL transpose op → 日志名（lazy 引用 PIL，模块级只存 op 名）
+_TRANSPOSE_LOG_NAMES = {
+    "FLIP_TOP_BOTTOM": "flip_tb",
+    "FLIP_LEFT_RIGHT": "flip_lr",
+    "ROTATE_180": "rot180",
+    "ROTATE_90": "rot90ccw",
+    "ROTATE_270": "rot90cw",
+    "TRANSPOSE": "transpose",
+    "TRANSVERSE": "transverse",
+}
+
+
+def _pdf_page_display_ops(page) -> dict:
+    """
+    计算页面上每个图片 xref 的显示朝向校正操作。
+
+    扫描件/转换器产出的 PDF 常把位图按非常规朝向存储（如逐行倒序＝垂直镜像、
+    或旋转 180°），再用内容流 CTM 补偿，viewer 显示正常；但 extract_image
+    导出的是存储字节，朝向就是错的。page /Rotate 同理只作用于显示。
+
+    判定依据：get_image_info 的 transform（未旋转页坐标系）∘ page.rotation_matrix
+    的符号模式 → 8 类朝向。轴主导时看 (a,d) 符号，对角主导时看 (b,c) 符号。
+    （已用 9 种合成组合 + 真实坏档逐像素对照页面渲染验证。）
+
+    Returns:
+        {xref: PIL Transpose op 名称字符串}；缺失或 None = 无需校正。
+    """
+    ops = {}
+    try:
+        infos = page.get_image_info(xrefs=True)
+    except Exception:
+        return ops
+
+    import fitz
+
+    best_area = {}  # xref -> bbox 面积（同一 xref 多次出现时取最大实例）
+    for info in infos:
+        xref = info.get("xref", 0)
+        transform = info.get("transform")
+        if not xref or transform is None:
+            continue
+        bbox = info.get("bbox") or (0, 0, 0, 0)
+        area = abs((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+        if xref in best_area and area <= best_area[xref]:
+            continue
+        best_area[xref] = area
+
+        try:
+            mat = fitz.Matrix(transform) * page.rotation_matrix
+        except Exception:
+            continue
+        a, b, c, d = mat.a, mat.b, mat.c, mat.d
+
+        if abs(a) + abs(d) >= abs(b) + abs(c):
+            # 轴对齐：a/d 符号决定上下/左右镜像
+            key = (a >= 0, d >= 0)
+            op = {
+                (True, True): None,
+                (True, False): "FLIP_TOP_BOTTOM",
+                (False, True): "FLIP_LEFT_RIGHT",
+                (False, False): "ROTATE_180",
+            }[key]
+        else:
+            # 90° 族：b/c 符号决定旋转方向/转置
+            key = (b >= 0, c >= 0)
+            op = {
+                (True, False): "ROTATE_270",   # 显示为顺时针 90°
+                (False, True): "ROTATE_90",    # 显示为逆时针 90°
+                (True, True): "TRANSPOSE",
+                (False, False): "TRANSVERSE",
+            }[key]
+
+        ops[xref] = op
+    return ops
+
+
+def _pdf_page_image_bboxes(page) -> dict:
+    """每个图片 xref 在本页的显示 bbox（同一 xref 多实例时取最大面积者）。
+
+    与 _pdf_page_display_ops 同源（get_image_info），坐标为页空间、上原点 —
+    与 pdfplumber 文本行的 top/bottom 同坐标系，供版面位置图片锚定。
+    """
+    bboxes = {}
+    try:
+        infos = page.get_image_info(xrefs=True)
+    except Exception:
+        return bboxes
+    best_area = {}
+    for info in infos:
+        xref = info.get("xref", 0)
+        bbox = info.get("bbox")
+        if not xref or not bbox:
+            continue
+        area = abs((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+        if xref not in best_area or area > best_area[xref]:
+            best_area[xref] = area
+            bboxes[xref] = tuple(float(v) for v in bbox)
+    return bboxes
+
+
+def _transpose_image_bytes(blob: bytes, op_name: str) -> Optional[bytes]:
+    """按 op_name 转置图片字节，使其与页面显示朝向一致。
+
+    失败返回 None（调用方回退写原始字节，保持优雅降级）。
+    JPEG 需重编码（quality=95，保留 ICC）；PNG 等无损格式无损转置。
+    """
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        return None
+
+    try:
+        transpose_enum = getattr(Image, "Transpose", Image)
+        op = getattr(transpose_enum, op_name)
+        src = Image.open(io.BytesIO(blob))
+        fmt = src.format or "PNG"
+        out_img = src.transpose(op)
+        buf = io.BytesIO()
+        save_kwargs = {}
+        if fmt == "JPEG":
+            save_kwargs["quality"] = 95
+        icc = src.info.get("icc_profile")
+        if icc:
+            save_kwargs["icc_profile"] = icc
+        out_img.save(buf, format=fmt, **save_kwargs)
+        return buf.getvalue()
+    except Exception:
+        return None
+
 
 def extract_images_from_pdf(
     local_path: str,
@@ -129,6 +276,11 @@ def extract_images_from_pdf(
 
     策略：使用 PyMuPDF (fitz) 逐页 get_images + extract_image。
     PyMuPDF 可提供每张图片所在的精确页码。
+
+    朝向校正：extract_image 返回的是存储字节；若内容流 CTM / page /Rotate
+    使显示朝向不同于存储朝向（典型：扫描件存储为垂直镜像或 180° 旋转），
+    则按 _pdf_page_display_ops 的判定转置后再落盘，保证导出图与读者所见一致
+    （下游 VLM 描述、OCR、钉钉卡片渲染都依赖这一点）。
 
     Args:
         local_path: PDF 文件的本地路径。
@@ -155,6 +307,7 @@ def extract_images_from_pdf(
 
     doc_basename = os.path.splitext(os.path.basename(local_path))[0]
     img_index = 0
+    corrected_counts: dict = {}  # op 名 -> 校正张数（用于日志）
 
     for page_idx in range(min(len(pdf), max_pages)):
         page = pdf[page_idx]
@@ -164,6 +317,9 @@ def extract_images_from_pdf(
             image_list = page.get_images(full=True)
         except Exception:
             continue
+
+        display_ops = _pdf_page_display_ops(page) if image_list else {}
+        page_bboxes = _pdf_page_image_bboxes(page) if image_list else {}
 
         for img_info in image_list:
             xref = img_info[0]
@@ -177,17 +333,31 @@ def extract_images_from_pdf(
                 continue
 
             blob = base_image["image"]
+            op_name = display_ops.get(xref)
 
-            # MD5 去重（PDF 中相同图片可能在多页出现）
+            # MD5 去重（PDF 中相同图片可能在多页出现）。
+            # key 含校正 op：同一存储字节在不同页可能以不同朝向显示。
             md5 = hashlib.md5(blob).hexdigest()
-            if md5 in seen_hashes:
+            dedup_key = (md5, op_name)
+            if dedup_key in seen_hashes:
                 continue
-            seen_hashes.add(md5)
+            seen_hashes.add(dedup_key)
 
             ext = f".{base_image.get('ext', 'png')}"
             # 跳过不支持的格式
             if ext in (".wmf", ".emf", ".svg"):
                 continue
+
+            # 朝向校正：转置失败回退原始字节（不阻断提取）
+            if op_name is not None:
+                corrected = _transpose_image_bytes(blob, op_name)
+                if corrected is not None:
+                    blob = corrected
+                    log_name = _TRANSPOSE_LOG_NAMES.get(op_name, op_name)
+                    corrected_counts[log_name] = corrected_counts.get(log_name, 0) + 1
+                else:
+                    print(f"      ⚠️ Orientation fix failed for xref={xref} "
+                          f"(op={op_name}), keeping raw bytes")
 
             filename = f"{doc_basename}_p{page_num}_img{img_index:04d}{ext}"
             out_path = os.path.join(output_dir, filename)
@@ -204,6 +374,7 @@ def extract_images_from_pdf(
                 page_num=page_num,
                 image_index=img_index,
                 original_name=f"xref_{xref}",
+                bbox=page_bboxes.get(xref),
             ))
             img_index += 1
 
@@ -212,6 +383,10 @@ def extract_images_from_pdf(
 
     if assets:
         print(f"      [pdf-img] Extracted {len(assets)} unique images from {total_pages} pages")
+        if corrected_counts:
+            detail = ", ".join(f"{k}×{v}" for k, v in sorted(corrected_counts.items()))
+            print(f"      [pdf-img] ⤿ orientation-corrected {sum(corrected_counts.values())} "
+                  f"images ({detail})")
 
     return assets
 

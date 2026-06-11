@@ -17,7 +17,7 @@ docx_extractor.py — Word/DOCX 文本提取器
 import re
 from typing import List, Optional, Tuple
 
-from opensearch_pipeline.extraction.schema import ExtractedBlock
+from opensearch_pipeline.extraction.schema import ExtractedBlock, is_pseudo_heading
 
 # Word 标题样式名 → heading level 映射
 _STYLE_LEVEL_MAP = {
@@ -57,7 +57,11 @@ def _detect_heading_level(style_name: str, text: str) -> Optional[int]:
         return 2
 
     # 3. Regex fallback：中文标题模式 (限制最大长度以防长正文段落被误判为标题而遗漏)
+    # 标注式 callout（圈数字开头）veto —— 与 pdf_extractor 同口径；现有两条
+    # 正则形状本就不可能匹配圈数字开头，guard 防未来放宽正则时回归。
     stripped = text.strip()
+    if is_pseudo_heading(stripped):
+        return None
     if len(stripped) <= 30:
         if _CN_HEADING_RE.match(stripped):
             if stripped.startswith("第"):

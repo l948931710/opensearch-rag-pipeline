@@ -296,23 +296,27 @@ def node_scan_raw_files(ctx: dict):
             tasks = []
             conn = None
             try:
+                from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
-                    # 查询未开始内容处理的所有活跃文档版本，并关联 document_meta 获取文件名和部门
-                    cursor.execute("""
-                        SELECT 
-                            dv.doc_id, 
-                            dv.version_no, 
-                            dv.bucket_name, 
-                            dv.raw_key, 
+                    # 查询未开始内容处理的所有活跃文档版本，并关联 document_meta 获取文件名和部门。
+                    # 扩展名排除片段来自 ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（单一来源）——
+                    # 必须与 dataworks_orchestrator._count_pending_rows 的 stage-1 计数完全一致，
+                    # 否则排空守卫会因"计得到却领不走"误判 stage-1 无进展而中止。
+                    cursor.execute(f"""
+                        SELECT
+                            dv.doc_id,
+                            dv.version_no,
+                            dv.bucket_name,
+                            dv.raw_key,
                             dv.file_ext,
                             dm.title,
                             dm.owner_dept
                         FROM document_version dv
                         LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
-                        WHERE dv.content_process_status = 'NOT_STARTED' 
+                        WHERE dv.content_process_status = 'NOT_STARTED'
                           AND dv.canonical_json_key IS NULL
-                          AND dv.file_ext NOT IN ('doc')
+                          AND dv.file_ext NOT IN {stage1_ext_exclusion_sql()}
                           AND dv.status = 'active'
                         ORDER BY dv.created_at ASC
                         LIMIT 100
@@ -574,25 +578,16 @@ def node_extract_text_with_ocr(ctx: dict):
                     f"{result.extract_method} [{block_summary}]"
                 )
     finally:
-        # ─── 在清理 tmp 之前，将 ROUTE_TO_VECTOR 的图片上传到 OSS ───
-        # 解决 local_path 生命周期问题：downstream 的 embedding 节点不再依赖 local_path
+        # ─── 在清理 tmp 之前，将保留图片上传到 OSS ───
+        # 解决 local_path 生命周期问题：downstream 的 embedding 节点不再依赖 local_path。
+        # ⚠️ ROUTE_TO_TEXT 也必须上传：绑定注入（_insert_image_refs_heuristic /
+        # _enrich_existing_image_refs）会把 TO_TEXT 截图绑进 step_card 并构造
+        # processing/assets/ 路径 —— 只传 TO_VECTOR 时这些路径永不存在，
+        # serving 签出 403 死图（2026-06-10 对抗评审发现，UI 截图多数走 TO_TEXT）。
+        # 已带 oss_key 的资产跳过（独立图片文档 oss_key=raw_key，原对象已在 OSS）。
         bucket_upload, is_sim_oss = _get_oss_bucket(ctx)
         if not is_sim_oss and bucket_upload:
-            for result in extractions:
-                if not hasattr(result, 'assets') or not result.assets:
-                    continue
-                for asset in result.assets:
-                    local_img = asset.get("local_path", "")
-                    if asset.get("status") == "ROUTE_TO_VECTOR" and local_img and os.path.exists(local_img):
-                        # 原先此处缺 startswith("raw/") guard（漂移点），统一走 _dept_from_raw_key
-                        dept = _dept_from_raw_key(getattr(result, "source_key", "") or "", "unknown")
-                        oss_key = f"processing/assets/{dept}/{result.doc_id}/v{result.version_no}/{os.path.basename(local_img)}"
-                        try:
-                            bucket_upload.put_object_from_file(oss_key, local_img)
-                            asset["oss_key"] = oss_key
-                            print(f"    📤 Uploaded image to OSS: {oss_key}")
-                        except Exception as e:
-                            print(f"    ⚠️ Failed to upload image to OSS: {e}")
+            _upload_clean_assets(extractions, bucket_upload)
 
         # 清理临时文件
         import shutil
@@ -769,6 +764,47 @@ def node_build_canonical(ctx: dict):
 # （retriever 按 permission_level="dept_internal" AND owner_dept=<部门> 放行本部门文档；
 #  写入 'internal' 的 chunk 两个分支都不命中，会对所有人不可见）。
 _PERMISSION_ALIAS = {"internal": "dept_internal"}
+
+
+def _upload_clean_assets(extractions, bucket_upload) -> int:
+    """把保留（CLEAN 路由）的图片资产上传到 OSS，并把 oss_key 回写进 asset dict。
+
+    上传条件（每条都 load-bearing）：
+      - status ∈ (ROUTE_TO_VECTOR, ROUTE_TO_TEXT)：绑定注入会把两类都绑进 chunk
+        并构造 processing/assets/ 路径，只传 TO_VECTOR 会让 TO_TEXT 截图在
+        serving 端签出 403 死图（UI 截图多数走 TO_TEXT —— 2026-06-10 对抗评审）；
+      - oss_key 为空：独立图片文档的 oss_key=raw_key（原对象已在 OSS），跳过重复上传；
+      - local_path 存在：tmp 清理前调用。
+    同一 local_path 的多个 asset（同一 media 被文档多处引用的出现副本）共享一次
+    上传：第二个起直接回写已上传的 oss_key。
+    Returns: 上传成功数。
+    """
+    uploaded = 0
+    uploaded_by_path: dict = {}  # local_path -> oss_key（出现副本共享上传）
+    for result in extractions:
+        if not hasattr(result, 'assets') or not result.assets:
+            continue
+        for asset in result.assets:
+            local_img = asset.get("local_path", "")
+            if (asset.get("status") in ("ROUTE_TO_VECTOR", "ROUTE_TO_TEXT")
+                    and not asset.get("oss_key")
+                    and local_img and os.path.exists(local_img)):
+                if local_img in uploaded_by_path:
+                    asset["oss_key"] = uploaded_by_path[local_img]
+                    continue
+                # 原先此处缺 startswith("raw/") guard（漂移点），统一走 _dept_from_raw_key
+                dept = _dept_from_raw_key(getattr(result, "source_key", "") or "", "unknown")
+                oss_key = (f"processing/assets/{dept}/{result.doc_id}"
+                           f"/v{result.version_no}/{os.path.basename(local_img)}")
+                try:
+                    bucket_upload.put_object_from_file(oss_key, local_img)
+                    asset["oss_key"] = oss_key
+                    uploaded_by_path[local_img] = oss_key
+                    uploaded += 1
+                    print(f"    📤 Uploaded image to OSS: {oss_key}")
+                except Exception as e:
+                    print(f"    ⚠️ Failed to upload image to OSS: {e}")
+    return uploaded
 
 
 def _dept_from_raw_key(source_key: str, default: str = "unknown") -> str:
@@ -1564,6 +1600,11 @@ def _detect_step_patterns(doc: dict) -> bool:
 
     sop_keywords = ["sop", "manual", "guide", "操作", "手册", "作业指导", "作业导书", "流程", "规程", "检验", "培训"]
     is_sop_like = any(kw in cat_l1 or kw in cat_l2 or kw in title for kw in sop_keywords)
+    # 企业 Work-Instruction 文号（FL-ZS-WI-010 等）：标题没有"作业指导书"字样的
+    # 工序文件（如《注塑销售出库单》-成品仓管）也要进入步骤检测。
+    # 2026-06-10 诊断：此 gate 漏判 WI 文号文档 → 整本 SOP 平文切块、图片零绑定。
+    if not is_sop_like and re.search(r'(?:^|[^a-z0-9])wi-\d', title):
+        is_sop_like = True
     if not is_sop_like:
         return False
 
@@ -1744,7 +1785,9 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
 
             valid_assets.append({
                 "image_index": asset.get("image_index", len(valid_assets)),
+                "original_index": asset.get("original_index", asset.get("image_index")),
                 "page_num": asset.get("page_num"),
+                "bbox": asset.get("bbox"),
                 "anchor_row": asset.get("anchor_row"),
                 "annotation_num": asset.get("annotation_num"),
                 "annotation_label": asset.get("annotation_label"),
@@ -1901,14 +1944,28 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
             anno_matched = []  # (block_idx, va)
             page_fallback = []  # va without annotation match
 
+            # visual_summary 里"标注语境"的圈号（如"红色方框标注区域③"）：
+            # VLM 经常不回 annotation_map 但会在描述里点名圈号；须与同页文本的
+            # 图N 引用（anno_ref_index）联合命中才算数，描述里单独出现不触发。
+            _vs_circled_re = re.compile(
+                r'(?:标注|红框|方框|圆圈|圈|区域|箭头|图)[^①-⑳]{0,6}([' + _CIRCLED_NUMS + r'])')
+
             for va in page_only_assets:
                 ann_map = va.get("vlm_annotation_map", {})
                 img_page = va.get("page_num")
                 matched = False
-                # 只匹配圈号字符（①②③...⑳），跳过非圈号 key（红箭头1、红框上部等）
-                for ann_key in ann_map:
-                    if ann_key not in _CIRCLED_NUMS:
-                        continue  # 非圈号 key，跳过
+                # 圈号候选 —— 关键约束：仅当图片的圈号【唯一】时才当作"这张图的图号"。
+                # 截图内部的 UI 步骤标注（①②③④⑤⑥ 一串）不是图号：拿它们去匹配
+                # 正文"如图①"会把 步骤3 的截图错绑到 步骤2（2026-06-10 pdf_sop 实证）。
+                map_circled = [k for k in ann_map if k in _CIRCLED_NUMS]
+                circled_candidates = map_circled if len(map_circled) == 1 else []
+                if not circled_candidates:
+                    # 次选：visual_summary 标注语境圈号（如"红色方框标注区域③"），同样要求唯一
+                    vs_circled = list(dict.fromkeys(
+                        _vs_circled_re.findall(va.get("visual_summary", "") or "")))
+                    if len(vs_circled) == 1:
+                        circled_candidates = vs_circled
+                for ann_key in circled_candidates:
                     key = (img_page, ann_key)
                     if key in anno_ref_index:
                         anno_matched.append((anno_ref_index[key], va))
@@ -1930,10 +1987,80 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 }
                 insertions.append((block_idx, [img_block]))
 
-            # 无标注号的图片 → 智能分配到该页各文本 block
+            # ── 策略 1b-2: 版面位置锚定（图片 bbox × 文本块 y 区间，同坐标系）──
+            # 图片物理上位于哪个步骤文本下方，就锚定到那个 block —— 版面即真值。
+            # 优先级：圈号精确匹配 > 版面位置 > 图N引用 bigram > 均匀分配 > 页末。
+            # （2026-06-10 诊断：均匀分配/页末把 步骤4 的截图停在 步骤3 中间、
+            #  跨页泄漏到上一页未关步骤；y 锚定从根上消除这两类错位。）
+            geo_fallback = []
+            page_block_anchors: Dict[int, list] = {}   # page → [(y0, block_idx)]
+            for i, block in enumerate(blocks):
+                bt = (block.get("block_type") if isinstance(block, dict)
+                      else getattr(block, "block_type", ""))
+                if bt in ("ocr_text", "image_ref"):
+                    continue
+                b_extra = (block.get("extra") if isinstance(block, dict)
+                           else getattr(block, "extra", None)) or {}
+                y0 = b_extra.get("y0")
+                bpg = (block.get("page_num") if isinstance(block, dict)
+                       else getattr(block, "page_num", None))
+                if bpg is not None and y0 is not None:
+                    page_block_anchors.setdefault(bpg, []).append((float(y0), i))
+            for anchors in page_block_anchors.values():
+                anchors.sort()
+
+            geo_assets = [va for va in page_fallback
+                          if va.get("bbox") and va.get("page_num") in page_block_anchors]
+            _geo_ids = {id(va) for va in geo_assets}
+            geo_fallback = [va for va in page_fallback if id(va) not in _geo_ids]
+            # 按 (页, 图片上缘, 提取序) 排序：同锚点多图保持版面阅读顺序
+            geo_assets.sort(key=lambda va: (
+                va["page_num"], float(va["bbox"][1]), va.get("image_index", 0)))
+            for va in geo_assets:
+                anchors = page_block_anchors[va["page_num"]]
+                img_y0 = float(va["bbox"][1])
+                img_y1 = float(va["bbox"][3])
+                # 锚定规则（优先级）：
+                #   1. 与图片 y 区间重叠最大的文本块 —— 图片与步骤行并排/部分重叠时
+                #      （如截图顶到页首、步骤行在图片右侧），重叠块才是它的步骤；
+                #   2. 无重叠 → 图片上方最近的文本块（阅读顺序：图属于其上的文字）；
+                #   3. 全页文本都在图片之下 → 插在该页首个文本块之前（交给 pending_images）。
+                best_idx = None
+                best_overlap = 0.0
+                for y0, bidx in anchors:
+                    blk = blocks[bidx]
+                    b_extra = (blk.get("extra") if isinstance(blk, dict)
+                               else getattr(blk, "extra", None)) or {}
+                    b_y1 = float(b_extra.get("y1", y0))
+                    overlap = min(img_y1, b_y1) - max(img_y0, y0)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_idx = bidx
+                if best_idx is None:
+                    for y0, bidx in anchors:
+                        if y0 <= img_y0 + 1.0:   # 块起始在图片上缘之上（容忍 1pt 重叠）
+                            best_idx = bidx
+                        else:
+                            break
+                img_block = {
+                    "block_type": "image_ref",
+                    "text": "",
+                    "page_num": va["page_num"],
+                    "section_path": None,
+                    "source": "multimodal",
+                    "extra": va,
+                }
+                if best_idx is None:
+                    # 图片在该页所有文本之上（页眉带图等）→ 插在该页首个文本块之前，
+                    # chunker 的 pending_images 会把它交给紧随其后的步骤
+                    insertions.append((anchors[0][1] - 1, [img_block]))
+                else:
+                    insertions.append((best_idx, [img_block]))
+
+            # 无标注号且无版面坐标的图片 → 智能分配到该页各文本 block
             # 策略：优先分配到含有图片引用（图①②等）的 block 后面
             page_to_assets = {}
-            for va in page_fallback:
+            for va in geo_fallback:
                 pg = va["page_num"]
                 page_to_assets.setdefault(pg, []).append(va)
 
@@ -2073,9 +2200,14 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                 "source": "multimodal", "extra": va,
                             }]))
 
-        # 从后往前插入，保持前面的索引不变
-        for insert_after, img_blocks in sorted(insertions, key=lambda x: x[0], reverse=True):
-            for j, ib in enumerate(img_blocks):
+        # 从后往前插入，保持前面的索引不变。
+        # 同一插入点的多条 insertions 先按出现顺序合并成组再一次性插入 ——
+        # 逐条 insert 到同一位置会把先插的图往后顶，颠倒同步骤多图的版面顺序。
+        merged_insertions: Dict[int, list] = {}
+        for insert_after, img_blocks in insertions:
+            merged_insertions.setdefault(insert_after, []).extend(img_blocks)
+        for insert_after in sorted(merged_insertions, reverse=True):
+            for j, ib in enumerate(merged_insertions[insert_after]):
                 enriched.insert(insert_after + 1 + j, ib)
 
         # 未匹配到页面的图片：用 VLM visual_summary 生成合成 text block + image_ref
@@ -2206,7 +2338,11 @@ def node_chunk_documents(ctx: dict):
             cat_l2 = str(doc.get("category_l2", "")).lower()
             title = str(doc.get("title", "")).lower()
             doc_id = str(doc.get("doc_id", "")).lower()
-            if doc.get("faq_eligible") or "faq" in cat_l1 or "faq" in cat_l2 or "faq" in title or "faq" in doc_id:
+            # FAQ 切块只看"文档本身是 FAQ"（分类/标题/doc_id 含 faq）。
+            # ⚠️ 不再让 faq_eligible 劫持路由：它是"可生成 FAQ"的下游标记，不是结构信号 ——
+            # 真实 LLM 分类把多数 SOP 标成 faq_eligible=True，曾导致 124 个 SOP 批次
+            # 只有 1 个走 step 模式（2026-06-10 本地 E2E 实测，123/124 被劫持进 faq）。
+            if "faq" in cat_l1 or "faq" in cat_l2 or "faq" in title or "faq" in doc_id:
                 m_chunk = ctx.get("faq_size", config.chunker.faq_strategy.max_chunk_chars)
                 m_overlap = ctx.get("faq_overlap", config.chunker.faq_strategy.overlap_chars)
                 m_mode = "faq"
@@ -2315,11 +2451,24 @@ def node_chunk_documents(ctx: dict):
 
         # ─── Step 模式：注入 image_ref 块到 block 序列 ───
         is_step_mode = (m_mode == "step")
-        if is_step_mode and blocks:
+        if blocks:
             assets = doc.get("assets", [])
-            if assets:
+            if assets and is_step_mode:
                 blocks = _inject_image_ref_blocks(blocks, assets, doc)
                 print(f"    ├─ [step-inject] Injected image_refs into block sequence for {doc['doc_id']}")
+            elif assets:
+                # 非 step 模式不做启发式插入，但已存在的位置性 image_ref（DOCX 抽取器
+                # 产出）仍须注入 funnel 数据 —— 否则 refs 只剩 rel_id/target_ref，
+                # serving 端没有 oss_key/source_image/visual_summary 可渲染，
+                # 图片在非步骤文档上整体失效（2026-06-10 诊断确认 live 即如此）。
+                _has_refs = any(
+                    (b.get("block_type") if isinstance(b, dict)
+                     else getattr(b, "block_type", "")) == "image_ref"
+                    for b in blocks
+                )
+                if _has_refs:
+                    blocks = _enrich_existing_image_refs(blocks, assets, doc)
+                    print(f"    ├─ [ref-enrich] Enriched positional image_refs (non-step mode) for {doc['doc_id']}")
 
         if blocks:
             chunks = chunker.chunk_from_blocks(
@@ -2341,6 +2490,9 @@ def node_chunk_documents(ctx: dict):
             chunk.sensitive_redacted = doc.get("redaction_action") == "REDACTED"
 
         # ─── 结构化 XLSX 图片绑定（按 anchor_row / figure_refs 绑定到 chunk）───
+        # layout_bound_fns：被结构化版式有意绑定（即使载体是文本类 chunk）的图片文件名，
+        # 兜底 image chunk 环节跳过它们，避免重复建 chunk
+        layout_bound_fns = set()
         if xlsx_layout_type in ("product_spec_instruction", "procedure_image_guide") and global_split_mode == "dynamic":
             assets = doc.get("assets", [])
             if assets:
@@ -2415,6 +2567,8 @@ def node_chunk_documents(ctx: dict):
                         imgs = chunk_images[id(c)]
                         if imgs:
                             c.extra["image_refs"] = imgs
+                            layout_bound_fns.update(
+                                e["filename"] for e in imgs if e.get("filename"))
 
                 elif xlsx_layout_type == "procedure_image_guide":
                     import re as _re_fig
@@ -2426,7 +2580,10 @@ def node_chunk_documents(ctx: dict):
 
                     def _img_entry(a):
                         fn = a.get("filename", "")
-                        oss_key = f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}"
+                        # 上传环节回填的 oss_key 优先（TO_VECTOR/TO_TEXT 均会上传）；
+                        # 构造路径仅作离线/旧数据兜底，与独立 image chunk 路径一致
+                        oss_key = (a.get("oss_key")
+                                   or f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}")
                         entry = {
                             "filename": fn,
                             "oss_key": oss_key,
@@ -2445,55 +2602,67 @@ def node_chunk_documents(ctx: dict):
                             entry["image_index"] = _fig
                         return entry
 
-                    vec_imgs = [a for a in assets if a.get("status") == "ROUTE_TO_VECTOR"]
-                    bound_nos = set()  # step_no already assigned an image
+                    # 绑定池分两轮：先 ROUTE_TO_VECTOR（行为与原单轮完全一致），再 ROUTE_TO_TEXT。
+                    # TO_TEXT 截图（UI 截图多数走此路由）原先被排除在绑定之外：OCR 文本进了
+                    # chunk，原图却没有任何 serving 可达载体（step_card 的 image_refs 经 RDS
+                    # image_refs_json 恢复；文本 chunk 上的 refs 检索期不可达），图片提取了
+                    # 却永远渲染不出（I5）。bound_nos 按轮独立：TO_TEXT 内容命中已有图的步骤
+                    # 时作为第二张图追加、不与 VECTOR 抢占；priority-2 只补完全无图的步骤。
+                    def _bind_pool(pool):
+                        bound_nos = set()  # 本轮内 step_no already assigned an image
 
-                    # 优先级 0：内容匹配（视觉描述/ocr ↔ 步骤文本）。
-                    # 「操作示图」列的 figure_no（图N）多为按提取顺序自动编号、anchor_row 也常不可靠，
-                    # 而图片描述里的动作关键词（归零/读数/电源）能更准地定位步骤。仅在强且唯一匹配时
-                    # 按内容绑定；其余回退到 figure_no / anchor 顺序（保护描述稀疏的图片不被误绑）。
-                    cms = []  # (margin, score, step_no, asset)
-                    for a in vec_imgs:
-                        it = ((a.get("visual_summary") or "") + " " + (a.get("ocr_text") or "")).strip()
-                        cands = [(c.extra.get("step_no"), c.chunk_text) for c in step_cards]
-                        sno, sc, sec = _content_match_steps(it, cands)
-                        cms.append((sc - sec, sc, sno, a))
-                    cms.sort(key=lambda x: (-x[0], -x[1]))  # 置信度（分差）高的先绑
-                    remaining = list(vec_imgs)
-                    for margin, sc, sno, a in cms:
-                        if sno is not None and sc >= 0.8 and margin >= 0.5 and sno not in bound_nos:
-                            step_by_no[sno].extra.setdefault("image_refs", []).append(_img_entry(a))
-                            bound_nos.add(sno)
-                            remaining.remove(a)
+                        # 优先级 0：内容匹配（视觉描述/ocr ↔ 步骤文本）。
+                        # 「操作示图」列的 figure_no（图N）多为按提取顺序自动编号、anchor_row 也常不可靠，
+                        # 而图片描述里的动作关键词（归零/读数/电源）能更准地定位步骤。仅在强且唯一匹配时
+                        # 按内容绑定；其余回退到 figure_no / anchor 顺序（保护描述稀疏的图片不被误绑）。
+                        cms = []  # (margin, score, step_no, asset)
+                        for a in pool:
+                            it = ((a.get("visual_summary") or "") + " " + (a.get("ocr_text") or "")).strip()
+                            cands = [(c.extra.get("step_no"), c.chunk_text) for c in step_cards]
+                            sno, sc, sec = _content_match_steps(it, cands)
+                            cms.append((sc - sec, sc, sno, a))
+                        cms.sort(key=lambda x: (-x[0], -x[1]))  # 置信度（分差）高的先绑
+                        remaining = list(pool)
+                        for margin, sc, sno, a in cms:
+                            if sno is not None and sc >= 0.8 and margin >= 0.5 and sno not in bound_nos:
+                                step_by_no[sno].extra.setdefault("image_refs", []).append(_img_entry(a))
+                                bound_nos.add(sno)
+                                remaining.remove(a)
 
-                    # 优先级 1：figure_no 数字 == 步骤号（图N→步骤N）/步骤文本显式引用图号；
-                    #           仅绑到尚未被内容匹配占用的步骤
-                    unbound = []
-                    for a in remaining:
-                        target = None
-                        fno = str(a.get("figure_no") or "")
-                        mnum = _re_fig.search(r"(\d+)", fno)
-                        if mnum and int(mnum.group(1)) not in bound_nos:
-                            target = step_by_no.get(int(mnum.group(1)))
-                        if target is None and fno:
-                            for c in step_cards:
-                                if fno in (c.extra.get("figure_refs") or []) and c.extra.get("step_no") not in bound_nos:
-                                    target = c
-                                    break
-                        if target is not None:
-                            target.extra.setdefault("image_refs", []).append(_img_entry(a))
-                            bound_nos.add(target.extra.get("step_no"))
-                        else:
-                            unbound.append(a)
+                        # 优先级 1：figure_no 数字 == 步骤号（图N→步骤N）/步骤文本显式引用图号；
+                        #           仅绑到尚未被内容匹配占用的步骤
+                        unbound = []
+                        for a in remaining:
+                            target = None
+                            fno = str(a.get("figure_no") or "")
+                            mnum = _re_fig.search(r"(\d+)", fno)
+                            if mnum and int(mnum.group(1)) not in bound_nos:
+                                target = step_by_no.get(int(mnum.group(1)))
+                            if target is None and fno:
+                                for c in step_cards:
+                                    if fno in (c.extra.get("figure_refs") or []) and c.extra.get("step_no") not in bound_nos:
+                                        target = c
+                                        break
+                            if target is not None:
+                                target.extra.setdefault("image_refs", []).append(_img_entry(a))
+                                bound_nos.add(target.extra.get("step_no"))
+                            else:
+                                unbound.append(a)
 
-                    # 优先级 2：剩余图片按 anchor_row 顺序补到仍空的步骤（旧逻辑）
-                    open_steps = [c for c in step_cards if c.extra.get("step_no") not in bound_nos]
-                    unbound.sort(key=lambda a: (a.get("anchor_row") or 0))
-                    if unbound and open_steps:
-                        n = len(open_steps)
-                        for idx, a in enumerate(unbound):
-                            si = idx if len(unbound) == n else min(int(idx * n / len(unbound)), n - 1)
-                            open_steps[si].extra.setdefault("image_refs", []).append(_img_entry(a))
+                        # 优先级 2：剩余图片按 anchor_row 顺序补到仍空的步骤（旧逻辑）。
+                        # 跨轮以"step_card 已带图"为占用判据（第一轮等价于 step_no not in bound_nos）
+                        open_steps = [c for c in step_cards
+                                      if not c.extra.get("image_refs")
+                                      and c.extra.get("step_no") not in bound_nos]
+                        unbound.sort(key=lambda a: (a.get("anchor_row") or 0))
+                        if unbound and open_steps:
+                            n = len(open_steps)
+                            for idx, a in enumerate(unbound):
+                                si = idx if len(unbound) == n else min(int(idx * n / len(unbound)), n - 1)
+                                open_steps[si].extra.setdefault("image_refs", []).append(_img_entry(a))
+
+                    _bind_pool([a for a in assets if a.get("status") == "ROUTE_TO_VECTOR"])
+                    _bind_pool([a for a in assets if a.get("status") == "ROUTE_TO_TEXT"])
 
         # ─── PPTX slide 模式：按 page_num 把图片绑定到对应 slide chunk ───
         if m_mode == "slide" and global_split_mode == "dynamic":
@@ -2504,18 +2673,32 @@ def node_chunk_documents(ctx: dict):
                 version = doc["version_no"]
                 d_id = doc["doc_id"]
                 slide_imgs = {}
-                for a in assets:
-                    if a.get("status") == "ROUTE_TO_VECTOR":
-                        slide_imgs.setdefault(a.get("page_num"), []).append(a)
+                # TO_TEXT 与 TO_VECTOR 同绑：TO_TEXT 截图的 OCR 文本进了 slide chunk，
+                # 原图若不绑进 serving 可达载体（visual_knowledge 的 source_image/
+                # image_refs）则永远渲染不出 —— 与 XLSX TO_TEXT 兜底同因（I5）。
+                # VECTOR 先入池：refs[0] 提升为封面 source_image，TO_TEXT 不抢占。
+                for _st in ("ROUTE_TO_VECTOR", "ROUTE_TO_TEXT"):
+                    for a in assets:
+                        if a.get("status") == _st:
+                            slide_imgs.setdefault(a.get("page_num"), []).append(a)
                 def _slide_img_refs(imgs):
-                    return [{
-                        "filename": a.get("filename", ""),
-                        "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{a.get('filename', '')}",
-                        "page_num": a.get("page_num"),
-                        "image_category": a.get("image_category", "unknown"),
-                        "visual_summary": a.get("visual_summary", ""),
-                        "ocr_text": a.get("ocr_text", ""),
-                    } for a in imgs]
+                    refs = []
+                    for a in imgs:
+                        # 上传环节回填的 oss_key 优先（TO_VECTOR/TO_TEXT 均上传），
+                        # 构造路径仅作离线/旧数据兜底，与 step_card/image chunk 路径一致
+                        oss_key = (a.get("oss_key")
+                                   or f"processing/assets/{dept_code}/{d_id}/v{version}/{a.get('filename', '')}")
+                        refs.append({
+                            "filename": a.get("filename", ""),
+                            "oss_key": oss_key,
+                            "source_image": oss_key,
+                            "page_num": a.get("page_num"),
+                            "image_index": a.get("image_index"),
+                            "image_category": a.get("image_category", "unknown"),
+                            "visual_summary": a.get("visual_summary", ""),
+                            "ocr_text": a.get("ocr_text", ""),
+                        })
+                    return refs
 
                 for c in chunks:
                     imgs = slide_imgs.get(c.page_num, [])
@@ -2542,9 +2725,12 @@ def node_chunk_documents(ctx: dict):
                         continue
                     refs = _slide_img_refs(imgs)
                     _summary = refs[0].get("visual_summary", "")
+                    # TO_TEXT 截图 caption 常缺失：chunk_text 回退 OCR 片段（与独立
+                    # image chunk 兜底一致），extra.visual_summary 保持真实 caption
+                    _desc = _summary or (refs[0].get("ocr_text") or "").strip()[:120]
                     _title = doc.get("title", "")
                     _prefix = f"【文档:{_title}】" if _title else ""
-                    _ctext = (f"{_prefix} [图片描述] {_summary}").strip()
+                    _ctext = (f"{_prefix} [图片描述] {_desc}").strip()
                     slide_chunk = Chunk(
                         chunk_id=_generate_chunk_id(d_id, version, _next_idx),
                         doc_id=d_id, version_no=version, chunk_index=_next_idx,
@@ -2604,35 +2790,76 @@ def node_chunk_documents(ctx: dict):
         # ─── Visual Embedding & Image Chunking ───
         # Step 模式下图片已经绑定到 step_card，不再创建独立 image chunk。
         # 结构化 XLSX 版式（procedure_image_guide / product_spec）也已将图片绑定到对应卡片，
-        # slide 模式也已按 page_num 绑定；以上均跳过独立 image chunk 以避免重复。
+        # slide 模式也已按 page_num 绑定（TO_VECTOR+TO_TEXT 全部进 visual_knowledge
+        # 载体，故 pptx 无需本环节兜底）；以上均跳过独立 image chunk 以避免重复。
         # 设备清扫基准书：仅跳过已按部位绑定的图片，未匹配的图片仍建独立 image chunk。
+        #
+        # XLSX 例外：上述"已绑定"假设对 XLSX 不总成立 —— 全屏 UI 截图型流程文档
+        # （如 外贸发票操作流程.xlsx：3 sheet 各 1 张 TO_TEXT 截图、无文本单元格）会被
+        # step-detect 误路由进 step 模式，refs 经启发式注入落在 ocr_chunk 上；而
+        # serving 可达的图片载体只有两种：image/visual_knowledge 的 chunk 级
+        # source_image（经 to_ha3_doc 进 HA3）、step_card/procedure_parent/
+        # visual_knowledge 的 image_refs（经 RDS image_refs_json 恢复）。因此 XLSX
+        # 一律进入本环节，按"是否已被 serving 可达载体携带"逐资产兜底建 image chunk。
         _imgs_bound_in_layout = (
             global_split_mode == "dynamic"
             and xlsx_layout_type in ("procedure_image_guide", "product_spec_instruction")
         )
-        if not is_step_mode and not _imgs_bound_in_layout and m_mode != "slide":
+        _is_xlsx_doc = str(doc.get("file_ext", "")).lower() in ("xlsx", "xls")
+        if (not is_step_mode and not _imgs_bound_in_layout and m_mode != "slide") or _is_xlsx_doc:
             current_chunk_count = len(chunks)
             assets = doc.get("assets", [])
             if assets:
                 source_key = doc.get("source_key", "")
                 dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
 
+                # 独立图片文档（jpg/png 海报、流程图）：图就是文档本体 ——
+                # ROUTE_TO_TEXT 也要建 image chunk，否则原图只存在于 text chunk 的
+                # image_refs 里（HA3 不携带、RDS 恢复只覆盖 step_card/visual_knowledge），
+                # serving 永远渲染不出（对抗评审 2026-06-10 证实）。
+                # XLSX 嵌入截图同理：TO_TEXT 截图若未绑进 serving 可达载体也必须建 image chunk。
+                _is_image_doc = str(doc.get("file_ext", "")).lower() in (
+                    "png", "jpg", "jpeg", "webp", "tif", "tiff", "gif", "bmp")
+
+                # 已被 serving 可达载体携带的图片（按文件名）：不再重复建独立 image chunk。
+                # ce_bound_fns / layout_bound_fns 是结构化版式的有意绑定（载体可能是文本类
+                # chunk，serving 可达性单议），同样视为已携带以保持既有版式行为不变。
+                _SERVING_REF_TYPES = ("step_card", "procedure_parent", "visual_knowledge")
+                represented_fns = set(ce_bound_fns) | set(layout_bound_fns)
+                for _c in chunks:
+                    _cx = _c.extra or {}
+                    if _c.chunk_type in ("image", "visual_knowledge") and _cx.get("source_image"):
+                        represented_fns.add(os.path.basename(str(_cx.get("source_image"))))
+                    if _c.chunk_type in _SERVING_REF_TYPES:
+                        for _ref in (_cx.get("image_refs") or []):
+                            _rfn = _ref.get("filename") or os.path.basename(
+                                str(_ref.get("source_image") or _ref.get("oss_key") or ""))
+                            if _rfn:
+                                represented_fns.add(_rfn)
+
                 for asset in assets:
-                    if asset.get("status") == "ROUTE_TO_VECTOR":
+                    _status = asset.get("status")
+                    if _status == "ROUTE_TO_VECTOR" or (
+                            _status == "ROUTE_TO_TEXT" and (_is_image_doc or _is_xlsx_doc)):
                         filename = asset.get("filename", "")
-                        # 设备清扫基准书中已按部位绑定的图片不再建独立 image chunk
-                        if filename in ce_bound_fns:
+                        # 已绑定/已携带的图片不再建独立 image chunk
+                        if filename in represented_fns:
                             continue
                         visual_summary = asset.get("visual_summary", "")
-                        
+
                         version = doc["version_no"]
                         doc_id = doc["doc_id"]
-                        source_image_url = f"processing/assets/{dept_code}/{doc_id}/v{version}/{filename}"
+                        # 优先用已存在的 oss_key（独立图片文档 = raw/ 对象本身；
+                        # 嵌入图 = 上传环节回填），构造路径仅作离线/旧数据兜底
+                        source_image_url = (asset.get("oss_key")
+                                            or f"processing/assets/{dept_code}/{doc_id}/v{version}/{filename}")
                         
                         # 图片 chunk_text 加入文档标题前缀，与文本 chunk 一致，提升 BM25 关键词匹配
+                        # TO_TEXT 截图可能只有 OCR 文本：caption 缺失时用 OCR 片段兜底，避免空描述
                         doc_title = doc.get("title", "")
                         context_prefix = f"【文档:{doc_title}】" if doc_title else ""
-                        chunk_text = f"{context_prefix} [图片描述] {visual_summary}" if context_prefix else f"[图片描述] {visual_summary}"
+                        _desc = visual_summary or (asset.get("ocr_text") or "").strip()[:120]
+                        chunk_text = f"{context_prefix} [图片描述] {_desc}" if context_prefix else f"[图片描述] {_desc}"
                         
                         from opensearch_pipeline.chunker import _generate_chunk_id, _estimate_tokens
                         chunk_id = _generate_chunk_id(doc_id, version, current_chunk_count)

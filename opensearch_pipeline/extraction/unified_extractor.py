@@ -8,6 +8,7 @@ unified_extractor.py — 统一文档提取入口
 DAG 层不需要知道文件类型，只调用 extract() 即可。
 """
 
+import copy
 import os
 from typing import Dict, List, Optional
 
@@ -17,7 +18,7 @@ from opensearch_pipeline.extraction.text_extractor import (
     blocks_to_text,
     extract_title_from_blocks,
 )
-from opensearch_pipeline.extraction.ocr_client import OCRClient
+from opensearch_pipeline.extraction.ocr_client import OCRClient, sanitize_ocr_text
 
 
 def _html_to_text(raw_html: str) -> str:
@@ -81,6 +82,170 @@ def _csv_to_text(raw_csv: str) -> str:
         return "\n".join(lines) or raw_csv
     except Exception:
         return raw_csv
+
+
+_VLM_CACHE_VALID_STATUSES = {"DISCARD_DECORATIVE", "ROUTE_TO_TEXT", "ROUTE_TO_VECTOR"}
+
+
+def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
+    """带命名空间的 VLM 缓存查询 + 遗留裸 MD5 key 的只读回退。
+
+    遗留条目（命名空间化之前写入，OSS 上 ~1500 条）用现行带后缀 key 永远
+    查不到 → 回灌时全量重打 VLM 白花钱。回退仅限 public 命名空间（裸 key
+    全部产生于 public-bypass 时代；quarantine 的 :sec 绝不回退，避免跳过
+    敏感审计），且要求 status 合法、非 QUARANTINE_SENSITIVE、无 Simulated
+    污染。命中即迁移到带后缀 key（内存中；真实运行随 _save_vlm_cache
+    持久化，simulate 不落盘），裸 key 自然老化。只读新写仍只用带后缀 key。
+    """
+    cache_key = f"{file_hash}:{'pub' if is_public else 'sec'}"
+    entry = vlm_cache.get(cache_key)
+    if entry is not None:
+        return entry
+    if not is_public:
+        return None
+    legacy = vlm_cache.get(file_hash)
+    if not isinstance(legacy, dict):
+        return None
+    if legacy.get("status") not in _VLM_CACHE_VALID_STATUSES:
+        return None
+    blob = (f"{legacy.get('visual_summary', '')}|{legacy.get('ocr_text', '')}"
+            f"|{legacy.get('reason', '')}")
+    if "simulat" in blob.lower():
+        return None
+    vlm_cache[cache_key] = legacy
+    return legacy
+
+
+def _stitch_strip_runs(blocks, image_assets, min_run=4, max_slice_height=80):
+    """缝合 Word 条带切片：一张照片被存成 N 条同宽窄条时，逐条都会被
+    Funnel-1 丢弃（h<50 或 aspect>8），整图彻底丢失。
+
+    判据（每条都 load-bearing，全部满足才缝合，否则原样返回）：
+      - blocks 中 ≥min_run 个连续 image_ref（之间无任何其他块——图片独占段落
+        不产生文本块，所以"连续"是唯一可观测信号）；
+      - 资产像素宽完全一致（纵向堆叠的前提）；
+      - 逐条 height<max_slice_height 且条状（w≥3h 或 w≥100）——方形图标行
+        （工具栏/①②③枚举）不会被误缝；
+      - 逐条都是今日 Funnel-1 的丢弃对象（w<50/h<50/<3KB/aspect>8）——
+        只"救回"，绝不改变现状能存活的图；
+      - 缝合总高在 [100, 6000] 内。
+    网格切片（如 23×31 小方块）因不满足条状判据而不缝——纵向堆叠会产生
+    无意义的细长柱，留待网格重建（future work）。
+    任何 PIL/IO 失败 → 该 run 原样保留（fail-open）。
+    """
+    if not blocks or not image_assets:
+        return blocks, image_assets
+    try:
+        from PIL import Image
+    except ImportError:
+        return blocks, image_assets
+
+    def _btype(b):
+        return b.block_type if hasattr(b, "block_type") else b.get("block_type", "")
+
+    def _bextra(b):
+        e = b.extra if hasattr(b, "extra") else b.get("extra")
+        return e if isinstance(e, dict) else {}
+
+    asset_by_index = {}
+    for a in image_assets:
+        asset_by_index.setdefault(getattr(a, "image_index", None), a)
+
+    runs = []  # [run_blocks, ...]
+    cur = []
+    for b in blocks:
+        if _btype(b) == "image_ref":
+            cur.append(b)
+        else:
+            if len(cur) >= min_run:
+                runs.append(list(cur))
+            cur = []
+    if len(cur) >= min_run:
+        runs.append(list(cur))
+    if not runs:
+        return blocks, image_assets
+
+    def _discard_bound(w, h, kb):
+        aspect = max(w / max(h, 1), h / max(w, 1))
+        return w < 50 or h < 50 or kb < 3.0 or aspect > 8.0
+
+    drop_block_ids = set()
+    drop_asset_idx = set()
+    new_assets = []
+
+    for run_blocks in runs:
+        infos = []  # (block, asset, w, h, kb, image_index)
+        ok = True
+        for b in run_blocks:
+            idx = _bextra(b).get("image_index")
+            a = asset_by_index.get(idx)
+            lp = getattr(a, "local_path", "") if a else ""
+            if not a or not lp or not os.path.exists(lp):
+                ok = False
+                break
+            try:
+                with Image.open(lp) as im:
+                    w, h = im.size
+                kb = os.path.getsize(lp) / 1024.0
+            except Exception:
+                ok = False
+                break
+            infos.append((b, a, w, h, kb, idx))
+        if not ok or not infos:
+            continue
+
+        if len({w for _, _, w, _, _, _ in infos}) != 1:
+            continue
+        if not all(
+            h < max_slice_height and (w >= 3 * h or w >= 100) and _discard_bound(w, h, kb)
+            for _, _, w, h, kb, _ in infos
+        ):
+            continue
+        w0 = infos[0][2]
+        total_h = sum(h for _, _, _, h, _, _ in infos)
+        if not (100 <= total_h <= 6000):
+            continue
+
+        try:
+            canvas = Image.new("RGB", (w0, total_h), (255, 255, 255))
+            y = 0
+            for _, a, _, h, _, _ in infos:
+                with Image.open(a.local_path) as im:
+                    canvas.paste(im.convert("RGB"), (0, y))
+                y += h
+            first_a = infos[0][1]
+            out_path = f"{os.path.splitext(first_a.local_path)[0]}_stitched{len(infos)}.png"
+            canvas.save(out_path)
+        except Exception as e:
+            print(f"      ⚠️ [strip-stitch] PIL stitch failed (run kept as-is): {e}")
+            continue
+
+        first_b = infos[0][0]
+        first_idx = infos[0][5]
+        for _, _, _, _, _, idx in infos:
+            drop_asset_idx.add(idx)
+        comp = copy.copy(first_a)
+        comp.local_path = out_path
+        comp.image_index = first_idx
+        comp.original_name = f"stitched:{len(infos)}slices"
+        new_assets.append(comp)
+        extra0 = first_b.extra if hasattr(first_b, "extra") else None
+        if isinstance(extra0, dict):
+            extra0["stitched_from"] = len(infos)
+        for b in run_blocks[1:]:
+            drop_block_ids.add(id(b))
+        print(f"      [strip-stitch] {len(infos)} slices ({w0}x{total_h}) → "
+              f"{os.path.basename(out_path)}")
+
+    if not new_assets:
+        return blocks, image_assets
+
+    blocks = [b for b in blocks if id(b) not in drop_block_ids]
+    image_assets = [
+        a for a in image_assets
+        if getattr(a, "image_index", None) not in drop_asset_idx
+    ] + new_assets
+    return blocks, image_assets
 
 
 class UnifiedExtractor:
@@ -153,14 +318,15 @@ class UnifiedExtractor:
         elif file_ext == "xlsx":
             return self._extract_xlsx(task)
         elif file_ext == "xls":
-            # 旧版二进制 Excel：openpyxl 无法解析。此前被误路由进 _extract_xlsx，
-            # 异常被吞掉后当"空文档"继续走（静默失败）；显式按不支持处理，错误可见。
+            # 旧版二进制 Excel：按用户决策不在管线内支持 —— .xls/.doc 走一次性
+            # 转换（xlsx/docx）后回灌；ingest_policy 已把 xls 排除在扫描之外。
+            # 显式 unsupported 保证错误可见（勿误路由进 _extract_xlsx 静默吞掉）。
             return self._unsupported(task, file_ext)
         elif file_ext == "pptx":
             return self._extract_pptx(task)
-        elif file_ext in ("txt", "md", "csv", "html"):
+        elif file_ext in ("txt", "md", "csv", "html", "htm"):
             return self._extract_text(task)
-        elif file_ext in ("png", "jpg", "jpeg", "webp"):
+        elif file_ext in ("png", "jpg", "jpeg", "webp", "tif", "tiff", "gif", "bmp"):
             return self._extract_image(task)
         else:
             return self._unsupported(task, file_ext)
@@ -288,12 +454,20 @@ class UnifiedExtractor:
                 if ref:
                     export_by_ref[ref] = ea
 
-            # 用 inline 顺序重建 exported 列表，确保 image_index 一致
+            # 用 inline 顺序重建 exported 列表，确保 image_index 一致。
+            # 同一 media 被正文引用多次时（同 rId 多处出现），第二次起必须
+            # 复制资产对象——直接复用会让 image_index 互相覆盖（last-write-wins），
+            # 先出现的步骤永远绑不到图。copy.copy 保留 XLSX 等动态附加属性。
             aligned_exports = []
+            consumed_ids = set()
             for ia in inline_image_assets:
                 ref = getattr(ia, "original_name", "") or ""
                 matched = export_by_ref.get(ref)
                 if matched:
+                    if id(matched) in consumed_ids:
+                        matched = copy.copy(matched)
+                    else:
+                        consumed_ids.add(id(matched))
                     # 用 inline 的 image_index 覆盖 export 的 image_index
                     matched.image_index = ia.image_index
                     aligned_exports.append(matched)
@@ -301,6 +475,12 @@ class UnifiedExtractor:
             # 如果对齐成功（大部分都能匹配），用对齐后的列表
             if len(aligned_exports) >= len(exported_images) * 0.5:
                 exported_images = aligned_exports
+
+        # ── 条带切片缝合（须在对齐之后：依赖 ref↔asset 的 image_index 对应）──
+        try:
+            blocks, exported_images = _stitch_strip_runs(blocks, exported_images)
+        except Exception as _e:
+            print(f"      ⚠️ [strip-stitch] skipped (non-fatal): {_e}")
 
         assets, img_blocks = self._process_embedded_images(
             exported_images, task,
@@ -1068,9 +1248,22 @@ class UnifiedExtractor:
                 hash_to_representative[file_hash] = img_asset
                 # 查询跨文档持久缓存（按 is_public 分命名空间）：public 文档会 bypass 安全审计，
                 # 其 CLEAN 结论绝不能被 quarantine 文档复用（否则跳过敏感审计）；反之亦然。
-                cache_key = f"{file_hash}:{'pub' if is_public else 'sec'}"
-                if cache_key in vlm_cache:
-                    hash_to_cached_result[file_hash] = vlm_cache[cache_key]
+                # 遗留裸 MD5 key 的回退/迁移逻辑见 _vlm_cache_lookup。
+                cached = _vlm_cache_lookup(vlm_cache, file_hash, is_public)
+                if cached is not None:
+                    # 反幻觉清洗同样覆盖历史缓存里的编造 ocr_text（幂等；
+                    # 缓存条目自带原图 width/height，密度上界可触发）
+                    if cached.get("ocr_text"):
+                        clean, _m = sanitize_ocr_text(
+                            cached.get("ocr_text", ""),
+                            width=cached.get("width") or None,
+                            height=cached.get("height") or None,
+                        )
+                        if clean != cached.get("ocr_text"):
+                            cached = dict(cached)
+                            cached["ocr_text"] = clean
+                            vlm_cache[f"{file_hash}:{'pub' if is_public else 'sec'}"] = cached
+                    hash_to_cached_result[file_hash] = cached
             hash_to_candidates[file_hash].append(img_asset)
 
         total_unique = len(hash_to_representative)
@@ -1114,7 +1307,10 @@ class UnifiedExtractor:
                         # 写入持久缓存：跳过降级结果（VLM 超时/解析失败的兜底，缓存会把一次性
                         # 故障变成跨文档/跨运行的永久错误标签）和无法稳定取哈希的 fallback key
                         # （基于内存地址，跨进程无意义）。缓存键按 is_public 分命名空间。
-                        if not funnel_res.get("degraded") and not file_hash.startswith("fallback_"):
+                        # ⚠️ simulate 模式的 mock 结果绝不能入持久缓存 —— 按真实 MD5 落键后，
+                        # 真实运行会命中 mock 描述（缓存投毒）。
+                        if (not self.simulate and not funnel_res.get("degraded")
+                                and not file_hash.startswith("fallback_")):
                             cache_key = f"{file_hash}:{'pub' if is_public else 'sec'}"
                             vlm_cache[cache_key] = {
                                 "status": funnel_res.get("status", ""),
@@ -1131,8 +1327,9 @@ class UnifiedExtractor:
                         rep = hash_to_representative[file_hash]
                         print(f"      ⚠️ Image funnel failed for {rep.original_name}: {e}")
 
-            # 处理完本文档后持久化缓存
-            self._save_vlm_cache()
+            # 处理完本文档后持久化缓存（simulate 不落盘，防 mock 污染共享缓存）
+            if not self.simulate:
+                self._save_vlm_cache()
 
         # ── Phase 3: 扇出结果到所有图片（包括重复项） ──
         all_results = []  # (img_asset, funnel_res)
@@ -1175,6 +1372,9 @@ class UnifiedExtractor:
                 "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
                 "reason": funnel_res.get("reason", ""),
             }
+            # 透传 PDF 显示 bbox（页坐标、上原点 — 版面位置图片锚定用）
+            if getattr(img_asset, "bbox", None):
+                asset_dict["bbox"] = list(img_asset.bbox)
             # 透传 XLSX anchor_row（用于行级图片绑定）
             if hasattr(img_asset, "anchor_row") and img_asset.anchor_row is not None:
                 asset_dict["anchor_row"] = img_asset.anchor_row
@@ -1235,6 +1435,15 @@ class UnifiedExtractor:
         assets = [{
             "filename": os.path.basename(local_path),
             "local_path": local_path,
+            # 与嵌入图 asset_dict 字段对齐：image_index/page_num/funnel 决策可溯源，
+            # 下游 _enrich_existing_image_refs 按 image_index 注入 source_image
+            "image_index": 0,
+            "original_index": 0,
+            "page_num": 1,
+            # 独立图片文档：raw/ 对象本身就是这张图，直接作为可签名的 oss_key ——
+            # 资产上传环节只上传 ROUTE_TO_VECTOR，构造出的 processing/assets/ 路径
+            # 对 ROUTE_TO_TEXT 永不存在（serving 签出 403 死图，对抗评审证实）。
+            "oss_key": task.get("raw_key", ""),
             "status": status,
             "width": funnel_res.get("width", 0),
             "height": funnel_res.get("height", 0),
@@ -1250,7 +1459,7 @@ class UnifiedExtractor:
         # 根据漏斗决策构建块和全文
         blocks = []
         warnings = []
-        
+
         if status == "ROUTE_TO_TEXT" and funnel_res.get("ocr_text"):
             blocks.append(ExtractedBlock(
                 block_type="ocr_text",
@@ -1263,6 +1472,17 @@ class UnifiedExtractor:
                     "image_category": funnel_res.get("image_category", ""),
                     "local_path": local_path,
                 },
+            ))
+            # 独立图片文档的图就是文档本体（磨床操作流程.png 等 SOP 海报）：
+            # ROUTE_TO_TEXT 只留 OCR 文本会让原图永远无法在回答里渲染。
+            # 附 image_ref 块（仅 image_index 占位），chunk 阶段由
+            # _enrich_existing_image_refs 注入 source_image/visual_summary。
+            blocks.append(ExtractedBlock(
+                block_type="image_ref",
+                text="",
+                page_num=1,
+                source="multimodal",
+                extra={"image_index": 0},
             ))
         elif status == "QUARANTINE_SENSITIVE":
             warnings.append(f"🚨 Sensitive content detected in non-public image asset: {funnel_res.get('reason')}")

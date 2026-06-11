@@ -28,6 +28,139 @@ _IMG_PLACEHOLDER_PATTERN = re.compile(r'<{1,2}IMG:(\d+)>{1,2}')
 # 句末收尾标点 + 闭合括号：按占位符切分后落在片段开头时，应回挂到上一文本块末尾
 _LEADING_CLOSER_PATTERN = re.compile(r'^[。，、；：！？）】」』]+')
 
+# ── 跨文档重复图片抑制 ──────────────────────────────────────────────
+# 目标是【真重复】：同一文件重复注册（A1员工行为管理标准 4 次注册）、docx+pdf 双格式
+# double-ingest、同一张截图被多份 SOP 原样内嵌（产成品入库单菜单截图 ×3 份 SOP）——
+# 这些的 VLM caption 逐字相同或高度一致（VLM cache 按图片 MD5 命中同一段文本）。
+# 阈值用真实答卷标定：真重复对 jac≥0.4/lcs≥35；最近的必留对（两份手册里不同路径的
+# U8 菜单截图）jac=0.342/lcs=12。
+# ⚠️ 三类绝不判重（2026-06-10 对抗评审用真实语料逐一证实的误杀面）：
+#   1. 同一文档（doc_id 相同）的多图 —— SOP 各步骤截图天然相似但各属其步；
+#   2. 值发散的同屏变体 —— 两份文档各自截的登录窗带不同部门的账套/工号标注
+#      （抑制其一会让读者照着错误账套操作，比展示两张更糟）；
+#   3. 引号目标发散的样板句 —— VLM caption 框架高度公式化（"左侧为业务导航…红色
+#      箭头指向'X'"），框架重合 ≠ 内容重合，'采购发票审核' vs '人事管理' 必须都保留。
+# 比较文本只用 VLM 出身的 visual_summary（near_dup_text）：ocr_text 由界面公共
+# 文案主导（"业务导航 常用功能…"），两张不同截图会 OCR 出同一段字，绝不能参与判重。
+_NEAR_DUP_MIN_CAPTION = 10     # 比较文本太短没有判别信号，一律不判重（宁可多展示）
+_NEAR_DUP_JAC_HIGH = 0.6       # 字符 bigram Jaccard 整体重合度极高 → 判重（仍受否决项约束）
+_NEAR_DUP_JAC = 0.35           # 中等重合度需叠加长公共子串（同屏截图的措辞锚点）
+_NEAR_DUP_LCS = 16
+_NEAR_DUP_MAX_CMP = 300        # 比较文本截断：LCS 是 O(n·m) 纯 Python DP，判别信号在头部
+_NEAR_DUP_MIN_BIGRAMS = 12     # bigram 并集太小 = 低熵样板文本（"操作界面如下图所示"），不判重
+_NEAR_DUP_MIN_SIDE_BIGRAMS = 8
+_VLM_DEGRADED_PATTERN = re.compile(r'^\s*\[VLM')          # "[VLM Fallback] …" 降级 caption 全网相同
+_QUOTED_TOKEN_PATTERN = re.compile(r'[‘“]([^‘’“”]{1,40})[’”]')   # VLM 引号里的菜单/按钮名
+_VALUE_TOKEN_PATTERN = re.compile(r'[A-Za-z0-9.\-@]{2,}')        # 工号/账套/IP/日期等取值 token
+# 箭头/高亮的目标项 = 这张截图的真正主语（"展开至'存货核算'→'记账'，红色箭头指向'X'"
+# 的路径引号会大量重合，只有 X 区分两张不同菜单截图）
+_ARROW_TARGET_PATTERN = re.compile(
+    r'(?:箭头指向|高亮选中|高亮的|红框标注|红框高亮)[^‘“’”，。；]{0,6}[‘“]([^‘’“”]{1,40})[’”]'
+)
+
+
+def _near_dup_normalize(text: str) -> str:
+    return re.sub(r'\s+', '', text or '')[:_NEAR_DUP_MAX_CMP]
+
+
+def _caption_bigrams(text: str) -> set:
+    s = _near_dup_normalize(text)
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _longest_common_substring(a: str, b: str) -> int:
+    """最长公共子串长度（去空白、截断到 _NEAR_DUP_MAX_CMP 后）。"""
+    a = _near_dup_normalize(a)
+    b = _near_dup_normalize(b)
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for ch_a in a:
+        cur = [0] * (len(b) + 1)
+        for j, ch_b in enumerate(b, 1):
+            if ch_a == ch_b:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def _is_near_dup_caption(a: str, b: str) -> bool:
+    """两段 VLM caption 是否描述同一张图（真重复），而非仅仅同类界面。
+
+    相似度门限（jac/lcs）先粗筛，再过三道否决项（任何一道命中即判不重复）：
+      低熵/降级样板 caption、引号目标发散、取值 token 发散。标定依据见常量注释。
+    """
+    a = (a or '').strip()
+    b = (b or '').strip()
+    if len(a) < _NEAR_DUP_MIN_CAPTION or len(b) < _NEAR_DUP_MIN_CAPTION:
+        return False
+    if _VLM_DEGRADED_PATTERN.match(a) or _VLM_DEGRADED_PATTERN.match(b):
+        return False   # 降级 caption 是常量文本，相同 ≠ 同图
+    set_a, set_b = _caption_bigrams(a), _caption_bigrams(b)
+    if (
+        len(set_a | set_b) < _NEAR_DUP_MIN_BIGRAMS
+        or min(len(set_a), len(set_b)) < _NEAR_DUP_MIN_SIDE_BIGRAMS
+    ):
+        return False   # 低熵文本（重复字符/超短样板句）没有判别力
+    jac = len(set_a & set_b) / len(set_a | set_b)
+    if jac < _NEAR_DUP_JAC:
+        return False
+    quoted_a = set(_QUOTED_TOKEN_PATTERN.findall(a))
+    quoted_b = set(_QUOTED_TOKEN_PATTERN.findall(b))
+    if jac < _NEAR_DUP_JAC_HIGH:
+        # 中带相似度（公式化框架天然重合）必须有引号主语为证：双方都要引出界面/
+        # 菜单名且有长公共子串，否则"职位信息维护 vs 部门信息维护"这类同框架
+        # 不同界面会被误判（真重复的 caption 逐字相同，走 ≥HIGH 快路，不受此限）
+        if not (quoted_a and quoted_b):
+            return False
+        if _longest_common_substring(a, b) < _NEAR_DUP_LCS:
+            return False
+    # 否决项 0：箭头/高亮目标发散 —— 菜单路径引号（'存货核算''记账'）会重合，
+    # 但"红色箭头指向'X'"的 X 才是截图主语；X 不同 = 不同操作的截图
+    target_a = set(_ARROW_TARGET_PATTERN.findall(a))
+    target_b = set(_ARROW_TARGET_PATTERN.findall(b))
+    if target_a and target_b and target_a.isdisjoint(target_b):
+        return False
+    # 否决项 1：引号目标发散 —— caption 框架公式化，引号里才是这张图的"主语"。
+    # 要求引号集多数重合（不止共享一个泛词如'我的桌面'），否则视为不同内容
+    if quoted_a and quoted_b and len(quoted_a & quoted_b) * 2 < min(len(quoted_a), len(quoted_b)):
+        return False
+    # 否决项 2：取值 token 发散 —— 真重复共享全部取值（同图同值）；
+    # 同屏不同部门变体恰好差在这些 token（FL063 vs FL0062、(888)PLS vs 188@FLSJ）
+    values_a = set(_VALUE_TOKEN_PATTERN.findall(a))
+    values_b = set(_VALUE_TOKEN_PATTERN.findall(b))
+    if values_a != values_b:
+        return False
+    return True
+
+
+def _find_duplicate_image(
+    accepted: List[Dict[str, str]],
+    doc_id: str,
+    oss_key: str,
+    near_dup_text: str,
+) -> Optional[Dict[str, str]]:
+    """候选图片与已采纳（将渲染）图片重复 → 返回命中项，否则 None。
+
+    两级判定：
+      1. oss_key 完全相同 —— 同一文件在一条回答里渲染两次永远无益（不分文档）；
+      2. VLM caption 真重复（_is_near_dup_caption）—— 仅适用于【不同 doc_id】之间，
+         且双方都要有 VLM 出身的比较文本（near_dup_text 为空 = 无判别信号，保守保留）。
+    """
+    for item in accepted:
+        if item["oss_key"] == oss_key:
+            return item
+        if (
+            doc_id and item["doc_id"] and item["doc_id"] != doc_id
+            and near_dup_text and item["near_dup_text"]
+            and _is_near_dup_caption(item["near_dup_text"], near_dup_text)
+        ):
+            return item
+    return None
+
 
 def strip_image_markers(text: Optional[str]) -> str:
     """去除 <<IMG:N>> / <IMG:N> 图片占位符（客户端可见文本的最终清理）。
@@ -84,6 +217,9 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
                 image_map[i] = [{
                     "source_image": source_image,
                     "visual_summary": chunk.get("visual_summary", ""),
+                    # near_dup_text = 跨文档判重的比较文本，只取 VLM 出身的 visual_summary；
+                    # 展示用 visual_summary 可能混入 ocr_text 兜底（界面公共文案），绝不参与判重
+                    "near_dup_text": chunk.get("visual_summary", ""),
                     "title": chunk.get("title", ""),
                 }]
 
@@ -105,6 +241,9 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
                                 or ref.get("visual_summary")
                                 or ref.get("ocr_text", "")
                             ),
+                            # caption 可能由 chunker 用 ocr_text 兜底拼成（出身不可考），
+                            # 判重只信 ref 自带的 visual_summary；为空则该图不参与近重判定
+                            "near_dup_text": ref.get("visual_summary") or "",
                             "title": chunk.get("title", ""),
                         })
                 if refs_list:
@@ -121,6 +260,8 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
                         refs_list.append({
                             "source_image": oss_key,
                             "visual_summary": ref.get("visual_summary", "") or ref.get("ocr_text", ""),
+                            # 判重不收 ocr_text：两张不同截图会 OCR 出同一段界面公共文案
+                            "near_dup_text": ref.get("visual_summary", ""),
                             "title": chunk.get("title", ""),
                         })
                 if refs_list:
@@ -132,6 +273,7 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
                     image_map[i] = [{
                         "source_image": source_image,
                         "visual_summary": chunk.get("visual_summary", "") or chunk.get("caption", ""),
+                        "near_dup_text": chunk.get("visual_summary", ""),
                         "title": chunk.get("title", ""),
                     }]
 
@@ -202,29 +344,46 @@ def build_content_blocks(
     #    url_expires=None 由 generate_signed_url 统一解析为 config.oss.signed_url_expires。
     signed_images: Dict[int, List[Dict[str, str]]] = {}
     generated_count = 0
+    accepted: List[Dict[str, str]] = []   # 已采纳（将渲染）图片：近重抑制的比较基准
     for doc_idx in referenced_order:
         if generated_count >= max_images:
             break
+        # doc_idx 由 enumerate(chunks, 1) 产生，必在界内；doc_id 用于「同文档绝不判近重」
+        chunk_doc_id = chunks[doc_idx - 1].get("doc_id", "")
         signed_list = []
         for img_info in image_map[doc_idx]:
             if generated_count >= max_images:
                 break
-            url = generate_signed_url(img_info["source_image"], expires=url_expires)
+            oss_key = img_info["source_image"]
+            summary = img_info.get('visual_summary', '')
+            near_dup_text = img_info.get("near_dup_text", "")
+            dup = _find_duplicate_image(accepted, chunk_doc_id, oss_key, near_dup_text)
+            if dup is not None:
+                # 被抑制的近重图不消耗 max_images 配额（continue 在计数之前）
+                logger.info(
+                    "近重图片抑制: 丢弃 '%s' (doc=%s)，与已采纳 '%s' (doc=%s) 描述同屏",
+                    oss_key, chunk_doc_id, dup["oss_key"], dup["doc_id"],
+                )
+                continue
+            url = generate_signed_url(oss_key, expires=url_expires)
             if url:
-                summary = img_info.get('visual_summary', '')
                 signed_list.append({
                     "url": url,
                     # oss_key 随块落库：签名 URL 1h 过期，卡片回调重建时按它重签
                     # （refresh_image_block_urls）；卡片模板/小程序只读 url，多余键无害
-                    "oss_key": img_info["source_image"],
+                    "oss_key": oss_key,
                     "title": "",
                     "caption": (summary[:max_caption_len] if max_caption_len else summary) if summary else "",
+                })
+                # 判重基准存 VLM 出身的 near_dup_text（caption 可能被 max_caption_len 截短/混 OCR）
+                accepted.append({
+                    "doc_id": chunk_doc_id, "oss_key": oss_key, "near_dup_text": near_dup_text,
                 })
                 generated_count += 1
             else:
                 logger.warning(
                     "Skipping image chunk %d: signed URL generation failed for '%s'",
-                    doc_idx, img_info["source_image"],
+                    doc_idx, oss_key,
                 )
         if signed_list:
             signed_images[doc_idx] = signed_list

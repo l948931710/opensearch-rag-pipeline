@@ -98,15 +98,63 @@ bucket = oss2.Bucket(auth, OSS_ENDPOINT, OSS_BUCKET_NAME)
 
 oss_files = {}  # raw_key -> file_size
 
+# ── 摄取准入策略 ──
+# 单一来源是 opensearch_pipeline/ingest_policy.py；本脚本作为 PyODPS 独立节点
+# 运行时无该包，使用内联副本（⚠️ 修改时两处同步；tests/test_ingest_generalization.py
+# 的 parity test 会用 AST 抽取本副本与正本逐键对拍，单边改动会挂 CI）。
+INGEST_POLICY_REV = "2026-06-10"   # 节点日志可见，核对线上跑的是哪一版策略
+try:
+    from opensearch_pipeline.ingest_policy import should_ingest_raw_key
+    print("   [ingest-policy] using opensearch_pipeline.ingest_policy (rev %s)" % INGEST_POLICY_REV)
+except ImportError:
+    print("   [ingest-policy] using inline fallback copy (rev %s)" % INGEST_POLICY_REV)
+    _IGNORED_PREFIXES = ("~$", ".~")
+    _IGNORED_BASENAMES = {"thumbs.db", ".ds_store", "desktop.ini"}
+    _IGNORED_EXTS = {"db", "tmp", "lnk", "exe", "dll",
+                     "mp4", "avi", "mov", "wmv", "mp3", "wav",
+                     "zip", "rar", "7z", "tar", "gz"}
+    _LEGACY_EXTS = {"doc", "xls", "ppt"}
+    _INGESTABLE_EXTS = {"pdf", "docx", "xlsx", "pptx",
+                        "txt", "md", "csv", "html", "htm",
+                        "png", "jpg", "jpeg", "webp", "tif", "tiff", "gif", "bmp"}
+
+    def should_ingest_raw_key(key):
+        if not key or key.endswith("/"):
+            return False, "directory"
+        if "/_quarantine/" in key or key.startswith(("raw/_quarantine/", "_quarantine/")):
+            return False, "excluded path (_quarantine)"
+        if "/_archive/" in key or key.startswith(("raw/_archive/", "_archive/")):
+            return False, "excluded path (_archive)"
+        base = os.path.basename(key).lower()
+        if any(base.startswith(p) for p in _IGNORED_PREFIXES):
+            return False, "temp file (~$)"
+        if base in _IGNORED_BASENAMES:
+            return False, "junk file"
+        ext = os.path.splitext(base)[1].lstrip(".")
+        if not ext:
+            return False, "no extension"
+        if ext in _IGNORED_EXTS:
+            return False, "ignored ext (.%s)" % ext
+        if ext in _LEGACY_EXTS:
+            return False, "unsupported legacy ext (.%s)" % ext
+        if ext not in _INGESTABLE_EXTS:
+            return False, "unknown ext (.%s)" % ext
+        return True, ""
+
+skip_stats = {}
 for obj in oss2.ObjectIteratorV2(bucket, prefix=OSS_RAW_PREFIX):
     key = obj.key
-    if key.endswith("/"):
-        continue
-    if "/_quarantine/" in key or key.startswith("raw/_quarantine/"):
+    ok, reason = should_ingest_raw_key(key)
+    if not ok:
+        skip_stats[reason] = skip_stats.get(reason, 0) + 1
         continue
     oss_files[key] = obj.size
 
-print(f"   ✅ OSS 发现 {len(oss_files)} 个文件")
+print(f"   ✅ OSS 发现 {len(oss_files)} 个可摄取文件")
+if skip_stats:
+    print("   ⏭️ 跳过统计:")
+    for reason, n in sorted(skip_stats.items(), key=lambda kv: -kv[1]):
+        print(f"      {n:5d} × {reason}")
 
 # ═══════════════════════════════════════════════════════════════
 # 3. 查 RDS 已注册记录

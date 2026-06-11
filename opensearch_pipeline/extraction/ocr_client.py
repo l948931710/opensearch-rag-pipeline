@@ -10,6 +10,7 @@ ocr_client.py — Qwen-VL OCR 统一客户端
 """
 
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -18,6 +19,96 @@ from opensearch_pipeline.extraction.schema import ExtractedBlock
 
 # DashScope / Gemini 两个分支共用的 OCR 指令
 _OCR_PROMPT = "请识别图片中的所有文字，保持原文顺序输出。只输出识别文本，不要解释。"
+
+
+def sanitize_ocr_text(text, *, width=None, height=None):
+    """OCR 输出反幻觉清洗 → (clean_text, meta)。
+
+    Qwen-VL OCR 对低文本/照片类输入会凭空编造内容（典型形态：同一表格行
+    重复几十次、尾部短语死循环），编造文本曾直接进入索引 chunk。规则
+    （全部为修剪而非整体丢弃，唯一例外是规则 4）：
+      1. 连续重复行：同一行（去空白比较）连续 >2 次 → 只留前 2 次；
+      2. 主导行：≥10 行里同一行占比 >40%（穿插重复）→ 只留前 2 次；
+      3. 尾部短语循环：≥6 字符短语在结尾连续 ≥4 次 → 截到 2 次
+         （只扫描末尾 2000 字符，避免回溯爆炸；≥6 字符下限保护
+         检验表里"合格 合格 合格"这类合法短单元格重复）；
+      4. 像素密度上界（仅传入尺寸的嵌入图触发；整页渲染不传尺寸）：
+         len(text) > max(120, w*h/40) 在物理上不可能 → 返回 ""。
+    永不抛异常：任何内部错误 → 原文原样返回（fail-open，与全管线
+    "辅助环节失败不破坏主流程"约定一致）。
+    """
+    meta = {"sanitized": False, "reason": ""}
+    try:
+        if not text or not isinstance(text, str):
+            return text, meta
+        original_len = len(text)
+        reasons = []
+
+        # 规则 4：像素密度上界（先于修剪——编造表格在小图上直接整体拒绝）
+        if width and height:
+            allowance = max(120, int(width * height / 40))
+            if len(text) > allowance:
+                meta["sanitized"] = True
+                meta["reason"] = f"density:{len(text)}>{allowance}@{width}x{height}"
+                print(f"      [ocr-sanitize] {meta['reason']}: dropped fabricated text")
+                return "", meta
+
+        def _norm(s):
+            return re.sub(r"\s+", "", s)
+
+        lines = text.splitlines()
+        dropped = 0
+        if len(lines) >= 3:
+            # 规则 1：连续重复行 collapse
+            out = []
+            run_norm, run_count = None, 0
+            for ln in lines:
+                n = _norm(ln)
+                if n and n == run_norm:
+                    run_count += 1
+                    if run_count > 2:
+                        dropped += 1
+                        continue
+                else:
+                    run_norm, run_count = n, 1
+                out.append(ln)
+
+            # 规则 2：主导行（穿插重复，规则 1 抓不到）
+            if len(out) >= 10:
+                from collections import Counter
+                norms = [_norm(ln) for ln in out if _norm(ln)]
+                if norms:
+                    top, cnt = Counter(norms).most_common(1)[0]
+                    if cnt > 2 and cnt / len(norms) > 0.4:
+                        kept, out2 = 0, []
+                        for ln in out:
+                            if _norm(ln) == top:
+                                kept += 1
+                                if kept > 2:
+                                    dropped += 1
+                                    continue
+                            out2.append(ln)
+                        out = out2
+            if dropped:
+                reasons.append(f"lines:{dropped}")
+            text = "\n".join(out)
+
+        # 规则 3：尾部短语循环（只看末尾 2000 字符，限定回溯成本）
+        tail = text[-2000:]
+        m = re.search(r"(.{6,80}?)(?:\1){3,}\s*$", tail, re.DOTALL)
+        if m:
+            cut = len(text) - len(tail) + m.start()
+            text = text[:cut] + m.group(1) * 2
+            reasons.append("tail-loop")
+
+        if reasons:
+            meta["sanitized"] = True
+            meta["reason"] = "+".join(reasons)
+            print(f"      [ocr-sanitize] {meta['reason']}: "
+                  f"{original_len} → {len(text)} chars")
+        return text, meta
+    except Exception:
+        return text, meta
 
 
 @dataclass
@@ -184,6 +275,8 @@ class OCRClient:
 
                 try:
                     page_text = self._call_ocr_api(b64_data, "image/png")
+                    # 反幻觉修剪（不传尺寸：整页渲染只修剪重复，绝不整体丢弃）
+                    page_text, _ = sanitize_ocr_text(page_text)
                     pages.append(OCRPageResult(
                         page_num=page_idx + 1,
                         text=page_text,
@@ -214,11 +307,21 @@ class OCRClient:
         try:
             with open(local_path, "rb") as f:
                 b64_data = base64.b64encode(f.read()).decode('utf-8')
-            
+
             ext = os.path.splitext(local_path)[1].lower()
             mime_type = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
-            
+
             text = self._call_ocr_api(b64_data, mime_type)
+
+            # 反幻觉清洗：嵌入图自测像素尺寸 → 密度上界可触发（整页渲染不传）
+            w = h = None
+            try:
+                from PIL import Image
+                with Image.open(local_path) as im:
+                    w, h = im.size
+            except Exception:
+                pass
+            text, _ = sanitize_ocr_text(text, width=w, height=h)
 
             return OCRResult(
                 pages=[OCRPageResult(page_num=1, text=text, status="DONE")],

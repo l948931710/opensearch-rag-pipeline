@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from opensearch_pipeline.extraction.schema import STEP_BOUNDARY_PATTERN
+
 # 分页标志（页眉/页脚表格识别）：仅含这类标志的短表格才视为可去重的重复页眉表，
 # 真实数据表不含分页短语，因此不会被误删。
 _PAGE_MARKER = re.compile(
@@ -387,19 +389,8 @@ class DocumentChunker:
             kb_type=meta.get("kb_type"),
             risk_level=meta.get("risk_level"),
         )
-    # ── 步骤边界检测正则 ──
-    _STEP_BOUNDARY_RE = re.compile(
-        r'^[ \t　]*(?:'                           # 容忍行首缩进（空格/制表/全角空格）— DOCX 子标题常带缩进
-        r'步骤\s*([一二三四五六七八九十\d]+)|'          # 步骤1 / 步骤三 / 步骤 2
-        r'Step\s*(\d+)|'                             # Step 1 / Step2
-        r'第\s*([一二三四五六七八九十\d]+)\s*步|'     # 第一步 / 第1步
-        r'(\d+)\s*[\.．、]\s*(?![\d])|'              # 1. / 1．/ 2、（排除 1.1 条款编号）
-        r'(\d+)\s*[)）]\s*|'                           # 1) / 2）
-        r'(\d+\.\d+)\s+\S|'                           # 1.2 / 3.2 / 4.2 条款编号步骤（后跟空格+文字）
-        r'(\d+\.\d+(?:\.\d+)+)\s*(?=[一-鿿A-Za-z0-9])'  # 4.2.1 / 4.2.3.2 / 4.2.3.1 3M 多级子步骤（数字后紧跟中文或字母数字）
-        r')',
-        re.IGNORECASE | re.MULTILINE,
-    )
+    # ── 步骤边界检测正则（模式串与 PDF 提取的段落切分共享单一来源 schema.STEP_BOUNDARY_PATTERN） ──
+    _STEP_BOUNDARY_RE = re.compile(STEP_BOUNDARY_PATTERN, re.IGNORECASE | re.MULTILINE)
 
     def _chunk_by_step(
         self,
@@ -455,6 +446,7 @@ class DocumentChunker:
         preamble_texts = []       # 步骤前的前导文本
         postamble_texts = []      # 最后一个步骤后的尾部文本
         current_step = None
+        current_main_no = None    # 最近一个显式主步骤号（步骤N/Step N/第N步），子项编号沿用
         found_any_step = False
         pending_images = []       # orphan images waiting for next step
 
@@ -622,7 +614,32 @@ class DocumentChunker:
                     else:
                         step_no = int(step_no_str)
                 except (ValueError, TypeError):
-                    step_no = len(step_groups) + 1
+                    # 文档内 ordinal。current_step 此刻尚未 append 进 step_groups
+                    # （append 在下方"结束上一个步骤组"），不补偿会得到 1,1,2,3…
+                    step_no = len(step_groups) + (2 if current_step is not None else 1)
+
+                # X.Y / X.Y.Z 条款编号步骤：int() 必然失败 → 上面的 fallback 给出
+                # 文档内序号（ordinal —— 故意不取主号 4：整篇 4.1…4.20 的 SOP 会
+                # 全部塌到 step_no=4，检索端 ±1 扩展窗一次拉满全文）。原始编号存
+                # section_no（heading 派生步骤的既有契约键）供展示层还原，回答里
+                # 显示 4.1 而非编造的 步骤5。
+                section_no = None
+                if step_no_str and re.fullmatch(r"\d+(?:\.\d+)+", step_no_str):
+                    section_no = step_no_str
+
+                # 子步骤判定：N) 编号出现在显式主步骤（步骤N/Step N/第N步）内部时是该
+                # 主步骤的子项（如 步骤5 的 1) 2) 3)）—— 沿用主步骤号、记录 sub_no。
+                # 否则子卡的 step_no=1/2/3 会与主步骤 1/2/3 在同一 parent 下冲突，
+                # 而 (parent_chunk_id, step_no) 是检索端步骤扩展的键（2026-06-10 诊断）。
+                sub_no = None
+                if match.group(5) and current_main_no is not None:
+                    sub_no = step_no
+                    step_no = current_main_no
+                elif match.group(1) or match.group(2) or match.group(3):
+                    current_main_no = step_no
+                elif section_no is not None:
+                    # X.Y 步骤同样是主步骤：后续 N) 子项嵌在它的 ordinal 下
+                    current_main_no = step_no
 
                 # 结束上一个步骤组
                 if current_step is not None:
@@ -631,6 +648,8 @@ class DocumentChunker:
                 # 开始新步骤组，并吸收 pending orphan images
                 current_step = {
                     "step_no": step_no,
+                    "sub_no": sub_no,
+                    "section_no": section_no,
                     "title": seg_text[:80],
                     "text_parts": [seg_text],
                     "image_refs": list(pending_images),
@@ -705,7 +724,18 @@ class DocumentChunker:
                         "image_index": img_extra.get("image_index"),
                         "source_image": img_extra.get("source_image", ""),
                         "oss_key": img_extra.get("oss_key", ""),
+                        # ── 溯源契约字段（extractor→chunker→HA3→serving 全链保留）──
+                        # page_num/bbox = 图片自己的页码与版面位置（≠ 步骤文本的页码，
+                        # 跨页图必须可审计）；visual_summary 是 CLAUDE.md 约定键，
+                        # 不能只以 caption 别名存在；ocr_text 按图归属（不再只有
+                        # chunk 级 image_ocr_raw 大杂烩）；funnel_status 记录路由决策。
+                        "page_num": img_extra.get("page_num"),
+                        "visual_summary": img_extra.get("visual_summary", ""),
+                        "ocr_text": img_extra.get("ocr_text", ""),
+                        "funnel_status": img_extra.get("funnel_status", ""),
                     }
+                    if img_extra.get("bbox"):
+                        img_ref_entry["bbox"] = list(img_extra["bbox"])
                     # 透传 VLM 结构化字段
                     for vk in ("image_category", "vlm_annotation_map"):
                         if img_extra.get(vk):
@@ -781,6 +811,10 @@ class DocumentChunker:
                                     "source_image": img_ref.get("source_image", ""),
                                     "oss_key": img_ref.get("oss_key", ""),
                                     "caption": caption,
+                                    # 溯源：图片自己的页码/版面位置/VLM 描述随独立 chunk 保留
+                                    "page_num": img_ref.get("page_num"),
+                                    "bbox": img_ref.get("bbox"),
+                                    "visual_summary": img_ref.get("visual_summary", ""),
                                     "context_step_no": sg["step_no"],
                                     "context_section": sg["section"],
                                 })
@@ -848,6 +882,8 @@ class DocumentChunker:
                     source=sg.get("source", "native"),
                 )
                 step_chunk.extra["step_no"] = sg["step_no"]
+                if sg.get("sub_no") is not None:
+                    step_chunk.extra["sub_step_no"] = sg["sub_no"]
                 if sg.get("section_no"):
                     step_chunk.extra["section_no"] = sg["section_no"]
                 step_chunk.extra["image_refs"] = image_refs_list
@@ -886,12 +922,15 @@ class DocumentChunker:
                 vk_chunk = self._create_chunk(
                     doc_id=doc_id, version_no=version_no,
                     chunk_index=chunk_index, chunk_type="visual_knowledge",
-                    chunk_text=vk_text, page_num=None,
+                    chunk_text=vk_text, page_num=vk.get("page_num"),
                     section_title=vk["context_section"], metadata=meta,
                 )
                 vk_chunk.extra["source_image"] = vk.get("source_image", "")
                 vk_chunk.extra["oss_key"] = vk.get("oss_key", "")
                 vk_chunk.extra["caption"] = vk["caption"]
+                vk_chunk.extra["visual_summary"] = vk.get("visual_summary", "")
+                if vk.get("bbox"):
+                    vk_chunk.extra["bbox"] = list(vk["bbox"])
                 vk_chunk.extra["context_step_no"] = vk["context_step_no"]
                 vk_chunk.extra["context_section"] = vk["context_section"]
                 vk_chunk.extra["image_index"] = vk["image_index"]

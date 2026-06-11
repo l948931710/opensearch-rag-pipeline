@@ -156,12 +156,16 @@ class TestNormalScenario:
         assert ctx["published_count"] == 1
         assert ctx["chunk_meta_written"] > 0
 
-        # 验证 chunk 结构
+        # 验证 chunk 结构（2026-06-10 起 faq_eligible 不再劫持路由：
+        # 含步骤标记的模拟文档会合法进入 step 模式，产出 step_card/procedure_parent）
         for chunk in ctx["valid_chunks"]:
             assert chunk.doc_id
             assert chunk.chunk_id
             assert chunk.chunk_text
-            assert chunk.chunk_type in ("text_chunk", "table_chunk", "ocr_chunk")
+            assert chunk.chunk_type in (
+                "text_chunk", "table_chunk", "ocr_chunk",
+                "step_card", "procedure_parent", "image", "visual_knowledge",
+            )
 
     def test_full_pipeline(self):
         ctx = get_test_data("normal")

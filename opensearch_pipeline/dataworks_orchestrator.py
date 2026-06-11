@@ -496,18 +496,21 @@ def _count_pending_rows(stage: int) -> int:
     """生产模式下统计某 stage 仍待处理的行数（用于 drain-loop 的进度判定）。
 
     各 stage 的谓词与 run_stage / node_scan_raw_files 的认领条件保持一致：
-      Stage 1: NOT_STARTED & canonical_json_key IS NULL & file_ext≠doc & active
+      Stage 1: NOT_STARTED & canonical_json_key IS NULL
+               & file_ext ∉ ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（与认领 SQL 同一常量；
+               不一致 = 计数器看得到、认领挑不走 → 无进展守卫永久判死 stage-1）& active
       Stage 2: (NOT_STARTED 或 FAILED&retry_count<3) & active & canonical_json_key IS NOT NULL
       Stage 3: chunk_meta NOT_INDEXED/FAILED & is_active & (dv 非 PROCESSING 或 已过 2h 失效锁)
     """
+    from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
 
     queries = {
-        1: """
+        1: f"""
             SELECT COUNT(*) FROM document_version
             WHERE content_process_status = 'NOT_STARTED'
               AND canonical_json_key IS NULL
-              AND file_ext NOT IN ('doc')
+              AND file_ext NOT IN {stage1_ext_exclusion_sql()}
               AND status = 'active'
         """,
         2: """

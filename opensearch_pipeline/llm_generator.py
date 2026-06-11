@@ -7,6 +7,7 @@ llm_generator.py — LLM 回答生成模块
 
 import json
 import logging
+import re
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
@@ -143,9 +144,17 @@ def _format_context(
         elif chunk_type == "step_card":
             step_no = chunk.get("step_no") or chunk.get("_step_no", "")
             total_steps = chunk.get("_total_steps", "")
-            step_label = f"步骤{step_no}" if step_no else "步骤"
-            if total_steps:
-                step_label = f"步骤{step_no}/{total_steps}"
+            # 条款编号步骤（4.1 / 3.2.4）优先显示原文编号：step_no 是文档内
+            # ordinal（排序键），照搬会让回答说"步骤5"而文档写"4.1"
+            section_no = chunk.get("section_no", "")
+            if section_no:
+                step_label = f"步骤{section_no}"
+            elif step_no:
+                step_label = f"步骤{step_no}"
+                if total_steps:
+                    step_label = f"步骤{step_no}/{total_steps}"
+            else:
+                step_label = "步骤"
             header += f" [{step_label}]"
             image_refs = chunk.get("image_refs") or []
             if image_refs and not pure_text:
@@ -177,35 +186,59 @@ def _format_context(
     return "\n---\n".join(parts)
 
 
+# 来源去重时从标题剥掉的文件扩展名（docx+pdf 双格式 double-ingest 视为同一来源）
+_TITLE_EXT_PATTERN = re.compile(r'\.(docx?|pdf|xlsx?|csv|html?|txt)\s*$', re.IGNORECASE)
+
+
+def _section_of(chunk: Dict[str, Any]) -> str:
+    """chunk 的定位信息：section_title，为空时回退页码（PDF 作业指导书等无标题结构文档）。
+
+    RDS 重建的 chunk 可能带显式 None（列为 NULL）—— 必须归一为 ""，
+    SourceInfo.section 是非可空 str。
+    """
+    section = chunk.get("section_title") or ""
+    if not section:
+        try:
+            page_num = int(chunk.get("page_num") or 0)
+        except (TypeError, ValueError):
+            page_num = 0   # 页码异常不影响回答（优雅降级）
+        if page_num > 0:
+            section = f"第{page_num}页"
+    return section
+
+
 def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """从 chunks 中提取来源信息。"""
-    sources = []
-    seen = set()
+    """从 chunks 中提取来源信息。
+
+    去重按【标题去扩展名】而非 doc_id：语料中同一文件被重复注册成多个 doc_id
+    （跨部门重复上传，如 A1员工行为管理标准 4 次注册）或 docx+pdf 双格式 double-ingest
+    时，用户不应看到同一文档出现两行。chunks 已按检索排序，保留首次出现（排名最高）；
+    被折叠行仅用于回填定位信息（docx 首位无页码、pdf 孪生有 第N页 时不丢失定位）。
+    无标题文档退回 doc_id 区分，避免互不相关的空标题文档被折叠。
+    """
+    sources: List[Dict[str, Any]] = []
+    key_to_idx: Dict[str, int] = {}
     for chunk in chunks:
         doc_id = chunk.get("doc_id", "")
         title = chunk.get("title", "")
-        key = (doc_id, title)
-        if key not in seen:
-            seen.add(key)
-            section = chunk.get("section_title", "")
-            if not section:
-                # PDF 作业指导书等无标题结构文档 section_title 为空 → 回退页码定位
-                try:
-                    page_num = int(chunk.get("page_num") or 0)
-                except (TypeError, ValueError):
-                    page_num = 0   # 页码异常不影响回答（优雅降级）
-                if page_num > 0:
-                    section = f"第{page_num}页"
-            sources.append({
-                "doc_id": doc_id,
-                "title": title,
-                "section": section,
-                "score": chunk.get("score", 0),
-                "level": score_level(chunk),
-                "chunk_type": chunk.get("chunk_type", ""),
-                "source_image": chunk.get("source_image", ""),
-                "visual_summary": chunk.get("visual_summary", ""),
-            })
+        key = _TITLE_EXT_PATTERN.sub('', title).strip() or doc_id
+        if key in key_to_idx:
+            # 折叠重复行，但若保留行缺定位而本行有（docx 无原生页码、pdf 孪生有），回填
+            kept = sources[key_to_idx[key]]
+            if not kept["section"]:
+                kept["section"] = _section_of(chunk)
+            continue
+        key_to_idx[key] = len(sources)
+        sources.append({
+            "doc_id": doc_id,
+            "title": title,
+            "section": _section_of(chunk),
+            "score": chunk.get("score", 0),
+            "level": score_level(chunk),
+            "chunk_type": chunk.get("chunk_type", ""),
+            "source_image": chunk.get("source_image", ""),
+            "visual_summary": chunk.get("visual_summary", ""),
+        })
     return sources
 
 
