@@ -436,6 +436,130 @@ def test_docx_totext_fallback_unchanged():
         "DOCX TO_TEXT 嵌入图的兜底行为不应被 XLSX 修复改变")
 
 
+# ═══════════════ PPTX TO_TEXT 嵌入图的 serving 可渲染性 ═══════════════
+# 与 XLSX 同类缺陷（2026-06-10 修复的 slide 版）：slide 绑定原先只收
+# ROUTE_TO_VECTOR，TO_TEXT 截图的 OCR 文本进了 slide chunk，原图却没有任何
+# serving 可达载体（slide 模式整体跳过独立 image chunk 兜底）→ I5 违例。
+# 修复：TO_TEXT 与 TO_VECTOR 同绑进 slide 的 visual_knowledge chunk，
+# VECTOR 先入池保证已有 VECTOR 封面不被抢占。
+
+
+def _pptx_doc(filename, blocks, assets, text=""):
+    doc = _xlsx_doc(filename, blocks, assets, text=text)
+    doc["doc_id"] = "PPTXIMG1"
+    doc["file_ext"] = "pptx"
+    doc["filename"] = filename
+    return doc
+
+
+def _pptx_asset(idx, filename, page_num, visual_summary="", ocr_text="",
+                status="ROUTE_TO_TEXT", oss_key=None):
+    a = _totext_asset(idx, filename, visual_summary, ocr_text, anchor_row=None,
+                      status=status)
+    a["page_num"] = page_num
+    if oss_key is not None:
+        a["oss_key"] = oss_key
+    return a
+
+
+def _pptx_slide_blocks(page_num, title, body=None, ocr=None, ocr_image=None):
+    blocks = [{"block_type": "heading", "text": title, "page_num": page_num,
+               "section_path": title, "source": "python_pptx",
+               "extra": {"placeholder": "title", "slide_num": page_num}}]
+    if body:
+        blocks.append({"block_type": "paragraph", "text": body, "page_num": page_num,
+                       "section_path": title, "source": "python_pptx", "extra": {}})
+    if ocr:
+        blocks.append({"block_type": "ocr_text", "text": ocr, "page_num": page_num,
+                       "source": "ocr", "extra": {"source_image": ocr_image or ""}})
+    return blocks
+
+
+def test_pptx_totext_slide_images_bound_serving_renderable():
+    """TO_TEXT 截图必须绑进所在 slide 的 visual_knowledge chunk（chunk 级
+    source_image 经 to_ha3_doc 进 HA3、image_refs 经 RDS image_refs_json 恢复），
+    且上传环节回填的 oss_key 优先于构造路径。"""
+    ocr1 = "U8系统登录界面 输入操作员编号与密码 选择账套后点击登录进入主菜单"
+    ocr2 = "销售出库单界面 录入出库日期仓库与货位 点击保存审核完成出库登记"
+    blocks = (
+        _pptx_slide_blocks(1, "U8系统登录", body="本节介绍U8系统的登录步骤与注意事项。",
+                           ocr=ocr1, ocr_image="培训_slide1_img0000.png")
+        + _pptx_slide_blocks(2, "销售出库操作", body="出库单录入的完整操作演示如下。",
+                             ocr=ocr2, ocr_image="培训_slide2_img0001.png")
+    )
+    assets = [
+        # slide 1：上传环节已回填 oss_key（出现副本共享上传的形态）→ 必须优先采用
+        _pptx_asset(0, "培训_slide1_img0000.png", 1,
+                    visual_summary="U8登录界面截图", ocr_text=ocr1,
+                    oss_key="processing/assets/it/PPTXIMG1/v1/dedup_shared.png"),
+        # slide 2：无回填 → 构造路径兜底；caption 缺失形态
+        _pptx_asset(1, "培训_slide2_img0001.png", 2, ocr_text=ocr2),
+    ]
+    doc = _pptx_doc("U8操作培训.pptx", blocks, assets)
+    chunks = _chunk_doc(doc)
+
+    vk = {c.page_num: c for c in chunks if c.chunk_type == "visual_knowledge"}
+    assert set(vk) == {1, 2}, (
+        f"带图 slide 应升级为 visual_knowledge，实际页: {sorted(vk)}")
+    for pg, c in vk.items():
+        assert c.extra.get("source_image"), f"slide {pg} 缺 chunk 级 source_image"
+        refs = c.extra.get("image_refs") or []
+        assert refs, f"slide {pg} 缺 image_refs"
+        # image_refs 契约键（CLAUDE.md：extractor → chunker → builder → 卡片全链路依赖）
+        for key in ("oss_key", "source_image", "visual_summary", "ocr_text"):
+            assert key in refs[0], f"image_refs 契约键缺失: {key}"
+    # 回填 oss_key 优先；未回填走构造路径
+    assert vk[1].extra["source_image"] == "processing/assets/it/PPTXIMG1/v1/dedup_shared.png"
+    assert vk[2].extra["source_image"] == (
+        "processing/assets/it/PPTXIMG1/v1/培训_slide2_img0001.png")
+    rendered = _serving_renderable_fns(chunks)
+    for a in assets:
+        assert a["filename"] in rendered, f"{a['filename']} 提取了但 serving 不可渲染（I5）"
+    # slide 模式不建独立 image chunk（绑定即载体，避免重复）
+    assert not [c for c in chunks if c.chunk_type == "image"]
+
+
+def test_pptx_vector_cover_not_displaced_by_totext():
+    """同一 slide 同时有 VECTOR 图与 TO_TEXT 截图（assets 中 TO_TEXT 在前）：
+    VECTOR 必须保持 refs[0]/封面 source_image，TO_TEXT 作后续 ref 追加。"""
+    blocks = _pptx_slide_blocks(1, "产品包装规范", body="包装流程与成品外观要求如下所示。")
+    assets = [
+        _pptx_asset(0, "包装_slide1_img0000.png", 1, ocr_text="包装机参数设置面板截图"),
+        _pptx_asset(1, "包装_slide1_img0001.png", 1,
+                    visual_summary="成品包装外观示意图", status="ROUTE_TO_VECTOR"),
+    ]
+    doc = _pptx_doc("产品包装培训.pptx", blocks, assets)
+    chunks = _chunk_doc(doc)
+
+    vks = [c for c in chunks if c.chunk_type == "visual_knowledge"]
+    assert len(vks) == 1
+    refs = vks[0].extra.get("image_refs") or []
+    assert [r["filename"] for r in refs] == [
+        "包装_slide1_img0001.png", "包装_slide1_img0000.png"], (
+        f"VECTOR 应先入池作封面、TO_TEXT 追加: {[r['filename'] for r in refs]}")
+    assert vks[0].extra["source_image"].endswith("包装_slide1_img0001.png"), (
+        "TO_TEXT 不得抢占已有 VECTOR 封面")
+    assert vks[0].extra.get("visual_summary") == "成品包装外观示意图"
+
+
+def test_pptx_totext_imageonly_slide_standalone_chunk_with_ocr_desc():
+    """纯图 slide（该页无任何文本块）的 TO_TEXT 截图：必须单独建 visual_knowledge
+    chunk，且 caption 缺失时 chunk_text 回退 OCR 片段、不得是空描述。"""
+    ocr3 = "单证打印窗口 勾选报关合同与财务发票选项 点击确认输出打印外贸单证资料"
+    blocks = _pptx_slide_blocks(1, "外贸单证培训", body="单证打印的操作入口见下一页截图。")
+    assets = [_pptx_asset(0, "单证_slide2_img0000.png", 2, ocr_text=ocr3)]
+    doc = _pptx_doc("外贸单证培训.pptx", blocks, assets)
+    chunks = _chunk_doc(doc)
+
+    standalone = [c for c in chunks if c.chunk_type == "visual_knowledge"
+                  and c.page_num == 2]
+    assert standalone, "纯图 slide 的 TO_TEXT 截图未建 visual_knowledge chunk（图被静默丢弃）"
+    c = standalone[0]
+    assert c.extra.get("source_image", "").endswith("单证_slide2_img0000.png")
+    assert "单证打印" in c.chunk_text, f"空 caption 未回退 OCR 片段: {c.chunk_text!r}"
+    assert "单证_slide2_img0000.png" in _serving_renderable_fns(chunks)
+
+
 def test_route_to_text_assets_uploaded(tmp_path):
     """绑定会把 ROUTE_TO_TEXT 截图绑进 chunk 并构造 processing/assets/ 路径 ——
     上传闸只传 TO_VECTOR 时这些路径永不存在，serving 签出 403 死图
