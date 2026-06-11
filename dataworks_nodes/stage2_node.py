@@ -26,6 +26,9 @@ if not SIMULATE:
     required_vars = [
         "DASHSCOPE_API_KEY", "RAG_RDS_HOST", "RAG_RDS_PASSWORD",
         "RAG_OSS_ACCESS_KEY_ID", "RAG_OSS_ACCESS_KEY_SECRET",
+        # ↓ stage2 本身不碰索引，但 config 守卫 R5/D7 要求 production 配置检索后端+显式表名
+        #   （同 stage1，2026-06-11）。节点内联粘贴时从 清理stage3 顶部复制 RAG_HA3_* 赋值。
+        "RAG_HA3_ENDPOINT", "RAG_HA3_TABLE_NAME",
     ]
     missing = [v for v in required_vars if not os.environ.get(v)]
     if missing:

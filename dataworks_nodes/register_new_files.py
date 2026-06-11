@@ -34,6 +34,18 @@ def ensure_deps():
 ensure_deps()
 
 # ═══════════════════════════════════════════════════════════════
+# 0.5 PyODPS 节点凭证注入
+# ═══════════════════════════════════════════════════════════════
+# 本文件是 DataWorks PyODPS 节点的粘贴源，节点环境没有任何 RAG_* 变量。
+# 粘贴进节点后：取消下面注释，两把 OSS key 和 RDS 密码从 清理stage3 节点
+# 顶部的同名赋值复制（仓库内严禁写真值）。本地有环境变量的场景无需此块。
+# os.environ["RAG_OSS_ACCESS_KEY_ID"]     = ""
+# os.environ["RAG_OSS_ACCESS_KEY_SECRET"] = ""
+# os.environ["RAG_RDS_HOST"]              = "rm-bp15j7wekd5738f09.rwlb.rds.aliyuncs.com"  # 内网地址
+# os.environ["RAG_RDS_USER"]              = "fuling_admin"
+# os.environ["RAG_RDS_PASSWORD"]          = ""
+
+# ═══════════════════════════════════════════════════════════════
 # 1. 配置
 # ═══════════════════════════════════════════════════════════════
 DRY_RUN = True  # True = 只报告不修改; False = 实际写入 RDS
@@ -59,6 +71,11 @@ DEPT_MAP = {
     "raw/production_thermoforming/": "PRODUCTION",
     "raw/production_injection/": "PRODUCTION",
     "raw/production_papercup/": "PRODUCTION",
+    "raw/production_paper_cup/": "PRODUCTION",  # OSS 实际目录拼写（带下划线），与上行双拼写并存
+    "raw/marketing/": "MARKETING",
+    "raw/pmc/": "PMC",
+    "raw/rd/": "RD",
+    "raw/supply/": "SUPPLY",
     "raw/finance/": "FINANCE",
     "raw/quality/": "QUALITY",
     "raw/sales/": "SALES",
@@ -243,12 +260,14 @@ with conn.cursor() as cursor:
             # 避免极小概率的 doc_id 冲突
             time.sleep(0.01)
             
-            # 插入 document_meta
+            # 插入 document_meta —— 列严格对齐生产表（无 source_system/gate_status 两列，
+            # 2026-06-11 实测 1054 报错）；owner_dept 跟存量行一致用小写；status/permission_level/
+            # kb_type 显式写存量惯例值（chunk 级权限仍由处理期路径启发式决定，此处仅元数据）
             cursor.execute("""
-                INSERT INTO document_meta (doc_id, title, owner_dept, source_system, gate_status)
-                VALUES (%s, %s, %s, 'oss_scan', 'pending_clean')
+                INSERT INTO document_meta (doc_id, title, owner_dept, status, permission_level, kb_type)
+                VALUES (%s, %s, %s, 'active', 'public', 'public')
                 ON DUPLICATE KEY UPDATE title = VALUES(title)
-            """, (doc_id, filename, dept))
+            """, (doc_id, filename, dept.lower()))
             
             # 插入 document_version
             cursor.execute("""
