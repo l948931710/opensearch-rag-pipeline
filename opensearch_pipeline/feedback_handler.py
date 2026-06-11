@@ -28,6 +28,13 @@ _FEEDBACK_STATUS_MAP = {
 }
 
 
+def _op_db() -> str:
+    """问答运营库名（qa_session_log/user_feedback/escalation_ticket 所在库）。
+    经 RAG_RDS_OPERATION_DATABASE 配置（STAGING 用 fuling_operation_stg）。"""
+    from opensearch_pipeline.config import get_config
+    return get_config().rds.operation_database
+
+
 def get_feedback_status_text(action: str) -> str:
     """根据 action 返回卡片显示的反馈状态文本。"""
     return _FEEDBACK_STATUS_MAP.get(action, "✅ 已反馈")
@@ -126,9 +133,9 @@ def _save_feedback(
 
         with conn.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT session_id, query_text, answer_text, cited_docs_json, user_dept
-                FROM fuling_operation.qa_session_log
+                FROM {_op_db()}.qa_session_log
                 WHERE message_id = %s
                 LIMIT 1
                 """,
@@ -148,8 +155,8 @@ def _save_feedback(
         feedback_id = str(uuid.uuid4())
         with conn.cursor() as cursor:
             cursor.execute(
-                """
-                INSERT INTO fuling_operation.user_feedback (
+                f"""
+                INSERT INTO {_op_db()}.user_feedback (
                     feedback_id, session_id, message_id, user_id, user_name, user_dept,
                     query_text, ai_answer, cited_doc_ids_json,
                     feedback_type, feedback_reason, feedback_comment,
@@ -221,9 +228,9 @@ def _create_escalation(
 
         with conn.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT session_id, query_text, answer_text, user_dept
-                FROM fuling_operation.qa_session_log
+                FROM {_op_db()}.qa_session_log
                 WHERE message_id = %s
                 LIMIT 1
                 """,
@@ -240,8 +247,8 @@ def _create_escalation(
         ticket_id = str(uuid.uuid4())
         with conn.cursor() as cursor:
             cursor.execute(
-                """
-                INSERT INTO fuling_operation.escalation_ticket (
+                f"""
+                INSERT INTO {_op_db()}.escalation_ticket (
                     ticket_id, session_id, message_id, user_id, user_name, user_dept,
                     query_text, ai_answer, trigger_reason, ticket_status
                 ) VALUES (
@@ -296,8 +303,8 @@ def mark_awaiting_comment(
         user_dept = None
         with conn.cursor() as cursor:
             cursor.execute(
-                """SELECT session_id, query_text, answer_text, cited_docs_json, user_dept
-                   FROM fuling_operation.qa_session_log WHERE message_id = %s LIMIT 1""",
+                f"""SELECT session_id, query_text, answer_text, cited_docs_json, user_dept
+                   FROM {_op_db()}.qa_session_log WHERE message_id = %s LIMIT 1""",
                 (message_id,),
             )
             row = cursor.fetchone()
@@ -311,8 +318,8 @@ def mark_awaiting_comment(
         feedback_id = str(uuid.uuid4())
         with conn.cursor() as cursor:
             cursor.execute(
-                """
-                INSERT INTO fuling_operation.user_feedback (
+                f"""
+                INSERT INTO {_op_db()}.user_feedback (
                     feedback_id, session_id, message_id, user_id, user_name, user_dept,
                     query_text, ai_answer, cited_doc_ids_json,
                     feedback_type, feedback_reason, handled_status
@@ -361,7 +368,7 @@ def take_awaiting_comment(*, user_id: str, comment: str, within_seconds: int = 6
             # 兜底回收：超窗仍滞留 AWAITING_COMMENT 的行归位 PENDING —— 没有这步，
             # 该用户多日后的任意私聊消息仍可能被误吞成「补充原因」，行也永远卡在挂起态
             cursor.execute(
-                """UPDATE fuling_operation.user_feedback
+                f"""UPDATE {_op_db()}.user_feedback
                    SET handled_status = 'PENDING'
                    WHERE user_id = %s AND handled_status = 'AWAITING_COMMENT'
                      AND updated_at < (NOW() - INTERVAL %s SECOND)""",
@@ -370,8 +377,8 @@ def take_awaiting_comment(*, user_id: str, comment: str, within_seconds: int = 6
             # 窗口按 updated_at 计：mark_awaiting_comment 的 upsert 只刷新 updated_at，
             # 旧投票行的 created_at 可能远早于点击「补充原因」的时刻，按 created_at 会误判超窗
             cursor.execute(
-                """
-                SELECT id FROM fuling_operation.user_feedback
+                f"""
+                SELECT id FROM {_op_db()}.user_feedback
                 WHERE user_id = %s AND handled_status = 'AWAITING_COMMENT'
                   AND updated_at >= (NOW() - INTERVAL %s SECOND)
                 ORDER BY updated_at DESC LIMIT 1
@@ -385,7 +392,7 @@ def take_awaiting_comment(*, user_id: str, comment: str, within_seconds: int = 6
             fid = row[0]
         with conn.cursor() as cursor:
             cursor.execute(
-                """UPDATE fuling_operation.user_feedback
+                f"""UPDATE {_op_db()}.user_feedback
                    SET feedback_comment = %s, handled_status = 'PENDING', updated_at = NOW()
                    WHERE id = %s""",
                 (comment.strip()[:1000], fid),

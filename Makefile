@@ -80,3 +80,17 @@ clean: ## 清理缓存
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -name "*.pyc" -delete 2>/dev/null || true
 	rm -rf build/ dist/ *.egg-info/
+
+# ── 本地受控 A/B 评测环境（详见 docs/local_eval_env.md）──
+
+ab-up: ## 启动 A/B 双实例 (:8001 新管线 / :8002 旧对照)
+	bash scripts/local_eval_env.sh up
+
+ab-down: ## 停止 A/B 双实例 (ab-down ALL=1 额外清 :8000)
+	bash scripts/local_eval_env.sh down $(if $(ALL),--all,)
+
+ab-status: ## A/B 环境总览 (实例/索引/DB/配置)
+	bash scripts/local_eval_env.sh status
+
+ab-smoke: ## A/B 双端各问 1 题验证可用
+	bash scripts/local_eval_env.sh smoke

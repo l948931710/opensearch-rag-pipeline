@@ -29,6 +29,11 @@ def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config) -> Non
         raise RuntimeError(
             "MOCK_HA3_CLIENT in real-mode index delete; simulate flags are inconsistent."
         )
+    from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+    assert_destructive_write_allowed(
+        "spot_check_delete",
+        config.alibaba_vector.endpoint or config.alibaba_vector.instance_id or config.opensearch.host,
+        kind="search")
 
     if hasattr(os_client, "push_documents"):
         # HA3 Engine: 查询 chunk 主键后用 push_documents cmd=delete 删除

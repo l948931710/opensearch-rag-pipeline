@@ -37,6 +37,7 @@ from opensearch_pipeline.content_blocks_builder import (
 from opensearch_pipeline.retriever import retrieve_and_enrich
 from opensearch_pipeline.llm_generator import (
     generate_answer, generate_answer_stream, parse_sse_data_frame, _extract_sources,
+    strip_doc_citations,
 )
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import (
@@ -80,6 +81,13 @@ router = APIRouter(prefix="/dingtalk", tags=["DingTalk"])
 # ═══════════════════════════════════════════════════════════════
 # 配置
 # ═══════════════════════════════════════════════════════════════
+
+def _op_db() -> str:
+    """问答运营库名（qa_session_log/user_feedback/escalation_ticket 所在库）。
+    经 RAG_RDS_OPERATION_DATABASE 配置（STAGING 用 fuling_operation_stg）。"""
+    from opensearch_pipeline.config import get_config
+    return get_config().rds.operation_database
+
 
 def _get_app_secret() -> str:
     return os.environ.get("DINGTALK_APP_SECRET", "")
@@ -353,8 +361,9 @@ def _stream_answer_to_card(
     error_message: Optional[str] = None
 
     def _clean(text: str) -> str:
-        # 与成品卡片一致的清理：去除末尾参考来源段 + <<IMG:N>> 占位符（钉钉端纯文本）
-        return strip_image_markers(_strip_trailing_sources(text))
+        # 与成品卡片一致的清理：去除末尾参考来源段 + [文档N] 编号引用 + <<IMG:N>> 占位符
+        # （钉钉端纯文本；流中残留靠 prompt 规则 8 压制，定稿帧由这里兜底）
+        return strip_image_markers(strip_doc_citations(_strip_trailing_sources(text)))
 
     # 非阻塞推流：后台单线程每 interval 推一次"最新累计正文"，主循环只消费 LLM token、不被
     # PUT /card/streaming 的网络往返阻塞。同步推流在推流往返慢时会把 ~6s 的生成拖成数十秒
@@ -937,10 +946,10 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT query_text, answer_text, cited_docs_json, model_name, latency_ms,
                            retrieval_latency_ms, llm_latency_ms, content_blocks_json
-                    FROM fuling_operation.qa_session_log
+                    FROM {_op_db()}.qa_session_log
                     WHERE message_id = %s LIMIT 1
                     """,
                     (message_id,),

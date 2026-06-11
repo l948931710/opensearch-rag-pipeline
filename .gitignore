@@ -9,6 +9,11 @@ build/
 .ruff_cache/
 .env
 .env.local
+.env.local_ab_*
+.env.prod_ro
+.env.staging
+# 模板（仅变量名）显式放行可提交
+!.env.production.template
 *.log
 index-jobs/
 rag-ready/

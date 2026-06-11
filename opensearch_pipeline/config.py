@@ -16,6 +16,41 @@ from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
 
+
+class EnvironmentMismatchError(ValueError):
+    """环境标签（RAG_ENVIRONMENT）与物理目标（RDS/HA3/OSS 指向）不一致。
+
+    继承 ValueError：与既有生产守卫的异常风格一致，pytest.raises(ValueError) 兼容。
+    """
+
+
+# 生产物理目标指纹（非密钥，仅实例标识子串）。交叉校验与运行时守卫共用。
+PROD_FINGERPRINTS = {
+    "rds": ("rm-bp15j7wekd5738f093o",),
+    "search": ("ha-cn-kgl4slr1n01",),
+    "oss": ("fuling-knowledge-base",),
+}
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", ""}
+
+# 守卫豁免变量（语义见 docs/environment_design.md）：
+#   RAG_ALLOW_REMOTE_DB=read_only_ack      非 production 标签下连接远程/生产 RDS 的显式声明
+#   RAG_ALLOW_REMOTE_SEARCH=read_only_ack  同上，针对 HA3/OpenSearch
+_ACK_VALUE = "read_only_ack"
+
+
+def is_prod_target(kind: str, value: str) -> bool:
+    """value 是否命中生产物理目标指纹。kind ∈ PROD_FINGERPRINTS。
+
+    oss 用精确匹配：staging 桶名（fuling-knowledge-base-staging）以生产桶名为前缀，
+    子串匹配会误判。rds/search 用子串匹配（值是带域名后缀的完整 endpoint）。
+    """
+    v = (value or "").lower()
+    if kind == "oss":
+        return v in PROD_FINGERPRINTS["oss"]
+    return any(fp in v for fp in PROD_FINGERPRINTS.get(kind, ()))
+
+
 def _load_env_files():
     """按 RAG_ENV 加载对应的 .env 文件。"""
     try:
@@ -32,19 +67,44 @@ def _load_env_files():
         load_dotenv(base_env, override=False)
 
     # 2. 再加载 .env.{RAG_ENV}（环境特定配置：存储层地址/凭证）
-    #    override=True → 环境文件覆盖 .env 中的同名变量
+    #    override=True（file-wins）是刻意设计：环境身份必须原子化，残留的 shell export
+    #    不能把生产端点拼进本地运行。被遮蔽的 shell 变量在 banner 中显式列出；
+    #    确需单变量临时覆盖时用 RAG_ALLOW_SHELL_OVERRIDE=VAR1,VAR2 白名单回填。
     rag_env = os.environ.get("RAG_ENV", "").lower()
+
+    # RAG_ENV=test 已更名 prod_ro（名实归一：它的真实用途是"从公网只读访问生产"）
+    if rag_env == "test" and (project_root / ".env.prod_ro").exists():
+        import warnings
+        warnings.warn("RAG_ENV=test 已弃用，请改用 RAG_ENV=prod_ro（语义：生产只读）",
+                      DeprecationWarning, stacklevel=2)
+        rag_env = "prod_ro"
+
+    shadowed = []
     if rag_env:
         env_file = project_root / f".env.{rag_env}"
         if env_file.exists():
+            _shell_snapshot = dict(os.environ)
             load_dotenv(env_file, override=True)
+            shadowed = sorted(
+                k for k, v in _shell_snapshot.items()
+                if (k.startswith(("RAG_", "DINGTALK_")) or k == "DASHSCOPE_API_KEY")
+                and os.environ.get(k) != v
+            )
+            # 逃生口：白名单变量保留 shell 值（单次实验性覆盖用）
+            allow = [s.strip() for s in
+                     _shell_snapshot.get("RAG_ALLOW_SHELL_OVERRIDE", "").split(",") if s.strip()]
+            for k in allow:
+                if k in _shell_snapshot:
+                    os.environ[k] = _shell_snapshot[k]
+                    if k in shadowed:
+                        shadowed.remove(k)
         else:
             print(f"  ⚠️ RAG_ENV={rag_env} 但 {env_file} 不存在，仅使用 .env")
 
     # 3. 打印环境标识
-    _print_env_banner(rag_env)
+    _print_env_banner(rag_env, shadowed)
 
-def _print_env_banner(rag_env: str):
+def _print_env_banner(rag_env: str, shadowed: Optional[list] = None):
     """启动时打印当前环境标识，避免误操作。"""
     rds_host = os.environ.get("RAG_RDS_HOST", "localhost")
     ha3_host = os.environ.get("RAG_HA3_ENDPOINT", "")
@@ -54,17 +114,26 @@ def _print_env_banner(rag_env: str):
     if rag_env == "production":
         icon = "🚀"
         label = "PRODUCTION (阿里云生产)"
-    elif rag_env == "test":
-        icon = "🧪"
-        label = "TEST (阿里云测试)"
+    elif rag_env in ("test", "prod_ro"):
+        icon = "🔎"
+        label = "PROD-RO (生产只读诊断)"
+    elif rag_env == "staging":
+        icon = "🎭"
+        label = "STAGING (预演环境)"
     elif rag_env == "local":
         icon = "🏠"
         label = "LOCAL (本地开发)"
+    elif rag_env.startswith("local_ab_"):
+        icon = "⚖️"
+        label = f"LOCAL-EVAL ({rag_env.removeprefix('local_ab_')} 臂)"
     else:
         icon = "⚙️"
         label = f"DEFAULT ({env_label})"
 
     print(f"  {icon} 环境: {label} | RDS={rds_host} | Search={os_host or 'localhost'}")
+    if shadowed:
+        print(f"  ⚠️ 以下 shell 变量被 .env.{rag_env} 遮蔽（file-wins）: {', '.join(shadowed)}"
+              f" —— 临时覆盖请用 RAG_ALLOW_SHELL_OVERRIDE")
 
 _load_env_files()
 
@@ -96,6 +165,8 @@ class RDSConfig:
     user: str = "root"
     password: str = ""
     database: str = "fuling_knowledge"
+    # 问答运营库（qa_session_log/user_feedback/escalation_ticket）；STAGING 用 fuling_operation_stg
+    operation_database: str = "fuling_operation"
     charset: str = "utf8mb4"
     connect_timeout: int = 10
     read_timeout: int = 30
@@ -311,6 +382,7 @@ class PipelineConfig:
     simulate_oss: bool = True               # 是否模拟 OSS 读写
     simulate_api: bool = True               # 是否模拟外部 API（LLM, Embedding, OCR），不发送真实外部网络请求
     environment: str = "development"        # development / staging / production
+    readonly: bool = False                  # RAG_READONLY：PROD-RO 会话声明，写路径守卫强制拦截
     log_level: str = "INFO"
 
     # 子配置
@@ -329,6 +401,90 @@ class PipelineConfig:
     max_concurrent_tasks: int = 5
     max_retry_count: int = 3
     scan_batch_size: int = 50
+
+
+def _require_ack(var: str) -> bool:
+    """读取守卫豁免变量。空=未豁免；read_only_ack=豁免；其他值=拼写错误，直接 raise（R7）。"""
+    v = os.environ.get(var, "")
+    if v not in ("", _ACK_VALUE):
+        raise EnvironmentMismatchError(
+            f"[ENV GUARD] {var}={v!r} 不是合法值，只接受 '{_ACK_VALUE}'（防 typo 静默放行）")
+    return v == _ACK_VALUE
+
+
+def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
+    """环境标签 ↔ 物理目标交叉校验（fail-fast，发生在任何连接建立之前）。
+
+    规则前置条件：仅当对应子系统 simulate=False 时才评估（make sim / 单测天然跳过）。
+    规则表与豁免变量语义见 docs/environment_design.md。
+    """
+    env = (config.environment or "development").lower()
+    search_targets = " ".join(filter(None, (
+        config.alibaba_vector.endpoint, config.alibaba_vector.instance_id,
+        config.opensearch.host)))
+
+    if env in ("development", "local", ""):
+        # R1：dev 标签禁止远程 RDS（豁免=只读声明）
+        if not config.simulate_db and config.rds.host not in _LOCAL_HOSTS:
+            if not _require_ack("RAG_ALLOW_REMOTE_DB"):
+                raise EnvironmentMismatchError(
+                    f"[ENV GUARD] environment={env} 但 RDS_HOST={config.rds.host!r} 是远程地址。"
+                    f"只读场景请显式 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
+        # R2：dev 标签禁止生产检索目标
+        if not config.simulate_opensearch and is_prod_target("search", search_targets):
+            if not _require_ack("RAG_ALLOW_REMOTE_SEARCH"):
+                raise EnvironmentMismatchError(
+                    f"[ENV GUARD] environment={env} 但检索目标命中生产指纹（{search_targets!r}）。"
+                    f"只读场景请显式 export RAG_ALLOW_REMOTE_SEARCH={_ACK_VALUE}")
+
+    elif env in ("staging", "test"):
+        # R3：staging/test 标签指向生产实例时——要么是 STAGING 形态（库/表带 _stg 后缀，合法），
+        #     要么是 PROD-RO 形态（必须显式只读声明）
+        if not config.simulate_db and is_prod_target("rds", config.rds.host) \
+                and not config.rds.database.endswith("_stg"):
+            if not _require_ack("RAG_ALLOW_REMOTE_DB"):
+                raise EnvironmentMismatchError(
+                    f"[ENV GUARD] environment={env} 指向生产 RDS（database={config.rds.database}，"
+                    f"非 _stg 库）。PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
+        if not config.simulate_opensearch and is_prod_target("search", search_targets) \
+                and not config.alibaba_vector.table_name.endswith("_stg"):
+            if not _require_ack("RAG_ALLOW_REMOTE_SEARCH"):
+                raise EnvironmentMismatchError(
+                    f"[ENV GUARD] environment={env} 指向生产检索实例"
+                    f"（table={config.alibaba_vector.table_name!r}，非 _stg 表）。"
+                    f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_SEARCH={_ACK_VALUE}")
+
+    if env == "production":
+        # R4：生产标签指 localhost 必为配错，无豁免
+        if not config.simulate_db and config.rds.host in _LOCAL_HOSTS:
+            raise EnvironmentMismatchError(
+                f"[ENV GUARD] environment=production 但 RDS_HOST={config.rds.host!r} 是本地地址")
+        # R5：生产无任何检索后端
+        if not config.simulate_opensearch and not search_targets.strip():
+            raise EnvironmentMismatchError(
+                "[ENV GUARD] environment=production 但未配置任何检索后端（HA3/OpenSearch 均为空）")
+
+    # D7：production/staging 实际启用 HA3 时表名必须显式声明（消除历史双标默认值）
+    if env in ("production", "staging") and not config.simulate_opensearch \
+            and config.alibaba_vector.endpoint and not config.alibaba_vector.table_name:
+        raise EnvironmentMismatchError(
+            "[ENV GUARD] HA3 endpoint 已配置但 RAG_HA3_TABLE_NAME 为空——"
+            "请显式声明表名（生产=fuling_kb_chunks / 预演=fuling_kb_chunks_stg）")
+
+    # STAGING overlay 的资源后缀强约束（防 staging 配置半生不熟指向生产资源；无豁免）
+    if os.environ.get("RAG_ENV", "").lower() == "staging":
+        problems = []
+        if env != "staging":
+            problems.append(f"RAG_ENVIRONMENT 必须为 staging（当前 {env}）")
+        if not config.simulate_db and not config.rds.database.endswith("_stg"):
+            problems.append(f"RDS_DATABASE 必须以 _stg 结尾（当前 {config.rds.database}）")
+        if not config.simulate_opensearch and config.alibaba_vector.endpoint \
+                and not config.alibaba_vector.table_name.endswith("_stg"):
+            problems.append(f"HA3_TABLE_NAME 必须以 _stg 结尾（当前 {config.alibaba_vector.table_name!r}）")
+        if not config.simulate_oss and not config.oss.bucket_name.endswith("-staging"):
+            problems.append(f"OSS_BUCKET_NAME 必须以 -staging 结尾（当前 {config.oss.bucket_name}）")
+        if problems:
+            raise EnvironmentMismatchError("[ENV GUARD] RAG_ENV=staging 资源约束不满足: " + "; ".join(problems))
 
 
 def load_config() -> PipelineConfig:
@@ -416,6 +572,7 @@ def load_config() -> PipelineConfig:
         simulate_oss=rag_simulate_oss,
         simulate_api=rag_simulate_api,
         environment=_env("ENVIRONMENT", "development"),
+        readonly=_env_bool("READONLY", False),
         log_level=_env("LOG_LEVEL", "INFO"),
         max_concurrent_tasks=_env_int("MAX_CONCURRENT_TASKS", 5),
         max_retry_count=_env_int("MAX_RETRY_COUNT", 3),
@@ -435,6 +592,7 @@ def load_config() -> PipelineConfig:
             user=_env("RDS_USER", "root"),
             password=_env("RDS_PASSWORD"),
             database=_env("RDS_DATABASE", "fuling_knowledge"),
+            operation_database=_env("RDS_OPERATION_DATABASE", "fuling_operation"),
         ),
 
         opensearch=OpenSearchConfig(
@@ -452,7 +610,9 @@ def load_config() -> PipelineConfig:
             instance_id=_env("HA3_INSTANCE_ID"),
             access_user_name=_env("HA3_USER"),
             access_pass_word=_env("HA3_PASSWORD"),
-            table_name=_env("HA3_TABLE_NAME", "fuling_knowledge_vector"),
+            # 默认空（曾默认 fuling_knowledge_vector——一张从未存在的表，与生产 fuling_kb_chunks 双标）。
+            # production/staging 实际启用 HA3 时表名为空会在交叉校验中 fail-fast，逼迫显式声明。
+            table_name=_env("HA3_TABLE_NAME", ""),
             pk_field=_env("HA3_PK_FIELD", "id"),
             enable_hybrid=_env_bool("HA3_ENABLE_HYBRID", True),
             hybrid_fusion=_env("HA3_HYBRID_FUSION", "weighted"),
@@ -574,6 +734,9 @@ def load_config() -> PipelineConfig:
                     f"(base_url='{base_url}', model='{model_name}') under '{config.environment}' environment! "
                     f"Production runs must strictly utilize Alibaba Cloud (Qwen) services."
                 )
+
+    # 💡 环境守卫第二层：环境标签 ↔ 物理目标交叉校验（规则表见函数 docstring）
+    _validate_environment_target_consistency(config)
 
     return config
 

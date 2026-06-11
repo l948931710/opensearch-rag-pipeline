@@ -132,6 +132,7 @@ class Chunk:
         """转为 OpenSearch 标准版索引文档格式。"""
         doc = {
             "id": self.chunk_id,
+            "chunk_id": self.chunk_id,
             "doc_id": self.doc_id,
             "version_no": self.version_no,
             "chunk_text": self.chunk_text,
@@ -145,6 +146,7 @@ class Chunk:
             "category_l2": self.category_l2 or "",
             "kb_type": self.kb_type or "public",
             "risk_level": self.risk_level or "low",
+            "chunk_index": self.chunk_index,
             "page_num": self.page_num or 0,
             "section_title": self.section_title or "",
             "source_url": self.source_oss_key or "",

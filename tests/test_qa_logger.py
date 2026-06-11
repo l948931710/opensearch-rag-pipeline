@@ -86,7 +86,8 @@ def test_insert_columns_all_exist_in_schema_files():
     from opensearch_pipeline import qa_logger
 
     source = inspect.getsource(qa_logger.log_qa_session)
-    m = re.search(r"INSERT INTO fuling_operation\.qa_session_log\s*\((.*?)\)\s*VALUES",
+    # 库名已配置化（RAG_RDS_OPERATION_DATABASE → f-string 插值 {_op_db()}），表名不变
+    m = re.search(r"INSERT INTO \{_op_db\(\)\}\.qa_session_log\s*\((.*?)\)\s*VALUES",
                   source, re.S)
     assert m, "找不到 INSERT 列清单"
     columns = [c.strip() for c in m.group(1).split(",") if c.strip()]

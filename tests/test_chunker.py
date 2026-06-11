@@ -566,3 +566,43 @@ class TestDottedStepNumbers:
             "chunk_type": "step_card", "step_no": 5, "score": 8.0,
         }])
         assert "步骤5" in ctx2, "无 section_no 时行为不变"
+
+
+class TestOpenSearchDocServingContract:
+    """to_opensearch_doc 必须携带本地检索 _source 请求的 serving 契约字段。
+
+    retriever._search_chunks_opensearch 的 _source 列表请求 chunk_id/chunk_index/
+    source_image/visual_summary；缺失会导致邻居拼接失效、图片不可达
+    （local_e2e_20260610 报告 artifact-3 的根因）。
+    """
+
+    def _chunk(self, **extra):
+        c = Chunk(
+            chunk_id="DOC_X_v1_c003", doc_id="DOC_X", version_no=1,
+            chunk_index=3, chunk_type="step_card",
+            chunk_text="步骤内容", token_count=4, page_num=2,
+            permission_level="public", extra=extra or None,
+        )
+        return c
+
+    def test_chunk_id_and_chunk_index_present(self):
+        doc = self._chunk().to_opensearch_doc()
+        assert doc["chunk_id"] == "DOC_X_v1_c003"
+        assert doc["chunk_index"] == 3
+        assert doc["id"] == "DOC_X_v1_c003", "保留 id 字段（bulk _id 兼容）"
+
+    def test_multimodal_fields_passthrough(self):
+        doc = self._chunk(
+            source_image="processing/assets/d/DOC_X/v1/p2_img1.png",
+            visual_summary="U8 登录界面截图",
+        ).to_opensearch_doc()
+        assert doc["source_image"] == "processing/assets/d/DOC_X/v1/p2_img1.png"
+        assert doc["visual_summary"] == "U8 登录界面截图"
+
+    def test_parity_with_ha3_doc_on_serving_fields(self):
+        """除引擎特有字段外，serving 消费的字段两种序列化都要有。"""
+        c = self._chunk(source_image="a.png", visual_summary="vs")
+        os_doc, ha3_doc = c.to_opensearch_doc(), c.to_ha3_doc()
+        for f in ("chunk_id", "doc_id", "chunk_index", "chunk_type",
+                  "source_image", "visual_summary", "page_num", "section_title"):
+            assert f in os_doc and f in ha3_doc, f"serving 字段 {f} 缺失"

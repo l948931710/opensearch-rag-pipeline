@@ -37,9 +37,11 @@ make lint             # ruff (line-length 100, py39);  make lint-fix to autofix
 
 ## Environments & config
 
-All config is in `config.py` (`load_config()` → cached `get_config()`), read from `RAG_`-prefixed env vars. `RAG_ENV` selects an overlay: `.env` (shared keys/models) + `.env.{local|test|production}` (storage endpoints/creds).
+All config is in `config.py` (`load_config()` → cached `get_config()`), read from `RAG_`-prefixed env vars. `RAG_ENV` selects an overlay: `.env` (shared keys/models) + `.env.{local|local_ab_*|staging|prod_ro}` (storage endpoints/creds). Six environment tiers (SIM / LOCAL-DEV / LOCAL-EVAL / STAGING / PROD-RO / PROD) — matrix, credential separation, and the cloud-console checklist live in **`docs/environment_design.md`**. `RAG_ENV=test` is a deprecated alias for `prod_ro`; production sets no `RAG_ENV` (SAE/DataWorks inject env vars directly).
 
 - **Production security guard** (`config.py`): when `environment ∈ {production, staging}`, it **hard-raises** if no DashScope key is set or if any of LLM/OCR/Embedding would resolve to Google/Gemini. Production must use Alibaba Qwen — never Gemini.
+- **Env↔target cross-validation** (`config.py::_validate_environment_target_consistency`): a dev label pointing at prod RDS/HA3 fingerprints hard-raises unless `RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack`. **Runtime destructive-op guard** (`env_guard.py`): non-production writes to prod targets need same-day `RAG_DESTRUCTIVE_PROD_ACK=<op>:<date>`; `RAG_READONLY=true` (PROD-RO) blocks all writes. Scripts reach prod **only** via `prod_access.py` (read-only session by default; RW requires same-day `PROD-RW:<date>` token) — never hand-parse `.env.production`.
+- The overlay loads with `override=True` (file-wins): shell-exported vars are shadowed by the env file (banner lists them); `RAG_ALLOW_SHELL_OVERRIDE=VAR1,VAR2` is the per-var escape hatch.
 - **Model names resolve at runtime**, not from dataclass defaults. With a DashScope key: LLM→`qwen3.6-plus`, OCR→`qwen-vl-ocr-latest`, VLM→`qwen3-vl-plus`, embedding→`text-embedding-v4`. The Gemini names in the dataclasses are only fallbacks. **Read the factory logic in `load_config()`, not the field defaults.**
 
 ## Architecture

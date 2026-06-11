@@ -44,7 +44,9 @@ def boot(table: str | None = None) -> dict:
     Returns a small dict of the resolved live-connection facts (no secrets).
     """
     _load_envfile(".env")
-    _load_envfile(".env.production")
+    # PROD-RO overlay 优先（生产凭证出仓后 .env.production 不复存在）；评测本就是只读形态
+    _load_envfile(".env.prod_ro" if os.path.exists(
+        os.path.join(_ROOT, ".env.prod_ro")) else ".env.production")
 
     # Force public, laptop-reachable, non-simulated, read paths.
     # RAG_ENVIRONMENT=test => config resolves PUBLIC dashscope base urls (LLM + embedding),
@@ -54,6 +56,9 @@ def boot(table: str | None = None) -> dict:
     for k in ("RAG_SIMULATE", "RAG_SIMULATE_DB", "RAG_SIMULATE_OPENSEARCH",
               "RAG_SIMULATE_OSS", "RAG_SIMULATE_API"):
         os.environ[k] = "false"
+    # 评测是合法的"非生产标签 + 生产只读目标"形态：向 config 的环境交叉校验声明只读会话
+    os.environ.setdefault("RAG_ALLOW_REMOTE_DB", "read_only_ack")
+    os.environ.setdefault("RAG_ALLOW_REMOTE_SEARCH", "read_only_ack")
     os.environ["RAG_HA3_ENDPOINT"] = os.environ.get(
         "EVAL_HA3_ENDPOINT", "ha-cn-kgl4slr1n01.public.ha.aliyuncs.com"
     )

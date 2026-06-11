@@ -218,7 +218,10 @@ def _get_oss_bucket(ctx: dict = None):
         
     auth = oss2.Auth(config.oss.access_key_id, config.oss.access_key_secret)
     bucket = oss2.Bucket(auth, config.oss.endpoint, config.oss.bucket_name)
-    return bucket, False
+    # 写守卫代理：非生产环境写生产桶需当日 ack（读/签名透传）。本地正常形态是
+    # simulate_oss=true 不进此分支——代理只防"误设 simulate_oss=false + 生产桶"的配置漂移。
+    from opensearch_pipeline.env_guard import GuardedBucket
+    return GuardedBucket(bucket, config.oss.bucket_name), False
 
 
 def _ensure_opensearch_index(client, index_name: str, dimension: int):
@@ -239,9 +242,13 @@ def _ensure_opensearch_index(client, index_name: str, dimension: int):
             "mappings": {
                 "properties": {
                     "id": {"type": "keyword"},
+                    "chunk_id": {"type": "keyword"},
                     "doc_id": {"type": "keyword"},
                     "version_no": {"type": "integer"},
+                    "chunk_index": {"type": "integer"},
                     "chunk_text": {"type": "text"},
+                    "source_image": {"type": "keyword"},
+                    "visual_summary": {"type": "text"},
                     "chunk_vector": {
                         "type": "knn_vector",
                         "dimension": dimension,
@@ -557,6 +564,16 @@ def node_extract_text_with_ocr(ctx: dict):
                     except Exception as e:
                         print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
                         task["local_path"] = ""
+            elif simulate_oss and "mock_text" not in task and not task.get("local_path"):
+                # 本地零 OSS 形态（LOCAL-DEV，见 docs/environment_design.md）：
+                # 真实文档由 scripts/sample_corpus.py 预先采样到 scratch/sample_corpus/<raw_key>，
+                # 这里直接挂为 local_path——管线全程不触 OSS。未采样的文件按原 simulate 行为处理。
+                _sample_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "scratch", "sample_corpus", task.get("raw_key", ""))
+                if task.get("raw_key") and os.path.exists(_sample_path):
+                    task["local_path"] = _sample_path
+                    print(f"    📂 {doc_id}: using sampled corpus file scratch/sample_corpus/{task['raw_key']}")
 
             result = extractor.extract(task)
             extractions.append(result)
@@ -3113,6 +3130,8 @@ def node_write_chunk_meta(ctx: dict):
 
     written = 0
     if not simulate_db and valid_chunks:
+        from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+        assert_destructive_write_allowed("write_chunk_meta", get_config().rds.host, kind="rds")
         conn = None
         try:
             conn = _get_db_conn(select_db=True)
@@ -3271,6 +3290,8 @@ def node_acquire_index_lock(ctx: dict):
 
     valid_doc_versions = set()
     if not simulate_db and chunks:
+        from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+        assert_destructive_write_allowed("acquire_index_lock", get_config().rds.host, kind="rds")
         # 找出当前待处理的所有 (doc_id, version_no) 对
         doc_versions = list(set((chunk.doc_id, chunk.version_no) for chunk in chunks))
         conn = None
@@ -3357,6 +3378,12 @@ def _search_delete_old_chunks(client, config, index_name: str, doc_id: str, ver:
             "MOCK_HA3_CLIENT surfaced in a real-mode search delete; "
             "simulate flags are inconsistent (ctx vs config). Aborting."
         )
+    # 唯一咽喉：node_deactivate_old_chunks 与 reconcile_stranded_versions 的索引删除都经此
+    from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+    assert_destructive_write_allowed(
+        "search_delete",
+        config.alibaba_vector.endpoint or config.alibaba_vector.instance_id or config.opensearch.host,
+        kind="search")
     if hasattr(client, "push_documents"):
         if not old_chunk_ids:
             print(f"    ├─ [HA3 Engine] No older chunks found in RDS to deactivate for '{doc_id}'")
@@ -3438,6 +3465,17 @@ def node_deactivate_old_chunks(ctx: dict):
     config = get_config()
     simulate_db = _resolve_simulate(ctx, "db")
     simulate_opensearch = _resolve_simulate(ctx, "opensearch")
+
+    # 环境守卫：停用旧版本 = 不可逆删除链路的入口，真实分支前先断言（见 env_guard.py）
+    if not simulate_db or not simulate_opensearch:
+        from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+        if not simulate_db:
+            assert_destructive_write_allowed("deactivate_old_chunks", config.rds.host, kind="rds")
+        if not simulate_opensearch:
+            assert_destructive_write_allowed(
+                "deactivate_old_chunks",
+                config.alibaba_vector.endpoint or config.alibaba_vector.instance_id or config.opensearch.host,
+                kind="search")
 
     # 从上下文获取在第一个节点中成功抢占锁的 document versions
     valid_doc_versions = ctx.get("preempted_doc_versions", set())
@@ -3546,7 +3584,7 @@ def node_deactivate_old_chunks(ctx: dict):
         else:
             try:
                 client = _get_opensearch_client(ctx)
-                index_name = ctx.get("opensearch_index", "fuling_knowledge_v1")
+                index_name = ctx.get("opensearch_index") or get_config().opensearch.index_name
                 for doc_id, ver in current_versions.items():
                     _search_delete_old_chunks(
                         client, config, index_name, doc_id, ver,
@@ -4063,7 +4101,7 @@ def node_build_opensearch_payload(ctx: dict):
                         payload_size_bytes = VALUES(payload_size_bytes)
                     """, (
                         batch["job_id"],
-                        ctx.get("opensearch_index", "fuling_knowledge_v1"),
+                        ctx.get("opensearch_index") or get_config().opensearch.index_name,
                         len(batch["chunks"]),
                         batch["oss_key"],
                         batch["payload_size"]
@@ -4103,7 +4141,17 @@ def node_push_to_opensearch(ctx: dict):
 
     print(f"    └─ Pushing {len(batches)} OpenSearch batches sequentially...")
 
-    index_name = ctx.get("opensearch_index", "fuling_knowledge_v1")
+    # 环境守卫：非生产环境向生产索引 upsert 同样是污染写
+    if not simulate_opensearch:
+        from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+        assert_destructive_write_allowed(
+            "push_index",
+            config.alibaba_vector.endpoint or config.alibaba_vector.instance_id or config.opensearch.host,
+            kind="search")
+
+    # ctx 优先（DAG 级覆盖），否则随配置走（RAG_OPENSEARCH_INDEX）——
+    # 不再硬编码回退：摄取推送与 serving 检索（retriever 用 cfg.index_name）必须同名
+    index_name = ctx.get("opensearch_index") or get_config().opensearch.index_name
 
     # If NOT simulating, initialize client and ensure index exists
     client = None
@@ -4421,9 +4469,14 @@ def node_update_index_status(ctx: dict):
         }]
 
     chunks_count = sum(len(b["chunks"]) for b in batches)
-    
+
     simulate_db = _resolve_simulate(ctx, "db")
-    
+
+    # 环境守卫：index_status 回写是停用旧版本的前置状态，同样属生产 RDS 写
+    if not simulate_db:
+        from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+        assert_destructive_write_allowed("update_index_status", get_config().rds.host, kind="rds")
+
     # Identify all (doc_id, version_no) that experienced chunk indexing failures
     failed_doc_versions = set()
     for batch in batches:

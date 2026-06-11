@@ -16,6 +16,13 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _op_db() -> str:
+    """问答运营库名（qa_session_log/user_feedback/escalation_ticket 所在库）。
+    经 RAG_RDS_OPERATION_DATABASE 配置（STAGING 用 fuling_operation_stg）。"""
+    from opensearch_pipeline.config import get_config
+    return get_config().rds.operation_database
+
+
 def generate_message_id() -> str:
     """生成唯一的 message_id，作为反馈系统的核心关联键。"""
     return str(uuid.uuid4())
@@ -101,8 +108,8 @@ def log_qa_session(
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """
-                    INSERT INTO fuling_operation.qa_session_log (
+                    f"""
+                    INSERT INTO {_op_db()}.qa_session_log (
                         session_id, message_id, user_id, user_name, user_dept,
                         query_text, answer_text, intent_type, risk_level, risk_blocked,
                         retrieved_docs_json, cited_docs_json,
