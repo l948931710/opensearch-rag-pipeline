@@ -62,6 +62,13 @@ def build_gates(r: Dict) -> Dict:
         sl = _g(l3, "positive", "source_leak_rate")
         gates["answer source-leak (L3)"] = {"target": "<= 0.05", "value": sl,
                                             "pass": (sl is not None and sl <= 0.05)}
+        # 完整性确定性门：gold 关键词覆盖率。基线 0.723（run_predeploy_q36）；
+        # 2026-06-11 实证 prompt 格式规则可悄悄吃掉相关细则（规则4 条目化后
+        # 路程假 0/3 丢失），该回归不触发任何旧门 —— 此门专为拦它。
+        kc = _g(l3, "positive", "mean_keyword_coverage")
+        gates["answer keyword-coverage (L3, 完整性)"] = {
+            "target": ">= 0.70", "value": kc,
+            "pass": (kc is not None and kc >= 0.70)}
 
     l5 = r.get("l5")
     if l5:
@@ -82,6 +89,11 @@ def build_gates(r: Dict) -> Dict:
         gates["answer correctness (Claude, L3)"] = {"target": ">= 4.0 / 5",
                                                     "value": corr,
                                                     "pass": (corr is not None and corr >= 4.0)}
+        # 完整性质量门：评审面板 completeness（四维中历史最弱，4.29@predeploy）
+        comp = _g(j, "positives", "completeness", "mean")
+        gates["answer completeness (Claude, L3)"] = {"target": ">= 4.0 / 5",
+                                                     "value": comp,
+                                                     "pass": (comp is not None and comp >= 4.0)}
         fab = j.get("positives_fabrication_rate")
         gates["positive fabrication (Claude, L3)"] = {"target": "<= 0.05", "value": fab,
                                                       "pass": (fab is not None and fab <= 0.05)}
