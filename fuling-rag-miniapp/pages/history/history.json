@@ -1,0 +1,7 @@
+{
+  "defaultTitle": "历史问答",
+  "pullRefresh": false,
+  "usingComponents": {
+    "answer-bubble": "/components/answer-bubble/answer-bubble"
+  }
+}

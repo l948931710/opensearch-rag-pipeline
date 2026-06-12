@@ -1,9 +1,4 @@
 {
   "defaultTitle": "我的",
-  "pullRefresh": false,
-  "usingComponents": {
-    "list": "dingtalk-design-miniapp/es/list/index",
-    "list-item": "dingtalk-design-miniapp/es/list-item/index",
-    "snackbar": "dingtalk-design-miniapp/es/snackbar/index"
-  }
+  "pullRefresh": false
 }

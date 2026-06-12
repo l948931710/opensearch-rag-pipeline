@@ -1,9 +1,15 @@
 <view class="answer-bubble">
+  <!-- 低匹配 guard 提示条：低置信回答不能和高置信长得一样权威 -->
+  <view a:if="{{guard}}" class="guard-note">
+    <text class="ico ico-warn guard-ico"></text>
+    <text class="guard-text">相关资料匹配度较低，以下回答仅供参考，请核对原文或转人工确认。</text>
+  </view>
+
   <block a:for="{{viewBlocks}}" a:key="key">
     <!-- text block: typewriter-revealed styled paragraphs (utils/markdown.js).
          Runs are nested <text> kept on ONE line — whitespace between inline
          <text> nodes would render as stray spaces. -->
-    <view a:if="{{item.type === 'text' && !item.hidden}}" class="ans-text-blk">
+    <view a:if="{{item.type === 'text'}}" class="ans-text-blk">
       <view
         a:for="{{item.revealedParas}}"
         a:for-item="p"
@@ -14,22 +20,34 @@
       </view>
     </view>
 
-    <!-- image block: widthFix is required for unknown-size images -->
-    <view
-      a:elif="{{item.type === 'image' && !item.hidden}}"
-      class="img-wrap"
-    >
-      <image
-        class="ans-img"
-        src="{{item.url}}"
-        mode="widthFix"
-        lazy-load="{{true}}"
-        data-url="{{item.url}}"
-        data-key="{{item.key}}"
-        onTap="onPreview"
-        onError="onImgError"
-      />
-      <text class="caption" a:if="{{item.caption}}">{{item.caption}}</text>
+    <!-- image block: widthFix is required for unknown-size images.
+         加载失败（OSS 签名 URL 1h 过期）→ 保留图框与说明、点按重载，绝不静默移除 -->
+    <view a:elif="{{item.type === 'image'}}" class="img-blk">
+      <view class="figure">
+        <image
+          a:if="{{!item.failed}}"
+          class="ans-img"
+          src="{{item.url}}"
+          mode="widthFix"
+          lazy-load="{{true}}"
+          data-url="{{item.url}}"
+          data-key="{{item.key}}"
+          onTap="onPreview"
+          onError="onImgError"
+        />
+        <view a:else class="img-fallback" data-key="{{item.key}}" onTap="onImgRetry">
+          <text class="ico {{item.reloading ? 'ico-refresh' : 'ico-image-off'}} fallback-ico"></text>
+          <text class="fallback-text">{{item.reloading ? '正在重新加载…' : '图片已过期 · 点按重新加载'}}</text>
+        </view>
+        <view class="figcaption">
+          <text class="ico ico-image cap-ico"></text>
+          <text class="cap-text">{{item.caption}}</text>
+          <view class="zoom-hint" a:if="{{!item.failed}}">
+            <text class="ico ico-expand zoom-ico"></text>
+            <text class="zoom-text">点按放大</text>
+          </view>
+        </view>
+      </view>
     </view>
   </block>
 

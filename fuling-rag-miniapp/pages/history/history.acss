@@ -1,0 +1,164 @@
+/* 历史问答页 — Aurora-Forest 卡片列表（颜色全走 page{} 令牌，自动跟随深色模式） */
+
+.history-page {
+  min-height: 100vh;
+  padding: 24rpx 24rpx 48rpx;
+}
+
+/* ---------- 状态页（骨架/未登录/失败/空） ---------- */
+.state-wrap {
+  padding-top: 16rpx;
+}
+
+.state-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 160rpx;
+  text-align: center;
+}
+
+.state-ico {
+  font-size: 56rpx;
+  color: var(--text-3);
+  margin-bottom: 20rpx;
+}
+
+.state-title {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.state-desc {
+  margin-top: 12rpx;
+  font-size: 25rpx;
+  color: var(--text-3);
+}
+
+.btn-retry {
+  margin-top: 28rpx;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  border: 1px solid var(--brand);
+  color: var(--brand);
+  border-radius: 999rpx;
+  padding: 12rpx 32rpx;
+  font-size: 26rpx;
+}
+
+.btn-retry:active {
+  background: var(--brand-soft);
+}
+
+.retry-ico {
+  font-size: 26rpx;
+  margin-right: 8rpx;
+}
+
+.skel-card {
+  background: var(--surface);
+  border-radius: 24rpx;
+  box-shadow: var(--sh-1);
+  padding: 28rpx 28rpx 20rpx;
+  margin-bottom: 20rpx;
+}
+
+.skel-ln {
+  height: 22rpx;
+  border-radius: 10rpx;
+  background: var(--surface-3);
+  margin-bottom: 16rpx;
+}
+
+.w70 { width: 70%; }
+.w40 { width: 40%; }
+
+/* ---------- 列表卡片 ---------- */
+.h-card {
+  background: var(--surface);
+  border-radius: 24rpx;
+  box-shadow: var(--sh-1);
+  margin-bottom: 20rpx;
+  overflow: hidden;
+}
+
+.h-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 24rpx 28rpx;
+}
+
+.h-head:active {
+  background: var(--surface-2);
+}
+
+.h-main {
+  flex: 1;
+  min-width: 0;
+  margin-right: 16rpx;
+}
+
+.h-q {
+  display: block;
+  font-size: 29rpx;
+  font-weight: 500;
+  color: var(--text-1);
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+.h-meta {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin-top: 10rpx;
+}
+
+.h-date {
+  font-size: 23rpx;
+  color: var(--text-3);
+  margin-right: 14rpx;
+}
+
+.h-badge {
+  font-size: 21rpx;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-radius: 999rpx;
+  padding: 2rpx 14rpx;
+}
+
+.h-chev {
+  flex-shrink: 0;
+  font-size: 26rpx;
+  color: var(--text-3);
+  transition: transform 0.2s ease;
+}
+
+.h-chev.open {
+  transform: rotate(180deg);
+}
+
+.h-body {
+  border-top: 1px solid var(--line-2);
+  padding: 20rpx 28rpx 24rpx;
+}
+
+.h-empty {
+  font-size: 25rpx;
+  color: var(--text-3);
+}
+
+.load-more {
+  text-align: center;
+  padding: 20rpx 0 8rpx;
+  font-size: 26rpx;
+  color: var(--brand);
+}
+
+.load-more:active {
+  opacity: 0.7;
+}

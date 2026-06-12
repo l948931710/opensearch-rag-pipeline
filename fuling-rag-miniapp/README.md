@@ -19,7 +19,11 @@ plus 赞踩 / 转人工 feedback and a client-side typewriter effect.
   <https://open.dingtalk.com/document/resourcedownload/download-the-development-tool>
 - A **corp-internal mini-program** created in the DingTalk developer console
   (开发者后台 → 应用开发 → 小程序), which gives you an **AppKey / MiniAppId**.
-- Node.js + npm (for installing the component library).
+
+No npm install needed — the app has **zero runtime dependencies** (UI is native
+AXML/ACSS with the Aurora-Forest token system in `app.acss`; icons ship as an
+embedded 2.8KB iconfont, see `styles/icons.acss` / `scratch/iconfont_build/`
+in the repo root for regeneration).
 
 This scaffold follows the official corp mini-program quick-start:
 **`open-dingtalk/eapp-corp-quick-start-fe`**
@@ -27,17 +31,14 @@ This scaffold follows the official corp mini-program quick-start:
 
 ---
 
-## 2. Install & configure
+## 2. Configure
 
-```bash
-cd fuling-rag-miniapp
-npm install
-```
+Set the backend host (single source of truth):
 
-Then set the backend host (single source of truth):
-
-- Edit **`utils/config.js`** → `BASE_URL` → your real API host
+- Edit **`utils/config.js`** → `PROD_BASE_URL` → your real **HTTPS** API host
   (e.g. `https://rag.fuling.example.com`). **TODO for the developer.**
+- 本地联调：本机起后端（`RAG_ENV=test ... uvicorn ... --port 8000`），IDE 勾选
+  「不校验安全域名」，把 `utils/config.js` 的 `DEV` 置 `true`（构建前改回）。
 
 Open the project in the **钉钉开发者工具** and fill in your **AppKey / MiniAppId**
 in the IDE project settings (**TODO** — not stored in this repo).

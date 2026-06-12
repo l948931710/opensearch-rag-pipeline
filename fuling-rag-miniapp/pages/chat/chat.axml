@@ -1,83 +1,177 @@
 <view class="chat-page">
+  <!-- 自绘导航（transparentTitle）：nav-grad 渐变 + 健康态副标题。
+       右上是钉钉胶囊，导航内不放自定义控件；ghost 占位让标题居中。 -->
+  <view class="navbar {{serviceOk ? '' : 'degraded'}}" style="padding-top:{{statusBarHeight}}px;">
+    <view class="brandmark"><text class="brandmark-text">富</text></view>
+    <view class="title-wrap">
+      <text class="nav-title">富岭知识助手</text>
+      <view class="subtitle">
+        <view class="subtitle-dot"></view>
+        <text class="subtitle-text">{{serviceOk ? '企业知识库 · 在线' : '企业知识库 · 服务暂不可用'}}</text>
+      </view>
+    </view>
+    <view class="brandmark-ghost"></view>
+  </view>
+
   <scroll-view
     class="msg-list"
     scroll-y="{{true}}"
     scroll-into-view="{{scrollIntoId}}"
     scroll-with-animation="{{true}}"
+    onScroll="onListScroll"
   >
     <view class="msg-list-inner">
-      <!-- empty-state hint -->
-      <view class="empty-hint" a:if="{{messages.length === 0}}">
-        <text class="empty-title">富岭知识助手</text>
-        <text class="empty-sub">向我提问 SOP / U8 ERP / 行政人事 等问题，我会从公司知识库为你解答。</text>
+      <view class="day-divider"><text class="day-divider-text">{{startTimeLabel}}</text></view>
+
+      <!-- 欢迎卡（静态） -->
+      <view class="row row-ai">
+        <view class="avatar avatar-ai"><text class="avatar-text">富</text></view>
+        <view class="ai-card">
+          <view class="welcome-body">
+            <text class="welcome-text">您好👋 我是</text><text class="welcome-text welcome-b">富岭知识助手</text><text class="welcome-text">。作业指导书（SOP）、U8+ 系统操作、考勤请假等人事行政制度，都可以直接问我。点下面的示例问题试试，或直接输入您的问题。</text>
+          </view>
+        </view>
       </view>
 
       <block a:for="{{messages}}" a:key="id">
-        <!-- anchor for scroll-into-view -->
-        <view id="msg-{{item.id}}" class="msg-anchor"></view>
-
         <!-- user bubble (right) -->
         <view a:if="{{item.role === 'user'}}" class="row row-user">
-          <view class="bubble bubble-user">
-            <text class="bubble-user-text">{{item.text}}</text>
-          </view>
+          <view class="bubble-user"><text class="bubble-user-text">{{item.text}}</text></view>
+          <view class="avatar avatar-me"><text class="avatar-text">我</text></view>
         </view>
 
         <!-- AI message (left) -->
         <view a:else class="row row-ai">
+          <view class="avatar avatar-ai"><text class="avatar-text">富</text></view>
           <view class="ai-col">
-            <!-- loading placeholder -->
-            <view a:if="{{item.loading}}" class="ai-loading">
-              <spin a:if="{{true}}" size="small" />
-              <skeleton
-                title="{{false}}"
-                row="{{2}}"
-                avatar="{{false}}"
-                active="{{true}}"
-              />
+
+            <!-- loading skeleton: brand typing dots + 阶段文案（检索→生成/深思）+ shimmer lines -->
+            <view a:if="{{item.loading}}" class="ai-card skel">
+              <view class="skel-body">
+                <view class="typing"><view class="typing-dot"></view><view class="typing-dot d2"></view><view class="typing-dot d3"></view></view>
+                <text a:if="{{item.stageText}}" class="skel-hint">{{item.stageText}}</text>
+                <view class="skel-ln ln-90"></view>
+                <view class="skel-ln ln-72"></view>
+                <view class="skel-ln ln-80"></view>
+              </view>
             </view>
 
-            <!-- error state -->
-            <view a:elif="{{item.error}}" class="ai-error">
-              <text class="ai-error-text">😞 {{item.errorText}}</text>
+            <!-- error card: danger 左标尺 + 重试；无来源、无反馈条 -->
+            <view a:elif="{{item.error}}" class="ai-card">
+              <view class="err-body">
+                <view class="err-p"><text class="err-text">{{item.errorText}}</text></view>
+                <view class="btn-retry" data-id="{{item.id}}" onTap="onRetry">
+                  <text class="ico ico-refresh retry-ico"></text>
+                  <text class="retry-label">重试</text>
+                </view>
+              </view>
             </view>
 
-            <!-- answer -->
-            <block a:else>
+            <!-- NO_RESULT 空结果卡：死胡同留出口（换个说法 chips + 转人工）；无来源、无赞踩 -->
+            <view a:elif="{{item.noResult}}" class="ai-card">
+              <view class="nr-body">
+                <text class="ico ico-search nr-ico"></text>
+                <text class="nr-title">未找到相关内容</text>
+                <text class="nr-desc">抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。</text>
+                <view a:if="{{item.rephrase && item.rephrase.length}}" class="nr-chips">
+                  <text class="nr-chips-label">试试这样问：</text>
+                  <view class="nr-chip" a:for="{{item.rephrase}}" a:key="*this" data-q="{{item}}" onTap="onNrChipTap">
+                    <text class="nr-chip-text">{{item}}</text>
+                  </view>
+                </view>
+                <view class="nr-handoff {{item.handoffDone ? 'nr-handoff-done' : ''}}" data-id="{{item.id}}" onTap="onNrHandoff">
+                  <text class="ico ico-headset nr-handoff-ico"></text>
+                  <text class="nr-handoff-label">{{item.handoffDone ? '已转交管理员' : '转人工协助'}}</text>
+                </view>
+              </view>
+            </view>
+
+            <!-- answer card: guard 条 + 图文 body + 参考来源 + 反馈条 -->
+            <view a:else class="ai-card">
               <answer-bubble
                 blocks="{{item.blocks}}"
+                guard="{{item.guard}}"
                 instant="{{item.instant}}"
                 onGrow="onAnswerGrow"
+                onTypingEnd="onTypingEnd"
               />
+
+              <!-- 参考来源（折叠；徽章=服务端 level） -->
+              <view a:if="{{item.sources && item.sources.length}}" class="sources {{item.sourcesOpen ? 'sources-open' : ''}}">
+                <view class="sources-toggle" data-id="{{item.id}}" onTap="onToggleSources">
+                  <text class="ico ico-chev-r sources-chev {{item.sourcesOpen ? 'sources-chev-open' : ''}}"></text>
+                  <text class="sources-label">参考来源</text>
+                  <text class="sources-badge">{{item.sources.length}} 条</text>
+                </view>
+                <view class="sources-list">
+                  <view class="src-item" a:for="{{item.sources}}" a:for-item="s" a:key="idx">
+                    <text class="si-idx">{{s.idx}}</text>
+                    <view class="si-main">
+                      <text class="si-title">{{s.title}}</text>
+                      <text class="si-meta" a:if="{{s.section}}">{{s.section}}</text>
+                    </view>
+                    <text class="si-score {{s.levelClass}}">相关度{{s.levelLabel}}</text>
+                  </view>
+                </view>
+              </view>
+
               <feedback-bar
                 a:if="{{item.messageId}}"
                 messageId="{{item.messageId}}"
+                copyText="{{item.copyText}}"
               />
-            </block>
+            </view>
+
           </view>
         </view>
       </block>
+
+      <!-- 跟滚目标：打字机要看的是底部，不是消息顶部 -->
+      <view id="bottom-anchor" class="msg-anchor"></view>
     </view>
   </scroll-view>
 
-  <!-- bottom input bar -->
+  <!-- 回到底部浮标（向上翻阅时出现） -->
+  <view class="to-bottom" a:if="{{showToBottom}}" onTap="onToBottom">
+    <text class="ico ico-chev-down to-bottom-ico"></text>
+  </view>
+
+  <!-- 示例问题快捷栏（横向滚动；老核默默忽略 gap，间距用子元素 margin） -->
+  <scroll-view class="quick" scroll-x="{{true}}">
+    <view class="quick-inner">
+      <text class="quick-label">示例：</text>
+      <view class="quick-chip" a:for="{{quick}}" a:key="*this" data-q="{{item}}" onTap="onQuickTap">
+        <text class="quick-chip-text">{{item}}</text>
+      </view>
+    </view>
+  </scroll-view>
+
+  <!-- 深度思考滑动开关行（整行可点；逐问生效、默认关） -->
+  <view class="think-row" onTap="onToggleThinking">
+    <text class="think-label">深度思考</text>
+    <text class="think-desc">{{thinking ? '已开启 · 更慢但更仔细' : '逐问生效，适合复杂问题'}}</text>
+    <view class="switch {{thinking ? 'switch-on' : ''}}">
+      <view class="switch-knob"></view>
+    </view>
+  </view>
+
+  <!-- bottom input bar：auto-height textarea + 发送/停止 -->
   <view class="input-bar">
-    <input
+    <textarea
       class="input-box"
       value="{{draft}}"
-      placeholder="输入你的问题…"
+      placeholder="请输入问题…"
+      placeholder-class="input-placeholder"
+      auto-height="{{true}}"
       confirm-type="send"
-      disabled="{{sending}}"
       onInput="onInput"
       onConfirm="onSend"
     />
     <view
-      class="send-btn btn btn-primary {{(!draft || sending) ? 'btn-disabled' : ''}}"
+      class="send-btn {{(sending || typing) ? 'send-btn-stop' : (draft ? '' : 'send-btn-disabled')}}"
       onTap="onSend"
     >
-      <text>{{sending ? '回答中' : '发送'}}</text>
+      <text class="send-btn-text">{{(sending || typing) ? '停止' : '发送'}}</text>
     </view>
   </view>
-
-  <snackbar id="snackbar" />
 </view>

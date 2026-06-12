@@ -1,0 +1,55 @@
+<view class="history-page">
+  <!-- 加载骨架 -->
+  <view a:if="{{loading}}" class="state-wrap">
+    <view class="skel-card" a:for="{{[1, 2, 3]}}" a:key="*this">
+      <view class="skel-ln w70"></view>
+      <view class="skel-ln w40"></view>
+    </view>
+  </view>
+
+  <!-- 未登录 -->
+  <view a:elif="{{errorKind === 'login'}}" class="state-wrap state-center">
+    <text class="ico ico-warn state-ico"></text>
+    <text class="state-title">登录后可查看历史问答</text>
+    <text class="state-desc">请在钉钉客户端中打开本小程序</text>
+    <view class="btn-retry" onTap="onRetry"><text class="ico ico-refresh retry-ico"></text><text>重试</text></view>
+  </view>
+
+  <!-- 加载失败 -->
+  <view a:elif="{{errorKind === 'error'}}" class="state-wrap state-center">
+    <text class="ico ico-warn state-ico"></text>
+    <text class="state-title">历史记录加载失败</text>
+    <view class="btn-retry" onTap="onRetry"><text class="ico ico-refresh retry-ico"></text><text>重试</text></view>
+  </view>
+
+  <!-- 空列表 -->
+  <view a:elif="{{items.length === 0}}" class="state-wrap state-center">
+    <text class="ico ico-search state-ico"></text>
+    <text class="state-title">还没有问答记录</text>
+    <text class="state-desc">去「问答」页提一个问题吧</text>
+  </view>
+
+  <!-- 列表 -->
+  <view a:else class="list">
+    <view class="h-card" a:for="{{items}}" a:key="messageId">
+      <view class="h-head" data-idx="{{index}}" onTap="onToggle">
+        <view class="h-main">
+          <text class="h-q">{{item.question}}</text>
+          <view class="h-meta">
+            <text class="h-date">{{item.dateLabel}}</text>
+            <text a:if="{{item.statusLabel}}" class="h-badge">{{item.statusLabel}}</text>
+          </view>
+        </view>
+        <text class="ico ico-chev-down h-chev {{item.expanded ? 'open' : ''}}"></text>
+      </view>
+      <view a:if="{{item.expanded}}" class="h-body">
+        <answer-bubble a:if="{{item.blocks.length}}" blocks="{{item.blocks}}" instant="{{true}}" />
+        <text a:else class="h-empty">（无回答内容）</text>
+      </view>
+    </view>
+
+    <view a:if="{{hasMore}}" class="load-more" onTap="onLoadMore">
+      <text>{{loadingMore ? '加载中…' : '加载更多'}}</text>
+    </view>
+  </view>
+</view>

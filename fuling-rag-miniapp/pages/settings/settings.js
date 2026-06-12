@@ -43,6 +43,10 @@ Page({
     });
   },
 
+  onOpenHistory() {
+    dd.navigateTo({ url: '/pages/history/history' });
+  },
+
   onClearSession() {
     dd.confirm({
       title: '清除会话',
@@ -62,12 +66,7 @@ Page({
             const content = ok
               ? '已清除会话'
               : '已在本地清除（服务器同步失败，旧上下文 30 分钟后自动过期）';
-            const sb = this.selectComponent('#snackbar');
-            if (sb && typeof sb.show === 'function') {
-              sb.show({ content, type: ok ? 'success' : 'warning', duration: 2500 });
-            } else {
-              dd.showToast({ type: ok ? 'success' : 'none', content, duration: 2500 });
-            }
+            dd.showToast({ type: ok ? 'success' : 'none', content, duration: 2500 });
           };
           const sid = this.data.sessionId;
           if (sid) {

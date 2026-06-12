@@ -1,58 +1,72 @@
 <view class="feedback-bar">
-  <view class="fb-row">
+  <!-- 嵌入式图标按钮条：赞/踩一次性互斥锁定；复制、转人工独立可用
+       （评价答案 ≠ 放弃升级人工） -->
+  <view class="fb">
     <view
-      class="fb-btn {{picked === 'upvote' ? 'fb-btn-on' : ''}} {{submitted ? 'fb-btn-locked' : ''}}"
+      class="fb-ico fb-up {{voted === 'up' ? 'fb-up-on' : ''}} {{voteLocked && voted !== 'up' ? 'fb-locked' : ''}}"
       onTap="onUpvote"
     >
-      <text class="fb-ico">👍</text>
-      <text class="fb-label">有用</text>
+      <text class="ico ico-up fb-glyph"></text>
     </view>
-
     <view
-      class="fb-btn {{panelOpen || picked === 'downvote' ? 'fb-btn-on' : ''}} {{submitted ? 'fb-btn-locked' : ''}}"
+      class="fb-ico fb-down {{voted === 'down' || panelOpen ? 'fb-down-on' : ''}} {{voteLocked && voted !== 'down' ? 'fb-locked' : ''}}"
       onTap="onDownvote"
     >
-      <text class="fb-ico">👎</text>
-      <text class="fb-label">没用</text>
+      <text class="ico ico-down fb-glyph"></text>
     </view>
-
-    <view
-      class="fb-btn {{picked === 'handoff' ? 'fb-btn-on' : ''}} {{submitted ? 'fb-btn-locked' : ''}}"
-      onTap="onHandoff"
-    >
-      <text class="fb-ico">🧑‍💼</text>
-      <text class="fb-label">转人工</text>
+    <view class="fb-ico" onTap="onCopy">
+      <text class="ico ico-copy fb-glyph"></text>
+    </view>
+    <view class="fb-spacer">
+      <text class="fb-done" a:if="{{voteLocked}}">已反馈</text>
+    </view>
+    <view class="fb-handoff {{handoffDone ? 'fb-handoff-done' : ''}}" onTap="onHandoff">
+      <text class="ico ico-headset fb-handoff-ico"></text>
+      <text class="fb-handoff-label">转人工</text>
     </view>
   </view>
 
-  <!-- inline downvote panel: reason chips + free-text + submit -->
-  <view class="fb-panel" a:if="{{panelOpen && !submitted}}">
-    <view class="fb-chips">
+  <!-- inline downvote panel: 多选原因 chips + free-text + submit -->
+  <view class="fb-panel" a:if="{{panelOpen && !voteLocked}}">
+    <text class="fp-q">请选择不满意的原因（可多选）：</text>
+    <view class="chips">
       <view
         a:for="{{reasons}}"
         a:key="code"
-        class="fb-chip {{reasonCode === item.code ? 'fb-chip-on' : ''}}"
+        class="chip {{item.sel ? 'chip-sel' : ''}}"
         data-code="{{item.code}}"
         onTap="onPickReason"
-      >{{item.label}}</view>
+      >
+        <text class="chip-text">{{item.label}}</text>
+      </view>
     </view>
 
     <textarea
       class="fb-textarea"
-      placeholder="其他原因（选填）"
+      placeholder="其他原因（选填）…"
+      placeholder-class="fb-ta-placeholder"
       value="{{comment}}"
       maxlength="200"
+      auto-height="{{true}}"
       onInput="onCommentInput"
     />
 
-    <view class="fb-panel-actions">
-      <view class="fb-cancel" onTap="onCancelPanel">取消</view>
+    <view class="fb-submit-row">
+      <view class="btn-text" onTap="onCancelPanel">
+        <text class="btn-text-label">取消</text>
+      </view>
       <view
-        class="fb-submit {{reasonCode || comment ? '' : 'btn-disabled'}}"
+        class="btn-primary {{(hasReason || comment) ? '' : 'btn-primary-disabled'}}"
         onTap="onSubmitDownvote"
-      >提交</view>
+      >
+        <text class="btn-primary-label">提交</text>
+      </view>
     </view>
   </view>
 
-  <text class="fb-thanks" a:if="{{submitted}}">{{thanksText}}</text>
+  <!-- 转人工后的持久确认行（toast 1.7s 即逝，滚回来要还能看到） -->
+  <view class="handoff-note" a:if="{{handoffDone}}">
+    <text class="ico ico-check hn-ico"></text>
+    <text class="hn-text">已转交管理员跟进，请留意钉钉消息</text>
+  </view>
 </view>

@@ -1,11 +1,10 @@
 {
-  "defaultTitle": "富岭知识助手",
+  "defaultTitle": "",
+  "transparentTitle": "always",
+  "titlePenetrate": "YES",
   "pullRefresh": false,
   "usingComponents": {
     "answer-bubble": "/components/answer-bubble/answer-bubble",
-    "feedback-bar": "/components/feedback-bar/feedback-bar",
-    "spin": "dingtalk-design-miniapp/es/spin/index",
-    "skeleton": "dingtalk-design-miniapp/es/skeleton/index",
-    "snackbar": "dingtalk-design-miniapp/es/snackbar/index"
+    "feedback-bar": "/components/feedback-bar/feedback-bar"
   }
 }

@@ -1,22 +1,111 @@
-/* Global styles — clean DingTalk look. Accent #1677ff, light-gray page bg. */
-page {
-  --accent: #1677ff;
-  --accent-press: #0e5fd8;
-  --bg: #f5f6f7;
-  --card-bg: #ffffff;
-  --text-main: #1f2329;
-  --text-sub: #646a73;
-  --text-weak: #8a8f99;
-  --border: #e5e6eb;
-  --danger: #f5222d;
+/* ============================================================
+   富岭知识助手 — Aurora-Forest 设计令牌系统（v1.1 原型 1:1 移植）
+   浅色放 page{}；深色放 @media (prefers-color-scheme: dark)。
+   令牌只放颜色/渐变/阴影/纹理 —— 尺寸一律写字面 rpx：
+   rpx 写进 custom property 编译器不换算，是已知坑。
+   预计算 rgba 替代 color-mix（旧版钉钉 WebView 整条声明会被丢弃）。
+   ============================================================ */
+@import "./styles/icons.acss";
 
-  background-color: var(--bg);
-  color: var(--text-main);
-  font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC',
+@font-face {
+  font-family: "flico";
+  src: url("data:font/woff2;charset=utf-8;base64,d09GMgABAAAAAAsEAAsAAAAAEuQAAAq5AAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHCoGYACBBAqfNJd1ATYCJAMkCyIABCAFfgcgGz4OUVSOCjAfCbnJ1EcW/hDRghaanasRksz+QNv8xx1Zx7AAibNjeYDRgNUYBVat0GWg60hc9o+cr83PIVmFpToSa52smUFYUecSbn3Q+gxDvmhC1uTbimiR+k383Tv/93v1R1rRMgSnO6PhyN6/v7LWTSW0M5GMxJE3iE+AptsQiNWFewZdndpmIhl9jmHZkhpPa85AX9sBkACACTh4AqKPTc4ArqW0tR6kQP5LQCEIVMqG3ibNBkoM0o0c4U3vZCM5IIiE9I4ABQVZiKEyphxOOCyvj6J/AEAeWQuSiwQ4FeAQACBs8Y9L6hDJ0KiWAr+0ULqjwbHM8fuAaCBhwDgwdcA+sGvgxOujQXZ0WFQ5pixQ7sir5SLZH7JTssOy8bJ6WaEs3jkRvLHC5b94iqBwFJqcymrIUWxwPumEoZSUSAEEiZQmqSVirr/czc3vMNYgkmgCJFSlu0jK9/CyhKuGe3G1PvzQQxpN3ehRSP+ALqAFVHg6mEmybJPWntcFM+X8hSsuZT2NsT8RO/oxFV/DDnZM/jfhZaQWIQQ2RpzNJYKgmr+3mEJarTDJJpxUHjcoVdVc6Fj0GY8CQBHrzuZrxxAjqKXs5bF6FBEumKMspwu3slg+z35lNv+dm3A4xwII4cexI4qWYfpuqj8HxiOcXE6PuLUWW8Yh1bQJcIb8nf7e42IbPJqBMVQ/nTWT8omUczzrpXCccEJkVEoWEEMlwitxzashzqdaOzIRWigcKylINgimyjSJy6oep6dgsNUMoRh0P6afYpCFVXblkmb4/jxfdauAZkPVVwezDES0Pn+P6Cbomj1RFMx0YzT2uV6W7GYlCLQCAOLUj4tXEtQF2gzs6UVEnLrw5CSqqnBNFWIISXZr19aoL69Nc0Ewa1I4zFVcy14Lp2SnLmKIAQCzOkCThx2Mc9p2dUwqtjjQtxTCOeGSZBRPJln37gkKFuWGtkDpdbsrJ6T7McZI+UzK+R87qynNmgah1X71i3tsSj1IqSxA67sJQpaYuObaECxaKnVBdTCYtRKirROnBvDuFdp6rUt2xI2mFxlnw6xea5PW6+9xYam5psun2324RhzDXhZFYLEbVVWMzbcnvExsWV5VbEucDG4OLkXP05VmquLZEE9jiLF8SFyLGCzzLc+78tJqNn++uhZmUdSjeYFxJ1NIqg/dUwojXNcBoiiBkDgECxatRbQUCgyzQBhDVlaZcE48LoYrjSuOG03+MN/fHmBDgXamMptEOiQD3jETdZAgs8TvdcWfVCxaXjYMc6dDM+obRXr5vhJoiGnB4tFqhBhiiv6p4/zUgPexEWHOCQ0Km/xhR19081XXBfnqZH0w+tjTwUGk8xOEaAHn94LMJ1GUC8Oc15K1tNJD5WHwQaEA8hnfV2kLbgl7OBZ2K1cRpaPhgVslo2kUdRNV30GKlm2hksQg9SGtRvXBZCbZnHCu65VxldHvl4lUvp5OZFzg+0Ks/9YDuCZBz6r+SdHxsFOTnk5NE2dN1aoFs7bg7cq7ylphAE5GiGJcM6wss90VCVUfNl1JqISgqPr4jLQ+T/MfCTcPZwSwqUUUnZQVGayGcGuEY/I0dqybA1Ei84gpTJMS6AH5KtVHlayK86VPTnhaR/2bgDjVW6Ci2dzal3aDjrqewW71aHt5U+9eYMK3bR/FGrOnZccn5Q9Hnk51mD8C79N/99CFkwbKHg6ZPn7xnaf7Yix9rTVvNkqTyeOGNe8NdmRF26dPGNz9+71MI/pCOSvPvPzbW79dninvULbdXdAPUk4W/jvczSwJL3+SGfQzCNGhEfsj4sOl9+Tu2/6jLGzfMd5x8NRJv2zYsnlA68Rdq9oT6rvtDQ2U6TrUSB3bQ+XxnTfBFxd9oSS2xZB70nsxZFtCs/Ve//lvGMev3cnFPXyg7l/YCREBXoaN+93LS5eY5tLZRSVNP8/E+btkoKXY1ElZh74xQXJaAldHoX26RwJ8H/N7eiorOiaU01AmMFYfJexfs2w+Z3z+oL+NWymKDnJRue/qx/fg1nvmPeZcb+GmySd1Xzq0nMLPt3cu+/QPYXdk9fic8iH+XrhdvOvMLvH2hX8T8/8bbVnfyTuW7ci+Z8X3YL1i4xajuBfbgzepjQ/uAbi9PJqKzCJqsvOwUWEuVdCMiXufehsdzh5zwv3XeENSMjODlkCOwlGG9a229Nt/BrZA5iwqz5L02LCs0QwUjyK/+zhjqHwoJHmv8Q9flQiv0P7Y+UMN7dABZs+aZ5llzW1FBvVUfYh+1kMBcxvWKQtDRebhaS//Kb7R6GE0UN9cfVskZk3SWN8QNoPAvM+Kw/YiGJIF2bh1n1lgsBnvWTWTWDDy/x6Dry+Qbx8l8LniyqoOzA84wPHD5n7xMvqRwmBF85n2yjUvDDqsVxWq0k+4xPZt+mSR5h3WmvaC+U09Dvor7hWT7EJj0Lk6jTR/4sT0oBJ+yfhNag2sdsd6vzjNff7c+tcQFdd1CHHvpv4skZjA5bH5lHZ9BA7Diormz6uuWV9dU1MNwFo9N4zoC4ESFgM/o9eXuZcBojUsvCLTdb88WOer3qU+1WpoO0g67CHn4QnsOdRuXkcz7F/vKpD4JX4fCXrktYmBE655koOFOWcLRBgfE1n2maSmfZbBXMZiisChe01Xn8BS3K4rffpk0WIWD2o1AF5mv1/VyoZGhovnYrqbZ7Vhnw0rNerDa6VrD6s1opC1qSFk8qTrl0rWChD5K+kMUkJTekQm7eE8lnPTYfZKXeAWuArc0vvOxAgJnaKizk2vSMmScujmUFOw0RhsCjXTTwSfuEXpoRkEUUi6EpDzmDQR7m/PV9HCfVW5Z9Iqhi0OmeM5JySe25Wv1KoF8VmCeLU70Z4Xz2u9NdfGW1WWGRbWJPAd8R7SRzSWnAfzWav6fXyX1gm67PTwKs4cAsD5dp/ixvh0WcQuhZcfwUsN8XKVB1ffjSppubhyaJLLGs4Uj/G3M0JSU9NS91Uiuy78E1JDQ5ZGZzNuBedr9GNKkgR61Wx5YPqKlVuTUkrf6/yx4Ecupom1WfQbs29mxsnfLng2dSJrfBGis4qNY1tM3JMCOvDHHfsh2PTeuD/TR+LM8YkcsX9ORaYDMJd2qjPNeXd8nNcpLtNgapmaYI9q+pwdY26Jh8aS3SR3/iJSd7qLKrYgHxvDHyZ63Ruf9CJrtm9uQHEcYm/o2tLLp4uz+foYLl7/uowGJu2hfBbjsLIjeHNFeKCjbT8aWnEzPub1CIfCf0UBgOz2Uer9yQn2qGZHVeIgDgy0P48dtH1gpV5eTRTpFqw0xc9D43nEqW1Jz2pbYvqNgGeY+Mn93uqXv9RF/bq1SS7++xhLDRoH403nLBp8qFdVo4LWiwvumvtgSxDhmjEpvvv/9k8E4YLd8FMLWPmYGddcNgc2ZgH3584m2Dtub+9+2JhtlD/2ScOKHkOdDrkOlZIGIYsLIIvQRBx6HL2O7iefQU/k70NZO/0XmIbo/cmDUCmQwNcgE6LEN4t5Q36js55TesCboVv4nRj0FvqIQ280EzCR+dP+recKPqJuggCzAJ/UDrxhuyBlqZAKKJDIDBnGpg8yEOACuzWqaE1uGRSQgDOX2vq3QBuUQQ2UQwWYLnZVoawFSqEZsqDC2S3iFA1QDwoIAn8IBBQkbyYA") format("woff2");
+  font-weight: normal;
+  font-style: normal;
+}
+
+page {
+  /* brand — Aurora Forest（深林绿 + 极光绿）；--brand 用于文字/图标，
+     --brand-strong 用于需要白字的填充（渐变上白字仅 1.9:1，不可用） */
+  --brand: #15604a;
+  --brand-strong: #134f3e;
+  --brand-press: #0e3f31;
+  --brand-soft: #d9ebe2;
+  --brand-a16: rgba(21, 96, 74, 0.16);
+  --brand-a30: rgba(21, 96, 74, 0.30);
+  --brand-a40: rgba(21, 96, 74, 0.40);
+  --brand-grad: linear-gradient(135deg, #0f5a43 0%, #1f9d76 60%, #34d6a3 100%);
+  --nav-grad: linear-gradient(125deg, #103f30 0%, #17795b 55%, #2bbf95 100%);
+  /* cotton-paper 棉纸底色 */
+  --page: #efe8da;
+  --page-tint: #dcebe2;
+  --chat-bg: #ece4d4;
+  --surface: #fbf8f1;
+  --surface-2: #f4efe3;
+  --surface-3: #ece5d6;
+  /* warm ink */
+  --text-1: #2a2620;
+  --text-2: #5b5347;
+  --text-3: #6f6657;
+  --line: #e3dccb;
+  --line-2: #efe9db;
+  --divider-bg: rgba(91, 83, 71, 0.12);
+  --success: #116449;
+  --success-bg: #d9ece4;
+  --warn: #82590c;
+  --warn-bg: #f3e7cf;
+  --danger: #b3402f;
+  --danger-soft: #c2503c;
+  --danger-bg: #f6e2dc;
+  --me-grad: linear-gradient(135deg, #8a7f6c, #6b6253);
+  --sh-1: 0 1px 2px rgba(60, 50, 30, 0.06);
+  --sh-2: 0 1px 3px rgba(60, 50, 30, 0.07), 0 6px 16px rgba(60, 50, 30, 0.08);
+  --sh-3: 0 10px 34px rgba(40, 35, 20, 0.16);
+  --sh-brand: 0 4px 14px rgba(21, 96, 74, 0.26);
+  /* 棉纸 feTurbulence 纹理（待真机 Android 钉钉冒烟；不行换预栅格化 PNG，
+     分层声明保持 var(--paper), radial-gradient(...), var(--page) 不变，纯色优雅退化） */
+  --paper: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27220%27%20height%3D%27220%27%3E%3Cfilter%20id%3D%27pp%27%3E%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%270.9%27%20numOctaves%3D%272%27%20stitchTiles%3D%27stitch%27%2F%3E%3CfeColorMatrix%20type%3D%27saturate%27%20values%3D%270%27%2F%3E%3CfeComponentTransfer%3E%3CfeFuncA%20type%3D%27linear%27%20slope%3D%270.05%27%2F%3E%3C%2FfeComponentTransfer%3E%3C%2Ffilter%3E%3Crect%20width%3D%27100%25%27%20height%3D%27100%25%27%20filter%3D%27url%28%23pp%29%27%2F%3E%3C%2Fsvg%3E");
+  --user-bubble: var(--brand-strong);
+  --scrim: rgba(15, 20, 15, 0.92);
+  --toast-bg: rgba(30, 36, 28, 0.94);
+
+  background: var(--paper), radial-gradient(900px 500px at 50% -8%, var(--page-tint) 0%, transparent 60%), var(--page);
+  color: var(--text-1);
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', sans-serif;
-  font-size: 30rpx;
-  line-height: 1.5;
+  font-size: 29rpx;
+  line-height: 1.6;
   box-sizing: border-box;
+}
+
+@media (prefers-color-scheme: dark) {
+  page {
+    --brand: #34e0ad;
+    --brand-strong: #15795a;
+    --brand-press: #0f5f47;
+    --brand-soft: #103127;
+    --brand-a16: rgba(52, 224, 173, 0.16);
+    --brand-a30: rgba(52, 224, 173, 0.30);
+    --brand-a40: rgba(52, 224, 173, 0.40);
+    --brand-grad: linear-gradient(135deg, #0f6a4e 0%, #22c08e 100%);
+    --nav-grad: linear-gradient(125deg, #0a2a20 0%, #115740 55%, #1f9d76 100%);
+    --page: #0c1611;
+    --page-tint: #10261c;
+    --chat-bg: #0e1a14;
+    --surface: #16271e;
+    --surface-2: #121f18;
+    --surface-3: #1d2f25;
+    --text-1: #e9efe9;
+    --text-2: #a7b6ac;
+    --text-3: #8a988d;
+    --line: #26352b;
+    --line-2: #1b271f;
+    --divider-bg: rgba(167, 182, 172, 0.14);
+    --success: #3dd9a0;
+    --success-bg: #0e2a1f;
+    --warn: #e0a93a;
+    --warn-bg: #2c2310;
+    --danger: #ff7a66;
+    --danger-soft: #ff7a66;
+    --danger-bg: #2a1714;
+    --me-grad: linear-gradient(135deg, #7c8a7e, #586256);
+    --sh-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --sh-2: 0 1px 3px rgba(0, 0, 0, 0.45), 0 8px 20px rgba(0, 0, 0, 0.5);
+    --sh-3: 0 12px 40px rgba(0, 0, 0, 0.6);
+    --sh-brand: 0 4px 16px rgba(34, 192, 142, 0.25);
+    --paper: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27220%27%20height%3D%27220%27%3E%3Cfilter%20id%3D%27pp%27%3E%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%270.9%27%20numOctaves%3D%272%27%20stitchTiles%3D%27stitch%27%2F%3E%3CfeColorMatrix%20type%3D%27saturate%27%20values%3D%270%27%2F%3E%3CfeComponentTransfer%3E%3CfeFuncA%20type%3D%27linear%27%20slope%3D%270.07%27%2F%3E%3C%2FfeComponentTransfer%3E%3C%2Ffilter%3E%3Crect%20width%3D%27100%25%27%20height%3D%27100%25%27%20filter%3D%27url%28%23pp%29%27%2F%3E%3C%2Fsvg%3E");
+    --toast-bg: rgba(6, 12, 9, 0.95);
+  }
 }
 
 view,
@@ -26,35 +115,4 @@ textarea,
 scroll-view,
 image {
   box-sizing: border-box;
-}
-
-/* Shared button reset used by custom <view> buttons. */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 12rpx;
-  font-size: 30rpx;
-  transition: background-color 0.15s ease, opacity 0.15s ease;
-}
-
-.btn-primary {
-  background-color: var(--accent);
-  color: #ffffff;
-}
-
-.btn-primary:active {
-  background-color: var(--accent-press);
-}
-
-.btn-disabled {
-  opacity: 0.5;
-}
-
-.hairline-top {
-  border-top: 1rpx solid var(--border);
-}
-
-.hairline-bottom {
-  border-bottom: 1rpx solid var(--border);
 }

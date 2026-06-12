@@ -1,17 +1,18 @@
 {
   "pages": [
     "pages/chat/chat",
+    "pages/history/history",
     "pages/settings/settings"
   ],
   "window": {
     "defaultTitle": "富岭知识助手",
     "pullRefresh": false,
-    "titleBarColor": "#1677ff"
+    "titleBarColor": "#15604a"
   },
   "tabBar": {
-    "textColor": "#8a8f99",
-    "selectedColor": "#1677ff",
-    "backgroundColor": "#ffffff",
+    "textColor": "#6f6657",
+    "selectedColor": "#15604a",
+    "backgroundColor": "#fbf8f1",
     "items": [
       {
         "pagePath": "pages/chat/chat",

@@ -1,115 +1,234 @@
+/* feedback-bar — 原型 .fb / .fb-panel / .handoff-note 的 1:1 移植（px×2=rpx）。
+   位于 ai-card 内部（卡片外壳在 chat.acss .ai-card），自带 border-top 分隔。 */
+@import "../../styles/icons.acss";
+
 .feedback-bar {
-  margin-top: 12rpx;
-  padding: 0 4rpx;
+  display: flex;
+  flex-direction: column;
 }
 
-.fb-row {
+.fb {
+  border-top: 1px solid var(--line);
+  padding: 10rpx 16rpx;
   display: flex;
   flex-direction: row;
   align-items: center;
-}
-
-.fb-btn {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  padding: 8rpx 18rpx;
-  margin-right: 16rpx;
-  border-radius: 999rpx;
-  background-color: #f2f3f5;
-  border: 1rpx solid transparent;
-}
-
-.fb-btn-on {
-  background-color: #e8f1ff;
-  border-color: #1677ff;
-}
-
-.fb-btn-locked {
-  opacity: 0.55;
 }
 
 .fb-ico {
-  font-size: 28rpx;
-  margin-right: 6rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 80rpx;
+  height: 80rpx;
+  border-radius: 20rpx;
+  margin-right: 8rpx;
 }
 
-.fb-label {
-  font-size: 24rpx;
-  color: #646a73;
+.fb-ico:active {
+  background: var(--surface-3);
+  transform: scale(0.88);
 }
 
+.fb-glyph {
+  font-size: 36rpx;
+  color: var(--text-3);
+}
+
+.fb-up-on {
+  background: var(--brand-soft);
+}
+
+.fb-up-on .fb-glyph {
+  color: var(--brand);
+}
+
+.fb-down-on {
+  background: var(--danger-bg);
+}
+
+.fb-down-on .fb-glyph {
+  color: var(--danger-soft);
+}
+
+/* 锁定后只弱化未选中的那一票 —— 已选中的保持饱和 */
+.fb-locked {
+  opacity: 0.45;
+}
+
+.fb-spacer {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+
+.fb-done {
+  font-size: 22rpx;
+  color: var(--text-3);
+}
+
+.fb-handoff {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 14rpx 20rpx;
+  border-radius: 20rpx;
+  min-height: 80rpx;
+}
+
+.fb-handoff:active {
+  background: var(--surface-3);
+}
+
+.fb-handoff-ico {
+  font-size: 36rpx;
+  color: var(--text-3);
+  margin-right: 10rpx;
+}
+
+.fb-handoff-label {
+  font-size: 25rpx;
+  color: var(--text-3);
+}
+
+.fb-handoff-done {
+  opacity: 1;
+}
+
+.fb-handoff-done .fb-handoff-ico,
+.fb-handoff-done .fb-handoff-label {
+  color: var(--brand);
+}
+
+/* ---------- downvote reason panel ---------- */
 .fb-panel {
-  margin-top: 16rpx;
-  padding: 16rpx;
-  background-color: #f7f8fa;
-  border-radius: 12rpx;
+  border-top: 1px solid var(--line);
+  padding: 24rpx 28rpx 28rpx;
 }
 
-.fb-chips {
+.fp-q {
+  display: block;
+  font-size: 25rpx;
+  color: var(--text-2);
+  margin-bottom: 20rpx;
+}
+
+.chips {
   display: flex;
   flex-direction: row;
   flex-wrap: wrap;
+  margin-bottom: 6rpx;
 }
 
-.fb-chip {
-  padding: 8rpx 20rpx;
-  margin: 0 12rpx 12rpx 0;
+.chip {
+  background: var(--surface-3);
+  border: 1px solid var(--line);
   border-radius: 999rpx;
-  background-color: #ffffff;
-  border: 1rpx solid #e5e6eb;
-  font-size: 24rpx;
-  color: #1f2329;
+  padding: 16rpx 28rpx;
+  margin: 0 16rpx 16rpx 0;
+  min-height: 72rpx;
+  display: flex;
+  align-items: center;
 }
 
-.fb-chip-on {
-  background-color: #e8f1ff;
-  border-color: #1677ff;
-  color: #1677ff;
+.chip:active {
+  transform: scale(0.95);
+}
+
+.chip-text {
+  font-size: 25rpx;
+  color: var(--text-2);
+}
+
+.chip-sel {
+  background: var(--brand-soft);
+  border-color: var(--brand-a40);
+}
+
+.chip-sel .chip-text {
+  color: var(--brand);
+  font-weight: 500;
 }
 
 .fb-textarea {
   width: 100%;
-  min-height: 120rpx;
-  margin-top: 4rpx;
-  padding: 16rpx;
-  background-color: #ffffff;
-  border: 1rpx solid #e5e6eb;
-  border-radius: 12rpx;
-  font-size: 26rpx;
-  color: #1f2329;
+  border: 1px solid var(--line);
+  border-radius: 20rpx;
+  font-size: 25rpx;
+  padding: 18rpx 22rpx;
+  color: var(--text-1);
+  min-height: 112rpx;
+  background: var(--surface-2);
 }
 
-.fb-panel-actions {
+.fb-ta-placeholder {
+  color: var(--text-3);
+}
+
+.fb-submit-row {
   display: flex;
   flex-direction: row;
   justify-content: flex-end;
   align-items: center;
-  margin-top: 16rpx;
+  margin-top: 22rpx;
 }
 
-.fb-cancel {
-  padding: 10rpx 28rpx;
+.btn-text {
+  padding: 16rpx 24rpx;
   margin-right: 16rpx;
-  font-size: 26rpx;
-  color: #646a73;
+  border-radius: 20rpx;
+  min-height: 76rpx;
+  display: flex;
+  align-items: center;
 }
 
-.fb-submit {
-  padding: 10rpx 32rpx;
-  border-radius: 10rpx;
-  background-color: #1677ff;
-  color: #ffffff;
-  font-size: 26rpx;
+.btn-text-label {
+  font-size: 25rpx;
+  color: var(--text-3);
 }
 
-.btn-disabled {
+/* 白字填充一律 --brand-strong（锁定的 brand/brand-strong 分工） */
+.btn-primary {
+  background: var(--brand-strong);
+  border-radius: 20rpx;
+  padding: 16rpx 40rpx;
+  min-height: 76rpx;
+  display: flex;
+  align-items: center;
+}
+
+.btn-primary:active {
+  background: var(--brand-press);
+}
+
+.btn-primary-disabled {
   opacity: 0.5;
 }
 
-.fb-thanks {
-  display: block;
-  margin-top: 10rpx;
-  font-size: 24rpx;
-  color: #8a8f99;
+.btn-primary-label {
+  font-size: 25rpx;
+  font-weight: 500;
+  color: #ffffff;
+}
+
+/* ---------- 转人工持久确认行 ---------- */
+.handoff-note {
+  background: var(--success-bg);
+  padding: 16rpx 28rpx;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+
+.hn-ico {
+  font-size: 28rpx;
+  color: var(--success);
+  margin-right: 12rpx;
+  flex-shrink: 0;
+}
+
+.hn-text {
+  font-size: 25rpx;
+  color: var(--success);
 }

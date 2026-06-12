@@ -1,0 +1,30 @@
+/* 图标字形类（Aurora-Forest v1.1 锁定图标集 → iconfont）。
+   字形来自 Lucide 官方字体的 15 字形子集（与原型 ICON.* 同源图标），
+   @font-face 在 app.acss 注册（base64 woff2，2.8KB）。
+   组件 acss 各自 @import 本文件 —— 类名在组件作用域内也可命中。
+   颜色随 color 继承（currentColor），所有状态×主题免图片资产。 */
+
+.ico {
+  font-family: "flico";
+  font-style: normal;
+  font-weight: normal;
+  line-height: 1;
+  display: inline-block;
+  -webkit-font-smoothing: antialiased;
+}
+
+.ico-up::before { content: "\e18a"; }
+.ico-down::before { content: "\e189"; }
+.ico-headset::before { content: "\e5bd"; }
+.ico-copy::before { content: "\e09e"; }
+.ico-image::before { content: "\e0f6"; }
+.ico-image-off::before { content: "\e1c0"; }
+.ico-refresh::before { content: "\e149"; }
+.ico-search::before { content: "\e151"; }
+.ico-warn::before { content: "\e193"; }
+.ico-check::before { content: "\e06c"; }
+.ico-x::before { content: "\e1b2"; }
+.ico-chev-r::before { content: "\e06f"; }
+.ico-chev-l::before { content: "\e06e"; }
+.ico-chev-down::before { content: "\e06d"; }
+.ico-expand::before { content: "\e113"; }
