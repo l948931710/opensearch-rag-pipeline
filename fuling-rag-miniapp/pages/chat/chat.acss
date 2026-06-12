@@ -729,3 +729,8 @@
   color: var(--text-3);
   margin: -4rpx 0 14rpx;
 }
+
+/* 键盘弹起时的附件栏避让：真机上钉钉语音入口条约 90rpx，垫高输入栏让出空间 */
+.input-bar.kb-pad {
+  padding-bottom: calc(96rpx + env(safe-area-inset-bottom, 0px));
+}

@@ -155,20 +155,23 @@
     </view>
   </view>
 
-  <!-- bottom input bar：auto-height textarea + 发送/停止 -->
-  <view class="input-bar">
-    <textarea
+  <!-- bottom input bar：单行 input（textarea 在真机会挂上钉钉语音附件栏盖住输入框，
+       换 input 移除它）+ 发送/停止。非受控输入：value 只接程序化写值（见 chat.js onInput）。
+       kb-pad = 聚焦时垫高避让（模拟器无真键盘看不到此问题） -->
+  <view class="input-bar {{kbOpen ? 'kb-pad' : ''}}">
+    <input
       class="input-box"
       value="{{draft}}"
       placeholder="请输入问题…"
       placeholder-class="input-placeholder"
-      auto-height="{{true}}"
       confirm-type="send"
       onInput="onInput"
       onConfirm="onSend"
+      onFocus="onInputFocus"
+      onBlur="onInputBlur"
     />
     <view
-      class="send-btn {{(sending || typing) ? 'send-btn-stop' : (draft ? '' : 'send-btn-disabled')}}"
+      class="send-btn {{(sending || typing) ? 'send-btn-stop' : (hasDraft ? '' : 'send-btn-disabled')}}"
       onTap="onSend"
     >
       <text class="send-btn-text">{{(sending || typing) ? '停止' : '发送'}}</text>

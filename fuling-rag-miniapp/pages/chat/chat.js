@@ -44,7 +44,8 @@ Page({
     //   messageId?, copyText?, question?, loading?, error?, errorText?,
     //   noResult?, handoffDone?, instant? }
     messages: [],
-    draft: '',
+    draft: '',        // 仅程序化写值（发送清空/chip 回填）；输入过程非受控，见 onInput
+    hasDraft: false,  // 发送按钮可用态（空↔非空翻转才 setData）
     sending: false,   // 等待 /api/ask 响应（骨架屏阶段）
     typing: false,    // 打字机揭示中（按钮显示「停止」）
     thinking: false,  // 深度思考开关：默认关、不持久化（每次进页都是关），逐问生效
@@ -70,6 +71,7 @@ Page({
       statusBarHeight: sbh,
       startTimeLabel: '今天 ' + pad2(now.getHours()) + ':' + pad2(now.getMinutes()),
     });
+    this._draft = '';           // 非受控草稿（真值；data.draft 只做程序化覆盖）
     this._pinned = true;        // 钉住才跟滚：用户上翻重读时绝不抢滚动条
     this._listHeight = 0;
     this._lastGrowScroll = 0;
@@ -133,9 +135,11 @@ Page({
       resetAt = 0;
     }
     if (resetAt && resetAt !== this.data.lastResetAt) {
+      this._draft = '';
       this.setData({
         messages: [],
         draft: '',
+        hasDraft: false,
         sending: false,
         typing: false,
         scrollIntoId: '',
@@ -146,8 +150,26 @@ Page({
     }
   },
 
+  // 非受控输入：按键绝不 setData 回推 value —— 受控回声在真机上与连续删除赛跑，
+  // 旧值把刚删的字"恢复"回来（删除要按好几遍的根因）。草稿存 this._draft，
+  // data.draft 只在程序化写值（发送清空 / chip 回填）时变更；按钮态用 hasDraft
+  // 布尔（仅空↔非空翻转时 setData，每键零开销）。
   onInput(e) {
-    this.setData({ draft: e.detail.value });
+    this._draft = e.detail.value;
+    const hasDraft = !!(this._draft || '').trim();
+    if (hasDraft !== this.data.hasDraft) {
+      this.setData({ hasDraft });
+    }
+  },
+
+  // 真机键盘附件栏避让：聚焦时给输入栏垫底（kb-pad），失焦还原。
+  // 引擎只按键盘高度顶页面，不算钉钉语音入口那条附件栏的高度。
+  onInputFocus() {
+    this.setData({ kbOpen: true });
+  },
+
+  onInputBlur() {
+    this.setData({ kbOpen: false });
   },
 
   // 深度思考逐问开关（影响下一次发送；骨架阶段/打字中也可切，只对后续提问生效）
@@ -277,11 +299,17 @@ Page({
       }
       return;
     }
-    const question = (this.data.draft || '').trim();
+    const question = (this._draft || '').trim();
     if (!question) {
       return;
     }
-    this.setData({ draft: '' });
+    // 两段式清空：data.draft 可能仍是 ''（非受控期间没跟踪），直接置 '' 无 diff
+    // 不会触发原生输入框清空 —— 先同步成当前文本，再异步置空（必有 diff）。
+    this._draft = '';
+    this.setData({ draft: question, hasDraft: false });
+    setTimeout(() => {
+      this.setData({ draft: '' });
+    }, 0);
     this._ask(question, true);
   },
 
@@ -313,7 +341,8 @@ Page({
   onNrChipTap(e) {
     const q = e.currentTarget.dataset.q;
     if (q && !this.data.sending && !this.data.typing) {
-      this.setData({ draft: q });
+      this._draft = q;
+      this.setData({ draft: q, hasDraft: true });
     }
   },
 
