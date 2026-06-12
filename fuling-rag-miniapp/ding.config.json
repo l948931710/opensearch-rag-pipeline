@@ -1,4 +1,6 @@
 {
   "type": "mp",
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "miniAppId": "5000000006765941",
+  "page": "pages/chat/chat"
 }
