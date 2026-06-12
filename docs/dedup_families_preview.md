@@ -51,4 +51,4 @@ rank=高使用家族的当前检索名次(keep/drop)
 1. Part A 本地 E2E 报告评审通过（keep-pdf 的选择在新管线下复核 — docx 绑定质量已大幅提升）
 2. 金集命中的家族先把 golden_full.json expected_doc_ids 改指 keep 侧
 3. 跨部门家族确认 ACL 归属（或等权限系统用权限解决共享，不靠重复注册）
-4. 执行顺序：HA3 删除（PENDING_DELETE 兜底）→ chunk_meta.is_active=0 → L0/L1 验证
+4. 执行顺序：RDS 停用（单事务）→ HA3 同步删除（幂等）；中断残留由 清理stage3 步骤0 清扫兜底。（原 HA3-first 方案废弃：中断会留下 RDS active-INDEXED 但 HA3 已删的幽灵行）

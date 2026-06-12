@@ -354,7 +354,7 @@
   ],
   "expected_doc_ids": [
    "DOC_ADMIN_20260513120216_B93A75",
-   "DOC_ADMIN_20260514123015_87F3E6"
+   "DOC_HR_20260514123018_7E12DE"
   ],
   "resolution": [
    {
@@ -368,10 +368,10 @@
    {
     "expected": "A21工厂进出厂、限制区域管理规定",
     "title": "A21工厂进出厂、限制区域管理规定.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_87F3E6",
+    "doc_id": "DOC_HR_20260514123018_7E12DE",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "答案需综合《家长、子女安全责任协议书》《A21工厂进出厂、限制区域管理规定》",

@@ -223,7 +223,7 @@
   ],
   "expected_doc_ids": [
    "DOC_ADMIN_20260513120214_12740B",
-   "DOC_ADMIN_20260514123015_7444E8"
+   "DOC_HR_20260514123024_C1E1B5"
   ],
   "resolution": [
    {
@@ -237,10 +237,10 @@
    {
     "expected": "保安员工作制度",
     "title": "A51保安员工作制度.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_7444E8",
+    "doc_id": "DOC_HR_20260514123024_C1E1B5",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "应召回《保安巡查记录表》或《保安员工作制度》",
@@ -371,16 +371,16 @@
    "A1员工行为管理标准"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_A8161D"
+   "DOC_HR_20260514123018_D7DD55"
   ],
   "resolution": [
    {
     "expected": "A1员工行为管理标准",
     "title": "A1员工行为管理标准.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_A8161D",
+    "doc_id": "DOC_HR_20260514123018_D7DD55",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "应召回《A1员工行为管理标准》",
@@ -1832,16 +1832,16 @@
    "A52吸烟管理制度"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_BD3C3F"
+   "DOC_HR_20260514123025_8FBDDE"
   ],
   "resolution": [
    {
     "expected": "A52吸烟管理制度",
     "title": "A52吸烟管理制度.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_BD3C3F",
+    "doc_id": "DOC_HR_20260514123025_8FBDDE",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "我已理解您想了解公司的吸烟管理规定。作为企业智能体，我会立即为您检索相关政策内容，确保您快速获取准确信息。\n富岭科技股份有限公司的吸烟管理规定如下：\n### 一、适用范围\n适用于公司全体员工及进入公司的外来人员。\n### 二、吸烟区域与时限\n- **允许吸烟区域**：\n  - 生产车间：在车间保安处设专门吸烟区，配备吸烟桶；\n  - 单独办公室/会议室：配备烟灰缸，仅限指定区域吸烟；\n  - 公共办公室人员：可至接待室吸烟；\n  - 外来人员：仅可在“小食堂旁边吸烟室”吸烟。...",
@@ -1902,16 +1902,16 @@
    "A51保安员工作制度"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_7444E8"
+   "DOC_HR_20260514123024_C1E1B5"
   ],
   "resolution": [
    {
     "expected": "A51保安员工作制度",
     "title": "A51保安员工作制度.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_7444E8",
+    "doc_id": "DOC_HR_20260514123024_C1E1B5",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "您想了解公司关于保安的管理制度，我马上为您查询相关规定。\n富岭科技股份有限公司的保安管理制度主要依据《A23保安管理程序》和《A51保安员工作制度》，核心内容如下：\n### 一、管理目的与范围\n- **目的**：确保生产、贮存、运输过程符合美国海关C-TPAT（海关—贸易伙伴防恐）安全要求，防范恐怖分子或违禁物品混入。\n- **适用范围**：公司保安队对厂内一切安全维护活动。\n### 二、职责分工\n- **安全经理**：统筹厂区所有安全工作的策划与安排。  \n- **保安队长**：监督保安队日常工作。  \n- **保安班长**：监督当班执勤保安工作。...",
@@ -2073,16 +2073,16 @@
    "A21工厂进出厂、限制区域管理规定"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_87F3E6"
+   "DOC_HR_20260514123018_7E12DE"
   ],
   "resolution": [
    {
     "expected": "A21工厂进出厂、限制区域管理规定",
     "title": "A21工厂进出厂、限制区域管理规定.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_87F3E6",
+    "doc_id": "DOC_HR_20260514123018_7E12DE",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "因召回《A21工厂进出厂、限制区域管理规定》",
@@ -2143,16 +2143,16 @@
    "A1员工行为管理标准"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_A8161D"
+   "DOC_HR_20260514123018_D7DD55"
   ],
   "resolution": [
    {
     "expected": "A1员工行为管理标准",
     "title": "A1员工行为管理标准.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_A8161D",
+    "doc_id": "DOC_HR_20260514123018_D7DD55",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "答案为A/B/C类行为划分；需提及个人形象、社交礼仪、作业纪律等细则",
@@ -2178,16 +2178,16 @@
    "A52吸烟管理制度"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_BD3C3F"
+   "DOC_HR_20260514123025_8FBDDE"
   ],
   "resolution": [
    {
     "expected": "A52吸烟管理制度",
     "title": "A52吸烟管理制度.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_BD3C3F",
+    "doc_id": "DOC_HR_20260514123025_8FBDDE",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "答案需包含对员工和外来人员的分级处罚：警告、罚款、解雇等",
@@ -5574,7 +5574,7 @@
   ],
   "expected_doc_ids": [
    "DOC_ADMIN_20260513120216_B93A75",
-   "DOC_ADMIN_20260514123015_87F3E6"
+   "DOC_HR_20260514123018_7E12DE"
   ],
   "resolution": [
    {
@@ -5588,10 +5588,10 @@
    {
     "expected": "A21工厂进出厂、限制区域管理规定",
     "title": "A21工厂进出厂、限制区域管理规定.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_87F3E6",
+    "doc_id": "DOC_HR_20260514123018_7E12DE",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "答案需综合《家长、子女安全责任协议书》《A21工厂进出厂、限制区域管理规定》",
@@ -6361,7 +6361,7 @@
   "expected_doc_ids": [
    "DOC_ADMIN_20260513120215_766809",
    "DOC_HR_20260514123023_33AD2C",
-   "DOC_ADMIN_20260514123015_87F3E6",
+   "DOC_HR_20260514123018_7E12DE",
    "DOC_ADMIN_20260513120215_A4D6AE",
    "DOC_ADMIN_20260513120214_E32FC7"
   ],
@@ -6385,10 +6385,10 @@
    {
     "expected": "A21工厂进出厂、限制区域管理规定",
     "title": "A21工厂进出厂、限制区域管理规定.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_87F3E6",
+    "doc_id": "DOC_HR_20260514123018_7E12DE",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    },
    {
     "expected": "公司自行车管理规定",
@@ -6675,16 +6675,16 @@
    "A1员工行为管理标准"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_A8161D"
+   "DOC_HR_20260514123018_D7DD55"
   ],
   "resolution": [
    {
     "expected": "A1员工行为管理标准",
     "title": "A1员工行为管理标准.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_A8161D",
+    "doc_id": "DOC_HR_20260514123018_D7DD55",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "admin"
+    "owner_dept": "hr"
    }
   ],
   "answer_points": "答案需准确标注来源为《A1员工行为管理标准》",
