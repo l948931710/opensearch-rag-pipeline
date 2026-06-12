@@ -8,8 +8,17 @@
   3. 为每个新文件创建 document_meta + document_version 记录
 
 安全模式：DRY_RUN = True 时只报告不修改
+
+变更 2026-06-11：新增注册侧同名(stem)防重 —— 同部门同名(去扩展名)已有 active
+注册则跳过 + 告警，跨部门同名仅告警不拦截；含批内防重与 DRY_RUN 预览统计。
+⚠️ 本文件是 DataWorks PyODPS 节点的粘贴源：下次发布窗口需把本文件重新粘贴到节点。
 """
-import subprocess, sys, os, hashlib, time, random
+import hashlib
+import os
+import random
+import subprocess
+import sys
+import time
 from datetime import datetime
 
 # ═══════════════════════════════════════════════════════════════
@@ -20,7 +29,8 @@ DEPS = ["PyMySQL", "DBUtils", "oss2"]
 def ensure_deps():
     dep_dir = "/tmp/pydeps"
     try:
-        import pymysql, oss2
+        import oss2     # noqa: F401  仅探测依赖是否可用
+        import pymysql  # noqa: F401
         return
     except ImportError:
         pass
@@ -102,7 +112,7 @@ def generate_doc_id(dept):
 # ═══════════════════════════════════════════════════════════════
 # 2. 扫描 OSS
 # ═══════════════════════════════════════════════════════════════
-import oss2
+import oss2  # noqa: E402  PyODPS 节点须先 ensure_deps() 再导入
 
 print("=" * 60)
 print("  OSS 新文件注册工具")
@@ -119,9 +129,13 @@ oss_files = {}  # raw_key -> file_size
 # 单一来源是 opensearch_pipeline/ingest_policy.py；本脚本作为 PyODPS 独立节点
 # 运行时无该包，使用内联副本（⚠️ 修改时两处同步；tests/test_ingest_generalization.py
 # 的 parity test 会用 AST 抽取本副本与正本逐键对拍，单边改动会挂 CI）。
-INGEST_POLICY_REV = "2026-06-10"   # 节点日志可见，核对线上跑的是哪一版策略
+INGEST_POLICY_REV = "2026-06-11"   # 节点日志可见，核对线上跑的是哪一版策略
 try:
-    from opensearch_pipeline.ingest_policy import should_ingest_raw_key
+    from opensearch_pipeline.ingest_policy import (
+        raw_key_stem,
+        should_ingest_raw_key,
+        stem_twin_action,
+    )
     print("   [ingest-policy] using opensearch_pipeline.ingest_policy (rev %s)" % INGEST_POLICY_REV)
 except ImportError:
     print("   [ingest-policy] using inline fallback copy (rev %s)" % INGEST_POLICY_REV)
@@ -158,6 +172,32 @@ except ImportError:
             return False, "unknown ext (.%s)" % ext
         return True, ""
 
+    # ── 同名(stem)防重（与正本 ingest_policy.py 逐字符一致，parity test 对拍） ──
+    def raw_key_stem(key: str) -> str:
+        """basename 去掉最后一层扩展名（只去一层："a.b.docx" → "a.b"；无扩展名原样返回）。"""
+        base = os.path.basename(key or "")
+        return os.path.splitext(base)[0].strip()
+
+    def stem_twin_action(dept: str, stem: str, existing: dict) -> tuple:
+        """同名（同 stem）注册防重裁决。existing 形如 {stem: set(已注册部门小写)}。
+
+        Returns:
+            ("skip", reason)  同部门（大小写不敏感）已有 active 同名注册 → 跳过（防孪生 doc_id）；
+            ("warn", reason)  仅异部门已有同名 → 告警不拦截（归属是 ACL 问题，防重不替它决定）；
+            ("ok", "")        无同名注册。reason 为中文，列出已注册部门。
+        """
+        if not stem:
+            return "ok", ""
+        depts = existing.get(stem) or set()
+        if not depts:
+            return "ok", ""
+        dept_l = (dept or "").strip().lower()
+        depts_l = sorted({str(d).strip().lower() for d in depts})
+        listed = ", ".join(depts_l)
+        if dept_l in depts_l:
+            return "skip", f"已有: {listed}"
+        return "warn", f"已有: {listed}"
+
 skip_stats = {}
 for obj in oss2.ObjectIteratorV2(bucket, prefix=OSS_RAW_PREFIX):
     key = obj.key
@@ -176,7 +216,7 @@ if skip_stats:
 # ═══════════════════════════════════════════════════════════════
 # 3. 查 RDS 已注册记录
 # ═══════════════════════════════════════════════════════════════
-import pymysql
+import pymysql  # noqa: E402  PyODPS 节点须先 ensure_deps() 再导入
 
 print("\n📋 查询 RDS 已注册记录...")
 conn = pymysql.connect(
@@ -189,7 +229,22 @@ with conn.cursor() as cursor:
     cursor.execute("SELECT raw_key FROM document_version")
     existing_keys = set(row[0] for row in cursor.fetchall())
 
-print(f"   ✅ RDS 已有 {len(existing_keys)} 条记录")
+    # ── 防重：active 注册的同名(stem)→部门映射（raw_key 精确比对抓不住
+    # 同名异扩展/换路径重传，它们会注册成孪生 doc_id）──
+    cursor.execute("""
+        SELECT dv.raw_key, dm.owner_dept
+        FROM document_version dv
+        JOIN document_meta dm ON dv.doc_id = dm.doc_id
+        WHERE dv.status = 'active' AND dm.status = 'active'
+    """)
+    existing_stem_depts = {}  # stem -> set(部门小写)
+    for raw_key, owner_dept in cursor.fetchall():
+        stem = raw_key_stem(raw_key or "")
+        if not stem:
+            continue
+        existing_stem_depts.setdefault(stem, set()).add((owner_dept or "").strip().lower())
+
+print(f"   ✅ RDS 已有 {len(existing_keys)} 条记录（active 同名防重映射 {len(existing_stem_depts)} 个 stem）")
 
 # ═══════════════════════════════════════════════════════════════
 # 4. 找出新文件
@@ -198,6 +253,13 @@ new_files = []
 for key, size in sorted(oss_files.items()):
     if key not in existing_keys:
         new_files.append((key, size))
+
+# 批内孪生裁决顺序：同 (部门, stem) 的双格式同批上传时，先注册 .pdf——
+# 字典序 'docx' < 'pdf' 会让 docx 先注册、pdf 被防重跳过，与转换对
+# 「一般留 pdf（布局+页码）」的既定取舍相反（2026-06-11 对抗评审）。
+new_files.sort(key=lambda ks: (
+    resolve_dept(ks[0]).lower(), raw_key_stem(ks[0]),
+    0 if ks[0].lower().endswith(".pdf") else 1, ks[0]))
 
 print(f"\n🆕 发现 {len(new_files)} 个未注册文件")
 
@@ -227,7 +289,7 @@ for ext, cnt in sorted(ext_counts.items()):
     print(f"    .{ext}: {cnt}")
 
 # 预览前 20 条
-print(f"\n── 前 20 条新文件 ──")
+print("\n── 前 20 条新文件 ──")
 for key, size in new_files[:20]:
     dept = resolve_dept(key)
     ext = key.rsplit(".", 1)[-1].lower() if "." in key else "unknown"
@@ -239,7 +301,31 @@ if len(new_files) > 20:
 # 5. 注册新文件
 # ═══════════════════════════════════════════════════════════════
 if DRY_RUN:
-    print(f"\n💡 DRY_RUN 模式，未执行修改。改为 DRY_RUN = False 后重跑即可实际注册。")
+    # ── 防重预览（与实际注册同一裁决逻辑，含批内防重）──
+    preview_map = {s: set(d) for s, d in existing_stem_depts.items()}
+    would_skip, would_warn = [], []
+    for key, size in new_files:
+        dept_l = resolve_dept(key).lower()
+        stem = raw_key_stem(key)
+        action, reason = stem_twin_action(dept_l, stem, preview_map)
+        if action == "skip":
+            would_skip.append((key, reason))
+            continue
+        if action == "warn":
+            would_warn.append((key, reason))
+        if stem:  # 视为将注册成功 → 批内后续同名同部门可被识别
+            preview_map.setdefault(stem, set()).add(dept_l)
+    print(f"\n🛡️ 防重预览: 同部门同名将跳过 {len(would_skip)} 个，跨部门同名将告警 {len(would_warn)} 个")
+    for key, reason in would_skip[:10]:
+        print(f"   ⏭️ [防重] 同部门同名已注册，将跳过: {key}（{reason}）")
+    if len(would_skip) > 10:
+        print(f"   ... 还有 {len(would_skip) - 10} 个")
+    for key, reason in would_warn[:10]:
+        print(f"   ⚠️ [防重] 跨部门同名已注册，仍会注册: {key}（{reason}）")
+    if len(would_warn) > 10:
+        print(f"   ... 还有 {len(would_warn) - 10} 个")
+
+    print("\n💡 DRY_RUN 模式，未执行修改。改为 DRY_RUN = False 后重跑即可实际注册。")
     conn.close()
     print("\n✅ 完成！")
     sys.exit(0)
@@ -247,11 +333,26 @@ if DRY_RUN:
 print(f"\n⚡ 正在注册 {len(new_files)} 个新文件...")
 registered = 0
 errors = 0
+twin_skipped = 0   # 防重：同部门同名跳过
+twin_warned = 0    # 防重：跨部门同名告警（仍注册）
 
 with conn.cursor() as cursor:
     for key, size in new_files:
         try:
             dept = resolve_dept(key)
+
+            # ── 注册防重：同部门同 stem（同名异扩展/换路径重传）跳过，防孪生 doc_id；
+            # 跨部门同 stem 仅告警（归属是 ACL 问题，防重不替它做决定）──
+            stem = raw_key_stem(key)
+            action, reason = stem_twin_action(dept.lower(), stem, existing_stem_depts)
+            if action == "skip":
+                twin_skipped += 1
+                print(f"   ⏭️ [防重] 同部门同名已注册，跳过: {key}（{reason}）")
+                continue
+            if action == "warn":
+                twin_warned += 1
+                print(f"   ⚠️ [防重] 跨部门同名已注册，仍注册: {key}（{reason}）")
+
             filename = os.path.basename(key)
             ext = key.rsplit(".", 1)[-1].lower() if "." in key else ""
             doc_id = generate_doc_id(dept)
@@ -281,7 +382,11 @@ with conn.cursor() as cursor:
                     'NOT_STARTED', 'NOT_INDEXED', 'active'
                 )
             """, (doc_id, OSS_BUCKET_NAME, key, raw_key_hash, ext))
-            
+
+            # 批内防重：注册成功即回填 (stem, dept)，本批后续同名同部门文件同样被跳过
+            if stem:
+                existing_stem_depts.setdefault(stem, set()).add(dept.lower())
+
             registered += 1
             if registered % 20 == 0:
                 conn.commit()
@@ -295,6 +400,10 @@ conn.commit()
 conn.close()
 
 print(f"\n   ✅ 成功注册: {registered}")
+if twin_skipped:
+    print(f"   ⏭️ 防重跳过（同部门同名）: {twin_skipped}")
+if twin_warned:
+    print(f"   ⚠️ 防重告警（跨部门同名，已注册）: {twin_warned}")
 if errors:
     print(f"   ⚠️ 失败: {errors}")
 print("\n✅ 完成！")

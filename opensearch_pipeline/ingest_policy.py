@@ -10,10 +10,19 @@ ingest_policy.py — raw/ 摄取准入策略（注册扫描与 stage-1 共用的
 
 注意：本策略只管"扫描时是否纳入"。已注册的存量垃圾行属于语料清理
 （docs/corpus_cleanup_worklist.md），不在此处处理。
+
+2026-06-11 新增注册侧同名防重（raw_key_stem / stem_twin_action）：同一文档以
+同名异扩展（.pdf/.docx 双上传）或换路径重传再注册会产生孪生 doc_id（实例：
+FL-ZS-WI-005《注塑收货报检》双注册、A1员工行为管理标准 被注册 4 次）。
+策略（用户拍板）：同部门同 stem 已有 active 注册 → 跳过注册 + 告警日志；
+跨部门同 stem → 仅告警不拦截（拦截与否是 ACL 归属问题，防重不替它做决定）。
 """
 
 import os
 from typing import Tuple
+
+# 策略版本（register_new_files.py 的 INGEST_POLICY_REV 必须与此一致，parity test 钉死）
+INGEST_POLICY_REV = "2026-06-11"
 
 # 编辑器/系统临时文件
 IGNORED_BASENAME_PREFIXES: Tuple[str, ...] = ("~$", ".~")
@@ -88,3 +97,33 @@ def should_ingest_raw_key(key: str) -> Tuple[bool, str]:
     if ext not in INGESTABLE_EXTS:
         return False, f"unknown ext (.{ext})"
     return True, ""
+
+
+# ⚠️ 下面两个函数在 dataworks_nodes/register_new_files.py 的内联 fallback 区有
+# 逐字符一致的副本（PyODPS 节点运行时无本包）——修改时两处同步，parity test 对拍。
+
+def raw_key_stem(key: str) -> str:
+    """basename 去掉最后一层扩展名（只去一层："a.b.docx" → "a.b"；无扩展名原样返回）。"""
+    base = os.path.basename(key or "")
+    return os.path.splitext(base)[0].strip()
+
+
+def stem_twin_action(dept: str, stem: str, existing: dict) -> tuple:
+    """同名（同 stem）注册防重裁决。existing 形如 {stem: set(已注册部门小写)}。
+
+    Returns:
+        ("skip", reason)  同部门（大小写不敏感）已有 active 同名注册 → 跳过（防孪生 doc_id）；
+        ("warn", reason)  仅异部门已有同名 → 告警不拦截（归属是 ACL 问题，防重不替它决定）；
+        ("ok", "")        无同名注册。reason 为中文，列出已注册部门。
+    """
+    if not stem:
+        return "ok", ""
+    depts = existing.get(stem) or set()
+    if not depts:
+        return "ok", ""
+    dept_l = (dept or "").strip().lower()
+    depts_l = sorted({str(d).strip().lower() for d in depts})
+    listed = ", ".join(depts_l)
+    if dept_l in depts_l:
+        return "skip", f"已有: {listed}"
+    return "warn", f"已有: {listed}"

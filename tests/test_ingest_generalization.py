@@ -888,21 +888,19 @@ def test_stage1_sql_predicates_share_single_source():
     assert rendered.startswith("(") and rendered.endswith(")") and "'doc'" in rendered
 
 
-def test_register_fallback_parity_with_canonical_policy():
-    """register_new_files.py 的内联副本（PyODPS 节点上实际执行的那份）必须与
-    正本逐键同判 —— 上一次漂移（只跳 _quarantine）正是垃圾注册的来源。"""
+def _register_src_path():
+    import os as _os
+    return _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                         "dataworks_nodes", "register_new_files.py")
+
+
+def _load_register_fallback_ns():
+    """AST 抽取 register_new_files.py 内联 fallback 区（PyODPS 节点上实际执行的那份），
+    exec 后返回含全部 fallback 函数的命名空间。"""
     import ast
     import os as _os
 
-    from opensearch_pipeline.ingest_policy import (
-        IGNORED_EXTS,
-        INGESTABLE_EXTS,
-        UNSUPPORTED_LEGACY_EXTS,
-        should_ingest_raw_key,
-    )
-
-    src_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                             "dataworks_nodes", "register_new_files.py")
+    src_path = _register_src_path()
     tree = ast.parse(open(src_path, encoding="utf-8").read())
     fallback_body = None
     for node in ast.walk(tree):
@@ -914,7 +912,20 @@ def test_register_fallback_parity_with_canonical_policy():
     assert fallback_body, "未找到内联 fallback should_ingest_raw_key"
     ns = {"os": _os, "INGEST_POLICY_REV": "", "print": lambda *a, **k: None}
     exec(compile(ast.Module(body=fallback_body, type_ignores=[]), src_path, "exec"), ns)
-    fallback_fn = ns["should_ingest_raw_key"]
+    return ns
+
+
+def test_register_fallback_parity_with_canonical_policy():
+    """register_new_files.py 的内联副本（PyODPS 节点上实际执行的那份）必须与
+    正本逐键同判 —— 上一次漂移（只跳 _quarantine）正是垃圾注册的来源。"""
+    from opensearch_pipeline.ingest_policy import (
+        IGNORED_EXTS,
+        INGESTABLE_EXTS,
+        UNSUPPORTED_LEGACY_EXTS,
+        should_ingest_raw_key,
+    )
+
+    fallback_fn = _load_register_fallback_ns()["should_ingest_raw_key"]
 
     # 全矩阵对拍：所有清单扩展名 × 路径形态 + 边角 key
     keys = []
@@ -930,3 +941,131 @@ def test_register_fallback_parity_with_canonical_policy():
         canonical_ok, _ = should_ingest_raw_key(key)
         fallback_ok, _ = fallback_fn(key)
         assert canonical_ok == fallback_ok, f"策略分歧 key={key}: 正本={canonical_ok} 副本={fallback_ok}"
+
+
+# ═══════════════ 注册侧同名(stem)防重 ═══════════════
+# 孪生实例（2026-06-11）：FL-ZS-WI-005《注塑收货报检》.pdf/.docx 双注册；
+# A1员工行为管理标准.docx 在 hr/admin/marketing/supply 多目录被注册 4 次。
+# 策略（用户拍板）：同部门同 stem 已有 active 注册 → skip + 告警；
+# 跨部门同 stem → 仅 warn 不拦截（拦截与否是 ACL 归属问题，防重不替它做决定）。
+
+
+def test_raw_key_stem_shapes():
+    from opensearch_pipeline.ingest_policy import raw_key_stem
+
+    key = "raw/production_injection/FL-ZS-WI-005《注塑收货报检》.pdf"
+    assert raw_key_stem(key) == "FL-ZS-WI-005《注塑收货报检》"   # 中文文件名
+    assert raw_key_stem("raw/admin/a.b.docx") == "a.b"            # 多点：只去最后一层
+    assert raw_key_stem("raw/admin/无扩展名") == "无扩展名"        # 无扩展名原样返回
+    assert raw_key_stem("raw/admin/报告.PDF") == "报告"            # 大写扩展名
+    assert raw_key_stem("raw/it/Report Final.DOCX") == "Report Final"  # stem 大小写保留
+    assert raw_key_stem("raw/hr/年假规定 .docx") == "年假规定"      # 去扩展名后 strip
+    assert raw_key_stem("员工手册.docx") == "员工手册"             # 裸文件名（无目录）
+    assert raw_key_stem("") == ""
+
+
+def test_stem_twin_action_three_branches():
+    from opensearch_pipeline.ingest_policy import stem_twin_action
+
+    existing = {"注塑收货报检": {"production"}}
+    # ok：无同名注册
+    assert stem_twin_action("admin", "新文档", existing) == ("ok", "")
+    # skip：同部门（大小写不敏感），reason 列出已注册部门
+    action, reason = stem_twin_action("PRODUCTION", "注塑收货报检", existing)
+    assert action == "skip" and "production" in reason
+    # warn：异部门，reason 列出已注册部门
+    action, reason = stem_twin_action("supply", "注塑收货报检", existing)
+    assert action == "warn" and "production" in reason
+    # 空 stem 不参与防重
+    assert stem_twin_action("admin", "", {"": {"admin"}}) == ("ok", "")
+
+
+def test_stem_twin_same_dept_cross_extension_skipped():
+    """孪生实例复刻：.pdf 已注册，同部门再传 .docx → 同 stem skip（防孪生 doc_id）。"""
+    from opensearch_pipeline.ingest_policy import raw_key_stem, stem_twin_action
+
+    registered = "raw/production_injection/FL-ZS-WI-005《注塑收货报检》.pdf"
+    incoming = "raw/production_injection/FL-ZS-WI-005《注塑收货报检》.docx"
+    existing = {raw_key_stem(registered): {"production"}}
+    action, _ = stem_twin_action("production", raw_key_stem(incoming), existing)
+    assert action == "skip"
+
+
+def test_stem_twin_cross_dept_warns_not_blocked():
+    """A1员工行为管理标准 多目录形态：跨部门同名 → 仅告警不拦截，reason 列出全部已注册部门。"""
+    from opensearch_pipeline.ingest_policy import raw_key_stem, stem_twin_action
+
+    stem = raw_key_stem("raw/supply/A1员工行为管理标准.docx")
+    existing = {stem: {"hr", "admin", "marketing"}}
+    action, reason = stem_twin_action("supply", stem, existing)
+    assert action == "warn"
+    for dept in ("hr", "admin", "marketing"):
+        assert dept in reason, f"reason 应列出已注册部门 {dept}: {reason!r}"
+
+
+def test_stem_twin_batch_internal_dedup():
+    """批内防重：注册成功后 (stem, dept) 回填 existing_map → 同一批第二个同名同部门
+    文件被跳过。（脚本主体的回填语句无法 import —— 此处函数级复刻同一更新逻辑，
+    脚本内回填位置靠 parity 注释 + 人工 review。）"""
+    from opensearch_pipeline.ingest_policy import raw_key_stem, stem_twin_action
+
+    existing = {}
+    k1, k2 = "raw/hr/考勤管理.docx", "raw/hr/考勤管理.pdf"
+    action, _ = stem_twin_action("hr", raw_key_stem(k1), existing)
+    assert action == "ok"
+    existing.setdefault(raw_key_stem(k1), set()).add("hr")   # 注册成功 → 回填
+    action, _ = stem_twin_action("hr", raw_key_stem(k2), existing)
+    assert action == "skip", "批内第二个同名同部门文件应被跳过"
+    # 批内跨部门：仍是 warn 不拦截
+    action, _ = stem_twin_action("admin", raw_key_stem(k2), existing)
+    assert action == "warn"
+
+
+def test_register_fallback_parity_stem_twin():
+    """同名防重两函数：register_new_files.py 内联副本必须与正本逐例同判
+    （与 should_ingest_raw_key 同一 AST 对拍机制）。"""
+    from opensearch_pipeline.ingest_policy import raw_key_stem, stem_twin_action
+
+    ns = _load_register_fallback_ns()
+    fb_stem = ns.get("raw_key_stem")
+    fb_action = ns.get("stem_twin_action")
+    assert fb_stem and fb_action, "内联 fallback 缺 raw_key_stem/stem_twin_action"
+
+    keys = [
+        "raw/production_injection/FL-ZS-WI-005《注塑收货报检》.pdf",
+        "raw/production_injection/FL-ZS-WI-005《注塑收货报检》.docx",
+        "raw/hr/A1员工行为管理标准.docx",
+        "raw/admin/a.b.docx", "raw/admin/无扩展名", "raw/admin/报告.PDF",
+        "raw/hr/年假规定 .docx", "raw/x/.DS_Store", "员工手册.docx", "", "raw/admin/",
+    ]
+    for key in keys:
+        assert raw_key_stem(key) == fb_stem(key), f"raw_key_stem 分歧 key={key}"
+
+    existing = {"A1员工行为管理标准": {"hr", "admin"}, "注塑收货报检": {"production"}}
+    cases = [
+        ("hr", "A1员工行为管理标准"), ("HR", "A1员工行为管理标准"),
+        ("marketing", "A1员工行为管理标准"), ("production", "注塑收货报检"),
+        ("supply", "注塑收货报检"), ("admin", "新文档"),
+        ("", "A1员工行为管理标准"), ("hr", ""),
+    ]
+    for dept, stem in cases:
+        assert stem_twin_action(dept, stem, existing) == fb_action(dept, stem, existing), \
+            f"stem_twin_action 分歧 dept={dept} stem={stem}"
+
+
+def test_ingest_policy_rev_in_sync():
+    """INGEST_POLICY_REV 两侧一致：正本常量 vs register_new_files.py 模块级赋值
+    （节点日志靠它核对线上策略版本，单边 bump 等于核对失效）。"""
+    import ast
+
+    from opensearch_pipeline.ingest_policy import INGEST_POLICY_REV
+
+    tree = ast.parse(open(_register_src_path(), encoding="utf-8").read())
+    register_rev = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "INGEST_POLICY_REV":
+                    register_rev = ast.literal_eval(node.value)
+    assert register_rev == INGEST_POLICY_REV, (
+        f"策略版本漂移: 正本={INGEST_POLICY_REV} register={register_rev}")
