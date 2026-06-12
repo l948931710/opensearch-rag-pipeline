@@ -92,6 +92,15 @@ def build_qa_log_kwargs(
     与 qa_logger.log_qa_session 的参数缺省一致）。
 
     chunks 语义：None = 检索未完成（命中数/分数全 None）；[] = NO_RESULT（命中数 0）。
+
+    answer_status 词表（语料排查按此分桶）：
+      SUCCESS   — 正常回答
+      REFUSAL   — 拒答型（检索有候选但 LLM 按护栏拒答，is_refusal_answer 判定；
+                  客户端同样显示"未找到"）→ 语料弱 / 检索未召回
+      NO_RESULT — 检索为空 → 语料缺，补文档的直接信号
+      LLM_ERROR — 生成异常（error_message 带 trace_id）
+    注意：入史策略（should_append_history）按翻转前的原状态判定 —— REFUSAL 只改
+    落库标签，不改变"拒答照旧入史"的既有行为。
     """
     return dict(
         session_id=session_id,

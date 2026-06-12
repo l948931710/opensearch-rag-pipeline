@@ -86,7 +86,9 @@ def bucketize(rows):
         band = _score_band(r["top_score"])
         if r["answer_status"] in ("LLM_ERROR", "RETRIEVAL_ERROR"):
             b["B4_errors"].append(r)
-        elif r["answer_status"] == "NO_RESULT":
+        elif r["answer_status"] in ("NO_RESULT", "REFUSAL"):
+            # NO_RESULT=检索空（缺语料）；REFUSAL=有候选但拒答（语料弱/未召回）——
+            # 都是语料缺口信号，同入 B3（2026-06-12 起拒答型不再混在 SUCCESS 里）
             b["B3_no_result"].append(r)
         elif negative and band in ("low", "medium", "unknown"):
             b["B1_lowscore_negative"].append(r)

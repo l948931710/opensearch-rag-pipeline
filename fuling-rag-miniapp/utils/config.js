@@ -4,8 +4,8 @@
 // 1. 本机起后端：RAG_ENV=test RAG_RERANK_ENABLE=true uvicorn opensearch_pipeline.api:app --port 8000
 // 2. 钉钉 IDE → 详情/设置 勾选「不校验安全域名」
 // 3. 把下面 DEV 置 true（提交/构建前改回 false）
-const DEV = false;
-const DEV_BASE_URL = 'http://127.0.0.1:8000';
+const DEV = true; // ← 真机预览联调中（构建/上传/提交前必须改回 false）
+const DEV_BASE_URL = 'http://10.0.0.87:8000'; // 电脑局域网 IP（手机需同 WiFi）
 
 // ── 生产 ──
 // TODO(developer): SSL 重做完成后替换为真实 HTTPS 域名。

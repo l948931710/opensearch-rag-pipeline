@@ -1092,3 +1092,50 @@ def test_ask_success_has_empty_rephrase(client, monkeypatch):
     r = client.post("/api/ask", json={"question": "U8怎么登录"})
     assert r.status_code == 200
     assert r.json()["rephrase"] == []
+
+
+# ── 落库溯源：REFUSAL 分桶 + thinking 模型后缀 ───────────────────────
+
+def test_ask_refusal_logged_as_refusal(client, monkeypatch):
+    """拒答型（检索有候选但 LLM 拒答）落库标 REFUSAL —— 与 NO_RESULT（检索空）分桶。"""
+    import opensearch_pipeline.api as api
+    from opensearch_pipeline.answer_flow import NO_RESULT_MESSAGE
+    monkeypatch.setattr(api, "retrieve_and_enrich",
+                        lambda q, **kw: [{"chunk_text": "弱相关", "title": "t", "score": 3.0}])
+    monkeypatch.setattr(api, "generate_answer",
+                        lambda q, c, **kw: {"answer": NO_RESULT_MESSAGE, "sources": [], "model": "m", "usage": {}})
+    captured = {}
+    monkeypatch.setattr(api, "log_qa_session", lambda **kw: captured.update(kw))
+    r = client.post("/api/ask", json={"question": "某个语料很弱的问题"})
+    assert r.status_code == 200
+    assert r.json()["no_result"] is True          # 客户端契约不变
+    assert captured["answer_status"] == "REFUSAL"  # 落库可分桶
+
+
+def test_ask_success_logged_as_success(client, monkeypatch):
+    import opensearch_pipeline.api as api
+    monkeypatch.setattr(api, "retrieve_and_enrich",
+                        lambda q, **kw: [{"chunk_text": "x", "title": "t", "score": 9.0}])
+    monkeypatch.setattr(api, "generate_answer",
+                        lambda q, c, **kw: {"answer": "正常的步骤回答", "sources": [], "model": "m", "usage": {}})
+    captured = {}
+    monkeypatch.setattr(api, "log_qa_session", lambda **kw: captured.update(kw))
+    r = client.post("/api/ask", json={"question": "U8怎么登录"})
+    assert r.status_code == 200
+    assert captured["answer_status"] == "SUCCESS"
+
+
+def test_ask_thinking_model_suffix(client, monkeypatch):
+    """深思请求：model 带 +thinking 后缀（响应与落库同值，便于分组分析）。"""
+    import opensearch_pipeline.api as api
+    monkeypatch.setattr(api, "retrieve_and_enrich",
+                        lambda q, **kw: [{"chunk_text": "x", "title": "t", "score": 9.0}])
+    monkeypatch.setattr(api, "generate_answer_via_stream",
+                        lambda q, c, **kw: {"answer": "深思答案", "sources": [], "model": "qwen-x", "usage": {}})
+    captured = {}
+    monkeypatch.setattr(api, "log_qa_session", lambda **kw: captured.update(kw))
+    r = client.post("/api/ask", json={"question": "复杂问题", "thinking": True})
+    assert r.status_code == 200
+    assert r.json()["model"] == "qwen-x+thinking"
+    assert captured["model_name"] == "qwen-x+thinking"
+    assert captured["answer_status"] == "SUCCESS"

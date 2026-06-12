@@ -422,6 +422,9 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
                 pure_text=req.pure_text,
                 thinking=True,
             )
+            # 深思标记进 model 名（响应与落库同值）：qa_session_log 无独立列，
+            # "+thinking" 后缀让后续成本/质量分析能按模式分组（LIKE '%+thinking'）。
+            result["model"] = f"{result.get('model') or ''}+thinking"
         else:
             result = generate_answer(
                 req.question,
@@ -478,7 +481,9 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
     resp_no_result = is_refusal_answer(answer_out)   # 拒答形态（可伴随弱相关来源）
     resp_guard = is_low_confidence_band(chunks)      # 不依赖 RAG_LOW_CONFIDENCE_GUARD 开关
 
-    # 5. 落库
+    # 5. 落库。拒答型回答（检索有候选但 LLM 按护栏拒答）标 REFUSAL，与 NO_RESULT
+    #    （检索为空，前面已 return）分桶 —— 语料排查一句 SQL 区分「缺语料」vs
+    #    「语料弱/未召回」。入史策略不变（拒答照旧入史，只改落库状态）。
     log_qa_session(**build_qa_log_kwargs(
         session_id=session_id,
         message_id=msg_id,
@@ -491,6 +496,7 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
         latency_ms=latency,
         retrieval_latency_ms=retrieval_latency_ms,
         llm_latency_ms=llm_latency_ms,
+        answer_status="REFUSAL" if resp_no_result else "SUCCESS",
         model_name=result.get("model"),
         content_blocks_json=content_blocks_to_json(blocks) if blocks else None,
     ))
@@ -642,6 +648,11 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
             # 统一策略：仅非空 SUCCESS 回答入史 —— 出错前的半截回答不再污染后续轮次上下文
             if should_append_history(full_answer, answer_status):
                 _append_to_history(session_id, req.question, full_answer)
+            # 拒答型标 REFUSAL（入史判定在上面、用原状态 —— 历史策略不变）；深思加 model 后缀
+            if answer_status == "SUCCESS" and is_refusal_answer(full_answer):
+                answer_status = "REFUSAL"
+            if req.thinking and model_name:
+                model_name = f"{model_name}+thinking"
             log_qa_session(**build_qa_log_kwargs(
                 session_id=session_id,
                 message_id=message_id,

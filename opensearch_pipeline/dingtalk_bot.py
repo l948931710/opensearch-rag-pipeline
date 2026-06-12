@@ -28,7 +28,6 @@ from typing import Any, Dict, List, Optional
 import requests as http_requests
 from fastapi import APIRouter, Request, HTTPException
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
 
 from opensearch_pipeline.content_blocks_builder import (
     refresh_image_block_urls,
@@ -51,11 +50,11 @@ from opensearch_pipeline.answer_flow import (
     DEFAULT_TEMPERATURE,
     NO_RESULT_MESSAGE,
     build_qa_log_kwargs,
+    is_refusal_answer,
     should_append_history,
 )
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
-    update_card_feedback_status,
     update_card_data,
     create_streaming_card,
     streaming_update_card,
@@ -470,6 +469,11 @@ def _stream_answer_to_card(
     if should_append_history(full_answer, answer_status):
         append_to_history(session_key, question, full_answer)
 
+    # 拒答型标 REFUSAL（与 NO_RESULT=检索空分桶）。必须在入史判定【之后】翻转 ——
+    # 拒答照旧入史，只改落库状态，历史策略不变。
+    if answer_status == "SUCCESS" and is_refusal_answer(full_answer):
+        answer_status = "REFUSAL"
+
     log_qa_session(**build_qa_log_kwargs(
         session_id=session_key,
         message_id=message_id,
@@ -593,7 +597,8 @@ def _process_rag_query(
         content_blocks = [] if pure_text else build_content_blocks(result["answer"], chunks)
         content_blocks_json_str = content_blocks_to_json(content_blocks)
 
-        # 5. 落库（包含 content_blocks_json 供回调重建）
+        # 5. 落库（包含 content_blocks_json 供回调重建）。拒答型标 REFUSAL
+        #    （入史在步骤 3、用原状态判定 —— 历史策略不变）
         log_qa_session(**build_qa_log_kwargs(
             session_id=session_key,
             message_id=message_id,
@@ -607,6 +612,7 @@ def _process_rag_query(
             latency_ms=latency_ms,
             retrieval_latency_ms=retrieval_latency_ms,
             llm_latency_ms=llm_latency_ms,
+            answer_status="REFUSAL" if is_refusal_answer(result["answer"]) else "SUCCESS",
             model_name=result.get("model"),
             conversation_type=conversation_type,
             content_blocks_json=content_blocks_json_str,
