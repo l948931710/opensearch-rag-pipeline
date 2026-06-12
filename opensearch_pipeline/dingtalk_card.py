@@ -181,8 +181,6 @@ def _format_sources_text(sources: List[Dict[str, Any]], *, style: str = "numbere
     return "\n".join(lines)
 
 
-import re
-
 # 匹配 LLM 在 answer 末尾追加的参考来源段落标题
 _TRAILING_SOURCES_PATTERN = re.compile(
     r'\n\s*[-—─]{2,}\s*\n'              # --- 分隔线 + 后续内容
@@ -298,10 +296,17 @@ def _assemble_delivery_payload(
         card_param_map["message_id"] = out_track_id
         private_data = {}
 
+    # 回调通道路由：Stream 客户端在运行 → callbackType=STREAM（按钮点击经出站 WSS
+    # 推回本服务，免公网回调端点）；否则维持 HTTP + callbackRouteKey。必须实测客户端
+    # 在跑才切 STREAM——开关开了但客户端没起来时，STREAM 卡片的按钮点击会丢失。
+    # 延迟导入：dingtalk_stream_runner 启动时反向导入 dingtalk_bot（→ 本模块），避免环。
+    from opensearch_pipeline.dingtalk_stream_runner import is_stream_active, stream_mode_enabled
+    use_stream_callback = stream_mode_enabled() and is_stream_active()
+
     payload: Dict[str, Any] = {
         "cardTemplateId": template_id,
         "outTrackId": out_track_id,
-        "callbackType": "HTTP",
+        "callbackType": "STREAM" if use_stream_callback else "HTTP",
         "userIdType": 1,
         "cardData": {"cardParamMap": card_param_map},
         "openSpaceId": open_space_id,
@@ -309,7 +314,7 @@ def _assemble_delivery_payload(
 
     if private_data:
         payload["privateData"] = private_data
-    if callback_route_key:
+    if callback_route_key and not use_stream_callback:
         payload["callbackRouteKey"] = callback_route_key
 
     # 投放模型（区分单聊/群聊）

@@ -26,6 +26,7 @@ production = [
     "oss2>=2.18",
     "dashscope>=1.14",
     "alibabacloud-ha3engine-vector>=1.1.18",
+    "dingtalk-stream>=0.24",
 ]
 dev = [
     "pytest>=8.0",

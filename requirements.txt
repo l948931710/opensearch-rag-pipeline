@@ -21,3 +21,7 @@ opensearch-py>=2.4
 oss2>=2.18
 dashscope>=1.14
 alibabacloud-ha3engine-vector>=1.1.18
+
+# DingTalk Stream 模式（出站 WSS 收机器人消息/卡片回调，免公网回调端点；
+# 由 DINGTALK_STREAM_MODE=true 启用，见 dingtalk_stream_runner.py）
+dingtalk-stream>=0.24
