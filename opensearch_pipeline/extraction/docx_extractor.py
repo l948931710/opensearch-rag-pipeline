@@ -118,13 +118,14 @@ def extract_docx(
             if child.tag.endswith('p'):
                 para = Paragraph(child, parent)
                 text = para.text.strip()
-                if not text:
+                tb_texts = _textbox_texts(child)
+                if not text and not tb_texts:
                     continue
 
                 style_name = para.style.name if para.style else "Normal"
-                heading_level = _detect_heading_level(style_name, text)
+                heading_level = _detect_heading_level(style_name, text) if text else None
 
-                if heading_level is not None:
+                if text and heading_level is not None:
                     current_section_ref[0] = text
                     extracted.append(ExtractedBlock(
                         block_type="heading",
@@ -134,13 +135,22 @@ def extract_docx(
                         source="native",
                         extra={"word_style": style_name},
                     ))
-                else:
+                elif text:
                     extracted.append(ExtractedBlock(
                         block_type="paragraph",
                         text=text,
                         section_path=current_section_ref[0],
                         source="native",
                         extra={"word_style": style_name},
+                    ))
+                # 文本框内容（para.text 不含）→ 独立 paragraph block
+                for tb in tb_texts:
+                    extracted.append(ExtractedBlock(
+                        block_type="paragraph",
+                        text=tb,
+                        section_path=current_section_ref[0],
+                        source="native",
+                        extra={"word_style": style_name, "from_textbox": True},
                     ))
             elif child.tag.endswith('tbl'):
                 table = Table(child, parent)
@@ -153,7 +163,7 @@ def extract_docx(
                     for row in table.rows:
                         cells = []
                         for cell in row.cells:
-                            cell_text = cell.text.strip()
+                            cell_text = _cell_text_with_textboxes(cell)
                             if cell_text:
                                 cells.append(cell_text)
                         if cells:
@@ -246,6 +256,47 @@ def _find_image_rel_ids(para_element) -> List[str]:
                 rel_ids.append(rid)
 
     return rel_ids
+
+
+def _textbox_texts(para_element) -> List[str]:
+    """收集段落/单元格元素内全部文本框（w:txbxContent）的文字。
+
+    para.text / cell.text（python-docx）只拼接直属 run 的文字——锚定在段落里的
+    文本框内容整段静默丢失。富岭 SOP 大量用文本框写步骤说明（FL-XS-WI-005
+    实证：72 个文本框，"在电脑桌面打开U8/输入密码登录"等关键步骤全在框内，
+    pdf 渲染可见而 docx 抽取为空，造成转换孪生"pdf 独有内容"假象 — 2026-06-12）。
+
+    注意：
+    - DrawingML（wps:txbx）与 VML 回退（v:textbox）各包一份相同的 w:txbxContent
+      （mc:AlternateContent 的 Choice/Fallback 双份）→ 按文本去重；
+    - 纯圈号/单字符标注框（"④"箭头标签类）是版面视觉标注，不入正文。
+    """
+    import re as _re
+    texts: List[str] = []
+    seen = set()
+    for txbx in para_element.iter(f"{{{_NSMAP_W}}}txbxContent"):
+        lines = []
+        for p in txbx.iter(f"{{{_NSMAP_W}}}p"):
+            line = "".join(t.text or "" for t in p.iter(f"{{{_NSMAP_W}}}t")).strip()
+            if line:
+                lines.append(line)
+        s = "\n".join(lines).strip()
+        if not s or s in seen:
+            continue
+        if _re.fullmatch(r"[①-⑳\s　]{1,2}", s):
+            continue
+        seen.add(s)
+        texts.append(s)
+    return texts
+
+
+def _cell_text_with_textboxes(cell) -> str:
+    """单元格文字 + 框内文字（cell.text 不含文本框）。"""
+    cell_text = cell.text.strip()
+    tb = _textbox_texts(cell._tc)
+    if tb:
+        cell_text = "\n".join(x for x in [cell_text] + tb if x).strip()
+    return cell_text
 
 
 def _has_images(para_element) -> bool:
@@ -349,6 +400,16 @@ def extract_docx_with_images(
                         extra={"word_style": style_name},
                     ))
 
+            # 文本框内容（para.text 不含，w:txbxContent）→ 独立 paragraph block
+            for tb in _textbox_texts(child):
+                blocks.append(ExtractedBlock(
+                    block_type="paragraph",
+                    text=tb,
+                    section_path=current_section,
+                    source="native",
+                    extra={"word_style": style_name, "from_textbox": True},
+                ))
+
             # 再处理图片引用（如果有）
             if has_img:
                 rel_ids = _find_image_rel_ids(child)
@@ -416,6 +477,15 @@ def extract_docx_with_images(
                                     extra={"word_style": sub_style},
                                 ))
 
+                        for tb in _textbox_texts(sub_child):
+                            blocks.append(ExtractedBlock(
+                                block_type="paragraph",
+                                text=tb,
+                                section_path=current_section,
+                                source="native",
+                                extra={"word_style": sub_style, "from_textbox": True},
+                            ))
+
                         if sub_has_img:
                             sub_rel_ids = _find_image_rel_ids(sub_child)
                             if not sub_rel_ids:
@@ -445,7 +515,7 @@ def extract_docx_with_images(
                 for row in table.rows:
                     cells = []
                     for cell in row.cells:
-                        cell_text = cell.text.strip()
+                        cell_text = _cell_text_with_textboxes(cell)
                         if cell_text:
                             cells.append(cell_text)
                     if cells:

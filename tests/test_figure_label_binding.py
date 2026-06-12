@@ -217,3 +217,31 @@ def test_step_like_heading_does_not_pollute_section():
     assert "1.3" not in (step2.section_title or ""), \
         f"步骤型标题渗透为 section_title: {step2.section_title!r}"
     assert (step2.section_title or "").startswith("三、"), step2.section_title
+
+
+# ──────────────────────── DOCX 文本框抽取（w:txbxContent）────────────────────────
+
+def test_docx_textbox_texts_extraction():
+    """para.text 不含文本框文字；_textbox_texts 应取回，并对 AlternateContent
+    的 Choice/Fallback 双份去重、丢弃纯圈号标注框（FL-XS-WI-005 实证缺口）。"""
+    from lxml import etree
+    from opensearch_pipeline.extraction.docx_extractor import _textbox_texts
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xml = f'''<w:p xmlns:w="{W}">
+      <w:r><w:t>锚段落自身文字</w:t></w:r>
+      <w:r><w:drawing>
+        <w:txbxContent>
+          <w:p><w:r><w:t>在电脑桌面打开U8</w:t></w:r></w:p>
+          <w:p><w:r><w:t>输入密码登录</w:t></w:r></w:p>
+        </w:txbxContent>
+        <w:txbxContent>
+          <w:p><w:r><w:t>在电脑桌面打开U8</w:t></w:r></w:p>
+          <w:p><w:r><w:t>输入密码登录</w:t></w:r></w:p>
+        </w:txbxContent>
+      </w:drawing></w:r>
+      <w:r><w:drawing><w:txbxContent>
+        <w:p><w:r><w:t>④</w:t></w:r></w:p>
+      </w:txbxContent></w:drawing></w:r>
+    </w:p>'''
+    texts = _textbox_texts(etree.fromstring(xml))
+    assert texts == ["在电脑桌面打开U8\n输入密码登录"], texts
