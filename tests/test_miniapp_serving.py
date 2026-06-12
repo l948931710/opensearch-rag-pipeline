@@ -739,3 +739,356 @@ def test_low_confidence_band_vs_guard_flag():
     assert G.is_low_confidence_band([{"score": 0.85, "rerank_score": 0.85}]) is False
     assert G.is_low_confidence_band([]) is False
     assert G._is_low_confidence(weak) is False   # RAG_LOW_CONFIDENCE_GUARD 默认 off
+
+
+# ── /api/resign-images（过期图重签 · 白名单防任意 OSS 读取） ──────────
+
+def test_resign_images_whitelist(client, monkeypatch):
+    import opensearch_pipeline.oss_url as oss_url
+    monkeypatch.setattr(oss_url, "generate_signed_url",
+                        lambda key, expires=None, method="GET": "https://fresh/" + key)
+    legit = "processing/assets/admin/DOC1/v2/img_001.png"
+    r = client.post("/api/resign-images", json={"oss_keys": [
+        legit,
+        "raw/admin/秘密文档.docx",                      # 前缀外：原始文档
+        "processing/assets/../raw/x.png",               # 路径穿越
+        "processing/assets/admin/DOC1/v2/file.pdf",     # 非图片扩展名
+    ]})
+    assert r.status_code == 200
+    urls = r.json()["urls"]
+    assert urls[legit] == "https://fresh/" + legit
+    assert urls["raw/admin/秘密文档.docx"] == ""
+    assert urls["processing/assets/../raw/x.png"] == ""
+    assert urls["processing/assets/admin/DOC1/v2/file.pdf"] == ""
+
+
+def test_resign_images_sign_failure_fail_open(client, monkeypatch):
+    import opensearch_pipeline.oss_url as oss_url
+    def _boom(key, expires=None, method="GET"):
+        raise RuntimeError("oss down")
+    monkeypatch.setattr(oss_url, "generate_signed_url", _boom)
+    r = client.post("/api/resign-images",
+                    json={"oss_keys": ["processing/assets/a/b/v1/c.png"]})
+    assert r.status_code == 200
+    assert r.json()["urls"]["processing/assets/a/b/v1/c.png"] == ""
+
+
+def test_resign_images_batch_cap(client):
+    keys = [f"processing/assets/a/b/v1/{i}.png" for i in range(11)]
+    r = client.post("/api/resign-images", json={"oss_keys": keys})
+    assert r.status_code == 422  # max_length=10
+
+
+# ── /api/history（仅本人 · 强制鉴权） ────────────────────────────────
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+        self.executed = None
+
+    def execute(self, sql, params=None):
+        self.executed = (sql, params)
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def cursor(self):
+        return _FakeCursor(self._rows)
+
+    def close(self):
+        pass
+
+
+def test_history_requires_token(client):
+    assert client.get("/api/history").status_code == 401
+
+
+def test_history_returns_own_rows_marker_stripped(client, monkeypatch):
+    import opensearch_pipeline.api as api
+    import opensearch_pipeline.pipeline_nodes as pn
+    rows = [
+        ("m1", "U8怎么登录", "看这张图<<IMG:1>>操作", '[{"type":"text","format":"plain","text":"看这张图"}]',
+         "2026-06-12 09:46:23", "SUCCESS"),
+        ("m2", "报销标准", None, None, "2026-06-11 08:00:00", "NO_RESULT"),
+    ]
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _FakeConn(rows))
+    monkeypatch.setattr(api, "refresh_image_block_urls", lambda j, url_expires=None: j)
+    token = auth_token.issue_session_token("U7", dept="行政部", name="李四")
+    r = client.get("/api/history", headers={"Authorization": "Bearer " + token})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["has_more"] is False
+    assert len(body["items"]) == 2
+    first = body["items"][0]
+    assert first["question"] == "U8怎么登录"
+    assert "<<IMG:" not in first["answer"]          # 占位符必须剥离
+    assert first["blocks"] and first["blocks"][0]["type"] == "text"
+    assert body["items"][1]["status"] == "NO_RESULT"
+
+
+def test_history_query_scoped_to_token_user(client, monkeypatch):
+    import opensearch_pipeline.pipeline_nodes as pn
+    captured = {}
+
+    class _SpyCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            captured["params"] = params
+            super().execute(sql, params)
+
+    class _SpyConn(_FakeConn):
+        def cursor(self):
+            return _SpyCursor(self._rows)
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _SpyConn([]))
+    token = auth_token.issue_session_token("U-OWNER")
+    r = client.get("/api/history?limit=5&offset=10",
+                   headers={"Authorization": "Bearer " + token})
+    assert r.status_code == 200
+    # 查询参数必须绑定令牌身份（绝不来自 query string）+ limit+1 取 has_more
+    assert captured["params"] == ("U-OWNER", 6, 10)
+
+
+# ── /api/hot-questions（猜你想问 · 缓存与兜底） ──────────────────────
+
+def _reset_hot_cache():
+    import opensearch_pipeline.api as api
+    api._hot_questions_cache["ts"] = 0.0
+    api._hot_questions_cache["data"] = None
+
+
+def test_hot_questions_db_down_falls_back(client, monkeypatch):
+    import opensearch_pipeline.pipeline_nodes as pn
+    _reset_hot_cache()
+
+    def _boom():
+        raise RuntimeError("rds down")
+    monkeypatch.setattr(pn, "_get_db_conn", _boom)
+    r = client.get("/api/hot-questions")
+    assert r.status_code == 200
+    qs = r.json()["questions"]
+    assert len(qs) >= 3 and "U8+ 如何登录？" in qs
+
+
+def test_hot_questions_filters_and_caches(client, monkeypatch):
+    import opensearch_pipeline.pipeline_nodes as pn
+    _reset_hot_cache()
+    rows = [("U8怎么登录", 9), ("新会话", 8), ("请假流程", 5),
+            ("访客WiFi密码", 4), ("打印机怎么连", 3), ("模具保养周期", 3),
+            ("考勤怎么补卡", 2), ("饭卡充值", 2)]
+    calls = {"n": 0}
+
+    def _conn():
+        calls["n"] += 1
+        return _FakeConn(rows)
+    monkeypatch.setattr(pn, "_get_db_conn", _conn)
+
+    r1 = client.get("/api/hot-questions")
+    qs = r1.json()["questions"]
+    assert "新会话" not in qs            # 控制指令不入热门
+    assert qs[0] == "U8怎么登录" and len(qs) == 6   # 截到 6 条
+    r2 = client.get("/api/hot-questions")
+    assert r2.json()["questions"] == qs
+    assert calls["n"] == 1               # 第二次命中进程内缓存
+
+
+# ── 深度思考（thinking）：默认关闭 · 路由 · 攒流收集器 ────────────────
+
+def test_ask_default_thinking_off(client, monkeypatch):
+    """不带 thinking 字段 → 走非流式 generate_answer，绝不触发思考路径。"""
+    import opensearch_pipeline.api as api
+    monkeypatch.setattr(api, "retrieve_and_enrich",
+                        lambda q, **kw: [{"chunk_text": "x", "title": "t", "score": 9.0}])
+
+    called = {}
+
+    def fake_generate(q, chunks, **kw):
+        called["kw"] = kw
+        return {"answer": "答案", "sources": [], "model": "m", "usage": {}}
+
+    def must_not_call(*a, **kw):
+        raise AssertionError("默认请求绝不能走思考攒流路径")
+
+    monkeypatch.setattr(api, "generate_answer", fake_generate)
+    monkeypatch.setattr(api, "generate_answer_via_stream", must_not_call)
+    r = client.post("/api/ask", json={"question": "U8怎么登录"})
+    assert r.status_code == 200
+    # generate_answer 不带 thinking 参数 → enable_thinking 取全局配置（默认 False）
+    assert "thinking" not in called["kw"]
+
+
+def test_ask_thinking_routes_via_stream_collector(client, monkeypatch):
+    """thinking=true → 走 generate_answer_via_stream（流式攒流），且放宽 max_tokens。"""
+    import opensearch_pipeline.api as api
+    monkeypatch.setattr(api, "retrieve_and_enrich",
+                        lambda q, **kw: [{"chunk_text": "x", "title": "t", "score": 9.0}])
+
+    called = {}
+
+    def fake_via_stream(q, chunks, **kw):
+        called["kw"] = kw
+        return {"answer": "深思后的答案", "sources": [], "model": "m", "usage": {"total_tokens": 1}}
+
+    def must_not_call(*a, **kw):
+        raise AssertionError("thinking 请求不能走非流式 generate_answer")
+
+    monkeypatch.setattr(api, "generate_answer_via_stream", fake_via_stream)
+    monkeypatch.setattr(api, "generate_answer", must_not_call)
+    r = client.post("/api/ask", json={"question": "年终奖如何划分", "thinking": True})
+    assert r.status_code == 200
+    assert r.json()["answer"] == "深思后的答案"
+    assert called["kw"]["thinking"] is True
+    assert called["kw"]["max_tokens"] >= 4096  # 思考挤占 token 预算防截断
+
+
+def test_generate_answer_via_stream_collects(monkeypatch):
+    """攒流收集器：chunk 拼接 + sources/model/usage 提取 + [文档N] 清洗。"""
+    import json as _json
+    from opensearch_pipeline import llm_generator as lg
+
+    frames = [
+        "data: " + _json.dumps({"type": "sources", "sources": [{"title": "T", "doc_id": "d"}]},
+                               ensure_ascii=False) + "\n\n",
+        "data: " + _json.dumps({"type": "chunk", "content": "第一步"}, ensure_ascii=False) + "\n\n",
+        "data: " + _json.dumps({"type": "chunk", "content": "[文档1]登录"}, ensure_ascii=False) + "\n\n",
+        "data: " + _json.dumps({"type": "done", "model": "qwen-x", "usage": {"total_tokens": 7}},
+                               ensure_ascii=False) + "\n\n",
+        "data: [DONE]\n\n",
+    ]
+
+    captured = {}
+
+    def fake_stream(q, chunks, **kw):
+        captured["kw"] = kw
+        for f in frames:
+            yield f
+
+    monkeypatch.setattr(lg, "generate_answer_stream", fake_stream)
+    result = lg.generate_answer_via_stream("q", [], thinking=True)
+    assert captured["kw"]["thinking"] is True
+    assert result["answer"] == "第一步登录"     # 拼接 + [文档N] 已清洗
+    assert result["sources"] == [{"title": "T", "doc_id": "d"}]
+    assert result["model"] == "qwen-x"
+    assert result["usage"] == {"total_tokens": 7}
+
+
+def test_stream_payload_thinking_override(monkeypatch):
+    """generate_answer_stream 的 enable_thinking：None→全局(False)，True→逐次覆盖。"""
+    from types import SimpleNamespace
+    from opensearch_pipeline import llm_generator as lg
+
+    cfg = SimpleNamespace(
+        llm=SimpleNamespace(api_key="k", api_base_url="https://x/v1",
+                            model="m", enable_thinking=False),
+        rag=SimpleNamespace(pure_text=True, low_confidence_guard=False),
+    )
+    monkeypatch.setattr(lg, "get_config", lambda: cfg)
+
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self, decode_unicode=True):
+            return iter(["data: [DONE]"])
+
+    def fake_post(url, json=None, headers=None, timeout=None, stream=False):
+        captured["payload"] = json
+        return _Resp()
+
+    monkeypatch.setattr(lg.requests, "post", fake_post)
+
+    list(lg.generate_answer_stream("q", [], thinking=True))
+    assert captured["payload"]["enable_thinking"] is True
+    list(lg.generate_answer_stream("q", []))
+    assert captured["payload"]["enable_thinking"] is False  # 默认=全局 False
+
+
+# ── NO_RESULT「换个说法」建议（rephrase） ────────────────────────────
+
+def _set_success_pool(monkeypatch, pool):
+    import opensearch_pipeline.api as api
+    api._success_pool_cache["ts"] = 0.0
+    api._success_pool_cache["data"] = None
+    monkeypatch.setattr(api, "_success_question_pool", lambda: pool)
+
+
+def test_rephrase_prefers_similar_success_questions(monkeypatch):
+    import opensearch_pipeline.api as api
+    _set_success_pool(monkeypatch, [
+        "出差报销流程是什么",      # 高重叠（报销/出差）
+        "差旅费报销标准",          # 中重叠
+        "年假有几天",              # 无关
+    ])
+    out = api._suggest_rephrase("出差住宿费怎么报销？")
+    assert "年假有几天" not in out
+    assert out and out[0] in ("出差报销流程是什么", "差旅费报销标准")
+    assert len(out) <= 2
+
+
+def test_rephrase_excludes_self_and_near_duplicate(monkeypatch):
+    import opensearch_pipeline.api as api
+    _set_success_pool(monkeypatch, [
+        "出差住宿费怎么报销？",    # 与原问题逐字相同 —— 推荐它毫无意义
+        "出差住宿费怎么报销",      # 近重复（仅差标点）
+    ])
+    out = api._suggest_rephrase("出差住宿费怎么报销？")
+    assert "出差住宿费怎么报销？" not in out
+    assert "出差住宿费怎么报销" not in out
+
+
+def test_rephrase_fallback_cleans_noise_prefix(monkeypatch):
+    import opensearch_pipeline.api as api
+    _set_success_pool(monkeypatch, [])  # 池为空 → 走清洗回退
+    out = api._suggest_rephrase("请问一下，办公用品怎么申领？")
+    assert out == ["办公用品怎么申领"]
+    # 没有客套前缀、清洗后无变化 → 不硬造建议
+    assert api._suggest_rephrase("办公用品怎么申领") == []
+
+
+def test_rephrase_fail_open(monkeypatch):
+    import opensearch_pipeline.api as api
+
+    def _boom():
+        raise RuntimeError("pool down")
+    monkeypatch.setattr(api, "_success_question_pool", _boom)
+    assert api._suggest_rephrase("任何问题") == []
+
+
+def test_ask_no_result_carries_rephrase(client, monkeypatch):
+    import opensearch_pipeline.api as api
+    monkeypatch.setattr(api, "retrieve_and_enrich", lambda q, **kw: [])  # 检索为空
+    _set_success_pool(monkeypatch, ["出差报销流程是什么"])
+    r = client.post("/api/ask", json={"question": "出差住宿费怎么报销？"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["no_result"] is True
+    assert body["rephrase"] == ["出差报销流程是什么"]
+
+
+def test_ask_success_has_empty_rephrase(client, monkeypatch):
+    import opensearch_pipeline.api as api
+    monkeypatch.setattr(api, "retrieve_and_enrich",
+                        lambda q, **kw: [{"chunk_text": "x", "title": "t", "score": 9.0}])
+    monkeypatch.setattr(api, "generate_answer",
+                        lambda q, c, **kw: {"answer": "正常答案", "sources": [], "model": "m", "usage": {}})
+    r = client.post("/api/ask", json={"question": "U8怎么登录"})
+    assert r.status_code == 200
+    assert r.json()["rephrase"] == []

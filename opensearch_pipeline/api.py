@@ -9,6 +9,7 @@ api.py — RAG 问答 FastAPI 应用
   GET  /api/health        健康检查
 """
 
+import json
 import logging
 import os
 import time
@@ -25,6 +26,7 @@ from pydantic import BaseModel, Field
 from opensearch_pipeline.llm_generator import (
     generate_answer,
     generate_answer_stream,
+    generate_answer_via_stream,
     is_low_confidence_band,
     parse_sse_data_frame,
     strip_doc_citations,
@@ -41,6 +43,7 @@ from opensearch_pipeline.content_blocks_builder import (
     build_content_blocks,
     content_blocks_to_json,
     build_mini_program_blocks,
+    refresh_image_block_urls,
     strip_image_markers,
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
@@ -68,16 +71,24 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """应用生命周期：启动时注册钉钉互动卡片 HTTP 回调地址（若已配置 DINGTALK_CARD_CALLBACK_URL）。
+    """应用生命周期：启动时注册钉钉互动卡片 HTTP 回调地址（若已配置 DINGTALK_CARD_CALLBACK_URL），
+    并按 DINGTALK_STREAM_MODE 启动钉钉 Stream 客户端（出站 WSS 接收机器人消息+卡片回调）。
 
     把本服务的 /dingtalk/card/callback 注册到 callbackRouteKey，使反馈按钮点击可回调。
-    非致命：注册失败只记日志、不阻断启动。多 worker 下每个进程各注册一次（幂等）。
+    Stream 模式开启后 HTTP 注册仍保留：存量卡片（创建时 callbackType=HTTP）的按钮
+    点击仍走 HTTP 路由，双模并存直到旧卡片自然老化。
+    均非致命：失败只记日志、不阻断启动。多 worker 下每个进程各注册一次（幂等）。
     """
     try:
         from opensearch_pipeline.dingtalk_card import register_card_callback
         register_card_callback()
     except Exception:
         logger.warning("启动时注册卡片回调失败（忽略，不影响服务）", exc_info=True)
+    try:
+        from opensearch_pipeline.dingtalk_stream_runner import start_stream_client
+        start_stream_client()
+    except Exception:
+        logger.warning("启动钉钉 Stream 客户端失败（忽略，HTTP 回调模式继续可用）", exc_info=True)
     yield
 
 
@@ -150,6 +161,12 @@ class AskRequest(BaseModel):
         None,
         description="纯文本开关：None 取全局 RAG_PURE_TEXT；True 仅文字回答（不穿插图片）",
     )
+    thinking: Optional[bool] = Field(
+        None,
+        description="深度思考开关（默认关闭）：True 时启用 Qwen3 思考模式，改走流式通道"
+                    "服务端攒流（DashScope qwen3 思考仅流式可用）并放宽 max_tokens"
+                    "（思考挤占 token 预算会截断答案）。显著更慢（约 3-5 倍），逐问生效。",
+    )
 
 
 class SearchRequest(BaseModel):
@@ -188,6 +205,9 @@ class AskResponse(BaseModel):
     # 低置信带：top 检索分 < medium 阈值（llm_generator.is_low_confidence_band，
     # 与 RAG_LOW_CONFIDENCE_GUARD 开关无关）。客户端据此渲染低匹配提示条。
     guard: bool = False
+    # 「换个说法」建议（仅 no_result=True 时非空）：优先近 30 天 SUCCESS 过的相似
+    # 真实问题（可答性有保证），不足回退清洗版原问题。空结果卡的逃生出口。
+    rephrase: List[str] = []
 
 
 class SearchResult(BaseModel):
@@ -386,18 +406,31 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
             usage={},
             latency_ms=latency,
             no_result=True,
+            rephrase=_suggest_rephrase(req.question),
         )
 
-    # 3. LLM 生成
+    # 3. LLM 生成。深度思考（req.thinking）走流式通道服务端攒流：DashScope qwen3
+    #    思考仅流式可用；同时放宽 max_tokens —— 思考挤占 token 预算会截断答案（实测）。
     try:
-        result = generate_answer(
-            req.question,
-            chunks,
-            history=merged_history if merged_history else None,
-            max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS,
-            temperature=req.temperature or DEFAULT_TEMPERATURE,
-            pure_text=req.pure_text,
-        )
+        if req.thinking:
+            result = generate_answer_via_stream(
+                req.question,
+                chunks,
+                history=merged_history if merged_history else None,
+                max_tokens=max(req.max_tokens or DEFAULT_MAX_TOKENS, 4096),
+                temperature=req.temperature or DEFAULT_TEMPERATURE,
+                pure_text=req.pure_text,
+                thinking=True,
+            )
+        else:
+            result = generate_answer(
+                req.question,
+                chunks,
+                history=merged_history if merged_history else None,
+                max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS,
+                temperature=req.temperature or DEFAULT_TEMPERATURE,
+                pure_text=req.pure_text,
+            )
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         logger.error("LLM generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -473,6 +506,7 @@ def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity
         latency_ms=latency,
         no_result=resp_no_result,
         guard=resp_guard,
+        rephrase=_suggest_rephrase(req.question) if resp_no_result else [],
     )
 
 
@@ -557,9 +591,12 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
                     req.question,
                     chunks,
                     history=merged_history if merged_history else None,
-                    max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS,
+                    # 思考挤占 token 预算会截断答案：thinking 时放宽（与 /api/ask 同策略）
+                    max_tokens=(max(req.max_tokens or DEFAULT_MAX_TOKENS, 4096)
+                                if req.thinking else (req.max_tokens or DEFAULT_MAX_TOKENS)),
                     temperature=req.temperature or DEFAULT_TEMPERATURE,
                     pure_text=req.pure_text,
+                    thinking=req.thinking,
                 ):
                     # 截获生成器自带的 [DONE]，改由本函数在 content_blocks 之后统一收尾
                     if event.strip() == "data: [DONE]":
@@ -676,6 +713,311 @@ def session_clear(req: SessionClearRequest,
             raise HTTPException(status_code=403, detail="无权清除该会话")
     cleared = clear_session(req.session_id)
     return {"status": "ok", "cleared": cleared, "session_id": req.session_id}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 小程序辅助接口：过期图重签 / 历史问答 / 猜你想问
+# ═══════════════════════════════════════════════════════════════
+
+# 重签白名单：仅 ingestion 上传的抽取图片（pipeline_nodes._upload_clean_assets 的
+# key 规则 processing/assets/{dept}/{doc_id}/v{n}/{file}）+ 图片扩展名。
+# 本接口绝不能变成任意 OSS 对象读取器 —— raw/ 下是未脱敏原始文档。
+_RESIGN_ALLOWED_PREFIX = "processing/assets/"
+_RESIGN_ALLOWED_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+class ResignImagesRequest(BaseModel):
+    oss_keys: List[str] = Field(
+        ..., min_length=1, max_length=10,
+        description="待重签的图片 oss_key 列表（来自 blocks[].oss_key）",
+    )
+
+
+@app.post("/api/resign-images")
+def resign_images(req: ResignImagesRequest):
+    """过期图片重签：OSS 签名 URL 默认 1 小时过期，客户端凭 blocks 里的
+    oss_key 换取新签名 URL（「图片已过期 · 点按重新加载」的真实后半段）。
+
+    单 key 失败/非法不影响其它 key（返回空串，客户端保留过期占位态）。
+    """
+    from opensearch_pipeline.oss_url import generate_signed_url
+
+    urls: Dict[str, str] = {}
+    for raw_key in req.oss_keys:
+        key = (raw_key or "").strip()
+        if not key:
+            continue
+        allowed = (
+            key.startswith(_RESIGN_ALLOWED_PREFIX)
+            and key.lower().endswith(_RESIGN_ALLOWED_EXT)
+            and ".." not in key
+        )
+        if not allowed:
+            logger.warning("resign-images 拒绝白名单外 key: %r", key[:128])
+            urls[key] = ""
+            continue
+        try:
+            urls[key] = generate_signed_url(key)
+        except Exception:
+            logger.warning("resign-images 签名失败: %s", key, exc_info=True)
+            urls[key] = ""
+    return {"urls": urls}
+
+
+class HistoryItem(BaseModel):
+    message_id: str
+    question: str
+    answer: str = ""
+    blocks: List[Dict[str, Any]] = []
+    created_at: str = ""
+    status: str = ""  # SUCCESS / NO_RESULT / LLM_ERROR
+
+
+class HistoryResponse(BaseModel):
+    items: List[HistoryItem]
+    has_more: bool = False
+
+
+@app.get("/api/history", response_model=HistoryResponse)
+def history(
+    limit: int = 20,
+    offset: int = 0,
+    identity: Optional[Identity] = Depends(current_identity),
+):
+    """历史问答（仅本人）：按 Bearer 令牌身份查 qa_session_log。
+
+    强制鉴权 —— user_id 是查询主键，匿名无从归属（也防扫他人记录）。
+    blocks 经 refresh_image_block_urls 重签，历史里的图文答案可直接渲染；
+    answer 字段已剥离 <<IMG:N>> 占位符（落库保留原始 answer 的约定不变）。
+    """
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="历史记录需要登录后查看")
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+
+    from opensearch_pipeline.qa_logger import _op_db
+
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT message_id, query_text, answer_text, content_blocks_json,
+                           created_at, answer_status
+                    FROM {_op_db()}.qa_session_log
+                    WHERE user_id = %s AND query_text IS NOT NULL AND query_text != ''
+                    ORDER BY id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (identity.user_id, limit + 1, offset),
+                )
+                rows = cursor.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("history 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"历史记录查询失败 (trace: {trace_id})")
+
+    has_more = len(rows) > limit
+    items: List[HistoryItem] = []
+    for row in rows[:limit]:
+        message_id, question, answer_text, blocks_json, created_at, status = row
+        blocks: List[Dict[str, Any]] = []
+        if blocks_json:
+            try:
+                blocks = json.loads(refresh_image_block_urls(
+                    blocks_json if isinstance(blocks_json, str)
+                    else json.dumps(blocks_json, ensure_ascii=False)
+                ))
+            except Exception:
+                blocks = []  # 重签/解析失败退回纯文字（fail open）
+        items.append(HistoryItem(
+            message_id=message_id or "",
+            question=question or "",
+            answer=strip_image_markers(answer_text or ""),
+            blocks=blocks,
+            created_at=str(created_at) if created_at else "",
+            status=status or "",
+        ))
+    return HistoryResponse(items=items, has_more=has_more)
+
+
+# 猜你想问：近 30 天高频 SUCCESS 问题（进程内缓存 1 小时；DB 不可用回退静态默认）。
+# 与 chat 页静态 chips 保持同一兜底集，客户端取接口失败时显示一致。
+_HOT_QUESTIONS_FALLBACK = ["U8+ 如何登录？", "请假流程是什么？", "访客 WiFi 密码是多少？"]
+_HOT_QUESTIONS_TTL_S = 3600
+_hot_questions_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+# 不计入热门的控制指令与联调账号
+_HOT_Q_EXCLUDE_TEXT = ("新会话", "重新开始")
+_HOT_Q_EXCLUDE_USER_PREFIX = ("miniapp-proto", "eval-", "test-")
+
+
+@app.get("/api/hot-questions")
+def hot_questions():
+    """真实高频问题 top-N，驱动 chat 页「示例问题」快捷栏。"""
+    now = time.time()
+    cached = _hot_questions_cache["data"]
+    if cached is not None and now - _hot_questions_cache["ts"] < _HOT_QUESTIONS_TTL_S:
+        return {"questions": cached}
+
+    from opensearch_pipeline.qa_logger import _op_db
+
+    questions: List[str] = []
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cursor:
+                user_excludes = " AND ".join(
+                    "user_id NOT LIKE %s" for _ in _HOT_Q_EXCLUDE_USER_PREFIX
+                )
+                cursor.execute(
+                    f"""
+                    SELECT query_text, COUNT(*) AS cnt
+                    FROM {_op_db()}.qa_session_log
+                    WHERE answer_status = 'SUCCESS'
+                      AND created_at >= NOW() - INTERVAL 30 DAY
+                      AND CHAR_LENGTH(query_text) BETWEEN 4 AND 30
+                      AND {user_excludes}
+                    GROUP BY query_text
+                    HAVING cnt >= 2
+                    ORDER BY cnt DESC, MAX(id) DESC
+                    LIMIT 20
+                    """,
+                    tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
+                )
+                for text, _cnt in cursor.fetchall():
+                    t = (text or "").strip()
+                    if not t or t in _HOT_Q_EXCLUDE_TEXT:
+                        continue
+                    questions.append(t)
+                    if len(questions) >= 6:
+                        break
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("hot-questions 查询失败，使用静态兜底", exc_info=True)
+
+    # 不足 3 条时用静态默认补齐（去重保序）
+    for q in _HOT_QUESTIONS_FALLBACK:
+        if len(questions) >= 3:
+            break
+        if q not in questions:
+            questions.append(q)
+
+    _hot_questions_cache["ts"] = now
+    _hot_questions_cache["data"] = questions
+    return {"questions": questions}
+
+
+# ── NO_RESULT「换个说法」建议 ─────────────────────────────────────
+# 设计依据：模板/LLM 改写都不保证改写后可答（LLM 改写在本链路已 A/B 为 dark），
+# 而近 30 天 SUCCESS 过的真实问题可答性有保证 —— 按字符 bigram 重叠推荐相似者，
+# 不足时回退「清洗版原问题」。纯启发式、零 LLM 成本、fail open。
+
+_SUCCESS_POOL_TTL_S = 3600
+_success_pool_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+_REPHRASE_NOISE_PREFIX = (
+    "请问一下", "请问", "你好", "您好", "帮我查一下", "帮我查", "帮我",
+    "我想知道", "我想问一下", "我想问", "想问一下", "问一下", "请教一下", "请教",
+)
+
+
+def _success_question_pool() -> List[str]:
+    """近 30 天 SUCCESS 问题池（去重、4-40 字、排除控制指令/联调账号；缓存 1h）。"""
+    now = time.time()
+    cached = _success_pool_cache["data"]
+    if cached is not None and now - _success_pool_cache["ts"] < _SUCCESS_POOL_TTL_S:
+        return cached
+
+    from opensearch_pipeline.qa_logger import _op_db
+
+    pool: List[str] = []
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cursor:
+                user_excludes = " AND ".join(
+                    "user_id NOT LIKE %s" for _ in _HOT_Q_EXCLUDE_USER_PREFIX
+                )
+                cursor.execute(
+                    f"""
+                    SELECT query_text, COUNT(*) AS cnt
+                    FROM {_op_db()}.qa_session_log
+                    WHERE answer_status = 'SUCCESS'
+                      AND created_at >= NOW() - INTERVAL 30 DAY
+                      AND CHAR_LENGTH(query_text) BETWEEN 4 AND 40
+                      AND {user_excludes}
+                    GROUP BY query_text
+                    ORDER BY cnt DESC
+                    LIMIT 200
+                    """,
+                    tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
+                )
+                for text, _cnt in cursor.fetchall():
+                    t = (text or "").strip()
+                    if t and t not in _HOT_Q_EXCLUDE_TEXT:
+                        pool.append(t)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("success 问题池查询失败（rephrase 退化为仅清洗原问题）", exc_info=True)
+
+    _success_pool_cache["ts"] = now
+    _success_pool_cache["data"] = pool
+    return pool
+
+
+def _char_bigrams(s: str) -> set:
+    """字符 bigram 集（仅保留中日韩/字母数字 —— 中文无需分词的相似度量纲）。"""
+    chars = [c for c in s if c.isalnum() or "一" <= c <= "鿿"]
+    return {"".join(chars[i:i + 2]) for i in range(len(chars) - 1)}
+
+
+def _suggest_rephrase(question: str, limit: int = 2) -> List[str]:
+    """NO_RESULT 出口的「换个说法」建议（fail open 返回 []）。"""
+    try:
+        q = (question or "").strip()
+        if not q:
+            return []
+        q_grams = _char_bigrams(q)
+        out: List[str] = []
+        if q_grams:
+            scored = []
+            for cand in _success_question_pool():
+                if cand == q:
+                    continue
+                c_grams = _char_bigrams(cand)
+                if not c_grams:
+                    continue
+                inter = len(q_grams & c_grams)
+                if not inter:
+                    continue
+                jac = inter / len(q_grams | c_grams)
+                # 太像（>0.85）≈ 同一问法换标点，再问大概率还是 NO_RESULT；太弱（<0.12）不相关
+                if 0.12 <= jac < 0.85:
+                    scored.append((jac, cand))
+            scored.sort(key=lambda x: -x[0])
+            out = [c for _, c in scored[:limit]]
+
+        # 不足时回退：剥掉客套前缀/尾标点的清洗版原问题（确有变化才建议）
+        if len(out) < limit:
+            cleaned = q
+            for p in _REPHRASE_NOISE_PREFIX:
+                if cleaned.startswith(p):
+                    cleaned = cleaned[len(p):].strip("，, ")
+                    break
+            cleaned = cleaned.rstrip("？?。！!")
+            if cleaned and cleaned != q.rstrip("？?。！!") and len(cleaned) >= 4 and cleaned not in out:
+                out.append(cleaned)
+        return out[:limit]
+    except Exception:
+        logger.warning("rephrase 建议生成失败（忽略）", exc_info=True)
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════

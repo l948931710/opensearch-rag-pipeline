@@ -372,6 +372,7 @@ def generate_answer(
     max_tokens: int = 2048,
     temperature: float = 0.1,
     pure_text: Optional[bool] = None,
+    thinking: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     根据检索结果生成 LLM 回答（非流式）。
@@ -380,6 +381,9 @@ def generate_answer(
         pure_text: 纯文本模式开关。None → 取 config.rag.pure_text（全局开关）；
                    True → 去掉图文穿插（system prompt 不含规则 9，context 不注入
                    <<IMG:N>> 标记）；False → 图文穿插（默认）。
+        thinking: 思考模式逐次覆盖。None → 取 config.llm.enable_thinking（默认 False）。
+                  ⚠️ DashScope 对 qwen3 非流式+思考支持受限 —— 思考请求请走
+                  generate_answer_via_stream（流式通道服务端攒流，同返回契约）。
 
     Returns:
         {
@@ -416,7 +420,8 @@ def generate_answer(
         "temperature": temperature,
         "stream": False,
         # 非流式同样关闭思考（默认 False）：思考拖慢且 DashScope 对 qwen3 非流式+思考支持受限。
-        "enable_thinking": llm.enable_thinking,
+        # thinking 参数允许逐次覆盖（None = 全局配置）。
+        "enable_thinking": llm.enable_thinking if thinking is None else bool(thinking),
     }
 
     resp = requests.post(
@@ -481,11 +486,14 @@ def generate_answer_stream(
     max_tokens: int = 2048,
     temperature: float = 0.1,
     pure_text: Optional[bool] = None,
+    thinking: Optional[bool] = None,
 ) -> Generator[str, None, None]:
     """
     根据检索结果生成 LLM 回答（SSE 流式）。
 
     pure_text: 见 generate_answer。None → 取 config.rag.pure_text。
+    thinking:  思考模式逐次覆盖；None → 取 config.llm.enable_thinking（默认 False）。
+               思考先产 reasoning_content（本函数只读 content、自动丢弃，不下发）。
 
     Yields SSE-formatted strings:
         data: {"type": "chunk", "content": "..."}
@@ -517,10 +525,11 @@ def generate_answer_stream(
         "temperature": temperature,
         "stream": True,
         "stream_options": {"include_usage": True},
-        # 关闭 Qwen3 思考模式（默认 False）：思考会先生成大量 reasoning_content（本函数只读 content、
+        # 默认关闭 Qwen3 思考模式：思考会先生成大量 reasoning_content（本函数只读 content、
         # 直接丢弃），实测拖慢 ~4.5x（38.5s→8.6s）且首字 34s→1.3s，并挤占 max_tokens 致答案截断。
-        # RAG 有检索上下文兜底，无需思考。可经 RAG_LLM_ENABLE_THINKING=true 开启对照。
-        "enable_thinking": llm.enable_thinking,
+        # RAG 有检索上下文兜底，常规问题无需思考。thinking 参数允许逐次覆盖（小程序「深度思考」
+        # 按钮逐问开启，调用方需同时放宽 max_tokens）；None = 全局 RAG_LLM_ENABLE_THINKING。
+        "enable_thinking": llm.enable_thinking if thinking is None else bool(thinking),
     }
 
     # 先 yield sources 信息
@@ -572,3 +581,57 @@ def generate_answer_stream(
     # 结束
     yield f"data: {json.dumps({'type': 'done', 'model': llm.model, 'usage': usage_info}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def generate_answer_via_stream(
+    query: str,
+    context_chunks: List[Dict[str, Any]],
+    *,
+    history: Optional[List[Dict[str, str]]] = None,
+    system_prompt: Optional[str] = None,
+    max_context_chars: int = 6000,
+    max_tokens: int = 2048,
+    temperature: float = 0.1,
+    pure_text: Optional[bool] = None,
+    thinking: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """流式通道生成、服务端攒齐后整体返回（与 generate_answer 同返回契约）。
+
+    用途：思考模式在 DashScope qwen3 上仅流式可用 —— /api/ask 等非流式（buffered）
+    出口在 thinking=True 时改走本函数，客户端契约不变。reasoning_content 由
+    generate_answer_stream 丢弃，这里只攒答案正文。
+    """
+    collected: List[str] = []
+    sources: List[Dict[str, Any]] = []
+    model = ""
+    usage: Dict[str, Any] = {}
+    for event in generate_answer_stream(
+        query,
+        context_chunks,
+        history=history,
+        system_prompt=system_prompt,
+        max_context_chars=max_context_chars,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        pure_text=pure_text,
+        thinking=thinking,
+    ):
+        frame = parse_sse_data_frame(event)
+        if not frame:
+            continue
+        ftype = frame.get("type")
+        if ftype == "chunk" and frame.get("content"):
+            collected.append(frame["content"])
+        elif ftype == "sources":
+            sources = frame.get("sources") or []
+        elif ftype == "done":
+            model = frame.get("model") or model
+            usage = frame.get("usage") or {}
+
+    # 与 generate_answer 一致：源头清洗 [文档N] 编号引用
+    return {
+        "answer": strip_doc_citations("".join(collected)),
+        "sources": sources,
+        "model": model or get_config().llm.model,
+        "usage": usage,
+    }
