@@ -353,6 +353,30 @@ def _pass2_extract_page(
                 _flush_paragraph()
             continue
 
+        # 页面叠加圈号标注（独立"⑧"文本元素，排版上贴在所属图片 bbox 内）：
+        # 独立成块并携带 x/y 几何，供 _insert_image_refs_heuristic 做
+        # 标注→图片的包含判定（图号引用绑定的第 0 优先级证据）。
+        # 该文档版式常见"图在引用文字之前"，仅靠阅读序/y 锚定会把图吞进前一步骤
+        # （2026-06-11 FL-ZS-WI-005 枪图实证）。
+        if re.fullmatch(r'[①-⑳]', line_text):
+            _flush_paragraph()
+            blocks.append(ExtractedBlock(
+                block_type="paragraph",
+                text=line_text,
+                page_num=page_num,
+                section_path=current_section[0],
+                source="native",
+                extra={
+                    "detected_by": "circled_label",
+                    "circled_label": line_text,
+                    "x0": line_info.get("x0"),
+                    "x1": line_info.get("x1"),
+                    "y0": line_info["top"],
+                    "y1": line_info.get("bottom", line_info["top"]),
+                },
+            ))
+            continue
+
         # 步骤边界行：先冲掉已缓冲段落，让每个步骤独立成块（携带自己的 y 区间）。
         # 不影响全文 text（仍按行拼接），只改变块粒度 —— chunker 会按尺寸再合并。
         if text_buffer and _STEP_LINE_RE.match(line_text):
@@ -513,6 +537,8 @@ def _build_line(words: list) -> dict:
         "text": line_text,
         "top": min(float(w["top"]) for w in words_sorted),
         "bottom": max(float(w.get("bottom", w["top"])) for w in words_sorted),
+        "x0": min(float(w["x0"]) for w in words_sorted),
+        "x1": max(float(w.get("x1", w["x0"])) for w in words_sorted),
         "dominant_size": dominant_size,
         "dominant_fontname": dominant_fontname,
     }

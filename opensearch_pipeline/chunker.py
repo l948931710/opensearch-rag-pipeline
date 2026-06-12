@@ -449,6 +449,8 @@ class DocumentChunker:
         postamble_texts = []      # 最后一个步骤后的尾部文本
         current_step = None
         current_main_no = None    # 最近一个显式主步骤号（步骤N/Step N/第N步），子项编号沿用
+        main_no_explicit = False  # current_main_no 是否来自显式标记（混合编号继承仅认显式主号，
+                                  # 防止纯 X.Y 编号文档因 ordinal 巧合误继承塌号）
         found_any_step = False
         pending_images = []       # orphan images waiting for next step
 
@@ -471,8 +473,6 @@ class DocumentChunker:
 
             # 更新 section 跟踪
             if block_type == "heading":
-                current_section = section_path or text
-
                 # ── 编号型操作标题也可能是步骤边界 ──
                 # 财务手册模式: heading "3.2.4正常单据记账" → table → image
                 # 工厂 SOP 模式: heading "1.2  若核对错误…" → 步骤
@@ -486,12 +486,36 @@ class DocumentChunker:
                     _rest = text[heading_step_match.end(1):].strip(" .．、:：\t　")
                     if _rest in _STEP_SECTION_HEADERS:
                         heading_step_match = None
+                # 混合编号继承：X.Y 的主号与当前显式主步骤号（步骤N）一致 ⇒
+                # 是该主步骤的子步骤，继承主号。否则 3.2 卡 step_no=0 在检索端
+                # ORDER BY step_no 排到最前、±1 扩展窗错乱（ZS-WI-005 实证）。
+                # 无显式主步骤的文档（纯 X.Y 编号/财务手册）不受影响，仍 step_no=0。
+                _h_step_no = 0
+                _h_sub_no = None
+                if heading_step_match:
+                    _h_no = heading_step_match.group(1)
+                    if (current_main_no is not None and main_no_explicit
+                            and re.fullmatch(r'\d+(?:\.\d+)+', _h_no)):
+                        if int(_h_no.split(".")[0]) == current_main_no:
+                            _h_step_no = current_main_no
+                            try:
+                                _h_sub_no = int(_h_no.split(".")[1])
+                            except ValueError:
+                                _h_sub_no = None
+                if heading_step_match is None or _h_step_no == 0:
+                    # 章节标题与独立编号标题正常更新 section——财务手册（"3.2.4
+                    # 正常单据记账"，全篇编号标题、无结构性标题兜底）依赖它做
+                    # embedding 章节前缀与兄弟扩展展示；只有显式主步骤序列内的
+                    # 继承子步骤标题（步骤1 下的 "1.3 …"）不渗透为后续步骤卡的
+                    # section_title（ZS-WI-005 实证 + 2026-06-11 对抗评审回归修正）
+                    current_section = section_path or text
                 if heading_step_match:
                     found_any_step = True  # heading 也可以首次触发
                     if current_step is not None:
                         step_groups.append(current_step)
                     current_step = {
-                        "step_no": 0,
+                        "step_no": _h_step_no,
+                        "sub_no": _h_sub_no,
                         "section_no": heading_step_match.group(1),
                         "title": text[:80],
                         "text_parts": [text],
@@ -546,6 +570,13 @@ class DocumentChunker:
             # 这些文本已经通过 image_ref 的 ocr_text/visual_summary 元数据保留
             # 不应塞入步骤文本（会产生大量垃圾：重复圈号、ERP 菜单项等）
             if block_type == "ocr_text":
+                continue
+
+            # 页面叠加圈号标注（独立"⑧"等标注元素）→ 不入步骤正文。
+            # 只认 pdf_extractor 的几何证据标志（circled_label），不做裸正则兜底：
+            # DOCX/XLSX 等格式的单圈号段落无叠加标注语境，不应被误吞
+            # （ZS-WI-005 实证 + 2026-06-11 对抗评审收窄）。
+            if extra.get("circled_label"):
                 continue
 
             # ── 检测步骤边界 ──
@@ -629,6 +660,21 @@ class DocumentChunker:
                 if step_no_str and re.fullmatch(r"\d+(?:\.\d+)+", step_no_str):
                     section_no = step_no_str
 
+                # 混合编号继承（与 heading 路径同规则）：X.Y 主号 == 当前显式主步骤
+                # 号 ⇒ 子步骤，step_no 继承主号、Y 记入 sub_no。否则 4.1 拿 ordinal
+                # 跳号（ZS-WI-005：4.1→step_no=8 排到 步骤5 之后 — 2026-06-11 实证）。
+                # 纯 X.Y 编号全篇（无显式 步骤N）的 SOP 不受影响，仍走 ordinal。
+                inherited_sub_no = None
+                inherited_main = False
+                if section_no is not None and current_main_no is not None and main_no_explicit:
+                    if int(section_no.split(".")[0]) == current_main_no:
+                        step_no = current_main_no
+                        inherited_main = True
+                        try:
+                            inherited_sub_no = int(section_no.split(".")[1])
+                        except ValueError:
+                            inherited_sub_no = None
+
                 # 子步骤判定：N) 编号出现在显式主步骤（步骤N/Step N/第N步）内部时是该
                 # 主步骤的子项（如 步骤5 的 1) 2) 3)）—— 沿用主步骤号、记录 sub_no。
                 # 否则子卡的 step_no=1/2/3 会与主步骤 1/2/3 在同一 parent 下冲突，
@@ -639,9 +685,14 @@ class DocumentChunker:
                     step_no = current_main_no
                 elif match.group(1) or match.group(2) or match.group(3):
                     current_main_no = step_no
-                elif section_no is not None:
+                    main_no_explicit = True
+                elif section_no is not None and not inherited_main:
                     # X.Y 步骤同样是主步骤：后续 N) 子项嵌在它的 ordinal 下
+                    # （继承了显式主号的 X.Y 子步骤除外——主号仍归 步骤N）
                     current_main_no = step_no
+                    main_no_explicit = False
+                if sub_no is None and inherited_sub_no is not None:
+                    sub_no = inherited_sub_no
 
                 # 结束上一个步骤组
                 if current_step is not None:
@@ -911,9 +962,11 @@ class DocumentChunker:
 
             # _step_label 用于统一 parent 中的步骤标题生成
             def _step_label(sg):
-                """生成步骤标签：heading 派生用 section_no，普通步骤用 step_no。"""
+                """生成步骤标签：有原始条款号（X.Y/heading 派生）用 section_no，
+                否则用 步骤N。混合编号继承后 3.2 卡 step_no=3，但展示仍应是 3.2
+                而非编造的"步骤3"（section_no 是原文真值）。"""
                 sno = sg.get("section_no")
-                if sg["step_no"] == 0 and sno:
+                if sno:
                     return f"{sno} {sg['title'][:40]}"
                 return f"步骤{sg['step_no']}：{sg['title'][:40]}"
 

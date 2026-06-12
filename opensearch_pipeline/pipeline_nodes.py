@@ -1967,6 +1967,44 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
             _vs_circled_re = re.compile(
                 r'(?:标注|红框|方框|圆圈|圈|区域|箭头|图)[^①-⑳]{0,6}([' + _CIRCLED_NUMS + r'])')
 
+            # ── 证据源 0：页面叠加圈号标注（PDF 原生文本"⑧"贴在图片 bbox 内）──
+            # pdf_extractor 把纯圈号行标记为 circled_label 块（带 x/y 几何）；
+            # 标注中心点落在哪张图 bbox 内（±4pt 容忍）即为该图的图号。
+            # 这是确定性版面证据，优先于 VLM annotation_map / visual_summary
+            # （FL-ZS-WI-005 枪图：OCR 空、无标注图，仅有此标注可依 — 2026-06-11）。
+            # 落在多张图 bbox 内的标注按歧义弃用，回退后续证据源。
+            label_points = []  # (circled_char, cx, cy, page)
+            for block in blocks:
+                b_extra = (block.get("extra") if isinstance(block, dict)
+                           else getattr(block, "extra", None)) or {}
+                lab = b_extra.get("circled_label")
+                if not lab or len(lab) != 1 or lab not in _CIRCLED_NUMS:
+                    continue
+                bpg = (block.get("page_num") if isinstance(block, dict)
+                       else getattr(block, "page_num", None))
+                if bpg is None or b_extra.get("x0") is None or b_extra.get("y0") is None:
+                    continue
+                cx = (float(b_extra["x0"]) + float(b_extra.get("x1") or b_extra["x0"])) / 2
+                cy = (float(b_extra["y0"]) + float(b_extra.get("y1") or b_extra["y0"])) / 2
+                label_points.append((lab, cx, cy, bpg))
+
+            # 严格包含（无容忍带）：±tol 会把贴在本图边缘外侧的标注误吸进相邻图
+            # bbox 形成「错误的唯一归属」——实测三例标注（①⑦⑧）都严格落在所属图
+            # bbox 内部，宽容不带来收益只扩大误吸面（2026-06-11 对抗评审收窄）。
+            _OVERLAY_TOL = 0.0
+            overlay_label_owner: Dict[int, list] = {}   # id(va) → [圈号]
+            for lab, cx, cy, lpg in label_points:
+                containing = []
+                for va in page_only_assets:
+                    if va.get("page_num") != lpg or not va.get("bbox"):
+                        continue
+                    bx0, by0, bx1, by1 = (float(v) for v in va["bbox"])
+                    if (bx0 - _OVERLAY_TOL <= cx <= bx1 + _OVERLAY_TOL
+                            and by0 - _OVERLAY_TOL <= cy <= by1 + _OVERLAY_TOL):
+                        containing.append(va)
+                if len(containing) == 1:
+                    overlay_label_owner.setdefault(id(containing[0]), []).append(lab)
+
             for va in page_only_assets:
                 ann_map = va.get("vlm_annotation_map", {})
                 img_page = va.get("page_num")
@@ -1974,8 +2012,11 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 # 圈号候选 —— 关键约束：仅当图片的圈号【唯一】时才当作"这张图的图号"。
                 # 截图内部的 UI 步骤标注（①②③④⑤⑥ 一串）不是图号：拿它们去匹配
                 # 正文"如图①"会把 步骤3 的截图错绑到 步骤2（2026-06-10 pdf_sop 实证）。
+                overlay_circled = overlay_label_owner.get(id(va), [])
                 map_circled = [k for k in ann_map if k in _CIRCLED_NUMS]
-                circled_candidates = map_circled if len(map_circled) == 1 else []
+                circled_candidates = overlay_circled if len(overlay_circled) == 1 else []
+                if not circled_candidates:
+                    circled_candidates = map_circled if len(map_circled) == 1 else []
                 if not circled_candidates:
                     # 次选：visual_summary 标注语境圈号（如"红色方框标注区域③"），同样要求唯一
                     vs_circled = list(dict.fromkeys(
