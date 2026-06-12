@@ -65,6 +65,9 @@ test: ## 运行测试
 test-cov: ## 运行测试 + 覆盖率
 	python -m pytest tests/ -v --cov=opensearch_pipeline --cov-report=term-missing
 
+miniapp-test: ## 小程序纯函数单测（markdown/typewriter，node 内置 runner，无须 IDE）
+	node --test fuling-rag-miniapp/tests/units.test.mjs
+
 # ── Quality ──
 
 lint: ## 代码检查

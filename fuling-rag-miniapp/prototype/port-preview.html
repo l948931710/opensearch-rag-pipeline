@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ACSS 移植预览 — iconfont + settings（富岭知识助手）</title>
+<style>
+  /* 与 app.acss 同源的 Aurora-Forest 令牌（浏览器预览用 html[data-theme] 切换） */
+  :root{
+    --brand:#15604a; --brand-strong:#134f3e; --brand-press:#0e3f31; --brand-soft:#d9ebe2;
+    --brand-a30:rgba(21,96,74,.30);
+    --brand-grad:linear-gradient(135deg,#0f5a43 0%,#1f9d76 60%,#34d6a3 100%);
+    --nav-grad:linear-gradient(125deg,#103f30 0%,#17795b 55%,#2bbf95 100%);
+    --page:#efe8da; --page-tint:#dcebe2; --chat-bg:#ece4d4;
+    --surface:#fbf8f1; --surface-2:#f4efe3; --surface-3:#ece5d6;
+    --text-1:#2a2620; --text-2:#5b5347; --text-3:#6f6657;
+    --line:#e3dccb; --line-2:#efe9db;
+    --success:#116449; --success-bg:#d9ece4; --warn:#82590c; --warn-bg:#f3e7cf;
+    --danger:#b3402f; --danger-soft:#c2503c; --danger-bg:#f6e2dc;
+    --sh-1:0 1px 2px rgba(60,50,30,.06);
+    --sh-2:0 1px 3px rgba(60,50,30,.07),0 6px 16px rgba(60,50,30,.08);
+    --sh-brand:0 4px 14px rgba(21,96,74,.26);
+    --paper:url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27220%27%20height%3D%27220%27%3E%3Cfilter%20id%3D%27pp%27%3E%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%270.9%27%20numOctaves%3D%272%27%20stitchTiles%3D%27stitch%27%2F%3E%3CfeColorMatrix%20type%3D%27saturate%27%20values%3D%270%27%2F%3E%3CfeComponentTransfer%3E%3CfeFuncA%20type%3D%27linear%27%20slope%3D%270.05%27%2F%3E%3C%2FfeComponentTransfer%3E%3C%2Ffilter%3E%3Crect%20width%3D%27100%25%27%20height%3D%27100%25%27%20filter%3D%27url%28%23pp%29%27%2F%3E%3C%2Fsvg%3E");
+  }
+  html[data-theme="dark"]{
+    --brand:#34e0ad; --brand-strong:#15795a; --brand-press:#0f5f47; --brand-soft:#103127;
+    --brand-a30:rgba(52,224,173,.30);
+    --brand-grad:linear-gradient(135deg,#0f6a4e 0%,#22c08e 100%);
+    --nav-grad:linear-gradient(125deg,#0a2a20 0%,#115740 55%,#1f9d76 100%);
+    --page:#0c1611; --page-tint:#10261c; --chat-bg:#0e1a14;
+    --surface:#16271e; --surface-2:#121f18; --surface-3:#1d2f25;
+    --text-1:#e9efe9; --text-2:#a7b6ac; --text-3:#8a988d;
+    --line:#26352b; --line-2:#1b271f;
+    --success:#3dd9a0; --success-bg:#0e2a1f; --warn:#e0a93a; --warn-bg:#2c2310;
+    --danger:#ff7a66; --danger-soft:#ff7a66; --danger-bg:#2a1714;
+    --sh-1:0 1px 2px rgba(0,0,0,.4);
+    --sh-2:0 1px 3px rgba(0,0,0,.45),0 8px 20px rgba(0,0,0,.5);
+    --sh-brand:0 4px 16px rgba(34,192,142,.25);
+    --paper:url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27220%27%20height%3D%27220%27%3E%3Cfilter%20id%3D%27pp%27%3E%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%270.9%27%20numOctaves%3D%272%27%20stitchTiles%3D%27stitch%27%2F%3E%3CfeColorMatrix%20type%3D%27saturate%27%20values%3D%270%27%2F%3E%3CfeComponentTransfer%3E%3CfeFuncA%20type%3D%27linear%27%20slope%3D%270.07%27%2F%3E%3C%2FfeComponentTransfer%3E%3C%2Ffilter%3E%3Crect%20width%3D%27100%25%27%20height%3D%27100%25%27%20filter%3D%27url%28%23pp%29%27%2F%3E%3C%2Fsvg%3E");
+  }
+
+  /* ★ 与小程序 app.acss 完全相同的字体：真实嵌入的 woff2 base64（构建脚本注入） */
+  @font-face{
+    font-family:"flico";
+    src:url("data:font/woff2;charset=utf-8;base64,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") format("woff2");
+  }
+  .ico{font-family:"flico";font-style:normal;line-height:1;display:inline-block;-webkit-font-smoothing:antialiased;}
+  .ico-up::before{content:"\e18a";} .ico-down::before{content:"\e189";}
+  .ico-headset::before{content:"\e5bd";} .ico-copy::before{content:"\e09e";}
+  .ico-image::before{content:"\e0f6";} .ico-image-off::before{content:"\e1c0";}
+  .ico-refresh::before{content:"\e149";} .ico-search::before{content:"\e151";}
+  .ico-warn::before{content:"\e193";} .ico-check::before{content:"\e06c";}
+  .ico-x::before{content:"\e1b2";} .ico-chev-r::before{content:"\e06f";}
+  .ico-chev-l::before{content:"\e06e";} .ico-chev-down::before{content:"\e06d";}
+  .ico-expand::before{content:"\e113";}
+
+  *{box-sizing:border-box;}
+  body{
+    margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    background:var(--paper), radial-gradient(900px 500px at 50% -8%, var(--page-tint) 0%, transparent 60%), var(--page);
+    color:var(--text-1);padding:24px 16px 48px;display:flex;flex-direction:column;align-items:center;gap:28px;
+  }
+  h1{font-size:18px;margin:0;}
+  h2{font-size:14px;color:var(--text-2);margin:0 0 12px;font-weight:600;}
+  .head{text-align:center;}
+  .head p{font-size:12.5px;color:var(--text-3);margin:6px 0 10px;}
+  .theme-toggle{font-size:12.5px;color:var(--text-2);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:6px 14px;cursor:pointer;}
+
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--sh-2);padding:20px 22px;width:680px;max-width:96vw;}
+
+  /* ── 字形表 ── */
+  .glyphs{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;}
+  .g{display:flex;flex-direction:column;align-items:center;gap:7px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:12px;padding:14px 6px 10px;}
+  .g .ico{font-size:26px;color:var(--text-2);}
+  .g span{font-size:10.5px;color:var(--text-3);font-family:ui-monospace,monospace;}
+
+  /* ── 反馈条状态演示（feedback-bar v1.1 同款语义）── */
+  .fb-demo{display:flex;align-items:center;gap:4px;border-top:1px solid var(--line);padding:6px 8px;margin-top:14px;}
+  .fb-ico{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:18px;}
+  .fb-ico.on-up{background:var(--brand-soft);color:var(--brand);}
+  .fb-ico.locked{opacity:.45;}
+  .fb-done{font-size:11px;color:var(--text-3);flex:1;padding-left:6px;}
+  .fb-handoff{display:flex;align-items:center;gap:5px;font-size:12.5px;color:var(--brand);padding:7px 10px;}
+  .fb-handoff .ico{font-size:18px;}
+  .handoff-note{background:var(--success-bg);color:var(--success);font-size:12.5px;padding:8px 14px;display:flex;align-items:center;gap:6px;border-radius:0 0 10px 10px;}
+  .caption{font-size:11.5px;color:var(--text-3);margin-top:8px;}
+
+  /* ── settings 手机框 ── */
+  .phones{display:flex;gap:24px;flex-wrap:wrap;justify-content:center;}
+  .phone{width:330px;background:#000;border-radius:38px;padding:9px;box-shadow:0 18px 48px rgba(15,22,40,.32);}
+  .screen{border-radius:30px;overflow:hidden;background:var(--paper), radial-gradient(500px 300px at 50% -8%, var(--page-tint) 0%, transparent 60%), var(--page);display:flex;flex-direction:column;min-height:560px;}
+  .titlebar{background:#15604a;color:#fff;text-align:center;font-size:15px;font-weight:600;padding:34px 0 12px;}
+  html[data-theme="dark"] .titlebar{background:#0f3d2f;}
+  .sp{padding:12px 12px 24px;display:flex;flex-direction:column;gap:12px;}
+  .pcard{display:flex;align-items:center;background:var(--surface);border-radius:16px;box-shadow:var(--sh-1);padding:18px 16px;}
+  .avatar{width:48px;height:48px;border-radius:14px;background:var(--brand-grad);display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;font-weight:600;margin-right:12px;box-shadow:0 0 0 1px rgba(52,214,163,.18),0 4px 12px rgba(21,96,74,.22);}
+  .pname{font-size:17px;font-weight:600;color:var(--text-1);}
+  .pdept{font-size:13px;color:var(--text-3);margin-top:4px;}
+  .scard{background:var(--surface);border-radius:16px;box-shadow:var(--sh-1);overflow:hidden;}
+  .cell{display:flex;align-items:center;min-height:48px;padding:10px 16px;border-bottom:1px solid var(--line-2);}
+  .cell:last-child{border-bottom:none;}
+  .cl{font-size:14.5px;color:var(--text-1);flex-shrink:0;margin-right:12px;}
+  .cv{flex:1;text-align:right;font-size:12.5px;color:var(--text-3);word-break:break-all;line-height:1.4;}
+  .chev{margin-left:auto;font-size:13px;color:var(--text-3);}
+  .tip{font-size:12px;color:var(--text-3);padding:6px 16px 0;line-height:1.5;}
+  .tabbar{margin-top:auto;display:flex;border-top:1px solid var(--line);background:var(--surface);}
+  .tab{flex:1;text-align:center;font-size:11px;padding:9px 0 14px;color:var(--text-3);}
+  .tab.on{color:#15604a;font-weight:600;}
+  html[data-theme="dark"] .tab.on{color:#34e0ad;}
+</style>
+</head>
+<body>
+  <div class="head">
+    <h1>ACSS 移植预览 — iconfont 字形 + settings 新设计</h1>
+    <p>字体 = app.acss 实际嵌入的同一份 base64 woff2（Lucide 15 字形子集，2.8KB）；令牌与 app.acss 同源</p>
+    <button class="theme-toggle" id="themeToggle">🌙 深色</button>
+  </div>
+
+  <div class="panel">
+    <h2>① iconfont 字形表（styles/icons.acss 全部 15 类）</h2>
+    <div class="glyphs" id="glyphs"></div>
+    <div class="fb-demo">
+      <div class="fb-ico on-up"><i class="ico ico-up"></i></div>
+      <div class="fb-ico locked"><i class="ico ico-down"></i></div>
+      <div class="fb-ico"><i class="ico ico-copy"></i></div>
+      <div class="fb-done">已反馈</div>
+      <div class="fb-handoff"><i class="ico ico-headset"></i><span>转人工</span></div>
+    </div>
+    <div class="handoff-note"><i class="ico ico-check"></i><span>已转交管理员跟进，请留意钉钉消息</span></div>
+    <div class="caption">↑ feedback-bar v1.1 状态演示：赞已选中保持饱和、踩弱化锁定、复制独立、转人工完成态 + 持久确认行</div>
+  </div>
+
+  <div class="panel" style="background:transparent;border:none;box-shadow:none;padding:0;">
+    <div class="phones">
+      <div class="phone"><div class="screen">
+        <div class="titlebar">我的</div>
+        <div class="sp">
+          <div class="pcard">
+            <div class="avatar">张</div>
+            <div><div class="pname">张伟</div><div class="pdept">生产部</div></div>
+          </div>
+          <div class="scard">
+            <div class="cell"><span class="cl">部门</span><span class="cv">生产部</span></div>
+            <div class="cell"><span class="cl">用户 ID</span><span class="cv">manager8174</span></div>
+            <div class="cell"><span class="cl">会话 ID</span><span class="cv">miniapp:manager8174</span></div>
+          </div>
+          <div>
+            <div class="scard">
+              <div class="cell"><span class="cl">清除会话</span><i class="ico ico-chev-r chev"></i></div>
+            </div>
+            <div class="tip">清除后，下一次提问将开启全新会话（不影响历史问答记录）。</div>
+          </div>
+          <div class="scard">
+            <div class="cell"><span class="cl">应用名称</span><span class="cv">富岭知识助手</span></div>
+            <div class="cell"><span class="cl">版本</span><span class="cv">0.1.0</span></div>
+          </div>
+        </div>
+        <div class="tabbar"><div class="tab">问答</div><div class="tab on">我的</div></div>
+      </div></div>
+    </div>
+  </div>
+
+<script>
+const GLYPHS = ['up','down','headset','copy','image','image-off','refresh','search','warn','check','x','chev-r','chev-l','chev-down','expand'];
+document.getElementById('glyphs').innerHTML = GLYPHS.map(n =>
+  '<div class="g"><i class="ico ico-' + n + '"></i><span>ico-' + n + '</span></div>').join('');
+
+const root = document.documentElement;
+const btn = document.getElementById('themeToggle');
+function apply(t){ root.setAttribute('data-theme', t); btn.textContent = t==='dark' ? '☀️ 浅色' : '🌙 深色'; }
+apply(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+btn.addEventListener('click', () => apply(root.getAttribute('data-theme')==='dark' ? 'light' : 'dark'));
+</script>
+</body>
+</html>
