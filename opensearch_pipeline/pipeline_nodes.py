@@ -1628,10 +1628,8 @@ def _detect_step_patterns(doc: dict) -> bool:
     # 2026-06-10 诊断：此 gate 漏判 WI 文号文档 → 整本 SOP 平文切块、图片零绑定。
     if not is_sop_like and re.search(r'(?:^|[^a-z0-9])wi-\d', title):
         is_sop_like = True
-    if not is_sop_like:
-        return False
 
-    # 从 blocks 文本中检测步骤边界
+    # 从 blocks 文本中检测步骤边界（提到 is_sop_like 判定之前,因 R1 fallback 也要用 text）
     text = doc.get("text", "")
     if not text:
         blocks = doc.get("blocks", [])
@@ -1644,6 +1642,27 @@ def _detect_step_patterns(doc: dict) -> bool:
             if t:
                 text_parts.append(t)
         text = "\n".join(text_parts)
+
+    # ── R1 fallback（D8 Phase 8）：正文 SOP 锚词检测 ──
+    # title-based gate 漏判企业内部短代号 SOP(xg001/zs006/ms* 类),正文是
+    # 真 SOP(含步骤N + 大量截图)但 title 无 sop/manual/wi-\d 关键词 → 路由
+    # 落 text mode、step_card 全失、图片散落独立 chunk(D8 Phase 7 dryrun 实证
+    # xg001 9 图 + zs006 7 图共 16 张全无 step 绑定)。
+    # 修法:正文头部 5000 字含 SOP 锚词 ≥2 个(作业前提/作业说明/生效日期/作业
+    # 指导/作业方法/SOP编号) → 升 is_sop_like,让下游 step 检测正常进行。锚词
+    # 取自富岭 SOP 实际文档头格式,跨业务通用。要求 ≥2 个避免单"生效日期"
+    # 误升非 SOP 公告文档(如 admin_lodging 仅含"通知",0 个锚词)。
+    if not is_sop_like:
+        sop_anchor_words = (
+            "作业前提", "作业说明", "生效日期", "作业指导",
+            "作业方法", "SOP编号", "操作规程",
+        )
+        anchor_hits = sum(1 for w in sop_anchor_words if w in text[:5000])
+        if anchor_hits >= 2:
+            is_sop_like = True
+
+    if not is_sop_like:
+        return False
 
     matches = _STEP_DETECT_RE.findall(text[:10000])  # 只检查前 10000 字符
     return len(matches) >= 2
