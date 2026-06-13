@@ -2199,6 +2199,58 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                     and best_alt_score
                                     >= max(geo_score, 1) * 3.0):
                                 best_idx = best_alt_idx
+                # ── Path B: 圈号 sub-step override（D8 Phase 6,同 env-gate）──
+                # image OCR 含的圈号集 vs 同页 step block 圈号集 Jaccard。
+                # 适合"填写示例图 vs 填写指示文本"匹配:image OCR 含的 ①②③ 是
+                # 用户在表单上写下的编号示例,step text 含的 ①②③ 是该 step 的填写
+                # 指示——两者圈号集匹配 = 该图正是该 step 的填写示例。
+                # pdf_sop image 10 实证(Bug A):OCR={①②③④⑤},step 4.1={①②③}
+                # Jaccard=0.6 vs step 4.2 heading={④} J=0.2/4.2 paragraph={⑤⑥} J=0.17 ——
+                # 圈号信号清晰指向 step 4.1。Path A bigram 信号弱(visual_summary
+                # 通用词与 step text bigram 仅 1 命中)不触发,Path B 圈号集精确语
+                # 义信号补上。仅 img OCR 含 ≥2 圈号且 alt Jaccard ≥0.5 且 ≥1.5x
+                # geo Jaccard 才触发,避免单圈号 OCR 噪声。
+                if (best_idx is not None and os.getenv(
+                        "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
+                        in ("1", "true", "yes")):
+                    _CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+                    img_ocr_txt = va.get("ocr_text") or ""
+                    img_circled = set(c for c in img_ocr_txt if c in _CIRCLED)
+                    if len(img_circled) >= 2:
+                        def _circled_set(t):
+                            return set(c for c in t if c in _CIRCLED)
+
+                        def _jacc(a, b):
+                            if not (a and b):
+                                return 0.0
+                            return len(a & b) / max(len(a | b), 1)
+
+                        geo_blk = blocks[best_idx]
+                        geo_txt = ((geo_blk.get("text", "")
+                                    if isinstance(geo_blk, dict)
+                                    else getattr(geo_blk, "text", ""))
+                                   or "")
+                        geo_jacc = _jacc(img_circled, _circled_set(geo_txt))
+                        best_cir_idx, best_cir_jacc = best_idx, geo_jacc
+                        for _y0, bidx in anchors:
+                            if bidx == best_idx:
+                                continue
+                            blk = blocks[bidx]
+                            blk_txt = ((blk.get("text", "")
+                                       if isinstance(blk, dict)
+                                       else getattr(blk, "text", ""))
+                                       or "")
+                            blk_circled = _circled_set(blk_txt)
+                            if not blk_circled:
+                                continue
+                            jacc = _jacc(img_circled, blk_circled)
+                            if jacc > best_cir_jacc:
+                                best_cir_jacc = jacc
+                                best_cir_idx = bidx
+                        if (best_cir_idx != best_idx
+                                and best_cir_jacc >= 0.5
+                                and best_cir_jacc >= max(geo_jacc, 0.01) * 1.5):
+                            best_idx = best_cir_idx
                 img_block = {
                     "block_type": "image_ref",
                     "text": "",
