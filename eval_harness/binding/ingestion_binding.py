@@ -243,6 +243,19 @@ def _match_gt_chunk_to_produced(gt: GtChunk, chunks: List[Any]) -> Optional[Any]
         if gt.chunk_type:
             typed = [s for s in covering if _gv(s[0], "chunk_type") == gt.chunk_type]
             if typed:
+                # D8 Phase 5 Bug C2 修:GT expected_image_refs 非空时,typed pool
+                # 内优先选含 image_refs 的 chunk —— 反映"主步骤含图"标注意图,
+                # 避免短的 visual_knowledge/摘要先行 chunk(image_refs=[],但因 text
+                # 含 visual_summary 命中 keyword)用 density 抢戏真子步骤。
+                # it_xxh_003 实证:step_no=5 sub1 i=8([补充图示] 摘要 200 字,
+                # imgs=[]) vs sub2 i=9(主步骤 500+字, imgs=[20-25])—— 旧路径
+                # density-max 选 sub1 → pred=[] J=0;含图过滤后选 sub2 J=1.0。
+                # 0-image GT(expected_image_refs=[])不进 filter → 无副作用。
+                if gt.expected_image_refs:
+                    with_imgs = [s for s in typed
+                                 if (_gv(s[0], "extra") or {}).get("image_refs")]
+                    if with_imgs:
+                        typed = with_imgs
                 # GT label 含步骤号 → sec_no/step_no 次级过滤(D8 Phase 3 finding 3 修)
                 step_no, sec_no = _extract_step_no_from_label(gt.label)
                 if step_no is not None:

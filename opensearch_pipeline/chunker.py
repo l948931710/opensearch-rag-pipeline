@@ -471,6 +471,21 @@ class DocumentChunker:
                 source = block.source
                 extra = block.extra if hasattr(block, "extra") else {}
 
+            # ── Bug D fix（D8 Phase 5）：含显式 step 标记的 heading 走 paragraph 路径 ──
+            # 原 heading 路径仅识别 ASCII X / X.Y / X.Y.Z 数字编号，错过 markdown
+            # SOP 的 "第N步：..." / "步骤N：..." / "Step N：..."。it_xxh_003 实证：
+            # pdf_extractor 把这类 step 段识别为 heading 块（独立成行+格式突出），
+            # 但 _STEP_BOUNDARY_RE 不在 heading 路径调用，导致 step_groups 空 →
+            # line 726 fallback 到 text mode、整文 SOP 失去 step_card 结构。
+            # 修法：行首显式 step 标记的 heading 重写为 paragraph，让下面 paragraph
+            # 路径的 _STEP_BOUNDARY_RE finditer + 中文数字转换 + 混合编号继承
+            # 统一处理。仅行首放行避免说明性 heading "本节含步骤…" 误判。
+            if block_type == "heading" and re.match(
+                    r'^[ \t　]*(?:步骤\s*[一二三四五六七八九十\d]+|'
+                    r'Step\s+\d+|第\s*[一二三四五六七八九十\d]+\s*步)',
+                    text, re.IGNORECASE):
+                block_type = "paragraph"
+
             # 更新 section 跟踪
             if block_type == "heading":
                 # ── 编号型操作标题也可能是步骤边界 ──
