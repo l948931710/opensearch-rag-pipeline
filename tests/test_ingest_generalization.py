@@ -421,6 +421,52 @@ def test_xlsx_procedure_unbindable_totext_falls_back_to_image_chunk():
     assert "q_img0001.png" in _serving_renderable_fns(chunks)
 
 
+def test_xlsx_procedure_autogen_figure_no_does_not_force_step_n():
+    """figure_no 是 extractor 给的"图1/.../图N"占位序号、step 文本无"如图N"
+    引用时，"图N→步骤N"启发式必须关闭——否则当图数==步骤数但 anchor 顺序
+    与步骤顺序不严格对应（xlsx_sop 真实形态：anchor=14 的图 figure_no=图6
+    被强行绑到 step6、anchor=15 的电源图被丢到 step5）就会强行错绑。
+    本测试锁死："每张图 figure_no 唯一、step 无 figure_refs"时走 anchor 兜底
+    而不是 figure_no→stepN 直接映射。"""
+    steps = [
+        "1\t第一步:打开设备外壳检查",
+        "2\t第二步:连接电源线",
+        "3\t第三步:启动设备",
+    ]
+    blocks = [{"block_type": "paragraph", "text": s, "page_num": 1,
+               "source": "openpyxl",
+               "extra": {"step_no": i + 1, "row_role": "step",
+                         "row_num": 10 + i, "sheet_idx": 0}}
+              for i, s in enumerate(steps)]
+    # 关键设置：3 张图、3 个步骤、anchor 顺序与 figure_no 不严格同步。
+    # 若沿用旧"图N→步骤N"启发式：图1→step1、图2→step2、图3→step3——anchor=15
+    # 的图会被绑到 step1（因 figure_no=图1）。真值应按 anchor 序：12→step1、
+    # 13→step2、15→step3。
+    assets = [
+        _totext_asset(0, "auto_img0000.png", "", "", anchor_row=15,
+                      figure_no="图1", status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "auto_img0001.png", "", "", anchor_row=12,
+                      figure_no="图2", status="ROUTE_TO_VECTOR"),
+        _totext_asset(2, "auto_img0002.png", "", "", anchor_row=13,
+                      figure_no="图3", status="ROUTE_TO_VECTOR"),
+    ]
+    # 文件名包含 "作业指导书" 触发 procedure_image_guide 分类器
+    doc = _xlsx_doc("自动编号示例作业指导书.xlsx", blocks, assets, text="\n".join(steps))
+    chunks = _chunk_doc(doc)
+
+    step_cards = {c.extra.get("step_no"): c for c in chunks if c.chunk_type == "step_card"}
+    assert set(step_cards) == {1, 2, 3}
+    # 按 anchor_row 升序分配：12→step1, 13→step2, 15→step3
+    assert [r["filename"] for r in step_cards[1].extra.get("image_refs") or []] == [
+        "auto_img0001.png"], (
+        "auto-gen figure_no 不应被信任：anchor=12 才是 step1 的图，不是 figure_no=图1")
+    assert [r["filename"] for r in step_cards[2].extra.get("image_refs") or []] == [
+        "auto_img0002.png"]
+    assert [r["filename"] for r in step_cards[3].extra.get("image_refs") or []] == [
+        "auto_img0000.png"], (
+        "anchor=15 的图必须走 step3（行号兜底），不应因 figure_no=图1 被劫持到 step1")
+
+
 def test_docx_totext_fallback_unchanged():
     """非 XLSX 路径行为保持不变：非 step 的 DOCX 嵌入 TO_TEXT 图片不建独立
     image chunk（既有 [ref-enrich] 行为，避免本修复扩大爆炸半径）。"""
@@ -1069,3 +1115,80 @@ def test_ingest_policy_rev_in_sync():
                     register_rev = ast.literal_eval(node.value)
     assert register_rev == INGEST_POLICY_REV, (
         f"策略版本漂移: 正本={INGEST_POLICY_REV} register={register_rev}")
+
+
+# ═══════════════ ImageRef filename 次级身份 + 同 anchor 消歧 ═══════════════
+
+def test_imageref_filename_secondary_identity_backward_compat():
+    """ImageRef.filename 作为 xlsx 同 block_index 多图的次级身份：
+    - GT 标了 filename：strict 比对要求 filename 一致（否则 jaccard=0）
+    - GT 未标 filename：退回旧 (fmt, block_index) presence 语义（pred 任意 filename 都算对）
+    避免老 GT 文件破坏 + 新 GT 文件能消歧。"""
+    from eval_harness.binding.ref_keys import parse_ref_dict, jaccard
+    # 同 block_index 同 filename → 1.0
+    gt = [parse_ref_dict({"block_index": 12, "filename": "a.jpg"}, "xlsx")]
+    pred_match = [parse_ref_dict({"block_index": 12, "filename": "a.jpg"}, "xlsx")]
+    assert jaccard(gt, pred_match) == 1.0
+    # 同 block_index 不同 filename → 0.0
+    pred_mismatch = [parse_ref_dict({"block_index": 12, "filename": "b.jpg"}, "xlsx")]
+    assert jaccard(gt, pred_mismatch) == 0.0
+    # 老 GT（无 filename）+ pred 有 filename → 1.0（向后兼容：旧 GT 不应失效）
+    gt_old = [parse_ref_dict({"block_index": 12}, "xlsx")]
+    assert jaccard(gt_old, pred_match) == 1.0
+    assert jaccard(gt_old, pred_mismatch) == 1.0
+    # 老 GT vs 不同 block_index pred → 0.0（block_index 本身的匹配不变）
+    pred_wrong_anchor = [parse_ref_dict({"block_index": 99, "filename": "x.jpg"}, "xlsx")]
+    assert jaccard(gt_old, pred_wrong_anchor) == 0.0
+    # 多 ref：GT 标了 2 张不同 filename，pred 给对 1/2 张 → 0.5
+    gt_two = [parse_ref_dict({"block_index": 12, "filename": "a.jpg"}, "xlsx"),
+              parse_ref_dict({"block_index": 14, "filename": "b.jpg"}, "xlsx")]
+    pred_one = [parse_ref_dict({"block_index": 12, "filename": "a.jpg"}, "xlsx"),
+                parse_ref_dict({"block_index": 14, "filename": "wrong.jpg"}, "xlsx")]
+    assert abs(jaccard(gt_two, pred_one) - 1/3) < 1e-6, (
+        f"GT 标 2 文件名、pred 错 1 → intersect=1 union=3 → 1/3，实际 {jaccard(gt_two, pred_one)}")
+
+
+def test_xlsx_procedure_same_anchor_secondary_falls_to_remote_step():
+    """同 anchor_row 多图消歧：首张图按内容信号绑到步骤 A 后，剩余同 anchor 的图
+    若内容信号也指向 A 的相邻步骤（±1 行），P0 不应贪心绑、应让 P2 兜到远端步骤。
+    模拟 xlsx_sop 形态：anchor=12 有 2 图，img_first 强信号→step4(row 14)，
+    img_second 弱偶合信号→step3(row 13) 相邻不绑；P2 把 img_second 推到 step6(row 16)。"""
+    steps = [
+        "1\t调水平:观察天平水平泡是否居中",
+        "2\t仪器开启:接上电源按 on/off 启动",
+        "3\t试样准备:湿样品不得直接接触天平托盘称量",
+        "4\t天平调零:按 0/T 将天平示值归零",
+        "5\t样品称重:放试样读数",
+        "6\t仪器关闭:测试结束拔掉电源",
+    ]
+    blocks = [{"block_type": "paragraph", "text": s, "page_num": 1, "source": "openpyxl",
+               "extra": {"step_no": i + 1, "row_role": "step", "row_num": 11 + i, "sheet_idx": 0}}
+              for i, s in enumerate(steps)]
+    # img_first: 强烈匹配 step4 (含"归零"独有词)
+    # img_second: 偶合匹配 step3 (含"称量" — step3 末尾偶然出现)；anchor 同 img_first；语义实际属于 step6（白色天平外观）
+    assets = [
+        _totext_asset(0, "sa_img0000.png",
+                      "梅特勒-托利多电子天平显示 0.00g 手指按 O/T 归零键",
+                      "归零", anchor_row=12, figure_no="图1", status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "sa_img0001.png",
+                      "白色电子天平 QA--005 称量盘外观 仪器编号",
+                      "QA--005", anchor_row=12, figure_no="图2", status="ROUTE_TO_VECTOR"),
+    ]
+    doc = _xlsx_doc("同anchor消歧测试作业指导书.xlsx", blocks, assets,
+                    text="\n".join(steps))
+    chunks = _chunk_doc(doc)
+    step_cards = {c.extra.get("step_no"): c for c in chunks if c.chunk_type == "step_card"}
+    assert set(step_cards) == {1, 2, 3, 4, 5, 6}
+    # 关键断言：img_first → step4（强内容信号），img_second NOT → step3
+    s4_refs = [r["filename"] for r in (step_cards[4].extra.get("image_refs") or [])]
+    assert s4_refs == ["sa_img0000.png"], f"step4 期望 sa_img0000：{s4_refs}"
+    s3_refs = step_cards[3].extra.get("image_refs") or []
+    assert not s3_refs, f"step3 不应被同 anchor 的偶合内容信号占用：{s3_refs}"
+    # img_second 进 P2 redirect 分支：_far_score 优先 forward (row > 已绑步骤 row)
+    # 且 row 最大。anchor_taken_steps[12] = [4]（row 14），open_steps row 11/12/13/15/16；
+    # forward = {step5(15), step6(16)} → max row = step6（往步骤序列末端推，避免抢占
+    # step5 的自然 anchor=14 槽）。
+    landed = [c.extra.get("step_no") for c in step_cards.values()
+              if "sa_img0001.png" in [r["filename"] for r in (c.extra.get("image_refs") or [])]]
+    assert landed == [6], (
+        f"sa_img0001 应被 P2 redirect 派到 step6（forward 远端），实际 step{landed}")

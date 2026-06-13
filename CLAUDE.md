@@ -73,7 +73,7 @@ For screenshot-heavy SOP/ERP docs:
 
 - **VLM image funnel** (`image_funnel_processor.py`, called from `extraction/unified_extractor.py`): a 3-stage cascade (cheap heuristics → OCR text density → Qwen-VL semantic+safety audit) routing each image to `DISCARD` / `ROUTE_TO_TEXT` / `ROUTE_TO_VECTOR` / `QUARANTINE_SENSITIVE`. MD5-deduped, concurrent (`RAG_VLM_CONCURRENCY=8`), with a cross-document persistent cache (`scratch/vlm_cache.json` + OSS).
 - **Step cards** (`chunker.py::_chunk_by_step`): procedural docs become one `procedure_parent` + per-step `step_card` chunks linked by `parent_chunk_id`/`step_no` (`schema/002_step_card_enhancement.sql`), each carrying its bound images (`image_refs_json`). The hard problem is **binding the right image to the right step** (DOCX uses exact positional `image_ref` blocks; PDF uses `page_num`; XLSX uses `anchor_row`/`figure_refs`).
-- The `image_refs` dict shape (`oss_key`/`source_image`/`visual_summary`/`ocr_text`/`image_index`) is a **load-bearing contract** across extractor → chunker → `content_blocks_builder` → DingTalk card. Preserve those keys end-to-end.
+- The `image_refs` dict shape (`oss_key`/`source_image`/`visual_summary`/`ocr_text`/`image_index`; xlsx additionally relies on `filename`+`anchor_row` as the strict identity for same-anchor disambiguation — both eval `jaccard` strict_key and chunker P2 anchor-aware fallback consume them) is a **load-bearing contract** across extractor → chunker → `content_blocks_builder` → DingTalk card. Preserve those keys end-to-end. Don't drop `filename`/`anchor_row` from `_img_entry` or any RDS→serving roundtrip — xlsx procedure_image_guide with multiple images at the same row will silently misbind without them.
 
 ## Layout
 

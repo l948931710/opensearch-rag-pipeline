@@ -1340,10 +1340,14 @@ class UnifiedExtractor:
             for img_asset in img_assets_group:
                 all_results.append((img_asset, funnel_res))
 
-        # 按 page_num → image_index 排序，保持文档内图片的原始顺序
-        # DOCX 的 page_num 全部是 None，需要用 image_index 作为 fallback
+        # 按 page_num → anchor_row → image_index 排序，保持文档内图片的原始顺序
+        # DOCX 的 page_num 全部是 None，需要用 image_index 作为 fallback。
+        # XLSX 在同一 sheet 内允许 image_index 跨 sheet 累加而 anchor_row 才是物理行号 —
+        # 把 anchor_row 提到 image_index 之前，确保 xlsx assets 的下游 pool 顺序由
+        # 物理行号唯一决定，避免任何 ThreadPoolExecutor / 历史索引顺序的残留影响。
         all_results.sort(key=lambda x: (
             x[0].page_num if x[0].page_num is not None else 999999,
+            getattr(x[0], "anchor_row", None) if getattr(x[0], "anchor_row", None) is not None else 999999,
             x[0].image_index if x[0].image_index is not None else 999999,
             x[0].original_name or "",
         ))

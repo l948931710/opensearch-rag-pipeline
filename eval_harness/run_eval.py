@@ -88,6 +88,9 @@ def phase_run(args):
     if "l4" in layers:
         print("\n[L4] multimodal (ingestion + serving) ...")
         from .layers import l4_multimodal
+        # L4-ingestion DOCX strict 路径默认开(make eval / DataWorks / CI 自动闭环)
+        # 显式 export EVAL_L4_DOCX_BINDING_ENABLE=false 可关 — setdefault 不覆盖
+        os.environ.setdefault("EVAL_L4_DOCX_BINDING_ENABLE", "true")
         # L4-ingestion 触发:env EVAL_L4_GT_FILES(逗号分隔)+ EVAL_L4_DOCS_DIR
         # 默认指向 eval_samples/ground_truth + documents(repo 外仓)
         _data = os.path.expanduser("~/Downloads/opensearch-rag-data/eval_samples")

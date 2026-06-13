@@ -1592,7 +1592,13 @@ def node_redact_or_quarantine(ctx: dict):
 # ═══════════════════════════════════════════════════════════════
 
 _STEP_DETECT_RE = re.compile(
-    r'(?:^|\n)\s*(?:'
+    # 容忍 markdown bullet/heading 前缀（• · - * #）+ 任意空白 —— 修复
+    # 2026-06-13 it_xxh_003 evaluation gap：作业指导书目录式行 "• 第一步：..."
+    # 和 markdown heading "# 第一步：..." 前缀被 `\s*` 卡住，全 SOP 被错路由到
+    # text mode，图全成独立 image chunk 无 step 绑定。bullet/hash 前缀本身
+    # 不改变"第N步"的语义，应当容忍。要求 ≥2 个匹配仍保护 false-positive：
+    # 单条 "- 1." 列表不够。
+    r'(?:^|\n)[\s•·\-\*\#]*(?:'
     r'步骤\s*[\d一二三四五六七八九十]+|'
     r'Step\s*\d+|'
     r'第\s*[一二三四五六七八九十\d]+\s*步|'
@@ -1767,9 +1773,14 @@ def _content_match_steps(img_text: str, candidates: list) -> tuple:
             df[t] += 1
 
     img_toks = _toks(img_text)
+    # set 迭代顺序受 PYTHONHASHSEED 影响（跨进程随机），叠加浮点求和不结合律，
+    # 同一 img_text 在不同运行下 score 会有 ~1e-16 抖动；当多个步骤评分极接近时
+    # 会翻转 best_key。先 sorted 再求和把 score 锁成 bit-exact 跨运行恒定。
+    # tiebreak 也显式排序候选 key（升序）：当 score 完全相等时，best_key 由最小
+    # 候选 key 唯一决定，不再依赖 cand 的输入顺序兜底。
     scored = sorted(
-        ((sum(1.0 / df[t] for t in (img_toks & toks)), k) for k, toks in cand),
-        key=lambda x: x[0], reverse=True,
+        ((sum(1.0 / df[t] for t in sorted(img_toks & toks)), k) for k, toks in cand),
+        key=lambda x: (-x[0], x[1] if x[1] is not None else float("inf")),
     )
     best_score, best_key = scored[0]
     second = scored[1][0] if len(scored) > 1 else 0.0
@@ -2052,13 +2063,36 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
             #  跨页泄漏到上一页未关步骤；y 锚定从根上消除这两类错位。）
             geo_fallback = []
             page_block_anchors: Dict[int, list] = {}   # page → [(y0, block_idx)]
+            # 多字符 circled overlay 段（如 "①  ②\n④  ⑤"）— 单字符 circled_label
+            # 标记不覆盖（pdf_extractor 仅给 1-char 标），需用「只含圈号+空白」
+            # 模式排除，否则几何 overlap 仍会吃到这些 2D 浮标块（xs_wi_007 image
+            # 30 在 page 3 命中 i=16 "①  ②\n④  ⑤" 实证）。
+            _CIRCLED_OVERLAY_RE = re.compile(
+                r'^[\s①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳双击]+$')
             for i, block in enumerate(blocks):
                 bt = (block.get("block_type") if isinstance(block, dict)
                       else getattr(block, "block_type", ""))
-                if bt in ("ocr_text", "image_ref"):
+                # 仅 paragraph/heading 做 anchor —— 排除 table/ocr_text/image_ref
+                # 及 circled overlay 段（单字符 cl 或纯圈号+空白）。
+                # Why table：pdf_extractor 把同页 table 先扫出来（i=7/8），随后才
+                # 是页内 paragraphs（i=9+）。tables y0 落在 step 之间，几何"上方
+                # 块"规则会选中早于 step 的 table → image_ref 插到 step 之前 →
+                # `_chunk_by_step` 缓存为 pending_images 归到下一个 step
+                # （pdf_sop image 5/6 → 错绑 step 2 实证）。tables 不代表 step
+                # 起始文本，不该当 anchor。
+                # Why circled overlay：独立"①/②/⑥"段是几何标注层而非文本主体，
+                # 几何 overlap 容易吃到 1-字符浮标块，错位（xs_wi_007 image 30 实证）。
+                if bt not in ("paragraph", "heading"):
                     continue
                 b_extra = (block.get("extra") if isinstance(block, dict)
                            else getattr(block, "extra", None)) or {}
+                if b_extra.get("circled_label"):
+                    continue
+                blk_text = ((block.get("text", "")
+                            if isinstance(block, dict)
+                            else getattr(block, "text", "")) or "")
+                if blk_text and _CIRCLED_OVERLAY_RE.match(blk_text):
+                    continue
                 y0 = b_extra.get("y0")
                 bpg = (block.get("page_num") if isinstance(block, dict)
                        else getattr(block, "page_num", None))
@@ -2100,6 +2134,71 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                             best_idx = bidx
                         else:
                             break
+                # ── Path A: content-match override（D8 Phase 3，env-gated 默认 OFF）──
+                # 当几何 anchor 选中非 step 起始块（如 step 内的延续段、独立"⑦"圈号
+                # 行），且页内某 step 起始块与图片 visual_summary+ocr_text 的 bigram
+                # 重叠显著高时，把 anchor 改到那个 step 块。
+                # Why: xs_wi_007 image 1（产品标识卡，y=[216,395]）几何上 overlap-max
+                # 锚到 step 2 的延续段 i=4「机台上尾数」(overlap=46) — 但 step 1 文本
+                # 「按《产品标识卡》清点」与图片 visual_summary「产品标识卡（包装车间
+                # 专用）」5-gram 精准匹配，bg=21 vs 几何 pick bg=2（10.5x 差距实证）。
+                # 这种「step 起始块 vs step 内延续段」的几何/语义冲突是 chunker step
+                # boundary 与 image anchor 一类通病，不局限于 dotted child step。
+                # 关键边界：仅当 **geo pick 自身不是 step 起始块** 时才覆写。同 step
+                # 内多个子条目"1）.../2）.../3）..."都匹配 STEP_BOUNDARY，几何选中后
+                # 内容覆写会把图错移到关键词更多的子条目（xs_wi_007 image 30: geo
+                # = "2）填写完后" → content 覆到 "3）假如点击带不出..." 错绑 5.2 异
+                # 常流程的 step_card）— 保留几何作为同级 step 间的最终裁决。
+                # 阈值保守：MIN_ABS=10、RATIO=3.0 — pdf_sop image 9/10 bg=1/7 信号
+                # 弱不触发，it_xxh_003 无 step_card 不影响。Env-gate 默认 OFF：评测开、
+                # 生产默认不开，3 doc 实测稳定后再考虑默认 ON。
+                if (best_idx is not None and os.getenv(
+                        "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
+                        in ("1", "true", "yes")):
+                    geo_blk = blocks[best_idx]
+                    geo_txt = ((geo_blk.get("text", "")
+                               if isinstance(geo_blk, dict)
+                               else getattr(geo_blk, "text", ""))
+                               or "")
+                    # 守门：geo pick 已是 step 起始块 ⇒ 不覆写（同 step 多子条目
+                    # 不要内容覆写，几何为准）
+                    geo_is_step = bool(
+                        DocumentChunker._STEP_BOUNDARY_RE.search(geo_txt))
+                    img_text_concat = (
+                        (va.get("visual_summary") or "") + " "
+                        + (va.get("ocr_text") or ""))
+                    if not geo_is_step and len(img_text_concat) >= 20:
+                        def _bg(t):
+                            s = set()
+                            for k in range(len(t) - 1):
+                                s.add(t[k:k + 2])
+                            for k in range(len(t) - 2):
+                                s.add(t[k:k + 3])
+                            return s
+                        img_bg = _bg(img_text_concat)
+                        if len(img_bg) >= 30:
+                            geo_score = len(img_bg & _bg(geo_txt))
+                            best_alt_idx, best_alt_score = best_idx, geo_score
+                            for _y0, bidx in anchors:
+                                if bidx == best_idx:
+                                    continue
+                                blk = blocks[bidx]
+                                blk_txt = ((blk.get("text", "")
+                                           if isinstance(blk, dict)
+                                           else getattr(blk, "text", ""))
+                                           or "")
+                                # 候选限于 step 起始块（含步骤边界标记）
+                                if not DocumentChunker._STEP_BOUNDARY_RE.search(
+                                        blk_txt):
+                                    continue
+                                sc = len(img_bg & _bg(blk_txt))
+                                if sc > best_alt_score:
+                                    best_alt_idx, best_alt_score = bidx, sc
+                            if (best_alt_idx != best_idx
+                                    and best_alt_score >= 10
+                                    and best_alt_score
+                                    >= max(geo_score, 1) * 3.0):
+                                best_idx = best_alt_idx
                 img_block = {
                     "block_type": "image_ref",
                     "text": "",
@@ -2666,8 +2765,59 @@ def node_chunk_documents(ctx: dict):
                     # image_refs_json 恢复；文本 chunk 上的 refs 检索期不可达），图片提取了
                     # 却永远渲染不出（I5）。bound_nos 按轮独立：TO_TEXT 内容命中已有图的步骤
                     # 时作为第二张图追加、不与 VECTOR 抢占；priority-2 只补完全无图的步骤。
+                    # figure_no 是否"有语义意义"：unified_extractor 在 procedure_image_guide
+                    # 版式下总会按提取顺序给每张图分配 "图1/图2/.../图N" 作为占位标签，
+                    # 这是位置计数器、不是文档真实图号。"图N→步骤N" 启发式只有在以下两种
+                    # 情形之一才反映作者意图：
+                    #   (a) 某个 figure_no 被多个 asset 共用（说明是作者手工标的语义标签，
+                    #       同一张图的多变体；test_xlsx_procedure_totext_appends_as_secondary_ref
+                    #       的典型场景），或
+                    #   (b) 至少一个 step.text 里通过 "如图N" 显式引用了该 figure_no
+                    #       （`figure_refs` 即从此提取，命中后的绑定走的是 figure_refs 分支）。
+                    # 否则 figure_no 仅是 1..N 的递增序号，强行 N→stepN 会在 step 数与图数
+                    # 不严格对应时把图绑错（xlsx_sop: step3 无图、step2 有 2 图、img5→step6
+                    # 而 GT 应到 step5 的"互换"全由此引起）。
+                    all_step_fig_refs = set()
+                    for c in step_cards:
+                        for fr in (c.extra.get("figure_refs") or []):
+                            all_step_fig_refs.add(fr)
+                    fno_counts: Dict[str, int] = {}
+                    for a in assets:
+                        fno = a.get("figure_no")
+                        if fno:
+                            fno_counts[fno] = fno_counts.get(fno, 0) + 1
+                    figure_no_meaningful = (
+                        any(v > 1 for v in fno_counts.values())
+                        or bool(all_step_fig_refs)
+                    )
+
+                    # step_no → row_num 映射：来自 doc.blocks（procedure_image_guide
+                    # 提取器把行号塞进每个 step block 的 extra.row_num，但 chunker 没
+                    # 把 row_num 往 step_card.extra 里搬，所以我们这里从原 blocks 现取。
+                    # 同 anchor 多图消歧（下面）需要根据 row_num 判断 "相邻步骤"。
+                    step_row_map: Dict[int, int] = {}
+                    for _b in doc.get("blocks", []):
+                        _ex = _b.get("extra") if isinstance(_b, dict) else getattr(_b, "extra", {})
+                        if _ex and _ex.get("step_no") is not None:
+                            _rn = _ex.get("row_num")
+                            if _rn is not None:
+                                step_row_map[_ex["step_no"]] = _rn
+
                     def _bind_pool(pool):
                         bound_nos = set()  # 本轮内 step_no already assigned an image
+
+                        # 跨轮 anchor 占用：TEXT 轮启动时，VECTOR 轮已绑的 step_card.image_refs
+                        # 里的 anchor_row 必须作为"该 anchor 已被占用"的种子——否则 TEXT 轮里
+                        # 一张与 VECTOR 同 anchor 的图，会绕开邻接守卫贪心绑到 VECTOR 已绑步骤
+                        # 的相邻位（与同轮内的同 anchor 多图同因；只是 anchor_taken_steps 默认
+                        # 重置丢失了上一轮信息）。
+                        anchor_taken_steps: Dict[int, list] = {}
+                        for c in step_cards:
+                            for r in (c.extra.get("image_refs") or []):
+                                _ar = r.get("anchor_row")
+                                _sn = c.extra.get("step_no")
+                                if _ar is not None and _sn is not None:
+                                    anchor_taken_steps.setdefault(_ar, []).append(_sn)
 
                         # 优先级 0：内容匹配（视觉描述/ocr ↔ 步骤文本）。
                         # 「操作示图」列的 figure_no（图N）多为按提取顺序自动编号、anchor_row 也常不可靠，
@@ -2679,13 +2829,40 @@ def node_chunk_documents(ctx: dict):
                             cands = [(c.extra.get("step_no"), c.chunk_text) for c in step_cards]
                             sno, sc, sec = _content_match_steps(it, cands)
                             cms.append((sc - sec, sc, sno, a))
-                        cms.sort(key=lambda x: (-x[0], -x[1]))  # 置信度（分差）高的先绑
+                        # 置信度（分差）高的先绑。当 (margin, score) 都相等时，按 asset 的
+                        # 物理位置（anchor_row → image_index → filename）做兜底 tiebreaker，
+                        # 避免依赖 Python 稳定排序回退到 pool 顺序（pool 顺序虽已在 extractor
+                        # 末尾排稳，但显式 tiebreaker 让此处对上游任何顺序震荡都免疫）。
+                        cms.sort(key=lambda x: (
+                            -x[0],
+                            -x[1],
+                            x[3].get("anchor_row") if x[3].get("anchor_row") is not None else 10**9,
+                            x[3].get("image_index") if x[3].get("image_index") is not None else 10**9,
+                            x[3].get("filename") or "",
+                        ))
                         remaining = list(pool)
+                        # 同 anchor_row 多图："首张图按内容绑步骤 A 后，剩余同 anchor
+                        # 的图不应再绑到 A 相邻 (±1 行) 的步骤"——典型 xlsx_sop：anchor=12
+                        # 的 img2/img4 用同 anchor，img2 内容信号"归零"→step4 正确；
+                        # img4 内容信号"称量"→step3 偶合，step3 row 13 与 step4 row 14
+                        # 相邻，应拒绑、让 img4 走 P2 兜底到 step6。
                         for margin, sc, sno, a in cms:
-                            if sno is not None and sc >= 0.8 and margin >= 0.5 and sno not in bound_nos:
-                                step_by_no[sno].extra.setdefault("image_refs", []).append(_img_entry(a))
-                                bound_nos.add(sno)
-                                remaining.remove(a)
+                            if sno is None or sc < 0.8 or margin < 0.5 or sno in bound_nos:
+                                continue
+                            ar = a.get("anchor_row")
+                            if ar is not None and ar in anchor_taken_steps and step_row_map:
+                                target_row = step_row_map.get(sno)
+                                # 已被同 anchor 占用、且 target 与已绑步骤相邻 → 拒绑，留给 P2
+                                if target_row is not None and any(
+                                    abs(target_row - step_row_map.get(prev_sno, target_row)) <= 1
+                                    for prev_sno in anchor_taken_steps[ar]
+                                ):
+                                    continue
+                            step_by_no[sno].extra.setdefault("image_refs", []).append(_img_entry(a))
+                            bound_nos.add(sno)
+                            if ar is not None:
+                                anchor_taken_steps.setdefault(ar, []).append(sno)
+                            remaining.remove(a)
 
                         # 优先级 1：figure_no 数字 == 步骤号（图N→步骤N）/步骤文本显式引用图号；
                         #           仅绑到尚未被内容匹配占用的步骤
@@ -2694,7 +2871,10 @@ def node_chunk_documents(ctx: dict):
                             target = None
                             fno = str(a.get("figure_no") or "")
                             mnum = _re_fig.search(r"(\d+)", fno)
-                            if mnum and int(mnum.group(1)) not in bound_nos:
+                            # 仅当 figure_no 在该文档中"有语义意义"时才信任 图N→stepN
+                            # 直接映射；否则它只是 extractor 给的位置序号，绑了就是误绑。
+                            if (figure_no_meaningful and mnum
+                                    and int(mnum.group(1)) not in bound_nos):
                                 target = step_by_no.get(int(mnum.group(1)))
                             if target is None and fno:
                                 for c in step_cards:
@@ -2707,17 +2887,145 @@ def node_chunk_documents(ctx: dict):
                             else:
                                 unbound.append(a)
 
-                        # 优先级 2：剩余图片按 anchor_row 顺序补到仍空的步骤（旧逻辑）。
-                        # 跨轮以"step_card 已带图"为占用判据（第一轮等价于 step_no not in bound_nos）
+                        # 优先级 2：剩余图片按 anchor_row 顺序补到仍空的步骤。
+                        # 两类分流：
+                        #   redirected = anchor 已在 P0 被占用的"剩余张"——必须避开 P0 占用步骤
+                        #     的相邻区，优先派往"前向远端"（row > 已绑 row，且非相邻）。
+                        #   naturals  = anchor 没冲突的图——保持旧位置分配语义（idx→open_steps[idx]
+                        #     的位置对位），让 step5/anchor=14 这类自然对齐保持不被打乱。
+                        # 算法：redirects 先选位（_far_score 决定），naturals 再用旧 idx-比例公式
+                        # 取位（被 redirect 占用的位置走"最近空闲"兜底，与旧 si 单一位置接近）。
+                        # 跨轮以"step_card 已带图"为占用判据（第一轮等价于 step_no not in bound_nos）。
                         open_steps = [c for c in step_cards
                                       if not c.extra.get("image_refs")
                                       and c.extra.get("step_no") not in bound_nos]
                         unbound.sort(key=lambda a: (a.get("anchor_row") or 0))
                         if unbound and open_steps:
-                            n = len(open_steps)
-                            for idx, a in enumerate(unbound):
-                                si = idx if len(unbound) == n else min(int(idx * n / len(unbound)), n - 1)
-                                open_steps[si].extra.setdefault("image_refs", []).append(_img_entry(a))
+                            n_open = len(open_steps)
+                            n_un = len(unbound)
+                            consumed = set()  # 已派出的 open_step index
+
+                            def _is_redirect(a):
+                                ar = a.get("anchor_row")
+                                return (ar is not None and ar in anchor_taken_steps
+                                        and step_row_map)
+
+                            def _far_score(idx_chunk, prev_steps):
+                                """挑远端开放步骤——优先 forward (row > max prev_row) 且 row 最大；
+                                forward 不存在则按 backward 距离最远。max() 取胜。"""
+                                i, c = idx_chunk
+                                sr = step_row_map.get(c.extra.get("step_no"))
+                                if sr is None:
+                                    return (-1, 0, 0)
+                                prev_rows = [step_row_map[p] for p in prev_steps if p in step_row_map]
+                                if not prev_rows:
+                                    return (0, 0, sr)
+                                max_prev = max(prev_rows)
+                                is_forward = 1 if sr > max_prev else 0
+                                # forward：sr 越大越好（推到列表末端，让中间空位给 naturals）；
+                                # backward：max_prev-sr 越大越好（离 prev 越远）
+                                return (is_forward, sr if is_forward else -(max_prev - sr), sr)
+
+                            # 1) Redirected 优先派位——claim 远端 slot
+                            for a in unbound:
+                                if not _is_redirect(a):
+                                    continue
+                                ar = a.get("anchor_row")
+                                prev_steps = anchor_taken_steps[ar]
+                                cands = [(i, c) for i, c in enumerate(open_steps)
+                                         if i not in consumed]
+                                if not cands:
+                                    break
+                                target_idx, _ = max(cands, key=lambda ic: _far_score(ic, prev_steps))
+                                open_steps[target_idx].extra.setdefault("image_refs", []).append(_img_entry(a))
+                                consumed.add(target_idx)
+
+                            # 2) Naturals 走旧位置分配——保留 si=idx 的"位置对位"语义。
+                            #    被 redirect 占用的位置：找未 consumed 中距离 nat_si 最近的位
+                            #    （与旧"step_no 顺序"的兜底接近，避免 pack-from-front 错绑）。
+                            # 2a) 兄弟图相似度优先：分配到 nat_si 之前，先看该 asset 是否与某个
+                            #     已绑图（任意 step）视觉描述+OCR bigram Jaccard ≥ 0.30 — 是则把
+                            #     它绑到那个 step（同 step 多图但分布在不同 anchor 的场景：
+                            #     xlsx_sop step2 = anchor=11 电源插入 + anchor=15 电源握持，
+                            #     两图 Jaccard=0.316；同 anchor 不同内容的 step4/step6
+                            #     img0002↔img0004 Jaccard=0.108 远低于阈值，不会误粘连）。
+                            #     必须在 naturals 循环中做（不能在 P1 后做）：sibling 图常自己也
+                            #     是 unbound，要 naturals 把 orig_idx 较小的兄弟先按位置兜进 step
+                            #     后，orig_idx 较大的同源图才能识别到 sibling。
+                            P0_IMG_CAP = 3
+                            def _toks_for_sim(s: str) -> set:
+                                s = (s or "").lower()
+                                cjk = _re_fig.findall(r'[一-鿿]', s)
+                                bigrams = {cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1)}
+                                alnum = set(_re_fig.findall(r'[a-z0-9]{2,}', s))
+                                return bigrams | alnum
+                            def _ref_text(r: dict) -> str:
+                                return ((r.get("visual_summary") or "") + " "
+                                        + (r.get("ocr_text") or "")).strip()
+                            for orig_idx, a in enumerate(unbound):
+                                if _is_redirect(a):
+                                    continue
+                                # 2a sibling pass
+                                a_text = ((a.get("visual_summary") or "") + " "
+                                          + (a.get("ocr_text") or "")).strip()
+                                a_toks = _toks_for_sim(a_text)
+                                sib_step = None
+                                sib_jacc = 0.0
+                                if a_toks:
+                                    for c in step_cards:
+                                        sno = c.extra.get("step_no")
+                                        if sno is None:
+                                            continue
+                                        refs = c.extra.get("image_refs") or []
+                                        if not refs or len(refs) >= P0_IMG_CAP:
+                                            continue
+                                        for r in refs:
+                                            r_toks = _toks_for_sim(_ref_text(r))
+                                            if not r_toks:
+                                                continue
+                                            jacc = len(a_toks & r_toks) / max(len(a_toks | r_toks), 1)
+                                            if jacc > sib_jacc:
+                                                sib_jacc = jacc
+                                                sib_step = sno
+                                sib_bound = False
+                                if sib_step is not None and sib_jacc >= 0.30:
+                                    # 邻接守卫：anchor 已被占用 且 target 与已占 step 相邻 → 让 nat_si 接管
+                                    ar = a.get("anchor_row")
+                                    skip_sib = False
+                                    if ar is not None and ar in anchor_taken_steps and step_row_map:
+                                        target_row = step_row_map.get(sib_step)
+                                        if target_row is not None and any(
+                                            abs(target_row - step_row_map.get(prev_sno, target_row)) <= 1
+                                            for prev_sno in anchor_taken_steps[ar]
+                                        ):
+                                            skip_sib = True
+                                    if not skip_sib:
+                                        step_by_no[sib_step].extra.setdefault("image_refs", []).append(_img_entry(a))
+                                        bound_nos.add(sib_step)
+                                        if ar is not None:
+                                            anchor_taken_steps.setdefault(ar, []).append(sib_step)
+                                        # 同步占位（若 sib_step 仍在 open_steps 中）：避免后续 nat_si
+                                        # 走"距离最近"兜底时再次撞到此 step；step_by_no 引用与 open_steps
+                                        # 同一对象，image_refs 增量也会让后续 open_steps 过滤生效
+                                        # （open_steps 是引用快照，不重算）
+                                        for i, oc in enumerate(open_steps):
+                                            if oc.extra.get("step_no") == sib_step:
+                                                consumed.add(i)
+                                                break
+                                        sib_bound = True
+                                if sib_bound:
+                                    continue
+                                if n_un == n_open:
+                                    nat_si = orig_idx
+                                else:
+                                    nat_si = min(int(orig_idx * n_open / max(n_un, 1)), n_open - 1)
+                                if nat_si in consumed:
+                                    free = [i for i in range(n_open) if i not in consumed]
+                                    if not free:
+                                        break
+                                    nat_si = min(free, key=lambda i: (abs(i - nat_si), i))
+                                open_steps[nat_si].extra.setdefault("image_refs", []).append(_img_entry(a))
+                                consumed.add(nat_si)
 
                     _bind_pool([a for a in assets if a.get("status") == "ROUTE_TO_VECTOR"])
                     _bind_pool([a for a in assets if a.get("status") == "ROUTE_TO_TEXT"])
