@@ -1180,7 +1180,7 @@ const LIVE_API = new URLSearchParams(location.search).get('api');
 let liveSession = null;
 window.LIVE_LOG = [];
 function mapLiveAnswer(resp){
-  if(resp.no_result) return {noResult:true, rephrase:[]};
+  if(resp.no_result) return {noResult:true, rephrase: resp.rephrase || []};
   const blocks = (resp.blocks && resp.blocks.length)
     ? resp.blocks.map(b => b.type==='image'
         ? {type:'image', url:b.url, caption:b.caption||'', alt:b.alt||b.caption||''}
