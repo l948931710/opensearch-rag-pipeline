@@ -19,6 +19,10 @@ import re
 
 os.environ["RAG_ENV"] = "local"
 
+# --strict: 关闭 [:25] 二级 fallback,只用 gt_core(去步骤号前缀后取前 40 字)做 in 匹配。
+# 用途:Day 1 校准 — 真基线 vs 回退基线 delta,据此决定 Day 2 的 DOCX hard 闸阈值。
+STRICT = "--strict" in sys.argv
+
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -160,8 +164,8 @@ for docx_path in docx_files:
                     "gt_core": gt_core[:35],
                     "target_ref": os.path.basename(gt["target_ref"]) if gt["target_ref"] else f"img_{img_idx}",
                 })
-            else:
-                # 二次匹配: 取 GT 文本前 20 字检查
+            elif not STRICT:
+                # 二次匹配: 取 GT 文本前 20 字检查(STRICT 模式跳过,得真基线)
                 gt_core2 = gt_text[:25]
                 if gt_core2 in pl_text:
                     doc_correct += 1
@@ -178,6 +182,14 @@ for docx_path in docx_files:
                         "pl_text": pl_text[:50],
                         "target_ref": os.path.basename(gt["target_ref"]) if gt["target_ref"] else f"img_{img_idx}",
                     })
+            else:
+                # STRICT 模式:gt_core(前 40 字)没命中 = 直接判错,不走 [:25] 回退
+                mismatches.append({
+                    "img_idx": img_idx,
+                    "gt_text": gt_text[:50],
+                    "pl_text": pl_text[:50],
+                    "target_ref": os.path.basename(gt["target_ref"]) if gt["target_ref"] else f"img_{img_idx}",
+                })
 
         accuracy = doc_correct / doc_checked * 100 if doc_checked > 0 else 0
         status = f"{GREEN}✅{RESET}" if accuracy >= 95 else (f"{YELLOW}⚠️{RESET}" if accuracy >= 70 else f"{RED}❌{RESET}")
