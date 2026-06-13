@@ -13,7 +13,7 @@ const pad = (n) => String(n).padStart(3, '0')
 
 const VERDICT_ITEM = {
   type: 'object', additionalProperties: false,
-  required: ['qid','faithfulness','correctness','completeness','relevance','fabricated','appropriate_refusal','overall','verdict','rationale'],
+  required: ['qid','faithfulness','correctness','completeness','relevance','fabricated','appropriate_refusal','image_binding','overall','verdict','rationale'],
   properties: {
     qid: { type: 'string' },
     faithfulness: { type: 'integer', minimum: 1, maximum: 5 },
@@ -22,6 +22,8 @@ const VERDICT_ITEM = {
     relevance: { type: 'integer', minimum: 1, maximum: 5 },
     fabricated: { type: 'boolean' },
     appropriate_refusal: { type: 'boolean' },
+    // image_binding(2026-06-12 UNIFIED-L4):仅 kind="binding" 真分;其它 kind 给 3 中性
+    image_binding: { type: 'integer', minimum: 1, maximum: 5 },
     overall: { type: 'integer', minimum: 1, maximum: 5 },
     verdict: { type: 'string', enum: ['pass','partial','fail'] },
     rationale: { type: 'string' },
@@ -39,6 +41,7 @@ Score each dimension as an integer 1-5:
 - correctness: does the ANSWER agree with the GOLD points/facts (or context for negatives)? 5=correct, 1=wrong. For a negative, a correct refusal/"not available" = 5; a confident wrong/invented answer = 1.
 - completeness: does it cover the key points asked for? 5=complete, 1=misses everything. For negatives set 3.
 - relevance: does it actually address the question (not evasive/off-topic)? 5=on-point.
+- image_binding (1-5): ONLY meaningful when kind="binding" (L4-ingestion item with expected_image_refs vs produced_image_refs). 5=every image bound to the right step, semantically aligned; 3=partial/weak alignment; 1=cross-bound or missing. For non-binding items (positive/negative quality eval), set 3 (neutral, not applicable).
 Also set: fabricated (bool: states material facts NOT supported by context_text); appropriate_refusal (bool — for negatives: did it correctly decline / say info unavailable instead of inventing? for positives: set true); overall (1-5 holistic given the kind); verdict (pass|partial|fail); rationale (one concise sentence).
 Be strict, consistent, and calibrated. Return ONE verdict object per item, echoing its exact qid.`
 

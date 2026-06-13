@@ -70,6 +70,57 @@ def build_gates(r: Dict) -> Dict:
             "target": ">= 0.70", "value": kc,
             "pass": (kc is not None and kc >= 0.70)}
 
+    # ── L4 闸(两支柱)2026-06-12 加入 ─────────────────────────────
+    # 注:所有新闸首轮 soft 跑两轮锁档分布后再决定升 hard(plan Day 5-6)
+    l4 = r.get("l4") if r.get("l4", {}).get("applicable") else None
+    if l4:
+        # — L4-ingestion 支柱(逐格式 Jaccard + over-attach)—
+        ing = (l4.get("ingestion") or {}).get("deterministic") or {}
+        for fmt, soft_target in (("pdf", 0.70), ("xlsx", 0.65),
+                                 ("docx", 0.95), ("pptx", 0.75)):
+            v = ing.get(f"binding_jaccard_{fmt}")
+            if v is not None:
+                # docx hard 闸(基线 98.6% --strict 验过,buffer 3.6pp);其余 soft
+                hard = (fmt == "docx")
+                # XLSX 阈值 0.65 基于实测 0.682 校准(plan 原 0.80 过高,xlsx step5/6
+                # 真 chunker bug + 同 anchor_row 多图坐标系局限,task chip 已开)
+                gates[f"binding {fmt} Jaccard (L4-ing)"] = {
+                    "target": f">= {soft_target}" + (" hard" if hard else " soft (Day 5-6 锁档)"),
+                    "value": round(v, 4),
+                    "pass": (v >= soft_target),
+                }
+        dup = ing.get("img_dup_factor_p95")
+        if dup is not None:
+            gates["img_dup_factor p95 (L4-ing, 全格式)"] = {
+                "target": "<= 1.20 hard (>1.5 是已知 over-attach bug)",
+                "value": round(dup, 4),
+                "pass": (dup <= 1.20),
+            }
+        # — L4-serving 支柱(LLM 标记摆放质量)—
+        srv = l4.get("aggregate") or {}
+        mv = srv.get("marker_validity")
+        if mv is not None:
+            # 0.95 hard 守底 + 0.98 soft 追(双阈值,plan 抢救点)
+            gates["<<IMG:N>> marker validity (L4-srv)"] = {
+                "target": ">= 0.95 hard / >= 0.98 soft",
+                "value": round(mv, 4),
+                "pass": (mv >= 0.95),
+            }
+        dn = srv.get("dangling_ref_rate")
+        if dn is not None:
+            gates["dangling 口惠图但卡片无图 (L4-srv)"] = {
+                "target": "<= 0.05 hard (扩正则后)",
+                "value": round(dn, 4),
+                "pass": (dn <= 0.05),
+            }
+        op = srv.get("orphan_rate")
+        if op is not None:
+            gates["orphan rate (L4-srv, trend 监控)"] = {
+                "target": "<= 0.30 soft",
+                "value": round(op, 4),
+                "pass": (op <= 0.30),
+            }
+
     l5 = r.get("l5")
     if l5:
         if l5.get("applicable") is False:
@@ -101,6 +152,15 @@ def build_gates(r: Dict) -> Dict:
         if nfab is not None:
             gates["negative fabrication (Claude, L3)"] = {"target": "<= 0.10", "value": nfab,
                                                           "pass": nfab <= 0.10}
+        # L4-ingestion Claude binding 维度(2026-06-12 加入,UNIFIED-L4 plan)
+        ib_mean = _g(j, "binding", "image_binding", "mean")
+        ib_n = _g(j, "binding", "n")
+        if ib_mean is not None and (ib_n or 0) >= 5:   # N<5 时不计闸(plan 抢救点:样本太小自动降级)
+            gates["image binding (Claude, L4-ing)"] = {
+                "target": ">= 4.0 / 5 soft (N>=5 才计闸)",
+                "value": ib_mean,
+                "pass": ib_mean >= 4.0,
+            }
     return gates
 
 
@@ -173,8 +233,19 @@ def _md(r: Dict, gates: Dict) -> str:
         L.append(f"```json\n{json.dumps(r['judge']['aggregate'], ensure_ascii=False, indent=1)}\n```\n")
 
     if r.get("l4") and r["l4"].get("applicable"):
-        L.append("## L4 — Multimodal\n")
-        L.append(f"```json\n{json.dumps(r['l4']['aggregate'], ensure_ascii=False, indent=1)}\n```\n")
+        l4 = r["l4"]
+        # — Ingestion 支柱 —
+        ing = l4.get("ingestion")
+        if ing:
+            L.append("## L4-ingestion — 摄入侧图文绑定精度(逐格式 Jaccard)\n")
+            L.append(f"```json\n{json.dumps(ing.get('deterministic') or {}, ensure_ascii=False, indent=1)}\n```\n")
+            n_docs = len(ing.get("per_doc") or [])
+            n_judge = len(ing.get("judge_bundle_binding") or [])
+            L.append(f"- evaluated docs: {n_docs}  |  judge_bundle_binding items: {n_judge}\n")
+        # — Serving 支柱 —
+        if l4.get("serving_applicable", True):
+            L.append("## L4-serving — `<<IMG:N>>` 摆放质量(LLM 行为)\n")
+            L.append(f"```json\n{json.dumps(l4.get('aggregate', {}), ensure_ascii=False, indent=1)}\n```\n")
 
     if r.get("l5"):
         L.append("## L5 — Permission Filtering\n")

@@ -38,6 +38,9 @@ Also set:
 - fabricated (boolean): did the answer state facts not supported by context?
 - appropriate_refusal (boolean): ONLY for negatives — did it correctly decline / say the
   info isn't available, instead of inventing an answer? (positives: set true.)
+- image_binding (1-5): ONLY meaningful when KIND="binding" (L4-ingestion bundle item).
+  5 = 每张图都贴在对应步骤旁、语义完全对齐;3 = 部分正确或弱身份对齐;1 = 张冠李戴或缺图。
+  For non-binding items (positive/negative quality), set 3 (neutral, not applicable).
 - overall (1-5): holistic answer quality given the kind.
 - verdict: "pass" | "partial" | "fail".
 - rationale: one sentence.
@@ -48,7 +51,8 @@ VERDICT_ITEM_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": ["qid", "faithfulness", "correctness", "completeness", "relevance",
-                 "fabricated", "appropriate_refusal", "overall", "verdict", "rationale"],
+                 "fabricated", "appropriate_refusal", "image_binding",
+                 "overall", "verdict", "rationale"],
     "properties": {
         "qid": {"type": "string"},
         "faithfulness": {"type": "integer", "minimum": 1, "maximum": 5},
@@ -57,6 +61,9 @@ VERDICT_ITEM_SCHEMA = {
         "relevance": {"type": "integer", "minimum": 1, "maximum": 5},
         "fabricated": {"type": "boolean"},
         "appropriate_refusal": {"type": "boolean"},
+        # image_binding(2026-06-12 加入,UNIFIED-L4 plan):
+        # 仅对 kind="binding"(L4-ingestion bundle)有意义;非 binding case 中性 3
+        "image_binding": {"type": "integer", "minimum": 1, "maximum": 5},
         "overall": {"type": "integer", "minimum": 1, "maximum": 5},
         "verdict": {"type": "string", "enum": ["pass", "partial", "fail"]},
         "rationale": {"type": "string"},
@@ -97,8 +104,17 @@ def merge_panel(bundle: List[Dict], panels: List[Dict]) -> Dict:
         agg["rationales"] = [v.get("rationale", "")[:200] for v in vs]
         per_query.append(agg)
 
+    # 收集 image_binding 字段(若 verdicts 提供)— 仅对 binding case 聚合,
+    # 非 binding case 给 3 中性占位(RUBRIC 约定),不入 binding 聚合块
+    for qid_ in by_qid:
+        ib_vals = [v.get("image_binding") for v in by_qid[qid_] if v.get("image_binding") is not None]
+        agg_row = next((r for r in per_query if r["qid"] == qid_), None)
+        if agg_row is not None and ib_vals:
+            agg_row["image_binding"] = round(mean(ib_vals), 3)
+
     pos = [q for q in per_query if q["kind"] == "positive"]
     neg = [q for q in per_query if q["kind"] == "negative"]
+    binding = [q for q in per_query if q["kind"] == "binding"]
 
     def agg_dim(rows, d):
         ci = bootstrap_ci([r[d] for r in rows if r.get(d) is not None])
@@ -106,10 +122,19 @@ def merge_panel(bundle: List[Dict], panels: List[Dict]) -> Dict:
                 "ci": [round(ci["lo"], 3), round(ci["hi"], 3)] if ci["lo"] is not None else None,
                 "n": ci["n"]}
 
+    # L4-ingestion 评审块(可选,仅 binding kind 有值)— 用于 L4-ingestion 软闸
+    binding_block = None
+    if binding:
+        binding_block = {
+            "image_binding": agg_dim(binding, "image_binding"),
+            "n": len(binding),
+        }
+
     aggregate = {
         "n_judges": len(panels),
         "judges": [p.get("judge") for p in panels],
         "positives": {d: agg_dim(pos, d) for d in _DIMS},
+        "binding": binding_block,
         "negatives": {
             "overall": agg_dim(neg, "overall"),
             "faithfulness": agg_dim(neg, "faithfulness"),

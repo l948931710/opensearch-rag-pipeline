@@ -86,14 +86,42 @@ def phase_run(args):
         print(f"   deterministic={json.dumps(results['l3']['deterministic'], ensure_ascii=False)}")
 
     if "l4" in layers:
-        print("\n[L4] multimodal ...")
+        print("\n[L4] multimodal (ingestion + serving) ...")
         from .layers import l4_multimodal
-        results["l4"] = l4_multimodal.run(cases)
+        # L4-ingestion 触发:env EVAL_L4_GT_FILES(逗号分隔)+ EVAL_L4_DOCS_DIR
+        # 默认指向 eval_samples/ground_truth + documents(repo 外仓)
+        _data = os.path.expanduser("~/Downloads/opensearch-rag-data/eval_samples")
+        gt_files_env = os.environ.get("EVAL_L4_GT_FILES")
+        if gt_files_env:
+            gt_files = [p for p in gt_files_env.split(",") if p.strip()]
+        else:
+            gt_files = [p for p in [
+                os.path.join(_data, "ground_truth", "gt_pdf_analysis.json"),
+                os.path.join(_data, "ground_truth", "gt_xlsx_pptx_analysis.json"),
+                os.path.join(_data, "ground_truth", "gt_docx_analysis.json"),
+            ] if os.path.exists(p)]
+        docs_dir = os.environ.get("EVAL_L4_DOCS_DIR") or os.path.join(_data, "documents")
+        results["l4"] = l4_multimodal.run(
+            cases,
+            gt_files=gt_files if gt_files else None,
+            docs_dir=docs_dir if os.path.isdir(docs_dir) else None,
+        )
         if results["l4"].get("applicable"):
-            json.dump(results["l4"]["judge_bundle_mm"],
-                      open(os.path.join(outdir, "judge_bundle_mm.json"), "w"),
-                      ensure_ascii=False, indent=1)
-        print(f"   applicable={results['l4'].get('applicable')}")
+            # serving bundle(可能为空)
+            if results["l4"].get("judge_bundle_mm"):
+                json.dump(results["l4"]["judge_bundle_mm"],
+                          open(os.path.join(outdir, "judge_bundle_mm.json"), "w"),
+                          ensure_ascii=False, indent=1)
+            # ingestion bundle(新:L4-ingestion Claude image_binding 评审用)
+            if results["l4"].get("judge_bundle_binding"):
+                json.dump(results["l4"]["judge_bundle_binding"],
+                          open(os.path.join(outdir, "judge_bundle_binding.json"), "w"),
+                          ensure_ascii=False, indent=1)
+        ing_det = (results["l4"].get("ingestion") or {}).get("deterministic", {})
+        print(f"   applicable={results['l4'].get('applicable')}  "
+              f"ingestion_pdf={ing_det.get('binding_jaccard_pdf')}  "
+              f"ingestion_xlsx={ing_det.get('binding_jaccard_xlsx')}  "
+              f"dup_p95={ing_det.get('img_dup_factor_p95')}")
 
     if "l5" in layers:
         print("\n[L5] permission filtering ...")
