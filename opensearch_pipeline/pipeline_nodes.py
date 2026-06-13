@@ -2270,6 +2270,85 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                 and best_cir_jacc >= 0.5
                                 and best_cir_jacc >= max(geo_jacc, 0.01) * 1.5):
                             best_idx = best_cir_idx
+                # ── Path C: 跨页 range-ref override（D8 Phase 10,同 env-gate）──
+                # step text 含"X-Y步操作"圈号范围引用(如 step 3.1 "扫码报检
+                # 界面(如下图②-⑥步操作)") 时,把该 step 范围内的 image 跨页
+                # 抢回。Path A/B 限同页 anchors,无法处理跨页 — pdf_sop image 9
+                # 在 page 3 但 step 3.1 在 page 2,几何走 step 4.2 错绑。
+                # 守门(双信号防误拉):
+                #   1. image 圈号(OCR + vlm_annotation_map.keys)∩ range ≥ 2 hit
+                #   2. image text(visual_summary + ocr) 与 range-ref step text
+                #      bigram 命中 ≥ 8(语义二次确认,避免 image 10 圈号 hit 高
+                #      但 visual "手写记录"与 step 3.1 "U8 扫码报检"无关被误拉)
+                # 全文扫含 STEP_BOUNDARY 的 step 起始块(不限同页),逆序优先前
+                # 页 step。env-gated 默认 OFF。
+                if (best_idx is not None and os.getenv(
+                        "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
+                        in ("1", "true", "yes")):
+                    _CIRCLED_C = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+                    _ann_map = va.get("vlm_annotation_map") or {}
+                    img_cir_all = (
+                        set(c for c in (va.get("ocr_text") or "") if c in _CIRCLED_C)
+                        | set(k for k in _ann_map.keys() if k in _CIRCLED_C)
+                    )
+                    img_cir_nums = set(_CIRCLED_C.index(c) + 1 for c in img_cir_all)
+                    if len(img_cir_nums) >= 2:
+                        _RANGE_RE = re.compile(
+                            r'(['
+                            r'①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+                            r'])[～至\-]('
+                            r'[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+                            r'])'
+                        )
+                        img_text_all = (
+                            (va.get("visual_summary") or "") + " "
+                            + (va.get("ocr_text") or "")
+                        )
+
+                        def _bg_c(t):
+                            s = set()
+                            for k in range(len(t) - 1):
+                                s.add(t[k:k + 2])
+                            return s
+
+                        img_bg = _bg_c(img_text_all)
+                        best_range_idx = None
+                        best_range_score = 0  # (圈号 hit count) * bg overlap
+                        # 逆序扫全 blocks(前页 step 优先)
+                        for ci in range(len(blocks) - 1, -1, -1):
+                            if ci == best_idx:
+                                continue
+                            cblk = blocks[ci]
+                            ctxt = ((cblk.get("text", "")
+                                     if isinstance(cblk, dict)
+                                     else getattr(cblk, "text", ""))
+                                    or "")
+                            if not DocumentChunker._STEP_BOUNDARY_RE.search(ctxt):
+                                continue
+                            for m_r in _RANGE_RE.finditer(ctxt):
+                                a_c, b_c = m_r.group(1), m_r.group(2)
+                                a_n = _CIRCLED_C.index(a_c) + 1
+                                b_n = _CIRCLED_C.index(b_c) + 1
+                                if a_n > b_n:
+                                    a_n, b_n = b_n, a_n
+                                hit = sum(1 for n in img_cir_nums
+                                          if a_n <= n <= b_n)
+                                if hit < 2:
+                                    continue
+                                # 双信号守门:bigram 命中 ≥ 3(step text 通常短,
+                                # 3 个主题词共现已是强语义信号 — image 9 step
+                                # 3.1 实证 bg={U8,8系,系统,界面}=4 hit,而 image
+                                # 10 vs step 3.1 bg=0,区分度清晰)
+                                bg_hit = len(img_bg & _bg_c(ctxt))
+                                if bg_hit < 3:
+                                    continue
+                                score = hit * bg_hit
+                                if score > best_range_score:
+                                    best_range_score = score
+                                    best_range_idx = ci
+                                    break  # 同 block 只算一个 range-ref
+                        if best_range_idx is not None:
+                            best_idx = best_range_idx
                 img_block = {
                     "block_type": "image_ref",
                     "text": "",
