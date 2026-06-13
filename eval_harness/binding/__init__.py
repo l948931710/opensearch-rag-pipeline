@@ -15,10 +15,13 @@ XLSX block_index / PPTX slide+shape)抽到独立子包,关注点分离:
 分离思路,这样未来若需拆出 l4_binding.py 仅需一行 import 改动。
 """
 
-from .ref_keys import ImageRef, jaccard, parse_ref_dict
+from .ref_keys import ImageRef, jaccard, parse_ref_dict, img_dup_factor
 from .gt_loader import GtChunk, GtDoc, load_gt, validate_gt_against_manifest
+# ingestion_binding 不在 __init__ 提前 import — 它会触发 opensearch_pipeline.*
+# 重链,反污染 pytest collection 阶段(envboot fix 同款问题)。
+# 用法:from eval_harness.binding import ingestion_binding;ingestion_binding.run(...)
 
 __all__ = [
-    "ImageRef", "jaccard", "parse_ref_dict",
+    "ImageRef", "jaccard", "parse_ref_dict", "img_dup_factor",
     "GtChunk", "GtDoc", "load_gt", "validate_gt_against_manifest",
 ]
