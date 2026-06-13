@@ -572,9 +572,11 @@ def _process_rag_query(
             ):
                 return
 
-        # 2. LLM 生成（传入多轮对话历史）
-        #    纯文本模式（RAG_PURE_TEXT）下生成纯文字回答，下游跳过图文穿插
-        pure_text = get_config().rag.pure_text
+        # 2. LLM 生成（传入多轮对话历史）。
+        #    机器人渠道【始终纯文本】——与流式卡片调用点（上方 pure_text=True）一致，
+        #    写死在调用点、不读全局：钉钉卡片端图文体验差，图文穿插是小程序的能力。
+        #    全局 RAG_PURE_TEXT 从此只作为 /api/ask（小程序）的默认值，生产不设=图文。
+        pure_text = True
         result = generate_answer(
             question,
             chunks,
