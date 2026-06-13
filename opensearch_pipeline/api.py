@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -47,6 +47,7 @@ from opensearch_pipeline.content_blocks_builder import (
     strip_image_markers,
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
+from opensearch_pipeline.rate_limiter import LIMITER, resolve_client_ip
 from opensearch_pipeline.answer_flow import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -89,6 +90,10 @@ async def _lifespan(_app: FastAPI):
         start_stream_client()
     except Exception:
         logger.warning("启动钉钉 Stream 客户端失败（忽略，HTTP 回调模式继续可用）", exc_info=True)
+    try:
+        logger.info("Serving 限流配置：%s", LIMITER.describe())
+    except Exception:
+        logger.warning("读取限流配置失败（忽略）", exc_info=True)
     yield
 
 
@@ -280,6 +285,46 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
 
 
 # ═══════════════════════════════════════════════════════════════
+# 公网防刷准入（rate_limiter 四层：限频/匿名IP限额/深思日配额/全局日熔断）
+# ═══════════════════════════════════════════════════════════════
+
+def _client_ip(request: Optional[Request]) -> str:
+    """从请求解析真实客户端 IP（EIP 直连 / SLB 后两形态自适应，见 resolve_client_ip）。"""
+    if request is None or request.client is None:
+        return "unknown"
+    return resolve_client_ip(request.client.host, request.headers.get("x-forwarded-for"))
+
+
+def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity], *,
+                        scope: str, thinking: bool = False, count_llm: bool = False) -> None:
+    """限流准入：拒绝抛 429/403/503（中文 detail 小程序错误卡直接可见）+ Retry-After。
+
+    计数主体：已验证令牌按 user_id（令牌即身份，限额更宽）；匿名按客户端 IP（严格档）。
+    请求体里的 user_id 是未鉴权字段，绝不能用作限流 key（攻击者可随意轮换）。
+    限流器自身异常 fail-open 放行——防护组件绝不拖垮回答主链路（项目降级约定）。
+    /api/health 与 /dingtalk/*（验签 + Stream 出站）不经过本函数。
+    """
+    denial = None
+    try:
+        if identity and identity.user_id:
+            actor, is_user = f"u:{identity.user_id}", True
+        else:
+            actor, is_user = f"ip:{_client_ip(request)}", False
+        if scope == "ask":
+            denial = LIMITER.admit_ask(actor, is_user=is_user,
+                                       thinking=thinking, count_llm=count_llm)
+        else:
+            denial = LIMITER.admit_aux(actor)
+    except Exception:
+        logger.warning("限流器内部异常（fail-open 放行）", exc_info=True)
+        return
+    if denial is not None:
+        headers = {"Retry-After": str(denial.retry_after)} if denial.retry_after > 0 else None
+        raise HTTPException(status_code=denial.status_code, detail=denial.message,
+                            headers=headers)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Endpoints
 # ═══════════════════════════════════════════════════════════════
 
@@ -290,12 +335,14 @@ async def health_check():
 
 
 @app.post("/api/auth/dingtalk", response_model=DingtalkAuthResponse)
-def auth_dingtalk(req: DingtalkAuthRequest):
+def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
     """钉钉小程序免登：authCode → userid → 部门/姓名 → 签发会话令牌。
 
     部门在服务端解析后写入令牌；客户端只持有短期 authCode 与签发的令牌，
     AppSecret / 签名密钥永不下发到客户端。模拟模式下返回测试用户（见 _exchange_authcode_for_userid）。
     """
+    # 按 IP 限频（身份尚未建立）：滥打 authCode 烧钉钉 OpenAPI 配额，可能拖垮发卡链路
+    _enforce_rate_limit(request, None, scope="aux")
     userid = _exchange_authcode_for_userid(req.auth_code)
     if not userid:
         raise HTTPException(status_code=401, detail="免登失败：authCode 无效或已过期")
@@ -310,8 +357,11 @@ def auth_dingtalk(req: DingtalkAuthRequest):
 
 
 @app.post("/api/search", response_model=SearchResponse)
-def search(req: SearchRequest, identity: Optional[Identity] = Depends(current_identity)):
+def search(req: SearchRequest, request: Request,
+           identity: Optional[Identity] = Depends(current_identity)):
     """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""
+    # 与问答共享限频/日配额（embedding+HA3 也是真金白银），但不计入全局 LLM 熔断
+    _enforce_rate_limit(request, identity, scope="ask", count_llm=False)
     t0 = time.time()
     try:
         # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
@@ -374,12 +424,16 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_i
 
 
 @app.post("/api/ask", response_model=AskResponse)
-def ask(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
+def ask(req: AskRequest, request: Request,
+        identity: Optional[Identity] = Depends(current_identity)):
     """非流式问答接口 — 检索 + LLM 一次性返回。
 
     用 def（非 async）声明：内部全是同步阻塞 I/O（embedding HTTP、HA3、pymysql、LLM
     requests.post），FastAPI 会把 def 处理器放进线程池执行，避免阻塞事件循环、拖垮并发请求。
     """
+    # 防刷准入：须在 _prepare_ask（embedding/HA3/rerank 开销）之前拒绝
+    _enforce_rate_limit(request, identity, scope="ask",
+                        thinking=bool(req.thinking), count_llm=True)
     (t0, session_id, merged_history, uid, user_dept,
      chunks, t_retrieval, retrieval_latency_ms) = _prepare_ask(req, identity)
 
@@ -524,7 +578,8 @@ _SSE_HEADERS = {
 
 
 @app.post("/api/ask/stream")
-def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_identity)):
+def ask_stream(req: AskRequest, request: Request,
+               identity: Optional[Identity] = Depends(current_identity)):
     """SSE 流式问答接口 — 检索 + LLM 逐 token 输出。
 
     SSE 事件格式：
@@ -543,6 +598,10 @@ def ask_stream(req: AskRequest, identity: Optional[Identity] = Depends(current_i
         完成后定稿，故 `content_blocks` 帧总是在 `done` 之后、`[DONE]` 之前发出。
     """
     import json
+
+    # 防刷准入：与 /api/ask 同层（在检索开销与 StreamingResponse 之前拒绝，普通 JSON 4xx/5xx）
+    _enforce_rate_limit(request, identity, scope="ask",
+                        thinking=bool(req.thinking), count_llm=True)
 
     # 图文模式才补充图片（纯文本模式不展示图片，跳过 co-surfacing 的额外 HA3 查询）
     _pure = req.pure_text if req.pure_text is not None else get_config().rag.pure_text
@@ -689,8 +748,10 @@ class FeedbackRequest(BaseModel):
 
 
 @app.post("/api/feedback")
-def submit_feedback(req: FeedbackRequest, identity: Optional[Identity] = Depends(current_identity)):
+def submit_feedback(req: FeedbackRequest, request: Request,
+                    identity: Optional[Identity] = Depends(current_identity)):
     """反馈接口 — 供前端/管理后台使用。"""
+    _enforce_rate_limit(request, identity, scope="aux")
     # 有令牌时以令牌身份为准，避免客户端伪造 user_id（uk_message_user 去重才可信）
     uid = identity.user_id if identity else req.user_id
     success = handle_feedback(
@@ -710,7 +771,7 @@ class SessionClearRequest(BaseModel):
 
 
 @app.post("/api/session/clear")
-def session_clear(req: SessionClearRequest,
+def session_clear(req: SessionClearRequest, request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
     """清除服务端会话历史（小程序「清除会话」/ 钉钉「新会话」）。
 
@@ -719,6 +780,7 @@ def session_clear(req: SessionClearRequest,
     其余 session_id（服务端 UUID / 钉钉会话 key，不可枚举）按持有即所有处理。
     幂等：会话不存在/已过期返回 200 + cleared=false（客户端结果一致：下一轮是全新会话）。
     """
+    _enforce_rate_limit(request, identity, scope="aux")
     if req.session_id.startswith("miniapp:"):
         if not identity or req.session_id != f"miniapp:{identity.user_id}":
             raise HTTPException(status_code=403, detail="无权清除该会话")
@@ -745,12 +807,14 @@ class ResignImagesRequest(BaseModel):
 
 
 @app.post("/api/resign-images")
-def resign_images(req: ResignImagesRequest):
+def resign_images(req: ResignImagesRequest, request: Request,
+                  identity: Optional[Identity] = Depends(current_identity)):
     """过期图片重签：OSS 签名 URL 默认 1 小时过期，客户端凭 blocks 里的
     oss_key 换取新签名 URL（「图片已过期 · 点按重新加载」的真实后半段）。
 
     单 key 失败/非法不影响其它 key（返回空串，客户端保留过期占位态）。
     """
+    _enforce_rate_limit(request, identity, scope="aux")
     from opensearch_pipeline.oss_url import generate_signed_url
 
     urls: Dict[str, str] = {}
@@ -791,6 +855,7 @@ class HistoryResponse(BaseModel):
 
 @app.get("/api/history", response_model=HistoryResponse)
 def history(
+    request: Request,
     limit: int = 20,
     offset: int = 0,
     identity: Optional[Identity] = Depends(current_identity),
@@ -801,6 +866,7 @@ def history(
     blocks 经 refresh_image_block_urls 重签，历史里的图文答案可直接渲染；
     answer 字段已剥离 <<IMG:N>> 占位符（落库保留原始 answer 的约定不变）。
     """
+    _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="历史记录需要登录后查看")
     limit = max(1, min(limit, 50))
@@ -867,8 +933,10 @@ _HOT_Q_EXCLUDE_USER_PREFIX = ("miniapp-proto", "eval-", "test-")
 
 
 @app.get("/api/hot-questions")
-def hot_questions():
+def hot_questions(request: Request,
+                  identity: Optional[Identity] = Depends(current_identity)):
     """真实高频问题 top-N，驱动 chat 页「示例问题」快捷栏。"""
+    _enforce_rate_limit(request, identity, scope="aux")
     now = time.time()
     cached = _hot_questions_cache["data"]
     if cached is not None and now - _hot_questions_cache["ts"] < _HOT_QUESTIONS_TTL_S:
