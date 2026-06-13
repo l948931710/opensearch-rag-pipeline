@@ -316,11 +316,15 @@ def _doc_to_judge_bundle_item(
         "produced_chunk_type": _gv(produced, "chunk_type"),
         "produced_chunk_text_excerpt": (_gv(produced, "chunk_text") or "")[:300],
         "produced_image_refs": [
+            # 2026-06-13: 取消 [:5] 截断 —— 旧 cap 让 6+ 图的 step_card（如 it_xxh_003
+            # 第五步 6 张硬盘图）在 judge bundle 里看起来漏图，但 jaccard_score 计算
+            # 用的是 pred_refs（无截断）所以分数对。误导了 D8 Phase 5 报告把"应是
+            # 显示截断"诊断成"chunker 漏绑 image 25"。pred_refs 已是真值，dump 不应另拷一份限长。
             {k: (img.get(k) or img.get("page_num") if k == "page" else img.get(k))
              for k in ("image_index", "page_num", "in_page_idx", "block_index",
                       "anchor_row", "slide_no", "visual_summary", "ocr_text")
              if img.get(k) is not None}
-            for img in img_refs_raw[:5]
+            for img in img_refs_raw
         ],
         "jaccard_score": round(score, 4),
     }
