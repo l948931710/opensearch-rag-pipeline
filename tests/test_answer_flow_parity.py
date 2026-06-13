@@ -244,7 +244,12 @@ class TestBotSyncBookkeeping:
         self, mock_retrieve, mock_gen, mock_append, mock_log, mock_dept, mock_card,
         monkeypatch,
     ):
-        """同步成功路径的落库字段全集（user_dept/conversation_type/content_blocks_json 都在）。"""
+        """同步成功路径的落库字段全集（user_dept/conversation_type 都在）。
+
+        机器人渠道纯文本已写死在调用点（088a6ec）：content_blocks 不再构建，
+        落库 content_blocks_json 必须为 None。monkeypatch 保留作绊线 ——
+        若有人把 bot 路径改回图文，这里会拿到非 None 立即失败。
+        """
         import opensearch_pipeline.content_blocks_builder as cb
         monkeypatch.setattr(cb, "build_content_blocks",
                             lambda ans, chunks: [{"type": "image", "url": "http://x/a.png"}])
@@ -265,7 +270,7 @@ class TestBotSyncBookkeeping:
         assert kw["model_name"] == "qwen-test"
         assert kw["opensearch_hit_count"] == 1
         assert kw["top_score"] == 8.5
-        assert kw["content_blocks_json"] and "image" in kw["content_blocks_json"]
+        assert kw["content_blocks_json"] is None
         mock_append.assert_called_once()
         assert mock_append.call_args.args[0] == "cid1:staff9"
 
