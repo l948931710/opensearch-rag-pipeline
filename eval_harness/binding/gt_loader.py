@@ -80,7 +80,12 @@ def _detect_fmt(label: str) -> str:
 def _parse_chunk(d: Dict[str, Any], fmt: str) -> GtChunk:
     raw_refs = d.get("expected_image_refs") or []
     refs = [parse_ref_dict(r, fmt) for r in raw_refs]
-    has_strong = bool(refs) and all(not r.is_weak() for r in refs)
+    # has_strong_refs 语义 = "可入 main jaccard 分子":
+    #  - 空集 refs(显式负例,该 step 不该有图)→ True(empty-vs-empty=1.0 入分子)
+    #  - 全 strong refs(每张图都有完整次级标识)→ True
+    #  - 任一 weak ref(PDF page-only / PPTX slide-only)→ False(presence-only,仅 trend)
+    # 注意:空 refs 也算"all strong" — all() over empty == True,正是想要的(显式负例)
+    has_strong = all(not r.is_weak() for r in refs)
     return GtChunk(
         label=d.get("label", ""),
         chunk_type=d.get("chunk_type", ""),

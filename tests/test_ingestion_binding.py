@@ -72,14 +72,15 @@ def test_pred_refs_extract_docx():
 
 
 def test_pred_refs_extract_pdf():
+    """PDF v2 坐标系:用 image_index 主键(extractor 全文 1-based),page 字段辅助。"""
     chunk = FakeChunk("...", extra={"image_refs": [
-        {"page_num": 3, "image_index_in_page": 1},  # alias 路径
-        {"page": 3, "in_page_idx": 2},               # 标准路径
+        {"page_num": 3, "image_index": 9},
+        {"page": 3, "image_index": 10},
     ]})
     refs = ib._pred_refs_from_chunk(chunk, "pdf")
     assert len(refs) == 2
     assert all(r.page == 3 for r in refs)
-    assert {r.in_page_idx for r in refs} == {1, 2}
+    assert {r.image_index for r in refs} == {9, 10}
 
 
 def test_pred_refs_extract_xlsx_anchor_row_alias():
@@ -210,7 +211,8 @@ def test_run_aggregates_by_fmt_and_emits_main_gates(monkeypatch, tmp_path):
         return [FakeChunk(
             chunk_text="装配 步骤",
             chunk_type="step_card",
-            extra={"image_refs": [{"page_num": 3, "image_index_in_page": 1}]},
+            # PDF 坐标系 v2:用 extractor 的全文 image_index(2026-06-12 修正)
+            extra={"image_refs": [{"image_index": 10, "page_num": 3}]},
         )]
     monkeypatch.setattr(ib, "_extract_and_chunk", fake_extract)
 
@@ -220,13 +222,13 @@ def test_run_aggregates_by_fmt_and_emits_main_gates(monkeypatch, tmp_path):
     (docs_dir / "pdf_sop.pdf").write_bytes(b"")
 
     gt_path = _write_gt_json({
-        "_meta": {"image_ref_scheme": "v1"},
+        "_meta": {"image_ref_scheme": "v2"},
         "pdf_sop": {
             "_doc_meta": {},
             "gt_chunks": [{
                 "label": "x", "chunk_type": "step_card",
                 "keywords": ["装配", "步骤"],
-                "expected_image_refs": [{"page": 3, "in_page_idx": 1}],
+                "expected_image_refs": [{"image_index": 10, "page": 3}],
             }],
         },
     })

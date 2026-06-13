@@ -26,33 +26,47 @@ class ImageRef:
     """图编号坐标 — 四格式 union 表达。
 
     fmt 决定哪些字段是 load-bearing:
-      docx:  image_index 必填
-      pdf:   page 必填, in_page_idx 可选(缺省=弱身份,仅页级 presence)
-      xlsx:  block_index 必填
-      pptx:  slide_no 必填, shape_idx 可选(缺省=slide 级 presence)
+      docx:  image_index 必填(UnifiedExtractor 全文 1-based 序号)
+      pdf:   image_index 必填(同 docx,extractor 全文 1-based;Funnel-1 弃的
+             装饰图会留序号空位)。page 字段保留作辅助/可读性,不参与判等
+      xlsx:  block_index 必填(UnifiedExtractor block 流序号,image 也作 block 计)
+      pptx:  slide_no 必填, shape_idx 可选(缺省=slide 级 presence,弱身份)
+
+    2026-06-12 修正:PDF 由 (page, in_page_idx) 改 image_index 主键 —
+    原设计臆造"页内重启 in_page_idx",与生产 chunker 的全文 image_index 脱节,
+    实测 PDF SOP 首轮 Jaccard=0.0(坐标系错位全 miss)。
     """
     fmt: str                                # 'docx' | 'pdf' | 'xlsx' | 'pptx'
-    image_index: Optional[int] = None       # docx
-    page: Optional[int] = None              # pdf
-    in_page_idx: Optional[int] = None       # pdf (可选)
+    image_index: Optional[int] = None       # docx + pdf 主键
+    page: Optional[int] = None              # pdf 辅助(可读性,不参与 strict 判等)
+    in_page_idx: Optional[int] = None       # [deprecated] PDF 旧坐标系遗留,新 GT 不要用
     block_index: Optional[int] = None       # xlsx
     slide_no: Optional[int] = None          # pptx
     shape_idx: Optional[int] = None         # pptx (可选)
 
     def is_weak(self) -> bool:
-        """弱身份 = 缺次级标识符的 PDF/PPTX,仅做 presence 比对,不做精度判定。"""
-        if self.fmt == "pdf" and self.in_page_idx is None:
+        """弱身份 = 缺主键的 ref,仅做 presence 比对,不做精度判定。
+
+        PDF 标了 page 但没标 image_index = weak(GT 标注未细化时的中间态)。
+        """
+        if self.fmt == "pdf" and self.image_index is None:
             return True
         if self.fmt == "pptx" and self.shape_idx is None:
             return True
         return False
 
     def primary_key(self) -> tuple:
-        """主键:用于"出现/不出现"层面的相等判定(忽略弱身份次级)。"""
+        """主键:用于"出现/不出现"层面的相等判定。
+
+        weak PDF GT(只标 page)用 page 级 presence 命名空间;strong 走 image_index。
+        命名空间不同(`pdf` vs `pdf:page`)避免 weak 与 strong 误等。
+        """
         if self.fmt == "docx":
             return ("docx", self.image_index)
         if self.fmt == "pdf":
-            return ("pdf", self.page)
+            if self.image_index is not None:
+                return ("pdf", self.image_index)
+            return ("pdf:page", self.page)
         if self.fmt == "xlsx":
             return ("xlsx", self.block_index)
         if self.fmt == "pptx":
@@ -64,7 +78,7 @@ class ImageRef:
         if self.fmt == "docx":
             return ("docx", self.image_index)
         if self.fmt == "pdf":
-            return ("pdf", self.page, self.in_page_idx)
+            return ("pdf", self.image_index)
         if self.fmt == "xlsx":
             return ("xlsx", self.block_index)
         if self.fmt == "pptx":

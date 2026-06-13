@@ -67,15 +67,19 @@ def _detect_fmt(path: str) -> str:
     raise ValueError(f"不支持的扩展名: {ext}(仅 docx/pdf/xlsx/pptx)")
 
 
-def _build_ref_key(fmt: str, asset: dict, in_page_idx: int | None = None) -> dict:
-    """从 asset dict 推出 ref_key(union ImageRef 形态)。"""
+def _build_ref_key(fmt: str, asset: dict) -> dict:
+    """从 asset dict 推出 ref_key(union ImageRef 形态)。
+
+    PDF 用 extractor 给的全文 image_index(2026-06-12 修正,原按页重启 in_page_idx
+    与生产 chunker 的全文 image_index 不匹配,导致 GT 坐标系错位)。
+    """
     rk: dict = {}
     if fmt == "docx":
         rk["image_index"] = asset.get("image_index")
     elif fmt == "pdf":
+        # PDF 同 docx:用 extractor 的全文 image_index;page 作辅助可读
+        rk["image_index"] = asset.get("image_index")
         rk["page"] = asset.get("page_num")
-        if in_page_idx is not None:
-            rk["in_page_idx"] = in_page_idx
     elif fmt == "xlsx":
         # xlsx 优先用 anchor_row(行级精度),回退 image_index
         if asset.get("anchor_row") is not None:
@@ -107,41 +111,21 @@ def gen_manifest(doc_path: str, doc_label: str) -> dict:
     result = extractor.extract(task)
     assets = result.assets or []
 
-    # PDF 需要按 page 分组给 in_page_idx
+    # 全格式统一:直接用 extractor 的 asset 顺序 + image_index(2026-06-12 简化,
+    # 不再为 PDF 按页重启 — extractor 已给全文连续 image_index)
     images_out: list[dict] = []
-    if fmt == "pdf":
-        by_page: defaultdict[int, list] = defaultdict(list)
-        for a in assets:
-            by_page[a.get("page_num") or 0].append(a)
-        # 按 page 升序,每页内按 image_index(原顺序)升序
-        asset_idx = 0
-        for pg in sorted(by_page):
-            for in_pg, a in enumerate(sorted(by_page[pg], key=lambda x: x.get("image_index") or 0), start=1):
-                asset_idx += 1
-                images_out.append({
-                    "asset_index": asset_idx,
-                    "ref_key": _build_ref_key("pdf", a, in_page_idx=in_pg),
-                    "filename": a.get("filename"),
-                    "page_num": a.get("page_num"),
-                    "visual_summary": (a.get("visual_summary") or "")[:80],
-                    "ocr_preview": (a.get("ocr_text") or "")[:80],
-                    "image_category": a.get("image_category"),
-                    "local_path": a.get("local_path"),
-                    "status": a.get("status"),
-                })
-    else:
-        for i, a in enumerate(assets, start=1):
-            images_out.append({
-                "asset_index": i,
-                "ref_key": _build_ref_key(fmt, a),
-                "filename": a.get("filename"),
-                "page_num": a.get("page_num"),
-                "visual_summary": (a.get("visual_summary") or "")[:80],
-                "ocr_preview": (a.get("ocr_text") or "")[:80],
-                "image_category": a.get("image_category"),
-                "local_path": a.get("local_path"),
-                "status": a.get("status"),
-            })
+    for i, a in enumerate(assets, start=1):
+        images_out.append({
+            "asset_index": i,
+            "ref_key": _build_ref_key(fmt, a),
+            "filename": a.get("filename"),
+            "page_num": a.get("page_num"),
+            "visual_summary": (a.get("visual_summary") or "")[:80],
+            "ocr_preview": (a.get("ocr_text") or "")[:80],
+            "image_category": a.get("image_category"),
+            "local_path": a.get("local_path"),
+            "status": a.get("status"),
+        })
 
     # extractor_version: 由 extract_method + result.text_length 派生(简版,
     # 真正版本锁应该用 extractor 模块的 git sha;follow-up 改进)

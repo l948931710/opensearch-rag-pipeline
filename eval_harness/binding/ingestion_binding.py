@@ -102,7 +102,17 @@ def _gv(obj: Any, key: str, default: Any = None) -> Any:
 
 
 def _match_gt_chunk_to_produced(gt: GtChunk, chunks: List[Any]) -> Optional[Any]:
-    """keyword recall ≥ 0.3 → density 最大者(与 gt_eval.py 同口径,density 偏好 step_card 而非 procedure_parent)。"""
+    """keyword recall ≥ 0.3 → density 最大者,但**chunk_type 同类型优先**。
+
+    口径同 gt_eval.py 的 covering+density 但加一道 chunk_type 偏好:GT 标 step_card
+    时,先在 covering 集里找 chunk_type=step_card 的 candidate;若有,density 最大者
+    胜。否则回退全 covering 集。
+
+    Why:density = hits / sqrt(len) 让短文本不公平胜出 — 实测 pdf_sop 步骤1.1 时,
+    前言段(text_chunk, 123 字, 4 hits = density 0.36)恰好比完整步骤段(step_card,
+    300 字, 6 hits = density 0.35)略胜,导致 matcher 选错 chunk 类型,使该 GT
+    被无图的 text_chunk 抢戏 jaccard=0。chunk_type 优先反映了 GT 标注者的真实意图。
+    """
     kws = gt.keywords
     if not kws:
         return None
@@ -119,6 +129,11 @@ def _match_gt_chunk_to_produced(gt: GtChunk, chunks: List[Any]) -> Optional[Any]
 
     covering = [s for s in scored if s[1] >= MATCH_THRESHOLD]
     if covering:
+        # chunk_type 同类型优先 — 给 GT 标的 chunk_type 一道偏好;无同类型回退全集
+        if gt.chunk_type:
+            typed = [s for s in covering if _gv(s[0], "chunk_type") == gt.chunk_type]
+            if typed:
+                return max(typed, key=lambda s: s[2])[0]
         return max(covering, key=lambda s: s[2])[0]
     return max(scored, key=lambda s: s[1])[0] if scored else None
 

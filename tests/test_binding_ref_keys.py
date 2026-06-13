@@ -24,12 +24,13 @@ def test_docx_strict_equals_primary():
     assert a.primary_key() == b.primary_key()
 
 
-def test_pdf_weak_when_no_in_page_idx():
+def test_pdf_weak_when_no_image_index():
+    """PDF v2 坐标系:image_index 是主键,缺失=weak(只标 page=presence-only)。"""
     weak = ImageRef(fmt="pdf", page=3)
-    strong = ImageRef(fmt="pdf", page=3, in_page_idx=1)
+    strong = ImageRef(fmt="pdf", page=3, image_index=10)
     assert weak.is_weak() and not strong.is_weak()
-    # primary 等价(都指页 3),strict 不等价
-    assert weak.primary_key() == strong.primary_key()
+    # weak 走 page 命名空间,strong 走 image_index — 不应误等
+    assert weak.primary_key() != strong.primary_key()
     assert weak.strict_key() != strong.strict_key()
 
 
@@ -53,10 +54,10 @@ def test_parse_ref_dict_docx():
 
 
 def test_parse_ref_dict_pdf_aliases():
-    # 接受 page 或 page_num,接受 in_page_idx 或 image_index_in_page
-    a = parse_ref_dict({"page": 3, "in_page_idx": 1}, "pdf")
-    b = parse_ref_dict({"page_num": 3, "image_index_in_page": 1}, "pdf")
-    assert a.strict_key() == b.strict_key()
+    """PDF v2:主键 image_index;page/page_num 别名仍认作辅助字段,不参与 strict。"""
+    a = parse_ref_dict({"image_index": 10, "page": 3}, "pdf")
+    b = parse_ref_dict({"image_index": 10, "page_num": 3}, "pdf")
+    assert a.strict_key() == b.strict_key() == ("pdf", 10)
 
 
 def test_parse_ref_dict_xlsx_anchor_row_alias():
@@ -96,14 +97,27 @@ def test_jaccard_partial():
     assert abs(jaccard(gt, pred) - 1 / 3) < 1e-9
 
 
-def test_jaccard_pdf_strict_vs_primary():
-    """PDF 弱 GT 在 primary 模式可匹配 strong pred。"""
-    gt_weak = [ImageRef(fmt="pdf", page=3)]              # 只标了 page
-    pred_strong = [ImageRef(fmt="pdf", page=3, in_page_idx=1)]
-    # strict 模式不匹配(in_page_idx None vs 1)
+def test_jaccard_pdf_weak_gt_does_not_match_strong_pred():
+    """PDF v2:weak GT(只标 page)的 primary_key 走 'pdf:page' 命名空间,
+    strong pred 走 'pdf' 命名空间 — 不应误匹配。
+
+    设计意图:weak GT 是 GT 半成品状态,strict 模式不计入(has_strong_refs=False
+    会让它走 presence-only path 不入 mean_jaccard)。primary 模式即使被显式调用
+    也不该 false-positive 跨命名空间相等。
+    """
+    gt_weak = [ImageRef(fmt="pdf", page=3)]
+    pred_strong = [ImageRef(fmt="pdf", image_index=10, page=3)]
     assert jaccard(gt_weak, pred_strong, strict=True) == 0.0
-    # primary 模式匹配(都指页 3)
-    assert jaccard(gt_weak, pred_strong, strict=False) == 1.0
+    assert jaccard(gt_weak, pred_strong, strict=False) == 0.0  # 命名空间分离
+
+
+def test_jaccard_pdf_strict_match():
+    """v2:PDF strict 用 image_index 主键判等。"""
+    gt = [ImageRef(fmt="pdf", image_index=10, page=3),
+          ImageRef(fmt="pdf", image_index=11, page=3)]
+    pred = [ImageRef(fmt="pdf", image_index=11, page=3),
+            ImageRef(fmt="pdf", image_index=10, page=3)]  # 顺序不重要
+    assert jaccard(gt, pred, strict=True) == 1.0
 
 
 # ── img_dup_factor over-attach 检测 ─────────────────────────
@@ -162,6 +176,40 @@ def test_load_gt_basic():
         assert d.gt_chunks[0].expected_image_refs[0].image_index == 3
         assert d.gt_chunks[0].has_strong_refs is True
         assert d.gt_chunks[1].expected_image_refs == []
+        # 显式负例语义:空 expected_image_refs 应当入主闸(empty-vs-empty=1.0),
+        # 不应被错判 weak 而排除 — 2026-06-12 修复
+        assert d.gt_chunks[1].has_strong_refs is True
+    finally:
+        os.unlink(gt_path)
+
+
+def test_load_gt_explicit_negative_is_strong():
+    """显式 `expected_image_refs: []` = 该 step 不该有图,GT 钉死不绑图也算对。
+
+    回归测试:2026-06-12 之前 `bool(refs) and ...` 把空 list 判 weak,
+    导致 PDF 首测 mean_jaccard=0(空 refs 全被踢出分母)。修后 jaccard 会算
+    empty-vs-empty=1.0,作为正确不绑图的奖励。
+    """
+    gt_path = _write_tmp_json({
+        "_meta": {},
+        "pdf_sop": {
+            "_doc_meta": {},
+            "gt_chunks": [
+                # 显式负例:前言段无图
+                {"label": "前言", "keywords": ["前言"], "expected_image_refs": []},
+                # weak ref(只标 page,无 image_index)
+                {"label": "弱", "keywords": ["弱"], "expected_image_refs": [{"page": 3}]},
+                # strong ref(v2:image_index 主键)
+                {"label": "强", "keywords": ["强"],
+                 "expected_image_refs": [{"image_index": 10, "page": 3}]},
+            ],
+        },
+    })
+    try:
+        d = load_gt(gt_path)["pdf_sop"]
+        assert d.gt_chunks[0].has_strong_refs is True   # 显式负例 = 可入主闸
+        assert d.gt_chunks[1].has_strong_refs is False  # weak page-only = 仅 trend
+        assert d.gt_chunks[2].has_strong_refs is True
     finally:
         os.unlink(gt_path)
 
