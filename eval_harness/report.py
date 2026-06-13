@@ -97,28 +97,35 @@ def build_gates(r: Dict) -> Dict:
                 "pass": (dup <= 1.20),
             }
         # — L4-serving 支柱(LLM 标记摆放质量)—
+        # 样本太小(N<5)自动降级:plan 抢救点,2-3 题样本上 marker_validity/orphan
+        # 等指标 noise 极大,FAIL 不具诊断价值,改 N/A 仅 trend 监控
         srv = l4.get("aggregate") or {}
+        n_srv = srv.get("n_answers_with_images") or 0
+        srv_degraded = n_srv < 5
         mv = srv.get("marker_validity")
         if mv is not None:
             # 0.95 hard 守底 + 0.98 soft 追(双阈值,plan 抢救点)
             gates["<<IMG:N>> marker validity (L4-srv)"] = {
-                "target": ">= 0.95 hard / >= 0.98 soft",
+                "target": (f">= 0.95 hard / >= 0.98 soft (N={n_srv} 太小,trend 监控)"
+                           if srv_degraded else ">= 0.95 hard / >= 0.98 soft"),
                 "value": round(mv, 4),
-                "pass": (mv >= 0.95),
+                "pass": None if srv_degraded else (mv >= 0.95),
             }
         dn = srv.get("dangling_ref_rate")
         if dn is not None:
             gates["dangling 口惠图但卡片无图 (L4-srv)"] = {
-                "target": "<= 0.05 hard (扩正则后)",
+                "target": (f"<= 0.05 hard (N={n_srv} 太小,trend 监控)"
+                           if srv_degraded else "<= 0.05 hard (扩正则后)"),
                 "value": round(dn, 4),
-                "pass": (dn <= 0.05),
+                "pass": None if srv_degraded else (dn <= 0.05),
             }
         op = srv.get("orphan_rate")
         if op is not None:
             gates["orphan rate (L4-srv, trend 监控)"] = {
-                "target": "<= 0.30 soft",
+                "target": (f"<= 0.30 soft (N={n_srv} 太小,仅 trend)"
+                           if srv_degraded else "<= 0.30 soft"),
                 "value": round(op, 4),
-                "pass": (op <= 0.30),
+                "pass": None if srv_degraded else (op <= 0.30),
             }
 
     l5 = r.get("l5")
@@ -132,22 +139,27 @@ def build_gates(r: Dict) -> Dict:
 
     j = r.get("judge", {}).get("aggregate") if r.get("judge") else None
     if j:
+        # 2026-06-12 修:value=None(本轮 bundle 不含 positive 类 case,如 L4-only run)
+        # 应当 N/A(pass=None),不应误判 FAIL
+        def _ge(v, t): return None if v is None else (v >= t)
+        def _le(v, t): return None if v is None else (v <= t)
+
         faith = _g(j, "positives", "faithfulness", "mean")
         corr = _g(j, "positives", "correctness", "mean")
         gates["answer faithfulness (Claude, L3)"] = {"target": ">= 4.0 / 5",
                                                      "value": faith,
-                                                     "pass": (faith is not None and faith >= 4.0)}
+                                                     "pass": _ge(faith, 4.0)}
         gates["answer correctness (Claude, L3)"] = {"target": ">= 4.0 / 5",
                                                     "value": corr,
-                                                    "pass": (corr is not None and corr >= 4.0)}
+                                                    "pass": _ge(corr, 4.0)}
         # 完整性质量门：评审面板 completeness（四维中历史最弱，4.29@predeploy）
         comp = _g(j, "positives", "completeness", "mean")
         gates["answer completeness (Claude, L3)"] = {"target": ">= 4.0 / 5",
                                                      "value": comp,
-                                                     "pass": (comp is not None and comp >= 4.0)}
+                                                     "pass": _ge(comp, 4.0)}
         fab = j.get("positives_fabrication_rate")
         gates["positive fabrication (Claude, L3)"] = {"target": "<= 0.05", "value": fab,
-                                                      "pass": (fab is not None and fab <= 0.05)}
+                                                      "pass": _le(fab, 0.05)}
         nfab = _g(j, "negatives", "fabrication_rate")
         if nfab is not None:
             gates["negative fabrication (Claude, L3)"] = {"target": "<= 0.10", "value": nfab,

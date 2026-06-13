@@ -78,14 +78,18 @@ def _detect_fmt(label: str) -> str:
 
 
 def _parse_chunk(d: Dict[str, Any], fmt: str) -> GtChunk:
+    # 2026-06-12 修正:区分字段缺失 vs 显式空集 ——
+    #   字段未写 = GT 未标该 chunk → 不入主闸(chunk 级 degraded,只算 trend)
+    #   显式 [] = 该 chunk 不该有图(负例)→ 入主闸 empty-vs-empty=1.0
+    #   strong refs / 全 strong = 入主闸
+    #   含 weak ref = 不入主闸(presence-only trend)
+    # 之前 `d.get(k) or []` 把 None/缺失/[] 归一,导致 GT 未标的 chunks 被
+    # 当显式负例入主闸 — DOCX 76 chunks 没标 refs 字段全被错算,DOCX mean
+    # 0.7763 是假阴性(实际 --strict 跑过 98.6%)。
+    field_present = "expected_image_refs" in d
     raw_refs = d.get("expected_image_refs") or []
     refs = [parse_ref_dict(r, fmt) for r in raw_refs]
-    # has_strong_refs 语义 = "可入 main jaccard 分子":
-    #  - 空集 refs(显式负例,该 step 不该有图)→ True(empty-vs-empty=1.0 入分子)
-    #  - 全 strong refs(每张图都有完整次级标识)→ True
-    #  - 任一 weak ref(PDF page-only / PPTX slide-only)→ False(presence-only,仅 trend)
-    # 注意:空 refs 也算"all strong" — all() over empty == True,正是想要的(显式负例)
-    has_strong = all(not r.is_weak() for r in refs)
+    has_strong = field_present and all(not r.is_weak() for r in refs)
     return GtChunk(
         label=d.get("label", ""),
         chunk_type=d.get("chunk_type", ""),

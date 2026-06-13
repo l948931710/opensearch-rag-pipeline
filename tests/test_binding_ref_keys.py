@@ -183,6 +183,33 @@ def test_load_gt_basic():
         os.unlink(gt_path)
 
 
+def test_load_gt_field_missing_vs_explicit_empty():
+    """区分'GT 未标该字段(不入主闸)'vs'显式 []`(入主闸 empty-vs-empty=1.0)。
+
+    回归测试:2026-06-12 D5 baseline 跑发现 DOCX 76 chunks 全部没标
+    expected_image_refs 字段,但被错当显式负例入主闸,假阴性把 DOCX mean
+    拖到 0.7763(实际 --strict 跑过 98.6%)。修后字段缺失走 degraded 路径。
+    """
+    gt_path = _write_tmp_json({
+        "_meta": {},
+        "docx_sop": {
+            "_doc_meta": {},
+            "gt_chunks": [
+                # 字段缺失:GT 未标 → degraded chunk,不入主闸
+                {"label": "未标", "keywords": ["a"]},
+                # 显式空集:显式负例 → 入主闸
+                {"label": "显式空", "keywords": ["b"], "expected_image_refs": []},
+            ],
+        },
+    })
+    try:
+        d = load_gt(gt_path)["docx_sop"]
+        assert d.gt_chunks[0].has_strong_refs is False  # 字段缺失 → degraded
+        assert d.gt_chunks[1].has_strong_refs is True   # 显式空 → 入主闸
+    finally:
+        os.unlink(gt_path)
+
+
 def test_load_gt_explicit_negative_is_strong():
     """显式 `expected_image_refs: []` = 该 step 不该有图,GT 钉死不绑图也算对。
 

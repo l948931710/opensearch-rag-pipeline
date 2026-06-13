@@ -144,8 +144,17 @@ def phase_run(args):
 def phase_merge(args):
     results = json.load(open(args.results, encoding="utf-8"))
     verdicts = json.load(open(args.verdicts, encoding="utf-8"))
-    bundle_path = os.path.join(os.path.dirname(args.results), "judge_bundle.json")
-    bundle = json.load(open(bundle_path, encoding="utf-8")) if os.path.exists(bundle_path) else []
+    # 合并 L3 bundle(judge_bundle.json)+ L4-binding bundle(judge_bundle_binding.json,
+    # 2026-06-12 新增)以提供完整 kind_by_qid。任一缺失视为不存在,不阻断 merge。
+    outdir = os.path.dirname(args.results)
+    bundle: list = []
+    for fname in ("judge_bundle.json", "judge_bundle_binding.json"):
+        bp = os.path.join(outdir, fname)
+        if os.path.exists(bp):
+            try:
+                bundle.extend(json.load(open(bp, encoding="utf-8")))
+            except Exception:
+                pass
 
     from .judge import merge_panel
     panels = verdicts["panels"] if isinstance(verdicts, dict) and "panels" in verdicts else verdicts
