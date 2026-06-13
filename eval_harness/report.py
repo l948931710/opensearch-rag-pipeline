@@ -76,19 +76,30 @@ def build_gates(r: Dict) -> Dict:
     if l4:
         # — L4-ingestion 支柱(逐格式 Jaccard + over-attach)—
         ing = (l4.get("ingestion") or {}).get("deterministic") or {}
-        for fmt, soft_target in (("pdf", 0.70), ("xlsx", 0.65),
-                                 ("docx", 0.95), ("pptx", 0.75)):
+        # 2026-06-13 D7 升 hard:5 轮 byte-equal 后 chunker 已 deterministic
+        # XLSX 升到 0.85 hard(实测 0.8636,1.4pp 缓冲;task chip 修了 step5/6 anchor 互换)
+        # DOCX 0.95 hard(D6 设定,实测 0.9847 走 strict_fixture)
+        # PDF 保 soft(1 doc 11 chunks 样本太小,3 个 PDF chunker bug 未修)
+        # PPTX 保 soft(待 GT 补)
+        for fmt, threshold, is_hard in (
+            ("pdf", 0.70, False),
+            ("xlsx", 0.85, True),     # ⬆ D7 hard
+            ("docx", 0.95, True),
+            ("pptx", 0.75, False),
+        ):
             v = ing.get(f"binding_jaccard_{fmt}")
             if v is not None:
-                # docx hard 闸(基线 98.6% --strict 验过,buffer 3.6pp);其余 soft
-                hard = (fmt == "docx")
-                # XLSX 阈值 0.65 基于实测 0.682 校准(plan 原 0.80 过高,xlsx step5/6
-                # 真 chunker bug + 同 anchor_row 多图坐标系局限,task chip 已开)
-                gates[f"binding {fmt} Jaccard (L4-ing)"] = {
-                    "target": f">= {soft_target}" + (" hard" if hard else " soft (Day 5-6 锁档)"),
+                gate_entry = {
+                    "target": f">= {threshold}" + (" hard (D7 升档)" if is_hard else " soft"),
                     "value": round(v, 4),
-                    "pass": (v >= soft_target),
+                    "pass": (v >= threshold),
                 }
+                # DOCX 来源标注:strict_fixture 时口径是 micro-accuracy(SOP-only)
+                # 而非 Jaccard,审计/复盘要能一眼看出
+                src = (ing.get("per_fmt", {}).get(fmt, {}) or {}).get("_source")
+                if fmt == "docx" and src == "strict_fixture":
+                    gate_entry["notes"] = "per-image micro-acc via fuling_chunk_exp fixture (SOP-only)"
+                gates[f"binding {fmt} Jaccard (L4-ing)"] = gate_entry
         dup = ing.get("img_dup_factor_p95")
         if dup is not None:
             gates["img_dup_factor p95 (L4-ing, 全格式)"] = {
