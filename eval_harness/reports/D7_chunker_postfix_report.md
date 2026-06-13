@@ -3,7 +3,7 @@
 
 # Day 7 chunker post-fix verify — compare
 
-*generated: 2026-06-13 08:52* — runs=3
+*generated: 2026-06-13 09:20* — runs=3
 
 
 ## ✅ Day 7 verdict: ALL_EQUAL — chunker 已确定
@@ -18,7 +18,7 @@
 | fmt | run1 | run2 | run3 | mean | std↓ | spread↓ |
 |---|---|---|---|---|---|---|
 | docx | 0.9898 | 0.9898 | 0.9898 | 0.9898 | 0.0000 | 0.0000 |
-| pdf | 0.7722 | 0.7722 | 0.7722 | 0.7722 | 0.0000 | 0.0000 |
+| pdf | 0.8389 | 0.8389 | 0.8389 | 0.8389 | 0.0000 | 0.0000 |
 | pptx | n/a | n/a | n/a | n/a | n/a | 0.0000 |
 | xlsx | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 0.0000 | 0.0000 |
 
@@ -43,7 +43,7 @@ _排除 degraded doc(与 ingestion_binding.py L313-316 一致)_
 | fmt | D6 mean | D7 mean | Δ |
 |---|---|---|---|
 | docx | n/a | 0.9898 | n/a |
-| pdf | 0.7273 | 0.7722 | 0.0450 |
+| pdf | 0.7273 | 0.8389 | 0.1116 |
 | pptx | n/a | n/a | n/a |
 | xlsx | 0.7727 | 1.0000 | 0.2273 |
 

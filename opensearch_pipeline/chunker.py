@@ -20,7 +20,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from opensearch_pipeline.extraction.schema import STEP_BOUNDARY_PATTERN
 
@@ -394,6 +394,86 @@ class DocumentChunker:
     # ── 步骤边界检测正则（模式串与 PDF 提取的段落切分共享单一来源 schema.STEP_BOUNDARY_PATTERN） ──
     _STEP_BOUNDARY_RE = re.compile(STEP_BOUNDARY_PATTERN, re.IGNORECASE | re.MULTILINE)
 
+    # ── ToC 行模式（D8 Phase 5+，配合 _extract_toc_steps）──
+    # 抽 "• 第N步：标题 „„„" 等目录条目。行首允许 bullet/空白/中文/全角空格。
+    _TOC_LINE_RE = re.compile(
+        r"^[\s•·●\-\*\#　]*第\s*([一二三四五六七八九十\d]+)\s*步\s*[:：]\s*(.+?)\s*(?:[„\.…]+|$)"
+    )
+
+    @staticmethod
+    def _toc_title_keywords(title: str) -> List[str]:
+        """从 ToC step title 抽 noun-style keywords for content matching.
+
+        去掉常见动词前缀（"安装"/"操作"/"使用"等），保留主语 noun。否则
+        "安装" 等通用动词在多个 step 内都命中 → 误触 implicit step trigger。
+        e.g. "安装显卡，并接好各种线缆" → ["显卡", "并接好各种线缆"]
+        """
+        segments = re.split(r"[\s　，,。.、（）()【】「」]+", title)
+        common_verbs = ("安装", "操作", "处理", "使用", "设置", "配置",
+                        "执行", "完成", "准备", "检查", "进行", "开始")
+        kws: List[str] = []
+        for seg in segments:
+            seg_clean = re.sub(r"[^一-鿿]", "", seg)
+            for verb in common_verbs:
+                if seg_clean.startswith(verb) and len(seg_clean) > len(verb):
+                    seg_clean = seg_clean[len(verb):]
+                    break
+            if len(seg_clean) >= 2:
+                kws.append(seg_clean)
+        # 去重保序
+        return list(dict.fromkeys(kws))
+
+    @classmethod
+    def _extract_toc_steps(cls, blocks: list) -> List[Tuple[int, str, List[str]]]:
+        """从 preamble blocks 抽 markdown ToC step 列表 — "• 第N步：标题 „„".
+
+        返回 [(step_no, title, keywords)]，仅在 ≥2 条 ToC 条目时返回非空。
+        Why ≥2: 单条 list-like 段（如某 SOP 提到"第一步"但只有 1 项）不算
+        ToC，避免误启 implicit trigger。
+
+        用途: 主循环 paragraph 路径在 STEP_BOUNDARY 不匹配时，靠 ToC declared
+        title 关键词 implicit start 下一 step — 解 it_xxh_003 page 11-14 无
+        "第七步" anchor 但 ToC 已声明的 case（page 11-14 内容全部被吞到 step 6 → step 7 不出 chunk）。
+        """
+        cn_to_int = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        toc: List[Tuple[int, str, List[str]]] = []
+        seen_step_nos = set()
+        for block in blocks:
+            bt = (block.get("block_type") if isinstance(block, dict)
+                  else getattr(block, "block_type", ""))
+            if bt in ("image_ref", "ocr_text", "table"):
+                continue
+            text = ((block.get("text") if isinstance(block, dict)
+                     else getattr(block, "text", "")) or "").strip()
+            if not text:
+                continue
+            block_hits = 0
+            for line in text.split("\n"):
+                m = cls._TOC_LINE_RE.match(line)
+                if not m:
+                    continue
+                step_no_str = m.group(1).strip()
+                title = m.group(2).strip()
+                step_no = cn_to_int.get(step_no_str)
+                if step_no is None:
+                    try:
+                        step_no = int(step_no_str)
+                    except ValueError:
+                        continue
+                if step_no in seen_step_nos:
+                    continue
+                kws = cls._toc_title_keywords(title)
+                if not kws:
+                    continue
+                toc.append((step_no, title, kws))
+                seen_step_nos.add(step_no)
+                block_hits += 1
+            # 一段含 ≥2 条 ToC 即为目录段，扫到就停（典型 ToC 集中一段）
+            if block_hits >= 2:
+                break
+        return toc if len(toc) >= 2 else []
+
     def _chunk_by_step(
         self,
         blocks: list,
@@ -440,6 +520,12 @@ class DocumentChunker:
             def clean_ocr_keywords(t, **kw): return ""
             def extract_circled_refs(s): return []
             classify_image_relation = None
+
+        # ── Phase 0.5: ToC 扫描（D8 Phase 5+）──
+        # 抽 "• 第N步：标题" 目录条目，给主循环 paragraph 路径在 STEP_BOUNDARY
+        # 未匹配时做 implicit step 触发用。不满足"≥2 条" 时为空，无副作用。
+        # See _extract_toc_steps docstring for the it_xxh_003 motivation.
+        toc_steps = self._extract_toc_steps(blocks)
 
         # ── Phase 1: 将 blocks 按步骤边界分组 ──
         # 每个 step_group = {"step_no": N, "title": str, "text_parts": [str],
@@ -602,6 +688,49 @@ class DocumentChunker:
             all_matches = list(self._STEP_BOUNDARY_RE.finditer(text))
 
             if not all_matches:
+                # ── ToC-aware implicit step trigger（D8 Phase 5+，Bug F fix）──
+                # 文档目录声明了 step N+1 但正文缺 "第(N+1)步" anchor 时，靠
+                # paragraph 内容含 declared title keyword 启动 implicit step。
+                # 解 it_xxh_003 case：PDF 正文 page 11-14 无 "第七步" anchor，
+                # 所有内容被吞到 step 6 chunk → step 7 / 收尾 GT chunk 无对应
+                # produced chunk → matcher 错配到含图 step 6 → J=0/0。
+                # 触发严格条件（任一不满足即 fallthrough，保证现行 doc byte-equal）：
+                #   1) toc_steps 非空（preamble 抽到 ≥2 ToC 条目）
+                #   2) current_step 已开 + found_any_step
+                #   3) declared step_no == current_step.step_no + 1（严格顺序，
+                #      不跳号 — 跳号意味着真有缺失 anchor 这种 case 太罕见）
+                #   4) paragraph 含某个 declared title noun keyword
+                #   5) paragraph 不是页眉模板段（"生效日期…" / 长度 < 20）
+                implicit_started = False
+                if (toc_steps and current_step is not None and found_any_step
+                        and len(text) >= 20 and not text.startswith("生效日期")):
+                    cur_step_no = current_step.get("step_no") or 0
+                    next_step_no = cur_step_no + 1
+                    for toc_step_no, toc_title, toc_kws in toc_steps:
+                        if toc_step_no != next_step_no:
+                            continue
+                        if not any(kw in text for kw in toc_kws):
+                            continue
+                        # 触发 implicit step
+                        step_groups.append(current_step)
+                        current_step = {
+                            "step_no": toc_step_no,
+                            "sub_no": None,
+                            "section_no": None,
+                            "title": f"第{toc_step_no}步：{toc_title}"[:80],
+                            "text_parts": [text],
+                            "image_refs": list(pending_images),
+                            "page_num": page_num,
+                            "section": current_section,
+                            "source": source,
+                        }
+                        pending_images.clear()
+                        current_main_no = toc_step_no
+                        main_no_explicit = True
+                        implicit_started = True
+                        break
+                if implicit_started:
+                    continue
                 # 无步骤标记 → 归入当前上下文
                 if current_step is not None:
                     current_step["text_parts"].append(text)
