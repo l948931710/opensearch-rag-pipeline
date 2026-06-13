@@ -234,7 +234,13 @@ def evaluate_doc(label: str, doc: GtDoc, doc_path: str) -> Dict[str, Any]:
             "jaccard": round(score, 4),
             "matched_produced_type": _gv(produced, "chunk_type"),
         })
-        judge_items.append(_doc_to_judge_bundle_item(label, fmt, gt, produced, pred_refs, score))
+        # 2026-06-12 D6 改进:Claude image_binding judge bundle 只 emit "图相关" case
+        # GT 显式负例(expected_image_refs=[])+ chunker 也没绑图 → 不送评(图无关 case 评 ib=3
+        # 中性会拖低均值,D5 baseline 15/36 显式负例使 mean 从真值被稀释到 3.343)
+        # GT 含图 OR pred 含图(含 cross-bind/over-attach 真 bug)→ 送评 — 真有图位置可判
+        if gt.expected_image_refs or pred_refs:
+            judge_items.append(_doc_to_judge_bundle_item(
+                label, fmt, gt, produced, pred_refs, score))
 
     all_refs = _all_step_card_refs(chunks, fmt)
     dup = img_dup_factor(all_refs)
@@ -304,7 +310,10 @@ def run(gt_files: List[str], docs_dir: str, *,
             errors.append(f"{label}: {result['error']}")
             continue
 
-        if result.get("img_dup_factor") is not None:
+        # 2026-06-12 D6:degraded doc 的 dup 不入主 p95 — degraded GT(如 xlsx_inspect
+        # schema 简化、pptx 0 step_card)的"同行多图"是文档形态不是 over-attach bug,
+        # 入主闸会掩盖真信号。per_doc 仍保留 dup_factor 字段供 trend 监控
+        if result.get("img_dup_factor") is not None and not doc.degraded:
             dup_factors_all.append(result["img_dup_factor"])
 
         if result.get("judge_items"):

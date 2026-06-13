@@ -342,3 +342,48 @@ def test_percentile_empty_returns_none():
 
 def test_percentile_single():
     assert ib._percentile([3.14], 0.5) == 3.14
+
+
+# ── D6 image_binding bundle 过滤(显式负例不送评)──────────────
+
+def test_judge_bundle_skips_explicit_negative_cases(monkeypatch, tmp_path):
+    """D6 改进:GT 标 []+pred 空 = 图无关 case,不入 judge_bundle_binding(避免
+    Claude ib=3 中性把 image_binding 均值拖低,plan 抢救点)。
+
+    GT 含图 OR pred 含图(cross-bind/over-attach 真 bug)仍送评。
+    """
+    # 3 个 chunks:含图+正确、显式负例+pred 空、显式负例+pred 含图(over-attach)
+    chunks = [
+        FakeChunk(chunk_text="扫码 步骤", chunk_type="step_card",
+                  extra={"image_refs": [{"image_index": 3}]}),
+        FakeChunk(chunk_text="前言 文字", chunk_type="text_chunk",
+                  extra={"image_refs": []}),
+        FakeChunk(chunk_text="补充 说明", chunk_type="step_card",
+                  extra={"image_refs": [{"image_index": 99}]}),  # over-attach
+    ]
+    monkeypatch.setattr(ib, "_extract_and_chunk", lambda *a, **kw: chunks)
+    gt_doc = GtDoc(label="docx_sop", fmt="docx", doc_sha256=None,
+                   extractor_version=None, manifest_path=None, degraded=False,
+                   gt_chunks=[
+                       GtChunk(label="step1", chunk_type="step_card",
+                               keywords=["扫码", "步骤"],
+                               expected_image_refs=[ImageRef(fmt="docx", image_index=3)],
+                               has_strong_refs=True),
+                       GtChunk(label="前言", chunk_type="text_chunk",
+                               keywords=["前言", "文字"],
+                               expected_image_refs=[],
+                               has_strong_refs=True),
+                       GtChunk(label="补充", chunk_type="step_card",
+                               keywords=["补充", "说明"],
+                               expected_image_refs=[],
+                               has_strong_refs=True),
+                   ])
+    result = ib.evaluate_doc("docx_sop", gt_doc, "/fake/p.docx")
+    # 3 chunks 都入 mean_jaccard(strong path)— GT 显式 + matched
+    assert result["n_strong_chunks"] == 3
+    # 但 judge_items 只入 2 个:step1(GT 含图)+ 补充(over-attach pred 含图)
+    qids = [it["qid"] for it in result["judge_items"]]
+    assert "docx_sop::step1" in qids
+    assert "docx_sop::补充" in qids
+    assert "docx_sop::前言" not in qids   # 显式负例 + pred 空 → 不送评
+    assert len(qids) == 2
