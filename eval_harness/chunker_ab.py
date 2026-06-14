@@ -39,6 +39,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
+DEFAULT_PDF_DOC_PATHS: Dict[str, str] = {
+    "pdf_sop": "~/Downloads/opensearch-rag-data/eval_samples/documents/pdf_sop.pdf",
+    "pdf_xs_wi_007": "~/Downloads/opensearch-rag-data/eval_samples/documents/pdf_xs_wi_007.pdf",
+    "pdf_it_xxh_003": "~/Downloads/opensearch-rag-data/eval_samples/documents/pdf_it_xxh_003.pdf",
+    "admin_lodging": "fuling_chunk_exp/admin_关于外来人员来访留宿相关规定.pdf",
+}
+
+
 # ──────────────────────────── enums / dataclasses ────────────────────────────
 
 
@@ -293,6 +301,171 @@ def check_topology_pairing(
     }
 
 
+# ──────────────────────────── semantic anchor GT (Step C+) ────────────────────────────
+
+
+def load_semantic_anchors(path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """读 gt_pdf_semantic_anchors.json,把 acceptable_chunk_anchors 内层 list → tuple.
+
+    Returns: {doc_id: [anchor_dict, ...]}
+    """
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for doc, dd in data.get("documents", {}).items():
+        anchor_list: List[Dict[str, Any]] = []
+        for a in dd.get("anchors", []):
+            anc = dict(a)
+            raw = a.get("acceptable_chunk_anchors") or []
+            anc["acceptable_chunk_anchors"] = [tuple(k) for k in raw]
+            anchor_list.append(anc)
+        out[doc] = anchor_list
+    return out
+
+
+def _anchor_hit(anchor: Dict[str, Any],
+                produced_chunks: Sequence[Any]) -> Tuple[bool, bool]:
+    """单 anchor vs arm produced chunks 命中检查.
+
+    Returns: (key_hit, image_hit)
+      - key_hit: 任一 acceptable_chunk_anchors 在 produced_chunks semantic key 集中
+      - image_hit: 命中后,所有 expected_image_signals 在匹配 chunks 的 image_refs 覆盖范围内
+                   * 数字 → 比 image_index
+                   * 其他 → 在 visual_summary + ocr_text 子串关键词
+                   * signals 为空 → 默认 True(只看 key_hit)
+    """
+    target_keys = set(anchor.get("acceptable_chunk_anchors") or [])
+    if not target_keys:
+        return False, False
+
+    chunk_keys_to_chunk: Dict[Tuple, Any] = {}
+    for c in produced_chunks:
+        try:
+            key, _sig = _chunk_to_sig(c)
+            chunk_keys_to_chunk[key] = c
+        except Exception:
+            continue
+
+    matched_keys = target_keys & set(chunk_keys_to_chunk.keys())
+    key_hit = len(matched_keys) > 0
+    if not key_hit:
+        return False, False
+
+    signals = [s.strip() for s in (anchor.get("expected_image_signals") or []) if str(s).strip()]
+    if not signals:
+        return True, True
+
+    all_indices: Set[int] = set()
+    all_text_parts: List[str] = []
+    for k in matched_keys:
+        c = chunk_keys_to_chunk[k]
+        if isinstance(c, dict):
+            extra = c.get("extra") or {}
+        else:
+            extra = getattr(c, "extra", None) or {}
+        for r in (extra.get("image_refs") or []):
+            if not isinstance(r, dict):
+                continue
+            idx = r.get("image_index")
+            if isinstance(idx, (int, float)) and not isinstance(idx, bool):
+                all_indices.add(int(idx))
+            all_text_parts.append((r.get("visual_summary") or "") + " " +
+                                  (r.get("ocr_text") or ""))
+    blob = " ".join(all_text_parts).lower()
+
+    for s in signals:
+        s_str = str(s)
+        if s_str.isdigit():
+            if int(s_str) not in all_indices:
+                return True, False
+        else:
+            if s_str.lower() not in blob:
+                return True, False
+    return True, True
+
+
+def _produce_chunks_for_anchor_metric(arm: "Arm",
+                                       doc_pool: List[Tuple[str, str, str]]
+                                       ) -> Dict[str, List[Any]]:
+    """子进程跑 chunker_ab_worker(produce_chunks)— 返 doc_label → chunks dict."""
+    worker_cmd = [sys.executable, "-m", "eval_harness.chunker_ab_worker"]
+    task = {
+        "op": "produce_chunks",
+        "arm": arm.name,
+        "doc_pool": [{"label": l, "fmt": f, "path": p} for l, f, p in doc_pool],
+    }
+    env = {**os.environ, **arm.env, "RAG_EVAL_MODE": "1"}
+    res = subprocess.run(
+        worker_cmd, env=env, input=json.dumps(task),
+        capture_output=True, text=True, check=True,
+        cwd=Path(__file__).parent.parent,
+    )
+    lines = [l for l in res.stdout.strip().split("\n") if l.strip()]
+    if not lines:
+        raise RuntimeError(f"worker arm={arm.name} 无 stdout 输出")
+    result = json.loads(lines[-1])
+    if not result.get("ok"):
+        raise RuntimeError(f"worker arm={arm.name} failed: {result.get('error')}")
+    with open(result["chunks_path"], "rb") as f:
+        chunks_by_doc = pickle.load(f)
+    return chunks_by_doc
+
+
+def _compute_anchor_metrics(
+    anchors_by_doc: Dict[str, List[Dict[str, Any]]],
+    chunks_by_doc_arm: Dict[str, Dict[str, List[Any]]],
+    arm_names: List[str],
+) -> Tuple[Dict[str, Dict[str, float]], List[Dict[str, Any]]]:
+    """聚合 per-arm semantic anchor metric.
+
+    Returns:
+      metrics: {arm: {semantic_anchor_key_jaccard, semantic_anchor_dual_jaccard,
+                       n_anchors_evaluated}}
+      per_case: [{doc_id, anchor_id, key_hit_<arm>, image_hit_<arm>, dual_hit_<arm>}, ...]
+    """
+    metrics: Dict[str, Dict[str, float]] = {a: {
+        "n_anchors_evaluated": 0,
+        "semantic_anchor_key_hits": 0,
+        "semantic_anchor_dual_hits": 0,
+    } for a in arm_names}
+    per_case: List[Dict[str, Any]] = []
+    for doc_id, anchors in anchors_by_doc.items():
+        for anc in anchors:
+            row: Dict[str, Any] = {
+                "doc_id": doc_id,
+                "anchor_id": anc.get("anchor_id"),
+                "step_name": anc.get("step_name"),
+                "step_no": anc.get("step_no"),
+            }
+            for arm_name in arm_names:
+                chunks = chunks_by_doc_arm.get(arm_name, {}).get(doc_id, [])
+                metrics[arm_name]["n_anchors_evaluated"] += 1
+                if not chunks:
+                    row[f"key_hit_{arm_name}"] = False
+                    row[f"image_hit_{arm_name}"] = False
+                    row[f"dual_hit_{arm_name}"] = False
+                    continue
+                key_hit, image_hit = _anchor_hit(anc, chunks)
+                row[f"key_hit_{arm_name}"] = key_hit
+                row[f"image_hit_{arm_name}"] = image_hit
+                row[f"dual_hit_{arm_name}"] = bool(key_hit and image_hit)
+                metrics[arm_name]["semantic_anchor_key_hits"] += int(key_hit)
+                metrics[arm_name]["semantic_anchor_dual_hits"] += int(
+                    key_hit and image_hit)
+            per_case.append(row)
+    for arm_name in arm_names:
+        n = metrics[arm_name]["n_anchors_evaluated"]
+        if n > 0:
+            metrics[arm_name]["semantic_anchor_key_jaccard"] = round(
+                metrics[arm_name]["semantic_anchor_key_hits"] / n, 4)
+            metrics[arm_name]["semantic_anchor_dual_jaccard"] = round(
+                metrics[arm_name]["semantic_anchor_dual_hits"] / n, 4)
+        else:
+            metrics[arm_name]["semantic_anchor_key_jaccard"] = float("nan")
+            metrics[arm_name]["semantic_anchor_dual_jaccard"] = float("nan")
+    return metrics, per_case
+
+
 # ──────────────────────────── ChunkerAB core ────────────────────────────
 
 
@@ -328,11 +501,15 @@ class ChunkerAB:
         *,
         gt_file: Optional[str],
         docs_dir: str,
+        anchor_gt: Optional[str] = None,
     ) -> ComparisonReport:
         """Tier 0: 子进程跑两次 scripts/eval_image_binding_pdf.py(env 隔离).
 
         每次跑 dump 一个 binding_pdf_<ts>.json,parse 出 per_fmt.pdf.mean_jaccard
         + per_doc 逐题.对比 ON-OFF.
+
+        若 anchor_gt 提供(Step C+ v3 #15):额外 spawn worker per arm,跑
+        semantic anchor 双门评测(key_jaccard + dual_jaccard).
         """
         script = Path(__file__).parent.parent / "scripts" / "eval_image_binding_pdf.py"
         if not script.exists():
@@ -349,16 +526,55 @@ class ChunkerAB:
             if gt_file:
                 cmd += ["--gt-file", gt_file]
             env = {**os.environ, **arm.env, "RAG_EVAL_MODE": "1"}
-            # 子进程级 env 隔离 — 避免 lru_cache get_config() 污染
             print(f"[BINDING_ONLY arm={arm.name}] running {script.name} ...")
             subprocess.run(cmd, env=env, check=True, cwd=script.parent.parent)
             with open(arm_out, encoding="utf-8") as f:
                 results[arm.name] = json.load(f)
 
-        return self._compare_binding(results)
+        anchor_metrics: Optional[Dict[str, Dict[str, float]]] = None
+        anchor_per_case: Optional[List[Dict[str, Any]]] = None
+        if anchor_gt:
+            anchors_by_doc = load_semantic_anchors(anchor_gt)
+            doc_pool: List[Tuple[str, str, str]] = []
+            missing: List[str] = []
+            for doc_id in sorted(anchors_by_doc):
+                path_template = DEFAULT_PDF_DOC_PATHS.get(doc_id)
+                if not path_template:
+                    missing.append(doc_id)
+                    continue
+                resolved = path_template
+                if resolved.startswith("~"):
+                    resolved = str(Path(resolved).expanduser())
+                elif not Path(resolved).is_absolute():
+                    resolved = str(Path(__file__).parent.parent / resolved)
+                if Path(resolved).exists():
+                    doc_pool.append((doc_id, "pdf", resolved))
+                else:
+                    missing.append(f"{doc_id} (path={resolved})")
+            if missing:
+                print(f"[BINDING_ONLY anchor] ⚠️ 这些 doc 在 DEFAULT_PDF_DOC_PATHS 缺映射"
+                      f"或文件不存在,跳过: {missing}")
+            chunks_by_doc_arm: Dict[str, Dict[str, List[Any]]] = {}
+            arm_names = [a.name for a in self.arms]
+            for arm in self.arms:
+                print(f"[BINDING_ONLY anchor arm={arm.name}] worker produce_chunks ...")
+                chunks_by_doc_arm[arm.name] = _produce_chunks_for_anchor_metric(
+                    arm, doc_pool)
+            filtered_anchors = {d: anchors_by_doc[d] for d in anchors_by_doc
+                                 if d in {x[0] for x in doc_pool}}
+            anchor_metrics, anchor_per_case = _compute_anchor_metrics(
+                filtered_anchors, chunks_by_doc_arm, arm_names)
 
-    def _compare_binding(self, results: Dict[str, Dict[str, Any]]) -> ComparisonReport:
-        """parse 两个 binding json + 出 ComparisonReport."""
+        return self._compare_binding(results, anchor_metrics, anchor_per_case)
+
+    def _compare_binding(self, results: Dict[str, Dict[str, Any]],
+                          anchor_metrics: Optional[Dict[str, Dict[str, float]]] = None,
+                          anchor_per_case: Optional[List[Dict[str, Any]]] = None
+                          ) -> ComparisonReport:
+        """parse 两个 binding json + 出 ComparisonReport.
+
+        anchor_metrics 提供时(Step C+ v3 #15)合并 semantic_anchor 维度 + per_case.
+        """
         metrics: Dict[str, Dict[str, Any]] = {}
         per_case: List[Dict[str, Any]] = []
         for arm_name, r in results.items():
@@ -372,7 +588,6 @@ class ChunkerAB:
                 "img_dup_p95": determ.get("img_dup_factor_p95"),
                 "img_dup_max": determ.get("img_dup_factor_max"),
             }
-        # per_case: 逐 (doc_label, gt_label) 配对
         a, b = [arm.name for arm in self.arms]
         per_doc_a = {d["label"]: d for d in results[a].get("per_doc", [])}
         per_doc_b = {d["label"]: d for d in results[b].get("per_doc", [])}
@@ -389,11 +604,11 @@ class ChunkerAB:
                 if ja is None or jb is None:
                     continue
                 per_case.append({
+                    "kind": "funnel",
                     "doc_id": label, "gt_label": gt_label,
                     f"jaccard_{a}": ja, f"jaccard_{b}": jb,
                     "delta": jb - ja,
                 })
-        # delta + win/tie/loss
         wins = sum(1 for r in per_case if r["delta"] > 0.001)
         losses = sum(1 for r in per_case if r["delta"] < -0.001)
         ties = len(per_case) - wins - losses
@@ -401,6 +616,44 @@ class ChunkerAB:
         m_b = metrics[b].get("mean_jaccard_pdf") or 0.0
         deltas = {"mean_jaccard_pdf": {"delta": m_b - m_a}}
         win_tie_loss = {"jaccard_pdf": {"win": wins, "tie": ties, "loss": losses}}
+
+        validity_notes = list(self.validity_notes)
+
+        if anchor_metrics is not None:
+            for arm_name, am in anchor_metrics.items():
+                metrics.setdefault(arm_name, {}).update(am)
+            ka = anchor_metrics.get(a, {}).get("semantic_anchor_key_jaccard")
+            kb = anchor_metrics.get(b, {}).get("semantic_anchor_key_jaccard")
+            da_ = anchor_metrics.get(a, {}).get("semantic_anchor_dual_jaccard")
+            db_ = anchor_metrics.get(b, {}).get("semantic_anchor_dual_jaccard")
+            if isinstance(ka, (int, float)) and isinstance(kb, (int, float)):
+                deltas["semantic_anchor_key_jaccard"] = {"delta": kb - ka}
+            if isinstance(da_, (int, float)) and isinstance(db_, (int, float)):
+                deltas["semantic_anchor_dual_jaccard"] = {"delta": db_ - da_}
+            if anchor_per_case:
+                a_wins = sum(1 for r in anchor_per_case
+                              if r.get(f"dual_hit_{b}") and not r.get(f"dual_hit_{a}"))
+                a_loss = sum(1 for r in anchor_per_case
+                              if r.get(f"dual_hit_{a}") and not r.get(f"dual_hit_{b}"))
+                a_tie = len(anchor_per_case) - a_wins - a_loss
+                win_tie_loss["semantic_anchor_dual"] = {
+                    "win": a_wins, "tie": a_tie, "loss": a_loss}
+                for r in anchor_per_case:
+                    r["kind"] = "semantic_anchor"
+                    per_case.append(r)
+            validity_notes.append(
+                "Tier 0 BINDING_ONLY ran 2 dimensions: (1) funnel image_index "
+                "Jaccard (regression reference, from eval_image_binding_pdf.py); "
+                "(2) semantic anchor key_jaccard / dual_jaccard (primary, v3 #15, "
+                "from anchor GT). Dual = key_hit AND image_hit."
+            )
+        else:
+            validity_notes.append(
+                "Tier 0 BINDING_ONLY uses funnel image_index Jaccard (regression "
+                "reference). Pass --anchor-gt to enable semantic anchor primary "
+                "Jaccard (v3 #15)."
+            )
+
         return ComparisonReport(
             mode=self.mode.value,
             arms=[a, b],
@@ -408,12 +661,8 @@ class ChunkerAB:
             deltas=deltas,
             win_tie_loss=win_tie_loss,
             per_case=per_case,
-            topology_check={},   # BINDING_ONLY 不做 topology check(chunks 不暴露)
-            validity_notes=self.validity_notes + [
-                "Tier 0 BINDING_ONLY uses funnel image_index Jaccard (regression "
-                "reference). Semantic anchor primary Jaccard (v3 #15) requires "
-                "Step C+ anchor GT — see plan.md.",
-            ],
+            topology_check={},
+            validity_notes=validity_notes,
             meta={
                 "git_commit": _git_commit(),
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -501,6 +750,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Tier 0 specific
     ap.add_argument("--gt-file", help="(binding_only)PDF GT 文件路径")
     ap.add_argument("--docs-dir", help="(binding_only)文档目录")
+    ap.add_argument("--anchor-gt", help="(binding_only, Step C+ v3 #15)semantic anchor GT 路径 "
+                                          "— 启 semantic_anchor_key/dual_jaccard 第二维")
     # Tier 1/2 specific(Step E/F 实施时启用)
     ap.add_argument("--doc-dir", action="append", default=[],
                     help="(quick_inject/full_reindex)文档目录(可重复)")
@@ -562,7 +813,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         gt_file = args.gt_file
         docs_dir = args.docs_dir or os.path.expanduser(
             "~/Downloads/opensearch-rag-data/eval_samples/documents")
-        report = runner.run_binding_only(gt_file=gt_file, docs_dir=docs_dir)
+        anchor_gt = args.anchor_gt
+        if anchor_gt:
+            anchor_gt = os.path.expanduser(anchor_gt)
+        report = runner.run_binding_only(gt_file=gt_file, docs_dir=docs_dir,
+                                          anchor_gt=anchor_gt)
     elif mode == Mode.QUICK_INJECT:
         # Step E 实施位 — 暂 raise 引导用户
         report = runner.run_quick_inject()

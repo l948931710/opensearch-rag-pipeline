@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import pytest
 
+import json
+
 from eval_harness.chunker_ab import (
     Arm,
     ChunkerAB,
@@ -20,11 +22,14 @@ from eval_harness.chunker_ab import (
     Mode,
     SemanticChunkSig,
     TopologyFingerprint,
+    _anchor_hit,
     _chunk_to_sig,
+    _compute_anchor_metrics,
     _parse_arm_env,
     _span_overlap,
     build_topology,
     check_topology_pairing,
+    load_semantic_anchors,
 )
 
 
@@ -287,3 +292,206 @@ def test_chunker_ab_full_reindex_raises_with_guide():
                        out_dir="/tmp/chunker_ab_test")
     with pytest.raises(NotImplementedError, match="Tier 2"):
         runner.run_full_reindex()
+
+
+def test_load_semantic_anchors_basic(tmp_path):
+    p = tmp_path / "gt.json"
+    p.write_text(json.dumps({
+        "_meta": {"version": "v1"},
+        "documents": {
+            "pdf_sop": {"anchors": [
+                {"anchor_id": "pdf_sop_a1", "step_name": "s1", "step_no": 1,
+                 "section_path": ["1", "1.1"],
+                 "expected_image_signals": ["1", "三联表单"],
+                 "acceptable_chunk_anchors": [["step_card", 1, None, "1.1", 3]]}
+            ]}
+        }
+    }, ensure_ascii=False))
+    out = load_semantic_anchors(str(p))
+    assert "pdf_sop" in out
+    assert len(out["pdf_sop"]) == 1
+    anc = out["pdf_sop"][0]
+    assert anc["anchor_id"] == "pdf_sop_a1"
+    assert isinstance(anc["acceptable_chunk_anchors"], list)
+    assert anc["acceptable_chunk_anchors"][0] == ("step_card", 1, None, "1.1", 3)
+
+
+def test_load_semantic_anchors_multi_doc(tmp_path):
+    p = tmp_path / "gt.json"
+    p.write_text(json.dumps({
+        "documents": {
+            "pdf_sop": {"anchors": [{"anchor_id": "a", "acceptable_chunk_anchors": []}]},
+            "pdf_xs_wi_007": {"anchors": [
+                {"anchor_id": "b1", "acceptable_chunk_anchors": [["step_card", 2, None, None, 5]]},
+                {"anchor_id": "b2", "acceptable_chunk_anchors": [["step_card", 3, None, None, 7]]},
+            ]},
+        }
+    }))
+    out = load_semantic_anchors(str(p))
+    assert len(out["pdf_sop"]) == 1
+    assert len(out["pdf_xs_wi_007"]) == 2
+    assert out["pdf_xs_wi_007"][1]["acceptable_chunk_anchors"][0] == (
+        "step_card", 3, None, None, 7)
+
+
+def _make_chunk_with_images(chunk_type, step_no, sub_no, sec_no, seq, text,
+                              img_specs):
+    """img_specs: list of dict with image_index/visual_summary/ocr_text."""
+    return {
+        "chunk_type": chunk_type,
+        "chunk_text": text,
+        "seq_no": seq,
+        "extra": {
+            "step_no": step_no, "sub_no": sub_no, "section_no": sec_no,
+            "section_path": [],
+            "image_refs": img_specs,
+        },
+    }
+
+
+def test_anchor_hit_key_only_no_signals():
+    chunks = [_make_chunk_with_images("step_card", 1, None, "1.1", 3, "abc",
+                                       [{"image_index": 5, "visual_summary": "x"}])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [("step_card", 1, None, "1.1", 3)],
+        "expected_image_signals": [],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is True
+    assert image_hit is True
+
+
+def test_anchor_hit_key_miss():
+    chunks = [_make_chunk_with_images("step_card", 2, None, "2.1", 4, "abc", [])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [("step_card", 1, None, "1.1", 3)],
+        "expected_image_signals": ["1"],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is False
+    assert image_hit is False
+
+
+def test_anchor_hit_signal_image_index_match():
+    chunks = [_make_chunk_with_images("step_card", 1, None, None, 3, "abc",
+                                       [{"image_index": 1, "visual_summary": "raw scan",
+                                         "ocr_text": ""}])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [("step_card", 1, None, None, 3)],
+        "expected_image_signals": ["1"],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is True
+    assert image_hit is True
+
+
+def test_anchor_hit_signal_image_index_miss():
+    chunks = [_make_chunk_with_images("step_card", 1, None, None, 3, "abc",
+                                       [{"image_index": 5, "visual_summary": ""}])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [("step_card", 1, None, None, 3)],
+        "expected_image_signals": ["1"],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is True
+    assert image_hit is False
+
+
+def test_anchor_hit_signal_keyword_match():
+    chunks = [_make_chunk_with_images("step_card", 1, None, None, 3, "abc",
+                                       [{"image_index": 7,
+                                         "visual_summary": "三联表单含商检号",
+                                         "ocr_text": "G2202415"}])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [("step_card", 1, None, None, 3)],
+        "expected_image_signals": ["三联表单"],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is True
+    assert image_hit is True
+
+
+def test_anchor_hit_signal_keyword_miss():
+    chunks = [_make_chunk_with_images("step_card", 1, None, None, 3, "abc",
+                                       [{"image_index": 7,
+                                         "visual_summary": "条形码扫描",
+                                         "ocr_text": ""}])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [("step_card", 1, None, None, 3)],
+        "expected_image_signals": ["三联表单"],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is True
+    assert image_hit is False
+
+
+def test_anchor_hit_mixed_signals_all_required():
+    chunks = [_make_chunk_with_images("step_card", 1, None, None, 3, "abc",
+                                       [{"image_index": 1,
+                                         "visual_summary": "三联表单含商检号"}])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [("step_card", 1, None, None, 3)],
+        "expected_image_signals": ["1", "三联表单"],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is True
+    assert image_hit is True
+
+
+def test_anchor_hit_multiple_acceptable_one_matches():
+    chunks = [_make_chunk_with_images("step_card", 2, None, None, 5, "abc", [])]
+    anchor = {
+        "anchor_id": "a",
+        "acceptable_chunk_anchors": [
+            ("step_card", 1, None, None, 3),
+            ("step_card", 2, None, None, 5),
+        ],
+        "expected_image_signals": [],
+    }
+    key_hit, image_hit = _anchor_hit(anchor, chunks)
+    assert key_hit is True
+    assert image_hit is True
+
+
+def test_compute_anchor_metrics_basic():
+    anchors_by_doc = {
+        "pdf_sop": [
+            {"anchor_id": "a1", "step_name": "s1", "step_no": 1,
+             "acceptable_chunk_anchors": [("step_card", 1, None, None, 3)],
+             "expected_image_signals": []},
+            {"anchor_id": "a2", "step_name": "s2", "step_no": 2,
+             "acceptable_chunk_anchors": [("step_card", 2, None, None, 5)],
+             "expected_image_signals": ["1"]},
+        ],
+    }
+    chunks_off = [
+        _make_chunk_with_images("step_card", 1, None, None, 3, "x", []),
+    ]
+    chunks_on = [
+        _make_chunk_with_images("step_card", 1, None, None, 3, "x", []),
+        _make_chunk_with_images("step_card", 2, None, None, 5, "y",
+                                  [{"image_index": 1, "visual_summary": "ok"}]),
+    ]
+    chunks_by_arm = {"off": {"pdf_sop": chunks_off},
+                     "on": {"pdf_sop": chunks_on}}
+    metrics, per_case = _compute_anchor_metrics(
+        anchors_by_doc, chunks_by_arm, ["off", "on"])
+    assert metrics["off"]["n_anchors_evaluated"] == 2
+    assert metrics["off"]["semantic_anchor_key_hits"] == 1
+    assert metrics["off"]["semantic_anchor_dual_hits"] == 1
+    assert metrics["on"]["semantic_anchor_key_hits"] == 2
+    assert metrics["on"]["semantic_anchor_dual_hits"] == 2
+    assert metrics["off"]["semantic_anchor_key_jaccard"] == 0.5
+    assert metrics["on"]["semantic_anchor_key_jaccard"] == 1.0
+    assert len(per_case) == 2
+    a1, a2 = per_case
+    assert a1["key_hit_off"] is True and a1["key_hit_on"] is True
+    assert a2["key_hit_off"] is False and a2["key_hit_on"] is True
+    assert a2["dual_hit_on"] is True
