@@ -4492,42 +4492,10 @@ def node_build_opensearch_payload(ctx: dict):
         # Default safety margin is 1.5MB (configured as 1,500,000 in config.py:L57)
         max_bulk_limit = getattr(config.opensearch, "max_bulk_size_bytes", 1_500_000)
 
-    batches = []
-    current_chunks = []
-    current_lines = []
-    current_size = 0
-
-    for chunk in chunks:
-        action = {"index": {"_id": chunk.chunk_id}}
-        doc = chunk.to_opensearch_doc()
-        action_line = json.dumps(action, ensure_ascii=False)
-        doc_line = json.dumps(doc, ensure_ascii=False)
-        chunk_payload = f"{action_line}\n{doc_line}\n"
-        chunk_size = len(chunk_payload.encode("utf-8"))
-
-        if current_size > 0 and current_size + chunk_size > max_bulk_limit:
-            # Close the current batch
-            payload = "".join(current_lines)
-            batches.append({
-                "chunks": current_chunks,
-                "payload": payload,
-                "payload_size": len(payload.encode("utf-8")),
-            })
-            current_chunks = []
-            current_lines = []
-            current_size = 0
-
-        current_chunks.append(chunk)
-        current_lines.append(chunk_payload)
-        current_size += chunk_size
-
-    if current_chunks:
-        payload = "".join(current_lines)
-        batches.append({
-            "chunks": current_chunks,
-            "payload": payload,
-            "payload_size": len(payload.encode("utf-8")),
-        })
+    # D8 Phase 11(A/B framework Step A):NDJSON 序列化 + 切批抽到 bulk_helpers,
+    # 生产 ingestion 与评测 chunker_ab 灌入共享单一来源,避免序列化漂移
+    from opensearch_pipeline.bulk_helpers import build_opensearch_bulk_actions
+    batches = build_opensearch_bulk_actions(chunks, max_bulk_size_bytes=max_bulk_limit)
 
     bucket, is_simulated = _get_oss_bucket(ctx)
     base_job_id = f"BULK_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
