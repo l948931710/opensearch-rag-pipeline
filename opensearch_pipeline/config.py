@@ -33,6 +33,13 @@ PROD_FINGERPRINTS = {
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", ""}
 
+# Staging HA3 表名允许的后缀（2026-06-15 起，含 _s）。
+# 由来：用户最初按 docs/environment_design.md 想建 `_stg` 后缀的 HA3 表，
+# 但阿里云控制台那次 _stg 表建失败（具体原因未深查），改用 `_s` 后缀建成功。
+# 守卫这边把 _s 和 _stg 都接受，docs/environment_design.md 也同步更新。
+# **不要**用于 RDS 库名校验——RDS 那边仍强制 _stg（fuling_knowledge_stg 已建好）。
+_STAGING_HA3_SUFFIXES = ("_stg", "_s")
+
 # 守卫豁免变量（语义见 docs/environment_design.md）：
 #   RAG_ALLOW_REMOTE_DB=read_only_ack      非 production 标签下连接远程/生产 RDS 的显式声明
 #   RAG_ALLOW_REMOTE_SEARCH=read_only_ack  同上，针对 HA3/OpenSearch
@@ -461,11 +468,11 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
                     f"[ENV GUARD] environment={env} 指向生产 RDS（database={config.rds.database}，"
                     f"非 _stg 库）。PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
         if not config.simulate_opensearch and is_prod_target("search", search_targets) \
-                and not config.alibaba_vector.table_name.endswith("_stg"):
+                and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             if not _require_ack("RAG_ALLOW_REMOTE_SEARCH"):
                 raise EnvironmentMismatchError(
                     f"[ENV GUARD] environment={env} 指向生产检索实例"
-                    f"（table={config.alibaba_vector.table_name!r}，非 _stg 表）。"
+                    f"（table={config.alibaba_vector.table_name!r}，非 _stg/_s 表）。"
                     f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_SEARCH={_ACK_VALUE}")
 
     if env == "production":
@@ -483,7 +490,7 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
             and config.alibaba_vector.endpoint and not config.alibaba_vector.table_name:
         raise EnvironmentMismatchError(
             "[ENV GUARD] HA3 endpoint 已配置但 RAG_HA3_TABLE_NAME 为空——"
-            "请显式声明表名（生产=fuling_kb_chunks / 预演=fuling_kb_chunks_stg）")
+            "请显式声明表名（生产=fuling_kb_chunks / 预演=fuling_kb_chunks_stg 或 fuling_kb_chunks_s）")
 
     # STAGING overlay 的资源后缀强约束（防 staging 配置半生不熟指向生产资源；无豁免）
     if os.environ.get("RAG_ENV", "").lower() == "staging":
@@ -493,8 +500,9 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
         if not config.simulate_db and not config.rds.database.endswith("_stg"):
             problems.append(f"RDS_DATABASE 必须以 _stg 结尾（当前 {config.rds.database}）")
         if not config.simulate_opensearch and config.alibaba_vector.endpoint \
-                and not config.alibaba_vector.table_name.endswith("_stg"):
-            problems.append(f"HA3_TABLE_NAME 必须以 _stg 结尾（当前 {config.alibaba_vector.table_name!r}）")
+                and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
+            problems.append(f"HA3_TABLE_NAME 必须以 _stg 或 _s 结尾"
+                            f"（当前 {config.alibaba_vector.table_name!r}）")
         if not config.simulate_oss and not config.oss.bucket_name.endswith("-staging"):
             problems.append(f"OSS_BUCKET_NAME 必须以 -staging 结尾（当前 {config.oss.bucket_name}）")
         if problems:
