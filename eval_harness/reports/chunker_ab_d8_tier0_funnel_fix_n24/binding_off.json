@@ -1,0 +1,1810 @@
+{
+ "deterministic": {
+  "img_dup_factor_p95": 1.0,
+  "img_dup_factor_max": 1.0,
+  "n_degraded_docs": 0,
+  "errors": [],
+  "per_fmt": {
+   "pdf": {
+    "n_docs": 3,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 30,
+    "mean_jaccard": 0.8555566666666666,
+    "std_jaccard": 0.3208379434987479
+   }
+  },
+  "binding_jaccard_pdf": 0.8555566666666666,
+  "binding_jaccard_docx": null,
+  "binding_jaccard_xlsx": null,
+  "binding_jaccard_pptx": null
+ },
+ "per_doc": [
+  {
+   "label": "pdf_sop",
+   "fmt": "pdf",
+   "degraded": false,
+   "n_gt_chunks": 11,
+   "n_strong_chunks": 11,
+   "mean_jaccard": 0.8787878787878789,
+   "img_dup_factor": 1.0,
+   "n_step_cards": 10,
+   "n_total_image_refs": 10,
+   "per_chunk": [
+    {
+     "gt_label": "前言(作业前提+说明)",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "text_chunk"
+    },
+    {
+     "gt_label": "步骤1.1 收取交货单",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤1.2 核对错误处理",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤1.3 抄录订单信息",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤2 交货单分类",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤3.1 U8扫码报检",
+     "weak": false,
+     "n_expected_refs": 3,
+     "n_pred_refs": 2,
+     "jaccard": 0.6667,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤3.2 扫码枪扫描",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤4 报检填写(父)",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤4.1 填写设备班次",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 2,
+     "jaccard": 0.5,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤4.2 班组人员",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 2,
+     "jaccard": 0.5,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤5 群通知完成",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    }
+   ],
+   "judge_items": [
+    {
+     "qid": "pdf_sop::步骤1.1 收取交货单",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤1.1 收取交货单",
+     "gt_keywords": [
+      "收取",
+      "交货单",
+      "标识卡",
+      "机台",
+      "货号",
+      "核对"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 1,
+       "page": 1
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤1： 1.1 收取《交货单》：交货单与标识卡按日期、机台、货号、商检号、数量核对（如下图①②）;核\n对正确后取走交货单，并在标识卡上标记“√”(上图①)；\n图中①为识卡按日期、机台、货号、商检号、数量核对。\n[图片OCR] 5-PAPERS-SU 客户：ACME-PAPER-SU 生产数量：450 货号：G2202415 产品描述：*21923 5.3G四色PP膜* 机台：纸机17 机台：包袋机 生产数量 5-BO 客户 包袋类型 出勤数 日清 机台1 机台2 机台3 备注 进料 PPS MDS% 色母# 黑色 蓝色 生产人员 k286 包装数量 产品定型 检验员",
+     "produced_image_refs": [
+      {
+       "image_index": 1,
+       "page_num": 1,
+       "visual_summary": "左侧为绿色纸质生产检验单（含商检号、包装日期、机台号、生产人员等字段），右侧为手写填写的生产记录表，含日清、机台编号、产品规格、数量及出勤数等信息，并有红色箭头标注关键字段对应关系。",
+       "ocr_text": "5-PAPERS-SU\n客户：ACME-PAPER-SU\n生产数量：450\n货号：G2202415\n产品描述：*21923 5.3G四色PP膜* 机台：纸机17/18 机台：包袋机\n生产数量：\n5-BO\n客户\n包袋类型：\n出勤数：\n日清\n机台1\n机台2\n机台3\n备注\n101\n进料\nPPS\nMDS%\n色母#\n2415\n黑色：\n8.24\n蓝色：\n131458\n放\n机台1：\n机台2：\n机台3：\n生产人员：\nk286\n包装数量：\n产品定型：\n检验员：\n17\n9 等 灰\n8 等 绿\n8 等 绿\n9 等 绿\n17 等"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_sop::步骤1.2 核对错误处理",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤1.2 核对错误处理",
+     "gt_keywords": [
+      "核对错误",
+      "群通知",
+      "班长",
+      "成品",
+      "竖起"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 2,
+       "page": 1
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n1.2  若核对错误，发送到群通知班长，并将最上层成品竖起一箱（图③）；\n图中③为仓库内堆叠的纸箱货物。",
+     "produced_image_refs": [
+      {
+       "image_index": 2,
+       "page_num": 1,
+       "visual_summary": "仓库内堆叠的纸箱货物，部分用透明塑料膜缠绕固定，红色方框标注区域③指向中间一垛未完全包裹的纸箱堆，背景可见厂房钢梁与吊装设备。",
+       "ocr_text": "③"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_sop::步骤1.3 抄录订单信息",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤1.3 抄录订单信息",
+     "gt_keywords": [
+      "抄录",
+      "订单",
+      "信息",
+      "时间",
+      "机台",
+      "数量"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 3,
+       "page": 1
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n1.3  按下列数据抄录订单信息（如下图④），用于后续跟踪；\n图中④为1.3  按下列数据抄录订单信息。\n[图片OCR] 时间 机台 数量 货品(商检号 G08 T40800+015 G09 G15",
+     "produced_image_refs": [
+      {
+       "image_index": 3,
+       "page_num": 1,
+       "visual_summary": "手写纸质记录单，包含‘时间’（8:14）、‘机台 数量 货品(商检号)’三列标题，下方填写多行机台编号（如G08、G09、G15）、数量及重复出现的商检号1440850413，页面上方有数字‘4’及红框标注区域。",
+       "ocr_text": "4\n时间\n8:14\n机台 数量 货品(商检号)\n1440850413\n1440850413\nG08 46+015\nT40800+015\nG09 32\nG15 35+11\n1440850413\n1440850413"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_sop::步骤2 交货单分类",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤2 交货单分类",
+     "gt_keywords": [
+      "交货单",
+      "分类",
+      "放置",
+      "班次",
+      "货号"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 4,
+       "page": 2
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤2：交货单按分类1为放置四堆；按分类2，3为上下顺序依次放置（如图①）；\n图中①为3为上下顺序依次放置。\n[图片OCR] 手串号：一般贸易 存放仓库 客户：直通车-IMPERIAL BAG 商检号：2202343 货号：IMP-1PP2SSB-1 包装类型：出穗数 生产数量：640 生产尾数 产品描述：（黑色 ASH00 1PP黑色5.3克手串总长1000公分手串包邮（机 日用 日期 月台号 员工编号 客户名称 备注 A17 陈晓玲 30箱 K500 刘华锋 24箱 陈秀英 54箱 产品描述：（黑 手串数量：3000 手串数量：内销",
+     "produced_image_refs": [
+      {
+       "image_index": 4,
+       "page_num": 2,
+       "visual_summary": "三份手写填写的生产尾数记录单，含客户信息（直通车-IMPERIAL BAG）、货号（IMP-1PP2SSB-1）、生产数量、员工编号与姓名、箱数等字段，置于键盘与鼠标旁的桌面上。",
+       "ocr_text": "手串号：一般贸易\n存放仓库：\n客户：直通车-IMPERIAL BAG\n商检号：2202343\n货号：IMP-1PP2SSB-1\n包装类型：出穗数：\n生产数量：640\n生产尾数：\n产品描述：（黑色） ASH00 1PP黑色5.3克手串总长1000公分手串包邮（机\n日用\n日期\n月台号\n员工编号\n客户名称\n备注\n8:26\nA17\n2799\n陈晓玲\n245\n30箱\nK500\n刘华锋\n24箱\n1899\n陈秀英\n放\n54箱\n手串号：一般贸易\n存放仓库：\n客户：直通车-IMPERIAL BAG\n商检号：2202343\n货号：IMP-1PP2SSB-1\n生产尾数：\n产品描述：（黑）\n手串数量：3000\n生产尾数\n手串数量：内销\n产品描述：（黑） ASH00 1PP黑色5.3克手串总长1000公分手串包邮（机\n日用\n日期\n月台号\n员工编号\n客户名称\n备注\n8:26\nA17\n2799\n陈晓玲\n245\n30箱\nK500\n刘华锋\n24箱\n1899\n陈秀英\n放\n54箱"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_sop::步骤3.1 U8扫码报检",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤3.1 U8扫码报检",
+     "gt_keywords": [
+      "U8",
+      "扫码",
+      "报检",
+      "业务导航",
+      "质量管理"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 5,
+       "page": 2
+      },
+      {
+       "image_index": 6,
+       "page": 2
+      },
+      {
+       "image_index": 9,
+       "page": 3
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤3： 3.1 进入U8系统的“扫码报检”界面（如下图②-⑥步操作）。\n图中①为产品目录，②为系统帮助，③为常用功能，④为系统管理，⑤为问题诊断，⑥为发票管理 山东山。\n[图片OCR] ②系统帮助 ③常用功能 ④系统管理 ⑤问题诊断 产品导航 ①产品目录 ②产品订单 ③产品入库单 ④产品出库单 ⑤采购订单列表 ⑥发票管理 山东山 采购订单 采购订单号 采购日期 采购批次 采购合同号 采购品名 规格型号 单位 数量 单价 金额 出库单号 出库日期 业务类型 包装类型 5-BA0 客户：ACME-PAPER-SUPPLY 客户合同号 客户简称 生产数量：450 生产部门",
+     "produced_image_refs": [
+      {
+       "image_index": 5,
+       "page_num": 2,
+       "visual_summary": "企业ERP系统左侧功能导航栏截图，包含业务导航、常用功能、消息任务、报表中心、实例导航、企业发现等模块；右侧展开‘系统管理’下的‘问题诊断’子菜单，并高亮显示‘产品导航’及其下属的‘产品目录’至‘发票管理’等选项。",
+       "ocr_text": "②系统帮助\n③常用功能\n④系统管理\n⑤问题诊断\n产品导航\n①产品目录\n②产品订单\n③产品入库单\n④产品出库单\n⑤采购订单列表\n⑥发票管理"
+      },
+      {
+       "image_index": 6,
+       "page_num": 2,
+       "visual_summary": "上半部分为ERP系统采购订单录入界面，含条码扫描区、货号、产品名等字段；下半部分为手写纸质交货单，含生产数量450、客户ACME-PAPER-SUPPLY、货号ACME-131458及物料明细表，底部有条形码。",
+       "ocr_text": "山东山\n采购订单\n采购订单号\n采购日期\n采购批次\n采购合同号\n采购品名\n规格型号\n单位\n数量\n单价\n金额\n出库单号\n出库日期\n业务类型\n包装类型\n5-BA0\n客户：ACME-PAPER-SUPPLY\n客户合同号\n客户简称\n生产数量：450\n生产部门\n客户地址\n仓库类型\n出库数量\n17箱\n8箱\n422\nK28L\n车床\n数\n9\n箱\n1.635\n特应检\n数\n8\n箱\nA257\n琴伟\n数\n8\n箱\nF58\n共全\n数\n9\n箱"
+      }
+     ],
+     "jaccard_score": 0.6667
+    },
+    {
+     "qid": "pdf_sop::步骤3.2 扫码枪扫描",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤3.2 扫码枪扫描",
+     "gt_keywords": [
+      "扫码枪",
+      "条形码",
+      "扫描",
+      "红光"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 7,
+       "page": 2
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n3.2 进入扫描报检页面后，扫码枪红光照准条形码区域，扫描《交货单》（图⑧）；\n生效日期：  2022年8月25日\n[图片内容] 办公桌面上放置黑色条码扫描枪（带柔性支架）、部分可见电脑显示器与键盘，前方有带条形码的纸质单据及透明塑料包装物，左侧可见电风扇局部。",
+     "produced_image_refs": [
+      {
+       "image_index": 7,
+       "page_num": 2,
+       "visual_summary": "办公桌面上放置黑色条码扫描枪（带柔性支架）、部分可见电脑显示器与键盘，前方有带条形码的纸质单据及透明塑料包装物，左侧可见电风扇局部。",
+       "ocr_text": ""
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_sop::步骤4.1 填写设备班次",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤4.1 填写设备班次",
+     "gt_keywords": [
+      "设备",
+      "班次",
+      "数量",
+      "机台",
+      "ZS"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 10,
+       "page": 3
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n4.2 填写完后，依次点击“④根据设备带出班组人员”若人员不对，以交货单为准进行修改（删行或增加）、\n“⑤根据交货单备注数的填写数量”、“⑥报检”完成报检；若“报检”无反映具体操作参照《注塑报检异常》\n作业指导书(文件编号：FL-ZS-WI-011)；\n 重复步骤3.2--步骤4，直至《交货单》报检全部完成；\n图中①为635 陈应袖 数 8 条，③为U8系统‘档案查询’界面截图，④为根据设备带出班组人员”若人员不对，⑤为根据交货单备注数的填写数量”、“，⑥为报检”完成报检。\n[图片OCR] 手册号:一般贸易 生产数量:450 客户:ACME-PAPER-SUPPLY",
+     "produced_image_refs": [
+      {
+       "image_index": 9,
+       "page_num": 3,
+       "visual_summary": "U8系统‘档案查询’界面截图，左侧为功能导航栏，中间为档案检索表单（含已归档区域、货号、手单号、品名等字段），下方显示检索结果列表；右侧弹出‘ItemSelectForm’选择窗口，含编码、名称、主辅料等列，并标注‘模糊查找’功能。",
+       "ocr_text": ""
+      },
+      {
+       "image_index": 10,
+       "page_num": 3,
+       "visual_summary": "一张手写生产记录表单，含手册号、客户信息、货号、产品描述及按日期、机号、员工编号、名称、条数、工号、数量等字段填写的作业记录，部分字段被红框和数字标注。",
+       "ocr_text": "手册号:一般贸易\n生产数量:450\n客户:ACME-PAPER-SUPPLY-\n商检号:Q202415\n货号:ACME-131458\n产品描述:纸,礼品\n包装类型:\n出模数:\n日期 机号 手工编号 名称 条数 工号 数量\n8月 422 K208 金牛 ⑤ 9 箱 ②\n① 635 陈应袖 数 8 条\n257 影伟 放勺 8 条\n158 金全 放勺 9 箱\n④ 17 箱\n③"
+      }
+     ],
+     "jaccard_score": 0.5
+    },
+    {
+     "qid": "pdf_sop::步骤4.2 班组人员",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤4.2 班组人员",
+     "gt_keywords": [
+      "班组人员",
+      "修改",
+      "报检",
+      "备注",
+      "报检异常"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 9,
+       "page": 3
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n4.2 填写完后，依次点击“④根据设备带出班组人员”若人员不对，以交货单为准进行修改（删行或增加）、\n“⑤根据交货单备注数的填写数量”、“⑥报检”完成报检；若“报检”无反映具体操作参照《注塑报检异常》\n作业指导书(文件编号：FL-ZS-WI-011)；\n 重复步骤3.2--步骤4，直至《交货单》报检全部完成；\n图中①为635 陈应袖 数 8 条，③为U8系统‘档案查询’界面截图，④为根据设备带出班组人员”若人员不对，⑤为根据交货单备注数的填写数量”、“，⑥为报检”完成报检。\n[图片OCR] 手册号:一般贸易 生产数量:450 客户:ACME-PAPER-SUPPLY",
+     "produced_image_refs": [
+      {
+       "image_index": 9,
+       "page_num": 3,
+       "visual_summary": "U8系统‘档案查询’界面截图，左侧为功能导航栏，中间为档案检索表单（含已归档区域、货号、手单号、品名等字段），下方显示检索结果列表；右侧弹出‘ItemSelectForm’选择窗口，含编码、名称、主辅料等列，并标注‘模糊查找’功能。",
+       "ocr_text": ""
+      },
+      {
+       "image_index": 10,
+       "page_num": 3,
+       "visual_summary": "一张手写生产记录表单，含手册号、客户信息、货号、产品描述及按日期、机号、员工编号、名称、条数、工号、数量等字段填写的作业记录，部分字段被红框和数字标注。",
+       "ocr_text": "手册号:一般贸易\n生产数量:450\n客户:ACME-PAPER-SUPPLY-\n商检号:Q202415\n货号:ACME-131458\n产品描述:纸,礼品\n包装类型:\n出模数:\n日期 机号 手工编号 名称 条数 工号 数量\n8月 422 K208 金牛 ⑤ 9 箱 ②\n① 635 陈应袖 数 8 条\n257 影伟 放勺 8 条\n158 金全 放勺 9 箱\n④ 17 箱\n③"
+      }
+     ],
+     "jaccard_score": 0.5
+    },
+    {
+     "qid": "pdf_sop::步骤5 群通知完成",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤5 群通知完成",
+     "gt_keywords": [
+      "群通知",
+      "报检完成",
+      "注塑车间",
+      "仓管"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 11,
+       "page": 3
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤5：发送到“注塑车间仓管”群通知统计报检完成（图⑦）。\n[图片内容] 注塑车间仓管群聊界面截图，显示12人参与，含陈云琴、王江铃、杨国红等人关于1号、5号物料扫码完成情况的沟通记录，时间戳为2022年8月29日。\n[图片OCR] 注塑车间仓管 共12人 青睐视频 文件 投票 短信 好了 陈云琴 1号扫好了 王江铃 @陈云琴 5号呢 2人未读 单子扫好没@全体成员 3人未读 杨国红 @王江铃",
+     "produced_image_refs": [
+      {
+       "image_index": 11,
+       "page_num": 3,
+       "visual_summary": "注塑车间仓管群聊界面截图，显示12人参与，含陈云琴、王江铃、杨国红等人关于1号、5号物料扫码完成情况的沟通记录，时间戳为2022年8月29日。",
+       "ocr_text": "注塑车间仓管\n共12人\n青睐视频 文件 投票 短信 邀\n好了\n陈云琴 2022/08/29 10:56:38\n1号扫好了\n王江铃 2022/08/29 11:29:27\n@陈云琴 5号呢\n2人未读\n王江铃 2022/08/29 13:45:14\n单子扫好没@全体成员\n3人未读\n杨国红 2022/08/29 13:46:37\n@王江铃 好了"
+      }
+     ],
+     "jaccard_score": 1.0
+    }
+   ]
+  },
+  {
+   "label": "pdf_xs_wi_007",
+   "fmt": "pdf",
+   "degraded": false,
+   "n_gt_chunks": 9,
+   "n_strong_chunks": 9,
+   "mean_jaccard": 0.7777777777777778,
+   "img_dup_factor": 1.0,
+   "n_step_cards": 10,
+   "n_total_image_refs": 8,
+   "per_chunk": [
+    {
+     "gt_label": "前言(作业前提+说明)",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "text_chunk"
+    },
+    {
+     "gt_label": "步骤1 按产品标识卡清点实货",
+     "weak": false,
+     "n_expected_refs": 2,
+     "n_pred_refs": 2,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤2 收集核对交货单",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 2,
+     "jaccard": 0.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤3 进入U8扫码报检界面",
+     "weak": false,
+     "n_expected_refs": 3,
+     "n_pred_refs": 3,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤4 扫码枪扫描交货单",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤5.1 报检主流程(填写设备班次数量)",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 0.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤5.2 报检异常流程(增加人员)",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤6 重复完成所有交货单报检",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "步骤7 复核报检信息",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    }
+   ],
+   "judge_items": [
+    {
+     "qid": "pdf_xs_wi_007::步骤1 按产品标识卡清点实货",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤1 按产品标识卡清点实货",
+     "gt_keywords": [
+      "产品标识卡",
+      "清点",
+      "定单号",
+      "机台号",
+      "抄录",
+      "纸箱"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 1,
+       "page": 1
+      },
+      {
+       "image_index": 2,
+       "page": 1
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤2：每天上午9点左右，向各区班长收集《交货单》，核对抄录信息与《交货单》，如发现异常，通知班长；\n如箱子上没有货号，则抄录“产品规格”\n机台上尾数\n其他托盘上的数量\n生效日期：  2022年8月19日\n[补充图示] 台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，；手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工",
+     "produced_image_refs": [
+      {
+       "image_index": 1,
+       "page_num": 1,
+       "visual_summary": "台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，下方可见部分产品型号P325-PP。",
+       "ocr_text": "台州富岭塑胶有限公司\n产品标识卡（包装车专用）\n手号：\nPP%\n1#\nHP8%\n色母#\nPET%\n进料\n国产\n装车间）\n对应定单号：\n2326\n客户：\n包装日期：\n8.25\n班次：\n白\n货号产品规格：\n3.25*125杯\n50*50\n机台号组号：\n107#\n221#\n数量：\n4个\n检验员：\n入库人员：\n产品克重：\nP325-PP"
+      },
+      {
+       "image_index": 2,
+       "page_num": 1,
+       "visual_summary": "手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工艺参数记录，无界面、实物、表单或流程图等可视结构。",
+       "ocr_text": "2336 P325-PPB D07(38) 22 7 +45"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_xs_wi_007::步骤2 收集核对交货单",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤2 收集核对交货单",
+     "gt_keywords": [
+      "收集",
+      "交货单",
+      "班长",
+      "异常",
+      "产品规格",
+      "尾数"
+     ],
+     "expected_image_refs": [],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤2：每天上午9点左右，向各区班长收集《交货单》，核对抄录信息与《交货单》，如发现异常，通知班长；\n如箱子上没有货号，则抄录“产品规格”\n机台上尾数\n其他托盘上的数量\n生效日期：  2022年8月19日\n[补充图示] 台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，；手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工",
+     "produced_image_refs": [
+      {
+       "image_index": 1,
+       "page_num": 1,
+       "visual_summary": "台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，下方可见部分产品型号P325-PP。",
+       "ocr_text": "台州富岭塑胶有限公司\n产品标识卡（包装车专用）\n手号：\nPP%\n1#\nHP8%\n色母#\nPET%\n进料\n国产\n装车间）\n对应定单号：\n2326\n客户：\n包装日期：\n8.25\n班次：\n白\n货号产品规格：\n3.25*125杯\n50*50\n机台号组号：\n107#\n221#\n数量：\n4个\n检验员：\n入库人员：\n产品克重：\nP325-PP"
+      },
+      {
+       "image_index": 2,
+       "page_num": 1,
+       "visual_summary": "手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工艺参数记录，无界面、实物、表单或流程图等可视结构。",
+       "ocr_text": "2336 P325-PPB D07(38) 22 7 +45"
+      }
+     ],
+     "jaccard_score": 0.0
+    },
+    {
+     "qid": "pdf_xs_wi_007::步骤3 进入U8扫码报检界面",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤3 进入U8扫码报检界面",
+     "gt_keywords": [
+      "U8系统",
+      "扫码报检",
+      "桌面",
+      "帐号密码",
+      "登录",
+      "双击"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 26,
+       "page": 2
+      },
+      {
+       "image_index": 27,
+       "page": 2
+      },
+      {
+       "image_index": 28,
+       "page": 2
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤3：进入U8系统的“扫码报检”界面（如下图①-⑤步操作）。\n③点击\n在电脑桌面打开U8 ①\n④输入“扫码报检”\n输入帐号密码登录\n⑤双击\n图中①为进入U8系统的“扫码报检”界面。\n[图片OCR] 用友U8+ 英语）班会 数学）班会 任务栏 微信 QQ 用友U8 2021年注册 学生会 资料中文 帮助 FL0429 修改密码 888]FLS 富岭 忘记密码 登录 电子文档 数字化资产管理的 最后一环 下载移动U8+ 电子文档管理 机器人组 统一云友 金融服务 用友网络科技股份有限公司版权所有 我的桌面 扫码报检 温岭中和用友软件 业务导航 常用功能 条码扫",
+     "produced_image_refs": [
+      {
+       "image_index": 26,
+       "page_num": 2,
+       "visual_summary": "用友U8+系统登录界面截图，显示IP地址192.168.0.144、用户名FL0429、密码输入框（带‘修改密码’复选框）、组织[888]FLS/富岭、日期2022-08-10及蓝色‘登录’按钮，左侧有‘电子文档 数字化资产管理的最后一环’宣传图。",
+       "ocr_text": "18\n用友U8+\n（英语）班会\n（数学）班会\n任务栏\n微信\nQQ\n（英语）班会\n用友U8\n2021年注册\n学生会\n用友U8\n资料中文\n帮助\n192.168.0.144\nFL0429\n修改密码\n[888]FLS/富岭\n2022-08-10\n忘记密码？\n登录\n电子文档\n数字化资产管理的\n最后一环\n下载移动U8+\n电子文档管理 机器人组 统一云友 金融服务 | 用友网络科技股份有限公司版权所有"
+      },
+      {
+       "image_index": 27,
+       "page_num": 2,
+       "visual_summary": "用友U8+系统桌面界面，左侧为业务导航、常用功能、消息任务、报表中心菜单栏；中间搜索框输入“扫码报检”，结果列表显示标题“扫码报检”及路径“供应链\\质...”；右侧展示三个快捷入口图标：产成品入库单列表、销售出库单列表、扫码报检。",
+       "ocr_text": "56,32,35,89,90\n190,116,35,77,90\n186,188,35,79,90\n62,272,35,75,90\n198,376,35,141,90\n164,458,35,39,90\n162,522,35,79,90\n62,494,35,75,90\n62,720,35,75,90\n62,940,35,75,90\n220,278,35,77,90\n410,458,35,39,90\n410,522,35,79,90\n588,898,35,129,90\n588,940,35,21,90\n770,898,35,131,90\n954,898,35,79,90"
+      },
+      {
+       "image_index": 28,
+       "page_num": 2,
+       "visual_summary": "温岭中和用友软件的扫码报检界面，包含条码扫描区、已扫条码、货号、产品名、数量、出模数、手册号、商检号、设备、班次、机台号、包装类型等输入字段，以及报检、重新分配、删除、增加、清空等操作按钮。",
+       "ocr_text": "我的桌面\n扫码报检\n温岭中和用友软件\n业务导航\n常用功能\n条码扫描区\n已扫条码\n货号\n产品名\n可报数\n数量\n出模数\n手册号\n商检号\n机台号\n包装类型\n设备\n班次\n日期\n根据设备带出班组人员\n重新分配\n删除\n增加\n清空\n报表中心"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_xs_wi_007::步骤4 扫码枪扫描交货单",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤4 扫码枪扫描交货单",
+     "gt_keywords": [
+      "扫码枪",
+      "红光",
+      "条形码",
+      "扫描",
+      "交货单"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 29,
+       "page": 2
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤4：扫码枪红光照准条形码区域，扫描《交货单》\n生效日期：  2022年8月19日\n[补充图示] 手持一张手写填写的生产尾数记录单，含客户信息（美国富岭-DIXIE CONS）、商检号、货号、产品规格、包装类型、出模数及员工班组签名与完工数量等字段，底部有条形码。\n[图片OCR] 客户：美国富岭-DIXIE CONS 商检号：2213363 货号：CC7WPP 包装类型：手 出模数：14 生产尾数 产品规格：45*宽70*透明PP加重水杯 200只 彩印袋（双排",
+     "produced_image_refs": [
+      {
+       "image_index": 29,
+       "page_num": 2,
+       "visual_summary": "手持一张手写填写的生产尾数记录单，含客户信息（美国富岭-DIXIE CONS）、商检号、货号、产品规格、包装类型、出模数及员工班组签名与完工数量等字段，底部有条形码。",
+       "ocr_text": "515 4500001153791\n客户：美国富岭-DIXIE CONS\n商检号：2213363\n货号：CC7WPP\n包装类型：手\n出模数：14\n生产尾数：\n产品规格：45*宽70*透明PP加重水杯，200只/彩印袋（双排），6\n53"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_xs_wi_007::步骤5.1 报检主流程(填写设备班次数量)",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤5.1 报检主流程(填写设备班次数量)",
+     "gt_keywords": [
+      "报检",
+      "设备",
+      "班次",
+      "数量",
+      "XS-D06",
+      "交货单"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 30,
+       "page": 3
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n3）假如，点击“根据设备带出班组人员”带不出人员，那么，点击“①增加”，按《交货单》②输入人名，\n点击“③模糊查询”，④双击编码完成增加，然后依次点击“⑤重新分配”、“⑥报检”完成报检；\n⑤  ①\n②  ③\n④双击\n图中①为增加”，②为输入人名，③为模糊查询”，④为双击编码完成增加，⑤为重新分配”、“，⑥为报检”完成报检。\n[图片OCR] 我的桌面 扫码报检 温岭中和用友软件 业务导航 常用功能 条码扫描区 已扫条码 M021 东部2号吸塑车间 报检 货号 PF-P550-PP 产品名 PF4克透明水杯50*50 可报数 手册号 一般贸易 商检号 数量 出模",
+     "produced_image_refs": [
+      {
+       "image_index": 41,
+       "page_num": 3,
+       "visual_summary": "温岭中和用友软件U8系统‘扫码报检’界面截图，显示条码扫描区、货号PF-P550-PP、产品名PF4克透明水杯50*50、设备XS-D06、批次自报等字段，下方列出班组人员尹忠伟、陈艳及其数量，右侧为档案选择与部门信息区域。",
+       "ocr_text": "我的桌面\n扫码报检\n温岭中和用友软件\n业务导航\n常用功能\n条码扫描区\n已扫条码\nM021|0000104136|8\n东部2号吸塑车间\n报检\n货号\nPF-P550-PP\n产品名\nPF4克透明水杯50*50\n可报数\n151\n手册号\n一般贸易\n商检号\n2211900\n数量\n58\n出模数\n14\n设备\nXS-D06\n批次\n自报\n机台号\n包装类型\n手\n根据设备带出班组人员\n重新分配\n删行\n增加\n清空\n报表中心\n编号\n姓名\n数量\n档案选择\n模糊查询\n编辑\n退出\nJ159\n尹忠伟\n29\n折叠所有节点\n展开所有节点\n返回\n李奕应\n编码\n名称\ncDept_num\n0533\n李柴应\n15\n所有\n(01)总经办"
+      }
+     ],
+     "jaccard_score": 0.0
+    },
+    {
+     "qid": "pdf_xs_wi_007::步骤5.2 报检异常流程(增加人员)",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "步骤5.2 报检异常流程(增加人员)",
+     "gt_keywords": [
+      "增加",
+      "输入人名",
+      "模糊查询",
+      "双击编码",
+      "重新分配",
+      "带不出人员"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 41,
+       "page": 3
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n3）假如，点击“根据设备带出班组人员”带不出人员，那么，点击“①增加”，按《交货单》②输入人名，\n点击“③模糊查询”，④双击编码完成增加，然后依次点击“⑤重新分配”、“⑥报检”完成报检；\n⑤  ①\n②  ③\n④双击\n图中①为增加”，②为输入人名，③为模糊查询”，④为双击编码完成增加，⑤为重新分配”、“，⑥为报检”完成报检。\n[图片OCR] 我的桌面 扫码报检 温岭中和用友软件 业务导航 常用功能 条码扫描区 已扫条码 M021 东部2号吸塑车间 报检 货号 PF-P550-PP 产品名 PF4克透明水杯50*50 可报数 手册号 一般贸易 商检号 数量 出模",
+     "produced_image_refs": [
+      {
+       "image_index": 41,
+       "page_num": 3,
+       "visual_summary": "温岭中和用友软件U8系统‘扫码报检’界面截图，显示条码扫描区、货号PF-P550-PP、产品名PF4克透明水杯50*50、设备XS-D06、批次自报等字段，下方列出班组人员尹忠伟、陈艳及其数量，右侧为档案选择与部门信息区域。",
+       "ocr_text": "我的桌面\n扫码报检\n温岭中和用友软件\n业务导航\n常用功能\n条码扫描区\n已扫条码\nM021|0000104136|8\n东部2号吸塑车间\n报检\n货号\nPF-P550-PP\n产品名\nPF4克透明水杯50*50\n可报数\n151\n手册号\n一般贸易\n商检号\n2211900\n数量\n58\n出模数\n14\n设备\nXS-D06\n批次\n自报\n机台号\n包装类型\n手\n根据设备带出班组人员\n重新分配\n删行\n增加\n清空\n报表中心\n编号\n姓名\n数量\n档案选择\n模糊查询\n编辑\n退出\nJ159\n尹忠伟\n29\n折叠所有节点\n展开所有节点\n返回\n李奕应\n编码\n名称\ncDept_num\n0533\n李柴应\n15\n所有\n(01)总经办"
+      }
+     ],
+     "jaccard_score": 1.0
+    }
+   ]
+  },
+  {
+   "label": "pdf_it_xxh_003",
+   "fmt": "pdf",
+   "degraded": false,
+   "n_gt_chunks": 10,
+   "n_strong_chunks": 10,
+   "mean_jaccard": 0.9,
+   "img_dup_factor": 1.0,
+   "n_step_cards": 9,
+   "n_total_image_refs": 11,
+   "per_chunk": [
+    {
+     "gt_label": "封面目录 七步总览",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "text_chunk"
+    },
+    {
+     "gt_label": "电脑安装作业概览(procedure_parent)",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 1,
+     "jaccard": 0.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "第一步 安装CPU处理器",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "第二步 安装散热器",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "第三步 安装内存条",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "第四步 将主板安装固定到机箱中",
+     "weak": false,
+     "n_expected_refs": 1,
+     "n_pred_refs": 1,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "第五步 安装硬盘",
+     "weak": false,
+     "n_expected_refs": 6,
+     "n_pred_refs": 6,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "第六步 安装光驱、电源",
+     "weak": false,
+     "n_expected_refs": 2,
+     "n_pred_refs": 2,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "第七步 安装显卡 并接好各种线缆",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    },
+    {
+     "gt_label": "全文收尾 线缆整理与总结",
+     "weak": false,
+     "n_expected_refs": 0,
+     "n_pred_refs": 0,
+     "jaccard": 1.0,
+     "matched_produced_type": "step_card"
+    }
+   ],
+   "judge_items": [
+    {
+     "qid": "pdf_it_xxh_003::电脑安装作业概览(procedure_parent)",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "电脑安装作业概览(procedure_parent)",
+     "gt_keywords": [
+      "电脑安装",
+      "概览",
+      "七个步骤",
+      "组装"
+     ],
+     "expected_image_refs": [],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第四步：将主板安装固定到机箱中\n目前，大部分主板板型为ATX或MATX结构，因此机箱的设计一般都符合这种标准。在安装主板之前，先装机\n箱提供的主板垫脚螺母安放到机箱主板托架的对应位置（有些机箱已经安装）。\n双手平行托住主板，将主板放入机箱中\n确定机箱安放到位，可以通过机箱背部的主板挡板来确定。\n拧紧螺丝，固定好主板。（在装螺丝时，注意每颗螺丝不要一定性的就拧紧，等全部螺丝安装到位后，再将\n每粒螺丝拧紧，这样做的好处是随时可以对主板的位置进行调整。）\n生效日期：  2022年7月1日\n主板安静的躺入到机箱中，安装过程结束。\n[图",
+     "produced_image_refs": [
+      {
+       "image_index": 16,
+       "page_num": 6,
+       "visual_summary": "一只手正将一个黄铜色六角螺母状零件插入金属面板上的孔位，面板表面有多个已钻孔及一处黑色方形嵌件，场景疑似设备组装或点检操作。",
+       "ocr_text": ""
+      }
+     ],
+     "jaccard_score": 0.0
+    },
+    {
+     "qid": "pdf_it_xxh_003::第一步 安装CPU处理器",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "第一步 安装CPU处理器",
+     "gt_keywords": [
+      "CPU",
+      "LGA775",
+      "处理器",
+      "三角标识",
+      "插座",
+      "压杆"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 8,
+       "page": 3
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第一步：安装 CPU 处理器\n英特尔处理器主要有32位与64位的赛扬与奔腾两种（酷睿目前已经上市，酷睿处理器是英特尔采用0.65制\n作工艺的全新处理器，采用了最新的架构，同样采用LGA775接口，在今后一段时间内，英特尔将全面主推酷睿\n处理器。由于同样采用 LGA 775 接口，因此安装方法与英特尔 64 位奔腾赛扬完全相同）。32 位的处理器采用了\n478针脚结构，而64位的则全部统一到LGA775平台。\n上图中我们可以看到，LGA 775接口的英特尔处理器全部采用了触点式设计，与478针管式设计相比，最大的优\n势是不用再去",
+     "produced_image_refs": [
+      {
+       "image_index": 8,
+       "page_num": 3,
+       "visual_summary": "手指正将CPU安装至主板插槽，图中标注了主板插槽上的三角形缺口标识与CPU边缘对应的三角形缺口标识，用于对齐定位。",
+       "ocr_text": "主板上三角型缺口标识\nCPU上三角型的缺口标识"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_it_xxh_003::第二步 安装散热器",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "第二步 安装散热器",
+     "gt_keywords": [
+      "散热器",
+      "导热硅脂",
+      "扣具",
+      "CPU_FAN",
+      "风扇接口"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 12,
+       "page": 4
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第二步：安装散热器\n由于 CPU 发热量较大，如果散热器安装不当，对散热的效果也会大打折扣。上图是 Intel LGA775\n针接口处理器的原装散热器，我们先要在 CPU表面均匀的涂上一层导热硅脂（很多散热器在购买时\n已经在底部与CPU接触的部分涂上了导致硅脂，这时就没有必要再在处理器上涂一层了。）安装时，\n将散热器的四角对准主板相应的位置，然后用力压下四角扣具即可。有些散热器采用了螺丝设计，\n因此在安装时还要在主板背面相应的位置安放螺母。\n生效日期：  2022年7月1日\n固定好散热器后，我们还要将散热风扇接到主板的供电接口",
+     "produced_image_refs": [
+      {
+       "image_index": 12,
+       "page_num": 4,
+       "visual_summary": "一个CPU散热器实物图，含铜质底座、铝制散热鳍片、四角固定支架及连接线缆，置于白色背景上。",
+       "ocr_text": "CPU散热器"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_it_xxh_003::第四步 将主板安装固定到机箱中",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "第四步 将主板安装固定到机箱中",
+     "gt_keywords": [
+      "主板",
+      "机箱",
+      "ATX",
+      "MATX",
+      "垫脚螺母",
+      "挡板"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 16,
+       "page": 6
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第四步：将主板安装固定到机箱中\n目前，大部分主板板型为ATX或MATX结构，因此机箱的设计一般都符合这种标准。在安装主板之前，先装机\n箱提供的主板垫脚螺母安放到机箱主板托架的对应位置（有些机箱已经安装）。\n双手平行托住主板，将主板放入机箱中\n确定机箱安放到位，可以通过机箱背部的主板挡板来确定。\n拧紧螺丝，固定好主板。（在装螺丝时，注意每颗螺丝不要一定性的就拧紧，等全部螺丝安装到位后，再将\n每粒螺丝拧紧，这样做的好处是随时可以对主板的位置进行调整。）\n生效日期：  2022年7月1日\n主板安静的躺入到机箱中，安装过程结束。\n[图",
+     "produced_image_refs": [
+      {
+       "image_index": 16,
+       "page_num": 6,
+       "visual_summary": "一只手正将一个黄铜色六角螺母状零件插入金属面板上的孔位，面板表面有多个已钻孔及一处黑色方形嵌件，场景疑似设备组装或点检操作。",
+       "ocr_text": ""
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_it_xxh_003::第五步 安装硬盘",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "第五步 安装硬盘",
+     "gt_keywords": [
+      "硬盘",
+      "3.5寸托架",
+      "扳手",
+      "螺丝",
+      "WD",
+      "Seagate"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 20,
+       "page": 7
+      },
+      {
+       "image_index": 21,
+       "page": 7
+      },
+      {
+       "image_index": 22,
+       "page": 8
+      },
+      {
+       "image_index": 23,
+       "page": 8
+      },
+      {
+       "image_index": 24,
+       "page": 8
+      },
+      {
+       "image_index": 25,
+       "page": 9
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第五步：安装硬盘\n在安装好CPU、内存之后，我们需要将硬盘固定在机箱的3.5寸硬盘托架上。\n对于普通的机箱，我们只需要将硬盘放入机箱的硬盘托架上，拧紧螺丝使其固定即可。\n机箱中固定3.5寸托架的扳手，拉动此扳手即可固定或取下3.5寸硬盘托架\n生效日期：  2022年7月1日\n取出后的3.5寸硬盘托架\n将硬盘装入托架中，并拧紧螺丝。\n生效日期：  2022年7月1日\n将托架重新装入机箱，并将固定扳手拉回原位固定好硬盘托架。简单的几步便将硬盘稳稳的装入机箱中，还\n有几种固定硬盘的方式，视机箱的不同大家可以参考一下机箱说明。\n[图片",
+     "produced_image_refs": [
+      {
+       "image_index": 20,
+       "page_num": 7,
+       "visual_summary": "一只手正在操作金属机柜内部的滑轨式安装支架，手指捏住金属卡扣进行推拉动作，背景为带冲孔的金属面板结构。",
+       "ocr_text": "手"
+      },
+      {
+       "image_index": 21,
+       "page_num": 7,
+       "visual_summary": "操作人员双手正在安装或调整一台金属外壳设备的抽屉式组件，该组件带有冲孔侧板和滑轨结构，背景可见部分线缆与设备内部结构。",
+       "ocr_text": ""
+      },
+      {
+       "image_index": 22,
+       "page_num": 8,
+       "visual_summary": "一个银色金属材质的方形空盒，表面有冲压孔洞与折边结构，顶部带可翻转金属盖及卡扣式把手，整体为未装配状态的裸件实物照片。",
+       "ocr_text": "金属盒"
+      },
+      {
+       "image_index": 23,
+       "page_num": 8,
+       "visual_summary": "双手正在将一块WD品牌硬盘装入金属硬盘支架中，硬盘标签面朝上，可见部分文字与标识，支架为银色金属材质，带散热孔和安装卡扣。",
+       "ocr_text": "WD"
+      },
+      {
+       "image_index": 24,
+       "page_num": 8,
+       "visual_summary": "一只手佩戴黑色腕带，使用金属螺丝刀对一个银色金属外壳组件进行操作，该组件内部装有黑色电子模块，表面有规则排列的圆形孔洞。",
+       "ocr_text": ""
+      },
+      {
+       "image_index": 25,
+       "page_num": 9,
+       "visual_summary": "一只手正在操作服务器机箱内的硬盘托架释放卡扣，托架中装有一块Seagate品牌硬盘，机箱为金属材质，带有通风孔和固定螺丝结构。",
+       "ocr_text": "HP"
+      }
+     ],
+     "jaccard_score": 1.0
+    },
+    {
+     "qid": "pdf_it_xxh_003::第六步 安装光驱、电源",
+     "kind": "binding",
+     "fmt": "pdf",
+     "gt_label": "第六步 安装光驱、电源",
+     "gt_keywords": [
+      "光驱",
+      "电源",
+      "4.25寸托架",
+      "抽拉式",
+      "DVD",
+      "簧片"
+     ],
+     "expected_image_refs": [
+      {
+       "image_index": 27,
+       "page": 10
+      },
+      {
+       "image_index": 29,
+       "page": 10
+      }
+     ],
+     "produced_chunk_type": "step_card",
+     "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第六步：安装光驱、电源\n安装光驱的方法与安装硬盘的方法大致相同，对于普通的机箱，我们只需要将机箱4.25寸的托架前的面板拆除，\n并将光驱将入对应的位置，拧紧螺丝即可。但还有一种抽拉式设计的光驱托架，简单介绍安装方法。\n这种光驱设计比较方便，在安装前，我们先要将类似于抽屉设计的托架安装到光驱上。\n生效日期：  2022年7月1日\n像推拉抽屉一样，将光驱推入机箱托架中\n机箱安装到位，需要取下时，用两手按们将两边的簧片，即可以拉出。\n机箱电源的安装，放入到位后，拧紧螺丝即可\n生效日期：  2022年7月1日\n主板上的PCI-E显卡插",
+     "produced_image_refs": [
+      {
+       "image_index": 27,
+       "page_num": 10,
+       "visual_summary": "操作人员正将一台带有DVD标识的光驱装入黑色机箱内，右手握持光驱前端蓝色释放卡扣，左手扶住机箱上沿，光驱面板可见DVD和CD图标及黄色警示标签。",
+       "ocr_text": "DVD"
+      },
+      {
+       "image_index": 29,
+       "page_num": 10,
+       "visual_summary": "一只手正在检查一台打开侧板的台式电脑主机内部，可见电源模块（含风扇、电源开关与插座）、内部走线及金属支架结构。",
+       "ocr_text": ""
+      }
+     ],
+     "jaccard_score": 1.0
+    }
+   ]
+  }
+ ],
+ "judge_bundle_binding": [
+  {
+   "qid": "pdf_sop::步骤1.1 收取交货单",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤1.1 收取交货单",
+   "gt_keywords": [
+    "收取",
+    "交货单",
+    "标识卡",
+    "机台",
+    "货号",
+    "核对"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 1,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤1： 1.1 收取《交货单》：交货单与标识卡按日期、机台、货号、商检号、数量核对（如下图①②）;核\n对正确后取走交货单，并在标识卡上标记“√”(上图①)；\n图中①为识卡按日期、机台、货号、商检号、数量核对。\n[图片OCR] 5-PAPERS-SU 客户：ACME-PAPER-SU 生产数量：450 货号：G2202415 产品描述：*21923 5.3G四色PP膜* 机台：纸机17 机台：包袋机 生产数量 5-BO 客户 包袋类型 出勤数 日清 机台1 机台2 机台3 备注 进料 PPS MDS% 色母# 黑色 蓝色 生产人员 k286 包装数量 产品定型 检验员",
+   "produced_image_refs": [
+    {
+     "image_index": 1,
+     "page_num": 1,
+     "visual_summary": "左侧为绿色纸质生产检验单（含商检号、包装日期、机台号、生产人员等字段），右侧为手写填写的生产记录表，含日清、机台编号、产品规格、数量及出勤数等信息，并有红色箭头标注关键字段对应关系。",
+     "ocr_text": "5-PAPERS-SU\n客户：ACME-PAPER-SU\n生产数量：450\n货号：G2202415\n产品描述：*21923 5.3G四色PP膜* 机台：纸机17/18 机台：包袋机\n生产数量：\n5-BO\n客户\n包袋类型：\n出勤数：\n日清\n机台1\n机台2\n机台3\n备注\n101\n进料\nPPS\nMDS%\n色母#\n2415\n黑色：\n8.24\n蓝色：\n131458\n放\n机台1：\n机台2：\n机台3：\n生产人员：\nk286\n包装数量：\n产品定型：\n检验员：\n17\n9 等 灰\n8 等 绿\n8 等 绿\n9 等 绿\n17 等"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤1.2 核对错误处理",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤1.2 核对错误处理",
+   "gt_keywords": [
+    "核对错误",
+    "群通知",
+    "班长",
+    "成品",
+    "竖起"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 2,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n1.2  若核对错误，发送到群通知班长，并将最上层成品竖起一箱（图③）；\n图中③为仓库内堆叠的纸箱货物。",
+   "produced_image_refs": [
+    {
+     "image_index": 2,
+     "page_num": 1,
+     "visual_summary": "仓库内堆叠的纸箱货物，部分用透明塑料膜缠绕固定，红色方框标注区域③指向中间一垛未完全包裹的纸箱堆，背景可见厂房钢梁与吊装设备。",
+     "ocr_text": "③"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤1.3 抄录订单信息",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤1.3 抄录订单信息",
+   "gt_keywords": [
+    "抄录",
+    "订单",
+    "信息",
+    "时间",
+    "机台",
+    "数量"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 3,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n1.3  按下列数据抄录订单信息（如下图④），用于后续跟踪；\n图中④为1.3  按下列数据抄录订单信息。\n[图片OCR] 时间 机台 数量 货品(商检号 G08 T40800+015 G09 G15",
+   "produced_image_refs": [
+    {
+     "image_index": 3,
+     "page_num": 1,
+     "visual_summary": "手写纸质记录单，包含‘时间’（8:14）、‘机台 数量 货品(商检号)’三列标题，下方填写多行机台编号（如G08、G09、G15）、数量及重复出现的商检号1440850413，页面上方有数字‘4’及红框标注区域。",
+     "ocr_text": "4\n时间\n8:14\n机台 数量 货品(商检号)\n1440850413\n1440850413\nG08 46+015\nT40800+015\nG09 32\nG15 35+11\n1440850413\n1440850413"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤2 交货单分类",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤2 交货单分类",
+   "gt_keywords": [
+    "交货单",
+    "分类",
+    "放置",
+    "班次",
+    "货号"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 4,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤2：交货单按分类1为放置四堆；按分类2，3为上下顺序依次放置（如图①）；\n图中①为3为上下顺序依次放置。\n[图片OCR] 手串号：一般贸易 存放仓库 客户：直通车-IMPERIAL BAG 商检号：2202343 货号：IMP-1PP2SSB-1 包装类型：出穗数 生产数量：640 生产尾数 产品描述：（黑色 ASH00 1PP黑色5.3克手串总长1000公分手串包邮（机 日用 日期 月台号 员工编号 客户名称 备注 A17 陈晓玲 30箱 K500 刘华锋 24箱 陈秀英 54箱 产品描述：（黑 手串数量：3000 手串数量：内销",
+   "produced_image_refs": [
+    {
+     "image_index": 4,
+     "page_num": 2,
+     "visual_summary": "三份手写填写的生产尾数记录单，含客户信息（直通车-IMPERIAL BAG）、货号（IMP-1PP2SSB-1）、生产数量、员工编号与姓名、箱数等字段，置于键盘与鼠标旁的桌面上。",
+     "ocr_text": "手串号：一般贸易\n存放仓库：\n客户：直通车-IMPERIAL BAG\n商检号：2202343\n货号：IMP-1PP2SSB-1\n包装类型：出穗数：\n生产数量：640\n生产尾数：\n产品描述：（黑色） ASH00 1PP黑色5.3克手串总长1000公分手串包邮（机\n日用\n日期\n月台号\n员工编号\n客户名称\n备注\n8:26\nA17\n2799\n陈晓玲\n245\n30箱\nK500\n刘华锋\n24箱\n1899\n陈秀英\n放\n54箱\n手串号：一般贸易\n存放仓库：\n客户：直通车-IMPERIAL BAG\n商检号：2202343\n货号：IMP-1PP2SSB-1\n生产尾数：\n产品描述：（黑）\n手串数量：3000\n生产尾数\n手串数量：内销\n产品描述：（黑） ASH00 1PP黑色5.3克手串总长1000公分手串包邮（机\n日用\n日期\n月台号\n员工编号\n客户名称\n备注\n8:26\nA17\n2799\n陈晓玲\n245\n30箱\nK500\n刘华锋\n24箱\n1899\n陈秀英\n放\n54箱"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤3.1 U8扫码报检",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤3.1 U8扫码报检",
+   "gt_keywords": [
+    "U8",
+    "扫码",
+    "报检",
+    "业务导航",
+    "质量管理"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 5,
+     "page": 2
+    },
+    {
+     "image_index": 6,
+     "page": 2
+    },
+    {
+     "image_index": 9,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤3： 3.1 进入U8系统的“扫码报检”界面（如下图②-⑥步操作）。\n图中①为产品目录，②为系统帮助，③为常用功能，④为系统管理，⑤为问题诊断，⑥为发票管理 山东山。\n[图片OCR] ②系统帮助 ③常用功能 ④系统管理 ⑤问题诊断 产品导航 ①产品目录 ②产品订单 ③产品入库单 ④产品出库单 ⑤采购订单列表 ⑥发票管理 山东山 采购订单 采购订单号 采购日期 采购批次 采购合同号 采购品名 规格型号 单位 数量 单价 金额 出库单号 出库日期 业务类型 包装类型 5-BA0 客户：ACME-PAPER-SUPPLY 客户合同号 客户简称 生产数量：450 生产部门",
+   "produced_image_refs": [
+    {
+     "image_index": 5,
+     "page_num": 2,
+     "visual_summary": "企业ERP系统左侧功能导航栏截图，包含业务导航、常用功能、消息任务、报表中心、实例导航、企业发现等模块；右侧展开‘系统管理’下的‘问题诊断’子菜单，并高亮显示‘产品导航’及其下属的‘产品目录’至‘发票管理’等选项。",
+     "ocr_text": "②系统帮助\n③常用功能\n④系统管理\n⑤问题诊断\n产品导航\n①产品目录\n②产品订单\n③产品入库单\n④产品出库单\n⑤采购订单列表\n⑥发票管理"
+    },
+    {
+     "image_index": 6,
+     "page_num": 2,
+     "visual_summary": "上半部分为ERP系统采购订单录入界面，含条码扫描区、货号、产品名等字段；下半部分为手写纸质交货单，含生产数量450、客户ACME-PAPER-SUPPLY、货号ACME-131458及物料明细表，底部有条形码。",
+     "ocr_text": "山东山\n采购订单\n采购订单号\n采购日期\n采购批次\n采购合同号\n采购品名\n规格型号\n单位\n数量\n单价\n金额\n出库单号\n出库日期\n业务类型\n包装类型\n5-BA0\n客户：ACME-PAPER-SUPPLY\n客户合同号\n客户简称\n生产数量：450\n生产部门\n客户地址\n仓库类型\n出库数量\n17箱\n8箱\n422\nK28L\n车床\n数\n9\n箱\n1.635\n特应检\n数\n8\n箱\nA257\n琴伟\n数\n8\n箱\nF58\n共全\n数\n9\n箱"
+    }
+   ],
+   "jaccard_score": 0.6667
+  },
+  {
+   "qid": "pdf_sop::步骤3.2 扫码枪扫描",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤3.2 扫码枪扫描",
+   "gt_keywords": [
+    "扫码枪",
+    "条形码",
+    "扫描",
+    "红光"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 7,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n3.2 进入扫描报检页面后，扫码枪红光照准条形码区域，扫描《交货单》（图⑧）；\n生效日期：  2022年8月25日\n[图片内容] 办公桌面上放置黑色条码扫描枪（带柔性支架）、部分可见电脑显示器与键盘，前方有带条形码的纸质单据及透明塑料包装物，左侧可见电风扇局部。",
+   "produced_image_refs": [
+    {
+     "image_index": 7,
+     "page_num": 2,
+     "visual_summary": "办公桌面上放置黑色条码扫描枪（带柔性支架）、部分可见电脑显示器与键盘，前方有带条形码的纸质单据及透明塑料包装物，左侧可见电风扇局部。",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤4.1 填写设备班次",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤4.1 填写设备班次",
+   "gt_keywords": [
+    "设备",
+    "班次",
+    "数量",
+    "机台",
+    "ZS"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 10,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n4.2 填写完后，依次点击“④根据设备带出班组人员”若人员不对，以交货单为准进行修改（删行或增加）、\n“⑤根据交货单备注数的填写数量”、“⑥报检”完成报检；若“报检”无反映具体操作参照《注塑报检异常》\n作业指导书(文件编号：FL-ZS-WI-011)；\n 重复步骤3.2--步骤4，直至《交货单》报检全部完成；\n图中①为635 陈应袖 数 8 条，③为U8系统‘档案查询’界面截图，④为根据设备带出班组人员”若人员不对，⑤为根据交货单备注数的填写数量”、“，⑥为报检”完成报检。\n[图片OCR] 手册号:一般贸易 生产数量:450 客户:ACME-PAPER-SUPPLY",
+   "produced_image_refs": [
+    {
+     "image_index": 9,
+     "page_num": 3,
+     "visual_summary": "U8系统‘档案查询’界面截图，左侧为功能导航栏，中间为档案检索表单（含已归档区域、货号、手单号、品名等字段），下方显示检索结果列表；右侧弹出‘ItemSelectForm’选择窗口，含编码、名称、主辅料等列，并标注‘模糊查找’功能。",
+     "ocr_text": ""
+    },
+    {
+     "image_index": 10,
+     "page_num": 3,
+     "visual_summary": "一张手写生产记录表单，含手册号、客户信息、货号、产品描述及按日期、机号、员工编号、名称、条数、工号、数量等字段填写的作业记录，部分字段被红框和数字标注。",
+     "ocr_text": "手册号:一般贸易\n生产数量:450\n客户:ACME-PAPER-SUPPLY-\n商检号:Q202415\n货号:ACME-131458\n产品描述:纸,礼品\n包装类型:\n出模数:\n日期 机号 手工编号 名称 条数 工号 数量\n8月 422 K208 金牛 ⑤ 9 箱 ②\n① 635 陈应袖 数 8 条\n257 影伟 放勺 8 条\n158 金全 放勺 9 箱\n④ 17 箱\n③"
+    }
+   ],
+   "jaccard_score": 0.5
+  },
+  {
+   "qid": "pdf_sop::步骤4.2 班组人员",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤4.2 班组人员",
+   "gt_keywords": [
+    "班组人员",
+    "修改",
+    "报检",
+    "备注",
+    "报检异常"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 9,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n4.2 填写完后，依次点击“④根据设备带出班组人员”若人员不对，以交货单为准进行修改（删行或增加）、\n“⑤根据交货单备注数的填写数量”、“⑥报检”完成报检；若“报检”无反映具体操作参照《注塑报检异常》\n作业指导书(文件编号：FL-ZS-WI-011)；\n 重复步骤3.2--步骤4，直至《交货单》报检全部完成；\n图中①为635 陈应袖 数 8 条，③为U8系统‘档案查询’界面截图，④为根据设备带出班组人员”若人员不对，⑤为根据交货单备注数的填写数量”、“，⑥为报检”完成报检。\n[图片OCR] 手册号:一般贸易 生产数量:450 客户:ACME-PAPER-SUPPLY",
+   "produced_image_refs": [
+    {
+     "image_index": 9,
+     "page_num": 3,
+     "visual_summary": "U8系统‘档案查询’界面截图，左侧为功能导航栏，中间为档案检索表单（含已归档区域、货号、手单号、品名等字段），下方显示检索结果列表；右侧弹出‘ItemSelectForm’选择窗口，含编码、名称、主辅料等列，并标注‘模糊查找’功能。",
+     "ocr_text": ""
+    },
+    {
+     "image_index": 10,
+     "page_num": 3,
+     "visual_summary": "一张手写生产记录表单，含手册号、客户信息、货号、产品描述及按日期、机号、员工编号、名称、条数、工号、数量等字段填写的作业记录，部分字段被红框和数字标注。",
+     "ocr_text": "手册号:一般贸易\n生产数量:450\n客户:ACME-PAPER-SUPPLY-\n商检号:Q202415\n货号:ACME-131458\n产品描述:纸,礼品\n包装类型:\n出模数:\n日期 机号 手工编号 名称 条数 工号 数量\n8月 422 K208 金牛 ⑤ 9 箱 ②\n① 635 陈应袖 数 8 条\n257 影伟 放勺 8 条\n158 金全 放勺 9 箱\n④ 17 箱\n③"
+    }
+   ],
+   "jaccard_score": 0.5
+  },
+  {
+   "qid": "pdf_sop::步骤5 群通知完成",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤5 群通知完成",
+   "gt_keywords": [
+    "群通知",
+    "报检完成",
+    "注塑车间",
+    "仓管"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 11,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:pdf_sop】\n步骤5：发送到“注塑车间仓管”群通知统计报检完成（图⑦）。\n[图片内容] 注塑车间仓管群聊界面截图，显示12人参与，含陈云琴、王江铃、杨国红等人关于1号、5号物料扫码完成情况的沟通记录，时间戳为2022年8月29日。\n[图片OCR] 注塑车间仓管 共12人 青睐视频 文件 投票 短信 好了 陈云琴 1号扫好了 王江铃 @陈云琴 5号呢 2人未读 单子扫好没@全体成员 3人未读 杨国红 @王江铃",
+   "produced_image_refs": [
+    {
+     "image_index": 11,
+     "page_num": 3,
+     "visual_summary": "注塑车间仓管群聊界面截图，显示12人参与，含陈云琴、王江铃、杨国红等人关于1号、5号物料扫码完成情况的沟通记录，时间戳为2022年8月29日。",
+     "ocr_text": "注塑车间仓管\n共12人\n青睐视频 文件 投票 短信 邀\n好了\n陈云琴 2022/08/29 10:56:38\n1号扫好了\n王江铃 2022/08/29 11:29:27\n@陈云琴 5号呢\n2人未读\n王江铃 2022/08/29 13:45:14\n单子扫好没@全体成员\n3人未读\n杨国红 2022/08/29 13:46:37\n@王江铃 好了"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤1 按产品标识卡清点实货",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤1 按产品标识卡清点实货",
+   "gt_keywords": [
+    "产品标识卡",
+    "清点",
+    "定单号",
+    "机台号",
+    "抄录",
+    "纸箱"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 1,
+     "page": 1
+    },
+    {
+     "image_index": 2,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤2：每天上午9点左右，向各区班长收集《交货单》，核对抄录信息与《交货单》，如发现异常，通知班长；\n如箱子上没有货号，则抄录“产品规格”\n机台上尾数\n其他托盘上的数量\n生效日期：  2022年8月19日\n[补充图示] 台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，；手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工",
+   "produced_image_refs": [
+    {
+     "image_index": 1,
+     "page_num": 1,
+     "visual_summary": "台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，下方可见部分产品型号P325-PP。",
+     "ocr_text": "台州富岭塑胶有限公司\n产品标识卡（包装车专用）\n手号：\nPP%\n1#\nHP8%\n色母#\nPET%\n进料\n国产\n装车间）\n对应定单号：\n2326\n客户：\n包装日期：\n8.25\n班次：\n白\n货号产品规格：\n3.25*125杯\n50*50\n机台号组号：\n107#\n221#\n数量：\n4个\n检验员：\n入库人员：\n产品克重：\nP325-PP"
+    },
+    {
+     "image_index": 2,
+     "page_num": 1,
+     "visual_summary": "手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工艺参数记录，无界面、实物、表单或流程图等可视结构。",
+     "ocr_text": "2336 P325-PPB D07(38) 22 7 +45"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤2 收集核对交货单",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤2 收集核对交货单",
+   "gt_keywords": [
+    "收集",
+    "交货单",
+    "班长",
+    "异常",
+    "产品规格",
+    "尾数"
+   ],
+   "expected_image_refs": [],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤2：每天上午9点左右，向各区班长收集《交货单》，核对抄录信息与《交货单》，如发现异常，通知班长；\n如箱子上没有货号，则抄录“产品规格”\n机台上尾数\n其他托盘上的数量\n生效日期：  2022年8月19日\n[补充图示] 台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，；手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工",
+   "produced_image_refs": [
+    {
+     "image_index": 1,
+     "page_num": 1,
+     "visual_summary": "台州富岭塑胶有限公司产品标识卡（包装车间专用），含手册号、材料配比（PP%、HP8%等）、进料来源、订单号2326、包装日期8.25、班次白、货号规格3.25*125杯与50*50、机台号107#与221#、数量4个、检验员及入库人员栏位，下方可见部分产品型号P325-PP。",
+     "ocr_text": "台州富岭塑胶有限公司\n产品标识卡（包装车专用）\n手号：\nPP%\n1#\nHP8%\n色母#\nPET%\n进料\n国产\n装车间）\n对应定单号：\n2326\n客户：\n包装日期：\n8.25\n班次：\n白\n货号产品规格：\n3.25*125杯\n50*50\n机台号组号：\n107#\n221#\n数量：\n4个\n检验员：\n入库人员：\n产品克重：\nP325-PP"
+    },
+    {
+     "image_index": 2,
+     "page_num": 1,
+     "visual_summary": "手写文本内容为'2336 P325-PPB D07(38) 22 7 +45'，疑似产品编号、批次或工艺参数记录，无界面、实物、表单或流程图等可视结构。",
+     "ocr_text": "2336 P325-PPB D07(38) 22 7 +45"
+    }
+   ],
+   "jaccard_score": 0.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤3 进入U8扫码报检界面",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤3 进入U8扫码报检界面",
+   "gt_keywords": [
+    "U8系统",
+    "扫码报检",
+    "桌面",
+    "帐号密码",
+    "登录",
+    "双击"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 26,
+     "page": 2
+    },
+    {
+     "image_index": 27,
+     "page": 2
+    },
+    {
+     "image_index": 28,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤3：进入U8系统的“扫码报检”界面（如下图①-⑤步操作）。\n③点击\n在电脑桌面打开U8 ①\n④输入“扫码报检”\n输入帐号密码登录\n⑤双击\n图中①为进入U8系统的“扫码报检”界面。\n[图片OCR] 用友U8+ 英语）班会 数学）班会 任务栏 微信 QQ 用友U8 2021年注册 学生会 资料中文 帮助 FL0429 修改密码 888]FLS 富岭 忘记密码 登录 电子文档 数字化资产管理的 最后一环 下载移动U8+ 电子文档管理 机器人组 统一云友 金融服务 用友网络科技股份有限公司版权所有 我的桌面 扫码报检 温岭中和用友软件 业务导航 常用功能 条码扫",
+   "produced_image_refs": [
+    {
+     "image_index": 26,
+     "page_num": 2,
+     "visual_summary": "用友U8+系统登录界面截图，显示IP地址192.168.0.144、用户名FL0429、密码输入框（带‘修改密码’复选框）、组织[888]FLS/富岭、日期2022-08-10及蓝色‘登录’按钮，左侧有‘电子文档 数字化资产管理的最后一环’宣传图。",
+     "ocr_text": "18\n用友U8+\n（英语）班会\n（数学）班会\n任务栏\n微信\nQQ\n（英语）班会\n用友U8\n2021年注册\n学生会\n用友U8\n资料中文\n帮助\n192.168.0.144\nFL0429\n修改密码\n[888]FLS/富岭\n2022-08-10\n忘记密码？\n登录\n电子文档\n数字化资产管理的\n最后一环\n下载移动U8+\n电子文档管理 机器人组 统一云友 金融服务 | 用友网络科技股份有限公司版权所有"
+    },
+    {
+     "image_index": 27,
+     "page_num": 2,
+     "visual_summary": "用友U8+系统桌面界面，左侧为业务导航、常用功能、消息任务、报表中心菜单栏；中间搜索框输入“扫码报检”，结果列表显示标题“扫码报检”及路径“供应链\\质...”；右侧展示三个快捷入口图标：产成品入库单列表、销售出库单列表、扫码报检。",
+     "ocr_text": "56,32,35,89,90\n190,116,35,77,90\n186,188,35,79,90\n62,272,35,75,90\n198,376,35,141,90\n164,458,35,39,90\n162,522,35,79,90\n62,494,35,75,90\n62,720,35,75,90\n62,940,35,75,90\n220,278,35,77,90\n410,458,35,39,90\n410,522,35,79,90\n588,898,35,129,90\n588,940,35,21,90\n770,898,35,131,90\n954,898,35,79,90"
+    },
+    {
+     "image_index": 28,
+     "page_num": 2,
+     "visual_summary": "温岭中和用友软件的扫码报检界面，包含条码扫描区、已扫条码、货号、产品名、数量、出模数、手册号、商检号、设备、班次、机台号、包装类型等输入字段，以及报检、重新分配、删除、增加、清空等操作按钮。",
+     "ocr_text": "我的桌面\n扫码报检\n温岭中和用友软件\n业务导航\n常用功能\n条码扫描区\n已扫条码\n货号\n产品名\n可报数\n数量\n出模数\n手册号\n商检号\n机台号\n包装类型\n设备\n班次\n日期\n根据设备带出班组人员\n重新分配\n删除\n增加\n清空\n报表中心"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤4 扫码枪扫描交货单",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤4 扫码枪扫描交货单",
+   "gt_keywords": [
+    "扫码枪",
+    "红光",
+    "条形码",
+    "扫描",
+    "交货单"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 29,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n步骤4：扫码枪红光照准条形码区域，扫描《交货单》\n生效日期：  2022年8月19日\n[补充图示] 手持一张手写填写的生产尾数记录单，含客户信息（美国富岭-DIXIE CONS）、商检号、货号、产品规格、包装类型、出模数及员工班组签名与完工数量等字段，底部有条形码。\n[图片OCR] 客户：美国富岭-DIXIE CONS 商检号：2213363 货号：CC7WPP 包装类型：手 出模数：14 生产尾数 产品规格：45*宽70*透明PP加重水杯 200只 彩印袋（双排",
+   "produced_image_refs": [
+    {
+     "image_index": 29,
+     "page_num": 2,
+     "visual_summary": "手持一张手写填写的生产尾数记录单，含客户信息（美国富岭-DIXIE CONS）、商检号、货号、产品规格、包装类型、出模数及员工班组签名与完工数量等字段，底部有条形码。",
+     "ocr_text": "515 4500001153791\n客户：美国富岭-DIXIE CONS\n商检号：2213363\n货号：CC7WPP\n包装类型：手\n出模数：14\n生产尾数：\n产品规格：45*宽70*透明PP加重水杯，200只/彩印袋（双排），6\n53"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤5.1 报检主流程(填写设备班次数量)",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤5.1 报检主流程(填写设备班次数量)",
+   "gt_keywords": [
+    "报检",
+    "设备",
+    "班次",
+    "数量",
+    "XS-D06",
+    "交货单"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 30,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n3）假如，点击“根据设备带出班组人员”带不出人员，那么，点击“①增加”，按《交货单》②输入人名，\n点击“③模糊查询”，④双击编码完成增加，然后依次点击“⑤重新分配”、“⑥报检”完成报检；\n⑤  ①\n②  ③\n④双击\n图中①为增加”，②为输入人名，③为模糊查询”，④为双击编码完成增加，⑤为重新分配”、“，⑥为报检”完成报检。\n[图片OCR] 我的桌面 扫码报检 温岭中和用友软件 业务导航 常用功能 条码扫描区 已扫条码 M021 东部2号吸塑车间 报检 货号 PF-P550-PP 产品名 PF4克透明水杯50*50 可报数 手册号 一般贸易 商检号 数量 出模",
+   "produced_image_refs": [
+    {
+     "image_index": 41,
+     "page_num": 3,
+     "visual_summary": "温岭中和用友软件U8系统‘扫码报检’界面截图，显示条码扫描区、货号PF-P550-PP、产品名PF4克透明水杯50*50、设备XS-D06、批次自报等字段，下方列出班组人员尹忠伟、陈艳及其数量，右侧为档案选择与部门信息区域。",
+     "ocr_text": "我的桌面\n扫码报检\n温岭中和用友软件\n业务导航\n常用功能\n条码扫描区\n已扫条码\nM021|0000104136|8\n东部2号吸塑车间\n报检\n货号\nPF-P550-PP\n产品名\nPF4克透明水杯50*50\n可报数\n151\n手册号\n一般贸易\n商检号\n2211900\n数量\n58\n出模数\n14\n设备\nXS-D06\n批次\n自报\n机台号\n包装类型\n手\n根据设备带出班组人员\n重新分配\n删行\n增加\n清空\n报表中心\n编号\n姓名\n数量\n档案选择\n模糊查询\n编辑\n退出\nJ159\n尹忠伟\n29\n折叠所有节点\n展开所有节点\n返回\n李奕应\n编码\n名称\ncDept_num\n0533\n李柴应\n15\n所有\n(01)总经办"
+    }
+   ],
+   "jaccard_score": 0.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤5.2 报检异常流程(增加人员)",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "步骤5.2 报检异常流程(增加人员)",
+   "gt_keywords": [
+    "增加",
+    "输入人名",
+    "模糊查询",
+    "双击编码",
+    "重新分配",
+    "带不出人员"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 41,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:FL-XS-WI-007】\n3）假如，点击“根据设备带出班组人员”带不出人员，那么，点击“①增加”，按《交货单》②输入人名，\n点击“③模糊查询”，④双击编码完成增加，然后依次点击“⑤重新分配”、“⑥报检”完成报检；\n⑤  ①\n②  ③\n④双击\n图中①为增加”，②为输入人名，③为模糊查询”，④为双击编码完成增加，⑤为重新分配”、“，⑥为报检”完成报检。\n[图片OCR] 我的桌面 扫码报检 温岭中和用友软件 业务导航 常用功能 条码扫描区 已扫条码 M021 东部2号吸塑车间 报检 货号 PF-P550-PP 产品名 PF4克透明水杯50*50 可报数 手册号 一般贸易 商检号 数量 出模",
+   "produced_image_refs": [
+    {
+     "image_index": 41,
+     "page_num": 3,
+     "visual_summary": "温岭中和用友软件U8系统‘扫码报检’界面截图，显示条码扫描区、货号PF-P550-PP、产品名PF4克透明水杯50*50、设备XS-D06、批次自报等字段，下方列出班组人员尹忠伟、陈艳及其数量，右侧为档案选择与部门信息区域。",
+     "ocr_text": "我的桌面\n扫码报检\n温岭中和用友软件\n业务导航\n常用功能\n条码扫描区\n已扫条码\nM021|0000104136|8\n东部2号吸塑车间\n报检\n货号\nPF-P550-PP\n产品名\nPF4克透明水杯50*50\n可报数\n151\n手册号\n一般贸易\n商检号\n2211900\n数量\n58\n出模数\n14\n设备\nXS-D06\n批次\n自报\n机台号\n包装类型\n手\n根据设备带出班组人员\n重新分配\n删行\n增加\n清空\n报表中心\n编号\n姓名\n数量\n档案选择\n模糊查询\n编辑\n退出\nJ159\n尹忠伟\n29\n折叠所有节点\n展开所有节点\n返回\n李奕应\n编码\n名称\ncDept_num\n0533\n李柴应\n15\n所有\n(01)总经办"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::电脑安装作业概览(procedure_parent)",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "电脑安装作业概览(procedure_parent)",
+   "gt_keywords": [
+    "电脑安装",
+    "概览",
+    "七个步骤",
+    "组装"
+   ],
+   "expected_image_refs": [],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第四步：将主板安装固定到机箱中\n目前，大部分主板板型为ATX或MATX结构，因此机箱的设计一般都符合这种标准。在安装主板之前，先装机\n箱提供的主板垫脚螺母安放到机箱主板托架的对应位置（有些机箱已经安装）。\n双手平行托住主板，将主板放入机箱中\n确定机箱安放到位，可以通过机箱背部的主板挡板来确定。\n拧紧螺丝，固定好主板。（在装螺丝时，注意每颗螺丝不要一定性的就拧紧，等全部螺丝安装到位后，再将\n每粒螺丝拧紧，这样做的好处是随时可以对主板的位置进行调整。）\n生效日期：  2022年7月1日\n主板安静的躺入到机箱中，安装过程结束。\n[图",
+   "produced_image_refs": [
+    {
+     "image_index": 16,
+     "page_num": 6,
+     "visual_summary": "一只手正将一个黄铜色六角螺母状零件插入金属面板上的孔位，面板表面有多个已钻孔及一处黑色方形嵌件，场景疑似设备组装或点检操作。",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 0.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第一步 安装CPU处理器",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "第一步 安装CPU处理器",
+   "gt_keywords": [
+    "CPU",
+    "LGA775",
+    "处理器",
+    "三角标识",
+    "插座",
+    "压杆"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 8,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第一步：安装 CPU 处理器\n英特尔处理器主要有32位与64位的赛扬与奔腾两种（酷睿目前已经上市，酷睿处理器是英特尔采用0.65制\n作工艺的全新处理器，采用了最新的架构，同样采用LGA775接口，在今后一段时间内，英特尔将全面主推酷睿\n处理器。由于同样采用 LGA 775 接口，因此安装方法与英特尔 64 位奔腾赛扬完全相同）。32 位的处理器采用了\n478针脚结构，而64位的则全部统一到LGA775平台。\n上图中我们可以看到，LGA 775接口的英特尔处理器全部采用了触点式设计，与478针管式设计相比，最大的优\n势是不用再去",
+   "produced_image_refs": [
+    {
+     "image_index": 8,
+     "page_num": 3,
+     "visual_summary": "手指正将CPU安装至主板插槽，图中标注了主板插槽上的三角形缺口标识与CPU边缘对应的三角形缺口标识，用于对齐定位。",
+     "ocr_text": "主板上三角型缺口标识\nCPU上三角型的缺口标识"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第二步 安装散热器",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "第二步 安装散热器",
+   "gt_keywords": [
+    "散热器",
+    "导热硅脂",
+    "扣具",
+    "CPU_FAN",
+    "风扇接口"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 12,
+     "page": 4
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第二步：安装散热器\n由于 CPU 发热量较大，如果散热器安装不当，对散热的效果也会大打折扣。上图是 Intel LGA775\n针接口处理器的原装散热器，我们先要在 CPU表面均匀的涂上一层导热硅脂（很多散热器在购买时\n已经在底部与CPU接触的部分涂上了导致硅脂，这时就没有必要再在处理器上涂一层了。）安装时，\n将散热器的四角对准主板相应的位置，然后用力压下四角扣具即可。有些散热器采用了螺丝设计，\n因此在安装时还要在主板背面相应的位置安放螺母。\n生效日期：  2022年7月1日\n固定好散热器后，我们还要将散热风扇接到主板的供电接口",
+   "produced_image_refs": [
+    {
+     "image_index": 12,
+     "page_num": 4,
+     "visual_summary": "一个CPU散热器实物图，含铜质底座、铝制散热鳍片、四角固定支架及连接线缆，置于白色背景上。",
+     "ocr_text": "CPU散热器"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第四步 将主板安装固定到机箱中",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "第四步 将主板安装固定到机箱中",
+   "gt_keywords": [
+    "主板",
+    "机箱",
+    "ATX",
+    "MATX",
+    "垫脚螺母",
+    "挡板"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 16,
+     "page": 6
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第四步：将主板安装固定到机箱中\n目前，大部分主板板型为ATX或MATX结构，因此机箱的设计一般都符合这种标准。在安装主板之前，先装机\n箱提供的主板垫脚螺母安放到机箱主板托架的对应位置（有些机箱已经安装）。\n双手平行托住主板，将主板放入机箱中\n确定机箱安放到位，可以通过机箱背部的主板挡板来确定。\n拧紧螺丝，固定好主板。（在装螺丝时，注意每颗螺丝不要一定性的就拧紧，等全部螺丝安装到位后，再将\n每粒螺丝拧紧，这样做的好处是随时可以对主板的位置进行调整。）\n生效日期：  2022年7月1日\n主板安静的躺入到机箱中，安装过程结束。\n[图",
+   "produced_image_refs": [
+    {
+     "image_index": 16,
+     "page_num": 6,
+     "visual_summary": "一只手正将一个黄铜色六角螺母状零件插入金属面板上的孔位，面板表面有多个已钻孔及一处黑色方形嵌件，场景疑似设备组装或点检操作。",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第五步 安装硬盘",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "第五步 安装硬盘",
+   "gt_keywords": [
+    "硬盘",
+    "3.5寸托架",
+    "扳手",
+    "螺丝",
+    "WD",
+    "Seagate"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 20,
+     "page": 7
+    },
+    {
+     "image_index": 21,
+     "page": 7
+    },
+    {
+     "image_index": 22,
+     "page": 8
+    },
+    {
+     "image_index": 23,
+     "page": 8
+    },
+    {
+     "image_index": 24,
+     "page": 8
+    },
+    {
+     "image_index": 25,
+     "page": 9
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第五步：安装硬盘\n在安装好CPU、内存之后，我们需要将硬盘固定在机箱的3.5寸硬盘托架上。\n对于普通的机箱，我们只需要将硬盘放入机箱的硬盘托架上，拧紧螺丝使其固定即可。\n机箱中固定3.5寸托架的扳手，拉动此扳手即可固定或取下3.5寸硬盘托架\n生效日期：  2022年7月1日\n取出后的3.5寸硬盘托架\n将硬盘装入托架中，并拧紧螺丝。\n生效日期：  2022年7月1日\n将托架重新装入机箱，并将固定扳手拉回原位固定好硬盘托架。简单的几步便将硬盘稳稳的装入机箱中，还\n有几种固定硬盘的方式，视机箱的不同大家可以参考一下机箱说明。\n[图片",
+   "produced_image_refs": [
+    {
+     "image_index": 20,
+     "page_num": 7,
+     "visual_summary": "一只手正在操作金属机柜内部的滑轨式安装支架，手指捏住金属卡扣进行推拉动作，背景为带冲孔的金属面板结构。",
+     "ocr_text": "手"
+    },
+    {
+     "image_index": 21,
+     "page_num": 7,
+     "visual_summary": "操作人员双手正在安装或调整一台金属外壳设备的抽屉式组件，该组件带有冲孔侧板和滑轨结构，背景可见部分线缆与设备内部结构。",
+     "ocr_text": ""
+    },
+    {
+     "image_index": 22,
+     "page_num": 8,
+     "visual_summary": "一个银色金属材质的方形空盒，表面有冲压孔洞与折边结构，顶部带可翻转金属盖及卡扣式把手，整体为未装配状态的裸件实物照片。",
+     "ocr_text": "金属盒"
+    },
+    {
+     "image_index": 23,
+     "page_num": 8,
+     "visual_summary": "双手正在将一块WD品牌硬盘装入金属硬盘支架中，硬盘标签面朝上，可见部分文字与标识，支架为银色金属材质，带散热孔和安装卡扣。",
+     "ocr_text": "WD"
+    },
+    {
+     "image_index": 24,
+     "page_num": 8,
+     "visual_summary": "一只手佩戴黑色腕带，使用金属螺丝刀对一个银色金属外壳组件进行操作，该组件内部装有黑色电子模块，表面有规则排列的圆形孔洞。",
+     "ocr_text": ""
+    },
+    {
+     "image_index": 25,
+     "page_num": 9,
+     "visual_summary": "一只手正在操作服务器机箱内的硬盘托架释放卡扣，托架中装有一块Seagate品牌硬盘，机箱为金属材质，带有通风孔和固定螺丝结构。",
+     "ocr_text": "HP"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第六步 安装光驱、电源",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "第六步 安装光驱、电源",
+   "gt_keywords": [
+    "光驱",
+    "电源",
+    "4.25寸托架",
+    "抽拉式",
+    "DVD",
+    "簧片"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 27,
+     "page": 10
+    },
+    {
+     "image_index": 29,
+     "page": 10
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "【文档:it_FL-CW-XXH-003-《电脑安装》作业指导书】\n第六步：安装光驱、电源\n安装光驱的方法与安装硬盘的方法大致相同，对于普通的机箱，我们只需要将机箱4.25寸的托架前的面板拆除，\n并将光驱将入对应的位置，拧紧螺丝即可。但还有一种抽拉式设计的光驱托架，简单介绍安装方法。\n这种光驱设计比较方便，在安装前，我们先要将类似于抽屉设计的托架安装到光驱上。\n生效日期：  2022年7月1日\n像推拉抽屉一样，将光驱推入机箱托架中\n机箱安装到位，需要取下时，用两手按们将两边的簧片，即可以拉出。\n机箱电源的安装，放入到位后，拧紧螺丝即可\n生效日期：  2022年7月1日\n主板上的PCI-E显卡插",
+   "produced_image_refs": [
+    {
+     "image_index": 27,
+     "page_num": 10,
+     "visual_summary": "操作人员正将一台带有DVD标识的光驱装入黑色机箱内，右手握持光驱前端蓝色释放卡扣，左手扶住机箱上沿，光驱面板可见DVD和CD图标及黄色警示标签。",
+     "ocr_text": "DVD"
+    },
+    {
+     "image_index": 29,
+     "page_num": 10,
+     "visual_summary": "一只手正在检查一台打开侧板的台式电脑主机内部，可见电源模块（含风扇、电源开关与插座）、内部走线及金属支架结构。",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  }
+ ]
+}

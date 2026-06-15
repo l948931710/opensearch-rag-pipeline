@@ -116,6 +116,288 @@ def test_label_text_suppressed_from_card_text():
                 "独立 ⑧ 标注不应出现在 3.1 卡正文"
 
 
+# ──────────── Path C 收紧：vlm_annotation_map.keys() 不再算圈号源 ──────────────
+
+
+def test_path_c_ignores_vlm_annotation_map_keys():
+    """Path C range-ref override 必须只信 OCR 真实印出的圈号,不能用
+    vlm_annotation_map.keys() 中的 ①-⑥(VLM 标的"图内区域位置编号",
+    与 step text 的"②-⑥步操作"sub-step 引用是不同语义)。
+
+    pdf_sop image 9 复现:OCR 空 + annotation_map={'①':'左侧导航栏',...,'⑥':'右侧弹窗'}
+    几何 anchor 在 step 4.2 area。step 3.1 文本含 "②-⑥步操作" range。
+    旧 Path C 触发 → image 9 错移到 step 3.1。
+    新 Path C(只信 OCR):img_cir_nums={} → 不触发 → image 留 step 4.2 ✓
+    """
+    import os
+    blocks = [
+        _para("步骤3： 3.1 进入U8系统的“扫码报检”界面（如下图②-⑥步操作）。", 2, 100, 130),
+        _para("步骤4：报检（根据交货单信息在U8扫码报检处填相对应数据）；", 3, 50, 80),
+        _para("4.2 填写完后，依次点击根据设备带出班组人员完成报检；", 3, 200, 230),
+    ]
+    asset_image_9_like = {
+        "image_index": 9, "page_num": 3, "bbox": [42, 240, 500, 400],
+        "status": "ROUTE_TO_VECTOR", "filename": "img9.jpeg",
+        "oss_key": "k9", "ocr_text": "",
+        "visual_summary": "U8系统‘档案查询’界面截图，左侧为功能导航栏",
+        "vlm_annotation_map": {
+            "①": "左侧功能导航栏", "②": "品名下拉框",
+            "③": "数量与单位输入框", "④": "检索结果数据表格",
+            "⑤": "结果表格中的具体记录行", "⑥": "右侧ItemSelectForm选择窗口",
+        },
+    }
+    old_env = os.environ.get("RAG_IMAGE_CONTENT_OVERRIDE")
+    os.environ["RAG_IMAGE_CONTENT_OVERRIDE"] = "1"
+    try:
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(asset_image_9_like)], dict(DOC))
+        chunks = DocumentChunker(split_mode="step", min_chunk_chars=5).chunk_from_blocks(
+            enriched, "T_ANN_MAP", 1, metadata={"title": "t.pdf"})
+        for c in chunks:
+            if c.chunk_type != "step_card":
+                continue
+            bound = {r.get("image_index") for r in c.extra.get("image_refs", [])}
+            if "②-⑥步操作" in (c.chunk_text or ""):
+                assert 9 not in bound, (
+                    f"Path C 错触发: image 9(OCR 空+annotation_map ①-⑥)"
+                    f"被错移到 step 3.1。step 3 chunk bound={bound}"
+                )
+    finally:
+        if old_env is None:
+            os.environ.pop("RAG_IMAGE_CONTENT_OVERRIDE", None)
+        else:
+            os.environ["RAG_IMAGE_CONTENT_OVERRIDE"] = old_env
+
+
+def test_path_c_still_works_with_real_ocr_circled():
+    """Path C 收紧后,OCR 真实印有圈号 ≥2 的 image 仍可触发跨页救援。
+    这是 Path C 的 intended use case,不能被收紧误伤。
+
+    场景:某 image OCR 含 "②③④" 真实圈号(图上印的引用),
+    几何 anchor 错位,step text 含 "②-⑤步" range → Path C 应当救活。
+    """
+    import os
+    blocks = [
+        _para("步骤3：进入扫码报检界面操作 ②-⑤ 步,如下图所示完成填表。", 2, 100, 130),
+        _para("步骤4：备注 — 报检后核对。", 3, 50, 80),
+    ]
+    asset = {
+        "image_index": 5, "page_num": 3, "bbox": [42, 90, 500, 200],
+        "status": "ROUTE_TO_VECTOR", "filename": "img5.jpeg",
+        "oss_key": "k5",
+        "ocr_text": "② 扫码区 ③ 输入货号 ④ 选择班次 ⑤ 点击报检",
+        "visual_summary": "U8 扫码报检界面操作流程图,显示扫码、输入、选择、点击四步",
+        "vlm_annotation_map": {},
+    }
+    old_env = os.environ.get("RAG_IMAGE_CONTENT_OVERRIDE")
+    os.environ["RAG_IMAGE_CONTENT_OVERRIDE"] = "1"
+    try:
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(asset)], dict(DOC))
+        chunks = DocumentChunker(split_mode="step", min_chunk_chars=5).chunk_from_blocks(
+            enriched, "T_REAL_OCR", 1, metadata={"title": "t.pdf"})
+        for c in chunks:
+            if c.chunk_type != "step_card":
+                continue
+            bound = {r.get("image_index") for r in c.extra.get("image_refs", [])}
+            if "②-⑤" in (c.chunk_text or ""):
+                assert 5 in bound, (
+                    f"Path C 真 OCR 圈号 case 应救活: step 3 bound={bound}"
+                )
+                return
+    finally:
+        if old_env is None:
+            os.environ.pop("RAG_IMAGE_CONTENT_OVERRIDE", None)
+        else:
+            os.environ["RAG_IMAGE_CONTENT_OVERRIDE"] = old_env
+
+
+# ──────────── Path D: image cluster propagation (8 约束验证) ──────────────
+
+
+import os as _os
+
+
+class _PathDCtx:
+    """Path D test 共用 context: set RAG_IMAGE_CONTENT_OVERRIDE=1。"""
+    def __enter__(self):
+        self.old = _os.environ.get("RAG_IMAGE_CONTENT_OVERRIDE")
+        _os.environ["RAG_IMAGE_CONTENT_OVERRIDE"] = "1"
+        return self
+    def __exit__(self, *a):
+        if self.old is None:
+            _os.environ.pop("RAG_IMAGE_CONTENT_OVERRIDE", None)
+        else:
+            _os.environ["RAG_IMAGE_CONTENT_OVERRIDE"] = self.old
+
+
+def _path_d_doc():
+    """构造 xs_wi_007 image 1+2 复现拓扑(step 1 + step 2 + image 1/2 在 step 2 area)."""
+    return {"doc_id": "T_PATH_D", "version_no": 1, "title": "t.pdf"}
+
+
+def _path_d_blocks():
+    """复现 xs_wi_007 page 1 真实拓扑: step 1 起始(top) + step 2 延续段
+    (image_1 几何 anchor 落到该非 step 起始块) + step 2 起始(在 image 2 下方)。
+    Path A 凭 image_1 OCR'产品标识卡' bigram 救活到 step 1; Path D 让 image 2
+    在同页/邻接 image_index/共享 P325 token 时跟随 image 1 到 step 1。
+    geo 延续段刻意避开'产品/机台/数量/标识'等 image_1 OCR 关键词,确保
+    alt_score/geo_score ≥ 3.0x 真触发 Path A。"""
+    return [
+        _para("步骤1：按《产品标识卡》清点实货,抄录定单号机台号组号数量到纸上;", 1, 100, 200),
+        _para("另需参考前述时间安排细则,可见相关章节附注说明;", 1, 250, 320),
+        _para("步骤2：每天上午9点左右,向各区班长收集《交货单》,核对抄录信息;", 1, 480, 500),
+    ]
+
+
+def _seed_asset(idx, page, bbox, ocr="", vsum="",
+                image_index=None, am=None):
+    """image asset with required fields."""
+    return {
+        "image_index": image_index if image_index is not None else idx,
+        "page_num": page, "bbox": bbox,
+        "status": "ROUTE_TO_VECTOR", "filename": f"img{idx}.jpeg",
+        "oss_key": f"k{idx}", "ocr_text": ocr,
+        "visual_summary": vsum, "vlm_annotation_map": am or {},
+    }
+
+
+def test_path_d_positive_propagation_image_2_follows_image_1():
+    """正例: image 1(强 Path A) + image 2(同页/邻接 index/相邻 bbox/共享 P325 token)
+    → image 2 跟随 image 1 到 step 1。provenance 写 route_reason=cluster_propagation。
+    """
+    blocks = _path_d_blocks()
+    image_1 = _seed_asset(
+        1, 1, [42, 216, 202, 395],
+        ocr="台州富岭塑胶有限公司 产品标识卡(包装车专用) 对应定单号:2326 包装日期:8.25 货号产品规格:3.25*125杯 50*50 机台号组号:107# 221# 数量:4个 P325-PP",
+        vsum="台州富岭塑胶有限公司产品标识卡(包装车间专用),含手册号、材料配比、订单号2326")
+    image_2 = _seed_asset(
+        2, 1, [42, 403, 342, 457],
+        ocr="2336 P325-PPB D07(38) 22 7 +45",
+        vsum="手写文本'2336 P325-PPB D07(38) 22 7 +45',疑似产品编号、批次或工艺参数记录")
+    with _PathDCtx():
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(image_1), dict(image_2)], _path_d_doc())
+    asset_2 = next(b for b in enriched if b.get("block_type") == "image_ref"
+                   and (b.get("extra") or {}).get("image_index") == 2)
+    assert asset_2["extra"].get("route_reason") == "cluster_propagation", \
+        f"image 2 应被 Path D 传播,实 route_reason={asset_2['extra'].get('route_reason')}"
+    assert asset_2["extra"].get("route_seed_image_index") == 1
+    chunks = DocumentChunker(split_mode="step", min_chunk_chars=5).chunk_from_blocks(
+        enriched, "T_PATH_D", 1, metadata={"title": "t.pdf"})
+    step1 = next(c for c in chunks if c.chunk_type == "step_card" and "产品标识卡" in c.chunk_text)
+    bound = {r.get("image_index") for r in step1.extra.get("image_refs", [])}
+    assert {1, 2}.issubset(bound), f"image 1+2 应都在 step 1, 实 bound={bound}"
+
+
+def test_path_d_negative_no_shared_token_blocks_propagation():
+    """负例 1: 同页相邻 + image_index delta=1, 但无高熵 token 共享 → 不传播。"""
+    blocks = _path_d_blocks()
+    image_1 = _seed_asset(
+        1, 1, [42, 216, 202, 395],
+        ocr="台州富岭塑胶有限公司 产品标识卡 对应定单号:2326 P325-PP",
+        vsum="台州富岭塑胶产品标识卡(包装车间专用),含订单号2326")
+    image_2 = _seed_asset(
+        2, 1, [42, 403, 342, 457],
+        ocr="完全不相关 XYZ9999 AAAA",
+        vsum="完全不相关的随机内容")
+    with _PathDCtx():
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(image_1), dict(image_2)], _path_d_doc())
+    asset_2 = next(b for b in enriched if b.get("block_type") == "image_ref"
+                   and (b.get("extra") or {}).get("image_index") == 2)
+    assert asset_2["extra"].get("route_reason") != "cluster_propagation"
+
+
+def test_path_d_negative_common_chinese_word_not_shared_token():
+    """负例 2: 仅"产品/记录"通用中文词共享(非高熵字母数字 token)→ 不传播。"""
+    blocks = _path_d_blocks()
+    image_1 = _seed_asset(
+        1, 1, [42, 216, 202, 395],
+        ocr="台州富岭塑胶有限公司 产品标识卡 对应定单号:2326 P325-PP",
+        vsum="台州富岭塑胶产品标识卡(包装车间专用),含订单号2326 产品记录")
+    image_2 = _seed_asset(
+        2, 1, [42, 403, 342, 457],
+        ocr="产品记录信息",
+        vsum="产品记录信息表单")
+    with _PathDCtx():
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(image_1), dict(image_2)], _path_d_doc())
+    asset_2 = next(b for b in enriched if b.get("block_type") == "image_ref"
+                   and (b.get("extra") or {}).get("image_index") == 2)
+    assert asset_2["extra"].get("route_reason") != "cluster_propagation", \
+        "仅中文通用词不应当作高熵 token 共享触发传播"
+
+
+def test_path_d_negative_follower_has_strong_self_evidence():
+    """负例 3: follower 自身 OCR > 200 chars 自带强证据 → 不传播。"""
+    blocks = _path_d_blocks()
+    image_1 = _seed_asset(
+        1, 1, [42, 216, 202, 395],
+        ocr="台州富岭塑胶有限公司 产品标识卡 对应定单号:2326 P325-PP",
+        vsum="台州富岭塑胶产品标识卡(包装车间专用),含订单号2326")
+    image_2 = _seed_asset(
+        2, 1, [42, 403, 342, 457],
+        ocr="P325-PPB " + "X" * 220,
+        vsum="follower 自带 long OCR")
+    with _PathDCtx():
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(image_1), dict(image_2)], _path_d_doc())
+    asset_2 = next(b for b in enriched if b.get("block_type") == "image_ref"
+                   and (b.get("extra") or {}).get("image_index") == 2)
+    assert asset_2["extra"].get("route_reason") != "cluster_propagation"
+
+
+def test_path_d_negative_two_seeds_conflict_fails_closed():
+    """负例 4: 两个 strong seed 同时提案传给一个 follower → fail-closed 不传播。"""
+    blocks = [
+        _para("步骤1: 按产品标识卡清点实货,抄录定单号", 1, 100, 130),
+        _para("步骤3: 进入U8系统扫码报检界面操作", 1, 460, 490),
+    ]
+    image_1 = _seed_asset(
+        1, 1, [42, 100, 202, 200],
+        ocr="台州富岭塑胶有限公司 产品标识卡 对应定单号:2326 P325-PP",
+        vsum="产品标识卡(包装车间专用)")
+    image_3 = _seed_asset(
+        3, 1, [42, 460, 202, 560],
+        ocr="用友U8 P325-PP 扫码报检界面 已扫条码",
+        vsum="用友U8系统扫码报检界面截图,显示扫码条码区")
+    image_2 = _seed_asset(
+        2, 1, [42, 280, 342, 380],
+        ocr="P325-PPB 2336",
+        vsum="手写P325-PPB 工艺参数")
+    with _PathDCtx():
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(image_1), dict(image_2), dict(image_3)], _path_d_doc())
+    asset_2 = next(b for b in enriched if b.get("block_type") == "image_ref"
+                   and (b.get("extra") or {}).get("image_index") == 2)
+    rr = asset_2["extra"].get("route_reason")
+    if rr == "cluster_propagation":
+        assert False, "两 seed 竞争 follower 应 fail-closed,实际传播了 (seed=%s)" % \
+            asset_2["extra"].get("route_seed_image_index")
+
+
+def test_path_d_negative_image_index_delta_not_1_blocks():
+    """负例 5: image_index delta != 1(如 1 与 3)→ 不传播,即使其他条件全满足。"""
+    blocks = _path_d_blocks()
+    image_1 = _seed_asset(
+        1, 1, [42, 216, 202, 395],
+        ocr="台州富岭塑胶有限公司 产品标识卡 对应定单号:2326 P325-PP",
+        vsum="产品标识卡(包装车间专用)")
+    image_3 = _seed_asset(
+        3, 1, [42, 403, 342, 457],
+        ocr="P325-PPB 2336",
+        vsum="手写P325-PPB 工艺参数",
+        image_index=3)
+    with _PathDCtx():
+        enriched = _inject_image_ref_blocks([dict(b) for b in blocks],
+                                             [dict(image_1), dict(image_3)], _path_d_doc())
+    asset_3 = next(b for b in enriched if b.get("block_type") == "image_ref"
+                   and (b.get("extra") or {}).get("image_index") == 3)
+    assert asset_3["extra"].get("route_reason") != "cluster_propagation", \
+        "image_index delta != 1 应阻止传播"
+
+
 # ──────────────────────────── RC2：混合编号继承 ────────────────────────────
 
 def _chunk_steps(blocks):

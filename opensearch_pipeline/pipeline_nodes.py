@@ -1668,6 +1668,145 @@ def _detect_step_patterns(doc: dict) -> bool:
     return len(matches) >= 2
 
 
+_PATH_D_TOKEN_RE = re.compile(r'[A-Za-z0-9#\-\*\(\)\.]{4,}')
+
+
+def _path_d_high_entropy_tokens(text: str) -> set:
+    """抽 ≥4 chars 字母数字混合 token(自然排除中文通用词如"产品/记录")。"""
+    return set(_PATH_D_TOKEN_RE.findall(text or ""))
+
+
+def _path_d_share_token(a: set, b: set, min_prefix: int = 4) -> bool:
+    """两 token 集合是否有 exact match 或 prefix-min_prefix match。"""
+    if a & b:
+        return True
+    for ta in a:
+        if len(ta) < min_prefix:
+            continue
+        ta_p = ta[:min_prefix]
+        for tb in b:
+            if len(tb) < min_prefix:
+                continue
+            if ta_p == tb[:min_prefix]:
+                return True
+    return False
+
+
+def _apply_path_d_cluster_propagation(geo_assets: list) -> None:
+    """D8 Tier 0 post-review — Path D: same-page image cluster propagation.
+
+    Path A strong override (alt ≥ 15 AND alt/geo ≥ 5.0) 的 image 作为 seed,
+    同页内 image_index 邻接(delta == 1) + bbox 相对页高 < 0.20 + 高熵 token
+    共享(exact 或 prefix-4)的 follower 跟随 seed 到同 chunk。
+
+    8 条严守约束(用户 spec):
+      1. seed 必由 Path A strong override 触发
+      2. follower 与 seed 在原始图片序列邻接(image_index delta == 1)
+      3. 同 page + abs(image_index_delta) == 1
+      4. bbox 距离相对页高 < 0.20
+      5. 高熵 token (≥4 chars 字母数字标点) exact/prefix-4 共享
+      6. follower 自身无强反向证据(OCR 长度 ≤ 200 chars,排除自带强 OCR)
+      7. follower 未被 Path B/C override
+      8. 单 follower 多 seed 竞争 → fail-closed(不传播)
+      9. provenance: 写 va['route_reason'] = 'cluster_propagation'
+         + va['route_seed_image_index']
+    """
+    by_page: dict = {}
+    for va in geo_assets:
+        by_page.setdefault(va.get("page_num"), []).append(va)
+
+    for _page, p_assets in by_page.items():
+        if len(p_assets) < 2:
+            continue
+        seeds = [va for va in p_assets if va.get("_path_a_strong")]
+        if not seeds:
+            continue
+        page_height = max(
+            (float((va.get("bbox") or [0, 0, 0, 0])[3]) for va in p_assets),
+            default=842.0,
+        )
+        page_height = max(page_height, 100.0)
+
+        proposals: dict = {}    # id(follower) → (id(seed), target_best_idx)
+        conflicts: set = set()  # id(follower)
+
+        for seed in seeds:
+            seed_target = seed.get("_d8_best_idx")
+            if seed_target is None:
+                continue
+            sb = seed.get("bbox") or [0, 0, 0, 0]
+            sy0, sy1 = float(sb[1]), float(sb[3])
+            sidx = seed.get("image_index")
+            stext = ((seed.get("visual_summary") or "") + " "
+                     + (seed.get("ocr_text") or ""))
+            stoks = _path_d_high_entropy_tokens(stext)
+            if not stoks:
+                continue
+            for f in p_assets:
+                if f is seed:
+                    continue
+                if id(f) in conflicts:
+                    continue
+                # 7. follower 不能已被 Path B/C override
+                if f.get("_path_b_overridden") or f.get("_path_c_overridden"):
+                    continue
+                # follower 自身是 strong seed → 不能被传播(避免 seed-seed)
+                if f.get("_path_a_strong"):
+                    continue
+                # 3. image_index delta == 1
+                fidx = f.get("image_index")
+                if not (isinstance(sidx, int) and isinstance(fidx, int)):
+                    continue
+                if abs(sidx - fidx) != 1:
+                    continue
+                # 4. bbox 距离 / 页高 < 0.20
+                fb = f.get("bbox") or [0, 0, 0, 0]
+                fy0, fy1 = float(fb[1]), float(fb[3])
+                if fy0 >= sy1:
+                    gap = fy0 - sy1
+                elif sy0 >= fy1:
+                    gap = sy0 - fy1
+                else:
+                    gap = 0.0
+                if gap / page_height >= 0.20:
+                    continue
+                # 5. 高熵 token 共享 (exact 或 prefix-4)
+                ftext = ((f.get("visual_summary") or "") + " "
+                         + (f.get("ocr_text") or ""))
+                ftoks = _path_d_high_entropy_tokens(ftext)
+                if not _path_d_share_token(stoks, ftoks):
+                    continue
+                # 6. follower 反向证据守门:OCR > 200 chars 自带强信号,不传播
+                if len(f.get("ocr_text") or "") > 200:
+                    continue
+                # follower 已与 seed 同 anchor → 无需传播
+                if f.get("_d8_best_idx") == seed_target:
+                    continue
+                # 8. 单 follower 多 seed 竞争 → fail-closed
+                if id(f) in proposals:
+                    prev_seed_id, prev_target = proposals[id(f)]
+                    if prev_seed_id != id(seed) or prev_target != seed_target:
+                        conflicts.add(id(f))
+                        proposals.pop(id(f), None)
+                        continue
+                proposals[id(f)] = (id(seed), seed_target)
+
+        # 应用未冲突的 proposals
+        for f in p_assets:
+            if id(f) in conflicts:
+                continue
+            prop = proposals.get(id(f))
+            if prop is None:
+                continue
+            seed_id, target = prop
+            seed_va = next((s for s in seeds if id(s) == seed_id), None)
+            f["_d8_best_idx"] = target
+            # 9. provenance
+            f["route_reason"] = "cluster_propagation"
+            if seed_va is not None:
+                f["route_seed_image_index"] = seed_va.get("image_index")
+
+
 def _inject_image_ref_blocks(blocks: list, assets: list, doc: dict) -> list:
     """
     将 funnel 处理后的图片信息作为 image_ref 块注入 block 序列。
@@ -2218,6 +2357,14 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                     and best_alt_score
                                     >= max(geo_score, 1) * 3.0):
                                 best_idx = best_alt_idx
+                                # Path D seed mark (D8 Tier 0 post-review):
+                                # 仅 strong override(alt ≥ 15 AND ratio ≥ 5.0)
+                                # 才作 cluster propagation seed,避免边缘 trigger
+                                # 把噪声传给邻居
+                                if (best_alt_score >= 15
+                                        and best_alt_score
+                                        >= max(geo_score, 1) * 5.0):
+                                    va['_path_a_strong'] = True
                 # ── Path B: 圈号 sub-step override（D8 Phase 6,同 env-gate）──
                 # image OCR 含的圈号集 vs 同页 step block 圈号集 Jaccard。
                 # 适合"填写示例图 vs 填写指示文本"匹配:image OCR 含的 ①②③ 是
@@ -2270,6 +2417,7 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                 and best_cir_jacc >= 0.5
                                 and best_cir_jacc >= max(geo_jacc, 0.01) * 1.5):
                             best_idx = best_cir_idx
+                            va['_path_b_overridden'] = True
                 # ── Path C: 跨页 range-ref override（D8 Phase 10,同 env-gate）──
                 # step text 含"X-Y步操作"圈号范围引用(如 step 3.1 "扫码报检
                 # 界面(如下图②-⑥步操作)") 时,把该 step 范围内的 image 跨页
@@ -2286,10 +2434,15 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                         "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
                         in ("1", "true", "yes")):
                     _CIRCLED_C = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
-                    _ann_map = va.get("vlm_annotation_map") or {}
-                    img_cir_all = (
-                        set(c for c in (va.get("ocr_text") or "") if c in _CIRCLED_C)
-                        | set(k for k in _ann_map.keys() if k in _CIRCLED_C)
+                    # D8 Tier 0 post-review: 移除 vlm_annotation_map.keys() 圈号源
+                    # VLM 在 annotation_map 标注的 ①-⑥ 是图内"区域位置编号"(如
+                    # "①": "左侧功能导航栏"),不是图本身印有的圈号引用,与 step
+                    # text "②-⑥步操作" 的 sub-step 引用语义不同。把 annotation_map
+                    # keys 算进圈号源会把 pdf_sop image 9 (OCR 空 + VLM 区域 ①-⑥)
+                    # 错移到 step 3.1。Path C intent 是"image 印着圈号引用对应
+                    # step text 圈号范围",应只信 OCR 真实印出的圈号。
+                    img_cir_all = set(
+                        c for c in (va.get("ocr_text") or "") if c in _CIRCLED_C
                     )
                     img_cir_nums = set(_CIRCLED_C.index(c) + 1 for c in img_cir_all)
                     if len(img_cir_nums) >= 2:
@@ -2349,6 +2502,27 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                     break  # 同 block 只算一个 range-ref
                         if best_range_idx is not None:
                             best_idx = best_range_idx
+                            va['_path_c_overridden'] = True
+                # Path D pre-pass: 暂存 best_idx 到 va metadata,延迟 img_block
+                # 构造到 second pass(Path D 可能改写 best_idx)
+                va['_d8_best_idx'] = best_idx
+                va['_d8_anchors_fallback'] = (
+                    anchors[0][1] - 1 if anchors else None
+                )
+
+            # ── Path D: same-page image cluster propagation (D8 Tier 0 post-review) ──
+            # Path A strong override 的 image 作为 seed,同页 image_index 邻接 +
+            # bbox 相对页高 < 0.20 + 高熵 token 共享 + follower 无反向证据 →
+            # 跟随 seed。详 _apply_path_d_cluster_propagation docstring 8 守门。
+            if (geo_assets and os.getenv(
+                    "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
+                    in ("1", "true", "yes")):
+                _apply_path_d_cluster_propagation(geo_assets)
+
+            # Second pass: 用 Path D 调整后的 best_idx 构造 img_block + insertions
+            for va in geo_assets:
+                best_idx = va.get('_d8_best_idx')
+                fallback = va.get('_d8_anchors_fallback')
                 img_block = {
                     "block_type": "image_ref",
                     "text": "",
@@ -2358,9 +2532,9 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                     "extra": va,
                 }
                 if best_idx is None:
-                    # 图片在该页所有文本之上（页眉带图等）→ 插在该页首个文本块之前，
-                    # chunker 的 pending_images 会把它交给紧随其后的步骤
-                    insertions.append((anchors[0][1] - 1, [img_block]))
+                    if fallback is not None:
+                        insertions.append((fallback, [img_block]))
+                    # else: 该 page 无 anchors,跳过(理论不应发生)
                 else:
                     insertions.append((best_idx, [img_block]))
 

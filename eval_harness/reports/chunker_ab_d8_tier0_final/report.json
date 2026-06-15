@@ -1,0 +1,617 @@
+{
+  "mode": "binding_only",
+  "arms": [
+    "off",
+    "on"
+  ],
+  "metrics": {
+    "off": {
+      "mean_jaccard_pdf": 0.8388899999999999,
+      "n_strong_chunks": 30,
+      "n_docs": 3,
+      "std_jaccard_pdf": 0.3260207274455689,
+      "img_dup_p95": 1.0,
+      "img_dup_max": 1.0,
+      "n_anchors_evaluated": 22,
+      "semantic_anchor_key_hits": 22,
+      "semantic_anchor_dual_hits": 19,
+      "semantic_anchor_key_jaccard": 1.0,
+      "semantic_anchor_dual_jaccard": 0.8636
+    },
+    "on": {
+      "mean_jaccard_pdf": 0.9333333333333333,
+      "n_strong_chunks": 30,
+      "n_docs": 3,
+      "std_jaccard_pdf": 0.2537081317024624,
+      "img_dup_p95": 1.0,
+      "img_dup_max": 1.0,
+      "n_anchors_evaluated": 22,
+      "semantic_anchor_key_hits": 22,
+      "semantic_anchor_dual_hits": 20,
+      "semantic_anchor_key_jaccard": 1.0,
+      "semantic_anchor_dual_jaccard": 0.9091
+    }
+  },
+  "deltas": {
+    "mean_jaccard_pdf": {
+      "delta": 0.09444333333333343
+    },
+    "semantic_anchor_key_jaccard": {
+      "delta": 0.0
+    },
+    "semantic_anchor_dual_jaccard": {
+      "delta": 0.045499999999999985
+    }
+  },
+  "win_tie_loss": {
+    "jaccard_pdf": {
+      "win": 5,
+      "tie": 25,
+      "loss": 0
+    },
+    "semantic_anchor_dual": {
+      "win": 2,
+      "tie": 19,
+      "loss": 1
+    }
+  },
+  "per_case": [
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "全文收尾 线缆整理与总结",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "封面目录 七步总览",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "电脑安装作业概览(procedure_parent)",
+      "jaccard_off": 0.0,
+      "jaccard_on": 0.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "第一步 安装CPU处理器",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "第七步 安装显卡 并接好各种线缆",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "第三步 安装内存条",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "第二步 安装散热器",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "第五步 安装硬盘",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "第六步 安装光驱、电源",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_it_xxh_003",
+      "gt_label": "第四步 将主板安装固定到机箱中",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "前言(作业前提+说明)",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤1.1 收取交货单",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤1.2 核对错误处理",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤1.3 抄录订单信息",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤2 交货单分类",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤3.1 U8扫码报检",
+      "jaccard_off": 0.6667,
+      "jaccard_on": 1.0,
+      "delta": 0.33330000000000004
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤3.2 扫码枪扫描",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤4 报检填写(父)",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤4.1 填写设备班次",
+      "jaccard_off": 0.5,
+      "jaccard_on": 1.0,
+      "delta": 0.5
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤4.2 班组人员",
+      "jaccard_off": 0.0,
+      "jaccard_on": 1.0,
+      "delta": 1.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_sop",
+      "gt_label": "步骤5 群通知完成",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "前言(作业前提+说明)",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤1 按产品标识卡清点实货",
+      "jaccard_off": 0.5,
+      "jaccard_on": 1.0,
+      "delta": 0.5
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤2 收集核对交货单",
+      "jaccard_off": 0.5,
+      "jaccard_on": 1.0,
+      "delta": 0.5
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤3 进入U8扫码报检界面",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤4 扫码枪扫描交货单",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤5.1 报检主流程(填写设备班次数量)",
+      "jaccard_off": 0.0,
+      "jaccard_on": 0.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤5.2 报检异常流程(增加人员)",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤6 重复完成所有交货单报检",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "kind": "funnel",
+      "doc_id": "pdf_xs_wi_007",
+      "gt_label": "步骤7 复核报检信息",
+      "jaccard_off": 1.0,
+      "jaccard_on": 1.0,
+      "delta": 0.0
+    },
+    {
+      "doc_id": "pdf_sop",
+      "anchor_id": "pdf_sop_a1",
+      "step_name": "步骤 1.1 收取交货单与标识卡核对",
+      "step_no": 1,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_sop",
+      "anchor_id": "pdf_sop_a2",
+      "step_name": "步骤 1.3 抄录订单信息",
+      "step_no": 1,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_sop",
+      "anchor_id": "pdf_sop_a3",
+      "step_name": "步骤 2 交货单分类放置",
+      "step_no": 2,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_sop",
+      "anchor_id": "pdf_sop_a4",
+      "step_name": "步骤 3 进入 U8 扫码报检界面",
+      "step_no": 3,
+      "key_hit_off": true,
+      "image_hit_off": false,
+      "dual_hit_off": false,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_sop",
+      "anchor_id": "pdf_sop_a5",
+      "step_name": "步骤 4.2 填表完成报检 (image 9 - U8 报检界面)",
+      "step_no": 4,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": false,
+      "dual_hit_on": false,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_sop",
+      "anchor_id": "pdf_sop_a6",
+      "step_name": "步骤 5 群通知统计完成",
+      "step_no": 5,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_sop",
+      "anchor_id": "pdf_sop_a7",
+      "step_name": "步骤 4.1 填写设备班次数量 — image 10 输入参考",
+      "step_no": 4,
+      "key_hit_off": true,
+      "image_hit_off": false,
+      "dual_hit_off": false,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_xs_wi_007",
+      "anchor_id": "pdf_xs_wi_007_a1",
+      "step_name": "步骤 1 按产品标识卡清点实货",
+      "step_no": 1,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_xs_wi_007",
+      "anchor_id": "pdf_xs_wi_007_a2",
+      "step_name": "步骤 1 按产品标识卡清点+抄录信息 (业务真相: image 1, 2 属于 step 1)",
+      "step_no": 1,
+      "key_hit_off": true,
+      "image_hit_off": false,
+      "dual_hit_off": false,
+      "key_hit_on": true,
+      "image_hit_on": false,
+      "dual_hit_on": false,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_xs_wi_007",
+      "anchor_id": "pdf_xs_wi_007_a3",
+      "step_name": "步骤 3 进入 U8 扫码报检界面",
+      "step_no": 3,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_xs_wi_007",
+      "anchor_id": "pdf_xs_wi_007_a4",
+      "step_name": "步骤 4 扫码枪扫描交货单",
+      "step_no": 4,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_xs_wi_007",
+      "anchor_id": "pdf_xs_wi_007_a5",
+      "step_name": "步骤 5.2 填表带出班组人员",
+      "step_no": 5,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_xs_wi_007",
+      "anchor_id": "pdf_xs_wi_007_a6",
+      "step_name": "步骤 5.3 带不出人员时增加人名",
+      "step_no": 5,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_it_xxh_003",
+      "anchor_id": "pdf_it_xxh_003_a1",
+      "step_name": "第一步 安装 CPU 处理器",
+      "step_no": 1,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_it_xxh_003",
+      "anchor_id": "pdf_it_xxh_003_a2",
+      "step_name": "第二步 安装 CPU 散热器",
+      "step_no": 2,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_it_xxh_003",
+      "anchor_id": "pdf_it_xxh_003_a3",
+      "step_name": "第三步 安装内存条",
+      "step_no": 3,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_it_xxh_003",
+      "anchor_id": "pdf_it_xxh_003_a4",
+      "step_name": "第四步 将主板固定到机箱",
+      "step_no": 4,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_it_xxh_003",
+      "anchor_id": "pdf_it_xxh_003_a5",
+      "step_name": "第五步 安装硬盘到 3.5 寸托架",
+      "step_no": 5,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "pdf_it_xxh_003",
+      "anchor_id": "pdf_it_xxh_003_a6",
+      "step_name": "第六步 安装光驱与电源",
+      "step_no": 6,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "admin_lodging",
+      "anchor_id": "admin_lodging_a1",
+      "step_name": "外来人员留宿规定整体背景",
+      "step_no": null,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "admin_lodging",
+      "anchor_id": "admin_lodging_a2",
+      "step_name": "被拜访人员住单人间登记流程",
+      "step_no": null,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    },
+    {
+      "doc_id": "admin_lodging",
+      "anchor_id": "admin_lodging_a3",
+      "step_name": "被拜访人员住集体宿舍登记流程",
+      "step_no": null,
+      "key_hit_off": true,
+      "image_hit_off": true,
+      "dual_hit_off": true,
+      "key_hit_on": true,
+      "image_hit_on": true,
+      "dual_hit_on": true,
+      "kind": "semantic_anchor"
+    }
+  ],
+  "topology_check": {},
+  "validity_notes": [
+    "Tier 0 BINDING_ONLY ran 2 dimensions: (1) funnel image_index Jaccard (regression reference, from eval_image_binding_pdf.py); (2) semantic anchor key_jaccard / dual_jaccard (primary, v3 #15, from anchor GT). Dual = key_hit AND image_hit."
+  ],
+  "meta": {
+    "git_commit": "63a2d9d8eb778e08c82875f7a4f3d2c02ce76266",
+    "timestamp": "2026-06-14T14:02:51",
+    "seed": 20260614,
+    "arms": [
+      {
+        "name": "off",
+        "env": {},
+        "ctx_overrides": {},
+        "index_name": null,
+        "serving_base": null,
+        "config_fingerprint": null,
+        "effective_env": {}
+      },
+      {
+        "name": "on",
+        "env": {
+          "RAG_IMAGE_CONTENT_OVERRIDE": "1"
+        },
+        "ctx_overrides": {},
+        "index_name": null,
+        "serving_base": null,
+        "config_fingerprint": null,
+        "effective_env": {}
+      }
+    ]
+  }
+}
