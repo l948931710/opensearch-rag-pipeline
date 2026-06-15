@@ -58,3 +58,9 @@ CLAUDE.md
 /pdf_*_img*.jpeg
 /pdf_*_img*.jpg
 /pdf_*_img*.png
+
+# Claude Code 本地工作区 (skills/launch.json 等,不入远程)
+.claude/
+
+# 评测模板/数据 — 本地素材,不入远程
+一期模型评测集和评测模板_v2.0(1).xlsx
