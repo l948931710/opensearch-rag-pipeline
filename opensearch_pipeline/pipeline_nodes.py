@@ -100,6 +100,21 @@ def _init_db_pool():
     from dbutils.pooled_db import PooledDB
 
     cfg = get_config().rds
+
+    # 🛡️ Sim→prod leak guard (added 2026-06-14 after the chunk_meta DELETE incident).
+    # simulate_db=True 表示全局 config 处于"sim 模式"——调用方应该走 mock 路径而非
+    # _get_db_conn。若此时 cfg.host 命中生产 RDS 指纹，几乎一定是 test fixture / sim
+    # 入口绕过了 sim 守卫直接连了 prod。拒绝建池避免 DELETE FROM chunk_meta 误打生产。
+    from opensearch_pipeline.config import is_prod_target
+    if get_config().simulate_db and is_prod_target("rds", cfg.host):
+        raise RuntimeError(
+            f"[DB POOL GUARD] simulate_db=True 但 RDS host {cfg.host!r} 命中生产指纹。"
+            f"拒绝建池防误写 prod。\n"
+            f"  - 想在 sim/test 流程里 *读* prod RDS："
+            f"用 opensearch_pipeline.prod_access.get_prod_readonly_conn() 而非 _get_db_conn。\n"
+            f"  - 真要写 prod：export RAG_SIMULATE=false RAG_SIMULATE_DB=false 再来（不推荐）。"
+        )
+
     _db_pool = PooledDB(
         creator=pymysql,
         mincached=2,           # 池中保持的最小空闲连接数

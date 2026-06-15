@@ -40,6 +40,13 @@ def force_gemini_config():
 @pytest.fixture(autouse=True)
 def clean_db():
     """清理数据库状态，保证测试隔离性。"""
+    # 🛡️ 防 sim→prod 泄露（2026-06-13 事故根因）：
+    # 这个 fixture 是 autouse=True 且无条件 DELETE FROM chunk_meta + UPDATE document_version。
+    # 不是 local host 直接 skip，绝不让它穿透到生产或 staging RDS。
+    from tests.local_stack import ensure_local_db_wired, local_db_unavailable_reason
+    if not ensure_local_db_wired():
+        pytest.skip(f"clean_db fixture refusing non-local RDS: {local_db_unavailable_reason()}")
+
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as c:

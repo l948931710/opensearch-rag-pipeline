@@ -10,6 +10,12 @@ from tests.local_stack import requires_local_db, requires_local_opensearch
 
 @pytest.fixture(autouse=True)
 def reset_db_state():
+    # 🛡️ 防 sim→prod 泄露（2026-06-13 事故根因）：autouse + 无条件 DELETE chunk_meta，
+    # 远程 host 直接 skip。
+    from tests.local_stack import ensure_local_db_wired, local_db_unavailable_reason
+    if not ensure_local_db_wired():
+        pytest.skip(f"reset_db_state fixture refusing non-local RDS: {local_db_unavailable_reason()}")
+
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
     try:
         conn = _get_db_conn(select_db=True)

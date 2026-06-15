@@ -545,6 +545,24 @@ def _print_final_summary(ctx: dict, scenario: str):
 
 
 def main():
+    # 🛡️ 防 sim→prod 泄露（2026-06-13 事故根因）：
+    # 即便 simulate_db=True，run_simulation 注册的 demo doc (DOC_*_20260518_001/002/003)
+    # 也会通过 DAG1 写入 document_meta。host 命中生产指纹一律拒绝启动。
+    from opensearch_pipeline.config import get_config, is_prod_target
+    _cfg = get_config()
+    if is_prod_target("rds", _cfg.rds.host):
+        raise RuntimeError(
+            f"[RUN_SIMULATION GUARD] 拒绝运行：RDS host {_cfg.rds.host!r} 命中生产指纹。\n"
+            f"  run_simulation.py 会注册 demo doc + 重置 chunk_meta，绝不允许打到生产。\n"
+            f"  - 本机 dev：unset RAG_ENV，并在 .env 用 docker-compose 配置（localhost）。\n"
+            f"  - 想读 prod 看效果：用 prod_access.get_prod_readonly_conn() 写独立脚本。"
+        )
+    if is_prod_target("search", _cfg.alibaba_vector.endpoint or _cfg.opensearch.host or ""):
+        raise RuntimeError(
+            f"[RUN_SIMULATION GUARD] 拒绝运行：检索 endpoint 命中生产指纹。\n"
+            f"  HA3={_cfg.alibaba_vector.endpoint!r} / OpenSearch={_cfg.opensearch.host!r}"
+        )
+
     parser = argparse.ArgumentParser(description="OpenSearch Pipeline Simulation")
     parser.add_argument(
         "--dag", type=str, default="1,2,3,4",
