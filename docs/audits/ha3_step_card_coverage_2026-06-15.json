@@ -1,0 +1,1453 @@
+{
+  "generated_at": "2026-06-15 10:20:27",
+  "ha3_table_name": "fuling_kb_chunks",
+  "D1": {
+    "rds_active": 3078,
+    "rds_indexed": 3078,
+    "rds_version_success": 3078,
+    "ha3_returned": 3078,
+    "ha3_unique": 3078,
+    "ha3_warning": null,
+    "only_in_rds": 0,
+    "only_in_ha3": 0,
+    "intersect": 3078,
+    "sym_diff": 0,
+    "only_in_rds_sample": [],
+    "only_in_ha3_sample": []
+  },
+  "D2": [
+    {
+      "fmt": "docx",
+      "docs": 429,
+      "docs_with_step": 133,
+      "step_cards": "2373",
+      "step_cards_with_refs": "410"
+    },
+    {
+      "fmt": "pdf",
+      "docs": 98,
+      "docs_with_step": 66,
+      "step_cards": "682",
+      "step_cards_with_refs": "302"
+    },
+    {
+      "fmt": "xlsx",
+      "docs": 30,
+      "docs_with_step": 5,
+      "step_cards": "23",
+      "step_cards_with_refs": "12"
+    },
+    {
+      "fmt": "png",
+      "docs": 3,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "pptx",
+      "docs": 3,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "jpg",
+      "docs": 2,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "jpeg",
+      "docs": 1,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    }
+  ],
+  "D3": {
+    "routed_total": 307,
+    "routed_with_step": 201,
+    "miss_list": [
+      {
+        "doc_id": "DOC_ADMIN_20260513120214_6469A5",
+        "title": "《结算水电房费》作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "《结算水电房费》作业指导书.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_ADMIN_20260513120216_0F780B",
+        "title": "宿舍水电工的工作范围.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "宿舍水电工的工作范围.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_IT_20260513120633_039B24",
+        "title": "外贸发票操作流程.xlsx",
+        "category_l1": "record",
+        "category_l2": "business",
+        "file_ext": "xlsx",
+        "original_filename": "外贸发票操作流程.xlsx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_IT_20260513120634_2947B1",
+        "title": "富岭U8+品质部操作手册.docx",
+        "category_l1": "reference",
+        "category_l2": "manual",
+        "file_ext": "docx",
+        "original_filename": "富岭U8+品质部操作手册.docx",
+        "total_chunks": 37
+      },
+      {
+        "doc_id": "DOC_IT_20260513120634_8549A8",
+        "title": "富岭U8+资材部操作手册.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "富岭U8+资材部操作手册.docx",
+        "total_chunks": 50
+      },
+      {
+        "doc_id": "DOC_IT_20260513120634_5E462A",
+        "title": "富岭U8+车间操作手册.docx",
+        "category_l1": "reference",
+        "category_l2": "manual",
+        "file_ext": "docx",
+        "original_filename": "富岭U8+车间操作手册.docx",
+        "total_chunks": 57
+      },
+      {
+        "doc_id": "DOC_IT_20260513120634_70759C",
+        "title": "调拨单简易操作手册.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "调拨单简易操作手册.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_IT_20260513120634_6B0EAA",
+        "title": "辅料赠送入库操手册.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "辅料赠送入库操手册.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260513120634_370F87",
+        "title": "D区、C区、F区(12oz仿PET杯)作业指导书.xlsx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "xlsx",
+        "original_filename": "D区、C区、F区(12oz仿PET杯)作业指导书.xlsx",
+        "total_chunks": 17
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260513120636_D49638",
+        "title": "设备清扫基准书-成型机（阿德沃）.xlsx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "xlsx",
+        "original_filename": "设备清扫基准书-成型机（阿德沃）.xlsx",
+        "total_chunks": 60
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260513120637_5FDA99",
+        "title": "合模机操作流程.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "合模机操作流程.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260513120637_E61F2E",
+        "title": "磨床操作流程.png",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "png",
+        "original_filename": "磨床操作流程.png",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260513120639_6735E8",
+        "title": "16&22OZ霸王工艺指导书20250305(1).xlsx",
+        "category_l1": "sop",
+        "category_l2": "others",
+        "file_ext": "xlsx",
+        "original_filename": "16&22OZ霸王工艺指导书20250305(1).xlsx",
+        "total_chunks": 15
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260513120642_6AF9D4",
+        "title": "纸杯设备清扫基准书-内贴机(2).xlsx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "xlsx",
+        "original_filename": "纸杯设备清扫基准书-内贴机(2).xlsx",
+        "total_chunks": 64
+      },
+      {
+        "doc_id": "DOC_HR_20260514123016_A91D6E",
+        "title": "A01安全控制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A01安全控制程序.docx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_HR_20260514123016_7DEAF4",
+        "title": "A03安全培训管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A03安全培训管理程序.docx",
+        "total_chunks": 11
+      },
+      {
+        "doc_id": "DOC_HR_20260514123016_846E49",
+        "title": "A04反恐意识培训管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A04反恐意识培训管理程序.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_HR_20260514123016_EDDC3B",
+        "title": "A08反恐日常检查及汇报程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A08反恐日常检查及汇报程序.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_HR_20260514123016_AC62F5",
+        "title": "A10危险源辨识、风险评价管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A10危险源辨识、风险评价管理程序.docx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_HR_20260514123017_4AB5A8",
+        "title": "A15背景调查与核实程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A15背景调查与核实程序.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_HR_20260514123017_A6F6F4",
+        "title": "A16噪声管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A16噪声管理程序.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_HR_20260514123018_3E6647",
+        "title": "A17离职、转岗员工及终止合作客商管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A17离职、转岗员工及终止合作客商管理程序.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_HR_20260514123018_6F270E",
+        "title": "A19供应商（服务商）选择和评估程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A19供应商（服务商）选择和评估程序.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_HR_20260514123018_DDE426",
+        "title": "A1环境和职业健康安全运行控制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A1环境和职业健康安全运行控制程序.docx",
+        "total_chunks": 9
+      },
+      {
+        "doc_id": "DOC_HR_20260514123018_018298",
+        "title": "A20怀孕女工和新生妈妈岗位风险评估程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A20怀孕女工和新生妈妈岗位风险评估程序.docx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_HR_20260514123019_9C6165",
+        "title": "A22处理访客程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A22处理访客程序.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_HR_20260514123019_8D8871",
+        "title": "A23保安管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A23保安管理程序.docx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_HR_20260514123019_126688",
+        "title": "A24温度与湿度管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A24温度与湿度管理程序.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_HR_20260514123020_416528",
+        "title": "A28废水废气管理控制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A28废水废气管理控制程序.docx",
+        "total_chunks": 8
+      },
+      {
+        "doc_id": "DOC_HR_20260514123020_008F61",
+        "title": "A2EHS环境健康管理控制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A2EHS环境健康管理控制程序.docx",
+        "total_chunks": 8
+      },
+      {
+        "doc_id": "DOC_HR_20260514123020_EA1870",
+        "title": "A30反偷窃程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A30反偷窃程序.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_HR_20260514123020_EFEA02",
+        "title": "A31包装管制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A31包装管制程序.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_HR_20260514123021_C12E78",
+        "title": "A32物理安全措施程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A32物理安全措施程序.docx",
+        "total_chunks": 6
+      },
+      {
+        "doc_id": "DOC_HR_20260514123021_824283",
+        "title": "A33设施管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A33设施管理程序.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_HR_20260514123021_C5FDDA",
+        "title": "A34仓库保安程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A34仓库保安程序.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_HR_20260514123021_9D9CCC",
+        "title": "A35收货及出货保安程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A35收货及出货保安程序.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_HR_20260514123022_FA2AD3",
+        "title": "A37-2触电应急.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A37-2触电应急.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_HR_20260514123022_A511B4",
+        "title": "A37货物过剩短缺管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "A37货物过剩短缺管理程序.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_HR_20260514123022_1F1D5D",
+        "title": "A38货物异常分析和处理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "A38货物异常分析和处理程序.docx",
+        "total_chunks": 10
+      },
+      {
+        "doc_id": "DOC_HR_20260514123023_EE117F",
+        "title": "A39照明系统维护管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "A39照明系统维护管理程序.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_HR_20260514123023_36A728",
+        "title": "A39货物凭据管制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "A39货物凭据管制程序.docx",
+        "total_chunks": 11
+      },
+      {
+        "doc_id": "DOC_HR_20260514123023_4F6B04",
+        "title": "A40运输设备保安程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A40运输设备保安程序.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_HR_20260514123023_CE96C6",
+        "title": "A41通风风速监测管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "inspection_sop",
+        "file_ext": "docx",
+        "original_filename": "A41通风风速监测管理程序.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_HR_20260514123023_9574A2",
+        "title": "A42对运输供货商的保安要求及评审程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A42对运输供货商的保安要求及评审程序.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_HR_20260514123024_48AE9F",
+        "title": "A45预约集装箱及货物追踪程序.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "A45预约集装箱及货物追踪程序.docx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_HR_20260514123024_6CC869",
+        "title": "A46封条管理及封条破损处理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A46封条管理及封条破损处理程序.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_HR_20260514123024_72C804",
+        "title": "A47货柜装柜监柜封箱（封条）追踪验证程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A47货柜装柜监柜封箱（封条）追踪验证程序.docx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_HR_20260514123024_EBAB27",
+        "title": "A48应急响应预案.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A48应急响应预案.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_HR_20260514123024_0FCF25",
+        "title": "A48装卸区域监管程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A48装卸区域监管程序.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_HR_20260514123024_062C9A",
+        "title": "A49禁止非法转运管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A49禁止非法转运管理程序.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_HR_20260514123024_DFBE5B",
+        "title": "A4职业健康安全管理方案管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A4职业健康安全管理方案管理程序.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_HR_20260514123025_5A8151",
+        "title": "A53照明系统维护管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "A53照明系统维护管理程序.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_HR_20260514123025_40D34E",
+        "title": "A54文件保安程序.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "A54文件保安程序.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_HR_20260514123025_23E3DB",
+        "title": "A55垃圾房管理程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A55垃圾房管理程序.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_HR_20260514123026_C23C36",
+        "title": "A6应急准备和响应预警程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A6应急准备和响应预警程序.docx",
+        "total_chunks": 28
+      },
+      {
+        "doc_id": "DOC_HR_20260514123026_669AD0",
+        "title": "A8安全生产、消防安全控制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "safety_sop",
+        "file_ext": "docx",
+        "original_filename": "A8安全生产、消防安全控制程序.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123027_131459",
+        "title": "FL-QC-009-070钻床安全操作规程.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-009-070钻床安全操作规程.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123028_BCF77F",
+        "title": "FL-QC-005-001-1恒温水浴锅.xlsx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "xlsx",
+        "original_filename": "FL-QC-005-001-1恒温水浴锅.xlsx",
+        "total_chunks": 10
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123028_6DE50C",
+        "title": "FL-QC-005-001-3电子天平操作规程.xlsx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "xlsx",
+        "original_filename": "FL-QC-005-001-3电子天平操作规程.xlsx",
+        "total_chunks": 10
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123028_16D29C",
+        "title": "FL-QC-009-015-1高速机安全操作规程(4).docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-009-015-1高速机安全操作规程(4).docx",
+        "total_chunks": 6
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123028_7B182C",
+        "title": "FL-QC-009-015中速机安全操作规程(5).docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-009-015中速机安全操作规程(5).docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123028_1F6535",
+        "title": "FL-QC-009-023分条机安全操作规程.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-009-023分条机安全操作规程.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123029_8FF098",
+        "title": "FL-QC-009-079成型工序作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-009-079成型工序作业指导书.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123029_718445",
+        "title": "FL-QC-009-080外套机工序作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-009-080外套机工序作业指导书.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_PRODUCTION_20260514123029_BC5123",
+        "title": "FL-QC-009-090纸杯套操作规程.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-009-090纸杯套操作规程.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_FINANCE_20260611201418_04C4D4",
+        "title": "FL-CW-CW-004《采购发票核销》作业指导书.pdf",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "pdf",
+        "original_filename": "FL-CW-CW-004《采购发票核销》作业指导书.pdf",
+        "total_chunks": 9
+      },
+      {
+        "doc_id": "DOC_FINANCE_20260611201418_EF06F8",
+        "title": "FL-CW-GRT-001《格润特新材料财务处理》作业指导书.pdf",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "pdf",
+        "original_filename": "FL-CW-GRT-001《格润特新材料财务处理》作业指导书.pdf",
+        "total_chunks": 25
+      },
+      {
+        "doc_id": "DOC_FINANCE_20260611201418_D89CE4",
+        "title": "FL-CW-SW-003《增值税发票开具》作业指导书.pdf",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "pdf",
+        "original_filename": "FL-CW-SW-003《增值税发票开具》作业指导书.pdf",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_E5FCCC",
+        "title": "FL-GJMY-WI-004《模具开发申请》作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GJMY-WI-004《模具开发申请》作业指导书.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_2F52EC",
+        "title": "FL-GJMY-WI-005《图稿传递确认》作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GJMY-WI-005《图稿传递确认》作业指导书.docx",
+        "total_chunks": 6
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_E4C2FE",
+        "title": "FL-GJMY-WI-007《订单登记》作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "inspection_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GJMY-WI-007《订单登记》作业指导书.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_13700D",
+        "title": "FL-GJMY-WI-013《投诉处理》作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GJMY-WI-013《投诉处理》作业指导书.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_F31CC4",
+        "title": "FL-GNYX-KZ-002《货物拒收后的退货处理跟进》控制卡 刘婷（未审核）.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-KZ-002《货物拒收后的退货处理跟进》控制卡 刘婷（未审核）.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_84FE60",
+        "title": "FL-GNYX-NI-001《客户接待》作业指导书-刘婷.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-001《客户接待》作业指导书-刘婷.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_986207",
+        "title": "FL-GNYX-NI-011《订单跟踪》作业指导书-毛君超.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-011《订单跟踪》作业指导书-毛君超.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_823976",
+        "title": "FL-GNYX-NI-012《订单到货过程跟踪-皮氏咖啡》作业指导书-蔡雨露.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-012《订单到货过程跟踪-皮氏咖啡》作业指导书-蔡雨露.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_DD791B",
+        "title": "FL-GNYX-NI-101《发货登记及传达-业务》作业指导书-刘婷.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-101《发货登记及传达-业务》作业指导书-刘婷.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_BB5BAA",
+        "title": "FL-GNYX-NI-102《发货登记及传达-单证》作业指导书-刘婷.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-102《发货登记及传达-单证》作业指导书-刘婷.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_A35058",
+        "title": "FL-GNYX-NI-103《系统内发货单操作》作业指导书-刘婷.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-103《系统内发货单操作》作业指导书-刘婷.docx",
+        "total_chunks": 6
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_460604",
+        "title": "FL-GNYX-NI-103《系统内退货单操作》作业指导书（未）-潘.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-103《系统内退货单操作》作业指导书（未）-潘.docx",
+        "total_chunks": 6
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_001DF0",
+        "title": "FL-GNYX-NI-104《成本专用发票》作业指导书（未）-江.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-104《成本专用发票》作业指导书（未）-江.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_1AFEAC",
+        "title": "FL-GNYX-NI-105《销售专用发票》作业指导书-刘樊虹.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-105《销售专用发票》作业指导书-刘樊虹.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_0850D4",
+        "title": "FL-GNYX-NI-106《关联发票》作业指导书（未）-胡.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-106《关联发票》作业指导书（未）-胡.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201418_5E75C6",
+        "title": "FL-GNYX-NI-107《物流对账》作业指导书（未）.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-GNYX-NI-107《物流对账》作业指导书（未）.docx",
+        "total_chunks": 1
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201419_51A68B",
+        "title": "业务操作SOP.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "业务操作SOP.docx",
+        "total_chunks": 11
+      },
+      {
+        "doc_id": "DOC_MARKETING_20260611201419_5F39F2",
+        "title": "客户接待SOP.docx",
+        "category_l1": "sop",
+        "category_l2": "business_sop",
+        "file_ext": "docx",
+        "original_filename": "客户接待SOP.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_QUALITY_20260611201420_435278",
+        "title": "FL-QC-015-013清洁消毒操作人员培训程序.docx",
+        "category_l1": "reference",
+        "category_l2": "training",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-015-013清洁消毒操作人员培训程序.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_451A53",
+        "title": "11231 BBC86生物安全柜作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "11231 BBC86生物安全柜作业指导书.docx",
+        "total_chunks": 6
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_ABCE07",
+        "title": "ALC-210.4型电子天平作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "ALC-210.4型电子天平作业指导书.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_E704EF",
+        "title": "BYC医用冷藏箱作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "BYC医用冷藏箱作业指导书.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_133B7B",
+        "title": "DDS-307型电导率仪作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "DDS-307型电导率仪作业指导书.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_A6262E",
+        "title": "FL-QC-005-301JJANM-11缺口制样机作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-301JJANM-11缺口制样机作业指导书.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_20E63C",
+        "title": "FL-QC-005-302WGT-S透光率雾度测定仪作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-302WGT-S透光率雾度测定仪作业指导书.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_4D59E2",
+        "title": "FL-QC-005-303XJJ系列简支梁冲击试验作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-303XJJ系列简支梁冲击试验作业指导书.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_0D954F",
+        "title": "FL-QC-005-305比重计作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-305比重计作业指导书.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_1D0513",
+        "title": "FL-QC-005-306电子拉力试验机作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-306电子拉力试验机作业指导书.docx",
+        "total_chunks": 5
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_11CA55",
+        "title": "FL-QC-005-307对色灯箱作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-307对色灯箱作业指导书.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_859B48",
+        "title": "FL-QC-005-308分析天平指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-308分析天平指导书.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_893932",
+        "title": "FL-QC-005-310光泽度仪作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-310光泽度仪作业指导书.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_1697E4",
+        "title": "FL-QC-005-312全自动色差计作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-312全自动色差计作业指导书.docx",
+        "total_chunks": 3
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_939868",
+        "title": "FL-QC-005-314熔体流动速率作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-314熔体流动速率作业指导书.docx",
+        "total_chunks": 7
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_1DE1CE",
+        "title": "FL-QC-005-315紫外灯耐气候试验箱作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-315紫外灯耐气候试验箱作业指导书.docx",
+        "total_chunks": 4
+      },
+      {
+        "doc_id": "DOC_RD_20260611201420_A8AB45",
+        "title": "FL-QC-005-316高低温试验箱作业指导书.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "FL-QC-005-316高低温试验箱作业指导书.docx",
+        "total_chunks": 2
+      },
+      {
+        "doc_id": "DOC_SUPPLY_20260611201420_38C7D1",
+        "title": "0-0-EQM02-09基础设施和工作环境控制程序.docx",
+        "category_l1": "sop",
+        "category_l2": "equipment_sop",
+        "file_ext": "docx",
+        "original_filename": "0-0-EQM02-09基础设施和工作环境控制程序.docx",
+        "total_chunks": 1
+      }
+    ]
+  },
+  "D4": {
+    "orphan_count": 116,
+    "reason_counter": {
+      "PARENT_NOT_FOUND": 116
+    },
+    "sample": [
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0001_890845EA",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 1,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0002_F43D922E",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 2,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0003_DD853E22",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 3,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0004_00A6B6FA",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 4,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0005_91E43744",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 5,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0006_47866FBC",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 6,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0007_07F8125A",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 7,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0008_C36C8769",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 8,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0009_B7FCE0A6",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 9,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0010_560660AF",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 10,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0011_5F32F315",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 11,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0012_68D0D850",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 12,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0013_C7603A23",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 13,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0014_6BD119BA",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 14,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0015_6E491836",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 14,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0016_C15E7FD8",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 14,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0017_30A68980",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 14,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0018_99742C90",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 18,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0019_E885306E",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 19,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      },
+      {
+        "step_card_id": "DOC_HR_20260514123022_0959E5_v2_c0020_D120F2E1",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "step_no": 20,
+        "orphan_reason": "PARENT_NOT_FOUND"
+      }
+    ]
+  },
+  "D5": {
+    "total": 204,
+    "gap_count": 59,
+    "sample": [
+      {
+        "parent_chunk_id": "DOC_FINANCE_20260611201418_0E0E89_v1_c0106_AC490C28",
+        "doc_id": "DOC_FINANCE_20260611201418_0E0E89",
+        "min_step": 0,
+        "max_step": 46,
+        "distinct_steps": 26,
+        "total_cards": 54,
+        "missing_count": 20
+      },
+      {
+        "parent_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0118_A4BBC47B",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "min_step": 0,
+        "max_step": 116,
+        "distinct_steps": 105,
+        "total_cards": 116,
+        "missing_count": 11
+      },
+      {
+        "parent_chunk_id": "DOC_HR_20260514123024_9A9DB9_v3_c0062_9951FFCA",
+        "doc_id": "DOC_HR_20260514123024_9A9DB9",
+        "min_step": 1,
+        "max_step": 60,
+        "distinct_steps": 54,
+        "total_cards": 61,
+        "missing_count": 6
+      },
+      {
+        "parent_chunk_id": "DOC_IT_20260513120634_C6FD16_v3_c0192_17ABC143",
+        "doc_id": "DOC_IT_20260513120634_C6FD16",
+        "min_step": 0,
+        "max_step": 27,
+        "distinct_steps": 21,
+        "total_cards": 184,
+        "missing_count": 6
+      },
+      {
+        "parent_chunk_id": "DOC_IT_20260513120632_52BD41_v3_c0006_41DB73E2",
+        "doc_id": "DOC_IT_20260513120632_52BD41",
+        "min_step": 6,
+        "max_step": 6,
+        "distinct_steps": 1,
+        "total_cards": 3,
+        "missing_count": 5
+      },
+      {
+        "parent_chunk_id": "DOC_FINANCE_20260611201418_8D4BC2_v1_c0006_2588E7BF",
+        "doc_id": "DOC_FINANCE_20260611201418_8D4BC2",
+        "min_step": 5,
+        "max_step": 5,
+        "distinct_steps": 1,
+        "total_cards": 1,
+        "missing_count": 4
+      },
+      {
+        "parent_chunk_id": "DOC_PRODUCTION_20260513120642_FDAF42_v3_c0032_17F06F84",
+        "doc_id": "DOC_PRODUCTION_20260513120642_FDAF42",
+        "min_step": 0,
+        "max_step": 28,
+        "distinct_steps": 24,
+        "total_cards": 28,
+        "missing_count": 4
+      },
+      {
+        "parent_chunk_id": "DOC_HR_20260514123020_815CD9_v2_c0016_685EF365",
+        "doc_id": "DOC_HR_20260514123020_815CD9",
+        "min_step": 0,
+        "max_step": 14,
+        "distinct_steps": 11,
+        "total_cards": 14,
+        "missing_count": 3
+      },
+      {
+        "parent_chunk_id": "DOC_RD_20260611201420_858258_v1_c0015_ED3B364A",
+        "doc_id": "DOC_RD_20260611201420_858258",
+        "min_step": 4,
+        "max_step": 5,
+        "distinct_steps": 2,
+        "total_cards": 2,
+        "missing_count": 3
+      },
+      {
+        "parent_chunk_id": "DOC_HR_20260514123023_76760A_v2_c0008_11952CBB",
+        "doc_id": "DOC_HR_20260514123023_76760A",
+        "min_step": 0,
+        "max_step": 8,
+        "distinct_steps": 6,
+        "total_cards": 8,
+        "missing_count": 2
+      },
+      {
+        "parent_chunk_id": "DOC_HR_20260514123026_B63FA8_v2_c0027_C3601F5B",
+        "doc_id": "DOC_HR_20260514123026_B63FA8",
+        "min_step": 0,
+        "max_step": 23,
+        "distinct_steps": 21,
+        "total_cards": 24,
+        "missing_count": 2
+      },
+      {
+        "parent_chunk_id": "DOC_MARKETING_20260611201418_09FEC9_v1_c0017_EFA69975",
+        "doc_id": "DOC_MARKETING_20260611201418_09FEC9",
+        "min_step": 1,
+        "max_step": 8,
+        "distinct_steps": 6,
+        "total_cards": 16,
+        "missing_count": 2
+      },
+      {
+        "parent_chunk_id": "DOC_PRODUCTION_20260513120639_4151FD_v3_c0004_B7E51B21",
+        "doc_id": "DOC_PRODUCTION_20260513120639_4151FD",
+        "min_step": 2,
+        "max_step": 4,
+        "distinct_steps": 2,
+        "total_cards": 2,
+        "missing_count": 2
+      },
+      {
+        "parent_chunk_id": "DOC_PRODUCTION_20260514123027_F4CA7C_v3_c0005_E4B8C8DE",
+        "doc_id": "DOC_PRODUCTION_20260514123027_F4CA7C",
+        "min_step": 2,
+        "max_step": 5,
+        "distinct_steps": 3,
+        "total_cards": 3,
+        "missing_count": 2
+      },
+      {
+        "parent_chunk_id": "DOC_ADMIN_20260513120213_185430_v3_c0029_E393E44F",
+        "doc_id": "DOC_ADMIN_20260513120213_185430",
+        "min_step": 1,
+        "max_step": 21,
+        "distinct_steps": 20,
+        "total_cards": 28,
+        "missing_count": 1
+      },
+      {
+        "parent_chunk_id": "DOC_ADMIN_20260513120214_39A378_v3_c0012_954C2A69",
+        "doc_id": "DOC_ADMIN_20260513120214_39A378",
+        "min_step": 1,
+        "max_step": 8,
+        "distinct_steps": 7,
+        "total_cards": 11,
+        "missing_count": 1
+      },
+      {
+        "parent_chunk_id": "DOC_ADMIN_20260513120214_61F67C_v3_c0006_FABD1F51",
+        "doc_id": "DOC_ADMIN_20260513120214_61F67C",
+        "min_step": 1,
+        "max_step": 3,
+        "distinct_steps": 2,
+        "total_cards": 6,
+        "missing_count": 1
+      },
+      {
+        "parent_chunk_id": "DOC_ADMIN_20260513120214_E32FC7_v3_c0004_66B3E676",
+        "doc_id": "DOC_ADMIN_20260513120214_E32FC7",
+        "min_step": 2,
+        "max_step": 3,
+        "distinct_steps": 2,
+        "total_cards": 4,
+        "missing_count": 1
+      },
+      {
+        "parent_chunk_id": "DOC_FINANCE_20260611201418_7525D8_v1_c0019_62DA75DE",
+        "doc_id": "DOC_FINANCE_20260611201418_7525D8",
+        "min_step": 0,
+        "max_step": 4,
+        "distinct_steps": 3,
+        "total_cards": 18,
+        "missing_count": 1
+      },
+      {
+        "parent_chunk_id": "DOC_FINANCE_20260611201418_C77238_v1_c0028_C4F879F3",
+        "doc_id": "DOC_FINANCE_20260611201418_C77238",
+        "min_step": 0,
+        "max_step": 5,
+        "distinct_steps": 4,
+        "total_cards": 25,
+        "missing_count": 1
+      }
+    ],
+    "null_step_no": 0
+  },
+  "D6": {
+    "total_chunks": 724,
+    "total_entries": 1706,
+    "bad_json_chunks": 0,
+    "chunk_compliant_all": 702,
+    "entry_oss_key_present": 1662,
+    "entry_image_index_present": 1696,
+    "entry_source_image_present": 1685,
+    "entry_visual_summary_present": 1681,
+    "xlsx_entries": 14,
+    "xlsx_filename_present": 10,
+    "xlsx_anchor_row_present": 10,
+    "per_ext": {
+      "pdf": 302,
+      "xlsx": 12,
+      "docx": 410
+    },
+    "per_ext_compliant": {
+      "pdf": 302,
+      "docx": 400
+    },
+    "bad_chunk_examples": [
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_DB8BB6_v2_c0001_2E198984",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_DB8BB6_v2_c0002_296BE4FE",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_DB8BB6_v2_c0003_314995D0",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_DB8BB6_v2_c0004_0DAA4E1B",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_DB8BB6_v2_c0005_05AD020E",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_51C663_v2_c0001_295CF1CB",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_51C663_v2_c0002_1A62DB7E",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_51C663_v2_c0003_559D2028",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_51C663_v2_c0004_7EC224FF",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      },
+      {
+        "chunk_id": "DOC_PRODUCTION_20260514123029_51C663_v2_c0005_329693B9",
+        "file_ext": "xlsx",
+        "missing": "image_index"
+      }
+    ]
+  },
+  "D7": {
+    "missing": 1,
+    "duplicate": 0,
+    "sample": [
+      {
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "version_no": 2,
+        "step_card_count": "116",
+        "procedure_parent_count": "0"
+      }
+    ]
+  },
+  "verdict": "- ✅ **D1 PASS**: RDS↔HA3 drift 0.00% < 0.5%\n- ⚠️ **D4 FAIL**: 116 个孤儿 step_card，分布看 reason_counter\n- ⚠️ **D7**: missing=1, duplicate=0\n- D5 gap 率: 28.92% （子步合并导致的非 gap 不计）\n- D6 chunk 全合规率: 96.96%"
+}
