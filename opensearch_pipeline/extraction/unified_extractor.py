@@ -397,6 +397,9 @@ class UnifiedExtractor:
             warnings=warnings,
             assets=assets,
         )
+        # Stash 本地路径，供 _pages_needing_ocr 在 page_count<=0 时
+        # 走保守 fallback 重拿真实页数（不暴露成 dataclass field 以避免序列化噪声）
+        result._local_path = local_path  # type: ignore[attr-defined]
 
 
         # OCR fallback 判断
@@ -1534,9 +1537,63 @@ class UnifiedExtractor:
         旧门槛按整文档 text_length 判断，会让"封面有文字、正文是扫描"的多页 PDF
         一页都不 OCR（#1 语料失败模式）。这里逐页统计原生文本，挑出需要 OCR 的页。
         图片块 / 已有 OCR 块不计入"原生文本"。
+
+        page_count<=0 的两种来源：
+          (a) 真的 0 页 PDF（不存在）；
+          (b) extraction 失败（pdfplumber 拿不到 + pypdf 也挂）——这才是真情况，
+              RD 61D861 就是被旧版静默 return [] 漏过的扫描型 PDF。
+        保守策略：尝试用别的 PDF 库重拿 page_count；都拿不到则返回 [1] 占位，
+        强制 qwen-vl-ocr 至少看第 1 页（它能自己识别 PDF 真实页数）。
         """
-        if result.file_ext != "pdf" or (result.page_count or 0) <= 0:
+        if result.file_ext != "pdf":
             return []
+
+        page_count = result.page_count or 0
+        if page_count <= 0:
+            # 保守 fallback：尝试用本地 PDF 库重新拿 page_count（graceful degradation）
+            local_path = ""
+            try:
+                # source_key 不一定是本地路径；这里仅能利用 result 自身已有的信息。
+                # 没有 local_path 时只能走 [1] 占位。
+                local_path = getattr(result, "_local_path", "") or ""
+            except Exception:
+                local_path = ""
+
+            recovered = 0
+            if local_path:
+                # 尝试 pypdf
+                try:
+                    from pypdf import PdfReader  # type: ignore
+                    recovered = len(PdfReader(local_path).pages)
+                except Exception:
+                    try:
+                        from PyPDF2 import PdfReader  # type: ignore
+                        recovered = len(PdfReader(local_path).pages)
+                    except Exception:
+                        recovered = 0
+                # 再尝试 pdfplumber
+                if recovered <= 0:
+                    try:
+                        import pdfplumber  # type: ignore
+                        with pdfplumber.open(local_path) as pdf:
+                            recovered = len(pdf.pages)
+                    except Exception:
+                        recovered = 0
+
+            warn_msg = (
+                f"_pages_needing_ocr: page_count<=0 (extraction likely failed); "
+                f"conservative OCR fallback engaged (recovered_page_count={recovered or 'unknown'})"
+            )
+            if isinstance(getattr(result, "warnings", None), list):
+                result.warnings.append(warn_msg)
+
+            if recovered <= 0:
+                # 拿不到真实页数 → 至少 OCR 第 1 页占位，让 qwen-vl-ocr 自己看图判断
+                return [1]
+            # 拿到了真实页数：用真实 page_count 走下面正常逐页路径
+            result.page_count = recovered
+            page_count = recovered
+
         per_page: Dict[int, int] = {}
         for b in result.blocks:
             bt = b.get("block_type", "") if isinstance(b, dict) else getattr(b, "block_type", "")
@@ -1547,7 +1604,7 @@ class UnifiedExtractor:
                 continue
             txt = (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")) or ""
             per_page[pg] = per_page.get(pg, 0) + len(txt.strip())
-        return [pg for pg in range(1, result.page_count + 1)
+        return [pg for pg in range(1, page_count + 1)
                 if per_page.get(pg, 0) < self.PER_PAGE_OCR_THRESHOLD]
 
     def _needs_ocr(self, result: ExtractionResult) -> bool:

@@ -55,6 +55,27 @@ current_dir = os.path.abspath(".")
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+# 安装 PDF 提取依赖
+# stage 2 也需要：unified_extractor._pages_needing_ocr 在 page_count<=0 时
+# 走 pypdf→PyPDF2→pdfplumber 三阶 recovery (2026-06-15 fix for RD 61D861)。
+# 如果 stage 1 已生成 page_count=0 的 canonical 残次品, stage 2 重读时仍会进 OCR fallback。
+print("=== 2.5 安装 PDF 提取依赖（pdfplumber + pypdf）===")
+import subprocess
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install",
+    "--force-reinstall", "--no-cache-dir", "-q",
+    "pdfplumber", "pypdf>=4.0",
+])
+
+try:
+    import pypdf
+    import pdfplumber
+    print(f"✅ pypdf={pypdf.__version__}  pdfplumber={pdfplumber.__version__}")
+except ImportError as e:
+    raise RuntimeError(
+        f"❌ PDF 依赖安装后仍无法 import: {e}. sys.path={sys.path}."
+    ) from e
+
 # ═══════════════════════════════════════════════════════════════
 # 2. 解析调度参数
 # ═══════════════════════════════════════════════════════════════

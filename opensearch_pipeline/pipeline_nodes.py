@@ -3697,6 +3697,55 @@ def node_publish_to_rag_ready(ctx: dict):
         if md_data is None:
             md_data = doc.get("text", "")
 
+        # ─── 空内容守卫（RD 61D861 修复）───
+        # 抽取层失败或文档本身无文本时，md_data 可能为空字符串。
+        # 之前会把 0 字节 content.md 推到 OSS 并把 publish_status 标成 PUBLISHED，
+        # 导致下游以为已发布、但 chunk 阶段无内容可用。
+        # 改为：跳过 OSS put_object，publish_status='SKIPPED_EMPTY'，
+        # 在 content_process_error 留痕，graceful degrade（不 raise）。
+        # 注意：publish_status 是 VARCHAR(32)，新增枚举值无需 schema 迁移；
+        #      未来若改 ENUM 需把 'SKIPPED_EMPTY' 加入定义。
+        if md_data is None or len(md_data.strip()) == 0:
+            doc["publish_status"] = "SKIPPED_EMPTY"
+            doc["rag_ready_key"] = None
+            doc["rag_ready_metadata_key"] = None
+            doc["redacted_key"] = None
+            print(
+                f"    └─ {doc_id} v{version}: skipped publish (empty text after extraction)"
+            )
+            if not simulate_db:
+                conn = None
+                try:
+                    conn = _get_db_conn(select_db=True)
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET publish_status = 'SKIPPED_EMPTY',
+                                rag_ready_key = NULL,
+                                redacted_key = NULL,
+                                content_process_error = %s
+                            WHERE doc_id = %s AND version_no = %s
+                        """, (
+                            "Empty text after extraction",
+                            doc_id,
+                            version,
+                        ))
+                    conn.commit()
+                    print(
+                        f"    ├─ Marked RDS publish_status='SKIPPED_EMPTY' for {doc_id} v{version}"
+                    )
+                except Exception as e:
+                    if conn:
+                        conn.rollback()
+                    # graceful degrade：不要因状态写失败而打断整批发布。
+                    print(
+                        f"    ⚠️ Failed to mark SKIPPED_EMPTY in RDS for {doc_id} v{version}: {e}"
+                    )
+                finally:
+                    if conn:
+                        conn.close()
+            continue
+
         metadata_payload = {
             "doc_id": doc_id,
             "version_no": version,

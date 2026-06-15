@@ -82,10 +82,79 @@ def test_end_to_end_merges_ocr_pages_in_order():
     assert order == sorted(order)  # merged in page order
 
 
+def test_zero_page_count_no_local_path_returns_placeholder_page1():
+    """RD 61D861: page_count<=0 + no local path → conservative [1] placeholder (was [])."""
+    ux = _gate()
+    res = ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="pdf",
+                           extract_method="m", title="t", text="", text_length=0,
+                           blocks=[], page_count=0)
+    pages = ux._pages_needing_ocr(res)
+    assert pages == [1], f"expected [1] placeholder, got {pages}"
+    assert ux._needs_ocr(res) is True
+    assert any("conservative OCR fallback" in w for w in res.warnings)
+
+
+def test_negative_page_count_returns_placeholder_page1():
+    """page_count<0 (defensive) also triggers conservative fallback."""
+    ux = _gate()
+    res = ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="pdf",
+                           extract_method="m", title="t", text="", text_length=0,
+                           blocks=[], page_count=-1)
+    pages = ux._pages_needing_ocr(res)
+    assert pages == [1]
+    assert any("conservative OCR fallback" in w for w in res.warnings)
+
+
+def test_none_page_count_returns_placeholder_page1():
+    """page_count=None (extraction never set it) also triggers conservative fallback."""
+    ux = _gate()
+    res = ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="pdf",
+                           extract_method="m", title="t", text="", text_length=0,
+                           blocks=[], page_count=None)
+    pages = ux._pages_needing_ocr(res)
+    assert pages == [1]
+
+
+def test_zero_page_count_with_recoverable_local_path_uses_recovered():
+    """page_count=0 but local PDF readable → recover real page_count, then OCR per-page."""
+    import fitz
+    doc = fitz.open()
+    for _ in range(3):
+        doc.new_page()  # 3 blank pages
+    path = tempfile.mktemp(suffix=".pdf")
+    doc.save(path)
+    doc.close()
+
+    ux = _gate()
+    res = ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="pdf",
+                           extract_method="m", title="t", text="", text_length=0,
+                           blocks=[], page_count=0)
+    res._local_path = path  # simulate stash by _extract_pdf
+    pages = ux._pages_needing_ocr(res)
+    # All 3 pages blank → all 3 below threshold → all OCR
+    assert pages == [1, 2, 3], f"expected [1,2,3], got {pages}"
+    assert res.page_count == 3  # recovered + persisted
+    assert any("recovered_page_count=3" in w for w in res.warnings)
+
+
+def test_non_pdf_with_zero_page_count_still_returns_empty():
+    """Non-PDF (e.g. docx) must not be affected by the PDF conservative fallback."""
+    ux = _gate()
+    res = ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="docx",
+                           extract_method="m", title="t", text="x", text_length=1,
+                           blocks=[], page_count=0)
+    assert ux._pages_needing_ocr(res) == []
+
+
 if __name__ == "__main__":
     for fn in [test_scanned_body_with_text_cover_triggers_per_page_ocr,
                test_image_only_page_counts_as_needing_ocr, test_all_text_pdf_skips_ocr,
                test_image_file_still_uses_whole_doc_threshold,
-               test_end_to_end_merges_ocr_pages_in_order]:
+               test_end_to_end_merges_ocr_pages_in_order,
+               test_zero_page_count_no_local_path_returns_placeholder_page1,
+               test_negative_page_count_returns_placeholder_page1,
+               test_none_page_count_returns_placeholder_page1,
+               test_zero_page_count_with_recoverable_local_path_uses_recovered,
+               test_non_pdf_with_zero_page_count_still_returns_empty]:
         fn(); print(f"  ✓ {fn.__name__}")
     print("all per-page-OCR tests passed")

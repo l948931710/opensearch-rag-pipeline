@@ -61,12 +61,28 @@ current_dir = os.path.abspath(".")
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# 安装 PDF 提取依赖（pypdf 在 Python 3.7 上无法提取中文 PDF）
+# 安装 PDF 提取依赖（强化版：force-reinstall + no-cache + import 校验）
+# 历史 bug: 旧版 stage1_node 没装 pypdf, 静默吞 ImportError, 导致 RD 61D861 等扫描 PDF
+# canonical 留 'pypdf/PyPDF2 not installed' warning + page_count=0 + 0 chunks (2026-06-15)
+# DataWorks runtime = Python 3.11 (2026-06-15 实测), site-packages 在 sys.path 内
+print("=== 1.5 安装 PDF 提取依赖（pdfplumber + pypdf）===")
 import subprocess
 subprocess.check_call([
     sys.executable, "-m", "pip", "install",
-    "pdfplumber", "pypdf", "-q"
+    "--force-reinstall", "--no-cache-dir", "-q",
+    "pdfplumber", "pypdf>=4.0",
 ])
+
+# 强校验：装完必须能 import, 否则 fail-fast (避免再次重蹈 RD 61D861 的静默坑)
+try:
+    import pypdf
+    import pdfplumber
+    print(f"✅ pypdf={pypdf.__version__}  pdfplumber={pdfplumber.__version__}")
+except ImportError as e:
+    raise RuntimeError(
+        f"❌ PDF 依赖安装后仍无法 import: {e}. "
+        f"sys.path={sys.path}. 检查 DataWorks 资源组 Python env."
+    ) from e
 
 # ═══════════════════════════════════════════════════════════════
 # 2. 解析调度参数

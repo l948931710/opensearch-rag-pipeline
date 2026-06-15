@@ -117,6 +117,10 @@ CREATE TABLE IF NOT EXISTS document_version (
     file_size_bytes            BIGINT DEFAULT NULL,
     validation_status          VARCHAR(32) DEFAULT 'PENDING',
     approval_status            VARCHAR(32) DEFAULT 'PENDING',
+    -- publish_status 枚举值（VARCHAR 不强制，文档用）：
+    --   NOT_PUBLISHED / PUBLISHED / QUARANTINED / SKIPPED_EMPTY
+    --   SKIPPED_EMPTY 由 node_publish_to_rag_ready 在 md_data 为空时使用（RD 61D861 修复）。
+    --   若未来切 ENUM 类型，需把 'SKIPPED_EMPTY' 加入枚举定义。
     publish_status             VARCHAR(32) DEFAULT 'NOT_PUBLISHED',
     classification_method      VARCHAR(32) DEFAULT NULL,
     classification_confidence  DECIMAL(5,4) DEFAULT NULL,
