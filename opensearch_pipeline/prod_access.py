@@ -36,7 +36,11 @@ class ProdAccessError(RuntimeError):
 def load_prod_env(overlay: str = None) -> dict:
     """解析 .env + 生产侧 overlay 为 dict（**不**写入 os.environ，不污染进程环境）。
 
-    overlay 解析顺序：显式参数 > .env.prod_ro > .env.test(过渡 symlink) > .env.production。
+    overlay 默认 fallback 顺序：.env.prod_ro > .env.test(过渡 symlink) > .env.production。
+    这条链是为 read-only 路径设计的（fuling_ro 在 .env.prod_ro）。
+
+    ⚠️ **RW 路径不要走这个 fallback**。get_prod_rw_conn 会显式传 overlay='.env.production'
+    （挂 fuling_admin），否则会加载 .env.prod_ro 拿到只读凭证再 ERROR 1142。
     """
     candidates = [overlay] if overlay else [".env.prod_ro", ".env.test", ".env.production"]
     chosen = None
@@ -83,14 +87,31 @@ def get_prod_rw_conn(ack: str, overlay: str = None, *, dict_cursor: bool = True)
     """生产 RDS 读写连接。必须显式传当日令牌 ack='PROD-RW:<YYYY-MM-DD>'。
 
     令牌按日过期：复制昨天的命令不会静默生效。
+
+    默认 overlay='.env.production'（含 RW 账号 fuling_admin），不再 fallback 到
+    .env.prod_ro——因为 .env.prod_ro 现在挂的是 fuling_ro 只读账号，拿来写会
+    在 MySQL 层 ERROR 1142 而非 ERROR-out 在 prod_access 这里，调试不友好。
     """
     expected = f"PROD-RW:{date.today().isoformat()}"
     if ack != expected:
         raise ProdAccessError(
             f"生产读写令牌无效（got {ack!r}）。确需写生产：传 ack={expected!r}。"
             f"批量写应优先走 DataWorks runbook 而非本地脚本。")
-    env = load_prod_env(overlay)
-    print(f"[prod_access] !! RW conn -> {env['RAG_RDS_HOST']} (token={ack}, creds: {env['_source_file']})")
+
+    # RW 默认从 .env.production 加载（fuling_admin），不走默认 fallback 链
+    env = load_prod_env(overlay or ".env.production")
+
+    # 守卫：如果加载到的账号看起来是只读账号，立即 raise——防止用户配错
+    # overlay 误指 .env.prod_ro 时不要静默拿到 fuling_ro 然后 ERROR 1142
+    _user = (env.get("RAG_RDS_USER") or "").lower()
+    if _user.endswith("_ro") or _user.endswith("-ro") or _user == "fuling_ro":
+        raise ProdAccessError(
+            f"get_prod_rw_conn 加载的 RAG_RDS_USER={_user!r} 看起来是只读账号"
+            f"（_source_file={env['_source_file']}）。RW 入口请走 fuling_admin 之类的"
+            f"账号。如果你确实要用 _ro 账号做 RW（不会成功），显式 overlay 指别处。")
+
+    print(f"[prod_access] !! RW conn -> {env['RAG_RDS_HOST']} "
+          f"(token={ack}, creds: {env['_source_file']}, user={env['RAG_RDS_USER']})")
     return _connect(env, dict_cursor=dict_cursor)
 
 
