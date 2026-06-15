@@ -3029,6 +3029,9 @@ def node_chunk_documents(ctx: dict):
                         img_entry = {
                             "filename": fn,
                             "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                            # image_index 契约键：取 asset 抽取序号（与其它版式/DOCX/PDF 同源）。
+                            # product_spec_instruction 绑定原先漏设此键（2026-06-15 D6）。
+                            "image_index": asset.get("image_index", asset.get("original_index")),
                             "anchor_row": ar,
                             "image_category": cat,
                         }
@@ -3485,6 +3488,9 @@ def node_chunk_documents(ctx: dict):
                     target.extra.setdefault("image_refs", []).append({
                         "filename": fn,
                         "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                        # image_index 契约键：取 asset 抽取序号（与 procedure_image_guide/DOCX/PDF 同源）。
+                        # equipment_cleaning_standard 的 part_labels 绑定原先漏设此键（2026-06-15 D6）。
+                        "image_index": a.get("image_index", a.get("original_index")),
                         "anchor_row": a.get("anchor_row"),
                         "part_labels": labels,
                         "annotation_num": a.get("annotation_num"),
