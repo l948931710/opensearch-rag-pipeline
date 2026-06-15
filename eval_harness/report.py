@@ -299,6 +299,11 @@ def _md(r: Dict, gates: Dict) -> str:
             if fam.get(fname):
                 L.append(f"\n### L6/{fname}\n```json\n"
                          f"{json.dumps(fam[fname], ensure_ascii=False, indent=1)}\n```")
+        jc = l6.get("judge_chunk")
+        if jc:
+            L.append("\n### L6/chunk-judge (Claude panel — representative is the gate metric, "
+                     "risk-enriched kept separate)\n```json\n"
+                     f"{json.dumps({k: jc.get(k) for k in ('representative','risk_enriched','by_chunk_type','mean_overall_interjudge_stdev','rubric_version')}, ensure_ascii=False, indent=1)}\n```")
         L.append("")
 
     return "\n".join(L)

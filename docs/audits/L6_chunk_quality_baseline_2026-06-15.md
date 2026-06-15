@@ -45,10 +45,29 @@ confirms. D3 separately lists 105 SOP-routed-but-0-step_card under-chunk candida
 
 **4. dangling-anaphor rate = 0.0011** (3 chunks) — essentially clean.
 
-## Phase-2 (not yet done)
-- 180→160-sample LLM chunk-judge (bundle `judge_bundle_chunk.json` written; run the Claude
-  panel → `judge_verdicts_chunk.json` → `run_eval merge`) — calibrates mid-sentence/truncation.
-- `resolve_split_mode` extraction + canonical-fetch faithful Family D (confirms the 50 routing
-  candidates).
+## LLM chunk-judge (Claude panel, 3 judges × 160 items)
+
+Blinded per-chunk_type rubric (`chunk_rubric_v1`). **Inter-judge overall stdev = 0.242 (low → reliable signal, not noise).** Representative bucket (n=141) is the gate metric; risk-enriched (n=19) reported separately.
+
+| dim | representative mean (CI) | reading |
+|---|---|---|
+| self_containedness | 3.59 (3.43–3.75) | `[上文]` context-prefix dangling refs + section_title↔body mismatch |
+| coherence | 3.88 (3.71–4.04) | mostly one unit; some non-contiguous-numbering splices |
+| type_fidelity | 3.44 (3.23–3.64) | **weakest** — thin/multi-step step_cards, clause-vs-form mislabels |
+| **truncation** | **3.87 (3.70–4.03)** | **calibration: confirms the 35% mid-sentence rate is largely legit boundaries, NOT real truncation** |
+| overall | 3.47 (3.30–3.64) | pass-rate (overall≥4) = **40.4%** |
+
+By type (overall / pass@≥4): image 4.8/1.0 & visual_knowledge 4.2/0.67 (cleanest) ▸ clause_chunk 3.63/0.46 ▸ table 3.50/0.33 ▸ text_chunk 3.36/0.42 ▸ **step_card 3.23/0.34** & **procedure_parent 3.13/0.33** (weakest).
+
+**Verdict stays GO** (soft dims don't gate; hard gates all pass, corpus functional). The actionable soft finding: highest-leverage chunk-quality fixes are (1) the `[上文]` context-prefix dangling references and (2) section_title↔body binding — both hit `self_containedness` + `type_fidelity` across step_card/text/clause. Truncation is NOT the priority.
+
+*Data caveat*: judge j2 emitted 39 duplicate item_ids (scored some shard items twice / missed others); j1 missing 2, j3 missing 7. All 141 representative items got ≥1 verdict; some have <3 judges. Doesn't change the picture (stdev 0.242), but a re-run with stricter shard discipline would tighten per-item n.
+
+## Accepted baseline — LOCKED 2026-06-15
+This run (`run_20260615_125726`, fingerprint `chunk_id_set_hash=9122a42bedffae9d`) is the locked deterministic + LLM chunk-content baseline. Future rebuilds report deltas against it.
+
+## Phase-2 remaining
+- `resolve_split_mode` extraction + canonical-fetch faithful Family D (confirms the 50 routing candidates).
 - Durable ingestion accept-manifest (A2 direct, replacing the D4/D7 proxy).
-- Lock the **accepted** baseline once the LLM pass + faithful routing land.
+- Refine the deterministic mid-sentence detector (exclude dates/form-fields/bullets/OCR-leaders) so the soft gate tracks *real* truncation, per the LLM calibration.
+- Act on the `[上文]` context-prefix + section_title binding findings (highest-leverage chunk-quality fixes).
