@@ -50,3 +50,6 @@ eval_harness/reports/rerank_ab.json
 eval_harness/reports/rerank_ab_v2.json
 eval_harness/reports/rerank_smoke.json
 eval_harness/**/__pycache__/
+
+# Claude Code 项目本地指令 (含 RDS 端点等内部细节,不入远程)
+CLAUDE.md
