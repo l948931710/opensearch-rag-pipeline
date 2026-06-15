@@ -3086,16 +3086,18 @@ def node_chunk_documents(ctx: dict):
                             # 契约键（CLAUDE.md）：source_image 与 DOCX step_card 一致，自描述、
                             # 不依赖检索期 oss_key→source_image 折叠
                             "source_image": oss_key,
+                            # image_index 契约键：直接取 asset 抽取序号（0-based，extract_images_from_xlsx
+                            # 赋值、_process_embedded_images 透传，= filename 内 _img{N} 序号），与 DOCX/PDF
+                            # step_card 同源（chunker._chunk_by_step 用 img_extra['image_index']）。
+                            # 注意：figure_no 是 '图N' 字符串标签(1-based)，≠ image_index，绝不可拿它当 index
+                            # （旧逻辑 isinstance(figure_no,int) 恒 False → image_index 永远 None → 2026-06-15 D6 漏洞）。
+                            "image_index": a.get("image_index", a.get("original_index")),
                             "figure_no": a.get("figure_no"),
                             "anchor_row": a.get("anchor_row"),
                             "image_category": a.get("image_category", "unknown"),
                             "visual_summary": a.get("visual_summary", ""),
                             "ocr_text": a.get("ocr_text", ""),
                         }
-                        # figure_no 为整数时作为 image_index（图N 的天然序号）；否则留给检索期按位置兜底
-                        _fig = a.get("figure_no")
-                        if isinstance(_fig, int):
-                            entry["image_index"] = _fig
                         return entry
 
                     # 绑定池分两轮：先 ROUTE_TO_VECTOR（行为与原单轮完全一致），再 ROUTE_TO_TEXT。
