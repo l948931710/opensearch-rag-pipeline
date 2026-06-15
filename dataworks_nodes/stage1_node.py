@@ -61,26 +61,28 @@ current_dir = os.path.abspath(".")
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# 安装 PDF 提取依赖（强化版：force-reinstall + no-cache + import 校验）
-# 历史 bug: 旧版 stage1_node 没装 pypdf, 静默吞 ImportError, 导致 RD 61D861 等扫描 PDF
-# canonical 留 'pypdf/PyPDF2 not installed' warning + page_count=0 + 0 chunks (2026-06-15)
+# 安装抽取依赖（强化版：force-reinstall + no-cache + import 校验）
+# 历史 bug: 旧版 stage1_node 漏装依赖, 静默吞 ImportError →
+#   - 没 pypdf → RD 61D861 等扫描 PDF: 'pypdf not installed' + page_count=0 + 0 chunks
+#   - 没 python-pptx → 成本核算/甘蔗渣培训.pptx: 抽取全空 → SKIPPED_EMPTY 0 chunks (2026-06-15)
 # DataWorks runtime = Python 3.11 (2026-06-15 实测), site-packages 在 sys.path 内
-print("=== 1.5 安装 PDF 提取依赖（pdfplumber + pypdf）===")
+print("=== 1.5 安装抽取依赖（pdfplumber + pypdf + python-pptx）===")
 import subprocess
 subprocess.check_call([
     sys.executable, "-m", "pip", "install",
     "--force-reinstall", "--no-cache-dir", "-q",
-    "pdfplumber", "pypdf>=4.0",
+    "pdfplumber", "pypdf>=4.0", "python-pptx>=0.6",
 ])
 
-# 强校验：装完必须能 import, 否则 fail-fast (避免再次重蹈 RD 61D861 的静默坑)
+# 强校验：装完必须能 import, 否则 fail-fast (避免再次重蹈 RD 61D861 / pptx 静默坑)
 try:
     import pypdf
     import pdfplumber
-    print(f"✅ pypdf={pypdf.__version__}  pdfplumber={pdfplumber.__version__}")
+    import pptx as _pptx_check  # noqa: F401  (python-pptx)
+    print(f"✅ pypdf={pypdf.__version__}  pdfplumber={pdfplumber.__version__}  python-pptx OK")
 except ImportError as e:
     raise RuntimeError(
-        f"❌ PDF 依赖安装后仍无法 import: {e}. "
+        f"❌ 抽取依赖安装后仍无法 import: {e}. "
         f"sys.path={sys.path}. 检查 DataWorks 资源组 Python env."
     ) from e
 

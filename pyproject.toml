@@ -10,7 +10,9 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     "pypdf>=4.0",
+    "pdfplumber>=0.11",     # PDF 版面/文本提取（pdf_extractor 主路径）
     "python-docx>=1.0",
+    "python-pptx>=0.6",     # PPTX 提取（_extract_pptx）— 漏声明致 DataWorks pptx 静默空抽
     "openpyxl>=3.1",
     "requests>=2.31",
 ]
