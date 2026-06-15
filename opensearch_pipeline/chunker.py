@@ -17,7 +17,6 @@ chunker.py — 文档切分器
 
 import hashlib
 import re
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,6 +40,65 @@ _STEP_SECTION_HEADERS = frozenset({
     "概述", "前言", "引言", "总则", "修订记录", "修改记录", "变更记录", "版本记录",
     "附录", "附则", "流程图",
 })
+
+# ── Fix B (2026-06-15 L6 A/B): section_title 失稳治理 ────────────────────────
+# 根因：current_section 仅在识别到 heading 块时推进，heading 稀疏/漏检时会"卡住"
+# 把一个标签盖到一长串内容不同的 chunk 上（如 七、安全奖惩制度 × 154）。
+# 修法（仅 clause/text，step_card 不动）：优先用 chunk 自身明确的编号/章节标题；
+# 否则只在 inherited 标题被正文内容印证时才沿用；都不满足时宁可留空，绝不保留错误标签。
+_HEADING_LINE_RE = re.compile(
+    r"^\s*(第[一二三四五六七八九十百零]+[章节篇条]|[一二三四五六七八九十]+、|\d+(?:\.\d+)*[\s、.．]*)\s*(\S.*)?$"
+)
+_FIX_B_TYPES = frozenset({"clause_chunk", "text_chunk", "section_chunk"})
+
+
+def _leading_section_heading(text: str) -> Optional[str]:
+    """chunk 自身首行若为"明确的编号/章节标题"则返回该行，否则 None。
+
+    保守：章节标记（第X章/一、）直接认；纯编号必须后接一个 *短* 标题（<=25 字、无句末
+    标点）才算 heading —— 避免把以编号开头的长条款正文误当成标题。
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    first = s.splitlines()[0].strip()
+    m = _HEADING_LINE_RE.match(first)
+    if not m:
+        return None
+    marker, title = m.group(1).strip(), (m.group(2) or "").strip()
+    if marker.startswith("第") or "、" in marker:
+        return first if title or marker.startswith("第") else None
+    # 纯数字编号：要求后接短标题（heading-like），否则视为条款正文，不当标题
+    if title and len(title) <= 25 and not re.search(r"[。！？；]", title):
+        return first
+    return None
+
+
+def _section_corroborated(body: str, section: str) -> bool:
+    """inherited 章节标题是否被正文印证：标题去掉前导编号后，任一 2 字 CJK gram 出现在正文。
+
+    标题只剩编号（无实义词）时无法印证 → False（宁可留空）。
+    """
+    title = re.sub(
+        r"^\s*(第[一二三四五六七八九十百零]+[章节篇条]|[一二三四五六七八九十]+、|\d+(?:\.\d+)*[\s、.．]*)",
+        "", section or "").strip()
+    grams = set()
+    for run in re.findall(r"[一-鿿]+", title):
+        for i in range(len(run) - 1):
+            grams.add(run[i:i + 2])
+    if not grams:
+        return False
+    return any(g in (body or "") for g in grams)
+
+
+def _resolve_clause_section_title(body: str, inherited: Optional[str]) -> Optional[str]:
+    """Fix B 解析：own heading → 被正文印证的 inherited → 否则 None（不留错误标签）。"""
+    own = _leading_section_heading(body)
+    if own:
+        return own
+    if inherited and _section_corroborated(body, inherited):
+        return inherited
+    return None
 
 
 def _stable_pk_from_chunk_id(chunk_id: str) -> int:
@@ -290,6 +348,12 @@ class DocumentChunker:
     ) -> Chunk:
         meta = metadata or {}
         raw_body = chunk_text.strip()
+
+        # Fix B (2026-06-15 L6 A/B): clause/text 章节标题失稳治理 —— 优先 chunk 自身明确编号
+        # 标题；否则仅在 inherited 被正文印证时沿用；都不满足留空（绝不保留错误 inherited）。
+        # 仅作用于 clause/text；step_card 及其他类型保持原样。
+        if chunk_type in _FIX_B_TYPES:
+            section_title = _resolve_clause_section_title(raw_body, section_title)
 
         # Check if context prepending is allowed for this chunk type
         is_faq = (chunk_type == "faq_chunk")
@@ -1650,54 +1714,40 @@ class DocumentChunker:
         if buffer:
             merged_segments.append(buffer)
 
-        # 5. Create chunks from segments with inter-clause context
-        # 提取每个条款的标题行（第一行），追加到下一个条款作为语义 overlap
-        prev_clause_title = ""  # 上一条款标题，用于跨条款上下文
-
-        for seg_idx, seg in enumerate(merged_segments):
-            # 提取当前条款标题（第一行，截断 60 字符）
-            first_line = seg.split("\n")[0].strip()[:60]
-
+        # 5. Create chunks from segments
+        # Fix A (2026-06-15 L6 A/B): 不再追加 `[上文] {prev_clause_title}` 跨条款面包屑 ——
+        # 离线 A/B 证实该"前一兄弟标题"对可读性净负（self_cont +0.83/+0.89、overall
+        # +0.62/+0.72），对 recall/rerank 无贡献（0 回退）。整段移除，section_title 仍由
+        # _create_chunk 内的 Fix B 解析。
+        for seg in merged_segments:
             if len(seg) > self.max_chunk_chars:
                 sub_texts = self._split_long_text(seg)
                 for sub in sub_texts:
                     if len(sub.strip()) < self.min_chunk_chars:
                         continue
-                    # 仅对该条款的第一个子 chunk 追加上文前缀
-                    clause_text = sub.strip()
-                    if prev_clause_title and sub == sub_texts[0]:
-                        context_line = f"[上文] {prev_clause_title}"
-                        clause_text = f"{context_line}\n{clause_text}"
                     chunks.append(self._create_chunk(
                         doc_id=doc_id,
                         version_no=version_no,
                         chunk_index=chunk_index,
                         chunk_type="clause_chunk",
-                        chunk_text=clause_text,
+                        chunk_text=sub.strip(),
                         section_title=current_section,
                         metadata=meta,
                     ))
                     chunk_index += 1
             else:
                 if len(seg.strip()) < self.min_chunk_chars:
-                    prev_clause_title = first_line
                     continue
-                clause_text = seg.strip()
-                if prev_clause_title:
-                    context_line = f"[上文] {prev_clause_title}"
-                    clause_text = f"{context_line}\n{clause_text}"
                 chunks.append(self._create_chunk(
                     doc_id=doc_id,
                     version_no=version_no,
                     chunk_index=chunk_index,
                     chunk_type="clause_chunk",
-                    chunk_text=clause_text,
+                    chunk_text=seg.strip(),
                     section_title=current_section,
                     metadata=meta,
                 ))
                 chunk_index += 1
-
-            prev_clause_title = first_line
 
         # 将暂存的 image_refs 附加到最后一个 chunk
         all_result = table_chunks + chunks
@@ -2613,7 +2663,6 @@ class DocumentChunker:
         产品规格书结构固定：物料信息 → 原材料 → 工艺 → 技术标准(感官/尺寸/微生物/理化/性能) → 附件
         每个 section 合并为一个 typed card chunk。
         """
-        import re
         meta = metadata or {}
         chunks: List[Chunk] = []
         chunk_index = 0

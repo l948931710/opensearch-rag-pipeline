@@ -377,10 +377,14 @@ class TestRowCardContextEnrichment:
 
 
 class TestClauseInterClauseOverlap:
-    """Fix 3: clause 模式条款间语义 overlap 测试。"""
+    """Fix A (2026-06-15 L6 A/B): clause 模式不再生成 `[上文]` 跨条款面包屑。
 
-    def test_clause_chunks_have_prev_context(self):
-        """第 2 个及之后的条款 chunk 应包含上一条款标题。"""
+    历史上每个条款 chunk 会前置 `[上文] {上一条款标题}`；离线 A/B 证实其对可读性净负、
+    对 recall/rerank 无贡献，故整段移除。本类改为验证"无 `[上文]`、条款正文完整保留"。
+    """
+
+    def test_clause_chunks_have_no_shangwen_prefix(self):
+        """所有条款 chunk 都不应含 `[上文]` 前缀，且条款正文完整保留。"""
         chunker = DocumentChunker(
             max_chunk_chars=500,
             min_chunk_chars=10,
@@ -403,19 +407,13 @@ class TestClauseInterClauseOverlap:
         ]
         chunks = chunker.chunk_from_blocks(blocks, "DOC_CLAUSE_OVL", 1)
         clause_chunks = [c for c in chunks if c.chunk_type == "clause_chunk"]
-        
+
         assert len(clause_chunks) == 3
-        
-        # 第一个条款无上文
-        assert "[上文]" not in clause_chunks[0].chunk_text
-        
-        # 第二个条款应包含第一条的标题
-        assert "[上文]" in clause_chunks[1].chunk_text
-        assert "第一条" in clause_chunks[1].chunk_text
-        
-        # 第三个条款应包含第二条的标题
-        assert "[上文]" in clause_chunks[2].chunk_text
-        assert "第二条" in clause_chunks[2].chunk_text
+        # Fix A: 没有任何 [上文] 面包屑
+        assert all("[上文]" not in c.chunk_text for c in clause_chunks)
+        # 条款正文仍完整保留（各自的条款内容在对应 chunk 内）
+        assert "第二条" in clause_chunks[1].chunk_text
+        assert "第三条" in clause_chunks[2].chunk_text
 
     def test_clause_first_chunk_no_context(self):
         """只有一个条款时不应有 [上文] 标记。"""
@@ -435,6 +433,93 @@ class TestClauseInterClauseOverlap:
         clause_chunks = [c for c in chunks if c.chunk_type == "clause_chunk"]
         assert len(clause_chunks) == 1
         assert "[上文]" not in clause_chunks[0].chunk_text
+
+
+class TestL6ContentFixes:
+    """Fix A (`[上文]` 移除) + Fix B (section_title 失稳治理) 回归 (2026-06-15 L6 A/B)。
+
+    依据 docs/audits/L6_ab_prefix_section_findings_2026-06-15.md（recall A/B 通过）。
+    """
+
+    # ── Fix B 解析器单测 (req 3/4) ──
+    def test_fixb_own_heading_overrides_stale_inherited(self):
+        from opensearch_pipeline.chunker import _resolve_clause_section_title as R
+        # 自身明确编号标题应覆盖被卡住的 inherited current_section
+        assert R("1.2 打卡规定\n员工应按时打卡上下班。", "七、安全奖惩制度") == "1.2 打卡规定"
+        assert R("第三章 安全管理\n本章规定。", "第一章 总则") == "第三章 安全管理"
+
+    def test_fixb_blank_when_inherited_not_corroborated(self):
+        from opensearch_pipeline.chunker import _resolve_clause_section_title as R
+        # 正文讲合同谈判、inherited 是"生产车间职责"→无任何印证→留空（绝不保留错误标签）
+        assert R("负责除销售采购合同以外的合同谈判工作。", "3.2 生产车间职责") is None
+
+    def test_fixb_keeps_corroborated_inherited(self):
+        from opensearch_pipeline.chunker import _resolve_clause_section_title as R
+        # 无 own heading 但 inherited 被正文印证 → 沿用（不过度留空）
+        assert R("急救药箱应配置常用药品并定期检查更换。", "5.2 急救药箱配置") == "5.2 急救药箱配置"
+
+    def test_fixb_number_only_inherited_blanked(self):
+        from opensearch_pipeline.chunker import _resolve_clause_section_title as R
+        assert R("一些没有编号的正文内容描述。", "3.2.1") is None  # 标题无实义词，无法印证
+
+    def test_fixb_long_numbered_clause_is_not_a_heading(self):
+        from opensearch_pipeline.chunker import _leading_section_heading as H
+        # 以编号开头的长条款正文不应被当成 own heading
+        assert H("3.2.1 负责除销售、采购合同以外其他各类合同的谈判工作并据法务意见办理。") is None
+        assert H("1.2 打卡规定\n正文") == "1.2 打卡规定"
+
+    # ── _create_chunk type-guard: 仅 clause/text 被治理；其他类型 byte-equal (req 1/5) ──
+    def test_fixb_only_affects_clause_text_types(self):
+        ch = DocumentChunker(prepend_section=True, prepend_title=False)
+        stale, body = "七、安全奖惩制度", "负责合同谈判与对外采购的协调工作安排。"
+        for t in ("clause_chunk", "text_chunk", "section_chunk"):
+            c = ch._create_chunk("D", 1, 0, t, body, section_title=stale, metadata={})
+            assert c.section_title is None, f"{t} 失稳标签应被治理"
+            assert "章节:" not in c.chunk_text
+        # 未受影响类型：section_title 原样、prefix 仍含原章节（byte-equal 保证）
+        for t in ("step_card", "table_chunk", "faq_chunk", "procedure_parent", "visual_knowledge"):
+            c = ch._create_chunk("D", 1, 0, t, body, section_title=stale, metadata={})
+            assert c.section_title == stale, f"{t} section_title 不应被改动"
+
+    # ── Fix A end-to-end: clause 无 [上文] (req 2) ──
+    def test_fixa_clause_no_shangwen_endtoend(self):
+        ch = DocumentChunker(max_chunk_chars=500, min_chunk_chars=10,
+                             overlap_chars=100, split_mode="clause")
+        blocks = [ExtractedBlock(block_type="paragraph", text=f"第{n}条 内容内容内容内容。" * 3)
+                  for n in ("一", "二", "三")]
+        chunks = ch.chunk_from_blocks(blocks, "DOC_CLAUSE_FIXA", 1)
+        clause = [c for c in chunks if c.chunk_type == "clause_chunk"]
+        assert clause and all("[上文]" not in c.chunk_text for c in clause)
+
+    # ── step doc 结构不变: step_no / image_refs / parent 链接 / chunk_index (req 5) ──
+    def test_step_doc_structure_unchanged(self):
+        ch = DocumentChunker(max_chunk_chars=2000, min_chunk_chars=10,
+                             overlap_chars=0, split_mode="step")
+        blocks = [
+            ExtractedBlock(block_type="paragraph", text="步骤1. 打开阀门并检查压力表读数是否正常"),
+            {"block_type": "image_ref", "text": "", "page_num": 1, "section_path": None,
+             "source": "multimodal", "extra": {"image_index": 0, "source_image": "img.png",
+             "oss_key": "key", "ocr_text": "阀门操作说明", "visual_summary": "操作面板视图"}},
+            ExtractedBlock(block_type="paragraph", text="步骤2. 确认读数后关闭阀门并记录数据"),
+            ExtractedBlock(block_type="paragraph", text="步骤3. 清理现场并签字确认完成操作"),
+        ]
+        chunks = ch.chunk_from_blocks(blocks, "DOC_STEP_FIX", 1)
+        step_cards = [c for c in chunks if c.chunk_type == "step_card"]
+        assert step_cards, "step doc 应产出 step_card"
+        # step_no 仍存在
+        assert all(c.extra.get("step_no") is not None for c in step_cards)
+        # image_refs 仍绑定到带图的 step_card（契约键不变）
+        assert any(c.extra.get("image_refs") for c in step_cards)
+        # chunk_index 连续且无重复（Fix A/B 不触碰；parent 取尾号，列表顺序≠索引序）
+        idxs = [c.chunk_index for c in chunks]
+        assert len(idxs) == len(set(idxs))               # 无重复
+        assert sorted(idxs) == list(range(len(idxs)))    # 连续 0..n-1
+        # 父子链接完好
+        parents = [c for c in chunks if c.chunk_type == "procedure_parent"]
+        if parents:
+            pids = {p.chunk_id for p in parents}
+            linked = [c for c in step_cards if c.extra.get("parent_chunk_id")]
+            assert linked and all(c.extra["parent_chunk_id"] in pids for c in linked)
 
 
 class TestProcedureParentEnrichment:

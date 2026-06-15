@@ -73,3 +73,21 @@ Quality significantly improves (readability A/B: +0.38 overall, +0.59 type_fidel
 **Rollout (all gated on your authorization, none this round):** patch chunker → unit/byte-equal tests → **staging** re-chunk of affected docs → run L6 + L1–L5 in staging (end-to-end hybrid+rerank confirmation) → if green, prod re-chunk + re-index of affected docs via the standard rebuild path.
 
 Artifacts: `scratch/l6_ab/*` (gitignored); reproducible via `eval_harness/l6_ab.py` (`build` / `recall`). Baseline (`L6_chunk_quality_baseline_2026-06-15.md`) stays the usable initial baseline — **GO = hard structural pass; semantic quality has clear, now-quantified room, and the `[上文]` + section_title fixes are validated levers (recall-safe).**
+
+## 8. Chunker patch IMPLEMENTED (code + offline tests only — no re-chunk/re-index)
+
+`chunker.py`: Fix A removes the `[上文]` prepend in `_chunk_by_clause`; Fix B adds `_resolve_clause_section_title` (own numbered/chapter heading → corroborated-inherited → empty), applied in `_create_chunk` **for clause/text/section only** (step_card/table/faq/proc_parent/visual untouched). +2 dead-import cleanups (`uuid`, a local `re`). Tests: `TestL6ContentFixes` (6-req coverage) + updated `TestClauseInterClauseOverlap`; **full suite 1032 green, ruff clean**.
+
+**Implemented Fix B differs from the §3 blank-only A/B** — it *replaces* with the chunk's own heading where available, blanking only when no reliable title. Re-validated the EXACT implemented behavior:
+- embedding stability cos(before,after): own-heading-replace 0.936 (min 0.860) / blank 0.954 (min 0.776).
+- **dense recall A/B (n=60, implemented resolver): r@1 0.967 → 1.000, r@5/MRR/nDCG → 1.0, 0 rank regressions** — own-heading-replacement is recall-*positive* (own heading is more body-aligned than a stale label).
+
+**Affected preview (read-only estimate, current 6690-chunk corpus):**
+| fix | chunks | docs | detail |
+|---|---|---|---|
+| Fix A (drop `[上文]`) | 1188 | 123 | 100% clause_chunk |
+| Fix B (clause/text) | 1519 | 277 | **1005 own-heading-replace + 514 blank**; text 415 / clause 1104 |
+| step_card section_title (Fix B OFF) | 0 changed | — | 1897 labels untouched |
+| **combined** | **1702 (25.4%)** | **280 / 562** | — |
+
+**Status: code + tests + recall validation complete; awaiting staging re-chunk authorization.** Staging gate = re-chunk the 280 affected docs → run L6 + L1–L5 end-to-end (full hybrid+rerank). No prod write performed.
