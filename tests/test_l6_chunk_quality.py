@@ -188,6 +188,32 @@ def test_judge_bundle_separates_buckets():
     assert repr_ids.isdisjoint(risk_ids)
 
 
+# ── l6_ab fix transforms (the chunker-fix spec) ───────────────────────────
+
+def test_strip_shangwen_removes_breadcrumb_line_anywhere():
+    from eval_harness import l6_ab  # clean import (no envboot at module top)
+    txt = "【文档:X | 章节:Y】\n[上文] 2、适用范围\n3.2 正文内容在这里。"
+    out = l6_ab.strip_shangwen(txt)
+    assert "[上文]" not in out
+    assert "【文档:X | 章节:Y】" in out and "3.2 正文内容在这里。" in out
+
+
+def test_drop_stale_section_keeps_doc_drops_section():
+    from eval_harness import l6_ab
+    txt = "【文档:员工手册 | 章节:七、安全奖惩制度】\n正文是关于面试流程的内容。"
+    out = l6_ab.drop_stale_section(txt)
+    assert "章节:" not in out and "文档:员工手册" in out
+    assert "正文是关于面试流程的内容。" in out
+
+
+def test_is_weak_prev_and_clause_fragment():
+    from eval_harness import l6_ab
+    assert l6_ab.is_weak_prev("1、总则") and l6_ab.is_weak_prev("目的：")
+    assert not l6_ab.is_weak_prev("3.2 公司合同管理小组负责合同管理工作")
+    assert l6_ab.section_is_clause_fragment("5.2 急救药箱配置")
+    assert not l6_ab.section_is_clause_fragment("第七章 附则")
+
+
 def test_merge_chunk_panel_keeps_buckets_separate():
     bundle = [{"item_id": "a", "bucket": "representative", "chunk_type": "text_chunk",
                "rubric_version": "chunk_rubric_v1"},
