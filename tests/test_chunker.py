@@ -468,6 +468,15 @@ class TestL6ContentFixes:
         assert H("3.2.1 负责除销售、采购合同以外其他各类合同的谈判工作并据法务意见办理。") is None
         assert H("1.2 打卡规定\n正文") == "1.2 打卡规定"
 
+    def test_fixb_long_chapter_line_not_heading_and_fits_column(self):
+        # 长的 "一、…/第X章…" run-on 不当 heading，且 section_title 永不超 varchar(255)
+        from opensearch_pipeline.chunker import (
+            _leading_section_heading as H, _resolve_clause_section_title as R)
+        long_line = "一、" + "甲方应按合同约定履行义务并承担相应责任" * 5  # >60 字
+        assert H(long_line + "\n正文") is None
+        out = R(long_line, "5.2 急救药箱配置")
+        assert out is None or len(out) <= 60
+
     # ── _create_chunk type-guard: 仅 clause/text 被治理；其他类型 byte-equal (req 1/5) ──
     def test_fixb_only_affects_clause_text_types(self):
         ch = DocumentChunker(prepend_section=True, prepend_title=False)

@@ -57,11 +57,16 @@ def _leading_section_heading(text: str) -> Optional[str]:
 
     保守：章节标记（第X章/一、）直接认；纯编号必须后接一个 *短* 标题（<=25 字、无句末
     标点）才算 heading —— 避免把以编号开头的长条款正文误当成标题。
+
+    标题必须简短（整行 <=60 字）：一行 100+ 字的"一、…/第X章…"是条款正文/run-on，不是标题；
+    且 section_title 列是 varchar(255)，长行会撑爆写库（2026-06-15 staging seed 实测）。
     """
     s = (text or "").strip()
     if not s:
         return None
     first = s.splitlines()[0].strip()
+    if len(first) > 60:   # 标题应简短；长行是正文/run-on，不当 heading（兼防撑爆 varchar(255)）
+        return None
     m = _HEADING_LINE_RE.match(first)
     if not m:
         return None
