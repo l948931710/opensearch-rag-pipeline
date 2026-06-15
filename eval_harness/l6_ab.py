@@ -145,14 +145,110 @@ def build_readability_ab(out_dir: str, *, seed: int = 20260615, n_shards: int = 
             "per_stratum": {k: len(v) for k, v in strata.items()}}
 
 
+def _body(text: str) -> str:
+    """Semantic core = chunk_text with BOTH prefixes stripped (identical for before/after)."""
+    t = re.sub(r"^【[^】]*】\n?", "", text)
+    t = re.sub(r"(?m)^\[上文\][^\n]*\n?", "", t)
+    return t.strip()
+
+
+def _cos(a, b):
+    import math
+    d = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return d / (na * nb) if na and nb else 0.0
+
+
+def recall_ab(ab_dir: str = "scratch/l6_ab", *, n_distractors: int = 250, seed: int = 7) -> Dict:
+    """Offline recall A/B: embedding stability + dense self-retrieval (body-query vs a
+    distractor pool) before vs after, per fix condition and chunk_type. Read-only; uses the
+    prod DashScope embedding. Returns a metrics summary.
+
+    NOTE: dense-only offline approximation. The full 3-way hybrid + rerank against BOTH
+    variants requires the eventual re-chunk; validate end-to-end in staging post-fix.
+    """
+    import math
+    import random
+    from statistics import mean
+    from .ha3live import install_into_retriever
+    install_into_retriever()
+    from opensearch_pipeline.retriever import get_query_embedding
+    from .layers.l6_chunk_quality import _load_corpus
+
+    bundle = json.load(open(os.path.join(ab_dir, "ab_bundle.json"), encoding="utf-8"))
+    pairs = json.load(open(os.path.join(ab_dir, "ab_pairs.json"), encoding="utf-8"))
+    text = {b["item_id"]: b["chunk_text"] for b in bundle}
+    strat = {p["chunk_id"]: p["stratum"] for p in pairs}
+    ctype = {p["chunk_id"]: p["chunk_type"] for p in pairs}
+    affected = {p["chunk_id"] for p in pairs}
+    cond_of = {"I1_weak_shangwen": "FixA", "I1_ok_shangwen": "FixA",
+               "I2_stale_section": "FixB", "I2_step_clausefrag": "FixB_step_ctrl"}
+
+    distract = random.Random(seed).sample([c for c in _load_corpus()
+                                           if c["chunk_id"] not in affected], n_distractors)
+    emb: Dict[str, list] = {}
+
+    def E(t):
+        if t not in emb:
+            emb[t] = get_query_embedding(t)[0]
+        return emb[t]
+
+    dvecs = [(c["chunk_id"], E(c["chunk_text"])) for c in distract]
+
+    def rank_of(qv, tid, tv):
+        scored = sorted([(tid, _cos(qv, tv))] + [(cid, _cos(qv, v)) for cid, v in dvecs],
+                        key=lambda x: -x[1])
+        return next((i for i, (cid, _) in enumerate(scored, 1) if cid == tid), None)
+
+    def metrics(ranks):
+        n = len(ranks) or 1
+        return {"r@1": round(sum(1 for r in ranks if r <= 1) / n, 3),
+                "r@5": round(sum(1 for r in ranks if r <= 5) / n, 3),
+                "mrr": round(mean(1 / r for r in ranks), 3),
+                "ndcg": round(mean(1 / math.log2(r + 1) for r in ranks), 3)}
+
+    by_cond: Dict = {}
+    by_type: Dict = {}
+    stability: Dict = {}
+    regressions = []
+    for p in pairs:
+        cid = p["chunk_id"]
+        eb, ea = E(text[f"{cid}::before"]), E(text[f"{cid}::after"])
+        stability.setdefault(cond_of[strat[cid]], []).append(_cos(eb, ea))
+        q = E(_body(text[f"{cid}::before"]))
+        rb, ra = rank_of(q, cid, eb), rank_of(q, cid, ea)
+        by_cond.setdefault(cond_of[strat[cid]], {"before": [], "after": []})
+        by_cond[cond_of[strat[cid]]]["before"].append(rb)
+        by_cond[cond_of[strat[cid]]]["after"].append(ra)
+        by_type.setdefault(ctype[cid], {"before": [], "after": []})
+        by_type[ctype[cid]]["before"].append(rb)
+        by_type[ctype[cid]]["after"].append(ra)
+        if ra > rb and ra > 1:
+            regressions.append({"chunk_id": cid, "stratum": strat[cid], "before": rb, "after": ra})
+    return {
+        "embedding_stability": {k: {"mean": round(mean(v), 4), "min": round(min(v), 4),
+                                    "lt_0.90": sum(1 for x in v if x < 0.90)}
+                                for k, v in stability.items()},
+        "recall_by_condition": {k: {"before": metrics(d["before"]), "after": metrics(d["after"])}
+                                for k, d in by_cond.items()},
+        "recall_by_chunk_type": {k: {"before": metrics(d["before"]), "after": metrics(d["after"])}
+                                 for k, d in by_type.items()},
+        "rank_regressions": regressions,
+        "n_pairs": len(pairs), "n_distractors": n_distractors,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["build"])
+    ap.add_argument("cmd", choices=["build", "recall"])
     ap.add_argument("--out", default="scratch/l6_ab")
     ap.add_argument("--seed", type=int, default=20260615)
     args = ap.parse_args()
     if args.cmd == "build":
         print(json.dumps(build_readability_ab(args.out, seed=args.seed), ensure_ascii=False))
+    elif args.cmd == "recall":
+        print(json.dumps(recall_ab(args.out), ensure_ascii=False, indent=1))
 
 
 if __name__ == "__main__":
