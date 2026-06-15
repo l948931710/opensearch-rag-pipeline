@@ -307,6 +307,13 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
         print(f"    └─ [RECONCILE] Healed {stranded_result['success']}/{stranded_result['total']} "
               f"stranded doc versions, {stranded_result['failed']} failed")
         report["errors"].extend(stranded_result["errors"])
+    # 三对账：清理重灌残留的孤儿 PK（同 chunk_id 双 PK / chunk_meta 已不认账的旧 id）
+    from opensearch_pipeline.ha3_reconcile import reconcile_ha3_orphan_pks
+    orphan_pk_result = reconcile_ha3_orphan_pks()
+    if orphan_pk_result["stale"] > 0 or orphan_pk_result["errors"]:
+        print(f"    └─ [RECONCILE] HA3 orphan PKs: checked={orphan_pk_result['checked']} "
+              f"stale={orphan_pk_result['stale']} deleted={orphan_pk_result['deleted']}")
+        report["errors"].extend(orphan_pk_result["errors"])
     try:
         conn = _get_db_conn(select_db=True)
     except Exception as e:
