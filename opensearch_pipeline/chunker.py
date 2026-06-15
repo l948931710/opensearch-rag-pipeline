@@ -1187,7 +1187,26 @@ class DocumentChunker:
             if preamble_summary:
                 parent_text += f"\n{preamble_summary}"
 
-            parent_text += "\n" + "\n".join(all_step_titles)
+            # parent 是检索导航/overview chunk。步骤过多时把全部标题拼进去会超过
+            # node_validate_chunks 的 2000-token 上限 → parent 被静默丢弃 → 所有 step_card
+            # 成孤儿（2026-06-15 A37突发事件 0959E5：116 步 → parent 2370 tokens → 丢 → 116 孤儿）。
+            # 按 token 预算前向累加标题，预留摘要标记空间，稳低于 2000；不改 all_step_titles。
+            _PARENT_MAX_TOKENS = 1800
+            _total_steps = len(all_step_titles)
+            _base_text = parent_text  # 此处 = doc_title + preamble_summary（上方已拼）
+            _included = []
+            for _t in all_step_titles:
+                _cand = (_base_text + "\n" + "\n".join(_included + [_t])
+                         + f"\n…（共 {_total_steps} 个步骤）")
+                if _estimate_tokens(_cand) > _PARENT_MAX_TOKENS:
+                    break
+                _included.append(_t)
+            parent_text = _base_text
+            if _included:
+                parent_text += "\n" + "\n".join(_included)
+            if len(_included) < _total_steps:
+                parent_text += (f"\n…（仅展示前 {len(_included)} 个标题，"
+                                f"完整流程共 {_total_steps} 个步骤）")
 
             parent_chunk = self._create_chunk(
                 doc_id=doc_id, version_no=version_no,

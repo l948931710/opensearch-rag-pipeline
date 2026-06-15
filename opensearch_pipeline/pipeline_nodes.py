@@ -3622,6 +3622,8 @@ def node_validate_chunks(ctx: dict):
     chunks = ctx.get("chunks", [])
     valid = []
     invalid = []
+    # 结构型 chunk（带父子引用/聚合语义）被丢弃绝不能静默——必须打全量上下文。
+    _STRUCTURAL = {"procedure_parent", "step_card", "table_chunk", "visual_knowledge"}
 
     for chunk in chunks:
         issues = []
@@ -3636,8 +3638,37 @@ def node_validate_chunks(ctx: dict):
 
         if issues:
             invalid.append({"chunk_id": chunk.chunk_id, "issues": issues})
+            # 结构型 chunk 被丢：打 doc_id/type/token/依赖子节点数，避免再次"静默丢 parent → 孤儿"
+            # （2026-06-15 0959E5：procedure_parent 2370 tokens 静默丢 → 116 孤儿 step_card 的教训）
+            if getattr(chunk, "chunk_type", "") in _STRUCTURAL:
+                _ex = chunk.extra if getattr(chunk, "extra", None) else {}
+                _dep = ""
+                if chunk.chunk_type == "procedure_parent":
+                    _dep = f" dependent_children={_ex.get('step_count', len(_ex.get('child_chunk_ids', [])))}"
+                print(f"    🚨 [VALIDATE] dropped STRUCTURAL chunk doc_id={chunk.doc_id} "
+                      f"chunk_id={chunk.chunk_id} type={chunk.chunk_type} "
+                      f"token_count={chunk.token_count} issues={issues}{_dep}")
         else:
             valid.append(chunk)
+
+    # 引用完整性安全网：step_card 的 parent 若被丢/不在有效集 → 切断悬挂 parent_chunk_id + 高优告警。
+    # 优雅降级（保 step 独立可检索，不阻断整篇文档写入）；正常情况下 chunker 已保证 parent 不超长不被丢。
+    _valid_ids = {c.chunk_id for c in valid}
+    _severed = 0
+    for c in valid:
+        _ex = c.extra if getattr(c, "extra", None) else None
+        if not _ex:
+            continue
+        _pid = _ex.get("parent_chunk_id")
+        if _pid and _pid not in _valid_ids:
+            _ex["orphaned_parent"] = _pid  # 留痕，便于事后定位根因
+            _ex["parent_chunk_id"] = None  # 切断悬挂引用，写库为 NULL（node_write_chunk_meta:3912 读 extra）
+            _severed += 1
+    if _severed:
+        print(f"    🚨 [VALIDATE] {_severed} 个 step_card 的 parent 不在有效集 → 已切断悬挂 parent_chunk_id "
+              f"(保留 step 可检索；根因见上方 dropped STRUCTURAL 日志)")
+        ctx.setdefault("validation_warnings", []).append(
+            f"severed {_severed} orphan parent links")
 
     ctx["valid_chunks"] = valid
     ctx["invalid_chunks"] = invalid
