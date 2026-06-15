@@ -1,0 +1,128 @@
+{
+  "generated_at": "2026-06-14 18:09:39",
+  "ha3_table_name": "fuling_kb_chunks",
+  "D1": {
+    "rds_active": 0,
+    "rds_indexed": 0,
+    "rds_version_success": 0,
+    "ha3_returned": 2112,
+    "ha3_unique": 2112,
+    "ha3_warning": null,
+    "only_in_rds": 0,
+    "only_in_ha3": 2112,
+    "intersect": 0,
+    "sym_diff": 2112,
+    "only_in_rds_sample": [],
+    "only_in_ha3_sample": [
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0000_4580E53C",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0001_AD979217",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0002_D96E638C",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0003_8145E7E6",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0004_21FFE9B7",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0005_F95B0435",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0006_444F5F9D",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0007_EE6B23CE",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0008_1A09E1F5",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0009_68E2C247",
+      "DOC_ADMIN_20260509102839_76AFFC_v4_c0010_7D0E3E54",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0000_53A14731",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0001_7809B002",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0002_E9A50C41",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0003_4205F38B",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0004_7FFE6AFF",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0005_0B155AB9",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0006_0ED9786A",
+      "DOC_ADMIN_20260513120213_12182D_v3_c0007_FE48BEE5",
+      "DOC_ADMIN_20260513120213_185430_v3_c0000_A85D74EE"
+    ]
+  },
+  "D2": [
+    {
+      "fmt": "docx",
+      "docs": 432,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "pdf",
+      "docs": 105,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "xlsx",
+      "docs": 30,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "png",
+      "docs": 3,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "pptx",
+      "docs": 3,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "jpg",
+      "docs": 2,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    },
+    {
+      "fmt": "jpeg",
+      "docs": 1,
+      "docs_with_step": 0,
+      "step_cards": "0",
+      "step_cards_with_refs": "0"
+    }
+  ],
+  "D3": {
+    "routed_total": 316,
+    "routed_with_step": 0,
+    "miss_list": []
+  },
+  "D4": {
+    "orphan_count": 0,
+    "reason_counter": {},
+    "sample": []
+  },
+  "D5": {
+    "total": 0,
+    "gap_count": 0,
+    "sample": [],
+    "null_step_no": 0
+  },
+  "D6": {
+    "total_chunks": 0,
+    "total_entries": 0,
+    "bad_json_chunks": 0,
+    "chunk_compliant_all": 0,
+    "entry_oss_key_present": 0,
+    "entry_image_index_present": 0,
+    "entry_source_image_present": 0,
+    "entry_visual_summary_present": 0,
+    "xlsx_entries": 0,
+    "xlsx_filename_present": 0,
+    "xlsx_anchor_row_present": 0,
+    "per_ext": {},
+    "per_ext_compliant": {},
+    "bad_chunk_examples": []
+  },
+  "D7": {
+    "missing": 0,
+    "duplicate": 0,
+    "sample": []
+  },
+  "verdict": "- ⚠️ **D1 FAIL**: drift 211200.00% ≥ 0.5%，需要触发 `reconcile_stranded_versions` 排查。\n- ✅ **D4 PASS**: 无孤儿 step_card\n- ✅ **D7 PASS**: 每 doc 恰好 1 个 procedure_parent\n- D5 gap 率: 0.00% （子步合并导致的非 gap 不计）\n- D6 chunk 全合规率: n/a"
+}

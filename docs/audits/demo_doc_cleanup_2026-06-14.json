@@ -1,0 +1,91 @@
+{
+  "started_at": "2026-06-14T19:08:51.873865",
+  "token": "PROD-RW:2026-06-14",
+  "demo_ids": [
+    "DOC_ADMIN_20260518_001",
+    "DOC_HR_20260518_002",
+    "DOC_PROD_20260518_003"
+  ],
+  "before": {
+    "document_meta": [
+      {
+        "doc_id": "DOC_ADMIN_20260518_001",
+        "status": "active"
+      },
+      {
+        "doc_id": "DOC_HR_20260518_002",
+        "status": "active"
+      },
+      {
+        "doc_id": "DOC_PROD_20260518_003",
+        "status": "active"
+      }
+    ],
+    "document_version": [
+      {
+        "doc_id": "DOC_ADMIN_20260518_001",
+        "version_no": 1,
+        "status": "active"
+      },
+      {
+        "doc_id": "DOC_ADMIN_20260518_001",
+        "version_no": 2,
+        "status": "active"
+      },
+      {
+        "doc_id": "DOC_HR_20260518_002",
+        "version_no": 1,
+        "status": "active"
+      },
+      {
+        "doc_id": "DOC_PROD_20260518_003",
+        "version_no": 1,
+        "status": "active"
+      }
+    ]
+  },
+  "after": {
+    "document_meta": [
+      {
+        "doc_id": "DOC_ADMIN_20260518_001",
+        "status": "inactive"
+      },
+      {
+        "doc_id": "DOC_HR_20260518_002",
+        "status": "inactive"
+      },
+      {
+        "doc_id": "DOC_PROD_20260518_003",
+        "status": "inactive"
+      }
+    ],
+    "document_version": [
+      {
+        "doc_id": "DOC_ADMIN_20260518_001",
+        "version_no": 1,
+        "status": "inactive"
+      },
+      {
+        "doc_id": "DOC_ADMIN_20260518_001",
+        "version_no": 2,
+        "status": "inactive"
+      },
+      {
+        "doc_id": "DOC_HR_20260518_002",
+        "version_no": 1,
+        "status": "inactive"
+      },
+      {
+        "doc_id": "DOC_PROD_20260518_003",
+        "version_no": 1,
+        "status": "inactive"
+      }
+    ]
+  },
+  "rowcounts": {
+    "document_meta": 3,
+    "document_version": 4
+  },
+  "committed_at": "2026-06-14T19:08:53.146805",
+  "status": "COMMITTED"
+}
