@@ -2052,6 +2052,26 @@ class DocumentChunker:
                 suffix = "\n" + "\n".join(suffix_parts)
                 last.chunk_text += suffix
                 last.token_count = _estimate_tokens(last.chunk_text)
+        elif pending_image_refs and not chunks:
+            # OCR-孤儿修复 (2026-06-15)：文档所有正文段落都 < min_chunk_chars 被丢弃，
+            # 但 ROUTE_TO_TEXT 图片携带丰富 OCR（image-heavy SOP，如 6B0EAA《辅料赠送入库操手册》）。
+            # 旧逻辑下 pending_image_refs 因 chunks 为空被静默丢弃 → 0 chunk → 文档从检索彻底消失。
+            # 合成一个独立 ocr_chunk 承载这些 OCR，复用 _attach_pending_images 保持 image_refs 契约不变。
+            # 仅在 chunks 为空时触发；正常文档的图片挂载路径（上方 if 分支）字节级不变。
+            fallback_chunk = self._create_chunk(
+                doc_id=doc_id,
+                version_no=version_no,
+                chunk_index=chunk_index,
+                chunk_type="ocr_chunk",
+                chunk_text="",
+                page_num=buffered_page_num,
+                section_title=current_section,
+                metadata=meta,
+                source="ocr",
+            )
+            chunks.append(fallback_chunk)
+            chunk_index += 1
+            _attach_pending_images(fallback_chunk)
 
         # ── Dedup: 去除重复的 table_chunk（DOCX 页眉表格重复问题）──
         chunks = self._dedup_table_chunks(chunks)

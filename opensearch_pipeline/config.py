@@ -243,7 +243,7 @@ class OCRConfig:
     api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     model: str = "gemini-3.1-flash-lite"            # OCR 专用模型
     vlm_model: str = ""                              # VLM caption/审计模型（为空则 fallback 到 model）
-    max_ocr_pages: int = 5
+    max_ocr_pages: int = 50
     ocr_threshold_chars: int = 100
 
 
@@ -664,7 +664,7 @@ def load_config() -> PipelineConfig:
             api_base_url=ocr_base_url,
             model=ocr_model,
             vlm_model=vlm_model,
-            max_ocr_pages=_env_int("OCR_MAX_PAGES", 5),
+            max_ocr_pages=_env_int("OCR_MAX_PAGES", 50),
             ocr_threshold_chars=_env_int("OCR_THRESHOLD_CHARS", 100),
         ),
 
