@@ -22,7 +22,7 @@ env_guard.py — 危险操作运行时守卫（环境防御纵深的第二道防
 import os
 from datetime import date
 
-from opensearch_pipeline.config import get_config, is_prod_target
+from opensearch_pipeline.config import _STAGING_HA3_SUFFIXES, get_config, is_prod_target
 
 __all__ = ["DestructiveOpBlocked", "EvalModeError",
            "assert_destructive_write_allowed", "GuardedBucket",
@@ -127,13 +127,13 @@ def assert_staging_eval_mode(*, index_name: str = None) -> None:
     if not cfg.oss.bucket_name.endswith("-staging"):
         raise EvalModeError(
             f"[EVAL GUARD STAGING] OSS bucket={cfg.oss.bucket_name} 不带 -staging 后缀.")
-    # HA3 table_name 在 staging HA3 表就绪后才有 _stg 后缀,放宽为 startswith staging_
+    # HA3 table_name 接受 _stg / _s 后缀（_stg 建表失败后改用 fuling_kb_chunks_s,
+    # 与 config._STAGING_HA3_SUFFIXES 对齐）或 staging_ 前缀
     if cfg.alibaba_vector.table_name and not (
-            cfg.alibaba_vector.table_name.endswith("_stg")
+            cfg.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES)
             or cfg.alibaba_vector.table_name.startswith("staging_")):
         raise EvalModeError(
-            f"[EVAL GUARD STAGING] HA3 table={cfg.alibaba_vector.table_name} 不带 _stg 后缀/staging_ 前缀."
-            "(staging HA3 表卡阿里后端待建,该 chip 跟踪)")
+            f"[EVAL GUARD STAGING] HA3 table={cfg.alibaba_vector.table_name} 不带 _stg/_s 后缀/staging_ 前缀.")
     if index_name is not None:
         if _STAGING_INDEX_PREFIX_RE is None:
             _compile_prefix_regexes()
@@ -172,7 +172,9 @@ def assert_destructive_write_allowed(op: str, target: str, *, kind: str) -> None
         # （后缀约束已在 config 加载期被 RAG_ENV=staging 强校验）
         if kind == "rds" and cfg.rds.database.endswith("_stg"):
             return
-        if kind == "search" and cfg.alibaba_vector.table_name.endswith("_stg"):
+        # HA3 staging 表接受 _stg 或 _s 后缀（_stg 建表失败后改用 _s,
+        # 与 config._STAGING_HA3_SUFFIXES 单一来源对齐）
+        if kind == "search" and cfg.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             return
         if kind == "oss" and cfg.oss.bucket_name.endswith("-staging"):
             return
