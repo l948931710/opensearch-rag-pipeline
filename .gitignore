@@ -53,3 +53,8 @@ eval_harness/**/__pycache__/
 
 # Claude Code 项目本地指令 (含 RDS 端点等内部细节,不入远程)
 CLAUDE.md
+
+# Ad-hoc PDF viewer / extractor 残留图片 (仓库根目录)
+/pdf_*_img*.jpeg
+/pdf_*_img*.jpg
+/pdf_*_img*.png
