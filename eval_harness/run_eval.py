@@ -132,6 +132,17 @@ def phase_run(args):
         results["l5"] = l5_permission.run()
         print(f"   {json.dumps({k: results['l5'].get(k) for k in ('applicable','PASS')}, ensure_ascii=False)}")
 
+    if "l6" in layers:
+        print("\n[L6] chunk-artifact content quality (read-only) ...")
+        from .layers import l6_chunk_quality
+        results["l6"] = l6_chunk_quality.run(d7_json_path=os.environ.get("EVAL_L6_D7_JSON"))
+        if results["l6"].get("applicable") and results["l6"].get("judge_bundle_chunk"):
+            json.dump(results["l6"]["judge_bundle_chunk"],
+                      open(os.path.join(outdir, "judge_bundle_chunk.json"), "w"),
+                      ensure_ascii=False, indent=1)
+        print(f"   verdict={results['l6'].get('state')}  go_no_go={results['l6'].get('go_no_go')}  "
+              f"d7={results['l6'].get('d7_source')}")
+
     from . import report
     gates = report.write(results, outdir)
     print(f"\n== PRELIMINARY REPORT -> {outdir}/report.md ==")
@@ -162,6 +173,17 @@ def phase_merge(args):
     from .judge import merge_panel
     panels = verdicts["panels"] if isinstance(verdicts, dict) and "panels" in verdicts else verdicts
     results["judge"] = merge_panel(bundle, panels)
+
+    # L6 chunk-judge merge (separate rubric/buckets) — convention-based files next to results.
+    # judge_bundle_chunk.json (from phase_run) + judge_verdicts_chunk.json (from the panel).
+    cb = os.path.join(outdir, "judge_bundle_chunk.json")
+    cv = os.path.join(outdir, "judge_verdicts_chunk.json")
+    if os.path.exists(cb) and os.path.exists(cv):
+        from .judge import merge_chunk_panel
+        chunk_bundle = json.load(open(cb, encoding="utf-8"))
+        cverd = json.load(open(cv, encoding="utf-8"))
+        cpanels = cverd["panels"] if isinstance(cverd, dict) and "panels" in cverd else cverd
+        results.setdefault("l6", {})["judge_chunk"] = merge_chunk_panel(chunk_bundle, cpanels)
 
     from . import report
     outdir = os.path.dirname(args.results)

@@ -148,6 +148,19 @@ def build_gates(r: Dict) -> Dict:
             gates["permission filtering (L5)"] = {"target": "no leak + injection-safe",
                                                   "value": l5.get("PASS"), "pass": bool(l5.get("PASS"))}
 
+    # ── L6 闸(chunk-artifact 内容质量;三态裁决)──────────────────────────
+    l6 = r.get("l6") if r.get("l6", {}).get("applicable") else None
+    if l6:
+        # 顶线三态裁决:GO / NO_GO_DEFECT / NO_GO_INCOMPLETE_EVIDENCE
+        gates["chunk-quality verdict (L6)"] = {
+            "target": "GO (all hard gates measured & pass)",
+            "value": l6.get("state"), "pass": bool(l6.get("go_no_go"))}
+        # 透传每条 L6 hard/soft 闸(已是 {target,value,pass} 形态,加 L6 前缀)
+        for name, g in (l6.get("gates") or {}).items():
+            tag = "L6-hard" if g.get("hard") else "L6-soft"
+            gates[f"[{tag}] {name}"] = {"target": g.get("target"),
+                                        "value": g.get("value"), "pass": g.get("pass")}
+
     j = r.get("judge", {}).get("aggregate") if r.get("judge") else None
     if j:
         # 2026-06-12 修:value=None(本轮 bundle 不含 positive 类 case,如 L4-only run)
@@ -273,6 +286,20 @@ def _md(r: Dict, gates: Dict) -> str:
     if r.get("l5"):
         L.append("## L5 — Permission Filtering\n")
         L.append(f"```json\n{json.dumps(r['l5'], ensure_ascii=False, indent=1)}\n```\n")
+
+    if r.get("l6") and r["l6"].get("applicable"):
+        l6 = r["l6"]
+        L.append("## L6 — Chunk-Artifact Content Quality\n")
+        L.append(f"- **verdict**: `{l6.get('state')}`  |  go_no_go: {l6.get('go_no_go')}  "
+                 f"|  D1-D7 source: {l6.get('d7_source')}")
+        L.append(f"- fingerprint: {json.dumps(l6.get('fingerprint'), ensure_ascii=False)}")
+        L.append(f"- RDS↔HA3 id-set (H): {json.dumps(l6.get('idset'), ensure_ascii=False)}")
+        fam = l6.get("families", {})
+        for fname in ("boundary", "self_containedness", "dedup", "image_binding", "routing"):
+            if fam.get(fname):
+                L.append(f"\n### L6/{fname}\n```json\n"
+                         f"{json.dumps(fam[fname], ensure_ascii=False, indent=1)}\n```")
+        L.append("")
 
     return "\n".join(L)
 
