@@ -1,0 +1,63 @@
+{
+ "step": "batch2_stage3_embed_push",
+ "timestamp": "2026-06-15T23:30+08:00",
+ "scope": "100 docs / 920 new chunks",
+ "manifest_sha256": "b1f70e7d9a4b79a6415156a727d6f5b49f5613ca0aad6e22327aa355e170a78c",
+ "preflight": {
+  "claimable_total": 920,
+  "non_batch_claimable": 0,
+  "per_doc_count_type_unchanged": true
+ },
+ "embedding": {
+  "model": "text-embedding-v4",
+  "native_dense_sparse": true,
+  "cache": "cleared",
+  "cache_miss": 920,
+  "success": 920,
+  "failed": 0,
+  "retries": 0,
+  "dense_present": 920,
+  "sparse_present": 920
+ },
+ "push": {
+  "table": "fuling_kb_chunks",
+  "indexed": 920,
+  "failed": 0,
+  "errors": false
+ },
+ "deactivation": {
+  "deactivated_chunks": 0,
+  "note": "node05 no-op (same-version), 100x No-older-chunks"
+ },
+ "verify": {
+  "DIM1_rds": {
+   "INDEXED": 920,
+   "no_indexed_at": 0,
+   "section_gt255": 0,
+   "shangwen": 0
+  },
+  "DIM2_reconcile": {
+   "new_in_ha3": 920,
+   "missing": 0,
+   "old_orphans_pre_purge": 920
+  },
+  "DIM3_sparse": {
+   "nonempty": 920,
+   "of": 920,
+   "pct": 100.0,
+   "zero_fallback": 0
+  },
+  "DIM4_dense": {
+   "dim1024": 920,
+   "of": 920
+  },
+  "DIM4b_self_retrieval": "6/6 rank-1 (changed chunks)"
+ },
+ "not_done": [
+  "old chunk deactivation",
+  "HA3 purge",
+  "range reconcile",
+  "other doc writes"
+ ],
+ "verdict": "PASS — 920 indexed dense+sparse, missing=0, sparse 100%; old 920 intact; awaiting scoped-purge auth"
+}
