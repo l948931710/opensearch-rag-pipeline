@@ -113,6 +113,144 @@ def test_c_empty_chunk_fix(mock_get_db_conn):
     assert called, "Should have executed status closure update with 'EMPTY' and 'DONE'"
 
 
+# ── node_write_chunk_meta full-replacement (anti-strand) regression suite ──────────────────────
+# Regression for the 2026-06-15 50-doc batch: the node deleted only the NEW chunk_ids (retry-
+# idempotency), so a doc re-chunked 8 -> 4 left old idx 4-7 active+INDEXED forever (strand). The fix
+# is full-replace DELETE-by-(doc_id, version_no), guarded against partial-doc batches.
+
+class _FakeChunkMetaConn:
+    """Stateful in-memory chunk_meta table to prove full-replacement semantics + tx rollback.
+    Ignores non-chunk_meta SQL (e.g. document_version status closure updates)."""
+    def __init__(self, seed_rows=None, fail_on_insert=False):
+        self.rows = [dict(r) for r in (seed_rows or [])]
+        self._snapshot = [dict(r) for r in self.rows]
+        self.fail_on_insert = fail_on_insert
+        self.rowcount = 0
+
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        s = sql.strip()
+        if s.startswith("DELETE FROM chunk_meta") and "doc_id" in s and "version_no" in s:
+            pairs, it = set(), iter(params or [])
+            for d in it:
+                pairs.add((d, next(it)))
+            self.rows = [r for r in self.rows if (r["doc_id"], r["version_no"]) not in pairs]
+        elif s.startswith("DELETE FROM chunk_meta") and "chunk_id IN" in s:  # the OLD buggy form
+            ids = set(params or [])
+            self.rows = [r for r in self.rows if r["chunk_id"] not in ids]
+        # else: ignore (UPDATE document_version, etc.)
+        self.rowcount = 0
+
+    def executemany(self, sql, rows):
+        if "INSERT INTO chunk_meta" in sql:
+            if self.fail_on_insert:
+                raise RuntimeError("simulated INSERT failure")
+            for r in rows:
+                self.rows.append({"chunk_id": r[0], "doc_id": r[1], "version_no": r[2], "chunk_index": r[3]})
+
+    def commit(self):
+        self._snapshot = [dict(r) for r in self.rows]
+
+    def rollback(self):
+        self.rows = [dict(r) for r in self._snapshot]
+
+    def close(self):
+        pass
+
+
+def _seed(doc, ver, n):
+    return [{"chunk_id": f"{doc}_v{ver}_c{i:04d}_X", "doc_id": doc, "version_no": ver, "chunk_index": i}
+            for i in range(n)]
+
+
+def _mk(doc, ver, idx):
+    return Chunk(chunk_id=f"{doc}_v{ver}_c{idx:04d}_X", doc_id=doc, version_no=ver,
+                 chunk_index=idx, chunk_type="clause_chunk", chunk_text=f"body {idx}", token_count=5)
+
+
+def _idxs(fake, doc):
+    return sorted(r["chunk_index"] for r in fake.rows if r["doc_id"] == doc)
+
+
+def test_rechunk_shrink_8_to_4_old_high_chunks_gone():
+    fake = _FakeChunkMetaConn(_seed("d", 1, 8))  # old: idx 0..7
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=fake):
+        ctx = {"valid_chunks": [_mk("d", 1, i) for i in range(4)],
+               "canonicals": [{"doc_id": "d", "version_no": 1}], "simulate_db": False}
+        node_write_chunk_meta(ctx)
+    assert _idxs(fake, "d") == [0, 1, 2, 3], "old high chunks idx 4-7 must be gone after shrink"
+
+
+def test_rechunk_grow_4_to_8_all_new_written():
+    fake = _FakeChunkMetaConn(_seed("d", 1, 4))  # old: idx 0..3
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=fake):
+        ctx = {"valid_chunks": [_mk("d", 1, i) for i in range(8)],
+               "canonicals": [{"doc_id": "d", "version_no": 1}], "simulate_db": False}
+        node_write_chunk_meta(ctx)
+    assert _idxs(fake, "d") == list(range(8)), "all 8 new chunks must be present after growth"
+
+
+def test_rechunk_same_count_retry_is_idempotent():
+    fake = _FakeChunkMetaConn(_seed("d", 1, 4))
+    for _ in range(2):  # run twice -> identical result
+        with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=fake):
+            ctx = {"valid_chunks": [_mk("d", 1, i) for i in range(4)],
+                   "canonicals": [{"doc_id": "d", "version_no": 1}], "simulate_db": False}
+            node_write_chunk_meta(ctx)
+    assert _idxs(fake, "d") == [0, 1, 2, 3] and len(fake.rows) == 4, "retry must be idempotent (no dup)"
+
+
+def test_rechunk_multi_doc_no_cross_impact():
+    fake = _FakeChunkMetaConn(_seed("A", 1, 3) + _seed("B", 1, 5))
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=fake):
+        ctx = {"valid_chunks": [_mk("A", 1, i) for i in range(2)] + [_mk("B", 1, i) for i in range(6)],
+               "canonicals": [{"doc_id": "A", "version_no": 1}, {"doc_id": "B", "version_no": 1}],
+               "simulate_db": False}
+        node_write_chunk_meta(ctx)
+    assert _idxs(fake, "A") == [0, 1], "A shrinks to 2, independent of B"
+    assert _idxs(fake, "B") == [0, 1, 2, 3, 4, 5], "B grows to 6, independent of A"
+
+
+def test_rechunk_insert_failure_rolls_back_delete():
+    fake = _FakeChunkMetaConn(_seed("d", 1, 4), fail_on_insert=True)
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=fake):
+        ctx = {"valid_chunks": [_mk("d", 1, i) for i in range(2)],
+               "canonicals": [{"doc_id": "d", "version_no": 1}], "simulate_db": False}
+        with pytest.raises(RuntimeError):
+            node_write_chunk_meta(ctx)
+    # DELETE must have been rolled back together with the failed INSERT -> original 4 intact
+    assert _idxs(fake, "d") == [0, 1, 2, 3], "INSERT failure must roll back the DELETE (no data loss)"
+
+
+def test_rechunk_partial_doc_batch_rejected_without_delete():
+    # a (doc,version) whose chunks arrive WITHOUT that doc being a fully-chunked canonical of this run
+    # is a partial / foreign batch — we cannot prove we hold its complete set, so we must NOT
+    # full-replace-DELETE it. Guard raises BEFORE any DELETE; the existing rows stay intact.
+    fake = _FakeChunkMetaConn(_seed("d", 1, 4))
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=fake):
+        ctx = {"valid_chunks": [_mk("d", 1, 0), _mk("d", 1, 1)],
+               "canonicals": [{"doc_id": "other", "version_no": 1}], "simulate_db": False}
+        with pytest.raises(RuntimeError, match="canonicals"):
+            node_write_chunk_meta(ctx)
+    assert _idxs(fake, "d") == [0, 1, 2, 3], "partial/foreign batch must NOT delete anything"
+
+    # also rejected when canonicals is empty (no evidence of full chunking this run)
+    fake2 = _FakeChunkMetaConn(_seed("d", 1, 4))
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=fake2):
+        ctx = {"valid_chunks": [_mk("d", 1, 0)], "canonicals": [], "simulate_db": False}
+        with pytest.raises(RuntimeError):
+            node_write_chunk_meta(ctx)
+    assert _idxs(fake2, "d") == [0, 1, 2, 3], "empty-canonicals batch must NOT delete anything"
+
+
 # Test D: Partial OpenSearch Failure Test
 def test_d_partial_opensearch_failure():
     """

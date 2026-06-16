@@ -3871,6 +3871,39 @@ def node_publish_to_rag_ready(ctx: dict):
         print("    └─ No documents published (all quarantined or empty)")
 
 
+def _rechunk_delete_targets(valid_chunks, canonicals):
+    """完整性前置断言 → 返回需「整体替换」(full-replace) 的 (doc_id, version_no) 列表（已排序）。
+
+    node_write_chunk_meta 用 DELETE-by-(doc_id,version_no) 全量替换，避免 shrink 时旧高位 chunk 残留
+    （strand，2026-06-15）。但全量删除只有在确知持有该文档**完整**新切分集时才安全；否则
+    partial-doc batch 会「删多插少」造成数据丢失。
+
+    **归属守卫**：每个 (doc_id, version_no) 必须出现在本次 run 的 canonicals 中。node_chunk_documents
+    对每个 canonical **一次性整文档切分**，所以命中 canonicals ⟺ 我们持有该文档的完整有效 chunk 集
+    （被 validate 丢弃的是有意排除，valid_chunks 即该文档的完整有效集，删旧全量再插 = 完整替换）。
+    若某 (doc, version) 不在 canonicals，说明它不是本次整文档切分的产物（partial-doc / 外来注入）→
+    无法保证完整 → raise，绝不全量删。
+
+    刻意**不**用 chunk_index 连续性/含 0 做守卫：node_validate_chunks 丢弃无效 chunk 时不重排 index，
+    合法文档的 valid_chunks 可有缺口或不从 0 开始（既有测试与生产均如此），连续性守卫会误伤。归属守卫
+    与丢弃完全兼容。空 valid_chunks 不会进入本函数（调用方 `and valid_chunks` 守卫）→ 不触发整文档删除。
+    """
+    canonical_dv = {
+        (d.get("doc_id"), d.get("version_no"))
+        for d in (canonicals or [])
+        if d.get("doc_id") and d.get("version_no")
+    }
+    doc_versions = sorted({(c.doc_id, c.version_no) for c in valid_chunks})
+    unowned = [dv for dv in doc_versions if dv not in canonical_dv]
+    if unowned:
+        raise RuntimeError(
+            f"node_write_chunk_meta: refusing full-replace DELETE — {len(unowned)} (doc_id,version_no) "
+            f"not in this run's canonicals (partial-doc / foreign batch), e.g. {unowned[:3]}; "
+            f"NO delete performed"
+        )
+    return doc_versions
+
+
 def node_write_chunk_meta(ctx: dict):
     """
     将验证通过的 chunks 写入 RDS chunk_meta。
@@ -3908,16 +3941,26 @@ def node_write_chunk_meta(ctx: dict):
     if not simulate_db and valid_chunks:
         from opensearch_pipeline.env_guard import assert_destructive_write_allowed
         assert_destructive_write_allowed("write_chunk_meta", get_config().rds.host, kind="rds")
+        # 完整性前置断言：在打开连接/事务之前 raise，绝不对 partial-doc batch 执行任何 DELETE。
+        # 返回需整体替换的 (doc_id, version_no) 集合（见 _rechunk_delete_targets 文档）。
+        delete_targets = _rechunk_delete_targets(valid_chunks, canonicals)
         conn = None
         try:
             conn = _get_db_conn(select_db=True)
             with conn.cursor() as cursor:
-                # 1. 运行 DELETE 已存在的相同 chunk_id 的记录，以确保幂等性/重试
-                chunk_ids = [chunk.chunk_id for chunk in valid_chunks]
-                if chunk_ids:
-                    format_strings = ','.join(['%s'] * len(chunk_ids))
-                    cursor.execute(f"DELETE FROM chunk_meta WHERE chunk_id IN ({format_strings})", tuple(chunk_ids))
-                
+                # 1. 全量替换：删除本次涉及的每个 (doc_id, version_no) 现存的全部 chunk，再整体重插。
+                #    ⚠️ 旧实现只按新 chunk_id 删（仅为幂等/重试）——但同版本 re-chunk 时，如果新切分的
+                #    chunk 数变少，旧的高 index chunk 的 chunk_id 不在新集合里就永远删不掉，残留为 active
+                #    僵尸（strand），造成 RDS↔HA3 双份、重复召回（2026-06-15 50-doc 批次实测发现）。
+                #    chunk_id 只依赖 (doc_id, version, index)、与内容无关，所以 shrink 必然 strand。
+                #    按 (doc_id, version_no) 全量删除 = 幂等重试 + 消除 strand；DELETE 与下方 INSERT
+                #    同一事务，任一失败整体 rollback。旧版本（version_no 不同）不受影响，仍由 stage-3
+                #    deactivate 处理（保留旧版本直到 stage-3 验证 + scoped purge）。
+                if delete_targets:
+                    dv_clause = " OR ".join(["(doc_id=%s AND version_no=%s)"] * len(delete_targets))
+                    dv_params = tuple(p for dv in delete_targets for p in dv)
+                    cursor.execute(f"DELETE FROM chunk_meta WHERE {dv_clause}", dv_params)
+
                 # 2. 批量插入新 chunk 记录（executemany 减少 RDS 往返）
                 insert_sql = """
                     INSERT INTO chunk_meta (
