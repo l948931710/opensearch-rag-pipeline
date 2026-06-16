@@ -1,0 +1,100 @@
+{
+  "step": "canary_step2_embed_push_stage3",
+  "timestamp": "2026-06-15T20:28:33+08:00",
+  "git_head": "fdebcd562a7179ab564eb94a4048b5ebee0dc466",
+  "chunker_tree_hash": "0865f871977807fea2b26b2925aa73bd4af2e7ef",
+  "scope": "10 canary docs / 374 new chunks only",
+  "preview_gate": {
+    "corpus_wide_stage3_claimable": 374,
+    "all_canary": true,
+    "non_canary_claimable": 0,
+    "loader_scope": "doc_id IN (canary 10), hard-assert==374"
+  },
+  "precondition_fix": {
+    "issue": "Step-1 reset set document_version.index_status='NOT_STARTED'; stage-3 lock needs 'NOT_INDEXED'",
+    "first_attempt": "lock skipped all 10 (0 work, 0 writes, dag3_no_work)",
+    "corrective": "scoped flip NOT_STARTED->NOT_INDEXED for current-version of the 10 docs (preview=10, committed 10)",
+    "ack": "PROD-RW:2026-06-15"
+  },
+  "embedding": {
+    "model": "text-embedding-v4",
+    "endpoint": "native dense+sparse (DASHSCOPE public)",
+    "cache": "cleared before run",
+    "cache_miss": 374,
+    "success": 374,
+    "failed": 0,
+    "retries": 0,
+    "dense_dim": 1024,
+    "dense_present": 374,
+    "sparse_present": 374
+  },
+  "push": {
+    "table": "fuling_kb_chunks",
+    "batches": 7,
+    "indexed": 374,
+    "failed": 0,
+    "errors": false,
+    "per_batch": [
+      60,
+      61,
+      59,
+      62,
+      61,
+      62,
+      9
+    ],
+    "index_result_status": "SUCCESS"
+  },
+  "deactivation": {
+    "node05_ran": true,
+    "ha3_deletes": 0,
+    "rds_deactivations": 0,
+    "deactivated_chunks": 0,
+    "note": "same-version re-chunk -> old_chunk_ids empty -> _search_delete_old_chunks early-return; document_version flipped to SUCCESS (normal post-push bookkeeping)"
+  },
+  "verify_readonly": {
+    "DIM1_rds": {
+      "not_indexed": 0,
+      "no_indexed_at": 0,
+      "section_gt255": 0,
+      "shangwen_in_text": 0,
+      "opensearch_doc_id": "stores string chunk_id (by design); HA3 PK = int chunk_meta.id"
+    },
+    "DIM2_reconcile": {
+      "new_in_ha3": 374,
+      "missing_in_ha3": 0,
+      "old_orphans_pre_purge": 374,
+      "per_doc_ha3_total": "exactly 2x cm count (clean 1:1 old:new coexistence)"
+    },
+    "DIM3_sparse": {
+      "new_nonempty": 374,
+      "of": 374,
+      "coverage_pct": 100.0,
+      "zero_fallback": 0,
+      "gate": "PASS 100%"
+    },
+    "DIM4_dense": {
+      "dim1024": 374,
+      "of": 374,
+      "bad": 0
+    },
+    "DIM4b_self_retrieval": {
+      "sample": 6,
+      "rank1": 6,
+      "note": "new id rank-1 over old twin (order=DESC)"
+    },
+    "DIM6": {
+      "old_pks_serving": 374,
+      "purged": 0
+    }
+  },
+  "isolation": "all metrics computed on NEW PK (=current chunk_meta.id); old orphans excluded (constraint #3)",
+  "not_done": [
+    "old-version deactivation",
+    "HA3 purge of 374 old orphans",
+    "version switch",
+    "any non-canary doc",
+    "DIM5 e2e (deferred to post-purge Step 5 to avoid coexistence duplication)"
+  ],
+  "verdict": "PASS — Step 2 complete; 374 new chunks indexed with full dense+sparse; old 374 intact; awaiting Step 3"
+}

@@ -1,0 +1,57 @@
+{
+  "step": "canary_step3_scoped_purge",
+  "timestamp": "2026-06-15T20:42+08:00",
+  "scope": "delete exactly the 374 enumerated old HA3 PKs of the 10 canary docs; explicit-PK only (no reconcile, no range delete)",
+  "rollback_snapshot": {
+    "path": "scratch/l6_ab/canary_rollback_2026-06-15T2040.json",
+    "count": 374,
+    "sha256": "d80922e0aae8e994adb07f04b658b27edc5c0e2f83180cd76d005cd182b7d41e",
+    "size_mb": 5.03,
+    "content": "FULL re-pushable payload per old chunk: all to_ha3_doc fields + dense_vector(1024) + sparse_vector_indices/values + chunk_text",
+    "verified_before_delete": "sha256 re-checked at delete time; matched"
+  },
+  "pre_purge_assertions": {
+    "delete_count": 374,
+    "distinct": 374,
+    "intersection_with_current_chunk_meta_ids": 0,
+    "all_belong_to_canary": true,
+    "new_chunks_dense_complete": 374,
+    "new_chunks_sparse_complete": 374,
+    "new_chunks_rds_INDEXED": 374,
+    "old_payloads_recoverable": 374
+  },
+  "delete": {
+    "method": "client.push_documents cmd=delete by explicit int id, 4 batches of 100",
+    "requested": 374,
+    "deleted": 374,
+    "failed": 0,
+    "anomaly": 0,
+    "ack": "canary_purge:2026-06-15",
+    "fresh_guard": "re-read current chunk_meta.id (374) ∩ delete_pks == ∅ before deleting"
+  },
+  "post_verify": {
+    "parity_per_doc": "all 10: missing=0 extra=0 Jaccard=1.0; HA3 count == active chunk_meta count",
+    "deleted_pk_still_present": 0,
+    "docs_with_twins": 0,
+    "D4_orphan_step_cards": 0,
+    "D7_missing_parent": 0,
+    "D1_drift": "0 (Jaccard=1.0)",
+    "e2e": {
+      "queries": 4,
+      "path": "dense+sparse+BM25+rerank (RAG_RERANK_ENABLE=true)",
+      "canary_target_rank1_scores": [
+        0.865,
+        0.974,
+        0.97,
+        0.825
+      ],
+      "duplicate_chunk_ids": 0,
+      "canary_chunks_with_shangwen": 0,
+      "note": "Q4 had 2 [上文] chunks but from NON-canary doc 131DCA (among the 267 unfixed) — canary clean"
+    }
+  },
+  "not_done": [
+    "remaining 267 docs batch re-chunk (NOT authorized)"
+  ],
+  "verdict": "PASS — Step 3 complete; 374 old chunks purged; canary fully reconciled (Jaccard=1.0), structurally clean, e2e twin-free; rollback snapshot retained"
+}

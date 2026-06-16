@@ -1,0 +1,139 @@
+{
+  "step": "canary_step1_reset_rechunk_stage2",
+  "timestamp": "2026-06-15T20:07:00+08:00",
+  "git_head": "fdebcd562a7179ab564eb94a4048b5ebee0dc466",
+  "chunker_tree_hash": "0865f871977807fea2b26b2925aa73bd4af2e7ef",
+  "working_tree_noise": [
+    "M Makefile",
+    "?? docs/diagrams/",
+    "?? scripts/render_mermaid.py"
+  ],
+  "pipeline_path_clean_vs_HEAD": true,
+  "set_hash": "c18a56f756c9fb91",
+  "doc_ids": [
+    "DOC_HR_20260513120631_D097E9",
+    "DOC_MARKETING_20260611201419_A9D6B9",
+    "DOC_FINANCE_20260611201418_C64FBD",
+    "DOC_QUALITY_20260611201420_435278",
+    "DOC_HR_20260514123017_78AB52",
+    "DOC_ADMIN_20260513120215_233653",
+    "DOC_PRODUCTION_20260514123028_869857",
+    "DOC_RD_20260611201420_8FF018",
+    "DOC_IT_20260513120632_BBDF6E",
+    "DOC_SUPPLY_20260611201420_236EDE"
+  ],
+  "preview_assertion": {
+    "target_eq_10": true,
+    "other_claimable": 0,
+    "gate_ok": true
+  },
+  "reset": {
+    "rows_affected": 10,
+    "to": "NOT_STARTED(content/chunk/index)",
+    "ack": "PROD-RW:2026-06-15",
+    "user": "fuling_admin",
+    "db": "fuling_knowledge"
+  },
+  "embedding_cache_disposition": "removed scratch/embedding_cache.json before run",
+  "stage2": {
+    "nodes_success": 7,
+    "nodes_failed": 0,
+    "valid_chunks": 374,
+    "drained_pending_after": 0,
+    "ack": "canary_stage2:2026-06-15"
+  },
+  "before_after": {
+    "DOC_HR_20260513120631_D097E9": {
+      "before": 155,
+      "after": 155,
+      "delta": 0
+    },
+    "DOC_MARKETING_20260611201419_A9D6B9": {
+      "before": 104,
+      "after": 104,
+      "delta": 0
+    },
+    "DOC_FINANCE_20260611201418_C64FBD": {
+      "before": 27,
+      "after": 27,
+      "delta": 0
+    },
+    "DOC_QUALITY_20260611201420_435278": {
+      "before": 2,
+      "after": 2,
+      "delta": 0
+    },
+    "DOC_HR_20260514123017_78AB52": {
+      "before": 7,
+      "after": 7,
+      "delta": 0
+    },
+    "DOC_ADMIN_20260513120215_233653": {
+      "before": 9,
+      "after": 9,
+      "delta": 0
+    },
+    "DOC_PRODUCTION_20260514123028_869857": {
+      "before": 3,
+      "after": 3,
+      "delta": 0
+    },
+    "DOC_RD_20260611201420_8FF018": {
+      "before": 43,
+      "after": 43,
+      "delta": 0
+    },
+    "DOC_IT_20260513120632_BBDF6E": {
+      "before": 5,
+      "after": 5,
+      "delta": 0
+    },
+    "DOC_SUPPLY_20260611201420_236EDE": {
+      "before": 19,
+      "after": 19,
+      "delta": 0
+    }
+  },
+  "totals": {
+    "before": 374,
+    "after": 374,
+    "delta": 0
+  },
+  "verify": {
+    "shangwen_residual": 0,
+    "section_title_max_len": 60,
+    "section_title_overflow_gt255": 0,
+    "section_title_blanked": 121,
+    "stale_label_destale": {
+      "七、安全奖惩制度": {
+        "baseline_committed": 154,
+        "after": 20,
+        "strong_corroborated": 19,
+        "weak_generic_only": 1
+      },
+      "3.2 生产车间职责": {
+        "baseline_committed": 104,
+        "after": 43,
+        "strong_corroborated": 42,
+        "weak_generic_only": 1
+      },
+      "一、收集需要备案的相关资料": {
+        "after": 11,
+        "strong_corroborated": 10,
+        "weak_generic_only": 1
+      }
+    },
+    "step_card_parent_orphans": 0,
+    "docs_multi_active_version": 0,
+    "chunk_index_index_status": "ALL 374 NOT_INDEXED (un-pushed)",
+    "document_version_status": "content=DONE chunk=DONE index=NOT_STARTED x10"
+  },
+  "not_done_this_step": [
+    "stage3 embed/push",
+    "HA3 activate/purge",
+    "reconcile",
+    "any other doc"
+  ],
+  "operator_host": "laptop (push-then-purge mode B)",
+  "verdict": "PASS — Step 1 complete, no HA3 write"
+}
