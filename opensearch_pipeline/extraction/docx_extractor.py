@@ -37,29 +37,74 @@ _CN_HEADING_RE = re.compile(
 )
 _SUB_HEADING_RE = re.compile(r"^\d+\.\d+\s+.+$")
 
+# 标题最大字数：超过即视为正文段落（与下方 regex fallback 的同一阈值一致）。
+_HEADING_MAX_LEN = 30
+# 行尾断句标点：真正的标题极少以句末标点收尾，正文/条款句几乎总是。
+_SENTENCE_FINAL = "。；！？．"
+# 平铺枚举条款前缀（阿拉伯数字 + 右括号/顿号）："1）" "2)" "3、"。这类是条款/列表
+# 正文项，不是章节标题（与 _CN_HEADING_RE 故意只认中文数字一致）。点分层级号
+# （"5.1" "4.2.1"）是真子标题 → 由 _DOTTED_SECTION_RE 豁免。
+_ENUM_CLAUSE_PREFIX_RE = re.compile(r"^\s*\d+\s*[)）、]")
+_DOTTED_SECTION_RE = re.compile(r"^\s*\d+\.\d")
+
+
+def _looks_like_clause_body(text: str) -> bool:
+    """style 把一段文字判成 heading，但文字本身明显是正文/条款句时返回 True，
+    用于否决其 heading 身份。
+
+    动机：部分 制度/管理规定 Word 文档把正文段落滥用了 Subtitle / 标题样式
+    （it_IT信息系统内控制度.docx 实证：62 块里 48 块被 Subtitle 样式误判 heading，
+    下游 clause 切块把 heading 文字当 section_label 而非正文 → 82% 正文 collapse，
+    recall 0.30）。仅靠样式信任会丢正文；此处对样式判定再加一道"内容是否像标题"
+    的复核。判定为正文的三类形状：
+      1) 圈数字标注（与 schema.is_pseudo_heading 同口径）；
+      2) 平铺阿拉伯枚举条款项（"1）申请…"），点分层级号 "5.1" 除外；
+      3) 过长（> _HEADING_MAX_LEN）或以句末标点收尾的整句。
+    """
+    if not text:
+        return False
+    # 1) 圈数字标注 callout
+    if is_pseudo_heading(text):
+        return True
+    # 2) 平铺阿拉伯枚举条款项（点分层级子标题豁免）
+    if _ENUM_CLAUSE_PREFIX_RE.match(text) and not _DOTTED_SECTION_RE.match(text):
+        return True
+    # 3) 过长 → 正文段落；或句末标点收尾 → 是句子而非标签
+    if len(text) > _HEADING_MAX_LEN:
+        return True
+    if text[-1] in _SENTENCE_FINAL:
+        return True
+    return False
+
 
 def _detect_heading_level(style_name: str, text: str) -> Optional[int]:
     """
     检测标题级别。
 
-    策略：style 优先，regex fallback。
+    策略：style 优先，regex fallback。style 命中后仍用 _looks_like_clause_body
+    复核内容，避免"正文滥用 Subtitle/标题样式"的制度文档丢正文（见该函数 docstring）。
     """
-    # 1. Word 样式检测
-    if style_name in _STYLE_LEVEL_MAP:
-        return _STYLE_LEVEL_MAP[style_name]
+    stripped = text.strip()
 
+    # 1. Word 样式检测
+    style_level: Optional[int] = None
+    if style_name in _STYLE_LEVEL_MAP:
+        style_level = _STYLE_LEVEL_MAP[style_name]
     # 2. 样式名包含 "Heading" 或 "标题"
-    if "heading" in style_name.lower():
-        # 尝试提取数字
+    elif "heading" in style_name.lower():
         nums = re.findall(r"\d+", style_name)
-        if nums:
-            return min(int(nums[0]), 4)
-        return 2
+        style_level = min(int(nums[0]), 4) if nums else 2
+
+    if style_level is not None:
+        # 样式声称是标题，但文字本身是正文/条款句 → 回落为 paragraph，
+        # 否则 clause 切块会把这段正文当 section_label 丢弃。
+        if _looks_like_clause_body(stripped):
+            return None
+        return style_level
 
     # 3. Regex fallback：中文标题模式 (限制最大长度以防长正文段落被误判为标题而遗漏)
     # 标注式 callout（圈数字开头）veto —— 与 pdf_extractor 同口径；现有两条
     # 正则形状本就不可能匹配圈数字开头，guard 防未来放宽正则时回归。
-    stripped = text.strip()
     if is_pseudo_heading(stripped):
         return None
     if len(stripped) <= 30:
