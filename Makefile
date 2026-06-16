@@ -1,4 +1,4 @@
-.PHONY: help install dev sim sim-all sim-sensitive sim-version test lint clean graph
+.PHONY: help install dev sim sim-all sim-sensitive sim-version test lint clean graph diagrams diagrams-list
 
 # ═══════════════════════════════════════════════════════════════
 # OpenSearch RAG Pipeline — Makefile
@@ -56,6 +56,14 @@ sim-dag2: ## 只运行 DAG 1,2
 
 graph: ## 打印 DAG 依赖图
 	python -m opensearch_pipeline.run_simulation --graph
+
+# ── Diagrams（把 .md 里的 mermaid 块离线导出成 SVG）──
+
+diagrams: ## 渲染全仓库 mermaid 图为 SVG → docs/diagrams/（需 node/npx，首次拉 mmdc）
+	python scripts/render_mermaid.py
+
+diagrams-list: ## 只列出仓库里的 mermaid 块，不渲染（零依赖）
+	python scripts/render_mermaid.py --list
 
 # ── Test ──
 

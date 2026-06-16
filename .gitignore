@@ -29,6 +29,9 @@ work_report*.svg
 convert_report.js
 node_modules/
 
+# mermaid 图渲染产物 (由 `make diagrams` 从 .md 的 mermaid 块重建,不版本控制)
+docs/diagrams/
+
 # Deployment build artifacts (rebuilt on demand, not version-controlled)
 *.zip
 
