@@ -50,7 +50,7 @@
 ```mermaid
 flowchart TB
     subgraph SRC["数据源"]
-        RAW[("OSS raw/<br/>原始文档<br/>PDF · DOCX · XLSX · TXT · MD ...")]
+        RAW[("OSS raw/<br/>原始文档<br/>PDF · DOCX · XLSX · PPTX · TXT · MD ...")]
     end
 
     subgraph INGEST["摄取平面 — DataWorks 每日批调度"]
@@ -78,6 +78,7 @@ flowchart TB
         direction TB
         API["api.py (FastAPI)<br/>/api/ask · /api/ask/stream<br/>/api/search · /api/auth/dingtalk<br/>/api/feedback · /api/session/clear"]
         BOT["dingtalk_bot.py<br/>Webhook 接收 · 流式卡片<br/>卡片回调(赞/踩)"]
+        RL["rate_limiter.py<br/>公网防刷四层准入<br/>限频·匿名IP·深思配额·全局熔断"]
         subgraph CORE["共享服务核心"]
             RET["retriever.py<br/>三路混合检索+拼接+扩展"]
             RR["reranker.py<br/>路由式重排 (文本/VL)"]
@@ -85,7 +86,7 @@ flowchart TB
             FLOW["answer_flow.py<br/>纯函数: 日志载荷/历史策略/NO_RESULT"]
             AUX["session_store · qa_logger<br/>feedback_handler · content_blocks_builder"]
         end
-        API --> CORE
+        API --> RL --> CORE
         BOT --> CORE
         RET --> RR --> GEN
     end
@@ -148,9 +149,9 @@ flowchart TB
 
 | 节点 | 职责 |
 |---|---|
-| `node_scan_raw_files` | 扫描 OSS `raw/` 待处理文件；准入策略见 [ingest_policy.py](../opensearch_pipeline/ingest_policy.py)（过滤临时文件/垃圾文件/不支持的 legacy 格式 `.doc`/`.xls`/`.ppt`，维护可摄取扩展名白名单） |
+| `node_scan_raw_files` | 扫描 OSS `raw/` 待处理文件；准入策略见 [ingest_policy.py](../opensearch_pipeline/ingest_policy.py)（可摄取白名单 `pdf`/`docx`/`xlsx`/`pptx`/`txt`/`md` 等；过滤临时文件/垃圾文件；不支持的 legacy 二进制 `.doc`/`.xls`/`.ppt` 走一次性转换为 `docx`/`xlsx`/`pptx` 后回灌） |
 | `node_register_metadata` | 写 `document_meta` + `document_version` 到 RDS |
-| `node_extract_text_with_ocr` | 原生抽取（[extraction/unified_extractor.py](../opensearch_pipeline/extraction/unified_extractor.py) 按格式分发）→ 文本量不足时回退 Qwen-VL OCR |
+| `node_extract_text_with_ocr` | 原生抽取（[extraction/unified_extractor.py](../opensearch_pipeline/extraction/unified_extractor.py) 按格式分发，PPTX 经 `_extract_pptx` 做 Shape 级结构化+演讲备注+嵌入图）→ 文本量不足时回退 Qwen-VL OCR |
 | `node_build_canonical` | 产出 `content.md` + `content.canonical.json` 到 OSS `canonical/` |
 
 **DAG 2 `canonical_to_safe_chunk` — 分类 + 脱敏 + 分块**
@@ -311,8 +312,11 @@ flowchart LR
 | **身份解析** | 钉钉 userid → RDS `user_role` 表 → `dept_code`（小程序经 `/api/auth/dingtalk` 用 authcode 换会话 token） |
 | **PII 存储** | 命中的敏感信息只存 **SHA-256 哈希 + 掩码预览**（`document_sensitive_finding` 表），永不存原文 |
 | **敏感文档隔离** | DAG 2 高风险文档进 quarantine，不进入索引；敏感图片由 VLM 漏斗路由 `QUARANTINE_SENSITIVE` |
-| **生产环境守卫** | `config.py`：`environment ∈ {production, staging}` 时若无 DashScope key、或 LLM/OCR/Embedding 任一会解析到 Google/Gemini，**直接 hard-raise**。生产必须用阿里 Qwen |
-| **安全复审** | [spot_checker.py](../opensearch_pipeline/spot_checker.py) 对已索引内容抽查复审；其 `PENDING_DELETE` 对账模式是跨云删除一致性的参考实现 |
+| **生产模型守卫** | `config.py`：`environment ∈ {production, staging}` 时若无 DashScope key、或 LLM/OCR/Embedding 任一会解析到 Google/Gemini，**直接 hard-raise**。生产必须用阿里 Qwen |
+| **环境↔目标交叉校验** | `config.py::_validate_environment_target_consistency`：dev 标签指向生产 RDS/HA3 指纹时 hard-raise，除非显式 `RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack` |
+| **运行时写守卫** | [env_guard.py](../opensearch_pipeline/env_guard.py)：`RAG_READONLY=true`（PROD-RO 会话）一律拒写；非生产向生产目标写入需当日 `RAG_DESTRUCTIVE_PROD_ACK=<op>:<YYYY-MM-DD>`；sim→prod 另有三层写防护（含 6 个回归测试） |
+| **生产访问通道** | 脚本访问生产**只能经** [prod_access.py](../opensearch_pipeline/prod_access.py)（默认只读会话；RW 需当日 `PROD-RW:<date>` 令牌），不得手解析 `.env.production` |
+| **安全复审 / 对账** | [spot_checker.py](../opensearch_pipeline/spot_checker.py) 对已索引内容抽查复审；`reconcile_*` 家族（含 [ha3_reconcile.py](../opensearch_pipeline/ha3_reconcile.py) 的 `reconcile_ha3_orphan_pks`）按 HA3 主键自愈删除 `chunk_meta` 已不认账的孤儿物理行；其 `PENDING_DELETE` 对账模式是跨云删除一致性的参考实现 |
 
 ---
 
@@ -348,6 +352,19 @@ flowchart LR
 | `prototype/` | 浏览器 HTML 原型（开发/演示用，支持 `?api=` 直连真实后端） |
 
 所有用户交互都是钉钉优先，没有独立的 Web 前端。
+
+### 7.4 公网防刷（rate_limiter.py）
+
+SAE 公网 EIP（HTTP 测试期形态）已被扫描器探到端口，匿名直打 `/api/ask` 照样会触发 DashScope（embedding + LLM + rerank）调用 = 刷百炼账单。[rate_limiter.py](../opensearch_pipeline/rate_limiter.py) 在**应用层**（不依赖框架，`api.py` 把拒绝翻成 `HTTPException`）做**四层进程内准入**——Dockerfile 钉死 `--workers 1`，进程内计数即权威，无需 Redis：
+
+| 层 | 准入 |
+|---|---|
+| 1. 每用户限频 + 日配额 | 已登录（Bearer 令牌验证过）按 `user_id` 计 |
+| 2. 匿名按 IP 严格限额 | 无令牌按客户端 IP 计，阈值远低于登录用户 |
+| 3. 深思（thinking）日配额 | 仅登录用户可用；~8x token 计费，单独限量（耗尽不消耗常规预算，关掉深思可立即重问） |
+| 4. 全局日熔断 | 全服务每日 LLM 问答总量帽，护住百炼账单底线 |
+
+线程安全：所有计数在一把锁内"检查全部通过 → 原子计入"；日界按**北京时间**（UTC+8 固定偏移）划分，不用容器本地 UTC 日期。
 
 ---
 
@@ -387,7 +404,18 @@ quarantine/   高风险隔离区
 ### 9.1 配置中心（config.py）
 
 - 全部配置经 `RAG_` 前缀环境变量进入 `load_config()` →（缓存的）`get_config()`；
-- `RAG_ENV` 选择 overlay：`.env`（共享 key/模型）+ `.env.{local|test|production}`（存储端点/凭证）；
+- `RAG_ENV` 选择 overlay：`.env`（共享 key/模型）+ `.env.{...}`（存储端点/凭证）。overlay 以 `override=True`（**文件覆盖 shell 导出变量**，banner 会列出被遮蔽项；`RAG_ALLOW_SHELL_OVERRIDE=VAR1,VAR2` 是逐变量逃生口）；
+- **六层环境矩阵**（完整矩阵、凭证隔离与云控制台清单见 [docs/environment_design.md](environment_design.md)）：
+
+  | 层 | overlay | 说明 |
+  |---|---|---|
+  | SIM | （无 overlay，`RAG_SIMULATE=true`） | 零外部依赖，哈希向量 + 本地文件 |
+  | LOCAL-DEV | `.env.local` | 真实 DashScope + 本地 MySQL/OpenSearch |
+  | LOCAL-EVAL | `.env.local_ab_new` / `.env.local_ab_old` | chunker A/B 评测的新旧两套 |
+  | STAGING | `.env.staging` | 全链路预演层（HA3 `_s`/`_stg` 表） |
+  | PROD-RO | `.env.prod_ro`（`RAG_ENV=test` 为其**弃用别名**） | 只读生产；`RAG_READONLY=true` |
+  | PROD | （生产不设 `RAG_ENV`，SAE/DataWorks 直接注入） | DataWorks 正式 pipeline + 钉钉服务 |
+
 - **模型名在运行时解析**，不是 dataclass 默认值：有 DashScope key 时 LLM→`qwen3.6-plus`、OCR→`qwen-vl-ocr-latest`、VLM→`qwen3-vl-plus`、embedding→`text-embedding-v4`。dataclass 里的 Gemini 名仅是回退。**读 `load_config()` 工厂逻辑，别信字段默认值。**
 
 ### 9.2 Simulate 模式（本地零依赖运行）
@@ -409,7 +437,7 @@ quarantine/   高风险隔离区
 尚未修复、做架构决策时需要知晓的事项（与 `CLAUDE.md` Gotchas 同步）：
 
 1. **乐观锁无通用租约/心跳**：stage-3 有 2h 失锁接管，但 stage-1/2 的 `content_process_status` 没有任何年龄守卫——进程崩溃会永久卡住行。
-2. **跨云无两阶段提交**：HA3 删除是不可逆操作，与 RDS 之间没有 2PC；`spot_checker.py` 的 `PENDING_DELETE` 对账模式是待推广的解法。
+2. **跨云无两阶段提交**：HA3 删除是不可逆操作，与 RDS 之间没有 2PC。`spot_checker.py` 的 `PENDING_DELETE` 对账模式是待推广的解法；`ha3_reconcile.py::reconcile_ha3_orphan_pks` 已作为**事后自愈**部分缓解（按 HA3 主键清掉同 chunk_id 重灌产生的孤儿物理行），但写入时刻的强一致仍缺。
 3. **部分批失败的双版本在线**：批内个别文档失败时，已 INDEXED 的文档其旧版本仍处激活态，新旧两版同时可检。
 4. **会话内存态**：见 §9.3，横向扩容前必须迁 Redis。
 5. **`.xls`（legacy 二进制）明确不支持**（有清晰告警，无静默失败）；HTML 去标签、CSV 解析后再分块。
@@ -430,6 +458,7 @@ quarantine/   高风险隔离区
 | `opensearch_pipeline/ingest_policy.py` | raw/ 准入策略（扩展名白名单、垃圾过滤） |
 | `opensearch_pipeline/chunker.py` | DocumentChunker，text/faq/clause/step 四模式（2,200 行） |
 | `opensearch_pipeline/run_simulation.py` | 本地模拟运行器 + 4 个测试场景 |
+| `opensearch_pipeline/bulk_helpers.py` | OpenSearch bulk action NDJSON 序列化（生产 + 评测共享） |
 | `dataworks_nodes/stage{1,2,3}_node.py` | DataWorks 各 stage 入口脚本 |
 
 ### 抽取与多模态
@@ -461,7 +490,12 @@ quarantine/   高风险隔离区
 | `opensearch_pipeline/qa_logger.py` / `feedback_handler.py` | 问答日志 / 反馈处理 |
 | `opensearch_pipeline/embedding_client.py` | DashScope 嵌入封装（原生 dense+sparse） |
 | `opensearch_pipeline/query_decomposer.py` | 多意图查询分解（实验性，默认关） |
+| `opensearch_pipeline/rate_limiter.py` | 公网防刷四层准入（限频/匿名IP/深思配额/全局熔断，§7.4） |
+| `opensearch_pipeline/auth_token.py` | 轻量签名会话令牌（HMAC-SHA256，小程序免登后颁发短期令牌） |
+| `opensearch_pipeline/dingtalk_identity.py` | 钉钉用户身份解析（机器人+小程序共用，OpenAPI 通讯录/免登） |
+| `opensearch_pipeline/dingtalk_stream_runner.py` | 钉钉 Stream 模式接入（出站 WSS，免公网回调端点） |
 | `opensearch_pipeline/spot_checker.py` | 已索引内容安全抽查 + PENDING_DELETE 对账 |
+| `opensearch_pipeline/ha3_reconcile.py` | HA3↔RDS 物理行对账，按主键自愈删除孤儿 PK（§6） |
 
 ### 前端
 
@@ -477,7 +511,9 @@ quarantine/   高风险隔离区
 
 | 路径 | 职责 |
 |---|---|
-| `opensearch_pipeline/config.py` | 配置中心 + 生产安全守卫 |
+| `opensearch_pipeline/config.py` | 配置中心 + 生产安全守卫 + 环境↔目标交叉校验 |
+| `opensearch_pipeline/env_guard.py` | 运行时写守卫（`RAG_READONLY` / `RAG_DESTRUCTIVE_PROD_ACK`，§6） |
+| `opensearch_pipeline/prod_access.py` | 生产资源访问唯一入口（只读会话 / RW 当日令牌，§6） |
 | `schema/001_opensearch_pipeline.sql` | 主 DDL（fuling_knowledge 库，§8.1） |
 | `schema/002_feedback_system.sql` | 反馈系统（fuling_operation 库） |
 | `schema/002_step_card_enhancement.sql` | step card 字段增强 |
@@ -489,4 +525,4 @@ quarantine/   高风险隔离区
 
 ---
 
-*文档版本：2026-06-10。代码持续演进，若与代码冲突以代码为准；开发约定与命令速查见 [CLAUDE.md](../CLAUDE.md)。*
+*文档版本：2026-06-15（六层环境矩阵 + 运行时写守卫 + 公网防刷 + PPTX 摄取 + HA3 孤儿对账）。代码持续演进，若与代码冲突以代码为准；开发约定与命令速查见 [CLAUDE.md](../CLAUDE.md)。*
