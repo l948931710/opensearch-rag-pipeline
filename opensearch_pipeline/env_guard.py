@@ -26,6 +26,7 @@ from opensearch_pipeline.config import _STAGING_HA3_SUFFIXES, get_config, is_pro
 
 __all__ = ["DestructiveOpBlocked", "EvalModeError",
            "assert_destructive_write_allowed", "GuardedBucket",
+           "GuardedDBConnection", "GuardedDBCursor", "is_write_sql",
            "assert_eval_mode", "assert_staging_eval_mode", "is_eval_mode"]
 
 
@@ -142,6 +143,18 @@ def assert_staging_eval_mode(*, index_name: str = None) -> None:
                 f"[EVAL GUARD STAGING] 索引名 {index_name!r} 不符合 staging_chunkab_<arm>_<YYYYMMDD>_<HHMM> 全小写前缀.")
 
 
+def _ack_today(ack: str) -> bool:
+    """ack 的日期部分是否为今天（忽略具体 op，但 op 段必须非空——拒 ':2026-..' 这类
+    退化/typo ack 静默放行）。连接层兜底守卫与 _pool_readonly_declared 共用：它们拿不到
+    语义 op，任意**合法** op 的当日 ack 即视为"今天已显式授权对生产写"。"""
+    if not ack or ":" not in ack:
+        return False
+    ack_op, _, ack_date = ack.partition(":")
+    if not ack_op.strip():
+        return False
+    return ack_date == date.today().isoformat()
+
+
 def _ack_matches(ack: str, op: str) -> bool:
     """ack 格式 '<op>:<YYYY-MM-DD>' 或 '*:<YYYY-MM-DD>'；日期必须为今天。"""
     if not ack or ":" not in ack:
@@ -152,13 +165,18 @@ def _ack_matches(ack: str, op: str) -> bool:
     return ack_date == date.today().isoformat()
 
 
-def assert_destructive_write_allowed(op: str, target: str, *, kind: str) -> None:
+def assert_destructive_write_allowed(op: str, target: str, *, kind: str,
+                                     quiet: bool = False, any_ack: bool = False) -> None:
     """在不可逆/污染性写操作前调用。
 
     Args:
-        op:     操作名（进 ack 与报错信息），如 'deactivate_old_chunks'、'search_delete'
-        target: 物理目标标识（host / endpoint / bucket 名）
-        kind:   指纹类别，∈ {'rds', 'search', 'oss'}
+        op:      操作名（进 ack 与报错信息），如 'deactivate_old_chunks'、'search_delete'
+        target:  物理目标标识（host / endpoint / bucket 名）
+        kind:    指纹类别，∈ {'rds', 'search', 'oss'}
+        quiet:   True 时抑制 ack 放行的 stdout 打印（连接层兜底守卫每条写语句都会过，
+                 用 quiet 避免刷屏；节点级显式调用保持 quiet=False 以保留一条可见放行记录）。
+        any_ack: True 时 ack 按"当日任意 op"匹配（连接层兜底守卫用：它只看到裸 SQL，
+                 拿不到语义 op，故接受任何当日 ack；节点级显式调用保持 False = 按精确 op）。
     """
     cfg = get_config()
     if cfg.readonly:
@@ -181,8 +199,9 @@ def assert_destructive_write_allowed(op: str, target: str, *, kind: str) -> None
     if not is_prod_target(kind, target):
         return
     ack = os.environ.get("RAG_DESTRUCTIVE_PROD_ACK", "")
-    if _ack_matches(ack, op):
-        print(f"    !! [ENV GUARD OVERRIDE] {op} -> {target} 已被 RAG_DESTRUCTIVE_PROD_ACK={ack} 显式放行")
+    if _ack_today(ack) if any_ack else _ack_matches(ack, op):
+        if not quiet:
+            print(f"    !! [ENV GUARD OVERRIDE] {op} -> {target} 已被 RAG_DESTRUCTIVE_PROD_ACK={ack} 显式放行")
         return
     raise DestructiveOpBlocked(
         f"[ENV GUARD] 拒绝在 environment={cfg.environment} 下对生产目标 {target!r} 执行 {op}。"
@@ -215,3 +234,152 @@ class GuardedBucket:
                 return attr(*args, **kwargs)
             return _guarded
         return attr
+
+
+# ── 裸 cursor 写守卫（P4：让 RAG_READONLY / 非生产→生产策略对**任何** cursor.execute 生效）──
+# 背景：assert_destructive_write_allowed 此前只在少数节点显式调用（write_chunk_meta /
+# acquire_index_lock / deactivate / push / update_index_status）。register_metadata、
+# classify 冻结维护 UPDATE、detect_sensitive、redact、publish_to_rag_ready 等仍是"裸
+# cursor"——RAG_READONLY=true 的 PROD-RO 会话照样能从这些路径写穿。本守卫在**连接层**
+# 兜底：_get_db_conn 返回 GuardedDBConnection，其 cursor 的 execute/executemany 只要识别到
+# 写语句就过同一道 assert_destructive_write_allowed（单一事实源，无策略漂移）。
+#
+# 读语句（SELECT/SHOW/...）一律直通——serving 的 retriever/api/dingtalk_identity 读路径
+# 与 ingest 写路径**共用**这个连接池，连接层守卫绝不能拦读。判定按"首关键字白名单"：
+# 只有动词命中写/DDL 集才过守卫，未知/读动词放行（对可用性 fail-open，对写 fail-loud）。
+
+_SQL_WRITE_VERBS = frozenset({
+    "INSERT", "UPDATE", "DELETE", "REPLACE", "TRUNCATE",
+    "DROP", "ALTER", "CREATE", "RENAME", "GRANT", "REVOKE",
+    "LOAD", "MERGE",
+})
+
+
+def _leading_sql_keyword(sql: str) -> str:
+    """取 SQL 首个关键字（大写）。剥离前导空白/注释，并穿透几类退化前缀拿到真实动词：
+      - `-- 行注释` / `/* 惰性块注释 */`：剥离（MySQL 不执行）。
+      - `/*!nnnnn ... */` **可执行**注释：MySQL 真的会执行——剥掉 `/*!` 与可选版本号，
+        继续看里面的真实动词（否则 `/*!40001 DELETE ... */` 会被当成空关键字=读而漏守卫）。
+      - 前导 `(` / `;`：跳过（`(SELECT ...)` 是读、`(INSERT ...)` 是写——穿透到真实动词，
+        既不把括号读误判为写，也不把括号写漏成读）。
+    注意：CTE 前缀 DML（`WITH cte AS (...) DELETE ...`，MySQL 8）仍返回 'WITH'→判为读——
+    这是 leading-keyword 模型的已知盲点，但本库写路径无 CTE-DML（且 PROD-RO/dev→prod 还有
+    池层 SESSION READ ONLY 兜底），故仅作注释留存，不做易误伤读的全句扫描。
+    """
+    s = (sql or "").lstrip()
+    while s:
+        if s.startswith("--"):
+            nl = s.find("\n")
+            s = s[nl + 1:].lstrip() if nl != -1 else ""
+        elif s.startswith("/*!"):
+            s = s[3:].lstrip()
+            j = 0
+            while j < len(s) and s[j].isdigit():  # 可选的版本号 /*!40001
+                j += 1
+            s = s[j:].lstrip()
+        elif s.startswith("/*"):
+            end = s.find("*/")
+            s = s[end + 2:].lstrip() if end != -1 else ""
+        elif s[0] in "(;":
+            s = s[1:].lstrip()
+        else:
+            break
+    i = 0
+    while i < len(s) and (s[i].isalpha() or s[i] == "_"):
+        i += 1
+    return s[:i].upper()
+
+
+def is_write_sql(sql: str) -> bool:
+    """首关键字是否属于写/DDL 动词（决定是否过破坏性写守卫）。读语句返回 False。"""
+    return _leading_sql_keyword(sql) in _SQL_WRITE_VERBS
+
+
+class GuardedDBCursor:
+    """包裹真实 DB cursor：写语句过 assert_destructive_write_allowed，读语句直通。
+
+    同时支持上下文管理（`with conn.cursor() as c:`）与裸用（`c = conn.cursor(DictCursor)`）。
+    execute/executemany/callproc 三个会写库的入口都过守卫；其余（fetch*/rowcount/...）直通。
+    """
+
+    def __init__(self, cursor, conn: "GuardedDBConnection"):
+        self._cursor = cursor
+        self._conn = conn  # 反向引用：守卫逻辑与"已放行"记忆化都集中在连接上（单点）
+
+    def execute(self, query, *args, **kwargs):
+        self._conn._guard_sql(query)
+        return self._cursor.execute(query, *args, **kwargs)
+
+    def executemany(self, query, *args, **kwargs):
+        self._conn._guard_sql(query)
+        return self._cursor.executemany(query, *args, **kwargs)
+
+    def callproc(self, procname, *args, **kwargs):
+        # 存储过程可能写库，且无法从调用静态判定——保守按"写"过守卫
+        #（当前代码库无 callproc 调用，纯属堵 __getattr__ 直通的兜底口子）。
+        self._conn._guard_callproc(procname)
+        return self._cursor.callproc(procname, *args, **kwargs)
+
+    def __enter__(self):
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._cursor.__exit__(exc_type, exc, tb)
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def __getattr__(self, name):
+        # fetchone/fetchall/fetchmany/rowcount/lastrowid/description/close/...
+        return getattr(self._cursor, name)
+
+
+class GuardedDBConnection:
+    """包裹连接池连接：cursor() 返回 GuardedDBCursor，其余（commit/rollback/close/ping/...）直通。
+
+    只防"裸 cursor 写穿"——读直通，真实写入语义不变。target 是 RDS host，供守卫做指纹比对与报错。
+    写守卫逻辑集中在这里（_guard_sql/_guard_callproc），被 cursor 的 execute/executemany/callproc
+    与连接自身的 query()（pymysql 底层 COM_QUERY 写口子）共用，确保所有写入口走同一道策略。
+    """
+
+    def __init__(self, conn, target: str):
+        # 直接写 __dict__，避免触发下面的 __getattr__（它会读 self._conn）。
+        self.__dict__["_conn"] = conn
+        self.__dict__["_target"] = target
+        self.__dict__["_write_guard_passed"] = False
+
+    def _guard_sql(self, query):
+        # 记忆化：一个连接内策略决策恒定（config 缓存、date 进程内稳定、ack env 稳定），
+        # 首条写放行后即不再重复评估——把每语句开销与（非 quiet 场景下的）打印都收敛到一次。
+        if self._write_guard_passed:
+            return
+        if is_write_sql(str(query)):
+            assert_destructive_write_allowed(
+                "rds_write", self._target, kind="rds", quiet=True, any_ack=True)
+            self.__dict__["_write_guard_passed"] = True
+
+    def _guard_callproc(self, procname):
+        if self._write_guard_passed:
+            return
+        assert_destructive_write_allowed(
+            f"rds_callproc:{procname}", self._target, kind="rds", quiet=True, any_ack=True)
+        self.__dict__["_write_guard_passed"] = True
+
+    def cursor(self, *args, **kwargs):
+        return GuardedDBCursor(self._conn.cursor(*args, **kwargs), self)
+
+    def query(self, sql, *args, **kwargs):
+        # pymysql.Connection.query —— cursor.execute 内部也走它；显式 conn.query() 也要过守卫。
+        self._guard_sql(sql)
+        return self._conn.query(sql, *args, **kwargs)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_conn"], name)

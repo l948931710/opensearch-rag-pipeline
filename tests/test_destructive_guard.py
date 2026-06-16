@@ -143,3 +143,214 @@ def test_guarded_bucket_non_prod_bucket_writes_allowed(patch_cfg):
     patch_cfg(_cfg(environment="staging", oss_bucket="fuling-knowledge-base-staging"))
     gb = GuardedBucket(_FakeBucket(), "fuling-knowledge-base-staging")
     assert gb.put_object("rag-ready/x/content.md", b"data") == "put-ok"
+
+
+# ── P4: 连接层裸 cursor 写守卫（GuardedDBConnection / GuardedDBCursor） ──
+
+PROD_RDS = "rm-bp15j7wekd5738f093o.mysql.rds.aliyuncs.com"
+
+
+class _FakeCursor:
+    def __init__(self):
+        self.executed = []
+
+    def execute(self, q, *a, **k):
+        self.executed.append(str(q))
+        return 1
+
+    def executemany(self, q, *a, **k):
+        self.executed.append(("many", str(q)))
+        return 2
+
+    def fetchall(self):
+        return [("row",)]
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeConn:
+    def __init__(self):
+        self.cur = _FakeCursor()
+        self.committed = False
+        self.closed = False
+
+    def cursor(self, *a, **k):
+        return self.cur
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        self.closed = True
+
+
+def test_is_write_sql_classification():
+    assert eg.is_write_sql("  INSERT INTO t VALUES (1)")
+    assert eg.is_write_sql("\n   UPDATE document_version SET x=1")
+    assert eg.is_write_sql("-- note\n DELETE FROM chunk_meta")
+    assert eg.is_write_sql("/* c */ REPLACE INTO t VALUES (1)")
+    assert eg.is_write_sql("TRUNCATE TABLE t")
+    assert not eg.is_write_sql("SELECT 1")
+    assert not eg.is_write_sql("  SHOW TABLES")
+    assert not eg.is_write_sql("SET SESSION TRANSACTION READ ONLY")
+
+
+def test_is_write_sql_degenerate_forms():
+    """加固：可执行注释 /*! */（MySQL 真执行）、前导 (/; 退化前缀都要穿透到真实动词。"""
+    # MySQL 可执行注释里的 DML 必须判为写（否则漏守卫）
+    assert eg.is_write_sql("/*!40001 DELETE FROM chunk_meta */")
+    assert eg.is_write_sql("/*! UPDATE t SET x=1 */")
+    # 前导括号/分号穿透：括号写=写，括号读=读（不误伤括号 SELECT）
+    assert eg.is_write_sql("(INSERT INTO t VALUES (1))")
+    assert eg.is_write_sql("; DELETE FROM t")
+    assert not eg.is_write_sql("(SELECT * FROM t) UNION (SELECT * FROM u)")
+    # 惰性块注释（非 /*!）仍按惰性剥离
+    assert not eg.is_write_sql("/* just a SELECT comment */ SELECT 1")
+
+
+def test_ack_today_rejects_empty_op():
+    """_ack_today 拒退化/typo ack（空 op 段），与文档化的 '<op>:<date>' 契约一致。"""
+    today = date.today().isoformat()
+    assert eg._ack_today(f"deactivate_old_chunks:{today}")
+    assert eg._ack_today(f"*:{today}")
+    assert not eg._ack_today(f":{today}")       # 空 op
+    assert not eg._ack_today(f"   :{today}")    # 纯空白 op
+    assert not eg._ack_today(f"anyop:{(date.today() - timedelta(days=1)).isoformat()}")  # 过期
+    assert not eg._ack_today("")
+
+
+def test_guarded_db_query_method_guarded_under_readonly(patch_cfg):
+    """加固：conn.query()（pymysql 底层写口子）在 readonly 下也被拦——堵 __getattr__ 直通。"""
+    patch_cfg(_cfg(readonly=True))
+    fc = _FakeConn()
+    # _FakeConn 需要一个 query 方法供透传
+    fc.query = lambda sql, *a, **k: fc.cur.executed.append(("query", str(sql)))
+    gc = eg.GuardedDBConnection(fc, "localhost")
+    gc.query("SELECT 1")  # 读放行
+    with pytest.raises(DestructiveOpBlocked):
+        gc.query("DELETE FROM chunk_meta")
+    assert all("DELETE" not in str(q) for q in fc.cur.executed)
+
+
+def test_guarded_db_callproc_guarded_under_readonly(patch_cfg):
+    """加固：cursor.callproc()（存储过程可写）在 readonly 下被保守拦截。"""
+    patch_cfg(_cfg(readonly=True))
+    fc = _FakeConn()
+    fc.cur.callproc = lambda name, *a, **k: fc.cur.executed.append(("call", name))
+    gc = eg.GuardedDBConnection(fc, "localhost")
+    cur = gc.cursor()
+    with pytest.raises(DestructiveOpBlocked):
+        cur.callproc("some_writing_proc")
+    assert ("call", "some_writing_proc") not in fc.cur.executed
+
+
+def test_guarded_db_callproc_allowed_in_production(patch_cfg):
+    patch_cfg(_cfg(environment="production"))
+    fc = _FakeConn()
+    fc.cur.callproc = lambda name, *a, **k: fc.cur.executed.append(("call", name))
+    gc = eg.GuardedDBConnection(fc, PROD_RDS)
+    cur = gc.cursor()
+    cur.callproc("some_proc")
+    assert ("call", "some_proc") in fc.cur.executed
+
+
+def test_guarded_db_reads_pass_through(patch_cfg):
+    """读语句直通——serving 的读路径共用同一池，绝不能被拦。"""
+    patch_cfg(_cfg())
+    fc = _FakeConn()
+    gc = eg.GuardedDBConnection(fc, "localhost")
+    with gc.cursor() as cur:
+        cur.execute("SELECT doc_id FROM chunk_meta WHERE is_active=1")
+        assert cur.fetchall() == [("row",)]
+    gc.commit()
+    gc.close()
+    assert fc.cur.executed == ["SELECT doc_id FROM chunk_meta WHERE is_active=1"]
+    assert fc.committed and fc.closed
+
+
+def test_guarded_db_blocks_write_under_readonly(patch_cfg, monkeypatch):
+    """RAG_READONLY=true：裸 cursor 的写被连接层拦下（即便本地 host、即便有 ack）；读仍放行。"""
+    patch_cfg(_cfg(readonly=True))
+    monkeypatch.setenv("RAG_DESTRUCTIVE_PROD_ACK", f"*:{date.today().isoformat()}")
+    fc = _FakeConn()
+    gc = eg.GuardedDBConnection(fc, "localhost")
+    cur = gc.cursor()
+    cur.execute("SELECT 1")  # 读放行
+    with pytest.raises(DestructiveOpBlocked):
+        cur.execute("DELETE FROM chunk_meta WHERE doc_id=%s", ("x",))
+    # 被拦的写从未抵达底层 cursor
+    assert all("DELETE" not in q for q in fc.cur.executed if isinstance(q, str))
+
+
+def test_guarded_db_blocks_dev_to_prod_write_no_ack(patch_cfg, monkeypatch):
+    """development 标签 + 生产 RDS 目标 + 无 ack：裸 cursor 写被拦。"""
+    patch_cfg(_cfg())
+    monkeypatch.delenv("RAG_DESTRUCTIVE_PROD_ACK", raising=False)
+    fc = _FakeConn()
+    gc = eg.GuardedDBConnection(fc, PROD_RDS)
+    cur = gc.cursor()
+    with pytest.raises(DestructiveOpBlocked):
+        cur.execute("UPDATE document_version SET status='x'")
+
+
+def test_guarded_db_allows_writes_in_production(patch_cfg):
+    """environment=production：写放行（DataWorks/SAE 是合法写方），executemany 也过。"""
+    patch_cfg(_cfg(environment="production"))
+    fc = _FakeConn()
+    gc = eg.GuardedDBConnection(fc, PROD_RDS)
+    with gc.cursor() as cur:
+        cur.executemany("INSERT INTO chunk_meta (a) VALUES (%s)", [(1,), (2,)])
+    assert ("many", "INSERT INTO chunk_meta (a) VALUES (%s)") in fc.cur.executed
+
+
+def test_guarded_db_any_ack_satisfies_connection_layer(patch_cfg, monkeypatch):
+    """连接层用 any_ack：节点级 per-op ack（write_chunk_meta:today）也能放行裸 cursor 写，
+    不与节点级显式守卫互相打架。"""
+    patch_cfg(_cfg())
+    monkeypatch.setenv("RAG_DESTRUCTIVE_PROD_ACK",
+                       f"write_chunk_meta:{date.today().isoformat()}")
+    fc = _FakeConn()
+    gc = eg.GuardedDBConnection(fc, PROD_RDS)
+    cur = gc.cursor()
+    cur.execute("DELETE FROM chunk_meta WHERE doc_id=%s", ("x",))  # 不应 raise
+    assert any("DELETE" in q for q in fc.cur.executed if isinstance(q, str))
+
+
+# ── P3: node_register_metadata 显式守卫（与其它写节点对齐） ──
+
+def test_node_register_metadata_explicit_guard_blocks_readonly(patch_cfg):
+    """P3: node_register_metadata 现有显式 assert_destructive_write_allowed('register_metadata', …)
+    —— PROD-RO（RAG_READONLY）会话下在**打开连接之前**就 fail-loud。报错带 op 名
+    'register_metadata' 证明触发的是节点级显式守卫（而非连接层兜底的 'rds_write'）。"""
+    from opensearch_pipeline import pipeline_nodes
+
+    patch_cfg(_cfg(readonly=True))
+    ctx = {"tasks": [{"doc_id": "d1", "version_no": 1}], "simulate_db": False}
+    with pytest.raises(DestructiveOpBlocked, match="register_metadata"):
+        pipeline_nodes.node_register_metadata(ctx)
+
+
+def test_node_register_metadata_blocks_dev_to_prod_no_ack(monkeypatch):
+    """P3: development 标签指向生产 RDS 且无 ack —— register_metadata 在打开连接前被显式守卫拦下
+    （走 dev→prod 分支，op 名证明是节点级显式守卫）。"""
+    from opensearch_pipeline import pipeline_nodes
+
+    cfg = SimpleNamespace(
+        environment="development", readonly=False, simulate_db=False,
+        rds=SimpleNamespace(host=PROD_RDS, database="fuling_knowledge"),
+        alibaba_vector=SimpleNamespace(table_name=""),
+        oss=SimpleNamespace(bucket_name="fuling-knowledge-base"),
+    )
+    monkeypatch.setattr(eg, "get_config", lambda: cfg)
+    monkeypatch.setattr(pipeline_nodes, "get_config", lambda: cfg)
+    monkeypatch.delenv("RAG_DESTRUCTIVE_PROD_ACK", raising=False)
+    ctx = {"tasks": [{"doc_id": "d1", "version_no": 1}], "simulate_db": False}
+    with pytest.raises(DestructiveOpBlocked, match="register_metadata"):
+        pipeline_nodes.node_register_metadata(ctx)
