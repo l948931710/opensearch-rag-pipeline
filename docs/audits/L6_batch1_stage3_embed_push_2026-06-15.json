@@ -1,0 +1,67 @@
+{
+ "step": "batch1_stage3_embed_push",
+ "timestamp": "2026-06-15T22:30+08:00",
+ "scope": "50 docs / 704 new chunks",
+ "manifest_sha256": "dd5721cdd77d892a850a95683d9631d13eb2ca4a6ab76832988ffaadb7ad31b3",
+ "preflight": {
+  "claimable_total": 704,
+  "all_canary_scope": true,
+  "non_batch_claimable": 0,
+  "per_doc_count_type_unchanged": true
+ },
+ "embedding": {
+  "model": "text-embedding-v4",
+  "native_dense_sparse": true,
+  "cache": "cleared",
+  "cache_miss": 704,
+  "success": 704,
+  "failed": 0,
+  "retries": 0,
+  "dense_dim": 1024,
+  "dense_present": 704,
+  "sparse_present": 704
+ },
+ "push": {
+  "table": "fuling_kb_chunks",
+  "batches": 12,
+  "indexed": 704,
+  "failed": 0,
+  "errors": false
+ },
+ "deactivation": {
+  "deactivated_chunks": 0,
+  "ha3_deletes": 0,
+  "note": "node05 no-op (same-version), 50x No-older-chunks"
+ },
+ "verify": {
+  "DIM1_rds": {
+   "INDEXED": 704,
+   "no_indexed_at": 0,
+   "section_gt255": 0,
+   "shangwen": 0
+  },
+  "DIM2_reconcile": {
+   "new_in_ha3": 704,
+   "missing": 0,
+   "old_orphans_pre_purge": 704
+  },
+  "DIM3_sparse": {
+   "nonempty": 704,
+   "of": 704,
+   "pct": 100.0,
+   "zero_fallback": 0
+  },
+  "DIM4_dense": {
+   "dim1024": 704,
+   "of": 704
+  },
+  "DIM4b_self_retrieval": "new chunks self-match score 1.0; rank tied with identical old twin (benign, resolves at purge)"
+ },
+ "not_done": [
+  "old chunk deactivation",
+  "HA3 purge",
+  "range reconcile",
+  "other doc writes"
+ ],
+ "verdict": "PASS — 704 indexed (dense+sparse), missing=0, sparse 100%; old 704 intact; awaiting scoped-purge auth"
+}
