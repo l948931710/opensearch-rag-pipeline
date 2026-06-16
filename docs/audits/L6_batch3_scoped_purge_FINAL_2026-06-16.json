@@ -1,0 +1,53 @@
+{
+ "step": "batch3_scoped_purge_FINAL",
+ "timestamp": "2026-06-16T00:30+08:00",
+ "scope": "delete 1194 old rebuild PKs (batch3, final)",
+ "rollback_snapshot": {
+  "path": "scratch/l6_ab/batch3_rollback_2026-06-16.json",
+  "count": 1194,
+  "sha256": "d0aaddcb630b18b4c6f9b102beb15f6cee462d4d2090c59bc7f6a43387090486",
+  "size_mb": 15.14,
+  "intact_post_purge": true
+ },
+ "pre_delete_gates": {
+  "sha256_ok": true,
+  "delete_count": 1194,
+  "distinct": 1194,
+  "all_in_batch": true,
+  "intersection": 0,
+  "new_indexed": 1194,
+  "new_dense": 1194,
+  "new_sparse": 1194,
+  "ha3_old_set_eq_delete_pks": true,
+  "non_batch": 0,
+  "corpus_drift": 0
+ },
+ "delete": {
+  "method": "explicit int-PK push_documents cmd=delete, 12 batches",
+  "requested": 1194,
+  "deleted": 1194,
+  "failed": 0,
+  "anomaly": 0,
+  "ack": "batch_purge:2026-06-16"
+ },
+ "post_verify": {
+  "parity": "all 117: missing=0 extra=0 Jaccard=1.0",
+  "deleted_still_present": 0,
+  "twins": 0,
+  "D4_orphan": 0,
+  "D7_missing_parent": 0,
+  "shangwen": 0,
+  "section_overflow": 0,
+  "e2e": "dense+sparse+BM25+rerank clean: 0 twin, 0 batch-[上文], no regression",
+  "snapshot_intact": true
+ },
+ "rollout_complete": {
+  "affected_total": 277,
+  "canary": 10,
+  "batch1": 50,
+  "batch2": 100,
+  "batch3": 117,
+  "done": 277
+ },
+ "verdict": "PASS — Batch 3 (117 docs) migrated; 1194 new serving, 1194 old purged. FULL 277-doc L6 rollout COMPLETE."
+}
