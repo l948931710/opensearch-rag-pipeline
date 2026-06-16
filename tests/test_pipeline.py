@@ -592,6 +592,7 @@ class TestDatabaseExceptionPropagation:
             def execute(self, query, params=None): pass
             @property
             def rowcount(self): return 1
+            def fetchall(self): return []  # unfrozen-rechunk guard's chunk_meta probe → no prior chunks
             def __enter__(self): return self
             def __exit__(self, *a): pass
         class MockConn:
@@ -603,8 +604,8 @@ class TestDatabaseExceptionPropagation:
         call_count = {"n": 0}
         def _mock_get_db_conn(**kwargs):
             call_count["n"] += 1
-            if call_count["n"] == 1:
-                return MockConn()  # 预占锁成功
+            if call_count["n"] <= 2:
+                return MockConn()  # call#1 = unfrozen-rechunk guard read, call#2 = content preempt
             raise RuntimeError("Mock RDS fail-safe write failed")
         
         monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", _mock_get_db_conn)
@@ -633,6 +634,7 @@ class TestDatabaseExceptionPropagation:
             def execute(self, query, params=None): pass
             @property
             def rowcount(self): return 1
+            def fetchall(self): return []  # unfrozen-rechunk guard's chunk_meta probe → no prior chunks
             def __enter__(self): return self
             def __exit__(self, *a): pass
         class MockConn:
@@ -644,8 +646,8 @@ class TestDatabaseExceptionPropagation:
         call_count = {"n": 0}
         def _mock_get_db_conn(**kwargs):
             call_count["n"] += 1
-            if call_count["n"] == 1:
-                return MockConn()  # 预占锁成功
+            if call_count["n"] <= 2:
+                return MockConn()  # call#1 = unfrozen-rechunk guard read, call#2 = content preempt
             raise RuntimeError("Mock RDS quarantine write failed")
         
         monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", _mock_get_db_conn)
@@ -680,6 +682,7 @@ class TestDatabaseExceptionPropagation:
             def execute(self, query, params=None): pass
             @property
             def rowcount(self): return 1
+            def fetchall(self): return []  # unfrozen-rechunk guard's chunk_meta probe → no prior chunks
             def __enter__(self): return self
             def __exit__(self, *a): pass
         class MockConn:
@@ -691,8 +694,8 @@ class TestDatabaseExceptionPropagation:
         call_count = {"n": 0}
         def _mock_get_db_conn(**kwargs):
             call_count["n"] += 1
-            if call_count["n"] == 1:
-                return MockConn()  # 预占锁成功
+            if call_count["n"] <= 2:
+                return MockConn()  # call#1 = unfrozen-rechunk guard read, call#2 = content preempt
             raise RuntimeError("Mock RDS persist metadata failed")
         
         monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", _mock_get_db_conn)

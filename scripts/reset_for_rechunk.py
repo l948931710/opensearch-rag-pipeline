@@ -65,6 +65,19 @@ def main():
     if len(rows) > 8:
         print(f"   ... and {len(rows) - 8} more")
 
+    # Doc-set hash for the UNFROZEN re-chunk override token. After this reset the docs keep their
+    # chunk_meta, so a stage-2 run on them WITHOUT a freeze will fail-close at node_classify (it would
+    # re-roll classification and could flip the chunk family). For a normal maintenance re-chunk set
+    # RAG_MAINTENANCE_ROUTING (freeze). Only to DELIBERATELY re-classify (route-v2 family migration)
+    # mint the doc-set-bound token below. This is the EXPECTED hash if the re-chunk run covers exactly
+    # these found docs; the stage-2 guard prints the AUTHORITATIVE hash for whatever it actually loads.
+    from datetime import date
+    from opensearch_pipeline.reindex_states import docset_hash
+    _h = docset_hash(found)
+    print(f"[preview] docset_hash(found)={_h}  "
+          f"(unfrozen-rechunk override, if ever needed: "
+          f"RAG_ALLOW_UNFROZEN_RECHUNK=<op>:{date.today().isoformat()}:{_h})")
+
     if not args.commit:
         print("\n[preview] DRY RUN — re-run with --commit (and PROD_RW_ACK=PROD-RW:<today>) to apply.")
         return

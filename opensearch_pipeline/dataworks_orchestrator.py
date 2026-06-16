@@ -71,6 +71,18 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
         print(f"[Orchestrator] MAINTENANCE re-chunk: frozen routing for "
               f"{len(ctx['frozen_routing'])} docs (LLM classifier disabled)")
 
+    # Deliberate UNFROZEN re-chunk override (route-v2 family migration). node_classify fail-closes
+    # when a re-chunk of an already-chunked doc runs WITHOUT a freeze; this doc-set-bound, same-day
+    # token (<op>:<date>:<docset_hash>) is the explicit escape hatch. Surfaced here for an auditable
+    # run-log banner; the node also reads the env var directly as a fallback. Ignored when a freeze is
+    # set (frozen_routing wins) and under --simulate.
+    _unfreeze_ack = os.environ.get("RAG_ALLOW_UNFROZEN_RECHUNK")
+    if _unfreeze_ack and not simulate:
+        ctx["allow_unfrozen_rechunk"] = _unfreeze_ack
+        print("[Orchestrator] ⚠️ UNFROZEN re-chunk override present "
+              "(RAG_ALLOW_UNFROZEN_RECHUNK set) — classifier WILL re-roll category for re-chunked "
+              "docs whose doc-set hash matches the token")
+
     if stage == 1:
         # ══ Stage 1 运行 ══
         dag = build_dag1_raw_to_canonical()

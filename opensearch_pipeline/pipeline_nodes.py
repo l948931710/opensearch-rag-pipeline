@@ -1173,6 +1173,89 @@ def run_gemini_classification(text: str, model_name: str, api_key: str, api_base
         return json.loads(cleaned_content)
 
 
+def _docs_with_existing_chunks(canonicals):
+    """Return this run's (doc_id, version_no) targets that ALREADY have chunk_meta rows.
+
+    A *current-version* target that already has chunks means this is a **re-chunk** of an
+    already-chunked doc — ``reset_for_rechunk.py`` keeps chunk_meta intact (it only flips
+    document_version statuses), so the old chunks survive until ``node_write_chunk_meta``'s
+    full-replace. A *first ingest* or a *version bump* (new version_no) has no rows for its exact
+    (doc_id, version_no), so it is never flagged. The unfrozen-rechunk guard uses this to refuse a
+    re-chunk that re-rolls classification (the PRODUCTION_14DFDF 79-vs-47 family flip).
+
+    FAIL CLOSED: an un-verifiable guard must block, never fall through. On a DB error we retry once
+    (mirroring the classify preempt loop) and then **raise** — we never return [] on error.
+    """
+    import time as _t
+
+    pairs = [(d["doc_id"], d["version_no"]) for d in canonicals
+             if d.get("doc_id") and d.get("version_no") is not None]
+    if not pairs:
+        return []
+    clause = " OR ".join(["(doc_id=%s AND version_no=%s)"] * len(pairs))
+    params = tuple(p for pr in pairs for p in pr)
+    last_err = None
+    for _attempt in range(2):  # initial + 1 retry, like the content-preempt loop
+        conn = None
+        try:
+            conn = _get_db_conn(select_db=True)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT DISTINCT doc_id, version_no FROM chunk_meta WHERE {clause}", params)
+                rows = cur.fetchall()
+            out = []
+            for r in (rows or []):
+                if isinstance(r, dict):
+                    out.append((r["doc_id"], r["version_no"]))
+                else:
+                    out.append((r[0], r[1]))
+            return out
+        except Exception as e:  # noqa: BLE001 — any failure must fail closed
+            last_err = e
+            if _attempt == 0:
+                _t.sleep(2)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RuntimeError(
+        f"unfrozen re-chunk guard could not verify chunk_meta (DB error after retry): {last_err} "
+        f"— refusing to proceed (fail closed). Set RAG_SIMULATE_DB=true for local runs, or fix RDS "
+        f"connectivity; never bypass this check on an error.")
+
+
+def _unfrozen_rechunk_acked(ctx, prior) -> bool:
+    """True iff a valid same-day, **doc-set-bound** override authorizes this unfrozen re-chunk.
+
+    Token (``ctx['allow_unfrozen_rechunk']`` or env ``RAG_ALLOW_UNFROZEN_RECHUNK``):
+    ``<op>:<YYYY-MM-DD>:<docset_hash>`` — op non-empty, date == today (mirrors the
+    ``RAG_DESTRUCTIVE_PROD_ACK`` same-day rule in env_guard), and docset_hash == the hash recomputed for
+    THIS run's flagged doc-set. A stale date, malformed token, or a hash minted for a *different*
+    doc-set does NOT satisfy the guard. The computed hash is always logged (accepted or not), so every
+    override attempt is auditable.
+    """
+    from datetime import date as _date
+
+    from opensearch_pipeline.reindex_states import docset_hash
+
+    expected = docset_hash(d for d, _ in prior)
+    tok = (ctx.get("allow_unfrozen_rechunk")
+           or os.environ.get("RAG_ALLOW_UNFROZEN_RECHUNK", ""))
+    parts = tok.split(":")
+    ok = (len(parts) == 3 and parts[0].strip()
+          and parts[1] == _date.today().isoformat()
+          and parts[2] == expected)
+    if ok:
+        print(f"    !! [UNFROZEN-RECHUNK OVERRIDE] accepted docset_hash={expected} token={tok} "
+              f"— classifier WILL re-roll category for {len(prior)} re-chunked doc(s)")
+    else:
+        print(f"    [unfrozen-rechunk] docset_hash={expected} ack=absent/invalid "
+              f"(need RAG_ALLOW_UNFROZEN_RECHUNK=<op>:{_date.today().isoformat()}:{expected})")
+    return bool(ok)
+
+
 def node_classify_and_risk_assess(ctx: dict):
     """
     文档分类 + 风险评估（合并节点，单次 LLM 调用）。
@@ -1204,6 +1287,30 @@ def node_classify_and_risk_assess(ctx: dict):
             raise RuntimeError(
                 f"maintenance re-chunk: frozen routing missing category_l1 for {len(_bad)} doc(s) "
                 f"{_bad[:5]} — fail closed, NO reclassification and NO write")
+    elif not simulate_db:
+        # ── Unfrozen re-chunk guard (fail closed, WHOLE-BATCH, pre-preempt) ──
+        # (2026-06-16) A current-version target that already has chunk_meta rows is a RE-CHUNK of an
+        # already-chunked doc (reset_for_rechunk keeps chunk_meta), NOT a first ingest or version bump.
+        # Re-running the LLM classifier here re-rolls category_l1/l2 → flips chunk mode → flips the
+        # chunk family run-to-run (the PRODUCTION_14DFDF 79-vs-47 incident, fixed for the maintenance
+        # path by RAG_MAINTENANCE_ROUTING). The daily pipeline never re-claims a served doc, so this
+        # only fires on a deliberate reset→re-chunk that FORGOT to freeze. Require either a freeze
+        # (frozen_routing, handled above) or a deliberate doc-set-bound same-day override. Block the
+        # WHOLE run if ANY target qualifies (mixed fresh+re-chunk batch = ambiguous intent → stop and
+        # force an explicit choice). Runs BEFORE the preempt UPDATE so nothing is stranded in PROCESSING.
+        _prior = _docs_with_existing_chunks(canonicals)
+        if _prior and not _unfrozen_rechunk_acked(ctx, _prior):
+            from datetime import date as _date
+
+            from opensearch_pipeline.reindex_states import docset_hash
+            _h = docset_hash(d for d, _ in _prior)
+            raise RuntimeError(
+                f"unfrozen re-chunk blocked: {len(_prior)} target doc(s) already have chunks for their "
+                f"current (doc_id,version_no), e.g. {_prior[:3]}, but no frozen routing is set. "
+                f"Re-running the LLM classifier would re-roll category->chunk mode and can flip the "
+                f"chunk family (the 79-vs-47 incident). For a maintenance re-chunk, set "
+                f"RAG_MAINTENANCE_ROUTING=<manifest>. To DELIBERATELY re-classify (route-v2 family "
+                f"migration), set RAG_ALLOW_UNFROZEN_RECHUNK=<op>:{_date.today().isoformat()}:{_h}")
 
     if not simulate_db:
         conn = None
