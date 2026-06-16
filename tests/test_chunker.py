@@ -376,6 +376,89 @@ class TestRowCardContextEnrichment:
         assert not text_chunks[0].chunk_text.startswith("【设备A】")
 
 
+class TestClauseNumberingStyles:
+    """L6 clause-routing fix (2026-06-15): `_CLAUSE_RE` 放宽以覆盖真实制度编号。
+
+    依据 docs/audits/clause_routing_inconsistency_scope_2026-06-15.md。
+    旧 regex 漏掉 `1.目的` / `3.1公司办`（无尾空格）/ `A、` 顿号子项，导致 ~47% 制度文档
+    clause 模式空命中 → 静默降级 text_chunk。下列用例锁定修复后的边界检测行为，并守卫
+    `2.5kg` 类带单位测量值不被误切。
+    """
+
+    def _clause_chunker(self):
+        return DocumentChunker(
+            max_chunk_chars=500, min_chunk_chars=10, overlap_chars=0, split_mode="clause"
+        )
+
+    def test_forklift_style_numbering_produces_clause_chunks(self):
+        """叉车制度编号风格：`1.目的` / `3.1公司办` / `4.1.1检查`（编号后无空格）应切成 clause_chunk。"""
+        blocks = [
+            ExtractedBlock(block_type="paragraph",
+                           text="1.目的 规范叉车的安全使用与管理，防止安全事故发生，保障人员设备安全。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="2.适用范围 适用于公司内部所有叉车的操作、维护及相关管理活动。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="3.1公司办公区域及车间内叉车行驶速度不得超过每小时五公里。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="4.1.1检查 每日作业前应检查叉车制动、灯光、喇叭及液压系统是否正常。"),
+        ]
+        chunks = self._clause_chunker().chunk_from_blocks(blocks, "DOC_FORKLIFT", 1)
+        clause_chunks = [c for c in chunks if c.chunk_type == "clause_chunk"]
+        # 修复前：0 匹配 → 全部降级 text_chunk；修复后：成为 clause_chunk
+        assert clause_chunks, "叉车编号风格应被识别为条款，而非降级 text_chunk"
+        assert all(c.chunk_type != "text_chunk" for c in chunks), "不应再出现 text 降级"
+        # 各级编号都被当作边界（内容完整保留）
+        joined = "\n".join(c.chunk_text for c in clause_chunks)
+        assert "3.1公司办公区域" in joined and "4.1.1检查" in joined
+
+    def test_smoking_style_numbering_produces_clause_chunks(self):
+        """吸烟制度编号风格：`3.1` / `4.1` 小数级 + `A、` 字母顿号子项应切成 clause_chunk。"""
+        blocks = [
+            ExtractedBlock(block_type="paragraph",
+                           text="3.1厂区内除指定吸烟区外，其余区域一律禁止吸烟，违者按规定处罚。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="4.1指定吸烟区应设置明显标识，并配备烟灰缸及灭火设施以防火灾。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="A、禁止在生产车间、仓库及易燃易爆场所内吸烟，一经发现严肃处理。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="B、员工应自觉遵守本制度并相互监督，共同维护厂区消防安全。"),
+        ]
+        chunks = self._clause_chunker().chunk_from_blocks(blocks, "DOC_SMOKING", 1)
+        clause_chunks = [c for c in chunks if c.chunk_type == "clause_chunk"]
+        assert clause_chunks, "吸烟编号风格（3.1/A、）应被识别为条款"
+        assert all(c.chunk_type != "text_chunk" for c in chunks)
+        joined = "\n".join(c.chunk_text for c in clause_chunks)
+        assert "A、" in joined and "B、" in joined
+
+    def test_single_level_arabic_dot_is_a_boundary(self):
+        """单级 `1.` / `2.` 阿拉伯点号（小数守卫）应作为条款边界。"""
+        blocks = [
+            ExtractedBlock(block_type="paragraph",
+                           text="1.目的 明确本制度的编制目的与适用前提，统一管理口径。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="2.适用范围 适用于全体在岗员工及外部相关方的日常行为规范。"),
+        ]
+        chunks = self._clause_chunker().chunk_from_blocks(blocks, "DOC_SINGLE_DOT", 1)
+        assert [c for c in chunks if c.chunk_type == "clause_chunk"]
+        assert all(c.chunk_type != "text_chunk" for c in chunks)
+
+    def test_decimal_measurement_does_not_split(self):
+        """小数误切守卫：行首 `2.5kg` / `3.5cm` 等带单位测量值不得被当成 `3.1` 式条款编号。
+
+        纯测量值文档无真实条款编号 → 应回退 text_chunk，而不是被 2.5/3.5 误切为 clause_chunk。
+        这同时验证多级小数 alt 的 `(?![A-Za-z])` 单位负向先行守卫。
+        """
+        blocks = [
+            ExtractedBlock(block_type="paragraph",
+                           text="2.5kg 是本产品的标准净重，每箱包装二十个，整托一百二十箱。"),
+            ExtractedBlock(block_type="paragraph",
+                           text="3.5cm 为杯口直径，杯身高度约九厘米，容量约二百五十毫升。"),
+        ]
+        chunks = self._clause_chunker().chunk_from_blocks(blocks, "DOC_MEASURE", 1)
+        assert all(c.chunk_type != "clause_chunk" for c in chunks), "测量值不得被误识别为条款"
+        assert any(c.chunk_type == "text_chunk" for c in chunks), "应回退为 text_chunk"
+
+
 class TestClauseInterClauseOverlap:
     """Fix A (2026-06-15 L6 A/B): clause 模式不再生成 `[上文]` 跨条款面包屑。
 
