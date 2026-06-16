@@ -908,6 +908,28 @@ def main():
     config = get_config()
     config.simulate = False
     config.simulate_api = True
+
+    # ── 生产安全总闸 ──────────────────────────────────────────────────────────
+    # 本脚本经真实 _get_db_conn 跑【无 WHERE 整表】DELETE/UPDATE（document_version /
+    # chunk_meta / document_sensitive_finding），与 2026-06-13 整表误清同形。simulate 已被
+    # 上面强制关闭，故只允许对本地 dev 栈运行；解析到非本地/生产指纹（含 staging，与生产同
+    # 物理实例）立即硬失败。如需远端只读评测，请改用 prod_access 只读路径或只读评测脚本。
+    from opensearch_pipeline.config import _LOCAL_HOSTS, is_prod_target
+    _rds_h = config.rds.host
+    _ha3_e = getattr(getattr(config, "alibaba_vector", None), "endpoint", "") or ""
+    _violations = []
+    if _rds_h not in _LOCAL_HOSTS or is_prod_target("rds", _rds_h):
+        _violations.append(f"RDS host={_rds_h!r}")
+    if is_prod_target("search", _ha3_e):
+        _violations.append(f"HA3 endpoint={_ha3_e!r}")
+    if _violations:
+        raise SystemExit(
+            "[PROD-GUARD] 拒绝运行 evaluate_large_corpus.py：含无 WHERE 整表破坏性 DML，"
+            "只允许对本地 dev 栈执行。命中非本地/生产目标 → " + "; ".join(_violations)
+            + "。请用本地 MySQL/OpenSearch，或改用只读评测脚本。"
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     client = _get_opensearch_client()
     
     base_dir = "/Users/laijunchen/fuling_raw_for_chunk_test"

@@ -59,6 +59,39 @@ class TestDocxHeadingDetection:
         assert _detect_heading_level("Title", "文档标题") == 1
         assert _detect_heading_level("Subtitle", "副标题") == 2
 
+    def test_subtitle_clause_body_demoted(self):
+        """回归：制度文档把正文段落滥用 Subtitle/标题样式时，内容像正文/条款句的
+        块必须回落为 paragraph（None），否则 clause 切块会把正文当 section_label
+        丢弃。实证 it_IT信息系统内控制度.docx：62 块里 48 块被 Subtitle 误判 heading，
+        82% 正文 collapse，gt_eval recall 0.30。形状取自该文档真实块。"""
+        # 平铺阿拉伯枚举条款项（"N）"/"N)"/"N、"）→ 正文，即便短、无句末标点
+        assert _detect_heading_level("Subtitle", "1)\t申请：业务部门用户填写申请表并注明所需的权限") is None
+        assert _detect_heading_level(
+            "Subtitle", "4）定期开展备份恢复性测试，记录和保存备份恢复性测试的结果。"
+        ) is None
+        assert _detect_heading_level("Subtitle", "1、目的") is None
+        # 短句但以句末标点收尾 → 正文
+        assert _detect_heading_level("Subtitle", "以上审批流程通过钉钉申请、审批、记录。") is None
+        # 过长整句 → 正文（以分号收尾）
+        assert _detect_heading_level(
+            "Subtitle", "变更需求申请：由业务部门关键用户或信息部门内部提出，变更需求的提出需要妥善记录；"
+        ) is None
+        # 同样的复核也作用于真 Heading 样式被滥用于正文的情况
+        assert _detect_heading_level(
+            "Heading 2", "本流程适用于机房、用友U8系统、金蝶KIS系统的逻辑访问管理流程。"
+        ) is None
+        # 圈数字标注 callout 在样式路径同样被否决（与 schema.is_pseudo_heading 同口径）
+        assert _detect_heading_level("Subtitle", "⑤双击图标") is None
+
+    def test_subtitle_genuine_heading_kept(self):
+        """回归对照：真正的短章节/子标题在 Subtitle 样式下仍保留为 heading —— veto
+        不能误伤合法标题。点分层级号（5.1）属子标题，绝不可被阿拉伯枚举规则误判。"""
+        assert _detect_heading_level("Subtitle", "二、逻辑访问管理") == 2
+        assert _detect_heading_level("Subtitle", "三、IT运维管理流程") == 2
+        assert _detect_heading_level("Subtitle", "5.1 系统账号申请流程") == 2
+        assert _detect_heading_level("Subtitle", "5.4用户权限审阅工作流程") == 2
+        assert _detect_heading_level("Subtitle", "1目的") == 2  # 无分隔符的短标签，保留
+
     def test_case_insensitive_heading_detection(self):
         """样式名包含 'heading' 但大小写不同时仍能识别。"""
         assert _detect_heading_level("heading 1", "abc") == 1
@@ -183,6 +216,46 @@ class TestDocxExtractorRealFile:
             assert headings[0].text == "文档标题"
             assert headings[1].level == 2
             assert len(paragraphs) >= 2
+        finally:
+            os.remove(path)
+
+    def test_subtitle_styled_clause_doc_not_collapsed(self):
+        """回归（端到端）：制度文档把条款正文滥用 Subtitle 样式时，正文不得被吞成
+        heading。复现 it_IT信息系统内控制度.docx 形状——真章节标题用 Subtitle，
+        条款正文也用 Subtitle。修复前 48/62 块被误判 heading、82% 正文丢失。"""
+        import docx
+        doc = docx.Document()
+        # 真标题（短、无句末标点）—— 应保留 heading
+        doc.add_paragraph("二、逻辑访问管理", style="Subtitle")
+        doc.add_paragraph("5.1 系统账号申请流程", style="Subtitle")
+        # 条款正文（同样误用 Subtitle）—— 必须回落 paragraph 才能进切块正文
+        clause_bodies = [
+            "1)\t申请：业务部门用户填写申请表并注明所需的权限",
+            "2)\t审批：由相关业务部门的负责人确认申请权限与岗位职责相符并在申请表中签字审批。",
+            "4）定期开展备份恢复性测试，记录和保存备份恢复性测试的结果。",
+            "以上审批流程通过钉钉申请、审批、记录。",
+        ]
+        for t in clause_bodies:
+            doc.add_paragraph(t, style="Subtitle")
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        doc.save(path)
+        try:
+            blocks, _ = extract_docx(path)
+            headings = [b for b in blocks if b.block_type == "heading"]
+            paragraphs = [b for b in blocks if b.block_type == "paragraph"]
+            head_texts = {b.text for b in headings}
+            para_texts = {b.text for b in paragraphs}
+            # 真标题保留
+            assert "二、逻辑访问管理" in head_texts
+            assert "5.1 系统账号申请流程" in head_texts
+            # 每条条款正文都进了 paragraph（即正文未丢失）
+            for t in clause_bodies:
+                assert t in para_texts, f"条款正文被误吞为 heading: {t!r}"
+            # 正文字符占比应占多数（防 82% collapse 回归）
+            body_chars = sum(len(b.text) for b in paragraphs)
+            head_chars = sum(len(b.text) for b in headings)
+            assert body_chars > head_chars
         finally:
             os.remove(path)
 

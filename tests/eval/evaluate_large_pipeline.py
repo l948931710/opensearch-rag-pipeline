@@ -245,6 +245,27 @@ def evaluate_retrieval_large(client, index_name: str, query_vectors: List[List[f
 def main():
     config = get_config()
     config.simulate = False
+
+    # ── 生产安全总闸 ──────────────────────────────────────────────────────────
+    # 本脚本经真实 _get_db_conn 跑全链 ingest（含 node_register_metadata 等写节点）。
+    # simulate 已被上面强制关闭，故只允许对本地 dev 栈运行；解析到非本地/生产指纹（含
+    # staging，与生产同物理实例）立即硬失败，杜绝任何测试/评测脚本无守卫地写生产。
+    from opensearch_pipeline.config import _LOCAL_HOSTS, is_prod_target
+    _rds_h = config.rds.host
+    _ha3_e = getattr(getattr(config, "alibaba_vector", None), "endpoint", "") or ""
+    _violations = []
+    if _rds_h not in _LOCAL_HOSTS or is_prod_target("rds", _rds_h):
+        _violations.append(f"RDS host={_rds_h!r}")
+    if is_prod_target("search", _ha3_e):
+        _violations.append(f"HA3 endpoint={_ha3_e!r}")
+    if _violations:
+        raise SystemExit(
+            "[PROD-GUARD] 拒绝运行 evaluate_large_pipeline.py：含真实 ingest 写路径，"
+            "只允许对本地 dev 栈执行。命中非本地/生产目标 → " + "; ".join(_violations)
+            + "。请用本地 MySQL/OpenSearch，或改用只读评测脚本。"
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     client = _get_opensearch_client()
     
     base_dir = "/Users/laijunchen/Downloads/opensearch-rag-pipeline"

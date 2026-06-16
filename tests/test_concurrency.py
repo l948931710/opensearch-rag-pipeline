@@ -16,8 +16,16 @@ from unittest.mock import patch
 def _get_real_db_conn():
     """获取真实 MySQL 连接（非连接池），用于并发隔离测试。"""
     import pymysql
-    from opensearch_pipeline.config import get_config
+    from opensearch_pipeline.config import _LOCAL_HOSTS, get_config, is_prod_target
     config = get_config()
+    # 安全闸：本测试跑真实 DELETE/INSERT/UPDATE，绕过 _get_db_conn chokepoint 自建连接，
+    # 故在此 host-pin——只允许本地 dev 栈，杜绝 RAG_ENV=prod_ro/staging/production 时把
+    # 并发写打到生产 RDS。命中即 raise → _db_available() 捕获 → skipif_no_db 整体 skip。
+    if config.rds.host not in _LOCAL_HOSTS or is_prod_target("rds", config.rds.host):
+        raise RuntimeError(
+            f"[PROD-GUARD] test_concurrency 仅允许本地 MySQL；解析到 host "
+            f"{config.rds.host!r}（非本地/命中生产指纹），拒绝连接。"
+        )
     return pymysql.connect(
         host=config.rds.host,
         port=config.rds.port,
