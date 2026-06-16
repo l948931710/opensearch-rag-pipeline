@@ -1,0 +1,45 @@
+{
+ "step": "batch2_scoped_purge",
+ "timestamp": "2026-06-15T23:45+08:00",
+ "scope": "delete 920 old rebuild PKs (batch2)",
+ "rollback_snapshot": {
+  "path": "scratch/l6_ab/batch2_rollback_2026-06-15T2330.json",
+  "count": 920,
+  "sha256": "d2ffbccdee3c1afcf5366cf3e279e178a1ce70f60404c534acaa4acaa1f9dc20",
+  "size_mb": 11.68,
+  "intact_post_purge": true
+ },
+ "pre_delete_gates": {
+  "sha256_ok": true,
+  "delete_count": 920,
+  "distinct": 920,
+  "all_in_batch": true,
+  "intersection_with_chunk_meta": 0,
+  "new_indexed": 920,
+  "new_dense": 920,
+  "new_sparse": 920,
+  "ha3_old_set_eq_delete_pks": true,
+  "non_batch": 0,
+  "corpus_drift": 0
+ },
+ "delete": {
+  "method": "explicit int-PK push_documents cmd=delete, 10 batches",
+  "requested": 920,
+  "deleted": 920,
+  "failed": 0,
+  "anomaly": 0,
+  "ack": "batch_purge:2026-06-15"
+ },
+ "post_verify": {
+  "parity": "all 100: missing=0 extra=0 Jaccard=1.0",
+  "deleted_still_present": 0,
+  "twins": 0,
+  "D4_orphan": 0,
+  "D7_missing_parent": 0,
+  "shangwen": 0,
+  "section_overflow": 0,
+  "e2e": "dense+sparse+BM25+rerank clean: 0 twin, 0 batch-[上文]; targets top (急救0.876/维卡0.956/成本0.735/外来0.941)",
+  "snapshot_intact": true
+ },
+ "verdict": "PASS — Batch 2 (100 docs) fully migrated; 920 new serving, 920 old purged, parity=1.0"
+}
