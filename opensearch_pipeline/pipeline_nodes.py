@@ -1131,6 +1131,21 @@ def node_classify_and_risk_assess(ctx: dict):
     simulate_db = _resolve_simulate(ctx, "db")
     valid_canonicals = []
 
+    # ── maintenance re-chunk: freeze the existing classification, NEVER call the LLM classifier ──
+    # (2026-06-15) Re-running the LLM classifier on a re-chunk re-rolls category_l1/l2, which drives
+    # chunk-strategy routing (faq/clause/step/text) — observed flipping a doc's family run-to-run
+    # (e.g. sop->step vs standard->clause). For a maintenance re-chunk (apply chunker text fixes only),
+    # reuse the frozen category so routing is deterministic and the chunk family is preserved.
+    # FAIL CLOSED before any write: every target doc must carry a frozen category_l1.
+    frozen_routing = ctx.get("frozen_routing")
+    if frozen_routing is not None:
+        _bad = [d["doc_id"] for d in canonicals
+                if not (frozen_routing.get(d["doc_id"]) or {}).get("category_l1")]
+        if _bad:
+            raise RuntimeError(
+                f"maintenance re-chunk: frozen routing missing category_l1 for {len(_bad)} doc(s) "
+                f"{_bad[:5]} — fail closed, NO reclassification and NO write")
+
     if not simulate_db:
         conn = None
         _preempt_max_retries = 1
@@ -1207,6 +1222,37 @@ def node_classify_and_risk_assess(ctx: dict):
         kb_type = "public" if permission_level == "public" else "private"
         doc["permission_level"] = permission_level
         doc["kb_type"] = kb_type
+
+        # 1.5 maintenance re-chunk：复用冻结分类，绝不调用 LLM classifier（presence 已由上方 fail-closed 保证）
+        if frozen_routing is not None:
+            fr = frozen_routing[doc["doc_id"]]
+            doc["category_l1"] = fr["category_l1"]
+            doc["category_l2"] = fr.get("category_l2") or "others"
+            doc["owner_dept"] = doc.get("owner_dept") or "unknown"
+            doc["faq_eligible"] = False
+            doc["confidence"] = 1.0
+            doc["summary"] = doc.get("summary") or text[:120]
+            doc["llm_risk_level"] = "low"
+            doc["risk_level"] = "low"
+            doc["classification_status"] = "FROZEN_MAINTENANCE"
+            if not simulate_db:
+                _cm = None
+                try:
+                    _cm = _get_db_conn(select_db=True)
+                    with _cm.cursor() as _cur:
+                        _cur.execute(
+                            "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s "
+                            "WHERE doc_id=%s",
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]))
+                        _cur.execute(
+                            "UPDATE document_version SET classification_method='FROZEN_MAINTENANCE', "
+                            "classification_status='CONTENT_CLASSIFIED' WHERE doc_id=%s AND version_no=%s",
+                            (doc["doc_id"], doc["version_no"]))
+                        _cm.commit()
+                finally:
+                    if _cm:
+                        _cm.close()
+            return True
 
         # 2. 分类与风险评估
         classification = None

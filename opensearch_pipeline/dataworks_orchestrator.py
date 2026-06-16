@@ -59,6 +59,18 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
         "cost_breaker": cost_breaker,  # 注入抽取节点 → UnifiedExtractor.cost_breaker
     }
 
+    # Maintenance re-chunk: freeze classification/routing (no LLM classifier). When
+    # RAG_MAINTENANCE_ROUTING points at a frozen-routing manifest, node_classify reuses each doc's
+    # frozen category_l1/l2 (deterministic routing, chunk family preserved) and fails closed on any
+    # missing entry. Absent the env var, ingestion behaves exactly as before (normal LLM classify).
+    _maint_path = os.environ.get("RAG_MAINTENANCE_ROUTING")
+    if _maint_path and not simulate:
+        import json as _json
+        with open(_maint_path, encoding="utf-8") as _mf:
+            ctx["frozen_routing"] = _json.load(_mf)
+        print(f"[Orchestrator] MAINTENANCE re-chunk: frozen routing for "
+              f"{len(ctx['frozen_routing'])} docs (LLM classifier disabled)")
+
     if stage == 1:
         # ══ Stage 1 运行 ══
         dag = build_dag1_raw_to_canonical()
