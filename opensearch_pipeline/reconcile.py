@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BUCKET = 500
 _HI_HEADROOM = 1000  # scan past max(rds.id) so freshly-pushed-but-unrecorded rows still surface
+_OSS_IMAGE_PREFIX = "processing/assets/"  # where active-chunk image_refs[].oss_key live
 
 
 def compute_parity(rds_rows: List[Dict[str, Any]],
@@ -187,6 +188,150 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
     return report
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CS4 — OSS↔RDS image-object parity (the third store)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def collect_referenced_image_keys(rds_rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Parse active chunks' extra_json image_refs[].oss_key → {oss_key: sample_chunk_id}.
+
+    Only is_active=1 rows count — an inactive chunk's image being absent is not a serving defect.
+    Fail-open per row: a malformed extra_json is skipped, not fatal.
+    """
+    import json
+    out: Dict[str, str] = {}
+    for r in rds_rows:
+        if r.get("is_active") != 1:
+            continue
+        raw = r.get("extra_json")
+        if not raw or "oss_key" not in raw:
+            continue
+        try:
+            ej = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:  # noqa: BLE001
+            continue
+        refs = ej.get("image_refs") if isinstance(ej, dict) else None
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if isinstance(ref, dict):
+                k = ref.get("oss_key")
+                if k and k not in out:
+                    out[k] = r.get("chunk_id", "")
+    return out
+
+
+def compute_oss_parity(referenced: Dict[str, str], present: set, *,
+                       verify_fn=None) -> Dict[str, Any]:
+    """OSS parity diff. Pure when verify_fn is None.
+
+    Args:
+        referenced: {oss_key: sample_chunk_id} that active chunks point at (ANY prefix).
+        present: set of oss_keys actually listed in OSS under the image prefix.
+        verify_fn: optional callable(key)->bool returning True iff the object EXISTS. CRITICAL:
+            `present` only covers the listed prefix, so a referenced key under a DIFFERENT prefix
+            (e.g. raw/marketing/*.jpg vs processing/assets/*) would be a FALSE 'missing' on the raw
+            set-diff. When verify_fn is given, each set-diff candidate is HEAD-checked and kept only
+            if it truly does NOT exist. Without verify_fn this returns the raw candidates (unit tests).
+
+    `ok` is True iff no referenced key is truly missing from OSS (broken-image / serving defect).
+    Orphan OSS objects (present but unreferenced) are storage bloat — reported, do NOT fail ok.
+    """
+    ref_keys = set(referenced)
+    candidates = sorted(ref_keys - present)
+    if verify_fn is not None:
+        missing = [k for k in candidates if not verify_fn(k)]
+    else:
+        missing = candidates
+    orphan = sorted(present - ref_keys)
+    return {
+        "ok": not missing,
+        "counts": {
+            "referenced": len(ref_keys),
+            "present": len(present),
+            "candidates_offprefix": len(candidates) - len(missing) if verify_fn else 0,
+            "missing": len(missing),
+            "orphan": len(orphan),
+        },
+        "missing": [{"oss_key": k, "chunk_id": referenced.get(k, "")} for k in missing[:50]],
+        "orphan_sample": orphan[:50],
+    }
+
+
+def _list_oss_keys(bucket, prefix: str = _OSS_IMAGE_PREFIX) -> set:
+    """Paginated read-only ListObjects under prefix → set of object keys."""
+    import oss2
+    keys = set()
+    for obj in oss2.ObjectIterator(bucket, prefix=prefix):
+        keys.add(obj.key)
+    return keys
+
+
+def run_oss_parity_check(*, alert: bool = False,
+                         prefix: str = _OSS_IMAGE_PREFIX) -> Dict[str, Any]:
+    """CS4: read active-chunk image keys (RDS, read-only) + list OSS image objects + diff.
+    Read-only (prod_access read-only bucket blocks all writes), simulate-safe, fail-open.
+    """
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+
+    if cfg.simulate or cfg.simulate_db:
+        logger.info("reconcile(oss): simulate mode → skipped no-op")
+        return {"ok": True, "skipped": "simulate", "complete": True, "counts": {}}
+
+    try:
+        from opensearch_pipeline.prod_access import get_prod_oss_bucket, get_prod_readonly_conn
+
+        conn = get_prod_readonly_conn()
+        try:
+            with conn.cursor() as c:
+                c.execute("""SELECT chunk_id, is_active, extra_json
+                             FROM fuling_knowledge.chunk_meta
+                             WHERE is_active=1 AND extra_json LIKE %s""", ("%oss_key%",))
+                rds_rows = list(c.fetchall())
+        finally:
+            conn.close()
+
+        referenced = collect_referenced_image_keys(rds_rows)
+        bucket = get_prod_oss_bucket()
+        present = _list_oss_keys(bucket, prefix)
+
+        # HEAD-verify candidates so a referenced key under a different prefix (e.g. raw/*) is not a
+        # false 'missing'; only objects that truly don't exist count. object_exists is read-only.
+        def _exists(k):
+            try:
+                return bool(bucket.object_exists(k))
+            except Exception:  # noqa: BLE001 — treat HEAD error conservatively as "exists" (no false alarm)
+                return True
+
+        report = compute_oss_parity(referenced, present, verify_fn=_exists)
+        report["complete"] = True
+        report["prefix"] = prefix
+    except Exception as e:  # noqa: BLE001 — fail-open by contract
+        logger.exception("reconcile(oss): parity check failed")
+        report = {"ok": False, "complete": False, "error": f"{type(e).__name__}: {e}", "counts": {}}
+
+    if alert and (not report.get("ok") or report.get("error")):
+        _alert_on_oss_drift(report)
+    return report
+
+
+def _alert_on_oss_drift(report: Dict[str, Any]) -> None:
+    """Fire one OBS-4 ops alert summarizing OSS image-object drift (fail-open)."""
+    try:
+        from opensearch_pipeline.alerting import send_ops_alert
+        c = report.get("counts", {})
+        if report.get("error"):
+            text = f"OSS parity check errored: {report['error']}"
+        else:
+            text = (f"active-chunk image oss_keys missing from OSS: **{c.get('missing', 0)}** "
+                    f"(broken images); orphan OSS objects: {c.get('orphan', 0)}")
+        send_ops_alert("OSS↔RDS image parity drift", text, severity="critical",
+                       dedup_key="reconcile:oss-rds-parity")
+    except Exception:  # noqa: BLE001
+        logger.warning("reconcile(oss): ops-alert dispatch failed (non-fatal)", exc_info=True)
+
+
 def _alert_on_drift(report: Dict[str, Any]) -> None:
     """Fire one OBS-4 ops alert summarizing recall-loss drift (fail-open)."""
     try:
@@ -205,42 +350,79 @@ def _alert_on_drift(report: Dict[str, Any]) -> None:
         logger.warning("reconcile: ops-alert dispatch failed (non-fatal)", exc_info=True)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """CLI. Exit 0 = parity OK (or simulate-skipped); 2 = drift; 3 = error/incomplete."""
-    import argparse
-    import json
-
-    ap = argparse.ArgumentParser(description="CS3 read-only RDS↔HA3 parity reconciler")
-    ap.add_argument("--alert", action="store_true", help="fire an OBS-4 ops alert on drift/error")
-    ap.add_argument("--json", action="store_true", help="emit the full report as JSON")
-    ap.add_argument("--hi", type=int, default=None, help="override HA3 PK scan upper bound")
-    args = ap.parse_args(argv)
-
-    report = run_parity_check(alert=args.alert, hi=args.hi)
-    if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
-    else:
-        if report.get("skipped"):
-            print(f"[reconcile] skipped ({report['skipped']})")
-            return 0
-        c = report.get("counts", {})
-        print(f"[reconcile] ok={report.get('ok')} complete={report.get('complete')}")
-        print(f"  RDS rows={c.get('rds_rows')} active={c.get('rds_active')} "
-              f"active_indexed={c.get('rds_active_indexed')} | HA3 pks={c.get('ha3_pks')}")
-        print(f"  ⚠️ RDS-active MISSING from HA3 = {c.get('rds_active_missing')} (recall loss)")
-        print(f"  ⚠️ fully-VANISHED docs = {c.get('vanished_docs')}")
-        print(f"  stale HA3 rows = {c.get('ha3_stale')} {report.get('stale_subtypes', {})}")
-        print(f"  orphan HA3 docs = {c.get('orphan_docs')}")
-        if report.get("error"):
-            print(f"  ERROR: {report['error']}")
-        for m in report.get("rds_active_missing", [])[:10]:
-            print(f"    MISSING id={m['id']} {m['chunk_id']} type={m['chunk_type']}")
-        for v in report.get("vanished_docs", [])[:10]:
-            print(f"    VANISHED {v}")
-
+def _exit_code(report: Dict[str, Any]) -> int:
+    """0 = ok (or simulate-skipped); 2 = drift; 3 = error/incomplete."""
+    if report.get("skipped"):
+        return 0
     if report.get("error") or report.get("complete") is False:
         return 3
     return 0 if report.get("ok") else 2
+
+
+def _print_ha3(report: Dict[str, Any]) -> None:
+    if report.get("skipped"):
+        print(f"[reconcile:ha3] skipped ({report['skipped']})")
+        return
+    c = report.get("counts", {})
+    print(f"[reconcile:ha3] ok={report.get('ok')} complete={report.get('complete')}")
+    print(f"  RDS rows={c.get('rds_rows')} active={c.get('rds_active')} "
+          f"active_indexed={c.get('rds_active_indexed')} | HA3 pks={c.get('ha3_pks')}")
+    print(f"  ⚠️ RDS-active MISSING from HA3 = {c.get('rds_active_missing')} (recall loss)")
+    print(f"  ⚠️ fully-VANISHED docs = {c.get('vanished_docs')}")
+    print(f"  stale HA3 rows = {c.get('ha3_stale')} {report.get('stale_subtypes', {})}")
+    print(f"  orphan HA3 docs = {c.get('orphan_docs')}")
+    if report.get("error"):
+        print(f"  ERROR: {report['error']}")
+    for m in report.get("rds_active_missing", [])[:10]:
+        print(f"    MISSING id={m['id']} {m['chunk_id']} type={m['chunk_type']}")
+    for v in report.get("vanished_docs", [])[:10]:
+        print(f"    VANISHED {v}")
+
+
+def _print_oss(report: Dict[str, Any]) -> None:
+    if report.get("skipped"):
+        print(f"[reconcile:oss] skipped ({report['skipped']})")
+        return
+    c = report.get("counts", {})
+    print(f"[reconcile:oss] ok={report.get('ok')} complete={report.get('complete')}")
+    print(f"  referenced image keys={c.get('referenced')} | OSS objects={c.get('present')}")
+    print(f"  ⚠️ referenced MISSING from OSS = {c.get('missing')} (broken images)")
+    print(f"  orphan OSS objects = {c.get('orphan')}")
+    if report.get("error"):
+        print(f"  ERROR: {report['error']}")
+    for m in report.get("missing", [])[:10]:
+        print(f"    MISSING {m['oss_key']} (chunk={m['chunk_id']})")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI. Runs the selected cross-store parity check(s). Exit = worst of the run codes
+    (0 = ok / simulate-skipped; 2 = drift; 3 = error/incomplete)."""
+    import argparse
+    import json
+
+    ap = argparse.ArgumentParser(description="read-only cross-store parity reconciler (CS3 + CS4)")
+    ap.add_argument("--check", choices=["ha3", "oss", "all"], default="all",
+                    help="which parity check to run (default: all)")
+    ap.add_argument("--alert", action="store_true", help="fire an OBS-4 ops alert on drift/error")
+    ap.add_argument("--json", action="store_true", help="emit the full report(s) as JSON")
+    ap.add_argument("--hi", type=int, default=None, help="override HA3 PK scan upper bound")
+    args = ap.parse_args(argv)
+
+    reports: Dict[str, Any] = {}
+    if args.check in ("ha3", "all"):
+        reports["ha3"] = run_parity_check(alert=args.alert, hi=args.hi)
+    if args.check in ("oss", "all"):
+        reports["oss"] = run_oss_parity_check(alert=args.alert)
+
+    if args.json:
+        print(json.dumps(reports, ensure_ascii=False, indent=2, default=str))
+    else:
+        if "ha3" in reports:
+            _print_ha3(reports["ha3"])
+        if "oss" in reports:
+            _print_oss(reports["oss"])
+
+    return max((_exit_code(r) for r in reports.values()), default=0)
 
 
 if __name__ == "__main__":

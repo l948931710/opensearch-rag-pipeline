@@ -130,24 +130,108 @@ def test_run_parity_check_alerts_on_drift(monkeypatch):
     assert sent[0][1].get("severity") == "critical"
 
 
+# ── CS4: OSS↔RDS image-object parity ──
+
+def test_collect_referenced_image_keys_active_only():
+    import json
+    rows = [
+        {"chunk_id": "cA", "is_active": 1,
+         "extra_json": json.dumps({"image_refs": [{"oss_key": "p/a.png"}, {"oss_key": "p/b.png"}]})},
+        {"chunk_id": "cB", "is_active": 0,  # inactive → ignored
+         "extra_json": json.dumps({"image_refs": [{"oss_key": "p/z.png"}]})},
+        {"chunk_id": "cC", "is_active": 1, "extra_json": "{not json"},  # malformed → skipped
+        {"chunk_id": "cD", "is_active": 1, "extra_json": None},
+    ]
+    ref = reconcile.collect_referenced_image_keys(rows)
+    assert set(ref) == {"p/a.png", "p/b.png"}
+    assert ref["p/a.png"] == "cA"
+
+
+def test_compute_oss_parity_missing_and_orphan():
+    ref = {"p/a.png": "cA", "p/b.png": "cB"}
+    present = {"p/a.png", "p/c.png"}  # b missing (broken image), c orphan
+    rep = reconcile.compute_oss_parity(ref, present)
+    assert rep["ok"] is False
+    assert rep["counts"] == {"referenced": 2, "present": 2, "candidates_offprefix": 0,
+                             "missing": 1, "orphan": 1}
+    assert rep["missing"][0]["oss_key"] == "p/b.png" and rep["missing"][0]["chunk_id"] == "cB"
+    assert rep["orphan_sample"] == ["p/c.png"]
+
+
+def test_compute_oss_parity_clean():
+    ref = {"p/a.png": "cA"}
+    rep = reconcile.compute_oss_parity(ref, {"p/a.png"})
+    assert rep["ok"] is True and rep["counts"]["missing"] == 0
+
+
+def test_compute_oss_parity_verify_fn_eliminates_offprefix_false_positive():
+    """A referenced key outside the listed prefix (raw/*) is NOT missing if it really exists.
+    Mirrors the live prod finding: raw/marketing/*.jpg flagged by set-diff but object_exists=True."""
+    ref = {"processing/assets/a.png": "cA", "raw/marketing/x.jpg": "cB", "processing/assets/gone.png": "cC"}
+    present = {"processing/assets/a.png"}  # only the listed prefix
+    # raw/x.jpg exists (off-prefix), gone.png truly absent
+    exists = {"raw/marketing/x.jpg"}
+    rep = reconcile.compute_oss_parity(ref, present, verify_fn=lambda k: k in exists)
+    assert rep["counts"]["missing"] == 1  # only gone.png
+    assert rep["missing"][0]["oss_key"] == "processing/assets/gone.png"
+    assert rep["counts"]["candidates_offprefix"] == 1  # raw/x.jpg verified-exists
+    assert rep["ok"] is False
+
+
+def test_compute_oss_parity_orphan_alone_is_ok():
+    """Orphan OSS objects (storage bloat) do NOT fail ok — only missing-referenced does."""
+    rep = reconcile.compute_oss_parity({}, {"p/x.png", "p/y.png"})
+    assert rep["ok"] is True and rep["counts"]["orphan"] == 2
+
+
+def test_run_oss_parity_check_simulate_is_noop(monkeypatch):
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", True)
+    rep = reconcile.run_oss_parity_check()
+    assert rep["ok"] is True and rep.get("skipped") == "simulate"
+
+
+def test_run_oss_parity_check_fail_open(monkeypatch):
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(cfg, "simulate_db", False)
+    import opensearch_pipeline.prod_access as pa
+    monkeypatch.setattr(pa, "get_prod_readonly_conn",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("oss-ro down")))
+    rep = reconcile.run_oss_parity_check()
+    assert rep["ok"] is False and "oss-ro down" in rep["error"]
+
+
 # ── CLI exit codes ──
 
 def test_cli_exit_codes(monkeypatch, capsys):
     # ok → 0
     monkeypatch.setattr(reconcile, "run_parity_check",
                         lambda **k: {"ok": True, "complete": True, "counts": {}})
-    assert reconcile.main([]) == 0
+    assert reconcile.main(["--check", "ha3"]) == 0
     # drift → 2
     monkeypatch.setattr(reconcile, "run_parity_check",
                         lambda **k: {"ok": False, "complete": True, "counts": {},
                                      "rds_active_missing": [], "vanished_docs": []})
-    assert reconcile.main([]) == 2
+    assert reconcile.main(["--check", "ha3"]) == 2
     # error/incomplete → 3
     monkeypatch.setattr(reconcile, "run_parity_check",
                         lambda **k: {"ok": False, "complete": False, "counts": {},
                                      "error": "x", "rds_active_missing": [], "vanished_docs": []})
-    assert reconcile.main([]) == 3
+    assert reconcile.main(["--check", "ha3"]) == 3
     # simulate skip → 0
     monkeypatch.setattr(reconcile, "run_parity_check",
                         lambda **k: {"ok": True, "skipped": "simulate", "counts": {}})
-    assert reconcile.main([]) == 0
+    assert reconcile.main(["--check", "ha3"]) == 0
+
+
+def test_cli_all_takes_worst_exit_code(monkeypatch):
+    """--check all → exit = max(ha3, oss) codes."""
+    monkeypatch.setattr(reconcile, "run_parity_check",
+                        lambda **k: {"ok": True, "complete": True, "counts": {}})  # 0
+    monkeypatch.setattr(reconcile, "run_oss_parity_check",
+                        lambda **k: {"ok": False, "complete": True, "counts": {},
+                                     "missing": []})  # drift → 2
+    assert reconcile.main(["--check", "all"]) == 2
