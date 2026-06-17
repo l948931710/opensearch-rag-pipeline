@@ -175,6 +175,8 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
             "title": fields.get("title", ""),
             "section_title": fields.get("section_title", ""),
             "doc_id": fields.get("doc_id", ""),
+            # version_no：答案血缘——使一条已落库回答能溯源到精确的文档版本(配合 _DEFAULT_OUTPUT_FIELDS)
+            "version_no": fields.get("version_no", 0),
             "category_l1": fields.get("category_l1", ""),
             "chunk_index": fields.get("chunk_index", 0),
             "page_num": fields.get("page_num", 0),
@@ -218,7 +220,7 @@ def _sanitize_ha3_filter_value(value: str) -> str:
 
 # HA3 查询统一返回字段（search_chunks / cosurface_doc_images / 文档展开共用，避免漂移）
 _DEFAULT_OUTPUT_FIELDS = [
-    "id", "chunk_id", "doc_id", "chunk_text_store", "title", "section_title",
+    "id", "chunk_id", "doc_id", "version_no", "chunk_text_store", "title", "section_title",
     "category_l1", "chunk_index", "page_num", "kb_type",
     "permission_level", "owner_dept", "chunk_type",
     "source_image", "visual_summary",

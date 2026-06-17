@@ -90,6 +90,10 @@ def log_qa_session(
                 [
                     {
                         "doc_id": d.get("doc_id", ""),
+                        # 答案血缘：chunk_id(内嵌 version) + version_no,使一条回答可溯源到精确 chunk/版本。
+                        # 不带它们时,re-chunk 后 chunk_index 漂移 → 历史答案无法定位到原始来源(L7-01/INC-6)。
+                        "chunk_id": d.get("chunk_id", ""),
+                        "version_no": d.get("version_no"),
                         "title": d.get("title", ""),
                         "section_title": d.get("section_title", ""),
                         "score": d.get("score", 0),
