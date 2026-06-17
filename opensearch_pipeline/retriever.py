@@ -624,7 +624,8 @@ def _normalize_image_refs(image_refs_json) -> List[Dict[str, Any]]:
     """把 RDS image_refs_json 归一化为统一的 image_refs 列表（单一实现，消除三份漂移）。
 
     保留 CLAUDE.md 标注的载荷契约键 oss_key/source_image/visual_summary/ocr_text/caption/
-    order/image_index，互相兜底（oss_key↔source_image）。下游 content_blocks_builder 读
+    order/image_index + filename/anchor_row（SF-2：xlsx 同 anchor 多图的严格身份键，不可在
+    RDS→serving 回路丢失），互相兜底（oss_key↔source_image）。下游 content_blocks_builder 读
     ``oss_key or source_image`` 与 ``caption or visual_summary or ocr_text``，因此键越全越好；
     原先三个分支各自只发部分键（两处丢 visual_summary、一处丢 ocr_text），导致 XLSX 绑定的
     图注（存在 visual_summary）渲染不出来。
@@ -653,6 +654,11 @@ def _normalize_image_refs(image_refs_json) -> List[Dict[str, Any]]:
             "caption": ref.get("caption", ""),
             "order": ref.get("order", idx),
             "image_index": ref.get("image_index", idx),
+            # SF-2: preserve the xlsx same-anchor disambiguation contract keys (CLAUDE.md) across the
+            # RDS→serving roundtrip — filename+anchor_row are the strict identity for multiple images
+            # bound at the same row; dropping them here breaks the documented end-to-end contract.
+            "filename": ref.get("filename", ""),
+            "anchor_row": ref.get("anchor_row"),
         })
     return out
 

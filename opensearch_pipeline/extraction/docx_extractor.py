@@ -15,9 +15,12 @@ docx_extractor.py — Word/DOCX 文本提取器
 """
 
 import re
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from opensearch_pipeline.extraction.schema import ExtractedBlock, is_pseudo_heading
+
+if TYPE_CHECKING:  # resolve the "ImageAsset" forward-ref annotation without a runtime import
+    from opensearch_pipeline.extraction.image_extraction_utils import ImageAsset
 
 # Word 标题样式名 → heading level 映射
 _STYLE_LEVEL_MAP = {
@@ -205,9 +208,19 @@ def extract_docx(
                     extracted.extend(_extract_recursive(cell))
                 else:
                     rows_text = []
+                    # DC-3: dedup merged cells (gridSpan/vMerge) — python-docx repeats the same
+                    # <w:tc> across spanned grid positions/rows. Store the element itself (not id():
+                    # lxml proxy ids get GC-reused → distinct cells collide & get dropped); holding a
+                    # reference keeps lxml's per-node proxy stable so membership is true identity.
+                    seen_tc = set()
                     for row in table.rows:
                         cells = []
                         for cell in row.cells:
+                            tc = getattr(cell, "_tc", None)
+                            if tc is not None:
+                                if tc in seen_tc:
+                                    continue
+                                seen_tc.add(tc)
                             cell_text = _cell_text_with_textboxes(cell)
                             if cell_text:
                                 cells.append(cell_text)
@@ -557,9 +570,17 @@ def extract_docx_with_images(
                                 image_counter += 1
             else:
                 rows_text = []
+                # DC-3: dedup merged cells (gridSpan/vMerge) — see note in extract_docx above; store
+                # the <w:tc> element itself (not id()) so lxml's per-node proxy keeps identity stable.
+                seen_tc = set()
                 for row in table.rows:
                     cells = []
                     for cell in row.cells:
+                        tc = getattr(cell, "_tc", None)
+                        if tc is not None:
+                            if tc in seen_tc:
+                                continue
+                            seen_tc.add(tc)
                         cell_text = _cell_text_with_textboxes(cell)
                         if cell_text:
                             cells.append(cell_text)
