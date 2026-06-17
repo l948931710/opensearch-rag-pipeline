@@ -1,28 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- macOS LaunchAgent for the standing health monitor (ops_monitor), READ-ONLY reconcilers.
+     Execs the python binary DIRECTLY (it lives outside ~/Downloads, so launchd can exec it) — so the
+     ONLY thing needing Full Disk Access is this python, not /bin/bash. (The bash wrapper
+     deploy/run_ops_monitor.sh is for the Linux/crontab path instead.)
+
+     Prereq on this Mac (repo is under ~/Downloads, which macOS TCC blocks for launchd):
+       System Settings → Privacy & Security → Full Disk Access → "+" → ⌘⇧G →
+       /Users/laijunchen/opt/anaconda3/envs/stack-test/bin/python3.10  → enable the toggle.
      Install:  cp deploy/com.fuling.ops-monitor.plist ~/Library/LaunchAgents/
-               launchctl load  ~/Library/LaunchAgents/com.fuling.ops-monitor.plist
-     Uninstall: launchctl unload ~/Library/LaunchAgents/com.fuling.ops-monitor.plist && rm it
-     Run-now (test): launchctl start com.fuling.ops-monitor
-     NOTE: laptop sleeps → StartCalendarInterval fires at 02:30 if awake, else once on next wake.
-     For a true nightly cadence use an always-on host (crontab line in docs/ops_monitoring_schedule.md). -->
+               launchctl load -w ~/Library/LaunchAgents/com.fuling.ops-monitor.plist
+     Test now: launchctl kickstart gui/$(id -u)/com.fuling.ops-monitor   (then: launchctl list | grep fuling)
+     Laptop sleeps → fires at 02:30 if awake, else once on next wake. -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.fuling.ops-monitor</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/deploy/run_ops_monitor.sh</string>
+    <string>/Users/laijunchen/opt/anaconda3/envs/stack-test/bin/python3.10</string>
+    <string>-m</string>
+    <string>opensearch_pipeline.ops_monitor</string>
     <string>--only</string>
     <string>reconcile_ha3</string>
     <string>reconcile_oss</string>
     <string>reconcile_raw</string>
   </array>
+  <key>WorkingDirectory</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>RAG_PY</key><string>/Users/laijunchen/opt/anaconda3/envs/stack-test/bin/python</string>
-    <key>RAG_OPS_ENV</key><string>prod_ro</string>
+    <key>RAG_ENV</key><string>prod_ro</string>
+    <key>PYTHONPATH</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
     <!-- set these to deliver OBS-4 alerts on drift (else the alert path is a logged no-op):
     <key>RAG_OPS_ALERT_WEBHOOK</key><string>https://oapi.dingtalk.com/robot/send?access_token=…</string>
     <key>RAG_OPS_ALERT_SECRET</key><string>SEC…</string> -->
