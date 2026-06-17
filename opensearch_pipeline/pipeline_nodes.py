@@ -4540,6 +4540,28 @@ def node_deactivate_old_chunks(ctx: dict):
                 d: v for d, v in current_versions.items() if (d, v) not in known_failed
             }
 
+    # ── 第三层正向不变量（P0 焊死, 2026-06-16）：拒绝停用"伪 INDEXED"当前版本 ──
+    # 上面的 known_failed 是负向过滤,只跳过 ctx 已记的失败集;它**漏掉** P0 僵尸——embedding 未生成
+    # (embedding_status != "DONE")却被推上 HA3 标记 index_status=="INDEXED" 的 chunk(无向量、kNN 不可见)。
+    # 这里正向断言:将对照停用旧版本的 (doc, current_version) 不得存在任何 INDEXED-but-not-DONE 的 chunk,
+    # 否则 raise、绝不停用。不依赖 ctx 失败集是否被填充,挡住未来绕过 node_update_index_status raise 闸、
+    # 直接调用本节点的路径(reconcile/重构)。正常成功流程下 valid_chunks 即推送对象,push 成功后被原地置
+    # INDEXED 且 embedding 成功时为 DONE,故此处必然全通过。
+    _cur_set = set(current_versions.items())
+    zombie = [
+        (c.doc_id, c.version_no, c.chunk_id, getattr(c, "embedding_status", None))
+        for c in chunks
+        if (c.doc_id, c.version_no) in _cur_set
+        and getattr(c, "index_status", None) == "INDEXED"
+        and getattr(c, "embedding_status", None) != "DONE"
+    ]
+    if zombie:
+        raise RuntimeError(
+            f"Refusing to deactivate old versions: {len(zombie)} current-version chunk(s) are marked "
+            f"INDEXED without a DONE embedding (vectorless kNN-invisible 'zombie' = the P0 signature). "
+            f"Aborting to avoid silent recall loss. Examples (doc,ver,chunk_id,embedding_status): {zombie[:5]}"
+        )
+
     # 检查 existing_chunks（模拟已在索引中的旧版本 chunks）
     existing_index = ctx.get("existing_opensearch_chunks", [])
     deactivated = []
