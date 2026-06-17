@@ -768,8 +768,6 @@ def node_build_canonical(ctx: dict):
                 ),
             }
 
-        canonicals.append(canonical)
-
         # ─── Physical Persistence of Canonical Documents (JSON & MD) ───
         import json
         import os
@@ -782,6 +780,53 @@ def node_build_canonical(ctx: dict):
 
         canonical_key = canonical["canonical_key"]
         canonical_md_key = canonical.get("canonical_md_key")
+
+        # L2 canonical-text content hash (computed once; reused by the skip-gate + the RDS UPDATE).
+        _canonical_sha256 = hashlib.sha256((md_data or "").encode("utf-8")).hexdigest()
+
+        # ── L2 skip-gate (flag-gated, default OFF: RAG_SKIP_UNCHANGED_REINGEST) ──
+        # If this is a re-ingest (version_no>1) whose canonical text is byte-identical to a prior
+        # version's, mark it SKIPPED_DUPLICATE and skip the rest of the pipeline (classify / PII /
+        # chunk / embed / index) — the prior version keeps serving. FAIL-SAFE: skip ONLY on a positive
+        # canonical_sha256 match against a prior version; any miss / NULL / error → process normally.
+        # (Maintenance re-chunks use a different path and create no new version, so they're unaffected.)
+        _skip_unchanged = os.environ.get("RAG_SKIP_UNCHANGED_REINGEST", "").lower() in ("1", "true", "yes")
+        if _skip_unchanged and not simulate_db and (canonical.get("version_no") or 0) > 1:
+            _do_skip = False
+            _prior_v = None
+            try:
+                _sk_conn = _get_db_conn(select_db=True)
+                try:
+                    with _sk_conn.cursor() as _sk_cur:
+                        _sk_cur.execute(
+                            "SELECT version_no, canonical_sha256 FROM document_version "
+                            "WHERE doc_id=%s AND version_no<%s AND canonical_sha256 IS NOT NULL "
+                            "ORDER BY version_no DESC LIMIT 1",
+                            (canonical["doc_id"], canonical["version_no"]))
+                        _prior = _sk_cur.fetchone()
+                        if _prior and _prior[1] == _canonical_sha256:
+                            _sk_cur.execute(
+                                "UPDATE document_version SET content_process_status='SKIPPED_DUPLICATE', "
+                                "chunk_status='SKIPPED', extraction_status='COMPLETED', "
+                                "canonical_sha256=%s, processed_at=NOW() "
+                                "WHERE doc_id=%s AND version_no=%s",
+                                (_canonical_sha256, canonical["doc_id"], canonical["version_no"]))
+                            # revert the version pointer to the still-served prior version
+                            _sk_cur.execute(
+                                "UPDATE document_meta SET current_version_no=%s WHERE doc_id=%s",
+                                (_prior[0], canonical["doc_id"]))
+                            _do_skip = True
+                            _prior_v = _prior[0]
+                    _sk_conn.commit()
+                finally:
+                    _sk_conn.close()
+            except Exception as _skip_err:
+                print(f"    ⚠️ skip-gate check failed (FAIL-SAFE: processing normally): {_skip_err}")
+                _do_skip = False
+            if _do_skip:
+                print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: canonical unchanged "
+                      f"vs v{_prior_v} → SKIPPED_DUPLICATE (prior version keeps serving)")
+                continue  # exclude from canonicals → skips classify/chunk/embed/index for this doc
 
         # 1. Write files physically
         if is_simulated_oss:
@@ -814,10 +859,8 @@ def node_build_canonical(ctx: dict):
 
         # 2. Update RDS metadata
         if not simulate_db:
-            # L2: content hashes for content-based invalidation. canonical_sha256 = sha256 of the
-            # canonical text (what chunking consumes); checksum_sha256 = sha256 of raw bytes (from
-            # node_extract). Additive/best-effort; a NULL hash means "process" (fail-safe — never skip).
-            _canonical_sha256 = hashlib.sha256((md_data or "").encode("utf-8")).hexdigest()
+            # L2: content hashes. canonical_sha256 computed above (reused by the skip-gate); checksum_sha256
+            # = sha256 of raw bytes (from node_extract). Additive; a NULL hash means "process" (fail-safe).
             _raw_checksum = ctx.get("_raw_checksum", {}).get(
                 (canonical["doc_id"], canonical["version_no"]))
             conn = None
@@ -865,6 +908,9 @@ def node_build_canonical(ctx: dict):
             f"({canonical['text_length']} chars, {block_count} blocks"
             f"{f', {warn_count} warnings' if warn_count else ''})"
         )
+
+        # Append only after a successful (non-skipped) build — the skip-gate `continue`s above.
+        canonicals.append(canonical)
 
     ctx["canonicals"] = canonicals
 
