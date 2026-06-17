@@ -24,24 +24,53 @@ table) → it needs a **write-capable** env, not `prod_ro` (PROD-RO blocks the U
   (`data_process`, Serverless_res_group_…137602). Until that deployment exists, schedule from an
   environment that already has the code + `.env` (the laptop).
 
-## Path A — laptop / any host with the repo + .env (works today)
+## Path A — cron on an always-on host (CHOSEN; works today, edition-independent)
 
-Add to crontab on a host that has the repo checked out and a write-capable prod `.env` (the same
-place you run `dataworks_orchestrator.py`). Example: daily 02:30 Beijing.
+Run on a host that's reliably on (not a laptop that sleeps) and has the repo checked out + the prod
+`.env` files (the same place you run `dataworks_orchestrator.py`). The monitor mixes a **read-only**
+part (CS3/CS4 reconcilers) and a **write** part (`qa_rollup` UPSERTs `qa_daily_metrics`), so roll it
+out in two safe stages.
+
+### Stage 1 — read-only reconcilers (deploy first; zero write-cred risk)
+
+CS3/CS4 parity is read-only end-to-end (`_rds_conn` prefers the `fuling_ro` read-only path via
+`.env.prod_ro`; HA3/OSS are read/list only). Schedule it with `prod_ro` — nothing it does can write:
 
 ```cron
-# m h dom mon dow   command
+# 02:30 Beijing — RDS↔HA3 + OSS↔RDS parity, read-only, alerts on drift
 30 2 * * *  cd /path/to/opensearch-rag-pipeline && \
-            RAG_ENV=prod /usr/bin/env python -m opensearch_pipeline.ops_monitor \
+            RAG_ENV=prod_ro RAG_OPS_ALERT_WEBHOOK=… RAG_OPS_ALERT_SECRET=… \
+            python -m opensearch_pipeline.ops_monitor --only reconcile_ha3 reconcile_oss \
+            >> /var/log/rag_ops_monitor.log 2>&1
+```
+Exit code: 0 ok · 2 drift (RDS-active missing from HA3 / vanished docs / broken images) — page on 2 · 3 error.
+
+### Stage 2 — add the OBS-5 QA rollup (needs a write account)
+
+`qa_rollup` writes `fuling_operation.qa_daily_metrics`, so it needs a **write-capable** config — NOT
+`prod_ro` (whose pool is `SESSION READ ONLY` and would fail the UPSERT). Recommended (least-privilege,
+since you're security-conscious): create a dedicated DB account that can only `INSERT/UPDATE` on
+`fuling_operation.qa_daily_metrics` + `SELECT` what the rollup reads, and give the cron a small
+overlay (e.g. `.env.metrics`) for it — do **not** put `fuling_admin` in a cron. Then run the full
+monitor (reconcilers stay read-only via `prod_access`; only the rollup uses the write account):
+
+```cron
+# 02:40 Beijing — full monitor incl. qa_rollup + SLO verdict
+40 2 * * *  cd /path/to/opensearch-rag-pipeline && \
+            RAG_ENV=metrics RAG_OPS_ALERT_WEBHOOK=… RAG_OPS_ALERT_SECRET=… \
+            python -m opensearch_pipeline.ops_monitor \
             >> /var/log/rag_ops_monitor.log 2>&1
 ```
 
-Requirements:
-- `RAG_OPS_ALERT_WEBHOOK` (+ `RAG_OPS_ALERT_SECRET`) set so OBS-4 alerts actually deliver; without
-  them the alert path is a logged no-op (jobs still run, exit codes still set).
-- A **write-capable** prod env for `qa_rollup` (not `prod_ro`). If you only want the read-only
-  reconcilers on a `prod_ro` box, run `--only reconcile_ha3 reconcile_oss`.
-- For read-only-reconcilers-only nodes, exit 2 means real drift → page.
+Notes:
+- `RAG_OPS_ALERT_WEBHOOK` (+ `RAG_OPS_ALERT_SECRET`) — without them OBS-4 alerts are a logged no-op
+  (jobs still run, exit codes still set). Prefer setting them in the host's secret store, not inline.
+- Back-fill once interactively before scheduling Stage 2 to populate history:
+  `RAG_ENV=metrics python -m opensearch_pipeline.qa_rollup --date <YYYY-MM-DD>` per day, or just let
+  the nightly run accumulate.
+- **Clean up the DataWorks artifact:** delete the Paused `ops_health_monitor` node in the DataStudio
+  console (it can't be deleted via the MCP — its id `5203574917819388193` exceeds 2^53). It's inert
+  (recurrence=Pause) so there's no rush.
 
 ## Path B — DataWorks scheduled node (requires a one-time deployment)
 
