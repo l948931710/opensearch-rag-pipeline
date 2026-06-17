@@ -18,6 +18,7 @@ import argparse
 import datetime
 import json
 import os
+import sys
 
 from . import envboot
 from .ha3live import install_into_retriever
@@ -33,6 +34,32 @@ def _ts():
 def _load_goldset(path):
     cases = json.load(open(path, encoding="utf-8"))
     return cases
+
+
+def _strict_enabled(args) -> bool:
+    return bool(getattr(args, "strict", False)) or \
+        os.environ.get("RAG_EVAL_STRICT", "").lower() in ("1", "true", "yes")
+
+
+def _strict_failures(gates: dict, results: dict) -> list:
+    """Hard-fail reasons under --strict: any gate whose pass is False, or L6 NO_GO_DEFECT.
+    L6 NO_GO_INCOMPLETE_EVIDENCE is advisory (not a hard fail) — missing evidence shouldn't block;
+    a detected defect should. (Flip via policy later if desired.)"""
+    fails = [name for name, g in (gates or {}).items() if g.get("pass") is False]
+    if (results.get("l6") or {}).get("state") == "NO_GO_DEFECT":
+        fails.append("l6:NO_GO_DEFECT")
+    return fails
+
+
+def _enforce_strict(gates: dict, results: dict, strict: bool):
+    """EVAL-1: convert advisory gates into a blocking exit code (the CI gate, EVAL-3, relies on this)."""
+    if not strict:
+        return
+    fails = _strict_failures(gates, results)
+    if fails:
+        print(f"\n❌ STRICT: hard gate failure(s): {fails} → exit 1")
+        sys.exit(1)
+    print("\n✅ STRICT: all hard gates passed")
 
 
 def phase_run(args):
@@ -152,6 +179,7 @@ def phase_run(args):
     print(f"\nNext: judge the bundle (Claude panel) -> {outdir}/judge_verdicts.json, then:\n"
           f"  python -m eval_harness.run_eval merge --results {outdir}/report.json "
           f"--verdicts {outdir}/judge_verdicts.json")
+    _enforce_strict(gates, results, _strict_enabled(args))
     return outdir
 
 
@@ -192,6 +220,7 @@ def phase_merge(args):
     for name, g in gates.items():
         mark = "PASS" if g["pass"] is True else ("FAIL" if g["pass"] is False else "N/A")
         print(f"   [{mark}] {name}: {g['value']}")
+    _enforce_strict(gates, results, _strict_enabled(args))
     return outdir
 
 
@@ -204,6 +233,9 @@ def main():
     ap.add_argument("--outdir", default="")
     ap.add_argument("--results", default="")
     ap.add_argument("--verdicts", default="")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit non-zero on any hard gate FAIL / L6 NO_GO_DEFECT (CI gate); "
+                         "also enabled by RAG_EVAL_STRICT=true")
     args = ap.parse_args()
     if args.phase == "run":
         phase_run(args)

@@ -330,8 +330,57 @@ def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity]
 
 @app.get("/api/health")
 async def health_check():
-    """健康检查。"""
+    """Liveness stub — process is up. Use /api/ready for dependency health."""
     return {"status": "ok", "service": "rag-qa-api"}
+
+
+@app.get("/api/ready")
+async def readiness_check():
+    """OBS-1 deep readiness probe: RDS + HA3 (critical) + DashScope (config-only, no live cost).
+
+    200 when the critical deps (RDS + HA3) are reachable, else 503 with the failing component — so a
+    load balancer / SAE / k8s readiness probe can stop routing to an instance that can't actually
+    answer (the old /api/health never probed anything). Simulate mode returns 200/skipped (no live
+    calls). DashScope is reported by config presence only (a live ping would cost quota).
+    """
+    from fastapi.responses import JSONResponse
+    cfg = get_config()
+    if getattr(cfg, "simulate", False):
+        return {"status": "ok", "mode": "simulate", "rds": "skipped", "ha3": "skipped", "dashscope": "skipped"}
+
+    checks: Dict[str, str] = {}
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            checks["rds"] = "ok"
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - readiness must report, not raise
+        checks["rds"] = f"error: {str(e)[:80]}"
+
+    try:
+        from opensearch_pipeline.retriever import _get_ha3_client
+        from alibabacloud_ha3engine_vector.models import QueryRequest
+        client = _get_ha3_client()
+        if client == "MOCK_HA3_CLIENT":
+            checks["ha3"] = "skipped"
+        else:
+            client.query(QueryRequest(
+                table_name=cfg.alibaba_vector.table_name, vector=[0.0] * 1024, top_k=1,
+                include_vector=False, output_fields=["id"], filter="id>=0 AND id<1"))
+            checks["ha3"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        checks["ha3"] = f"error: {str(e)[:80]}"
+
+    checks["dashscope"] = "configured" if getattr(cfg.embedding, "api_key", None) else "unconfigured"
+
+    critical_ok = checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
+    body = {"status": "ok" if critical_ok else "degraded", **checks}
+    return body if critical_ok else JSONResponse(status_code=503, content=body)
 
 
 @app.post("/api/auth/dingtalk", response_model=DingtalkAuthResponse)
