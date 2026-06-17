@@ -87,3 +87,19 @@ def test_deactivate_wires_audit_write():
     assert "from opensearch_pipeline.audit_log import write_audit" in src
     assert 'action_type="DEACTIVATE"' in src
     assert "simulate=simulate_db" in src, "audit must no-op in simulate (pass simulate=simulate_db)"
+
+
+def test_register_wires_audit_write():
+    """node_register_metadata must emit a REGISTER audit (doc/version lifecycle start)."""
+    from opensearch_pipeline.pipeline_nodes import node_register_metadata
+    src = inspect.getsource(node_register_metadata)
+    assert 'action_type="REGISTER"' in src and "write_audit(" in src
+    assert "simulate=simulate_db" in src
+
+
+def test_chunk_status_closure_wires_audit_write():
+    """node_write_chunk_meta status closure must emit a CHUNK audit (DONE/EMPTY) per (doc,version)."""
+    from opensearch_pipeline.pipeline_nodes import node_write_chunk_meta
+    src = inspect.getsource(node_write_chunk_meta)
+    assert 'action_type="CHUNK"' in src and "write_audit(" in src
+    assert "simulate=simulate_db" in src

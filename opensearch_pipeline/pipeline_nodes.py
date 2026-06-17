@@ -581,6 +581,11 @@ def node_register_metadata(ctx: dict):
             "registered_at": datetime.now().isoformat(),
         }
         registered.append(meta)
+        # L5 audit: doc/version REGISTER transition (lifecycle start), fail-open + sim no-op.
+        from opensearch_pipeline.audit_log import write_audit, audit_trace_id
+        write_audit(doc_id=meta["doc_id"], version_no=meta["version_no"],
+                    action_type="REGISTER", action_result="SUCCESS",
+                    trace_id=audit_trace_id(ctx), simulate=simulate_db)
         print(f"    └─ Registered: {meta['doc_id']} v{meta['version_no']}")
 
     ctx["registered_docs"] = registered
@@ -4360,6 +4365,13 @@ def node_write_chunk_meta(ctx: dict):
                         conn.close()
             else:
                 print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} content_process_status='DONE', chunk_status='DONE', chunk_count={chunk_cnt}")
+
+            # L5 audit: per-(doc,version) chunk-status transition (DONE/EMPTY), fail-open + sim no-op.
+            from opensearch_pipeline.audit_log import write_audit, audit_trace_id
+            write_audit(doc_id=doc_id, version_no=ver, action_type="CHUNK",
+                        action_result=("DONE" if chunk_cnt > 0 else "EMPTY"),
+                        trace_id=audit_trace_id(ctx), message=f"{chunk_cnt} chunks",
+                        simulate=simulate_db)
 
     ctx["chunk_meta_written"] = written
 
