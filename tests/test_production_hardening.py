@@ -586,6 +586,78 @@ def test_k_embedding_failed_chunks_excluded_and_block_deactivation():
     assert "deactivat" in str(excinfo.value).lower()
 
 
+# Test K2 (P0 regression, 2026-06-16): a partial DashScope embedding response omits a text_index,
+# so embedding_client returns None for that slot and node_generate_embeddings leaves the chunk at
+# embedding_status="NOT_STARTED" with NO vector — NOT "FAILED". It must be treated exactly like
+# FAILED: excluded from the payload AND counted as a failure so the DAG aborts before deactivating
+# old versions. Before the fix the payload filter only excluded "== FAILED", so this vectorless
+# NOT_STARTED chunk was pushed kNN-invisible, marked INDEXED, and the old version deactivated →
+# silent, non-deterministic recall loss. Test K covers FAILED; this covers the NOT_STARTED/None slot.
+def test_k2_embedding_not_started_none_slot_excluded_and_blocks_deactivation():
+    from opensearch_pipeline.pipeline_nodes import (
+        node_build_opensearch_payload,
+        node_update_index_status,
+    )
+
+    def mk(cid, status, vec):
+        c = Chunk(chunk_id=cid, doc_id="docY", version_no=3, chunk_index=0,
+                  chunk_type="text_chunk", chunk_text=f"text-{cid}", token_count=1)
+        c.embedding_status = status
+        c.embedding_vector = [0.1, 0.2, 0.3] if vec else None
+        return c
+
+    ok = mk("c_ok", "DONE", True)
+    none_slot = mk("c_none", "NOT_STARTED", False)  # the omitted-text_index / None-slot case
+    ctx = {"embedded_chunks": [ok, none_slot], "dag3_no_work": False}
+
+    node_build_opensearch_payload(ctx)
+
+    # The vectorless NOT_STARTED chunk is excluded from the payload and recorded as failed.
+    assert ctx["embedding_failed_chunks"] == [none_slot]
+    pushed_ids = [c.chunk_id for b in ctx["bulk_batches"] for c in b["chunks"]]
+    assert pushed_ids == ["c_ok"], pushed_ids
+
+    # Even with the pushed chunk fully successful, update_index_status must raise (total_failed>0)
+    # so node_deactivate_old_chunks never runs for docY.
+    ctx["simulate_db"] = True
+    for b in ctx["bulk_batches"]:
+        b["result"] = {"failed": 0, "indexed": len(b["chunks"]), "took_ms": 1, "errors": False}
+    with pytest.raises(RuntimeError) as excinfo:
+        node_update_index_status(ctx)
+    assert "deactivat" in str(excinfo.value).lower()
+
+
+# Test K3 (non-regression for the broadened "!= DONE" filter): a fully-DONE batch must NOT be
+# flagged — every chunk is pushed and update_index_status does not raise. Guards against the
+# fix over-excluding legitimate chunks (e.g. if a chunk type were ever left non-DONE by design).
+def test_k3_all_done_batch_not_flagged_by_broadened_filter():
+    from opensearch_pipeline.pipeline_nodes import (
+        node_build_opensearch_payload,
+        node_update_index_status,
+    )
+
+    def mk(cid):
+        c = Chunk(chunk_id=cid, doc_id="docZ", version_no=1, chunk_index=0,
+                  chunk_type="text_chunk", chunk_text=f"text-{cid}", token_count=1)
+        c.embedding_status = "DONE"
+        c.embedding_vector = [0.1, 0.2, 0.3]
+        return c
+
+    chunks = [mk("c1"), mk("c2")]
+    ctx = {"embedded_chunks": chunks, "dag3_no_work": False}
+    node_build_opensearch_payload(ctx)
+
+    assert ctx["embedding_failed_chunks"] == []
+    pushed_ids = sorted(c.chunk_id for b in ctx["bulk_batches"] for c in b["chunks"])
+    assert pushed_ids == ["c1", "c2"], pushed_ids
+
+    # All DONE + zero push failures → must NOT raise (normal deactivation may proceed).
+    ctx["simulate_db"] = True
+    for b in ctx["bulk_batches"]:
+        b["result"] = {"failed": 0, "indexed": len(b["chunks"]), "took_ms": 1, "errors": False}
+    node_update_index_status(ctx)
+
+
 # Test L: real-mode push must REJECT the mock client string, never fake INDEXED.
 # A ctx/config simulate mismatch used to fake INDEXED and then let deactivation
 # delete the old version for real (split-brain).
@@ -624,6 +696,7 @@ def test_m_deactivate_rejects_mock_client_in_real_mode(mock_get_client, mock_get
     chunk = Chunk(chunk_id="c1", doc_id="doc1", version_no=2, chunk_index=0,
                   chunk_type="text_chunk", chunk_text="t", token_count=1)
     chunk.index_status = "INDEXED"
+    chunk.embedding_status = "DONE"  # 真正成功索引的当前 chunk 必为 DONE（否则即 P0 僵尸，被第三层护栏拦下）
     ctx = {
         "valid_chunks": [chunk],
         "preempted_doc_versions": {("doc1", 2)},
@@ -639,6 +712,36 @@ def test_m_deactivate_rejects_mock_client_in_real_mode(mock_get_client, mock_get
         assert "is_active = FALSE" not in sql, (
             "a mock client in real mode must never lead to real RDS old-version deactivation"
         )
+
+
+# Test M2 (P0 layer-3, 2026-06-16): node_deactivate_old_chunks must REFUSE to deactivate when a
+# current-version chunk is a "zombie" — index_status==INDEXED but embedding_status!=DONE (pushed
+# vectorless). This positive invariant is independent of ctx["embedding_failed_chunks"]/failed_doc_versions,
+# so it catches any path reaching deactivation while the new version is incompletely indexed even when
+# those negative sets were never populated (e.g. a future reconcile/refactor bypassing the raise gate).
+def test_m2_deactivate_refuses_indexed_but_not_embedded_zombie():
+    from opensearch_pipeline.pipeline_nodes import node_deactivate_old_chunks
+
+    good = Chunk(chunk_id="g", doc_id="docZ", version_no=2, chunk_index=0,
+                 chunk_type="text_chunk", chunk_text="t", token_count=1)
+    good.embedding_status = "DONE"; good.index_status = "INDEXED"
+    zombie = Chunk(chunk_id="z", doc_id="docZ", version_no=2, chunk_index=1,
+                   chunk_type="text_chunk", chunk_text="t", token_count=1)
+    zombie.embedding_status = "NOT_STARTED"; zombie.index_status = "INDEXED"  # pushed vectorless (the P0)
+
+    ctx = {
+        "valid_chunks": [good, zombie],
+        "preempted_doc_versions": {("docZ", 2)},
+        "existing_opensearch_chunks": [{"chunk_id": "old", "doc_id": "docZ", "version_no": 1}],
+        # deliberately NOT populating embedding_failed_chunks/failed_doc_versions —
+        # the layer-3 invariant must catch the zombie WITHOUT the negative sets.
+        "simulate_db": True,
+        "simulate_opensearch": True,
+        "dag3_no_work": False,
+    }
+    with pytest.raises(RuntimeError) as ei:
+        node_deactivate_old_chunks(ctx)
+    assert "zombie" in str(ei.value).lower() or "INDEXED without a DONE" in str(ei.value)
 
 
 # Test N: _get_opensearch_client must resolve the simulate flag from ctx
@@ -782,6 +885,7 @@ def test_s_deactivate_skips_known_failed_docs(mock_get_client, mock_get_db_conn)
         c = Chunk(chunk_id=cid, doc_id=doc, version_no=2, chunk_index=0,
                   chunk_type="text_chunk", chunk_text="t", token_count=1)
         c.index_status = status
+        c.embedding_status = "DONE" if status == "INDEXED" else "FAILED"  # INDEXED ⇒ DONE（非僵尸）
         return c
 
     ok_chunk = mk("ca", "docA", "INDEXED")

@@ -4657,6 +4657,28 @@ def node_deactivate_old_chunks(ctx: dict):
                 d: v for d, v in current_versions.items() if (d, v) not in known_failed
             }
 
+    # ── 第三层正向不变量（P0 焊死, 2026-06-16）：拒绝停用"伪 INDEXED"当前版本 ──
+    # 上面的 known_failed 是负向过滤,只跳过 ctx 已记的失败集;它**漏掉** P0 僵尸——embedding 未生成
+    # (embedding_status != "DONE")却被推上 HA3 标记 index_status=="INDEXED" 的 chunk(无向量、kNN 不可见)。
+    # 这里正向断言:将对照停用旧版本的 (doc, current_version) 不得存在任何 INDEXED-but-not-DONE 的 chunk,
+    # 否则 raise、绝不停用。不依赖 ctx 失败集是否被填充,挡住未来绕过 node_update_index_status raise 闸、
+    # 直接调用本节点的路径(reconcile/重构)。正常成功流程下 valid_chunks 即推送对象,push 成功后被原地置
+    # INDEXED 且 embedding 成功时为 DONE,故此处必然全通过。
+    _cur_set = set(current_versions.items())
+    zombie = [
+        (c.doc_id, c.version_no, c.chunk_id, getattr(c, "embedding_status", None))
+        for c in chunks
+        if (c.doc_id, c.version_no) in _cur_set
+        and getattr(c, "index_status", None) == "INDEXED"
+        and getattr(c, "embedding_status", None) != "DONE"
+    ]
+    if zombie:
+        raise RuntimeError(
+            f"Refusing to deactivate old versions: {len(zombie)} current-version chunk(s) are marked "
+            f"INDEXED without a DONE embedding (vectorless kNN-invisible 'zombie' = the P0 signature). "
+            f"Aborting to avoid silent recall loss. Examples (doc,ver,chunk_id,embedding_status): {zombie[:5]}"
+        )
+
     # 检查 existing_chunks（模拟已在索引中的旧版本 chunks）
     existing_index = ctx.get("existing_opensearch_chunks", [])
     deactivated = []
@@ -5008,7 +5030,11 @@ def node_generate_embeddings(ctx: dict):
 
                 for i, r in enumerate(results):
                     if r is None:
-                        continue  # 响应未覆盖该 text_index（保持原状，既不标 DONE 也不标 FAILED）
+                        # P0 修复(2026-06-16)：响应未覆盖该 text_index → 标 FAILED（而非保持 NOT_STARTED）。
+                        # 否则该无向量 chunk 会混过 payload 构建、被推上 HA3 标 INDEXED、旧版本随后被停用
+                        # → 静默召回丢失且永不重试。标 FAILED 后由 payload 阶段剔除并计入失败，下轮重试。
+                        batch[i].embedding_status = "FAILED"
+                        continue
                     dense, sidx, sval = r
                     batch[i].embedding_vector = dense
                     batch[i].embedding_model = embedding_model
@@ -5128,19 +5154,26 @@ def node_build_opensearch_payload(ctx: dict):
     import uuid
     chunks = ctx.get("embedded_chunks", [])
 
-    # ── 剔除 embedding 失败的 chunk ──
+    # ── 剔除未成功生成 embedding 的 chunk（embedding_status != "DONE"）──
     # 它们没有 dense/sparse 向量，若照常推到 HA3 会成为 kNN 完全不可见的"僵尸文档"，
     # 却仍被当成已索引而触发旧版本停用 → 静默召回丢失且永不重试。这里从 payload 中排除，
     # 单独记录到 ctx，由 node_update_index_status 计为失败（阻止停用 + 标记 FAILED 供下轮重试）。
+    #
+    # ⚠️ P0 修复(2026-06-16)：必须按 "!= DONE" 剔除，不能只剔 "== FAILED"。
+    # DashScope native 响应可能漏掉某个 text_index（embedding_client 该槽位返回 None），使该 chunk
+    # 停在 embedding_status="NOT_STARTED" 且无向量。只剔 FAILED 会让它混入 payload、被推上 HA3 标记
+    # INDEXED、漏出 failed_doc_versions 计数，进而停用旧版本 → 静默非确定性召回丢失。
+    # 所有应被索引的 chunk 在 embedding 成功后都会被显式置为 "DONE"（simulate / cache-hit / DashScope /
+    # Gemini 四条路径皆然，且无任何 chunk 类型按设计 vectorless 索引），故 "!= DONE" 不会误剔合法 chunk。
     embedding_failed_chunks = [
-        c for c in chunks if getattr(c, "embedding_status", None) == "FAILED"
+        c for c in chunks if getattr(c, "embedding_status", None) != "DONE"
     ]
     ctx["embedding_failed_chunks"] = embedding_failed_chunks
     if embedding_failed_chunks:
-        chunks = [c for c in chunks if getattr(c, "embedding_status", None) != "FAILED"]
+        chunks = [c for c in chunks if getattr(c, "embedding_status", None) == "DONE"]
         print(
-            f"    ⚠️ Excluding {len(embedding_failed_chunks)} embedding-FAILED chunk(s) from index "
-            f"payload (marked FAILED for retry; old versions will NOT be deactivated this run)"
+            f"    ⚠️ Excluding {len(embedding_failed_chunks)} chunk(s) without a DONE embedding "
+            f"from index payload (marked FAILED for retry; old versions will NOT be deactivated this run)"
         )
 
     if not chunks:
