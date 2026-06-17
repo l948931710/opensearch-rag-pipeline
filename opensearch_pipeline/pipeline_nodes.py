@@ -649,6 +649,18 @@ def node_extract_text_with_ocr(ctx: dict):
                     task["local_path"] = _sample_path
                     print(f"    📂 {doc_id}: using sampled corpus file scratch/sample_corpus/{task['raw_key']}")
 
+            # L2: raw-bytes content hash (best-effort, fail-open) for content-based invalidation.
+            _lp = task.get("local_path")
+            if _lp and os.path.exists(_lp):
+                try:
+                    _h = hashlib.sha256()
+                    with open(_lp, "rb") as _rf:
+                        for _blk in iter(lambda: _rf.read(1 << 20), b""):
+                            _h.update(_blk)
+                    ctx.setdefault("_raw_checksum", {})[(task["doc_id"], task.get("version_no"))] = _h.hexdigest()
+                except Exception:
+                    pass  # checksum is auxiliary; absence → NULL → "process" (never blocks extraction)
+
             result = extractor.extract(task)
             extractions.append(result)
 
@@ -797,6 +809,12 @@ def node_build_canonical(ctx: dict):
 
         # 2. Update RDS metadata
         if not simulate_db:
+            # L2: content hashes for content-based invalidation. canonical_sha256 = sha256 of the
+            # canonical text (what chunking consumes); checksum_sha256 = sha256 of raw bytes (from
+            # node_extract). Additive/best-effort; a NULL hash means "process" (fail-safe — never skip).
+            _canonical_sha256 = hashlib.sha256((md_data or "").encode("utf-8")).hexdigest()
+            _raw_checksum = ctx.get("_raw_checksum", {}).get(
+                (canonical["doc_id"], canonical["version_no"]))
             conn = None
             try:
                 conn = _get_db_conn(select_db=True)
@@ -805,6 +823,8 @@ def node_build_canonical(ctx: dict):
                         UPDATE document_version
                         SET canonical_json_key = %s,
                             canonical_md_key = %s,
+                            checksum_sha256 = %s,
+                            canonical_sha256 = %s,
                             extraction_status = 'COMPLETED',
                             ocr_status = %s,
                             page_count = %s,
@@ -814,6 +834,8 @@ def node_build_canonical(ctx: dict):
                     """, (
                         canonical_key,
                         canonical_md_key,
+                        _raw_checksum,
+                        _canonical_sha256,
                         canonical.get("ocr_status", "NOT_REQUIRED"),
                         canonical.get("page_count", 0),
                         canonical.get("text_length", 0),
