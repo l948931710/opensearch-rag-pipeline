@@ -689,6 +689,17 @@ def main():
         sys.exit(0)
     except Exception as e:
         run_finish(_run_id, "FAILED", error_message=str(e), simulate=simulate_mode)
+        # OBS-4: orchestrator non-zero exit → ops alert (fail-open, no-op if webhook unset).
+        try:
+            from opensearch_pipeline.alerting import send_ops_alert
+            send_ops_alert(
+                title=f"Ingestion stage {args.stage} FAILED ({args.bizdate})",
+                text=(f"- **bizdate**: `{args.bizdate}`\n- **stage**: `{args.stage}`\n"
+                      f"- **run_id**: `{_run_id or 'n/a'}`\n- **error**: `{str(e)[:400]}`"),
+                severity="critical", dedup_key=f"orch-fail:{args.stage}:{args.bizdate}",
+            )
+        except Exception:
+            pass
         print(f"\n[Orchestrator] ERROR: Stage {args.stage} failed: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
