@@ -58,7 +58,25 @@ Prerequisites that do **not** exist yet for this project:
 
 Once 1–2 exist, the node body is just the Path-A command. Until then, Path A is the supported route.
 
-## Path C — DataWorks custom image (the chosen production route)
+## ⚠️ Edition note (DataWorks Standard)
+
+Path C below (custom image) is **NOT suitable on DataWorks Standard for a scheduled production node**:
+Standard does not support image **build** (no persisted image), ACR images require Enterprise ACR
+**and PyODPS nodes cannot use ACR images at all**, and the official-image+Script-mode option is
+"temporarily usable, not 固化 for stable production scheduling" (needs Professional+). So
+`deploy/dataworks_monitor.Dockerfile` only applies if you upgrade to Professional+.
+
+**On Standard, the supported DataWorks route is Path C-Std:** reuse the *exact* mechanism the stage
+nodes already use — the **official PyODPS pod (Python 3.7)** + the **`opensearch_pipeline_production.zip`**
+Archive resource for the package code + its deps. The monitor's import chain is 3.7-safe (no
+walrus/match; `typing.*` generics), and the cred-portability refactor (reconcile `_rds_conn`/`_oss_bucket`
+fall back to the config/env pool) means it reaches prod from the same injected env the stage nodes use.
+To finish Path C-Std we need the stage node's loader header (the `##@resource_reference{...}` + sys.path
+boilerplate) — copy it from `opensearch_stage1_canonicalize1` in DataStudio; it can't be read via the
+MCP (node id > 2^53). If that friction isn't worth it, **Path A (cron on an always-on host)** is the
+most robust production-reliable option and sidesteps all edition limits.
+
+## Path C — DataWorks custom image (Professional+ only; not for Standard scheduled prod)
 
 Correction to Path B: the ingestion pipeline **is** authored on DataWorks — in `default_workspace_6na2`
 (609583) as 5 `PYODPS3` stage nodes that load the package from the Archive resource
