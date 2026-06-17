@@ -5,11 +5,13 @@ Aggregates fuling_operation.qa_session_log into one qa_daily_metrics row per Bei
 evaluates the serving SLOs. `compute_daily_metrics` is a PURE function (no I/O) and is the unit-tested
 core; percentiles are computed here because MySQL 8.0 lacks PERCENTILE_CONT.
 
-SLOs (thresholds env-overridable; defaults are the drafted starting values pending ratification):
-  RAG_SLO_ANSWER_RATE_MIN   answer_rate     ≥ 0.70   (success / total)
+SLOs (thresholds env-overridable; defaults RATIFIED 2026-06-16, grounded in the last-21d prod
+qa_session_log distribution — they fire on the 6-08/6-09 incident days without false-alarming normal
+days; p95 reflects that latency_ms is END-TO-END incl. the typewriter stream, not compute time):
+  RAG_SLO_ANSWER_RATE_MIN    answer_rate    ≥ 0.75   (success / total)
   RAG_SLO_NO_RESULT_RATE_MAX no_result_rate ≤ 0.15   (retrieval misses)
-  RAG_SLO_P95_LATENCY_MS_MAX p95 latency    ≤ 8000   (end-to-end)
-  RAG_SLO_ERROR_RATE_MAX     error_rate     ≤ 0.02   (LLM_ERROR / total)
+  RAG_SLO_P95_LATENCY_MS_MAX p95 latency    ≤ 25000  (end-to-end incl. stream)
+  RAG_SLO_ERROR_RATE_MAX     error_rate     ≤ 0.05   (LLM_ERROR / total)
 
 answer_status ∈ {SUCCESS, NO_RESULT, REFUSAL, LLM_ERROR} + separate risk_blocked flag.
 created_at is the SAE container's Pacific wall-clock; tz_shift_hours (default +15) buckets to the
@@ -37,10 +39,10 @@ def _slo_thresholds() -> Dict[str, float]:
         except (TypeError, ValueError):
             return default
     return {
-        "answer_rate_min": _f("RAG_SLO_ANSWER_RATE_MIN", 0.70),
+        "answer_rate_min": _f("RAG_SLO_ANSWER_RATE_MIN", 0.75),
         "no_result_rate_max": _f("RAG_SLO_NO_RESULT_RATE_MAX", 0.15),
-        "p95_latency_ms_max": _f("RAG_SLO_P95_LATENCY_MS_MAX", 8000),
-        "error_rate_max": _f("RAG_SLO_ERROR_RATE_MAX", 0.02),
+        "p95_latency_ms_max": _f("RAG_SLO_P95_LATENCY_MS_MAX", 25000),
+        "error_rate_max": _f("RAG_SLO_ERROR_RATE_MAX", 0.05),
     }
 
 
