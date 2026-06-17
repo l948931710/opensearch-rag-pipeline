@@ -59,6 +59,16 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
         "cost_breaker": cost_breaker,  # 注入抽取节点 → UnifiedExtractor.cost_breaker
     }
 
+    # 每次运行的来源指纹（git sha + extractor/chunker/detector/embedding 版本 + 解析后模型名 + bizdate）。
+    # 纯只读、不读未用时零行为变化（Phase-1 L1，provenance/lineage 地基）；供 chunk provenance、
+    # kb_audit_log、pipeline_run、受影响文档集 diff 复用——trace_id 的单一来源。
+    from opensearch_pipeline.versions import build_run_provenance
+    ctx["run_provenance"] = build_run_provenance(stage=stage, bizdate=bizdate)
+    print(f"[Orchestrator] run provenance: commit={ctx['run_provenance']['git_commit']} "
+          f"chunker={ctx['run_provenance']['chunker_version']} "
+          f"detector={ctx['run_provenance']['detector_version']} "
+          f"embed={ctx['run_provenance']['embedding_model_version']}")
+
     # Maintenance re-chunk: freeze classification/routing (no LLM classifier). When
     # RAG_MAINTENANCE_ROUTING points at a frozen-routing manifest, node_classify reuses each doc's
     # frozen category_l1/l2 (deterministic routing, chunk family preserved) and fails closed on any
