@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS LaunchAgent for the standing health monitor (ops_monitor), READ-ONLY reconcilers.
+     Install:  cp deploy/com.fuling.ops-monitor.plist ~/Library/LaunchAgents/
+               launchctl load  ~/Library/LaunchAgents/com.fuling.ops-monitor.plist
+     Uninstall: launchctl unload ~/Library/LaunchAgents/com.fuling.ops-monitor.plist && rm it
+     Run-now (test): launchctl start com.fuling.ops-monitor
+     NOTE: laptop sleeps → StartCalendarInterval fires at 02:30 if awake, else once on next wake.
+     For a true nightly cadence use an always-on host (crontab line in docs/ops_monitoring_schedule.md). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fuling.ops-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/deploy/run_ops_monitor.sh</string>
+    <string>--only</string>
+    <string>reconcile_ha3</string>
+    <string>reconcile_oss</string>
+    <string>reconcile_raw</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RAG_PY</key><string>/Users/laijunchen/opt/anaconda3/envs/stack-test/bin/python</string>
+    <key>RAG_OPS_ENV</key><string>prod_ro</string>
+    <!-- set these to deliver OBS-4 alerts on drift (else the alert path is a logged no-op):
+    <key>RAG_OPS_ALERT_WEBHOOK</key><string>https://oapi.dingtalk.com/robot/send?access_token=…</string>
+    <key>RAG_OPS_ALERT_SECRET</key><string>SEC…</string> -->
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>30</integer></dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/scratch/ops_monitor.launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/scratch/ops_monitor.launchd.err</string>
+</dict>
+</plist>

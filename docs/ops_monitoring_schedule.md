@@ -72,6 +72,31 @@ Notes:
   console (it can't be deleted via the MCP — its id `5203574917819388193` exceeds 2^53). It's inert
   (recurrence=Pause) so there's no rush.
 
+### macOS host (LaunchAgent) + the ~/Downloads TCC blocker (2026-06-17)
+
+On macOS use a **LaunchAgent**, not `cron` (cron is deprecated, needs Full Disk Access, and handles
+sleep poorly; a LaunchAgent's `StartCalendarInterval` fires at the time if awake, else once on wake).
+Committed artifacts: `deploy/run_ops_monitor.sh` (portable wrapper — `RAG_REPO`/`RAG_PY`/`RAG_OPS_ENV`
+overridable, defaults to the read-only reconcilers) + `deploy/com.fuling.ops-monitor.plist` (daily 02:30,
+read-only, stack-test python). Install: `cp` the plist to `~/Library/LaunchAgents/` then
+`launchctl load -w …`; test with `launchctl kickstart gui/$(id -u)/com.fuling.ops-monitor`.
+
+⚠️ **CONFIRMED BLOCKER on this laptop:** the repo lives under `~/Downloads`, and modern macOS **TCC
+denies launchd ALL access to ~/Downloads** (verified: a launchd job got `Operation not permitted` even
+just `head`-ing `.env.prod_ro`; exit 126). The wrapper runs fine from an interactive shell (Terminal
+has Downloads access) but a LaunchAgent does not. Three fixes, ranked:
+1. **Always-on Linux host + crontab** (best — no TCC, true nightly):
+   `30 2 * * * RAG_REPO=/path/to/repo RAG_PY=/path/to/python /path/to/repo/deploy/run_ops_monitor.sh`
+2. **Move the repo out of `~/Downloads`** on this Mac (e.g. `~/rag-pipeline/`) → the LaunchAgent then
+   works with no security change (update the plist's absolute paths).
+3. **Grant Full Disk Access** to `/bin/bash` (and the python) in System Settings → Privacy & Security →
+   Full Disk Access (a manual GUI step; broader permission). Then re-load the agent.
+
+The agent is currently **unloaded** (not left failing daily). Re-enable after picking a fix. Note also:
+the read-only set exits **2** today because `reconcile_raw` flags 1 known benign gap
+(`DOC_ADMIN_20260513120213_14D1C1` raw `.docx` missing from OSS) — resolve/triage that or drop
+`reconcile_raw` from the daily args if you want green-when-healthy signal.
+
 ## Path B — DataWorks scheduled node (requires a one-time deployment)
 
 Prerequisites that do **not** exist yet for this project:
