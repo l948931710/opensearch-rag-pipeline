@@ -9,10 +9,11 @@ def test_run_all_sequences_selected_jobs(monkeypatch):
     import opensearch_pipeline.qa_rollup as qr
     monkeypatch.setattr(rec, "run_parity_check", lambda **k: calls.append("ha3") or {"ok": True})
     monkeypatch.setattr(rec, "run_oss_parity_check", lambda **k: calls.append("oss") or {"ok": True})
+    monkeypatch.setattr(rec, "run_raw_parity_check", lambda **k: calls.append("raw") or {"ok": True})
     monkeypatch.setattr(qr, "run_rollup", lambda **k: calls.append("rollup") or {"ok": True, "slo_ok": 1})
     out = ops_monitor.run_all(alert=False)
-    assert set(out) == {"reconcile_ha3", "reconcile_oss", "qa_rollup"}
-    assert calls == ["ha3", "oss", "rollup"]
+    assert set(out) == {"reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup"}
+    assert calls == ["ha3", "oss", "raw", "rollup"]
 
 
 def test_run_all_only_subset(monkeypatch):

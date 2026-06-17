@@ -26,7 +26,7 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-_JOBS = ("reconcile_ha3", "reconcile_oss", "qa_rollup")
+_JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup")
 
 
 def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
@@ -40,6 +40,9 @@ def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
     if "reconcile_oss" in sel:
         from opensearch_pipeline.reconcile import run_oss_parity_check
         out["reconcile_oss"] = run_oss_parity_check(alert=alert)
+    if "reconcile_raw" in sel:
+        from opensearch_pipeline.reconcile import run_raw_parity_check
+        out["reconcile_raw"] = run_raw_parity_check(alert=alert)
     if "qa_rollup" in sel:
         from opensearch_pipeline.qa_rollup import run_rollup
         out["qa_rollup"] = run_rollup(alert=alert)

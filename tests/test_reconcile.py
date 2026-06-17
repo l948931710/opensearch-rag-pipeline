@@ -236,6 +236,47 @@ def test_run_oss_parity_check_fail_open(monkeypatch):
     assert rep["ok"] is False and "oss-ro down" in rep["error"]
 
 
+# ── CS4b: raw_key↔OSS parity ──
+
+def test_compute_raw_parity_missing_and_null():
+    rows = [
+        {"doc_id": "dA", "version_no": 1, "raw_key": "raw/a.docx"},   # exists
+        {"doc_id": "dB", "version_no": 2, "raw_key": "raw/gone.docx"},  # missing
+        {"doc_id": "dC", "version_no": 1, "raw_key": None},            # null → not a missing-file
+    ]
+    exists = {"raw/a.docx"}
+    rep = reconcile.compute_raw_parity(rows, lambda k: k in exists)
+    assert rep["ok"] is False
+    assert rep["counts"] == {"total": 3, "have_raw_key": 2, "null_raw_key": 1, "missing": 1}
+    assert rep["missing"][0]["doc_id"] == "dB"
+    assert rep["null_raw_key_sample"] == ["dC"]
+
+
+def test_compute_raw_parity_clean():
+    rows = [{"doc_id": "dA", "version_no": 1, "raw_key": "raw/a.docx"}]
+    rep = reconcile.compute_raw_parity(rows, lambda k: True)
+    assert rep["ok"] is True and rep["counts"]["missing"] == 0
+
+
+def test_run_raw_parity_check_simulate_is_noop(monkeypatch):
+    from opensearch_pipeline.config import get_config
+    monkeypatch.setattr(get_config(), "simulate", True)
+    rep = reconcile.run_raw_parity_check()
+    assert rep["ok"] is True and rep.get("skipped") == "simulate"
+
+
+def test_run_raw_parity_check_fail_open(monkeypatch):
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(cfg, "simulate_db", False)
+    import opensearch_pipeline.prod_access as pa
+    monkeypatch.setattr(pa, "get_prod_readonly_conn",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("raw-ro down")))
+    rep = reconcile.run_raw_parity_check()
+    assert rep["ok"] is False and "raw-ro down" in rep["error"]
+
+
 # ── CLI exit codes ──
 
 def test_cli_exit_codes(monkeypatch, capsys):

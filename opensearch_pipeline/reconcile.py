@@ -364,6 +364,83 @@ def _alert_on_oss_drift(report: Dict[str, Any]) -> None:
         logger.warning("reconcile(oss): ops-alert dispatch failed (non-fatal)", exc_info=True)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CS4b — raw_key↔OSS parity (the source-file gap CS4 doesn't cover)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_raw_parity(rows: List[Dict[str, Any]], exists_fn) -> Dict[str, Any]:
+    """Pure (+ injected exists_fn): of current-version active docs, which raw_key OSS objects are
+    MISSING. rows: [{doc_id, version_no, raw_key}]; exists_fn(key)->bool (True iff object exists).
+    A NULL raw_key is 'unregistered' (reported separately, not a missing-file). CS4 checks image keys
+    only; this closes the raw source-file gap (the DC-3-survey 404). Lower severity: a missing raw does
+    NOT break serving (canonical/chunks already exist) — it's a re-ingest/audit concern."""
+    null_raw = [r for r in rows if not r.get("raw_key")]
+    have = [r for r in rows if r.get("raw_key")]
+    missing = [r for r in have if not exists_fn(r["raw_key"])]
+    return {
+        "ok": not missing,
+        "counts": {"total": len(rows), "have_raw_key": len(have),
+                   "null_raw_key": len(null_raw), "missing": len(missing)},
+        "missing": [{"doc_id": r.get("doc_id"), "version_no": r.get("version_no"),
+                     "raw_key": r.get("raw_key")} for r in missing[:50]],
+        "null_raw_key_sample": [r.get("doc_id") for r in null_raw[:20]],
+    }
+
+
+def run_raw_parity_check(*, alert: bool = False) -> Dict[str, Any]:
+    """CS4b: current-version active docs whose raw_key OSS object is missing. Read-only, simulate-safe,
+    fail-open. HEAD-checks each raw_key (bounded to active docs)."""
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    if cfg.simulate or cfg.simulate_db:
+        logger.info("reconcile(raw): simulate mode → skipped no-op")
+        return {"ok": True, "skipped": "simulate", "complete": True, "counts": {}}
+    try:
+        conn = _rds_conn()
+        try:
+            with conn.cursor() as c:
+                c.execute("""SELECT v.doc_id, v.version_no, v.raw_key
+                             FROM fuling_knowledge.document_version v
+                             JOIN fuling_knowledge.document_meta m
+                               ON m.doc_id=v.doc_id AND m.current_version_no=v.version_no
+                             WHERE m.status='active'""")
+                rows = _as_dict_rows(c.fetchall(), ("doc_id", "version_no", "raw_key"))
+        finally:
+            conn.close()
+        bucket = _oss_bucket()
+
+        def _exists(k):
+            try:
+                return bool(bucket.object_exists(k))
+            except Exception:  # noqa: BLE001 — conservative: HEAD error → treat as exists (no false alarm)
+                return True
+
+        report = compute_raw_parity(rows, _exists)
+        report["complete"] = True
+    except Exception as e:  # noqa: BLE001 — fail-open
+        logger.exception("reconcile(raw): parity check failed")
+        report = {"ok": False, "complete": False, "error": f"{type(e).__name__}: {e}", "counts": {}}
+    if alert and (not report.get("ok") or report.get("error")):
+        _alert_on_raw_drift(report)
+    return report
+
+
+def _alert_on_raw_drift(report: Dict[str, Any]) -> None:
+    """Fire one OBS-4 ops alert summarizing raw_key→OSS drift (fail-open)."""
+    try:
+        from opensearch_pipeline.alerting import send_ops_alert
+        c = report.get("counts", {})
+        if report.get("error"):
+            text = f"raw_key parity check errored: {report['error']}"
+        else:
+            text = (f"active docs whose raw source file is MISSING from OSS: **{c.get('missing', 0)}** "
+                    f"(of {c.get('have_raw_key', 0)} with raw_key; {c.get('null_raw_key', 0)} have none)")
+        send_ops_alert("raw_key↔OSS parity drift", text, severity="warning",
+                       dedup_key="reconcile:raw-oss-parity")
+    except Exception:  # noqa: BLE001
+        logger.warning("reconcile(raw): ops-alert dispatch failed (non-fatal)", exc_info=True)
+
+
 def _alert_on_drift(report: Dict[str, Any]) -> None:
     """Fire one OBS-4 ops alert summarizing recall-loss drift (fail-open)."""
     try:
@@ -426,14 +503,29 @@ def _print_oss(report: Dict[str, Any]) -> None:
         print(f"    MISSING {m['oss_key']} (chunk={m['chunk_id']})")
 
 
+def _print_raw(report: Dict[str, Any]) -> None:
+    if report.get("skipped"):
+        print(f"[reconcile:raw] skipped ({report['skipped']})")
+        return
+    c = report.get("counts", {})
+    print(f"[reconcile:raw] ok={report.get('ok')} complete={report.get('complete')}")
+    print(f"  current-version active docs={c.get('total')} "
+          f"(with raw_key={c.get('have_raw_key')}, null={c.get('null_raw_key')})")
+    print(f"  ⚠️ raw source MISSING from OSS = {c.get('missing')} (CS4 covers image keys only)")
+    if report.get("error"):
+        print(f"  ERROR: {report['error']}")
+    for m in report.get("missing", [])[:10]:
+        print(f"    MISSING {m['doc_id']} v{m['version_no']} raw_key={m['raw_key']}")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI. Runs the selected cross-store parity check(s). Exit = worst of the run codes
     (0 = ok / simulate-skipped; 2 = drift; 3 = error/incomplete)."""
     import argparse
     import json
 
-    ap = argparse.ArgumentParser(description="read-only cross-store parity reconciler (CS3 + CS4)")
-    ap.add_argument("--check", choices=["ha3", "oss", "all"], default="all",
+    ap = argparse.ArgumentParser(description="read-only cross-store parity reconciler (CS3 + CS4 + CS4b)")
+    ap.add_argument("--check", choices=["ha3", "oss", "raw", "all"], default="all",
                     help="which parity check to run (default: all)")
     ap.add_argument("--alert", action="store_true", help="fire an OBS-4 ops alert on drift/error")
     ap.add_argument("--json", action="store_true", help="emit the full report(s) as JSON")
@@ -445,6 +537,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         reports["ha3"] = run_parity_check(alert=args.alert, hi=args.hi)
     if args.check in ("oss", "all"):
         reports["oss"] = run_oss_parity_check(alert=args.alert)
+    if args.check in ("raw", "all"):
+        reports["raw"] = run_raw_parity_check(alert=args.alert)
 
     if args.json:
         print(json.dumps(reports, ensure_ascii=False, indent=2, default=str))
@@ -453,6 +547,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _print_ha3(reports["ha3"])
         if "oss" in reports:
             _print_oss(reports["oss"])
+        if "raw" in reports:
+            _print_raw(reports["raw"])
 
     return max((_exit_code(r) for r in reports.values()), default=0)
 
