@@ -4116,6 +4116,26 @@ def _rechunk_delete_targets(valid_chunks, canonicals):
     return doc_versions
 
 
+def _compute_chunk_set_hashes(chunks) -> dict:
+    """Per (doc_id, version_no) sha256 over the ORDERED (chunk_index, chunk_type, chunk_text) tuples.
+
+    A deterministic re-chunk-parity fingerprint (L3): independent of created_at / ids / git_commit,
+    so a frozen-routing maintenance re-chunk of the same canonical text reproduces the same hash.
+    Returned as {(doc_id, version_no): hex16}; persisted into extra_json for in-band parity checks.
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for c in chunks:
+        groups[(c.doc_id, c.version_no)].append(c)
+    out = {}
+    for key, cs in groups.items():
+        h = hashlib.sha256()
+        for c in sorted(cs, key=lambda c: c.chunk_index):
+            h.update(f"{c.chunk_index}\x1f{c.chunk_type}\x1f{c.chunk_text}\x1e".encode("utf-8"))
+        out[key] = h.hexdigest()[:16]
+    return out
+
+
 def node_write_chunk_meta(ctx: dict):
     """
     将验证通过的 chunks 写入 RDS chunk_meta。
@@ -4192,15 +4212,32 @@ def node_write_chunk_meta(ctx: dict):
                     )
                 """
                 import json as _json
+                # L3 provenance: per-run code/model versions (ctx['run_provenance'] from L1, with a
+                # read-only fallback) + per-(doc,version) chunk_set_hash, merged into extra_json so a
+                # stored chunk is traceable to its producing revision and re-chunk parity is verifiable
+                # from stored state. Additive JSON keys only; chunk.extra itself is never mutated, so
+                # to_ha3_doc / image-ref extraction below are unaffected.
+                _prov = ctx.get("run_provenance")
+                if not _prov:
+                    from opensearch_pipeline.versions import build_run_provenance
+                    _prov = build_run_provenance(bizdate=ctx.get("bizdate"))
+                _provenance = {k: _prov.get(k) for k in (
+                    "git_commit", "extractor_version", "chunker_version",
+                    "detector_version", "embedding_model_version", "bizdate")}
+                _chunk_set_hashes = _compute_chunk_set_hashes(valid_chunks)
+
                 insert_rows = []
                 for chunk in valid_chunks:
                     rag_ready_key = rag_ready_map.get(chunk.doc_id, "")
                     preview = chunk.chunk_text[:200]
 
-                    # 序列化 extra dict → JSON 字符串（图片 chunk 的 source_image/visual_summary/oss_key）
-                    extra_json_val = None
-                    if chunk.extra:
-                        extra_json_val = _json.dumps(chunk.extra, ensure_ascii=False)
+                    # 序列化 extra dict → JSON（图片 chunk 的 source_image/visual_summary/oss_key）
+                    # + 合并 L3 provenance + chunk_set_hash（构造新 dict，不就地改 chunk.extra）。
+                    _extra_for_json = dict(chunk.extra or {})
+                    _extra_for_json["_provenance"] = _provenance
+                    _extra_for_json["_chunk_set_hash"] = _chunk_set_hashes.get(
+                        (chunk.doc_id, chunk.version_no))
+                    extra_json_val = _json.dumps(_extra_for_json, ensure_ascii=False)
 
                     # Step Card 专有字段（从 extra 中提取）
                     parent_chunk_id = chunk.extra.get("parent_chunk_id") if chunk.extra else None
@@ -5455,6 +5492,7 @@ def node_update_index_status(ctx: dict):
         return
 
     from datetime import datetime
+    from opensearch_pipeline.versions import EMBEDDING_MODEL_VERSION  # L3: populate embedding_version
     
     batches = ctx.get("bulk_batches")
     if batches is None:
@@ -5548,6 +5586,7 @@ def node_update_index_status(ctx: dict):
                             SET 
                                 embedding_status = %s,
                                 embedding_model = %s,
+                                embedding_version = %s,
                                 embedding_dimension = %s,
                                 embedded_at = %s,
                                 index_status = %s,
@@ -5561,6 +5600,7 @@ def node_update_index_status(ctx: dict):
                         """, (
                             chunk.embedding_status,
                             chunk.embedding_model,
+                            EMBEDDING_MODEL_VERSION,
                             dim,
                             emb_at,
                             chunk.index_status,
