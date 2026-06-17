@@ -25,7 +25,11 @@
     <string>--only</string>
     <string>reconcile_ha3</string>
     <string>reconcile_oss</string>
-    <string>reconcile_raw</string>
+    <!-- reconcile_raw intentionally NOT in the daily set: it exit-2's on the 1 known benign raw_key
+         gap (DOC_ADMIN_…14D1C1), which would train RED-blindness. Daily = recall-critical ha3+oss
+         (green-when-healthy → RED means a real new problem). Run reconcile_raw ad-hoc:
+           RAG_ENV=prod_ro /usr/bin/python3 -m opensearch_pipeline.reconcile --check raw
+         (or add a separate weekly agent once that 1 doc's raw is triaged). -->
   </array>
   <key>WorkingDirectory</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
   <key>EnvironmentVariables</key>
