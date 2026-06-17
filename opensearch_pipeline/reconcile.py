@@ -32,6 +32,41 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BUCKET = 500
 _HI_HEADROOM = 1000  # scan past max(rds.id) so freshly-pushed-but-unrecorded rows still surface
 _OSS_IMAGE_PREFIX = "processing/assets/"  # where active-chunk image_refs[].oss_key live
+_RDS_COLS = ("id", "chunk_id", "doc_id", "version_no", "is_active", "index_status", "chunk_type")
+
+
+# ── cred portability: run from the laptop (prod_access .env files → dedicated read-only fuling_ro)
+# OR inside a DataWorks pod / any host with injected RAG_ env vars (no .env files). Prefer the
+# read-only path; fall back to the config/env pool when prod_access finds no .env file. On
+# RAG_ENV=prod_ro the config pool is itself SESSION READ ONLY, so read-only safety holds on both
+# paths; the reconcilers only ever SELECT / HA3-query / OSS-list. ────────────────────────────────
+
+def _rds_conn():
+    from opensearch_pipeline.prod_access import ProdAccessError, get_prod_readonly_conn
+    try:
+        return get_prod_readonly_conn()
+    except ProdAccessError:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        return _get_db_conn(select_db=False)
+
+
+def _oss_bucket():
+    from opensearch_pipeline.prod_access import ProdAccessError, get_prod_oss_bucket
+    try:
+        return get_prod_oss_bucket()
+    except ProdAccessError:
+        import oss2
+        from opensearch_pipeline.config import get_config
+        from opensearch_pipeline.oss_url import _ensure_public_endpoint
+        from opensearch_pipeline.prod_access import _ReadOnlyBucket
+        oc = get_config().oss
+        auth = oss2.Auth(oc.access_key_id, oc.access_key_secret)
+        return _ReadOnlyBucket(oss2.Bucket(auth, _ensure_public_endpoint(oc.endpoint), oc.bucket_name))
+
+
+def _as_dict_rows(raw, cols):
+    """Normalize cursor rows to dicts regardless of cursor class (prod_access=DictCursor, pool=tuple)."""
+    return [r if isinstance(r, dict) else dict(zip(cols, r)) for r in raw]
 
 
 def compute_parity(rds_rows: List[Dict[str, Any]],
@@ -157,16 +192,15 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
         return {"ok": True, "skipped": "simulate", "complete": True, "counts": {}}
 
     try:
-        from opensearch_pipeline.prod_access import get_prod_readonly_conn
         from opensearch_pipeline.retriever import _get_ha3_client
 
-        conn = get_prod_readonly_conn()
+        conn = _rds_conn()
         try:
             with conn.cursor() as c:
                 c.execute("""SELECT id, chunk_id, doc_id, version_no, is_active,
                                     index_status, chunk_type
                              FROM fuling_knowledge.chunk_meta""")
-                rds_rows = list(c.fetchall())
+                rds_rows = _as_dict_rows(c.fetchall(), _RDS_COLS)
         finally:
             conn.close()
 
@@ -280,20 +314,18 @@ def run_oss_parity_check(*, alert: bool = False,
         return {"ok": True, "skipped": "simulate", "complete": True, "counts": {}}
 
     try:
-        from opensearch_pipeline.prod_access import get_prod_oss_bucket, get_prod_readonly_conn
-
-        conn = get_prod_readonly_conn()
+        conn = _rds_conn()
         try:
             with conn.cursor() as c:
                 c.execute("""SELECT chunk_id, is_active, extra_json
                              FROM fuling_knowledge.chunk_meta
                              WHERE is_active=1 AND extra_json LIKE %s""", ("%oss_key%",))
-                rds_rows = list(c.fetchall())
+                rds_rows = _as_dict_rows(c.fetchall(), ("chunk_id", "is_active", "extra_json"))
         finally:
             conn.close()
 
         referenced = collect_referenced_image_keys(rds_rows)
-        bucket = get_prod_oss_bucket()
+        bucket = _oss_bucket()
         present = _list_oss_keys(bucket, prefix)
 
         # HEAD-verify candidates so a referenced key under a different prefix (e.g. raw/*) is not a

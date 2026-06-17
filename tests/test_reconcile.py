@@ -109,6 +109,38 @@ def test_run_parity_check_fail_open_on_db_error(monkeypatch):
     assert rep["ok"] is False and "ro down" in rep["error"]
 
 
+def test_rds_conn_falls_back_to_pool_when_no_env_file(monkeypatch):
+    """Cred portability: when prod_access has no .env file (DataWorks pod), _rds_conn falls back to
+    the config/env pool (_get_db_conn) instead of failing."""
+    import opensearch_pipeline.prod_access as pa
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    def _raise_no_env(*a, **k):
+        raise pa.ProdAccessError("未找到生产侧 env 文件")
+
+    monkeypatch.setattr(pa, "get_prod_readonly_conn", _raise_no_env)
+    sentinel = object()
+    monkeypatch.setattr(pn, "_get_db_conn", lambda **k: sentinel)
+    assert reconcile._rds_conn() is sentinel
+
+
+def test_rds_conn_prefers_prod_access_when_available(monkeypatch):
+    """On the laptop (env file present), _rds_conn uses the dedicated read-only path, NOT the pool."""
+    import opensearch_pipeline.prod_access as pa
+    import opensearch_pipeline.pipeline_nodes as pn
+    ro = object()
+    monkeypatch.setattr(pa, "get_prod_readonly_conn", lambda *a, **k: ro)
+    monkeypatch.setattr(pn, "_get_db_conn",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("must not use pool")))
+    assert reconcile._rds_conn() is ro
+
+
+def test_as_dict_rows_handles_tuple_and_dict_cursors():
+    cols = ("id", "chunk_id")
+    assert reconcile._as_dict_rows([(1, "c1")], cols) == [{"id": 1, "chunk_id": "c1"}]
+    assert reconcile._as_dict_rows([{"id": 2, "chunk_id": "c2"}], cols) == [{"id": 2, "chunk_id": "c2"}]
+
+
 def test_run_parity_check_alerts_on_drift(monkeypatch):
     """alert=True + drift → exactly one OBS-4 ops alert, fail-open if it errors."""
     from opensearch_pipeline.config import get_config

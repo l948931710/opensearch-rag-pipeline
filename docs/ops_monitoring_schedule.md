@@ -58,6 +58,63 @@ Prerequisites that do **not** exist yet for this project:
 
 Once 1–2 exist, the node body is just the Path-A command. Until then, Path A is the supported route.
 
+## Path C — DataWorks custom image (the chosen production route)
+
+Correction to Path B: the ingestion pipeline **is** authored on DataWorks — in `default_workspace_6na2`
+(609583) as 5 `PYODPS3` stage nodes that load the package from the Archive resource
+`opensearch_pipeline_production.zip`, on the official **Python 3.7** PyODPS pod. The monitor can't use
+that pod directly: the import surface (`reconcile → retriever`, `qa_rollup → pipeline_nodes`) needs
+the third-party deps (pymysql/oss2/dashscope/ha3 SDK) at the right ABI, and a 3.7-built zip won't
+serve them on a newer Python. So the monitor runs on a **custom image** instead.
+
+Two prerequisites are already handled in code:
+- **Cred portability** (reconcile.py `_rds_conn`/`_oss_bucket`): the reconcilers prefer the dedicated
+  read-only `fuling_ro` path (`prod_access`, laptop `.env` files) and **fall back to the config/env
+  pool** when no `.env` file is present (a DataWorks pod). So the monitor reaches prod from injected
+  env vars, no `.env` file needed. `qa_rollup` already used the config/env pool.
+- **Self-contained node**: the image bakes the package (`COPY opensearch_pipeline` + `PYTHONPATH`), so
+  the node script is a plain `import` + `ops_monitor.main([])` — no `##@resource_reference` boilerplate.
+
+### Steps
+
+1. **Build + push the image** from `deploy/dataworks_monitor.Dockerfile` (build context = repo root).
+   - Fill the `BASE` arg with the **exact** official py311 pod-image tag from DataWorks
+     console → 镜像管理 (region/version-pinned — a guessed tag fails the build).
+   - The build's `pip install` needs network egress: the Serverless RG's VPC must have a NAT/proxy, or
+     use the Aliyun PyPI mirror (already the default `PIP_INDEX`).
+   - Push to a registry DataWorks can pull (Aliyun ACR). Register under 镜像管理 → 自定义镜像.
+   - Limits: ≤10 GB/image, ≤10 images/tenant; custom images are **Serverless-RG only**.
+2. **Point the `ops_health_monitor` node at the image** — in the DataStudio console (the MCP can't
+   reliably update the node: its id `5203574917819388193` exceeds 2^53 and truncates as a float).
+   Select the custom image in **BOTH** 运行配置 **and** 调度配置 — they must match (documented footgun).
+3. **Replace the node script** with the clean version (image already has the code on `PYTHONPATH`):
+   ```python
+   import sys
+   print("python:", sys.version)
+   try:
+       import opensearch_pipeline
+       print("opensearch_pipeline:", opensearch_pipeline.__file__)
+   except Exception as e:
+       print("IMPORT FAILED:", type(e).__name__, e); raise
+   from opensearch_pipeline.ops_monitor import main
+   sys.exit(main([]))
+   ```
+4. **Set the cred env vars** on the node/workspace (NOT baked in the image):
+   - The same `RAG_*` storage creds your stage nodes already use (RDS / HA3 / OSS). `qa_rollup` writes
+     `qa_daily_metrics`, so the env must be **write-capable** (production creds, not `prod_ro`); the
+     reconcilers only SELECT/list.
+   - `RAG_OPS_ALERT_WEBHOOK` (+ `RAG_OPS_ALERT_SECRET`) — or OBS-4 alerts are a silent no-op.
+   - Optional SLO overrides: `RAG_SLO_ANSWER_RATE_MIN` etc. (defaults already ratified).
+5. **Validate**: 临时运行 (test run). Expect `opensearch_pipeline: /opt/rag/...` and the
+   `[ops_monitor] reconcile_ha3: ok / reconcile_oss: ok / qa_rollup: ...` lines. Exit 0 ok / 2
+   drift-or-SLO-breach / 3 error.
+6. **Activate**: 提交/发布, then set `recurrence` Pause → Normal. Runs daily 02:30 Asia/Shanghai.
+
+### Updating later
+- Code change → rebuild + repush the image (code-in-image). Or switch to the zip-reference approach if
+  you want code updates without image rebuilds.
+- Dep change → rebuild the image.
+
 ## Verifying a run
 
 ```bash
