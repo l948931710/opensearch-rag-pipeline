@@ -35,7 +35,10 @@
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>50</integer></dict>
   <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/scratch/qa_rollup.launchd.out</string>
-  <key>StandardErrorPath</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/scratch/qa_rollup.launchd.err</string>
+  <!-- logs MUST live outside ~/Downloads: launchd opens StandardOut/ErrorPath as launchd (not the
+       FDA'd python), and macOS TCC blocks launchd from ~/Downloads → EX_CONFIG (78) spawn failure.
+       ~/Library/Logs is the conventional, non-TCC-restricted location. -->
+  <key>StandardOutPath</key><string>/Users/laijunchen/Library/Logs/fuling-qa-rollup.out</string>
+  <key>StandardErrorPath</key><string>/Users/laijunchen/Library/Logs/fuling-qa-rollup.err</string>
 </dict>
 </plist>

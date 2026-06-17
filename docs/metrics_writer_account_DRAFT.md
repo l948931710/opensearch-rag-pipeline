@@ -1,9 +1,13 @@
-# DRAFT — least-privilege metrics-writer account for OBS-5 `qa_rollup`
+# Least-privilege metrics-writer account for OBS-5 `qa_rollup`
 
-> ⚠️ **DRAFT / NOT APPLIED.** This documents a proposed DB account + config so the OBS-5 nightly
-> `qa_rollup` (the only **write** job in `ops_monitor`) can run in a standing cron **without**
-> `fuling_admin` creds sitting in a scheduled job. **Do not run the SQL or create the account until
-> reviewed.** (User decision pending — drafted 2026-06-17.)
+> ✅ **APPLIED 2026-06-17.** `fuling_metrics` created (by the user), `.env.metrics` authored,
+> 16 complete days back-filled into `qa_daily_metrics`, and the `com.fuling.qa-rollup` LaunchAgent is
+> live (daily 02:50, verified exit 0 through launchd). The SLO eval surfaces real signal (9/16 days
+> breached, almost all p95-latency 70–88s ≫ 8s threshold + the 06-08 answer-rate incident).
+> **Operational gotcha found:** launchd opens a LaunchAgent's `StandardOutPath`/`StandardErrorPath`
+> as *launchd itself* (not the FDA'd python), and macOS TCC blocks launchd from `~/Downloads` →
+> `EX_CONFIG (78)` spawn failure with empty logs. Fix: agent logs live in `~/Library/Logs`, not the
+> repo's `scratch/`. The original draft (account design + grants) follows for the record.
 
 ## Why
 
@@ -96,12 +100,11 @@ RAG_ENV=metrics /usr/bin/python3 -m opensearch_pipeline.qa_rollup --date <YYYY-M
 - [x] Write-agent `deploy/com.fuling.qa-rollup.plist` committed (built, NOT installed)
 - [x] Config-guard path confirmed: base `.env` auto-satisfies the production guard; `.env.metrics` = `cp` + 3 lines
 
-**You must run (credential / access-control steps Claude is not permitted to perform):**
-- [ ] DBA review of the grants
-- [ ] `openssl rand -base64 24` → password; run the `CREATE USER` + `GRANT` SQL as `fuling_admin`
-- [ ] RDS IP-whitelist the cron host; restrict the user host if its egress IP is static
-- [ ] `cp .env.production .env.metrics`, set the 3 RDS lines (user/password/database)
+**You ran (credential / access-control steps Claude is not permitted to perform):**
+- [x] `CREATE USER` + `GRANT` SQL as `fuling_admin` (verified: connects as `fuling_metrics@%`, grants exact)
+- [x] `.env.metrics` authored (3 RDS lines; gitignored)
+- [ ] RDS IP-whitelist — N/A on this Mac (same host already reaches RDS); revisit if moved to a server
 
-**Then Claude can verify (on your go):**
-- [ ] back-fill run + confirm a `qa_daily_metrics` row lands + SLO verdict is sane
-- [ ] install + kickstart `com.fuling.qa-rollup`; confirm it writes via launchd
+**Claude verified (done):**
+- [x] back-fill: 16 complete days (2026-05-28..06-17) landed in `qa_daily_metrics`; SLO verdicts sane
+- [x] installed + kickstarted `com.fuling.qa-rollup`; writes via launchd, exit 0 (logs → ~/Library/Logs)
