@@ -42,12 +42,18 @@ def _strict_enabled(args) -> bool:
 
 
 def _strict_failures(gates: dict, results: dict) -> list:
-    """Hard-fail reasons under --strict: any gate whose pass is False, or L6 NO_GO_DEFECT.
+    """Hard-fail reasons under --strict: any gate whose pass is False, or L6 NO_GO_DEFECT,
+    or EVAL-2 manifest drift (extractor/sha256/ref-key) detected during preflight.
     L6 NO_GO_INCOMPLETE_EVIDENCE is advisory (not a hard fail) — missing evidence shouldn't block;
     a detected defect should. (Flip via policy later if desired.)"""
     fails = [name for name, g in (gates or {}).items() if g.get("pass") is False]
     if (results.get("l6") or {}).get("state") == "NO_GO_DEFECT":
         fails.append("l6:NO_GO_DEFECT")
+    # EVAL-2: count any errors prefixed "manifest_drift::" surfaced by ingestion_binding preflight
+    _errs = ((results.get("l4") or {}).get("ingestion") or {}).get("deterministic", {}).get("errors") or []
+    _drift = [e for e in _errs if isinstance(e, str) and e.startswith("manifest_drift::")]
+    if _drift:
+        fails.append(f"l4:manifest_drift({len(_drift)})")
     return fails
 
 
@@ -131,10 +137,13 @@ def phase_run(args):
                 os.path.join(_data, "ground_truth", "gt_docx_analysis.json"),
             ] if os.path.exists(p)]
         docs_dir = os.environ.get("EVAL_L4_DOCS_DIR") or os.path.join(_data, "documents")
+        # EVAL-2: image-manifest dir for GT preflight; default mirrors the existing CLI heuristic
+        manifest_dir = os.environ.get("EVAL_L4_MANIFEST_DIR") or os.path.join(_data, "scratch", "eval_manifest")
         results["l4"] = l4_multimodal.run(
             cases,
             gt_files=gt_files if gt_files else None,
             docs_dir=docs_dir if os.path.isdir(docs_dir) else None,
+            manifest_dir=manifest_dir if os.path.isdir(manifest_dir) else None,
         )
         if results["l4"].get("applicable"):
             # serving bundle(可能为空)

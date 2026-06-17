@@ -74,21 +74,24 @@ def _run_serving(cases: List[Dict], top_k: int, max_images: int) -> Dict:
     }
 
 
-def _run_ingestion(gt_files: List[str], docs_dir: str) -> Optional[Dict]:
+def _run_ingestion(gt_files: List[str], docs_dir: str,
+                   manifest_dir: Optional[str] = None) -> Optional[Dict]:
     """L4-ingestion:摄入侧图文绑定精度(逐格式 Jaccard)。
 
     Fail-open:子包内部抛异常返回带 error 的 dict,不阻断 l4 layer 调用。
+    EVAL-2: 透传 manifest_dir 用于 GT-manifest preflight 漂移检测。
     """
     try:
         from eval_harness.binding import ingestion_binding
-        return ingestion_binding.run(gt_files, docs_dir)
+        return ingestion_binding.run(gt_files, docs_dir, manifest_dir=manifest_dir)
     except Exception as e:
         return {"deterministic": {"errors": [f"l4-ingestion exception: {type(e).__name__}: {e}"]},
                 "per_doc": [], "judge_bundle_binding": []}
 
 
 def run(cases: List[Dict], top_k: int = 7, max_images: int = 3,
-        gt_files: Optional[List[str]] = None, docs_dir: Optional[str] = None) -> Dict:
+        gt_files: Optional[List[str]] = None, docs_dir: Optional[str] = None,
+        manifest_dir: Optional[str] = None) -> Dict:
     """L4 双支柱。两个支柱独立触发、独立 fail-open;applicable=True 当任一支柱出数。
 
     Args:
@@ -97,7 +100,7 @@ def run(cases: List[Dict], top_k: int = 7, max_images: int = 3,
         docs_dir: ingestion 用的源文档目录(eval_samples/documents/)
     """
     serving = _run_serving(cases, top_k=top_k, max_images=max_images)
-    ingestion = _run_ingestion(gt_files, docs_dir) if (gt_files and docs_dir) else None
+    ingestion = _run_ingestion(gt_files, docs_dir, manifest_dir) if (gt_files and docs_dir) else None
 
     applicable = bool(serving.get("applicable") or ingestion)
     if not applicable:

@@ -89,3 +89,57 @@ def test_ci_workflow_present_and_runs_tests_in_simulate():
     assert "pull_request" in txt, "CI must run on PRs"
     assert "pytest tests/" in txt, "CI must run the test suite"
     assert "RAG_SIMULATE" in txt, "CI must run in simulate mode (no cloud creds)"
+
+
+# ── EVAL-2: GT-manifest preflight wired into the L4 run-path ──
+
+def test_eval2_preflight_missing_manifest_is_not_drift(tmp_path):
+    """Graceful skip when no manifest is authored yet — NOT a drift."""
+    from eval_harness.binding.gt_loader import GtDoc
+    from eval_harness.binding.ingestion_binding import _preflight_manifest
+    doc = GtDoc(label="d", fmt="pdf", doc_sha256="s", extractor_version="x",
+                manifest_path=None, degraded=False, gt_chunks=[])
+    assert _preflight_manifest(doc, "d", None) is None
+    assert _preflight_manifest(doc, "d", str(tmp_path)) is None  # dir exists, file doesn't
+
+
+def test_eval2_preflight_drift_returns_reason(tmp_path, monkeypatch):
+    """A drifted manifest (extractor_version mismatch) returns a non-empty reason string."""
+    import json
+    from eval_harness.binding.gt_loader import GtDoc
+    from eval_harness.binding import ingestion_binding
+
+    mp = tmp_path / "d_images.json"
+    json.dump({"_meta": {"extractor_version": "v2", "doc_sha256": "abc"}, "images": []},
+              open(mp, "w"))
+    doc = GtDoc(label="d", fmt="pdf", doc_sha256="abc", extractor_version="v1",
+                manifest_path=str(mp), degraded=False, gt_chunks=[])
+    reason = ingestion_binding._preflight_manifest(doc, "d", None)
+    assert reason and "extractor_version" in reason
+
+
+def test_eval2_preflight_ok_returns_none(tmp_path):
+    """A clean manifest returns None (no drift)."""
+    import json
+    from eval_harness.binding.gt_loader import GtDoc
+    from eval_harness.binding import ingestion_binding
+
+    mp = tmp_path / "d_images.json"
+    json.dump({"_meta": {"extractor_version": "v1", "doc_sha256": "abc"}, "images": []},
+              open(mp, "w"))
+    doc = GtDoc(label="d", fmt="pdf", doc_sha256="abc", extractor_version="v1",
+                manifest_path=str(mp), degraded=False, gt_chunks=[])
+    assert ingestion_binding._preflight_manifest(doc, "d", None) is None
+
+
+def test_eval2_strict_fails_on_manifest_drift_error():
+    """_strict_failures must surface manifest_drift errors as a hard gate failure."""
+    from eval_harness.run_eval import _strict_failures
+    results = {"l4": {"ingestion": {"deterministic": {"errors": [
+        "manifest_drift::doc_a: extractor_version 漂移",
+        "other_error",
+    ]}}}}
+    fails = _strict_failures({}, results)
+    assert any("manifest_drift" in f for f in fails)
+    # no drift → no failure
+    assert _strict_failures({}, {"l4": {"ingestion": {"deterministic": {"errors": []}}}}) == []

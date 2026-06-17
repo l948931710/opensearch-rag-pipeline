@@ -46,7 +46,7 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from .ref_keys import ImageRef, jaccard, img_dup_factor, parse_ref_dict
-from .gt_loader import GtChunk, GtDoc, load_gt
+from .gt_loader import GtChunk, GtDoc, load_gt, validate_gt_against_manifest
 
 
 # ── DOCX 独立 strict 路径(env-gated)─────────────────────────────────
@@ -604,14 +604,38 @@ def _run_docx_strict_path(
     }
 
 
+def _preflight_manifest(doc: GtDoc, label: str,
+                        manifest_dir: Optional[str]) -> Optional[str]:
+    """EVAL-2: pre-flight a GT doc against its image manifest. Return a non-empty drift-reason
+    string if the manifest exists and the GT has drifted (extractor_version / doc_sha256 / ref-key
+    mismatch); return None for OK or graceful-skip (no manifest authored yet).
+
+    `validate_gt_against_manifest` conflates "manifest not found" with drift in its ok=False path,
+    so we MUST distinguish them — only true drift should flag degraded; a missing manifest is just
+    "preflight not authored" and falls through to normal evaluation.
+    """
+    mp = doc.manifest_path or (
+        os.path.join(manifest_dir, f"{label}_images.json") if manifest_dir else None)
+    if not mp or not os.path.exists(mp):
+        return None  # graceful: no manifest authored yet
+    res = validate_gt_against_manifest(doc, mp)
+    if res.get("ok"):
+        return None
+    real = [r for r in (res.get("reasons") or []) if "manifest not found" not in r]
+    return "; ".join(real) if real else None
+
+
 def run(gt_files: List[str], docs_dir: str, *,
-        only_fmt: Optional[str] = None) -> Dict[str, Any]:
+        only_fmt: Optional[str] = None,
+        manifest_dir: Optional[str] = None) -> Dict[str, Any]:
     """跑全套 ingestion 绑定评测。
 
     Args:
         gt_files: 1 个或多个 ground_truth/*.json 路径
         docs_dir: 源文档目录(eval_samples/documents/)
         only_fmt: 只跑指定格式(docx/pdf/xlsx/pptx)— 用于 eval_image_binding_pdf 等独立脚本
+        manifest_dir: image-manifest 目录(EVAL-2 preflight 用,可选)。若 GT 含 manifest_path
+            则优先用,否则用 `{manifest_dir}/{label}_images.json` 兜底。
 
     返回 l4_multimodal ingestion 支柱契约的 dict。fail-open:单 doc 失败入 errors 不阻断。
     """
@@ -632,6 +656,15 @@ def run(gt_files: List[str], docs_dir: str, *,
     dup_factors_all: List[float] = []
 
     for label, doc in all_docs.items():
+        # EVAL-2: GT-manifest preflight. Drift (extractor_version / doc_sha256 / ref-key) → mark
+        # degraded so jaccard accounting skips it (reuses the existing degraded-skip path), and log
+        # `manifest_drift::{label}: {reason}` into errors so report.py can count it for the strict
+        # gate. Missing manifest is NOT drift (graceful skip).
+        _drift = _preflight_manifest(doc, label, manifest_dir)
+        if _drift:
+            doc.degraded = True
+            errors.append(f"manifest_drift::{label}: {_drift}")
+
         doc_path = _doc_path(docs_dir, label, doc.fmt)
         if not doc_path:
             errors.append(f"{label}: 源文档不存在(docs_dir={docs_dir})")
