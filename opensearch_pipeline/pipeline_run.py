@@ -55,12 +55,71 @@ def run_start(provenance: dict, *, simulate: bool = False) -> Optional[str]:
         return None
 
 
+# OBS-3: ctx counter key → pipeline_run column. The DAG nodes already write these into ctx;
+# extract_run_metrics pulls the subset, accumulate_metrics sums them across drain batches.
+_METRIC_CTX_MAP = {
+    "embedded_chunks": "embedded_chunks",
+    "embedding_failed_chunks": "embedding_failed_chunks",
+    "chunk_meta_written": "chunks_written",
+    "deactivated_chunks": "chunks_deactivated",
+    "published_count": "docs_processed",
+}
+
+
+def _as_count(v) -> Optional[int]:
+    """Coerce a ctx counter to an int count. Lists/sets → len; ints → value; else None."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v)
+    return None
+
+
+def extract_run_metrics(ctx: dict) -> dict:
+    """OBS-3: pull the pipeline_run metric columns out of a DAG result ctx. Fail-open → {} on junk.
+    `docs_failed` derives from ctx['failed_doc_versions'] (a set/list of (doc_id, ver))."""
+    if not isinstance(ctx, dict):
+        return {}
+    out = {}
+    for ctx_key, col in _METRIC_CTX_MAP.items():
+        n = _as_count(ctx.get(ctx_key))
+        if n is not None:
+            out[col] = n
+    failed = _as_count(ctx.get("failed_doc_versions"))
+    if failed is not None:
+        out["docs_failed"] = failed
+    return out
+
+
+def accumulate_metrics(acc: dict, new: dict) -> dict:
+    """Sum metric dicts across drain-loop batches (None-safe)."""
+    if not new:
+        return acc
+    for k, v in new.items():
+        if v is None:
+            continue
+        acc[k] = (acc.get(k) or 0) + v
+    return acc
+
+
 def run_finish(run_id: Optional[str], status: str, *, docs_processed: Optional[int] = None,
                chunks_written: Optional[int] = None, error_message: Optional[str] = None,
-               simulate: bool = False) -> None:
-    """UPDATE the pipeline_run row to a terminal status + finished_at. No-op if no run_id; fail-open."""
+               metrics: Optional[dict] = None, simulate: bool = False) -> None:
+    """UPDATE the pipeline_run row to a terminal status + finished_at. No-op if no run_id; fail-open.
+
+    OBS-3: `metrics` (from extract_run_metrics/accumulate_metrics) backfills the per-run counter
+    columns. Explicit docs_processed/chunks_written args win over the same keys in metrics."""
     if simulate or not run_id:
         return
+    m = dict(metrics or {})
+    if docs_processed is not None:
+        m["docs_processed"] = docs_processed
+    if chunks_written is not None:
+        m["chunks_written"] = chunks_written
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn(select_db=True)
@@ -70,10 +129,14 @@ def run_finish(run_id: Optional[str], status: str, *, docs_processed: Optional[i
                     """
                     UPDATE pipeline_run
                        SET status=%s, docs_processed=%s, chunks_written=%s,
+                           embedded_chunks=%s, embedding_failed_chunks=%s,
+                           chunks_deactivated=%s, docs_failed=%s,
                            error_message=%s, finished_at=NOW()
                      WHERE run_id=%s
                     """,
-                    (status, docs_processed, chunks_written,
+                    (status, m.get("docs_processed"), m.get("chunks_written"),
+                     m.get("embedded_chunks"), m.get("embedding_failed_chunks"),
+                     m.get("chunks_deactivated"), m.get("docs_failed"),
                      (error_message[:2000] if error_message else None), run_id),
                 )
             conn.commit()

@@ -16,7 +16,6 @@ dataworks_orchestrator.py — DataWorks 调度执行主入口
 import argparse
 import sys
 import os
-from datetime import datetime
 
 # 保证当前目录在 python path 中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,7 +26,7 @@ from opensearch_pipeline.dag_definitions import (
     build_dag2_canonical_to_chunk,
     build_dag3_chunk_to_opensearch,
 )
-from opensearch_pipeline.run_simulation import get_test_data, get_version_update_data
+from opensearch_pipeline.run_simulation import get_test_data
 
 
 def run_stage(stage: int, bizdate: str, simulate: bool):
@@ -480,10 +479,12 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                             """, (doc_id, ver))
                         conn_rb.commit()
                 except Exception as e:
-                    if 'conn_rb' in locals() and conn_rb: conn_rb.rollback()
+                    if 'conn_rb' in locals() and conn_rb:
+                        conn_rb.rollback()
                     print(f"[Orchestrator] ERROR: Failed to rollback locks: {e}", file=sys.stderr)
                 finally:
-                    if 'conn_rb' in locals() and conn_rb: conn_rb.close()
+                    if 'conn_rb' in locals() and conn_rb:
+                        conn_rb.close()
             raise RuntimeError(f"DAG 3 execution failed at nodes: {failed_nodes}")
         
         index_res = result_ctx.get("index_result", {})
@@ -491,6 +492,9 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
 
     else:
         raise ValueError(f"Invalid stage number: {stage}. Must be 1, 2, or 3.")
+
+    # OBS-3: hand the DAG result ctx back so the drain loop can extract per-run metric counters.
+    return result_ctx
 
 
 def _reset_stale_stage2_locks() -> int:
@@ -585,9 +589,12 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
       因此该守卫是必需的。
     - run_stage 在任何批次失败时仍会 raise（沿用 fail-fast 语义），异常会冒泡到 main 退出。
     """
+    from opensearch_pipeline.pipeline_run import accumulate_metrics, extract_run_metrics
+    run_metrics: dict = {}
+
     if simulate:
         run_stage(stage, bizdate, simulate)
-        return
+        return run_metrics
 
     if stage == 3:
         # ── 搁浅版本对账：上一次部分失败可能留下「新版本已全量 INDEXED 但旧版本仍 active」
@@ -622,6 +629,7 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         if remaining == 0:
             print(f"[Orchestrator] Stage {stage} drained: 0 pending rows after {iteration - 1} batch(es).")
             break
+        # (metrics accumulate after each batch below)
         if prev_remaining is not None and remaining >= prev_remaining:
             # 一整批跑完后剩余行数没有下降 = 有卡住/持续失败的行。必须抛错，让退出码非零，
             # 否则 DataWorks 会把卡死的运行标记为成功（绿色），无人察觉语料停止入库。
@@ -631,7 +639,10 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
             )
         print(f"[Orchestrator] Stage {stage} drain batch #{iteration} — {remaining} rows pending...")
         prev_remaining = remaining
-        run_stage(stage, bizdate, simulate)
+        _batch_ctx = run_stage(stage, bizdate, simulate)
+        accumulate_metrics(run_metrics, extract_run_metrics(_batch_ctx))
+
+    return run_metrics
 
 
 def main():
@@ -683,8 +694,8 @@ def main():
     _run_id = run_start(_prov, simulate=simulate_mode)
 
     try:
-        run_stage_drained(args.stage, args.bizdate, simulate_mode)
-        run_finish(_run_id, "SUCCESS", simulate=simulate_mode)
+        _metrics = run_stage_drained(args.stage, args.bizdate, simulate_mode)
+        run_finish(_run_id, "SUCCESS", metrics=_metrics, simulate=simulate_mode)
         print(f"\n[Orchestrator] SUCCESS: Stage {args.stage} finished successfully.")
         sys.exit(0)
     except Exception as e:
