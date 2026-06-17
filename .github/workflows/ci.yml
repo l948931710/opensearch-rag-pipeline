@@ -1,0 +1,40 @@
+name: CI
+
+# Roadmap-to-8 EVAL-3: the previously-absent CI gate. Runs the full test suite in SIMULATE mode on
+# every push to main and every PR — catching extractor/chunker/retriever/serving regressions before
+# they merge (the dim9 "no CI / advisory gates" gap). No cloud creds: RAG_SIMULATE forces hash
+# embeddings + mock HA3, and DB-integration tests self-skip without a local MySQL (skipif_no_db).
+# Live layers (run_eval l3/l4/l5 + l1/l2 against real HA3) stay manual/staged — they need creds,
+# the gold set, and the out-of-repo data repo, so they are deliberately NOT in this blocking gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      RAG_SIMULATE: "true"
+      RAG_SIMULATE_API: "true"
+      RAG_SIMULATE_DB: "true"
+      RAG_SIMULATE_OSS: "true"
+      RAG_SIMULATE_OPENSEARCH: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,production,ocr]"
+      - name: Lint (ruff — informational; pre-existing baseline not yet zeroed)
+        continue-on-error: true
+        run: python -m ruff check opensearch_pipeline/ tests/
+      - name: Test (simulate mode — no external services)
+        run: python -m pytest tests/ -q -p no:cacheprovider

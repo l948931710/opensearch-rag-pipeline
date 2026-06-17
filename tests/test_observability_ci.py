@@ -77,3 +77,15 @@ def test_run_eval_wires_strict():
     assert '"--strict"' in inspect.getsource(run_eval.main)
     assert "_enforce_strict(gates, results" in inspect.getsource(run_eval.phase_run)
     assert "_enforce_strict(gates, results" in inspect.getsource(run_eval.phase_merge)
+
+
+# ── EVAL-3: GitHub Actions CI gate ──
+
+def test_ci_workflow_present_and_runs_tests_in_simulate():
+    from pathlib import Path
+    ci = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+    assert ci.exists(), "EVAL-3: CI workflow must exist"
+    txt = ci.read_text(encoding="utf-8")
+    assert "pull_request" in txt, "CI must run on PRs"
+    assert "pytest tests/" in txt, "CI must run the test suite"
+    assert "RAG_SIMULATE" in txt, "CI must run in simulate mode (no cloud creds)"
