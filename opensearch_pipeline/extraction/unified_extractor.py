@@ -1153,11 +1153,13 @@ class UnifiedExtractor:
 
         cache_json = json.dumps(cls._vlm_cache, ensure_ascii=False)
 
-        # 写入本地
+        # 写入本地（DET: 原子写 temp + os.replace，避免崩溃/并发写产生半截 JSON 触发全量 VLM 重判）
         try:
             os.makedirs(os.path.dirname(cls._vlm_cache_file), exist_ok=True)
-            with open(cls._vlm_cache_file, "w", encoding="utf-8") as f:
+            _tmp = f"{cls._vlm_cache_file}.tmp.{os.getpid()}"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 f.write(cache_json)
+            os.replace(_tmp, cls._vlm_cache_file)
         except Exception as e:
             print(f"      ⚠️ Failed to save VLM cache locally: {e}")
 

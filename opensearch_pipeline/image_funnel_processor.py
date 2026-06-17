@@ -333,7 +333,8 @@ class ImageFunnelProcessor:
 
             use_compat = use_compat_mode(model_name, api_base_url)
             url = resolve_vlm_url(api_base_url, use_compat)
-            payload = build_image_chat_payload(model_name, prompt, b64_data, mime_type, use_compat)
+            payload = build_image_chat_payload(model_name, prompt, b64_data, mime_type, use_compat,
+                                               temperature=0)  # DET: pin funnel routing/caption determinism
 
             resp = requests.post(url, json=payload, headers=auth_headers(api_key), timeout=(10, 90))
             if resp.status_code != 200:

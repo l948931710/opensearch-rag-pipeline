@@ -1141,7 +1141,7 @@ def run_gemini_classification(text: str, model_name: str, api_key: str, api_base
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.1
+            "temperature": 0  # DET: deterministic classification → stable category → stable chunk routing
         }
         
         resp = requests.post(url, json=payload, headers=headers, timeout=90)
@@ -1174,7 +1174,7 @@ def run_gemini_classification(text: str, model_name: str, api_key: str, api_base
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "responseSchema": schema,
-                "temperature": 0.1
+                "temperature": 0  # DET: deterministic classification (mirrors DashScope branch)
             }
         }
         
@@ -4879,8 +4879,12 @@ def node_generate_embeddings(ctx: dict):
             try:
                 _evict_oldest(_cache, _CACHE_MAX_ENTRIES)
                 os.makedirs(os.path.dirname(_cache_file), exist_ok=True)
-                with open(_cache_file, "w", encoding="utf-8") as _cf:
+                # DET: atomic write (temp + os.replace) — a half-written cache JSON would force a
+                # full cache-miss re-embed next run (and is a known B-vs-B nondeterminism hazard).
+                _tmp = f"{_cache_file}.tmp.{os.getpid()}"
+                with open(_tmp, "w", encoding="utf-8") as _cf:
                     json.dump(_cache, _cf, ensure_ascii=False)
+                os.replace(_tmp, _cache_file)
             except Exception as e:
                 print(f"    ⚠️ Failed to save embedding cache: {e}")
 
