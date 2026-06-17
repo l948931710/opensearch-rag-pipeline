@@ -673,12 +673,22 @@ def main():
     import opensearch_pipeline.config as _cfg_module
     _cfg_module._config = config
     simulate_mode = config.simulate
-    
+
+    # L6prov: per-run provenance header (RUNNING → SUCCESS/FAILED). Fail-open + no-op in simulate;
+    # joins to kb_audit_log via the same git_commit/bizdate. Records which run/code/model ran this
+    # stage and how it ended — the lineage capstone.
+    from opensearch_pipeline.versions import build_run_provenance
+    from opensearch_pipeline.pipeline_run import run_start, run_finish
+    _prov = build_run_provenance(stage=args.stage, bizdate=args.bizdate)
+    _run_id = run_start(_prov, simulate=simulate_mode)
+
     try:
         run_stage_drained(args.stage, args.bizdate, simulate_mode)
+        run_finish(_run_id, "SUCCESS", simulate=simulate_mode)
         print(f"\n[Orchestrator] SUCCESS: Stage {args.stage} finished successfully.")
         sys.exit(0)
     except Exception as e:
+        run_finish(_run_id, "FAILED", error_message=str(e), simulate=simulate_mode)
         print(f"\n[Orchestrator] ERROR: Stage {args.stage} failed: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
