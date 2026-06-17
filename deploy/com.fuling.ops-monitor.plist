@@ -7,7 +7,9 @@
 
      Prereq on this Mac (repo is under ~/Downloads, which macOS TCC blocks for launchd):
        System Settings → Privacy & Security → Full Disk Access → "+" → ⌘⇧G →
-       /Users/laijunchen/opt/anaconda3/envs/stack-test/bin/python3.10  → enable the toggle.
+       /usr/bin/python3   → enable the toggle.
+     (We use /usr/bin/python3 — arm64-native, has the prod deps in user-site — instead of the conda
+      python3.10, which is an x86_64 binary the FDA picker greys out on Apple Silicon.)
      Install:  cp deploy/com.fuling.ops-monitor.plist ~/Library/LaunchAgents/
                launchctl load -w ~/Library/LaunchAgents/com.fuling.ops-monitor.plist
      Test now: launchctl kickstart gui/$(id -u)/com.fuling.ops-monitor   (then: launchctl list | grep fuling)
@@ -17,7 +19,7 @@
   <key>Label</key><string>com.fuling.ops-monitor</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/laijunchen/opt/anaconda3/envs/stack-test/bin/python3.10</string>
+    <string>/usr/bin/python3</string>
     <string>-m</string>
     <string>opensearch_pipeline.ops_monitor</string>
     <string>--only</string>
