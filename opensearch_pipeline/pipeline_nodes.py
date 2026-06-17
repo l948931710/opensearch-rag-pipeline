@@ -4780,6 +4780,17 @@ def node_deactivate_old_chunks(ctx: dict):
                                         UPDATE chunk_meta SET index_status = 'FAILED'
                                         WHERE chunk_id IN ({format_strings_new})
                                     """, tuple(new_chunk_ids))
+                                # CS5 outbox: durably queue the OLD-version HA3 delete that just failed so
+                                # reconcile_pending_deletes retries it even if this batch's retry never
+                                # runs (laptop/manual ingestion). Additive — the raise below is unchanged
+                                # (new version fails-safe + retries; never-disappear holds). The old chunks
+                                # stay is_active=1 (still in HA3) until the reconciler deletes them and sets
+                                # is_active=0 (CS5 edit in reconcile_pending_deletes), so no CS3 orphan.
+                                cur.execute("""
+                                    UPDATE document_version SET index_status = 'PENDING_DELETE'
+                                    WHERE doc_id = %s AND version_no < %s
+                                      AND index_status NOT IN ('DELETED', 'PENDING_DELETE')
+                                """, (doc_id, ver))
                         conn_fail.commit()
                         conn_fail.close()
                     except Exception as fail_e:

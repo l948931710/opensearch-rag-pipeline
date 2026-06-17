@@ -121,13 +121,21 @@ def reconcile_pending_deletes() -> dict:
             try:
                 _delete_chunks_from_index(doc_id, version_no, conn, config)
 
-                # 删除成功 → 标记为 DELETED
+                # 删除成功 → 标记为 DELETED + 停用 chunk_meta（CS5：自洽——无论是谁喂的
+                # PENDING_DELETE（spot-check 退役 / node_deactivate 失败兜底），对账成功后都把
+                # chunk_meta 落到 is_active=0，避免留下 RDS-active 但 HA3 已删的孤儿（CS3 会报）。
+                # 幂等：再跑命中 0 行。
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         UPDATE document_version
                         SET index_status = 'DELETED'
                         WHERE doc_id = %s AND version_no = %s
                           AND index_status = 'PENDING_DELETE'
+                    """, (doc_id, version_no))
+                    cursor.execute("""
+                        UPDATE chunk_meta
+                        SET is_active = FALSE, index_status = 'DELETED'
+                        WHERE doc_id = %s AND version_no = %s AND is_active = 1
                     """, (doc_id, version_no))
                 conn.commit()
                 result["success"] += 1

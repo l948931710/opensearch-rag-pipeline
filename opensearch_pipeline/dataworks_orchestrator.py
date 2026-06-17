@@ -600,7 +600,7 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         # ── 搁浅版本对账：上一次部分失败可能留下「新版本已全量 INDEXED 但旧版本仍 active」
         # 的文档（双版本同时被检索）。必须在 drain 循环之前跑：这类文档没有待处理 chunk，
         # _count_pending_rows(3)==0 时 run_stage 根本不会执行。失败不阻断当日入库（优雅降级）。
-        from opensearch_pipeline.spot_checker import reconcile_stranded_versions
+        from opensearch_pipeline.spot_checker import reconcile_pending_deletes, reconcile_stranded_versions
         try:
             rec = reconcile_stranded_versions()
             if rec["total"]:
@@ -608,6 +608,17 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
                       f"healed, {rec['failed']} failed")
         except Exception as e:
             print(f"[Orchestrator] WARNING: stranded-version reconcile failed (non-fatal): {e}",
+                  file=sys.stderr)
+        # CS5: drain the PENDING_DELETE outbox every stage-3 run (previously only drained inside the
+        # un-scheduled spot-check). Retries old-version HA3 deletes that node_deactivate / spot-check
+        # retirement queued on failure. Fail-open — never blocks the day's ingestion.
+        try:
+            pd = reconcile_pending_deletes()
+            if pd["total"]:
+                print(f"[Orchestrator] Pending-delete outbox drain: {pd['success']}/{pd['total']} "
+                      f"deleted, {pd['failed']} failed")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: pending-delete reconcile failed (non-fatal): {e}",
                   file=sys.stderr)
 
     max_iters = int(os.environ.get("RAG_DRAIN_MAX_ITERS", "100000"))
