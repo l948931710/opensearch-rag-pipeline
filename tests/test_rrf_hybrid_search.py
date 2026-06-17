@@ -739,4 +739,6 @@ class TestSharedPermissionFilter:
         from opensearch_pipeline.retriever import _DEFAULT_OUTPUT_FIELDS
         assert _DEFAULT_OUTPUT_FIELDS[:3] == ["id", "chunk_id", "doc_id"]
         assert "permission_level" in _DEFAULT_OUTPUT_FIELDS and "owner_dept" in _DEFAULT_OUTPUT_FIELDS
-        assert len(_DEFAULT_OUTPUT_FIELDS) == 15
+        # version_no 加入用于答案血缘（served chunk -> 精确文档版本可溯源）
+        assert "version_no" in _DEFAULT_OUTPUT_FIELDS
+        assert len(_DEFAULT_OUTPUT_FIELDS) == 16

@@ -99,3 +99,31 @@ def test_insert_columns_all_exist_in_schema_files():
     )
     missing = [c for c in columns if c not in ddl_text]
     assert not missing, f"INSERT 用到了 schema DDL 里不存在的列: {missing}"
+
+
+@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+def test_retrieved_docs_json_carries_chunk_id_and_version_no(mock_get_conn):
+    """答案血缘：retrieved_docs_json 必须带 chunk_id + version_no，使一条已落库回答能
+    溯源到精确的 chunk 与文档版本（L7-01 / INC-6）。re-chunk 后 chunk_index 会漂移，
+    仅靠 doc_id/chunk_index 无法复现原始来源。"""
+    import json as _json
+
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    log_qa_session(
+        session_id="s1", message_id="m1", query_text="q",
+        retrieved_docs=[{
+            "doc_id": "DOC_HR_x", "chunk_id": "DOC_HR_x_v3_c0007_ABCD1234",
+            "version_no": 3, "title": "t", "section_title": "s",
+            "score": 9.1, "chunk_index": 7,
+        }],
+    )
+    params = cur.execute.call_args[0][1]
+    # 找到 retrieved_docs_json 参数（含 chunk_id 的 JSON 串）
+    rj = next(p for p in params if isinstance(p, str) and "chunk_id" in p)
+    docs = _json.loads(rj)
+    assert docs[0]["chunk_id"] == "DOC_HR_x_v3_c0007_ABCD1234"
+    assert docs[0]["version_no"] == 3
