@@ -435,11 +435,14 @@ class TestBulkPayloadSplitting:
             _get_db_conn,
         )
 
-        # 1. 构造 3 个 chunks
+        # 1. 构造 3 个 chunks。本测试验证 payload 切分/推送机制（非向量内容），且真实推送本地
+        #    OpenSearch(simulate=False)——其 knn_vector 字段维度=1024，故沿用原 fixture 的"无向量"
+        #    文档(to_opensearch_doc 在无向量时省略 chunk_vector，本地索引可接受)。
+        #    payload 现按 embedding_status != "DONE" 剔除，故必须显式置 DONE 让 chunk 进入 payload。
         chunks = [
-            Chunk(chunk_id="chunk_split_1", doc_id="doc_split", version_no=1, chunk_index=1, chunk_type="text_chunk", chunk_text="This is chunk 1" * 10, token_count=10, page_num=1, permission_level="PUBLIC"),
-            Chunk(chunk_id="chunk_split_2", doc_id="doc_split", version_no=1, chunk_index=2, chunk_type="text_chunk", chunk_text="This is chunk 2" * 10, token_count=10, page_num=1, permission_level="PUBLIC"),
-            Chunk(chunk_id="chunk_split_3", doc_id="doc_split", version_no=1, chunk_index=3, chunk_type="text_chunk", chunk_text="This is chunk 3" * 10, token_count=10, page_num=1, permission_level="PUBLIC"),
+            Chunk(chunk_id="chunk_split_1", doc_id="doc_split", version_no=1, chunk_index=1, chunk_type="text_chunk", chunk_text="This is chunk 1" * 10, token_count=10, page_num=1, permission_level="PUBLIC", embedding_status="DONE"),
+            Chunk(chunk_id="chunk_split_2", doc_id="doc_split", version_no=1, chunk_index=2, chunk_type="text_chunk", chunk_text="This is chunk 2" * 10, token_count=10, page_num=1, permission_level="PUBLIC", embedding_status="DONE"),
+            Chunk(chunk_id="chunk_split_3", doc_id="doc_split", version_no=1, chunk_index=3, chunk_type="text_chunk", chunk_text="This is chunk 3" * 10, token_count=10, page_num=1, permission_level="PUBLIC", embedding_status="DONE"),
         ]
 
         # 2. 设置 context，设定较小的 payload limit 比如 200 字节，强制定向分包
@@ -747,7 +750,7 @@ class TestDatabaseExceptionPropagation:
         monkeypatch.setattr(opensearch_pipeline.pipeline_nodes, "_get_db_conn", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Mock RDS bulk job insert failed")))
         
         chunks = [
-            Chunk(chunk_id="chunk1", doc_id="doc1", version_no=1, chunk_index=1, chunk_type="text_chunk", chunk_text="test", token_count=1, page_num=1, permission_level="PUBLIC")
+            Chunk(chunk_id="chunk1", doc_id="doc1", version_no=1, chunk_index=1, chunk_type="text_chunk", chunk_text="test", token_count=1, page_num=1, permission_level="PUBLIC", embedding_status="DONE", embedding_vector=[0.1, 0.2, 0.3])
         ]
         ctx = {
             "embedded_chunks": chunks,
