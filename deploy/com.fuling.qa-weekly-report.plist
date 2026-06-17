@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Weekly LaunchAgent: 富岭 RAG 问答周报 + Claude 叙述式分析 (Markdown + 中文 PDF).
+     Reads fuling_operation.qa_daily_metrics + qa_session_log (read-only via fuling_metrics), calls the
+     local claude CLI for the narrative, renders PDF via pandoc+xelatex. Monday 09:00 (a time the laptop
+     is reliably awake; on sleep it runs on next wake). Runs the FDA'd /usr/bin/python3.
+
+     OUTPUT to ~/fuling-rag-reports (NOT ~/Downloads): the pandoc/claude child processes aren't FDA'd,
+     so outputs + their cwd must avoid the TCC-protected Downloads folder. Logs likewise → ~/Library/Logs.
+     Install (after the metrics account + .env.metrics exist, which they do):
+       cp deploy/com.fuling.qa-weekly-report.plist ~/Library/LaunchAgents/
+       launchctl load -w ~/Library/LaunchAgents/com.fuling.qa-weekly-report.plist
+       launchctl kickstart gui/$(id -u)/com.fuling.qa-weekly-report   # test -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fuling.qa-weekly-report</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/deploy/weekly_qa_report.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RAG_ENV</key><string>metrics</string>
+    <key>PYTHONPATH</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+    <key>RAG_REPORTS_DIR</key><string>/Users/laijunchen/fuling-rag-reports</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/laijunchen/Library/Logs/fuling-qa-weekly-report.out</string>
+  <key>StandardErrorPath</key><string>/Users/laijunchen/Library/Logs/fuling-qa-weekly-report.err</string>
+</dict>
+</plist>
