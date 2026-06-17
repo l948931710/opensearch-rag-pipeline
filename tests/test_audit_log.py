@@ -103,3 +103,11 @@ def test_chunk_status_closure_wires_audit_write():
     src = inspect.getsource(node_write_chunk_meta)
     assert 'action_type="CHUNK"' in src and "write_audit(" in src
     assert "simulate=simulate_db" in src
+
+
+def test_index_status_wires_audit_write():
+    """node_update_index_status must emit an INDEX audit (SUCCESS/FAILED) per (doc,version)."""
+    from opensearch_pipeline.pipeline_nodes import node_update_index_status
+    src = inspect.getsource(node_update_index_status)
+    assert 'action_type="INDEX"' in src and "write_audit(" in src
+    assert '"FAILED" if (_d, _v) in failed_doc_versions else "SUCCESS"' in src

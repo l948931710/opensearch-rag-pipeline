@@ -5694,6 +5694,17 @@ def node_update_index_status(ctx: dict):
             if conn:
                 conn.close()
 
+        # L5 audit: per-(doc,version) INDEX outcome (SUCCESS/FAILED). After the commit, before the
+        # abort-raise (so FAILED docs are recorded too). Fail-open + no-op in simulate.
+        from opensearch_pipeline.audit_log import write_audit, audit_trace_id
+        _idx_dvs = {(c.doc_id, c.version_no) for b in batches for c in b["chunks"]}
+        _idx_dvs |= {(c.doc_id, c.version_no) for c in embedding_failed_chunks}
+        _idx_trace = audit_trace_id(ctx)
+        for _d, _v in sorted(_idx_dvs):
+            write_audit(doc_id=_d, version_no=_v, action_type="INDEX",
+                        action_result=("FAILED" if (_d, _v) in failed_doc_versions else "SUCCESS"),
+                        trace_id=_idx_trace, simulate=simulate_db)
+
         total_failed = sum(b.get("result", {}).get("failed", 0) for b in batches) + len(embedding_failed_chunks)
         if total_failed > 0:
             raise RuntimeError(
