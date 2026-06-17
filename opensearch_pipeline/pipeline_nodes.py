@@ -4742,6 +4742,20 @@ def node_deactivate_old_chunks(ctx: dict):
                 if conn:
                     conn.close()
 
+    # L5 audit: append-only DEACTIVATE events for the irreversible old-version retirement.
+    # Placed after the RDS is_active=FALSE flip so it logs the realized outcome; fail-open + no-op in
+    # simulate (write_audit handles both). kb_audit_log had ZERO writers before this.
+    if deactivated:
+        from opensearch_pipeline.audit_log import write_audit, audit_trace_id
+        _trace = audit_trace_id(ctx)
+        for _d in deactivated:
+            write_audit(
+                doc_id=_d["doc_id"], version_no=_d["old_version"],
+                action_type="DEACTIVATE", action_result="SUCCESS", trace_id=_trace,
+                message=f"old v{_d['old_version']} retired by v{_d['new_version']} ({_d['chunk_id']})",
+                simulate=simulate_db,
+            )
+
 
 # ═══════════════════════════════════════════════════════════════
 # DAG 3: chunk → embedding → OpenSearch
