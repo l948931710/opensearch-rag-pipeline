@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent for the OBS-5 qa_rollup WRITE job (separate from the read-only monitor).
+     Runs under RAG_ENV=metrics → loads .env + .env.metrics (least-privilege fuling_metrics account,
+     RAG_ENVIRONMENT=production so the pool is write-capable; DashScope+HA3 come from the base .env so
+     the production config guard passes). Daily 02:50 (after the read-only monitor at 02:30).
+
+     ⚠️ DO NOT INSTALL/LOAD until BOTH exist (else RAG_ENV=metrics falls back to .env only → wrong RDS):
+        1. the fuling_metrics DB account + grants (see docs/metrics_writer_account_DRAFT.md)
+        2. .env.metrics (gitignored)  — `cp .env.production .env.metrics` then set
+           RAG_RDS_USER=fuling_metrics / RAG_RDS_PASSWORD=… / RAG_RDS_DATABASE=fuling_operation
+     Install (after the above): cp deploy/com.fuling.qa-rollup.plist ~/Library/LaunchAgents/ ;
+        launchctl load -w ~/Library/LaunchAgents/com.fuling.qa-rollup.plist
+     Reuses the same /usr/bin/python3 that already has Full Disk Access. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fuling.qa-rollup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-m</string>
+    <string>opensearch_pipeline.ops_monitor</string>
+    <string>--only</string>
+    <string>qa_rollup</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RAG_ENV</key><string>metrics</string>
+    <key>PYTHONPATH</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+    <!-- OBS-4 SLO-breach alerts (optional): same webhook as the read-only agent
+    <key>RAG_OPS_ALERT_WEBHOOK</key><string>https://oapi.dingtalk.com/robot/send?access_token=…</string>
+    <key>RAG_OPS_ALERT_SECRET</key><string>SEC…</string> -->
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>50</integer></dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/scratch/qa_rollup.launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/scratch/qa_rollup.launchd.err</string>
+</dict>
+</plist>
