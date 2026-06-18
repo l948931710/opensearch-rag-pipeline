@@ -1,4 +1,4 @@
-.PHONY: help install dev sim sim-all sim-sensitive sim-version test lint clean graph diagrams diagrams-list
+.PHONY: help install dev sim sim-all sim-sensitive sim-version test lint clean graph diagrams diagrams-list release-gate eval-baseline-freeze
 
 # ═══════════════════════════════════════════════════════════════
 # OpenSearch RAG Pipeline — Makefile
@@ -105,3 +105,13 @@ ab-status: ## A/B 环境总览 (实例/索引/DB/配置)
 
 ab-smoke: ## A/B 双端各问 1 题验证可用
 	bash scripts/local_eval_env.sh smoke
+
+# ── dim9 evaluation release gate (pre-deploy) — 详见 docs/eval_release_gate.md ──
+RAG_PY ?= python3
+
+release-gate: ## 部署前评测闸(dim9 闭环): run→auto-judge→merge --strict; exit≠0 阻断发布
+	bash deploy/eval_release_gate.sh
+
+eval-baseline-freeze: ## 冻结评测基线(首次可接受 gate 后一次性): make eval-baseline-freeze RESULTS=<rundir>/report.json
+	@test -n "$(RESULTS)" || { echo "用法: make eval-baseline-freeze RESULTS=<rundir>/report.json"; exit 2; }
+	$(RAG_PY) -m eval_harness.run_eval baseline-freeze --results "$(RESULTS)" --baseline eval_harness/goldset/baseline.json

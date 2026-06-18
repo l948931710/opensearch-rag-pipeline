@@ -1,9 +1,14 @@
-# DRAFT — eval release gate (the dim9 closed loop)
+# Eval release gate (the dim9 closed loop) — PRE-DEPLOY placement
 
-> ⚠️ **DRAFT / not yet wired.** Items 1–4 raised the eval *framework's* trustworthiness; this runner is
-> what turns it into an enforced loop. Stand it up on a real host (you're preparing the machine), then
-> validate one full pass before gating real releases. Artifacts: `deploy/eval_release_gate.sh`,
-> `eval_harness/run_judge.py`, plus `run_eval baseline-freeze` / `--baseline`.
+> **WIRED, pending activation.** Placement decided 2026-06-17: a **pre-deploy gate** (option 2) — the
+> mandatory first step of every serving/ingestion release; a non-zero exit BLOCKS the rollout. Invoke
+> via `make release-gate` (→ `deploy/eval_release_gate.sh`). On-demand at deploy time, so the
+> laptop-sleep objection doesn't apply (you're awake deploying) — but the box you deploy from still
+> needs the prerequisites below (prod-read creds + Alibaba reachability + data repo + authed claude).
+> Items 1–4 + ① (inter-judge gate) + ② (judge-calibration draft) hardened the framework; THIS gate
+> enforces it. Two activation steps remain (§First run). Artifacts: `deploy/eval_release_gate.sh`,
+> `eval_harness/run_judge.py`, `run_eval baseline-freeze`/`--baseline`, `make release-gate` /
+> `make eval-baseline-freeze`.
 
 ## Why this exists
 Without an automated, blocking `run_eval --strict` + judge-merge, dim9 isn't 8 — the gates exist but
@@ -16,8 +21,10 @@ release gate (and `~/Downloads` + TCC bit us already). Pick one of:
 1. **Dedicated self-hosted CI runner inside the Alibaba VPC** (recommended) — a persistent box with
    prod-read creds + the data repo + claude CLI; the GitHub Actions eval job targets it (the public CI
    runner can't reach prod). Blocks PRs/merges.
-2. **Deploy-pipeline pre-deploy step** — run `deploy/eval_release_gate.sh` as a gate in the SAE deploy
-   flow; non-zero blocks the rollout. Best "blocks release" fit.
+2. ✅ **CHOSEN — Deploy-pipeline pre-deploy step**: `make release-gate` as the mandatory first step of
+   the SAE serving / DataWorks ingestion release procedure; non-zero exit BLOCKS the rollout. Best
+   "blocks release" fit. (Caveat vs option 1: it only runs at deploy time, so it does not catch drift
+   *between* releases — pair with an occasional manual run or add option 3 later for drift monitoring.)
 3. **Cloud cron node** (ECS/function) — nightly run + OBS-4 alert on failure. Easiest, but monitoring
    not a hard gate (a regression can still ship; you just get paged).
 
@@ -57,8 +64,10 @@ silently passes or fails.
 - `expected_na` (e.g. L5 on the all-public corpus) does **not** block.
 
 ## Still open AFTER this runner (to fully trust the numbers — beyond items 1–4)
-- **Judge calibration**: keep a small human-labelled subset; gate inter-judge stdev (computed, not yet
-  gated). The auto-judge is Claude-vs-Qwen (no self-grading) but its absolute validity is unanchored.
+- **Judge calibration (② DRAFTED)**: inter-judge stdev is now GATED (① `1e9df48`, L3 + L6 panels).
+  Judge-vs-human validity: `eval_harness/judge_calibration.py` + `docs/judge_calibration_DRAFT.md` are
+  ready — awaiting ~20–50 human labels to activate that gate (the auto-judge is Claude-vs-Qwen, no
+  self-grading, but its absolute validity is unanchored until then).
 - **Image-binding circularity**: the strict "which-image" key is the extractor's own `image_index`
   (acknowledged, bounded) — re-derive from a raw-reconstructible coordinate for a held-out subset.
 - **Gold-set de-skew**: add IT/production/quality/sales/marketing depts, typed hard-query classes,
