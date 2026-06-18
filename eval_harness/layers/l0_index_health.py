@@ -33,11 +33,25 @@ def _stored_vector(item: Dict):
     return None
 
 
+def _item_sparse_indices(item: Dict):
+    """Stored sparse_data indices of a returned HA3 item ([] if none).
+
+    This is the basis of the G3 sparse-health check: a non-empty list proves the sparse
+    vector was actually built for that chunk. We read the STORED field rather than re-issuing
+    a "sparse-only" query with a zero dense vector — that old method is regime-fragile (under
+    InnerProduct a zero dense vector scores 0 for every doc, so it ranks by a meaningless
+    score and returned 0/40 post-rebuild even though sparse was fully healthy)."""
+    spd = item.get("sparse_data")
+    if spd is None:
+        spd = (item.get("fields") or {}).get("sparse_data")
+    if isinstance(spd, dict):
+        return spd.get("indices") or []
+    return getattr(spd, "indices", None) or []
+
+
 def run(n_dense: int = 60, n_sparse: int = 40, self_score_min: float = 0.95,
         drift_min: float = 0.99, seed: int = 7) -> Dict:
-    from opensearch_pipeline.config import get_config
     from opensearch_pipeline.retriever import get_query_embedding
-    dim = get_config().embedding.dimension or 1024
 
     out: Dict = {"table": table()}
 
@@ -131,32 +145,48 @@ def run(n_dense: int = 60, n_sparse: int = 40, self_score_min: float = 0.95,
         {"pass": None, "n": 0, "note": "include_vector returned no vectors; drift check skipped"}
     )
 
-    # G3 — sparse-only self-query (zero dense). Same dup-text tolerance as G2.
-    zeros = [0.0] * dim
-    sparse_ok = sparse_tot = 0
-    from alibabacloud_ha3engine_vector.models import SparseData
+    # G3 — sparse vector health: (1) the query embedding produces a non-empty sparse vector
+    # AND (2) the index stored a non-empty sparse_data for the chunk. This is the actual
+    # invariant ("the sparse vector was built, else hybrid collapses to BM25").
+    #
+    # The OLD method (sparse-only query via a ZERO dense vector) is regime-fragile and was
+    # REPLACED 2026-06-17: under InnerProduct a zero dense vector scores 0 for every doc, so it
+    # ranks by a meaningless all-zero score (observed score=-0.0) and returned 0/40 post-rebuild
+    # even though sparse is fully healthy. Probe-verified that day (read-only prod, 8/8 chunks):
+    # stored sparse_data present on every chunk + the real hybrid (dense+sparse) retrieval is
+    # perfect (8/8); only the zero-dense trick failed. It had passed 38-40/40 pre-rebuild only
+    # because the score regime differed. See scratch/probe_l0_sparse.py.
+    sparse_ok = sparse_tot = embed_sparse_ok = 0
     for row in sample[:n_sparse]:
         cid, txt = row["chunk_id"], row["chunk_text"]
         try:
-            _d, si, sv = get_query_embedding(txt)
+            dense, si, _sv = get_query_embedding(txt)
         except Exception:
             continue
-        if not si:
+        items = query_vector(dense, top_k=1, include_vector=True,
+                             output_fields=["chunk_id", "chunk_text_store"])
+        if not items:
+            continue
+        top = items[0]
+        tf = fields_of(top)
+        # only inspect when the dense self-query resolved the chunk itself (or an identical-text
+        # sibling); a dense miss is a G2 concern, not a sparse-presence one.
+        if not (tf.get("chunk_id") == cid or (
+                _norm(tf.get("chunk_text_store")) == _norm(txt) and _norm(txt))):
             continue
         sparse_tot += 1
-        sd = SparseData(count=[len(si)], indices=si, values=sv)
-        items = query_vector(zeros, sparse=sd, top_k=5, order="DESC",
-                             output_fields=["chunk_id", "chunk_text_store"])
-        if items:
-            tf = fields_of(items[0])
-            if tf.get("chunk_id") == cid or (
-                    _norm(tf.get("chunk_text_store")) == _norm(txt) and _norm(txt)):
-                sparse_ok += 1
+        if si:
+            embed_sparse_ok += 1
+        if _item_sparse_indices(top):
+            sparse_ok += 1
     out["G3_sparse_self_query"] = {
-        "pass": (sparse_tot > 0 and sparse_ok >= int(sparse_tot * 0.90)),
-        "ok": sparse_ok, "total": sparse_tot,
-        "note": "sparse vector present & queryable (dup-text siblings allowed)" if sparse_tot
-                else "NO sparse vectors produced",
+        "pass": (sparse_tot > 0 and sparse_ok >= int(sparse_tot * 0.90)
+                 and embed_sparse_ok >= int(sparse_tot * 0.90)),
+        "ok": sparse_ok, "total": sparse_tot, "embed_sparse_ok": embed_sparse_ok,
+        "method": "stored sparse_data non-empty on dense self-match + query-embedding sparse "
+                  "non-empty (was: zero-dense sparse-only query — regime-fragile, replaced 2026-06-17)",
+        "note": "sparse vector built in index & embeddable (else hybrid collapses to BM25)"
+                if sparse_tot else "NO chunks resolved for the sparse-presence check",
     }
 
     gates = [out["G0_status_doccount"]["pass"], out["G1_segments"]["pass"],
