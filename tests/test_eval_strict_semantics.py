@@ -130,3 +130,31 @@ def test_default_layers_include_l6():
     import inspect
     import eval_harness.run_eval as rev
     assert "l0,l1,l2,l3,l4,l5,l6" in inspect.getsource(rev.main)
+
+
+# ── auto-judge runner (draft): JSON extraction + panel assembly (no live claude) ──
+
+def test_run_judge_extracts_json_array_tolerant():
+    from eval_harness.run_judge import _extract_json_array
+    fenced = "sure, here:\n```json\n[{\"qid\":\"a\",\"overall\":4}]\n```\n"
+    assert _extract_json_array(fenced) == [{"qid": "a", "overall": 4}]
+    bare = "[{\"qid\":\"b\",\"overall\":5}]"
+    assert _extract_json_array(bare)[0]["qid"] == "b"
+    import pytest
+    with pytest.raises(ValueError):
+        _extract_json_array("no json here")
+
+
+def test_run_judge_assembles_panels(monkeypatch, tmp_path):
+    import json as _json
+    from eval_harness import run_judge
+    bundle = [{"qid": "q1"}, {"qid": "q2"}]
+    _json.dump(bundle, open(tmp_path / "b.json", "w"))
+    # mock the claude call: echo a verdict per item
+    monkeypatch.setattr(run_judge, "_judge_batch",
+                        lambda rub, items, pi, idk: [{idk: it[idk], "overall": 4} for it in items])
+    out = str(tmp_path / "v.json")
+    run_judge.run(str(tmp_path / "b.json"), out, panels=3, rubric="answer", batch=1)
+    saved = _json.load(open(out))
+    assert len(saved["panels"]) == 3
+    assert {v["qid"] for v in saved["panels"][0]["verdicts"]} == {"q1", "q2"}
