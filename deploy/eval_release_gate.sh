@@ -30,6 +30,9 @@ LAYERS="${RAG_EVAL_LAYERS:-l0,l1,l2,l3,l4,l5,l6}"
 cd "$REPO" || { echo "FATAL: cannot cd $REPO"; exit 3; }
 
 bl_arg=(); [ -f "$BASELINE" ] && bl_arg=(--baseline "$BASELINE")
+# optional deterministic cost cap: RAG_EVAL_LIMIT=N → run_eval run --limit N (first N cases of the
+# fixed goldset; deterministic). Unset = full goldset.
+lim_arg=(); [ -n "${RAG_EVAL_LIMIT:-}" ] && lim_arg=(--limit "$RAG_EVAL_LIMIT")
 
 echo "== [1/4] preflight =="
 command -v "${RAG_CLAUDE_BIN:-claude}" >/dev/null 2>&1 || { echo "FATAL: claude CLI not found (judge merge needs it)"; exit 3; }
@@ -39,7 +42,8 @@ command -v "${RAG_CLAUDE_BIN:-claude}" >/dev/null 2>&1 || { echo "FATAL: claude 
   $PY -m eval_harness.run_eval baseline-freeze --results $RUNDIR/report.json --baseline $BASELINE"
 
 echo "== [2/4] run_eval run (no strict) → $RUNDIR =="
-"$PY" -m eval_harness.run_eval run --goldset "$GOLDSET" --layers "$LAYERS" --outdir "$RUNDIR" "${bl_arg[@]}" || true
+"$PY" -m eval_harness.run_eval run --goldset "$GOLDSET" --layers "$LAYERS" --outdir "$RUNDIR" \
+      ${lim_arg[@]+"${lim_arg[@]}"} ${bl_arg[@]+"${bl_arg[@]}"} || true
 
 echo "== [3/4] auto-judge (Claude panel x$PANELS) =="
 "$PY" -m eval_harness.run_judge --bundle "$RUNDIR/judge_bundle.json" \
@@ -51,7 +55,7 @@ fi
 
 echo "== [4/4] run_eval merge --strict (THE gate) =="
 "$PY" -m eval_harness.run_eval merge --results "$RUNDIR/report.json" \
-      --verdicts "$RUNDIR/judge_verdicts.json" --strict "${bl_arg[@]}"
+      --verdicts "$RUNDIR/judge_verdicts.json" --strict ${bl_arg[@]+"${bl_arg[@]}"}
 gate=$?
 echo "== release gate exit=$gate (0=ship, non-zero=BLOCK; report: $RUNDIR/report.md) =="
 exit $gate
