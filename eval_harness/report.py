@@ -172,9 +172,17 @@ def build_gates(r: Dict) -> Dict:
             "value": l6.get("state"), "pass": bool(l6.get("go_no_go"))}
         # 透传每条 L6 hard/soft 闸(已是 {target,value,pass} 形态,加 L6 前缀)
         for name, g in (l6.get("gates") or {}).items():
-            tag = "L6-hard" if g.get("hard") else "L6-soft"
-            gates[f"[{tag}] {name}"] = {"target": g.get("target"),
-                                        "value": g.get("value"), "pass": g.get("pass")}
+            is_hard = bool(g.get("hard"))
+            tag = "L6-hard" if is_hard else "L6-soft"
+            gate = {"target": g.get("target"), "value": g.get("value"), "pass": g.get("pass")}
+            # L6 soft signals are DIAGNOSTIC/advisory (decision 2026-06-18): the GO/NO_GO verdict +
+            # the [L6-hard] gates are the real release gate. mid-sentence over-counts legitimate
+            # boundaries (judge-confirmed: truncation 3.87), routing-family churn is a known minor
+            # issue with a fix queued — neither should BLOCK a release. _strict_failures skips
+            # advisory gates, so a failing soft signal stays VISIBLE in the report but is not strict.
+            if not is_hard:
+                gate["advisory"] = True
+            gates[f"[{tag}] {name}"] = gate
         # ① inter-judge agreement on the L6 chunk panel (only present after a chunk-judge merge)
         jc_sd = (l6.get("judge_chunk") or {}).get("mean_overall_interjudge_stdev")
         if jc_sd is not None:

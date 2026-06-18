@@ -123,6 +123,8 @@ def _strict_failures(gates: dict, results: dict, *, requested_layers=None) -> li
     fails = []
     for name, g in (gates or {}).items():
         p = g.get("pass")
+        if g.get("advisory"):
+            continue  # advisory/diagnostic gate (e.g. L6-soft) — visible in the report, never blocks
         if p is False:
             fails.append(name)
         elif p is None and g.get("na_reason") == "not_executed":

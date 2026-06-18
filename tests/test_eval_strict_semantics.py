@@ -140,6 +140,25 @@ def test_report_l4srv_shortfall_taxonomy():
     assert g["orphan rate (L4-srv, trend 监控)"]["na_reason"] == "expected_na"        # soft → advisory
 
 
+def test_l6_soft_gates_are_advisory_not_strict_block():
+    """L6 soft signals (mid-sentence, routing-family) are DIAGNOSTIC — a failing one stays visible in
+    the report but must NOT block --strict; the GO/NO_GO verdict + [L6-hard] gates are the real gate
+    (decision 2026-06-18). A failing HARD L6 gate still blocks."""
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    r = {"l6": {"applicable": True, "state": "GO", "go_no_go": True, "gates": {
+        "mid-sentence cut rate (B)": {"target": "<=0.05", "value": 0.35, "pass": False, "hard": False},
+        "tokens in [5,2000] (B)": {"target": "0", "value": 0, "pass": True, "hard": True}}}}
+    g = build_gates(r)
+    soft = g["[L6-soft] mid-sentence cut rate (B)"]
+    assert soft["pass"] is False and soft.get("advisory") is True       # visible FAIL, flagged advisory
+    assert not any("L6-soft" in f for f in _strict_failures(g, r))      # ... but does NOT block strict
+    # a failing HARD L6 gate DOES block
+    r2 = {"l6": {"applicable": True, "state": "NO_GO_DEFECT", "go_no_go": False, "gates": {
+        "RDS↔HA3 drift (A/D1)": {"target": "0", "value": 5, "pass": False, "hard": True}}}}
+    assert any("L6-hard" in f for f in _strict_failures(build_gates(r2), r2))
+
+
 def test_report_baseline_gates_merged():
     from eval_harness.report import build_gates
     g = build_gates({"baseline_gates": {"baseline regression (x)":
