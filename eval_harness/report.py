@@ -113,37 +113,46 @@ def build_gates(r: Dict) -> Dict:
         srv = l4.get("aggregate") or {}
         n_srv = srv.get("n_answers_with_images") or 0
         srv_degraded = n_srv < 5
+        # HARD L4-srv gates (marker_validity, dangling): N<5 is a SAMPLE SHORTFALL, not a free pass —
+        # mark na_reason='not_executed' so --strict FAILs (add image cases to the goldset, don't
+        # silently pass an unmeasured hard gate). The soft orphan gate stays advisory (expected_na).
+        _shortfall = {"na_reason": "not_executed",
+                      "notes": f"image-bearing answers N={n_srv}<5 — hard gate unmeasured; add image cases"}
         mv = srv.get("marker_validity")
         if mv is not None:
-            # 0.95 hard 守底 + 0.98 soft 追(双阈值,plan 抢救点)
             gates["<<IMG:N>> marker validity (L4-srv)"] = {
-                "target": (f">= 0.95 hard / >= 0.98 soft (N={n_srv} 太小,trend 监控)"
+                "target": (f">= 0.95 hard / >= 0.98 soft (N={n_srv}<5)"
                            if srv_degraded else ">= 0.95 hard / >= 0.98 soft"),
                 "value": round(mv, 4),
                 "pass": None if srv_degraded else (mv >= 0.95),
+                **(_shortfall if srv_degraded else {}),
             }
         dn = srv.get("dangling_ref_rate")
         if dn is not None:
             gates["dangling 口惠图但卡片无图 (L4-srv)"] = {
-                "target": (f"<= 0.05 hard (N={n_srv} 太小,trend 监控)"
-                           if srv_degraded else "<= 0.05 hard (扩正则后)"),
+                "target": (f"<= 0.05 hard (N={n_srv}<5)" if srv_degraded else "<= 0.05 hard (扩正则后)"),
                 "value": round(dn, 4),
                 "pass": None if srv_degraded else (dn <= 0.05),
+                **(_shortfall if srv_degraded else {}),
             }
         op = srv.get("orphan_rate")
         if op is not None:
             gates["orphan rate (L4-srv, trend 监控)"] = {
-                "target": (f"<= 0.30 soft (N={n_srv} 太小,仅 trend)"
-                           if srv_degraded else "<= 0.30 soft"),
+                "target": (f"<= 0.30 soft (N={n_srv} 太小,仅 trend)" if srv_degraded else "<= 0.30 soft"),
                 "value": round(op, 4),
                 "pass": None if srv_degraded else (op <= 0.30),
+                **({"na_reason": "expected_na"} if srv_degraded else {}),  # soft → advisory, not a fail
             }
 
     l5 = r.get("l5")
     if l5:
         if l5.get("applicable") is False:
+            # genuinely inapplicable: all-public corpus has no gated docs to leak. expected_na (not a
+            # strict fail) — but injection/ACL stays UNTESTED until gated docs exist (ACL track, dim8).
             gates["permission filtering (L5)"] = {"target": "n/a (no gated docs)",
-                                                  "value": "not exercised", "pass": None}
+                                                  "value": "not exercised", "pass": None,
+                                                  "na_reason": "expected_na",
+                                                  "notes": "all-public corpus; ACL/injection untested until gated docs exist"}
         else:
             gates["permission filtering (L5)"] = {"target": "no leak + injection-safe",
                                                   "value": l5.get("PASS"), "pass": bool(l5.get("PASS"))}
@@ -191,12 +200,26 @@ def build_gates(r: Dict) -> Dict:
         # L4-ingestion Claude binding 维度(2026-06-12 加入,UNIFIED-L4 plan)
         ib_mean = _g(j, "binding", "image_binding", "mean")
         ib_n = _g(j, "binding", "n")
-        if ib_mean is not None and (ib_n or 0) >= 5:   # N<5 时不计闸(plan 抢救点:样本太小自动降级)
+        if ib_mean is not None and (ib_n or 0) >= 5:
             gates["image binding (Claude, L4-ing)"] = {
-                "target": ">= 4.0 / 5 soft (N>=5 才计闸)",
-                "value": ib_mean,
-                "pass": ib_mean >= 4.0,
-            }
+                "target": ">= 4.0 / 5 soft (N>=5 才计闸)", "value": ib_mean, "pass": ib_mean >= 4.0}
+        elif ib_mean is not None:  # emit (not silently omit) but soft → advisory N/A, not a fail
+            gates["image binding (Claude, L4-ing)"] = {
+                "target": ">= 4.0 / 5 soft (N>=5 才计闸)", "value": ib_mean, "pass": None,
+                "na_reason": "expected_na", "notes": f"N={ib_n}<5 — soft binding gate, advisory only"}
+
+    # ── item 3: fusion/calibration regime guard ── thresholds are weighted-fusion-calibrated;
+    # RRF (or an un-accounted fusion change) invalidates the absolute gates even when they "pass".
+    rg = r.get("regime_guard")
+    if rg:
+        gates["fusion/calibration regime (guard)"] = {
+            "target": f"fusion == '{rg.get('expected_fusion')}' (the thresholds' calibration regime)",
+            "value": f"active fusion={rg.get('active_fusion')}, rerank={rg.get('rerank_enable')}",
+            "pass": bool(rg.get("match"))}
+
+    # ── item 1: per-layer/subset regression gates vs the frozen baseline (precomputed in run_eval) ──
+    for name, g in (r.get("baseline_gates") or {}).items():
+        gates[name] = g
     return gates
 
 

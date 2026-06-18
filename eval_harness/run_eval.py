@@ -36,32 +36,99 @@ def _load_goldset(path):
     return cases
 
 
+# The retrieval regime the L1/L2/L3 score thresholds were calibrated on. RRF (or an un-accounted
+# fusion change) invalidates the absolute thresholds even when gates still "pass" → the guard fails.
+CALIBRATION_FUSION = "weighted"
+
+
+def _cfg_get(cfg, name, default=None):
+    """hybrid_fusion / rerank_enable live on cfg or cfg.alibaba_vector depending on version."""
+    if hasattr(cfg, name):
+        return getattr(cfg, name)
+    av = getattr(cfg, "alibaba_vector", None)
+    if av is not None and hasattr(av, name):
+        return getattr(av, name)
+    return default
+
+
+def _regime(cfg, goldset_path: str) -> dict:
+    """Run-condition fingerprint stamped into meta + the baseline, so deltas are never compared across
+    different eval-set / code / model / reranker / fusion / threshold conditions."""
+    import hashlib
+    try:
+        sha = hashlib.sha256(open(goldset_path, "rb").read()).hexdigest()[:16]
+    except Exception:
+        sha = "unknown"
+    try:
+        from opensearch_pipeline.versions import git_commit
+        commit = git_commit()
+    except Exception:
+        commit = "unknown"
+    av = getattr(cfg, "alibaba_vector", None)
+    rag = getattr(cfg, "rag", cfg)
+    rerank_on = bool(_cfg_get(cfg, "rerank_enable", False))
+    thr = (f"sh={getattr(rag,'score_threshold_high',None)},sm={getattr(rag,'score_threshold_medium',None)},"
+           f"rh={getattr(rag,'rerank_score_threshold_high',None)},rm={getattr(rag,'rerank_score_threshold_medium',None)}")
+    return {
+        "eval_set_sha": sha,
+        "fusion": _cfg_get(cfg, "hybrid_fusion", None),
+        "rerank_enable": rerank_on,
+        "llm_model": cfg.llm.model,
+        "embedding_model": cfg.embedding.model,
+        "reranker_models": (f"{getattr(av,'rerank_text_model',None)}/{getattr(av,'rerank_vl_model',None)}"
+                            if rerank_on and av is not None else None),
+        "threshold_version": thr,
+        "code_commit": commit,
+    }
+
+
+def _regime_guard(regime: dict) -> dict:
+    return {"expected_fusion": CALIBRATION_FUSION, "active_fusion": regime.get("fusion"),
+            "rerank_enable": regime.get("rerank_enable"),
+            "match": regime.get("fusion") == CALIBRATION_FUSION}
+
+
 def _strict_enabled(args) -> bool:
     return bool(getattr(args, "strict", False)) or \
         os.environ.get("RAG_EVAL_STRICT", "").lower() in ("1", "true", "yes")
 
 
-def _strict_failures(gates: dict, results: dict) -> list:
-    """Hard-fail reasons under --strict: any gate whose pass is False, or L6 NO_GO_DEFECT,
-    or EVAL-2 manifest drift (extractor/sha256/ref-key) detected during preflight.
-    L6 NO_GO_INCOMPLETE_EVIDENCE is advisory (not a hard fail) — missing evidence shouldn't block;
-    a detected defect should. (Flip via policy later if desired.)"""
-    fails = [name for name, g in (gates or {}).items() if g.get("pass") is False]
+def _strict_failures(gates: dict, results: dict, *, requested_layers=None) -> list:
+    """Hard-fail reasons under --strict. A gate's ``pass``:
+      True → ok ; False → fail ; None → depends on ``na_reason``:
+        - 'not_executed'  (sample / config / verdict shortfall — should have run but didn't) → FAIL.
+          Never silently pass an unmeasured HARD gate.
+        - 'expected_na'   (genuinely inapplicable by design, e.g. L5 with no gated docs) → ok.
+    Plus: L6 NO_GO_DEFECT; EVAL-2 manifest drift; answer-correctness-not-judged (L3 ran but no judge
+    merge); and L6 requested but un-runnable. (L6 NO_GO_INCOMPLETE_EVIDENCE already FAILs via its
+    verdict gate's pass=False — once L6 is actually in the run.)"""
+    fails = []
+    for name, g in (gates or {}).items():
+        p = g.get("pass")
+        if p is False:
+            fails.append(name)
+        elif p is None and g.get("na_reason") == "not_executed":
+            fails.append(f"{name} [not_executed]")
     if (results.get("l6") or {}).get("state") == "NO_GO_DEFECT":
         fails.append("l6:NO_GO_DEFECT")
-    # EVAL-2: count any errors prefixed "manifest_drift::" surfaced by ingestion_binding preflight
     _errs = ((results.get("l4") or {}).get("ingestion") or {}).get("deterministic", {}).get("errors") or []
-    _drift = [e for e in _errs if isinstance(e, str) and e.startswith("manifest_drift::")]
-    if _drift:
-        fails.append(f"l4:manifest_drift({len(_drift)})")
+    if [e for e in _errs if isinstance(e, str) and e.startswith("manifest_drift::")]:
+        fails.append("l4:manifest_drift")
+    # answer-correctness MUST be judged: L3 ran (answers generated) but no judge merge → a strict run
+    # cannot certify correctness. This is a FAIL, not "judge not enabled".
+    if results.get("l3") and not (results.get("judge") or {}).get("aggregate"):
+        fails.append("answer_correctness:not_judged (merge a judge_verdicts.json)")
+    # L6 was requested but could not be evaluated at all → not a silent skip.
+    if requested_layers and "l6" in requested_layers and (results.get("l6") or {}).get("applicable") is False:
+        fails.append("l6:not_executed (requested but applicable=False)")
     return fails
 
 
-def _enforce_strict(gates: dict, results: dict, strict: bool):
+def _enforce_strict(gates: dict, results: dict, strict: bool, *, requested_layers=None):
     """EVAL-1: convert advisory gates into a blocking exit code (the CI gate, EVAL-3, relies on this)."""
     if not strict:
         return
-    fails = _strict_failures(gates, results)
+    fails = _strict_failures(gates, results, requested_layers=requested_layers)
     if fails:
         print(f"\n❌ STRICT: hard gate failure(s): {fails} → exit 1")
         sys.exit(1)
@@ -87,6 +154,9 @@ def phase_run(args):
         **envboot.facts(),
     }
     results = {"meta": meta}
+    regime = _regime(cfg, args.goldset)
+    results["meta"]["regime"] = regime
+    results["regime_guard"] = _regime_guard(regime)  # item 3: fusion/calibration consistency gate
     print(f"== EVAL RUN {meta['run_id']} | table={meta['ha3_table']} | n={len(cases)} ==")
     print(json.dumps({k: meta[k] for k in ("ha3_endpoint", "llm_model", "rag_environment", "simulate")},
                      ensure_ascii=False))
@@ -179,16 +249,21 @@ def phase_run(args):
         print(f"   verdict={results['l6'].get('state')}  go_no_go={results['l6'].get('go_no_go')}  "
               f"d7={results['l6'].get('d7_source')}")
 
+    if args.baseline and os.path.exists(args.baseline):
+        from . import baseline as _bl
+        results["baseline_gates"] = _bl.compare(
+            json.load(open(args.baseline, encoding="utf-8")), results)
     from . import report
     gates = report.write(results, outdir)
     print(f"\n== PRELIMINARY REPORT -> {outdir}/report.md ==")
     for name, g in gates.items():
-        mark = "PASS" if g["pass"] is True else ("FAIL" if g["pass"] is False else "N/A")
+        mark = ("PASS" if g["pass"] is True else "FAIL" if g["pass"] is False
+                else "N/A!" if g.get("na_reason") == "not_executed" else "N/A")
         print(f"   [{mark}] {name}: {g['value']}")
     print(f"\nNext: judge the bundle (Claude panel) -> {outdir}/judge_verdicts.json, then:\n"
           f"  python -m eval_harness.run_eval merge --results {outdir}/report.json "
           f"--verdicts {outdir}/judge_verdicts.json")
-    _enforce_strict(gates, results, _strict_enabled(args))
+    _enforce_strict(gates, results, _strict_enabled(args), requested_layers=layers)
     return outdir
 
 
@@ -222,34 +297,56 @@ def phase_merge(args):
         cpanels = cverd["panels"] if isinstance(cverd, dict) and "panels" in cverd else cverd
         results.setdefault("l6", {})["judge_chunk"] = merge_chunk_panel(chunk_bundle, cpanels)
 
+    if args.baseline and os.path.exists(args.baseline):
+        from . import baseline as _bl
+        results["baseline_gates"] = _bl.compare(
+            json.load(open(args.baseline, encoding="utf-8")), results)
     from . import report
     outdir = os.path.dirname(args.results)
     gates = report.write(results, outdir)
     print(f"== FINAL REPORT -> {outdir}/report.md ==")
     for name, g in gates.items():
-        mark = "PASS" if g["pass"] is True else ("FAIL" if g["pass"] is False else "N/A")
+        mark = ("PASS" if g["pass"] is True else "FAIL" if g["pass"] is False
+                else "N/A!" if g.get("na_reason") == "not_executed" else "N/A")
         print(f"   [{mark}] {name}: {g['value']}")
-    _enforce_strict(gates, results, _strict_enabled(args))
+    _enforce_strict(gates, results, _strict_enabled(args),
+                    requested_layers=set((results.get("meta") or {}).get("layers") or []))
     return outdir
+
+
+def phase_baseline_freeze(args):
+    """Freeze the current run's report.json into a committed baseline (regime-tagged)."""
+    from . import baseline as _bl
+    results = json.load(open(args.results, encoding="utf-8"))
+    out = args.baseline or os.path.join(HERE, "goldset", "baseline.json")
+    base = _bl.freeze(results, out)
+    print(f"== BASELINE FROZEN -> {out} ==")
+    print(f"   regime: {json.dumps(base['regime'], ensure_ascii=False)}")
+    print(f"   metrics: {len(base['metrics'])} (delta={base['delta']})")
+    return out
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["run", "merge"])
+    ap.add_argument("phase", choices=["run", "merge", "baseline-freeze"])
     ap.add_argument("--goldset", default=DEFAULT_GOLDSET)
-    ap.add_argument("--layers", default="l0,l1,l2,l3,l4,l5")
+    ap.add_argument("--layers", default="l0,l1,l2,l3,l4,l5,l6")  # L6 now in default (item 4)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--outdir", default="")
     ap.add_argument("--results", default="")
     ap.add_argument("--verdicts", default="")
+    ap.add_argument("--baseline", default="",
+                    help="path to a frozen baseline.json; enables per-layer/subset regression gating")
     ap.add_argument("--strict", action="store_true",
-                    help="exit non-zero on any hard gate FAIL / L6 NO_GO_DEFECT (CI gate); "
-                         "also enabled by RAG_EVAL_STRICT=true")
+                    help="exit non-zero on any hard gate FAIL / not_executed / L6 NO_GO_DEFECT / "
+                         "unjudged correctness (CI gate); also enabled by RAG_EVAL_STRICT=true")
     args = ap.parse_args()
     if args.phase == "run":
         phase_run(args)
-    else:
+    elif args.phase == "merge":
         phase_merge(args)
+    else:
+        phase_baseline_freeze(args)
 
 
 if __name__ == "__main__":
