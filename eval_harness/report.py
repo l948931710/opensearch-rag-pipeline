@@ -6,6 +6,12 @@ import json
 import os
 from typing import Dict
 
+# ① inter-judge agreement gate: the panel already computes mean_overall_interjudge_stdev (judge.py)
+# but never gated it — high disagreement = unreliable verdicts that silently passed. Conservative
+# HARD bound on the 1-5 overall scale; tighten toward ~0.8-1.0 once the real-run distribution is
+# observed (a stdev ~1.2 means judges typically disagree by >1 point → the mean is not trustworthy).
+_JUDGE_STDEV_MAX = float(os.environ.get("RAG_EVAL_JUDGE_STDEV_MAX", "1.2"))
+
 
 def _g(d, *path, default=None):
     for p in path:
@@ -169,6 +175,12 @@ def build_gates(r: Dict) -> Dict:
             tag = "L6-hard" if g.get("hard") else "L6-soft"
             gates[f"[{tag}] {name}"] = {"target": g.get("target"),
                                         "value": g.get("value"), "pass": g.get("pass")}
+        # ① inter-judge agreement on the L6 chunk panel (only present after a chunk-judge merge)
+        jc_sd = (l6.get("judge_chunk") or {}).get("mean_overall_interjudge_stdev")
+        if jc_sd is not None:
+            gates["judge inter-rater agreement (L6 chunk panel)"] = {
+                "target": f"mean overall inter-judge stdev <= {_JUDGE_STDEV_MAX} (1-5 scale)",
+                "value": jc_sd, "pass": (jc_sd <= _JUDGE_STDEV_MAX)}
 
     j = r.get("judge", {}).get("aggregate") if r.get("judge") else None
     if j:
@@ -197,6 +209,15 @@ def build_gates(r: Dict) -> Dict:
         if nfab is not None:
             gates["negative fabrication (Claude, L3)"] = {"target": "<= 0.10", "value": nfab,
                                                           "pass": nfab <= 0.10}
+        # ① inter-judge agreement gate (L3 answer panel). sd None = no positives judged this run →
+        # expected_na (the answer-correctness gates above already carry the not-judged signal).
+        sd = j.get("mean_overall_interjudge_stdev")
+        gates["judge inter-rater agreement (L3 panel)"] = {
+            "target": f"mean overall inter-judge stdev <= {_JUDGE_STDEV_MAX} (1-5 scale; lower=more agreement)",
+            "value": sd,
+            "pass": None if sd is None else (sd <= _JUDGE_STDEV_MAX),
+            **({"na_reason": "expected_na", "notes": "no positives judged this run"} if sd is None else {}),
+        }
         # L4-ingestion Claude binding 维度(2026-06-12 加入,UNIFIED-L4 plan)
         ib_mean = _g(j, "binding", "image_binding", "mean")
         ib_n = _g(j, "binding", "n")

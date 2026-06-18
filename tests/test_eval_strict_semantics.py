@@ -158,3 +158,45 @@ def test_run_judge_assembles_panels(monkeypatch, tmp_path):
     saved = _json.load(open(out))
     assert len(saved["panels"]) == 3
     assert {v["qid"] for v in saved["panels"][0]["verdicts"]} == {"q1", "q2"}
+
+
+# ── ① inter-judge agreement gate (judge.py computed mean_overall_interjudge_stdev but never gated) ──
+
+def test_judge_interrater_agreement_gate_l3():
+    from eval_harness.report import build_gates
+    assert build_gates({"judge": {"aggregate": {"mean_overall_interjudge_stdev": 0.4}}})[
+        "judge inter-rater agreement (L3 panel)"]["pass"] is True
+    assert build_gates({"judge": {"aggregate": {"mean_overall_interjudge_stdev": 1.5}}})[
+        "judge inter-rater agreement (L3 panel)"]["pass"] is False
+    g = build_gates({"judge": {"aggregate": {"mean_overall_interjudge_stdev": None}}})[
+        "judge inter-rater agreement (L3 panel)"]
+    assert g["pass"] is None and g["na_reason"] == "expected_na"
+
+
+def test_judge_high_disagreement_blocks_strict():
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    g = build_gates({"judge": {"aggregate": {"mean_overall_interjudge_stdev": 1.5}}})
+    fails = _strict_failures(g, {"l3": {"deterministic": {}},
+                                 "judge": {"aggregate": {"positives": {}}}})
+    assert any("inter-rater agreement" in x for x in fails)
+
+
+def test_l6_chunk_judge_interrater_gate():
+    from eval_harness.report import build_gates
+    g = build_gates({"l6": {"applicable": True, "state": "GO", "go_no_go": True, "gates": {},
+                            "judge_chunk": {"mean_overall_interjudge_stdev": 1.5}}})
+    assert g["judge inter-rater agreement (L6 chunk panel)"]["pass"] is False
+
+
+def test_judge_stdev_threshold_env_override(monkeypatch):
+    import importlib
+    from eval_harness import report
+    monkeypatch.setenv("RAG_EVAL_JUDGE_STDEV_MAX", "0.5")
+    importlib.reload(report)
+    try:
+        assert report.build_gates({"judge": {"aggregate": {"mean_overall_interjudge_stdev": 0.8}}})[
+            "judge inter-rater agreement (L3 panel)"]["pass"] is False
+    finally:
+        monkeypatch.delenv("RAG_EVAL_JUDGE_STDEV_MAX", raising=False)
+        importlib.reload(report)
