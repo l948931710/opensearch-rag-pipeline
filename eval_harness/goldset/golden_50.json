@@ -1999,15 +1999,14 @@
    "商检号"
   ],
   "difficulty": null,
-  "expect_images": true,
-  "expected_images": [
-   "绿色纸质生产检验单，含商检号/包装日期/机台号字段，红色箭头标注关键字段对应关系"
-  ],
+  "expect_images": false,
+  "expected_images": [],
   "expected_permission": [
    "public"
   ],
   "live_scorable": true,
-  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness",
+  "_img_verdict": "2026-06-18: question '收货报检涉及哪些关键字段' is text-sufficient (answer fully lists fields from text; the 生产检验单 image is redundant visual evidence) → expect_images=false. NOT relaxed to clear a gate (marker_validity was None for it). A genuinely image-requiring question on this doc could be added later to restore a 5th image case."
  },
  {
   "qid": "S5-qa-inspect-release",

@@ -166,6 +166,17 @@ def build_gates(r: Dict) -> Dict:
                 "pass": None if srv_degraded else (op <= 0.30),
                 **({"na_reason": "expected_na"} if srv_degraded else {}),  # soft → advisory, not a fail
             }
+        # marker_distinctness — ADVISORY (never blocks): fraction of in-range markers that are DISTINCT
+        # images. <1.0 = a valid image was reused across the answer (often a chunk that bundles several
+        # step-level images under ONE addressable marker index → distinct steps can't get distinct
+        # markers; an addressability limitation, not a defect). Surfaced so reuse stays visible without
+        # conflating it with marker_validity (which only penalises out-of-range markers).
+        di = srv.get("marker_distinctness")
+        if di is not None:
+            gates["marker distinctness (L4-srv, advisory)"] = {
+                "target": "advisory — 1.0 = no image reuse (lower = bundled/reused markers)",
+                "value": round(di, 4), "pass": (di >= 0.95), "advisory": True,
+            }
 
     l5 = r.get("l5")
     if l5:

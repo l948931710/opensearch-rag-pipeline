@@ -20,21 +20,15 @@ cases 触发 Serving;gt_files+docs_dir 触发 Ingestion;两者独立可单跑、
 """
 from __future__ import annotations
 
-import os
-import sys
 from typing import Dict, List, Optional
 
 from .. import envboot  # noqa: F401
 from ..gen_nothink import generate_answer_nothink
 
-_SCRIPTS = os.path.expanduser("~/Downloads/opensearch-rag-data/eval_samples/scripts")
-if _SCRIPTS not in sys.path:
-    sys.path.insert(0, _SCRIPTS)
-
 
 def _run_serving(cases: List[Dict], top_k: int, max_images: int) -> Dict:
     """L4-serving:LLM `<<IMG:N>>` 摆放质量(原 l4 路径,封装进 serving 子键)。"""
-    import mm_answer_metrics as M
+    from eval_harness import mm_answer_metrics as M  # single source of truth, in-repo (was data-repo)
     from opensearch_pipeline.retriever import retrieve_and_enrich
 
     img_cases = [c for c in cases if c.get("expect_images") and c.get("live_scorable")]

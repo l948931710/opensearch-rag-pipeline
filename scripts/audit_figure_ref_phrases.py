@@ -15,9 +15,8 @@ from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.expanduser("~/Downloads/opensearch-rag-data/eval_samples/scripts"))
 
-from mm_answer_metrics import _FIGURE_REF_RE
+from eval_harness.mm_answer_metrics import _FIGURE_REF_RE  # noqa: E402  moved in-repo 2026-06-18
 
 
 def main():

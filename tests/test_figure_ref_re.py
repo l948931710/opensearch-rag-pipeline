@@ -8,13 +8,10 @@ test_figure_ref_re.py — 校准后 _FIGURE_REF_RE 的覆盖与误报边界。
 
 跑测:pytest tests/test_figure_ref_re.py -v
 """
-import os
-import sys
-
-sys.path.insert(0, os.path.expanduser("~/Downloads/opensearch-rag-data/eval_samples/scripts"))
-
 import pytest
-from mm_answer_metrics import (
+# mm_answer_metrics moved in-repo 2026-06-18 (eval_harness/mm_answer_metrics.py) so these tests run in
+# CI sim without the out-of-repo data repo. The data-repo copy is now a shim re-exporting this module.
+from eval_harness.mm_answer_metrics import (
     _FIGURE_REF_RE,
     _FIGURE_REF_FALSE_POSITIVES,
     dump_dangling_cases,
@@ -124,3 +121,62 @@ def test_false_positive_constant_documented():
     """显式标定:_FIGURE_REF_FALSE_POSITIVES 至少含图标/图样/图片参数(已知误报候选)。"""
     for word in ("图标", "图样", "图片参数"):
         assert word in _FIGURE_REF_FALSE_POSITIVES
+
+
+# ── marker_validity redefinition (2026-06-18) ────────────────────────────────────
+# validity = IN-RANGE marker occurrences / total occurrences. Reuse of a VALID marker is NOT invalid
+# (that's marker_distinctness). Regression for the J-water_soak 0.8 artifact (it placed <<IMG:1>> twice
+# across two steps → old distinct/total formula scored 0.5 even though zero markers were out-of-range).
+import eval_harness.mm_answer_metrics as _M  # noqa: E402
+from eval_harness.mm_answer_metrics import analyze_answer, aggregate  # noqa: E402
+
+_MAP3 = {1: [{"visual_summary": "a"}], 2: [{"visual_summary": "b"}], 3: [{"visual_summary": "c"}]}
+
+
+def test_marker_validity_valid_reuse_not_penalised(monkeypatch):
+    monkeypatch.setattr(_M, "_extract_image_chunks", lambda c: _MAP3)
+    det = analyze_answer("第1步 <<IMG:1>> 第2步 <<IMG:1>>", used_chunks=[])
+    assert det["n_markers"] == 2 and det["n_invalid_markers"] == 0
+    assert det["marker_validity"] == 1.0          # was 0.5 under the old distinct/total formula
+    assert det["marker_distinctness"] == 0.5      # reuse surfaces here (advisory), not as invalidity
+
+
+def test_marker_validity_invalid_out_of_range(monkeypatch):
+    monkeypatch.setattr(_M, "_extract_image_chunks", lambda c: _MAP3)
+    det = analyze_answer("占位 <<IMG:5>>", used_chunks=[])   # 5 not in {1,2,3}
+    assert det["n_markers"] == 1 and det["n_invalid_markers"] == 1
+    assert det["marker_validity"] == 0.0
+    assert det["marker_distinctness"] is None     # no in-range markers
+
+
+def test_marker_validity_mixed(monkeypatch):
+    monkeypatch.setattr(_M, "_extract_image_chunks", lambda c: _MAP3)
+    det = analyze_answer("<<IMG:1>> <<IMG:2>> <<IMG:9>>", used_chunks=[])  # 1,2 valid; 9 out-of-range
+    assert det["n_markers"] == 3 and det["n_invalid_markers"] == 1
+    assert abs(det["marker_validity"] - 2 / 3) < 1e-9
+    assert det["marker_distinctness"] == 1.0      # 2 distinct / 2 in-range
+
+
+def test_aggregate_marker_validity_and_distinctness(monkeypatch):
+    monkeypatch.setattr(_M, "_extract_image_chunks", lambda c: _MAP3)
+    dets = [
+        analyze_answer("<<IMG:1>> <<IMG:1>>", []),            # reuse: inrange2 distinct1 markers2
+        analyze_answer("<<IMG:1>> <<IMG:2>> <<IMG:9>>", []),  # mixed: inrange2 distinct2 markers3
+        analyze_answer("占位 <<IMG:5>>", []),                 # invalid: inrange0 distinct0 markers1
+    ]
+    agg = aggregate(dets)
+    assert agg["total_markers"] == 6 and agg["total_invalid_markers"] == 2
+    assert abs(agg["marker_validity"] - 4 / 6) < 1e-9        # 4 in-range / 6 total occurrences
+    assert abs(agg["marker_distinctness"] - 3 / 4) < 1e-9    # 3 distinct / 4 in-range
+
+
+def test_aggregate_validity_recomputes_from_legacy_dets():
+    """Older stored dets (pre-2026-06-18) lack n_inrange/n_distinct → aggregate must recompute from
+    n_markers/n_invalid. Proves the baseline marker_validity can be recomputed: the J-water_soak det
+    (markers 2, invalid 0, distinct 1) → 1.0 under the new formula (was 0.5)."""
+    legacy = [{"n_available": 4, "n_markers": 2, "n_valid_markers": 1, "n_invalid_markers": 0,
+               "interleaved": True, "dangling_ref": False, "over_cap": False, "n_orphan": 0,
+               "strategy": "interleaved", "n_shown": 2}]
+    agg = aggregate(legacy)
+    assert agg["marker_validity"] == 1.0
+    assert agg["marker_distinctness"] == 0.5
