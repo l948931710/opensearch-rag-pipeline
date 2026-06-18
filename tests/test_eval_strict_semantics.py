@@ -107,6 +107,29 @@ def test_report_regime_guard_gate():
     assert good["fusion/calibration regime (guard)"]["pass"] is True
 
 
+def test_regime_guard_pins_rerank_state(monkeypatch):
+    """The guard fails-closed when the active rerank state != the calibration/prod regime — L2 uses
+    different score bands for rerank-on vs -off, so a rerank mismatch makes L1/L2 non-representative."""
+    import eval_harness.run_eval as rev
+    monkeypatch.setattr(rev, "CALIBRATION_RERANK", True)  # production serves rerank ON
+    g_off = rev._regime_guard({"fusion": "weighted", "rerank_enable": False})
+    assert g_off["match"] is False and "rerank" in g_off["mismatch"]      # rerank OFF vs prod ON → fail
+    g_on = rev._regime_guard({"fusion": "weighted", "rerank_enable": True})
+    assert g_on["match"] is True and g_on["mismatch"] == []                # matched regime → pass
+    g_fus = rev._regime_guard({"fusion": "rrf", "rerank_enable": True})
+    assert g_fus["match"] is False and "fusion" in g_fus["mismatch"]       # fusion still caught
+
+
+def test_regime_guard_rerank_mismatch_blocks_strict(monkeypatch):
+    """A rerank-regime mismatch must make the report gate fail (so _strict_failures blocks)."""
+    import eval_harness.run_eval as rev
+    from eval_harness.report import build_gates
+    monkeypatch.setattr(rev, "CALIBRATION_RERANK", True)
+    rg = rev._regime_guard({"fusion": "weighted", "rerank_enable": False})
+    gate = build_gates({"regime_guard": rg})["fusion/calibration regime (guard)"]
+    assert gate["pass"] is False and "MISMATCH" in gate["value"]
+
+
 def test_report_l4srv_shortfall_taxonomy():
     from eval_harness.report import build_gates
     r = {"l4": {"applicable": True, "aggregate": {"n_answers_with_images": 2, "marker_validity": 1.0,

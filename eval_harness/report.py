@@ -234,8 +234,10 @@ def build_gates(r: Dict) -> Dict:
     rg = r.get("regime_guard")
     if rg:
         gates["fusion/calibration regime (guard)"] = {
-            "target": f"fusion == '{rg.get('expected_fusion')}' (the thresholds' calibration regime)",
-            "value": f"active fusion={rg.get('active_fusion')}, rerank={rg.get('rerank_enable')}",
+            "target": (f"fusion == '{rg.get('expected_fusion')}' AND rerank == {rg.get('expected_rerank')} "
+                       f"(thresholds' calibration regime == production serving regime)"),
+            "value": (f"active fusion={rg.get('active_fusion')}, rerank={rg.get('active_rerank', rg.get('rerank_enable'))}"
+                      + (f" — REGIME MISMATCH: {rg.get('mismatch')}" if not rg.get("match") else "")),
             "pass": bool(rg.get("match"))}
 
     # ── item 1: per-layer/subset regression gates vs the frozen baseline (precomputed in run_eval) ──

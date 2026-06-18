@@ -40,6 +40,15 @@ def _load_goldset(path):
 # fusion change) invalidates the absolute thresholds even when gates still "pass" → the guard fails.
 CALIBRATION_FUSION = "weighted"
 
+# Production serves with the routed reranker ON (verified read-only 2026-06-18: docs/audits/L6_*_
+# 2026-06-15 record RAG_RERANK_ENABLE=true, and live qa_session_log.top_score sits in the 0-1 rerank
+# band — NOT the 7.7/5.8 weighted scale). The eval MUST run in the same rerank state or its L1/L2
+# numbers don't represent production: L2 switches to the rerank 0.9/0.8 bands when rerank is on
+# (l2_calibration.py), so a rerank-OFF run scores against the wrong thresholds. Override ONLY to
+# deliberately evaluate/recalibrate a different regime.
+CALIBRATION_RERANK = os.environ.get(
+    "RAG_EVAL_CALIBRATION_RERANK", "true").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _cfg_get(cfg, name, default=None):
     """hybrid_fusion / rerank_enable live on cfg or cfg.alibaba_vector depending on version."""
@@ -83,9 +92,18 @@ def _regime(cfg, goldset_path: str) -> dict:
 
 
 def _regime_guard(regime: dict) -> dict:
-    return {"expected_fusion": CALIBRATION_FUSION, "active_fusion": regime.get("fusion"),
-            "rerank_enable": regime.get("rerank_enable"),
-            "match": regime.get("fusion") == CALIBRATION_FUSION}
+    """Fail-closed if the active retrieval regime != the regime the thresholds were calibrated on
+    (== production serving regime). Pins BOTH fusion and rerank state: L2 uses different score bands
+    for rerank-on vs -off, so a rerank mismatch makes L1/L2 absolute numbers non-representative."""
+    active_fusion = regime.get("fusion")
+    active_rerank = bool(regime.get("rerank_enable"))
+    fusion_ok = active_fusion == CALIBRATION_FUSION
+    rerank_ok = active_rerank == CALIBRATION_RERANK
+    mismatch = [m for m, ok in (("fusion", fusion_ok), ("rerank", rerank_ok)) if not ok]
+    return {"expected_fusion": CALIBRATION_FUSION, "active_fusion": active_fusion,
+            "expected_rerank": CALIBRATION_RERANK, "active_rerank": active_rerank,
+            "rerank_enable": active_rerank,
+            "match": (fusion_ok and rerank_ok), "mismatch": mismatch}
 
 
 def _strict_enabled(args) -> bool:
