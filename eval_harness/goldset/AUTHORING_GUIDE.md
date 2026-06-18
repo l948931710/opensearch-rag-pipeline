@@ -14,7 +14,7 @@ fingerprint changes → refreeze any baseline).
 | **metadata negatives** | **0** | **≥ 3** | genuinely-absent metadata (author/owner/版本日期 not in content). NB: some metadata IS in docs (e.g. 文控编号) — those are positives, not negatives |
 | **image cases (positive)** | ~2 | **≥ 5** | L4-srv hard gates (marker validity / dangling) are `not_executed` below N=5 → currently unmeasured |
 | **xlsx cases (positive)** | few | **+several** | xlsx recall is high-variance on a tiny n |
-| **dept coverage (positive)** | HR/admin/finance only | **+IT, production, quality, sales, marketing** (≥3 each) | gold has ZERO questions for 5 of 8 depts; L1 recall only represents 3 depts |
+| **dept coverage (positive)** | HR/admin/finance only | **+IT, production, quality, marketing, rd** (≥3 each) | gold has ZERO questions for these depts; L1 recall only represents 3. NB: corpus has **no "sales" dept** — 外贸/客户 lives under `marketing`; `pmc`/`supply` (采购) are also thin, extend later |
 | **finance** | present | **+3 (authorable NOW)** | verified 2026-06-18: **24 finance docs are ALL `permission_level=public` + registered today** (tax SOPs `FL-CW-SW-*`, 制度 `CWZD-*`, 内控手册V2). Author finance positives as public now (`--verify-live` confirms each is retrievable). Nothing finance is restricted yet — ACL (model B) only changes their permission LATER |
 
 ## Integrity rules (non-negotiable — these are the project's gold-quality principles)
@@ -39,7 +39,7 @@ fingerprint changes → refreeze any baseline).
   "qid": "IT-erp-login-01",                 // unique, dept-prefixed
   "source": "docx",                          // docx | pdf | xlsx | json_text
   "module": "rag_retrieval",                 // rag_retrieval | rag_retrieval_json
-  "dept": "it",                              // it|production|quality|sales|marketing|hr|admin|finance
+  "dept": "it",                              // hr|admin|finance|it|production|quality|marketing|rd|pmc|supply (no "sales")
   "query": "U8 系统登录失败提示密码错误怎么处理？",
   "kind": "positive",
   "expected_docs": ["富岭U8+财务部操作手册"],   // exact title(s)

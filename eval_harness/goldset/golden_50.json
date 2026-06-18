@@ -1821,5 +1821,816 @@
   "expected_permission": [],
   "live_scorable": true,
   "neg_type": "near_miss_answer_absent"
+ },
+ {
+  "qid": "S5-it-strawcount-01",
+  "source": "pdf",
+  "module": "rag_retrieval",
+  "dept": "it",
+  "query": "吸管车间盘点每月几号前要完成？",
+  "kind": "positive",
+  "expected_docs": [
+   "《吸管车间盘点》作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120632_05FACF"
+  ],
+  "resolution": [
+   {
+    "expected": "《吸管车间盘点》作业指导书",
+    "title": "《吸管车间盘点》作业指导书.pdf",
+    "doc_id": "DOC_IT_20260513120632_05FACF",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "it"
+   }
+  ],
+  "answer_points": "每月1号要完成存货的实地盘点",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "每月1号"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-it-pkgwage-01",
+  "source": "pdf",
+  "module": "rag_retrieval",
+  "dept": "it",
+  "query": "包装区工资统计第一步要根据交货单货号查找什么？",
+  "kind": "positive",
+  "expected_docs": [
+   "《包装区工资统计》作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120632_6BCB45"
+  ],
+  "resolution": [
+   {
+    "expected": "《包装区工资统计》作业指导书",
+    "title": "《包装区工资统计》作业指导书.pdf",
+    "doc_id": "DOC_IT_20260513120632_6BCB45",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "it"
+   }
+  ],
+  "answer_points": "根据交货单的货号查找包装区工资表—工价表",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "工价表"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-it-u8void-docno",
+  "source": "pdf",
+  "module": "rag_retrieval",
+  "dept": "it",
+  "query": "《U8弃审》作业指导书的文件编号是多少？",
+  "kind": "positive",
+  "expected_docs": [
+   "《U8弃审》作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120632_AAF7F0"
+  ],
+  "resolution": [
+   {
+    "expected": "《U8弃审》作业指导书",
+    "title": "《U8弃审》作业指导书.pdf",
+    "doc_id": "DOC_IT_20260513120632_AAF7F0",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "it"
+   }
+  ],
+  "answer_points": "文件编号 FL-QG-CB-004",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "FL-QG-CB-004"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-prod-12ozcup-stamp",
+  "source": "xlsx",
+  "module": "rag_retrieval",
+  "dept": "production",
+  "query": "12oz仿PET杯自动包装作业，盖章位置在哪里？",
+  "kind": "positive",
+  "expected_docs": [
+   "D区、C区、F区(12oz仿PET杯)作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_PRODUCTION_20260513120634_370F87"
+  ],
+  "resolution": [
+   {
+    "expected": "D区、C区、F区(12oz仿PET杯)作业指导书",
+    "title": "D区、C区、F区(12oz仿PET杯)作业指导书.xlsx",
+    "doc_id": "DOC_PRODUCTION_20260513120634_370F87",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "production"
+   }
+  ],
+  "answer_points": "盖章位置位于侧唛商检号下方",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "侧唛商检号下方"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-prod-receipt-img",
+  "source": "pdf",
+  "module": "rag_retrieval",
+  "dept": "production",
+  "query": "注塑收货报检时，生产检验单上有哪些关键字段？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-ZS-WI-005《注塑收货报检》作业指导书-成品仓管"
+  ],
+  "expected_doc_ids": [
+   "DOC_PRODUCTION_20260513120638_C4ECCD"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-ZS-WI-005《注塑收货报检》作业指导书-成品仓管",
+    "title": "FL-ZS-WI-005《注塑收货报检》作业指导书-成品仓管.pdf",
+    "doc_id": "DOC_PRODUCTION_20260513120638_C4ECCD",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "production"
+   }
+  ],
+  "answer_points": "生产检验单含商检号、包装日期、机台号、生产人员等字段",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "商检号"
+  ],
+  "difficulty": null,
+  "expect_images": true,
+  "expected_images": [
+   "绿色纸质生产检验单，含商检号/包装日期/机台号字段，红色箭头标注关键字段对应关系"
+  ],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-qa-inspect-release",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "quality",
+  "query": "产品检验规程规定，检验合格的产品方可怎样？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-QC-015-002产品检验规范"
+  ],
+  "expected_doc_ids": [
+   "DOC_QUALITY_20260611201419_5A271A"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-QC-015-002产品检验规范",
+    "title": "FL-QC-015-002产品检验规范.docx",
+    "doc_id": "DOC_QUALITY_20260611201419_5A271A",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "quality"
+   }
+  ],
+  "answer_points": "按规定项目检验合格的产品方可入库、转序和交付",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "入库、转序和交付"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-qa-rework-report",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "quality",
+  "query": "发现半成品不良后要填写一式几份的什么报告？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-QC-015-005返工返修操作规范"
+  ],
+  "expected_doc_ids": [
+   "DOC_QUALITY_20260611201419_521DE1"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-QC-015-005返工返修操作规范",
+    "title": "FL-QC-015-005返工返修操作规范.docx",
+    "doc_id": "DOC_QUALITY_20260611201419_521DE1",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "quality"
+   }
+  ],
+  "answer_points": "填写一式四份《产品不合格报告》",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "一式四份《产品不合格报告》"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-qa-recycle-mark",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "quality",
+  "query": "回料控制程序中生产车间负责对回料做什么？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-QC-015-007回料控制程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_QUALITY_20260611201419_7FA6C7"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-QC-015-007回料控制程序",
+    "title": "FL-QC-015-007回料控制程序.docx",
+    "doc_id": "DOC_QUALITY_20260611201419_7FA6C7",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "quality"
+   }
+  ],
+  "answer_points": "生产车间负责对回料的挑检区分和标识",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "挑检区分和标识"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-mkt-sample-fee",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "marketing",
+  "query": "打样寄样作业指导书规定，客户样品费什么时候到账才寄出样品？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-GJMY-WI-003《打样寄样》作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_MARKETING_20260611201418_59B5CE"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-GJMY-WI-003《打样寄样》作业指导书",
+    "title": "FL-GJMY-WI-003《打样寄样》作业指导书.docx",
+    "doc_id": "DOC_MARKETING_20260611201418_59B5CE",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "marketing"
+   }
+  ],
+  "answer_points": "客户样品费到账之后再寄出样品",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "样品费到账"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-mkt-audit-contact",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "marketing",
+  "query": "验厂申请第一步要先和谁确认审核时间？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-GJMY-WI-002《验厂申请》作业指导书(1)"
+  ],
+  "expected_doc_ids": [
+   "DOC_MARKETING_20260611201418_3C0825"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-GJMY-WI-002《验厂申请》作业指导书(1)",
+    "title": "FL-GJMY-WI-002《验厂申请》作业指导书(1).docx",
+    "doc_id": "DOC_MARKETING_20260611201418_3C0825",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "marketing"
+   }
+  ],
+  "answer_points": "先跟验厂负责人（质量-林剑/社会责任-陈超）确认时间",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "林剑"
+  ],
+  "difficulty": null,
+  "expect_images": true,
+  "expected_images": [
+   "署名 Sandy Jiang 的邮件正文截图，申请安排麦当劳质量审核"
+  ],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-mkt-dispatch-img",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "marketing",
+  "query": "填写派车通知，第一步要在钉钉里进入什么界面？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-GJMY-WI-001《派车通知》作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_MARKETING_20260611201418_AA9490"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-GJMY-WI-001《派车通知》作业指导书",
+    "title": "FL-GJMY-WI-001《派车通知》作业指导书.docx",
+    "doc_id": "DOC_MARKETING_20260611201418_AA9490",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "marketing"
+   }
+  ],
+  "answer_points": "打开钉钉进入出车单界面",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "出车单"
+  ],
+  "difficulty": null,
+  "expect_images": true,
+  "expected_images": [
+   "钉钉工作台界面截图，标注从工作台进入出车单入口"
+  ],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-rd-biosafety-reserve",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "rd",
+  "query": "BBC86生物安全柜怎么启动预约功能？",
+  "kind": "positive",
+  "expected_docs": [
+   "11231 BBC86生物安全柜作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_RD_20260611201420_451A53"
+  ],
+  "resolution": [
+   {
+    "expected": "11231 BBC86生物安全柜作业指导书",
+    "title": "11231 BBC86生物安全柜作业指导书.docx",
+    "doc_id": "DOC_RD_20260611201420_451A53",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "rd"
+   }
+  ],
+  "answer_points": "插上电源打开电源锁后按下预约键(SUB)，调时间后再按电源键启动预约",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "预约键"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-rd-conduct-temp",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "rd",
+  "query": "DDS-307电导率仪校准时溶液温度要控制在多少？",
+  "kind": "positive",
+  "expected_docs": [
+   "DDS-307型电导率仪作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_RD_20260611201420_133B7B"
+  ],
+  "resolution": [
+   {
+    "expected": "DDS-307型电导率仪作业指导书",
+    "title": "DDS-307型电导率仪作业指导书.docx",
+    "doc_id": "DOC_RD_20260611201420_133B7B",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "rd"
+   }
+  ],
+  "answer_points": "控制溶液温度为25±1℃",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "25±1℃"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-rd-conduct-clean",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "rd",
+  "query": "DDS-307电导率仪校准的第一步要做什么？",
+  "kind": "positive",
+  "expected_docs": [
+   "DDS-307型电导率仪作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_RD_20260611201420_133B7B"
+  ],
+  "resolution": [
+   {
+    "expected": "DDS-307型电导率仪作业指导书",
+    "title": "DDS-307型电导率仪作业指导书.docx",
+    "doc_id": "DOC_RD_20260611201420_133B7B",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "rd"
+   }
+  ],
+  "answer_points": "1.1 清洗电极",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "清洗电极"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-fin-vat-taxrate",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "finance",
+  "query": "增值税申报的税负分析表怎么计算实际税负率？",
+  "kind": "positive",
+  "expected_docs": [
+   "增值税申报操作规程 "
+  ],
+  "expected_doc_ids": [
+   "DOC_FINANCE_20260611201418_B16A13"
+  ],
+  "resolution": [
+   {
+    "expected": "增值税申报操作规程 ",
+    "title": "增值税申报操作规程 .docx",
+    "doc_id": "DOC_FINANCE_20260611201418_B16A13",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "finance"
+   }
+  ],
+  "answer_points": "实际税负率=应纳增值税/应税销售额",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "应纳增值税/应税销售额"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-fin-ap-review",
+  "source": "docx",
+  "module": "rag_retrieval",
+  "dept": "finance",
+  "query": "采购与付款管理制度中谁负责复核购货单据的数量与金额？",
+  "kind": "positive",
+  "expected_docs": [
+   "CWZD-006采购与付款管理制度 "
+  ],
+  "expected_doc_ids": [
+   "DOC_FINANCE_20260611201418_3C9A1E"
+  ],
+  "resolution": [
+   {
+    "expected": "CWZD-006采购与付款管理制度 ",
+    "title": "CWZD-006采购与付款管理制度 .docx",
+    "doc_id": "DOC_FINANCE_20260611201418_3C9A1E",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "finance"
+   }
+  ],
+  "answer_points": "财务部门成本会计对所有购货单据的数量与金额进行复核",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "成本会计对所有购货单据"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-fin-cost-date",
+  "source": "pdf",
+  "module": "rag_retrieval",
+  "dept": "finance",
+  "query": "《成本核算》作业指导书的生效日期是哪天？",
+  "kind": "positive",
+  "expected_docs": [
+   "FL-CW-CW-005《成本核算》作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_FINANCE_20260611201418_C77238"
+  ],
+  "resolution": [
+   {
+    "expected": "FL-CW-CW-005《成本核算》作业指导书",
+    "title": "FL-CW-CW-005《成本核算》作业指导书.pdf",
+    "doc_id": "DOC_FINANCE_20260611201418_C77238",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "finance"
+   }
+  ],
+  "answer_points": "生效日期 2022年7月1日",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "2022年7月1日"
+  ],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "_authored": "2026-06-18 grounded+verified (keyword_gt verbatim in retrieved chunk); review for naturalness"
+ },
+ {
+  "qid": "S5-off-stockcode",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "富岭科技的股票代码是多少？",
+  "kind": "negative",
+  "neg_type": "off_topic",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "off_topic：内部文档无股票/IR 主题"
+ },
+ {
+  "qid": "S5-off-ceobday",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "公司董事长的生日是哪一天？",
+  "kind": "negative",
+  "neg_type": "off_topic",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "off_topic：无高管个人传记信息"
+ },
+ {
+  "qid": "S5-off-weather",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "今天台州的天气怎么样？",
+  "kind": "negative",
+  "neg_type": "off_topic",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "off_topic：实时天气，非静态文档内容"
+ },
+ {
+  "qid": "S5-off-competitor",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "主要竞争对手的纸杯报价是多少？",
+  "kind": "negative",
+  "neg_type": "off_topic",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "off_topic：无竞品/外部报价数据"
+ },
+ {
+  "qid": "S5-off-ustariff",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "美国2024年对一次性塑料餐具征收的关税税率是多少？",
+  "kind": "negative",
+  "neg_type": "off_topic",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "off_topic：外部政策，内部 SOP 不含"
+ },
+ {
+  "qid": "S5-meta-uploader",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "《吸管车间盘点》作业指导书是谁上传到知识库的？",
+  "kind": "negative",
+  "neg_type": "metadata",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "metadata：上传者非正文信息"
+ },
+ {
+  "qid": "S5-meta-downloads",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "FL-QC-015-002产品检验规范这份文档被下载过多少次？",
+  "kind": "negative",
+  "neg_type": "metadata",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "metadata：下载次数从不在正文"
+ },
+ {
+  "qid": "S5-meta-lastmod",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "增值税申报操作规程的最后修改人是谁？",
+  "kind": "negative",
+  "neg_type": "metadata",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "answer_points": "",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "metadata：模板修改人/日期为空，正文未载"
  }
 ]

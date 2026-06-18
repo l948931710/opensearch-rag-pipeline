@@ -18,10 +18,11 @@ import sys
 from collections import Counter
 
 NEG_TYPES = {"off_topic", "near_miss_answer_absent", "metadata", "modality_gap", "live_data"}
-DEPTS = {"it", "production", "quality", "sales", "marketing", "hr", "admin", "finance"}
+# actual corpus owner_dept values (verified 2026-06-18 — there is no "sales"; it ≈ marketing/外贸)
+DEPTS = {"hr", "production", "admin", "marketing", "it", "pmc", "rd", "quality", "finance", "supply"}
 TARGETS = {"off_topic": 5, "metadata": 3, "image_cases": 5, "xlsx_cases": 1}
 DEPT_TARGET = 3  # positives per uncovered dept
-UNCOVERED = {"it", "production", "quality", "sales", "marketing"}
+UNCOVERED = {"it", "production", "quality", "marketing", "rd"}  # pmc/supply also thin — extend later
 
 
 def _schema_errors(e: dict, qid: str) -> list:
