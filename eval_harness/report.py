@@ -241,6 +241,13 @@ def build_gates(r: Dict) -> Dict:
     # ── item 1: per-layer/subset regression gates vs the frozen baseline (precomputed in run_eval) ──
     for name, g in (r.get("baseline_gates") or {}).items():
         gates[name] = g
+
+    # ── ② judge-calibration gate (judge-vs-human agreement) — present only once a human-labeled
+    # calibration set has been compared (eval_harness.judge_calibration.compare → results['judge_calibration']).
+    cal = r.get("judge_calibration")
+    if cal:
+        from .judge_calibration import calibration_gate
+        gates["judge calibration vs human (L3)"] = calibration_gate(cal)
     return gates
 
 

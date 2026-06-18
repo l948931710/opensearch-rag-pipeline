@@ -200,3 +200,52 @@ def test_judge_stdev_threshold_env_override(monkeypatch):
     finally:
         monkeypatch.delenv("RAG_EVAL_JUDGE_STDEV_MAX", raising=False)
         importlib.reload(report)
+
+
+# ── ② judge calibration vs human (DRAFT: code ready, labels TODO) ──
+
+def test_judge_calibration_compare_math():
+    from eval_harness.judge_calibration import compare
+    panel = {"verdicts": [
+        {"qid": "q1", "faithfulness": 4, "correctness": 4, "completeness": 4, "relevance": 4, "fabricated": False},
+        {"qid": "q2", "faithfulness": 2, "correctness": 2, "completeness": 2, "relevance": 2, "fabricated": True}]}
+    panels = [panel, panel, panel]
+    human = [{"qid": "q1", "human": {"faithfulness": 4, "correctness": 4, "completeness": 4, "relevance": 4, "fabricated": False}},
+             {"qid": "q2", "human": {"faithfulness": 3, "correctness": 3, "completeness": 3, "relevance": 3, "fabricated": True}}]
+    c = compare(human, panels)
+    assert c["n_items"] == 2
+    assert c["per_dim"]["faithfulness"]["mae"] == 0.5   # mean(|4-4|, |3-2|)
+    assert c["fabrication"]["f1"] == 1.0                 # q1 TN, q2 TP
+
+
+def test_judge_calibration_gate_states():
+    from eval_harness.judge_calibration import calibration_gate, MIN_N
+    g = calibration_gate({"n_items": 1, "per_dim": {}, "fabrication": {}})
+    assert g["pass"] is None and g["na_reason"] == "not_executed"   # too few → must not silently pass
+    good = {"n_items": MIN_N, "per_dim": {"faithfulness": {"mae": 0.3}, "correctness": {"mae": 0.4}},
+            "fabrication": {"f1": 0.9}}
+    assert calibration_gate(good)["pass"] is True
+    bad = {"n_items": MIN_N, "per_dim": {"faithfulness": {"mae": 1.2}, "correctness": {"mae": 0.4}},
+           "fabrication": {"f1": 0.9}}
+    assert calibration_gate(bad)["pass"] is False
+
+
+def test_judge_calibration_gate_wired():
+    from eval_harness.report import build_gates
+    from eval_harness.judge_calibration import MIN_N
+    g = build_gates({"judge_calibration": {"n_items": MIN_N,
+                     "per_dim": {"faithfulness": {"mae": 1.5}, "correctness": {"mae": 0.2}},
+                     "fabrication": {"f1": 0.9}}})
+    assert g["judge calibration vs human (L3)"]["pass"] is False
+
+
+def test_judge_calibration_template_blank(tmp_path):
+    import json as _j
+    from eval_harness.judge_calibration import build_template, SCORE_DIMS
+    bundle = [{"qid": f"q{i}", "kind": "positive", "question": "?", "answer": "a"} for i in range(10)]
+    bundle.append({"qid": "neg1", "kind": "negative", "question": "?", "answer": "no"})
+    out = str(tmp_path / "tmpl.json")
+    t = build_template(bundle, 6, out, seed=1)
+    assert len(t) == 6
+    assert all(item["human"][d] is None for item in t for d in SCORE_DIMS)
+    assert _j.load(open(out))
