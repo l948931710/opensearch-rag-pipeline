@@ -1,0 +1,82 @@
+[
+ {
+  "qid": "TEMPLATE-it-positive-01",
+  "source": "docx", "module": "rag_retrieval", "dept": "it",
+  "query": "<IT 部门真实问题，答案须在语料中——作答前用 --verify-live 确认>",
+  "kind": "positive",
+  "expected_docs": ["<目标文档真实标题>"],
+  "expected_doc_ids": [],
+  "answer_points": "<文档支持的答案要点>",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": ["<chunk 文本里的逐字子串>"],
+  "difficulty": null, "expect_images": false, "expected_images": [],
+  "expected_permission": ["public"], "live_scorable": true,
+  "_todo": "替换 query/expected_docs/keyword_gt；跑 --verify-live 解析 doc_id 并确认关键词在召回 chunk 中。IT 目标 ≥3 正例。"
+ },
+ {
+  "qid": "TEMPLATE-production-image-01",
+  "source": "docx", "module": "rag_retrieval", "dept": "production",
+  "query": "<生产 SOP 的某操作步骤问题（带截图/示意图）>",
+  "kind": "positive",
+  "expected_docs": ["<SOP 真实标题>"],
+  "expected_doc_ids": [],
+  "answer_points": "<步骤要点>",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": ["<步骤文本逐字子串>"],
+  "difficulty": null,
+  "expect_images": true,
+  "expected_images": ["<该步骤绑定图片的 VLM 描述要点>"],
+  "expected_permission": ["public"], "live_scorable": true,
+  "_todo": "图文例目标 ≥5（docx/pdf/xlsx 各几条）。expected_images 写图片视觉要点。"
+ },
+ {
+  "qid": "TEMPLATE-quality-xlsx-01",
+  "source": "xlsx", "module": "rag_retrieval", "dept": "quality",
+  "query": "<质量检验基准表里的某限值/项目问题>",
+  "kind": "positive",
+  "expected_docs": ["<检验基准/规范表真实标题>"],
+  "expected_doc_ids": [],
+  "answer_points": "<限值/项目>",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": ["<表格 chunk 逐字子串>"],
+  "difficulty": null, "expect_images": false, "expected_images": [],
+  "expected_permission": ["public"], "live_scorable": true,
+  "_todo": "xlsx 正例补几条（当前 n 太小、方差大）。"
+ },
+ {
+  "qid": "TEMPLATE-sales-positive-01",
+  "source": "docx", "module": "rag_retrieval", "dept": "sales",
+  "query": "<销售/外贸相关真实问题>",
+  "kind": "positive",
+  "expected_docs": ["<目标文档真实标题>"], "expected_doc_ids": [],
+  "answer_points": "<答案要点>", "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": ["<逐字子串>"], "difficulty": null,
+  "expect_images": false, "expected_images": [],
+  "expected_permission": ["public"], "live_scorable": true,
+  "_todo": "sales + marketing 各 ≥3 正例（当前金集 0 覆盖这两个部门）。"
+ },
+ {
+  "qid": "TEMPLATE-offtopic-neg-01",
+  "source": "json_text", "module": "rag_retrieval", "dept": null,
+  "query": "富岭科技的股票代码是多少？",
+  "kind": "negative", "neg_type": "off_topic",
+  "expected_docs": [], "expected_doc_ids": [],
+  "answer_points": "", "pass_criteria": "应拒答 / 无结果（语料无此主题）",
+  "keyword_gt": [], "difficulty": null,
+  "expect_images": false, "expected_images": [],
+  "expected_permission": ["public"], "live_scorable": true,
+  "note": "off_topic：内部文档完全无股票/IR 主题。高 rerank 分=真泄漏（L2 AUC 闸度量此类）。目标 ≥5。"
+ },
+ {
+  "qid": "TEMPLATE-metadata-neg-01",
+  "source": "json_text", "module": "rag_retrieval", "dept": null,
+  "query": "<某制度文档>的批准人是谁？",
+  "kind": "negative", "neg_type": "metadata",
+  "expected_docs": [], "expected_doc_ids": [],
+  "answer_points": "", "pass_criteria": "应拒答（正文未载此元数据）",
+  "keyword_gt": [], "difficulty": null,
+  "expect_images": false, "expected_images": [],
+  "expected_permission": ["public"], "live_scorable": true,
+  "note": "metadata：选正文确实没有的元数据（批准人/最后修改人）。注意：文控编号等常在正文中→那是正例。目标 ≥3。"
+ }
+]
