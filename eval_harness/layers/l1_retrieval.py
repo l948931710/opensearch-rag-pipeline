@@ -58,6 +58,7 @@ def run(cases: List[Dict], top_k: int = 10, stitch_window: int = 1) -> Dict:
             "qid": c["qid"], "query": c["query"], "module": c["module"],
             "source": c.get("source"),
             "dept": c.get("dept"), "difficulty": c.get("difficulty"), "kind": c["kind"],
+            "neg_type": c.get("neg_type"),  # off_topic / near_miss_answer_absent / metadata / modality_gap / live_data
             "publicly_retrievable": _publicly_retrievable(c),
             "live_scorable": c.get("live_scorable"),
             "expected_permission": c.get("expected_permission"),

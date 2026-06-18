@@ -54,6 +54,23 @@ def build_gates(r: Dict) -> Dict:
         gates["score calibration (L2)"] = {"target": "labels still fit",
                                            "value": l2.get("thresholds_ok"),
                                            "pass": bool(l2.get("thresholds_ok"))}
+        # off-topic discrimination (AUC of positive vs off-topic-negative top-1). The principled
+        # relevance-vs-answerability separation; near-miss/live-data/modality negatives legitimately
+        # score high (NOT leaks), so this is scoped to off_topic only. Advisory until off-topic
+        # negatives exist in the gold (a known Step-5 authoring gap, not a regression).
+        n_off = l2.get("n_offtopic_neg") or 0
+        auc = l2.get("separation_auc_offtopic")
+        if auc is not None:
+            gates["off-topic discrimination AUC (L2)"] = {
+                "target": ">= 0.85 (pos vs off-topic-negative top-1 separation)",
+                "value": auc, "pass": auc >= 0.85}
+        else:
+            gates["off-topic discrimination AUC (L2)"] = {
+                "target": ">= 0.85 (pos vs off-topic-negative top-1 separation)",
+                "value": f"only {n_off} off-topic negatives — unmeasured", "pass": None,
+                "na_reason": "expected_na", "advisory": True,
+                "notes": "author off-topic negatives (Step 5) to measure off-topic discrimination; "
+                         "near-miss/live-data/modality negative-高 is expected, not a leak"}
 
     l3 = r.get("l3", {}).get("deterministic") if r.get("l3") else None
     if l3:

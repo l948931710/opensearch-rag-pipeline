@@ -159,6 +159,48 @@ def test_l6_soft_gates_are_advisory_not_strict_block():
     assert any("L6-hard" in f for f in _strict_failures(build_gates(r2), r2))
 
 
+# ── L2 off-topic-AUC metric (relevance != answerability) ─────────────────────────
+
+def test_l2_auc_helper():
+    from eval_harness.layers.l2_calibration import _auc
+    assert _auc([0.9, 0.95, 0.8], [0.1, 0.2]) == 1.0     # perfect separation
+    assert _auc([0.5], [0.5]) == 0.5                      # tie → no separation
+    assert _auc([], [0.1]) is None and _auc([0.1], []) is None
+
+
+def _pq(qid, kind, score, nt=None):
+    return {"qid": qid, "kind": kind, "top1_score": score, "live_scorable": True,
+            "publicly_retrievable": True, "gold_rank": 1 if kind == "positive" else None, "neg_type": nt}
+
+
+def test_l2_offtopic_auc_gate_and_near_miss_not_penalized():
+    from eval_harness.layers import l2_calibration as L2
+    pos = [_pq(f"p{i}", "positive", 0.9) for i in range(8)]
+    # near-miss negatives scoring HIGH (even above positives) must NOT fail L2 — relevance !=
+    # answerability; and with no off-topic negatives the AUC gate is N/A.
+    r = L2.run({"per_query": pos + [_pq(f"nm{i}", "negative", 0.92, "near_miss_answer_absent") for i in range(4)]},
+               high=0.9, med=0.8)
+    assert r["thresholds_ok"] is True
+    assert r["separation_auc_offtopic"] is None and r["n_offtopic_neg"] == 0
+    # off-topic negatives scoring LOW → high AUC → pass
+    r2 = L2.run({"per_query": pos + [_pq(f"o{i}", "negative", 0.2, "off_topic") for i in range(6)]},
+                high=0.9, med=0.8)
+    assert r2["separation_auc_offtopic"] >= 0.85 and r2["thresholds_ok"] is True
+    # off-topic negatives scoring HIGH (a REAL leak) → low AUC → fail
+    r3 = L2.run({"per_query": pos + [_pq(f"o{i}", "negative", 0.95, "off_topic") for i in range(6)]},
+                high=0.9, med=0.8)
+    assert r3["separation_auc_offtopic"] < 0.85 and r3["thresholds_ok"] is False
+
+
+def test_report_offtopic_auc_advisory_when_absent():
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    g = build_gates({"l2": {"thresholds_ok": True, "n_offtopic_neg": 0, "separation_auc_offtopic": None}})
+    gate = g["off-topic discrimination AUC (L2)"]
+    assert gate["pass"] is None and gate.get("advisory") is True          # advisory, not a fail
+    assert not any("off-topic discrimination" in f for f in _strict_failures(g, {"l2": {}}))
+
+
 def test_report_baseline_gates_merged():
     from eval_harness.report import build_gates
     g = build_gates({"baseline_gates": {"baseline regression (x)":

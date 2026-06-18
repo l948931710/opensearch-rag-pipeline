@@ -1553,7 +1553,9 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "modality_gap",
+  "relabel_note": "corpus DOES contain a relevant notice image (充值饭卡时间.jpeg) + the top-up times; whether 'send me the notice image' should be answered with the available image or declined is a boundary-policy decision — flagged for review."
  },
  {
   "qid": "RAG-51",
@@ -1573,7 +1575,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "live_data"
  },
  {
   "qid": "J-spec_migration",
@@ -1593,7 +1596,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "near_miss_answer_absent"
  },
  {
   "qid": "RAG-54",
@@ -1602,18 +1606,36 @@
   "subtype": "负例-多模态拒答",
   "dept": "边界控制",
   "query": "车辆停放示意图上黄色区域代表什么？",
-  "kind": "negative",
-  "expected_docs": [],
-  "expected_doc_ids": [],
-  "resolution": [],
-  "answer_points": "系统应拒绝或提示'暂不支持图片类文档查询'",
-  "pass_criteria": "不召回《车辆停放示意图》图片/Excel",
-  "keyword_gt": [],
+  "kind": "positive",
+  "expected_docs": [
+   "车辆停放示意图"
+  ],
+  "expected_doc_ids": [
+   "DOC_ADMIN_20260513120217_64F432"
+  ],
+  "resolution": [
+   {
+    "expected": "车辆停放示意图",
+    "title": "车辆停放示意图.xlsx",
+    "doc_id": "DOC_ADMIN_20260513120217_64F432",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "admin"
+   }
+  ],
+  "answer_points": "黄色区域代表公司车辆停车位",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "公司车辆停车位"
+  ],
   "difficulty": null,
   "expect_images": false,
   "expected_images": [],
-  "expected_permission": [],
-  "live_scorable": true
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "relabel_note": "was mislabeled negative; answer is verbatim in the corpus (verified read-only 2026-06-18) → relabeled positive; answer_points/pass_criteria auto-derived, review."
  },
  {
   "qid": "RAG-53",
@@ -1633,7 +1655,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "live_data"
  },
  {
   "qid": "J-itin_neg_antistatic",
@@ -1653,7 +1676,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "near_miss_answer_absent"
  },
  {
   "qid": "RAG-60",
@@ -1673,7 +1697,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "live_data"
  },
  {
   "qid": "J-xsop_corrosive",
@@ -1693,7 +1718,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "near_miss_answer_absent"
  },
  {
   "qid": "J-visit_neg_fee",
@@ -1713,7 +1739,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "near_miss_answer_absent"
  },
  {
   "qid": "J-manual_docno",
@@ -1722,18 +1749,36 @@
   "subtype": "orig",
   "dept": null,
   "query": "富岭U8+财务操作手册的文档编号是多少？",
-  "kind": "negative",
-  "expected_docs": [],
-  "expected_doc_ids": [],
-  "resolution": [],
-  "answer_points": "",
-  "pass_criteria": "Top5召回目标文档",
-  "keyword_gt": [],
+  "kind": "positive",
+  "expected_docs": [
+   "富岭U8+财务部操作手册"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120634_C6FD16"
+  ],
+  "resolution": [
+   {
+    "expected": "富岭U8+财务部操作手册",
+    "title": "富岭U8+财务部操作手册.docx",
+    "doc_id": "DOC_IT_20260513120634_C6FD16",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "it"
+   }
+  ],
+  "answer_points": "文控编号为 UF_U8130_FLCW_18_04",
+  "pass_criteria": "Top5召回目标文档 + 答案含目标信息",
+  "keyword_gt": [
+   "UF_U8130_FLCW_18_04"
+  ],
   "difficulty": null,
   "expect_images": false,
   "expected_images": [],
-  "expected_permission": [],
-  "live_scorable": true
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "relabel_note": "was mislabeled negative; answer is verbatim in the corpus (verified read-only 2026-06-18) → relabeled positive; answer_points/pass_criteria auto-derived, review."
  },
  {
   "qid": "RAG-59",
@@ -1753,7 +1798,8 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "near_miss_answer_absent"
  },
  {
   "qid": "J-psop_neg_gloves",
@@ -1773,6 +1819,7 @@
   "expect_images": false,
   "expected_images": [],
   "expected_permission": [],
-  "live_scorable": true
+  "live_scorable": true,
+  "neg_type": "near_miss_answer_absent"
  }
 ]
