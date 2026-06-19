@@ -215,7 +215,7 @@ def test_path_c_still_works_with_real_ocr_circled():
 # ──────────── Path D: image cluster propagation (8 约束验证) ──────────────
 
 
-import os as _os
+import os as _os  # noqa: E402
 
 
 class _PathDCtx:

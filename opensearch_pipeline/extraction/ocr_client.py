@@ -11,9 +11,8 @@ ocr_client.py — Qwen-VL OCR 统一客户端
 
 import os
 import re
-import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from opensearch_pipeline.extraction.schema import ExtractedBlock
 

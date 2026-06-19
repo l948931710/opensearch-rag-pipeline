@@ -26,7 +26,6 @@ from opensearch_pipeline.extraction.schema import (
 )
 from opensearch_pipeline.extraction.text_extractor import (
     extract_text_file,
-    extract_title_from_blocks,
 )
 
 # 步骤边界（行锚定）：PDF 页面常把多个步骤合并为一个视觉段落；按步骤行切开段落，
@@ -611,7 +610,7 @@ def _extract_with_pdfplumber(
     # 记录 layout analysis 结果到 warnings（供调试）
     if analysis.heading_size_to_level:
         size_map = ", ".join(
-            f"{s}pt→H{l}" for s, l in sorted(analysis.heading_size_to_level.items())
+            f"{s}pt→H{lvl}" for s, lvl in sorted(analysis.heading_size_to_level.items())
         )
         warnings.append(f"Layout: body={analysis.body_size}pt, headings=[{size_map}]")
     if analysis.header_texts:
@@ -710,7 +709,7 @@ def extract_pdf(
         if total_chars > 0:
             print(f"      [pdf] pypdf extracted {total_chars} chars from {page_count} pages")
         else:
-            print(f"      [pdf] pypdf also returned 0 chars (scanned PDF?)")
+            print("      [pdf] pypdf also returned 0 chars (scanned PDF?)")
         all_warnings.extend(warnings)
         return blocks, page_count, all_warnings
     except Exception as e:

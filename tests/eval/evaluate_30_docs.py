@@ -9,10 +9,7 @@ evaluate_30_docs.py — 对 30 个有代表性的文档进行大规模 Strategy_
 import os
 import sys
 import json
-import hashlib
-import time
 from datetime import datetime
-from typing import List, Dict, Any
 
 # 添加工作目录到 python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,11 +18,11 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 from dotenv import load_dotenv
 load_dotenv()
 
-from opensearch_pipeline.config import get_config
-from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
-from opensearch_pipeline.chunker import DocumentChunker, Chunk
-from opensearch_pipeline.pipeline_nodes import _ensure_opensearch_index, _get_opensearch_client
-from evaluate_chunking import (
+from opensearch_pipeline.config import get_config  # noqa: E402
+from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor  # noqa: E402
+from opensearch_pipeline.chunker import DocumentChunker  # noqa: E402
+from opensearch_pipeline.pipeline_nodes import _ensure_opensearch_index, _get_opensearch_client  # noqa: E402
+from evaluate_chunking import (  # noqa: E402
     EVAL_QUERIES,
     load_embedding_cache,
     get_cached_embeddings,
@@ -233,11 +230,11 @@ def run_large_evaluation():
         "\nThis report benchmark retrieval metrics on a significantly scaled-up corpus of **30 representative corporate documents** containing a total of multiple department SOPs, operator manuals, and FAQ sheets.",
         "\n---",
         "\n## 1. Document Category & Corpus Distribution",
-        f"\nWe classified the 30 representative documents into the following category routing distribution:",
-        f"- **SOPs / Rules (`sop`)**: 16 files",
-        f"- **Job Manuals / Operator Guides (`manual`)**: 12 files",
-        f"- **FAQ Collections (`faq`)**: 2 files",
-        f"\nTotal Corpus Size: **30 Documents**",
+        "\nWe classified the 30 representative documents into the following category routing distribution:",
+        "- **SOPs / Rules (`sop`)**: 16 files",
+        "- **Job Manuals / Operator Guides (`manual`)**: 12 files",
+        "- **FAQ Collections (`faq`)**: 2 files",
+        "\nTotal Corpus Size: **30 Documents**",
         "\n---",
         "\n## 2. Ingestion Benchmark Summary Table",
         "\nBelow are the retrieval evaluation metrics comparing rigid single-configuration strategies against **Category-Aware Dynamic Routing** across the expanded 30-document index:",
@@ -288,7 +285,7 @@ def run_large_evaluation():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
         
-    print(f"\n✅ Large-scale evaluation report exported successfully to: scratch/evaluation_30_docs_report.md")
+    print("\n✅ Large-scale evaluation report exported successfully to: scratch/evaluation_30_docs_report.md")
 
 if __name__ == "__main__":
     run_large_evaluation()

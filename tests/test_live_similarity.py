@@ -4,7 +4,6 @@ import sys
 import json
 import requests
 import numpy as np
-from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,7 +63,6 @@ def main():
     q_live_vec = np.array(get_live_embedding(q_text, api_key, model, base_url))
     c_live_vec = np.array(get_live_embedding(c_text, api_key, model, base_url))
     
-    live_sim = np.dot(q_live_vec, q_live_vec) # 1.0
     sim = np.dot(q_live_vec, c_live_vec) / (np.linalg.norm(q_live_vec) * np.linalg.norm(c_live_vec))
     print(f"\nLive Cosine Similarity: {sim:.6f}")
     

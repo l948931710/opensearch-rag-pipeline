@@ -9,7 +9,6 @@ feedback_handler.py — RAG 反馈处理模块
 供钉钉卡片回调和 REST API 端点共用。
 """
 
-import json
 import logging
 import uuid
 from typing import Optional

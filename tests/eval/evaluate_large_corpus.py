@@ -14,7 +14,6 @@ import sys
 import json
 import numpy as np
 import hashlib
-import time
 import re
 from datetime import datetime
 from typing import List, Dict, Any
@@ -25,8 +24,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from opensearch_pipeline.config import get_config
-from opensearch_pipeline.pipeline_nodes import (
+from opensearch_pipeline.config import get_config  # noqa: E402
+from opensearch_pipeline.pipeline_nodes import (  # noqa: E402
     node_scan_raw_files,
     node_register_metadata,
     node_extract_text_with_ocr,
@@ -38,12 +37,10 @@ from opensearch_pipeline.pipeline_nodes import (
     node_validate_chunks,
     node_publish_to_rag_ready,
     node_write_chunk_meta,
-    node_deactivate_old_chunks,
     node_build_opensearch_payload,
     _get_db_conn,
     _get_opensearch_client
 )
-from opensearch_pipeline.chunker import DocumentChunker, Chunk
 
 # ─── 28个精细业务评测 Query 定义 (包含新旧对比及多组必要关键词) ───
 LARGE_EVAL_QUERIES = [
@@ -661,8 +658,8 @@ def is_relevant_large(query_idx: int, chunk: Dict[str, Any], strict_mode: bool =
 
 
 
-import jieba
-from rank_bm25 import BM25Okapi
+import jieba  # noqa: E402
+from rank_bm25 import BM25Okapi  # noqa: E402
 
 def evaluate_retrieval_large(
     valid_chunks,
@@ -727,7 +724,8 @@ def evaluate_retrieval_large(
         def cosine_similarity(v1, v2):
             norm1 = np.linalg.norm(v1)
             norm2 = np.linalg.norm(v2)
-            if norm1 == 0 or norm2 == 0: return 0.0
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
             return np.dot(v1, v2) / (norm1 * norm2)
 
         config_local = get_config()
@@ -777,7 +775,8 @@ def evaluate_retrieval_large(
             else:
                 hybrid_scores = [alpha * b + (1.0 - alpha) * v for b, v in zip(bm25_norm, vec_norm)]
 
-            if max(vec_norm) == 0.0: print('WARNING: All vec_norms are 0.0!')
+            if max(vec_norm) == 0.0:
+                print('WARNING: All vec_norms are 0.0!')
             
             top_k_idx = sorted(range(len(hybrid_scores)), key=lambda i: hybrid_scores[i], reverse=True)[:k]
             hits = []
@@ -1353,8 +1352,8 @@ def main():
     new_query_texts = [q["new_query"] for q in LARGE_EVAL_QUERIES]
     old_query_doc_ids = [q["target_doc"] for q in LARGE_EVAL_QUERIES]
     
-    old_query_vectors = get_cached_embeddings(old_query_texts, embedding_cache, config, doc_ids=old_query_doc_ids)
-    new_query_vectors = get_cached_embeddings(new_query_texts, embedding_cache, config, doc_ids=old_query_doc_ids)
+    get_cached_embeddings(old_query_texts, embedding_cache, config, doc_ids=old_query_doc_ids)
+    get_cached_embeddings(new_query_texts, embedding_cache, config, doc_ids=old_query_doc_ids)
 
     # 5. Phase 1: Baseline Sweep (optimal sizes locked, no prepending)
     print("\n=== Phase 1: Running Baseline Evaluation Sweep (Prepend: None) ===")
@@ -1790,9 +1789,9 @@ def main():
         f.write("\n".join(report_lines) + "\n")
         
     
-    print(f"\n=== Running Alpha Weight Sweep ===")
+    print("\n=== Running Alpha Weight Sweep ===")
     for alpha in [1.0, 0.7, 0.5, 0.3, 0.0, -1.0]:
-        print(f"\n[RRF Strategy] (Reciprocal Rank Fusion)") if alpha == -1.0 else print(f"\n[Alpha = {alpha:.1f}] (BM25: {alpha*100:.0f}%, Vector: {(1.0-alpha)*100:.0f}%)")
+        print("\n[RRF Strategy] (Reciprocal Rank Fusion)") if alpha == -1.0 else print(f"\n[Alpha = {alpha:.1f}] (BM25: {alpha*100:.0f}%, Vector: {(1.0-alpha)*100:.0f}%)")
         eval_res = evaluate_retrieval_large(sweep_ctx["valid_chunks"], embedding_cache, baseline_ranks=None, alpha=alpha)
         
         # Calculate Strict MRR and Cross-Doc Conf
@@ -1803,8 +1802,10 @@ def main():
         for r in eval_res:
             mrr = r["mrr"]
             sum_mrr += mrr
-            if r["recall_1"] == 1: r1_count += 1
-            if r["recall_5"] == 1: r5_count += 1
+            if r["recall_1"] == 1:
+                r1_count += 1
+            if r["recall_5"] == 1:
+                r5_count += 1
             if mrr > 0 and r["is_cross_doc_confusion"]:
                 confusions += 1
         avg_mrr = sum_mrr / len(eval_res) if eval_res else 0.0
@@ -1812,7 +1813,7 @@ def main():
         print(f"    └─ [Regr]   Cross-Doc Conf: {confusions/len(eval_res)*100:.2f}%")
 
 
-    print(f"\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_corpus_report.md")
+    print("\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_corpus_report.md")
 
 if __name__ == "__main__":
     main()

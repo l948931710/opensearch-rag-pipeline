@@ -6,11 +6,8 @@ test_concurrency.py — Stage 2/3 并发互斥的真实 MySQL 测试
 验证 P0-3 修复的 UPDATE-then-SELECT 原子抢占是否真能防止重复处理。
 """
 
-import os
 import threading
-import time
 import pytest
-from unittest.mock import patch
 
 
 def _get_real_db_conn():

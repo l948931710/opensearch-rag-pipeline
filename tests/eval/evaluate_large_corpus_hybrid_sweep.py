@@ -13,7 +13,6 @@ import os
 import sys
 import json
 import hashlib
-import time
 import re
 from datetime import datetime
 from typing import List, Dict, Any
@@ -26,24 +25,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from opensearch_pipeline.config import get_config
-from opensearch_pipeline.pipeline_nodes import (
-    node_scan_raw_files,
-    node_register_metadata,
-    node_extract_text_with_ocr,
-    node_build_canonical,
-    node_classify_and_risk_assess,
-    node_detect_sensitive,
-    node_redact_or_quarantine,
-    node_publish_to_rag_ready,
-    node_chunk_documents,
-    node_validate_chunks,
-    node_write_chunk_meta,
-    node_build_opensearch_payload,
-    _get_db_conn,
-    _get_opensearch_client
-)
-from opensearch_pipeline.chunker import DocumentChunker, Chunk
+from opensearch_pipeline.config import get_config  # noqa: E402
+from opensearch_pipeline.chunker import DocumentChunker  # noqa: E402
 
 # ─── 28个精细业务评测 Query 定义 (包含新旧对比及多组必要关键词) ───
 LARGE_EVAL_QUERIES = [
@@ -898,7 +881,8 @@ def evaluate_retrieval_large_hybrid(
         # Normalize Vector & BM25 scores
         def normalize(scores):
             min_s, max_s = np.min(scores), np.max(scores)
-            if max_s - min_s == 0: return np.zeros_like(scores)
+            if max_s - min_s == 0:
+                return np.zeros_like(scores)
             return (scores - min_s) / (max_s - min_s)
             
         norm_vector = normalize(vector_scores)
@@ -1070,7 +1054,6 @@ def evaluate_retrieval_large_hybrid(
 
 def main():
     import sys
-    from opensearch_pipeline.config import get_config
     config = get_config()
     config.simulate = False
     

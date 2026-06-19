@@ -724,10 +724,12 @@ def test_m2_deactivate_refuses_indexed_but_not_embedded_zombie():
 
     good = Chunk(chunk_id="g", doc_id="docZ", version_no=2, chunk_index=0,
                  chunk_type="text_chunk", chunk_text="t", token_count=1)
-    good.embedding_status = "DONE"; good.index_status = "INDEXED"
+    good.embedding_status = "DONE"
+    good.index_status = "INDEXED"
     zombie = Chunk(chunk_id="z", doc_id="docZ", version_no=2, chunk_index=1,
                    chunk_type="text_chunk", chunk_text="t", token_count=1)
-    zombie.embedding_status = "NOT_STARTED"; zombie.index_status = "INDEXED"  # pushed vectorless (the P0)
+    zombie.embedding_status = "NOT_STARTED"
+    zombie.index_status = "INDEXED"  # pushed vectorless (the P0)
 
     ctx = {
         "valid_chunks": [good, zombie],

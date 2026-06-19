@@ -10,7 +10,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from opensearch_pipeline.extraction.image_relation_classifier import (
     classify_image_relation,
     keyword_overlap,
-    ImageRelation,
 )
 
 

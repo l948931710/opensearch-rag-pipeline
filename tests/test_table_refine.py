@@ -86,7 +86,8 @@ def test_requires_enabled(monkeypatch):
 def test_non_pdf_noop(monkeypatch):
     monkeypatch.setattr(VR, "_render_page_image", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
     blk = _table("| a | 89.3 |\n| b |")
-    res = _result([blk]); res.file_ext = "docx"
+    res = _result([blk])
+    res.file_ext = "docx"
     VR.maybe_refine_tables({"local_path": "/x.docx"}, res, _cfg())
     assert blk.extra.get("refined_by") is None
 

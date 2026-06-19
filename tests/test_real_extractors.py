@@ -12,12 +12,11 @@ test_real_extractors.py — DOCX/PDF/OCR 真实文档解析器测试套件
 
 import os
 import tempfile
-import unittest.mock as mock
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from opensearch_pipeline.extraction.schema import ExtractedBlock, ExtractionResult
+from opensearch_pipeline.extraction.schema import ExtractedBlock
 from opensearch_pipeline.extraction.docx_extractor import (
     _detect_heading_level,
     extract_docx,
@@ -25,7 +24,6 @@ from opensearch_pipeline.extraction.docx_extractor import (
 from opensearch_pipeline.extraction.pdf_extractor import (
     extract_pdf,
     get_pdf_text_length,
-    _extract_with_pypdf,
 )
 from opensearch_pipeline.extraction.ocr_client import (
     OCRClient,
@@ -161,7 +159,7 @@ class TestDocxExtractorRealFile:
                     doc.add_heading(text, level=level)
             if paragraphs:
                 for style, text in paragraphs:
-                    p = doc.add_paragraph(text, style=style)
+                    doc.add_paragraph(text, style=style)
             if tables:
                 for table_data in tables:
                     rows = len(table_data)
@@ -413,7 +411,7 @@ class TestPdfExtractorRealFile:
         from pypdf import PdfWriter
         from pypdf.generic import (
             ArrayObject, DictionaryObject, NameObject, NumberObject,
-            TextStringObject, StreamObject,
+            StreamObject,
         )
         temp_files = []
 

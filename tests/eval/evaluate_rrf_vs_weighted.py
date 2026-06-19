@@ -15,12 +15,9 @@ evaluate_rrf_vs_weighted.py — RRF vs Weighted 融合策略基线对比实验
 
 import os
 import sys
-import json
-import hashlib
 import numpy as np
 from datetime import datetime
-from typing import List, Dict, Any, Tuple
-import re
+from typing import List, Dict, Any
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", ".."))
@@ -30,26 +27,22 @@ if _PROJECT_ROOT not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
 
-from rank_bm25 import BM25Okapi
-import jieba
+from rank_bm25 import BM25Okapi  # noqa: E402
+import jieba  # noqa: E402
 
-from opensearch_pipeline.config import get_config
+from opensearch_pipeline.config import get_config  # noqa: E402
 
-from evaluate_large_corpus_hybrid_sweep import (
+from evaluate_large_corpus_hybrid_sweep import (  # noqa: E402
     LARGE_EVAL_QUERIES,
-    load_embedding_cache,
-    save_embedding_cache,
     get_cached_embeddings,
-    normalize_text,
-    is_relevant_tokenized,
     is_relevant_large,
 )
 
 # Reuse helper functions from weight_sweep
-from evaluate_weight_sweep import (
+from evaluate_weight_sweep import (  # noqa: E402
     _get_dept_filter,
     _get_dept_from_doc_id,
     _get_doc_filter,
@@ -349,9 +342,9 @@ def generate_report(all_aggs: List[Dict], report_path: str):
         "",
         f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        f"**Chunk Config:** Clause_1000_150 (locked)",
+        "**Chunk Config:** Clause_1000_150 (locked)",
         f"**Query Count:** {n_queries}",
-        f"**RRF Constant (k):** 60",
+        "**RRF Constant (k):** 60",
         "",
         "---",
         "",
@@ -417,7 +410,6 @@ def generate_report(all_aggs: List[Dict], report_path: str):
     # ── 4. RRF vs Weighted Decision Summary ──
     lines.extend(["", "---", "", "## 4. Decision Summary", ""])
 
-    best = max(all_aggs, key=lambda a: (a["macro_mrr"], a["margin_mean"]))
     rrf_aggs = [a for a in all_aggs if "RRF" in a["label"]]
     weighted_aggs = [a for a in all_aggs if "RRF" not in a["label"]]
 
@@ -497,7 +489,6 @@ def main():
     # ── Step 3: Load query embeddings ──
     print("\n>>> Step 3: Loading query embeddings...")
     query_texts = [q["new_query"] for q in LARGE_EVAL_QUERIES]
-    query_doc_ids = [q["target_doc"] for q in LARGE_EVAL_QUERIES]
     query_vectors, query_sparse = get_cached_embeddings(query_texts, emb_cache, config)
     print(f"    └─ Query vectors: {len(query_vectors)}")
 

@@ -16,8 +16,6 @@ Review Findings 集成：
 import os
 import sys
 import json
-import hashlib
-import time
 import re
 import numpy as np
 from datetime import datetime
@@ -35,22 +33,19 @@ if _PROJECT_ROOT_EARLY not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
 
-from opensearch_pipeline.config import get_config
-from opensearch_pipeline.chunker import DocumentChunker, Chunk
+from opensearch_pipeline.config import get_config  # noqa: E402
+from opensearch_pipeline.chunker import DocumentChunker  # noqa: E402
 
 # ─── 复用 hybrid_sweep 的共享基础设施 (同目录直接 import) ───
-from evaluate_large_corpus_hybrid_sweep import (
+from evaluate_large_corpus_hybrid_sweep import (  # noqa: E402
     LARGE_EVAL_QUERIES,
     load_embedding_cache,
     save_embedding_cache,
     get_cached_embeddings,
-    normalize_text,
-    is_relevant_tokenized,
     is_relevant_large,
-    _call_embedding,
 )
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -665,10 +660,8 @@ def generate_report(
             default_3way_idx = i
             break
 
-    default_2way_idx = None
     for i, a in enumerate(agg_2way):
         if abs(a["w_dense"] - 0.7) < 0.01 and abs(a["w_bm25"] - 0.3) < 0.01:
-            default_2way_idx = i
             break
 
     # ─── R@1 perfect count ───
@@ -682,7 +675,7 @@ def generate_report(
         "",
         f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        f"**Chunk Config:** Clause_1000_150 (locked)",
+        "**Chunk Config:** Clause_1000_150 (locked)",
         f"**Query Count:** {n_queries} (Manual={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='manual')}, "
         f"SOP={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='sop')}, "
         f"FAQ={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='faq')}, "

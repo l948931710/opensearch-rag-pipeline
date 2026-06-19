@@ -9,7 +9,6 @@ import json
 import os
 import tempfile
 
-import pytest
 
 from eval_harness.binding.ref_keys import ImageRef, jaccard, parse_ref_dict, img_dup_factor
 from eval_harness.binding.gt_loader import load_gt, validate_gt_against_manifest
@@ -333,7 +332,8 @@ def test_validate_gt_against_manifest_ok():
         result = validate_gt_against_manifest(gt, manifest_path)
         assert result["ok"], result["reasons"]
     finally:
-        os.unlink(manifest_path); os.unlink(gt_path)
+        os.unlink(manifest_path)
+        os.unlink(gt_path)
 
 
 def test_validate_gt_extractor_version_drift():
@@ -355,7 +355,8 @@ def test_validate_gt_extractor_version_drift():
         assert not result["ok"]
         assert any("extractor_version" in r for r in result["reasons"])
     finally:
-        os.unlink(manifest_path); os.unlink(gt_path)
+        os.unlink(manifest_path)
+        os.unlink(gt_path)
 
 
 def test_validate_gt_missing_ref():
@@ -377,4 +378,5 @@ def test_validate_gt_missing_ref():
         assert len(result["missing_refs"]) == 1
         assert result["missing_refs"][0]["ref"] == {"image_index": 99}
     finally:
-        os.unlink(manifest_path); os.unlink(gt_path)
+        os.unlink(manifest_path)
+        os.unlink(gt_path)

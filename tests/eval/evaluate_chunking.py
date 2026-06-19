@@ -20,9 +20,8 @@ import os
 import sys
 import json
 import hashlib
-import time
 from datetime import datetime
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 # 添加工作目录到 python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,11 +29,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from opensearchpy import OpenSearch
-from opensearch_pipeline.config import get_config
-from opensearch_pipeline.extraction.docx_extractor import extract_docx
-from opensearch_pipeline.chunker import DocumentChunker, Chunk
-from opensearch_pipeline.pipeline_nodes import _call_gemini_embedding, _ensure_opensearch_index, _get_opensearch_client
+from opensearch_pipeline.config import get_config  # noqa: E402
+from opensearch_pipeline.extraction.docx_extractor import extract_docx  # noqa: E402
+from opensearch_pipeline.chunker import DocumentChunker  # noqa: E402
+from opensearch_pipeline.pipeline_nodes import _call_gemini_embedding, _ensure_opensearch_index, _get_opensearch_client  # noqa: E402
 
 # ─── 8个业务评测 Query 定义 ───
 EVAL_QUERIES = [
@@ -458,11 +456,6 @@ def main():
     report_path = os.path.join(base_dir, "scratch", "evaluation_report.md")
     
     # 找出最优参数组合
-    best_sweep = max(sweep_results, key=lambda x: x["mrr"]) if sweep_results else None
-    best_chunk_size = best_sweep['max_chunk'] if best_sweep else 800
-    best_overlap = best_sweep['overlap'] if best_sweep else 150
-    best_recall_1 = f"{best_sweep['recall_1']:.2%}" if best_sweep else "87.5%"
-    best_mrr = f"{best_sweep['mrr']:.3f}" if best_sweep else "0.900"
     
     report_lines = [
         "# Fuling Category-Aware Dynamic Chunking Evaluation Report",
@@ -551,7 +544,7 @@ def main():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
         
-    print(f"\n✅ Beautiful evaluation report exported successfully to: scratch/evaluation_report.md")
+    print("\n✅ Beautiful evaluation report exported successfully to: scratch/evaluation_report.md")
 
 
 if __name__ == "__main__":

@@ -200,7 +200,6 @@ def main():
     print("=" * 80)
 
     config = get_config()
-    simulate_api = os.environ.get("SIMULATE_API", "true").lower() == "true"
 
     # 1. 连接
     client = get_opensearch_client()
@@ -306,7 +305,7 @@ def main():
 
     # Summary
     print(f"\n{'═' * 80}")
-    print(f"  📊 检索结果汇总")
+    print("  📊 检索结果汇总")
     print(f"{'═' * 80}")
     print(f"  Top-1 命中率: {correct_top1}/{total_queries} ({correct_top1/total_queries*100:.0f}%)")
     print(f"  Top-3 命中率: {correct_top3}/{total_queries} ({correct_top3/total_queries*100:.0f}%)")

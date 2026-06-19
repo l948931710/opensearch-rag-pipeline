@@ -7,7 +7,6 @@ import os
 import sys
 import json
 import hashlib
-import time
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -17,8 +16,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from opensearch_pipeline.config import get_config
-from opensearch_pipeline.pipeline_nodes import (
+from opensearch_pipeline.config import get_config  # noqa: E402
+from opensearch_pipeline.pipeline_nodes import (  # noqa: E402
     node_scan_raw_files,
     node_register_metadata,
     node_extract_text_with_ocr,
@@ -36,7 +35,6 @@ from opensearch_pipeline.pipeline_nodes import (
     _ensure_opensearch_index,
     _call_gemini_embedding
 )
-from opensearch_pipeline.chunker import DocumentChunker, Chunk
 
 # ─── 12个针对大文档的精细业务评测 Query 定义 ───
 LARGE_EVAL_QUERIES = [
@@ -529,7 +527,7 @@ def main():
         "\n   - *Characteristics*: Administrative and company life FAQs.",
         "\n---",
         "\n## 2. Ingestion & Retrieval Sweep Results",
-        f"\nBelow are the top configurations identified during the parameter sweep over the **12 highly targeted business queries**:",
+        "\nBelow are the top configurations identified during the parameter sweep over the **12 highly targeted business queries**:",
         "\n| Config Rank | SOP (Size/Overlap) | Manual (Size/Overlap) | FAQ (Size/Overlap) | Chunks Generated | Recall@1 | Recall@5 | Recall@10 | MRR |",
         "| :---: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |"
     ]
@@ -583,7 +581,7 @@ def main():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
         
-    print(f"\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_docs_report.md")
+    print("\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_docs_report.md")
 
 if __name__ == "__main__":
     main()

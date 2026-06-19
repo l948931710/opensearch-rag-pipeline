@@ -16,12 +16,9 @@ test_staging_ha3_suffix.py — verify config 守卫接受 `_s` 和 `_stg` 两种
 
 from __future__ import annotations
 
-from dataclasses import replace
-from unittest import mock
 
 import pytest
 
-from opensearch_pipeline import config as config_mod
 from opensearch_pipeline.config import (
     EnvironmentMismatchError,
     _STAGING_HA3_SUFFIXES,

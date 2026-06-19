@@ -22,27 +22,23 @@ import os
 import sys
 import json
 import time
-import re
-import traceback
 from datetime import datetime
-from collections import defaultdict
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict
 
 # 项目路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 load_dotenv(os.path.join(PROJECT_ROOT, ".env.local"))
 
 # 本地评测强制用公网域名（覆盖 .env.local 里的 production 设置）
 os.environ["RAG_ENVIRONMENT"] = "development"
 
-import pymysql
-import requests
+import pymysql  # noqa: E402
+import requests  # noqa: E402
 
-from opensearch_pipeline.retriever import search_chunks
-from opensearch_pipeline.config import get_config
+from opensearch_pipeline.retriever import search_chunks  # noqa: E402
 
 # ═══════════════════════════════════════════════════════════════
 # 配置
@@ -406,7 +402,7 @@ def main():
             continue
 
         if not hits:
-            print(f"    ⚠️ 无检索结果，跳过")
+            print("    ⚠️ 无检索结果，跳过")
             continue
 
         # R@1
@@ -528,7 +524,7 @@ def main():
 
     n = max(len(results), 1)
     identical_cnt = sum(1 for r in results if r.get("contexts_identical"))
-    print(f"\n  Neighbor Stitch vs Flat (Context Coverage):")
+    print("\n  Neighbor Stitch vs Flat (Context Coverage):")
     print(f"    提升: {improved} ({improved/n:.1%})")
     print(f"    下降: {degraded} ({degraded/n:.1%})")
     print(f"    不变: {unchanged} ({unchanged/n:.1%})")

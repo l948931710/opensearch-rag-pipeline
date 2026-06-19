@@ -68,8 +68,11 @@ def test_end_to_end_merges_ocr_pages_in_order():
     import fitz
     doc = fitz.open()
     doc.new_page().insert_text((72, 72), "Fuling cover page with substantial native text " * 6)
-    doc.new_page(); doc.new_page()  # blank pages 2 & 3
-    path = tempfile.mktemp(suffix=".pdf"); doc.save(path); doc.close()
+    doc.new_page()
+    doc.new_page()  # blank pages 2 & 3
+    path = tempfile.mktemp(suffix=".pdf")
+    doc.save(path)
+    doc.close()
 
     ux = UnifiedExtractor()
     ux.ocr_client.simulate = True  # deterministic OCR text
@@ -156,5 +159,6 @@ if __name__ == "__main__":
                test_none_page_count_returns_placeholder_page1,
                test_zero_page_count_with_recoverable_local_path_uses_recovered,
                test_non_pdf_with_zero_page_count_still_returns_empty]:
-        fn(); print(f"  ✓ {fn.__name__}")
+        fn()
+        print(f"  ✓ {fn.__name__}")
     print("all per-page-OCR tests passed")

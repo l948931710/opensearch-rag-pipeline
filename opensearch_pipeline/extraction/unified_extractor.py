@@ -319,9 +319,6 @@ class UnifiedExtractor:
         根据 file_ext 分发，自动处理 OCR fallback。
         """
         file_ext = task.get("file_ext", "txt").lower().strip().lstrip(".")
-        doc_id = task["doc_id"]
-        version_no = task["version_no"]
-        source_key = task.get("raw_key", "")
 
         # ── Mock 模式：直接解析注入的文本 ──
         if "mock_text" in task:

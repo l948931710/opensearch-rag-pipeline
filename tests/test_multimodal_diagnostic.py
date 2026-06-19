@@ -18,7 +18,6 @@ from PIL import Image
 from opensearch_pipeline.dag_definitions import (
     build_dag1_raw_to_canonical,
     build_dag2_canonical_to_chunk,
-    build_dag3_chunk_to_opensearch,
 )
 from opensearch_pipeline.run_simulation import get_test_data
 from opensearch_pipeline.chunker import Chunk
@@ -128,7 +127,7 @@ class TestImageChunkCreation:
         assert img.extra.get("source_image_vector") is None
         assert "local_path" not in img.extra
 
-        print(f"\n  ✅ Image chunk created successfully:")
+        print("\n  ✅ Image chunk created successfully:")
         print(f"     chunk_type = {img.chunk_type}")
         print(f"     chunk_text = {img.chunk_text[:80]}...")
         print(f"     source_image = {img.extra['source_image']}")
@@ -181,17 +180,17 @@ class TestHA3DocFieldCoverage:
         assert "chunk_type" in ha3_fields, "to_ha3_doc() 应包含 chunk_type"
         assert ha3_doc["chunk_type"] == "image"
 
-        print(f"\n  ✅ to_ha3_doc() 字段验证 — 图像元数据透传:")
+        print("\n  ✅ to_ha3_doc() 字段验证 — 图像元数据透传:")
         print(f"     HA3 doc fields: {sorted(ha3_fields)}")
-        print(f"     source_image: ✅ 透传")
-        print(f"     visual_summary: ✅ 透传")
-        print(f"     source_image_vector: ❌ 已废弃（One-Peace）")
+        print("     source_image: ✅ 透传")
+        print("     visual_summary: ✅ 透传")
+        print("     source_image_vector: ❌ 已废弃（One-Peace）")
         print(f"     chunk_type: ✅ 已有 (value='{ha3_doc['chunk_type']}')")
 
         # ─── OpenSearch doc: 验证有条件输出 ───
         os_fields = set(os_doc.keys())
         has_image_vector = "source_image_vector" in os_fields
-        print(f"\n  📋 to_opensearch_doc() 对比:")
+        print("\n  📋 to_opensearch_doc() 对比:")
         print(f"     source_image_vector: {'✅ 存在' if has_image_vector else '❌ 缺失'}")
 
     def test_to_ha3_doc_vs_to_opensearch_doc_field_diff(self):
@@ -224,7 +223,7 @@ class TestHA3DocFieldCoverage:
         only_in_os = os_keys - ha3_keys
         only_in_ha3 = ha3_keys - os_keys
 
-        print(f"\n  📊 字段差异分析:")
+        print("\n  📊 字段差异分析:")
         print(f"     HA3 独有字段: {sorted(only_in_ha3)}")
         print(f"     OpenSearch 独有字段: {sorted(only_in_os)}")
         print(f"     共同字段: {sorted(ha3_keys & os_keys)}")
@@ -283,7 +282,7 @@ class TestLocalPathLifecycle:
             "One-Peace 图像向量已废弃，embedding 阶段不应再填充 source_image_vector"
 
         print(f"\n  ✅ 模拟模式: 统一文本向量已生成 ({len(img_chunk.embedding_vector)} 维)")
-        print(f"     source_image_vector: None（One-Peace 已废弃）")
+        print("     source_image_vector: None（One-Peace 已废弃）")
         print(f"     local_path: {img_chunk.extra['local_path']}")
         print(f"     local_path exists: {os.path.exists(img_chunk.extra['local_path'])}")
 
@@ -305,8 +304,8 @@ class TestLocalPathLifecycle:
             "With deleted tmp_dir, os.path.exists returns False → One-Peace API call is silently skipped"
         )
         print(f"\n  ✅ 确认：local_path '{fake_path}' 不存在")
-        print(f"     os.path.exists() = False → One-Peace 调用被静默跳过")
-        print(f"     source_image_vector 将永远为 None（在生产模式下）")
+        print("     os.path.exists() = False → One-Peace 调用被静默跳过")
+        print("     source_image_vector 将永远为 None（在生产模式下）")
 
     def test_tmp_dir_cleanup_timing(self):
         """验证 tempfile + shutil.rmtree 的时序：文件在 finally 块中立即被删除。"""
@@ -334,12 +333,12 @@ class TestLocalPathLifecycle:
         assert not os.path.exists(saved_path), "File should be deleted after rmtree"
         assert saved_path != "", "Path string still exists as a dangling reference"
         
-        print(f"\n  ✅ 时序验证:")
+        print("\n  ✅ 时序验证:")
         print(f"     tmp_dir created: {tmp_dir}")
         print(f"     file created: {test_file}")
-        print(f"     rmtree executed in finally block")
+        print("     rmtree executed in finally block")
         print(f"     saved_path = '{saved_path}' (dangling reference)")
-        print(f"     os.path.exists(saved_path) = False")
+        print("     os.path.exists(saved_path) = False")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -358,7 +357,6 @@ class TestFullPipelineWithImageAsset:
             node_chunk_documents,
             node_validate_chunks,
             node_generate_embeddings,
-            node_build_opensearch_payload,
         )
 
         # ── Step 1: 构造带图片的 canonical ──
@@ -404,7 +402,7 @@ class TestFullPipelineWithImageAsset:
         text_chunks = [c for c in all_chunks if c.chunk_type != "image"]
         image_chunks = [c for c in all_chunks if c.chunk_type == "image"]
         
-        print(f"\n  📋 DAG 2 Chunk 结果:")
+        print("\n  📋 DAG 2 Chunk 结果:")
         print(f"     Total: {len(all_chunks)} | Text: {len(text_chunks)} | Image: {len(image_chunks)}")
         
         assert len(image_chunks) == 1, f"Expected 1 image chunk, got {len(image_chunks)}"
@@ -424,7 +422,7 @@ class TestFullPipelineWithImageAsset:
         embedded = ctx["embedded_chunks"]
         embedded_img = [c for c in embedded if c.chunk_type == "image"]
         
-        print(f"\n  📋 DAG 3 Embedding 结果:")
+        print("\n  📋 DAG 3 Embedding 结果:")
         for c in embedded_img:
             has_text_emb = c.embedding_vector is not None
             has_img_emb = c.extra.get("source_image_vector") is not None
@@ -441,7 +439,7 @@ class TestFullPipelineWithImageAsset:
             ha3 = c.to_ha3_doc()
             os_doc = c.to_opensearch_doc()
             
-            print(f"\n  📋 序列化对比:")
+            print("\n  📋 序列化对比:")
             print(f"     to_ha3_doc() fields: {sorted(ha3.keys())}")
             print(f"     to_opensearch_doc() fields: {sorted(os_doc.keys())}")
             
@@ -457,8 +455,8 @@ class TestFullPipelineWithImageAsset:
             assert ha3_has_source, "to_ha3_doc() 必须透传 source_image（serving 真图渲染依赖）"
             assert not ha3_has_vector, "One-Peace 图像向量已废弃，不应出现在 HA3 doc"
 
-        print(f"\n  🔍 契约结论:")
-        print(f"     1. 图片 chunk 创建: ✅ 正常")
-        print(f"     2. 模拟 embedding 生成: ✅ 正常（统一文本向量路径）")
-        print(f"     3. to_ha3_doc() 输出: ✅ 透传 source_image / visual_summary")
-        print(f"     4. 独立图像向量: ❌ One-Peace 已废弃（检索靠 chunk_text 文本向量）")
+        print("\n  🔍 契约结论:")
+        print("     1. 图片 chunk 创建: ✅ 正常")
+        print("     2. 模拟 embedding 生成: ✅ 正常（统一文本向量路径）")
+        print("     3. to_ha3_doc() 输出: ✅ 透传 source_image / visual_summary")
+        print("     4. 独立图像向量: ❌ One-Peace 已废弃（检索靠 chunk_text 文本向量）")

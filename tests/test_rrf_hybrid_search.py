@@ -14,10 +14,8 @@ test_rrf_hybrid_search.py — RRF 与混合检索请求构造的单元测试
 
 import sys
 import types
-import json
 import pytest
-from unittest.mock import MagicMock, patch, ANY
-from dataclasses import dataclass
+from unittest.mock import MagicMock, patch
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -104,7 +102,7 @@ def _ensure_ha3_mock_modules():
 
 _ensure_ha3_mock_modules()
 
-from opensearch_pipeline.config import (
+from opensearch_pipeline.config import (  # noqa: E402
     PipelineConfig, AlibabaVectorSearchConfig, EmbeddingConfig,
 )
 

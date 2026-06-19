@@ -16,10 +16,9 @@ import hashlib
 import json
 import os
 import re
-import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from opensearch_pipeline.chunker import Chunk, DocumentChunker
 from opensearch_pipeline.config import get_config
@@ -296,7 +295,7 @@ def _ensure_opensearch_index(client, index_name: str, dimension: int):
     """确保 OpenSearch 索引存在并具有正确的 Lucene KNN 映射。"""
     # 如果是 HA3 Engine 客户端，其表结构由阿里云控制台可视化配置，不可在此动态创建，直接跳过
     if hasattr(client, "push_documents") or client == "MOCK_HA3_CLIENT":
-        print(f"    ├─ [HA3 Engine] Table and mappings are fully managed on Alibaba Cloud Web Console. Skipping dynamic creation.")
+        print("    ├─ [HA3 Engine] Table and mappings are fully managed on Alibaba Cloud Web Console. Skipping dynamic creation.")
         return
 
     if not client.indices.exists(index=index_name):
@@ -563,7 +562,8 @@ def node_register_metadata(ctx: dict):
                 conn.commit()
             print("    └─ Saved registered metadata to RDS (document_meta, document_version)")
         except Exception as e:
-            if conn: conn.rollback()
+            if conn:
+                conn.rollback()
             print(f"    ⚠️ Failed to write metadata to RDS: {e}")
             raise RuntimeError(f"Database write failure in node_register_metadata: {e}") from e
         finally:
@@ -895,7 +895,8 @@ def node_build_canonical(ctx: dict):
                 conn.commit()
                 print(f"    ├─ Saved canonical keys to RDS for {canonical['doc_id']} v{canonical['version_no']}")
             except Exception as e:
-                if conn: conn.rollback()
+                if conn:
+                    conn.rollback()
                 print(f"    ⚠️ Failed to save canonical keys to RDS: {e}")
                 raise RuntimeError(f"Database write failure in node_build_canonical: {e}") from e
             finally:
@@ -1408,8 +1409,10 @@ def node_classify_and_risk_assess(ctx: dict):
                 break  # 预占成功，退出重试循环
             except Exception as e:
                 if conn:
-                    try: conn.rollback()
-                    except Exception: pass
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 if _preempt_attempt < _preempt_max_retries:
                     import time as _time_preempt
                     print(f"    ⚠️ Preemption DB error (attempt {_preempt_attempt + 1}), retrying in 2s: {e}")
@@ -1596,8 +1599,10 @@ def node_classify_and_risk_assess(ctx: dict):
                         conn_dv.commit()
                 except Exception as dv_err:
                     if conn_dv:
-                        try: conn_dv.rollback()
-                        except Exception: pass
+                        try:
+                            conn_dv.rollback()
+                        except Exception:
+                            pass
                     print(f"    ⚠️ Failed to update document_version for {doc['doc_id']}: {dv_err}")
                 finally:
                     if conn_dv:
@@ -1657,7 +1662,8 @@ def node_classify_and_risk_assess(ctx: dict):
                         """, (confidence, doc["llm_risk_level"], doc["faq_eligible"], doc["doc_id"], doc["version_no"]))
                         conn.commit()
                 except Exception as db_err:
-                    if conn: conn.rollback()
+                    if conn:
+                        conn.rollback()
                     print(f"    ⚠️ Failed to persist metadata to RDS: {db_err}")
                     raise RuntimeError(f"Database write failure in node_classify_document (persist metadata): {db_err}") from db_err
                 finally:
@@ -1809,7 +1815,8 @@ def node_detect_sensitive(ctx: dict):
                         ))
                 conn.commit()
             except Exception as e:
-                if conn: conn.rollback()
+                if conn:
+                    conn.rollback()
                 print(f"    ⚠️ Failed to persist sensitive findings to RDS: {e}")
                 raise RuntimeError(f"Database write failure in node_detect_sensitive: {e}") from e
             finally:
@@ -3574,10 +3581,13 @@ def node_chunk_documents(ctx: dict):
                             best_dist = 9999
                             for c, rs, re_ in spec_chunks:
                                 if rs <= ar <= re_:
-                                    best_chunk = c; best_dist = 0; break
+                                    best_chunk = c
+                                    best_dist = 0
+                                    break
                                 dist = min(abs(ar - rs), abs(ar - re_))
                                 if dist < best_dist:
-                                    best_dist = dist; best_chunk = c
+                                    best_dist = dist
+                                    best_chunk = c
                             # 非 logo 的 unknown 图片优先归 product_photo
                             if best_chunk and best_chunk.extra.get("spec_section") in ("header", "appendix"):
                                 fallback_id = sec_chunk_map.get("product_photo")
@@ -4364,7 +4374,8 @@ def node_publish_to_rag_ready(ctx: dict):
                 conn.commit()
                 print(f"    ├─ Saved publish status to RDS for {doc_id} v{version}")
             except Exception as e:
-                if conn: conn.rollback()
+                if conn:
+                    conn.rollback()
                 print(f"    ⚠️ Failed to save publish status to RDS: {e}")
                 raise RuntimeError(f"Database write failure in node_publish_to_rag_ready: {e}") from e
             finally:
@@ -4560,7 +4571,8 @@ def node_write_chunk_meta(ctx: dict):
                 conn.commit()
             print(f"    └─ Saved {written} chunk records to RDS chunk_meta (batch insert)")
         except Exception as e:
-            if conn: conn.rollback()
+            if conn:
+                conn.rollback()
             print(f"    ⚠️ Failed to write chunk_meta to RDS: {e}")
             raise RuntimeError(f"Database write failure in node_write_chunk_meta: {e}") from e
         finally:
@@ -4605,7 +4617,8 @@ def node_write_chunk_meta(ctx: dict):
                         """, (doc_id, ver))
                         conn.commit()
                 except Exception as db_err:
-                    if conn: conn.rollback()
+                    if conn:
+                        conn.rollback()
                     print(f"    ⚠️ Failed to update failed status in RDS: {db_err}")
                 finally:
                     if conn:
@@ -4630,7 +4643,8 @@ def node_write_chunk_meta(ctx: dict):
                         """, (chunk_cnt, doc_id, ver))
                         conn.commit()
                 except Exception as db_err:
-                    if conn: conn.rollback()
+                    if conn:
+                        conn.rollback()
                     print(f"    ⚠️ Failed to update DONE status in RDS for document {doc_id} v{ver}: {db_err}")
                     raise RuntimeError(f"Database write failure in node_write_chunk_meta status closure: {db_err}") from db_err
                 finally:
@@ -4716,7 +4730,8 @@ def node_acquire_index_lock(ctx: dict):
             # 仅保留成功抢占锁的版本的 chunks
             chunks = [c for c in chunks if (c.doc_id, c.version_no) in valid_doc_versions]
         except Exception as e:
-            if conn: conn.rollback()
+            if conn:
+                conn.rollback()
             valid_doc_versions.clear()
             print(f"    ⚠️ Failed to preempt indexing tasks: {e}")
             raise RuntimeError(f"Failed to acquire index preemption lock: {e}") from e
@@ -4975,7 +4990,7 @@ def node_deactivate_old_chunks(ctx: dict):
         # 2. Delete from Search Index (HA3 Engine SDK delete or standard OpenSearch delete_by_query)
         if simulate_opensearch:
             if deactivated:
-                print(f"    └─ [SIMULATED] OpenSearch: DELETE BY QUERY")
+                print("    └─ [SIMULATED] OpenSearch: DELETE BY QUERY")
                 for doc_id, ver in current_versions.items():
                     print(f"       {{ \"doc_id\": \"{doc_id}\", \"version_no\": {{ \"lt\": {ver} }} }}")
         else:
@@ -5041,7 +5056,7 @@ def node_deactivate_old_chunks(ctx: dict):
 
         if simulate_db:
             if deactivated:
-                print(f"    └─ [SIMULATED] RDS: UPDATE chunk_meta SET is_active=FALSE, index_status='DELETED'")
+                print("    └─ [SIMULATED] RDS: UPDATE chunk_meta SET is_active=FALSE, index_status='DELETED'")
                 for doc_id, ver in current_versions.items():
                     print(f"       WHERE doc_id='{doc_id}' AND version_no < {ver} AND is_active = 1")
             for (doc_id, ver), fail_cnt in failed_counts.items():
@@ -5075,7 +5090,8 @@ def node_deactivate_old_chunks(ctx: dict):
                             print(f"    ├─ RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
                 conn.commit()
             except Exception as e:
-                if conn: conn.rollback()
+                if conn:
+                    conn.rollback()
                 print(f"    ⚠️ Failed to update RDS states (deactivate old chunks / update doc status): {e}")
                 raise RuntimeError(f"Failed to update RDS states: {e}")
             finally:
@@ -5140,11 +5156,10 @@ def node_generate_embeddings(ctx: dict):
             # 不再需要独立的多模态向量（实验证明 text-embedding-v4 + visual_summary 效果最优）
             
         print(f"    └─ Generated {len(chunks)} embeddings (model={embedding_model}, dim={embedding_dim})")
-        print(f"       ⚡ Note: using simulated vectors (hash-based) for local testing")
+        print("       ⚡ Note: using simulated vectors (hash-based) for local testing")
     else:
         import requests
         import time
-        import base64
         api_key = config.embedding.api_key
         base_url = config.embedding.api_base_url
         batch_size = config.embedding.batch_size
@@ -5514,7 +5529,8 @@ def node_build_opensearch_payload(ctx: dict):
                 conn.commit()
             print(f"    └─ Saved {len(batches)} opensearch_bulk_job tracking records to RDS")
         except Exception as e:
-            if conn: conn.rollback()
+            if conn:
+                conn.rollback()
             print(f"    ⚠️ Failed to insert opensearch_bulk_jobs to RDS: {e}")
             raise RuntimeError(f"Database write failure in node_build_opensearch_payload: {e}") from e
         finally:
@@ -5589,7 +5605,6 @@ def node_push_to_opensearch(ctx: dict):
 
     for i, batch in enumerate(batches):
         chunk_count = len(batch["chunks"])
-        payload_size = batch["payload_size"]
         job_id = batch["job_id"]
 
         if simulate_opensearch:
@@ -5903,7 +5918,7 @@ def node_update_index_status(ctx: dict):
 
     if simulate_db:
         print(f"    └─ [SIMULATED] Would update {chunks_count} chunk records in RDS:")
-        print(f"       embedding_status=DONE, index_status=INDEXED")
+        print("       embedding_status=DONE, index_status=INDEXED")
         if failed_doc_versions:
             print(f"       [SIMULATED] Would update document_version status to 'FAILED' for: {list(failed_doc_versions)}")
 
@@ -6004,7 +6019,8 @@ def node_update_index_status(ctx: dict):
                 conn.commit()
             print(f"    └─ Updated {len(batches)} opensearch_bulk_job and {chunks_count} chunk_meta records in RDS.")
         except Exception as e:
-            if conn: conn.rollback()
+            if conn:
+                conn.rollback()
             print(f"    ⚠️ Failed to update opensearch_bulk_jobs/chunk_meta in RDS: {e}")
             raise RuntimeError(f"Database write failure in node_update_index_status: {e}") from e
         finally:
@@ -6306,7 +6322,7 @@ def node_eval_report(ctx: dict):
 
     ctx["eval_report"] = report
 
-    print(f"    └─ Eval Report:")
+    print("    └─ Eval Report:")
     print(f"       Documents: {report['summary']['total_documents']}")
     print(f"       Chunks: {report['summary']['total_chunks']}")
     print(f"       Chunk types: {type_counts}")

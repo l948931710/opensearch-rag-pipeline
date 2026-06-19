@@ -3,7 +3,6 @@
 test_extraction.py — Unified Extraction Layer 单元测试
 """
 
-import pytest
 from opensearch_pipeline.extraction.schema import ExtractionResult, ExtractedBlock
 from opensearch_pipeline.extraction.text_extractor import (
     extract_text_file,
