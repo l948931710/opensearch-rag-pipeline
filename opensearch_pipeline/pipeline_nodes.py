@@ -3127,6 +3127,212 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
     return enriched
 
 
+_CE_PART_COL_NAMES = ("清扫部位名称", "点检部位", "部位名称")
+_CE_SEQ_COL_NAMES = ("序号", "序 号", "序")
+
+
+def _resolve_part_col_index(blocks):
+    """从 worksheet 表头行解析"部位名称"列在 body（去掉序号后）里的下标，按 section 返回。
+
+    返回 {section_heading: body_col_index}。约定：
+      body_col_index ∈ {0, 1} → 当前支持的"两格身份"结构（类别/点检部位 + 部位名称/点检项目）；
+      body_col_index ≥ 2      → 三格身份层级（系统→子系统→部位名称），属**未支持**版式，
+                                 调用方应对其降级 + 发诊断，绝不用错位身份硬绑。
+    未解析到表头的 section 不入 map → 调用方走 first-two-cells 兜底并发诊断。
+
+    只读 doc.blocks（表头被 row_role=metadata 标记、不进 chunk），不依赖 extractor 改动。
+    """
+    out = {}
+    current_heading = None
+    for b in blocks or []:
+        bt = b.get("block_type") if isinstance(b, dict) else getattr(b, "block_type", None)
+        text = (b.get("text") if isinstance(b, dict) else getattr(b, "text", "")) or ""
+        if bt == "heading":
+            current_heading = (text or "").strip()
+            continue
+        if current_heading is None or current_heading in out or "\t" not in text:
+            continue
+        cells = [c.replace("\n", "").strip() for c in text.split("\t")]
+        idx = next((i for i, c in enumerate(cells) if c in _CE_PART_COL_NAMES), None)
+        if idx is None:
+            continue
+        # body 下标 = 整行下标 − 1（仅当首列确是"序号"类表头时成立；否则首列即 body[0]）。
+        first = cells[0] if cells else ""
+        out[current_heading] = idx - 1 if first in _CE_SEQ_COL_NAMES else idx
+    return out
+
+
+def _ce_chunk_regions(chunk_text: str, part_col_index=None):
+    """把"设备清扫基准书"的一行 row-card 文本拆成 (identity_region, item_region, part_name, status)。
+
+    去掉 【文档:…】/【章节:…】 上下文前缀后，正文是 Tab 分隔的单元格：
+      清扫 sheet:  序号 ⇥ 类别 ⇥ 清扫部位名称 ⇥ 清扫基准 ⇥ 清扫方法 …
+      点检 sheet:  序号 ⇥ 点检部位 ⇥ 点检项目 ⇥ 判定标准/点检方法 …
+    identity_region = 序号 之后的两个"身份"单元格（类别+部位 或 部位+项目）—— 部位名称就在这里；
+    item_region     = 其余单元格（清扫基准/方法、判定标准，以及"空开，线接头，温控表，电机，
+                      烘箱"这类被点检的部件清单）；
+    part_name       = 用于"逐字命名"判定的具体部位名。
+
+    part_col_index（由 `_resolve_part_col_index` 从表头解析、按 section 给出）决定 status：
+      None      → 未解析到表头：走 first-two-cells 兜底（part_name=第2格否则第1格），status='fallback'；
+      0 或 1    → 表头确认的两格身份结构：part_name=body[part_col_index]，status='header'；
+      ≥ 2       → 三格身份层级，**未支持**版式：status='unsupported'（调用方降级，不在此行绑图）。
+    身份/明细区始终按"序号后两格"切分（这是受支持版式的不变式）；part_col_index 只用于
+    精确定位 part_name 与判定是否为未支持版式。
+    """
+    import re as _re
+    t = (chunk_text or "")
+    # 先切掉可能已追加的图片后缀，再去掉所有 【…】 上下文前缀
+    t = t.split("[图片")[0]
+    t = _re.sub(r"【[^】]*】", "", t).strip()
+    fields = [f.strip() for f in t.split("\t")]
+    # 行首数字 序号 → 身份/明细从其后开始
+    body = fields[1:] if fields and fields[0].lstrip("★ ").isdigit() else fields
+    identity = " ".join(body[:2])
+    items = " ".join(body[2:])
+    if part_col_index is not None and part_col_index >= 2:
+        # 三格身份层级：未支持版式 —— 身份区(序号后两格)落不到真正的部位名称，标记降级。
+        return identity, items, "", "unsupported"
+    if part_col_index is not None and 0 <= part_col_index <= 1:
+        cell = body[part_col_index] if part_col_index < len(body) else ""
+        part_name = (cell or (body[0] if body else "")).lstrip("★ ").strip()
+        return identity, items, part_name, "header"
+    # 兜底：无表头，沿用 first-two-cells 启发（第2格否则第1格）
+    part_name = (body[1] if len(body) > 1 and body[1] else (body[0] if body else "")).lstrip("★ ").strip()
+    return identity, items, part_name, "fallback"
+
+
+def _bind_equipment_cleaning_images(chunks, assets, dept_code, d_id, version, blocks=None):
+    """把 设备清扫基准书 的部位照片绑定到对应的 清扫/点检 行 chunk。
+
+    返回 (ce_bound_fns, diag)：ce_bound_fns = 已绑定文件名集合（供兜底跳过）；
+    diag = {"header","fallback","unsupported": 计数, "fallback_sections","unsupported_sections": set}
+    —— 调用方据此打降级/诊断日志。
+
+    取代旧的"每张图独立绑到最短匹配行"启发式 —— 旧逻辑让多张图挤到同一最短行
+    （over-attach：丝杆图 + 齿轮油图都因含 '齿轮' 落到 ★齿轮油 行；3 张 '电机' 图都落到
+    电机螺丝行），且让一张图凭 label 只在某行"判定标准/点检项目"列出现就跨绑
+    （cross-bind：控制面板 仪表/标识 照片绑到 设备外观 行，只因该行点检项目列出"门，
+    防护罩，仪表，标识"）。eval 摄入侧 Jaccard 据此把 xlsx_clean 从 0.54 拉到误判。
+
+    身份列优先用**表头**解析（`_resolve_part_col_index`，按 section）；表头缺失才退回
+    first-two-cells 兜底（发 fallback 诊断）；表头显示三格身份层级（部位名称在第 3+ 格）的
+    **未支持**版式则把该 section 的行排除出绑定目标并发 unsupported 诊断（图改建独立 chunk），
+    绝不用错位身份硬绑。
+
+    三条规则 —— 每张图先选唯一最佳行，再做两步保守清理：
+      1) 目标选择：优先选 label 命中 *身份列*（部位名称）的行，命中次数多者优先、再短者
+         优先；只有当不存在身份命中行时，才退回"明细列命中"的行。
+      2) 驱逐：一旦某行已有身份命中的图，丢弃其"仅明细列命中"的图（整机/部位照片胜过
+         只是出现在点检项目清单里的部件照片）。**只有明细命中**的行保留其图（如 烘箱 图
+         凭"空开/电机/烘箱"明细合法绑定 电气系统 行）。
+      3) 强者归并：当一行有多张身份命中图，**部分**图的视觉描述/OCR 里逐字出现该行
+         part_name、另一些没有时，只保留逐字命中的（real 齿轮油 标签图在场后丢掉 丝杆/齿轮
+         图）。若所有图证据等强（全逐字命中 或 全不命中），一律**保留全部** —— 一行多图
+         的合法场景与真正歧义的近重复图都不被武断单选。
+
+    被丢弃/驱逐的图不进返回集合 → 仍会走兜底建独立 image chunk，serving 可达性不丢。
+    """
+    ce_bound_fns = set()
+    diag = {"header": 0, "fallback": 0, "unsupported": 0,
+            "fallback_sections": set(), "unsupported_sections": set()}
+    all_rows = [c for c in chunks if c.chunk_type != "image"]
+    if not all_rows:
+        return ce_bound_fns, diag
+
+    # 表头优先解析部位名称列（按 section）；逐行定 region + status，未支持版式行排除出绑定目标。
+    section_part_col = _resolve_part_col_index(blocks or [])
+    rows = []
+    regions = {}
+    for c in all_rows:
+        sec = getattr(c, "section_title", None)
+        pci = section_part_col.get(sec)
+        ident, items, pname, status = _ce_chunk_regions(c.chunk_text or "", pci)
+        diag[status] = diag.get(status, 0) + 1
+        if status == "fallback":
+            diag["fallback_sections"].add(sec)
+        if status == "unsupported":
+            diag["unsupported_sections"].add(sec)
+            continue  # 未支持的三格身份行：不作绑定目标，避免用错位身份产生误绑
+        regions[id(c)] = (ident, items, pname)
+        rows.append(c)
+
+    # phase 1 —— 每张 ROUTE_TO_VECTOR 图选唯一最佳行（允许撞行：同 label 的歧义图故意堆叠，
+    # 仅在 phase 2/3 有原则性赢家时才清理）。
+    for a in assets:
+        if a.get("status") != "ROUTE_TO_VECTOR":
+            continue
+        labels = [lbl for lbl in (a.get("part_labels") or []) if lbl]
+        if not labels:
+            continue
+        content = f"{a.get('visual_summary', '')} {a.get('ocr_text', '')}"
+        best_key = None        # (tier, occ, -len, -idx) —— 越大越好
+        best_meta = None       # (chunk, tier, exact)
+        for idx, c in enumerate(rows):
+            ident, items, pname = regions[id(c)]
+            id_hit = any(lbl in ident for lbl in labels)
+            it_hit = any(lbl in items for lbl in labels)
+            if not (id_hit or it_hit):
+                continue
+            tier = 2 if id_hit else 1
+            # occ = 身份列里"最具体那个 label"出现的次数：奖励把部位名写多遍的"真正点检行"
+            # （xlsx_clean 设备外观 行身份列写了两遍 设备外观，胜过只写一遍的裸行）。
+            # 用 max 而非 sum 是为了不让"嵌套 label"（如 链条/链条总成 同时命中一处）虚高计数。
+            occ = max((ident.count(lbl) for lbl in labels if lbl in ident), default=0) if id_hit else 0
+            key = (tier, occ, -len(c.chunk_text or ""), -idx)
+            if best_key is None or key > best_key:
+                best_key = key
+                exact = bool(pname) and len(pname) >= 2 and pname in content
+                best_meta = (c, tier, exact)
+        if best_meta is None:
+            continue
+        target, tier, exact = best_meta
+        fn = a.get("filename", "")
+        target.extra.setdefault("image_refs", []).append({
+            "filename": fn,
+            "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+            # image_index 契约键：取 asset 抽取序号（与 procedure_image_guide/DOCX/PDF 同源）。
+            # equipment_cleaning_standard 的 part_labels 绑定原先漏设此键（2026-06-15 D6）。
+            "image_index": a.get("image_index", a.get("original_index")),
+            "anchor_row": a.get("anchor_row"),
+            "part_labels": labels,
+            "annotation_num": a.get("annotation_num"),
+            "image_category": a.get("image_category", "unknown"),
+            "visual_summary": a.get("visual_summary", ""),
+            "ocr_text": a.get("ocr_text", ""),
+            "_ce_tier": tier,
+            "_ce_exact": exact,
+        })
+
+    # phase 2（驱逐）+ phase 3（强者归并），仅作用于本函数新加的带标签 ref；
+    # 任何已存在的无标签 ref（其它路径可能预先挂载）原样保留。
+    for c in rows:
+        all_refs = c.extra.get("image_refs")
+        if not all_refs:
+            continue
+        pre = [r for r in all_refs if "_ce_tier" not in r]
+        new = [r for r in all_refs if "_ce_tier" in r]
+        if new:
+            if any(r.get("_ce_tier") == 2 for r in new):
+                new = [r for r in new if r.get("_ce_tier") == 2]
+            if len(new) > 1:
+                exacts = [r for r in new if r.get("_ce_exact")]
+                if exacts and len(exacts) < len(new):
+                    new = exacts
+            for r in new:
+                r.pop("_ce_tier", None)
+                r.pop("_ce_exact", None)
+        merged = pre + new
+        if merged:
+            c.extra["image_refs"] = merged
+        else:
+            c.extra.pop("image_refs", None)
+        for r in new:
+            if r.get("filename"):
+                ce_bound_fns.add(r["filename"])
+    return ce_bound_fns, diag
+
+
 def node_chunk_documents(ctx: dict):
     """
     切分文档为结构化 chunks。
@@ -3784,41 +3990,27 @@ def node_chunk_documents(ctx: dict):
 
         # ─── 设备清扫基准书：把部位照片绑定到对应"清扫部位" chunk ───
         # 提取阶段已为每张图片标注 part_labels（匹配清扫部位名）与 anchor_row。
-        # 用 part_labels 在 chunk 文本中找对应部位行绑定；未匹配的图片仍作独立 image chunk。
+        # 身份列优先 + 驱逐 + 强者归并的绑定（见 _bind_equipment_cleaning_images）；
+        # 未匹配/被丢弃的图片仍作独立 image chunk。
         ce_bound_fns = set()
         if xlsx_layout_type == "equipment_cleaning_standard" and global_split_mode == "dynamic":
             assets = doc.get("assets", [])
             if assets:
                 source_key = doc.get("source_key", "")
                 dept_code = _dept_from_raw_key(source_key, doc.get("owner_dept", "unknown"))
-                version = doc["version_no"]
-                d_id = doc["doc_id"]
-                for a in assets:
-                    if a.get("status") != "ROUTE_TO_VECTOR":
-                        continue
-                    labels = [l for l in (a.get("part_labels") or []) if l]
-                    if not labels:
-                        continue
-                    cands = [c for c in chunks if c.chunk_type != "image"
-                             and any(lbl in (c.chunk_text or "") for lbl in labels)]
-                    if not cands:
-                        continue
-                    target = min(cands, key=lambda c: len(c.chunk_text or ""))
-                    fn = a.get("filename", "")
-                    target.extra.setdefault("image_refs", []).append({
-                        "filename": fn,
-                        "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
-                        # image_index 契约键：取 asset 抽取序号（与 procedure_image_guide/DOCX/PDF 同源）。
-                        # equipment_cleaning_standard 的 part_labels 绑定原先漏设此键（2026-06-15 D6）。
-                        "image_index": a.get("image_index", a.get("original_index")),
-                        "anchor_row": a.get("anchor_row"),
-                        "part_labels": labels,
-                        "annotation_num": a.get("annotation_num"),
-                        "image_category": a.get("image_category", "unknown"),
-                        "visual_summary": a.get("visual_summary", ""),
-                        "ocr_text": a.get("ocr_text", ""),
-                    })
-                    ce_bound_fns.add(fn)
+                ce_bound_fns, _ce_diag = _bind_equipment_cleaning_images(
+                    chunks, assets, dept_code, doc["doc_id"], doc["version_no"],
+                    doc.get("blocks"))
+                # 诊断：未支持版式（三格身份）= 降级；无表头 = first-two-cells 兜底。
+                if _ce_diag.get("unsupported"):
+                    print(f"    ⚠️ equipment_cleaning 图文绑定：检测到未支持的三格身份版式 "
+                          f"({_ce_diag['unsupported']} 行, section="
+                          f"{sorted(s for s in _ce_diag['unsupported_sections'] if s)}) "
+                          f"→ 已降级（该 section 图片改建独立 image chunk，不硬绑）")
+                elif _ce_diag.get("fallback"):
+                    print(f"    ⚠️ equipment_cleaning 图文绑定：{_ce_diag['fallback']} 行无表头、"
+                          f"走 first-two-cells 兜底 (section="
+                          f"{sorted(s for s in _ce_diag['fallback_sections'] if s)})")
 
         # ─── Visual Embedding & Image Chunking ───
         # Step 模式下图片已经绑定到 step_card，不再创建独立 image chunk。
