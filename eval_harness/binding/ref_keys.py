@@ -151,24 +151,29 @@ def jaccard(gt_refs: Iterable[ImageRef], pred_refs: Iterable[ImageRef],
 
 
 def img_dup_factor(all_refs: Iterable[ImageRef]) -> float:
-    """全文 image_refs 数 / 唯一图身份数。
+    """全文 image_refs 数 / 唯一图身份数 = 平均"每张图被几个 step_card 引用"。
 
     1.0 = 完美(每张图只被一个 step 绑定一次)
     > 1.5 = 已知 over-attach bug(每子步骤被塞所有图)
     本方案 hard 闸 p95 <= 1.20(容忍多步骤合理共享总览图/封面图)
 
-    NB. 这里的"唯一身份"故意忽略 xlsx 的 filename 次级身份——dup_factor 度量的是
-    "同一锚点位重复出现"，引入 filename 会让"同 anchor 多张不同文件"被算作不同
-    身份而失去 over-attach 信号（同 anchor=12 两张图原本就该 dup=2 触警，加 filename
-    后会变 dup=1 漏报）。
+    身份键 = strict_key —— xlsx 即 (block_index, filename) 完整图身份(pred 总带
+    filename;缺失时回退 block_index-only)。
+
+    2026-06-19 修正:xlsx 从"仅 anchor(block_index)"改回完整图身份。旧设计按
+    anchor-only 计身份,本意是"同一 anchor 出现多次 = over-attach"。但 figure-grid
+    版式(设备清扫基准书 / 自检表)的 extractor 会把【多张不同图】聚簇到同一
+    anchor_row,而它们各自 1:1 正确绑到【不同】step_card —— anchor-only 把这误判成
+    over-attach(实测 xlsx_inspect:anchor7 三张不同图各绑一步 → 假阳 dup=1.667;
+    xlsx_sop:anchor12 两张 → 假阳 1.2)。改用完整图身份后 dup = 平均每张图被引用
+    次数,仍精确捕获真 over-attach:
+      * 同一张图被塞进 N 个 card(经典"每子步骤被塞所有图" dogpile)→ 该图在
+        all_refs 重复 N 次、unique 计 1 → dup 抬升(K 图全塞 N 步 → dup=N),触警;
+      * 同 anchor 多张【不同】图各自 1:1 → total=unique → dup=1.0(正确)。
+    图绑错 card 但仍 1:1 的「误绑」不归 dup_factor 管,由 Jaccard 捕获。
     """
     refs = list(all_refs)
     if not refs:
         return 1.0
-    def _dup_key(r):
-        # 对 xlsx，强制退回 (fmt, block_index) 计身份；其他格式沿用 strict_key
-        if r.fmt == "xlsx":
-            return ("xlsx", r.block_index)
-        return r.strict_key()
-    unique = {_dup_key(r) for r in refs}
+    unique = {r.strict_key() for r in refs}
     return len(refs) / len(unique) if unique else 1.0

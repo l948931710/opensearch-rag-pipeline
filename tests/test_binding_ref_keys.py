@@ -142,6 +142,42 @@ def test_dup_factor_empty():
     assert img_dup_factor([]) == 1.0  # 没有图 = no problem(分母防 0)
 
 
+# ── 2026-06-19: xlsx figure-grid 聚簇 anchor 不再假阳 + dogpile 仍捕获 ──────────
+
+def test_dup_factor_xlsx_clustered_anchor_not_overattach():
+    """figure-grid 版式:三张【不同】图聚簇到同一 anchor_row=7,各自 1:1 绑到不同
+    step_card。这是 extractor 已知聚簇,非 over-attach —— 必须 1.0(旧 anchor-only
+    身份在此假阳为 3.0)。实测 xlsx_inspect 的真实形态。"""
+    refs = [
+        ImageRef(fmt="xlsx", block_index=7, filename="img0000.png"),
+        ImageRef(fmt="xlsx", block_index=7, filename="img0001.png"),
+        ImageRef(fmt="xlsx", block_index=7, filename="img0002.png"),
+    ]
+    assert img_dup_factor(refs) == 1.0
+
+
+def test_dup_factor_xlsx_same_image_multi_card_caught():
+    """真 over-attach:同一张图(同 block+filename)被塞进 3 个 step_card → 该图重复
+    3 次、unique 计 1;另有一张正常图 → total=4 / unique=2 = 2.0,触警。"""
+    refs = [
+        ImageRef(fmt="xlsx", block_index=7, filename="img0000.png"),  # card1
+        ImageRef(fmt="xlsx", block_index=7, filename="img0000.png"),  # card2 (dogpile)
+        ImageRef(fmt="xlsx", block_index=7, filename="img0000.png"),  # card3 (dogpile)
+        ImageRef(fmt="xlsx", block_index=8, filename="img0003.png"),  # card4 (normal)
+    ]
+    assert img_dup_factor(refs) == 2.0
+
+
+def test_dup_factor_xlsx_every_image_every_card_caught():
+    """最坏 dogpile「每子步骤被塞所有图」:2 张图 × 各被 3 个 card 引用 → dup=3.0
+    (= step 数)。证明换完整图身份后该信号不被掩盖。"""
+    refs = []
+    for _card in range(3):
+        refs.append(ImageRef(fmt="xlsx", block_index=7, filename="imgA.png"))
+        refs.append(ImageRef(fmt="xlsx", block_index=8, filename="imgB.png"))
+    assert img_dup_factor(refs) == 3.0
+
+
 # ── gt_loader 集成 ─────────────────────────────────────────
 
 def _write_tmp_json(payload, suffix=".json"):
