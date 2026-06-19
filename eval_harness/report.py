@@ -160,11 +160,17 @@ def build_gates(r: Dict) -> Dict:
             }
         op = srv.get("orphan_rate")
         if op is not None:
+            # orphan rate is a SOFT/trend metric — it must NEVER block --strict (referenced-only
+            # rendering: unreferenced candidate images are not shown to users, so a high orphan
+            # rate on photo-dense docs is a trend signal, not a serving defect). N<5 → expected_na
+            # (unmeasured); N>=5 → advisory FAIL stays VISIBLE but non-blocking (2026-06-19: the
+            # N>=5 branch previously LACKED the advisory flag, so the first N>=5 run wrongly hard-
+            # blocked on it — sibling marker_distinctness + the degraded path were always advisory).
             gates["orphan rate (L4-srv, trend 监控)"] = {
-                "target": (f"<= 0.30 soft (N={n_srv} 太小,仅 trend)" if srv_degraded else "<= 0.30 soft"),
+                "target": (f"<= 0.30 soft (N={n_srv} 太小,仅 trend)" if srv_degraded else "<= 0.30 soft (trend, advisory)"),
                 "value": round(op, 4),
                 "pass": None if srv_degraded else (op <= 0.30),
-                **({"na_reason": "expected_na"} if srv_degraded else {}),  # soft → advisory, not a fail
+                **({"na_reason": "expected_na"} if srv_degraded else {"advisory": True}),
             }
         # marker_distinctness — ADVISORY (never blocks): fraction of in-range markers that are DISTINCT
         # images. <1.0 = a valid image was reused across the answer (often a chunk that bundles several

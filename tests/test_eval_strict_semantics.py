@@ -140,6 +140,61 @@ def test_report_l4srv_shortfall_taxonomy():
     assert g["orphan rate (L4-srv, trend 监控)"]["na_reason"] == "expected_na"        # soft → advisory
 
 
+def test_report_l4srv_orphan_advisory_when_measured_N5():
+    """Invariant 2: at N>=5 the orphan-rate gate is a soft/trend metric — a FAIL (>0.30) stays
+    VISIBLE but must NOT block --strict (referenced-only render: unreferenced candidate images
+    are never shown to users). The measured value stays observable as advisory telemetry."""
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    r = {"l4": {"applicable": True, "aggregate": {
+        "n_answers_with_images": 5, "marker_validity": 1.0, "dangling_ref_rate": 0.0,
+        "orphan_rate": 0.7895, "marker_distinctness": 0.8}}}
+    g = build_gates(r)
+    orphan = g["orphan rate (L4-srv, trend 监控)"]
+    assert orphan["pass"] is False and orphan.get("advisory") is True   # measured FAIL, advisory
+    assert orphan["value"] == 0.7895                                    # telemetry stays observable
+    assert "na_reason" not in orphan                                    # measured, not expected_na
+    assert not any("orphan" in f for f in _strict_failures(g, r))       # ... does NOT block --strict
+    # invariant 4: no other L4-srv gate flips classification
+    assert g["<<IMG:N>> marker validity (L4-srv)"]["pass"] is True
+    assert g["<<IMG:N>> marker validity (L4-srv)"].get("advisory") is not True   # stays HARD
+    assert g["dangling 口惠图但卡片无图 (L4-srv)"]["pass"] is True
+    assert g["dangling 口惠图但卡片无图 (L4-srv)"].get("advisory") is not True     # stays HARD
+    assert g["marker distinctness (L4-srv, advisory)"].get("advisory") is True   # stays advisory
+
+
+def test_report_l4srv_orphan_expected_na_nonblocking_N_lt_5():
+    """Invariant 1: N<5 orphan stays expected-N/A (unmeasured) and non-blocking."""
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    r = {"l4": {"applicable": True, "aggregate": {
+        "n_answers_with_images": 4, "marker_validity": 1.0, "dangling_ref_rate": 0.0,
+        "orphan_rate": 0.79, "marker_distinctness": 0.8}}}
+    g = build_gates(r)
+    orphan = g["orphan rate (L4-srv, trend 监控)"]
+    assert orphan["pass"] is None and orphan["na_reason"] == "expected_na"
+    assert not any("orphan" in f for f in _strict_failures(g, r))
+
+
+def test_report_l4srv_marker_and_dangling_stay_hard_blockers_N5():
+    """Invariant 3: at N>=5, marker-validity (<0.95) and dangling (>0.05) FAILs remain HARD
+    --strict blockers (NOT advisory) — the orphan fix must not soften them."""
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    r = {"l4": {"applicable": True, "aggregate": {
+        "n_answers_with_images": 6, "marker_validity": 0.5, "dangling_ref_rate": 0.5,
+        "orphan_rate": 0.1, "marker_distinctness": 1.0}}}
+    g = build_gates(r)
+    mv = g["<<IMG:N>> marker validity (L4-srv)"]
+    dn = g["dangling 口惠图但卡片无图 (L4-srv)"]
+    assert mv["pass"] is False and mv.get("advisory") is not True
+    assert dn["pass"] is False and dn.get("advisory") is not True
+    fails = _strict_failures(g, r)
+    assert any("marker validity" in f for f in fails)        # hard blocker
+    assert any("dangling" in f for f in fails)               # hard blocker
+    assert g["orphan rate (L4-srv, trend 监控)"]["pass"] is True   # 0.1<=0.30 → PASS (still advisory)
+
+
 def test_l6_soft_gates_are_advisory_not_strict_block():
     """L6 soft signals (mid-sentence, routing-family) are DIAGNOSTIC — a failing one stays visible in
     the report but must NOT block --strict; the GO/NO_GO verdict + [L6-hard] gates are the real gate
