@@ -50,6 +50,81 @@ def test_baseline_regime_mismatch_is_na_not_a_pass():
     assert g["pass"] is None and g["na_reason"] == "expected_na"  # can't compare across regimes
 
 
+_REG = {"fusion": "weighted", "eval_set_sha": "x", "rerank_enable": True, "llm_model": "q",
+        "embedding_model": "e", "reranker_models": None, "threshold_version": "t"}
+
+
+def test_baseline_advisory_delta_visible_but_not_strict_block():
+    """Invariant 1: a baseline DELTA on an advisory metric (l4srv.orphan_rate) is REPORTED (visible)
+    but must NOT block --strict."""
+    from eval_harness import baseline as BL
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    base = {"regime": _REG, "delta": 0.03,
+            "metrics": {"l4srv.orphan_rate": 0.5, "l1.ranking.recall@5": 0.9}}
+    # orphan worsened 0.5 → 0.9 (lower-better → regressed); hard metric fine
+    cur = {"meta": {"regime": _REG}, "l4": {"aggregate": {"orphan_rate": 0.9}},
+           "l1": {"ranking": {"recall@5": 0.92}}}
+    bg = BL.compare(base, cur)
+    adv = next(v for v in bg.values() if v.get("advisory"))
+    assert adv["pass"] is False and adv["advisory"] is True          # visible drift, flagged advisory
+    assert "l4srv.orphan_rate" in adv["value"]                       # reported, not hidden
+    hard = next(v for k, v in bg.items() if not v.get("advisory"))
+    assert hard["pass"] is True                                      # hard side clean
+    g = build_gates({"baseline_gates": bg})
+    assert not any("advisory" in f or "orphan" in f for f in _strict_failures(g, {}))  # NOT blocking
+
+
+def test_baseline_hard_metric_delta_still_blocks_strict():
+    """Invariant 2: a HARD metric regression keeps fully blocking --strict (the orphan fix must not
+    soften hard regressions)."""
+    from eval_harness import baseline as BL
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    base = {"regime": _REG, "delta": 0.03,
+            "metrics": {"l1.ranking.recall@5": 0.9, "l4srv.orphan_rate": 0.5}}
+    cur = {"meta": {"regime": _REG}, "l1": {"ranking": {"recall@5": 0.5}},  # cratered hard metric
+           "l4": {"aggregate": {"orphan_rate": 0.5}}}                       # orphan fine
+    bg = BL.compare(base, cur)
+    hard = next(v for v in bg.values() if not v.get("advisory"))
+    assert hard["pass"] is False and hard.get("advisory") is not True
+    g = build_gates({"baseline_gates": bg})
+    assert any("hard metrics" in f for f in _strict_failures(g, {}))        # blocks --strict
+
+
+def test_baseline_advisory_metric_kept_and_reported(tmp_path):
+    """Invariant 3: advisory metrics stay in the frozen baseline (trend output) and a delta on them
+    is reported in the advisory gate — value never removed/disguised."""
+    import json as _j
+    from eval_harness import baseline as BL
+    run = {"meta": {"regime": {"fusion": "weighted"}, "timestamp": "t"},
+           "l4": {"aggregate": {"orphan_rate": 0.74, "marker_validity": 1.0, "dangling_ref_rate": 0.0}}}
+    p = str(tmp_path / "b.json")
+    base = BL.freeze(run, p)
+    assert base["metrics"]["l4srv.orphan_rate"] == 0.74                     # kept in baseline
+    assert _j.load(open(p))["metrics"]["l4srv.orphan_rate"] == 0.74         # persisted for trend
+    cur = {"meta": {"regime": {"fusion": "weighted"}}, "l4": {"aggregate": {"orphan_rate": 0.9}}}
+    adv = next(v for v in BL.compare(base, cur).values() if v.get("advisory"))
+    assert "l4srv.orphan_rate" in adv["value"]                             # visibly reported
+
+
+def test_baseline_only_orphan_advisory_no_silent_reclassification():
+    """Invariant 4: the advisory registry is EXACTLY {l4srv.orphan_rate}; every other extractable
+    metric (recall/jaccard/dup/marker_validity/dangling/judge/refusal) stays HARD."""
+    from eval_harness.baseline import ADVISORY_METRICS, _is_advisory, extract_metrics
+    assert ADVISORY_METRICS == frozenset({"l4srv.orphan_rate"})
+    sample = {"l1": {"ranking": {"recall@5": 0.9}, "by_source": {"xlsx": {"recall@5": 0.8}}},
+              "l3": {"deterministic": {"positive": {"over_refusal_rate": 0.05, "mean_keyword_coverage": 0.8}}},
+              "l4": {"ingestion": {"deterministic": {"binding_jaccard_pdf": 0.8, "img_dup_factor_p95": 1.0}},
+                     "aggregate": {"marker_validity": 1.0, "dangling_ref_rate": 0.0, "orphan_rate": 0.7}},
+              "judge": {"aggregate": {"positives": {"faithfulness": {"mean": 4.5}}}}}
+    m = extract_metrics(sample)
+    assert {p for p in m if _is_advisory(p)} == {"l4srv.orphan_rate"}       # exactly one advisory
+    for hard in ("l4srv.marker_validity", "l4srv.dangling_ref_rate", "l4ing.jaccard.pdf",
+                 "l4ing.img_dup_p95", "l1.ranking.recall@5", "l3.over_refusal_rate", "judge.faithfulness"):
+        assert hard in m and not _is_advisory(hard)                         # stays HARD
+
+
 def test_baseline_clean_passes_and_freeze_roundtrip(tmp_path):
     from eval_harness import baseline
     cur = {"meta": {"regime": {"fusion": "weighted"}, "timestamp": "t"},
