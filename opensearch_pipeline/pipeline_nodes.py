@@ -986,14 +986,32 @@ def _dept_from_raw_key(source_key: str, default: str = "unknown") -> str:
     return default
 
 
+def _perm_level_from_path(path: str) -> str:
+    """从 OSS 路径解析权限等级，按【路径段精确匹配】（H6）。
+
+    历史用子串匹配（"internal" in path），会被 internal-audit/、international.docx 等
+    误触发。改为对 '/' 分段后整段精确比对：仅当某一路径段恰为 'restricted' / 'internal' /
+    'dept_internal' 时命中。约定的受限目录是 raw/<dept>/internal/<file>。
+    命中返回 'restricted' 或 'dept_internal'；无匹配返回 ""。
+    """
+    if not path:
+        return ""
+    segs = {s for s in path.lower().split("/") if s}
+    if "restricted" in segs:
+        return "restricted"
+    if "internal" in segs or "dept_internal" in segs:
+        return "dept_internal"
+    return ""
+
+
 def resolve_permission_level(doc: dict, ctx: dict) -> str:
     """
     确定文档的权限等级，完全由 OSS 路径/预配置属性决定，绝不经过模型预测。
     根据以下优先级：
     1. 查找 doc 或 task 中显式指定的 permission_level（'internal' 归一为 'dept_internal'）。
-    2. 从 doc['source_key']、doc['canonical_key'] 或 task['raw_key'] 等路径中解析：
-       - 如果包含 'restricted' (大小写不敏感)，返回 'restricted'
-       - 如果包含 'internal' 或 'dept_internal' (大小写不敏感)，返回 'dept_internal'
+    2. 从 doc['source_key']、doc['canonical_key'] 或 task['raw_key'] 等路径中【按路径段精确】解析：
+       - 某一路径段恰为 'restricted'，返回 'restricted'
+       - 某一路径段恰为 'internal' / 'dept_internal'（约定 raw/<dept>/internal/），返回 'dept_internal'
        - 否则默认返回 'public'（raw/ 根目录除隔离/归档外约定为公开，敏感内容靠脱敏兜底）
     """
     # 1. 显式指定的权限
@@ -1008,28 +1026,21 @@ def resolve_permission_level(doc: dict, ctx: dict) -> str:
             if "permission_level" in task:
                 v = task["permission_level"]
                 return _PERMISSION_ALIAS.get(v, v)
-            # 检查任务的 raw_key
-            raw_key = task.get("raw_key", "")
-            if raw_key:
-                if "restricted" in raw_key.lower():
-                    return "restricted"
-                if "internal" in raw_key.lower():
-                    return "dept_internal"
+            # 检查任务的 raw_key（路径段精确匹配）
+            lvl = _perm_level_from_path(task.get("raw_key", ""))
+            if lvl:
+                return lvl
 
-    # 2. 从路径特征中解析
+    # 2. 从路径特征中解析（路径段精确匹配）
     paths_to_check = [
         doc.get("source_key", ""),
         doc.get("canonical_key", ""),
         doc.get("canonical_md_key", "")
     ]
     for p in paths_to_check:
-        if not p:
-            continue
-        p_lower = p.lower()
-        if "restricted" in p_lower:
-            return "restricted"
-        if "internal" in p_lower:
-            return "dept_internal"
+        lvl = _perm_level_from_path(p)
+        if lvl:
+            return lvl
 
     # 默认值为 'public'
     return "public"

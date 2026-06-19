@@ -627,25 +627,23 @@ class TestHA3FilterInjectionPrevention:
         # 模拟注入攻击
         search_chunks("测试", user_dept='x" OR 1=1 OR owner_dept="y')
 
-        # 验证 kNN query 的 filter 中注入被中和
+        # 验证 kNN query 的 filter 中注入被中和：注入串既非合法权限组，被白名单整体丢弃 →
+        # 退化为仅 public（fail-closed），不含任何注入片段
         knn = _captured_knn_queries[0]
         filter_val = knn.filter
-        # filter 中不应出现额外的 OR（除了原有的 permission_level OR）
-        or_count = filter_val.count(" OR ")
-        assert or_count == 1, (
-            f"filter 中应只有 1 个 OR（原有权限 OR），实际有 {or_count} 个: {filter_val}"
-        )
+        assert filter_val == '(permission_level="public")', f"实际 filter: {filter_val}"
+        assert "1=1" not in filter_val and '"y' not in filter_val
 
     @patch("opensearch_pipeline.retriever.get_query_embedding")
     @patch("opensearch_pipeline.retriever.get_config")
     @patch("opensearch_pipeline.retriever._get_ha3_client")
-    def test_chinese_dept_name_filter_expression(
+    def test_group_code_filter_expression(
         self, mock_client_fn, mock_config, mock_embedding
     ):
-        """钉钉中文部门名（如「营销中心」）必须完整保留在 HA3 权限过滤表达式中。
+        """已解析的 ACL 组代码（如 marketing）必须完整进入 HA3 权限过滤表达式。
 
-        部门是名称字符串（与 chunk 的 owner_dept 对齐，见 dingtalk_identity），
-        若净化函数剥掉中文字符，dept_internal 文档对本部门将全部不可见。
+        中文部门名在 dingtalk_identity 上游已归一化为组代码；filter 只接受组代码，
+        非白名单值（含中文名）被丢弃为仅 public（见 test_filter_exact_strings）。
         """
         mock_config.return_value = _make_config(hybrid_fusion="rrf")
         mock_embedding.return_value = ([0.1] * 1024, [1], [0.5])
@@ -655,12 +653,36 @@ class TestHA3FilterInjectionPrevention:
         mock_client_fn.return_value = client
 
         from opensearch_pipeline.retriever import search_chunks
-        search_chunks("产品报价流程", user_dept="营销中心")
+        search_chunks("产品报价流程", user_dept="marketing")
 
         knn = _captured_knn_queries[0]
         assert knn.filter == (
-            'permission_level="public"'
-            ' OR (permission_level="dept_internal" AND owner_dept="营销中心")'
+            '(permission_level="public")'
+            ' OR (permission_level="dept_internal" AND (owner_dept="marketing"))'
+        ), f"实际 filter: {knn.filter}"
+
+    @patch("opensearch_pipeline.retriever.get_query_embedding")
+    @patch("opensearch_pipeline.retriever.get_config")
+    @patch("opensearch_pipeline.retriever._get_ha3_client")
+    def test_multi_dept_filter_expression(
+        self, mock_client_fn, mock_config, mock_embedding
+    ):
+        """多组用户（如 marketing+production）→ filter 用 OR-join 等值放行多个 owner_dept。"""
+        mock_config.return_value = _make_config(hybrid_fusion="rrf")
+        mock_embedding.return_value = ([0.1] * 1024, [1], [0.5])
+
+        client = MagicMock()
+        client.search.return_value = _make_ha3_response()
+        mock_client_fn.return_value = client
+
+        from opensearch_pipeline.retriever import search_chunks
+        search_chunks("产品报价流程", user_dept=["marketing", "production"])
+
+        knn = _captured_knn_queries[0]
+        assert knn.filter == (
+            '(permission_level="public")'
+            ' OR (permission_level="dept_internal" AND ('
+            'owner_dept="marketing" OR owner_dept="production"))'
         ), f"实际 filter: {knn.filter}"
 
     @patch("opensearch_pipeline.retriever.get_query_embedding")
@@ -681,7 +703,7 @@ class TestHA3FilterInjectionPrevention:
         search_chunks("测试", user_dept=None)
 
         knn = _captured_knn_queries[0]
-        assert knn.filter == 'permission_level="public"', f"实际 filter: {knn.filter}"
+        assert knn.filter == '(permission_level="public")', f"实际 filter: {knn.filter}"
 
 
 class TestHA3FilterInjectionAPIBoundary:
@@ -722,18 +744,41 @@ class TestSharedPermissionFilter:
 
     def test_filter_exact_strings(self):
         from opensearch_pipeline.retriever import _build_permission_filter
-        assert _build_permission_filter(None) == 'permission_level="public"'
-        assert _build_permission_filter("") == 'permission_level="public"'
-        assert _build_permission_filter("营销中心") == (
-            'permission_level="public"'
-            ' OR (permission_level="dept_internal" AND owner_dept="营销中心")'
+        # fail-closed：空/None/全空白/非白名单 → 仅 public（完整括号 H6）
+        assert _build_permission_filter(None) == '(permission_level="public")'
+        assert _build_permission_filter("") == '(permission_level="public")'
+        assert _build_permission_filter("   ") == '(permission_level="public")'
+        assert _build_permission_filter([""]) == '(permission_level="public")'
+        assert _build_permission_filter("营销中心") == '(permission_level="public")'  # 中文名非组代码→丢弃
+        assert _build_permission_filter("production_injection") == '(permission_level="public")'  # 非白名单
+        # 合法组代码（单 / 多）
+        assert _build_permission_filter("marketing") == (
+            '(permission_level="public")'
+            ' OR (permission_level="dept_internal" AND (owner_dept="marketing"))'
         )
+        assert _build_permission_filter(["marketing", "production"]) == (
+            '(permission_level="public")'
+            ' OR (permission_level="dept_internal" AND ('
+            'owner_dept="marketing" OR owner_dept="production"))'
+        )
+        # CSV 字符串等价于列表
+        assert _build_permission_filter("marketing,production") == _build_permission_filter(
+            ["marketing", "production"])
 
     def test_filter_neutralizes_injection(self):
         from opensearch_pipeline.retriever import _build_permission_filter
+        # 纯注入串：非合法组 → 整体丢弃 → 仅 public
         f = _build_permission_filter('x" OR owner_dept="y')
-        assert f.count(" OR ") == 1   # 仅合法权限 OR，注入的 OR 被净化
+        assert f == '(permission_level="public")'
         assert '"y' not in f
+        # 合法组 + 注入元素混入：合法组保留，注入元素被净化+白名单丢弃，不产生越权 OR
+        f2 = _build_permission_filter(['marketing', 'x" OR permission_level="restricted'])
+        assert f2 == (
+            '(permission_level="public")'
+            ' OR (permission_level="dept_internal" AND (owner_dept="marketing"))'
+        )
+        assert "restricted" not in f2
+        assert f2.count(" OR ") == 1  # 仅顶层 public OR；注入未引入额外 OR
 
     def test_output_fields_canonical_set(self):
         from opensearch_pipeline.retriever import _DEFAULT_OUTPUT_FIELDS

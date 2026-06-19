@@ -97,6 +97,32 @@ class TestPathPermissionResolution:
         ctx = {"tasks": [{"doc_id": "doc5", "permission_level": "restricted"}]}
         assert resolve_permission_level(doc, ctx) == "restricted"
 
+    # ── H6：路径段精确匹配（新约定 raw/<dept>/internal/<file>） ──
+    def test_dept_internal_subfolder_convention(self):
+        """新约定：raw/<dept>/internal/<file> → dept_internal（internal 为独立路径段）。"""
+        doc = {"doc_id": "h6a", "source_key": "raw/finance/internal/CWZD-003.docx"}
+        assert resolve_permission_level(doc, {"tasks": []}) == "dept_internal"
+
+    def test_internal_substring_not_segment_is_public(self):
+        """H6：'internal' 仅作为子串（internal-audit/ 目录、international.docx 文件名）不应误触发。"""
+        assert resolve_permission_level(
+            {"doc_id": "h6b", "source_key": "raw/finance/internal-audit/x.docx"}, {"tasks": []}
+        ) == "public"
+        assert resolve_permission_level(
+            {"doc_id": "h6c", "source_key": "raw/marketing/international_sales.docx"}, {"tasks": []}
+        ) == "public"
+
+    def test_restricted_substring_not_segment_is_public(self):
+        assert resolve_permission_level(
+            {"doc_id": "h6d", "source_key": "raw/hr/restricted-list-notes.docx"}, {"tasks": []}
+        ) == "public"
+
+    def test_dept_internal_via_task_raw_key_segment(self):
+        """任务 raw_key 同样走路径段精确匹配。"""
+        doc = {"doc_id": "h6e"}
+        ctx = {"tasks": [{"doc_id": "h6e", "raw_key": "raw/admin/internal/通讯录.xlsx"}]}
+        assert resolve_permission_level(doc, ctx) == "dept_internal"
+
 
 class TestLiveClassificationPipeline:
     """生产级分类与安全兜底测试。"""
