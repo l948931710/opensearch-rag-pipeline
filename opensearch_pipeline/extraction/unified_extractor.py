@@ -10,6 +10,7 @@ DAG 层不需要知道文件类型，只调用 extract() 即可。
 
 import copy
 import os
+import tempfile
 from typing import Dict, List, Optional
 
 from opensearch_pipeline.extraction.schema import ExtractionResult, ExtractedBlock
@@ -19,6 +20,22 @@ from opensearch_pipeline.extraction.text_extractor import (
     extract_title_from_blocks,
 )
 from opensearch_pipeline.extraction.ocr_client import OCRClient, sanitize_ocr_text
+
+
+_DEFAULT_IMG_DIR: Optional[str] = None
+
+
+def _safe_image_output_dir(task: dict) -> str:
+    """解析图片导出目录。绝不返回 ""——空串会被 os.path.join("", filename) 落到 cwd,
+    污染工作区(历史上往仓库根目录散落 *_img*.png / *_slide*.png)。调用方未传 `_tmp_dir`
+    时,回退到一个稳定的系统临时目录(进程级复用,不落仓库)。"""
+    d = (task or {}).get("_tmp_dir")
+    if d:
+        return d
+    global _DEFAULT_IMG_DIR
+    if _DEFAULT_IMG_DIR is None:
+        _DEFAULT_IMG_DIR = tempfile.mkdtemp(prefix="rag_extract_images_")
+    return _DEFAULT_IMG_DIR
 
 
 def _html_to_text(raw_html: str) -> str:
@@ -369,7 +386,7 @@ class UnifiedExtractor:
 
         # 提取嵌入图片 → 三阶段过滤漏斗
         assets, img_blocks = self._process_embedded_images(
-            extract_images_from_pdf(local_path, task.get("_tmp_dir", ""), max_pages=20),
+            extract_images_from_pdf(local_path, _safe_image_output_dir(task), max_pages=20),
             task,
         )
         if img_blocks:
@@ -444,7 +461,7 @@ class UnifiedExtractor:
 
         # ── 提取嵌入图片到磁盘 → 三阶段过滤漏斗 ──
         exported_images = extract_images_from_docx(
-            local_path, task.get("_tmp_dir", "")
+            local_path, _safe_image_output_dir(task)
         )
 
         # ── 对齐 image_index：inline_image_assets 按文档顺序，
@@ -729,7 +746,7 @@ class UnifiedExtractor:
 
         # 提取嵌入图片 → 三阶段过滤漏斗
         assets, img_blocks = self._process_embedded_images(
-            extract_images_from_xlsx(local_path, task.get("_tmp_dir", "")),
+            extract_images_from_xlsx(local_path, _safe_image_output_dir(task)),
             task,
         )
 
@@ -993,7 +1010,7 @@ class UnifiedExtractor:
 
         # 提取嵌入图片 → 三阶段过滤漏斗
         assets, img_blocks = self._process_embedded_images(
-            extract_images_from_pptx(local_path, task.get("_tmp_dir", "")),
+            extract_images_from_pptx(local_path, _safe_image_output_dir(task)),
             task,
         )
         if img_blocks:
