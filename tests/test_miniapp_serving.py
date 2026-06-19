@@ -29,7 +29,35 @@ from opensearch_pipeline import content_blocks_builder as cb
 def test_token_roundtrip():
     t = auth_token.issue_session_token("U1", dept="行政部", name="张三")
     p = auth_token.verify_session_token(t)
-    assert p and p["uid"] == "U1" and p["dept"] == "行政部" and p["name"] == "张三"
+    assert p and p["uid"] == "U1" and p["name"] == "张三"
+    assert p["acl_groups"] == ["行政部"]          # 新：权威组数组
+    assert p["dept"] == "行政部"                   # 旧·兼容：单值 CSV 与历史标量一致
+
+
+def test_token_multi_group_roundtrip():
+    t = auth_token.issue_session_token("U2", dept=["marketing", "production"], name="王五")
+    p = auth_token.verify_session_token(t)
+    assert p["acl_groups"] == ["marketing", "production"]
+    assert p["dept"] == "marketing,production"     # 旧·兼容：CSV
+
+
+def test_token_legacy_dept_string_back_compat():
+    """老令牌只有 dept(标量字符串)、无 acl_groups → current_identity 仍能解析出组列表。"""
+    import opensearch_pipeline.api as api
+    # 手工构造一个"老格式" payload（只有 dept 标量），用真实签名密钥签发
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import time
+    payload = {"uid": "OLD", "dept": "marketing", "name": "老", "exp": int(time.time()) + 3600}
+    pb = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    sig = hmac.new(auth_token._get_signing_key(), pb.encode("ascii"), hashlib.sha256).digest()
+    tok = pb + "." + base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+    ident = api.current_identity("Bearer " + tok)
+    assert ident is not None
+    assert ident.acl_groups == ["marketing"]       # 由旧 dept 标量拆分而来
 
 
 def test_token_tamper_and_garbage():
@@ -112,7 +140,7 @@ def test_ask_uses_token_dept_not_body(monkeypatch):
                json={"question": "q", "user_id": "ATTACKER", "user_dept": "财务部"},
                headers={"Authorization": "Bearer " + tok})
     assert r.status_code == 200, r.text
-    assert captured["dept"] == "行政部"   # 取自令牌，而非请求体的 财务部
+    assert captured["dept"] == ["行政部"]   # 取自令牌(acl_groups 列表)，而非请求体的 财务部
     j = r.json()
     assert j["message_id"]
     assert j["blocks"] == [{"type": "text", "format": "plain", "text": "答案正文"}]
@@ -331,7 +359,7 @@ def test_ask_no_token_is_anonymous_public_only(monkeypatch):
 
 
 def test_ask_token_dept_marketing_center(monkeypatch):
-    """钉钉部门「营销中心」走令牌 → 检索收到的 user_dept 原样为「营销中心」。"""
+    """钉钉部门走令牌 → 检索收到的 user_dept 为令牌里的 acl_groups 列表。"""
     import opensearch_pipeline.api as api
     from fastapi.testclient import TestClient
 
@@ -347,12 +375,13 @@ def test_ask_token_dept_marketing_center(monkeypatch):
     monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks: [])
     monkeypatch.setattr(api, "log_qa_session", lambda **kw: None)
 
-    tok = auth_token.issue_session_token("MKT001", dept="营销中心", name="测试用户")
+    # 令牌签发多组（国际贸易部 → marketing+production 的解析结果），检索按列表收到
+    tok = auth_token.issue_session_token("MKT001", dept=["marketing", "production"], name="测试用户")
     c = TestClient(api.app)
     r = c.post("/api/ask", json={"question": "q"},
                headers={"Authorization": "Bearer " + tok})
     assert r.status_code == 200, r.text
-    assert captured["dept"] == "营销中心"
+    assert captured["dept"] == ["marketing", "production"]
 
 
 def test_feedback_uses_token_user(monkeypatch):

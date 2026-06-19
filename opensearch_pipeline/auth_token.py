@@ -4,8 +4,12 @@ auth_token.py — 轻量级签名会话令牌（仅用 Python 标准库 HMAC-SHA
 
 钉钉小程序免登后，后端用 issue_session_token() 颁发一个短期签名令牌返回给客户端；
 后续 /api/ask、/api/feedback 等请求携带 `Authorization: Bearer <token>`，由
-verify_session_token() 校验。令牌内嵌 {uid, dept, name, exp}，**部门由服务端解析后写入令牌，
-绝不信任客户端传入的部门**，从而堵住跨部门越权读取 dept_internal 文档的漏洞。
+verify_session_token() 校验。令牌内嵌 {uid, acl_groups, dept, name, exp}，**ACL 权限组由服务端
+解析后写入令牌，绝不信任客户端传入的部门**，从而堵住跨部门越权读取 dept_internal 文档的漏洞。
+
+- `acl_groups`（权威）：用户所属 ACL 权限组数组，如 ["marketing","production"]。
+- `dept`（旧·兼容）：同一组列表的 CSV，保留给旧消费端；新读取应优先 acl_groups。
+  注意承载的是"权限组"而非组织部门——见 dingtalk_identity._DEPT_NAME_TO_GROUPS。
 
 紧凑、自包含格式（精简版 JWT 思路）：
     base64url(json_payload) + "." + base64url(hmac_sha256(payload_b64, key))
@@ -25,7 +29,7 @@ import logging
 import os
 import secrets
 import time
-from typing import Optional
+from typing import List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +76,42 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
+def _coerce_acl_groups(dept: Union[str, List[str], None]) -> List[str]:
+    """把 dept 入参（单串 / CSV / 列表）归一为干净去重的 ACL 组列表。
+
+    不做合法组白名单——白名单在检索安全边界 retriever._normalize_acl_groups 强制；
+    此处只保证存进 token 的格式干净。放在本模块内（而非 import retriever）以保持
+    auth_token 的零第三方依赖与无 import 环。
+    """
+    if not dept:
+        return []
+    items = dept.split(",") if isinstance(dept, str) else dept
+    out: List[str] = []
+    seen = set()
+    for d in items:
+        s = (d or "").strip() if isinstance(d, str) else str(d).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def issue_session_token(
     user_id: str,
-    dept: Optional[str] = None,
+    dept: Union[str, List[str], None] = None,
     name: Optional[str] = None,
     ttl: int = _DEFAULT_TTL_SECONDS,
 ) -> str:
-    """签发会话令牌。部门由服务端解析后写入，客户端不可篡改。"""
+    """签发会话令牌。ACL 权限组由服务端解析后写入，客户端不可篡改。
+
+    `dept` 入参接受单组字符串、CSV 或组列表（历史参数名，承载的是 ACL 组）。
+    令牌同时写权威 `acl_groups`（数组）与旧 `dept`（CSV，向后兼容）。
+    """
+    groups = _coerce_acl_groups(dept)
     payload = {
         "uid": user_id,
-        "dept": dept or "",
+        "acl_groups": groups,        # 权威：权限组数组
+        "dept": ",".join(groups),    # 旧·兼容：CSV（单值时与历史标量一致）
         "name": name or "",
         "exp": int(time.time()) + int(ttl),
     }

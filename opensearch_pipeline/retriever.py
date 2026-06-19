@@ -8,7 +8,7 @@ retriever.py — 检索模块
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from opensearch_pipeline.config import get_config
 
@@ -227,27 +227,66 @@ _DEFAULT_OUTPUT_FIELDS = [
 ]
 
 
-def _build_permission_filter(user_dept: Optional[str]) -> str:
+# 合法 ACL 权限组白名单（单一来源；H2 防御纵深）。
+# ⚠️ 语义：这些代码承载的是"ACL 权限组"，不是组织部门——一个组织部门可映射到多个组，
+# 映射见 dingtalk_identity._DEPT_NAME_TO_GROUPS。字段名沿用历史的 dept/owner_dept/user_dept。
+_VALID_ACL_GROUPS = frozenset({
+    "finance", "it", "marketing", "production",
+    "pmc", "admin", "hr", "rd", "quality", "supply",
+})
+
+
+def _normalize_acl_groups(user_dept: Union[str, List[str], None]) -> List[str]:
+    """把任意形态的部门/组入参归一为干净、去重、白名单内的 ACL 组列表（单一归一点）。
+
+    每个元素先 _sanitize_ha3_filter_value 净化，再过 _VALID_ACL_GROUPS 白名单。
+    fail-closed：空 / None / 全空白 / 全非法 → []（→ 仅 public 可见，绝不 fail-open）。
+    接受形态：单字符串、逗号分隔字符串、列表（列表元素本身也可含逗号）。
+    """
+    if not user_dept:
+        return []
+    raw: List[str] = []
+    if isinstance(user_dept, str):
+        raw = user_dept.split(",")
+    else:
+        for item in user_dept:
+            if item is None:
+                continue
+            raw.extend(str(item).split(","))
+    out: List[str] = []
+    seen = set()
+    for d in raw:
+        code = _sanitize_ha3_filter_value(d.strip())
+        if code and code in _VALID_ACL_GROUPS and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
     """构建 HA3 权限过滤表达式（安全边界，单一实现）。
 
-    放行 public；有部门时额外放行该部门的 dept_internal。部门值经 _sanitize_ha3_filter_value
-    白名单净化，防止 filter 注入。多个调用点（search_chunks / cosurface_doc_images）共用，
-    确保权限规则只有一处、不会某处改了另一处漏改而越权或漏召回。
+    放行 public；对用户所属的每个 ACL 组额外放行该组的 dept_internal。入参经
+    _normalize_acl_groups（净化 + 白名单 + 去重）后才进表达式；为空 → 仅 public（fail-closed）。
+    所有调用点（search_chunks / cosurface_doc_images / 本地回退）共用，权限规则只有一处。
+    完整括号包裹每个子句，避免 HA3 对 AND/OR 优先级的歧义。
     """
-    if user_dept:
-        safe_dept = _sanitize_ha3_filter_value(user_dept)
-        return (
-            'permission_level="public"'
-            ' OR (permission_level="dept_internal" AND owner_dept="' + safe_dept + '")'
-        )
-    return 'permission_level="public"'
+    groups = _normalize_acl_groups(user_dept)
+    if not groups:
+        return '(permission_level="public")'
+    # groups 已净化+白名单（仅字母），字符串拼接无注入风险
+    dept_clause = " OR ".join('owner_dept="' + g + '"' for g in groups)
+    return (
+        '(permission_level="public")'
+        ' OR (permission_level="dept_internal" AND (' + dept_clause + '))'
+    )
 
 
 def _search_chunks_opensearch(
     query: str,
     dense: List[float],
     top_k: int,
-    user_dept: str = None,
+    user_dept: Union[str, List[str], None] = None,
 ) -> List[Dict[str, Any]]:
     """本地开发回退检索：标准 OpenSearch dense kNN(0.7) + BM25(0.3)。
 
@@ -267,10 +306,11 @@ def _search_chunks_opensearch(
     )
 
     perm_should = [{"term": {"kb_type": "public"}}]
-    if user_dept:
+    groups = _normalize_acl_groups(user_dept)  # 多组：term→terms（净化+白名单后的组列表）
+    if groups:
         perm_should.append({"bool": {"must": [
             {"term": {"permission_level": "dept_internal"}},
-            {"term": {"owner_dept": user_dept}},
+            {"terms": {"owner_dept": groups}},
         ]}})
 
     fetch_k = max(top_k * 2, top_k + 5)
@@ -336,7 +376,7 @@ def search_chunks(
     min_score: float = 0.0,
     max_distance: float = 0.0,
     output_fields: Optional[List[str]] = None,
-    user_dept: Optional[str] = None,
+    user_dept: Union[str, List[str], None] = None,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -504,6 +544,17 @@ def search_chunks(
 # 4. Neighbor Stitching（邻居扩展）
 # ═══════════════════════════════════════════════════════════════
 
+def _same_permission(row: Dict[str, Any], center: Dict[str, Any]) -> bool:
+    """H4 防御纵深：二次取回（邻居拼接 / step 扩展）的行必须与中心 chunk 同
+    (permission_level, owner_dept)。同文档本应天然一致（权限按文档统一），万一不一致
+    则丢弃——绝不把比"已通过权限的中心"更严的内容拼进答案上下文。统一边界，单一实现。
+    """
+    return (
+        (row.get("permission_level") or "public") == center.get("permission_level", "public")
+        and (row.get("owner_dept") or "") == center.get("owner_dept", "")
+    )
+
+
 def stitch_neighbor_chunks(
     chunks: List[Dict[str, Any]],
     *,
@@ -580,7 +631,8 @@ def stitch_neighbor_chunks(
                     where_parts.append("(doc_id = %s AND chunk_index BETWEEN %s AND %s)")
                     params.extend([doc_id, lo, hi])
                 cursor.execute(
-                    "SELECT doc_id, chunk_index, chunk_text, section_title "
+                    "SELECT doc_id, chunk_index, chunk_text, section_title, "
+                    "       permission_level, owner_dept "
                     "FROM chunk_meta WHERE is_active = 1 AND (" + " OR ".join(where_parts) + ")",
                     tuple(params),
                 )
@@ -594,7 +646,11 @@ def stitch_neighbor_chunks(
         for slot, chunk, doc_id, center_idx in pending:
             doc_neighbors = neighbors_by_doc.get(doc_id, {})
             lo, hi = center_idx - window, center_idx + window
-            neighbor_rows = [doc_neighbors[i] for i in sorted(doc_neighbors) if lo <= i <= hi]
+            # H4 防御纵深：邻居必须与中心 chunk 同权限（同文档本应一致），否则丢弃
+            neighbor_rows = [
+                doc_neighbors[i] for i in sorted(doc_neighbors)
+                if lo <= i <= hi and _same_permission(doc_neighbors[i], chunk)
+            ]
             if neighbor_rows:
                 stitched_text = "\n".join(nb["chunk_text"] or "" for nb in neighbor_rows)
             else:
@@ -767,7 +823,8 @@ def expand_step_context(
             ph = ",".join(["%s"] * len(parent_ids))
             cursor.execute(
                 "SELECT chunk_id, chunk_text, step_no, section_title, "
-                "       extra_json, image_refs_json, parent_chunk_id "
+                "       extra_json, image_refs_json, parent_chunk_id, "
+                "       permission_level, owner_dept "
                 f"FROM chunk_meta WHERE parent_chunk_id IN ({ph}) AND is_active = 1 "
                 # chunk_id 内嵌零填充 _cNNNN_ 序号 → 字典序 = 文档顺序；
                 # 兜底 step_no 平局（N) 子步骤沿用主号、X.Y 步骤等）的展示顺序
@@ -812,7 +869,9 @@ def expand_step_context(
 
                 parent_id = meta_row["parent_chunk_id"]
                 hit_step_no = meta_row.get("step_no") or 0
-                siblings = siblings_by_parent.get(parent_id, [])
+                # H4 防御纵深：只展开与命中 step_card 同权限的兄弟（同家族本应一致）
+                siblings = [s for s in siblings_by_parent.get(parent_id, [])
+                            if _same_permission(s, chunk)]
 
                 # 按意图筛选
                 if intent == "full_procedure":
@@ -896,7 +955,9 @@ def expand_step_context(
                 original_score = chunk.get("score", 0)
                 parent_chunk_id = chunk.get("chunk_id") or chunk.get("id", "")
 
-                children = siblings_by_parent.get(parent_chunk_id, [])
+                # H4 防御纵深：只展开与命中 procedure_parent 同权限的子步骤
+                children = [s for s in siblings_by_parent.get(parent_chunk_id, [])
+                            if _same_permission(s, chunk)]
                 total_children = len(children)
 
                 if not children:
@@ -1011,7 +1072,7 @@ def cosurface_doc_images(
     query: str,
     chunks: List[Dict[str, Any]],
     *,
-    user_dept: Optional[str] = None,
+    user_dept: Union[str, List[str], None] = None,
     max_docs: int = 3,
     max_images: int = 3,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
@@ -1163,7 +1224,7 @@ def _multi_query_search(
     *,
     fetch_k: int,
     top_k: int,
-    user_dept: Optional[str],
+    user_dept: Union[str, List[str], None],
     rerank_enable: bool,
     multimodal: bool,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
@@ -1242,7 +1303,7 @@ def retrieve_and_enrich(
     query: str,
     *,
     top_k: Optional[int] = None,
-    user_dept: Optional[str] = None,
+    user_dept: Union[str, List[str], None] = None,
     stitch_window: int = 1,
     cosurface_images: bool = False,
 ) -> List[Dict[str, Any]]:

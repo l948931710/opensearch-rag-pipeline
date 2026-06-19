@@ -23,7 +23,7 @@ import re
 import threading
 import uuid
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import requests as http_requests
 from fastapi import APIRouter, Request, HTTPException
@@ -316,7 +316,7 @@ def _stream_answer_to_card(
     conversation_type: str,
     sender_staff_id: str,
     sender_nick: str,
-    user_dept: Optional[str],
+    user_dept: Union[str, List[str], None],
     t0: float,
     t_retrieval: float,
     retrieval_latency_ms: int,

@@ -3,15 +3,16 @@
 dingtalk_identity.py — 钉钉用户身份解析（OpenAPI 通讯录 / 免登）
 
 这是机器人与小程序**共用**的身份基础设施，与「机器人收发消息」解耦：
-  - _resolve_user_dept(staff_id)        : userid → 部门名称（RDS 缓存优先 + 钉钉 API 回退）
-  - _fetch_dingtalk_user_info(user_id)  : 钉钉 user/get → {user_name, dept_name}
+  - _resolve_user_dept(staff_id)        : userid → ACL 权限组列表（RDS 缓存优先 + 钉钉 API 回退）
+  - _fetch_dingtalk_user_info(user_id)  : 钉钉 user/get → {user_name, dept_name(全部门 CSV)}
   - _fetch_dept_name(token, dept_id)    : 部门 ID → 部门名称
   - _get_miniapp_access_token()         : 小程序应用 access_token（独立凭证，回退机器人应用）
   - _exchange_authcode_for_userid(code) : 小程序免登 authCode → userid（getuserinfo）
-  - _resolve_user_identity(userid)      : userid → {dept, name}（供 /api/auth/dingtalk 签发令牌）
+  - _resolve_user_identity(userid)      : userid → {dept:[组列表], name}（供 /api/auth/dingtalk 签发令牌）
 
 设计要点：
-  - 部门是**名称字符串**（如「行政部」），与 HA3 owner_dept 对齐 —— 不用 dept_id。
+  - **ACL 权限组**（H1）：一个钉钉叶子部门映射到一个或多个权限组（owner_dept 代码，如
+    marketing/production），用户可属多组；解析结果是组【列表】，与 HA3 owner_dept 对齐。
   - 模块级无钉钉依赖（access_token / DB 连接均惰性导入），避免循环引用。
   - 模拟模式（simulate_api）下不发真实请求，返回可配置的测试身份，便于离线联调。
 """
@@ -20,7 +21,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 
@@ -30,63 +31,100 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 钉钉部门名 → OSS/owner_dept 代码 映射
+# 钉钉部门名 → ACL 权限组 映射
 # ───────────────────────────────────────────────────────────────
-# 用户部门来自钉钉，是【中文部门名】（如「营销中心」）；而 chunk 的 owner_dept 来自
-# OSS 目录 raw/<dept>/...，是【英文代码】（如 marketing/hr）。HA3 权限过滤要求两边
-# 字符串完全相等，因此在解析用户部门时把中文名归一化为英文代码。
+# ⚠️ 语义（H1）：右侧是【ACL 权限组】代码，不是组织部门。一个钉钉【叶子部门】可映射到
+#    【多个】权限组（如 国际贸易部 → marketing + production）。chunk 的 owner_dept 来自
+#    OSS 目录 raw/<group>/...，HA3 权限过滤要求组代码完全相等，故解析用户部门时把中文名
+#    归一化为权限组代码【列表】。映射来源：用户提供的「权限单.xlsx」。
 #
-# ⚠️ 安全约定：未在表中的部门【原样返回】（落到 fail-closed）——匹配不到任何 chunk，
-#    用户只能看到 public 文档，绝不会误授予 dept_internal 访问。所以这张表可以先填高
-#    置信度的部分，歧义项留空由人工补；宁缺勿错。
-# ⚠️ 当前线上所有 chunk 均为 public，本表尚未产生任何实际授权效果（无 dept_internal 内容）。
+# ⚠️ 必须按【叶子部门(部门列)】键控，不能按中心：综合管理中心下 行政部→admin、
+#    人力资源部→hr 不同；财务中心下 财务部→finance、自动化信息部→it 不同。跨多组的
+#    中心名（如 财务中心/营销中心整体）【不要】映射，留作 fail-closed，避免越权。
 #
-# 待业务确认的歧义项（暂不映射，留作 fail-closed）：
-#   办公室 / 综合管理中心 → admin?      电子商务部 → marketing? it? 独立?
-#   杭州分公司 → （无对应 OSS 目录）
-# OSS 中已有但暂无对应钉钉部门的代码：it / finance / quality / rd / supply / production_*
-_DEPT_NAME_TO_CODE = {
-    # 高置信度（中英一一对应、无歧义）
-    "营销中心": "marketing",
-    "人力资源部": "hr",
-    "PMC部": "pmc",
-    "生产中心": "production",
+# ⚠️ 安全约定：未命中的名字透传后会被 _VALID_ACL_GROUPS 白名单丢弃（fail-closed）——
+#    匹配不到任何 chunk，仅 public 可见，绝不误授予 dept_internal。宁缺勿错。
+#
+# 个人级覆盖（如 乐敏杰 人力资源部 但应属 admin）用 seeded user_role 行实现，
+# seeded 行优先于自动映射（见 _resolve_user_dept）。
+_DEPT_NAME_TO_GROUPS = {
+    # —— 叶子部门（权限单口径，主） ——
+    "财务部": ["finance"],
+    "自动化信息部": ["it"],
+    "国际贸易部": ["marketing", "production"],
+    "国内营销部": ["marketing", "production"],
+    "电子商务部": ["marketing", "production"],
+    "计划部": ["marketing", "pmc"],
+    "行政部": ["admin"],
+    "人力资源部": ["hr"],
+    "生产部": ["production"],
+    "海外中心": ["production"],
+    "研发部": ["rd"],
+    "实验室": ["rd"],
+    "技术部": ["quality"],
+    "品质部": ["quality"],
+    "资材部": ["supply", "pmc"],
+    # —— 中心级名（历史/兜底；待真钉钉账号确认 _fetch_dept_name 返回叶子还是中心。
+    #    仅保留【单组无歧义】的中心名，多组中心名不放以免越权） ——
+    "营销中心": ["marketing"],
+    "生产中心": ["production"],
+    "PMC部": ["pmc"],
 }
 
 
-def _normalize_dept_to_code(raw: Optional[str]) -> Optional[str]:
-    """把钉钉中文部门名归一化为 owner_dept 英文代码。
+def _normalize_dept_to_codes(raw: Union[str, List[str], None]) -> List[str]:
+    """把钉钉中文部门名 / 代码 / CSV / 列表 归一化为 ACL 权限组代码【列表】。
 
-    - 已是英文代码（marketing 等）→ 原样返回（映射表里查不到即透传，幂等）。
-    - 已知中文名 → 对应英文代码。
-    - 未知部门 → 原样返回（fail-closed：匹配不到 chunk，仅 public 可见）。
+    - 已知中文叶子部门名 → 对应权限组列表（一名可映射多组）。
+    - 已是组代码 / CSV / 列表 → 拆分后逐项透传。
+    - 最终统一过 retriever._VALID_ACL_GROUPS 白名单 + 去重（H2 防御纵深）。
+    - 未知 / 空 / 全非法 → []（fail-closed：匹配不到 chunk，仅 public 可见）。
     """
     if not raw:
-        return raw
-    return _DEPT_NAME_TO_CODE.get(raw.strip(), raw)
+        return []
+    items = raw.split(",") if isinstance(raw, str) else raw
+    # 白名单：检索安全边界的同一份合法组集合（惰性 import 避免任何 import 环）
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        key = (item or "").strip() if isinstance(item, str) else str(item).strip()
+        if not key:
+            continue
+        mapped = _DEPT_NAME_TO_GROUPS.get(key, [key])  # 已知名→组列表；否则透传（待白名单裁决）
+        for code in mapped:
+            code = code.strip()
+            if code and code in _VALID_ACL_GROUPS and code not in seen:
+                seen.add(code)
+                out.append(code)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
 # 用户部门解析（机器人 + 小程序共用）
 # ═══════════════════════════════════════════════════════════════
 
-def _resolve_user_dept(staff_id: str) -> Optional[str]:
-    """
-    从 RDS user_role 表查询用户所属部门。
-    如果 user_role 中不存在，自动通过钉钉 API 获取并缓存。
+def _resolve_user_dept(staff_id: str) -> List[str]:
+    """从 RDS user_role 表查询用户所属 ACL 权限组【列表】。
 
-    查询失败或用户不存在时返回 None，调用方会降级为只返回 public 文档。
+    user_role 中不存在时，自动通过钉钉 API 获取（遍历完整 dept_id_list）并缓存。
+    查询失败或用户不存在时返回 []，调用方据此降级为只返回 public 文档（fail-closed）。
+
+    ⚠️ seeded 行优先（H3）：本函数先 SELECT 缓存，命中即返回；【只有】缓存为空才调
+    API 并 INSERT。因此人工 seeded 的 user_role 行（如个人级覆盖 乐敏杰→admin）会被
+    SELECT 命中并返回，API 分支根本不触发，绝不会被自动部门映射覆盖。
     """
     if not staff_id or staff_id.startswith("$:"):
-        return None
+        return []
 
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
 
         conn = _get_db_conn()
         try:
-            # 1. 先查本地缓存（按最新行取值：历史上 user_id 无唯一键可能产生重复行，
-            #    见 schema/003_user_role_unique.sql；显式排序保证确定性）
+            # 1. 先查本地缓存（seeded 行在此命中并优先；按最新行取值，user_id 唯一键见
+            #    schema/003_user_role_unique.sql；显式排序保证确定性）
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT dept_code FROM fuling_knowledge.user_role "
@@ -96,19 +134,19 @@ def _resolve_user_dept(staff_id: str) -> Optional[str]:
                 )
                 row = cur.fetchone()
                 if row and row[0]:
-                    # 缓存里存的可能是中文名（历史/钉钉直采）；归一化为英文代码再返回，
-                    # 以与 chunk.owner_dept 对齐。未知部门透传 = fail-closed（仅 public）。
-                    code = _normalize_dept_to_code(row[0])
-                    logger.info("用户部门解析成功（缓存）: staff_id=%s → dept=%s（code=%s）",
-                                staff_id, row[0], code)
-                    return code
+                    # 缓存里存的可能是中文名(CSV) 或组代码(CSV)；归一化为组列表再返回。
+                    # 未知项经白名单丢弃 = fail-closed（仅 public）。
+                    codes = _normalize_dept_to_codes(row[0])
+                    logger.info("用户权限组解析成功（缓存）: staff_id=%s → raw=%s（groups=%s）",
+                                staff_id, row[0], codes)
+                    return codes
 
-            # 2. 本地没有，调钉钉 API 获取
+            # 2. 本地没有，调钉钉 API 获取（dept_name 为该用户所有部门名的 CSV）
             user_info = _fetch_dingtalk_user_info(staff_id)
             if user_info:
                 dept_name = user_info.get("dept_name", "")
                 user_name = user_info.get("user_name", "")
-                # 3. 缓存到 user_role 表
+                # 3. 缓存到 user_role 表（仅 cache-miss 分支，不会覆盖 seeded 行）
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -126,24 +164,27 @@ def _resolve_user_dept(staff_id: str) -> Optional[str]:
                     logger.info("用户信息已缓存: staff_id=%s, name=%s, dept=%s", staff_id, user_name, dept_name)
                 except Exception as cache_err:
                     logger.warning("缓存用户信息失败: %s", cache_err)
-                # 缓存原始中文名（便于在 DMS/钉钉侧对照），返回时归一化为英文代码
-                return _normalize_dept_to_code(dept_name) or None
+                # 缓存原始中文名（便于在 DMS/钉钉侧对照），返回时归一化为组列表
+                return _normalize_dept_to_codes(dept_name)
             else:
                 logger.warning("用户未在 user_role 表中注册且 API 查询失败: staff_id=%s", staff_id)
-                return None
+                return []
         finally:
             conn.close()
     except Exception as e:
         logger.warning("查询用户部门失败 staff_id=%s: %s", staff_id, e)
-        return None
+        return []
 
 
 def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
     """
     通过钉钉 API 获取用户信息（姓名、部门等）。
 
+    dept_name 是该用户【所有】所属部门名的 CSV（遍历完整 dept_id_list，H3），
+    以便多部门用户拿到全部权限组（如 国际贸易部 → marketing+production）。
+
     Returns:
-        {"user_name": "张三", "dept_name": "行政部"} 或 None
+        {"user_name": "张三", "dept_name": "国际贸易部,行政部"} 或 None
     """
     from opensearch_pipeline.dingtalk_card import _get_access_token
 
@@ -163,11 +204,16 @@ def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
             if data.get("errcode") == 0:
                 result = data.get("result", {})
                 user_name = result.get("name", "")
-                dept_name = ""
-                # 获取部门 ID 列表，取第一个部门名称
+                # 遍历完整 dept_id_list（H3），收集全部部门名 → CSV，支持多部门用户
                 dept_id_list = result.get("dept_id_list", [])
-                if dept_id_list:
-                    dept_name = _fetch_dept_name(token, dept_id_list[0])
+                dept_names = []
+                seen_names = set()
+                for did in dept_id_list:
+                    nm = _fetch_dept_name(token, did)
+                    if nm and nm not in seen_names:
+                        seen_names.add(nm)
+                        dept_names.append(nm)
+                dept_name = ",".join(dept_names)
                 return {"user_name": user_name, "dept_name": dept_name}
             logger.warning("用户查询业务失败: errcode=%s errmsg=%s", data.get("errcode"), data.get("errmsg"))
             return None
@@ -277,27 +323,27 @@ def _exchange_authcode_for_userid(code: str) -> Optional[str]:
     return None
 
 
-def _resolve_user_identity(userid: str) -> Dict[str, Optional[str]]:
-    """解析用户身份：返回 {"dept": <部门名称>, "name": <显示名>}。
+def _resolve_user_identity(userid: str) -> Dict[str, Any]:
+    """解析用户身份：返回 {"dept": <ACL 权限组列表>, "name": <显示名>}。
 
-    复用 _resolve_user_dept 的「RDS 缓存优先 + 钉钉 API 回退」逻辑获取部门名称（与 HA3
-    owner_dept 对齐的名称字符串，不是 dept_id）；显示名从 user_role 缓存中取。
-    模拟模式下从 RAG_SIM_USER_DEPT 取部门，便于离线联调权限过滤。
+    "dept" 键承载的是 ACL 权限组【列表】（如 ["marketing","production"]），供
+    /api/auth/dingtalk 写入令牌的 acl_groups。复用 _resolve_user_dept 的「RDS 缓存优先 +
+    钉钉 API 回退」逻辑；显示名从 user_role 缓存中取。
+    模拟模式下从 RAG_SIM_USER_DEPT（可填中文名 / 组代码 / CSV）取，便于离线联调权限过滤。
     """
     if not userid:
-        return {"dept": None, "name": ""}
+        return {"dept": [], "name": ""}
 
     try:
         if get_config().simulate_api:
-            # 归一化，使离线联调与线上一致（RAG_SIM_USER_DEPT 可填中文名或英文代码）
             return {
-                "dept": _normalize_dept_to_code(os.environ.get("RAG_SIM_USER_DEPT")) or None,
+                "dept": _normalize_dept_to_codes(os.environ.get("RAG_SIM_USER_DEPT")),
                 "name": userid,
             }
     except Exception:
         pass
 
-    dept = _resolve_user_dept(userid)  # 已归一化为 owner_dept 英文代码（含缓存 + API 回退）
+    dept = _resolve_user_dept(userid)  # ACL 权限组列表（含缓存 + API 回退）
     name = ""
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
