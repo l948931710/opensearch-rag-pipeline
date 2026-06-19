@@ -2631,5 +2631,44 @@
   ],
   "live_scorable": true,
   "note": "metadata：模板修改人/日期为空，正文未载"
+ },
+ {
+  "qid": "S5-img-straw-heattest",
+  "source": "pdf",
+  "module": "rag_retrieval",
+  "dept": null,
+  "query": "做纸吸管耐热测试时，怎么确认测试机的温度已经到达预设温度？",
+  "kind": "positive",
+  "expected_docs": [
+   "吸管-纸吸管耐热测试作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_PRODUCTION_20260513120637_D78040"
+  ],
+  "resolution": [
+   {
+    "expected": "吸管-纸吸管耐热测试作业指导书",
+    "title": "FL-XG-WI-008《吸管-纸吸管耐热测试》作业指导书-检验员.pdf",
+    "doc_id": "DOC_PRODUCTION_20260513120637_D78040",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "production"
+   }
+  ],
+  "answer_points": "查看测试机器控制面板，确认温度到达预设温度（测试温度 60±1 度）",
+  "pass_criteria": "Top5召回目标文档 + 答案在温控面板步骤后插入对应 <<IMG:N>> 标记",
+  "keyword_gt": [
+   "预设温度"
+  ],
+  "difficulty": null,
+  "expect_images": true,
+  "expected_images": [
+   "测试机温控设备控制面板照片，红色LED显示PV/SV实际温度值（约60℃），用于确认是否到达预设测试温度60±1度"
+  ],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true,
+  "note": "image-augmented serving case (image EXPECTED, not strictly text-insufficient): the temperature-controller panel photo is genuine step evidence / visual localization for reading the test-machine temperature. Verified live (prod_ro, rerank ON, 2 runs): retrieval top-3 = this doc; the answer stably emits a single <<IMG:N>> that resolves UNIQUELY to the panel chunk (marker_validity 1.0, dangling False). Expected image anchored by doc/step/visual content, not by runtime marker index."
  }
 ]

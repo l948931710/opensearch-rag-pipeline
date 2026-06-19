@@ -57,8 +57,15 @@ fingerprint changes → refreeze any baseline).
   "live_scorable": true
 }
 ```
-**Image case**: set `"expect_images": true` + `"expected_images": ["蓝色箱内透明杯浸水", ...]` (caption
-gists). Aim for ≥5 across docx/pdf/xlsx.
+**Image case** (`expect_images: true`) = **image EXPECTED / image-augmented**, NOT "strictly
+image-required / text-insufficient". The bar: the bound image is genuine step evidence or visual
+localization the answer should surface via `<<IMG:N>>` — it does **not** require the question to be
+unanswerable from text alone. (Prod SOP chunks inline the image's OCR/description into the chunk text,
+so a strictly text-insufficient image case essentially does not exist in this corpus; all current
+image cases — 验厂/派车/奶茶杯/吸管耐热测试 — are image-augmented.) The L4-srv gate measures **marker
+hygiene** (valid in-range `<<IMG:N>>` + no dangling reference), not image necessity. Set
+`"expected_images": ["蓝色箱内透明杯浸水", ...]` (caption gists — anchor the expected image by
+document/step/visual content, never by the runtime marker index). Aim for ≥5 across docx/pdf/xlsx.
 
 ## Schema — NEGATIVE
 ```jsonc
