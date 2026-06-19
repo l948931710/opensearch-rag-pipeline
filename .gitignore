@@ -57,10 +57,17 @@ eval_harness/**/__pycache__/
 # Claude Code 项目本地指令 (含 RDS 端点等内部细节,不入远程)
 CLAUDE.md
 
-# Ad-hoc PDF viewer / extractor 残留图片 (仓库根目录)
+# 提取器残留图片 (仓库根目录) — 兜底。根因已修:unified_extractor 未传 _tmp_dir 时
+# 现回退到系统临时目录而非 ""(=cwd)。此规则覆盖 pdf/docx/xlsx/pptx 全格式导出命名。
 /pdf_*_img*.jpeg
 /pdf_*_img*.jpg
 /pdf_*_img*.png
+/*_p[0-9]*_img*.jpeg
+/*_p[0-9]*_img*.png
+/*_sheet[0-9]*_img*.jpeg
+/*_sheet[0-9]*_img*.png
+/*_slide[0-9]*_img*.jpeg
+/*_slide[0-9]*_img*.png
 
 # Claude Code 本地工作区 (skills/launch.json 等,不入远程)
 .claude/
