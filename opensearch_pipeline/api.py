@@ -15,7 +15,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
@@ -241,7 +241,8 @@ class DingtalkAuthResponse(BaseModel):
     token: str = Field(..., description="服务端签发的会话令牌，后续请求放入 Authorization: Bearer")
     user_id: str
     display_name: str = ""
-    dept: Optional[str] = None
+    acl_groups: List[str] = Field(default_factory=list, description="用户所属 ACL 权限组（权威）")
+    dept: Optional[str] = None  # 旧·兼容：acl_groups 的 CSV
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -260,14 +261,16 @@ _append_to_history = append_to_history
 @dataclass
 class Identity:
     user_id: str
-    dept: Optional[str] = None
+    acl_groups: List[str] = field(default_factory=list)  # 权威：ACL 权限组列表
+    dept: Optional[str] = None  # 旧·兼容：CSV（acl_groups 的逗号拼接）
     name: str = ""
 
 
 def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Identity]:
     """从 Authorization: Bearer <token> 解析已验证身份；无/无效令牌返回 None。
 
-    部门来自服务端签发的令牌，客户端不可篡改；端点据此解析部门，绝不信任请求体里的部门字段。
+    ACL 权限组来自服务端签发的令牌，客户端不可篡改；端点据此解析权限，绝不信任请求体。
+    优先读新令牌的 acl_groups（数组）；旧令牌只有 dept（CSV/标量）则拆分兼容。
     """
     if not authorization:
         return None
@@ -277,9 +280,18 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
     payload = verify_session_token(parts[1].strip())
     if not payload:
         return None
+    raw_groups = payload.get("acl_groups")
+    legacy_dept = payload.get("dept") or None
+    if isinstance(raw_groups, list):
+        groups = [str(g).strip() for g in raw_groups if str(g).strip()]
+    elif legacy_dept:  # 旧令牌：dept 为 CSV 或标量
+        groups = [s.strip() for s in str(legacy_dept).split(",") if s.strip()]
+    else:
+        groups = []
     return Identity(
         user_id=payload.get("uid", ""),
-        dept=(payload.get("dept") or None),
+        acl_groups=groups,
+        dept=legacy_dept,
         name=payload.get("name", ""),
     )
 
@@ -396,12 +408,14 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
     if not userid:
         raise HTTPException(status_code=401, detail="免登失败：authCode 无效或已过期")
     ident = _resolve_user_identity(userid)
-    token = issue_session_token(userid, dept=ident.get("dept"), name=ident.get("name"))
+    groups = ident.get("dept") or []  # _resolve_user_identity 现返回 ACL 组列表
+    token = issue_session_token(userid, dept=groups, name=ident.get("name"))
     return DingtalkAuthResponse(
         token=token,
         user_id=userid,
         display_name=ident.get("name") or "",
-        dept=ident.get("dept"),
+        acl_groups=groups,
+        dept=",".join(groups) if isinstance(groups, list) else (groups or None),
     )
 
 
@@ -415,7 +429,7 @@ def search(req: SearchRequest, request: Request,
     try:
         # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
         # 请求体里的身份字段绝不能反查部门授予 dept_internal 权限。
-        user_dept = identity.dept if identity else None
+        user_dept = identity.acl_groups if identity else None
         results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
@@ -454,7 +468,7 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_i
     uid = identity.user_id if identity else (req.user_id or "")
     # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
     # 请求体里的 user_id 只用于日志归因，绝不能反查部门授予 dept_internal 权限。
-    user_dept = identity.dept if identity else None
+    user_dept = identity.acl_groups if identity else None
 
     # 2. 检索
     try:
