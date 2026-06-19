@@ -2,6 +2,18 @@
  "frozen_at": "20260618_144036",
  "run_id": "eval_baseline2",
  "delta": 0.03,
+ "partial_refresh": {
+  "20260619": {
+   "metric": "l4ing.jaccard.xlsx",
+   "from": 1.0,
+   "to": 0.891665,
+   "main_repo_commit": "c6017bf",
+   "data_repo_gt_commit": "8c3101b",
+   "xlsx_strong_ref_denominator": 20,
+   "regime_note": "fusion=weighted, rerank=ON, PDF override default OFF; eval_set_sha unchanged (a8ae8c78829bbb0e — golden_50.json, separate from the binding GT)",
+   "reason": "Previous 1.0 was frozen against the pre-session GT that EXCLUDED degraded XLSX cases; it is not comparable to the current verified GT (data-repo 8c3101b), which un-degrades xlsx_inspect/xlsx_clean. 0.891665 is the honest measurement on the verified GT with the identity-aware equipment-cleaning binding fix (denominator = 20 strong refs). img_dup_p95 stays 1.0 (no refresh) because the img_dup_factor full-identity fix (merge b3dcb84) removed the clustered-anchor false-positive. All OTHER metrics remain frozen at code 8ffeb73."
+  }
+ },
  "regime": {
   "eval_set_sha": "a8ae8c78829bbb0e",
   "fusion": "weighted",
@@ -61,7 +73,7 @@
   "l3.source_leak_rate": 0.0,
   "l3.mean_keyword_coverage": 0.8106,
   "l4ing.jaccard.pdf": 0.8555566666666666,
-  "l4ing.jaccard.xlsx": 1.0,
+  "l4ing.jaccard.xlsx": 0.891665,
   "l4ing.jaccard.docx": 0.9898,
   "l4ing.img_dup_p95": 1.0,
   "l4srv.marker_validity": 1.0,
