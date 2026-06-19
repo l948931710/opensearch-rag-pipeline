@@ -23,6 +23,7 @@ from typing import Any, Dict, List
 
 from opensearch_pipeline.chunker import Chunk, DocumentChunker
 from opensearch_pipeline.config import get_config
+from opensearch_pipeline.image_binding_reconcile import reconcile_move
 
 # ─── 复用现有模块的敏感检测逻辑 ────────────────────────────────
 
@@ -2656,15 +2657,28 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                     and best_alt_score >= 10
                                     and best_alt_score
                                     >= max(geo_score, 1) * 3.0):
-                                best_idx = best_alt_idx
-                                # Path D seed mark (D8 Tier 0 post-review):
-                                # 仅 strong override(alt ≥ 15 AND ratio ≥ 5.0)
-                                # 才作 cluster propagation seed,避免边缘 trigger
-                                # 把噪声传给邻居
-                                if (best_alt_score >= 15
-                                        and best_alt_score
-                                        >= max(geo_score, 1) * 5.0):
-                                    va['_path_a_strong'] = True
+                                # ── reconciliation guard (post-binding ownership check) ──
+                                # Only apply if the destination owns the image more strongly than
+                                # the geometric source. Blocks the range-theft misfire (22767C);
+                                # keeps valid corrections (5FFA22/328126). See image_binding_reconcile.
+                                _alt_blk = blocks[best_alt_idx]
+                                _alt_txt = ((_alt_blk.get("text", "") if isinstance(_alt_blk, dict)
+                                             else getattr(_alt_blk, "text", "")) or "")
+                                _rec = reconcile_move(geo_txt, _alt_txt, va.get("ocr_text"),
+                                                      va.get("visual_summary"))
+                                print(f"[img-reconcile] path=A img={va.get('image_index')} "
+                                      f"result={_rec['result']} reason={_rec['reason_code']} "
+                                      f"src_tier={_rec['src_tier']} dst_tier={_rec['dst_tier']}")
+                                if _rec.get("apply"):
+                                    best_idx = best_alt_idx
+                                    # Path D seed mark (D8 Tier 0 post-review):
+                                    # 仅 strong override(alt ≥ 15 AND ratio ≥ 5.0)
+                                    # 才作 cluster propagation seed,避免边缘 trigger
+                                    # 把噪声传给邻居
+                                    if (best_alt_score >= 15
+                                            and best_alt_score
+                                            >= max(geo_score, 1) * 5.0):
+                                        va['_path_a_strong'] = True
                 # ── Path B: 圈号 sub-step override（D8 Phase 6,同 env-gate）──
                 # image OCR 含的圈号集 vs 同页 step block 圈号集 Jaccard。
                 # 适合"填写示例图 vs 填写指示文本"匹配:image OCR 含的 ①②③ 是
@@ -2716,8 +2730,17 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                         if (best_cir_idx != best_idx
                                 and best_cir_jacc >= 0.5
                                 and best_cir_jacc >= max(geo_jacc, 0.01) * 1.5):
-                            best_idx = best_cir_idx
-                            va['_path_b_overridden'] = True
+                            _cir_blk = blocks[best_cir_idx]
+                            _cir_txt = ((_cir_blk.get("text", "") if isinstance(_cir_blk, dict)
+                                         else getattr(_cir_blk, "text", "")) or "")
+                            _rec = reconcile_move(geo_txt, _cir_txt, va.get("ocr_text"),
+                                                  va.get("visual_summary"))
+                            print(f"[img-reconcile] path=B img={va.get('image_index')} "
+                                  f"result={_rec['result']} reason={_rec['reason_code']} "
+                                  f"src_tier={_rec['src_tier']} dst_tier={_rec['dst_tier']}")
+                            if _rec.get("apply"):
+                                best_idx = best_cir_idx
+                                va['_path_b_overridden'] = True
                 # ── Path C: 跨页 range-ref override（D8 Phase 10,同 env-gate）──
                 # step text 含"X-Y步操作"圈号范围引用(如 step 3.1 "扫码报检
                 # 界面(如下图②-⑥步操作)") 时,把该 step 范围内的 image 跨页
@@ -2801,8 +2824,20 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                                     best_range_idx = ci
                                     break  # 同 block 只算一个 range-ref
                         if best_range_idx is not None:
-                            best_idx = best_range_idx
-                            va['_path_c_overridden'] = True
+                            _geo_blk = blocks[best_idx]
+                            _geo_txt = ((_geo_blk.get("text", "") if isinstance(_geo_blk, dict)
+                                         else getattr(_geo_blk, "text", "")) or "")
+                            _rng_blk = blocks[best_range_idx]
+                            _rng_txt = ((_rng_blk.get("text", "") if isinstance(_rng_blk, dict)
+                                         else getattr(_rng_blk, "text", "")) or "")
+                            _rec = reconcile_move(_geo_txt, _rng_txt, va.get("ocr_text"),
+                                                  va.get("visual_summary"))
+                            print(f"[img-reconcile] path=C img={va.get('image_index')} "
+                                  f"result={_rec['result']} reason={_rec['reason_code']} "
+                                  f"src_tier={_rec['src_tier']} dst_tier={_rec['dst_tier']}")
+                            if _rec.get("apply"):
+                                best_idx = best_range_idx
+                                va['_path_c_overridden'] = True
                 # Path D pre-pass: 暂存 best_idx 到 va metadata,延迟 img_block
                 # 构造到 second pass(Path D 可能改写 best_idx)
                 va['_d8_best_idx'] = best_idx
