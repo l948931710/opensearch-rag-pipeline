@@ -300,6 +300,42 @@ def _blk_get(b, name, default=None):
     return default if v is None else v
 
 
+# ── P3: monolithic "prose table" detection/flatten ──────────────────────────
+# Some 制度/控制程序/规程 docx lay out the WHOLE sectioned SOP inside one table; the
+# docx extractor then emits a single block_type="table". Such a block becomes one
+# oversized table_chunk that validation drops → "No valid chunks generated" (0 chunks).
+# Fix: detect these "prose tables" and reclassify table→paragraph (strip ' | ' cell
+# delimiters, break top-level clauses to lines) so the clause/step/text path chunks them.
+# Conservative: real DATA tables (short cells, no clause markers) and blank forms
+# (<500 chars) are NOT matched — verified against real data tables + FL-QR blank forms.
+_PROSE_CLAUSE = re.compile(r'(?:(?<=\s)|^)\d{1,2}[、.][一-龥]')   # 1、目的 / 4.术语
+_PROSE_SUBCLAUSE = re.compile(r'\d{1,2}\.\d{1,2}')               # 5.1 5.2
+
+
+def _is_prose_table(text: str) -> bool:
+    if not text:
+        return False
+    clean = text.strip()
+    if len(re.sub(r'\s', '', clean)) < 500:        # blank/short forms → stay EMPTY
+        return False
+    cm = len(_PROSE_CLAUSE.findall(clean)) + len(_PROSE_SUBCLAUSE.findall(clean))
+    if cm < 3:                                      # data tables: few/no clause markers
+        return False
+    segs = [s for s in re.split(r'\s*\|\s*', clean) if s.strip()]
+    if not segs:
+        return False
+    avg = sum(len(s) for s in segs) / len(segs)
+    return avg >= 18                                # prose runs long; grid cells short
+
+
+def _flatten_prose_table_text(text: str) -> str:
+    """Strip ' | ' cell delimiters; put each top-level clause on its own line."""
+    t = re.sub(r'\s*\|\s*', ' ', text).strip()
+    t = re.sub(r'[ \t]{2,}', ' ', t)
+    t = _PROSE_CLAUSE.sub(lambda m: '\n' + m.group(0).lstrip(), t)
+    return t.strip()
+
+
 class DocumentChunker:
     """文档切分器。"""
 
@@ -1832,6 +1868,7 @@ class DocumentChunker:
             version_no: 版本号
             metadata: 继承到每个 chunk 的 metadata
         """
+        blocks = self._flatten_prose_tables(blocks)
         if self.split_mode == "faq":
             return self._chunk_faq(blocks, doc_id, version_no, metadata)
         if self.split_mode == "clause":
@@ -1845,6 +1882,34 @@ class DocumentChunker:
         if self.xlsx_layout_type == "product_spec_instruction":
             return self._chunk_product_spec(blocks, doc_id, version_no, metadata)
 
+        meta = metadata or {}  # noqa: F841 (default path below)
+        return self._chunk_default(blocks, doc_id, version_no, metadata)
+
+    def _flatten_prose_tables(self, blocks):
+        """P3: reclassify monolithic 'prose table' blocks (whole SOP trapped in one table)
+        to paragraph blocks so they chunk normally. No-op for data tables / blank forms /
+        non-table blocks. Handles dict- and ExtractedBlock-shaped blocks (see _blk_get)."""
+        if not blocks:
+            return blocks
+        out = []
+        for b in blocks:
+            bt = _blk_get(b, "block_type", "")
+            txt = _blk_get(b, "text", "")
+            if bt == "table" and _is_prose_table(txt):
+                out.append({
+                    "block_type": "paragraph",
+                    "text": _flatten_prose_table_text(txt),
+                    "page_num": _blk_get(b, "page_num", None),
+                    "section_path": _blk_get(b, "section_path", None),
+                    "source": _blk_get(b, "source", "native"),
+                    "extra": _blk_get(b, "extra", {}) or {},
+                    "_p3_flattened": True,
+                })
+            else:
+                out.append(b)
+        return out
+
+    def _chunk_default(self, blocks, doc_id, version_no, metadata=None):
         meta = metadata or {}
         chunks: List[Chunk] = []
         chunk_index = 0
