@@ -333,15 +333,44 @@ class ImageFunnelProcessor:
 
             use_compat = use_compat_mode(model_name, api_base_url)
             url = resolve_vlm_url(api_base_url, use_compat)
-            payload = build_image_chat_payload(model_name, prompt, b64_data, mime_type, use_compat,
-                                               temperature=0)  # DET: pin funnel routing/caption determinism
 
-            resp = requests.post(url, json=payload, headers=auth_headers(api_key), timeout=(10, 90))
-            if resp.status_code != 200:
-                label = "VLM (compat)" if use_compat else "Qwen-VL VLM"
-                raise RuntimeError(f"{label} HTTP {resp.status_code}: {resp.text[:400]}")
+            def _post_and_extract(payload_bytes, mime):
+                """POST one rendition → VLM content str; raises on non-200 (HTTP <code>)."""
+                _b64 = base64.b64encode(payload_bytes).decode("utf-8")
+                _payload = build_image_chat_payload(model_name, prompt, _b64, mime, use_compat,
+                                                    temperature=0)  # DET: pin routing/caption determinism
+                _resp = requests.post(url, json=_payload, headers=auth_headers(api_key), timeout=(10, 90))
+                if _resp.status_code != 200:
+                    _label = "VLM (compat)" if use_compat else "Qwen-VL VLM"
+                    raise RuntimeError(f"{_label} HTTP {_resp.status_code}: {_resp.text[:400]}")
+                return extract_vlm_text(_resp.json(), use_compat)
 
-            content = extract_vlm_text(resp.json(), use_compat)
+            if os.environ.get("RAG_VLM_COMPRESS_RETRY", "false").lower() == "true":
+                # Hardened path (gated): bounded compress-on-retry on transient upload
+                # failures (timeout/conn-abort/429/5xx) — shrink the image and retry,
+                # instead of the legacy single 500KB threshold. Default OFF = legacy.
+                from opensearch_pipeline.vlm_retry import call_with_compress_retry
+                with open(local_path, "rb") as _f:
+                    _orig = _f.read()
+                _ext = os.path.splitext(local_path)[1].lower()
+                _smime = "image/jpeg" if _ext in (".jpg", ".jpeg") else "image/png"
+                _r = call_with_compress_retry(_orig, _smime, _post_and_extract,
+                                              model_version=model_name)
+                if not _r["ok"]:
+                    raise RuntimeError(f"VLM failed after compress-retry: {_r['last_error']}")
+                if _r["retry_count"]:
+                    print(f"    [VLM] compress-retry recovered {filename} via {_r['transform_used']} "
+                          f"(retries={_r['retry_count']})")
+                content = _r["result"]
+            else:
+                # Legacy single-shot (unchanged default behavior).
+                payload = build_image_chat_payload(model_name, prompt, b64_data, mime_type, use_compat,
+                                                   temperature=0)  # DET: pin funnel routing/caption determinism
+                resp = requests.post(url, json=payload, headers=auth_headers(api_key), timeout=(10, 90))
+                if resp.status_code != 200:
+                    label = "VLM (compat)" if use_compat else "Qwen-VL VLM"
+                    raise RuntimeError(f"{label} HTTP {resp.status_code}: {resp.text[:400]}")
+                content = extract_vlm_text(resp.json(), use_compat)
 
             # ── 解析 JSON 结果 ──
             try:

@@ -59,19 +59,34 @@ def _classify_stale(ha3_map: dict, rds_active_ids: set, rds_active_chunkid: dict
 
 
 def _enumerate_ha3_pks(client, cfg, parse, output_fields, query_cls, id_hi: int,
-                       bucket: int = _ID_SCAN_BUCKET) -> dict:
-    """PK 区间确定性扫描 → {pk:int -> (chunk_id, doc_id)}。零向量 + 小区间 filter，桶内召回完整。"""
+                       bucket: int = _ID_SCAN_BUCKET, max_rounds: int = 3) -> dict:
+    """PK 区间扫描 → {pk:int -> (chunk_id, doc_id)}。零向量 + 小区间 filter。
+
+    ⚠️ G30: a single zero-vector scan is **non-deterministic / incomplete** — it can
+    return a different partial subset each call (and right after a realtime push it may
+    return nothing at all). So we **loop each bucket until stable**: re-scan and union
+    the ids until a round adds nothing new (or max_rounds). Unioning is safe because the
+    only consumer (reconcile) deletes PKs absent from chunk_meta(active) under G1/G3
+    guards — more-complete enumeration finds more true orphans, never an active id.
+
+    NOTE for *verification* (confirming a doc IS present), do NOT rely on this scan —
+    use ha3_verify.verify_chunks_present (per-chunk self-query), which is authoritative.
+    """
     out = {}
     start = 0
     while start < id_hi:
-        req = query_cls(table_name=cfg.table_name, vector=[0.0] * 1024, top_k=bucket + 100,
-                        include_vector=False, output_fields=output_fields,
-                        filter=f"id>={start} AND id<{start + bucket}")
-        for r in parse(client.query(req)):
-            try:
-                out[int(r.get("id"))] = (r.get("chunk_id", ""), r.get("doc_id", ""))
-            except (TypeError, ValueError):
-                pass
+        for _ in range(max(1, max_rounds)):
+            before = len(out)
+            req = query_cls(table_name=cfg.table_name, vector=[0.0] * 1024, top_k=bucket + 100,
+                            include_vector=False, output_fields=output_fields,
+                            filter=f"id>={start} AND id<{start + bucket}")
+            for r in parse(client.query(req)):
+                try:
+                    out[int(r.get("id"))] = (r.get("chunk_id", ""), r.get("doc_id", ""))
+                except (TypeError, ValueError):
+                    pass
+            if len(out) == before:   # this round surfaced nothing new → bucket stable
+                break
         start += bucket
     return out
 
