@@ -113,7 +113,7 @@ def test_unfrozen_rechunk_with_prior_chunks_blocks(mock_db, mock_llm):
 # ── 2. first ingest (no prior chunks) → passes, classifier runs (regression) ──
 @patch(LLM_PATH)
 @patch(DB_PATH)
-def test_first_ingest_passes(mock_db, mock_llm):
+def test_first_ingest_passes(mock_db, mock_llm, llm_key_present):
     mock_llm.return_value = _good_classification()
     factory, _ = _conn_factory(set())  # chunk_meta empty for this (doc_id, version_no)
     mock_db.side_effect = factory
@@ -127,7 +127,7 @@ def test_first_ingest_passes(mock_db, mock_llm):
 # ── 3. version bump → passes (predicate keys on exact (doc_id, version_no)) ───
 @patch(LLM_PATH)
 @patch(DB_PATH)
-def test_version_bump_passes(mock_db, mock_llm):
+def test_version_bump_passes(mock_db, mock_llm, llm_key_present):
     mock_llm.return_value = _good_classification()
     # v1 has chunks, but this run is v2 → the guard's SELECT for (d1, 2) returns nothing.
     factory, _ = _conn_factory({("d1", 1)})
@@ -155,7 +155,7 @@ def test_frozen_routing_bypasses_guard(mock_db, mock_llm):
 # ── 5a. doc-set-bound ack (correct) → passes, classifier runs ────────────────
 @patch(LLM_PATH)
 @patch(DB_PATH)
-def test_correct_docset_ack_allows_reclassify(mock_db, mock_llm):
+def test_correct_docset_ack_allows_reclassify(mock_db, mock_llm, llm_key_present):
     mock_llm.return_value = _good_classification()
     factory, _ = _conn_factory({("d1", 1)})
     mock_db.side_effect = factory
@@ -197,7 +197,7 @@ def test_wrong_docset_hash_blocks(mock_db, mock_llm):
 # ── 6. simulate_db=True → guard skipped, no DB connection opened ──────────────
 @patch(LLM_PATH)
 @patch(DB_PATH)
-def test_simulate_db_skips_guard(mock_db, mock_llm):
+def test_simulate_db_skips_guard(mock_db, mock_llm, llm_key_present):
     mock_llm.return_value = _good_classification()
     ctx = {"canonicals": [_doc("d1")], "simulate_db": True, "simulate_api": False}
     node_classify_and_risk_assess(ctx)

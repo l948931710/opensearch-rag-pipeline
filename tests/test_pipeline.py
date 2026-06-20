@@ -628,7 +628,7 @@ class TestDatabaseExceptionPropagation:
         # 验证文档因 fail-safe 被移除（_classify_single_doc returns False → failed_doc_ids → 过滤掉）
         assert len(ctx["canonicals"]) == 0, "Failed doc should be removed from canonicals after fail-safe"
 
-    def test_node_classify_document_low_confidence_raises_on_db_error(self, monkeypatch):
+    def test_node_classify_document_low_confidence_raises_on_db_error(self, monkeypatch, llm_key_present):
         import opensearch_pipeline.pipeline_nodes
         from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
         
@@ -676,7 +676,7 @@ class TestDatabaseExceptionPropagation:
         with pytest.raises(RuntimeError, match="Database write failure in node_classify_document \\(persist metadata\\): Mock RDS quarantine write failed"):
             node_classify_and_risk_assess(ctx)
 
-    def test_node_classify_document_high_confidence_raises_on_db_error(self, monkeypatch):
+    def test_node_classify_document_high_confidence_raises_on_db_error(self, monkeypatch, llm_key_present):
         import opensearch_pipeline.pipeline_nodes
         from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
         

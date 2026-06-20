@@ -74,3 +74,18 @@ def _refuse_prod_targets():
     except Exception:
         pass
     yield
+
+
+@pytest.fixture
+def llm_key_present(monkeypatch):
+    """让 config.llm.api_key 在测试内非空 → node_classify 走"已配置 key"分支（其 LLM 调用由各测试自行 mock）。
+
+    keyless CI 隔离：这些测试验证"key 已配置时分类正常进行"的路径，但缺 key 时 node 的 fail-safe
+    会在 mock 触达前短路（→ mock 未被调用）。本 fixture 在测试内注入 dummy key 建立正确前置条件：
+      - 不依赖开发机 .env；- 不发真实网络（run_gemini_classification 已被各测试 patch）；
+      - monkeypatch 测试结束自动还原 → 无环境泄漏、无顺序依赖。
+    非 autouse：仅显式声明该参数的测试启用。"""
+    from opensearch_pipeline.config import get_config
+
+    monkeypatch.setattr(get_config().llm, "api_key", "test-dummy-key", raising=False)
+    return "test-dummy-key"

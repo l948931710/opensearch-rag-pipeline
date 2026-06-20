@@ -41,7 +41,7 @@ def test_maintenance_missing_routing_fails_closed_no_write(mock_llm, mock_db):
 
 # (d) normal ingestion (no frozen_routing) still uses the LLM classifier
 @patch(LLM_PATH)
-def test_normal_ingestion_still_uses_classifier(mock_llm):
+def test_normal_ingestion_still_uses_classifier(mock_llm, llm_key_present):
     mock_llm.return_value = {"category_l1": "sop", "category_l2": "safety_sop", "faq_eligible": False,
                              "confidence": 0.9, "llm_risk_level": "low", "summary": "s"}
     docs = [_doc("d1")]
