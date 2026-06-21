@@ -667,7 +667,7 @@ class TestHA3FilterInjectionPrevention:
     def test_multi_dept_filter_expression(
         self, mock_client_fn, mock_config, mock_embedding
     ):
-        """多组用户（如 marketing+production）→ filter 用 OR-join 等值放行多个 owner_dept。"""
+        """多组用户（marketing+production）→ filter OR-join 等值；'production' 伞组展开为各子线 owner。"""
         mock_config.return_value = _make_config(hybrid_fusion="rrf")
         mock_embedding.return_value = ([0.1] * 1024, [1], [0.5])
 
@@ -675,15 +675,17 @@ class TestHA3FilterInjectionPrevention:
         client.search.return_value = _make_ha3_response()
         mock_client_fn.return_value = client
 
-        from opensearch_pipeline.retriever import search_chunks
+        from opensearch_pipeline.retriever import search_chunks, _expand_groups_to_owners
         search_chunks("产品报价流程", user_dept=["marketing", "production"])
 
         knn = _captured_knn_queries[0]
+        owners = " OR ".join('owner_dept="%s"' % o
+                             for o in _expand_groups_to_owners(["marketing", "production"]))
         assert knn.filter == (
             '(permission_level="public")'
-            ' OR (permission_level="dept_internal" AND ('
-            'owner_dept="marketing" OR owner_dept="production"))'
+            ' OR (permission_level="dept_internal" AND (' + owners + '))'
         ), f"实际 filter: {knn.filter}"
+        assert 'owner_dept="production_mold"' in knn.filter  # 伞组确实展开了子线
 
     @patch("opensearch_pipeline.retriever.get_query_embedding")
     @patch("opensearch_pipeline.retriever.get_config")
@@ -756,12 +758,17 @@ class TestSharedPermissionFilter:
             '(permission_level="public")'
             ' OR (permission_level="dept_internal" AND (owner_dept="marketing"))'
         )
+        # 'production' 现为伞组 → 展开为各 production* 子线 owner；marketing 仍精确匹配。
+        # 用 _expand_groups_to_owners 派生期望值，新增子线时测试自动跟随（单一来源）。
+        from opensearch_pipeline.retriever import _expand_groups_to_owners
+        _mp = " OR ".join('owner_dept="%s"' % o
+                          for o in _expand_groups_to_owners(["marketing", "production"]))
         assert _build_permission_filter(["marketing", "production"]) == (
             '(permission_level="public")'
-            ' OR (permission_level="dept_internal" AND ('
-            'owner_dept="marketing" OR owner_dept="production"))'
+            ' OR (permission_level="dept_internal" AND (' + _mp + '))'
         )
-        # CSV 字符串等价于列表
+        assert 'owner_dept="production_mold"' in _build_permission_filter(["production"])
+        # CSV 字符串等价于列表（伞组展开一致）
         assert _build_permission_filter("marketing,production") == _build_permission_filter(
             ["marketing", "production"])
 

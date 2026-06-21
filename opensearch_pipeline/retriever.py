@@ -235,6 +235,68 @@ _VALID_ACL_GROUPS = frozenset({
     "pmc", "admin", "hr", "rd", "quality", "supply",
 })
 
+# ── Owner taxonomy (resource-side) vs user-facing ACL groups ──────────────────
+# A chunk's owner_dept is the CONTENT owner and KEEPS subline granularity
+# (e.g. production_mold / production_paper_cup / production_thermoforming) — it is
+# never rewritten to the umbrella. _VALID_ACL_GROUPS above are the USER-facing
+# groups. The two are deliberately separate.
+#
+# 'production' is an UMBRELLA group: a user holding it may read dept_internal
+# content owned by 'production' OR any approved production subline. Every other
+# group maps to EXACTLY itself (exact-match, unchanged). The mapping is a
+# taxonomy-driven EXPLICIT allow-list (NOT an open startswith): a production-like
+# owner not listed here is NOT granted (fail-closed) and is surfaced by
+# audit_production_owner_taxonomy(). Add a new subline here (single source of truth).
+# Only APPROVED + real (live-in-data) owners. Unapproved production_* owners (incl.
+# the production_papercup double-spelling and not-yet-live production_injection) are
+# deliberately excluded → they fail closed and surface via audit_production_owner_taxonomy()
+# until explicitly approved + added here. Mirrors the live active-chunk owner set.
+_PRODUCTION_UMBRELLA_OWNERS = frozenset({
+    "production",                 # the umbrella owner itself (exact)
+    "production_mold",
+    "production_paper_cup",
+    "production_thermoforming",
+})
+# user-facing group -> owner_dept set it grants. Absent group => exact {group}.
+_DEPT_OWNER_EXPANSION = {
+    "production": _PRODUCTION_UMBRELLA_OWNERS,
+}
+
+
+def _expand_groups_to_owners(groups: List[str]) -> List[str]:
+    """Map normalized user ACL groups → the owner_dept values they may retrieve.
+
+    'production' umbrella expands to all approved production* sublines (the explicit
+    taxonomy allow-list); every other group maps to exactly itself (exact-match —
+    unchanged behavior for non-production depts). Returns a sorted, de-duped list.
+    Inputs are already sanitized + whitelisted by _normalize_acl_groups and outputs
+    are taxonomy constants, so the result is injection-safe.
+    """
+    owners = set()
+    for g in groups:
+        owners |= set(_DEPT_OWNER_EXPANSION.get(g, (g,)))
+    return sorted(owners)
+
+
+def audit_production_owner_taxonomy(active_owner_depts) -> List[str]:
+    """Surface production-like owner_dept values present in data but NOT in the umbrella
+    taxonomy. Such owners are invisible to 'production' users (fail-closed) until added
+    to _PRODUCTION_UMBRELLA_OWNERS — this never auto-includes them. Read-only; logs a
+    warning and returns the suspicious set (also catches malformed 'productionx' shapes).
+    """
+    known = _PRODUCTION_UMBRELLA_OWNERS
+    suspicious = sorted({
+        o for o in (active_owner_depts or [])
+        if o and o not in known and str(o).startswith("production")
+    })
+    if suspicious:
+        logger.warning(
+            "Unrecognized production-like owner_dept NOT in umbrella taxonomy "
+            "(fail-closed: invisible to 'production' users; add to _PRODUCTION_UMBRELLA_OWNERS "
+            "if legitimate): %s", suspicious,
+        )
+    return suspicious
+
 
 def _normalize_acl_groups(user_dept: Union[str, List[str], None]) -> List[str]:
     """把任意形态的部门/组入参归一为干净、去重、白名单内的 ACL 组列表（单一归一点）。
@@ -270,12 +332,14 @@ def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
     _normalize_acl_groups（净化 + 白名单 + 去重）后才进表达式；为空 → 仅 public（fail-closed）。
     所有调用点（search_chunks / cosurface_doc_images / 本地回退）共用，权限规则只有一处。
     完整括号包裹每个子句，避免 HA3 对 AND/OR 优先级的歧义。
+    'production' 伞组经 _expand_groups_to_owners 展开为各 production* 子线 owner（其余组精确匹配）。
     """
     groups = _normalize_acl_groups(user_dept)
     if not groups:
         return '(permission_level="public")'
-    # groups 已净化+白名单（仅字母），字符串拼接无注入风险
-    dept_clause = " OR ".join('owner_dept="' + g + '"' for g in groups)
+    # groups 已净化+白名单；owners 为 taxonomy 常量（伞组展开），字符串拼接无注入风险
+    owners = _expand_groups_to_owners(groups)
+    dept_clause = " OR ".join('owner_dept="' + o + '"' for o in owners)
     return (
         '(permission_level="public")'
         ' OR (permission_level="dept_internal" AND (' + dept_clause + '))'
@@ -310,7 +374,8 @@ def _search_chunks_opensearch(
     if groups:
         perm_should.append({"bool": {"must": [
             {"term": {"permission_level": "dept_internal"}},
-            {"terms": {"owner_dept": groups}},
+            # 'production' 伞组展开为各 production* 子线 owner（与 HA3 _build_permission_filter 同源）
+            {"terms": {"owner_dept": _expand_groups_to_owners(groups)}},
         ]}})
 
     fetch_k = max(top_k * 2, top_k + 5)

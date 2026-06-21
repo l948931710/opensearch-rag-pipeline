@@ -112,4 +112,8 @@ def test_opensearch_fallback_uses_terms(monkeypatch):
     dept_clauses = [c for c in perm_should if "bool" in c]
     assert dept_clauses, perm_should
     terms = [m for m in dept_clauses[0]["bool"]["must"] if "terms" in m]
-    assert terms and terms[0]["terms"]["owner_dept"] == ["marketing", "production"]
+    # 'production' 伞组展开为各 production* 子线 owner（与 HA3 _build_permission_filter 同源）；
+    # marketing 仍精确。期望值由 _expand_groups_to_owners 派生，新增子线时自动跟随。
+    assert terms and terms[0]["terms"]["owner_dept"] == \
+        retriever._expand_groups_to_owners(["marketing", "production"])
+    assert "production_mold" in terms[0]["terms"]["owner_dept"]
