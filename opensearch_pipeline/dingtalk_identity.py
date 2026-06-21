@@ -72,13 +72,123 @@ _DEPT_NAME_TO_GROUPS = {
 }
 
 
+# ───────────────────────────────────────────────────────────────
+# 生产中心子树 → 'production' 伞组（H4：subline 用户实际拿到 production）
+# ───────────────────────────────────────────────────────────────
+# 钉钉把一线员工挂在【叶子部门】上（如 模具A / 三车间A区机修），_fetch_dept_name 返回的就是
+# 这些叶子名，而非「生产中心」。所以仅映射中心/事业部名不够——大量真实产线用户会落到
+# fail-closed 仅 public。下面这张【显式白名单】枚举了「生产中心」(钉钉 dept_id 599318766)
+# 整棵子树的所有部门名（含事业部/车间/班组等中间与叶子节点），统一归一化为 'production'
+# 伞组——一个 production 用户经 retriever._PRODUCTION_UMBRELLA_OWNERS 可读 production 及各
+# production_* 子线内容（伞组是粗粒度的：生产中心全体员工共享 production dept_internal）。
+#
+# ⚠️ 排除 资材部：它结构上挂在生产中心下，但权限单口径属 [supply, pmc]——靠
+#    _normalize_dept_to_codes 的「_DEPT_NAME_TO_GROUPS 优先」裁决保证不被覆盖（已从本集合剔除，
+#    双保险）。品质/技术（品技中心）与研发（研发中心）是独立中心、不在本子树内，不受影响。
+# ⚠️ 这是 2026-06-21 对线上钉钉组织树的快照（85 个节点）。组织调整后会新增/改名叶子；
+#    未命中的新叶子 fail-closed（仅 public，安全的失败方向），由 audit 暴露后再回灌。
+#    刷新：python scripts/gen_production_dept_names.py（遍历子树重出本集合，粘回此处）。
+_PRODUCTION_WORKSHOP_DEPTS = frozenset({
+    "F区机修",
+    "G区机修",
+    "一、四车间办公室",
+    "一车间拉片",
+    "三车间A区机修",
+    "三车间B区机修",
+    "三车间E区机修",
+    "三车间办公室",
+    "三车间印刷机修",
+    "二车间C区机修",
+    "二车间D区机修",
+    "二车间办公室",
+    "包装车间—其他人员",
+    "包装车间—机修",
+    "包装车间—管理员",
+    "原辅料、五金仓库",
+    "吸塑一、四车间",
+    "吸塑一、四车间其他",
+    "吸塑一、四车间拉片",
+    "吸塑一、四车间料房",
+    "吸塑一、四车间机修",
+    "吸塑一、四车间班组长",
+    "吸塑三车间",
+    "吸塑三车间—其他人员",
+    "吸塑三车间成型机修",
+    "吸塑三车间拉片机修",
+    "吸塑三车间料房",
+    "吸塑三车间班组长",
+    "吸塑事业部",
+    "吸塑二车间",
+    "吸塑二车间其他",
+    "吸塑二车间拉片",
+    "吸塑二车间料房",
+    "吸塑二车间机修",
+    "吸塑二车间班组长",
+    "吸塑制程检",
+    "吸塑办公室",
+    "吸塑叉车",
+    "吸塑成品仓管",
+    "吸塑手包",
+    "吸管1车间仓管",
+    "吸管1车间叉车",
+    "吸管1车间料房",
+    "吸管1车间机修",
+    "吸管1车间班长",
+    "吸管2车间仓管",
+    "吸管2车间其他",
+    "吸管2车间料房",
+    "吸管2车间机修",
+    "吸管2车间班长",
+    "吸管事业部",
+    "吸管制程检",
+    "吹膜—仓管",
+    "吹膜—其他",
+    "吹膜—切袋",
+    "吹膜—吹膜机修",
+    "吹膜—机修",
+    "吹膜车间",
+    "四车间拉片",
+    "模具A",
+    "模具B",
+    "模具车间",
+    "注塑事业部",
+    "注塑制程检",
+    "注塑叉车",
+    "注塑成品仓管",
+    "注塑车间—其他人员",
+    "注塑车间—料房",
+    "注塑车间—机修",
+    "注塑车间—班组长",
+    "生产部",
+    "精益部",
+    "纸杯—其他",
+    "纸杯—办公室",
+    "纸杯—半成品仓管",
+    "纸杯—印刷",
+    "纸杯—成品仓管、叉车",
+    "纸杯—机修",
+    "纸杯—模切",
+    "纸杯—淋膜",
+    "纸杯—班组长",
+    "纸杯事业部",
+    "纸杯制程检",
+    "纸浆模塑事业部",
+    "纸箱车间",
+})
+
+
 def _normalize_dept_to_codes(raw: Union[str, List[str], None]) -> List[str]:
     """把钉钉中文部门名 / 代码 / CSV / 列表 归一化为 ACL 权限组代码【列表】。
 
     - 已知中文叶子部门名 → 对应权限组列表（一名可映射多组）。
+    - 生产中心子树叶子名（_PRODUCTION_WORKSHOP_DEPTS）→ ['production'] 伞组。
     - 已是组代码 / CSV / 列表 → 拆分后逐项透传。
     - 最终统一过 retriever._VALID_ACL_GROUPS 白名单 + 去重（H2 防御纵深）。
     - 未知 / 空 / 全非法 → []（fail-closed：匹配不到 chunk，仅 public 可见）。
+
+    匹配优先级：_DEPT_NAME_TO_GROUPS（精确映射，含 资材部→[supply,pmc] 的反例）优先于
+    _PRODUCTION_WORKSHOP_DEPTS（生产子树伞组），最后才透传——保证子树下的 资材部 不被
+    误归一化为 production。
     """
     if not raw:
         return []
@@ -92,7 +202,12 @@ def _normalize_dept_to_codes(raw: Union[str, List[str], None]) -> List[str]:
         key = (item or "").strip() if isinstance(item, str) else str(item).strip()
         if not key:
             continue
-        mapped = _DEPT_NAME_TO_GROUPS.get(key, [key])  # 已知名→组列表；否则透传（待白名单裁决）
+        if key in _DEPT_NAME_TO_GROUPS:          # 精确映射优先（资材部 等反例在此裁决）
+            mapped = _DEPT_NAME_TO_GROUPS[key]
+        elif key in _PRODUCTION_WORKSHOP_DEPTS:  # 生产中心子树 → production 伞组
+            mapped = ["production"]
+        else:
+            mapped = [key]                       # 透传（待白名单裁决：未知即 fail-closed）
         for code in mapped:
             code = code.strip()
             if code and code in _VALID_ACL_GROUPS and code not in seen:
