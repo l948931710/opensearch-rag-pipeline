@@ -258,19 +258,31 @@ _PRODUCTION_UMBRELLA_OWNERS = frozenset({
     "production_thermoforming",
 })
 # user-facing group -> owner_dept set it grants. Absent group => exact {group}.
+#
+# Production+Marketing shared-access policy (2026-06-21): production-family dept_internal
+# docs must be readable by BOTH the 'production' umbrella AND the 'marketing' group.
+# owner_dept stays the REAL subline (never normalized to production, never rewritten to
+# marketing, never duplicated). Access is granted SUBJECT-side: 'marketing' is expanded to
+# also cover the production-family owners. This expresses effective_access_groups=
+# ["production","marketing"] for production-family content under the existing owner_dept-
+# equality filter — valid because the policy is UNIFORM (every production-family doc shares
+# the same access set). It is asymmetric by design: marketing → can read production-family +
+# its own marketing; production → reads production-family only (NOT marketing docs), per 权限单.
+# (Per-document access variation would instead require a resource-side access_groups field.)
 _DEPT_OWNER_EXPANSION = {
     "production": _PRODUCTION_UMBRELLA_OWNERS,
+    "marketing": frozenset({"marketing"}) | _PRODUCTION_UMBRELLA_OWNERS,
 }
 
 
 def _expand_groups_to_owners(groups: List[str]) -> List[str]:
     """Map normalized user ACL groups → the owner_dept values they may retrieve.
 
-    'production' umbrella expands to all approved production* sublines (the explicit
-    taxonomy allow-list); every other group maps to exactly itself (exact-match —
-    unchanged behavior for non-production depts). Returns a sorted, de-duped list.
-    Inputs are already sanitized + whitelisted by _normalize_acl_groups and outputs
-    are taxonomy constants, so the result is injection-safe.
+    'production' umbrella expands to all approved production* sublines; 'marketing' expands
+    to itself + the production family (Production+Marketing shared-access policy). Every
+    OTHER group maps to exactly itself (exact-match — unchanged for non-production depts).
+    Returns a sorted, de-duped list. Inputs are already sanitized + whitelisted by
+    _normalize_acl_groups and outputs are taxonomy constants, so the result is injection-safe.
     """
     owners = set()
     for g in groups:

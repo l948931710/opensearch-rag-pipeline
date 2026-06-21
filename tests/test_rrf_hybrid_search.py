@@ -14,10 +14,8 @@ test_rrf_hybrid_search.py — RRF 与混合检索请求构造的单元测试
 
 import sys
 import types
-import json
 import pytest
-from unittest.mock import MagicMock, patch, ANY
-from dataclasses import dataclass
+from unittest.mock import MagicMock, patch
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -652,14 +650,18 @@ class TestHA3FilterInjectionPrevention:
         client.search.return_value = _make_ha3_response()
         mock_client_fn.return_value = client
 
-        from opensearch_pipeline.retriever import search_chunks
+        from opensearch_pipeline.retriever import search_chunks, _expand_groups_to_owners
         search_chunks("产品报价流程", user_dept="marketing")
 
         knn = _captured_knn_queries[0]
+        owners = " OR ".join('owner_dept="%s"' % o for o in _expand_groups_to_owners(["marketing"]))
         assert knn.filter == (
             '(permission_level="public")'
-            ' OR (permission_level="dept_internal" AND (owner_dept="marketing"))'
+            ' OR (permission_level="dept_internal" AND (' + owners + '))'
         ), f"实际 filter: {knn.filter}"
+        # marketing 现含 production-family（共享访问策略），且自身 owner 仍在
+        assert 'owner_dept="marketing"' in knn.filter
+        assert 'owner_dept="production_mold"' in knn.filter
 
     @patch("opensearch_pipeline.retriever.get_query_embedding")
     @patch("opensearch_pipeline.retriever.get_config")
@@ -753,21 +755,19 @@ class TestSharedPermissionFilter:
         assert _build_permission_filter([""]) == '(permission_level="public")'
         assert _build_permission_filter("营销中心") == '(permission_level="public")'  # 中文名非组代码→丢弃
         assert _build_permission_filter("production_injection") == '(permission_level="public")'  # 非白名单
-        # 合法组代码（单 / 多）
-        assert _build_permission_filter("marketing") == (
-            '(permission_level="public")'
-            ' OR (permission_level="dept_internal" AND (owner_dept="marketing"))'
-        )
-        # 'production' 现为伞组 → 展开为各 production* 子线 owner；marketing 仍精确匹配。
-        # 用 _expand_groups_to_owners 派生期望值，新增子线时测试自动跟随（单一来源）。
+        # 合法组代码：'production' 伞组 + 'marketing'(共享访问→含 production family) 均展开；
+        # 期望值由 _expand_groups_to_owners 派生（单一来源，新增子线自动跟随）。
         from opensearch_pipeline.retriever import _expand_groups_to_owners
-        _mp = " OR ".join('owner_dept="%s"' % o
-                          for o in _expand_groups_to_owners(["marketing", "production"]))
-        assert _build_permission_filter(["marketing", "production"]) == (
-            '(permission_level="public")'
-            ' OR (permission_level="dept_internal" AND (' + _mp + '))'
-        )
+        def _expect(ud):
+            owners = _expand_groups_to_owners(ud if isinstance(ud, list) else [ud])
+            clause = " OR ".join('owner_dept="%s"' % o for o in owners)
+            return ('(permission_level="public")'
+                    ' OR (permission_level="dept_internal" AND (' + clause + '))')
+        assert _build_permission_filter("marketing") == _expect("marketing")
+        assert _build_permission_filter(["marketing", "production"]) == _expect(["marketing", "production"])
+        # production-family 子线对 production 与 marketing 两组都可见（共享访问策略）
         assert 'owner_dept="production_mold"' in _build_permission_filter(["production"])
+        assert 'owner_dept="production_mold"' in _build_permission_filter(["marketing"])
         # CSV 字符串等价于列表（伞组展开一致）
         assert _build_permission_filter("marketing,production") == _build_permission_filter(
             ["marketing", "production"])
@@ -778,14 +778,19 @@ class TestSharedPermissionFilter:
         f = _build_permission_filter('x" OR owner_dept="y')
         assert f == '(permission_level="public")'
         assert '"y' not in f
-        # 合法组 + 注入元素混入：合法组保留，注入元素被净化+白名单丢弃，不产生越权 OR
+        # 合法组 + 注入元素混入：合法组保留(marketing 共享访问展开为含 production-family)，
+        # 注入元素被净化+白名单丢弃，不产生越权 OR
+        from opensearch_pipeline.retriever import _expand_groups_to_owners
         f2 = _build_permission_filter(['marketing', 'x" OR permission_level="restricted'])
+        owners = " OR ".join('owner_dept="%s"' % o for o in _expand_groups_to_owners(["marketing"]))
         assert f2 == (
             '(permission_level="public")'
-            ' OR (permission_level="dept_internal" AND (owner_dept="marketing"))'
+            ' OR (permission_level="dept_internal" AND (' + owners + '))'
         )
-        assert "restricted" not in f2
-        assert f2.count(" OR ") == 1  # 仅顶层 public OR；注入未引入额外 OR
+        assert "restricted" not in f2          # 注入元素被丢弃
+        assert 'owner_dept="x' not in f2       # 注入未引入伪 owner
+        # OR 数量 = 顶层 public OR(1) + marketing 展开 owner 间的 OR(N-1)；注入未引入额外 owner
+        assert f2.count(" OR ") == 1 + (len(_expand_groups_to_owners(["marketing"])) - 1)
 
     def test_output_fields_canonical_set(self):
         from opensearch_pipeline.retriever import _DEFAULT_OUTPUT_FIELDS

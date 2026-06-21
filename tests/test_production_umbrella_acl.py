@@ -171,3 +171,74 @@ def test_sim_legacy_string_production():
 def test_sim_hr_cannot_see_production():
     vis = {c["id"] for c in _corpus() if _visible(c, ["hr"])}
     assert vis == {"h", "pub"}
+
+
+# ── Production + Marketing shared-access policy (2026-06-21) ──────────────────
+# production-family dept_internal docs readable by BOTH production AND marketing;
+# owner_dept stays the real subline (no rewrite, no duplication).
+NEG_DEPTS = ["hr", "finance", "admin", "pmc", "supply", "rd", "quality"]
+
+
+def test_marketing_group_grants_production_family():
+    owners = set(R._expand_groups_to_owners(["marketing"]))
+    assert "marketing" in owners
+    for s in SUBLINES:
+        assert s in owners, f"marketing should reach production subline {s}"
+
+
+def test_marketing_filter_contains_production_sublines():
+    f = R._build_permission_filter(["marketing"])
+    for s in SUBLINES:
+        assert f'owner_dept="{s}"' in f
+
+
+def test_production_does_NOT_grant_marketing():
+    # asymmetric by design: production reads production-family, NOT marketing docs
+    assert "marketing" not in set(R._expand_groups_to_owners(["production"]))
+
+
+def _prod_corpus():
+    # one dept_internal chunk per production subline + a marketing-owned + negatives + public
+    c = [{"permission_level": "dept_internal", "owner_dept": o, "id": o} for o in SUBLINES]
+    c += [{"permission_level": "dept_internal", "owner_dept": "marketing", "id": "mkt"}]
+    c += [{"permission_level": "dept_internal", "owner_dept": d, "id": d} for d in NEG_DEPTS]
+    c += [{"permission_level": "dept_internal", "owner_dept": "production_secret", "id": "unk"},
+          {"permission_level": "public", "owner_dept": "production", "id": "pub"}]
+    return c
+
+
+def test_sim_marketing_sees_all_production_family():
+    vis = {c["id"] for c in _prod_corpus() if _visible(c, ["marketing"])}
+    for s in SUBLINES:
+        assert s in vis, f"marketing must see production-family {s}"
+    assert "mkt" in vis and "pub" in vis
+    # marketing must NOT gain other depts or unknown subline
+    for d in NEG_DEPTS:
+        assert d not in vis
+    assert "unk" not in vis
+
+
+def test_sim_production_user_sees_family_not_marketing():
+    vis = {c["id"] for c in _prod_corpus() if _visible(c, ["production"])}
+    for s in SUBLINES:
+        assert s in vis
+    assert "mkt" not in vis            # production does NOT see marketing docs
+    for d in NEG_DEPTS:
+        assert d not in vis
+
+
+def test_sim_production_marketing_multigroup_sees_family():
+    vis = {c["id"] for c in _prod_corpus() if _visible(c, ["production", "marketing"])}
+    for s in SUBLINES:
+        assert s in vis
+    assert "mkt" in vis and "pub" in vis
+    for d in NEG_DEPTS:
+        assert d not in vis
+
+
+def test_sim_production_family_invisible_to_all_other_depts_and_anon():
+    fam = set(SUBLINES)
+    for ud in [None] + [[d] for d in NEG_DEPTS]:
+        vis = {c["id"] for c in _prod_corpus() if _visible(c, ud)}
+        assert not (vis & fam), f"{ud} leaked production-family: {vis & fam}"
+        assert "pub" in vis  # public still visible to all
