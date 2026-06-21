@@ -32,6 +32,7 @@ def test_center_names_single_group_fallback():
     # 单组无歧义的中心名保留为兜底
     assert _normalize_dept_to_codes("营销中心") == ["marketing"]
     assert _normalize_dept_to_codes("生产中心") == ["production"]
+    assert _normalize_dept_to_codes("研发中心") == ["rd"]  # 纯 rd 子树（研发部/实验室皆 →rd）
     assert _normalize_dept_to_codes("PMC部") == ["pmc"]
 
 
