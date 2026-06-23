@@ -6339,40 +6339,49 @@ def node_update_index_status(ctx: dict):
             )
 
 
-def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, max_retries):
+def _parity_content_hash(text) -> str:
+    """Verbatim sha256 of a chunk's text. NO normalization — chunk_text_store is written verbatim
+    from chunk_text (chunker.py), so verbatim-both-sides is the only false-positive-proof compare."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, max_retries,
+                                     drift_chunks=None):
     """把校验失败的 chunk 写回 chunk_meta.index_status='FAILED' 后 raise，阻断
     node_deactivate_old_chunks（守住"新版本确认入库后才停用旧版本"不变量）。
 
-    - DROP（确认 HA3 缺失）写 error_code='PARITY_DROP'；UNKNOWN（无法确认）写 'PARITY_UNKNOWN'。
-      两组**分开** UPDATE，保留故障分类，绝不合并成一条。
+    - DROP（确认 HA3 缺失）→ 'PARITY_DROP'；UNKNOWN（无法确认）→ 'PARITY_UNKNOWN'；
+      DRIFT（PK 在但内容陈旧、补推后仍不一致）→ 'PARITY_DRIFT'。三组**分开** UPDATE，保留故障分类。
     - 全有或全无：任一 UPDATE 的 rowcount 与目标数不符 → rollback + raise 状态持久化错误。
-      （部分写回会让一些 chunk 仍 INDEXED → 下轮 loader 不会重选 → 静默丢失被持久化。）
+      （部分写回会让一些 chunk 仍 INDEXED → 下轮 loader 不会重选 → 静默丢失/漂移被持久化。）
       注：pymysql 默认 rowcount=changed 行数；这些 chunk RDS 当前为 INDEXED→FAILED 必然计数。
     """
     from opensearch_pipeline.env_guard import assert_destructive_write_allowed
     assert_destructive_write_allowed("parity_repush", config.rds.host, kind="rds")
 
+    drift_chunks = drift_chunks or []
     drop_msg = f"PARITY: absent from HA3 after {max_retries} re-push attempt(s)"
     unknown_msg = "PARITY: presence unconfirmable (HA3 read failed); conservatively un-indexed for retry"
+    drift_msg = f"PARITY: content drift vs RDS chunk_text, unhealed after {max_retries} re-push(es)"
+
+    buckets = (
+        (drop_chunks, "PARITY_DROP", drop_msg),
+        (unknown_chunks, "PARITY_UNKNOWN", unknown_msg),
+        (drift_chunks, "PARITY_DRIFT", drift_msg),
+    )
 
     # 内存状态同步（DAG 随后中断，主要为可读性/可测性；RDS 才是下轮重选的事实源）
-    for c in drop_chunks:
-        c.index_status = "FAILED"
-        c.index_error_code = "PARITY_DROP"
-        c.index_error_message = drop_msg
-    for c in unknown_chunks:
-        c.index_status = "FAILED"
-        c.index_error_code = "PARITY_UNKNOWN"
-        c.index_error_message = unknown_msg
+    for chunks, code, msg in buckets:
+        for c in chunks:
+            c.index_status = "FAILED"
+            c.index_error_code = code
+            c.index_error_message = msg
 
     conn = None
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cursor:
-            for chunks, code, msg in (
-                (drop_chunks, "PARITY_DROP", drop_msg),
-                (unknown_chunks, "PARITY_UNKNOWN", unknown_msg),
-            ):
+            for chunks, code, msg in buckets:
                 if not chunks:
                     continue
                 ids = [c.chunk_id for c in chunks]
@@ -6403,13 +6412,14 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
 
     # node 05 防御过滤器：键 = (doc_id, version_no)，与 node_update_index_status 完全一致
     fdv = ctx.setdefault("failed_doc_versions", set())
-    for c in list(drop_chunks) + list(unknown_chunks):
-        fdv.add((c.doc_id, c.version_no))
+    for chunks, _code, _msg in buckets:
+        for c in chunks:
+            fdv.add((c.doc_id, c.version_no))
 
     raise RuntimeError(
-        f"Stage-3 parity: {len(drop_chunks)} chunk(s) absent from HA3 after re-push "
-        f"(PARITY_DROP) + {len(unknown_chunks)} unconfirmable (PARITY_UNKNOWN); marked FAILED "
-        f"and aborting DAG to prevent deactivating older chunk versions."
+        f"Stage-3 parity: {len(drop_chunks)} absent (PARITY_DROP) + {len(unknown_chunks)} "
+        f"unconfirmable (PARITY_UNKNOWN) + {len(drift_chunks)} content-drift (PARITY_DRIFT); "
+        f"marked FAILED and aborting DAG to prevent deactivating older chunk versions."
     )
 
 
@@ -6425,6 +6435,11 @@ def node_verify_and_repush(ctx: dict):
     默认关闭（RAG_STAGE3_PARITY_VERIFY）；simulate / MOCK / 非 HA3 客户端均 no-op。
     校验基础设施异常 fail-open（仅"廉价 hint enum"失败时降级为全量 point-read，绝不跳过校验）；
     只有"权威 point-read 确认缺失(DROP)"或"point-read 无法完成(UNKNOWN)"才 fail-closed 阻断 05。
+
+    内容漂移子检查（RAG_STAGE3_PARITY_DRIFT，默认关闭，依附于本节点 → 不会单独生效）：对确认
+    PRESENT 且拿到 chunk_text_store 的 chunk 比对 sha256(返回文本) vs sha256(内存 chunk_text)，
+    PK 在但内容陈旧 = drift → 有界补推(upsert) → 重读重算 hash → 仍不一致写 'PARITY_DRIFT' 阻断 05。
+    drift 读/hash 异常只 fail-open 该 chunk 的 drift 判定，存在性三态结论不受影响。
 
     ⚠️ 已知遗留：Stage-3 chunk_meta 无 per-chunk retry_count 上限（loader 仅按
     index_status IN (NOT_INDEXED,FAILED) 重选）。被 HA3 永久拒收的"毒 chunk"会每轮重推→
@@ -6482,10 +6497,13 @@ def node_verify_and_repush(ctx: dict):
     from alibabacloud_ha3engine_vector.models import QueryRequest
     from opensearch_pipeline.retriever import _parse_ha3_response, _DEFAULT_OUTPUT_FIELDS
 
+    text_by_pk = {}  # present pk → returned chunk_text_store (for the drift sub-check); side-effect
+
     def _present_unknown(pks):
         """对一组 PK 逐个权威 point-read。返回 (present:set, unknown:set)。
         PRESENT = 返回行 id 等于目标 pk（非空还不够，须 PK 相符）；read 抛异常 = UNKNOWN
-        （无法判定，绝不当作缺失）。read 完成但无匹配行 → MISSING（既不在 present 也不在 unknown）。"""
+        （无法判定，绝不当作缺失）。read 完成但无匹配行 → MISSING（既不在 present 也不在 unknown）。
+        副作用：对 PRESENT 的 pk 把返回的 chunk_text_store 存入 text_by_pk（drift 子检查用）。"""
         present, unknown = set(), set()
         for pk in pks:
             try:
@@ -6493,8 +6511,10 @@ def node_verify_and_repush(ctx: dict):
                                    include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
                                    filter=f"{cfg.pk_field}={int(pk)}")
                 rows = _parse_ha3_response(client.query(req))
-                if any(str(r.get("id")) == str(pk) for r in rows):
+                match = next((r for r in rows if str(r.get("id")) == str(pk)), None)
+                if match is not None:
                     present.add(pk)
+                    text_by_pk[pk] = match.get("chunk_text")
             except Exception as e:
                 unknown.add(pk)
                 print(f"    ⚠️ [PARITY] point-read {cfg.pk_field}={pk} UNKNOWN (read failed): {e}")
@@ -6553,16 +6573,64 @@ def node_verify_and_repush(ctx: dict):
         c.index_error_code = None
         c.index_error_message = None
 
+    # 3b) 内容漂移子检查（flag-gated, default OFF: RAG_STAGE3_PARITY_DRIFT；本节点仅在 PARITY_VERIFY
+    #     已开启时运行，故 drift 不会单独生效）。对"确认 PRESENT 且 point-read 拿到 chunk_text_store"
+    #     的 chunk，比对 sha256(返回文本) vs sha256(内存 chunk_text)：不一致 = PK 在但内容陈旧（drift）。
+    #     有界补推（upsert 覆盖内容）→ 重读**重算 hash**确认（不止 PK 存在）→ 仍不一致 = PARITY_DRIFT。
+    #     fail-OPEN：读/hash 异常只跳过该 chunk 的 drift 判定，绝不影响上面的存在性三态结论。
+    #     注：大批模式下 enum 命中(未 point-read)的 chunk 无返回文本 → 不做 drift（设 POINTREAD_ALL_MAX
+    #     ≥ 批量可获得全量 drift 覆盖）。
+    still_drift = set()
+    initial_drift = 0
+    drift_enabled = os.environ.get("RAG_STAGE3_PARITY_DRIFT", "").lower() in ("1", "true", "yes")
+    if drift_enabled:
+        def _drift_candidates(pks):
+            d = set()
+            for pk in pks:
+                txt = text_by_pk.get(pk)
+                if txt is None:
+                    continue  # 无返回文本 → fail-open，跳过 drift
+                try:
+                    if _parity_content_hash(txt) != _parity_content_hash(expected[pk].chunk_text):
+                        d.add(pk)
+                except Exception:
+                    continue  # hash 异常 → fail-open
+            return d
+
+        present_final = expected_pks - still_missing - unknown
+        still_drift = _drift_candidates(present_final)
+        initial_drift = len(still_drift)
+        for _ in range(max_retries):
+            if not still_drift:
+                break
+            _push_chunks_to_ha3(client, cfg, [expected[pk] for pk in sorted(still_drift)],
+                                max_retries=config.embedding.max_retries)
+            if settle > 0:
+                time.sleep(settle)
+            present_d, unknown_d = _present_unknown(still_drift)  # 重读刷新 text_by_pk
+            # 重算 hash 确认：仍 present 且内容已一致 → 愈合；变 UNKNOWN → 移入 unknown 桶
+            healed_d = set()
+            for pk in list(still_drift):
+                if pk in unknown_d:
+                    unknown.add(pk)
+                    still_drift.discard(pk)
+                elif pk in present_d and not _drift_candidates({pk}):
+                    healed_d.add(pk)
+            still_drift -= healed_d
+
     verify_latency_ms = int((time.time() - t0) * 1000)
     print(f"    ├─ [PARITY] expected={len(expected_pks)} initial_missing={initial_missing} "
           f"healed={len(healed)} persistent_drop={len(still_missing)} unknown={len(unknown)} "
+          f"initial_drift={initial_drift} persistent_drift={len(still_drift)} "
           f"verify_latency_ms={verify_latency_ms}")
 
-    # 4) 终态：仍缺失(DROP) 或 无法确认(UNKNOWN) → 写回 FAILED + raise，阻断 05
-    if still_missing or unknown:
+    # 4) 终态：仍缺失(DROP) / 无法确认(UNKNOWN) / 内容漂移(DRIFT) → 写回 FAILED + raise，阻断 05
+    if still_missing or unknown or still_drift:
         drop_chunks = [expected[pk] for pk in sorted(still_missing)]
-        unknown_chunks = [expected[pk] for pk in sorted(unknown)]   # 与 still_missing 互斥
-        _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, max_retries)
+        unknown_chunks = [expected[pk] for pk in sorted(unknown)]      # 与 still_missing 互斥
+        drift_chunks = [expected[pk] for pk in sorted(still_drift)]    # 与上面两者互斥
+        _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, max_retries,
+                                         drift_chunks=drift_chunks)
 
 
 # ═══════════════════════════════════════════════════════════════

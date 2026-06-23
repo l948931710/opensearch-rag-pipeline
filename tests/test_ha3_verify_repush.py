@@ -54,18 +54,29 @@ class FakeHA3:
     """可配置的 HA3 client。point-read(filter id=<pk>) + range-enum(id>=lo AND id<hi) + push。"""
 
     def __init__(self, present=(), never_heal=(), point_raise=(), wrong_id=(),
-                 lag_first=(), enumerate_raise=False):
+                 lag_first=(), enumerate_raise=False, stale=(), stale_heals=True, texts=None):
         self.present = set(present)            # 当前"真在" HA3 的 pk
         self.never_heal = set(never_heal)      # 补推也不会进 HA3（持久 DROP）
         self.point_raise = set(point_raise)    # 这些 pk 的 point-read 抛异常（UNKNOWN）
         self.wrong_id = set(wrong_id)          # 返回行 id 与目标不符（PK 不匹配 → MISSING）
         self.lag_first = set(lag_first)        # 在 present 但首次 point-read 返回空（最终一致性滞后）
         self.enumerate_raise = enumerate_raise
+        self.stale = set(stale)               # present 但 chunk_text_store 陈旧（≠ 内存 t{pk}）→ drift
+        self.stale_heals = stale_heals        # 补推后陈旧内容是否变一致
+        self.texts = dict(texts or {})        # 显式覆盖某 pk 返回的 chunk_text_store
         self.push_calls = []                   # list[list[int]]
         self.point_reads = []                  # list[int]
         self.range_reads = []                  # list[(lo, hi)]
         self.query_vector_lens = []
         self._reads = {}
+        self._repushed = set()
+
+    def _text_for(self, pk):
+        if pk in self.texts:
+            return self.texts[pk]
+        if pk in self.stale and not (self.stale_heals and pk in self._repushed):
+            return "STALE_CONTENT"
+        return f"t{pk}"                        # matches _mk_chunk's chunk_text → no drift
 
     def query(self, req):
         self.query_vector_lens.append(len(req.vector))
@@ -79,7 +90,8 @@ class FakeHA3:
             lagging = pk in self.lag_first and self._reads[pk] == 1
             if pk in self.present and not lagging:
                 rid = (pk + 100000) if pk in self.wrong_id else pk
-                return _resp([{"id": rid, "fields": {"chunk_id": f"c{pk}", "doc_id": "doc1"}}])
+                return _resp([{"id": rid, "fields": {"chunk_id": f"c{pk}", "doc_id": "doc1",
+                                                     "chunk_text_store": self._text_for(pk)}}])
             return _resp([])
         mr = re.search(r"id>=(\d+) AND id<(\d+)", req.filter)
         if self.enumerate_raise:
@@ -94,6 +106,7 @@ class FakeHA3:
         pks = [int(d["fields"][pk_field]) for d in request.body]
         self.push_calls.append(pks)
         for pk in pks:
+            self._repushed.add(pk)         # re-push heals stale content (if stale_heals)
             if pk not in self.never_heal:
                 self.present.add(pk)
         return types.SimpleNamespace(status_code=200, body={})
@@ -354,3 +367,54 @@ def test_dag3_wiring_04b_before_05():
     assert "04b" in dag.nodes
     assert dag.nodes["04b"].depends_on == ["04"]
     assert dag.nodes["05"].depends_on == ["04b"]
+
+
+# ── 16-20. content-drift sub-check (RAG_STAGE3_PARITY_DRIFT) ──────────────────
+def test_drift_detected_then_healed(monkeypatch):
+    chunks = [_mk_chunk(10), _mk_chunk(11)]
+    client = FakeHA3(present={10, 11}, stale={11}, stale_heals=True)  # 11 present but stale content
+    ctx = _setup(monkeypatch, client, chunks,
+                 RAG_STAGE3_PARITY_DRIFT="true", RAG_STAGE3_PARITY_MAX_RETRIES=2)
+    pn.node_verify_and_repush(ctx)              # drift re-pushed → content matches → no raise
+    assert client.push_calls == [[11]]
+    assert chunks[1].index_status == "INDEXED"
+
+
+def test_drift_persistent_raises_parity_drift(monkeypatch):
+    chunks = [_mk_chunk(10), _mk_chunk(11)]
+    client = FakeHA3(present={10, 11}, stale={11}, stale_heals=False)  # never reconciles
+    conn = FakeConn()
+    ctx = _setup(monkeypatch, client, chunks, conn=conn,
+                 RAG_STAGE3_PARITY_DRIFT="true", RAG_STAGE3_PARITY_MAX_RETRIES=1)
+    with pytest.raises(RuntimeError, match="parity"):
+        pn.node_verify_and_repush(ctx)
+    assert chunks[1].index_error_code == "PARITY_DRIFT"
+    upd = [e for e in conn.cur.executed if "UPDATE chunk_meta" in e[0]]
+    assert any(e[1][0] == "PARITY_DRIFT" for e in upd)
+    assert conn.committed
+    assert ("doc1", 2) in ctx["failed_doc_versions"]
+
+
+def test_drift_flag_off_no_check(monkeypatch):
+    chunks = [_mk_chunk(10), _mk_chunk(11)]
+    client = FakeHA3(present={10, 11}, stale={11}, stale_heals=False)  # content differs...
+    ctx = _setup(monkeypatch, client, chunks)  # ...but RAG_STAGE3_PARITY_DRIFT unset
+    pn.node_verify_and_repush(ctx)             # presence-only → no drift check → no raise
+    assert client.push_calls == []             # nothing re-pushed
+
+
+def test_drift_matching_content_no_drift(monkeypatch):
+    chunks = [_mk_chunk(10), _mk_chunk(11)]
+    client = FakeHA3(present={10, 11})          # returns t{pk} == in-memory chunk_text
+    ctx = _setup(monkeypatch, client, chunks, RAG_STAGE3_PARITY_DRIFT="true")
+    pn.node_verify_and_repush(ctx)             # no drift, no raise
+    assert client.push_calls == []
+
+
+def test_drift_failopen_on_unreadable_text(monkeypatch):
+    chunks = [_mk_chunk(10), _mk_chunk(11)]
+    # 11 present but returns no chunk_text_store (None) → drift skipped (fail-open), no raise
+    client = FakeHA3(present={10, 11}, texts={11: None})
+    ctx = _setup(monkeypatch, client, chunks, RAG_STAGE3_PARITY_DRIFT="true")
+    pn.node_verify_and_repush(ctx)
+    assert client.push_calls == []
