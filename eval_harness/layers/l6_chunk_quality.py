@@ -619,16 +619,49 @@ def build_chunk_judge_bundle(chunks: List[Dict], risk_ids: set, *,
 
 # ── Family H — RDS↔HA3 all-type id-set ────────────────────────────────────
 
-def _ha3_all_active_chunk_ids(top_k: int = 12000) -> Dict:
-    """All active chunk_ids in HA3 via a single zero-vector query (mirrors D1's proven
-    path). Truncation (returned >= top_k) marks the result unmeasured (don't claim GO)."""
-    from ..ha3live import query_vector
+def _ha3_all_active_chunk_ids(bucket: int = 5000, max_rounds: int = 3) -> Dict:
+    """All chunk_ids present in HA3 via PAGED zero-vector PK-range scans.
+
+    A single zero-vector query is capped (top_k) — at 12000 it truncated on the ~28k corpus
+    and could NEVER reach GO. We instead page the full PK range [0, MAX(chunk_meta.id)] in
+    `bucket`-sized id-windows (HA3 PK = chunk_meta.id), unioning chunk_ids. Per G30 a
+    zero-vector scan is non-deterministic/incomplete, so each window re-scans until a round
+    adds nothing new (or max_rounds). `truncated` is True only if the PK ceiling is unknown
+    or a single window saturated its top_k (window too small) — i.e. coverage is NOT full.
+    Assert `not truncated` before trusting the idset for exact-parity GO."""
+    from ..ha3live import query_vector, rds_conn
     from opensearch_pipeline.config import get_config
     dim = get_config().embedding.dimension or 1024
-    items = query_vector([0.0] * dim, top_k=top_k,
-                         output_fields=["chunk_id", "is_active"])
-    ids = {(_fld(it, "chunk_id")) for it in items if _fld(it, "chunk_id")}
-    return {"ids": ids, "returned": len(items), "truncated": len(items) >= top_k}
+    # PK ceiling from RDS (HA3 PK = chunk_meta.id)
+    conn = rds_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(id) FROM chunk_meta")
+    row = cur.fetchone()
+    id_hi = (list(row.values())[0] if isinstance(row, dict) else row[0]) or 0
+    cur.close()
+    conn.close()
+    if not id_hi:
+        return {"ids": set(), "returned": 0, "truncated": True, "windows": 0}
+    cap = bucket + 200
+    ids, windows, saturated = set(), 0, False
+    start = 0
+    while start <= id_hi:
+        for _ in range(max(1, max_rounds)):
+            before = len(ids)
+            items = query_vector([0.0] * dim, top_k=cap,
+                                 filter=f"id>={start} AND id<{start + bucket}",
+                                 output_fields=["chunk_id", "id"])
+            if len(items) >= cap:
+                saturated = True  # window saturated its cap → would miss ids; shrink bucket
+            for it in items:
+                cid = _fld(it, "chunk_id")
+                if cid:
+                    ids.add(cid)
+            if len(ids) == before:   # window stable → next
+                break
+        windows += 1
+        start += bucket
+    return {"ids": ids, "returned": len(ids), "truncated": saturated, "windows": windows}
 
 
 def _fld(item: Dict, key: str):
