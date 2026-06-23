@@ -676,6 +676,11 @@ def main():
         choices=["true", "false"],
         help="Explicitly force or disable simulation mode (overrides RAG_SIMULATE)"
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Print a READ-ONLY resume/recovery report (current RDS state) before draining; "
+             "the drain itself is the unchanged run_stage_drained. Also via RAG_INGEST_RESUME."
+    )
 
     args = parser.parse_args()
     
@@ -695,6 +700,15 @@ def main():
     import opensearch_pipeline.config as _cfg_module
     _cfg_module._config = config
     simulate_mode = config.simulate
+
+    # Resume/recovery: print a READ-ONLY report of what the (unchanged) drain will pick up from
+    # current RDS state. The drain below is untouched — no new version, no reset, never bypasses 04b.
+    if args.resume or os.environ.get("RAG_INGEST_RESUME", "").lower() in ("1", "true", "yes"):
+        try:
+            from opensearch_pipeline.ingestion_resume import build_resume_report, format_report
+            print(format_report(build_resume_report(args.stage)))
+        except Exception as e:
+            print(f"[Orchestrator] resume report failed (non-fatal): {e}", file=sys.stderr)
 
     # L6prov: per-run provenance header (RUNNING → SUCCESS/FAILED). Fail-open + no-op in simulate;
     # joins to kb_audit_log via the same git_commit/bizdate. Records which run/code/model ran this
