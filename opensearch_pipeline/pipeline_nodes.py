@@ -902,8 +902,12 @@ def node_build_canonical(ctx: dict):
         # incumbent 时才 SKIP（避免把文档藏到更受限/受众更窄的 incumbent 后 → ACL 静默降级）。
         # 多条 exact-dup 时只要任一 incumbent 覆盖即可 SKIP（不取任意首行）。FAIL-SAFE：任何
         # miss / NULL / 异常 → 正常处理；绝不停用 incumbent。索引 idx_canonical_sha256 是启用前提。
+        # ⚠️ 跳过空/近空 canonical：image-only / 抽取失败的文档其 canonical 文本为空，sha256 全部
+        # 落在空串 hash（e3b0c442…）→ 互相误判为 dup（生产实测的 group-10 假分组）。短文本同理无意义。
+        _xd_min_chars = 32
         if (os.environ.get("RAG_DEDUP_CROSS_DOC", "").lower() in ("1", "true", "yes")
-                and not simulate_db):
+                and not simulate_db
+                and md_data and len((md_data or "").strip()) >= _xd_min_chars):
             try:
                 _xd_conn = _get_db_conn(select_db=True)
                 _cover = None    # an incumbent whose visibility fully covers the new doc's audience

@@ -85,12 +85,15 @@ class _FakeConn:
         pass
 
 
-def _ctx(fake, monkeypatch):
+_BODY = "duplicate canonical content for the cross-doc dedup test"  # >= 32 chars (passes the empty guard)
+
+
+def _ctx(fake, monkeypatch, text=_BODY):
     monkeypatch.setattr(pn, "_get_db_conn", lambda **kw: fake)
     monkeypatch.setattr(pn, "_get_oss_bucket", lambda ctx: (MagicMock(), False))
     return {
-        "extractions": [{"doc_id": "NEW", "version_no": 1, "text": "duplicate canonical content",
-                         "text_length": 27, "extract_method": "native"}],
+        "extractions": [{"doc_id": "NEW", "version_no": 1, "text": text,
+                         "text_length": len(text), "extract_method": "native"}],
         "simulate_db": False,
         "_raw_checksum": {("NEW", 1): "rawhash"},
     }
@@ -146,3 +149,15 @@ def test_node_db_error_is_failsafe(monkeypatch):
     ctx = _ctx(fake, monkeypatch)
     pn.node_build_canonical(ctx)                                   # must not raise
     assert any(c["doc_id"] == "NEW" for c in ctx["canonicals"])   # processed normally
+
+
+def test_node_skips_empty_canonical(monkeypatch):
+    # empty/near-empty canonical (image-only / failed extraction) → hashes to empty-string hash and
+    # would false-group with other empties; the guard must skip cross-doc dedup entirely.
+    monkeypatch.setenv("RAG_DEDUP_CROSS_DOC", "true")
+    fake = _FakeConn(self_acl=("dept_internal", "finance"),
+                     incumbents=[("INC_PUB", "public", None)])    # would "cover" if it ran
+    ctx = _ctx(fake, monkeypatch, text="")                        # empty canonical
+    pn.node_build_canonical(ctx)
+    assert any(c["doc_id"] == "NEW" for c in ctx["canonicals"])   # processed, NOT skipped
+    assert not any("dv.canonical_sha256=%s AND dv.doc_id<>%s" in c[0] for c in fake.calls)  # no cross-doc query
