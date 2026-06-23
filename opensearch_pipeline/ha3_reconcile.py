@@ -59,7 +59,8 @@ def _classify_stale(ha3_map: dict, rds_active_ids: set, rds_active_chunkid: dict
 
 
 def _enumerate_ha3_pks(client, cfg, parse, output_fields, query_cls, id_hi: int,
-                       bucket: int = _ID_SCAN_BUCKET, max_rounds: int = 3) -> dict:
+                       bucket: int = _ID_SCAN_BUCKET, max_rounds: int = 3,
+                       id_lo: int = 0) -> dict:
     """PK 区间扫描 → {pk:int -> (chunk_id, doc_id)}。零向量 + 小区间 filter。
 
     ⚠️ G30: a single zero-vector scan is **non-deterministic / incomplete** — it can
@@ -70,14 +71,19 @@ def _enumerate_ha3_pks(client, cfg, parse, output_fields, query_cls, id_hi: int,
     guards — more-complete enumeration finds more true orphans, never an active id.
 
     NOTE for *verification* (confirming a doc IS present), do NOT rely on this scan —
-    use ha3_verify.verify_chunks_present (per-chunk self-query), which is authoritative.
+    use a per-PK point-read (filter id=<pk>), which is authoritative.
+
+    id_lo: 起始 PK（默认 0）。Stage-3 推送后校验只需扫本批 [min_pk, max_pk] 窗口，
+    传 id_lo=min(expected) 避免从 0 扫整个 id 空间（"廉价 hint" 才真的廉价）。
     """
+    from opensearch_pipeline.config import get_config
+    dim = get_config().embedding.dimension   # 向量维度读配置，勿硬编码 1024
     out = {}
-    start = 0
+    start = id_lo
     while start < id_hi:
         for _ in range(max(1, max_rounds)):
             before = len(out)
-            req = query_cls(table_name=cfg.table_name, vector=[0.0] * 1024, top_k=bucket + 100,
+            req = query_cls(table_name=cfg.table_name, vector=[0.0] * dim, top_k=bucket + 100,
                             include_vector=False, output_fields=output_fields,
                             filter=f"id>={start} AND id<{start + bucket}")
             for r in parse(client.query(req)):

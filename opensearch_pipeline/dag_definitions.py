@@ -29,6 +29,7 @@ from opensearch_pipeline.pipeline_nodes import (
     node_build_opensearch_payload,
     node_push_to_opensearch,
     node_update_index_status,
+    node_verify_and_repush,
     node_deactivate_old_chunks,
     # DAG 4
     node_simulate_retrieval,
@@ -181,9 +182,15 @@ def build_dag3_chunk_to_opensearch() -> DAG:
         description="更新 chunk_meta.index_status 等字段，索引失败时中断 DAG 防止停用旧版本",
     ))
     dag.add_node(DAGNode(
+        "04b", "校验并补推 (parity verify)",
+        node_verify_and_repush,
+        depends_on=["04"],
+        description="推送后 HA3 物理存在性校验 + 有界补推；静默丢失补救，补救失败/无法确认则中断防止停用旧版本（RAG_STAGE3_PARITY_VERIFY 默认关闭）",
+    ))
+    dag.add_node(DAGNode(
         "05", "停用旧版本",
         node_deactivate_old_chunks,
-        depends_on=["04"],
+        depends_on=["04b"],
         description="在新版本索引确认成功后，停用 RDS 和 OpenSearch 中的旧版本 chunk",
     ))
 

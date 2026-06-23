@@ -75,9 +75,10 @@ class TestDAGStructure:
         dag = build_dag2_canonical_to_chunk()
         assert len(dag.nodes) == 7
 
-    def test_dag3_has_6_nodes(self):
+    def test_dag3_has_7_nodes(self):
+        # 00 lock / 01 embed / 02 payload / 03 push / 04 update / 04b parity-verify / 05 deactivate
         dag = build_dag3_chunk_to_opensearch()
-        assert len(dag.nodes) == 6
+        assert len(dag.nodes) == 7
 
     def test_dag4_has_2_nodes(self):
         dag = build_dag4_retrieval_eval()
@@ -1040,15 +1041,20 @@ class TestIndexingPartialFailureSafety:
         # Verify Node statuses in the DAG
         node_push = dag3.nodes["03"]
         node_update = dag3.nodes["04"]
+        node_verify = dag3.nodes["04b"]
         node_deactivate = dag3.nodes["05"]
-        
+
         assert node_push.status.name == "SUCCESS"
         assert node_update.status.name == "FAILED"
         assert "Index push had 1 failures" in node_update.error
-        
-        # Crucial Safety check: Node 05 (Deactivate Old Chunks) MUST be SKIPPED
+
+        # Node 04b (parity verify) MUST be SKIPPED because Node 04 failed (parity flag off here anyway)
+        assert node_verify.status.name == "SKIPPED"
+        assert "dependency 04 is FAILED" in node_verify.error
+
+        # Crucial Safety check: Node 05 (Deactivate Old Chunks) MUST be SKIPPED (now via 04b)
         assert node_deactivate.status.name == "SKIPPED"
-        assert "dependency 04 is FAILED" in node_deactivate.error
+        assert "dependency 04b is SKIPPED" in node_deactivate.error
         
         # Crucial Safety check: Old chunks from v1 must NOT have been deactivated
         deactivated = final_context.get("deactivated_chunks", [])
