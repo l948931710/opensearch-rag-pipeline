@@ -1,0 +1,98 @@
+{
+  "_provenance": {
+    "date": "2026-06-23",
+    "mode": "READ-ONLY (prod_access.get_prod_readonly_conn, SET SESSION TRANSACTION READ ONLY; DB fuling_knowledge on rm-bp15j7wekd5738f093o)",
+    "confirmation": "Every number cross-checked by TWO independent prod read-only SQL runs that agree: (1) the interactive forensics battery run 2026-06-22/23, and (2) the goldset-rebuild-plan workflow coverage-gap agent (run wf_2fee33fc-8c3). Supersedes the stale eval_harness/reports/coverage_gap_findings.md (2026-06-07, 396 docs all-public, L5 N/A) — that snapshot predates the dept_internal campaign.",
+    "writes": "NONE to prod. This file + scratch/coverage_gap/gold_distinct_ids.json are the only local artifacts."
+  },
+  "totals": {
+    "active_docs": 1621,
+    "active_docs_served_ge1_active_chunk": 1479,
+    "active_docs_zero_active_chunks": 142,
+    "active_chunks_is_active_1": 27729,
+    "total_chunk_meta_rows": 52433,
+    "inactive_chunk_rows": 24704,
+    "gold_total_cases": 251,
+    "gold_positive_cases": 225,
+    "gold_negative_cases": 26,
+    "gold_distinct_expected_doc_ids": 120,
+    "gold_expected_doc_id_occurrences": 222,
+    "gold_expected_docs_still_active": 120,
+    "gold_expected_docs_missing_from_document_meta": 0,
+    "active_docs_with_ge1_gold_query": 120,
+    "active_docs_with_ZERO_gold_query": 1501,
+    "gold_coverage_pct_of_active_docs": 7.4,
+    "note": "All 120 distinct gold expected_doc_ids resolve to active, served, permission_level=public docs. The gold set was authored pre-campaign (gold docs created 2026-05-13/14) so it has 0 dept_internal cases."
+  },
+  "by_dept_zero_coverage": {
+    "production": 799, "marketing": 180, "rd": 175, "hr": 102, "quality": 55,
+    "finance": 50, "pmc": 49, "admin": 35, "it": 33, "supply": 23, "_sum": 1501
+  },
+  "by_filetype_zero_coverage": {
+    "pdf": 643, "docx": 510, "xlsx": 337, "pptx": 5, "png": 3, "jpg": 2, "jpeg": 1,
+    "_note": "file_ext from document_version joined on version_no=current_version_no; 0 missing current-version rows; sum=1501."
+  },
+  "by_category_zero_coverage": {
+    "standard": 492, "sop": 425, "reference": 203, "policy": 103, "record": 77,
+    "template": 74, "others": 67, "process": 60
+  },
+  "by_permission_zero_coverage": {
+    "dept_internal": 1055, "public": 446,
+    "_note": "All 1055 active dept_internal docs are zero-coverage (0 gold queries touch any dept_internal doc). Of 566 active public docs, 446 zero-coverage + 120 gold-covered."
+  },
+  "campaign_vs_old": {
+    "zero_coverage_pre_campaign_le_2026_06_11": 445,
+    "zero_coverage_campaign_2026_06_20_to_22": 1056,
+    "all_active_docs_pre_campaign": 565,
+    "all_active_docs_campaign": 1056,
+    "min_created_at": "2026-05-12 21:02:13",
+    "max_created_at": "2026-06-22 20:22:59",
+    "interpretation": "The entire 1056-doc dept_internal campaign corpus (created 2026-06-20..22) is unscored by the current gold set; 445 pre-campaign docs also uncovered."
+  },
+  "acl_l5": {
+    "active_dept_internal_docs": 1055,
+    "active_public_docs": 566,
+    "active_dept_internal_chunks": 21008,
+    "active_public_chunks": 6721,
+    "gold_cases_with_expected_permission_dept_internal": 0,
+    "gold_cases_with_expected_permission_public": 165,
+    "gold_cases_with_no_expected_permission_listed": 86,
+    "active_dept_internal_docs_with_gold_coverage": 0,
+    "L5_now_exercisable": true,
+    "interpretation": "CONFIRMED LIVE: dept_internal is the majority of the corpus (1055/1621 docs = 65%; 21008/27729 active chunks = 76%). L5 was N/A on the old all-public corpus; it is now exercisable but the gold set has 0 dept_internal cases. This is NOT contingent — dept_internal is verified live by two independent SQL runs."
+  },
+  "capability_targets": {
+    "active_docs_with_ge1_step_card_chunk_SOP": 279,
+    "active_docs_with_ge1_image_or_visual_knowledge_chunk": 623,
+    "active_docs_with_ge1_chunk_carrying_image_refs_json": 247,
+    "active_xlsx_docs": 339,
+    "active_docs_with_ge1_table_chunk": 511,
+    "active_public_docs": 566,
+    "active_chunk_type_distribution": {
+      "clause_chunk": 7944, "table_chunk": 6664, "text_chunk": 4196, "step_card": 3919,
+      "image": 3288, "ocr_chunk": 1375, "procedure_parent": 279, "visual_knowledge": 64
+    }
+  },
+  "negatives_health": {
+    "gold_negative_cases_total": 26,
+    "all_negatives_have_empty_expected_doc_ids": true,
+    "families": { "RAG_46_to_60_boundary_refusal": 15, "J_star_answer_absent": 11 },
+    "boundary_refusal_subtypes": { "sensitive_PII_refusal": 5, "realtime_data_refusal": 3, "multimodal_image_refusal": 3, "table_refusal": 3, "ERP_OA_integration_refusal": 1 },
+    "CONFIRMED_BROKEN": [
+      { "qid": "J-spec_rim_od", "query": "纸杯中杯知兰的杯口外径是多少？", "evidence": "Active dept_internal doc DOC_PRODUCTION_20260622202134_58669A '01-富岭-纸杯中杯-知兰-2025款-产品规格书' has active chunk '*杯口外径 89.3±0.2' (campaign-ingested 2026-06-22). This answer-absent negative is now answerable → must be retired or re-scoped." }
+    ],
+    "AT_RISK": [
+      { "qid": "J-spec_migration", "query": "这个纸杯的总迁移量标准限值是多少？", "evidence": "5 active chunks now mention 总迁移量 incl. DOC_PRODUCTION_20260621121611_2E81D6; needs author review of whether a specific 限值 is present." },
+      { "qid": "J-manual_docno", "query": "富岭U8+财务操作手册的文档编号是多少？", "evidence": "DOC_IT_20260513120634_C6FD16 has '文控编号: UF_U8130_FLCW_18_04'; if 文控编号 counts as 文档编号, now answerable. (Pre-campaign; latent risk.)" }
+    ],
+    "NEEDS_SPOT_CHECK": ["J-psop_neg_gloves", "J-itin_neg_antistatic", "J-qc_sticker_pwd", "J-qc_change_depts", "J-sop_reject", "J-xsop_corrosive", "J-xsop_clean"],
+    "boundary_refusal_now_have_matching_docs": "RAG-49 (绩效考核 → DOC_HR_20260620073928_111AB5), RAG-58 (品质验厂药品清单 → DOC_ADMIN_20260622202257_86D8A1), RAG-59 (固定资产 → DOC_FINANCE_20260620150144_580E45) — these test refusal-on-policy so they do NOT break, but the refusal path is now exercised against REAL matching content (a more meaningful test) — verify the refusal still fires.",
+    "risk_summary": "Corpus growth turned >=1 answer-absent negative (J-spec_rim_od) into a false negative, 2 more at risk, ~7 needing spot-checks. Every J-* negative must be re-validated against the current corpus before carry-forward."
+  },
+  "caveats": [
+    "'Active doc' = document_meta.status='ACTIVE' (case-insensitive: 1620 'active' + 1 'ACTIVE' = 1621). 142 have 0 active chunks (served set = 1479).",
+    "All 120 gold expected_doc_ids are active AND served AND public; coverage 120/1621 = 7.4%.",
+    "expected_permission populated on only 165/251 cases (all 'public'); 86 (incl. all 26 negatives) have empty expected_permission → permission-axis scoring undefined for those.",
+    "file_ext lives in document_version (joined on version_no=current_version_no), not document_meta."
+  ]
+}
