@@ -722,6 +722,44 @@ def node_extract_text_with_ocr(ctx: dict):
     ctx["extractions"] = extractions
 
 
+def _xd_covers(incumbent, newdoc) -> bool:
+    """跨文档去重的权限偏序：incumbent 的可见受众是否 ⊇ new 文档的受众（即把 new 藏到
+    incumbent 之后，原本能看到 new 的人仍都能看到 incumbent → 无 ACL 静默降级）。
+
+    incumbent / newdoc 均为 (permission_level, owner_dept)。public = 全集。
+    取不到 ACL 模型 → 保守返回 False（→ WARN-and-process，绝不冒险 SKIP）。
+    """
+    try:
+        from opensearch_pipeline.retriever import _VALID_ACL_GROUPS, _expand_groups_to_owners
+    except Exception:
+        return False
+
+    def _aud(pl, dept):
+        if (pl or "").strip().lower() == "public":
+            return None  # 全体可见（全集）
+        owner = (dept or "").strip()
+        aud = set()
+        for g in _VALID_ACL_GROUPS:
+            try:
+                if owner in _expand_groups_to_owners([g]):
+                    aud.add(g)
+            except Exception:
+                pass
+        if owner in _VALID_ACL_GROUPS:
+            aud.add(owner)
+        return aud
+
+    inc = _aud(*incumbent)
+    new = _aud(*newdoc)
+    if inc is None:      # public incumbent 覆盖所有人
+        return True
+    if new is None:      # new 是 public 而 incumbent 不是 → 不覆盖（不能把公开文档藏到受限 incumbent 后）
+        return False
+    if not new:          # new 文档受众无法解析/为空 → 保守不覆盖（不 SKIP，转 WARN）
+        return False
+    return inc >= new    # incumbent 受众 ⊇ new 受众
+
+
 def node_build_canonical(ctx: dict):
     """
     构建 canonical document（增强版）。
@@ -842,6 +880,63 @@ def node_build_canonical(ctx: dict):
                 print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: canonical unchanged "
                       f"vs v{_prior_v} → SKIPPED_DUPLICATE (prior version keeps serving)")
                 continue  # exclude from canonicals → skips classify/chunk/embed/index for this doc
+
+        # ── Cross-doc dedup (flag-gated, default OFF: RAG_DEDUP_CROSS_DOC) ──
+        # 跨文档 exact-hash 去重：捕获 intra-doc gate 漏掉的 dup-of-public / 跨部门精确副本。
+        # 默认 WARN-and-process（仅告警仍入库）；仅当存在一个"可见性完整覆盖新文档受众"的 active
+        # incumbent 时才 SKIP（避免把文档藏到更受限/受众更窄的 incumbent 后 → ACL 静默降级）。
+        # 多条 exact-dup 时只要任一 incumbent 覆盖即可 SKIP（不取任意首行）。FAIL-SAFE：任何
+        # miss / NULL / 异常 → 正常处理；绝不停用 incumbent。索引 idx_canonical_sha256 是启用前提。
+        if (os.environ.get("RAG_DEDUP_CROSS_DOC", "").lower() in ("1", "true", "yes")
+                and not simulate_db):
+            try:
+                _xd_conn = _get_db_conn(select_db=True)
+                _cover = None    # an incumbent whose visibility fully covers the new doc's audience
+                _matches = []    # all exact-hash active incumbents (for WARN logging)
+                try:
+                    # new doc's ACL comes from document_meta (set at register; not yet on canonical)
+                    with _xd_conn.cursor() as _xd_cur:
+                        _xd_cur.execute(
+                            "SELECT permission_level, owner_dept FROM document_meta WHERE doc_id=%s",
+                            (canonical["doc_id"],))
+                        _self = _xd_cur.fetchone()
+                    _new_pl, _new_dept = (_self[0], _self[1]) if _self else (None, None)
+                    with _xd_conn.cursor() as _xd_cur:
+                        _xd_cur.execute(
+                            "SELECT dv.doc_id, dm.permission_level, dm.owner_dept "
+                            "FROM document_version dv JOIN document_meta dm ON dv.doc_id=dm.doc_id "
+                            "WHERE dv.canonical_sha256=%s AND dv.doc_id<>%s "
+                            "AND dv.status='active' AND dm.status='active' "
+                            "AND dm.current_version_no=dv.version_no",
+                            (_canonical_sha256, canonical["doc_id"]))
+                        _rows = _xd_cur.fetchall() or []
+                    for _r in _rows:
+                        _matches.append(_r[0])
+                        if _cover is None and _xd_covers((_r[1], _r[2]), (_new_pl, _new_dept)):
+                            _cover = (_r[0], _r[1], _r[2])
+                    if _cover:
+                        with _xd_conn.cursor() as _xd_cur:
+                            # write canonical_sha256 on the SKIPPED row (else a later intra-doc match misses)
+                            _xd_cur.execute(
+                                "UPDATE document_version SET content_process_status='SKIPPED_DUPLICATE', "
+                                "chunk_status='SKIPPED', extraction_status='COMPLETED', "
+                                "canonical_sha256=%s, processed_at=NOW() "
+                                "WHERE doc_id=%s AND version_no=%s",
+                                (_canonical_sha256, canonical["doc_id"], canonical["version_no"]))
+                        _xd_conn.commit()
+                finally:
+                    _xd_conn.close()
+                if _cover:
+                    print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: cross-doc duplicate "
+                          f"of {_cover[0]} (covering incumbent) → SKIPPED_DUPLICATE")
+                    continue
+                elif _matches:
+                    _w = (f"{canonical['doc_id']}: cross-doc content match with {_matches[:5]} but no "
+                          f"incumbent covers its audience → WARN, processing normally (ACL review)")
+                    print(f"    ⚠️ {_w}")
+                    ctx.setdefault("validation_warnings", []).append(_w)
+            except Exception as _xd_err:
+                print(f"    ⚠️ cross-doc dedup check failed (FAIL-SAFE: processing normally): {_xd_err}")
 
         # 1. Write files physically
         if is_simulated_oss:
