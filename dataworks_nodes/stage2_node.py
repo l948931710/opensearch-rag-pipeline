@@ -21,6 +21,14 @@ SIMULATE = True
 os.environ["RAG_SIMULATE"] = str(SIMULATE).lower()
 os.environ["RAG_ENVIRONMENT"] = "production"
 
+# ── Robustness features (validated GO 2026-06-23; default-OFF in code, enabled here for prod) ──
+# Stage-2. setdefault → overridable (set the env var to 'false' to disable).
+# Chunk-explosion: gate on; MODE stays 'warn' (default) — telemetry only, does NOT quarantine
+# (set RAG_CHUNK_EXPLOSION_MODE=quarantine to escalate). Image-OCR PII: scans asset['ocr_text'],
+# medium→redact, high→whole-doc quarantine (shadow showed 0 high-sev currently).
+os.environ.setdefault("RAG_CHUNK_EXPLOSION_GATE", "true")
+os.environ.setdefault("RAG_IMAGE_OCR_PII", "true")
+
 if not SIMULATE:
     # 生产凭证：由 DataWorks 调度参数注入
     required_vars = [

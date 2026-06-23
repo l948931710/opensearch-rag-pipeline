@@ -22,6 +22,13 @@ SIMULATE = True
 os.environ["RAG_SIMULATE"] = str(SIMULATE).lower()
 os.environ["RAG_ENVIRONMENT"] = "production"
 
+# ── Robustness features (validated GO 2026-06-23; default-OFF in code, enabled here for prod) ──
+# Stage-1 (node_build_canonical). setdefault → still overridable (set the env var to 'false' to disable).
+# Cross-doc dedup: idx_canonical_sha256 applied (schema/005); cross-scope default = WARN-and-process
+# (skips only behind a fully-covering incumbent). Skip-gate: fail-safe idempotent re-ingest.
+os.environ.setdefault("RAG_DEDUP_CROSS_DOC", "true")
+os.environ.setdefault("RAG_SKIP_UNCHANGED_REINGEST", "true")
+
 if not SIMULATE:
     # 生产凭证：由 DataWorks 调度参数注入，或在 PyODPS 节点的「资源」配置中设置
     # 必须设置以下环境变量:

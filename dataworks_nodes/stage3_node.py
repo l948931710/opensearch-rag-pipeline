@@ -38,6 +38,14 @@ SIMULATE = True
 os.environ["RAG_SIMULATE"] = str(SIMULATE).lower()
 os.environ["RAG_ENVIRONMENT"] = "production"
 
+# ── Robustness features (validated GO 2026-06-23; default-OFF in code, enabled here for prod) ──
+# Stage-3 node 04b. setdefault → overridable (set the env var to 'false' to disable).
+# Parity-verify: re-read HA3 after push + bounded re-push of silent drops (first prod runs healed
+# 96+1 cleanly). Drift: PK-present-but-stale-content sub-check (requires parity-verify on; verbatim
+# hash = false-positive-proof). SETTLE_SEC stays default 30s.
+os.environ.setdefault("RAG_STAGE3_PARITY_VERIFY", "true")
+os.environ.setdefault("RAG_STAGE3_PARITY_DRIFT", "true")
+
 if not SIMULATE:
     # 生产凭证：由 DataWorks 调度参数注入
     required_vars = [
