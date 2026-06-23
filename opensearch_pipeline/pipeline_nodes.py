@@ -722,6 +722,18 @@ def node_extract_text_with_ocr(ctx: dict):
     ctx["extractions"] = extractions
 
 
+def _audit_reingest_skip(ctx, doc_id, version_no, message, simulate_db):
+    """SKIPPED_DUPLICATE 的 fail-open 审计（含 trace + doc/version + incumbent/prior 信息，便于
+    日后解释为何被跳过）。审计写失败绝不影响 skip 本身（连 import 都包在 try 里）。"""
+    try:
+        from opensearch_pipeline.audit_log import write_audit, audit_trace_id
+        write_audit(doc_id=doc_id, version_no=version_no, action_type="REINGEST",
+                    action_result="SKIPPED_DUPLICATE", trace_id=audit_trace_id(ctx),
+                    message=message, simulate=simulate_db)
+    except Exception as _ae:
+        print(f"    ⚠️ audit of SKIPPED_DUPLICATE failed (non-fatal): {_ae}")
+
+
 def _xd_covers(incumbent, newdoc) -> bool:
     """跨文档去重的权限偏序：incumbent 的可见受众是否 ⊇ new 文档的受众（即把 new 藏到
     incumbent 之后，原本能看到 new 的人仍都能看到 incumbent → 无 ACL 静默降级）。
@@ -879,6 +891,9 @@ def node_build_canonical(ctx: dict):
             if _do_skip:
                 print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: canonical unchanged "
                       f"vs v{_prior_v} → SKIPPED_DUPLICATE (prior version keeps serving)")
+                _audit_reingest_skip(
+                    ctx, canonical["doc_id"], canonical["version_no"],
+                    f"intra-doc: canonical unchanged vs prior v{_prior_v} (kept serving)", simulate_db)
                 continue  # exclude from canonicals → skips classify/chunk/embed/index for this doc
 
         # ── Cross-doc dedup (flag-gated, default OFF: RAG_DEDUP_CROSS_DOC) ──
@@ -929,6 +944,10 @@ def node_build_canonical(ctx: dict):
                 if _cover:
                     print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: cross-doc duplicate "
                           f"of {_cover[0]} (covering incumbent) → SKIPPED_DUPLICATE")
+                    _audit_reingest_skip(
+                        ctx, canonical["doc_id"], canonical["version_no"],
+                        f"cross-doc: covered by incumbent {_cover[0]} "
+                        f"(pl={_cover[1]}, owner={_cover[2]})", simulate_db)
                     continue
                 elif _matches:
                     _w = (f"{canonical['doc_id']}: cross-doc content match with {_matches[:5]} but no "
