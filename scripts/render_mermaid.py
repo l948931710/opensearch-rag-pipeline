@@ -103,6 +103,31 @@ _MMDC_CONFIG = {
 }
 
 
+def _chrome_executable() -> str | None:
+    """找一个可靠的 Chrome 给 mermaid-cli 的 puppeteer 用（系统 Chrome 优先，回退 puppeteer 缓存）。"""
+    for c in (
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ):
+        if Path(c).exists():
+            return c
+    cache = Path.home() / ".cache" / "puppeteer" / "chrome"
+    if cache.is_dir():
+        bins = sorted(cache.glob("*/chrome-mac-*/*.app/Contents/MacOS/*"))
+        if bins:
+            return str(bins[-1])
+    return None
+
+
+def _puppeteer_cfg() -> dict:
+    cfg = {"args": ["--no-sandbox"]}
+    exe = _chrome_executable()
+    if exe:
+        cfg["executablePath"] = exe   # 钉死可靠 Chrome，避免 mermaid-cli 自带 chromium 偶发起不来
+    return cfg
+
+
 def render_source(src: str, out_svg: Path, theme: str = "neutral") -> bool:
     """把单段 mermaid 源码渲染成 SVG（view_doc 拆图复用）。"""
     mmdc = resolve_mmdc()
@@ -113,7 +138,7 @@ def render_source(src: str, out_svg: Path, theme: str = "neutral") -> bool:
         cfg = Path(td) / "mmdc.json"
         cfg.write_text(json.dumps(_MMDC_CONFIG), encoding="utf-8")
         pup = Path(td) / "puppeteer.json"
-        pup.write_text(json.dumps({"args": ["--no-sandbox"]}), encoding="utf-8")
+        pup.write_text(json.dumps(_puppeteer_cfg()), encoding="utf-8")
         mmd = Path(td) / "in.mmd"
         mmd.write_text(src, encoding="utf-8")
         cmd = [*mmdc, "-i", str(mmd), "-o", str(out_svg),
@@ -167,7 +192,7 @@ def main() -> int:
         cfg = Path(td) / "mmdc.json"
         cfg.write_text(json.dumps(_MMDC_CONFIG), encoding="utf-8")
         pup = Path(td) / "puppeteer.json"
-        pup.write_text(json.dumps({"args": ["--no-sandbox"]}), encoding="utf-8")
+        pup.write_text(json.dumps(_puppeteer_cfg()), encoding="utf-8")
 
         index_rows: list[str] = []
         ok = fail = 0

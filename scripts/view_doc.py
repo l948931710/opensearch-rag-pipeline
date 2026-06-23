@@ -43,7 +43,7 @@ _STYLE = """<style>
     --ink:#1f2328; --muted:#5b6470; --line:#e6e8eb; --code-bg:#f5f7f9;
   }
   *{box-sizing:border-box}
-  body{max-width:880px;margin:0 auto;padding:0 32px 64px;color:var(--ink);
+  body{max-width:880px;margin:0 auto;padding:0 32px 24px;color:var(--ink);
        font-family:"PingFang SC","Microsoft YaHei","Helvetica Neue",-apple-system,
                    BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
        font-size:15.5px;line-height:1.78;
@@ -79,8 +79,8 @@ _STYLE = """<style>
   blockquote{margin:1.2em 0;padding:.75em 1.15em;background:#fbfaf4;
              border-left:4px solid #d8b441;border-radius:0 7px 7px 0;color:#5b5236}
   blockquote p{margin:.3em 0}
-  svg{max-width:100%;height:auto;display:block;margin:1.6em auto;
-      border:1px solid var(--line);border-radius:10px;background:#fff;padding:14px;
+  svg,img{max-width:100%;height:auto;display:block;margin:1.1em auto;
+      border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px;
       break-inside:avoid;page-break-inside:avoid}
   nav#TOC{background:#f6f9f9;border:1px solid var(--line);border-radius:10px;
           padding:14px 8px 14px 30px;margin:0 0 2em;font-size:13.6px}
@@ -154,9 +154,9 @@ def preprocess(md: Path, total: int) -> tuple[str, str]:
                 out.append("")
                 for j, (cap, src) in enumerate(override, 1):
                     sub = OUT_DIR / "_split" / f"{md.stem}-{idx}{chr(96 + j)}.svg"
-                    if render_source(src, sub):
+                    if render_source(src, sub) or sub.exists():  # 渲染成功 or 复用已缓存子图
                         out += [f"**{cap}**", "", f"![{cap}]({sub.resolve().as_posix()})", ""]
-                    else:  # 渲染失败则回退整张宽图，不丢内容
+                    else:  # 既渲染不出又无缓存，才回退整张宽图，不丢内容
                         whole = (OUT_DIR / svg_name(md.stem, idx, total)).resolve()
                         out += [f"![{md.stem} · 图 {idx}]({whole.as_posix()})", ""]
                         break
@@ -230,7 +230,8 @@ def main() -> int:
     if res.returncode != 0:
         print("✗ pandoc 失败：\n" + (res.stderr or res.stdout), file=sys.stderr)
         return 1
-    n_imgs = html.read_text(encoding="utf-8").count("<svg ")
+    _h = html.read_text(encoding="utf-8")
+    n_imgs = _h.count("<img") + _h.count('id="my-svg"')   # data-uri img 或内联 svg 都算
     print(f"✓ HTML（{n_imgs} 张图内联）：{html.relative_to(REPO)}")
 
     pdf_path = None
