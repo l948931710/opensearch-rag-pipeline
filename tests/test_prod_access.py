@@ -95,3 +95,91 @@ def test_readonly_oss_bucket_blocks_writes():
     assert ro.get_object("raw/a.pdf") == "ok"
     with pytest.raises(ProdAccessError):
         ro.put_object("raw/a.pdf", b"x")
+
+
+# ─── OSS 只读句柄要拦**所有**写方法（含 copy_object——HR-4 漏拦的洞） ─────
+
+class _FakeBucket:
+    """底层 oss2.Bucket 的 stub：写方法本应被 _ReadOnlyBucket 代理拦掉，
+    真透传到这里就用返回值证明它确实透传了（白名单放行时）。"""
+
+    def get_object(self, k):
+        return "ok"
+
+    def put_object(self, k, d):
+        return f"put:{k}"
+
+    def copy_object(self, src_bucket, src, dst):
+        return f"copy:{src}->{dst}"
+
+    def delete_object(self, k):
+        return f"del:{k}"
+
+    def batch_delete_objects(self, keys):
+        return f"batchdel:{keys}"
+
+
+@pytest.mark.parametrize("blocked", [
+    "put_object", "put_object_from_file", "append_object",
+    "copy_object", "restore_object", "process_object",
+    "delete_object", "batch_delete_objects",
+    "put_object_acl", "put_symlink", "create_bucket", "delete_bucket",
+])
+def test_readonly_oss_bucket_blocks_all_writes(blocked):
+    """copy_object 等写方法在只读句柄上必须 raise（之前 copy_object 经 __getattr__ 透传）。"""
+    ro = pa._ReadOnlyBucket(_FakeBucket())
+    assert ro.get_object("raw/a.pdf") == "ok"
+    with pytest.raises(ProdAccessError):
+        getattr(ro, blocked)
+
+
+@pytest.fixture
+def patch_oss_build(monkeypatch):
+    """让 get_prod_oss_rw_bucket 不真正连 oss2，返回 _FakeBucket。"""
+    monkeypatch.setattr(
+        pa, "load_prod_env",
+        lambda overlay=None: {"_source_file": overlay or ".env.production",
+                              "RAG_OSS_BUCKET_NAME": "b"})
+    monkeypatch.setattr(pa, "_build_oss_bucket", lambda env, **kw: _FakeBucket())
+
+
+def test_oss_rw_bucket_requires_today_token(patch_oss_build):
+    today = date.today().isoformat()
+    bucket = pa.get_prod_oss_rw_bucket(ack=f"PROD-RW:{today}")
+    # 当日令牌：copy_object/put_object 放行，透传到底层
+    assert bucket.copy_object("b", "raw/a", "raw/b") == "copy:raw/a->raw/b"
+    assert bucket.put_object("raw/a", b"x") == "put:raw/a"
+
+
+@pytest.mark.parametrize("bad", ["", "PROD-RW", "prod-rw:2026-06-10", "PROD-RW:1999-01-01"])
+def test_oss_rw_bucket_rejects_bad_token(patch_oss_build, bad):
+    with pytest.raises(ProdAccessError):
+        pa.get_prod_oss_rw_bucket(ack=bad)
+
+
+def test_oss_rw_bucket_rejects_yesterday(patch_oss_build):
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    with pytest.raises(ProdAccessError):
+        pa.get_prod_oss_rw_bucket(ack=f"PROD-RW:{yesterday}")
+
+
+def test_oss_rw_bucket_blocks_delete_by_default(patch_oss_build):
+    """窄口 RW 默认只放 copy/put——delete 仍被拦，即便带了合法的 PROD-RW 令牌。"""
+    today = date.today().isoformat()
+    bucket = pa.get_prod_oss_rw_bucket(ack=f"PROD-RW:{today}")
+    with pytest.raises(ProdAccessError):
+        getattr(bucket, "delete_object")
+    with pytest.raises(ProdAccessError):
+        getattr(bucket, "batch_delete_objects")
+
+
+def test_oss_rw_bucket_delete_needs_stronger_today_token(patch_oss_build):
+    today = date.today().isoformat()
+    # 错误/过期的强删令牌也要拒
+    with pytest.raises(ProdAccessError):
+        pa.get_prod_oss_rw_bucket(ack=f"PROD-RW:{today}",
+                                  allow_delete_ack="PROD-DELETE:1999-01-01")
+    # 正确的当日强删令牌：放行 delete
+    bucket = pa.get_prod_oss_rw_bucket(ack=f"PROD-RW:{today}",
+                                       allow_delete_ack=f"PROD-DELETE:{today}")
+    assert bucket.delete_object("raw/a") == "del:raw/a"

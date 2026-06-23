@@ -12,8 +12,14 @@ scratch/、eval_harness/ 等脚本**不得**再自行解析 .env.production/.env
   读写（罕见，必须显式带当日令牌）:
       conn = get_prod_rw_conn(ack=f"PROD-RW:{date.today():%Y-%m-%d}")
 
-  OSS 只读:
-      bucket = get_prod_oss_bucket()          # put_*/delete_* 一律 raise
+  OSS 只读（默认，日常诊断/镜像/对账）:
+      bucket = get_prod_oss_bucket()          # put_*/copy_*/delete_* 等一律 raise
+
+  OSS 窄口读写（罕见，必须显式带当日令牌——与 RDS RW 同一道闸）:
+      bucket = get_prod_oss_rw_bucket(ack=f"PROD-RW:{date.today():%Y-%m-%d}")
+      # 默认只放行 copy_object/put_object；delete_object/batch_delete_objects 仍拦，
+      # 需另传当日强令牌 allow_delete_ack=f"PROD-DELETE:{date.today():%Y-%m-%d}"。
+      # 其余写方法（put_object_acl/put_symlink/restore_object/...）始终拦。
 
 注意：MySQL 的会话只读是防呆不是防恶意（同会话可被 SET 反转）。真正的物理边界
 是 RDS 只读账号（fuling_ro，见 docs/environment_design.md 控制台 checklist）——
@@ -24,7 +30,7 @@ from datetime import date
 from pathlib import Path
 
 __all__ = ["load_prod_env", "get_prod_readonly_conn", "get_prod_rw_conn",
-           "get_prod_oss_bucket", "ProdAccessError"]
+           "get_prod_oss_bucket", "get_prod_oss_rw_bucket", "ProdAccessError"]
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -116,27 +122,88 @@ def get_prod_rw_conn(ack: str, overlay: str = None, *, dict_cursor: bool = True)
 
 
 class _ReadOnlyBucket:
-    """OSS 只读代理：put_*/delete_* 一律 raise，读与签名透传。"""
+    """OSS 只读代理：所有写方法（put_*/copy_*/delete_*/ACL/symlink/bucket 级）一律
+    raise，读与签名透传。
 
-    _BLOCKED = ("put_object", "put_object_from_file", "delete_object",
-                "batch_delete_objects", "append_object")
+    ``allow`` 是显式放行的方法白名单——给 get_prod_oss_rw_bucket 的窄口 RW 句柄用：
+    白名单内的方法不再被 _BLOCKED 拦、直接透传到底层 bucket。默认 None = 全拦（纯只读）。
 
-    def __init__(self, bucket):
+    ⚠️ _BLOCKED 必须覆盖底层 oss2.Bucket 上**所有**会改变服务端状态的方法，否则
+    任何遗漏的写方法都会经 __getattr__ 静默透传——这正是本次（HR-4，copy_object 漏拦）
+    要堵的洞。新增 oss2 写方法时同步往这里加。
+    """
+
+    _BLOCKED = (
+        # 对象写入 / 拷贝 / 追加 / 解冻 / 处理（图像处理落盘）
+        "put_object", "put_object_from_file", "append_object",
+        "copy_object", "restore_object", "process_object",
+        # 删除
+        "delete_object", "batch_delete_objects",
+        # 元数据 / ACL / 符号链接 写
+        "put_object_acl", "put_symlink",
+        # bucket 级写
+        "create_bucket", "delete_bucket",
+    )
+
+    def __init__(self, bucket, allow=None):
         self._bucket = bucket
+        self._allow = frozenset(allow or ())
 
     def __getattr__(self, name):
-        if name in self._BLOCKED:
-            raise ProdAccessError(f"prod_access 的 OSS 句柄是只读的（拒绝 {name}）。"
-                                  f"生产 OSS 写入走 DataWorks/SAE 注入凭证的正式管线。")
+        if name in self._BLOCKED and name not in self._allow:
+            raise ProdAccessError(
+                f"prod_access 的 OSS 句柄拒绝写方法 {name}。只读诊断用 get_prod_oss_bucket()；"
+                f"确需写生产 OSS 走 get_prod_oss_rw_bucket(ack='PROD-RW:<today>')，"
+                f"或 DataWorks/SAE 注入凭证的正式管线。")
         return getattr(self._bucket, name)
 
 
-def get_prod_oss_bucket(overlay: str = None, *, public_endpoint: bool = True):
-    """生产 OSS 只读句柄（GetObject/ListObjects/sign_url 可用）。"""
+def _build_oss_bucket(env: dict, *, public_endpoint: bool = True):
+    """从已解析的 env dict 构造底层 oss2.Bucket（公网 / 内网 endpoint 切换）。"""
     import oss2
-    env = load_prod_env(overlay)
     endpoint = env.get("RAG_OSS_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
     if public_endpoint:
         endpoint = endpoint.replace("-internal", "")
     auth = oss2.Auth(env["RAG_OSS_ACCESS_KEY_ID"], env["RAG_OSS_ACCESS_KEY_SECRET"])
-    return _ReadOnlyBucket(oss2.Bucket(auth, endpoint, env.get("RAG_OSS_BUCKET_NAME", "fuling-knowledge-base")))
+    return oss2.Bucket(auth, endpoint, env.get("RAG_OSS_BUCKET_NAME", "fuling-knowledge-base"))
+
+
+def get_prod_oss_bucket(overlay: str = None, *, public_endpoint: bool = True):
+    """生产 OSS 只读句柄（GetObject/ListObjects/sign_url 可用，所有写方法 raise）。"""
+    env = load_prod_env(overlay)
+    return _ReadOnlyBucket(_build_oss_bucket(env, public_endpoint=public_endpoint))
+
+
+def get_prod_oss_rw_bucket(ack: str, overlay: str = ".env.production", *,
+                           allow_delete_ack: str = None, public_endpoint: bool = True):
+    """生产 OSS 窄口读写句柄。必须显式传当日令牌 ack='PROD-RW:<YYYY-MM-DD>'
+    （与 get_prod_rw_conn 同一道闸——令牌按日过期，复制昨天的命令不会静默生效）。
+
+    默认只放行 ``copy_object`` / ``put_object``；``delete_object`` /
+    ``batch_delete_objects`` 仍被拦——除非另传当日强令牌
+    allow_delete_ack='PROD-DELETE:<YYYY-MM-DD>'（删除不可逆，单设一道更高的闸）。
+    其余写方法（put_object_acl / put_symlink / restore_object / ...）始终拦。
+
+    默认 overlay='.env.production'（admin AK，可写），**不**走 .env.prod_ro fallback——
+    与 get_prod_rw_conn 一致：RW 入口绝不静默拿只读凭证。
+    """
+    expected = f"PROD-RW:{date.today().isoformat()}"
+    if ack != expected:
+        raise ProdAccessError(
+            f"生产 OSS 读写令牌无效（got {ack!r}）。确需写生产 OSS：传 ack={expected!r}。"
+            f"批量写应优先走 DataWorks/SAE 正式管线而非本地脚本。")
+
+    allow = {"copy_object", "put_object"}
+    if allow_delete_ack is not None:
+        expected_del = f"PROD-DELETE:{date.today().isoformat()}"
+        if allow_delete_ack != expected_del:
+            raise ProdAccessError(
+                f"生产 OSS 删除强令牌无效（got {allow_delete_ack!r}）。"
+                f"确需删生产 OSS：传 allow_delete_ack={expected_del!r}。")
+        allow |= {"delete_object", "batch_delete_objects"}
+
+    env = load_prod_env(overlay)
+    print(f"[prod_access] !! OSS RW handle -> "
+          f"{env.get('RAG_OSS_BUCKET_NAME', 'fuling-knowledge-base')} "
+          f"(token={ack}, allow={sorted(allow)}, creds: {env['_source_file']})")
+    return _ReadOnlyBucket(_build_oss_bucket(env, public_endpoint=public_endpoint), allow=allow)
