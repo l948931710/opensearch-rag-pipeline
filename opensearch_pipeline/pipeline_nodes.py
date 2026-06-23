@@ -73,6 +73,20 @@ ENTITY_SEVERITY = {
 }
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
 
+# 图像 OCR PII 的已知误报锚点：18 位物料编码会命中 cn_id_card 正则。仅在这一类已确证的
+# FP 上抑制（锚点共现时），绝不抑制密钥/手机号等。⚠️ 启用 RAG_IMAGE_OCR_PII 前须用真实
+# CE38C5 等 OCR 样本验证此 allow-list，避免过度抑制真实身份证号。
+_MATERIAL_CODE_ANCHORS = ("物料编码", "物料号", "料号", "编码", "material code", "material no")
+
+
+def _image_ocr_fp_ignore(entity_name: str, ocr_text: str) -> bool:
+    """图像 OCR 命中是否属已知误报（当前仅：cn_id_card 命中且物料编码锚点共现）。"""
+    if entity_name == "cn_id_card":
+        low = ocr_text.lower()
+        return any(a.lower() in low for a in _MATERIAL_CODE_ANCHORS)
+    return False
+
+
 def _get_db_conn(select_db=True):
     """从连接池获取一个数据库连接。
 
@@ -1768,6 +1782,42 @@ def node_detect_sensitive(ctx: dict):
                 })
                 entity_risk = "high"
 
+        # 4. 图像 OCR 文本 PII 检测（flag-gated, default OFF: RAG_IMAGE_OCR_PII）
+        #    base text 扫不到截图/嵌图里的电话/身份证/密钥（CE38C5、test-report、intro.pptx）。
+        #    只扫 asset['ocr_text']，绝不扫 visual_summary（避免 UI 标签 FP）；每个 asset 独立
+        #    try/except —— 图像分支异常绝不影响上面的正文 PII 检测（优雅降级）。
+        if os.environ.get("RAG_IMAGE_OCR_PII", "").lower() in ("1", "true", "yes"):
+            for asset in doc.get("assets", []):
+                try:
+                    if str(asset.get("status", "")).startswith("DISCARD"):
+                        continue
+                    octext = asset.get("ocr_text") or ""
+                    if not octext:
+                        continue
+                    for name, pattern in ENTITY_PATTERNS.items():
+                        if re.search(pattern, octext) and not _image_ocr_fp_ignore(name, octext):
+                            sev = ENTITY_SEVERITY.get(name, "high")
+                            hits.append({
+                                "type": "IMAGE_OCR", "category": name, "keyword": name,
+                                "source": "image_ocr", "finding_type": f"image_ocr:{name}",
+                                "severity": sev,
+                            })
+                            if _SEVERITY_RANK[sev] > _SEVERITY_RANK[entity_risk]:
+                                entity_risk = sev
+                    for category, keywords in SEMANTIC_KEYWORDS.items():
+                        for kw in keywords:
+                            if kw in octext:
+                                hits.append({
+                                    "type": "IMAGE_OCR_SEMANTIC", "category": category, "keyword": kw,
+                                    "source": "image_ocr",
+                                    "finding_type": f"image_ocr_semantic:{category}", "severity": "medium",
+                                })
+                                if entity_risk != "high":
+                                    entity_risk = "medium"
+                except Exception as _ocr_err:
+                    print(f"    ⚠️ image-OCR PII scan failed for an asset in {doc['doc_id']} "
+                          f"(FAIL-SAFE: text PII still applied): {_ocr_err}")
+
         doc["risk_hits"] = hits
         doc["entity_risk_level"] = entity_risk
         doc["sensitive_detected"] = len(hits) > 0
@@ -1797,7 +1847,8 @@ def node_detect_sensitive(ctx: dict):
                             finding_type = "IMAGE_SENSITIVE_AUDIT"
                             preview = kw
                         else:
-                            finding_type = hit.get("category", "unknown")
+                            # image_ocr hits carry a distinct finding_type; text hits fall back to category
+                            finding_type = hit.get("finding_type") or hit.get("category", "unknown")
                             if len(kw) <= 4:
                                 preview = "*" * len(kw)
                             else:
@@ -1888,6 +1939,23 @@ def node_redact_or_quarantine(ctx: dict):
                             if replacer:
                                 block_text = re.sub(pattern, replacer, block_text)
                         block["text"] = block_text
+
+            # 图像 OCR 文本脱敏（flag-gated, default OFF: RAG_IMAGE_OCR_PII）。GAP-FIX：今天
+            # asset['ocr_text'] 从不脱敏，却经 [图片OCR] 合成块 / image_refs 流入 chunk —— medium
+            # 命中后会把 PII 带进索引。就地改写同一份 in-memory asset 对象（detect/redact/chunk
+            # 共用同一 ctx['canonicals']，redact(node 03) 在 chunk(node 05) 之前）。不修改
+            # filename/anchor_row（xlsx 绑定契约）。注意：仅本轮内存生效，不回写 canonical OSS JSON
+            # → 受影响文档的后续重切仍依赖本 flag 持续开启。
+            if os.environ.get("RAG_IMAGE_OCR_PII", "").lower() in ("1", "true", "yes"):
+                for asset in doc.get("assets", []):
+                    octext = asset.get("ocr_text")
+                    if not octext:
+                        continue
+                    for name, pattern in ENTITY_PATTERNS.items():
+                        replacer = REDACTION_MAP.get(name)
+                        if replacer:
+                            octext = re.sub(pattern, replacer, octext)
+                    asset["ocr_text"] = octext
 
         doc["redacted_text"] = redacted
         doc["redaction_count"] = redaction_count
