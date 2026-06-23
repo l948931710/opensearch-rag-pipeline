@@ -3344,6 +3344,48 @@ def _bind_equipment_cleaning_images(chunks, assets, dept_code, d_id, version, bl
     return ce_bound_fns, diag
 
 
+def _chunk_explosion_verdict(chunks):
+    """首次入库 chunk-爆炸判定（纯函数，单测入口）。返回原因字符串则触发，否则 None。
+
+    (A) count > RAG_CHUNK_EXPLOSION_MAX（默认 2000）；
+    (B) 退化型: count >= RAG_CHUNK_EXPLOSION_DEGENERATE_MIN（默认 200）AND 单一 chunk_type 占比
+        >= RAG_CHUNK_EXPLOSION_DOMINANT_FRAC（默认 0.95）AND 该主导类型是 table_chunk
+        （限定 table_chunk 以免误伤合法的 300 步 step_card SOP；image 等其它类型不触发 B）。
+    """
+    from collections import Counter
+
+    n = len(chunks)
+    if n == 0:
+        return None
+
+    def _envi(k, d):
+        v = os.environ.get(k, "")
+        try:
+            return int(v) if v != "" else d
+        except ValueError:
+            return d
+
+    def _envf(k, d):
+        v = os.environ.get(k, "")
+        try:
+            return float(v) if v != "" else d
+        except ValueError:
+            return d
+
+    max_n = _envi("RAG_CHUNK_EXPLOSION_MAX", 2000)
+    if n > max_n:
+        return f"count {n} > max {max_n}"
+
+    degen_min = _envi("RAG_CHUNK_EXPLOSION_DEGENERATE_MIN", 200)
+    dom_frac = _envf("RAG_CHUNK_EXPLOSION_DOMINANT_FRAC", 0.95)
+    if n >= degen_min:
+        counts = Counter(getattr(c, "chunk_type", "") for c in chunks)
+        top_type, top_n = counts.most_common(1)[0]
+        if top_type == "table_chunk" and top_n / n >= dom_frac:
+            return f"degenerate type-mix: {top_n}/{n} ({top_n / n:.0%}) are table_chunk"
+    return None
+
+
 def node_chunk_documents(ctx: dict):
     """
     切分文档为结构化 chunks。
@@ -4135,6 +4177,35 @@ def node_chunk_documents(ctx: dict):
                         current_chunk_count += 1
 
 
+        # ── Chunk-explosion gate (flag-gated, default OFF: RAG_CHUNK_EXPLOSION_GATE) ──
+        # 首次入库的"chunk 爆炸"防线（如单元格化 xlsx 产出上万 table_chunk 垃圾块）。
+        # warn 模式仅告警仍正常入库；quarantine 模式丢弃本轮 chunks + 标记 QUARANTINE（旧版本继续服务，
+        # 由 node_write_chunk_meta 的 0-chunk 分支写回可见的 QUARANTINED 状态 + 置空 rag_ready_key）。
+        # 整段 fail-safe：gate 内部异常 → 结构化 warning + 正常处理（绝不静默吞）。
+        if os.environ.get("RAG_CHUNK_EXPLOSION_GATE", "").lower() in ("1", "true", "yes"):
+            _explosion_reason = None
+            try:
+                _explosion_reason = _chunk_explosion_verdict(chunks)
+            except Exception as _exp_err:
+                _w = (f"chunk-explosion gate error for {doc['doc_id']} "
+                      f"(FAIL-SAFE: processing normally): {_exp_err}")
+                print(f"    ⚠️ {_w}")
+                ctx.setdefault("validation_warnings", []).append(_w)
+            if _explosion_reason:
+                _mode = os.environ.get("RAG_CHUNK_EXPLOSION_MODE", "warn").lower()
+                if _mode == "quarantine":
+                    doc["redaction_action"] = "QUARANTINE"
+                    doc["chunk_explosion_reason"] = _explosion_reason
+                    _w = f"{doc['doc_id']}: chunk-explosion QUARANTINE — {_explosion_reason}"
+                    print(f"    🚫 {_w}; {len(chunks)} chunks dropped, prior version keeps serving")
+                    ctx.setdefault("validation_warnings", []).append(_w)
+                    continue  # do NOT extend → 0 valid chunks → visible QUARANTINED in write_chunk_meta
+                else:
+                    _w = (f"{doc['doc_id']}: chunk-explosion WARN — {_explosion_reason} "
+                          f"({len(chunks)} chunks)")
+                    print(f"    ⚠️ {_w}")
+                    ctx.setdefault("validation_warnings", []).append(_w)
+
         all_chunks.extend(chunks)
         print(f"    └─ {doc['doc_id']}: {len(chunks)} chunks generated")
 
@@ -4595,11 +4666,46 @@ def node_write_chunk_meta(ctx: dict):
     for chunk in valid_chunks:
         doc_versions_to_process.add((chunk.doc_id, chunk.version_no))
 
+    # (doc_id, version) → canonical dict, for recovering per-doc flags (e.g. chunk-explosion quarantine)
+    _canon_by_dv = {(d.get("doc_id"), d.get("version_no")): d for d in canonicals}
+
     for doc_id, ver in sorted(doc_versions_to_process):
         doc_chunks = [c for c in valid_chunks if c.doc_id == doc_id and c.version_no == ver]
         chunk_cnt = len(doc_chunks)
 
-        if chunk_cnt == 0:
+        _exp_reason = _canon_by_dv.get((doc_id, ver), {}).get("chunk_explosion_reason")
+        if chunk_cnt == 0 and _exp_reason:
+            # chunk-explosion quarantine: record a VISIBLE status (not silent EMPTY) + retire the
+            # orphaned rag-ready artifact (publish ran before chunk) — RDS publish_status + NULL
+            # rag_ready_key, mirroring the SKIPPED_EMPTY cleanup, not just in-memory fields.
+            print(f"    🚫 {doc_id} v{ver}: chunk-explosion quarantined — {_exp_reason}")
+            if not simulate_db:
+                conn = None
+                try:
+                    conn = _get_db_conn(select_db=True)
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET chunk_status = 'QUARANTINED_EXPLOSION',
+                                content_process_status = 'QUARANTINED',
+                                content_process_error = %s,
+                                publish_status = 'SKIPPED_EXPLOSION',
+                                rag_ready_key = NULL,
+                                processed_at = NOW()
+                            WHERE doc_id = %s AND version_no = %s
+                        """, (f"chunk-explosion: {_exp_reason}"[:255], doc_id, ver))
+                        conn.commit()
+                except Exception as db_err:
+                    if conn:
+                        conn.rollback()
+                    print(f"    ⚠️ Failed to write explosion-quarantine status for {doc_id} v{ver}: {db_err}")
+                finally:
+                    if conn:
+                        conn.close()
+            else:
+                print(f"    └─ [SIMULATED] {doc_id} v{ver} chunk_status='QUARANTINED_EXPLOSION', "
+                      f"publish_status='SKIPPED_EXPLOSION', rag_ready_key=NULL")
+        elif chunk_cnt == 0:
             print(f"    ⚠️ No valid chunks generated for document {doc_id} v{ver}")
             if not simulate_db:
                 conn = None
