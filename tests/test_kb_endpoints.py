@@ -64,3 +64,79 @@ def test_dept_admin_org_tree_scope(monkeypatch):
     assert resp.my_role == "dept_admin"
     assert resp.my_managed_owner_depts == ["marketing"]      # 读≠写：managed 不含 production
     assert resp.my_grantable_owner_depts == ["marketing"]
+
+
+# ── my-docs 文档名搜索：子句 + LIKE 通配符转义（防"输入 % 匹配全部"）──────────────
+class _CaptureCur:
+    """桩游标：捕获 execute(sql, params)，fetchall 返回空。"""
+    def __init__(self, sink):
+        self._sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self._sink["sql"] = sql
+        self._sink["params"] = params
+
+    def fetchall(self):
+        return []
+
+
+def _stub_capture(monkeypatch):
+    sink = {}
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _Conn:
+        def cursor(self):
+            return _CaptureCur(sink)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    return sink
+
+
+def test_my_docs_search_filters_and_escapes(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, q="报告%_x",
+                          identity=api.Identity(user_id="dev1"))
+    assert resp.items == []
+    assert "LIKE %s ESCAPE '!'" in sink["sql"]          # 显式 '!' 转义符（不依赖 sql_mode）
+    # % → !% , _ → !_ 被转义（否则用户输入 % 会匹配全部、_ 匹配任意单字符）
+    like = sink["params"][0]
+    assert like == "%报告!%!_x%"
+    assert sink["params"][1] == like
+
+
+def test_my_docs_no_query_adds_no_search_clause(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    api.kb_my_docs(request=None, limit=20, offset=0, q="", identity=api.Identity(user_id="dev1"))
+    assert "LIKE" not in sink["sql"]
+    assert sink["params"] == (21, 0)   # kb_admin 无 owner 参数 → 仅 limit+1, offset
+
+
+def test_my_docs_dept_admin_search_keeps_owner_scope(monkeypatch):
+    """搜索不绕过 owner 作用域：dept_admin 搜索时 owner_dept 过滤仍在，参数顺序正确。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    api.kb_my_docs(request=None, limit=20, offset=0, q="杯", identity=api.Identity(user_id="da1"))
+    assert "m.owner_dept IN" in sink["sql"]              # 作用域子句仍在
+    assert sink["sql"].index("owner_dept IN") < sink["sql"].index("LIKE")  # 作用域在搜索之前
+    # 参数顺序：owner(marketing) → 2×LIKE → limit+1, offset（错位会破坏过滤）
+    assert sink["params"][0] == "marketing"
+    assert sink["params"][1] == "%杯%" and sink["params"][2] == "%杯%"
+    assert sink["params"][-2:] == (21, 0)

@@ -127,6 +127,74 @@ def test_upload_url_dept_admin_public_needs_approval(monkeypatch):
     assert getattr(ei.value, "status_code", None) == 403
 
 
+# ── 升版（action=version）：可见范围不可被客户端篡改 + 越权部门拒绝 ───────────────
+class _FakeCur:
+    """桩游标：with conn.cursor() as cur → execute/fetchone 返回固定 (owner, perm)。"""
+    def __init__(self, row):
+        self._row = row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **k):
+        pass
+
+    def fetchone(self):
+        return self._row
+
+
+class _FakeConn:
+    def __init__(self, row):
+        self._row = row
+
+    def cursor(self):
+        return _FakeCur(self._row)
+
+    def close(self):
+        pass
+
+
+def _stub_doc(monkeypatch, owner, perm):
+    """让 upload-url 的 version 分支读到 (owner, perm) 作为「原文档」元数据。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _FakeConn((owner, perm)))
+
+
+def test_upload_url_version_forces_original_permission(monkeypatch):
+    """升版强制继承原文档 permission_level —— 客户端伪造 public 必须被忽略（防偷偷转公开）。"""
+    _sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
+    _stub_doc(monkeypatch, owner="production", perm="dept_internal")  # 原文档=部门内
+    from opensearch_pipeline import api
+    # 客户端伪造 permission_level=public，试图借升版把 dept_internal 文档转公开
+    req = api.KbUploadUrlRequest(action="version", doc_id="DOC_X", filename="v2.pdf",
+                                 owner_dept="production", permission_level="public")
+    resp = api.kb_upload_url(req=req, request=None, identity=api.Identity(user_id="dev1"))
+    p = ku.verify_upload_token(resp.upload_token)
+    assert p["permission_level"] == "dept_internal"   # 强制继承，忽略伪造的 public
+    assert p["action"] == "version" and p["doc_id"] == "DOC_X"
+    assert resp.requires_kb_admin_approval is False    # 若伪造转 public 成功会要求审批
+
+
+def test_upload_url_version_other_dept_forbidden(monkeypatch):
+    """dept_admin 不能升版其管理范围外部门的文档（owner 不在 managed → 403）。"""
+    _sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "finance")
+    monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
+    _stub_doc(monkeypatch, owner="production", perm="dept_internal")
+    from opensearch_pipeline import api
+    req = api.KbUploadUrlRequest(action="version", doc_id="DOC_P", filename="v2.pdf",
+                                 owner_dept="production", permission_level="dept_internal")
+    with pytest.raises(Exception) as ei:
+        api.kb_upload_url(req=req, request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
 def test_register_bad_token(monkeypatch):
     _sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")

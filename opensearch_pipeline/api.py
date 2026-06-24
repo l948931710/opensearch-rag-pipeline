@@ -1350,14 +1350,26 @@ def kb_org_tree(request: Request, identity: Optional[Identity] = Depends(current
 
 
 @app.get("/api/kb/my-docs", response_model=KbMyDocsResponse)
-def kb_my_docs(request: Request, limit: int = 20, offset: int = 0,
+def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                identity: Optional[Identity] = Depends(current_identity)):
-    """管理员可管理的文档列表（kb_admin 全量；dept_admin 限其 managed owner_dept）。只读。"""
+    """管理员可管理的文档列表（kb_admin 全量；dept_admin 限其 managed owner_dept）。只读。
+
+    q：文档名搜索（标题 / 原始文件名子串匹配），用于"是否已有现存版本"自查。
+    """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
     clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    # 文档名搜索：转义 LIKE 通配符（% _ \）防"输入 % 即匹配全部"，作用域过滤仍在前 → 不越权。
+    q = (q or "").strip()[:80]
+    search_clause, search_params = "", []
+    if q:
+        # 用非反斜杠转义符 '!'：不依赖 DB 的 sql_mode（NO_BACKSLASH_ESCAPES 开启时反斜杠转义会失效）。
+        esc = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        like = "%" + esc + "%"
+        search_clause = "AND (m.title LIKE %s ESCAPE '!' OR m.original_filename LIKE %s ESCAPE '!')"
+        search_params = [like, like]
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn()
@@ -1371,11 +1383,11 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0,
                     FROM fuling_knowledge.document_meta m
                     LEFT JOIN fuling_knowledge.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
-                    WHERE 1=1 {clause}
-                    ORDER BY m.updated_at DESC
+                    WHERE 1=1 {clause} {search_clause}
+                    ORDER BY (m.status='active') DESC, m.updated_at DESC
                     LIMIT %s OFFSET %s
                     """,
-                    (*params, limit + 1, offset),
+                    (*params, *search_params, limit + 1, offset),
                 )
                 rows = cur.fetchall()
         finally:
@@ -1573,9 +1585,7 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         raise HTTPException(status_code=400, detail=msg)
 
     owner = (req.owner_dept or "").strip()
-    decision = kb_authz.authorize_upload(kb, owner, req.permission_level, req.share_owner_depts)
-    if not decision.allowed:
-        raise HTTPException(status_code=403, detail=f"无权上传：{decision.reason}")
+    perm = req.permission_level
 
     if req.action == "version":
         if not req.doc_id:
@@ -1585,7 +1595,7 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             conn = _get_db_conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT owner_dept FROM fuling_knowledge.document_meta "
+                    cur.execute("SELECT owner_dept, permission_level FROM fuling_knowledge.document_meta "
                                 "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                     row = cur.fetchone()
             finally:
@@ -1600,9 +1610,16 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             raise HTTPException(status_code=404, detail="升版目标文档不存在")
         if (row[0] or "") != owner or not _kb_can_manage(kb, owner):
             raise HTTPException(status_code=403, detail="无权升版该文档（owner_dept 不在管理范围）")
+        # 升版强制继承原文档 permission_level —— 忽略客户端传值（升版不得改可见范围，防越权）。
+        perm = row[1] or perm
         doc_id = req.doc_id
     else:
         doc_id = kb_upload.new_doc_id()
+
+    # 授权裁决用最终生效的 perm（新建=客户端选；升版=原文档继承）。
+    decision = kb_authz.authorize_upload(kb, owner, perm, req.share_owner_depts)
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=f"无权上传：{decision.reason}")
 
     upload_id = kb_upload.new_ulid()
     raw_key = kb_upload.build_raw_key(owner, doc_id, upload_id, req.filename)
@@ -1611,7 +1628,7 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         "raw_key": raw_key, "filename": kb_upload.safe_filename(req.filename), "ext": ext,
         "title": req.title or kb_upload.safe_filename(req.filename),
         "category_l1": req.category_l1 or "", "category_l2": req.category_l2 or "",
-        "permission_level": req.permission_level,
+        "permission_level": perm,
         "share_owner_depts": kb_authz.sanitize_owner_depts(req.share_owner_depts),
         "max_size": kb_upload.MAX_UPLOAD_BYTES,
         "requires_approval": bool(decision.requires_kb_admin_approval),
@@ -1695,11 +1712,14 @@ def kb_register(req: KbRegisterRequest, request: Request,
                 doc_id = payload["doc_id"]
                 if action == "version":
                     # 行锁串行化版本号分配，避免并发升版撞号
-                    cur.execute("SELECT current_version_no FROM fuling_knowledge.document_meta "
+                    cur.execute("SELECT current_version_no, permission_level FROM fuling_knowledge.document_meta "
                                 "WHERE doc_id=%s FOR UPDATE", (doc_id,))
                     mrow = cur.fetchone()
                     if not mrow:
                         raise HTTPException(status_code=404, detail="升版目标文档不存在")
+                    # 纵深防御：升版绝不改可见范围（token 由 upload-url 钦定继承，此处再核一次）
+                    if perm != (mrow[1] or perm):
+                        raise HTTPException(status_code=403, detail="升版不可改变可见范围")
                     version_no = int(mrow[0] or 1) + 1
                     cur.execute("UPDATE fuling_knowledge.document_meta "
                                 "SET current_version_no=%s, updated_at=NOW() WHERE doc_id=%s",
