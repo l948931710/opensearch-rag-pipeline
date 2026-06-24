@@ -36,6 +36,7 @@ Page({
     loading: true,
     loadingMore: false,
     hasMore: false,
+    query: '',
     // '' 正常 / 'login' 未登录 / 'forbidden' 非管理员 / 'error' 加载失败
     errorKind: '',
   },
@@ -52,11 +53,19 @@ Page({
     }
   },
 
-  _reload() {
+  _reload(q) {
+    if (typeof q !== 'string') {
+      q = (this.data.query || '').trim();
+    }
+    this._activeQ = q;
+    const seq = (this._seq = (this._seq || 0) + 1);   // 竞态守卫：仅最新一次搜索的结果生效
     this.setData({ loading: true, errorKind: '', items: [] });
     ensureLogin()
-      .then(() => getMyDocs(0))
+      .then(() => getMyDocs(0, q))
       .then((resp) => {
+        if (seq !== this._seq) {
+          return;   // 已有更新的搜索发起 → 丢弃过期结果，避免旧结果覆盖新结果
+        }
         this._loadedOnce = true;
         this.setData({
           loading: false,
@@ -65,6 +74,9 @@ Page({
         });
       })
       .catch((err) => {
+        if (seq !== this._seq) {
+          return;
+        }
         this._loadedOnce = true;
         const status = err && err.status;
         const kind = status === 401 ? 'login' : status === 403 ? 'forbidden' : 'error';
@@ -76,13 +88,37 @@ Page({
     this._reload();
   },
 
+  // 文档名搜索：输入防抖 300ms 再查（避免逐字一请求）；竞态由 _reload 的 seq 守卫兜底。
+  onSearchInput(e) {
+    const v = (e && e.detail && e.detail.value) || '';
+    this.setData({ query: v });
+    if (this._searchTimer) {
+      clearTimeout(this._searchTimer);
+    }
+    this._searchTimer = setTimeout(() => {
+      this._reload(v.trim());
+    }, 300);
+  },
+
+  onSearchClear() {
+    if (this._searchTimer) {
+      clearTimeout(this._searchTimer);
+    }
+    this.setData({ query: '' });
+    this._reload('');
+  },
+
   onLoadMore() {
     if (this.data.loadingMore || !this.data.hasMore) {
       return;
     }
+    const seq = this._seq;   // 绑定当前搜索：加载更多途中若发起新搜索 → seq 变 → 丢弃旧分页结果
     this.setData({ loadingMore: true });
-    getMyDocs(this.data.items.length)
+    getMyDocs(this.data.items.length, this._activeQ)
       .then((resp) => {
+        if (seq !== this._seq) {
+          return;
+        }
         this.setData({
           loadingMore: false,
           items: this.data.items.concat(((resp && resp.items) || []).map(decorate)),
@@ -90,6 +126,9 @@ Page({
         });
       })
       .catch(() => {
+        if (seq !== this._seq) {
+          return;
+        }
         this.setData({ loadingMore: false });
         dd.showToast({ type: 'none', content: '加载失败，请稍后重试', duration: 2000 });
       });

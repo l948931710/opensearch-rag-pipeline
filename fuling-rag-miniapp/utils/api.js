@@ -168,9 +168,13 @@ export function getOrgTree() {
   return request('/api/kb/org-tree', { auth: true });
 }
 
-/** 我（kb_admin 全量 / dept_admin 限 managed）可管理的文档列表。 */
-export function getMyDocs(offset) {
-  return request('/api/kb/my-docs?limit=20&offset=' + (offset || 0), { auth: true });
+/** 我（kb_admin 全量 / dept_admin 限 managed）可管理的文档列表；q=文档名搜索（可空）。 */
+export function getMyDocs(offset, q) {
+  let p = '/api/kb/my-docs?limit=20&offset=' + (offset || 0);
+  if (q) {
+    p += '&q=' + encodeURIComponent(q);
+  }
+  return request(p, { auth: true });
 }
 
 /** 某文档的版本历史（各版本管线状态）。 */

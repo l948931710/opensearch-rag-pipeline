@@ -9,15 +9,26 @@ import { BASE_URL } from '../../utils/config';
 Page({
   data: { src: '', err: '' },
 
-  onLoad() {
+  onLoad(q) {
+    // 带 doc_id（从文档详情「上传新版本」进入）→ 透传给 /console，H5 列表加载后自动进升版态。
+    const docId = (q && q.doc_id) || '';
+    const docTitle = (q && q.title) || '';
+    const owner = (q && q.owner) || '';
     ensureLogin()
       .then((g) => {
         if (!g.token) {
           this.setData({ err: '未登录' });
           return;
         }
-        const url = BASE_URL + '/console?token=' + encodeURIComponent(g.token) +
+        let url = BASE_URL + '/console?token=' + encodeURIComponent(g.token) +
           '&name=' + encodeURIComponent(g.displayName || '');
+        if (docId) {
+          // owner 透传 → 即使目标文档不在 my-docs 首屏，/console 也能据 doc_id+owner 进升版态
+          // （可见范围由后端 upload-url 强制继承，前端无需 permission_level）。
+          url += '&doc_id=' + encodeURIComponent(docId) +
+            '&title=' + encodeURIComponent(docTitle) +
+            '&owner=' + encodeURIComponent(owner);
+        }
         this.setData({ src: url });
       })
       .catch(() => {

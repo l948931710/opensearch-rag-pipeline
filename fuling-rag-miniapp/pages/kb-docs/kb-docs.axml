@@ -7,6 +7,14 @@
     </view>
   </view>
 
+  <!-- 文档名搜索（查"是否已有现存版本"，避免重复上传）-->
+  <view class="searchbar">
+    <text class="ico ico-search search-ico"></text>
+    <input class="search-input" value="{{query}}" placeholder="搜索文档名…" confirm-type="search"
+           onInput="onSearchInput" />
+    <text a:if="{{query}}" class="search-clear" onTap="onSearchClear">✕</text>
+  </view>
+
   <!-- 加载骨架 -->
   <view a:if="{{loading}}" class="state-wrap">
     <view class="skel-card" a:for="{{[1, 2, 3]}}" a:key="*this">
@@ -40,8 +48,8 @@
   <!-- 空列表 -->
   <view a:elif="{{items.length === 0}}" class="state-wrap state-center">
     <text class="ico ico-search state-ico"></text>
-    <text class="state-title">暂无可管理的文档</text>
-    <text class="state-desc">点右上角「上传」添加文档</text>
+    <text class="state-title">{{query ? '未找到匹配的文档' : '暂无可管理的文档'}}</text>
+    <text class="state-desc">{{query ? '换个关键词，或点右上角「上传」新建' : '点右上角「上传」添加文档'}}</text>
   </view>
 
   <!-- 列表 -->

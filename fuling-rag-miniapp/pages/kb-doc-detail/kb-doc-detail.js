@@ -93,10 +93,15 @@ Page({
   },
 
   onUploadVersion() {
-    dd.showToast({
-      type: 'none',
-      content: '升版功能待域名上线后开放（建议在钉钉电脑端操作）',
-      duration: 2800,
+    // 升版走 web-view 上传页（小程序容器选不了 office 文档）。带 doc_id → /console 自动进升版态，
+    // 归属/可见范围继承原文档。⚠️ 真机生效仍需业务域名上线（与新建上传同一前置）。
+    if (!this._docId) {
+      return;
+    }
+    dd.navigateTo({
+      url: '/pages/kb-upload/kb-upload?doc_id=' + encodeURIComponent(this._docId) +
+        '&title=' + encodeURIComponent(this.data.title || '') +
+        '&owner=' + encodeURIComponent(this.data.ownerDept || ''),
     });
   },
 });
