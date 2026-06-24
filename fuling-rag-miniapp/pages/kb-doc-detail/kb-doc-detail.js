@@ -13,7 +13,9 @@ const CPS_LABEL = {
   FAILED: '失败', SKIPPED_DUPLICATE: '内容未变', PENDING_APPROVAL: '待审核', REJECTED: '已驳回',
 };
 const IX_LABEL = {
-  NOT_INDEXED: '未上线', PROCESSING: '上线中', INDEXED: '已上线', FAILED: '上线失败', DELETED: '已下线',
+  // 管线用 'SUCCESS' 表示上线成功（非 'INDEXED'）；两者都映射为已上线。
+  NOT_INDEXED: '未上线', PROCESSING: '上线中', INDEXED: '已上线', SUCCESS: '已上线',
+  FAILED: '上线失败', DELETED: '已下线', PENDING_DELETE: '待删除',
 };
 
 function decorate(v) {

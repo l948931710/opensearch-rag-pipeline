@@ -1250,12 +1250,15 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
     ix = (index_status or "").upper()
     if doc_status and str(doc_status).lower() not in ("active", ""):
         return "已退役"
-    if ix == "INDEXED" and (chunk_active is None or chunk_active > 0):
+    # 管线把 document_version.index_status 置 'SUCCESS'（非 'INDEXED'）作为上线成功值。
+    if ix in ("INDEXED", "SUCCESS") and (chunk_active is None or chunk_active > 0):
         return "已上线"
     if cs == "FAILED" or ix == "FAILED":
         return "处理失败"
     if cs == "SKIPPED_DUPLICATE":
         return "内容未变"
+    if cs == "PENDING_APPROVAL":
+        return "待审核"
     if cs in ("", "NOT_STARTED"):
         return "排队中"
     return "处理中"

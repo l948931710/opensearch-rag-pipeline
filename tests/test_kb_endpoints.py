@@ -126,6 +126,20 @@ def test_my_docs_no_query_adds_no_search_clause(monkeypatch):
     assert sink["params"] == (21, 0)   # kb_admin 无 owner 参数 → 仅 limit+1, offset
 
 
+def test_kb_status_badge_recognizes_success():
+    """管线 index_status='SUCCESS' 必须映射为已上线（曾错认 'INDEXED' → 1478 活跃文档全显示处理中）。"""
+    from opensearch_pipeline import api
+    b = api._kb_status_badge
+    assert b("DONE", "SUCCESS", "active") == "已上线"        # 管线真实上线值
+    assert b("DONE", "INDEXED", "active") == "已上线"        # 兼容旧/别名词
+    assert b("DONE", "NOT_INDEXED", "active") == "处理中"    # 内容处理完但没进索引
+    assert b("DONE", "SUCCESS", "superseded") == "已退役"    # 退役判定优先于上线
+    assert b("FAILED", "NOT_INDEXED", "active") == "处理失败"
+    assert b("NOT_STARTED", "NOT_INDEXED", "active") == "排队中"
+    assert b("PENDING_APPROVAL", "NOT_INDEXED", "active") == "待审核"   # 公开/跨组上传待审批
+    assert b("DONE", "SUCCESS", "active", 0) == "处理中"     # SUCCESS 但 0 活跃 chunk → 不算已上线
+
+
 def test_my_docs_dept_admin_search_keeps_owner_scope(monkeypatch):
     """搜索不绕过 owner 作用域：dept_admin 搜索时 owner_dept 过滤仍在，参数顺序正确。"""
     _skip_if_not_sim()
