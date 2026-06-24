@@ -94,6 +94,38 @@ def generate_signed_url(
         return ""
 
 
+def head_object(oss_key: str) -> Optional[dict]:
+    """对 OSS 对象做 HEAD：存在返回 {size, content_type, etag}，不存在/失败返回 None。
+
+    供 kb register 校验"客户端确已把文件直传到后端钦定的 raw_key"。只读，无写副作用。
+    """
+    if not oss_key:
+        return None
+    try:
+        from opensearch_pipeline.config import get_config
+        config = get_config()
+        access_id = config.oss.access_key_id
+        access_secret = config.oss.access_key_secret
+        if not access_id or access_id.strip() in ("xxx", ""):
+            return None
+        import oss2
+    except ImportError:
+        logger.warning("oss2 未安装，无法 head_object")
+        return None
+    try:
+        public_endpoint = _ensure_public_endpoint(config.oss.endpoint)
+        bucket = oss2.Bucket(oss2.Auth(access_id, access_secret), public_endpoint, config.oss.bucket_name)
+        meta = bucket.head_object(oss_key)
+        return {
+            "size": int(meta.content_length or 0),
+            "content_type": meta.content_type or "",
+            "etag": (meta.etag or "").strip('"'),
+        }
+    except Exception as e:
+        logger.info("head_object(%s) 未命中/失败: %s", oss_key[:80], e)
+        return None
+
+
 def generate_signed_urls_batch(
     oss_keys: list,
     expires: Optional[int] = None,

@@ -2,7 +2,10 @@
   "pages": [
     "pages/chat/chat",
     "pages/history/history",
-    "pages/settings/settings"
+    "pages/settings/settings",
+    "pages/kb-docs/kb-docs",
+    "pages/kb-doc-detail/kb-doc-detail",
+    "pages/kb-upload/kb-upload"
   ],
   "window": {
     "defaultTitle": "富岭知识助手",

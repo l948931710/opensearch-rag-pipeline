@@ -1,0 +1,59 @@
+<view class="dd-page">
+  <!-- 加载骨架 -->
+  <view a:if="{{loading}}" class="state-wrap">
+    <view class="skel-card" a:for="{{[1, 2]}}" a:key="*this">
+      <view class="skel-ln w70"></view>
+      <view class="skel-ln w40"></view>
+    </view>
+  </view>
+
+  <view a:elif="{{errorKind === 'login'}}" class="state-wrap state-center">
+    <text class="ico ico-warn state-ico"></text>
+    <text class="state-title">登录后可查看</text>
+    <view class="btn-retry" onTap="onRetry"><text class="ico ico-refresh retry-ico"></text><text>重试</text></view>
+  </view>
+
+  <view a:elif="{{errorKind === 'forbidden'}}" class="state-wrap state-center">
+    <text class="ico ico-warn state-ico"></text>
+    <text class="state-title">无权查看该文档</text>
+    <text class="state-desc">该文档不在你的管理范围内</text>
+  </view>
+
+  <view a:elif="{{errorKind === 'notfound'}}" class="state-wrap state-center">
+    <text class="ico ico-warn state-ico"></text>
+    <text class="state-title">文档不存在</text>
+  </view>
+
+  <view a:elif="{{errorKind === 'error'}}" class="state-wrap state-center">
+    <text class="ico ico-warn state-ico"></text>
+    <text class="state-title">加载失败</text>
+    <view class="btn-retry" onTap="onRetry"><text class="ico ico-refresh retry-ico"></text><text>重试</text></view>
+  </view>
+
+  <view a:else>
+    <!-- 头部摘要 -->
+    <view class="head-card">
+      <text class="head-title">{{title || docId}}</text>
+      <view class="head-meta">
+        <text class="doc-tag">{{ownerDept}}</text>
+        <text class="head-count">共 {{versions.length}} 个版本</text>
+      </view>
+      <text a:if="{{chunkLine}}" class="head-chunk">{{chunkLine}}</text>
+      <view class="btn-upver" onTap="onUploadVersion">
+        <text class="btn-upver-ico">＋</text><text>上传新版本</text>
+      </view>
+    </view>
+
+    <!-- 版本列表 -->
+    <view class="ver-card" a:for="{{versions}}" a:key="versionNo">
+      <view class="ver-head">
+        <text class="ver-no">v{{item.versionNo}}</text>
+        <text a:if="{{item.badge}}" class="badge badge-{{item.badgeClass}}">{{item.badge}}</text>
+        <text class="ver-date">{{item.createdAt}}</text>
+      </view>
+      <view class="ver-row"><text class="ver-k">处理</text><text class="ver-v">{{item.cps}}</text></view>
+      <view class="ver-row"><text class="ver-k">上线</text><text class="ver-v">{{item.ix}}</text></view>
+      <view a:if="{{item.err}}" class="ver-err">{{item.err}}</view>
+    </view>
+  </view>
+</view>

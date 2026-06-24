@@ -1,0 +1,234 @@
+/* 知识库管理 · 文档列表 — 复用 Aurora-Forest 令牌（surface / text / brand 等） */
+.kb-page {
+  min-height: 100vh;
+  padding: 16rpx 24rpx 48rpx;
+}
+
+/* ---------- 顶部操作条 ---------- */
+.topbar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16rpx 8rpx 20rpx;
+}
+
+.topbar-title {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.btn-upload {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  background: var(--brand-grad);
+  color: #ffffff;
+  font-size: 26rpx;
+  border-radius: 999rpx;
+  padding: 12rpx 28rpx;
+  box-shadow: 0 4px 12px rgba(21, 96, 74, 0.22);
+}
+
+.btn-upload-ico {
+  margin-right: 8rpx;
+  font-size: 26rpx;
+}
+
+.btn-upload:active {
+  opacity: 0.88;
+}
+
+/* ---------- 列表 ---------- */
+.list {
+  display: flex;
+  flex-direction: column;
+}
+
+.doc-card {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  background: var(--surface);
+  border-radius: 28rpx;
+  box-shadow: var(--sh-1);
+  padding: 28rpx 28rpx;
+  margin-bottom: 18rpx;
+}
+
+.doc-card:active {
+  background: var(--surface-2);
+}
+
+.doc-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.doc-title {
+  font-size: 29rpx;
+  font-weight: 600;
+  color: var(--text-1);
+  line-height: 1.35;
+  word-break: break-all;
+}
+
+.doc-meta {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 12rpx;
+}
+
+.doc-tag {
+  font-size: 22rpx;
+  color: var(--text-3);
+  background: var(--surface-2);
+  border-radius: 12rpx;
+  padding: 2rpx 12rpx;
+  margin-right: 12rpx;
+}
+
+.doc-ver {
+  font-size: 22rpx;
+  color: var(--text-3);
+  margin-right: 12rpx;
+}
+
+.doc-date {
+  font-size: 22rpx;
+  color: var(--text-3);
+}
+
+.doc-right {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin-left: 16rpx;
+  flex-shrink: 0;
+}
+
+.doc-chev {
+  margin-left: 8rpx;
+  font-size: 26rpx;
+  color: var(--text-3);
+}
+
+/* ---------- 状态徽章 ---------- */
+.badge {
+  font-size: 22rpx;
+  border-radius: 14rpx;
+  padding: 4rpx 14rpx;
+}
+
+.badge-ok {
+  color: #15604a;
+  background: rgba(52, 214, 163, 0.18);
+}
+
+.badge-busy {
+  color: #2563eb;
+  background: rgba(59, 130, 246, 0.14);
+}
+
+.badge-queue {
+  color: var(--text-3);
+  background: var(--surface-2);
+}
+
+.badge-warn {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.16);
+}
+
+.badge-fail {
+  color: #dc2626;
+  background: rgba(239, 68, 68, 0.14);
+}
+
+.badge-muted {
+  color: var(--text-3);
+  background: var(--surface-2);
+}
+
+/* ---------- 加载/空/错误态 ---------- */
+.state-wrap {
+  padding: 24rpx 8rpx;
+}
+
+.state-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 120rpx;
+}
+
+.state-ico {
+  font-size: 64rpx;
+  color: var(--text-3);
+  margin-bottom: 20rpx;
+}
+
+.state-title {
+  font-size: 30rpx;
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.state-desc {
+  font-size: 25rpx;
+  color: var(--text-3);
+  margin-top: 12rpx;
+}
+
+.skel-card {
+  background: var(--surface);
+  border-radius: 28rpx;
+  box-shadow: var(--sh-1);
+  padding: 28rpx;
+  margin-bottom: 18rpx;
+}
+
+.skel-ln {
+  height: 26rpx;
+  border-radius: 8rpx;
+  background: var(--surface-2);
+  margin-bottom: 16rpx;
+}
+
+.skel-ln.w70 {
+  width: 70%;
+}
+
+.skel-ln.w40 {
+  width: 40%;
+  margin-bottom: 0;
+}
+
+.btn-retry {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin-top: 28rpx;
+  background: var(--surface);
+  box-shadow: var(--sh-1);
+  border-radius: 999rpx;
+  padding: 14rpx 36rpx;
+  font-size: 26rpx;
+  color: var(--text-1);
+}
+
+.retry-ico {
+  margin-right: 10rpx;
+  font-size: 26rpx;
+  color: var(--brand);
+}
+
+.load-more {
+  text-align: center;
+  padding: 24rpx;
+  font-size: 25rpx;
+  color: var(--text-3);
+}

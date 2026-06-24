@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from opensearch_pipeline.llm_generator import (
@@ -243,6 +243,8 @@ class DingtalkAuthResponse(BaseModel):
     display_name: str = ""
     acl_groups: List[str] = Field(default_factory=list, description="用户所属 ACL 权限组（权威）")
     dept: Optional[str] = None  # 旧·兼容：acl_groups 的 CSV
+    role: str = Field(default="employee", description="知识库写授权角色：employee/dept_admin/kb_admin")
+    can_manage_kb: bool = Field(default=False, description="是否显示「知识库管理」入口（角色为管理员）")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -264,6 +266,7 @@ class Identity:
     acl_groups: List[str] = field(default_factory=list)  # 权威：ACL 权限组列表
     dept: Optional[str] = None  # 旧·兼容：CSV（acl_groups 的逗号拼接）
     name: str = ""
+    role: str = "employee"  # 知识库写授权角色【UI 提示】——非边界；写接口须 DB 现查 resolve_kb_identity
 
 
 def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Identity]:
@@ -293,6 +296,7 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
         acl_groups=groups,
         dept=legacy_dept,
         name=payload.get("name", ""),
+        role=(payload.get("role") or "employee"),
     )
 
 
@@ -409,13 +413,19 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
         raise HTTPException(status_code=401, detail="免登失败：authCode 无效或已过期")
     ident = _resolve_user_identity(userid)
     groups = ident.get("dept") or []  # _resolve_user_identity 现返回 ACL 组列表
-    token = issue_session_token(userid, dept=groups, name=ident.get("name"))
+    # 知识库写授权角色（DB 现查；写入令牌仅作入口可见性 UI 提示，特权接口仍会再现查裁决）
+    from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+    from opensearch_pipeline.kb_authz import can_access_console
+    kb_ident = resolve_kb_identity(userid)
+    token = issue_session_token(userid, dept=groups, name=ident.get("name"), role=kb_ident.role)
     return DingtalkAuthResponse(
         token=token,
         user_id=userid,
         display_name=ident.get("name") or "",
         acl_groups=groups,
         dept=",".join(groups) if isinstance(groups, list) else (groups or None),
+        role=kb_ident.role,
+        can_manage_kb=can_access_console(kb_ident),
     )
 
 
@@ -1160,6 +1170,688 @@ def _suggest_rephrase(question: str, limit: int = 2) -> List[str]:
     except Exception:
         logger.warning("rephrase 建议生成失败（忽略）", exc_info=True)
         return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# 知识库管理（部门管理员）— Phase 0 只读接口
+# 全部【只读】(SELECT)，PROD-RO 安全；授权一律【先现查】resolve_kb_identity（DB 权威，
+# 撤销管理员即时生效），非管理员在任何 DB 查询【之前】403。owner_dept 作用域：kb_admin 全量，
+# dept_admin 仅其 dept_admin_grant 授予的 owner_dept（绝不用读组推导）。
+# ═══════════════════════════════════════════════════════════════
+
+# 10 个 ACL 组的中文标签（权限选择器展示用；单一来源 retriever._VALID_ACL_GROUPS）
+_KB_ACL_GROUP_LABELS = {
+    "finance": "财务", "it": "信息技术", "marketing": "营销", "production": "生产",
+    "pmc": "计划 PMC", "admin": "行政", "hr": "人力资源", "rd": "研发",
+    "quality": "品质技术", "supply": "资材供应",
+}
+
+
+class KbOrgTreeResponse(BaseModel):
+    acl_groups: List[Dict[str, str]] = Field(default_factory=list, description="[{code,label}] 10 个权限组")
+    dept_name_to_groups: Dict[str, List[str]] = Field(default_factory=dict, description="钉钉部门名→组")
+    my_role: str = "employee"
+    my_managed_owner_depts: List[str] = Field(default_factory=list)
+    my_grantable_owner_depts: List[str] = Field(default_factory=list)
+    org_tree: Optional[Dict[str, Any]] = Field(default=None, description="org 快照（缺失则 null）")
+
+
+class KbDocItem(BaseModel):
+    doc_id: str
+    title: str = ""
+    original_filename: str = ""
+    owner_dept: str = ""
+    permission_level: str = "public"
+    current_version_no: int = 1
+    status: str = "active"
+    status_badge: str = ""
+    updated_at: str = ""
+
+
+class KbMyDocsResponse(BaseModel):
+    items: List[KbDocItem] = Field(default_factory=list)
+    has_more: bool = False
+
+
+class KbVersionItem(BaseModel):
+    version_no: int
+    content_process_status: str = ""
+    chunk_status: str = ""
+    index_status: str = ""
+    publish_status: str = ""
+    status_badge: str = ""
+    error_message: str = ""
+    created_at: str = ""
+
+
+class KbVersionHistoryResponse(BaseModel):
+    doc_id: str
+    owner_dept: str = ""
+    versions: List[KbVersionItem] = Field(default_factory=list)
+
+
+class KbDocStatusResponse(BaseModel):
+    doc_id: str
+    version_no: int
+    owner_dept: str = ""
+    content_process_status: str = ""
+    chunk_status: str = ""
+    index_status: str = ""
+    chunk_total: int = 0
+    chunk_active: int = 0
+    chunk_indexed: int = 0
+    status_badge: str = ""
+    error_message: str = ""
+
+
+def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None) -> str:
+    """把管线多字段折叠为用户可读三态+：排队中/处理中/已上线/处理失败/内容未变/已退役。"""
+    cs = (content_status or "").upper()
+    ix = (index_status or "").upper()
+    if doc_status and str(doc_status).lower() not in ("active", ""):
+        return "已退役"
+    if ix == "INDEXED" and (chunk_active is None or chunk_active > 0):
+        return "已上线"
+    if cs == "FAILED" or ix == "FAILED":
+        return "处理失败"
+    if cs == "SKIPPED_DUPLICATE":
+        return "内容未变"
+    if cs in ("", "NOT_STARTED"):
+        return "排队中"
+    return "处理中"
+
+
+def _require_kb_console(identity: Optional[Identity]):
+    """强制：调用者必须是知识库管理员（dept_admin/kb_admin）。返回 DB 现查的 KbIdentity。
+
+    授权【现查】DB（resolve_kb_identity），不信令牌里的 role 提示——撤销管理员/收回授权即时生效。
+    """
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="需要登录")
+    from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+    from opensearch_pipeline.kb_authz import can_access_console
+    kb = resolve_kb_identity(identity.user_id)
+    if not can_access_console(kb):
+        raise HTTPException(status_code=403, detail="无知识库管理权限")
+    return kb
+
+
+def _kb_owner_scope_sql(kb, col: str = "owner_dept"):
+    """owner_dept 作用域 SQL：kb_admin 不限；dept_admin 限其 managed；无授权 → 匹配空集。"""
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    if kb.role == ROLE_KB_ADMIN:
+        return "", []
+    owners = managed_owner_depts(kb)
+    if not owners:
+        return "AND 1=0", []
+    placeholders = ",".join(["%s"] * len(owners))
+    return f"AND {col} IN ({placeholders})", list(owners)
+
+
+def _kb_can_manage(kb, owner_dept: str) -> bool:
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    if kb.role == ROLE_KB_ADMIN:
+        return True
+    return (owner_dept or "") in set(managed_owner_depts(kb))
+
+
+def _load_org_tree_snapshot() -> Optional[Dict[str, Any]]:
+    """读取 org 树快照（scratch/dingtalk_org_tree.json）；缺失/异常 → None（fail open）。"""
+    try:
+        from pathlib import Path
+        p = Path(__file__).resolve().parent.parent / "scratch" / "dingtalk_org_tree.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return None
+
+
+class KbWhoamiResponse(BaseModel):
+    user_id: str
+    display_name: str = ""
+    role: str = "employee"
+    can_manage_kb: bool = False
+    managed_owner_depts: List[str] = Field(default_factory=list)
+
+
+@app.get("/api/kb/whoami", response_model=KbWhoamiResponse)
+def kb_whoami(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """当前 Bearer 身份的角色/可管理范围（DB 现查）。供 web-view 上传页用传入 token 拿身份，
+    无需在 H5 里再走 requestAuthCode 免登（token 由小程序传入）。仅要求登录，不要求管理员。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="需要登录")
+    from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+    from opensearch_pipeline.kb_authz import can_access_console, managed_owner_depts
+    kb = resolve_kb_identity(identity.user_id)
+    return KbWhoamiResponse(
+        user_id=kb.user_id, display_name=kb.name or "", role=kb.role,
+        can_manage_kb=can_access_console(kb), managed_owner_depts=managed_owner_depts(kb),
+    )
+
+
+@app.get("/api/kb/org-tree", response_model=KbOrgTreeResponse)
+def kb_org_tree(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """权限选择器数据：10 个 ACL 组 + 钉钉部门→组映射 + 调用者自身可管理/可授权范围 + org 快照。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.dingtalk_identity import _DEPT_NAME_TO_GROUPS
+    from opensearch_pipeline.kb_authz import managed_owner_depts, grantable_owner_depts
+    return KbOrgTreeResponse(
+        acl_groups=[{"code": c, "label": _KB_ACL_GROUP_LABELS.get(c, c)}
+                    for c in sorted(_KB_ACL_GROUP_LABELS)],
+        dept_name_to_groups={k: list(v) for k, v in _DEPT_NAME_TO_GROUPS.items()},
+        my_role=kb.role,
+        my_managed_owner_depts=managed_owner_depts(kb),
+        my_grantable_owner_depts=grantable_owner_depts(kb),
+        org_tree=_load_org_tree_snapshot(),
+    )
+
+
+@app.get("/api/kb/my-docs", response_model=KbMyDocsResponse)
+def kb_my_docs(request: Request, limit: int = 20, offset: int = 0,
+               identity: Optional[Identity] = Depends(current_identity)):
+    """管理员可管理的文档列表（kb_admin 全量；dept_admin 限其 managed owner_dept）。只读。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
+                           m.permission_level, m.current_version_no, m.status, m.updated_at,
+                           v.content_process_status, v.index_status
+                    FROM fuling_knowledge.document_meta m
+                    LEFT JOIN fuling_knowledge.document_version v
+                      ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
+                    WHERE 1=1 {clause}
+                    ORDER BY m.updated_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*params, limit + 1, offset),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_my_docs 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"文档列表查询失败 (trace: {trace_id})")
+
+    has_more = len(rows) > limit
+    items = []
+    for r in rows[:limit]:
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs) = r
+        items.append(KbDocItem(
+            doc_id=doc_id or "", title=title or "", original_filename=fname or "",
+            owner_dept=owner or "", permission_level=perm or "public",
+            current_version_no=int(cur_ver or 1), status=status or "active",
+            status_badge=_kb_status_badge(cps, ixs, status),
+            updated_at=str(updated) if updated else "",
+        ))
+    return KbMyDocsResponse(items=items, has_more=has_more)
+
+
+@app.get("/api/kb/version-history", response_model=KbVersionHistoryResponse)
+def kb_version_history(request: Request, doc_id: str,
+                       identity: Optional[Identity] = Depends(current_identity)):
+    """某文档的版本历史（含每版管线状态）。授权：kb_admin 或文档 owner_dept 在调用者 managed 内。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, status FROM fuling_knowledge.document_meta "
+                            "WHERE doc_id=%s LIMIT 1", (doc_id,))
+                meta = cur.fetchone()
+                if not meta:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, _doc_status = meta[0] or "", meta[1]
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权查看该文档")
+                cur.execute(
+                    """
+                    SELECT version_no, content_process_status, chunk_status, index_status,
+                           publish_status, error_message, created_at
+                    FROM fuling_knowledge.document_version
+                    WHERE doc_id=%s ORDER BY version_no DESC
+                    """,
+                    (doc_id,),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_version_history 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"版本历史查询失败 (trace: {trace_id})")
+
+    versions = []
+    for r in rows:
+        (vno, cps, chs, ixs, pubs, err, created) = r
+        versions.append(KbVersionItem(
+            version_no=int(vno or 0), content_process_status=cps or "",
+            chunk_status=chs or "", index_status=ixs or "", publish_status=pubs or "",
+            status_badge=_kb_status_badge(cps, ixs, None),
+            error_message=err or "", created_at=str(created) if created else "",
+        ))
+    return KbVersionHistoryResponse(doc_id=doc_id, owner_dept=owner_dept, versions=versions)
+
+
+@app.get("/api/kb/doc-status", response_model=KbDocStatusResponse)
+def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
+                  identity: Optional[Identity] = Depends(current_identity)):
+    """某文档某版本的详细管线状态 + chunk 计数（不传 version → 取 current_version_no）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, status, current_version_no "
+                            "FROM fuling_knowledge.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
+                meta = cur.fetchone()
+                if not meta:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, doc_status, cur_ver = meta[0] or "", meta[1], int(meta[2] or 1)
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权查看该文档")
+                vno = int(version) if version else cur_ver
+                cur.execute(
+                    "SELECT content_process_status, chunk_status, index_status, error_message "
+                    "FROM fuling_knowledge.document_version WHERE doc_id=%s AND version_no=%s LIMIT 1",
+                    (doc_id, vno),
+                )
+                dv = cur.fetchone()
+                cur.execute(
+                    "SELECT COUNT(*), SUM(is_active=1), SUM(index_status='INDEXED') "
+                    "FROM fuling_knowledge.chunk_meta WHERE doc_id=%s AND version_no=%s",
+                    (doc_id, vno),
+                )
+                total, active, indexed = cur.fetchone() or (0, 0, 0)
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_doc_status 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"文档状态查询失败 (trace: {trace_id})")
+
+    cps, chs, ixs, err = (dv or ("", "", "", ""))
+    active = int(active or 0)
+    return KbDocStatusResponse(
+        doc_id=doc_id, version_no=vno, owner_dept=owner_dept,
+        content_process_status=cps or "", chunk_status=chs or "", index_status=ixs or "",
+        chunk_total=int(total or 0), chunk_active=active, chunk_indexed=int(indexed or 0),
+        status_badge=_kb_status_badge(cps, ixs, doc_status, active),
+        error_message=err or "",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 知识库管理 — Phase 1 上传/升版/审批（写）
+# 两段式：upload-url 颁发后端钦定 raw_key + 签名 PUT + upload token；客户端直传 OSS；
+# register 校验 token（HMAC）+ OSS-HEAD 实物 + 现查授权 + 事务内分配 version_no（行锁）+ 幂等。
+# 公开 / 跨组共享 → content_process_status='PENDING_APPROVAL'（scanner 不认领，等 kb_admin 审批）。
+# 写守卫用【轻量】assert_metadata_write_allowed（≠ HA3 删除级开关）。
+# ═══════════════════════════════════════════════════════════════
+
+class KbUploadUrlRequest(BaseModel):
+    action: Literal["new", "version"] = "new"
+    filename: str
+    owner_dept: str
+    permission_level: str = "dept_internal"
+    title: Optional[str] = None
+    category_l1: Optional[str] = None
+    category_l2: Optional[str] = None
+    doc_id: Optional[str] = None                       # action=version 必填
+    share_owner_depts: Optional[List[str]] = None      # 多部门共享意图（Phase 2 才在检索侧生效）
+
+
+class KbUploadUrlResponse(BaseModel):
+    upload_token: str
+    put_url: str
+    raw_key: str
+    doc_id: str
+    expires_in: int
+    requires_kb_admin_approval: bool = False
+
+
+class KbRegisterRequest(BaseModel):
+    upload_token: str
+
+
+class KbRegisterResponse(BaseModel):
+    doc_id: str
+    version_no: int
+    content_process_status: str
+    requires_kb_admin_approval: bool = False
+    status_badge: str = ""
+    idempotent: bool = False
+
+
+class KbApprovalRequest(BaseModel):
+    doc_id: str
+    version_no: Optional[int] = None
+    reason: Optional[str] = None
+
+
+@app.post("/api/kb/upload-url", response_model=KbUploadUrlResponse)
+def kb_upload_url(req: KbUploadUrlRequest, request: Request,
+                  identity: Optional[Identity] = Depends(current_identity)):
+    """颁发签名 PUT URL + upload token。后端钦定 raw_key/doc_id（客户端不可改）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline import kb_upload, kb_authz
+    from opensearch_pipeline.oss_url import generate_signed_url
+    from opensearch_pipeline.config import get_config
+
+    ok, ext, reason = kb_upload.validate_upload_filename(req.filename)
+    if not ok:
+        msg = {"legacy_format": "旧版 Office 格式（.doc/.xls/.ppt）暂不支持，请另存为 .docx/.xlsx/.pptx 后重传",
+               "unsupported_format": "不支持的文件类型",
+               "no_extension": "文件缺少扩展名"}.get(reason, "文件名非法")
+        raise HTTPException(status_code=400, detail=msg)
+
+    owner = (req.owner_dept or "").strip()
+    decision = kb_authz.authorize_upload(kb, owner, req.permission_level, req.share_owner_depts)
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=f"无权上传：{decision.reason}")
+
+    if req.action == "version":
+        if not req.doc_id:
+            raise HTTPException(status_code=400, detail="升版需提供 doc_id")
+        try:
+            from opensearch_pipeline.pipeline_nodes import _get_db_conn
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT owner_dept FROM fuling_knowledge.document_meta "
+                                "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        except HTTPException:
+            raise
+        except Exception as e:
+            trace_id = uuid.uuid4().hex[:8]
+            logger.error("upload-url 查 doc 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"查询文档失败 (trace: {trace_id})")
+        if not row:
+            raise HTTPException(status_code=404, detail="升版目标文档不存在")
+        if (row[0] or "") != owner or not _kb_can_manage(kb, owner):
+            raise HTTPException(status_code=403, detail="无权升版该文档（owner_dept 不在管理范围）")
+        doc_id = req.doc_id
+    else:
+        doc_id = kb_upload.new_doc_id()
+
+    upload_id = kb_upload.new_ulid()
+    raw_key = kb_upload.build_raw_key(owner, doc_id, upload_id, req.filename)
+    token = kb_upload.sign_upload_token({
+        "uid": kb.user_id, "action": req.action, "doc_id": doc_id, "owner_dept": owner,
+        "raw_key": raw_key, "filename": kb_upload.safe_filename(req.filename), "ext": ext,
+        "title": req.title or kb_upload.safe_filename(req.filename),
+        "category_l1": req.category_l1 or "", "category_l2": req.category_l2 or "",
+        "permission_level": req.permission_level,
+        "share_owner_depts": kb_authz.sanitize_owner_depts(req.share_owner_depts),
+        "max_size": kb_upload.MAX_UPLOAD_BYTES,
+        "requires_approval": bool(decision.requires_kb_admin_approval),
+        "owner_name": kb.name,
+    })
+    bucket = get_config().oss.bucket_name
+    put_url = generate_signed_url(raw_key, expires=kb_upload.UPLOAD_TOKEN_TTL, method="PUT")
+    logger.info("kb upload-url: uid=%s action=%s doc_id=%s owner=%s bucket=%s",
+                kb.user_id, req.action, doc_id, owner, bucket)
+    return KbUploadUrlResponse(
+        upload_token=token, put_url=put_url, raw_key=raw_key, doc_id=doc_id,
+        expires_in=kb_upload.UPLOAD_TOKEN_TTL,
+        requires_kb_admin_approval=bool(decision.requires_kb_admin_approval),
+    )
+
+
+@app.post("/api/kb/register", response_model=KbRegisterResponse)
+def kb_register(req: KbRegisterRequest, request: Request,
+                identity: Optional[Identity] = Depends(current_identity)):
+    """登记上传：校验 token + OSS-HEAD + 现查授权 → 事务内分配 version_no（行锁）写 RDS（幂等）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline import kb_upload, kb_authz
+    from opensearch_pipeline.oss_url import head_object
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+
+    payload = kb_upload.verify_upload_token(req.upload_token)
+    if not payload:
+        raise HTTPException(status_code=400, detail="upload_token 无效或已过期")
+    if (payload.get("uid") or "") != kb.user_id:
+        raise HTTPException(status_code=403, detail="upload_token 与当前用户不符")
+
+    owner = payload["owner_dept"]
+    raw_key = payload["raw_key"]
+    perm = payload["permission_level"]
+    # 现查授权（撤销/收回授权后即时生效，绝不信旧 token 的判断）
+    decision = kb_authz.authorize_upload(kb, owner, perm, payload.get("share_owner_depts"))
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=f"无权登记：{decision.reason}")
+    requires_approval = bool(decision.requires_kb_admin_approval)
+
+    # OSS-HEAD 实物校验：存在 + 大小
+    meta = head_object(raw_key)
+    if not meta:
+        raise HTTPException(status_code=400, detail="未检测到已上传的文件（请先完成直传，或 PUT 已过期）")
+    size = int(meta.get("size") or 0)
+    if size <= 0:
+        raise HTTPException(status_code=400, detail="上传的文件为空")
+    if size > int(payload.get("max_size") or kb_upload.MAX_UPLOAD_BYTES):
+        raise HTTPException(status_code=413, detail="文件超过大小上限")
+
+    cfg = get_config()
+    assert_metadata_write_allowed("kb_register_upload", cfg.rds.host, kind="rds")
+
+    cps = "PENDING_APPROVAL" if requires_approval else "NOT_STARTED"
+    appr = "PENDING" if requires_approval else "APPROVED"
+    action = payload.get("action", "new")
+    bucket = cfg.oss.bucket_name
+    trace_id = uuid.uuid4().hex[:8]
+
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 幂等：同一 raw_key 已登记 → 直接返回既有行
+                cur.execute("SELECT doc_id, version_no, content_process_status "
+                            "FROM fuling_knowledge.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                exist = cur.fetchone()
+                if exist:
+                    conn.commit()
+                    return KbRegisterResponse(
+                        doc_id=exist[0], version_no=int(exist[1]),
+                        content_process_status=exist[2] or cps,
+                        requires_kb_admin_approval=requires_approval,
+                        status_badge=_kb_status_badge(exist[2], None, "active"),
+                        idempotent=True,
+                    )
+                doc_id = payload["doc_id"]
+                if action == "version":
+                    # 行锁串行化版本号分配，避免并发升版撞号
+                    cur.execute("SELECT current_version_no FROM fuling_knowledge.document_meta "
+                                "WHERE doc_id=%s FOR UPDATE", (doc_id,))
+                    mrow = cur.fetchone()
+                    if not mrow:
+                        raise HTTPException(status_code=404, detail="升版目标文档不存在")
+                    version_no = int(mrow[0] or 1) + 1
+                    cur.execute("UPDATE fuling_knowledge.document_meta "
+                                "SET current_version_no=%s, updated_at=NOW() WHERE doc_id=%s",
+                                (version_no, doc_id))
+                else:
+                    version_no = 1
+                    cur.execute(
+                        """
+                        INSERT INTO fuling_knowledge.document_meta
+                          (doc_id, title, original_filename, owner_dept, owner_user_id, owner_name,
+                           category_l1, category_l2, permission_level, kb_type, status, current_version_no)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',1)
+                        ON DUPLICATE KEY UPDATE current_version_no=GREATEST(current_version_no,1),
+                                                updated_at=NOW()
+                        """,
+                        (doc_id, payload.get("title"), payload.get("filename"), owner,
+                         kb.user_id, payload.get("owner_name") or kb.name,
+                         payload.get("category_l1") or None, payload.get("category_l2") or None,
+                         perm, ("public" if perm == "public" else "private")),
+                    )
+                cur.execute(
+                    """
+                    INSERT INTO fuling_knowledge.document_version
+                      (doc_id, version_no, bucket_name, raw_key, file_ext, mime_type, file_size_bytes,
+                       content_process_status, approval_status, status, received_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',NOW())
+                    """,
+                    (doc_id, version_no, bucket, raw_key, payload.get("ext"),
+                     kb_upload.expected_mime(payload.get("ext")), size, cps, appr),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_register 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"登记失败 (trace: {trace_id})")
+
+    write_audit(doc_id=doc_id, version_no=version_no,
+                action_type=("VERSION_UP" if action == "version" else "UPLOAD_REGISTER"),
+                operator_type="user", operator_id=kb.user_id, oss_key=raw_key, trace_id=trace_id,
+                message=f"owner={owner} perm={perm} approval={appr} share={payload.get('share_owner_depts')}")
+    return KbRegisterResponse(
+        doc_id=doc_id, version_no=version_no, content_process_status=cps,
+        requires_kb_admin_approval=requires_approval,
+        status_badge=_kb_status_badge(cps, None, "active"),
+    )
+
+
+@app.post("/api/kb/approve")
+def kb_approve(req: KbApprovalRequest, request: Request,
+               identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 审批放行：PENDING_APPROVAL → NOT_STARTED（下一批入库）。仅 kb_admin。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+    if kb.role != ROLE_KB_ADMIN:
+        raise HTTPException(status_code=403, detail="仅知识库管理员可审批")
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    assert_metadata_write_allowed("kb_approve", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                vfilter = "AND version_no=%s" if req.version_no else ""
+                vargs = (req.version_no,) if req.version_no else ()
+                n = cur.execute(
+                    f"UPDATE fuling_knowledge.document_version "
+                    f"SET content_process_status='NOT_STARTED', approval_status='APPROVED', updated_at=NOW() "
+                    f"WHERE doc_id=%s {vfilter} AND content_process_status='PENDING_APPROVAL'",
+                    (req.doc_id, *vargs),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("kb_approve 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"审批失败 (trace: {trace_id})")
+    write_audit(doc_id=req.doc_id, version_no=req.version_no, action_type="APPROVE",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=f"approved {n} version(s)")
+    return {"status": "ok", "approved": n}
+
+
+@app.post("/api/kb/reject")
+def kb_reject(req: KbApprovalRequest, request: Request,
+              identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 驳回：PENDING_APPROVAL → REJECTED（永不入库）。仅 kb_admin。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+    if kb.role != ROLE_KB_ADMIN:
+        raise HTTPException(status_code=403, detail="仅知识库管理员可驳回")
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    assert_metadata_write_allowed("kb_reject", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                vfilter = "AND version_no=%s" if req.version_no else ""
+                vargs = (req.version_no,) if req.version_no else ()
+                n = cur.execute(
+                    f"UPDATE fuling_knowledge.document_version "
+                    f"SET content_process_status='REJECTED', approval_status='REJECTED', "
+                    f"    content_process_error=%s, updated_at=NOW() "
+                    f"WHERE doc_id=%s {vfilter} AND content_process_status='PENDING_APPROVAL'",
+                    ((req.reason or "rejected")[:500], req.doc_id, *vargs),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("kb_reject 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"驳回失败 (trace: {trace_id})")
+    write_audit(doc_id=req.doc_id, version_no=req.version_no, action_type="REJECT",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=(req.reason or "")[:200])
+    return {"status": "ok", "rejected": n}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 电脑端 H5 控制台（PC 免登 + 文档上传/管理）— 同源单页，钉钉小程序"PC 端访问地址"指向 /console
+# ═══════════════════════════════════════════════════════════════
+
+_KB_CONSOLE_HTML_CACHE: Dict[str, Any] = {"html": None}
+
+
+@app.get("/console", response_class=HTMLResponse)
+def kb_console_page():
+    """自包含 H5 控制台单页：jsapi 免登 → /api/auth/dingtalk → /api/kb/*（同源调用）。"""
+    if _KB_CONSOLE_HTML_CACHE["html"] is None:
+        from pathlib import Path
+        p = Path(__file__).resolve().parent / "webconsole" / "console.html"
+        try:
+            _KB_CONSOLE_HTML_CACHE["html"] = p.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error("console.html 读取失败: %s", e)
+            _KB_CONSOLE_HTML_CACHE["html"] = "<h1>知识库控制台页面缺失</h1>"
+    return HTMLResponse(_KB_CONSOLE_HTML_CACHE["html"])
 
 
 # ═══════════════════════════════════════════════════════════════

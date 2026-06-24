@@ -9,6 +9,9 @@ App({
     displayName: '',
     dept: '',
     corpId: '',
+    // 知识库写授权角色（来自 /api/auth/dingtalk；仅控制入口可见性，真正鉴权在服务端每个接口）
+    role: 'employee',
+    canManageKb: false,
   },
 
   onLaunch(options) {

@@ -1,0 +1,8 @@
+<web-view a:if="{{src}}" src="{{src}}"></web-view>
+<view a:elif="{{err}}" class="wv-state">
+  <text class="wv-ico ico ico-warn"></text>
+  <text class="wv-title">{{err}}</text>
+</view>
+<view a:else class="wv-state">
+  <text class="wv-title">加载中…</text>
+</view>
