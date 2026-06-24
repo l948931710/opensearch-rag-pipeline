@@ -126,6 +126,36 @@ def test_my_docs_no_query_adds_no_search_clause(monkeypatch):
     assert sink["params"] == (21, 0)   # kb_admin 无 owner 参数 → 仅 limit+1, offset
 
 
+def test_pending_approvals_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_pending_approvals(request=None, identity=api.Identity(user_id="emp1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_pending_approvals_dept_admin_forbidden(monkeypatch):
+    """部门管理员能进控制台，但审批队列仅 kb_admin（读≠审批）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_pending_approvals(request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_pending_approvals_kb_admin_ok(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    resp = api.kb_pending_approvals(request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.items == []
+    assert "PENDING_APPROVAL" in sink["sql"]
+
+
 def test_kb_status_badge_recognizes_success():
     """管线 index_status='SUCCESS' 必须映射为已上线（曾错认 'INDEXED' → 1478 活跃文档全显示处理中）。"""
     from opensearch_pipeline import api

@@ -48,7 +48,24 @@
     .doctable tbody tr:hover { background:#faf8f2; }
     .dt-name { font-weight:600; color:var(--text1); word-break:break-all; }
     .doctable .verbtn { margin-top:0; padding:5px 14px; white-space:nowrap; }
+    .doctable th[data-sort] { cursor:pointer; user-select:none; }
+    .doctable th[data-sort]:hover { color:var(--brand); }
     .pill { white-space:nowrap; }
+    /* 状态筛选 chips */
+    .chips { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0 4px; }
+    .chip { font-size:13px; color:var(--text3); background:#f4f1ea; border:1px solid var(--line); border-radius:999px; padding:4px 14px; cursor:pointer; }
+    .chip.on { color:#fff; background:var(--brand); border-color:var(--brand); }
+    /* 待审批项 */
+    .appr-item { border-top:1px solid var(--line); padding:12px 0; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+    .appr-item:first-child { border-top:0; }
+    .appr-main { flex:1; min-width:200px; }
+    .appr-title { font-weight:600; }
+    .appr-meta { color:var(--text3); font-size:12px; margin-top:3px; }
+    .btn-ghost { background:#fff; border:1px solid var(--line); color:var(--text1); border-radius:8px; padding:6px 14px; font-size:13px; cursor:pointer; }
+    .btn-ghost.danger { color:#b3261e; border-color:#f3cfca; }
+    /* 上传查重提示 */
+    #dupWarn { background:#fff3da; border:1px solid #f0d9a8; border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; line-height:1.6; }
+    #dupWarn .linklike { color:#9a6b00; }
     /* 桌面：宽屏时上传表单两列、表单控件不至于拉满一整行 */
     @media (min-width:760px) {
       #newModeFields input[type=text], #newModeFields select { max-width:560px; }
@@ -79,6 +96,14 @@
     <div class="muted" id="identScope" style="margin-top:6px"></div>
   </div>
 
+  <div class="card hidden" id="approvalCard">
+    <div class="row" style="justify-content:space-between">
+      <strong>待审批 <span id="apprCount" class="pill warn"></span></strong>
+      <span class="muted">公开 / 跨组上传，需知识库管理员放行</span>
+    </div>
+    <div id="appr"></div>
+  </div>
+
   <div class="card hidden" id="uploadCard">
     <div class="row" style="justify-content:space-between">
       <strong id="uploadTitle">上传新文档</strong>
@@ -86,6 +111,7 @@
     </div>
     <label>选择文件（.pdf .docx .xlsx .pptx .jpg .png）</label>
     <input type="file" id="file" accept=".pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png" />
+    <div id="dupWarn" class="hidden"></div>
     <div id="verModeInfo" class="hidden"></div>
     <div id="newModeFields">
       <label>标题（可空，默认用文件名）</label>
@@ -112,16 +138,21 @@
       <span class="muted" id="docsCount"></span>
     </div>
     <input type="text" id="docSearch" maxlength="80" placeholder="搜索文档名（查是否已有现存版本）…" />
+    <div class="chips" id="filterChips"></div>
     <div class="tablewrap" id="docTable">
       <table class="doctable">
-        <thead><tr><th>文档名</th><th>归属</th><th>版本</th><th>状态</th><th>更新</th><th>操作</th></tr></thead>
+        <thead><tr>
+          <th data-sort="title">文档名</th><th data-sort="owner_dept">归属</th>
+          <th data-sort="current_version_no">版本</th><th data-sort="status_badge">状态</th>
+          <th data-sort="updated_at">更新</th><th>操作</th>
+        </tr></thead>
         <tbody id="docs"></tbody>
       </table>
     </div>
     <div id="docsEmpty" class="muted hidden" style="padding:12px 0"></div>
   </div>
 
-  <div id="diag"><div><strong>诊断（免登/HTTP 调试用）</strong></div></div>
+  <div id="diag" class="hidden"><div><strong>诊断（免登/HTTP 调试用）</strong></div></div>
 </div>
 
 <script>
@@ -133,11 +164,14 @@
   var BADGE_CLASS = { '已上线':'ok','处理中':'busy','排队中':'queue','待审核':'warn','处理失败':'fail','已退役':'muted','内容未变':'muted' };
   var verCtx = null, docsById = {}, pendingVer = '';   // 升版上下文 / doc_id→doc 索引 / web-view 传入待升版 doc_id
   var _docsSeq = 0;   // 文档列表请求序号（搜索竞态守卫）
+  var allDocs = [], curFilter = '', curSort = { key:'', dir:1 };   // 列表状态筛选/列排序
+  var FILTERS = ['', '已上线', '处理中', '待审核', '已退役'];
 
   function $(id){ return document.getElementById(id); }
   function show(id){ $(id).classList.remove('hidden'); }
-  function diag(msg){ var d=document.createElement('div'); d.textContent='• '+msg; $('diag').appendChild(d); }
+  function diag(msg){ if(!qs('debug')) return; var d=document.createElement('div'); d.textContent='• '+msg; $('diag').appendChild(d); }
   function qs(name){ var m=new RegExp('[?&]'+name+'=([^&]+)').exec(location.search); return m?decodeURIComponent(m[1]):''; }
+  if (qs('debug')) { show('diag'); }   // 诊断面板默认隐藏，仅 ?debug=1 显示
 
   function api(path, opts){
     opts = opts || {};
@@ -195,7 +229,7 @@
     show('identCard');
     if (!canManage){ $('identScope').textContent='你不是知识库管理员，无上传权限。'; return; }
     pendingVer = qs('doc_id');   // 手机端 web-view 升版：从文档详情带入 doc_id → 列表加载后自动进升版态
-    loadOrgTree(); loadDocs();
+    loadOrgTree(); loadDocs(); loadApprovals();
   }
 
   // ── 2. 归属部门下拉（来自本人 managed_owner_depts）──
@@ -210,59 +244,114 @@
     }).catch(function(e){ diag('org-tree FAIL: '+e.message); });
   }
 
-  // ── 3. 文档列表 ──
-  // ── 3. 文档列表（桌面表格 / 窄屏堆叠）──
+  // ── 3. 文档列表（桌面表格 / 窄屏堆叠；客户端状态筛选 + 列排序）──
   function loadDocs(){
     var q=($('docSearch') && $('docSearch').value || '').trim();
     var url='/api/kb/my-docs?limit=50'+(q?'&q='+encodeURIComponent(q):'');
     var seq=(_docsSeq=(_docsSeq||0)+1);   // 竞态守卫：仅最新一次查询/搜索的结果落地
     api(url, { auth:true }).then(function(r){
       if(seq!==_docsSeq){ return; }       // 已有更新搜索发起 → 丢弃过期结果
-      var box=$('docs'); box.innerHTML=''; docsById={};
-      var items=r.items||[];
-      $('docsCount').textContent=items.length+' 篇';
-      if(!items.length){
-        $('docTable').classList.add('hidden');
-        $('docsEmpty').classList.remove('hidden');
-        $('docsEmpty').textContent = q ? ('未找到匹配「'+q+'」的文档') : '暂无文档';   // textContent 防 XSS
-      } else {
-        $('docsEmpty').classList.add('hidden');
-        $('docTable').classList.remove('hidden');
-        items.forEach(function(d){
-          docsById[d.doc_id]=d;
-          var cls=BADGE_CLASS[d.status_badge]||'muted';
-          var tr=document.createElement('tr');
-          tr.innerHTML=
-            '<td data-label="文档名"><span class="dt-name">'+esc(d.title||d.original_filename||d.doc_id)+'</span></td>'+
-            '<td data-label="归属">'+esc(GROUP_LABEL[d.owner_dept]||d.owner_dept||'')+'</td>'+
-            '<td data-label="版本">v'+(d.current_version_no||1)+'</td>'+
-            '<td data-label="状态"><span class="pill '+cls+'">'+esc(d.status_badge||'')+'</span></td>'+
-            '<td data-label="更新">'+esc((d.updated_at||'').slice(0,16))+'</td>';
-          var act=document.createElement('td'); act.setAttribute('data-label','操作');
-          var vb=document.createElement('button'); vb.className='verbtn'; vb.textContent='升版';
-          vb.onclick=function(){ enterVersionMode(d); };
-          act.appendChild(vb);
-          tr.appendChild(act);
-          box.appendChild(tr);
-        });
-      }
+      allDocs = r.items||[];
+      docsById = {}; allDocs.forEach(function(d){ docsById[d.doc_id]=d; });
+      renderChips(); renderDocs();
       show('docsCard');
-      if(pendingVer){
-        var pv=pendingVer; pendingVer='';
-        var pd=docsById[pv];
-        if(pd){ enterVersionMode(pd); }
-        else {
-          var ow=qs('owner');
-          if(ow){
-            // 目标文档不在首屏（>50 / 旧文档）：据 URL 的 doc_id+owner 直接进升版态。
-            // 可见范围由后端 upload-url 强制继承，前端无需 permission_level。
-            enterVersionMode({ doc_id:pv, owner_dept:ow, title:qs('title'), permission_level:'', current_version_no:0 });
-          } else {
-            show('uploadCard'); $('uploadMsg').textContent='未在你的文档列表中找到该文档，请在下方列表点「升版」';
-          }
-        }
-      }
+      handlePendingVer();
     }).catch(function(e){ diag('my-docs FAIL: '+e.message); });
+  }
+  function renderChips(){
+    var box=$('filterChips'); box.innerHTML='';
+    FILTERS.forEach(function(f){
+      var n = f ? allDocs.filter(function(d){return d.status_badge===f;}).length : allDocs.length;
+      var c=document.createElement('span'); c.className='chip'+(curFilter===f?' on':'');
+      c.textContent=(f||'全部')+' '+n;
+      c.onclick=function(){ curFilter=f; renderChips(); renderDocs(); };
+      box.appendChild(c);
+    });
+  }
+  function renderDocs(){
+    var box=$('docs'); box.innerHTML='';
+    var rows=allDocs.filter(function(d){ return !curFilter || d.status_badge===curFilter; });
+    if(curSort.key){
+      rows=rows.slice().sort(function(a,b){
+        var x=a[curSort.key], y=b[curSort.key];
+        if(curSort.key==='current_version_no'){ x=+x||0; y=+y||0; }
+        else { x=String(x==null?'':x); y=String(y==null?'':y); }
+        return (x<y?-1:(x>y?1:0))*curSort.dir;
+      });
+    }
+    $('docsCount').textContent = (rows.length===allDocs.length ? allDocs.length : (rows.length+' / '+allDocs.length)) + ' 篇';
+    if(!rows.length){
+      $('docTable').classList.add('hidden');
+      $('docsEmpty').classList.remove('hidden');
+      $('docsEmpty').textContent = curFilter ? ('没有「'+curFilter+'」状态的文档') : '暂无文档';
+      return;
+    }
+    $('docsEmpty').classList.add('hidden'); $('docTable').classList.remove('hidden');
+    rows.forEach(function(d){
+      var cls=BADGE_CLASS[d.status_badge]||'muted';
+      var tr=document.createElement('tr');
+      tr.innerHTML=
+        '<td data-label="文档名"><span class="dt-name">'+esc(d.title||d.original_filename||d.doc_id)+'</span></td>'+
+        '<td data-label="归属">'+esc(GROUP_LABEL[d.owner_dept]||d.owner_dept||'')+'</td>'+
+        '<td data-label="版本">v'+(d.current_version_no||1)+'</td>'+
+        '<td data-label="状态"><span class="pill '+cls+'">'+esc(d.status_badge||'')+'</span></td>'+
+        '<td data-label="更新">'+esc((d.updated_at||'').slice(0,16))+'</td>';
+      var act=document.createElement('td'); act.setAttribute('data-label','操作');
+      var vb=document.createElement('button'); vb.className='verbtn'; vb.textContent='升版';
+      vb.onclick=function(){ enterVersionMode(d); };
+      act.appendChild(vb); tr.appendChild(act); box.appendChild(tr);
+    });
+  }
+  function handlePendingVer(){
+    if(!pendingVer) return;
+    var pv=pendingVer; pendingVer='';
+    var pd=docsById[pv];
+    if(pd){ enterVersionMode(pd); return; }
+    var ow=qs('owner');
+    // 目标文档不在首屏（>50 / 旧文档）：据 URL 的 doc_id+owner 直接进升版态（可见范围后端强制继承）。
+    if(ow){ enterVersionMode({ doc_id:pv, owner_dept:ow, title:qs('title'), permission_level:'', current_version_no:0 }); }
+    else { show('uploadCard'); $('uploadMsg').textContent='未在你的文档列表中找到该文档，请在下方列表点「升版」'; }
+  }
+  // 列头排序（点击切换升/降序）
+  Array.prototype.forEach.call(document.querySelectorAll('.doctable th[data-sort]'), function(th){
+    th.onclick=function(){
+      var k=th.getAttribute('data-sort');
+      curSort = { key:k, dir: (curSort.key===k ? -curSort.dir : 1) };
+      renderDocs();
+    };
+  });
+
+  // ── 待审批队列（仅 kb_admin）──
+  function loadApprovals(){
+    if(role!=='kb_admin') return;
+    api('/api/kb/pending-approvals', { auth:true }).then(function(r){
+      var items=r.items||[]; var box=$('appr'); box.innerHTML='';
+      if(!items.length){ $('approvalCard').classList.add('hidden'); return; }
+      $('apprCount').textContent=items.length;
+      items.forEach(function(d){
+        var el=document.createElement('div'); el.className='appr-item';
+        el.innerHTML='<div class="appr-main"><div class="appr-title">'+esc(d.title||d.original_filename||d.doc_id)+'</div>'+
+          '<div class="appr-meta">'+esc(GROUP_LABEL[d.owner_dept]||d.owner_dept||'')+' · '+esc(PERM_LABEL[d.permission_level]||d.permission_level||'')+
+          ' · v'+(d.version_no||1)+' · '+esc(d.owner_name||'')+' · '+esc((d.created_at||'').slice(0,16))+'</div></div>';
+        var ok=document.createElement('button'); ok.className='btn-ghost'; ok.textContent='通过';
+        ok.onclick=function(){ apprAct('approve', d, ok); };
+        var no=document.createElement('button'); no.className='btn-ghost danger'; no.textContent='驳回';
+        no.onclick=function(){ apprAct('reject', d, no); };
+        el.appendChild(ok); el.appendChild(no); box.appendChild(el);
+      });
+      show('approvalCard');
+    }).catch(function(e){ diag('pending-approvals FAIL: '+e.message); });
+  }
+  function apprAct(kind, d, btn){
+    var reason='';
+    if(kind==='reject'){
+      reason=prompt('驳回理由（可空）：');   // 取消 → null（先判空再用，勿 ||'' 否则取消会误驳回）
+      if(reason===null) return;
+    }
+    btn.disabled=true;
+    api('/api/kb/'+kind, { method:'POST', auth:true, body:{ doc_id:d.doc_id, version_no:d.version_no, reason:reason } })
+      .then(function(){ loadApprovals(); loadDocs(); })
+      .catch(function(e){ btn.disabled=false; diag(kind+' FAIL: '+e.message); alert('操作失败：'+e.message); });
   }
 
   // ── 升版态：复用同一上传卡，归属/可见范围继承原文档（不可改），仅替换文件 → 版本号 +1 ──
@@ -279,6 +368,7 @@
     $('cancelVer').classList.remove('hidden');
     $('uploadBtn').textContent='上传新版本';
     $('uploadMsg').textContent=''; $('uploadErr').textContent=''; $('file').value='';
+    $('dupWarn').classList.add('hidden');
     show('uploadCard');
     $('uploadCard').scrollIntoView({ behavior:'smooth', block:'start' });
   }
@@ -290,12 +380,33 @@
     $('cancelVer').classList.add('hidden');
     $('uploadBtn').textContent='上传';
     $('uploadMsg').textContent=''; $('uploadErr').textContent='';
+    $('dupWarn').classList.add('hidden'); $('dupWarn').innerHTML='';   // 退出升版态一并清掉查重提示
   }
   $('cancelVer').onclick = exitVersionMode;
 
   // 文档名搜索：输入防抖 300ms 再查（loadDocs 自取 #docSearch 值拼 ?q=）。
   var _docSearchTimer;
   $('docSearch').oninput = function(){ clearTimeout(_docSearchTimer); _docSearchTimer=setTimeout(loadDocs, 300); };
+
+  // 上传查重：新建模式下选文件后按文件名查现存文档，命中（非已退役）则提示"应升版而非新建"。
+  $('file').onchange = function(){
+    $('dupWarn').classList.add('hidden');
+    if(verCtx) return;   // 升版态不查重
+    var f=$('file').files[0]; if(!f) return;
+    var core=f.name.replace(/\.[^.]+$/,'').trim();
+    if(core.length<2) return;
+    api('/api/kb/my-docs?limit=10&q='+encodeURIComponent(core), { auth:true }).then(function(r){
+      var hits=(r.items||[]).filter(function(d){ return d.status_badge!=='已退役'; });
+      if(!hits.length) return;
+      var top=hits[0]; var w=$('dupWarn'); w.innerHTML='';
+      var t=document.createElement('span');
+      t.innerHTML='⚠️ 已有相似文档 <strong>'+esc(top.title||top.original_filename||top.doc_id)+'</strong>（v'+(top.current_version_no||1)+' · '+esc(top.status_badge||'')+'）'+
+        (hits.length>1?('等 '+hits.length+' 篇'):'')+'。是否应升版而非新建？ ';
+      var a=document.createElement('span'); a.className='linklike'; a.textContent='改为升版该文档';
+      a.onclick=function(){ enterVersionMode(top); };
+      w.appendChild(t); w.appendChild(a); w.classList.remove('hidden');
+    }).catch(function(){});
+  };
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
 
@@ -317,7 +428,8 @@
       .then(function(reg){
         $('uploadBtn').disabled=false;
         $('uploadMsg').innerHTML='<span class="ok">已提交：'+esc(reg.doc_id)+' v'+reg.version_no+'（'+esc(reg.status_badge||'')+(reg.requires_kb_admin_approval?'，待审批':'')+'）</span>';
-        $('file').value=''; if($('title')){ $('title').value=''; } if(verCtx){ exitVersionMode(); } loadDocs();
+        $('file').value=''; if($('title')){ $('title').value=''; } $('dupWarn').classList.add('hidden');
+        if(verCtx){ exitVersionMode(); } loadDocs(); loadApprovals();
       })
       .catch(function(e){ $('uploadBtn').disabled=false; $('uploadMsg').textContent=''; $('uploadErr').textContent='上传失败：'+e.message; diag('upload FAIL: '+e.message); });
   };

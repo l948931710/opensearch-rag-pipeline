@@ -1856,6 +1856,65 @@ def kb_reject(req: KbApprovalRequest, request: Request,
     return {"status": "ok", "rejected": n}
 
 
+class KbPendingItem(BaseModel):
+    doc_id: str
+    version_no: int = 1
+    title: str = ""
+    original_filename: str = ""
+    owner_dept: str = ""
+    permission_level: str = "public"
+    owner_name: str = ""
+    created_at: str = ""
+
+
+class KbPendingResponse(BaseModel):
+    items: List[KbPendingItem] = Field(default_factory=list)
+
+
+@app.get("/api/kb/pending-approvals", response_model=KbPendingResponse)
+def kb_pending_approvals(request: Request,
+                         identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 待审批队列：列出 content_process_status='PENDING_APPROVAL' 的版本。仅 kb_admin。只读。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    if kb.role != ROLE_KB_ADMIN:
+        raise HTTPException(status_code=403, detail="仅知识库管理员可查看审批队列")
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT m.doc_id, v.version_no, m.title, m.original_filename, m.owner_dept,
+                           m.permission_level, m.owner_name, v.received_at
+                    FROM fuling_knowledge.document_version v
+                    JOIN fuling_knowledge.document_meta m ON m.doc_id = v.doc_id
+                    WHERE v.content_process_status = 'PENDING_APPROVAL'
+                    ORDER BY v.received_at DESC
+                    LIMIT 100
+                    """
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_pending_approvals 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"待审批队列查询失败 (trace: {trace_id})")
+    items = [
+        KbPendingItem(
+            doc_id=r[0] or "", version_no=int(r[1] or 1), title=r[2] or "",
+            original_filename=r[3] or "", owner_dept=r[4] or "",
+            permission_level=r[5] or "public", owner_name=r[6] or "",
+            created_at=str(r[7]) if r[7] else "",
+        )
+        for r in rows
+    ]
+    return KbPendingResponse(items=items)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 电脑端 H5 控制台（PC 免登 + 文档上传/管理）— 同源单页，钉钉小程序"PC 端访问地址"指向 /console
 # ═══════════════════════════════════════════════════════════════
