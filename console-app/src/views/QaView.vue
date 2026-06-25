@@ -46,8 +46,11 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
 
     <!-- 空态：居中问候 + 输入 + 热门问题 -->
     <div v-else class="flex flex-1 flex-col items-center justify-center px-4 pb-20">
-      <div class="mb-7 flex items-center gap-2.5 text-2xl font-extrabold tracking-tight text-foreground">
-        <span class="text-primary">✳</span> 你好{{ name ? '，' + name : '，同事' }}
+      <div class="mb-7 flex items-center gap-3">
+        <span class="grid size-9 place-items-center rounded-[10px] bg-accent-strong">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="var(--primary-foreground)"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
+        </span>
+        <span class="font-serif text-[34px] leading-none tracking-tight text-foreground">你好{{ name ? '，' + name : '，同事' }}</span>
       </div>
       <Composer v-model="draft" :asking="asking" :has-messages="false" :thinking="thinking" @submit="ask()" @stop="stop" @toggle-thinking="toggleThinking" />
       <div v-if="hotQuestions.length" class="mt-5 flex max-w-2xl flex-wrap justify-center gap-2">

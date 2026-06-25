@@ -13,14 +13,14 @@ const m = props.message
 
 <template>
   <!-- 用户 -->
-  <div v-if="m.role === 'user'" class="flex justify-end">
-    <div class="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-accent px-4 py-2.5 text-[15px] text-accent-foreground">
+  <div v-if="m.role === 'user'" class="msg-row flex justify-end">
+    <div class="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-user-bubble px-4 py-2.5 text-[15px] text-foreground">
       {{ m.text }}
     </div>
   </div>
 
   <!-- AI -->
-  <div v-else class="max-w-full">
+  <div v-else class="msg-row group/msg max-w-full">
     <!-- 加载骨架 -->
     <div v-if="m.loading" class="flex items-center gap-2 py-1 text-sm text-muted-foreground">
       <span class="flex gap-1">

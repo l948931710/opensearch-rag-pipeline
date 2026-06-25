@@ -1,54 +1,67 @@
 @import "tailwindcss";
 
 /* ════════════════════════════════════════════════════════════════════
-   富岭设计 tokens —— 三层 CSS-first（Tailwind v4）：
-   ① primitive（富岭原始色值，唯一真实来源）
-   ② semantic（shadcn 语义层；Figma Variables 只映射到这一层，不映射字面色）
-   ③ @theme inline（语义 → Tailwind utilities：bg-background / text-primary …）
-   换肤/对接 Figma：只改第 ① 层色值或第 ② 层指向，组件零改动。
+   设计 tokens —— 三层 CSS-first（Tailwind v4），适配 claude.ai/design「Atlas Chat」：
+   暖纸面 + 绿强调，亮/暗双主题（[data-theme] 切换），Hanken Grotesk / Instrument
+   Serif / JetBrains Mono。① primitive（Atlas 原始色值，按主题分两套）→ ② semantic
+   （shadcn 约定名，零改组件）→ ③ @theme inline（→ Tailwind utilities）。
    ════════════════════════════════════════════════════════════════════ */
 
-/* ── ① primitive ── */
-:root {
-  --fl-green:       #15604a;
-  --fl-green-deep:  #0e4435;
-  --fl-green-wash:  #e8f0ea;
-  --fl-ink:         #1b211d;
-  --fl-ink-2:       #56605a;
-  --fl-ink-3:       #8b948c;
-  --fl-paper:       #eceee8;
-  --fl-surface:     #ffffff;
-  --fl-surface-2:   #f6f7f3;
-  --fl-line:        #dee2d8;
-  --fl-line-2:      #cdd3c6;
-  --fl-st-live:  #15604a;  --fl-st-busy:  #a9760c;  --fl-st-queue: #79847a;
-  --fl-st-warn:  #2f6098;  --fl-st-fail:  #b3261e;  --fl-st-muted: #a7ada0;
-  --fl-mono: "DIN Alternate","SF Mono",ui-monospace,"Roboto Mono",Menlo,Consolas,monospace;
-  --fl-sans: -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
-  --radius: 0.625rem;
+/* ── ① primitive · 亮色（默认）── */
+:root, [data-theme="light"] {
+  --bg:#FAFAF7; --surface:#FFFFFF; --sidebar:#F4F3EE; --panel:#F7F6F1;
+  --border:#E8E7DF; --border-strong:#D8D6CC;
+  --text:#1B1B18; --muted:#6C6B62; --faint:#A3A299;
+  --accent:#2F6B4F; --accent-hover:#27593F; --accent-soft:#E7F0EA; --accent-text:#2F6B4F;
+  --accent-fg:#FFFFFF;                 /* 主按钮上的文字（亮：深绿底配白） */
+  --user-bubble:#F0EFE8;
+  --destructive:#B3261E;
+  --st-live:#2F6B4F; --st-busy:#A9760C; --st-queue:#79847A;
+  --st-warn:#2563A0; --st-fail:#B3261E; --st-muted:#A3A299;
+  --shadow:0 1px 2px rgba(20,20,15,.05),0 6px 20px rgba(20,20,15,.04);
 }
 
-/* ── ② semantic（shadcn 约定名）── */
+/* ── ① primitive · 暗色 ── */
+[data-theme="dark"] {
+  --bg:#171715; --surface:#201F1C; --sidebar:#131312; --panel:#1C1B18;
+  --border:#312E29; --border-strong:#413D36;
+  --text:#ECEAE3; --muted:#9D998E; --faint:#6E6A61;
+  --accent:#74C39A; --accent-hover:#86CDA8; --accent-soft:#1E2A23; --accent-text:#83CBA1;
+  --accent-fg:#10221A;                 /* 主按钮上的文字（暗：浅绿底配深字） */
+  --user-bubble:#262420;
+  --destructive:#E06A6A;
+  --st-live:#74C39A; --st-busy:#E0A06A; --st-queue:#9D998E;
+  --st-warn:#7FB0E0; --st-fail:#E06A6A; --st-muted:#6E6A61;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.32);
+}
+
+/* ── 字体 ── */
 :root {
-  --background: var(--fl-paper);
-  --foreground: var(--fl-ink);
-  --card: var(--fl-surface);
-  --card-foreground: var(--fl-ink);
-  --popover: var(--fl-surface);
-  --popover-foreground: var(--fl-ink);
-  --primary: var(--fl-green);
-  --primary-foreground: #ffffff;
-  --secondary: var(--fl-surface-2);
-  --secondary-foreground: var(--fl-ink);
-  --muted: var(--fl-surface-2);
-  --muted-foreground: var(--fl-ink-3);
-  --accent: var(--fl-green-wash);
-  --accent-foreground: var(--fl-green-deep);
-  --destructive: var(--fl-st-fail);
-  --destructive-foreground: #ffffff;
-  --border: var(--fl-line);
-  --input: var(--fl-line-2);
-  --ring: var(--fl-green);
+  --font-display: "Instrument Serif","Songti SC","STSong",Georgia,"Noto Serif SC",serif;
+  --font-body: "Hanken Grotesk",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+  --font-code: "JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --radius: 0.7rem;
+}
+
+/* ── ② semantic（shadcn 约定名 → Atlas primitive）── */
+:root {
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--surface);
+  --card-foreground: var(--text);
+  --popover: var(--surface);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: var(--accent-fg);
+  --secondary: var(--panel);
+  --secondary-foreground: var(--text);
+  --muted-bg: var(--panel);
+  --muted-foreground: var(--muted);
+  --accent-bg: var(--accent-soft);
+  --accent-foreground: var(--accent-text);
+  --destructive-fg: #ffffff;
+  --input: var(--border-strong);
+  --ring: var(--accent);
 }
 
 /* ── ③ semantic → Tailwind utilities ── */
@@ -63,32 +76,61 @@
   --color-primary-foreground: var(--primary-foreground);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
-  --color-muted: var(--muted);
+  --color-muted: var(--muted-bg);
   --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
+  --color-accent: var(--accent-bg);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-fg);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  /* 富岭专属语义（状态书脊用，问答/台账复用） */
-  --color-st-live:  var(--fl-st-live);
-  --color-st-busy:  var(--fl-st-busy);
-  --color-st-queue: var(--fl-st-queue);
-  --color-st-warn:  var(--fl-st-warn);
-  --color-st-fail:  var(--fl-st-fail);
-  --color-st-muted: var(--fl-st-muted);
-  --font-sans: var(--fl-sans);
-  --font-mono: var(--fl-mono);
+  /* Atlas 专属（组件直接用：bg-sidebar / bg-panel / bg-user-bubble / text-faint …） */
+  --color-sidebar: var(--sidebar);
+  --color-panel: var(--panel);
+  --color-surface: var(--surface);
+  --color-user-bubble: var(--user-bubble);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-strong: var(--accent);
+  --color-accent-text: var(--accent-text);
+  --color-faint: var(--faint);
+  --color-border-strong: var(--border-strong);
+  /* 状态色（高/中/低 + 文档徽章） */
+  --color-st-live:  var(--st-live);
+  --color-st-busy:  var(--st-busy);
+  --color-st-queue: var(--st-queue);
+  --color-st-warn:  var(--st-warn);
+  --color-st-fail:  var(--st-fail);
+  --color-st-muted: var(--st-muted);
+  --font-sans: var(--font-body);
+  --font-serif: var(--font-display);
+  --font-mono: var(--font-code);
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 2px);
   --radius-sm: calc(var(--radius) - 4px);
 }
 
 * { -webkit-tap-highlight-color: transparent; }
-body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--fl-sans); -webkit-font-smoothing: antialiased; }
+html { color-scheme: light dark; }
+[data-theme="dark"] { color-scheme: dark; }
+[data-theme="light"] { color-scheme: light; }
+body {
+  margin: 0; color: var(--text);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  /* 右上角径向绿光（Atlas 签名底） */
+  background:
+    radial-gradient(1000px 460px at 97% -12%, color-mix(in srgb, var(--accent) 8%, var(--bg)) 0%, var(--bg) 56%) fixed,
+    var(--bg);
+}
 
-/* 无障碍：尊重「减少动态效果」——关掉过渡/动画/平滑滚动（侧栏展开、fade、按钮 scale、loading 跳点等） */
+/* 自定义滚动条（Atlas） */
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; border: 3px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* 无障碍：尊重「减少动态效果」 */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
@@ -98,12 +140,14 @@ body { margin: 0; background: var(--background); color: var(--foreground); font-
   }
 }
 
-/* 答案 markdown（renderMd 产出，经 v-html 注入——故不能用 scoped；内容已转义防注入） */
-.md > * { margin: 0; }
-.md > * + * { margin-top: 0.55rem; }
-.md h3 { font-size: 1rem; font-weight: 700; line-height: 1.5; }
-.md p { line-height: 1.75; }
-.md .md-li { position: relative; padding-left: 1.1rem; line-height: 1.7; }
-.md .md-li::before { content: ""; position: absolute; left: 0.35rem; top: 0.7em; width: 4px; height: 4px; border-radius: 9999px; background: var(--fl-ink-3); }
-.md code { font-family: var(--fl-mono); font-size: 0.85em; background: var(--fl-surface-2); padding: 0.1em 0.35em; border-radius: 5px; }
-.md strong { font-weight: 700; }
+/* 答案 markdown（renderMd 产出，v-html 注入；内容已转义防注入）—— Atlas .md 风格 */
+.md { font-size: 14.5px; line-height: 1.68; color: var(--text); }
+.md > *:first-child { margin-top: 0; }
+.md > *:last-child { margin-bottom: 0; }
+.md h3 { font-size: 15px; font-weight: 600; margin: 18px 0 8px; letter-spacing: -.005em; }
+.md p { margin: 0 0 12px; }
+.md .md-li { position: relative; margin: 5px 0; padding-left: 22px; }
+.md .md-li::before { content: ""; position: absolute; left: 8px; top: 0.72em; width: 4px; height: 4px; border-radius: 9999px; background: var(--faint); }
+.md strong { font-weight: 600; }
+.md code { font-family: var(--font-code); font-size: 12.5px; background: var(--accent-soft); color: var(--accent-text); padding: 1.5px 5px; border-radius: 5px; }
+.md a { color: var(--accent-text); text-decoration: underline; }

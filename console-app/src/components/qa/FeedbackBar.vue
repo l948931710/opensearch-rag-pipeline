@@ -9,7 +9,7 @@ const m = props.message
 </script>
 
 <template>
-  <div class="mt-2 flex items-center gap-0.5 text-muted-foreground">
+  <div class="mt-2 flex items-center gap-0.5 text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/msg:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
     <button
       type="button" class="grid size-7 place-items-center rounded-md transition hover:bg-secondary hover:text-foreground disabled:opacity-100"
       :class="{ '!text-st-live': m.voted === 'up' }" :disabled="!!m.voted" title="有用" aria-label="有用"
