@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { Check, X } from 'lucide-vue-next'
+import { Clock, FileText } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
 
-// 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。
+// 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
 const { approvals, apprBusy, isKbAdmin, approve, reject } = useKb()
 
 function onReject(d: PendingItem) {
@@ -14,36 +14,42 @@ function onReject(d: PendingItem) {
 </script>
 
 <template>
-  <section v-if="isKbAdmin && approvals.length" class="rounded-xl border border-st-warn/30 bg-st-warn/5 p-5">
-    <h2 class="flex items-center gap-2 text-sm font-bold text-foreground">
-      待审批
-      <span class="rounded px-1.5 py-0.5 text-[11px] font-medium text-st-warn bg-st-warn/15">{{ approvals.length }}</span>
-    </h2>
-    <p class="mt-1 text-xs text-muted-foreground">公开 / 跨组上传，需知识库管理员放行后才进入入库。</p>
-
-    <div class="mt-3 grid gap-3 sm:grid-cols-2">
-      <div v-for="d in approvals" :key="d.doc_id + '/' + d.version_no" class="kb-card flex flex-col rounded-xl border border-border bg-card p-4">
-        <div class="flex items-start justify-between gap-2">
-          <div class="truncate text-sm font-semibold text-foreground">{{ d.title || d.original_filename || d.doc_id }}</div>
-          <span class="shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium text-st-warn bg-st-warn/15">待审</span>
+  <section v-if="isKbAdmin && approvals.length">
+    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">待审批</p>
+    <div class="overflow-hidden rounded-[15px] border border-border bg-card">
+      <!-- 橙头 -->
+      <div class="flex items-center gap-2.5 border-b border-border bg-st-busy/[0.07] px-[18px] py-3">
+        <Clock :size="16" :stroke-width="1.9" class="text-st-busy" />
+        <span class="text-sm font-semibold text-foreground">待审批队列</span>
+        <span class="rounded-full bg-st-busy px-2 py-px text-[11px] font-bold text-white">{{ approvals.length }}</span>
+        <div class="flex-1" />
+        <span class="hidden text-xs text-muted-foreground sm:inline">公开 / 跨组上传，需放行后入库</span>
+      </div>
+      <!-- 行 -->
+      <div
+        v-for="d in approvals" :key="d.doc_id + '/' + d.version_no"
+        class="flex flex-wrap items-center gap-x-3.5 gap-y-2 border-t border-border px-[18px] py-3 first:border-t-0"
+      >
+        <span class="grid size-8 shrink-0 place-items-center rounded-lg bg-accent-soft text-accent-text">
+          <FileText :size="16" :stroke-width="1.7" />
+        </span>
+        <div class="min-w-0 flex-1">
+          <div class="truncate text-[13.5px] font-semibold text-foreground">{{ d.title || d.original_filename || d.doc_id }}</div>
+          <div class="truncate text-[11.5px] text-faint">
+            {{ deptLabel(d.owner_dept) }} · {{ permLabel(d.permission_level) }} · v{{ d.version_no }}
+            <span v-if="d.owner_name"> · 上传人 {{ d.owner_name }}</span>
+          </div>
         </div>
-        <div class="mt-2 flex flex-wrap items-center gap-1.5">
-          <span class="rounded bg-panel px-1.5 py-0.5 text-[11px] text-muted-foreground">{{ deptLabel(d.owner_dept) }}</span>
-          <span class="rounded bg-panel px-1.5 py-0.5 text-[11px] text-muted-foreground">{{ permLabel(d.permission_level) }}</span>
-          <span class="rounded bg-panel px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">v{{ d.version_no }}</span>
-        </div>
-        <div v-if="d.owner_name || d.created_at" class="mt-1.5 text-xs text-muted-foreground">
-          <span v-if="d.owner_name">{{ d.owner_name }}</span>
-          <span v-if="d.created_at" class="font-mono"> · {{ d.created_at.slice(0, 16) }}</span>
-        </div>
-        <div class="mt-3 flex gap-2 border-t border-border pt-3">
-          <button type="button" class="flex flex-1 items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-medium text-st-live transition hover:bg-st-live/10 disabled:opacity-50" :disabled="apprBusy" @click="approve(d)">
-            <Check :size="14" :stroke-width="2" /> 通过
-          </button>
-          <button type="button" class="flex flex-1 items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-medium text-st-fail transition hover:bg-st-fail/10 disabled:opacity-50" :disabled="apprBusy" @click="onReject(d)">
-            <X :size="14" :stroke-width="2" /> 驳回
-          </button>
-        </div>
+        <button
+          type="button"
+          class="rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          :disabled="apprBusy" @click="onReject(d)"
+        >驳回</button>
+        <button
+          type="button"
+          class="rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+          :disabled="apprBusy" @click="approve(d)"
+        >通过</button>
       </div>
     </div>
   </section>

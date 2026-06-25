@@ -256,10 +256,12 @@ function removeConversation(id: string): void {
   if (activeId.value === id) activeId.value = conversations.value[0]?.id || ''
 }
 
-/** 按标题/消息文本搜索会话（用于侧栏搜索框）。 */
+/** 按标题/消息文本搜索会话（用于侧栏搜索框）。空会话（未提问）不进列表，避免噪声。 */
 function searchConversations(q: string): Conversation[] {
   const k = q.trim().toLowerCase()
-  const list = [...conversations.value].sort((a, b) => b.updatedAt - a.updatedAt)
+  const list = [...conversations.value]
+    .filter((c) => c.messages.length > 0)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
   if (!k) return list
   return list.filter((c) =>
     c.title.toLowerCase().includes(k) ||

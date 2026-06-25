@@ -24,13 +24,13 @@ function onDrop(e: DragEvent) {
 </script>
 
 <template>
-  <section class="rounded-xl border border-border bg-card p-5">
-    <div class="flex items-center justify-between">
-      <h2 class="flex items-center gap-2 text-sm font-bold text-foreground">
-        <UploadCloud :size="17" :stroke-width="1.75" class="text-primary" />
-        {{ verCtx ? '上传新版本' : '上传文档' }}
-      </h2>
-      <button v-if="verCtx" type="button" class="text-xs text-muted-foreground transition hover:text-foreground" @click="backToNew">
+  <section class="rounded-[15px] border border-border bg-card p-[18px]">
+    <div class="flex items-center gap-2.5">
+      <UploadCloud :size="18" :stroke-width="1.8" class="text-accent-text" />
+      <h2 class="text-[14.5px] font-semibold text-foreground">{{ verCtx ? '上传新版本' : '上传文档' }}</h2>
+      <span v-if="verCtx" class="rounded-md border border-st-busy/30 bg-st-busy/[0.14] px-2 py-0.5 text-[11px] font-semibold text-st-busy">升版模式</span>
+      <div class="flex-1" />
+      <button v-if="verCtx" type="button" class="text-[12.5px] text-muted-foreground transition hover:text-foreground" @click="backToNew">
         ← 改为新建文档
       </button>
     </div>
@@ -43,12 +43,12 @@ function onDrop(e: DragEvent) {
       <span v-if="verCtx.current_version_no"> · 当前 v{{ verCtx.current_version_no }}</span>
     </div>
 
-    <!-- 文件选择 -->
-    <div class="mt-3">
+    <!-- 文件选择（Atlas 横向 dropzone） -->
+    <div class="mt-3.5">
       <input ref="fileInput" type="file" class="hidden" :accept="UPLOAD_ACCEPT" :multiple="!verCtx" @change="onChange" />
       <button
         type="button"
-        class="dropzone flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed border-input bg-panel/40 px-4 py-7 text-sm text-muted-foreground hover:border-border-strong hover:bg-panel/70"
+        class="dropzone flex w-full items-center gap-[15px] rounded-[13px] border-[1.5px] border-dashed border-border-strong bg-panel px-[22px] py-5 text-left hover:border-accent-strong hover:bg-accent-soft"
         :data-drag="dragging ? '1' : '0'"
         @click="fileInput?.click()"
         @dragover.prevent="dragging = true"
@@ -56,10 +56,14 @@ function onDrop(e: DragEvent) {
         @dragleave.prevent="dragging = false"
         @drop.prevent="onDrop"
       >
-        <FileUp :size="20" :stroke-width="1.6" :class="dragging ? 'text-accent-text' : ''" />
-        <span :class="dragging ? 'text-accent-text' : ''">
-          {{ dragging ? '松开以选择文件' : (selectedNames.length ? '重新选择' : (verCtx ? '点击或拖拽 1 个文件' : '点击或拖拽文件（可多选）')) }}
+        <span class="grid size-[42px] shrink-0 place-items-center rounded-[11px] border border-border bg-surface text-accent-text">
+          <FileUp :size="20" :stroke-width="1.8" />
         </span>
+        <span class="min-w-0 flex-1">
+          <span class="block text-sm font-semibold text-foreground">{{ dragging ? '松开以选择文件' : '拖拽文件到此，或点击选择' }}</span>
+          <span class="mt-0.5 block text-xs text-faint">{{ verCtx ? '仅需选择 1 个文件作为新版本' : '支持批量 · PDF / DOCX / XLSX / PPTX / JPG / PNG · 单文件 ≤ 50MB' }}</span>
+        </span>
+        <span class="shrink-0 rounded-[9px] border border-border bg-surface px-[15px] py-2 text-[12.5px] font-semibold text-accent-text">选择文件</span>
       </button>
       <div v-if="selectedNames.length" class="mt-2 flex flex-wrap items-center gap-1.5">
         <span v-for="(n, i) in selectedNames" :key="i" class="inline-flex max-w-full items-center rounded bg-secondary px-2 py-1 text-xs text-foreground">
@@ -69,7 +73,6 @@ function onDrop(e: DragEvent) {
           <X :size="13" :stroke-width="2" />
         </button>
       </div>
-      <p class="mt-1.5 text-xs text-muted-foreground">支持 PDF / DOCX / XLSX / PPTX / JPG / PNG，单文件 ≤ 50MB。</p>
     </div>
 
     <p v-if="dupWarn" class="mt-2 rounded-lg border border-st-warn/30 bg-st-warn/10 px-3 py-2 text-xs text-st-warn">{{ dupWarn }}</p>

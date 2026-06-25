@@ -89,22 +89,27 @@ onMounted(async () => {
   </div>
 
   <!-- ───────── 管理员：完整管理台 ───────── -->
-  <div v-else class="mx-auto w-full max-w-5xl space-y-5 px-6 py-8">
+  <div v-else class="mx-auto w-full max-w-5xl space-y-6 px-6 py-8">
     <header class="flex items-baseline justify-between border-b border-border pb-4">
       <h1 class="font-serif text-2xl tracking-tight text-foreground">知识库管理</h1>
       <span class="font-mono text-xs text-muted-foreground">{{ identity?.managedOwnerDepts.join(' · ') || '—' }}</span>
     </header>
 
-    <!-- 仪表盘卡片 -->
-    <div class="kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4">
-      <div v-for="s in stats" :key="s.key" class="kb-card rounded-xl border border-border bg-card p-4">
-        <div class="flex items-center justify-between">
-          <span class="text-xs text-muted-foreground">{{ s.label }}</span>
-          <component :is="s.icon" :size="15" :stroke-width="1.75" :class="s.tone" />
+    <!-- 概览 -->
+    <section>
+      <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">概览</p>
+      <div class="kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div v-for="s in stats" :key="s.key" class="kb-card rounded-[14px] border border-border bg-card p-[15px]">
+          <div class="mb-2.5 flex items-center gap-2">
+            <span class="grid size-7 shrink-0 place-items-center rounded-lg bg-accent-soft" :class="s.tone">
+              <component :is="s.icon" :size="15" :stroke-width="1.8" />
+            </span>
+            <span class="truncate text-[12.5px] font-medium text-muted-foreground">{{ s.label }}</span>
+          </div>
+          <div class="font-mono text-[26px] font-bold leading-none tracking-tight tabular-nums" :class="s.tone">{{ s.value }}</div>
         </div>
-        <div class="mt-1.5 font-mono text-2xl font-semibold tabular-nums" :class="s.tone">{{ s.value }}</div>
       </div>
-    </div>
+    </section>
 
     <ApprovalQueue />
     <UploadCard />
