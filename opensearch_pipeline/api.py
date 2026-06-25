@@ -695,7 +695,8 @@ def ask_stream(req: AskRequest, request: Request,
             try:
                 yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'type': 'chunk', 'content': NO_RESULT_MESSAGE}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}}, ensure_ascii=False)}\n\n"
+                # done 帧带 no_result + rephrase：让流式前端也能渲染结构化空结果卡（换个说法 + 转人工）
+                yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(req.question)}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 log_qa_session(**build_qa_log_kwargs(
@@ -725,6 +726,7 @@ def ask_stream(req: AskRequest, request: Request,
 
         try:
             try:
+                _stream_guard = bool(is_low_confidence_band(chunks))   # 低置信带：补进 done 帧供前端渲染提示条
                 for event in generate_answer_stream(
                     req.question,
                     chunks,
@@ -739,16 +741,17 @@ def ask_stream(req: AskRequest, request: Request,
                     # 截获生成器自带的 [DONE]，改由本函数在 content_blocks 之后统一收尾
                     if event.strip() == "data: [DONE]":
                         continue
-                    yield event
-
-                    # 收集完整回答 + 模型名（用于写历史 & 落库）
                     frame = parse_sse_data_frame(event)
-                    if frame is None:
-                        continue
-                    if frame.get("type") == "chunk" and frame.get("content"):
-                        collected_answer.append(frame["content"])
-                    elif frame.get("type") == "done":
+                    # done 帧补 guard 后再下发（流式也能显示低置信提示条）；其余帧原样透传
+                    if frame is not None and frame.get("type") == "done":
                         model_name = frame.get("model")
+                        frame["guard"] = _stream_guard
+                        yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
+                        continue
+                    yield event
+                    # 收集完整回答（用于写历史 & 落库）
+                    if frame is not None and frame.get("type") == "chunk" and frame.get("content"):
+                        collected_answer.append(frame["content"])
 
                 # 正常完成：图文模式下补发 content_blocks 帧（图片须在全文完成后定稿）。
                 # [文档N] 引用清洗只能作用在定稿（chunk 帧已流出，标记可能跨帧切断）：
