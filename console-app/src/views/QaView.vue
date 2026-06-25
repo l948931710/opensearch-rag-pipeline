@@ -1,21 +1,54 @@
 <script setup lang="ts">
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useSession } from '@/stores/session'
+import { useAsk } from '@/composables/useAsk'
+import Thread from '@/components/qa/Thread.vue'
+import Composer from '@/components/qa/Composer.vue'
 
-// P2：仅外壳占位。问答输入框 / 流式打字机 / 来源卡 / 反馈按钮在 P3 接入。
 const { identity } = storeToRefs(useSession())
+const name = computed(() => identity.value?.name || '')
+
+const { messages, asking, draft, hotQuestions, ask, stop, loadHotQuestions } = useAsk()
+
+const scroller = ref<HTMLElement | null>(null)
+// 流式更新时跟随滚动到底（深 watch 覆盖逐 token 追加 + 状态切换）。
+watch(messages, () => nextTick(() => {
+  const el = scroller.value
+  if (el) el.scrollTop = el.scrollHeight
+}), { deep: true })
+
+onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
 </script>
 
 <template>
-  <div class="mx-auto flex min-h-full w-full max-w-3xl flex-col items-center justify-center px-6 py-16 text-center">
-    <div class="grid size-14 place-items-center rounded-2xl bg-accent text-2xl text-accent-foreground">✳</div>
-    <h1 class="mt-6 text-2xl font-extrabold tracking-tight text-foreground">
-      你好{{ identity?.name ? '，' + identity.name : '' }}
-    </h1>
-    <p class="mt-2 text-sm text-muted-foreground">从富岭自有文档里找答案 —— SOP、U8+、行政与 FAQ。</p>
+  <div class="flex h-full flex-col">
+    <!-- 有消息：线程滚动区 + 底部固定输入 -->
+    <template v-if="messages.length">
+      <div ref="scroller" class="min-h-0 flex-1 overflow-y-auto">
+        <Thread :messages="messages" />
+      </div>
+      <div class="shrink-0 border-t border-border/60 py-3">
+        <Composer v-model="draft" :asking="asking" :has-messages="true" @submit="ask()" @stop="stop" />
+      </div>
+    </template>
 
-    <div class="mt-8 w-full rounded-xl border border-dashed border-border bg-card/60 px-5 py-8 text-sm text-muted-foreground">
-      <span class="font-mono text-xs">P3 · 问答输入 + 流式回答 + 来源 + 反馈</span>
+    <!-- 空态：居中问候 + 输入 + 热门问题 -->
+    <div v-else class="flex flex-1 flex-col items-center justify-center px-4 pb-20">
+      <div class="mb-7 flex items-center gap-2.5 text-2xl font-extrabold tracking-tight text-foreground">
+        <span class="text-primary">✳</span> 你好{{ name ? '，' + name : '，同事' }}
+      </div>
+      <Composer v-model="draft" :asking="asking" :has-messages="false" @submit="ask()" @stop="stop" />
+      <div v-if="hotQuestions.length" class="mt-5 flex max-w-2xl flex-wrap justify-center gap-2">
+        <button
+          v-for="(h, i) in hotQuestions" :key="i"
+          type="button"
+          class="rounded-full border border-border bg-card px-3.5 py-1.5 text-sm text-foreground transition hover:border-ring hover:bg-secondary"
+          @click="ask(h)"
+        >
+          {{ h }}
+        </button>
+      </div>
     </div>
   </div>
 </template>

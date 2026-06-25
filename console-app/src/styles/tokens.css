@@ -87,3 +87,13 @@
 
 * { -webkit-tap-highlight-color: transparent; }
 body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--fl-sans); -webkit-font-smoothing: antialiased; }
+
+/* 答案 markdown（renderMd 产出，经 v-html 注入——故不能用 scoped；内容已转义防注入） */
+.md > * { margin: 0; }
+.md > * + * { margin-top: 0.55rem; }
+.md h3 { font-size: 1rem; font-weight: 700; line-height: 1.5; }
+.md p { line-height: 1.75; }
+.md .md-li { position: relative; padding-left: 1.1rem; line-height: 1.7; }
+.md .md-li::before { content: ""; position: absolute; left: 0.35rem; top: 0.7em; width: 4px; height: 4px; border-radius: 9999px; background: var(--fl-ink-3); }
+.md code { font-family: var(--fl-mono); font-size: 0.85em; background: var(--fl-surface-2); padding: 0.1em 0.35em; border-radius: 5px; }
+.md strong { font-weight: 700; }
