@@ -181,6 +181,12 @@ body {
 .led-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
 .doc-actions { opacity: 0; transition: opacity .13s; }
 .led-row:hover .doc-actions, .led-row:focus-within .doc-actions { opacity: 1; }
+
+/* 会话历史行：hover 显删除 + 当前会话高亮（Atlas） */
+.conv-del { opacity: 0; transition: opacity .13s; }
+.conv-row:hover .conv-del, .conv-row:focus-within .conv-del { opacity: 1; }
+[data-active-item="1"] { background: var(--accent-soft) !important; color: var(--accent-text) !important; font-weight: 600; }
+@media (hover: none) { .conv-del { opacity: 1; } }
 @media (max-width: 680px) {
   .led-head { display: none; }
   .led-row { grid-template-columns: 1fr; gap: 6px; padding: 14px 16px; }

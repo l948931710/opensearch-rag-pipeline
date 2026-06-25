@@ -1,10 +1,10 @@
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { apiFetch, apiJson } from '@/lib/api'
 import { createSseDecoder, type SseEvent } from '@/lib/sseDecoder'
 import { renderMd, stripImg } from '@/lib/markdown'
 
-// 问答线程的单一事实来源（模块级单例，等同轻量 store）。一条线程、进程内、内存态——
-// 切到管理页再回来不丢；与服务端会话历史由 qaSession 关联。
+// 问答单一事实来源（模块级单例，等同轻量 store）。多会话（Atlas 式）：每条会话独立 messages +
+// 服务端 qaSession；新建/切换/删除/搜索；localStorage 持久化（reload 仍在，故有会话历史）。
 
 const NO_RESULT_FALLBACK = '抱歉，当前知识库中未找到相关信息。'
 
@@ -49,16 +49,39 @@ export interface ChatMessage {
   _stageTimer?: ReturnType<typeof setTimeout> | null
 }
 
+export interface Conversation {
+  id: string
+  title: string            // 取首条用户问句；未提问前为「新对话」
+  messages: ChatMessage[]
+  qaSession: string        // 服务端会话关联（reload 后失效，下次提问重建）
+  updatedAt: number
+}
+
 // ── 模块级状态 ──
-const messages = ref<ChatMessage[]>([])
+const conversations = ref<Conversation[]>([])
+const activeId = ref('')
 const asking = ref(false)
 const draft = ref('')
 const thinking = ref(false)            // 深度思考开关（逐问生效，与小程序对齐；后端 qwen3 思考流式）
 const hotQuestions = ref<string[]>([])
-let qaSession = ''
 let askSeq = 0                       // 竞态锁：停止/新提问/重试递增，作废在途流回调
 let abortCtl: AbortController | null = null
-let mid = 0
+let mid = Date.now()                 // 消息 id 计数（Date 种子，避开 load 后旧 id 冲突）
+let cid = Date.now()                 // 会话 id 计数
+
+/** 当前激活会话（无则新建一个）。 */
+function ensureActive(): Conversation {
+  let c = conversations.value.find((x) => x.id === activeId.value)
+  if (!c) {
+    c = reactive({ id: 'c' + (++cid), title: '新对话', messages: [], qaSession: '', updatedAt: Date.now() })
+    conversations.value.unshift(c)   // 最新在前
+    activeId.value = c.id
+  }
+  return c
+}
+
+// 当前会话的 messages（组件读这个；ask/retry/stop 推到激活会话的数组里）。
+const messages = computed<ChatMessage[]>(() => conversations.value.find((c) => c.id === activeId.value)?.messages ?? [])
 
 const LV: Record<Level, string> = { high: '高', mid: '中', low: '低' }
 
@@ -72,12 +95,12 @@ function mapSources(sources: any[]): SourceRow[] {
   })
 }
 
-function onEvent(ai: ChatMessage, ev: SseEvent, seq: number): void {
+function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number): void {
   if (seq !== askSeq) return
   switch (ev.type) {
     case 'session':
       ai.messageId = (ev.message_id as string) || ''
-      if (ev.session_id) qaSession = ev.session_id as string
+      if (ev.session_id) conv.qaSession = ev.session_id as string
       break
     case 'sources':
       ai.sources = mapSources(ev.sources as any[])
@@ -134,13 +157,16 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
   const text = ((preset != null ? preset : draft.value) || '').trim()
   if (!text || asking.value) return
   if (preset == null) draft.value = ''
-  if (!skipUser) messages.value.push({ id: 'u' + (++mid), role: 'user', text })
+  const conv = ensureActive()
+  if (!skipUser) conv.messages.push({ id: 'u' + (++mid), role: 'user', text })
+  if (conv.title === '新对话' && text) conv.title = text.slice(0, 24)   // 标题取首问
+  conv.updatedAt = Date.now()
 
   const ai: ChatMessage = reactive({
     id: 'a' + (++mid), role: 'ai', loading: true, stageText: '正在检索知识库…',
     question: text, sourcesOpen: false, voted: '', viewBlocks: null,
   })
-  messages.value.push(ai)
+  conv.messages.push(ai)
   asking.value = true
 
   const seq = ++askSeq
@@ -149,7 +175,7 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
   abortCtl = ctl
 
   const body: Record<string, unknown> = { question: text }
-  if (qaSession) body.session_id = qaSession
+  if (conv.qaSession) body.session_id = conv.qaSession
   if (thinking.value) body.thinking = true   // 深度思考（仅 true 时带，避免覆盖服务端默认）
 
   try {
@@ -167,11 +193,11 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
       const { value, done } = await reader.read()
       if (seq !== askSeq) { try { reader.cancel() } catch { /* noop */ } if (ai._stageTimer) clearTimeout(ai._stageTimer); return }
       if (done) {
-        for (const ev of dec.flush()) onEvent(ai, ev, seq)
+        for (const ev of dec.flush()) onEvent(conv, ai, ev, seq)
         finishStream(ai, seq)
         break
       }
-      for (const ev of dec.push(value!)) onEvent(ai, ev, seq)
+      for (const ev of dec.push(value!)) onEvent(conv, ai, ev, seq)
     }
   } catch (e: any) {
     if (seq !== askSeq) return   // 已被停止/新提问接管
@@ -203,12 +229,41 @@ function retry(m: ChatMessage): void {
   void ask(m.question, true)
 }
 
-/** 新会话：作废在途流、清空线程与服务端会话关联（下次提问重新建会话）。 */
-function resetThread(): void {
+/** 新会话：作废在途流，新建并切换到一条空会话（下次提问重建服务端会话）。 */
+function newConversation(): void {
   if (asking.value) stop()
-  messages.value = []
   draft.value = ''
-  qaSession = ''
+  const c: Conversation = reactive({ id: 'c' + (++cid), title: '新对话', messages: [], qaSession: '', updatedAt: Date.now() })
+  conversations.value.unshift(c)
+  activeId.value = c.id
+}
+const resetThread = newConversation   // 旧名兼容
+
+/** 切到某条历史会话。 */
+function switchTo(id: string): void {
+  if (id === activeId.value) return
+  if (asking.value) stop()
+  draft.value = ''
+  if (conversations.value.some((c) => c.id === id)) activeId.value = id
+}
+
+/** 删除某条会话；若删的是当前会话则切到最近一条（无则留空，下次提问自建）。 */
+function removeConversation(id: string): void {
+  const i = conversations.value.findIndex((c) => c.id === id)
+  if (i < 0) return
+  if (id === activeId.value && asking.value) stop()
+  conversations.value.splice(i, 1)
+  if (activeId.value === id) activeId.value = conversations.value[0]?.id || ''
+}
+
+/** 按标题/消息文本搜索会话（用于侧栏搜索框）。 */
+function searchConversations(q: string): Conversation[] {
+  const k = q.trim().toLowerCase()
+  const list = [...conversations.value].sort((a, b) => b.updatedAt - a.updatedAt)
+  if (!k) return list
+  return list.filter((c) =>
+    c.title.toLowerCase().includes(k) ||
+    c.messages.some((m) => (m.text || m.raw || m.answer || '').toLowerCase().includes(k)))
 }
 
 async function vote(m: ChatMessage, type: 'upvote' | 'downvote'): Promise<void> {
@@ -275,22 +330,68 @@ async function loadHotQuestions(): Promise<void> {
   } catch { hotQuestions.value = fb }
 }
 
+// ── localStorage 持久化（防御式：失败不影响功能；debounce 防流式期间狂写）──
+const LS_KEY = 'fl-conversations'
+
+function persist(): void {
+  try {
+    const data = conversations.value.slice(0, 30).map((c) => ({
+      id: c.id, title: c.title, updatedAt: c.updatedAt,
+      // 丢 _stageTimer（计时器句柄）、loading（reload 后无在途流）。
+      messages: c.messages.map((m) => { const { _stageTimer, loading, ...rest } = m as any; return rest }),
+    }))
+    localStorage.setItem(LS_KEY, JSON.stringify({ activeId: activeId.value, conversations: data }))
+  } catch { /* 隐私模式/超额忽略 */ }
+}
+
+function loadPersisted(): void {
+  try {
+    const raw = localStorage.getItem(LS_KEY)
+    if (!raw) return
+    const d = JSON.parse(raw)
+    if (!d || !Array.isArray(d.conversations)) return
+    conversations.value = d.conversations.map((c: any) => reactive({
+      id: c.id || 'c' + (++cid),
+      title: c.title || '新对话',
+      qaSession: '',   // 服务端会话已失效，下次提问重建
+      updatedAt: c.updatedAt || Date.now(),
+      messages: (c.messages || []).map((m: any) => reactive({ ...m, loading: false, _stageTimer: null })),
+    }))
+    activeId.value = (d.activeId && conversations.value.some((c) => c.id === d.activeId))
+      ? d.activeId : (conversations.value[0]?.id || '')
+  } catch { /* 损坏数据忽略 */ }
+}
+
+let _persistTimer: ReturnType<typeof setTimeout> | null = null
+function schedulePersist(): void {
+  if (_persistTimer) clearTimeout(_persistTimer)
+  _persistTimer = setTimeout(persist, 400)
+}
+
+// 模块初始化：从 localStorage 恢复 + 建立持久化 watch（仅浏览器环境）。
+if (typeof window !== 'undefined') {
+  loadPersisted()
+  watch([conversations, activeId], schedulePersist, { deep: true })
+}
+
 export function useAsk() {
   return {
     messages, asking, draft, thinking, hotQuestions,
-    ask, stop, retry, resetThread, vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions,
+    conversations, activeId,
+    ask, stop, retry, resetThread, newConversation, switchTo, removeConversation, searchConversations,
+    vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions,
   }
 }
 
-/** 仅供测试：重置线程单例状态。 */
+/** 仅供测试：重置单例状态。 */
 export function __resetAsk(): void {
-  messages.value = []
+  conversations.value = []
+  activeId.value = ''
   asking.value = false
   draft.value = ''
   thinking.value = false
   hotQuestions.value = []
-  qaSession = ''
   askSeq = 0
   abortCtl = null
-  mid = 0
+  if (_persistTimer) { clearTimeout(_persistTimer); _persistTimer = null }
 }

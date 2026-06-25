@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { SquarePen } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useAsk } from '@/composables/useAsk'
 import Thread from '@/components/qa/Thread.vue'
@@ -10,7 +9,7 @@ import Composer from '@/components/qa/Composer.vue'
 const { identity } = storeToRefs(useSession())
 const name = computed(() => identity.value?.name || '')
 
-const { messages, asking, draft, thinking, hotQuestions, ask, stop, resetThread, loadHotQuestions } = useAsk()
+const { messages, asking, draft, thinking, hotQuestions, ask, stop, loadHotQuestions } = useAsk()
 function toggleThinking() { thinking.value = !thinking.value }
 
 const scroller = ref<HTMLElement | null>(null)
@@ -25,17 +24,8 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
 
 <template>
   <div class="flex h-full flex-col">
-    <!-- 有消息：顶部「新会话」+ 线程滚动区 + 底部固定输入 -->
+    <!-- 有消息：线程滚动区 + 底部固定输入（新会话/历史在侧栏） -->
     <template v-if="messages.length">
-      <div class="flex shrink-0 items-center justify-end border-b border-border/60 px-4 py-2">
-        <button
-          type="button"
-          class="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground"
-          title="新会话" @click="resetThread()"
-        >
-          <SquarePen :size="14" :stroke-width="1.75" /> 新会话
-        </button>
-      </div>
       <div ref="scroller" class="min-h-0 flex-1 overflow-y-auto">
         <Thread :messages="messages" />
       </div>

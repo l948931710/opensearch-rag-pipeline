@@ -33,20 +33,22 @@ function mountWith(comp: any, id: Identity) {
   })
 }
 
-describe('Sidebar — 导航 + 角色标签', () => {
-  it('管理员：问答 + 知识库管理（完整标签）', () => {
+describe('Sidebar — 新会话/知识库入口/角色标签', () => {
+  it('管理员：新会话 + 搜索对话 + 知识库管理入口', () => {
     const w = mountWith(Sidebar, identity({ canManage: true }))
-    const links = w.findAll('a.rl')
-    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/', '/manage'])
+    expect(w.text()).toContain('新会话')
+    expect(w.find('input[type="search"]').exists()).toBe(true)   // 搜索对话
+    const links = w.findAll('a.rl')                              // 聊天走会话列表（非 RouterLink）；唯一链接 = /manage
+    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/manage'])
     expect(w.text()).toContain('知识库管理')
   })
 
-  it('普通员工：问答 + 知识库（只读入口，标签精简为「知识库」）', () => {
+  it('普通员工：知识库入口存在（标签精简为「知识库」，非管理）', () => {
     const w = mountWith(Sidebar, identity({ canManage: false, role: 'employee' }))
     const links = w.findAll('a.rl')
-    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/', '/manage'])   // 员工也有入口
+    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/manage'])
     expect(w.text()).toContain('知识库')
-    expect(w.text()).not.toContain('知识库管理')                                   // 但不是管理标签
+    expect(w.text()).not.toContain('知识库管理')
   })
 
   it('展示姓名首字与角色', () => {

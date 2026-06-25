@@ -2,19 +2,19 @@
 import { computed, onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
-import { FileText, CheckCircle2, Loader, Clock, Building2, BadgeCheck, MessagesSquare, Sparkles } from 'lucide-vue-next'
+import { FileText, CheckCircle2, Loader, Clock, Building2, MessagesSquare, Sparkles } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
 import { useAsk } from '@/composables/useAsk'
-import { deptLabel, ROLE_LABEL } from '@/lib/kb'
+import { deptLabel } from '@/lib/kb'
 import UploadCard from '@/components/manage/UploadCard.vue'
 import ApprovalQueue from '@/components/manage/ApprovalQueue.vue'
 import DocTable from '@/components/manage/DocTable.vue'
 
 // 知识库入口：管理员 → 完整管理台；普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，
 // 不打 admin-gated 接口）。AppShell 仅在 ready 后渲染，故身份已解析。
-const { canManage, identity, role } = storeToRefs(useSession())
+const { canManage, identity } = storeToRefs(useSession())
 const { docs, approvals, countOf, loadDocs, loadApprovals, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
@@ -31,7 +31,6 @@ const stats = computed(() => [
 const myDepts = computed(() => (identity.value?.aclGroups || []).map(deptLabel).join('、') || '—')
 const empCards = computed(() => [
   { key: 'dept', label: '我的部门', value: myDepts.value, icon: Building2, mono: false },
-  { key: 'role', label: '我的角色', value: ROLE_LABEL[role.value] || role.value, icon: BadgeCheck, mono: false },
   { key: 'hot', label: '热门问题', value: String(hotQuestions.value.length), icon: Sparkles, mono: true },
 ])
 
@@ -57,7 +56,7 @@ onMounted(async () => {
       <p class="mt-1 text-sm text-muted-foreground">你以员工身份访问，可查看概览并直接提问；文档上传与管理由部门管理员负责。</p>
     </header>
 
-    <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
       <div v-for="c in empCards" :key="c.key" class="kb-card rounded-xl border border-border bg-card p-4">
         <div class="flex items-center justify-between">
           <span class="text-xs text-muted-foreground">{{ c.label }}</span>

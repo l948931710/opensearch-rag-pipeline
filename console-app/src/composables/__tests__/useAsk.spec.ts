@@ -182,6 +182,43 @@ describe('useAsk — 深度思考（parity-5）', () => {
   })
 })
 
+describe('useAsk — 多会话（新建/切换/删除/搜索/标题）', () => {
+  it('提问建会话并取首问为标题；新建切换；删除回退；搜索过滤', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp([
+      frame({ type: 'session', session_id: 's', message_id: 'm' }),
+      frame({ type: 'chunk', content: 'ok' }),
+      frame({ type: 'done', model: 'q', usage: {}, guard: false }), DONE,
+    ])))
+    const { ask, conversations, activeId, newConversation, switchTo, removeConversation, searchConversations, messages } = useAsk()
+
+    await ask('年假怎么休')
+    expect(conversations.value).toHaveLength(1)
+    expect(conversations.value[0].title).toBe('年假怎么休')   // 标题取首问
+    const firstId = activeId.value
+    expect(messages.value.length).toBe(2)                    // 当前会话有 user+ai
+
+    // 新建 → 空会话、切为激活
+    newConversation()
+    expect(conversations.value.length).toBe(2)
+    expect(activeId.value).not.toBe(firstId)
+    expect(messages.value).toEqual([])                       // 新会话空
+
+    // 搜索按标题过滤
+    expect(searchConversations('年假').map((c) => c.id)).toEqual([firstId])
+    expect(searchConversations('不存在')).toEqual([])
+
+    // 切回第一条
+    switchTo(firstId)
+    expect(activeId.value).toBe(firstId)
+    expect(messages.value.length).toBe(2)
+
+    // 删除当前 → 回退到剩余一条
+    removeConversation(firstId)
+    expect(conversations.value.some((c) => c.id === firstId)).toBe(false)
+    expect(activeId.value).not.toBe(firstId)
+  })
+})
+
 describe('useAsk.resetThread — 新会话（parity-6）', () => {
   it('清空线程 + 草稿（下次提问重建会话）', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp([

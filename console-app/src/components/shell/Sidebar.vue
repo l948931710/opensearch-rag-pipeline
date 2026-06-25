@@ -1,102 +1,140 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
-import { MessagesSquare, Library, Sun, Moon, type LucideIcon } from 'lucide-vue-next'
+import { useRoute, useRouter } from 'vue-router'
+import { Plus, Search, Library, Sun, Moon, PanelLeft, PanelLeftClose, Trash2 } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useTheme } from '@/composables/useTheme'
+import { useAsk } from '@/composables/useAsk'
 
-// 图标轨侧栏（Atlas 风）：默认 56px 只显图标，悬停展开成 240px 浮层（绝对定位，覆盖内容、不挤压重排）。
-// 导航由路由派生；「管理」仅 canManage 可见（深链另由 ManageView 自检兜底）。
-interface NavItem { to: string; label: string; icon: LucideIcon; show: boolean }
-
+// Atlas 式侧栏（钉住、可折叠）：品牌 → 新会话 → 搜索 → 会话历史 → 知识库入口 → 主题 → 账户。
 const session = useSession()
 const { identity, role, canManage } = storeToRefs(session)
 const { theme, toggle } = useTheme()
+const { activeId, newConversation, switchTo, removeConversation, searchConversations } = useAsk()
+const route = useRoute()
+const router = useRouter()
 
-// 知识库入口对【所有人】可见：管理员进完整管理台，普通员工进只读概览（ManageView 内分流）。
-const nav = computed<NavItem[]>(() => [
-  { to: '/', label: '问答', icon: MessagesSquare, show: true },
-  { to: '/manage', label: canManage.value ? '知识库管理' : '知识库', icon: Library, show: true },
-].filter((i) => i.show))
+const RAIL_KEY = 'fl-rail'
+const collapsed = ref<boolean>((() => { try { return localStorage.getItem(RAIL_KEY) === '1' } catch { return false } })())
+function toggleRail() { collapsed.value = !collapsed.value; try { localStorage.setItem(RAIL_KEY, collapsed.value ? '1' : '0') } catch { /* noop */ } }
 
-const ROLE_LABEL: Record<string, string> = {
-  employee: '员工', dept_admin: '部门管理员', kb_admin: '知识库管理员',
-}
+const q = ref('')
+const convs = computed(() => searchConversations(q.value))
+function isActiveConv(id: string) { return route.path === '/' && id === activeId.value }
+
+function onNewChat() { newConversation(); if (route.path !== '/') void router.push('/') }
+function onPickConv(id: string) { switchTo(id); if (route.path !== '/') void router.push('/') }
+function onDelConv(id: string, e: Event) { e.stopPropagation(); removeConversation(id) }
+
+const ROLE_LABEL: Record<string, string> = { employee: '员工', dept_admin: '部门管理员', kb_admin: '知识库管理员' }
 const initial = computed(() => (identity.value?.name || '?').trim().charAt(0) || '?')
-// 管理员「额度/管辖」：可管部门数（无则回退 ACL 组数）——Atlas 式账户区的副信息。
-const budget = computed(() => {
-  const n = identity.value?.managedOwnerDepts?.length || 0
-  return n > 0 ? `管辖 ${n} 个部门` : ''
-})
+const kbLabel = computed(() => (canManage.value ? '知识库管理' : '知识库'))
 </script>
 
 <template>
-  <!-- 外层占住 56px 轨道宽；内层浮层悬停展开覆盖内容 -->
-  <aside class="relative z-20 w-14 shrink-0">
-    <div
-      class="group/sb absolute inset-y-0 left-0 flex w-14 flex-col overflow-hidden border-r border-border
-             bg-sidebar transition-[width,box-shadow] duration-200 ease-out hover:w-60 hover:shadow-xl hover:shadow-black/10"
-    >
-      <!-- 品牌位：绿色 sparkle 标 + 衬线字标 -->
-      <div class="flex h-16 items-center gap-2.5 px-3.5">
-        <div class="grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-accent-strong">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="var(--primary-foreground)">
-            <path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" />
-          </svg>
-        </div>
-        <span class="whitespace-nowrap font-serif text-[21px] leading-none tracking-tight text-foreground opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100">
-          富岭知识库
+  <aside
+    class="flex h-full shrink-0 flex-col border-r border-border bg-sidebar transition-[width] duration-200 ease-out"
+    :class="collapsed ? 'w-14' : 'w-64'"
+  >
+    <!-- 品牌 + 折叠 -->
+    <div class="flex h-14 items-center gap-2.5 px-3">
+      <div class="grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-accent-strong">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="var(--primary-foreground)"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
+      </div>
+      <span v-if="!collapsed" class="flex-1 truncate font-serif text-[21px] leading-none tracking-tight text-foreground">富岭知识库</span>
+      <button
+        type="button"
+        class="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition hover:bg-accent-soft hover:text-foreground"
+        :class="collapsed ? 'mx-auto' : ''"
+        :title="collapsed ? '展开侧栏' : '收起侧栏'"
+        @click="toggleRail"
+      >
+        <component :is="collapsed ? PanelLeft : PanelLeftClose" :size="17" :stroke-width="1.75" />
+      </button>
+    </div>
+
+    <!-- 新会话 -->
+    <div class="px-2">
+      <button
+        type="button"
+        class="flex h-10 w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-2.5 text-sm font-medium text-foreground transition hover:border-border-strong hover:bg-panel"
+        :class="collapsed ? 'justify-center' : ''"
+        title="新会话"
+        @click="onNewChat"
+      >
+        <Plus :size="18" :stroke-width="2" class="shrink-0" />
+        <span v-if="!collapsed">新会话</span>
+      </button>
+    </div>
+
+    <!-- 搜索 -->
+    <div v-if="!collapsed" class="px-2 pt-2">
+      <div class="relative">
+        <Search :size="14" :stroke-width="1.75" class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+        <input
+          v-model="q" type="search" placeholder="搜索对话…"
+          class="w-full rounded-lg border border-border bg-surface py-1.5 pl-8 pr-2.5 text-sm text-foreground placeholder:text-faint focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/15"
+        />
+      </div>
+    </div>
+
+    <!-- 会话历史 -->
+    <nav v-if="!collapsed" class="mt-1 min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 py-1">
+      <button
+        v-for="c in convs" :key="c.id"
+        type="button"
+        class="conv-row group/c flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm transition hover:bg-accent-soft"
+        :data-active-item="isActiveConv(c.id) ? '1' : '0'"
+        :class="isActiveConv(c.id) ? 'text-accent-text' : 'text-foreground'"
+        @click="onPickConv(c.id)"
+      >
+        <span class="min-w-0 flex-1 truncate">{{ c.title || '新对话' }}</span>
+        <span
+          class="conv-del grid size-6 shrink-0 place-items-center rounded text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
+          title="删除会话" @click="onDelConv(c.id, $event)"
+        >
+          <Trash2 :size="13" :stroke-width="1.75" />
         </span>
-      </div>
+      </button>
+      <p v-if="!convs.length" class="px-2.5 py-6 text-center text-xs text-muted-foreground">
+        {{ q ? '无匹配对话' : '还没有对话，点「新会话」开始' }}
+      </p>
+    </nav>
+    <div v-else class="flex-1" />
 
-      <!-- 导航 -->
-      <nav class="mt-1 flex flex-col gap-1 px-2">
-        <RouterLink
-          v-for="item in nav"
-          :key="item.to"
-          :to="item.to"
-          class="group/it relative flex h-10 items-center gap-3 rounded-lg px-2.5 text-muted-foreground
-                 transition-colors hover:bg-accent-soft hover:text-foreground"
-          active-class="!bg-accent-soft !text-accent-text !font-semibold"
-          exact-active-class=""
-        >
-          <component :is="item.icon" :size="19" :stroke-width="1.75" class="shrink-0" />
-          <span class="whitespace-nowrap text-sm font-medium opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100">
-            {{ item.label }}
-          </span>
-        </RouterLink>
-      </nav>
+    <!-- 知识库入口 + 主题 -->
+    <div class="space-y-1 border-t border-border px-2 py-2">
+      <RouterLink
+        to="/manage"
+        class="flex h-10 items-center gap-3 rounded-lg px-2.5 text-muted-foreground transition hover:bg-accent-soft hover:text-foreground"
+        :class="collapsed ? 'justify-center' : ''"
+        active-class="!bg-accent-soft !text-accent-text !font-semibold"
+      >
+        <Library :size="19" :stroke-width="1.75" class="shrink-0" />
+        <span v-if="!collapsed" class="truncate text-sm font-medium">{{ kbLabel }}</span>
+      </RouterLink>
+      <button
+        type="button"
+        class="flex h-10 w-full items-center gap-3 rounded-lg px-2.5 text-muted-foreground transition hover:bg-accent-soft hover:text-foreground"
+        :class="collapsed ? 'justify-center' : ''"
+        :title="theme === 'dark' ? '切到亮色' : '切到暗色'"
+        @click="toggle"
+      >
+        <component :is="theme === 'dark' ? Sun : Moon" :size="19" :stroke-width="1.75" class="shrink-0" />
+        <span v-if="!collapsed" class="text-sm font-medium">{{ theme === 'dark' ? '亮色模式' : '暗色模式' }}</span>
+      </button>
+    </div>
 
-      <div class="flex-1" />
-
-      <!-- 主题切换 -->
-      <div class="px-2 pb-1">
-        <button
-          type="button"
-          class="flex h-10 w-full items-center gap-3 rounded-lg px-2.5 text-muted-foreground transition-colors hover:bg-accent-soft hover:text-foreground"
-          :title="theme === 'dark' ? '切到亮色' : '切到暗色'"
-          @click="toggle"
-        >
-          <component :is="theme === 'dark' ? Sun : Moon" :size="19" :stroke-width="1.75" class="shrink-0" />
-          <span class="whitespace-nowrap text-sm font-medium opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100">
-            {{ theme === 'dark' ? '亮色模式' : '暗色模式' }}
-          </span>
-        </button>
-      </div>
-
-      <!-- 账户区（Atlas 式）：头像 + 姓名 + 角色徽章 + 管理员额度 -->
-      <div class="flex items-center gap-3 border-t border-border px-3 py-3">
-        <div class="grid size-8 shrink-0 place-items-center rounded-full bg-accent-soft text-sm font-semibold text-accent-text">{{ initial }}</div>
-        <div class="min-w-0 flex-1 opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100">
-          <div class="truncate text-sm font-semibold text-foreground">{{ identity?.name || '未登录' }}</div>
-          <div class="mt-0.5 flex items-center gap-1.5">
-            <span
-              class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
-              :class="canManage ? 'bg-accent-soft text-accent-text' : 'bg-panel text-muted-foreground'"
-            >{{ ROLE_LABEL[role] || role }}</span>
-            <span v-if="budget" class="truncate text-[11px] text-muted-foreground">{{ budget }}</span>
-          </div>
-        </div>
+    <!-- 账户（无额度） -->
+    <div class="flex items-center gap-3 border-t border-border px-3 py-3">
+      <div class="grid size-8 shrink-0 place-items-center rounded-full bg-accent-soft text-sm font-semibold text-accent-text">{{ initial }}</div>
+      <div v-if="!collapsed" class="min-w-0 flex-1">
+        <div class="truncate text-sm font-semibold text-foreground">{{ identity?.name || '未登录' }}</div>
+        <span
+          class="mt-0.5 inline-block rounded px-1.5 py-0.5 text-[10px] font-medium"
+          :class="canManage ? 'bg-accent-soft text-accent-text' : 'bg-panel text-muted-foreground'"
+        >{{ ROLE_LABEL[role] || role }}</span>
       </div>
     </div>
   </aside>
