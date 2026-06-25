@@ -16,11 +16,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 from opensearch_pipeline.llm_generator import (
@@ -2116,6 +2117,42 @@ def kb_console_page():
             logger.error("console.html 读取失败: %s", e)
             _KB_CONSOLE_HTML_CACHE["html"] = "<h1>知识库控制台页面缺失</h1>"
     return HTMLResponse(_KB_CONSOLE_HTML_CACHE["html"])
+
+
+# ═══════════════════════════════════════════════════════════════
+# Vite 控制台 SPA（/console-next）— 与旧 /console 并行双跑（P7 再切默认入口、P8 退役 legacy）
+#   · hash 命名的静态资源 immutable，index.html no-cache（修正#9）
+#   · SPA 回退【仅作用于 /console-next/*】：未命中文件 → index.html，由前端路由接管。
+#     该 catch-all 不匹配 /api/*，故不存在的 API 仍返回 FastAPI 默认 JSON 404（修正#3）。
+# ═══════════════════════════════════════════════════════════════
+
+_NEXT_DIST = Path(__file__).resolve().parent / "webconsole" / "next-dist"
+
+
+def _serve_next_file(rel: str) -> Response:
+    """从 next-dist 安全返回文件；越界/不存在 → index.html（SPA 回退，no-cache）。"""
+    base = _NEXT_DIST
+    index = base / "index.html"
+    if rel:
+        target = (base / rel).resolve()
+        # 路径穿越守卫：解析后必须仍落在 next-dist 之内
+        if (target == base or base in target.parents) and target.is_file():
+            cache = "public, max-age=31536000, immutable" if rel.startswith("assets/") else "no-cache"
+            return FileResponse(target, headers={"Cache-Control": cache})
+    if index.is_file():
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+    return HTMLResponse("<h1>/console-next 尚未构建（在 console-app 下运行 npm run build）</h1>", status_code=404)
+
+
+@app.get("/console-next", include_in_schema=False)
+def kb_console_next_root():
+    """无尾斜杠 → 重定向到带斜杠（与构建 base /console-next/ 一致，资源相对路径才正确）。"""
+    return RedirectResponse(url="/console-next/")
+
+
+@app.get("/console-next/{path:path}", include_in_schema=False)
+def kb_console_next(path: str):
+    return _serve_next_file(path)
 
 
 # ═══════════════════════════════════════════════════════════════
