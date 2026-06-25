@@ -8,7 +8,8 @@ import { useTheme } from '@/composables/useTheme'
 import { useAsk } from '@/composables/useAsk'
 
 // Atlas 式侧栏：默认 56px 图标轨，悬停/聚焦展开成 272px 浮层（覆盖内容、不挤压重排）。
-// 品牌 → 新会话 → 搜索对话 → 会话历史 → 知识库入口 → 主题 → 账户。
+// 每行图标放进统一的 56px 居中槽（.rail-ico = size-10，外层 px-2）→ 收起态所有图标恒在轨道中线，
+// 展开时图标不动、仅标签淡入，故折叠时图标不会漂移。
 const session = useSession()
 const { identity, role, canManage } = storeToRefs(session)
 const { theme, toggle } = useTheme()
@@ -27,6 +28,8 @@ function onDelConv(id: string, e: Event) { e.stopPropagation(); removeConversati
 const ROLE_LABEL: Record<string, string> = { employee: '员工', dept_admin: '部门管理员', kb_admin: '知识库管理员' }
 const initial = computed(() => (identity.value?.name || '?').trim().charAt(0) || '?')
 const kbLabel = computed(() => (canManage.value ? '知识库管理' : '知识库'))
+// 展开淡入：标签/搜索/历史共用
+const reveal = 'opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100'
 </script>
 
 <template>
@@ -35,30 +38,32 @@ const kbLabel = computed(() => (canManage.value ? '知识库管理' : '知识库
     <div
       class="group/sb absolute inset-y-0 left-0 flex w-14 flex-col overflow-hidden border-r border-border bg-sidebar
              transition-[width,box-shadow] duration-200 ease-out hover:w-[272px] focus-within:w-[272px]
-             hover:shadow-2xl hover:shadow-black/10 focus-within:w-[272px] focus-within:shadow-2xl focus-within:shadow-black/10"
+             hover:shadow-2xl hover:shadow-black/10 focus-within:shadow-2xl focus-within:shadow-black/10"
     >
       <!-- 品牌 -->
-      <div class="flex h-14 items-center gap-2.5 px-3">
-        <div class="grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-accent-strong">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="var(--primary-foreground)"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
-        </div>
-        <span class="whitespace-nowrap font-serif text-[21px] leading-none tracking-tight text-foreground opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100">富岭知识库</span>
+      <div class="flex h-14 items-center px-2">
+        <span class="grid size-10 shrink-0 place-items-center">
+          <span class="grid size-[30px] place-items-center rounded-[9px] bg-accent-strong">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="var(--primary-foreground)"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
+          </span>
+        </span>
+        <span class="ml-1 truncate font-serif text-[21px] leading-none tracking-tight text-foreground" :class="reveal">富岭知识库</span>
       </div>
 
       <!-- 新会话 -->
       <div class="px-2 pt-1">
         <button
           type="button"
-          class="flex h-10 w-full items-center gap-3 rounded-lg border border-border bg-surface px-[11px] text-sm font-medium text-foreground transition hover:border-border-strong hover:bg-panel"
+          class="flex h-10 w-full items-center rounded-lg border border-border bg-surface text-sm font-medium text-foreground transition hover:border-border-strong hover:bg-panel"
           title="新会话" @click="onNewChat"
         >
-          <Plus :size="18" :stroke-width="2" class="shrink-0" />
-          <span class="whitespace-nowrap opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100">新会话</span>
+          <span class="grid size-10 shrink-0 place-items-center"><Plus :size="18" :stroke-width="2" /></span>
+          <span class="truncate" :class="reveal">新会话</span>
         </button>
       </div>
 
-      <!-- 搜索（展开可见；折叠时透明占位） -->
-      <div class="px-2 pt-2 opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100">
+      <!-- 搜索（展开可见） -->
+      <div class="px-3 pt-2" :class="reveal">
         <div class="relative">
           <Search :size="14" :stroke-width="1.75" class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
           <input
@@ -69,7 +74,7 @@ const kbLabel = computed(() => (canManage.value ? '知识库管理' : '知识库
       </div>
 
       <!-- 会话历史 -->
-      <nav class="mt-1 min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 py-1 opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100">
+      <nav class="mt-1 min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 py-1" :class="reveal">
         <button
           v-for="c in convs" :key="c.id"
           type="button"
@@ -95,26 +100,28 @@ const kbLabel = computed(() => (canManage.value ? '知识库管理' : '知识库
       <div class="space-y-1 border-t border-border px-2 py-2">
         <RouterLink
           to="/manage"
-          class="flex h-10 items-center gap-3 rounded-lg px-[11px] text-muted-foreground transition hover:bg-accent-soft hover:text-foreground"
+          class="flex h-10 items-center rounded-lg text-muted-foreground transition hover:bg-accent-soft hover:text-foreground"
           active-class="!bg-accent-soft !text-accent-text !font-semibold"
         >
-          <Library :size="19" :stroke-width="1.75" class="shrink-0" />
-          <span class="whitespace-nowrap text-sm font-medium opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100">{{ kbLabel }}</span>
+          <span class="grid size-10 shrink-0 place-items-center"><Library :size="19" :stroke-width="1.75" /></span>
+          <span class="truncate text-sm font-medium" :class="reveal">{{ kbLabel }}</span>
         </RouterLink>
         <button
           type="button"
-          class="flex h-10 w-full items-center gap-3 rounded-lg px-[11px] text-muted-foreground transition hover:bg-accent-soft hover:text-foreground"
+          class="flex h-10 w-full items-center rounded-lg text-muted-foreground transition hover:bg-accent-soft hover:text-foreground"
           :title="theme === 'dark' ? '切到亮色' : '切到暗色'" @click="toggle"
         >
-          <component :is="theme === 'dark' ? Sun : Moon" :size="19" :stroke-width="1.75" class="shrink-0" />
-          <span class="whitespace-nowrap text-sm font-medium opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100">{{ theme === 'dark' ? '亮色模式' : '暗色模式' }}</span>
+          <span class="grid size-10 shrink-0 place-items-center"><component :is="theme === 'dark' ? Sun : Moon" :size="19" :stroke-width="1.75" /></span>
+          <span class="text-sm font-medium" :class="reveal">{{ theme === 'dark' ? '亮色模式' : '暗色模式' }}</span>
         </button>
       </div>
 
       <!-- 账户 -->
-      <div class="flex items-center gap-3 border-t border-border px-3 py-3">
-        <div class="grid size-8 shrink-0 place-items-center rounded-full bg-accent-soft text-sm font-semibold text-accent-text">{{ initial }}</div>
-        <div class="min-w-0 flex-1 opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100 group-focus-within/sb:opacity-100">
+      <div class="flex items-center border-t border-border px-2 py-3">
+        <span class="grid size-10 shrink-0 place-items-center">
+          <span class="grid size-8 place-items-center rounded-full bg-accent-soft text-sm font-semibold text-accent-text">{{ initial }}</span>
+        </span>
+        <div class="ml-1 min-w-0 flex-1" :class="reveal">
           <div class="truncate text-sm font-semibold text-foreground">{{ identity?.name || '未登录' }}</div>
           <span
             class="mt-0.5 inline-block rounded px-1.5 py-0.5 text-[10px] font-medium"
