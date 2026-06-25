@@ -167,6 +167,7 @@ def test_kb_status_badge_recognizes_success():
     assert b("FAILED", "NOT_INDEXED", "active") == "处理失败"
     assert b("NOT_STARTED", "NOT_INDEXED", "active") == "排队中"
     assert b("PENDING_APPROVAL", "NOT_INDEXED", "active") == "待审核"   # 公开/跨组上传待审批
+    assert b("REJECTED", "NOT_INDEXED", "active") == "已驳回"   # 升版被驳回：不得落到默认"处理中"
     assert b("DONE", "SUCCESS", "active", 0) == "处理中"     # SUCCESS 但 0 活跃 chunk → 不算已上线
     # PII 隔离：即便 index_status 残留 SUCCESS 也必须显示已隔离（绝不能误显示已上线）
     assert b("DONE", "SUCCESS", "active", None, "QUARANTINED") == "已隔离"

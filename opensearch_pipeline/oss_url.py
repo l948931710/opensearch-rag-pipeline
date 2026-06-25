@@ -94,6 +94,35 @@ def generate_signed_url(
         return ""
 
 
+_SIM_HEAD_MIME = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+}
+
+
+def _sim_head_object(oss_key: str) -> dict:
+    """simulate 模式下的合成 HEAD：无真实 OSS 时也能让 kb register 的"存在性 + 大小 + etag"在本地跑通
+    （满足 CLAUDE.md「改动先在 simulate 验证」——此前 head_object 在 sim 下恒返 None，register 永远 400）。
+
+    大小优先取 RAG_SIM_OSS_HEAD_SIZE（让 0 字节 / 超限分支可被确定性测试），否则默认 1024（非空）。
+    etag 优先取 RAG_SIM_OSS_HEAD_ETAG（让内容查重命中可被确定性测试），否则按 oss_key 派生——
+    必须【按 key 不同】，否则所有 sim 上传 etag 相同会在内容查重里假撞。content_type 由扩展名粗推。
+    """
+    import hashlib
+    import os
+    raw = os.environ.get("RAG_SIM_OSS_HEAD_SIZE", "")
+    try:
+        size = int(raw) if raw != "" else 1024
+    except ValueError:
+        size = 1024
+    ext = oss_key.rsplit(".", 1)[-1].lower() if "." in oss_key else ""
+    etag = os.environ.get("RAG_SIM_OSS_HEAD_ETAG") or hashlib.sha256(oss_key.encode("utf-8")).hexdigest()[:32].upper()
+    return {"size": size, "content_type": _SIM_HEAD_MIME.get(ext, "application/octet-stream"), "etag": etag}
+
+
 def head_object(oss_key: str) -> Optional[dict]:
     """对 OSS 对象做 HEAD：存在返回 {size, content_type, etag}，不存在/失败返回 None。
 
@@ -104,6 +133,9 @@ def head_object(oss_key: str) -> Optional[dict]:
     try:
         from opensearch_pipeline.config import get_config
         config = get_config()
+        # simulate：无真实 OSS → 返回合成 HEAD（让 register 在 sim 下可跑；真实凭据缺失时也走此分支）。
+        if getattr(config, "simulate_oss", False):
+            return _sim_head_object(oss_key)
         access_id = config.oss.access_key_id
         access_secret = config.oss.access_key_secret
         if not access_id or access_id.strip() in ("xxx", ""):

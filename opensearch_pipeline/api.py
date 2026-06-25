@@ -1260,6 +1260,10 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
         return "已上线"
     if cs == "FAILED" or ix == "FAILED":
         return "处理失败"
+    # 升版被 kb_admin 驳回：content_process_status='REJECTED'（见 kb_reject）。my-docs JOIN 在
+    # current_version_no 上，驳回不回退该指针 → 不显式区分会落到默认"处理中"，让上传者误以为还在跑。
+    if cs == "REJECTED":
+        return "已驳回"
     if cs == "SKIPPED_DUPLICATE":
         return "内容未变"
     if cs == "PENDING_APPROVAL":
@@ -1301,6 +1305,47 @@ def _kb_can_manage(kb, owner_dept: str) -> bool:
     if kb.role == ROLE_KB_ADMIN:
         return True
     return (owner_dept or "") in set(managed_owner_depts(kb))
+
+
+def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
+    """按 OSS ETag（字节级内容指纹）找其它 active 文档（跨部门内容查重）。
+
+    隐私分级：调用者【可管理】的命中给详情（doc_id/标题/部门）；管理范围外的只计数（仅提示"存在"，
+    不泄露部门/标题）。只读、**fail-open**——任何异常都返回空，绝不影响 register（advisory，不拦上传）。
+    覆盖面 = 已存 etag 的文档（今后自助上传从零累积）；docx↔pdf 跨格式孪生由管线 canonical_sha256 去重处理。
+    """
+    if not etag:
+        return [], 0
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT m.doc_id, m.title, m.owner_dept
+                    FROM fuling_knowledge.document_meta m
+                    JOIN fuling_knowledge.document_version v
+                      ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
+                    WHERE v.etag = %s AND v.etag <> '' AND m.status = 'active' AND m.doc_id <> %s
+                    LIMIT 20
+                    """,
+                    (etag, exclude_doc_id),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.info("content-dup 查询失败（fail-open，不报警）: %s", e)
+        return [], 0
+    visible, other = [], 0
+    for r in rows:
+        doc_id, title, owner = (r[0] or ""), (r[1] or ""), (r[2] or "")
+        if _kb_can_manage(kb, owner):
+            visible.append(KbDupDoc(doc_id=doc_id, title=title, owner_dept=owner))
+        else:
+            other += 1
+    return visible[:10], other
 
 
 def _load_org_tree_snapshot() -> Optional[Dict[str, Any]]:
@@ -1560,6 +1605,12 @@ class KbRegisterRequest(BaseModel):
     upload_token: str
 
 
+class KbDupDoc(BaseModel):
+    doc_id: str
+    title: str = ""
+    owner_dept: str = ""
+
+
 class KbRegisterResponse(BaseModel):
     doc_id: str
     version_no: int
@@ -1567,12 +1618,30 @@ class KbRegisterResponse(BaseModel):
     requires_kb_admin_approval: bool = False
     status_badge: str = ""
     idempotent: bool = False
+    title: str = ""
+    # 内容查重（按 OSS ETag = 字节级指纹，跨部门）。advisory，不拦上传。
+    content_dups: List[KbDupDoc] = Field(default_factory=list)   # 调用者可见范围内的同内容文档
+    content_dups_other: int = 0                                   # 可见范围外的同内容文档计数（仅提示存在，不泄露部门/标题）
 
 
 class KbApprovalRequest(BaseModel):
     doc_id: str
     version_no: Optional[int] = None
     reason: Optional[str] = None
+
+
+class KbRetireRequest(BaseModel):
+    doc_id: str
+    reason: Optional[str] = None
+
+
+class KbRetireResponse(BaseModel):
+    status: str = "ok"
+    doc_id: str
+    retired: bool = False
+    already: bool = False
+    status_badge: str = "已退役"
+    note: str = ""
 
 
 @app.post("/api/kb/upload-url", response_model=KbUploadUrlResponse)
@@ -1659,6 +1728,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
     """登记上传：校验 token + OSS-HEAD + 现查授权 → 事务内分配 version_no（行锁）写 RDS（幂等）。"""
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
+    import hashlib
     from opensearch_pipeline import kb_upload, kb_authz
     from opensearch_pipeline.oss_url import head_object
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
@@ -1689,6 +1759,8 @@ def kb_register(req: KbRegisterRequest, request: Request,
         raise HTTPException(status_code=400, detail="上传的文件为空")
     if size > int(payload.get("max_size") or kb_upload.MAX_UPLOAD_BYTES):
         raise HTTPException(status_code=413, detail="文件超过大小上限")
+    # OSS ETag = 内容指纹（自助上传单次 PUT ⇒ 内容 MD5，与路径/部门无关）→ 用于跨部门内容查重。
+    etag_val = (meta.get("etag") or "")[:128]
 
     cfg = get_config()
     assert_metadata_write_allowed("kb_register_upload", cfg.rds.host, kind="rds")
@@ -1716,6 +1788,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
                         requires_kb_admin_approval=requires_approval,
                         status_badge=_kb_status_badge(exist[2], None, "active"),
                         idempotent=True,
+                        title=payload.get("title") or "",
                     )
                 doc_id = payload["doc_id"]
                 if action == "version":
@@ -1748,16 +1821,43 @@ def kb_register(req: KbRegisterRequest, request: Request,
                          payload.get("category_l1") or None, payload.get("category_l2") or None,
                          perm, ("public" if perm == "public" else "private")),
                     )
-                cur.execute(
-                    """
-                    INSERT INTO fuling_knowledge.document_version
-                      (doc_id, version_no, bucket_name, raw_key, file_ext, mime_type, file_size_bytes,
-                       content_process_status, approval_status, status, received_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',NOW())
-                    """,
-                    (doc_id, version_no, bucket, raw_key, payload.get("ext"),
-                     kb_upload.expected_mime(payload.get("ext")), size, cps, appr),
-                )
+                # raw_key_hash 与生产管线/批量注册一致写入（自助路径此前置 NULL）——供 reconcile/dedup
+                # 工具按内容键去重，并为未来的 UNIQUE(raw_key_hash) 加固预填数据。
+                raw_key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO fuling_knowledge.document_version
+                          (doc_id, version_no, bucket_name, raw_key, raw_key_hash, etag, file_ext, mime_type,
+                           file_size_bytes, content_process_status, approval_status, status, received_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',NOW())
+                        """,
+                        (doc_id, version_no, bucket, raw_key, raw_key_hash, etag_val, payload.get("ext"),
+                         kb_upload.expected_mime(payload.get("ext")), size, cps, appr),
+                    )
+                except Exception as ins_err:
+                    # uk_doc_version(doc_id,version_no) 唯一键 1062：并发双提交（同一 upload_token 双击/
+                    # 重试，共用 upload-url 钦定的 doc_id+version_no）。赢家事务已提交该版本（InnoDB 唯一键
+                    # 把输家的 INSERT 阻塞到赢家 commit 才抛 1062），故回滚本事务（连带撤销 meta 的
+                    # current_version_no 副作用，避免输家留下半截写入），按 raw_key 重查赢家行返回幂等成功——
+                    # 而非把可预期的竞态当 500 抛给用户。非 1062 的完整性错误照常上抛走 500 分支。
+                    if (getattr(ins_err, "args", None) or (None,))[0] != 1062:
+                        raise
+                    conn.rollback()
+                    with conn.cursor() as c2:
+                        c2.execute("SELECT doc_id, version_no, content_process_status "
+                                   "FROM fuling_knowledge.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                        won = c2.fetchone()
+                    if not won:
+                        raise   # 1062 但查不到赢家行 → 非预期，按 500 处理
+                    logger.info("kb_register 并发幂等命中：raw_key=%s 赢家 doc=%s v=%s", raw_key, won[0], won[1])
+                    return KbRegisterResponse(
+                        doc_id=won[0], version_no=int(won[1]),
+                        content_process_status=won[2] or cps,
+                        requires_kb_admin_approval=requires_approval,
+                        status_badge=_kb_status_badge(won[2], None, "active"),
+                        idempotent=True, title=payload.get("title") or "",
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -1771,10 +1871,17 @@ def kb_register(req: KbRegisterRequest, request: Request,
                 action_type=("VERSION_UP" if action == "version" else "UPLOAD_REGISTER"),
                 operator_type="user", operator_id=kb.user_id, oss_key=raw_key, trace_id=trace_id,
                 message=f"owner={owner} perm={perm} approval={appr} share={payload.get('share_owner_depts')}")
+    # 跨部门内容查重（按 ETag 字节指纹）：advisory，命中也不拦上传——仅在响应里提示，让上传者决定是否退役其一。
+    # 升版（同 doc_id 换文件）天然不算重复，故仅新建查；fail-open。
+    dups, dups_other = ([], 0)
+    if action != "version":
+        dups, dups_other = _kb_content_dups(etag_val, doc_id, kb)
     return KbRegisterResponse(
         doc_id=doc_id, version_no=version_no, content_process_status=cps,
         requires_kb_admin_approval=requires_approval,
         status_badge=_kb_status_badge(cps, None, "active"),
+        title=payload.get("title") or "",
+        content_dups=dups, content_dups_other=dups_other,
     )
 
 
@@ -1859,6 +1966,73 @@ def kb_reject(req: KbApprovalRequest, request: Request,
                 operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
                 message=(req.reason or "")[:200])
     return {"status": "ok", "rejected": n}
+
+
+@app.post("/api/kb/retire", response_model=KbRetireResponse)
+def kb_retire(req: KbRetireRequest, request: Request,
+              identity: Optional[Identity] = Depends(current_identity)):
+    """软退役（可逆，不删 HA3）：把文档标记下线 + 停用本版本 RDS chunk，交现有 gated 运维完成 HA3 移除。
+
+    授权：kb_admin 任意；dept_admin 限其 managed owner_dept，且【公开文档需 kb_admin】（影响全公司）。
+    仅改 RDS（document_meta/version.status='retired' + chunk_meta.is_active=0），**不触碰 HA3**——
+    真实检索下线由 gated 运维（带 prod token 的 HA3 删除/reconcile）完成；本接口仅"申请退役 + 即时标记"，
+    文案如实告知。可逆：运维侧把 status 改回 active 即恢复（HA3 未删）。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    assert_metadata_write_allowed("kb_retire", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    owner_dept = perm = ""
+    cur_ver = 1
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 行锁文档元数据，串行化并发退役 / 退役-vs-升版
+                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                            "FROM fuling_knowledge.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm = (row[0] or ""), (row[1] or "")
+                status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                # 授权：先作用域，再"公开需 kb_admin"（与上传同款不对称——公开影响全公司）
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权退役该文档（owner_dept 不在管理范围）")
+                if perm == "public" and kb.role != ROLE_KB_ADMIN:
+                    raise HTTPException(status_code=403, detail="公开文档需知识库管理员退役")
+                if str(status).lower() != "active":
+                    conn.commit()       # 幂等：已退役/非活跃 → 直接回既有态
+                    return KbRetireResponse(doc_id=req.doc_id, retired=False, already=True,
+                                            note="该文档已是退役/非活跃状态")
+                cur.execute("UPDATE fuling_knowledge.document_meta SET status='retired', updated_at=NOW() "
+                            "WHERE doc_id=%s", (req.doc_id,))
+                cur.execute("UPDATE fuling_knowledge.document_version SET status='retired', updated_at=NOW() "
+                            "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
+                # RDS 侧停用本版本 chunk（停止邻居拼接复用 + 给 reconcile/HA3 删除一个明确信号）；HA3 不动。
+                cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=0 "
+                            "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_retire 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"退役失败 (trace: {trace_id})")
+    write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RETIRE_REQUEST",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}")
+    return KbRetireResponse(
+        doc_id=req.doc_id, retired=True,
+        note="已申请退役：已标记下线、停止作为升版目标；从检索彻底移除将在下次维护完成（本操作可逆）")
 
 
 class KbPendingItem(BaseModel):

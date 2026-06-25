@@ -35,6 +35,8 @@
     #diag div { padding:1px 0; }
     .linklike { color:var(--brand); font-size:13px; cursor:pointer; text-decoration:underline; }
     .verbtn { display:inline-block; background:#fff; color:var(--brand); border:1px solid var(--brand); border-radius:8px; padding:5px 14px; font-size:13px; cursor:pointer; }
+    .verbtn.danger { color:#b3261e; border-color:#e8b9b3; }
+    .doctable .verbtn + .verbtn { margin-left:6px; }
     #verModeInfo { background:#f4f1ea; border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; line-height:1.6; color:var(--text1); }
     #docSearch, input[type=text]#docSearch { margin:10px 0 4px; }
     .tablewrap { overflow-x:auto; }
@@ -133,6 +135,7 @@
         <span class="muted" :class="{ ok: uploadOk }">{{ uploadMsg }}</span>
       </div>
       <div class="err">{{ uploadErr }}</div>
+      <div id="dupWarn" v-if="contentDupMsg">⚠️ {{ contentDupMsg }}</div>
     </div>
 
     <div class="card" v-if="canManage">
@@ -157,7 +160,10 @@
               <td data-label="版本">v{{ d.current_version_no || 1 }}</td>
               <td data-label="状态"><span class="pill" :class="badgeClass(d.status_badge)">{{ d.status_badge }}</span></td>
               <td data-label="更新">{{ (d.updated_at || '').slice(0,16) }}</td>
-              <td data-label="操作"><button class="verbtn" @click="enterVersionMode(d)">升版</button></td>
+              <td data-label="操作">
+                <button class="verbtn" @click="enterVersionMode(d)">升版</button>
+                <button class="verbtn danger" v-if="d.status_badge !== '已退役'" :disabled="retireBusy" @click="doRetire(d)">退役</button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -186,9 +192,24 @@
   var BASE = location.origin;   // 同源：H5 与 API 同一主机
   var GROUP_LABEL = { finance:'财务', it:'信息技术', marketing:'营销', production:'生产', pmc:'计划PMC', admin:'行政', hr:'人力资源', rd:'研发', quality:'品质技术', supply:'资材供应' };
   var PERM_LABEL = { dept_internal:'仅本部门', public:'全公司', restricted:'受限' };
-  var BADGE_CLASS = { '已上线':'ok', '处理中':'busy', '排队中':'queue', '待审核':'warn', '已隔离':'fail', '处理失败':'fail', '已退役':'muted', '内容未变':'muted' };
+  var BADGE_CLASS = { '已上线':'ok', '处理中':'busy', '排队中':'queue', '待审核':'warn', '已隔离':'fail', '处理失败':'fail', '已驳回':'fail', '已退役':'muted', '内容未变':'muted' };
+  var MAX_UPLOAD_MB = 50;   // 与后端 kb_upload.MAX_UPLOAD_BYTES 对齐：客户端先拦，省得 50MB 传完才 413
 
   function qs(name){ var m = new RegExp('[?&]' + name + '=([^&]+)').exec(location.search); return m ? decodeURIComponent(m[1]) : ''; }
+
+  // 直传 OSS：fetch 无法上报上传进度，改用 XHR 接 upload.onprogress。onProg(pct) 回调驱动百分比。
+  function putWithProgress(url, file, onProg){
+    return new Promise(function(resolve, reject){
+      var xhr = new XMLHttpRequest();
+      xhr.open('PUT', url, true);
+      if (xhr.upload) xhr.upload.onprogress = function(e){ if (e.lengthComputable && onProg) onProg(Math.round(e.loaded * 100 / e.total)); };
+      xhr.onload = function(){ (xhr.status >= 200 && xhr.status < 300) ? resolve() : reject(new Error('OSS PUT 失败 HTTP ' + xhr.status)); };
+      xhr.onerror = function(){ reject(new Error('OSS PUT 网络错误（可能是 OSS 桶未对本页来源放行 CORS PUT）')); };
+      xhr.ontimeout = function(){ reject(new Error('OSS PUT 超时')); };
+      xhr.timeout = 25 * 60 * 1000;   // 略小于 upload token 30min TTL，超时给明确提示而非静默
+      xhr.send(file);
+    });
+  }
 
   Vue.createApp({
     data() {
@@ -201,11 +222,11 @@
         ownerDepts: [], newTitle: '', newOwner: '', newPerm: 'dept_internal',
         /** @type {Doc|null} */ verCtx: null,
         /** @type {?{title:string,ver:number,badge:string,more:string,top:Doc}} */ dupWarn: null,
-        uploadMsg: '', uploadErr: '', uploadOk: false, uploadBusy: false,
+        uploadMsg: '', uploadErr: '', uploadOk: false, uploadBusy: false, contentDupMsg: '',
         /** @type {Doc[]} */ docs: [], q: '', filter: '', sortKey: '', sortDir: 1,
-        _docsSeq: 0, pendingVer: '', _searchTimer: null,
-        /** @type {Pending[]} */ approvals: [], approvalBusy: false,
-        filters: [ {v:'',label:'全部'}, {v:'已上线',label:'已上线'}, {v:'处理中',label:'处理中'}, {v:'待审核',label:'待审核'}, {v:'已隔离',label:'已隔离'}, {v:'已退役',label:'已退役'} ],
+        _docsSeq: 0, pendingVer: '', _searchTimer: null, _trackSeq: 0,
+        /** @type {Pending[]} */ approvals: [], approvalBusy: false, retireBusy: false,
+        filters: [ {v:'',label:'全部'}, {v:'已上线',label:'已上线'}, {v:'处理中',label:'处理中'}, {v:'待审核',label:'待审核'}, {v:'处理失败',label:'处理失败'}, {v:'已驳回',label:'已驳回'}, {v:'已隔离',label:'已隔离'}, {v:'已退役',label:'已退役'} ],
         cols: [ {key:'title',label:'文档名'}, {key:'owner_dept',label:'归属'}, {key:'current_version_no',label:'版本'}, {key:'status_badge',label:'状态'}, {key:'updated_at',label:'更新'} ],
       };
     },
@@ -337,7 +358,7 @@
 
       // ── 升版态：归属/可见范围继承原文档（不可改），仅替换文件 → 版本号 +1 ──
       enterVersionMode(d) {
-        this.verCtx = d; this.dupWarn = null;
+        this.verCtx = d; this.dupWarn = null; this.contentDupMsg = '';
         this.uploadMsg = ''; this.uploadErr = ''; this.uploadOk = false;
         if (this.$refs.file) this.$refs.file.value = '';
         var self = this; this.$nextTick(function(){ if (self.$refs.uploadCard) self.$refs.uploadCard.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
@@ -345,7 +366,29 @@
       exitVersionMode() {
         this.verCtx = null; this.dupWarn = null;
         this.uploadMsg = ''; this.uploadErr = ''; this.uploadOk = false;
+        // 注意：不清 contentDupMsg——上传成功后转出升版态时要保留刚弹出的查重提示。
         if (this.$refs.file) this.$refs.file.value = '';
+      },
+
+      // 软退役（可逆，不删 HA3）：标记下线 + 停用本版本 chunk；真实检索移除由 gated 运维完成。
+      doRetire(d) {
+        var self = this;
+        var name = d.title || d.original_filename || d.doc_id;
+        if (!confirm('确认退役《' + name + '》？\n\n将标记下线、停止作为升版目标。\n注意：从检索彻底移除会在下次维护完成（本操作可逆）。')) return;
+        if (this.retireBusy) return;
+        this.retireBusy = true;
+        this.api('/api/kb/retire', { method: 'POST', auth: true, body: { doc_id: d.doc_id } })
+          .then(function(r){
+            self.retireBusy = false;
+            d.status_badge = '已退役';                 // 即时反映到行
+            self.uploadOk = true;
+            self.uploadMsg = r.note || (r.already ? '该文档已退役' : '已申请退役');
+            self.loadDocs();
+          })
+          .catch(function(e){
+            self.retireBusy = false; self.diag('retire FAIL: ' + e.message);
+            alert(e.status === 403 ? (e.message || '无权退役该文档') : ('退役失败：' + e.message));
+          });
       },
 
       // 上传查重：新建模式下选文件后按文件名查现存文档，命中（非已退役）则提示"应升版而非新建"。
@@ -363,30 +406,102 @@
         }).catch(function(){});
       },
 
-      // ── 上传：upload-url → PUT OSS → register ──
+      // ── 上传：upload-url → PUT OSS（带进度）→ register → 轮询入库状态 ──
       doUpload() {
         var self = this;
         var f = this.$refs.file && this.$refs.file.files[0];
         if (!f) { this.uploadErr = '请先选择文件'; return; }
-        this.uploadErr = ''; this.uploadBusy = true; this.uploadOk = false; this.uploadMsg = '申请上传地址…';
+        // #6 客户端预检：空文件 / 超限先拦，避免把 50MB 传完才在 register 被 413 拒。
+        if (f.size <= 0) { this.uploadErr = '所选文件为空，请重新选择'; return; }
+        if (f.size > MAX_UPLOAD_MB * 1024 * 1024) {
+          this.uploadErr = '文件 ' + (f.size / 1024 / 1024).toFixed(1) + 'MB，超过上限 ' + MAX_UPLOAD_MB + 'MB，请压缩或拆分后再传'; return;
+        }
+        this.uploadErr = ''; this.uploadBusy = true; this.uploadOk = false; this.uploadMsg = '申请上传地址…'; this.contentDupMsg = '';
+        this._trackSeq++;   // 新一轮上传 → 作废上一份正在跑的状态轮询
         // 升版态：action=version + 继承原文档 owner/perm（后端再校验 doc 存在 + owner 在管理范围 + 强制继承 perm）。
         var payload = this.verCtx
           ? { action: 'version', doc_id: this.verCtx.doc_id, owner_dept: this.verCtx.owner_dept, permission_level: (this.verCtx.permission_level || 'dept_internal'), filename: f.name, title: (this.verCtx.title || undefined) }
           : { action: 'new', filename: f.name, owner_dept: this.newOwner, permission_level: this.newPerm, title: this.newTitle || undefined };
         this.api('/api/kb/upload-url', { method: 'POST', auth: true, body: payload })
           .then(function(u){
-            self.uploadMsg = '上传文件到 OSS…';
-            return fetch(u.put_url, { method: 'PUT', body: f }).then(function(r){ if (!r.ok) throw new Error('OSS PUT 失败 HTTP ' + r.status + '（可能需在 OSS 桶配置 CORS 允许本页来源 PUT）'); return u.upload_token; });
+            self.uploadMsg = '上传文件到 OSS… 0%';
+            return putWithProgress(u.put_url, f, function(pct){ self.uploadMsg = '上传文件到 OSS… ' + pct + '%'; }).then(function(){ return u.upload_token; });
           })
           .then(function(uploadToken){ self.uploadMsg = '登记…'; return self.api('/api/kb/register', { method: 'POST', auth: true, body: { upload_token: uploadToken } }); })
           .then(function(reg){
             self.uploadBusy = false; self.uploadOk = true;
-            self.uploadMsg = '已提交：' + reg.doc_id + ' v' + reg.version_no + '（' + (reg.status_badge || '') + (reg.requires_kb_admin_approval ? '，待审批' : '') + '）';
+            var verCtx = self.verCtx;
+            self.uploadMsg = '已提交：' + (reg.title || reg.doc_id) + ' v' + reg.version_no + '（' + (reg.status_badge || '') + (reg.requires_kb_admin_approval ? '，待审批' : '') + '）';
             if (self.$refs.file) self.$refs.file.value = ''; self.newTitle = ''; self.dupWarn = null;
-            if (self.verCtx) self.exitVersionMode();
+            self.contentDupMsg = self.buildDupMsg(reg);   // 跨部门内容查重提示（命中才显示）
+            if (verCtx) self.exitVersionMode();
             self.loadDocs(); self.loadApprovals();
+            // #3/#4 公开/跨组待审批的不轮询（要等人审），其余启动入库状态轮询直到上线/失败。
+            if (!reg.requires_kb_admin_approval) self.trackStatus(reg.doc_id, reg.version_no);
           })
-          .catch(function(e){ self.uploadBusy = false; self.uploadOk = false; self.uploadMsg = ''; self.uploadErr = '上传失败：' + e.message; self.diag('upload FAIL: ' + e.message); });
+          .catch(function(e){ self.uploadBusy = false; self.uploadOk = false; self.uploadMsg = ''; self.uploadErr = self.uploadErrText(e); self.diag('upload FAIL: ' + e.message); });
+      },
+
+      // 跨部门内容查重提示（命中才返回非空）：可见命中给详情，范围外仅计数（隐私）。
+      buildDupMsg(reg) {
+        var self = this;
+        var parts = (reg.content_dups || []).map(function(d){ return '《' + (d.title || d.doc_id) + '》（' + self.deptLabel(d.owner_dept) + '）'; });
+        var m = '';
+        if (parts.length) m = '相同内容的文档已存在：' + parts.join('、') + '。如确属重复，可在「我的文档」对其一点「退役」。';
+        if (reg.content_dups_other) m += (m ? ' ' : '') + '另有 ' + reg.content_dups_other + ' 篇相同内容在你管理范围外的部门。';
+        return m;
+      },
+
+      // 报错转人话：非技术管理员看到的是可操作提示，而非 OSS/CORS/trace 技术串。
+      uploadErrText(e) {
+        var m = (e && e.message) || '';
+        if (e && e.status === 413) return '文件超过大小上限（' + MAX_UPLOAD_MB + 'MB），请压缩或拆分后再传';
+        if (/upload_token/.test(m) || (e && e.status === 400 && /过期|无效/.test(m))) return '上传超时或会话失效，请重新选择文件上传';
+        if (/OSS PUT|CORS|网络错误|超时/.test(m)) return '文件上传通道异常，请稍后重试；若持续失败请联系知识库管理员';
+        if (e && e.status === 403) return '无权在该归属/可见范围上传（请确认部门授权）';
+        if (/trace:/.test(m) || (e && e.status >= 500)) return '系统繁忙，请稍后重试（如持续失败请反馈管理员）';
+        return '上传失败：' + m;
+      },
+
+      // #3/#4 入库状态轮询：register 后每 ~8s 查 doc-status，直至终态（已上线/失败/隔离/驳回/内容未变）。
+      // 复用现成只读端点，无新接口；_trackSeq 作废过期轮询；最长 ~3 分钟后停（不挂死）。
+      trackStatus(docId, versionNo) {
+        var self = this;
+        var mySeq = this._trackSeq;
+        var tries = 0, MAX_TRIES = 22;   // 22 × 8s ≈ 3 分钟
+        var TERMINAL = { '已上线':1, '处理失败':1, '已隔离':1, '已驳回':1, '内容未变':1, '已退役':1 };
+        function patchRow(badge){
+          var d = self.docs.filter(function(x){ return x.doc_id === docId; })[0];
+          if (d) d.status_badge = badge;   // Vue3 proxy：直接改元素属性即响应式刷新表格
+        }
+        function poll(){
+          if (mySeq !== self._trackSeq) return;   // 已被新上传/操作作废
+          tries++;
+          self.api('/api/kb/doc-status?doc_id=' + encodeURIComponent(docId) + '&version=' + versionNo, { auth: true })
+            .then(function(s){
+              if (mySeq !== self._trackSeq) return;
+              var badge = s.status_badge || '';
+              patchRow(badge);
+              if (TERMINAL[badge]) {
+                if (badge === '处理失败') {
+                  self.uploadOk = false;
+                  self.uploadErr = '入库失败：' + (s.error_message || '未知原因') + '（doc ' + docId + ' v' + versionNo + '）';
+                  self.uploadMsg = '';
+                } else {
+                  self.uploadMsg = (reg2msg(badge)) + '：' + docId + ' v' + versionNo +
+                    (badge === '已上线' && s.chunk_active ? '（' + s.chunk_active + ' 段已检索）' : '');
+                }
+                self.loadDocs();   // 终态同步整张表
+                return;
+              }
+              self.uploadMsg = '处理中…（' + (badge || '排队中') + '，约几分钟，可离开本页）';
+              if (tries < MAX_TRIES) setTimeout(poll, 8000);
+              else self.uploadMsg = '仍在处理：' + docId + ' v' + versionNo + '（耗时较长，稍后刷新「我的文档」查看）';
+            })
+            .catch(function(e){ self.diag('doc-status FAIL: ' + e.message); if (tries < MAX_TRIES && mySeq === self._trackSeq) setTimeout(poll, 8000); });
+        }
+        function reg2msg(b){ return b === '已上线' ? '✅ 已上线' : (b === '内容未变' ? '内容未变（无需重复入库）' : b); }
+        setTimeout(poll, 4000);   // 首查延后 4s，给 scanner 一点认领时间
       },
     },
   }).mount('#app');
