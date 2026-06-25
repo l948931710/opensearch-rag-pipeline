@@ -13,15 +13,21 @@ const session = useSession()
 const { identity, role, canManage } = storeToRefs(session)
 const { theme, toggle } = useTheme()
 
+// 知识库入口对【所有人】可见：管理员进完整管理台，普通员工进只读概览（ManageView 内分流）。
 const nav = computed<NavItem[]>(() => [
   { to: '/', label: '问答', icon: MessagesSquare, show: true },
-  { to: '/manage', label: '知识库管理', icon: Library, show: canManage.value },
+  { to: '/manage', label: canManage.value ? '知识库管理' : '知识库', icon: Library, show: true },
 ].filter((i) => i.show))
 
 const ROLE_LABEL: Record<string, string> = {
   employee: '员工', dept_admin: '部门管理员', kb_admin: '知识库管理员',
 }
 const initial = computed(() => (identity.value?.name || '?').trim().charAt(0) || '?')
+// 管理员「额度/管辖」：可管部门数（无则回退 ACL 组数）——Atlas 式账户区的副信息。
+const budget = computed(() => {
+  const n = identity.value?.managedOwnerDepts?.length || 0
+  return n > 0 ? `管辖 ${n} 个部门` : ''
+})
 </script>
 
 <template>
@@ -78,12 +84,18 @@ const initial = computed(() => (identity.value?.name || '?').trim().charAt(0) ||
         </button>
       </div>
 
-      <!-- 身份位 -->
+      <!-- 账户区（Atlas 式）：头像 + 姓名 + 角色徽章 + 管理员额度 -->
       <div class="flex items-center gap-3 border-t border-border px-3 py-3">
         <div class="grid size-8 shrink-0 place-items-center rounded-full bg-accent-soft text-sm font-semibold text-accent-text">{{ initial }}</div>
-        <div class="min-w-0 opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100">
+        <div class="min-w-0 flex-1 opacity-0 transition-opacity duration-200 group-hover/sb:opacity-100">
           <div class="truncate text-sm font-semibold text-foreground">{{ identity?.name || '未登录' }}</div>
-          <div class="truncate font-mono text-[11px] text-muted-foreground">{{ ROLE_LABEL[role] || role }}</div>
+          <div class="mt-0.5 flex items-center gap-1.5">
+            <span
+              class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
+              :class="canManage ? 'bg-accent-soft text-accent-text' : 'bg-panel text-muted-foreground'"
+            >{{ ROLE_LABEL[role] || role }}</span>
+            <span v-if="budget" class="truncate text-[11px] text-muted-foreground">{{ budget }}</span>
+          </div>
         </div>
       </div>
     </div>

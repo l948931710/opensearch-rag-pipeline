@@ -33,19 +33,20 @@ function mountWith(comp: any, id: Identity) {
   })
 }
 
-describe('Sidebar — 导航按权限过滤', () => {
-  it('管理员：问答 + 知识库管理 两项', () => {
+describe('Sidebar — 导航 + 角色标签', () => {
+  it('管理员：问答 + 知识库管理（完整标签）', () => {
     const w = mountWith(Sidebar, identity({ canManage: true }))
     const links = w.findAll('a.rl')
     expect(links.map((l) => l.attributes('data-to'))).toEqual(['/', '/manage'])
     expect(w.text()).toContain('知识库管理')
   })
 
-  it('普通员工：仅问答，无管理入口', () => {
+  it('普通员工：问答 + 知识库（只读入口，标签精简为「知识库」）', () => {
     const w = mountWith(Sidebar, identity({ canManage: false, role: 'employee' }))
     const links = w.findAll('a.rl')
-    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/'])
-    expect(w.text()).not.toContain('知识库管理')
+    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/', '/manage'])   // 员工也有入口
+    expect(w.text()).toContain('知识库')
+    expect(w.text()).not.toContain('知识库管理')                                   // 但不是管理标签
   })
 
   it('展示姓名首字与角色', () => {
@@ -55,18 +56,21 @@ describe('Sidebar — 导航按权限过滤', () => {
   })
 })
 
-describe('ManageView — 视图内权限自检（深链兜底）', () => {
-  it('非管理员深链 /manage → 落「无管理权限」，不暴露管理 UI', () => {
-    const w = mountWith(ManageView, identity({ canManage: false }))
-    expect(w.text()).toContain('无管理权限')
-    expect(w.text()).not.toContain('P4')
+describe('ManageView — 按角色分流', () => {
+  it('普通员工 → 只读概览（不暴露上传/台账/审批管理 UI）', () => {
+    const w = mountWith(ManageView, identity({ canManage: false, role: 'employee' }))
+    expect(w.text()).toContain('知识库概览')
+    expect(w.text()).toContain('员工身份')
+    expect(w.text()).toContain('去问答')
+    expect(w.text()).not.toContain('上传文档')   // 无管理控件
+    expect(w.text()).not.toContain('待审批')
   })
 
-  it('管理员 → 渲染管理区（占位）', () => {
+  it('管理员 → 完整管理台', () => {
     const w = mountWith(ManageView, identity({ canManage: true, managedOwnerDepts: ['hr'] }))
-    expect(w.text()).not.toContain('无管理权限')
     expect(w.text()).toContain('知识库管理')
     expect(w.text()).toContain('hr')
+    expect(w.text()).not.toContain('知识库概览')
   })
 })
 

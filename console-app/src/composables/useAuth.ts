@@ -131,16 +131,18 @@ export function useAuth() {
   function init(): Promise<void> {
     if (_initPromise) return _initPromise
     _initPromise = (async () => {
-      // 设计预览：仅 dev（import.meta.env.DEV）且 URL 带 ?preview 时，注入 mock 管理员身份直接进 UI——
-      // 无需钉钉容器/后端，纯看设计。生产构建里 DEV=false → 整段死代码消除，绝不进线上。
-      if (import.meta.env.DEV && new URLSearchParams(window.location.search).has('preview')) {
+      // 设计预览：仅 dev（import.meta.env.DEV）且 URL 带 ?preview 时，注入 mock 身份直接进 UI——
+      // 无需钉钉容器/后端，纯看设计。?preview=employee 预览员工只读视图，否则按管理员。
+      // 生产构建里 DEV=false → 整段死代码消除，绝不进线上。
+      const _pv = new URLSearchParams(window.location.search)
+      if (import.meta.env.DEV && _pv.has('preview')) {
+        const asEmployee = _pv.get('preview') === 'employee'
         session.setToken('dev-preview')
-        session.setIdentity(toIdentity({
-          user_id: 'preview', display_name: '设计预览', role: 'kb_admin', can_manage_kb: true,
-          acl_groups: ['marketing'], managed_owner_depts: ['marketing', 'hr', 'finance', 'production'],
-        }))
+        session.setIdentity(toIdentity(asEmployee
+          ? { user_id: 'preview', display_name: '设计预览·员工', role: 'employee', can_manage_kb: false, acl_groups: ['marketing'], managed_owner_depts: [] }
+          : { user_id: 'preview', display_name: '设计预览', role: 'kb_admin', can_manage_kb: true, acl_groups: ['marketing'], managed_owner_depts: ['marketing', 'hr', 'finance', 'production'] }))
         session.ready = true; session.error = ''
-        diag('DEV ?preview：注入 mock 身份（无后端）')
+        diag(`DEV ?preview：注入 mock 身份（${asEmployee ? '员工' : '管理员'}，无后端）`)
         return
       }
       try {

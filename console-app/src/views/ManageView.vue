@@ -1,19 +1,25 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
-import { ShieldAlert, FileText, CheckCircle2, Loader, Clock } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
+import { FileText, CheckCircle2, Loader, Clock, Building2, BadgeCheck, MessagesSquare, Sparkles } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
+import { useAsk } from '@/composables/useAsk'
+import { deptLabel, ROLE_LABEL } from '@/lib/kb'
 import UploadCard from '@/components/manage/UploadCard.vue'
 import ApprovalQueue from '@/components/manage/ApprovalQueue.vue'
 import DocTable from '@/components/manage/DocTable.vue'
 
-// 视图内权限自检（深链 /manage 的非管理员落「无权限」）；AppShell 仅在 ready 后渲染，故 canManage 已解析。
-const { canManage, identity } = storeToRefs(useSession())
+// 知识库入口：管理员 → 完整管理台；普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，
+// 不打 admin-gated 接口）。AppShell 仅在 ready 后渲染，故身份已解析。
+const { canManage, identity, role } = storeToRefs(useSession())
 const { docs, approvals, countOf, loadDocs, loadApprovals, applyPendingVersion } = useKb()
+const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
+const router = useRouter()
 
-// 仪表盘卡片（基于已加载文档；my-docs 取前 50，作用域内概览）。
+// 管理员仪表盘（基于已加载文档；my-docs 取前 50，作用域内概览）。
 const stats = computed(() => [
   { key: 'total', label: '我的文档', value: docs.value.length, icon: FileText, tone: 'text-foreground' },
   { key: 'live', label: '已上线', value: countOf('已上线'), icon: CheckCircle2, tone: 'text-st-live' },
@@ -21,25 +27,69 @@ const stats = computed(() => [
   { key: 'pending', label: '待审批', value: approvals.value.length, icon: Clock, tone: 'text-st-warn' },
 ])
 
+// 员工概览卡（只读，可访问数据）。
+const myDepts = computed(() => (identity.value?.aclGroups || []).map(deptLabel).join('、') || '—')
+const empCards = computed(() => [
+  { key: 'dept', label: '我的部门', value: myDepts.value, icon: Building2, mono: false },
+  { key: 'role', label: '我的角色', value: ROLE_LABEL[role.value] || role.value, icon: BadgeCheck, mono: false },
+  { key: 'hot', label: '热门问题', value: String(hotQuestions.value.length), icon: Sparkles, mono: true },
+])
+
+function askHot(q: string) { fillInput(q); void router.push('/') }
+
 onMounted(async () => {
-  if (!canManage.value) return
-  await loadDocs()
-  void loadApprovals()
-  // 升版深链：文档加载后消费一次（命中行→进升版态；列表外→合成 verCtx，perm 交后端继承）。
-  const p = consumePendingVersion()
-  if (p) applyPendingVersion(p)
+  if (canManage.value) {
+    await loadDocs()
+    void loadApprovals()
+    const p = consumePendingVersion()   // 升版深链：文档加载后消费一次
+    if (p) applyPendingVersion(p)
+  } else {
+    if (!hotQuestions.value.length) void loadHotQuestions()
+  }
 })
 </script>
 
 <template>
-  <div v-if="!canManage" class="mx-auto flex min-h-full max-w-md flex-col items-center justify-center px-6 text-center">
-    <ShieldAlert :size="40" :stroke-width="1.75" class="text-st-busy" />
-    <h2 class="mt-4 text-lg font-bold text-foreground">无管理权限</h2>
-    <p class="mt-2 text-sm text-muted-foreground">
-      知识库管理仅对部门管理员 / 知识库管理员开放。如需上传文档，请联系你的部门管理员。
-    </p>
+  <!-- ───────── 普通员工：只读基本概览 ───────── -->
+  <div v-if="!canManage" class="mx-auto w-full max-w-3xl space-y-5 px-6 py-8">
+    <header class="border-b border-border pb-4">
+      <h1 class="font-serif text-2xl tracking-tight text-foreground">知识库概览</h1>
+      <p class="mt-1 text-sm text-muted-foreground">你以员工身份访问，可查看概览并直接提问；文档上传与管理由部门管理员负责。</p>
+    </header>
+
+    <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div v-for="c in empCards" :key="c.key" class="kb-card rounded-xl border border-border bg-card p-4">
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-muted-foreground">{{ c.label }}</span>
+          <component :is="c.icon" :size="15" :stroke-width="1.75" class="text-accent-text" />
+        </div>
+        <div class="mt-1.5 truncate text-lg font-semibold text-foreground" :class="c.mono ? 'font-mono tabular-nums' : ''">{{ c.value }}</div>
+      </div>
+    </div>
+
+    <section class="rounded-xl border border-border bg-card p-5">
+      <h2 class="flex items-center gap-2 text-sm font-bold text-foreground"><Sparkles :size="15" :stroke-width="1.75" class="text-accent-text" /> 热门问题</h2>
+      <p class="mt-1 text-xs text-muted-foreground">点一个直接带去「问答」。</p>
+      <div v-if="hotQuestions.length" class="mt-3 flex flex-wrap gap-2">
+        <button
+          v-for="(h, i) in hotQuestions" :key="i"
+          type="button"
+          class="rounded-full border border-border bg-card px-3.5 py-1.5 text-sm text-foreground transition hover:border-ring hover:bg-panel"
+          @click="askHot(h)"
+        >{{ h }}</button>
+      </div>
+      <p v-else class="mt-3 text-sm text-muted-foreground">暂无热门问题。</p>
+      <button
+        type="button"
+        class="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90"
+        @click="router.push('/')"
+      >
+        <MessagesSquare :size="15" :stroke-width="1.9" /> 去问答
+      </button>
+    </section>
   </div>
 
+  <!-- ───────── 管理员：完整管理台 ───────── -->
   <div v-else class="mx-auto w-full max-w-5xl space-y-5 px-6 py-8">
     <header class="flex items-baseline justify-between border-b border-border pb-4">
       <h1 class="font-serif text-2xl tracking-tight text-foreground">知识库管理</h1>
