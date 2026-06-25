@@ -4,7 +4,11 @@ import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { useSession } from '@/stores/session'
 import { useAuth, hasPendingVersion } from '@/composables/useAuth'
+import { debugEnabled } from '@/lib/diag'
 import AppShell from '@/components/shell/AppShell.vue'
+import DebugPanel from '@/components/DebugPanel.vue'
+
+const debug = debugEnabled()   // ?debug=1（不被 scrubUrl 抹除）
 
 // 唯一在此触发免登 init（修正#6）。store/router 不再各自触发。
 // 三态：登录中（全屏加载）/ 失败（全屏错误，多为非钉钉环境）/ 就绪（进应用外壳）。
@@ -32,4 +36,7 @@ watch(ready, (r) => { if (r && hasPendingVersion() && session.canManage) void ro
       <p v-else class="mx-auto mt-3 max-w-xs text-sm text-destructive">{{ error }}</p>
     </div>
   </div>
+
+  <!-- ?debug=1：诊断面板（覆盖在三态之上，登录失败也可见） -->
+  <DebugPanel v-if="debug" />
 </template>

@@ -3,11 +3,11 @@ import { fileURLToPath, URL } from 'node:url'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
 
-// base 环境化注入（绝不硬编码）：并行验收用 /console-next/，正式切换用 /console/。
-//   并行：CONSOLE_BASE=/console-next/ npm run build   （默认值）
-//   正式：CONSOLE_BASE=/console/      npm run build
+// base 环境化注入（绝不硬编码）。P7 已切换：默认 = /console/（正式入口）。
+//   正式（默认）：npm run build                       → base /console/
+//   并行/回归：  CONSOLE_BASE=/console-next/ npm run build
 // Router 的 history base 在运行时取 import.meta.env.BASE_URL（= 此处 base），单一来源。
-const BASE = process.env.CONSOLE_BASE || '/console-next/'
+const BASE = process.env.CONSOLE_BASE || '/console/'
 
 export default defineConfig({
   base: BASE,

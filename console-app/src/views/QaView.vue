@@ -10,7 +10,8 @@ import Composer from '@/components/qa/Composer.vue'
 const { identity } = storeToRefs(useSession())
 const name = computed(() => identity.value?.name || '')
 
-const { messages, asking, draft, hotQuestions, ask, stop, resetThread, loadHotQuestions } = useAsk()
+const { messages, asking, draft, thinking, hotQuestions, ask, stop, resetThread, loadHotQuestions } = useAsk()
+function toggleThinking() { thinking.value = !thinking.value }
 
 const scroller = ref<HTMLElement | null>(null)
 // 流式更新时跟随滚动到底（深 watch 覆盖逐 token 追加 + 状态切换）。
@@ -39,7 +40,7 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
         <Thread :messages="messages" />
       </div>
       <div class="shrink-0 border-t border-border/60 py-3">
-        <Composer v-model="draft" :asking="asking" :has-messages="true" @submit="ask()" @stop="stop" />
+        <Composer v-model="draft" :asking="asking" :has-messages="true" :thinking="thinking" @submit="ask()" @stop="stop" @toggle-thinking="toggleThinking" />
       </div>
     </template>
 
@@ -48,7 +49,7 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
       <div class="mb-7 flex items-center gap-2.5 text-2xl font-extrabold tracking-tight text-foreground">
         <span class="text-primary">✳</span> 你好{{ name ? '，' + name : '，同事' }}
       </div>
-      <Composer v-model="draft" :asking="asking" :has-messages="false" @submit="ask()" @stop="stop" />
+      <Composer v-model="draft" :asking="asking" :has-messages="false" :thinking="thinking" @submit="ask()" @stop="stop" @toggle-thinking="toggleThinking" />
       <div v-if="hotQuestions.length" class="mt-5 flex max-w-2xl flex-wrap justify-center gap-2">
         <button
           v-for="(h, i) in hotQuestions" :key="i"

@@ -1,5 +1,6 @@
 import { useSession, toIdentity } from '@/stores/session'
 import { apiJson } from '@/lib/api'
+import { diag } from '@/lib/diag'
 
 // 本企业 corpId（非密钥，可硬编码兜底）。钉钉「PC 端访问地址」注入的 H5 拿不到 corpId 时用它，
 // 否则 requestAuthCode 报 'corpId is illegal'。URL 带 ?corpId= 时优先。
@@ -80,6 +81,7 @@ export function captureUrlCredential(): void {
   if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name') }
   if (docId) _pendingVersion = { docId, owner: qs('owner'), title: qs('title') }   // 小程序升版深链
   if (urlToken || docId) scrubUrl(['token', 'name', 'doc_id', 'owner', 'title'])   // 先抹除，再发任何请求
+  diag(`capture: token=${urlToken ? 'set' : '-'} pendingVer=${docId || '-'}`)
 }
 
 /** 是否有待处理的升版深链（App 据此在就绪后路由到 /manage）。不清除。 */
@@ -103,6 +105,7 @@ async function doLogin(force: boolean): Promise<void> {
   if (!force) {
     if (!session.token && _stashedToken) session.setToken(_stashedToken)
     if (session.token) {
+      diag('login: URL 透传 token → /api/kb/whoami')
       const who = await apiJson<Record<string, any>>('/api/kb/whoami', { auth: true })
       session.setIdentity(toIdentity({ ...who, display_name: who.display_name || _capturedName }))
       return
@@ -110,7 +113,9 @@ async function doLogin(force: boolean): Promise<void> {
   }
 
   const corpId = qs('corpId') || qs('corpid') || CORP_ID_FALLBACK
+  diag(`login: 容器免登 requestAuthCode（corpId=${corpId}${force ? ', 401 重登' : ''}）`)
   const code = await getAuthCode(corpId)
+  diag('login: authCode 取得 → /api/auth/dingtalk 换证')
   const data = await apiJson<Record<string, any>>('/api/auth/dingtalk', {
     method: 'POST', auth: false, body: JSON.stringify({ auth_code: code }),
   })
@@ -131,9 +136,11 @@ export function useAuth() {
         await doLogin(false)
         session.ready = true
         session.error = ''
+        diag(`login OK: role=${session.role} canManage=${session.canManage}`)
       } catch (e: any) {
         session.ready = false
         session.error = e?.message || '登录失败'
+        diag(`login FAIL: ${e?.message || e}`)
       }
     })()
     return _initPromise

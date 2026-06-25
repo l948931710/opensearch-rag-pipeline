@@ -53,6 +53,7 @@ export interface ChatMessage {
 const messages = ref<ChatMessage[]>([])
 const asking = ref(false)
 const draft = ref('')
+const thinking = ref(false)            // 深度思考开关（逐问生效，与小程序对齐；后端 qwen3 思考流式）
 const hotQuestions = ref<string[]>([])
 let qaSession = ''
 let askSeq = 0                       // 竞态锁：停止/新提问/重试递增，作废在途流回调
@@ -149,6 +150,7 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
 
   const body: Record<string, unknown> = { question: text }
   if (qaSession) body.session_id = qaSession
+  if (thinking.value) body.thinking = true   // 深度思考（仅 true 时带，避免覆盖服务端默认）
 
   try {
     // apiFetch：自动 Bearer（部门过滤需要）+ 首帧 401 自动重登重试一次（流未消费，可干净重发）。
@@ -275,7 +277,7 @@ async function loadHotQuestions(): Promise<void> {
 
 export function useAsk() {
   return {
-    messages, asking, draft, hotQuestions,
+    messages, asking, draft, thinking, hotQuestions,
     ask, stop, retry, resetThread, vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions,
   }
 }
@@ -285,6 +287,7 @@ export function __resetAsk(): void {
   messages.value = []
   asking.value = false
   draft.value = ''
+  thinking.value = false
   hotQuestions.value = []
   qaSession = ''
   askSeq = 0

@@ -2099,38 +2099,22 @@ def kb_pending_approvals(request: Request,
 
 
 # ═══════════════════════════════════════════════════════════════
-# 电脑端 H5 控制台（PC 免登 + 文档上传/管理）— 同源单页，钉钉小程序"PC 端访问地址"指向 /console
-# ═══════════════════════════════════════════════════════════════
-
-_KB_CONSOLE_HTML_CACHE: Dict[str, Any] = {"html": None}
-
-
-@app.get("/console", response_class=HTMLResponse)
-def kb_console_page():
-    """自包含 H5 控制台单页：jsapi 免登 → /api/auth/dingtalk → /api/kb/*（同源调用）。"""
-    if _KB_CONSOLE_HTML_CACHE["html"] is None:
-        from pathlib import Path
-        p = Path(__file__).resolve().parent / "webconsole" / "console.html"
-        try:
-            _KB_CONSOLE_HTML_CACHE["html"] = p.read_text(encoding="utf-8")
-        except Exception as e:
-            logger.error("console.html 读取失败: %s", e)
-            _KB_CONSOLE_HTML_CACHE["html"] = "<h1>知识库控制台页面缺失</h1>"
-    return HTMLResponse(_KB_CONSOLE_HTML_CACHE["html"])
-
-
-# ═══════════════════════════════════════════════════════════════
-# Vite 控制台 SPA（/console-next）— 与旧 /console 并行双跑（P7 再切默认入口、P8 退役 legacy）
-#   · hash 命名的静态资源 immutable，index.html no-cache（修正#9）
-#   · SPA 回退【仅作用于 /console-next/*】：未命中文件 → index.html，由前端路由接管。
-#     该 catch-all 不匹配 /api/*，故不存在的 API 仍返回 FastAPI 默认 JSON 404（修正#3）。
+# 控制台托管（P7 切换）：
+#   · /console            = 新 Vite SPA（默认入口）；无尾斜杠 → 307 到 /console/（保留 query）
+#   · /console/{path}     = SPA 静态 + 作用域 SPA 回退（构建 base 须为 /console/）
+#   · /console-legacy     = 旧·自包含 H5 控制台（退居此处，保留 ≥1 发布周期，P8 退役）
+#   · /console-next[/...] = 并行阶段路径 → 307 重定向到 /console/...（向后兼容，保留 query）
+#   缓存（修正#9）：hash 资源 immutable，index.html / SPA 回退 no-cache。
+#   作用域（修正#3）：回退仅作用于 /console 与 /console/*，不匹配 /api/* → 未知 API 仍 JSON 404。
+#   小程序兼容：既有 web-view 链接 /console?token=&doc_id=... 零改动命中新 SPA（query 原样保留）。
 # ═══════════════════════════════════════════════════════════════
 
 _NEXT_DIST = Path(__file__).resolve().parent / "webconsole" / "next-dist"
+_KB_CONSOLE_HTML_CACHE: Dict[str, Any] = {"html": None}
 
 
-def _serve_next_file(rel: str) -> Response:
-    """从 next-dist 安全返回文件；越界/不存在 → index.html（SPA 回退，no-cache）。"""
+def _serve_console_spa(rel: str) -> Response:
+    """从 next-dist 安全返回文件；越界/不存在 → index.html（SPA 回退，no-cache）。构建 base 须为 /console/。"""
     base = _NEXT_DIST
     index = base / "index.html"
     if rel:
@@ -2141,18 +2125,51 @@ def _serve_next_file(rel: str) -> Response:
             return FileResponse(target, headers={"Cache-Control": cache})
     if index.is_file():
         return FileResponse(index, headers={"Cache-Control": "no-cache"})
-    return HTMLResponse("<h1>/console-next 尚未构建（在 console-app 下运行 npm run build）</h1>", status_code=404)
+    return HTMLResponse("<h1>/console 尚未构建（在 console-app 下 CONSOLE_BASE=/console/ npm run build）</h1>", status_code=404)
+
+
+def _redirect_to_console(path: str, request: Request) -> RedirectResponse:
+    """重定向到 /console/<path>，原样保留 query（小程序 ?token=&doc_id= 深链不可丢）。"""
+    target = f"/console/{path}" if path else "/console/"
+    q = request.url.query
+    if q:
+        target += f"?{q}"
+    return RedirectResponse(url=target, status_code=307)
+
+
+@app.get("/console", include_in_schema=False)
+def kb_console_root(request: Request):
+    """无尾斜杠 → 307 到 /console/（与构建 base 对齐；保留 query，避免 vue-router base 归一化歧义）。"""
+    return _redirect_to_console("", request)
+
+
+@app.get("/console/{path:path}", include_in_schema=False)
+def kb_console_spa(path: str):
+    return _serve_console_spa(path)
+
+
+@app.get("/console-legacy", response_class=HTMLResponse, include_in_schema=False)
+def kb_console_legacy():
+    """旧·自包含 H5 控制台单页：jsapi 免登 → /api/auth/dingtalk → /api/kb/*（同源调用）。P8 退役。"""
+    if _KB_CONSOLE_HTML_CACHE["html"] is None:
+        p = Path(__file__).resolve().parent / "webconsole" / "console.html"
+        try:
+            _KB_CONSOLE_HTML_CACHE["html"] = p.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error("console.html 读取失败: %s", e)
+            _KB_CONSOLE_HTML_CACHE["html"] = "<h1>知识库控制台页面缺失</h1>"
+    return HTMLResponse(_KB_CONSOLE_HTML_CACHE["html"])
 
 
 @app.get("/console-next", include_in_schema=False)
-def kb_console_next_root():
-    """无尾斜杠 → 重定向到带斜杠（与构建 base /console-next/ 一致，资源相对路径才正确）。"""
-    return RedirectResponse(url="/console-next/")
+def kb_console_next_root(request: Request):
+    return _redirect_to_console("", request)
 
 
 @app.get("/console-next/{path:path}", include_in_schema=False)
-def kb_console_next(path: str):
-    return _serve_next_file(path)
+def kb_console_next_redirect(path: str, request: Request):
+    """并行阶段 /console-next/* → 统一 307 到 /console/*（保留子路径 + query）。"""
+    return _redirect_to_console(path, request)
 
 
 # ═══════════════════════════════════════════════════════════════

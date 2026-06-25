@@ -160,6 +160,28 @@ describe('useAsk.vote — 乐观置态 + 失败回滚', () => {
   })
 })
 
+describe('useAsk — 深度思考（parity-5）', () => {
+  it('开启时请求体带 thinking:true；关闭时不带', async () => {
+    const mk = () => streamResp([
+      frame({ type: 'session', session_id: 's', message_id: 'm' }),
+      frame({ type: 'chunk', content: 'x' }),
+      frame({ type: 'done', model: 'q', usage: {}, guard: false }), DONE,
+    ])
+    const fetchMock = vi.fn().mockResolvedValue(mk())
+    vi.stubGlobal('fetch', fetchMock)
+    const { ask, thinking } = useAsk()
+
+    await ask('普通问')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).not.toHaveProperty('thinking')
+
+    thinking.value = true
+    fetchMock.mockResolvedValue(mk())
+    await ask('深度问')
+    const body = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect(body).toMatchObject({ question: '深度问', thinking: true })
+  })
+})
+
 describe('useAsk.resetThread — 新会话（parity-6）', () => {
   it('清空线程 + 草稿（下次提问重建会话）', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp([
