@@ -3,36 +3,28 @@ import { onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useSession } from '@/stores/session'
 import { useAuth } from '@/composables/useAuth'
+import AppShell from '@/components/shell/AppShell.vue'
 
-// P1：唯一在此触发免登 init（修正#6）。store/router 不再各自触发。
+// 唯一在此触发免登 init（修正#6）。store/router 不再各自触发。
+// 三态：登录中（全屏加载）/ 失败（全屏错误，多为非钉钉环境）/ 就绪（进应用外壳）。
 const session = useSession()
-const { ready, error, identity, role, canManage } = storeToRefs(session)
+const { ready, error } = storeToRefs(session)
 const { init } = useAuth()
 onMounted(() => { void init() })
 </script>
 
 <template>
-  <div class="min-h-screen flex items-center justify-center bg-background text-foreground p-8">
-    <div class="w-full max-w-md rounded-lg border border-border bg-card p-6 shadow-sm">
-      <div class="flex items-center gap-2 text-lg font-extrabold tracking-tight">
-        <span class="text-primary">✳</span> 富岭知识库
-      </div>
+  <!-- 就绪：进外壳（侧栏 + 路由内容）。router-view 只在此分支内，故视图挂载时身份已解析。 -->
+  <AppShell v-if="ready" />
 
-      <p v-if="!ready && !error" class="mt-3 text-sm text-muted-foreground">正在登录…</p>
-      <p v-else-if="error" class="mt-3 text-sm text-destructive">{{ error }}</p>
+  <!-- 未就绪：全屏品牌 + 登录中 / 错误 -->
+  <div v-else class="flex min-h-[100dvh] items-center justify-center bg-background p-8 text-foreground">
+    <div class="w-full max-w-sm text-center">
+      <div class="mx-auto grid size-12 place-items-center rounded-xl bg-primary text-lg font-bold text-primary-foreground">富</div>
+      <div class="mt-4 text-base font-extrabold tracking-tight">富岭知识库</div>
 
-      <template v-else>
-        <p class="mt-1 text-sm text-muted-foreground">P1 · 免登 + 会话就绪</p>
-        <div class="mt-4 rounded-md border border-border bg-secondary p-4">
-          <div class="font-semibold">{{ identity?.name || '—' }}</div>
-          <div class="mt-1.5 space-y-0.5 font-mono text-xs text-muted-foreground">
-            <div>role · {{ role }}</div>
-            <div>canManage · {{ canManage }}</div>
-            <div>acl · {{ identity?.aclGroups.join(', ') || '-' }}</div>
-          </div>
-        </div>
-        <p class="mt-3 text-xs text-muted-foreground">token 已保存在内存并从地址栏抹除（防泄露）。</p>
-      </template>
+      <p v-if="!error" class="mt-3 text-sm text-muted-foreground">正在登录…</p>
+      <p v-else class="mx-auto mt-3 max-w-xs text-sm text-destructive">{{ error }}</p>
     </div>
   </div>
 </template>

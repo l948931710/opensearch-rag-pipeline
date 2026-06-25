@@ -55,9 +55,32 @@ function getAuthCode(corpId: string, timeoutMs = 4000): Promise<string> {
 
 function safeJson(v: unknown): string { try { return JSON.stringify(v) } catch { return String(v) } }
 
+// 早捕获的暂存：token 暂存在模块级（捕获时 Pinia 可能尚未创建，不能落 store），name 作 whoami 兜底显示名。
+let _stashedToken = ''
+let _capturedName = ''
+let _captured = false
+
+/**
+ * 【最早期】从 URL 捕获透传令牌（小程序 web-view 的 ?token=）→ 暂存 + 立即抹除（修正#4）。
+ * 关键时序：必须在 `@/router` 被 import（createWebHistory 读 location）【之前】执行 ——
+ * 故由 `@/boot/capture` 作为 main.ts 第一个 import 触发。否则 router 在模块加载时就快照了带
+ * token 的 URL，并在初始导航 finalize 时把 token 写回地址栏（token 重新出现在历史/日志/截图）。
+ * 此刻 Pinia 可能还没创建，所以只暂存到模块变量、不碰 store；token 由 doLogin 再注入 store。
+ * 幂等：_captured 守卫 + 抹除后 URL 已无 token，重复调用 no-op（init 起始也会再调一次兜底）。
+ */
+export function captureUrlCredential(): void {
+  if (_captured) return
+  _captured = true
+  const urlToken = qs('token')
+  if (!urlToken) return
+  _stashedToken = urlToken
+  _capturedName = qs('name')
+  scrubUrl(['token', 'name'])   // 先抹除，再发任何请求（whoami 的 Referer 里也不含 token）
+}
+
 /**
  * 执行一次登录：
- *  ① URL 透传 token（小程序 web-view）优先 → 存 token、抹 URL、whoami 取权威身份。
+ *  ① 早捕获的透传 token（_stashedToken）→ 注入 store → whoami 取权威身份。
  *  ② 否则钉钉容器内 requestAuthCode → /api/auth/dingtalk 换证。
  * force=true（401 重登）跳过 ① 直接重走容器免登。
  */
@@ -65,13 +88,10 @@ async function doLogin(force: boolean): Promise<void> {
   const session = useSession()
 
   if (!force) {
-    const urlToken = qs('token')
-    if (urlToken) {
-      const name = qs('name')
-      session.setToken(urlToken)
-      scrubUrl(['token', 'name'])                       // 先抹除，再发请求（即使 whoami 失败 token 也已离开 URL）
+    if (!session.token && _stashedToken) session.setToken(_stashedToken)
+    if (session.token) {
       const who = await apiJson<Record<string, any>>('/api/kb/whoami', { auth: true })
-      session.setIdentity(toIdentity({ ...who, display_name: who.display_name || name }))
+      session.setIdentity(toIdentity({ ...who, display_name: who.display_name || _capturedName }))
       return
     }
   }
@@ -94,6 +114,7 @@ export function useAuth() {
     if (_initPromise) return _initPromise
     _initPromise = (async () => {
       try {
+        captureUrlCredential()   // 幂等兜底：若 main.ts 已捕获则 no-op
         await doLogin(false)
         session.ready = true
         session.error = ''
@@ -119,5 +140,10 @@ export function useAuth() {
   return { init, reauth }
 }
 
-/** 仅供测试：重置单次守卫。 */
-export function __resetInitGuard() { _initPromise = null }
+/** 仅供测试：重置单次守卫 + 早捕获暂存。 */
+export function __resetInitGuard() {
+  _initPromise = null
+  _captured = false
+  _stashedToken = ''
+  _capturedName = ''
+}

@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { useAuth, scrubUrl, qs, __resetInitGuard } from '@/composables/useAuth'
+import { useAuth, scrubUrl, qs, captureUrlCredential, __resetInitGuard } from '@/composables/useAuth'
 import { useSession } from '@/stores/session'
 
 function jsonRes(body: unknown, status = 200): Response {
@@ -35,6 +35,33 @@ describe('qs', () => {
     setUrl('?name=%E9%A2%84%E8%A7%88')
     expect(qs('name')).toBe('预览')
     expect(qs('absent')).toBe('')
+  })
+})
+
+describe('captureUrlCredential（早捕获：先抹 URL、token 暂存而非立即落 store）', () => {
+  it('抹除 URL token/name；不落 store；随后 init 用暂存 token 走 whoami', async () => {
+    setUrl('?token=EARLY&name=%E5%BC%A0')
+    captureUrlCredential()                       // 模拟 main 第一个 import（router 加载前）的早调用
+    expect(window.location.search).not.toContain('EARLY') // 已立即抹除（先于任何请求）
+    expect(window.location.search).not.toContain('name')
+    expect(useSession().token).toBe('')          // 早捕获不碰 store（彼时 Pinia 可能尚未创建）
+
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({
+      user_id: 'u', role: 'kb_admin', can_manage_kb: true, // display_name 缺省 → 用早捕获的 name 兜底
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    await useAuth().init()
+    expect(useSession().token).toBe('EARLY')      // doLogin 注入暂存 token
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/kb/whoami')
+    expect(useSession().identity?.name).toBe('张') // 兜底显示名
+  })
+
+  it('幂等：第二次 capture 不再改动（已捕获守卫）', () => {
+    setUrl('?token=ONCE')
+    captureUrlCredential()
+    setUrl('?token=AGAIN')                         // 即便 URL 又出现 token
+    captureUrlCredential()                         // 守卫拦下，不二次暂存
+    expect(window.location.search).toContain('AGAIN') // 第二次未抹除（已被守卫短路）
   })
 })
 
