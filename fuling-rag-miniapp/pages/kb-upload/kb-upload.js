@@ -35,4 +35,11 @@ Page({
         this.setData({ err: '登录失败，请在钉钉中重试' });
       });
   },
+
+  // web-view 加载失败（最常见：上传页域名未登记为「业务域名」，或网络/证书问题）。
+  // 给出可操作兜底，而非静默空白——引导改用电脑端浏览器完成上传。
+  onWvError(e) {
+    console.log('[kb-upload] web-view error', e && e.detail);
+    this.setData({ src: '', err: '上传页加载失败（手机端上传需后台登记业务域名）。请在电脑端浏览器打开知识库管理完成上传。' });
+  },
 });

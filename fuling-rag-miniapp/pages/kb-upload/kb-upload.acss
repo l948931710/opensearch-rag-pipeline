@@ -15,3 +15,12 @@
   font-size: 28rpx;
   color: var(--text-3);
 }
+
+.wv-tip {
+  font-size: 24rpx;
+  color: var(--text-3);
+  margin-top: 16rpx;
+  padding: 0 60rpx;
+  text-align: center;
+  line-height: 1.6;
+}

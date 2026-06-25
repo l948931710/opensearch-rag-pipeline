@@ -60,6 +60,11 @@
     .btn-ghost.danger { color:#b3261e; border-color:#f3cfca; }
     #dupWarn { background:#fff3da; border:1px solid #f0d9a8; border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; line-height:1.6; }
     #dupWarn .linklike { color:#9a6b00; }
+    .upqueue { margin-top:12px; border-top:1px solid var(--line); }
+    .qrow { display:flex; align-items:center; gap:10px; padding:9px 0; border-bottom:1px solid var(--line); }
+    .qname { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
+    .qmsg { flex:0 0 auto; }
+    .qdup { color:#9a6b00; font-size:12px; padding:0 0 8px; line-height:1.5; }
     @media (min-width:760px) { .upform input[type=text], .upform select { max-width:560px; } }
     @media (max-width:640px) {
       .doctable, .doctable thead, .doctable tbody, .doctable tr, .doctable th, .doctable td { display:block; }
@@ -107,8 +112,8 @@
         <strong>{{ verCtx ? '上传新版本' : '上传新文档' }}</strong>
         <span class="linklike" v-if="verCtx" @click="exitVersionMode">← 改为新建文档</span>
       </div>
-      <label>选择文件（.pdf .docx .xlsx .pptx .jpg .png）</label>
-      <input type="file" ref="file" accept=".pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png" @change="onFile" />
+      <label>选择文件（{{ verCtx ? '升版仅取 1 个' : '新建可多选批量' }}；.pdf .docx .xlsx .pptx .jpg .png）</label>
+      <input type="file" ref="file" multiple accept=".pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png" @change="onFile" />
       <div id="dupWarn" v-if="dupWarn && !verCtx">
         ⚠️ 已有相似文档 <strong>{{ dupWarn.title }}</strong>（v{{ dupWarn.ver }} · {{ dupWarn.badge }}）{{ dupWarn.more }}。是否应升版而非新建？
         <span class="linklike" @click="enterVersionMode(dupWarn.top)">改为升版该文档</span>
@@ -136,6 +141,16 @@
       </div>
       <div class="err">{{ uploadErr }}</div>
       <div id="dupWarn" v-if="contentDupMsg">⚠️ {{ contentDupMsg }}</div>
+      <div class="upqueue" v-if="uploadQueue.length">
+        <div v-for="(q, idx) in uploadQueue" :key="idx">
+          <div class="qrow">
+            <span class="qname">{{ q.name }}</span>
+            <span class="pill" :class="qBadgeClass(q.status)">{{ q.status }}</span>
+            <span class="muted qmsg">{{ q.msg }}</span>
+          </div>
+          <div class="qdup" v-if="q.dup">⚠️ {{ q.dup }}</div>
+        </div>
+      </div>
     </div>
 
     <div class="card" v-if="canManage">
@@ -223,6 +238,7 @@
         /** @type {Doc|null} */ verCtx: null,
         /** @type {?{title:string,ver:number,badge:string,more:string,top:Doc}} */ dupWarn: null,
         uploadMsg: '', uploadErr: '', uploadOk: false, uploadBusy: false, contentDupMsg: '',
+        /** @type {Array<{name:string,status:string,msg:string,dup:string}>} */ uploadQueue: [],
         /** @type {Doc[]} */ docs: [], q: '', filter: '', sortKey: '', sortDir: 1,
         _docsSeq: 0, pendingVer: '', _searchTimer: null, _trackSeq: 0,
         /** @type {Pending[]} */ approvals: [], approvalBusy: false, retireBusy: false,
@@ -358,7 +374,7 @@
 
       // ── 升版态：归属/可见范围继承原文档（不可改），仅替换文件 → 版本号 +1 ──
       enterVersionMode(d) {
-        this.verCtx = d; this.dupWarn = null; this.contentDupMsg = '';
+        this.verCtx = d; this.dupWarn = null; this.contentDupMsg = ''; this.uploadQueue = [];
         this.uploadMsg = ''; this.uploadErr = ''; this.uploadOk = false;
         if (this.$refs.file) this.$refs.file.value = '';
         var self = this; this.$nextTick(function(){ if (self.$refs.uploadCard) self.$refs.uploadCard.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
@@ -393,7 +409,7 @@
 
       // 上传查重：新建模式下选文件后按文件名查现存文档，命中（非已退役）则提示"应升版而非新建"。
       onFile() {
-        var self = this; this.dupWarn = null;
+        var self = this; this.dupWarn = null; this.uploadQueue = []; this.uploadMsg = ''; this.uploadErr = '';
         if (this.verCtx) return;
         var f = this.$refs.file && this.$refs.file.files[0]; if (!f) return;
         var core = f.name.replace(/\.[^.]+$/, '').trim();
@@ -406,17 +422,23 @@
         }).catch(function(){});
       },
 
-      // ── 上传：upload-url → PUT OSS（带进度）→ register → 轮询入库状态 ──
+      // ── 上传分发：升版 / 单文件 → 富流程（进度+查重+轮询）；多文件新建 → 批量队列 ──
       doUpload() {
+        var files = (this.$refs.file && this.$refs.file.files) || [];
+        if (!files.length) { this.uploadErr = '请先选择文件'; return; }
+        if (this.verCtx || files.length === 1) { this.uploadSingle(files[0]); return; }
+        this.uploadBatch(Array.prototype.slice.call(files));
+      },
+
+      // 单文件：upload-url → PUT(带进度) → register → 查重提示 + 入库状态轮询。
+      uploadSingle(f) {
         var self = this;
-        var f = this.$refs.file && this.$refs.file.files[0];
-        if (!f) { this.uploadErr = '请先选择文件'; return; }
         // #6 客户端预检：空文件 / 超限先拦，避免把 50MB 传完才在 register 被 413 拒。
         if (f.size <= 0) { this.uploadErr = '所选文件为空，请重新选择'; return; }
         if (f.size > MAX_UPLOAD_MB * 1024 * 1024) {
           this.uploadErr = '文件 ' + (f.size / 1024 / 1024).toFixed(1) + 'MB，超过上限 ' + MAX_UPLOAD_MB + 'MB，请压缩或拆分后再传'; return;
         }
-        this.uploadErr = ''; this.uploadBusy = true; this.uploadOk = false; this.uploadMsg = '申请上传地址…'; this.contentDupMsg = '';
+        this.uploadErr = ''; this.uploadBusy = true; this.uploadOk = false; this.uploadMsg = '申请上传地址…'; this.contentDupMsg = ''; this.uploadQueue = [];
         this._trackSeq++;   // 新一轮上传 → 作废上一份正在跑的状态轮询
         // 升版态：action=version + 继承原文档 owner/perm（后端再校验 doc 存在 + owner 在管理范围 + 强制继承 perm）。
         var payload = this.verCtx
@@ -441,6 +463,46 @@
           })
           .catch(function(e){ self.uploadBusy = false; self.uploadOk = false; self.uploadMsg = ''; self.uploadErr = self.uploadErrText(e); self.diag('upload FAIL: ' + e.message); });
       },
+
+      // 多文件新建：顺序上传（一次一个），逐文件显示状态；单文件失败不影响其余。
+      // 标题各自用文件名（不套用「标题」框）；归属/可见范围共用表单选择。真实 File 留在闭包（不进响应式，
+      // 否则 Vue 的 Proxy 包裹会破坏 XHR 的 send(file)）；uploadQueue 仅承载显示状态。
+      uploadBatch(files) {
+        var self = this;
+        this.uploadErr = ''; this.uploadOk = false; this.uploadMsg = ''; this.contentDupMsg = ''; this.dupWarn = null;
+        this._trackSeq++;
+        var owner = this.newOwner, perm = this.newPerm;
+        this.uploadQueue = files.map(function(f){
+          var bad = f.size <= 0 ? '空文件' : (f.size > MAX_UPLOAD_MB * 1024 * 1024 ? ('超' + MAX_UPLOAD_MB + 'MB') : '');
+          return { name: f.name, status: bad ? '跳过' : '排队', msg: bad, dup: '' };
+        });
+        this.uploadBusy = true;
+        var i = 0;
+        function finish() {
+          self.uploadBusy = false;
+          var ok = self.uploadQueue.filter(function(q){ return q.status === '已提交'; }).length;
+          var bad = self.uploadQueue.filter(function(q){ return q.status === '失败' || q.status === '跳过'; }).length;
+          self.uploadOk = bad === 0;
+          self.uploadMsg = '批量完成：' + ok + ' 成功' + (bad ? ('，' + bad + ' 失败/跳过') : '');
+          if (self.$refs.file) self.$refs.file.value = '';
+          self.loadDocs(); self.loadApprovals();
+        }
+        function next() {
+          while (i < files.length && self.uploadQueue[i].status === '跳过') i++;
+          if (i >= files.length) { finish(); return; }
+          var item = self.uploadQueue[i];   // 响应式显示对象
+          var file = files[i];              // 真实 File（闭包，非响应式）
+          item.status = '上传中';
+          self.api('/api/kb/upload-url', { method: 'POST', auth: true, body: { action: 'new', filename: file.name, owner_dept: owner, permission_level: perm } })
+            .then(function(u){ return putWithProgress(u.put_url, file, function(pct){ item.msg = pct + '%'; }).then(function(){ return u.upload_token; }); })
+            .then(function(tok){ item.status = '登记中'; item.msg = ''; return self.api('/api/kb/register', { method: 'POST', auth: true, body: { upload_token: tok } }); })
+            .then(function(reg){ item.status = '已提交'; item.msg = 'v' + reg.version_no + (reg.requires_kb_admin_approval ? ' · 待审批' : ''); item.dup = self.buildDupMsg(reg); i++; next(); })
+            .catch(function(e){ item.status = '失败'; item.msg = self.uploadErrText(e); self.diag('batch upload FAIL: ' + e.message); i++; next(); });
+        }
+        next();
+      },
+
+      qBadgeClass(s) { return ({ '已提交': 'ok', '失败': 'fail', '跳过': 'fail', '上传中': 'busy', '登记中': 'busy', '排队': 'queue' })[s] || 'queue'; },
 
       // 跨部门内容查重提示（命中才返回非空）：可见命中给详情，范围外仅计数（隐私）。
       buildDupMsg(reg) {
