@@ -12,9 +12,15 @@ const {
 } = useKb()
 
 const fileInput = ref<HTMLInputElement | null>(null)
+const dragging = ref(false)
 function onChange(e: Event) { onFileSelected((e.target as HTMLInputElement).files) }
 function clearFiles() { if (fileInput.value) fileInput.value.value = ''; onFileSelected(null) }
 function backToNew() { exitVersionMode(); clearFiles() }
+function onDrop(e: DragEvent) {
+  dragging.value = false
+  const files = e.dataTransfer?.files
+  if (files && files.length) onFileSelected(files)   // 升版态由 onFileSelected 自动只取首个
+}
 </script>
 
 <template>
@@ -42,11 +48,18 @@ function backToNew() { exitVersionMode(); clearFiles() }
       <input ref="fileInput" type="file" class="hidden" :accept="UPLOAD_ACCEPT" :multiple="!verCtx" @change="onChange" />
       <button
         type="button"
-        class="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-input bg-secondary/30 px-4 py-5 text-sm text-muted-foreground transition hover:border-ring hover:bg-secondary/60"
+        class="dropzone flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed border-input bg-panel/40 px-4 py-7 text-sm text-muted-foreground hover:border-border-strong hover:bg-panel/70"
+        :data-drag="dragging ? '1' : '0'"
         @click="fileInput?.click()"
+        @dragover.prevent="dragging = true"
+        @dragenter.prevent="dragging = true"
+        @dragleave.prevent="dragging = false"
+        @drop.prevent="onDrop"
       >
-        <FileUp :size="18" :stroke-width="1.75" />
-        {{ selectedNames.length ? '重新选择' : (verCtx ? '选择 1 个文件' : '选择文件（可多选）') }}
+        <FileUp :size="20" :stroke-width="1.6" :class="dragging ? 'text-accent-text' : ''" />
+        <span :class="dragging ? 'text-accent-text' : ''">
+          {{ dragging ? '松开以选择文件' : (selectedNames.length ? '重新选择' : (verCtx ? '点击或拖拽 1 个文件' : '点击或拖拽文件（可多选）')) }}
+        </span>
       </button>
       <div v-if="selectedNames.length" class="mt-2 flex flex-wrap items-center gap-1.5">
         <span v-for="(n, i) in selectedNames" :key="i" class="inline-flex max-w-full items-center rounded bg-secondary px-2 py-1 text-xs text-foreground">

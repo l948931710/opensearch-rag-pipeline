@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { escapeHtml, renderMd, stripImg } from '@/lib/markdown'
+import { escapeHtml, renderMd, stripImg, highlightCode } from '@/lib/markdown'
 
 describe('escapeHtml', () => {
   it('转义 < > & " \'', () => {
@@ -23,6 +23,26 @@ describe('renderMd（白名单 markdown，转义优先防注入）', () => {
   it('多行合并 + 空串兜底', () => {
     expect(renderMd('一\n\n二')).toBe('<p>一</p><p>二</p>')
     expect(renderMd('')).toBe('<p></p>')
+  })
+})
+
+describe('renderMd 围栏代码块 + highlightCode', () => {
+  it('``` 块 → <pre><code>，内部不被逐行 md 误伤', () => {
+    const h = renderMd('说明：\n```sql\nselect * from t -- 注释\n```\n结束')
+    expect(h).toContain('<pre><code data-lang="sql">')
+    expect(h).toContain('<p>说明：</p>')
+    expect(h).toContain('<p>结束</p>')
+    // 内部 -- 注释 没被当成列表项
+    expect(h).not.toContain('md-li')
+  })
+  it('highlightCode 给注释/字符串/数字/关键字上色且转义安全', () => {
+    const out = highlightCode(`const x = "a<b" // c\nfoo(1)`)
+    expect(out).toContain('<span class="c-key">const</span>')
+    expect(out).toContain('<span class="c-str">&quot;a&lt;b&quot;</span>')   // 已转义
+    expect(out).toContain('<span class="c-comment">// c</span>')
+    expect(out).toContain('<span class="c-num">1</span>')
+    expect(out).toContain('<span class="c-fn">foo</span>')                    // 标识符后紧跟 (
+    expect(out).not.toContain('<b')                                          // 无未转义标签注入
   })
 })
 

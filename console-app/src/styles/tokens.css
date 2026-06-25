@@ -18,6 +18,7 @@
   --destructive:#B3261E;
   --st-live:#2F6B4F; --st-busy:#A9760C; --st-queue:#79847A;
   --st-warn:#2563A0; --st-fail:#B3261E; --st-muted:#A3A299;
+  --c-key:#2F6B4F; --c-str:#B05A33; --c-num:#8154AD; --c-comment:#A3A299; --c-fn:#2563A0;
   --shadow:0 1px 2px rgba(20,20,15,.05),0 6px 20px rgba(20,20,15,.04);
 }
 
@@ -32,6 +33,7 @@
   --destructive:#E06A6A;
   --st-live:#74C39A; --st-busy:#E0A06A; --st-queue:#9D998E;
   --st-warn:#7FB0E0; --st-fail:#E06A6A; --st-muted:#6E6A61;
+  --c-key:#83CBA1; --c-str:#E0A06A; --c-num:#C6A0E8; --c-comment:#6E6A61; --c-fn:#7FB0E0;
   --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.32);
 }
 
@@ -151,3 +153,46 @@ body {
 .md strong { font-weight: 600; }
 .md code { font-family: var(--font-code); font-size: 12.5px; background: var(--accent-soft); color: var(--accent-text); padding: 1.5px 5px; border-radius: 5px; }
 .md a { color: var(--accent-text); text-decoration: underline; }
+.md blockquote { margin: 0 0 12px; padding: 9px 15px; border-left: 2.5px solid var(--accent); background: var(--accent-soft); border-radius: 0 9px 9px 0; color: var(--muted); font-size: 13.5px; }
+/* 围栏代码块（renderMd 输出 <pre><code>，highlightCode 已转义并标记 token） */
+.md pre { margin: 0 0 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 11px; overflow: hidden; }
+.md pre code { display: block; background: none; color: var(--text); padding: 14px 16px; font-size: 12.5px; line-height: 1.62; overflow-x: auto; border-radius: 0; }
+.md pre code .c-key { color: var(--c-key); }
+.md pre code .c-str { color: var(--c-str); }
+.md pre code .c-num { color: var(--c-num); }
+.md pre code .c-comment { color: var(--c-comment); font-style: italic; }
+.md pre code .c-fn { color: var(--c-fn); }
+
+/* ── Atlas 台账网格（DocTable）── */
+.led-head, .led-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px 64px 92px 132px 116px;
+  align-items: center;
+  gap: 12px;
+}
+.led-head { padding: 0 14px 8px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.led-row { padding: 12px 14px; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+.led-row:last-child { border-bottom: none; }
+.led-row:hover { background: color-mix(in srgb, var(--panel) 60%, transparent); }
+.led-row[data-retired="1"] { opacity: .5; }
+.led-row[data-retired="1"]:hover { opacity: .85; }
+.led-sort { cursor: pointer; user-select: none; }
+.led-sort:hover { color: var(--text); }
+.led-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.doc-actions { opacity: 0; transition: opacity .13s; }
+.led-row:hover .doc-actions, .led-row:focus-within .doc-actions { opacity: 1; }
+@media (max-width: 680px) {
+  .led-head { display: none; }
+  .led-row { grid-template-columns: 1fr; gap: 6px; padding: 14px 16px; }
+  .led-row .led-cell { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .led-row .led-cell::before { content: attr(data-label); color: var(--faint); font-size: 11px; font-weight: 600; flex-shrink: 0; }
+  .led-row .led-cell-main::before { display: none; }
+  .led-row .led-actions { justify-content: flex-start; }
+  .led-row .doc-actions { opacity: 1; }   /* 卡片态常显操作 */
+}
+
+/* ── Atlas 仪表盘卡片 + 拖拽上传 ── */
+.kb-card { transition: border-color .14s ease, transform .14s ease; }
+.kb-card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+.dropzone { transition: border-color .14s ease, background .14s ease; }
+.dropzone[data-drag="1"] { border-color: var(--accent) !important; background: var(--accent-soft) !important; }

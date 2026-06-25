@@ -53,55 +53,50 @@ async function onRetire(d: DocItem) {
         v-for="c in chips" :key="c || 'all'"
         type="button"
         class="rounded-full border px-2.5 py-1 text-xs transition"
-        :class="filter === c ? 'border-ring bg-accent text-accent-foreground' : 'border-border bg-card text-muted-foreground hover:bg-secondary'"
+        :class="filter === c ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
         @click="filter = c"
       >
         {{ c || '全部' }} <span class="font-mono">{{ countOf(c) }}</span>
       </button>
     </div>
 
-    <!-- 表格 -->
-    <div class="mt-4 overflow-x-auto">
-      <table class="w-full border-collapse text-sm">
-        <thead>
-          <tr class="border-b border-border text-left text-xs text-muted-foreground">
-            <th v-for="col in COLS" :key="col.key" class="cursor-pointer select-none px-2 py-2 font-medium hover:text-foreground" @click="sortBy(col.key)">
-              <span class="inline-flex items-center gap-1">{{ col.label }}<ArrowUpDown :size="11" :stroke-width="1.75" class="opacity-40" />{{ arrow(col.key) }}</span>
-            </th>
-            <th class="px-2 py-2 text-right font-medium">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="d in filtered" :key="d.doc_id" class="border-b border-border/60 last:border-0 hover:bg-secondary/30">
-            <td class="max-w-xs px-2 py-2.5">
-              <div class="truncate font-medium text-foreground">{{ d.title || d.original_filename || d.doc_id }}</div>
-            </td>
-            <td class="px-2 py-2.5 text-muted-foreground">{{ deptLabel(d.owner_dept) }}</td>
-            <td class="px-2 py-2.5 font-mono text-xs text-muted-foreground">v{{ d.current_version_no || 1 }}</td>
-            <td class="px-2 py-2.5"><StatusPill :badge="d.status_badge" /></td>
-            <td class="px-2 py-2.5 font-mono text-xs text-muted-foreground">{{ (d.updated_at || '').slice(0, 16) }}</td>
-            <td class="px-2 py-2.5">
-              <div class="flex items-center justify-end gap-1">
-                <button type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground" @click="enterVersionMode(d)">
-                  <FilePlus2 :size="13" :stroke-width="1.75" /> 升版
-                </button>
-                <button
-                  v-if="d.status_badge !== '已退役'"
-                  type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
-                  @click="onRetire(d)"
-                >
-                  <Archive :size="13" :stroke-width="1.75" /> 退役
-                </button>
-              </div>
-            </td>
-          </tr>
-          <tr v-if="!filtered.length">
-            <td colspan="6" class="px-2 py-8 text-center text-sm text-muted-foreground">
-              {{ loadingDocs ? '加载中…' : (q ? '无匹配文档' : '暂无文档，先上传一篇吧') }}
-            </td>
-          </tr>
-        </tbody>
-      </table>
+    <!-- Atlas 台账网格（< 680px 自动卡片化，由 .led-* 媒体查询接管） -->
+    <div class="mt-4 overflow-hidden rounded-xl border border-border bg-card">
+      <div class="led-head font-medium">
+        <span v-for="col in COLS" :key="col.key" class="led-sort inline-flex items-center gap-1" @click="sortBy(col.key)">
+          {{ col.label }}<ArrowUpDown :size="11" :stroke-width="1.75" class="opacity-40" /><span class="text-accent-text">{{ arrow(col.key) }}</span>
+        </span>
+        <span class="text-right">操作</span>
+      </div>
+
+      <div
+        v-for="d in filtered" :key="d.doc_id"
+        class="led-row" :data-retired="d.status_badge === '已退役' ? '1' : '0'"
+      >
+        <div class="led-cell led-cell-main min-w-0" data-label="文档名">
+          <span class="truncate font-medium text-foreground">{{ d.title || d.original_filename || d.doc_id }}</span>
+        </div>
+        <div class="led-cell text-sm text-muted-foreground" data-label="归属">{{ deptLabel(d.owner_dept) }}</div>
+        <div class="led-cell font-mono text-xs text-muted-foreground" data-label="版本">v{{ d.current_version_no || 1 }}</div>
+        <div class="led-cell" data-label="状态"><StatusPill :badge="d.status_badge" /></div>
+        <div class="led-cell font-mono text-xs text-muted-foreground" data-label="更新">{{ (d.updated_at || '').slice(0, 16) }}</div>
+        <div class="led-cell led-actions doc-actions" data-label="操作">
+          <button type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="enterVersionMode(d)">
+            <FilePlus2 :size="13" :stroke-width="1.75" /> 升版
+          </button>
+          <button
+            v-if="d.status_badge !== '已退役'"
+            type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
+            @click="onRetire(d)"
+          >
+            <Archive :size="13" :stroke-width="1.75" /> 退役
+          </button>
+        </div>
+      </div>
+
+      <div v-if="!filtered.length" class="px-4 py-10 text-center text-sm text-muted-foreground">
+        {{ loadingDocs ? '加载中…' : (q ? '无匹配文档' : '暂无文档，先上传一篇吧') }}
+      </div>
     </div>
   </section>
 </template>
