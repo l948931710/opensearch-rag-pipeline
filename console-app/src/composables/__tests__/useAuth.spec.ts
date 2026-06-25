@@ -88,6 +88,27 @@ describe('captureUrlCredential — 升版深链 ?doc_id（parity-1/3 补回）',
   })
 })
 
+describe('init — DEV ?preview 设计预览（无后端）', () => {
+  it('?preview 注入 mock 管理员身份直接 ready，不打任何接口', async () => {
+    setUrl('?preview')
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    await useAuth().init()
+    const s = useSession()
+    expect(s.ready).toBe(true)
+    expect(s.canManage).toBe(true)
+    expect(s.role).toBe('kb_admin')
+    expect(s.identity?.name).toBe('设计预览')
+    expect(fetchMock).not.toHaveBeenCalled()   // 纯前端，零后端
+  })
+
+  it('无 ?preview → 不走预览分支（仍按正常免登）', async () => {
+    setUrl('')
+    await useAuth().init()
+    expect(useSession().ready).toBe(false)     // 非钉钉环境 → 失败（未被预览短路）
+  })
+})
+
 describe('init — URL token 透传路径', () => {
   it('存 token、抹 URL、whoami 取权威身份', async () => {
     setUrl('?token=TKN123&name=%E5%BC%A0%E4%B8%89')

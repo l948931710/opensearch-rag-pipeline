@@ -9,9 +9,26 @@ import tailwindcss from '@tailwindcss/vite'
 // Router 的 history base 在运行时取 import.meta.env.BASE_URL（= 此处 base），单一来源。
 const BASE = process.env.CONSOLE_BASE || '/console/'
 
+// dev 便利：base 是 /console/，故根路径 / 不是应用入口（直接开 / 会白屏）。
+// 这个 dev-only 插件把 / 重定向到 base，省得忘了带路径。生产构建不含 dev server。
+const devRootRedirect = {
+  name: 'dev-root-redirect',
+  configureServer(server: any) {
+    server.middlewares.use((req: any, res: any, next: any) => {
+      const url = (req.url || '').split('?')[0]
+      if (url === '/' || url === '/index.html') {
+        res.writeHead(302, { Location: BASE })
+        res.end()
+        return
+      }
+      next()
+    })
+  },
+}
+
 export default defineConfig({
   base: BASE,
-  plugins: [vue(), tailwindcss()],
+  plugins: [vue(), tailwindcss(), devRootRedirect],
   resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
   server: {
     port: 5173,

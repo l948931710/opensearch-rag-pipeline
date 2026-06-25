@@ -131,6 +131,18 @@ export function useAuth() {
   function init(): Promise<void> {
     if (_initPromise) return _initPromise
     _initPromise = (async () => {
+      // 设计预览：仅 dev（import.meta.env.DEV）且 URL 带 ?preview 时，注入 mock 管理员身份直接进 UI——
+      // 无需钉钉容器/后端，纯看设计。生产构建里 DEV=false → 整段死代码消除，绝不进线上。
+      if (import.meta.env.DEV && new URLSearchParams(window.location.search).has('preview')) {
+        session.setToken('dev-preview')
+        session.setIdentity(toIdentity({
+          user_id: 'preview', display_name: '设计预览', role: 'kb_admin', can_manage_kb: true,
+          acl_groups: ['marketing'], managed_owner_depts: ['marketing', 'hr', 'finance', 'production'],
+        }))
+        session.ready = true; session.error = ''
+        diag('DEV ?preview：注入 mock 身份（无后端）')
+        return
+      }
       try {
         captureUrlCredential()   // 幂等兜底：若 main.ts 已捕获则 no-op
         await doLogin(false)
