@@ -38,7 +38,10 @@ def run(cases: List[Dict], top_k: int = 7, retrieved_by_qid: Dict = None) -> Dic
         chunks = (retrieved_by_qid or {}).get(c["qid"])
         if chunks is None:
             try:
-                chunks = retrieve_and_enrich(c["query"], top_k=top_k, user_dept=None)
+                # authenticate as the case's dept (like L1) — else dept_internal docs are
+                # ACL-filtered out at answer time and EVERY dept_internal case wrongly refuses
+                # (prod authenticates the DingTalk/API user's dept; the eval must mirror that).
+                chunks = retrieve_and_enrich(c["query"], top_k=top_k, user_dept=c.get("dept"))
             except Exception as e:
                 chunks = []
                 per_query.append({"qid": c["qid"], "error": f"retrieve:{e}"[:160]})

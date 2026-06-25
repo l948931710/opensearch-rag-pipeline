@@ -208,6 +208,33 @@ def assert_destructive_write_allowed(op: str, target: str, *, kind: str,
         f"确需操作（你清楚自己在做什么）：export RAG_DESTRUCTIVE_PROD_ACK={op}:{date.today().isoformat()}")
 
 
+def assert_metadata_write_allowed(op: str, target: str, *, kind: str = "rds") -> None:
+    """【轻量】元数据写守卫——用于 kb 自助上传的 register（写 document_meta/version 行）等
+    **可逆、非污染性**的写，与不可逆 HA3 删除级别的 assert_destructive_write_allowed【分级隔离】。
+
+    ⚠️ 故意使用【独立】的放行开关 RAG_METADATA_PROD_ACK（≠ RAG_DESTRUCTIVE_PROD_ACK）：
+    一个元数据写的临时放行，绝不能顺带授权一次 HA3 删除，反之亦然。
+
+    规则与 destructive 一致的两点：RAG_READONLY=true（PROD-RO）一律拒绝、无豁免；
+    生产/预发环境的正常写直接放行。差异：非生产环境写生产目标时，认 RAG_METADATA_PROD_ACK。
+    """
+    cfg = get_config()
+    if cfg.readonly:
+        raise DestructiveOpBlocked(
+            f"[ENV GUARD] RAG_READONLY=true（PROD-RO 会话）下拒绝写操作 {op} -> {target}。")
+    if cfg.environment in ("production", "staging"):
+        return
+    if not is_prod_target(kind, target):
+        return
+    ack = os.environ.get("RAG_METADATA_PROD_ACK", "")
+    if _ack_matches(ack, op) or _ack_today(ack):
+        print(f"    !! [ENV GUARD OVERRIDE] {op} -> {target} 已被 RAG_METADATA_PROD_ACK={ack} 放行")
+        return
+    raise DestructiveOpBlocked(
+        f"[ENV GUARD] 拒绝在 environment={cfg.environment} 下对生产目标 {target!r} 执行元数据写 {op}。"
+        f"确需操作：export RAG_METADATA_PROD_ACK={op}:{date.today().isoformat()}")
+
+
 class GuardedBucket:
     """OSS Bucket 写守卫代理：拦截 put_*/delete_*，读与签名透传。
 

@@ -112,3 +112,23 @@
   color: var(--text-3);
   line-height: 1.5;
 }
+
+/* ---------- 知识库管理入口 ---------- */
+.cell-right {
+  margin-left: auto;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+
+.cell-right .cell-chev {
+  margin-left: 8rpx;
+}
+
+.role-badge {
+  font-size: 22rpx;
+  color: #ffffff;
+  background: var(--brand);
+  border-radius: 16rpx;
+  padding: 4rpx 14rpx;
+}

@@ -479,3 +479,72 @@ def _resolve_user_identity(userid: str) -> Dict[str, Any]:
     except Exception:
         pass
     return {"dept": dept, "name": name}
+
+
+def resolve_kb_identity(staff_id: str):
+    """解析知识库【写授权】身份 → kb_authz.KbIdentity（role + managed_owner_depts）。
+
+    ⚠️ 这是写授权的【权威现查】入口：每个特权写接口在写库前调用本函数（而非信任令牌里的
+    role 提示），从 DB 现读 user_role.role + dept_admin_grant，从而撤销管理员/收回授权后即时生效。
+    - role：user_role.role（seeded 行优先，与 _resolve_user_dept 同源语义）；缺省 → employee。
+    - managed_owner_depts：dept_admin_grant 中该用户 is_active=1 的 owner_dept（kb_admin 不依赖此表，
+      kb_authz.managed_owner_depts 直接给全量）。
+    - acl_groups：复用读组解析，仅作审计/展示参考（kb_authz 不用它推导写权）。
+    失败/未注册 → employee 空授权（fail-closed：无入口、无写权）。simulate 下从 env 取，便于离线联调。
+    """
+    from opensearch_pipeline.kb_authz import KbIdentity, ROLE_EMPLOYEE
+
+    if not staff_id or staff_id.startswith("$:"):
+        return KbIdentity.build(user_id=staff_id or "", role=ROLE_EMPLOYEE)
+
+    # 模拟模式：从环境变量构造测试身份（RAG_SIM_USER_ROLE / RAG_SIM_MANAGED_OWNER_DEPTS）
+    try:
+        if get_config().simulate_api:
+            ident = _resolve_user_identity(staff_id)
+            return KbIdentity.build(
+                user_id=staff_id,
+                name=ident.get("name") or staff_id,
+                role=os.environ.get("RAG_SIM_USER_ROLE", ROLE_EMPLOYEE),
+                acl_groups=ident.get("dept") or [],
+                granted_owner_depts=os.environ.get("RAG_SIM_MANAGED_OWNER_DEPTS", ""),
+            )
+    except Exception:
+        pass
+
+    role = ROLE_EMPLOYEE
+    name = ""
+    managed: List[str] = []
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 角色（seeded 行优先，确定性排序）
+                cur.execute(
+                    "SELECT role, user_name FROM fuling_knowledge.user_role "
+                    "WHERE user_id=%s AND is_active=1 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    (staff_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    role = row[0] or ROLE_EMPLOYEE
+                    name = row[1] or ""
+                # 显式管理授权（dept_admin 用；kb_admin 不依赖此表）
+                cur.execute(
+                    "SELECT managed_owner_dept FROM fuling_knowledge.dept_admin_grant "
+                    "WHERE user_id=%s AND is_active=1",
+                    (staff_id,),
+                )
+                managed = [r[0] for r in cur.fetchall() if r and r[0]]
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("解析知识库授权身份失败 staff_id=%s: %s（fail-closed→employee）", staff_id, e)
+        return KbIdentity.build(user_id=staff_id, role=ROLE_EMPLOYEE)
+
+    acl_groups = _resolve_user_dept(staff_id)
+    return KbIdentity.build(
+        user_id=staff_id, name=name, role=role,
+        acl_groups=acl_groups, granted_owner_depts=managed,
+    )

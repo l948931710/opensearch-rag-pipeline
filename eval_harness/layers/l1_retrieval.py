@@ -39,7 +39,11 @@ def run(cases: List[Dict], top_k: int = 10, stitch_window: int = 1) -> Dict:
     for c in cases:
         t0 = time.time()
         try:
-            res = retrieve_and_enrich(c["query"], top_k=top_k, user_dept=None,
+            # authenticate as the case's dept (mirrors prod DingTalk/API). With the corpus now
+            # ~76% dept_internal, the old public path (user_dept=None) left every dept_internal
+            # positive unretrievable + excluded from recall. Public-leak safety is covered by
+            # the standalone ACL probe + L5, so recall here measures the AUTHORIZED path.
+            res = retrieve_and_enrich(c["query"], top_k=top_k, user_dept=c.get("dept"),
                                       stitch_window=stitch_window)
             err = None
         except Exception as e:
@@ -81,8 +85,10 @@ def run(cases: List[Dict], top_k: int = 10, stitch_window: int = 1) -> Dict:
     # Headline = single-target recall. multi_doc queries span several docs, so single-doc
     # rank is not the right metric for them (and some reuse120 multi_doc gold labels are
     # unreliable) -> report them separately, not in the headline.
-    pos_single = [q for q in pos_public if q.get("difficulty") != "multi_doc"]
-    pos_multi = [q for q in pos_public if q.get("difficulty") == "multi_doc"]
+    # Authenticated path: every scorable positive (public AND dept_internal) is retrieved on
+    # its authorized dept, so all count toward recall (pos_public/gated kept as telemetry).
+    pos_single = [q for q in pos if q.get("difficulty") != "multi_doc"]
+    pos_multi = [q for q in pos if q.get("difficulty") == "multi_doc"]
 
     summary = ranking_summary([q["gold_rank"] for q in pos_single], ks=(1, 3, 5, 10),
                               relevances_per_query=[q["relevances"] for q in pos_single],

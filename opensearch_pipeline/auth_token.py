@@ -100,12 +100,17 @@ def issue_session_token(
     user_id: str,
     dept: Union[str, List[str], None] = None,
     name: Optional[str] = None,
+    role: Optional[str] = None,
     ttl: int = _DEFAULT_TTL_SECONDS,
 ) -> str:
     """签发会话令牌。ACL 权限组由服务端解析后写入，客户端不可篡改。
 
     `dept` 入参接受单组字符串、CSV 或组列表（历史参数名，承载的是 ACL 组）。
     令牌同时写权威 `acl_groups`（数组）与旧 `dept`（CSV，向后兼容）。
+
+    `role`（知识库写授权角色，可选）：employee / dept_admin / kb_admin。仅作【入口可见性 UI 提示】，
+    **非授权边界**——每个特权写接口必须用 DB 现查的 role + dept_admin_grant 重新裁决，
+    以便撤销管理员后即时生效（不等令牌 8h 过期）。缺省/未知不写该键（消费端按 employee 兜底）。
     """
     groups = _coerce_acl_groups(dept)
     payload = {
@@ -115,6 +120,8 @@ def issue_session_token(
         "name": name or "",
         "exp": int(time.time()) + int(ttl),
     }
+    if role and isinstance(role, str) and role.strip():
+        payload["role"] = role.strip()
     payload_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     payload_b64 = _b64url_encode(payload_bytes)
     sig = hmac.new(_get_signing_key(), payload_b64.encode("ascii"), hashlib.sha256).digest()
@@ -141,6 +148,43 @@ def verify_session_token(token: str) -> Optional[dict]:
         return None
 
     if not isinstance(payload, dict) or not payload.get("uid"):
+        return None
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    return payload
+
+
+def sign_payload(payload: dict, ttl: int = _DEFAULT_TTL_SECONDS) -> str:
+    """通用签名载荷（HMAC-SHA256，复用会话密钥）：供 upload token 等短期带签名凭证使用。
+
+    自动写入 `exp`（现在 + ttl）。与 issue_session_token 同密钥、同紧凑格式，但不要求 uid，
+    校验走 verify_payload（只验签名 + exp，不强制 uid，区别于 verify_session_token）。
+    """
+    body = dict(payload or {})
+    body["exp"] = int(time.time()) + int(ttl)
+    payload_bytes = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    payload_b64 = _b64url_encode(payload_bytes)
+    sig = hmac.new(_get_signing_key(), payload_b64.encode("ascii"), hashlib.sha256).digest()
+    return f"{payload_b64}.{_b64url_encode(sig)}"
+
+
+def verify_payload(token: str) -> Optional[dict]:
+    """校验 sign_payload 颁发的载荷；有效返回 dict，否则 None（签名不符 / 格式错 / 过期）。"""
+    if not token or "." not in token:
+        return None
+    try:
+        payload_b64, sig_b64 = token.split(".", 1)
+        expected = hmac.new(_get_signing_key(), payload_b64.encode("ascii"), hashlib.sha256).digest()
+        actual = _b64url_decode(sig_b64)
+    except Exception:
+        return None
+    if not hmac.compare_digest(expected, actual):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
         return None
     if int(payload.get("exp", 0)) < int(time.time()):
         return None

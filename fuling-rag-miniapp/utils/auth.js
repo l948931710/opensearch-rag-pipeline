@@ -79,6 +79,9 @@ export function ensureLogin(opts) {
       app.globalData.userId = data.user_id || '';
       app.globalData.displayName = data.display_name || '';
       app.globalData.dept = data.dept || '';
+      // 知识库写授权角色（入口可见性用；后端每个写接口仍会现查 DB 鉴权）
+      app.globalData.role = data.role || 'employee';
+      app.globalData.canManageKb = !!data.can_manage_kb;
       loginPromise = null;
       return app.globalData;
     })

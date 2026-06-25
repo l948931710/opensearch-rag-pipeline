@@ -159,3 +159,55 @@ export function getHistory(offset) {
 export function getHotQuestions() {
   return request('/api/hot-questions', {});
 }
+
+// ── 知识库管理（部门管理员）──────────────────────────────────────
+// 全部强制鉴权；后端按 token + DB 现查角色裁决（前端入口只是便利）。
+
+/** 权限选择器数据：10 组 + 部门→组映射 + 本人可管理/可授权范围 + org 快照。 */
+export function getOrgTree() {
+  return request('/api/kb/org-tree', { auth: true });
+}
+
+/** 我（kb_admin 全量 / dept_admin 限 managed）可管理的文档列表；q=文档名搜索（可空）。 */
+export function getMyDocs(offset, q) {
+  let p = '/api/kb/my-docs?limit=20&offset=' + (offset || 0);
+  if (q) {
+    p += '&q=' + encodeURIComponent(q);
+  }
+  return request(p, { auth: true });
+}
+
+/** 某文档的版本历史（各版本管线状态）。 */
+export function getVersionHistory(docId) {
+  return request('/api/kb/version-history?doc_id=' + encodeURIComponent(docId), { auth: true });
+}
+
+/** 某文档某版本的详细管线状态 + chunk 计数（version 省略取当前版本）。 */
+export function getDocStatus(docId, version) {
+  let p = '/api/kb/doc-status?doc_id=' + encodeURIComponent(docId);
+  if (version) {
+    p += '&version=' + encodeURIComponent(version);
+  }
+  return request(p, { auth: true });
+}
+
+/**
+ * createUploadUrl(payload) -> Promise<{upload_token, put_url, raw_key, doc_id, expires_in, requires_kb_admin_approval}>
+ * payload: { action:'new'|'version', filename, owner_dept, permission_level, title?, category_l1?, category_l2?, doc_id?, share_owner_depts? }
+ */
+export function createUploadUrl(payload) {
+  return request('/api/kb/upload-url', { method: 'POST', auth: true, data: payload });
+}
+
+/** registerDoc(uploadToken) -> Promise<{doc_id, version_no, content_process_status, requires_kb_admin_approval, status_badge, idempotent}> */
+export function registerDoc(uploadToken) {
+  return request('/api/kb/register', { method: 'POST', auth: true, data: { upload_token: uploadToken } });
+}
+
+/** kb_admin 审批放行 / 驳回（payload: {doc_id, version_no?, reason?}）。 */
+export function approveDoc(payload) {
+  return request('/api/kb/approve', { method: 'POST', auth: true, data: payload });
+}
+export function rejectDoc(payload) {
+  return request('/api/kb/reject', { method: 'POST', auth: true, data: payload });
+}

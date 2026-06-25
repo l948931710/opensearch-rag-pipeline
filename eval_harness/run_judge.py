@@ -63,7 +63,22 @@ def run(bundle_path: str, out_path: str, panels: int = 3, rubric: str = "answer"
     for pi in range(panels):
         verdicts = []
         for i in range(0, len(bundle), batch):
-            verdicts.extend(_judge_batch(rub, bundle[i:i + batch], pi, id_key))
+            chunk = bundle[i:i + batch]
+            # Graceful degradation: a single stochastic claude batch returning malformed JSON
+            # (missing comma etc.) must NOT crash the whole panel/run. Retry once, then skip
+            # that batch's items in THIS panel (the other panels still cover them).
+            got = None
+            for attempt in range(2):
+                try:
+                    got = _judge_batch(rub, chunk, pi, id_key)
+                    break
+                except (ValueError, RuntimeError) as e:  # JSONDecodeError ⊂ ValueError
+                    print(f"[run_judge] panel {pi + 1} batch@{i} attempt {attempt + 1} "
+                          f"failed: {type(e).__name__}: {str(e)[:120]}")
+            if got is None:
+                print(f"[run_judge] panel {pi + 1} batch@{i}: SKIPPED {len(chunk)} items after retries")
+                continue
+            verdicts.extend(got)
         out_panels.append({"judge": f"claude-auto-{pi + 1}", "verdicts": verdicts})
         print(f"[run_judge] panel {pi + 1}/{panels}: {len(verdicts)} verdicts")
     with open(out_path, "w", encoding="utf-8") as f:

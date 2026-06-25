@@ -110,3 +110,14 @@ twin_content_coverage 系列），裂成三种情况：
    docx 有监装毛重±5% 责任条款，互不包含且均不在对方源文件中）。
    **唯一真正需要文控的：请文档责任人出合并完整版，入库后退役两旧身份。**
    在此之前双身份并行服务（serving 端有标题折叠，答案层无重复来源）。
+
+## §8 孪生退役补记（2026-06-24）
+- scan: active docs 1621，剩 4 活跃孪生组（58 组已往轮解决）。
+- 退役：FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管 **docx `DOC_PRODUCTION_20260513120638_3282C7`**（keep pdf `…326895`）。同部门 public 转换对，docx 仅多一张微信传输噪声图，pdf 覆盖全部实质图。RDS 14 停用 + HA3 14 删；双侧验证 RDS/HA3 残留=0、keep 在线。令牌 PROD-RW:2026-06-24。
+- **待办（跨部门 ACL 决策）**：杯盖黑/粗吸管/试饮杯 产品规格书（marketing↔production，dept_internal）。ACL 铁律 = **keep production**（marketing 能读 production，反之不能；keep marketing 会切断 production 访问）。脚本 chunk-count 自动选对杯盖黑/试饮杯选错（选了 marketing）。试饮杯两份文本差 390 字需先核漂移。journal: scratch/twin_retire_journal_twin_retire_manifest_20260624.json
+
+### §8 续：2026-06-24 本轮 4 组孪生全清（收官）
+- 共退役 4 份 / RDS 停用 70 chunk + HA3 删 70，全部双侧验证（退役侧 RDS active=0 ∧ HA3=0；keep 侧 active 在线 ∧ HA3 在线）。
+- 跨部门产品规格书（杯盖黑/粗吸管/试饮杯）：**一律 keep production**（ACL 铁律：marketing 经展开可读 production，反之不能；若 keep marketing 会切断 production 访问）。
+- ⚠️ 覆盖核查假象记录：杯盖黑 初判 production 仅覆盖 marketing 87%、13 句"独有"全是实质规格字段——**实为格式差异假象**（marketing 纯文本句 vs production 表格+图片描述）。字段级复核 production 含 10/10 关键字段 → 安全。教训：exact-substring + 剥 [图片描述] 会把"表格 vs 句子"误判为内容缺失，须字段级复核兜底。
+- 令牌 PROD-RW:2026-06-24；journal: scratch/twin_retire_journal_twin_retire_manifest_20260624.json

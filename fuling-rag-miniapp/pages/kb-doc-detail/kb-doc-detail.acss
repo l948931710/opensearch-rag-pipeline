@@ -1,0 +1,155 @@
+/* 文档详情 · 版本历史 — 复用 Aurora-Forest 令牌 */
+.dd-page {
+  min-height: 100vh;
+  padding: 24rpx 24rpx 48rpx;
+}
+
+/* ---------- 头部摘要 ---------- */
+.head-card {
+  background: var(--surface);
+  border-radius: 32rpx;
+  box-shadow: var(--sh-1);
+  padding: 32rpx;
+  margin-bottom: 24rpx;
+}
+
+.head-title {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: var(--text-1);
+  line-height: 1.35;
+  word-break: break-all;
+}
+
+.head-meta {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin-top: 16rpx;
+}
+
+.head-count {
+  font-size: 24rpx;
+  color: var(--text-3);
+  margin-left: 8rpx;
+}
+
+.head-chunk {
+  display: block;
+  margin-top: 14rpx;
+  font-size: 24rpx;
+  color: var(--text-3);
+}
+
+.btn-upver {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  margin-top: 24rpx;
+  background: var(--brand-grad);
+  color: #ffffff;
+  font-size: 26rpx;
+  border-radius: 999rpx;
+  padding: 14rpx 32rpx;
+  box-shadow: 0 4px 12px rgba(21, 96, 74, 0.22);
+}
+
+.btn-upver-ico {
+  margin-right: 8rpx;
+  font-size: 26rpx;
+}
+
+.btn-upver:active {
+  opacity: 0.88;
+}
+
+/* ---------- 版本卡 ---------- */
+.ver-card {
+  background: var(--surface);
+  border-radius: 28rpx;
+  box-shadow: var(--sh-1);
+  padding: 26rpx 28rpx;
+  margin-bottom: 18rpx;
+}
+
+.ver-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin-bottom: 14rpx;
+}
+
+.ver-no {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-1);
+  margin-right: 14rpx;
+}
+
+.ver-date {
+  margin-left: auto;
+  font-size: 22rpx;
+  color: var(--text-3);
+}
+
+.ver-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin-top: 6rpx;
+}
+
+.ver-k {
+  font-size: 25rpx;
+  color: var(--text-3);
+  width: 96rpx;
+}
+
+.ver-v {
+  font-size: 25rpx;
+  color: var(--text-1);
+}
+
+.ver-err {
+  margin-top: 12rpx;
+  font-size: 23rpx;
+  color: #dc2626;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 12rpx;
+  padding: 10rpx 16rpx;
+  word-break: break-all;
+}
+
+.doc-tag {
+  font-size: 22rpx;
+  color: var(--text-3);
+  background: var(--surface-2);
+  border-radius: 12rpx;
+  padding: 2rpx 12rpx;
+}
+
+/* ---------- 徽章 ---------- */
+.badge {
+  font-size: 22rpx;
+  border-radius: 14rpx;
+  padding: 4rpx 14rpx;
+}
+.badge-ok { color: #15604a; background: rgba(52, 214, 163, 0.18); }
+.badge-busy { color: #2563eb; background: rgba(59, 130, 246, 0.14); }
+.badge-queue { color: var(--text-3); background: var(--surface-2); }
+.badge-warn { color: #b45309; background: rgba(245, 158, 11, 0.16); }
+.badge-fail { color: #dc2626; background: rgba(239, 68, 68, 0.14); }
+.badge-muted { color: var(--text-3); background: var(--surface-2); }
+
+/* ---------- 状态/骨架 ---------- */
+.state-wrap { padding: 24rpx 8rpx; }
+.state-center { display: flex; flex-direction: column; align-items: center; padding-top: 120rpx; }
+.state-ico { font-size: 64rpx; color: var(--text-3); margin-bottom: 20rpx; }
+.state-title { font-size: 30rpx; color: var(--text-1); font-weight: 600; }
+.state-desc { font-size: 25rpx; color: var(--text-3); margin-top: 12rpx; }
+.skel-card { background: var(--surface); border-radius: 28rpx; box-shadow: var(--sh-1); padding: 28rpx; margin-bottom: 18rpx; }
+.skel-ln { height: 26rpx; border-radius: 8rpx; background: var(--surface-2); margin-bottom: 16rpx; }
+.skel-ln.w70 { width: 70%; }
+.skel-ln.w40 { width: 40%; margin-bottom: 0; }
+.btn-retry { display: flex; flex-direction: row; align-items: center; margin-top: 28rpx; background: var(--surface); box-shadow: var(--sh-1); border-radius: 999rpx; padding: 14rpx 36rpx; font-size: 26rpx; color: var(--text-1); }
+.retry-ico { margin-right: 10rpx; font-size: 26rpx; color: var(--brand); }

@@ -3,14 +3,14 @@
     <view class="avatar"><text class="avatar-text">{{avatarChar}}</text></view>
     <view class="profile-meta">
       <text class="profile-name">{{displayName || '未登录'}}</text>
-      <text class="profile-dept">{{dept || '部门未知'}}</text>
+      <text class="profile-dept">{{deptLabel || '部门未知'}}</text>
     </view>
   </view>
 
   <view class="section card">
     <view class="cell">
       <text class="cell-label">部门</text>
-      <text class="cell-value">{{dept || '—'}}</text>
+      <text class="cell-value">{{deptLabel || '—'}}</text>
     </view>
     <view class="cell">
       <text class="cell-label">用户 ID</text>
@@ -20,6 +20,20 @@
       <text class="cell-label">会话 ID</text>
       <text class="cell-value">{{sessionId || '—'}}</text>
     </view>
+  </view>
+
+  <!-- 知识库管理入口：仅管理员可见（后端每个接口仍会再校验角色） -->
+  <view a:if="{{canManageKb}}" class="section">
+    <view class="card">
+      <view class="cell cell-last cell-tap" onTap="onOpenKbConsole">
+        <text class="cell-label">知识库管理</text>
+        <view class="cell-right">
+          <text a:if="{{roleLabel}}" class="role-badge">{{roleLabel}}</text>
+          <text class="ico ico-chev-r cell-chev"></text>
+        </view>
+      </view>
+    </view>
+    <text class="section-tip">上传 / 升版 / 管理本部门文档。</text>
   </view>
 
   <view class="section">

@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>富岭知识库管理</title>
+  <!-- 钉钉 jsapi（HTTPS 脚本，HTTP 页面可加载）。用于 PC/移动端免登 requestAuthCode。 -->
+  <script src="https://g.alicdn.com/dingding/dingtalk-jsapi/3.0.25/dingtalk.open.js"></script>
+  <!-- Vue 3.5（最新稳定）global build，CDN，零构建。 -->
+  <script src="https://g.alicdn.com/code/lib/vue/3.5.13/vue.global.prod.min.js"></script>
+  <style>
+    :root { --brand:#15604a; --surface:#ffffff; --page:#fbf8f1; --line:#ece6da; --text1:#2b2b27; --text3:#8a8273; }
+    [v-cloak] { display:none; }
+    * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+    body { margin:0; background:var(--page); color:var(--text1); font:15px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+    .wrap { max-width:1040px; margin:0 auto; padding:24px 20px 64px; }
+    h1 { font-size:20px; margin:8px 0 4px; color:var(--brand); }
+    .sub { color:var(--text3); font-size:13px; margin-bottom:16px; }
+    .card { background:var(--surface); border-radius:14px; box-shadow:0 1px 6px rgba(21,96,74,.06); padding:18px 18px; margin-bottom:16px; }
+    .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .badge { font-size:12px; color:#fff; background:var(--brand); border-radius:10px; padding:2px 10px; }
+    label { display:block; font-size:13px; color:var(--text3); margin:12px 0 4px; }
+    input[type=text], select { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:10px; font-size:15px; background:#fff; }
+    input[type=file] { width:100%; font-size:14px; margin-top:4px; }
+    button { background:var(--brand); color:#fff; border:0; border-radius:10px; padding:11px 18px; font-size:15px; cursor:pointer; }
+    button[disabled] { opacity:.5; cursor:not-allowed; }
+    .muted { color:var(--text3); font-size:13px; }
+    .err { color:#b3261e; font-size:13px; white-space:pre-wrap; word-break:break-all; }
+    .ok { color:var(--brand); }
+    .pill { font-size:11px; border-radius:9px; padding:1px 8px; white-space:nowrap; }
+    .pill.ok{background:#e6f4ee;color:#15604a;} .pill.busy{background:#fff3da;color:#9a6b00;}
+    .pill.queue{background:#eef0f2;color:#5a6470;} .pill.warn{background:#fde9d9;color:#a8520f;}
+    .pill.fail{background:#fde8e6;color:#b3261e;} .pill.muted{background:#eef0f2;color:#8a8273;}
+    #diag { font-size:12px; color:var(--text3); background:#f4f1ea; border-radius:10px; padding:10px 12px; margin-top:14px; }
+    #diag div { padding:1px 0; }
+    .linklike { color:var(--brand); font-size:13px; cursor:pointer; text-decoration:underline; }
+    .verbtn { display:inline-block; background:#fff; color:var(--brand); border:1px solid var(--brand); border-radius:8px; padding:5px 14px; font-size:13px; cursor:pointer; }
+    #verModeInfo { background:#f4f1ea; border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; line-height:1.6; color:var(--text1); }
+    #docSearch, input[type=text]#docSearch { margin:10px 0 4px; }
+    .tablewrap { overflow-x:auto; }
+    .doctable { width:100%; border-collapse:collapse; font-size:14px; }
+    .doctable th, .doctable td { text-align:left; padding:11px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+    .doctable th { color:var(--text3); font-weight:600; font-size:13px; white-space:nowrap; cursor:pointer; user-select:none; }
+    .doctable th:hover { color:var(--brand); }
+    .doctable tbody tr:last-child td { border-bottom:0; }
+    .doctable tbody tr:hover { background:#faf8f2; }
+    .dt-name { font-weight:600; color:var(--text1); word-break:break-all; }
+    .doctable .verbtn { padding:5px 14px; }
+    .chips { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0 4px; }
+    .chip { font-size:13px; color:var(--text3); background:#f4f1ea; border:1px solid var(--line); border-radius:999px; padding:4px 14px; cursor:pointer; }
+    .chip.on { color:#fff; background:var(--brand); border-color:var(--brand); }
+    .appr-item { border-top:1px solid var(--line); padding:12px 0; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+    .appr-item:first-child { border-top:0; }
+    .appr-main { flex:1; min-width:200px; }
+    .appr-title { font-weight:600; }
+    .appr-meta { color:var(--text3); font-size:12px; margin-top:3px; }
+    .btn-ghost { background:#fff; border:1px solid var(--line); color:var(--text1); border-radius:8px; padding:6px 14px; font-size:13px; cursor:pointer; }
+    .btn-ghost.danger { color:#b3261e; border-color:#f3cfca; }
+    #dupWarn { background:#fff3da; border:1px solid #f0d9a8; border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; line-height:1.6; }
+    #dupWarn .linklike { color:#9a6b00; }
+    @media (min-width:760px) { .upform input[type=text], .upform select { max-width:560px; } }
+    @media (max-width:640px) {
+      .doctable, .doctable thead, .doctable tbody, .doctable tr, .doctable th, .doctable td { display:block; }
+      .doctable thead { display:none; }
+      .doctable tbody tr { border:1px solid var(--line); border-radius:10px; margin-bottom:10px; padding:8px 12px; }
+      .doctable td { border:0; padding:5px 0; display:flex; justify-content:space-between; gap:14px; }
+      .doctable td::before { content:attr(data-label); color:var(--text3); font-size:12px; flex:0 0 auto; }
+      .doctable .dt-name { text-align:right; }
+    }
+  </style>
+</head>
+<body>
+<div id="app" class="wrap" v-cloak>
+  <h1>富岭知识库管理</h1>
+  <div class="sub">部门管理员文档上传 / 版本 / 状态（电脑端）</div>
+
+  <div class="card" v-if="!ready">
+    <div class="muted">{{ loginMsg }}</div>
+    <div class="err">{{ loginErr }}</div>
+  </div>
+
+  <template v-if="ready">
+    <div class="card">
+      <div class="row"><strong>{{ identName }}</strong><span class="badge">{{ identRole }}</span></div>
+      <div class="muted" style="margin-top:6px">{{ identScope }}</div>
+    </div>
+
+    <div class="card" v-if="role==='kb_admin' && approvals.length">
+      <div class="row" style="justify-content:space-between">
+        <strong>待审批 <span class="pill warn">{{ approvals.length }}</span></strong>
+        <span class="muted">公开 / 跨组上传，需知识库管理员放行</span>
+      </div>
+      <div class="appr-item" v-for="d in approvals" :key="d.doc_id + '/' + d.version_no">
+        <div class="appr-main">
+          <div class="appr-title">{{ d.title || d.original_filename || d.doc_id }}</div>
+          <div class="appr-meta">{{ deptLabel(d.owner_dept) }} · {{ permLabel(d.permission_level) }} · v{{ d.version_no }} · {{ d.owner_name }} · {{ (d.created_at || '').slice(0,16) }}</div>
+        </div>
+        <button class="btn-ghost" :disabled="approvalBusy" @click="apprAct('approve', d)">通过</button>
+        <button class="btn-ghost danger" :disabled="approvalBusy" @click="apprAct('reject', d)">驳回</button>
+      </div>
+    </div>
+
+    <div class="card" ref="uploadCard" v-if="canManage">
+      <div class="row" style="justify-content:space-between">
+        <strong>{{ verCtx ? '上传新版本' : '上传新文档' }}</strong>
+        <span class="linklike" v-if="verCtx" @click="exitVersionMode">← 改为新建文档</span>
+      </div>
+      <label>选择文件（.pdf .docx .xlsx .pptx .jpg .png）</label>
+      <input type="file" ref="file" accept=".pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png" @change="onFile" />
+      <div id="dupWarn" v-if="dupWarn && !verCtx">
+        ⚠️ 已有相似文档 <strong>{{ dupWarn.title }}</strong>（v{{ dupWarn.ver }} · {{ dupWarn.badge }}）{{ dupWarn.more }}。是否应升版而非新建？
+        <span class="linklike" @click="enterVersionMode(dupWarn.top)">改为升版该文档</span>
+      </div>
+      <div id="verModeInfo" v-if="verCtx">
+        升版：<strong>{{ verCtx.title || verCtx.original_filename || verCtx.doc_id }}</strong><br>
+        归属 {{ deptLabel(verCtx.owner_dept) }} · 可见范围 {{ verCtx.permission_level ? permLabel(verCtx.permission_level) : '继承原文档' }}<span v-if="verCtx.current_version_no"> · 当前 v{{ verCtx.current_version_no }}</span><br>
+        <span class="muted">继承原文档归属与可见范围，仅替换文件（提交后版本号 +1）</span>
+      </div>
+      <div class="upform" v-else>
+        <label>标题（可空，默认用文件名）</label>
+        <input type="text" v-model="newTitle" placeholder="文档标题" />
+        <label>归属部门（owner_dept）</label>
+        <select v-model="newOwner"><option v-for="o in ownerDepts" :key="o" :value="o">{{ deptLabel(o) }}</option></select>
+        <label>可见范围</label>
+        <select v-model="newPerm">
+          <option value="dept_internal">仅本部门可见</option>
+          <option value="public">全公司可见（可能需审批）</option>
+          <option value="restricted">受限（不进检索，仅归档）</option>
+        </select>
+      </div>
+      <div style="margin-top:16px" class="row">
+        <button :disabled="uploadBusy" @click="doUpload">{{ verCtx ? '上传新版本' : '上传' }}</button>
+        <span class="muted" :class="{ ok: uploadOk }">{{ uploadMsg }}</span>
+      </div>
+      <div class="err">{{ uploadErr }}</div>
+    </div>
+
+    <div class="card" v-if="canManage">
+      <div class="row" style="justify-content:space-between">
+        <strong>我的文档</strong>
+        <span class="muted">{{ filtered.length === docs.length ? docs.length : (filtered.length + ' / ' + docs.length) }} 篇</span>
+      </div>
+      <input id="docSearch" type="text" v-model="q" maxlength="80" placeholder="搜索文档名（查是否已有现存版本）…" />
+      <div class="chips">
+        <span class="chip" v-for="f in filters" :key="f.v" :class="{ on: filter === f.v }" @click="filter = f.v">{{ f.label }} {{ countOf(f.v) }}</span>
+      </div>
+      <div class="tablewrap" v-if="filtered.length">
+        <table class="doctable">
+          <thead><tr>
+            <th v-for="c in cols" :key="c.key" @click="sortBy(c.key)">{{ c.label }} <span v-if="sortKey === c.key">{{ sortDir > 0 ? '↑' : '↓' }}</span></th>
+            <th>操作</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="d in filtered" :key="d.doc_id">
+              <td data-label="文档名"><span class="dt-name">{{ d.title || d.original_filename || d.doc_id }}</span></td>
+              <td data-label="归属">{{ deptLabel(d.owner_dept) }}</td>
+              <td data-label="版本">v{{ d.current_version_no || 1 }}</td>
+              <td data-label="状态"><span class="pill" :class="badgeClass(d.status_badge)">{{ d.status_badge }}</span></td>
+              <td data-label="更新">{{ (d.updated_at || '').slice(0,16) }}</td>
+              <td data-label="操作"><button class="verbtn" @click="enterVersionMode(d)">升版</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="muted" v-else style="padding:12px 0">{{ filter ? ('没有「' + filter + '」状态的文档') : (q ? '没有匹配的文档' : '暂无文档') }}</div>
+    </div>
+  </template>
+
+  <div id="diag" v-if="debug"><div><strong>诊断（免登/HTTP 调试用）</strong></div><div v-for="(m,i) in diagLines" :key="i">• {{ m }}</div></div>
+</div>
+
+<script>
+/* 零构建 Vue 3 控制台。JSDoc 类型（VS Code 直接给提示/报错，不引构建链）。
+ * 真 .ts/.vue 单文件组件 = 需上 Vite 构建管线，是另一步（见迁移说明）。
+ * @typedef {Object} Doc
+ * @property {string} doc_id @property {string} title @property {string} [original_filename]
+ * @property {string} owner_dept @property {string} permission_level @property {number} current_version_no
+ * @property {string} status_badge @property {string} updated_at
+ *
+ * @typedef {Object} Pending
+ * @property {string} doc_id @property {number} version_no @property {string} title
+ * @property {string} [original_filename] @property {string} owner_dept @property {string} permission_level
+ * @property {string} owner_name @property {string} created_at
+ */
+(function () {
+  var BASE = location.origin;   // 同源：H5 与 API 同一主机
+  var GROUP_LABEL = { finance:'财务', it:'信息技术', marketing:'营销', production:'生产', pmc:'计划PMC', admin:'行政', hr:'人力资源', rd:'研发', quality:'品质技术', supply:'资材供应' };
+  var PERM_LABEL = { dept_internal:'仅本部门', public:'全公司', restricted:'受限' };
+  var BADGE_CLASS = { '已上线':'ok', '处理中':'busy', '排队中':'queue', '待审核':'warn', '已隔离':'fail', '处理失败':'fail', '已退役':'muted', '内容未变':'muted' };
+
+  function qs(name){ var m = new RegExp('[?&]' + name + '=([^&]+)').exec(location.search); return m ? decodeURIComponent(m[1]) : ''; }
+
+  Vue.createApp({
+    data() {
+      return {
+        ready: false, debug: !!qs('debug'),
+        token: '', role: '', canManage: false,
+        loginMsg: '正在登录…', loginErr: '',
+        identName: '', identScope: '',
+        diagLines: [],
+        ownerDepts: [], newTitle: '', newOwner: '', newPerm: 'dept_internal',
+        /** @type {Doc|null} */ verCtx: null,
+        /** @type {?{title:string,ver:number,badge:string,more:string,top:Doc}} */ dupWarn: null,
+        uploadMsg: '', uploadErr: '', uploadOk: false, uploadBusy: false,
+        /** @type {Doc[]} */ docs: [], q: '', filter: '', sortKey: '', sortDir: 1,
+        _docsSeq: 0, pendingVer: '', _searchTimer: null,
+        /** @type {Pending[]} */ approvals: [], approvalBusy: false,
+        filters: [ {v:'',label:'全部'}, {v:'已上线',label:'已上线'}, {v:'处理中',label:'处理中'}, {v:'待审核',label:'待审核'}, {v:'已隔离',label:'已隔离'}, {v:'已退役',label:'已退役'} ],
+        cols: [ {key:'title',label:'文档名'}, {key:'owner_dept',label:'归属'}, {key:'current_version_no',label:'版本'}, {key:'status_badge',label:'状态'}, {key:'updated_at',label:'更新'} ],
+      };
+    },
+    computed: {
+      identRole() { return this.role === 'kb_admin' ? '知识库管理员' : (this.role === 'dept_admin' ? '部门管理员' : '员工'); },
+      /** @returns {Doc[]} 客户端状态筛选 + 列排序（q 已由服务端过滤） */
+      filtered() {
+        var f = this.filter, k = this.sortKey, dir = this.sortDir;
+        var r = this.docs.filter(function(d){ return !f || d.status_badge === f; });
+        if (k) {
+          r = r.slice().sort(function(a, b){
+            var x = a[k], y = b[k];
+            if (k === 'current_version_no') { x = +x || 0; y = +y || 0; } else { x = String(x == null ? '' : x); y = String(y == null ? '' : y); }
+            return (x < y ? -1 : (x > y ? 1 : 0)) * dir;
+          });
+        }
+        return r;
+      },
+    },
+    watch: {
+      // 文档名搜索走服务端（可命中未加载的 >50 文档）；防抖 300ms。
+      q() { clearTimeout(this._searchTimer); this._searchTimer = setTimeout(this.loadDocs, 300); },
+    },
+    mounted() { this.login(); },
+    methods: {
+      diag(msg) { if (this.debug) this.diagLines.push(msg); },
+      deptLabel(o) { return GROUP_LABEL[o] || o || ''; },
+      permLabel(p) { return PERM_LABEL[p] || p || ''; },
+      badgeClass(b) { return BADGE_CLASS[b] || 'muted'; },
+      countOf(f) { return f ? this.docs.filter(function(d){ return d.status_badge === f; }).length : this.docs.length; },
+      sortBy(k) { this.sortDir = this.sortKey === k ? -this.sortDir : 1; this.sortKey = k; },
+
+      api(path, opts) {
+        opts = opts || {};
+        var h = { 'Content-Type': 'application/json' };
+        if (opts.auth && this.token) h['Authorization'] = 'Bearer ' + this.token;
+        return fetch(BASE + path, { method: opts.method || 'GET', headers: h, body: opts.body ? JSON.stringify(opts.body) : undefined })
+          .then(function(r){ return r.json().then(function(j){ if (!r.ok) { var e = new Error((j && j.detail) || ('HTTP ' + r.status)); e.status = r.status; throw e; } return j; }); });
+      },
+
+      // ── 身份：web-view 传入 token（优先）/ 独立 PC 访问地址走 requestAuthCode ──
+      login() {
+        var self = this;
+        this.diag('query=' + (location.search || '(无)'));
+        var passedToken = qs('token');
+        if (passedToken) {
+          this.token = passedToken;
+          this.diag('web-view 模式：用小程序传入的 token');
+          this.api('/api/kb/whoami', { auth: true })
+            .then(function(w){ self.role = w.role || 'employee'; self.canManage = !!w.can_manage_kb; self.afterAuth(qs('name') || w.display_name || w.user_id); })
+            .catch(function(e){ self.loginMsg = ''; self.loginErr = '身份校验失败：' + e.message; self.diag('whoami FAIL: ' + e.message); });
+          return;
+        }
+        // corpId：URL 优先（大小写都认），兜底本企业常量（非密钥）。
+        var corpId = qs('corpId') || qs('corpid') || qs('corpID') || 'dingcafb3fdca0e8380a';
+        this.diag('corpId=' + (corpId || '(空)'));
+        if (typeof dd === 'undefined') { this.loginMsg = ''; this.loginErr = '未检测到钉钉环境（dd 未定义）。请在钉钉客户端中打开本页面。'; this.diag('dd undefined → 非钉钉环境'); return; }
+        dd.ready(function(){
+          self.diag('dd.ready 触发');
+          dd.runtime.permission.requestAuthCode({
+            corpId: corpId,
+            onSuccess: function(res){ self.diag('requestAuthCode OK, code=' + (res && res.code ? res.code.slice(0,8) + '…' : '?')); self.exchange(res.code); },
+            onFail: function(err){ self.loginMsg = ''; self.loginErr = '免登失败（requestAuthCode）：' + JSON.stringify(err); self.diag('requestAuthCode FAIL'); },
+          });
+        });
+        dd.error(function(err){ self.diag('dd.error: ' + JSON.stringify(err)); });
+      },
+      exchange(code) {
+        var self = this;
+        this.api('/api/auth/dingtalk', { method: 'POST', body: { auth_code: code } })
+          .then(function(data){ self.token = data.token || ''; self.role = data.role || 'employee'; self.canManage = !!data.can_manage_kb; self.diag('换令牌 OK，role=' + self.role + ' can_manage_kb=' + self.canManage); self.afterAuth(data.display_name || data.user_id); })
+          .catch(function(e){ self.loginMsg = ''; self.loginErr = '换取令牌失败：' + e.message; self.diag('exchange FAIL: ' + e.message); });
+      },
+      afterAuth(displayName) {
+        this.diag('身份就绪，role=' + this.role + ' can_manage_kb=' + this.canManage);
+        this.identName = displayName || '';
+        this.ready = true;
+        if (!this.canManage) { this.identScope = '你不是知识库管理员，无上传权限。'; return; }
+        this.pendingVer = qs('doc_id');   // 手机端 web-view 升版：列表加载后自动进升版态
+        this.loadOrgTree(); this.loadDocs(); this.loadApprovals();
+      },
+
+      loadOrgTree() {
+        var self = this;
+        this.api('/api/kb/org-tree', { auth: true }).then(function(t){
+          self.ownerDepts = t.my_managed_owner_depts || [];
+          if (self.ownerDepts.length && !self.newOwner) self.newOwner = self.ownerDepts[0];
+          self.identScope = '可管理部门：' + self.ownerDepts.map(function(o){ return GROUP_LABEL[o] || o; }).join('、');
+        }).catch(function(e){ self.diag('org-tree FAIL: ' + e.message); });
+      },
+
+      loadDocs() {
+        var self = this;
+        var q = (this.q || '').trim();
+        var url = '/api/kb/my-docs?limit=50' + (q ? '&q=' + encodeURIComponent(q) : '');
+        var seq = (this._docsSeq = this._docsSeq + 1);   // 竞态守卫：仅最新一次搜索的结果落地
+        this.api(url, { auth: true }).then(function(r){
+          if (seq !== self._docsSeq) return;             // 已有更新搜索 → 丢弃过期结果
+          self.docs = r.items || [];
+          self.handlePendingVer();
+        }).catch(function(e){ self.diag('my-docs FAIL: ' + e.message); });
+      },
+      handlePendingVer() {
+        if (!this.pendingVer) return;
+        var pv = this.pendingVer; this.pendingVer = '';
+        var pd = this.docs.filter(function(d){ return d.doc_id === pv; })[0];
+        if (pd) { this.enterVersionMode(pd); return; }
+        var ow = qs('owner');   // 不在首屏（>50/旧文档）：据 URL doc_id+owner 进升版态（perm 后端强制继承）
+        if (ow) { this.enterVersionMode({ doc_id: pv, owner_dept: ow, title: qs('title'), permission_level: '', current_version_no: 0 }); }
+        else { this.uploadMsg = '未在你的文档列表中找到该文档，请在下方列表点「升版」'; }
+      },
+
+      loadApprovals() {
+        var self = this;
+        if (this.role !== 'kb_admin') return;
+        this.api('/api/kb/pending-approvals', { auth: true })
+          .then(function(r){ self.approvals = r.items || []; })
+          .catch(function(e){ self.diag('pending-approvals FAIL: ' + e.message); });
+      },
+      apprAct(kind, d) {
+        var self = this, reason = '';
+        if (kind === 'reject') { reason = prompt('驳回理由（可空）：'); if (reason === null) return; }   // 取消 → null，先判空
+        if (this.approvalBusy) return;
+        this.approvalBusy = true;   // 防连点重复提交（对齐 vanilla 的 btn.disabled）
+        this.api('/api/kb/' + kind, { method: 'POST', auth: true, body: { doc_id: d.doc_id, version_no: d.version_no, reason: reason } })
+          .then(function(){ self.approvalBusy = false; self.loadApprovals(); self.loadDocs(); })
+          .catch(function(e){ self.approvalBusy = false; self.diag(kind + ' FAIL: ' + e.message); alert('操作失败：' + e.message); });
+      },
+
+      // ── 升版态：归属/可见范围继承原文档（不可改），仅替换文件 → 版本号 +1 ──
+      enterVersionMode(d) {
+        this.verCtx = d; this.dupWarn = null;
+        this.uploadMsg = ''; this.uploadErr = ''; this.uploadOk = false;
+        if (this.$refs.file) this.$refs.file.value = '';
+        var self = this; this.$nextTick(function(){ if (self.$refs.uploadCard) self.$refs.uploadCard.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+      },
+      exitVersionMode() {
+        this.verCtx = null; this.dupWarn = null;
+        this.uploadMsg = ''; this.uploadErr = ''; this.uploadOk = false;
+        if (this.$refs.file) this.$refs.file.value = '';
+      },
+
+      // 上传查重：新建模式下选文件后按文件名查现存文档，命中（非已退役）则提示"应升版而非新建"。
+      onFile() {
+        var self = this; this.dupWarn = null;
+        if (this.verCtx) return;
+        var f = this.$refs.file && this.$refs.file.files[0]; if (!f) return;
+        var core = f.name.replace(/\.[^.]+$/, '').trim();
+        if (core.length < 2) return;
+        this.api('/api/kb/my-docs?limit=10&q=' + encodeURIComponent(core), { auth: true }).then(function(r){
+          var hits = (r.items || []).filter(function(d){ return d.status_badge !== '已退役'; });
+          if (!hits.length) return;
+          var top = hits[0];
+          self.dupWarn = { title: top.title || top.original_filename || top.doc_id, ver: top.current_version_no || 1, badge: top.status_badge || '', more: hits.length > 1 ? ('等 ' + hits.length + ' 篇') : '', top: top };
+        }).catch(function(){});
+      },
+
+      // ── 上传：upload-url → PUT OSS → register ──
+      doUpload() {
+        var self = this;
+        var f = this.$refs.file && this.$refs.file.files[0];
+        if (!f) { this.uploadErr = '请先选择文件'; return; }
+        this.uploadErr = ''; this.uploadBusy = true; this.uploadOk = false; this.uploadMsg = '申请上传地址…';
+        // 升版态：action=version + 继承原文档 owner/perm（后端再校验 doc 存在 + owner 在管理范围 + 强制继承 perm）。
+        var payload = this.verCtx
+          ? { action: 'version', doc_id: this.verCtx.doc_id, owner_dept: this.verCtx.owner_dept, permission_level: (this.verCtx.permission_level || 'dept_internal'), filename: f.name, title: (this.verCtx.title || undefined) }
+          : { action: 'new', filename: f.name, owner_dept: this.newOwner, permission_level: this.newPerm, title: this.newTitle || undefined };
+        this.api('/api/kb/upload-url', { method: 'POST', auth: true, body: payload })
+          .then(function(u){
+            self.uploadMsg = '上传文件到 OSS…';
+            return fetch(u.put_url, { method: 'PUT', body: f }).then(function(r){ if (!r.ok) throw new Error('OSS PUT 失败 HTTP ' + r.status + '（可能需在 OSS 桶配置 CORS 允许本页来源 PUT）'); return u.upload_token; });
+          })
+          .then(function(uploadToken){ self.uploadMsg = '登记…'; return self.api('/api/kb/register', { method: 'POST', auth: true, body: { upload_token: uploadToken } }); })
+          .then(function(reg){
+            self.uploadBusy = false; self.uploadOk = true;
+            self.uploadMsg = '已提交：' + reg.doc_id + ' v' + reg.version_no + '（' + (reg.status_badge || '') + (reg.requires_kb_admin_approval ? '，待审批' : '') + '）';
+            if (self.$refs.file) self.$refs.file.value = ''; self.newTitle = ''; self.dupWarn = null;
+            if (self.verCtx) self.exitVersionMode();
+            self.loadDocs(); self.loadApprovals();
+          })
+          .catch(function(e){ self.uploadBusy = false; self.uploadOk = false; self.uploadMsg = ''; self.uploadErr = '上传失败：' + e.message; self.diag('upload FAIL: ' + e.message); });
+      },
+    },
+  }).mount('#app');
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,2917 @@
+[
+  {
+    "qid": "S6-dept_internal-0-dotp-pvc-sml",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "GB 9685-2016标准里，添加剂DOTP（FCA0073）用在PVC材料上时，特定迁移量SML限值是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "GB 9685-2016 食品安全国家标准  食品接触材料及制品用添加剂使用标准.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622202139_6EDAB1"
+    ],
+    "resolution": [
+      {
+        "expected": "GB 9685-2016 食品安全国家标准  食品接触材料及制品用添加剂使用标准.pdf",
+        "title": "GB 9685-2016 食品安全国家标准  食品接触材料及制品用添加剂使用标准.pdf",
+        "doc_id": "DOC_PRODUCTION_20260622202139_6EDAB1",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "该文档为食品安全国家标准 GB 9685-2016《食品接触材料及制品用添加剂使用标准》",
+      "添加剂 FCA0073（即 DOTP，对苯二甲酸二（2-乙基己基）酯）用于 PVC 时的特定迁移量限值为 ＰＶＣ：７５（即 75 mg/kg）"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "（ＤＯＴＰ）",
+      "ＰＶＣ：７５",
+      "ＦＣＡ００７３"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622202139_6EDAB1_v1_c0005_F36896A3"
+  },
+  {
+    "qid": "S6-dept_internal-1-mosha-zhusu-bei-shengchan-xukezheng",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "茶百道磨砂注塑杯（中杯）产品规格书里的生产许可证编号是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "磨砂注塑杯（中杯、大杯、超大杯）、超大杯盖、500黑色杯盖产品规格书-富岭20250113_1738900812858.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622085831_899899"
+    ],
+    "resolution": [
+      {
+        "expected": "磨砂注塑杯（中杯、大杯、超大杯）、超大杯盖、500黑色杯盖产品规格书-富岭20250113_1738900812858.pdf",
+        "title": "磨砂注塑杯（中杯、大杯、超大杯）、超大杯盖、500黑色杯盖产品规格书-富岭20250113_1738900812858.pdf",
+        "doc_id": "DOC_PRODUCTION_20260622085831_899899",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "该产品的生产许可证编号为 浙XK16-204-03181",
+      "产品执行标准为 GB/T 18006.1",
+      "生产商为富岭科技股份有限公司，贮存期24个月"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "生产许可证编号：浙XK16-204-03181"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622085831_899899_v1_c0008_FC3BCEC4"
+  },
+  {
+    "qid": "S6-dept_internal-2-zhijinzhi-zhongjinshu-xiangong",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "纸巾纸国标里重金属含量的限值是多少？铅、砷、镉、汞各自的上限是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "GBT 20808-2022 纸巾纸.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622085821_96414A"
+    ],
+    "resolution": [
+      {
+        "expected": "GBT 20808-2022 纸巾纸.pdf",
+        "title": "GBT 20808-2022 纸巾纸.pdf",
+        "doc_id": "DOC_PRODUCTION_20260622085821_96414A",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "重金属含量指标(单位 mg/kg)：铅(Pb) ≤10",
+      "砷(As) ≤2.0",
+      "镉(Cd) ≤5.0",
+      "汞(Hg) ≤1.0"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "铅(Pb)\n砷(As)\n镉(Cd)\n汞(Hg)\n≤10\n≤2.0\n≤5.0\n≤1.0"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622085821_96414A_v1_c0027_219C65EF"
+  },
+  {
+    "qid": "S6-dept_internal-3-paper-straw-carton-dimensions",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "纸吸管（粗）整箱的包装箱外径尺寸（长*宽*高）和整箱毛重、净重分别是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "纸吸管(粗)、纸吸管(细)、16oz纸杯(H)、20oz纸杯(H)产品规格书-富岭20250117_1738900824734.pdf#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622184307_1784A3"
+    ],
+    "resolution": [
+      {
+        "expected": "纸吸管(粗)、纸吸管(细)、16oz纸杯(H)、20oz纸杯(H)产品规格书-富岭20250117_1738900824734.pdf#redacted",
+        "title": "纸吸管(粗)、纸吸管(细)、16oz纸杯(H)、20oz纸杯(H)产品规格书-富岭20250117_1738900824734.pdf#redacted",
+        "doc_id": "DOC_PRODUCTION_20260622184307_1784A3",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "纸吸管（粗）空白纸箱的包装箱外径尺寸（长*宽*高）为 550mm*520mm*415mm",
+      "整箱毛重为 9.5kg",
+      "整箱净重为 8.8kg"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "550mm*520mm*415mm",
+      "整箱毛重：9.5kg",
+      "整箱净重：8.8kg"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622184307_1784A3_v1_c0010_0AB4BCD3"
+  },
+  {
+    "qid": "S6-dept_internal-4-10oz-paper-cup-weight-barcode",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "marketing",
+    "query": "10oz一次性热饮纸杯（PE淋膜白色）的克重是多少？货号和条形码分别是什么？",
+    "kind": "positive",
+    "expected_docs": [
+      "产品信息价格.xlsx#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_MARKETING_20260622132045_675207"
+    ],
+    "resolution": [
+      {
+        "expected": "产品信息价格.xlsx#redacted",
+        "title": "产品信息价格.xlsx#redacted",
+        "doc_id": "DOC_MARKETING_20260622132045_675207",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "marketing"
+      }
+    ],
+    "answer_points": [
+      "10oz纸杯（10OZ Disposable Hot Drink Paper Cup）克重为9.8克",
+      "货号为 G-ZB-10",
+      "条形码为 6947803271302",
+      "材质为 PE淋膜白色，包装 50只/袋，20袋/箱"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "9.8",
+      "G-ZB-10",
+      "6947803271302"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_MARKETING_20260622132045_675207_v1_c0004_4E301DDF"
+  },
+  {
+    "qid": "S6-dept_internal-5-pss-chashao-jiagongfei",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "marketing",
+    "query": "注塑模具加工费外贸表里，M-ZS100-A 这套 PSS-茶勺模具的加工费是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "注塑模具加工费外贸201701.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_MARKETING_20260622121413_6995BE"
+    ],
+    "resolution": [
+      {
+        "expected": "注塑模具加工费外贸201701.xlsx",
+        "title": "注塑模具加工费外贸201701.xlsx",
+        "doc_id": "DOC_MARKETING_20260622121413_6995BE",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "marketing"
+      }
+    ],
+    "answer_points": [
+      "模具 M-ZS100-A（PSS-茶勺）的加工费为 3.33333333333333（约 3.33 元）",
+      "该型号出模数为 25，标准克重 1.4"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "M-ZS100-A",
+      "PSS-茶勺",
+      "3.33333333333333"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_MARKETING_20260622121413_6995BE_v1_c0000_6190E41C"
+  },
+  {
+    "qid": "S6-dept_internal-6-haiwaicang-shangye-huilu-weiyuejin",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "marketing",
+    "query": "海外仓委托合同里，如果甲方违反禁止商业贿赂的约定，违约金怎么算？",
+    "kind": "positive",
+    "expected_docs": [
+      "海外仓委托合同20220715终版---增加廉洁条款.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_MARKETING_20260622123223_8539C4"
+    ],
+    "resolution": [
+      {
+        "expected": "海外仓委托合同20220715终版---增加廉洁条款.docx",
+        "title": "海外仓委托合同20220715终版---增加廉洁条款.docx",
+        "doc_id": "DOC_MARKETING_20260622123223_8539C4",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "marketing"
+      }
+    ],
+    "answer_points": [
+      "甲方违反禁止商业贿赂约定视为严重违约，乙方有权立即终止全部合作并要求赔偿经济损失",
+      "损失难以计算的，按双方近一年度交易总额的50%承担违约金责任",
+      "违约金不得低于500万元人民币",
+      "乙方有权在应付款中径行扣减，并冻结甲方所有应付账款支付，构成刑事犯罪的移交司法机关"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "按照双方近一年度交易总额的50%承担违约金责任",
+      "不得低于500万元人民币"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_MARKETING_20260622123223_8539C4_v1_c0021_7D773186"
+  },
+  {
+    "qid": "S6-dept_internal-7-shiyan-huanjing-hengwen",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "rd",
+    "query": "GB/T 19277.1 受控堆肥生物分解试验里，微生物培养的试验环境温度要保持在多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "GB_T19277.1-2011受控堆肥条件下材料最终需氧生物分解能力的测定采用测定释放的二氧化碳的方法第1部分：通用方法.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_RD_20260622105037_9606BE"
+    ],
+    "resolution": [
+      {
+        "expected": "GB_T19277.1-2011受控堆肥条件下材料最终需氧生物分解能力的测定采用测定释放的二氧化碳的方法第1部分：通用方法.pdf",
+        "title": "GB_T19277.1-2011受控堆肥条件下材料最终需氧生物分解能力的测定采用测定释放的二氧化碳的方法第1部分：通用方法.pdf",
+        "doc_id": "DOC_RD_20260622105037_9606BE",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "rd"
+      }
+    ],
+    "answer_points": [
+      "试验环境（第5节）要求微生物培养在容器或室内、黑暗或弱光下进行",
+      "需保持恒温 58℃±2℃",
+      "特殊情况（如材料熔点很低）可选其他温度，但须恒定在±2℃并在试验报告中注明"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "保持恒温 $58{ }^{\\circ} \\mathrm{C} \\pm 2{ }^{\\circ} \\mathrm{C}$"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_RD_20260622105037_9606BE_v1_c0025_31F59F6B"
+  },
+  {
+    "qid": "S6-dept_internal-8-gb480610-2025-shishi-riqi",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "rd",
+    "query": "GB 4806.10-2025 食品接触材料及制品用涂料及涂层这个新标准是什么时候发布、什么时候开始实施的？它代替了哪个旧标准？",
+    "kind": "positive",
+    "expected_docs": [
+      "GB 4806.10-2025 食品安全国家标准 食品接触材料及制品用涂料及涂层.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_RD_20260622105055_AA3F61"
+    ],
+    "resolution": [
+      {
+        "expected": "GB 4806.10-2025 食品安全国家标准 食品接触材料及制品用涂料及涂层.pdf",
+        "title": "GB 4806.10-2025 食品安全国家标准 食品接触材料及制品用涂料及涂层.pdf",
+        "doc_id": "DOC_RD_20260622105055_AA3F61",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "rd"
+      }
+    ],
+    "answer_points": [
+      "GB 4806.10-2025 于 2025-09-02 发布，2026-09-02 实施",
+      "本标准代替 GB4806.10—2016《食品安全国家标准 食品接触用涂料及涂层》"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "2025-09-02发布  2026-09-02实施",
+      "GB4806.10—2016"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_RD_20260622105055_AA3F61_v1_c0007_69E17922"
+  },
+  {
+    "qid": "S6-dept_internal-9-late-fee-rate",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "rd",
+    "query": "委托IQTC检测时如果逾期交款，滞纳金是怎么算的？",
+    "kind": "positive",
+    "expected_docs": [
+      "新版FCM-4-404-01-01委托业务申请单（中文）-20211227.docx#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_RD_20260622132037_6DD0A4"
+    ],
+    "resolution": [
+      {
+        "expected": "新版FCM-4-404-01-01委托业务申请单（中文）-20211227.docx#redacted",
+        "title": "新版FCM-4-404-01-01委托业务申请单（中文）-20211227.docx#redacted",
+        "doc_id": "DOC_RD_20260622132037_6DD0A4",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "rd"
+      }
+    ],
+    "answer_points": [
+      "委托方逾期交款时，IQTC保留加收滞纳金的权利",
+      "滞纳金为每逾期一天，按未交纳检验费用的千分之五计算",
+      "检验日期从实际交纳费用时起算"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "滞纳金为每逾期一天，按未交纳检验费用的千分之五计算",
+      "且检验日期从实际交纳费用时起算"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_RD_20260622132037_6DD0A4_v1_c0015_FD2227A2"
+  },
+  {
+    "qid": "S6-dept_internal-10-annual-perf-review-deadline",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "hr",
+    "query": "绩效管理制度里，员工的年度绩效考核要在什么时间之内完成？个人季度考核表又是几个工作日内完成？",
+    "kind": "positive",
+    "expected_docs": [
+      "绩效管理制度流程3.23(5).docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_HR_20260620073928_B23C6D"
+    ],
+    "resolution": [
+      {
+        "expected": "绩效管理制度流程3.23(5).docx",
+        "title": "绩效管理制度流程3.23(5).docx",
+        "doc_id": "DOC_HR_20260620073928_B23C6D",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "hr"
+      }
+    ],
+    "answer_points": [
+      "个人季度考核表分别于每考核周期结束后7个工作日内完成",
+      "年度考核于年度结束后15个工作日内完成",
+      "考核期初由人力资源部组织各部门开展个人绩效指标确认，于每考核周期前7个工作日前报人力资源部备案"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "年度考核于年度结束后15个工作日内完成",
+      "个人季度考核表分别于每考核周期结束后7个工作日内完成"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_HR_20260620073928_B23C6D_v1_c0001_B5B1B707"
+  },
+  {
+    "qid": "S6-dept_internal-11-zhongkongbei-waitao-beidi-juli",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "quality",
+    "query": "成型检验里，中空杯外套下沿与杯底的距离标准是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-015-002-4成型检验计划表（终版).xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_QUALITY_20260620161442_58B23C"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-015-002-4成型检验计划表（终版).xlsx",
+        "title": "FL-QC-015-002-4成型检验计划表（终版).xlsx",
+        "doc_id": "DOC_QUALITY_20260620161442_58B23C",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "quality"
+      }
+    ],
+    "answer_points": [
+      "成型检验计划中，中空杯外套下沿与杯底距离的质量标准为 10 ± 1mm",
+      "超出范围（>11mm 或 <9mm）为严重缺陷，处理为产品隔离、停机调整",
+      "检验方法为测量，频率为换单/每班抽检"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "中空杯外套下沿与杯底距离",
+      "10 ± 1mm"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_QUALITY_20260620161442_58B23C_v1_c0026_561E4E2A"
+  },
+  {
+    "qid": "S6-dept_internal-12-shenglouye-peizhi-bili",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "quality",
+    "query": "纸制品渗漏检测的渗漏液怎么配置？测漏剂和纯净水的比例是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-015-028纸制品渗漏检测作业指导书(20240312).docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_QUALITY_20260620151303_8B3395"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-015-028纸制品渗漏检测作业指导书(20240312).docx",
+        "title": "FL-QC-015-028纸制品渗漏检测作业指导书(20240312).docx",
+        "doc_id": "DOC_QUALITY_20260620151303_8B3395",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "quality"
+      }
+    ],
+    "answer_points": [
+      "渗漏液由质检班长每周进行配置",
+      "测漏剂与纯净水按 1:70 进行配置",
+      "配好的渗漏液与染色剂胭脂红配比 1000:1",
+      "使用精度为 0.1g 的电子秤，配置约 50L"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "测漏剂与纯净水1:70进行配置",
+      "胭脂红配比1000:1"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_QUALITY_20260620151303_8B3395_v1_c0008_48714B91"
+  },
+  {
+    "qid": "S6-dept_internal-13-baisheng-sample-qty",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "quality",
+    "query": "百胜互配里PP圣代杯的取样数量是多少？取样负责人是谁？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-015-025百胜产品互配管理规范.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_QUALITY_20260620155625_480EBA"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-015-025百胜产品互配管理规范.docx",
+        "title": "FL-QC-015-025百胜产品互配管理规范.docx",
+        "doc_id": "DOC_QUALITY_20260620155625_480EBA",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "quality"
+      }
+    ],
+    "answer_points": [
+      "附表2规定PP圣代杯的互配取样数量为7整模",
+      "取样负责人为童金伟",
+      "生产车间为吸塑，邮寄厂家为青岛日之容（及富岭实验室）"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "PP圣代杯 | 童金伟 | 吸塑 | 7整模 | 青岛日之容"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_QUALITY_20260620155625_480EBA_v1_c0006_6D40316B"
+  },
+  {
+    "qid": "S6-dept_internal-14-waihui-board-approval-threshold",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "finance",
+    "query": "外汇套期保值业务累计金额达到净资产多少比例时必须经董事会审批？",
+    "kind": "positive",
+    "expected_docs": [
+      "CWZD-015外汇套期保值业务管理制度.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_FINANCE_20260620150210_EE262A"
+    ],
+    "resolution": [
+      {
+        "expected": "CWZD-015外汇套期保值业务管理制度.docx",
+        "title": "CWZD-015外汇套期保值业务管理制度.docx",
+        "doc_id": "DOC_FINANCE_20260620150210_EE262A",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "finance"
+      }
+    ],
+    "answer_points": [
+      "公司开展外汇套期保值业务单次或连续十二个月内累计金额达到或超过公司最近一期经审计净资产10%的，必须经董事会审批",
+      "累计金额达到或超过净资产50%的，需董事会审议后提交股东大会审批",
+      "未达董事会审议标准时，由公司总经理审批"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "累计金额达到或超过公司最近一期经审计净资产10%的必须经董事会审批",
+      "由公司总经理审批"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_FINANCE_20260620150210_EE262A_v1_c0009_19BCB354"
+  },
+  {
+    "qid": "S6-dept_internal-15-caiwubu-touzi-banshi-jigou",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "finance",
+    "query": "对外投资管理制度里，公司哪个部门是总经理进行对外投资工作的日常办事机构？",
+    "kind": "positive",
+    "expected_docs": [
+      "CWZD-020对外投资管理制度.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_FINANCE_20260620150241_6379C1"
+    ],
+    "resolution": [
+      {
+        "expected": "CWZD-020对外投资管理制度.docx",
+        "title": "CWZD-020对外投资管理制度.docx",
+        "doc_id": "DOC_FINANCE_20260620150241_6379C1",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "finance"
+      }
+    ],
+    "answer_points": [
+      "第十条规定，公司财务部是总经理进行对外投资工作的日常办事机构",
+      "财务部负责对外投资项目立项前的调查研究、分析和初步评估，提供分析论证材料和投资建议",
+      "财务部还负责对外投资项目的日常管理"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "公司财务部是总经理进行对外投资工作的日常办事机构",
+      "立项前的调查研究、分析和初步评估"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_FINANCE_20260620150241_6379C1_v1_c0007_59056846"
+  },
+  {
+    "qid": "S6-dept_internal-16-rd-welfare-14pct",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "finance",
+    "query": "研发费用核算里，在职研发人员的福利费是按什么比例计提的？",
+    "kind": "positive",
+    "expected_docs": [
+      "CWZD-019研发费用核算财务管理制度.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_FINANCE_20260620150237_413A70"
+    ],
+    "resolution": [
+      {
+        "expected": "CWZD-019研发费用核算财务管理制度.docx",
+        "title": "CWZD-019研发费用核算财务管理制度.docx",
+        "doc_id": "DOC_FINANCE_20260620150237_413A70",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "finance"
+      }
+    ],
+    "answer_points": [
+      "在职研发人员的福利费（餐费、工伤支出、医疗费、部门活动餐费、其他职业福利支出等）按在职研发人员应发工资的14%计提"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "按在职研发人员应发工资的14%计提"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_FINANCE_20260620150237_413A70_v1_c0000_654E893A"
+  },
+  {
+    "qid": "S6-dept_internal-17-mja009-10oz-cavity-speed",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "pmc",
+    "query": "A区模具MJ-A-009（10ozPET杯78MM恒丰80T）的出模腔数和速度分别是多少？用的是哪台机台？",
+    "kind": "positive",
+    "expected_docs": [
+      "A区产品模具数据库.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PMC_20260622202212_CC2D9E"
+    ],
+    "resolution": [
+      {
+        "expected": "A区产品模具数据库.xlsx",
+        "title": "A区产品模具数据库.xlsx",
+        "doc_id": "DOC_PMC_20260622202212_CC2D9E",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "pmc"
+      }
+    ],
+    "answer_points": [
+      "模具MJ-A-009对应10ozPET杯(78MM--恒丰80T)",
+      "出模腔数为40",
+      "速度为20（模/每分钟）",
+      "适用机台为A07，机型HFTF-80T，设备厂家恒丰机械有限公司"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "MJ-A-009",
+      "10ozPET杯(78MM--恒丰80T)\t40\t20\tA07",
+      "HFTF-80T"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PMC_20260622202212_CC2D9E_v1_c0002_BBE1B035"
+  },
+  {
+    "qid": "S6-dept_internal-18-zhijin-u8-caigou-dingdan-lujing",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "pmc",
+    "query": "纸巾到货后在U8系统下采购订单，进入采购订单界面的系统路径是什么？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-PMC-WI-017《纸巾采购下单》作业指导书-陈慧.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PMC_20260620143129_50BED0"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-PMC-WI-017《纸巾采购下单》作业指导书-陈慧.docx",
+        "title": "FL-PMC-WI-017《纸巾采购下单》作业指导书-陈慧.docx",
+        "doc_id": "DOC_PMC_20260620143129_50BED0",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "pmc"
+      }
+    ],
+    "answer_points": [
+      "U8采购订单的系统路径为：业务导航－>供应链－>采购管理－>采购订货－>采购订单",
+      "进入后点击“采购订单”进入采购订单界面",
+      "再点击“增加”下的倒三角▼选择空白单据"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "业务导航－>供应链－>采购管理－>采购订货－>采购订单"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PMC_20260620143129_50BED0_v1_c0007_DDA9DE7D"
+  },
+  {
+    "qid": "S6-dept_internal-19-kesu-jiuzheng-cuoshi-2xiaoshi",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "pmc",
+    "query": "客诉处理流程里，问题责任部门要在多长时间内把纠正预防措施提交给品技中心？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QT-KZ-021《客诉处理流程》控制卡.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PMC_20260622202230_2A5962"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QT-KZ-021《客诉处理流程》控制卡.docx",
+        "title": "FL-QT-KZ-021《客诉处理流程》控制卡.docx",
+        "doc_id": "DOC_PMC_20260622202230_2A5962",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "pmc"
+      }
+    ],
+    "answer_points": [
+      "问题责任部门需按照调查结果制定纠正预防措施，在2小时内提交品技中心",
+      "若不认可调查结果需提供证据"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "在2小时内提交品技中心",
+      "制定纠正预防措施"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PMC_20260622202230_2A5962_v1_c0000_D98445E4"
+  },
+  {
+    "qid": "S6-dept_internal-20-yaoxiang-cheijian-shuliang",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "admin",
+    "query": "品质验厂药品清单里，1号车间（注塑）配了几个药箱？编号是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "品质验厂药品清单.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_ADMIN_20260622202257_86D8A1"
+    ],
+    "resolution": [
+      {
+        "expected": "品质验厂药品清单.xlsx",
+        "title": "品质验厂药品清单.xlsx",
+        "doc_id": "DOC_ADMIN_20260622202257_86D8A1",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "admin"
+      }
+    ],
+    "answer_points": [
+      "1号车间（注塑）配置了3个药箱，编号为1#、2#、3#。"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "1号车间（注塑）\t3个（1#、2#、3#）"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_ADMIN_20260622202257_86D8A1_v1_c0005_191F1A97"
+  },
+  {
+    "qid": "S6-dept_internal-21-hr-reply-2-workdays",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "supply",
+    "query": "用人部门提交《员工需求计划表》后，人力资源部需要在几个工作日内给予答复？",
+    "kind": "positive",
+    "expected_docs": [
+      "6-0人力资源控制程序2.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_SUPPLY_20260620154211_642271"
+    ],
+    "resolution": [
+      {
+        "expected": "6-0人力资源控制程序2.docx",
+        "title": "6-0人力资源控制程序2.docx",
+        "doc_id": "DOC_SUPPLY_20260620154211_642271",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "supply"
+      }
+    ],
+    "answer_points": [
+      "人力资源部收到用人部门的《员工需求计划表》后，无论是招聘、内部调动还是暂且不招，均需在2个工作日内给予答复。"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "2个工作日内给予答复",
+      "《员工需求计划表》"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_SUPPLY_20260620154211_642271_v1_c0005_47FC71A3"
+  },
+  {
+    "qid": "S6-dept_internal-22-gongfang-yeji-pingfen",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "supply",
+    "query": "采购控制程序里，资材部每年对合格供方做业绩评估，品质、交货期、价格、服务、产能各占多少分？等级又是怎么划分的？",
+    "kind": "positive",
+    "expected_docs": [
+      "7-0采购控制程序.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_SUPPLY_20260620155554_992731"
+    ],
+    "resolution": [
+      {
+        "expected": "7-0采购控制程序.docx",
+        "title": "7-0采购控制程序.docx",
+        "doc_id": "DOC_SUPPLY_20260620155554_992731",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "supply"
+      }
+    ],
+    "answer_points": [
+      "合格供方业绩评估满分100分，由资材部每年度评估一次",
+      "评分项及分值：品质40分、交货期20分、价格15分、服务15分、产能10分",
+      "根据评价总分确定等级：A≥90分为优秀、B≥75为合格、C≥60分为一般、D＜60分为差"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "品质40分，交货期20分，价格15分，服务15分，产能10分",
+      "A≥90分为优秀、B≥75为合格、C≥60分为一般、D＜60分为差"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_SUPPLY_20260620155554_992731_v1_c0006_622E1F23"
+  },
+  {
+    "qid": "S6-dept_internal-23-iqa-sampling-frequency",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "quality",
+    "query": "产品规格控制图管理规范里，IQA专员制订抽样计划时，当订单量较小时总体取样次数和每次取样量有什么要求？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-015-026产品规格控制图管理规范.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_QUALITY_20260620151258_960B46"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-015-026产品规格控制图管理规范.docx",
+        "title": "FL-QC-015-026产品规格控制图管理规范.docx",
+        "doc_id": "DOC_QUALITY_20260620151258_960B46",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "quality"
+      }
+    ],
+    "answer_points": [
+      "当订单量较小时，根据每个产程的总时长均匀分配，总体取样次数不少于20次",
+      "每次的取样量应不少于5个",
+      "模穴数大于5时，固定其中5个做为监控对象，每次相同；模穴数小于5个时，取连续模次涵盖所有模穴"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "总体取样次数不少于20次",
+      "每次的取样量应不少于5个"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_QUALITY_20260620151258_960B46_v1_c0008_65EEF178"
+  },
+  {
+    "qid": "S6-public-24-tingche-yanse-fenqu",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "admin",
+    "query": "公司停车位示意图里，蓝色区域和绿色区域分别是给谁停车的？",
+    "kind": "positive",
+    "expected_docs": [
+      "车辆停放示意图.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_ADMIN_20260513120217_64F432"
+    ],
+    "resolution": [
+      {
+        "expected": "车辆停放示意图.xlsx",
+        "title": "车辆停放示意图.xlsx",
+        "doc_id": "DOC_ADMIN_20260513120217_64F432",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "admin"
+      }
+    ],
+    "answer_points": [
+      "黄色区域为公司车辆停车位",
+      "绿色区域为职能部门人员停车位",
+      "蓝色区域为生产部门人员停车位"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "蓝色区域为生产部门人员停车位",
+      "绿色区域为职能部门人员停车位"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_ADMIN_20260513120217_64F432_v2_c0000_067296DB"
+  },
+  {
+    "qid": "S6-public-25-changqu-xiansu",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "admin",
+    "query": "外来车辆进入富岭厂区后，行驶限速是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "外来人员入厂告知书 （松门）.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_ADMIN_20260513120215_F78539"
+    ],
+    "resolution": [
+      {
+        "expected": "外来人员入厂告知书 （松门）.docx",
+        "title": "外来人员入厂告知书 （松门）.docx",
+        "doc_id": "DOC_ADMIN_20260513120215_F78539",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "admin"
+      }
+    ],
+    "answer_points": [
+      "外来车辆（自行车、汽车、摩托车、电瓶车、货车等）进入厂区后必须遵守外来车辆管理规定，不得乱停乱放、超速行驶",
+      "厂区内限速5公里/小时"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "厂区内限速5公里/小时"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_ADMIN_20260513120215_F78539_v2_c0004_55B068A5"
+  },
+  {
+    "qid": "S6-public-26-yuanliao-juyixi-jubingxi",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "hr",
+    "query": "公司生产所需的原料是什么？",
+    "kind": "positive",
+    "expected_docs": [
+      "安全手册2021版（需要修订）.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_HR_20260514123026_F54673"
+    ],
+    "resolution": [
+      {
+        "expected": "安全手册2021版（需要修订）.docx",
+        "title": "安全手册2021版（需要修订）.docx",
+        "doc_id": "DOC_HR_20260514123026_F54673",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "hr"
+      }
+    ],
+    "answer_points": [
+      "公司生产所需原料为聚乙烯和聚丙烯塑料",
+      "常温下性质稳定，不会产生有害气体",
+      "产品由这两种原料通过高温软化、模具挤压成型"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "公司生产所需原料为聚乙烯和聚丙烯塑料",
+      "常温下性质稳定，不会产生有害气体"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_HR_20260514123026_F54673_v2_c0028_0822EC3B"
+  },
+  {
+    "qid": "S6-public-27-ladder-angle",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "hr",
+    "query": "登高作业时，登高单梯的支设角度和人字梯的两梯夹角分别要求是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "A57登高作业安全管理规定.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_HR_20260514123025_3B4CC5"
+    ],
+    "resolution": [
+      {
+        "expected": "A57登高作业安全管理规定.docx",
+        "title": "A57登高作业安全管理规定.docx",
+        "doc_id": "DOC_HR_20260514123025_3B4CC5",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "hr"
+      }
+    ],
+    "answer_points": [
+      "登高单梯只允许1人操作，支设角度60-70度为宜，梯子下脚要采取防滑措施",
+      "支设人字梯时，两梯夹角40度，同时两梯要固定牢固，移动时禁止上面站人"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "支设角度60-70度为宜",
+      "两梯夹角40度"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_HR_20260514123025_3B4CC5_v2_c0010_2EEE08E7"
+  },
+  {
+    "qid": "S6-public-28-shengchan-dingdan-liebiao-lujing",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "it",
+    "query": "在U8+车间操作手册里，查看生产订单列表的系统菜单路径是怎么走的？",
+    "kind": "positive",
+    "expected_docs": [
+      "富岭U8+车间操作手册.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_IT_20260513120634_5E462A"
+    ],
+    "resolution": [
+      {
+        "expected": "富岭U8+车间操作手册.docx",
+        "title": "富岭U8+车间操作手册.docx",
+        "doc_id": "DOC_IT_20260513120634_5E462A",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "it"
+      }
+    ],
+    "answer_points": [
+      "生产订单列表的系统路径为：业务工作－>生产制造－>生产订单－>生产订单维护－>生产订单->生产订单列表",
+      "责任岗位为车间"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "业务工作－>生产制造－>生产订单－>生产订单维护－>生产订单->生产订单列表"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_IT_20260513120634_5E462A_v3_c0024_7B9352CA"
+  },
+  {
+    "qid": "S6-public-29-jifang-yingpan-genghuan-zhouqi",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "it",
+    "query": "公司机房的硬盘按多长周期更换以确保数据安全？",
+    "kind": "positive",
+    "expected_docs": [
+      "新XXHZD-001机房管理制度.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_IT_20260513120634_74C3E9"
+    ],
+    "resolution": [
+      {
+        "expected": "新XXHZD-001机房管理制度.docx",
+        "title": "新XXHZD-001机房管理制度.docx",
+        "doc_id": "DOC_IT_20260513120634_74C3E9",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "it"
+      }
+    ],
+    "answer_points": [
+      "机房硬盘按3年周期更换",
+      "通过数据平台监控硬盘寿命，以确保数据安全"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "按3年周期更换硬盘"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_IT_20260513120634_74C3E9_v2_c0001_FCBD7E25"
+  },
+  {
+    "qid": "S6-public-30-taoyin-zhuyao-gongcha",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "production",
+    "query": "成型检验计划里，印刷套印的主要部分对位偏差合格标准是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "QU0P001-01成型检验计划表（终版).xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260513120642_14DFDF"
+    ],
+    "resolution": [
+      {
+        "expected": "QU0P001-01成型检验计划表（终版).xlsx",
+        "title": "QU0P001-01成型检验计划表（终版).xlsx",
+        "doc_id": "DOC_PRODUCTION_20260513120642_14DFDF",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "印刷套印的质量标准：主要部分≤0.3mm，次要部分≤0.5mm（合格判定标准）",
+      "轻微缺陷B(AQL-1.5)：主要部分0.3~0.5mm，次要部分0.5~1.0mm；严重缺陷A(AQL-0.25)：主要部分≥0.5mm，次要部分≥1.0mm",
+      "反应计划：产品隔离，质量评估，停机等待判定结果"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "主要部分≤0.3mm,次要部分≤0.5mm",
+      "套印"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260513120642_14DFDF_v2_c0007_879B079B"
+  },
+  {
+    "qid": "S6-public-31-guangshan-chuanganqi-qingsao",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "production",
+    "query": "成型机（片材机）的光栅传感器多久清扫一次？用什么方法清扫？",
+    "kind": "positive",
+    "expected_docs": [
+      "设备清扫基准书-成型机（阿德沃）.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260513120636_D49638"
+    ],
+    "resolution": [
+      {
+        "expected": "设备清扫基准书-成型机（阿德沃）.xlsx",
+        "title": "设备清扫基准书-成型机（阿德沃）.xlsx",
+        "doc_id": "DOC_PRODUCTION_20260513120636_D49638",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "光栅传感器属于电气系统，清扫周期为每日",
+      "清扫方法：先将重油清洗剂喷在抹布上，用抹布擦拭干净",
+      "使用工具：重油清洗剂、干抹布；标准为无黑手印、油污；耗时约3分钟，由作业员执行"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "光栅传感器",
+      "先将重油清洗剂喷在抹布上，用抹布擦拭干净",
+      "每日"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260513120636_D49638_v2_c0007_3E09A972"
+  },
+  {
+    "qid": "S6-public-32-zhigong-jieyong-shenghuofei-2000",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "finance",
+    "query": "职工借用生活费用走借款审批流程时，金额达到多少就需要公司总经理审批？",
+    "kind": "positive",
+    "expected_docs": [
+      "台州富岭领、付款审批制度2019.11.4.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_FINANCE_20260611201418_9CFE36"
+    ],
+    "resolution": [
+      {
+        "expected": "台州富岭领、付款审批制度2019.11.4.pdf",
+        "title": "台州富岭领、付款审批制度2019.11.4.pdf",
+        "doc_id": "DOC_FINANCE_20260611201418_9CFE36",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "finance"
+      }
+    ],
+    "answer_points": [
+      "职工借用生活费用的借款审批流程按金额分档：金额在2000元以下的，流程为填制借款申请单→主管部门负责人确认签字→财务部门审核→财务经理安排付款→出纳支付款项（无需总经理审批）",
+      "金额在2000元以上的，流程中需增加公司总经理审批环节，即填制借款申请单→主管部门负责人确认签字→财务部门审核→公司总经理审批→财务经理安排付款→出纳支付款项",
+      "因此当借款金额达到2000元以上时，必须经公司总经理审批"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "金额在 2000 以上的",
+      "公司总经理审批"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_FINANCE_20260611201418_9CFE36_v1_c0017_2999C660"
+  },
+  {
+    "qid": "S6-public-33-gunte-fixed-asset-depreciation-method",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "finance",
+    "query": "U8里格润特新材料的固定资产卡片，默认用的是哪种折旧方法？净残值率设多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-CW-GRT-001《格润特新材料财务处理》作业指导书.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_FINANCE_20260611201418_EF06F8"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-CW-GRT-001《格润特新材料财务处理》作业指导书.pdf",
+        "title": "FL-CW-GRT-001《格润特新材料财务处理》作业指导书.pdf",
+        "doc_id": "DOC_FINANCE_20260611201418_EF06F8",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "finance"
+      }
+    ],
+    "answer_points": [
+      "固定资产卡片折旧方法为平均年限法(一)",
+      "净残值率为10%"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "折旧方法 平均年限法(一)",
+      "净残值率 10%"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_FINANCE_20260611201418_EF06F8_v1_c0003_4A050599"
+  },
+  {
+    "qid": "S6-public-34-baoguan-zhuanyongzhang-zhangguan",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "marketing",
+    "query": "公司的报关专业章由谁负责掌管？",
+    "kind": "positive",
+    "expected_docs": [
+      "企业进出口经营行为规范管理制度-富岭塑胶.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_MARKETING_20260611201419_A9D6B9"
+    ],
+    "resolution": [
+      {
+        "expected": "企业进出口经营行为规范管理制度-富岭塑胶.docx",
+        "title": "企业进出口经营行为规范管理制度-富岭塑胶.docx",
+        "doc_id": "DOC_MARKETING_20260611201419_A9D6B9",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "marketing"
+      }
+    ],
+    "answer_points": [
+      "报关专业章仅供报关使用",
+      "由单证主管负责掌管"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "报关专业章仅供报关使用，由单证主管负责掌管"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_MARKETING_20260611201419_A9D6B9_v1_c0027_D5114903"
+  },
+  {
+    "qid": "S6-public-35-total-revenue-usd",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "marketing",
+    "query": "富岭科技在SGS能力评估报告里，上一年度的总营收（美元）是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "富岭科技股份有限公司_能力评估.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_MARKETING_20260611201419_A821CC"
+    ],
+    "resolution": [
+      {
+        "expected": "富岭科技股份有限公司_能力评估.pdf",
+        "title": "富岭科技股份有限公司_能力评估.pdf",
+        "doc_id": "DOC_MARKETING_20260611201419_A821CC",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "marketing"
+      }
+    ],
+    "answer_points": [
+      "上一年度总营收（Total revenue, Previous year, USD）为 171,988,780 美元",
+      "数据来自 SGS 出具的富岭科技能力评估报告（Current Export Situation 部分）"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "Total revenue (Previous year, USD)",
+      "171,988,780"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_MARKETING_20260611201419_A821CC_v1_c0025_6D0B68D4"
+  },
+  {
+    "qid": "S6-public-36-caigou-hetong-zhengyi-jiejue",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "pmc",
+    "query": "采购合同里如果履行过程中发生争议，协商或调解不成应该怎么解决？",
+    "kind": "positive",
+    "expected_docs": [
+      "08采购合同.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PMC_20260611201419_5C1E8C"
+    ],
+    "resolution": [
+      {
+        "expected": "08采购合同.docx",
+        "title": "08采购合同.docx",
+        "doc_id": "DOC_PMC_20260611201419_5C1E8C",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "pmc"
+      }
+    ],
+    "answer_points": [
+      "合同履行过程中发生的争议先由双方当事人协商解决，也可由当地工商行政管理部门调解",
+      "协商或调解不成的，按约定方式解决：㈠提交仲裁委员会仲裁；㈡依法向人民法院起诉"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "提交　　　　　　　　　　　　仲裁委员会仲裁",
+      "依法向人民法院起诉"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PMC_20260611201419_5C1E8C_v1_c0002_2DD099DD"
+  },
+  {
+    "qid": "S6-public-37-baisheng-label-date-size",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "quality",
+    "query": "百胜产品的外箱日期标签和内标签的日期高度尺寸有什么要求？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-015-016标签日期确认管理规范.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_QUALITY_20260611201420_131DCA"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-015-016标签日期确认管理规范.docx",
+        "title": "FL-QC-015-016标签日期确认管理规范.docx",
+        "doc_id": "DOC_QUALITY_20260611201420_131DCA",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "quality"
+      }
+    ],
+    "answer_points": [
+      "百胜产品的外箱日期标签日期应不小于1.5cm",
+      "内标签日期应不小于4mm"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "外箱日期标签日期应不小于于1.5cm",
+      "内标签日期应不小于4mm"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_QUALITY_20260611201420_131DCA_v1_c0011_A4F7A682"
+  },
+  {
+    "qid": "S6-public-38-recall-notify-2days",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "quality",
+    "query": "缺陷食品召回时，从召回计划开始实施起，要在多少天内完成所有相关顾客的通知工作？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-015-010缺陷食品召回管理制度.doc.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_QUALITY_20260611201419_B4BBB4"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-015-010缺陷食品召回管理制度.doc.docx",
+        "title": "FL-QC-015-010缺陷食品召回管理制度.doc.docx",
+        "doc_id": "DOC_QUALITY_20260611201419_B4BBB4",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "quality"
+      }
+    ],
+    "answer_points": [
+      "执行召回或撤柜计划时，从计划开始实施起，应在2日内完成所有相关顾客的通知工作",
+      "需确保每一个有可能被同种危害影响的顾客都能得到产品召回的具体信息，且产品召回或撤柜要彻底"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "应在2日完成所有相关顾客的通知工作",
+      "从计划开始实施起"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_QUALITY_20260611201419_B4BBB4_v1_c0006_B6DE4245"
+  },
+  {
+    "qid": "S6-public-39-jszx-zhuren-fenguan-lingdao",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "rd",
+    "query": "企业研究院管理制度里，技术中心主任是在谁的领导下分管公司的技术管理工作？",
+    "kind": "positive",
+    "expected_docs": [
+      "企业研究开发的组织管理制度.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_RD_20260611201420_8FF018"
+    ],
+    "resolution": [
+      {
+        "expected": "企业研究开发的组织管理制度.pdf",
+        "title": "企业研究开发的组织管理制度.pdf",
+        "doc_id": "DOC_RD_20260611201420_8FF018",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "rd"
+      }
+    ],
+    "answer_points": [
+      "技术中心主任在公司副总经理的领导下分管公司的技术管理工作，主抓技术部日常工作"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "在公司副总经理的领导下分管公司的技术管理工作"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_RD_20260611201420_8FF018_v1_c0002_EE24DA5C"
+  },
+  {
+    "qid": "S6-sop-40-u8-caigou-fapiao-luru-lujing",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "it",
+    "query": "U8+系统里采购发票录入的系统路径（菜单）是什么？责任岗位是哪个？",
+    "kind": "positive",
+    "expected_docs": [
+      "富岭U8+财务部操作手册.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_IT_20260513120634_C6FD16"
+    ],
+    "resolution": [
+      {
+        "expected": "富岭U8+财务部操作手册.docx",
+        "title": "富岭U8+财务部操作手册.docx",
+        "doc_id": "DOC_IT_20260513120634_C6FD16",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "it"
+      }
+    ],
+    "answer_points": [
+      "采购发票录入的系统路径为：业务导航－>业务工作－>供应链－>采购管理－>采购发票－>采购专用发票、采购普通发票",
+      "责任岗位为财务",
+      "普通发票或专用发票根据实际收到供应商的发票类型来决定录入哪一种"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "业务导航－>业务工作－>供应链－>采购管理－>采购发票－>采购专用发票、采购普通发票",
+      "责任岗位 | 财务"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_IT_20260513120634_C6FD16_v3_c0040_B41A776B"
+  },
+  {
+    "qid": "S6-sop-41-emergency-injury-120",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "hr",
+    "query": "突发事件处理中如果有人员受伤，应该拨打哪个电话求救？",
+    "kind": "positive",
+    "expected_docs": [
+      "A37突发事件的处理工作规程.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_HR_20260514123022_0959E5"
+    ],
+    "resolution": [
+      {
+        "expected": "A37突发事件的处理工作规程.docx",
+        "title": "A37突发事件的处理工作规程.docx",
+        "doc_id": "DOC_HR_20260514123022_0959E5",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "hr"
+      }
+    ],
+    "answer_points": [
+      "突发事件处理中如有人员受伤，应及时拨打\"120\"求救"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "如有人员受伤应及时拨打“120”求救"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_HR_20260514123022_0959E5_v2_c0008_C36C8769"
+  },
+  {
+    "qid": "S6-sop-42-dorm-high-power-appliance-watt",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "员工宿舍使用多大功率以上的电器算违反消防安全规定？",
+    "kind": "positive",
+    "expected_docs": [
+      "FLEQM02-18应急准备与响应控制程序.docx#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622082122_13F01D"
+    ],
+    "resolution": [
+      {
+        "expected": "FLEQM02-18应急准备与响应控制程序.docx#redacted",
+        "title": "FLEQM02-18应急准备与响应控制程序.docx#redacted",
+        "doc_id": "DOC_PRODUCTION_20260622082122_13F01D",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "员工宿舍不得随意私接电线",
+      "不得擅自使用大功率（100W以上）电器",
+      "任何部门和个人不得私藏汽油等易燃易爆物品"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "大功率（100W以上）电器",
+      "不得随意私接电线"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622082122_13F01D_v1_c0029_2259255F"
+  },
+  {
+    "qid": "S6-sop-45-zhusuji-youwen-yure",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "supply",
+    "query": "注塑机开马达时，如果液压油温在20℃以下，需要怎么做才能开始正常生产？",
+    "kind": "positive",
+    "expected_docs": [
+      "5-0设备安全操作规程.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_SUPPLY_20260620141842_763365"
+    ],
+    "resolution": [
+      {
+        "expected": "5-0设备安全操作规程.docx",
+        "title": "5-0设备安全操作规程.docx",
+        "doc_id": "DOC_SUPPLY_20260620141842_763365",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "supply"
+      }
+    ],
+    "answer_points": [
+      "注塑机开马达时，若液压油温在20℃以下，必须让马达空转半小时（无负载）",
+      "使油温提升到25℃才能开始正常生产"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "马达空转半小时（无负载）",
+      "使油温提升到25℃才能开始正常生产"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_SUPPLY_20260620141842_763365_v1_c0005_13C707DF"
+  },
+  {
+    "qid": "S6-sop-46-fangong-fanxiu-sanian",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "quality",
+    "query": "不合格品需要返工返修时，常规返工返修要求在多长时间内完成？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-015-008不合格产品流程管控.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_QUALITY_20260611201419_028220"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-015-008不合格产品流程管控.docx",
+        "title": "FL-QC-015-008不合格产品流程管控.docx",
+        "doc_id": "DOC_QUALITY_20260611201419_028220",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "quality"
+      }
+    ],
+    "answer_points": [
+      "不合格品判定后由品质主管确定返工返修/让步接收/报废处理；需返工返修的产品要确认最迟的返工日期",
+      "常规返工返修的时间必须在三天内完成"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "常规返工返修的时间必须在三天内完成"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_QUALITY_20260611201419_028220_v1_c0014_3BC10259"
+  },
+  {
+    "qid": "S6-sop-47-haiwai-bizhong-huilv",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "it",
+    "query": "海外发票系统里2024年6月配置的美元、日元、欧元汇率分别是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "海外发票系统操作手册（2024年6月12日修订版）.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_IT_20260514123026_CD1C87"
+    ],
+    "resolution": [
+      {
+        "expected": "海外发票系统操作手册（2024年6月12日修订版）.docx",
+        "title": "海外发票系统操作手册（2024年6月12日修订版）.docx",
+        "doc_id": "DOC_IT_20260514123026_CD1C87",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "it"
+      }
+    ],
+    "answer_points": [
+      "2024年6月在海外币种设置中配置的三种外币汇率为：美元 7.00000、日元 0.55000、欧元 8.00000",
+      "海外币种设置路径：业务导航--供应链--海外销售管理--海外档案--海外币种设置，每个月录入一张汇率表，用于发票出库自动带出终端人民币金额"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "美元7.00000",
+      "日元0.55000",
+      "欧元8.00000"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_IT_20260514123026_CD1C87_v3_c0019_C5A44A7F"
+  },
+  {
+    "qid": "S6-sop-48-fuzaigan-tuopan-zhiliang",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "rd",
+    "query": "热变形维卡软化点温度测定仪的负载杆及托盘的质量是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "FL-QC-005-313热变形维卡软化点温度测定仪作业指导书.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_RD_20260611201420_B5513A"
+    ],
+    "resolution": [
+      {
+        "expected": "FL-QC-005-313热变形维卡软化点温度测定仪作业指导书.docx",
+        "title": "FL-QC-005-313热变形维卡软化点温度测定仪作业指导书.docx",
+        "doc_id": "DOC_RD_20260611201420_B5513A",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "rd"
+      }
+    ],
+    "answer_points": [
+      "负载杆及托盘的质量为54g"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "负载杆及托盘的质量：54g"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_RD_20260611201420_B5513A_v1_c0007_5B488934"
+  },
+  {
+    "qid": "S6-sop-49-banchengpin-gongjiadan-weiyi-bianma",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "it",
+    "query": "在工资核算的半成品工价单里录入工价时，同一个半成品物料编码可以重复录入吗？",
+    "kind": "positive",
+    "expected_docs": [
+      "工资核算管理操作手册（2025年5月28日初版）.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_IT_20260514123026_951420"
+    ],
+    "resolution": [
+      {
+        "expected": "工资核算管理操作手册（2025年5月28日初版）.docx",
+        "title": "工资核算管理操作手册（2025年5月28日初版）.docx",
+        "doc_id": "DOC_IT_20260514123026_951420",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "it"
+      }
+    ],
+    "answer_points": [
+      "半成品工价单中半成品编码已做唯一值控制",
+      "工价单中出现重复的物料编码会被控制，不能重复录入",
+      "只有审核后的工价单才能认定为生效，方可在日工资单中取数"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "半成品编码已进行唯一值控制",
+      "重复的物料编码则会进行控制不能重复录入"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_IT_20260514123026_951420_v3_c0009_A12C45A1"
+  },
+  {
+    "qid": "S6-sop-50-gongcheng-biangeng-leibie",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "工程变更包括哪几种变更类别？",
+    "kind": "positive",
+    "expected_docs": [
+      "FLEQM02-43工程变更控制程序.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260621115502_EE81E7"
+    ],
+    "resolution": [
+      {
+        "expected": "FLEQM02-43工程变更控制程序.docx",
+        "title": "FLEQM02-43工程变更控制程序.docx",
+        "doc_id": "DOC_PRODUCTION_20260621115502_EE81E7",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "工程变更指样品通过客户认定后（批量制造阶段）与产品制造工程方面相关条件发生变化的情况",
+      "包括人员变更、设备变更、材料变更和方法变更4种变更类别"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "人员变更、设备变更、材料变更和方法变更4种变更类别"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260621115502_EE81E7_v1_c0016_E2421423"
+  },
+  {
+    "qid": "S6-sop-51-banchengpin-chuku-path",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "it",
+    "query": "U8+系统里半成品出库单要怎么操作？在哪个系统路径录入？",
+    "kind": "positive",
+    "expected_docs": [
+      "富岭U8+成品仓库操作手册.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_IT_20260513120634_93B432"
+    ],
+    "resolution": [
+      {
+        "expected": "富岭U8+成品仓库操作手册.docx",
+        "title": "富岭U8+成品仓库操作手册.docx",
+        "doc_id": "DOC_IT_20260513120634_93B432",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "it"
+      }
+    ],
+    "answer_points": [
+      "半成品出库单无法根据生产订单出库，本质是材料出库单，需仓库人员不参照任何单据手工录入",
+      "系统路径：业务工作－>供应链－>库存管理－>材料出库－>材料出库单",
+      "责任岗位为成品仓",
+      "表头录入仓库、领用部门、出库类别，表体录入半成品、数量、颜色，确认无误后保存并审核"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "业务工作－>供应链－>库存管理－>材料出库－>材料出库单",
+      "半成品出库单无法根据生产订单进行出库"
+    ],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_IT_20260513120634_93B432_v3_c0026_AB1DBB94"
+  },
+  {
+    "qid": "S6-image-52-large-cup-outer-packaging",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "茶姬亚太红款大号纸杯的外包装规格是怎么装箱的？一箱多少个？",
+    "kind": "positive",
+    "expected_docs": [
+      "包材规格书-纸杯亚太红蓝款-富岭.xlsx#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622184314_098D14"
+    ],
+    "resolution": [
+      {
+        "expected": "包材规格书-纸杯亚太红蓝款-富岭.xlsx#redacted",
+        "title": "包材规格书-纸杯亚太红蓝款-富岭.xlsx#redacted",
+        "doc_id": "DOC_PRODUCTION_20260622184314_098D14",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "大号纸杯-亚太红款的内包装规格为20个/提",
+      "外包装规格为20个/提*25提/箱（即每箱500个）",
+      "内包装材质为PE高压袋单层2丝，外包装材质为五层双瓦楞粘合黄牛皮"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "大号纸杯-亚太红款",
+      "内包装规格\t\t20个/提\t\t外包装规格\t20个/提*25提/箱"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622184314_098D14_v1_c0028_742E30A8"
+  },
+  {
+    "qid": "S6-image-53-gold-supplier-validity-period",
+    "source": "docx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-public",
+    "dept": "marketing",
+    "query": "富岭科技的阿里巴巴金牌供应商主营产品线验证报告（报告编号23214577_P+T）有效期是什么时候？",
+    "kind": "positive",
+    "expected_docs": [
+      "富岭科技股份有限公司_主营产品.docx"
+    ],
+    "expected_doc_ids": [
+      "DOC_MARKETING_20260611201419_179D9F"
+    ],
+    "resolution": [
+      {
+        "expected": "富岭科技股份有限公司_主营产品.docx",
+        "title": "富岭科技股份有限公司_主营产品.docx",
+        "doc_id": "DOC_MARKETING_20260611201419_179D9F",
+        "sim": 1.0,
+        "permission_level": "public",
+        "owner_dept": "marketing"
+      }
+    ],
+    "answer_points": [
+      "该报告（Report Number: 23214577_P+T）的有效期为 08/Mar./2022 -- 07/Mar./2023",
+      "评估类型为 Main Product Lines Verification，评估日期与报告日期均为 07/Mar./2022",
+      "评估员为 Jimmy Jiang，复核人为 Sam Wang，在线验证地址为 www.sgs.com/ecv"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "08/Mar./2022 -- 07/Mar./2023",
+      "23214577_P+T"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_MARKETING_20260611201419_179D9F_v1_c0004_B8C9F4A3"
+  },
+  {
+    "qid": "S6-image-54-bawangchaji-zhongbei-waixiangbiao-rongliang",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "霸王茶姬中号纸杯（乾隆奶茶款黄-6）的外包装箱标签上标注的容量和执行标准是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "产品规格书-霸王茶姬 中号纸杯-乾隆奶茶款黄-6.xlsx#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622184308_841487"
+    ],
+    "resolution": [
+      {
+        "expected": "产品规格书-霸王茶姬 中号纸杯-乾隆奶茶款黄-6.xlsx#redacted",
+        "title": "产品规格书-霸王茶姬 中号纸杯-乾隆奶茶款黄-6.xlsx#redacted",
+        "doc_id": "DOC_PRODUCTION_20260622184308_841487",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "外包装箱标签标注容量550mL",
+      "执行标准GB/T 27590",
+      "材质为PP/PLA/纸，含CHAGEE霸王茶姬Logo与二维码"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "容量550mL",
+      "执行标准GB/T 27590"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622184308_841487_v1_c0028_B6B9DDFE"
+  },
+  {
+    "qid": "S6-image-55-shuangceng-lenggai-waixiang-baozhuang",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "双层冷盖大盖的外包装规格是怎样的？一箱装多少袋，外箱用什么包装材质？",
+    "kind": "positive",
+    "expected_docs": [
+      "20241217-ps双层冷盖产品标准书2024新版（富岭科技)(3) 20241217(7).xlsx#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622184308_3049F8"
+    ],
+    "resolution": [
+      {
+        "expected": "20241217-ps双层冷盖产品标准书2024新版（富岭科技)(3) 20241217(7).xlsx#redacted",
+        "title": "20241217-ps双层冷盖产品标准书2024新版（富岭科技)(3) 20241217(7).xlsx#redacted",
+        "doc_id": "DOC_PRODUCTION_20260622184308_3049F8",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "双层冷盖大盖外包装规格为 10袋/箱（内包装为 100只/袋）",
+      "外包装材质为五层双瓦黄牛皮",
+      "大盖外箱毛重 3.5kg、净重量 3kg，外箱包装尺寸 480*200*565mm，允许堆高 限高4层"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "10袋/箱",
+      "五层双瓦黄牛皮"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622184308_3049F8_v1_c0011_9CD4EEE4"
+  },
+  {
+    "qid": "S6-image-56-bawangchaji-zhongbei-shezhipla-kezhong",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "霸王茶姬中号纸杯蛇年CNY款的聚乳酸（PLA）原料克重和添加比例是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "产品规格书-霸王茶姬 中号纸杯--蛇年CNY款-6 规格书 (2).xlsx#redacted"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622184305_7C912D"
+    ],
+    "resolution": [
+      {
+        "expected": "产品规格书-霸王茶姬 中号纸杯--蛇年CNY款-6 规格书 (2).xlsx#redacted",
+        "title": "产品规格书-霸王茶姬 中号纸杯--蛇年CNY款-6 规格书 (2).xlsx#redacted",
+        "doc_id": "DOC_PRODUCTION_20260622184305_7C912D",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "聚乳酸（PLA）是该中号纸杯的主要原料之一，材料序号为2",
+      "其克重/添加比例为 1.47g/7%",
+      "聚乳酸（PLA）接触食品，材料供应商为浙江海正生物材料股份有限公司，材料执行标准 GB 29284-2012"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "1.47g/7%",
+      "聚乳酸（PLA）"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622184305_7C912D_v1_c0001_2D27A903"
+  },
+  {
+    "qid": "S6-image-58-gb5009-156-qianyi-shiyan-wendu-piancha",
+    "source": "pdf",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "GB 5009.156-2016 食品接触材料迁移试验里，121℃ 和 175℃ 这两个试验温度的允许偏差分别是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "GB 5009.156-2016.pdf"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622004425_E31E68"
+    ],
+    "resolution": [
+      {
+        "expected": "GB 5009.156-2016.pdf",
+        "title": "GB 5009.156-2016.pdf",
+        "doc_id": "DOC_PRODUCTION_20260622004425_E31E68",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "GB 5009.156-2016 规定的试验温度档位带有允许偏差",
+      "121℃ 档位的允许偏差为 ±3℃（即 121℃±3℃）",
+      "175℃ 档位的允许偏差为 ±5℃（即 175℃±5℃）"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "１２１℃±３℃",
+      "１７５℃±５℃"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622004425_E31E68_v1_c0001_22BE9CAA"
+  },
+  {
+    "qid": "S6-image-59-700-neidanbei-bei-biaoqian-chicun",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "700内胆杯杯盖（亚太款）的杯盖内标签尺寸是多大？标签上标注的使用温度和规格是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "包材规格书-700内胆杯杯盖-亚太款-富岭.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622023314_7EAB04"
+    ],
+    "resolution": [
+      {
+        "expected": "包材规格书-700内胆杯杯盖-亚太款-富岭.xlsx",
+        "title": "包材规格书-700内胆杯杯盖-亚太款-富岭.xlsx",
+        "doc_id": "DOC_PRODUCTION_20260622023314_7EAB04",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "杯盖内标签尺寸为 50mm×90mm",
+      "标签标注使用温度 -10℃~70℃",
+      "标签标注规格 φ100mm、数量 50PCS",
+      "材质为 PS，制造商为富凌科技"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "50mm×90mm",
+      "使用温度-10℃~70℃",
+      "规格φ100mm"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622023314_7EAB04_v1_c0026_6824D290"
+  },
+  {
+    "qid": "S6-image-60-pla-supplier-ratio",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "霸王茶姬中号纸杯黄茶D款6的产品规格书里，聚乳酸（PLA）是哪家供应商提供的？克重和添加比例是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "产品规格书-霸王茶姬中号纸杯-黄茶D款-6-富岭 11.08.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260621225940_3B0D85"
+    ],
+    "resolution": [
+      {
+        "expected": "产品规格书-霸王茶姬中号纸杯-黄茶D款-6-富岭 11.08.xlsx",
+        "title": "产品规格书-霸王茶姬中号纸杯-黄茶D款-6-富岭 11.08.xlsx",
+        "doc_id": "DOC_PRODUCTION_20260621225940_3B0D85",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "聚乳酸（PLA）的材料供应商为浙江海正生物材料股份有限公司",
+      "PLA 克重 1.47g、添加比例 7%",
+      "其材料执行标准为 GB 29284-2012",
+      "PLA 为接触食品材料、非边角料/回收料"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "聚乳酸（PLA）",
+      "1.47g/7%",
+      "浙江海正生物材料股份有限公司"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260621225940_3B0D85_v1_c0001_7B7D6F0B"
+  },
+  {
+    "qid": "S6-image-61-zhibao-shaozi-pla-gongyingshang",
+    "source": "xlsx",
+    "module": "rag_retrieval",
+    "subtype": "正例-新语料-dept_internal",
+    "dept": "production",
+    "query": "霸王茶姬纸包勺子（茶马古道US-6.1）用的PLA原料是哪家供应商提供的？克重是多少？",
+    "kind": "positive",
+    "expected_docs": [
+      "产品规格书-霸王茶姬纸包勺子-茶马古道US-6.1.xlsx"
+    ],
+    "expected_doc_ids": [
+      "DOC_PRODUCTION_20260622085722_B815D1"
+    ],
+    "resolution": [
+      {
+        "expected": "产品规格书-霸王茶姬纸包勺子-茶马古道US-6.1.xlsx",
+        "title": "产品规格书-霸王茶姬纸包勺子-茶马古道US-6.1.xlsx",
+        "doc_id": "DOC_PRODUCTION_20260622085722_B815D1",
+        "sim": 1.0,
+        "permission_level": "dept_internal",
+        "owner_dept": "production"
+      }
+    ],
+    "answer_points": [
+      "PLA原料的材料供应商为宁波利万新材料有限公司",
+      "该PLA部件克重为7.8g",
+      "材料执行标准为GB 4806.6-2016"
+    ],
+    "pass_criteria": "Top3召回目标文档",
+    "keyword_gt": [
+      "宁波利万新材料有限公司",
+      "7.8g",
+      "GB 4806.6-2016"
+    ],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "dept_internal"
+    ],
+    "live_scorable": true,
+    "neg_type": null,
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": "DOC_PRODUCTION_20260622085722_B815D1_v1_c0001_A41E9E96"
+  },
+  {
+    "qid": "S6-off-q1-net-profit",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "公司今年第一季度的净利润是多少？",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "知识库中不存在任何文档报告富岭今年第一季度的实际净利润数字，应判定为无法回答/超出知识库范围（off_topic），而非给出具体金额。",
+      "知识库的财务类文档仅为制度/流程/模板（如外汇套期保值管理制度、内部控制手册信息披露流程、会计业务SOP、利润表空白模板），均不含实际经营业绩数据。",
+      "正确行为：返回'未在知识库中找到相关内容'类提示，不得编造任何净利润金额。"
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-hengxin-quotation",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "恒鑫生活同款纸杯的最新对外报价单是多少？想拿来跟咱们的纸杯报价做个对比。",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "知识库中没有竞争对手恒鑫生活（恒鑫）任何对外报价单/价格信息——跨表探针 恒鑫 AND (报价 OR 价格) = 0 条 active chunk",
+      "'恒鑫生活'(0)、'对外报价'(0) 在 chunk_text 中均无命中；'恒鑫'(3) 命中的是青山计划入围名录与 GBT 18006.3 起草单位列表里的同行企业，与纸杯报价无关",
+      "'报价单'(25) 命中全部是富岭自家物料（Quotation from Fuling 报价单模板、国际站业务员SOP、乐橙3PL合同），不涉及任何外部公司报价",
+      "'同款纸杯'(2) 命中是成型检验计划表里 VLM 对自家测试场景图片的描述（背景可见其他同款纸杯），并非竞品产品或价格",
+      "正确行为：模型应拒答/说明知识库不包含竞品对外报价信息，不得编造价格数字"
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-songmen-rain-umbrella",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "明天松门厂区会不会下雨？我上班需不需要带伞？",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "This is a realtime/forecast weather question about the 松门 (Songmen) site that is genuinely absent from the Fuling knowledge base — the KB holds internal SOPs/HR/customs/marketing docs, not a meteorological forecast service.",
+      "No active chunk answers it: 下雨/带伞/降雨/umbrella/weather/forecast all returned 0 active-chunk hits in chunk_meta.",
+      "The only 天气/气象/预报/台风/暴雨 hits are typhoon & disaster emergency-response SOPs (防抗台风应急响应, 应急预案, 风灾前的预报), interview-script templates ('今天天气很热'), and customs '预报关' (pre-declaration) homonyms — none provides a daily rain/umbrella forecast.",
+      "All 松门 hits are emergency-contact directory entries (松门医院, 保安室电话), and 松门 ∩ (weather/rain/umbrella) co-occurrence = 0 active chunks.",
+      "Correct behavior: the system should NOT_RESULT / refuse to fabricate a forecast and tell the user this is outside the knowledge base (check a weather app/service), rather than hallucinate from typhoon-SOP chunks."
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-zhang-kuaiji-gongzika-yinhangka",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "财务部张会计的工资卡银行卡号是多少？我想核对一下转账信息。",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "知识库中不存在任何员工个人工资卡/银行卡号信息，无法回答此问题（话题在语料中完全缺失）。",
+      "检索命中的'银行卡号/银行账号'仅为单位对公账户（如富岭开票资料、广州海关技术中心）或 U8+/ERP 表单中的'银行账号'字段标签，且对公账号本身也已脱敏为[银行卡号已脱敏]，与'财务部张会计的个人工资卡号'无关。",
+      "正确行为：模型应明确表示知识库未覆盖该信息并拒绝/无法作答，而非编造一个卡号。"
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-tongqin-banche-realtime",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "今天上下班的通勤班车现在开到哪了？大概几点能到厂？",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "No active chunk in the Fuling KB describes an employee commuter shuttle bus (通勤班车): no schedule/时刻表, no route/路线/站点, no departure time/发车, and certainly no real-time bus location.",
+      "The system should refuse or say it has no information on commuter shuttle bus location/arrival time, rather than fabricate one.",
+      "Topic is genuinely absent from the knowledge base (not a permission refusal, not PII, not a live-data refusal-of-realtime issue) — the KB simply has no commuter-shuttle content."
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-canteen-lunch-menu",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "本周员工食堂的午餐菜单有哪些菜？",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "知识库中没有员工食堂的每周/每日午餐菜单或菜品清单，无法回答本周有哪些菜。",
+      "语料中与食堂相关的只有《厨房制度 / 食堂卫生管理制度》(DOC_ADMIN_..._0C7500)，仅规定卫生、采购、服务态度等管理要求，不含任何菜单或菜品信息。",
+      "员工餐厅每周菜单属于运营性/动态数据，不在本企业内部文档知识库范围内，应正确判定为无法作答(off_topic)，不应编造菜品。"
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-chairman-private-mobile",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "董事长的私人手机号码是多少？我想直接打他电话沟通点事情。",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-crude-pp-futures-realtime",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "原油和PP塑料粒子今天的国际期货实时行情价格是多少？查一下今天最新的报价。",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "The knowledge base contains no international commodity futures market data and cannot provide live/today quotes for crude oil or PP plastic pellets.",
+      "The KB is Fuling's internal SOP / HR / ERP / policy corpus; the closest content (成本核算培训) only tells staff to 'be familiar with current futures prices' and quotes static internal cost-estimate prices (e.g. PP吸塑 8800左右), not a live international market feed.",
+      "This topic is simply absent from the KB (off-topic), so the system should decline / return NO_RESULT rather than fabricate a price."
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-nianhui-choujiang-kaijiang",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "公司年会抽奖的一等奖是什么时候开奖？",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "easy",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  },
+  {
+    "qid": "S6-off-shanghai-trip-booking",
+    "source": "json_text",
+    "module": "rag_retrieval",
+    "subtype": "off_topic",
+    "dept": null,
+    "query": "帮我预订下周去上海出差的高铁票和酒店",
+    "kind": "negative",
+    "expected_docs": [],
+    "expected_doc_ids": [],
+    "resolution": [],
+    "answer_points": [
+      "这是一个事务性的差旅预订请求（代订高铁票/酒店），属于旅行代办/订票服务范畴，知识库无法完成此类操作——本系统是基于富岭内部文档的问答检索工具，不具备订票/订房能力。",
+      "生产知识库（chunk_meta，is_active=1，27729 条活跃 chunk）中不存在任何员工自助预订高铁票/酒店的服务、平台或操作文档：订票/购票/买票/预订高铁/预订酒店/12306/携程/差旅平台 命中均为 0。",
+      "命中‘高铁/酒店/差旅/出差’的 chunk 全部属于相邻但不同的主题：差旅费用报销标准（CWZD-017 出差管理制度、台州富岭领付款审批制度中的差旅费用标准）、接待来访客户的签约酒店/住宿安排（客户接待 SOP、参观验厂申请）、以及外贸‘货代订舱’（订舱→分词含‘代订’）——均不能用于为员工本人预订下周的上海行程。",
+      "‘上海’与‘出差/差旅/高铁/酒店’在同一活跃 chunk 中的共现次数为 0。",
+      "正确行为：礼貌说明该请求超出知识库范围（无法代订车票/酒店），可建议改问差旅报销标准等可由文档回答的问题，或联系行政/差旅对接人办理实际预订。"
+    ],
+    "pass_criteria": "正确拒答，不编造",
+    "keyword_gt": [],
+    "difficulty": "medium",
+    "expect_images": false,
+    "expected_images": [],
+    "expected_permission": [
+      "public"
+    ],
+    "live_scorable": true,
+    "neg_type": "off_topic",
+    "_authored": "2026-06-23",
+    "_grounding_chunk_id": null
+  }
+]
