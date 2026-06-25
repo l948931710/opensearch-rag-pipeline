@@ -186,7 +186,7 @@
   var BASE = location.origin;   // 同源：H5 与 API 同一主机
   var GROUP_LABEL = { finance:'财务', it:'信息技术', marketing:'营销', production:'生产', pmc:'计划PMC', admin:'行政', hr:'人力资源', rd:'研发', quality:'品质技术', supply:'资材供应' };
   var PERM_LABEL = { dept_internal:'仅本部门', public:'全公司', restricted:'受限' };
-  var BADGE_CLASS = { '已上线':'ok', '处理中':'busy', '排队中':'queue', '待审核':'warn', '处理失败':'fail', '已退役':'muted', '内容未变':'muted' };
+  var BADGE_CLASS = { '已上线':'ok', '处理中':'busy', '排队中':'queue', '待审核':'warn', '已隔离':'fail', '处理失败':'fail', '已退役':'muted', '内容未变':'muted' };
 
   function qs(name){ var m = new RegExp('[?&]' + name + '=([^&]+)').exec(location.search); return m ? decodeURIComponent(m[1]) : ''; }
 
@@ -205,7 +205,7 @@
         /** @type {Doc[]} */ docs: [], q: '', filter: '', sortKey: '', sortDir: 1,
         _docsSeq: 0, pendingVer: '', _searchTimer: null,
         /** @type {Pending[]} */ approvals: [], approvalBusy: false,
-        filters: [ {v:'',label:'全部'}, {v:'已上线',label:'已上线'}, {v:'处理中',label:'处理中'}, {v:'待审核',label:'待审核'}, {v:'已退役',label:'已退役'} ],
+        filters: [ {v:'',label:'全部'}, {v:'已上线',label:'已上线'}, {v:'处理中',label:'处理中'}, {v:'待审核',label:'待审核'}, {v:'已隔离',label:'已隔离'}, {v:'已退役',label:'已退役'} ],
         cols: [ {key:'title',label:'文档名'}, {key:'owner_dept',label:'归属'}, {key:'current_version_no',label:'版本'}, {key:'status_badge',label:'状态'}, {key:'updated_at',label:'更新'} ],
       };
     },

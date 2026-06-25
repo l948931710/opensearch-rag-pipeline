@@ -6,7 +6,7 @@ import { getVersionHistory, getDocStatus } from '../../utils/api';
 
 const BADGE_CLASS = {
   已上线: 'ok', 处理中: 'busy', 排队中: 'queue', 待审核: 'warn',
-  处理失败: 'fail', 已退役: 'muted', 内容未变: 'muted',
+  已隔离: 'fail', 处理失败: 'fail', 已退役: 'muted', 内容未变: 'muted',
 };
 const CPS_LABEL = {
   NOT_STARTED: '待处理', LOADING: '处理中', PROCESSING: '处理中', DONE: '已处理',

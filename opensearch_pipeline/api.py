@@ -1244,12 +1244,17 @@ class KbDocStatusResponse(BaseModel):
     error_message: str = ""
 
 
-def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None) -> str:
-    """把管线多字段折叠为用户可读三态+：排队中/处理中/已上线/处理失败/内容未变/已退役。"""
+def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
+                     publish_status=None) -> str:
+    """把管线多字段折叠为用户可读态：排队中/处理中/已上线/处理失败/内容未变/已隔离/已退役。"""
     cs = (content_status or "").upper()
     ix = (index_status or "").upper()
     if doc_status and str(doc_status).lower() not in ("active", ""):
         return "已退役"
+    # PII 隔离优先于"已上线"：隔离件的 index_status 可能残留 'SUCCESS'，但 chunk 已停用、不在检索中，
+    # 绝不能显示"已上线"（会被误读为可搜/已脱敏）。统一显示"已隔离"，等脱敏重灌。
+    if str(publish_status or "").upper() == "QUARANTINED":
+        return "已隔离"
     # 管线把 document_version.index_status 置 'SUCCESS'（非 'INDEXED'）作为上线成功值。
     if ix in ("INDEXED", "SUCCESS") and (chunk_active is None or chunk_active > 0):
         return "已上线"
@@ -1382,7 +1387,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
-                           v.content_process_status, v.index_status
+                           v.content_process_status, v.index_status, v.publish_status
                     FROM fuling_knowledge.document_meta m
                     LEFT JOIN fuling_knowledge.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -1405,12 +1410,12 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs) = r
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status),
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs),
             updated_at=str(updated) if updated else "",
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)

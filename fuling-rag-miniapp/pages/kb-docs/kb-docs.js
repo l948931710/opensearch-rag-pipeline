@@ -10,6 +10,7 @@ const BADGE_CLASS = {
   处理中: 'busy',
   排队中: 'queue',
   待审核: 'warn',
+  已隔离: 'fail',
   处理失败: 'fail',
   已退役: 'muted',
   内容未变: 'muted',
