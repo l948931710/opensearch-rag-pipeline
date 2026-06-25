@@ -1,11 +1,22 @@
 <script setup lang="ts">
+import { onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ShieldAlert } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
+import { useKb } from '@/composables/useKb'
+import UploadCard from '@/components/manage/UploadCard.vue'
+import ApprovalQueue from '@/components/manage/ApprovalQueue.vue'
+import DocTable from '@/components/manage/DocTable.vue'
 
-// P2：外壳占位 + 视图内权限自检（深链 /manage 的非管理员落「无权限」，而非静默跳转）。
-// 上传 / 台账 / 审批队列 / 退役在 P4 接入。AppShell 仅在 ready 后渲染，故此处 canManage 已解析。
+// 视图内权限自检（深链 /manage 的非管理员落「无权限」）；AppShell 仅在 ready 后渲染，故 canManage 已解析。
 const { canManage, identity } = storeToRefs(useSession())
+const { loadDocs, loadApprovals } = useKb()
+
+onMounted(() => {
+  if (!canManage.value) return
+  void loadDocs()
+  void loadApprovals()
+})
 </script>
 
 <template>
@@ -17,13 +28,14 @@ const { canManage, identity } = storeToRefs(useSession())
     </p>
   </div>
 
-  <div v-else class="mx-auto w-full max-w-5xl px-6 py-10">
+  <div v-else class="mx-auto w-full max-w-5xl space-y-5 px-6 py-8">
     <header class="flex items-baseline justify-between border-b border-border pb-4">
       <h1 class="text-xl font-extrabold tracking-tight text-foreground">知识库管理</h1>
       <span class="font-mono text-xs text-muted-foreground">{{ identity?.managedOwnerDepts.join(' · ') || '—' }}</span>
     </header>
-    <div class="mt-8 rounded-xl border border-dashed border-border bg-card/60 px-5 py-12 text-center text-sm text-muted-foreground">
-      <span class="font-mono text-xs">P4 · 上传 + 台账 + 审批队列 + 退役</span>
-    </div>
+
+    <ApprovalQueue />
+    <UploadCard />
+    <DocTable />
   </div>
 </template>

@@ -1,10 +1,17 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { createTestingPinia } from '@pinia/testing'
 import type { Identity } from '@/stores/session'
 import Sidebar from '@/components/shell/Sidebar.vue'
 import ManageView from '@/views/ManageView.vue'
 import { router } from '@/router'
+
+// ManageView 的 onMounted 会拉 my-docs/pending-approvals（canManage 时）——桩掉 fetch，
+// 避免真 fetch 泄漏到 teardown（AbortError 噪声）。
+beforeEach(() => {
+  vi.restoreAllMocks()
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ items: [], has_more: false }), text: async () => '{}' })))
+})
 
 function identity(over: Partial<Identity> = {}): Identity {
   return {
