@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+/* ════════════════════════════════════════════════════════════════════
+   富岭设计 tokens —— 三层 CSS-first（Tailwind v4）：
+   ① primitive（富岭原始色值，唯一真实来源）
+   ② semantic（shadcn 语义层；Figma Variables 只映射到这一层，不映射字面色）
+   ③ @theme inline（语义 → Tailwind utilities：bg-background / text-primary …）
+   换肤/对接 Figma：只改第 ① 层色值或第 ② 层指向，组件零改动。
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ── ① primitive ── */
+:root {
+  --fl-green:       #15604a;
+  --fl-green-deep:  #0e4435;
+  --fl-green-wash:  #e8f0ea;
+  --fl-ink:         #1b211d;
+  --fl-ink-2:       #56605a;
+  --fl-ink-3:       #8b948c;
+  --fl-paper:       #eceee8;
+  --fl-surface:     #ffffff;
+  --fl-surface-2:   #f6f7f3;
+  --fl-line:        #dee2d8;
+  --fl-line-2:      #cdd3c6;
+  --fl-st-live:  #15604a;  --fl-st-busy:  #a9760c;  --fl-st-queue: #79847a;
+  --fl-st-warn:  #2f6098;  --fl-st-fail:  #b3261e;  --fl-st-muted: #a7ada0;
+  --fl-mono: "DIN Alternate","SF Mono",ui-monospace,"Roboto Mono",Menlo,Consolas,monospace;
+  --fl-sans: -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+  --radius: 0.625rem;
+}
+
+/* ── ② semantic（shadcn 约定名）── */
+:root {
+  --background: var(--fl-paper);
+  --foreground: var(--fl-ink);
+  --card: var(--fl-surface);
+  --card-foreground: var(--fl-ink);
+  --popover: var(--fl-surface);
+  --popover-foreground: var(--fl-ink);
+  --primary: var(--fl-green);
+  --primary-foreground: #ffffff;
+  --secondary: var(--fl-surface-2);
+  --secondary-foreground: var(--fl-ink);
+  --muted: var(--fl-surface-2);
+  --muted-foreground: var(--fl-ink-3);
+  --accent: var(--fl-green-wash);
+  --accent-foreground: var(--fl-green-deep);
+  --destructive: var(--fl-st-fail);
+  --destructive-foreground: #ffffff;
+  --border: var(--fl-line);
+  --input: var(--fl-line-2);
+  --ring: var(--fl-green);
+}
+
+/* ── ③ semantic → Tailwind utilities ── */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  /* 富岭专属语义（状态书脊用，问答/台账复用） */
+  --color-st-live:  var(--fl-st-live);
+  --color-st-busy:  var(--fl-st-busy);
+  --color-st-queue: var(--fl-st-queue);
+  --color-st-warn:  var(--fl-st-warn);
+  --color-st-fail:  var(--fl-st-fail);
+  --color-st-muted: var(--fl-st-muted);
+  --font-sans: var(--fl-sans);
+  --font-mono: var(--fl-mono);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+* { -webkit-tap-highlight-color: transparent; }
+body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--fl-sans); -webkit-font-smoothing: antialiased; }

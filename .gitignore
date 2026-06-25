@@ -76,3 +76,8 @@ CLAUDE.md
 一期模型评测集和评测模板_v2.0(1).xlsx
 .env.metrics
 reports/
+
+# Vite console build
+console-app/node_modules/
+console-app/dist/
+opensearch_pipeline/webconsole/next-dist/
