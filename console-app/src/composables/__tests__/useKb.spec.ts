@@ -131,6 +131,23 @@ describe('useKb 上传（两段式：upload-url → PUT → register）', () => 
   })
 })
 
+describe('useKb.applyPendingVersion — 升版深链落地（parity-1/3）', () => {
+  it('命中已加载文档 → 进升版态（继承该行）', async () => {
+    const d: DocItem = { doc_id: 'd1', title: '年假制度', original_filename: '', owner_dept: 'hr', permission_level: 'dept_internal', current_version_no: 2, status: 'active', status_badge: '已上线', updated_at: '' }
+    vi.stubGlobal('fetch', routeFetch({ myDocs: jsonResp({ items: [d], has_more: false }) }))
+    const kb = useKb()
+    await kb.loadDocs()
+    kb.applyPendingVersion({ docId: 'd1', owner: 'hr', title: '年假制度' })
+    expect(kb.verCtx.value).toMatchObject({ doc_id: 'd1', owner_dept: 'hr', permission_level: 'dept_internal', current_version_no: 2 })
+  })
+
+  it('列表外文档（>50/旧）→ 合成 verCtx，perm 留空交后端继承', () => {
+    const kb = useKb()
+    kb.applyPendingVersion({ docId: 'DOC_OLD', owner: 'finance', title: '历史制度' })
+    expect(kb.verCtx.value).toMatchObject({ doc_id: 'DOC_OLD', owner_dept: 'finance', title: '历史制度', permission_level: '', current_version_no: 0 })
+  })
+})
+
 describe('useKb.retire', () => {
   it('成功 → 行徽章变已退役', async () => {
     const d: DocItem = { doc_id: 'd1', title: 'x', original_filename: '', owner_dept: 'hr', permission_level: 'dept_internal', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '' }

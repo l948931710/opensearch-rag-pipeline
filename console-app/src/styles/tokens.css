@@ -88,6 +88,16 @@
 * { -webkit-tap-highlight-color: transparent; }
 body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--fl-sans); -webkit-font-smoothing: antialiased; }
 
+/* 无障碍：尊重「减少动态效果」——关掉过渡/动画/平滑滚动（侧栏展开、fade、按钮 scale、loading 跳点等） */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* 答案 markdown（renderMd 产出，经 v-html 注入——故不能用 scoped；内容已转义防注入） */
 .md > * { margin: 0; }
 .md > * + * { margin-top: 0.55rem; }

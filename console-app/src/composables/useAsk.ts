@@ -201,6 +201,14 @@ function retry(m: ChatMessage): void {
   void ask(m.question, true)
 }
 
+/** 新会话：作废在途流、清空线程与服务端会话关联（下次提问重新建会话）。 */
+function resetThread(): void {
+  if (asking.value) stop()
+  messages.value = []
+  draft.value = ''
+  qaSession = ''
+}
+
 async function vote(m: ChatMessage, type: 'upvote' | 'downvote'): Promise<void> {
   if (m.voted || !m.messageId) return
   m.voted = type === 'upvote' ? 'up' : 'down'   // 乐观置态
@@ -268,7 +276,7 @@ async function loadHotQuestions(): Promise<void> {
 export function useAsk() {
   return {
     messages, asking, draft, hotQuestions,
-    ask, stop, retry, vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions,
+    ask, stop, retry, resetThread, vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions,
   }
 }
 

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
+import { useRouter } from 'vue-router'
 import { useSession } from '@/stores/session'
-import { useAuth } from '@/composables/useAuth'
+import { useAuth, hasPendingVersion } from '@/composables/useAuth'
 import AppShell from '@/components/shell/AppShell.vue'
 
 // 唯一在此触发免登 init（修正#6）。store/router 不再各自触发。
@@ -10,7 +11,11 @@ import AppShell from '@/components/shell/AppShell.vue'
 const session = useSession()
 const { ready, error } = storeToRefs(session)
 const { init } = useAuth()
+const router = useRouter()
 onMounted(() => { void init() })
+
+// 升版深链（小程序「上传新版本」?doc_id=...）：就绪后若有待处理升版，路由到 /manage 让 ManageView 消费。
+watch(ready, (r) => { if (r && hasPendingVersion() && session.canManage) void router.push('/manage') }, { immediate: true })
 </script>
 
 <template>

@@ -3,6 +3,7 @@ import { onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ShieldAlert } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
+import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
 import UploadCard from '@/components/manage/UploadCard.vue'
 import ApprovalQueue from '@/components/manage/ApprovalQueue.vue'
@@ -10,12 +11,15 @@ import DocTable from '@/components/manage/DocTable.vue'
 
 // 视图内权限自检（深链 /manage 的非管理员落「无权限」）；AppShell 仅在 ready 后渲染，故 canManage 已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { loadDocs, loadApprovals } = useKb()
+const { loadDocs, loadApprovals, applyPendingVersion } = useKb()
 
-onMounted(() => {
+onMounted(async () => {
   if (!canManage.value) return
-  void loadDocs()
+  await loadDocs()
   void loadApprovals()
+  // 升版深链：文档加载后消费一次（命中行→进升版态；列表外→合成 verCtx，perm 交后端继承）。
+  const p = consumePendingVersion()
+  if (p) applyPendingVersion(p)
 })
 </script>
 

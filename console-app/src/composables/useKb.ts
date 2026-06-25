@@ -118,6 +118,19 @@ function enterVersionMode(d: DocItem) {
 }
 function exitVersionMode() { verCtx.value = null }
 
+/**
+ * 升版深链落地（小程序「上传新版本」→ ?doc_id=&owner=&title=）：命中已加载文档则正常进升版态；
+ * 列表外（>50 / 旧文档）则用 doc_id+owner+title 合成 verCtx，permission_level 留空交后端强制继承
+ * （action=version 时后端忽略客户端 perm）。补回 parity-1/3 丢失的能力。
+ */
+function applyPendingVersion(p: { docId: string; owner: string; title: string }) {
+  const doc = docs.value.find((d) => d.doc_id === p.docId)
+  if (doc) { enterVersionMode(doc); return }
+  verCtx.value = { doc_id: p.docId, title: p.title || p.docId, owner_dept: p.owner, permission_level: '', current_version_no: 0 }
+  newTitle.value = ''; dupWarn.value = ''; contentDupMsg.value = ''; uploadErr.value = ''; uploadMsg.value = ''
+  selectedFiles = []; selectedNames.value = []
+}
+
 // ── 选文件：预检 + 文件名级查重 ──
 async function onFileSelected(list: FileList | null) {
   uploadErr.value = ''; uploadMsg.value = ''; contentDupMsg.value = ''; uploadQueue.value = []
@@ -267,7 +280,7 @@ export function useKb() {
     ownerDepts, isKbAdmin,
     // 方法
     loadDocs, setQuery, loadApprovals, sortBy, countOf,
-    enterVersionMode, exitVersionMode, onFileSelected, doUpload,
+    enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire,
   }
 }

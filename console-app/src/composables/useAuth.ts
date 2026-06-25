@@ -60,22 +60,35 @@ let _stashedToken = ''
 let _capturedName = ''
 let _captured = false
 
+/** 升版深链暂存（小程序「上传新版本」→ /console-next/?doc_id=&owner=&title=）。 */
+export interface PendingVersion { docId: string; owner: string; title: string }
+let _pendingVersion: PendingVersion | null = null
+
 /**
- * 【最早期】从 URL 捕获透传令牌（小程序 web-view 的 ?token=）→ 暂存 + 立即抹除（修正#4）。
+ * 【最早期】从 URL 捕获透传令牌（?token=）与升版深链（?doc_id=&owner=&title=）→ 暂存 + 立即抹除（修正#4）。
  * 关键时序：必须在 `@/router` 被 import（createWebHistory 读 location）【之前】执行 ——
  * 故由 `@/boot/capture` 作为 main.ts 第一个 import 触发。否则 router 在模块加载时就快照了带
- * token 的 URL，并在初始导航 finalize 时把 token 写回地址栏（token 重新出现在历史/日志/截图）。
+ * token 的 URL，并在初始导航 finalize 时把这些参数写回地址栏（token 重新出现在历史/日志/截图）。
  * 此刻 Pinia 可能还没创建，所以只暂存到模块变量、不碰 store；token 由 doLogin 再注入 store。
- * 幂等：_captured 守卫 + 抹除后 URL 已无 token，重复调用 no-op（init 起始也会再调一次兜底）。
+ * 幂等：_captured 守卫 + 抹除后 URL 已无这些参数，重复调用 no-op（init 起始也会再调一次兜底）。
  */
 export function captureUrlCredential(): void {
   if (_captured) return
   _captured = true
   const urlToken = qs('token')
-  if (!urlToken) return
-  _stashedToken = urlToken
-  _capturedName = qs('name')
-  scrubUrl(['token', 'name'])   // 先抹除，再发任何请求（whoami 的 Referer 里也不含 token）
+  const docId = qs('doc_id')
+  if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name') }
+  if (docId) _pendingVersion = { docId, owner: qs('owner'), title: qs('title') }   // 小程序升版深链
+  if (urlToken || docId) scrubUrl(['token', 'name', 'doc_id', 'owner', 'title'])   // 先抹除，再发任何请求
+}
+
+/** 是否有待处理的升版深链（App 据此在就绪后路由到 /manage）。不清除。 */
+export function hasPendingVersion(): boolean { return !!_pendingVersion }
+/** 取走升版深链（ManageView 加载文档后消费一次）。 */
+export function consumePendingVersion(): PendingVersion | null {
+  const p = _pendingVersion
+  _pendingVersion = null
+  return p
 }
 
 /**
@@ -146,4 +159,5 @@ export function __resetInitGuard() {
   _captured = false
   _stashedToken = ''
   _capturedName = ''
+  _pendingVersion = null
 }

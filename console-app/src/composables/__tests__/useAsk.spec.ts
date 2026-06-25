@@ -160,6 +160,23 @@ describe('useAsk.vote — 乐观置态 + 失败回滚', () => {
   })
 })
 
+describe('useAsk.resetThread — 新会话（parity-6）', () => {
+  it('清空线程 + 草稿（下次提问重建会话）', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp([
+      frame({ type: 'session', session_id: 's', message_id: 'm' }),
+      frame({ type: 'chunk', content: 'hi' }),
+      frame({ type: 'done', model: 'q', usage: {}, guard: false }), DONE,
+    ])))
+    const { ask, resetThread, messages, draft } = useAsk()
+    await ask('问一下')
+    expect(messages.value.length).toBeGreaterThan(0)
+    draft.value = '半句草稿'
+    resetThread()
+    expect(messages.value).toEqual([])
+    expect(draft.value).toBe('')
+  })
+})
+
 describe('useAsk.retry — 移除错误卡并用原问句重发', () => {
   it('错误后 retry 复用 question', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => 'boom' }))
