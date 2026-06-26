@@ -1,44 +1,58 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { ChevronDown } from 'lucide-vue-next'
+import { FileText } from 'lucide-vue-next'
 import type { SourceRow } from '@/composables/useAsk'
 
-// 折叠的参考来源；高/中/低用状态色印记（以服务端 level 为准）。
+// Atlas 式来源：一排「来源」chip（文件图标 + 标题 + 章节 + 相关度点）；点击展开该来源详情卡
+// （相关度条 + 档位/分数 + 正文省略版）。同一时间只展开一条。
 defineProps<{ sources: SourceRow[] }>()
-const open = ref(false)
+const openIdx = ref<number | null>(null)
+function toggle(idx: number) { openIdx.value = openIdx.value === idx ? null : idx }
 
-const PILL: Record<string, string> = {
-  high: 'text-st-live bg-st-live/12',
-  mid: 'text-st-busy bg-st-busy/12',
-  low: 'text-st-queue bg-st-queue/12',
-}
+const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low: 'bg-st-queue' }
+// 相关度条按档位填充（score 量纲随 rerank 开关变化，故用档位画条、原始分数另显）。
+const BAR: Record<string, string> = { high: 'w-[92%] bg-st-live', mid: 'w-[64%] bg-st-busy', low: 'w-[40%] bg-st-queue' }
 </script>
 
 <template>
-  <div class="mt-3 overflow-hidden rounded-xl border border-border bg-panel/50">
-    <button
-      type="button"
-      class="flex w-full items-center justify-between px-3.5 py-2.5 text-xs font-medium text-muted-foreground transition hover:text-foreground"
-      @click="open = !open"
-    >
-      <span class="inline-flex items-center gap-1.5">
-        参考来源
-        <span class="rounded bg-accent-soft px-1.5 py-0.5 font-mono text-accent-text">{{ sources.length }}</span>
-      </span>
-      <ChevronDown :size="14" :stroke-width="2" class="transition-transform" :class="{ 'rotate-180': open }" />
-    </button>
-    <div v-show="open" class="border-t border-border px-1.5 py-1.5">
-      <div
-        v-for="s in sources" :key="s.idx"
-        class="flex items-start gap-3 rounded-lg px-2 py-2 transition hover:bg-surface"
+  <div class="mt-3.5">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-[11px] font-bold uppercase tracking-[0.06em] text-faint">来源</span>
+      <button
+        v-for="s in sources" :key="s.idx" type="button"
+        class="inline-flex max-w-[20rem] items-center gap-2 rounded-lg border bg-surface px-2.5 py-1.5 text-xs transition hover:border-border-strong"
+        :class="openIdx === s.idx ? 'border-border-strong' : 'border-border'"
+        :aria-expanded="openIdx === s.idx" @click="toggle(s.idx)"
       >
-        <span class="mt-px grid size-5 shrink-0 place-items-center rounded-md bg-accent-soft font-mono text-[11px] font-medium text-accent-text">{{ s.idx }}</span>
-        <div class="min-w-0 flex-1">
-          <div class="truncate text-sm text-foreground">{{ s.title }}</div>
-          <div v-if="s.section" class="truncate text-xs text-muted-foreground">{{ s.section }}</div>
-        </div>
-        <span class="shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium" :class="PILL[s.level]">相关度{{ s.levelLabel }}</span>
-      </div>
+        <span class="size-1.5 shrink-0 rounded-full" :class="DOT[s.level]" />
+        <FileText :size="13" :stroke-width="1.7" class="shrink-0 text-accent-text" />
+        <span class="truncate font-medium text-foreground">{{ s.title }}</span>
+        <span v-if="s.section" class="shrink-0 text-faint">· {{ s.section }}</span>
+      </button>
     </div>
+
+    <!-- 来源详情（Atlas「Retrieved sources」面板内联版） -->
+    <template v-for="s in sources" :key="'d' + s.idx">
+      <div v-if="openIdx === s.idx" class="mt-2 rounded-[13px] border border-border bg-panel p-3.5">
+        <div class="flex items-center gap-2.5">
+          <span class="grid size-7 shrink-0 place-items-center rounded-lg bg-accent-soft text-accent-text">
+            <FileText :size="14" :stroke-width="1.7" />
+          </span>
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[13px] font-semibold text-foreground">{{ s.title }}</div>
+            <div v-if="s.section" class="truncate text-[11.5px] text-faint">{{ s.section }}</div>
+          </div>
+        </div>
+        <div class="mt-3 flex items-center gap-2.5">
+          <span class="text-[10.5px] font-bold uppercase tracking-[0.03em] text-faint">相关度</span>
+          <span class="h-[5px] flex-1 overflow-hidden rounded-full bg-border">
+            <span class="block h-full rounded-full" :class="BAR[s.level]" />
+          </span>
+          <span class="font-mono text-[11.5px] font-semibold text-accent-text">{{ s.levelLabel }} · {{ s.score.toFixed(2) }}</span>
+        </div>
+        <p v-if="s.preview" class="mt-3 text-[12.5px] italic leading-relaxed text-muted-foreground">“{{ s.preview }}”</p>
+        <p class="mt-2.5 text-[11px] leading-relaxed text-faint">该片段取自你已索引的文档、作为上下文喂给模型；按部门权限过滤。</p>
+      </div>
+    </template>
   </div>
 </template>

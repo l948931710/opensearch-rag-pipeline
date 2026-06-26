@@ -8,7 +8,7 @@ import StatusPill from './StatusPill.vue'
 const {
   verCtx, newTitle, newOwner, newPerm, ownerDepts, selectedNames,
   dupWarn, uploadBusy, uploadMsg, uploadErr, uploadOk, contentDupMsg, uploadQueue,
-  onFileSelected, doUpload, exitVersionMode,
+  onFileSelected, doUpload, exitVersionMode, maxUploadMb,
 } = useKb()
 
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -26,7 +26,7 @@ function onDrop(e: DragEvent) {
 <template>
   <section class="rounded-[15px] border border-border bg-card p-[18px]">
     <div class="flex items-center gap-2.5">
-      <UploadCloud :size="18" :stroke-width="1.8" class="text-accent-text" />
+      <UploadCloud :size="18" :stroke-width="1.75" class="text-accent-text" />
       <h2 class="text-[14.5px] font-semibold text-foreground">{{ verCtx ? '上传新版本' : '上传文档' }}</h2>
       <span v-if="verCtx" class="rounded-md border border-st-busy/30 bg-st-busy/[0.14] px-2 py-0.5 text-[11px] font-semibold text-st-busy">升版模式</span>
       <div class="flex-1" />
@@ -57,11 +57,11 @@ function onDrop(e: DragEvent) {
         @drop.prevent="onDrop"
       >
         <span class="grid size-[42px] shrink-0 place-items-center rounded-[11px] border border-border bg-surface text-accent-text">
-          <FileUp :size="20" :stroke-width="1.8" />
+          <FileUp :size="20" :stroke-width="1.75" />
         </span>
         <span class="min-w-0 flex-1">
           <span class="block text-sm font-semibold text-foreground">{{ dragging ? '松开以选择文件' : '拖拽文件到此，或点击选择' }}</span>
-          <span class="mt-0.5 block text-xs text-faint">{{ verCtx ? '仅需选择 1 个文件作为新版本' : '支持批量 · PDF / DOCX / XLSX / PPTX / JPG / PNG · 单文件 ≤ 50MB' }}</span>
+          <span class="mt-0.5 block text-xs text-faint">{{ verCtx ? '仅需选择 1 个文件作为新版本' : `支持批量 · PDF / DOCX / XLSX / PPTX / JPG / PNG · 单文件 ≤ ${maxUploadMb}MB` }}</span>
         </span>
         <span class="shrink-0 rounded-[9px] border border-border bg-surface px-[15px] py-2 text-[12.5px] font-semibold text-accent-text">选择文件</span>
       </button>
@@ -69,7 +69,7 @@ function onDrop(e: DragEvent) {
         <span v-for="(n, i) in selectedNames" :key="i" class="inline-flex max-w-full items-center rounded bg-secondary px-2 py-1 text-xs text-foreground">
           <span class="truncate">{{ n }}</span>
         </span>
-        <button type="button" class="grid size-6 place-items-center rounded text-muted-foreground transition hover:bg-secondary hover:text-foreground" title="清空" @click="clearFiles">
+        <button type="button" class="grid size-6 place-items-center rounded text-muted-foreground transition hover:bg-secondary hover:text-foreground" title="清空" aria-label="清空已选文件" @click="clearFiles">
           <X :size="13" :stroke-width="2" />
         </button>
       </div>
@@ -121,7 +121,7 @@ function onDrop(e: DragEvent) {
       <div v-for="(row, i) in uploadQueue" :key="i" class="rounded-lg border border-border bg-secondary/30 px-3 py-2">
         <div class="flex items-center justify-between gap-2 text-sm">
           <span class="min-w-0 flex-1 truncate text-foreground">{{ row.name }}</span>
-          <StatusPill :badge="row.status" />
+          <StatusPill :badge="row.status" kind="queue" />
           <span class="shrink-0 text-xs text-muted-foreground">{{ row.msg }}</span>
         </div>
         <p v-if="row.dupMsg" class="mt-1 text-xs text-st-warn">{{ row.dupMsg }}</p>

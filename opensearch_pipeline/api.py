@@ -194,6 +194,8 @@ class SourceInfo(BaseModel):
     # 相关度档位 'high'|'mid'|'low'（与 prompt 高/中/低 同源，见 llm_generator.score_level）。
     # rerank 开启后 score 为 0-1 量纲，客户端必须用本字段、不可按融合阈值重算。
     level: str = ""
+    # 正文省略版（折叠空白 + 截断的 chunk_text）：供前端「点击来源看正文」。已脱敏、已权限过滤。
+    preview: str = ""
 
 
 class AskResponse(BaseModel):
@@ -1370,6 +1372,9 @@ class KbWhoamiResponse(BaseModel):
     role: str = "employee"
     can_manage_kb: bool = False
     managed_owner_depts: List[str] = Field(default_factory=list)
+    # 用户所属 ACL 读权限组（仅展示/审计，写授权不据此推导）。与 /api/auth/dingtalk 的 acl_groups 同源，
+    # 补齐后 web-view ?token= 直登路径也能拿到部门信息（员工概览「我的部门」依赖它）。
+    acl_groups: List[str] = Field(default_factory=list)
 
 
 @app.get("/api/kb/whoami", response_model=KbWhoamiResponse)
@@ -1385,6 +1390,7 @@ def kb_whoami(request: Request, identity: Optional[Identity] = Depends(current_i
     return KbWhoamiResponse(
         user_id=kb.user_id, display_name=kb.name or "", role=kb.role,
         can_manage_kb=can_access_console(kb), managed_owner_depts=managed_owner_depts(kb),
+        acl_groups=list(kb.acl_groups),
     )
 
 
@@ -1468,6 +1474,76 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             updated_at=str(updated) if updated else "",
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
+
+
+class KbStatsResponse(BaseModel):
+    total: int = 0
+    active: int = 0
+    retired: int = 0
+    by_badge: Dict[str, int] = Field(default_factory=dict)
+
+
+@app.get("/api/kb/stats", response_model=KbStatsResponse)
+def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """管理范围内文档聚合（真实总数 + 状态分布），不受 my-docs 的 50 上限影响。
+
+    只读、按 owner 作用域过滤（与 my-docs 同一 _kb_owner_scope_sql，不会越权统计他部门）；
+    徽章在 Python 端按与 my-docs 相同的 _kb_status_badge 复算，故口径一致。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT m.status, v.content_process_status, v.index_status, v.publish_status
+                    FROM fuling_knowledge.document_meta m
+                    LEFT JOIN fuling_knowledge.document_version v
+                      ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
+                    WHERE 1=1 {clause}
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_stats 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"统计查询失败 (trace: {trace_id})")
+    active = retired = 0
+    by_badge: Dict[str, int] = {}
+    for row in rows:
+        status, cps, ixs, pubs = row[0], row[1], row[2], row[3]
+        if (status or "active") == "active":
+            active += 1
+        else:
+            retired += 1
+        badge = _kb_status_badge(cps, ixs, status, publish_status=pubs)
+        by_badge[badge] = by_badge.get(badge, 0) + 1
+    return KbStatsResponse(total=len(rows), active=active, retired=retired, by_badge=by_badge)
+
+
+class KbConfigResponse(BaseModel):
+    max_upload_bytes: int = 0
+    accepted_exts: List[str] = Field(default_factory=list)
+
+
+@app.get("/api/kb/config", response_model=KbConfigResponse)
+def kb_config(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """前端能力配置（上传上限/受理类型）—— 后端权威，省得客户端硬编码 50MB/类型导致"传完才 413"漂移。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    from opensearch_pipeline.kb_upload import MAX_UPLOAD_BYTES, _PHASE1_EXTS
+    return KbConfigResponse(
+        max_upload_bytes=int(MAX_UPLOAD_BYTES),
+        accepted_exts=sorted(_PHASE1_EXTS),
+    )
 
 
 @app.get("/api/kb/version-history", response_model=KbVersionHistoryResponse)

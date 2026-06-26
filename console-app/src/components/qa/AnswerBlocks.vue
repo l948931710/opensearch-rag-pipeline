@@ -19,7 +19,7 @@ const m = props.message
       <figure v-else class="my-3">
         <img
           v-if="!b.failed"
-          :src="b.url" :alt="b.alt"
+          :src="b.url" :alt="b.alt || '答案配图'"
           class="max-w-full cursor-zoom-in rounded-lg border border-border"
           @click="preview(b)" @error="imgFailed(m, bi)"
         />

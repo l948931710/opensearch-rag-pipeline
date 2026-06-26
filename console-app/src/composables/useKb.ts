@@ -21,6 +21,12 @@ export interface QueueRow { name: string; status: string; pct: number; msg: stri
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
 interface MyDocsResp { items: DocItem[]; has_more: boolean }
+export interface KbStats { total: number; active: number; retired: number; by_badge: Record<string, number> }
+export interface KbConfig { max_upload_bytes: number; accepted_exts: string[] }
+export interface VersionItem {
+  version_no: number; content_process_status: string; chunk_status: string
+  index_status: string; publish_status: string; status_badge: string; error_message: string; created_at: string
+}
 interface UploadUrlResp { upload_token: string; put_url: string; raw_key: string; doc_id: string; expires_in: number; requires_kb_admin_approval: boolean }
 interface RegisterResp { doc_id: string; version_no: number; content_process_status: string; requires_kb_admin_approval: boolean; status_badge: string; idempotent: boolean; title: string; content_dups: DupDoc[]; content_dups_other: number }
 interface DocStatusResp { status_badge: string; chunk_active: number; error_message: string }
@@ -30,6 +36,11 @@ export type SortKey = 'updated_at' | 'current_version_no' | 'title' | 'owner_dep
 
 // ── 状态 ──
 const docs = ref<DocItem[]>([])
+const kbStats = ref<KbStats | null>(null)   // 全作用域聚合（真实总数/状态分布，不受 my-docs 50 上限影响）
+const kbConfig = ref<KbConfig | null>(null) // 后端能力配置（上传上限/类型）；缺省用常量兜底
+const maxUploadBytes = computed(() => kbConfig.value?.max_upload_bytes || MAX_UPLOAD_MB * 1048576)
+const maxUploadMb = computed(() => Math.round(maxUploadBytes.value / 1048576))
+const verHistory = ref<{ doc: DocItem | null; versions: VersionItem[]; loading: boolean; error: string } | null>(null)
 const approvals = ref<PendingItem[]>([])
 const loadingDocs = ref(false)
 const q = ref('')
@@ -95,6 +106,26 @@ async function loadDocs() {
     docs.value = r.items || []
   } catch { /* 保留旧表 */ } finally { if (seq === docsSeq) loadingDocs.value = false }
 }
+
+async function loadStats() {
+  // 概览真实口径（总数/状态分布）；失败则前端兜底用已加载文档计数（docs.length / countOf）。
+  try { kbStats.value = await apiJson<KbStats>('/api/kb/stats', { auth: true }) } catch { /* 兜底 */ }
+}
+
+async function loadConfig() {
+  // 上传上限/类型走后端权威，避免硬编码漂移（失败则用 MAX_UPLOAD_MB 常量兜底）。
+  try { kbConfig.value = await apiJson<KbConfig>('/api/kb/config', { auth: true }) } catch { /* 兜底 */ }
+}
+
+// 版本历史（点击文档行「历史」）：拉 /api/kb/version-history（后端现成）。
+async function openHistory(d: DocItem) {
+  verHistory.value = { doc: d, versions: [], loading: true, error: '' }
+  try {
+    const r = await apiJson<{ versions: VersionItem[] }>(`/api/kb/version-history?doc_id=${encodeURIComponent(d.doc_id)}`, { auth: true })
+    verHistory.value = { doc: d, versions: r.versions || [], loading: false, error: '' }
+  } catch { verHistory.value = { doc: d, versions: [], loading: false, error: '版本历史加载失败' } }
+}
+function closeHistory() { verHistory.value = null }
 
 function setQuery(v: string) {
   q.value = v
@@ -178,7 +209,7 @@ function trackStatus(docId: string, versionNo: number) {
 async function uploadSingle(file: File) {
   uploadErr.value = ''; uploadMsg.value = ''; uploadOk.value = false; contentDupMsg.value = ''
   if (file.size <= 0) { uploadErr.value = '所选文件为空。'; return }
-  if (file.size > MAX_UPLOAD_MB * 1048576) { uploadErr.value = `文件 ${(file.size / 1048576).toFixed(1)}MB，超过上限 ${MAX_UPLOAD_MB}MB，请压缩或拆分。`; return }
+  if (file.size > maxUploadBytes.value) { uploadErr.value = `文件 ${(file.size / 1048576).toFixed(1)}MB，超过上限 ${maxUploadMb.value}MB，请压缩或拆分。`; return }
   trackSeq++                                        // 作废上一轮轮询
   uploadBusy.value = true
   try {
@@ -211,7 +242,7 @@ async function uploadBatch(files: File[]) {
   let okN = 0, badN = 0
   for (let i = 0; i < files.length; i++) {
     const f = files[i], row = rows[i]
-    if (f.size <= 0 || f.size > MAX_UPLOAD_MB * 1048576) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : '超过 50MB'; badN++; continue }
+    if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; continue }
     try {
       row.status = '上传中'
       const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify({ action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: newPerm.value }) })
@@ -277,9 +308,9 @@ export function useKb() {
     docs, filtered, approvals, loadingDocs, q, filter, sortKey, sortDir,
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
-    ownerDepts, isKbAdmin,
+    ownerDepts, isKbAdmin, kbStats, kbConfig, maxUploadMb, verHistory,
     // 方法
-    loadDocs, setQuery, loadApprovals, sortBy, countOf,
+    loadDocs, loadStats, loadConfig, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire,
   }
@@ -287,7 +318,7 @@ export function useKb() {
 
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
-  docs.value = []; approvals.value = []; loadingDocs.value = false
+  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; loadingDocs.value = false
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false

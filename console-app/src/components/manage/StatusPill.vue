@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { badgeTone } from '@/lib/kb'
+import { badgeTone, qBadgeTone } from '@/lib/kb'
 
-// 文档状态徽章：文案来自后端 status_badge，颜色由 badgeTone 映射到 st-* 语义色。
-const props = defineProps<{ badge: string }>()
+// 状态徽章：文案直显，颜色按 kind 取语义色 —— 文档徽章走 badgeTone，批量上传队列态走 qBadgeTone。
+const props = defineProps<{ badge: string; kind?: 'doc' | 'queue' }>()
 const TONE: Record<string, string> = {
   live: 'text-st-live bg-st-live/10',
   busy: 'text-st-busy bg-st-busy/10',
@@ -12,7 +12,7 @@ const TONE: Record<string, string> = {
   fail: 'text-st-fail bg-st-fail/10',
   muted: 'text-st-muted bg-st-muted/10',
 }
-const cls = computed(() => TONE[badgeTone(props.badge)] || TONE.muted)
+const cls = computed(() => TONE[(props.kind === 'queue' ? qBadgeTone : badgeTone)(props.badge)] || TONE.muted)
 </script>
 
 <template>

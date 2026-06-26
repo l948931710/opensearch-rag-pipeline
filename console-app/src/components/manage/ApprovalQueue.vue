@@ -19,7 +19,7 @@ function onReject(d: PendingItem) {
     <div class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 橙头 -->
       <div class="flex items-center gap-2.5 border-b border-border bg-st-busy/[0.07] px-[18px] py-3">
-        <Clock :size="16" :stroke-width="1.9" class="text-st-busy" />
+        <Clock :size="16" :stroke-width="1.75" class="text-st-busy" />
         <span class="text-sm font-semibold text-foreground">待审批队列</span>
         <span class="rounded-full bg-st-busy px-2 py-px text-[11px] font-bold text-white">{{ approvals.length }}</span>
         <div class="flex-1" />
@@ -31,7 +31,7 @@ function onReject(d: PendingItem) {
         class="flex flex-wrap items-center gap-x-3.5 gap-y-2 border-t border-border px-[18px] py-3 first:border-t-0"
       >
         <span class="grid size-8 shrink-0 place-items-center rounded-lg bg-accent-soft text-accent-text">
-          <FileText :size="16" :stroke-width="1.7" />
+          <FileText :size="16" :stroke-width="1.75" />
         </span>
         <div class="min-w-0 flex-1">
           <div class="truncate text-[13.5px] font-semibold text-foreground">{{ d.title || d.original_filename || d.doc_id }}</div>

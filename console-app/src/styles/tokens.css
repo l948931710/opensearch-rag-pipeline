@@ -116,6 +116,12 @@
 html { color-scheme: light dark; }
 [data-theme="dark"] { color-scheme: dark; }
 [data-theme="light"] { color-scheme: light; }
+
+/* 无障碍：键盘焦点环（:focus-visible 仅键盘导航可见，鼠标点击不出环；outline 自动贴合圆角） */
+:where(button, a[href], [role="button"], summary):focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
 body {
   margin: 0; color: var(--text);
   font-family: var(--font-body);
@@ -170,13 +176,13 @@ body {
   align-items: center;
   gap: 12px;
 }
-.led-head { padding: 0 14px 8px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
-.led-row { padding: 12px 14px; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+.led-head { padding: 11px 16px; font-size: 11px; font-weight: 700; letter-spacing: .035em; color: var(--faint); border-bottom: 1px solid var(--border); }
+.led-row { padding: 12px 16px; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
 .led-row:last-child { border-bottom: none; }
 .led-row:hover { background: color-mix(in srgb, var(--panel) 60%, transparent); }
 .led-row[data-retired="1"] { opacity: .5; }
 .led-row[data-retired="1"]:hover { opacity: .85; }
-.led-sort { cursor: pointer; user-select: none; }
+.led-sort { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; user-select: none; }
 .led-sort:hover { color: var(--text); }
 .led-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
 .doc-actions { opacity: 0; transition: opacity .13s; }

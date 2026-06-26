@@ -19,8 +19,12 @@ const m = props.message
     </div>
   </div>
 
-  <!-- AI -->
-  <div v-else class="msg-row group/msg max-w-full">
+  <!-- AI（Atlas 式：左侧 30px 星标头像 + 内容列） -->
+  <div v-else class="msg-row group/msg flex gap-3.5">
+    <span class="mt-px grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-accent-strong" aria-hidden="true">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="var(--primary-foreground)" aria-hidden="true" focusable="false"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
+    </span>
+    <div class="min-w-0 flex-1 pt-0.5">
     <!-- 加载骨架 -->
     <div v-if="m.loading" class="flex items-center gap-2 py-1 text-sm text-muted-foreground">
       <span class="flex gap-1">
@@ -79,5 +83,6 @@ const m = props.message
       <SourceList v-if="m.sources && m.sources.length" :sources="m.sources" />
       <FeedbackBar v-if="m.messageId" :message="m" />
     </template>
+    </div>
   </div>
 </template>

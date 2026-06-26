@@ -209,6 +209,18 @@ def _section_of(chunk: Dict[str, Any]) -> str:
     return section
 
 
+def _source_preview(chunk: Dict[str, Any], limit: int = 140) -> str:
+    """来源正文省略版：折叠空白 + 截断，供前端「点击来源看正文」展示。
+
+    取已脱敏、已权限过滤的 chunk_text（即喂给 LLM 的同一上下文片段），不额外暴露任何东西。
+    """
+    text = str(chunk.get("chunk_text", "") or "")
+    text = re.sub(r"^\s*【[^】]*】\s*", "", text)   # 去「【文档:.. | 章节:..】」上下文前缀
+    text = re.sub(r"<<IMG:\d+>>", "", text)          # 去图片占位符
+    text = re.sub(r"\s+", " ", text).strip()
+    return (text[:limit].rstrip() + "…") if len(text) > limit else text
+
+
 def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """从 chunks 中提取来源信息。
 
@@ -237,6 +249,7 @@ def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "section": _section_of(chunk),
             "score": chunk.get("score", 0),
             "level": score_level(chunk),
+            "preview": _source_preview(chunk),
             "chunk_type": chunk.get("chunk_type", ""),
             "source_image": chunk.get("source_image", ""),
             "visual_summary": chunk.get("visual_summary", ""),

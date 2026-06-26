@@ -10,7 +10,7 @@ const NO_RESULT_FALLBACK = '抱歉，当前知识库中未找到相关信息。'
 
 export type Level = 'high' | 'mid' | 'low'
 
-export interface SourceRow { idx: number; title: string; section: string; levelLabel: string; level: Level }
+export interface SourceRow { idx: number; title: string; section: string; levelLabel: string; level: Level; score: number; preview: string }
 
 export interface ViewBlock {
   type: 'text' | 'image'
@@ -47,6 +47,7 @@ export interface ChatMessage {
   error?: boolean
   errorText?: string
   _stageTimer?: ReturnType<typeof setTimeout> | null
+  _renderRaf?: number | null
 }
 
 export interface Conversation {
@@ -91,7 +92,19 @@ function mapSources(sources: any[]): SourceRow[] {
     const level: Level = (s.level === 'high' || s.level === 'mid' || s.level === 'low')
       ? s.level
       : (s.score >= 7.7 ? 'high' : s.score >= 5.8 ? 'mid' : 'low')
-    return { idx: i + 1, title: s.title || s.doc_id || '', section: s.section || '', levelLabel: LV[level], level }
+    return { idx: i + 1, title: s.title || s.doc_id || '', section: s.section || '', levelLabel: LV[level], level, score: Number(s.score) || 0, preview: s.preview || '' }
+  })
+}
+
+// 流式逐 token 重渲：首帧立即渲染（内容尽快出现），后续用 rAF 节流（每帧至多一次，避免长答案逐 token O(n²)
+// 重渲卡顿；人眼跟不上逐 token；finishStream 收尾会再渲一次定稿）。
+function scheduleRender(ai: ChatMessage, seq: number): void {
+  if (ai.html == null || typeof requestAnimationFrame !== 'function') { ai.html = renderMd(stripImg(ai.raw || '')); return }
+  if (ai._renderRaf != null) return
+  ai._renderRaf = requestAnimationFrame(() => {
+    ai._renderRaf = null
+    if (seq !== askSeq || ai.viewBlocks) return
+    ai.html = renderMd(stripImg(ai.raw || ''))
   })
 }
 
@@ -110,7 +123,7 @@ function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number)
       if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
       ai.loading = false
       ai.raw = (ai.raw || '') + ((ev.content as string) || '')
-      if (!ai.viewBlocks) ai.html = renderMd(stripImg(ai.raw))   // 逐 token 实时打字
+      if (!ai.viewBlocks) scheduleRender(ai, seq)   // 逐 token 实时打字（rAF 节流，避免长答案逐帧 O(n²) 重渲）
       break
     case 'done':
       ai.guard = !!ev.guard
@@ -147,6 +160,7 @@ function finishStream(ai: ChatMessage, seq: number): void {
   asking.value = false
   abortCtl = null
   if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
+  if (ai._renderRaf != null) { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }
   ai.loading = false
   if (ai.noResult || ai.error) return
   if (!ai.raw && !ai.viewBlocks) { ai.error = true; ai.errorText = '回答为空，请重试。'; return }

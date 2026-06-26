@@ -13,6 +13,7 @@ function grow() {
 }
 function onInput(e: Event) { emit('update:modelValue', (e.target as HTMLTextAreaElement).value); grow() }
 function onKey(e: KeyboardEvent) {
+  if (e.isComposing || (e as { keyCode?: number }).keyCode === 229) return   // 输入法选词回车不当作发送
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!props.asking) emit('submit') }
 }
 watch(() => props.modelValue, () => grow())
@@ -52,7 +53,7 @@ defineExpose({ focus: () => ta.value?.focus() })
         <button
           type="button"
           class="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition"
-          :class="thinking ? 'border-primary/40 bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-secondary'"
+          :class="thinking ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
           :aria-pressed="thinking"
           title="深度思考：更慢但更深入（逐问生效）"
           @click="emit('toggle-thinking')"

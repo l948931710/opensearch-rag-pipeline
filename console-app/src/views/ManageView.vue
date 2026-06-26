@@ -11,20 +11,22 @@ import { deptLabel } from '@/lib/kb'
 import UploadCard from '@/components/manage/UploadCard.vue'
 import ApprovalQueue from '@/components/manage/ApprovalQueue.vue'
 import DocTable from '@/components/manage/DocTable.vue'
+import VersionHistoryModal from '@/components/manage/VersionHistoryModal.vue'
 
 // 知识库入口：管理员 → 完整管理台；普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，
 // 不打 admin-gated 接口）。AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { docs, approvals, countOf, loadDocs, loadApprovals, applyPendingVersion } = useKb()
+const { docs, approvals, countOf, loadDocs, loadStats, loadConfig, kbStats, loadApprovals, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 
-// 管理员仪表盘（基于已加载文档；my-docs 取前 50，作用域内概览）。
+// 管理员仪表盘：优先用 /api/kb/stats 的全作用域真实口径，未到则兜底用已加载文档计数（≤50）。
+function badgeN(b: string) { return kbStats.value?.by_badge ? (kbStats.value.by_badge[b] || 0) : countOf(b) }
 const stats = computed(() => [
-  { key: 'total', label: '我的文档', value: docs.value.length, icon: FileText, tone: 'text-foreground' },
-  { key: 'live', label: '已上线', value: countOf('已上线'), icon: CheckCircle2, tone: 'text-st-live' },
-  { key: 'busy', label: '处理中 / 排队', value: countOf('处理中') + countOf('排队中'), icon: Loader, tone: 'text-st-busy' },
-  { key: 'pending', label: '待审批', value: approvals.value.length, icon: Clock, tone: 'text-st-warn' },
+  { key: 'total', label: '文档总数', value: kbStats.value?.total ?? docs.value.length, hint: '我管理范围内', icon: FileText, tone: 'text-foreground' },
+  { key: 'live', label: '已上线', value: badgeN('已上线'), hint: '可被检索', icon: CheckCircle2, tone: 'text-st-live' },
+  { key: 'busy', label: '处理中 / 排队', value: badgeN('处理中') + badgeN('排队中'), hint: '入库处理中', icon: Loader, tone: 'text-st-busy' },
+  { key: 'pending', label: '待审批', value: approvals.value.length, hint: '需放行入库', icon: Clock, tone: 'text-st-warn' },
 ])
 
 // 员工概览卡（只读，可访问数据）。
@@ -39,6 +41,8 @@ function askHot(q: string) { fillInput(q); void router.push('/') }
 onMounted(async () => {
   if (canManage.value) {
     await loadDocs()
+    void loadStats()
+    void loadConfig()
     void loadApprovals()
     const p = consumePendingVersion()   // 升版深链：文档加载后消费一次
     if (p) applyPendingVersion(p)
@@ -83,7 +87,7 @@ onMounted(async () => {
         class="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90"
         @click="router.push('/')"
       >
-        <MessagesSquare :size="15" :stroke-width="1.9" /> 去问答
+        <MessagesSquare :size="15" :stroke-width="1.75" /> 去问答
       </button>
     </section>
   </div>
@@ -102,11 +106,12 @@ onMounted(async () => {
         <div v-for="s in stats" :key="s.key" class="kb-card rounded-[14px] border border-border bg-card p-[15px]">
           <div class="mb-2.5 flex items-center gap-2">
             <span class="grid size-7 shrink-0 place-items-center rounded-lg bg-accent-soft" :class="s.tone">
-              <component :is="s.icon" :size="15" :stroke-width="1.8" />
+              <component :is="s.icon" :size="15" :stroke-width="1.75" />
             </span>
             <span class="truncate text-[12.5px] font-medium text-muted-foreground">{{ s.label }}</span>
           </div>
           <div class="font-mono text-[26px] font-bold leading-none tracking-tight tabular-nums" :class="s.tone">{{ s.value }}</div>
+          <div class="mt-1.5 text-[11.5px] text-faint">{{ s.hint }}</div>
         </div>
       </div>
     </section>
@@ -114,5 +119,6 @@ onMounted(async () => {
     <ApprovalQueue />
     <UploadCard />
     <DocTable />
+    <VersionHistoryModal />
   </div>
 </template>

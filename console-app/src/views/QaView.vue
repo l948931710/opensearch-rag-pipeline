@@ -38,7 +38,7 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
     <div v-else class="flex flex-1 flex-col items-center justify-center px-4 pb-20">
       <div class="mb-7 flex items-center gap-3">
         <span class="grid size-9 place-items-center rounded-[10px] bg-accent-strong">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="var(--primary-foreground)"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="var(--primary-foreground)" aria-hidden="true" focusable="false"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
         </span>
         <span class="font-serif text-[34px] leading-none tracking-tight text-foreground">你好{{ name ? '，' + name : '，同事' }}</span>
       </div>
@@ -47,7 +47,7 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
         <button
           v-for="(h, i) in hotQuestions" :key="i"
           type="button"
-          class="rounded-full border border-border bg-card px-3.5 py-1.5 text-sm text-foreground transition hover:border-ring hover:bg-secondary"
+          class="rounded-full border border-border bg-card px-3.5 py-1.5 text-sm text-foreground transition hover:border-ring hover:bg-panel"
           @click="ask(h)"
         >
           {{ h }}

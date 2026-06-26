@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Search, ArrowUpDown, FilePlus2, Archive } from 'lucide-vue-next'
-import { deptLabel } from '@/lib/kb'
+import { Search, ArrowUpDown, FilePlus2, Archive, History } from 'lucide-vue-next'
+import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 
 const {
   docs, filtered, loadingDocs, q, filter, sortKey, sortDir,
-  setQuery, sortBy, countOf, enterVersionMode, retire,
+  setQuery, sortBy, countOf, enterVersionMode, retire, openHistory,
 } = useKb()
 
 // 状态筛选 chip：从已加载文档里取出现过的徽章（+ 全部）。
@@ -36,7 +36,7 @@ async function onRetire(d: DocItem) {
 <template>
   <section class="rounded-xl border border-border bg-card p-5">
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <h2 class="text-sm font-bold text-foreground">我的文档 <span class="font-mono text-xs text-muted-foreground">{{ docs.length }}</span></h2>
+      <h2 class="text-[15px] font-semibold text-foreground">我的文档 <span class="font-mono text-xs text-muted-foreground">{{ docs.length }}</span></h2>
       <div class="relative">
         <Search :size="14" :stroke-width="1.75" class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
         <input
@@ -62,10 +62,16 @@ async function onRetire(d: DocItem) {
 
     <!-- Atlas 台账网格（< 680px 自动卡片化，由 .led-* 媒体查询接管） -->
     <div class="mt-4 overflow-hidden rounded-xl border border-border bg-card">
-      <div class="led-head font-medium">
-        <span v-for="col in COLS" :key="col.key" class="led-sort inline-flex items-center gap-1" @click="sortBy(col.key)">
+      <div class="led-head">
+        <button
+          v-for="col in COLS" :key="col.key" type="button"
+          class="led-sort inline-flex items-center gap-1"
+          :aria-label="`按${col.label}排序`"
+          :aria-sort="sortKey === col.key ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'"
+          @click="sortBy(col.key)"
+        >
           {{ col.label }}<ArrowUpDown :size="11" :stroke-width="1.75" class="opacity-40" /><span class="text-accent-text">{{ arrow(col.key) }}</span>
-        </span>
+        </button>
         <span class="text-right">操作</span>
       </div>
 
@@ -74,13 +80,19 @@ async function onRetire(d: DocItem) {
         class="led-row" :data-retired="d.status_badge === '已退役' ? '1' : '0'"
       >
         <div class="led-cell led-cell-main min-w-0" data-label="文档名">
-          <span class="truncate font-medium text-foreground">{{ d.title || d.original_filename || d.doc_id }}</span>
+          <div class="truncate text-[13.5px] font-semibold text-foreground">{{ d.title || d.original_filename || d.doc_id }}</div>
+          <div class="truncate text-[11px] text-faint">
+            {{ permLabel(d.permission_level) }}<span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
+          </div>
         </div>
         <div class="led-cell text-sm text-muted-foreground" data-label="归属">{{ deptLabel(d.owner_dept) }}</div>
         <div class="led-cell font-mono text-xs text-muted-foreground" data-label="版本">v{{ d.current_version_no || 1 }}</div>
         <div class="led-cell" data-label="状态"><StatusPill :badge="d.status_badge" /></div>
         <div class="led-cell font-mono text-xs text-muted-foreground" data-label="更新">{{ (d.updated_at || '').slice(0, 16) }}</div>
         <div class="led-cell led-actions doc-actions" data-label="操作">
+          <button type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="openHistory(d)">
+            <History :size="13" :stroke-width="1.75" /> 历史
+          </button>
           <button type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="enterVersionMode(d)">
             <FilePlus2 :size="13" :stroke-width="1.75" /> 升版
           </button>
