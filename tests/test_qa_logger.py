@@ -80,25 +80,31 @@ def test_success_path_commits_and_closes(mock_get_conn):
 
 
 def test_insert_columns_all_exist_in_schema_files():
-    """结构漂移防回归：log_qa_session 的 INSERT 列必须每一列都出现在 schema/ DDL 里
-    （正是这条护栏缺失让 content_blocks_json 静默丢了所有问答日志）。"""
+    """结构漂移防回归：log_qa_session 写入的每一列都必须出现在 schema/ DDL 里
+    （正是这条护栏缺失让 content_blocks_json 静默丢了所有问答日志）。
+
+    INSERT 现为动态构造（base_cols 恒定列 + 可选增强列 conversation_id）：
+    base_cols 校验 001/002，conversation_id 作为增强列校验 006。"""
     import inspect
     from opensearch_pipeline import qa_logger
 
     source = inspect.getsource(qa_logger.log_qa_session)
-    # 库名已配置化（RAG_RDS_OPERATION_DATABASE → f-string 插值 {_op_db()}），表名不变
-    m = re.search(r"INSERT INTO \{_op_db\(\)\}\.qa_session_log\s*\((.*?)\)\s*VALUES",
-                  source, re.S)
-    assert m, "找不到 INSERT 列清单"
-    columns = [c.strip() for c in m.group(1).split(",") if c.strip()]
+    m = re.search(r"base_cols\s*=\s*\[(.*?)\]", source, re.S)
+    assert m, "找不到 base_cols 列清单"
+    columns = [c.strip().strip('"').strip("'") for c in m.group(1).split(",") if c.strip()]
     assert "content_blocks_json" in columns  # sanity
+    assert "conversation_id" not in columns  # 增强列不在 base_cols，避免污染 legacy INSERT
 
-    ddl_text = "".join(
+    legacy_ddl = "".join(
         (SCHEMA_DIR / f).read_text(encoding="utf-8")
         for f in ("001_opensearch_pipeline.sql", "002_feedback_system.sql")
     )
-    missing = [c for c in columns if c not in ddl_text]
-    assert not missing, f"INSERT 用到了 schema DDL 里不存在的列: {missing}"
+    missing = [c for c in columns if c not in legacy_ddl]
+    assert not missing, f"base_cols 用到了 001/002 DDL 里不存在的列: {missing}"
+
+    # 增强列 conversation_id 必须落在 006 DDL（开关开时进主 INSERT）。
+    conv_ddl = (SCHEMA_DIR / "006_conversation_history.sql").read_text(encoding="utf-8")
+    assert "conversation_id" in conv_ddl
 
 
 @patch("opensearch_pipeline.pipeline_nodes._get_db_conn")

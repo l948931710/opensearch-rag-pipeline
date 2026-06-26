@@ -28,6 +28,40 @@ def generate_message_id() -> str:
     return str(uuid.uuid4())
 
 
+def _conversation_history_on() -> bool:
+    """RAG_CONVERSATION_HISTORY 开关（懒读 config；异常退回 False）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return bool(get_config().rag.conversation_history)
+    except Exception:
+        return False
+
+
+def _upsert_conversation(conn, user_id: str, conversation_id: str, title) -> None:
+    """会话元数据幂等 upsert（标题仅首次落、后续只更新时间）。
+
+    独立小事务，失败仅 warning、绝不回滚已落库的审计行。隐藏状态由删除接口单独管理，
+    本 upsert 不触碰 hidden_at —— 故对已隐藏会话继续写入不会令其自动重现。
+    """
+    try:
+        with conn.cursor() as c2:
+            c2.execute(
+                f"""
+                INSERT INTO {_op_db()}.qa_conversation
+                    (user_id, conversation_id, title, created_at, updated_at, last_message_at)
+                VALUES (%s, %s, %s, NOW(3), NOW(3), NOW(3))
+                ON DUPLICATE KEY UPDATE updated_at = NOW(3), last_message_at = NOW(3)
+                """,
+                (user_id, conversation_id, (title or "")[:255]),
+            )
+        conn.commit()
+    except Exception as ce:
+        logger.warning(
+            "qa_conversation upsert 失败 (non-fatal): conversation_id=%s, %s",
+            conversation_id, ce,
+        )
+
+
 def log_qa_session(
     *,
     session_id: str,
@@ -111,61 +145,64 @@ def log_qa_session(
 
         conn = _get_db_conn()
         try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    INSERT INTO {_op_db()}.qa_session_log (
-                        session_id, message_id, user_id, user_name, user_dept,
-                        query_text, answer_text, intent_type, risk_level, risk_blocked,
-                        retrieved_docs_json, cited_docs_json,
-                        latency_ms, retrieval_latency_ms, llm_latency_ms,
-                        answer_status, model_name, error_message,
-                        opensearch_hit_count, top_score, conversation_type,
-                        content_blocks_json
-                    ) VALUES (
-                        %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s,
-                        %s
+            base_cols = [
+                "session_id", "message_id", "user_id", "user_name", "user_dept",
+                "query_text", "answer_text", "intent_type", "risk_level", "risk_blocked",
+                "retrieved_docs_json", "cited_docs_json",
+                "latency_ms", "retrieval_latency_ms", "llm_latency_ms",
+                "answer_status", "model_name", "error_message",
+                "opensearch_hit_count", "top_score", "conversation_type",
+                "content_blocks_json",
+            ]
+            base_vals = [
+                session_id, message_id, user_id or "", user_name, user_dept,
+                query_text, answer_text, intent_type, risk_level,
+                1 if risk_blocked else 0,
+                retrieved_json, cited_json,
+                latency_ms, retrieval_latency_ms, llm_latency_ms,
+                answer_status, model_name, error_message,
+                opensearch_hit_count, top_score, conversation_type,
+                content_blocks_json,
+            ]
+
+            def _insert(cols, vals):
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"INSERT INTO {_op_db()}.qa_session_log ({', '.join(cols)}) "
+                        f"VALUES ({', '.join(['%s'] * len(cols))})",
+                        tuple(vals),
                     )
-                    """,
-                    (
-                        session_id, message_id, user_id or "", user_name, user_dept,
-                        query_text, answer_text, intent_type, risk_level,
-                        1 if risk_blocked else 0,
-                        retrieved_json, cited_json,
-                        latency_ms, retrieval_latency_ms, llm_latency_ms,
-                        answer_status, model_name, error_message,
-                        opensearch_hit_count, top_score, conversation_type,
-                        content_blocks_json,
-                    ),
-                )
-            conn.commit()
+                conn.commit()
+
+            # 正常路径：开关开 + 有 conversation_id → conversation_id 直接进主 INSERT（原子，无 post-commit 空窗）。
+            # 兼容降级：库未迁移（unknown column 1054）→ 回滚后改 legacy INSERT，核心审计行恒落库、绝不丢。
+            enrich = bool(conversation_id) and _conversation_history_on()
+            try:
+                if enrich:
+                    _insert(base_cols + ["conversation_id"], base_vals + [conversation_id])
+                else:
+                    _insert(base_cols, base_vals)
+            except Exception as ie:
+                ierr = ie.args[0] if getattr(ie, "args", None) and isinstance(ie.args[0], int) else None
+                if enrich and ierr == 1054:
+                    logger.warning(
+                        "conversation_id 列缺失，降级 legacy INSERT（请应用 schema/006）: message_id=%s, %s",
+                        message_id, ie,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    _insert(base_cols, base_vals)
+                else:
+                    raise
             logger.info(
                 "qa_session_log 写入成功: message_id=%s, status=%s",
                 message_id, answer_status,
             )
-            # 会话归属回填（仅 RAG_CONVERSATION_HISTORY 开 + 有 conversation_id）。独立小事务：
-            # 审计行已 commit，故列缺失/开关误开只记 warning，绝不回滚已落库的日志行（不丢审计）。
-            if conversation_id:
-                from opensearch_pipeline.config import get_config
-                if get_config().rag.conversation_history:
-                    try:
-                        with conn.cursor() as c2:
-                            c2.execute(
-                                f"UPDATE {_op_db()}.qa_session_log "
-                                f"SET conversation_id=%s WHERE message_id=%s",
-                                (conversation_id, message_id),
-                            )
-                        conn.commit()
-                    except Exception as ce:
-                        logger.warning(
-                            "conversation_id 回填失败 (non-fatal): message_id=%s, %s",
-                            message_id, ce,
-                        )
+            # 审计行已落库；再 best-effort 幂等 upsert 会话元数据（独立小事务，失败仅 warning）。
+            if enrich:
+                _upsert_conversation(conn, user_id or "", conversation_id, query_text)
         finally:
             conn.close()
 

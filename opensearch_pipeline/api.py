@@ -1010,12 +1010,14 @@ def history(
 
 
 # ── 服务端会话历史（控制台 Phase 2/3；全部 gate 在 RAG_CONVERSATION_HISTORY，关时返回空/404）──
+# 设计：qa_session_log 仅承载 conversation_id（审计事实、append-only，删除会话绝不动它）；会话级状态
+# （标题/最近活动/隐藏）在独立的 qa_conversation 表。列表读 qa_conversation；消息读 qa_session_log；
+# 隐藏只 UPDATE qa_conversation.hidden_at。
 
 class ConversationSummary(BaseModel):
     conversation_id: str
     title: str = ""
-    updated_at: str = ""
-    message_count: int = 0
+    updated_at: str = ""   # = qa_conversation.last_message_at
 
 
 class ConversationListResponse(BaseModel):
@@ -1026,7 +1028,7 @@ class ConversationListResponse(BaseModel):
 @app.get("/api/conversations", response_model=ConversationListResponse)
 def list_conversations(request: Request, limit: int = 30, offset: int = 0,
                        identity: Optional[Identity] = Depends(current_identity)):
-    """本人会话列表（按 conversation_id 归并 qa_session_log；title 取首问）。仅本人。"""
+    """本人未隐藏会话列表（直接读 qa_conversation，按最近活动倒序）。仅本人。"""
     _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
@@ -1042,18 +1044,11 @@ def list_conversations(request: Request, limit: int = 30, offset: int = 0,
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT t.conversation_id, q.query_text AS title, t.updated_at, t.cnt
-                    FROM (
-                        SELECT conversation_id, COUNT(*) cnt, MAX(created_at) updated_at, MIN(id) first_id
-                        FROM {_op_db()}.qa_session_log
-                        WHERE user_id=%s AND conversation_id IS NOT NULL AND conversation_id <> ''
-                          AND (conversation_hidden IS NULL OR conversation_hidden = 0)
-                        GROUP BY conversation_id
-                        ORDER BY updated_at DESC
-                        LIMIT %s OFFSET %s
-                    ) t
-                    JOIN {_op_db()}.qa_session_log q ON q.id = t.first_id
-                    ORDER BY t.updated_at DESC
+                    SELECT conversation_id, title, last_message_at
+                    FROM {_op_db()}.qa_conversation
+                    WHERE user_id=%s AND hidden_at IS NULL
+                    ORDER BY last_message_at DESC
+                    LIMIT %s OFFSET %s
                     """,
                     (identity.user_id, limit + 1, offset),
                 )
@@ -1066,8 +1061,8 @@ def list_conversations(request: Request, limit: int = 30, offset: int = 0,
         raise HTTPException(status_code=500, detail=f"会话列表查询失败 (trace: {trace_id})")
     has_more = len(rows) > limit
     items = [ConversationSummary(
-        conversation_id=r[0] or "", title=(r[1] or "")[:60],
-        updated_at=str(r[2]) if r[2] else "", message_count=int(r[3] or 0),
+        conversation_id=r[0] or "", title=(r[1] or "")[:255],
+        updated_at=str(r[2]) if r[2] else "",
     ) for r in rows[:limit]]
     return ConversationListResponse(items=items, has_more=has_more)
 
@@ -1075,7 +1070,7 @@ def list_conversations(request: Request, limit: int = 30, offset: int = 0,
 @app.get("/api/conversations/{conversation_id}", response_model=HistoryResponse)
 def get_conversation(conversation_id: str, request: Request,
                      identity: Optional[Identity] = Depends(current_identity)):
-    """某会话的全部消息（时间正序）；复用 history 的图文重签。仅本人。"""
+    """某会话的全部消息（时间正序，走 idx_user_conversation_time）；复用 history 图文重签。仅本人。"""
     _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
@@ -1093,8 +1088,7 @@ def get_conversation(conversation_id: str, request: Request,
                            created_at, answer_status
                     FROM {_op_db()}.qa_session_log
                     WHERE user_id=%s AND conversation_id=%s
-                      AND (conversation_hidden IS NULL OR conversation_hidden = 0)
-                    ORDER BY id ASC
+                    ORDER BY created_at ASC, id ASC
                     LIMIT 200
                     """,
                     (identity.user_id, conversation_id),
@@ -1128,13 +1122,12 @@ def get_conversation(conversation_id: str, request: Request,
 
 class DeleteConversationResponse(BaseModel):
     deleted: bool = False
-    affected: int = 0
 
 
 @app.delete("/api/conversations/{conversation_id}", response_model=DeleteConversationResponse)
 def delete_conversation(conversation_id: str, request: Request,
                         identity: Optional[Identity] = Depends(current_identity)):
-    """从会话列表移除（软删除 conversation_hidden=1）。仅本人；审计行保留、可复原。"""
+    """从会话列表移除（软删除：qa_conversation.hidden_at=NOW）。仅本人；qa_session_log 审计行【不动】。"""
     _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
@@ -1148,9 +1141,9 @@ def delete_conversation(conversation_id: str, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                affected = cur.execute(
-                    f"UPDATE {_op_db()}.qa_session_log SET conversation_hidden=1 "
-                    f"WHERE user_id=%s AND conversation_id=%s AND conversation_hidden=0",
+                cur.execute(
+                    f"UPDATE {_op_db()}.qa_conversation SET hidden_at=NOW(3) "
+                    f"WHERE user_id=%s AND conversation_id=%s AND hidden_at IS NULL",
                     (identity.user_id, conversation_id),
                 )
             conn.commit()
@@ -1160,7 +1153,7 @@ def delete_conversation(conversation_id: str, request: Request,
         trace_id = uuid.uuid4().hex[:8]
         logger.error("delete_conversation 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"会话删除失败 (trace: {trace_id})")
-    return DeleteConversationResponse(deleted=True, affected=int(affected or 0))
+    return DeleteConversationResponse(deleted=True)
 
 
 # 猜你想问：近 30 天高频 SUCCESS 问题（进程内缓存 1 小时；DB 不可用回退静态默认）。

@@ -60,6 +60,22 @@ export interface Conversation {
   _loading?: boolean       // 该会话消息按需加载中
 }
 
+// 会话 ID = UUIDv4。优先 crypto.randomUUID（仅安全上下文/https），降级 getRandomValues（http 也可用），
+// 再退到时间+随机（避免可预测/自增 ID）。
+function uuid(): string {
+  try {
+    const c = (typeof crypto !== 'undefined' ? crypto : undefined) as Crypto | undefined
+    if (c?.randomUUID) return c.randomUUID()
+    if (c?.getRandomValues) {
+      const b = new Uint8Array(16); c.getRandomValues(b)
+      b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80
+      const h = Array.from(b, (x) => x.toString(16).padStart(2, '0'))
+      return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`
+    }
+  } catch { /* noop */ }
+  return 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12)
+}
+
 // ── 模块级状态 ──
 const conversations = ref<Conversation[]>([])
 const activeId = ref('')
@@ -70,13 +86,12 @@ const hotQuestions = ref<string[]>([])
 let askSeq = 0                       // 竞态锁：停止/新提问/重试递增，作废在途流回调
 let abortCtl: AbortController | null = null
 let mid = Date.now()                 // 消息 id 计数（Date 种子，避开 load 后旧 id 冲突）
-let cid = Date.now()                 // 会话 id 计数
 
 /** 当前激活会话（无则新建一个）。 */
 function ensureActive(): Conversation {
   let c = conversations.value.find((x) => x.id === activeId.value)
   if (!c) {
-    c = reactive({ id: 'c' + (++cid), title: '新对话', messages: [], qaSession: '', updatedAt: Date.now() })
+    c = reactive({ id: uuid(), title: '新对话', messages: [], qaSession: '', updatedAt: Date.now() })
     conversations.value.unshift(c)   // 最新在前
     activeId.value = c.id
   }
@@ -250,7 +265,7 @@ function retry(m: ChatMessage): void {
 function newConversation(): void {
   if (asking.value) stop()
   draft.value = ''
-  const c: Conversation = reactive({ id: 'c' + (++cid), title: '新对话', messages: [], qaSession: '', updatedAt: Date.now() })
+  const c: Conversation = reactive({ id: uuid(), title: '新对话', messages: [], qaSession: '', updatedAt: Date.now() })
   conversations.value.unshift(c)
   activeId.value = c.id
 }
@@ -375,7 +390,7 @@ function loadPersisted(): void {
     const d = JSON.parse(raw)
     if (!d || !Array.isArray(d.conversations)) return
     conversations.value = d.conversations.map((c: any) => reactive({
-      id: c.id || 'c' + (++cid),
+      id: c.id || uuid(),
       title: c.title || '新对话',
       qaSession: '',   // 服务端会话已失效，下次提问重建
       updatedAt: c.updatedAt || Date.now(),
@@ -399,7 +414,7 @@ if (typeof window !== 'undefined') {
 }
 
 // ── 服务端会话历史（Phase 2/3）：端点 gate 在 RAG_CONVERSATION_HISTORY，关时返回空 → 全部退回 localStorage ──
-interface ServerConv { conversation_id: string; title: string; updated_at: string; message_count: number }
+interface ServerConv { conversation_id: string; title: string; updated_at: string }
 interface ServerMsg { message_id: string; question: string; answer: string; blocks: ViewBlock[]; created_at: string; status: string }
 
 // 服务端一条问答 → [用户气泡, AI 消息]（与 onEvent/finishStream 的渲染口径一致）。
