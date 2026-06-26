@@ -10,7 +10,7 @@ const NO_RESULT_FALLBACK = '抱歉，当前知识库中未找到相关信息。'
 
 export type Level = 'high' | 'mid' | 'low'
 
-export interface SourceRow { idx: number; title: string; section: string; levelLabel: string; level: Level; score: number; preview: string }
+export interface SourceRow { idx: number; title: string; section: string; levelLabel: string; level: Level; score: number; relevance: number; preview: string }
 
 export interface ViewBlock {
   type: 'text' | 'image'
@@ -56,6 +56,8 @@ export interface Conversation {
   messages: ChatMessage[]
   qaSession: string        // 服务端会话关联（reload 后失效，下次提问重建）
   updatedAt: number
+  _server?: boolean        // 仅服务端历史回灌的占位（消息点开再拉）
+  _loading?: boolean       // 该会话消息按需加载中
 }
 
 // ── 模块级状态 ──
@@ -92,7 +94,7 @@ function mapSources(sources: any[]): SourceRow[] {
     const level: Level = (s.level === 'high' || s.level === 'mid' || s.level === 'low')
       ? s.level
       : (s.score >= 7.7 ? 'high' : s.score >= 5.8 ? 'mid' : 'low')
-    return { idx: i + 1, title: s.title || s.doc_id || '', section: s.section || '', levelLabel: LV[level], level, score: Number(s.score) || 0, preview: s.preview || '' }
+    return { idx: i + 1, title: s.title || s.doc_id || '', section: s.section || '', levelLabel: LV[level], level, score: Number(s.score) || 0, relevance: Number(s.relevance) || 0, preview: s.preview || '' }
   })
 }
 
@@ -190,6 +192,7 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
 
   const body: Record<string, unknown> = { question: text }
   if (conv.qaSession) body.session_id = conv.qaSession
+  body.conversation_id = conv.id   // 客户端会话 ID → 服务端按此归并历史（仅 RAG_CONVERSATION_HISTORY 开时落库）
   if (thinking.value) body.thinking = true   // 深度思考（仅 true 时带，避免覆盖服务端默认）
 
   try {
@@ -253,28 +256,33 @@ function newConversation(): void {
 }
 const resetThread = newConversation   // 旧名兼容
 
-/** 切到某条历史会话。 */
+/** 切到某条历史会话；服务端回灌的占位会按需拉取消息。 */
 function switchTo(id: string): void {
   if (id === activeId.value) return
   if (asking.value) stop()
   draft.value = ''
-  if (conversations.value.some((c) => c.id === id)) activeId.value = id
+  const c = conversations.value.find((x) => x.id === id)
+  if (!c) return
+  activeId.value = id
+  if (c.messages.length === 0) void loadConversationMessages(c)   // 空（含服务端占位）→ 按需拉取
 }
 
-/** 删除某条会话；若删的是当前会话则切到最近一条（无则留空，下次提问自建）。 */
+/** 删除某条会话；若删的是当前会话则切到最近一条（无则留空，下次提问自建）。
+ *  同时 best-effort 服务端软删除（端点未启用则忽略，本地照常移除）。 */
 function removeConversation(id: string): void {
   const i = conversations.value.findIndex((c) => c.id === id)
   if (i < 0) return
   if (id === activeId.value && asking.value) stop()
   conversations.value.splice(i, 1)
   if (activeId.value === id) activeId.value = conversations.value[0]?.id || ''
+  void apiJson(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE', auth: true }).catch(() => {})
 }
 
 /** 按标题/消息文本搜索会话（用于侧栏搜索框）。空会话（未提问）不进列表，避免噪声。 */
 function searchConversations(q: string): Conversation[] {
   const k = q.trim().toLowerCase()
   const list = [...conversations.value]
-    .filter((c) => c.messages.length > 0)
+    .filter((c) => c.messages.length > 0 || c._server)   // 服务端占位（标题先到、消息未拉）也展示
     .sort((a, b) => b.updatedAt - a.updatedAt)
   if (!k) return list
   return list.filter((c) =>
@@ -351,7 +359,7 @@ const LS_KEY = 'fl-conversations'
 
 function persist(): void {
   try {
-    const data = conversations.value.slice(0, 30).map((c) => ({
+    const data = conversations.value.filter((c) => c.messages.length > 0).slice(0, 30).map((c) => ({
       id: c.id, title: c.title, updatedAt: c.updatedAt,
       // 丢 _stageTimer（计时器句柄）、loading（reload 后无在途流）。
       messages: c.messages.map((m) => { const { _stageTimer, loading, ...rest } = m as any; return rest }),
@@ -390,12 +398,67 @@ if (typeof window !== 'undefined') {
   watch([conversations, activeId], schedulePersist, { deep: true })
 }
 
+// ── 服务端会话历史（Phase 2/3）：端点 gate 在 RAG_CONVERSATION_HISTORY，关时返回空 → 全部退回 localStorage ──
+interface ServerConv { conversation_id: string; title: string; updated_at: string; message_count: number }
+interface ServerMsg { message_id: string; question: string; answer: string; blocks: ViewBlock[]; created_at: string; status: string }
+
+// 服务端一条问答 → [用户气泡, AI 消息]（与 onEvent/finishStream 的渲染口径一致）。
+function serverItemToMessages(it: ServerMsg): ChatMessage[] {
+  const u: ChatMessage = { id: 'u' + (++mid), role: 'user', text: it.question }
+  const a: ChatMessage = reactive({
+    id: 'a' + (++mid), role: 'ai', question: it.question, messageId: it.message_id,
+    sourcesOpen: false, voted: '', viewBlocks: null,
+  })
+  if (it.status === 'NO_RESULT') {
+    a.noResult = true
+    a.answer = it.answer || NO_RESULT_FALLBACK
+  } else if (it.blocks && it.blocks.length) {
+    a.viewBlocks = (it.blocks as any[]).map((b) =>
+      b.type === 'image'
+        ? { type: 'image', url: b.url, oss_key: b.oss_key, caption: b.caption || '', alt: b.caption || '', failed: false, reloading: false } as ViewBlock
+        : { type: 'text', html: renderMd(b.content || '') } as ViewBlock)
+    a.copyText = it.answer || ''
+  } else {
+    a.html = renderMd(stripImg(it.answer || ''))
+    a.copyText = it.answer || ''
+  }
+  return [u, a]
+}
+
+/** 登录后拉服务端会话列表，把本地没有的并进侧栏（占位：标题先到，消息点开再拉）。best-effort。 */
+async function hydrateConversations(): Promise<void> {
+  try {
+    const r = await apiJson<{ items: ServerConv[] }>('/api/conversations', { auth: true })
+    for (const sc of (r.items || [])) {
+      if (!sc.conversation_id || conversations.value.some((c) => c.id === sc.conversation_id)) continue
+      conversations.value.push(reactive({
+        id: sc.conversation_id, title: sc.title || '历史会话', messages: [],
+        qaSession: '', updatedAt: Date.parse(sc.updated_at) || Date.now(), _server: true,
+      }))
+    }
+  } catch { /* 端点未启用/失败 → 仅 localStorage */ }
+}
+
+/** 点开某会话时按需拉其消息（仅当本地为空）。best-effort。 */
+async function loadConversationMessages(c: Conversation): Promise<void> {
+  if (c._loading || c.messages.length > 0) return
+  c._loading = true
+  try {
+    const r = await apiJson<{ items: ServerMsg[] }>(`/api/conversations/${encodeURIComponent(c.id)}`, { auth: true })
+    if (c.messages.length === 0 && r.items && r.items.length) {
+      const msgs: ChatMessage[] = []
+      for (const it of r.items) msgs.push(...serverItemToMessages(it))
+      c.messages = msgs
+    }
+  } catch { /* noop */ } finally { c._loading = false }
+}
+
 export function useAsk() {
   return {
     messages, asking, draft, thinking, hotQuestions,
     conversations, activeId,
     ask, stop, retry, resetThread, newConversation, switchTo, removeConversation, searchConversations,
-    vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions,
+    vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions, hydrateConversations,
   }
 }
 

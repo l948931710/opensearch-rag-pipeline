@@ -155,6 +155,7 @@ class AskRequest(BaseModel):
         None, max_length=40, description="对话历史（最多 40 条 = 20 轮）",
     )
     session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
+    conversation_id: Optional[str] = Field(None, max_length=128, description="客户端会话 ID（控制台会话历史归属；仅 RAG_CONVERSATION_HISTORY 开启时落库）")
     temperature: Optional[float] = Field(DEFAULT_TEMPERATURE, ge=0.0, le=2.0, description="生成温度")
     max_tokens: Optional[int] = Field(DEFAULT_MAX_TOKENS, ge=100, le=8192, description="最大生成 token 数")
     user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
@@ -194,6 +195,8 @@ class SourceInfo(BaseModel):
     # 相关度档位 'high'|'mid'|'low'（与 prompt 高/中/低 同源，见 llm_generator.score_level）。
     # rerank 开启后 score 为 0-1 量纲，客户端必须用本字段、不可按融合阈值重算。
     level: str = ""
+    # 0-1 归一相关度（按 high 阈值归一，rerank/RRF 自洽）：供前端按比例画相关度条。
+    relevance: float = 0.0
     # 正文省略版（折叠空白 + 截断的 chunk_text）：供前端「点击来源看正文」。已脱敏、已权限过滤。
     preview: str = ""
 
@@ -518,6 +521,7 @@ def ask(req: AskRequest, request: Request,
         msg_id = generate_message_id()
         log_qa_session(**build_qa_log_kwargs(
             session_id=session_id,
+            conversation_id=req.conversation_id,
             message_id=msg_id,
             question=req.question,
             user_id=uid,
@@ -570,6 +574,7 @@ def ask(req: AskRequest, request: Request,
         # 失败也落库：此前这里只回 500、不留任何记录，是四条链路中唯一的"无痕失败"
         log_qa_session(**build_qa_log_kwargs(
             session_id=session_id,
+            conversation_id=req.conversation_id,
             message_id=generate_message_id(),
             question=req.question,
             user_id=uid,
@@ -616,6 +621,7 @@ def ask(req: AskRequest, request: Request,
     #    「语料弱/未召回」。入史策略不变（拒答照旧入史，只改落库状态）。
     log_qa_session(**build_qa_log_kwargs(
         session_id=session_id,
+        conversation_id=req.conversation_id,
         message_id=msg_id,
         question=req.question,
         user_id=uid,
@@ -704,6 +710,7 @@ def ask_stream(req: AskRequest, request: Request,
             finally:
                 log_qa_session(**build_qa_log_kwargs(
                     session_id=session_id,
+                    conversation_id=req.conversation_id,
                     message_id=message_id,
                     question=req.question,
                     user_id=uid,
@@ -793,6 +800,7 @@ def ask_stream(req: AskRequest, request: Request,
                 model_name = f"{model_name}+thinking"
             log_qa_session(**build_qa_log_kwargs(
                 session_id=session_id,
+                conversation_id=req.conversation_id,
                 message_id=message_id,
                 question=req.question,
                 user_id=uid,
@@ -999,6 +1007,160 @@ def history(
             status=status or "",
         ))
     return HistoryResponse(items=items, has_more=has_more)
+
+
+# ── 服务端会话历史（控制台 Phase 2/3；全部 gate 在 RAG_CONVERSATION_HISTORY，关时返回空/404）──
+
+class ConversationSummary(BaseModel):
+    conversation_id: str
+    title: str = ""
+    updated_at: str = ""
+    message_count: int = 0
+
+
+class ConversationListResponse(BaseModel):
+    items: List[ConversationSummary] = Field(default_factory=list)
+    has_more: bool = False
+
+
+@app.get("/api/conversations", response_model=ConversationListResponse)
+def list_conversations(request: Request, limit: int = 30, offset: int = 0,
+                       identity: Optional[Identity] = Depends(current_identity)):
+    """本人会话列表（按 conversation_id 归并 qa_session_log；title 取首问）。仅本人。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="需要登录")
+    if not get_config().rag.conversation_history:
+        return ConversationListResponse(items=[], has_more=False)
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    from opensearch_pipeline.qa_logger import _op_db
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT t.conversation_id, q.query_text AS title, t.updated_at, t.cnt
+                    FROM (
+                        SELECT conversation_id, COUNT(*) cnt, MAX(created_at) updated_at, MIN(id) first_id
+                        FROM {_op_db()}.qa_session_log
+                        WHERE user_id=%s AND conversation_id IS NOT NULL AND conversation_id <> ''
+                          AND (conversation_hidden IS NULL OR conversation_hidden = 0)
+                        GROUP BY conversation_id
+                        ORDER BY updated_at DESC
+                        LIMIT %s OFFSET %s
+                    ) t
+                    JOIN {_op_db()}.qa_session_log q ON q.id = t.first_id
+                    ORDER BY t.updated_at DESC
+                    """,
+                    (identity.user_id, limit + 1, offset),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("list_conversations 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"会话列表查询失败 (trace: {trace_id})")
+    has_more = len(rows) > limit
+    items = [ConversationSummary(
+        conversation_id=r[0] or "", title=(r[1] or "")[:60],
+        updated_at=str(r[2]) if r[2] else "", message_count=int(r[3] or 0),
+    ) for r in rows[:limit]]
+    return ConversationListResponse(items=items, has_more=has_more)
+
+
+@app.get("/api/conversations/{conversation_id}", response_model=HistoryResponse)
+def get_conversation(conversation_id: str, request: Request,
+                     identity: Optional[Identity] = Depends(current_identity)):
+    """某会话的全部消息（时间正序）；复用 history 的图文重签。仅本人。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="需要登录")
+    if not get_config().rag.conversation_history:
+        return HistoryResponse(items=[], has_more=False)
+    from opensearch_pipeline.qa_logger import _op_db
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT message_id, query_text, answer_text, content_blocks_json,
+                           created_at, answer_status
+                    FROM {_op_db()}.qa_session_log
+                    WHERE user_id=%s AND conversation_id=%s
+                      AND (conversation_hidden IS NULL OR conversation_hidden = 0)
+                    ORDER BY id ASC
+                    LIMIT 200
+                    """,
+                    (identity.user_id, conversation_id),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("get_conversation 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"会话读取失败 (trace: {trace_id})")
+    items: List[HistoryItem] = []
+    for row in rows:
+        message_id, question, answer_text, blocks_json, created_at, status = row
+        blocks: List[Dict[str, Any]] = []
+        if blocks_json:
+            try:
+                blocks = json.loads(refresh_image_block_urls(
+                    blocks_json if isinstance(blocks_json, str)
+                    else json.dumps(blocks_json, ensure_ascii=False)
+                ))
+            except Exception:
+                blocks = []  # 重签/解析失败退回纯文字（fail open）
+        items.append(HistoryItem(
+            message_id=message_id or "", question=question or "",
+            answer=strip_image_markers(answer_text or ""), blocks=blocks,
+            created_at=str(created_at) if created_at else "", status=status or "",
+        ))
+    return HistoryResponse(items=items, has_more=False)
+
+
+class DeleteConversationResponse(BaseModel):
+    deleted: bool = False
+    affected: int = 0
+
+
+@app.delete("/api/conversations/{conversation_id}", response_model=DeleteConversationResponse)
+def delete_conversation(conversation_id: str, request: Request,
+                        identity: Optional[Identity] = Depends(current_identity)):
+    """从会话列表移除（软删除 conversation_hidden=1）。仅本人；审计行保留、可复原。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="需要登录")
+    if not get_config().rag.conversation_history:
+        raise HTTPException(status_code=404, detail="会话历史未启用")
+    if not conversation_id:
+        raise HTTPException(status_code=400, detail="缺少 conversation_id")
+    from opensearch_pipeline.qa_logger import _op_db
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                affected = cur.execute(
+                    f"UPDATE {_op_db()}.qa_session_log SET conversation_hidden=1 "
+                    f"WHERE user_id=%s AND conversation_id=%s AND conversation_hidden=0",
+                    (identity.user_id, conversation_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("delete_conversation 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"会话删除失败 (trace: {trace_id})")
+    return DeleteConversationResponse(deleted=True, affected=int(affected or 0))
 
 
 # 猜你想问：近 30 天高频 SUCCESS 问题（进程内缓存 1 小时；DB 不可用回退静态默认）。

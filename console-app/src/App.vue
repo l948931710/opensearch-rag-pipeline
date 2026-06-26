@@ -4,6 +4,7 @@ import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { useSession } from '@/stores/session'
 import { useAuth, hasPendingVersion } from '@/composables/useAuth'
+import { useAsk } from '@/composables/useAsk'
 import { debugEnabled } from '@/lib/diag'
 import AppShell from '@/components/shell/AppShell.vue'
 import DebugPanel from '@/components/DebugPanel.vue'
@@ -15,11 +16,16 @@ const debug = debugEnabled()   // ?debug=1（不被 scrubUrl 抹除）
 const session = useSession()
 const { ready, error } = storeToRefs(session)
 const { init } = useAuth()
+const { hydrateConversations } = useAsk()
 const router = useRouter()
 onMounted(() => { void init() })
 
-// 升版深链（小程序「上传新版本」?doc_id=...）：就绪后若有待处理升版，路由到 /manage 让 ManageView 消费。
-watch(ready, (r) => { if (r && hasPendingVersion() && session.canManage) void router.push('/manage') }, { immediate: true })
+// 就绪后：回灌服务端会话历史（best-effort；端点关时返回空、无副作用）+ 升版深链路由。
+watch(ready, (r) => {
+  if (!r) return
+  void hydrateConversations()
+  if (hasPendingVersion() && session.canManage) void router.push('/manage')
+}, { immediate: true })
 </script>
 
 <template>

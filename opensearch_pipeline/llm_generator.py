@@ -106,6 +106,23 @@ def score_level(chunk: Dict[str, Any]) -> str:
     return "high" if score >= hi else "mid" if score >= md else "low"
 
 
+def score_relevance(chunk: Dict[str, Any]) -> float:
+    """0-1 归一相关度（供前端按比例画相关度条）。
+
+    按当前量纲的 high 阈值归一（rerank 0.9 / 融合 7.7），封顶 1.0 —— 即「达到 high 阈值=满格」，
+    其余按比例。与 score_level 同源选阈值，故跨 rerank 开关/RRF 都自洽，前端无需再硬编码桶宽。
+    """
+    score = chunk.get("score", 0)
+    if not isinstance(score, (int, float)) or score <= 0:
+        return 0.0
+    config = get_config()
+    hi = (config.rag.rerank_score_threshold_high if "rerank_score" in chunk
+          else config.rag.score_threshold_high)
+    if hi <= 0:
+        return 0.0
+    return round(min(1.0, score / hi), 3)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Context 组装
 # ═══════════════════════════════════════════════════════════════
@@ -249,6 +266,7 @@ def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "section": _section_of(chunk),
             "score": chunk.get("score", 0),
             "level": score_level(chunk),
+            "relevance": score_relevance(chunk),
             "preview": _source_preview(chunk),
             "chunk_type": chunk.get("chunk_type", ""),
             "source_image": chunk.get("source_image", ""),

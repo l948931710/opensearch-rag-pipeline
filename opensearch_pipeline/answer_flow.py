@@ -87,6 +87,7 @@ def build_qa_log_kwargs(
     error_message: Optional[str] = None,
     conversation_type: Optional[str] = None,
     content_blocks_json: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """qa_session_log 载荷的单一组装点。永远返回【全字段】（未知处显式 None，
     与 qa_logger.log_qa_session 的参数缺省一致）。
@@ -123,4 +124,5 @@ def build_qa_log_kwargs(
         top_score=top_score_of(chunks),
         conversation_type=conversation_type,
         content_blocks_json=content_blocks_json or None,
+        conversation_id=conversation_id,
     )

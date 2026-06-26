@@ -298,6 +298,9 @@ class RAGConfig:
     #    根因需 reranker / 调融合权重 / 按 query 归一化（见 eval_harness/recalibration.json）。
     # ⚠️ 如果切换 hybrid_fusion 从 "weighted" 到 "rrf"，score 分布
     #    会完全不同（RRF 分数 ∈ [0, 1]），必须重新标定这两个值。
+    # 服务端会话历史（Phase 2/3）：开启后 /api/ask(/stream) 回填 conversation_id 到 qa_session_log，
+    # 并启用 /api/conversations 列表/读取/软删除。默认关；需先在 RDS 应用 schema/006 再开。
+    conversation_history: bool = False      # RAG_CONVERSATION_HISTORY
     score_threshold_high: float = 7.7
     score_threshold_medium: float = 5.8
     # 重排序开启时，相关度标签改用 rerank 分（0~1）。
@@ -714,6 +717,7 @@ def load_config() -> PipelineConfig:
             max_history_turns=_env_int("MAX_HISTORY_TURNS", 10),     # RAG_MAX_HISTORY_TURNS
             pure_text=_env_bool("PURE_TEXT", False),               # RAG_PURE_TEXT
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
+            conversation_history=_env_bool("CONVERSATION_HISTORY", False),
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
             score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM
             rerank_score_threshold_high=_env_float("RERANK_SCORE_THRESHOLD_HIGH", 0.9),

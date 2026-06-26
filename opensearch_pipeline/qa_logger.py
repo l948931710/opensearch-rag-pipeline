@@ -52,6 +52,7 @@ def log_qa_session(
     top_score: Optional[float] = None,
     conversation_type: Optional[str] = None,
     content_blocks_json: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> None:
     """
     写入一条 qa_session_log 记录。
@@ -147,6 +148,24 @@ def log_qa_session(
                 "qa_session_log 写入成功: message_id=%s, status=%s",
                 message_id, answer_status,
             )
+            # 会话归属回填（仅 RAG_CONVERSATION_HISTORY 开 + 有 conversation_id）。独立小事务：
+            # 审计行已 commit，故列缺失/开关误开只记 warning，绝不回滚已落库的日志行（不丢审计）。
+            if conversation_id:
+                from opensearch_pipeline.config import get_config
+                if get_config().rag.conversation_history:
+                    try:
+                        with conn.cursor() as c2:
+                            c2.execute(
+                                f"UPDATE {_op_db()}.qa_session_log "
+                                f"SET conversation_id=%s WHERE message_id=%s",
+                                (conversation_id, message_id),
+                            )
+                        conn.commit()
+                    except Exception as ce:
+                        logger.warning(
+                            "conversation_id 回填失败 (non-fatal): message_id=%s, %s",
+                            message_id, ce,
+                        )
         finally:
             conn.close()
 

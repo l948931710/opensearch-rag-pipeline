@@ -69,7 +69,7 @@ class TestBuildQaLogKwargs:
             "latency_ms", "retrieval_latency_ms", "llm_latency_ms",
             "answer_status", "model_name", "error_message",
             "opensearch_hit_count", "top_score", "conversation_type",
-            "content_blocks_json",
+            "content_blocks_json", "conversation_id",
         }
 
     def test_keys_match_log_qa_session_signature(self):

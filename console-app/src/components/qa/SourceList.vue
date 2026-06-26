@@ -10,8 +10,8 @@ const openIdx = ref<number | null>(null)
 function toggle(idx: number) { openIdx.value = openIdx.value === idx ? null : idx }
 
 const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low: 'bg-st-queue' }
-// 相关度条按档位填充（score 量纲随 rerank 开关变化，故用档位画条、原始分数另显）。
-const BAR: Record<string, string> = { high: 'w-[92%] bg-st-live', mid: 'w-[64%] bg-st-busy', low: 'w-[40%] bg-st-queue' }
+// 相关度条：宽度按服务端归一 relevance(0-1) 比例画，颜色按档位（量纲已由后端消化，前端不再硬编码桶宽）。
+const FILL: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low: 'bg-st-queue' }
 </script>
 
 <template>
@@ -46,7 +46,7 @@ const BAR: Record<string, string> = { high: 'w-[92%] bg-st-live', mid: 'w-[64%] 
         <div class="mt-3 flex items-center gap-2.5">
           <span class="text-[10.5px] font-bold uppercase tracking-[0.03em] text-faint">相关度</span>
           <span class="h-[5px] flex-1 overflow-hidden rounded-full bg-border">
-            <span class="block h-full rounded-full" :class="BAR[s.level]" />
+            <span class="block h-full rounded-full transition-[width]" :class="FILL[s.level]" :style="{ width: Math.max(6, Math.round(s.relevance * 100)) + '%' }" />
           </span>
           <span class="font-mono text-[11.5px] font-semibold text-accent-text">{{ s.levelLabel }} · {{ s.score.toFixed(2) }}</span>
         </div>
