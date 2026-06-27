@@ -68,6 +68,27 @@ def resolve_allowed_depts_one(doc_id: str, cursor) -> List[str]:
     return resolve_allowed_depts([doc_id], cursor).get(doc_id, [])
 
 
+def current_allowed_for_doc(cursor, doc_id: str, version_no: int) -> List[str]:
+    """该 doc 指定版本 active chunk 现存的 allowed_depts 并集（去重、稳定排序）。
+
+    用于 diff「应有 vs 现存」——decide 端点的同步标脏、allowed_depts_reconcile 对账、回填脚本
+    共用同一口径（单一 diff 实现，避免三处漂移）。cursor 由调用方提供（连接/事务自掌）。
+    """
+    import json as _json
+    cursor.execute(
+        "SELECT DISTINCT allowed_depts FROM fuling_knowledge.chunk_meta "
+        "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+        (doc_id, version_no),
+    )
+    vals = set()
+    for (ad,) in cursor.fetchall():
+        if not ad:
+            continue
+        parsed = ad if isinstance(ad, list) else _json.loads(ad)
+        vals.update(parsed or [])
+    return sorted(vals)
+
+
 def gate_by_permission(
     allowed: Dict[str, List[str]], permission_by_doc: Dict[str, str]
 ) -> Dict[str, List[str]]:

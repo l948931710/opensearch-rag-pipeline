@@ -2624,6 +2624,40 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 cur.execute("UPDATE fuling_knowledge.kb_access_request "
                             "SET status=%s, decided_by=%s, decided_at=NOW(), decision_note=%s WHERE id=%s",
                             (decision, kb.user_id, (req.reason or "")[:512], req.id))
+                # Phase D（flag 开）：同事务内把该 doc 的 allowed_depts 投影【标脏】——重算 authority
+                # （含刚改的本行 status，读己写：approve→纳入、reject→剔除）→ gate 到 dept_internal →
+                # diff →（变更）写 chunk_meta.allowed_depts + index_status='NOT_INDEXED'，stage-3 下次
+                # drain 据此重推 HA3。**绝不写 HA3 / 不 re-embed**（重活留给 stage-3）。flag 关 = no-op；
+                # 失败只记日志、**不回滚 status**（allowed_depts_reconcile 每轮 stage-3 兜底）。
+                if get_config().rag.allowed_depts_acl and doc_id:
+                    try:
+                        import json as _json
+                        from opensearch_pipeline.access_grants import (
+                            resolve_allowed_depts_one, gate_by_permission, current_allowed_for_doc,
+                        )
+                        cur.execute("SELECT current_version_no FROM fuling_knowledge.document_meta "
+                                    "WHERE doc_id=%s", (doc_id,))
+                        _vrow = cur.fetchone()
+                        if _vrow:
+                            _ver = int(_vrow[0] or 1)
+                            cur.execute("SELECT GROUP_CONCAT(DISTINCT permission_level) FROM "
+                                        "fuling_knowledge.chunk_meta WHERE doc_id=%s AND version_no=%s "
+                                        "AND is_active=1", (doc_id, _ver))
+                            _prow = cur.fetchone()
+                            _want = gate_by_permission(
+                                {doc_id: resolve_allowed_depts_one(doc_id, cur)},
+                                {doc_id: (_prow[0] if _prow else None)},
+                            ).get(doc_id, [])
+                            _have = current_allowed_for_doc(cur, doc_id, _ver)
+                            if sorted(_want) != _have:
+                                _aj = _json.dumps(_want, ensure_ascii=False) if _want else None
+                                cur.execute(
+                                    "UPDATE fuling_knowledge.chunk_meta SET allowed_depts=%s, "
+                                    "index_status='NOT_INDEXED' WHERE doc_id=%s AND version_no=%s "
+                                    "AND is_active=1", (_aj, doc_id, _ver))
+                    except Exception as _pe:
+                        logger.warning("decide allowed_depts 标脏失败（reconciler 兜底）doc=%s: %s",
+                                       doc_id, _pe)
             conn.commit()
         finally:
             conn.close()

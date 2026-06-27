@@ -639,6 +639,19 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         except Exception as e:
             print(f"[Orchestrator] WARNING: pending-delete reconcile failed (non-fatal): {e}",
                   file=sys.stderr)
+        # Phase D（flag 开）：跨部门授权投影对账——从 approved authority 重算 allowed_depts，drift
+        # 文档标脏（chunk_meta.allowed_depts + index_status='NOT_INDEXED'），交本轮 drain 推 HA3。
+        # 兜住 decide 端点漏标脏 / 直接改库的 authority。flag 关 → skipped no-op。失败不阻断入库。
+        try:
+            from opensearch_pipeline.allowed_depts_reconcile import reconcile_allowed_depts
+            ad = reconcile_allowed_depts(commit=True)
+            if not ad.get("skipped") and (ad["materialized"] or ad["retracted"]):
+                print(f"[Orchestrator] allowed_depts reconcile: materialized={ad['materialized']} "
+                      f"retracted={ad['retracted']} reset_chunks={ad['reset_chunks']} "
+                      f"errors={len(ad['errors'])}")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: allowed_depts reconcile failed (non-fatal): {e}",
+                  file=sys.stderr)
 
     max_iters = int(os.environ.get("RAG_DRAIN_MAX_ITERS", "100000"))
     prev_remaining = None
