@@ -445,7 +445,19 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                             extra=extra
                         )
                         valid_chunks.append(chunk_obj)
-                        
+
+                    # Phase D（RAG_ALLOWED_DEPTS_ACL，默认关）：重推路径也必须经唯一 helper 从 approved
+                    # 授权【重解析】allowed_depts（约束 2：不读可能过时的 chunk_meta 投影；约束 3：按
+                    # doc_id 聚合、跟随 current version）。fail-closed：失败置空，不放行。
+                    if config.rag.allowed_depts_acl and valid_chunks:
+                        try:
+                            from opensearch_pipeline.access_grants import resolve_allowed_depts
+                            _allowed = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                            for c in valid_chunks:
+                                c.allowed_depts = _allowed.get(c.doc_id, [])
+                        except Exception as _ade:
+                            print(f"[Orchestrator] ⚠️ allowed_depts 重解析失败（fail-closed 置空）: {_ade}")
+
                     print(f"[Orchestrator] Successfully loaded {len(valid_chunks)} chunks from database.")
             except Exception as e:
                 print(f"[Orchestrator] ERROR: Failed to load Stage 3 production data: {e}", file=sys.stderr)

@@ -301,6 +301,10 @@ class RAGConfig:
     # 服务端会话历史（Phase 2/3）：开启后 /api/ask(/stream) 回填 conversation_id 到 qa_session_log，
     # 并启用 /api/conversations 列表/读取/软删除。默认关；需先在 RDS 应用 schema/006 再开。
     conversation_history: bool = False      # RAG_CONVERSATION_HISTORY
+    # 跨部门检索授权放行（Phase D）：开启后 retriever 过滤追加 allowed_depts OR 项、to_ha3_doc 推送
+    # allowed_depts、入库按 approved 授权聚合写 chunk_meta.allowed_depts。默认关；需先 HA3 加
+    # allowed_depts 字段(Step 2) + 回填(Step 3) 再开。flag 关时全链路与现状逐字节一致。
+    allowed_depts_acl: bool = False         # RAG_ALLOWED_DEPTS_ACL
     score_threshold_high: float = 7.7
     score_threshold_medium: float = 5.8
     # 重排序开启时，相关度标签改用 rerank 分（0~1）。
@@ -718,6 +722,7 @@ def load_config() -> PipelineConfig:
             pure_text=_env_bool("PURE_TEXT", False),               # RAG_PURE_TEXT
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
             conversation_history=_env_bool("CONVERSATION_HISTORY", False),
+            allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
             score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM
             rerank_score_threshold_high=_env_float("RERANK_SCORE_THRESHOLD_HIGH", 0.9),

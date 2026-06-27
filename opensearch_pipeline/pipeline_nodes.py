@@ -4748,6 +4748,19 @@ def node_write_chunk_meta(ctx: dict):
         try:
             conn = _get_db_conn(select_db=True)
             with conn.cursor() as cursor:
+                # Phase D（RAG_ALLOWED_DEPTS_ACL，默认关）：从 approved 跨部门授权按 doc_id 聚合
+                # allowed_depts（唯一注入点 access_grants.resolve_allowed_depts；约束 2/3）→ 设到内存
+                # chunk（供 ctx 流/首推）+ 下方写 chunk_meta.allowed_depts 列。flag 关 → 不查、写 NULL。
+                # fail-closed：解析失败 → 置空（无授权，绝不放行），不阻断入库。先于 DELETE 的纯读。
+                if get_config().rag.allowed_depts_acl and valid_chunks:
+                    try:
+                        from opensearch_pipeline.access_grants import resolve_allowed_depts
+                        _allowed_by_doc = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                        for chunk in valid_chunks:
+                            chunk.allowed_depts = _allowed_by_doc.get(chunk.doc_id, [])
+                    except Exception as _ade:
+                        print(f"    ⚠️ allowed_depts 解析失败（fail-closed 置空，不放行）: {_ade}")
+
                 # 1. 全量替换：删除本次涉及的每个 (doc_id, version_no) 现存的全部 chunk，再整体重插。
                 #    ⚠️ 旧实现只按新 chunk_id 删（仅为幂等/重试）——但同版本 re-chunk 时，如果新切分的
                 #    chunk 数变少，旧的高 index chunk 的 chunk_id 不在新集合里就永远删不掉，残留为 active
@@ -4769,14 +4782,14 @@ def node_write_chunk_meta(ctx: dict):
                         source, rag_ready_key, permission_level, owner_dept, category_l1,
                         category_l2, sensitive_redacted, is_active, embedding_status,
                         index_status, embedding_model, extra_json,
-                        parent_chunk_id, step_no, image_refs_json
+                        parent_chunk_id, step_no, image_refs_json, allowed_depts
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s, %s
                     )
                 """
                 import json as _json
@@ -4812,6 +4825,10 @@ def node_write_chunk_meta(ctx: dict):
                     step_no = chunk.extra.get("step_no") if chunk.extra else None
                     image_refs = chunk.extra.get("image_refs") if chunk.extra else None
                     image_refs_json_val = _json.dumps(image_refs, ensure_ascii=False) if image_refs else None
+                    # Phase D：allowed_depts(JSON)；空 → NULL（flag 关或无授权时即 NULL，列已存在于 schema/001）。
+                    allowed_depts_json_val = (
+                        _json.dumps(chunk.allowed_depts, ensure_ascii=False) if getattr(chunk, "allowed_depts", None) else None
+                    )
 
                     insert_rows.append((
                         chunk.chunk_id, chunk.doc_id, chunk.version_no, chunk.chunk_index, chunk.page_num, chunk.section_title,
@@ -4819,7 +4836,7 @@ def node_write_chunk_meta(ctx: dict):
                         chunk.source, rag_ready_key, chunk.permission_level, chunk.owner_dept, chunk.category_l1,
                         chunk.category_l2, chunk.sensitive_redacted, chunk.is_active, chunk.embedding_status,
                         chunk.index_status, chunk.embedding_model, extra_json_val,
-                        parent_chunk_id, step_no, image_refs_json_val
+                        parent_chunk_id, step_no, image_refs_json_val, allowed_depts_json_val
                     ))
 
                 if insert_rows:
@@ -5837,7 +5854,10 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
 
     ha3_batch_size = 100  # HA3 单次 pushDocuments 上限
     all_chunks = list(chunks)
-    ha3_docs = [{"cmd": "add", "fields": c.to_ha3_doc(cfg.pk_field)} for c in all_chunks]
+    # Phase D（默认关）：仅 flag 开时推送 allowed_depts(MULTI_STRING)；关时输出与历史逐字节一致，
+    # 且 HA3 表加该字段【之前】绝不推未知字段（Step 2 加字段后才会开 flag）。
+    _incl_ad = get_config().rag.allowed_depts_acl
+    ha3_docs = [{"cmd": "add", "fields": c.to_ha3_doc(cfg.pk_field, include_allowed_depts=_incl_ad)} for c in all_chunks]
 
     start_time = time.time()
     for sub_start in range(0, len(ha3_docs), ha3_batch_size):

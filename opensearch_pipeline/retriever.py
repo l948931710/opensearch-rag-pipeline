@@ -352,10 +352,20 @@ def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
     # groups 已净化+白名单；owners 为 taxonomy 常量（伞组展开），字符串拼接无注入风险
     owners = _expand_groups_to_owners(groups)
     dept_clause = " OR ".join('owner_dept="' + o + '"' for o in owners)
-    return (
+    base = (
         '(permission_level="public")'
         ' OR (permission_level="dept_internal" AND (' + dept_clause + '))'
     )
+    # Phase D（RAG_ALLOWED_DEPTS_ACL，默认关）：跨部门检索授权——文档 allowed_depts 含调用者
+    # 任一【组码】（用 groups 本身，非 _expand_groups_to_owners 的 owner 展开；allowed_depts 存
+    # 组码、按组匹配）即放行该 dept_internal 文档。与 dept_internal AND 绑定 → public/restricted
+    # 不受影响、restricted 永不放行；allowed_depts 仅授权文档有值 → 零越权扩散；组码已净化+白名单，
+    # 无注入。仅在 base 末尾整体括号化追加一个 OR 分支，不改既有任一子句 → flag 关时返回串与历史
+    # 逐字节一致。HA3 多值字段 `allowed_depts="g"` = 数组成员匹配（Phase D Step 0 实证）。
+    if get_config().rag.allowed_depts_acl:
+        allowed_clause = " OR ".join('allowed_depts="' + g + '"' for g in groups)
+        base = base + ' OR (permission_level="dept_internal" AND (' + allowed_clause + '))'
+    return base
 
 
 def _search_chunks_opensearch(
@@ -389,6 +399,13 @@ def _search_chunks_opensearch(
             # 'production' 伞组展开为各 production* 子线 owner（与 HA3 _build_permission_filter 同源）
             {"terms": {"owner_dept": _expand_groups_to_owners(groups)}},
         ]}})
+        # Phase D（默认关）：allowed_depts 含调用者组码（非 owner 展开）→ 放行该 dept_internal 文档。
+        # 本地回退路径，与 HA3 _build_permission_filter 的 allowed_depts 分支同义（restricted 仍排除）。
+        if get_config().rag.allowed_depts_acl:
+            perm_should.append({"bool": {"must": [
+                {"term": {"permission_level": "dept_internal"}},
+                {"terms": {"allowed_depts": groups}},
+            ]}})
 
     fetch_k = max(top_k * 2, top_k + 5)
     body = {

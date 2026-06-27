@@ -142,6 +142,10 @@ class Chunk:
     category_l1: Optional[str] = None
     category_l2: Optional[str] = None
     permission_level: Optional[str] = None
+    # Phase D 跨部门检索授权：获授权检索本文档的【用户组码】集合（来自 approved kb_access_request
+    # 聚合，单一注入点 access_grants.resolve_allowed_depts）。默认空；仅 to_ha3_doc(include_allowed_depts=True)
+    # 时推送。owner_dept/permission_level 不变。
+    allowed_depts: List[str] = field(default_factory=list)
     kb_type: Optional[str] = None
     risk_level: Optional[str] = None
 
@@ -228,7 +232,7 @@ class Chunk:
                 
         return doc
 
-    def to_ha3_doc(self, pk_field: str = "id") -> Dict[str, Any]:
+    def to_ha3_doc(self, pk_field: str = "id", include_allowed_depts: bool = False) -> Dict[str, Any]:
         """转为阿里云 OpenSearch 向量检索版 (HA3 Engine) 文档格式。
 
         HA3 与标准 OpenSearch 的关键差异:
@@ -236,6 +240,10 @@ class Chunk:
         - 稠密向量走 dense_vector 浮点列表，稀疏向量拆 indices/values 平行列表（SDK JSON 序列化）
         - 布尔字段使用 int (0/1) 而非 JSON boolean
         - 不支持嵌套对象字段
+
+        include_allowed_depts（Phase D，默认 False）：是否推送 allowed_depts(MULTI_STRING)。
+        ⚠️ 默认 False —— HA3 表在 Step 2 加该字段【之前】绝不能推送未知字段（可能被拒/误处理）。
+        调用方（推送节点）按 RAG_ALLOWED_DEPTS_ACL 决定；关时输出与历史逐字节一致。
         """
         doc = {
             pk_field: self.rds_id if self.rds_id is not None else _stable_pk_from_chunk_id(self.chunk_id),
@@ -269,6 +277,10 @@ class Chunk:
                 doc["source_image"] = self.extra["source_image"]
             if self.extra.get("visual_summary"):
                 doc["visual_summary"] = self.extra["visual_summary"]
+
+        # Phase D：跨部门检索授权组码（MULTI_STRING）。默认不推送——HA3 表加该字段前推送未知字段不安全。
+        if include_allowed_depts:
+            doc["allowed_depts"] = list(self.allowed_depts or [])
 
         return doc
 
