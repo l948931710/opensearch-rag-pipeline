@@ -4754,8 +4754,16 @@ def node_write_chunk_meta(ctx: dict):
                 # fail-closed：解析失败 → 置空（无授权，绝不放行），不阻断入库。先于 DELETE 的纯读。
                 if get_config().rag.allowed_depts_acl and valid_chunks:
                     try:
-                        from opensearch_pipeline.access_grants import resolve_allowed_depts
+                        from opensearch_pipeline.access_grants import (
+                            resolve_allowed_depts, gate_by_permission,
+                        )
                         _allowed_by_doc = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                        # 纵深守卫：只有 permission_level=='dept_internal' 的文档物化 allowed_depts
+                        # （用 chunk 自身=新版本权威 permission_level；restricted/public 即便有 approved
+                        # 行也不放行——审计 Step 4 backstop a）。
+                        _allowed_by_doc = gate_by_permission(
+                            _allowed_by_doc, {c.doc_id: c.permission_level for c in valid_chunks}
+                        )
                         for chunk in valid_chunks:
                             chunk.allowed_depts = _allowed_by_doc.get(chunk.doc_id, [])
                     except Exception as _ade:

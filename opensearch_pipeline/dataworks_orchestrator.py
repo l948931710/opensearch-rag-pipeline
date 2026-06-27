@@ -451,8 +451,15 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                     # doc_id 聚合、跟随 current version）。fail-closed：失败置空，不放行。
                     if config.rag.allowed_depts_acl and valid_chunks:
                         try:
-                            from opensearch_pipeline.access_grants import resolve_allowed_depts
+                            from opensearch_pipeline.access_grants import (
+                                resolve_allowed_depts, gate_by_permission,
+                            )
                             _allowed = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                            # 纵深守卫：只有 permission_level=='dept_internal' 的文档物化 allowed_depts
+                            # （用 chunk 自身权威 permission_level；审计 Step 4 backstop a）。
+                            _allowed = gate_by_permission(
+                                _allowed, {c.doc_id: c.permission_level for c in valid_chunks}
+                            )
                             for c in valid_chunks:
                                 c.allowed_depts = _allowed.get(c.doc_id, [])
                         except Exception as _ade:

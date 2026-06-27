@@ -60,6 +60,27 @@ def test_resolve_allowed_depts_partial_bad_codes_kept_clean():
     assert access_grants.resolve_allowed_depts(["D1"], cur)["D1"] == ["hr", "marketing"]
 
 
+# ── gate_by_permission：纵深守卫，只有 dept_internal 文档物化 allowed_depts（审计 Step 4 backstop a）──
+def test_gate_by_permission_keeps_only_dept_internal():
+    from opensearch_pipeline import access_grants
+    allowed = {"D1": ["finance"], "D2": ["hr"], "D3": ["quality"], "D4": ["marketing"]}
+    perm = {"D1": "dept_internal", "D2": "restricted", "D3": "public", "D4": None}
+    out = access_grants.gate_by_permission(allowed, perm)
+    assert out == {"D1": ["finance"]}                       # 仅 dept_internal 保留
+    assert "D2" not in out and "D3" not in out and "D4" not in out   # restricted/public/未知全丢
+
+
+def test_gate_by_permission_missing_doc_dropped():
+    """permission_by_doc 缺该 doc（无 active chunk 等）→ 视为非 dept_internal，丢弃（fail-closed）。"""
+    from opensearch_pipeline import access_grants
+    assert access_grants.gate_by_permission({"DX": ["finance"]}, {}) == {}
+
+
+def test_gate_by_permission_empty():
+    from opensearch_pipeline import access_grants
+    assert access_grants.gate_by_permission({}, {"D1": "dept_internal"}) == {}
+
+
 # ── to_ha3_doc 推送门控（默认不推；显式 True 才推）──
 def test_to_ha3_doc_gates_allowed_depts():
     from opensearch_pipeline.chunker import Chunk

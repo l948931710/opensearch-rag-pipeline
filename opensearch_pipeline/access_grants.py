@@ -66,3 +66,32 @@ def resolve_allowed_depts_one(doc_id: str, cursor) -> List[str]:
     if not doc_id:
         return []
     return resolve_allowed_depts([doc_id], cursor).get(doc_id, [])
+
+
+def gate_by_permission(
+    allowed: Dict[str, List[str]], permission_by_doc: Dict[str, str]
+) -> Dict[str, List[str]]:
+    """纵深防御守卫：只有【当前/将投影版本】permission_level=='dept_internal' 的文档保留 allowed_depts。
+
+    - allowed: `resolve_allowed_depts` 的输出 {doc_id: [组码...]}。
+    - permission_by_doc: {doc_id: permission_level}——调用方按【权威来源】提供：ingestion / 重推用
+      chunk 自身的 permission_level（= 将写入的新版本，权威）；回填用当前 active chunk 的 permission_level。
+    - 非 dept_internal（restricted / public / 未知 None）→ 丢弃 + warning。
+
+    为何要这层（审计 Step 4 backstop a）：一篇文档在提交时是 dept_internal、获批授权后被改判为
+    restricted（重传到 restricted 路径→新版本），若不守卫，approved 行会把 allowed_depts 物化到
+    restricted chunk 上。消费侧（retriever）已把 allowed_depts OR 项 AND-bind 到
+    permission_level='dept_internal'（故今天不泄露），本守卫在【写入源头】再加一层：restricted 文档
+    绝不携带 allowed_depts，杜绝任何未来旁路 filter 因残留字段而泄露。被丢弃的 approved 文档在回填
+    materialize 循环里会以空 want 清空（= 撤销其残留物化）。
+    """
+    out: Dict[str, List[str]] = {}
+    for doc_id, groups in allowed.items():
+        if permission_by_doc.get(doc_id) == "dept_internal":
+            out[doc_id] = groups
+        else:
+            logger.warning(
+                "allowed_depts 守卫：doc=%s permission_level=%r != dept_internal → 不物化（纵深防御）",
+                doc_id, permission_by_doc.get(doc_id),
+            )
+    return out
