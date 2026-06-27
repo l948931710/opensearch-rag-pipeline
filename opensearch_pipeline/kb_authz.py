@@ -265,14 +265,11 @@ def authorize_upload(
     return AuthzDecision(True, needs_approval, reason)
 
 
-def authorize_retire(identity: KbIdentity, owner_dept: str) -> AuthzDecision:
-    """退役/恢复文档。退役驱动不可逆 HA3 删除链路 → 仅 kb_admin。"""
-    if identity.role != ROLE_KB_ADMIN:
-        return AuthzDecision(False, False, "retire_requires_kb_admin")
-    owner = _SANITIZE_RE.sub("", (owner_dept or "").strip())
-    if not owner or owner not in _valid_owner_depts():
-        return AuthzDecision(False, False, "invalid_owner_dept")
-    return AuthzDecision(True, False, "ok")
+# 退役/恢复【无】独立 authorize_* 纯函数：退役授权 = managed_owner_depts 作用域
+# （_kb_can_manage）+「公开文档需 kb_admin」的端点内不对称规则，刻意内联于
+# api.py::kb_retire（dept_admin 可退役本部门非 public 文档；public 影响全公司故需
+# kb_admin）。不在此提供便利函数，以免与端点产生双口径（曾有 born-dead 的 kb_admin-only
+# authorize_retire，语义与端点冲突，已删）。
 
 
 def audit_managed_grants(granted_owner_depts: Iterable[str]) -> List[str]:

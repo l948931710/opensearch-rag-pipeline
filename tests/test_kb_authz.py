@@ -4,7 +4,8 @@ test_kb_authz.py — 知识库写授权层边界（读 ≠ 管理 ≠ 授权 三
 
 核心回归：marketing 管理员的【读】组含 production（_DEPT_NAME_TO_GROUPS["国际贸易部"]
 = [marketing, production]），但【写】范围绝不含 production —— 即写授权不得从读组推导。
-其余覆盖：fail-closed 角色/净化、公开需 kb_admin、跨组共享需审批、退役仅 kb_admin。
+其余覆盖：fail-closed 角色/净化、公开需 kb_admin、跨组共享需审批。
+（退役授权不在本层：用 managed_owner_depts 作用域 + 端点内「公开需 kb_admin」规则，见 api.py::kb_retire。）
 """
 
 from opensearch_pipeline import kb_authz as ka
@@ -128,15 +129,6 @@ def test_hard_denials():
     assert ka.authorize_upload(da, "hr", "bogus_level").reason == "invalid_permission_level"
     # owner 合法但不在 managed
     assert ka.authorize_upload(da, "finance", "dept_internal").reason == "owner_dept_not_managed"
-
-
-# ── 退役仅 kb_admin ──────────────────────────────────────────────
-def test_retire_only_kb_admin():
-    da = KbIdentity.build(role="dept_admin", granted_owner_depts=["hr"])
-    assert ka.authorize_retire(da, "hr").reason == "retire_requires_kb_admin"
-    kb = KbIdentity.build(role="kb_admin")
-    assert ka.authorize_retire(kb, "hr").allowed
-    assert not ka.authorize_retire(kb, "not_a_group").allowed
 
 
 # ── grant 审计 ────────────────────────────────────────────────────
