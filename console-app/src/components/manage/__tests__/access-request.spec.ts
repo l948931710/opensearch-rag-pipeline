@@ -4,6 +4,7 @@ import { createTestingPinia } from '@pinia/testing'
 import { setActivePinia } from 'pinia'
 import type { Identity } from '@/stores/session'
 import AccessRequestQueue from '@/components/manage/AccessRequestQueue.vue'
+import AccessSyncPill from '@/components/manage/AccessSyncPill.vue'
 import Sidebar from '@/components/shell/Sidebar.vue'
 import { useKb, __resetKb, type AccessRequestItem } from '@/composables/useKb'
 
@@ -84,5 +85,42 @@ describe('Sidebar — 知识库管理入口待审核角标', () => {
     const w = mount(Sidebar, { global: { plugins: [pinia], stubs } })
     expect(w.text()).toContain('知识库管理')
     expect(w.find('[aria-label^="待审核"]').exists()).toBe(false)
+  })
+})
+
+
+describe('accessStateOf — 申请人侧 4 态派生', () => {
+  it('approved+projected→projected · approved+pending_sync→approved_pending_sync · pending · rejected→none', () => {
+    activate(identity({ role: 'dept_admin' }))
+    const kb = useKb()
+    ;(kb as any).myAccessReqs.value = new Map([
+      ['DA', { status: 'approved', sync_state: 'projected' }],
+      ['DB', { status: 'approved', sync_state: 'pending_sync' }],
+      ['DC', { status: 'pending', sync_state: 'n/a' }],
+      ['DD', { status: 'rejected', sync_state: 'n/a' }],
+    ])
+    expect(kb.accessStateOf('DA')).toBe('projected')
+    expect(kb.accessStateOf('DB')).toBe('approved_pending_sync')
+    expect(kb.accessStateOf('DC')).toBe('pending')
+    expect(kb.accessStateOf('DD')).toBe('none')          // 驳回 → 可重新申请
+    expect(kb.accessStateOf('DX')).toBe('none')          // 无 row
+  })
+
+  it('乐观标记：本会话刚提交（requestedDocIds）→ pending（权威态回灌前）', () => {
+    activate(identity({ role: 'dept_admin' }))
+    const kb = useKb()
+    ;(kb as any).requestedDocIds.value = new Set(['DZ'])
+    expect(kb.accessStateOf('DZ')).toBe('pending')
+  })
+})
+
+describe('AccessSyncPill — 独立同步态徽章', () => {
+  it('projected→已放行（live 调）· approved_pending_sync→同步中（busy 调）', () => {
+    const p = mount(AccessSyncPill, { props: { state: 'projected' } })
+    expect(p.text()).toContain('已放行')
+    expect(p.find('.text-st-live').exists()).toBe(true)
+    const s = mount(AccessSyncPill, { props: { state: 'approved_pending_sync' } })
+    expect(s.text()).toContain('同步中')
+    expect(s.find('.text-st-busy').exists()).toBe(true)
   })
 })

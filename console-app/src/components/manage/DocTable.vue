@@ -4,6 +4,7 @@ import { Search, ArrowUpDown, FilePlus2, Archive, History, Lock, Clock } from 'l
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
+import AccessSyncPill from './AccessSyncPill.vue'
 
 const {
   docs, filtered, loadingDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
@@ -137,10 +138,14 @@ async function onRetire(d: DocItem) {
               <Archive :size="13" :stroke-width="1.75" /> 退役
             </button>
           </template>
-          <!-- 其他部门（只读）：申请授权 / 审批中 -->
+          <!-- 其他部门（只读）：申请授权 / 审批中 / 同步中 / 已放行 -->
           <template v-else>
+            <AccessSyncPill
+              v-if="accessStateOf(d.doc_id) === 'projected' || accessStateOf(d.doc_id) === 'approved_pending_sync'"
+              :state="(accessStateOf(d.doc_id) as 'approved_pending_sync' | 'projected')"
+            />
             <span
-              v-if="accessStateOf(d.doc_id) === 'pending'"
+              v-else-if="accessStateOf(d.doc_id) === 'pending'"
               class="flex items-center gap-1 rounded-md bg-st-busy/10 px-2 py-1 text-xs font-medium text-st-busy"
             >
               <Clock :size="12" :stroke-width="2" /> 审批中

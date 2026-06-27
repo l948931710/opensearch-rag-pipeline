@@ -484,3 +484,72 @@ def test_access_reject_non_pending_idempotent(monkeypatch):
     from opensearch_pipeline import api
     resp = api.kb_access_request_reject(api.KbAccessDecisionRequest(id="5", reason="x"), request=None, identity=api.Identity(user_id="dev1"))
     assert resp.already is True and resp.decided is False
+
+
+def _stub_myreq(monkeypatch, request_rows, doc_state):
+    """桩游标（按 SQL 片段分支）：主列表 fetchall 返回 request_rows；per-doc count(fetchone) +
+    allowed_depts(fetchall) 由 doc_state 提供。用于验 /api/kb/my-access-requests 派生同步态。"""
+    import json
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            self._s = " ".join(sql.lower().split())
+            self._p = tuple(params or ())
+
+        def fetchall(self):
+            if "from fuling_knowledge.kb_access_request r" in self._s:
+                return request_rows
+            if "distinct allowed_depts" in self._s:
+                al = doc_state.get(self._p[0], {}).get("allowed", [])
+                return [(json.dumps(al),)] if al else []
+            return []
+
+        def fetchone(self):
+            if "sum(index_status='indexed')" in self._s:
+                st = doc_state.get(self._p[0], {})
+                return (st.get("cnt", 0), st.get("indexed", 0))
+            return None
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+
+
+def test_my_access_requests_sync_state(monkeypatch):
+    """申请人侧派生态：approved 且全 INDEXED 且 allowed_depts⊇授予组 → projected；
+    否则 pending_sync；rejected → n/a。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    rows = [
+        ("1", "DA", "TA", "marketing", "finance", "approved", "r", "2026-06-01", "2026-06-02", 1),
+        ("2", "DB", "TB", "marketing", "quality", "approved", "r", "2026-06-01", "2026-06-02", 1),
+        ("3", "DC", "TC", "marketing", "hr", "approved", "r", "2026-06-01", "2026-06-02", 1),
+        ("4", "DD", "TD", "marketing", "supply", "rejected", "r", "2026-06-01", "2026-06-02", 1),
+    ]
+    doc_state = {
+        "DA": {"cnt": 3, "indexed": 3, "allowed": ["finance"]},   # 全 INDEXED + finance⊆ → projected
+        "DB": {"cnt": 2, "indexed": 1, "allowed": ["quality"]},   # 未全 INDEXED → pending_sync
+        "DC": {"cnt": 2, "indexed": 2, "allowed": []},            # 全 INDEXED 但 hr⊄[] → pending_sync
+    }
+    _stub_myreq(monkeypatch, rows, doc_state)
+    from opensearch_pipeline import api
+    resp = api.kb_my_access_requests(request=None, identity=api.Identity(user_id="da1"))
+    by_id = {it.id: it.sync_state for it in resp.items}
+    assert by_id["1"] == "projected"
+    assert by_id["2"] == "pending_sync"
+    assert by_id["3"] == "pending_sync"
+    assert by_id["4"] == "n/a"                                    # rejected → 不派生
+    assert len(resp.items) == 4

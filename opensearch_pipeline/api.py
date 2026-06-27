@@ -2465,6 +2465,23 @@ class KbAccessRequestListResponse(BaseModel):
     items: List[KbAccessRequestItem] = Field(default_factory=list)
 
 
+class MyAccessRequestItem(BaseModel):
+    id: str = ""
+    doc_id: str = ""
+    doc_title: str = ""
+    owner_dept: str = ""
+    requester_dept: str = ""        # 本次授予的组码（requester_depts）
+    status: str = ""               # pending / approved / rejected
+    sync_state: str = ""           # n/a | pending_sync（已批准·待同步）| projected（已放行）
+    reason: str = ""
+    created_at: str = ""
+    decided_at: str = ""
+
+
+class MyAccessRequestListResponse(BaseModel):
+    items: List[MyAccessRequestItem] = Field(default_factory=list)
+
+
 @app.post("/api/kb/access-requests", response_model=KbAccessRequestSubmitResponse)
 def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
                              identity: Optional[Identity] = Depends(current_identity)):
@@ -2586,6 +2603,69 @@ def kb_access_requests_list(request: Request,
         for r in rows
     ]
     return KbAccessRequestListResponse(items=items)
+
+
+@app.get("/api/kb/my-access-requests", response_model=MyAccessRequestListResponse)
+def kb_my_access_requests(request: Request,
+                          identity: Optional[Identity] = Depends(current_identity)):
+    """申请人侧：列出【我提交】的授权申请 + 派生同步态。只读。
+
+    派生（不存列，Phase D constraint 7）：approved 且该 doc current-version active chunk 全
+    INDEXED 且 chunk_meta.allowed_depts ⊇ 本次授予组码 → 'projected'（已放行）；否则
+    'pending_sync'（已批准·待同步）。pending/rejected → 'n/a'。flag 关时投影恒空 → approved
+    恒显 pending_sync（如实，未真正放行）。INDEXED 在生产 parity-verify 开时 = HA3 物理存在态。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    items: List[MyAccessRequestItem] = []
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.access_grants import current_allowed_for_doc
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT r.id, r.doc_id, m.title, r.owner_dept, r.requester_depts, r.status,
+                           r.reason, r.created_at, r.decided_at, m.current_version_no
+                    FROM fuling_knowledge.kb_access_request r
+                    LEFT JOIN fuling_knowledge.document_meta m ON m.doc_id = r.doc_id
+                    WHERE r.requester_id = %s
+                    ORDER BY r.created_at DESC
+                    LIMIT 100
+                    """,
+                    (kb.user_id,),
+                )
+                rows = cur.fetchall()
+                for r in rows:
+                    doc_id = r[1] or ""
+                    rdepts = r[4] or ""
+                    status = r[5] or ""
+                    sync = "n/a"
+                    if status == "approved" and doc_id:
+                        ver = int(r[9] or 1)
+                        cur.execute(
+                            "SELECT COUNT(*), SUM(index_status='INDEXED') "
+                            "FROM fuling_knowledge.chunk_meta "
+                            "WHERE doc_id=%s AND version_no=%s AND is_active=1", (doc_id, ver))
+                        cnt_row = cur.fetchone() or (0, 0)
+                        cnt = int(cnt_row[0] or 0)
+                        n_idx = int(cnt_row[1] or 0)
+                        allowed = set(current_allowed_for_doc(cur, doc_id, ver))
+                        granted = {g.strip() for g in rdepts.split(",") if g.strip()}
+                        projected = bool(cnt and cnt == n_idx and granted and granted <= allowed)
+                        sync = "projected" if projected else "pending_sync"
+                    items.append(MyAccessRequestItem(
+                        id=str(r[0]), doc_id=doc_id, doc_title=r[2] or "", owner_dept=r[3] or "",
+                        requester_dept=rdepts, status=status, sync_state=sync, reason=r[6] or "",
+                        created_at=str(r[7]) if r[7] else "", decided_at=str(r[8]) if r[8] else ""))
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_my_access_requests 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"我的授权申请查询失败 (trace: {trace_id})")
+    return MyAccessRequestListResponse(items=items)
 
 
 def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,

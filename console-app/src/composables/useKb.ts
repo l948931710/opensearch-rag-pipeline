@@ -24,6 +24,14 @@ export interface AccessRequestItem {
   id: string; doc_id: string; doc_title: string; owner_dept: string
   requester_dept: string; requester_name: string; permission_level: string; reason: string; created_at: string
 }
+// 申请人侧：我的申请 + 派生同步态（已批准·待同步 vs 已放行；后端 /api/kb/my-access-requests）。
+export interface MyAccessRequestItem {
+  id: string; doc_id: string; doc_title: string; owner_dept: string; requester_dept: string
+  status: string                 // pending / approved / rejected
+  sync_state: string             // n/a | pending_sync | projected
+  reason: string; created_at: string; decided_at: string
+}
+export type AccessState = 'none' | 'pending' | 'approved_pending_sync' | 'projected'
 export interface QueueRow { name: string; status: string; pct: number; msg: string; dupMsg?: string }
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
@@ -55,7 +63,9 @@ const docScope = ref<'managed' | 'all'>('managed')   // 本部门(my-docs) / 全
 // 授权申请（申请人侧，Phase C）：本会话内已申请的 doc_id（无后端持久化，仅即时反映「审批中」）。
 const accessReqDoc = ref<DocItem | null>(null)
 const accessReqBusy = ref(false)
-const requestedDocIds = ref<Set<string>>(new Set())
+const requestedDocIds = ref<Set<string>>(new Set())   // 乐观：本会话刚提交、服务端态尚未回灌前临时显「审批中」
+// 申请人侧权威态：doc_id → {status, sync_state}（拉自 /api/kb/my-access-requests；后端未上线则空）
+const myAccessReqs = ref<Map<string, { status: string; sync_state: string }>>(new Map())
 const q = ref('')
 const filter = ref('')                 // status_badge 精确过滤；'' = 全部
 const sortKey = ref<SortKey>('updated_at')
@@ -143,12 +153,28 @@ function setScope(s: 'managed' | 'all') {
   docScope.value = s
   filter.value = ''
   void loadDocs()
+  if (s === 'all') void loadMyAccessRequests()   // 全部门浏览：回灌我的申请态以渲染 申请授权/审批中/同步中/已放行
 }
 
 // ── 授权申请（申请人侧）：对其他部门文档发起检索授权申请 ──
 function openAccessRequest(d: DocItem) { accessReqDoc.value = d }
 function closeAccessRequest() { accessReqDoc.value = null }
-function accessStateOf(docId: string): 'none' | 'pending' { return requestedDocIds.value.has(docId) ? 'pending' : 'none' }
+function accessStateOf(docId: string): AccessState {
+  const r = myAccessReqs.value.get(docId)
+  if (r?.status === 'approved') return r.sync_state === 'projected' ? 'projected' : 'approved_pending_sync'
+  if (r?.status === 'pending') return 'pending'
+  // 服务端无 row 或已驳回 → 看本会话乐观标记（刚提交、态未回灌前）；否则未申请
+  return requestedDocIds.value.has(docId) ? 'pending' : 'none'
+}
+// 申请人侧权威态：拉我的申请 + 派生同步态。后端未上线 / 无申请 → 静默空（不报错、不打扰）。
+async function loadMyAccessRequests() {
+  try {
+    const r = await apiJson<{ items: MyAccessRequestItem[] }>('/api/kb/my-access-requests', { auth: true })
+    const m = new Map<string, { status: string; sync_state: string }>()
+    for (const it of (r.items || [])) m.set(it.doc_id, { status: it.status, sync_state: it.sync_state })
+    myAccessReqs.value = m
+  } catch { /* 兜底空 */ }
+}
 async function submitAccessRequest(reason: string) {
   const d = accessReqDoc.value
   if (!d || accessReqBusy.value) return
@@ -163,6 +189,7 @@ async function submitAccessRequest(reason: string) {
     await apiJson('/api/kb/access-requests', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, owner_dept: d.owner_dept, reason }) })
     requestedDocIds.value = new Set(requestedDocIds.value).add(d.doc_id)
     accessReqDoc.value = null
+    void loadMyAccessRequests()   // 提交后回灌权威态（pending）；乐观标记保证即时反馈
   } catch (e: any) {
     // 后端（Phase C）未上线 → 404：诚实告知，不伪造「已提交」。
     alert(e && e.status === 404 ? '授权申请功能即将上线，敬请期待。' : '提交失败：' + uploadErrText(e))
@@ -414,12 +441,12 @@ export function useKb() {
     docs, filtered, approvals, accessRequests, loadingDocs, docScope, q, filter, sortKey, sortDir,
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
-    accessReqDoc, accessReqBusy, requestedDocIds,
+    accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, maxUploadMb, verHistory,
     // 方法
     loadDocs, loadStats, loadConfig, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, setScope,
-    openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf,
+    openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire,
   }
@@ -428,7 +455,7 @@ export function useKb() {
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
   docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; loadingDocs.value = false
-  docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set()
+  docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
