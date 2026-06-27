@@ -5,6 +5,7 @@ import { useRouter } from 'vue-router'
 import { useSession } from '@/stores/session'
 import { useAuth, hasPendingVersion } from '@/composables/useAuth'
 import { useAsk } from '@/composables/useAsk'
+import { useKb } from '@/composables/useKb'
 import { debugEnabled } from '@/lib/diag'
 import AppShell from '@/components/shell/AppShell.vue'
 import DebugPanel from '@/components/DebugPanel.vue'
@@ -17,13 +18,15 @@ const session = useSession()
 const { ready, error } = storeToRefs(session)
 const { init } = useAuth()
 const { hydrateConversations } = useAsk()
+const { loadApprovals, loadAccessRequests } = useKb()
 const router = useRouter()
 onMounted(() => { void init() })
 
-// 就绪后：回灌服务端会话历史（best-effort；端点关时返回空、无副作用）+ 升版深链路由。
+// 就绪后：回灌服务端会话历史（best-effort）+ 预载待审核数（侧栏红点即时可见，不必先进管理台）+ 升版深链路由。
 watch(ready, (r) => {
   if (!r) return
   void hydrateConversations()
+  if (session.canManage) { void loadApprovals(); void loadAccessRequests() }
   if (hasPendingVersion() && session.canManage) void router.push('/manage')
 }, { immediate: true })
 </script>

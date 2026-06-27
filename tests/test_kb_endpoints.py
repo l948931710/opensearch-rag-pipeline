@@ -189,3 +189,298 @@ def test_my_docs_dept_admin_search_keeps_owner_scope(monkeypatch):
     assert sink["params"][0] == "marketing"
     assert sink["params"][1] == "%杯%" and sink["params"][2] == "%杯%"
     assert sink["params"][-2:] == (21, 0)
+
+
+# ── /api/kb/browse 全部门只读浏览（Phase B）──────────────────────────────────
+def _stub_rows(monkeypatch, rows):
+    """桩游标：execute 捕获 SQL/params，fetchall 返回给定行（用于验 can_manage 映射）。"""
+    sink = {}
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _RowsCur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            sink["sql"] = sql
+            sink["params"] = params
+
+        def fetchall(self):
+            return rows
+
+    class _Conn:
+        def cursor(self):
+            return _RowsCur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    return sink
+
+
+def test_browse_employee_forbidden_before_db(monkeypatch):
+    """全部门浏览仍是管理员特权：employee 在任何 DB 查询【之前】403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_browse(request=None, scope="all", identity=api.Identity(user_id="emp1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_browse_excludes_restricted_and_no_write_scope(monkeypatch):
+    """安全核心：只允许 public/dept_internal（排除 restricted）+ 只在线 + 绝不复用写作用域过滤。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    api.kb_browse(request=None, scope="all", identity=api.Identity(user_id="da1"))
+    sql = sink["sql"]
+    assert "permission_level IN ('public','dept_internal')" in sql   # 允许清单：restricted 一律排除
+    assert "restricted" not in sql                                   # 连词都不出现
+    assert "m.status='active'" in sql                                # 只列在线（退役件不可申请）
+    assert "owner_dept IN" not in sql                                # 绝不复用 _kb_owner_scope_sql 写作用域
+
+
+def test_browse_can_manage_flags_dept_admin(monkeypatch):
+    """可见=全部门、可操作=写作用域：本部门行 can_manage=True，其他部门行 False。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    rows = [
+        ("D1", "营销规范", "a.pdf", "marketing", "dept_internal", 1, "active", "2026-06-26", "DONE", "SUCCESS", None),
+        ("D2", "HR 手册", "b.pdf", "hr", "dept_internal", 2, "active", "2026-06-25", "DONE", "SUCCESS", None),
+    ]
+    _stub_rows(monkeypatch, rows)
+    from opensearch_pipeline import api
+    resp = api.kb_browse(request=None, scope="all", identity=api.Identity(user_id="da1"))
+    by = {i.doc_id: i for i in resp.items}
+    assert by["D1"].can_manage is True      # 本部门 marketing → 可管
+    assert by["D2"].can_manage is False     # 其他部门 hr → 只读
+
+
+def test_browse_kb_admin_all_manageable(monkeypatch):
+    """kb_admin 全部门皆可管：can_manage 恒 True。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    rows = [("D1", "x", "a.pdf", "hr", "dept_internal", 1, "active", "t", "DONE", "SUCCESS", None)]
+    _stub_rows(monkeypatch, rows)
+    from opensearch_pipeline import api
+    resp = api.kb_browse(request=None, scope="all", identity=api.Identity(user_id="dev1"))
+    assert resp.items[0].can_manage is True
+
+
+def test_browse_invalid_scope_fail_closed_empty(monkeypatch):
+    """非法 scope（非 all）→ fail-closed 空，绝不静默当全量。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    resp = api.kb_browse(request=None, scope="managed", identity=api.Identity(user_id="dev1"))
+    assert resp.items == [] and resp.has_more is False
+
+
+def test_browse_owner_facet_param(monkeypatch):
+    """owner_dept facet：参数化 = %s，作为查询参数传入。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    api.kb_browse(request=None, scope="all", owner_dept="hr", identity=api.Identity(user_id="dev1"))
+    assert "m.owner_dept = %s" in sink["sql"]
+    assert sink["params"][0] == "hr"
+
+
+# ── /api/kb/access-requests 跨部门检索授权申请（Phase C 记录层）──────────────
+def _stub_multi(monkeypatch, fetch_seq):
+    """桩游标：execute 累积 calls；fetchone 依次弹 fetch_seq，fetchall 弹一个列表元素。"""
+    sink = {"calls": []}
+    seq = list(fetch_seq)
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _Cur:
+        lastrowid = 123
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            sink["calls"].append((sql, params))
+            sink["sql"] = sql
+            sink["params"] = params
+
+        def fetchone(self):
+            return seq.pop(0) if seq else None
+
+        def fetchall(self):
+            return seq.pop(0) if seq else []
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def commit(self):
+            sink["committed"] = True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    return sink
+
+
+def test_access_submit_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_request_submit(api.KbAccessRequestSubmit(doc_id="D1"), request=None, identity=api.Identity(user_id="e1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_access_submit_kb_admin_rejected(monkeypatch):
+    """kb_admin 直接管理全部，无需申请 → 400（不查库）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_request_submit(api.KbAccessRequestSubmit(doc_id="D1"), request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_access_submit_own_dept_rejected(monkeypatch):
+    """本部门文档无需申请 → 400。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("marketing", "dept_internal", "active")])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_request_submit(api.KbAccessRequestSubmit(doc_id="D1"), request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_access_submit_public_rejected(monkeypatch):
+    """公开文档全公司可读 → 400。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "public", "active")])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_request_submit(api.KbAccessRequestSubmit(doc_id="D1"), request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_access_submit_restricted_rejected(monkeypatch):
+    """受限文档不可申请授权 → 403（绝不开放）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "restricted", "active")])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_request_submit(api.KbAccessRequestSubmit(doc_id="D1"), request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_access_submit_foreign_dept_internal_inserts(monkeypatch):
+    """其他部门 dept_internal → 入队 pending；requester_depts = 申请人 managed。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [("hr", "dept_internal", "active"), None])   # 文档 + 无既有 pending
+    from opensearch_pipeline import api
+    resp = api.kb_access_request_submit(api.KbAccessRequestSubmit(doc_id="D1", reason="需引用"),
+                                        request=None, identity=api.Identity(user_id="da1"))
+    assert resp.status == "pending" and resp.already is False and resp.id == "123"
+    inserts = [c for c in sink["calls"] if "INSERT INTO fuling_knowledge.kb_access_request" in c[0]]
+    assert len(inserts) == 1
+    assert "marketing" in inserts[0][1]      # requester_depts = managed
+    assert "hr" in inserts[0][1]             # owner_dept = 文档归属
+
+
+def test_access_submit_idempotent_existing_pending(monkeypatch):
+    """同 (doc, 申请人) 已有 pending → 幂等返回既有，不重复入队。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "dept_internal", "active"), (77,)])
+    from opensearch_pipeline import api
+    resp = api.kb_access_request_submit(api.KbAccessRequestSubmit(doc_id="D1"), request=None, identity=api.Identity(user_id="da1"))
+    assert resp.already is True and resp.id == "77"
+
+
+def test_access_list_dept_admin_scoped(monkeypatch):
+    """审批方作用域：dept_admin 仅见 owner_dept ∈ managed 的 pending。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [[]])
+    from opensearch_pipeline import api
+    resp = api.kb_access_requests_list(request=None, identity=api.Identity(user_id="da1"))
+    assert resp.items == []
+    assert "r.owner_dept IN" in sink["sql"]
+    assert "r.status='pending'" in sink["sql"]
+    assert sink["params"] == ("marketing",)
+
+
+def test_access_list_kb_admin_all(monkeypatch):
+    """kb_admin 见全部 pending（不限作用域）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [[]])
+    from opensearch_pipeline import api
+    api.kb_access_requests_list(request=None, identity=api.Identity(user_id="dev1"))
+    assert "owner_dept IN" not in sink["sql"]
+
+
+def test_access_list_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_requests_list(request=None, identity=api.Identity(user_id="e1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_access_approve_requires_owner_manage(monkeypatch):
+    """审批权 = 文档所属部门管理员：非 owner_dept 管理者 → 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "pending", "D1")])      # 申请归属 hr，调用者只管 marketing
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_request_approve(api.KbAccessDecisionRequest(id="5"), request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_access_approve_updates(monkeypatch):
+    """owner_dept 管理者通过 → UPDATE status='approved'。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [("marketing", "pending", "D1")])
+    from opensearch_pipeline import api
+    resp = api.kb_access_request_approve(api.KbAccessDecisionRequest(id="5"), request=None, identity=api.Identity(user_id="da1"))
+    assert resp.decided is True and resp.status == "approved"
+    updates = [c for c in sink["calls"] if "UPDATE fuling_knowledge.kb_access_request" in c[0]]
+    assert len(updates) == 1 and "approved" in updates[0][1]
+
+
+def test_access_reject_non_pending_idempotent(monkeypatch):
+    """已决申请再审 → 幂等（decided=False, already=True），不重复改。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [("marketing", "approved", "D1")])
+    from opensearch_pipeline import api
+    resp = api.kb_access_request_reject(api.KbAccessDecisionRequest(id="5", reason="x"), request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.already is True and resp.decided is False

@@ -1367,6 +1367,9 @@ class KbDocItem(BaseModel):
     status: str = "active"
     status_badge: str = ""
     updated_at: str = ""
+    # 可操作性（= 写作用域 managed；my-docs 恒 True，browse 全部门时外部门为 False）。
+    # 与"可见"解耦：浏览看得见 ≠ 能管。前端据此决定 升版/退役 还是 申请授权。
+    can_manage: bool = True
 
 
 class KbMyDocsResponse(BaseModel):
@@ -1627,6 +1630,94 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             current_version_no=int(cur_ver or 1), status=status or "active",
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs),
             updated_at=str(updated) if updated else "",
+        ))
+    return KbMyDocsResponse(items=items, has_more=has_more)
+
+
+@app.get("/api/kb/browse", response_model=KbMyDocsResponse)
+def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str = "",
+              limit: int = 20, offset: int = 0,
+              identity: Optional[Identity] = Depends(current_identity)):
+    """全部门只读浏览：部门管理员看【其他部门】文档（可见、不可操作）。只读。
+
+    与 my-docs 的根本区别——**绝不复用 _kb_owner_scope_sql（写作用域）**：
+      · 可见范围 = 全部门（不按 managed 过滤）；可操作(can_manage) 仍 = 写作用域 managed。
+      · 只列 permission_level ∈ {public, dept_internal}（**允许清单**，restricted 及任何未知值
+        一律排除）——审计/法务/总经办等 restricted 敏感件连标题都不外露（锁定决策 2026-06-26）。
+      · 只列 status='active'（退役件无需被申请检索）。
+      · 每行带 can_manage（kb_admin 全 True；dept_admin 仅其 managed owner_dept）。
+    申请其他部门文档检索 → 授权申请（Phase C）；真正放行检索 → allowed_depts 接入检索（Phase D）。
+    employee/匿名在任何 DB 查询【之前】被 401/403（_require_kb_console 先行）。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    if scope != "all":
+        # 目前仅 all 语义（本部门用 my-docs）；非法 scope fail-closed 空，避免静默当全量。
+        return KbMyDocsResponse(items=[], has_more=False)
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+
+    # owner_dept facet（可选）：参数化 = %s 本身防注入，这里再剥离注入字符 + 限长做纵深防御。
+    from opensearch_pipeline.kb_authz import _SANITIZE_RE
+    owner_facet = _SANITIZE_RE.sub("", (owner_dept or "").strip())[:64]
+    owner_clause, owner_params = "", []
+    if owner_dept and not owner_facet:
+        return KbMyDocsResponse(items=[], has_more=False)   # 非法 facet → fail-closed 空
+    if owner_facet:
+        owner_clause = "AND m.owner_dept = %s"
+        owner_params = [owner_facet]
+
+    # 文档名搜索：与 my-docs 同款显式 '!' 转义（不依赖 sql_mode 的 NO_BACKSLASH_ESCAPES）。
+    q = (q or "").strip()[:80]
+    search_clause, search_params = "", []
+    if q:
+        esc = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        like = "%" + esc + "%"
+        search_clause = "AND (m.title LIKE %s ESCAPE '!' OR m.original_filename LIKE %s ESCAPE '!')"
+        search_params = [like, like]
+
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
+                           m.permission_level, m.current_version_no, m.status, m.updated_at,
+                           v.content_process_status, v.index_status, v.publish_status
+                    FROM fuling_knowledge.document_meta m
+                    LEFT JOIN fuling_knowledge.document_version v
+                      ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
+                    WHERE m.status='active'
+                      AND m.permission_level IN ('public','dept_internal')
+                      {owner_clause} {search_clause}
+                    ORDER BY m.owner_dept ASC, m.updated_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*owner_params, *search_params, limit + 1, offset),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_browse 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"全部门浏览查询失败 (trace: {trace_id})")
+
+    has_more = len(rows) > limit
+    items = []
+    for r in rows[:limit]:
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs) = r
+        items.append(KbDocItem(
+            doc_id=doc_id or "", title=title or "", original_filename=fname or "",
+            owner_dept=owner or "", permission_level=perm or "dept_internal",
+            current_version_no=int(cur_ver or 1), status=status or "active",
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs),
+            updated_at=str(updated) if updated else "",
+            can_manage=_kb_can_manage(kb, owner or ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
 
@@ -2327,6 +2418,238 @@ def kb_pending_approvals(request: Request,
         for r in rows
     ]
     return KbPendingResponse(items=items)
+
+
+# ── 跨部门文档检索授权申请（Phase C 记录层）─────────────────────────────────
+# 申请人 = 部门管理员（在「全部门」浏览里对其他部门 dept_internal 文档发起）；
+# 审批方 = 文档所属部门管理员（owner_dept ∈ 其 managed）或 kb_admin（_kb_can_manage）。
+# ⚠️ 审批通过【只记录决策】，不立即放行检索——真正让申请部门检索到该文档 = Phase D
+#    （把授予部门写进 allowed_depts 并接入 retriever HA3 ACL，不可逆 HA3 改动，单独授权）。
+class KbAccessRequestSubmit(BaseModel):
+    doc_id: str
+    owner_dept: Optional[str] = None   # 客户端值仅参考；owner_dept 一律以 DB 现查为准
+    reason: Optional[str] = None
+
+
+class KbAccessDecisionRequest(BaseModel):
+    id: str
+    reason: Optional[str] = None
+
+
+class KbAccessRequestSubmitResponse(BaseModel):
+    id: str = ""
+    status: str = "pending"
+    already: bool = False
+
+
+class KbAccessDecisionResponse(BaseModel):
+    id: str = ""
+    status: str = ""
+    decided: bool = False
+    already: bool = False
+
+
+class KbAccessRequestItem(BaseModel):
+    id: str = ""
+    doc_id: str = ""
+    doc_title: str = ""
+    owner_dept: str = ""
+    requester_dept: str = ""
+    requester_name: str = ""
+    permission_level: str = "dept_internal"
+    reason: str = ""
+    created_at: str = ""
+
+
+class KbAccessRequestListResponse(BaseModel):
+    items: List[KbAccessRequestItem] = Field(default_factory=list)
+
+
+@app.post("/api/kb/access-requests", response_model=KbAccessRequestSubmitResponse)
+def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
+                             identity: Optional[Identity] = Depends(current_identity)):
+    """部门管理员对【其他部门】dept_internal 文档发起检索授权申请。
+
+    硬规则（fail-closed）：只 dept_internal 可申请（public 本就可读、restricted 不可外露）；
+    本部门文档无需申请；kb_admin 直接管理无需申请；同 (doc, 申请人) 已有 pending → 幂等返回。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    if kb.role == ROLE_KB_ADMIN:
+        raise HTTPException(status_code=400, detail="知识库管理员可直接管理全部文档，无需申请授权")
+    managed = set(managed_owner_depts(kb))
+    if not managed:
+        raise HTTPException(status_code=403, detail="无管理部门，无法代部门申请授权")
+    assert_metadata_write_allowed("kb_access_request_submit", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    owner_dept = ""
+    requester_depts = ",".join(sorted(managed))
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, permission_level, status FROM fuling_knowledge.document_meta "
+                            "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm, status = (row[0] or ""), (row[1] or ""), (row[2] or "active")
+                if str(status).lower() != "active":
+                    raise HTTPException(status_code=400, detail="该文档非在线状态，无法申请")
+                if perm == "public":
+                    raise HTTPException(status_code=400, detail="公开文档全公司可检索，无需申请")
+                if perm != "dept_internal":
+                    raise HTTPException(status_code=403, detail="该文档不可申请授权")
+                if owner_dept in managed:
+                    raise HTTPException(status_code=400, detail="本部门文档无需申请")
+                # 幂等：已有同 (doc, 申请人) pending → 返回既有，不重复入队
+                cur.execute("SELECT id FROM fuling_knowledge.kb_access_request "
+                            "WHERE doc_id=%s AND requester_id=%s AND status='pending' LIMIT 1",
+                            (req.doc_id, kb.user_id))
+                ex = cur.fetchone()
+                if ex:
+                    conn.commit()
+                    return KbAccessRequestSubmitResponse(id=str(ex[0]), status="pending", already=True)
+                cur.execute(
+                    "INSERT INTO fuling_knowledge.kb_access_request "
+                    "(doc_id, owner_dept, requester_id, requester_name, requester_depts, reason, status) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,'pending')",
+                    (req.doc_id, owner_dept, kb.user_id, kb.name, requester_depts, (req.reason or "")[:512]),
+                )
+                new_id = cur.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_access_request_submit 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"提交授权申请失败 (trace: {trace_id})")
+    write_audit(doc_id=req.doc_id, version_no=None, action_type="ACCESS_REQUEST_SUBMIT",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=f"owner={owner_dept} requester_depts={requester_depts}")
+    return KbAccessRequestSubmitResponse(id=str(new_id), status="pending", already=False)
+
+
+@app.get("/api/kb/access-requests", response_model=KbAccessRequestListResponse)
+def kb_access_requests_list(request: Request,
+                            identity: Optional[Identity] = Depends(current_identity)):
+    """审批方待办：列出【我有权审批】的 pending 申请（owner_dept ∈ 我 managed；kb_admin 全部）。只读。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    clause, params = "", []
+    if kb.role != ROLE_KB_ADMIN:
+        owners = managed_owner_depts(kb)
+        if not owners:
+            return KbAccessRequestListResponse(items=[])
+        clause = "AND r.owner_dept IN (" + ",".join(["%s"] * len(owners)) + ")"
+        params = list(owners)
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT r.id, r.doc_id, m.title, r.owner_dept, r.requester_depts,
+                           r.requester_name, m.permission_level, r.reason, r.created_at
+                    FROM fuling_knowledge.kb_access_request r
+                    JOIN fuling_knowledge.document_meta m ON m.doc_id = r.doc_id
+                    WHERE r.status='pending' {clause}
+                    ORDER BY r.created_at DESC
+                    LIMIT 100
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_access_requests_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"授权申请队列查询失败 (trace: {trace_id})")
+    items = [
+        KbAccessRequestItem(
+            id=str(r[0]), doc_id=r[1] or "", doc_title=r[2] or "", owner_dept=r[3] or "",
+            requester_dept=r[4] or "", requester_name=r[5] or "",
+            permission_level=r[6] or "dept_internal", reason=r[7] or "",
+            created_at=str(r[8]) if r[8] else "",
+        )
+        for r in rows
+    ]
+    return KbAccessRequestListResponse(items=items)
+
+
+def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
+                      identity: Optional[Identity], decision: str) -> KbAccessDecisionResponse:
+    """审批一条申请（approve/reject）。授权：文档所属部门管理员（_kb_can_manage）或 kb_admin。
+
+    仅改 kb_access_request.status —— 【不】触碰 allowed_depts / 检索（Phase D 才放行）。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+    if not req.id:
+        raise HTTPException(status_code=400, detail="缺少 id")
+    assert_metadata_write_allowed(f"kb_access_request_{decision}", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    owner_dept = ""
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, status, doc_id FROM fuling_knowledge.kb_access_request "
+                            "WHERE id=%s FOR UPDATE", (req.id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="申请不存在")
+                owner_dept, status, doc_id = (row[0] or ""), (row[1] or ""), (row[2] or "")
+                # 审批权：文档所属部门管理员（owner_dept ∈ managed）或 kb_admin
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权审批该申请（非文档所属部门管理员）")
+                if status != "pending":
+                    conn.commit()       # 幂等：已决 → 返回既有态
+                    return KbAccessDecisionResponse(id=req.id, status=status, decided=False, already=True)
+                cur.execute("UPDATE fuling_knowledge.kb_access_request "
+                            "SET status=%s, decided_by=%s, decided_at=NOW(), decision_note=%s WHERE id=%s",
+                            (decision, kb.user_id, (req.reason or "")[:512], req.id))
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_access_request_%s 失败 [trace=%s]: %s", decision, trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"审批失败 (trace: {trace_id})")
+    write_audit(doc_id=doc_id, version_no=None, action_type=f"ACCESS_REQUEST_{decision.upper()}",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=f"req_id={req.id} owner={owner_dept}")
+    return KbAccessDecisionResponse(id=req.id, status=decision, decided=True, already=False)
+
+
+@app.post("/api/kb/access-requests/approve", response_model=KbAccessDecisionResponse)
+def kb_access_request_approve(req: KbAccessDecisionRequest, request: Request,
+                              identity: Optional[Identity] = Depends(current_identity)):
+    """通过申请（仅记录决策；真正放行检索 = Phase D allowed_depts）。"""
+    return _kb_access_decide(req, request, identity, decision="approved")
+
+
+@app.post("/api/kb/access-requests/reject", response_model=KbAccessDecisionResponse)
+def kb_access_request_reject(req: KbAccessDecisionRequest, request: Request,
+                             identity: Optional[Identity] = Depends(current_identity)):
+    """驳回申请。"""
+    return _kb_access_decide(req, request, identity, decision="rejected")
 
 
 # ═══════════════════════════════════════════════════════════════

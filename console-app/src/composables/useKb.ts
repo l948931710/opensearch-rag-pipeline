@@ -12,10 +12,17 @@ export interface DocItem {
   doc_id: string; title: string; original_filename: string; owner_dept: string
   permission_level: string; current_version_no: number; status: string
   status_badge: string; updated_at: string
+  can_manage?: boolean   // 可操作（写作用域）；my-docs 恒 true，browse 全部门时外部门为 false
 }
 export interface PendingItem {
   doc_id: string; version_no: number; title: string; original_filename: string
   owner_dept: string; permission_level: string; owner_name: string; created_at: string
+}
+// 授权申请（Phase C）：其他部门申请检索本部门文档；审批人 = 文档所属部门管理员（锁定决策 2026-06-26）。
+// 后端 /api/kb/access-requests 尚未上线 → loadAccessRequests 静默兜底空；DEV ?preview 注入 mock 以可视化。
+export interface AccessRequestItem {
+  id: string; doc_id: string; doc_title: string; owner_dept: string
+  requester_dept: string; requester_name: string; permission_level: string; reason: string; created_at: string
 }
 export interface QueueRow { name: string; status: string; pct: number; msg: string; dupMsg?: string }
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
@@ -42,7 +49,13 @@ const maxUploadBytes = computed(() => kbConfig.value?.max_upload_bytes || MAX_UP
 const maxUploadMb = computed(() => Math.round(maxUploadBytes.value / 1048576))
 const verHistory = ref<{ doc: DocItem | null; versions: VersionItem[]; loading: boolean; error: string } | null>(null)
 const approvals = ref<PendingItem[]>([])
+const accessRequests = ref<AccessRequestItem[]>([])   // 授权申请队列（审批人侧）
 const loadingDocs = ref(false)
+const docScope = ref<'managed' | 'all'>('managed')   // 本部门(my-docs) / 全部门只读浏览(browse)
+// 授权申请（申请人侧，Phase C）：本会话内已申请的 doc_id（无后端持久化，仅即时反映「审批中」）。
+const accessReqDoc = ref<DocItem | null>(null)
+const accessReqBusy = ref(false)
+const requestedDocIds = ref<Set<string>>(new Set())
 const q = ref('')
 const filter = ref('')                 // status_badge 精确过滤；'' = 全部
 const sortKey = ref<SortKey>('updated_at')
@@ -101,10 +114,59 @@ async function loadDocs() {
   const seq = ++docsSeq
   loadingDocs.value = true
   try {
-    const r = await apiJson<MyDocsResp>(`/api/kb/my-docs?limit=50${q.value ? `&q=${encodeURIComponent(q.value)}` : ''}`, { auth: true })
+    // DEV ?preview：注入 mock（含外部门 can_manage=false 行）以可视化全部门只读浏览；prod 死代码消除。
+    if (import.meta.env.DEV && useSession().token === 'dev-preview') {
+      const mine: DocItem[] = [
+        { doc_id: 'm1', title: '营销物料使用规范 v3', original_filename: 'guideline.pdf', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 3, status: 'active', status_badge: '已上线', updated_at: '2026-06-26 10:00', can_manage: true },
+        { doc_id: 'm2', title: '品牌 VI 手册', original_filename: 'vi.pdf', owner_dept: 'marketing', permission_level: 'public', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '2026-06-20 09:00', can_manage: true },
+        { doc_id: 'm3', title: '618 活动复盘', original_filename: '618.docx', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 2, status: 'active', status_badge: '处理中', updated_at: '2026-06-25 14:00', can_manage: true },
+      ]
+      const foreign: DocItem[] = [
+        { doc_id: 'h1', title: '员工考勤管理制度', original_filename: 'attendance.pdf', owner_dept: 'hr', permission_level: 'dept_internal', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '2026-06-24 11:00', can_manage: false },
+        { doc_id: 'f1', title: '差旅报销标准', original_filename: 'travel.xlsx', owner_dept: 'finance', permission_level: 'public', current_version_no: 2, status: 'active', status_badge: '已上线', updated_at: '2026-06-22 16:00', can_manage: false },
+        { doc_id: 'p1', title: '注塑车间作业指导书', original_filename: 'sop.docx', owner_dept: 'production', permission_level: 'dept_internal', current_version_no: 5, status: 'active', status_badge: '已上线', updated_at: '2026-06-19 08:00', can_manage: false },
+      ]
+      docs.value = docScope.value === 'all' ? [...mine, ...foreign] : mine
+      return
+    }
+    // 作用域分流：全部门走只读 browse（排除 restricted、带 can_manage），本部门走 my-docs。
+    const base = docScope.value === 'all' ? '/api/kb/browse?scope=all&limit=50' : '/api/kb/my-docs?limit=50'
+    const r = await apiJson<MyDocsResp>(base + (q.value ? `&q=${encodeURIComponent(q.value)}` : ''), { auth: true })
     if (seq !== docsSeq) return            // 竞态守卫：仅最新结果落地
     docs.value = r.items || []
   } catch { /* 保留旧表 */ } finally { if (seq === docsSeq) loadingDocs.value = false }
+}
+
+// 切换台账作用域（本部门 ↔ 全部门只读）。切换即清状态筛选（两个集合徽章分布不同）并重载。
+function setScope(s: 'managed' | 'all') {
+  if (docScope.value === s) return
+  docScope.value = s
+  filter.value = ''
+  void loadDocs()
+}
+
+// ── 授权申请（申请人侧）：对其他部门文档发起检索授权申请 ──
+function openAccessRequest(d: DocItem) { accessReqDoc.value = d }
+function closeAccessRequest() { accessReqDoc.value = null }
+function accessStateOf(docId: string): 'none' | 'pending' { return requestedDocIds.value.has(docId) ? 'pending' : 'none' }
+async function submitAccessRequest(reason: string) {
+  const d = accessReqDoc.value
+  if (!d || accessReqBusy.value) return
+  accessReqBusy.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') {   // 预览演示：本地标记审批中
+      requestedDocIds.value = new Set(requestedDocIds.value).add(d.doc_id)
+      accessReqDoc.value = null
+      return
+    }
+    await apiJson('/api/kb/access-requests', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, owner_dept: d.owner_dept, reason }) })
+    requestedDocIds.value = new Set(requestedDocIds.value).add(d.doc_id)
+    accessReqDoc.value = null
+  } catch (e: any) {
+    // 后端（Phase C）未上线 → 404：诚实告知，不伪造「已提交」。
+    alert(e && e.status === 404 ? '授权申请功能即将上线，敬请期待。' : '提交失败：' + uploadErrText(e))
+  } finally { accessReqBusy.value = false }
 }
 
 async function loadStats() {
@@ -284,6 +346,46 @@ async function reject(d: PendingItem, reason: string) {
   } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
 }
 
+// ── 授权申请（Phase C，审批人侧）──
+// 数据源 /api/kb/access-requests 尚未上线 → 静默兜底空（不报错、不打扰）。DEV ?preview 注入 mock 可视化。
+async function loadAccessRequests() {
+  const s = useSession()
+  if (!s.identity?.canManage) { accessRequests.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    accessRequests.value = [
+      { id: 'ar1', doc_id: 'D1', doc_title: '营销物料使用规范 v3', owner_dept: 'marketing', requester_dept: 'production', requester_name: '王伟', permission_level: 'dept_internal', reason: '生产部包装设计需引用营销规范，确保对外物料一致。', created_at: '2026-06-26' },
+      { id: 'ar2', doc_id: 'D2', doc_title: '客户投诉处理 SOP', owner_dept: 'marketing', requester_dept: 'quality', requester_name: '李娜', permission_level: 'dept_internal', reason: '品质部需对照投诉闭环流程。', created_at: '2026-06-25' },
+    ]
+    return
+  }
+  try {
+    const r = await apiJson<{ items: AccessRequestItem[] }>('/api/kb/access-requests', { auth: true })
+    accessRequests.value = r.items || []
+  } catch { accessRequests.value = [] }   // 端点未上线/出错 → 静默空，不阻断
+}
+
+async function approveAccess(d: AccessRequestItem) {
+  if (apprBusy.value) return
+  apprBusy.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
+    await apiJson('/api/kb/access-requests/approve', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id }) })
+    await loadAccessRequests()
+  } catch (e: any) { alert('授权失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+}
+
+async function rejectAccess(d: AccessRequestItem, reason: string) {
+  if (apprBusy.value) return
+  apprBusy.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
+    await apiJson('/api/kb/access-requests/reject', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id, reason }) })
+    await loadAccessRequests()
+  } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+}
+
 async function retire(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
   if (retireBusy.value) return { ok: false }
   retireBusy.value = true
@@ -302,15 +404,22 @@ export function useKb() {
   const session = useSession()
   const ownerDepts = computed(() => session.identity?.managedOwnerDepts ?? [])
   const isKbAdmin = computed(() => session.role === 'kb_admin')
+  const isDeptAdmin = computed(() => session.role === 'dept_admin')
+  // 待你审核的数量（红点/角标单一来源）：kb_admin = 待审批上传 + 授权申请；dept_admin = 授权申请（其本部门文档的）。
+  // 上传审批仅 kb_admin（/pending-approvals kb-only），故 dept_admin 的 approvals 恒空、不计入。
+  const reviewCount = computed(() => (session.role === 'kb_admin' ? approvals.value.length : 0) + accessRequests.value.length)
 
   return {
     // 状态
-    docs, filtered, approvals, loadingDocs, q, filter, sortKey, sortDir,
+    docs, filtered, approvals, accessRequests, loadingDocs, docScope, q, filter, sortKey, sortDir,
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
-    ownerDepts, isKbAdmin, kbStats, kbConfig, maxUploadMb, verHistory,
+    accessReqDoc, accessReqBusy, requestedDocIds,
+    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, maxUploadMb, verHistory,
     // 方法
     loadDocs, loadStats, loadConfig, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
+    loadAccessRequests, approveAccess, rejectAccess, setScope,
+    openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire,
   }
@@ -318,7 +427,8 @@ export function useKb() {
 
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; loadingDocs.value = false
+  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; loadingDocs.value = false
+  docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set()
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false

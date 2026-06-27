@@ -6,6 +6,7 @@ import { Plus, Search, Library, Sun, Moon, Trash2 } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useTheme } from '@/composables/useTheme'
 import { useAsk } from '@/composables/useAsk'
+import { useKb } from '@/composables/useKb'
 import { ROLE_LABEL } from '@/lib/kb'
 
 // Atlas 式侧栏：默认 56px 图标轨，悬停/聚焦展开成 272px 浮层（覆盖内容、不挤压重排）。
@@ -17,6 +18,7 @@ const session = useSession()
 const { identity, role, canManage } = storeToRefs(session)
 const { theme, toggle } = useTheme()
 const { activeId, newConversation, switchTo, removeConversation, searchConversations } = useAsk()
+const { reviewCount } = useKb()   // 待你审核数（红点/角标）；App.vue 在 ready 后已预加载，故入口红点即时可见
 const route = useRoute()
 const router = useRouter()
 
@@ -108,11 +110,23 @@ const reveal = 'opacity-0 transition-opacity duration-200 group-hover/sb:opacity
           class="flex h-10 items-center rounded-lg text-muted-foreground transition hover:text-foreground group-hover/sb:hover:bg-accent-soft"
           active-class="!text-accent-text !font-semibold"
         >
-          <span class="grid size-10 shrink-0 place-items-center">
+          <span class="relative grid size-10 shrink-0 place-items-center">
             <span class="grid size-8 place-items-center rounded-[10px] border transition-colors"
                   :class="onManage ? 'border-transparent bg-accent-soft' : 'border-border bg-surface group-hover/sb:!border-transparent group-hover/sb:!bg-transparent'"><Library :size="19" :stroke-width="1.75" /></span>
+            <!-- 收起态：图标角红点；展开态淡出（换成右侧数字角标） -->
+            <span
+              v-if="canManage && reviewCount"
+              class="absolute right-1.5 top-1.5 size-2 rounded-full bg-st-busy ring-2 ring-sidebar transition-opacity group-hover/sb:opacity-0 group-focus-within/sb:opacity-0"
+              aria-hidden="true"
+            />
           </span>
           <span class="truncate text-sm font-medium" :class="reveal">{{ kbLabel }}</span>
+          <!-- 展开态：右侧待审核数字 -->
+          <span
+            v-if="canManage && reviewCount"
+            class="ml-auto mr-1 grid h-[18px] min-w-[18px] shrink-0 place-items-center rounded-full bg-st-busy px-1.5 text-[10px] font-bold tabular-nums text-white"
+            :class="reveal" :aria-label="`待审核 ${reviewCount} 项`"
+          >{{ reviewCount }}</span>
         </RouterLink>
         <button
           type="button"

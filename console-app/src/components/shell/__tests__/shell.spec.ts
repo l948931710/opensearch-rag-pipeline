@@ -4,12 +4,14 @@ import { createTestingPinia } from '@pinia/testing'
 import type { Identity } from '@/stores/session'
 import Sidebar from '@/components/shell/Sidebar.vue'
 import ManageView from '@/views/ManageView.vue'
+import { __resetKb } from '@/composables/useKb'
 import { router } from '@/router'
 
-// ManageView 的 onMounted 会拉 my-docs/pending-approvals（canManage 时）——桩掉 fetch，
-// 避免真 fetch 泄漏到 teardown（AbortError 噪声）。
+// ManageView 的 onMounted 会拉 my-docs/pending-approvals/access-requests（canManage 时）——桩掉 fetch，
+// 避免真 fetch 泄漏到 teardown（AbortError 噪声）；重置 useKb 单例避免跨例污染 reviewCount。
 beforeEach(() => {
   vi.restoreAllMocks()
+  __resetKb()
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ items: [], has_more: false }), text: async () => '{}' })))
 })
 
@@ -68,11 +70,21 @@ describe('ManageView — 按角色分流', () => {
     expect(w.text()).not.toContain('待审批')
   })
 
-  it('管理员 → 完整管理台', () => {
-    const w = mountWith(ManageView, identity({ canManage: true, managedOwnerDepts: ['hr'] }))
+  it('知识库管理员 → 分 tab 管理台（概览看板 / 文档管理），默认全库看板', () => {
+    const w = mountWith(ManageView, identity({ canManage: true, role: 'kb_admin', managedOwnerDepts: ['hr'] }))
     expect(w.text()).toContain('知识库管理')
     expect(w.text()).toContain('hr')
-    expect(w.text()).not.toContain('知识库概览')
+    expect(w.text()).toContain('概览看板')        // 子 tab
+    expect(w.text()).toContain('文档管理')        // 子 tab
+    expect(w.text()).toContain('全库资产概览')     // kb_admin 看板（默认 tab）
+    expect(w.text()).not.toContain('知识库概览')   // 员工专属文案
+  })
+
+  it('部门管理员 → 默认看板为本部门视图（非全库）', () => {
+    const w = mountWith(ManageView, identity({ canManage: true, role: 'dept_admin', managedOwnerDepts: ['marketing'] }))
+    expect(w.text()).toContain('概览看板')
+    expect(w.text()).toContain('文档总数')        // 本部门概览卡
+    expect(w.text()).not.toContain('全库资产概览') // 不是 kb_admin 看板
   })
 })
 

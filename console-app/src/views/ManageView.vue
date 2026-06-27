@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
-import { FileText, CheckCircle2, Loader, Clock, Building2, MessagesSquare, Sparkles } from 'lucide-vue-next'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
@@ -10,26 +10,31 @@ import { useAsk } from '@/composables/useAsk'
 import { deptLabel } from '@/lib/kb'
 import UploadCard from '@/components/manage/UploadCard.vue'
 import ApprovalQueue from '@/components/manage/ApprovalQueue.vue'
+import AccessRequestQueue from '@/components/manage/AccessRequestQueue.vue'
 import DocTable from '@/components/manage/DocTable.vue'
 import VersionHistoryModal from '@/components/manage/VersionHistoryModal.vue'
+import AccessRequestModal from '@/components/manage/AccessRequestModal.vue'
+import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
+import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 
-// 知识库入口：管理员 → 完整管理台；普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，
-// 不打 admin-gated 接口）。AppShell 仅在 ready 后渲染，故身份已解析。
+// 知识库入口：管理员 → 分 tab 管理台（概览看板 / 文档管理，设计稿 SUB-TAB SWITCHER）；
+// 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
+// AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { docs, approvals, countOf, loadDocs, loadStats, loadConfig, kbStats, loadApprovals, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadApprovals, loadAccessRequests, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 
-// 管理员仪表盘：优先用 /api/kb/stats 的全作用域真实口径，未到则兜底用已加载文档计数（≤50）。
-function badgeN(b: string) { return kbStats.value?.by_badge ? (kbStats.value.by_badge[b] || 0) : countOf(b) }
-const stats = computed(() => [
-  { key: 'total', label: '文档总数', value: kbStats.value?.total ?? docs.value.length, hint: '我管理范围内', icon: FileText, tone: 'text-foreground' },
-  { key: 'live', label: '已上线', value: badgeN('已上线'), hint: '可被检索', icon: CheckCircle2, tone: 'text-st-live' },
-  { key: 'busy', label: '处理中 / 排队', value: badgeN('处理中') + badgeN('排队中'), hint: '入库处理中', icon: Loader, tone: 'text-st-busy' },
-  { key: 'pending', label: '待审批', value: approvals.value.length, hint: '需放行入库', icon: Clock, tone: 'text-st-warn' },
-])
+// ── 管理台子 tab ──
+type Tab = 'dash' | 'docs'
+const activeTab = ref<Tab>('dash')
+const tabs: { key: Tab; label: string; icon: any }[] = [
+  { key: 'dash', label: '概览看板', icon: LayoutDashboard },
+  { key: 'docs', label: '文档管理', icon: FolderOpen },
+]
+// 「文档管理」tab 角标 = 待你审核数（reviewCount，与侧栏入口红点同一来源）。
 
-// 员工概览卡（只读，可访问数据）。
+// ── 员工概览卡（只读，可访问数据）──
 const myDepts = computed(() => (identity.value?.aclGroups || []).map(deptLabel).join('、') || '—')
 const empCards = computed(() => [
   { key: 'dept', label: '我的部门', value: myDepts.value, icon: Building2, mono: false },
@@ -44,8 +49,9 @@ onMounted(async () => {
     void loadStats()
     void loadConfig()
     void loadApprovals()
-    const p = consumePendingVersion()   // 升版深链：文档加载后消费一次
-    if (p) applyPendingVersion(p)
+    void loadAccessRequests()
+    const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
+    if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
   } else {
     if (!hotQuestions.value.length) void loadHotQuestions()
   }
@@ -92,33 +98,44 @@ onMounted(async () => {
     </section>
   </div>
 
-  <!-- ───────── 管理员：完整管理台 ───────── -->
+  <!-- ───────── 管理员：分 tab 管理台 ───────── -->
   <div v-else class="mx-auto w-full max-w-5xl space-y-6 px-6 py-8">
     <header class="flex items-baseline justify-between border-b border-border pb-4">
       <h1 class="font-serif text-2xl tracking-tight text-foreground">知识库管理</h1>
       <span class="font-mono text-xs text-muted-foreground">{{ identity?.managedOwnerDepts.join(' · ') || '—' }}</span>
     </header>
 
-    <!-- 概览 -->
-    <section>
-      <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">概览</p>
-      <div class="kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <div v-for="s in stats" :key="s.key" class="kb-card rounded-[14px] border border-border bg-card p-[15px]">
-          <div class="mb-2.5 flex items-center gap-2">
-            <span class="grid size-7 shrink-0 place-items-center rounded-lg bg-accent-soft" :class="s.tone">
-              <component :is="s.icon" :size="15" :stroke-width="1.75" />
-            </span>
-            <span class="truncate text-[12.5px] font-medium text-muted-foreground">{{ s.label }}</span>
-          </div>
-          <div class="font-mono text-[26px] font-bold leading-none tracking-tight tabular-nums" :class="s.tone">{{ s.value }}</div>
-          <div class="mt-1.5 text-[11.5px] text-faint">{{ s.hint }}</div>
-        </div>
-      </div>
-    </section>
+    <!-- 子 tab：概览看板 / 文档管理 -->
+    <div class="-mt-2 flex gap-1 border-b border-border" role="tablist" aria-label="管理台分区">
+      <button
+        v-for="t in tabs" :key="t.key" type="button" role="tab"
+        :aria-selected="activeTab === t.key"
+        class="relative -mb-px flex items-center gap-2 border-b-2 px-3.5 py-2.5 text-sm font-medium transition"
+        :class="activeTab === t.key ? 'border-accent-strong text-accent-text' : 'border-transparent text-muted-foreground hover:text-foreground'"
+        @click="activeTab = t.key"
+      >
+        <component :is="t.icon" :size="15" :stroke-width="1.75" />
+        {{ t.label }}
+        <span
+          v-if="t.key === 'docs' && reviewCount"
+          class="grid h-[17px] min-w-[17px] place-items-center rounded-full bg-st-busy px-1.5 text-[10px] font-bold tabular-nums text-white"
+        >{{ reviewCount }}</span>
+      </button>
+    </div>
 
-    <ApprovalQueue />
-    <UploadCard />
-    <DocTable />
+    <!-- 概览看板：按角色分流（kb_admin 全库 / dept_admin 本部门） -->
+    <KbAdminDashboard v-if="activeTab === 'dash' && isKbAdmin" />
+    <DeptDashboard v-else-if="activeTab === 'dash'" />
+
+    <!-- 文档管理：待审批队列（上传放行，kb_admin）+ 授权申请队列（跨部门检索，本部门文档归属者）+ 上传 + 台账 -->
+    <template v-else-if="activeTab === 'docs'">
+      <ApprovalQueue />
+      <AccessRequestQueue />
+      <UploadCard />
+      <DocTable />
+    </template>
+
     <VersionHistoryModal />
+    <AccessRequestModal />
   </div>
 </template>
