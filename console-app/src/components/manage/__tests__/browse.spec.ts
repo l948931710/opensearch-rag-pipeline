@@ -82,3 +82,23 @@ describe('授权申请（申请人侧）', () => {
     expect(kb.accessReqDoc.value).toBeNull()
   })
 })
+
+describe('DocTable — 退役行「恢复上线」', () => {
+  it('已退役本部门行 → 显示恢复上线、隐藏退役', () => {
+    const p = activate(identity({ role: 'dept_admin' }))
+    const kb = useKb()
+    ;(kb as any).docs.value = [doc({ doc_id: 'mine', owner_dept: 'marketing', can_manage: true, status_badge: '已退役' })]
+    const w = mount(DocTable, { global: { plugins: [p] } })
+    const btns = w.findAll('button').map((b) => b.text().trim())
+    expect(btns.some((t) => t === '恢复上线')).toBe(true)
+    expect(btns.some((t) => t === '退役')).toBe(false)   // 退役动作按钮隐藏（v-else；状态 chip「已退役」不算）
+  })
+
+  it('restore（DEV preview）→ status_badge 即时变排队中', async () => {
+    activate(identity({ role: 'kb_admin' }), 'dev-preview')
+    const d = doc({ doc_id: 'mine', status_badge: '已退役' })
+    const r = await useKb().restore(d)
+    expect(r.ok).toBe(true)
+    expect(d.status_badge).toBe('排队中')
+  })
+})

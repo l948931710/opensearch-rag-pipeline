@@ -1979,6 +1979,15 @@ class KbRetireResponse(BaseModel):
     note: str = ""
 
 
+class KbRestoreResponse(BaseModel):
+    status: str = "ok"
+    doc_id: str
+    restored: bool = False
+    already: bool = False
+    status_badge: str = "在线"
+    note: str = ""
+
+
 @app.post("/api/kb/upload-url", response_model=KbUploadUrlResponse)
 def kb_upload_url(req: KbUploadUrlRequest, request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
@@ -2368,6 +2377,71 @@ def kb_retire(req: KbRetireRequest, request: Request,
     return KbRetireResponse(
         doc_id=req.doc_id, retired=True,
         note="已申请退役：已标记下线、停止作为升版目标；从检索彻底移除将在下次维护完成（本操作可逆）")
+
+
+@app.post("/api/kb/restore", response_model=KbRestoreResponse)
+def kb_restore(req: KbRetireRequest, request: Request,
+               identity: Optional[Identity] = Depends(current_identity)):
+    """恢复上线（退役的逆操作）：把退役文档重新激活 + 标脏待重索引。授权与退役同款。
+
+    仅改 RDS（document_meta/version.status='active' + chunk_meta.is_active=1 + index_status='NOT_INDEXED'）。
+    软退役不删 HA3（is_active=0 仅 RDS 标记）：若退役后【尚未】跑 HA3 清除维护，chunk 仍在 HA3 →
+    本操作即时恢复检索；若已被 gated 维护从 HA3 删除，则标脏 NOT_INDEXED，下次 stage-3 drain 重嵌+重推
+    后恢复（与退役"可逆"承诺对齐，且覆盖已清除的边界情形）。不触碰 HA3（重推交 stage-3）。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    assert_metadata_write_allowed("kb_restore", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    owner_dept = perm = ""
+    cur_ver = 1
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                            "FROM fuling_knowledge.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm = (row[0] or ""), (row[1] or "")
+                status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                # 授权：与退役同款不对称——作用域 + 公开文档需 kb_admin
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权恢复该文档（owner_dept 不在管理范围）")
+                if perm == "public" and kb.role != ROLE_KB_ADMIN:
+                    raise HTTPException(status_code=403, detail="公开文档需知识库管理员恢复")
+                if str(status).lower() == "active":
+                    conn.commit()       # 幂等：已在线 → 直接回既有态
+                    return KbRestoreResponse(doc_id=req.doc_id, restored=False, already=True,
+                                             note="该文档已是在线状态")
+                cur.execute("UPDATE fuling_knowledge.document_meta SET status='active', updated_at=NOW() "
+                            "WHERE doc_id=%s", (req.doc_id,))
+                cur.execute("UPDATE fuling_knowledge.document_version SET status='active', updated_at=NOW() "
+                            "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
+                # 重新激活本版本 chunk + 标脏 NOT_INDEXED（下次 stage-3 重推 HA3；若 HA3 未删则为幂等重推）。
+                cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=1, index_status='NOT_INDEXED' "
+                            "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_restore 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"恢复失败 (trace: {trace_id})")
+    write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}")
+    return KbRestoreResponse(
+        doc_id=req.doc_id, restored=True,
+        note="已恢复上线：重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复")
 
 
 class KbPendingItem(BaseModel):

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Search, ArrowUpDown, FilePlus2, Archive, History, Lock, Clock } from 'lucide-vue-next'
+import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
@@ -8,7 +8,7 @@ import AccessSyncPill from './AccessSyncPill.vue'
 
 const {
   docs, filtered, loadingDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
-  setQuery, sortBy, countOf, setScope, enterVersionMode, retire, openHistory,
+  setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
   openAccessRequest, accessStateOf,
 } = useKb()
 
@@ -32,6 +32,12 @@ async function onRetire(d: DocItem) {
   if (!confirm(`确认退役《${d.title || d.original_filename || d.doc_id}》？\n将标记下线、停止作为升版目标。从检索彻底移除会在下次维护完成（本操作可逆）。`)) return
   const r = await retire(d)
   if (!r.ok && r.msg) alert('退役失败：' + r.msg)
+}
+
+async function onRestore(d: DocItem) {
+  if (!confirm(`确认恢复上线《${d.title || d.original_filename || d.doc_id}》？\n将重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复。`)) return
+  const r = await restore(d)
+  if (!r.ok && r.msg) alert('恢复失败：' + r.msg)
 }
 </script>
 
@@ -136,6 +142,13 @@ async function onRetire(d: DocItem) {
               @click="onRetire(d)"
             >
               <Archive :size="13" :stroke-width="1.75" /> 退役
+            </button>
+            <button
+              v-else
+              type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-st-live transition hover:bg-st-live/10"
+              @click="onRestore(d)"
+            >
+              <ArchiveRestore :size="13" :stroke-width="1.75" /> 恢复上线
             </button>
           </template>
           <!-- 其他部门（只读）：申请授权 / 审批中 / 同步中 / 已放行 -->

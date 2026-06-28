@@ -652,6 +652,55 @@ def test_admin_revoke_all_demotes(monkeypatch):
     assert "SET role=%s" in sqls   # 降级 user_role
 
 
+# ── 恢复上线 /api/kb/restore（退役逆操作）──
+def test_restore_reactivates_retired(monkeypatch):
+    """退役文档恢复：status retired→active（meta+version）+ chunk is_active=1 + NOT_INDEXED。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("marketing", "dept_internal", "retired", 2)])
+    from opensearch_pipeline import api
+    resp = api.kb_restore(api.KbRetireRequest(doc_id="D1"), request=None, identity=api.Identity(user_id="kb1"))
+    assert resp.restored is True and resp.already is False
+    sqls = " ".join(c[0] for c in sink["calls"])
+    assert sqls.count("SET status='active'") == 2                      # document_meta + document_version
+    assert "is_active=1, index_status='NOT_INDEXED'" in sqls           # chunk 重激活 + 标脏
+
+
+def test_restore_already_active_idempotent(monkeypatch):
+    """已在线 → 幂等（restored=False, already=True），不写。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("marketing", "dept_internal", "active", 1)])
+    from opensearch_pipeline import api
+    resp = api.kb_restore(api.KbRetireRequest(doc_id="D1"), request=None, identity=api.Identity(user_id="kb1"))
+    assert resp.already is True and resp.restored is False
+    assert not [c for c in sink["calls"] if "SET status='active'" in c[0]]   # 幂等不写
+
+
+def test_restore_public_needs_kb_admin(monkeypatch):
+    """公开文档 dept_admin 不可恢复（与退役同款不对称）→ 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("marketing", "public", "retired", 1)])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_restore(api.KbRetireRequest(doc_id="D1"), request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_restore_scope_forbidden(monkeypatch):
+    """dept_admin 非管理部门 → 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "dept_internal", "retired", 1)])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_restore(api.KbRetireRequest(doc_id="D1"), request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
 def _stub_myreq(monkeypatch, request_rows, doc_state):
     """桩游标（按 SQL 片段分支）：主列表 fetchall 返回 request_rows；per-doc count(fetchone) +
     allowed_depts(fetchall) 由 doc_state 提供。用于验 /api/kb/my-access-requests 派生同步态。"""

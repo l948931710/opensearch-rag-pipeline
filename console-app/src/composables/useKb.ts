@@ -525,6 +525,22 @@ async function retire(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
   } finally { retireBusy.value = false }
 }
 
+// 恢复上线（退役逆操作）：重新激活 + 标脏待重索引；HA3 未删则即时可检索，否则下次维护重索引后恢复。
+async function restore(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
+  if (retireBusy.value) return { ok: false }
+  retireBusy.value = true
+  try {
+    if (import.meta.env.DEV && useSession().token === 'dev-preview') { d.status_badge = '排队中'; return { ok: true } }
+    const r = await apiJson<{ note?: string }>('/api/kb/restore', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id }) })
+    d.status_badge = '排队中'                       // 即时反映（NOT_INDEXED → 待重索引）；loadDocs 复算权威态
+    void loadDocs()
+    return { ok: true, msg: r.note }
+  } catch (e: any) {
+    const msg = e && e.status === 403 ? (e.detail || '无权恢复该文档') : uploadErrText(e)
+    return { ok: false, msg }
+  } finally { retireBusy.value = false }
+}
+
 export function useKb() {
   const session = useSession()
   const ownerDepts = computed(() => session.identity?.managedOwnerDepts ?? [])
@@ -547,7 +563,7 @@ export function useKb() {
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
-    approve, reject, retire,
+    approve, reject, retire, restore,
   }
 }
 
