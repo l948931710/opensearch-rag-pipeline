@@ -46,16 +46,16 @@ if not SIMULATE:
 # 1. 下载并解压代码包
 # ═══════════════════════════════════════════════════════════════
 print("=== 1. 下载 Archive 资源 ===")
-resource = odps.get_resource('opensearch_pipeline.zip')
+resource = odps.get_resource('opensearch_pipeline_production.zip')
 with resource.open(mode='rb') as reader:
-    with open('opensearch_pipeline.zip', 'wb') as writer:
+    with open('opensearch_pipeline_production.zip', 'wb') as writer:
         writer.write(reader.read())
 
 print("=== 2. 解压代码包 ===")
-if not os.path.exists('opensearch_pipeline.zip'):
-    raise RuntimeError("❌ 未能下载 opensearch_pipeline.zip")
+if not os.path.exists('opensearch_pipeline_production.zip'):
+    raise RuntimeError("❌ 未能下载 opensearch_pipeline_production.zip")
 
-with zipfile.ZipFile('opensearch_pipeline.zip', 'r') as zip_ref:
+with zipfile.ZipFile('opensearch_pipeline_production.zip', 'r') as zip_ref:
     zip_ref.extractall('.')
 print("✅ 解压成功")
 
