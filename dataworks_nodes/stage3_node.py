@@ -93,9 +93,16 @@ else:
     print(f"⚠️ 未获取到调度参数，按 T-1 兜底: {bizdate}")
 
 # ═══════════════════════════════════════════════════════════════
-# 3. 执行 Stage 3
+# 3. 执行 Stage 3（排空式：drain 整批 + pre-drain 三对账）
 # ═══════════════════════════════════════════════════════════════
-print(f"=== 4. 启动 Stage 3 ({'模拟' if SIMULATE else '生产'}) ===")
-from opensearch_pipeline.dataworks_orchestrator import run_stage
-run_stage(stage=3, bizdate=bizdate, simulate=SIMULATE)
+# ⚠️ 用 run_stage_drained（非单批 run_stage）：生产排空整个 stage-3 待处理集，并在 drain【之前】跑
+#    三个对账——reconcile_stranded_versions / reconcile_pending_deletes / reconcile_allowed_depts
+#    （Phase D 撤销·授权投影自愈，RAG_ALLOWED_DEPTS_ACL 关时 skipped no-op）。这些对账只在
+#    run_stage_drained 里；旧的单批 run_stage 既不排空也不跑对账。SIMULATE=True 时 drained 内部
+#    退化为单次 run_stage（行为不变）。
+# ⚠️ RAG_ALLOWED_DEPTS_ACL 不在此设默认——保持由 DataWorks 环境注入（双端 flip 前为 OFF），
+#    避免在 serving 侧之前单边激活 Phase D。
+print(f"=== 4. 启动 Stage 3 排空（{'模拟' if SIMULATE else '生产'}）===")
+from opensearch_pipeline.dataworks_orchestrator import run_stage_drained
+run_stage_drained(stage=3, bizdate=bizdate, simulate=SIMULATE)
 print("✅ Stage 3 完成！")
