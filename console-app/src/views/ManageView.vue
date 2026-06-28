@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen } from 'lucide-vue-next'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
@@ -17,22 +17,24 @@ import VersionHistoryModal from '@/components/manage/VersionHistoryModal.vue'
 import AccessRequestModal from '@/components/manage/AccessRequestModal.vue'
 import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
+import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
 
 // 知识库入口：管理员 → 分 tab 管理台（概览看板 / 文档管理，设计稿 SUB-TAB SWITCHER）；
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadApprovals, loadAccessRequests, loadAccessGrants, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadApprovals, loadAccessRequests, loadAccessGrants, loadAdminGrants, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 
-// ── 管理台子 tab ──
-type Tab = 'dash' | 'docs'
+// ── 管理台子 tab（成员管理仅 kb_admin 可见）──
+type Tab = 'dash' | 'docs' | 'members'
 const activeTab = ref<Tab>('dash')
-const tabs: { key: Tab; label: string; icon: any }[] = [
+const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
   { key: 'dash', label: '概览看板', icon: LayoutDashboard },
   { key: 'docs', label: '文档管理', icon: FolderOpen },
-]
+  ...(isKbAdmin.value ? [{ key: 'members' as Tab, label: '成员管理', icon: UserCog }] : []),
+])
 // 「文档管理」tab 角标 = 待你审核数（reviewCount，与侧栏入口红点同一来源）。
 
 // ── 员工概览卡（只读，可访问数据）──
@@ -52,6 +54,7 @@ onMounted(async () => {
     void loadApprovals()
     void loadAccessRequests()
     void loadAccessGrants()
+    if (isKbAdmin.value) void loadAdminGrants()
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
     if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
   } else {
@@ -137,6 +140,9 @@ onMounted(async () => {
       <UploadCard />
       <DocTable />
     </template>
+
+    <!-- 成员管理（仅 kb_admin）：维护部门管理员 + 其可管理 owner_dept（写授权） -->
+    <MemberRoleManager v-else-if="activeTab === 'members' && isKbAdmin" />
 
     <VersionHistoryModal />
     <AccessRequestModal />

@@ -560,6 +560,98 @@ def test_access_grants_list_employee_forbidden(monkeypatch):
     assert getattr(ei.value, "status_code", None) == 403
 
 
+# ── Phase F：成员/角色管理（kb_admin 专属）──
+def test_admin_grants_list_kb_admin(monkeypatch):
+    """kb_admin 列管理员名单 + 各自 managed_owner_depts + grantable 白名单。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [
+        [("u1", "张三", "marketing", "dept_admin"), ("u2", "李四", "", "kb_admin")],  # user_role
+        [("u1", "marketing"), ("u1", "finance")],                                     # dept_admin_grant
+    ])
+    from opensearch_pipeline import api
+    resp = api.kb_admin_grants_list(request=None, identity=api.Identity(user_id="kbadmin"))
+    by = {it.user_id: it for it in resp.items}
+    assert by["u1"].role == "dept_admin" and by["u1"].managed_owner_depts == ["finance", "marketing"]
+    assert by["u2"].role == "kb_admin" and by["u2"].managed_owner_depts == []
+    assert "marketing" in resp.grantable_owner_depts and "finance" in resp.grantable_owner_depts
+
+
+def test_admin_grants_dept_admin_forbidden(monkeypatch):
+    """成员管理 = kb_admin 专属：dept_admin 调 → 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_admin_grants_list(request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_admin_grant_creates_dept_admin(monkeypatch):
+    """kb_admin 授予 → upsert user_role=dept_admin + dept_admin_grant 行（净化后的组）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [None])   # 目标用户当前 role 查询 → 无行（新用户）
+    from opensearch_pipeline import api
+    resp = api.kb_admin_grant(
+        api.KbAdminGrantRequest(user_id="newuser", user_name="王五", owner_depts=["marketing", "typo_dept", "finance"], note="营销+财务"),
+        request=None, identity=api.Identity(user_id="kbadmin"))
+    assert resp.ok and resp.role == "dept_admin"
+    assert resp.managed_owner_depts == ["finance", "marketing"]            # typo_dept fail-closed 丢弃
+    sqls = " ".join(c[0] for c in sink["calls"])
+    assert "INSERT INTO fuling_knowledge.user_role" in sqls
+    assert sqls.count("INSERT INTO fuling_knowledge.dept_admin_grant") == 2  # 2 个净化后的组
+
+
+def test_admin_grant_invalid_depts_400(monkeypatch):
+    """owner_depts 全非白名单 → 400（不写库）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_admin_grant(api.KbAdminGrantRequest(user_id="u9", owner_depts=["nope", "bad"]),
+                           request=None, identity=api.Identity(user_id="kbadmin"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_admin_grant_self_forbidden(monkeypatch):
+    """不能改自己的角色 → 400。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_admin_grant(api.KbAdminGrantRequest(user_id="kbadmin", owner_depts=["marketing"]),
+                           request=None, identity=api.Identity(user_id="kbadmin"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_admin_grant_kb_admin_target_forbidden(monkeypatch):
+    """目标已是 kb_admin → 拒绝（防误降级）400。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [("kb_admin",)])   # 目标当前 role=kb_admin
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_admin_grant(api.KbAdminGrantRequest(user_id="otherkb", owner_depts=["marketing"]),
+                           request=None, identity=api.Identity(user_id="kbadmin"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_admin_revoke_all_demotes(monkeypatch):
+    """撤销全部授权 → 软删 grant + 无剩余 → 降级 employee。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("dept_admin",), (0,)])   # 目标 role；撤后剩余 0
+    from opensearch_pipeline import api
+    resp = api.kb_admin_grant_revoke(api.KbAdminRevokeRequest(user_id="u1"),
+                                     request=None, identity=api.Identity(user_id="kbadmin"))
+    assert resp.ok and resp.role == "employee"
+    sqls = " ".join(c[0] for c in sink["calls"])
+    assert "UPDATE fuling_knowledge.dept_admin_grant SET is_active=0" in sqls
+    assert "SET role=%s" in sqls   # 降级 user_role
+
+
 def _stub_myreq(monkeypatch, request_rows, doc_state):
     """桩游标（按 SQL 片段分支）：主列表 fetchall 返回 request_rows；per-doc count(fetchone) +
     allowed_depts(fetchall) 由 doc_state 提供。用于验 /api/kb/my-access-requests 派生同步态。"""

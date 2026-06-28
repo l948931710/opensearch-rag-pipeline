@@ -1452,6 +1452,15 @@ def _require_kb_console(identity: Optional[Identity]):
     return kb
 
 
+def _require_kb_admin(identity: Optional[Identity]):
+    """强制：调用者必须是【知识库管理员 kb_admin】（成员/角色管理 = kb_admin 专属，dept_admin 不可）。"""
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    if kb.role != ROLE_KB_ADMIN:
+        raise HTTPException(status_code=403, detail="仅知识库管理员可管理成员/角色")
+    return kb
+
+
 def _kb_owner_scope_sql(kb, col: str = "owner_dept"):
     """owner_dept 作用域 SQL：kb_admin 不限；dept_admin 限其 managed；无授权 → 匹配空集。"""
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
@@ -2482,6 +2491,38 @@ class KbAccessGrantListResponse(BaseModel):
     items: List[KbAccessGrantItem] = Field(default_factory=list)
 
 
+# ── Phase F：成员/角色管理（kb_admin 维护 dept_admin 写授权；三分授权 读≠管理≠授权）──
+class KbAdminItem(BaseModel):
+    user_id: str = ""
+    user_name: str = ""
+    role: str = ""                                            # dept_admin / kb_admin
+    managed_owner_depts: List[str] = Field(default_factory=list)  # dept_admin 显式授权；kb_admin=全部(空数组表示全量)
+
+
+class KbAdminListResponse(BaseModel):
+    items: List[KbAdminItem] = Field(default_factory=list)
+    grantable_owner_depts: List[str] = Field(default_factory=list)  # 表单可选项（写白名单单一来源）
+
+
+class KbAdminGrantRequest(BaseModel):
+    user_id: str = ""                                         # 钉钉 staffId
+    user_name: str = ""
+    owner_depts: List[str] = Field(default_factory=list)      # 授予可管理的 owner_dept（权威全集，提交即覆盖）
+    note: str = ""
+
+
+class KbAdminRevokeRequest(BaseModel):
+    user_id: str = ""
+    owner_dept: str = ""                                      # 空 = 撤销该用户全部授权并降级 employee
+
+
+class KbAdminGrantResponse(BaseModel):
+    user_id: str = ""
+    role: str = ""
+    managed_owner_depts: List[str] = Field(default_factory=list)
+    ok: bool = True
+
+
 class MyAccessRequestItem(BaseModel):
     id: str = ""
     doc_id: str = ""
@@ -2840,6 +2881,167 @@ def kb_access_request_revoke(req: KbAccessDecisionRequest, request: Request,
     撤销后申请人可重新申请（revoked 同 rejected，不阻 submit 去重——后者只挡 pending）。
     """
     return _kb_access_decide(req, request, identity, decision="revoked", from_status="approved")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase F — 成员/角色管理（kb_admin 专属）：维护 dept_admin 角色 + 其 owner_dept 写授权。
+#   权威表：fuling_knowledge.user_role.role + dept_admin_grant（resolve_kb_identity 现查,撤销即时生效）。
+#   三分授权：读组(acl_groups) ≠ 可管理(dept_admin_grant) ≠ 可授权(本组端点=kb_admin)。
+#   守卫：kb_admin 用户不经本 UI 改（防误降级/锁死）；不能改自己；owner_dept 经 sanitize fail-closed。
+# ═══════════════════════════════════════════════════════════════
+@app.get("/api/kb/admin-grants", response_model=KbAdminListResponse)
+def kb_admin_grants_list(request: Request,
+                         identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 查看现行管理员名单（dept_admin + kb_admin）及各自可管理的 owner_dept。只读。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    _require_kb_admin(identity)
+    from opensearch_pipeline.kb_authz import _valid_owner_depts
+    items: List[KbAdminItem] = []
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, user_name, dept_code, role FROM fuling_knowledge.user_role "
+                            "WHERE is_active=1 AND role IS NOT NULL AND role<>'employee' ORDER BY role, user_id")
+                roles = cur.fetchall()
+                cur.execute("SELECT user_id, managed_owner_dept FROM fuling_knowledge.dept_admin_grant "
+                            "WHERE is_active=1")
+                grants: Dict[str, List[str]] = {}
+                for r in cur.fetchall():
+                    if r and r[0]:
+                        grants.setdefault(r[0], []).append(r[1])
+                for r in roles:
+                    uid = r[0] or ""
+                    items.append(KbAdminItem(
+                        user_id=uid, user_name=r[1] or "", role=r[3] or "",
+                        managed_owner_depts=sorted(grants.get(uid, []))))
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_admin_grants_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"成员名单查询失败 (trace: {trace_id})")
+    return KbAdminListResponse(items=items, grantable_owner_depts=sorted(_valid_owner_depts()))
+
+
+@app.post("/api/kb/admin-grants", response_model=KbAdminGrantResponse)
+def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
+                   identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 授予/更新一名【部门管理员】可管理的 owner_dept（owner_depts = 权威全集,提交即覆盖）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_admin(identity)
+    from opensearch_pipeline.kb_authz import sanitize_owner_depts, ROLE_DEPT_ADMIN, ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    uid = (req.user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="缺少 user_id（钉钉 staffId）")
+    if uid == kb.user_id:
+        raise HTTPException(status_code=400, detail="不能修改自己的角色/授权")
+    depts = sanitize_owner_depts(req.owner_depts)   # 净化 + 写白名单（fail-closed 丢非法）
+    if not depts:
+        raise HTTPException(status_code=400, detail="可管理部门为空或全不在白名单（无法授予）")
+    assert_metadata_write_allowed("kb_admin_grant", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    note = (req.note or "")[:255] or None
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 守卫：已是 kb_admin 的用户不经本 UI 改（避免误降级；kb_admin 调整走运维脚本）
+                cur.execute("SELECT role FROM fuling_knowledge.user_role WHERE user_id=%s AND is_active=1 "
+                            "ORDER BY updated_at DESC, id DESC LIMIT 1", (uid,))
+                row = cur.fetchone()
+                if row and (row[0] or "") == ROLE_KB_ADMIN:
+                    raise HTTPException(status_code=400,
+                                        detail="该用户已是知识库管理员（kb_admin），请用运维脚本调整以免误降级")
+                # 角色 → dept_admin（dept_code 同步为可管理组 CSV，与 seed 口径一致）
+                cur.execute("INSERT INTO fuling_knowledge.user_role (user_id, user_name, dept_code, role, is_active) "
+                            "VALUES (%s,%s,%s,%s,1) ON DUPLICATE KEY UPDATE "
+                            "user_name=COALESCE(VALUES(user_name), user_name), dept_code=VALUES(dept_code), "
+                            "role=VALUES(role), is_active=1, updated_at=NOW()",
+                            (uid, (req.user_name or None), ",".join(depts), ROLE_DEPT_ADMIN))
+                # 权威全集语义：先软撤销本次【未包含】的旧授权,再 upsert 本次
+                ph = ",".join(["%s"] * len(depts))
+                cur.execute(f"UPDATE fuling_knowledge.dept_admin_grant SET is_active=0, updated_at=NOW() "
+                            f"WHERE user_id=%s AND is_active=1 AND managed_owner_dept NOT IN ({ph})",
+                            (uid, *depts))
+                for owner in depts:
+                    cur.execute("INSERT INTO fuling_knowledge.dept_admin_grant "
+                                "(user_id, managed_owner_dept, granted_by, note, is_active) VALUES (%s,%s,%s,%s,1) "
+                                "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
+                                "note=VALUES(note), updated_at=NOW()",
+                                (uid, owner, kb.user_id, note))
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_admin_grant 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"授予部门管理员失败 (trace: {trace_id})")
+    write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=f"grant dept_admin {uid} → {','.join(depts)}")
+    return KbAdminGrantResponse(user_id=uid, role=ROLE_DEPT_ADMIN, managed_owner_depts=depts, ok=True)
+
+
+@app.post("/api/kb/admin-grants/revoke", response_model=KbAdminGrantResponse)
+def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
+                          identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 撤销部门管理员授权：owner_dept 指定→撤该一项；为空→撤全部并降级 employee。
+    无活跃授权剩余时把 user_role.role 降为 employee（即时失去管理入口）。kb_admin/自身不可经此撤销。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_admin(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, ROLE_EMPLOYEE
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    uid = (req.user_id or "").strip()
+    owner = (req.owner_dept or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="缺少 user_id")
+    if uid == kb.user_id:
+        raise HTTPException(status_code=400, detail="不能撤销自己的授权")
+    assert_metadata_write_allowed("kb_admin_grant_revoke", get_config().rds.host, kind="rds")
+    trace_id = uuid.uuid4().hex[:8]
+    demoted = False
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT role FROM fuling_knowledge.user_role WHERE user_id=%s AND is_active=1 "
+                            "ORDER BY updated_at DESC, id DESC LIMIT 1", (uid,))
+                row = cur.fetchone()
+                if row and (row[0] or "") == ROLE_KB_ADMIN:
+                    raise HTTPException(status_code=400, detail="不能经本 UI 撤销知识库管理员（kb_admin）")
+                if owner:
+                    cur.execute("UPDATE fuling_knowledge.dept_admin_grant SET is_active=0, updated_at=NOW() "
+                                "WHERE user_id=%s AND managed_owner_dept=%s AND is_active=1", (uid, owner))
+                else:
+                    cur.execute("UPDATE fuling_knowledge.dept_admin_grant SET is_active=0, updated_at=NOW() "
+                                "WHERE user_id=%s AND is_active=1", (uid,))
+                cur.execute("SELECT COUNT(*) FROM fuling_knowledge.dept_admin_grant "
+                            "WHERE user_id=%s AND is_active=1", (uid,))
+                remaining = int(cur.fetchone()[0] or 0)
+                if remaining == 0:
+                    cur.execute("UPDATE fuling_knowledge.user_role SET role=%s, updated_at=NOW() "
+                                "WHERE user_id=%s", (ROLE_EMPLOYEE, uid))
+                    demoted = True
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_admin_grant_revoke 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"撤销部门管理员授权失败 (trace: {trace_id})")
+    write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_REVOKE",
+                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                message=f"revoke {uid} owner={owner or 'ALL'} demoted={demoted}")
+    return KbAdminGrantResponse(user_id=uid, role=(ROLE_EMPLOYEE if demoted else "dept_admin"), ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════

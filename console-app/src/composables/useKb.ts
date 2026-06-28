@@ -29,6 +29,10 @@ export interface AccessGrantItem {
   id: string; doc_id: string; doc_title: string; owner_dept: string
   requester_dept: string; requester_name: string; permission_level: string; reason: string; decided_at: string
 }
+// Phase F 成员/角色管理（kb_admin 专属）：现行管理员 + 各自可管理 owner_dept（后端 /api/kb/admin-grants）。
+export interface AdminItem {
+  user_id: string; user_name: string; role: string; managed_owner_depts: string[]
+}
 // 申请人侧：我的申请 + 派生同步态（已批准·待同步 vs 已放行；后端 /api/kb/my-access-requests）。
 export interface MyAccessRequestItem {
   id: string; doc_id: string; doc_title: string; owner_dept: string; requester_dept: string
@@ -64,6 +68,8 @@ const verHistory = ref<{ doc: DocItem | null; versions: VersionItem[]; loading: 
 const approvals = ref<PendingItem[]>([])
 const accessRequests = ref<AccessRequestItem[]>([])   // 授权申请队列（审批人侧 · pending）
 const accessGrants = ref<AccessGrantItem[]>([])       // 已授权清单（审批人侧 · approved 存量，供撤销）
+const adminGrants = ref<AdminItem[]>([])              // Phase F 现行管理员名单（kb_admin 专属）
+const grantableDepts = ref<string[]>([])             // 授予表单可选 owner_dept（写白名单）
 const loadingDocs = ref(false)
 const docScope = ref<'managed' | 'all'>('managed')   // 本部门(my-docs) / 全部门只读浏览(browse)
 // 授权申请（申请人侧，Phase C）：本会话内已申请的 doc_id（无后端持久化，仅即时反映「审批中」）。
@@ -450,6 +456,61 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
   } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
 }
 
+// ── Phase F：成员/角色管理（仅 kb_admin）──
+async function loadAdminGrants() {
+  const s = useSession()
+  if (s.role !== 'kb_admin') { adminGrants.value = []; grantableDepts.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    adminGrants.value = [
+      { user_id: 'mgr001', user_name: '王伟', role: 'dept_admin', managed_owner_depts: ['marketing'] },
+      { user_id: 'mgr002', user_name: '李娜', role: 'dept_admin', managed_owner_depts: ['quality', 'production'] },
+      { user_id: 'kb001', user_name: '系统管理员', role: 'kb_admin', managed_owner_depts: [] },
+    ]
+    grantableDepts.value = ['marketing', 'production', 'quality', 'finance', 'hr', 'supply', 'pmc', 'rd', 'admin', 'it']
+    return
+  }
+  try {
+    const r = await apiJson<{ items: AdminItem[]; grantable_owner_depts: string[] }>('/api/kb/admin-grants', { auth: true })
+    adminGrants.value = r.items || []
+    grantableDepts.value = r.grantable_owner_depts || []
+  } catch { adminGrants.value = []; grantableDepts.value = [] }   // 端点未上线/非 kb_admin → 静默空
+}
+
+// 授予/更新一名部门管理员（owner_depts = 权威全集,提交即覆盖）。成功返回 true。
+async function grantDeptAdmin(userId: string, userName: string, ownerDepts: string[], note: string): Promise<boolean> {
+  if (apprBusy.value) return false
+  apprBusy.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') {
+      const i = adminGrants.value.findIndex((a) => a.user_id === userId)
+      const row: AdminItem = { user_id: userId, user_name: userName, role: 'dept_admin', managed_owner_depts: [...ownerDepts] }
+      adminGrants.value = i >= 0 ? adminGrants.value.map((a, k) => (k === i ? row : a)) : [...adminGrants.value, row]
+      return true
+    }
+    await apiJson('/api/kb/admin-grants', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, user_name: userName, owner_depts: ownerDepts, note }) })
+    await loadAdminGrants()
+    return true
+  } catch (e: any) { alert('授予失败：' + uploadErrText(e)); return false } finally { apprBusy.value = false }
+}
+
+// 撤销：ownerDept 指定→撤该一项；为空→撤全部并降级 employee。
+async function revokeAdminGrant(userId: string, ownerDept = ''): Promise<void> {
+  if (apprBusy.value) return
+  apprBusy.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') {
+      adminGrants.value = adminGrants.value
+        .map((a) => (a.user_id === userId ? { ...a, managed_owner_depts: ownerDept ? a.managed_owner_depts.filter((d) => d !== ownerDept) : [] } : a))
+        .filter((a) => a.role === 'kb_admin' || a.managed_owner_depts.length > 0)   // 无授权剩余 → 视为降级移出
+      return
+    }
+    await apiJson('/api/kb/admin-grants/revoke', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, owner_dept: ownerDept }) })
+    await loadAdminGrants()
+  } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+}
+
 async function retire(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
   if (retireBusy.value) return { ok: false }
   retireBusy.value = true
@@ -475,7 +536,7 @@ export function useKb() {
 
   return {
     // 状态
-    docs, filtered, approvals, accessRequests, accessGrants, loadingDocs, docScope, q, filter, sortKey, sortDir,
+    docs, filtered, approvals, accessRequests, accessGrants, adminGrants, grantableDepts, loadingDocs, docScope, q, filter, sortKey, sortDir,
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
@@ -483,6 +544,7 @@ export function useKb() {
     // 方法
     loadDocs, loadStats, loadConfig, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, setScope,
+    loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire,
@@ -491,7 +553,7 @@ export function useKb() {
 
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; loadingDocs.value = false
+  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null
