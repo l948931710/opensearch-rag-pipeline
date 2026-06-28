@@ -58,4 +58,4 @@ CREATE TABLE IF NOT EXISTS qa_daily_metrics (
     tz_shift_hours       INT          DEFAULT NULL COMMENT 'Pacific→Beijing offset used for bucketing',
     computed_at          DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_slo_ok (slo_ok)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -43,4 +43,4 @@ CREATE TABLE IF NOT EXISTS pipeline_run (
     finished_at             DATETIME     DEFAULT NULL,
     INDEX idx_bizdate (bizdate),
     INDEX idx_started (started_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

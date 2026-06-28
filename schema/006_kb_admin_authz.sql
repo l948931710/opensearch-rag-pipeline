@@ -42,5 +42,5 @@ CREATE TABLE IF NOT EXISTS dept_admin_grant (
     updated_at          DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_user_owner (user_id, managed_owner_dept),
     INDEX idx_user_active (user_id, is_active)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='部门管理员可管理的 owner_dept 显式授权（写授权，绝不从读组推导）';

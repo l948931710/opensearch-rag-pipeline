@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS user_feedback (
     updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_feedback_id (feedback_id),
     INDEX idx_session (session_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS escalation_ticket (
     id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS escalation_ticket (
     closed_at           DATETIME DEFAULT NULL,
     updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_ticket_id (ticket_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 全新安装时 fuling_operation 里没有 qa_session_log（001 只在 fuling_knowledge 建过），
 -- 下方对它的 CALL/UPDATE/ALTER 会直接报 1146。这里按「001 基础形态 + 本文件追加的全部列」
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS qa_session_log (
     INDEX idx_session (session_id),
     INDEX idx_user (user_id),
     INDEX idx_message_id (message_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ------------------------------------------------------------
 -- Helper stored procedures for idempotent DDL operations

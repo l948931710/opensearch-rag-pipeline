@@ -69,5 +69,5 @@ CREATE TABLE IF NOT EXISTS qa_conversation (
     hidden_at        DATETIME(3) DEFAULT NULL,
     PRIMARY KEY (user_id, conversation_id),
     INDEX idx_user_visible_recent (user_id, hidden_at, last_message_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='控制台会话元数据；隐藏状态与审计日志分离';

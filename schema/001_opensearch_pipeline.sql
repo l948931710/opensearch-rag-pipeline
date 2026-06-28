@@ -2,6 +2,11 @@
 # OpenSearch RAG Pipeline — RDS Schema (Production Aligned)
 # ═══════════════════════════════════════════════════════════════
 # 在 fuling_knowledge 数据库上执行
+# ───────────────────────────────────────────────────────────────
+# ⚠️ COLLATE 约定：所有表【显式】 COLLATE=utf8mb4_unicode_ci（全库统一）。绝不依赖服务器默认——
+#    RDS MySQL 8 默认 utf8mb4_0900_ai_ci，跨版本/分批建库会让不同表拿到不同 collation，跨表
+#    JOIN（如 X.doc_id = document_meta.doc_id）即报 1267 "Illegal mix of collations"（2026-06-27
+#    kb_access_request 实证：未显式 COLLATE → _0900 → 三个 JOIN 端点 500）。新增表/迁移务必照此显式写。
 # ═══════════════════════════════════════════════════════════════
 
 CREATE DATABASE IF NOT EXISTS fuling_knowledge;
@@ -25,7 +30,7 @@ CREATE TABLE IF NOT EXISTS user_role (
     -- user_id 必须唯一：dept_code 驱动 HA3 dept_internal 权限过滤，重复行会导致部门解析不确定；
     -- 代码里的 INSERT ... ON DUPLICATE KEY UPDATE 也依赖此键去重（存量库见 003_user_role_unique.sql）
     UNIQUE KEY uk_user_id (user_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS document_acl_rule (
     id             BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -38,7 +43,7 @@ CREATE TABLE IF NOT EXISTS document_acl_rule (
     created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_doc_id (doc_id),
     INDEX idx_principal (principal_type, principal_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ──────────────────────────────────────────────────────────────
 -- 2. Metadata & Classification Tables
@@ -54,7 +59,7 @@ CREATE TABLE IF NOT EXISTS tag_taxonomy (
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_tag_key_val (tag_key, tag_value)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS document_meta (
     id                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -83,7 +88,7 @@ CREATE TABLE IF NOT EXISTS document_meta (
     INDEX idx_category (category_l1, category_l2),
     INDEX idx_permission (permission_level),
     INDEX idx_owner_dept (owner_dept)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS document_tag (
     id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -93,7 +98,7 @@ CREATE TABLE IF NOT EXISTS document_tag (
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_doc_tag (doc_id, tag_key, tag_value),
     INDEX idx_tag (tag_key, tag_value)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ──────────────────────────────────────────────────────────────
 -- 3. Document Version & RAG State Table
@@ -171,7 +176,7 @@ CREATE TABLE IF NOT EXISTS document_version (
     INDEX idx_chunk (chunk_status),
     INDEX idx_index (index_status),
     INDEX idx_content_process (content_process_status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ──────────────────────────────────────────────────────────────
 -- 4. Chunk Metadata Management Table
@@ -231,7 +236,7 @@ CREATE TABLE IF NOT EXISTS chunk_meta (
     INDEX idx_index_status (index_status),
     INDEX idx_is_active (is_active),
     INDEX idx_permission_dept (permission_level, owner_dept)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ──────────────────────────────────────────────────────────────
 -- 5. Operational, Audit & Queue Tables
@@ -251,7 +256,7 @@ CREATE TABLE IF NOT EXISTS kb_audit_log (
     message        TEXT DEFAULT NULL,
     created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_doc_id (doc_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS kb_import_job (
     id                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -275,7 +280,7 @@ CREATE TABLE IF NOT EXISTS kb_import_job (
     created_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at            DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_job_id (job_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS review_task (
     id                         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -299,7 +304,7 @@ CREATE TABLE IF NOT EXISTS review_task (
     updated_at                 DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_task_id (task_id),
     INDEX idx_doc_version (doc_id, version_no)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS faq_review_queue (
     id                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -327,7 +332,7 @@ CREATE TABLE IF NOT EXISTS faq_review_queue (
     updated_at            DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_faq_id (faq_id),
     INDEX idx_source_doc (source_doc_id, source_version_no)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS qa_session_log (
     id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -348,7 +353,7 @@ CREATE TABLE IF NOT EXISTS qa_session_log (
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_session (session_id),
     INDEX idx_user (user_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS user_feedback (
     id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -374,7 +379,7 @@ CREATE TABLE IF NOT EXISTS user_feedback (
     updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_feedback_id (feedback_id),
     INDEX idx_session (session_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS escalation_ticket (
     id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -399,7 +404,7 @@ CREATE TABLE IF NOT EXISTS escalation_ticket (
     closed_at           DATETIME DEFAULT NULL,
     updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_ticket_id (ticket_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ──────────────────────────────────────────────────────────────
 -- 6. Batch LLM Processing Tables
@@ -420,7 +425,7 @@ CREATE TABLE IF NOT EXISTS batch_llm_job (
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_job_id (job_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS batch_llm_item (
     id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -435,7 +440,7 @@ CREATE TABLE IF NOT EXISTS batch_llm_item (
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at    DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_job_custom (job_id, custom_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ──────────────────────────────────────────────────────────────
 -- 7. Downstream RAG-Specific Pipeline Support Tables
@@ -456,7 +461,7 @@ CREATE TABLE IF NOT EXISTS opensearch_bulk_job (
     created_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
     completed_at          DATETIME DEFAULT NULL,
     UNIQUE KEY uk_job_id (job_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='OpenSearch bulk 索引任务跟踪';
 
 CREATE TABLE IF NOT EXISTS document_sensitive_finding (
@@ -477,7 +482,7 @@ CREATE TABLE IF NOT EXISTS document_sensitive_finding (
       COMMENT 'REDACTED / QUARANTINED / IGNORED',
     created_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_doc_version (doc_id, version_no)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='敏感信息检测结果';
 
 SET FOREIGN_KEY_CHECKS = 1;
