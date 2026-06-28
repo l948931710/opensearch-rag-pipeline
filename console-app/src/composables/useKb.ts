@@ -58,11 +58,14 @@ export interface KbEmbedRun { bizdate: string; embedded: number; failed: number;
 export interface KbDeptCoverage { owner_dept: string; docs: number; new_month: number; qa_hits: number; no_answer_rate: number; pii_docs: number }
 export interface KbFeedbackDay { day: string; up: number; down: number }
 export interface KbDownvoteReason { reason: string; count: number }
+export interface KbFileType { ftype: string; count: number }
 export interface KbGovernance {
   window_days: number
+  file_types: KbFileType[]
   docs_active: number; docs_in_index: number; dual_version_docs: number
   avg_latency_ms: number; p50_latency_ms: number; p95_latency_ms: number
   avg_retrieval_ms: number; avg_llm_ms: number; embed_runs: KbEmbedRun[]
+  qa_api_success_rate: number; retrieval_api_success_rate: number; errors_24h: number; qa_total_30d: number
   pii_redacted_docs: number; pii_quarantined_docs: number
   answer_total: number; answer_success: number; answer_refusal: number; answer_no_result: number; answer_error: number
   effective_rate: number
@@ -284,6 +287,11 @@ async function loadGovernance() {
   if (import.meta.env.DEV && s.token === 'dev-preview') {
     kbGovernance.value = {
       window_days: 30, docs_active: 1618, docs_in_index: 1475, dual_version_docs: 0,
+      file_types: [
+        { ftype: 'PDF', count: 628 }, { ftype: 'DOCX', count: 607 }, { ftype: 'XLSX', count: 313 },
+        { ftype: 'PPTX', count: 5 }, { ftype: '图片', count: 6 },
+      ],
+      qa_api_success_rate: 0.974, retrieval_api_success_rate: 0.974, errors_24h: 0, qa_total_30d: 951,
       avg_latency_ms: 14035, p50_latency_ms: 8106, p95_latency_ms: 54994, avg_retrieval_ms: 1538, avg_llm_ms: 12428,
       embed_runs: [
         { bizdate: '2026-06-23', embedded: 117, failed: 0, fail_rate: 0 },

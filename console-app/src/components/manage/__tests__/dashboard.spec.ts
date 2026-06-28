@@ -37,6 +37,8 @@ const INSIGHTS: KbInsights = {
 }
 const GOV: KbGovernance = {
   window_days: 30, docs_active: 1618, docs_in_index: 1475, dual_version_docs: 0,
+  file_types: [{ ftype: 'PDF', count: 628 }, { ftype: 'DOCX', count: 607 }, { ftype: 'XLSX', count: 313 }],
+  qa_api_success_rate: 0.974, retrieval_api_success_rate: 0.974, errors_24h: 0, qa_total_30d: 951,
   avg_latency_ms: 14035, p50_latency_ms: 8106, p95_latency_ms: 54994, avg_retrieval_ms: 1538, avg_llm_ms: 12428,
   embed_runs: [{ bizdate: '2026-06-23', embedded: 117, failed: 0, fail_rate: 0 }],
   pii_redacted_docs: 475, pii_quarantined_docs: 3,
@@ -72,15 +74,25 @@ describe('KbAdminDashboard — 全库真实口径，无造数', () => {
   it('治理 + 洞察就绪 → 运行健康(含治理风险)/部门覆盖与失衡/知识效果/用户反馈 真实数', () => {
     const w = mountWith(KbAdminDashboard, identity({ role: 'kb_admin' }),
       { stats: { total: 1618, active: 1618, retired: 0, chunks: 27659, new_this_month: 1249, by_badge: { 已上线: 1475 } }, gov: GOV, insights: INSIGHTS })
+    // 全库资产概览扩展：各部门文档数分布 + 文件类型分布
+    expect(w.text()).toContain('各部门文档数分布')
+    expect(w.text()).toContain('文件类型分布')
+    expect(w.text()).toContain('PDF')
     expect(w.text()).toContain('运行健康')
     expect(w.text()).toContain('入库成功率')          // 设计版健康卡（1475/1618=91.2%）
     expect(w.text()).toContain('91.2%')
-    expect(w.text()).toContain('检索可用率')
     expect(w.text()).toContain('数据一致性')
     expect(w.text()).toContain('100.0%')             // 数据一致性 = (1475-0)/1475（百分比）
-    expect(w.text()).toContain('治理风险')           // 并入运行健康一个区
+    expect(w.text()).toContain('问答延迟 p95')        // p95 移入运行健康
+    expect(w.text()).toContain('近期入库趋势')        // 入库改为趋势图
+    expect(w.text()).toContain('治理风险')           // 并入运行健康下面
     expect(w.text()).toContain('475')                // PII 已脱敏文档
     expect(w.text()).toContain('19')                 // 转人工
+    // 服务可用性（独立区）
+    expect(w.text()).toContain('服务可用性')
+    expect(w.text()).toContain('问答 API 成功率')
+    expect(w.text()).toContain('97.4%')              // 问答/检索 API 成功率
+    expect(w.text()).toContain('流式回答中断率')      // 无埋点 → 显示「—」
     // 部门覆盖与失衡（设计版表格）
     expect(w.text()).toContain('部门覆盖与失衡')
     expect(w.text()).toContain('无答案率')

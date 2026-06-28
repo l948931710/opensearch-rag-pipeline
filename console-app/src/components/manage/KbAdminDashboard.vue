@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import {
   Database, CheckCircle2, Archive, Clock, GitBranch, Timer, Cpu,
   ShieldAlert, ShieldCheck, ThumbsUp, ThumbsDown, Headset, Percent, Quote, MessageSquare, Ban,
+  Search, Activity, AlertTriangle,
 } from 'lucide-vue-next'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
@@ -12,6 +13,7 @@ import BarList from './BarList.vue'
 import DeptTable from './DeptTable.vue'
 import FeedbackTrend from './FeedbackTrend.vue'
 import DonutChart from './DonutChart.vue'
+import MiniTrend from './MiniTrend.vue'
 
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
@@ -48,23 +50,41 @@ const assetCards = computed<Card[]>(() => {
   ]
 })
 
-// ── 运行健康（含治理风险，一个区）——设计版指标：入库成功率/检索可用率/数据一致性/嵌入失败率 ──
+// ── 全库运行健康：入库成功率 / 数据一致性 / 嵌入失败率 / 问答延迟 p95（检索可用率移入「服务可用性」）──
 const healthCards = computed<Card[]>(() => {
   const g = kbGovernance.value
   const maxFail = Math.max(0, ...(g?.embed_runs || []).map((r) => r.fail_rate))
   const ingest = (g && g.docs_active) ? g.docs_in_index / g.docs_active : undefined
-  const avail = (g && g.answer_total) ? (g.answer_total - g.answer_error) / g.answer_total : undefined
   const dual = g?.dual_version_docs ?? 0
   const consistency = (g && g.docs_in_index) ? (g.docs_in_index - dual) / g.docs_in_index : undefined
   return [
     { label: '入库成功率', value: pct(ingest), icon: CheckCircle2, tone: 'text-st-live', hint: `${g?.docs_in_index ?? 0}/${g?.docs_active ?? 0} 已索引上线` },
-    { label: '检索可用率', value: pct(avail), icon: Timer, tone: 'text-st-live', hint: `p95 ${ms2s(g?.p95_latency_ms)} · 非错误回答占比` },
     { label: '数据一致性', value: pct(consistency), icon: GitBranch, tone: dual ? 'text-st-warn' : 'text-st-live', hint: dual ? `${dual} 文档双版本残留` : '无双版本残留' },
     { label: '嵌入失败率', value: pct(maxFail), icon: Cpu, tone: maxFail > 0 ? 'text-st-warn' : 'text-st-live', hint: '近 8 次入库最差' },
+    { label: '问答延迟 p95', value: ms2s(g?.p95_latency_ms), icon: Timer, tone: 'text-foreground', hint: `p50 ${ms2s(g?.p50_latency_ms)} · 含流式渲染` },
   ]
 })
-const embedItems = computed(() =>
-  (kbGovernance.value?.embed_runs || []).map((r) => ({ label: r.bizdate, sub: `失败率 ${pct(r.fail_rate)}`, value: r.embedded })))
+// 近期入库趋势（纵向柱，最新在右）：bizdate 取 MM-DD，值 = 嵌入块数。
+const embedTrend = computed(() =>
+  [...(kbGovernance.value?.embed_runs || [])].reverse().map((r) => {
+    const d = (r.bizdate || '').replace(/\D/g, '')
+    return { label: d.length >= 4 ? `${d.slice(-4, -2)}-${d.slice(-2)}` : (r.bizdate || ''), value: r.embedded, sub: `失败率 ${pct(r.fail_rate)}` }
+  }))
+// ── 服务可用性 ──
+const availabilityCards = computed<Card[]>(() => {
+  const g = kbGovernance.value
+  return [
+    { label: '问答 API 成功率', value: pct(g?.qa_api_success_rate), icon: CheckCircle2, tone: 'text-st-live', hint: `近 ${g?.window_days ?? 30} 天 · ${fmtN(g?.qa_total_30d)} 次` },
+    { label: '检索 API 成功率', value: pct(g?.retrieval_api_success_rate), icon: Search, tone: 'text-st-live', hint: '检索正常返回占比' },
+    { label: '流式回答中断率', value: '—', icon: Activity, tone: 'text-st-muted', hint: '暂无埋点（待前端流式上报）' },
+    { label: '近 24h 错误数', value: g?.errors_24h ?? 0, icon: AlertTriangle, tone: g?.errors_24h ? 'text-st-fail' : 'text-st-live', hint: '失败请求 · DashScope/HA3' },
+  ]
+})
+// ── 全库资产概览扩展：各部门文档数分布（识别偏科）+ 文件类型分布 ──
+const deptDocItems = computed(() =>
+  [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => c.docs - a.docs).map((d) => ({ label: deptLabel(d.owner_dept), value: d.docs })))
+const fileTypeItems = computed(() => (kbGovernance.value?.file_types || []).map((f) => ({ label: f.ftype, value: f.count })))
+const fileTotal = computed(() => (kbGovernance.value?.file_types || []).reduce((s, f) => s + f.count, 0))
 const riskCards = computed<Card[]>(() => {
   const g = kbGovernance.value
   // 未答出率移除：与「全库知识效果 · 无答案率」重复（同一 (无结果+拒答)/总 口径）。
@@ -117,7 +137,7 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-card div
 
 <template>
   <div class="space-y-7">
-    <!-- 全库资产概览（含状态分布） -->
+    <!-- 全库资产概览（含状态分布 + 部门覆盖情况） -->
     <section>
       <p :class="HEADER">全库资产概览</p>
       <div :class="GRID">
@@ -125,29 +145,47 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-card div
       </div>
       <p :class="SUBHEAD" class="ml-0.5 mt-4">状态分布</p>
       <StatusDistBar :by-badge="kbStats?.by_badge || {}" />
+      <!-- 各部门文档数分布（偏科）| 文件类型分布 —— 一个框两半 -->
+      <div v-if="kbGovernance" :class="SPLIT" class="mt-4">
+        <div class="p-[15px]">
+          <p :class="SUBHEAD">各部门文档数分布</p>
+          <BarList bare :items="deptDocItems" unit=" 篇" empty="暂无文档。" />
+          <p class="mt-1 text-[11px] text-faint">条形悬殊 = 知识偏科：少数部门撑起大部分语料。</p>
+        </div>
+        <div class="flex flex-col p-[15px]">
+          <p :class="SUBHEAD">文件类型分布</p>
+          <DonutChart :items="fileTypeItems" :center-value="fmtN(fileTotal)" center-label="篇" class="my-auto" empty="暂无文件。" />
+        </div>
+      </div>
     </section>
 
-    <!-- 全库运行健康 -->
+    <!-- 全库运行健康（含近期入库趋势 + 部门覆盖与失衡 + 治理风险） -->
     <section v-if="kbGovernance">
       <p :class="HEADER">全库运行健康</p>
       <div :class="GRID">
         <StatCard v-for="s in healthCards" :key="s.label" v-bind="s" />
       </div>
-      <p :class="SUBHEAD" class="ml-0.5 mt-4">近期入库批次（嵌入块数）</p>
-      <BarList :items="embedItems" unit=" 块" empty="近期无入库批次记录。" />
-    </section>
-
-    <!-- 治理风险（含部门覆盖与失衡） -->
-    <section v-if="kbGovernance">
-      <p :class="HEADER">治理风险</p>
+      <p :class="SUBHEAD" class="ml-0.5 mt-4">近期入库趋势（嵌入块数）</p>
+      <div class="rounded-2xl border border-border bg-card p-[15px]">
+        <MiniTrend :items="embedTrend" empty="近期无入库批次记录。" />
+      </div>
+      <p :class="SUBHEAD" class="ml-0.5 mt-5">部门覆盖与失衡</p>
+      <DeptTable :rows="kbGovernance.dept_coverage" />
+      <p class="ml-0.5 mb-1 mt-1.5 text-[11.5px] text-faint">
+        覆盖多≠用得多：对照「已上线 vs 使用量」找出失衡部门；「无答案率」高 = 该部门文档被问到却答不好，「风险」= 含敏感信息文档数。
+      </p>
+      <p :class="SUBHEAD" class="ml-0.5 mt-5">治理风险</p>
       <div :class="GRID">
         <StatCard v-for="s in riskCards" :key="s.label" v-bind="s" />
       </div>
-      <p :class="SUBHEAD" class="ml-0.5 mt-4">部门覆盖与失衡</p>
-      <DeptTable :rows="kbGovernance.dept_coverage" />
-      <p class="ml-0.5 mt-2 text-[11.5px] text-faint">
-        覆盖多≠用得多：对照「已上线 vs 使用量」找出失衡部门；「无答案率」高 = 该部门文档被问到却答不好，「风险」= 含敏感信息文档数。
-      </p>
+    </section>
+
+    <!-- 服务可用性 -->
+    <section v-if="kbGovernance">
+      <p :class="HEADER">服务可用性</p>
+      <div :class="GRID">
+        <StatCard v-for="s in availabilityCards" :key="s.label" v-bind="s" />
+      </div>
     </section>
 
     <!-- 全库知识效果 -->

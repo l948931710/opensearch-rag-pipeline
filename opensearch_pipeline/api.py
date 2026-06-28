@@ -1985,8 +1985,15 @@ class KbDownvoteReason(BaseModel):
     count: int = 0
 
 
+class KbFileType(BaseModel):
+    ftype: str = ""                      # PDF / DOCX / XLSX / PPTX / 图片 / 其他
+    count: int = 0
+
+
 class KbGovernanceResponse(BaseModel):
     window_days: int = _KB_INSIGHTS_WINDOW_DAYS
+    # 资产构成
+    file_types: List[KbFileType] = Field(default_factory=list)   # 文件类型分布（按扩展名归类）
     # 运行健康
     docs_active: int = 0
     docs_in_index: int = 0
@@ -1997,6 +2004,11 @@ class KbGovernanceResponse(BaseModel):
     avg_retrieval_ms: int = 0
     avg_llm_ms: int = 0
     embed_runs: List[KbEmbedRunItem] = Field(default_factory=list)
+    # 服务可用性（近 30 天 + 近 24h）
+    qa_api_success_rate: float = 0.0     # (总 - LLM_ERROR)/总
+    retrieval_api_success_rate: float = 0.0   # (总 - 检索未完成 hit_count IS NULL)/总
+    errors_24h: int = 0                  # 近 24 小时错误请求数
+    qa_total_30d: int = 0                # 近 30 天问答总数（成功率分母）
     # 治理风险 / 知识效果
     pii_redacted_docs: int = 0
     pii_quarantined_docs: int = 0
@@ -2221,9 +2233,43 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     key=lambda x: x.docs, reverse=True)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance dept_coverage 失败: %s", e)
+            # 10) 文件类型分布（按 original_filename 扩展名归类；Python 端合并到 PDF/DOCX/XLSX/PPTX/图片/其他）
+            try:
+                cur.execute(
+                    "SELECT LOWER(SUBSTRING_INDEX(original_filename, '.', -1)) ext, COUNT(*)"
+                    " FROM fuling_knowledge.document_meta"
+                    " WHERE status='active' AND original_filename LIKE '%.%' GROUP BY ext")
+                _EXT2T = {"pdf": "PDF", "docx": "DOCX", "doc": "DOCX", "xlsx": "XLSX", "xls": "XLSX",
+                          "pptx": "PPTX", "ppt": "PPTX",
+                          "png": "图片", "jpg": "图片", "jpeg": "图片", "gif": "图片", "webp": "图片", "bmp": "图片"}
+                _ORDER = ["PDF", "DOCX", "XLSX", "PPTX", "图片", "其他"]
+                ftc: Dict[str, int] = {}
+                for ext, n in cur.fetchall():
+                    ftc[_EXT2T.get((ext or "").strip(), "其他")] = ftc.get(_EXT2T.get((ext or "").strip(), "其他"), 0) + int(n or 0)
+                out.file_types = [KbFileType(ftype=t, count=ftc[t]) for t in _ORDER if ftc.get(t)]
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance file_types 失败: %s", e)
+            # 11) 服务可用性：问答API成功率(非 LLM_ERROR) / 检索API成功率(hit_count 非空) / 近30天总数 / 近24h错误数。
+            #     检索错误（HA3 connection refused）在 serving 里落到 LLM_ERROR + hit_count=NULL，故用 NULL 判检索未完成。
+            try:
+                cur.execute(
+                    "SELECT COUNT(*), SUM(answer_status='LLM_ERROR'), SUM(opensearch_hit_count IS NULL)"
+                    " FROM fuling_operation.qa_session_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)", (win,))
+                r = cur.fetchone() or (0, 0, 0)
+                tot = int(r[0] or 0); llm_err = int(r[1] or 0); hit_null = int(r[2] or 0)
+                out.qa_total_30d = tot
+                out.qa_api_success_rate = round((tot - llm_err) / tot, 4) if tot else 0.0
+                out.retrieval_api_success_rate = round((tot - hit_null) / tot, 4) if tot else 0.0
+                cur.execute(
+                    "SELECT SUM(answer_status LIKE '%ERROR%') FROM fuling_operation.qa_session_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)")
+                out.errors_24h = int((cur.fetchone() or (0,))[0] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance availability 失败: %s", e)
     finally:
         conn.close()
-    if fails >= 11:   # 11 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非伪造健康
+    if fails >= 13:   # 13 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非伪造健康
         trace_id = uuid.uuid4().hex[:8]
         logger.error("kb_governance 全部子查询失败 [trace=%s]", trace_id)
         raise HTTPException(status_code=500, detail=f"治理查询失败 (trace: {trace_id})")
