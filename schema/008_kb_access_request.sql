@@ -33,5 +33,9 @@ CREATE TABLE IF NOT EXISTS kb_access_request (
     INDEX idx_owner_status (owner_dept, status),     -- 审批方列待审批队列
     INDEX idx_requester (requester_id, status),       -- 申请人查自己的申请 / 去重 pending
     INDEX idx_doc (doc_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  -- ⚠️ COLLATE 必须显式 = utf8mb4_unicode_ci，与全库一致（document_meta/chunk_meta/document_version）。
+  -- 不写 COLLATE 会拿服务器默认：本表在 RDS MySQL 8 上建库时拿到 utf8mb4_0900_ai_ci，导致
+  -- kb_access_request ⋈ document_meta ON doc_id=doc_id 报 1267「Illegal mix of collations」→
+  -- access-requests-list / access-grants / my-access-requests 三个 JOIN 端点 500（2026-06-27 prod_ro 冒烟实证）。
   COMMENT='跨部门文档检索授权申请（Phase C 记录层；真正放行检索 = Phase D allowed_depts）';
