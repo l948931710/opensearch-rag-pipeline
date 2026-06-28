@@ -582,6 +582,8 @@ def _stub_myreq(monkeypatch, request_rows, doc_state):
                 return request_rows
             if "distinct allowed_depts" in self._s:
                 al = doc_state.get(self._p[0], {}).get("allowed", [])
+                if al == "__BAD_JSON__":
+                    return [("{not valid json",)]   # 触发 current_allowed_for_doc 的 json.loads 抛错（#7）
                 return [(json.dumps(al),)] if al else []
             return []
 
@@ -627,3 +629,25 @@ def test_my_access_requests_sync_state(monkeypatch):
     assert by_id["3"] == "pending_sync"
     assert by_id["4"] == "n/a"                                    # rejected → 不派生
     assert len(resp.items) == 4
+
+
+def test_my_access_requests_bad_row_degrades_not_500(monkeypatch):
+    """#7 防御：单行脏 allowed_depts JSON → 该行降级 n/a 并继续，绝不 500 整张列表。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    rows = [
+        ("1", "DBAD", "T坏", "marketing", "finance", "approved", "r", "2026-06-01", "2026-06-02", 1),
+        ("2", "DOK", "T好", "marketing", "quality", "approved", "r", "2026-06-01", "2026-06-02", 1),
+    ]
+    doc_state = {
+        "DBAD": {"cnt": 1, "indexed": 1, "allowed": "__BAD_JSON__"},   # 脏 JSON → 派生抛错
+        "DOK": {"cnt": 1, "indexed": 1, "allowed": ["quality"]},       # 正常 → projected
+    }
+    _stub_myreq(monkeypatch, rows, doc_state)
+    from opensearch_pipeline import api
+    resp = api.kb_my_access_requests(request=None, identity=api.Identity(user_id="da1"))  # 不抛 500
+    by_id = {it.id: it.sync_state for it in resp.items}
+    assert len(resp.items) == 2                  # 坏行未吞掉整张表，两行都在
+    assert by_id["1"] == "n/a"                   # 坏行降级 n/a
+    assert by_id["2"] == "projected"             # 好行不受影响

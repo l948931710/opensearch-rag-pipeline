@@ -2714,18 +2714,23 @@ def kb_my_access_requests(request: Request,
                     status = r[5] or ""
                     sync = "n/a"
                     if status == "approved" and doc_id:
-                        ver = int(r[9] or 1)
-                        cur.execute(
-                            "SELECT COUNT(*), SUM(index_status='INDEXED') "
-                            "FROM fuling_knowledge.chunk_meta "
-                            "WHERE doc_id=%s AND version_no=%s AND is_active=1", (doc_id, ver))
-                        cnt_row = cur.fetchone() or (0, 0)
-                        cnt = int(cnt_row[0] or 0)
-                        n_idx = int(cnt_row[1] or 0)
-                        allowed = set(current_allowed_for_doc(cur, doc_id, ver))
-                        granted = {g.strip() for g in rdepts.split(",") if g.strip()}
-                        projected = bool(cnt and cnt == n_idx and granted and granted <= allowed)
-                        sync = "projected" if projected else "pending_sync"
+                        try:
+                            ver = int(r[9] or 1)
+                            cur.execute(
+                                "SELECT COUNT(*), SUM(index_status='INDEXED') "
+                                "FROM fuling_knowledge.chunk_meta "
+                                "WHERE doc_id=%s AND version_no=%s AND is_active=1", (doc_id, ver))
+                            cnt_row = cur.fetchone() or (0, 0)
+                            cnt = int(cnt_row[0] or 0)
+                            n_idx = int(cnt_row[1] or 0)
+                            allowed = set(current_allowed_for_doc(cur, doc_id, ver))
+                            granted = {g.strip() for g in rdepts.split(",") if g.strip()}
+                            projected = bool(cnt and cnt == n_idx and granted and granted <= allowed)
+                            sync = "projected" if projected else "pending_sync"
+                        except Exception as _re:   # noqa: BLE001 — 单行派生失败（如脏 allowed_depts JSON）→
+                            # 降级该行为 n/a 并继续，绝不连累整张列表 500（与 reconcile 逐文档兜底同型）。
+                            logger.warning("my-access 同步态派生失败 doc=%s，降级 n/a: %s", doc_id, _re)
+                            sync = "n/a"
                     items.append(MyAccessRequestItem(
                         id=str(r[0]), doc_id=doc_id, doc_title=r[2] or "", owner_dept=r[3] or "",
                         requester_dept=rdepts, status=status, sync_state=sync, reason=r[6] or "",
