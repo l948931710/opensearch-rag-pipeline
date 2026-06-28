@@ -91,3 +91,32 @@ describe('apiJson — 错误抛 ApiError', () => {
     expect(data.questions).toEqual(['a'])
   })
 })
+
+describe('apiFetch — DEV dev-preview 哨兵：带 auth 不打网络（修 ?preview token 被 401-reauth 清掉）', () => {
+  it("token='dev-preview' 且带 auth → 合成 503 短路：绝不调 fetch、不动哨兵 token", async () => {
+    useSession().setToken('dev-preview')
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const res = await apiFetch('/api/kb/stats')
+    expect(res.status).toBe(503)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(useSession().token).toBe('dev-preview')   // 哨兵未被清（这正是 mock 分支存活的前提）
+  })
+
+  it("token='dev-preview' 但 auth:false（匿名端点）→ 仍走真实 fetch（不短路）", async () => {
+    useSession().setToken('dev-preview')
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ ok: true }))
+    vi.stubGlobal('fetch', fetchMock)
+    await apiFetch('/api/hot-questions', { auth: false })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("dev-preview 带 auth 经 apiJson → 抛 ApiError(503)，绝不触发 reauth（短路先于 401 分支）", async () => {
+    useSession().setToken('dev-preview')
+    const reauth = vi.fn().mockResolvedValue(true)
+    setReauthHandler(reauth)
+    vi.stubGlobal('fetch', vi.fn())
+    await expect(apiJson('/api/kb/stats')).rejects.toMatchObject({ status: 503 })
+    expect(reauth).not.toHaveBeenCalled()
+  })
+})

@@ -34,6 +34,15 @@ function buildInit(opts: ApiOpts): RequestInit {
  * 返回原始 Response（流式/SSE 调用方自取 body）。
  */
 export async function apiFetch(path: string, opts: ApiOpts = {}, _retried = false): Promise<Response> {
+  // DEV 设计预览（?preview，token 哨兵 'dev-preview'）契约 = 无后端、纯看设计。带 auth 的请求若真打网络会被
+  // vite 代理到 FastAPI 拿 401 → 触发 reauth → 清掉哨兵 token → 各 loader 的 dev-preview mock 分支
+  //（判 token==='dev-preview'）随之失效、数据区段全空。故带 auth 的预览请求直接合成 503 短路：不打网络、
+  // 不重登、不动 token。有 mock 分支的 loader 早在 token 判定处短路、不会到这里；无 mock 分支的安静兜底空。
+  // prod 构建 DEV=false → 整段死代码消除。
+  if (import.meta.env.DEV && opts.auth !== false && useSession().token === 'dev-preview') {
+    return new Response(JSON.stringify({ detail: 'dev-preview: 无后端' }),
+      { status: 503, headers: { 'Content-Type': 'application/json' } })
+  }
   const res = await fetch(path, buildInit(opts))
   if (res.status === 401 && !_retried && _reauth) {
     const ok = await _reauth()

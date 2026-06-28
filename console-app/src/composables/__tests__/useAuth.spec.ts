@@ -99,6 +99,7 @@ describe('init — DEV ?preview 设计预览（无后端）', () => {
     expect(s.canManage).toBe(true)
     expect(s.role).toBe('kb_admin')
     expect(s.identity?.name).toBe('设计预览')
+    expect(s.token).toBe('dev-preview')        // 哨兵 token——各 loader 的预览 mock 分支判它，必须落定
     expect(fetchMock).not.toHaveBeenCalled()   // 纯前端，零后端
   })
 
@@ -205,5 +206,16 @@ describe('reauth — 401 重登走容器免登', () => {
     const ok = await useAuth().reauth()
     expect(ok).toBe(true)
     expect(s.token).toBe('FRESH')
+  })
+
+  it("dev-preview 哨兵：reauth 直接 false 且【不清】token、不打网络（保 ?preview 数据 mock 分支存活）", async () => {
+    const s = useSession()
+    s.setToken('dev-preview')
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const ok = await useAuth().reauth()
+    expect(ok).toBe(false)
+    expect(s.token).toBe('dev-preview')        // 未被清
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

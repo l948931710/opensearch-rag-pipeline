@@ -165,6 +165,9 @@ export function useAuth() {
 
   /** 401 重登：清旧 token，强制重走容器免登一次。成功返回 true。 */
   async function reauth(): Promise<boolean> {
+    // dev-preview 哨兵：无钉钉容器，重登必失败，且【绝不能】清掉哨兵 token——否则各 loader 的预览 mock 分支
+    //（判 token==='dev-preview'）失效、?preview 数据区段全空。直接返回 false，不清不重登。
+    if (session.token === 'dev-preview') return false
     try {
       session.setToken('')
       await doLogin(true)
