@@ -108,9 +108,11 @@ else:
     print(f"⚠️ 未获取到调度参数，按 T-1 兜底: {bizdate}")
 
 # ═══════════════════════════════════════════════════════════════
-# 3. 执行 Stage 1
+# 3. 执行 Stage 1（排空式：drain 整批）
 # ═══════════════════════════════════════════════════════════════
-print(f"=== 4. 启动 Stage 1 ({'模拟' if SIMULATE else '生产'}) ===")
-from opensearch_pipeline.dataworks_orchestrator import run_stage
-run_stage(stage=1, bizdate=bizdate, simulate=SIMULATE)
+# 用 run_stage_drained（与 stage-2/3 一致、与已部署节点对齐）：生产排空整个 stage-1 待处理集。
+# pre-drain 对账只在 stage-3（stage-1/2 无）。SIMULATE=True 时 drained 退化为单次 run_stage（不变）。
+print(f"=== 4. 启动 Stage 1 排空（{'模拟' if SIMULATE else '生产'}）===")
+from opensearch_pipeline.dataworks_orchestrator import run_stage_drained
+run_stage_drained(stage=1, bizdate=bizdate, simulate=SIMULATE)
 print("✅ Stage 1 完成！")
