@@ -45,7 +45,7 @@ export interface QueueRow { name: string; status: string; pct: number; msg: stri
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
 interface MyDocsResp { items: DocItem[]; has_more: boolean }
-export interface KbStats { total: number; active: number; retired: number; by_badge: Record<string, number> }
+export interface KbStats { total: number; active: number; retired: number; chunks: number; new_this_month: number; by_badge: Record<string, number> }
 // Phase E 概览看板真实数据（镜像 api.py KbInsightsResponse / KbGovernanceResponse，字段一一对应）
 export interface KbTopDoc { title: string; owner_dept: string; hits: number }
 export interface KbGapQuery { query: string; count: number; avg_top: number }
@@ -55,7 +55,9 @@ export interface KbInsights {
   top_docs: KbTopDoc[]; gap_queries: KbGapQuery[]
 }
 export interface KbEmbedRun { bizdate: string; embedded: number; failed: number; fail_rate: number }
-export interface KbDeptCoverage { owner_dept: string; docs: number; qa_hits: number }
+export interface KbDeptCoverage { owner_dept: string; docs: number; new_month: number; qa_hits: number; no_answer_rate: number; pii_docs: number }
+export interface KbFeedbackDay { day: string; up: number; down: number }
+export interface KbDownvoteReason { reason: string; count: number }
 export interface KbGovernance {
   window_days: number
   docs_active: number; docs_in_index: number; dual_version_docs: number
@@ -65,6 +67,7 @@ export interface KbGovernance {
   answer_total: number; answer_success: number; answer_refusal: number; answer_no_result: number; answer_error: number
   effective_rate: number
   feedback_up: number; feedback_down: number; feedback_total: number; helpful_rate: number
+  feedback_last7: number; feedback_daily: KbFeedbackDay[]; downvote_reasons: KbDownvoteReason[]
   escalations: number
   dept_coverage: KbDeptCoverage[]
 }
@@ -235,7 +238,14 @@ async function submitAccessRequest(reason: string) {
 }
 
 async function loadStats() {
-  // 概览真实口径（总数/状态分布）；失败则前端兜底用已加载文档计数（docs.length / countOf）。
+  // 概览真实口径（总数/状态分布/已索引分块）；失败则前端兜底用已加载文档计数（docs.length / countOf）。
+  const s = useSession()
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    kbStats.value = s.role === 'kb_admin'
+      ? { total: 1618, active: 1475, retired: 143, chunks: 27659, new_this_month: 1249, by_badge: { 已上线: 1475, 处理中: 8, 排队中: 4, 已退役: 143 } }
+      : { total: 42, active: 40, retired: 2, chunks: 612, new_this_month: 6, by_badge: { 已上线: 38, 待审核: 3, 处理中: 1 } }
+    return
+  }
   try { kbStats.value = await apiJson<KbStats>('/api/kb/stats', { auth: true }) } catch { /* 兜底 */ }
 }
 
@@ -283,13 +293,24 @@ async function loadGovernance() {
       pii_redacted_docs: 475, pii_quarantined_docs: 3,
       answer_total: 902, answer_success: 790, answer_refusal: 112, answer_no_result: 15, answer_error: 25,
       effective_rate: 0.876,
-      feedback_up: 64, feedback_down: 44, feedback_total: 108, helpful_rate: 0.593, escalations: 19,
+      feedback_up: 64, feedback_down: 44, feedback_total: 108, helpful_rate: 0.593,
+      feedback_last7: 5, escalations: 19,
+      feedback_daily: [
+        { day: '2026-06-15', up: 4, down: 4 }, { day: '2026-06-16', up: 9, down: 0 },
+        { day: '2026-06-17', up: 1, down: 7 }, { day: '2026-06-18', up: 3, down: 21 },
+        { day: '2026-06-20', up: 1, down: 0 }, { day: '2026-06-22', up: 0, down: 2 },
+        { day: '2026-06-24', up: 0, down: 1 }, { day: '2026-06-26', up: 1, down: 1 },
+      ],
+      downvote_reasons: [
+        { reason: '其他', count: 14 }, { reason: '不准确', count: 12 }, { reason: '不相关', count: 8 },
+        { reason: '不完整', count: 8 }, { reason: '已过时', count: 2 }, { reason: '未注明', count: 2 },
+      ],
       dept_coverage: [
-        { owner_dept: 'production', docs: 800, qa_hits: 980 },
-        { owner_dept: 'hr', docs: 192, qa_hits: 1991 },
-        { owner_dept: 'it', docs: 36, qa_hits: 2640 },
-        { owner_dept: 'marketing', docs: 178, qa_hits: 420 },
-        { owner_dept: 'rd', docs: 175, qa_hits: 96 },
+        { owner_dept: 'production', docs: 800, new_month: 711, qa_hits: 303, no_answer_rate: 0.221, pii_docs: 247 },
+        { owner_dept: 'hr', docs: 192, new_month: 0, qa_hits: 372, no_answer_rate: 0.124, pii_docs: 71 },
+        { owner_dept: 'it', docs: 36, new_month: 0, qa_hits: 384, no_answer_rate: 0.102, pii_docs: 8 },
+        { owner_dept: 'marketing', docs: 178, new_month: 178, qa_hits: 186, no_answer_rate: 0.231, pii_docs: 29 },
+        { owner_dept: 'rd', docs: 175, new_month: 175, qa_hits: 24, no_answer_rate: 0.0, pii_docs: 64 },
       ],
     }
     return
@@ -314,7 +335,15 @@ function setQuery(v: string) {
 }
 
 async function loadApprovals() {
-  if (useSession().role !== 'kb_admin') { approvals.value = []; return }
+  const s = useSession()
+  if (s.role !== 'kb_admin') { approvals.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    approvals.value = [
+      { doc_id: 'P1', version_no: 2, title: '2026 客户验厂应答模板', original_filename: '验厂应答.docx', owner_dept: 'quality', permission_level: 'public', owner_name: '李娜', created_at: '2026-06-27' },
+      { doc_id: 'P2', version_no: 1, title: '外销报价单（公开版）', original_filename: '报价单.xlsx', owner_dept: 'marketing', permission_level: 'public', owner_name: '王伟', created_at: '2026-06-26' },
+    ]
+    return
+  }
   try {
     const r = await apiJson<{ items: PendingItem[] }>('/api/kb/pending-approvals', { auth: true })
     approvals.value = r.items || []

@@ -1735,12 +1735,14 @@ class KbStatsResponse(BaseModel):
     total: int = 0
     active: int = 0
     retired: int = 0
+    chunks: int = 0                      # 作用域内当前已索引分块数（is_active=1 AND index_status='INDEXED'）
+    new_this_month: int = 0              # 本月新增文档数（document_meta.created_at 落在当月，active）
     by_badge: Dict[str, int] = Field(default_factory=dict)
 
 
 @app.get("/api/kb/stats", response_model=KbStatsResponse)
 def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_identity)):
-    """管理范围内文档聚合（真实总数 + 状态分布），不受 my-docs 的 50 上限影响。
+    """管理范围内文档聚合（真实总数 + 状态分布 + 已索引分块数），不受 my-docs 的 50 上限影响。
 
     只读、按 owner 作用域过滤（与 my-docs 同一 _kb_owner_scope_sql，不会越权统计他部门）；
     徽章在 Python 端按与 my-docs 相同的 _kb_status_badge 复算，故口径一致。
@@ -1748,6 +1750,11 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    ck_clause, ck_params = _kb_owner_scope_sql(kb, "owner_dept")   # chunk_meta.owner_dept 同口径作用域
+    dm_clause, dm_params = _kb_owner_scope_sql(kb, "owner_dept")   # document_meta.owner_dept（本月新增计数）
+    from datetime import date
+    month_start = date.today().replace(day=1).isoformat()         # 当月首日；以参数传入避免 % 转义坑
+    chunks = new_this_month = 0
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn()
@@ -1764,6 +1771,26 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                     tuple(params),
                 )
                 rows = cur.fetchall()
+                # 当前已索引分块总数（设计「全库已索引 chunk」口径）；取数失败仅置 0，不拖垮主统计。
+                try:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM fuling_knowledge.chunk_meta "
+                        f"WHERE is_active=1 AND index_status='INDEXED' {ck_clause}",
+                        tuple(ck_params),
+                    )
+                    chunks = int((cur.fetchone() or (0,))[0] or 0)
+                except Exception as e:
+                    logger.warning("kb_stats 分块计数失败: %s", e)
+                # 本月新增文档数（设计「+N 本月新增」徽标）；月首日以参数传入；取数失败仅置 0。
+                try:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM fuling_knowledge.document_meta "
+                        f"WHERE created_at >= %s AND status='active' {dm_clause}",
+                        tuple([month_start] + dm_params),
+                    )
+                    new_this_month = int((cur.fetchone() or (0,))[0] or 0)
+                except Exception as e:
+                    logger.warning("kb_stats 本月新增计数失败: %s", e)
         finally:
             conn.close()
     except HTTPException:
@@ -1782,7 +1809,8 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
             retired += 1
         badge = _kb_status_badge(cps, ixs, status, publish_status=pubs)
         by_badge[badge] = by_badge.get(badge, 0) + 1
-    return KbStatsResponse(total=len(rows), active=active, retired=retired, by_badge=by_badge)
+    return KbStatsResponse(total=len(rows), active=active, retired=retired, chunks=chunks,
+                           new_this_month=new_this_month, by_badge=by_badge)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1939,8 +1967,22 @@ class KbEmbedRunItem(BaseModel):
 
 class KbDeptCoverageItem(BaseModel):
     owner_dept: str = ""
-    docs: int = 0
-    qa_hits: int = 0
+    docs: int = 0                        # 已上线（active）文档数
+    new_month: int = 0                   # 本月新增
+    qa_hits: int = 0                     # 使用量（命中本部门文档的提问数）
+    no_answer_rate: float = 0.0          # 无答案率（命中本部门文档的提问中 REFUSAL 占比）
+    pii_docs: int = 0                    # 风险（含 PII 脱敏/隔离的文档数）
+
+
+class KbFeedbackDay(BaseModel):
+    day: str = ""
+    up: int = 0
+    down: int = 0
+
+
+class KbDownvoteReason(BaseModel):
+    reason: str = ""                     # 中文原因标签
+    count: int = 0
 
 
 class KbGovernanceResponse(BaseModel):
@@ -1968,6 +2010,9 @@ class KbGovernanceResponse(BaseModel):
     feedback_down: int = 0
     feedback_total: int = 0
     helpful_rate: float = 0.0
+    feedback_last7: int = 0              # 近 7 天反馈数
+    feedback_daily: List[KbFeedbackDay] = Field(default_factory=list)   # 近 30 北京日 up/down 趋势
+    downvote_reasons: List[KbDownvoteReason] = Field(default_factory=list)  # 点踩原因分布
     escalations: int = 0
     # 部门覆盖 / 使用失衡
     dept_coverage: List[KbDeptCoverageItem] = Field(default_factory=list)
@@ -2082,51 +2127,103 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 out.pii_redacted_docs, out.pii_quarantined_docs = int(r[0] or 0), int(r[1] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance pii 失败: %s", e)
-            # 7) 用户反馈（二元好评率，累计；反馈稀疏故不按窗口切薄）
+            # 7) 用户反馈（二元好评率 + 近7天量，累计；反馈稀疏故不按窗口切薄）
             try:
                 cur.execute(
-                    "SELECT SUM(feedback_type='upvote'), SUM(feedback_type='downvote'), COUNT(*)"
+                    "SELECT SUM(feedback_type='upvote'), SUM(feedback_type='downvote'), COUNT(*),"
+                    " SUM(created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY))"
                     " FROM fuling_operation.user_feedback WHERE feedback_type IN ('upvote','downvote')")
-                r = cur.fetchone() or (0, 0, 0)
+                r = cur.fetchone() or (0, 0, 0, 0)
                 out.feedback_up, out.feedback_down = int(r[0] or 0), int(r[1] or 0)
-                out.feedback_total = int(r[2] or 0)
+                out.feedback_total = int(r[2] or 0); out.feedback_last7 = int(r[3] or 0)
                 out.helpful_rate = round(out.feedback_up / out.feedback_total, 4) if out.feedback_total else 0.0
             except Exception as e:
                 fails += 1; logger.warning("kb_governance feedback 失败: %s", e)
+            # 7b) 反馈趋势：近 30 北京日 up/down（+15h 分桶）
+            try:
+                cur.execute(
+                    "SELECT DATE(DATE_ADD(created_at, INTERVAL 15 HOUR)),"
+                    " SUM(feedback_type='upvote'), SUM(feedback_type='downvote')"
+                    " FROM fuling_operation.user_feedback"
+                    " WHERE feedback_type IN ('upvote','downvote')"
+                    "   AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
+                    " GROUP BY 1 ORDER BY 1")
+                out.feedback_daily = [KbFeedbackDay(day=str(row[0]), up=int(row[1] or 0), down=int(row[2] or 0))
+                                      for row in cur.fetchall()]
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance feedback_daily 失败: %s", e)
+            # 7c) 点踩原因分布（feedback_reason 多选逗号拼接 → Python 拆分计数 + 中文标签；null=未注明）
+            try:
+                cur.execute(
+                    "SELECT feedback_reason, COUNT(*) FROM fuling_operation.user_feedback"
+                    " WHERE feedback_type='downvote' GROUP BY feedback_reason")
+                _RLABEL = {"inaccurate": "不准确", "irrelevant": "不相关", "incomplete": "不完整",
+                           "outdated": "已过时", "not_found": "未找到", "other": "其他"}
+                rcount: Dict[str, int] = {}
+                for reason, n in cur.fetchall():
+                    n = int(n or 0)
+                    codes = [x.strip() for x in (reason or "").split(",") if x.strip()] or ["__none__"]
+                    for code in codes:
+                        label = "未注明" if code == "__none__" else _RLABEL.get(code, code)
+                        rcount[label] = rcount.get(label, 0) + n
+                out.downvote_reasons = sorted(
+                    [KbDownvoteReason(reason=k, count=v) for k, v in rcount.items()],
+                    key=lambda x: x.count, reverse=True)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance downvote_reasons 失败: %s", e)
             # 8) 转人工工单数
             try:
                 cur.execute("SELECT COUNT(*) FROM fuling_operation.escalation_ticket")
                 out.escalations = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance escalations 失败: %s", e)
-            # 9) 部门覆盖（文档数）+ 使用失衡（窗口内命中本部门文档的提问数），按 owner_dept 合并。
-            #    qa_hits 用 COUNT(DISTINCT message_id) = 提问数（retrieved_docs_json 是 chunk 级、
-            #    一问可含同文档多 chunk，COUNT(*) 会把 chunk 命中误当提问数 → 与 top_docs 同一去扇出纪律）。
+            # 9) 部门覆盖与失衡：已上线 / 本月新增 / 使用量(命中提问数) / 无答案率(refusal占比) / 风险(PII文档)。
+            #    qa_hits + refusal 用 COUNT(DISTINCT message_id) 去 chunk 扇出；PII JOIN 同样需 collation-cast。
             try:
+                from datetime import date as _date
+                ms = _date.today().replace(day=1).isoformat()
                 cov: Dict[str, Dict[str, int]] = {}
-                cur.execute(
-                    "SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
-                    " WHERE status='active' GROUP BY owner_dept")
+
+                def _cell(d):
+                    return cov.setdefault(d or "unknown", {"docs": 0, "new_month": 0, "qa_hits": 0, "refusal": 0, "pii": 0})
+
+                cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                            " WHERE status='active' GROUP BY owner_dept")
                 for dept, docs in cur.fetchall():
-                    cov.setdefault(dept or "unknown", {"docs": 0, "qa_hits": 0})["docs"] = int(docs or 0)
+                    _cell(dept)["docs"] = int(docs or 0)
+                cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                            " WHERE status='active' AND created_at >= %s GROUP BY owner_dept", (ms,))
+                for dept, n in cur.fetchall():
+                    _cell(dept)["new_month"] = int(n or 0)
                 cur.execute(
-                    "SELECT m.owner_dept, COUNT(DISTINCT q.message_id)"
+                    "SELECT m.owner_dept, COUNT(DISTINCT q.message_id),"
+                    " COUNT(DISTINCT CASE WHEN q.answer_status='REFUSAL' THEN q.message_id END)"
                     " FROM fuling_operation.qa_session_log q"
                     " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
                     " JOIN fuling_knowledge.document_meta m"
                     "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-                    " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
-                    " GROUP BY m.owner_dept", (win,))
-                for dept, hits in cur.fetchall():
-                    cov.setdefault(dept or "unknown", {"docs": 0, "qa_hits": 0})["qa_hits"] = int(hits or 0)
+                    " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY m.owner_dept", (win,))
+                for dept, hits, refu in cur.fetchall():
+                    cell = _cell(dept); cell["qa_hits"] = int(hits or 0); cell["refusal"] = int(refu or 0)
+                cur.execute(
+                    "SELECT m.owner_dept, COUNT(DISTINCT f.doc_id)"
+                    " FROM fuling_knowledge.document_sensitive_finding f"
+                    " JOIN fuling_knowledge.document_meta m"
+                    "   ON m.doc_id = CONVERT(f.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
+                    " WHERE f.action IN ('QUARANTINED','REDACTED') GROUP BY m.owner_dept")
+                for dept, n in cur.fetchall():
+                    _cell(dept)["pii"] = int(n or 0)
                 out.dept_coverage = sorted(
-                    [KbDeptCoverageItem(owner_dept=k, docs=v["docs"], qa_hits=v["qa_hits"]) for k, v in cov.items()],
+                    [KbDeptCoverageItem(
+                        owner_dept=k, docs=v["docs"], new_month=v["new_month"], qa_hits=v["qa_hits"],
+                        no_answer_rate=round(v["refusal"] / v["qa_hits"], 4) if v["qa_hits"] else 0.0,
+                        pii_docs=v["pii"]) for k, v in cov.items()],
                     key=lambda x: x.docs, reverse=True)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance dept_coverage 失败: %s", e)
     finally:
         conn.close()
-    if fails >= 9:   # 9 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非伪造健康
+    if fails >= 11:   # 11 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非伪造健康
         trace_id = uuid.uuid4().hex[:8]
         logger.error("kb_governance 全部子查询失败 [trace=%s]", trace_id)
         raise HTTPException(status_code=500, detail=f"治理查询失败 (trace: {trace_id})")

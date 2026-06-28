@@ -9,6 +9,7 @@ const props = defineProps<{
   tone?: string        // 主条颜色（默认 bg-accent-strong）
   tone2?: string       // value2 第二条颜色（部门覆盖：文档数 vs 使用数）
   empty?: string
+  bare?: boolean       // 嵌在共享面板里时去掉自身边框/底色（避免框中框）
 }>()
 
 const max = computed(() => Math.max(1, ...props.items.map((i) => Math.max(i.value || 0, i.value2 || 0))))
@@ -16,7 +17,7 @@ const fmt = (n: number) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) +
 </script>
 
 <template>
-  <div class="rounded-[14px] border border-border bg-card p-[15px]">
+  <div :class="bare ? '' : 'rounded-[14px] border border-border bg-card p-[15px]'">
     <template v-if="items.length">
       <div v-for="(it, i) in items" :key="i" class="py-1.5">
         <div class="flex items-baseline justify-between gap-3">
