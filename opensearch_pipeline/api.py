@@ -1972,6 +1972,17 @@ class KbDeptCoverageItem(BaseModel):
     qa_hits: int = 0                     # 使用量（命中本部门文档的提问数）
     no_answer_rate: float = 0.0          # 无答案率（命中本部门文档的提问中 REFUSAL 占比）
     pii_docs: int = 0                    # 风险（含 PII 脱敏/隔离的文档数）
+    # 文档总量周环比：本周净变化 = active 新增 − 本周退役（退役仅计上周末前已存在者）。
+    #   wow_net  = 净变化「篇数」（前端徽标主显，对大部门比百分比更可读）。
+    #   wow_total = 净变化 / 上周末总量（比率）；无上周基数(全新部门)→ null。
+    # 近似口径：退役时点用 updated_at（retire 即 status='retired'+updated_at=NOW()，无独立 retired_at）；
+    #   superseded（版本/去重转移）不计入本指标；故为估算非账面精确值。
+    wow_net: Optional[int] = None
+    wow_total: Optional[float] = None
+    # 使用量周环比：近7天 vs 前7天 命中提问数（COUNT(DISTINCT message_id)）。
+    #   qa_wow_net = 净变化「次」（徽标主显）；qa_wow = 净变化 / 上周使用量（无上周使用→ null）。
+    qa_wow_net: Optional[int] = None
+    qa_wow: Optional[float] = None
 
 
 class KbFeedbackDay(BaseModel):
@@ -2197,7 +2208,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 cov: Dict[str, Dict[str, int]] = {}
 
                 def _cell(d):
-                    return cov.setdefault(d or "unknown", {"docs": 0, "new_month": 0, "qa_hits": 0, "refusal": 0, "pii": 0})
+                    return cov.setdefault(d or "unknown", {"docs": 0, "new_month": 0, "qa_hits": 0, "refusal": 0, "pii": 0, "new7": 0, "ret7": 0, "qa7": 0, "qa_prev7": 0})
 
                 cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
                             " WHERE status='active' GROUP BY owner_dept")
@@ -2207,6 +2218,22 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                             " WHERE status='active' AND created_at >= %s GROUP BY owner_dept", (ms,))
                 for dept, n in cur.fetchall():
                     _cell(dept)["new_month"] = int(n or 0)
+                # 文档总量周环比：本周 active 新增；本周退役只计【上周末前已存在】者（created_at < 7d），
+                # 否则「同周内先建后退役」会被算成 −1 幻影下跌（该文档上/本周末都不在 active 集，净贡献应为 0）。
+                # updated_at 近似退役时点（无独立 retired_at）。
+                wow_ok = True
+                try:
+                    cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                                " WHERE status='active' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
+                    for dept, n in cur.fetchall():
+                        _cell(dept)["new7"] = int(n or 0)
+                    cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                                " WHERE status='retired' AND updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
+                                " AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
+                    for dept, n in cur.fetchall():
+                        _cell(dept)["ret7"] = int(n or 0)
+                except Exception as e:
+                    wow_ok = False; logger.warning("kb_governance dept wow 失败: %s", e)
                 cur.execute(
                     "SELECT m.owner_dept, COUNT(DISTINCT q.message_id),"
                     " COUNT(DISTINCT CASE WHEN q.answer_status='REFUSAL' THEN q.message_id END)"
@@ -2217,6 +2244,23 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY m.owner_dept", (win,))
                 for dept, hits, refu in cur.fetchall():
                     cell = _cell(dept); cell["qa_hits"] = int(hits or 0); cell["refusal"] = int(refu or 0)
+                # 各部门使用量周环比：近7天 vs 前7天 命中提问数（与 qa_hits 同 DISTINCT message_id 去 chunk 扇出口径）。
+                qa_wow_ok = True
+                try:
+                    cur.execute(
+                        "SELECT m.owner_dept,"
+                        " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END),"
+                        " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)"
+                        "   AND q.created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END)"
+                        " FROM fuling_operation.qa_session_log q"
+                        " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
+                        " JOIN fuling_knowledge.document_meta m"
+                        "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
+                        " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY m.owner_dept")
+                    for dept, q7, qp7 in cur.fetchall():
+                        cell = _cell(dept); cell["qa7"] = int(q7 or 0); cell["qa_prev7"] = int(qp7 or 0)
+                except Exception as e:
+                    qa_wow_ok = False; logger.warning("kb_governance dept usage wow 失败: %s", e)
                 cur.execute(
                     "SELECT m.owner_dept, COUNT(DISTINCT f.doc_id)"
                     " FROM fuling_knowledge.document_sensitive_finding f"
@@ -2225,11 +2269,26 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     " WHERE f.action IN ('QUARANTINED','REDACTED') GROUP BY m.owner_dept")
                 for dept, n in cur.fetchall():
                     _cell(dept)["pii"] = int(n or 0)
+                def _wow_net(v):                          # 本周净变化「篇数」
+                    return (v["new7"] - v["ret7"]) if wow_ok else None
+                def _wow_pct(v):                          # 净变化 / 上周末总量（无上周基数→null）
+                    if not wow_ok:
+                        return None
+                    delta = v["new7"] - v["ret7"]
+                    base = v["docs"] - delta               # 上周末总量 = 今总量 − 净变化
+                    return round(delta / base, 4) if base > 0 else None
+                def _qa_wow_net(v):                        # 使用量本周净变化「次」
+                    return (v["qa7"] - v["qa_prev7"]) if qa_wow_ok else None
+                def _qa_wow(v):                            # 使用量周环比（无上周使用→null）
+                    if not qa_wow_ok:
+                        return None
+                    return round((v["qa7"] - v["qa_prev7"]) / v["qa_prev7"], 4) if v["qa_prev7"] > 0 else None
                 out.dept_coverage = sorted(
                     [KbDeptCoverageItem(
                         owner_dept=k, docs=v["docs"], new_month=v["new_month"], qa_hits=v["qa_hits"],
                         no_answer_rate=round(v["refusal"] / v["qa_hits"], 4) if v["qa_hits"] else 0.0,
-                        pii_docs=v["pii"]) for k, v in cov.items()],
+                        pii_docs=v["pii"], wow_net=_wow_net(v), wow_total=_wow_pct(v),
+                        qa_wow_net=_qa_wow_net(v), qa_wow=_qa_wow(v)) for k, v in cov.items()],
                     key=lambda x: x.docs, reverse=True)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance dept_coverage 失败: %s", e)

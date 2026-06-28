@@ -55,7 +55,7 @@ export interface KbInsights {
   top_docs: KbTopDoc[]; gap_queries: KbGapQuery[]
 }
 export interface KbEmbedRun { bizdate: string; embedded: number; failed: number; fail_rate: number }
-export interface KbDeptCoverage { owner_dept: string; docs: number; new_month: number; qa_hits: number; no_answer_rate: number; pii_docs: number }
+export interface KbDeptCoverage { owner_dept: string; docs: number; new_month: number; qa_hits: number; no_answer_rate: number; pii_docs: number; wow_net?: number | null; wow_total?: number | null; qa_wow_net?: number | null; qa_wow?: number | null }
 export interface KbFeedbackDay { day: string; up: number; down: number }
 export interface KbDownvoteReason { reason: string; count: number }
 export interface KbFileType { ftype: string; count: number }
@@ -314,11 +314,11 @@ async function loadGovernance() {
         { reason: '不完整', count: 8 }, { reason: '已过时', count: 2 }, { reason: '未注明', count: 2 },
       ],
       dept_coverage: [
-        { owner_dept: 'production', docs: 800, new_month: 711, qa_hits: 303, no_answer_rate: 0.221, pii_docs: 247 },
-        { owner_dept: 'hr', docs: 192, new_month: 0, qa_hits: 372, no_answer_rate: 0.124, pii_docs: 71 },
-        { owner_dept: 'it', docs: 36, new_month: 0, qa_hits: 384, no_answer_rate: 0.102, pii_docs: 8 },
-        { owner_dept: 'marketing', docs: 178, new_month: 178, qa_hits: 186, no_answer_rate: 0.231, pii_docs: 29 },
-        { owner_dept: 'rd', docs: 175, new_month: 175, qa_hits: 24, no_answer_rate: 0.0, pii_docs: 64 },
+        { owner_dept: 'production', docs: 800, new_month: 711, qa_hits: 303, no_answer_rate: 0.221, pii_docs: 247, wow_net: 30, wow_total: 0.04, qa_wow_net: -10, qa_wow: -0.032 },
+        { owner_dept: 'hr', docs: 192, new_month: 0, qa_hits: 372, no_answer_rate: 0.124, pii_docs: 71, wow_net: 0, wow_total: 0.0, qa_wow_net: 15, qa_wow: 0.042 },
+        { owner_dept: 'it', docs: 36, new_month: 0, qa_hits: 384, no_answer_rate: 0.102, pii_docs: 8, wow_net: -2, wow_total: -0.053, qa_wow_net: 22, qa_wow: 0.061 },
+        { owner_dept: 'marketing', docs: 178, new_month: 178, qa_hits: 186, no_answer_rate: 0.231, pii_docs: 29, wow_net: 19, wow_total: 0.12, qa_wow_net: 8, qa_wow: 0.045 },
+        { owner_dept: 'rd', docs: 175, new_month: 175, qa_hits: 24, no_answer_rate: 0.0, pii_docs: 64, wow_net: 9, wow_total: 0.054, qa_wow_net: 3, qa_wow: 0.143 },
       ],
     }
     return

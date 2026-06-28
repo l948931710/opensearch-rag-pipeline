@@ -142,6 +142,7 @@ body {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
+    animation-delay: 0 !important;            /* 清逐条 inline 错峰延迟（否则柱体仍按 i*Nms 保持不可见后突现） */
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
@@ -208,3 +209,18 @@ body {
 .kb-card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
 .dropzone { transition: border-color .14s ease, background .14s ease; }
 .dropzone[data-drag="1"] { border-color: var(--accent) !important; background: var(--accent-soft) !important; }
+
+/* ── 看板图表「自我绘制」入场（趋势竖起 / 分布横展 / 环图淡入）——
+   prefers-reduced-motion 已在全局把所有 animation-duration 压成瞬时，故此处无需再判。
+   每根条带由组件按 index 传 inline animation-delay 形成轻微错峰。 ── */
+@keyframes kb-rise { from { transform: scaleY(0); } }
+@keyframes kb-grow { from { transform: scaleX(0); } }
+@keyframes kb-in   { from { opacity: 0; transform: scale(.96); } }
+.kb-rise     { animation: kb-rise .5s cubic-bezier(.22,1,.36,1) both; transform-origin: bottom; }
+.kb-rise-top { animation: kb-rise .5s cubic-bezier(.22,1,.36,1) both; transform-origin: top; }
+.kb-grow     { animation: kb-grow .55s cubic-bezier(.22,1,.36,1) both; transform-origin: left; }
+.kb-in       { animation: kb-in .5s ease-out both; }
+/* 趋势条 hover 提亮 + 分段图 hover 聚焦（图例↔切片联动由组件控 data-dim） */
+.kb-trend-bar { transition: filter .14s ease, opacity .14s ease; }
+.kb-trend-col:hover .kb-trend-bar { filter: brightness(1.08) saturate(1.05); }
+.kb-seg { transition: stroke-width .16s ease, opacity .16s ease; }

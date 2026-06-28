@@ -10,6 +10,7 @@ import { deptLabel } from '@/lib/kb'
 import StatusDistBar from './StatusDistBar.vue'
 import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
+import ColumnChart from './ColumnChart.vue'
 import DeptTable from './DeptTable.vue'
 import FeedbackTrend from './FeedbackTrend.vue'
 import DonutChart from './DonutChart.vue'
@@ -64,11 +65,11 @@ const healthCards = computed<Card[]>(() => {
     { label: '问答延迟 p95', value: ms2s(g?.p95_latency_ms), icon: Timer, tone: 'text-foreground', hint: `p50 ${ms2s(g?.p50_latency_ms)} · 含流式渲染` },
   ]
 })
-// 近期入库趋势（纵向柱，最新在右）：bizdate 取 MM-DD，值 = 嵌入块数。
+// 近期入库趋势（纵向柱，最新在右）：bizdate 取 MM-DD，值 = 嵌入块数；带失败计数 → 条顶红盖。
 const embedTrend = computed(() =>
   [...(kbGovernance.value?.embed_runs || [])].reverse().map((r) => {
     const d = (r.bizdate || '').replace(/\D/g, '')
-    return { label: d.length >= 4 ? `${d.slice(-4, -2)}-${d.slice(-2)}` : (r.bizdate || ''), value: r.embedded, sub: `失败率 ${pct(r.fail_rate)}` }
+    return { label: d.length >= 4 ? `${d.slice(-4, -2)}-${d.slice(-2)}` : (r.bizdate || ''), value: r.embedded, failed: r.failed, failRate: r.fail_rate }
   }))
 // ── 服务可用性 ──
 const availabilityCards = computed<Card[]>(() => {
@@ -81,7 +82,12 @@ const availabilityCards = computed<Card[]>(() => {
 })
 // ── 全库资产概览扩展：各部门文档数分布（识别偏科）+ 文件类型分布 ──
 const deptDocItems = computed(() =>
-  [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => c.docs - a.docs).map((d) => ({ label: deptLabel(d.owner_dept), value: d.docs })))
+  [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => c.docs - a.docs)
+    .map((d) => ({ label: deptLabel(d.owner_dept), value: d.docs, delta: d.wow_net ?? null, deltaPct: d.wow_total ?? null })))
+// 各部门使用量（命中提问数，近 30 天）+ 使用量周环比（本周 vs 上周）——按使用量降序。
+const deptUsageItems = computed(() =>
+  [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => c.qa_hits - a.qa_hits)
+    .map((d) => ({ label: deptLabel(d.owner_dept), value: d.qa_hits, delta: d.qa_wow_net ?? null, deltaPct: d.qa_wow ?? null })))
 const fileTypeItems = computed(() => (kbGovernance.value?.file_types || []).map((f) => ({ label: f.ftype, value: f.count })))
 const fileTotal = computed(() => (kbGovernance.value?.file_types || []).reduce((s, f) => s + f.count, 0))
 const riskCards = computed<Card[]>(() => {
@@ -148,14 +154,15 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       <div :class="GRID">
         <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" />
       </div>
-      <p :class="SUBHEAD" class="ml-0.5 mt-4">状态分布</p>
-      <StatusDistBar :by-badge="kbStats?.by_badge || {}" />
       <!-- 各部门文档数分布（偏科）| 文件类型分布 —— 一个框两半 -->
       <div v-if="kbGovernance" :class="SPLIT" class="mt-4">
         <div class="p-[15px]">
-          <p :class="SUBHEAD">各部门文档数分布</p>
-          <BarList bare :items="deptDocItems" unit=" 篇" empty="暂无文档。" />
-          <p class="mt-1 text-[11px] text-faint">条形悬殊 = 知识偏科：少数部门撑起大部分语料。</p>
+          <div class="mb-2 flex items-baseline justify-between gap-2">
+            <span class="text-[12.5px] font-medium text-muted-foreground">各部门文档数分布</span>
+            <span class="text-[11px] text-faint">▲▼ = 本周净变化（篇）</span>
+          </div>
+          <ColumnChart :items="deptDocItems" unit=" 篇" empty="暂无文档。" />
+          <p class="mt-1 text-[11px] text-faint">柱高悬殊 = 知识偏科：少数部门撑起大部分语料。</p>
         </div>
         <div class="flex flex-col p-[15px]">
           <p :class="SUBHEAD">文件类型分布</p>
@@ -164,25 +171,30 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       </div>
     </section>
 
-    <!-- 全库运行健康（含近期入库趋势 + 部门覆盖与失衡 + 治理风险） -->
-    <section v-if="kbGovernance" :class="SECTION">
+    <!-- 全库运行健康（状态分布 + 健康卡 + 近期入库趋势 + 部门覆盖与失衡 + 治理风险） -->
+    <!-- 状态分布按 kbStats（治理未就绪也显）；其余指标治理就绪才显（无对应数据如实空，不造数）。 -->
+    <section v-if="kbGovernance || kbStats" :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库运行健康</header>
-      <div :class="GRID">
-        <StatCard v-for="s in healthCards" :key="s.label" v-bind="s" />
-      </div>
-      <p :class="SUBHEAD" class="ml-0.5 mt-4">近期入库趋势（嵌入块数）</p>
-      <div class="rounded-2xl border border-border bg-surface p-[15px]">
-        <MiniTrend :items="embedTrend" empty="近期无入库批次记录。" />
-      </div>
-      <p :class="SUBHEAD" class="ml-0.5 mt-5">部门覆盖与失衡</p>
-      <DeptTable :rows="kbGovernance.dept_coverage" />
-      <p class="ml-0.5 mb-1 mt-1.5 text-[11.5px] text-faint">
-        覆盖多≠用得多：对照「已上线 vs 使用量」找出失衡部门；「无答案率」高 = 该部门文档被问到却答不好，「风险」= 含敏感信息文档数。
-      </p>
-      <p :class="SUBHEAD" class="ml-0.5 mt-5">治理风险</p>
-      <div :class="GRID3">
-        <StatCard v-for="s in riskCards" :key="s.label" v-bind="s" />
-      </div>
+      <p :class="SUBHEAD" class="ml-0.5">状态分布</p>
+      <StatusDistBar :by-badge="kbStats?.by_badge || {}" />
+      <template v-if="kbGovernance">
+        <div :class="GRID" class="mt-4">
+          <StatCard v-for="s in healthCards" :key="s.label" v-bind="s" />
+        </div>
+        <p :class="SUBHEAD" class="ml-0.5 mt-4">近期入库趋势（嵌入块数）</p>
+        <div class="rounded-2xl border border-border bg-surface p-[15px]">
+          <MiniTrend :items="embedTrend" empty="近期无入库批次记录。" />
+        </div>
+        <p :class="SUBHEAD" class="ml-0.5 mt-5">部门覆盖与失衡</p>
+        <DeptTable :rows="kbGovernance.dept_coverage" />
+        <p class="ml-0.5 mb-1 mt-1.5 text-[11.5px] text-faint">
+          覆盖多≠用得多：对照「已上线 vs 使用量」找出失衡部门；「无答案率」高 = 该部门文档被问到却答不好，「风险」= 含敏感信息文档数。
+        </p>
+        <p :class="SUBHEAD" class="ml-0.5 mt-5">治理风险</p>
+        <div :class="GRID3">
+          <StatCard v-for="s in riskCards" :key="s.label" v-bind="s" />
+        </div>
+      </template>
     </section>
 
     <!-- 服务可用性 -->
@@ -210,6 +222,15 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
           <BarList bare :items="gapItems" tone="bg-st-warn" unit=" 次" empty="近期无「召回但未答好」的提问。" />
         </div>
       </div>
+      <!-- 各部门使用量 + 使用量周环比（命中提问数；柱=近30天、徽标=本周净变化） -->
+      <div v-if="deptUsageItems.length" class="mt-3 rounded-2xl border border-border bg-surface p-[15px]">
+        <div class="mb-2 flex items-baseline justify-between gap-2">
+          <span class="text-[12.5px] font-medium text-muted-foreground">各部门使用量（近 30 天）</span>
+          <span class="text-[11px] text-faint">▲▼ = 本周使用量净变化（次）</span>
+        </div>
+        <ColumnChart :items="deptUsageItems" unit=" 次" empty="近期无检索记录。" />
+        <p class="mt-1 text-[11px] text-faint">使用量 = 命中本部门文档的提问数；对照「各部门文档数」找覆盖多但用得少的部门。</p>
+      </div>
     </section>
 
     <!-- 用户反馈与回答质量（卡 + 趋势|原因 收在同一个框里） -->
@@ -224,8 +245,12 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
           <FeedbackTrend bare :days="kbGovernance.feedback_daily" :last7="kbGovernance.feedback_last7" :total="kbGovernance.feedback_total" />
         </div>
         <div class="p-[15px]">
-          <p :class="SUBHEAD">点踩原因分布</p>
-          <DonutChart :items="downvoteItems" :center-value="kbGovernance.feedback_down" center-label="点踩" empty="近期无点踩反馈。" />
+          <div class="mb-2 flex items-baseline justify-between gap-2">
+            <span class="text-[12.5px] font-medium text-muted-foreground">点踩原因分布</span>
+            <span class="font-mono text-[11px] tabular-nums text-faint">共 {{ fmtN(kbGovernance.feedback_down) }} 条</span>
+          </div>
+          <ColumnChart :items="downvoteItems" show-share :share-base="kbGovernance.feedback_down" color="var(--st-fail)" unit=" 次" empty="近期无点踩反馈。" />
+          <p v-if="downvoteItems.length" class="mt-1 text-[11px] text-faint">占比 = 该原因 / 点踩总数；点踩可多选，故合计可超 100%。</p>
         </div>
       </div>
     </section>

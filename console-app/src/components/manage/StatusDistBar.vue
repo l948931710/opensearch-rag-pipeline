@@ -20,9 +20,10 @@ const segs = computed(() => {
   const total = entries.reduce((s, [, n]) => s + (n || 0), 0)
   return {
     total,
-    items: entries.map(([k, n]) => ({
-      k, n, pct: total ? (n * 100) / total : 0, bg: TONE_BG[badgeTone(k)] || 'bg-st-muted',
-    })),
+    items: entries.map(([k, n]) => {
+      const pct = total ? (n * 100) / total : 0
+      return { k, n, pct, label: pct >= 1 ? Math.round(pct) + '%' : '<1%', bg: TONE_BG[badgeTone(k)] || 'bg-st-muted' }
+    }),
   }
 })
 </script>
@@ -30,12 +31,14 @@ const segs = computed(() => {
 <template>
   <div class="rounded-[14px] border border-border bg-card p-[15px]">
     <template v-if="segs.total">
-      <div class="mb-3 flex h-2.5 gap-0.5 overflow-hidden rounded">
+      <!-- 段宽 ∝ 占比；精确读数交给下方图例（label+计数+占比，主题安全色）与 hover tooltip，
+           不在段内叠字——段底色覆盖 6 种状态色，任何单一前景色都无法在亮/暗双主题保证对比度。 -->
+      <div class="kb-grow mb-3 flex h-4 gap-0.5 overflow-hidden rounded-md">
         <div
           v-for="s in segs.items" :key="s.k"
-          class="h-full first:rounded-l-md last:rounded-r-md"
+          class="h-full transition-[filter] first:rounded-l-md last:rounded-r-md hover:brightness-110"
           :class="s.bg" :style="{ width: s.pct + '%' }"
-          :title="`${s.k} ${s.n}`"
+          :title="`${s.k} ${s.n}（${s.label}）`"
         />
       </div>
       <div class="flex flex-wrap gap-x-4 gap-y-1.5">
@@ -43,6 +46,7 @@ const segs = computed(() => {
           <span class="size-2 rounded-sm" :class="s.bg" />
           <span class="text-[12.5px] text-muted-foreground">{{ s.k }}</span>
           <span class="font-mono text-[12.5px] font-bold tabular-nums text-foreground">{{ s.n }}</span>
+          <span class="font-mono text-[11px] tabular-nums text-faint">{{ s.label }}</span>
         </div>
       </div>
     </template>
