@@ -2669,10 +2669,16 @@ def kb_my_access_requests(request: Request,
 
 
 def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
-                      identity: Optional[Identity], decision: str) -> KbAccessDecisionResponse:
-    """审批一条申请（approve/reject）。授权：文档所属部门管理员（_kb_can_manage）或 kb_admin。
+                      identity: Optional[Identity], decision: str,
+                      *, from_status: str = "pending") -> KbAccessDecisionResponse:
+    """审批 / 撤销一条申请。授权：文档所属部门管理员（_kb_can_manage）或 kb_admin。
 
-    仅改 kb_access_request.status —— 【不】触碰 allowed_depts / 检索（Phase D 才放行）。
+    状态机（单向）：pending→approved / pending→rejected（审批）；approved→revoked（撤销已批授权）。
+    `from_status` = 本次操作要求的前态——非该前态 → 幂等返回（不重复改、不误转）。
+
+    改 kb_access_request.status，并（flag 开）在同事务内经 materialize_doc_allowed_depts 把该 doc 的
+    allowed_depts 投影标脏。撤销（approved→revoked）后该行不再 status='approved' → 重算时被剔除 →
+    投影收窄/清空 → stage-3 下次 drain 从 HA3 收回（这正是「无撤销路径」缺口的修复）。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
@@ -2697,16 +2703,16 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 owner_dept, status, doc_id = (row[0] or ""), (row[1] or ""), (row[2] or "")
                 # 审批权：文档所属部门管理员（owner_dept ∈ managed）或 kb_admin
                 if not _kb_can_manage(kb, owner_dept):
-                    raise HTTPException(status_code=403, detail="无权审批该申请（非文档所属部门管理员）")
-                if status != "pending":
-                    conn.commit()       # 幂等：已决 → 返回既有态
+                    raise HTTPException(status_code=403, detail="无权操作该申请（非文档所属部门管理员）")
+                if status != from_status:
+                    conn.commit()       # 幂等：非目标前态（已决 / 非 approved）→ 返回既有态
                     return KbAccessDecisionResponse(id=req.id, status=status, decided=False, already=True)
                 cur.execute("UPDATE fuling_knowledge.kb_access_request "
                             "SET status=%s, decided_by=%s, decided_at=NOW(), decision_note=%s WHERE id=%s",
                             (decision, kb.user_id, (req.reason or "")[:512], req.id))
                 # Phase D（flag 开）：同事务内把该 doc 的 allowed_depts 投影【标脏】——经共享注入点
                 # materialize_doc_allowed_depts 重算 authority（含刚改的本行 status，读己写：approve→纳入、
-                # reject→剔除）→ 版本限定 gate 到 dept_internal → diff →（变更）写 chunk_meta.allowed_depts +
+                # reject/revoke→剔除）→ 版本限定 gate 到 dept_internal → diff →（变更）写 chunk_meta.allowed_depts +
                 # index_status='NOT_INDEXED'，stage-3 下次 drain 据此重推 HA3。helper 内置 2h PROCESSING
                 # 反抢锁（与对账同口径）：current version 正在 stage-3 装载时跳过标脏，交对账下轮重对，杜绝
                 # 标脏被 stage-3 写回 INDEXED 覆盖而 HA3 仍旧 ACL 的自愈失败漂移。**绝不写 HA3 / 不
@@ -2726,7 +2732,7 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
         raise
     except Exception as e:
         logger.error("kb_access_request_%s 失败 [trace=%s]: %s", decision, trace_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"审批失败 (trace: {trace_id})")
+        raise HTTPException(status_code=500, detail=f"操作失败 (trace: {trace_id})")
     write_audit(doc_id=doc_id, version_no=None, action_type=f"ACCESS_REQUEST_{decision.upper()}",
                 operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
                 message=f"req_id={req.id} owner={owner_dept}")
@@ -2745,6 +2751,19 @@ def kb_access_request_reject(req: KbAccessDecisionRequest, request: Request,
                              identity: Optional[Identity] = Depends(current_identity)):
     """驳回申请。"""
     return _kb_access_decide(req, request, identity, decision="rejected")
+
+
+@app.post("/api/kb/access-requests/revoke", response_model=KbAccessDecisionResponse)
+def kb_access_request_revoke(req: KbAccessDecisionRequest, request: Request,
+                             identity: Optional[Identity] = Depends(current_identity)):
+    """撤销一条【已批准】的跨部门授权（approved→revoked）。授权同审批方（owner-dept 管理员 / kb_admin）。
+
+    复用 decide 机制：同事务把该 doc 的 allowed_depts 重算（剔除本撤销行、保留其余 approved 授权）→
+    收窄/清空投影 + 标脏，stage-3 下次 drain 从 HA3 收回放行。这是「approved 无法经 API 撤销」缺口的
+    一等修复——此前 reject 对 approved 行因 status!='pending' 幂等无效，只能直接改库 + 等夜间对账。
+    撤销后申请人可重新申请（revoked 同 rejected，不阻 submit 去重——后者只挡 pending）。
+    """
+    return _kb_access_decide(req, request, identity, decision="revoked", from_status="approved")
 
 
 # ═══════════════════════════════════════════════════════════════

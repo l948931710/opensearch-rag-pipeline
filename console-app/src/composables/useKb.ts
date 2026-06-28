@@ -171,7 +171,9 @@ async function loadMyAccessRequests() {
   try {
     const r = await apiJson<{ items: MyAccessRequestItem[] }>('/api/kb/my-access-requests', { auth: true })
     const m = new Map<string, { status: string; sync_state: string }>()
-    for (const it of (r.items || [])) m.set(it.doc_id, { status: it.status, sync_state: it.sync_state })
+    // 后端按 created_at DESC（最新在前）返回；每 doc 保留【最新】一行——拒后重申/撤销后重申会留多行，
+    // 若 last-write-wins（直接 m.set）会让最旧行覆盖最新 → 误显「申请授权」。首见即最新 → 不覆盖。
+    for (const it of (r.items || [])) if (!m.has(it.doc_id)) m.set(it.doc_id, { status: it.status, sync_state: it.sync_state })
     myAccessReqs.value = m
   } catch { /* 兜底空 */ }
 }
@@ -413,6 +415,19 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
   } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
 }
 
+// 撤销【已批准】的跨部门授权（approved→revoked）：后端同事务收窄 allowed_depts 投影 + 标脏，stage-3 收回放行。
+// 绑定就绪供「已授权清单」视图调用（该视图为后续 UI 增量；当前先提供可调用的撤销能力）。
+async function revokeAccess(d: AccessRequestItem, reason: string) {
+  if (apprBusy.value) return
+  apprBusy.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
+    await apiJson('/api/kb/access-requests/revoke', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id, reason }) })
+    await loadAccessRequests()
+  } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+}
+
 async function retire(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
   if (retireBusy.value) return { ok: false }
   retireBusy.value = true
@@ -445,7 +460,7 @@ export function useKb() {
     ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, maxUploadMb, verHistory,
     // 方法
     loadDocs, loadStats, loadConfig, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
-    loadAccessRequests, approveAccess, rejectAccess, setScope,
+    loadAccessRequests, approveAccess, rejectAccess, revokeAccess, setScope,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire,

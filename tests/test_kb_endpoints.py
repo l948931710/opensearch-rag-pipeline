@@ -486,6 +486,43 @@ def test_access_reject_non_pending_idempotent(monkeypatch):
     assert resp.already is True and resp.decided is False
 
 
+def test_access_revoke_approved_updates(monkeypatch):
+    """owner_dept 管理者撤销【已批准】授权 → UPDATE status='revoked'（approved→revoked）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [("marketing", "approved", "D1")])
+    from opensearch_pipeline import api
+    resp = api.kb_access_request_revoke(
+        api.KbAccessDecisionRequest(id="5", reason="申请人离职收回"), request=None, identity=api.Identity(user_id="da1"))
+    assert resp.decided is True and resp.status == "revoked"
+    updates = [c for c in sink["calls"] if "UPDATE fuling_knowledge.kb_access_request" in c[0]]
+    assert len(updates) == 1 and "revoked" in updates[0][1]
+
+
+def test_access_revoke_non_approved_idempotent(monkeypatch):
+    """撤销作用于非 approved（pending/rejected）→ 幂等（already=True, decided=False），绝不误转、不写。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("marketing", "pending", "D1")])
+    from opensearch_pipeline import api
+    resp = api.kb_access_request_revoke(api.KbAccessDecisionRequest(id="5"), request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.already is True and resp.decided is False and resp.status == "pending"
+    assert not [c for c in sink["calls"] if "UPDATE fuling_knowledge.kb_access_request" in c[0]]   # 非 approved → 不写
+
+
+def test_access_revoke_requires_owner_manage(monkeypatch):
+    """撤销权 = 文档所属部门管理员（与审批同授权）：非 owner_dept 管理者 → 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "approved", "D1")])     # 授权归 hr，调用者只管 marketing
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_request_revoke(api.KbAccessDecisionRequest(id="5"), request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
 def _stub_myreq(monkeypatch, request_rows, doc_state):
     """桩游标（按 SQL 片段分支）：主列表 fetchall 返回 request_rows；per-doc count(fetchone) +
     allowed_depts(fetchall) 由 doc_state 提供。用于验 /api/kb/my-access-requests 派生同步态。"""
