@@ -523,6 +523,43 @@ def test_access_revoke_requires_owner_manage(monkeypatch):
     assert getattr(ei.value, "status_code", None) == 403
 
 
+# ── 已授权清单 /api/kb/access-grants（approved 存量，供撤销）──
+def test_access_grants_list_dept_admin_scoped(monkeypatch):
+    """已授权清单作用域：dept_admin 仅见 owner_dept ∈ managed 的 approved；映射 requester_depts / decided_at。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [[
+        ("7", "D1", "营销规范", "marketing", "production", "王伟", "dept_internal", "引用", "2026-06-26"),
+    ]])
+    from opensearch_pipeline import api
+    resp = api.kb_access_grants_list(request=None, identity=api.Identity(user_id="da1"))
+    assert "r.status='approved'" in sink["sql"] and "r.owner_dept IN" in sink["sql"]
+    assert sink["params"] == ("marketing",)
+    assert len(resp.items) == 1
+    assert resp.items[0].requester_dept == "production" and resp.items[0].decided_at == "2026-06-26"
+
+
+def test_access_grants_list_kb_admin_all(monkeypatch):
+    """kb_admin 见全部 approved（不限作用域）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [[]])
+    from opensearch_pipeline import api
+    api.kb_access_grants_list(request=None, identity=api.Identity(user_id="dev1"))
+    assert "owner_dept IN" not in sink["sql"] and "r.status='approved'" in sink["sql"]
+
+
+def test_access_grants_list_employee_forbidden(monkeypatch):
+    """员工无管理台访问 → 403（先于任何 DB）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_grants_list(request=None, identity=api.Identity(user_id="e1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
 def _stub_myreq(monkeypatch, request_rows, doc_state):
     """桩游标（按 SQL 片段分支）：主列表 fetchall 返回 request_rows；per-doc count(fetchone) +
     allowed_depts(fetchall) 由 doc_state 提供。用于验 /api/kb/my-access-requests 派生同步态。"""

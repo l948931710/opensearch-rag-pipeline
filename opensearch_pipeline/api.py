@@ -2465,6 +2465,23 @@ class KbAccessRequestListResponse(BaseModel):
     items: List[KbAccessRequestItem] = Field(default_factory=list)
 
 
+class KbAccessGrantItem(BaseModel):
+    """审批方侧的【已放行】跨部门授权（status='approved'）——供「已授权清单」展示 + 撤销。"""
+    id: str = ""
+    doc_id: str = ""
+    doc_title: str = ""
+    owner_dept: str = ""
+    requester_dept: str = ""        # 获授权检索的组码（requester_depts）
+    requester_name: str = ""
+    permission_level: str = "dept_internal"
+    reason: str = ""
+    decided_at: str = ""            # 批准时间（授权生效时点）
+
+
+class KbAccessGrantListResponse(BaseModel):
+    items: List[KbAccessGrantItem] = Field(default_factory=list)
+
+
 class MyAccessRequestItem(BaseModel):
     id: str = ""
     doc_id: str = ""
@@ -2603,6 +2620,60 @@ def kb_access_requests_list(request: Request,
         for r in rows
     ]
     return KbAccessRequestListResponse(items=items)
+
+
+@app.get("/api/kb/access-grants", response_model=KbAccessGrantListResponse)
+def kb_access_grants_list(request: Request,
+                          identity: Optional[Identity] = Depends(current_identity)):
+    """审批方侧：列出【我可管理】文档上现行有效（status='approved'）的跨部门检索授权，供撤销。
+
+    owner_dept ∈ 我 managed（kb_admin 全部）。与待审批队列（pending）区分：此处是已放行的【存量】，
+    撤销动作走 POST /api/kb/access-requests/revoke。只读。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    clause, params = "", []
+    if kb.role != ROLE_KB_ADMIN:
+        owners = managed_owner_depts(kb)
+        if not owners:
+            return KbAccessGrantListResponse(items=[])
+        clause = "AND r.owner_dept IN (" + ",".join(["%s"] * len(owners)) + ")"
+        params = list(owners)
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT r.id, r.doc_id, m.title, r.owner_dept, r.requester_depts,
+                           r.requester_name, m.permission_level, r.reason, r.decided_at
+                    FROM fuling_knowledge.kb_access_request r
+                    JOIN fuling_knowledge.document_meta m ON m.doc_id = r.doc_id
+                    WHERE r.status='approved' {clause}
+                    ORDER BY r.decided_at DESC
+                    LIMIT 200
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_access_grants_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"已授权清单查询失败 (trace: {trace_id})")
+    items = [
+        KbAccessGrantItem(
+            id=str(r[0]), doc_id=r[1] or "", doc_title=r[2] or "", owner_dept=r[3] or "",
+            requester_dept=r[4] or "", requester_name=r[5] or "",
+            permission_level=r[6] or "dept_internal", reason=r[7] or "",
+            decided_at=str(r[8]) if r[8] else "",
+        )
+        for r in rows
+    ]
+    return KbAccessGrantListResponse(items=items)
 
 
 @app.get("/api/kb/my-access-requests", response_model=MyAccessRequestListResponse)

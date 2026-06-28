@@ -11,6 +11,7 @@ import { deptLabel } from '@/lib/kb'
 import UploadCard from '@/components/manage/UploadCard.vue'
 import ApprovalQueue from '@/components/manage/ApprovalQueue.vue'
 import AccessRequestQueue from '@/components/manage/AccessRequestQueue.vue'
+import AccessGrantList from '@/components/manage/AccessGrantList.vue'
 import DocTable from '@/components/manage/DocTable.vue'
 import VersionHistoryModal from '@/components/manage/VersionHistoryModal.vue'
 import AccessRequestModal from '@/components/manage/AccessRequestModal.vue'
@@ -21,7 +22,7 @@ import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadApprovals, loadAccessRequests, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadApprovals, loadAccessRequests, loadAccessGrants, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 
@@ -50,6 +51,7 @@ onMounted(async () => {
     void loadConfig()
     void loadApprovals()
     void loadAccessRequests()
+    void loadAccessGrants()
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
     if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
   } else {
@@ -131,6 +133,7 @@ onMounted(async () => {
     <template v-else-if="activeTab === 'docs'">
       <ApprovalQueue />
       <AccessRequestQueue />
+      <AccessGrantList />
       <UploadCard />
       <DocTable />
     </template>

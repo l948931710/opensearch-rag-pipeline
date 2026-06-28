@@ -24,6 +24,11 @@ export interface AccessRequestItem {
   id: string; doc_id: string; doc_title: string; owner_dept: string
   requester_dept: string; requester_name: string; permission_level: string; reason: string; created_at: string
 }
+// 审批方侧：已放行（approved）的跨部门授权存量（后端 /api/kb/access-grants）——供「已授权清单」展示 + 撤销。
+export interface AccessGrantItem {
+  id: string; doc_id: string; doc_title: string; owner_dept: string
+  requester_dept: string; requester_name: string; permission_level: string; reason: string; decided_at: string
+}
 // 申请人侧：我的申请 + 派生同步态（已批准·待同步 vs 已放行；后端 /api/kb/my-access-requests）。
 export interface MyAccessRequestItem {
   id: string; doc_id: string; doc_title: string; owner_dept: string; requester_dept: string
@@ -57,7 +62,8 @@ const maxUploadBytes = computed(() => kbConfig.value?.max_upload_bytes || MAX_UP
 const maxUploadMb = computed(() => Math.round(maxUploadBytes.value / 1048576))
 const verHistory = ref<{ doc: DocItem | null; versions: VersionItem[]; loading: boolean; error: string } | null>(null)
 const approvals = ref<PendingItem[]>([])
-const accessRequests = ref<AccessRequestItem[]>([])   // 授权申请队列（审批人侧）
+const accessRequests = ref<AccessRequestItem[]>([])   // 授权申请队列（审批人侧 · pending）
+const accessGrants = ref<AccessGrantItem[]>([])       // 已授权清单（审批人侧 · approved 存量，供撤销）
 const loadingDocs = ref(false)
 const docScope = ref<'managed' | 'all'>('managed')   // 本部门(my-docs) / 全部门只读浏览(browse)
 // 授权申请（申请人侧，Phase C）：本会话内已申请的 doc_id（无后端持久化，仅即时反映「审批中」）。
@@ -415,16 +421,32 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
   } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
 }
 
+// 已授权清单（审批人侧 · approved 存量）：后端 /api/kb/access-grants 未上线 → 静默兜底空；DEV ?preview 注入 mock。
+async function loadAccessGrants() {
+  const s = useSession()
+  if (!s.identity?.canManage) { accessGrants.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    accessGrants.value = [
+      { id: 'ag1', doc_id: 'D1', doc_title: '营销物料使用规范 v3', owner_dept: 'marketing', requester_dept: 'production', requester_name: '王伟', permission_level: 'dept_internal', reason: '生产部包装设计需引用营销规范。', decided_at: '2026-06-26' },
+      { id: 'ag2', doc_id: 'D2', doc_title: '客户投诉处理 SOP', owner_dept: 'marketing', requester_dept: 'quality', requester_name: '李娜', permission_level: 'dept_internal', reason: '品质部对照投诉闭环流程。', decided_at: '2026-06-25' },
+    ]
+    return
+  }
+  try {
+    const r = await apiJson<{ items: AccessGrantItem[] }>('/api/kb/access-grants', { auth: true })
+    accessGrants.value = r.items || []
+  } catch { accessGrants.value = [] }   // 端点未上线/出错 → 静默空，不阻断
+}
+
 // 撤销【已批准】的跨部门授权（approved→revoked）：后端同事务收窄 allowed_depts 投影 + 标脏，stage-3 收回放行。
-// 绑定就绪供「已授权清单」视图调用（该视图为后续 UI 增量；当前先提供可调用的撤销能力）。
-async function revokeAccess(d: AccessRequestItem, reason: string) {
+async function revokeAccess(g: AccessGrantItem, reason: string) {
   if (apprBusy.value) return
   apprBusy.value = true
   try {
     const s = useSession()
-    if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
-    await apiJson('/api/kb/access-requests/revoke', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id, reason }) })
-    await loadAccessRequests()
+    if (import.meta.env.DEV && s.token === 'dev-preview') { accessGrants.value = accessGrants.value.filter((x) => x.id !== g.id); return }
+    await apiJson('/api/kb/access-requests/revoke', { method: 'POST', auth: true, body: JSON.stringify({ id: g.id, reason }) })
+    await loadAccessGrants()
   } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
 }
 
@@ -453,14 +475,14 @@ export function useKb() {
 
   return {
     // 状态
-    docs, filtered, approvals, accessRequests, loadingDocs, docScope, q, filter, sortKey, sortDir,
+    docs, filtered, approvals, accessRequests, accessGrants, loadingDocs, docScope, q, filter, sortKey, sortDir,
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, maxUploadMb, verHistory,
     // 方法
     loadDocs, loadStats, loadConfig, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
-    loadAccessRequests, approveAccess, rejectAccess, revokeAccess, setScope,
+    loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, setScope,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire,
@@ -469,7 +491,7 @@ export function useKb() {
 
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; loadingDocs.value = false
+  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; loadingDocs.value = false
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null
