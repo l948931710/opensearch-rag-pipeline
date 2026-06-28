@@ -1785,6 +1785,354 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     return KbStatsResponse(total=len(rows), active=active, retired=retired, by_badge=by_badge)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase E — 概览看板的真实数据（不造数）。两个只读聚合端点，口径全部来自真实 RDS 表：
+#   GET /api/kb/insights    —— owner 作用域的「知识使用成效 + 知识缺口」（dept_admin 看本部门、
+#                              kb_admin 看全库；经 retrieved_docs_json→doc_id→owner_dept 归属）
+#   GET /api/kb/governance  —— 全库运行健康 / 治理风险 / 部门覆盖（仅 kb_admin）
+#
+# 关键事实（scratch/phase_e_data_probe.py 实测 + qa-log-analytics-gotchas）：
+#  · qa_session_log / user_feedback / escalation_ticket 在 fuling_operation；document_meta /
+#    chunk_meta / pipeline_run / document_sensitive_finding 在 fuling_knowledge —— 同实例可跨库 JOIN。
+#  · retrieved_docs_json 元素只留 doc_id 等 7 键、**不含 owner_dept** → 必须 JOIN document_meta 取归属。
+#    JSON_TABLE 抽出的串默认 utf8mb4_0900_ai_ci，与 document_meta.doc_id(unicode_ci) 直接 JOIN 报
+#    1267（kb_access_request 同坑），必须 CONVERT(... USING utf8mb4) COLLATE utf8mb4_unicode_ci。
+#  · answer_status ∈ {SUCCESS, NO_RESULT, REFUSAL, LLM_ERROR}（无裸 'ERROR'，错误用 LIKE '%ERROR%'）。
+#  · created_at 是 SAE 容器太平洋时间（北京 = +15h）：日历分桶用 DATE_ADD(created_at, INTERVAL 15 HOUR)。
+#  · 每个子查询独立 try/except：单指标取数失败只让该指标诚实空，不拖垮整块看板（auxiliary fail-open）。
+# ─────────────────────────────────────────────────────────────────────────────
+_KB_INSIGHTS_WINDOW_DAYS = 30
+
+# retrieved_docs_json → doc_id → document_meta.owner_dept 的归属 JOIN（collation-cast 必需）。
+# 末尾 WHERE 已含窗口占位符 %s；调用处再拼 _kb_owner_scope_sql 的作用域子句（kb_admin 为空 = 全库）。
+_KB_QA_OWNER_JOIN = (
+    " FROM fuling_operation.qa_session_log q"
+    " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
+    " JOIN fuling_knowledge.document_meta m"
+    "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
+    " WHERE q.retrieved_docs_json IS NOT NULL"
+    "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+)
+
+
+class KbTopDocItem(BaseModel):
+    title: str = ""
+    owner_dept: str = ""
+    hits: int = 0
+
+
+class KbGapQueryItem(BaseModel):
+    query: str = ""
+    count: int = 0
+    avg_top: float = 0.0
+
+
+class KbInsightsResponse(BaseModel):
+    scope: str = "dept"                  # 'global'（kb_admin 全库）| 'dept'（dept_admin 本部门）
+    window_days: int = _KB_INSIGHTS_WINDOW_DAYS
+    questions: int = 0                   # 命中所辖文档的提问数（DISTINCT message_id，去 JSON 扇出重复）
+    askers: int = 0
+    success: int = 0
+    refusal: int = 0
+    cited: int = 0                       # 所辖文档被「实际引用」的提问数
+    effective_rate: float = 0.0          # success / questions
+    top_docs: List[KbTopDocItem] = Field(default_factory=list)
+    gap_queries: List[KbGapQueryItem] = Field(default_factory=list)
+
+
+@app.get("/api/kb/insights", response_model=KbInsightsResponse)
+def kb_insights(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """知识使用成效 + 知识缺口（owner 作用域；真实口径，无造数）。
+
+    归属链 retrieved_docs_json→doc_id→document_meta.owner_dept，按 _kb_owner_scope_sql 作用域：
+    dept_admin 只见本部门文档被使用情况，kb_admin 见全库。各子查询独立降级，缺数据诚实空。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    win = _KB_INSIGHTS_WINDOW_DAYS
+    base = _KB_QA_OWNER_JOIN + (" " + scope_clause if scope_clause else "")
+    args = tuple([win] + scope_params)
+    out = KbInsightsResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"), window_days=win)
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_insights 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"洞察查询失败 (trace: {trace_id})")
+    fails = 0   # 子查询失败计数；全失败 = 连接级故障 → 诚实 500（而非 all-zeros 伪装无数据）
+    try:
+        # 共享一个游标跑多条子查询：依赖 pymysql 默认 buffered Cursor（_init_db_pool 未设 SSCursor），
+        # 某子查询异常后结果已全量缓冲，下一句 execute 不会 "Commands out of sync (2014)"。
+        with conn.cursor() as cur:
+            # 1) 使用聚合：提问数 / 提问人 / 成功 / 拒答（DISTINCT message_id 去 JSON 扇出）
+            try:
+                cur.execute(
+                    "SELECT COUNT(DISTINCT q.message_id), COUNT(DISTINCT q.user_id),"
+                    " COUNT(DISTINCT CASE WHEN q.answer_status='SUCCESS' THEN q.message_id END),"
+                    " COUNT(DISTINCT CASE WHEN q.answer_status='REFUSAL' THEN q.message_id END)" + base,
+                    args)
+                r = cur.fetchone() or (0, 0, 0, 0)
+                out.questions, out.askers = int(r[0] or 0), int(r[1] or 0)
+                out.success, out.refusal = int(r[2] or 0), int(r[3] or 0)
+                out.effective_rate = round(out.success / out.questions, 4) if out.questions else 0.0
+            except Exception as e:
+                fails += 1; logger.warning("kb_insights 使用聚合失败: %s", e)
+            # 2) 被引用问题数（cited_docs_json JOIN；NO_RESULT/REFUSAL 行该列为空，故弱于 retrieved）
+            try:
+                cur.execute(
+                    "SELECT COUNT(DISTINCT q.message_id)"
+                    " FROM fuling_operation.qa_session_log q"
+                    " JOIN JSON_TABLE(q.cited_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
+                    " JOIN fuling_knowledge.document_meta m"
+                    "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
+                    " WHERE q.cited_docs_json IS NOT NULL"
+                    "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    + (" " + scope_clause if scope_clause else ""), args)
+                out.cited = int((cur.fetchone() or (0,))[0] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_insights cited 失败: %s", e)
+            # 3) 最常被检索的文档（COUNT(DISTINCT message_id) 去扇出，与其它计数同一纪律）
+            try:
+                cur.execute(
+                    "SELECT m.title, m.owner_dept, COUNT(DISTINCT q.message_id)" + base
+                    + " GROUP BY m.doc_id, m.title, m.owner_dept"
+                    " ORDER BY COUNT(DISTINCT q.message_id) DESC LIMIT 8", args)
+                out.top_docs = [KbTopDocItem(title=row[0] or "", owner_dept=row[1] or "", hits=int(row[2] or 0))
+                                for row in cur.fetchall()]
+            except Exception as e:
+                fails += 1; logger.warning("kb_insights top_docs 失败: %s", e)
+            # 4) 知识缺口：所辖文档上「未答好」的提问（REFUSAL = 召回了我的文档但没答好，最可行动）。
+            #    avg_top 必须在「去扇出后的每问一行」上求均值——直接 AVG(q.top_score) 会被检索文档数
+            #    （最多 top_k=7）加权失真，故先 DISTINCT message_id 折叠扇出再外层 AVG。
+            try:
+                cur.execute(
+                    "SELECT d.query_text, COUNT(*), ROUND(AVG(d.top_score), 3) FROM ("
+                    "SELECT DISTINCT q.message_id, q.query_text, q.top_score" + base
+                    + " AND q.answer_status='REFUSAL') d"
+                    " GROUP BY d.query_text ORDER BY COUNT(*) DESC LIMIT 10", args)
+                out.gap_queries = [
+                    KbGapQueryItem(query=row[0] or "", count=int(row[1] or 0),
+                                   avg_top=float(row[2]) if row[2] is not None else 0.0)
+                    for row in cur.fetchall()]
+            except Exception as e:
+                fails += 1; logger.warning("kb_insights gap_queries 失败: %s", e)
+    finally:
+        conn.close()
+    if fails >= 4:   # 4 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非 0
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_insights 全部子查询失败 [trace=%s]", trace_id)
+        raise HTTPException(status_code=500, detail=f"洞察查询失败 (trace: {trace_id})")
+    return out
+
+
+class KbEmbedRunItem(BaseModel):
+    bizdate: str = ""
+    embedded: int = 0
+    failed: int = 0
+    fail_rate: float = 0.0
+
+
+class KbDeptCoverageItem(BaseModel):
+    owner_dept: str = ""
+    docs: int = 0
+    qa_hits: int = 0
+
+
+class KbGovernanceResponse(BaseModel):
+    window_days: int = _KB_INSIGHTS_WINDOW_DAYS
+    # 运行健康
+    docs_active: int = 0
+    docs_in_index: int = 0
+    dual_version_docs: int = 0
+    avg_latency_ms: int = 0
+    p50_latency_ms: int = 0
+    p95_latency_ms: int = 0
+    avg_retrieval_ms: int = 0
+    avg_llm_ms: int = 0
+    embed_runs: List[KbEmbedRunItem] = Field(default_factory=list)
+    # 治理风险 / 知识效果
+    pii_redacted_docs: int = 0
+    pii_quarantined_docs: int = 0
+    answer_total: int = 0
+    answer_success: int = 0
+    answer_refusal: int = 0
+    answer_no_result: int = 0
+    answer_error: int = 0
+    effective_rate: float = 0.0
+    feedback_up: int = 0
+    feedback_down: int = 0
+    feedback_total: int = 0
+    helpful_rate: float = 0.0
+    escalations: int = 0
+    # 部门覆盖 / 使用失衡
+    dept_coverage: List[KbDeptCoverageItem] = Field(default_factory=list)
+
+
+@app.get("/api/kb/governance", response_model=KbGovernanceResponse)
+def kb_governance(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """全库运行健康 / 治理风险 / 部门覆盖（仅 kb_admin；真实口径，无造数）。
+
+    延迟为端到端（含钉钉打字机流式渲染，非纯推理）；嵌入失败率仅取 OBS-3 列非空的 stage-3 跑批，
+    NULL 视为「未知」绝不当 0；PII/隔离按 document_sensitive_finding 的 COUNT(DISTINCT doc_id)。
+    各子查询独立降级，缺数据诚实空。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    _require_kb_admin(identity)
+    win = _KB_INSIGHTS_WINDOW_DAYS
+    out = KbGovernanceResponse(window_days=win)
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_governance 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"治理查询失败 (trace: {trace_id})")
+    fails = 0   # 子查询失败计数；全失败 = 连接级故障 → 诚实 500（而非 all-zeros 伪装健康）
+    try:
+        # 共享一个游标跑多条子查询：依赖 pymysql 默认 buffered Cursor（_init_db_pool 未设 SSCursor），
+        # 某子查询异常后结果已全量缓冲，下一句 execute 不会 "Commands out of sync (2014)"。
+        with conn.cursor() as cur:
+            # 1) 资产 / 索引可见性
+            try:
+                cur.execute(
+                    "SELECT (SELECT COUNT(*) FROM fuling_knowledge.document_meta WHERE status='active'),"
+                    " (SELECT COUNT(DISTINCT doc_id) FROM fuling_knowledge.chunk_meta"
+                    "   WHERE is_active=1 AND index_status='INDEXED')")
+                r = cur.fetchone() or (0, 0)
+                out.docs_active, out.docs_in_index = int(r[0] or 0), int(r[1] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance 资产 失败: %s", e)
+            # 2) 双版本残留（stage-3 不变量被破坏的信号；健康应为 0）
+            try:
+                cur.execute(
+                    "SELECT COUNT(*) FROM (SELECT doc_id FROM fuling_knowledge.chunk_meta"
+                    " WHERE is_active=1 AND index_status='INDEXED'"
+                    " GROUP BY doc_id HAVING COUNT(DISTINCT version_no) > 1) t")
+                out.dual_version_docs = int((cur.fetchone() or (0,))[0] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance dual_version 失败: %s", e)
+            # 3) 端到端延迟（avg + p50/p95 + 检索/生成分段；窗口内 latency_ms>0）
+            try:
+                cur.execute(
+                    "SELECT ROUND(AVG(latency_ms)), ROUND(AVG(retrieval_latency_ms)), ROUND(AVG(llm_latency_ms)),"
+                    " MAX(CASE WHEN pr<=0.5 THEN latency_ms END), MAX(CASE WHEN pr<=0.95 THEN latency_ms END)"
+                    " FROM (SELECT latency_ms, retrieval_latency_ms, llm_latency_ms,"
+                    "   PERCENT_RANK() OVER (ORDER BY latency_ms) pr"
+                    "   FROM fuling_operation.qa_session_log"
+                    "   WHERE latency_ms > 0 AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)) t",
+                    (win,))
+                r = cur.fetchone() or (0, 0, 0, 0, 0)
+                out.avg_latency_ms = int(r[0] or 0); out.avg_retrieval_ms = int(r[1] or 0)
+                out.avg_llm_ms = int(r[2] or 0)
+                out.p50_latency_ms = int(r[3] or 0); out.p95_latency_ms = int(r[4] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance latency 失败: %s", e)
+            # 4) 嵌入失败率（OBS-3）：两列都必须非空，否则失败数未知。embedding_failed_chunks 是
+            #    独立可空列（embedded_chunks=100、failed=NULL 是合法「未知」），若只判 embedded_chunks
+            #    非空会把 NULL 当 0 → 伪造 0% 完美率。故 WHERE 同时要求 failed 非空，未知批次整条不计入。
+            try:
+                cur.execute(
+                    "SELECT bizdate, embedded_chunks, embedding_failed_chunks"
+                    " FROM fuling_knowledge.pipeline_run"
+                    " WHERE stage=3 AND embedded_chunks IS NOT NULL AND embedding_failed_chunks IS NOT NULL"
+                    " ORDER BY started_at DESC LIMIT 8")
+                runs = []
+                for row in cur.fetchall():
+                    emb, fail = int(row[1] or 0), int(row[2] or 0)
+                    denom = emb + fail
+                    runs.append(KbEmbedRunItem(bizdate=str(row[0] or ""), embedded=emb, failed=fail,
+                                               fail_rate=round(fail / denom, 4) if denom else 0.0))
+                out.embed_runs = runs
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance embed_runs 失败: %s", e)
+            # 5) 全库回答结果分布（原始 qa_session_log，含 NO_RESULT）
+            try:
+                cur.execute(
+                    "SELECT answer_status, COUNT(*) FROM fuling_operation.qa_session_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY answer_status", (win,))
+                for status, n in cur.fetchall():
+                    n = int(n or 0); st = (status or "").upper()
+                    out.answer_total += n
+                    if st == "SUCCESS":
+                        out.answer_success += n
+                    elif st == "REFUSAL":
+                        out.answer_refusal += n
+                    elif st == "NO_RESULT":
+                        out.answer_no_result += n
+                    elif "ERROR" in st:
+                        out.answer_error += n
+                out.effective_rate = round(out.answer_success / out.answer_total, 4) if out.answer_total else 0.0
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance answer_mix 失败: %s", e)
+            # 6) PII：已脱敏 / 已隔离文档数（COUNT DISTINCT doc_id，按动作）
+            try:
+                cur.execute(
+                    "SELECT (SELECT COUNT(DISTINCT doc_id) FROM fuling_knowledge.document_sensitive_finding"
+                    "   WHERE action='REDACTED'),"
+                    " (SELECT COUNT(DISTINCT doc_id) FROM fuling_knowledge.document_sensitive_finding"
+                    "   WHERE action='QUARANTINED')")
+                r = cur.fetchone() or (0, 0)
+                out.pii_redacted_docs, out.pii_quarantined_docs = int(r[0] or 0), int(r[1] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance pii 失败: %s", e)
+            # 7) 用户反馈（二元好评率，累计；反馈稀疏故不按窗口切薄）
+            try:
+                cur.execute(
+                    "SELECT SUM(feedback_type='upvote'), SUM(feedback_type='downvote'), COUNT(*)"
+                    " FROM fuling_operation.user_feedback WHERE feedback_type IN ('upvote','downvote')")
+                r = cur.fetchone() or (0, 0, 0)
+                out.feedback_up, out.feedback_down = int(r[0] or 0), int(r[1] or 0)
+                out.feedback_total = int(r[2] or 0)
+                out.helpful_rate = round(out.feedback_up / out.feedback_total, 4) if out.feedback_total else 0.0
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance feedback 失败: %s", e)
+            # 8) 转人工工单数
+            try:
+                cur.execute("SELECT COUNT(*) FROM fuling_operation.escalation_ticket")
+                out.escalations = int((cur.fetchone() or (0,))[0] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance escalations 失败: %s", e)
+            # 9) 部门覆盖（文档数）+ 使用失衡（窗口内命中本部门文档的提问数），按 owner_dept 合并。
+            #    qa_hits 用 COUNT(DISTINCT message_id) = 提问数（retrieved_docs_json 是 chunk 级、
+            #    一问可含同文档多 chunk，COUNT(*) 会把 chunk 命中误当提问数 → 与 top_docs 同一去扇出纪律）。
+            try:
+                cov: Dict[str, Dict[str, int]] = {}
+                cur.execute(
+                    "SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                    " WHERE status='active' GROUP BY owner_dept")
+                for dept, docs in cur.fetchall():
+                    cov.setdefault(dept or "unknown", {"docs": 0, "qa_hits": 0})["docs"] = int(docs or 0)
+                cur.execute(
+                    "SELECT m.owner_dept, COUNT(DISTINCT q.message_id)"
+                    " FROM fuling_operation.qa_session_log q"
+                    " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
+                    " JOIN fuling_knowledge.document_meta m"
+                    "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
+                    " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " GROUP BY m.owner_dept", (win,))
+                for dept, hits in cur.fetchall():
+                    cov.setdefault(dept or "unknown", {"docs": 0, "qa_hits": 0})["qa_hits"] = int(hits or 0)
+                out.dept_coverage = sorted(
+                    [KbDeptCoverageItem(owner_dept=k, docs=v["docs"], qa_hits=v["qa_hits"]) for k, v in cov.items()],
+                    key=lambda x: x.docs, reverse=True)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance dept_coverage 失败: %s", e)
+    finally:
+        conn.close()
+    if fails >= 9:   # 9 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非伪造健康
+        trace_id = uuid.uuid4().hex[:8]
+        logger.error("kb_governance 全部子查询失败 [trace=%s]", trace_id)
+        raise HTTPException(status_code=500, detail=f"治理查询失败 (trace: {trace_id})")
+    return out
+
+
 class KbConfigResponse(BaseModel):
     max_upload_bytes: int = 0
     accepted_exts: List[str] = Field(default_factory=list)

@@ -46,6 +46,28 @@ export interface VerCtx { doc_id: string; title: string; owner_dept: string; per
 
 interface MyDocsResp { items: DocItem[]; has_more: boolean }
 export interface KbStats { total: number; active: number; retired: number; by_badge: Record<string, number> }
+// Phase E 概览看板真实数据（镜像 api.py KbInsightsResponse / KbGovernanceResponse，字段一一对应）
+export interface KbTopDoc { title: string; owner_dept: string; hits: number }
+export interface KbGapQuery { query: string; count: number; avg_top: number }
+export interface KbInsights {
+  scope: string; window_days: number
+  questions: number; askers: number; success: number; refusal: number; cited: number; effective_rate: number
+  top_docs: KbTopDoc[]; gap_queries: KbGapQuery[]
+}
+export interface KbEmbedRun { bizdate: string; embedded: number; failed: number; fail_rate: number }
+export interface KbDeptCoverage { owner_dept: string; docs: number; qa_hits: number }
+export interface KbGovernance {
+  window_days: number
+  docs_active: number; docs_in_index: number; dual_version_docs: number
+  avg_latency_ms: number; p50_latency_ms: number; p95_latency_ms: number
+  avg_retrieval_ms: number; avg_llm_ms: number; embed_runs: KbEmbedRun[]
+  pii_redacted_docs: number; pii_quarantined_docs: number
+  answer_total: number; answer_success: number; answer_refusal: number; answer_no_result: number; answer_error: number
+  effective_rate: number
+  feedback_up: number; feedback_down: number; feedback_total: number; helpful_rate: number
+  escalations: number
+  dept_coverage: KbDeptCoverage[]
+}
 export interface KbConfig { max_upload_bytes: number; accepted_exts: string[] }
 export interface VersionItem {
   version_no: number; content_process_status: string; chunk_status: string
@@ -61,6 +83,8 @@ export type SortKey = 'updated_at' | 'current_version_no' | 'title' | 'owner_dep
 // ── 状态 ──
 const docs = ref<DocItem[]>([])
 const kbStats = ref<KbStats | null>(null)   // 全作用域聚合（真实总数/状态分布，不受 my-docs 50 上限影响）
+const kbInsights = ref<KbInsights | null>(null)     // Phase E：使用成效 + 知识缺口（owner 作用域）
+const kbGovernance = ref<KbGovernance | null>(null) // Phase E：全库运行健康/治理风险/部门覆盖（kb_admin）
 const kbConfig = ref<KbConfig | null>(null) // 后端能力配置（上传上限/类型）；缺省用常量兜底
 const maxUploadBytes = computed(() => kbConfig.value?.max_upload_bytes || MAX_UPLOAD_MB * 1048576)
 const maxUploadMb = computed(() => Math.round(maxUploadBytes.value / 1048576))
@@ -218,6 +242,59 @@ async function loadStats() {
 async function loadConfig() {
   // 上传上限/类型走后端权威，避免硬编码漂移（失败则用 MAX_UPLOAD_MB 常量兜底）。
   try { kbConfig.value = await apiJson<KbConfig>('/api/kb/config', { auth: true }) } catch { /* 兜底 */ }
+}
+
+// ── Phase E：概览看板真实数据（缺数据/端点未上线 → 静默兜底 null，由组件如实显空/加载中）──
+// DEV ?preview 注入 mock（取自真实口径量级，便于设计走查）；prod build 死代码消除。
+async function loadInsights() {
+  const s = useSession()
+  if (!s.identity?.canManage) { kbInsights.value = null; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    kbInsights.value = {
+      scope: s.role === 'kb_admin' ? 'global' : 'dept', window_days: 30,
+      questions: 186, askers: 40, success: 143, refusal: 43, cited: 130, effective_rate: 0.769,
+      top_docs: [
+        { title: 'FL-GJMY-WI-008《下达销售订单》作业指导书.docx', owner_dept: 'marketing', hits: 64 },
+        { title: '亚马逊运营SOP（标准化流程）.docx', owner_dept: 'marketing', hits: 51 },
+        { title: '客户投诉处理 SOP.pdf', owner_dept: 'marketing', hits: 33 },
+      ],
+      gap_queries: [
+        { query: '2ozpp杯在龙盛机上的速度', count: 2, avg_top: 0.729 },
+        { query: '由此写一封英文信', count: 1, avg_top: 0.617 },
+      ],
+    }
+    return
+  }
+  try { kbInsights.value = await apiJson<KbInsights>('/api/kb/insights', { auth: true }) } catch { /* 兜底 */ }
+}
+
+async function loadGovernance() {
+  const s = useSession()
+  if (s.role !== 'kb_admin') { kbGovernance.value = null; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    kbGovernance.value = {
+      window_days: 30, docs_active: 1618, docs_in_index: 1475, dual_version_docs: 0,
+      avg_latency_ms: 14035, p50_latency_ms: 8106, p95_latency_ms: 54994, avg_retrieval_ms: 1538, avg_llm_ms: 12428,
+      embed_runs: [
+        { bizdate: '2026-06-23', embedded: 117, failed: 0, fail_rate: 0 },
+        { bizdate: '2026-06-22', embedded: 96, failed: 0, fail_rate: 0 },
+        { bizdate: '2026-06-21', embedded: 228, failed: 0, fail_rate: 0 },
+      ],
+      pii_redacted_docs: 475, pii_quarantined_docs: 3,
+      answer_total: 902, answer_success: 790, answer_refusal: 112, answer_no_result: 15, answer_error: 25,
+      effective_rate: 0.876,
+      feedback_up: 64, feedback_down: 44, feedback_total: 108, helpful_rate: 0.593, escalations: 19,
+      dept_coverage: [
+        { owner_dept: 'production', docs: 800, qa_hits: 980 },
+        { owner_dept: 'hr', docs: 192, qa_hits: 1991 },
+        { owner_dept: 'it', docs: 36, qa_hits: 2640 },
+        { owner_dept: 'marketing', docs: 178, qa_hits: 420 },
+        { owner_dept: 'rd', docs: 175, qa_hits: 96 },
+      ],
+    }
+    return
+  }
+  try { kbGovernance.value = await apiJson<KbGovernance>('/api/kb/governance', { auth: true }) } catch { /* 兜底 */ }
 }
 
 // 版本历史（点击文档行「历史」）：拉 /api/kb/version-history（后端现成）。
@@ -556,9 +633,9 @@ export function useKb() {
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
-    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, maxUploadMb, verHistory,
+    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory,
     // 方法
-    loadDocs, loadStats, loadConfig, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
+    loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, setScope,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
@@ -569,7 +646,7 @@ export function useKb() {
 
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false
+  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null

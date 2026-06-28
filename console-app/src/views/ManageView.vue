@@ -23,7 +23,7 @@ import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadApprovals, loadAccessRequests, loadAccessGrants, loadAdminGrants, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadAdminGrants, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 
@@ -51,10 +51,11 @@ onMounted(async () => {
     await loadDocs()
     void loadStats()
     void loadConfig()
+    void loadInsights()                              // 概览看板：使用成效 + 知识缺口（两角色）
     void loadApprovals()
     void loadAccessRequests()
     void loadAccessGrants()
-    if (isKbAdmin.value) void loadAdminGrants()
+    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants() }   // 全库治理看板 + 成员管理（kb_admin）
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
     if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
   } else {

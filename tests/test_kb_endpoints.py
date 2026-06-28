@@ -792,3 +792,193 @@ def test_my_access_requests_bad_row_degrades_not_500(monkeypatch):
     assert len(resp.items) == 2                  # 坏行未吞掉整张表，两行都在
     assert by_id["1"] == "n/a"                   # 坏行降级 n/a
     assert by_id["2"] == "projected"             # 好行不受影响
+
+
+# ── /api/kb/insights 使用成效 + 知识缺口（Phase E）──────────────────────────────
+def test_insights_employee_forbidden_before_db(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:   # 管理员特权：employee 在任何 DB 查询前 403
+        api.kb_insights(request=None, identity=api.Identity(user_id="emp1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_insights_anonymous_unauthorized(monkeypatch):
+    _skip_if_not_sim()
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_insights(request=None, identity=None)
+    assert getattr(ei.value, "status_code", None) == 401
+
+
+def test_insights_dept_admin_scope_and_collation(monkeypatch):
+    """dept_admin：作用域收窄到本部门 + JSON→doc_id collation-cast（1267 防御）+ 参数化。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [])   # 空桩：各子查询取数为空 → 安全默认，不 500
+    from opensearch_pipeline import api
+    resp = api.kb_insights(request=None, identity=api.Identity(user_id="da1"))
+    assert resp.scope == "dept"
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "m.owner_dept IN" in sqls                              # 作用域收窄
+    assert "COLLATE utf8mb4_unicode_ci" in sqls                   # 1267 防御：collation-cast
+    assert "JSON_TABLE" in sqls                                   # 经 retrieved_docs_json 归属
+    assert any(p and "marketing" in p for _, p in sink["calls"])  # 部门参数化
+    assert "AND 1=0" not in sqls                                  # 有授权 → 非空集
+
+
+def test_insights_kb_admin_unscoped_global(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [])
+    from opensearch_pipeline import api
+    resp = api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.scope == "global"
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "m.owner_dept IN" not in sqls                          # kb_admin 不限作用域
+    assert "AND 1=0" not in sqls
+
+
+def test_insights_dept_admin_no_managed_fail_closed(monkeypatch):
+    """无授权 dept_admin → 作用域 1=0 空集，绝不静默当全量。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "")
+    sink = _stub_multi(monkeypatch, [])
+    from opensearch_pipeline import api
+    api.kb_insights(request=None, identity=api.Identity(user_id="da0"))
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "AND 1=0" in sqls
+
+
+# ── /api/kb/governance 全库治理（Phase E，仅 kb_admin）──────────────────────────
+def test_governance_dept_admin_forbidden(monkeypatch):
+    """治理看板是 kb_admin 专属：dept_admin（含写授权）也 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_governance(request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_governance_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_governance(request=None, identity=api.Identity(user_id="emp1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_governance_kb_admin_shape_and_queries(monkeypatch):
+    """kb_admin：空桩 → 安全默认不 500；关键治理查询都在（PII/反馈/延迟分位）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [])
+    from opensearch_pipeline import api
+    resp = api.kb_governance(request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.window_days == 30
+    assert resp.docs_active == 0 and resp.dept_coverage == []     # 空桩降级，不 500
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "document_sensitive_finding" in sqls                   # PII 风险
+    assert "user_feedback" in sqls                                # 反馈好评率
+    assert "PERCENT_RANK()" in sqls                               # 延迟 p50/p95
+    assert "escalation_ticket" in sqls                            # 转人工
+    # 嵌入失败率两列都判非空（NULL 失败数绝不当 0% 完美率）
+    assert "embedding_failed_chunks IS NOT NULL" in sqls
+
+
+def _stub_all_fail(monkeypatch):
+    """桩游标：每条 execute 都抛 → 验「全部子查询失败 → 诚实 500」而非 all-zeros 200。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            raise RuntimeError("simulated DB fault")
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+
+
+def test_insights_all_queries_fail_raises_500(monkeypatch):
+    """连接成功但所有子查询失败（DB mid-batch gone-away）→ 诚实 500，不伪装 all-zeros 无数据。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_all_fail(monkeypatch)
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 500
+
+
+def test_governance_all_queries_fail_raises_500(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_all_fail(monkeypatch)
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_governance(request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 500
+
+
+def test_insights_partial_failure_degrades_not_500(monkeypatch):
+    """部分子查询失败（首条成功、其余抛）→ 不 500：已取到的指标照常，未取到的诚实空。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _Cur:
+        def __init__(self):
+            self.n = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            self.n += 1
+            if self.n > 1:                       # 仅第一条（使用聚合）成功，其余抛
+                raise RuntimeError("simulated partial fault")
+
+        def fetchone(self):
+            return (12, 5, 9, 3)                  # questions/askers/success/refusal
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    from opensearch_pipeline import api
+    resp = api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))   # 不抛 500
+    assert resp.questions == 12 and resp.success == 9    # 成功子查询的真实指标保留
+    assert resp.top_docs == [] and resp.gap_queries == []  # 失败子查询诚实空
