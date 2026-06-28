@@ -43,9 +43,9 @@ class _Cur:
             self._r = [(d, ",".join(g)) for d, g in self.st["approved"].items() if d in ids]
         elif "kb_access_request" in s and "distinct doc_id" in s:   # approved 列表
             self._r = [(d,) for d in self.st["approved"]]
-        elif "group_concat(distinct permission_level)" in s:        # gate 守卫 perm 查询
-            ids = set(p)
-            self._r = [(d, self.st["perm"][d]) for d in ids if d in self.st["perm"]]
+        elif "group_concat(distinct permission_level)" in s:        # gate 守卫 perm 查询（helper 单列、版本限定）
+            d = p[0]
+            self._r = [(self.st["perm"][d],)] if d in self.st.get("perm", {}) else []
         elif "allowed_depts is not null" in s:                      # have_ad（retract 候选）
             self._r = [(d,) for d, a in self.st["have"].items() if a]
         elif "current_version_no" in s:                             # per-doc 版本 + 反抢锁

@@ -116,3 +116,67 @@ def gate_by_permission(
                 doc_id, permission_by_doc.get(doc_id),
             )
     return out
+
+
+def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) -> Dict[str, object]:
+    """把单篇文档的 approved 授权【物化】到 chunk_meta.allowed_depts 投影——decide 端点与
+    allowed_depts_reconcile 对账共用的【唯一写实现】（与上面 resolve/gate/current 读原语配套）。
+
+    单一注入点，绝不重复手写。流程：
+      1. 解析 current version，并施加 2h PROCESSING 反抢锁（与 stage-3 loader 同约定）——current
+         version 正在 stage-3 跑（PROCESSING < 2h）→ 返回 skipped_locked、本轮不动，交对账下轮重对。
+         **必须有这层**：否则在 stage-3 装载窗口内抢改 index_status，会被 stage-3 写回 INDEXED
+         覆盖、而 HA3 仍是旧 ACL → chunk_meta 已等于 authority 致对账判 unchanged 不再重推的【自愈
+         失败漂移】（Step 5 审计；decide 旧实现缺此守卫）。
+      2. 从 authority 重解析该 doc 应有 allowed_depts，并按【该 version】permission_level **版本限定**
+         gate 到 dept_internal（对账旧实现版本无关 GROUP_CONCAT → 双活混级误撤合法授权；此处统一）。
+      3. 与现存投影 diff；变更则 UPDATE chunk_meta.allowed_depts + 标脏 index_status='NOT_INDEXED'
+         （= stage-3 outbox，下次 drain 重推 HA3）。
+
+    **不提交事务、不写 HA3**（连接/事务由调用方掌控；HA3 由 stage-3 drain 携带）。
+    apply=False：只算 want/have/status、不写（对账只读预览）。
+
+    Returns: {"status": "skipped"|"skipped_locked"|"unchanged"|"materialized"|"retracted",
+              "reset_chunks": int, "version_no": int|None}
+    """
+    import json as _json
+    if not doc_id:
+        return {"status": "skipped", "reset_chunks": 0, "version_no": None}
+    # 1. current version + 2h PROCESSING 反抢锁（与 stage-3 loader / 对账同约定）
+    cursor.execute(
+        "SELECT dm.current_version_no FROM fuling_knowledge.document_meta dm "
+        "LEFT JOIN fuling_knowledge.document_version dv "
+        "  ON dv.doc_id=dm.doc_id AND dv.version_no=dm.current_version_no "
+        "WHERE dm.doc_id=%s AND (dv.index_status IS NULL "
+        "  OR dv.index_status!='PROCESSING' OR dv.updated_at < NOW() - INTERVAL 2 HOUR)",
+        (doc_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None}
+    ver = int(row[0] or 1)
+    # 2. authority → 该版本 permission_level 版本限定 gate 到 dept_internal
+    raw_want = resolve_allowed_depts_one(doc_id, cursor)
+    cursor.execute(
+        "SELECT GROUP_CONCAT(DISTINCT permission_level) FROM fuling_knowledge.chunk_meta "
+        "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+        (doc_id, ver),
+    )
+    prow = cursor.fetchone()
+    want = gate_by_permission(
+        {doc_id: raw_want}, {doc_id: (prow[0] if prow else None)},
+    ).get(doc_id, [])
+    # 3. diff vs 现存投影
+    have = current_allowed_for_doc(cursor, doc_id, ver)
+    if sorted(want) == have:
+        return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
+    status = "materialized" if want else "retracted"
+    if not apply:
+        return {"status": status, "reset_chunks": 0, "version_no": ver}
+    aj = _json.dumps(want, ensure_ascii=False) if want else None
+    cursor.execute(
+        "UPDATE fuling_knowledge.chunk_meta SET allowed_depts=%s, index_status='NOT_INDEXED' "
+        "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+        (aj, doc_id, ver),
+    )
+    return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
