@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import {
   Database, CheckCircle2, Archive, Clock, GitBranch, Timer, Cpu,
   ShieldAlert, ShieldCheck, ThumbsUp, ThumbsDown, Headset, Percent, Quote, MessageSquare, Ban,
-  Search, Activity, AlertTriangle,
+  Search, AlertTriangle,
 } from 'lucide-vue-next'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
@@ -76,7 +76,6 @@ const availabilityCards = computed<Card[]>(() => {
   return [
     { label: '问答 API 成功率', value: pct(g?.qa_api_success_rate), icon: CheckCircle2, tone: 'text-st-live', hint: `近 ${g?.window_days ?? 30} 天 · ${fmtN(g?.qa_total_30d)} 次` },
     { label: '检索 API 成功率', value: pct(g?.retrieval_api_success_rate), icon: Search, tone: 'text-st-live', hint: '检索正常返回占比' },
-    { label: '流式回答中断率', value: '—', icon: Activity, tone: 'text-st-muted', hint: '暂无埋点（待前端流式上报）' },
     { label: '近 24h 错误数', value: g?.errors_24h ?? 0, icon: AlertTriangle, tone: g?.errors_24h ? 'text-st-fail' : 'text-st-live', hint: '失败请求 · DashScope/HA3' },
   ]
 })
@@ -128,18 +127,24 @@ const feedbackCards = computed<Card[]>(() => {
 const downvoteItems = computed(() =>
   (kbGovernance.value?.downvote_reasons || []).map((r) => ({ label: r.reason, value: r.count })))
 
-const HEADER = 'mb-3 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint'
+// 每个主分区 = 一个有边框的「区域面板」（暖底 bg-panel + 描边），白色指标卡浮于其上（卡上区的标准看板分层）。
+const SECTION = 'rounded-2xl border border-border bg-panel/60 p-4 sm:p-5'
+// 区域标题：绿色竖条 + 区名 + 下方细分隔线（替代原 uppercase「眉标」，更像真标题而非装饰）。
+const ZONE_HEAD = 'mb-4 flex items-center gap-2 border-b border-border/70 pb-3 text-[13px] font-semibold tracking-tight text-foreground'
+const ZONE_TICK = 'h-3.5 w-1 shrink-0 rounded-full bg-accent-strong'
 const SUBHEAD = 'mb-2 text-[12.5px] font-medium text-muted-foreground'
 const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
+const GRID3 = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-3'   // 3 张卡的区（服务可用性 / 治理风险）：N 项 N 格，不留空格
 // 成对子项收进「一个框、两半、中间竖线分隔」的共享面板（对齐设计：趋势|原因、最常用|未答好）。
-const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-card divide-y divide-border sm:grid-cols-2 sm:divide-y-0 sm:divide-x'
+// 嵌在区域面板里 → 用纯白 bg-surface 与暖底面板拉开层次。
+const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface divide-y divide-border sm:grid-cols-2 sm:divide-y-0 sm:divide-x'
 </script>
 
 <template>
-  <div class="space-y-7">
+  <div class="space-y-6">
     <!-- 全库资产概览（含状态分布 + 部门覆盖情况） -->
-    <section>
-      <p :class="HEADER">全库资产概览</p>
+    <section :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库资产概览</header>
       <div :class="GRID">
         <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" />
       </div>
@@ -160,13 +165,13 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-card div
     </section>
 
     <!-- 全库运行健康（含近期入库趋势 + 部门覆盖与失衡 + 治理风险） -->
-    <section v-if="kbGovernance">
-      <p :class="HEADER">全库运行健康</p>
+    <section v-if="kbGovernance" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库运行健康</header>
       <div :class="GRID">
         <StatCard v-for="s in healthCards" :key="s.label" v-bind="s" />
       </div>
       <p :class="SUBHEAD" class="ml-0.5 mt-4">近期入库趋势（嵌入块数）</p>
-      <div class="rounded-2xl border border-border bg-card p-[15px]">
+      <div class="rounded-2xl border border-border bg-surface p-[15px]">
         <MiniTrend :items="embedTrend" empty="近期无入库批次记录。" />
       </div>
       <p :class="SUBHEAD" class="ml-0.5 mt-5">部门覆盖与失衡</p>
@@ -175,22 +180,22 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-card div
         覆盖多≠用得多：对照「已上线 vs 使用量」找出失衡部门；「无答案率」高 = 该部门文档被问到却答不好，「风险」= 含敏感信息文档数。
       </p>
       <p :class="SUBHEAD" class="ml-0.5 mt-5">治理风险</p>
-      <div :class="GRID">
+      <div :class="GRID3">
         <StatCard v-for="s in riskCards" :key="s.label" v-bind="s" />
       </div>
     </section>
 
     <!-- 服务可用性 -->
-    <section v-if="kbGovernance">
-      <p :class="HEADER">服务可用性</p>
-      <div :class="GRID">
+    <section v-if="kbGovernance" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>服务可用性</header>
+      <div :class="GRID3">
         <StatCard v-for="s in availabilityCards" :key="s.label" v-bind="s" />
       </div>
     </section>
 
     <!-- 全库知识效果 -->
-    <section v-if="kbGovernance || kbInsights">
-      <p :class="HEADER">全库知识效果</p>
+    <section v-if="kbGovernance || kbInsights" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库知识效果</header>
       <div v-if="effectCards.length" :class="GRID" class="mb-3">
         <StatCard v-for="s in effectCards" :key="s.label" v-bind="s" />
       </div>
@@ -208,14 +213,14 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-card div
     </section>
 
     <!-- 用户反馈与回答质量（卡 + 趋势|原因 收在同一个框里） -->
-    <section v-if="kbGovernance">
-      <p :class="HEADER">用户反馈与回答质量</p>
+    <section v-if="kbGovernance" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>用户反馈与回答质量</header>
       <div :class="GRID" class="mb-3">
         <StatCard v-for="s in feedbackCards" :key="s.label" v-bind="s" />
       </div>
       <div :class="SPLIT">
         <div class="p-[15px]">
-          <p :class="SUBHEAD">近 30 天反馈趋势</p>
+          <p :class="SUBHEAD">反馈趋势</p>
           <FeedbackTrend bare :days="kbGovernance.feedback_daily" :last7="kbGovernance.feedback_last7" :total="kbGovernance.feedback_total" />
         </div>
         <div class="p-[15px]">
@@ -226,9 +231,9 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-card div
     </section>
 
     <!-- 治理/洞察数据加载中（端点未接入）→ 如实占位 -->
-    <section v-if="!kbGovernance && !kbInsights">
-      <p :class="HEADER">全库治理看板</p>
-      <div class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
+    <section v-if="!kbGovernance && !kbInsights" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库治理看板</header>
+      <div class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         运行健康 / 治理风险 / 部门覆盖 / 知识效果数据加载中（需后端
         <code class="font-mono text-[11.5px]">/api/kb/governance</code> 与
         <code class="font-mono text-[11.5px]">/api/kb/insights</code>）；稍后自动呈现。

@@ -92,7 +92,8 @@ describe('KbAdminDashboard — 全库真实口径，无造数', () => {
     expect(w.text()).toContain('服务可用性')
     expect(w.text()).toContain('问答 API 成功率')
     expect(w.text()).toContain('97.4%')              // 问答/检索 API 成功率
-    expect(w.text()).toContain('流式回答中断率')      // 无埋点 → 显示「—」
+    expect(w.text()).toContain('近 24h 错误数')       // 服务可用性第 3 卡
+    expect(w.text()).not.toContain('流式回答中断率')  // 已移除（无埋点，不显伪占位）
     // 部门覆盖与失衡（设计版表格）
     expect(w.text()).toContain('部门覆盖与失衡')
     expect(w.text()).toContain('无答案率')
@@ -108,7 +109,7 @@ describe('KbAdminDashboard — 全库真实口径，无造数', () => {
     expect(w.text()).toContain('点踩')
     expect(w.text()).toContain('59.3%')              // 正反馈率 helpful_rate
     expect(w.text()).toContain('12.0%')              // 反馈覆盖率 = 108/902
-    expect(w.text()).toContain('近 30 天反馈趋势')
+    expect(w.text()).toContain('反馈趋势')
     expect(w.text()).toContain('点踩原因分布')
     expect(w.text()).toContain('不准确')              // downvote reason
     expect(w.text()).not.toContain('数据加载中')      // 已就绪 → 不再占位
