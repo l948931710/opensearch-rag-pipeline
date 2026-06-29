@@ -708,7 +708,7 @@ async function retire(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
   try {
     const r = await apiJson<RetireResp>('/api/kb/retire', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id }) })
     d.status_badge = '已退役'                       // 即时反映行
-    void loadDocs()
+    await loadDocs()                                // await 重拉，让服务端权威徽章纠正乐观值（对齐 approve/reject；G3）
     return { ok: true, msg: r.note }
   } catch (e: any) {
     const msg = e && e.status === 403 ? (e.detail || '无权退役该文档') : uploadErrText(e)
@@ -723,8 +723,8 @@ async function restore(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
   try {
     if (import.meta.env.DEV && useSession().token === 'dev-preview') { d.status_badge = '排队中'; return { ok: true } }
     const r = await apiJson<{ note?: string }>('/api/kb/restore', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id }) })
-    d.status_badge = '排队中'                       // 即时反映（NOT_INDEXED → 待重索引）；loadDocs 复算权威态
-    void loadDocs()
+    d.status_badge = '排队中'                       // 即时反映（NOT_INDEXED → 待重索引）
+    await loadDocs()                                // await 重拉，把乐观「排队中」纠正为服务端权威徽章（HA3 未删则即时「已上线」；G3）
     return { ok: true, msg: r.note }
   } catch (e: any) {
     const msg = e && e.status === 403 ? (e.detail || '无权恢复该文档') : uploadErrText(e)
