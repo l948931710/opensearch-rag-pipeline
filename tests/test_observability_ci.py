@@ -91,6 +91,15 @@ def test_ci_workflow_present_and_runs_tests_in_simulate():
     assert "RAG_SIMULATE" in txt, "CI must run in simulate mode (no cloud creds)"
 
 
+def test_ci_workflow_has_frontend_test_build_job():
+    """前端门回归：CI 必须有 console-app 的 vitest + build 阻塞 job（此前 135 测试从未在 CI 跑）。"""
+    from pathlib import Path
+    txt = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "setup-node" in txt, "CI must set up Node for the frontend job"
+    assert "working-directory: console-app" in txt, "frontend job must run in console-app"
+    assert "npm run test" in txt and "npm run build" in txt, "frontend job must run vitest + build"
+
+
 # ── EVAL-2: GT-manifest preflight wired into the L4 run-path ──
 
 def test_eval2_preflight_missing_manifest_is_not_drift(tmp_path):
