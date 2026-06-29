@@ -14,8 +14,10 @@ days; p95 reflects that latency_ms is END-TO-END incl. the typewriter stream, no
   RAG_SLO_ERROR_RATE_MAX     error_rate     ≤ 0.05   (LLM_ERROR / total)
 
 answer_status ∈ {SUCCESS, NO_RESULT, REFUSAL, LLM_ERROR} + separate risk_blocked flag.
-created_at is the SAE container's Pacific wall-clock; tz_shift_hours (default +15) buckets to the
-Beijing business day (see the qa-log-analytics gotcha).
+created_at is the SAE container's Pacific wall-clock; rows are bucketed to the Beijing business day
+via DST-correct CONVERT_TZ(created_at,'America/Los_Angeles','Asia/Shanghai') (named zones; RDS tz
+tables verified loaded). tz_shift_hours is now legacy/nominal — recorded in the audit column only, it
+no longer drives bucketing (the old hardcoded +15h was off by one hour in US winter, PST=+16h).
 
 Runner is fail-open + simulate-safe (no-op), read/UPSERT only (no destructive ops). alert=True fires
 one OBS-4 ops alert per breached day.
@@ -29,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TZ_SHIFT_HOURS = 15  # Pacific(stored) → Beijing business day
+_DEFAULT_TZ_SHIFT_HOURS = 15  # legacy/nominal audit value only — bucketing now uses DST-correct CONVERT_TZ
 
 
 def _op_db() -> str:
@@ -200,7 +202,10 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
                     row = c.fetchone()
                     target = str(row["d"] if isinstance(row, dict) else row[0])
 
-            # pull the day's rows, bucketed to Beijing via tz_shift on the stored Pacific time.
+            # pull the day's rows, bucketed to Beijing from the stored Pacific time via DST-correct
+            # CONVERT_TZ (named zones; RDS tz tables verified loaded). Replaces the old hardcoded
+            # +tz_shift — which was off by one hour during US winter (PST=+16h, not +15h). tz_shift_hours
+            # is now legacy/nominal: it no longer drives bucketing, only the audit column below.
             # The shared pool uses a tuple cursor (no DictCursor) → map to dicts via the known
             # column order so compute_daily_metrics' keyed access works regardless of cursor type.
             _cols = ["answer_status", "risk_blocked", "latency_ms", "top_score", "user_id",
@@ -209,8 +214,8 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
                 c.execute(
                     f"""SELECT {', '.join(_cols)}
                           FROM {_op_db()}.qa_session_log
-                         WHERE DATE(DATE_ADD(created_at, INTERVAL %s HOUR)) = %s""",
-                    (tz_shift_hours, target))
+                         WHERE DATE(CONVERT_TZ(created_at, 'America/Los_Angeles', 'Asia/Shanghai')) = %s""",
+                    (target,))
                 raw = c.fetchall()
             rows = [r if isinstance(r, dict) else dict(zip(_cols, r)) for r in raw]
 
@@ -249,7 +254,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="OBS-5 nightly QA rollup + SLO verdict")
     ap.add_argument("--date", default=None, help="Beijing business day YYYY-MM-DD (default: yesterday)")
-    ap.add_argument("--tz-shift", type=int, default=_DEFAULT_TZ_SHIFT_HOURS, help="Pacific→Beijing hours")
+    ap.add_argument("--tz-shift", type=int, default=_DEFAULT_TZ_SHIFT_HOURS,
+                    help="legacy/nominal audit value only (bucketing now uses DST-correct CONVERT_TZ)")
     ap.add_argument("--alert", action="store_true", help="fire OBS-4 alert on SLO breach/error")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
