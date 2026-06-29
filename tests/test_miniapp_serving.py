@@ -73,6 +73,24 @@ def test_token_expired():
     assert auth_token.verify_session_token(t) is None
 
 
+def test_upload_token_rejected_as_session_token():
+    """令牌类型混淆防护（P1-02）：upload token(typ=kb_upload) 与会话令牌同密钥同格式，
+    但绝不能通过 verify_session_token 冒充会话身份；会话令牌正常放行；旧版无 typ 令牌向后兼容。"""
+    from opensearch_pipeline import kb_upload
+
+    up = kb_upload.sign_upload_token({"uid": "ADMIN1", "owner_dept": "hr", "raw_key": "raw/x"})
+    # upload token 自校验仍 OK，但当成会话令牌必须被拒
+    assert kb_upload.verify_upload_token(up) is not None
+    assert auth_token.verify_session_token(up) is None
+
+    # 正常会话令牌（新版带 typ=session）放行
+    sess = auth_token.issue_session_token("U1", dept="finance")
+    assert auth_token.verify_session_token(sess) is not None
+    # 旧版会话令牌（无 typ 键）在 TTL 抽干窗口内向后兼容仍放行
+    legacy = auth_token.sign_payload({"uid": "U1", "acl_groups": []})
+    assert auth_token.verify_session_token(legacy) is not None
+
+
 def test_session_token_default_ttl_is_2h():
     """会话令牌默认 TTL = 2h（原 8h，缩短读组撤销窗口）。"""
     import time
@@ -271,6 +289,44 @@ def test_ask_oversized_history_rejected_and_trimmed(client, monkeypatch):
         "history": [{"role": "user", "content": ""}],
     })
     assert r3.status_code == 422, "空 content 必须 422"
+
+
+# ── /api/ask 会话归属（P1-01：可预测 miniapp:<uid> 命名空间防跨用户读/污染）──
+
+
+def test_ask_miniapp_session_requires_owner_token(client, monkeypatch):
+    """'miniapp:<uid>' 可枚举 → 匿名/他人令牌带他人会话 ID 一律 403（防读取/污染他人会话上下文）；
+    本人令牌放行。与 /api/session/clear 同策略，覆盖 /api/ask 读写路径。"""
+    captured = {}
+    _stub_ask_pipeline(monkeypatch, captured)
+
+    # 匿名（无令牌）携带他人可预测会话 ID → 403，且在检索/LLM 开销之前拒绝
+    r_anon = client.post("/api/ask", json={"question": "q", "session_id": "miniapp:U1"})
+    assert r_anon.status_code == 403, r_anon.text
+    assert "history" not in captured, "403 必须早于检索/LLM，不得进入会话/生成路径"
+
+    # 他人令牌（U2）携带 U1 会话 ID → 403
+    tok_other = auth_token.issue_session_token("U2", dept="行政部")
+    r_other = client.post("/api/ask", json={"question": "q", "session_id": "miniapp:U1"},
+                          headers={"Authorization": "Bearer " + tok_other})
+    assert r_other.status_code == 403, r_other.text
+
+    # 本人令牌（U1）携带自己的会话 ID → 放行
+    tok = auth_token.issue_session_token("U1", dept="行政部")
+    r_owner = client.post("/api/ask", json={"question": "q", "session_id": "miniapp:U1"},
+                          headers={"Authorization": "Bearer " + tok})
+    assert r_owner.status_code == 200, r_owner.text
+
+
+def test_ask_uuid_session_holder_is_owner(client, monkeypatch):
+    """不可枚举的服务端 UUID 会话仍按持有即所有处理——匿名 UUID 会话不被 miniapp 归属校验误伤。"""
+    from opensearch_pipeline import session_store
+
+    captured = {}
+    _stub_ask_pipeline(monkeypatch, captured)
+    sid, _ = session_store.get_or_create_session(None)
+    r = client.post("/api/ask", json={"question": "q", "session_id": sid})
+    assert r.status_code == 200, r.text
 
 
 # ── /api/session/clear ───────────────────────────────────────

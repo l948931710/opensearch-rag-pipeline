@@ -512,6 +512,13 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_i
     检索失败统一抛 HTTPException(500)（流式端点也要求在返回 StreamingResponse 之前抛出）。
     retrieve_and_enrich 经本模块全局名调用，保持测试 monkeypatch(api.retrieve_and_enrich) 接缝。
     """
+    # 会话归属校验：'miniapp:<staffId>' 是可预测命名空间（chat.js 用 'miniapp:'+userId 构造），
+    # 必须校验令牌归属，防止匿名/他人读取或污染他人会话上下文（与 /api/session/clear 同策略）。
+    # 其余 session_id（服务端 UUID / 钉钉会话 key，不可枚举）按持有即所有处理。
+    if req.session_id and req.session_id.startswith("miniapp:"):
+        if not identity or req.session_id != f"miniapp:{identity.user_id}":
+            raise HTTPException(status_code=403, detail="无权访问该会话")
+
     t0 = time.time()
 
     # 1. 会话管理

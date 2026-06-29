@@ -315,7 +315,7 @@ def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT dept_code FROM fuling_knowledge.user_role "
+                    f"SELECT dept_code FROM {_kb_db()}.user_role "
                     "WHERE user_id = %s AND is_active = 1 "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (staff_id,),
