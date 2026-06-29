@@ -3868,22 +3868,29 @@ def _contrib_item(row) -> "KbContributionItem":
 def _reconcile_contributions_searchable(conn) -> None:
     """懒式对账：registered 的贡献文档若 DAG 已索引成功→searchable，索引失败→failed。
 
-    跨库 UPDATE...JOIN document_version（同实例可跑，COLLATE 一致）。best-effort、非致命——
-    辅助治理绝不拖垮读端点（任何异常只记 info 并放过；读端点仍按持久态展示）。
+    跨库 UPDATE...JOIN document_version。best-effort、非致命——辅助治理绝不拖垮读端点
+    （任何异常只记 info 并放过；读端点仍按持久态展示）。
+
+    ⚠️ doc_id 跨库 JOIN【必须】collation-cast：kb_contribution(fuling_operation, unicode_ci) ⋈
+       document_version(fuling_knowledge)——后者若 _0900_ai_ci（staging _stg / 未显式 COLLATE 建库
+       即漂移，与 kb_access_request 同坑：staging 实测 1267）直接 JOIN 报 1267 → 被本函数 try/except
+       吞掉 → reconcile 静默永不 flip searchable。显式 COLLATE 强制统一比较；prod 两侧 unicode_ci 时为 no-op。
     """
     from opensearch_pipeline import contribution as C
     ok_in = ",".join("'%s'" % s for s in C.INDEX_OK_STATUSES)
     fail_in = ",".join("'%s'" % s for s in C.INDEX_FAIL_STATUSES)
+    _doc_join = ("dv.doc_id = CONVERT(c.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
+                 " AND dv.version_no=1")
     try:
         with conn.cursor() as cur:
             cur.execute(
                 f"UPDATE {_op_db()}.kb_contribution c"
-                f" JOIN {_kb_db()}.document_version dv ON dv.doc_id=c.doc_id AND dv.version_no=1"
+                f" JOIN {_kb_db()}.document_version dv ON {_doc_join}"
                 " SET c.ingestion_status='searchable', c.searchable_at=NOW()"
                 f" WHERE c.ingestion_status='registered' AND dv.index_status IN ({ok_in})")
             cur.execute(
                 f"UPDATE {_op_db()}.kb_contribution c"
-                f" JOIN {_kb_db()}.document_version dv ON dv.doc_id=c.doc_id AND dv.version_no=1"
+                f" JOIN {_kb_db()}.document_version dv ON {_doc_join}"
                 " SET c.ingestion_status='failed', c.ingestion_error='索引失败（管线 index_status 异常）'"
                 f" WHERE c.ingestion_status='registered' AND dv.index_status IN ({fail_in})")
         conn.commit()

@@ -459,3 +459,17 @@ def test_gaps_requires_login_401(monkeypatch):
     with pytest.raises(Exception) as ei:
         api.kb_gaps(request=None, limit=20, offset=0, identity=None)
     assert getattr(ei.value, "status_code", None) == 401
+
+
+# ── 9) reconcile 跨库 JOIN 必须 collation-cast（staging _stg 实测 1267 静默吞 → 永不 searchable）──
+def test_reconcile_join_collation_safe(monkeypatch):
+    """staging 端到端逮到的真 bug 回归：kb_contribution(unicode_ci) ⋈ document_version(_0900) 不
+    cast 会 1267 被 try/except 吞掉 → reconcile 永不 flip searchable。锁死 COLLATE cast 在 SQL 里。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(list_rows=[]))
+    from opensearch_pipeline import api
+    api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    recon = [s for s, _ in conn.calls if "kb_contribution c" in s and "document_version dv" in s]
+    assert recon, "reconcile UPDATE 未发出"
+    assert all("COLLATE utf8mb4_unicode_ci" in s for s in recon), "reconcile 跨库 doc_id JOIN 必须 collation-cast"
