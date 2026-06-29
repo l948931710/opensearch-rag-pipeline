@@ -108,6 +108,46 @@ def test_insert_columns_all_exist_in_schema_files():
 
 
 @patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+def test_query_and_answer_pii_redacted_before_insert(mock_get_conn):
+    """OBS-qa-pii：query_text/answer_text 写库前做不可逆 PII 掩码。
+    用户问题里的手机号、回答里回显的身份证号都不得以明文进入 INSERT 参数。"""
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    log_qa_session(
+        session_id="s1", message_id="m1",
+        query_text="我的手机是13812345678，工资条能查吗",
+        answer_text="登记的身份证号是110101199003076418，请到系统查询。",
+    )
+    params = cur.execute.call_args[0][1]
+    blob = "".join(p for p in params if isinstance(p, str))
+    # 原始 PII 绝不落盘
+    assert "13812345678" not in blob, "手机号明文进了 qa_session_log"
+    assert "110101199003076418" not in blob, "身份证号明文进了 qa_session_log"
+    # 占位符确实落盘（掩码生效，而非整段被丢）
+    assert "已脱敏" in blob
+    # 非 PII 文本保留，问题仍可读
+    assert "工资条能查吗" in blob
+
+
+@patch("opensearch_pipeline.qa_logger._qa_log_pii_redact_on", return_value=False)
+@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+def test_redaction_flag_off_keeps_raw(mock_get_conn, _flag_off):
+    """RAG_QA_LOG_PII_REDACT=false（调试取证）→ 原文不掩码，逐字落盘。"""
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    log_qa_session(session_id="s1", message_id="m1",
+                   query_text="手机13812345678")
+    params = cur.execute.call_args[0][1]
+    assert any(isinstance(p, str) and "13812345678" in p for p in params)
+
+
+@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
 def test_retrieved_docs_json_carries_chunk_id_and_version_no(mock_get_conn):
     """答案血缘：retrieved_docs_json 必须带 chunk_id + version_no，使一条已落库回答能
     溯源到精确的 chunk 与文档版本（L7-01 / INC-6）。re-chunk 后 chunk_index 会漂移，

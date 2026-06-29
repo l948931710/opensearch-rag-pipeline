@@ -222,3 +222,33 @@ def test_drain_outbox_preview_no_writes(monkeypatch):
     res = access_grants.drain_acl_projection_outbox(commit=False)
     assert res["processed"] == 1
     assert not any("done_at=NOW()" in w[0] for w in store["writes"])   # 预览不写
+
+
+# ── P0-3 收尾：投影 outbox 的 DDL 契约 + decide 同事务原子入队 ────────────────
+def test_acl_projection_outbox_table_has_committed_ddl():
+    """enqueue/drain 的 INSERT/SELECT 目标表 kb_acl_projection_outbox 必须有已提交的 schema DDL。
+    否则 fresh 部署/迁移上 decide 端点撞 errno 1146（表不存在）→ 同事务回滚 → 每次
+    approve/reject/revoke 全失败。DDL 不可只存在于未提交的工作区文件（009 必须随代码入库）。"""
+    from pathlib import Path
+    schema_dir = Path(__file__).resolve().parent.parent / "schema"
+    ddl = "".join(p.read_text(encoding="utf-8") for p in sorted(schema_dir.glob("*.sql")))
+    assert "kb_acl_projection_outbox" in ddl, \
+        "kb_acl_projection_outbox 缺 DDL：请提交 schema/009_acl_projection_outbox.sql"
+    # enqueue/drain 实际读写的列都必须在 DDL 里（防列契约漂移）
+    for col in ("doc_id", "reason", "attempts", "last_error", "enqueued_at", "done_at"):
+        assert col in ddl, f"kb_acl_projection_outbox DDL 缺列 {col}"
+
+
+def test_decide_enqueues_outbox_same_transaction_after_status_change():
+    """撤权必达原子性（P0-3）：_kb_access_decide 在改 kb_access_request.status 的同一游标/事务内
+    调用 enqueue_acl_projection，且 enqueue 在 status 变更【之后】（权威变更与投影意图原子提交）。
+    enqueue 刻意不吞异常 → 失败则整笔回滚，绝不出现权威已改而 outbox 缺行的撕裂。"""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent
+           / "opensearch_pipeline" / "api.py").read_text(encoding="utf-8")
+    i = src.index("def _kb_access_decide(")
+    body = src[i:i + 4000]   # 函数体（decide 约 80 行，4k 字符足够覆盖）
+    assert "SET status=%s" in body, "decide 应改 kb_access_request.status"
+    assert "enqueue_acl_projection(cur" in body, "decide 应同游标入队投影 outbox"
+    assert body.index("SET status=%s") < body.index("enqueue_acl_projection(cur"), \
+        "enqueue 必须在 status 变更之后（同事务原子入队，读己写）"
