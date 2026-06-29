@@ -3,13 +3,15 @@ import { Clock, FileText } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
+import { useDialog } from '@/composables/useDialog'
 
 // 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
 const { approvals, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors } = useKb()
+const { promptText } = useDialog()
 const rowKey = (d: PendingItem) => `appr:${d.doc_id}/${d.version_no}`
 
-function onReject(d: PendingItem) {
-  const reason = prompt('驳回原因（可空）：', '')
+async function onReject(d: PendingItem) {
+  const reason = await promptText({ title: '驳回上传', message: `驳回《${d.title || d.original_filename || d.doc_id}》的上传？`, placeholder: '驳回原因（可空）', confirmText: '驳回', danger: true })
   if (reason === null) return   // 取消
   void reject(d, reason || 'rejected')
 }

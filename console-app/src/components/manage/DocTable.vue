@@ -6,6 +6,9 @@ import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
 import LoadError from './LoadError.vue'
+import { useDialog } from '@/composables/useDialog'
+
+const { confirm } = useDialog()
 
 const {
   docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
@@ -33,13 +36,21 @@ const COLS: { key: SortKey; label: string }[] = [
 function arrow(k: SortKey) { return sortKey.value === k ? (sortDir.value === 1 ? '↑' : '↓') : '' }
 
 async function onRetire(d: DocItem) {
-  if (!confirm(`确认退役《${d.title || d.original_filename || d.doc_id}》？\n将标记下线、停止作为升版目标。从检索彻底移除会在下次维护完成（本操作可逆）。`)) return
+  const okGo = await confirm({
+    title: '退役文档', confirmText: '退役', danger: true,
+    message: `确认退役《${d.title || d.original_filename || d.doc_id}》？\n将标记下线、停止作为升版目标。从检索彻底移除会在下次维护完成（本操作可逆）。`,
+  })
+  if (!okGo) return
   const r = await retire(d)
   if (!r.ok && r.msg) alert('退役失败：' + r.msg)
 }
 
 async function onRestore(d: DocItem) {
-  if (!confirm(`确认恢复上线《${d.title || d.original_filename || d.doc_id}》？\n将重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复。`)) return
+  const okGo = await confirm({
+    title: '恢复上线', confirmText: '恢复上线',
+    message: `确认恢复上线《${d.title || d.original_filename || d.doc_id}》？\n将重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复。`,
+  })
+  if (!okGo) return
   const r = await restore(d)
   if (!r.ok && r.msg) alert('恢复失败：' + r.msg)
 }

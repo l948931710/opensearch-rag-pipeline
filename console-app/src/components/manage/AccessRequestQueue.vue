@@ -3,13 +3,15 @@ import { Lock, FileText } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessRequestItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
+import { useDialog } from '@/composables/useDialog'
 
 // 授权申请队列（审批人侧，Phase C）：其他部门申请检索本部门文档 → 由文档所属部门管理员审批。
 // 与「待审批队列」（上传放行，橙头）区分：此处绿头。数据空时整块不渲染（无后端 = 自然隐藏，不造占位噪声）。
 const { accessRequests, isBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
+const { promptText } = useDialog()
 
-function onReject(d: AccessRequestItem) {
-  const reason = prompt('驳回原因（可空，将通知申请人）：', '')
+async function onReject(d: AccessRequestItem) {
+  const reason = await promptText({ title: '驳回授权申请', message: `驳回「${d.requester_name || d.requester_dept}」对《${d.doc_title}》的检索授权申请？`, placeholder: '驳回原因（可空，将通知申请人）', confirmText: '驳回', danger: true })
   if (reason === null) return   // 取消
   void rejectAccess(d, reason || 'rejected')
 }
