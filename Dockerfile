@@ -4,6 +4,12 @@
 
 FROM python:3.11-slim AS base
 
+# 部署版本指纹（canary 校验 / 回滚确认）：构建期烤入 git 短 SHA，运行期经 RAG_GIT_SHA 暴露给
+# versions.git_commit() → /api/version。打包步骤传 --build-arg GIT_SHA=$(git rev-parse --short HEAD)；
+# 不传则为 'unknown'（不影响功能，仅版本端点显示 unknown）。
+ARG GIT_SHA=unknown
+ENV RAG_GIT_SHA=$GIT_SHA
+
 # 阿里云 VPC 内网不需要代理，保持 pip 默认源即可
 # 如果构建环境在国内公网，可取消注释下行加速
 # RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
