@@ -115,6 +115,60 @@ def test_write_audit_cursor_path_propagates_error():
         write_audit(doc_id="D1", version_no=1, action_type="KB_ADMIN_REVOKE", cursor=_BadCur())
 
 
+# ── ACL 策略版本（acl_policy_version 盖进 ACL 审计行）──
+def test_acl_policy_version_stable_and_content_addressed():
+    from opensearch_pipeline.versions import acl_policy_version
+    v = acl_policy_version()
+    assert v and v != "unknown" and len(v) == 12   # 真实 12-hex 内容指纹（test 环境映射可 import）
+    assert acl_policy_version() == v                # 同进程稳定
+
+
+def test_acl_policy_version_changes_when_mapping_changes(monkeypatch):
+    import opensearch_pipeline.dingtalk_identity as di
+    from opensearch_pipeline.versions import acl_policy_version
+    before = acl_policy_version()
+    patched = dict(di._DEPT_NAME_TO_GROUPS)
+    patched["新部门X"] = ["finance"]
+    monkeypatch.setattr(di, "_DEPT_NAME_TO_GROUPS", patched)
+    assert acl_policy_version() != before           # 映射改动 → 版本自动变（无需手动 bump）
+
+
+def _capture_conn(monkeypatch, captured):
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): captured["params"] = params
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda **kw: _Conn())
+
+
+def test_write_audit_stamps_acl_policy_on_acl_action(monkeypatch):
+    """ACL 授权动作（KB_ADMIN_GRANT 等）→ 消息盖上 [acl_policy=<ver>]，原文保留。"""
+    captured = {}
+    _capture_conn(monkeypatch, captured)
+    from opensearch_pipeline.audit_log import write_audit
+    write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
+                operator_id="admin1", trace_id="t", message="granted kb_admin to u9")
+    msg = captured["params"][8]
+    assert msg.startswith("[acl_policy=") and "granted kb_admin to u9" in msg
+
+
+def test_write_audit_no_acl_stamp_on_lifecycle_action(monkeypatch):
+    """文档生命周期动作（DEACTIVATE 等）不盖 ACL 策略版本（避免噪声）。"""
+    captured = {}
+    _capture_conn(monkeypatch, captured)
+    from opensearch_pipeline.audit_log import write_audit
+    write_audit(doc_id="D", version_no=1, action_type="DEACTIVATE", message="retired")
+    assert captured["params"][8] == "retired"
+
+
 def test_deactivate_wires_audit_write():
     """node_deactivate_old_chunks must emit a DEACTIVATE audit on the irreversible retirement."""
     from opensearch_pipeline.pipeline_nodes import node_deactivate_old_chunks

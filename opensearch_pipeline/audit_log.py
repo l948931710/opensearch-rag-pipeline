@@ -50,6 +50,17 @@ def _audit_insert_sql() -> str:
     )
 
 
+# ACL 授权类动作（dept_internal / 跨部门 / 管理员授权的增减）——这些审计行附带 acl_policy_version。
+# 文档生命周期动作（REGISTER/CHUNK/INDEX/DEACTIVATE/RETIRE_REQUEST/RESTORE_REQUEST...）不在此列，
+# 不加策略版本噪声。新增 ACL 动作类型时在此登记即自动获得盖戳。
+_ACL_AUDIT_ACTIONS = frozenset({
+    "APPROVE", "REJECT", "REVOKE",
+    "ACCESS_REQUEST_SUBMIT", "ACCESS_REQUEST_APPROVED",
+    "ACCESS_REQUEST_REJECTED", "ACCESS_REQUEST_REVOKED",
+    "KB_ADMIN_GRANT", "KB_ADMIN_REVOKE",
+})
+
+
 def write_audit(*, doc_id: Optional[str], version_no: Optional[int],
                 action_type: str, action_result: str = "SUCCESS",
                 trace_id: Optional[str] = None, message: Optional[str] = None,
@@ -69,6 +80,16 @@ def write_audit(*, doc_id: Optional[str], version_no: Optional[int],
     """
     if simulate:
         return
+    # ACL 授权类动作：盖上当时生效的 dept→组映射策略版本（acl_policy_version）。per-doc 授权本就审计，
+    # 缺的是「org 级映射改动」这一维——映射常量改一次 commit 就静默放大/收窄全员可读范围却无审计行；
+    # 内容 hash 版本盖进消息后，授权时点的映射版本即可溯源（且版本随映射自动变）。仅 ACL 动作，避免
+    # 在 ingestion 审计行（REGISTER/CHUNK/INDEX/...）上加噪。
+    if action_type in _ACL_AUDIT_ACTIONS:
+        try:
+            from opensearch_pipeline.versions import acl_policy_version
+            message = f"[acl_policy={acl_policy_version()}] {message or ''}".rstrip()
+        except Exception:   # noqa: BLE001 — 版本盖戳失败绝不阻断审计写入
+            pass
     params = (trace_id, doc_id, version_no, action_type, action_result,
               operator_type, operator_id, oss_key, message)
     if cursor is not None:
