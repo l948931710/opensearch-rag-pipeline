@@ -2910,9 +2910,11 @@ def kb_retire(req: KbRetireRequest, request: Request,
                             "WHERE doc_id=%s", (req.doc_id,))
                 cur.execute("UPDATE fuling_knowledge.document_version SET status='retired', updated_at=NOW() "
                             "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
-                # RDS 侧停用本版本 chunk（停止邻居拼接复用 + 给 reconcile/HA3 删除一个明确信号）；HA3 不动。
+                # RDS 侧停用该文档【全部活跃版本】chunk（不限当前版本）——若此前部分入库/搬迁残留了旧版本
+                # is_active=1（双版本 gap），只停当前版本会让它们退役后仍存活、被邻居拼接复用、且 HA3 清除
+                # 漏删而无限期滞留。退役语义是「整篇下线」，故停全部活跃 chunk（stage-3 reconcile 再兜底 HA3）。
                 cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=0 "
-                            "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
+                            "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
             conn.commit()
         finally:
             conn.close()

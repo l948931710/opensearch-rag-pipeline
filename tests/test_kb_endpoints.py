@@ -653,6 +653,23 @@ def test_admin_revoke_all_demotes(monkeypatch):
 
 
 # ── 恢复上线 /api/kb/restore（退役逆操作）──
+def test_retire_deactivates_all_versions(monkeypatch):
+    """退役停用该文档【全部活跃版本】chunk（WHERE doc_id 不限 version_no）——闭合旧版本残留 is_active=1。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("marketing", "dept_internal", "active", 3)])
+    from opensearch_pipeline import api
+    resp = api.kb_retire(api.KbRetireRequest(doc_id="D1"), request=None, identity=api.Identity(user_id="kb1"))
+    assert resp.retired is True and resp.already is False
+    chunk_upd = [c for c in sink["calls"] if "chunk_meta SET is_active=0" in c[0]]
+    assert len(chunk_upd) == 1
+    assert "version_no" not in chunk_upd[0][0]          # 不再限当前版本
+    assert chunk_upd[0][1] == ("D1",)                    # 仅按 doc_id（全部活跃版本）
+    # document_version 仍只退役当前版本（版本表语义保留）
+    ver_upd = [c for c in sink["calls"] if "document_version SET status='retired'" in c[0]]
+    assert ver_upd and ver_upd[0][1] == ("D1", 3)
+
+
 def test_restore_reactivates_retired(monkeypatch):
     """退役文档恢复：status retired→active（meta+version）+ chunk is_active=1 + NOT_INDEXED。"""
     _skip_if_not_sim()
