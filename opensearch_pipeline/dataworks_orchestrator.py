@@ -159,49 +159,58 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                 
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
-                    # ── P0-3 Fix: 原子化抢占 ──
-                    # 先用 UPDATE 将符合条件的行状态从 NOT_STARTED/FAILED 改为 LOADING，
-                    # 再 SELECT 只取本实例抢占到的行。防止并发实例重复处理同一批文档。
+                    # ── P0-02 Fix: 实例级原子认领（FOR UPDATE SKIP LOCKED） ──
+                    # 旧实现先 UPDATE...SET LOADING 再 SELECT WHERE status='LOADING'：第二次
+                    # SELECT 不带实例归属谓词，会读到【所有】实例的 LOADING 行 → 并发 Stage-2
+                    # 实例重复处理同一批（旧注释自称"只取本实例抢占到的行"，与实现不符）。
+                    # 现改为单步认领：SELECT ... FOR UPDATE OF dv SKIP LOCKED 锁定候选并跳过其它
+                    # 实例已锁的行 → 各实例认领集合天然不相交；随即按 id 置 LOADING 并提交释放
+                    # 行锁。**不再做第二次按状态 SELECT**——认领到的行已在 rows 内存里。行锁只在
+                    # 认领事务内短暂持有，绝不跨后续 OSS/DAG 长流程（MySQL 8 支持，生产实测 8.0.36）。
+                    # 进程在 commit 后崩溃留下的 LOADING 仍由 _reset_stale_stage2_locks（2h）兜底回收。
                     cursor.execute("""
-                        UPDATE document_version
-                        SET content_process_status = 'LOADING'
-                        WHERE (content_process_status = 'NOT_STARTED' OR (content_process_status = 'FAILED' AND retry_count < 3))
-                          AND status = 'active'
-                          AND canonical_json_key IS NOT NULL
-                          AND (publish_status IS NULL OR publish_status != 'QUARANTINED')
-                        ORDER BY created_at ASC
+                        SELECT
+                            dv.doc_id,
+                            dv.version_no,
+                            dv.canonical_json_key,
+                            dv.canonical_md_key,
+                            dv.file_ext,
+                            dv.page_count,
+                            dv.text_length,
+                            dv.extract_method,
+                            dv.ocr_status,
+                            dm.title,
+                            dm.owner_dept,
+                            dv.raw_key,
+                            dv.id
+                        FROM document_version dv
+                        LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
+                        WHERE (content_process_status = 'NOT_STARTED'
+                               OR (content_process_status = 'FAILED' AND retry_count < 3))
+                          AND dv.status = 'active'
+                          AND dv.canonical_json_key IS NOT NULL
+                          AND (dv.publish_status IS NULL OR dv.publish_status != 'QUARANTINED')
+                        ORDER BY dv.created_at ASC
                         LIMIT 100
+                        FOR UPDATE OF dv SKIP LOCKED
                     """)
-                    preempted_count = cursor.rowcount
-                    conn.commit()
-                    
+                    rows = cursor.fetchall()
+                    preempted_count = len(rows)
+
                     if preempted_count == 0:
+                        conn.commit()   # 结束（空）认领事务，释放可能的间隙锁
                         print("[Orchestrator] No pending canonical documents found (or all preempted by another instance).")
-                        rows = []
                     else:
+                        # 仅对本实例锁定到的行置 LOADING（按 id），提交后释放行锁。
+                        claimed_ids = [r[12] for r in rows]
+                        _ph = ",".join(["%s"] * len(claimed_ids))
+                        cursor.execute(
+                            "UPDATE document_version SET content_process_status = 'LOADING', "
+                            f"updated_at = NOW() WHERE id IN ({_ph})",
+                            claimed_ids,
+                        )
+                        conn.commit()
                         print(f"[Orchestrator] Preempted {preempted_count} documents for processing.")
-                        cursor.execute("""
-                            SELECT 
-                                dv.doc_id, 
-                                dv.version_no, 
-                                dv.canonical_json_key, 
-                                dv.canonical_md_key,
-                                dv.file_ext,
-                                dv.page_count,
-                                dv.text_length,
-                                dv.extract_method,
-                                dv.ocr_status,
-                                dm.title,
-                                dm.owner_dept,
-                                dv.raw_key
-                            FROM document_version dv
-                            LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
-                            WHERE dv.content_process_status = 'LOADING'
-                              AND dv.status = 'active'
-                              AND dv.canonical_json_key IS NOT NULL
-                            ORDER BY dv.created_at ASC
-                        """)
-                        rows = cursor.fetchall()
                     has_load_errors = False
                     for row in rows:
                         doc_id = row[0]
