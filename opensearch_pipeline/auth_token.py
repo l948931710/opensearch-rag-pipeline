@@ -33,7 +33,17 @@ from typing import List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TTL_SECONDS = 8 * 3600  # 8 小时
+def _default_session_ttl_seconds() -> int:
+    """会话令牌默认 TTL（秒）。RAG_SESSION_TOKEN_TTL_HOURS 配置，默认 2h（原 8h）——缩短读组
+    撤销窗口；current_identity 现已读时实时重查 acl，TTL 仅作兜底上界。下限 5 分钟（防误配 0）。"""
+    try:
+        hours = float(os.environ.get("RAG_SESSION_TOKEN_TTL_HOURS", "2"))
+    except (TypeError, ValueError):
+        hours = 2.0
+    return max(300, int(hours * 3600))
+
+
+_DEFAULT_TTL_SECONDS = _default_session_ttl_seconds()  # import 期解析；issue_session_token 调用期重解析
 
 # 进程级临时密钥：仅在开发环境且未配置 RAG_SESSION_SIGNING_KEY 时使用
 _ephemeral_key: Optional[str] = None
@@ -101,7 +111,7 @@ def issue_session_token(
     dept: Union[str, List[str], None] = None,
     name: Optional[str] = None,
     role: Optional[str] = None,
-    ttl: int = _DEFAULT_TTL_SECONDS,
+    ttl: Optional[int] = None,
 ) -> str:
     """签发会话令牌。ACL 权限组由服务端解析后写入，客户端不可篡改。
 
@@ -110,8 +120,10 @@ def issue_session_token(
 
     `role`（知识库写授权角色，可选）：employee / dept_admin / kb_admin。仅作【入口可见性 UI 提示】，
     **非授权边界**——每个特权写接口必须用 DB 现查的 role + dept_admin_grant 重新裁决，
-    以便撤销管理员后即时生效（不等令牌 8h 过期）。缺省/未知不写该键（消费端按 employee 兜底）。
+    以便撤销管理员后即时生效（不等令牌过期）。缺省/未知不写该键（消费端按 employee 兜底）。
     """
+    if ttl is None:
+        ttl = _default_session_ttl_seconds()   # 调用期重解析，随 RAG_SESSION_TOKEN_TTL_HOURS
     groups = _coerce_acl_groups(dept)
     payload = {
         "uid": user_id,

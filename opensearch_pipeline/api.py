@@ -281,10 +281,11 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
     ACL 权限组来自服务端签发的令牌，客户端不可篡改；端点据此解析权限，绝不信任请求体。
     优先读新令牌的 acl_groups（数组）；旧令牌只有 dept（CSV/标量）则拆分兼容。
 
-    ⚠️ 读组撤销窗口（S1）：此处的 acl_groups 取自令牌（TTL 8h），**非**服务端现查——与【写授权】
-    不同（_require_kb_console 每次现查 DB user_role/dept_admin_grant，撤销即时生效）。故【收紧】某用户的
-    读组只在其下次令牌签发（重登/续签）后才生效，存在 ≤TTL 的窗口；这是读路径的撤销窗口，不是写授权绕过，
-    且令牌本身不可伪造。高敏部署可缩短 TTL，或对 restricted 语料在 /api/ask 服务端复读 acl_groups。
+    读组撤销窗口（S1）收敛：默认（RAG_LIVE_ACL_REREAD=true）对令牌内嵌 acl_groups 做【读时实时
+    重查】——以 DB user_role 现查为准（_resolve_user_dept_cached，SELECT-only 无副作用），部门收紧/
+    放宽即时生效，不等令牌过期。复查无在册行 / DB 失败 → 保留令牌内嵌组（绝不因瞬时抖动把用户降到
+    仅 public），由短 TTL（RAG_SESSION_TOKEN_TTL_HOURS，默认 2h，原 8h）兜底。令牌不可伪造；跨部门
+    读另有 retriever 查询侧实时拒绝（_deny_revoked_cross_dept）。flag 关 → 退回纯令牌内嵌（历史行为）。
     """
     if not authorization:
         return None
@@ -302,8 +303,16 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
         groups = [s.strip() for s in str(legacy_dept).split(",") if s.strip()]
     else:
         groups = []
+    uid = payload.get("uid", "")
+    # 读时实时重查 acl（默认 ON）：令牌内嵌组仅作兜底，实时以 DB user_role 为准（部门变更即时生效）。
+    # 无在册行 / DB 失败 → live 为 None → 保留令牌组（绝不因瞬时抖动降级）。
+    if uid and os.environ.get("RAG_LIVE_ACL_REREAD", "true").lower() in ("1", "true", "yes"):
+        from opensearch_pipeline.dingtalk_identity import _resolve_user_dept_cached
+        live = _resolve_user_dept_cached(uid)
+        if live is not None:
+            groups = live
     return Identity(
-        user_id=payload.get("uid", ""),
+        user_id=uid,
         acl_groups=groups,
         dept=legacy_dept,
         name=payload.get("name", ""),

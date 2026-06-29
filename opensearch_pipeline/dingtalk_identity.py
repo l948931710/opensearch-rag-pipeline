@@ -292,6 +292,40 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
         return []
 
 
+def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
+    """读时实时重查（SELECT-only）：仅查 user_role 缓存，**不调钉钉 API、不 INSERT、无副作用**，
+    供 current_identity 读路径对令牌内嵌 acl_groups 做实时复核（部门收紧/放宽即时生效，不等 TTL）。
+
+    与 _resolve_user_dept 的关键区别（故意不复用——后者在 cache-miss 时有 API+写副作用，不可放热路径）：
+      - 命中在册行 → 返回归一化组列表（含放宽/收紧）。
+      - 无在册行 或 DB 失败 → 返回 **None**（调用方据此【保留令牌内嵌组】）。绝不因瞬时 DB 抖动或
+        未缓存把用户降到仅 public（区别于 _resolve_user_dept 的 []=fail-closed）。撤销窗口由短 TTL 兜底。
+    """
+    if not staff_id or staff_id.startswith("$:"):
+        return None
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT dept_code FROM fuling_knowledge.user_role "
+                    "WHERE user_id = %s AND is_active = 1 "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    (staff_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            return _normalize_dept_to_codes(row[0])
+        return None   # 无在册行：可能只是未缓存，不收紧到 public；保留令牌组，短 TTL 兜底
+    except Exception as e:
+        logger.warning("读时 acl 复核失败（保留令牌组）staff_id=%s: %s", staff_id, e)
+        return None
+
+
 def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
     """
     通过钉钉 API 获取用户信息（姓名、部门等）。
