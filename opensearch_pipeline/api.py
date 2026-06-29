@@ -382,6 +382,22 @@ async def health_check():
     return {"status": "ok", "service": "rag-qa-api"}
 
 
+@app.get("/api/version")
+async def version_info():
+    """部署版本指纹（canary 校验 / 回滚确认）。git_commit 是核心字段：灰度时 curl 该端点比对目标
+    SHA 即可确认实例跑的是哪个 build；SAE 原生灰度路由 + 健康检查回滚负责流量切换。复用既有
+    versions.git_commit()（RAG_GIT_SHA env 优先；Dockerfile 构建期烤入）。仅暴露短 SHA + 模型版本 +
+    环境标签，低敏感，与 /api/health、/api/ready、/api/kb/config 同为公开探针。"""
+    from opensearch_pipeline.versions import EMBEDDING_MODEL_VERSION, git_commit
+    cfg = get_config()
+    return {
+        "git_commit": git_commit(),
+        "embedding_model_version": EMBEDDING_MODEL_VERSION,
+        "environment": getattr(cfg, "environment", "unknown"),
+        "simulate": getattr(cfg, "simulate", False),
+    }
+
+
 @app.get("/api/ready")
 async def readiness_check():
     """OBS-1 deep readiness probe: RDS + HA3 (critical) + DashScope (config-only, no live cost).

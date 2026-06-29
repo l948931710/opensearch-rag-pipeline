@@ -77,6 +77,34 @@ def test_api_health_still_dumb_liveness():
     assert r.status_code == 200 and r.json()["status"] == "ok"
 
 
+# ── canary: /api/version build fingerprint + Dockerfile GIT_SHA bake ──
+
+def test_api_version_returns_build_fingerprint():
+    """/api/version 暴露 git_commit + 模型版本 + 环境（canary 校验/回滚确认）。"""
+    from fastapi.testclient import TestClient
+    from opensearch_pipeline.api import app
+    r = TestClient(app).get("/api/version")
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("git_commit")                       # 非空（git rev-parse 或 RAG_GIT_SHA 或 'unknown'）
+    assert "embedding_model_version" in body and "environment" in body
+
+
+def test_api_version_honors_rag_git_sha(monkeypatch):
+    """RAG_GIT_SHA（Dockerfile 构建期烤入）→ /api/version.git_commit 直读该值。"""
+    monkeypatch.setenv("RAG_GIT_SHA", "deadbeef")
+    from fastapi.testclient import TestClient
+    from opensearch_pipeline.api import app
+    assert TestClient(app).get("/api/version").json()["git_commit"] == "deadbeef"
+
+
+def test_dockerfile_bakes_git_sha():
+    """Dockerfile 构建期接收并烤入 GIT_SHA（否则版本端点恒为 unknown）。"""
+    from pathlib import Path
+    df = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG GIT_SHA" in df and "ENV RAG_GIT_SHA" in df
+
+
 # ── EVAL-1: run_eval --strict (advisory → blocking) ──
 
 def test_eval_strict_failures_detects_gate_fail():
