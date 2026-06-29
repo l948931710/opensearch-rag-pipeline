@@ -21,7 +21,12 @@ from opensearch_pipeline.config import get_config
 
 logger = logging.getLogger(__name__)
 
-_KB = "fuling_knowledge"
+def _kb_db() -> str:
+    """知识库库名（kb_access_request/chunk_meta 所在库）；经 RAG_RDS_DATABASE 配置（STAGING=_stg）。
+    惰性读 config（不在 import 期），随 RAG_ENV 指向 staging/prod 库。"""
+    return get_config().rds.database
+
+
 _LIMIT = 200
 
 
@@ -49,11 +54,11 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
     try:
         with conn.cursor() as cur:
             # 1. authority → approved doc_ids（统计 + 候选并集；逐文档物化经单一注入点 helper）
-            cur.execute(f"SELECT DISTINCT doc_id FROM {_KB}.kb_access_request WHERE status='approved'")
+            cur.execute(f"SELECT DISTINCT doc_id FROM {_kb_db()}.kb_access_request WHERE status='approved'")
             approved = [r[0] for r in cur.fetchall() if r and r[0]]
             result["approved"] = len(approved)
             # 2. 候选 = approved ∪ 仍有残留 allowed_depts 的文档（后者是 retract 候选）
-            cur.execute(f"SELECT DISTINCT doc_id FROM {_KB}.chunk_meta "
+            cur.execute(f"SELECT DISTINCT doc_id FROM {_kb_db()}.chunk_meta "
                         f"WHERE is_active=1 AND allowed_depts IS NOT NULL")
             have_ad = {r[0] for r in cur.fetchall() if r and r[0]}
             # 全量扫描候选，但按【实际漂移写】数封顶（_LIMIT）——unchanged 文档只读不占写预算，故高位
