@@ -171,6 +171,57 @@ def head_object(oss_key: str) -> Optional[dict]:
         return None
 
 
+def _sim_put_object(oss_key: str, data: bytes) -> bool:
+    """simulate 模式的 PUT：best-effort 写本地镜像（scratch/sim_oss/<key>），让采纳贡献的
+    合成 .md 在 sim 下也有落地物（便于本地核对 / 测试断言），失败不致命（恒返 True，因为
+    register 的存在性校验走 head_object 的合成 HEAD，不依赖真实物体）。"""
+    try:
+        from pathlib import Path
+
+        base = Path(__file__).resolve().parent.parent / "scratch" / "sim_oss"
+        target = base / oss_key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    except Exception as e:
+        logger.info("sim put_object 本地镜像写入跳过 (non-fatal): %s", e)
+    return True
+
+
+def put_object(oss_key: str, data, content_type: str = "text/markdown; charset=utf-8") -> bool:
+    """服务端【写】OSS 对象（采纳贡献合成 .md 入 raw/）。成功 True / 失败 False。
+
+    与 head_object 同款 bucket 构造；simulate / 凭据缺失 → 走本地镜像分支（不连云）。
+    幂等由调用方保证（固定 raw_key，重复 PUT 覆盖同键、内容相同 → 等价）。
+    """
+    if not oss_key:
+        return False
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    try:
+        from opensearch_pipeline.config import get_config
+
+        config = get_config()
+        if getattr(config, "simulate_oss", False):
+            return _sim_put_object(oss_key, data)
+        access_id = config.oss.access_key_id
+        access_secret = config.oss.access_key_secret
+        if not access_id or access_id.strip() in ("xxx", ""):
+            logger.warning("OSS 凭据缺失，put_object 跳过（走本地镜像）: %s", oss_key[:80])
+            return _sim_put_object(oss_key, data)
+        import oss2
+    except ImportError:
+        logger.warning("oss2 未安装，put_object 跳过")
+        return False
+    try:
+        public_endpoint = _ensure_public_endpoint(config.oss.endpoint)
+        bucket = oss2.Bucket(oss2.Auth(access_id, access_secret), public_endpoint, config.oss.bucket_name)
+        bucket.put_object(oss_key, data, headers={"Content-Type": content_type})
+        return True
+    except Exception as e:
+        logger.error("put_object(%s) 失败: %s", oss_key[:80], e, exc_info=True)
+        return False
+
+
 def generate_signed_urls_batch(
     oss_keys: list,
     expires: Optional[int] = None,

@@ -6,6 +6,7 @@ import { useSession } from '@/stores/session'
 import { useAuth, hasPendingVersion } from '@/composables/useAuth'
 import { useAsk } from '@/composables/useAsk'
 import { useKb } from '@/composables/useKb'
+import { useContribute } from '@/composables/useContribute'
 import { debugEnabled } from '@/lib/diag'
 import AppShell from '@/components/shell/AppShell.vue'
 import DebugPanel from '@/components/DebugPanel.vue'
@@ -19,6 +20,7 @@ const { ready, error } = storeToRefs(session)
 const { init } = useAuth()
 const { hydrateConversations } = useAsk()
 const { loadApprovals, loadAccessRequests } = useKb()
+const { loadPending: loadPendingContribs } = useContribute()
 const router = useRouter()
 onMounted(() => { void init() })
 
@@ -26,7 +28,7 @@ onMounted(() => { void init() })
 watch(ready, (r) => {
   if (!r) return
   void hydrateConversations()
-  if (session.canManage) { void loadApprovals(); void loadAccessRequests() }
+  if (session.canManage) { void loadApprovals(); void loadAccessRequests(); void loadPendingContribs() }
   if (hasPendingVersion() && session.canManage) void router.push('/manage')
 }, { immediate: true })
 </script>

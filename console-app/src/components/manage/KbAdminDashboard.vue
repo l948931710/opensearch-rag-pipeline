@@ -220,7 +220,10 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
           <BarList bare :items="topDocItems" unit=" 问" empty="近期暂无检索记录。" />
         </div>
         <div class="p-[15px]">
-          <p :class="SUBHEAD">高频未答好（待补充/改进）</p>
+          <div class="flex items-baseline justify-between gap-2">
+            <p :class="SUBHEAD">高频未答好（待补充/改进）</p>
+            <RouterLink to="/contribute" class="shrink-0 text-[11.5px] font-semibold text-accent-text transition hover:underline">去补充 →</RouterLink>
+          </div>
           <BarList bare :items="gapItems" tone="bg-st-warn" unit=" 次" empty="近期无「召回但未答好」的提问。" />
         </div>
       </div>

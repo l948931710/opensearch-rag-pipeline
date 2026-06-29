@@ -3,12 +3,15 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 // 视图按需加载：首屏只拉问答，管理页懒载（多数员工用不到）。
 const QaView = () => import('@/views/QaView.vue')
 const ManageView = () => import('@/views/ManageView.vue')
+const ContributeView = () => import('@/views/ContributeView.vue')
 
 const routes: RouteRecordRaw[] = [
   { path: '/', name: 'qa', component: QaView, meta: { title: '问答' } },
   // requiresManage 仅作语义标注 + 视图内自检；不在此处做会跳转的守卫，
   // 免登/权限解析全部收口在 useAuth（修正#6），路由守卫绝不触发免登。
   { path: '/manage', name: 'manage', component: ManageView, meta: { title: '知识库管理', requiresManage: true } },
+  // 知识贡献：员工可访问（不加 requiresManage）；审核区在视图内按 role 门控。
+  { path: '/contribute', name: 'contribute', component: ContributeView, meta: { title: '知识贡献' } },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
