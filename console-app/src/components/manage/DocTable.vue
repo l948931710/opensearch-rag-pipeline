@@ -7,9 +7,9 @@ import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
 
 const {
-  docs, filtered, loadingDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
+  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
   setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
-  openAccessRequest, accessStateOf,
+  openAccessRequest, accessStateOf, loadMoreDocs,
 } = useKb()
 
 // 状态筛选 chip：从已加载文档里取出现过的徽章（+ 全部）。
@@ -178,6 +178,15 @@ async function onRestore(d: DocItem) {
       <div v-if="!filtered.length" class="px-4 py-10 text-center text-sm text-muted-foreground">
         {{ loadingDocs ? '加载中…' : (q ? '无匹配文档' : (docScope === 'all' ? '暂无可浏览的文档' : '暂无文档，先上传一篇吧')) }}
       </div>
+    </div>
+
+    <!-- 分页：服务端还有下一页时显「加载更多」（单页 50 条；管理大量文档时尾部不再被静默截断） -->
+    <div v-if="hasMoreDocs" class="mt-3 flex items-center justify-center gap-2">
+      <button
+        type="button" :disabled="loadingMoreDocs"
+        class="rounded-lg border border-border px-4 py-1.5 text-xs font-medium text-muted-foreground transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-60"
+        @click="loadMoreDocs()"
+      >{{ loadingMoreDocs ? '加载中…' : `加载更多（已显示 ${docs.length} 条）` }}</button>
     </div>
   </section>
 </template>

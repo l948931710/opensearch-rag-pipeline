@@ -81,6 +81,56 @@ describe('useKb.loadDocs + 过滤/排序/计数', () => {
   })
 })
 
+describe('useKb 分页（has_more / loadMoreDocs）', () => {
+  function pageItem(id: string): DocItem {
+    return { doc_id: id, title: id, original_filename: '', owner_dept: 'hr', permission_level: 'dept_internal', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '2026-06-20 10:00' }
+  }
+
+  it('首屏消费 has_more；loadMoreDocs 追加下一页且 offset 累进；末页隐藏', async () => {
+    const calls: string[] = []
+    const page1 = Array.from({ length: 3 }, (_, i) => pageItem(`a${i}`))
+    const page2 = Array.from({ length: 2 }, (_, i) => pageItem(`b${i}`))
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      calls.push(path)
+      if (path.startsWith('/api/kb/my-docs')) {
+        if (path.includes('offset=0')) return jsonResp({ items: page1, has_more: true })
+        if (path.includes('offset=50')) return jsonResp({ items: page2, has_more: false })
+      }
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const kb = useKb()
+    await kb.loadDocs()
+    expect(kb.docs.value).toHaveLength(3)
+    expect(kb.hasMoreDocs.value).toBe(true)
+
+    await kb.loadMoreDocs()
+    expect(kb.docs.value.map((d) => d.doc_id)).toEqual(['a0', 'a1', 'a2', 'b0', 'b1'])   // 追加不覆盖
+    expect(kb.hasMoreDocs.value).toBe(false)                                              // 末页
+    expect(calls.some((c) => c.includes('offset=50'))).toBe(true)                          // offset 累进
+
+    await kb.loadMoreDocs()   // hasMore=false → no-op，不再请求第三页
+    expect(kb.docs.value).toHaveLength(5)
+  })
+
+  it('loadDocs 重置 offset：翻页后重载从第一页起、hasMore 重判', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (path.startsWith('/api/kb/my-docs')) {
+        if (path.includes('offset=0')) return jsonResp({ items: [pageItem('x0')], has_more: false })
+        if (path.includes('offset=50')) return jsonResp({ items: [pageItem('x1')], has_more: false })
+      }
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const kb = useKb()
+    await kb.loadDocs()
+    kb.hasMoreDocs.value = true       // 模拟仍有下一页
+    await kb.loadMoreDocs()
+    expect(kb.docs.value).toHaveLength(2)
+    await kb.loadDocs()               // 重载 → offset 归 0、列表重置
+    expect(kb.docs.value.map((d) => d.doc_id)).toEqual(['x0'])
+    expect(kb.hasMoreDocs.value).toBe(false)
+  })
+})
+
 describe('useKb 上传（两段式：upload-url → PUT → register）', () => {
   it('单文件新建成功：进度→已提交，含内容查重提示', async () => {
     vi.stubGlobal('fetch', routeFetch({
