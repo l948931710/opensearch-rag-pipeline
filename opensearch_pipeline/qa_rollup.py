@@ -32,6 +32,13 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TZ_SHIFT_HOURS = 15  # Pacific(stored) → Beijing business day
 
 
+def _op_db() -> str:
+    """问答运营库名（qa_session_log/qa_daily_metrics 所在库）；经 RAG_RDS_OPERATION_DATABASE
+    配置（STAGING=fuling_operation_stg）。镜像 qa_logger._op_db()，惰性读 config。"""
+    from opensearch_pipeline.config import get_config
+    return get_config().rds.operation_database
+
+
 def _slo_thresholds() -> Dict[str, float]:
     def _f(env, default):
         try:
@@ -197,7 +204,7 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
             with conn.cursor() as c:
                 c.execute(
                     f"""SELECT {', '.join(_cols)}
-                          FROM fuling_operation.qa_session_log
+                          FROM {_op_db()}.qa_session_log
                          WHERE DATE(DATE_ADD(created_at, INTERVAL %s HOUR)) = %s""",
                     (tz_shift_hours, target))
                 raw = c.fetchall()

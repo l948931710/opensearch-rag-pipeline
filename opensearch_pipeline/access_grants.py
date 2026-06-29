@@ -19,6 +19,13 @@ from typing import Dict, Iterable, List
 logger = logging.getLogger(__name__)
 
 
+def _kb_db() -> str:
+    """知识库库名（kb_access_request/chunk_meta/document_*/kb_acl_projection_outbox 所在库）；
+    经 RAG_RDS_DATABASE 配置（STAGING=_stg）。惰性读 config（caller-cursor 路径也共用同一库名）。"""
+    from opensearch_pipeline.config import get_config
+    return get_config().rds.database
+
+
 def resolve_allowed_depts(doc_ids: Iterable[str], cursor) -> Dict[str, List[str]]:
     """聚合给定 doc_id 集的 approved 跨部门检索授权 → {doc_id: [组码...]}。
 
@@ -33,7 +40,7 @@ def resolve_allowed_depts(doc_ids: Iterable[str], cursor) -> Dict[str, List[str]
     whitelist = _valid_owner_depts()
     placeholders = ",".join(["%s"] * len(ids))
     cursor.execute(
-        "SELECT doc_id, requester_depts FROM fuling_knowledge.kb_access_request "
+        f"SELECT doc_id, requester_depts FROM {_kb_db()}.kb_access_request "
         f"WHERE status='approved' AND doc_id IN ({placeholders})",
         tuple(ids),
     )
@@ -76,7 +83,7 @@ def current_allowed_for_doc(cursor, doc_id: str, version_no: int) -> List[str]:
     """
     import json as _json
     cursor.execute(
-        "SELECT DISTINCT allowed_depts FROM fuling_knowledge.chunk_meta "
+        f"SELECT DISTINCT allowed_depts FROM {_kb_db()}.chunk_meta "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
         (doc_id, version_no),
     )
@@ -144,8 +151,8 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         return {"status": "skipped", "reset_chunks": 0, "version_no": None}
     # 1. current version + 2h PROCESSING 反抢锁（与 stage-3 loader / 对账同约定）
     cursor.execute(
-        "SELECT dm.current_version_no FROM fuling_knowledge.document_meta dm "
-        "LEFT JOIN fuling_knowledge.document_version dv "
+        f"SELECT dm.current_version_no FROM {_kb_db()}.document_meta dm "
+        f"LEFT JOIN {_kb_db()}.document_version dv "
         "  ON dv.doc_id=dm.doc_id AND dv.version_no=dm.current_version_no "
         "WHERE dm.doc_id=%s AND (dv.index_status IS NULL "
         "  OR dv.index_status!='PROCESSING' OR dv.updated_at < NOW() - INTERVAL 2 HOUR)",
@@ -158,7 +165,7 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
     # 2. authority → 该版本 permission_level 版本限定 gate 到 dept_internal
     raw_want = resolve_allowed_depts_one(doc_id, cursor)
     cursor.execute(
-        "SELECT GROUP_CONCAT(DISTINCT permission_level) FROM fuling_knowledge.chunk_meta "
+        f"SELECT GROUP_CONCAT(DISTINCT permission_level) FROM {_kb_db()}.chunk_meta "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
         (doc_id, ver),
     )
@@ -175,7 +182,7 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         return {"status": status, "reset_chunks": 0, "version_no": ver}
     aj = _json.dumps(want, ensure_ascii=False) if want else None
     cursor.execute(
-        "UPDATE fuling_knowledge.chunk_meta SET allowed_depts=%s, index_status='NOT_INDEXED' "
+        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, index_status='NOT_INDEXED' "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
         (aj, doc_id, ver),
     )
@@ -194,7 +201,7 @@ def enqueue_acl_projection(cursor, doc_id: str, reason: str = "") -> None:
     if not doc_id:
         return
     cursor.execute(
-        "INSERT INTO fuling_knowledge.kb_acl_projection_outbox (doc_id, reason) VALUES (%s, %s) "
+        f"INSERT INTO {_kb_db()}.kb_acl_projection_outbox (doc_id, reason) VALUES (%s, %s) "
         "ON DUPLICATE KEY UPDATE done_at=NULL, attempts=0, last_error=NULL, "
         "reason=VALUES(reason), updated_at=NOW()",
         (doc_id, (reason or "")[:64]),
@@ -226,7 +233,7 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, doc_id FROM fuling_knowledge.kb_acl_projection_outbox "
+                f"SELECT id, doc_id FROM {_kb_db()}.kb_acl_projection_outbox "
                 "WHERE done_at IS NULL ORDER BY enqueued_at LIMIT %s",
                 (int(limit),),
             )
@@ -242,7 +249,7 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
                     if outcome["status"] == "skipped_locked":
                         # current version 正在 stage-3 跑 → 本轮跳过、下轮再 drain（留 done_at=NULL）
                         cur.execute(
-                            "UPDATE fuling_knowledge.kb_acl_projection_outbox "
+                            f"UPDATE {_kb_db()}.kb_acl_projection_outbox "
                             "SET attempts=attempts+1, last_error='skipped_locked', updated_at=NOW() WHERE id=%s",
                             (row_id,),
                         )
@@ -250,7 +257,7 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
                     else:
                         # unchanged / materialized / retracted / skipped → 投影意图已落实 → 标 done
                         cur.execute(
-                            "UPDATE fuling_knowledge.kb_acl_projection_outbox "
+                            f"UPDATE {_kb_db()}.kb_acl_projection_outbox "
                             "SET done_at=NOW(), last_error=NULL, updated_at=NOW() WHERE id=%s",
                             (row_id,),
                         )
@@ -263,7 +270,7 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
                     conn.rollback()
                     with conn.cursor() as cur:
                         cur.execute(
-                            "UPDATE fuling_knowledge.kb_acl_projection_outbox "
+                            f"UPDATE {_kb_db()}.kb_acl_projection_outbox "
                             "SET attempts=attempts+1, last_error=%s, updated_at=NOW() WHERE id=%s",
                             (str(e)[:512], row_id),
                         )

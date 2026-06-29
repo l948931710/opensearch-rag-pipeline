@@ -38,7 +38,7 @@ from opensearch_pipeline.dingtalk_identity import (
     _exchange_authcode_for_userid,
     _resolve_user_identity,
 )
-from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
+from opensearch_pipeline.qa_logger import _op_db, generate_message_id, log_qa_session
 from opensearch_pipeline.feedback_handler import handle_feedback
 from opensearch_pipeline.content_blocks_builder import (
     build_content_blocks,
@@ -66,6 +66,14 @@ from opensearch_pipeline.session_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _kb_db() -> str:
+    """知识库库名（document_meta/version/chunk_meta/kb_* 等所在库）；经 RAG_RDS_DATABASE 配置
+    （STAGING=fuling_knowledge_stg）。SQL 一律用 {_kb_db()}./{_op_db()}. 前缀，使 RAG_ENV=staging
+    指向 *_stg 库（环境隔离，P0-01）；_op_db 复用 qa_logger 同名 helper。镜像该 helper，惰性读 config。"""
+    return get_config().rds.database
+
 
 # ═══════════════════════════════════════════════════════════════
 # FastAPI App
@@ -1503,10 +1511,10 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT m.doc_id, m.title, m.owner_dept
-                    FROM fuling_knowledge.document_meta m
-                    JOIN fuling_knowledge.document_version v
+                    FROM {_kb_db()}.document_meta m
+                    JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE v.etag = %s AND v.etag <> '' AND m.status = 'active' AND m.doc_id <> %s
                     LIMIT 20
@@ -1618,8 +1626,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status
-                    FROM fuling_knowledge.document_meta m
-                    LEFT JOIN fuling_knowledge.document_version v
+                    FROM {_kb_db()}.document_meta m
+                    LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE 1=1 {clause} {search_clause}
                     ORDER BY (m.status='active') DESC, m.updated_at DESC
@@ -1703,8 +1711,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status
-                    FROM fuling_knowledge.document_meta m
-                    LEFT JOIN fuling_knowledge.document_version v
+                    FROM {_kb_db()}.document_meta m
+                    LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE m.status='active'
                       AND m.permission_level IN ('public','dept_internal')
@@ -1771,8 +1779,8 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 cur.execute(
                     f"""
                     SELECT m.status, v.content_process_status, v.index_status, v.publish_status
-                    FROM fuling_knowledge.document_meta m
-                    LEFT JOIN fuling_knowledge.document_version v
+                    FROM {_kb_db()}.document_meta m
+                    LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE 1=1 {clause}
                     """,
@@ -1782,7 +1790,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 # 当前已索引分块总数（设计「全库已索引 chunk」口径）；取数失败仅置 0，不拖垮主统计。
                 try:
                     cur.execute(
-                        f"SELECT COUNT(*) FROM fuling_knowledge.chunk_meta "
+                        f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta "
                         f"WHERE is_active=1 AND index_status='INDEXED' {ck_clause}",
                         tuple(ck_params),
                     )
@@ -1792,7 +1800,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 # 本月新增文档数（设计「+N 本月新增」徽标）；月首日以参数传入；取数失败仅置 0。
                 try:
                     cur.execute(
-                        f"SELECT COUNT(*) FROM fuling_knowledge.document_meta "
+                        f"SELECT COUNT(*) FROM {_kb_db()}.document_meta "
                         f"WHERE created_at >= %s AND status='active' {dm_clause}",
                         tuple([month_start] + dm_params),
                     )
@@ -1842,9 +1850,9 @@ _KB_INSIGHTS_WINDOW_DAYS = 30
 # retrieved_docs_json → doc_id → document_meta.owner_dept 的归属 JOIN（collation-cast 必需）。
 # 末尾 WHERE 已含窗口占位符 %s；调用处再拼 _kb_owner_scope_sql 的作用域子句（kb_admin 为空 = 全库）。
 _KB_QA_OWNER_JOIN = (
-    " FROM fuling_operation.qa_session_log q"
+    f" FROM {_op_db()}.qa_session_log q"
     " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-    " JOIN fuling_knowledge.document_meta m"
+    f" JOIN {_kb_db()}.document_meta m"
     "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
     " WHERE q.retrieved_docs_json IS NOT NULL"
     "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
@@ -1922,9 +1930,9 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
             try:
                 cur.execute(
                     "SELECT COUNT(DISTINCT q.message_id)"
-                    " FROM fuling_operation.qa_session_log q"
+                    f" FROM {_op_db()}.qa_session_log q"
                     " JOIN JSON_TABLE(q.cited_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-                    " JOIN fuling_knowledge.document_meta m"
+                    f" JOIN {_kb_db()}.document_meta m"
                     "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
                     " WHERE q.cited_docs_json IS NOT NULL"
                     "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
@@ -2078,8 +2086,8 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             # 1) 资产 / 索引可见性
             try:
                 cur.execute(
-                    "SELECT (SELECT COUNT(*) FROM fuling_knowledge.document_meta WHERE status='active'),"
-                    " (SELECT COUNT(DISTINCT doc_id) FROM fuling_knowledge.chunk_meta"
+                    f"SELECT (SELECT COUNT(*) FROM {_kb_db()}.document_meta WHERE status='active'),"
+                    f" (SELECT COUNT(DISTINCT doc_id) FROM {_kb_db()}.chunk_meta"
                     "   WHERE is_active=1 AND index_status='INDEXED')")
                 r = cur.fetchone() or (0, 0)
                 out.docs_active, out.docs_in_index = int(r[0] or 0), int(r[1] or 0)
@@ -2088,7 +2096,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             # 2) 双版本残留（stage-3 不变量被破坏的信号；健康应为 0）
             try:
                 cur.execute(
-                    "SELECT COUNT(*) FROM (SELECT doc_id FROM fuling_knowledge.chunk_meta"
+                    f"SELECT COUNT(*) FROM (SELECT doc_id FROM {_kb_db()}.chunk_meta"
                     " WHERE is_active=1 AND index_status='INDEXED'"
                     " GROUP BY doc_id HAVING COUNT(DISTINCT version_no) > 1) t")
                 out.dual_version_docs = int((cur.fetchone() or (0,))[0] or 0)
@@ -2101,7 +2109,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     " MAX(CASE WHEN pr<=0.5 THEN latency_ms END), MAX(CASE WHEN pr<=0.95 THEN latency_ms END)"
                     " FROM (SELECT latency_ms, retrieval_latency_ms, llm_latency_ms,"
                     "   PERCENT_RANK() OVER (ORDER BY latency_ms) pr"
-                    "   FROM fuling_operation.qa_session_log"
+                    f"   FROM {_op_db()}.qa_session_log"
                     "   WHERE latency_ms > 0 AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)) t",
                     (win,))
                 r = cur.fetchone() or (0, 0, 0, 0, 0)
@@ -2116,7 +2124,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             try:
                 cur.execute(
                     "SELECT bizdate, embedded_chunks, embedding_failed_chunks"
-                    " FROM fuling_knowledge.pipeline_run"
+                    f" FROM {_kb_db()}.pipeline_run"
                     " WHERE stage=3 AND embedded_chunks IS NOT NULL AND embedding_failed_chunks IS NOT NULL"
                     " ORDER BY started_at DESC LIMIT 8")
                 runs = []
@@ -2131,7 +2139,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             # 5) 全库回答结果分布（原始 qa_session_log，含 NO_RESULT）
             try:
                 cur.execute(
-                    "SELECT answer_status, COUNT(*) FROM fuling_operation.qa_session_log"
+                    f"SELECT answer_status, COUNT(*) FROM {_op_db()}.qa_session_log"
                     " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY answer_status", (win,))
                 for status, n in cur.fetchall():
                     n = int(n or 0); st = (status or "").upper()
@@ -2150,9 +2158,9 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             # 6) PII：已脱敏 / 已隔离文档数（COUNT DISTINCT doc_id，按动作）
             try:
                 cur.execute(
-                    "SELECT (SELECT COUNT(DISTINCT doc_id) FROM fuling_knowledge.document_sensitive_finding"
+                    f"SELECT (SELECT COUNT(DISTINCT doc_id) FROM {_kb_db()}.document_sensitive_finding"
                     "   WHERE action='REDACTED'),"
-                    " (SELECT COUNT(DISTINCT doc_id) FROM fuling_knowledge.document_sensitive_finding"
+                    f" (SELECT COUNT(DISTINCT doc_id) FROM {_kb_db()}.document_sensitive_finding"
                     "   WHERE action='QUARANTINED')")
                 r = cur.fetchone() or (0, 0)
                 out.pii_redacted_docs, out.pii_quarantined_docs = int(r[0] or 0), int(r[1] or 0)
@@ -2163,7 +2171,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 cur.execute(
                     "SELECT SUM(feedback_type='upvote'), SUM(feedback_type='downvote'), COUNT(*),"
                     " SUM(created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY))"
-                    " FROM fuling_operation.user_feedback WHERE feedback_type IN ('upvote','downvote')")
+                    f" FROM {_op_db()}.user_feedback WHERE feedback_type IN ('upvote','downvote')")
                 r = cur.fetchone() or (0, 0, 0, 0)
                 out.feedback_up, out.feedback_down = int(r[0] or 0), int(r[1] or 0)
                 out.feedback_total = int(r[2] or 0); out.feedback_last7 = int(r[3] or 0)
@@ -2175,7 +2183,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 cur.execute(
                     "SELECT DATE(DATE_ADD(created_at, INTERVAL 15 HOUR)),"
                     " SUM(feedback_type='upvote'), SUM(feedback_type='downvote')"
-                    " FROM fuling_operation.user_feedback"
+                    f" FROM {_op_db()}.user_feedback"
                     " WHERE feedback_type IN ('upvote','downvote')"
                     "   AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
                     " GROUP BY 1 ORDER BY 1")
@@ -2186,7 +2194,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             # 7c) 点踩原因分布（feedback_reason 多选逗号拼接 → Python 拆分计数 + 中文标签；null=未注明）
             try:
                 cur.execute(
-                    "SELECT feedback_reason, COUNT(*) FROM fuling_operation.user_feedback"
+                    f"SELECT feedback_reason, COUNT(*) FROM {_op_db()}.user_feedback"
                     " WHERE feedback_type='downvote' GROUP BY feedback_reason")
                 _RLABEL = {"inaccurate": "不准确", "irrelevant": "不相关", "incomplete": "不完整",
                            "outdated": "已过时", "not_found": "未找到", "other": "其他"}
@@ -2204,7 +2212,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 fails += 1; logger.warning("kb_governance downvote_reasons 失败: %s", e)
             # 8) 转人工工单数
             try:
-                cur.execute("SELECT COUNT(*) FROM fuling_operation.escalation_ticket")
+                cur.execute(f"SELECT COUNT(*) FROM {_op_db()}.escalation_ticket")
                 out.escalations = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance escalations 失败: %s", e)
@@ -2218,11 +2226,11 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 def _cell(d):
                     return cov.setdefault(d or "unknown", {"docs": 0, "new_month": 0, "qa_hits": 0, "refusal": 0, "pii": 0, "new7": 0, "ret7": 0, "qa7": 0, "qa_prev7": 0})
 
-                cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
                             " WHERE status='active' GROUP BY owner_dept")
                 for dept, docs in cur.fetchall():
                     _cell(dept)["docs"] = int(docs or 0)
-                cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
                             " WHERE status='active' AND created_at >= %s GROUP BY owner_dept", (ms,))
                 for dept, n in cur.fetchall():
                     _cell(dept)["new_month"] = int(n or 0)
@@ -2231,11 +2239,11 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 # updated_at 近似退役时点（无独立 retired_at）。
                 wow_ok = True
                 try:
-                    cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                    cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
                                 " WHERE status='active' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
                     for dept, n in cur.fetchall():
                         _cell(dept)["new7"] = int(n or 0)
-                    cur.execute("SELECT owner_dept, COUNT(*) FROM fuling_knowledge.document_meta"
+                    cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
                                 " WHERE status='retired' AND updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
                                 " AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
                     for dept, n in cur.fetchall():
@@ -2245,9 +2253,9 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 cur.execute(
                     "SELECT m.owner_dept, COUNT(DISTINCT q.message_id),"
                     " COUNT(DISTINCT CASE WHEN q.answer_status='REFUSAL' THEN q.message_id END)"
-                    " FROM fuling_operation.qa_session_log q"
+                    f" FROM {_op_db()}.qa_session_log q"
                     " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-                    " JOIN fuling_knowledge.document_meta m"
+                    f" JOIN {_kb_db()}.document_meta m"
                     "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
                     " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY m.owner_dept", (win,))
                 for dept, hits, refu in cur.fetchall():
@@ -2260,9 +2268,9 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                         " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END),"
                         " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)"
                         "   AND q.created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END)"
-                        " FROM fuling_operation.qa_session_log q"
+                        f" FROM {_op_db()}.qa_session_log q"
                         " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-                        " JOIN fuling_knowledge.document_meta m"
+                        f" JOIN {_kb_db()}.document_meta m"
                         "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
                         " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY m.owner_dept")
                     for dept, q7, qp7 in cur.fetchall():
@@ -2271,8 +2279,8 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     qa_wow_ok = False; logger.warning("kb_governance dept usage wow 失败: %s", e)
                 cur.execute(
                     "SELECT m.owner_dept, COUNT(DISTINCT f.doc_id)"
-                    " FROM fuling_knowledge.document_sensitive_finding f"
-                    " JOIN fuling_knowledge.document_meta m"
+                    f" FROM {_kb_db()}.document_sensitive_finding f"
+                    f" JOIN {_kb_db()}.document_meta m"
                     "   ON m.doc_id = CONVERT(f.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
                     " WHERE f.action IN ('QUARANTINED','REDACTED') GROUP BY m.owner_dept")
                 for dept, n in cur.fetchall():
@@ -2304,7 +2312,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             try:
                 cur.execute(
                     "SELECT LOWER(SUBSTRING_INDEX(original_filename, '.', -1)) ext, COUNT(*)"
-                    " FROM fuling_knowledge.document_meta"
+                    f" FROM {_kb_db()}.document_meta"
                     " WHERE status='active' AND original_filename LIKE '%.%' GROUP BY ext")
                 _EXT2T = {"pdf": "PDF", "docx": "DOCX", "doc": "DOCX", "xlsx": "XLSX", "xls": "XLSX",
                           "pptx": "PPTX", "ppt": "PPTX",
@@ -2321,7 +2329,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             try:
                 cur.execute(
                     "SELECT COUNT(*), SUM(answer_status='LLM_ERROR'), SUM(opensearch_hit_count IS NULL)"
-                    " FROM fuling_operation.qa_session_log"
+                    f" FROM {_op_db()}.qa_session_log"
                     " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)", (win,))
                 r = cur.fetchone() or (0, 0, 0)
                 tot = int(r[0] or 0); llm_err = int(r[1] or 0); hit_null = int(r[2] or 0)
@@ -2329,7 +2337,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 out.qa_api_success_rate = round((tot - llm_err) / tot, 4) if tot else 0.0
                 out.retrieval_api_success_rate = round((tot - hit_null) / tot, 4) if tot else 0.0
                 cur.execute(
-                    "SELECT SUM(answer_status LIKE '%ERROR%') FROM fuling_operation.qa_session_log"
+                    f"SELECT SUM(answer_status LIKE '%ERROR%') FROM {_op_db()}.qa_session_log"
                     " WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)")
                 out.errors_24h = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
@@ -2376,7 +2384,7 @@ def kb_version_history(request: Request, doc_id: str,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, status FROM fuling_knowledge.document_meta "
+                cur.execute(f"SELECT owner_dept, status FROM {_kb_db()}.document_meta "
                             "WHERE doc_id=%s LIMIT 1", (doc_id,))
                 meta = cur.fetchone()
                 if not meta:
@@ -2385,10 +2393,10 @@ def kb_version_history(request: Request, doc_id: str,
                 if not _kb_can_manage(kb, owner_dept):
                     raise HTTPException(status_code=403, detail="无权查看该文档")
                 cur.execute(
-                    """
+                    f"""
                     SELECT version_no, content_process_status, chunk_status, index_status,
                            publish_status, error_message, created_at
-                    FROM fuling_knowledge.document_version
+                    FROM {_kb_db()}.document_version
                     WHERE doc_id=%s ORDER BY version_no DESC
                     """,
                     (doc_id,),
@@ -2429,7 +2437,7 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT owner_dept, status, current_version_no "
-                            "FROM fuling_knowledge.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
                 meta = cur.fetchone()
                 if not meta:
                     raise HTTPException(status_code=404, detail="文档不存在")
@@ -2439,13 +2447,13 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
                 vno = int(version) if version else cur_ver
                 cur.execute(
                     "SELECT content_process_status, chunk_status, index_status, error_message "
-                    "FROM fuling_knowledge.document_version WHERE doc_id=%s AND version_no=%s LIMIT 1",
+                    f"FROM {_kb_db()}.document_version WHERE doc_id=%s AND version_no=%s LIMIT 1",
                     (doc_id, vno),
                 )
                 dv = cur.fetchone()
                 cur.execute(
                     "SELECT COUNT(*), SUM(is_active=1), SUM(index_status='INDEXED') "
-                    "FROM fuling_knowledge.chunk_meta WHERE doc_id=%s AND version_no=%s",
+                    f"FROM {_kb_db()}.chunk_meta WHERE doc_id=%s AND version_no=%s",
                     (doc_id, vno),
                 )
                 total, active, indexed = cur.fetchone() or (0, 0, 0)
@@ -2579,7 +2587,7 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             conn = _get_db_conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT owner_dept, permission_level FROM fuling_knowledge.document_meta "
+                    cur.execute(f"SELECT owner_dept, permission_level FROM {_kb_db()}.document_meta "
                                 "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                     row = cur.fetchone()
             finally:
@@ -2691,7 +2699,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
             with conn.cursor() as cur:
                 # 幂等：同一 raw_key 已登记 → 直接返回既有行
                 cur.execute("SELECT doc_id, version_no, content_process_status "
-                            "FROM fuling_knowledge.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                            f"FROM {_kb_db()}.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
                 exist = cur.fetchone()
                 if exist:
                     conn.commit()
@@ -2706,7 +2714,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
                 doc_id = payload["doc_id"]
                 if action == "version":
                     # 行锁串行化版本号分配，避免并发升版撞号
-                    cur.execute("SELECT current_version_no, permission_level FROM fuling_knowledge.document_meta "
+                    cur.execute(f"SELECT current_version_no, permission_level FROM {_kb_db()}.document_meta "
                                 "WHERE doc_id=%s FOR UPDATE", (doc_id,))
                     mrow = cur.fetchone()
                     if not mrow:
@@ -2715,14 +2723,14 @@ def kb_register(req: KbRegisterRequest, request: Request,
                     if perm != (mrow[1] or perm):
                         raise HTTPException(status_code=403, detail="升版不可改变可见范围")
                     version_no = int(mrow[0] or 1) + 1
-                    cur.execute("UPDATE fuling_knowledge.document_meta "
+                    cur.execute(f"UPDATE {_kb_db()}.document_meta "
                                 "SET current_version_no=%s, updated_at=NOW() WHERE doc_id=%s",
                                 (version_no, doc_id))
                 else:
                     version_no = 1
                     cur.execute(
-                        """
-                        INSERT INTO fuling_knowledge.document_meta
+                        f"""
+                        INSERT INTO {_kb_db()}.document_meta
                           (doc_id, title, original_filename, owner_dept, owner_user_id, owner_name,
                            category_l1, category_l2, permission_level, kb_type, status, current_version_no)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',1)
@@ -2739,8 +2747,8 @@ def kb_register(req: KbRegisterRequest, request: Request,
                 raw_key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
                 try:
                     cur.execute(
-                        """
-                        INSERT INTO fuling_knowledge.document_version
+                        f"""
+                        INSERT INTO {_kb_db()}.document_version
                           (doc_id, version_no, bucket_name, raw_key, raw_key_hash, etag, file_ext, mime_type,
                            file_size_bytes, content_process_status, approval_status, status, received_at)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',NOW())
@@ -2759,7 +2767,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
                     conn.rollback()
                     with conn.cursor() as c2:
                         c2.execute("SELECT doc_id, version_no, content_process_status "
-                                   "FROM fuling_knowledge.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                                   f"FROM {_kb_db()}.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
                         won = c2.fetchone()
                     if not won:
                         raise   # 1062 但查不到赢家行 → 非预期，按 500 处理
@@ -2822,7 +2830,7 @@ def kb_approve(req: KbApprovalRequest, request: Request,
                 vfilter = "AND version_no=%s" if req.version_no else ""
                 vargs = (req.version_no,) if req.version_no else ()
                 n = cur.execute(
-                    f"UPDATE fuling_knowledge.document_version "
+                    f"UPDATE {_kb_db()}.document_version "
                     f"SET content_process_status='NOT_STARTED', approval_status='APPROVED', updated_at=NOW() "
                     f"WHERE doc_id=%s {vfilter} AND content_process_status='PENDING_APPROVAL'",
                     (req.doc_id, *vargs),
@@ -2863,7 +2871,7 @@ def kb_reject(req: KbApprovalRequest, request: Request,
                 vfilter = "AND version_no=%s" if req.version_no else ""
                 vargs = (req.version_no,) if req.version_no else ()
                 n = cur.execute(
-                    f"UPDATE fuling_knowledge.document_version "
+                    f"UPDATE {_kb_db()}.document_version "
                     f"SET content_process_status='REJECTED', approval_status='REJECTED', "
                     f"    content_process_error=%s, updated_at=NOW() "
                     f"WHERE doc_id=%s {vfilter} AND content_process_status='PENDING_APPROVAL'",
@@ -2910,7 +2918,7 @@ def kb_retire(req: KbRetireRequest, request: Request,
             with conn.cursor() as cur:
                 # 行锁文档元数据，串行化并发退役 / 退役-vs-升版
                 cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
-                            "FROM fuling_knowledge.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
@@ -2925,14 +2933,14 @@ def kb_retire(req: KbRetireRequest, request: Request,
                     conn.commit()       # 幂等：已退役/非活跃 → 直接回既有态
                     return KbRetireResponse(doc_id=req.doc_id, retired=False, already=True,
                                             note="该文档已是退役/非活跃状态")
-                cur.execute("UPDATE fuling_knowledge.document_meta SET status='retired', updated_at=NOW() "
+                cur.execute(f"UPDATE {_kb_db()}.document_meta SET status='retired', updated_at=NOW() "
                             "WHERE doc_id=%s", (req.doc_id,))
-                cur.execute("UPDATE fuling_knowledge.document_version SET status='retired', updated_at=NOW() "
+                cur.execute(f"UPDATE {_kb_db()}.document_version SET status='retired', updated_at=NOW() "
                             "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
                 # RDS 侧停用该文档【全部活跃版本】chunk（不限当前版本）——若此前部分入库/搬迁残留了旧版本
                 # is_active=1（双版本 gap），只停当前版本会让它们退役后仍存活、被邻居拼接复用、且 HA3 清除
                 # 漏删而无限期滞留。退役语义是「整篇下线」，故停全部活跃 chunk（stage-3 reconcile 再兜底 HA3）。
-                cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=0 "
+                cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=0 "
                             "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
                 # 审计行入【同事务】（commit 前、同 cursor）：与退役变更原子提交，杜绝 commit 与审计之间
                 # 崩溃丢记录的窗口（B1）。失败 → 整笔回滚 → 500 可重试。
@@ -2980,7 +2988,7 @@ def kb_restore(req: KbRetireRequest, request: Request,
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
-                            "FROM fuling_knowledge.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
@@ -2995,12 +3003,12 @@ def kb_restore(req: KbRetireRequest, request: Request,
                     conn.commit()       # 幂等：已在线 → 直接回既有态
                     return KbRestoreResponse(doc_id=req.doc_id, restored=False, already=True,
                                              note="该文档已是在线状态")
-                cur.execute("UPDATE fuling_knowledge.document_meta SET status='active', updated_at=NOW() "
+                cur.execute(f"UPDATE {_kb_db()}.document_meta SET status='active', updated_at=NOW() "
                             "WHERE doc_id=%s", (req.doc_id,))
-                cur.execute("UPDATE fuling_knowledge.document_version SET status='active', updated_at=NOW() "
+                cur.execute(f"UPDATE {_kb_db()}.document_version SET status='active', updated_at=NOW() "
                             "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
                 # 重新激活本版本 chunk + 标脏 NOT_INDEXED（下次 stage-3 重推 HA3；若 HA3 未删则为幂等重推）。
-                cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=1, index_status='NOT_INDEXED' "
+                cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=1, index_status='NOT_INDEXED' "
                             "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
                 write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
@@ -3049,11 +3057,11 @@ def kb_pending_approvals(request: Request,
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT m.doc_id, v.version_no, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.owner_name, v.received_at
-                    FROM fuling_knowledge.document_version v
-                    JOIN fuling_knowledge.document_meta m ON m.doc_id = v.doc_id
+                    FROM {_kb_db()}.document_version v
+                    JOIN {_kb_db()}.document_meta m ON m.doc_id = v.doc_id
                     WHERE v.content_process_status = 'PENDING_APPROVAL'
                     ORDER BY v.received_at DESC
                     LIMIT 100
@@ -3219,7 +3227,7 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, permission_level, status FROM fuling_knowledge.document_meta "
+                cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
                             "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
@@ -3234,7 +3242,7 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
                 if owner_dept in managed:
                     raise HTTPException(status_code=400, detail="本部门文档无需申请")
                 # 幂等：已有同 (doc, 申请人) pending → 返回既有，不重复入队
-                cur.execute("SELECT id FROM fuling_knowledge.kb_access_request "
+                cur.execute(f"SELECT id FROM {_kb_db()}.kb_access_request "
                             "WHERE doc_id=%s AND requester_id=%s AND status='pending' LIMIT 1",
                             (req.doc_id, kb.user_id))
                 ex = cur.fetchone()
@@ -3242,7 +3250,7 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
                     conn.commit()
                     return KbAccessRequestSubmitResponse(id=str(ex[0]), status="pending", already=True)
                 cur.execute(
-                    "INSERT INTO fuling_knowledge.kb_access_request "
+                    f"INSERT INTO {_kb_db()}.kb_access_request "
                     "(doc_id, owner_dept, requester_id, requester_name, requester_depts, reason, status) "
                     "VALUES (%s,%s,%s,%s,%s,%s,'pending')",
                     (req.doc_id, owner_dept, kb.user_id, kb.name, requester_depts, (req.reason or "")[:512]),
@@ -3285,8 +3293,8 @@ def kb_access_requests_list(request: Request,
                     f"""
                     SELECT r.id, r.doc_id, m.title, r.owner_dept, r.requester_depts,
                            r.requester_name, m.permission_level, r.reason, r.created_at
-                    FROM fuling_knowledge.kb_access_request r
-                    JOIN fuling_knowledge.document_meta m ON m.doc_id = r.doc_id
+                    FROM {_kb_db()}.kb_access_request r
+                    JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id
                     WHERE r.status='pending' {clause}
                     ORDER BY r.created_at DESC
                     LIMIT 100
@@ -3339,8 +3347,8 @@ def kb_access_grants_list(request: Request,
                     f"""
                     SELECT r.id, r.doc_id, m.title, r.owner_dept, r.requester_depts,
                            r.requester_name, m.permission_level, r.reason, r.decided_at
-                    FROM fuling_knowledge.kb_access_request r
-                    JOIN fuling_knowledge.document_meta m ON m.doc_id = r.doc_id
+                    FROM {_kb_db()}.kb_access_request r
+                    JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id
                     WHERE r.status='approved' {clause}
                     ORDER BY r.decided_at DESC
                     LIMIT 200
@@ -3386,11 +3394,11 @@ def kb_my_access_requests(request: Request,
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT r.id, r.doc_id, m.title, r.owner_dept, r.requester_depts, r.status,
                            r.reason, r.created_at, r.decided_at, m.current_version_no
-                    FROM fuling_knowledge.kb_access_request r
-                    LEFT JOIN fuling_knowledge.document_meta m ON m.doc_id = r.doc_id
+                    FROM {_kb_db()}.kb_access_request r
+                    LEFT JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id
                     WHERE r.requester_id = %s
                     ORDER BY r.created_at DESC
                     LIMIT 100
@@ -3408,7 +3416,7 @@ def kb_my_access_requests(request: Request,
                             ver = int(r[9] or 1)
                             cur.execute(
                                 "SELECT COUNT(*), SUM(index_status='INDEXED') "
-                                "FROM fuling_knowledge.chunk_meta "
+                                f"FROM {_kb_db()}.chunk_meta "
                                 "WHERE doc_id=%s AND version_no=%s AND is_active=1", (doc_id, ver))
                             cnt_row = cur.fetchone() or (0, 0)
                             cnt = int(cnt_row[0] or 0)
@@ -3461,7 +3469,7 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, status, doc_id FROM fuling_knowledge.kb_access_request "
+                cur.execute(f"SELECT owner_dept, status, doc_id FROM {_kb_db()}.kb_access_request "
                             "WHERE id=%s FOR UPDATE", (req.id,))
                 row = cur.fetchone()
                 if not row:
@@ -3473,7 +3481,7 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 if status != from_status:
                     conn.commit()       # 幂等：非目标前态（已决 / 非 approved）→ 返回既有态
                     return KbAccessDecisionResponse(id=req.id, status=status, decided=False, already=True)
-                cur.execute("UPDATE fuling_knowledge.kb_access_request "
+                cur.execute(f"UPDATE {_kb_db()}.kb_access_request "
                             "SET status=%s, decided_by=%s, decided_at=NOW(), decision_note=%s WHERE id=%s",
                             (decision, kb.user_id, (req.reason or "")[:512], req.id))
                 # Phase D（flag 开）：同事务内把该 doc 的 allowed_depts 投影【标脏】——经共享注入点
@@ -3559,10 +3567,10 @@ def kb_admin_grants_list(request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT user_id, user_name, dept_code, role FROM fuling_knowledge.user_role "
+                cur.execute(f"SELECT user_id, user_name, dept_code, role FROM {_kb_db()}.user_role "
                             "WHERE is_active=1 AND role IS NOT NULL AND role<>'employee' ORDER BY role, user_id")
                 roles = cur.fetchall()
-                cur.execute("SELECT user_id, managed_owner_dept FROM fuling_knowledge.dept_admin_grant "
+                cur.execute(f"SELECT user_id, managed_owner_dept FROM {_kb_db()}.dept_admin_grant "
                             "WHERE is_active=1")
                 grants: Dict[str, List[str]] = {}
                 for r in cur.fetchall():
@@ -3608,25 +3616,25 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
         try:
             with conn.cursor() as cur:
                 # 守卫：已是 kb_admin 的用户不经本 UI 改（避免误降级；kb_admin 调整走运维脚本）
-                cur.execute("SELECT role FROM fuling_knowledge.user_role WHERE user_id=%s AND is_active=1 "
+                cur.execute(f"SELECT role FROM {_kb_db()}.user_role WHERE user_id=%s AND is_active=1 "
                             "ORDER BY updated_at DESC, id DESC LIMIT 1", (uid,))
                 row = cur.fetchone()
                 if row and (row[0] or "") == ROLE_KB_ADMIN:
                     raise HTTPException(status_code=400,
                                         detail="该用户已是知识库管理员（kb_admin），请用运维脚本调整以免误降级")
                 # 角色 → dept_admin（dept_code 同步为可管理组 CSV，与 seed 口径一致）
-                cur.execute("INSERT INTO fuling_knowledge.user_role (user_id, user_name, dept_code, role, is_active) "
+                cur.execute(f"INSERT INTO {_kb_db()}.user_role (user_id, user_name, dept_code, role, is_active) "
                             "VALUES (%s,%s,%s,%s,1) ON DUPLICATE KEY UPDATE "
                             "user_name=COALESCE(VALUES(user_name), user_name), dept_code=VALUES(dept_code), "
                             "role=VALUES(role), is_active=1, updated_at=NOW()",
                             (uid, (req.user_name or None), ",".join(depts), ROLE_DEPT_ADMIN))
                 # 权威全集语义：先软撤销本次【未包含】的旧授权,再 upsert 本次
                 ph = ",".join(["%s"] * len(depts))
-                cur.execute(f"UPDATE fuling_knowledge.dept_admin_grant SET is_active=0, updated_at=NOW() "
+                cur.execute(f"UPDATE {_kb_db()}.dept_admin_grant SET is_active=0, updated_at=NOW() "
                             f"WHERE user_id=%s AND is_active=1 AND managed_owner_dept NOT IN ({ph})",
                             (uid, *depts))
                 for owner in depts:
-                    cur.execute("INSERT INTO fuling_knowledge.dept_admin_grant "
+                    cur.execute(f"INSERT INTO {_kb_db()}.dept_admin_grant "
                                 "(user_id, managed_owner_dept, granted_by, note, is_active) VALUES (%s,%s,%s,%s,1) "
                                 "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
                                 "note=VALUES(note), updated_at=NOW()",
@@ -3670,22 +3678,22 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT role FROM fuling_knowledge.user_role WHERE user_id=%s AND is_active=1 "
+                cur.execute(f"SELECT role FROM {_kb_db()}.user_role WHERE user_id=%s AND is_active=1 "
                             "ORDER BY updated_at DESC, id DESC LIMIT 1", (uid,))
                 row = cur.fetchone()
                 if row and (row[0] or "") == ROLE_KB_ADMIN:
                     raise HTTPException(status_code=400, detail="不能经本 UI 撤销知识库管理员（kb_admin）")
                 if owner:
-                    cur.execute("UPDATE fuling_knowledge.dept_admin_grant SET is_active=0, updated_at=NOW() "
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_grant SET is_active=0, updated_at=NOW() "
                                 "WHERE user_id=%s AND managed_owner_dept=%s AND is_active=1", (uid, owner))
                 else:
-                    cur.execute("UPDATE fuling_knowledge.dept_admin_grant SET is_active=0, updated_at=NOW() "
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_grant SET is_active=0, updated_at=NOW() "
                                 "WHERE user_id=%s AND is_active=1", (uid,))
-                cur.execute("SELECT COUNT(*) FROM fuling_knowledge.dept_admin_grant "
+                cur.execute(f"SELECT COUNT(*) FROM {_kb_db()}.dept_admin_grant "
                             "WHERE user_id=%s AND is_active=1", (uid,))
                 remaining = int(cur.fetchone()[0] or 0)
                 if remaining == 0:
-                    cur.execute("UPDATE fuling_knowledge.user_role SET role=%s, updated_at=NOW() "
+                    cur.execute(f"UPDATE {_kb_db()}.user_role SET role=%s, updated_at=NOW() "
                                 "WHERE user_id=%s", (ROLE_EMPLOYEE, uid))
                     demoted = True
                 # 同事务审计（B1）：与撤销/降级变更原子提交。

@@ -162,8 +162,12 @@ def _stub_drain(monkeypatch, *, flag=True, pending=(), status_by_doc=None, mater
     class _Rag:
         allowed_depts_acl = flag
 
+    class _Rds:
+        database = "fuling_knowledge"   # _kb_db() 解析库名（drain 的 outbox SQL 现走 {_kb_db()}.）
+
     class _Cfg:
         rag = _Rag()
+        rds = _Rds()
 
     monkeypatch.setattr("opensearch_pipeline.config.get_config", lambda: _Cfg())
     monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda: _DrainConn(store))

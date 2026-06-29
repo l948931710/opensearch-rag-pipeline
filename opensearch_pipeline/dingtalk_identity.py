@@ -30,6 +30,11 @@ from opensearch_pipeline.config import get_config
 logger = logging.getLogger(__name__)
 
 
+def _kb_db() -> str:
+    """知识库库名（user_role/dept_admin_grant 所在库）；经 RAG_RDS_DATABASE 配置（STAGING=_stg）。"""
+    return get_config().rds.database
+
+
 # ═══════════════════════════════════════════════════════════════
 # 钉钉部门名 → ACL 权限组 映射
 # ───────────────────────────────────────────────────────────────
@@ -243,7 +248,7 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
             #    schema/003_user_role_unique.sql；显式排序保证确定性）
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT dept_code FROM fuling_knowledge.user_role "
+                    f"SELECT dept_code FROM {_kb_db()}.user_role "
                     "WHERE user_id = %s AND is_active = 1 "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (staff_id,),
@@ -266,8 +271,8 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
-                            """
-                            INSERT INTO fuling_knowledge.user_role (user_id, user_name, dept_code, role, is_active)
+                            f"""
+                            INSERT INTO {_kb_db()}.user_role (user_id, user_name, dept_code, role, is_active)
                             VALUES (%s, %s, %s, %s, 1)
                             ON DUPLICATE KEY UPDATE
                                 user_name = VALUES(user_name),
@@ -467,7 +472,7 @@ def _resolve_user_identity(userid: str) -> Dict[str, Any]:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT user_name FROM fuling_knowledge.user_role WHERE user_id=%s "
+                    f"SELECT user_name FROM {_kb_db()}.user_role WHERE user_id=%s "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (userid,),
                 )
@@ -522,7 +527,7 @@ def resolve_kb_identity(staff_id: str):
             with conn.cursor() as cur:
                 # 角色（seeded 行优先，确定性排序）
                 cur.execute(
-                    "SELECT role, user_name FROM fuling_knowledge.user_role "
+                    f"SELECT role, user_name FROM {_kb_db()}.user_role "
                     "WHERE user_id=%s AND is_active=1 ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (staff_id,),
                 )
@@ -532,7 +537,7 @@ def resolve_kb_identity(staff_id: str):
                     name = row[1] or ""
                 # 显式管理授权（dept_admin 用；kb_admin 不依赖此表）
                 cur.execute(
-                    "SELECT managed_owner_dept FROM fuling_knowledge.dept_admin_grant "
+                    f"SELECT managed_owner_dept FROM {_kb_db()}.dept_admin_grant "
                     "WHERE user_id=%s AND is_active=1",
                     (staff_id,),
                 )

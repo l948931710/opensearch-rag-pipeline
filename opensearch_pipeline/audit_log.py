@@ -32,12 +32,22 @@ def audit_trace_id(ctx: Optional[dict]) -> Optional[str]:
         return None
 
 
-_AUDIT_INSERT = (
-    "INSERT INTO fuling_knowledge.kb_audit_log ("
-    "trace_id, doc_id, version_no, action_type, action_result, "
-    "operator_type, operator_id, oss_key, message"
-    ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
-)
+def _kb_db() -> str:
+    """知识库库名（document_meta/version/chunk_meta/kb_audit_log 等所在库）。
+    经 RAG_RDS_DATABASE 配置（STAGING 用 fuling_knowledge_stg）。镜像 qa_logger._op_db()。"""
+    from opensearch_pipeline.config import get_config
+    return get_config().rds.database
+
+
+def _audit_insert_sql() -> str:
+    """每次调用按 config 解析库名构建 INSERT —— 故意惰性（不在 import 期读 config），
+    与服务端各处 {_kb_db()}. 同步随 RAG_ENV 指向 staging/prod 库。"""
+    return (
+        f"INSERT INTO {_kb_db()}.kb_audit_log ("
+        "trace_id, doc_id, version_no, action_type, action_result, "
+        "operator_type, operator_id, oss_key, message"
+        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
 
 
 def write_audit(*, doc_id: Optional[str], version_no: Optional[int],
@@ -62,14 +72,14 @@ def write_audit(*, doc_id: Optional[str], version_no: Optional[int],
     params = (trace_id, doc_id, version_no, action_type, action_result,
               operator_type, operator_id, oss_key, message)
     if cursor is not None:
-        cursor.execute(_AUDIT_INSERT, params)   # 同事务、不开连接/不提交/不吞异常（原子审计）
+        cursor.execute(_audit_insert_sql(), params)   # 同事务、不开连接/不提交/不吞异常（原子审计）
         return
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn(select_db=True)
         try:
             with conn.cursor() as cur:
-                cur.execute(_AUDIT_INSERT, params)
+                cur.execute(_audit_insert_sql(), params)
             conn.commit()
         finally:
             conn.close()

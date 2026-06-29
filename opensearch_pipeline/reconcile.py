@@ -29,6 +29,13 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _kb_db() -> str:
+    """知识库库名（document_meta/version/chunk_meta 所在库）；经 RAG_RDS_DATABASE 配置（STAGING=_stg）。
+    惰性读 config（不在 import 期）。"""
+    from opensearch_pipeline.config import get_config
+    return get_config().rds.database
+
 _DEFAULT_BUCKET = 500
 _HI_HEADROOM = 1000  # scan past max(rds.id) so freshly-pushed-but-unrecorded rows still surface
 _OSS_IMAGE_PREFIX = "processing/assets/"  # where active-chunk image_refs[].oss_key live
@@ -197,9 +204,9 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
         conn = _rds_conn()
         try:
             with conn.cursor() as c:
-                c.execute("""SELECT id, chunk_id, doc_id, version_no, is_active,
+                c.execute(f"""SELECT id, chunk_id, doc_id, version_no, is_active,
                                     index_status, chunk_type
-                             FROM fuling_knowledge.chunk_meta""")
+                             FROM {_kb_db()}.chunk_meta""")
                 rds_rows = _as_dict_rows(c.fetchall(), _RDS_COLS)
         finally:
             conn.close()
@@ -317,8 +324,8 @@ def run_oss_parity_check(*, alert: bool = False,
         conn = _rds_conn()
         try:
             with conn.cursor() as c:
-                c.execute("""SELECT chunk_id, is_active, extra_json
-                             FROM fuling_knowledge.chunk_meta
+                c.execute(f"""SELECT chunk_id, is_active, extra_json
+                             FROM {_kb_db()}.chunk_meta
                              WHERE is_active=1 AND extra_json LIKE %s""", ("%oss_key%",))
                 rds_rows = _as_dict_rows(c.fetchall(), ("chunk_id", "is_active", "extra_json"))
         finally:
@@ -399,9 +406,9 @@ def run_raw_parity_check(*, alert: bool = False) -> Dict[str, Any]:
         conn = _rds_conn()
         try:
             with conn.cursor() as c:
-                c.execute("""SELECT v.doc_id, v.version_no, v.raw_key
-                             FROM fuling_knowledge.document_version v
-                             JOIN fuling_knowledge.document_meta m
+                c.execute(f"""SELECT v.doc_id, v.version_no, v.raw_key
+                             FROM {_kb_db()}.document_version v
+                             JOIN {_kb_db()}.document_meta m
                                ON m.doc_id=v.doc_id AND m.current_version_no=v.version_no
                              WHERE m.status='active'""")
                 rows = _as_dict_rows(c.fetchall(), ("doc_id", "version_no", "raw_key"))
