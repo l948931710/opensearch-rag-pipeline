@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { mount, flushPromises } from '@vue/test-utils'
 import { createTestingPinia } from '@pinia/testing'
 import { setActivePinia } from 'pinia'
 import type { Identity } from '@/stores/session'
 import { apiJson } from '@/lib/api'
 import AccessGrantList from '@/components/manage/AccessGrantList.vue'
 import { useKb, __resetKb, type AccessGrantItem } from '@/composables/useKb'
+import { useDialog } from '@/composables/useDialog'
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>()
@@ -73,24 +74,37 @@ describe('AccessGrantList', () => {
     expect(w.text()).toContain('撤销')
   })
 
-  it('撤销（DEV preview，确认）→ 本地移除该行', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => true))
-    vi.stubGlobal('prompt', vi.fn(() => '离职收回'))
+  it('撤销（DEV preview，确认框确认 → 输入理由确认）→ 本地移除该行', async () => {
     const pinia = activate(identity(), 'dev-preview')
     const kb = useKb()
     ;(kb as any).accessGrants.value = [GRANT, { ...GRANT, id: 'ag2', doc_title: '另一篇' }]
     const w = mount(AccessGrantList, { global: { plugins: [pinia] } })
-    await w.findAll('button')[0].trigger('click')
+    const { dialog, onConfirm } = useDialog()
+    await w.findAll('button')[0].trigger('click')      // onRevoke → 打开确认框
+    await flushPromises()
+    expect(dialog.value.open).toBe(true)
+    expect(dialog.value.kind).toBe('confirm')
+    onConfirm()                                         // 确认 → 接着打开理由输入框
+    await flushPromises()
+    expect(dialog.value.kind).toBe('prompt')
+    dialog.value.value = '离职收回'
+    onConfirm()                                         // 确认理由 → revokeAccess
+    await flushPromises()
     expect(kb.accessGrants.value.map((g: AccessGrantItem) => g.id)).toEqual(['ag2'])
   })
 
-  it('撤销取消（confirm=false）→ 不动', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => false))
+  it('撤销取消（确认框点取消）→ 不动、不进理由框', async () => {
     const pinia = activate(identity(), 'dev-preview')
     const kb = useKb()
     ;(kb as any).accessGrants.value = [GRANT]
     const w = mount(AccessGrantList, { global: { plugins: [pinia] } })
+    const { dialog, onCancel } = useDialog()
     await w.findAll('button')[0].trigger('click')
+    await flushPromises()
+    expect(dialog.value.open).toBe(true)
+    onCancel()                                          // 取消 → confirm(false)，不再弹理由框
+    await flushPromises()
+    expect(dialog.value.open).toBe(false)
     expect(kb.accessGrants.value.map((g: AccessGrantItem) => g.id)).toEqual(['ag1'])
   })
 })

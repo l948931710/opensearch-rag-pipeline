@@ -137,3 +137,13 @@ def test_audit_managed_grants_surfaces_bad():
     assert "typo_dept" in bad and "production_mold" in bad
     assert "marketing" not in bad           # 合法项不报
     assert ka.audit_managed_grants(["finance"]) == []
+
+
+def test_normalize_permission_level_fail_closed():
+    """未知/空 → restricted（最严，fail-closed，G8）；合法值与别名仍正确。"""
+    assert ka.normalize_permission_level("") == ka.PERM_RESTRICTED
+    assert ka.normalize_permission_level(None) == ka.PERM_RESTRICTED
+    assert ka.normalize_permission_level("garbage") == ka.PERM_RESTRICTED
+    assert ka.normalize_permission_level("internal") == ka.PERM_DEPT_INTERNAL   # 别名仍生效
+    assert ka.normalize_permission_level("public") == ka.PERM_PUBLIC
+    assert ka.normalize_permission_level("RESTRICTED") == ka.PERM_RESTRICTED

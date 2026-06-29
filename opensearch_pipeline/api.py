@@ -280,6 +280,11 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
 
     ACL 权限组来自服务端签发的令牌，客户端不可篡改；端点据此解析权限，绝不信任请求体。
     优先读新令牌的 acl_groups（数组）；旧令牌只有 dept（CSV/标量）则拆分兼容。
+
+    ⚠️ 读组撤销窗口（S1）：此处的 acl_groups 取自令牌（TTL 8h），**非**服务端现查——与【写授权】
+    不同（_require_kb_console 每次现查 DB user_role/dept_admin_grant，撤销即时生效）。故【收紧】某用户的
+    读组只在其下次令牌签发（重登/续签）后才生效，存在 ≤TTL 的窗口；这是读路径的撤销窗口，不是写授权绕过，
+    且令牌本身不可伪造。高敏部署可缩短 TTL，或对 restricted 语料在 /api/ask 服务端复读 acl_groups。
     """
     if not authorization:
         return None
@@ -1408,6 +1413,9 @@ class KbDocStatusResponse(BaseModel):
     error_message: str = ""
 
 
+_KB_MAX_OFFSET = 10000   # 文档列表分页 offset 上界（全库 ~1600 篇，1 万足够；防巨大 offset 深分页扫表，G7）
+
+
 def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
                      publish_status=None) -> str:
     """把管线多字段折叠为用户可读态：排队中/处理中/已上线/处理失败/内容未变/已隔离/已退役。"""
@@ -1589,7 +1597,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     limit = max(1, min(limit, 50))
-    offset = max(0, offset)
+    offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（全库 ~1600，1万 offset 绰绰有余，G7）
     clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
     # 文档名搜索：转义 LIKE 通配符（% _ \）防"输入 % 即匹配全部"，作用域过滤仍在前 → 不越权。
     q = (q or "").strip()[:80]
@@ -1664,7 +1672,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         # 目前仅 all 语义（本部门用 my-docs）；非法 scope fail-closed 空，避免静默当全量。
         return KbMyDocsResponse(items=[], has_more=False)
     limit = max(1, min(limit, 50))
-    offset = max(0, offset)
+    offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（G7）
 
     # owner_dept facet（可选）：参数化 = %s 本身防注入，这里再剥离注入字符 + 限长做纵深防御。
     from opensearch_pipeline.kb_authz import _SANITIZE_RE
@@ -2342,7 +2350,11 @@ class KbConfigResponse(BaseModel):
 
 @app.get("/api/kb/config", response_model=KbConfigResponse)
 def kb_config(request: Request, identity: Optional[Identity] = Depends(current_identity)):
-    """前端能力配置（上传上限/受理类型）—— 后端权威，省得客户端硬编码 50MB/类型导致"传完才 413"漂移。"""
+    """前端能力配置（上传上限/受理类型）—— 后端权威，省得客户端硬编码 50MB/类型导致"传完才 413"漂移。
+
+    **有意公开**（不加 _require_kb_console）：仅暴露静态能力常量（上传字节上限 + 扩展名白名单），
+    非敏感、无部门/文档数据；客户端在上传前自检需要它，限流即足以防滥用（G6）。
+    """
     _enforce_rate_limit(request, identity, scope="aux")
     from opensearch_pipeline.kb_upload import MAX_UPLOAD_BYTES, _PHASE1_EXTS
     return KbConfigResponse(
@@ -2397,7 +2409,7 @@ def kb_version_history(request: Request, doc_id: str,
         versions.append(KbVersionItem(
             version_no=int(vno or 0), content_process_status=cps or "",
             chunk_status=chs or "", index_status=ixs or "", publish_status=pubs or "",
-            status_badge=_kb_status_badge(cps, ixs, None),
+            status_badge=_kb_status_badge(cps, ixs, _doc_status),   # 传 doc 级状态 → 退役文档各版本如实显「已退役」(B4)
             error_message=err or "", created_at=str(created) if created else "",
         ))
     return KbVersionHistoryResponse(doc_id=doc_id, owner_dept=owner_dept, versions=versions)
@@ -2484,6 +2496,7 @@ class KbUploadUrlResponse(BaseModel):
     doc_id: str
     expires_in: int
     requires_kb_admin_approval: bool = False
+    content_type: str = ""   # 客户端 PUT 必须发此 Content-Type（已签入 put_url，不一致 OSS 403）；G4
 
 
 class KbRegisterRequest(BaseModel):
@@ -2606,13 +2619,19 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         "owner_name": kb.name,
     })
     bucket = get_config().oss.bucket_name
-    put_url = generate_signed_url(raw_key, expires=kb_upload.UPLOAD_TOKEN_TTL, method="PUT")
-    logger.info("kb upload-url: uid=%s action=%s doc_id=%s owner=%s bucket=%s",
-                kb.user_id, req.action, doc_id, owner, bucket)
+    # G4：把 Content-Type 按申报扩展名钉死并签入 PUT URL —— 客户端须发完全一致的 Content-Type，
+    # 否则 OSS 拒签（403），杜绝持 URL 者上传任意类型/与扩展名不符的字节。content_type 回传客户端。
+    from opensearch_pipeline.oss_url import mime_for_ext
+    content_type = mime_for_ext(ext)
+    put_url = generate_signed_url(raw_key, expires=kb_upload.UPLOAD_TOKEN_TTL, method="PUT",
+                                  content_type=content_type)
+    logger.info("kb upload-url: uid=%s action=%s doc_id=%s owner=%s bucket=%s ctype=%s",
+                kb.user_id, req.action, doc_id, owner, bucket, content_type)
     return KbUploadUrlResponse(
         upload_token=token, put_url=put_url, raw_key=raw_key, doc_id=doc_id,
         expires_in=kb_upload.UPLOAD_TOKEN_TTL,
         requires_kb_admin_approval=bool(decision.requires_kb_admin_approval),
+        content_type=content_type,
     )
 
 
@@ -2910,9 +2929,17 @@ def kb_retire(req: KbRetireRequest, request: Request,
                             "WHERE doc_id=%s", (req.doc_id,))
                 cur.execute("UPDATE fuling_knowledge.document_version SET status='retired', updated_at=NOW() "
                             "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
-                # RDS 侧停用本版本 chunk（停止邻居拼接复用 + 给 reconcile/HA3 删除一个明确信号）；HA3 不动。
+                # RDS 侧停用该文档【全部活跃版本】chunk（不限当前版本）——若此前部分入库/搬迁残留了旧版本
+                # is_active=1（双版本 gap），只停当前版本会让它们退役后仍存活、被邻居拼接复用、且 HA3 清除
+                # 漏删而无限期滞留。退役语义是「整篇下线」，故停全部活跃 chunk（stage-3 reconcile 再兜底 HA3）。
                 cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=0 "
-                            "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
+                            "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
+                # 审计行入【同事务】（commit 前、同 cursor）：与退役变更原子提交，杜绝 commit 与审计之间
+                # 崩溃丢记录的窗口（B1）。失败 → 整笔回滚 → 500 可重试。
+                write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RETIRE_REQUEST",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}",
+                            cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -2921,9 +2948,6 @@ def kb_retire(req: KbRetireRequest, request: Request,
     except Exception as e:
         logger.error("kb_retire 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"退役失败 (trace: {trace_id})")
-    write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RETIRE_REQUEST",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}")
     return KbRetireResponse(
         doc_id=req.doc_id, retired=True,
         note="已申请退役：已标记下线、停止作为升版目标；从检索彻底移除将在下次维护完成（本操作可逆）")
@@ -2978,6 +3002,10 @@ def kb_restore(req: KbRetireRequest, request: Request,
                 # 重新激活本版本 chunk + 标脏 NOT_INDEXED（下次 stage-3 重推 HA3；若 HA3 未删则为幂等重推）。
                 cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=1, index_status='NOT_INDEXED' "
                             "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
+                write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}",
+                            cursor=cur)   # 同事务审计（B1）
             conn.commit()
         finally:
             conn.close()
@@ -2986,9 +3014,6 @@ def kb_restore(req: KbRetireRequest, request: Request,
     except Exception as e:
         logger.error("kb_restore 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"恢复失败 (trace: {trace_id})")
-    write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}")
     return KbRestoreResponse(
         doc_id=req.doc_id, restored=True,
         note="已恢复上线：重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复")
@@ -3460,12 +3485,23 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 # re-embed**（重活留给 stage-3）。flag 关 = no-op；失败只记日志、**不回滚 status**
                 # （allowed_depts_reconcile 每轮 stage-3 兜底）。
                 if get_config().rag.allowed_depts_acl and doc_id:
+                    from opensearch_pipeline.access_grants import (
+                        enqueue_acl_projection, materialize_doc_allowed_depts,
+                    )
+                    # 持久入队（同事务、不吞异常）：权威变更与投影意图原子提交——enqueue 失败则整笔回滚，
+                    # 绝不出现「权威已改而无 outbox 行」的撕裂。stage-3 outbox drain 据此定向幂等重试至成功。
+                    enqueue_acl_projection(cur, doc_id, reason=decision)
+                    # 内联标脏 = best-effort 快路径：成功则本轮 stage-3 即可重推；抛/skipped_locked → 上面
+                    # 的 outbox 行兜底（+ allowed_depts_reconcile 全扫）。失败只记日志、**不回滚 status**。
                     try:
-                        from opensearch_pipeline.access_grants import materialize_doc_allowed_depts
                         materialize_doc_allowed_depts(cur, doc_id)
                     except Exception as _pe:
-                        logger.warning("decide allowed_depts 标脏失败（reconciler 兜底）doc=%s: %s",
+                        logger.warning("decide allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
                                        doc_id, _pe)
+                # 审计行入【同事务】（commit 前、同 cursor）：与 status 变更 + outbox 入队原子提交（B1）。
+                write_audit(doc_id=doc_id, version_no=None, action_type=f"ACCESS_REQUEST_{decision.upper()}",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"req_id={req.id} owner={owner_dept}", cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -3474,9 +3510,6 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
     except Exception as e:
         logger.error("kb_access_request_%s 失败 [trace=%s]: %s", decision, trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"操作失败 (trace: {trace_id})")
-    write_audit(doc_id=doc_id, version_no=None, action_type=f"ACCESS_REQUEST_{decision.upper()}",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"req_id={req.id} owner={owner_dept}")
     return KbAccessDecisionResponse(id=req.id, status=decision, decided=True, already=False)
 
 
@@ -3598,6 +3631,10 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
                                 "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
                                 "note=VALUES(note), updated_at=NOW()",
                                 (uid, owner, kb.user_id, note))
+                # 同事务审计（B1）：与角色/授权变更原子提交。
+                write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"grant dept_admin {uid} → {','.join(depts)}", cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -3606,9 +3643,6 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
     except Exception as e:
         logger.error("kb_admin_grant 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"授予部门管理员失败 (trace: {trace_id})")
-    write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"grant dept_admin {uid} → {','.join(depts)}")
     return KbAdminGrantResponse(user_id=uid, role=ROLE_DEPT_ADMIN, managed_owner_depts=depts, ok=True)
 
 
@@ -3654,6 +3688,10 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
                     cur.execute("UPDATE fuling_knowledge.user_role SET role=%s, updated_at=NOW() "
                                 "WHERE user_id=%s", (ROLE_EMPLOYEE, uid))
                     demoted = True
+                # 同事务审计（B1）：与撤销/降级变更原子提交。
+                write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_REVOKE",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"revoke {uid} owner={owner or 'ALL'} demoted={demoted}", cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -3662,9 +3700,6 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
     except Exception as e:
         logger.error("kb_admin_grant_revoke 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"撤销部门管理员授权失败 (trace: {trace_id})")
-    write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_REVOKE",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"revoke {uid} owner={owner or 'ALL'} demoted={demoted}")
     return KbAdminGrantResponse(user_id=uid, role=(ROLE_EMPLOYEE if demoted else "dept_admin"), ok=True)
 
 

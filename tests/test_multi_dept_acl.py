@@ -217,3 +217,99 @@ def test_opensearch_fallback_flag_on_adds_allowed_depts_terms(monkeypatch):
     allowed_terms = [m for dc in dept_clauses for m in dc["bool"]["must"]
                      if "terms" in m and "allowed_depts" in m["terms"]]
     assert allowed_terms and allowed_terms[0]["terms"]["allowed_depts"] == ["marketing", "production"]
+
+
+# ── Phase D：查询侧拒绝（read-side deny）—— 撤销跨部门授权后即时生效，不等 HA3 投影收回 ────
+
+class _FakeCur:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeConn:
+    def cursor(self):
+        return _FakeCur()
+
+    def close(self):
+        pass
+
+
+def _stub_deny(monkeypatch, *, flag, authorized=None, db_raises=False):
+    """桩：retriever.get_config(flag) + _get_db_conn + resolve_allowed_depts（受控权威）。"""
+    from opensearch_pipeline import retriever
+
+    class _Rag:
+        allowed_depts_acl = flag
+
+    class _Cfg:
+        rag = _Rag()
+
+    monkeypatch.setattr(retriever, "get_config", lambda: _Cfg())
+
+    def _conn():
+        if db_raises:
+            raise RuntimeError("DB down")
+        return _FakeConn()
+
+    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", _conn)
+    monkeypatch.setattr(
+        "opensearch_pipeline.access_grants.resolve_allowed_depts",
+        lambda ids, cur: dict(authorized or {}),
+    )
+    return retriever
+
+
+def _rows():
+    # finance 用户：own=finance(dept_internal) 同部门；mkt_x=marketing(dept_internal) 跨部门；pub=public。
+    return [
+        {"doc_id": "own", "owner_dept": "finance", "permission_level": "dept_internal"},
+        {"doc_id": "mkt_x", "owner_dept": "marketing", "permission_level": "dept_internal"},
+        {"doc_id": "pub", "owner_dept": "marketing", "permission_level": "public"},
+    ]
+
+
+def test_deny_flag_off_passthrough(monkeypatch):
+    r = _stub_deny(monkeypatch, flag=False)
+    rows = _rows()
+    assert r._deny_revoked_cross_dept(rows, "finance") == rows   # flag 关：原样返回（不建连）
+
+
+def test_deny_keeps_cross_dept_with_live_grant(monkeypatch):
+    # 权威仍有 mkt_x→finance 的 approved 授权 → 保留。
+    r = _stub_deny(monkeypatch, flag=True, authorized={"mkt_x": ["finance"]})
+    out = {x["doc_id"] for x in r._deny_revoked_cross_dept(_rows(), "finance")}
+    assert out == {"own", "mkt_x", "pub"}
+
+
+def test_deny_drops_revoked_cross_dept(monkeypatch):
+    # 权威无 mkt_x 的 approved 授权（已撤销/投影未收回）→ 丢弃跨部门命中，同部门/public 保留。
+    r = _stub_deny(monkeypatch, flag=True, authorized={})
+    out = {x["doc_id"] for x in r._deny_revoked_cross_dept(_rows(), "finance")}
+    assert out == {"own", "pub"}
+
+
+def test_deny_other_group_grant_does_not_match(monkeypatch):
+    # mkt_x 仅授权给 hr（非 finance）→ finance 用户仍被丢弃（按组码交集判定）。
+    r = _stub_deny(monkeypatch, flag=True, authorized={"mkt_x": ["hr"]})
+    out = {x["doc_id"] for x in r._deny_revoked_cross_dept(_rows(), "finance")}
+    assert out == {"own", "pub"}
+
+
+def test_deny_fail_closed_on_db_error(monkeypatch):
+    # 权威不可达 → fail-closed：丢弃全部跨部门命中，保留同部门/public。
+    r = _stub_deny(monkeypatch, flag=True, db_raises=True)
+    out = {x["doc_id"] for x in r._deny_revoked_cross_dept(_rows(), "finance")}
+    assert out == {"own", "pub"}
+
+
+def test_deny_no_cross_dept_skips_db(monkeypatch):
+    # 全为同部门/public（无跨部门命中）→ 不建连即原样返回（即便 DB 会抛错也不触发）。
+    r = _stub_deny(monkeypatch, flag=True, db_raises=True)
+    rows = [
+        {"doc_id": "own", "owner_dept": "finance", "permission_level": "dept_internal"},
+        {"doc_id": "pub", "owner_dept": "marketing", "permission_level": "public"},
+    ]
+    assert {x["doc_id"] for x in r._deny_revoked_cross_dept(rows, "finance")} == {"own", "pub"}

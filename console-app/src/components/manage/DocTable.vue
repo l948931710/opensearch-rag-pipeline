@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
+import LoadError from './LoadError.vue'
+import { useDialog } from '@/composables/useDialog'
+
+const { confirm } = useDialog()
 
 const {
-  docs, filtered, loadingDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
+  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
   setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
-  openAccessRequest, accessStateOf,
+  openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
 } = useKb()
 
 // 状态筛选 chip：从已加载文档里取出现过的徽章（+ 全部）。
@@ -17,6 +21,9 @@ const chips = computed(() => {
   const present = Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))
   return ['', ...present]
 })
+
+// 自愈：当前筛选的徽章因状态重载消失（chip 已不在）→ 回退「全部」，避免列表空且无高亮 chip 的死角。
+watch(chips, (c) => { if (filter.value && !c.includes(filter.value)) filter.value = '' })
 
 const COLS: { key: SortKey; label: string }[] = [
   { key: 'title', label: '文档名' },
@@ -29,13 +36,21 @@ const COLS: { key: SortKey; label: string }[] = [
 function arrow(k: SortKey) { return sortKey.value === k ? (sortDir.value === 1 ? '↑' : '↓') : '' }
 
 async function onRetire(d: DocItem) {
-  if (!confirm(`确认退役《${d.title || d.original_filename || d.doc_id}》？\n将标记下线、停止作为升版目标。从检索彻底移除会在下次维护完成（本操作可逆）。`)) return
+  const okGo = await confirm({
+    title: '退役文档', confirmText: '退役', danger: true,
+    message: `确认退役《${d.title || d.original_filename || d.doc_id}》？\n将标记下线、停止作为升版目标。从检索彻底移除会在下次维护完成（本操作可逆）。`,
+  })
+  if (!okGo) return
   const r = await retire(d)
   if (!r.ok && r.msg) alert('退役失败：' + r.msg)
 }
 
 async function onRestore(d: DocItem) {
-  if (!confirm(`确认恢复上线《${d.title || d.original_filename || d.doc_id}》？\n将重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复。`)) return
+  const okGo = await confirm({
+    title: '恢复上线', confirmText: '恢复上线',
+    message: `确认恢复上线《${d.title || d.original_filename || d.doc_id}》？\n将重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复。`,
+  })
+  if (!okGo) return
   const r = await restore(d)
   if (!r.ok && r.msg) alert('恢复失败：' + r.msg)
 }
@@ -81,6 +96,8 @@ async function onRestore(d: DocItem) {
       <Lock :size="13" :stroke-width="1.75" class="mt-0.5 shrink-0 text-faint" />
       <span>全部门为只读视图：其他部门文档不可直接管理；如需让本部门可检索，点「申请授权」由文档所属部门管理员审批。（不含受限文档）</span>
     </div>
+
+    <LoadError class="mt-3" :message="loadErrors['docs']" @retry="loadDocs()" />
 
     <!-- 状态筛选 chips -->
     <div class="mt-3 flex flex-wrap gap-1.5">
@@ -178,6 +195,15 @@ async function onRestore(d: DocItem) {
       <div v-if="!filtered.length" class="px-4 py-10 text-center text-sm text-muted-foreground">
         {{ loadingDocs ? '加载中…' : (q ? '无匹配文档' : (docScope === 'all' ? '暂无可浏览的文档' : '暂无文档，先上传一篇吧')) }}
       </div>
+    </div>
+
+    <!-- 分页：服务端还有下一页时显「加载更多」（单页 50 条；管理大量文档时尾部不再被静默截断） -->
+    <div v-if="hasMoreDocs" class="mt-3 flex items-center justify-center gap-2">
+      <button
+        type="button" :disabled="loadingMoreDocs"
+        class="rounded-lg border border-border px-4 py-1.5 text-xs font-medium text-muted-foreground transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-60"
+        @click="loadMoreDocs()"
+      >{{ loadingMoreDocs ? '加载中…' : `加载更多（已显示 ${docs.length} 条）` }}</button>
     </div>
   </section>
 </template>

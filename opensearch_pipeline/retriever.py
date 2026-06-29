@@ -368,6 +368,53 @@ def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
     return base
 
 
+def _deny_revoked_cross_dept(results, user_dept):
+    """查询侧拒绝（Phase D 读侧 fail-closed 复核）——撤销即时生效，不等 HA3 投影收回。
+
+    HA3 的 allowed_depts 过滤依赖【投影】（chunk_meta→HA3，由 stage-3 drain 物化）。撤销跨部门授权后
+    投影可能滞后（drain 未跑），残留授权会让被撤销部门仍检索到该文档。本函数对【跨部门命中】——
+    permission_level='dept_internal' 且 owner_dept 不在调用者自有 owner 集（这类只可能经 allowed_depts
+    分支进来）——按【权威表】kb_access_request(status='approved') 再核一次：无在册 approved 授权 → 丢弃。
+
+    fail-closed：权威查询异常 → 丢弃【全部】跨部门命中（拒绝），保留同部门/public 命中（常见路径不受影响）。
+    flag 关 / 无结果 / 无跨部门命中 → 原样返回（零开销，不建连）。与 _build_permission_filter 的 allowed_depts
+    分支配套：投影是快路径，本复核是 fail-closed 兜底，二者口径一致（按【组码】匹配授权）。
+    """
+    if not get_config().rag.allowed_depts_acl or not results:
+        return results
+    norm = _normalize_acl_groups(user_dept)
+    groups = set(norm)
+    owner_set = set(_expand_groups_to_owners(norm))
+    cross_idx = [
+        i for i, r in enumerate(results)
+        if r.get("permission_level") == "dept_internal"
+        and r.get("owner_dept") and r.get("owner_dept") not in owner_set
+    ]
+    if not cross_idx:
+        return results
+    cross_doc_ids = {results[i].get("doc_id") for i in cross_idx if results[i].get("doc_id")}
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.access_grants import resolve_allowed_depts
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                authorized = resolve_allowed_depts(cross_doc_ids, cur)   # {doc_id: [approved 组码]}
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 权威不可达 → fail-closed 丢弃全部跨部门命中（机密性优先）
+        logger.warning("查询侧授权复核失败，fail-closed 丢弃 %d 条跨部门命中: %s", len(cross_idx), e)
+        drop = set(cross_idx)
+        return [r for i, r in enumerate(results) if i not in drop]
+    drop = {
+        i for i in cross_idx
+        if not (groups & set(authorized.get(results[i].get("doc_id"), [])))
+    }
+    if drop:
+        logger.info("查询侧拒绝：丢弃 %d 条已撤销/无在册授权的跨部门命中", len(drop))
+    return [r for i, r in enumerate(results) if i not in drop]
+
+
 def _search_chunks_opensearch(
     query: str,
     dense: List[float],
@@ -523,7 +570,7 @@ def search_chunks(
     #  生产配置了 HA3 endpoint，此分支不可达 —— 2026-06-10 本地 E2E 引入）
     _full_cfg = get_config()
     if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
-        return _search_chunks_opensearch(query, dense, top_k, user_dept)
+        return _deny_revoked_cross_dept(_search_chunks_opensearch(query, dense, top_k, user_dept), user_dept)
 
     client = _get_ha3_client()
 
@@ -591,6 +638,9 @@ def search_chunks(
 
     # 4. 解析结果
     results = _parse_ha3_response(resp)
+
+    # 4b. 查询侧拒绝（Phase D 读侧 fail-closed 复核）：撤销跨部门授权后即时生效，不等 HA3 投影收回。
+    results = _deny_revoked_cross_dept(results, user_dept)
 
     # 5. 过滤低相关度结果
     # 注意：混合检索模式下 score 是 RRF/加权融合分（越大越相关，DESC 排序），

@@ -76,16 +76,17 @@ def normalize_role(raw: Optional[str]) -> str:
 
 
 def normalize_permission_level(raw: Optional[str]) -> str:
-    """归一 permission_level；别名 internal/private → dept_internal；未知/空 → public（最保守可见？
+    """归一 permission_level；别名 internal/private → dept_internal；未知/空 → **restricted**（fail-closed）。
 
-    注意：这里"未知→public"仅用于【归一化展示】，真正的放行由 authorize_upload 裁决——
-    dept_admin 设 public 会被要求 kb_admin 审批，不会因归一化而被静默放行。
+    未知/空归一到【最严】级别（restricted = 仅归档、不进检索），让任何误用 fail-closed：即便未来有调用方
+    直接存其输出，也绝不会把垃圾/空值静默放成 public 而过度暴露（G8）。真正的写放行仍由 authorize_upload
+    独立裁决（dept_admin 设 public 需 kb_admin 审批），不依赖本函数的归一结果。
     """
     if not raw or not isinstance(raw, str):
-        return PERM_PUBLIC
+        return PERM_RESTRICTED
     v = raw.strip().lower()
     v = _PERMISSION_ALIAS.get(v, v)
-    return v if v in _VALID_PERMISSION_LEVELS else PERM_PUBLIC
+    return v if v in _VALID_PERMISSION_LEVELS else PERM_RESTRICTED
 
 
 def sanitize_owner_depts(values: Union[str, Iterable[str], None]) -> List[str]:
@@ -278,14 +279,13 @@ def audit_managed_grants(granted_owner_depts: Iterable[str]) -> List[str]:
     类比 retriever.audit_production_owner_taxonomy：净化后被白名单丢弃的项浮出水面，
     供 kb_admin 复核 dept_admin_grant 是否拼写错误 / 引用了未批准的 owner_dept。
     """
-    whitelist = _valid_owner_depts()
     accepted = set(sanitize_owner_depts(granted_owner_depts))
+    # accepted = 净化+白名单后保留项；凡【净化后】不在 accepted 的原始项即可疑（拼写错/未批准 owner_dept）。
+    # （此前还有一行「accepted 中不在 whitelist 的」二次去重——accepted 恒为 whitelist 子集，故恒空、死代码，已删 B10。）
     suspicious = sorted({
         str(o).strip() for o in (granted_owner_depts or [])
         if str(o).strip() and _SANITIZE_RE.sub("", str(o).strip()) not in accepted
     })
-    # 二次：被净化保留但仍不在白名单（理论上 sanitize 已过滤，这里兜底）
-    suspicious += sorted({o for o in accepted if o not in whitelist})
     if suspicious:
         logger.warning(
             "dept_admin_grant 含不在写白名单的 owner_dept（fail-closed：已丢弃，不授予写权）: %s",

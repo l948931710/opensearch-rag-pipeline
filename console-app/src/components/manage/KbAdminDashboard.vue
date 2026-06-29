@@ -15,11 +15,12 @@ import DeptTable from './DeptTable.vue'
 import FeedbackTrend from './FeedbackTrend.vue'
 import DonutChart from './DonutChart.vue'
 import MiniTrend from './MiniTrend.vue'
+import LoadError from './LoadError.vue'
 
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
 // 全部真实口径，无对应数据则如实显空 —— 绝不造数。
-const { kbStats, approvals, kbGovernance, kbInsights } = useKb()
+const { kbStats, approvals, kbGovernance, kbInsights, loadStats, loadGovernance, loadInsights, loadErrors } = useKb()
 const b = (k: string) => kbStats.value?.by_badge?.[k] || 0
 const fmtN = (n?: number) => (n || 0).toLocaleString('en-US')
 const ms2s = (ms?: number) => (ms ? (ms / 1000).toFixed(1) + 's' : '—')
@@ -151,6 +152,7 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
     <!-- 全库资产概览（含状态分布 + 部门覆盖情况） -->
     <section :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库资产概览</header>
+      <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
       <div :class="GRID">
         <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" />
       </div>
@@ -255,10 +257,14 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       </div>
     </section>
 
-    <!-- 治理/洞察数据加载中（端点未接入）→ 如实占位 -->
+    <!-- 治理/洞察数据加载中（端点未接入）→ 如实占位；真实失败（5xx）→ 错误条 + 重试 -->
     <section v-if="!kbGovernance && !kbInsights" :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库治理看板</header>
-      <div class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
+      <div v-if="loadErrors['governance'] || loadErrors['insights']" class="space-y-2">
+        <LoadError :message="loadErrors['governance']" @retry="loadGovernance()" />
+        <LoadError :message="loadErrors['insights']" @retry="loadInsights()" />
+      </div>
+      <div v-else class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         运行健康 / 治理风险 / 部门覆盖 / 知识效果数据加载中（需后端
         <code class="font-mono text-[11.5px]">/api/kb/governance</code> 与
         <code class="font-mono text-[11.5px]">/api/kb/insights</code>）；稍后自动呈现。

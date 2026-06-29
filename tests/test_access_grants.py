@@ -95,3 +95,130 @@ def test_to_ha3_doc_gates_allowed_depts():
     c2 = Chunk(chunk_id="c2", doc_id="D2", version_no=1, chunk_index=0,
                chunk_type="text", chunk_text="x", token_count=1)
     assert c2.to_ha3_doc("id", include_allowed_depts=True)["allowed_depts"] == []  # 空授权 → 推空数组（可清）
+
+
+# ── 投影 outbox：enqueue（decide 同事务入队）+ drain（stage-3 幂等重试）──
+def test_enqueue_acl_projection_upserts():
+    """入队 = INSERT...ON DUPLICATE 复活（done_at=NULL, attempts=0），一行一 doc。"""
+    from opensearch_pipeline import access_grants
+    cur = _Cur([])
+    access_grants.enqueue_acl_projection(cur, "D1", reason="revoked")
+    assert "INSERT INTO fuling_knowledge.kb_acl_projection_outbox" in cur.sql
+    assert "ON DUPLICATE KEY UPDATE done_at=NULL" in cur.sql and "attempts=0" in cur.sql
+    assert cur.params == ("D1", "revoked")
+
+
+def test_enqueue_acl_projection_skips_empty():
+    from opensearch_pipeline import access_grants
+    cur = _Cur([])
+    access_grants.enqueue_acl_projection(cur, "", reason="x")
+    assert cur.sql is None   # 空 doc_id → no-op
+
+
+class _DrainCur:
+    """drain 用桩游标：SELECT 待处理行返回预置；其余（UPDATE）记入 store['writes']。"""
+    def __init__(self, store):
+        self.store = store
+        self._fetch = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.store["sql"].append((sql, params))
+        if sql.lstrip().startswith("SELECT") and "kb_acl_projection_outbox" in sql:
+            self._fetch = list(self.store["pending"])
+        else:
+            self._fetch = []
+            self.store["writes"].append((sql, params))
+
+    def fetchall(self):
+        return self._fetch
+
+
+class _DrainConn:
+    def __init__(self, store):
+        self.store = store
+
+    def cursor(self):
+        return _DrainCur(self.store)
+
+    def commit(self):
+        self.store["commits"] += 1
+
+    def rollback(self):
+        self.store["rollbacks"] += 1
+
+    def close(self):
+        pass
+
+
+def _stub_drain(monkeypatch, *, flag=True, pending=(), status_by_doc=None, materialize_raises=()):
+    store = {"sql": [], "writes": [], "pending": list(pending), "commits": 0, "rollbacks": 0}
+
+    class _Rag:
+        allowed_depts_acl = flag
+
+    class _Cfg:
+        rag = _Rag()
+
+    monkeypatch.setattr("opensearch_pipeline.config.get_config", lambda: _Cfg())
+    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda: _DrainConn(store))
+
+    def _mat(cur, doc_id, apply=True):
+        if doc_id in materialize_raises:
+            raise RuntimeError("materialize boom")
+        return {"status": (status_by_doc or {}).get(doc_id, "unchanged"),
+                "reset_chunks": 0, "version_no": 1}
+
+    monkeypatch.setattr("opensearch_pipeline.access_grants.materialize_doc_allowed_depts", _mat)
+    return store
+
+
+def test_drain_outbox_flag_off_skipped(monkeypatch):
+    from opensearch_pipeline import access_grants
+    _stub_drain(monkeypatch, flag=False)
+    res = access_grants.drain_acl_projection_outbox()
+    assert res["skipped"] is True and res["processed"] == 0
+
+
+def test_drain_outbox_marks_done_on_success(monkeypatch):
+    from opensearch_pipeline import access_grants
+    store = _stub_drain(monkeypatch, pending=[(1, "D1"), (2, "D2")],
+                        status_by_doc={"D1": "retracted", "D2": "unchanged"})
+    res = access_grants.drain_acl_projection_outbox()
+    assert res["processed"] == 2 and res["done"] == 2 and res["locked"] == 0 and res["failed"] == 0
+    done_updates = [w for w in store["writes"] if "done_at=NOW()" in w[0]]
+    assert len(done_updates) == 2 and store["commits"] >= 2
+
+
+def test_drain_outbox_skipped_locked_retries_not_done(monkeypatch):
+    """skipped_locked（current version 正跑 stage-3）→ attempts++ 留 done_at=NULL 待下轮，不标 done。"""
+    from opensearch_pipeline import access_grants
+    store = _stub_drain(monkeypatch, pending=[(9, "DL")], status_by_doc={"DL": "skipped_locked"})
+    res = access_grants.drain_acl_projection_outbox()
+    assert res["locked"] == 1 and res["done"] == 0
+    assert any("attempts=attempts+1" in w[0] and "skipped_locked" in w[0] for w in store["writes"])
+    assert not any("done_at=NOW()" in w[0] for w in store["writes"])
+
+
+def test_drain_outbox_failure_records_attempt_not_done(monkeypatch):
+    """materialize 抛错 → 记 errors + attempts++（last_error），不标 done，不连累其余文档。"""
+    from opensearch_pipeline import access_grants
+    store = _stub_drain(monkeypatch, pending=[(1, "BAD"), (2, "OK")],
+                        status_by_doc={"OK": "materialized"}, materialize_raises=("BAD",))
+    res = access_grants.drain_acl_projection_outbox()
+    assert res["failed"] == 1 and res["done"] == 1 and res["errors"]
+    assert any("attempts=attempts+1" in w[0] and "last_error" in w[0].lower() for w in store["writes"])
+
+
+def test_drain_outbox_preview_no_writes(monkeypatch):
+    """commit=False 预览：不标 done/不写 outbox（只统计）。"""
+    from opensearch_pipeline import access_grants
+    store = _stub_drain(monkeypatch, pending=[(1, "D1")], status_by_doc={"D1": "retracted"})
+    res = access_grants.drain_acl_projection_outbox(commit=False)
+    assert res["processed"] == 1
+    assert not any("done_at=NOW()" in w[0] for w in store["writes"])   # 预览不写

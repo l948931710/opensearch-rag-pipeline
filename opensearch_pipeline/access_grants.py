@@ -180,3 +180,99 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         (aj, doc_id, ver),
     )
     return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
+
+
+# ── 投影 outbox：decide 同事务入队 + stage-3 幂等 drain（与全扫 reconcile 互补）──
+def enqueue_acl_projection(cursor, doc_id: str, reason: str = "") -> None:
+    """把一篇文档持久入队到 allowed_depts 投影 outbox（kb_acl_projection_outbox）。
+
+    decide 端点在【改 kb_access_request.status 的同一事务】内调用——权威变更与投影意图原子提交：
+    enqueue 失败 → 整笔回滚（绝不出现权威已改而无 outbox 行的撕裂；与「内联 materialize best-effort」
+    不同，本入队是【持久保证】，刻意不吞异常）。一行一 doc（UNIQUE doc_id）：重复入队走 ON DUPLICATE
+    复活（done_at=NULL, attempts=0），不留历史。**不提交事务**（连接/事务由调用方掌控）。
+    """
+    if not doc_id:
+        return
+    cursor.execute(
+        "INSERT INTO fuling_knowledge.kb_acl_projection_outbox (doc_id, reason) VALUES (%s, %s) "
+        "ON DUPLICATE KEY UPDATE done_at=NULL, attempts=0, last_error=NULL, "
+        "reason=VALUES(reason), updated_at=NOW()",
+        (doc_id, (reason or "")[:64]),
+    )
+
+
+def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
+    """Drain 投影 outbox：逐文档幂等 materialize（标脏 chunk_meta + index_status='NOT_INDEXED'），
+    成功/unchanged → 标 done_at；skipped_locked/失败 → attempts++ 留待下轮。**绝不抛**（失败进 errors）。
+
+    与 allowed_depts_reconcile 互补：outbox 是 decide 受影响 doc 的【定向必达】重试，reconcile 是
+    authority↔投影漂移的【全扫兜底】。stage-3 pre-drain 调用（HA3 重推由其后的 drain 循环携带）。
+    flag 关 → 直接返回 skipped（投影路径全程惰性）。commit=False 为只读预览（不写 outbox/不标脏）。
+    """
+    from opensearch_pipeline.config import get_config
+
+    result = {"processed": 0, "done": 0, "locked": 0, "failed": 0, "skipped": False, "errors": []}
+    if not get_config().rag.allowed_depts_acl:
+        result["skipped"] = True
+        return result
+
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+    try:
+        conn = _get_db_conn()
+    except Exception as e:   # noqa: BLE001
+        result["errors"].append(f"DB connect failed: {e}")
+        return result
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, doc_id FROM fuling_knowledge.kb_acl_projection_outbox "
+                "WHERE done_at IS NULL ORDER BY enqueued_at LIMIT %s",
+                (int(limit),),
+            )
+            rows = [(r[0], r[1]) for r in cur.fetchall() if r and r[1]]
+        for row_id, doc_id in rows:
+            result["processed"] += 1
+            try:
+                with conn.cursor() as cur:
+                    outcome = materialize_doc_allowed_depts(cur, doc_id, apply=commit)
+                    if not commit:
+                        conn.rollback()          # 预览：不改 outbox/不落标脏
+                        continue
+                    if outcome["status"] == "skipped_locked":
+                        # current version 正在 stage-3 跑 → 本轮跳过、下轮再 drain（留 done_at=NULL）
+                        cur.execute(
+                            "UPDATE fuling_knowledge.kb_acl_projection_outbox "
+                            "SET attempts=attempts+1, last_error='skipped_locked', updated_at=NOW() WHERE id=%s",
+                            (row_id,),
+                        )
+                        result["locked"] += 1
+                    else:
+                        # unchanged / materialized / retracted / skipped → 投影意图已落实 → 标 done
+                        cur.execute(
+                            "UPDATE fuling_knowledge.kb_acl_projection_outbox "
+                            "SET done_at=NOW(), last_error=NULL, updated_at=NOW() WHERE id=%s",
+                            (row_id,),
+                        )
+                        result["done"] += 1
+                conn.commit()
+            except Exception as e:   # noqa: BLE001 — 单文档失败不抛、记 errors、attempts++ 待重试
+                result["errors"].append(f"{doc_id}: {e}")
+                result["failed"] += 1
+                try:
+                    conn.rollback()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE fuling_knowledge.kb_acl_projection_outbox "
+                            "SET attempts=attempts+1, last_error=%s, updated_at=NOW() WHERE id=%s",
+                            (str(e)[:512], row_id),
+                        )
+                    conn.commit()
+                except Exception:   # noqa: BLE001 — 连记错误都失败 → 下轮 reconcile 兜底
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+    finally:
+        conn.close()
+    return result

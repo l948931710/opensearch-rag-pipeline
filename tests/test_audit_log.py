@@ -73,11 +73,46 @@ def test_write_audit_inserts_expected_row(monkeypatch):
     write_audit(doc_id="DOC_X", version_no=3, action_type="DEACTIVATE", action_result="SUCCESS",
                 trace_id="abc:20260616", message="retired", simulate=False)
 
-    assert "INSERT INTO kb_audit_log" in captured["sql"]
+    assert "INSERT INTO fuling_knowledge.kb_audit_log" in captured["sql"]
     p = captured["params"]
     assert p[0] == "abc:20260616" and p[1] == "DOC_X" and p[2] == 3
     assert p[3] == "DEACTIVATE" and p[4] == "SUCCESS"
     assert captured.get("committed") and captured.get("closed")
+
+
+def test_write_audit_cursor_path_same_txn_no_new_conn(monkeypatch):
+    """cursor 路径（serving）：用调用方游标写、【不】开新连接（同事务原子审计，B1）。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    def _boom(**kw):
+        raise AssertionError("cursor 路径不得自开连接（应复用调用方事务）")
+
+    monkeypatch.setattr(pn, "_get_db_conn", _boom)
+    captured = {}
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            captured["sql"] = sql
+            captured["params"] = params
+
+    from opensearch_pipeline.audit_log import write_audit
+    write_audit(doc_id="D1", version_no=2, action_type="RETIRE_REQUEST",
+                operator_type="user", operator_id="u1", trace_id="t", cursor=_Cur())
+    assert "INSERT INTO fuling_knowledge.kb_audit_log" in captured["sql"]
+    assert captured["params"][1] == "D1" and captured["params"][3] == "RETIRE_REQUEST"
+
+
+def test_write_audit_cursor_path_propagates_error():
+    """cursor 路径【不吞】异常（区别于 ingestion fail-open）：游标抛错 → 向上传播 → 调用方事务回滚。"""
+    import pytest
+
+    class _BadCur:
+        def execute(self, *a, **k):
+            raise RuntimeError("boom")
+
+    from opensearch_pipeline.audit_log import write_audit
+    with pytest.raises(RuntimeError):
+        write_audit(doc_id="D1", version_no=1, action_type="KB_ADMIN_REVOKE", cursor=_BadCur())
 
 
 def test_deactivate_wires_audit_write():

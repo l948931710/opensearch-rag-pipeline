@@ -2,22 +2,26 @@
 import { Lock, FileText } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessRequestItem } from '@/composables/useKb'
+import LoadError from './LoadError.vue'
+import { useDialog } from '@/composables/useDialog'
 
 // 授权申请队列（审批人侧，Phase C）：其他部门申请检索本部门文档 → 由文档所属部门管理员审批。
 // 与「待审批队列」（上传放行，橙头）区分：此处绿头。数据空时整块不渲染（无后端 = 自然隐藏，不造占位噪声）。
-const { accessRequests, apprBusy, approveAccess, rejectAccess } = useKb()
+const { accessRequests, isBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
+const { promptText } = useDialog()
 
-function onReject(d: AccessRequestItem) {
-  const reason = prompt('驳回原因（可空，将通知申请人）：', '')
+async function onReject(d: AccessRequestItem) {
+  const reason = await promptText({ title: '驳回授权申请', message: `驳回「${d.requester_name || d.requester_dept}」对《${d.doc_title}》的检索授权申请？`, placeholder: '驳回原因（可空，将通知申请人）', confirmText: '驳回', danger: true })
   if (reason === null) return   // 取消
   void rejectAccess(d, reason || 'rejected')
 }
 </script>
 
 <template>
-  <section v-if="accessRequests.length">
+  <section v-if="accessRequests.length || loadErrors['accessRequests']">
     <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">授权申请</p>
-    <div class="overflow-hidden rounded-[15px] border border-border bg-card">
+    <LoadError class="mb-2.5" :message="loadErrors['accessRequests']" @retry="loadAccessRequests()" />
+    <div v-if="accessRequests.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 绿头（区别于上传审批的橙头） -->
       <div class="flex items-center gap-2.5 border-b border-border bg-accent-soft px-[18px] py-3">
         <Lock :size="16" :stroke-width="1.75" class="text-accent-text" />
@@ -47,12 +51,12 @@ function onReject(d: AccessRequestItem) {
         <button
           type="button"
           class="self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
-          :disabled="apprBusy" @click="onReject(d)"
+          :disabled="isBusy(`acc:${d.id}`)" @click="onReject(d)"
         >驳回</button>
         <button
           type="button"
           class="self-start rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-          :disabled="apprBusy" @click="approveAccess(d)"
+          :disabled="isBusy(`acc:${d.id}`)" @click="approveAccess(d)"
         >授权</button>
       </div>
     </div>

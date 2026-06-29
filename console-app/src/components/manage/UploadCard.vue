@@ -79,11 +79,13 @@ function onDrop(e: DragEvent) {
 
     <!-- 新建表单（升版态隐藏归属/可见范围，强制继承） -->
     <div v-if="!verCtx" class="mt-3 grid gap-3 sm:grid-cols-3">
-      <label class="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-3">
+      <!-- 标题仅单文件可设（批量上传按文件名入库、不读此框，故多选时隐藏避免误以为生效，B9） -->
+      <label v-if="selectedNames.length <= 1" class="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-3">
         标题（可空，默认文件名）
         <input v-model="newTitle" type="text" placeholder="如：货代发票审批作业指导书"
           class="rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/15" />
       </label>
+      <p v-else class="text-xs text-faint sm:col-span-3">已选 {{ selectedNames.length }} 个文件，将批量上传，标题各取文件名（如需自定义标题请逐个上传）。</p>
       <label class="flex flex-col gap-1 text-xs text-muted-foreground">
         归属部门
         <select v-model="newOwner" class="rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
