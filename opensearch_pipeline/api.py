@@ -1881,7 +1881,9 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
 #    JSON_TABLE 抽出的串默认 utf8mb4_0900_ai_ci，与 document_meta.doc_id(unicode_ci) 直接 JOIN 报
 #    1267（kb_access_request 同坑），必须 CONVERT(... USING utf8mb4) COLLATE utf8mb4_unicode_ci。
 #  · answer_status ∈ {SUCCESS, NO_RESULT, REFUSAL, LLM_ERROR}（无裸 'ERROR'，错误用 LIKE '%ERROR%'）。
-#  · created_at 是 SAE 容器太平洋时间（北京 = +15h）：日历分桶用 DATE_ADD(created_at, INTERVAL 15 HOUR)。
+#  · created_at 是 SAE 容器太平洋时间：日历分桶用 CONVERT_TZ(created_at,'America/Los_Angeles','Asia/Shanghai')
+#    —— DST-correct（夏令时 +15h / 冬令时 +16h）；旧硬编码 +15h 在美国冬令时(PST)会有 1 小时跨天偏移。
+#    依赖 RDS 已加载具名时区表（已核实生产可用）。
 #  · 每个子查询独立 try/except：单指标取数失败只让该指标诚实空，不拖垮整块看板（auxiliary fail-open）。
 # ─────────────────────────────────────────────────────────────────────────────
 _KB_INSIGHTS_WINDOW_DAYS = 30
@@ -2217,10 +2219,10 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 out.helpful_rate = round(out.feedback_up / out.feedback_total, 4) if out.feedback_total else 0.0
             except Exception as e:
                 fails += 1; logger.warning("kb_governance feedback 失败: %s", e)
-            # 7b) 反馈趋势：近 30 北京日 up/down（+15h 分桶）
+            # 7b) 反馈趋势：近 30 北京日 up/down（DST-correct 分桶）
             try:
                 cur.execute(
-                    "SELECT DATE(DATE_ADD(created_at, INTERVAL 15 HOUR)),"
+                    "SELECT DATE(CONVERT_TZ(created_at, 'America/Los_Angeles', 'Asia/Shanghai')),"
                     " SUM(feedback_type='upvote'), SUM(feedback_type='downvote')"
                     f" FROM {_op_db()}.user_feedback"
                     " WHERE feedback_type IN ('upvote','downvote')"
