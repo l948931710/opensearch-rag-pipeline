@@ -38,3 +38,25 @@ jobs:
         run: python -m ruff check opensearch_pipeline/ tests/
       - name: Test (simulate mode — no external services)
         run: python -m pytest tests/ -q -p no:cacheprovider
+
+  # 前端门（console-app Vite/Vue3）：此前完全无 CI——135 个 vitest 与 vue-tsc 类型检查从未在
+  # 合并前跑过。本 job 把它们设为【阻塞】门：build 含 vue-tsc 类型检查（package.json:8），故无需
+  # 单独 typecheck 步。node 22 对齐本地工具链；构建产物（next-dist/）gitignore，仅作编译校验。
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console-app/package-lock.json
+      - name: Install (npm ci)
+        run: npm ci
+      - name: Test (vitest)
+        run: npm run test
+      - name: Build (vue-tsc 类型检查 + vite build)
+        run: npm run build
