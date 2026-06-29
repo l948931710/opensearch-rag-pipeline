@@ -305,6 +305,12 @@ class RAGConfig:
     # allowed_depts、入库按 approved 授权聚合写 chunk_meta.allowed_depts。默认关；需先 HA3 加
     # allowed_depts 字段(Step 2) + 回填(Step 3) 再开。flag 关时全链路与现状逐字节一致。
     allowed_depts_acl: bool = False         # RAG_ALLOWED_DEPTS_ACL
+    # ── QA 日志查询侧 PII 脱敏（OBS-qa-pii 整改）──────────────────
+    # qa_session_log.query_text/answer_text 此前明文落盘：用户可能输入身份证/手机号，
+    # 答案可能回显受限文档里的 PII。开启后在写库前用 redaction.redact_text（与入库侧
+    # 同一套正则，纯本地、无 LLM/网络）做**不可逆**掩码，仅落占位符。默认 ON（安全
+    # 方向，与入库侧 hash+mask 姿态对齐）；置 false 仅用于本地调试取证。
+    qa_log_pii_redact: bool = True          # RAG_QA_LOG_PII_REDACT
     score_threshold_high: float = 7.7
     score_threshold_medium: float = 5.8
     # 重排序开启时，相关度标签改用 rerank 分（0~1）。
@@ -723,6 +729,7 @@ def load_config() -> PipelineConfig:
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
             conversation_history=_env_bool("CONVERSATION_HISTORY", False),
             allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
+            qa_log_pii_redact=_env_bool("QA_LOG_PII_REDACT", True),             # RAG_QA_LOG_PII_REDACT
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
             score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM
             rerank_score_threshold_high=_env_float("RERANK_SCORE_THRESHOLD_HIGH", 0.9),

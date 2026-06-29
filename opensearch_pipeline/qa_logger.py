@@ -28,6 +28,33 @@ def generate_message_id() -> str:
     return str(uuid.uuid4())
 
 
+def _qa_log_pii_redact_on() -> bool:
+    """RAG_QA_LOG_PII_REDACT 开关（懒读 config；异常退回 True=安全方向）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return bool(get_config().rag.qa_log_pii_redact)
+    except Exception:
+        return True
+
+
+def _redact_for_log(text: Optional[str]) -> Optional[str]:
+    """写 qa_session_log 前对 query_text/answer_text 做查询侧 PII 不可逆掩码（OBS-qa-pii）。
+
+    复用入库侧 redaction.redact_text（纯本地正则，不传 name_llm_fn → 无 LLM/网络/延迟），
+    把身份证/手机号/邮箱/银行卡/地址/密钥及标注式姓名替换为占位符。flag 关或空文本时原样
+    返回。掩码失败退回原文并 warning：此处属辅助治理，绝不阻断主写入；且真实失败模式下
+    （pipeline_nodes 不可导入）整条写库本就先一步失败，不会造成静默泄漏。"""
+    if not text or not _qa_log_pii_redact_on():
+        return text
+    try:
+        from opensearch_pipeline.redaction import redact_text
+        masked, _counts = redact_text(text)
+        return masked
+    except Exception as e:
+        logger.warning("qa_session_log PII 掩码失败，退回原文 (non-fatal): %s", e)
+        return text
+
+
 def _conversation_history_on() -> bool:
     """RAG_CONVERSATION_HISTORY 开关（懒读 config；异常退回 False）。"""
     try:
@@ -116,6 +143,12 @@ def log_qa_session(
     """
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+        # 查询侧 PII 掩码（OBS-qa-pii）：用户问题与机器人回答在落盘前做不可逆掩码，
+        # 避免身份证/手机号/受限文档 PII 明文驻留 qa_session_log。conversation 标题取
+        # 自掩码后的 query_text（见下方 _upsert_conversation），故标题同样不含 PII。
+        query_text = _redact_for_log(query_text)
+        answer_text = _redact_for_log(answer_text)
 
         # 序列化 JSON 字段
         retrieved_json = None
