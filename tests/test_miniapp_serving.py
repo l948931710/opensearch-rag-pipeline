@@ -73,6 +73,52 @@ def test_token_expired():
     assert auth_token.verify_session_token(t) is None
 
 
+def test_session_token_default_ttl_is_2h():
+    """会话令牌默认 TTL = 2h（原 8h，缩短读组撤销窗口）。"""
+    import time
+    p = auth_token.verify_session_token(auth_token.issue_session_token("U1", dept="finance"))
+    assert abs(p["exp"] - (int(time.time()) + 2 * 3600)) <= 60
+
+
+def test_session_token_ttl_env_override(monkeypatch):
+    """RAG_SESSION_TOKEN_TTL_HOURS 调用期生效（无需重导入模块）。"""
+    import time
+    monkeypatch.setenv("RAG_SESSION_TOKEN_TTL_HOURS", "1")
+    p = auth_token.verify_session_token(auth_token.issue_session_token("U1", dept="finance"))
+    assert abs(p["exp"] - (int(time.time()) + 1 * 3600)) <= 60
+
+
+def test_current_identity_live_acl_overrides_token(monkeypatch):
+    """读时实时重查：DB 现查返回组 → current_identity 用 live 组（覆盖令牌内嵌，调岗即时生效）。"""
+    import opensearch_pipeline.api as api
+    import opensearch_pipeline.dingtalk_identity as di
+    tok = auth_token.issue_session_token("U1", dept=["finance"])          # 令牌内嵌 finance
+    monkeypatch.setattr(di, "_resolve_user_dept_cached", lambda uid: ["hr"])  # 已调岗 → hr
+    assert api.current_identity("Bearer " + tok).acl_groups == ["hr"]
+
+
+def test_current_identity_live_acl_none_keeps_token(monkeypatch):
+    """复查 None（无在册行 / DB 失败）→ 保留令牌内嵌组，绝不因瞬时抖动把用户降到仅 public。"""
+    import opensearch_pipeline.api as api
+    import opensearch_pipeline.dingtalk_identity as di
+    tok = auth_token.issue_session_token("U1", dept=["finance"])
+    monkeypatch.setattr(di, "_resolve_user_dept_cached", lambda uid: None)
+    assert api.current_identity("Bearer " + tok).acl_groups == ["finance"]
+
+
+def test_current_identity_live_acl_flag_off(monkeypatch):
+    """RAG_LIVE_ACL_REREAD=false → 退回纯令牌内嵌（根本不查 DB）。"""
+    import opensearch_pipeline.api as api
+    import opensearch_pipeline.dingtalk_identity as di
+    monkeypatch.setenv("RAG_LIVE_ACL_REREAD", "false")
+    called = []
+    monkeypatch.setattr(di, "_resolve_user_dept_cached",
+                        lambda uid: called.append(uid) or ["hr"])
+    tok = auth_token.issue_session_token("U1", dept=["finance"])
+    ident = api.current_identity("Bearer " + tok)
+    assert ident.acl_groups == ["finance"] and called == []   # flag 关：不调 DB、用令牌组
+
+
 # ── build_mini_program_blocks ────────────────────────────────
 
 def test_blocks_pure_text_returns_empty():
