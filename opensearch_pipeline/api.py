@@ -397,7 +397,10 @@ async def readiness_check():
             checks["ha3"] = "skipped"
         else:
             client.query(QueryRequest(
-                table_name=cfg.alibaba_vector.table_name, vector=[0.0] * 1024, top_k=1,
+                # 维度读 config（勿硬编码 1024）：HA3 重建为非默认维度时硬编码会让探针抛错→
+                # /api/ready 误报 503→健康实例被摘出。与全代码库其它零向量探针一致。
+                table_name=cfg.alibaba_vector.table_name,
+                vector=[0.0] * cfg.embedding.dimension, top_k=1,
                 include_vector=False, output_fields=["id"], filter="id>=0 AND id<1"))
             checks["ha3"] = "ok"
     except Exception as e:  # noqa: BLE001

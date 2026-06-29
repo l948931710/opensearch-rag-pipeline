@@ -42,12 +42,12 @@ def test_batched_stitch_matches_and_single_round_trip():
         {"chunk_index": 0, "chunk_type": "text_chunk", "chunk_text": "no-doc"},                   # 无 doc_id → pass-through
     ]
     db_rows = [
-        {"doc_id": "A", "chunk_index": 0, "chunk_text": "a0", "section_title": ""},
-        {"doc_id": "A", "chunk_index": 1, "chunk_text": "a1", "section_title": ""},
-        {"doc_id": "A", "chunk_index": 2, "chunk_text": "a2", "section_title": ""},
-        {"doc_id": "B", "chunk_index": 4, "chunk_text": "b4", "section_title": ""},
-        {"doc_id": "B", "chunk_index": 5, "chunk_text": "b5", "section_title": ""},
-        {"doc_id": "B", "chunk_index": 6, "chunk_text": "b6", "section_title": ""},
+        {"doc_id": "A", "version_no": 0, "chunk_index": 0, "chunk_text": "a0", "section_title": ""},
+        {"doc_id": "A", "version_no": 0, "chunk_index": 1, "chunk_text": "a1", "section_title": ""},
+        {"doc_id": "A", "version_no": 0, "chunk_index": 2, "chunk_text": "a2", "section_title": ""},
+        {"doc_id": "B", "version_no": 0, "chunk_index": 4, "chunk_text": "b4", "section_title": ""},
+        {"doc_id": "B", "version_no": 0, "chunk_index": 5, "chunk_text": "b5", "section_title": ""},
+        {"doc_id": "B", "version_no": 0, "chunk_index": 6, "chunk_text": "b6", "section_title": ""},
     ]
     calls = []
     with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_fake_conn(db_rows, calls)):
@@ -81,6 +81,32 @@ def test_no_eligible_chunks_skips_db():
 def test_window_zero_returns_unchanged():
     chunks = [{"doc_id": "A", "chunk_index": 1, "chunk_type": "text_chunk", "chunk_text": "x"}]
     assert retriever.stitch_neighbor_chunks(chunks, window=0) is chunks
+
+
+def test_neighbor_version_isolation_dual_active():
+    """双活版本回归：同 (doc_id, chunk_index) 同时存在 v1（旧版未 deactivate）与 v2（新版）行；
+    version_no=2 的中心只能拼 v2 邻居，绝不混入 v1 文本。这是 neighbor-version 修复防的缺陷。"""
+    chunks = [
+        {"doc_id": "A", "chunk_index": 1, "version_no": 2,
+         "chunk_type": "text_chunk", "chunk_text": "a1-v2-orig"},
+    ]
+    db_rows = [
+        # v1（旧版，双活窗口内仍 is_active）
+        {"doc_id": "A", "version_no": 1, "chunk_index": 0, "chunk_text": "a0-v1", "section_title": ""},
+        {"doc_id": "A", "version_no": 1, "chunk_index": 1, "chunk_text": "a1-v1", "section_title": ""},
+        {"doc_id": "A", "version_no": 1, "chunk_index": 2, "chunk_text": "a2-v1", "section_title": ""},
+        # v2（新版）
+        {"doc_id": "A", "version_no": 2, "chunk_index": 0, "chunk_text": "a0-v2", "section_title": ""},
+        {"doc_id": "A", "version_no": 2, "chunk_index": 1, "chunk_text": "a1-v2", "section_title": ""},
+        {"doc_id": "A", "version_no": 2, "chunk_index": 2, "chunk_text": "a2-v2", "section_title": ""},
+    ]
+    calls = []
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_fake_conn(db_rows, calls)):
+        out = retriever.stitch_neighbor_chunks(chunks, window=1)
+    assert out[0]["chunk_text"] == "a0-v2\na1-v2\na2-v2"   # 只拼 v2
+    assert "v1" not in out[0]["chunk_text"]                # 绝不混入旧版文本
+    assert out[0]["_neighbor_count"] == 3
+    assert "version_no = %s" in calls[0][0]                # WHERE 带版本约束
 
 
 def test_missing_neighbors_falls_back_to_original_text():
