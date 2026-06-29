@@ -639,6 +639,19 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         except Exception as e:
             print(f"[Orchestrator] WARNING: pending-delete reconcile failed (non-fatal): {e}",
                   file=sys.stderr)
+        # Phase D（flag 开）：投影 outbox 定向 drain——decide 端点同事务入队的受影响 doc，逐文档幂等
+        # materialize（标脏 chunk_meta + index_status='NOT_INDEXED'），交本轮 drain 推 HA3。这是
+        # 「decide 内联 materialize best-effort（抛/skipped_locked 漏标脏）」的【必达】兜底，先于下面的
+        # 全扫 reconcile 跑（定向必达 + 全扫兜底互补）。flag 关 → skipped no-op。失败不阻断入库。
+        try:
+            from opensearch_pipeline.access_grants import drain_acl_projection_outbox
+            ob = drain_acl_projection_outbox(commit=True)
+            if not ob.get("skipped") and ob["processed"]:
+                print(f"[Orchestrator] ACL projection outbox drain: done={ob['done']} "
+                      f"locked={ob['locked']} failed={ob['failed']} (processed={ob['processed']})")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: ACL projection outbox drain failed (non-fatal): {e}",
+                  file=sys.stderr)
         # Phase D（flag 开）：跨部门授权投影对账——从 approved authority 重算 allowed_depts，drift
         # 文档标脏（chunk_meta.allowed_depts + index_status='NOT_INDEXED'），交本轮 drain 推 HA3。
         # 兜住 decide 端点漏标脏 / 直接改库的 authority。flag 关 → skipped no-op。失败不阻断入库。

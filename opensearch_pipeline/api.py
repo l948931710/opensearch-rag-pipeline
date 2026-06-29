@@ -3460,11 +3460,18 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 # re-embed**（重活留给 stage-3）。flag 关 = no-op；失败只记日志、**不回滚 status**
                 # （allowed_depts_reconcile 每轮 stage-3 兜底）。
                 if get_config().rag.allowed_depts_acl and doc_id:
+                    from opensearch_pipeline.access_grants import (
+                        enqueue_acl_projection, materialize_doc_allowed_depts,
+                    )
+                    # 持久入队（同事务、不吞异常）：权威变更与投影意图原子提交——enqueue 失败则整笔回滚，
+                    # 绝不出现「权威已改而无 outbox 行」的撕裂。stage-3 outbox drain 据此定向幂等重试至成功。
+                    enqueue_acl_projection(cur, doc_id, reason=decision)
+                    # 内联标脏 = best-effort 快路径：成功则本轮 stage-3 即可重推；抛/skipped_locked → 上面
+                    # 的 outbox 行兜底（+ allowed_depts_reconcile 全扫）。失败只记日志、**不回滚 status**。
                     try:
-                        from opensearch_pipeline.access_grants import materialize_doc_allowed_depts
                         materialize_doc_allowed_depts(cur, doc_id)
                     except Exception as _pe:
-                        logger.warning("decide allowed_depts 标脏失败（reconciler 兜底）doc=%s: %s",
+                        logger.warning("decide allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
                                        doc_id, _pe)
             conn.commit()
         finally:
