@@ -280,6 +280,11 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
 
     ACL 权限组来自服务端签发的令牌，客户端不可篡改；端点据此解析权限，绝不信任请求体。
     优先读新令牌的 acl_groups（数组）；旧令牌只有 dept（CSV/标量）则拆分兼容。
+
+    ⚠️ 读组撤销窗口（S1）：此处的 acl_groups 取自令牌（TTL 8h），**非**服务端现查——与【写授权】
+    不同（_require_kb_console 每次现查 DB user_role/dept_admin_grant，撤销即时生效）。故【收紧】某用户的
+    读组只在其下次令牌签发（重登/续签）后才生效，存在 ≤TTL 的窗口；这是读路径的撤销窗口，不是写授权绕过，
+    且令牌本身不可伪造。高敏部署可缩短 TTL，或对 restricted 语料在 /api/ask 服务端复读 acl_groups。
     """
     if not authorization:
         return None
@@ -1408,6 +1413,9 @@ class KbDocStatusResponse(BaseModel):
     error_message: str = ""
 
 
+_KB_MAX_OFFSET = 10000   # 文档列表分页 offset 上界（全库 ~1600 篇，1 万足够；防巨大 offset 深分页扫表，G7）
+
+
 def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
                      publish_status=None) -> str:
     """把管线多字段折叠为用户可读态：排队中/处理中/已上线/处理失败/内容未变/已隔离/已退役。"""
@@ -1589,7 +1597,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     limit = max(1, min(limit, 50))
-    offset = max(0, offset)
+    offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（全库 ~1600，1万 offset 绰绰有余，G7）
     clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
     # 文档名搜索：转义 LIKE 通配符（% _ \）防"输入 % 即匹配全部"，作用域过滤仍在前 → 不越权。
     q = (q or "").strip()[:80]
@@ -1664,7 +1672,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         # 目前仅 all 语义（本部门用 my-docs）；非法 scope fail-closed 空，避免静默当全量。
         return KbMyDocsResponse(items=[], has_more=False)
     limit = max(1, min(limit, 50))
-    offset = max(0, offset)
+    offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（G7）
 
     # owner_dept facet（可选）：参数化 = %s 本身防注入，这里再剥离注入字符 + 限长做纵深防御。
     from opensearch_pipeline.kb_authz import _SANITIZE_RE
@@ -2342,7 +2350,11 @@ class KbConfigResponse(BaseModel):
 
 @app.get("/api/kb/config", response_model=KbConfigResponse)
 def kb_config(request: Request, identity: Optional[Identity] = Depends(current_identity)):
-    """前端能力配置（上传上限/受理类型）—— 后端权威，省得客户端硬编码 50MB/类型导致"传完才 413"漂移。"""
+    """前端能力配置（上传上限/受理类型）—— 后端权威，省得客户端硬编码 50MB/类型导致"传完才 413"漂移。
+
+    **有意公开**（不加 _require_kb_console）：仅暴露静态能力常量（上传字节上限 + 扩展名白名单），
+    非敏感、无部门/文档数据；客户端在上传前自检需要它，限流即足以防滥用（G6）。
+    """
     _enforce_rate_limit(request, identity, scope="aux")
     from opensearch_pipeline.kb_upload import MAX_UPLOAD_BYTES, _PHASE1_EXTS
     return KbConfigResponse(
@@ -2397,7 +2409,7 @@ def kb_version_history(request: Request, doc_id: str,
         versions.append(KbVersionItem(
             version_no=int(vno or 0), content_process_status=cps or "",
             chunk_status=chs or "", index_status=ixs or "", publish_status=pubs or "",
-            status_badge=_kb_status_badge(cps, ixs, None),
+            status_badge=_kb_status_badge(cps, ixs, _doc_status),   # 传 doc 级状态 → 退役文档各版本如实显「已退役」(B4)
             error_message=err or "", created_at=str(created) if created else "",
         ))
     return KbVersionHistoryResponse(doc_id=doc_id, owner_dept=owner_dept, versions=versions)

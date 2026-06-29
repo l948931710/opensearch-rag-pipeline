@@ -653,6 +653,31 @@ def test_admin_revoke_all_demotes(monkeypatch):
 
 
 # ── 恢复上线 /api/kb/restore（退役逆操作）──
+def test_version_history_retired_doc_badges(monkeypatch):
+    """退役文档的版本历史：传入 doc 级状态后各版本徽章如实显「已退役」（B4），不再误显流水线态。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    ver_rows = [
+        (2, "SUCCESS", "", "SUCCESS", "", "", "2026-06-20"),   # 退役前是「已上线」，doc 退役后应显已退役
+        (1, "SUCCESS", "", "SUCCESS", "", "", "2026-06-10"),
+    ]
+    _stub_multi(monkeypatch, [("marketing", "retired"), ver_rows])   # meta(fetchone) + versions(fetchall)
+    from opensearch_pipeline import api
+    resp = api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
+    assert len(resp.versions) == 2
+    assert all(v.status_badge == "已退役" for v in resp.versions)
+
+
+def test_version_history_active_doc_pipeline_badge(monkeypatch):
+    """对照：active 文档版本仍显流水线态（已上线），doc_status 传入不误伤。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [("marketing", "active"), [(1, "SUCCESS", "", "SUCCESS", "", "", "2026-06-10")]])
+    from opensearch_pipeline import api
+    resp = api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
+    assert resp.versions[0].status_badge == "已上线"
+
+
 def test_retire_deactivates_all_versions(monkeypatch):
     """退役停用该文档【全部活跃版本】chunk（WHERE doc_id 不限 version_no）——闭合旧版本残留 is_active=1。"""
     _skip_if_not_sim()
