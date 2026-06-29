@@ -162,7 +162,11 @@ def _upsert_daily(conn, metric_date: str, m: Dict[str, Any], tz_shift: int) -> N
     breaches_json = json.dumps(m.get("slo_breaches") or [], ensure_ascii=False)
     set_clause = ", ".join(f"{c}=VALUES({c})" for c in cols) + \
         ", slo_breaches_json=VALUES(slo_breaches_json), tz_shift_hours=VALUES(tz_shift_hours)"
-    sql = (f"INSERT INTO qa_daily_metrics (metric_date, {', '.join(cols)}, "
+    # 显式限定运营库（qa_daily_metrics 定义在 fuling_operation，见 schema/004）。生产 writer
+    # 经 LaunchAgent RAG_ENV=metrics 把连接默认库设为 fuling_operation，非限定写本就落到此库；
+    # 显式 {_op_db()}. 是纵深加固：去掉对 RDS_DATABASE 取值的隐式依赖（不再因默认库变动而错位写
+    # 到知识库），且 staging 自动指向 fuling_operation_stg。生产目标不变（_op_db()=fuling_operation）。
+    sql = (f"INSERT INTO {_op_db()}.qa_daily_metrics (metric_date, {', '.join(cols)}, "
            f"slo_breaches_json, tz_shift_hours) "
            f"VALUES (%s, {', '.join(['%s'] * len(cols))}, %s, %s) "
            f"ON DUPLICATE KEY UPDATE {set_clause}")
