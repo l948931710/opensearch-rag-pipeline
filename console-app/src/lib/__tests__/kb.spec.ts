@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { uploadErrText, buildDupMsg, fileCore, badgeTone, deptLabel, permLabel, extOf, unsupportedNames } from '@/lib/kb'
+import { describe, expect, it, vi } from 'vitest'
+import { uploadErrText, buildDupMsg, fileCore, badgeTone, deptLabel, permLabel, extOf, unsupportedNames, putWithProgress } from '@/lib/kb'
 
 describe('uploadErrText（技术错误 → 人话，绝不暴露 trace/HTTP）', () => {
   it('413/超大 → 大小提示', () => {
@@ -56,6 +56,26 @@ describe('fileCore / badgeTone / labels', () => {
     expect(deptLabel('unknown')).toBe('unknown')
     expect(permLabel('dept_internal')).toBe('仅本部门')
     expect(permLabel('public')).toBe('全公司')
+  })
+  it('putWithProgress 发签入的 Content-Type 头（G4）；缺省则不显式设头', async () => {
+    const headers: Record<string, string> = {}
+    class FakeXHR {
+      upload: any = {}
+      status = 200; timeout = 0
+      onload: any = null; onerror: any = null; ontimeout: any = null
+      open() {}
+      setRequestHeader(k: string, v: string) { headers[k] = v }
+      send() { if (this.onload) this.onload() }
+    }
+    vi.stubGlobal('XMLHttpRequest', FakeXHR as any)
+    await putWithProgress('https://oss/x', new File([new Uint8Array(3)], 'a.pdf'), undefined, 'application/pdf')
+    expect(headers['Content-Type']).toBe('application/pdf')   // 与 URL 签名一致，否则 OSS 403
+
+    const h2: Record<string, string> = {}
+    class FakeXHR2 extends FakeXHR { setRequestHeader(k: string, v: string) { h2[k] = v } }
+    vi.stubGlobal('XMLHttpRequest', FakeXHR2 as any)
+    await putWithProgress('https://oss/x', new File([new Uint8Array(3)], 'a.pdf'))
+    expect(h2['Content-Type']).toBeUndefined()               // 未给 → 不显式设头
   })
   it('extOf / unsupportedNames（客户端扩展名预检，G9）', () => {
     expect(extOf('a.PDF')).toBe('.pdf')          // 小写归一

@@ -2496,6 +2496,7 @@ class KbUploadUrlResponse(BaseModel):
     doc_id: str
     expires_in: int
     requires_kb_admin_approval: bool = False
+    content_type: str = ""   # 客户端 PUT 必须发此 Content-Type（已签入 put_url，不一致 OSS 403）；G4
 
 
 class KbRegisterRequest(BaseModel):
@@ -2618,13 +2619,19 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         "owner_name": kb.name,
     })
     bucket = get_config().oss.bucket_name
-    put_url = generate_signed_url(raw_key, expires=kb_upload.UPLOAD_TOKEN_TTL, method="PUT")
-    logger.info("kb upload-url: uid=%s action=%s doc_id=%s owner=%s bucket=%s",
-                kb.user_id, req.action, doc_id, owner, bucket)
+    # G4：把 Content-Type 按申报扩展名钉死并签入 PUT URL —— 客户端须发完全一致的 Content-Type，
+    # 否则 OSS 拒签（403），杜绝持 URL 者上传任意类型/与扩展名不符的字节。content_type 回传客户端。
+    from opensearch_pipeline.oss_url import mime_for_ext
+    content_type = mime_for_ext(ext)
+    put_url = generate_signed_url(raw_key, expires=kb_upload.UPLOAD_TOKEN_TTL, method="PUT",
+                                  content_type=content_type)
+    logger.info("kb upload-url: uid=%s action=%s doc_id=%s owner=%s bucket=%s ctype=%s",
+                kb.user_id, req.action, doc_id, owner, bucket, content_type)
     return KbUploadUrlResponse(
         upload_token=token, put_url=put_url, raw_key=raw_key, doc_id=doc_id,
         expires_in=kb_upload.UPLOAD_TOKEN_TTL,
         requires_kb_admin_approval=bool(decision.requires_kb_admin_approval),
+        content_type=content_type,
     )
 
 

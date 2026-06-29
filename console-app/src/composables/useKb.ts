@@ -79,7 +79,7 @@ export interface VersionItem {
   version_no: number; content_process_status: string; chunk_status: string
   index_status: string; publish_status: string; status_badge: string; error_message: string; created_at: string
 }
-interface UploadUrlResp { upload_token: string; put_url: string; raw_key: string; doc_id: string; expires_in: number; requires_kb_admin_approval: boolean }
+interface UploadUrlResp { upload_token: string; put_url: string; raw_key: string; doc_id: string; expires_in: number; requires_kb_admin_approval: boolean; content_type?: string }
 interface RegisterResp { doc_id: string; version_no: number; content_process_status: string; requires_kb_admin_approval: boolean; status_badge: string; idempotent: boolean; title: string; content_dups: DupDoc[]; content_dups_other: number }
 interface DocStatusResp { status_badge: string; chunk_active: number; error_message: string }
 interface RetireResp { status: string; retired: boolean; already: boolean; status_badge: string; note: string }
@@ -511,7 +511,7 @@ async function uploadSingle(file: File) {
     uploadMsg.value = '申请上传地址…'
     const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify(body) })
     uploadMsg.value = '上传文件到 OSS… 0%'
-    await putWithProgress(u.put_url, file, (pct) => { uploadMsg.value = `上传文件到 OSS… ${pct}%` })
+    await putWithProgress(u.put_url, file, (pct) => { uploadMsg.value = `上传文件到 OSS… ${pct}%` }, u.content_type)
     uploadMsg.value = '登记…'
     const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
     uploadOk.value = true
@@ -537,7 +537,7 @@ async function uploadBatch(files: File[]) {
     try {
       row.status = '上传中'
       const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify({ action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: newPerm.value }) })
-      await putWithProgress(u.put_url, f, (pct) => { row.pct = pct; row.msg = `${pct}%` })
+      await putWithProgress(u.put_url, f, (pct) => { row.pct = pct; row.msg = `${pct}%` }, u.content_type)
       row.status = '登记中'; row.msg = ''
       const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
       row.status = '已提交'; row.msg = `v${r.version_no}（${r.status_badge}）`

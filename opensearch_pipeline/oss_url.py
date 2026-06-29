@@ -30,10 +30,28 @@ def _ensure_public_endpoint(endpoint: str) -> str:
     return re.sub(r'-internal(?=\.)', '', endpoint)
 
 
+# 扩展名 → MIME（受理类型单一真相；签名 PUT 绑定 Content-Type + sim HEAD 共用）。
+EXT_MIME = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+}
+
+
+def mime_for_ext(name_or_ext: str) -> str:
+    """由文件名或扩展名推 MIME；未知 → application/octet-stream（兜底，不抛）。"""
+    s = (name_or_ext or "").strip().lower()
+    ext = s.rsplit(".", 1)[-1] if "." in s else s
+    return EXT_MIME.get(ext, "application/octet-stream")
+
+
 def generate_signed_url(
     oss_key: str,
     expires: Optional[int] = None,
     method: str = "GET",
+    content_type: Optional[str] = None,
 ) -> str:
     """
     将 OSS 对象 key 转为带签名的公开访问 URL。
@@ -43,6 +61,9 @@ def generate_signed_url(
         expires: 签名有效期（秒）；None 取 config.oss.signed_url_expires
                  （RAG_OSS_URL_EXPIRES，默认 3600 = 1 小时）
         method: HTTP 方法，默认 GET
+        content_type: 仅 PUT 用——把 Content-Type 签入 URL。给定后客户端 PUT 必须发**完全一致**的
+            Content-Type 头，否则 OSS 拒签（403）。用于把上传对象的类型钉死为申报扩展名对应 MIME，
+            杜绝持 URL 者上传任意类型 / 与扩展名不符的字节。调用方须把同一值回传客户端（见 upload-url）。
 
     Returns:
         签名 URL 字符串。失败时返回空字符串。
@@ -79,7 +100,9 @@ def generate_signed_url(
         auth = oss2.Auth(access_id, access_secret)
         bucket = oss2.Bucket(auth, public_endpoint, bucket_name)
 
-        url = bucket.sign_url(method, oss_key, expires)
+        # PUT 绑定 Content-Type：签入 headers → 客户端必须发一致的 Content-Type，否则 OSS 403。
+        sign_headers = {"Content-Type": content_type} if (content_type and method.upper() == "PUT") else None
+        url = bucket.sign_url(method, oss_key, expires, headers=sign_headers)
 
         # 强制 HTTPS — 钉钉客户端要求图片 URL 必须是 HTTPS
         if url.startswith("http://"):
@@ -92,15 +115,6 @@ def generate_signed_url(
         print(f"[OSS] ❌ sign_url failed: endpoint={endpoint}, bucket={bucket_name}, key={oss_key[:80]}, error={e}", flush=True)
         logger.error("Failed to generate signed URL for '%s': %s", oss_key, e, exc_info=True)
         return ""
-
-
-_SIM_HEAD_MIME = {
-    "pdf": "application/pdf",
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-}
 
 
 def _sim_head_object(oss_key: str) -> dict:
@@ -118,9 +132,8 @@ def _sim_head_object(oss_key: str) -> dict:
         size = int(raw) if raw != "" else 1024
     except ValueError:
         size = 1024
-    ext = oss_key.rsplit(".", 1)[-1].lower() if "." in oss_key else ""
     etag = os.environ.get("RAG_SIM_OSS_HEAD_ETAG") or hashlib.sha256(oss_key.encode("utf-8")).hexdigest()[:32].upper()
-    return {"size": size, "content_type": _SIM_HEAD_MIME.get(ext, "application/octet-stream"), "etag": etag}
+    return {"size": size, "content_type": mime_for_ext(oss_key), "etag": etag}
 
 
 def head_object(oss_key: str) -> Optional[dict]:

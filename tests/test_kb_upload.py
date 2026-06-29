@@ -104,9 +104,22 @@ def test_upload_url_kb_admin_new_ok(monkeypatch):
     assert resp.doc_id.startswith("DOC_")
     assert resp.raw_key.startswith("raw/production/")
     assert not resp.requires_kb_admin_approval     # kb_admin dept_internal 直接发布
+    assert resp.content_type == "application/pdf"  # G4：按扩展名钉死 Content-Type，回传客户端
     # token 解析回来，owner/raw_key 与响应一致（客户端不可改）
     p = ku.verify_upload_token(resp.upload_token)
     assert p["owner_dept"] == "production" and p["raw_key"] == resp.raw_key
+
+
+def test_mime_for_ext_g4():
+    """G4：扩展名 → MIME（受理类型单一真相）；未知兜底 octet-stream。"""
+    from opensearch_pipeline.oss_url import mime_for_ext
+    assert mime_for_ext("a.pdf") == "application/pdf"
+    assert mime_for_ext("PNG") == "image/png"                 # 纯扩展名 + 大小写
+    assert mime_for_ext("x.JPEG") == "image/jpeg"
+    assert mime_for_ext("raw/hr/d/u/报告.docx") == \
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    assert mime_for_ext("noext") == "application/octet-stream"
+    assert mime_for_ext("") == "application/octet-stream"
 
 
 def test_upload_url_dept_admin_public_needs_approval(monkeypatch):
