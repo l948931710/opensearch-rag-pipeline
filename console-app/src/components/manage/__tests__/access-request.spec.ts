@@ -114,6 +114,24 @@ describe('accessStateOf — 申请人侧 4 态派生', () => {
   })
 })
 
+describe('loadMyAccessRequests — 终态清乐观标记（B6）', () => {
+  it('权威回灌「已驳回」→ 清乐观 requestedDocIds，accessStateOf 回 none（不再卡「审批中」）', async () => {
+    activate(identity())
+    const kb = useKb()
+    ;(kb as any).requestedDocIds.value = new Set(['DZ'])
+    expect(kb.accessStateOf('DZ')).toBe('pending')   // 回灌前：乐观显审批中
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (path.startsWith('/api/kb/my-access-requests')) {
+        return { ok: true, status: 200, json: async () => ({ items: [{ id: 'm1', doc_id: 'DZ', status: 'rejected', sync_state: 'n/a' }] }) }
+      }
+      return { ok: false, status: 404, json: async () => ({}) }
+    }))
+    await kb.loadMyAccessRequests()
+    expect((kb as any).requestedDocIds.value.has('DZ')).toBe(false)   // 乐观标记被清
+    expect(kb.accessStateOf('DZ')).toBe('none')                       // 可重新申请
+  })
+})
+
 describe('AccessSyncPill — 独立同步态徽章', () => {
   it('projected→已放行（live 调）· approved_pending_sync→同步中（busy 调）', () => {
     const p = mount(AccessSyncPill, { props: { state: 'projected' } })

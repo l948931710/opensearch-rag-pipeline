@@ -3,6 +3,19 @@
 
 export const MAX_UPLOAD_MB = 50   // 必须与后端 kb_upload.MAX_UPLOAD_BYTES 对齐（否则传完才 413）
 export const UPLOAD_ACCEPT = '.pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png'
+// 受支持扩展名（= UPLOAD_ACCEPT 拆分；后端 validate_filename 为权威，前端仅预检省一次失败往返）。
+export const UPLOAD_EXTS = UPLOAD_ACCEPT.split(',')
+
+/** 取文件扩展名（小写，含点），无扩展名返回 ''。 */
+export function extOf(filename: string): string {
+  const m = /\.[^.]+$/.exec(String(filename || ''))
+  return m ? m[0].toLowerCase() : ''
+}
+
+/** 列出不在受支持扩展名内的文件名（拖拽绕过 input accept 时的客户端预检）。 */
+export function unsupportedNames(files: Array<{ name: string }>): string[] {
+  return files.filter((f) => !UPLOAD_EXTS.includes(extOf(f.name))).map((f) => f.name)
+}
 
 // 部门 ACL 组码 → 中文（owner_dept 存组码）。
 export const GROUP_LABEL: Record<string, string> = {

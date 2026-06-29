@@ -6,7 +6,7 @@ import LoadError from './LoadError.vue'
 
 // 已授权清单（审批人侧）：本部门文档现行有效（approved 存量）的跨部门检索授权，可撤销（approved→revoked）。
 // 与「授权申请」（pending 待审批）区分：此处是已放行的存量，活跃态调（st-live）。空时整块不渲染。
-const { accessGrants, apprBusy, revokeAccess, loadAccessGrants, loadErrors } = useKb()
+const { accessGrants, isBusy, revokeAccess, loadAccessGrants, loadErrors } = useKb()
 
 // requester_depts 为逗号分隔组码（多部门管理员可一次授予多组）→ 逐个 deptLabel 再拼。
 const reqLabel = (csv: string) => csv.split(',').map((c) => deptLabel(c.trim())).filter(Boolean).join('、')
@@ -53,7 +53,7 @@ function onRevoke(g: AccessGrantItem) {
         <button
           type="button"
           class="self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
-          :disabled="apprBusy" @click="onRevoke(g)"
+          :disabled="isBusy(`grant:${g.id}`)" @click="onRevoke(g)"
         >撤销</button>
       </div>
     </div>

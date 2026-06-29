@@ -5,7 +5,8 @@ import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
 
 // 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
-const { approvals, apprBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors } = useKb()
+const { approvals, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors } = useKb()
+const rowKey = (d: PendingItem) => `appr:${d.doc_id}/${d.version_no}`
 
 function onReject(d: PendingItem) {
   const reason = prompt('驳回原因（可空）：', '')
@@ -45,12 +46,12 @@ function onReject(d: PendingItem) {
         <button
           type="button"
           class="rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
-          :disabled="apprBusy" @click="onReject(d)"
+          :disabled="isBusy(rowKey(d))" @click="onReject(d)"
         >驳回</button>
         <button
           type="button"
           class="rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-          :disabled="apprBusy" @click="approve(d)"
+          :disabled="isBusy(rowKey(d))" @click="approve(d)"
         >通过</button>
       </div>
     </div>

@@ -7,7 +7,7 @@ import LoadError from './LoadError.vue'
 
 // Phase F 成员/角色管理（kb_admin 专属）：维护部门管理员 + 其可管理 owner_dept（写授权）。
 // 三分授权：读组 ≠ 可管理(dept_admin_grant) ≠ 可授权(本面=kb_admin)。kb_admin 行只读受保护。
-const { adminGrants, grantableDepts, apprBusy, grantDeptAdmin, revokeAdminGrant, loadAdminGrants, loadErrors } = useKb()
+const { adminGrants, grantableDepts, isBusy, grantDeptAdmin, revokeAdminGrant, loadAdminGrants, loadErrors } = useKb()
 
 const formUser = ref('')
 const formName = ref('')
@@ -76,7 +76,7 @@ function onRevokeDept(a: AdminItem, d: string) {
         </div>
         <input v-model="formNote" placeholder="备注（可空，如授权依据）" class="w-full rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-foreground placeholder:text-faint" />
         <div class="flex gap-2">
-          <button type="button" :disabled="apprBusy" class="rounded-lg bg-primary px-4 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50" @click="submit">提交授予</button>
+          <button type="button" :disabled="isBusy(`member:${formUser.trim()}`)" class="rounded-lg bg-primary px-4 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50" @click="submit">提交授予</button>
           <button type="button" class="rounded-lg border border-border px-4 py-[7px] text-[12.5px] text-foreground transition hover:border-border-strong" @click="formOpen = false">取消</button>
         </div>
       </div>
@@ -92,13 +92,13 @@ function onRevokeDept(a: AdminItem, d: string) {
           <div class="mt-1 flex flex-wrap gap-1.5">
             <span v-for="d in a.managed_owner_depts" :key="d" class="inline-flex items-center gap-1 rounded-md bg-panel px-2 py-0.5 text-[11.5px] text-muted-foreground">
               {{ deptLabel(d) }}
-              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="apprBusy" @click="onRevokeDept(a, d)"><X :size="11" :stroke-width="2.5" /></button>
+              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeDept(a, d)"><X :size="11" :stroke-width="2.5" /></button>
             </span>
             <span v-if="!a.managed_owner_depts.length" class="text-[11.5px] text-faint">（无可管理部门）</span>
           </div>
         </div>
-        <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="apprBusy" @click="startEdit(a)">编辑</button>
-        <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="apprBusy" @click="onRevokeAll(a)">撤销全部</button>
+        <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="startEdit(a)">编辑</button>
+        <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeAll(a)">撤销全部</button>
       </div>
       <div v-if="!deptAdmins.length" class="border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">暂无部门管理员，点「授予」添加</div>
 

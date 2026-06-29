@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { uploadErrText, buildDupMsg, fileCore, badgeTone, deptLabel, permLabel } from '@/lib/kb'
+import { uploadErrText, buildDupMsg, fileCore, badgeTone, deptLabel, permLabel, extOf, unsupportedNames } from '@/lib/kb'
 
 describe('uploadErrText（技术错误 → 人话，绝不暴露 trace/HTTP）', () => {
   it('413/超大 → 大小提示', () => {
@@ -56,5 +56,12 @@ describe('fileCore / badgeTone / labels', () => {
     expect(deptLabel('unknown')).toBe('unknown')
     expect(permLabel('dept_internal')).toBe('仅本部门')
     expect(permLabel('public')).toBe('全公司')
+  })
+  it('extOf / unsupportedNames（客户端扩展名预检，G9）', () => {
+    expect(extOf('a.PDF')).toBe('.pdf')          // 小写归一
+    expect(extOf('a.b.docx')).toBe('.docx')      // 取最后一段
+    expect(extOf('noext')).toBe('')
+    expect(unsupportedNames([{ name: 'a.pdf' }, { name: 'b.png' }])).toEqual([])
+    expect(unsupportedNames([{ name: 'a.pdf' }, { name: 'm.zip' }, { name: 'x.exe' }])).toEqual(['m.zip', 'x.exe'])
   })
 })

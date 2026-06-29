@@ -29,9 +29,12 @@ function close() { reason.value = ''; closeAccessRequest() }
           为本部门申请访问《<span class="font-semibold text-foreground">{{ accessReqDoc.title || accessReqDoc.original_filename || accessReqDoc.doc_id }}</span>》（归属
           {{ deptLabel(accessReqDoc.owner_dept) }} · {{ permLabel(accessReqDoc.permission_level) }}）。提交后由文档所属部门管理员审批；通过后本部门将获得该文档检索授权（检索开放随后续维护生效）。
         </p>
-        <label class="mb-1.5 block text-[11px] font-bold uppercase tracking-[0.04em] text-faint">申请理由</label>
+        <div class="mb-1.5 flex items-baseline justify-between">
+          <label class="block text-[11px] font-bold uppercase tracking-[0.04em] text-faint">申请理由</label>
+          <span class="font-mono text-[10.5px] tabular-nums text-faint">{{ reason.length }}/500</span>
+        </div>
         <textarea
-          v-model="reason" rows="3" placeholder="说明为何需要访问此文档（会随申请一同送审）"
+          v-model="reason" rows="3" maxlength="500" placeholder="说明为何需要访问此文档（会随申请一同送审）"
           class="w-full resize-none rounded-[10px] border border-input bg-surface px-3 py-2.5 text-[13px] leading-relaxed text-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/15"
         />
       </div>

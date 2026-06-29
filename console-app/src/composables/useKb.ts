@@ -2,7 +2,7 @@ import { computed, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import {
-  MAX_UPLOAD_MB, TERMINAL_BADGES, putWithProgress, uploadErrText, buildDupMsg, fileCore, type DupDoc,
+  MAX_UPLOAD_MB, TERMINAL_BADGES, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
 
 // 知识库管理台单例 store。身份/可管部门复用 P1 的 session（whoami 已给 managed_owner_depts），
@@ -128,7 +128,8 @@ const dupWarn = ref('')                // 文件名级预查重
 const contentDupMsg = ref('')          // ETag 内容级查重
 const uploadQueue = ref<QueueRow[]>([])
 const selectedNames = ref<string[]>([])
-const apprBusy = ref(false)
+// 在途互斥（按行/按用户 key）：一行审批/撤销不再禁用其他不相关按钮（B5）。
+const inflight = ref<Set<string>>(new Set())
 const retireBusy = ref(false)
 
 // File 真身【绝不进响应式】（Vue3 Proxy 会破坏 xhr.send(file)）——留模块闭包。
@@ -148,6 +149,14 @@ function noteLoadError(key: string, e: unknown) {
   loadErrors.value[key] = '加载失败，请重试'
 }
 function clearLoadError(key: string) { delete loadErrors.value[key] }
+
+// 在途互斥：按 key（行/用户）加锁，避免一键禁用无关按钮 + 防同行重复提交。组件用 isBusy(key) 绑 :disabled。
+function isBusy(key: string): boolean { return inflight.value.has(key) }
+async function withInflight<T>(key: string, fn: () => Promise<T>): Promise<T | undefined> {
+  if (inflight.value.has(key)) return undefined
+  inflight.value = new Set(inflight.value).add(key)
+  try { return await fn() } finally { const n = new Set(inflight.value); n.delete(key); inflight.value = n }
+}
 
 function sortDocs(list: DocItem[], key: SortKey, dir: 1 | -1): DocItem[] {
   return [...list].sort((a, b) => {
@@ -260,6 +269,13 @@ async function loadMyAccessRequests() {
     // 若 last-write-wins（直接 m.set）会让最旧行覆盖最新 → 误显「申请授权」。首见即最新 → 不覆盖。
     for (const it of (r.items || [])) if (!m.has(it.doc_id)) m.set(it.doc_id, { status: it.status, sync_state: it.sync_state })
     myAccessReqs.value = m
+    // 权威已有该 doc 的行 → 清掉本会话乐观标记（否则被驳回/撤销的文档因乐观回退仍显「审批中」、抑制「申请授权」按钮）。
+    if (requestedDocIds.value.size) {
+      const next = new Set(requestedDocIds.value)
+      let changed = false
+      for (const id of next) if (m.has(id)) { next.delete(id); changed = true }
+      if (changed) requestedDocIds.value = next
+    }
   } catch { /* 兜底空 */ }
 }
 async function submitAccessRequest(reason: string) {
@@ -431,6 +447,12 @@ async function onFileSelected(list: FileList | null) {
   uploadErr.value = ''; uploadMsg.value = ''; contentDupMsg.value = ''; uploadQueue.value = []
   selectedFiles = list ? Array.from(list) : []
   if (verCtx.value) selectedFiles = selectedFiles.slice(0, 1)   // 升版仅 1 文件
+  // 客户端扩展名预检（拖拽绕过 input accept）：剔除不支持的文件并提示，省一次「传完才被后端拒」的往返。
+  const bad = unsupportedNames(selectedFiles)
+  if (bad.length) {
+    selectedFiles = selectedFiles.filter((f) => !bad.includes(f.name))
+    uploadErr.value = `已忽略 ${bad.length} 个不支持的文件（${bad.join('、')}）。仅支持 PDF / DOCX / XLSX / PPTX / JPG / PNG。`
+  }
   selectedNames.value = selectedFiles.map((f) => f.name)
   dupWarn.value = ''
   if (!verCtx.value && selectedFiles.length === 1) {
@@ -449,6 +471,7 @@ function trackStatus(docId: string, versionNo: number) {
   const mySeq = ++trackSeq
   if (trackTimer) clearTimeout(trackTimer)
   let tries = 0
+  let fails = 0                                     // 连续轮询失败计：区分「处理慢」与「状态检查接口出错」
   const MAX = 22
   const poll = async () => {
     if (mySeq !== trackSeq) return                 // 被新上传/操作作废
@@ -456,6 +479,7 @@ function trackStatus(docId: string, versionNo: number) {
     try {
       const s = await apiJson<DocStatusResp>(`/api/kb/doc-status?doc_id=${encodeURIComponent(docId)}&version=${versionNo}`, { auth: true })
       if (mySeq !== trackSeq) return               // await 期间被作废
+      fails = 0                                     // 成功 → 清失败计
       patchRow(docId, s.status_badge)
       if (TERMINAL_BADGES.includes(s.status_badge)) {
         if (s.status_badge === '处理失败') { uploadOk.value = false; uploadErr.value = `入库失败：${s.error_message || ''}（${docId} v${versionNo}）`; uploadMsg.value = '' }
@@ -463,7 +487,10 @@ function trackStatus(docId: string, versionNo: number) {
         void loadDocs()
         return
       }
-    } catch { /* 轮询本身失败：重试到上限 */ }
+    } catch {
+      // 轮询本身失败：累计，连续多次才提示（偶发抖动不打扰），仍重试到上限。
+      if (++fails >= 3) uploadMsg.value = '状态检查暂时失败，仍在重试…若持续请手动刷新「我的文档」'
+    }
     if (tries >= MAX) { uploadMsg.value = '仍在处理…耗时较长，稍后刷新「我的文档」查看'; return }
     trackTimer = setTimeout(poll, 8000)
   }
@@ -531,21 +558,21 @@ function doUpload() {
 }
 
 async function approve(d: PendingItem) {
-  if (apprBusy.value) return
-  apprBusy.value = true
-  try {
-    await apiJson('/api/kb/approve', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no }) })
-    await loadApprovals(); await loadDocs()
-  } catch (e: any) { alert('通过失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+  await withInflight(`appr:${d.doc_id}/${d.version_no}`, async () => {
+    try {
+      await apiJson('/api/kb/approve', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no }) })
+      await loadApprovals(); await loadDocs()
+    } catch (e: any) { alert('通过失败：' + uploadErrText(e)) }
+  })
 }
 
 async function reject(d: PendingItem, reason: string) {
-  if (apprBusy.value) return
-  apprBusy.value = true
-  try {
-    await apiJson('/api/kb/reject', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no, reason }) })
-    await loadApprovals(); await loadDocs()
-  } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+  await withInflight(`appr:${d.doc_id}/${d.version_no}`, async () => {
+    try {
+      await apiJson('/api/kb/reject', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no, reason }) })
+      await loadApprovals(); await loadDocs()
+    } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) }
+  })
 }
 
 // ── 授权申请（Phase C，审批人侧）──
@@ -568,25 +595,25 @@ async function loadAccessRequests() {
 }
 
 async function approveAccess(d: AccessRequestItem) {
-  if (apprBusy.value) return
-  apprBusy.value = true
-  try {
-    const s = useSession()
-    if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
-    await apiJson('/api/kb/access-requests/approve', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id }) })
-    await loadAccessRequests()
-  } catch (e: any) { alert('授权失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+  await withInflight(`acc:${d.id}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
+      await apiJson('/api/kb/access-requests/approve', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id }) })
+      await loadAccessRequests()
+    } catch (e: any) { alert('授权失败：' + uploadErrText(e)) }
+  })
 }
 
 async function rejectAccess(d: AccessRequestItem, reason: string) {
-  if (apprBusy.value) return
-  apprBusy.value = true
-  try {
-    const s = useSession()
-    if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
-    await apiJson('/api/kb/access-requests/reject', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id, reason }) })
-    await loadAccessRequests()
-  } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+  await withInflight(`acc:${d.id}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
+      await apiJson('/api/kb/access-requests/reject', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id, reason }) })
+      await loadAccessRequests()
+    } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) }
+  })
 }
 
 // 已授权清单（审批人侧 · approved 存量）：后端 /api/kb/access-grants 未上线 → 静默兜底空；DEV ?preview 注入 mock。
@@ -609,14 +636,14 @@ async function loadAccessGrants() {
 
 // 撤销【已批准】的跨部门授权（approved→revoked）：后端同事务收窄 allowed_depts 投影 + 标脏，stage-3 收回放行。
 async function revokeAccess(g: AccessGrantItem, reason: string) {
-  if (apprBusy.value) return
-  apprBusy.value = true
-  try {
-    const s = useSession()
-    if (import.meta.env.DEV && s.token === 'dev-preview') { accessGrants.value = accessGrants.value.filter((x) => x.id !== g.id); return }
-    await apiJson('/api/kb/access-requests/revoke', { method: 'POST', auth: true, body: JSON.stringify({ id: g.id, reason }) })
-    await loadAccessGrants()
-  } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+  await withInflight(`grant:${g.id}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') { accessGrants.value = accessGrants.value.filter((x) => x.id !== g.id); return }
+      await apiJson('/api/kb/access-requests/revoke', { method: 'POST', auth: true, body: JSON.stringify({ id: g.id, reason }) })
+      await loadAccessGrants()
+    } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) }
+  })
 }
 
 // ── Phase F：成员/角色管理（仅 kb_admin）──
@@ -642,37 +669,37 @@ async function loadAdminGrants() {
 
 // 授予/更新一名部门管理员（owner_depts = 权威全集,提交即覆盖）。成功返回 true。
 async function grantDeptAdmin(userId: string, userName: string, ownerDepts: string[], note: string): Promise<boolean> {
-  if (apprBusy.value) return false
-  apprBusy.value = true
-  try {
-    const s = useSession()
-    if (import.meta.env.DEV && s.token === 'dev-preview') {
-      const i = adminGrants.value.findIndex((a) => a.user_id === userId)
-      const row: AdminItem = { user_id: userId, user_name: userName, role: 'dept_admin', managed_owner_depts: [...ownerDepts] }
-      adminGrants.value = i >= 0 ? adminGrants.value.map((a, k) => (k === i ? row : a)) : [...adminGrants.value, row]
+  return (await withInflight(`member:${userId}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') {
+        const i = adminGrants.value.findIndex((a) => a.user_id === userId)
+        const row: AdminItem = { user_id: userId, user_name: userName, role: 'dept_admin', managed_owner_depts: [...ownerDepts] }
+        adminGrants.value = i >= 0 ? adminGrants.value.map((a, k) => (k === i ? row : a)) : [...adminGrants.value, row]
+        return true
+      }
+      await apiJson('/api/kb/admin-grants', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, user_name: userName, owner_depts: ownerDepts, note }) })
+      await loadAdminGrants()
       return true
-    }
-    await apiJson('/api/kb/admin-grants', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, user_name: userName, owner_depts: ownerDepts, note }) })
-    await loadAdminGrants()
-    return true
-  } catch (e: any) { alert('授予失败：' + uploadErrText(e)); return false } finally { apprBusy.value = false }
+    } catch (e: any) { alert('授予失败：' + uploadErrText(e)); return false }
+  })) ?? false   // 在途（重复点击）→ 视为未提交
 }
 
 // 撤销：ownerDept 指定→撤该一项；为空→撤全部并降级 employee。
 async function revokeAdminGrant(userId: string, ownerDept = ''): Promise<void> {
-  if (apprBusy.value) return
-  apprBusy.value = true
-  try {
-    const s = useSession()
-    if (import.meta.env.DEV && s.token === 'dev-preview') {
-      adminGrants.value = adminGrants.value
-        .map((a) => (a.user_id === userId ? { ...a, managed_owner_depts: ownerDept ? a.managed_owner_depts.filter((d) => d !== ownerDept) : [] } : a))
-        .filter((a) => a.role === 'kb_admin' || a.managed_owner_depts.length > 0)   // 无授权剩余 → 视为降级移出
-      return
-    }
-    await apiJson('/api/kb/admin-grants/revoke', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, owner_dept: ownerDept }) })
-    await loadAdminGrants()
-  } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) } finally { apprBusy.value = false }
+  await withInflight(`member:${userId}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') {
+        adminGrants.value = adminGrants.value
+          .map((a) => (a.user_id === userId ? { ...a, managed_owner_depts: ownerDept ? a.managed_owner_depts.filter((d) => d !== ownerDept) : [] } : a))
+          .filter((a) => a.role === 'kb_admin' || a.managed_owner_depts.length > 0)   // 无授权剩余 → 视为降级移出
+        return
+      }
+      await apiJson('/api/kb/admin-grants/revoke', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, owner_dept: ownerDept }) })
+      await loadAdminGrants()
+    } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) }
+  })
 }
 
 async function retire(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
@@ -718,7 +745,7 @@ export function useKb() {
     // 状态
     docs, filtered, approvals, accessRequests, accessGrants, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir,
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
-    dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
+    dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory, loadErrors,
     // 方法
@@ -739,7 +766,7 @@ export function __resetKb() {
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []
-  apprBusy.value = false; retireBusy.value = false
+  inflight.value = new Set(); retireBusy.value = false
   selectedFiles = []; docsOffset = 0; docsSeq = 0; trackSeq = 0
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (trackTimer) { clearTimeout(trackTimer); trackTimer = null }

@@ -6,7 +6,7 @@ import LoadError from './LoadError.vue'
 
 // 授权申请队列（审批人侧，Phase C）：其他部门申请检索本部门文档 → 由文档所属部门管理员审批。
 // 与「待审批队列」（上传放行，橙头）区分：此处绿头。数据空时整块不渲染（无后端 = 自然隐藏，不造占位噪声）。
-const { accessRequests, apprBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
+const { accessRequests, isBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
 
 function onReject(d: AccessRequestItem) {
   const reason = prompt('驳回原因（可空，将通知申请人）：', '')
@@ -49,12 +49,12 @@ function onReject(d: AccessRequestItem) {
         <button
           type="button"
           class="self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
-          :disabled="apprBusy" @click="onReject(d)"
+          :disabled="isBusy(`acc:${d.id}`)" @click="onReject(d)"
         >驳回</button>
         <button
           type="button"
           class="self-start rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-          :disabled="apprBusy" @click="approveAccess(d)"
+          :disabled="isBusy(`acc:${d.id}`)" @click="approveAccess(d)"
         >授权</button>
       </div>
     </div>

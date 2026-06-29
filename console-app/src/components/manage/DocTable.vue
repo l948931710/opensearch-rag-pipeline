@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
@@ -18,6 +18,9 @@ const chips = computed(() => {
   const present = Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))
   return ['', ...present]
 })
+
+// 自愈：当前筛选的徽章因状态重载消失（chip 已不在）→ 回退「全部」，避免列表空且无高亮 chip 的死角。
+watch(chips, (c) => { if (filter.value && !c.includes(filter.value)) filter.value = '' })
 
 const COLS: { key: SortKey; label: string }[] = [
   { key: 'title', label: '文档名' },
