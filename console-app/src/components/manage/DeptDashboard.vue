@@ -87,6 +87,7 @@ const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
       />
       <p class="ml-0.5 mt-2 text-[11.5px] text-faint">
         这些问题命中了本部门文档却未能答好（拒答）—— 多为文档内容缺漏或表述不清，是最直接的补充/改进线索。
+        <RouterLink to="/contribute" class="font-semibold text-accent-text transition hover:underline">去知识贡献补充 →</RouterLink>
       </p>
     </section>
 

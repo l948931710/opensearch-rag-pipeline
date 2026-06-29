@@ -42,6 +42,24 @@ const BADGE_TONE: Record<string, string> = {
 }
 export const badgeTone = (badge: string) => BADGE_TONE[badge] || 'muted'
 
+// 知识贡献的 5 态徽章（state 码由后端 contribution_state 折叠 review/ingestion 两生命周期而来）
+// → 文案 + 色调键（与 StatusPill 的 st-* 同一套）。与文档/队列徽章独立，勿合并。
+export const CONTRIB_STATE: Record<string, { label: string; tone: string }> = {
+  pending: { label: '待审核', tone: 'warn' },
+  registering: { label: '已采纳·待入库', tone: 'busy' },
+  searchable: { label: '已入库', tone: 'live' },
+  failed: { label: '入库失败', tone: 'fail' },
+  rejected: { label: '已驳回', tone: 'muted' },
+}
+export const contribStateLabel = (s: string) => CONTRIB_STATE[s]?.label || s
+export const contribStateTone = (s: string) => CONTRIB_STATE[s]?.tone || 'muted'
+
+// 缺口来源 → 中文短标。no_result=检索没召回（缺文档）；refusal=召回了但没答好（深度/口径差）。
+export const GAP_KIND_LABEL: Record<string, string> = {
+  no_result: '没有相关文档', refusal: '答案不够好',
+}
+export const gapKindLabel = (k: string) => GAP_KIND_LABEL[k] || ''
+
 // 上传队列内部态（批量行用）→ 色调；与文档徽章是两套独立状态机，勿合并。
 const QBADGE_TONE: Record<string, string> = {
   已提交: 'live', 失败: 'fail', 跳过: 'fail', 上传中: 'busy', 登记中: 'busy', 排队: 'queue',

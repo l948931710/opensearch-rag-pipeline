@@ -2,11 +2,12 @@
 import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Library, Sun, Moon, Trash2 } from 'lucide-vue-next'
+import { Plus, Search, Library, Lightbulb, Sun, Moon, Trash2 } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useTheme } from '@/composables/useTheme'
 import { useAsk } from '@/composables/useAsk'
 import { useKb } from '@/composables/useKb'
+import { useContribute } from '@/composables/useContribute'
 import { ROLE_LABEL } from '@/lib/kb'
 
 // Atlas 式侧栏：默认 56px 图标轨，悬停/聚焦展开成 272px 浮层（覆盖内容、不挤压重排）。
@@ -19,12 +20,14 @@ const { identity, role, canManage } = storeToRefs(session)
 const { theme, toggle } = useTheme()
 const { activeId, newConversation, switchTo, removeConversation, searchConversations } = useAsk()
 const { reviewCount } = useKb()   // 待你审核数（红点/角标）；App.vue 在 ready 后已预加载，故入口红点即时可见
+const { reviewCount: contribReviewCount } = useContribute()   // 待审核的知识贡献数（管理员）
 const route = useRoute()
 const router = useRouter()
 
 const q = ref('')
 const convs = computed(() => searchConversations(q.value))
 const onManage = computed(() => route?.path === '/manage')
+const onContribute = computed(() => route?.path === '/contribute')
 function isActiveConv(id: string) { return route?.path === '/' && id === activeId.value }
 
 function onNewChat() { newConversation(); if (route.path !== '/') void router.push('/') }
@@ -103,8 +106,29 @@ const reveal = 'opacity-0 transition-opacity duration-200 group-hover/sb:opacity
         </p>
       </nav>
 
-      <!-- 知识库入口 + 主题 -->
+      <!-- 知识贡献 + 知识库入口 + 主题 -->
       <div class="space-y-1 border-t border-border px-2 py-2">
+        <RouterLink
+          to="/contribute"
+          class="flex h-10 items-center rounded-lg text-muted-foreground transition hover:text-foreground group-hover/sb:hover:bg-accent-soft"
+          active-class="!text-accent-text !font-semibold"
+        >
+          <span class="relative grid size-10 shrink-0 place-items-center">
+            <span class="grid size-8 place-items-center rounded-[10px] border transition-colors"
+                  :class="onContribute ? 'border-transparent bg-accent-soft' : 'border-border bg-surface group-hover/sb:!border-transparent group-hover/sb:!bg-transparent'"><Lightbulb :size="19" :stroke-width="1.75" /></span>
+            <span
+              v-if="canManage && contribReviewCount"
+              class="absolute right-1.5 top-1.5 size-2 rounded-full bg-st-warn ring-2 ring-sidebar transition-opacity group-hover/sb:opacity-0 group-focus-within/sb:opacity-0"
+              aria-hidden="true"
+            />
+          </span>
+          <span class="truncate text-sm font-medium" :class="reveal">知识贡献</span>
+          <span
+            v-if="canManage && contribReviewCount"
+            class="ml-auto mr-1 grid h-[18px] min-w-[18px] shrink-0 place-items-center rounded-full bg-st-warn px-1.5 text-[10px] font-bold tabular-nums text-white"
+            :class="reveal" :aria-label="`待审核贡献 ${contribReviewCount} 项`"
+          >{{ contribReviewCount }}</span>
+        </RouterLink>
         <RouterLink
           to="/manage"
           class="flex h-10 items-center rounded-lg text-muted-foreground transition hover:text-foreground group-hover/sb:hover:bg-accent-soft"

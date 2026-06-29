@@ -40,15 +40,17 @@ describe('Sidebar — 新会话/知识库入口/角色标签', () => {
     const w = mountWith(Sidebar, identity({ canManage: true }))
     expect(w.text()).toContain('新会话')
     expect(w.find('input[type="search"]').exists()).toBe(true)   // 搜索对话
-    const links = w.findAll('a.rl')                              // 聊天走会话列表（非 RouterLink）；唯一链接 = /manage
-    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/manage'])
+    const links = w.findAll('a.rl')                              // 聊天走会话列表（非 RouterLink）；导航链接 = /contribute + /manage
+    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/contribute', '/manage'])
+    expect(w.text()).toContain('知识贡献')
     expect(w.text()).toContain('知识库管理')
   })
 
-  it('普通员工：知识库入口存在（标签精简为「知识库」，非管理）', () => {
+  it('普通员工：知识贡献 + 知识库入口存在（库标签精简为「知识库」，非管理）', () => {
     const w = mountWith(Sidebar, identity({ canManage: false, role: 'employee' }))
     const links = w.findAll('a.rl')
-    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/manage'])
+    expect(links.map((l) => l.attributes('data-to'))).toEqual(['/contribute', '/manage'])  // 知识贡献员工也可见
+    expect(w.text()).toContain('知识贡献')
     expect(w.text()).toContain('知识库')
     expect(w.text()).not.toContain('知识库管理')
   })
@@ -89,10 +91,12 @@ describe('ManageView — 按角色分流', () => {
 })
 
 describe('router — 路由表 + base 单一来源', () => {
-  it('注册 qa / manage；manage 标记 requiresManage', () => {
+  it('注册 qa / manage / contribute；manage 标记 requiresManage，contribute 不标记', () => {
     expect(router.hasRoute('qa')).toBe(true)
     expect(router.hasRoute('manage')).toBe(true)
+    expect(router.hasRoute('contribute')).toBe(true)
     expect(router.resolve('/manage').meta.requiresManage).toBe(true)
+    expect(router.resolve('/contribute').meta.requiresManage).toBeFalsy()   // 员工可访问
   })
 
   it('未知路径回落到 /（catch-all 重定向已配置）', () => {
