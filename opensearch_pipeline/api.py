@@ -2915,6 +2915,12 @@ def kb_retire(req: KbRetireRequest, request: Request,
                 # 漏删而无限期滞留。退役语义是「整篇下线」，故停全部活跃 chunk（stage-3 reconcile 再兜底 HA3）。
                 cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=0 "
                             "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
+                # 审计行入【同事务】（commit 前、同 cursor）：与退役变更原子提交，杜绝 commit 与审计之间
+                # 崩溃丢记录的窗口（B1）。失败 → 整笔回滚 → 500 可重试。
+                write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RETIRE_REQUEST",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}",
+                            cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -2923,9 +2929,6 @@ def kb_retire(req: KbRetireRequest, request: Request,
     except Exception as e:
         logger.error("kb_retire 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"退役失败 (trace: {trace_id})")
-    write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RETIRE_REQUEST",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}")
     return KbRetireResponse(
         doc_id=req.doc_id, retired=True,
         note="已申请退役：已标记下线、停止作为升版目标；从检索彻底移除将在下次维护完成（本操作可逆）")
@@ -2980,6 +2983,10 @@ def kb_restore(req: KbRetireRequest, request: Request,
                 # 重新激活本版本 chunk + 标脏 NOT_INDEXED（下次 stage-3 重推 HA3；若 HA3 未删则为幂等重推）。
                 cur.execute("UPDATE fuling_knowledge.chunk_meta SET is_active=1, index_status='NOT_INDEXED' "
                             "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
+                write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}",
+                            cursor=cur)   # 同事务审计（B1）
             conn.commit()
         finally:
             conn.close()
@@ -2988,9 +2995,6 @@ def kb_restore(req: KbRetireRequest, request: Request,
     except Exception as e:
         logger.error("kb_restore 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"恢复失败 (trace: {trace_id})")
-    write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}")
     return KbRestoreResponse(
         doc_id=req.doc_id, restored=True,
         note="已恢复上线：重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复")
@@ -3475,6 +3479,10 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                     except Exception as _pe:
                         logger.warning("decide allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
                                        doc_id, _pe)
+                # 审计行入【同事务】（commit 前、同 cursor）：与 status 变更 + outbox 入队原子提交（B1）。
+                write_audit(doc_id=doc_id, version_no=None, action_type=f"ACCESS_REQUEST_{decision.upper()}",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"req_id={req.id} owner={owner_dept}", cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -3483,9 +3491,6 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
     except Exception as e:
         logger.error("kb_access_request_%s 失败 [trace=%s]: %s", decision, trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"操作失败 (trace: {trace_id})")
-    write_audit(doc_id=doc_id, version_no=None, action_type=f"ACCESS_REQUEST_{decision.upper()}",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"req_id={req.id} owner={owner_dept}")
     return KbAccessDecisionResponse(id=req.id, status=decision, decided=True, already=False)
 
 
@@ -3607,6 +3612,10 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
                                 "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
                                 "note=VALUES(note), updated_at=NOW()",
                                 (uid, owner, kb.user_id, note))
+                # 同事务审计（B1）：与角色/授权变更原子提交。
+                write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"grant dept_admin {uid} → {','.join(depts)}", cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -3615,9 +3624,6 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
     except Exception as e:
         logger.error("kb_admin_grant 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"授予部门管理员失败 (trace: {trace_id})")
-    write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"grant dept_admin {uid} → {','.join(depts)}")
     return KbAdminGrantResponse(user_id=uid, role=ROLE_DEPT_ADMIN, managed_owner_depts=depts, ok=True)
 
 
@@ -3663,6 +3669,10 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
                     cur.execute("UPDATE fuling_knowledge.user_role SET role=%s, updated_at=NOW() "
                                 "WHERE user_id=%s", (ROLE_EMPLOYEE, uid))
                     demoted = True
+                # 同事务审计（B1）：与撤销/降级变更原子提交。
+                write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_REVOKE",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"revoke {uid} owner={owner or 'ALL'} demoted={demoted}", cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -3671,9 +3681,6 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
     except Exception as e:
         logger.error("kb_admin_grant_revoke 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"撤销部门管理员授权失败 (trace: {trace_id})")
-    write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_REVOKE",
-                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                message=f"revoke {uid} owner={owner or 'ALL'} demoted={demoted}")
     return KbAdminGrantResponse(user_id=uid, role=(ROLE_EMPLOYEE if demoted else "dept_admin"), ok=True)
 
 
