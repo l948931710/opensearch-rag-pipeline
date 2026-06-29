@@ -126,6 +126,7 @@ def issue_session_token(
         ttl = _default_session_ttl_seconds()   # 调用期重解析，随 RAG_SESSION_TOKEN_TTL_HOURS
     groups = _coerce_acl_groups(dept)
     payload = {
+        "typ": "session",            # 令牌类型判别：堵住 upload token（typ=kb_upload）被当会话令牌复用
         "uid": user_id,
         "acl_groups": groups,        # 权威：权限组数组
         "dept": ",".join(groups),    # 旧·兼容：CSV（单值时与历史标量一致）
@@ -160,6 +161,12 @@ def verify_session_token(token: str) -> Optional[dict]:
         return None
 
     if not isinstance(payload, dict) or not payload.get("uid"):
+        return None
+    # 令牌类型判别：拒绝携带【非 session】typ 的令牌（如 sign_payload 颁发的 upload token
+    # typ=kb_upload），否则它带 uid+exp+合法签名即可冒充会话令牌建立身份。向后兼容——
+    # 旧版会话令牌无 typ 键，在 TTL 抽干窗口内仍放行（payload.get("typ") is None）。
+    typ = payload.get("typ")
+    if typ is not None and typ != "session":
         return None
     if int(payload.get("exp", 0)) < int(time.time()):
         return None
