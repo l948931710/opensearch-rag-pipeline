@@ -169,8 +169,10 @@ class TestVisualKnowledgeServing:
                 pass
 
             def fetchall(self):
-                # 批量化后查询会 SELECT doc_id 并按 doc_id 分组；chunk_index 落在中心 5 的 ±1 内
-                return [{"doc_id": "D", "chunk_index": 5, "chunk_text": "邻居文本", "section_title": ""}]
+                # 批量化后查询 SELECT doc_id+version_no，按 (doc_id, version_no) 分组；chunk_index
+                # 落在中心 5 的 ±1 内。version_no=0 与中心（无 version_no→0）同桶，方能命中。
+                return [{"doc_id": "D", "version_no": 0, "chunk_index": 5,
+                         "chunk_text": "邻居文本", "section_title": ""}]
 
             def close(self):
                 pass

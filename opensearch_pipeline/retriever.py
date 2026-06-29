@@ -438,7 +438,9 @@ def _search_chunks_opensearch(
         timeout=30,
     )
 
-    perm_should = [{"term": {"kb_type": "public"}}]
+    # public 子句统一用 permission_level（与下方 dept/allowed_depts 分支及 HA3
+    # _build_permission_filter 同字段）——此前用 kb_type 造成本地回退路径字段漂移（field-drift）。
+    perm_should = [{"term": {"permission_level": "public"}}]
     groups = _normalize_acl_groups(user_dept)  # 多组：term→terms（净化+白名单后的组列表）
     if groups:
         perm_should.append({"bool": {"must": [
@@ -718,7 +720,7 @@ def stitch_neighbor_chunks(
 
     实现细节：
       - 从 RDS chunk_meta 查询邻居（<10ms per query）
-      - 按 (doc_id, chunk_index) 去重，不跨文档边界
+      - 按 (doc_id, version_no, chunk_index) 去重，不跨文档边界、不跨版本（双活版本窗口安全）
       - 同一个文档内的邻居 chunk 按 chunk_index 排序后拼接文本
       - 保留原始检索 chunk 的 score / metadata
 
@@ -738,8 +740,8 @@ def stitch_neighbor_chunks(
         # 用占位符保留输出顺序，并按 (doc_id, center_idx) 去重（重复中心整条丢弃，与原行为一致）。
         expanded: List[Optional[Dict[str, Any]]] = []
         seen_centers = set()
-        pending = []          # (slot, chunk, doc_id, center_idx)
-        ranges = []           # (doc_id, lo, hi)
+        pending = []          # (slot, chunk, doc_id, center_idx, center_ver)
+        ranges = []           # (doc_id, center_ver, lo, hi)
 
         for chunk in chunks:
             doc_id = chunk.get("doc_id", "")
@@ -750,18 +752,30 @@ def stitch_neighbor_chunks(
                 expanded.append(chunk)
                 continue
 
-            center_key = (doc_id, center_idx)
+            # 版本号：邻居必须与中心【同文档同版本】。chunk_meta 的 (doc_id, chunk_index) 跨版本
+            # 不唯一——双活版本窗口（新版已 INDEXED、旧版尚未 deactivate；或部分失败长期双活）下
+            # 两版本 chunk_index 重叠，不带 version_no 约束会把【别版本】文本拼进答案上下文。
+            # HA3 多值字段可能回列表（与 chunk_type 同），防御性归一为 int，失败退 0（= 不拼别版本）。
+            _cv = chunk.get("version_no", 0)
+            if isinstance(_cv, (list, tuple)):
+                _cv = _cv[0] if _cv else 0
+            try:
+                center_ver = int(_cv)
+            except (TypeError, ValueError):
+                center_ver = 0
+
+            center_key = (doc_id, center_ver, center_idx)
             if center_key in seen_centers:
                 continue  # 重复中心：丢弃（hit A 的邻居恰是 hit B 的中心）
             seen_centers.add(center_key)
 
             slot = len(expanded)
             expanded.append(None)  # 占位，批量查询后回填
-            pending.append((slot, chunk, doc_id, center_idx))
-            ranges.append((doc_id, center_idx - window, center_idx + window))
+            pending.append((slot, chunk, doc_id, center_idx, center_ver))
+            ranges.append((doc_id, center_ver, center_idx - window, center_idx + window))
 
         # 只有存在待拼接 chunk 时才连库
-        neighbors_by_doc: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        neighbors_by_doc: Dict[tuple, Dict[int, Dict[str, Any]]] = {}
         if pending:
             import pymysql.cursors
             from opensearch_pipeline.pipeline_nodes import _get_db_conn
@@ -771,24 +785,25 @@ def stitch_neighbor_chunks(
             try:
                 where_parts = []
                 params: List[Any] = []
-                for doc_id, lo, hi in ranges:
-                    where_parts.append("(doc_id = %s AND chunk_index BETWEEN %s AND %s)")
-                    params.extend([doc_id, lo, hi])
+                for doc_id, ver, lo, hi in ranges:
+                    where_parts.append("(doc_id = %s AND version_no = %s AND chunk_index BETWEEN %s AND %s)")
+                    params.extend([doc_id, ver, lo, hi])
                 cursor.execute(
-                    "SELECT doc_id, chunk_index, chunk_text, section_title, "
+                    "SELECT doc_id, version_no, chunk_index, chunk_text, section_title, "
                     "       permission_level, owner_dept "
                     "FROM chunk_meta WHERE is_active = 1 AND (" + " OR ".join(where_parts) + ")",
                     tuple(params),
                 )
                 for row in cursor.fetchall():
-                    neighbors_by_doc.setdefault(row["doc_id"], {})[row["chunk_index"]] = row
+                    # 按 (doc_id, version_no) 分桶 → 中心只取本版本邻居（防跨版本拼接）
+                    neighbors_by_doc.setdefault((row["doc_id"], row["version_no"]), {})[row["chunk_index"]] = row
             finally:
                 cursor.close()
                 conn.close()
 
         # 第二遍：回填每个待拼接 chunk 的拼接文本（按 chunk_index 升序，含中心本身）
-        for slot, chunk, doc_id, center_idx in pending:
-            doc_neighbors = neighbors_by_doc.get(doc_id, {})
+        for slot, chunk, doc_id, center_idx, center_ver in pending:
+            doc_neighbors = neighbors_by_doc.get((doc_id, center_ver), {})
             lo, hi = center_idx - window, center_idx + window
             # H4 防御纵深：邻居必须与中心 chunk 同权限（同文档本应一致），否则丢弃
             neighbor_rows = [

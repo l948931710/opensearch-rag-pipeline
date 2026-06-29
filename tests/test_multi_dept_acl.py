@@ -113,6 +113,9 @@ def test_opensearch_fallback_uses_terms(monkeypatch):
                                         user_dept=["marketing", "production"])
 
     perm_should = captured["body"]["query"]["bool"]["filter"][0]["bool"]["should"]
+    # field-drift 回归：public 子句必须用 permission_level（与 dept/allowed_depts 分支及 HA3
+    # _build_permission_filter 同字段），不得回退到 kb_type。
+    assert perm_should[0] == {"term": {"permission_level": "public"}}, perm_should
     dept_clauses = [c for c in perm_should if "bool" in c]
     assert dept_clauses, perm_should
     terms = [m for m in dept_clauses[0]["bool"]["must"] if "terms" in m]
