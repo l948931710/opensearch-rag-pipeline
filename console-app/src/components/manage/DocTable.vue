@@ -5,11 +5,12 @@ import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
+import LoadError from './LoadError.vue'
 
 const {
   docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
   setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
-  openAccessRequest, accessStateOf, loadMoreDocs,
+  openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
 } = useKb()
 
 // 状态筛选 chip：从已加载文档里取出现过的徽章（+ 全部）。
@@ -81,6 +82,8 @@ async function onRestore(d: DocItem) {
       <Lock :size="13" :stroke-width="1.75" class="mt-0.5 shrink-0 text-faint" />
       <span>全部门为只读视图：其他部门文档不可直接管理；如需让本部门可检索，点「申请授权」由文档所属部门管理员审批。（不含受限文档）</span>
     </div>
+
+    <LoadError class="mt-3" :message="loadErrors['docs']" @retry="loadDocs()" />
 
     <!-- 状态筛选 chips -->
     <div class="mt-3 flex flex-wrap gap-1.5">

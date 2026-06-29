@@ -6,11 +6,12 @@ import { deptLabel } from '@/lib/kb'
 import StatusDistBar from './StatusDistBar.vue'
 import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
+import LoadError from './LoadError.vue'
 
 // 部门管理员「概览看板」= 本部门视角。/api/kb/stats 已按 managed owner_dept 作用域聚合，
 // 故资产/状态口径只覆盖本部门。「待审核」用 by_badge（= 我提交、待 kb_admin 放行的版本）。
 // 使用成效/知识缺口取自 /api/kb/insights（retrieved_docs_json→doc_id→owner_dept 归属，本部门文档）。
-const { kbStats, kbInsights } = useKb()
+const { kbStats, kbInsights, loadStats, loadInsights, loadErrors } = useKb()
 const b = (k: string) => kbStats.value?.by_badge?.[k] || 0
 const fmtN = (n?: number) => (n || 0).toLocaleString('en-US')
 const pct = (x?: number) => (x === undefined ? '—' : (x * 100).toFixed(1) + '%')
@@ -59,6 +60,7 @@ const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
     <!-- 本部门概览（含状态分布） -->
     <section>
       <p :class="HEADER">概览</p>
+      <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
       <div :class="GRID">
         <StatCard v-for="s in cards" :key="s.label" v-bind="s" />
       </div>
@@ -88,10 +90,11 @@ const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
       </p>
     </section>
 
-    <!-- 使用数据尚未就绪（端点未接入/加载中）→ 如实占位，不显 0 误导 -->
+    <!-- 使用数据尚未就绪（端点未接入/加载中）→ 如实占位，不显 0 误导；真实失败（5xx）→ 错误条 + 重试 -->
     <section v-else>
       <p :class="HEADER">使用成效 · 知识缺口</p>
-      <div class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
+      <LoadError :message="loadErrors['insights']" @retry="loadInsights()" />
+      <div v-if="!loadErrors['insights']" class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
         使用成效与知识缺口数据加载中（需后端 <code class="font-mono text-[11.5px]">/api/kb/insights</code>）；稍后自动呈现。
       </div>
     </section>

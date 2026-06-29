@@ -2,10 +2,11 @@
 import { ShieldCheck, FileText } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem } from '@/composables/useKb'
+import LoadError from './LoadError.vue'
 
 // 已授权清单（审批人侧）：本部门文档现行有效（approved 存量）的跨部门检索授权，可撤销（approved→revoked）。
 // 与「授权申请」（pending 待审批）区分：此处是已放行的存量，活跃态调（st-live）。空时整块不渲染。
-const { accessGrants, apprBusy, revokeAccess } = useKb()
+const { accessGrants, apprBusy, revokeAccess, loadAccessGrants, loadErrors } = useKb()
 
 // requester_depts 为逗号分隔组码（多部门管理员可一次授予多组）→ 逐个 deptLabel 再拼。
 const reqLabel = (csv: string) => csv.split(',').map((c) => deptLabel(c.trim())).filter(Boolean).join('、')
@@ -19,9 +20,10 @@ function onRevoke(g: AccessGrantItem) {
 </script>
 
 <template>
-  <section v-if="accessGrants.length">
+  <section v-if="accessGrants.length || loadErrors['accessGrants']">
     <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">已授权</p>
-    <div class="overflow-hidden rounded-[15px] border border-border bg-card">
+    <LoadError class="mb-2.5" :message="loadErrors['accessGrants']" @retry="loadAccessGrants()" />
+    <div v-if="accessGrants.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 活跃态头（st-live，区别于待审批的绿/橙头） -->
       <div class="flex items-center gap-2.5 border-b border-border bg-st-live/10 px-[18px] py-3">
         <ShieldCheck :size="16" :stroke-width="1.75" class="text-st-live" />

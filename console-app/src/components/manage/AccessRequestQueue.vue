@@ -2,10 +2,11 @@
 import { Lock, FileText } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessRequestItem } from '@/composables/useKb'
+import LoadError from './LoadError.vue'
 
 // 授权申请队列（审批人侧，Phase C）：其他部门申请检索本部门文档 → 由文档所属部门管理员审批。
 // 与「待审批队列」（上传放行，橙头）区分：此处绿头。数据空时整块不渲染（无后端 = 自然隐藏，不造占位噪声）。
-const { accessRequests, apprBusy, approveAccess, rejectAccess } = useKb()
+const { accessRequests, apprBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
 
 function onReject(d: AccessRequestItem) {
   const reason = prompt('驳回原因（可空，将通知申请人）：', '')
@@ -15,9 +16,10 @@ function onReject(d: AccessRequestItem) {
 </script>
 
 <template>
-  <section v-if="accessRequests.length">
+  <section v-if="accessRequests.length || loadErrors['accessRequests']">
     <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">授权申请</p>
-    <div class="overflow-hidden rounded-[15px] border border-border bg-card">
+    <LoadError class="mb-2.5" :message="loadErrors['accessRequests']" @retry="loadAccessRequests()" />
+    <div v-if="accessRequests.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 绿头（区别于上传审批的橙头） -->
       <div class="flex items-center gap-2.5 border-b border-border bg-accent-soft px-[18px] py-3">
         <Lock :size="16" :stroke-width="1.75" class="text-accent-text" />

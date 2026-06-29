@@ -2,9 +2,10 @@
 import { Clock, FileText } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
+import LoadError from './LoadError.vue'
 
 // 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
-const { approvals, apprBusy, isKbAdmin, approve, reject } = useKb()
+const { approvals, apprBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors } = useKb()
 
 function onReject(d: PendingItem) {
   const reason = prompt('驳回原因（可空）：', '')
@@ -14,9 +15,10 @@ function onReject(d: PendingItem) {
 </script>
 
 <template>
-  <section v-if="isKbAdmin && approvals.length">
+  <section v-if="isKbAdmin && (approvals.length || loadErrors['approvals'])">
     <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">待审批</p>
-    <div class="overflow-hidden rounded-[15px] border border-border bg-card">
+    <LoadError class="mb-2.5" :message="loadErrors['approvals']" @retry="loadApprovals()" />
+    <div v-if="approvals.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 橙头 -->
       <div class="flex items-center gap-2.5 border-b border-border bg-st-busy/[0.07] px-[18px] py-3">
         <Clock :size="16" :stroke-width="1.75" class="text-st-busy" />

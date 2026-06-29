@@ -3,10 +3,11 @@ import { ref, computed } from 'vue'
 import { UserCog, ShieldCheck, Plus, X } from 'lucide-vue-next'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AdminItem } from '@/composables/useKb'
+import LoadError from './LoadError.vue'
 
 // Phase F 成员/角色管理（kb_admin 专属）：维护部门管理员 + 其可管理 owner_dept（写授权）。
 // 三分授权：读组 ≠ 可管理(dept_admin_grant) ≠ 可授权(本面=kb_admin)。kb_admin 行只读受保护。
-const { adminGrants, grantableDepts, apprBusy, grantDeptAdmin, revokeAdminGrant } = useKb()
+const { adminGrants, grantableDepts, apprBusy, grantDeptAdmin, revokeAdminGrant, loadAdminGrants, loadErrors } = useKb()
 
 const formUser = ref('')
 const formName = ref('')
@@ -42,6 +43,7 @@ function onRevokeDept(a: AdminItem, d: string) {
 <template>
   <section>
     <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">成员 / 角色管理</p>
+    <LoadError class="mb-2.5" :message="loadErrors['adminGrants']" @retry="loadAdminGrants()" />
     <div class="overflow-hidden rounded-[15px] border border-border bg-card">
       <div class="flex items-center gap-2.5 border-b border-border bg-accent-soft px-[18px] py-3">
         <UserCog :size="16" :stroke-width="1.75" class="text-accent-text" />

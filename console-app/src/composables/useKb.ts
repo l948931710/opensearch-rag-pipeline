@@ -1,5 +1,5 @@
 import { computed, ref } from 'vue'
-import { apiJson } from '@/lib/api'
+import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import {
   MAX_UPLOAD_MB, TERMINAL_BADGES, putWithProgress, uploadErrText, buildDupMsg, fileCore, type DupDoc,
@@ -140,6 +140,15 @@ let trackSeq = 0
 let qTimer: ReturnType<typeof setTimeout> | null = null
 let trackTimer: ReturnType<typeof setTimeout> | null = null   // 当前轮询定时器句柄（可取消）
 
+// 各分区加载错误（key→提示文案）。诚实区分：404（端点未上线，Phase C/D 可选）→ 静默兜底空；
+// 5xx/网络/其他 → 置错误条，组件显「加载失败 + 重试」，不再把服务端故障伪装成「无数据」。
+const loadErrors = ref<Record<string, string>>({})
+function noteLoadError(key: string, e: unknown) {
+  if (e instanceof ApiError && e.status === 404) { delete loadErrors.value[key]; return }
+  loadErrors.value[key] = '加载失败，请重试'
+}
+function clearLoadError(key: string) { delete loadErrors.value[key] }
+
 function sortDocs(list: DocItem[], key: SortKey, dir: 1 | -1): DocItem[] {
   return [...list].sort((a, b) => {
     let r: number
@@ -181,6 +190,7 @@ async function loadDocs() {
   const seq = ++docsSeq
   loadingDocs.value = true
   docsOffset = 0
+  clearLoadError('docs')
   try {
     // DEV ?preview：注入 mock（含外部门 can_manage=false 行）以可视化全部门只读浏览；prod 死代码消除。
     if (import.meta.env.DEV && useSession().token === 'dev-preview') {
@@ -203,7 +213,7 @@ async function loadDocs() {
     if (seq !== docsSeq) return            // 竞态守卫：仅最新结果落地
     docs.value = r.items || []
     hasMoreDocs.value = !!r.has_more       // 服务端探测到下一页 → 显「加载更多」
-  } catch { /* 保留旧表 */ } finally { if (seq === docsSeq) loadingDocs.value = false }
+  } catch (e) { if (seq === docsSeq) noteLoadError('docs', e) /* 保留旧表 */ } finally { if (seq === docsSeq) loadingDocs.value = false }
 }
 
 // 加载下一页并【追加】到当前列表（不自增 docsSeq：追加属于当前列表；期间若 loadDocs/换 scope/搜索
@@ -282,7 +292,8 @@ async function loadStats() {
       : { total: 42, active: 40, retired: 2, chunks: 612, new_this_month: 6, by_badge: { 已上线: 38, 待审核: 3, 处理中: 1 } }
     return
   }
-  try { kbStats.value = await apiJson<KbStats>('/api/kb/stats', { auth: true }) } catch { /* 兜底 */ }
+  clearLoadError('stats')
+  try { kbStats.value = await apiJson<KbStats>('/api/kb/stats', { auth: true }) } catch (e) { noteLoadError('stats', e) /* 兜底 */ }
 }
 
 async function loadConfig() {
@@ -311,7 +322,8 @@ async function loadInsights() {
     }
     return
   }
-  try { kbInsights.value = await apiJson<KbInsights>('/api/kb/insights', { auth: true }) } catch { /* 兜底 */ }
+  clearLoadError('insights')
+  try { kbInsights.value = await apiJson<KbInsights>('/api/kb/insights', { auth: true }) } catch (e) { noteLoadError('insights', e) /* 兜底 */ }
 }
 
 async function loadGovernance() {
@@ -356,7 +368,8 @@ async function loadGovernance() {
     }
     return
   }
-  try { kbGovernance.value = await apiJson<KbGovernance>('/api/kb/governance', { auth: true }) } catch { /* 兜底 */ }
+  clearLoadError('governance')
+  try { kbGovernance.value = await apiJson<KbGovernance>('/api/kb/governance', { auth: true }) } catch (e) { noteLoadError('governance', e) /* 兜底 */ }
 }
 
 // 版本历史（点击文档行「历史」）：拉 /api/kb/version-history（后端现成）。
@@ -385,10 +398,11 @@ async function loadApprovals() {
     ]
     return
   }
+  clearLoadError('approvals')
   try {
     const r = await apiJson<{ items: PendingItem[] }>('/api/kb/pending-approvals', { auth: true })
     approvals.value = r.items || []
-  } catch { approvals.value = [] }
+  } catch (e) { approvals.value = []; noteLoadError('approvals', e) }
 }
 
 // ── 升版态 ──
@@ -546,10 +560,11 @@ async function loadAccessRequests() {
     ]
     return
   }
+  clearLoadError('accessRequests')
   try {
     const r = await apiJson<{ items: AccessRequestItem[] }>('/api/kb/access-requests', { auth: true })
     accessRequests.value = r.items || []
-  } catch { accessRequests.value = [] }   // 端点未上线/出错 → 静默空，不阻断
+  } catch (e) { accessRequests.value = []; noteLoadError('accessRequests', e) }   // 404（未上线）静默；5xx 显错
 }
 
 async function approveAccess(d: AccessRequestItem) {
@@ -585,10 +600,11 @@ async function loadAccessGrants() {
     ]
     return
   }
+  clearLoadError('accessGrants')
   try {
     const r = await apiJson<{ items: AccessGrantItem[] }>('/api/kb/access-grants', { auth: true })
     accessGrants.value = r.items || []
-  } catch { accessGrants.value = [] }   // 端点未上线/出错 → 静默空，不阻断
+  } catch (e) { accessGrants.value = []; noteLoadError('accessGrants', e) }   // 404（未上线）静默；5xx 显错
 }
 
 // 撤销【已批准】的跨部门授权（approved→revoked）：后端同事务收窄 allowed_depts 投影 + 标脏，stage-3 收回放行。
@@ -616,11 +632,12 @@ async function loadAdminGrants() {
     grantableDepts.value = ['marketing', 'production', 'quality', 'finance', 'hr', 'supply', 'pmc', 'rd', 'admin', 'it']
     return
   }
+  clearLoadError('adminGrants')
   try {
     const r = await apiJson<{ items: AdminItem[]; grantable_owner_depts: string[] }>('/api/kb/admin-grants', { auth: true })
     adminGrants.value = r.items || []
     grantableDepts.value = r.grantable_owner_depts || []
-  } catch { adminGrants.value = []; grantableDepts.value = [] }   // 端点未上线/非 kb_admin → 静默空
+  } catch (e) { adminGrants.value = []; grantableDepts.value = []; noteLoadError('adminGrants', e) }   // 404 静默；5xx 显错
 }
 
 // 授予/更新一名部门管理员（owner_depts = 权威全集,提交即覆盖）。成功返回 true。
@@ -703,7 +720,7 @@ export function useKb() {
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, apprBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
-    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory,
+    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory, loadErrors,
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, setScope,
@@ -716,7 +733,7 @@ export function useKb() {
 
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false
+  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null

@@ -131,6 +131,40 @@ describe('useKb 分页（has_more / loadMoreDocs）', () => {
   })
 })
 
+describe('useKb 加载错误态（404 静默 / 5xx 显错 + 重试清除）', () => {
+  it('my-docs 5xx → loadErrors.docs 置；404 → 静默空', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({ detail: 'boom' }, { ok: false, status: 500 })))
+    const kb = useKb()
+    await kb.loadDocs()
+    expect(kb.loadErrors.value.docs).toBeTruthy()
+
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({ detail: 'not found' }, { ok: false, status: 404 })))
+    await kb.loadDocs()
+    expect(kb.loadErrors.value.docs).toBeUndefined()   // 404（端点未上线）静默，不当作错误
+  })
+
+  it('governance 5xx → loadErrors.governance；重试成功后清除', async () => {
+    setIdentity('kb_admin', ['hr'])
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({}, { ok: false, status: 503 })))
+    const kb = useKb()
+    await kb.loadGovernance()
+    expect(kb.loadErrors.value.governance).toBeTruthy()
+
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({ window_days: 30, dept_coverage: [] }, { ok: true, status: 200 })))
+    await kb.loadGovernance()
+    expect(kb.loadErrors.value.governance).toBeUndefined()   // 成功 → 清错误条
+  })
+
+  it('access-requests 404（Phase C 未上线）→ 静默空、不置错误', async () => {
+    setIdentity('dept_admin', ['hr'])
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({}, { ok: false, status: 404 })))
+    const kb = useKb()
+    await kb.loadAccessRequests()
+    expect(kb.accessRequests.value).toEqual([])
+    expect(kb.loadErrors.value.accessRequests).toBeUndefined()
+  })
+})
+
 describe('useKb 上传（两段式：upload-url → PUT → register）', () => {
   it('单文件新建成功：进度→已提交，含内容查重提示', async () => {
     vi.stubGlobal('fetch', routeFetch({
