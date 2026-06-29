@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +57,7 @@ from opensearch_pipeline.answer_flow import (
     should_append_history,
 )
 from opensearch_pipeline.config import get_config
+from opensearch_pipeline.request_context import RequestIdMiddleware, get_request_id
 from opensearch_pipeline.session_store import (
     MAX_HISTORY_TURNS,
     append_to_history,
@@ -135,6 +135,10 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# 请求级 correlation id（统一 trace，OBS-trace）：纯 ASGI 中间件，入站读/生成 X-Request-Id 存入
+# ContextVar（端点与嵌套 retriever/llm_generator 调用可见）、响应头回写。最后 add → 最外层 → 最先跑。
+app.add_middleware(RequestIdMiddleware)
 
 # 钉钉机器人路由
 app.include_router(dingtalk_router)
@@ -473,7 +477,7 @@ def search(req: SearchRequest, request: Request,
         user_dept = identity.acl_groups if identity else None
         results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept)
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
 
@@ -518,7 +522,7 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_i
             cosurface_images=cosurface_images,
         )
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
 
@@ -594,7 +598,7 @@ def ask(req: AskRequest, request: Request,
                 pure_text=req.pure_text,
             )
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("LLM generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
         # 失败也落库：此前这里只回 500、不留任何记录，是四条链路中唯一的"无痕失败"
         log_qa_session(**build_qa_log_kwargs(
@@ -805,7 +809,7 @@ def ask_stream(req: AskRequest, request: Request,
 
             except Exception as e:
                 answer_status = "LLM_ERROR"
-                trace_id = uuid.uuid4().hex[:8]
+                trace_id = get_request_id()
                 error_message = f"[trace={trace_id}] {str(e)[:500]}"
                 logger.error("Stream generation failed [trace=%s]: %s", trace_id, e, exc_info=True)
                 error_msg = json.dumps({"type": "error", "message": f"回答生成失败，请联系管理员 (trace: {trace_id})"}, ensure_ascii=False)
@@ -1006,7 +1010,7 @@ def history(
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("history 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"历史记录查询失败 (trace: {trace_id})")
 
@@ -1081,7 +1085,7 @@ def list_conversations(request: Request, limit: int = 30, offset: int = 0,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("list_conversations 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"会话列表查询失败 (trace: {trace_id})")
     has_more = len(rows) > limit
@@ -1122,7 +1126,7 @@ def get_conversation(conversation_id: str, request: Request,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("get_conversation 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"会话读取失败 (trace: {trace_id})")
     items: List[HistoryItem] = []
@@ -1175,7 +1179,7 @@ def delete_conversation(conversation_id: str, request: Request,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("delete_conversation 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"会话删除失败 (trace: {trace_id})")
     return DeleteConversationResponse(deleted=True)
@@ -1653,7 +1657,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     except HTTPException:
         raise
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_my_docs 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"文档列表查询失败 (trace: {trace_id})")
 
@@ -1740,7 +1744,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     except HTTPException:
         raise
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_browse 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"全部门浏览查询失败 (trace: {trace_id})")
 
@@ -1824,7 +1828,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     except HTTPException:
         raise
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_stats 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"统计查询失败 (trace: {trace_id})")
     active = retired = 0
@@ -1917,7 +1921,7 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     except HTTPException:
         raise
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_insights 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"洞察查询失败 (trace: {trace_id})")
     fails = 0   # 子查询失败计数；全失败 = 连接级故障 → 诚实 500（而非 all-zeros 伪装无数据）
@@ -1980,7 +1984,7 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     finally:
         conn.close()
     if fails >= 4:   # 4 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非 0
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_insights 全部子查询失败 [trace=%s]", trace_id)
         raise HTTPException(status_code=500, detail=f"洞察查询失败 (trace: {trace_id})")
     return out
@@ -2087,7 +2091,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
     except HTTPException:
         raise
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_governance 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"治理查询失败 (trace: {trace_id})")
     fails = 0   # 子查询失败计数；全失败 = 连接级故障 → 诚实 500（而非 all-zeros 伪装健康）
@@ -2357,7 +2361,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
     finally:
         conn.close()
     if fails >= 13:   # 13 条子查询全失败 = 连接级故障：诚实 500，前端据此显「加载中」而非伪造健康
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_governance 全部子查询失败 [trace=%s]", trace_id)
         raise HTTPException(status_code=500, detail=f"治理查询失败 (trace: {trace_id})")
     return out
@@ -2419,7 +2423,7 @@ def kb_version_history(request: Request, doc_id: str,
     except HTTPException:
         raise
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_version_history 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"版本历史查询失败 (trace: {trace_id})")
 
@@ -2474,7 +2478,7 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
     except HTTPException:
         raise
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_doc_status 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"文档状态查询失败 (trace: {trace_id})")
 
@@ -2607,7 +2611,7 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         except HTTPException:
             raise
         except Exception as e:
-            trace_id = uuid.uuid4().hex[:8]
+            trace_id = get_request_id()
             logger.error("upload-url 查 doc 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
             raise HTTPException(status_code=500, detail=f"查询文档失败 (trace: {trace_id})")
         if not row:
@@ -2702,7 +2706,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
     appr = "PENDING" if requires_approval else "APPROVED"
     action = payload.get("action", "new")
     bucket = cfg.oss.bucket_name
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
 
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
@@ -2833,7 +2837,7 @@ def kb_approve(req: KbApprovalRequest, request: Request,
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     assert_metadata_write_allowed("kb_approve", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn()
@@ -2874,7 +2878,7 @@ def kb_reject(req: KbApprovalRequest, request: Request,
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     assert_metadata_write_allowed("kb_reject", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
         conn = _get_db_conn()
@@ -2920,7 +2924,7 @@ def kb_retire(req: KbRetireRequest, request: Request,
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     assert_metadata_write_allowed("kb_retire", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     owner_dept = perm = ""
     cur_ver = 1
     try:
@@ -2991,7 +2995,7 @@ def kb_restore(req: KbRetireRequest, request: Request,
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     assert_metadata_write_allowed("kb_restore", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     owner_dept = perm = ""
     cur_ver = 1
     try:
@@ -3083,7 +3087,7 @@ def kb_pending_approvals(request: Request,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_pending_approvals 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"待审批队列查询失败 (trace: {trace_id})")
     items = [
@@ -3231,7 +3235,7 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
     if not managed:
         raise HTTPException(status_code=403, detail="无管理部门，无法代部门申请授权")
     assert_metadata_write_allowed("kb_access_request_submit", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     owner_dept = ""
     requester_depts = ",".join(sorted(managed))
     try:
@@ -3317,7 +3321,7 @@ def kb_access_requests_list(request: Request,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_access_requests_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"授权申请队列查询失败 (trace: {trace_id})")
     items = [
@@ -3371,7 +3375,7 @@ def kb_access_grants_list(request: Request,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_access_grants_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"已授权清单查询失败 (trace: {trace_id})")
     items = [
@@ -3448,7 +3452,7 @@ def kb_my_access_requests(request: Request,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_my_access_requests 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"我的授权申请查询失败 (trace: {trace_id})")
     return MyAccessRequestListResponse(items=items)
@@ -3474,7 +3478,7 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
     if not req.id:
         raise HTTPException(status_code=400, detail="缺少 id")
     assert_metadata_write_allowed(f"kb_access_request_{decision}", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     owner_dept = ""
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
@@ -3596,7 +3600,7 @@ def kb_admin_grants_list(request: Request,
         finally:
             conn.close()
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = get_request_id()
         logger.error("kb_admin_grants_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"成员名单查询失败 (trace: {trace_id})")
     return KbAdminListResponse(items=items, grantable_owner_depts=sorted(_valid_owner_depts()))
@@ -3620,7 +3624,7 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
     if not depts:
         raise HTTPException(status_code=400, detail="可管理部门为空或全不在白名单（无法授予）")
     assert_metadata_write_allowed("kb_admin_grant", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     note = (req.note or "")[:255] or None
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
@@ -3683,7 +3687,7 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
     if uid == kb.user_id:
         raise HTTPException(status_code=400, detail="不能撤销自己的授权")
     assert_metadata_write_allowed("kb_admin_grant_revoke", get_config().rds.host, kind="rds")
-    trace_id = uuid.uuid4().hex[:8]
+    trace_id = get_request_id()
     demoted = False
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
