@@ -20,7 +20,7 @@ const FILL: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', lo
       <span class="text-[11px] font-bold uppercase tracking-[0.06em] text-faint">来源</span>
       <button
         v-for="s in sources" :key="s.idx" type="button" data-testid="citation"
-        class="inline-flex max-w-[20rem] items-center gap-2 rounded-lg border bg-surface px-2.5 py-1.5 text-xs transition hover:border-border-strong"
+        class="inline-flex max-w-[20rem] items-center gap-2 rounded-full border bg-surface px-2.5 py-1 text-xs transition hover:border-border-strong"
         :class="openIdx === s.idx ? 'border-border-strong' : 'border-border'"
         :aria-expanded="openIdx === s.idx" @click="toggle(s.idx)"
       >

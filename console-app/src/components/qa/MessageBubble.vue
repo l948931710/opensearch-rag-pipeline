@@ -79,7 +79,7 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
           <button
             v-for="(r, i) in m.rephrase" :key="i"
             type="button"
-            class="rounded-full border border-border bg-card px-3 py-1 text-xs text-foreground transition hover:border-ring hover:bg-secondary"
+            class="rounded-full border border-border bg-card px-2.5 py-1 text-xs text-foreground transition hover:border-ring hover:bg-secondary"
             @click="fillInput(r)"
           >
             {{ r }}
@@ -88,11 +88,11 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
       </div>
       <button
         type="button"
-        class="mt-3 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground disabled:opacity-60"
+        class="mt-3 flex h-7 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground disabled:opacity-60"
         :class="{ '!text-st-live': m.handoffDone }" :disabled="m.handoffDone"
         @click="handoff(m)"
       >
-        <Headset :size="14" :stroke-width="1.75" /> {{ m.handoffDone ? '已转交管理员' : '转人工' }}
+        <Headset :size="15" :stroke-width="1.75" /> {{ m.handoffDone ? '已转交管理员' : '转人工' }}
       </button>
     </div>
 
