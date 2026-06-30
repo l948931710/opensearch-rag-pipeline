@@ -390,7 +390,11 @@ def _stream_answer_to_card(
     def _stop_pusher() -> None:
         _pstop.set()
         if _pthread.is_alive():
-            _pthread.join(timeout=5)
+            # join 超时必须 ≥ streaming_update_card 的 PUT 超时(10s)：否则 join 提前返回时仍有
+            # 在途推流 PUT，会在 finalize【之后】落地、把定稿帧覆盖成残帧（空白/掉页脚）。停止事件
+            # 已 set，推流线程在当前在途 PUT 返回后即退出，故正常 idle 时 join 立即返回，仅慢网在途
+            # PUT 时才等满——这正是要等的。
+            _pthread.join(timeout=12)
 
     try:
         _pthread.start()
