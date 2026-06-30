@@ -170,6 +170,28 @@ body {
 .md pre code .c-comment { color: var(--c-comment); font-style: italic; }
 .md pre code .c-fn { color: var(--c-fn); }
 
+/* 流式光标：仅生成中（.is-streaming）显示于最后一个块的末尾，随节奏轻闪——"正在书写"的信号。 */
+.md.is-streaming > *:last-child::after {
+  content: "";
+  display: inline-block;
+  width: 0.5em;
+  height: 1.02em;
+  margin-left: 3px;
+  vertical-align: -0.16em;
+  border-radius: 1.5px;
+  background: var(--accent-text);
+  animation: caret-blink 1.05s steps(1) infinite;
+}
+@keyframes caret-blink { 0%, 52% { opacity: .9; } 52.01%, 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .md.is-streaming > *:last-child::after { animation: none; opacity: .9; }
+}
+
+/* content_blocks 定稿：图片块淡入就位（文本保持不变，避免流式文字重渲闪烁）——平滑"打字→图文定稿"交接。 */
+.vb-fade { animation: vb-fade .34s ease-out both; }
+@keyframes vb-fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .vb-fade { animation: none; } }
+
 /* ── Atlas 台账网格（DocTable）── */
 .led-head, .led-row {
   display: grid;

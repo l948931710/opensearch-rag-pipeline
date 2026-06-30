@@ -47,8 +47,19 @@ export interface ChatMessage {
   copied?: boolean
   error?: boolean
   errorText?: string
+  streaming?: boolean      // 正在流式书写（驱动答案末尾的流式光标）；finish/stop/error 置 false
+  reasoning?: string       // 思考过程原始累积（深度思考 + RAG_STREAM_REASONING 开时下发的 reasoning 帧）
+  reasoningHtml?: string   // 思考过程已渲染（与答案共用匀速吐字泵平滑显现）
+  reasoningOpen?: boolean  // 「思考过程」披露条是否展开（思考中默认展开，答案开始自动收起，可手动切换）
   _stageTimer?: ReturnType<typeof setTimeout> | null
   _renderRaf?: number | null
+  _shownLen?: number       // 答案已"吐字"显现到的字符位置（匀速泵推进，<= raw 长度）
+  _lastRenderTs?: number   // 答案上次渲染时间戳（performance.now），用于节流到 ~40fps
+  _rRaf?: number | null    // 思考通道 rAF 句柄
+  _rShownLen?: number      // 思考过程已显现位置
+  _rTs?: number            // 思考通道上次渲染时间戳
+  _reasoningDone?: boolean // 思考流结束（答案开始/收尾）→ 停思考泵、定稿全文
+  _thinking?: boolean      // 本次是否开了「深度思考」（仅影响有据等待态文案）
 }
 
 export interface Conversation {
@@ -114,16 +125,79 @@ function mapSources(sources: any[]): SourceRow[] {
   })
 }
 
-// 流式逐 token 重渲：首帧立即渲染（内容尽快出现），后续用 rAF 节流（每帧至多一次，避免长答案逐 token O(n²)
-// 重渲卡顿；人眼跟不上逐 token；finishStream 收尾会再渲一次定稿）。
-function scheduleRender(ai: ChatMessage, seq: number): void {
-  if (ai.html == null || typeof requestAnimationFrame !== 'function') { ai.html = renderMd(stripImg(ai.raw || '')); return }
-  if (ai._renderRaf != null) return
-  ai._renderRaf = requestAnimationFrame(() => {
-    ai._renderRaf = null
-    if (seq !== askSeq || ai.viewBlocks) return
-    ai.html = renderMd(stripImg(ai.raw || ''))
-  })
+// 流式"匀速吐字"泵：把 bursty 的网络到达解耦成屏幕上的匀速显现——已收到的 raw 入缓冲，rAF 以稳定
+// 节奏推进 _shownLen 朝末尾追平（落后越多走越快、有上限），渲染节流到 ~30fps（省一半重排）。追平即停，
+// 新 chunk 由 ensureReveal 重启；finishStream/stop 收尾时一次性渲染全文定稿（故尾部一两字的"补齐"无感）。
+function _now(): number { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0 }
+
+// 通用"匀速吐字"通道：answer（raw→html）与 reasoning（reasoning→reasoningHtml）共用同一套墙钟节奏泵，
+// 把 bursty 到达解耦成屏幕匀速显现。两者从不同时流式（思考先、答案后），共用逻辑只是渲染目标/状态键不同。
+interface RevealCh {
+  text: (ai: ChatMessage) => string                  // 源文本
+  html: (ai: ChatMessage) => string | undefined      // 当前已渲染 html（判首帧）
+  setHtml: (ai: ChatMessage, h: string) => void       // 写回渲染结果
+  alive: (ai: ChatMessage) => boolean                 // 存活条件（停止则不再推进）
+  raf: '_renderRaf' | '_rRaf'
+  shown: '_shownLen' | '_rShownLen'
+  ts: '_lastRenderTs' | '_rTs'
+}
+const ANSWER_CH: RevealCh = {
+  text: (ai) => stripImg(ai.raw || ''),
+  html: (ai) => ai.html,
+  setHtml: (ai, h) => { ai.html = h },
+  alive: (ai) => !ai.viewBlocks && !ai.error && !ai.noResult,
+  raf: '_renderRaf', shown: '_shownLen', ts: '_lastRenderTs',
+}
+const REASON_CH: RevealCh = {
+  text: (ai) => ai.reasoning || '',
+  html: (ai) => ai.reasoningHtml,
+  setHtml: (ai, h) => { ai.reasoningHtml = h },
+  alive: (ai) => !ai._reasoningDone,
+  raf: '_rRaf', shown: '_rShownLen', ts: '_rTs',
+}
+function pumpTick(ai: ChatMessage, seq: number, ch: RevealCh): void {
+  ;(ai as any)[ch.raf] = null
+  if (seq !== askSeq || !ch.alive(ai)) return            // 作废/定稿/错误/无结果 → 停
+  const target = ch.text(ai).length
+  const shown = ((ai as any)[ch.shown] as number) || 0
+  if (shown >= target) return                            // 追平即停；新帧由 ensureReveal 重启
+  const now = _now()
+  const lastTs = (ai as any)[ch.ts] as number | undefined
+  const since = lastTs ? (now - lastTs) : 24
+  if (lastTs && since < 24) {                            // 重排节流 ≤~40fps（与刷新率/headless 无关）
+    ;(ai as any)[ch.raf] = requestAnimationFrame(() => pumpTick(ai, seq, ch))
+    return
+  }
+  // 按【真实时间】推进：~200ms 时间常数内追平当前积压（比例显现）；dt 封顶 40ms，使长停顿后不会一帧
+  // 吐完（"一卡一卡"的根因）；步长有下限/上限 → 任何刷新率下都匀速。
+  const dt = Math.min(40, since)
+  const remain = target - shown
+  const next = shown + Math.max(2, Math.min(remain, Math.ceil(remain * (dt / 200))))
+  ;(ai as any)[ch.shown] = next
+  ;(ai as any)[ch.ts] = now
+  ch.setHtml(ai, renderMd(ch.text(ai).slice(0, next)))
+  ;(ai as any)[ch.raf] = requestAnimationFrame(() => pumpTick(ai, seq, ch))
+}
+// 帧到达即确保泵在跑。首帧立即同步渲染（内容尽快出现 + 保证 html 是字符串），其后增量交给匀速泵；
+// 无 rAF 环境（SSR/测试）退化为即时全量渲染（与收尾口径一致）。默认 answer 通道。
+function ensureReveal(ai: ChatMessage, seq: number, ch: RevealCh = ANSWER_CH): void {
+  if (!ch.alive(ai)) return
+  if (ch.html(ai) == null || typeof requestAnimationFrame !== 'function') {
+    const full = ch.text(ai)
+    ;(ai as any)[ch.shown] = full.length
+    ch.setHtml(ai, renderMd(full))
+    if (typeof requestAnimationFrame !== 'function') return
+  }
+  if ((ai as any)[ch.raf] != null) return                // 已在跑
+  ;(ai as any)[ch.raf] = requestAnimationFrame(() => pumpTick(ai, seq, ch))
+}
+// 思考定稿：答案开始或收尾时停思考泵、渲染全文、自动收起披露条。
+function finalizeReasoning(ai: ChatMessage, collapse = true): void {
+  if (ai._rRaf != null) { cancelAnimationFrame(ai._rRaf); ai._rRaf = null }
+  if (!ai.reasoning || ai._reasoningDone) return
+  ai._reasoningDone = true
+  ai.reasoningHtml = renderMd(ai.reasoning)
+  if (collapse) ai.reasoningOpen = false
 }
 
 function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number): void {
@@ -136,12 +210,28 @@ function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number)
     case 'sources':
       ai.sources = mapSources(ev.sources as any[])
       ai.sourcesOpen = false
+      // 有据等待态：检索完成（总在首个答案 token 之前到达）即把"找到了什么"如实显出，
+      // 替代盲目计时的「正在生成回答」。深度思考时此窗口更长，预览价值更大。
+      if (ai.loading && ai.sources.length) {
+        if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
+        ai.stageText = `已找到 ${ai.sources.length} 篇相关资料，正在${ai._thinking ? '深度思考并' : ''}作答…`
+      }
+      break
+    case 'reasoning':
+      // 深度思考过程（thinking + RAG_STREAM_REASONING 开；在答案 chunk 之前到达）。披露条接管等待态，
+      // 思考中默认展开，文本经思考通道匀速显现。
+      if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
+      ai.loading = false
+      ai.reasoning = (ai.reasoning || '') + ((ev.content as string) || '')
+      if (ai.reasoningOpen == null) ai.reasoningOpen = true
+      ensureReveal(ai, seq, REASON_CH)
       break
     case 'chunk':
       if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
       ai.loading = false
+      if (ai.reasoning && !ai._reasoningDone) finalizeReasoning(ai)   // 答案开始 → 思考定稿并收起
       ai.raw = (ai.raw || '') + ((ev.content as string) || '')
-      if (!ai.viewBlocks) scheduleRender(ai, seq)   // 逐 token 实时打字（rAF 节流，避免长答案逐帧 O(n²) 重渲）
+      if (!ai.viewBlocks) ensureReveal(ai, seq)   // 匀速吐字泵（解耦 bursty 到达 → 屏幕匀速显现）
       break
     case 'done':
       ai.guard = !!ev.guard
@@ -166,6 +256,8 @@ function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number)
       // 流内错误帧（替代 done）：HTTP 200 已发出，错误只能作为帧下发。
       if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
       ai.loading = false
+      ai.streaming = false
+      finalizeReasoning(ai, false)
       ai.error = true
       ai.errorText = (ev.message as string) || '回答生成失败，请重试。'
       break
@@ -179,7 +271,9 @@ function finishStream(ai: ChatMessage, seq: number): void {
   abortCtl = null
   if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
   if (ai._renderRaf != null) { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }
+  finalizeReasoning(ai, false)   // 思考定稿（若有）：停泵 + 渲染全文，保留展开态
   ai.loading = false
+  ai.streaming = false
   if (ai.noResult || ai.error) return
   if (!ai.raw && !ai.viewBlocks) { ai.error = true; ai.errorText = '回答为空，请重试。'; return }
   if (!ai.viewBlocks) { ai.html = renderMd(stripImg(ai.raw)); ai.copyText = stripImg(ai.raw) }
@@ -197,12 +291,13 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
   const ai: ChatMessage = reactive({
     id: 'a' + (++mid), role: 'ai', loading: true, stageText: '正在检索知识库…',
     question: text, sourcesOpen: false, voted: '', viewBlocks: null,
+    streaming: true, _thinking: thinking.value,
   })
   conv.messages.push(ai)
   asking.value = true
 
   const seq = ++askSeq
-  ai._stageTimer = setTimeout(() => { if (ai.loading) ai.stageText = '正在生成回答…' }, 2200)
+  // 等待态文案由真实流帧驱动（sources 帧 → 有据态；chunk 帧 → 收起）——不再盲目计时翻页。
   const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null
   abortCtl = ctl
 
@@ -237,7 +332,9 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
     asking.value = false
     abortCtl = null
     if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
+    finalizeReasoning(ai, false)
     ai.loading = false
+    ai.streaming = false
     ai.error = true
     ai.errorText = e && e.name === 'AbortError' ? '已取消本次提问。' : '回答失败，请检查网络后重试。'
   }
@@ -250,8 +347,11 @@ function stop(): void {
   const ai = messages.value[messages.value.length - 1]
   if (ai && ai.role === 'ai') {
     if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
+    if (ai._renderRaf != null) { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }   // 停吐字泵
+    finalizeReasoning(ai, false)
     ai.loading = false
-    if (ai.raw && !ai.viewBlocks) ai.html = renderMd(stripImg(ai.raw))   // 保留已生成部分（不算错误）
+    ai.streaming = false
+    if (ai.raw && !ai.viewBlocks) ai.html = renderMd(stripImg(ai.raw))   // 保留已生成部分（一次性定稿）
     else if (!ai.raw && !ai.viewBlocks) { ai.error = true; ai.errorText = '已取消本次提问。' }
   }
 }
@@ -380,7 +480,7 @@ function persist(): void {
     const data = conversations.value.filter((c) => c.messages.length > 0).slice(0, 30).map((c) => ({
       id: c.id, title: c.title, updatedAt: c.updatedAt,
       // 丢 _stageTimer（计时器句柄）、loading（reload 后无在途流）。
-      messages: c.messages.map((m) => { const { _stageTimer, loading, ...rest } = m as any; return rest }),
+      messages: c.messages.map((m) => { const { _stageTimer, _renderRaf, _shownLen, _lastRenderTs, _rRaf, _rShownLen, _rTs, _reasoningDone, loading, streaming, _thinking, ...rest } = m as any; return rest }),
     }))
     // uid 戳：登录后 syncHistoryForUser 据此判断本地缓存是否属于当前用户（共享设备防残留）。
     localStorage.setItem(LS_KEY, JSON.stringify({ uid, activeId: activeId.value, conversations: data }))

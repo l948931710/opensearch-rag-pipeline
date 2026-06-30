@@ -12,6 +12,7 @@ defineProps<{
   pillLabel?: string     // 徽标后说明（如 本月新增）
   subValue?: string      // 子行强调值（如 27,659）
   subLabel?: string      // 子行说明（如 已索引分块）
+  loading?: boolean      // 数据未就绪（如 kbStats 尚未返回）：显骨架，避免闪 "0" 误导
 }>()
 </script>
 
@@ -23,15 +24,22 @@ defineProps<{
       </span>
       <span class="truncate text-[12.5px] font-medium text-muted-foreground">{{ label }}</span>
     </div>
-    <div class="font-mono text-[26px] font-bold leading-none tracking-tight tabular-nums" :class="tone || 'text-foreground'">{{ value }}</div>
-    <div v-if="pill" class="mt-2 flex items-center gap-1.5">
-      <span class="rounded-full bg-accent-soft px-[7px] py-px text-[11px] font-semibold text-accent-text">{{ pill }}</span>
-      <span v-if="pillLabel" class="text-[11.5px] text-faint">{{ pillLabel }}</span>
-    </div>
-    <div v-if="subValue" class="mt-1.5 flex items-baseline gap-1.5">
-      <span class="font-mono text-[13px] font-bold tabular-nums text-accent-text">{{ subValue }}</span>
-      <span v-if="subLabel" class="text-[11.5px] text-muted-foreground">{{ subLabel }}</span>
-    </div>
-    <div v-if="hint" class="mt-1.5 truncate text-[11.5px] text-faint">{{ hint }}</div>
+    <!-- 加载态：骨架条占位（避免在 stats 返回前闪 "0"，与下方分区的「加载中」占位一致） -->
+    <template v-if="loading">
+      <div class="mt-0.5 h-[24px] w-14 animate-pulse rounded-md bg-border/70" aria-hidden="true" />
+      <span class="sr-only">加载中</span>
+    </template>
+    <template v-else>
+      <div class="font-mono text-[26px] font-bold leading-none tracking-tight tabular-nums" :class="tone || 'text-foreground'">{{ value }}</div>
+      <div v-if="pill" class="mt-2 flex items-center gap-1.5">
+        <span class="rounded-full bg-accent-soft px-[7px] py-px text-[11px] font-semibold text-accent-text">{{ pill }}</span>
+        <span v-if="pillLabel" class="text-[11.5px] text-faint">{{ pillLabel }}</span>
+      </div>
+      <div v-if="subValue" class="mt-1.5 flex items-baseline gap-1.5">
+        <span class="font-mono text-[13px] font-bold tabular-nums text-accent-text">{{ subValue }}</span>
+        <span v-if="subLabel" class="text-[11.5px] text-muted-foreground">{{ subLabel }}</span>
+      </div>
+      <div v-if="hint" class="mt-1.5 truncate text-[11.5px] text-faint">{{ hint }}</div>
+    </template>
   </div>
 </template>

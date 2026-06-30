@@ -9,14 +9,14 @@ const m = props.message
 </script>
 
 <template>
-  <!-- 未定稿：纯文本逐 token 打字 -->
-  <div v-if="!m.viewBlocks" class="md text-[15px] text-foreground" v-html="m.html" />
+  <!-- 未定稿：纯文本逐 token 打字（流式期间末尾显光标，定稿/停止/出错即隐） -->
+  <div v-if="!m.viewBlocks" class="md text-[15px] text-foreground" :class="{ 'is-streaming': m.streaming }" v-html="m.html" />
 
   <!-- 定稿：图文交错 -->
   <div v-else class="md text-[15px] text-foreground">
     <template v-for="(b, bi) in m.viewBlocks" :key="bi">
       <div v-if="b.type === 'text'" v-html="b.html" />
-      <figure v-else class="my-3">
+      <figure v-else class="vb-fade my-3">
         <img
           v-if="!b.failed"
           :src="b.url" :alt="b.alt || '答案配图'"

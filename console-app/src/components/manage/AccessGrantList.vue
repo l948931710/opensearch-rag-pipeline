@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ShieldCheck, FileText } from 'lucide-vue-next'
+import { ShieldCheck, FileText, Loader2 } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
@@ -58,9 +58,9 @@ async function onRevoke(g: AccessGrantItem) {
         </div>
         <button
           type="button"
-          class="self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          class="inline-flex items-center justify-center gap-1 self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
           :disabled="isBusy(`grant:${g.id}`)" @click="onRevoke(g)"
-        >撤销</button>
+        ><Loader2 v-if="isBusy(`grant:${g.id}`)" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(`grant:${g.id}`) ? '撤销中…' : '撤销' }}</button>
       </div>
     </div>
   </section>

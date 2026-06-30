@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
+import { ArrowDown } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useAsk } from '@/composables/useAsk'
 import Thread from '@/components/qa/Thread.vue'
@@ -13,11 +14,25 @@ const { messages, asking, draft, thinking, hotQuestions, ask, stop, loadHotQuest
 function toggleThinking() { thinking.value = !thinking.value }
 
 const scroller = ref<HTMLElement | null>(null)
-// 流式更新时跟随滚动到底（深 watch 覆盖逐 token 追加 + 状态切换）。
-watch(messages, () => nextTick(() => {
+const atBottom = ref(true)          // 用户是否贴近底部（决定流式是否跟随；上滚阅读时停跟随）
+const NEAR_PX = 80                  // 贴底判定阈值
+
+function refreshAtBottom() {
   const el = scroller.value
-  if (el) el.scrollTop = el.scrollHeight
-}), { deep: true })
+  if (el) atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_PX
+}
+function scrollToBottom(smooth = false) {
+  const el = scroller.value
+  if (!el) return
+  el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+  atBottom.value = true
+}
+
+// 流式逐 token / 状态变化：仅当用户本就贴底才跟随到底，否则不动（不把正在上翻阅读的人拽回去）。
+watch(messages, () => { if (atBottom.value) nextTick(() => scrollToBottom(false)) }, { deep: true })
+
+// 发起提问：用户期望立刻看到自己的问句与作答 → 强制贴底跟随。
+function send(preset?: string) { atBottom.value = true; void ask(preset) }
 
 onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
 </script>
@@ -26,11 +41,24 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
   <div class="flex h-full flex-col">
     <!-- 有消息：线程滚动区 + 底部固定输入（新会话/历史在侧栏） -->
     <template v-if="messages.length">
-      <div ref="scroller" class="min-h-0 flex-1 overflow-y-auto">
-        <Thread :messages="messages" />
+      <div class="relative min-h-0 flex-1">
+        <div ref="scroller" class="h-full overflow-y-auto" @scroll.passive="refreshAtBottom">
+          <Thread :messages="messages" />
+        </div>
+        <!-- 上翻阅读时浮现「回到最新」（贴底时隐藏）；流式跟随不再劫持滚动 -->
+        <Transition name="jump">
+          <button
+            v-if="!atBottom"
+            type="button"
+            class="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-card/95 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur transition hover:border-border-strong hover:text-foreground"
+            @click="scrollToBottom(true)"
+          >
+            <ArrowDown :size="13" :stroke-width="2" /> 回到最新
+          </button>
+        </Transition>
       </div>
       <div class="shrink-0 border-t border-border/60 py-3">
-        <Composer v-model="draft" :asking="asking" :has-messages="true" :thinking="thinking" @submit="ask()" @stop="stop" @toggle-thinking="toggleThinking" />
+        <Composer v-model="draft" :asking="asking" :has-messages="true" :thinking="thinking" @submit="send()" @stop="stop" @toggle-thinking="toggleThinking" />
       </div>
     </template>
 
@@ -42,13 +70,13 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
         </span>
         <span class="font-serif text-[34px] leading-none tracking-tight text-foreground">你好{{ name ? '，' + name : '，同事' }}</span>
       </div>
-      <Composer v-model="draft" :asking="asking" :has-messages="false" :thinking="thinking" @submit="ask()" @stop="stop" @toggle-thinking="toggleThinking" />
+      <Composer v-model="draft" :asking="asking" :has-messages="false" :thinking="thinking" @submit="send()" @stop="stop" @toggle-thinking="toggleThinking" />
       <div v-if="hotQuestions.length" class="mt-5 flex max-w-2xl flex-wrap justify-center gap-2">
         <button
           v-for="(h, i) in hotQuestions" :key="i"
           type="button"
           class="rounded-full border border-border bg-card px-3.5 py-1.5 text-sm text-foreground transition hover:border-ring hover:bg-panel"
-          @click="ask(h)"
+          @click="send(h)"
         >
           {{ h }}
         </button>
@@ -56,3 +84,10 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 「回到最新」淡入淡出（仅透明度，避免与 -translate-x-1/2 的 transform 冲突）。 */
+.jump-enter-active, .jump-leave-active { transition: opacity .18s ease; }
+.jump-enter-from, .jump-leave-to { opacity: 0; }
+@media (prefers-reduced-motion: reduce) { .jump-enter-active, .jump-leave-active { transition: none; } }
+</style>

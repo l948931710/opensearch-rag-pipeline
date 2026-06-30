@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { RotateCw, Headset } from 'lucide-vue-next'
+import { RotateCw, Headset, FileText } from 'lucide-vue-next'
 import { useAsk, type ChatMessage } from '@/composables/useAsk'
 import AnswerBlocks from './AnswerBlocks.vue'
 import SourceList from './SourceList.vue'
 import FeedbackBar from './FeedbackBar.vue'
+import ThinkingDisclosure from './ThinkingDisclosure.vue'
 
-// 一条消息：用户气泡 / AI 四态（加载骨架·错误重试·无结果卡·正常答案）。
+// 一条消息：用户气泡 / AI 多态（思考过程披露条 · 加载骨架 · 错误重试 · 无结果卡 · 正常答案）。
 const props = defineProps<{ message: ChatMessage }>()
 const { retry, handoff, fillInput } = useAsk()
 const m = props.message
+
+// 等待态来源预览的档位点颜色（与 SourceList 同口径）。
+const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low: 'bg-st-queue' }
 </script>
 
 <template>
@@ -25,14 +29,32 @@ const m = props.message
       <svg width="16" height="16" viewBox="0 0 24 24" fill="var(--primary-foreground)" aria-hidden="true" focusable="false"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
     </span>
     <div class="min-w-0 flex-1 pt-0.5">
-    <!-- 加载骨架 -->
-    <div v-if="m.loading" class="flex items-center gap-2 py-1 text-sm text-muted-foreground">
-      <span class="flex gap-1">
-        <i class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.2s]" />
-        <i class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.1s]" />
-        <i class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
-      </span>
-      {{ m.stageText }}
+    <!-- 思考过程披露条（深度思考；仅当有 reasoning 时）：思考期独占显示，答案到来后收起置顶 -->
+    <ThinkingDisclosure v-if="m.reasoning" :message="m" />
+
+    <!-- 加载骨架（有据等待态：检索完成即预览"找到了哪些文档"，淡入浮现） -->
+    <div v-if="m.loading" class="py-1">
+      <div class="flex items-center gap-2 text-sm text-muted-foreground">
+        <span class="flex gap-1">
+          <i class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.2s]" />
+          <i class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.1s]" />
+          <i class="size-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
+        </span>
+        {{ m.stageText }}
+      </div>
+      <ul v-if="m.sources && m.sources.length" class="mt-2 space-y-1">
+        <li
+          v-for="(s, i) in m.sources.slice(0, 4)" :key="s.idx"
+          class="src-pop flex items-center gap-1.5 text-xs text-faint" :style="{ animationDelay: i * 60 + 'ms' }"
+        >
+          <span class="size-1.5 shrink-0 rounded-full" :class="DOT[s.level]" />
+          <FileText :size="12" :stroke-width="1.7" class="shrink-0 text-faint" />
+          <span class="min-w-0 truncate" :title="s.title">{{ s.title }}</span>
+        </li>
+        <li v-if="m.sources.length > 4" class="src-pop pl-[19px] text-xs text-faint" :style="{ animationDelay: '240ms' }">
+          +{{ m.sources.length - 4 }} 篇
+        </li>
+      </ul>
     </div>
 
     <!-- 错误 + 重试 -->
@@ -74,8 +96,8 @@ const m = props.message
       </button>
     </div>
 
-    <!-- 正常答案 -->
-    <template v-else>
+    <!-- 正常答案（答案有内容才渲染；思考独占阶段只显披露条，不露空答案区） -->
+    <template v-else-if="m.html != null || m.viewBlocks">
       <div v-if="m.guard" class="mb-2 rounded-lg border border-st-busy/30 bg-st-busy/10 px-3 py-2 text-xs text-st-busy">
         ⚠️ 相关资料匹配度较低，以下回答仅供参考，请核对原文或转人工确认。
       </div>
@@ -86,3 +108,10 @@ const m = props.message
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 来源预览淡入（逐条交错 → "正在它们之中检索"的浮现感）；尊重减弱动效。 */
+.src-pop { animation: src-pop .26s ease-out both; }
+@keyframes src-pop { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .src-pop { animation: none; } }
+</style>

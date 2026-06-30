@@ -305,6 +305,10 @@ class RAGConfig:
     # allowed_depts、入库按 approved 授权聚合写 chunk_meta.allowed_depts。默认关；需先 HA3 加
     # allowed_depts 字段(Step 2) + 回填(Step 3) 再开。flag 关时全链路与现状逐字节一致。
     allowed_depts_acl: bool = False         # RAG_ALLOWED_DEPTS_ACL
+    # 思考过程下发（深度思考「思考过程」披露条）：开启后，thinking=True 时把 reasoning_content 作为
+    # {"type":"reasoning"} 附加帧流式下发（与 chunk 并行；老客户端忽略未知帧类型 → 向后兼容）。默认关
+    # （reasoning 更费带宽且暴露思维链是产品取舍）；仅「thinking 开 + 本 flag 开」时下发，否则照旧丢弃。
+    stream_reasoning: bool = False          # RAG_STREAM_REASONING
     # ── QA 日志查询侧 PII 脱敏（OBS-qa-pii 整改）──────────────────
     # qa_session_log.query_text/answer_text 此前明文落盘：用户可能输入身份证/手机号，
     # 答案可能回显受限文档里的 PII。开启后在写库前用 redaction.redact_text（与入库侧
@@ -729,6 +733,7 @@ def load_config() -> PipelineConfig:
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
             conversation_history=_env_bool("CONVERSATION_HISTORY", False),
             allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
+            stream_reasoning=_env_bool("STREAM_REASONING", False),              # RAG_STREAM_REASONING
             qa_log_pii_redact=_env_bool("QA_LOG_PII_REDACT", True),             # RAG_QA_LOG_PII_REDACT
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
             score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM

@@ -258,3 +258,29 @@ describe('useAsk.retry — 移除错误卡并用原问句重发', () => {
     expect(messages.value[messages.value.length - 1].html).toContain('好了')
   })
 })
+
+describe('useAsk.ask — 深度思考过程帧（reasoning，披露条）', () => {
+  it('reasoning 累积入 ai.reasoning + 渲染；答案开始即定稿收起；不污染答案 html', async () => {
+    const chunks = [
+      frame({ type: 'session', session_id: 's', message_id: 'mT' }),
+      frame({ type: 'sources', sources: [{ doc_id: 'd1', title: '年假制度.pdf', section: '第3条', level: 'high', score: 9 }] }),
+      frame({ type: 'reasoning', content: '先确认范围，' }),
+      frame({ type: 'reasoning', content: '应查年假制度。' }),
+      frame({ type: 'chunk', content: '每年' }),
+      frame({ type: 'chunk', content: '5 天。' }),
+      frame({ type: 'done', model: 'q', usage: {}, guard: false }),
+      DONE,
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp(chunks)))
+    const { ask, messages } = useAsk()
+
+    await ask('年假几天')
+    const ai = messages.value[1]
+    expect(ai.reasoning).toBe('先确认范围，应查年假制度。')        // 思考全文累积
+    expect(ai.reasoningHtml).toContain('应查年假制度')             // 已渲染
+    expect(ai.reasoningOpen).toBe(false)                          // 答案开始 → 自动收起
+    expect(ai.html).toContain('每年')                             // 答案正常
+    expect(ai.html).toContain('5 天')
+    expect(ai.html).not.toContain('应查年假制度')                  // 思考不混入答案
+  })
+})
