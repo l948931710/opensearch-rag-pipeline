@@ -1867,15 +1867,12 @@ def node_classify_and_risk_assess(ctx: dict):
     failed_doc_ids = set()
 
     if len(valid_canonicals) <= 1:
-        # 单文档无需并发。异常处理与多文档路径【一致】：捕获→标记该 doc 失败→drop+续跑，
-        # 绝不让单文档的异常（如 DB 持久化 RuntimeError）propagate 出去 abort 整个节点。
+        # 单文档无需并发。⚠️ 不吞异常：DB 持久化失败等 RuntimeError 必须 propagate 出去 abort 节点
+        # （TestDatabaseExceptionPropagation 的不变量——绝不把真实 DB 写失败静默吞掉/掩盖）。
+        # 「LLM 缺键」这类已由 _safe_classification_fields 在源头消化，不再到这里崩 KeyError。
         for doc in valid_canonicals:
-            try:
-                success = _classify_single_doc(doc)
-                if not success:
-                    failed_doc_ids.add(doc["doc_id"])
-            except Exception as e:
-                print(f"    ❌ Unexpected error classifying {doc['doc_id']}: {e}")
+            success = _classify_single_doc(doc)
+            if not success:
                 failed_doc_ids.add(doc["doc_id"])
     else:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(valid_canonicals))) as pool:

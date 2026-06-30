@@ -815,7 +815,12 @@ def test_my_access_requests_sync_state(monkeypatch):
 
 
 def test_my_access_requests_bad_row_degrades_not_500(monkeypatch):
-    """#7 防御：单行脏 allowed_depts JSON → 该行降级 n/a 并继续，绝不 500 整张列表。"""
+    """#7 防御：单行脏 allowed_depts JSON → 绝不 500 整张列表（两行都在）。
+
+    注：access_grants.current_allowed_for_doc 现在对单行坏 JSON 是【跳过坏行+告警、不再 raise】
+    （fail-closed-trio P2 修复）——所以坏 doc 的 current 派生不含被跳过的 chunk → projected=False
+    → 显 'pending_sync'（对账会重投影自愈），而非旧的 raise→端点 except→'n/a'。端点的 n/a 降级
+    路径仍服务于真正的 DB 异常。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
     monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
@@ -824,15 +829,15 @@ def test_my_access_requests_bad_row_degrades_not_500(monkeypatch):
         ("2", "DOK", "T好", "marketing", "quality", "approved", "r", "2026-06-01", "2026-06-02", 1),
     ]
     doc_state = {
-        "DBAD": {"cnt": 1, "indexed": 1, "allowed": "__BAD_JSON__"},   # 脏 JSON → 派生抛错
+        "DBAD": {"cnt": 1, "indexed": 1, "allowed": "__BAD_JSON__"},   # 脏 JSON → 坏 chunk 被跳过
         "DOK": {"cnt": 1, "indexed": 1, "allowed": ["quality"]},       # 正常 → projected
     }
     _stub_myreq(monkeypatch, rows, doc_state)
     from opensearch_pipeline import api
     resp = api.kb_my_access_requests(request=None, identity=api.Identity(user_id="da1"))  # 不抛 500
     by_id = {it.id: it.sync_state for it in resp.items}
-    assert len(resp.items) == 2                  # 坏行未吞掉整张表，两行都在
-    assert by_id["1"] == "n/a"                   # 坏行降级 n/a
+    assert len(resp.items) == 2                  # 坏行未吞掉整张表，两行都在（#7 核心：不 500）
+    assert by_id["1"] == "pending_sync"          # 坏 chunk 被跳过 → 未投影 → 待对账重投影自愈
     assert by_id["2"] == "projected"             # 好行不受影响
 
 
