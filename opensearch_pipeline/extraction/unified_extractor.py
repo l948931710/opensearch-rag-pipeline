@@ -9,6 +9,7 @@ DAG 层不需要知道文件类型，只调用 extract() 即可。
 """
 
 import copy
+import datetime as _dt
 import os
 import tempfile
 from typing import Dict, List, Optional
@@ -114,6 +115,21 @@ def _vlm_cache_ns(is_public):
     ns = "pub" if is_public else "sec"
     ver = os.environ.get("RAG_VLM_CACHE_VERSION", "").strip()
     return f"{ns}:{ver}" if ver else ns
+
+
+def _xlsx_cell_to_str(c) -> str:
+    """xlsx 单元格值 → 字符串。data_only=True 下日期单元格是 datetime/date 对象，裸 str() 会产出
+    '2024-01-15 00:00:00' 这类噪声 → 渲染为干净日期。
+    注意：百分比/前导零(001234) 的语义依赖 cell.number_format，而 read_only 的 iter_rows(values_only)
+    路径取不到 number_format（大表强制 read_only）→ 那部分不在此处理（B2-4 deferred，避免只在小表生效
+    的不一致 + 改 chunk 文本带来的 embedding 漂移）。仅日期清理：不依赖 number_format，两条路径一致、安全。"""
+    if isinstance(c, _dt.datetime):
+        if (c.hour, c.minute, c.second) == (0, 0, 0):
+            return c.strftime("%Y-%m-%d")
+        return c.strftime("%Y-%m-%d %H:%M")
+    if isinstance(c, _dt.date):
+        return c.strftime("%Y-%m-%d")
+    return str(c)
 
 
 def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
@@ -616,6 +632,16 @@ class UnifiedExtractor:
             for sheet_idx, sheet_name in enumerate(wb.sheetnames):
                 ws = wb[sheet_name]
 
+                # 隐藏/超隐藏 sheet 不入库（B2-1）：常为草稿/中间计算/下拉源/内部辅助数据，
+                # 入库 = 噪声，且可能泄露不该展示的内容。不静默——逐 sheet loud log。enumerate
+                # 不跳号 → 可见 sheet 的 sheet_idx/page_num 与图片路径(同样跳隐藏)保持一致。
+                # getattr 兜底默认 'visible'，odd worksheet 对象不致中断抽取（优雅降级）。
+                _state = getattr(ws, "sheet_state", "visible")
+                if _state != "visible":
+                    warnings.append(f"skipped {_state} sheet: {sheet_name}")
+                    print(f"      ⏭️ [xlsx] skip {_state} sheet '{sheet_name}' (not ingested)", flush=True)
+                    continue
+
                 # 合并单元格"向下填充"：纵向合并的首格值（如"类别"列）传播到该列下方各行，
                 # 避免下游丢失分组键。横向合并不填充（标题只出现一次）。
                 merge_fill = {}
@@ -656,7 +682,7 @@ class UnifiedExtractor:
                     for ci0, c in enumerate(row):
                         if c is None and (row_idx, ci0 + 1) in merge_fill:
                             c = merge_fill[(row_idx, ci0 + 1)]
-                        cells.append(str(c) if c is not None else "")
+                        cells.append(_xlsx_cell_to_str(c) if c is not None else "")
                     all_rows.append((row_idx, cells))
 
                     # 检测表头行（命中 ≥2 个关键词）
@@ -1018,9 +1044,12 @@ class UnifiedExtractor:
                         fallback_title = f"Slide {page_num}" + (f": {first_text}" if first_text else "")
                         current_section = fallback_title
 
-                # ── Phase 3: Speaker notes → paragraph block ──
+                # ── Phase 3: Speaker notes → paragraph block（默认关闭，B2-2）──
+                # 演讲备注常含演讲提示/内部备注/旧内容/"此页不要展示"等，默认不入库。需要时
+                # 设 RAG_PPTX_INCLUDE_NOTES=1/true/yes 显式开启（沿用项目 default-OFF flag 约定）。
+                _include_notes = os.environ.get("RAG_PPTX_INCLUDE_NOTES", "").lower() in ("1", "true", "yes")
                 try:
-                    if slide.has_notes_slide and slide.notes_slide:
+                    if _include_notes and slide.has_notes_slide and slide.notes_slide:
                         notes_text = slide.notes_slide.notes_text_frame.text.strip()
                         if notes_text and len(notes_text) > 5:
                             blocks.append(ExtractedBlock(
