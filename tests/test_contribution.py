@@ -317,26 +317,56 @@ def test_accept_cross_dept_readonly_cannot_review(monkeypatch):
 
 
 def test_accept_dept_change_reauthz(monkeypatch):
-    """改目标部门：改成本人 managed 的部门→放行；改成未管理部门→403。"""
+    """锁定原部门（用户裁决 2026-06-29）：accept 先校验 _kb_can_manage(原 category_dept)。
+    - 仅管 marketing 的管理员，原 finance → 改投 marketing：禁止跨部门接管 → 403。
+    - 同时管 finance+marketing 的管理员，原 finance → 改投 marketing：合法改投 → 放行。
+    - 改成未管理的目标部门 → 403。
+    """
     _skip_if_not_sim()
-    _dept_admin(monkeypatch, managed="marketing")
     _capture_put(monkeypatch, ok=True)
-    # 原 finance（管不了），改成 marketing → 放行
+    from opensearch_pipeline import api
+    # (1) 仅管 marketing，原 finance → 改投 marketing：管不了原部门 finance → 403（防抢稿）
+    _dept_admin(monkeypatch, managed="marketing")
     _install_conn(monkeypatch, _FakeConn(
         contrib_row=("pending", "none", None, None, None, "q", "a", "finance"),
         claim_rowcount=1, dv_exists=None))
-    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei0:
+        api.kb_contribution_accept(
+            cid="C1", req=api.KbContributionAcceptRequest(category_dept="marketing"),
+            request=None, identity=_ident())
+    assert getattr(ei0.value, "status_code", None) == 403
+    # (2) 同时管 finance+marketing，原 finance → 改投 marketing：两端皆可管 → 放行
+    _dept_admin(monkeypatch, managed="finance,marketing")
+    _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "finance"),
+        claim_rowcount=1, dv_exists=None))
     resp = api.kb_contribution_accept(
-        cid="C1", req=api.KbContributionAcceptRequest(category_dept="marketing"),
+        cid="C2", req=api.KbContributionAcceptRequest(category_dept="marketing"),
         request=None, identity=_ident())
     assert resp.review_status == "accepted"
-    # 原 marketing，改成 finance（管不了）→ 403
+    # (3) 仅管 marketing，原 marketing → 改投未管理的 finance → 403（目标部门写权限）
+    _dept_admin(monkeypatch, managed="marketing")
     _install_conn(monkeypatch, _FakeConn(
         contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"), claim_rowcount=1))
     with pytest.raises(Exception) as ei:
         api.kb_contribution_accept(
-            cid="C2", req=api.KbContributionAcceptRequest(category_dept="finance"),
+            cid="C3", req=api.KbContributionAcceptRequest(category_dept="finance"),
             request=None, identity=_ident())
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_accept_foreign_dept_poach_blocked(monkeypatch):
+    """回归：仅管 marketing 的管理员凭 cid 直接采纳 finance 队列的贡献（不改 final_dept），
+    也必须 403——原部门校验先于目标部门，杜绝跨部门接管。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "finance"), claim_rowcount=1))
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_contribution_accept(cid="C9", req=api.KbContributionAcceptRequest(),
+                                   request=None, identity=_ident())
     assert getattr(ei.value, "status_code", None) == 403
 
 
