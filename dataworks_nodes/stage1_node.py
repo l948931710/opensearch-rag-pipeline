@@ -3,7 +3,7 @@
 DataWorks PyODPS 3 节点 — Stage 1: Raw → Canonical
 上传到 DataWorks 调度节点中直接使用。
 
-⚠️ 生产模式：将 SIMULATE = True 改为 False
+⚠️ 默认生产模式（SIMULATE=False）。冒烟测试：在节点环境变量设 RAG_NODE_SIMULATE=true。
 """
 import os
 import sys
@@ -11,9 +11,10 @@ import zipfile
 from datetime import datetime, timedelta
 
 # ═══════════════════════════════════════════════════════════════
-# 🔧 模式开关（冒烟测试 True / 生产运行 False）
+# 🔧 模式开关：默认生产（False）。冒烟测试设环境变量 RAG_NODE_SIMULATE=true。
+#    旧写法硬编码 True，部署忘改 → 整阶段跑 mock 却 exit 0（DataWorks 绿），语料静默停更。
 # ═══════════════════════════════════════════════════════════════
-SIMULATE = True
+SIMULATE = os.environ.get("RAG_NODE_SIMULATE", "false").strip().lower() in ("true", "1", "yes")
 
 # ═══════════════════════════════════════════════════════════════
 # 🔐 环境变量配置（必须在 import pipeline 代码之前设置）
