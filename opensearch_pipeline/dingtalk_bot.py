@@ -666,9 +666,16 @@ def _process_rag_query(
     except Exception as e:
         trace_id = uuid.uuid4().hex[:8]
         latency_ms = int((time.time() - t0) * 1000)
+        # 应用日志是 qa_session_log 之外的另一 PII sink：原始问题可能含身份证/手机号。
+        # 无条件脱敏 + 截断后再记（debug 靠 trace_id + error，不需要原文 PII）。
+        try:
+            from opensearch_pipeline.contribution import redact_query_text as _rq
+            q_for_log = _rq(question)[:200]
+        except Exception:
+            q_for_log = "[redact-failed]"
         logger.error(
             "RAG 处理失败 [trace=%s]: question=%s, error=%s",
-            trace_id, question, e, exc_info=True,
+            trace_id, q_for_log, e, exc_info=True,
         )
         # 失败也要落库（user_dept / retrieval_latency_ms 已在 try 外初始化，
         # 部门解析或检索阶段抛错时取 None，不会 NameError）

@@ -2,6 +2,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { apiFetch, apiJson } from '@/lib/api'
 import { createSseDecoder, type SseEvent } from '@/lib/sseDecoder'
 import { renderMd, stripImg } from '@/lib/markdown'
+import { useSession } from '@/stores/session'
 
 // 问答单一事实来源（模块级单例，等同轻量 store）。多会话（Atlas 式）：每条会话独立 messages +
 // 服务端 qaSession；新建/切换/删除/搜索；localStorage 持久化（reload 仍在，故有会话历史）。
@@ -374,13 +375,34 @@ const LS_KEY = 'fl-conversations'
 
 function persist(): void {
   try {
+    let uid = ''
+    try { uid = useSession().identity?.userId || '' } catch { /* pinia 未就绪 */ }
     const data = conversations.value.filter((c) => c.messages.length > 0).slice(0, 30).map((c) => ({
       id: c.id, title: c.title, updatedAt: c.updatedAt,
       // 丢 _stageTimer（计时器句柄）、loading（reload 后无在途流）。
       messages: c.messages.map((m) => { const { _stageTimer, loading, ...rest } = m as any; return rest }),
     }))
-    localStorage.setItem(LS_KEY, JSON.stringify({ activeId: activeId.value, conversations: data }))
+    // uid 戳：登录后 syncHistoryForUser 据此判断本地缓存是否属于当前用户（共享设备防残留）。
+    localStorage.setItem(LS_KEY, JSON.stringify({ uid, activeId: activeId.value, conversations: data }))
   } catch { /* 隐私模式/超额忽略 */ }
+}
+
+/** 拿到权威身份后调用：若本地缓存属于【其他】用户（或旧版无 uid 戳），清空本地会话历史。
+ *  共享钉钉 PC / kiosk 上 token 仅在内存、localStorage 却跨用户残留——上一个人的部门内部
+ *  答案与来源摘录会被下一个人 loadPersisted 还原。无条件清，再 ensureActive 起一个空会话。 */
+export function syncHistoryForUser(uid: string): void {
+  if (typeof window === 'undefined') return
+  try {
+    const raw = localStorage.getItem(LS_KEY)
+    if (!raw) return
+    let storedUid = ''
+    try { storedUid = (JSON.parse(raw) || {}).uid || '' } catch { storedUid = '' }
+    if (storedUid === (uid || '')) return   // 同一用户：保留本地历史
+    localStorage.removeItem(LS_KEY)
+    conversations.value = []
+    activeId.value = ''
+    ensureActive()
+  } catch { /* 失败不影响功能 */ }
 }
 
 function loadPersisted(): void {
