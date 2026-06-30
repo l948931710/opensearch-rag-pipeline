@@ -81,3 +81,50 @@ def test_reasoning_dropped_when_flag_off():
 def test_reasoning_dropped_when_thinking_off():
     frames = _frames(thinking=False, flag=True)
     assert "reasoning" not in [f.get("type") for f in frames]
+
+
+# ── /api/ask/stream 透传护栏：reasoning 帧只发给【显式请求 thinking】的调用方 ──
+from unittest.mock import patch as _patch  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+def _fake_stream_with_reasoning(*_a, **_k):
+    yield 'data: {"type":"sources","sources":[]}\n\n'
+    yield 'data: {"type":"reasoning","content":"先想想，"}\n\n'
+    yield 'data: {"type":"reasoning","content":"查制度。"}\n\n'
+    yield 'data: {"type":"chunk","content":"每年 5 天。"}\n\n'
+    yield 'data: {"type":"done","model":"q","usage":{}}\n\n'
+    yield "data: [DONE]\n\n"
+
+
+def _stream_types(thinking):
+    from opensearch_pipeline.api import app
+    client = TestClient(app)
+    with _patch("opensearch_pipeline.api.generate_answer_stream", side_effect=_fake_stream_with_reasoning), \
+         _patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=[{"doc_id": "D1", "title": "制度", "chunk_text": "x", "score": 9.0}]), \
+         _patch("opensearch_pipeline.api.build_content_blocks", return_value=[]), \
+         _patch("opensearch_pipeline.api.log_qa_session"), \
+         _patch("opensearch_pipeline.api._append_to_history"):
+        body = {"question": "年假几天"}
+        if thinking:
+            body["thinking"] = True
+        resp = client.post("/api/ask/stream", json=body)
+        assert resp.status_code == 200
+        types = []
+        for ln in resp.text.splitlines():
+            ln = ln.strip()
+            if ln.startswith("data: ") and ln[6:] != "[DONE]":
+                try:
+                    types.append(json.loads(ln[6:]).get("type"))
+                except json.JSONDecodeError:
+                    pass
+        return types
+
+
+def test_endpoint_passes_reasoning_only_when_thinking_requested():
+    # thinking=true → reasoning 帧透传给调用方；答案仍在
+    t = _stream_types(thinking=True)
+    assert "reasoning" in t and "chunk" in t
+    # 未请求 thinking → reasoning 帧被护栏丢弃（杜绝把 CoT 广播给未 opt-in 的 SSE 客户端），答案不受影响
+    n = _stream_types(thinking=False)
+    assert "reasoning" not in n and "chunk" in n
