@@ -126,6 +126,19 @@ class TestUnifiedExtractor:
         assert result.text_length > 0
         assert len(result.blocks) > 0
 
+    def test_htm_and_html_both_tag_stripped(self, tmp_path):
+        """.htm 与 .html 都必须去标签（此前仅 .html 触发，.htm 满屏标签进索引）。"""
+        body = "<html><body><h1>标题</h1><p>正文内容在这里。</p></body></html>"
+        for ext in ("html", "htm"):
+            p = tmp_path / f"doc.{ext}"
+            p.write_text(body, encoding="utf-8")
+            task = {"doc_id": "d", "version_no": 1, "raw_key": f"raw/admin/doc.{ext}",
+                    "filename": f"doc.{ext}", "file_ext": ext, "local_path": str(p)}
+            res = self.extractor._extract_text(task)
+            assert res.extract_method == "html_text", f".{ext} 未去标签: {res.extract_method}"
+            assert "<p>" not in res.text and "<h1>" not in res.text
+            assert "正文内容在这里" in res.text
+
     def test_mock_blocks_have_headings(self):
         task = {
             "doc_id": "DOC_TEST_002",

@@ -54,6 +54,20 @@ def test_all_text_pdf_skips_ocr():
     assert ux._needs_ocr(res) is False
 
 
+def test_pages_beyond_native_cap_not_flagged_for_ocr():
+    """原生抽取只覆盖前 PDF_NATIVE_MAX_PAGES(=20) 页；page_count 更大时，越界页（未被抽取、
+    per_page 缺失）不能因"0 原生字符"被误判需 OCR——否则浪费 OCR 预算并挤出真扫描页。"""
+    ux = _gate()
+    # 50 页 PDF，前 20 页都有充足原生文本（21-50 未抽取）→ 不应有任何页需 OCR
+    res = _pdf({pg: 200 for pg in range(1, 21)}, page_count=50)
+    assert ux._pages_needing_ocr(res) == []
+    # 对照：前 20 页内仍有真扫描页（page 5 空）→ 照常被 OCR
+    pages = {pg: 200 for pg in range(1, 21)}
+    pages[5] = 0
+    res2 = _pdf(pages, page_count=50)
+    assert ux._pages_needing_ocr(res2) == [5]
+
+
 def test_image_file_still_uses_whole_doc_threshold():
     ux = _gate()
     res = ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="jpg",
