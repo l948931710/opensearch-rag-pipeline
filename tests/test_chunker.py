@@ -131,6 +131,35 @@ class TestChunkDocument:
         assert chunks[0].chunk_id.startswith("DOC_LEGACY_002_v1_c")
 
 
+class TestChunkClauseImagePreserved:
+    """clause 模式：无 clause 边界 / 正文为空时，暂存的 image_refs 绝不丢（载荷契约）。"""
+
+    def setup_method(self):
+        self.chunker = DocumentChunker(max_chunk_chars=300, min_chunk_chars=5, split_mode="clause")
+
+    def _img_block(self, idx=0):
+        return {"block_type": "image_ref", "text": "", "extra": {
+            "oss_key": f"processing/assets/hr/DOC/v1/img_{idx}.png",
+            "source_image": f"img_{idx}.png", "visual_summary": f"图{idx}说明",
+            "image_index": idx}}
+
+    def test_no_clause_boundary_keeps_images(self):
+        """无 第X条/一、 等条款标记 → fallback 文本切分，但暂存图片必须附到 chunk。"""
+        blocks = [
+            {"block_type": "paragraph", "text": "这是一段没有任何条款编号的普通说明文字内容。"},
+            self._img_block(0),
+        ]
+        chunks = self.chunker.chunk_from_blocks(blocks, "DOC_CLS_IMG1", 1)
+        assert any((c.extra or {}).get("image_refs") for c in chunks), "无 clause 边界时图片被丢弃"
+
+    def test_all_image_clause_doc_keeps_images(self):
+        """全图（正文为空）clause-routed 文档 → 新建承载图片的 chunk，绝不丢图。"""
+        blocks = [self._img_block(0), self._img_block(1)]
+        chunks = self.chunker.chunk_from_blocks(blocks, "DOC_CLS_IMG2", 1)
+        imgs = [r for c in chunks for r in ((c.extra or {}).get("image_refs") or [])]
+        assert len(imgs) == 2, f"全图文档丢图，chunks={[(c.chunk_type, c.extra) for c in chunks]}"
+
+
 class TestChunkFaq:
     """FAQ (split_mode='faq') 切分测试。"""
 

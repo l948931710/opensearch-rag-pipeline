@@ -1709,7 +1709,10 @@ class DocumentChunker:
         # 2. Join all paragraphs and split by clause boundaries
         full_text = "\n".join(all_para_texts)
         if not full_text.strip():
-            return self._dedup_table_chunks(table_chunks)
+            # 正文为空（全图/表+图文档）：仍要把暂存图片落定，绝不丢图
+            return self._finalize_clause_with_images(
+                table_chunks, pending_image_refs, doc_id, version_no,
+                chunk_index, meta, current_section)
 
         matches = list(_CLAUSE_RE.finditer(full_text))
 
@@ -1729,7 +1732,9 @@ class DocumentChunker:
                     metadata=meta,
                 ))
                 chunk_index += 1
-            return self._dedup_table_chunks(table_chunks + chunks)
+            return self._finalize_clause_with_images(
+                table_chunks + chunks, pending_image_refs, doc_id, version_no,
+                chunk_index, meta, current_section)
 
         # 3. Build clause segments
         clause_segments: List[str] = []
@@ -1811,19 +1816,32 @@ class DocumentChunker:
                 ))
                 chunk_index += 1
 
-        # 将暂存的 image_refs 附加到最后一个 chunk
-        all_result = table_chunks + chunks
-        if pending_image_refs and all_result:
-            last = all_result[-1]
-            existing = last.extra.get("image_refs", [])
-            last.extra["image_refs"] = existing + pending_image_refs
-            captions = [r.get("visual_summary", "") for r in pending_image_refs if r.get("visual_summary")]
-            if captions:
-                suffix = "\n[图片内容] " + "；".join(c[:120] for c in captions)
-                last.chunk_text += suffix
-                last.token_count = _estimate_tokens(last.chunk_text)
+        return self._finalize_clause_with_images(
+            table_chunks + chunks, pending_image_refs, doc_id, version_no,
+            chunk_index, meta, current_section)
 
-        return self._dedup_table_chunks(all_result)
+    def _finalize_clause_with_images(self, result_chunks, pending_image_refs, doc_id,
+                                     version_no, chunk_index, meta, section):
+        """clause 模式收尾：把暂存 image_refs 附到最后一个 chunk；若无任何文本/表格 chunk
+        （全图/表+图文档），新建一个承载 image_refs 的 chunk —— 绝不丢图（image_refs 载荷契约）。
+        所有 early-return 也走此口，否则 clause 边界缺失/正文为空时图片被静默丢弃。"""
+        if pending_image_refs:
+            captions = [r.get("visual_summary", "") for r in pending_image_refs if r.get("visual_summary")]
+            if result_chunks:
+                last = result_chunks[-1]
+                existing = last.extra.get("image_refs", [])
+                last.extra["image_refs"] = existing + pending_image_refs
+                if captions:
+                    last.chunk_text += "\n[图片内容] " + "；".join(c[:120] for c in captions)
+                    last.token_count = _estimate_tokens(last.chunk_text)
+            else:
+                text = ("[图片内容] " + "；".join(c[:120] for c in captions)) if captions else "[图片]"
+                img_chunk = self._create_chunk(
+                    doc_id=doc_id, version_no=version_no, chunk_index=chunk_index,
+                    chunk_type="text_chunk", chunk_text=text, section_title=section, metadata=meta)
+                img_chunk.extra["image_refs"] = pending_image_refs
+                result_chunks = result_chunks + [img_chunk]
+        return self._dedup_table_chunks(result_chunks)
 
     @staticmethod
     def _dedup_table_chunks(chunks: List["Chunk"]) -> List["Chunk"]:
