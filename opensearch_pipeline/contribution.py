@@ -68,14 +68,17 @@ def question_hash(s: Optional[str]) -> str:
 
 
 def synthesize_markdown(question: Optional[str], content: Optional[str]) -> str:
-    """把采纳的问答合成为可检索 .md 正文。
+    """把采纳的问答合成为可检索 .md 正文（FAQ 形态）。
 
-    正文 = 「# 问题」+「答案」，【不含提交人姓名/审计信息】（那些只留 kb_contribution 表，
-    doc_id↔contribution_id 即溯源链）。不加 YAML front matter——避免 .md 提取器把它当正文索引。
+    正文 = 「问：{问题}」+「答：{答案}」两段，让管线的 FAQ 分块器（chunker._chunk_faq 认 问：/答：
+    前缀）把问→答配成 1 个 faq_chunk：问题进 chunk 文本→检索可命中问句、答案聚合不被打散。
+    用「# 标题」会被当 heading 打断 FAQ 配对、丢问题，故不用。【不含提交人姓名/审计信息】（那些只留
+    kb_contribution 表，doc_id↔contribution_id 即溯源链）；不加 YAML front matter。
+    标题/展示名走 document_meta（采纳时已存问题），不依赖正文里的 heading。
     """
     q = (question or "").strip()
     c = (content or "").strip()
-    return f"# {q}\n\n{c}\n"
+    return f"问：{q}\n\n答：{c}\n"
 
 
 def contribution_state(review_status: Optional[str], ingestion_status: Optional[str]) -> str:

@@ -152,11 +152,13 @@ def test_normalize_and_hash_equivalence():
     assert C.question_hash("a") != C.question_hash("b")
 
 
-def test_synthesize_markdown_excludes_author_name():
+def test_synthesize_markdown_faq_shape_excludes_author_name():
     from opensearch_pipeline import contribution as C
     md = C.synthesize_markdown("如何报销?", "走 OA 流程提交。")
-    assert md == "# 如何报销?\n\n走 OA 流程提交。\n"
-    assert "张三" not in md and "提交人" not in md  # 姓名/审计绝不进正文
+    # FAQ 形态：问：/答： 段落（chunker._chunk_faq 可配成 1 个 faq_chunk）；不用 # 标题（会打断配对）
+    assert md == "问：如何报销?\n\n答：走 OA 流程提交。\n"
+    assert not md.lstrip().startswith("#")              # 无 H1 heading
+    assert "张三" not in md and "提交人" not in md      # 姓名/审计绝不进正文
 
 
 def test_contribution_state_folding():
@@ -239,8 +241,9 @@ def test_accept_happy_materializes_clean_doc(monkeypatch):
     # 写了 document_meta + document_version（NOT_STARTED）
     assert any("INSERT INTO" in s and "document_meta" in s for s, _ in conn.calls)
     assert any("document_version" in s and "NOT_STARTED" in s for s, _ in conn.calls)
-    # 合成正文洁净：OSS 写入内容不含提交人姓名
-    assert sink and "张三" not in sink[0][1] and "# 如何申请密钥?" in sink[0][1]
+    # 合成正文洁净（FAQ 形态：问：/答：，不含提交人姓名）
+    assert sink and "张三" not in sink[0][1]
+    assert "问：如何申请密钥?" in sink[0][1] and "答：" in sink[0][1]
 
 
 # ── 3b) 部门领导定可见范围 + 权限编码进路径（防 stage-2 升/降权）──

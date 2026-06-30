@@ -1637,6 +1637,40 @@ def node_classify_and_risk_assess(ctx: dict):
                         _cm.close()
             return True
 
+        # 1.6 知识贡献合成的 .md（contribution-<cid>.md）天生是「问→答」对：直接 pin 为 faq 类目，
+        # 走 FAQ 分块（问题进 chunk 文本→检索命中问句、答案聚合），跳过 LLM 重判（避免 category 漂移
+        # 翻 chunk 模式）。category_l1='faq' 不在 LLM 分类白名单(ALLOWED_CATEGORY_L1)，故此处直接落定
+        # 并【绕过下方 taxonomy 校验】（与 frozen_routing 同型，权限已在上方 resolve 过、不动）。
+        if os.path.basename(doc.get("source_key", "")).startswith("contribution-"):
+            doc["category_l1"] = "faq"
+            doc["category_l2"] = "qa"
+            doc["owner_dept"] = doc.get("owner_dept") or "unknown"
+            doc["faq_eligible"] = True
+            doc["confidence"] = 1.0
+            doc["summary"] = doc.get("summary") or text[:120]
+            doc["llm_risk_level"] = "low"
+            doc["classification_status"] = "CONTENT_CLASSIFIED"
+            if not simulate_db:
+                _cm = None
+                try:
+                    _cm = _get_db_conn(select_db=True)
+                    with _cm.cursor() as _cur:
+                        _cur.execute(
+                            "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s, "
+                            "permission_level=%s, kb_type=%s WHERE doc_id=%s",
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"],
+                             doc["permission_level"], doc["kb_type"], doc["doc_id"]))
+                        _cur.execute(
+                            "UPDATE document_version SET classification_method='CONTRIBUTION_FAQ', "
+                            "faq_eligible=1, classification_status='CONTENT_CLASSIFIED' "
+                            "WHERE doc_id=%s AND version_no=%s",
+                            (doc["doc_id"], doc["version_no"]))
+                        _cm.commit()
+                finally:
+                    if _cm:
+                        _cm.close()
+            return True
+
         # 2. 分类与风险评估
         classification = None
         api_failed = False
