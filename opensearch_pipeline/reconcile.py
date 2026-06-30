@@ -262,7 +262,16 @@ def collect_referenced_image_keys(rds_rows: List[Dict[str, Any]]) -> Dict[str, s
             ej = json.loads(raw) if isinstance(raw, str) else raw
         except Exception:  # noqa: BLE001
             continue
-        refs = ej.get("image_refs") if isinstance(ej, dict) else None
+        ej_dict = ej if isinstance(ej, dict) else {}
+        # 顶层 oss_key：独立 image chunk (pipeline_nodes ~4413) 和 step-card 派生 visual_knowledge
+        # (chunker ~1244) 把图键存在 extra 顶层，而非 image_refs[]。这些是非 step DOCX/PDF / 独立
+        # 图文档的【主要】图片载体，之前被下面的 image_refs 列表门 (isinstance(refs,list)) 整行跳过
+        # → OSS 对账在最易坏图处假性返回 ok=True，坏图告警从不触发。只取 oss_key（present 是 OSS
+        # key 集合）；source_image 是 URL，不与 present 同域，加入会误报 missing。
+        _top_k = ej_dict.get("oss_key")
+        if isinstance(_top_k, str) and _top_k and _top_k not in out:
+            out[_top_k] = r.get("chunk_id", "")
+        refs = ej_dict.get("image_refs")
         if not isinstance(refs, list):
             continue
         for ref in refs:

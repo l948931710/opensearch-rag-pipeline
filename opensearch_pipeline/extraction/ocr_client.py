@@ -292,7 +292,11 @@ class OCRClient:
 
             doc.close()
             combined = "\n\n".join(p.text for p in pages if p.text)
-            return OCRResult(pages=pages, combined_text=combined, status="DONE")
+            # 聚合状态：之前恒返回 DONE，即使每页都失败也掩盖为成功（扫描件内容全丢却报成功，
+            # 下游 node_write_chunk_meta 把它当"真空"以 DONE 收尾）。仅当所有页都 FAILED 时翻成
+            # FAILED（最小改动，不引入 PARTIAL 枚举，避免改动有文本的部分失败语义）。
+            agg_status = "FAILED" if (pages and all(p.status == "FAILED" for p in pages)) else "DONE"
+            return OCRResult(pages=pages, combined_text=combined, status=agg_status)
 
         except Exception as e:
             return OCRResult(status="FAILED", error=repr(e))
@@ -350,7 +354,10 @@ class OCRClient:
             payload = build_image_chat_payload(
                 self.ocr_model, _OCR_PROMPT, base64_image, mime_type, use_compat,
             )
-            resp = requests.post(url, json=payload, headers=auth_headers(self.api_key), timeout=60)
+            from opensearch_pipeline.vlm_retry import post_json_with_retry
+            # 重试瞬时 429/5xx：单次抖动会让该图/页 OCR 文本变空（被静默吞成 ""），降低 chunk 质量。
+            resp = post_json_with_retry(url, json=payload, headers=auth_headers(self.api_key),
+                                        timeout=60, label="OCR(DashScope)", post_fn=requests.post)
             if resp.status_code != 200:
                 raise RuntimeError(f"DashScope OCR HTTP {resp.status_code}: {resp.text[:500]}")
 

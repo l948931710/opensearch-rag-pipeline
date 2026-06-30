@@ -805,6 +805,8 @@ def node_build_canonical(ctx: dict):
                 "assets": result.assets,
                 # 成本封存标记：VLM-rebuild 成本闸拒绝 → node_redact_or_quarantine 据此跳过
                 "cost_quarantined": getattr(result, "cost_quarantined", False),
+                # DAG1 的 xlsx layout 判定（用真实 filename）→ 持久化供 DAG2 直接消费，不再重分类 (P0-3)
+                "xlsx_layout_type": getattr(result, "xlsx_layout_type", None),
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result.doc_id}"
@@ -1339,7 +1341,11 @@ def run_gemini_classification(text: str, model_name: str, api_key: str, api_base
             "temperature": 0  # DET: deterministic classification → stable category → stable chunk routing
         }
         
-        resp = requests.post(url, json=payload, headers=headers, timeout=90)
+        from opensearch_pipeline.vlm_retry import post_json_with_retry
+        # 重试瞬时 429/5xx：并发=RAG_CLASSIFY_CONCURRENCY(默认 8) 下 429 高发，单次失败会让整篇
+        # 文档分类失败、本轮不入库（DashScope 429 是已知脆弱点）。drop-in，调用方仍判 status_code。
+        resp = post_json_with_retry(url, json=payload, headers=headers, timeout=90,
+                                    label="classify(DashScope)", post_fn=requests.post)
         if resp.status_code != 200:
             raise Exception(f"DashScope API returned status code {resp.status_code}: {resp.text}")
             
@@ -3674,7 +3680,12 @@ def node_chunk_documents(ctx: dict):
                 m_overlap = ctx.get("sop_overlap", config.chunker.sop_strategy.overlap_chars)
 
             # ─── Step Card 路由：SOP/manual/guide 类文档 + 包含步骤标记 → step 模式 ───
-            if m_mode == "text" and _detect_step_patterns(doc):
+            # 也允许从 clause 升级（B1-3）：操作规程/检验规程/作业标准 等 step-rich 文档常因 cat=standard
+            # 或标题含"规范"先落 clause，却带真实步骤+截图——之前 step 检测只在 m_mode=='text' 时跑，
+            # 这些文档永远拿不到 step_card。_detect_step_patterns 仍要求 is_sop_like(sop/操作/作业指导/
+            # 规程/检验 等关键词或 ≥2 SOP 锚词) + ≥2 步骤边界，纯制度/规定政策文档（无 sop 信号）不会被
+            # 误升，仍走 clause。
+            if m_mode in ("text", "clause") and _detect_step_patterns(doc):
                 m_mode = "step"
                 m_chunk = ctx.get("sop_size", config.chunker.sop_strategy.max_chunk_chars)
                 m_overlap = 0  # step 模式按步骤边界切，不需要 overlap
@@ -3705,11 +3716,20 @@ def node_chunk_documents(ctx: dict):
                             if _text and _text not in _sheet_names:
                                 _sheet_names.append(_text)
 
-                xlsx_layout_type, _layout_debug = classify_xlsx_layout(
-                    filename=doc.get("filename", ""),
-                    sheet_names=_sheet_names,
-                    flat_text=text[:5000],  # 前 5000 字足够分类
-                )
+                # P0-3：优先消费 DAG1 持久化的 layout 判定（用真实 filename 分类一次）。DAG2 的
+                # doc.filename 在生产 Stage-2 重载后为空 → 若在此重分类会与 DAG1 不一致，可能把
+                # procedure_image_guide 误判成 normal_spreadsheet → _chunk_procedure_steps 不触发、
+                # step_card 结构静默丢失。仅当 canonical 无持久值（旧 canonical 向后兼容）才回退重分类。
+                _persisted_layout = doc.get("xlsx_layout_type")
+                if _persisted_layout:
+                    xlsx_layout_type = _persisted_layout
+                    _layout_debug = {"scores": {}, "matched_signals": ["persisted-from-DAG1"]}
+                else:
+                    xlsx_layout_type, _layout_debug = classify_xlsx_layout(
+                        filename=doc.get("filename", ""),
+                        sheet_names=_sheet_names,
+                        flat_text=text[:5000],  # 前 5000 字足够分类
+                    )
                 print(f"    ├─ [xlsx-layout] {xlsx_layout_type} "
                       f"(scores={_layout_debug['scores']}, "
                       f"signals={_layout_debug['matched_signals'][:2]})")
@@ -4972,20 +4992,72 @@ def node_write_chunk_meta(ctx: dict):
                 print(f"    └─ [SIMULATED] {doc_id} v{ver} chunk_status='QUARANTINED_EXPLOSION', "
                       f"publish_status='SKIPPED_EXPLOSION', rag_ready_key=NULL")
         elif chunk_cnt == 0:
-            print(f"    ⚠️ No valid chunks generated for document {doc_id} v{ver}")
+            # 0 chunk 收尾：区分「真空文档」(合法无文本) 与「疑似失败」(本应有内容却没产出)。
+            # 旧逻辑一律 chunk_status='EMPTY' + content_process_status='DONE'(成功)，使损坏文件 /
+            # 扫描件 OCR 失败 / 抽取异常 的文档与合法空文档无法区分 → 坏 SOP 静默从检索消失且无告警
+            # (known-issues: 77 chunk-EMPTY 中 4 个真 SOP=bug 即此类)。用 canonical 已有信号判定，
+            # 疑似失败 → NEEDS_REVIEW + FAILED（可查询、不被 NOT_STARTED 扫描重新认领 → 不形成
+            # 重试循环），原因写入 content_process_error。无 schema 变更（列均为 VARCHAR）。
+            # 隔离文档 (PII / 成本 QUARANTINE) 不在此重新定级 —— 保留既有 EMPTY/DONE 行为不动。
+            _canon = _canon_by_dv.get((doc_id, ver), {}) or {}
+            _is_quarantine = _canon.get("redaction_action") == "QUARANTINE"
+            _text_len = _canon.get("text_length")
+            if _text_len is None:
+                _text_len = len(_canon.get("text") or "")
+            _ocr_status = str(_canon.get("ocr_status") or "").upper()
+            _extract_method = str(_canon.get("extract_method") or "")
+            _warns = _canon.get("warnings") or []
+            try:
+                _text_threshold = int(os.environ.get("RAG_EMPTY_DOC_TEXT_THRESHOLD", "100"))
+            except ValueError:
+                _text_threshold = 100
+
+            _reasons = []
+            if not _is_quarantine:
+                if _ocr_status == "FAILED":
+                    _reasons.append("ocr_failed")
+                if _text_len >= _text_threshold:
+                    # 有实质正文却 0 chunk → chunker/validator 把所有 chunk 丢光（如超长 table_chunk）
+                    _reasons.append(f"text_present({_text_len}chars)_but_zero_chunks")
+                _em_low = _extract_method.lower()
+                if any(k in _em_low for k in ("unsupported", "failed", "error")):
+                    _reasons.append(f"extract_method={_extract_method}")
+                _faily = [str(w) for w in _warns if any(
+                    k in str(w).lower() for k in ("fail", "error", "cannot", "无法", "错误", "失败"))]
+                if _faily:
+                    _reasons.append("warn:" + " | ".join(_faily))
+
+            if _reasons:
+                # content_process_status='FAILED' 复用既有"毒文档"机制：orchestrator Stage-2 谓词
+                # (content_process_status='FAILED' AND retry_count<3) 会重试 ≤3 次（自愈瞬时
+                # OCR/embedding 整轮故障），到 retry_count=3 自然停在 FAILED 等人工检查。**必须**在此
+                # 自增 retry_count —— claim 本身不自增，否则确定性坏文档(损坏 DOCX 等)会无限重处理。
+                _chunk_status, _cps = "NEEDS_REVIEW", "FAILED"
+                _cpe = ("suspected extraction/chunk failure: " + "; ".join(_reasons))[:255]
+                _retry_clause = ", retry_count = retry_count + 1"
+                print(f"    🚨 {doc_id} v{ver}: 0 chunks + SUSPECTED FAILURE → "
+                      f"chunk_status=NEEDS_REVIEW, content_process_status=FAILED, retry_count+1 ({_cpe})")
+            else:
+                _chunk_status, _cps = "EMPTY", "DONE"
+                _cpe = "No valid chunks generated (empty document)"
+                _retry_clause = ""
+                _tag = "quarantined" if _is_quarantine else "treated as empty"
+                print(f"    ⚠️ No valid chunks generated for document {doc_id} v{ver} ({_tag})")
+
             if not simulate_db:
                 conn = None
                 try:
                     conn = _get_db_conn(select_db=True)
                     with conn.cursor() as cursor:
-                        cursor.execute("""
+                        # _retry_clause 是上面二选一的常量字面量（非用户输入）→ 无注入风险。
+                        cursor.execute(f"""
                             UPDATE document_version
-                            SET chunk_status = 'EMPTY',
-                                content_process_status = 'DONE',
-                                content_process_error = 'No valid chunks generated',
+                            SET chunk_status = %s,
+                                content_process_status = %s,
+                                content_process_error = %s{_retry_clause},
                                 processed_at = NOW()
                             WHERE doc_id = %s AND version_no = %s
-                        """, (doc_id, ver))
+                        """, (_chunk_status, _cps, _cpe, doc_id, ver))
                         conn.commit()
                 except Exception as db_err:
                     if conn: conn.rollback()
@@ -4994,7 +5066,8 @@ def node_write_chunk_meta(ctx: dict):
                     if conn:
                         conn.close()
             else:
-                print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} chunk_status='EMPTY', content_process_status='DONE'")
+                print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} "
+                      f"chunk_status='{_chunk_status}', content_process_status='{_cps}'")
         else:
             print(f"    └─ Document {doc_id} v{ver} generated {chunk_cnt} valid chunks.")
             if not simulate_db:

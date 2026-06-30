@@ -430,6 +430,10 @@ def extract_images_from_xlsx(
     img_index = 0
 
     for sheet_idx, ws in enumerate(wb.worksheets):
+        # 隐藏/超隐藏 sheet 的图片不提取（B2-1，与文本路径一致）。enumerate 不跳号 → sheet_idx
+        # 与文本路径对齐（drawing→sheet 的 MD5 字节匹配仍兜底）。getattr 兜底，优雅降级。
+        if getattr(ws, "sheet_state", "visible") != "visible":
+            continue
         if not hasattr(ws, '_images'):
             continue
 

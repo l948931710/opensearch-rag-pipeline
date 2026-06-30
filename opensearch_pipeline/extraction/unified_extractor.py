@@ -9,6 +9,7 @@ DAG 层不需要知道文件类型，只调用 extract() 即可。
 """
 
 import copy
+import datetime as _dt
 import os
 import tempfile
 from typing import Dict, List, Optional
@@ -104,6 +105,33 @@ def _csv_to_text(raw_csv: str) -> str:
 _VLM_CACHE_VALID_STATUSES = {"DISCARD_DECORATIVE", "ROUTE_TO_TEXT", "ROUTE_TO_VECTOR"}
 
 
+def _vlm_cache_ns(is_public):
+    """缓存命名空间：pub/sec [+ 可选模型/prompt 版本标签]。
+
+    RAG_VLM_CACHE_VERSION 默认空 → key 与历史完全一致（零行为变化、不强制重打缓存）。升级 VLM
+    模型或改 funnel prompt 后，把它设成一个新值（如新模型名）即可让旧缓存整体【干净失效】、按新
+    模型重打，而无需手动清 scratch/OSS 缓存——修复"模型升级后旧标注被永久复用"的陈旧问题。
+    """
+    ns = "pub" if is_public else "sec"
+    ver = os.environ.get("RAG_VLM_CACHE_VERSION", "").strip()
+    return f"{ns}:{ver}" if ver else ns
+
+
+def _xlsx_cell_to_str(c) -> str:
+    """xlsx 单元格值 → 字符串。data_only=True 下日期单元格是 datetime/date 对象，裸 str() 会产出
+    '2024-01-15 00:00:00' 这类噪声 → 渲染为干净日期。
+    注意：百分比/前导零(001234) 的语义依赖 cell.number_format，而 read_only 的 iter_rows(values_only)
+    路径取不到 number_format（大表强制 read_only）→ 那部分不在此处理（B2-4 deferred，避免只在小表生效
+    的不一致 + 改 chunk 文本带来的 embedding 漂移）。仅日期清理：不依赖 number_format，两条路径一致、安全。"""
+    if isinstance(c, _dt.datetime):
+        if (c.hour, c.minute, c.second) == (0, 0, 0):
+            return c.strftime("%Y-%m-%d")
+        return c.strftime("%Y-%m-%d %H:%M")
+    if isinstance(c, _dt.date):
+        return c.strftime("%Y-%m-%d")
+    return str(c)
+
+
 def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
     """带命名空间的 VLM 缓存查询 + 遗留裸 MD5 key 的只读回退。
 
@@ -114,10 +142,13 @@ def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
     污染。命中即迁移到带后缀 key（内存中；真实运行随 _save_vlm_cache
     持久化，simulate 不落盘），裸 key 自然老化。只读新写仍只用带后缀 key。
     """
-    cache_key = f"{file_hash}:{'pub' if is_public else 'sec'}"
+    cache_key = f"{file_hash}:{_vlm_cache_ns(is_public)}"
     entry = vlm_cache.get(cache_key)
     if entry is not None:
         return entry
+    # 设了显式缓存版本（模型/prompt 升级）→ 不回退任何旧 key，让旧条目干净失效、按新模型重打。
+    if os.environ.get("RAG_VLM_CACHE_VERSION", "").strip():
+        return None
     if not is_public:
         return None
     legacy = vlm_cache.get(file_hash)
@@ -458,8 +489,8 @@ class UnifiedExtractor:
 
         # ── 方案 B：用 extract_docx_with_images 获得段落级 image_ref 位置 ──
         # 这让 _inject_image_ref_blocks 走精确匹配路径而非启发式均匀分配
-        blocks, inline_image_assets = extract_docx_with_images(local_path)
-        warnings = []
+        blocks, inline_image_assets, docx_warnings = extract_docx_with_images(local_path)
+        warnings = list(docx_warnings)
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
 
@@ -601,6 +632,16 @@ class UnifiedExtractor:
             for sheet_idx, sheet_name in enumerate(wb.sheetnames):
                 ws = wb[sheet_name]
 
+                # 隐藏/超隐藏 sheet 不入库（B2-1）：常为草稿/中间计算/下拉源/内部辅助数据，
+                # 入库 = 噪声，且可能泄露不该展示的内容。不静默——逐 sheet loud log。enumerate
+                # 不跳号 → 可见 sheet 的 sheet_idx/page_num 与图片路径(同样跳隐藏)保持一致。
+                # getattr 兜底默认 'visible'，odd worksheet 对象不致中断抽取（优雅降级）。
+                _state = getattr(ws, "sheet_state", "visible")
+                if _state != "visible":
+                    warnings.append(f"skipped {_state} sheet: {sheet_name}")
+                    print(f"      ⏭️ [xlsx] skip {_state} sheet '{sheet_name}' (not ingested)", flush=True)
+                    continue
+
                 # 合并单元格"向下填充"：纵向合并的首格值（如"类别"列）传播到该列下方各行，
                 # 避免下游丢失分组键。横向合并不填充（标题只出现一次）。
                 merge_fill = {}
@@ -641,7 +682,7 @@ class UnifiedExtractor:
                     for ci0, c in enumerate(row):
                         if c is None and (row_idx, ci0 + 1) in merge_fill:
                             c = merge_fill[(row_idx, ci0 + 1)]
-                        cells.append(str(c) if c is not None else "")
+                        cells.append(_xlsx_cell_to_str(c) if c is not None else "")
                     all_rows.append((row_idx, cells))
 
                     # 检测表头行（命中 ≥2 个关键词）
@@ -871,6 +912,8 @@ class UnifiedExtractor:
             blocks=blocks,
             warnings=warnings,
             assets=assets,
+            # 持久化 DAG1 的 layout 判定（用真实 task filename 分类），DAG2 直接消费，不再重分类。
+            xlsx_layout_type=_layout_type,
         )
 
     # ── PPTX ──
@@ -1001,9 +1044,12 @@ class UnifiedExtractor:
                         fallback_title = f"Slide {page_num}" + (f": {first_text}" if first_text else "")
                         current_section = fallback_title
 
-                # ── Phase 3: Speaker notes → paragraph block ──
+                # ── Phase 3: Speaker notes → paragraph block（默认关闭，B2-2）──
+                # 演讲备注常含演讲提示/内部备注/旧内容/"此页不要展示"等，默认不入库。需要时
+                # 设 RAG_PPTX_INCLUDE_NOTES=1/true/yes 显式开启（沿用项目 default-OFF flag 约定）。
+                _include_notes = os.environ.get("RAG_PPTX_INCLUDE_NOTES", "").lower() in ("1", "true", "yes")
                 try:
-                    if slide.has_notes_slide and slide.notes_slide:
+                    if _include_notes and slide.has_notes_slide and slide.notes_slide:
                         notes_text = slide.notes_slide.notes_text_frame.text.strip()
                         if notes_text and len(notes_text) > 5:
                             blocks.append(ExtractedBlock(
@@ -1296,7 +1342,7 @@ class UnifiedExtractor:
                         if clean != cached.get("ocr_text"):
                             cached = dict(cached)
                             cached["ocr_text"] = clean
-                            vlm_cache[f"{file_hash}:{'pub' if is_public else 'sec'}"] = cached
+                            vlm_cache[f"{file_hash}:{_vlm_cache_ns(is_public)}"] = cached
                     hash_to_cached_result[file_hash] = cached
             hash_to_candidates[file_hash].append(img_asset)
 
@@ -1308,6 +1354,43 @@ class UnifiedExtractor:
         if dup_count > 0 or cache_hit_count > 0:
             print(f"      [Hash Dedup] {len(candidates)} candidates → {total_unique} unique, "
                   f"{cache_hit_count} cache hits, {len(need_vlm_hashes)} need VLM")
+
+        # ── 单文档图片硬上限（默认无限）──
+        # 一个图爆多的文档 = N 张图 × (1 OCR + 1 VLM) DashScope 调用，无任何硬界。RAG_FUNNEL_MAX_IMAGES
+        # 给一个可预测的 per-doc 上限：>0 且 need_vlm 超限时，截断尾部并 loud log（绝不静默丢）。这是
+        # 与成本熔断器(opt-in、按 RMB)互补的、默认安全的最坏情况界；默认 0 = 不限 → 零行为变化。
+        try:
+            _funnel_cap = int(os.environ.get("RAG_FUNNEL_MAX_IMAGES", "0"))
+        except ValueError:
+            _funnel_cap = 0
+        if _funnel_cap > 0 and len(need_vlm_hashes) > _funnel_cap:
+            print(f"    🚨 [img-funnel] {doc_id}: {len(need_vlm_hashes)} unique images exceed "
+                  f"RAG_FUNNEL_MAX_IMAGES={_funnel_cap} → capping; "
+                  f"{len(need_vlm_hashes) - _funnel_cap} image(s) skipped (no VLM/OCR)", flush=True)
+            need_vlm_hashes = need_vlm_hashes[:_funnel_cap]
+
+        # ── Cost ceiling: 把 always-on 图片漏斗纳入与 VLM-rebuilder 相同的成本熔断器 ──
+        # 此前熔断器只 gate 默认关闭的 rebuilder（unified_extractor:434/443），always-on 的嵌入图
+        # 漏斗（每张图 = 1 OCR + 1 VLM 调用）完全无成本上限。这里用 *同一个* run 级 breaker 计费：
+        # breaker 默认 disabled → no-op（零行为变化）；一旦启用，单文档/单次运行的 VLM 图片预算
+        # 同样约束漏斗。DENY → 跳过本文档剩余 VLM（图片不过 VLM），loud log + run 级熔断告警，
+        # 绝不静默。估算/预留任何异常都放行漏斗（优雅降级，不阻断抽取）。
+        _breaker = getattr(self, "cost_breaker", None)
+        if _breaker is not None and getattr(_breaker, "enabled", False) and need_vlm_hashes:
+            try:
+                from opensearch_pipeline.extraction.cost_breaker import estimate_doc_cost
+                _file_ext = (task.get("file_ext")
+                             or os.path.splitext(task.get("local_path", ""))[1]).lstrip(".").lower()
+                _est = estimate_doc_cost(_file_ext, unit_count=len(need_vlm_hashes),
+                                         cached_count=0, cfg=self.config)
+                _allowed, _reason = _breaker.try_reserve(doc_id, _est)
+                if not _allowed:
+                    print(f"    🚨 [CostBreaker] funnel DENY {doc_id}: {_reason} "
+                          f"→ skipping VLM for {len(need_vlm_hashes)} image(s) this doc", flush=True)
+                    _breaker.maybe_alert_run_tripped()
+                    need_vlm_hashes = []
+            except Exception as _ce:
+                print(f"    ⚠️ [CostBreaker] funnel reserve skipped (non-fatal): {_ce}", flush=True)
 
         # ── Phase 2: Funnel 2+3 并发处理，仅处理未命中缓存的唯一图片 ──
         max_workers = int(os.environ.get("RAG_VLM_CONCURRENCY", "8"))
@@ -1345,7 +1428,7 @@ class UnifiedExtractor:
                         # 真实运行会命中 mock 描述（缓存投毒）。
                         if (not self.simulate and not funnel_res.get("degraded")
                                 and not file_hash.startswith("fallback_")):
-                            cache_key = f"{file_hash}:{'pub' if is_public else 'sec'}"
+                            cache_key = f"{file_hash}:{_vlm_cache_ns(is_public)}"
                             vlm_cache[cache_key] = {
                                 "status": funnel_res.get("status", ""),
                                 "visual_summary": funnel_res.get("visual_summary", ""),

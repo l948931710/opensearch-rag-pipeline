@@ -368,7 +368,7 @@ def _has_images(para_element) -> bool:
 
 def extract_docx_with_images(
     local_path: str,
-) -> Tuple[List[ExtractedBlock], List["ImageAsset"]]:
+) -> Tuple[List[ExtractedBlock], List["ImageAsset"], List[str]]:
     """
     带图片位置追踪的 DOCX 提取（方案 B — heuristic）。
 
@@ -398,15 +398,19 @@ def extract_docx_with_images(
         from docx.text.paragraph import Paragraph
         from docx.table import Table
     except ImportError:
-        return [], []
+        return [], [], ["python-docx not installed, cannot extract DOCX"]
 
     try:
         document = docx.Document(local_path)
-    except Exception:
-        return [], []
+    except Exception as e:
+        # 损坏 / 加密 / 截断下载的 DOCX：之前静默 return [], [] → 上游 warnings=[]，
+        # 0 chunk 却以 DONE(成功) 收尾，坏文档无任何信号。回传 warning 让其可被
+        # node_write_chunk_meta 的"疑似失败"判定捕获（DOCX 无 OCR 兜底，必须显式留痕）。
+        return [], [], [f"Failed to open DOCX: {e}"]
 
     blocks: List[ExtractedBlock] = []
     image_assets: List[ImageAsset] = []
+    warnings: List[str] = []
     current_section: Optional[str] = None
     image_counter = 0
 
@@ -597,4 +601,4 @@ def extract_docx_with_images(
                         extra={"row_count": len(rows_text)},
                     ))
 
-    return blocks, image_assets
+    return blocks, image_assets, warnings
