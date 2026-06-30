@@ -876,8 +876,11 @@ def test_low_confidence_band_vs_guard_flag():
 
 def test_resign_images_whitelist(client, monkeypatch):
     import opensearch_pipeline.oss_url as oss_url
+    import opensearch_pipeline.api as api
     monkeypatch.setattr(oss_url, "generate_signed_url",
                         lambda key, expires=None, method="GET": "https://fresh/" + key)
+    # 鉴权：模拟调用者对 DOC1 有可见权（真实逻辑在 test_resign_images_entitlement_* 覆盖）
+    monkeypatch.setattr(api, "_resign_visible_doc_ids", lambda doc_ids, identity: {"DOC1"})
     legit = "processing/assets/admin/DOC1/v2/img_001.png"
     r = client.post("/api/resign-images", json={"oss_keys": [
         legit,
@@ -893,11 +896,28 @@ def test_resign_images_whitelist(client, monkeypatch):
     assert urls["processing/assets/admin/DOC1/v2/file.pdf"] == ""
 
 
+def test_resign_images_denies_unentitled(client, monkeypatch):
+    """越权防护：白名单通过但调用者对该文档无可见权 → 空串（不签名，不泄露图字节）。"""
+    import opensearch_pipeline.oss_url as oss_url
+    import opensearch_pipeline.api as api
+    signed = []
+    monkeypatch.setattr(oss_url, "generate_signed_url",
+                        lambda key, expires=None, method="GET": signed.append(key) or ("https://fresh/" + key))
+    monkeypatch.setattr(api, "_resign_visible_doc_ids", lambda doc_ids, identity: set())  # 无任何可见文档
+    key = "processing/assets/hr/DOC_HR_X/v1/img_3.png"
+    r = client.post("/api/resign-images", json={"oss_keys": [key]})
+    assert r.status_code == 200
+    assert r.json()["urls"][key] == ""
+    assert signed == []  # 越权 key 绝不进入签名
+
+
 def test_resign_images_sign_failure_fail_open(client, monkeypatch):
     import opensearch_pipeline.oss_url as oss_url
+    import opensearch_pipeline.api as api
     def _boom(key, expires=None, method="GET"):
         raise RuntimeError("oss down")
     monkeypatch.setattr(oss_url, "generate_signed_url", _boom)
+    monkeypatch.setattr(api, "_resign_visible_doc_ids", lambda doc_ids, identity: {"b"})
     r = client.post("/api/resign-images",
                     json={"oss_keys": ["processing/assets/a/b/v1/c.png"]})
     assert r.status_code == 200
@@ -908,6 +928,38 @@ def test_resign_images_batch_cap(client):
     keys = [f"processing/assets/a/b/v1/{i}.png" for i in range(11)]
     r = client.post("/api/resign-images", json={"oss_keys": keys})
     assert r.status_code == 422  # max_length=10
+
+
+def test_resign_images_entitlement_boundary(monkeypatch):
+    """_resign_visible_doc_ids 复用检索权限边界：public 放行 / owner 展开命中放行 /
+    其它部门 dept_internal 拒 / restricted 永不 / 未知 doc 拒。"""
+    import opensearch_pipeline.api as api
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    rows = [
+        ("DOC_PUB", "public", "hr"),
+        ("DOC_MKT", "dept_internal", "marketing"),
+        ("DOC_HR", "dept_internal", "hr"),
+        ("DOC_RES", "restricted", "marketing"),
+    ]
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): pass
+        def fetchall(self): return rows
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def close(self): pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _Conn())
+    ident = api.Identity(user_id="u1", acl_groups=["marketing"])
+    visible = api._resign_visible_doc_ids(
+        {"DOC_PUB", "DOC_MKT", "DOC_HR", "DOC_RES", "DOC_UNKNOWN"}, ident)
+    assert visible == {"DOC_PUB", "DOC_MKT"}
+    # 匿名（无 identity）→ groups 空 → 仅 public 放行
+    assert api._resign_visible_doc_ids({"DOC_PUB", "DOC_MKT"}, None) == {"DOC_PUB"}
 
 
 # ── /api/history（仅本人 · 强制鉴权） ────────────────────────────────
