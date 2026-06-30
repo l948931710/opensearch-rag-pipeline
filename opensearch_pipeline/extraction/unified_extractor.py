@@ -284,6 +284,10 @@ class UnifiedExtractor:
     # Increment 0b: PDF 逐页 OCR 门槛——原生文本少于此字符数的页视为扫描页/坏字体页，
     # 单独送 OCR；取代旧的"按整文档 text_length 一刀切"（封面有字则整文档跳过 OCR）。
     PER_PAGE_OCR_THRESHOLD = 50
+    # 原生文本抽取的页上限（必须与 pdf_extractor.extract_pdf 的 max_pages 默认值一致）。
+    # OCR 门槛只考察【原生抽取实际覆盖过】的页：超过此上限的页根本没被抽取（按设计截断），
+    # 不能因其"0 原生字符"就误判为需 OCR——那会浪费 Qwen-VL 预算、并把真扫描页挤出 OCR 配额。
+    PDF_NATIVE_MAX_PAGES = 20
 
     def __init__(
         self,
@@ -492,9 +496,17 @@ class UnifiedExtractor:
                     matched.image_index = ia.image_index
                     aligned_exports.append(matched)
 
-            # 如果对齐成功（大部分都能匹配），用对齐后的列表
+            # 如果对齐成功（大部分都能匹配），用对齐后的列表——但【保留】未匹配到 inline ref 的
+            # 导出图（页眉/页脚/VML-only、或 ref 解析失败者），否则它们被静默丢弃、永不索引/渲染。
+            # 追加在末尾并重排 image_index（接 aligned 之后），不碰 inline 已绑定图的下标/顺序。
             if len(aligned_exports) >= len(exported_images) * 0.5:
-                exported_images = aligned_exports
+                leftovers = [ea for ea in exported_images if id(ea) not in consumed_ids]
+                next_idx = max((getattr(ea, "image_index", 0) for ea in aligned_exports),
+                               default=-1) + 1
+                for ea in leftovers:
+                    ea.image_index = next_idx
+                    next_idx += 1
+                exported_images = aligned_exports + leftovers
 
         # ── 条带切片缝合（须在对齐之后：依赖 ref↔asset 的 image_index 对应）──
         try:
@@ -1060,7 +1072,7 @@ class UnifiedExtractor:
         # HTML/CSV 此前被直读为纯文本：HTML 满屏标签、CSV 引号/转义糊在一起。
         # 先转成可读文本再走统一分块；转换失败回退原文（保持优雅降级约定）。
         extract_method = "plain_text"
-        if file_ext == "html":
+        if file_ext in ("html", "htm"):   # .htm 与 .html 同样去标签（否则 .htm 满屏标签进索引）
             raw_text = _html_to_text(raw_text)
             extract_method = "html_text"
         elif file_ext == "csv":
@@ -1623,7 +1635,9 @@ class UnifiedExtractor:
                 continue
             txt = (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")) or ""
             per_page[pg] = per_page.get(pg, 0) + len(txt.strip())
-        return [pg for pg in range(1, page_count + 1)
+        # 只考察原生抽取覆盖过的页（≤ PDF_NATIVE_MAX_PAGES）；越界页未被抽取，非"缺文本=需OCR"。
+        scan_upto = min(page_count, self.PDF_NATIVE_MAX_PAGES)
+        return [pg for pg in range(1, scan_upto + 1)
                 if per_page.get(pg, 0) < self.PER_PAGE_OCR_THRESHOLD]
 
     def _needs_ocr(self, result: ExtractionResult) -> bool:
