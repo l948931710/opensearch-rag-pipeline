@@ -122,15 +122,15 @@ class TestImageFunnelThreeStages:
         assert result["status"] == "QUARANTINE_SENSITIVE"
         assert "Funnel 3" in result["reason"]
 
-    def test_funnel3_vlm_sensitive_bypassed_for_public(self, temp_image):
-        """测试漏斗 3：如果是普通 raw 下的内部公开文档 (is_public = True)，会跳过敏感印章拦截，路由至向量化。"""
-        # is_public = True 时，虽然含有 "seal"，但会跳过安全敏感报警
+    def test_funnel3_vlm_sensitive_quarantined_even_when_public(self, temp_image):
+        """新策略（2026-06-29「保留旁路但不丢信号」）：is_public=True 仅省去 VLM 敏感审计【指令】，
+        但若 VLM 仍主动判定 SENSITIVE（公章/身份证），不再强制 CLEAN 放行，而是隔离不索引。"""
         img_path = temp_image(100, 100, "red_seal_stamp.png", fill_bytes=5120)
         processor = ImageFunnelProcessor(simulate=True)
-        
+
         result = processor.process_image(img_path, doc_id="doc_pub", is_public=True)
-        assert result["status"] == "ROUTE_TO_VECTOR"
-        assert "visual_summary" in result
+        assert result["status"] == "QUARANTINE_SENSITIVE"   # 不再 ROUTE_TO_VECTOR
+        assert "Funnel 3" in result["reason"]
 
     def test_funnel3_vlm_low_relevance(self, temp_image):
         """测试漏斗 3：低业务相关性图片（例如 banner、decoration、spacer）会被判定为 LOW_RELEVANCE 并丢弃。"""
