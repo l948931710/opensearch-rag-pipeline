@@ -41,6 +41,29 @@ def test_raw_key_owner_is_second_segment():
     assert _dept_from_raw_key(key) == "marketing"   # 管线据此解析 owner_dept
 
 
+def test_raw_key_permission_encoding_and_dept_segment():
+    """可见范围编码进第 3 段(internal/restricted),部门恒第 2 段;public/省略=扁平(向后兼容)。
+    防自助上传/贡献的 dept_internal/restricted 被管线 stage-2 静默升 public(staging 实测)。"""
+    from opensearch_pipeline.pipeline_nodes import _dept_from_raw_key, resolve_permission_level
+    di = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level="dept_internal")
+    assert "/internal/" in di and _dept_from_raw_key(di) == "marketing"
+    rs = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level="restricted")
+    assert "/restricted/" in rs and _dept_from_raw_key(rs) == "marketing"
+    pub = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level="public")
+    flat = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf")   # 省略 → 扁平(旧行为)
+    assert "/internal/" not in pub and "/restricted/" not in pub and pub == flat
+    # 管线路径启发式解析回登记值(round-trip,防升/降权)
+    assert resolve_permission_level({"doc_id": "DOC_X", "source_key": di}, {"tasks": []}) == "dept_internal"
+    assert resolve_permission_level({"doc_id": "DOC_X", "source_key": pub}, {"tasks": []}) == "public"
+
+
+def test_perm_from_raw_key_roundtrip():
+    for perm in ("dept_internal", "public", "restricted"):
+        rk = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level=perm)
+        assert ku.perm_from_raw_key(rk) == perm
+    assert ku.perm_from_raw_key("raw/marketing/DOC_X/UP1/f.pdf") == "public"   # 扁平 → public
+
+
 # ── 签名 upload token：往返 / 篡改 / 过期 ──────────────────────────
 def test_upload_token_roundtrip(monkeypatch):
     monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
