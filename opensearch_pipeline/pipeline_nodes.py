@@ -1473,6 +1473,21 @@ def _unfrozen_rechunk_acked(ctx, prior) -> bool:
     return bool(ok)
 
 
+def _safe_classification_fields(classification: dict, text: str) -> dict:
+    """从（可能缺键的）LLM 分类结果取字段，缺键用保守默认 —— 绝不 KeyError。
+
+    compatible-mode 不硬约束 JSON schema，模型在负载/截断下常漏键；直接索引会崩节点。
+    默认取"低置信(0.0)/低风险(low)/非 faq"——保守、不误升权（PII 仍由 node_detect_sensitive
+    的正则独立把关，不依赖此处 risk）。
+    """
+    return {
+        "confidence": classification.get("confidence", 0.0),
+        "faq_eligible": classification.get("faq_eligible", False),
+        "summary": classification.get("summary") or (text or "")[:100],
+        "llm_risk_level": classification.get("llm_risk_level", "low"),
+    }
+
+
 def node_classify_and_risk_assess(ctx: dict):
     """
     文档分类 + 风险评估（合并节点，单次 LLM 调用）。
@@ -1749,7 +1764,11 @@ def node_classify_and_risk_assess(ctx: dict):
             return False  # 标记为失败，主循环跳过
 
         else:
-            confidence = classification["confidence"]
+            # LLM 输出不可信：compatible-mode 不强制 JSON schema，缺键常见（负载/截断）。
+            # 经 _safe_classification_fields 取值（.get + 保守默认），缺键绝不 KeyError 崩节点
+            # （此前直接索引会，且单文档路径无 try/except → 整节点 abort）。
+            sc = _safe_classification_fields(classification, text)
+            confidence = sc["confidence"]
 
             l1 = str(classification.get("category_l1", "")).strip().lower()
             l2 = str(classification.get("category_l2", "")).strip().lower()
@@ -1763,10 +1782,10 @@ def node_classify_and_risk_assess(ctx: dict):
             doc["category_l1"] = l1
             doc["category_l2"] = l2
             doc["owner_dept"] = doc.get("owner_dept") or "unknown"
-            doc["faq_eligible"] = classification["faq_eligible"]
+            doc["faq_eligible"] = sc["faq_eligible"]
             doc["confidence"] = confidence
-            doc["summary"] = classification["summary"]
-            doc["llm_risk_level"] = classification["llm_risk_level"]
+            doc["summary"] = sc["summary"]
+            doc["llm_risk_level"] = sc["llm_risk_level"]
 
             if confidence < 0.85:
                 print(f"    ⚠️ Low confidence ({confidence:.2f} < 0.85) for {doc['doc_id']}. Proceeding without quarantine.")
@@ -1814,10 +1833,15 @@ def node_classify_and_risk_assess(ctx: dict):
     failed_doc_ids = set()
 
     if len(valid_canonicals) <= 1:
-        # 单文档无需并发
+        # 单文档无需并发。异常处理与多文档路径【一致】：捕获→标记该 doc 失败→drop+续跑，
+        # 绝不让单文档的异常（如 DB 持久化 RuntimeError）propagate 出去 abort 整个节点。
         for doc in valid_canonicals:
-            success = _classify_single_doc(doc)
-            if not success:
+            try:
+                success = _classify_single_doc(doc)
+                if not success:
+                    failed_doc_ids.add(doc["doc_id"])
+            except Exception as e:
+                print(f"    ❌ Unexpected error classifying {doc['doc_id']}: {e}")
                 failed_doc_ids.add(doc["doc_id"])
     else:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(valid_canonicals))) as pool:
