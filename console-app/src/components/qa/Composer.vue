@@ -21,7 +21,7 @@ defineExpose({ focus: () => ta.value?.focus() })
 </script>
 
 <template>
-  <div class="mx-auto w-full max-w-3xl px-4">
+  <div class="mx-auto w-full max-w-3xl xl:max-w-4xl px-4">
     <div class="rounded-2xl border border-input bg-card px-3 py-2 shadow-sm
                 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/15">
       <div class="flex items-end gap-2">
