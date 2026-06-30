@@ -836,6 +836,12 @@ async def card_callback(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="无法解析请求体")
 
+    # HTTP 专属计数日志：Stream 投递的回调经 _CardCallbackHandler 直达 _process_card_callback_body，
+    # 不过本 HTTP 路由。故这行只在【存量 callbackType=HTTP 卡】（旧卡 / Stream 客户端 down 窗口发的卡）
+    # 的按钮点击时打 —— SAE 日志数它即可判断旧卡何时老化归零、从而安全关闭本公网端点。
+    logger.info("[CARD-CB-HTTP] 经公网 HTTP 端点收到卡片回调（非 Stream）: outTrackId=%s userId=%s",
+                (body or {}).get("outTrackId", "?"), (body or {}).get("userId", "?"))
+
     # 落库/文本回复均为阻塞 I/O → 线程池执行，避免阻塞事件循环
     return await run_in_threadpool(_process_card_callback_body, body)
 
