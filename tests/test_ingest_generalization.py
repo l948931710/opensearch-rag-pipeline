@@ -226,6 +226,58 @@ def test_true_faq_doc_still_routes_faq():
     assert not any(getattr(c, "chunk_type", "") == "step_card" for c in ctx["chunks"])
 
 
+def test_contribution_md_pinned_to_faq_by_classify():
+    """知识贡献合成的 contribution-<cid>.md：classify 阶段直接 pin 成 faq 类目（跳过 LLM、
+    不被默认 reference 覆盖），从而走 FAQ 分块。"""
+    import os as _os
+    if _os.environ.get("RAG_SIMULATE", "").lower() not in ("1", "true", "yes"):
+        pytest.skip("需 RAG_SIMULATE=true")
+    from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
+    doc = {
+        "doc_id": "CONTRIBFAQ1", "version_no": 1, "title": "员工饭卡怎么充值？",
+        "filename": "contribution-01J0.md", "file_ext": "md",
+        "text": "问：员工饭卡怎么充值？\n\n答：每周一三五 10:30-12:00 在行政楼一楼前台办理。",
+        "blocks": [], "assets": [],
+        "source_key": "raw/hr/internal/CONTRIBFAQ1/UP1/contribution-01J0.md", "canonical_key": "",
+        "owner_dept": "hr", "permission_level": "dept_internal",
+        "kb_type": "private", "risk_level": "low",
+    }
+    ctx = {"canonicals": [doc], "simulate": True}
+    node_classify_and_risk_assess(ctx)
+    assert doc["category_l1"] == "faq"      # pin 生效（不走 LLM、不落 reference）
+    assert doc["category_l2"] == "qa"
+    assert doc["faq_eligible"] is True
+
+
+def test_contribution_faq_format_yields_faq_chunk():
+    """synthesize_markdown 的 问：/答： 段落经 FAQ 分块 → faq_chunk，问题进 chunk 文本、答案聚合。"""
+    from opensearch_pipeline.pipeline_nodes import node_chunk_documents
+    q = "员工饭卡怎么充值？"
+    a = "每周一三五中午 10:30-12:00 在行政楼一楼前台办理，补卡同时间办理需下午领新卡。"
+    blocks = [
+        {"block_type": "paragraph", "text": f"问：{q}", "page_num": None,
+         "section_path": None, "source": "native", "extra": {}},
+        {"block_type": "paragraph", "text": f"答：{a}", "page_num": None,
+         "section_path": None, "source": "native", "extra": {}},
+    ]
+    doc = {
+        "doc_id": "CONTRIBFAQ2", "version_no": 1, "title": q,
+        "filename": "contribution-02.md", "file_ext": "md",
+        "category_l1": "faq", "category_l2": "qa", "faq_eligible": True,
+        "text": f"问：{q}\n\n答：{a}", "blocks": blocks, "assets": [],
+        "source_key": "raw/hr/internal/CONTRIBFAQ2/UP1/contribution-02.md", "canonical_key": "",
+        "owner_dept": "hr", "permission_level": "dept_internal",
+        "kb_type": "private", "risk_level": "low", "redaction_action": "CLEAN",
+    }
+    ctx = {"canonicals": [doc], "split_mode": "dynamic",
+           "prepend_title": True, "prepend_section": True}
+    node_chunk_documents(ctx)
+    faq_chunks = [c for c in ctx["chunks"] if getattr(c, "chunk_type", "") == "faq_chunk"]
+    assert faq_chunks, f"应产出 faq_chunk，实得: {[getattr(c, 'chunk_type', '') for c in ctx['chunks']]}"
+    txt = faq_chunks[0].chunk_text
+    assert q in txt and a in txt           # 问题进 chunk 文本（检索命中问句）+ 答案聚合
+
+
 # ═══════════════ XLSX TO_TEXT 截图的 serving 可渲染性 ═══════════════
 # 真实失败件：raw/it/外贸发票操作流程.xlsx —— 3 个 sheet 各 1 张全屏 U8 截图、无文本
 # 单元格，VLM 全部路由 ROUTE_TO_TEXT。OCR 文本进了 chunk，但原图没有任何 serving 可达
