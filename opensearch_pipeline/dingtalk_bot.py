@@ -840,8 +840,52 @@ async def card_callback(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="无法解析请求体")
 
+    # HTTP 专属计数日志：Stream 投递的回调经 _CardCallbackHandler 直达 _process_card_callback_body，
+    # 不过本 HTTP 路由。故这行只在【存量 callbackType=HTTP 卡】（旧卡 / Stream 客户端 down 窗口发的卡）
+    # 的按钮点击时打 —— SAE 日志数它即可判断旧卡何时老化归零、从而安全关闭本公网端点。
+    logger.info("[CARD-CB-HTTP] 经公网 HTTP 端点收到卡片回调（非 Stream）: outTrackId=%s userId=%s",
+                (body or {}).get("outTrackId", "?"), (body or {}).get("userId", "?"))
+
     # 落库/文本回复均为阻塞 I/O → 线程池执行，避免阻塞事件循环
     return await run_in_threadpool(_process_card_callback_body, body)
+
+
+def _card_callback_authorized(message_id: str, user_id: str) -> bool:
+    """Track-2 防伪造：写反馈/工单前校验卡片回调的 message_id 归属。
+
+    公网 POST /dingtalk/card/callback 无签名校验、可被任意 POST 伪造（Stream 模式下合法回调走
+    出站 WSS、根本不经此 HTTP 路由）。攻击者可凭伪造 body 灌反馈/开转人工工单/把他人会话标
+    AWAITING_COMMENT。落库前必须确认：
+      1) message_id 是【真实存在】的问答消息（杜绝喷洒/捏造 id —— message_id 是 128 位不可枚举 id）；
+      2) 若该消息有【明确归属用户】(qa_session_log.user_id 非空)，回调 userId 必须一致（防跨用户伪造）；
+         群聊/无归属(user_id 空)仅做存在性门控，不误伤合法群聊反馈。
+    查库异常 → fail-open 放行：下游写在同一故障下本就会失败，不因瞬时 SELECT 抖动误拒合法反馈。
+    """
+    if not message_id:
+        return False
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT user_id FROM {_op_db()}.qa_session_log WHERE message_id=%s LIMIT 1",
+                    (message_id,))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("卡片回调归属校验查库失败（fail-open 放行）: %s", e)
+        return True
+    if row is None:
+        logger.warning("卡片回调引用了不存在的 message_id（疑似伪造），拒绝写入: %s", message_id)
+        return False
+    owner = (row.get("user_id") if isinstance(row, dict) else row[0]) or ""
+    if owner and user_id and owner != user_id:
+        logger.warning("卡片回调 userId 与消息归属不符（疑似跨用户伪造），拒绝写入: "
+                       "message_id=%s owner=%s caller=%s", message_id, owner, user_id)
+        return False
+    return True
 
 
 def _process_card_callback_body(body: dict):
@@ -892,6 +936,11 @@ def _process_card_callback_body(body: dict):
     # （白屏根因，已三次实证）。赞踩的视觉由钉钉【原生 Feedback 组件】自己呈现；转人工/补充原因的
     # 提示走机器人 1 对 1 文本消息（回调请求里没有 sessionWebhook）。落库失败 fail open，不影响 ACK。
     _ACK: dict = {}
+
+    # ── Track-2 防伪造：写任何反馈/工单前先校验 message_id 归属（见 _card_callback_authorized）。
+    #    未过 → ACK-only 返回（不写库、不更新卡片），杜绝公网伪造 POST 注入反馈/开工单/劫持会话。──
+    if not _card_callback_authorized(message_id, user_id):
+        return _ACK
 
     # ── 转人工 ──
     if action == "handoff":

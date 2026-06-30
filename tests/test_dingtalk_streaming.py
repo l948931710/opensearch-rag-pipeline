@@ -325,6 +325,7 @@ def test_card_callback_acks_without_carddata():
 
     with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True) as mock_hf, \
          patch("opensearch_pipeline.dingtalk_bot.mark_awaiting_comment", return_value=True) as mock_mark, \
+         patch("opensearch_pipeline.dingtalk_bot._card_callback_authorized", return_value=True), \
          patch("opensearch_pipeline.dingtalk_bot.send_text_to_user", return_value=True):
         for action in ("handoff", "upvote", "downvote", "add_reason", "some_native_like"):
             resp = asyncio.run(dingtalk_bot.card_callback(_req(action)))
@@ -351,7 +352,8 @@ def test_card_callback_official_feedback_template():
 
         return _R()
 
-    with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True) as mock_hf:
+    with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True) as mock_hf, \
+         patch("opensearch_pipeline.dingtalk_bot._card_callback_authorized", return_value=True):
         # 👍：feedback=good（无 action / 无 message_id）→ upvote，message_id 用 outTrackId
         resp = asyncio.run(dingtalk_bot.card_callback(
             _req({"feedback": "good", "content": "答案…", "query": "怎么报销"})))
@@ -368,6 +370,76 @@ def test_card_callback_official_feedback_template():
         assert kw["action"] == "downvote"
         assert kw["reason"] == "other"
         assert kw["comment"] == "答非所问"
+
+
+class _GateCur:
+    def __init__(self, row, boom):
+        self._row, self._boom = row, boom
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        if self._boom:
+            raise RuntimeError("db down")
+
+    def fetchone(self):
+        return self._row
+
+
+class _GateConn:
+    def __init__(self, row, boom):
+        self._row, self._boom = row, boom
+
+    def cursor(self):
+        return _GateCur(self._row, self._boom)
+
+    def close(self):
+        pass
+
+
+def test_card_callback_authorized_predicate(monkeypatch):
+    """Track-2 归属校验：不存在的 message_id 拒；跨用户拒；归属一致放行；群聊(无归属)仅存在性放行；
+    空 id 拒；查库异常 fail-open 放行。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+    from opensearch_pipeline.dingtalk_bot import _card_callback_authorized
+
+    def _wire(row, boom=False):
+        monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _GateConn(row, boom))
+
+    _wire(None);            assert _card_callback_authorized("m1", "u1") is False   # 不存在 → 伪造
+    _wire(("u1",));         assert _card_callback_authorized("m1", "u1") is True    # 归属一致
+    _wire(("u1",));         assert _card_callback_authorized("m1", "u2") is False   # 跨用户伪造
+    _wire((None,));         assert _card_callback_authorized("m1", "u9") is True    # 群聊/无归属 → 存在性门控
+    _wire(("",));           assert _card_callback_authorized("m1", "u9") is True    # 同上（空归属）
+    _wire(("u1",));         assert _card_callback_authorized("", "u1") is False     # 空 message_id
+    _wire(None, boom=True); assert _card_callback_authorized("m1", "u1") is True    # 查库异常 → fail-open
+
+
+def test_card_callback_forged_message_id_no_write(monkeypatch):
+    """端到端：伪造（不存在的 message_id）的 downvote 回调 → 归属校验拒 → handle_feedback 绝不被调用。"""
+    import asyncio
+    import json as _json
+    import opensearch_pipeline.pipeline_nodes as pn
+    from opensearch_pipeline import dingtalk_bot
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _GateConn(None, False))  # message_id 不存在
+    body = {"outTrackId": "forged-x", "userId": "attacker",
+            "content": _json.dumps({"cardPrivateData": {"params": {"action": "downvote", "message_id": "forged-x"}}})}
+
+    class _R:
+        async def json(self):
+            return body
+
+    with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True) as mock_hf, \
+         patch("opensearch_pipeline.dingtalk_bot.mark_awaiting_comment", return_value=True) as mock_mark:
+        resp = asyncio.run(dingtalk_bot.card_callback(_R()))
+    assert "cardData" not in resp           # 仍 ACK-only
+    assert not mock_hf.called               # 伪造 → 绝不落反馈
+    assert not mock_mark.called
 
 
 def test_take_awaiting_comment_hit_and_miss():
