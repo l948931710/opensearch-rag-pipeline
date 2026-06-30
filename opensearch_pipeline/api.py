@@ -945,18 +945,81 @@ class ResignImagesRequest(BaseModel):
     )
 
 
+def _parse_asset_doc_id(key: str) -> Optional[str]:
+    """从 processing/assets/{dept}/{doc_id}/v{n}/{file} 解析 doc_id；非该形态 → None。"""
+    parts = key.split("/")
+    if (len(parts) < 6 or parts[0] != "processing" or parts[1] != "assets"
+            or not parts[4].startswith("v")):
+        return None
+    return parts[3] or None
+
+
+def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
+    """resign-images 可见性鉴权 —— 复用检索的同一权限边界（安全边界单一来源）。
+
+    public 放行；dept_internal 仅当 owner_dept ∈ 调用者组展开的 owner 集，或（Phase D）文档
+    allowed_depts 含调用者任一组码；restricted 永不放行；未知 doc_id 不放行。DB 异常 → fail-closed
+    （全部拒签）：本接口产出可读图字节，绝不 fail-open。
+    """
+    if not doc_ids:
+        return set()
+    from opensearch_pipeline import retriever as _R
+    groups = _R._normalize_acl_groups(identity.acl_groups if identity else None)
+    owners = set(_R._expand_groups_to_owners(groups))
+    phase_d = bool(get_config().rag.allowed_depts_acl)
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+    except Exception as e:
+        logger.warning("resign-images 鉴权 DB 连接失败（fail-closed 全拒）: %s", e)
+        return set()
+    visible: set = set()
+    try:
+        ids = sorted(doc_ids)
+        ph = ",".join(["%s"] * len(ids))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT doc_id, permission_level, owner_dept FROM {_kb_db()}.document_meta "
+                f"WHERE doc_id IN ({ph})", tuple(ids))
+            meta = {r[0]: ((r[1] or "").strip().lower(), (r[2] or "")) for r in cur.fetchall()}
+            for d in ids:
+                pl, owner = meta.get(d, (None, None))
+                if pl is None:
+                    continue                       # 未知文档 → 拒签
+                if pl == "public":
+                    visible.add(d); continue
+                if pl == "restricted":
+                    continue                       # 永不服务
+                if owner in owners:                # dept_internal 等：owner 展开命中
+                    visible.add(d); continue
+                if phase_d and groups:             # Phase D 跨部门授权
+                    from opensearch_pipeline import access_grants
+                    if set(access_grants.resolve_allowed_depts_one(d, cur)) & set(groups):
+                        visible.add(d)
+    except Exception as e:
+        logger.warning("resign-images 鉴权查询失败（fail-closed 全拒）: %s", e)
+        return set()
+    finally:
+        conn.close()
+    return visible
+
+
 @app.post("/api/resign-images")
 def resign_images(req: ResignImagesRequest, request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
     """过期图片重签：OSS 签名 URL 默认 1 小时过期，客户端凭 blocks 里的
     oss_key 换取新签名 URL（「图片已过期 · 点按重新加载」的真实后半段）。
 
+    鉴权：除白名单（前缀/扩展名/无路径穿越）外，还按【文档可见性】逐 key 校验——与检索同一
+    权限边界（public/owner 展开/Phase-D allowed_depts，restricted 永不）；无权或未知文档返回空串。
+    否则任何人凭可枚举的 dept 段 + 带外获取的 doc_id 即可绕过 HA3 权限过滤读取他部门文档抽取图。
     单 key 失败/非法不影响其它 key（返回空串，客户端保留过期占位态）。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     from opensearch_pipeline.oss_url import generate_signed_url
 
     urls: Dict[str, str] = {}
+    key_doc: Dict[str, str] = {}
     for raw_key in req.oss_keys:
         key = (raw_key or "").strip()
         if not key:
@@ -968,6 +1031,19 @@ def resign_images(req: ResignImagesRequest, request: Request,
         )
         if not allowed:
             logger.warning("resign-images 拒绝白名单外 key: %r", key[:128])
+            urls[key] = ""
+            continue
+        doc_id = _parse_asset_doc_id(key)
+        if not doc_id:
+            logger.warning("resign-images 无法解析 doc_id，拒签: %r", key[:128])
+            urls[key] = ""
+            continue
+        key_doc[key] = doc_id
+
+    visible_docs = _resign_visible_doc_ids(set(key_doc.values()), identity)
+    for key, doc_id in key_doc.items():
+        if doc_id not in visible_docs:
+            logger.warning("resign-images 拒绝越权 key（无文档可见权 doc=%s）: %r", doc_id, key[:128])
             urls[key] = ""
             continue
         try:
