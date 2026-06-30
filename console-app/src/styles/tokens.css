@@ -10,8 +10,8 @@
 /* ── ① primitive · 亮色（默认）── */
 :root, [data-theme="light"] {
   --bg:#FAFAF7; --surface:#FFFFFF; --sidebar:#F4F3EE; --panel:#F7F6F1;
-  --border:#E8E7DF; --border-strong:#D8D6CC;
-  --text:#1B1B18; --muted:#6C6B62; --faint:#A3A299;
+  --border:#E8E7DF; --border-strong:#D8D6CC; --track:#CBC9BF;
+  --text:#1B1B18; --muted:#6C6B62; --faint:#84837B;
   --accent:#2F6B4F; --accent-hover:#27593F; --accent-soft:#E7F0EA; --accent-text:#2F6B4F;
   --accent-fg:#FFFFFF;                 /* 主按钮上的文字（亮：深绿底配白） */
   --user-bubble:#F0EFE8;
@@ -25,8 +25,8 @@
 /* ── ① primitive · 暗色 ── */
 [data-theme="dark"] {
   --bg:#171715; --surface:#201F1C; --sidebar:#131312; --panel:#1C1B18;
-  --border:#312E29; --border-strong:#413D36;
-  --text:#ECEAE3; --muted:#9D998E; --faint:#6E6A61;
+  --border:#312E29; --border-strong:#413D36; --track:#403C35;
+  --text:#ECEAE3; --muted:#9D998E; --faint:#7C786F;
   --accent:#74C39A; --accent-hover:#86CDA8; --accent-soft:#1E2A23; --accent-text:#83CBA1;
   --accent-fg:#10221A;                 /* 主按钮上的文字（暗：浅绿底配深字） */
   --user-bubble:#262420;
@@ -97,6 +97,7 @@
   --color-accent-text: var(--accent-text);
   --color-faint: var(--faint);
   --color-border-strong: var(--border-strong);
+  --color-track: var(--track);
   /* 状态色（高/中/低 + 文档徽章） */
   --color-st-live:  var(--st-live);
   --color-st-busy:  var(--st-busy);

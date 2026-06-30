@@ -45,7 +45,7 @@ const FILL: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', lo
         </div>
         <div class="mt-3 flex items-center gap-2.5">
           <span class="text-[10.5px] font-bold uppercase tracking-[0.03em] text-faint">相关度</span>
-          <span class="h-[5px] flex-1 overflow-hidden rounded-full bg-border">
+          <span class="h-[5px] flex-1 overflow-hidden rounded-full bg-track">
             <span class="block h-full rounded-full transition-[width]" :class="FILL[s.level]" :style="{ width: Math.max(6, Math.round(s.relevance * 100)) + '%' }" />
           </span>
           <span class="font-mono text-[11.5px] font-semibold text-accent-text">{{ s.levelLabel }} · {{ s.score.toFixed(2) }}</span>
