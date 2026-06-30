@@ -96,6 +96,9 @@ def verify_chunks_present(
         "present": len(present),
         "total": len(expected),
         "served_ids": sorted(served),
+        # 契约键（docstring 承诺）：自查中浮现的【他文档】id —— 跨文档/ACL 泄漏信号。
+        # 此前漏返回，导致上线 verify 读 result['foreign_ids'] KeyError、泄漏检查形同虚设。
+        "foreign_ids": sorted(foreign),
         "ok": bool(expected) and not missing,
         "method": "per-chunk self-query (G30-immune)",
     }

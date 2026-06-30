@@ -91,7 +91,17 @@ def current_allowed_for_doc(cursor, doc_id: str, version_no: int) -> List[str]:
     for (ad,) in cursor.fetchall():
         if not ad:
             continue
-        parsed = ad if isinstance(ad, list) else _json.loads(ad)
+        if isinstance(ad, list):
+            vals.update(ad)
+            continue
+        # 单行坏 JSON 不得 abort 整篇 doc 的 ACL 投影/对账（否则该文档授权永久卡死、无法收敛）：
+        # 跳过坏行并告警；少计 current 只会让 reconcile 朝"重投影"自愈方向，绝不越权扩散。
+        try:
+            parsed = _json.loads(ad)
+        except (ValueError, TypeError):
+            logger.warning("current_allowed_for_doc: 跳过 doc=%s v=%s 的坏 allowed_depts JSON: %r",
+                           doc_id, version_no, str(ad)[:80])
+            continue
         vals.update(parsed or [])
     return sorted(vals)
 

@@ -28,6 +28,13 @@ def test_current_allowed_for_doc_parses_dedup_sorts():
     assert current_allowed_for_doc(_AllowedCur([(["hr"],)]), "D2", 1) == ["hr"]  # 已是 list 直接用
 
 
+def test_current_allowed_for_doc_skips_bad_json_not_abort():
+    """单行坏 JSON 不得抛异常 abort 整篇 doc 的投影/对账——跳过坏行、保留好行。"""
+    from opensearch_pipeline.access_grants import current_allowed_for_doc
+    cur = _AllowedCur([('["finance"]',), ("{坏的 json",), ('["quality"]',)])
+    assert current_allowed_for_doc(cur, "D3", 1) == ["finance", "quality"]   # 坏行被跳过，不 raise
+
+
 # ── reconcile_allowed_depts：可编程桩 DB ──
 class _Cur:
     def __init__(self, st):

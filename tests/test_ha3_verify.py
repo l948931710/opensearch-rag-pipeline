@@ -69,6 +69,8 @@ def test_foreign_doc_surfaced_recorded():
     assert r["ok"]                          # all D chunks still present
     # foreign id observed but not counted as present/served for D
     assert 999 not in r["served_ids"]
+    # 契约键 foreign_ids 必须返回（此前漏返回 → 上线 verify 读它 KeyError、ACL 泄漏检查失效）
+    assert r["foreign_ids"] == [999]
 
 
 # ── enumerator loop-until-stable (G30 mitigation) ───────────────

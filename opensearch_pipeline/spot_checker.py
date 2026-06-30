@@ -16,6 +16,23 @@ from opensearch_pipeline.pipeline_nodes import (
 
 logger = logging.getLogger(__name__)
 
+# 权限严重等级： public(0) < internal/dept_internal(1) < restricted(2)
+_PERM_ORDER = {"public": 0, "internal": 1, "dept_internal": 1, "restricted": 2}
+
+
+def _suggests_tightening(suggested_perm: str, current_permission: str) -> bool:
+    """安全复审：LLM 建议的权限是否比现状更严（→ 触发隔离复核）。
+
+    fail-closed（纯函数，可单测）：先归一化大小写/空白；【未知】suggested 按最严（宁可触发复审，
+    绝不把不认识的安全建议当 public 放过——这正是此前 `.get(...,0)` 静默 fail-open 的洞）；
+    未知 current 按最松（同样偏向触发复审）。
+    """
+    sp = (suggested_perm or "").strip().lower()
+    cp = (current_permission or "").strip().lower()
+    suggested_rank = _PERM_ORDER.get(sp, max(_PERM_ORDER.values()) + 1)
+    current_rank = _PERM_ORDER.get(cp, 0)
+    return suggested_rank > current_rank
+
 
 def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config) -> None:
     """从搜索索引中删除指定文档的所有 chunks。
@@ -514,14 +531,8 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
             report["checked_documents"] += 1
             print(f"       └─ Safety Check Result: status={safety_status}, suggested_permission={suggested_perm}")
 
-            # 5. 安全等级比对 (权限降级判定)
-            # 权限严重等级顺序： public (0) < internal (1) < restricted (2)
-            # 'dept_internal' 是 'internal' 的归一化写法（与 HA3 过滤表达式对齐），同级
-            perm_order = {"public": 0, "internal": 1, "dept_internal": 1, "restricted": 2}
-            suggested_rank = perm_order.get(suggested_perm, 0)
-            current_rank = perm_order.get(current_permission, 0)
-
-            if suggested_rank > current_rank:
+            # 5. 安全等级比对 (权限降级判定) —— 纯函数 _suggests_tightening（fail-closed，可单测）
+            if _suggests_tightening(suggested_perm, current_permission):
                 # 判定为权限泄露 mismatch！触发 quarantine 锁定
                 print(f"       🚨 SECURITY WARNING: Permission mismatch detected for {doc_id}! Indexed as '{current_permission}' but spot-check recommends '{suggested_perm}'. Reason: {reason}")
                 report["mismatch_detected"] += 1
