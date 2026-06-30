@@ -2655,7 +2655,8 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         raise HTTPException(status_code=403, detail=f"无权上传：{decision.reason}")
 
     upload_id = kb_upload.new_ulid()
-    raw_key = kb_upload.build_raw_key(owner, doc_id, upload_id, req.filename)
+    # 可见范围编码进路径段，防管线 stage-2 把 dept_internal/restricted 升成 public（自助上传/贡献同款）。
+    raw_key = kb_upload.build_raw_key(owner, doc_id, upload_id, req.filename, permission_level=perm)
     token = kb_upload.sign_upload_token({
         "uid": kb.user_id, "action": req.action, "doc_id": doc_id, "owner_dept": owner,
         "raw_key": raw_key, "filename": kb_upload.safe_filename(req.filename), "ext": ext,
@@ -3901,28 +3902,6 @@ def _reconcile_contributions_searchable(conn) -> None:
         logger.info("contribution reconcile 跳过 (non-fatal): %s", e)
 
 
-def _contribution_raw_key(owner_dept: str, doc_id: str, upload_id: str, cid: str,
-                          permission_level: str) -> str:
-    """贡献合成 .md 的 raw_key——【把权限编码进路径段】，让管线 resolve_permission_level 解析回同一值。
-
-    ⚠️ 否则扁平 raw/<dept>/<doc>/... 路径无 'internal' 段 → 管线 stage-2 按路径启发式默认 'public'
-       并覆盖写回 → dept_internal 贡献被静默升成全公司可见（实测，escalation）。
-    - dept_internal（部门公开）→ raw/<dept>/internal/<doc>/<up>/file（管线解析回 dept_internal）
-    - public（全员公开）→ raw/<dept>/<doc>/<up>/file（扁平=管线解析回 public，正合意）
-    owner_dept 始终是第 2 段（_dept_from_raw_key 依赖；'internal' 是第 3 段，不影响部门解析）。
-    """
-    from opensearch_pipeline import kb_upload
-    fname = kb_upload.safe_filename(f"contribution-{cid}.md")
-    if permission_level == "public":
-        return f"raw/{owner_dept}/{doc_id}/{upload_id}/{fname}"
-    return f"raw/{owner_dept}/internal/{doc_id}/{upload_id}/{fname}"
-
-
-def _perm_from_contribution_raw_key(raw_key: str) -> str:
-    """从已固定的贡献 raw_key 反推权限（retry 续跑用，路径即权威）：含 /internal/ 段→dept_internal，否则 public。"""
-    return "dept_internal" if "/internal/" in (raw_key or "") else "public"
-
-
 def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: str, bucket: str,
                               title: str, reviewer_id: str, reviewer_name: str, md_text: str,
                               permission_level: str = "dept_internal") -> None:
@@ -3996,10 +3975,11 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
     from opensearch_pipeline.audit_log import write_audit
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
 
+    from opensearch_pipeline import kb_upload
     cfg = get_config()
     md = C.synthesize_markdown(question, content)
     # 权限以【已固定的 raw_key 路径】为权威（accept 时按部门领导选择编码进路径；retry 续跑沿用同键）。
-    permission_level = _perm_from_contribution_raw_key(raw_key)
+    permission_level = kb_upload.perm_from_raw_key(raw_key)
     try:
         assert_metadata_write_allowed("kb_contribution_materialize", cfg.rds.host, kind="rds")
         conn = _get_db_conn()
@@ -4216,7 +4196,8 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             # 一次性固定键（raw_key 把可见范围编码进路径段，防管线 stage-2 重解析升/降权）
             doc_id = cur_doc_id or kb_upload.new_doc_id()
             upload_id = cur_upload_id or kb_upload.new_ulid()
-            raw_key = cur_raw_key or _contribution_raw_key(final_dept, doc_id, upload_id, cid, chosen_perm)
+            raw_key = cur_raw_key or kb_upload.build_raw_key(
+                final_dept, doc_id, upload_id, f"contribution-{cid}.md", permission_level=chosen_perm)
             cur.execute(
                 f"UPDATE {_op_db()}.kb_contribution SET review_status='accepted',"
                 " ingestion_status='registering', reviewed_by=%s, reviewed_at=NOW(),"

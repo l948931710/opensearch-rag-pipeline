@@ -91,9 +91,36 @@ def expected_mime(ext: str) -> str:
     return _EXT_MIME.get((ext or "").lower(), "application/octet-stream")
 
 
-def build_raw_key(owner_dept: str, doc_id: str, upload_id: str, filename: str) -> str:
-    """raw/<owner_dept>/<doc_id>/<upload_id>/<filename>。owner_dept 第 2 段（_dept_from_raw_key 依赖）。"""
-    return f"raw/{owner_dept}/{doc_id}/{upload_id}/{safe_filename(filename)}"
+# permission_level → 部门后的路径段（dept_internal/restricted 编码;public/None→无段=扁平）。
+# 系统设计：可见范围【由路径定】(resolve_permission_level 路径启发式,非 LLM)。自助上传/贡献的扁平
+# raw/<dept>/<doc>/... 无段 → 管线 stage-2 默认 public 覆盖回写 → dept_internal/restricted 被静默升公开
+# (staging 实测)。故把可见范围编码进路径,让管线解析回登记值。
+_PERM_PATH_SEG = {"dept_internal": "internal", "internal": "internal", "restricted": "restricted"}
+
+
+def build_raw_key(owner_dept: str, doc_id: str, upload_id: str, filename: str,
+                  permission_level: Optional[str] = None) -> str:
+    """raw/<owner_dept>[/<perm_seg>]/<doc_id>/<upload_id>/<filename>。
+
+    owner_dept 始终第 2 段（_dept_from_raw_key 依赖）；可见范围段（internal/restricted）是第 3 段,
+    不影响部门解析。permission_level 省略/public → 扁平（= 旧行为,向后兼容）。
+    """
+    seg = _PERM_PATH_SEG.get((permission_level or "").strip().lower())
+    head = f"{owner_dept}/{seg}" if seg else owner_dept
+    return f"raw/{head}/{doc_id}/{upload_id}/{safe_filename(filename)}"
+
+
+def perm_from_raw_key(raw_key: str) -> str:
+    """从已固定的 raw_key 反推可见范围（路径即权威,retry/对账/续跑用）：
+    第 3 段 internal/dept_internal→dept_internal · restricted→restricted · 否则 public。"""
+    parts = (raw_key or "").split("/")
+    if len(parts) >= 3 and parts[0] == "raw":
+        seg = parts[2].strip().lower()
+        if seg in ("internal", "dept_internal"):
+            return "dept_internal"
+        if seg == "restricted":
+            return "restricted"
+    return "public"
 
 
 def sign_upload_token(payload: dict, ttl: int = UPLOAD_TOKEN_TTL) -> str:
