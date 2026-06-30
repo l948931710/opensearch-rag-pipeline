@@ -173,6 +173,31 @@ def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = False,
         conn.close()
         return result
 
+    # TOCTOU 二次确认：枚举 HA3 期间（loop-until-stable，可达数十秒）Stage-3 可能并发推入新 chunk
+    # —— 新 id 已进 HA3 但不在【枚举前】拍的 chunk_meta 快照里 → 被误判 orphan 删掉（在线 chunk 凭空
+    # 消失，召回丢失）。删除前用【最新】chunk_meta 重算 active 真相再判一次，剔除窗口内新增/复活的 id
+    # 与 chunk_id。残余窗口（重读→push 删除）仅毫秒级，且只朝"少删"偏（fail-closed）。
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, chunk_id FROM chunk_meta WHERE is_active=1")
+            fresh = cur.fetchall()
+        fresh_active_ids = {int(r[0]) for r in fresh}
+        fresh_active_chunkid = {r[1]: int(r[0]) for r in fresh}
+    except Exception as e:
+        result["errors"].append(f"RDS re-read failed (fail-closed, skip delete): {e}")
+        conn.close()
+        return result
+    delete_pks, skipped = _classify_stale(ha3_map, fresh_active_ids, fresh_active_chunkid)
+    born = result["stale"] - len(delete_pks)
+    if born > 0:
+        skipped["born_during_scan"] = born
+        logger.info("[RECONCILE-HA3] 二次确认：剔除 %d 个枚举窗口内复活/新增的 PK（不删在线 chunk）", born)
+    result["stale"] = len(delete_pks)
+    result["skipped"] = skipped
+    if not delete_pks:
+        conn.close()
+        return result
+
     for i in range(0, len(delete_pks), batch):
         sub = delete_pks[i:i + batch]
         body = [{"cmd": "delete", "fields": {cfg.pk_field: pk}} for pk in sub]
