@@ -68,7 +68,7 @@ for docx_path in docx_files:
     total_docs += 1
 
     try:
-        blocks, img_assets = extract_docx_with_images(docx_path)
+        blocks, img_assets, _ = extract_docx_with_images(docx_path)
         if not blocks:
             continue
 

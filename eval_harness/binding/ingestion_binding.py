@@ -485,7 +485,7 @@ def _run_docx_strict_path(
         try:
             # GT 提取:邻近文本(用 docx_extractor 直拿 blocks,不走完整 _extract_and_chunk
             # 是因为我们要的是 blocks.extra.image_index 的顺序锚点)
-            blocks, _assets = extract_docx_with_images(path)
+            blocks, _assets, _ = extract_docx_with_images(path)
             if not blocks:
                 continue
 

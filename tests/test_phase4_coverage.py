@@ -134,7 +134,7 @@ def test_dc3_dedup_in_with_images_path(cleanup_files):
     path = _save(doc)
     cleanup_files.append(path)
 
-    blocks, _ = extract_docx_with_images(path)
+    blocks, _, _ = extract_docx_with_images(path)
     text = _table_text(blocks)
     assert "HDR | HDR" not in text
     assert "HDR | Z" in text

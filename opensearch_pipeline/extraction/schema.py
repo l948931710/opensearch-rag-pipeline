@@ -114,6 +114,10 @@ class ExtractionResult:
     # 成本封存：VLM-rebuild 成本闸拒绝本文档 → 下游应跳过切块/索引 (避免裂脑状态)
     cost_quarantined: bool = False
 
+    # XLSX 版面分类结果：DAG1 用真实 filename 分类一次后持久化到 canonical，供 DAG2 直接消费，
+    # 避免 DAG2 用（重载后丢失的）空 filename 重新分类 → layout 漂移 → step_card 结构静默丢失 (P0-3)。
+    xlsx_layout_type: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "doc_id": self.doc_id,
@@ -131,4 +135,5 @@ class ExtractionResult:
             "warnings": self.warnings,
             "assets": self.assets,
             "cost_quarantined": self.cost_quarantined,
+            "xlsx_layout_type": self.xlsx_layout_type,
         }

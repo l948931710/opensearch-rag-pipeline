@@ -101,16 +101,81 @@ def test_c_empty_chunk_fix(mock_get_db_conn):
     # Should not raise
     node_write_chunk_meta(ctx)
 
+    # Status closure UPDATE is now parametrized (chunk_status = %s, content_process_status = %s,
+    # content_process_error = %s, ... doc_id, ver). A genuinely-empty doc (no text / ocr_status /
+    # warnings) must still close to EMPTY / DONE (graceful — the doc is legitimately empty).
     called = False
     for call in mock_cursor.execute.call_args_list:
         sql = call[0][0]
         params = call[0][1]
-        if "UPDATE document_version" in sql and "chunk_status = 'EMPTY'" in sql:
+        if "UPDATE document_version" in sql and "chunk_status = %s" in sql:
             called = True
-            assert "content_process_status = 'DONE'" in sql
-            assert params[0] == "doc_empty"
-            assert params[1] == 2
+            assert params[0] == "EMPTY"
+            assert params[1] == "DONE"
+            assert params[-2] == "doc_empty"
+            assert params[-1] == 2
     assert called, "Should have executed status closure update with 'EMPTY' and 'DONE'"
+
+
+# Test C2: Suspected-failure 0-chunk doc → NEEDS_REVIEW / FAILED (not silently DONE)
+@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+def test_c2_suspected_failure_needs_review(mock_get_db_conn):
+    """A doc that yields 0 chunks but shows failure signals (OCR failed, or real text that
+    produced no chunks, or a failure warning) must NOT close as DONE/EMPTY (which masquerades
+    as success and lets a broken SOP vanish from search). It must close as NEEDS_REVIEW / FAILED
+    with a reason — and must NOT raise."""
+    for canon, why in [
+        ({"doc_id": "d_ocrfail", "version_no": 1, "ocr_status": "FAILED", "text_length": 0}, "ocr_failed"),
+        ({"doc_id": "d_text0", "version_no": 1, "text_length": 5000}, "text_present"),
+        ({"doc_id": "d_warn", "version_no": 1, "text_length": 0,
+          "warnings": ["Failed to open DOCX: bad zip"]}, "warn"),
+    ]:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_get_db_conn.return_value = mock_conn
+
+        node_write_chunk_meta({"valid_chunks": [], "canonicals": [canon], "simulate_db": False})
+
+        seen = False
+        for call in mock_cursor.execute.call_args_list:
+            sql, params = call[0][0], call[0][1]
+            if "UPDATE document_version" in sql and "chunk_status = %s" in sql:
+                seen = True
+                assert params[0] == "NEEDS_REVIEW", f"{why}: {params[0]}"
+                assert params[1] == "FAILED", f"{why}: {params[1]}"
+                assert params[2]  # non-empty reason
+                # MUST bump retry_count so the orchestrator's (FAILED AND retry_count<3) re-claim
+                # predicate parks deterministically-broken docs after ≤3 tries (no infinite loop).
+                assert "retry_count = retry_count + 1" in sql, f"{why}: retry_count not incremented"
+        assert seen, f"{why}: expected a status-closure UPDATE"
+
+
+# Test C3: QUARANTINE 0-chunk doc keeps EMPTY/DONE (suspected-failure guard must not re-grade it)
+@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+def test_c3_quarantine_not_regraded(mock_get_db_conn):
+    """A PII/cost-quarantined doc skips chunking (0 chunks) and has real text — but it is NOT a
+    failure. The suspected-failure guard must leave its prior EMPTY/DONE closure untouched."""
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_get_db_conn.return_value = mock_conn
+
+    node_write_chunk_meta({
+        "valid_chunks": [],
+        "canonicals": [{"doc_id": "d_quar", "version_no": 1, "text_length": 9000,
+                        "redaction_action": "QUARANTINE"}],
+        "simulate_db": False,
+    })
+
+    seen = False
+    for call in mock_cursor.execute.call_args_list:
+        sql, params = call[0][0], call[0][1]
+        if "UPDATE document_version" in sql and "chunk_status = %s" in sql:
+            seen = True
+            assert params[0] == "EMPTY"
+            assert params[1] == "DONE"
+    assert seen, "expected a status-closure UPDATE for quarantined doc"
 
 
 # ── node_write_chunk_meta full-replacement (anti-strand) regression suite ──────────────────────

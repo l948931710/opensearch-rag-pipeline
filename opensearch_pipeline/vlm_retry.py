@@ -81,6 +81,73 @@ def is_retryable(*, exc: Optional[BaseException] = None, status: Optional[int] =
     return False
 
 
+def _retry_after_seconds(resp) -> Optional[float]:
+    """Parse a numeric Retry-After header (seconds). HTTP-date form is ignored."""
+    try:
+        v = resp.headers.get("Retry-After")
+        return float(int(v)) if v is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def post_json_with_retry(
+    url: str,
+    *,
+    json: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    timeout: Any = 60,
+    max_retries: int = 2,
+    base_backoff: float = 2.0,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+    label: str = "",
+    post_fn: Optional[Callable[..., Any]] = None,
+):
+    """POST with bounded retry on *transient* failures (timeout / conn-abort / 429 / 5xx).
+
+    Why: the embedding path (pipeline_nodes 嵌入重试) already retries on (429,5xx); the
+    other DashScope call sites — classify / OCR / VLM funnel — had NONE, so a single
+    transient 429 (this account's documented fragility) lost a whole document's
+    classification or an image's OCR text / caption, making ingest quality
+    non-deterministic. This is a drop-in for ``requests.post``: it returns the
+    ``requests.Response`` untouched (the caller still inspects ``status_code``), and
+    only RETRIES transient errors — 4xx(≠429) and terminal exceptions surface
+    immediately. Honors a numeric ``Retry-After`` header.
+
+    ``post_fn`` defaults to ``requests.post`` but call sites SHOULD pass their own
+    module's ``requests.post`` so existing test monkeypatches keep working.
+    """
+    import time as _time
+    if post_fn is None:
+        import requests as _requests
+        post_fn = _requests.post
+    if sleep_fn is None:
+        sleep_fn = _time.sleep
+
+    attempt = 0
+    while True:
+        try:
+            resp = post_fn(url, json=json, headers=headers, timeout=timeout)
+        except Exception as e:  # noqa: BLE001 — re-raised below if not transient/retries left
+            if attempt < max_retries and is_retryable(exc=e):
+                wait = base_backoff * (2 ** attempt)
+                if label:
+                    print(f"    ⚠️ {label} attempt {attempt + 1} transient error: "
+                          f"{type(e).__name__}: {str(e)[:120]} → retry in {wait:.0f}s", flush=True)
+                sleep_fn(wait)
+                attempt += 1
+                continue
+            raise
+        if (resp.status_code == 429 or 500 <= resp.status_code < 600) and attempt < max_retries:
+            wait = _retry_after_seconds(resp) or base_backoff * (2 ** attempt)
+            if label:
+                print(f"    ⚠️ {label} attempt {attempt + 1} HTTP {resp.status_code} "
+                      f"→ retry in {wait:.0f}s", flush=True)
+            sleep_fn(wait)
+            attempt += 1
+            continue
+        return resp
+
+
 def source_hash(image_bytes: bytes) -> str:
     """Stable hash of the *original* source image (before any transform)."""
     return hashlib.sha256(image_bytes).hexdigest()

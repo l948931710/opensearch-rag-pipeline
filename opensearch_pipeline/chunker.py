@@ -2702,8 +2702,27 @@ class DocumentChunker:
             parent_lines = [doc_title] if doc_title else []
             if header_lines:
                 parent_lines.append("\n".join(header_lines)[:200])
-            parent_lines.extend(_blk_get(b, "text", "").strip() for b in step_blocks)
-            parent_text = "\n".join(pl for pl in parent_lines if pl)
+            # Token 预算前向累加（与 _chunk_by_step parent 一致，chunker.py:1311）：xlsx 旧实现把每个
+            # step 行【全文】无上限拼入 parent，长 SOP(几十步) 会超 node_validate_chunks 的 2000-token
+            # 上限 → parent 被静默丢弃 → 所有 step_card 成孤儿（与 0959E5 116-孤儿同类，但 xlsx 路径
+            # 之前没补这个守卫）。累加到 _PARENT_MAX_TOKENS 即停并留截断标记，稳低于 2000。
+            _PARENT_MAX_TOKENS = 1800
+            _base_text = "\n".join(pl for pl in parent_lines if pl)
+            _step_texts = [t for t in (_blk_get(b, "text", "").strip() for b in step_blocks) if t]
+            _total_steps = len(_step_texts)
+            _included = []
+            for _t in _step_texts:
+                _cand = (_base_text + "\n" + "\n".join(_included + [_t])
+                         + f"\n…（共 {_total_steps} 个步骤）")
+                if _estimate_tokens(_cand) > _PARENT_MAX_TOKENS:
+                    break
+                _included.append(_t)
+            parent_text = _base_text
+            if _included:
+                parent_text += "\n" + "\n".join(_included)
+            if len(_included) < _total_steps:
+                parent_text += (f"\n…（仅展示前 {len(_included)} 个步骤，"
+                                f"完整流程共 {_total_steps} 个步骤）")
 
             parent_chunk = self._create_chunk(
                 doc_id=doc_id,

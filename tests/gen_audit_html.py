@@ -80,7 +80,7 @@ for doc_path in DOCS:
     bn = os.path.basename(full)
     label = bn.replace(".docx", "").replace(" ", "_")[:45]
 
-    blocks, image_assets = extract_docx_with_images(full)
+    blocks, image_assets, _ = extract_docx_with_images(full)
     if not blocks:
         continue
 

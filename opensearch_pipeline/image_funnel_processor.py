@@ -365,10 +365,14 @@ class ImageFunnelProcessor:
                           f"(retries={_r['retry_count']})")
                 content = _r["result"]
             else:
-                # Legacy single-shot (unchanged default behavior).
+                # Legacy single-shot (default path) — now with bounded transient 429/5xx retry
+                # (no image compression, unlike the gated compress-retry above): a single 429
+                # otherwise drops this image's caption to the degraded fallback for the run.
+                from opensearch_pipeline.vlm_retry import post_json_with_retry
                 payload = build_image_chat_payload(model_name, prompt, b64_data, mime_type, use_compat,
                                                    temperature=0)  # DET: pin funnel routing/caption determinism
-                resp = requests.post(url, json=payload, headers=auth_headers(api_key), timeout=(10, 90))
+                resp = post_json_with_retry(url, json=payload, headers=auth_headers(api_key),
+                                            timeout=(10, 90), label="VLM-funnel", post_fn=requests.post)
                 if resp.status_code != 200:
                     label = "VLM (compat)" if use_compat else "Qwen-VL VLM"
                     raise RuntimeError(f"{label} HTTP {resp.status_code}: {resp.text[:400]}")

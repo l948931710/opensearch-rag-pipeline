@@ -202,6 +202,53 @@ def test_faq_eligible_does_not_hijack_step_routing():
     assert "step_card" in types, f"SOP 被 faq_eligible 劫持出 step 模式: {types}"
 
 
+def _routing_doc(doc_id, title, cat_l1, cat_l2, steps):
+    return {
+        "doc_id": doc_id, "version_no": 1, "title": title,
+        "filename": "x.docx", "file_ext": "docx",
+        "category_l1": cat_l1, "category_l2": cat_l2,
+        "text": "\n".join(steps),
+        "blocks": [{"block_type": "paragraph", "text": s, "page_num": None,
+                    "section_path": None, "source": "native", "extra": {}} for s in steps],
+        "assets": [], "source_key": "raw/production/x.docx", "canonical_key": "",
+        "owner_dept": "production", "permission_level": "public",
+        "kb_type": "public", "risk_level": "low", "redaction_action": "CLEAN",
+    }
+
+
+def test_step_rich_regulation_upgrades_clause_to_step():
+    """B1-3：操作规程/检验规程类（cat=standard 或标题含'规范'）先落 clause，但带真实步骤标记的
+    文档应升级到 step 模式（此前 step 检测只在 m_mode=='text' 时跑 → 这些文档永远拿不到 step_card）。"""
+    from opensearch_pipeline.pipeline_nodes import node_chunk_documents
+    steps = [
+        "步骤1：进入U8系统登录注塑检验模块，双击图标输入用户名与密码完成登录操作。",
+        "步骤2：按系统路径点击进入检验录入界面，录入检验批次、产品编号与检验项目数据。",
+        "步骤3：核对实测值与判定标准是否一致无误后，依次点击保存、审核并打印检验报告。",
+    ]
+    doc = _routing_doc("REG_STEP01", "注塑成型操作规范.docx", "standard", "operation_std", steps)
+    ctx = {"canonicals": [doc], "split_mode": "dynamic",
+           "prepend_title": True, "prepend_section": True}
+    node_chunk_documents(ctx)
+    types = {getattr(c, "chunk_type", "") for c in ctx["chunks"]}
+    assert "step_card" in types, f"step-rich 操作规范 未升级到 step 模式: {types}"
+
+
+def test_pure_policy_stays_clause_not_step():
+    """B1-3 守卫：纯制度/规定政策文档（无 sop 关键词、条款式正文）不得被误升到 step 模式。"""
+    from opensearch_pipeline.pipeline_nodes import node_chunk_documents
+    clauses = [
+        "第一条 为规范公司员工考勤管理，维护正常工作秩序，特制定本制度。",
+        "第二条 员工应严格遵守上下班时间，不得迟到、早退或无故旷工。",
+        "第三条 因公外出须提前向部门负责人报备，并在考勤系统中登记。",
+    ]
+    doc = _routing_doc("POL01", "员工考勤管理制度.docx", "policy", "hr_policy", clauses)
+    ctx = {"canonicals": [doc], "split_mode": "dynamic",
+           "prepend_title": True, "prepend_section": True}
+    node_chunk_documents(ctx)
+    types = {getattr(c, "chunk_type", "") for c in ctx["chunks"]}
+    assert "step_card" not in types, f"纯制度被误升到 step 模式: {types}"
+
+
 def test_true_faq_doc_still_routes_faq():
     """真 FAQ 文档（标题/分类含 faq）仍走 faq 模式。"""
     from opensearch_pipeline.pipeline_nodes import node_chunk_documents

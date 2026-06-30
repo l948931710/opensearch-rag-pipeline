@@ -250,6 +250,38 @@ def _pass2_extract_page(
     except Exception:
         tables = []
 
+    # 无框/少框表格：lines 策略检不出 → 这些表格此前降级成普通段落（丢失行列结构）。仅当 lines
+    # 完全无结果时，用 text 策略（按文字对齐推断行列）再试一次——只在 lines 为空时启用，绝不改动既有
+    # 有框表格的行为；text 策略更易误判，故加 2×2 + 单元格填充率(≥0.3) 合理性闸，过闸才接受。fail-open。
+    _detect_label = "pdfplumber_lines"
+    if not tables:
+        try:
+            _cand = cropped.find_tables(table_settings={
+                "vertical_strategy": "text",
+                "horizontal_strategy": "text",
+                "snap_tolerance": 4,
+            })
+        except Exception:
+            _cand = []
+        _accepted = []
+        for _t in _cand:
+            try:
+                _rd = _t.extract()
+            except Exception:
+                continue
+            if not _rd or len(_rd) < 2:
+                continue
+            if max((len(r) for r in _rd), default=0) < 2:
+                continue
+            _cells = sum(len(r) for r in _rd) or 1
+            _filled = sum(1 for r in _rd for c in r if c and str(c).strip())
+            if _filled / _cells < 0.3:
+                continue
+            _accepted.append(_t)
+        if _accepted:
+            tables = _accepted
+            _detect_label = "pdfplumber_text"
+
     for table_idx, table in enumerate(tables):
         try:
             rows_data = table.extract()
@@ -280,7 +312,7 @@ def _pass2_extract_page(
                 extra={
                     "table_index": table_idx,
                     "row_count": len(rows_text),
-                    "detected_by": "pdfplumber_lines",
+                    "detected_by": _detect_label,
                     "y0": float(table.bbox[1]),
                     "y1": float(table.bbox[3]),
                 },
