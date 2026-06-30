@@ -13,7 +13,8 @@ import pytest
 
 import opensearch_pipeline.env_guard as eg
 from opensearch_pipeline.env_guard import (DestructiveOpBlocked, GuardedBucket,
-                                           assert_destructive_write_allowed)
+                                           assert_destructive_write_allowed,
+                                           assert_metadata_write_allowed)
 
 PROD_HA3 = "ha-cn-kgl4slr1n01.public.ha.aliyuncs.com"
 
@@ -80,6 +81,31 @@ def test_wrong_op_ack_rejected(patch_cfg, monkeypatch):
                        f"some_other_op:{date.today().isoformat()}")
     with pytest.raises(DestructiveOpBlocked):
         assert_destructive_write_allowed("search_delete", PROD_HA3, kind="search")
+
+
+# ── 元数据写 ack 必须 op-scoped（去掉 `or _ack_today` 的跨 op 越权口子）──
+def test_metadata_ack_is_op_scoped(patch_cfg, monkeypatch):
+    patch_cfg(_cfg())  # development
+    monkeypatch.setattr(eg, "is_prod_target", lambda kind, target: True)
+    today = date.today().isoformat()
+    # A 的当日 ack 绝不放行 B 的元数据写（此前 _ack_today 会误放）
+    monkeypatch.setenv("RAG_METADATA_PROD_ACK", f"kb_register_upload:{today}")
+    with pytest.raises(DestructiveOpBlocked):
+        assert_metadata_write_allowed("kb_approve", "x", kind="rds")
+    # A 的 ack 放行 A（op 匹配）
+    assert_metadata_write_allowed("kb_register_upload", "x", kind="rds")
+    # 显式通配 *:<today> 仍放行任意 op（刻意跨 op 的逃生阀）
+    monkeypatch.setenv("RAG_METADATA_PROD_ACK", f"*:{today}")
+    assert_metadata_write_allowed("kb_approve", "x", kind="rds")
+
+
+def test_metadata_stale_ack_rejected(patch_cfg, monkeypatch):
+    patch_cfg(_cfg())
+    monkeypatch.setattr(eg, "is_prod_target", lambda kind, target: True)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    monkeypatch.setenv("RAG_METADATA_PROD_ACK", f"kb_approve:{yesterday}")
+    with pytest.raises(DestructiveOpBlocked):
+        assert_metadata_write_allowed("kb_approve", "x", kind="rds")
 
 
 def test_readonly_blocks_everything(patch_cfg, monkeypatch):

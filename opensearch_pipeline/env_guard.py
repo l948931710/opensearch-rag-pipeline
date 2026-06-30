@@ -227,7 +227,10 @@ def assert_metadata_write_allowed(op: str, target: str, *, kind: str = "rds") ->
     if not is_prod_target(kind, target):
         return
     ack = os.environ.get("RAG_METADATA_PROD_ACK", "")
-    if _ack_matches(ack, op) or _ack_today(ack):
+    # 必须 op-scoped：'<op>:<today>' 或显式通配 '*:<today>'。此前 `or _ack_today(ack)` 让【任意】
+    # 当日 op 的 ack 放行【别的】op 的元数据写，破坏 docstring 承诺的 op 隔离——去掉该口子。
+    # 确需跨 op 的当日临时放行 → 显式用 RAG_METADATA_PROD_ACK=*:<today>（_ack_matches 已支持）。
+    if _ack_matches(ack, op):
         print(f"    !! [ENV GUARD OVERRIDE] {op} -> {target} 已被 RAG_METADATA_PROD_ACK={ack} 放行")
         return
     raise DestructiveOpBlocked(
