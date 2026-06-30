@@ -3822,6 +3822,9 @@ class KbContributionAcceptRequest(BaseModel):
     question: Optional[str] = None
     content: Optional[str] = None
     category_dept: Optional[str] = None
+    # 部门领导采纳时决定可见范围：dept_internal=部门公开（默认）/ public=全员公开。
+    # 用户裁决（2026-06-29）：部门领导直接定，public 不再转 kb_admin 审批。
+    permission_level: Optional[str] = None
     note: Optional[str] = None
 
 
@@ -3898,8 +3901,31 @@ def _reconcile_contributions_searchable(conn) -> None:
         logger.info("contribution reconcile 跳过 (non-fatal): %s", e)
 
 
+def _contribution_raw_key(owner_dept: str, doc_id: str, upload_id: str, cid: str,
+                          permission_level: str) -> str:
+    """贡献合成 .md 的 raw_key——【把权限编码进路径段】，让管线 resolve_permission_level 解析回同一值。
+
+    ⚠️ 否则扁平 raw/<dept>/<doc>/... 路径无 'internal' 段 → 管线 stage-2 按路径启发式默认 'public'
+       并覆盖写回 → dept_internal 贡献被静默升成全公司可见（实测，escalation）。
+    - dept_internal（部门公开）→ raw/<dept>/internal/<doc>/<up>/file（管线解析回 dept_internal）
+    - public（全员公开）→ raw/<dept>/<doc>/<up>/file（扁平=管线解析回 public，正合意）
+    owner_dept 始终是第 2 段（_dept_from_raw_key 依赖；'internal' 是第 3 段，不影响部门解析）。
+    """
+    from opensearch_pipeline import kb_upload
+    fname = kb_upload.safe_filename(f"contribution-{cid}.md")
+    if permission_level == "public":
+        return f"raw/{owner_dept}/{doc_id}/{upload_id}/{fname}"
+    return f"raw/{owner_dept}/internal/{doc_id}/{upload_id}/{fname}"
+
+
+def _perm_from_contribution_raw_key(raw_key: str) -> str:
+    """从已固定的贡献 raw_key 反推权限（retry 续跑用，路径即权威）：含 /internal/ 段→dept_internal，否则 public。"""
+    return "dept_internal" if "/internal/" in (raw_key or "") else "public"
+
+
 def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: str, bucket: str,
-                              title: str, reviewer_id: str, reviewer_name: str, md_text: str) -> None:
+                              title: str, reviewer_id: str, reviewer_name: str, md_text: str,
+                              permission_level: str = "dept_internal") -> None:
     """把合成 .md 写入 OSS + 登记 document_meta/version（NOT_STARTED，等下一批 DAG 入库）。
 
     全部以【固定 doc_id/raw_key】幂等执行：已登记（raw_key 命中）直接返回；document_version 唯一键
@@ -3913,6 +3939,10 @@ def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: st
     size = len(data)
     etag = hashlib.sha256(data).hexdigest()[:32].upper()
     raw_key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    # original_filename 取 raw_key 真实 basename（= contribution-<contribution_id>.md），
+    # 与 OSS 对象名严格一致——别另拼 doc_id，否则台账显示名与实际对象对不上。
+    oss_filename = raw_key.rsplit("/", 1)[-1]
+    kb_type = "public" if permission_level == "public" else "private"
 
     if not put_object(raw_key, data, "text/markdown; charset=utf-8"):
         raise RuntimeError("OSS 写入合成文档失败")
@@ -3928,11 +3958,11 @@ def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: st
             INSERT INTO {_kb_db()}.document_meta
               (doc_id, title, original_filename, owner_dept, owner_user_id, owner_name,
                category_l1, category_l2, permission_level, kb_type, status, current_version_no)
-            VALUES (%s,%s,%s,%s,%s,%s,'faq','knowledge','dept_internal','private','active',1)
+            VALUES (%s,%s,%s,%s,%s,%s,'reference','others',%s,%s,'active',1)
             ON DUPLICATE KEY UPDATE current_version_no=GREATEST(current_version_no,1), updated_at=NOW()
             """,
-            (doc_id, (title or "")[:200], f"contribution-{doc_id}.md", owner_dept,
-             reviewer_id, reviewer_name or ""),
+            (doc_id, (title or "")[:200], oss_filename, owner_dept,
+             reviewer_id, reviewer_name or "", permission_level, kb_type),
         )
         try:
             cur.execute(
@@ -3968,6 +3998,8 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
 
     cfg = get_config()
     md = C.synthesize_markdown(question, content)
+    # 权限以【已固定的 raw_key 路径】为权威（accept 时按部门领导选择编码进路径；retry 续跑沿用同键）。
+    permission_level = _perm_from_contribution_raw_key(raw_key)
     try:
         assert_metadata_write_allowed("kb_contribution_materialize", cfg.rds.host, kind="rds")
         conn = _get_db_conn()
@@ -3975,7 +4007,7 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
             _materialize_contribution(
                 conn, doc_id=doc_id, owner_dept=owner_dept, raw_key=raw_key,
                 bucket=cfg.oss.bucket_name, title=question, reviewer_id=reviewer_id,
-                reviewer_name=reviewer_name, md_text=md)
+                reviewer_name=reviewer_name, md_text=md, permission_level=permission_level)
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {_op_db()}.kb_contribution SET ingestion_status='registered', "
@@ -4169,16 +4201,22 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             if verr:
                 conn.rollback()
                 raise HTTPException(status_code=400, detail=verr)
-            # 按【最终】目标部门做写授权（DB 现查的 kb；改部门即按新部门裁决）
-            decision = kb_authz.authorize_upload(kb, final_dept, "dept_internal")
+            # 部门领导采纳时定可见范围：dept_internal（部门公开，默认）/ public（全员公开）。
+            chosen_perm = (req.permission_level or "dept_internal").strip().lower()
+            chosen_perm = {"internal": "dept_internal", "private": "dept_internal"}.get(chosen_perm, chosen_perm)
+            if chosen_perm not in ("dept_internal", "public"):
+                conn.rollback()
+                raise HTTPException(status_code=400, detail="可见范围只能是 部门公开 或 全员公开")
+            # 按【最终】目标部门 + 选定可见范围做写授权（DB 现查的 kb；改部门即按新部门裁决）。
+            # 用户裁决（2026-06-29）：部门领导直接定——public 只校验 allowed，不因 requires_kb_admin_approval 转审批。
+            decision = kb_authz.authorize_upload(kb, final_dept, chosen_perm)
             if not decision.allowed:
                 conn.rollback()
                 raise HTTPException(status_code=403, detail=f"无权采纳到部门「{final_dept}」：{decision.reason}")
-            # 一次性固定键
+            # 一次性固定键（raw_key 把可见范围编码进路径段，防管线 stage-2 重解析升/降权）
             doc_id = cur_doc_id or kb_upload.new_doc_id()
             upload_id = cur_upload_id or kb_upload.new_ulid()
-            raw_key = cur_raw_key or kb_upload.build_raw_key(final_dept, doc_id, upload_id,
-                                                             f"contribution-{cid}.md")
+            raw_key = cur_raw_key or _contribution_raw_key(final_dept, doc_id, upload_id, cid, chosen_perm)
             cur.execute(
                 f"UPDATE {_op_db()}.kb_contribution SET review_status='accepted',"
                 " ingestion_status='registering', reviewed_by=%s, reviewed_at=NOW(),"
