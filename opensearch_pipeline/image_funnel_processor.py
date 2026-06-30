@@ -199,8 +199,10 @@ class ImageFunnelProcessor:
 
         # 模拟模式或 API 模拟模式下的规则逻辑（支持 deterministic 的单元测试）
         if self.simulate or self.simulate_api:
-            # 模拟审计机制：通过文件名或特定的模拟前缀测试
-            if not bypass_safety and any(k in filename for k in ["seal", "stamp", "id_card", "signature", "confidential"]):
+            # 模拟审计机制：通过文件名或特定的模拟前缀测试。
+            # 新策略（2026-06-29「保留旁路但不丢信号」）：即便 bypass_safety，VLM 主动判定的
+            # SENSITIVE 也不丢——与生产解析路径一致（不再 SENSITIVE→CLEAN），交由 Funnel 3 隔离。
+            if any(k in filename for k in ["seal", "stamp", "id_card", "signature", "confidential"]):
                 return {"status": "SENSITIVE", "caption": "", "image_category": "decorative",
                         "annotation_map": {}}
             
@@ -383,9 +385,12 @@ class ImageFunnelProcessor:
                 image_category = result_json.get("image_category", "unknown")
                 annotation_map = result_json.get("annotation_map", {})
 
-                # 纠合逻辑：bypass_safety 时 SENSITIVE 强制转 CLEAN
+                # bypass_safety 仅省去 prompt 里的敏感审计【指令】以省成本；但若 VLM 仍【主动】
+                # 判定 SENSITIVE（认出公章/身份证/签名），绝不再强制转 CLEAN 丢弃信号 —— 保留
+                # SENSITIVE 让 Funnel 3 路由到 QUARANTINE_SENSITIVE（防 dept_internal/restricted
+                # 文档的敏感图被索引/外发；用户裁决 2026-06-29「保留旁路但不丢信号」）。
                 if bypass_safety and status == "SENSITIVE":
-                    status = "CLEAN"
+                    print(f"    [Funnel 3] ⚠️ bypass_safety 下 VLM 仍判 SENSITIVE，保留并隔离: {doc_id}")
 
                 # 确保 annotation_map 是 dict
                 if not isinstance(annotation_map, dict):
