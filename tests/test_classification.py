@@ -646,3 +646,17 @@ class TestSpotCheckerSafetyDaemon:
             )
         assert "DashScope API returned status code 401" in str(exc_info.value)
 
+
+
+def test_safe_classification_fields_defaults_on_missing_keys():
+    """LLM 缺键（compatible-mode 不强约束 schema、负载/截断）→ 保守默认，绝不 KeyError。"""
+    from opensearch_pipeline.pipeline_nodes import _safe_classification_fields
+    full = {"confidence": 0.9, "faq_eligible": True, "summary": "S", "llm_risk_level": "high"}
+    assert _safe_classification_fields(full, "正文") == full          # 完整 → 原值
+    out = _safe_classification_fields({}, "这是正文内容")             # 全缺 → 默认（不抛）
+    assert out["confidence"] == 0.0
+    assert out["faq_eligible"] is False
+    assert out["llm_risk_level"] == "low"
+    assert out["summary"] == "这是正文内容"
+    part = _safe_classification_fields({"confidence": 0.7}, "x")     # 部分缺
+    assert part["confidence"] == 0.7 and part["faq_eligible"] is False
