@@ -27,6 +27,7 @@ defineExpose({ focus: () => ta.value?.focus() })
       <div class="flex items-end gap-2">
         <textarea
           ref="ta"
+          data-testid="chat-input"
           :value="modelValue"
           rows="1"
           placeholder="问点什么…（Enter 发送 · Shift+Enter 换行）"
@@ -37,6 +38,7 @@ defineExpose({ focus: () => ta.value?.focus() })
         />
         <button
           type="button"
+          data-testid="chat-send"
           class="grid size-9 shrink-0 place-items-center rounded-xl bg-primary text-primary-foreground transition
                  hover:opacity-90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
           :disabled="!asking && !modelValue.trim()"
