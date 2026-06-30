@@ -418,7 +418,7 @@ def extract_images_from_xlsx(
         return []
 
     assets: List[ImageAsset] = []
-    seen_hashes: set = set()
+    seen_hashes: dict = {}  # md5 -> {"asset": 首次导出资产, "anchors": set((sheet_idx, anchor_row))}
 
     try:
         wb = load_workbook(local_path, data_only=True)
@@ -449,11 +449,31 @@ def extract_images_from_xlsx(
             if not blob:
                 continue
 
-            # MD5 去重
             md5 = hashlib.md5(blob).hexdigest()
-            if md5 in seen_hashes:
+
+            # 先取 anchor 行号（行级图片绑定 + 别名判定都要用）
+            anchor_row = None
+            anchor = getattr(xl_img, 'anchor', None)
+            if anchor and hasattr(anchor, '_from'):
+                anchor_row = getattr(anchor._from, 'row', None)
+
+            # MD5 去重：字节只落盘一次；但同一张图复用在【不同 anchor 行】（步骤1/步骤3 共用
+            # 一张截图）必须各自保留 anchor_row，否则第二处 step_card 丢图（与 DOCX 别名逻辑对齐）。
+            dup = seen_hashes.get(md5)
+            if dup is not None:
+                key = (sheet_idx, anchor_row)
+                if anchor_row is not None and key not in dup["anchors"]:
+                    alias = ImageAsset(
+                        local_path=dup["asset"].local_path,  # 复用已落盘文件，不重复写
+                        page_num=sheet_idx + 1,
+                        image_index=img_index,
+                        original_name=f"sheet{sheet_idx}_image",
+                    )
+                    alias.anchor_row = anchor_row
+                    assets.append(alias)
+                    dup["anchors"].add(key)
+                    img_index += 1
                 continue
-            seen_hashes.add(md5)
 
             # 推测扩展名
             ext = ".png"  # openpyxl 默认
@@ -472,12 +492,6 @@ def extract_images_from_xlsx(
                 print(f"      ⚠️ Failed to export XLSX image: {e}")
                 continue
 
-            # 提取 anchor 行号（用于行级图片绑定）
-            anchor_row = None
-            anchor = getattr(xl_img, 'anchor', None)
-            if anchor and hasattr(anchor, '_from'):
-                anchor_row = getattr(anchor._from, 'row', None)
-
             asset = ImageAsset(
                 local_path=out_path,
                 page_num=sheet_idx + 1,
@@ -487,6 +501,7 @@ def extract_images_from_xlsx(
             if anchor_row is not None:
                 asset.anchor_row = anchor_row
             assets.append(asset)
+            seen_hashes[md5] = {"asset": asset, "anchors": {(sheet_idx, anchor_row)}}
             img_index += 1
 
     wb.close()
