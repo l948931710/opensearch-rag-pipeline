@@ -51,6 +51,8 @@ export interface ChatMessage {
   reasoning?: string       // 思考过程原始累积（深度思考 + RAG_STREAM_REASONING 开时下发的 reasoning 帧）
   reasoningHtml?: string   // 思考过程已渲染（与答案共用匀速吐字泵平滑显现）
   reasoningOpen?: boolean  // 「思考过程」披露条是否展开（思考中默认展开，答案开始自动收起，可手动切换）
+  reasoningMs?: number     // 思考耗时（ms）：首个 reasoning 帧 → 答案开始；收起态如实展示"思考 N.Ns"
+  _reasoningT0?: number    // 思考起点时间戳（performance.now）
   _stageTimer?: ReturnType<typeof setTimeout> | null
   _renderRaf?: number | null
   _shownLen?: number       // 答案已"吐字"显现到的字符位置（匀速泵推进，<= raw 长度）
@@ -197,6 +199,7 @@ function finalizeReasoning(ai: ChatMessage, collapse = true): void {
   if (!ai.reasoning || ai._reasoningDone) return
   ai._reasoningDone = true
   ai.reasoningHtml = renderMd(ai.reasoning)
+  if (ai._reasoningT0 != null && ai.reasoningMs == null) ai.reasoningMs = Math.round(_now() - ai._reasoningT0)
   if (collapse) ai.reasoningOpen = false
 }
 
@@ -221,6 +224,7 @@ function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number)
       // 深度思考过程（thinking + RAG_STREAM_REASONING 开；在答案 chunk 之前到达）。披露条接管等待态，
       // 思考中默认展开，文本经思考通道匀速显现。
       if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
+      if (ai._reasoningT0 == null) ai._reasoningT0 = _now()
       ai.loading = false
       ai.reasoning = (ai.reasoning || '') + ((ev.content as string) || '')
       if (ai.reasoningOpen == null) ai.reasoningOpen = true
@@ -480,7 +484,7 @@ function persist(): void {
     const data = conversations.value.filter((c) => c.messages.length > 0).slice(0, 30).map((c) => ({
       id: c.id, title: c.title, updatedAt: c.updatedAt,
       // 丢 _stageTimer（计时器句柄）、loading（reload 后无在途流）。
-      messages: c.messages.map((m) => { const { _stageTimer, _renderRaf, _shownLen, _lastRenderTs, _rRaf, _rShownLen, _rTs, _reasoningDone, loading, streaming, _thinking, ...rest } = m as any; return rest }),
+      messages: c.messages.map((m) => { const { _stageTimer, _renderRaf, _shownLen, _lastRenderTs, _rRaf, _rShownLen, _rTs, _reasoningDone, _reasoningT0, loading, streaming, _thinking, ...rest } = m as any; return rest }),
     }))
     // uid 戳：登录后 syncHistoryForUser 据此判断本地缓存是否属于当前用户（共享设备防残留）。
     localStorage.setItem(LS_KEY, JSON.stringify({ uid, activeId: activeId.value, conversations: data }))

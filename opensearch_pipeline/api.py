@@ -810,6 +810,11 @@ def ask_stream(req: AskRequest, request: Request,
                         frame["guard"] = _stream_guard
                         yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
                         continue
+                    # 思考过程帧只下发给【显式请求 thinking】的调用方：防 RAG_STREAM_REASONING 全局 flag
+                    # 把思维链广播给任何 SSE 客户端（小程序走 /api/ask 不受影响；钉钉只收 chunk；但杜绝未知
+                    # SSE 调用方拿到 CoT）。reasoning 只在 thinking 时产生，故此处按 req.thinking 收口即可。
+                    if frame is not None and frame.get("type") == "reasoning" and not req.thinking:
+                        continue
                     yield event
                     # 收集完整回答（用于写历史 & 落库）
                     if frame is not None and frame.get("type") == "chunk" and frame.get("content"):
