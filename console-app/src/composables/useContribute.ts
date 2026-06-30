@@ -181,12 +181,12 @@ async function submitContribution(): Promise<boolean> {
 }
 
 // ── 审核动作（部门管理员/kb_admin）──
-async function acceptContribution(c: ContributionItem) {
+async function acceptContribution(c: ContributionItem, permissionLevel: 'dept_internal' | 'public' = 'dept_internal') {
   await withInflight(`ct:${c.contribution_id}`, async () => {
     try {
       const s = useSession()
       if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = pendingContribs.value.filter((x) => x.contribution_id !== c.contribution_id); return }
-      await apiJson(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({}) })
+      await apiJson(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({ permission_level: permissionLevel }) })
       await Promise.all([loadPending(), loadMine()])
     } catch (e: any) { alert('采纳失败：' + uploadErrText(e)) }
   })

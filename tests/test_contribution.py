@@ -243,6 +243,53 @@ def test_accept_happy_materializes_clean_doc(monkeypatch):
     assert sink and "张三" not in sink[0][1] and "# 如何申请密钥?" in sink[0][1]
 
 
+# ── 3b) 部门领导定可见范围 + 权限编码进路径（防 stage-2 升/降权）──
+def test_accept_default_is_dept_internal_internal_path(monkeypatch):
+    """默认=部门公开：raw_key 含 /internal/ 段（管线解析回 dept_internal，不升公开），meta 写 dept_internal/private。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    sink = []
+    _capture_put(monkeypatch, ok=True, sink=sink)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"), claim_rowcount=1, dv_exists=None))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(), request=None, identity=_ident())
+    assert resp.ok is True
+    assert sink and "/internal/" in sink[0][0]   # 路径编码 dept_internal
+    meta = [p for s, p in conn.calls if "INSERT INTO" in s and "document_meta" in s][0]
+    assert "dept_internal" in meta and "private" in meta
+
+
+def test_accept_public_choice_flat_path_direct(monkeypatch):
+    """部门领导选「全员公开」→ 直接放行（不转 kb_admin）；raw_key 扁平（无 /internal/），meta 写 public。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")   # dept_admin 直接定 public（用户裁决 A）
+    sink = []
+    _capture_put(monkeypatch, ok=True, sink=sink)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"), claim_rowcount=1, dv_exists=None))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(permission_level="public"),
+                                      request=None, identity=_ident())
+    assert resp.ok is True and resp.ingestion_status == "registered"   # 直接入库，无 PENDING_APPROVAL
+    assert sink and "/internal/" not in sink[0][0]
+    meta = [p for s, p in conn.calls if "INSERT INTO" in s and "document_meta" in s][0]
+    assert "public" in meta
+
+
+def test_accept_invalid_permission_400(monkeypatch):
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"), claim_rowcount=1))
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(permission_level="restricted"),
+                                   request=None, identity=_ident())
+    assert getattr(ei.value, "status_code", None) == 400
+
+
 # ── 4) 授权矩阵 ──────────────────────────────────────────────────────────
 def test_accept_employee_forbidden(monkeypatch):
     _skip_if_not_sim()
