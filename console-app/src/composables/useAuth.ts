@@ -1,6 +1,7 @@
 import { useSession, toIdentity } from '@/stores/session'
 import { apiJson } from '@/lib/api'
 import { diag } from '@/lib/diag'
+import { syncHistoryForUser } from '@/composables/useAsk'
 
 // 本企业 corpId（非密钥，可硬编码兜底）。钉钉「PC 端访问地址」注入的 H5 拿不到 corpId 时用它，
 // 否则 requestAuthCode 报 'corpId is illegal'。URL 带 ?corpId= 时优先。
@@ -153,6 +154,7 @@ export function useAuth() {
         await doLogin(false)
         session.ready = true
         session.error = ''
+        syncHistoryForUser(session.identity?.userId || '')   // 共享设备：清掉他人残留的本地会话历史
         diag(`login OK: role=${session.role} canManage=${session.canManage}`)
       } catch (e: any) {
         session.ready = false
@@ -172,6 +174,7 @@ export function useAuth() {
     try {
       session.setToken('')
       await doLogin(true)
+      syncHistoryForUser(session.identity?.userId || '')   // 重登为不同用户时清掉前者残留
       return !!session.token
     } catch {
       return false

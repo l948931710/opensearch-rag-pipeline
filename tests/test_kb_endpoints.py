@@ -895,6 +895,21 @@ def test_insights_dept_admin_no_managed_fail_closed(monkeypatch):
     assert "AND 1=0" in sqls
 
 
+def test_insights_gap_queries_pii_redacted(monkeypatch):
+    """知识缺口跨用户展示：gap_queries 是【他人】原始提问，必须 PII 脱敏（与 /api/kb/gaps 一致）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    raw = "我的手机号13800138000怎么报销"
+    # fetch 顺序：usage(fetchone) → cited(fetchone) → top_docs(fetchall) → gap_queries(fetchall)
+    _stub_multi(monkeypatch, [(10, 5, 8, 2), (3,), [], [(raw, 2, 7.5)]])
+    from opensearch_pipeline import api
+    resp = api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.gap_queries, "应有一条缺口"
+    q = resp.gap_queries[0].query
+    assert "13800138000" not in q     # 他人手机号不外泄
+    assert q != raw                   # 已脱敏
+
+
 # ── /api/kb/governance 全库治理（Phase E，仅 kb_admin）──────────────────────────
 def test_governance_dept_admin_forbidden(monkeypatch):
     """治理看板是 kb_admin 专属：dept_admin（含写授权）也 403。"""
