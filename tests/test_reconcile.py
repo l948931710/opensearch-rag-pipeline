@@ -308,3 +308,33 @@ def test_cli_all_takes_worst_exit_code(monkeypatch):
                         lambda **k: {"ok": False, "complete": True, "counts": {},
                                      "missing": []})  # drift → 2
     assert reconcile.main(["--check", "all"]) == 2
+
+
+# ── _scan_ha3_pks: G30 loop-until-stable ──
+def test_scan_ha3_pks_loops_until_stable(monkeypatch):
+    """G30：单次零向量扫描会 under-return；逐桶 loop-until-stable 并集直到稳定，
+    避免把"本轮没扫到但实际在库"的 PK 误判为 missing/vanished（误报 OBS-4 召回丢失）。"""
+    from opensearch_pipeline import retriever
+    # 同一桶三次查询各返回不同部分子集（非确定）：第1轮见 {1}，第2轮见 {1,2}，第3轮无新增
+    rounds = [
+        [{"id": 1, "chunk_id": "c1", "doc_id": "d1"}],
+        [{"id": 2, "chunk_id": "c2", "doc_id": "d1"}, {"id": 1, "chunk_id": "c1", "doc_id": "d1"}],
+        [{"id": 1, "chunk_id": "c1", "doc_id": "d1"}],
+    ]
+    calls = {"n": 0}
+
+    def fake_parse(resp):
+        i = min(calls["n"], len(rounds) - 1)
+        calls["n"] += 1
+        return rounds[i]
+
+    monkeypatch.setattr(retriever, "_parse_ha3_response", fake_parse)
+
+    class _Cli:
+        def query(self, req):
+            return None
+
+    out = reconcile._scan_ha3_pks(_Cli(), "tbl", hi=100, lo=0, bucket=1000, max_rounds=3)
+    assert set(out["rows"].keys()) == {1, 2}   # 并集完整：首轮漏掉的 id=2 被后续轮补齐
+    assert out["truncated"] == []
+    assert calls["n"] >= 2                      # 首轮不完整 → 至少又扫了一轮

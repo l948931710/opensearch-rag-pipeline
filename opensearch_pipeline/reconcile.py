@@ -154,11 +154,18 @@ def compute_parity(rds_rows: List[Dict[str, Any]],
 
 
 def _scan_ha3_pks(cli, table_name: str, hi: int, *,
-                  lo: int = 0, bucket: int = _DEFAULT_BUCKET) -> Dict[str, Any]:
-    """Deterministic HA3 PK-range enumeration. Returns {"rows": {pk: {...}}, "truncated": [lo,...]}.
+                  lo: int = 0, bucket: int = _DEFAULT_BUCKET,
+                  max_rounds: int = 3) -> Dict[str, Any]:
+    """HA3 PK-range enumeration with G30 mitigation. Returns {"rows": {pk: {...}}, "truncated": [...]}.
 
-    A bucket whose result count reaches its cap is flagged truncated (some ids may be unseen) so the
-    caller can mark the report incomplete rather than reporting false 'missing' rows.
+    ⚠️ G30: a single zero-vector range scan is non-deterministic — it can under-return BELOW the cap
+    (a different partial subset each call, ~nothing right after a realtime push). Trusting one pass
+    surfaces phantom 'missing'/'vanished' rows → false OBS-4 recall-loss alerts for chunks that are in
+    fact indexed and serving. So we **loop each bucket until stable** — re-scan and union the rows until
+    a round adds nothing new (or max_rounds), the same fix ha3_reconcile._enumerate_ha3_pks uses.
+    Unioning is safe: the consumer only diffs vs RDS, so more-complete enumeration removes false
+    positives, never invents rows. A bucket whose single query reaches its cap is still flagged
+    truncated (genuinely > cap rows → caller marks the report incomplete).
     """
     from alibabacloud_ha3engine_vector.models import QueryRequest
     from opensearch_pipeline.retriever import _DEFAULT_OUTPUT_FIELDS, _parse_ha3_response
@@ -167,19 +174,23 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
     truncated: List[int] = []
     cap = bucket + 100
     for start in range(lo, hi, bucket):
-        req = QueryRequest(table_name=table_name, vector=[0.0] * 1024, top_k=cap,
-                           include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
-                           filter=f"id>={start} AND id<{start + bucket}")
-        parsed = _parse_ha3_response(cli.query(req))
-        if len(parsed) >= cap:
-            truncated.append(start)
-        for r in parsed:
-            try:
-                pk = int(r.get("id"))
-            except (TypeError, ValueError):
-                continue
-            rows[pk] = {"chunk_id": r.get("chunk_id", ""), "doc_id": r.get("doc_id", ""),
-                        "chunk_type": r.get("chunk_type", ""), "version_no": r.get("version_no")}
+        for _ in range(max(1, max_rounds)):
+            before = len(rows)
+            req = QueryRequest(table_name=table_name, vector=[0.0] * 1024, top_k=cap,
+                               include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
+                               filter=f"id>={start} AND id<{start + bucket}")
+            parsed = _parse_ha3_response(cli.query(req))
+            if len(parsed) >= cap and start not in truncated:
+                truncated.append(start)
+            for r in parsed:
+                try:
+                    pk = int(r.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                rows[pk] = {"chunk_id": r.get("chunk_id", ""), "doc_id": r.get("doc_id", ""),
+                            "chunk_type": r.get("chunk_type", ""), "version_no": r.get("version_no")}
+            if len(rows) == before:   # round surfaced nothing new → bucket stable
+                break
     return {"rows": rows, "truncated": truncated}
 
 
