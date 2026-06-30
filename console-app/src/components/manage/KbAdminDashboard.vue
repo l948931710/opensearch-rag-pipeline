@@ -21,6 +21,8 @@ import LoadError from './LoadError.vue'
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
 // 全部真实口径，无对应数据则如实显空 —— 绝不造数。
 const { kbStats, approvals, kbGovernance, kbInsights, loadStats, loadGovernance, loadInsights, loadErrors } = useKb()
+// 资产概览卡的加载态：stats 尚未返回且无错误 → 显骨架（避免闪 0）。
+const statsLoading = computed(() => !kbStats.value && !loadErrors.value['stats'])
 const b = (k: string) => kbStats.value?.by_badge?.[k] || 0
 const fmtN = (n?: number) => (n || 0).toLocaleString('en-US')
 const ms2s = (ms?: number) => (ms ? (ms / 1000).toFixed(1) + 's' : '—')
@@ -154,7 +156,7 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库资产概览</header>
       <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
       <div :class="GRID">
-        <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" />
+        <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" :loading="statsLoading" />
       </div>
       <!-- 各部门文档数分布（偏科）| 文件类型分布 —— 一个框两半 -->
       <div v-if="kbGovernance" :class="SPLIT" class="mt-4">

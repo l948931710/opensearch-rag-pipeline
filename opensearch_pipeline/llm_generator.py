@@ -523,12 +523,14 @@ def generate_answer_stream(
     根据检索结果生成 LLM 回答（SSE 流式）。
 
     pure_text: 见 generate_answer。None → 取 config.rag.pure_text。
-    thinking:  思考模式逐次覆盖；None → 取 config.llm.enable_thinking（默认 False）。
-               思考先产 reasoning_content（本函数只读 content、自动丢弃，不下发）。
+    thinking:  思考模式逐次覆盖；None → 取 config.llm.enable_thinking（默认 False）。思考先产
+               reasoning_content；仅「thinking 开 + RAG_STREAM_REASONING 开」时作为 reasoning 帧
+               下发（否则只读 content、丢弃 reasoning，与历史一致）。
 
     Yields SSE-formatted strings:
-        data: {"type": "chunk", "content": "..."}
         data: {"type": "sources", "sources": [...]}
+        data: {"type": "reasoning", "content": "..."}   # 仅 thinking + RAG_STREAM_REASONING 开；在 chunk 之前
+        data: {"type": "chunk", "content": "..."}
         data: {"type": "done", "usage": {...}}
         data: [DONE]
     """
@@ -549,6 +551,11 @@ def generate_answer_stream(
 
     url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
 
+    _think = llm.enable_thinking if thinking is None else bool(thinking)
+    # 思考过程下发：仅「thinking 开 + RAG_STREAM_REASONING 开」时，把 reasoning_content 作为
+    # {"type":"reasoning"} 附加帧流式下发（供「思考过程」披露条）；否则照旧只读 content、丢弃 reasoning。
+    _emit_reasoning = _think and bool(config.rag.stream_reasoning)
+
     payload = {
         "model": llm.model,
         "messages": messages,
@@ -556,11 +563,11 @@ def generate_answer_stream(
         "temperature": temperature,
         "stream": True,
         "stream_options": {"include_usage": True},
-        # 默认关闭 Qwen3 思考模式：思考会先生成大量 reasoning_content（本函数只读 content、
-        # 直接丢弃），实测拖慢 ~4.5x（38.5s→8.6s）且首字 34s→1.3s，并挤占 max_tokens 致答案截断。
-        # RAG 有检索上下文兜底，常规问题无需思考。thinking 参数允许逐次覆盖（小程序「深度思考」
-        # 按钮逐问开启，调用方需同时放宽 max_tokens）；None = 全局 RAG_LLM_ENABLE_THINKING。
-        "enable_thinking": llm.enable_thinking if thinking is None else bool(thinking),
+        # 默认关闭 Qwen3 思考模式：思考会先生成大量 reasoning_content（默认只读 content、直接丢弃），
+        # 实测拖慢 ~4.5x（38.5s→8.6s）且首字 34s→1.3s，并挤占 max_tokens 致答案截断。RAG 有检索上下文
+        # 兜底，常规问题无需思考。thinking 参数逐次覆盖（小程序/控制台「深度思考」按钮逐问开，调用方需
+        # 同时放宽 max_tokens）；None = 全局 RAG_LLM_ENABLE_THINKING。
+        "enable_thinking": _think,
     }
 
     # 先 yield sources 信息
@@ -605,6 +612,11 @@ def generate_answer_stream(
             choices = chunk_data.get("choices", [])
             if choices:
                 delta = choices[0].get("delta", {})
+                # 思考阶段先于答案产出 reasoning_content；flag 开时作为 reasoning 帧下发（在 chunk 之前）。
+                if _emit_reasoning:
+                    rc = delta.get("reasoning_content")
+                    if rc:
+                        yield f"data: {json.dumps({'type': 'reasoning', 'content': rc}, ensure_ascii=False)}\n\n"
                 content = delta.get("content")
                 if content:
                     yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"

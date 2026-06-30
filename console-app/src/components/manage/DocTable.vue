@@ -132,7 +132,7 @@ async function onRestore(d: DocItem) {
         class="led-row" :data-retired="d.status_badge === '已退役' ? '1' : '0'" :data-foreign="d.can_manage === false ? '1' : '0'"
       >
         <div class="led-cell led-cell-main min-w-0" data-label="文档名">
-          <div class="truncate text-[13.5px] font-semibold text-foreground">{{ d.title || d.original_filename || d.doc_id }}</div>
+          <div class="truncate text-[13.5px] font-semibold text-foreground" :title="d.title || d.original_filename || d.doc_id">{{ d.title || d.original_filename || d.doc_id }}</div>
           <div class="truncate text-[11px] text-faint">
             {{ permLabel(d.permission_level) }}<span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
           </div>

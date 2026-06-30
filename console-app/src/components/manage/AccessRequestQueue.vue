@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Lock, FileText } from 'lucide-vue-next'
+import { Lock, FileText, Loader2 } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessRequestItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
@@ -50,14 +50,14 @@ async function onReject(d: AccessRequestItem) {
         </div>
         <button
           type="button"
-          class="self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          class="inline-flex items-center justify-center gap-1 self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
           :disabled="isBusy(`acc:${d.id}`)" @click="onReject(d)"
-        >驳回</button>
+        ><Loader2 v-if="isBusy(`acc:${d.id}`)" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(`acc:${d.id}`) ? '驳回中…' : '驳回' }}</button>
         <button
           type="button"
-          class="self-start rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+          class="inline-flex items-center justify-center gap-1 self-start rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
           :disabled="isBusy(`acc:${d.id}`)" @click="approveAccess(d)"
-        >授权</button>
+        ><Loader2 v-if="isBusy(`acc:${d.id}`)" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(`acc:${d.id}`) ? '授权中…' : '授权' }}</button>
       </div>
     </div>
   </section>

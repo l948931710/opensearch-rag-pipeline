@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { ClipboardCheck, User } from 'lucide-vue-next'
+import { ClipboardCheck, User, Loader2 } from 'lucide-vue-next'
 import { deptLabel } from '@/lib/kb'
 import { useContribute, type ContributionItem } from '@/composables/useContribute'
 import LoadError from '@/components/manage/LoadError.vue'
@@ -58,14 +58,14 @@ async function onReject(c: ContributionItem) {
           </select>
           <button
             type="button" :disabled="isBusy(`ct:${c.contribution_id}`)"
-            class="rounded-lg border border-border px-3.5 py-[6px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+            class="inline-flex items-center justify-center gap-1 rounded-lg border border-border px-3.5 py-[6px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
             @click="onReject(c)"
-          >驳回</button>
+          ><Loader2 v-if="isBusy(`ct:${c.contribution_id}`)" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(`ct:${c.contribution_id}`) ? '驳回中…' : '驳回' }}</button>
           <button
             type="button" :disabled="isBusy(`ct:${c.contribution_id}`)"
-            class="rounded-lg bg-primary px-3.5 py-[6px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+            class="inline-flex items-center justify-center gap-1 rounded-lg bg-primary px-3.5 py-[6px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
             @click="acceptContribution(c, scopeOf(c.contribution_id))"
-          >采纳</button>
+          ><Loader2 v-if="isBusy(`ct:${c.contribution_id}`)" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(`ct:${c.contribution_id}`) ? '采纳中…' : '采纳' }}</button>
         </div>
       </div>
     </div>

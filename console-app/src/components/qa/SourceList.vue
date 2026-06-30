@@ -26,7 +26,7 @@ const FILL: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', lo
       >
         <span class="size-1.5 shrink-0 rounded-full" :class="DOT[s.level]" />
         <FileText :size="13" :stroke-width="1.7" class="shrink-0 text-accent-text" />
-        <span class="truncate font-medium text-foreground">{{ s.title }}</span>
+        <span class="min-w-0 truncate font-medium text-foreground" :title="s.title">{{ s.title }}</span>
         <span v-if="s.section" class="shrink-0 text-faint">· {{ s.section }}</span>
       </button>
     </div>

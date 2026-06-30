@@ -12,6 +12,8 @@ import LoadError from './LoadError.vue'
 // 故资产/状态口径只覆盖本部门。「待审核」用 by_badge（= 我提交、待 kb_admin 放行的版本）。
 // 使用成效/知识缺口取自 /api/kb/insights（retrieved_docs_json→doc_id→owner_dept 归属，本部门文档）。
 const { kbStats, kbInsights, loadStats, loadInsights, loadErrors } = useKb()
+// 概览指标卡的加载态：stats 尚未返回且无错误 → 显骨架（避免闪 0）。
+const statsLoading = computed(() => !kbStats.value && !loadErrors.value['stats'])
 const b = (k: string) => kbStats.value?.by_badge?.[k] || 0
 const fmtN = (n?: number) => (n || 0).toLocaleString('en-US')
 const pct = (x?: number) => (x === undefined ? '—' : (x * 100).toFixed(1) + '%')
@@ -62,7 +64,7 @@ const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
       <p :class="HEADER">概览</p>
       <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
       <div :class="GRID">
-        <StatCard v-for="s in cards" :key="s.label" v-bind="s" />
+        <StatCard v-for="s in cards" :key="s.label" v-bind="s" :loading="statsLoading" />
       </div>
       <p :class="SUBHEAD" class="mt-4">状态分布</p>
       <StatusDistBar :by-badge="kbStats?.by_badge || {}" />

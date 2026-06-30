@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Clock, FileText } from 'lucide-vue-next'
+import { Clock, FileText, Loader2 } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
@@ -47,14 +47,14 @@ async function onReject(d: PendingItem) {
         </div>
         <button
           type="button"
-          class="rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          class="inline-flex items-center justify-center gap-1 rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
           :disabled="isBusy(rowKey(d))" @click="onReject(d)"
-        >驳回</button>
+        ><Loader2 v-if="isBusy(rowKey(d))" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(rowKey(d)) ? '驳回中…' : '驳回' }}</button>
         <button
           type="button"
-          class="rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+          class="inline-flex items-center justify-center gap-1 rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
           :disabled="isBusy(rowKey(d))" @click="approve(d)"
-        >通过</button>
+        ><Loader2 v-if="isBusy(rowKey(d))" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(rowKey(d)) ? '通过中…' : '通过' }}</button>
       </div>
     </div>
   </section>
