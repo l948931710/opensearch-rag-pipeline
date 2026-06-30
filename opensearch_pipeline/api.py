@@ -4162,6 +4162,11 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             ingestion_status = row[1] or "none"
             cur_doc_id, cur_upload_id, cur_raw_key = row[2], row[3], row[4]
             cur_q, cur_c, cur_dept = row[5], row[6], row[7]
+            # 采纳前必须能管理贡献【原始】所属部门（与 reject/retry 一致）——否则 A 部门管理员
+            # 可凭 cid 把 B 部门贡献改 category_dept 抢入 A 部门（authorize_upload 只校验目标部门）。
+            if not _kb_can_manage(kb, cur_dept or ""):
+                conn.rollback()
+                raise HTTPException(status_code=403, detail="无权审核该部门的贡献")
             if review_status == C.REVIEW_REJECTED:
                 conn.rollback()
                 raise HTTPException(status_code=409, detail="该贡献已被驳回，不能采纳")
