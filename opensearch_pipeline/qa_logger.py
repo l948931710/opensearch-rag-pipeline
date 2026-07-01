@@ -55,6 +55,45 @@ def _redact_for_log(text: Optional[str]) -> Optional[str]:
         return text
 
 
+def _redact_content_blocks_for_log(cbj: Optional[str]) -> Optional[str]:
+    """写 qa_session_log 前对 content_blocks_json 做【结构感知】PII 掩码（OBS-qa-pii 的补口）。
+
+    query_text/answer_text 已在别处掩码，但同一行的 content_blocks_json（图文卡片序列化）
+    此前旁路了掩码 —— markdown/文本块里复述的身份证/手机号会明文驻留、且经 /api/history
+    原样回渲。这里 json.loads 后只对【文本载荷】跑 redact_text：type=text 的 text、image 的
+    caption/alt/title、以及 legacy markdown 的 content；url/oss_key 一律不动，故卡片回调重签
+    （content_blocks_builder.refresh_image_block_urls 只改 url 字段）完全不受影响。
+    flag 关或空时原样返回；解析/掩码异常时返回 None（丢弃图文块，绝不把未脱敏 PII 落库）。"""
+    if not cbj or not _qa_log_pii_redact_on():
+        return cbj
+    try:
+        from opensearch_pipeline.redaction import redact_text
+        blocks = json.loads(cbj)
+        if not isinstance(blocks, list):
+            return cbj
+        changed = False
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") in ("text", "markdown"):
+                keys = ("text", "content")
+            elif b.get("type") == "image":
+                keys = ("caption", "alt", "title")
+            else:
+                continue
+            for k in keys:
+                if b.get(k):
+                    masked, counts = redact_text(b[k])
+                    if counts:
+                        b[k] = masked
+                        changed = True
+        # 无命中时原样返回（字节级不变，避免无谓的 JSON 空白归一化 / 回调重签面）。
+        return json.dumps(blocks, ensure_ascii=False) if changed else cbj
+    except Exception as e:
+        logger.warning("qa_session_log content_blocks PII 掩码失败，丢弃图文块 (non-fatal): %s", e)
+        return None
+
+
 def _conversation_history_on() -> bool:
     """RAG_CONVERSATION_HISTORY 开关（懒读 config；异常退回 False）。"""
     try:
@@ -149,6 +188,8 @@ def log_qa_session(
         # 自掩码后的 query_text（见下方 _upsert_conversation），故标题同样不含 PII。
         query_text = _redact_for_log(query_text)
         answer_text = _redact_for_log(answer_text)
+        # content_blocks_json 同为 PII sink（图文块里可能复述号码），结构感知掩码后再落库。
+        content_blocks_json = _redact_content_blocks_for_log(content_blocks_json)
 
         # 序列化 JSON 字段
         retrieved_json = None

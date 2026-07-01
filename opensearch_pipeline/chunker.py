@@ -1264,22 +1264,12 @@ class DocumentChunker:
                 first_step_page = sec_steps[0]["page_num"]
                 first_step_section = sec_steps[0].get("section") or current_section
 
-        # ── Phase 4.9: 前导文本（步骤前的元信息/目的/职责/检验频率等）→ 独立 text_chunk ──
-        # 这些非步骤段落既会被 procedure_parent 摘要引用，也单独成块，
-        # 以便"文档编号/职责/检验频率"等查询能精确命中（而非只匹配到 parent）。
-        if preamble_texts:
-            pre_full = "\n".join(t.strip() for t, _, _, _ in preamble_texts if t and t.strip())
-            pg0, sect0, src0 = preamble_texts[0][1], preamble_texts[0][2], preamble_texts[0][3]
-            for sub in self._split_long_text(pre_full):
-                if len(sub.strip()) < self.min_chunk_chars:
-                    continue
-                chunks.append(self._create_chunk(
-                    doc_id=doc_id, version_no=version_no,
-                    chunk_index=chunk_index, chunk_type="text_chunk",
-                    chunk_text=sub.strip(), page_num=pg0,
-                    section_title=sect0, metadata=meta, source=src0,
-                ))
-                chunk_index += 1
+        # 注（F-4）：步骤前的前导文本（文档编号/目的/职责/检验频率等）已在上方 Phase 2 逐条发为
+        # 独立 text_chunk，且保留各自的 page_num/section_title/source。此处不再重复发块——原 Phase 4.9
+        # 会把同一份 preamble_texts 用 preamble_texts[0] 的 page/section 扁平化再发一遍，产出与 Phase 2
+        # 逐字节相同（单段前言时）或元数据错误（多段/跨 section 时）的重复 text_chunk，白付一份
+        # embedding + 索引位、并挤占 top_k、污染来源面板。procedure_parent 的前导摘要由下方 Phase 5
+        # 独立从 preamble_texts 抽取，不依赖此处发块。
 
         # ── Phase 5 (unified): 生成唯一 procedure_parent ──
         # 将所有 section 的步骤合并为一个 parent，避免多 section SOP 产生冗余 parent

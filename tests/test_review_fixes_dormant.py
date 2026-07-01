@@ -142,3 +142,25 @@ class TestCostQuarantineSkip:
         canonical = ctx["canonicals"][0]
         content_json = _json.loads(_json.dumps(canonical))  # OSS write → stage-2 read
         assert content_json.get("cost_quarantined", False) is True
+
+    def test_xlsx_layout_type_survives_stage2_reload(self):
+        """F-2：DAG1 把 xlsx_layout_type 写进 canonical JSON，且生产 Stage-2 loader 必须回读它——
+        否则重载后为空 → DAG2 回退重分类 → procedure_image_guide 被误判 normal_spreadsheet、
+        step_card/图片绑定结构静默丢失。"""
+        import json as _json
+        import inspect
+        from opensearch_pipeline import dataworks_orchestrator as dwo
+        # (1) DAG1 侧：xlsx_layout_type 经 json.dumps 落盘后仍可回读
+        r = _pdf_result()
+        r.file_ext = "xlsx"
+        r.text = "一些单元格内容"
+        r.xlsx_layout_type = "procedure_image_guide"
+        ctx = {"extractions": [r]}
+        pn.node_build_canonical(ctx)
+        content_json = _json.loads(_json.dumps(ctx["canonicals"][0]))  # OSS write → stage-2 read
+        assert content_json.get("xlsx_layout_type") == "procedure_image_guide"
+        # (2) Stage-2 loader 侧：canonical_doc 白名单必须回读 xlsx_layout_type + filename（合同）
+        src = inspect.getsource(dwo)
+        assert '"xlsx_layout_type": content_json.get("xlsx_layout_type")' in src, \
+            "orchestrator Stage-2 canonical_doc 未回读 xlsx_layout_type（F-2 回归）"
+        assert '"filename": content_json.get("filename") or title' in src

@@ -208,6 +208,39 @@ class TestHA3PushResponseParsing:
 
     @patch("opensearch_pipeline.pipeline_nodes._get_opensearch_client")
     @patch("opensearch_pipeline.pipeline_nodes._ensure_opensearch_index")
+    def test_ha3_push_str_body_per_doc_errors_marks_failed(self, mock_ensure, mock_get_client):
+        """F-12：真实 SDK 的 body 是 JSON【字符串】。含 doc 级 errors 时必须 json.loads 后解析、
+        把被拒 chunk 标 FAILED —— 而非旧代码那样（body 非 dict → 整批静默标 INDEXED，96 例静默丢失同类）。"""
+        from opensearch_pipeline.pipeline_nodes import node_push_to_opensearch
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        # 关键：body 为字符串（真实 PushDocumentsResponse 形态），而非 dict
+        mock_resp.body = '{"errors":[{"index":1,"code":"FIELD_ERROR","message":"vector dim mismatch"}]}'
+
+        client = MagicMock()
+        client.push_documents = MagicMock(return_value=mock_resp)
+        mock_get_client.return_value = client
+
+        chunks = self._make_chunks(3)
+        ctx = {
+            "bulk_batches": [{
+                "chunks": chunks, "payload": "", "payload_size": 100,
+                "job_id": "JOB_STR", "oss_key": "test.jsonl",
+            }],
+            "simulate_opensearch": False,
+            "opensearch_index": "test_idx",
+        }
+
+        node_push_to_opensearch(ctx)
+
+        assert chunks[0].index_status == "INDEXED"
+        assert chunks[1].index_status == "FAILED"          # 字符串 body 里的拒收不再被静默标 INDEXED
+        assert chunks[1].index_error_code == "FIELD_ERROR"
+        assert chunks[2].index_status == "INDEXED"
+
+    @patch("opensearch_pipeline.pipeline_nodes._get_opensearch_client")
+    @patch("opensearch_pipeline.pipeline_nodes._ensure_opensearch_index")
     def test_ha3_push_http_400_no_retry(self, mock_ensure, mock_get_client):
         """HA3 HTTP 400 (非瞬时错误)：不重试，标记失败。"""
         from opensearch_pipeline.pipeline_nodes import node_push_to_opensearch

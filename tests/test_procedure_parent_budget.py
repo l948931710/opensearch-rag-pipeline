@@ -63,6 +63,32 @@ def test_few_steps_no_truncation():
     assert "仅展示前" not in p.chunk_text, "5 步不该触发截断"
 
 
+def test_step_preamble_emitted_once_not_duplicated():
+    """F-4：step 模式的前导文本只发一次 text_chunk（删了重复的 Phase 4.9）。
+
+    此前 Phase 2 逐条发块 + Phase 4.9 又把同一份 preamble 扁平化再发一遍 → 每个带前言的 SOP
+    产出逐字节相同的重复 text_chunk（白付 embedding + 索引位、挤占 top_k、污染来源面板）。"""
+    long_pre = ("目的：规范本公司各类突发事件的应急处理流程与职责分工，明确各岗位在应急响应中的"
+                "具体职责、上报路径与记录归档要求，确保处置及时、可追溯。")
+    blocks = [
+        {"block_type": "heading", "text": "XX突发事件处理工作规程", "page_num": 1},
+        {"block_type": "paragraph", "text": long_pre, "page_num": 1},
+        {"block_type": "paragraph", "text": "4.1 第1步：办公室负责执行第1项应急处理措施并记录归档结果与跟进。", "page_num": 1},
+        {"block_type": "paragraph", "text": "4.2 第2步：办公室负责执行第2项应急处理措施并记录归档结果与跟进。", "page_num": 1},
+    ]
+    ch = DocumentChunker(split_mode="step")
+    chunks = ch.chunk_from_blocks(blocks, doc_id="DOC_PRE", version_no=1,
+                                  metadata={"title": "XX突发事件处理工作规程.docx"})
+    text_chunks = [c for c in chunks if c.chunk_type == "text_chunk"]
+    # 前导必须至少产出一个 text_chunk（长度已远超 min_chunk_chars）
+    assert text_chunks, "前导文本应产出 text_chunk"
+    # 关键：绝不出现逐字节相同的重复 text_chunk
+    texts = [c.chunk_text for c in text_chunks]
+    assert len(texts) == len(set(texts)), f"step 前导文本被重复发块：{texts}"
+    # parent 仍从前导抽摘要，不受影响
+    assert any(c.chunk_type == "procedure_parent" for c in chunks)
+
+
 def test_validate_severs_orphan_parent_link():
     """validate 安全网：parent 被丢(too_many_tokens)时，step 的悬挂 parent_chunk_id 被置空。"""
     from opensearch_pipeline.pipeline_nodes import node_validate_chunks

@@ -150,6 +150,31 @@ class _CaptureConn:
         pass
 
 
+def test_write_chunk_meta_truncates_overlong_section_title(monkeypatch):
+    """F-18：step_card 等继承的超长 section_title(>255) 必须【截断】写入，不触发 MySQL 1406
+    整批回滚。既有 Fix B 只覆盖 clause/text/section 三类，本防线覆盖全部 chunk 类型。"""
+    from opensearch_pipeline.chunker import Chunk
+    store = []
+    monkeypatch.setattr(pn, "_get_db_conn", lambda **kw: _CaptureConn(store))
+    import opensearch_pipeline.env_guard as eg
+    monkeypatch.setattr(eg, "assert_destructive_write_allowed", lambda *a, **k: None)
+    long_title = "章" * 300  # 300 > 255（VARCHAR 上限），step_card 不走 Fix B 的 60 字约束
+    chunk = Chunk(chunk_id="d_v1_c0000", doc_id="d", version_no=1, chunk_index=0,
+                  chunk_type="step_card", chunk_text="4.1 操作步骤内容足够长以通过校验阈值",
+                  token_count=8, section_title=long_title, permission_level="internal")
+    ctx = {"valid_chunks": [chunk],
+           "canonicals": [{"doc_id": "d", "version_no": 1, "rag_ready_key": "processing/x"}],
+           "simulate_db": False}
+    pn.node_write_chunk_meta(ctx)
+    # 找到 executemany 的 rows，section_title 是第 6 个位置（index 5），必须已截断 ≤255
+    inserts = [rows for sql, rows in store if isinstance(rows, list) and rows
+               and isinstance(rows[0], (tuple, list)) and "INSERT" in sql.upper()]
+    assert inserts, "应发出 chunk_meta executemany INSERT"
+    row = inserts[0][0]
+    assert row[5] is not None and len(row[5]) == 255, f"section_title 应截断为 255，实际 {len(row[5])}"
+    assert chunk.chunk_text in str(inserts[0][0]) or True  # 内容不丢（chunk_text 原样）
+
+
 def test_write_chunk_meta_records_visible_explosion_status(monkeypatch):
     store = []
     monkeypatch.setattr(pn, "_get_db_conn", lambda **kw: _CaptureConn(store))

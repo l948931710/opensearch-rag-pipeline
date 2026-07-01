@@ -110,13 +110,19 @@ class TestApiAskBookkeeping:
     @patch("opensearch_pipeline.api._append_to_history")
     @patch("opensearch_pipeline.api.generate_answer", return_value=GEN_RESULT)
     @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=API_CHUNKS)
-    def test_ask_success_log_user_id_body_fallback_anonymous(
+    def test_ask_anonymous_ignores_body_user_id(
         self, mock_retrieve, mock_gen, mock_append, mock_log, mock_blocks, client
     ):
-        """匿名 + 请求体 user_id：日志归因用请求体值（修复 #1 后也必须保持）。"""
+        """匿名 + 请求体 user_id：绝不采信请求体 user_id 作落库身份（F-5 IDOR 修复）。
+
+        /api/history 按令牌 identity.user_id 过滤本人记录；若匿名请求能写入任意 staffId，
+        攻击者即可把伪造问答注入受害者历史。改为落 anon:<ip 短哈希>，与真实 staffId 命名空间
+        天然不相交（永不出现在任何人历史里），请求体自报的 EMP1 被彻底忽略。"""
         resp = client.post("/api/ask", json={"question": "q", "user_id": "EMP1"})
         assert resp.status_code == 200
-        assert mock_log.call_args.kwargs["user_id"] == "EMP1"
+        uid = mock_log.call_args.kwargs["user_id"]
+        assert uid != "EMP1"
+        assert uid.startswith("anon:")
 
     @patch("opensearch_pipeline.api.log_qa_session")
     @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=[])

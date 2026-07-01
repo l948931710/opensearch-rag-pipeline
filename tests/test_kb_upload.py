@@ -193,10 +193,11 @@ class _FakeConn:
         pass
 
 
-def _stub_doc(monkeypatch, owner, perm):
-    """让 upload-url 的 version 分支读到 (owner, perm) 作为「原文档」元数据。"""
+def _stub_doc(monkeypatch, owner, perm, status="active"):
+    """让 upload-url 的 version 分支读到 (owner, perm, status) 作为「原文档」元数据。
+    upload-url version SELECT 现读 3 列（F-37 加 status），桩须同步返回 3 元组。"""
     import opensearch_pipeline.pipeline_nodes as pn
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _FakeConn((owner, perm)))
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _FakeConn((owner, perm, status)))
 
 
 def test_upload_url_version_forces_original_permission(monkeypatch):
@@ -214,6 +215,21 @@ def test_upload_url_version_forces_original_permission(monkeypatch):
     assert p["permission_level"] == "dept_internal"   # 强制继承，忽略伪造的 public
     assert p["action"] == "version" and p["doc_id"] == "DOC_X"
     assert resp.requires_kb_admin_approval is False    # 若伪造转 public 成功会要求审批
+
+
+def test_upload_url_version_on_retired_doc_409(monkeypatch):
+    """F-37：退役文档禁止升版 —— upload-url 早失败返回 409，连 PUT URL 都不颁发。"""
+    _sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
+    _stub_doc(monkeypatch, owner="production", perm="dept_internal", status="retired")
+    from opensearch_pipeline import api
+    req = api.KbUploadUrlRequest(action="version", doc_id="DOC_R", filename="v2.pdf",
+                                 owner_dept="production", permission_level="dept_internal")
+    with pytest.raises(Exception) as ei:
+        api.kb_upload_url(req=req, request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 409
+    assert "恢复上线" in str(getattr(ei.value, "detail", ""))
 
 
 def test_upload_url_version_other_dept_forbidden(monkeypatch):

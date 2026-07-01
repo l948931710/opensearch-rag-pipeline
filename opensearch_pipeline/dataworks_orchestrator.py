@@ -283,6 +283,13 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                             # canonical JSON 里带 cost_quarantined=True，stage-2 据此跳过切块/索引
                             # (否则 RDS 已封存而索引仍写入 chunk → 裂脑)。
                             "cost_quarantined": content_json.get("cost_quarantined", False),
+                            # xlsx layout 判定必须跨 stage 边界回读（F-2）：DAG1 用真实 filename 分类一次
+                            # 并写入 canonical JSON；stage-2 重载若丢弃它 → DAG2 消费点回退重分类，此时
+                            # doc.filename 为空 → procedure_image_guide 被误判成 normal_spreadsheet →
+                            # step_card / 图片绑定结构静默丢失。filename 从未写入 canonical JSON，用 RDS
+                            # title 兜底供 DAG2 回退分类器（正常路径有 xlsx_layout_type 即不回退）。
+                            "xlsx_layout_type": content_json.get("xlsx_layout_type"),
+                            "filename": content_json.get("filename") or title,
                             "canonical_status": "DONE",
                             "canonical_key": canonical_json_key,
                             "canonical_md_key": canonical_md_key,
