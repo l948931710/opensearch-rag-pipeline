@@ -15,7 +15,6 @@ reranker.py — 路由式重排序（DashScope rerank），插入在混合检索
 import logging
 from typing import Any, Dict, List, Optional
 
-import requests
 
 from opensearch_pipeline.http_session import http_post as _http_post
 

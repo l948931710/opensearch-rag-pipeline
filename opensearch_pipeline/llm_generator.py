@@ -10,7 +10,6 @@ import logging
 import re
 from typing import Any, Dict, Generator, List, Optional
 
-import requests
 
 from opensearch_pipeline.http_session import http_post as _http_post
 
