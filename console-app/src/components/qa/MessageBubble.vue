@@ -105,6 +105,20 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
       <SourceList v-if="m.sources && m.sources.length" :sources="m.sources" />
       <FeedbackBar v-if="m.messageId" :message="m" />
     </template>
+
+    <!-- 兜底：AI 消息既非加载/错误/无结果，又无可渲染内容（如"检索/思考中"被持久化后回灌的半截会话）
+         → 优雅提示而非空白气泡；有原问句则给重试。 -->
+    <template v-else>
+      <div class="text-[15px] text-muted-foreground">这条回答没有内容（可能上次未生成完）。</div>
+      <button
+        v-if="m.question"
+        type="button"
+        class="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground"
+        @click="retry(m)"
+      >
+        <RotateCw :size="14" :stroke-width="1.75" /> 重试
+      </button>
+    </template>
     </div>
   </div>
 </template>
