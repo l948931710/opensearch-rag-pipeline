@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Database, CheckCircle2, Loader, Clock, MessageSquare, Percent, Users, Quote } from 'lucide-vue-next'
+import { Database, CheckCircle2, Loader, Clock, Percent, UserCheck, Quote } from 'lucide-vue-next'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
 import StatusDistBar from './StatusDistBar.vue'
@@ -41,10 +41,9 @@ const cards = computed<Card[]>(() => {
 const usageCards = computed<Card[]>(() => {
   const i = kbInsights.value
   return [
-    { label: '被提问', value: i?.questions ?? 0, icon: MessageSquare, tone: 'text-foreground', hint: '命中本部门文档' },
-    { label: '有效回答率', value: pct(i?.effective_rate), icon: Percent, tone: 'text-st-live', hint: '成功 / 提问' },
-    { label: '提问人数', value: i?.askers ?? 0, icon: Users, tone: 'text-foreground', hint: '不同员工' },
-    { label: '被引用', value: i?.cited ?? 0, icon: Quote, tone: 'text-accent-text', hint: '实际作答引用' },
+    { label: '帮助用户数', value: i?.helped_users ?? 0, icon: UserCheck, tone: 'text-accent-text', hint: '答案引用了本部门文档的不同员工' },
+    { label: '有效回答率', value: pct(i?.effective_rate), icon: Percent, tone: 'text-st-live', hint: '成功作答 / 命中本部门文档的提问' },
+    { label: '被引用', value: i?.cited ?? 0, icon: Quote, tone: 'text-foreground', hint: '本部门文档进入最终回答的提问数' },
   ]
 })
 const topDocItems = computed(() =>
@@ -55,6 +54,7 @@ const gapItems = computed(() =>
 const HEADER = 'mb-3 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint'
 const SUBHEAD = 'mb-2 ml-0.5 text-[12.5px] font-medium text-muted-foreground'
 const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
+const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用成效合并为 3 卡后独立网格
 </script>
 
 <template>
@@ -73,7 +73,7 @@ const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
     <!-- 使用成效（真实，近 N 天，本部门文档被使用情况） -->
     <section v-if="kbInsights">
       <p :class="HEADER">使用成效 · 近 {{ kbInsights.window_days }} 天（本部门文档）</p>
-      <div :class="GRID">
+      <div :class="USAGE_GRID">
         <StatCard v-for="s in usageCards" :key="s.label" v-bind="s" />
       </div>
       <p :class="SUBHEAD" class="mt-4">最常被检索的文档</p>

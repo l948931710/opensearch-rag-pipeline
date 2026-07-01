@@ -31,7 +31,7 @@ function mountWith(comp: any, id: Identity, inject?: { stats?: any; insights?: K
 
 const INSIGHTS: KbInsights = {
   scope: 'global', window_days: 30,
-  questions: 186, askers: 40, success: 143, refusal: 43, cited: 130, effective_rate: 0.769,
+  questions: 186, askers: 40, success: 143, refusal: 43, cited: 130, helped_users: 37, effective_rate: 0.769,
   top_docs: [{ title: '下达销售订单作业指导书', owner_dept: 'marketing', hits: 64 }],
   gap_queries: [{ query: '2ozpp杯在龙盛机上的速度', count: 2, avg_top: 0.729 }],
 }
@@ -141,7 +141,7 @@ describe('DeptDashboard — 本部门口径', () => {
     const w = mountWith(DeptDashboard, identity({ role: 'dept_admin', managedOwnerDepts: ['marketing'] }),
       { stats: { total: 42, active: 40, retired: 2, by_badge: { 已上线: 38 } }, insights: INSIGHTS })
     expect(w.text()).toContain('使用成效')
-    expect(w.text()).toContain('186')                // 被提问数
+    expect(w.text()).toContain('37')                 // 帮助用户数（被引用本部门文档的不同用户）
     expect(w.text()).toContain('76.9%')              // 有效回答率
     expect(w.text()).toContain('下达销售订单作业指导书')  // 最常被检索
     expect(w.text()).toContain('知识缺口')

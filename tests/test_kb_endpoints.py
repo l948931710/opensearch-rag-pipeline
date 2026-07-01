@@ -905,10 +905,11 @@ def test_insights_gap_queries_pii_redacted(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     raw = "我的手机号13800138000怎么报销"
-    # fetch 顺序：usage(fetchone) → cited(fetchone) → top_docs(fetchall) → gap_queries(fetchall)
-    _stub_multi(monkeypatch, [(10, 5, 8, 2), (3,), [], [(raw, 2, 7.5)]])
+    # fetch 顺序：usage(fetchone) → cited(fetchone: 提问数, 被帮到的用户数) → top_docs(fetchall) → gap_queries(fetchall)
+    _stub_multi(monkeypatch, [(10, 5, 8, 2), (3, 2), [], [(raw, 2, 7.5)]])
     from opensearch_pipeline import api
     resp = api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.cited == 3 and resp.helped_users == 2   # 同一 cited JOIN：提问数 vs 去重用户数
     assert resp.gap_queries, "应有一条缺口"
     q = resp.gap_queries[0].query
     assert "13800138000" not in q     # 他人手机号不外泄
@@ -1044,3 +1045,133 @@ def test_insights_partial_failure_degrades_not_500(monkeypatch):
     resp = api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))   # 不抛 500
     assert resp.questions == 12 and resp.success == 9    # 成功子查询的真实指标保留
     assert resp.top_docs == [] and resp.gap_queries == []  # 失败子查询诚实空
+
+
+# ── /api/kb/approval-history 审批历史（只读聚合，四流合并时间线）───────────────────
+def test_approval_history_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:   # 管理员特权：employee 在任何 DB 查询前 403
+        api.kb_approval_history(request=None, identity=api.Identity(user_id="e1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_approval_history_anonymous_unauthorized(monkeypatch):
+    _skip_if_not_sim()
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_approval_history(request=None, identity=None)
+    assert getattr(ei.value, "status_code", None) == 401
+
+
+def test_approval_history_dept_admin_scope(monkeypatch):
+    """dept_admin：只跑 access+contribution，两者均 owner/category 作用域收窄；不碰 kb_audit_log。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    # fetch 顺序（全 fetchall）：access → contribution → user_role(操作者名)
+    access = [("D1", "销售SOP", "marketing", "production", "王伟", "approved", "引用", "", "da1", "2026-06-28 14:00:00")]
+    contrib = [("2ozpp杯速度", "marketing", "孙工", "accepted", "", "searchable", "mgr2", "2026-06-27 09:00:00")]
+    names = [("da1", "李娜"), ("mgr2", "陈立")]
+    sink = _stub_multi(monkeypatch, [access, contrib, names])
+    from opensearch_pipeline import api
+    resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="da1"))
+    assert len(resp.items) == 2
+    assert {it.kind for it in resp.items} == {"access", "contribution"}
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "owner_dept IN" in sqls and "category_dept IN" in sqls   # 双作用域收窄
+    assert "kb_audit_log" not in sqls                               # dept_admin 不查上传/成员授权
+    assert "status IN" in sqls and "review_status IN" in sqls       # 只取已决行
+    acc = next(it for it in resp.items if it.kind == "access")
+    assert acc.action == "approved" and acc.subject == "王伟" and acc.decided_by_name == "李娜"
+
+
+def test_approval_history_kb_admin_all_sources(monkeypatch):
+    """kb_admin：四源都跑（含 kb_audit_log 上传 APPROVE + 成员 KB_ADMIN_GRANT），无作用域收窄。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    access = [("D1", "销售SOP", "marketing", "production", "王伟", "revoked", "", "到期收回", "kb1", "2026-06-28 14:00:00")]
+    contrib = [("请假加急", "hr", "周敏", "rejected", "与制度冲突", "", "mgr3", "2026-06-26 16:00:00")]
+    upload = [("D9", "安全规程v4", "production", "APPROVE", "kb1", "2026-06-28 11:00:00", "")]
+    admin = [("KB_ADMIN_GRANT", "kb1", "2026-06-25 09:00:00", "grant dept_admin mgr002 → quality,production")]
+    names = [("kb1", "系统管理员"), ("mgr3", "陈立")]
+    sink = _stub_multi(monkeypatch, [access, contrib, upload, admin, names])
+    from opensearch_pipeline import api
+    resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))
+    assert {it.kind for it in resp.items} == {"access", "contribution", "upload", "admin_grant"}
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "kb_audit_log" in sqls and "APPROVE" in sqls and "KB_ADMIN_GRANT" in sqls
+    assert "owner_dept IN (" not in sqls                            # kb_admin 不收窄
+    ag = next(it for it in resp.items if it.kind == "admin_grant")
+    assert ag.title == "mgr002" and ag.action == "granted"          # message 解析出目标 uid
+    assert next(it for it in resp.items if it.kind == "upload").action == "approved"
+    # 合并按 decided_at 倒序：最新 access(28 14:00) 在首
+    assert resp.items[0].kind == "access"
+
+
+def test_approval_history_pii_redacted(monkeypatch):
+    """跨用户自由文本（申请理由 / 贡献问题）必须脱敏，不泄露他人手机号。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    access = [("D1", "报销SOP", "finance", "hr", "王伟", "approved", "我手机13800138000报销用", "", "kb1", "2026-06-28 10:00:00")]
+    contrib = [("我的手机号13900139000怎么改", "hr", "周敏", "rejected", "", "", "kb1", "2026-06-27 10:00:00")]
+    names = [("kb1", "系统管理员")]
+    _stub_multi(monkeypatch, [access, contrib, [], [], names])   # upload/admin 空
+    from opensearch_pipeline import api
+    resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))
+    blob = " ".join((it.title + " " + it.detail) for it in resp.items)
+    assert "13800138000" not in blob and "13900139000" not in blob
+
+
+def test_approval_history_all_queries_fail_raises_500(monkeypatch):
+    """连接成功但所有子查询失败 → 诚实 500，不伪装 all-empty 无历史。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_all_fail(monkeypatch)
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 500
+
+
+def test_approval_history_partial_degrades_not_500(monkeypatch):
+    """部分子查询失败（access 成功、其余抛）→ 不 500：已取到的照常，操作者名回退 uid。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    import opensearch_pipeline.pipeline_nodes as pn
+    access = [("D1", "销售SOP", "marketing", "production", "王伟", "approved", "引用", "", "kb1", "2026-06-28 14:00:00")]
+
+    class _Cur:
+        def __init__(self):
+            self.n = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            self.n += 1
+            if self.n > 1:                       # 仅第一条（access）成功，其余抛
+                raise RuntimeError("simulated partial fault")
+
+        def fetchall(self):
+            return access                        # 仅 access execute 后被调用一次
+
+        def fetchone(self):
+            return None
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    from opensearch_pipeline import api
+    resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))   # 不抛 500
+    assert [it.kind for it in resp.items] == ["access"]
+    assert resp.items[0].decided_by_name == "kb1"    # names 查询也失败 → 回退 uid

@@ -29,6 +29,15 @@ export interface AccessGrantItem {
   id: string; doc_id: string; doc_title: string; owner_dept: string
   requester_dept: string; requester_name: string; permission_level: string; reason: string; decided_at: string
 }
+// 审批历史（只读聚合 /api/kb/approval-history）：四条审批流的【历史决策】合并时间线。
+// dept_admin 见 access+contribution（本部门）；kb_admin 见全部四类（全库，含 upload/admin_grant）。
+export interface ApprovalHistoryItem {
+  kind: string            // 'access' | 'contribution' | 'upload' | 'admin_grant'
+  action: string          // approved | rejected | revoked | accepted | granted
+  title: string; owner_dept: string; subject: string
+  detail: string; extra: string
+  decided_by: string; decided_by_name: string; decided_at: string
+}
 // Phase F 成员/角色管理（kb_admin 专属）：现行管理员 + 各自可管理 owner_dept（后端 /api/kb/admin-grants）。
 export interface AdminItem {
   user_id: string; user_name: string; role: string; managed_owner_depts: string[]
@@ -51,7 +60,7 @@ export interface KbTopDoc { title: string; owner_dept: string; hits: number }
 export interface KbGapQuery { query: string; count: number; avg_top: number }
 export interface KbInsights {
   scope: string; window_days: number
-  questions: number; askers: number; success: number; refusal: number; cited: number; effective_rate: number
+  questions: number; askers: number; success: number; refusal: number; cited: number; helped_users: number; effective_rate: number
   top_docs: KbTopDoc[]; gap_queries: KbGapQuery[]
 }
 export interface KbEmbedRun { bizdate: string; embedded: number; failed: number; fail_rate: number }
@@ -98,6 +107,7 @@ const verHistory = ref<{ doc: DocItem | null; versions: VersionItem[]; loading: 
 const approvals = ref<PendingItem[]>([])
 const accessRequests = ref<AccessRequestItem[]>([])   // 授权申请队列（审批人侧 · pending）
 const accessGrants = ref<AccessGrantItem[]>([])       // 已授权清单（审批人侧 · approved 存量，供撤销）
+const approvalHistory = ref<ApprovalHistoryItem[]>([]) // 审批历史（只读聚合，四流合并时间线）
 const adminGrants = ref<AdminItem[]>([])              // Phase F 现行管理员名单（kb_admin 专属）
 const grantableDepts = ref<string[]>([])             // 授予表单可选 owner_dept（写白名单）
 const loadingDocs = ref(false)
@@ -325,7 +335,7 @@ async function loadInsights() {
   if (import.meta.env.DEV && s.token === 'dev-preview') {
     kbInsights.value = {
       scope: s.role === 'kb_admin' ? 'global' : 'dept', window_days: 30,
-      questions: 186, askers: 40, success: 143, refusal: 43, cited: 130, effective_rate: 0.769,
+      questions: 186, askers: 40, success: 143, refusal: 43, cited: 130, helped_users: 37, effective_rate: 0.769,
       top_docs: [
         { title: 'FL-GJMY-WI-008《下达销售订单》作业指导书.docx', owner_dept: 'marketing', hits: 64 },
         { title: '亚马逊运营SOP（标准化流程）.docx', owner_dept: 'marketing', hits: 51 },
@@ -646,6 +656,35 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
   })
 }
 
+// 审批历史（只读聚合）：后端按角色作用域 —— dept_admin 见本部门 access+contribution、kb_admin 见全库四类。
+// 404（未上线）静默兜底空；5xx 显错。DEV ?preview 注入 mock（kb_admin 见四类混合、dept_admin 仅两类）。
+async function loadApprovalHistory() {
+  const s = useSession()
+  if (!s.identity?.canManage) { approvalHistory.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    const base: ApprovalHistoryItem[] = [
+      { kind: 'access', action: 'approved', title: '客户投诉处理 SOP', owner_dept: 'marketing', subject: '王伟', detail: '生产部包装设计需引用营销规范。', extra: '', decided_by: 'kb001', decided_by_name: '系统管理员', decided_at: '2026-06-28 14:32:10' },
+      { kind: 'access', action: 'rejected', title: '海外客户名录 v2', owner_dept: 'marketing', subject: '赵强', detail: '涉客户隐私，暂不外放。', extra: '', decided_by: 'mgr001', decided_by_name: '王伟', decided_at: '2026-06-27 10:05:00' },
+      { kind: 'contribution', action: 'accepted', title: '2ozpp杯在龙盛机上的速度是多少？', owner_dept: 'production', subject: '孙工', detail: '', extra: 'searchable', decided_by: 'mgr002', decided_by_name: '李娜', decided_at: '2026-06-27 09:15:22' },
+      { kind: 'contribution', action: 'rejected', title: '请假流程能不能加急', owner_dept: 'hr', subject: '周敏', detail: '与现行制度冲突，未采纳。', extra: '', decided_by: 'mgr003', decided_by_name: '陈立', decided_at: '2026-06-26 16:40:00' },
+    ]
+    const adminOnly: ApprovalHistoryItem[] = [
+      { kind: 'upload', action: 'approved', title: '注塑车间安全操作规程 v4.docx', owner_dept: 'production', subject: '', detail: '', extra: '', decided_by: 'kb001', decided_by_name: '系统管理员', decided_at: '2026-06-28 11:20:00' },
+      { kind: 'upload', action: 'rejected', title: '旧版包装规范.pdf', owner_dept: 'marketing', subject: '', detail: '内容过期，已被 v3 取代。', extra: '', decided_by: 'kb001', decided_by_name: '系统管理员', decided_at: '2026-06-26 17:40:00' },
+      { kind: 'admin_grant', action: 'granted', title: 'mgr002', owner_dept: '', subject: 'mgr002', detail: 'grant dept_admin mgr002 → quality,production', extra: '', decided_by: 'kb001', decided_by_name: '系统管理员', decided_at: '2026-06-25 09:00:00' },
+    ]
+    approvalHistory.value = s.role === 'kb_admin'
+      ? [...base, ...adminOnly].sort((a, b) => (a.decided_at < b.decided_at ? 1 : -1))
+      : base
+    return
+  }
+  clearLoadError('approvalHistory')
+  try {
+    const r = await apiJson<{ items: ApprovalHistoryItem[] }>('/api/kb/approval-history', { auth: true })
+    approvalHistory.value = r.items || []
+  } catch (e) { approvalHistory.value = []; noteLoadError('approvalHistory', e) }
+}
+
 // ── Phase F：成员/角色管理（仅 kb_admin）──
 async function loadAdminGrants() {
   const s = useSession()
@@ -743,14 +782,14 @@ export function useKb() {
 
   return {
     // 状态
-    docs, filtered, approvals, accessRequests, accessGrants, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir,
+    docs, filtered, approvals, accessRequests, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir,
     newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory, loadErrors,
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
-    loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, setScope,
+    loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
@@ -760,7 +799,7 @@ export function useKb() {
 
 /** 仅供测试：重置 store。 */
 export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
+  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null

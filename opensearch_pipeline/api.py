@@ -2001,6 +2001,7 @@ class KbInsightsResponse(BaseModel):
     success: int = 0
     refusal: int = 0
     cited: int = 0                       # 所辖文档被「实际引用」的提问数
+    helped_users: int = 0                # 被「实际引用」所辖文档的不同用户数（= 真正被本部门知识帮到的人数）
     effective_rate: float = 0.0          # success / questions
     top_docs: List[KbTopDocItem] = Field(default_factory=list)
     gap_queries: List[KbGapQueryItem] = Field(default_factory=list)
@@ -2048,10 +2049,12 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
                 out.effective_rate = round(out.success / out.questions, 4) if out.questions else 0.0
             except Exception as e:
                 fails += 1; logger.warning("kb_insights 使用聚合失败: %s", e)
-            # 2) 被引用问题数（cited_docs_json JOIN；NO_RESULT/REFUSAL 行该列为空，故弱于 retrieved）
+            # 2) 被引用问题数 + 被帮到的不同用户数（cited_docs_json JOIN；NO_RESULT/REFUSAL 行该列为空，
+            #    故 cited 天然「成功且实际用到本部门文档」，不会高估）。helped_users = 同一 JOIN 上按 user_id
+            #    去重 → 真正被本部门知识帮到的人数（与 cited=提问数 配对：帮了 helped_users 人 / cited 个问题）。
             try:
                 cur.execute(
-                    "SELECT COUNT(DISTINCT q.message_id)"
+                    "SELECT COUNT(DISTINCT q.message_id), COUNT(DISTINCT q.user_id)"
                     f" FROM {_op_db()}.qa_session_log q"
                     " JOIN JSON_TABLE(q.cited_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
                     f" JOIN {_kb_db()}.document_meta m"
@@ -2059,9 +2062,11 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
                     " WHERE q.cited_docs_json IS NOT NULL"
                     "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                     + (" " + scope_clause if scope_clause else ""), args)
-                out.cited = int((cur.fetchone() or (0,))[0] or 0)
+                r2 = cur.fetchone() or (0, 0)
+                out.cited = int(r2[0] or 0)
+                out.helped_users = int(r2[1] or 0)
             except Exception as e:
-                fails += 1; logger.warning("kb_insights cited 失败: %s", e)
+                fails += 1; logger.warning("kb_insights cited/helped 失败: %s", e)
             # 3) 最常被检索的文档（COUNT(DISTINCT message_id) 去扇出，与其它计数同一纪律）
             try:
                 cur.execute(
@@ -3498,6 +3503,207 @@ def kb_access_grants_list(request: Request,
         for r in rows
     ]
     return KbAccessGrantListResponse(items=items)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 审批历史 (Approval History) — 只读聚合，四条审批流的【历史决策】合并时间线。
+#   dept_admin：见本部门的 access（跨部门检索授权）+ contribution（知识贡献采纳）历史；
+#   kb_admin：见全库四类（再加 upload 上传审批 + admin_grant 成员/角色授权，取自审计日志）。
+# 无需改表：kb_access_request/kb_contribution 有 decided_by/decided_at(reviewed_*)+备注；
+# 上传审批 & 成员授权的决策元数据在 append-only kb_audit_log（operator_id/created_at/action_type）。
+# 镜像 /api/kb/insights 的多子查询 fail-open：各子查询独立 try/except + fails 计数，全失败→诚实 500。
+# ─────────────────────────────────────────────────────────────────────────────
+_APPROVAL_HISTORY_LIMIT = 200
+# 决策时间统一转北京时（与 Phase E 看板同口径）；tz 表缺失时 COALESCE 回退原值（Pacific）不致排序崩。
+_TZ_PACIFIC_TO_BJ = "'America/Los_Angeles','Asia/Shanghai'"
+
+
+def _parse_admin_target(msg: str) -> str:
+    """从 KB_ADMIN_GRANT/REVOKE 审计 message 抽目标用户 id（best-effort，格式由我方代码固定）。
+
+    grant：'grant dept_admin <uid> → <depts>'；revoke：'revoke <uid> owner=<..> demoted=..'。
+    """
+    try:
+        parts = (msg or "").split()
+        if len(parts) >= 3 and parts[0] == "grant":
+            return parts[2]
+        if len(parts) >= 2 and parts[0] == "revoke":
+            return parts[1]
+    except Exception:
+        pass
+    return ""
+
+
+class KbApprovalHistoryItem(BaseModel):
+    kind: str = ""            # 'access' | 'contribution' | 'upload' | 'admin_grant'
+    action: str = ""          # approved|rejected|revoked|accepted|granted
+    title: str = ""           # 文档标题 / 贡献问题 / 目标用户
+    owner_dept: str = ""      # 作用域部门（contribution=category_dept；admin_grant 无）
+    subject: str = ""         # requester_name / author_name / 目标 uid（已存展示名，与队列一致，不脱敏）
+    detail: str = ""          # 理由/备注 —— 跨用户自由文本，已脱敏
+    extra: str = ""           # 次要状态：contribution 的 ingestion_status
+    decided_by: str = ""      # 操作者 staffId
+    decided_by_name: str = ""  # 操作者展示名（best-effort，缺则回退 uid）
+    decided_at: str = ""      # 北京时间 'YYYY-MM-DD HH:MM:SS'
+
+
+class KbApprovalHistoryResponse(BaseModel):
+    items: List[KbApprovalHistoryItem] = Field(default_factory=list)
+
+
+@app.get("/api/kb/approval-history", response_model=KbApprovalHistoryResponse)
+def kb_approval_history(request: Request,
+                        identity: Optional[Identity] = Depends(current_identity)):
+    """审批历史（只读聚合，owner 作用域）。dept_admin 见本部门 access+contribution；kb_admin 见全库四类。
+
+    各子查询独立降级（单流取数失败只让该流缺失，不拖垮整块）；跑过的子查询【全部】失败 → 诚实 500。
+    跨用户自由文本（申请理由/贡献问题/审批备注/审计 message）一律 redact_query_text 脱敏。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    is_admin = (kb.role == ROLE_KB_ADMIN)
+    scope_owner, scope_owner_params = "", []
+    scope_cat, scope_cat_params = "", []
+    if not is_admin:
+        owners = managed_owner_depts(kb)
+        if not owners:
+            return KbApprovalHistoryResponse(items=[])   # 无管理部门 → 空（fail-closed，绝不当全量）
+        ph = ",".join(["%s"] * len(owners))
+        scope_owner = f"AND r.owner_dept IN ({ph})"; scope_owner_params = list(owners)
+        scope_cat = f"AND category_dept IN ({ph})"; scope_cat_params = list(owners)
+    lim = _APPROVAL_HISTORY_LIMIT
+    from opensearch_pipeline import contribution as _C
+
+    def _rq(t: Optional[str]) -> str:   # 跨用户自由文本脱敏兜底（失败即安全空）
+        try:
+            return _C.redact_query_text(t or "")
+        except Exception:
+            return ""
+
+    out: List[KbApprovalHistoryItem] = []
+    op_ids: set = set()
+    fails = 0
+    ran = 0
+    try:
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_approval_history 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"审批历史查询失败 (trace: {trace_id})")
+    try:
+        # 共享 buffered 游标跑多条子查询（pymysql 默认 Cursor，非 SSCursor）：某条异常后结果已缓冲，
+        # 下一句 execute 不会 "Commands out of sync"。与 /api/kb/insights 同型。
+        with conn.cursor() as cur:
+            # 1) access —— kb_access_request 的已决行（两角色，owner_dept 作用域）
+            ran += 1
+            try:
+                cur.execute(
+                    "SELECT r.doc_id, m.title, r.owner_dept, r.requester_depts, r.requester_name,"
+                    " r.status, r.reason, r.decision_note, r.decided_by,"
+                    f" COALESCE(CONVERT_TZ(r.decided_at,{_TZ_PACIFIC_TO_BJ}), r.decided_at)"
+                    f" FROM {_kb_db()}.kb_access_request r"
+                    f" JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id"
+                    " WHERE r.status IN ('approved','rejected','revoked') " + scope_owner +
+                    " ORDER BY r.decided_at DESC LIMIT %s",
+                    tuple(scope_owner_params + [lim]))
+                for x in cur.fetchall():
+                    out.append(KbApprovalHistoryItem(
+                        kind="access", action=(x[5] or ""), title=(x[1] or ""),
+                        owner_dept=(x[2] or ""), subject=(x[4] or ""),
+                        detail=(_rq(x[6]) or _rq(x[7])), decided_by=(x[8] or ""),
+                        decided_at=str(x[9]) if x[9] else ""))
+                    if x[8]:
+                        op_ids.add(x[8])
+            except Exception as e:
+                fails += 1; logger.warning("approval_history access 失败: %s", e)
+            # 2) contribution —— kb_contribution 的已决行（两角色，category_dept 作用域；库=_op_db）
+            ran += 1
+            try:
+                cur.execute(
+                    "SELECT question, category_dept, author_name, review_status, review_note,"
+                    " ingestion_status, reviewed_by,"
+                    f" COALESCE(CONVERT_TZ(reviewed_at,{_TZ_PACIFIC_TO_BJ}), reviewed_at)"
+                    f" FROM {_op_db()}.kb_contribution"
+                    " WHERE review_status IN ('accepted','rejected') " + scope_cat +
+                    " ORDER BY reviewed_at DESC LIMIT %s",
+                    tuple(scope_cat_params + [lim]))
+                for x in cur.fetchall():
+                    out.append(KbApprovalHistoryItem(
+                        kind="contribution", action=(x[3] or ""), title=_rq(x[0]),
+                        owner_dept=(x[1] or ""), subject=(x[2] or ""), detail=_rq(x[4]),
+                        extra=(x[5] or ""), decided_by=(x[6] or ""),
+                        decided_at=str(x[7]) if x[7] else ""))
+                    if x[6]:
+                        op_ids.add(x[6])
+            except Exception as e:
+                fails += 1; logger.warning("approval_history contribution 失败: %s", e)
+            if is_admin:
+                # 3) upload —— 上传审批（仅 kb_admin，取自 kb_audit_log；APPROVE/REJECT 是上传专用 action）
+                ran += 1
+                try:
+                    cur.execute(
+                        "SELECT a.doc_id, m.title, m.owner_dept, a.action_type, a.operator_id,"
+                        f" COALESCE(CONVERT_TZ(a.created_at,{_TZ_PACIFIC_TO_BJ}), a.created_at), a.message"
+                        f" FROM {_kb_db()}.kb_audit_log a"
+                        f" LEFT JOIN {_kb_db()}.document_meta m ON m.doc_id = a.doc_id"
+                        " WHERE a.operator_type='user' AND a.action_type IN ('APPROVE','REJECT')"
+                        " ORDER BY a.created_at DESC LIMIT %s", (lim,))
+                    for x in cur.fetchall():
+                        act = "approved" if (x[3] or "") == "APPROVE" else "rejected"
+                        out.append(KbApprovalHistoryItem(
+                            kind="upload", action=act, title=(x[1] or x[0] or ""),
+                            owner_dept=(x[2] or ""), subject="", detail=_rq(x[6]),
+                            decided_by=(x[4] or ""), decided_at=str(x[5]) if x[5] else ""))
+                        if x[4]:
+                            op_ids.add(x[4])
+                except Exception as e:
+                    fails += 1; logger.warning("approval_history upload 失败: %s", e)
+                # 4) admin_grant —— 成员/角色授权（仅 kb_admin，取自 kb_audit_log）
+                ran += 1
+                try:
+                    cur.execute(
+                        "SELECT action_type, operator_id,"
+                        f" COALESCE(CONVERT_TZ(created_at,{_TZ_PACIFIC_TO_BJ}), created_at), message"
+                        f" FROM {_kb_db()}.kb_audit_log"
+                        " WHERE operator_type='user' AND action_type IN ('KB_ADMIN_GRANT','KB_ADMIN_REVOKE')"
+                        " ORDER BY created_at DESC LIMIT %s", (lim,))
+                    for x in cur.fetchall():
+                        act = "granted" if (x[0] or "") == "KB_ADMIN_GRANT" else "revoked"
+                        tgt = _parse_admin_target(x[3] or "")
+                        out.append(KbApprovalHistoryItem(
+                            kind="admin_grant", action=act, title=tgt, subject=tgt,
+                            detail=_rq(x[3]), decided_by=(x[1] or ""),
+                            decided_at=str(x[2]) if x[2] else ""))
+                        if x[1]:
+                            op_ids.add(x[1])
+                except Exception as e:
+                    fails += 1; logger.warning("approval_history admin_grant 失败: %s", e)
+            # 操作者 staffId → 展示名（best-effort，enrichment；失败不计入 fails、回退 uid）
+            if op_ids:
+                try:
+                    ph = ",".join(["%s"] * len(op_ids))
+                    cur.execute(f"SELECT user_id, user_name FROM {_kb_db()}.user_role WHERE user_id IN ({ph})",
+                                tuple(op_ids))
+                    names = {r0: (r1 or "") for (r0, r1) in cur.fetchall()}
+                    for it in out:
+                        it.decided_by_name = names.get(it.decided_by, "") or it.decided_by
+                except Exception as e:
+                    logger.warning("approval_history 操作者名解析失败: %s", e)
+                    for it in out:
+                        it.decided_by_name = it.decided_by
+    finally:
+        conn.close()
+    if ran and fails >= ran:   # 跑过的子查询全失败 = 连接级故障：诚实 500，而非 all-empty 伪装无历史
+        trace_id = get_request_id()
+        logger.error("kb_approval_history 全部子查询失败 [trace=%s]", trace_id)
+        raise HTTPException(status_code=500, detail=f"审批历史查询失败 (trace: {trace_id})")
+    # 跨源合并按北京时字符串倒序（ISO 'YYYY-MM-DD HH:MM:SS' 字典序=时序）；空时间沉底。
+    out.sort(key=lambda r: r.decided_at or "", reverse=True)
+    return KbApprovalHistoryResponse(items=out[:lim])
 
 
 @app.get("/api/kb/my-access-requests", response_model=MyAccessRequestListResponse)
