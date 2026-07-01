@@ -12,4 +12,10 @@ routes/ — api.py 的冷域 APIRouter 拆分（F-A2，2026-07-01）
       search_chunks）。凡引用这些名字的端点（ask/stream/session/feedback/history/
       hot-questions）一律留在 api.py。
   3. api.py 对搬出的端点函数与域内模型做 re-export（tests 直接 `api.kb_stats(...)`）。
+  4. 下面这行 import 保证规则 1 对**任意导入顺序**成立：谁先 import 一个路由子模块，
+     包 __init__ 先把 api 拉到全量初始化（api 底部会顺势完整加载全部路由模块），
+     不加它则「先 import routes.contribution 后 import api」会循环导入炸在
+     include_router（partially initialized module 无 router 属性）。
 """
+
+from opensearch_pipeline import api as _api  # noqa: F401,E402  # 见 docstring 规则 4
