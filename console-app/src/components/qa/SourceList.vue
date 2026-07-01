@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { FileText } from 'lucide-vue-next'
 import type { SourceRow } from '@/composables/useAsk'
 
 // Atlas 式来源：一排「来源」chip（文件图标 + 标题 + 章节 + 相关度点）；点击展开该来源详情卡
 // （相关度条 + 档位/分数 + 正文省略版）。同一时间只展开一条。
-defineProps<{ sources: SourceRow[] }>()
+const props = defineProps<{ sources: SourceRow[] }>()
+// 防御：回灌历史/后端偶发可能塞进 null 或缺 idx 的坏来源，v-for 里解引用会整块渲染崩溃 → 先滤掉。
+const rows = computed(() => (props.sources || []).filter((s): s is SourceRow => !!s && s.idx != null))
 const openIdx = ref<number | null>(null)
 function toggle(idx: number) { openIdx.value = openIdx.value === idx ? null : idx }
 
@@ -21,7 +23,7 @@ const fmtScore = (n: number) => (Math.round(n * 10) / 10).toString()
     <div class="flex flex-wrap items-center gap-2">
       <span class="text-[11px] font-bold uppercase tracking-[0.06em] text-faint">来源</span>
       <button
-        v-for="s in sources" :key="s.idx" type="button" data-testid="citation"
+        v-for="s in rows" :key="s.idx" type="button" data-testid="citation"
         class="inline-flex max-w-[20rem] items-center gap-2 rounded-full border px-2.5 py-1 text-xs transition hover:border-border-strong"
         :class="openIdx === s.idx ? 'border-accent-text bg-accent-soft' : 'border-border bg-surface'"
         :aria-expanded="openIdx === s.idx" @click="toggle(s.idx)"
@@ -34,7 +36,7 @@ const fmtScore = (n: number) => (Math.round(n * 10) / 10).toString()
     </div>
 
     <!-- 来源详情（Atlas「Retrieved sources」面板内联版） -->
-    <template v-for="s in sources" :key="'d' + s.idx">
+    <template v-for="s in rows" :key="'d' + s.idx">
       <div v-if="openIdx === s.idx" class="mt-2 rounded-[13px] border border-border bg-panel p-3.5">
         <!-- 标题不在卡内重复（上方选中态 chip 即标题）；卡内只给相关度 + 引文 + 说明 -->
         <div class="flex items-center gap-2.5">
