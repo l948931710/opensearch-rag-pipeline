@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Library, Lightbulb, Sun, Moon, Trash2 } from 'lucide-vue-next'
+import { Plus, Search, Library, Lightbulb, Sun, Moon, Trash2, Sparkles } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useTheme } from '@/composables/useTheme'
 import { useAsk } from '@/composables/useAsk'
@@ -52,7 +52,7 @@ const reveal = 'opacity-0 transition-opacity duration-200 group-hover/sb:opacity
       <div class="flex h-14 items-center px-2">
         <span class="grid size-10 shrink-0 place-items-center">
           <span class="grid size-8 place-items-center rounded-[10px] bg-accent-strong">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="var(--primary-foreground)" aria-hidden="true" focusable="false"><path d="M12 2.5l1.7 6.1 6.1 1.7-6.1 1.7L12 18.1l-1.7-6.1L4.2 10.3l6.1-1.7z" /></svg>
+            <Sparkles :size="17" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
           </span>
         </span>
         <span class="truncate font-serif text-[21px] leading-none tracking-tight text-foreground" :class="reveal">富岭知识库</span>
