@@ -7,7 +7,10 @@ retriever.py — 检索模块
 
 import json
 import logging
+import os
 import re
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from opensearch_pipeline.config import get_config
@@ -64,6 +67,25 @@ def _classify_step_query_intent(query: str) -> str:
 # 1. Query Embedding
 # ═══════════════════════════════════════════════════════════════
 
+# 小 LRU（性能第一梯队 #7）：重复问题（FAQ 快捷栏 / 示例问题 / 多轮同题）免一次
+# DashScope 往返（~百 ms）。同输入 → 同 embedding，确定性无正确性风险；失败不缓存。
+# RAG_QUERY_EMBED_CACHE_SIZE=0 关闭。conftest 每测清空（_query_embed_cache_clear）。
+_query_embed_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_query_embed_cache_lock = threading.Lock()
+
+
+def _query_embed_cache_size() -> int:
+    try:
+        return int(os.environ.get("RAG_QUERY_EMBED_CACHE_SIZE", "128"))
+    except ValueError:
+        return 128
+
+
+def _query_embed_cache_clear() -> None:
+    with _query_embed_cache_lock:
+        _query_embed_cache.clear()
+
+
 def get_query_embedding(
     query: str,
     *,
@@ -82,6 +104,19 @@ def get_query_embedding(
     """
     config = get_config()
 
+    resolved_model = model or config.embedding.model
+    resolved_dim = dimension or config.embedding.dimension
+    cache_size = _query_embed_cache_size()
+    cache_key = (query, resolved_model, resolved_dim)
+    if cache_size > 0:
+        with _query_embed_cache_lock:
+            hit = _query_embed_cache.get(cache_key)
+            if hit is not None:
+                _query_embed_cache.move_to_end(cache_key)
+                d, si, sv = hit
+                # 返回浅拷贝：命中方若原地改动向量（当前无此调用方）不污染缓存
+                return list(d), list(si), list(sv)
+
     # 与入库侧共用加固实现（URL 去重 + 429/5xx 重试 + 退避）。查询侧 sparse_fallback=False：
     # 空 sparse 表示该查询不参与 sparse 匹配，比塞入 [0]/[0.001] 假项更准确。
     from opensearch_pipeline.embedding_client import embed_texts_native
@@ -89,8 +124,8 @@ def get_query_embedding(
     results = embed_texts_native(
         [query],
         api_key=api_key or config.embedding.api_key,
-        model=model or config.embedding.model,
-        dimension=dimension or config.embedding.dimension,
+        model=resolved_model,
+        dimension=resolved_dim,
         api_base_url=config.embedding.api_base_url,
         max_retries=getattr(config.embedding, "max_retries", 2),
         request_timeout=30,
@@ -101,6 +136,13 @@ def get_query_embedding(
     if r is None:
         raise RuntimeError("DashScope 未返回 query embedding")
     dense, sparse_indices, sparse_values = r
+
+    if cache_size > 0:
+        with _query_embed_cache_lock:
+            _query_embed_cache[cache_key] = (list(dense), list(sparse_indices), list(sparse_values))
+            _query_embed_cache.move_to_end(cache_key)
+            while len(_query_embed_cache) > cache_size:
+                _query_embed_cache.popitem(last=False)
 
     logger.debug(
         "Embedding generated: dense=%d dims, sparse=%d nonzero",

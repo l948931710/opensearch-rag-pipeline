@@ -132,7 +132,7 @@ def capture_payload(monkeypatch):
         captured["payload"] = json
         return _Resp()
 
-    monkeypatch.setattr(G.requests, "post", _fake_post)
+    monkeypatch.setattr(G, "_http_post", _fake_post)
     return captured
 
 

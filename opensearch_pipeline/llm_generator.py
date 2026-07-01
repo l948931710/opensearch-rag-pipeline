@@ -12,6 +12,8 @@ from typing import Any, Dict, Generator, List, Optional
 
 import requests
 
+from opensearch_pipeline.http_session import http_post as _http_post
+
 from opensearch_pipeline.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -455,7 +457,7 @@ def generate_answer(
         "enable_thinking": llm.enable_thinking if thinking is None else bool(thinking),
     }
 
-    resp = requests.post(
+    resp = _http_post(
         url,
         json=payload,
         headers={
@@ -575,7 +577,7 @@ def generate_answer_stream(
     yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
 
     # 流式请求
-    with requests.post(
+    with _http_post(
         url,
         json=payload,
         headers={

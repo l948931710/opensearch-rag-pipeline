@@ -1191,7 +1191,7 @@ def test_stream_payload_thinking_override(monkeypatch):
         captured["payload"] = json
         return _Resp()
 
-    monkeypatch.setattr(lg.requests, "post", fake_post)
+    monkeypatch.setattr(lg, "_http_post", fake_post)
 
     list(lg.generate_answer_stream("q", [], thinking=True))
     assert captured["payload"]["enable_thinking"] is True

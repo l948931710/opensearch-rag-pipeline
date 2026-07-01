@@ -9,6 +9,9 @@ include_router 并 re-export 全部端点函数/模型（tests 直接调用 api.
 api 属性（规则见 routes/__init__.py）。
 """
 
+import os
+import threading
+import time
 from typing import Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -347,6 +350,43 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
 # ─────────────────────────────────────────────────────────────────────────────
 _KB_INSIGHTS_WINDOW_DAYS = 30
 
+# 看板聚合 TTL 缓存（性能第一梯队 #6）：insights/governance 每请求现算 4-14 条聚合
+# 子查询（含 JSON_TABLE 跨库 JOIN），30 天窗口对分钟级 staleness 完全不敏感。
+# 键含作用域（dept_admin 的 managed 部门集 / kb_admin=GLOBAL），角色校验先于缓存读；
+# 子查询有失败（降级响应）不缓存。RAG_KB_DASHBOARD_CACHE_TTL=0 关闭；conftest 每测清空。
+_dashboard_cache: dict = {}
+_dashboard_cache_lock = threading.Lock()
+
+
+def _dashboard_cache_ttl() -> float:
+    try:
+        return float(os.environ.get("RAG_KB_DASHBOARD_CACHE_TTL", "60"))
+    except ValueError:
+        return 60.0
+
+
+def _dashboard_cache_clear() -> None:
+    with _dashboard_cache_lock:
+        _dashboard_cache.clear()
+
+
+def _dashboard_cache_get(key):
+    if _dashboard_cache_ttl() <= 0:
+        return None
+    with _dashboard_cache_lock:
+        ent = _dashboard_cache.get(key)
+        if ent is not None and ent[0] > time.time():
+            return ent[1]
+    return None
+
+
+def _dashboard_cache_put(key, value) -> None:
+    ttl = _dashboard_cache_ttl()
+    if ttl <= 0:
+        return
+    with _dashboard_cache_lock:
+        _dashboard_cache[key] = (time.time() + ttl, value)
+
 # retrieved_docs_json → doc_id → document_meta.owner_dept 的归属 JOIN（collation-cast 必需）。
 # 末尾 WHERE 已含窗口占位符 %s；调用处再拼 _kb_owner_scope_sql 的作用域子句（kb_admin 为空 = 全库）。
 _KB_QA_OWNER_JOIN = (
@@ -397,6 +437,12 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
     scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
     win = _KB_INSIGHTS_WINDOW_DAYS
+    # 角色/作用域解析之后才查缓存：键按作用域分片，永不跨权限串数据
+    cache_key = ("insights",
+                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL", win)
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
     base = _KB_QA_OWNER_JOIN + (" " + scope_clause if scope_clause else "")
     args = tuple([win] + scope_params)
     out = KbInsightsResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"), window_days=win)
@@ -479,6 +525,8 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
         trace_id = get_request_id()
         logger.error("kb_insights 全部子查询失败 [trace=%s]", trace_id)
         raise HTTPException(status_code=500, detail=f"洞察查询失败 (trace: {trace_id})")
+    if fails == 0:   # 降级响应（部分子查询失败）不缓存——下一请求重试取全量
+        _dashboard_cache_put(cache_key, out)
     return out
 
 
@@ -576,6 +624,11 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
     _enforce_rate_limit(request, identity, scope="aux")
     _require_kb_admin(identity)
     win = _KB_INSIGHTS_WINDOW_DAYS
+    # kb_admin-only → 全局单键；角色校验先于缓存读
+    cache_key = ("governance", "GLOBAL", win)
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
     out = KbGovernanceResponse(window_days=win)
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -856,6 +909,8 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
         trace_id = get_request_id()
         logger.error("kb_governance 全部子查询失败 [trace=%s]", trace_id)
         raise HTTPException(status_code=500, detail=f"治理查询失败 (trace: {trace_id})")
+    if fails == 0:   # 降级响应（部分子查询失败）不缓存——下一请求重试取全量
+        _dashboard_cache_put(cache_key, out)
     return out
 
 

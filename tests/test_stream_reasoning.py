@@ -45,7 +45,7 @@ def _frames(thinking, flag):
     cfg.rag.stream_reasoning = flag
     out = []
     try:
-        with patch.object(llm_generator.requests, "post", _fake_post):
+        with patch.object(llm_generator, "_http_post", _fake_post):
             for ev in llm_generator.generate_answer_stream("年假几天", _CHUNKS, thinking=thinking):
                 s = ev.strip()
                 if s.startswith("data: "):

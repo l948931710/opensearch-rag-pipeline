@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -88,6 +88,18 @@ async def _lifespan(_app: FastAPI):
     点击仍走 HTTP 路由，双模并存直到旧卡片自然老化。
     均非致命：失败只记日志、不阻断启动。多 worker 下每个进程各注册一次（幂等）。
     """
+    # 性能第一梯队 #4：调大 AnyIO 线程令牌。Starlette 把 sync def 端点丢进
+    # anyio 默认线程池（40 token 全局硬上限）——~40 个用户同窗口提问即打满，
+    # 之后 feedback/webhook/鉴权全排队。这些线程 99% 在等网络（DashScope/HA3/RDS），
+    # 代价仅每线程 ~8MB 栈上限的虚存。必须在事件循环内设置，故放 lifespan。
+    try:
+        import anyio.to_thread
+        _tokens = int(os.environ.get("RAG_THREADPOOL_TOKENS", "120"))
+        if _tokens > 0:
+            anyio.to_thread.current_default_thread_limiter().total_tokens = _tokens
+            logger.info("AnyIO 线程令牌: %d (RAG_THREADPOOL_TOKENS)", _tokens)
+    except Exception:
+        logger.warning("设置 AnyIO 线程令牌失败（忽略，用默认 40）", exc_info=True)
     try:
         from opensearch_pipeline.dingtalk_card import register_card_callback
         register_card_callback()
@@ -568,12 +580,17 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
 
 
 @app.post("/api/ask", response_model=AskResponse)
-def ask(req: AskRequest, request: Request,
+def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         identity: Optional[Identity] = Depends(current_identity)):
     """非流式问答接口 — 检索 + LLM 一次性返回。
 
     用 def（非 async）声明：内部全是同步阻塞 I/O（embedding HTTP、HA3、pymysql、LLM
     requests.post），FastAPI 会把 def 处理器放进线程池执行，避免阻塞事件循环、拖垮并发请求。
+
+    落库走 BackgroundTasks（性能第一梯队 #5）：掩码+INSERT 从用户可见延迟中剔除，
+    RDS 抖动不再放大 P99。call site 仍在本文件（tests monkeypatch api.log_qa_session；
+    名字在 add_task 时按模块全局解析，patch 照常生效；TestClient 会在断言前跑完 bg task）。
+    LLM_ERROR 分支保持同步——handler 抛异常时 BackgroundTasks 不会执行，失败必须留痕。
     """
     # 防刷准入：须在 _prepare_ask（embedding/HA3/rerank 开销）之前拒绝
     _enforce_rate_limit(request, identity, scope="ask",
@@ -584,7 +601,7 @@ def ask(req: AskRequest, request: Request,
     if not chunks:
         latency = int((time.time() - t0) * 1000)
         msg_id = generate_message_id()
-        log_qa_session(**build_qa_log_kwargs(
+        background_tasks.add_task(log_qa_session, **build_qa_log_kwargs(
             session_id=session_id,
             conversation_id=req.conversation_id,
             message_id=msg_id,
@@ -684,7 +701,8 @@ def ask(req: AskRequest, request: Request,
     # 5. 落库。拒答型回答（检索有候选但 LLM 按护栏拒答）标 REFUSAL，与 NO_RESULT
     #    （检索为空，前面已 return）分桶 —— 语料排查一句 SQL 区分「缺语料」vs
     #    「语料弱/未召回」。入史策略不变（拒答照旧入史，只改落库状态）。
-    log_qa_session(**build_qa_log_kwargs(
+    #    kwargs 在请求内构建（纯簿记，µs 级），掩码+INSERT 推迟到响应发出后。
+    background_tasks.add_task(log_qa_session, **build_qa_log_kwargs(
         session_id=session_id,
         conversation_id=req.conversation_id,
         message_id=msg_id,

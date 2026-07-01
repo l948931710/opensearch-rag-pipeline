@@ -22,6 +22,8 @@ from typing import List, Optional, Tuple
 
 import requests
 
+from opensearch_pipeline.http_session import http_post as _http_post
+
 logger = logging.getLogger(__name__)
 
 # (dense_vector, sparse_indices, sparse_values)
@@ -85,7 +87,7 @@ def embed_texts_native(
 
     for attempt in range(max_retries + 1):
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=request_timeout)
+            resp = _http_post(url, json=payload, headers=headers, timeout=request_timeout)
             resp.raise_for_status()
             data = resp.json()
             items = data.get("output", {}).get("embeddings", [])

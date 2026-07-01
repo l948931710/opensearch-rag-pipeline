@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from opensearch_pipeline.http_session import http_post as _http_post
+
 from .config import get_config
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,7 @@ def _build_documents(chunks: List[Dict[str, Any]], use_images: bool):
 def _call_rerank(query: str, documents: List[Any], model: str, api_key: str,
                  base_url: str, timeout: int) -> List[Dict[str, Any]]:
     url = base_url.rstrip("/") + RERANK_URL_PATH
-    resp = requests.post(
+    resp = _http_post(
         url,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={"model": model, "input": {"query": query, "documents": documents},

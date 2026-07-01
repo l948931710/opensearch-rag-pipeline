@@ -436,7 +436,7 @@ def test_generate_answer_injects_rule_only_when_low(monkeypatch):
 
         return _Resp()
 
-    monkeypatch.setattr(G.requests, "post", _post)
+    monkeypatch.setattr(G, "_http_post", _post)
 
     low = [{"chunk_text": "x", "title": "t", "score": 0.5, "rerank_score": 0.5}]
     G.generate_answer("q", low)

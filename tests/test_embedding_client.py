@@ -50,7 +50,7 @@ def _payload(*embs):
 
 def test_dense_and_sparse_parsed_sorted():
     pl = _payload((0, [0.1, 0.2], [{"index": 5, "value": 0.9}, {"index": 1, "value": 0.3}]))
-    with patch("opensearch_pipeline.embedding_client.requests.post", return_value=_resp(pl)):
+    with patch("opensearch_pipeline.embedding_client._http_post", return_value=_resp(pl)):
         out = embed_texts_native(["q"], api_key="k", model="m", dimension=2, api_base_url="https://x")
     dense, sidx, sval = out[0]
     assert dense == [0.1, 0.2]
@@ -59,7 +59,7 @@ def test_dense_and_sparse_parsed_sorted():
 
 def test_sparse_fallback_only_when_requested():
     pl = _payload((0, [0.1], []))
-    with patch("opensearch_pipeline.embedding_client.requests.post", return_value=_resp(pl)):
+    with patch("opensearch_pipeline.embedding_client._http_post", return_value=_resp(pl)):
         q = embed_texts_native(["q"], api_key="k", model="m", dimension=1,
                                api_base_url="https://x", sparse_fallback=False)
         ing = embed_texts_native(["q"], api_key="k", model="m", dimension=1,
@@ -71,7 +71,7 @@ def test_sparse_fallback_only_when_requested():
 def test_text_index_alignment_and_missing_slot_is_none():
     # 响应乱序 + 缺第 1 个 → 结果按 text_index 对齐，缺的为 None
     pl = _payload((2, [0.3], []), (0, [0.1], []))
-    with patch("opensearch_pipeline.embedding_client.requests.post", return_value=_resp(pl)):
+    with patch("opensearch_pipeline.embedding_client._http_post", return_value=_resp(pl)):
         out = embed_texts_native(["a", "b", "c"], api_key="k", model="m", dimension=1, api_base_url="https://x")
     assert out[0][0] == [0.1]
     assert out[1] is None       # text_index 1 未返回
@@ -86,7 +86,7 @@ def test_retries_on_429_then_succeeds():
         calls["n"] += 1
         return _resp(pl) if calls["n"] >= 2 else _resp({}, status=429)
 
-    with patch("opensearch_pipeline.embedding_client.requests.post", side_effect=_post), \
+    with patch("opensearch_pipeline.embedding_client._http_post", side_effect=_post), \
          patch("opensearch_pipeline.embedding_client.time.sleep"):
         out = embed_texts_native(["q"], api_key="k", model="m", dimension=1,
                                  api_base_url="https://x", max_retries=2)
@@ -100,7 +100,7 @@ def test_400_fails_immediately_no_retry():
         calls["n"] += 1
         return _resp({}, status=400)
 
-    with patch("opensearch_pipeline.embedding_client.requests.post", side_effect=_post), \
+    with patch("opensearch_pipeline.embedding_client._http_post", side_effect=_post), \
          patch("opensearch_pipeline.embedding_client.time.sleep"):
         with pytest.raises(requests.exceptions.HTTPError):
             embed_texts_native(["q"], api_key="k", model="m", dimension=1,
