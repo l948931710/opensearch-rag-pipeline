@@ -96,7 +96,7 @@ def write_audit(*, doc_id: Optional[str], version_no: Optional[int],
         cursor.execute(_audit_insert_sql(), params)   # 同事务、不开连接/不提交/不吞异常（原子审计）
         return
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn(select_db=True)
         try:
             with conn.cursor() as cur:

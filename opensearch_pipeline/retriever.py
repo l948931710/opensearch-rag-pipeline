@@ -394,7 +394,7 @@ def _deny_revoked_cross_dept(results, user_dept):
         return results
     cross_doc_ids = {results[i].get("doc_id") for i in cross_idx if results[i].get("doc_id")}
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         from opensearch_pipeline.access_grants import resolve_allowed_depts
         conn = _get_db_conn()
         try:
@@ -774,7 +774,7 @@ def stitch_neighbor_chunks(
         neighbors_by_doc: Dict[tuple, Dict[int, Dict[str, Any]]] = {}
         if pending:
             import pymysql.cursors
-            from opensearch_pipeline.pipeline_nodes import _get_db_conn
+            from opensearch_pipeline.db import _get_db_conn
 
             conn = _get_db_conn()
             cursor = conn.cursor(pymysql.cursors.DictCursor)
@@ -923,7 +923,7 @@ def expand_step_context(
 
     try:
         import pymysql.cursors
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         conn = _get_db_conn()
         cursor = conn.cursor(pymysql.cursors.DictCursor)

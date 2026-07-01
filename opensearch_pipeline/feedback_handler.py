@@ -120,7 +120,7 @@ def _save_feedback(
     使用 ON DUPLICATE KEY UPDATE (基于 uk_message_user 唯一约束)。
     从 qa_session_log 获取原始问答上下文冗余存储。
     """
-    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    from opensearch_pipeline.db import _get_db_conn
 
     conn = _get_db_conn()
     try:
@@ -216,7 +216,7 @@ def _create_escalation(
 
     转人工不写 user_feedback 表（它们是不同的业务语义）。
     """
-    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    from opensearch_pipeline.db import _get_db_conn
 
     conn = _get_db_conn()
     try:
@@ -294,7 +294,7 @@ def mark_awaiting_comment(
     (downvote / reason=other / handled_status=AWAITING_COMMENT)。"""
     if not message_id or not user_id:
         return False
-    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    from opensearch_pipeline.db import _get_db_conn
 
     conn = _get_db_conn()
     try:
@@ -351,7 +351,7 @@ def take_awaiting_comment(*, user_id: str, comment: str, within_seconds: int = 6
     不是新问题」）。未命中返回 False（按普通问答处理）。"""
     if not user_id or not comment or not comment.strip():
         return False
-    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    from opensearch_pipeline.db import _get_db_conn
 
     try:
         conn = _get_db_conn()

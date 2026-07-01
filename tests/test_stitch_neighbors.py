@@ -50,7 +50,7 @@ def test_batched_stitch_matches_and_single_round_trip():
         {"doc_id": "B", "version_no": 0, "chunk_index": 6, "chunk_text": "b6", "section_title": ""},
     ]
     calls = []
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_fake_conn(db_rows, calls)):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_fake_conn(db_rows, calls)):
         out = retriever.stitch_neighbor_chunks(chunks, window=1)
 
     # 单次 RDS 往返
@@ -72,7 +72,7 @@ def test_no_eligible_chunks_skips_db():
         {"chunk_index": 0, "chunk_type": "text_chunk", "chunk_text": "no-doc"},
     ]
     calls = []
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_fake_conn([], calls)):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_fake_conn([], calls)):
         out = retriever.stitch_neighbor_chunks(chunks, window=1)
     assert len(calls) == 0  # 全 pass-through → 不连库
     assert out == chunks
@@ -101,7 +101,7 @@ def test_neighbor_version_isolation_dual_active():
         {"doc_id": "A", "version_no": 2, "chunk_index": 2, "chunk_text": "a2-v2", "section_title": ""},
     ]
     calls = []
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_fake_conn(db_rows, calls)):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_fake_conn(db_rows, calls)):
         out = retriever.stitch_neighbor_chunks(chunks, window=1)
     assert out[0]["chunk_text"] == "a0-v2\na1-v2\na2-v2"   # 只拼 v2
     assert "v1" not in out[0]["chunk_text"]                # 绝不混入旧版文本
@@ -112,7 +112,7 @@ def test_neighbor_version_isolation_dual_active():
 def test_missing_neighbors_falls_back_to_original_text():
     chunks = [{"doc_id": "Z", "chunk_index": 3, "chunk_type": "text_chunk", "chunk_text": "orig"}]
     calls = []
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_fake_conn([], calls)):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_fake_conn([], calls)):
         out = retriever.stitch_neighbor_chunks(chunks, window=1)
     assert len(calls) == 1
     assert out[0]["chunk_text"] == "orig" and out[0]["_neighbor_count"] == 0

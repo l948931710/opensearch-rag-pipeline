@@ -250,7 +250,7 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
         return []
 
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         conn = _get_db_conn()
         try:
@@ -348,7 +348,7 @@ def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
     if not staff_id or staff_id.startswith("$:"):
         return None
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         conn = _get_db_conn()
         try:
@@ -547,7 +547,7 @@ def _resolve_user_identity(userid: str) -> Dict[str, Any]:
     dept = _resolve_user_dept(userid)  # ACL 权限组列表（含缓存 + API 回退）
     name = ""
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -600,7 +600,7 @@ def resolve_kb_identity(staff_id: str):
     name = ""
     managed: List[str] = []
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         conn = _get_db_conn()
         try:

@@ -184,7 +184,7 @@ class TestVisualKnowledgeServing:
             def close(self):
                 pass
 
-        monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _Conn())
+        monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _Conn())
 
         chunks = [
             {"chunk_type": "text_chunk", "doc_id": "D", "chunk_index": 5, "chunk_text": "原文"},
@@ -242,7 +242,7 @@ class TestVisualKnowledgeServing:
             def close(self):
                 pass
 
-        monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _Conn())
+        monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _Conn())
 
     def test_ha3_parser_exposes_chunk_id(self):
         """Root fix: _parse_ha3_response must surface chunk_id (RDS-rebuild key + dedup key)."""

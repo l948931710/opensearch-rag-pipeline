@@ -426,7 +426,7 @@ async def readiness_check():
 
     checks: Dict[str, str] = {}
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -987,7 +987,7 @@ def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
     owners = set(_R._expand_groups_to_owners(groups))
     phase_d = bool(get_config().rag.allowed_depts_acl)
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception as e:
         logger.warning("resign-images 鉴权 DB 连接失败（fail-closed 全拒）: %s", e)
@@ -1109,7 +1109,7 @@ def history(
     from opensearch_pipeline.qa_logger import _op_db
 
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cursor:
@@ -1185,7 +1185,7 @@ def list_conversations(request: Request, limit: int = 30, offset: int = 0,
     offset = max(0, offset)
     from opensearch_pipeline.qa_logger import _op_db
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -1225,7 +1225,7 @@ def get_conversation(conversation_id: str, request: Request,
         return HistoryResponse(items=[], has_more=False)
     from opensearch_pipeline.qa_logger import _op_db
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -1284,7 +1284,7 @@ def delete_conversation(conversation_id: str, request: Request,
         raise HTTPException(status_code=400, detail="缺少 conversation_id")
     from opensearch_pipeline.qa_logger import _op_db
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -1327,7 +1327,7 @@ def hot_questions(request: Request,
 
     questions: List[str] = []
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cursor:
@@ -1397,7 +1397,7 @@ def _success_question_pool() -> List[str]:
 
     pool: List[str] = []
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cursor:
@@ -1640,7 +1640,7 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
     if not etag:
         return [], 0
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -1751,7 +1751,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
         search_clause = "AND (m.title LIKE %s ESCAPE '!' OR m.original_filename LIKE %s ESCAPE '!')"
         search_params = [like, like]
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -1836,7 +1836,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         search_params = [like, like]
 
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -1906,7 +1906,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     month_start = date.today().replace(day=1).isoformat()         # 当月首日；以参数传入避免 % 转义坑
     chunks = new_this_month = 0
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -2037,7 +2037,7 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     args = tuple([win] + scope_params)
     out = KbInsightsResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"), window_days=win)
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except HTTPException:
         raise
@@ -2214,7 +2214,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
     win = _KB_INSIGHTS_WINDOW_DAYS
     out = KbGovernanceResponse(window_days=win)
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except HTTPException:
         raise
@@ -2524,7 +2524,7 @@ def kb_version_history(request: Request, doc_id: str,
     if not doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -2576,7 +2576,7 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
     if not doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -2727,7 +2727,7 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         if not req.doc_id:
             raise HTTPException(status_code=400, detail="升版需提供 doc_id")
         try:
-            from opensearch_pipeline.pipeline_nodes import _get_db_conn
+            from opensearch_pipeline.db import _get_db_conn
             conn = _get_db_conn()
             try:
                 with conn.cursor() as cur:
@@ -2842,7 +2842,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
     trace_id = get_request_id()
 
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -2993,7 +2993,7 @@ def kb_approve(req: KbApprovalRequest, request: Request,
     assert_metadata_write_allowed("kb_approve", get_config().rds.host, kind="rds")
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3042,7 +3042,7 @@ def kb_reject(req: KbApprovalRequest, request: Request,
     assert_metadata_write_allowed("kb_reject", get_config().rds.host, kind="rds")
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3090,7 +3090,7 @@ def kb_retire(req: KbRetireRequest, request: Request,
     owner_dept = perm = ""
     cur_ver = 1
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3161,7 +3161,7 @@ def kb_restore(req: KbRetireRequest, request: Request,
     owner_dept = perm = ""
     cur_ver = 1
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3230,7 +3230,7 @@ def kb_pending_approvals(request: Request,
     if kb.role != ROLE_KB_ADMIN:
         raise HTTPException(status_code=403, detail="仅知识库管理员可查看审批队列")
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3401,7 +3401,7 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
     owner_dept = ""
     requester_depts = ",".join(sorted(managed))
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3463,7 +3463,7 @@ def kb_access_requests_list(request: Request,
         clause = "AND r.owner_dept IN (" + ",".join(["%s"] * len(owners)) + ")"
         params = list(owners)
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3517,7 +3517,7 @@ def kb_access_grants_list(request: Request,
         clause = "AND r.owner_dept IN (" + ",".join(["%s"] * len(owners)) + ")"
         params = list(owners)
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3633,7 +3633,7 @@ def kb_approval_history(request: Request,
     fails = 0
     ran = 0
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except HTTPException:
         raise
@@ -3767,7 +3767,7 @@ def kb_my_access_requests(request: Request,
     kb = _require_kb_console(identity)
     items: List[MyAccessRequestItem] = []
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         from opensearch_pipeline.access_grants import current_allowed_for_doc
         conn = _get_db_conn()
         try:
@@ -3844,7 +3844,7 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
     trace_id = get_request_id()
     owner_dept = ""
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3942,7 +3942,7 @@ def kb_admin_grants_list(request: Request,
     from opensearch_pipeline.kb_authz import _valid_owner_depts
     items: List[KbAdminItem] = []
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -3990,7 +3990,7 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
     trace_id = get_request_id()
     note = (req.note or "")[:255] or None
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -4053,7 +4053,7 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
     trace_id = get_request_id()
     demoted = False
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -4310,7 +4310,7 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
     from opensearch_pipeline.config import get_config
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
     from opensearch_pipeline.audit_log import write_audit
-    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    from opensearch_pipeline.db import _get_db_conn
 
     from opensearch_pipeline import kb_upload
     cfg = get_config()
@@ -4377,7 +4377,7 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
     ngq = C.normalize_question(gq) if gq else None
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -4416,7 +4416,7 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
     limit = max(1, min(int(limit or 20), 100)); offset = max(0, int(offset or 0))
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception as e:
         logger.error("kb_contributions_mine 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -4445,7 +4445,7 @@ def kb_contributions_pending(request: Request, limit: int = 20, offset: int = 0,
     scope_clause, scope_params = _kb_owner_scope_sql(kb, "category_dept")
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception as e:
         logger.error("kb_contributions_pending 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -4480,7 +4480,7 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
     # ── 阶段1：行锁认领（独立事务，commit 后才物化）──
     claim = None
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception as e:
         logger.error("kb_contribution_accept 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -4589,7 +4589,7 @@ def kb_contribution_reject(cid: str, req: KbContributionRejectRequest, request: 
     from opensearch_pipeline import contribution as C
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception as e:
         logger.error("kb_contribution_reject 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -4638,7 +4638,7 @@ def kb_contribution_retry(cid: str, request: Request,
     from opensearch_pipeline import contribution as C
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception as e:
         logger.error("kb_contribution_retry 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -4690,7 +4690,7 @@ def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depe
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception:
         return KbHeroesResponse(items=[])
@@ -4729,7 +4729,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
     depts = kb_authz.sanitize_owner_depts(identity.acl_groups)
     trace_id = get_request_id()
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
     except Exception as e:
         logger.error("kb_gaps 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)

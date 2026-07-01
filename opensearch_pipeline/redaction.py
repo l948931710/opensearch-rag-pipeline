@@ -49,7 +49,7 @@ import json
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from opensearch_pipeline.pipeline_nodes import ENTITY_PATTERNS
+from opensearch_pipeline.pii_patterns import ENTITY_PATTERNS
 
 REDACTION_VERSION = "redact-v2"
 

@@ -222,7 +222,7 @@ def test_rebuild_card_param_map_restores_is_answer_done_on_db_hit():
     conn.cursor.return_value.__enter__.return_value = cursor
 
     card_param_map = {"feedback_status": "👍 已反馈：有帮助"}
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn):
         dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-123")
 
     assert card_param_map["is_answer_done"] == "true"   # ← 修复点
@@ -235,7 +235,7 @@ def test_rebuild_card_param_map_sets_is_answer_done_even_when_db_fails():
     from opensearch_pipeline import dingtalk_bot
 
     card_param_map = {}
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", side_effect=RuntimeError("rds down")):
+    with patch("opensearch_pipeline.db._get_db_conn", side_effect=RuntimeError("rds down")):
         dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-x")  # 异常被吞，不抛出
 
     assert card_param_map["is_answer_done"] == "true"
@@ -255,7 +255,7 @@ def test_rebuild_card_param_map_no_row_sets_placeholder_not_blank():
 
     # 模拟"其他原因"回调已设的字段（content/answer 未设 → 不兜底就白屏）
     card_param_map = {"feedback_status": "", "show_other_feedback_form": "true", "form_status": "normal"}
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn):
         dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-unlogged")
 
     assert card_param_map["is_answer_done"] == "true"
@@ -289,7 +289,7 @@ def test_rebuild_card_param_map_streaming_folds_sources_and_latency_into_content
     streaming_cfg.rag.dingtalk_streaming = True
 
     card_param_map = {}
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn), \
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn), \
          patch("opensearch_pipeline.dingtalk_bot.get_config", return_value=streaming_cfg):
         dingtalk_bot._rebuild_card_param_map(card_param_map, "msg-s")
 
@@ -404,11 +404,10 @@ class _GateConn:
 def test_card_callback_authorized_predicate(monkeypatch):
     """Track-2 归属校验：不存在的 message_id 拒；跨用户拒；归属一致放行；群聊(无归属)仅存在性放行；
     空 id 拒；查库异常 fail-open 放行。"""
-    import opensearch_pipeline.pipeline_nodes as pn
     from opensearch_pipeline.dingtalk_bot import _card_callback_authorized
 
     def _wire(row, boom=False):
-        monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _GateConn(row, boom))
+        monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _GateConn(row, boom))
 
     _wire(None);            assert _card_callback_authorized("m1", "u1") is False   # 不存在 → 伪造
     _wire(("u1",));         assert _card_callback_authorized("m1", "u1") is True    # 归属一致
@@ -423,10 +422,9 @@ def test_card_callback_forged_message_id_no_write(monkeypatch):
     """端到端：伪造（不存在的 message_id）的 downvote 回调 → 归属校验拒 → handle_feedback 绝不被调用。"""
     import asyncio
     import json as _json
-    import opensearch_pipeline.pipeline_nodes as pn
     from opensearch_pipeline import dingtalk_bot
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _GateConn(None, False))  # message_id 不存在
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _GateConn(None, False))  # message_id 不存在
     body = {"outTrackId": "forged-x", "userId": "attacker",
             "content": _json.dumps({"cardPrivateData": {"params": {"action": "downvote", "message_id": "forged-x"}}})}
 
@@ -450,7 +448,7 @@ def test_take_awaiting_comment_hit_and_miss():
     cur = MagicMock()
     cur.fetchone.return_value = (42,)  # 找到一条待补充
     conn.cursor.return_value.__enter__.return_value = cur
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn):
         assert feedback_handler.take_awaiting_comment(user_id="u1", comment="缺少XX制度") is True
     conn.commit.assert_called_once()
 
@@ -458,7 +456,7 @@ def test_take_awaiting_comment_hit_and_miss():
     cur2 = MagicMock()
     cur2.fetchone.return_value = None  # 无待补充
     conn2.cursor.return_value.__enter__.return_value = cur2
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn2):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn2):
         assert feedback_handler.take_awaiting_comment(user_id="u1", comment="这其实是个新问题") is False
 
     assert feedback_handler.take_awaiting_comment(user_id="", comment="x") is False
@@ -475,7 +473,7 @@ def test_take_awaiting_comment_window_uses_updated_at_and_expires_stale():
     cur = MagicMock()
     cur.fetchone.return_value = None  # miss 路径
     conn.cursor.return_value.__enter__.return_value = cur
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=conn):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn):
         assert feedback_handler.take_awaiting_comment(user_id="u1", comment="迟到的补充") is False
 
     sqls = [c[0][0] for c in cur.execute.call_args_list]
@@ -494,7 +492,7 @@ def test_take_awaiting_comment_db_down_returns_false():
     抛出去会让每条私聊问题 500。"""
     from opensearch_pipeline import feedback_handler
 
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn",
+    with patch("opensearch_pipeline.db._get_db_conn",
                side_effect=Exception("RDS down")):
         assert feedback_handler.take_awaiting_comment(user_id="u1", comment="补充") is False
 

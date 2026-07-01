@@ -170,7 +170,7 @@ def _stub_drain(monkeypatch, *, flag=True, pending=(), status_by_doc=None, mater
         rds = _Rds()
 
     monkeypatch.setattr("opensearch_pipeline.config.get_config", lambda: _Cfg())
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda: _DrainConn(store))
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _DrainConn(store))
 
     def _mat(cur, doc_id, apply=True):
         if doc_id in materialize_raises:

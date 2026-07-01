@@ -196,8 +196,7 @@ class _FakeConn:
 def _stub_doc(monkeypatch, owner, perm, status="active"):
     """让 upload-url 的 version 分支读到 (owner, perm, status) 作为「原文档」元数据。
     upload-url version SELECT 现读 3 列（F-37 加 status），桩须同步返回 3 元组。"""
-    import opensearch_pipeline.pipeline_nodes as pn
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _FakeConn((owner, perm, status)))
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _FakeConn((owner, perm, status)))
 
 
 def test_upload_url_version_forces_original_permission(monkeypatch):

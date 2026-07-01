@@ -233,7 +233,7 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
         result["skipped"] = True
         return result
 
-    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    from opensearch_pipeline.db import _get_db_conn
 
     try:
         conn = _get_db_conn()

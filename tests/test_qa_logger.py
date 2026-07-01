@@ -25,7 +25,7 @@ def _conn_raising(exc):
     return conn
 
 
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_unknown_column_logs_critical_with_schema_hint(mock_get_conn, caplog):
     """errno 1054（列不存在）→ CRITICAL + 指向 schema/002 的修复提示；绝不向外抛。"""
     mock_get_conn.return_value = _conn_raising(
@@ -39,7 +39,7 @@ def test_unknown_column_logs_critical_with_schema_hint(mock_get_conn, caplog):
     assert "schema/002_feedback_system.sql" in crit[0].getMessage()
 
 
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_unknown_table_logs_critical(mock_get_conn, caplog):
     """errno 1146（表不存在，全新 fuling_operation 库）同样按 CRITICAL 告警。"""
     mock_get_conn.return_value = _conn_raising(
@@ -51,7 +51,7 @@ def test_unknown_table_logs_critical(mock_get_conn, caplog):
     assert any(r.levelno == logging.CRITICAL for r in caplog.records)
 
 
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_generic_error_stays_error_level(mock_get_conn, caplog):
     """非结构漂移的写入失败保持原有 ERROR 级别（non-fatal），不升 CRITICAL。"""
     mock_get_conn.return_value = _conn_raising(Exception("connection reset"))
@@ -62,7 +62,7 @@ def test_generic_error_stays_error_level(mock_get_conn, caplog):
     assert not any(r.levelno == logging.CRITICAL for r in caplog.records)
 
 
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_success_path_commits_and_closes(mock_get_conn):
     conn = MagicMock()
     cur = MagicMock()
@@ -79,7 +79,7 @@ def test_success_path_commits_and_closes(mock_get_conn):
     assert '[{"type":"text"}]' in params
 
 
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_content_blocks_pii_masked_urls_preserved(mock_get_conn):
     """F-8 回归：content_blocks_json 里文本块复述的 PII 必须结构感知脱敏，
     而 image 块的 url/oss_key 一律保留（否则 /api/history 回渲 + 卡片回调重签会断）。"""
@@ -135,7 +135,7 @@ def test_insert_columns_all_exist_in_schema_files():
     assert "conversation_id" in conv_ddl
 
 
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_query_and_answer_pii_redacted_before_insert(mock_get_conn):
     """OBS-qa-pii：query_text/answer_text 写库前做不可逆 PII 掩码。
     用户问题里的手机号、回答里回显的身份证号都不得以明文进入 INSERT 参数。"""
@@ -161,7 +161,7 @@ def test_query_and_answer_pii_redacted_before_insert(mock_get_conn):
 
 
 @patch("opensearch_pipeline.qa_logger._qa_log_pii_redact_on", return_value=False)
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_redaction_flag_off_keeps_raw(mock_get_conn, _flag_off):
     """RAG_QA_LOG_PII_REDACT=false（调试取证）→ 原文不掩码，逐字落盘。"""
     conn = MagicMock()
@@ -175,7 +175,7 @@ def test_redaction_flag_off_keeps_raw(mock_get_conn, _flag_off):
     assert any(isinstance(p, str) and "13812345678" in p for p in params)
 
 
-@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.db._get_db_conn")
 def test_retrieved_docs_json_carries_chunk_id_and_version_no(mock_get_conn):
     """答案血缘：retrieved_docs_json 必须带 chunk_id + version_no，使一条已落库回答能
     溯源到精确的 chunk 与文档版本（L7-01 / INC-6）。re-chunk 后 chunk_index 会漂移，

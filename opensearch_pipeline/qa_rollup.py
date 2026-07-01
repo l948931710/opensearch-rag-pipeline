@@ -188,7 +188,7 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
         return {"ok": True, "skipped": "simulate"}
 
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn(select_db=False)
         try:
             # resolve target Beijing day; default = yesterday (Beijing), computed by the DB to avoid
