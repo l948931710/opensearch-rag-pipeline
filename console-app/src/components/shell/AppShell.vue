@@ -23,7 +23,12 @@ const resetSignal = computed(() => route.fullPath + '::' + activeId.value)
       <ErrorBoundary :reset-signal="resetSignal">
         <RouterView v-slot="{ Component }">
           <Transition name="fade" mode="out-in">
-            <component :is="Component" />
+            <!-- 包一层带 key 的单根 div：路由视图可能是多根(如 ManageView 有 员工/管理员 两套根 div),
+                 直接塞进 mode="out-in" 的 Transition 会因离场元素非单根而卡住、下个视图永不挂载 → 整页白屏
+                 (点「知识库」后再去别的页就空白的根因)。统一包成单根后,任何视图形态都能正确离场/进场。 -->
+            <div :key="route.fullPath" class="h-full">
+              <component :is="Component" />
+            </div>
           </Transition>
         </RouterView>
       </ErrorBoundary>
