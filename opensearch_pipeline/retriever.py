@@ -536,7 +536,7 @@ def search_chunks(
         query: 用户查询文本
         top_k: 最终返回的结果数
         min_score: (保留兼容) 相似度下限，仅在 score 为 0-1 相似度时使用
-        max_distance: HA3 距离上限，score 越小越相关；设为 0 表示不过滤
+        max_distance: (已弃用 no-op) InnerProduct 索引无「距离」语义，保留仅为签名兼容，不生效（F-20）
         output_fields: 自定义返回字段列表
 
     Returns:
@@ -625,7 +625,7 @@ def search_chunks(
         )
         resp = client.search(request)
     else:
-        # ── 纯向量检索（降级 / 兼容旧行为）──
+        # ── 纯向量检索（降级 / 兼容旧行为，RAG_HA3_ENABLE_HYBRID=false 才走）──
         request = QueryRequest(
             table_name=cfg.table_name,
             vector=dense,
@@ -634,6 +634,7 @@ def search_chunks(
             include_vector=False,
             output_fields=_output_fields,
             filter=filter_expr,
+            order="DESC",  # F-20/G29: InnerProduct 越高越相似，缺 DESC 引擎按升序返回、最不相关排第一
         )
         logger.info("Vector-only search: top_k=%d", top_k)
         resp = client.query(request)
@@ -644,15 +645,10 @@ def search_chunks(
     # 4b. 查询侧拒绝（Phase D 读侧 fail-closed 复核）：撤销跨部门授权后即时生效，不等 HA3 投影收回。
     results = _deny_revoked_cross_dept(results, user_dept)
 
-    # 5. 过滤低相关度结果
-    # 注意：混合检索模式下 score 是 RRF/加权融合分（越大越相关，DESC 排序），
-    # 纯向量模式下 score 是距离分（越小越相关）。max_distance 仅适用于纯向量模式。
-    if not cfg.enable_hybrid and max_distance > 0:
-        before_count = len(results)
-        results = [r for r in results if r.get("score", 0) <= max_distance]
-        filtered = before_count - len(results)
-        if filtered > 0:
-            logger.info("Filtered %d distant results (max_distance=%.2f)", filtered, max_distance)
+    # 5. （F-20）原 max_distance「距离上限」过滤已删除：HA3 索引是 InnerProduct（score 是相似度，
+    # 越大越相关），不存在「距离」；旧代码 `score <= max_distance` 方向与内积相反，会把最相关结果全滤掉。
+    # 该分支从无生产调用方传 max_distance（默认 0.0，恒不触发），故整段删除以消除反向陷阱。
+    # max_distance 参数保留仅为签名兼容，现为 no-op（见 docstring）。
 
     # 6. 封面/元数据 chunk 降权
     # 短文本 + 无 section_title 的 chunk 通常是封面页或目录，
@@ -1050,6 +1046,18 @@ def expand_step_context(
                         and hit_step_no - 1 <= s["step_no"] <= hit_step_no + 1
                     ]
 
+                # ── 公共不变量（F-21）：命中卡永不被意图筛选裁掉 ──────────────
+                # full_procedure 的 siblings[:max_steps] 位置截断、以及 locate/specific/general
+                # 的 step_no 区间筛选（命中卡自身 step_no 为 None / 平局 / 越界）都可能把命中
+                # step_card 排除出 selected。命中卡是最佳匹配文本，一旦缺席 → 答案只讲前 N 步、
+                # 对用户实际问的后段步骤无中生有或拒答。把防洪 cap 分支里 keep_ids={chunk_id} 的
+                # 「命中永存」保证提升为所有意图分支共享：缺失则从（已过 _same_permission 的）
+                # siblings 取回命中行置于队首（最终展示序由组内 step_no 重排决定，见下方 sort）。
+                if chunk_id not in {s["chunk_id"] for s in selected}:
+                    hit_self = next((s for s in siblings if s["chunk_id"] == chunk_id), None)
+                    if hit_self is not None:
+                        selected = [hit_self] + selected
+
                 # ── 超大家族防洪（RAG_STEP_EXPAND_FAMILY_CAP）──────────────
                 # 意图筛选按 step_no 数值区间：正常 SOP（step_no 基本互异）选出 2-3 个；
                 # 但超大手册的 step_no 大规模平局（如 41 个小节卡全是 step_no=0）会让
@@ -1305,6 +1313,7 @@ def cosurface_doc_images(
             include_vector=False,
             output_fields=_output_fields,
             filter=filter_expr,
+            order="DESC",  # G29: InnerProduct 越高越相似，缺 DESC 引擎按升序返回 → "每文档取首个"取到最不相关图
         )
         img_results = _parse_ha3_response(_get_ha3_client().query(req))
     except Exception as e:

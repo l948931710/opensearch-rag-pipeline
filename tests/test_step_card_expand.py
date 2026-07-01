@@ -107,3 +107,24 @@ def test_step_card_with_parent_expands_siblings_in_one_query():
     s1 = [c for c in out if c["chunk_id"] == "S1"][0]
     assert s1["image_refs"][0]["visual_summary"] == "图"
     assert len([s for s in cur.calls if "parent_chunk_id IN" in s]) == 1  # 单次兄弟查询
+
+
+def test_full_procedure_keeps_hit_when_truncated_out():
+    """F-21：命中卡在 full_procedure 的 siblings[:max_steps] 位置截断之外时，必须仍被强制保留——
+    否则最佳匹配文本从未进 LLM 上下文，答案只讲前 N 步。11 步家族、命中第 10 步、max_steps=8。"""
+    meta = [{"chunk_id": "S10", "parent_chunk_id": "P1", "step_no": 10,
+             "extra_json": None, "image_refs_json": None}]
+    # 11 个兄弟 step_no=1..11（SQL 序即 step_no 升序）；命中 S10 排在 siblings[:8] 之外
+    siblings = [
+        {"chunk_id": f"S{i}", "chunk_text": f"步骤{i}", "step_no": i, "section_title": "",
+         "extra_json": None, "image_refs_json": None, "parent_chunk_id": "P1"}
+        for i in range(1, 12)
+    ]
+    cur = _RoutingCursor(meta, siblings, [])
+    chunks = [{"chunk_type": "step_card", "chunk_id": "S10", "score": 1.0}]
+    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_conn(cur)):
+        out = retriever.expand_step_context(chunks, query="完整流程怎么操作")  # full_procedure
+    out_ids = {c["chunk_id"] for c in out}
+    assert "S10" in out_ids, f"命中卡 S10 被意图筛选裁掉：{sorted(out_ids)}"
+    # 家族 11 ≤ cap(12) 不触发防洪；前 8 步仍在，且命中卡额外保留（共 9）
+    assert {"S1", "S8"}.issubset(out_ids)

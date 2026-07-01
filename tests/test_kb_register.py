@@ -48,8 +48,14 @@ class _FakeCur:
     def fetchone(self):
         s = self._last
         if "document_version" in s and "WHERE raw_key=" in s:
-            # 回滚后的 winner 重查 → winner 行；否则初始幂等查 → idempotent_row。
-            return self.conn.winner_row if self.conn.rolled_back else self.conn.idempotent_row
+            self.conn._rawkey_query_count += 1
+            if self.conn.rolled_back:
+                return self.conn.winner_row
+            # F-38：模拟"锁前 raw_key 读空、持锁后复查命中赢家"的升版竞态——
+            # 第 1 次(锁前)返回 idempotent_row(None)，第 2 次(锁内复查)返回 lock_recheck_row。
+            if self.conn.lock_recheck_row is not None and self.conn._rawkey_query_count >= 2:
+                return self.conn.lock_recheck_row
+            return self.conn.idempotent_row
         if "current_version_no, permission_level" in s:
             return self.conn.meta_row
         return None
@@ -63,10 +69,12 @@ class _FakeCur:
 
 class _FakeConn:
     def __init__(self, *, idempotent_row=None, meta_row=None, winner_row=None, raise_dupkey=False,
-                 dup_rows=None, raise_on_dedup=False):
+                 dup_rows=None, raise_on_dedup=False, lock_recheck_row=None):
         self.idempotent_row = idempotent_row
         self.meta_row = meta_row
         self.winner_row = winner_row
+        self.lock_recheck_row = lock_recheck_row   # F-38 升版锁内复查命中行（None=不命中）
+        self._rawkey_query_count = 0
         self.raise_dupkey_on_version_insert = raise_dupkey
         self.dup_rows = dup_rows or []        # 内容查重 SELECT 返回的 (doc_id, title, owner_dept) 行
         self.raise_on_dedup = raise_on_dedup
@@ -167,12 +175,38 @@ def test_register_idempotent_reregister(monkeypatch):
 def test_register_version_up_increments_version_no(monkeypatch):
     _skip_if_not_sim()
     _dept_admin(monkeypatch)
-    conn = _install_conn(monkeypatch, _FakeConn(idempotent_row=None, meta_row=(3, "dept_internal")))
+    conn = _install_conn(monkeypatch, _FakeConn(idempotent_row=None, meta_row=(3, "dept_internal", "active")))
     resp = _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))
     assert resp.version_no == 4               # current 3 → +1
     assert resp.idempotent is False
-    # 升版应 UPDATE document_meta.current_version_no
-    assert any("UPDATE" in sql and "document_meta" in sql for sql, _ in conn.calls)
+    # 升版应 UPDATE document_meta.current_version_no（匹配语句体，别误命中 SELECT ... FOR UPDATE）
+    assert any("SET current_version_no" in sql for sql, _ in conn.calls)
+
+
+def test_register_version_up_on_retired_doc_409(monkeypatch):
+    """F-37：退役文档在 register 写库入口也必须拦（upload-url 与 register 间存在 token TTL 窗口）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(idempotent_row=None, meta_row=(3, "dept_internal", "retired")))
+    with pytest.raises(Exception) as ei:
+        _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))
+    assert getattr(ei.value, "status_code", None) == 409
+
+
+def test_register_version_lock_recheck_idempotent(monkeypatch):
+    """F-38：升版并发双击——锁前 raw_key 读空，持锁后复查命中赢家行 → 幂等返回，不推高版本号。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        idempotent_row=None, meta_row=(3, "dept_internal", "active"),
+        lock_recheck_row=("DOC_X", 4, "NOT_STARTED"),
+    ))
+    resp = _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))
+    assert resp.idempotent is True and resp.version_no == 4
+    # 幂等命中即返回：绝不 UPDATE document_meta.current_version_no（避免版本空洞）。
+    # 注意匹配真正的 UPDATE 语句体（"SET current_version_no"），别误命中 "SELECT ... FOR UPDATE"。
+    assert not any("SET current_version_no" in sql for sql, _ in conn.calls)
+    assert conn.committed is True
 
 
 def test_register_zero_byte_rejected(monkeypatch):
@@ -258,7 +292,7 @@ def test_version_up_skips_content_dedup(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     conn = _install_conn(monkeypatch, _FakeConn(
-        idempotent_row=None, meta_row=(2, "dept_internal"),
+        idempotent_row=None, meta_row=(2, "dept_internal", "active"),
         dup_rows=[("DOC_X", "本不该出现", "finance")],
     ))
     resp = _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))

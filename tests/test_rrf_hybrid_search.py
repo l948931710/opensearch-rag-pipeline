@@ -799,3 +799,29 @@ class TestSharedPermissionFilter:
         # version_no 加入用于答案血缘（served chunk -> 精确文档版本可溯源）
         assert "version_no" in _DEFAULT_OUTPUT_FIELDS
         assert len(_DEFAULT_OUTPUT_FIELDS) == 16
+
+
+# ═══════════════════════════════════════════════════════════════
+# Section: 纯向量降级分支 order="DESC"（F-20 / G29）
+# ═══════════════════════════════════════════════════════════════
+
+class TestVectorOnlyOrderDesc:
+    """enable_hybrid=False 逃生路径的 QueryRequest 必须带 order='DESC'（InnerProduct 越高越相似）。"""
+
+    @patch("opensearch_pipeline.retriever.get_query_embedding")
+    @patch("opensearch_pipeline.retriever.get_config")
+    @patch("opensearch_pipeline.retriever._get_ha3_client")
+    def test_vector_only_query_request_has_order_desc(self, mock_client_fn, mock_config, mock_embedding):
+        mock_config.return_value = _make_config(enable_hybrid=False)
+        mock_embedding.return_value = ([0.1] * 1024, [1, 5, 10], [0.5, 0.3, 0.2])
+        client = MagicMock()
+        client.query.return_value = _make_ha3_response()   # 纯向量走 client.query()
+        mock_client_fn.return_value = client
+
+        from opensearch_pipeline.retriever import search_chunks
+        search_chunks("纯向量降级排序测试")
+
+        assert client.query.called and not client.search.called, "enable_hybrid=False 应走 client.query()"
+        assert len(_captured_knn_queries) == 1
+        req = _captured_knn_queries[0]
+        assert getattr(req, "order", None) == "DESC", "纯向量 QueryRequest 缺 order='DESC'（F-20/G29）"

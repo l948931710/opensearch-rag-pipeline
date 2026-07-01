@@ -44,11 +44,16 @@ SEMANTIC_KEYWORDS = {
     ],
 }
 
+# ⚠️ 号码/密钥类实体用显式 lookaround 定界，不用 \b：Python 正则里 CJK 属 \w，\b 只在
+# word/非word 交界成立，故「身份证号110101…」「密钥LTAI…」这类号码紧贴中文时 \b 不成立、
+# 整体漏检（cn_mobile 早已改用 (?<!\d)…(?!\d) 规避）。lookaround 只断言前后不是同类字符，
+# 与中文/空格/标点邻接均能命中，同时仍防止匹配更长数字/标识串的子串。redaction.py 直接
+# 复用本表（_FULL_ID/_ACCESS_KEY = ENTITY_PATTERNS[...]），改这里即同步修复入库脱敏侧。
 ENTITY_PATTERNS = {
-    "cn_id_card": r"\b[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b",
+    "cn_id_card": r"(?<![0-9Xx])[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9Xx])",
     "cn_mobile": r"(?<!\d)1[3-9]\d{9}(?!\d)",
     "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-    "access_key": r"\b(LTAI|AKIA)[A-Za-z0-9]{12,}\b",
+    "access_key": r"(?<![A-Za-z0-9])(LTAI|AKIA)[A-Za-z0-9]{12,}(?![A-Za-z0-9])",
     "secret_like": r"(?i)\b(secret|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)[A-Za-z0-9_\-]{8,}",
 }
 
@@ -1788,7 +1793,8 @@ def node_classify_and_risk_assess(ctx: dict):
                                 risk_level = 'high',
                                 classification_status = 'PENDING_AUDIT',
                                 content_process_status = 'FAILED',
-                                content_process_error = %s
+                                content_process_error = %s,
+                                retry_count = retry_count + 1
                             WHERE doc_id = %s AND version_no = %s
                         """, (api_error_reason, doc["doc_id"], doc["version_no"]))
                         conn_dv.commit()
@@ -1881,16 +1887,26 @@ def node_classify_and_risk_assess(ctx: dict):
             if not success:
                 failed_doc_ids.add(doc["doc_id"])
     else:
+        # ⚠️ 与单文档路径对齐（F-13）：worker `return False` = 业务性失败（LLM API 不可达的
+        # fail-safe 降级）→ 按文档跳过；worker 抛异常 = 应中止类（DB 持久化失败 RuntimeError /
+        # 未预期 bug）→ 取消剩余 futures 并 re-raise，让节点 FAILED、由 DataWorks 重试。绝不像旧代码
+        # 那样把 DB 写失败塞进 failed_doc_ids 静默降级——那会让"同一 RDS 故障单篇 abort、多篇 SUCCESS"
+        # 的错误语义随批次大小漂移，破坏 TestDatabaseExceptionPropagation 守护的不变量。
         with ThreadPoolExecutor(max_workers=min(max_workers, len(valid_canonicals))) as pool:
             future_to_doc = {pool.submit(_classify_single_doc, doc): doc for doc in valid_canonicals}
             for future in as_completed(future_to_doc):
                 doc = future_to_doc[future]
                 try:
                     success = future.result()
-                    if not success:
-                        failed_doc_ids.add(doc["doc_id"])
-                except Exception as e:
-                    print(f"    ❌ Unexpected error classifying {doc['doc_id']}: {e}")
+                except Exception:
+                    # 意外/DB 写失败：取消未启动 futures、快速关闭线程池（不等在飞任务，各自 finally
+                    # 关连接无泄漏）、抛出原异常 abort 节点。cancel_futures 需 Python≥3.9（本仓满足）。
+                    print(f"    ❌ Abort: DB/unexpected failure classifying {doc['doc_id']}")
+                    for _f in future_to_doc:
+                        _f.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                if not success:
                     failed_doc_ids.add(doc["doc_id"])
 
     elapsed = _time.time() - t0
@@ -4287,7 +4303,10 @@ def node_chunk_documents(ctx: dict):
                         chunk_type="visual_knowledge", chunk_text=_ctext,
                         token_count=_estimate_tokens(_ctext), raw_text=_ctext,
                         page_num=pg, source_oss_key=doc.get("canonical_key", ""),
-                        source="multimodal", title=_title, owner_dept=dept_code,
+                        # F-19：chunk 的 ACL owner_dept 一律取 RDS 权威值（doc.owner_dept），不用
+                        # dept_code（raw/ 路径推导）——否则管理员改正 owner_dept 后升版，文本 chunk 用
+                        # 新值、图片 chunk 用旧路径值 → 同文档 ACL 归属分裂。dept_code 只保留给 OSS 路径拼接。
+                        source="multimodal", title=_title, owner_dept=(doc.get("owner_dept") or "unknown"),
                         category_l1=doc.get("category_l1", ""), category_l2=doc.get("category_l2", ""),
                         permission_level=doc.get("permission_level", "public"),
                         kb_type=doc.get("kb_type", "public"), risk_level=doc.get("risk_level", "low"),
@@ -4418,7 +4437,8 @@ def node_chunk_documents(ctx: dict):
                             source_oss_key=doc.get("canonical_key", ""),
                             source="multimodal",
                             title=doc.get("title", ""),
-                            owner_dept=dept_code,
+                            # F-19：ACL owner_dept 取 RDS 权威值，不用 dept_code（路径推导）——见上方同注。
+                            owner_dept=(doc.get("owner_dept") or "unknown"),
                             category_l1=doc.get("category_l1", ""),
                             category_l2=doc.get("category_l2", ""),
                             permission_level=doc.get("permission_level", "public"),
@@ -4913,8 +4933,13 @@ def node_write_chunk_meta(ctx: dict):
                         _json.dumps(chunk.allowed_depts, ensure_ascii=False) if getattr(chunk, "allowed_depts", None) else None
                     )
 
+                    # F-18：section_title 全类型长度防线（列为 VARCHAR(255)）。既有 Fix B 只覆盖
+                    # clause/text/section 三类（chunker 里 60 字 heading 约束）；step_card/faq/table
+                    # 等继承的超长标题会在 executemany 触发 MySQL 1406，整批（≤100 文档）回滚 + 毒文档
+                    # 每日重试每日失败拖住日更管线。截断而非丢块（保 chunk_text/image_refs 内容不丢）。
+                    _section_title = (chunk.section_title or None) and chunk.section_title[:255]
                     insert_rows.append((
-                        chunk.chunk_id, chunk.doc_id, chunk.version_no, chunk.chunk_index, chunk.page_num, chunk.section_title,
+                        chunk.chunk_id, chunk.doc_id, chunk.version_no, chunk.chunk_index, chunk.page_num, _section_title,
                         preview, chunk.source_oss_key, chunk.chunk_type, chunk.chunk_text, chunk.token_count,
                         chunk.source, rag_ready_key, chunk.permission_level, chunk.owner_dept, chunk.category_l1,
                         chunk.category_l2, chunk.sensitive_redacted, chunk.is_active, chunk.embedding_status,
@@ -6045,6 +6070,17 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
         status_code = getattr(resp, "status_code", 200)
         body = getattr(resp, "body", None)
 
+        # 真实 SDK：PushDocumentsResponse 无 status_code（getattr 恒兜底 200），body 是原始 JSON
+        # 字符串；4xx/5xx 由上面 except 的 TeaException 路径处理、永不到此，故此处只可能是 2xx。
+        # 必须先把 str body 解析成 dict，才能真正读到 doc 级 errors —— 否则被 HA3 拒收的 chunk 会被
+        # 静默标 INDEXED（96 例静默丢失同类）。解析失败保守按无 per-doc 错误处理（与历史行为一致，
+        # 不新增失败面）。isinstance(body,str) 守卫保证既有 dict-body 单测路径不变、sim 零暴露。
+        if isinstance(body, str) and body.strip():
+            try:
+                body = json.loads(body)
+            except (ValueError, TypeError):
+                body = None
+
         if 200 <= status_code < 300:
             # 尝试解析 per-document 结果
             per_doc_parsed = False
@@ -6592,7 +6628,8 @@ def node_verify_and_repush(ctx: dict):
     确认本批 INDEXED chunk 真实存在，对确认丢失的有界补推；补救失败(DROP) 或 无法确认(UNKNOWN)
     则写回 FAILED 并 raise —— 阻断 05，守住"新版本确认入库后才停用旧版本"不变量。
 
-    默认关闭（RAG_STAGE3_PARITY_VERIFY）；simulate / MOCK / 非 HA3 客户端均 no-op。
+    默认常开（RAG_STAGE3_PARITY_VERIFY，opt-out；设 0/false/no/off 才关）；
+    simulate / MOCK / 非 HA3 客户端均 no-op。
     校验基础设施异常 fail-open（仅"廉价 hint enum"失败时降级为全量 point-read，绝不跳过校验）；
     只有"权威 point-read 确认缺失(DROP)"或"point-read 无法完成(UNKNOWN)"才 fail-closed 阻断 05。
 
@@ -6610,8 +6647,10 @@ def node_verify_and_repush(ctx: dict):
         print("    [SKIP] node_verify_and_repush skipped because ctx['dag3_no_work'] is True.")
         return
 
-    # 特性开关（默认关闭）：先小范围 controlled validation，再考虑 default-on
-    if os.environ.get("RAG_STAGE3_PARITY_VERIFY", "").lower() not in ("1", "true", "yes"):
+    # 特性开关（默认常开 / opt-out）：显式设 RAG_STAGE3_PARITY_VERIFY=0/false/no/off 才关。
+    # 不经 DataWorks stage3_node（笔记本手工重灌等路径）也强制走推送后物理校验，堵住 96 例类
+    # 静默丢失复发面（sim/MOCK/非 HA3 客户端在下方仍 no-op，故常开对本地/测试零影响）。
+    if os.environ.get("RAG_STAGE3_PARITY_VERIFY", "true").lower() in ("0", "false", "no", "off"):
         return
 
     if _resolve_simulate(ctx, "opensearch"):

@@ -134,6 +134,43 @@ class TestImageChunkCreation:
         print(f"     source_image = {img.extra['source_image']}")
         print(f"     Text chunks: {len(text_chunks)}")
 
+    def test_image_chunk_owner_dept_from_rds_not_raw_path(self):
+        """F-19：image chunk 的 ACL owner_dept 取 RDS document_meta 权威值，不取 raw/ 路径段——
+        否则管理员改正 owner_dept 后升版，文本 chunk 与图片 chunk ACL 归属分裂。
+        路径推导（source_image 的 processing/assets/<dept>/... 前缀）仍 pin raw 段，不受影响。"""
+        from opensearch_pipeline.pipeline_nodes import node_chunk_documents
+        canonical = {
+            "doc_id": "DOC_F19", "version_no": 1, "text": MOCK_TEXT_WITH_IMAGE_REF,
+            "title": "已改归属的流程图.docx",
+            # 关键：RDS 权威 owner_dept=sales，但 raw 路径段=marketing（管理员改正后升版的场景）
+            "owner_dept": "sales",
+            "source_key": "raw/marketing/已改归属的流程图.docx",
+            "category_l1": "sop", "category_l2": "equipment_sop",
+            "permission_level": "dept_internal", "kb_type": "private", "risk_level": "low",
+            "blocks": [{"text": "本文档展示了完整工艺流程。", "page_num": 1, "block_type": "paragraph"}],
+            "assets": [{
+                "filename": "workflow_diagram.png", "status": "ROUTE_TO_VECTOR",
+                "visual_summary": "工艺流程图", "ocr_text": "原料 → 注塑",
+                "width": 800, "height": 600, "file_size_kb": 120.5,
+                "local_path": "/tmp/nonexistent/DOC_F19_workflow_diagram.png",
+            }],
+        }
+        ctx = {"canonicals": [canonical], "min_chunk_chars": 5}
+        node_chunk_documents(ctx)
+        chunks = ctx["chunks"]
+        image_chunks = [c for c in chunks if c.chunk_type == "image"]
+        text_chunks = [c for c in chunks if c.chunk_type not in ("image", "visual_knowledge")]
+        assert len(image_chunks) == 1
+        img = image_chunks[0]
+        # 修复点：ACL owner_dept 用 RDS 权威值 sales（不是 raw 段 marketing）
+        assert img.owner_dept == "sales", f"image chunk owner_dept 应=sales(RDS)，实得 {img.owner_dept}"
+        # 与文本 chunk 归属一致（不再分裂）
+        assert all(c.owner_dept == "sales" for c in text_chunks), \
+            f"文本 chunk owner_dept 应=sales，实得 {[c.owner_dept for c in text_chunks]}"
+        # 边界：OSS 路径推导仍 pin raw 段 marketing（source_image 未被误改）
+        assert "marketing" in img.extra["source_image"], \
+            f"source_image OSS 路径应仍含 raw 段 marketing，实得 {img.extra['source_image']}"
+
 
 # ═══════════════════════════════════════════════════════════════
 # 测试组 3：to_ha3_doc() 图像元数据字段验证（多模态修复后的契约）

@@ -192,13 +192,26 @@ def test_mock_client_is_noop(monkeypatch):
 
 
 # ── 2. flag OFF ──────────────────────────────────────────────────────────────
-def test_flag_off_returns_even_in_real_mode(monkeypatch):
-    monkeypatch.delenv("RAG_STAGE3_PARITY_VERIFY", raising=False)
+def test_flag_explicit_off_returns_even_in_real_mode(monkeypatch):
+    # F-12: 默认已翻为常开（opt-out），显式设 0/false/no/off 才 no-op。
+    monkeypatch.setenv("RAG_STAGE3_PARITY_VERIFY", "0")
     client = FakeHA3(present={1})
     monkeypatch.setattr(pn, "_get_opensearch_client", lambda ctx=None: client)
     ctx = {"bulk_batches": [{"chunks": [_mk_chunk(1)]}], "simulate_opensearch": False}
     pn.node_verify_and_repush(ctx)
     assert client.point_reads == [] and client.push_calls == []
+
+
+def test_flag_default_on_runs_verify_in_real_mode(monkeypatch):
+    # F-12: 未设 flag（默认常开）→ 真实模式下必须真正跑校验（点读），堵住不经 DataWorks
+    # stage3_node（笔记本重灌等路径）的 96 例类静默丢失复发面。
+    monkeypatch.delenv("RAG_STAGE3_PARITY_VERIFY", raising=False)
+    monkeypatch.setenv("RAG_STAGE3_PARITY_SETTLE_SEC", "0")
+    client = FakeHA3(present={1})
+    monkeypatch.setattr(pn, "_get_opensearch_client", lambda ctx=None: client)
+    ctx = {"bulk_batches": [{"chunks": [_mk_chunk(1)]}], "simulate_opensearch": False}
+    pn.node_verify_and_repush(ctx)
+    assert client.point_reads != []  # 默认常开 → 真的读了 HA3
 
 
 # ── 3. all present ───────────────────────────────────────────────────────────

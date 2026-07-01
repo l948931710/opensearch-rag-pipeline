@@ -343,6 +343,18 @@ def _client_ip(request: Optional[Request]) -> str:
     return resolve_client_ip(request.client.host, request.headers.get("x-forwarded-for"))
 
 
+def _anon_uid(request: Optional[Request]) -> str:
+    """匿名请求的日志归属身份：``anon:<客户端 IP 短哈希>``。
+
+    绝不采信客户端自报的 req.user_id 作为落库 user_id —— /api/history 严格按令牌
+    identity.user_id（真实钉钉 staffId）过滤本人记录；若匿名 /api/ask 能写入任意 user_id，
+    攻击者即可枚举他人 staffId、把伪造问答注入受害者的私有历史与审计链。anon: 命名空间与
+    真实 staffId 天然不相交（永不出现在任何人历史里），又保留按客户端聚合排查的能力。"""
+    import hashlib
+    ip = _client_ip(request)
+    return "anon:" + hashlib.sha256(ip.encode("utf-8")).hexdigest()[:12]
+
+
 def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity], *,
                         scope: str, thinking: bool = False, count_llm: bool = False) -> None:
     """限流准入：拒绝抛 429/403/503（中文 detail 小程序错误卡直接可见）+ Retry-After。
@@ -505,7 +517,8 @@ def search(req: SearchRequest, request: Request,
     )
 
 
-def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_images: bool = False):
+def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
+                 request: Optional[Request] = None, cosurface_images: bool = False):
     """/api/ask 与 /api/ask/stream 共用的前置段：会话管理、客户端历史合并、
     身份/部门解析（仅信 Bearer 令牌）、检索 + 计时。
 
@@ -533,9 +546,10 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *, cosurface_i
     if len(merged_history) > max_messages:
         merged_history = merged_history[-max_messages:]
 
-    uid = identity.user_id if identity else (req.user_id or "")
+    # 落库归属：仅令牌身份可作 user_id 主键。匿名请求一律落 anon:<ip 短哈希>，绝不采信
+    # 客户端自报的 req.user_id —— 否则攻击者可传他人 staffId 把伪造问答注入受害者 /api/history。
+    uid = identity.user_id if identity else _anon_uid(request)
     # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
-    # 请求体里的 user_id 只用于日志归因，绝不能反查部门授予 dept_internal 权限。
     user_dept = identity.acl_groups if identity else None
 
     # 2. 检索
@@ -566,7 +580,7 @@ def ask(req: AskRequest, request: Request,
     _enforce_rate_limit(request, identity, scope="ask",
                         thinking=bool(req.thinking), count_llm=True)
     (t0, session_id, merged_history, uid, user_dept,
-     chunks, t_retrieval, retrieval_latency_ms) = _prepare_ask(req, identity)
+     chunks, t_retrieval, retrieval_latency_ms) = _prepare_ask(req, identity, request=request)
 
     if not chunks:
         latency = int((time.time() - t0) * 1000)
@@ -743,7 +757,7 @@ def ask_stream(req: AskRequest, request: Request,
     # 前置段与 /api/ask 共用；检索失败在返回 StreamingResponse 之前即抛 500
     (t0, session_id, merged_history, uid, user_dept,
      chunks, _t_retrieval, retrieval_latency_ms) = _prepare_ask(
-        req, identity, cosurface_images=not _pure)
+        req, identity, request=request, cosurface_images=not _pure)
     message_id = generate_message_id()
 
     # 无结果：仍发出 message_id 并落库（NO_RESULT），与 /api/ask 空结果分支保持一致
@@ -2717,7 +2731,7 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             conn = _get_db_conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT owner_dept, permission_level FROM {_kb_db()}.document_meta "
+                    cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
                                 "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                     row = cur.fetchone()
             finally:
@@ -2732,6 +2746,10 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             raise HTTPException(status_code=404, detail="升版目标文档不存在")
         if (row[0] or "") != owner or not _kb_can_manage(kb, owner):
             raise HTTPException(status_code=403, detail="无权升版该文档（owner_dept 不在管理范围）")
+        # F-37 早失败：退役文档禁止升版——否则新版本会被 stage-1 认领复活（认领只看 dv.status）。
+        # 连 PUT URL 都不颁发，客户端根本传不了文件。恢复上线走 /api/kb/restore。
+        if str(row[2] or "active").lower() != "active":
+            raise HTTPException(status_code=409, detail="该文档已退役，请先在控制台恢复上线后再升版")
         # 升版强制继承原文档 permission_level —— 忽略客户端传值（升版不得改可见范围，防越权）。
         perm = row[1] or perm
         doc_id = req.doc_id
@@ -2845,11 +2863,32 @@ def kb_register(req: KbRegisterRequest, request: Request,
                 doc_id = payload["doc_id"]
                 if action == "version":
                     # 行锁串行化版本号分配，避免并发升版撞号
-                    cur.execute(f"SELECT current_version_no, permission_level FROM {_kb_db()}.document_meta "
+                    cur.execute(f"SELECT current_version_no, permission_level, status FROM {_kb_db()}.document_meta "
                                 "WHERE doc_id=%s FOR UPDATE", (doc_id,))
                     mrow = cur.fetchone()
                     if not mrow:
                         raise HTTPException(status_code=404, detail="升版目标文档不存在")
+                    # F-37 纵深防御（行锁内，与并发退役串行化）：退役文档禁止升版——否则新 document_version
+                    # 行 status='active'（下方硬编码）会被 stage-1 认领（认领只看 dv.status，不看 dm.status），
+                    # 退役文档次日复活、全员可检索。upload-url 已早拦一次，此处是写库入口再核（token TTL 窗口内文档可能被退役）。
+                    if str(mrow[2] or "active").lower() != "active":
+                        raise HTTPException(status_code=409, detail="该文档已退役，请先在控制台恢复上线后再升版")
+                    # F-38：拿到 document_meta 行锁【之后】再查一次 raw_key。并发升版双击时，锁前那次幂等
+                    # SELECT 可能两边都读空（都在赢家 commit 前）；升版路径 FOR UPDATE 串行化后各自算出不同
+                    # 版本号 → uk_doc_version 不撞、1062 兜底也不触发 → 会落成两个版本。持锁后按 raw_key 复查，
+                    # 命中赢家已提交行即幂等返回，不再推高 current_version_no（避免版本空洞 + 双份抽取/嵌入）。
+                    cur.execute("SELECT doc_id, version_no, content_process_status "
+                                f"FROM {_kb_db()}.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                    _relock = cur.fetchone()
+                    if _relock:
+                        conn.commit()   # 释放 document_meta 行锁
+                        return KbRegisterResponse(
+                            doc_id=_relock[0], version_no=int(_relock[1]),
+                            content_process_status=_relock[2] or cps,
+                            requires_kb_admin_approval=requires_approval,
+                            status_badge=_kb_status_badge(_relock[2], None, "active"),
+                            idempotent=True, title=payload.get("title") or "",
+                        )
                     # 纵深防御：升版绝不改可见范围（token 由 upload-url 钦定继承，此处再核一次）
                     if perm != (mrow[1] or perm):
                         raise HTTPException(status_code=403, detail="升版不可改变可见范围")
@@ -2958,6 +2997,14 @@ def kb_approve(req: KbApprovalRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # F-37 纵深防御：文档已退役则不放行任何 PENDING 版本。堵"多 pending 版本 + 退役后审批"
+                # 复活窗口——kb_retire 只把 current 版本置 retired，更早的 pending 版本可能仍 status=active，
+                # 审批放行后会被 stage-1 认领复活。FOR UPDATE 与 kb_retire（同样锁 document_meta）串行化。
+                cur.execute(f"SELECT status FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                _m = cur.fetchone()
+                if _m and str(_m[0] or "active").lower() != "active":
+                    conn.commit()
+                    return {"status": "ok", "approved": 0, "note": "文档已退役，未放行任何版本"}
                 vfilter = "AND version_no=%s" if req.version_no else ""
                 vargs = (req.version_no,) if req.version_no else ()
                 n = cur.execute(

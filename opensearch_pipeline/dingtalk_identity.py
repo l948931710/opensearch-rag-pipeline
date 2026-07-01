@@ -30,6 +30,16 @@ from opensearch_pipeline.config import get_config
 logger = logging.getLogger(__name__)
 
 
+def _acl_cache_ttl_seconds() -> int:
+    """_resolve_user_dept（机器人写路径）缓存命中的行级复核 TTL（秒）。超过则对【自动缓存的
+    employee 行】穿透重查钉钉 API，自愈 department/get 瞬时失败留下的残缺 dept_code（F-22）。
+    seeded 行（role≠employee）不受 TTL 约束，始终缓存优先（H3）。0=禁用穿透。默认 6 小时。"""
+    try:
+        return max(0, int(os.environ.get("RAG_ACL_CACHE_TTL", "21600")))
+    except (TypeError, ValueError):
+        return 21600
+
+
 def _kb_db() -> str:
     """知识库库名（user_role/dept_admin_grant 所在库）；经 RAG_RDS_DATABASE 配置（STAGING=_stg）。"""
     return get_config().rds.database
@@ -244,11 +254,16 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
 
         conn = _get_db_conn()
         try:
+            # F-22：过期 employee 行穿透重查时的旧缓存兜底——若 API 重查失败/不完整则退回它，
+            # 绝不把已知部门的用户 fail-closed 掉到 public。
+            _cached_codes = None
             # 1. 先查本地缓存（seeded 行在此命中并优先；按最新行取值，user_id 唯一键见
-            #    schema/003_user_role_unique.sql；显式排序保证确定性）
+            #    schema/003_user_role_unique.sql；显式排序保证确定性）。一并取 role 与"已缓存秒数"
+            #    （SQL 侧 TIMESTAMPDIFF，避免应用/DB 时区不一致——项目已知 tz=Pacific 陷阱）。
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT dept_code FROM {_kb_db()}.user_role "
+                    f"SELECT dept_code, role, TIMESTAMPDIFF(SECOND, updated_at, NOW()) "
+                    f"FROM {_kb_db()}.user_role "
                     "WHERE user_id = %s AND is_active = 1 "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (staff_id,),
@@ -258,16 +273,36 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
                     # 缓存里存的可能是中文名(CSV) 或组代码(CSV)；归一化为组列表再返回。
                     # 未知项经白名单丢弃 = fail-closed（仅 public）。
                     codes = _normalize_dept_to_codes(row[0])
-                    logger.info("用户权限组解析成功（缓存）: staff_id=%s → raw=%s（groups=%s）",
-                                staff_id, row[0], codes)
-                    return codes
+                    _ttl = _acl_cache_ttl_seconds()
+                    _role = (row[1] or "employee")
+                    _age = row[2]
+                    # F-22 行级 TTL 复核：仅对自动缓存的 employee 行、且已过期时穿透重查钉钉 API
+                    # （自愈 department/get 瞬时失败留下的残缺 dept_code）。seeded 行（role≠employee）
+                    # 永远缓存优先（H3），绝不因 TTL 被 API 覆盖。TTL=0 或 age 取不到 → 不穿透。
+                    _stale = (_ttl > 0 and _role == "employee"
+                              and _age is not None and _age > _ttl)
+                    if not _stale:
+                        logger.info("用户权限组解析成功（缓存）: staff_id=%s → raw=%s（groups=%s）",
+                                    staff_id, row[0], codes)
+                        return codes
+                    _cached_codes = codes
+                    logger.info("ACL 缓存过期，穿透重查钉钉 API: staff_id=%s age=%ss ttl=%ss",
+                                staff_id, _age, _ttl)
 
-            # 2. 本地没有，调钉钉 API 获取（dept_name 为该用户所有部门名的 CSV）
+            # 2. cache-miss 或 过期 employee 行穿透：调钉钉 API 获取（dept_name 为全部部门名 CSV）
             user_info = _fetch_dingtalk_user_info(staff_id)
             if user_info:
+                if user_info.get("is_partial"):
+                    # F-22：解析不完整（某 dept 瞬时失败）→ 绝不落缓存，避免残缺 CSV 永久少授权。
+                    # 穿透场景退回旧缓存（更全）；纯 cache-miss 返回本次 best-effort 组（仅 public 之上、
+                    # 仍是真实子集=fail-closed 方向）。下次调用重新走 API 复核，自愈。
+                    fresh = _normalize_dept_to_codes(user_info.get("dept_name", ""))
+                    logger.warning("用户部门解析不完整（department/get 瞬时失败），跳过缓存: staff_id=%s", staff_id)
+                    return _cached_codes if _cached_codes is not None else fresh
                 dept_name = user_info.get("dept_name", "")
                 user_name = user_info.get("user_name", "")
-                # 3. 缓存到 user_role 表（仅 cache-miss 分支，不会覆盖 seeded 行）
+                # 3. 缓存到 user_role 表（employee 行；ON DUPLICATE KEY UPDATE 刷新 updated_at；
+                #    绝不覆盖 seeded 行——seeded 行在上方缓存命中即返回，根本走不到这里）
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -288,6 +323,10 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
                 # 缓存原始中文名（便于在 DMS/钉钉侧对照），返回时归一化为组列表
                 return _normalize_dept_to_codes(dept_name)
             else:
+                # API 失败：穿透场景退回旧缓存（不丢已知部门）；纯 cache-miss 才 fail-closed []
+                if _cached_codes is not None:
+                    logger.warning("穿透重查 API 失败，退回旧缓存: staff_id=%s", staff_id)
+                    return _cached_codes
                 logger.warning("用户未在 user_role 表中注册且 API 查询失败: staff_id=%s", staff_id)
                 return []
         finally:
@@ -363,13 +402,20 @@ def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
                 dept_id_list = result.get("dept_id_list", [])
                 dept_names = []
                 seen_names = set()
+                # F-22：任一 dept_id 的 department/get 瞬时失败（返回空名）→ 解析不完整。
+                # 多部门用户丢任一组即少授权，调用方据此【不落缓存】（避免残缺 CSV 永久少授权）。
+                # dept_id_list 为空是合法的「无部门」，不算不完整。
+                is_partial = False
                 for did in dept_id_list:
                     nm = _fetch_dept_name(token, did)
-                    if nm and nm not in seen_names:
+                    if not nm:
+                        is_partial = True
+                        continue
+                    if nm not in seen_names:
                         seen_names.add(nm)
                         dept_names.append(nm)
                 dept_name = ",".join(dept_names)
-                return {"user_name": user_name, "dept_name": dept_name}
+                return {"user_name": user_name, "dept_name": dept_name, "is_partial": is_partial}
             logger.warning("用户查询业务失败: errcode=%s errmsg=%s", data.get("errcode"), data.get("errmsg"))
             return None
         logger.warning("用户查询 HTTP 失败: %s", resp.text[:300])

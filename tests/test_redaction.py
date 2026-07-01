@@ -49,6 +49,20 @@ def test_id_redacted_before_bankcard_no_double_count():
     assert counts.get("cn_id_card") == 1 and "bank_card" not in counts
 
 
+def test_id_and_accesskey_redacted_when_glued_to_cjk():
+    """F-1 回归：身份证号/AccessKey 紧贴中文（无分隔符，OCR 常见）时仍必须命中并脱敏。
+
+    旧正则用 \\b 定界，而 Python 正则里 CJK 属 \\w → \\b 在中文邻接处不成立 → 整体漏检、
+    明文入索引。改用 lookaround 后，中文紧贴的号码/密钥同样被脱敏。"""
+    ak = "LTAIabcd1234efgh5678"  # synthetic, pattern-valid fake AccessKey
+    out, counts = R.redact_text(f"身份证号{ID1}属实，密钥{ak}请勿外泄")
+    assert counts.get("cn_id_card") == 1 and counts.get("access_key") == 1
+    assert ID1 not in out and ak not in out
+    # 中文两侧夹住也要命中（前一版 \\b 在此彻底失效）
+    out2, counts2 = R.redact_text(f"证号{ID1}的员工")
+    assert counts2.get("cn_id_card") == 1 and ID1 not in out2
+
+
 def test_long_caseid_and_uscc_not_personal_pii():
     # 21-digit 办件单号 and 18-char-with-letter USCC are not personal PII patterns
     case_id = "120000000000000000009"   # synthetic 21-digit case-number shape

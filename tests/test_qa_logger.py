@@ -74,9 +74,37 @@ def test_success_path_commits_and_closes(mock_get_conn):
 
     conn.commit.assert_called_once()
     conn.close.assert_called_once()
-    # content_blocks_json 必须真的进了 INSERT 参数
+    # content_blocks_json 必须真的进了 INSERT 参数（无 PII 时字节级不变）
     params = cur.execute.call_args[0][1]
     assert '[{"type":"text"}]' in params
+
+
+@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+def test_content_blocks_pii_masked_urls_preserved(mock_get_conn):
+    """F-8 回归：content_blocks_json 里文本块复述的 PII 必须结构感知脱敏，
+    而 image 块的 url/oss_key 一律保留（否则 /api/history 回渲 + 卡片回调重签会断）。"""
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    import json as _json
+    blocks = _json.dumps([
+        {"type": "text", "text": "员工手机号13800138000社保补缴"},
+        {"type": "image", "url": "https://oss/x.jpg?OSSAccessKeyId=LTAIabcd1234efgh5678&sig=z",
+         "oss_key": "processing/a/b.jpg", "caption": "身份证110101199003078515的截图"},
+    ], ensure_ascii=False)
+
+    log_qa_session(session_id="s1", message_id="m1", query_text="q",
+                   content_blocks_json=blocks)
+
+    params = cur.execute.call_args[0][1]
+    stored = next(p for p in params if isinstance(p, str) and p.startswith("["))
+    # 文本 PII 与 caption PII 被脱敏
+    assert "13800138000" not in stored and "110101199003078515" not in stored
+    # image 的 url（含签名 AccessKeyId）与 oss_key 原样保留 —— 回调重签依赖它们
+    assert "OSSAccessKeyId=LTAIabcd1234efgh5678" in stored
+    assert "processing/a/b.jpg" in stored
 
 
 def test_insert_columns_all_exist_in_schema_files():

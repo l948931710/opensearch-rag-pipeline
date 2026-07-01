@@ -151,6 +151,24 @@ def test_c2_suspected_failure_needs_review(mock_get_db_conn):
         assert seen, f"{why}: expected a status-closure UPDATE"
 
 
+# Test C4 (F-14): classify fail-safe FAILED write must bump retry_count (else deterministically
+# broken docs re-claim forever → stage-2 no-progress guard raises every day).
+def test_c4_classify_failsafe_bumps_retry_count():
+    """F-14：node_classify_and_risk_assess 的 fail-safe（LLM 400/持续 429/缺 key）写 FAILED 时，
+    必须自增 retry_count —— 与 orchestrator 的 (FAILED AND retry_count<3) 认领谓词配套，N 次后
+    自然停在 FAILED 等人工，不再每日整轮 no-progress raise。"""
+    import inspect, re
+    import opensearch_pipeline.pipeline_nodes as pn
+    src = inspect.getsource(pn.node_classify_and_risk_assess)
+    # 唯一定位 fail-safe UPDATE：含 classification_confidence = 0.0 + content_process_status = 'FAILED'
+    m = re.search(r"classification_confidence = 0\.0.*?WHERE doc_id = %s AND version_no = %s",
+                  src, re.DOTALL)
+    assert m, "未找到 classify fail-safe 的 document_version FAILED UPDATE"
+    block = m.group(0)
+    assert "content_process_status = 'FAILED'" in block
+    assert "retry_count = retry_count + 1" in block, "fail-safe FAILED 未自增 retry_count（F-14 回归）"
+
+
 # Test C3: QUARANTINE 0-chunk doc keeps EMPTY/DONE (suspected-failure guard must not re-grade it)
 @patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
 def test_c3_quarantine_not_regraded(mock_get_db_conn):

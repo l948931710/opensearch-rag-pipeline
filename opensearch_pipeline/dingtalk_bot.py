@@ -136,6 +136,19 @@ def _verify_signature(timestamp: str, sign: str) -> bool:
 # 消息解析
 # ═══════════════════════════════════════════════════════════════
 
+def _q_for_log(text: Optional[str]) -> str:
+    """钉钉【应用日志】里的问题/消息文本 PII 脱敏 + 截断。
+
+    应用日志（logger/stdout→SAE 日志服务长期留存）是 qa_session_log 之外的另一 PII sink：
+    原始消息可能含身份证/手机号。复用 contribution.redact_query_text（纯本地正则、无 LLM/网络、
+    失败回退安全占位符）。所有打印问题/消息体原文的日志点都必须先过它，绝不明文外泄。"""
+    try:
+        from opensearch_pipeline.contribution import redact_query_text as _rq
+        return _rq(text)[:200]
+    except Exception:
+        return "[redact-failed]"
+
+
 def _extract_question(body: Dict[str, Any]) -> str:
     """
     从钉钉回调 body 中提取用户问题文本。
@@ -190,8 +203,7 @@ def _extract_question(body: Dict[str, Any]) -> str:
 
     content = content.strip()
 
-    logger.info("[消息提取] msgtype=%s, raw_content=%r", msgtype, content)
-    print(f"[DINGTALK] 消息提取: msgtype={msgtype}, raw_content={content!r}", flush=True)
+    logger.info("[消息提取] msgtype=%s, content_len=%d, preview=%s", msgtype, len(content), _q_for_log(content))
 
     if not content:
         return ""
@@ -199,8 +211,7 @@ def _extract_question(body: Dict[str, Any]) -> str:
     # 去除 @机器人 标记（群聊场景，可能出现在任意位置）
     cleaned = re.sub(r"@\S+", "", content).strip()
 
-    logger.info("[消息提取] 去除@后: %r", cleaned)
-    print(f"[DINGTALK] 去除@后: {cleaned!r}", flush=True)
+    logger.info("[消息提取] 去除@后 len=%d", len(cleaned))
 
     return cleaned
 
@@ -751,15 +762,13 @@ async def _handle_webhook(request: Request):
 
 def _process_webhook_body(body: dict):
     """webhook 同步处理：日志、问题提取、「补充原因」回收、ack 回复、起后台 RAG 线程。"""
-    body_json = json.dumps(body, ensure_ascii=False, default=str)
+    # 只记结构化元数据 —— 完整 body（含用户问题原文，可能带身份证/手机号）绝不整段落日志。
     logger.info(
         "收到钉钉消息: sender=%s, conversationType=%s, msgId=%s",
         body.get("senderNick", "unknown"),
         body.get("conversationType", "?"),
         body.get("msgId", "?"),
     )
-    logger.info("钉钉完整消息体: %s", body_json)
-    print(f"[DINGTALK] 完整消息体: {body_json}", flush=True)
 
     # 3. 提取问题文本
     question = _extract_question(body)
@@ -768,7 +777,7 @@ def _process_webhook_body(body: dict):
     sender_staff_id = body.get("senderStaffId", "") or body.get("senderId", "")
     conversation_id = body.get("conversationId", "")
 
-    print(f"[DINGTALK] 提取结果: question={question!r}, has_webhook={bool(session_webhook)}", flush=True)
+    print(f"[DINGTALK] 提取结果: content_len={len(question)}, has_webhook={bool(session_webhook)}", flush=True)
 
     if not question:
         if session_webhook:
