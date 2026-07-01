@@ -21,12 +21,13 @@ defineExpose({ focus: () => ta.value?.focus() })
 </script>
 
 <template>
-  <div class="mx-auto w-full max-w-3xl px-4">
+  <div class="mx-auto w-full max-w-3xl xl:max-w-4xl px-4">
     <div class="rounded-2xl border border-input bg-card px-3 py-2 shadow-sm
                 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/15">
       <div class="flex items-end gap-2">
         <textarea
           ref="ta"
+          data-testid="chat-input"
           :value="modelValue"
           rows="1"
           placeholder="问点什么…（Enter 发送 · Shift+Enter 换行）"
@@ -37,6 +38,7 @@ defineExpose({ focus: () => ta.value?.focus() })
         />
         <button
           type="button"
+          data-testid="chat-send"
           class="grid size-9 shrink-0 place-items-center rounded-xl bg-primary text-primary-foreground transition
                  hover:opacity-90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
           :disabled="!asking && !modelValue.trim()"

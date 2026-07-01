@@ -522,8 +522,9 @@ function loadPersisted(): void {
       updatedAt: c.updatedAt || Date.now(),
       messages: (c.messages || []).map((m: any) => reactive({ ...m, loading: false, _stageTimer: null })),
     }))
-    activeId.value = (d.activeId && conversations.value.some((c) => c.id === d.activeId))
-      ? d.activeId : (conversations.value[0]?.id || '')
+    // 开机默认空态（欢迎界面）：历史照常回灌进侧栏,但不自动激活上次会话——
+    // 关闭再打开 = 新对话起点,想续聊点侧栏历史即可（与 ChatGPT 开窗即新对话的习惯一致）。
+    activeId.value = ''
   } catch { /* 损坏数据忽略 */ }
 }
 
