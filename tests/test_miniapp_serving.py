@@ -1173,7 +1173,7 @@ def test_stream_payload_thinking_override(monkeypatch):
     cfg = SimpleNamespace(
         llm=SimpleNamespace(api_key="k", api_base_url="https://x/v1",
                             model="m", enable_thinking=False),
-        rag=SimpleNamespace(pure_text=True, low_confidence_guard=False),
+        rag=SimpleNamespace(pure_text=True, low_confidence_guard=False, stream_reasoning=False),
     )
     monkeypatch.setattr(lg, "get_config", lambda: cfg)
 
