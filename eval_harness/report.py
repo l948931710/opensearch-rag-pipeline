@@ -102,18 +102,24 @@ def build_gates(r: Dict) -> Dict:
         # 2026-06-13 D7 升 hard:5 轮 byte-equal 后 chunker 已 deterministic
         # XLSX 升到 0.85 hard(实测 0.8636,1.4pp 缓冲;task chip 修了 step5/6 anchor 互换)
         # DOCX 0.95 hard(D6 设定,实测 0.9847 走 strict_fixture)
-        # PDF 保 soft(1 doc 11 chunks 样本太小,3 个 PDF chunker bug 未修)
+        # PDF 2026-07-01 #F-mm8 升 hard@0.78:D7 时代保 soft 的两个理由均已消解——
+        #   GT 已从 1 doc/11 chunks 扩到 3 docs/33 chunks(D8 回写 scratch 验证成绩,
+        #   gt_pdf_analysis.json),Batch-1 PDF chunker 修复后最新实测 0.8556
+        #   (reports/p3_on_full, 2026-06-23),0.78 留 ~7.6pp 缓冲(宽于 xlsx 升档先例)。
+        #   PDF 侧 chunker 回退(如横条缝合改动)从此被硬闸拦住。
         # PPTX 保 soft(待 GT 补)
         for fmt, threshold, is_hard in (
-            ("pdf", 0.70, False),
+            ("pdf", 0.78, True),      # ⬆ #F-mm8 hard
             ("xlsx", 0.85, True),     # ⬆ D7 hard
             ("docx", 0.95, True),
             ("pptx", 0.75, False),
         ):
             v = ing.get(f"binding_jaccard_{fmt}")
             if v is not None:
+                _hard_note = {"pdf": " hard (#F-mm8 升档)", "xlsx": " hard (D7 升档)",
+                              "docx": " hard (D6 设定)"}.get(fmt, " hard")
                 gate_entry = {
-                    "target": f">= {threshold}" + (" hard (D7 升档)" if is_hard else " soft"),
+                    "target": f">= {threshold}" + (_hard_note if is_hard else " soft"),
                     "value": round(v, 4),
                     "pass": (v >= threshold),
                 }
@@ -195,6 +201,28 @@ def build_gates(r: Dict) -> Dict:
                 "advisory": True,
                 "notes": f"n_image_answers={n_srv}; 对照臂见 l4.arms.cosurface_true",
             }
+
+    # ── #F-mm8c GT 缺席防静默（故意放在 `if l4:` 守卫之外）────────────────
+    # 旧行为:run_eval 的 GT 路径 `if os.path.exists` 过滤 + 上面 `if v is not None`
+    # 才发闸 —— GT 整体缺席(换机/CI 数据仓没挂载)或 l4 整层 applicable=False 时,
+    # pdf/xlsx/docx 绑定闸【无声消失】且 --strict 照样放行,防回退能力静默失效。
+    # 新语义:只要本 run 请求了 l4 层(results 含 "l4" 键),期望格式的 binding 闸就
+    # 必须存在;缺失 = na_reason='not_executed' → --strict FAIL(挂载数据仓,或显式
+    # EVAL_L4_EXPECT_FMTS= 空值放行)。pptx 无 GT,不入默认期望清单。
+    if "l4" in r:
+        _expect_fmts = [f.strip() for f in
+                        os.environ.get("EVAL_L4_EXPECT_FMTS", "docx,xlsx,pdf").split(",")
+                        if f.strip()]
+        _ing_all = ((r.get("l4") or {}).get("ingestion") or {}).get("deterministic") or {}
+        for fmt in _expect_fmts:
+            if _ing_all.get(f"binding_jaccard_{fmt}") is None:
+                gates[f"binding {fmt} Jaccard (L4-ing)"] = {
+                    "target": "expected-format binding gate must be measured",
+                    "value": "not measured (GT absent or ingestion pillar not run)",
+                    "pass": None, "na_reason": "not_executed",
+                    "notes": ("mount the eval data repo (EVAL_L4_GT_FILES/EVAL_L4_DOCS_DIR) "
+                              "or shrink EVAL_L4_EXPECT_FMTS explicitly"),
+                }
 
     l5 = r.get("l5")
     if l5:

@@ -408,6 +408,15 @@ class RAGConfig:
     #        否则子卡继承父类型，其 RDS 装载的 image_refs 在生成与渲染两端均不可达。
     # False（默认）→ 行为与历史逐字节一致。
     parent_child_as_stepcard: bool = False  # RAG_PARENT_CHILD_AS_STEPCARD
+    # ── 会话历史 <<IMG:N>> 标记清洗（#F-mm5）───────────────────
+    # True → (1) 入史前剥掉答案里的 <<IMG:N>> 标记（qa_session_log 的 answer_text
+    #        不受影响，日志保真）；(2) LLM 回放历史时对 assistant 轮再洗一遍（覆盖
+    #        存量已污染历史与客户端显式传入的 req.history）；(3) 图文 prompt 追加
+    #        「不要模仿历史标记」规则。堵 follow-up 噪声图的机制性来源：历史里的
+    #        <<IMG:N>> 会诱导 LLM 模仿，而 N 按当前轮 image_map 解析，界内即穿透
+    #        全部渲染防线附上无关图（2026-06-10 已知症状的代码根源）。
+    # False（默认）→ 行为与历史逐字节一致。
+    history_strip_img_markers: bool = False  # RAG_HISTORY_STRIP_IMG_MARKERS
 
 
 @dataclass
@@ -771,6 +780,7 @@ def load_config() -> PipelineConfig:
             img_marker_lenient=_env_bool("IMG_MARKER_LENIENT", False),          # RAG_IMG_MARKER_LENIENT
             expand_image_keep=_env_int("EXPAND_IMAGE_KEEP", 0),                 # RAG_EXPAND_IMAGE_KEEP
             parent_child_as_stepcard=_env_bool("PARENT_CHILD_AS_STEPCARD", False),  # RAG_PARENT_CHILD_AS_STEPCARD
+            history_strip_img_markers=_env_bool("HISTORY_STRIP_IMG_MARKERS", False),  # RAG_HISTORY_STRIP_IMG_MARKERS
         ),
     )
 

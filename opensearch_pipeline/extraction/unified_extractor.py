@@ -118,6 +118,32 @@ def _vlm_cache_ns(is_public):
     return f"{ns}:{ver}" if ver else ns
 
 
+def _funnel_doc_title(task: dict) -> str:
+    """VLM funnel 的文档语境（#F-mm7，RAG_VLM_DOC_CONTEXT 默认 OFF）。
+
+    修死参：extraction task 构造从不设 doc_title 键 → funnel prompt 的【文档标题】
+    上下文分支从未生效，visual_summary/image_category 缺文档语境，拉低内容匹配绑定
+    （xlsx P0 IDF-bigram / 图N bigram）与 VL rerank 依赖的图注质量。工厂文件名
+    （如「注塑机安全操作规程.docx」）就是最强的免费文档语境。
+
+    OFF（默认）→ 沿用 task.get('doc_title','') = 恒空串，行为逐字节一致。
+    ⚠️ 开启前置（eval-first，缺一不放行）：
+      1. 同步设新 RAG_VLM_CACHE_VERSION（VLM 输入变化 → 旧缓存 caption 必须干净失效）；
+      2. 跑 L4-ingestion 全格式闸：xlsx ≥0.8917 / docx ≥0.95 硬线（caption 变化会
+         移动内容匹配层的绑定结果——xlsx 0.8917 是按现状 caption 调优的）；
+      3. 已知偏置（显式接受）：VLM 缓存 key=(md5, ns) 不含文档语境，同 MD5 图片跨
+         文档复用时 caption 由先处理的文档标题决定（first-wins），换 version 清不掉
+         ——prompt 侧已加「不要照抄标题」指令压低串染面。
+    """
+    explicit = task.get("doc_title") or ""
+    if os.environ.get("RAG_VLM_DOC_CONTEXT", "").strip().lower() not in ("1", "true", "yes"):
+        return explicit   # OFF：与历史 task.get("doc_title", "") 完全一致（恒 ""）
+    if explicit:
+        return explicit
+    fn = os.path.basename(task.get("filename") or "")
+    return os.path.splitext(fn)[0]
+
+
 def _xlsx_cell_to_str(c) -> str:
     """xlsx 单元格值 → 字符串。data_only=True 下日期单元格是 datetime/date 对象，裸 str() 会产出
     '2024-01-15 00:00:00' 这类噪声 → 渲染为干净日期。
@@ -1437,7 +1463,7 @@ class UnifiedExtractor:
             """单张图片的 Funnel 2+3 处理（线程安全）。"""
             return processor.process_image(
                 img_asset.local_path, doc_id, is_public=is_public,
-                doc_title=task.get("doc_title", ""),
+                doc_title=_funnel_doc_title(task),
             )
 
         # 合并结果：缓存命中 + 新处理
@@ -1584,7 +1610,7 @@ class UnifiedExtractor:
         processor = ImageFunnelProcessor(simulate=self.simulate)
         funnel_res = processor.process_image(
             local_path, task["doc_id"], is_public=is_public,
-            doc_title=task.get("doc_title", ""),
+            doc_title=_funnel_doc_title(task),
         )
         
         status = funnel_res["status"]

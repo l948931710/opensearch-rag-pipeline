@@ -286,7 +286,15 @@ class ImageFunnelProcessor:
             if doc_title or ocr_text:
                 context_parts = []
                 if doc_title:
-                    context_parts.append(f"文档标题：{doc_title[:100]}")
+                    # #F-mm7 防串染：VLM 缓存按图片 MD5 跨文档复用（key 不含文档语境），
+                    # caption 照抄标题会把先处理文档的标题钉进同 MD5 图片的所有复用点
+                    # （first-wins）。标题只作理解背景，描述必须只写画面可见内容。
+                    # doc_title 今日恒空（RAG_VLM_DOC_CONTEXT 默认 OFF）→ 本分支不生效，
+                    # prompt 与历史逐字节一致。
+                    context_parts.append(
+                        f"文档标题：{doc_title[:100]}"
+                        "（仅作理解背景，不要在图片描述中照抄文档标题本身，只描述画面可见内容）"
+                    )
                 if ocr_text:
                     context_parts.append(f"图片OCR文本：{ocr_text[:300]}")
                 context_block = "\n【参考信息】\n" + "\n".join(context_parts) + "\n"

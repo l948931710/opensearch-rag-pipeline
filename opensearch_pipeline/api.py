@@ -52,6 +52,7 @@ from opensearch_pipeline.answer_flow import (
     DEFAULT_TEMPERATURE,
     NO_RESULT_MESSAGE,
     build_qa_log_kwargs,
+    history_answer_text,
     is_refusal_answer,
     should_append_history,
 )
@@ -674,9 +675,11 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
     # 都没有下游用途，且入史会诱导后续轮模仿 → 在一切消费之前清理。
     result["answer"] = strip_doc_citations(result["answer"])
 
-    # 4. 更新会话历史（统一策略：仅非空 SUCCESS 回答入史）
+    # 4. 更新会话历史（统一策略：仅非空 SUCCESS 回答入史；#F-mm5 入史文本经
+    #    history_answer_text —— flag ON 时剥 <<IMG:N>> 防 follow-up 标记模仿。
+    #    只包裹实参：result["answer"] 保持原文，下方 blocks 构建依赖原始标记）
     if should_append_history(result["answer"], "SUCCESS"):
-        _append_to_history(session_id, req.question, result["answer"])
+        _append_to_history(session_id, req.question, history_answer_text(result["answer"]))
 
     t_llm = time.time()
     llm_latency_ms = int((t_llm - t_retrieval) * 1000)
@@ -693,7 +696,8 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
 
     # 响应契约：blocks 必须先用【原始 answer】构建（穿插位置依赖占位符），
     # 之后才清理客户端可见文本 —— blocks 为空时小程序把 answer 当纯文本渲染，
-    # 残留 <<IMG:N>> 会原样打给用户。qa_session_log / 会话历史仍存原始 answer（日志保真）。
+    # 残留 <<IMG:N>> 会原样打给用户。qa_session_log 仍存原始 answer（日志保真）；
+    # 会话历史默认同原文，RAG_HISTORY_STRIP_IMG_MARKERS 开启时入史前剥标记（#F-mm5）。
     answer_out = strip_image_markers(result["answer"])
     resp_no_result = is_refusal_answer(answer_out)   # 拒答形态（可伴随弱相关来源）
     resp_guard = is_low_confidence_band(chunks)      # 不依赖 RAG_LOW_CONFIDENCE_GUARD 开关
@@ -879,8 +883,9 @@ def ask_stream(req: AskRequest, request: Request,
             # 保证流式回答可被反馈/分析（落库函数自身吞掉异常，绝不影响回复）
             full_answer = strip_doc_citations("".join(collected_answer))
             # 统一策略：仅非空 SUCCESS 回答入史 —— 出错前的半截回答不再污染后续轮次上下文
+            # （#F-mm5 入史文本经 history_answer_text；blocks 已在上方用原文构建完毕）
             if should_append_history(full_answer, answer_status):
-                _append_to_history(session_id, req.question, full_answer)
+                _append_to_history(session_id, req.question, history_answer_text(full_answer))
             # 拒答型标 REFUSAL（入史判定在上面、用原状态 —— 历史策略不变）；深思加 model 后缀
             if answer_status == "SUCCESS" and is_refusal_answer(full_answer):
                 answer_status = "REFUSAL"

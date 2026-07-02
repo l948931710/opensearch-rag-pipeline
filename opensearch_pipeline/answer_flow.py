@@ -68,6 +68,32 @@ def should_append_history(answer_text: Optional[str], answer_status: str) -> boo
     return bool(answer_text) and answer_status == "SUCCESS"
 
 
+def history_answer_text(answer_text: str) -> str:
+    """统一入史文本策略（#F-mm5, RAG_HISTORY_STRIP_IMG_MARKERS 默认 OFF）。
+
+    ON 时入史前剥掉 <<IMG:N>> 图片标记：历史里的标记会诱导 follow-up 轮 LLM 模仿，
+    而 N 按【当前轮】image_map 解析——旧轮的 N 恰落在新轮任一带图 chunk 上即穿透
+    referenced-only 的全部防线，附上无关噪声图（与 strip_doc_citations 防「文档N」
+    编号模仿是同一根因的同款处理）。四个入史调用点（/api/ask、/api/ask/stream、
+    钉钉流式/非流式）统一过本函数；qa_session_log 的 answer_text **不经此函数**
+    （日志保真/溯源用原文）。回放侧兜底在 llm_generator._build_messages（覆盖存量
+    已污染历史与客户端显式 req.history）。
+
+    ⚠️ 调用方约束：只包裹入史实参，绝不提前改写 result["answer"] —— content_blocks
+    构建依赖原始标记（/api/ask 的 blocks 在入史之后才构建）。
+    """
+    if not answer_text:
+        return answer_text
+    try:
+        from opensearch_pipeline.config import get_config
+        if not get_config().rag.history_strip_img_markers:
+            return answer_text
+        from opensearch_pipeline.content_blocks_builder import strip_image_markers
+        return strip_image_markers(answer_text)
+    except Exception:
+        return answer_text   # fail-open：清洗失败不阻塞入史
+
+
 def build_qa_log_kwargs(
     *,
     session_id: str,
