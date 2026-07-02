@@ -1,117 +1,105 @@
-# OpenSearch RAG Pipeline
+# opensearch-rag-pipeline
 
-企业级知识库文档处理管线：文件提取 → 分类脱敏 → 切分 → OpenSearch 索引。
+浙江富岭塑胶的**阿里云原生企业 RAG 知识库**：把内部文档（SOP/作业指导书、U8+ ERP 手册、行政
+制度、FAQ）变成员工自助问答服务——钉钉机器人 + 钉钉小程序 + PC 网页控制台三端提问，后端从
+富岭自己的文档里检索作答，带**部门级权限过滤**与**图文混排**（答案内嵌截图）。
 
-## 架构
+> 项目名带 "opensearch"，但检索实际跑在**阿里 HA3 向量引擎**（"OpenSearch 向量检索版"，SDK
+> `alibabacloud_ha3engine_vector`），非 Elastic/AWS OpenSearch；标准 OpenSearch 仅作本地开发
+> 回退。模型全家桶 = DashScope/百炼（Qwen LLM · text-embedding-v4 · Qwen-VL OCR/VLM）。
+> 开发者向的权威文档是 **[CLAUDE.md](CLAUDE.md)**（架构、不变量、gotchas），本 README 是导览。
+
+## 系统全景
+
+| 层 | 跑在哪 | 入口 | 干什么 |
+|---|---|---|---|
+| **摄取**（批） | DataWorks 每日调度 | `dataworks_orchestrator.py --stage {1,2,3}` | OSS raw/ → 提取(+OCR/VLM 图片漏斗) → 分类/PII 脱敏 → 切分(step 卡片) → embedding → 推 HA3 |
+| **服务**（在线） | SAE 单实例 | `api.py`(FastAPI :8000) + `dingtalk_bot.py`(Stream) | 3 路混合检索 → 邻居拼接/步骤扩展 → Qwen 生成 → 图文卡片；会话/反馈/限流/QA 落库 |
+| **前端** | 钉钉 + 浏览器 | 小程序 `fuling-rag-miniapp/` · 控制台 `console-app/`(Vue3+Vite) | 问答、来源溯源、知识库管理（上传/审批/授权/看板/知识贡献） |
+| **评测** | 本地 | `eval_harness/` + `make release-gate` | 251 题金集端到端评测、L4/L6 质量层、发布门 |
+
+## 摄取管线（4 DAG）
 
 ```
-raw/ → DAG 1 → canonical/ → DAG 2 → rag-ready/ + chunk_meta → DAG 3 → OpenSearch
+raw/ ─DAG1→ canonical/ ─DAG2→ rag-ready/ + chunk_meta ─DAG3→ HA3 索引
+                                                        └DAG4→ 检索评测（未接入生产）
 ```
 
-| DAG | 名称 | 节点数 | 职责 |
-|-----|------|--------|------|
-| DAG 1 | raw_to_canonical | 4 | 统一提取（PDF/DOCX/TXT/OCR） |
-| DAG 2 | canonical_to_safe_chunk | 7 | 分类 → 脱敏 → 发布 → 切分 → 持久化 (write_chunk_meta) |
-| DAG 3 | chunk_to_opensearch | 6 | 抢占锁定 (acquire_lock) → Embedding → Bulk Payload → OpenSearch 写入 → 旧版停用 (deactivate_old) |
-| DAG 4 | retrieval_eval | 2 | 检索评测（Phase 3） |
+**⚠️ 关键安全不变量**：新 chunk 必须先落 RDS **且**成功索引，**之后**才停用旧版本
+（`node_deactivate_old_chunks`）。顺序反了 = 中途任何失败都会让文档从搜索里消失。
+**严禁重排 DAG3 节点或把 deactivate 提前。**
 
-### 跨 DAG 安全顺序
+## 检索与生成（服务侧）
 
-```
-DAG 2: classify → detect → redact → publish → chunk → validate → write_chunk_meta
-                                                                      │
-                                                                 (必须先落盘)
-                                                                      ▼
-DAG 3: acquire_index_lock → generate_embeddings → build_opensearch_payload → push_to_opensearch → update_index_status → deactivate_old
-```
-
-> **关键不变量**：新 chunk 写入 RDS (`write_chunk_meta`) 并成功推送至 OpenSearch (`push_to_opensearch`) 必须在旧版本停用 (`deactivate_old`) 之前完成。
-> 如果反过来，中间任何环节失败都会导致文档从索引中"消失"。
+- **3 路混合检索**：Dense + Sparse（kNN 路）+ BM25（`chunk_text`），weighted 融合(knn 0.7/text 0.3)；
+  查询 embedding 必须走 DashScope **native** API（compat 模式会丢 sparse 向量、召回悄悄崩）。
+- 权限过滤在 **HA3 服务端**执行（部门值经白名单防注入）；跨部门授权走 `allowed_depts` 投影。
+- 检索后处理：封面页降权 → 邻居拼接（RDS ±1）→ step 卡片扩展 → 可选 learned rerank
+  （`RAG_RERANK_ENABLE`，默认 OFF，+10.5pp recall@1）。
+- 答案分档 高/中/低（阈值 7.7/5.8，**校准在 weighted 融合分上，换 RRF 即失效**）；图片经
+  `<<IMG:N>>`（图级 `<<IMG:N.M>>`）标记穿插进卡片。
 
 ## 快速开始
 
 ```bash
-# 1. 克隆
-cd ~/Downloads/opensearch-rag-pipeline
-
-# 2. 安装
-pip install -e ".[dev]"
-
-# 3. 运行模拟
-make sim          # normal 场景
-make sim-all      # 全部 4 个场景
-make graph        # 打印 DAG 依赖图
-
-# 4. 运行测试
-make test
+make install        # 基础依赖；make dev = +pytest/ruff；make prod = +生产 SDK
+make sim            # 模拟模式跑通整条管线（无需任何外部服务）
+make sim-all        # 4 场景：normal / sensitive / multi / version_update
+make api            # 本地起服务 API（:8000）
+make test           # 全量测试（pytest-xdist 并行；make test-serial 串行排查）
+make lint           # ruff（line-length 100 / py39）
 ```
 
-## 目录结构
+**模拟模式**（`RAG_SIMULATE=true`，默认）：embedding 变哈希向量、OSS 读本地文件、HA3 用
+mock 客户端。**改管线必须先在模拟模式验证。** 细粒度开关：`RAG_SIMULATE_DB/OPENSEARCH/OSS/API`。
+
+## 环境与配置
+
+配置中心在 `config.py`（`RAG_` 前缀环境变量 + `RAG_ENV` 选 overlay）。六档环境
+（SIM / LOCAL-DEV / LOCAL-EVAL / STAGING / PROD-RO / PROD）矩阵见
+[docs/environment_design.md](docs/environment_design.md)。三道生产防线：
+
+1. **生产安全闸**：production/staging 若无 DashScope key 或解析到 Gemini → 启动即硬报错；
+2. **环境↔目标交叉校验**：开发标签指向生产 RDS/HA3 指纹 → 硬报错（需显式 ack）；
+3. **运行时破坏性写闸**（`env_guard.py`）+ 脚本仅经 `prod_access.py` 触达生产
+   （只读默认；RW 需当日 `PROD-RW:<date>` 令牌）。
+
+## 目录导览
 
 ```
-opensearch-rag-pipeline/
-├── opensearch_pipeline/
-│   ├── config.py              # 配置中心（env vars）
-│   ├── dag_engine.py          # DAG 引擎
-│   ├── dag_definitions.py     # 4 条 DAG 定义
-│   ├── pipeline_nodes.py      # 节点实现
-│   ├── chunker.py             # 文档切分器
-│   ├── run_simulation.py      # 模拟运行器
-│   └── extraction/            # 统一提取层
-│       ├── schema.py           # ExtractionResult / ExtractedBlock
-│       ├── unified_extractor.py # 策略分发器
-│       ├── pdf_extractor.py    # PDF 提取（PyPDF2）
-│       ├── docx_extractor.py   # DOCX 提取（python-docx + regex）
-│       ├── text_extractor.py   # TXT/MD 结构化解析
-│       └── ocr_client.py       # Qwen-VL OCR（按页）
-├── schema/
-│   └── 001_opensearch_pipeline.sql  # RDS 表结构
-├── tests/
-│   ├── test_extraction.py     # 提取层测试
-│   ├── test_chunker.py        # 切分器测试
-│   └── test_pipeline.py       # DAG 集成测试
-├── pyproject.toml
-├── Makefile
-├── .env.example
-└── .gitignore
+opensearch_pipeline/
+  dag_engine/definitions/pipeline_nodes   # 摄取：DAG 引擎 + 4 DAG + ~19 个 node_* 实现
+  dataworks_orchestrator.py               # 生产摄取 CLI（--stage/--bizdate，DataWorks 节点调用）
+  chunker.py                              # 切分器：text/faq/clause/step（step 卡片 + 图片绑定）
+  extraction/                             # 统一提取：pdf/docx/xlsx/text + OCR + VLM 图片漏斗
+  image_funnel_processor.py               # 3 级图片漏斗（启发式→OCR 密度→Qwen-VL 语义+安全）
+  api.py + routes/                        # FastAPI：热路径在 api.py，冷域拆 routes/（kb 控制台/授权/贡献）
+  retriever.py / reranker.py / llm_generator.py   # 检索 / 重排 / 生成
+  dingtalk_bot.py / dingtalk_card.py      # 钉钉机器人（Stream 模式）+ 图文卡片
+  session_store / qa_logger / feedback_handler / rate_limiter   # 会话 · QA 落库 · 反馈 · 四层防刷
+  db.py / clients.py / prod_access.py     # 连接池+守卫 / OSS·HA3 客户端 / 生产访问通道
+schema/          # RDS DDL 唯一权威（编号迁移 + schema_migrations 台账，见 schema/README.md）
+console-app/     # PC 网页控制台（Vue3+Vite；构建产物进 SAE 包的 webconsole/next-dist）
+fuling-rag-miniapp/   # 钉钉小程序（已发布）
+eval_harness/    # 端到端评测 + 报告；tests/（pytest，CI 阻塞门）
+dataworks_nodes/ # DataWorks 各 stage 节点脚本
+docs/            # 环境设计 / 架构审查 / 性能 backlog 等
 ```
 
-## 配置
+## 部署（两个包，勿混）
 
-复制 `.env.example` → `.env`，填入服务配置：
+| 包 | 用途 | 打法 |
+|---|---|---|
+| `opensearch_sae_rag.zip` | SAE 服务侧 | zip 根 = `requirements.txt`(必须) + `opensearch_pipeline/`(含 webconsole/next-dist，**打包前先 `cd console-app && npm run build`**) + `Dockerfile` + `pyproject.toml` + `.dockerignore`；无 pyc/.env/tests |
+| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装） |
 
-```bash
-cp .env.example .env
-```
+**铁律**：一律打到 `~/Downloads/dw_upload_<YYYYMMDD>[_<purpose>]/`（勿打 repo 根）；部署时
+**按 SIZE/SHA-256 认包，别按文件名**（每个日期目录里文件名都一样，选错目录 = 静默部署旧版）。
+SAE 启动命令在应用配置里（保持 `--workers 1`：会话/限流是进程内状态）。
 
-模拟模式（`RAG_SIMULATE=true`）不需要任何外部服务。
+## 更多
 
-## 模拟场景
-
-| 场景 | 命令 | 说明 |
-|------|------|------|
-| normal | `make sim` | 标准 SOP 文档，低风险 |
-| sensitive | `make sim-sensitive` | 含身份证/手机号，高风险隔离 |
-| multi | `--scenario multi` | 2 个文档并行处理 |
-| version_update | `make sim-version` | v1→v2 版本更新，旧 chunk 停用 |
-
-## RDS 表
-
-在 `schema/001_opensearch_pipeline.sql` 中定义：
-
-- **chunk_meta** — Chunk 管理（索引数据源）
-- **opensearch_bulk_job** — Bulk 索引任务跟踪
-- **document_sensitive_finding** — 敏感信息检测记录
-- **document_version 增量字段** — extraction/chunk/index 状态
-
-## 依赖
-
-| 包 | 用途 | 必需 |
-|----|------|------|
-| pypdf | PDF 文本提取 | 核心 |
-| python-docx | DOCX 段落/表格 | 核心 |
-| PyMuPDF | PDF→图片（OCR 前处理） | 可选 |
-| opensearch-py | OpenSearch 写入 | 生产 |
-| pymysql | RDS 连接 | 生产 |
-| oss2 | 阿里云 OSS | 生产 |
-| dashscope | Embedding / OCR / LLM | 生产 |
+- **[CLAUDE.md](CLAUDE.md)** — 架构细节、载荷契约（image_refs）、chunk 路由 gotchas、约定
+- [docs/perf_optimization_backlog.md](docs/perf_optimization_backlog.md) — 97 项性能优化（已全量落地）
+- [schema/README.md](schema/README.md) — 表→库矩阵、迁移编号规则、台账流程
+- `work_report.md` 偏管理层口径；客观记录以 git log + tests/eval 报告为准
