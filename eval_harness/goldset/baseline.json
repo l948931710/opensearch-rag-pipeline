@@ -75,11 +75,17 @@
   "l4ing.jaccard.xlsx": 0.891665,
   "l4ing.jaccard.docx": 0.9898,
   "l4ing.img_dup_p95": 1.0,
-  "l4srv.marker_validity": 1.0,
-  "l4srv.dangling_ref_rate": 0.0,
-  "l4srv.orphan_rate": 0.7368421052631579,
+  "l4srv.marker_validity": 0.6637168141592921,
+  "l4srv.dangling_ref_rate": 0.02631578947368421,
+  "l4srv.orphan_rate": 0.611764705882353,
   "judge.faithfulness": 4.96,
   "judge.correctness": 4.793,
-  "judge.completeness": 4.672
+  "judge.completeness": 4.672,
+  "l4srv.answer_image_rate": 0.75
+ },
+ "l4_refrozen_at": "20260701_222146",
+ "l4_refrozen_run": "eval_l4_lock",
+ "notes": {
+  "l4_refreeze_2026-07-01": "l4srv.* 重测于 referenced-only 口径 + cosurface=False 主臂（#F-mm1）；answer_image_rate 新增（ADVISORY）；l1/l3/judge 沿用 5268a7e/20260619 冻结值（regime 同）。"
  }
 }
