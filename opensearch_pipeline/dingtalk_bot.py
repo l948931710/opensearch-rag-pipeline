@@ -50,6 +50,7 @@ from opensearch_pipeline.answer_flow import (
     DEFAULT_TEMPERATURE,
     NO_RESULT_MESSAGE,
     build_qa_log_kwargs,
+    history_answer_text,
     is_refusal_answer,
     should_append_history,
 )
@@ -492,8 +493,9 @@ def _stream_answer_to_card(
     # 代价：meta 页脚不带"耗时"（保持 create 时的"模型: X"），换取不丢正文——值得。
 
     # 写历史（仅成功且有内容时）+ 落库（与非流式路径一致的反馈语义）
+    # （#F-mm5 入史文本经 history_answer_text，防 follow-up 标记模仿）
     if should_append_history(full_answer, answer_status):
-        append_to_history(session_key, question, full_answer)
+        append_to_history(session_key, question, history_answer_text(full_answer))
 
     # 拒答型标 REFUSAL（与 NO_RESULT=检索空分桶）。必须在入史判定【之后】翻转 ——
     # 拒答照旧入史，只改落库状态，历史策略不变。
@@ -616,9 +618,10 @@ def _process_rag_query(
         llm_latency_ms = int((t_llm - t_retrieval) * 1000)
         latency_ms = int((t_llm - t0) * 1000)
 
-        # 3. 追加到会话历史（统一策略：仅非空 SUCCESS 回答入史）
+        # 3. 追加到会话历史（统一策略：仅非空 SUCCESS 回答入史；#F-mm5 入史文本
+        #    经 history_answer_text —— 只包裹实参，下一行 blocks 构建依赖原始标记）
         if should_append_history(result["answer"], "SUCCESS"):
-            append_to_history(session_key, question, result["answer"])
+            append_to_history(session_key, question, history_answer_text(result["answer"]))
 
         # 4. 构建 content_blocks（图文穿插）；纯文本模式下不展示图片
         from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json

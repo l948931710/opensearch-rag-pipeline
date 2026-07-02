@@ -57,6 +57,12 @@ _SYSTEM_PROMPT_BASE = """你是浙江富岭塑胶有限公司的智能知识库�
 _IMG_INTERLEAVE_RULE = """
 10. 如果参考文档中包含图片（标记为 [📷 图片]），请阅读图片内容描述，在回答中与该图片内容相关的段落后插入 <<IMG:N>> 标记（N 为文档编号）。对操作步骤类回答：若步骤正文来自带 [📷 图片] 标记的文档，默认应在该步骤后插入对应 <<IMG:N>>（界面截图/实物图对执行者有直接帮助），仅当图片与该步骤内容明显无关时才省略。严禁插入与回答内容无关的其他文档的图片标记。不要重复描述图片内容本身，用户将直接看到图片"""
 
+# 历史标记反模仿规则（规则 11，#F-mm5）：仅在 RAG_HISTORY_STRIP_IMG_MARKERS 开启
+# 且本轮带对话历史、且使用图文 prompt 时由 _build_messages 条件追加 —— 不改模块常量，
+# 保证 flag OFF 时 prompt 逐字节不变（A/B 对照干净，遵守 prompt-edit 纪律）。
+_IMG_HISTORY_ANTIMIMIC_RULE = """
+11. 不要模仿历史回答中出现过的 <<IMG:N>> 图片标记；是否插图与编号 N 只依据【本轮】参考文档中的 [📷 图片] 标记决定，历史回答里的图片编号对本轮无效"""
+
 # 默认（图文穿插）system prompt
 # 2026-06-10：规则 4 增加「**第N步**」步骤编号 house style（小程序/原型步骤样式
 # 与机器人格式统一）——此后与历史 prompt 不再逐字节一致。
@@ -387,6 +393,25 @@ def _build_messages(
         system_prompt: 自定义 system prompt
     """
     _system = system_prompt or DEFAULT_SYSTEM_PROMPT
+
+    # ── #F-mm5 历史标记防模仿（RAG_HISTORY_STRIP_IMG_MARKERS，默认 OFF）────
+    # 回放侧是执法主体：写侧清洗（answer_flow.history_answer_text）覆盖不到存量
+    # 已污染历史与客户端显式传入的 req.history，这里对 assistant 轮再洗一遍兜底；
+    # 并对带历史的图文 prompt 追加规则 11（反模仿指令）。OFF 时逐字节不变。
+    _strip_hist = False
+    try:
+        _strip_hist = bool(history) and get_config().rag.history_strip_img_markers
+    except Exception:
+        pass
+    if _strip_hist:
+        from opensearch_pipeline.content_blocks_builder import strip_image_markers
+        history = [
+            {**m, "content": strip_image_markers(m.get("content", ""))}
+            if m.get("role") == "assistant" else m
+            for m in history
+        ]
+        if _IMG_INTERLEAVE_RULE in _system and _IMG_HISTORY_ANTIMIMIC_RULE not in _system:
+            _system = _system + _IMG_HISTORY_ANTIMIMIC_RULE
 
     messages = [
         {"role": "system", "content": _system},

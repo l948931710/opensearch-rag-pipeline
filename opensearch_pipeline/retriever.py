@@ -896,6 +896,10 @@ def _normalize_image_refs(image_refs_json) -> List[Dict[str, Any]]:
                 raw = []
         elif isinstance(image_refs_json, list):
             raw = image_refs_json
+    if not isinstance(raw, list):
+        # JSON 列可能存了非数组值（'null'/'{}'/数字）：json.loads 成功但结果不可
+        # enumerate → 此前会炸掉整个调用方（expand 整体回退）。归一为空列表。
+        raw = []
     out: List[Dict[str, Any]] = []
     for idx, ref in enumerate(raw):
         if not isinstance(ref, dict):
@@ -916,6 +920,16 @@ def _normalize_image_refs(image_refs_json) -> List[Dict[str, Any]]:
             "anchor_row": ref.get("anchor_row"),
         })
     return out
+
+
+def _row_has_images(row: Dict[str, Any]) -> bool:
+    """RDS 兄弟行是否携带可渲染图片（#F-mm4 带图保底的判定谓词）。
+
+    ⚠️ 不能对 image_refs_json 做裸 truthiness 判断：'[]' / 'null' 都是真值字符串。
+    统一走 _normalize_image_refs 解析，并要求至少一个 ref 带 oss_key（可渲染）。
+    """
+    refs = _normalize_image_refs(row.get("image_refs_json"))
+    return any(r.get("oss_key") for r in refs)
 
 
 def expand_step_context(
@@ -953,6 +967,15 @@ def expand_step_context(
 
     intent = _classify_step_query_intent(query)
     logger.info("Step Card 意图分类: query=%r → intent=%s", query[:60], intent)
+
+    # #F-mm4 图感知双修（两个独立 flag，默认关闭 = 行为与历史逐字节一致）：
+    #   expand_image_keep（RAG_EXPAND_IMAGE_KEEP，K>0 生效）— 意图筛选后入选兄弟
+    #   全部无图而家族里有带图 step_card 时，按步号最近补入最多 K 张带图兄弟；
+    #   parent_child_as_stepcard（RAG_PARENT_CHILD_AS_STEPCARD）— parent 展开子卡
+    #   chunk_type 归位 step_card，使其 image_refs 在生成/渲染两端可达。
+    _cfg_rag = get_config().rag
+    _img_keep = _cfg_rag.expand_image_keep
+    _child_as_stepcard = _cfg_rag.parent_child_as_stepcard
 
     # 判断是否存在需要扩展的 chunk 类型，避免无意义的 RDS 连接
     # visual_knowledge：image_refs 仅落库 RDS（HA3 只回 source_image 首图），需按 chunk_id 补全多图。
@@ -1100,6 +1123,32 @@ def expand_step_context(
                     if hit_self is not None:
                         selected = [hit_self] + selected
 
+                # ── 带图兄弟保底（RAG_EXPAND_IMAGE_KEEP，#F-mm4a）──────────
+                # 意图窗/max_steps 裁剪零图感知：宽泛问题命中概述卡（step_no 大批
+                # 平局）时真正带截图的操作步最易被切掉 → 答案恒无图。K>0 且入选
+                # 兄弟全部无图而家族有带图行时，按步号最近补入最多 K 张。
+                # locate_field 的设计语义是「仅保留命中步、不扩展」，不参与保底。
+                # 判定只读预取行的 image_refs_json（零额外 RDS 查询）。
+                img_keep_ids: set = set()
+                if _img_keep > 0 and intent != "locate_field" and selected:
+                    if not any(_row_has_images(s) for s in selected):
+                        _sel_ids = {s["chunk_id"] for s in selected}
+                        img_sibs = [
+                            s for s in siblings
+                            if s["chunk_id"] not in _sel_ids and _row_has_images(s)
+                        ]
+                        if img_sibs:
+                            # 步号最近优先；平局按 chunk_id（零填充序号=文档序）保证确定性
+                            img_sibs.sort(key=lambda s: (
+                                abs((s.get("step_no") or 0) - hit_step_no), s["chunk_id"]))
+                            extra_sibs = img_sibs[:_img_keep]
+                            img_keep_ids = {s["chunk_id"] for s in extra_sibs}
+                            selected = selected + extra_sibs
+                            logger.info(
+                                "Step 扩展带图保底: parent=%s 补入 %d 张带图兄弟 (K=%d, hit_step=%s)",
+                                parent_id, len(extra_sibs), _img_keep, hit_step_no,
+                            )
+
                 # ── 超大家族防洪（RAG_STEP_EXPAND_FAMILY_CAP）──────────────
                 # 意图筛选按 step_no 数值区间：正常 SOP（step_no 基本互异）选出 2-3 个；
                 # 但超大手册的 step_no 大规模平局（如 41 个小节卡全是 step_no=0）会让
@@ -1122,12 +1171,44 @@ def expand_step_context(
                             s["chunk_id"] for s in selected[max(0, hi - 2):hi + 3])
                     else:
                         keep_ids.update(s["chunk_id"] for s in selected[:_cap])
+                    # #F-mm4a：带图保底行进保留集（否则收缩规则会立即吐掉刚补的图）
+                    keep_ids.update(img_keep_ids)
+                    # #F-mm4a：cap 分支自身的图感知——step_no 大规模平局时区间退化为
+                    # 全家族（selected 本就含带图行，前面的保底不触发），而「命中 +
+                    # 同 section + 文档序 ±2」的收缩规则零图感知，会把带图操作步全部
+                    # 吐掉（宽泛问题恒零图的真实形态）。保留集无图而 selected 有时，
+                    # 按步号最近补最多 K 张进保留集。
+                    if _img_keep > 0 and intent != "locate_field":
+                        _kept_rows = [s for s in selected if s["chunk_id"] in keep_ids]
+                        if not any(_row_has_images(s) for s in _kept_rows):
+                            _img_rows = [
+                                s for s in selected
+                                if s["chunk_id"] not in keep_ids and _row_has_images(s)
+                            ]
+                            _img_rows.sort(key=lambda s: (
+                                abs((s.get("step_no") or 0) - hit_step_no), s["chunk_id"]))
+                            for row in _img_rows[:_img_keep]:
+                                keep_ids.add(row["chunk_id"])
+                                img_keep_ids.add(row["chunk_id"])
                     trimmed = [s for s in selected if s["chunk_id"] in keep_ids]
                     logger.info(
                         "Step 扩展防洪: parent=%s 家族筛选 %d → %d (cap=%d, hit_section=%r)",
                         parent_id, len(selected), len(trimmed), _cap, hit_section,
                     )
                     selected = trimmed[:_cap]
+                    # #F-mm4a：带图保底行必须在末端 [:_cap] 切片内存活——被挤出时
+                    # 从尾部向前替换「非命中、非带图」的行（保底行数 ≤ K，替换有界）
+                    if img_keep_ids:
+                        _in_slice = {s["chunk_id"] for s in selected}
+                        _evicted = [s for s in trimmed
+                                    if s["chunk_id"] in img_keep_ids
+                                    and s["chunk_id"] not in _in_slice]
+                        for row in _evicted:
+                            for i in range(len(selected) - 1, -1, -1):
+                                sid = selected[i]["chunk_id"]
+                                if sid != chunk_id and sid not in img_keep_ids:
+                                    selected[i] = row
+                                    break
 
                 for sib in selected:
                     is_hit = (sib["chunk_id"] == chunk_id)
@@ -1208,6 +1289,13 @@ def expand_step_context(
                         "expanded_from": parent_chunk_id,
                         "expansion_reason": "parent_children",
                     })
+                    if _child_as_stepcard:
+                        # #F-mm4b：子卡归位 step_card（父卡本体保持 procedure_parent）。
+                        # 否则子卡继承父类型：_format_context 只加 [流程概览] 不注
+                        # <<IMG:N>>、content_blocks_builder 无该类型提图分支 —— 上面
+                        # 从 RDS 装载的 image_refs 在生成/渲染两端 100% 不可达。
+                        # 归位后自动进入现有 step_card 全链路，零下游代码改动。
+                        expanded_chunk["chunk_type"] = "step_card"
                     expanded_all.append(expanded_chunk)
 
             # ── visual_knowledge：按 chunk_id 从 RDS 补全全部 image_refs（多图幻灯片）──
