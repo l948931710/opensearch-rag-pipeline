@@ -121,6 +121,93 @@ CHUNK_VERDICT_ITEM_SCHEMA = {
 
 _CHUNK_DIMS = ["self_containedness", "coherence", "type_fidelity", "truncation", "overall"]
 
+# ── L4-serving 图文贴题率 rubric（#F-mm13a，2026-07-01）──────────────────
+# 确定性指标（marker_validity/dangling/answer_image_rate）只能判「标记合法/有没有
+# 图」，判不了「出的图贴不贴题」——这是唯一的语义通道。评的是 caption 贴题率而非
+# 看图（VLM 看图评审是更大工程，本 rubric 明示局限）；advisory 起步，先锁分布。
+MM_RUBRIC = """You are an impartial evaluator of IMAGE-TEXT quality for answers from an
+enterprise Chinese knowledge-base assistant (manufacturing SOPs / ERP manuals). Per item you
+get: the user QUERY, EXPECTED_IMAGES (short human descriptions of images a good answer should
+show; may be empty = no specific expectation), SHOWN_IMAGE_CAPTIONS (captions of the images
+the answer's card actually offered, keyed by retrieved-document index; may be empty = no
+images), N_AVAILABLE (how many retrieved docs carried images), STRATEGY, and the ANSWER text.
+You judge ONLY from these captions/descriptions — you cannot see pixels (caption-based proxy;
+known limitation). Score integers:
+
+- image_relevance (1-5): are the shown images relevant to the query/answer content?
+  5 = every shown image clearly supports the answer; 3 = mixed; 1 = mostly unrelated noise.
+  If NO images were shown: set 3 when EXPECTED_IMAGES is empty (nothing was promised);
+  set 1-2 when EXPECTED_IMAGES is non-empty (figures were expected but none shown).
+- image_expected_match (1-5): do the shown images cover EXPECTED_IMAGES? 5 = all expected
+  content covered; 3 = partial; 1 = none. If EXPECTED_IMAGES is empty set 3 (neutral).
+- noise_image (boolean): is at least one shown image clearly unrelated to the query
+  (e.g. a screenshot from a different system/manual than the one asked about)?
+- rationale: one sentence (Chinese ok).
+Return strictly the structured object."""
+
+MM_VERDICT_ITEM_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["qid", "image_relevance", "image_expected_match", "noise_image", "rationale"],
+    "properties": {
+        "qid": {"type": "string"},
+        "image_relevance": {"type": "integer", "minimum": 1, "maximum": 5},
+        "image_expected_match": {"type": "integer", "minimum": 1, "maximum": 5},
+        "noise_image": {"type": "boolean"},
+        "rationale": {"type": "string"},
+    },
+}
+
+_MM_DIMS = ["image_relevance", "image_expected_match"]
+
+
+def merge_mm_panel(bundle: List[Dict], panels: List[Dict]) -> Dict:
+    """Merge N mm-judge panels（仿 merge_chunk_panel 先例，独立 schema 独立聚合）。
+
+    aggregate.image_relevance.mean 是 advisory 闸/baseline（judge.mm.image_relevance）
+    的读数来源；noise_image_rate = 任一评委判噪声图的 case 占比（多数决更严——取
+    any，宁可高估噪声供人工抽检）。
+    """
+    by_qid: Dict[str, List[Dict]] = {}
+    for p in panels:
+        for v in p.get("verdicts", []):
+            if v.get("qid"):
+                by_qid.setdefault(v["qid"], []).append(v)
+
+    per_query = []
+    disagreements = []
+    for qid, vs in by_qid.items():
+        row = {"qid": qid, "n_judges": len(vs)}
+        for d in _MM_DIMS:
+            vals = [v[d] for v in vs if d in v]
+            row[d] = round(mean(vals), 3) if vals else None
+        ir = [v["image_relevance"] for v in vs if "image_relevance" in v]
+        if len(ir) > 1:
+            m = sum(ir) / len(ir)
+            sd = (sum((x - m) ** 2 for x in ir) / len(ir)) ** 0.5
+            row["image_relevance_stdev"] = round(sd, 3)
+            disagreements.append(sd)
+        row["noise_any"] = any(v.get("noise_image") for v in vs)
+        row["rationales"] = [v.get("rationale", "")[:200] for v in vs]
+        per_query.append(row)
+
+    def _dim(rows, d):
+        ci = bootstrap_ci([r[d] for r in rows if r.get(d) is not None])
+        return {"mean": round(ci["mean"], 3) if ci["mean"] is not None else None,
+                "ci": [round(ci["lo"], 3), round(ci["hi"], 3)] if ci["lo"] is not None else None,
+                "n": ci["n"]}
+
+    aggregate = {
+        "n_judges": len(panels),
+        "judges": [p.get("judge") for p in panels],
+        "n": len(per_query),
+        **{d: _dim(per_query, d) for d in _MM_DIMS},
+        "noise_image_rate": round(
+            mean([1.0 if r["noise_any"] else 0.0 for r in per_query]), 3) if per_query else None,
+        "mean_relevance_interjudge_stdev": round(mean(disagreements), 3) if disagreements else None,
+    }
+    return {"aggregate": aggregate, "per_query": per_query}
+
 
 def merge_chunk_panel(bundle: List[Dict], panels: List[Dict]) -> Dict:
     """Merge N chunk-judge panels into per-dimension aggregates, kept SEPARATE by bucket.

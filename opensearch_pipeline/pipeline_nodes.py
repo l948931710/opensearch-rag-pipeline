@@ -4100,7 +4100,31 @@ def node_chunk_documents(ctx: dict):
             and xlsx_layout_type in ("procedure_image_guide", "product_spec_instruction")
         )
         _is_xlsx_doc = str(doc.get("file_ext", "")).lower() in ("xlsx", "xls")
-        if (not is_step_mode and not _imgs_bound_in_layout and m_mode != "slide") or _is_xlsx_doc:
+        # ── #F-mm12 死 refs 救活 v2（RAG_IMG_CHUNK_FALLBACK_V2，默认 OFF）────
+        # 修两个残余 serving-dead 缺口（xlsx/pptx/纯图文档已由 I5 修复）：
+        #   (1) step 误路由逃生门：_detect_step_patterns 判 step 但 chunker 0
+        #       step_groups 回退 text（步骤标记全在表格/OCR 里）时 is_step_mode 仍
+        #       True → 兜底分支被跳过，整篇图无任何 serving 载体。实证信号 =
+        #       本轮 chunks 无任何 step_card/procedure_parent（比猜路由可靠）。
+        #   (2) 非 step docx/pdf 的 ROUTE_TO_TEXT 截图：refs 落在 text/clause
+        #       chunk 上（HA3 不携带、RDS 恢复白名单不含）→ 图上传了 OSS 却永远
+        #       渲染不出（UI 截图 OCR>120 字恰最易走 TO_TEXT）。
+        # file_ext 显式限定 docx/doc/pdf（勿裸放行 csv/html 等）。被救活的 chunk
+        # 打 extra.fallback_source 便于观测与定向 purge。
+        # ⚠️ 护栏说明：img_dup_factor_p95 只统计 step_card，对本改动的双载体风险
+        # 失明——真护栏 = 审计脚本「同一 source_image 被 >1 个 serving 可达载体
+        # 携带」计数 + HA3 行数增幅监控。存量文档生效需 re-chunk：必须走
+        # RAG_MAINTENANCE_ROUTING 冻结 + 预编码期望增量的 manifest（本改动有意
+        # 增加 chunk 数/type_mix，不冻结会被 unfrozen-rechunk 守卫按设计拦下）。
+        _fallback_v2 = os.environ.get(
+            "RAG_IMG_CHUNK_FALLBACK_V2", "").lower() in ("1", "true", "yes")
+        _is_docx_pdf = str(doc.get("file_ext", "")).lower() in ("docx", "doc", "pdf")
+        _step_route_fell_back = (
+            _fallback_v2 and _is_docx_pdf and is_step_mode
+            and not any(c.chunk_type in ("step_card", "procedure_parent") for c in chunks)
+        )
+        if ((not is_step_mode and not _imgs_bound_in_layout and m_mode != "slide")
+                or _is_xlsx_doc or _step_route_fell_back):
             current_chunk_count = len(chunks)
             assets = doc.get("assets", [])
             if assets:
@@ -4131,10 +4155,15 @@ def node_chunk_documents(ctx: dict):
                             if _rfn:
                                 represented_fns.add(_rfn)
 
+                # #F-mm12(2)：v2 下非 step docx/pdf（以及逃生门文档）的 TO_TEXT 截图
+                # 也建 image chunk —— 它们的 refs 落在 text/clause chunk 上是死载体
+                _v2_to_text = (_fallback_v2 and _is_docx_pdf
+                               and (not is_step_mode or _step_route_fell_back))
                 for asset in assets:
                     _status = asset.get("status")
                     if _status == "ROUTE_TO_VECTOR" or (
-                            _status == "ROUTE_TO_TEXT" and (_is_image_doc or _is_xlsx_doc)):
+                            _status == "ROUTE_TO_TEXT"
+                            and (_is_image_doc or _is_xlsx_doc or _v2_to_text)):
                         filename = asset.get("filename", "")
                         # 已绑定/已携带的图片不再建独立 image chunk
                         if filename in represented_fns:
@@ -4188,6 +4217,15 @@ def node_chunk_documents(ctx: dict):
                                 "source_image": source_image_url,
                                 "visual_summary": visual_summary,
                                 "oss_key": asset.get("oss_key", ""),
+                                # #F-mm12：仅当该 chunk 没有 v2 就不会存在时打归因标记
+                                # （观测出图面变化 + 需要时按标记定向 purge）
+                                **({"fallback_source": (
+                                        "step_route_fallback_v2" if _step_route_fell_back
+                                        else "to_text_docx_pdf_v2")}
+                                   if (_step_route_fell_back
+                                       or (_status == "ROUTE_TO_TEXT" and _v2_to_text
+                                           and not _is_image_doc and not _is_xlsx_doc))
+                                   else {}),
                             }
                         )
                         chunks.append(img_chunk)

@@ -23,9 +23,26 @@ import re
 import subprocess
 import sys
 
-from .judge import CHUNK_RUBRIC, JUDGE_RUBRIC, VERDICT_ITEM_SCHEMA
+from .judge import (
+    CHUNK_RUBRIC,
+    CHUNK_VERDICT_ITEM_SCHEMA,
+    JUDGE_RUBRIC,
+    MM_RUBRIC,
+    MM_VERDICT_ITEM_SCHEMA,
+    VERDICT_ITEM_SCHEMA,
+)
 
 CLAUDE = os.environ.get("RAG_CLAUDE_BIN", "claude")
+
+# rubric → (rubric 文本, verdict schema, item id 键)。
+# #F-mm13：mm rubric 新增；顺带修存量坑——chunk rubric 此前也用 answer 的
+# VERDICT_ITEM_SCHEMA 列 keys（prompt 里 keys 行与 rubric 文本自相矛盾，全靠
+# rubric 文本压住），现在逐 rubric 用自己的 schema。
+_RUBRICS = {
+    "answer": (JUDGE_RUBRIC, VERDICT_ITEM_SCHEMA, "qid"),
+    "chunk": (CHUNK_RUBRIC, CHUNK_VERDICT_ITEM_SCHEMA, "item_id"),
+    "mm": (MM_RUBRIC, MM_VERDICT_ITEM_SCHEMA, "qid"),
+}
 
 
 def _extract_json_array(text: str):
@@ -41,8 +58,9 @@ def _extract_json_array(text: str):
     return json.loads(m.group(0))
 
 
-def _judge_batch(rubric: str, items: list, panel_idx: int, item_id_key: str) -> list:
-    keys = sorted(VERDICT_ITEM_SCHEMA["required"])
+def _judge_batch(rubric: str, items: list, panel_idx: int, item_id_key: str,
+                 schema: dict = VERDICT_ITEM_SCHEMA) -> list:
+    keys = sorted(schema["required"])
     prompt = (
         f"{rubric}\n\nYou are judge #{panel_idx + 1} of an INDEPENDENT panel; judge on your own merits.\n"
         f"Judge EVERY item below. Return ONLY a JSON array — one object per item — each with EXACTLY "
@@ -57,8 +75,7 @@ def _judge_batch(rubric: str, items: list, panel_idx: int, item_id_key: str) -> 
 
 def run(bundle_path: str, out_path: str, panels: int = 3, rubric: str = "answer", batch: int = 20):
     bundle = json.load(open(bundle_path, encoding="utf-8"))
-    rub = JUDGE_RUBRIC if rubric == "answer" else CHUNK_RUBRIC
-    id_key = "qid" if rubric == "answer" else "item_id"
+    rub, schema, id_key = _RUBRICS[rubric]
     out_panels = []
     for pi in range(panels):
         verdicts = []
@@ -70,7 +87,7 @@ def run(bundle_path: str, out_path: str, panels: int = 3, rubric: str = "answer"
             got = None
             for attempt in range(2):
                 try:
-                    got = _judge_batch(rub, chunk, pi, id_key)
+                    got = _judge_batch(rub, chunk, pi, id_key, schema=schema)
                     break
                 except (ValueError, RuntimeError) as e:  # JSONDecodeError ⊂ ValueError
                     print(f"[run_judge] panel {pi + 1} batch@{i} attempt {attempt + 1} "
@@ -92,7 +109,7 @@ def main(argv=None):
     ap.add_argument("--bundle", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--panels", type=int, default=3)
-    ap.add_argument("--rubric", choices=["answer", "chunk"], default="answer")
+    ap.add_argument("--rubric", choices=["answer", "chunk", "mm"], default="answer")
     ap.add_argument("--batch", type=int, default=20)
     a = ap.parse_args(argv)
     if not os.path.exists(a.bundle):

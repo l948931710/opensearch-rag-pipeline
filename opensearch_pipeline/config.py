@@ -417,6 +417,41 @@ class RAGConfig:
     #        全部渲染防线附上无关图（2026-06-10 已知症状的代码根源）。
     # False（默认）→ 行为与历史逐字节一致。
     history_strip_img_markers: bool = False  # RAG_HISTORY_STRIP_IMG_MARKERS
+    # ── context 截断的带图压缩条目补救（#F-mm11b）───────────────
+    # True → _format_context 截断丢弃尾部 chunk 时，对其中带图的以「header+正文
+    #        前 200 字」压缩条目补回最多 3 条，保住 [📷 图片] <<IMG:N>> 提示
+    #        （否则 step 扩展+邻居拼接常态性顶超 6000，尾部带图步骤卡的图在
+    #        referenced-only 下恒出不来）。压缩条目用显式 10% 溢出预算
+    #        （context 上限 = max_chars*1.1）。⚠️ 200 字残文与规则 9（数字须
+    #        出自原文）有张力 —— e2e judge 把关（correctness/faithfulness
+    #        无回退）后才开。半截标记防漏修复不挂此 flag（常开）。
+    # False（默认）→ 不补救；截断行为与历史一致（除半截标记修复）。
+    ctx_img_aware_trunc: bool = False  # RAG_CTX_IMG_AWARE_TRUNC
+    # ── 候选池带图探测（#F-mm10a，rerank ON 专用）──────────────
+    # True → rerank 之前对池内 step_card 批量探测 RDS image_refs_json 并附到
+    #        chunk 上：重排发生在 expand 之前，step_card 此时无 image_refs（RDS
+    #        未拉）且 HA3 行无 source_image → reranker._img_key 恒 None，
+    #        qwen3-vl-rerank 对带图 step_card 结构性失明。探测后 VL 路由经既有
+    #        any(_img_key) 通路自动激活，锁档的图池 VL 增益（0.825→0.850 R@1）
+    #        才真正作用于 step_card 主体。
+    #        ⚠️ rollout 注意：探测会把更多 query 从文本 qwen3-rerank 切到
+    #        qwen3-vl-rerank——两模型分数分布若不同，高/中/低标签标定
+    #        （rerank 0.9/0.8）会漂，开启前按 rerank_ab 口径复跑并 sanity check。
+    # False（默认）→ 行为与历史逐字节一致。
+    rerank_img_probe: bool = False  # RAG_RERANK_IMG_PROBE
+    # ── 近平局带图倾斜（#F-mm10b，rerank OFF 专用）─────────────
+    # True → rerank OFF 时 over-fetch 到 image_tiebreak_pool 个候选（over-fetch
+    #        绑死在本 flag 内，不做独立 env），探测带图后对融合分差 < eps 的相邻
+    #        近平局把带图载体前移，再显式截回 top_k——给 rerank OFF 的生产主路径
+    #        一个不付 rerank 延迟/成本的「带图 step_card 反挤出」手段（HA3 端
+    #        size=top_k 截断使排第 8 的带图卡任何后续机制都救不回）。
+    #        仅单查询路径生效（multi-query 轮转合并语义与相邻交换不兼容，缺口
+    #        已在 _multi_query_search docstring 声明）。eps 须金集标定后调整，
+    #        取错会用弱文本换图——这是全清单对文本质量扰动面最大的一条。
+    # False（默认）→ 行为与历史逐字节一致。
+    image_tiebreak: bool = False        # RAG_IMAGE_TIEBREAK
+    image_tiebreak_eps: float = 0.05    # RAG_IMAGE_TIEBREAK_EPS（融合分制,默认保守）
+    image_tiebreak_pool: int = 14       # RAG_IMAGE_TIEBREAK_POOL（over-fetch 上限,默认 2×top_k）
 
 
 @dataclass
@@ -781,6 +816,11 @@ def load_config() -> PipelineConfig:
             expand_image_keep=_env_int("EXPAND_IMAGE_KEEP", 0),                 # RAG_EXPAND_IMAGE_KEEP
             parent_child_as_stepcard=_env_bool("PARENT_CHILD_AS_STEPCARD", False),  # RAG_PARENT_CHILD_AS_STEPCARD
             history_strip_img_markers=_env_bool("HISTORY_STRIP_IMG_MARKERS", False),  # RAG_HISTORY_STRIP_IMG_MARKERS
+            ctx_img_aware_trunc=_env_bool("CTX_IMG_AWARE_TRUNC", False),            # RAG_CTX_IMG_AWARE_TRUNC
+            rerank_img_probe=_env_bool("RERANK_IMG_PROBE", False),                  # RAG_RERANK_IMG_PROBE
+            image_tiebreak=_env_bool("IMAGE_TIEBREAK", False),                      # RAG_IMAGE_TIEBREAK
+            image_tiebreak_eps=_env_float("IMAGE_TIEBREAK_EPS", 0.05),              # RAG_IMAGE_TIEBREAK_EPS
+            image_tiebreak_pool=_env_int("IMAGE_TIEBREAK_POOL", 14),                # RAG_IMAGE_TIEBREAK_POOL
         ),
     )
 

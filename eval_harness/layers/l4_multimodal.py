@@ -42,7 +42,11 @@ def _run_serving(cases: List[Dict], top_k: int, max_images: int,
     from eval_harness import mm_answer_metrics as M  # single source of truth, in-repo (was data-repo)
     from opensearch_pipeline.retriever import retrieve_and_enrich
 
-    img_cases = [c for c in cases if c.get("expect_images") and c.get("live_scorable")]
+    # multi_turn case（带固定注入 history）只进 history 臂（#F-mm13b）：裸 follow-up
+    # 问句检索天然偏弱，混入主臂会拉低已锁定的 answer_image_rate 基线读数
+    img_cases = [c for c in cases
+                 if c.get("expect_images") and c.get("live_scorable")
+                 and not c.get("multi_turn")]
     if not img_cases:
         return {"applicable": False, "n_image_cases": 0,
                 "note": "No image-expecting, live-scorable cases"}
@@ -99,6 +103,68 @@ def _run_serving(cases: List[Dict], top_k: int, max_images: int,
     return out
 
 
+def _run_history_arm(cases: List[Dict], top_k: int, max_images: int) -> Dict:
+    """history 臂（#F-mm13b，EVAL_L4_HISTORY_ARM 显式开启才跑）：follow-up 噪声图回归钉。
+
+    只跑 multi_turn case（goldset 携带固定注入的 history，含上轮 <<IMG:N>> 标记，
+    逐字节不变 → 跨 run 可比 trend）。产出 history_marker_mimic_rate（ADVISORY，
+    绝不进 hard 闸——LLM 行为指标、小样本方差大）。
+
+    mimic 的固定操作性定义（写死，配单测）：本轮答案的 <<IMG:N>> 标记集合与注入
+    history 的 assistant 文本中出现的标记集合有非空交集。可能包含合法重叠（同一
+    文档两轮都真相关）→ 只做 trend：history 固定，比率的跨 run 变化才是信号
+    （RAG_HISTORY_STRIP_IMG_MARKERS 改前锁基线/改后验收的口径）。
+    """
+    from eval_harness import mm_answer_metrics as M
+    from opensearch_pipeline.content_blocks_builder import _IMG_PLACEHOLDER_PATTERN
+    from opensearch_pipeline.retriever import retrieve_and_enrich
+
+    mt_cases = [c for c in cases
+                if c.get("multi_turn") and c.get("history")
+                and c.get("expect_images") and c.get("live_scorable")]
+    if not mt_cases:
+        return {"applicable": False, "n_cases": 0,
+                "note": "no multi_turn cases with history in goldset"}
+
+    per_query: List[Dict] = []
+    mimic_flags: List[bool] = []
+    for c in mt_cases:
+        history = c["history"]
+        hist_ns = {
+            int(m.group(1))
+            for msg in history if msg.get("role") == "assistant"
+            for m in _IMG_PLACEHOLDER_PATTERN.finditer(msg.get("content", ""))
+        }
+        try:
+            chunks = retrieve_and_enrich(c["query"], top_k=top_k, user_dept=None,
+                                         cosurface_images=False)
+            gen = generate_answer_nothink(c["query"], chunks, pure_text=False,
+                                          history=history)
+        except Exception as e:
+            per_query.append({"qid": c["qid"], "error": f"{type(e).__name__}: {e}"[:160]})
+            continue
+        ans = gen["answer"]
+        ans_ns = {int(m.group(1)) for m in _IMG_PLACEHOLDER_PATTERN.finditer(ans)}
+        mimic = bool(hist_ns & ans_ns)
+        mimic_flags.append(mimic)
+        det = M.analyze_answer(ans, chunks, max_images=max_images)
+        per_query.append({
+            "qid": c["qid"], "query": c["query"], "answer": ans,
+            "history_marker_ns": sorted(hist_ns), "answer_marker_ns": sorted(ans_ns),
+            "mimic_overlap": mimic,
+            "n_shown": det["n_shown"], "rendered_any": det["rendered_any"],
+            "n_invalid_markers": det["n_invalid_markers"],
+        })
+
+    return {
+        "applicable": True,
+        "n_cases": len(mt_cases),
+        "history_marker_mimic_rate": (
+            round(sum(mimic_flags) / len(mimic_flags), 4) if mimic_flags else None),
+        "per_query": per_query,
+    }
+
+
 def _run_ingestion(gt_files: List[str], docs_dir: str,
                    manifest_dir: Optional[str] = None) -> Optional[Dict]:
     """L4-ingestion:摄入侧图文绑定精度(逐格式 Jaccard)。
@@ -151,6 +217,9 @@ def run(cases: List[Dict], top_k: int = 7, max_images: int = 6,
             "by_breadth": arm_true.get("by_breadth"),
             "per_query": arm_true.get("per_query", []),
         }
+    # history 臂（#F-mm13b）：显式开启才跑（额外 LLM 费用 + 需要 goldset multi_turn case）
+    if os.environ.get("EVAL_L4_HISTORY_ARM", "").lower() in ("1", "true", "yes"):
+        arms["history"] = _run_history_arm(cases, top_k=top_k, max_images=max_images)
     ingestion = _run_ingestion(gt_files, docs_dir, manifest_dir) if (gt_files and docs_dir) else None
 
     applicable = bool(serving.get("applicable") or ingestion)

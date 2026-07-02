@@ -147,6 +147,72 @@ def score_relevance(chunk: Dict[str, Any]) -> float:
 # Context 组装
 # ═══════════════════════════════════════════════════════════════
 
+def _chunk_header(i: int, chunk: Dict[str, Any], pure_text: bool) -> str:
+    """单个 chunk 的 context header（[文档N] 标题 > 章节 [标签] <<IMG:N>> (相关度)）。
+
+    从 _format_context 原地抽出（行为逐字节等价），供主循环与 #F-mm11b 的
+    压缩条目补救共用 —— 压缩条目必须保住与主循环完全一致的 [📷 图片] <<IMG:N>>
+    标记与相关度标签，两处手写会漂移。
+    """
+    title = chunk.get("title", "未知文档")
+    section = chunk.get("section_title", "")
+    score = chunk.get("score", 0)
+    chunk_type = chunk.get("chunk_type", "")
+
+    header = f"[文档{i+1}] {title}"
+    if section:
+        header += f" > {section}"
+    if chunk_type == "image":
+        visual_summary = chunk.get("visual_summary", "")
+        # 纯文本模式只保留 [📷 图片] 标签 + 图片内容描述，不注入 <<IMG:N>> 标记
+        header += " [📷 图片]" if pure_text else f" [📷 图片] <<IMG:{i+1}>>"
+        if visual_summary:
+            header += f"\n图片内容：{visual_summary[:120]}"
+    elif chunk_type == "step_card":
+        step_no = chunk.get("step_no") or chunk.get("_step_no", "")
+        total_steps = chunk.get("_total_steps", "")
+        # 条款编号步骤（4.1 / 3.2.4）优先显示原文编号：step_no 是文档内
+        # ordinal（排序键），照搬会让回答说"步骤5"而文档写"4.1"
+        section_no = chunk.get("section_no", "")
+        if section_no:
+            step_label = f"步骤{section_no}"
+        elif step_no:
+            step_label = f"步骤{step_no}"
+            if total_steps:
+                step_label = f"步骤{step_no}/{total_steps}"
+        else:
+            step_label = "步骤"
+        header += f" [{step_label}]"
+        image_refs = chunk.get("image_refs") or []
+        if image_refs and not pure_text:
+            # [📷 图片] 标签与 image/text_chunk 分支对齐：缺标签时 LLM 引用倾向明显
+            # 偏低（2026-06-11 生产复测 J-water_soak/QA-24 带图步骤卡 0 引用实证）。
+            header += f" [📷 图片] <<IMG:{i+1}>>"
+    elif chunk_type == "procedure_parent":
+        header += " [流程概览]"
+    elif chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
+        # 与 content_blocks_builder._extract_image_chunks 对齐：这些类型若携带图片，
+        # 也要给 LLM 一个 <<IMG:N>> 提示；否则 referenced-only 渲染（只展示被引用图）会漏图。
+        # 纯文本模式下不注入标记（也不展示图片）。
+        if not pure_text and ((chunk.get("image_refs") or []) or chunk.get("source_image")):
+            header += f" [📷 图片] <<IMG:{i+1}>>"
+    if isinstance(score, (int, float)):
+        # 档位判定与 API sources[].level 同源（score_level），中文标签仅作 prompt 展示
+        header += f" (相关度: {_LEVEL_ZH[score_level(chunk)]} {score:.2f})"
+    return header
+
+
+def _chunk_has_renderable_image(chunk: Dict[str, Any]) -> bool:
+    """#F-mm11b：chunk 是否携带 serving 可渲染的图片（与 _chunk_header 的注标记条件对齐）。"""
+    ctype = chunk.get("chunk_type", "")
+    if ctype == "image":
+        return bool(chunk.get("source_image"))
+    if ctype in ("step_card", "text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
+        return bool((chunk.get("image_refs") or []) or
+                    (ctype != "step_card" and chunk.get("source_image")))
+    return False
+
+
 def _format_context(
     chunks: List[Dict[str, Any]],
     max_chars: int = 6000,
@@ -158,69 +224,89 @@ def _format_context(
     [📷 图片] 标签与 visual_summary 文本，确保图片的语义内容不丢失（LLM 仍可
     据此用文字作答），只是不会触发图片穿插渲染。
     pure_text=False（默认）：行为与历史完全一致（图文穿插）。
+
+    截断语义（#F-mm11, 2026-07-01）：
+      - 半截标记防漏（无 flag 常开）：截断点落在 header 首行内（超长标题+章节）时
+        整条放弃 —— 半截 <<IMG: / [📷 图 / 相关度标签会被 LLM 照抄成渲染与清洗
+        正则都不认识的残片漏给用户；切点在正文内无此风险（chunk_text 不含标记）。
+      - 压缩条目补救（RAG_CTX_IMG_AWARE_TRUNC，默认 OFF）：break 后对被整体丢弃
+        的带图 chunk，以「header + 正文前 200 字」压缩条目补回最多 3 条，保住
+        [📷 图片] <<IMG:N>> 提示 —— 否则 step 扩展+邻居拼接把流程类查询（最需要
+        图的）常态性顶超 6000，尾部带图步骤卡的图在 referenced-only 下恒出不来。
+        压缩条目使用【显式 10% 溢出预算】（context 上限变为 max_chars*1.1），
+        不挤占主预算也不假装 6000 未变。
     """
     parts = []
     total_chars = 0
+    n_dropped = 0
+    n_dropped_with_images = 0
+    salvage_start = len(chunks)   # 首个未进 context 的 chunk 下标
 
     for i, chunk in enumerate(chunks):
-        title = chunk.get("title", "未知文档")
-        section = chunk.get("section_title", "")
+        header = _chunk_header(i, chunk, pure_text)
         text = chunk.get("chunk_text", "")
-        score = chunk.get("score", 0)
-        chunk_type = chunk.get("chunk_type", "")
-
-        header = f"[文档{i+1}] {title}"
-        if section:
-            header += f" > {section}"
-        if chunk_type == "image":
-            visual_summary = chunk.get("visual_summary", "")
-            # 纯文本模式只保留 [📷 图片] 标签 + 图片内容描述，不注入 <<IMG:N>> 标记
-            header += " [📷 图片]" if pure_text else f" [📷 图片] <<IMG:{i+1}>>"
-            if visual_summary:
-                header += f"\n图片内容：{visual_summary[:120]}"
-        elif chunk_type == "step_card":
-            step_no = chunk.get("step_no") or chunk.get("_step_no", "")
-            total_steps = chunk.get("_total_steps", "")
-            # 条款编号步骤（4.1 / 3.2.4）优先显示原文编号：step_no 是文档内
-            # ordinal（排序键），照搬会让回答说"步骤5"而文档写"4.1"
-            section_no = chunk.get("section_no", "")
-            if section_no:
-                step_label = f"步骤{section_no}"
-            elif step_no:
-                step_label = f"步骤{step_no}"
-                if total_steps:
-                    step_label = f"步骤{step_no}/{total_steps}"
-            else:
-                step_label = "步骤"
-            header += f" [{step_label}]"
-            image_refs = chunk.get("image_refs") or []
-            if image_refs and not pure_text:
-                # [📷 图片] 标签与 image/text_chunk 分支对齐：缺标签时 LLM 引用倾向明显
-                # 偏低（2026-06-11 生产复测 J-water_soak/QA-24 带图步骤卡 0 引用实证）。
-                header += f" [📷 图片] <<IMG:{i+1}>>"
-        elif chunk_type == "procedure_parent":
-            header += " [流程概览]"
-        elif chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
-            # 与 content_blocks_builder._extract_image_chunks 对齐：这些类型若携带图片，
-            # 也要给 LLM 一个 <<IMG:N>> 提示；否则 referenced-only 渲染（只展示被引用图）会漏图。
-            # 纯文本模式下不注入标记（也不展示图片）。
-            if not pure_text and ((chunk.get("image_refs") or []) or chunk.get("source_image")):
-                header += f" [📷 图片] <<IMG:{i+1}>>"
-        if isinstance(score, (int, float)):
-            # 档位判定与 API sources[].level 同源（score_level），中文标签仅作 prompt 展示
-            header += f" (相关度: {_LEVEL_ZH[score_level(chunk)]} {score:.2f})"
-
         entry = f"{header}\n{text}\n"
 
         if total_chars + len(entry) > max_chars:
             # 截断过长的 context
             remaining = max_chars - total_chars
             if remaining > 100:
-                parts.append(entry[:remaining] + "...(截断)")
+                cut = entry[:remaining]
+                if "\n" in cut:
+                    # 切点在正文内：header（含标记）完整，保持原截断行为
+                    parts.append(cut + "...(截断)")
+                    salvage_start = i + 1
+                else:
+                    # #F-mm11a：header 首行都放不下 → 整条放弃，绝不漏半截标记
+                    salvage_start = i
+            else:
+                salvage_start = i
             break
-
         parts.append(entry)
         total_chars += len(entry)
+        salvage_start = i + 1
+
+    # ── 截断后处理：遥测 + 可选的带图压缩条目补救 ──────────────────
+    if salvage_start < len(chunks):
+        dropped = chunks[salvage_start:]
+        n_dropped = len(dropped)
+        n_dropped_with_images = sum(1 for c in dropped if _chunk_has_renderable_image(c))
+
+        _img_aware = False
+        if not pure_text and n_dropped_with_images:
+            try:
+                _img_aware = get_config().rag.ctx_img_aware_trunc
+            except Exception:
+                pass
+        n_salvaged = 0
+        if _img_aware:
+            # 显式 10% 溢出预算（上限 max_chars*1.1）；每条=完整 header+正文前 200 字。
+            # 200 字残文与规则 9（数字须出自原文）有张力 —— e2e judge 把关后才开。
+            budget = int(max_chars * 0.1)
+            for j in range(salvage_start, len(chunks)):
+                if n_salvaged >= 3:
+                    break
+                cj = chunks[j]
+                if not _chunk_has_renderable_image(cj):
+                    continue
+                h = _chunk_header(j, cj, pure_text)
+                if "<<IMG:" not in h:
+                    continue   # header 无标记（异常形态）→ 压缩无意义
+                body = str(cj.get("chunk_text") or "")[:200]
+                centry = f"{h}\n{body}...(截断)\n"
+                if len(centry) > budget:
+                    continue
+                parts.append(centry)
+                budget -= len(centry)
+                n_salvaged += 1
+        # 截断可观测（#F-mm11c，独立于 image_render_stats 的 logger 兜底）
+        try:
+            logger.info(
+                "context_truncation dropped=%d dropped_with_images=%d salvaged=%d max_chars=%d",
+                n_dropped, n_dropped_with_images, n_salvaged, max_chars,
+            )
+        except Exception:
+            pass
 
     return "\n---\n".join(parts)
 

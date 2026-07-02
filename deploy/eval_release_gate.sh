@@ -52,6 +52,12 @@ if [ -f "$RUNDIR/judge_bundle_chunk.json" ]; then
   "$PY" -m eval_harness.run_judge --bundle "$RUNDIR/judge_bundle_chunk.json" \
         --out "$RUNDIR/judge_verdicts_chunk.json" --panels "$PANELS" --rubric chunk || echo "WARN: chunk judge failed"
 fi
+# #F-mm13a：图文贴题率语义通道（advisory,失败 WARN 不 FATAL）——judge_bundle_mm.json
+# 此前每轮落盘却从未被消费;merge 按同目录约定拾取 judge_verdicts_mm.json。
+if [ -f "$RUNDIR/judge_bundle_mm.json" ]; then
+  "$PY" -m eval_harness.run_judge --bundle "$RUNDIR/judge_bundle_mm.json" \
+        --out "$RUNDIR/judge_verdicts_mm.json" --panels "$PANELS" --rubric mm || echo "WARN: mm judge failed (advisory channel)"
+fi
 
 echo "== [4/4] run_eval merge --strict (THE gate) =="
 "$PY" -m eval_harness.run_eval merge --results "$RUNDIR/report.json" \

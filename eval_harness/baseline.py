@@ -33,11 +33,19 @@ def _direction(path: str) -> str:
 #     docs is a trend signal, not a defect);
 #   - l4srv.answer_image_rate (#F-mm1, 2026-07-01): brand-new端到端出图率主指标 — 项目惯例
 #     新指标先 advisory 跑两轮锁分布再议升 hard（LLM 非确定性下小样本波动大,冒然 hard 会
-#     把噪声当回退阻断发布）。
+#     把噪声当回退阻断发布）;
+#   - l4srv.marker_distinctness (#F-mm13b): report 侧一直是 advisory 闸（复用捆包是
+#     addressability 限制非缺陷）,但此前不进 baseline → chunker 改动使捆包恶化无 delta
+#     告警。入 baseline 后恶化可见,仍不阻断（与 report advisory 语义对齐）;
+#   - judge.mm.image_relevance (#F-mm13a): caption-based 语义贴题率,judge 主观性+面板
+#     方差,advisory trend 起步。
 # Everything else — recall, jaccard, dup, marker_validity, dangling, judge scores, refusal/leak
 # rates — stays a FULLY blocking hard metric. Keep this in sync with the advisory:True gates in
 # report.py (test pins the exact set).
-ADVISORY_METRICS = frozenset({"l4srv.orphan_rate", "l4srv.answer_image_rate"})
+ADVISORY_METRICS = frozenset({
+    "l4srv.orphan_rate", "l4srv.answer_image_rate",
+    "l4srv.marker_distinctness", "judge.mm.image_relevance",
+})
 
 
 def _is_advisory(path: str) -> bool:
@@ -75,13 +83,17 @@ def extract_metrics(results: Dict) -> Dict[str, float]:
         put(f"l4ing.jaccard.{fmt}", ing.get(f"binding_jaccard_{fmt}"))  # 图文 ingestion subset
     put("l4ing.img_dup_p95", ing.get("img_dup_factor_p95"))
     srv = (results.get("l4") or {}).get("aggregate") or {}
-    for k in ("marker_validity", "dangling_ref_rate", "orphan_rate", "answer_image_rate"):
+    for k in ("marker_validity", "dangling_ref_rate", "orphan_rate", "answer_image_rate",
+              "marker_distinctness"):
         put(f"l4srv.{k}", srv.get(k))
 
     j = (results.get("judge") or {}).get("aggregate") or {}
     posj = j.get("positives") or {}
     for k in ("faithfulness", "correctness", "completeness"):
         put(f"judge.{k}", (posj.get(k) or {}).get("mean"))
+    # mm judge（#F-mm13a）：语义贴题率 advisory trend
+    jmm = (results.get("judge_mm") or {}).get("aggregate") or {}
+    put("judge.mm.image_relevance", (jmm.get("image_relevance") or {}).get("mean"))
     return m
 
 
