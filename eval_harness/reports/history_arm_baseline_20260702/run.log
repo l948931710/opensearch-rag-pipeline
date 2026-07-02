@@ -1,0 +1,11 @@
+EXIT=0
+  ⚙️ 环境: DEFAULT (test) | RDS=rm-bp15j7wekd5738f093o.rwlb.rds.aliyuncs.com | Search=ha-cn-kgl4slr1n01.public.ha.aliyuncs.com
+multi_turn cases: 6
+    [Pool] MySQL connection pool initialized (min=2, max=20, classify_concurrency=8, host=rm-bp15j7wekd5738f093o.rwlb.rds.aliyuncs.com:3306, db=fuling_knowledge，🔒 SESSION READ ONLY（声明式只读）)
+{"applicable": true, "n_cases": 6, "history_marker_mimic_rate": 0.0}
+{"qid": "MT-whs_followup", "mimic_overlap": false, "history_marker_ns": [1, 2, 3], "answer_marker_ns": [11], "n_shown": 1, "error": null}
+{"qid": "MT-water_followup", "mimic_overlap": false, "history_marker_ns": [1], "answer_marker_ns": [], "n_shown": 0, "error": null}
+{"qid": "MT-itin_followup", "mimic_overlap": false, "history_marker_ns": [2], "answer_marker_ns": [3, 5, 7, 8], "n_shown": 6, "error": null}
+{"qid": "MT-zc_followup", "mimic_overlap": false, "history_marker_ns": [1, 4], "answer_marker_ns": [2], "n_shown": 0, "error": null}
+{"qid": "MT-hr_followup", "mimic_overlap": false, "history_marker_ns": [2], "answer_marker_ns": [], "n_shown": 0, "error": null}
+{"qid": "MT-dorm_followup", "mimic_overlap": false, "history_marker_ns": [5], "answer_marker_ns": [2], "n_shown": 0, "error": null}
