@@ -12,6 +12,7 @@ import copy
 import datetime as _dt
 import os
 import tempfile
+import threading
 from typing import Dict, List, Optional
 
 from opensearch_pipeline.extraction.schema import ExtractionResult, ExtractedBlock
@@ -1151,6 +1152,14 @@ class UnifiedExtractor:
     _vlm_cache = None  # lazy-load，类级别共享
     _vlm_cache_file = None
     _vlm_cache_oss_key = "processing/cache/vlm_cache.json"
+    # perf#27：OSS 同步脏计数——自上次成功 OSS put 以来经历的 per-doc 保存次数。
+    # 本地原子写仍每文档一次（廉价、防崩溃），OSS 整包上传降频为每 N 个文档 +
+    # run 结束 flush（node_extract_text_with_ocr finally），~1500 条整包 dumps+PUT
+    # 从 100 次/百文档降到个位数，也缩小 last-write-wins 竞态窗口。
+    _vlm_cache_oss_dirty = 0
+    # perf#30 配套：RAG_EXTRACT_CONCURRENCY>1 时多文档线程并发保存——tmp 文件名含 pid 不含
+    # tid，两线程同时写同一 .tmp 路径会交错出半截 JSON 再被 os.replace 发布；串行化落盘。
+    _vlm_cache_save_lock = threading.Lock()
 
     @classmethod
     def _load_vlm_cache(cls) -> dict:
@@ -1214,39 +1223,65 @@ class UnifiedExtractor:
             return None
 
     @classmethod
-    def _save_vlm_cache(cls):
+    def _vlm_cache_oss_sync_every(cls) -> int:
+        """OSS 整包同步间隔（每 N 次 per-doc 保存一传；≤1 = 每次都传即旧行为）。"""
+        try:
+            return max(1, int(os.environ.get("RAG_VLM_CACHE_OSS_SYNC_EVERY", "10")))
+        except ValueError:
+            return 10
+
+    @classmethod
+    def _save_vlm_cache(cls, force_oss: bool = False):
         """
         持久化 VLM 缓存。
 
         写入目标：
-          1. 本地 scratch/vlm_cache.json（快速读取）
-          2. OSS processing/cache/vlm_cache.json（跨运行持久化）
+          1. 本地 scratch/vlm_cache.json——每次调用都写（原子写，廉价、防崩溃丢缓存）
+          2. OSS processing/cache/vlm_cache.json——脏计数降频（perf#27）：每
+             RAG_VLM_CACHE_OSS_SYNC_EVERY（默认 10）次保存一传；force_oss=True
+             （run 结束 flush）时只要有脏即传。上传失败不清计数，下一文档自然重试。
         """
         import json
         if cls._vlm_cache is None or cls._vlm_cache_file is None:
             return
 
-        cache_json = json.dumps(cls._vlm_cache, ensure_ascii=False)
+        # perf#30：并发提取时串行化整个保存路径（dumps 快照 + 本地原子写 + OSS put + 脏计数）
+        with cls._vlm_cache_save_lock:
+            cache_json = json.dumps(cls._vlm_cache, ensure_ascii=False)
 
-        # 写入本地（DET: 原子写 temp + os.replace，避免崩溃/并发写产生半截 JSON 触发全量 VLM 重判）
-        try:
-            os.makedirs(os.path.dirname(cls._vlm_cache_file), exist_ok=True)
-            _tmp = f"{cls._vlm_cache_file}.tmp.{os.getpid()}"
-            with open(_tmp, "w", encoding="utf-8") as f:
-                f.write(cache_json)
-            os.replace(_tmp, cls._vlm_cache_file)
-        except Exception as e:
-            print(f"      ⚠️ Failed to save VLM cache locally: {e}")
+            # 写入本地（DET: 原子写 temp + os.replace，避免崩溃/并发写产生半截 JSON 触发全量 VLM 重判）
+            try:
+                os.makedirs(os.path.dirname(cls._vlm_cache_file), exist_ok=True)
+                _tmp = f"{cls._vlm_cache_file}.tmp.{os.getpid()}"
+                with open(_tmp, "w", encoding="utf-8") as f:
+                    f.write(cache_json)
+                os.replace(_tmp, cls._vlm_cache_file)
+            except Exception as e:
+                print(f"      ⚠️ Failed to save VLM cache locally: {e}")
 
-        # 上传到 OSS
-        try:
-            from opensearch_pipeline.pipeline_nodes import _get_oss_bucket
-            bucket, is_sim = _get_oss_bucket()
-            if not is_sim and bucket is not None:
-                bucket.put_object(cls._vlm_cache_oss_key, cache_json.encode("utf-8"))
-                print(f"      [VLM Cache] Synced {len(cls._vlm_cache)} entries to OSS {cls._vlm_cache_oss_key}")
-        except Exception as e:
-            print(f"      ⚠️ Failed to sync VLM cache to OSS: {e}")
+            # 上传到 OSS（脏计数降频；本地写成功与否不影响计数——OSS 是跨运行权威副本）
+            if not force_oss:
+                cls._vlm_cache_oss_dirty += 1
+            if cls._vlm_cache_oss_dirty <= 0 or (
+                    not force_oss and cls._vlm_cache_oss_dirty < cls._vlm_cache_oss_sync_every()):
+                return
+            try:
+                from opensearch_pipeline.pipeline_nodes import _get_oss_bucket
+                bucket, is_sim = _get_oss_bucket()
+                if not is_sim and bucket is not None:
+                    bucket.put_object(cls._vlm_cache_oss_key, cache_json.encode("utf-8"))
+                    print(f"      [VLM Cache] Synced {len(cls._vlm_cache)} entries to OSS {cls._vlm_cache_oss_key}")
+                    cls._vlm_cache_oss_dirty = 0
+            except Exception as e:
+                print(f"      ⚠️ Failed to sync VLM cache to OSS: {e}")
+
+    @classmethod
+    def flush_vlm_cache_to_oss(cls):
+        """run 结束的 OSS flush（perf#27）：把脏计数未满一轮的尾巴同步上去。
+        node_extract_text_with_ocr finally 调用；无脏/无缓存时零动作。"""
+        if cls._vlm_cache is None or cls._vlm_cache_oss_dirty <= 0:
+            return
+        cls._save_vlm_cache(force_oss=True)
 
     def _process_embedded_images(self, image_assets: list, task: dict) -> tuple:
         """

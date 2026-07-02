@@ -73,12 +73,15 @@ def _refuse_prod_targets():
         _pn._reset_db_pool()
     except Exception:
         pass
-    # 清空性能第一梯队引入的进程内缓存（query-embed LRU / 读时 ACL TTL / 看板 TTL），
-    # 防止跨测试串数据；仅清已导入的模块（未导入则跳过，避免为清缓存反而拉起模块）。
+    # 清空性能批次引入的进程内缓存（query-embed LRU / 读时 ACL TTL / 看板 TTL / 机器人部门
+    # TTL / 缺口 TTL），防止跨测试串数据；仅清已导入的模块（未导入则跳过，避免为清缓存反而拉起模块）。
     import sys as _sys
     for _mod, _fn in (("opensearch_pipeline.retriever", "_query_embed_cache_clear"),
                       ("opensearch_pipeline.dingtalk_identity", "_live_acl_cache_clear"),
-                      ("opensearch_pipeline.routes.kb_console", "_dashboard_cache_clear")):
+                      ("opensearch_pipeline.dingtalk_identity", "_bot_dept_cache_clear"),
+                      ("opensearch_pipeline.routes.kb_console", "_dashboard_cache_clear"),
+                      ("opensearch_pipeline.routes.contribution", "_gaps_cache_clear"),
+                      ("opensearch_pipeline.qa_facts", "_fact_state_clear")):
         try:
             m = _sys.modules.get(_mod)
             if m is not None:

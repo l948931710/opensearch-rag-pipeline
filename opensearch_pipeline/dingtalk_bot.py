@@ -379,22 +379,34 @@ def _stream_answer_to_card(
     # PUT /card/streaming 的网络往返阻塞。同步推流在推流往返慢时会把 ~6s 的生成拖成数十秒
     # （每帧阻塞累加）。关键不变量：finalize 前必须 stop+join 推流线程，杜绝"推流帧覆盖定稿帧"
     # → 空白/掉页脚（曾踩过的坑）。单线程顺序推流→帧不乱序；推流失败 fail open。
+    # perf#33：_clean（8+ 全文正则）从主循环挪到本推送线程——主循环每 token 帧只记帧数，
+    # 清洗次数从 ~帧数（数百次 O(全文)）降到 ~推送次数（每 interval 一次）；清洗的仍是
+    # collected 前缀的全量累计文本，推送内容与旧实现逐帧等价。定稿帧路径不变（生成结束后
+    # 已 stop+join，主线程独占 collected）。
     _push_interval = interval_s if interval_s > 0 else 0.3
-    _latest = {"text": ""}
+    _latest = {"n": 0}   # 已收 token 帧数（只增；主循环在 append 之后更新）
     _plock = threading.Lock()
     _pstop = threading.Event()
 
     def _pusher() -> None:
-        last = ""
+        last_n = 0        # 上次已处理的帧数
+        last_txt = ""     # 上次成功推送的清洗后文本
         while not _pstop.wait(_push_interval):
             with _plock:
-                txt = _latest["text"]
-            if txt and txt != last:
+                n = _latest["n"]
+            if n == last_n:
+                continue
+            # collected 只被主线程 append（已有元素不变），按已发布帧数取前缀切片线程安全
+            txt = _clean("".join(collected[:n]))
+            if txt and txt != last_txt:
                 try:
                     streaming_update_card(message_id, txt, key=stream_key, is_full=True)
-                    last = txt
+                    last_txt = txt
+                    last_n = n
                 except Exception:
-                    pass  # 推流失败不影响生成/定稿
+                    pass  # 推流失败不影响生成/定稿（last_n 不动，下一 tick 重试）
+            else:
+                last_n = n  # 清洗后无可见变化：推进游标，避免每 tick 重复 join+clean
 
     _pthread = threading.Thread(target=_pusher, name="dt-stream-push", daemon=True)
 
@@ -421,9 +433,8 @@ def _stream_answer_to_card(
             if not frame or frame.get("type") != "chunk" or not frame.get("content"):
                 continue
             collected.append(frame["content"])
-            _txt = _clean("".join(collected))
             with _plock:
-                _latest["text"] = _txt  # 后台线程按节流推送，主循环不阻塞
+                _latest["n"] = len(collected)  # 后台线程按节流 join+clean+推送，主循环不做全文正则
 
         # 生成结束 → 先停推流线程（确保不与定稿竞争），再写定稿帧
         _stop_pusher()

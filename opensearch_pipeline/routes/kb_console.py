@@ -387,16 +387,18 @@ def _dashboard_cache_put(key, value) -> None:
     with _dashboard_cache_lock:
         _dashboard_cache[key] = (time.time() + ttl, value)
 
-# retrieved_docs_json → doc_id → document_meta.owner_dept 的归属 JOIN（collation-cast 必需）。
+# retrieved_docs_json → doc_id → document_meta.owner_dept 的归属 JOIN。perf#3 后按环境二态：
+# 事实表 qa_retrieved_doc 可用（schema/013 + RAG_QA_FACT_JOIN）→ 普通索引 JOIN；
+# 否则回退历史 JSON_TABLE+collation-cast 展开。片段构造收敛在 qa_facts.qa_docs_join_sql。
 # 末尾 WHERE 已含窗口占位符 %s；调用处再拼 _kb_owner_scope_sql 的作用域子句（kb_admin 为空 = 全库）。
-_KB_QA_OWNER_JOIN = (
-    f" FROM {_op_db()}.qa_session_log q"
-    " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-    f" JOIN {_kb_db()}.document_meta m"
-    "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-    " WHERE q.retrieved_docs_json IS NOT NULL"
-    "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
-)
+def _kb_qa_owner_join() -> str:
+    from opensearch_pipeline.qa_facts import qa_docs_join_sql
+    return (
+        f" FROM {_op_db()}.qa_session_log q"
+        + qa_docs_join_sql(cited=False)
+        + " WHERE q.retrieved_docs_json IS NOT NULL"
+          "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+    )
 
 
 class KbTopDocItem(BaseModel):
@@ -443,7 +445,7 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
-    base = _KB_QA_OWNER_JOIN + (" " + scope_clause if scope_clause else "")
+    base = _kb_qa_owner_join() + (" " + scope_clause if scope_clause else "")
     args = tuple([win] + scope_params)
     out = KbInsightsResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"), window_days=win)
     try:
@@ -477,13 +479,12 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
             #    故 cited 天然「成功且实际用到本部门文档」，不会高估）。helped_users = 同一 JOIN 上按 user_id
             #    去重 → 真正被本部门知识帮到的人数（与 cited=提问数 配对：帮了 helped_users 人 / cited 个问题）。
             try:
+                from opensearch_pipeline.qa_facts import qa_docs_join_sql
                 cur.execute(
                     "SELECT COUNT(DISTINCT q.message_id), COUNT(DISTINCT q.user_id)"
                     f" FROM {_op_db()}.qa_session_log q"
-                    " JOIN JSON_TABLE(q.cited_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-                    f" JOIN {_kb_db()}.document_meta m"
-                    "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-                    " WHERE q.cited_docs_json IS NOT NULL"
+                    + qa_docs_join_sql(cited=True)
+                    + " WHERE q.cited_docs_json IS NOT NULL"
                     "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                     + (" " + scope_clause if scope_clause else ""), args)
                 r2 = cur.fetchone() or (0, 0)
@@ -811,14 +812,13 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                         _cell(dept)["ret7"] = int(n or 0)
                 except Exception as e:
                     wow_ok = False; logger.warning("kb_governance dept wow 失败: %s", e)
+                from opensearch_pipeline.qa_facts import qa_docs_join_sql
                 cur.execute(
                     "SELECT m.owner_dept, COUNT(DISTINCT q.message_id),"
                     " COUNT(DISTINCT CASE WHEN q.answer_status='REFUSAL' THEN q.message_id END)"
                     f" FROM {_op_db()}.qa_session_log q"
-                    " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-                    f" JOIN {_kb_db()}.document_meta m"
-                    "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-                    " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY m.owner_dept", (win,))
+                    + qa_docs_join_sql()
+                    + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY m.owner_dept", (win,))
                 for dept, hits, refu in cur.fetchall():
                     cell = _cell(dept); cell["qa_hits"] = int(hits or 0); cell["refusal"] = int(refu or 0)
                 # 各部门使用量周环比：近7天 vs 前7天 命中提问数（与 qa_hits 同 DISTINCT message_id 去 chunk 扇出口径）。
@@ -830,10 +830,8 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                         " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)"
                         "   AND q.created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END)"
                         f" FROM {_op_db()}.qa_session_log q"
-                        " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]' COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-                        f" JOIN {_kb_db()}.document_meta m"
-                        "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-                        " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY m.owner_dept")
+                        + qa_docs_join_sql()
+                        + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY m.owner_dept")
                     for dept, q7, qp7 in cur.fetchall():
                         cell = _cell(dept); cell["qa7"] = int(q7 or 0); cell["qa_prev7"] = int(qp7 or 0)
                 except Exception as e:
@@ -1254,6 +1252,12 @@ def kb_register(req: KbRegisterRequest, request: Request,
     bucket = cfg.oss.bucket_name
     trace_id = get_request_id()
 
+    # raw_key 幂等点查统一走 raw_key_hash 索引（perf#5，schema/014）：谓词形态
+    # `raw_key=%s AND (raw_key_hash=%s OR raw_key_hash IS NULL)` —— hash 等值 + IS NULL 走
+    # idx_raw_key_hash 的 ref_or_null 访问，raw_key 等值仍是权威判定；014 回填前的存量
+    # NULL 行 / 索引未建的环境退化为与旧行为等价的正确结果，无部署顺序风险。
+    raw_key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    _RAW_KEY_PRED = "WHERE raw_key=%s AND (raw_key_hash=%s OR raw_key_hash IS NULL)"
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -1261,7 +1265,8 @@ def kb_register(req: KbRegisterRequest, request: Request,
             with conn.cursor() as cur:
                 # 幂等：同一 raw_key 已登记 → 直接返回既有行
                 cur.execute("SELECT doc_id, version_no, content_process_status "
-                            f"FROM {_kb_db()}.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                            f"FROM {_kb_db()}.document_version {_RAW_KEY_PRED} LIMIT 1",
+                            (raw_key, raw_key_hash))
                 exist = cur.fetchone()
                 if exist:
                     conn.commit()
@@ -1291,7 +1296,8 @@ def kb_register(req: KbRegisterRequest, request: Request,
                     # 版本号 → uk_doc_version 不撞、1062 兜底也不触发 → 会落成两个版本。持锁后按 raw_key 复查，
                     # 命中赢家已提交行即幂等返回，不再推高 current_version_no（避免版本空洞 + 双份抽取/嵌入）。
                     cur.execute("SELECT doc_id, version_no, content_process_status "
-                                f"FROM {_kb_db()}.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                                f"FROM {_kb_db()}.document_version {_RAW_KEY_PRED} LIMIT 1",
+                                (raw_key, raw_key_hash))
                     _relock = cur.fetchone()
                     if _relock:
                         conn.commit()   # 释放 document_meta 行锁
@@ -1326,8 +1332,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
                          perm, ("public" if perm == "public" else "private")),
                     )
                 # raw_key_hash 与生产管线/批量注册一致写入（自助路径此前置 NULL）——供 reconcile/dedup
-                # 工具按内容键去重，并为未来的 UNIQUE(raw_key_hash) 加固预填数据。
-                raw_key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+                # 工具按内容键去重（hash 已在函数入口处统一计算，幂等点查同键）。
                 try:
                     cur.execute(
                         f"""
@@ -1350,7 +1355,8 @@ def kb_register(req: KbRegisterRequest, request: Request,
                     conn.rollback()
                     with conn.cursor() as c2:
                         c2.execute("SELECT doc_id, version_no, content_process_status "
-                                   f"FROM {_kb_db()}.document_version WHERE raw_key=%s LIMIT 1", (raw_key,))
+                                   f"FROM {_kb_db()}.document_version {_RAW_KEY_PRED} LIMIT 1",
+                                   (raw_key, raw_key_hash))
                         won = c2.fetchone()
                     if not won:
                         raise   # 1062 但查不到赢家行 → 非预期，按 500 处理

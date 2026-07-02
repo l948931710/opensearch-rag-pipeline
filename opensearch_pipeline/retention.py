@@ -54,7 +54,7 @@ DEFAULT_BATCH = 5000
 MAX_BATCHES_PER_JOB = 400
 SLEEP_BETWEEN_BATCHES = 0.2
 
-_JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings")
+_JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_facts")
 
 
 def _kb_db() -> str:
@@ -80,6 +80,8 @@ def _retention_windows() -> Dict[str, int]:
         "audit": _months("RAG_RETENTION_AUDIT_MONTHS", 24),
         "pipeline_run": _months("RAG_RETENTION_PIPELINE_RUN_MONTHS", 12),
         "findings": _months("RAG_RETENTION_FINDING_MONTHS", 24),
+        # perf#3 事实表（schema/013）：与 qa_rows 同窗——瘦行只服务 30 天级看板，跟主日志同期退役
+        "qa_facts": _months("RAG_RETENTION_QA_FACTS_MONTHS", 18),
     }
 
 
@@ -102,6 +104,11 @@ def _job_sqls(job: str) -> Dict[str, str]:
     if job == "audit":
         pred = ("FROM {kb}.kb_audit_log "
                 "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(kb=kb)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "qa_facts":
+        # qa_retrieved_doc（schema/013，可选迁移）：表未建的环境由 run_retention 按 1146 静默 skip
+        pred = ("FROM {op}.qa_retrieved_doc "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
         return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
     if job == "pipeline_run":
         pred = ("FROM {kb}.pipeline_run "
@@ -223,8 +230,16 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
             finally:
                 conn.close()
         except Exception as e:
-            rep["error"] = str(e)
-            print(f"[retention] {job}: ✗ {e}")
+            errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
+            if job == "qa_facts" and errno == 1146:
+                # schema/013 是可选迁移：未 apply 的环境（staging/本地）表不存在不算失败——
+                # 其余作业的 1146 仍按事故上报（基础表缺失=部署错库）。
+                rep["ok"] = True
+                rep["skipped"] = "qa_retrieved_doc 不存在（schema/013 未应用）"
+                print(f"[retention] {job}: skip（事实表未建）")
+            else:
+                rep["error"] = str(e)
+                print(f"[retention] {job}: ✗ {e}")
     return reports
 
 

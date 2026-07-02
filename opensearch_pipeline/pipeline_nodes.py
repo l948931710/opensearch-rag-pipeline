@@ -343,68 +343,97 @@ def node_extract_text_with_ocr(ctx: dict):
     # 创建临时目录存放下载的文件
     tmp_dir = tempfile.mkdtemp(prefix="rag_extract_")
 
+    # perf#30：文档级并发（默认 1 = 既有串行路径，零行为变化）。同批 classify 早已 8 线程，
+    # 而提取（OSS 下载 + 解析 + OCR/VLM 外呼）跨文档串行是 stage-1 墙钟主体。>1 时用线程池：
+    # 循环体除共享 tmp_dir 外无跨文档数据依赖（VLM funnel 类缓存 dict/GIL + _save 落盘锁、
+    # cost_breaker 自带 Lock、oss2 Bucket 线程安全、ctx["_raw_checksum"] dict 写 GIL 原子）；
+    # 并发时每文档独立 tmp 子目录，杜绝跨文档同名资产互踩。结果按 tasks 原序收敛，
+    # 下游（canonical/chunk）看到的顺序与串行完全一致。
     try:
-        for task in tasks:
-            doc_id = task["doc_id"]
-            task["_tmp_dir"] = tmp_dir  # 传递给 image_extraction_utils 导出嵌入图片
+        extract_concurrency = max(1, int(os.environ.get("RAG_EXTRACT_CONCURRENCY", "1")))
+    except ValueError:
+        extract_concurrency = 1
 
-            # 生产模式：从 OSS 下载原始文件到本地
-            if not simulate_oss and "mock_text" not in task:
-                raw_key = task.get("raw_key", "")
-                if raw_key and bucket:
-                    # 保留原始文件名（含中文）以便提取器识别类型
-                    filename = os.path.basename(raw_key)
-                    local_path = os.path.join(tmp_dir, f"{doc_id}_{filename}")
-                    try:
-                        bucket.get_object_to_file(raw_key, local_path)
-                        file_size = os.path.getsize(local_path)
-                        task["local_path"] = local_path
-                        print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)")
-                    except Exception as e:
-                        print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
-                        task["local_path"] = ""
-            elif simulate_oss and "mock_text" not in task and not task.get("local_path"):
-                # 本地零 OSS 形态（LOCAL-DEV，见 docs/environment_design.md）：
-                # 真实文档由 scripts/sample_corpus.py 预先采样到 scratch/sample_corpus/<raw_key>，
-                # 这里直接挂为 local_path——管线全程不触 OSS。未采样的文件按原 simulate 行为处理。
-                _sample_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "scratch", "sample_corpus", task.get("raw_key", ""))
-                if task.get("raw_key") and os.path.exists(_sample_path):
-                    task["local_path"] = _sample_path
-                    print(f"    📂 {doc_id}: using sampled corpus file scratch/sample_corpus/{task['raw_key']}")
+    def _extract_one(task, task_tmp_dir):
+        doc_id = task["doc_id"]
+        task["_tmp_dir"] = task_tmp_dir  # 传递给 image_extraction_utils 导出嵌入图片
 
-            # L2: raw-bytes content hash (best-effort, fail-open) for content-based invalidation.
-            _lp = task.get("local_path")
-            if _lp and os.path.exists(_lp):
+        # 生产模式：从 OSS 下载原始文件到本地
+        if not simulate_oss and "mock_text" not in task:
+            raw_key = task.get("raw_key", "")
+            if raw_key and bucket:
+                # 保留原始文件名（含中文）以便提取器识别类型
+                filename = os.path.basename(raw_key)
+                local_path = os.path.join(task_tmp_dir, f"{doc_id}_{filename}")
                 try:
-                    _h = hashlib.sha256()
-                    with open(_lp, "rb") as _rf:
-                        for _blk in iter(lambda: _rf.read(1 << 20), b""):
-                            _h.update(_blk)
-                    ctx.setdefault("_raw_checksum", {})[(task["doc_id"], task.get("version_no"))] = _h.hexdigest()
-                except Exception:
-                    pass  # checksum is auxiliary; absence → NULL → "process" (never blocks extraction)
+                    bucket.get_object_to_file(raw_key, local_path)
+                    file_size = os.path.getsize(local_path)
+                    task["local_path"] = local_path
+                    print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)")
+                except Exception as e:
+                    print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
+                    task["local_path"] = ""
+        elif simulate_oss and "mock_text" not in task and not task.get("local_path"):
+            # 本地零 OSS 形态（LOCAL-DEV，见 docs/environment_design.md）：
+            # 真实文档由 scripts/sample_corpus.py 预先采样到 scratch/sample_corpus/<raw_key>，
+            # 这里直接挂为 local_path——管线全程不触 OSS。未采样的文件按原 simulate 行为处理。
+            _sample_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "scratch", "sample_corpus", task.get("raw_key", ""))
+            if task.get("raw_key") and os.path.exists(_sample_path):
+                task["local_path"] = _sample_path
+                print(f"    📂 {doc_id}: using sampled corpus file scratch/sample_corpus/{task['raw_key']}")
 
-            result = extractor.extract(task)
-            extractions.append(result)
+        # L2: raw-bytes content hash (best-effort, fail-open) for content-based invalidation.
+        _lp = task.get("local_path")
+        if _lp and os.path.exists(_lp):
+            try:
+                _h = hashlib.sha256()
+                with open(_lp, "rb") as _rf:
+                    for _blk in iter(lambda: _rf.read(1 << 20), b""):
+                        _h.update(_blk)
+                ctx.setdefault("_raw_checksum", {})[(task["doc_id"], task.get("version_no"))] = _h.hexdigest()
+            except Exception:
+                pass  # checksum is auxiliary; absence → NULL → "process" (never blocks extraction)
 
-            # 日志
-            block_types = {}
-            for b in result.blocks:
-                block_types[b.block_type] = block_types.get(b.block_type, 0) + 1
-            block_summary = ", ".join(f"{k}={v}" for k, v in block_types.items())
+        result = extractor.extract(task)
 
-            if result.ocr_required:
-                print(
-                    f"    └─ {doc_id}: {result.text_length} chars via "
-                    f"{result.extract_method} (OCR {result.ocr_status})"
-                )
-            else:
-                print(
-                    f"    └─ {doc_id}: {result.text_length} chars via "
-                    f"{result.extract_method} [{block_summary}]"
-                )
+        # 日志
+        block_types = {}
+        for b in result.blocks:
+            block_types[b.block_type] = block_types.get(b.block_type, 0) + 1
+        block_summary = ", ".join(f"{k}={v}" for k, v in block_types.items())
+
+        if result.ocr_required:
+            print(
+                f"    └─ {doc_id}: {result.text_length} chars via "
+                f"{result.extract_method} (OCR {result.ocr_status})"
+            )
+        else:
+            print(
+                f"    └─ {doc_id}: {result.text_length} chars via "
+                f"{result.extract_method} [{block_summary}]"
+            )
+        return result
+
+    try:
+        if extract_concurrency > 1 and len(tasks) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            print(f"    └─ Extracting {len(tasks)} docs with {extract_concurrency} concurrent workers "
+                  f"(RAG_EXTRACT_CONCURRENCY)...")
+
+            def _extract_isolated(idx_task):
+                idx, task = idx_task
+                sub = os.path.join(tmp_dir, f"doc_{idx}")
+                os.makedirs(sub, exist_ok=True)
+                return _extract_one(task, sub)
+
+            with ThreadPoolExecutor(max_workers=extract_concurrency) as _pool:
+                # executor.map 保持 tasks 原序；单文档异常冒泡 fail 整节点（与串行一致）
+                extractions = list(_pool.map(_extract_isolated, enumerate(tasks)))
+        else:
+            for task in tasks:
+                extractions.append(_extract_one(task, tmp_dir))
     finally:
         # ─── 在清理 tmp 之前，将保留图片上传到 OSS ───
         # 解决 local_path 生命周期问题：downstream 的 embedding 节点不再依赖 local_path。
@@ -416,6 +445,13 @@ def node_extract_text_with_ocr(ctx: dict):
         bucket_upload, is_sim_oss = _get_oss_bucket(ctx)
         if not is_sim_oss and bucket_upload:
             _upload_clean_assets(extractions, bucket_upload)
+
+        # perf#27：VLM 缓存的 OSS 整包上传已降频为每 N 文档一次，这里 flush 未满一轮的尾巴
+        # （无脏时零动作；失败不影响提取结果——本地副本已逐文档原子落盘）
+        try:
+            UnifiedExtractor.flush_vlm_cache_to_oss()
+        except Exception as _ve:
+            print(f"    ⚠️ VLM cache OSS flush failed (non-fatal): {_ve}")
 
         # 清理临时文件
         import shutil
@@ -5341,63 +5377,37 @@ def node_generate_embeddings(ctx: dict):
         max_retries = config.embedding.max_retries  # default: 3
         request_timeout = 60  # seconds per HTTP request
 
-        # ── 本地 embedding 缓存（与 tests/eval 共享同一份 cache 文件）──
-        # 容量上限：每个 dense entry ≈ 20KB JSON，每个 sparse entry ≈ 2KB
-        # 20000 entries ≈ dense 10000 + sparse 10000 ≈ 220MB（JSON 文件上限）
+        # ── 本地 embedding 缓存（perf#18/19/20：SQLite KV + 进程级单例 + OSS 镜像）──
+        # 旧 scratch/embedding_cache.json 整读整写形态（每批 json.load/重写 ~220MB、
+        # serverless 永远冷）的问题、迁移与镜像语义见 embedding_cache.py 模块 docstring。
+        # 键/值契约不变：md5(f"{model}_{text}")，sparse 条目 "sp_" 前缀。DET: 崩溃安全
+        # 由 SQLite WAL 日志保证（等价旧实现的 temp + os.replace 原子写不变量）。
+        # 存量 JSON 首次自动迁移进 sqlite；JSON 文件原样保留供 tests/eval 脚本独立使用。
         _CACHE_MAX_ENTRIES = int(os.environ.get("RAG_EMBEDDING_CACHE_MAX_ENTRIES", "20000"))
-        _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _cache_file = os.path.join(_project_root, "scratch", "embedding_cache.json")
-        _cache = {}
-        if os.path.exists(_cache_file):
-            try:
-                _cache_size_bytes = os.path.getsize(_cache_file)
-                if _cache_size_bytes > 100 * 1024 * 1024:  # > 100MB
-                    print(f"    ⚠️ Embedding cache file is large: {_cache_size_bytes / 1024 / 1024:.0f}MB. "
-                          f"Consider lowering RAG_EMBEDDING_CACHE_MAX_ENTRIES (current: {_CACHE_MAX_ENTRIES}).")
-                with open(_cache_file, "r", encoding="utf-8") as _cf:
-                    _cache = json.load(_cf)
-                print(f"    └─ Loaded embedding cache: {len(_cache)} entries from {_cache_size_bytes / 1024 / 1024:.1f}MB file")
-            except Exception:
-                _cache = {}
+        from opensearch_pipeline.embedding_cache import get_embedding_cache
+        _store = get_embedding_cache()
+        print(f"    └─ Embedding cache ready: backend={_store.backend}, {_store.count()} entries")
 
         def _cache_key(text):
             return hashlib.md5(f"{embedding_model}_{text}".encode("utf-8")).hexdigest()
 
-        def _evict_oldest(cache, max_entries):
-            """淘汰最旧的条目（dict 按插入顺序迭代，Python 3.7+）。"""
-            if len(cache) <= max_entries:
-                return cache
-            evict_count = len(cache) - max_entries
-            keys_to_evict = list(cache.keys())[:evict_count]
-            for k in keys_to_evict:
-                del cache[k]
-            print(f"    └─ Evicted {evict_count} oldest cache entries (cap: {max_entries})")
-            return cache
-
-        def _save_cache():
-            try:
-                _evict_oldest(_cache, _CACHE_MAX_ENTRIES)
-                os.makedirs(os.path.dirname(_cache_file), exist_ok=True)
-                # DET: atomic write (temp + os.replace) — a half-written cache JSON would force a
-                # full cache-miss re-embed next run (and is a known B-vs-B nondeterminism hazard).
-                _tmp = f"{_cache_file}.tmp.{os.getpid()}"
-                with open(_tmp, "w", encoding="utf-8") as _cf:
-                    json.dump(_cache, _cf, ensure_ascii=False)
-                os.replace(_tmp, _cache_file)
-            except Exception as e:
-                print(f"    ⚠️ Failed to save embedding cache: {e}")
-
-        # 分离 cache hit / miss
+        # 分离 cache hit / miss（一次批量点查，dense+sparse 两键族）
         cache_hits = 0
         miss_chunks = []
+        _all_keys = []
+        for chunk in chunks:
+            _ck = _cache_key(chunk.chunk_text)
+            _all_keys.append(_ck)
+            _all_keys.append(f"sp_{_ck}")
+        _found = _store.get_many(_all_keys)
         for chunk in chunks:
             ck = _cache_key(chunk.chunk_text)
             sp_ck = f"sp_{ck}"
-            if ck in _cache:
-                chunk.embedding_vector = _cache[ck]
+            if ck in _found:
+                chunk.embedding_vector = _found[ck]
                 chunk.embedding_model = embedding_model
                 chunk.embedding_status = "DONE"
-                sp_data = _cache.get(sp_ck, {})
+                sp_data = _found.get(sp_ck) or {}
                 if sp_data:
                     chunk.sparse_vector_indices = sp_data.get("indices", [])
                     chunk.sparse_vector_values = sp_data.get("values", [])
@@ -5406,7 +5416,7 @@ def node_generate_embeddings(ctx: dict):
                 miss_chunks.append(chunk)
 
         if cache_hits > 0:
-            print(f"    └─ Embedding cache hit: {cache_hits}/{len(chunks)} chunks (from {os.path.basename(_cache_file)})")
+            print(f"    └─ Embedding cache hit: {cache_hits}/{len(chunks)} chunks (sqlite)")
 
         if not miss_chunks:
             print(f"    └─ All {len(chunks)} chunks served from cache, no API calls needed")
@@ -5416,15 +5426,14 @@ def node_generate_embeddings(ctx: dict):
             # HTTP/URL/重试/解析与查询侧共用 embedding_client.embed_texts_native（消除漂移）。
             from opensearch_pipeline.embedding_client import embed_texts_native
             # ── 并发生成 embedding：每个 size-batch_size 的 batch 一个线程 ──
-            # RAG_EMBED_CONCURRENCY 控制并发度（默认 5，保守值）。DashScope text-embedding
-            # 有账户级 QPS 限制，可按配额上调/下调。每个 batch 内保留 2**attempt 指数退避以吸收
-            # 429，因此移除了原先无条件的 time.sleep(1)（对 1000 chunks ≈ 100s 纯空转）。
+            # RAG_EMBED_CONCURRENCY 控制并发度（默认 5，保守值；配额允许时可经环境变量提到
+            # 8-10，perf#20——吞吐近似线性）。DashScope text-embedding 有账户级 QPS 限制，
+            # 可按配额上调/下调。每个 batch 内保留 2**attempt 指数退避以吸收 429，
+            # 因此移除了原先无条件的 time.sleep(1)（对 1000 chunks ≈ 100s 纯空转）。
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            import threading
 
             embed_concurrency = max(1, int(os.environ.get("RAG_EMBED_CONCURRENCY", "5")))
             batches = [miss_chunks[i:i + batch_size] for i in range(0, len(miss_chunks), batch_size)]
-            _cache_lock = threading.Lock()
 
             def _embed_one_batch(batch_no, batch):
                 try:
@@ -5461,17 +5470,16 @@ def node_generate_embeddings(ctx: dict):
                     batch[i].sparse_vector_indices = sidx
                     batch[i].sparse_vector_values = sval
 
-                # 写入缓存（多线程共享 _cache，加锁保护）
-                with _cache_lock:
-                    for c in batch:
-                        if c.embedding_status == "DONE":
-                            ck = _cache_key(c.chunk_text)
-                            _cache[ck] = c.embedding_vector
-                            sp_data = {}
-                            if getattr(c, 'sparse_vector_indices', None):
-                                sp_data = {"indices": c.sparse_vector_indices, "values": c.sparse_vector_values}
-                            if sp_data:
-                                _cache[f"sp_{ck}"] = sp_data
+                # 写入缓存（store 内部线程安全；本批一次 executemany+commit 增量落盘）
+                _updates = {}
+                for c in batch:
+                    if c.embedding_status == "DONE":
+                        ck = _cache_key(c.chunk_text)
+                        _updates[ck] = c.embedding_vector
+                        if getattr(c, 'sparse_vector_indices', None):
+                            _updates[f"sp_{ck}"] = {"indices": c.sparse_vector_indices,
+                                                    "values": c.sparse_vector_values}
+                _store.put_many(_updates)
 
             if embed_concurrency > 1 and len(batches) > 1:
                 print(f"    └─ Embedding {len(batches)} batches with {embed_concurrency} concurrent workers...")
@@ -5482,8 +5490,8 @@ def node_generate_embeddings(ctx: dict):
             else:
                 for bn, b in enumerate(batches):
                     _embed_one_batch(bn, b)
-            _save_cache()
-            print(f"    └─ Embedding cache updated: {len(_cache)} total entries")
+            _store.finalize(_CACHE_MAX_ENTRIES)
+            print(f"    └─ Embedding cache updated: {_store.count()} total entries")
         elif not is_dashscope and miss_chunks:
             print(f"    └─ Calling Gemini API for {len(miss_chunks)} cache-miss chunks (batch_size={batch_size}, model={embedding_model}, max_retries={max_retries})...")
             for i in range(0, len(miss_chunks), batch_size):
@@ -5513,10 +5521,9 @@ def node_generate_embeddings(ctx: dict):
                             batch[idx].embedding_model = embedding_model
                             batch[idx].embedding_status = "DONE"
                         # 写入缓存
-                        for c in batch:
-                            if c.embedding_status == "DONE":
-                                ck = _cache_key(c.chunk_text)
-                                _cache[ck] = c.embedding_vector
+                        _store.put_many({
+                            _cache_key(c.chunk_text): c.embedding_vector
+                            for c in batch if c.embedding_status == "DONE"})
                         last_error = None
                         break  # success
                     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -5543,8 +5550,8 @@ def node_generate_embeddings(ctx: dict):
                     raise RuntimeError(f"Gemini API invocation failed during embedding generation: {last_error}")
 
                 time.sleep(1)
-            _save_cache()
-            print(f"    └─ Embedding cache updated: {len(_cache)} total entries")
+            _store.finalize(_CACHE_MAX_ENTRIES)
+            print(f"    └─ Embedding cache updated: {_store.count()} total entries")
         # ─── 图片 chunk embedding 说明 ───
         # 实验证明 text-embedding-v4 + visual_summary 文本描述 = 最优检索效果
         # 图片 chunk 已通过 chunk_text ("[Image Schematic] {visual_summary}") 走统一批量 text-embedding-v4 路径

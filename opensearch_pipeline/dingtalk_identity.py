@@ -236,8 +236,53 @@ def _normalize_dept_to_codes(raw: Union[str, List[str], None]) -> List[str]:
 # 用户部门解析（机器人 + 小程序共用）
 # ═══════════════════════════════════════════════════════════════
 
+# 机器人路径的进程内短 TTL 缓存（perf#17）：_process_rag_query 每条消息都同步调
+# _resolve_user_dept，即使 user_role 命中也要一次阻塞 RDS 往返，压在用户首字延迟上。
+# 只缓存【确定性来源】的非空解析（fresh 缓存行 / API 完整成功）——partial（等下次自愈）、
+# API 失败回退旧缓存（等下次重试）、fail-closed []（未知用户逐次重查）一律不缓存，
+# 各 fail-open/fail-closed 语义原样保留。撤销/调岗窗口 = TTL（默认 90s，远短于会话粒度）；
+# RAG_BOT_DEPT_CACHE_TTL_SECONDS=0 关闭。conftest 每测清空。
+_bot_dept_cache: dict = {}
+_bot_dept_cache_lock = threading.Lock()
+
+
+def _bot_dept_cache_ttl_seconds() -> float:
+    try:
+        return float(os.environ.get("RAG_BOT_DEPT_CACHE_TTL_SECONDS", "90"))
+    except ValueError:
+        return 90.0
+
+
+def _bot_dept_cache_clear() -> None:
+    with _bot_dept_cache_lock:
+        _bot_dept_cache.clear()
+
+
 def _resolve_user_dept(staff_id: str) -> List[str]:
-    """从 RDS user_role 表查询用户所属 ACL 权限组【列表】。
+    """从 RDS user_role 表查询用户所属 ACL 权限组【列表】（进程内 TTL 缓存，见 _bot_dept_cache）。
+
+    语义与缓存策略详见 _resolve_user_dept_live；本包装层只对确定性非空结果做短 TTL 复用。
+    """
+    if not staff_id or staff_id.startswith("$:"):
+        return []
+    ttl = _bot_dept_cache_ttl_seconds()
+    now = time.time()
+    if ttl > 0:
+        with _bot_dept_cache_lock:
+            ent = _bot_dept_cache.get(staff_id)
+            if ent is not None and ent[0] > now:
+                return list(ent[1])
+    codes, cacheable = _resolve_user_dept_live(staff_id)
+    if ttl > 0 and cacheable and codes:
+        with _bot_dept_cache_lock:
+            _bot_dept_cache[staff_id] = (now + ttl, list(codes))
+            if len(_bot_dept_cache) > 4096:   # 粗粒度防胀，同 _live_acl_cache
+                _bot_dept_cache.clear()
+    return codes
+
+
+def _resolve_user_dept_live(staff_id: str) -> "tuple[List[str], bool]":
+    """_resolve_user_dept 的真实解析体。返回 (组列表, cacheable)。
 
     user_role 中不存在时，自动通过钉钉 API 获取（遍历完整 dept_id_list）并缓存。
     查询失败或用户不存在时返回 []，调用方据此降级为只返回 public 文档（fail-closed）。
@@ -245,10 +290,10 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
     ⚠️ seeded 行优先（H3）：本函数先 SELECT 缓存，命中即返回；【只有】缓存为空才调
     API 并 INSERT。因此人工 seeded 的 user_role 行（如个人级覆盖 乐敏杰→admin）会被
     SELECT 命中并返回，API 分支根本不触发，绝不会被自动部门映射覆盖。
-    """
-    if not staff_id or staff_id.startswith("$:"):
-        return []
 
+    cacheable=True 仅限确定性来源：fresh 缓存行 / API 完整成功（含穿透刷新）。partial、
+    API 失败回退旧缓存、fail-closed [] 都标 False——让下一条消息照旧重查/自愈。
+    """
     try:
         from opensearch_pipeline.db import _get_db_conn
 
@@ -284,7 +329,7 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
                     if not _stale:
                         logger.info("用户权限组解析成功（缓存）: staff_id=%s → raw=%s（groups=%s）",
                                     staff_id, row[0], codes)
-                        return codes
+                        return codes, True
                     _cached_codes = codes
                     logger.info("ACL 缓存过期，穿透重查钉钉 API: staff_id=%s age=%ss ttl=%ss",
                                 staff_id, _age, _ttl)
@@ -298,7 +343,7 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
                     # 仍是真实子集=fail-closed 方向）。下次调用重新走 API 复核，自愈。
                     fresh = _normalize_dept_to_codes(user_info.get("dept_name", ""))
                     logger.warning("用户部门解析不完整（department/get 瞬时失败），跳过缓存: staff_id=%s", staff_id)
-                    return _cached_codes if _cached_codes is not None else fresh
+                    return (_cached_codes if _cached_codes is not None else fresh), False
                 dept_name = user_info.get("dept_name", "")
                 user_name = user_info.get("user_name", "")
                 # 3. 缓存到 user_role 表（employee 行；ON DUPLICATE KEY UPDATE 刷新 updated_at；
@@ -321,19 +366,19 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
                 except Exception as cache_err:
                     logger.warning("缓存用户信息失败: %s", cache_err)
                 # 缓存原始中文名（便于在 DMS/钉钉侧对照），返回时归一化为组列表
-                return _normalize_dept_to_codes(dept_name)
+                return _normalize_dept_to_codes(dept_name), True
             else:
                 # API 失败：穿透场景退回旧缓存（不丢已知部门）；纯 cache-miss 才 fail-closed []
                 if _cached_codes is not None:
                     logger.warning("穿透重查 API 失败，退回旧缓存: staff_id=%s", staff_id)
-                    return _cached_codes
+                    return _cached_codes, False
                 logger.warning("用户未在 user_role 表中注册且 API 查询失败: staff_id=%s", staff_id)
-                return []
+                return [], False
         finally:
             conn.close()
     except Exception as e:
         logger.warning("查询用户部门失败 staff_id=%s: %s", staff_id, e)
-        return []
+        return [], False
 
 
 # 读时复核的进程内短 TTL 缓存（性能第一梯队 #3）：RAG_LIVE_ACL_REREAD 默认开 →

@@ -71,6 +71,29 @@ def _pool_readonly_declared(full_cfg) -> bool:
     return not _ack_today(os.environ.get("RAG_DESTRUCTIVE_PROD_ACK", ""))
 
 
+def _pool_max_connections() -> int:
+    """池上限（perf#13/#14）。默认 max(20, RAG_CLASSIFY_CONCURRENCY+4)，RAG_DB_POOL_MAX 显式覆盖。
+
+    背景：固定 10 时（blocking=True 无超时），serving 侧看板类长查询 + AnyIO 线程池（默认 120 令牌）
+    并发 >10 即让其余请求无限期静默等连接（『问答莫名卡住』尾延迟，无日志线索）；摄取侧
+    classify 并发（默认 8）逼近上限后，调大 RAG_CLASSIFY_CONCURRENCY 会被池上限静默串行化。
+    20 只是上限不是常驻——mincached=2/maxcached=5 不变，空闲连接照旧回收，RDS 侧成本≈0。"""
+    try:
+        classify_conc = int(os.environ.get("RAG_CLASSIFY_CONCURRENCY", "8") or 8)
+    except ValueError:
+        classify_conc = 8
+    default_max = max(20, classify_conc + 4)
+    try:
+        v = int(os.environ.get("RAG_DB_POOL_MAX", str(default_max)))
+        maxconn = v if v > 0 else default_max
+    except ValueError:
+        maxconn = default_max
+    if classify_conc > maxconn:
+        print(f"    ⚠️ [Pool] RAG_CLASSIFY_CONCURRENCY={classify_conc} > 池上限 {maxconn}——"
+              f"blocking=True 下超出部分将串行等连接，调参无效果；请同步调大 RAG_DB_POOL_MAX。")
+    return maxconn
+
+
 def _init_db_pool():
     """懒初始化 MySQL 连接池。"""
     global _db_pool
@@ -105,11 +128,12 @@ def _init_db_pool():
     # 互补，并把守卫覆盖面从"simulate_db=True"扩展到声明式只读的真实跑。
     pool_readonly = _pool_readonly_declared(full_cfg)
 
+    _max_conn = _pool_max_connections()
     pool_kwargs = dict(
         creator=pymysql,
         mincached=2,           # 池中保持的最小空闲连接数
         maxcached=5,           # 池中保持的最大空闲连接数
-        maxconnections=10,     # 池允许的最大连接数 (0 = 无限制)
+        maxconnections=_max_conn,  # 池上限（perf#13/#14 可配+联动，见 _pool_max_connections）
         blocking=True,         # 连接数耗尽时阻塞等待，而非抛异常
         ping=1,                # 每次取连接时 ping 一次，自动重连 (应对 MySQL wait_timeout)
         host=cfg.host,
@@ -128,7 +152,8 @@ def _init_db_pool():
         pool_kwargs["init_command"] = "SET SESSION TRANSACTION READ ONLY"
 
     _db_pool = PooledDB(**pool_kwargs)
-    print(f"    [Pool] MySQL connection pool initialized (min=2, max=10, "
+    print(f"    [Pool] MySQL connection pool initialized (min=2, max={_max_conn}, "
+          f"classify_concurrency={os.environ.get('RAG_CLASSIFY_CONCURRENCY', '8')}, "
           f"host={cfg.host}:{cfg.port}, db={cfg.database}"
           + ("，🔒 SESSION READ ONLY（声明式只读）" if pool_readonly else "") + ")")
 
