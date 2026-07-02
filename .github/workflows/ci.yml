@@ -45,6 +45,33 @@ jobs:
         # 复刻 loadfile 语义并把共享本地栈的模块钉到同一 worker（CI 无本地 DB，该组多为 skip）。
         run: python -m pytest tests/ -q -p no:cacheprovider -n auto --dist loadgroup
 
+  # 供应链/密钥门（P2-03）：secret 扫描 + 依赖 CVE 审计。此前 CI 完全无安全门。
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 全历史：gitleaks 既扫工作树也扫历史提交
+      # 【阻塞】secret 扫描：默认规则 + .gitleaks.toml 白名单（测试合成假 key + 生产指纹非密钥）。
+      # 价值主要在【防未来误提交】真凭证——当前 .mcp.json/.env.* 均 gitignored，工作树本就干净。
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # 依赖 CVE 审计：首次落地设【非阻塞】——上游传递依赖的 CVE 不受本仓库控制，先看基线、
+      # 建 ignore 清单后再翻成阻塞（勿一上来就红全员）。翻阻塞：删 continue-on-error 即可。
+      - name: Dependency CVE audit (pip-audit — informational until baseline triaged)
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -e ".[production,api,ocr]"
+          python -m pip_audit --desc
+
   # 前端门（console-app Vite/Vue3）：此前完全无 CI——135 个 vitest 与 vue-tsc 类型检查从未在
   # 合并前跑过。本 job 把它们设为【阻塞】门：build 含 vue-tsc 类型检查（package.json:8），故无需
   # 单独 typecheck 步。node 22 对齐本地工具链；构建产物（next-dist/）gitignore，仅作编译校验。

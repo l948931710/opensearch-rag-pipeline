@@ -78,14 +78,18 @@ def test_api_health_still_dumb_liveness():
 # ── canary: /api/version build fingerprint + Dockerfile GIT_SHA bake ──
 
 def test_api_version_returns_build_fingerprint():
-    """/api/version 暴露 git_commit + 模型版本 + 环境（canary 校验/回滚确认）。"""
+    """/api/version 仅暴露 git_commit + 模型版本（canary 校验/回滚确认）。
+
+    P2-05：environment / simulate 已从公开响应移除——它们泄露部署形态（prod/staging、是否 sim）
+    给任何匿名调用方、无运维价值。此处断言二者【不再出现】，防回归。"""
     from fastapi.testclient import TestClient
     from opensearch_pipeline.api import app
     r = TestClient(app).get("/api/version")
     assert r.status_code == 200
     body = r.json()
     assert body.get("git_commit")                       # 非空（git rev-parse 或 RAG_GIT_SHA 或 'unknown'）
-    assert "embedding_model_version" in body and "environment" in body
+    assert "embedding_model_version" in body
+    assert "environment" not in body and "simulate" not in body   # P2-05：不外泄部署形态
 
 
 def test_api_version_honors_rag_git_sha(monkeypatch):

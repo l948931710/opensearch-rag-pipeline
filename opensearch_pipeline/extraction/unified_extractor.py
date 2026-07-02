@@ -659,6 +659,18 @@ class UnifiedExtractor:
         except Exception as _e:
             print(f"    ⚠️ [table_refine] skipped (non-fatal): {_e}", flush=True)
 
+        # P1-09：标注原生抽取页上限截断。page_count 是【真实总页数】（extract_pdf 切片前计算），
+        # 用入口处的 page_count 局部量（OCR/VLM 重建 result 时可能不透传），并回写 result.page_count
+        # 确保总页数落库（document_version.page_count），供治理看板按 page_count>上限 统计截断文档数。
+        if (page_count or 0) > self.PDF_NATIVE_MAX_PAGES:
+            result.extract_truncated = True
+            result.extracted_pages = self.PDF_NATIVE_MAX_PAGES
+            result.page_count = page_count
+            result.warnings.append(
+                f"[TRUNCATED] PDF 共 {page_count} 页，仅前 {self.PDF_NATIVE_MAX_PAGES} 页被抽取；"
+                f"第 {self.PDF_NATIVE_MAX_PAGES + 1} 页起的内容未进入索引（含 OCR）。"
+            )
+
         return result
 
     # ── DOCX ──

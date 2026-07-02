@@ -98,6 +98,39 @@ _TIMESTAMP_TOLERANCE = 3600
 
 
 # ═══════════════════════════════════════════════════════════════
+# 事件级防重放（P2-09）：签名只锁 timestamp 且窗口 1h——窗口内被日志/代理/网络设备
+# 捕获的合法请求可重复投递，触发重复 LLM 调用与重复回复。以 msgId 做幂等去重：
+# 同一 msgId 在窗口内二次到达直接忽略。进程内 TTL 表（与 session/限流一致，--workers 1
+# 下即全局权威；多副本需迁 Redis）。
+# ═══════════════════════════════════════════════════════════════
+_seen_msg_ids: Dict[str, float] = {}
+_seen_msg_lock = threading.Lock()
+_SEEN_MSG_MAX = 20000
+
+
+def _is_duplicate_msg(msg_id: str) -> bool:
+    """msgId 在防重放窗口内是否已处理过。空 / 缺失 msgId 无法去重 → 一律按新消息放行。
+
+    首次见到即登记（now+TTL 过期）并返回 False；窗口内二次见到返回 True。TTL 对齐签名时间窗
+    （_TIMESTAMP_TOLERANCE）。粗粒度防胀：条目超 _SEEN_MSG_MAX 先清过期，仍超则整表清空。"""
+    if not msg_id or msg_id == "?":
+        return False
+    now = time.time()
+    ttl = _TIMESTAMP_TOLERANCE
+    with _seen_msg_lock:
+        exp = _seen_msg_ids.get(msg_id)
+        if exp is not None and exp > now:
+            return True
+        if len(_seen_msg_ids) >= _SEEN_MSG_MAX:
+            for k in [k for k, v in _seen_msg_ids.items() if v <= now]:
+                _seen_msg_ids.pop(k, None)
+            if len(_seen_msg_ids) >= _SEEN_MSG_MAX:
+                _seen_msg_ids.clear()
+        _seen_msg_ids[msg_id] = now + ttl
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
 # 签名验证
 # ═══════════════════════════════════════════════════════════════
 
@@ -783,6 +816,12 @@ def _process_webhook_body(body: dict):
         body.get("conversationType", "?"),
         body.get("msgId", "?"),
     )
+
+    # 事件级幂等（P2-09）：同一 msgId 在签名时间窗内二次投递（重放/网络重试）→ 直接忽略，
+    # 不再触发一次 RAG/LLM 调用与重复回复。放在问题提取/「补充原因」回收/ack 之前。
+    if _is_duplicate_msg(str(body.get("msgId") or "")):
+        logger.info("钉钉消息重复投递已忽略（幂等）: msgId=%s", body.get("msgId", "?"))
+        return {"msgtype": "duplicate"}
 
     # 3. 提取问题文本
     question = _extract_question(body)

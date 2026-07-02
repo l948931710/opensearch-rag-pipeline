@@ -350,6 +350,11 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
 # ─────────────────────────────────────────────────────────────────────────────
 _KB_INSIGHTS_WINDOW_DAYS = 30
 
+# P1-09：PDF 原生抽取页上限（治理看板「截断文档数」判据）。须与
+# extraction.unified_extractor.PDF_NATIVE_MAX_PAGES 一致；此处独立定义避免把重抽取依赖
+# 拖进 serving 进程（F-A1 拆分意图）。改动上限时两处同步。
+_PDF_NATIVE_MAX_PAGES = 20
+
 # 看板聚合 TTL 缓存（性能第一梯队 #6）：insights/governance 每请求现算 4-14 条聚合
 # 子查询（含 JSON_TABLE 跨库 JOIN），30 天窗口对分钟级 staleness 完全不敏感。
 # 键含作用域（dept_admin 的 managed 部门集 / kb_admin=GLOBAL），角色校验先于缓存读；
@@ -582,6 +587,7 @@ class KbGovernanceResponse(BaseModel):
     docs_active: int = 0
     docs_in_index: int = 0
     dual_version_docs: int = 0
+    pdf_truncated_docs: int = 0          # P1-09：现役 PDF 总页数超原生抽取上限（仅前 N 页上线）的文档数
     avg_latency_ms: int = 0
     p50_latency_ms: int = 0
     p95_latency_ms: int = 0
@@ -664,6 +670,19 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 out.dual_version_docs = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance dual_version 失败: %s", e)
+            # 2b) PDF 页上限截断（P1-09）：现役文档的当前版本是 PDF 且真实总页数 > 原生抽取上限，
+            #     即「仅前 N 页上线」的文档——21 页起的内容既无原生文本也未进 OCR，静默丢知识。
+            #     上限值须与 extraction.unified_extractor.PDF_NATIVE_MAX_PAGES 保持一致（当前 20）。
+            try:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {_kb_db()}.document_meta m"
+                    f" JOIN {_kb_db()}.document_version v"
+                    "   ON v.doc_id=m.doc_id AND v.version_no=m.current_version_no"
+                    " WHERE m.status='active' AND v.file_ext='pdf' AND v.page_count > %s",
+                    (_PDF_NATIVE_MAX_PAGES,))
+                out.pdf_truncated_docs = int((cur.fetchone() or (0,))[0] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_governance pdf_truncated 失败: %s", e)
             # 3) 端到端延迟（avg + p50/p95 + 检索/生成分段；窗口内 latency_ms>0）
             try:
                 cur.execute(
@@ -1368,6 +1387,17 @@ def kb_register(req: KbRegisterRequest, request: Request,
                         status_badge=_kb_status_badge(won[2], None, "active"),
                         idempotent=True, title=payload.get("title") or "",
                     )
+            # P2-06：登记与审计【同事务】原子提交——审计行随该版本一并 commit（失败则一并回滚 →
+            # 500 可重试）。此前 audit 在 commit 之后用独立连接写且吞异常：进程崩在 commit 与 audit
+            # 之间 → 留下有登记、无审计的业务变更。kb_audit_log 与 document_version 同库同服务器
+            # （均 {_kb_db()}，_audit_insert_sql 全限定表名），故可复用本连接的事务。
+            with conn.cursor() as _acur:
+                write_audit(doc_id=doc_id, version_no=version_no,
+                            action_type=("VERSION_UP" if action == "version" else "UPLOAD_REGISTER"),
+                            operator_type="user", operator_id=kb.user_id, oss_key=raw_key,
+                            trace_id=trace_id,
+                            message=f"owner={owner} perm={perm} approval={appr} share={payload.get('share_owner_depts')}",
+                            cursor=_acur)
             conn.commit()
         finally:
             conn.close()
@@ -1376,11 +1406,6 @@ def kb_register(req: KbRegisterRequest, request: Request,
     except Exception as e:
         logger.error("kb_register 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"登记失败 (trace: {trace_id})")
-
-    write_audit(doc_id=doc_id, version_no=version_no,
-                action_type=("VERSION_UP" if action == "version" else "UPLOAD_REGISTER"),
-                operator_type="user", operator_id=kb.user_id, oss_key=raw_key, trace_id=trace_id,
-                message=f"owner={owner} perm={perm} approval={appr} share={payload.get('share_owner_depts')}")
     # 跨部门内容查重（按 ETag 字节指纹）：advisory，命中也不拦上传——仅在响应里提示，让上传者决定是否退役其一。
     # 升版（同 doc_id 换文件）天然不算重复，故仅新建查；fail-open。
     dups, dups_other = ([], 0)

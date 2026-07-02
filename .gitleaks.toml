@@ -1,0 +1,23 @@
+# gitleaks 配置（CI secret 门禁，P2-03）
+# 默认规则 + 本仓库的白名单：合成测试夹具（非真实密钥）与生产资源【指纹】（实例 ID，非凭证）。
+# 真凭证（AccessKey/AppSecret/DashScope key）从不入库——.mcp.json / .env.* 均 gitignored。
+title = "fuling-rag gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "合成测试夹具 + 生产资源指纹（非密钥）"
+# 路径白名单：脱敏/日志测试里内置 pattern-valid 的【假】AccessKey 做正/负样本，非真实密钥。
+paths = [
+  '''tests/test_redaction\.py''',
+  '''tests/test_qa_logger\.py''',
+]
+# 具体字符串白名单：
+#  - LTAIabcd1234efgh5678 —— 测试用合成假 AccessKey（tests/ 内多处引用）。
+#  - rm-…/ha-cn-… —— 生产 RDS/HA3 实例标识子串（config.PROD_FINGERPRINTS，注释明确"非密钥"）。
+regexes = [
+  '''LTAIabcd1234efgh5678''',
+  '''rm-bp15j7wekd5738f093o''',
+  '''ha-cn-kgl4slr1n01''',
+]

@@ -144,6 +144,9 @@ def test_register_new_happy_path(monkeypatch):
     assert resp.idempotent is False
     assert resp.title == "营销方案"
     assert conn.committed is True
+    # P2-06：审计随登记【同事务】写入——kb_audit_log INSERT 必须走【同一】conn（改动前是 commit 后
+    # 另开连接写、且吞异常）。它出现在本 conn.calls 里即证明同连接/同事务（崩在两步之间不再丢审计）。
+    assert any(sql for sql, _ in conn.calls if "kb_audit_log" in sql), "审计未在登记事务内写入（P2-06 回归）"
     # raw_key_hash 写入：document_version INSERT 的 params 含 sha256(raw_key)
     sql, params = _version_insert_call(conn)
     assert sql is not None and "raw_key_hash" in sql

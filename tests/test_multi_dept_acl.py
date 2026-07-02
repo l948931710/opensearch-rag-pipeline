@@ -52,11 +52,14 @@ def test_same_permission_guard():
     assert not _same_permission({"permission_level": "dept_internal", "owner_dept": "hr"}, center)
 
 
-def test_same_permission_defaults_public():
+def test_same_permission_defaults_restricted():
+    # P2-02：缺 permission_level 一律按最严的 restricted 兜底（fail-closed），不再默认 public。
     from opensearch_pipeline.retriever import _same_permission
-    # 缺字段默认 public/""，两个 public 行视为一致
+    # 两侧都缺 → 都 restricted → 仍视为一致（同为未知，可拼）
     assert _same_permission({}, {})
-    assert _same_permission({"permission_level": "public", "owner_dept": ""}, {})
+    # 已知 public 行 vs 权限缺失（→restricted）中心 → 不一致 → 不拼接
+    # （改前默认 public 会把已知 public 误判成与未知中心一致，正是本项要堵的宽松兜底）
+    assert not _same_permission({"permission_level": "public", "owner_dept": ""}, {})
 
 
 # ── build_qa_log_kwargs：list → CSV ─────────────────────────────

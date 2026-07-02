@@ -58,6 +58,7 @@ from opensearch_pipeline.answer_flow import (
     should_append_history,
 )
 from opensearch_pipeline.config import get_config
+from opensearch_pipeline.db import DBPoolExhausted
 from opensearch_pipeline.request_context import RequestIdMiddleware, get_request_id
 from opensearch_pipeline.session_store import (
     MAX_HISTORY_TURNS,
@@ -155,6 +156,23 @@ app.add_middleware(RequestIdMiddleware)
 
 # 钉钉机器人路由
 app.include_router(dingtalk_router)
+
+
+@app.exception_handler(DBPoolExhausted)
+async def _db_pool_exhausted_handler(request: Request, exc: DBPoolExhausted):
+    """P1-07：连接池获取超时 → 503 DB_POOL_EXHAUSTED（而非无限挂起 / 裸 500）。
+
+    读路径的绝大多数 DB 用途（邻居缝合 / qa 落库 / 读时 acl 复核）本就 fail-open，会各自
+    吞掉本异常降级作答；本处理器只兜住那些把 DB 当关键依赖、未 fail-open 的端点（如 /api/history、
+    kb 控制台），给出明确的可重试信号而非模糊的高尾延迟。"""
+    from fastapi.responses import JSONResponse
+    logger.warning("DB 连接池获取超时 [trace=%s]: %s", get_request_id(), exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "服务繁忙，请稍后重试", "code": "DB_POOL_EXHAUSTED",
+                 "trace_id": get_request_id()},
+        headers={"Retry-After": "2"},
+    )
 
 
 
@@ -374,7 +392,9 @@ def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity]
 
     计数主体：已验证令牌按 user_id（令牌即身份，限额更宽）；匿名按客户端 IP（严格档）。
     请求体里的 user_id 是未鉴权字段，绝不能用作限流 key（攻击者可随意轮换）。
-    限流器自身异常 fail-open 放行——防护组件绝不拖垮回答主链路（项目降级约定）。
+    限流器异常时的降级姿态【按 scope 分叉】（P1-03）：辅助端点（无成本）fail-open 放行——防护组件绝不
+    拖垮 UI 辅助链路；问答/检索类（成本路径：embedding+HA3±LLM）fail-CLOSED——限流器是最后一道成本
+    防线，异常时放行 = 公网匿名扫描无上限烧百炼预算。异常本应极罕见（纯进程内 dict/锁操作）。
     /api/health 与 /dingtalk/*（验签 + Stream 出站）不经过本函数。
     """
     denial = None
@@ -389,7 +409,11 @@ def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity]
         else:
             denial = LIMITER.admit_aux(actor)
     except Exception:
-        logger.warning("限流器内部异常（fail-open 放行）", exc_info=True)
+        if scope == "ask":
+            logger.error("限流器内部异常（成本路径 fail-CLOSED 拒绝）", exc_info=True)
+            raise HTTPException(status_code=503, detail="服务暂时繁忙，请稍后再试",
+                                headers={"Retry-After": "5"})
+        logger.warning("限流器内部异常（辅助端点 fail-open 放行）", exc_info=True)
         return
     if denial is not None:
         headers = {"Retry-After": str(denial.retry_after)} if denial.retry_after > 0 else None
@@ -414,12 +438,11 @@ async def version_info():
     versions.git_commit()（RAG_GIT_SHA env 优先；Dockerfile 构建期烤入）。仅暴露短 SHA + 模型版本 +
     环境标签，低敏感，与 /api/health、/api/ready、/api/kb/config 同为公开探针。"""
     from opensearch_pipeline.versions import EMBEDDING_MODEL_VERSION, git_commit
-    cfg = get_config()
+    # P2-05：仅回灰度/回滚必需的 git_commit + 模型版本。此前额外暴露 environment / simulate
+    # 给任何匿名调用方——泄露部署形态（是否 sim、prod/staging），无运维价值、增侦察面，故移除。
     return {
         "git_commit": git_commit(),
         "embedding_model_version": EMBEDDING_MODEL_VERSION,
-        "environment": getattr(cfg, "environment", "unknown"),
-        "simulate": getattr(cfg, "simulate", False),
     }
 
 
@@ -437,6 +460,9 @@ async def readiness_check():
     if getattr(cfg, "simulate", False):
         return {"status": "ok", "mode": "simulate", "rds": "skipped", "ha3": "skipped", "dashscope": "skipped"}
 
+    # P2-05：对外只报组件 up/down（ok/error/skipped），绝不回灌异常原文（DB host / 驱动错误 /
+    # 索引错误经 str(e) 泄露内部拓扑）。完整异常写内部日志，响应带 trace_id 供运维对账。
+    trace_id = get_request_id()
     checks: Dict[str, str] = {}
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -449,7 +475,8 @@ async def readiness_check():
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 - readiness must report, not raise
-        checks["rds"] = f"error: {str(e)[:80]}"
+        logger.warning("readiness: RDS 探针失败 [trace=%s]: %s", trace_id, e)
+        checks["rds"] = "error"
 
     try:
         from opensearch_pipeline.retriever import _get_ha3_client
@@ -466,12 +493,13 @@ async def readiness_check():
                 include_vector=False, output_fields=["id"], filter="id>=0 AND id<1"))
             checks["ha3"] = "ok"
     except Exception as e:  # noqa: BLE001
-        checks["ha3"] = f"error: {str(e)[:80]}"
+        logger.warning("readiness: HA3 探针失败 [trace=%s]: %s", trace_id, e)
+        checks["ha3"] = "error"
 
     checks["dashscope"] = "configured" if getattr(cfg.embedding, "api_key", None) else "unconfigured"
 
     critical_ok = checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
-    body = {"status": "ok" if critical_ok else "degraded", **checks}
+    body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
     return body if critical_ok else JSONResponse(status_code=503, content=body)
 
 
