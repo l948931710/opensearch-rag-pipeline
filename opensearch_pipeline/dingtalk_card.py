@@ -412,8 +412,9 @@ def send_interactive_card(
     # 防御性清理：LLM 可能仍在 answer 末尾输出参考来源，
     # 卡片已有独立的 sources 区域，需要去重避免大片空白
     clean_answer = _strip_trailing_sources(answer)
-    # 清理 <<IMG:N>> / <IMG:N> 占位符
-    clean_answer = re.sub(r'<{1,2}IMG:\d+>{1,2}', '', clean_answer).strip()
+    # 清理 <<IMG:N>> / <IMG:N> / <<IMG:N.M>> 占位符（#F-mm6：含图级子下标，
+    # 否则 RAG_IMG_SUBINDEX 开时 <<IMG:3.2>> 会以字面量泄漏进钉钉卡兜底文本）
+    clean_answer = re.sub(r'<{1,2}IMG:\d+(?:\.\d+)?>{1,2}', '', clean_answer).strip()
 
     # 当有 content_blocks 图文穿插时，answer 置空避免内容重复显示
     # （模板条件可见性不可靠，从代码端强制互斥）

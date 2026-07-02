@@ -452,6 +452,17 @@ class RAGConfig:
     image_tiebreak: bool = False        # RAG_IMAGE_TIEBREAK
     image_tiebreak_eps: float = 0.05    # RAG_IMAGE_TIEBREAK_EPS（融合分制,默认保守）
     image_tiebreak_pool: int = 14       # RAG_IMAGE_TIEBREAK_POOL（over-fetch 上限,默认 2×top_k）
+    # ── <<IMG:N.M>> 图级子下标寻址（#F-mm6）──────────────────────
+    # True → 多图 chunk（可渲染图 >1 张）逐图发 <<IMG:{N}.{M}>>（M=1-based，与渲染侧
+    #        renderable_image_refs 的第 M 张同源），header 下逐图列编号 caption 帮 LLM
+    #        选图；LLM 可「步骤2放图A(N.1)、步骤5放图B(N.2)」，同 N 不同 M 各引各图。
+    #        单图 chunk 仍发纯 <<IMG:N>>。解析侧尊重 M（渲染 image_map[N] 第 M 张），
+    #        M 越界忽略、纯 N 保持整包语义（向后兼容）。
+    # False（默认）→ llm 只发纯 <<IMG:N>>，解析侧忽略任何 M 后缀（当纯 N 整包），
+    #        行为与历史一致。⚠️ 注意 _IMG_PLACEHOLDER_PATTERN 本身无条件扩宽为可选
+    #        接受 .M（模块级常量，不门控）——OFF 时仅多「识别并 strip 掉畸形 .M
+    #        残片」这一无害增强，不是逐字节不变（对标准 <<IMG:N>> 完全兼容）。
+    img_subindex: bool = False  # RAG_IMG_SUBINDEX
 
 
 @dataclass
@@ -821,6 +832,7 @@ def load_config() -> PipelineConfig:
             image_tiebreak=_env_bool("IMAGE_TIEBREAK", False),                      # RAG_IMAGE_TIEBREAK
             image_tiebreak_eps=_env_float("IMAGE_TIEBREAK_EPS", 0.05),              # RAG_IMAGE_TIEBREAK_EPS
             image_tiebreak_pool=_env_int("IMAGE_TIEBREAK_POOL", 14),                # RAG_IMAGE_TIEBREAK_POOL
+            img_subindex=_env_bool("IMG_SUBINDEX", False),                          # RAG_IMG_SUBINDEX
         ),
     )
 

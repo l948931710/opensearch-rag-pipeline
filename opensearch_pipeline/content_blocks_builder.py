@@ -22,8 +22,11 @@ from opensearch_pipeline.oss_url import generate_signed_url
 logger = logging.getLogger(__name__)
 
 # LLM 在回答中标记图片插入位置的占位符格式
-# 兼容双尖括号 <<IMG:3>> 和单尖括号 <IMG:3>（LLM 经常简化括号）
-_IMG_PLACEHOLDER_PATTERN = re.compile(r'<{1,2}IMG:(\d+)>{1,2}')
+# 兼容双尖括号 <<IMG:3>> 和单尖括号 <IMG:3>（LLM 经常简化括号）。
+# #F-mm6：group(2) = 可选子下标 M（<<IMG:3.2>> = 第 3 文档第 2 张图，图级寻址）。
+# 无条件扩宽（模块级常量，不门控）：对标准 <<IMG:N>> 完全兼容（group(2)=None），
+# 仅额外识别 .M 后缀——OFF 时用于把畸形 .M 残片也 strip 干净（无害增强）。
+_IMG_PLACEHOLDER_PATTERN = re.compile(r'<{1,2}IMG:(\d+)(?:\.(\d+))?>{1,2}')
 
 # LLM 偶发的畸形标记变体：全角冒号（<<IMG：3>>）、中文括号（【IMG:3】/《IMG:3》）、
 # 括号内多余空白。标准正则不认识这些变体 → 既不出图也不被 strip 清除，字面残片
@@ -225,93 +228,116 @@ def _reattach_leading_punct(blocks: List[Dict[str, str]], fragment: str) -> str:
     return fragment[m.end():].lstrip()
 
 
+def renderable_image_refs(chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """单个 chunk 的【可渲染图列表】—— serving 出图的单一权威（#F-mm6）。
+
+    只收带 oss_key 的图、按 chunk 内顺序返回。这是 <<IMG:N.M>> 的 M 与最终渲染
+    第 M 张图【同源】的关键：llm_generator 编 m 与本函数、_extract_image_chunks
+    都基于这同一份过滤后列表，任一侧另起过滤都会让 LLM 看到的 m 与渲染错位、
+    图-步错绑（验证阶段点名的最大坑）。
+
+    Returns: [{"source_image", "visual_summary", "near_dup_text", "title"}, ...]（可空）
+    """
+    chunk_type = chunk.get("chunk_type", "")
+    title = chunk.get("title", "")
+
+    if chunk_type == "image":
+        source_image = chunk.get("source_image", "")
+        if source_image:
+            return [{
+                "source_image": source_image,
+                "visual_summary": chunk.get("visual_summary", ""),
+                # near_dup_text = 跨文档判重的比较文本，只取 VLM 出身的 visual_summary；
+                # 展示用 visual_summary 可能混入 ocr_text 兜底（界面公共文案），绝不参与判重
+                "near_dup_text": chunk.get("visual_summary", ""),
+                "title": title,
+            }]
+        return []
+
+    if chunk_type == "step_card":
+        refs_list = []
+        for ref in (chunk.get("image_refs") or []):
+            oss_key = ref.get("oss_key") or ref.get("source_image", "")
+            if oss_key:
+                refs_list.append({
+                    "source_image": oss_key,
+                    # step_card 的 image_refs 把图注存在 caption（chunker），
+                    # 经 retriever 重建后仍是 caption；ocr_text 在该路径恒为空。
+                    # 优先 caption，回退 visual_summary / ocr_text。
+                    "visual_summary": (
+                        ref.get("caption")
+                        or ref.get("visual_summary")
+                        or ref.get("ocr_text", "")
+                    ),
+                    # caption 可能由 chunker 用 ocr_text 兜底拼成（出身不可考），
+                    # 判重只信 ref 自带的 visual_summary；为空则该图不参与近重判定
+                    "near_dup_text": ref.get("visual_summary") or "",
+                    "title": title,
+                })
+        return refs_list
+
+    if chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
+        refs_list = []
+        for ref in (chunk.get("image_refs") or []):
+            oss_key = ref.get("oss_key") or ref.get("source_image", "")
+            if oss_key:
+                refs_list.append({
+                    "source_image": oss_key,
+                    "visual_summary": ref.get("visual_summary", "") or ref.get("ocr_text", ""),
+                    # 判重不收 ocr_text：两张不同截图会 OCR 出同一段界面公共文案
+                    "near_dup_text": ref.get("visual_summary", ""),
+                    "title": title,
+                })
+        if refs_list:
+            return refs_list
+        if chunk_type == "visual_knowledge":
+            # chunker Phase-5.5 的 visual_knowledge 变体用 source_image/oss_key 携带单图（无 image_refs）
+            source_image = chunk.get("source_image") or chunk.get("oss_key", "")
+            if source_image:
+                return [{
+                    "source_image": source_image,
+                    "visual_summary": chunk.get("visual_summary", "") or chunk.get("caption", ""),
+                    "near_dup_text": chunk.get("visual_summary", ""),
+                    "title": title,
+                }]
+        return []
+
+    return []
+
+
 def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
     """
-    从检索 chunks 中提取图片信息，按文档编号索引。
-
-    支持两种图片来源：
-      1. 独立 image chunk（chunk_type="image"）— 现有路径
-      2. step_card 绑定的 image_refs — Phase 2 新增
+    从检索 chunks 中提取图片信息，按文档编号索引（逐 chunk 委托 renderable_image_refs）。
 
     _format_context() 中文档编号从 1 开始（[文档1], [文档2], ...），
     所以这里用 enumerate(chunks, 1) 对齐。
 
     Returns:
         {doc_index: [{"source_image": ..., "visual_summary": ..., "title": ...}, ...]}
-        注意：值改为 list 以支持 step_card 多图
+        注意：值为 list 以支持多图 chunk
     """
     image_map: Dict[int, List[Dict[str, Any]]] = {}
     for i, chunk in enumerate(chunks, 1):
-        chunk_type = chunk.get("chunk_type", "")
-
-        if chunk_type == "image":
-            # 路径 1: 独立 image chunk
-            source_image = chunk.get("source_image", "")
-            if source_image:
-                image_map[i] = [{
-                    "source_image": source_image,
-                    "visual_summary": chunk.get("visual_summary", ""),
-                    # near_dup_text = 跨文档判重的比较文本，只取 VLM 出身的 visual_summary；
-                    # 展示用 visual_summary 可能混入 ocr_text 兜底（界面公共文案），绝不参与判重
-                    "near_dup_text": chunk.get("visual_summary", ""),
-                    "title": chunk.get("title", ""),
-                }]
-
-        elif chunk_type == "step_card":
-            # 路径 2: step_card 绑定的 image_refs
-            image_refs = chunk.get("image_refs") or []
-            if image_refs:
-                refs_list = []
-                for ref in image_refs:
-                    oss_key = ref.get("oss_key") or ref.get("source_image", "")
-                    if oss_key:
-                        refs_list.append({
-                            "source_image": oss_key,
-                            # step_card 的 image_refs 把图注存在 caption（chunker），
-                            # 经 retriever 重建后仍是 caption；ocr_text 在该路径恒为空。
-                            # 优先 caption，回退 visual_summary / ocr_text。
-                            "visual_summary": (
-                                ref.get("caption")
-                                or ref.get("visual_summary")
-                                or ref.get("ocr_text", "")
-                            ),
-                            # caption 可能由 chunker 用 ocr_text 兜底拼成（出身不可考），
-                            # 判重只信 ref 自带的 visual_summary；为空则该图不参与近重判定
-                            "near_dup_text": ref.get("visual_summary") or "",
-                            "title": chunk.get("title", ""),
-                        })
-                if refs_list:
-                    image_map[i] = refs_list
-
-        elif chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
-            # 路径 3: text/clause/ocr/visual_knowledge chunk 携带的 image_refs
-            image_refs = chunk.get("image_refs") or []
-            if image_refs:
-                refs_list = []
-                for ref in image_refs:
-                    oss_key = ref.get("oss_key") or ref.get("source_image", "")
-                    if oss_key:
-                        refs_list.append({
-                            "source_image": oss_key,
-                            "visual_summary": ref.get("visual_summary", "") or ref.get("ocr_text", ""),
-                            # 判重不收 ocr_text：两张不同截图会 OCR 出同一段界面公共文案
-                            "near_dup_text": ref.get("visual_summary", ""),
-                            "title": chunk.get("title", ""),
-                        })
-                if refs_list:
-                    image_map[i] = refs_list
-            elif chunk_type == "visual_knowledge":
-                # chunker Phase-5.5 的 visual_knowledge 变体用 source_image/oss_key 携带单图（无 image_refs）
-                source_image = chunk.get("source_image") or chunk.get("oss_key", "")
-                if source_image:
-                    image_map[i] = [{
-                        "source_image": source_image,
-                        "visual_summary": chunk.get("visual_summary", "") or chunk.get("caption", ""),
-                        "near_dup_text": chunk.get("visual_summary", ""),
-                        "title": chunk.get("title", ""),
-                    }]
-
+        refs = renderable_image_refs(chunk)
+        if refs:
+            image_map[i] = refs
     return image_map
+
+
+def _img_subindex_enabled() -> bool:
+    """RAG_IMG_SUBINDEX 开关（fail-open：配置不可用时视为关闭）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return bool(get_config().rag.img_subindex)
+    except Exception:
+        return False
+
+
+def _parse_marker(match) -> "tuple":
+    """把一个 <<IMG:N>> / <<IMG:N.M>> 匹配解析为 (N, M)，M 缺省为 None。"""
+    n = int(match.group(1))
+    m = match.group(2)
+    return n, (int(m) if m else None)
 
 
 def plan_image_rotation(counts: List[int], max_images: int) -> List[int]:
@@ -410,28 +436,62 @@ def build_content_blocks(
         _log_render_stats(stats)
         return []
 
-    # 2. 扫描 <<IMG:N>> 占位符；只保留指向真实图片的有效引用，
-    #    去重并保持首次引用顺序（截断时按此顺序定优先级）
+    # 2. 扫描占位符；解析为 (N, M)（#F-mm6：M=图级子下标，仅 RAG_IMG_SUBINDEX 尊重）。
+    #    单元语义：某 N 若有任一有效 .M 引用 → 分图模式（每个 distinct (N,m) 独立渲染，
+    #    该 N 的裸标记被忽略）；否则纯 N 整包（向后兼容）。OFF 时 M 恒 None → 全部纯 N，
+    #    与历史逐字节一致。
+    subindex = _img_subindex_enabled()
     placeholders = list(_IMG_PLACEHOLDER_PATTERN.finditer(answer))
-    referenced_order: List[int] = []
-    seen_refs = set()
-    invalid_ns = set()
+    parsed = []  # 对齐 placeholders 的 (N, M)；OFF 时 M 强制 None
     for match in placeholders:
-        doc_idx = int(match.group(1))
-        if doc_idx in image_map:
-            if doc_idx not in seen_refs:
-                referenced_order.append(doc_idx)
-                seen_refs.add(doc_idx)
-        else:
-            # 越界 / 指向无图 chunk 的引用：历史上完全静默，是「为什么没图」
-            # 排查的首要盲区（幻觉标记、截断残留、历史模仿都落在这一桶）
+        n, m = _parse_marker(match)
+        parsed.append((n, m if subindex else None))
+
+    # 哪些 N 处于分图模式（有 ≥1 个有效 .M 引用）
+    subindexed_ns = set()
+    if subindex:
+        for n, m in parsed:
+            if m is not None and n in image_map and 1 <= m <= len(image_map[n]):
+                subindexed_ns.add(n)
+
+    # 单元化 + 保序去重；placeholder_units 对齐 placeholders 供穿插期复用（不重复判定）
+    referenced_units: List[tuple] = []
+    seen_units = set()
+    placeholder_units: List[Optional[tuple]] = []
+    invalid_ns = set()
+    for n, m in parsed:
+        if n not in image_map:
+            placeholder_units.append(None)
             stats["n_invalid_refs"] += 1
-            invalid_ns.add(doc_idx)
+            invalid_ns.add(n)
+            continue
+        if n in subindexed_ns:
+            if m is None:
+                placeholder_units.append(None)   # 分图模式下的裸标记：歧义，忽略（不计幻觉）
+                continue
+            if not (1 <= m <= len(image_map[n])):
+                placeholder_units.append(None)   # M 越界：幻觉
+                stats["n_invalid_refs"] += 1
+                invalid_ns.add(n)
+                continue
+            unit = (n, m)
+        else:
+            # 纯 N 整包（M 给定但该 N 无任何有效 .M → 该 .M 越界，计幻觉）
+            if m is not None:
+                placeholder_units.append(None)
+                stats["n_invalid_refs"] += 1
+                invalid_ns.add(n)
+                continue
+            unit = (n, None)
+        placeholder_units.append(unit)
+        if unit not in seen_units:
+            seen_units.add(unit)
+            referenced_units.append(unit)
     stats["invalid_ns"] = sorted(invalid_ns)[:10]
     stats["n_placeholders"] = len(placeholders)
-    stats["n_referenced"] = len(referenced_order)
+    stats["n_referenced"] = len(referenced_units)
 
-    if not referenced_order:
+    if not referenced_units:
         # LLM 没有引用任何图片 → 不展示图片（走 answer 降级）
         # 有图可用却零引用（referenced_none 且 n_images_available>0）= referenced-only
         # 策略下最常见的丢图形态，此前不可观测
@@ -439,22 +499,26 @@ def build_content_blocks(
         _log_render_stats(stats)
         return []
 
-    # 3. 只为“被引用”的图片签名，配额**轮转**分配后再受 max_images 截断：
-    #    每轮按引用顺序给每个文档/步骤取 1 张（跳过近重与签名失败、不消耗配额），
-    #    直到配额用尽或全部取完。同一文档内出图保持原始顺序（逐轮从队首弹出）。
-    #    url_expires=None 由 generate_signed_url 统一解析为 config.oss.signed_url_expires。
-    signed_images: Dict[int, List[Dict[str, str]]] = {}
+    # 3. 只为“被引用”的单元签名，配额**轮转**分配后再受 max_images 截断：
+    #    每轮按引用顺序给每个单元取 1 张（跳过近重与签名失败、不消耗配额），
+    #    直到配额用尽或全部取完。整包单元（N,None）逐轮弹队首保原始顺序；
+    #    分图单元（N,m）只含单张。url_expires=None 由 generate_signed_url 统一解析。
+    signed_images: Dict[tuple, List[Dict[str, str]]] = {}
     generated_count = 0
     accepted: List[Dict[str, str]] = []   # 已采纳（将渲染）图片：近重抑制的比较基准
-    # doc_idx 由 enumerate(chunks, 1) 产生，必在界内；doc_id 用于「同文档绝不判近重」
-    queues = [(doc_idx, list(image_map[doc_idx])) for doc_idx in referenced_order]
+    # 单元 queue：(N,None)=该 chunk 全部可渲染图；(N,m)=第 m 张单图
+    def _unit_queue(unit):
+        n, m = unit
+        refs = image_map[n]
+        return list(refs) if m is None else [refs[m - 1]]
+    queues = [(unit, _unit_queue(unit)) for unit in referenced_units]
     while generated_count < max_images and any(q for _, q in queues):
         progressed = False
-        for doc_idx, q in queues:
+        for unit, q in queues:
             if generated_count >= max_images:
                 break
-            chunk_doc_id = chunks[doc_idx - 1].get("doc_id", "")
-            # 本轮为该文档取 1 张：弹出队首直到拿到一张可用图（近重/签名失败不耗配额）
+            chunk_doc_id = chunks[unit[0] - 1].get("doc_id", "")
+            # 本轮为该单元取 1 张：弹出队首直到拿到一张可用图（近重/签名失败不耗配额）
             while q:
                 img_info = q.pop(0)
                 oss_key = img_info["source_image"]
@@ -473,11 +537,11 @@ def build_content_blocks(
                 if not url:
                     stats["n_sign_failed"] += 1
                     logger.warning(
-                        "Skipping image chunk %d: signed URL generation failed for '%s'",
-                        doc_idx, oss_key,
+                        "Skipping image unit %s: signed URL generation failed for '%s'",
+                        unit, oss_key,
                     )
                     continue
-                signed_images.setdefault(doc_idx, []).append({
+                signed_images.setdefault(unit, []).append({
                     "url": url,
                     # oss_key 随块落库：签名 URL 1h 过期，卡片回调重建时按它重签
                     # （refresh_image_block_urls）；卡片模板/小程序只读 url，多余键无害
@@ -508,8 +572,8 @@ def build_content_blocks(
     stats["outcome"] = "ok"
     _log_render_stats(stats)
 
-    # 4. 按占位符位置把被引用的图片穿插进文本
-    blocks = _build_interleaved(answer, placeholders, signed_images)
+    # 4. 按占位符位置把被引用的图片穿插进文本（placeholder_units 对齐 placeholders）
+    blocks = _build_interleaved(answer, placeholders, placeholder_units, signed_images)
 
     # 最终清理：确保所有 markdown 块不残留 <IMG:N> 占位符
     return _sanitize_blocks(blocks)
@@ -531,20 +595,20 @@ def _sanitize_blocks(blocks: List[Dict[str, str]]) -> List[Dict[str, str]]:
 def _build_interleaved(
     answer: str,
     placeholders: list,
-    signed_images: Dict[int, List[Dict[str, str]]],
+    placeholder_units: List[Optional[tuple]],
+    signed_images: Dict[tuple, List[Dict[str, str]]],
 ) -> List[Dict[str, str]]:
-    """按 <<IMG:N>> 占位符位置穿插图片。
+    """按占位符位置穿插图片（#F-mm6：按渲染单元 (N,M) 而非 chunk 号）。
 
-    signed_images 只包含被 LLM 引用的 chunk，因此每个图片都会在其占位符处插入；
-    不再把未被引用的图片追加到末尾（over-attachment 修复）。
+    signed_images 只含被引用单元；每个单元的图在其【首个】占位符处插入，同单元
+    二次引用被 used 跳过。分图模式下 (N,1)/(N,2) 是不同单元 → 可在不同步骤各出各图。
+    placeholder_units 对齐 placeholders（build 期已算好，此处不重复判定）。
     """
     blocks = []
     last_end = 0
-    used_indices = set()
+    used_units = set()
 
-    for match in placeholders:
-        doc_idx = int(match.group(1))
-
+    for match, unit in zip(placeholders, placeholder_units):
         # 占位符前的文本块（清理签名失败的图片残留占位符；句首孤立标点回挂上一块）
         text_before = answer[last_end:match.start()].strip()
         text_before = _IMG_PLACEHOLDER_PATTERN.sub('', text_before).strip()
@@ -552,9 +616,9 @@ def _build_interleaved(
         if text_before:
             blocks.append({"type": "markdown", "content": text_before})
 
-        # 插入对应的图片块（可能有多张）
-        if doc_idx in signed_images and doc_idx not in used_indices:
-            for img in signed_images[doc_idx]:
+        # 插入对应单元的图片块（整包单元可能多张；分图单元单张）
+        if unit is not None and unit in signed_images and unit not in used_units:
+            for img in signed_images[unit]:
                 blocks.append({
                     "type": "image",
                     "title": img["title"],
@@ -562,7 +626,7 @@ def _build_interleaved(
                     "oss_key": img.get("oss_key", ""),
                     "caption": img["caption"],
                 })
-            used_indices.add(doc_idx)
+            used_units.add(unit)
 
         last_end = match.end()
 
