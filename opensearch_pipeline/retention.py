@@ -110,9 +110,15 @@ def _job_sqls(job: str) -> Dict[str, str]:
     if job == "findings":
         # 当前版本守卫：finding 所指版本仍为 current_version_no 的绝不删（活审计依据）。
         # 多表条件删除 MySQL 不允许 LIMIT → select-PK-then-delete 两步批。
+        # ⚠️ doc_id JOIN 必须 collation-cast（2026-07-02 生产首跑实测 1267）：
+        # document_sensitive_finding 建表未显式 COLLATE、吃了库默认 _0900_ai_ci，而
+        # document_meta 是 _unicode_ci——与 kb_access_request / contribution reconcile 同坑。
+        # 显式 COLLATE（coercibility 0）压过两侧隐式列 collation：比较按 unicode_ci 进行、
+        # m.doc_id 索引仍可用；两侧本就一致的环境里是 no-op。
         pred = (
             "FROM {kb}.document_sensitive_finding f "
-            "LEFT JOIN {kb}.document_meta m ON m.doc_id = f.doc_id "
+            "LEFT JOIN {kb}.document_meta m "
+            "  ON m.doc_id = CONVERT(f.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci "
             "WHERE f.created_at < DATE_SUB(NOW(), INTERVAL %s MONTH) "
             "AND (m.doc_id IS NULL OR f.version_no <> m.current_version_no)"
         ).format(kb=kb)

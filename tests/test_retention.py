@@ -148,6 +148,9 @@ def test_findings_deletes_by_ids_with_current_version_guard(monkeypatch, live_db
     sqls = " || ".join(s for s, _ in conn.executed)
     assert "current_version_no" in sqls, "findings 必须带当前版本守卫（现役版本的 finding 永不删）"
     assert "WHERE id IN (11,12)" in sqls, "多表条件删除走 select-PK-then-delete 两步批"
+    assert "CONVERT(f.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci" in sqls, (
+        "doc_id JOIN 必须 collation-cast——document_sensitive_finding 是 _0900_ai_ci、"
+        "document_meta 是 _unicode_ci，裸 JOIN 生产实测 1267（2026-07-02）")
 
 
 def test_window_zero_disables_job(monkeypatch, live_db):
