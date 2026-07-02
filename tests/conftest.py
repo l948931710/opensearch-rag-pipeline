@@ -91,6 +91,36 @@ def _refuse_prod_targets():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _dummy_llm_key_in_simulate(monkeypatch):
+    """根治「测试依赖开发机 .env 的 ambient LLM key」这类雷（本地有 .env 全绿 / CI 干净检出全红）。
+
+    症状回顾：generate_answer / generate_answer_stream 在调（已被测试 mock 的）传输层【之前】先过
+    `if not llm.api_key: raise`（llm_generator.py:780）。本机 .env 供了真实 key → 门通过 → 本地绿；
+    CI 的 actions/checkout / 全新 clone 无 .env → key 为空 → 在 mock 生效前就 raise → 每次 merge 都红。
+    （2026-07-02 定位：test_stream_reasoning 的 3 个用例即因此长期在 CI 挂。）
+
+    根治：simulate 模式下若 llm.api_key 为空，统一注入哑 key，让「key 存在」前置门通过——真实 LLM
+    调用在 simulate 下本就被各测试 mock，哑 key 只满足存在性检查、不发任何网络。此后新写的 LLM
+    路径测试无需再各自记得注入 key，也不会再依赖本机 .env。
+
+    刻意的边界：
+      - 只设 api_key【字段】，不碰 DASHSCOPE_API_KEY【env】→ 不触发模型名重解析（Gemini↔Qwen），
+        也不影响 test_config_loading 里走 _fresh_load 的用例（它们另建 config，不读这个缓存对象）。
+      - 仅 simulate；RAG_ENV=local 真库集成不注入，尊重真实配置。
+      - 只管 llm；ocr/embedding 有测试刻意验「无 key」路径（如 test_real_extractors 直接
+        OCRClient(api_key="")），不在此代劳。
+      - monkeypatch 每测试结束自动还原 → 无跨测试泄漏；已显式用 llm_key_present 的测试值相同、不冲突。"""
+    from opensearch_pipeline.config import get_config
+
+    cfg = get_config()
+    if getattr(cfg, "simulate", False):
+        llm = getattr(cfg, "llm", None)
+        if llm is not None and not getattr(llm, "api_key", ""):
+            monkeypatch.setattr(llm, "api_key", "test-dummy-key", raising=False)
+    yield
+
+
 @pytest.fixture
 def llm_key_present(monkeypatch):
     """让 config.llm.api_key 在测试内非空 → node_classify 走"已配置 key"分支（其 LLM 调用由各测试自行 mock）。

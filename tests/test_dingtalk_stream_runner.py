@@ -84,9 +84,17 @@ def fake_sdk(monkeypatch):
     monkeypatch.setattr(runner, "_thread", None)
     runner._running.clear()
     yield mod
-    # 释放阻塞中的伪客户端线程，避免悬挂线程跨测试
+    # 释放阻塞中的伪客户端线程，避免悬挂线程跨测试。
+    # ⚠️ 必须 join 后再 clear（根治 F#48 偶发 flake）：_run() 的 finally 会 _running.clear()，
+    # 而它在 release.set() 后【异步】执行。若不 join，前一个测试的线程可能在【下一个】测试
+    # 调 _running.set() 之【后】才跑 finally → 把新测试刚设的共享 _running 抹掉 → 下个测试
+    # is_stream_active()（=_running.is_set() and _thread.is_alive()）偶发读到 False。
+    # join 让线程的 finally 在本测试 teardown 内跑完，绝不泄漏到下一个测试。
     for c in _FakeClient.instances:
         c.release.set()
+    t = runner._thread
+    if t is not None:
+        t.join(timeout=30)
     runner._running.clear()
     runner._thread = None
 
