@@ -8,8 +8,8 @@
 -- ADDITIVE / 非破坏 / 与 005 同纪律：
 --   * 仅加二级索引，不改列、不改既有行（存量 etag 多为 NULL，多 NULL 不冲突、不命中）。
 --   * 不动检索路径、不动 HA3 → 对问答用户零影响。
---   * ⚠️ NOT YET APPLIED——gated 生产 DDL。代码【不依赖】此索引即可正确运行（仅查询变快）；
---     按需通过 information_schema 守卫的 apply 脚本（RW token）应用，同 003/004/005。
+--   * ✅ APPLIED 2026-07-02（生产 fuling_knowledge，scratch/apply_migration_007_015.py，
+--     schema_migrations v007）。代码【不依赖】此索引即可正确运行（仅查询变快）。
 --   * MySQL 8.0 无 CREATE INDEX IF NOT EXISTS；apply 脚本须守卫 information_schema.STATISTICS。
 --
 -- 非唯一索引（绝不能 UNIQUE）：同一文件合法地被多个部门各自上传（不同 ACL）——内容相同是

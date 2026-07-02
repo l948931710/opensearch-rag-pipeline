@@ -67,7 +67,9 @@ def _make_conn(first_rows, fresh_rows, max_id):
             self._last = sql
 
         def fetchall(self):
-            if "WHERE is_active=1" in self._last:   # 删除前的【最新】重读
+            # 按 SELECT 列形态路由（勿按 WHERE 子句空格路由——perf#90 后两条读都过滤 is_active）：
+            # 二次确认读=两列 `id, chunk_id`；初始快照=三列 `id, chunk_id, is_active`。
+            if "SELECT id, chunk_id FROM chunk_meta" in self._last:   # 删除前的【最新】重读
                 return fresh_rows
             if "FROM chunk_meta" in self._last:     # 枚举前的初始快照
                 return first_rows

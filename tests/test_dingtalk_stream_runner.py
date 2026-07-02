@@ -33,6 +33,9 @@ class _FakeClient:
     def __init__(self, credential):
         self.credential = credential
         self.handlers = {}
+        # started/release 的 .wait() 与线程 .join() 在下面测试里用 30s 上限：正常瞬间就绪，
+        # 但 xdist 并行(-n auto)下 10 个 worker 争 CPU，真实线程偶发在旧的 5s 内没 set → 误判失败
+        # （perf F#48 并行化后暴露；放宽上限只影响慢路径余量，不拖慢正常用例）。
         self.started = threading.Event()
         self.release = threading.Event()
         _FakeClient.instances.append(self)
@@ -130,7 +133,7 @@ class TestGating:
         _enable(monkeypatch)
         assert runner.start_stream_client() is True
         client = _FakeClient.instances[-1]
-        assert client.started.wait(timeout=5)
+        assert client.started.wait(timeout=30)
         assert runner.start_stream_client() is True  # 二次调用不再建新客户端
         assert len(_FakeClient.instances) == 1
 
@@ -144,7 +147,7 @@ class TestAssembly:
         _enable(monkeypatch)
         assert runner.start_stream_client() is True
         client = _FakeClient.instances[-1]
-        assert client.started.wait(timeout=5)
+        assert client.started.wait(timeout=30)
         assert set(client.handlers) == {
             "/v1.0/im/bot/messages/get",
             "/v1.0/card/instances/callback",
@@ -158,9 +161,9 @@ class TestAssembly:
         _enable(monkeypatch)
         runner.start_stream_client()
         client = _FakeClient.instances[-1]
-        client.started.wait(timeout=5)
+        client.started.wait(timeout=30)
         client.release.set()  # start_forever 返回 → 线程收尾
-        runner._thread.join(timeout=5)
+        runner._thread.join(timeout=30)
         assert runner.is_stream_active() is False
 
 
@@ -173,7 +176,7 @@ class TestHandlers:
         _enable(monkeypatch)
         assert runner.start_stream_client() is True
         client = _FakeClient.instances[-1]
-        assert client.started.wait(timeout=5)
+        assert client.started.wait(timeout=30)
         return (
             client.handlers["/v1.0/im/bot/messages/get"],
             client.handlers["/v1.0/card/instances/callback"],

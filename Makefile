@@ -67,7 +67,10 @@ diagrams-list: ## 只列出仓库里的 mermaid 块，不渲染（零依赖）
 
 # ── Test ──
 
-test: ## 运行测试
+test: ## 运行测试（perf F#48：xdist 并行，共享本地 dev 栈的模块经 conftest 分组同 worker 串行）
+	python -m pytest tests/ -v --tb=short -n auto --dist loadgroup
+
+test-serial: ## 运行测试（串行——排查并行相关 flake / 无 pytest-xdist 环境用）
 	python -m pytest tests/ -v --tb=short
 
 test-cov: ## 运行测试 + 覆盖率

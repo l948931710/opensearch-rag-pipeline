@@ -9,7 +9,6 @@ feedback_handler.py — RAG 反馈处理模块
 供钉钉卡片回调和 REST API 端点共用。
 """
 
-import json
 import logging
 import uuid
 from typing import Optional
@@ -52,6 +51,7 @@ def handle_feedback(
     action: str,
     reason: Optional[str] = None,
     comment: Optional[str] = None,
+    qa_context: Optional[dict] = None,
 ) -> bool:
     """
     处理用户反馈。
@@ -63,6 +63,9 @@ def handle_feedback(
         action: 'upvote' / 'downvote' / 'handoff'
         reason: 反馈原因代码（可选）
         comment: 反馈备注（可选）
+        qa_context: 可选的预取 qa_session_log 上下文行（qa_session_log 列名为键，perf#87：
+            钉钉卡片回调的归属校验已查过同表同行，传入即免 _save_feedback 重开连接重查）。
+            None（REST API 等独立调用路径的默认）→ 行为与原来完全一致，自查上下文。
 
     Returns:
         True=处理成功, False=处理失败
@@ -84,6 +87,7 @@ def handle_feedback(
                 feedback_type=action,
                 reason=reason,
                 comment=comment,
+                qa_context=qa_context,
             )
         elif action == "handoff":
             return _create_escalation(
@@ -113,41 +117,50 @@ def _save_feedback(
     feedback_type: str,
     reason: Optional[str],
     comment: Optional[str],
+    qa_context: Optional[dict] = None,
 ) -> bool:
     """
     写入 user_feedback 表，重复反馈覆盖更新。
 
     使用 ON DUPLICATE KEY UPDATE (基于 uk_message_user 唯一约束)。
-    从 qa_session_log 获取原始问答上下文冗余存储。
+    从 qa_session_log 获取原始问答上下文冗余存储；调用方已查过同行时可经 qa_context 传入
+    （qa_session_log 列名为键，perf#87：卡片回调归属校验顺带预取），跳过重查、单连接完成。
     """
     from opensearch_pipeline.db import _get_db_conn
 
     conn = _get_db_conn()
     try:
-        # 查询原始问答上下文
+        # 查询原始问答上下文（qa_context 已预取 → 直接复用，免重查同表同行）
         session_id = ""
         query_text = ""
         ai_answer = ""
         cited_json = None
         user_dept = None
 
-        with conn.cursor() as cursor:
-            cursor.execute(
-                f"""
-                SELECT session_id, query_text, answer_text, cited_docs_json, user_dept
-                FROM {_op_db()}.qa_session_log
-                WHERE message_id = %s
-                LIMIT 1
-                """,
-                (message_id,),
-            )
-            row = cursor.fetchone()
-            if row:
-                session_id = row[0] or ""
-                query_text = row[1] or ""
-                ai_answer = row[2] or ""
-                cited_json = row[3]
-                user_dept = row[4]
+        if qa_context is not None:
+            session_id = qa_context.get("session_id") or ""
+            query_text = qa_context.get("query_text") or ""
+            ai_answer = qa_context.get("answer_text") or ""
+            cited_json = qa_context.get("cited_docs_json")
+            user_dept = qa_context.get("user_dept")
+        else:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT session_id, query_text, answer_text, cited_docs_json, user_dept
+                    FROM {_op_db()}.qa_session_log
+                    WHERE message_id = %s
+                    LIMIT 1
+                    """,
+                    (message_id,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    session_id = row[0] or ""
+                    query_text = row[1] or ""
+                    ai_answer = row[2] or ""
+                    cited_json = row[3]
+                    user_dept = row[4]
 
         # 写入 user_feedback（覆盖更新）。注意 handled_status 的 IF：用户点过「补充原因」
         # （AWAITING_COMMENT）后又通过卡片内联表单/小程序提交了明确反馈，挂起状态必须取消，

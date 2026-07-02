@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import { Plus, Search, Library, Lightbulb, Sun, Moon, Trash2, Sparkles } from 'lucide-vue-next'
@@ -24,8 +24,18 @@ const { reviewCount: contribReviewCount } = useContribute()   // 待审核的知
 const route = useRoute()
 const router = useRouter()
 
+// H#70 搜索防抖（~200ms）：q 绑输入框即时回显；qDebounced 才驱动全文扫描（searchConversations），
+// 连续敲字不再逐键全量扫。清空立即生效（恢复全列表不该等防抖）。
 const q = ref('')
-const convs = computed(() => searchConversations(q.value))
+const qDebounced = ref('')
+let qTimer: ReturnType<typeof setTimeout> | null = null
+watch(q, (v) => {
+  if (qTimer) { clearTimeout(qTimer); qTimer = null }
+  if (!v.trim()) { qDebounced.value = v; return }
+  qTimer = setTimeout(() => { qDebounced.value = v }, 200)
+})
+onUnmounted(() => { if (qTimer) { clearTimeout(qTimer); qTimer = null } })
+const convs = computed(() => searchConversations(qDebounced.value))
 const onManage = computed(() => route?.path === '/manage')
 const onContribute = computed(() => route?.path === '/contribute')
 function isActiveConv(id: string) { return route?.path === '/' && id === activeId.value }

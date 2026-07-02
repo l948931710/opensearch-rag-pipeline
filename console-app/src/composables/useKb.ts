@@ -160,6 +160,13 @@ function noteLoadError(key: string, e: unknown) {
 }
 function clearLoadError(key: string) { delete loadErrors.value[key] }
 
+// staleness 门（#82）：App ready 已为侧栏红点预载 approvals/accessRequests，30s 内再进 /manage 不重拉。
+// 起跑即记时间戳 → 预载尚在途时挂载视图也不会并发双拉；失败清零重开门（LoadError 重试按钮走非 force
+// 也能真重拉）。数据确实变化的写路径（上传产生待审批单等）传 force=true 逃生。
+const STALE_MS = 30_000
+const lastLoadedAt: Record<string, number> = {}
+function freshEnough(key: string): boolean { return Date.now() - (lastLoadedAt[key] || 0) < STALE_MS }
+
 // 在途互斥：按 key（行/用户）加锁，避免一键禁用无关按钮 + 防同行重复提交。组件用 isBusy(key) 绑 :disabled。
 function isBusy(key: string): boolean { return inflight.value.has(key) }
 async function withInflight<T>(key: string, fn: () => Promise<T>): Promise<T | undefined> {
@@ -414,7 +421,7 @@ function setQuery(v: string) {
   qTimer = setTimeout(() => void loadDocs(), 300)   // 防抖；搜索走服务端（可命中未加载文档）
 }
 
-async function loadApprovals() {
+async function loadApprovals(force = false) {
   const s = useSession()
   if (s.role !== 'kb_admin') { approvals.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -424,11 +431,13 @@ async function loadApprovals() {
     ]
     return
   }
+  if (!force && freshEnough('approvals')) return   // App ready 刚预载过 → 跳过（#82）
+  lastLoadedAt['approvals'] = Date.now()
   clearLoadError('approvals')
   try {
     const r = await apiJson<{ items: PendingItem[] }>('/api/kb/pending-approvals', { auth: true })
     approvals.value = r.items || []
-  } catch (e) { approvals.value = []; noteLoadError('approvals', e) }
+  } catch (e) { lastLoadedAt['approvals'] = 0; approvals.value = []; noteLoadError('approvals', e) }
 }
 
 // ── 升版态 ──
@@ -529,10 +538,16 @@ async function uploadSingle(file: File) {
     contentDupMsg.value = buildDupMsg(r.content_dups, r.content_dups_other)
     newTitle.value = ''; dupWarn.value = ''; selectedFiles = []; selectedNames.value = []
     if (isVer) exitVersionMode()
-    void loadDocs(); void loadApprovals()
+    void loadDocs(); void loadApprovals(true)   // force：刚上传可能新增待审批单，穿透 staleness 门
     if (!r.requires_kb_admin_approval) trackStatus(r.doc_id, r.version_no)   // 待审批不轮询
   } catch (e: any) { uploadErr.value = uploadErrText(e); uploadMsg.value = '' } finally { uploadBusy.value = false }
 }
+
+// 批量上传并发度（E#35）。跨文件小并发池：每文件内部 upload-url → OSS PUT → register 三步顺序不变，
+// 文件之间并发。register 侧已按 raw_key 幂等 + 行锁防撞号（批量恒为 action=new、各文件独立 doc_id/
+// raw_key），无跨文件顺序依赖。取 2 而非 3：upload-url/register 都计入后端 aux 限流（默认 30/分，
+// 每文件吃 2 次），并发越高小文件批越易撞 429——撞上也只影响该行（失败隔离），但保守起见压低突发。
+const BATCH_CONCURRENCY = 2
 
 async function uploadBatch(files: File[]) {
   uploadErr.value = ''; uploadOk.value = false; contentDupMsg.value = ''; uploadMsg.value = ''
@@ -541,9 +556,10 @@ async function uploadBatch(files: File[]) {
   uploadQueue.value = rows
   uploadBusy.value = true
   let okN = 0, badN = 0
-  for (let i = 0; i < files.length; i++) {
+  // 单文件全流程（三步顺序不变）；异常只落到本行——与原串行版一致的失败隔离，其余文件照常。
+  const uploadOne = async (i: number) => {
     const f = files[i], row = rows[i]
-    if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; continue }
+    if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; return }
     try {
       row.status = '上传中'
       const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify({ action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: newPerm.value }) })
@@ -555,9 +571,13 @@ async function uploadBatch(files: File[]) {
       okN++
     } catch (e: any) { row.status = '失败'; row.msg = uploadErrText(e); badN++ }
   }
+  // 小并发池：worker 共享游标领任务，按队列顺序开工（uploadOne 自吞异常，Promise.all 不会中途 reject）。
+  let cursor = 0
+  const worker = async () => { for (;;) { const i = cursor++; if (i >= files.length) return; await uploadOne(i) } }
+  await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, files.length) }, () => worker()))
   uploadBusy.value = false
   uploadMsg.value = `${okN} 成功${badN ? `，${badN} 失败/跳过` : ''}`
-  void loadDocs(); void loadApprovals()
+  void loadDocs(); void loadApprovals(true)   // force：批量里可能有待审批单
 }
 
 function doUpload() {
@@ -567,11 +587,19 @@ function doUpload() {
   else void uploadBatch(selectedFiles)
 }
 
+// 审批后定向更新（#82）：成功即本地移除该单（reviewCount 红点由 approvals.length 派生，随之同步），
+// 免一次全量审批队列重拉；文档列表真受影响（放行/驳回改变该文档徽章）→ 保留一次权威 loadDocs。
+// 失败路径保持现状：alert 提示、该单留在队列可重试。
+function removeApproval(d: PendingItem) {
+  approvals.value = approvals.value.filter((x) => !(x.doc_id === d.doc_id && x.version_no === d.version_no))
+}
+
 async function approve(d: PendingItem) {
   await withInflight(`appr:${d.doc_id}/${d.version_no}`, async () => {
     try {
       await apiJson('/api/kb/approve', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no }) })
-      await loadApprovals(); await loadDocs()
+      removeApproval(d)
+      await loadDocs()
     } catch (e: any) { alert('通过失败：' + uploadErrText(e)) }
   })
 }
@@ -580,14 +608,15 @@ async function reject(d: PendingItem, reason: string) {
   await withInflight(`appr:${d.doc_id}/${d.version_no}`, async () => {
     try {
       await apiJson('/api/kb/reject', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no, reason }) })
-      await loadApprovals(); await loadDocs()
+      removeApproval(d)
+      await loadDocs()
     } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) }
   })
 }
 
 // ── 授权申请（Phase C，审批人侧）──
 // 数据源 /api/kb/access-requests 尚未上线 → 静默兜底空（不报错、不打扰）。DEV ?preview 注入 mock 可视化。
-async function loadAccessRequests() {
+async function loadAccessRequests(force = false) {
   const s = useSession()
   if (!s.identity?.canManage) { accessRequests.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -597,11 +626,13 @@ async function loadAccessRequests() {
     ]
     return
   }
+  if (!force && freshEnough('accessRequests')) return   // App ready 刚预载过 → 跳过（#82）
+  lastLoadedAt['accessRequests'] = Date.now()
   clearLoadError('accessRequests')
   try {
     const r = await apiJson<{ items: AccessRequestItem[] }>('/api/kb/access-requests', { auth: true })
     accessRequests.value = r.items || []
-  } catch (e) { accessRequests.value = []; noteLoadError('accessRequests', e) }   // 404（未上线）静默；5xx 显错
+  } catch (e) { lastLoadedAt['accessRequests'] = 0; accessRequests.value = []; noteLoadError('accessRequests', e) }   // 404（未上线）静默；5xx 显错
 }
 
 async function approveAccess(d: AccessRequestItem) {
@@ -610,7 +641,9 @@ async function approveAccess(d: AccessRequestItem) {
       const s = useSession()
       if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
       await apiJson('/api/kb/access-requests/approve', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id }) })
-      await loadAccessRequests()
+      // 定向更新（#82）：本地移除该单（与 preview 分支同构）；新授权落到「已授权清单」→ 只刷真正受影响的列表。
+      accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id)
+      void loadAccessGrants()
     } catch (e: any) { alert('授权失败：' + uploadErrText(e)) }
   })
 }
@@ -621,7 +654,7 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
       const s = useSession()
       if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
       await apiJson('/api/kb/access-requests/reject', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id, reason }) })
-      await loadAccessRequests()
+      accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id)   // 定向更新（#82）：驳回只影响本队列
     } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) }
   })
 }
@@ -807,6 +840,7 @@ export function __resetKb() {
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []
   inflight.value = new Set(); retireBusy.value = false
   selectedFiles = []; docsOffset = 0; docsSeq = 0; trackSeq = 0
+  for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (trackTimer) { clearTimeout(trackTimer); trackTimer = null }
 }

@@ -268,13 +268,24 @@ class OCRClient:
             for page_idx in page_idxs:
                 page = doc[page_idx]
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                
+
                 # 直接获取图像二进制数据
                 img_data = pix.tobytes("png")
+                # perf#64：2x 渲染的 A4 中文页 PNG 常 1-3MB，直接 base64 上传曾触发
+                # write timeout（vlm_retry docstring 记载 381KB 即出过事）。复用
+                # vlm_rebuilder 生产验证过的压缩（JPEG q78 + 限边 1568px，OCR 精度
+                # 已在版面重建路径验证），base64 体积降 ~5x；helper 内部 fail-open，
+                # 任何失败原样回退 PNG 字节，绝不阻断 OCR。
+                mime_type = "image/png"
+                try:
+                    from opensearch_pipeline.extraction.vlm_rebuilder import compress_page_png
+                    img_data, mime_type = compress_page_png(img_data)
+                except Exception:
+                    pass
                 b64_data = base64.b64encode(img_data).decode('utf-8')
 
                 try:
-                    page_text = self._call_ocr_api(b64_data, "image/png")
+                    page_text = self._call_ocr_api(b64_data, mime_type)
                     # 反幻觉修剪（不传尺寸：整页渲染只修剪重复，绝不整体丢弃）
                     page_text, _ = sanitize_ocr_text(page_text)
                     pages.append(OCRPageResult(

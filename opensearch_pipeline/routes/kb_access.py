@@ -389,8 +389,10 @@ def kb_approval_history(request: Request,
         if not owners:
             return KbApprovalHistoryResponse(items=[])   # 无管理部门 → 空（fail-closed，绝不当全量）
         ph = ",".join(["%s"] * len(owners))
-        scope_owner = f"AND r.owner_dept IN ({ph})"; scope_owner_params = list(owners)
-        scope_cat = f"AND category_dept IN ({ph})"; scope_cat_params = list(owners)
+        scope_owner = f"AND r.owner_dept IN ({ph})"
+        scope_owner_params = list(owners)
+        scope_cat = f"AND category_dept IN ({ph})"
+        scope_cat_params = list(owners)
     lim = _APPROVAL_HISTORY_LIMIT
     from opensearch_pipeline import contribution as _C
 
@@ -438,7 +440,8 @@ def kb_approval_history(request: Request,
                     if x[8]:
                         op_ids.add(x[8])
             except Exception as e:
-                fails += 1; logger.warning("approval_history access 失败: %s", e)
+                fails += 1
+                logger.warning("approval_history access 失败: %s", e)
             # 2) contribution —— kb_contribution 的已决行（两角色，category_dept 作用域；库=_op_db）
             ran += 1
             try:
@@ -459,7 +462,8 @@ def kb_approval_history(request: Request,
                     if x[6]:
                         op_ids.add(x[6])
             except Exception as e:
-                fails += 1; logger.warning("approval_history contribution 失败: %s", e)
+                fails += 1
+                logger.warning("approval_history contribution 失败: %s", e)
             if is_admin:
                 # 3) upload —— 上传审批（仅 kb_admin，取自 kb_audit_log；APPROVE/REJECT 是上传专用 action）
                 ran += 1
@@ -480,7 +484,8 @@ def kb_approval_history(request: Request,
                         if x[4]:
                             op_ids.add(x[4])
                 except Exception as e:
-                    fails += 1; logger.warning("approval_history upload 失败: %s", e)
+                    fails += 1
+                    logger.warning("approval_history upload 失败: %s", e)
                 # 4) admin_grant —— 成员/角色授权（仅 kb_admin，取自 kb_audit_log）
                 ran += 1
                 try:
@@ -500,7 +505,8 @@ def kb_approval_history(request: Request,
                         if x[1]:
                             op_ids.add(x[1])
                 except Exception as e:
-                    fails += 1; logger.warning("approval_history admin_grant 失败: %s", e)
+                    fails += 1
+                    logger.warning("approval_history admin_grant 失败: %s", e)
             # 操作者 staffId → 展示名（best-effort，enrichment；失败不计入 fails、回退 uid）
             if op_ids:
                 try:
@@ -534,6 +540,10 @@ def kb_my_access_requests(request: Request,
     INDEXED 且 chunk_meta.allowed_depts ⊇ 本次授予组码 → 'projected'（已放行）；否则
     'pending_sync'（已批准·待同步）。pending/rejected → 'n/a'。flag 关时投影恒空 → approved
     恒显 pending_sync（如实，未真正放行）。INDEXED 在生产 parity-verify 开时 = HA3 物理存在态。
+
+    E#40：同步态派生批量化——原实现逐行 2 条 SQL（最多 100 行 × 2 的 N+1），现先收集全部
+    (doc_id, version_no)，1 条 GROUP BY 拿计数 + 1 条 IN 拿 allowed_depts（Python 端并集），
+    循环内纯内存判定；round-trip 常数 3 条。批量结果为空/异常 → 回退逐行派生（行为不变）。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
@@ -557,6 +567,68 @@ def kb_my_access_requests(request: Request,
                     (kb.user_id,),
                 )
                 rows = cur.fetchall()
+                # ── E#40 批量预取：approved 行的 (doc_id, current_version) 去重对 ──
+                import json as _json
+                pairs: List[tuple] = []
+                _seen_pairs = set()
+                for r in rows:
+                    if (r[5] or "") == "approved" and (r[1] or ""):
+                        try:
+                            p = (r[1], int(r[9] or 1))
+                        except (TypeError, ValueError):
+                            continue   # 坏版本号：留给逐行 try 降级 n/a（与旧行为一致）
+                        if p not in _seen_pairs:
+                            _seen_pairs.add(p)
+                            pairs.append(p)
+                counts: Dict[tuple, tuple] = {}      # (doc_id, ver) → (cnt, n_idx)
+                allowed_map: Dict[tuple, set] = {}   # (doc_id, ver) → allowed_depts 并集
+                batch_ok = False
+                if pairs:
+                    try:
+                        ph = ",".join(["(%s,%s)"] * len(pairs))
+                        flat = [v for p in pairs for v in p]
+                        cur.execute(
+                            "SELECT doc_id, version_no, COUNT(*), SUM(index_status='INDEXED') "
+                            f"FROM {_kb_db()}.chunk_meta "
+                            f"WHERE (doc_id, version_no) IN ({ph}) AND is_active=1 "
+                            "GROUP BY doc_id, version_no",
+                            tuple(flat),
+                        )
+                        cnt_rows = cur.fetchall() or ()
+                        if cnt_rows:
+                            for cr in cnt_rows:
+                                counts[(cr[0], int(cr[1]))] = (int(cr[2] or 0), int(cr[3] or 0))
+                            # allowed_depts 并集：解析语义与 access_grants.current_allowed_for_doc
+                            # 一致——单行坏 JSON 跳过+告警，不连累整篇 doc（少计只会显 pending_sync，
+                            # 朝对账重投影自愈方向，绝不虚报 projected）。
+                            cur.execute(
+                                "SELECT DISTINCT doc_id, version_no, allowed_depts "
+                                f"FROM {_kb_db()}.chunk_meta "
+                                f"WHERE (doc_id, version_no) IN ({ph}) AND is_active=1",
+                                tuple(flat),
+                            )
+                            for ar in cur.fetchall() or ():
+                                key = (ar[0], int(ar[1]))
+                                vals = allowed_map.setdefault(key, set())
+                                ad = ar[2]
+                                if not ad:
+                                    continue
+                                if isinstance(ad, list):
+                                    vals.update(ad)
+                                    continue
+                                try:
+                                    vals.update(_json.loads(ad) or [])
+                                except (ValueError, TypeError):
+                                    logger.warning(
+                                        "my-access 跳过 doc=%s v=%s 的坏 allowed_depts JSON: %r",
+                                        ar[0], ar[1], str(ad)[:80])
+                            batch_ok = True
+                        # cnt_rows 为空 = 全部 doc 无 active chunk（罕见）→ 走逐行回退，
+                        # 逐行 COUNT 同样得 0 → pending_sync，结果一致（也兼容按单 doc
+                        # 参数分发的测试桩游标）。
+                    except Exception as _be:   # noqa: BLE001 — 批量失败绝不连累列表，回退逐行
+                        logger.warning("my-access 批量派生失败，回退逐行: %s", _be)
+                        batch_ok = False
                 for r in rows:
                     doc_id = r[1] or ""
                     rdepts = r[4] or ""
@@ -565,14 +637,19 @@ def kb_my_access_requests(request: Request,
                     if status == "approved" and doc_id:
                         try:
                             ver = int(r[9] or 1)
-                            cur.execute(
-                                "SELECT COUNT(*), SUM(index_status='INDEXED') "
-                                f"FROM {_kb_db()}.chunk_meta "
-                                "WHERE doc_id=%s AND version_no=%s AND is_active=1", (doc_id, ver))
-                            cnt_row = cur.fetchone() or (0, 0)
-                            cnt = int(cnt_row[0] or 0)
-                            n_idx = int(cnt_row[1] or 0)
-                            allowed = set(current_allowed_for_doc(cur, doc_id, ver))
+                            if batch_ok:
+                                # 纯内存判定：GROUP BY 缺席 ≡ 无 active chunk ≡ (0,0)
+                                cnt, n_idx = counts.get((doc_id, ver), (0, 0))
+                                allowed = allowed_map.get((doc_id, ver), set())
+                            else:
+                                cur.execute(
+                                    "SELECT COUNT(*), SUM(index_status='INDEXED') "
+                                    f"FROM {_kb_db()}.chunk_meta "
+                                    "WHERE doc_id=%s AND version_no=%s AND is_active=1", (doc_id, ver))
+                                cnt_row = cur.fetchone() or (0, 0)
+                                cnt = int(cnt_row[0] or 0)
+                                n_idx = int(cnt_row[1] or 0)
+                                allowed = set(current_allowed_for_doc(cur, doc_id, ver))
                             granted = {g.strip() for g in rdepts.split(",") if g.strip()}
                             projected = bool(cnt and cnt == n_idx and granted and granted <= allowed)
                             sync = "projected" if projected else "pending_sync"
@@ -669,6 +746,15 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
     except Exception as e:
         logger.error("kb_access_request_%s 失败 [trace=%s]: %s", decision, trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"操作失败 (trace: {trace_id})")
+    # E#39：授权决策已提交（approve/reject/revoke 均经此唯一状态机）→ 主动失效检索侧
+    # _deny_revoked_cross_dept 的 (doc_id → approved 组码) TTL 缓存，RAG_ACL_DENY_CACHE_TTL_S>0
+    # 时保住「撤销即时生效」语义（默认 TTL=0 缓存恒空，本调用为廉价 no-op）。惰性 import：
+    # 依赖方向 retriever ↛ api/routes（无环）；fail-open——失效失败只记日志，绝不影响已提交结果。
+    try:
+        from opensearch_pipeline.retriever import invalidate_deny_cache
+        invalidate_deny_cache(doc_id or None)
+    except Exception as _ie:   # noqa: BLE001
+        logger.warning("deny 缓存失效失败（忽略，TTL 兜底）doc=%s: %s", doc_id, _ie)
     return KbAccessDecisionResponse(id=req.id, status=decision, decided=True, already=False)
 
 

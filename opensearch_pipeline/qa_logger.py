@@ -103,23 +103,34 @@ def _conversation_history_on() -> bool:
         return False
 
 
-def _upsert_conversation(conn, user_id: str, conversation_id: str, title) -> None:
-    """会话元数据幂等 upsert（标题仅首次落、后续只更新时间）。
+def _exec_conversation_upsert(conn, user_id: str, conversation_id: str, title) -> None:
+    """执行 qa_conversation 幂等 upsert 语句（**不 commit**，事务边界由调用方掌控）。
 
-    独立小事务，失败仅 warning、绝不回滚已落库的审计行。隐藏状态由删除接口单独管理，
-    本 upsert 不触碰 hidden_at —— 故对已隐藏会话继续写入不会令其自动重现。
+    标题仅首次落、后续只更新时间。隐藏状态由删除接口单独管理，本 upsert 不触碰
+    hidden_at —— 故对已隐藏会话继续写入不会令其自动重现。
+    perf E#47：拆出纯执行体，主路径把它并入审计行 INSERT 的同一事务（一次 commit）；
+    降级路径 _upsert_conversation 仍以独立小事务包装（现状两段式）。
+    """
+    with conn.cursor() as c2:
+        c2.execute(
+            f"""
+            INSERT INTO {_op_db()}.qa_conversation
+                (user_id, conversation_id, title, created_at, updated_at, last_message_at)
+            VALUES (%s, %s, %s, NOW(3), NOW(3), NOW(3))
+            ON DUPLICATE KEY UPDATE updated_at = NOW(3), last_message_at = NOW(3)
+            """,
+            (user_id, conversation_id, (title or "")[:255]),
+        )
+
+
+def _upsert_conversation(conn, user_id: str, conversation_id: str, title) -> None:
+    """会话元数据幂等 upsert（独立小事务降级路径）。
+
+    失败仅 warning、绝不回滚已落库的审计行。合并事务（E#47 主路径）失败时回退到本函数，
+    行为与历史两段式完全一致。
     """
     try:
-        with conn.cursor() as c2:
-            c2.execute(
-                f"""
-                INSERT INTO {_op_db()}.qa_conversation
-                    (user_id, conversation_id, title, created_at, updated_at, last_message_at)
-                VALUES (%s, %s, %s, NOW(3), NOW(3), NOW(3))
-                ON DUPLICATE KEY UPDATE updated_at = NOW(3), last_message_at = NOW(3)
-                """,
-                (user_id, conversation_id, (title or "")[:255]),
-            )
+        _exec_conversation_upsert(conn, user_id, conversation_id, title)
         conn.commit()
     except Exception as ce:
         logger.warning(
@@ -239,21 +250,44 @@ def log_qa_session(
                 content_blocks_json,
             ]
 
-            def _insert(cols, vals):
+            def _execute_insert(cols, vals):
                 with conn.cursor() as cursor:
                     cursor.execute(
                         f"INSERT INTO {_op_db()}.qa_session_log ({', '.join(cols)}) "
                         f"VALUES ({', '.join(['%s'] * len(cols))})",
                         tuple(vals),
                     )
+
+            def _insert(cols, vals):
+                _execute_insert(cols, vals)
                 conn.commit()
 
             # 正常路径：开关开 + 有 conversation_id → conversation_id 直接进主 INSERT（原子，无 post-commit 空窗）。
             # 兼容降级：库未迁移（unknown column 1054）→ 回滚后改 legacy INSERT，核心审计行恒落库、绝不丢。
             enrich = bool(conversation_id) and _conversation_history_on()
+            conversation_upserted = False
             try:
                 if enrich:
-                    _insert(base_cols + ["conversation_id"], base_vals + [conversation_id])
+                    # perf E#47：qa_conversation upsert 并入主事务、同一 commit（省一次
+                    # RDS 往返+fsync）。合并事务任何失败 → 回滚后降级为现状两段式：先单独
+                    # 重试主 INSERT（含 conversation_id，1054 由外层 except 继续降级 legacy），
+                    # upsert 交回下方独立小事务 best-effort——核心审计行绝不因 upsert 丢失。
+                    try:
+                        _execute_insert(base_cols + ["conversation_id"],
+                                        base_vals + [conversation_id])
+                        _exec_conversation_upsert(conn, user_id or "", conversation_id, query_text)
+                        conn.commit()
+                        conversation_upserted = True
+                    except Exception as me:
+                        logger.warning(
+                            "qa_session_log 合并事务失败，降级两段式 (non-fatal): "
+                            "message_id=%s, %s", message_id, me,
+                        )
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        _insert(base_cols + ["conversation_id"], base_vals + [conversation_id])
                 else:
                     _insert(base_cols, base_vals)
             except Exception as ie:
@@ -282,8 +316,9 @@ def log_qa_session(
                 insert_qa_doc_facts(conn, message_id, retrieved_docs, cited_docs)
             except Exception as _fe:
                 logger.warning("qa_retrieved_doc 物化异常 (non-fatal): %s", _fe)
-            # best-effort 幂等 upsert 会话元数据（独立小事务，失败仅 warning）。
-            if enrich:
+            # best-effort 幂等 upsert 会话元数据（独立小事务，失败仅 warning）——
+            # 仅在 E#47 合并事务未覆盖时（降级两段式 / legacy 回退）才补跑。
+            if enrich and not conversation_upserted:
                 _upsert_conversation(conn, user_id or "", conversation_id, query_text)
         finally:
             conn.close()

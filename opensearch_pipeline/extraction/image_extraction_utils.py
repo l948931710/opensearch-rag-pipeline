@@ -27,6 +27,9 @@ class ImageAsset:
     # 页面显示 bbox (x0, y0, x1, y1)，页坐标、上原点（PDF/PPTX 可提供；与文本块
     # extra.y0/y1 同坐标系，供按版面位置锚定图片→步骤）
     bbox: Optional[tuple] = None
+    # perf#88：导出时已算过的 blob MD5（xlsx 路径回填；别处构造的旧路径为 None 时
+    # _enrich_xlsx_annotations 回退逐文件读哈希）。避免配对阶段 O(pics×assets) 重读+重哈希。
+    md5: Optional[str] = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -36,6 +39,7 @@ class ImageAsset:
 def extract_images_from_docx(
     local_path: str,
     output_dir: str,
+    document=None,
 ) -> List[ImageAsset]:
     """
     从 DOCX 文件中提取所有嵌入图片。
@@ -48,23 +52,26 @@ def extract_images_from_docx(
     Args:
         local_path: DOCX 文件的本地路径。
         output_dir: 图片导出目标目录。
+        document: 可选，调用方已解析好的 python-docx Document（perf#63 复用，
+            避免同一 DOCX 再做一次完整 OOXML 解包 + lxml 树构建）；
+            None = 自行加载（独立调用兼容，行为同旧版）。
 
     Returns:
         导出的 ImageAsset 列表（已 MD5 去重）。
     """
-    try:
-        import docx
-    except ImportError:
-        return []
-
     assets: List[ImageAsset] = []
     seen_hashes: dict = {}  # md5 -> 首次导出的 ImageAsset
 
-    try:
-        document = docx.Document(local_path)
-    except Exception as e:
-        print(f"      ⚠️ Failed to open DOCX for image extraction: {e}")
-        return []
+    if document is None:
+        try:
+            import docx
+        except ImportError:
+            return []
+        try:
+            document = docx.Document(local_path)
+        except Exception as e:
+            print(f"      ⚠️ Failed to open DOCX for image extraction: {e}")
+            return []
 
     doc_basename = os.path.splitext(os.path.basename(local_path))[0]
     img_index = 0
@@ -398,6 +405,7 @@ def extract_images_from_pdf(
 def extract_images_from_xlsx(
     local_path: str,
     output_dir: str,
+    workbook=None,
 ) -> List[ImageAsset]:
     """
     从 XLSX 文件中提取嵌入图片。
@@ -407,6 +415,12 @@ def extract_images_from_xlsx(
     Args:
         local_path: XLSX 文件的本地路径。
         output_dir: 图片导出目标目录。
+        workbook: 可选，调用方已加载的**普通模式** openpyxl workbook（perf#62 复用，
+            避免同一 xlsx 再次 zip 解包）。read_only workbook 的 worksheet 没有
+            _images（openpyxl 只在普通模式加载 drawing），直接用会静默丢图 →
+            检测到 read_only 一律忽略、回退自行加载。传入的 workbook 不在此关闭
+            （生命周期归调用方）；普通模式 _images 数据在 load 时已读入内存，
+            不依赖 archive 开闭。
 
     Returns:
         导出的 ImageAsset 列表（已 MD5 去重）。
@@ -420,11 +434,17 @@ def extract_images_from_xlsx(
     assets: List[ImageAsset] = []
     seen_hashes: dict = {}  # md5 -> {"asset": 首次导出资产, "anchors": set((sheet_idx, anchor_row))}
 
-    try:
-        wb = load_workbook(local_path, data_only=True)
-    except Exception as e:
-        print(f"      ⚠️ Failed to open XLSX for image extraction: {e}")
-        return []
+    wb = None
+    owns_wb = True
+    if workbook is not None and not getattr(workbook, "read_only", False):
+        wb = workbook
+        owns_wb = False
+    if wb is None:
+        try:
+            wb = load_workbook(local_path, data_only=True)
+        except Exception as e:
+            print(f"      ⚠️ Failed to open XLSX for image extraction: {e}")
+            return []
 
     doc_basename = os.path.splitext(os.path.basename(local_path))[0]
     img_index = 0
@@ -472,6 +492,7 @@ def extract_images_from_xlsx(
                         page_num=sheet_idx + 1,
                         image_index=img_index,
                         original_name=f"sheet{sheet_idx}_image",
+                        md5=md5,  # perf#88：别名与原资产同字节，直接携带同一 MD5
                     )
                     alias.anchor_row = anchor_row
                     assets.append(alias)
@@ -501,6 +522,7 @@ def extract_images_from_xlsx(
                 page_num=sheet_idx + 1,
                 image_index=img_index,
                 original_name=f"sheet{sheet_idx}_image",
+                md5=md5,  # perf#88：导出时已算过的 MD5 直接携带，配对阶段免重读重哈希
             )
             if anchor_row is not None:
                 asset.anchor_row = anchor_row
@@ -508,7 +530,8 @@ def extract_images_from_xlsx(
             seen_hashes[md5] = {"asset": asset, "anchors": {(sheet_idx, anchor_row)}}
             img_index += 1
 
-    wb.close()
+    if owns_wb:
+        wb.close()
 
     # ── 后处理：从 Drawing XML 提取 group 编号标注 ──
     # openpyxl 的 _images 无法读取 grpSp 里的文字标注（如①②③序号圆圈）
@@ -550,21 +573,30 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
         col_off = int(from_el.find('xdr:colOff', ns).text)
         return row, col, col_off
 
-    def _find_asset_by_md5(media_blob, sheet_idx):
-        """通过 MD5 找到对应的 ImageAsset。"""
-        if not media_blob:
-            return None
-        media_md5 = hashlib.md5(media_blob).hexdigest()
-        for asset in assets:
-            if asset.page_num != sheet_idx + 1:
-                continue
+    # perf#88：导出循环已算过每个 blob 的 MD5（ImageAsset.md5），此处一次性预建
+    # {md5: [assets 原序]} 索引——方式A/方式B 每次配对从「全量重读文件+重哈希」
+    # （O(pics×assets) 磁盘 IO）降为零额外 IO 的字典查找。asset.md5 为 None
+    # （外部构造的旧路径，如 docx_extractor）时回退现状逐文件读哈希，每文件至多
+    # 一次；读失败按现状跳过该资产。
+    md5_to_assets: dict = {}
+    for asset in assets:
+        asset_md5 = asset.md5
+        if asset_md5 is None:
             try:
                 with open(asset.local_path, 'rb') as f:
                     asset_md5 = hashlib.md5(f.read()).hexdigest()
-                if asset_md5 == media_md5:
-                    return asset
             except Exception:
                 continue
+        md5_to_assets.setdefault(asset_md5, []).append(asset)
+
+    def _find_asset_by_md5(media_blob, sheet_idx):
+        """通过 MD5 找到对应的 ImageAsset（预建索引；assets 原序 first-match 语义不变）。"""
+        if not media_blob:
+            return None
+        media_md5 = hashlib.md5(media_blob).hexdigest()
+        for asset in md5_to_assets.get(media_md5, ()):
+            if asset.page_num == sheet_idx + 1:
+                return asset
         return None
 
     with zipfile.ZipFile(xlsx_path) as z:

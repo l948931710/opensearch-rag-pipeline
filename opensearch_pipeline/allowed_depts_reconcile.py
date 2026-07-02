@@ -30,6 +30,67 @@ def _kb_db() -> str:
 _LIMIT = 200
 
 
+def _prescreen_unchanged(cur, targets) -> set:
+    """批量预筛出【确定无漂移】的 doc 子集（perf E#36，消除常态轮次逐 doc 4×SQL 的 N+1）。
+
+    两条聚合查询：① resolve_allowed_depts 一条 IN 拉全部 approved grants（白名单净化同口径）；
+    ② 一条 current-version 投影明细（allowed_depts / permission_level）。随后在内存按
+    materialize_doc_allowed_depts 同一 diff 口径（版本限定 gate 到 dept_internal + 排序比较）
+    复算。只有明细数据完整且 want==have 的 doc 才判 unchanged；任何数据缺失 / 行形状异常 /
+    坏 JSON 一律【不判】——保守方向：宁可多跑 materialize 复核，绝不把真实漂移误判成 unchanged。
+    本函数只读；写路径与 2h 反抢锁语义完全由单一注入点 helper 保持不变。
+    """
+    import json as _json
+    from opensearch_pipeline.access_grants import resolve_allowed_depts
+
+    targets = list(targets)
+    if not targets:
+        return set()
+    grants = resolve_allowed_depts(targets, cur)         # ① 应有授权（一条 IN 查询）
+    placeholders = ",".join(["%s"] * len(targets))
+    cur.execute(                                         # ② 现存投影 + 版本限定权限（一条查询）
+        f"SELECT DISTINCT cm.doc_id, cm.allowed_depts, cm.permission_level "
+        f"FROM {_kb_db()}.chunk_meta cm "
+        f"JOIN {_kb_db()}.document_meta dm "
+        f"  ON dm.doc_id=cm.doc_id AND cm.version_no=dm.current_version_no "
+        f"WHERE cm.is_active=1 AND cm.doc_id IN ({placeholders})",
+        tuple(targets),
+    )
+    rows = cur.fetchall()
+    have_map: dict = {}
+    perm_map: dict = {}
+    bad: set = set()
+    for row in rows:
+        try:
+            d, ad, perm = row[0], row[1], row[2]
+        except Exception:  # noqa: BLE001 — 行形状异常（桩/驱动差异）→ 整体放弃预筛，全量复核
+            return set()
+        perm_map.setdefault(d, set())
+        if perm is not None:                     # 与 GROUP_CONCAT 同口径：NULL 权限不计入 gate 判定
+            perm_map[d].add(perm)
+        if not ad:
+            continue
+        if isinstance(ad, list):
+            have_map.setdefault(d, set()).update(ad)
+            continue
+        try:
+            have_map.setdefault(d, set()).update(_json.loads(ad) or [])
+        except (ValueError, TypeError):
+            bad.add(d)                           # 坏 JSON → 该 doc 不预筛，交 materialize 复核
+
+    unchanged = set()
+    for d in targets:
+        if d not in perm_map or d in bad:        # 无 current-version 明细 → 保守交逐 doc 复核
+            continue
+        raw_want = grants.get(d, [])
+        # 版本限定 gate（与 materialize 的 GROUP_CONCAT==‘dept_internal’ 等价）：
+        # 唯一权限级且为 dept_internal 才保留 want，否则 want=[]。
+        want = raw_want if perm_map[d] == {"dept_internal"} else []
+        if sorted(want) == sorted(have_map.get(d, set())):
+            unchanged.add(d)
+    return unchanged
+
+
 def reconcile_allowed_depts(commit: bool = True) -> dict:
     """全量对账 approved authority → chunk_meta.allowed_depts 投影。
 
@@ -66,7 +127,19 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
             # 审计）。漂移文档本轮处理后下轮即变 unchanged，预算自然腾给后续漂移 → 自清、最终全覆盖。
             targets = sorted(set(approved) | have_ad)
 
+            # perf E#36：批量预筛（2 条聚合查询）先在内存 diff 出确定无漂移的 doc，跳过其
+            # 逐 doc 4×SQL 复核；漂移/存疑子集仍走单一注入点 materialize 复核+写（锁/gate/
+            # 写语义不变）。预筛异常 → 退回全量逐 doc 复核（现状行为，graceful degradation）。
+            prescreen_unchanged: set = set()
+            try:
+                prescreen_unchanged = _prescreen_unchanged(cur, targets)
+            except Exception as pe:  # noqa: BLE001 — 预筛失败绝不影响对账本体
+                logger.warning("allowed_depts 预筛失败，退回全量逐 doc 复核: %s", pe)
+            result["unchanged"] += len(prescreen_unchanged)
+
             for doc_id in targets:
+                if doc_id in prescreen_unchanged:
+                    continue                             # 预筛判定无漂移 → 零逐 doc SQL
                 if result["materialized"] + result["retracted"] >= _LIMIT:
                     result["capped"] = True
                     logger.info("allowed_depts reconcile 单轮写达上限 _LIMIT=%d，剩余漂移下轮续（自清不饿死）",

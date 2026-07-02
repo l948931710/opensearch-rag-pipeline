@@ -41,7 +41,9 @@ jobs:
         continue-on-error: true
         run: python -m ruff check opensearch_pipeline/ tests/
       - name: Test (simulate mode — no external services)
-        run: python -m pytest tests/ -q -p no:cacheprovider
+        # perf F#48：xdist 并行（ubuntu runner 4 vCPU）；--dist loadgroup + conftest 分组钩子
+        # 复刻 loadfile 语义并把共享本地栈的模块钉到同一 worker（CI 无本地 DB，该组多为 skip）。
+        run: python -m pytest tests/ -q -p no:cacheprovider -n auto --dist loadgroup
 
   # 前端门（console-app Vite/Vue3）：此前完全无 CI——135 个 vitest 与 vue-tsc 类型检查从未在
   # 合并前跑过。本 job 把它们设为【阻塞】门：build 含 vue-tsc 类型检查（package.json:8），故无需

@@ -495,6 +495,60 @@ def strip_doc_citations(text: Optional[str]) -> str:
 # Messages 构建（支持多轮对话）
 # ═══════════════════════════════════════════════════════════════
 
+def _history_char_budget() -> int:
+    """会话历史字符预算（perf I#77）。RAG_HISTORY_CHAR_BUDGET，默认 12000；0=关闭裁剪。
+
+    历史此前只按轮数裁剪、无字符预算——多轮长答案线性放大每轮 prompt token 成本
+    （DashScope 按 token 计费）与 TTFT。负数/非法值按默认处理。"""
+    try:
+        v = int(os.environ.get("RAG_HISTORY_CHAR_BUDGET", "12000"))
+        return v if v >= 0 else 12000
+    except (TypeError, ValueError):
+        return 12000
+
+
+def _trim_history_by_char_budget(
+    history: List[Dict[str, str]], budget: int
+) -> List[Dict[str, str]]:
+    """从新到旧按【整轮】保留会话历史，累计字符数 ≤ budget 即截断（不截半轮）。
+
+    一「轮」= 一条 user 消息起、到下一条 user 消息之前的连续段（user+assistant 配对；
+    历史开头的孤儿 assistant 段自成一轮）。当前问题不在 history 内、永不受影响。
+    budget<=0（关闭）或总量未超预算时原样返回（零拷贝、逐字节不变）。
+    """
+    if not history or budget <= 0:
+        return history
+    total_chars = sum(len(m.get("content") or "") for m in history)
+    if total_chars <= budget:
+        return history
+    # 按轮分组（user 边界切分）
+    rounds: List[List[Dict[str, str]]] = []
+    cur: List[Dict[str, str]] = []
+    for m in history:
+        if m.get("role") == "user" and cur:
+            rounds.append(cur)
+            cur = [m]
+        else:
+            cur.append(m)
+    if cur:
+        rounds.append(cur)
+    kept: List[List[Dict[str, str]]] = []
+    acc = 0
+    for rnd in reversed(rounds):            # 从最新轮往旧累计
+        size = sum(len(m.get("content") or "") for m in rnd)
+        if acc + size > budget:
+            break                           # 该轮连同更旧的所有轮整体丢弃（不截半轮）
+        kept.append(rnd)
+        acc += size
+    kept.reverse()
+    trimmed = [m for rnd in kept for m in rnd]
+    logger.info(
+        "会话历史按字符预算截断（RAG_HISTORY_CHAR_BUDGET=%d）：%d 条/%d 字符 → %d 条/%d 字符",
+        budget, len(history), total_chars, len(trimmed), acc,
+    )
+    return trimmed
+
+
 def _build_messages(
     query: str,
     context: str,
@@ -544,7 +598,10 @@ def _build_messages(
         {"role": "system", "content": _system},
     ]
 
-    # 插入对话历史
+    # 插入对话历史（perf I#77：先按字符预算从新到旧整轮裁剪——多轮长答案不再无界放大
+    # 每轮 prompt token；默认预算 12000 字符，RAG_HISTORY_CHAR_BUDGET=0 关闭）
+    if history:
+        history = _trim_history_by_char_budget(history, _history_char_budget())
     if history:
         messages.extend(history)
 

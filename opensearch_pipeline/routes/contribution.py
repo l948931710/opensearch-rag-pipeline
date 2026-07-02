@@ -56,6 +56,16 @@ _CONTRIB_CANDIDATE_CAP = 400   # 每源（NO_RESULT / REFUSAL）拉取的原始�
 _gaps_cache: dict = {}
 _gaps_cache_lock = threading.Lock()
 
+# reconcile 写-on-read 降噪（perf#84）：4 个 GET 端点读前对账原本每请求无条件发
+# 2 条跨库 UPDATE + 1 commit。两道闸：① 进程内 60s 节流——稳态（无 registered 行）
+# 下把后续请求降为零额外 DB 往返（--workers 1 单进程即权威）；② EXISTS 短路——
+# 有 registered 行才发 UPDATE/commit。有贡献待对账时行为不变（EXISTS 命中不武装
+# 节流，每请求照常对账直到 registered 清空）。节流状态并入 _gaps_cache_clear 统一
+# 清理（conftest 每测清空复用同一钩子；提交/采纳写路径调用后即时解除节流）。
+_RECONCILE_THROTTLE_S = 60.0
+_reconcile_state = {"ts": 0.0}
+_reconcile_lock = threading.Lock()
+
 
 def _gaps_cache_ttl() -> float:
     try:
@@ -67,6 +77,9 @@ def _gaps_cache_ttl() -> float:
 def _gaps_cache_clear() -> None:
     with _gaps_cache_lock:
         _gaps_cache.clear()
+    # perf#84：连带解除 reconcile 节流（写路径产生的 registered 即时可对账）
+    with _reconcile_lock:
+        _reconcile_state["ts"] = 0.0
 
 
 def _gaps_cache_get(key):
@@ -201,7 +214,15 @@ def _reconcile_contributions_searchable(conn) -> None:
        document_version(fuling_knowledge)——后者若 _0900_ai_ci（staging _stg / 未显式 COLLATE 建库
        即漂移，与 kb_access_request 同坑：staging 实测 1267）直接 JOIN 报 1267 → 被本函数 try/except
        吞掉 → reconcile 静默永不 flip searchable。显式 COLLATE 强制统一比较；prod 两侧 unicode_ci 时为 no-op。
+
+    perf#84 两道降噪闸（见模块级 _RECONCILE_THROTTLE_S 注释）：60s 节流 + EXISTS 短路。
+    仅在 EXISTS 干净地返回「无 registered 行」时武装节流；EXISTS 命中或结果异常
+    （驱动/桩未返回行）一律 fail open 走原对账路径，有贡献待对账时行为不变。
     """
+    now = time.time()
+    with _reconcile_lock:
+        if now - _reconcile_state["ts"] < _RECONCILE_THROTTLE_S:
+            return
     from opensearch_pipeline import contribution as C
     ok_in = ",".join("'%s'" % s for s in C.INDEX_OK_STATUSES)
     fail_in = ",".join("'%s'" % s for s in C.INDEX_FAIL_STATUSES)
@@ -209,6 +230,15 @@ def _reconcile_contributions_searchable(conn) -> None:
                  " AND dv.version_no=1")
     try:
         with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT EXISTS(SELECT 1 FROM {_op_db()}.kb_contribution"
+                " WHERE ingestion_status='registered' LIMIT 1)")
+            row = cur.fetchone()
+            if row is not None and not row[0]:
+                # 稳态（无待对账行）→ 武装节流，60s 内后续读请求零额外 DB 往返
+                with _reconcile_lock:
+                    _reconcile_state["ts"] = now
+                return
             cur.execute(
                 f"UPDATE {_op_db()}.kb_contribution c"
                 f" JOIN {_kb_db()}.document_version dv ON {_doc_join}"

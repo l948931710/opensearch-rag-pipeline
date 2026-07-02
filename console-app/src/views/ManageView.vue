@@ -55,8 +55,8 @@ onMounted(async () => {
     void loadStats()
     void loadConfig()
     void loadInsights()                              // 概览看板：使用成效 + 知识缺口（两角色）
-    void loadApprovals()
-    void loadAccessRequests()
+    void loadApprovals()                             // 非 force：App ready 已为红点预载，30s 内不重拉（#82）
+    void loadAccessRequests()                        // 同上（staleness 门在 useKb 内）
     void loadAccessGrants()
     void loadApprovalHistory()                       // 审批历史（两角色，只读聚合）
     if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants() }   // 全库治理看板 + 成员管理（kb_admin）

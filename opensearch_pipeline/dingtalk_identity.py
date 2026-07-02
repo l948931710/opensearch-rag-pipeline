@@ -488,8 +488,12 @@ def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
             if data.get("errcode") == 0:
                 result = data.get("result", {})
                 user_name = result.get("name", "")
-                # 遍历完整 dept_id_list（H3），收集全部部门名 → CSV，支持多部门用户
+                # 遍历完整 dept_id_list（H3），收集全部部门名 → CSV，支持多部门用户。
+                # perf F#55：多部门用户此前串行逐部门 HTTP（每次 5s 超时）压在首问关键路径
+                # （cache-miss 才走）——改小线程池并发拉取；结果仍按 dept_id_list 原顺序
+                # 消费，去重/顺序/is_partial 判定与串行版等价。
                 dept_id_list = result.get("dept_id_list", [])
+                name_by_id = _fetch_dept_names_concurrent(token, dept_id_list)
                 dept_names = []
                 seen_names = set()
                 # F-22：任一 dept_id 的 department/get 瞬时失败（返回空名）→ 解析不完整。
@@ -497,7 +501,7 @@ def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
                 # dept_id_list 为空是合法的「无部门」，不算不完整。
                 is_partial = False
                 for did in dept_id_list:
-                    nm = _fetch_dept_name(token, did)
+                    nm = name_by_id.get(did, "")
                     if not nm:
                         is_partial = True
                         continue
@@ -513,6 +517,34 @@ def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
     except Exception as e:
         logger.warning("用户查询异常: %s", e)
         return None
+
+
+def _dept_fetch_concurrency() -> int:
+    """部门名并发拉取线程数（perf F#55）。RAG_DEPT_FETCH_CONCURRENCY，默认 4（只读钉钉
+    department/get、仅 cache-miss 首解析才走）；<=1 退回串行。"""
+    try:
+        return max(1, int(os.environ.get("RAG_DEPT_FETCH_CONCURRENCY", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _fetch_dept_names_concurrent(token: str, dept_id_list) -> Dict[Any, str]:
+    """并发解析 dept_id → 部门名，返回 {dept_id: name}（失败/超时值为 ""，语义同串行版）。
+
+    cache-miss 首解析的关键路径优化：N 个部门从 N×RTT（最坏 N×5s）降到 ~1×RTT。
+    单部门或并发=1 时退化为串行调用（零行为差异）；结果 dict 由调用方按原顺序消费，
+    去重/顺序稳定性不在本函数内。_fetch_dept_name 按模块全局名调用（tests monkeypatch 兼容）。
+    """
+    ids = list(dept_id_list or [])
+    if not ids:
+        return {}
+    conc = min(_dept_fetch_concurrency(), len(ids))
+    if conc <= 1 or len(ids) == 1:
+        return {did: _fetch_dept_name(token, did) for did in ids}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=conc) as pool:
+        names = list(pool.map(lambda did: _fetch_dept_name(token, did), ids))
+    return dict(zip(ids, names))
 
 
 def _fetch_dept_name(token: str, dept_id: int) -> str:

@@ -104,3 +104,40 @@ def llm_key_present(monkeypatch):
 
     monkeypatch.setattr(get_config().llm, "api_key", "test-dummy-key", raising=False)
     return "test-dummy-key"
+
+
+# ---------------------------------------------------------------------------
+# perf F#48（pytest-xdist 并行化）：配合 `-n auto --dist loadgroup` 使用。
+# 按模块名分组 = 复刻 --dist loadfile 语义（同文件测试落同 worker，天然兼容既有的
+# 模块级 autouse fixture / import 期 env setdefault）；共享本地 dev 栈的模块（真实
+# DML、含无 WHERE 整表清空的 reset fixture、并发认领互斥用例、prod-guard 全局态）
+# 强制归入同一 group → 同一 worker 串行执行，防止并行 worker 互相清库/串状态。
+# 串行运行（无 -n）时本钩子只是给 item 挂个惰性 marker，零行为影响。
+# ---------------------------------------------------------------------------
+_LOCAL_STACK_SERIAL_MODULES = {
+    "test_pipeline.py",       # reset_db_state 整表清空 + 真实写 chunk_meta/bulk_job
+    "test_concurrency.py",    # 真实并发认领互斥（行锁语义）
+    "test_classification.py", # RDS 集成用例
+    "test_image_funnel.py",   # RDS 集成用例
+    "test_simulate_prod_guard.py",  # 操纵 prod-guard/config 全局态
+}
+
+
+# ⚠️ tryfirst 必须加：worker 进程里 conftest 在 _prepareconfig 阶段注册、WorkerInteractor 之后
+# 注册（pluggy LIFO → 后注册先执行），若不 tryfirst，xdist 的 modifyitems（读 marker 拼 @group
+# 后缀）会先于本钩子执行 → marker 打晚了 → loadgroup 退化为逐测试分发、DB 模块互相清库。
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    # 不能用 pluginmanager.hasplugin("xdist") 判断：worker 端该插件名不存在（WorkerInteractor
+    # 匿名注册）。import 探测在 controller/worker 两端行为一致；未安装 xdist 时跳过。
+    try:
+        import xdist  # noqa: F401
+    except ImportError:
+        return
+    import os as _os
+
+    for item in items:
+        mod = item.nodeid.split("::", 1)[0]
+        base = _os.path.basename(mod)
+        group = "local-db-stack" if base in _LOCAL_STACK_SERIAL_MODULES else mod
+        item.add_marker(pytest.mark.xdist_group(group))

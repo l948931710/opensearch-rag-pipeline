@@ -273,3 +273,98 @@ describe('useKb.loadApprovals — 仅 kb_admin', () => {
     expect(kb.approvals.value[0].title).toBe('公开件')
   })
 })
+
+describe('useKb staleness 门（#82）— 预载后 30s 内不重拉', () => {
+  const P1 = { doc_id: 'p1', version_no: 1, title: '公开件', owner_dept: 'hr', permission_level: 'public', owner_name: '李四', created_at: '', original_filename: '' }
+
+  it('二次 loadApprovals 跳过（App ready 预载 → ManageView 挂载不重拉）；force 逃生', async () => {
+    const fetchMock = routeFetch({ pending: jsonResp({ items: [P1] }) })
+    vi.stubGlobal('fetch', fetchMock)
+    const kb = useKb()
+    setIdentity('kb_admin', ['hr'])
+    await kb.loadApprovals()            // App ready 预载
+    await kb.loadApprovals()            // ManageView onMounted（非 force）→ 门内跳过
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(kb.approvals.value).toHaveLength(1)
+    await kb.loadApprovals(true)        // force 逃生 → 真重拉
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('加载失败重开门：LoadError 重试（非 force）能真重拉', async () => {
+    setIdentity('kb_admin', ['hr'])
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({ detail: 'boom' }, { ok: false, status: 500 })))
+    const kb = useKb()
+    await kb.loadApprovals()
+    expect(kb.loadErrors.value.approvals).toBeTruthy()
+    vi.stubGlobal('fetch', routeFetch({ pending: jsonResp({ items: [P1] }) }))
+    await kb.loadApprovals()            // 失败已清时间戳 → 非 force 也重拉
+    expect(kb.approvals.value).toHaveLength(1)
+  })
+
+  it('loadAccessRequests 同门：二次跳过、force 重拉', async () => {
+    setIdentity('dept_admin', ['hr'])
+    const fetchMock = vi.fn(async () => jsonResp({ items: [] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const kb = useKb()
+    await kb.loadAccessRequests()
+    await kb.loadAccessRequests()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await kb.loadAccessRequests(true)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('useKb.approve/reject — 审批后定向更新（#82）', () => {
+  const P = (id: string) => ({ doc_id: id, version_no: 2, title: id, original_filename: '', owner_dept: 'hr', permission_level: 'public', owner_name: '李四', created_at: '' })
+
+  it('approve 成功：本地移除该单（不重拉审批队列）+ 只刷一次文档列表；reviewCount 同步', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      calls.push(path)
+      if (path.startsWith('/api/kb/approve')) return jsonResp({ status: 'ok', approved: 1 })
+      if (path.startsWith('/api/kb/my-docs')) return jsonResp({ items: [], has_more: false })
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const kb = useKb()
+    setIdentity('kb_admin', ['hr'])
+    ;(kb as any).approvals.value = [P('p1'), P('p2')]
+    await kb.approve(P('p1') as any)
+    expect(kb.approvals.value.map((x) => x.doc_id)).toEqual(['p2'])                          // 本地移除
+    expect(kb.reviewCount.value).toBe(1)                                                     // 红点/角标同步
+    expect(calls.filter((c) => c.startsWith('/api/kb/pending-approvals'))).toHaveLength(0)   // 不再全量重拉队列
+    expect(calls.filter((c) => c.startsWith('/api/kb/my-docs'))).toHaveLength(1)             // 保留一次权威刷新
+  })
+
+  it('reject 失败：alert、该单保留可重试（现状回退）', async () => {
+    const alertMock = vi.fn()
+    vi.stubGlobal('alert', alertMock)
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (path.startsWith('/api/kb/reject')) return jsonResp({ detail: 'boom' }, { ok: false, status: 500 })
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const kb = useKb()
+    setIdentity('kb_admin', ['hr'])
+    ;(kb as any).approvals.value = [P('p1')]
+    await kb.reject(P('p1') as any, '理由')
+    expect(kb.approvals.value).toHaveLength(1)     // 失败不动队列
+    expect(alertMock).toHaveBeenCalled()
+  })
+
+  it('approveAccess 成功：本地移除该单 + 只刷「已授权清单」（不重拉申请队列）', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      calls.push(path)
+      if (path.startsWith('/api/kb/access-requests/approve')) return jsonResp({ status: 'ok' })
+      if (path.startsWith('/api/kb/access-grants')) return jsonResp({ items: [{ id: 'g1' }] })
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const kb = useKb()
+    setIdentity('dept_admin', ['hr'])
+    const req = { id: 'ar1', doc_id: 'D1', doc_title: 't', owner_dept: 'hr', requester_dept: 'it', requester_name: 'w', permission_level: 'dept_internal', reason: '', created_at: '' }
+    ;(kb as any).accessRequests.value = [req, { ...req, id: 'ar2' }]
+    await kb.approveAccess(req as any)
+    await waitFor(() => kb.accessGrants.value.length === 1)   // void loadAccessGrants 异步落地（受影响列表）
+    expect(kb.accessRequests.value.map((x) => x.id)).toEqual(['ar2'])
+    expect(calls.filter((c) => c === '/api/kb/access-requests')).toHaveLength(0)   // 队列 GET 未发生
+  })
+})

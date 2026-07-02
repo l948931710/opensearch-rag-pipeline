@@ -29,7 +29,21 @@ function scrollToBottom(smooth = false) {
 }
 
 // 流式逐 token / 状态变化：仅当用户本就贴底才跟随到底，否则不动（不把正在上翻阅读的人拽回去）。
-watch(messages, () => { if (atBottom.value) nextTick(() => scrollToBottom(false)) }, { deep: true })
+// H#71：不再 deep watch 整棵 messages（流式期每 tick 深遍历所有消息只为滚动跟随）。高度变化只由
+// 【最后一条】消息的可见字段驱动（流式 html/思考披露条/加载骨架+来源预览/定稿图文/错误/无结果/
+// 展开态）+ 消息条数（含切换会话时 messages 整体换源）→ 拼成窄信号串，变了才跟随。
+watch(
+  () => {
+    const list = messages.value
+    const l = list[list.length - 1]
+    if (!l) return '0'
+    return list.length + ':' + (l.html?.length || 0) + ':' + (l.reasoningHtml?.length || 0)
+      + ':' + (l.viewBlocks?.length || 0) + ':' + (l.sources?.length || 0)
+      + ':' + (l.stageText || '') + ':' + (l.loading ? 1 : 0) + (l.error ? 1 : 0) + (l.noResult ? 1 : 0)
+      + (l.sourcesOpen ? 1 : 0) + (l.reasoningOpen ? 1 : 0)
+  },
+  () => { if (atBottom.value) nextTick(() => scrollToBottom(false)) },
+)
 
 // 发起提问：用户期望立刻看到自己的问句与作答 → 强制贴底跟随。
 function send(preset?: string) { atBottom.value = true; void ask(preset) }

@@ -57,36 +57,53 @@ def _page_char_counts(pdf_path: str) -> List[int]:
         return []
 
 
-def _render_page_image(pdf_path: str, page_idx: int, zoom: float = 2.2):
+def compress_page_png(png_bytes: bytes, max_edge: int = 1568, jpeg_quality: int = 78):
+    """整页渲染 PNG → JPEG(q78) + 限边 1568px，返回 (bytes, mime)。
+
+    生产验证过的上传体积参数（与 image_funnel 一致的区间，文字仍清晰；首版 2.2x PNG
+    的 1-3MB payload 曾踩到 write timeout）。perf#64：ocr_client 的整页 OCR 上传
+    复用同一压缩，别在调用方手写第二份参数。PIL 缺失/任何失败 → 原样返回 PNG 字节
+    （fail-open，绝不阻断上传）。
+    """
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        if max(im.size) > max_edge:
+            im.thumbnail((max_edge, max_edge))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=jpeg_quality)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return png_bytes, "image/png"
+
+
+def _render_page_image(pdf_path: str, page_idx: int, zoom: float = 2.2, doc=None):
     """渲染单页并压缩为可上传体积，返回 (bytes, mime)。
 
-    密集中文页用 ~2.2x 保证清晰；超过 ~600KB 或边长 >2200px 时转 JPEG(q82) 并限边，
+    密集中文页用 ~2.2x 保证清晰；始终经 compress_page_png 转 JPEG(q78) 并限边 1568px，
     避免大 payload 上传写超时（首版踩到的 write timeout）。失败返回 (None, None)。
+    doc: 可选，调用方已打开的 fitz Document（perf#66 复用，避免每页重开整个 PDF）；
+         传入时由调用方负责 close，None = 自行 open/close（独立调用兼容）。
     """
     try:
         import fitz
-        doc = fitz.open(pdf_path)
+        own_doc = None
+        if doc is None:
+            own_doc = fitz.open(pdf_path)
+            doc = own_doc
         try:
             pix = doc.load_page(page_idx).get_pixmap(matrix=fitz.Matrix(zoom, zoom))
             png = pix.tobytes("png")
         finally:
-            doc.close()
+            if own_doc is not None:
+                own_doc.close()
     except Exception as e:
         logger.warning("[vlm_rebuilder] render page %s failed: %s", page_idx, e)
         return None, None
     # 始终转 JPEG 并限边 ~1568px（与 image_funnel 一致的上传体积区间，文字仍清晰），
     # 避免大 base64 payload 上传写超时。
-    try:
-        import io
-        from PIL import Image
-        im = Image.open(io.BytesIO(png)).convert("RGB")
-        if max(im.size) > 1568:
-            im.thumbnail((1568, 1568))
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=78)
-        return buf.getvalue(), "image/jpeg"
-    except Exception:
-        return png, "image/png"
+    return compress_page_png(png)
 
 
 _RECON_PROMPT = (
@@ -197,31 +214,48 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
     doc_title = task.get("doc_title", "") or task.get("filename", "")
     added = 0
     new_blocks_by_page = {}
-    for pidx in escalate:
-        img, mime = _render_page_image(local_path, pidx)
-        if not img:
-            continue
-        recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime)
-        page_blocks = []
-        for b in recon:
-            # 单块容错：一个畸形块 (如 level="一") 不应丢掉整页重建
-            try:
-                bt = b.get("type", "paragraph")
-                if bt not in ("heading", "paragraph", "table"):
-                    bt = "paragraph"
-                blk = ExtractedBlock(
-                    block_type=bt, text=(b.get("text") or "").strip(),
-                    level=_safe_int_level(b.get("level")), page_num=pidx + 1,
-                    source="multimodal",
-                )
-                blk.extra = {"rebuilt_by": "vlm"}
-                page_blocks.append(blk)
-            except Exception as _be:
-                logger.warning("[vlm_rebuilder] skip malformed VLM block on page %s: %s", pidx + 1, _be)
+    # perf#66：整个升级循环只 open 一次 PDF（大 PDF 每次 open 数百 ms，逐页重开 ×N）；
+    # open 失败则 _doc=None → _render_page_image 逐页自行 open（行为同旧版，优雅降级）。
+    _doc = None
+    try:
+        import fitz
+        _doc = fitz.open(local_path)
+    except Exception as _oe:
+        logger.warning("[vlm_rebuilder] shared open failed (per-page fallback): %s", _oe)
+        _doc = None
+    try:
+        for pidx in escalate:
+            img, mime = _render_page_image(local_path, pidx, doc=_doc)
+            if not img:
                 continue
-        if page_blocks:
-            new_blocks_by_page[pidx + 1] = page_blocks
-            added += len(page_blocks)
+            recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime)
+            page_blocks = []
+            for b in recon:
+                # 单块容错：一个畸形块 (如 level="一") 不应丢掉整页重建
+                try:
+                    bt = b.get("type", "paragraph")
+                    if bt not in ("heading", "paragraph", "table"):
+                        bt = "paragraph"
+                    blk = ExtractedBlock(
+                        block_type=bt, text=(b.get("text") or "").strip(),
+                        level=_safe_int_level(b.get("level")), page_num=pidx + 1,
+                        source="multimodal",
+                    )
+                    blk.extra = {"rebuilt_by": "vlm"}
+                    page_blocks.append(blk)
+                except Exception as _be:
+                    logger.warning("[vlm_rebuilder] skip malformed VLM block on page %s: %s",
+                                   pidx + 1, _be)
+                    continue
+            if page_blocks:
+                new_blocks_by_page[pidx + 1] = page_blocks
+                added += len(page_blocks)
+    finally:
+        if _doc is not None:
+            try:
+                _doc.close()
+            except Exception:
+                pass
 
     if not added:
         # 放行但实际未产生任何重建块 (渲染/VLM 全失败) → 退还预留，勿空耗运行预算
@@ -383,33 +417,48 @@ def maybe_refine_tables(task: dict, result, cfg, breaker=None):
     doc_title = task.get("doc_title", "") or task.get("filename", "")
     page_tables = {}  # page_num → [vlm table markdown, ...]（每页渲染+重建一次）
     refined = rejected = 0
-    for b in targets:
-        pg = getattr(b, "page_num", None)
-        if pg is None:
-            continue
-        if pg not in page_tables:
-            img, mime = _render_page_image(local_path, pg - 1)
-            recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime) if img else []
-            page_tables[pg] = [(rb.get("text") or "").strip() for rb in recon
-                               if rb.get("type") == "table" and (rb.get("text") or "").strip()]
-        cands = page_tables[pg]
-        if not cands:
-            continue
-        native = getattr(b, "text", "")
-        nat_tokens = _table_tokens(native)
-        # 同页多表时，选与原生表"内容"(文本 token+数字)重叠最多的 VLM 表，避免错配到同页别的表
-        best = max(cands, key=lambda t: len(nat_tokens & _table_tokens(t)))
-        # 双闸：① 数字保真（VLM 不漏原生数字）② 内容对应（确是同一张表，非同页别的表）
-        if not _native_numbers_preserved(native, best) \
-                or not _content_corresponds(nat_tokens, _table_tokens(best)):
-            rejected += 1
-            continue
-        merged_extra = dict(getattr(b, "extra", {}) or {})
-        merged_extra["fallback_text"] = native
-        merged_extra["refined_by"] = "vlm"
-        b.extra = merged_extra
-        b.text = best
-        refined += 1
+    # perf#66：精修循环同样只 open 一次 PDF；失败回退逐页自行 open（优雅降级）。
+    _doc = None
+    try:
+        import fitz
+        _doc = fitz.open(local_path)
+    except Exception as _oe:
+        logger.warning("[table_refine] shared open failed (per-page fallback): %s", _oe)
+        _doc = None
+    try:
+        for b in targets:
+            pg = getattr(b, "page_num", None)
+            if pg is None:
+                continue
+            if pg not in page_tables:
+                img, mime = _render_page_image(local_path, pg - 1, doc=_doc)
+                recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime) if img else []
+                page_tables[pg] = [(rb.get("text") or "").strip() for rb in recon
+                                   if rb.get("type") == "table" and (rb.get("text") or "").strip()]
+            cands = page_tables[pg]
+            if not cands:
+                continue
+            native = getattr(b, "text", "")
+            nat_tokens = _table_tokens(native)
+            # 同页多表时，选与原生表"内容"(文本 token+数字)重叠最多的 VLM 表，避免错配到同页别的表
+            best = max(cands, key=lambda t: len(nat_tokens & _table_tokens(t)))
+            # 双闸：① 数字保真（VLM 不漏原生数字）② 内容对应（确是同一张表，非同页别的表）
+            if not _native_numbers_preserved(native, best) \
+                    or not _content_corresponds(nat_tokens, _table_tokens(best)):
+                rejected += 1
+                continue
+            merged_extra = dict(getattr(b, "extra", {}) or {})
+            merged_extra["fallback_text"] = native
+            merged_extra["refined_by"] = "vlm"
+            b.extra = merged_extra
+            b.text = best
+            refined += 1
+    finally:
+        if _doc is not None:
+            try:
+                _doc.close()
+            except Exception:
+                pass
 
     if refined:
         from opensearch_pipeline.extraction.text_extractor import blocks_to_text

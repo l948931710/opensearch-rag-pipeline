@@ -880,7 +880,12 @@ async def card_callback(request: Request):
     return await run_in_threadpool(_process_card_callback_body, body)
 
 
-def _card_callback_authorized(message_id: str, user_id: str) -> bool:
+# perf#87：归属校验与 _save_feedback 的上下文 SELECT 查的是同表同行 → 合并为一次查询。
+_QA_CTX_COLS = ("user_id", "session_id", "query_text", "answer_text", "cited_docs_json", "user_dept")
+
+
+def _card_callback_authorized(message_id: str, user_id: str,
+                              prefetch: Optional[dict] = None) -> bool:
     """Track-2 防伪造：写反馈/工单前校验卡片回调的 message_id 归属。
 
     公网 POST /dingtalk/card/callback 无签名校验、可被任意 POST 伪造（Stream 模式下合法回调走
@@ -890,6 +895,11 @@ def _card_callback_authorized(message_id: str, user_id: str) -> bool:
       2) 若该消息有【明确归属用户】(qa_session_log.user_id 非空)，回调 userId 必须一致（防跨用户伪造）；
          群聊/无归属(user_id 空)仅做存在性门控，不误伤合法群聊反馈。
     查库异常 → fail-open 放行：下游写在同一故障下本就会失败，不因瞬时 SELECT 抖动误拒合法反馈。
+
+    perf#87：一次赞/踩回调原本开 2 个连接查同表同行（这里 SELECT user_id 一个连接，
+    _save_feedback 再开一个连接查上下文）。现把上下文列并进同一 SELECT：调用方传入 prefetch
+    dict，放行时回填 prefetch["qa_context"]（qa_session_log 列名为键），供 _save_feedback 复用、
+    免去第二个连接。授权判定逻辑与返回值形态【逐字不变】；fail-open 放行时不回填（下游自查兜底）。
     """
     if not message_id:
         return False
@@ -899,7 +909,8 @@ def _card_callback_authorized(message_id: str, user_id: str) -> bool:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT user_id FROM {_op_db()}.qa_session_log WHERE message_id=%s LIMIT 1",
+                    f"SELECT {', '.join(_QA_CTX_COLS)} "
+                    f"FROM {_op_db()}.qa_session_log WHERE message_id=%s LIMIT 1",
                     (message_id,))
                 row = cur.fetchone()
         finally:
@@ -915,6 +926,15 @@ def _card_callback_authorized(message_id: str, user_id: str) -> bool:
         logger.warning("卡片回调 userId 与消息归属不符（疑似跨用户伪造），拒绝写入: "
                        "message_id=%s owner=%s caller=%s", message_id, owner, user_id)
         return False
+    # 放行 → 回填预取的上下文行（defensive：行形状不符就不回填，下游 _save_feedback 自查兜底）
+    if prefetch is not None:
+        try:
+            if isinstance(row, dict):
+                prefetch["qa_context"] = {k: row.get(k) for k in _QA_CTX_COLS}
+            elif len(row) >= len(_QA_CTX_COLS):
+                prefetch["qa_context"] = dict(zip(_QA_CTX_COLS, row))
+        except Exception:
+            pass
     return True
 
 
@@ -968,8 +988,11 @@ def _process_card_callback_body(body: dict):
     _ACK: dict = {}
 
     # ── Track-2 防伪造：写任何反馈/工单前先校验 message_id 归属（见 _card_callback_authorized）。
-    #    未过 → ACK-only 返回（不写库、不更新卡片），杜绝公网伪造 POST 注入反馈/开工单/劫持会话。──
-    if not _card_callback_authorized(message_id, user_id):
+    #    未过 → ACK-only 返回（不写库、不更新卡片），杜绝公网伪造 POST 注入反馈/开工单/劫持会话。
+    #    perf#87：校验 SELECT 顺带预取同行的问答上下文（_prefetch["qa_context"]），赞/踩落库复用，
+    #    免开第二个 DB 连接重查同表同行。──
+    _prefetch: dict = {}
+    if not _card_callback_authorized(message_id, user_id, prefetch=_prefetch):
         return _ACK
 
     # ── 转人工 ──
@@ -1003,7 +1026,8 @@ def _process_card_callback_body(body: dict):
         _reason = reason or ("other" if (norm == "downvote" and comment) else None)
         try:
             handle_feedback(message_id=message_id, user_id=user_id, user_name=user_name,
-                            action=norm, reason=_reason, comment=comment)
+                            action=norm, reason=_reason, comment=comment,
+                            qa_context=_prefetch.get("qa_context"))
             print(f"[CALLBACK DEBUG] 赞踩落库: message_id={message_id}, action={action}->{norm}, "
                   f"reason={_reason}, has_comment={bool(comment)}", flush=True)
         except Exception as e:
