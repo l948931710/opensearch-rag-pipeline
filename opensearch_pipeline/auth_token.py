@@ -53,12 +53,15 @@ _ephemeral_key: Optional[str] = None
 # 缓存 _ephemeral_key，此处对齐 env 分支）。仅缓存【非空 env key】：未配置时仍每次走原有解析
 # （生产/预发硬报错、开发 ephemeral），语义零变化。
 _signing_key_cache: Optional[bytes] = None
+_upload_signing_key_cache: Optional[bytes] = None
 
 
 def _reset_signing_key_cache() -> None:
-    """测试钩子：清空签名密钥缓存（测试中途换 RAG_SESSION_SIGNING_KEY 时调用；生产无需）。"""
-    global _signing_key_cache
+    """测试钩子：清空签名密钥缓存（测试中途换 RAG_SESSION_SIGNING_KEY / RAG_UPLOAD_SIGNING_KEY
+    时调用；生产无需）。"""
+    global _signing_key_cache, _upload_signing_key_cache
     _signing_key_cache = None
+    _upload_signing_key_cache = None
 
 
 def _get_signing_key() -> bytes:
@@ -91,6 +94,23 @@ def _get_signing_key() -> bytes:
             "服务重启后已签发的令牌全部失效）。"
         )
     return _ephemeral_key.encode("utf-8")
+
+
+def _get_upload_signing_key() -> bytes:
+    """上传令牌（sign_payload/verify_payload）的签名密钥（P2-04）。
+
+    RAG_UPLOAD_SIGNING_KEY 配置则用它，让上传令牌与会话令牌【密钥隔离】——一方泄露不牵连另一方。
+    未配置 → **回退会话密钥**（_get_signing_key，与拆分前行为完全一致，向后兼容：既有部署只设了
+    RAG_SESSION_SIGNING_KEY 也照常工作；生产/预发缺会话密钥仍由 _get_signing_key 硬报错兜底）。
+    仅缓存显式配置的独立上传密钥；回退时直接返回会话密钥（其自身已缓存）。"""
+    global _upload_signing_key_cache
+    if _upload_signing_key_cache is not None:
+        return _upload_signing_key_cache
+    key = os.environ.get("RAG_UPLOAD_SIGNING_KEY", "").strip()
+    if key:
+        _upload_signing_key_cache = key.encode("utf-8")
+        return _upload_signing_key_cache
+    return _get_signing_key()
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -190,26 +210,29 @@ def verify_session_token(token: str) -> Optional[dict]:
 
 
 def sign_payload(payload: dict, ttl: int = _DEFAULT_TTL_SECONDS) -> str:
-    """通用签名载荷（HMAC-SHA256，复用会话密钥）：供 upload token 等短期带签名凭证使用。
+    """通用签名载荷（HMAC-SHA256）：供 upload token 等短期带签名凭证使用。
 
-    自动写入 `exp`（现在 + ttl）。与 issue_session_token 同密钥、同紧凑格式，但不要求 uid，
+    P2-04：用【上传密钥】签名（RAG_UPLOAD_SIGNING_KEY，未配置回退会话密钥），与会话令牌隔离。
+    自动写入 `exp`（现在 + ttl）。与 issue_session_token 同紧凑格式，但不要求 uid，
     校验走 verify_payload（只验签名 + exp，不强制 uid，区别于 verify_session_token）。
     """
     body = dict(payload or {})
     body["exp"] = int(time.time()) + int(ttl)
     payload_bytes = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     payload_b64 = _b64url_encode(payload_bytes)
-    sig = hmac.new(_get_signing_key(), payload_b64.encode("ascii"), hashlib.sha256).digest()
+    sig = hmac.new(_get_upload_signing_key(), payload_b64.encode("ascii"), hashlib.sha256).digest()
     return f"{payload_b64}.{_b64url_encode(sig)}"
 
 
 def verify_payload(token: str) -> Optional[dict]:
-    """校验 sign_payload 颁发的载荷；有效返回 dict，否则 None（签名不符 / 格式错 / 过期）。"""
+    """校验 sign_payload 颁发的载荷；有效返回 dict，否则 None（签名不符 / 格式错 / 过期）。
+
+    P2-04：用【上传密钥】验签（RAG_UPLOAD_SIGNING_KEY，未配置回退会话密钥）——与 sign_payload 同源。"""
     if not token or "." not in token:
         return None
     try:
         payload_b64, sig_b64 = token.split(".", 1)
-        expected = hmac.new(_get_signing_key(), payload_b64.encode("ascii"), hashlib.sha256).digest()
+        expected = hmac.new(_get_upload_signing_key(), payload_b64.encode("ascii"), hashlib.sha256).digest()
         actual = _b64url_decode(sig_b64)
     except Exception:
         return None

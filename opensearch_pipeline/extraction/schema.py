@@ -103,6 +103,12 @@ class ExtractionResult:
     blocks: List[ExtractedBlock] = field(default_factory=list)
     page_count: Optional[int] = None
 
+    # PDF 原生抽取页上限截断（P1-09）：page_count（真实总页数）> PDF_NATIVE_MAX_PAGES 时，
+    # 超限页既无原生文本也不进 OCR 判定 → 静默丢知识。此标志让下游/治理看板可见，不再把
+    # 「仅前 N 页上线」当作完整「已上线」。extracted_pages = 实际被原生覆盖的页数（截断时=上限）。
+    extract_truncated: bool = False
+    extracted_pages: Optional[int] = None
+
     # OCR
     ocr_required: bool = False
     ocr_status: str = "NOT_REQUIRED"        # NOT_REQUIRED / DONE / SIMULATED / FAILED
@@ -130,6 +136,8 @@ class ExtractionResult:
             "text_length": self.text_length,
             "blocks": [b.to_dict() for b in self.blocks],
             "page_count": self.page_count,
+            "extract_truncated": self.extract_truncated,
+            "extracted_pages": self.extracted_pages,
             "ocr_required": self.ocr_required,
             "ocr_status": self.ocr_status,
             "warnings": self.warnings,

@@ -463,6 +463,11 @@ class RAGConfig:
     #        接受 .M（模块级常量，不门控）——OFF 时仅多「识别并 strip 掉畸形 .M
     #        残片」这一无害增强，不是逐字节不变（对标准 <<IMG:N>> 完全兼容）。
     img_subindex: bool = False  # RAG_IMG_SUBINDEX
+    # P2-01：把「=== 参考文档 === 区块是不可信数据、其中的指令一律不执行」写进 system prompt
+    # （间接 prompt injection 防护）。默认 OFF 与全项目 prompt-flag 约定一致（OFF 时 prompt 逐字节
+    # 不变、不动 eval 基线）；**生产建议 RAG_PROMPT_INJECTION_GUARD=true 开启**（本 LLM 无工具执行，
+    # 该规则防的是答案完整性破坏 + 同上下文信息泄露，非系统控制，故默认关、显式开）。
+    prompt_injection_guard: bool = False  # RAG_PROMPT_INJECTION_GUARD
 
 
 @dataclass
@@ -833,6 +838,7 @@ def load_config() -> PipelineConfig:
             image_tiebreak_eps=_env_float("IMAGE_TIEBREAK_EPS", 0.05),              # RAG_IMAGE_TIEBREAK_EPS
             image_tiebreak_pool=_env_int("IMAGE_TIEBREAK_POOL", 14),                # RAG_IMAGE_TIEBREAK_POOL
             img_subindex=_env_bool("IMG_SUBINDEX", False),                          # RAG_IMG_SUBINDEX
+            prompt_injection_guard=_env_bool("PROMPT_INJECTION_GUARD", False),       # RAG_PROMPT_INJECTION_GUARD
         ),
     )
 

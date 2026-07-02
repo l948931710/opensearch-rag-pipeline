@@ -14,8 +14,19 @@ GuardedDBConnection 连接层拦写）逐字保留——见各函数 docstring�
 """
 
 import os
+import time
 
 from opensearch_pipeline.config import get_config
+
+
+class DBPoolExhausted(RuntimeError):
+    """连接池在 RAG_DB_ACQUIRE_TIMEOUT 内拿不到连接（OBS/P1-07）。
+
+    此前池以 blocking=True 无超时建立：并发 > 池上限时，多余请求**无限期静默等连接**
+    （『问答莫名卡住』尾延迟，无日志线索），AnyIO 线程池令牌被逐一等死→假健康。
+    现在获取连接有上限等待，超时抛本异常；serving 端 api.py 注册了异常处理器把它映射成
+    503 DB_POOL_EXHAUSTED（而非 500/挂起），让调用方快速失败、释放线程池令牌。
+    """
 
 
 def _get_db_conn(select_db=True):
@@ -31,12 +42,54 @@ def _get_db_conn(select_db=True):
     非生产→生产 策略对**任何** cursor 写入生效（含 register_metadata、classify 冻结维护、
     detect_sensitive、redact、publish 等没有显式守卫调用的"裸 cursor"节点），而不拖累
     serving（retriever/api/dingtalk_identity）共用同一池的读路径。
+
+    池耗尽时最多等待 RAG_DB_ACQUIRE_TIMEOUT 秒（默认 5s），超时抛 DBPoolExhausted
+    （P1-07），而非无限期阻塞。设 ≤0 恢复旧的无限阻塞语义。
     """
     global _db_pool
     if _db_pool is None:
         _init_db_pool()
     from opensearch_pipeline.env_guard import GuardedDBConnection
-    return GuardedDBConnection(_db_pool.connection(), get_config().rds.host)
+    return GuardedDBConnection(_acquire_pool_connection(), get_config().rds.host)
+
+
+def _db_acquire_timeout() -> float:
+    """池获取连接的上限等待秒数（P1-07）。默认 5.0；≤0 恢复无限阻塞（旧语义）。"""
+    try:
+        return float(os.environ.get("RAG_DB_ACQUIRE_TIMEOUT", "5") or 5)
+    except ValueError:
+        return 5.0
+
+
+def _acquire_pool_connection():
+    """从池取一个裸连接，池耗尽时有上限地等待（P1-07）。
+
+    timeout ≤ 0 → 直接走 PooledDB 的阻塞取连接（旧的无限等待）。
+    timeout > 0 → 池以 blocking=False 建立（见 _init_db_pool），耗尽时 .connection() 抛
+    TooManyConnections；此处按指数退避轮询到 deadline，仍拿不到就抛 DBPoolExhausted。
+    轮询而非独立信号量：连接归还由池自身记账，绝不会因未 close 的连接泄漏许可导致更严重死锁。
+    """
+    timeout = _db_acquire_timeout()
+    if timeout <= 0:
+        return _db_pool.connection()
+    try:
+        from dbutils.pooled_db import TooManyConnections
+    except Exception:  # pragma: no cover - 依赖缺失时退回阻塞语义
+        return _db_pool.connection()
+    deadline = time.monotonic() + timeout
+    delay = 0.02
+    while True:
+        try:
+            return _db_pool.connection()
+        except TooManyConnections:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DBPoolExhausted(
+                    f"连接池耗尽：{timeout}s 内未取得连接"
+                    f"（上限 {_pool_max_connections()}，调大 RAG_DB_POOL_MAX 或排查慢查询/连接泄漏）"
+                ) from None
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.2)
 
 
 # ─── 连接池内部实现 ───────────────────────────────────────────────
@@ -129,12 +182,15 @@ def _init_db_pool():
     pool_readonly = _pool_readonly_declared(full_cfg)
 
     _max_conn = _pool_max_connections()
+    # P1-07：timeout>0 时以 blocking=False 建池，由 _acquire_pool_connection 做「有上限的等待」；
+    # ≤0 恢复旧的 blocking=True 无限等待（逃生口）。
+    _blocking = _db_acquire_timeout() <= 0
     pool_kwargs = dict(
         creator=pymysql,
         mincached=2,           # 池中保持的最小空闲连接数
         maxcached=5,           # 池中保持的最大空闲连接数
         maxconnections=_max_conn,  # 池上限（perf#13/#14 可配+联动，见 _pool_max_connections）
-        blocking=True,         # 连接数耗尽时阻塞等待，而非抛异常
+        blocking=_blocking,    # P1-07：默认 False（有超时轮询）；RAG_DB_ACQUIRE_TIMEOUT≤0 恢复无限阻塞
         ping=1,                # 每次取连接时 ping 一次，自动重连 (应对 MySQL wait_timeout)
         host=cfg.host,
         port=cfg.port,

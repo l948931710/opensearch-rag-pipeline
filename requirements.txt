@@ -9,6 +9,11 @@ openpyxl>=3.1
 requests>=2.31
 Pillow>=10.0
 PyMuPDF>=1.24
+# 抽取链路真实运行依赖（此前漏声明 → 与 pyproject 漂移；两条部署路径实际都不读本文件
+# [Dockerfile 装 pyproject、DataWorks 内联 pip]，但本文件被 README 标为部署清单，不能骗人）：
+pdfplumber>=0.11        # PDF 版面/文本提取（pdf_extractor 主路径；漏则 PDF 抽取降级）
+python-pptx>=0.6        # PPTX 提取（_extract_pptx；漏则 pptx 静默空抽）
+jieba>=0.42             # 中文分词（image_relation_classifier / chunker 图文关系分类）
 
 # API Runtime
 fastapi>=0.115

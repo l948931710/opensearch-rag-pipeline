@@ -237,7 +237,10 @@ def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
             "chunk_index": fields.get("chunk_index", 0),
             "page_num": fields.get("page_num", 0),
             "kb_type": fields.get("kb_type", "public"),
-            "permission_level": fields.get("permission_level", "public"),
+            # P2-02：字段缺失（投影漂移/旧索引/异常文档）时默认按最严的 restricted 兜底，
+            # 绝不把权限未知的命中当 public 处理（fail-closed 标签；真实 restricted 本就被
+            # 引擎端过滤不会返回，故这里只在字段漂移时生效，正常流量零影响）。
+            "permission_level": fields.get("permission_level") or "restricted",
             "owner_dept": fields.get("owner_dept", ""),
             "chunk_type": raw_chunk_type,
             "source_image": fields.get("source_image", ""),
@@ -469,9 +472,12 @@ def _deny_revoked_cross_dept(results, user_dept):
     norm = _normalize_acl_groups(user_dept)
     groups = set(norm)
     owner_set = set(_expand_groups_to_owners(norm))
+    # P2-02：从「仅 dept_internal」放宽到「任何非 public」——这样字段漂移→restricted 兜底的
+    # owner-不匹配命中也会走下面的 fail-closed 授权复核（查不到授权即丢弃），而非被当 public 放行。
+    # 真实 restricted 本就被引擎端过滤不返回，故此放宽只作用于字段漂移命中，正常 dept_internal 语义不变。
     cross_idx = [
         i for i, r in enumerate(results)
-        if r.get("permission_level") == "dept_internal"
+        if r.get("permission_level") != "public"
         and r.get("owner_dept") and r.get("owner_dept") not in owner_set
     ]
     if not cross_idx:
@@ -595,7 +601,7 @@ def _search_chunks_opensearch(
             "chunk_index": src.get("chunk_index") or 0,
             "page_num": src.get("page_num") or 0,
             "kb_type": src.get("kb_type") or "public",
-            "permission_level": src.get("permission_level") or "public",
+            "permission_level": src.get("permission_level") or "restricted",   # P2-02：缺失 fail-closed
             "owner_dept": src.get("owner_dept") or "",
             "chunk_type": src.get("chunk_type") or "",
             "source_image": src.get("source_image") or "",
@@ -799,7 +805,8 @@ def _same_permission(row: Dict[str, Any], center: Dict[str, Any]) -> bool:
     则丢弃——绝不把比"已通过权限的中心"更严的内容拼进答案上下文。统一边界，单一实现。
     """
     return (
-        (row.get("permission_level") or "public") == center.get("permission_level", "public")
+        # P2-02：缺失一律按 restricted（fail-closed）——邻居权限未知时绝不拼进已通过权限的中心
+        (row.get("permission_level") or "restricted") == (center.get("permission_level") or "restricted")
         and (row.get("owner_dept") or "") == center.get("owner_dept", "")
     )
 
