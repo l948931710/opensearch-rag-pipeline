@@ -41,6 +41,30 @@ def _op_db() -> str:
     return get_config().rds.operation_database
 
 
+def _beijing_day_pacific_bounds(target: str):
+    """把北京业务日 target（'YYYY-MM-DD'）换算为存储时区（太平洋墙钟）的半开区间 [start, end)。
+
+    perf#6/7（sargable 化）：等价改写 `DATE(CONVERT_TZ(created_at, LA, Shanghai)) = %s` ——
+    函数包裹列使 created_at 索引永久失效、日汇总全表扫；把同一 DST-correct 换算搬到常量侧后，
+    谓词变 `created_at >= %s AND created_at < %s`，吃到 schema/012 索引族。语义等价论证：
+    CONVERT_TZ 单调，日期分桶 ⟺ 北京日两端 00:00 边界换算成太平洋墙钟的区间成员判定；边界落在
+    北京 00:00 = 太平洋 08:00/09:00（随 DST），永不落入太平洋 01:00-02:00 的 fall-back 歧义小时，
+    故与 CONVERT_TZ 的逐行换算分桶一致。zoneinfo 缺 tz 数据等异常 → 返回 None，调用方回退
+    旧 CONVERT_TZ 谓词（fail-open，语义不变只慢）。"""
+    try:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        day = datetime.strptime(str(target), "%Y-%m-%d")
+        start_bj = day.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        pac = ZoneInfo("America/Los_Angeles")
+        start = start_bj.astimezone(pac).replace(tzinfo=None)
+        end = (start_bj + timedelta(days=1)).astimezone(pac).replace(tzinfo=None)
+        return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:  # noqa: BLE001 — 缺 tzdata / 非法日期 → 回退旧谓词
+        logger.warning("qa_rollup: 北京日→太平洋区间换算失败（回退 CONVERT_TZ 谓词）: %s", e)
+        return None
+
+
 def _slo_thresholds() -> Dict[str, float]:
     def _f(env, default):
         try:
@@ -210,12 +234,22 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
             # column order so compute_daily_metrics' keyed access works regardless of cursor type.
             _cols = ["answer_status", "risk_blocked", "latency_ms", "top_score", "user_id",
                      "session_id", "conversation_type", "opensearch_hit_count"]
+            # perf#6/7：优先 sargable 半开区间（吃 created_at/(answer_status,created_at) 索引），
+            # 区间换算失败才回退函数包裹列的旧谓词（全表扫但语义相同）。
+            _bounds = _beijing_day_pacific_bounds(target)
             with conn.cursor() as c:
-                c.execute(
-                    f"""SELECT {', '.join(_cols)}
-                          FROM {_op_db()}.qa_session_log
-                         WHERE DATE(CONVERT_TZ(created_at, 'America/Los_Angeles', 'Asia/Shanghai')) = %s""",
-                    (target,))
+                if _bounds:
+                    c.execute(
+                        f"""SELECT {', '.join(_cols)}
+                              FROM {_op_db()}.qa_session_log
+                             WHERE created_at >= %s AND created_at < %s""",
+                        _bounds)
+                else:
+                    c.execute(
+                        f"""SELECT {', '.join(_cols)}
+                              FROM {_op_db()}.qa_session_log
+                             WHERE DATE(CONVERT_TZ(created_at, 'America/Los_Angeles', 'Asia/Shanghai')) = %s""",
+                        (target,))
                 raw = c.fetchall()
             rows = [r if isinstance(r, dict) else dict(zip(_cols, r)) for r in raw]
 

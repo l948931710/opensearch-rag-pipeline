@@ -9,6 +9,9 @@ include_router 并 re-export 全部端点函数/模型（tests 直接调用 api.
 api 属性（规则见 routes/__init__.py）。
 """
 
+import os
+import threading
+import time
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -44,6 +47,44 @@ _CONTRIB_COLS = ("contribution_id, question, content, category_dept, author_id, 
                  "review_status, ingestion_status, doc_id, review_note, created_at, reviewed_at")
 _CONTRIB_WINDOW_DAYS = 30
 _CONTRIB_CANDIDATE_CAP = 400   # 每源（NO_RESULT / REFUSAL）拉取的原始候选行上限，再在 py 内归一去重
+
+# 缺口清单 TTL 缓存（perf#16）：kb_gaps 每次打开贡献页都全量重算两条重查询 + Python 聚合归并，
+# 而可见范围只由用户的 depts 集决定 → 按 sorted(depts) 键缓存分页前的 open_gaps 全集 + summary，
+# 同部门员工翻页/刷新直接内存切片（PII 脱敏留在渲染层，仅每页 ≤100 条）。缺口数据天级演化，
+# 60s staleness 无感；提交/采纳物化两条主写路径主动清空（「等待入库」徽标即时可见），
+# 驳回/重试由 TTL 兜底。部分子查询失败的降级结果不缓存。RAG_KB_GAPS_CACHE_TTL=0 关闭；conftest 每测清空。
+_gaps_cache: dict = {}
+_gaps_cache_lock = threading.Lock()
+
+
+def _gaps_cache_ttl() -> float:
+    try:
+        return float(os.environ.get("RAG_KB_GAPS_CACHE_TTL", "60"))
+    except ValueError:
+        return 60.0
+
+
+def _gaps_cache_clear() -> None:
+    with _gaps_cache_lock:
+        _gaps_cache.clear()
+
+
+def _gaps_cache_get(key):
+    if _gaps_cache_ttl() <= 0:
+        return None
+    with _gaps_cache_lock:
+        ent = _gaps_cache.get(key)
+        if ent is not None and ent[0] > time.time():
+            return ent[1]
+    return None
+
+
+def _gaps_cache_put(key, value) -> None:
+    ttl = _gaps_cache_ttl()
+    if ttl <= 0:
+        return
+    with _gaps_cache_lock:
+        _gaps_cache[key] = (time.time() + ttl, value)
 
 
 class KbGapItem(BaseModel):
@@ -208,9 +249,11 @@ def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: st
         raise RuntimeError("OSS 写入合成文档失败")
 
     with conn.cursor() as cur:
-        # 幂等：固定 raw_key 已登记 → 直接返回（续跑/竞态安全）
-        cur.execute(f"SELECT doc_id, version_no FROM {_kb_db()}.document_version WHERE raw_key=%s LIMIT 1",
-                    (raw_key,))
+        # 幂等：固定 raw_key 已登记 → 直接返回（续跑/竞态安全）。谓词走 raw_key_hash 索引
+        # （perf#5，schema/014；OR IS NULL 兜住回填前存量行，见 kb_register 同款注释）。
+        cur.execute(f"SELECT doc_id, version_no FROM {_kb_db()}.document_version "
+                    "WHERE raw_key=%s AND (raw_key_hash=%s OR raw_key_hash IS NULL) LIMIT 1",
+                    (raw_key, raw_key_hash))
         if cur.fetchone():
             return
         cur.execute(
@@ -279,6 +322,7 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
         write_audit(doc_id=doc_id, version_no=1, action_type="CONTRIB_ADOPT",
                     operator_type="user", operator_id=reviewer_id, oss_key=raw_key,
                     trace_id=trace_id, message=f"contribution={cid} owner={owner_dept}")
+        _gaps_cache_clear()   # 采纳物化完成 → 缺口徽标状态变化即时可见
         return C.INGEST_REGISTERED, None
     except Exception as e:
         err = str(e)[:480]
@@ -344,6 +388,7 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
     except Exception as e:
         logger.error("kb_contribution_submit 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"提交失败 (trace: {trace_id})")
+    _gaps_cache_clear()   # 缺口的「等待入库」徽标即时可见，不等 TTL
     return KbContributionItem(
         contribution_id=cid, question=req.question.strip(), content=req.content.strip(),
         category_dept=category_dept, author_id=identity.user_id, author_name=identity.name or "",
@@ -672,6 +717,21 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
     win = _CONTRIB_WINDOW_DAYS
     depts = kb_authz.sanitize_owner_depts(identity.acl_groups)
     trace_id = get_request_id()
+
+    def _page_response(open_gaps, summary):
+        """分页前全集 → 本页响应（PII 脱敏只做本页，供缓存命中/未命中两路共用）。"""
+        page = open_gaps[offset:offset + limit]
+        items = [KbGapItem(
+            question=C.redact_query_text(g["raw"]), asks=g["asks"], last_days=g["days"],
+            dept=g["dept"], kind=g["kind"], question_hash=g["hash"],
+            source_message_id=g["msg"], has_pending_contribution=g["pending"]) for g in page]
+        return KbGapsResponse(items=items, summary=summary, has_more=(offset + limit) < len(open_gaps))
+
+    # 可见范围只由 depts 决定 → 按 sorted(depts) 键取缓存（同部门用户共享；权限判定在键构造前已完成）
+    cache_key = tuple(sorted(depts))
+    cached = _gaps_cache_get(cache_key)
+    if cached is not None:
+        return _page_response(cached[0], cached[1])
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -727,6 +787,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                 if depts:
                     ph = ",".join(["%s"] * len(depts))
                     mine_expr = f"MAX(CASE WHEN m.owner_dept IN ({ph}) THEN 1 ELSE 0 END)"
+                from opensearch_pipeline.qa_facts import qa_docs_join_sql
                 cur.execute(
                     "SELECT t.query_text, t.message_id, t.days_ago, t.any_dept FROM ("
                     " SELECT q.message_id,"
@@ -735,11 +796,8 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                     "   MIN(CASE WHEN m.permission_level='public' THEN 1 ELSE 0 END) all_public,"
                     "   MIN(m.owner_dept) any_dept"
                     f" FROM {_op_db()}.qa_session_log q"
-                    " JOIN JSON_TABLE(q.retrieved_docs_json, '$[*]'"
-                    "   COLUMNS(doc_id VARCHAR(100) PATH '$.doc_id')) jt"
-                    f" JOIN {_kb_db()}.document_meta m"
-                    "   ON m.doc_id = CONVERT(jt.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-                    " WHERE q.answer_status='REFUSAL' AND q.retrieved_docs_json IS NOT NULL"
+                    + qa_docs_join_sql()
+                    + " WHERE q.answer_status='REFUSAL' AND q.retrieved_docs_json IS NOT NULL"
                     "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                     " GROUP BY q.message_id"
                     ") t WHERE t.hit_mine=1 OR t.all_public=1"
@@ -794,9 +852,6 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
         })
     open_gaps.sort(key=lambda g: (-g["asks"], g["days"]))
     summary.unanswered = len(open_gaps)
-    page = open_gaps[offset:offset + limit]
-    items = [KbGapItem(
-        question=C.redact_query_text(g["raw"]), asks=g["asks"], last_days=g["days"],
-        dept=g["dept"], kind=g["kind"], question_hash=g["hash"],
-        source_message_id=g["msg"], has_pending_contribution=g["pending"]) for g in page]
-    return KbGapsResponse(items=items, summary=summary, has_more=(offset + limit) < len(open_gaps))
+    if fails == 0:   # 降级结果（部分子查询失败）不缓存——下一请求重试取全量
+        _gaps_cache_put(cache_key, (open_gaps, summary))
+    return _page_response(open_gaps, summary)

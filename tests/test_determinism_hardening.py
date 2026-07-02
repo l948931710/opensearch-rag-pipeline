@@ -29,10 +29,15 @@ def test_build_image_chat_payload_propagates_temperature():
     assert native.get("parameters", {}).get("temperature") == 0
 
 
-def test_embedding_cache_writes_atomically():
+def test_embedding_cache_writes_are_crash_safe():
+    """perf#18 后 embedding 缓存换 SQLite：崩溃安全不变量从 temp+os.replace 原子写
+    转由 WAL 日志 + 逐批 commit 承担——半截写入回滚为上次 commit，绝不产生撕裂缓存。"""
+    import opensearch_pipeline.embedding_cache as ec
+    src = inspect.getsource(ec)
+    assert "journal_mode=WAL" in src, "embedding cache sqlite must run in WAL mode (crash safety)"
     from opensearch_pipeline.pipeline_nodes import node_generate_embeddings
-    assert "os.replace(_tmp, _cache_file)" in inspect.getsource(node_generate_embeddings), (
-        "embedding cache must write atomically (temp + os.replace)"
+    assert "get_embedding_cache" in inspect.getsource(node_generate_embeddings), (
+        "node_generate_embeddings must use the shared crash-safe store"
     )
 
 

@@ -7,6 +7,7 @@ llm_generator.py — LLM 回答生成模块
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, Generator, List, Optional
 
@@ -16,6 +17,18 @@ from opensearch_pipeline.http_session import http_post as _http_post
 from opensearch_pipeline.config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+def _llm_request_timeout() -> float:
+    """LLM HTTP 超时秒数（perf#34）。默认 120（维持既有行为，长上下文非流式生成可达分钟级）；
+    RAG_LLM_TIMEOUT_SECONDS 可下调——SAE 单实例 --workers 1 + 有限线程池下，一批挂起的慢
+    LLM 调用会按该超时占满线程，运维可据实测 llm_latency_ms 分布把它压到 60-90s。
+    流式路径同用：requests 的 timeout 对 stream=True 作用于 connect + 帧间 read gap，不限制总时长。"""
+    try:
+        v = float(os.environ.get("RAG_LLM_TIMEOUT_SECONDS", "120"))
+        return v if v > 0 else 120.0
+    except ValueError:
+        return 120.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -463,7 +476,7 @@ def generate_answer(
             "Authorization": f"Bearer {llm.api_key}",
             "Content-Type": "application/json",
         },
-        timeout=120,
+        timeout=_llm_request_timeout(),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -583,7 +596,7 @@ def generate_answer_stream(
             "Authorization": f"Bearer {llm.api_key}",
             "Content-Type": "application/json",
         },
-        timeout=120,
+        timeout=_llm_request_timeout(),
         stream=True,
     ) as resp:
         resp.raise_for_status()

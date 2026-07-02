@@ -274,7 +274,15 @@ def log_qa_session(
                 "qa_session_log 写入成功: message_id=%s, status=%s",
                 message_id, answer_status,
             )
-            # 审计行已落库；再 best-effort 幂等 upsert 会话元数据（独立小事务，失败仅 warning）。
+            # perf#3：审计行已落库，顺手物化 (message_id, doc_id, cited) 瘦事实行——
+            # 看板归属链从 JSON_TABLE 现场展开变普通索引 JOIN（schema/013 + RAG_QA_FACT_JOIN）。
+            # fail-open，表缺失自动熔断；见 qa_facts.insert_qa_doc_facts。
+            try:
+                from opensearch_pipeline.qa_facts import insert_qa_doc_facts
+                insert_qa_doc_facts(conn, message_id, retrieved_docs, cited_docs)
+            except Exception as _fe:
+                logger.warning("qa_retrieved_doc 物化异常 (non-fatal): %s", _fe)
+            # best-effort 幂等 upsert 会话元数据（独立小事务，失败仅 warning）。
             if enrich:
                 _upsert_conversation(conn, user_id or "", conversation_id, query_text)
         finally:
