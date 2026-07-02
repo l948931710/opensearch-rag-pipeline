@@ -3,6 +3,7 @@
 spot_checker.py — 定时安全抽检任务 (Spot-Check Safety Daemon)
 """
 import logging
+import os
 import random
 import requests
 import json
@@ -32,6 +33,118 @@ def _suggests_tightening(suggested_perm: str, current_permission: str) -> bool:
     suggested_rank = _PERM_ORDER.get(sp, max(_PERM_ORDER.values()) + 1)
     current_rank = _PERM_ORDER.get(cp, 0)
     return suggested_rank > current_rank
+
+
+def _spotcheck_concurrency() -> int:
+    """安全复审 LLM 并发度（perf F#61）。RAG_SPOTCHECK_CONCURRENCY，默认 4（LLM 只读调用，
+    与 image_funnel 的并发模式同型）；<=1 退回串行。quarantine 写路径不受影响、恒为主线程串行。"""
+    try:
+        return max(1, int(os.environ.get("RAG_SPOTCHECK_CONCURRENCY", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _safety_review_llm(title, doc_text, *, api_key, model_name, api_base_url):
+    """单篇文档的二次安全复审 LLM 调用（纯只读 HTTP，无 DB/写副作用——可安全并发，F#61）。
+
+    从 run_spot_check_pipeline 主循环机械抽出：schema/prompt/payload/超时/解析逻辑逐字保持。
+    返回解析后的 safety_eval dict（safety_status / suggested_permission_level / reason）；
+    任何失败向上抛，由调用方按既有 "Spot-check safety assessment failed" 口径聚合。
+    """
+    is_dashscope = "dashscope.aliyuncs.com" in api_base_url or "qwen" in model_name.lower()
+    schema = {
+        "type": "OBJECT",
+        "properties": {
+            "safety_status": {
+                "type": "STRING",
+                "description": "Must be either 'safe' or 'unsafe'. If document contains highly sensitive payroll, commercial secrets, or PII that shouldn't be public, mark 'unsafe'"
+            },
+            "suggested_permission_level": {
+                "type": "STRING",
+                "description": "Must be one of: 'public', 'internal', or 'restricted'"
+            },
+            "reason": {
+                "type": "STRING",
+                "description": "Detailed justification for safety classification and permission level suggestion"
+            }
+        },
+        "required": ["safety_status", "suggested_permission_level", "reason"]
+    }
+
+    prompt_instructions = (
+        "You are a Senior Corporate Security Compliance Auditor.\n"
+        "Evaluate this corporate document text and verify if it is suitable to be public-safe or if it contains restricted/confidential information.\n"
+        "Provide your structured review:\n"
+        "- safety_status: 'safe' or 'unsafe'\n"
+        "- suggested_permission_level: 'public', 'internal', or 'restricted'\n"
+        "- reason: explain your reasoning\n\n"
+    )
+
+    if is_dashscope:
+        # 与 funnel / ocr_client / vlm_rebuilder 共用同一 URL 构造（按域名重建路径，
+        # 原实现对 /api/v1 这类原生 base 会拼出 /api/v1/compatible-mode/... 的坏 URL）
+        from opensearch_pipeline.vlm_endpoint import compat_chat_completions_url
+        url = compat_chat_completions_url(api_base_url)
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        schema_str = json.dumps(schema, indent=2, ensure_ascii=False)
+        system_prompt = (
+            "You are a Senior Corporate Security Compliance Auditor.\n"
+            "You MUST respond ONLY with a single valid JSON object adhering strictly to the schema below. Do not output any markdown code blocks, do not output your thinking process or any introductory text.\n"
+            f"Required JSON Schema:\n{schema_str}"
+        )
+        user_prompt = (
+            f"{prompt_instructions}"
+            f"Document Title: {title}\n"
+            f"Document Text:\n{doc_text[:8000]}\n\n"
+            "Please output the required JSON object now."
+        )
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.1
+        }
+
+        resp = requests.post(url, json=payload, headers=headers, timeout=90)
+        if resp.status_code != 200:
+            raise Exception(f"DashScope API returned status code {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        choices = data["choices"]
+        text_content = choices[0]["message"]["content"]
+        cleaned_content = _clean_llm_json_response(text_content)
+        return json.loads(cleaned_content)
+
+    url = f"{api_base_url}/models/{model_name}:generateContent"
+    prompt = (
+        f"{prompt_instructions}"
+        f"Document Title: {title}\n"
+        f"Document Text:\n{doc_text[:8000]}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "temperature": 0.1
+        }
+    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+
+    resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    if resp.status_code != 200:
+        raise Exception(f"Gemini API returned status code {resp.status_code}")
+
+    result = resp.json()
+    text_content = result["candidates"][0]["content"]["parts"][0]["text"]
+    cleaned_content = _clean_llm_json_response(text_content)
+    return json.loads(cleaned_content)
 
 
 def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config) -> None:
@@ -397,6 +510,11 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
         conn.close()
         return report
 
+    # ── perf F#61 三段式 ─────────────────────────────────────────────
+    # ① 串行重构文本（共享 conn 的 DB 读，连接非线程安全）→ ② 并发 LLM 复审（纯只读
+    # HTTP，RAG_SPOTCHECK_CONCURRENCY 默认 4）→ ③ 主线程串行裁决 + 隔离写（quarantine
+    # 命中率极低，写路径/事务语义保持原样；report 聚合恒在主线程，天然线程安全）。
+    review_docs = []   # [(doc, doc_text)] —— 顺序与 sampled 一致（跳过重构失败/空文本）
     for doc in sampled:
         doc_id = doc["doc_id"]
         version_no = doc["version_no"]
@@ -425,109 +543,46 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
         if not doc_text.strip():
             print(f"    ⚠️ Reconstructed text for {doc_id} is empty. Skipping.")
             continue
+        review_docs.append((doc, doc_text))
 
-        # 4. 调用 secondary/safety LLM check
-        is_dashscope = "dashscope.aliyuncs.com" in api_base_url or "qwen" in model_name.lower()
-        schema = {
-            "type": "OBJECT",
-            "properties": {
-                "safety_status": {
-                    "type": "STRING",
-                    "description": "Must be either 'safe' or 'unsafe'. If document contains highly sensitive payroll, commercial secrets, or PII that shouldn't be public, mark 'unsafe'"
-                },
-                "suggested_permission_level": {
-                    "type": "STRING",
-                    "description": "Must be one of: 'public', 'internal', or 'restricted'"
-                },
-                "reason": {
-                    "type": "STRING",
-                    "description": "Detailed justification for safety classification and permission level suggestion"
-                }
-            },
-            "required": ["safety_status", "suggested_permission_level", "reason"]
-        }
+    # 4. 调用 secondary/safety LLM check（并发；单篇失败以异常对象占位，③ 段按原口径聚合）
+    def _review(item):
+        d, txt = item
+        return _safety_review_llm(d["title"], txt, api_key=api_key,
+                                  model_name=model_name, api_base_url=api_base_url)
 
-        prompt_instructions = (
-            "You are a Senior Corporate Security Compliance Auditor.\n"
-            "Evaluate this corporate document text and verify if it is suitable to be public-safe or if it contains restricted/confidential information.\n"
-            "Provide your structured review:\n"
-            "- safety_status: 'safe' or 'unsafe'\n"
-            "- suggested_permission_level: 'public', 'internal', or 'restricted'\n"
-            "- reason: explain your reasoning\n\n"
-        )
+    outcomes = []
+    _conc = min(_spotcheck_concurrency(), max(1, len(review_docs)))
+    if _conc > 1 and len(review_docs) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=_conc) as pool:
+            futures = [pool.submit(_review, it) for it in review_docs]
+            for fut in futures:
+                try:
+                    outcomes.append(fut.result())
+                except Exception as e:  # noqa: BLE001 — 单篇 LLM 失败不拖垮整轮
+                    outcomes.append(e)
+    else:
+        for it in review_docs:
+            try:
+                outcomes.append(_review(it))
+            except Exception as e:  # noqa: BLE001
+                outcomes.append(e)
+
+    # 5+. 主线程串行裁决与隔离（写路径与事务顺序与原实现逐字保持）
+    for (doc, _doc_text), outcome in zip(review_docs, outcomes):
+        doc_id = doc["doc_id"]
+        version_no = doc["version_no"]
+        current_permission = doc["permission_level"]
 
         try:
-            if is_dashscope:
-                # 与 funnel / ocr_client / vlm_rebuilder 共用同一 URL 构造（按域名重建路径，
-                # 原实现对 /api/v1 这类原生 base 会拼出 /api/v1/compatible-mode/... 的坏 URL）
-                from opensearch_pipeline.vlm_endpoint import compat_chat_completions_url
-                url = compat_chat_completions_url(api_base_url)
-
-
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                schema_str = json.dumps(schema, indent=2, ensure_ascii=False)
-                system_prompt = (
-                    "You are a Senior Corporate Security Compliance Auditor.\n"
-                    "You MUST respond ONLY with a single valid JSON object adhering strictly to the schema below. Do not output any markdown code blocks, do not output your thinking process or any introductory text.\n"
-                    f"Required JSON Schema:\n{schema_str}"
-                )
-                user_prompt = (
-                    f"{prompt_instructions}"
-                    f"Document Title: {title}\n"
-                    f"Document Text:\n{doc_text[:8000]}\n\n"
-                    "Please output the required JSON object now."
-                )
-                payload = {
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "temperature": 0.1
-                }
-                
-                resp = requests.post(url, json=payload, headers=headers, timeout=90)
-                if resp.status_code != 200:
-                    raise Exception(f"DashScope API returned status code {resp.status_code}: {resp.text}")
-                
-                data = resp.json()
-                choices = data["choices"]
-                text_content = choices[0]["message"]["content"]
-                cleaned_content = _clean_llm_json_response(text_content)
-                safety_eval = json.loads(cleaned_content)
-            else:
-                url = f"{api_base_url}/models/{model_name}:generateContent"
-                prompt = (
-                    f"{prompt_instructions}"
-                    f"Document Title: {title}\n"
-                    f"Document Text:\n{doc_text[:8000]}"
-                )
-                payload = {
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "responseMimeType": "application/json",
-                        "responseSchema": schema,
-                        "temperature": 0.1
-                    }
-                }
-                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-                
-                resp = requests.post(url, json=payload, headers=headers, timeout=30)
-                if resp.status_code != 200:
-                    raise Exception(f"Gemini API returned status code {resp.status_code}")
-                
-                result = resp.json()
-                text_content = result["candidates"][0]["content"]["parts"][0]["text"]
-                cleaned_content = _clean_llm_json_response(text_content)
-                safety_eval = json.loads(cleaned_content)
-            
+            if isinstance(outcome, Exception):
+                raise outcome
+            safety_eval = outcome
             suggested_perm = safety_eval["suggested_permission_level"]
             safety_status = safety_eval["safety_status"]
             reason = safety_eval["reason"]
-            
+
             report["checked_documents"] += 1
             print(f"       └─ Safety Check Result: status={safety_status}, suggested_permission={suggested_perm}")
 

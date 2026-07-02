@@ -285,11 +285,24 @@ class Chunk:
         return doc
 
 
+def _token_char_counts(text: str) -> Tuple[int, int]:
+    """统计 _estimate_tokens 口径的（中文字符数, 其余字符数）。
+
+    两个计数对字符串拼接严格可加（单字符 regex 无跨界匹配），供 token 预算
+    循环增量维护；换算回 token 必须走 _tokens_from_counts，保持公式单一来源。
+    """
+    cn_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    return cn_chars, len(text) - cn_chars
+
+
+def _tokens_from_counts(cn_chars: int, en_chars: int) -> int:
+    """由字符计数换算 token 估算——与 _estimate_tokens 完全同一公式（含 int 截断）。"""
+    return int(cn_chars / 1.5 + en_chars / 4)
+
+
 def _estimate_tokens(text: str) -> int:
     """粗略估算 token 数（中文约 1.5 字/token，英文约 4 字符/token）。"""
-    cn_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
-    en_chars = len(text) - cn_chars
-    return int(cn_chars / 1.5 + en_chars / 4)
+    return _tokens_from_counts(*_token_char_counts(text))
 
 
 def _generate_chunk_id(doc_id: str, version_no: int, chunk_index: int) -> str:
@@ -515,6 +528,29 @@ class DocumentChunker:
     # 抽 "• 第N步：标题 „„„" 等目录条目。行首允许 bullet/空白/中文/全角空格。
     _TOC_LINE_RE = re.compile(
         r"^[\s•·●\-\*\#　]*第\s*([一二三四五六七八九十\d]+)\s*步\s*[:：]\s*(.+?)\s*(?:[„\.…]+|$)"
+    )
+
+    # ── 条款边界检测 regex（_chunk_by_clause 用；类属性常量，与 _STEP_BOUNDARY_RE 同法，
+    # 避免每次调用重新 re.compile）──
+    # 2026-06-15 L6 clause-routing fix（见 docs/audits/clause_routing_inconsistency_scope_2026-06-15.md）：
+    # 旧 regex 漏掉真实制度编号，导致 ~47% 制度文档 clause 模式空命中 → 静默降级 text_chunk。
+    # 放宽三处（仅影响 clause-mode 门控文档；8 个原工作文档 match-count 字节不变，已离线 A/B 核实）：
+    #   (a) 去掉小数级别尾部 \s —— 真实文档写 `3.1公司办`/`4.2.1检查`（编号后无空格）。
+    #   (b) 新增小数守卫的单级 `\d{1,2}\.(?=\D)` —— 命中 `1.目的`/`2.适用范围`，但 `2.5kg` 不切。
+    #   (c) 字母子项类追加 `、` —— 命中 `A、` 顿号子项（旧版只认 `a）` 括号）。
+    # 小数级别另加单位负向先行 `(?![A-Za-z])`，使行首 `2.5kg` 也不会被当成 3.1 式编号
+    # （对全语料 match-count 与无该守卫时完全一致）。
+    _CLAUSE_RE = re.compile(
+        r'^(?:'
+        r'第[一二三四五六七八九十百零\d]+[章节条款部分编]|'  # 第X章/第X条
+        r'[一二三四五六七八九十]+[、\.]|'  # 一、二、
+        r'\d+[、]|'  # 1、2、…（阿拉伯数字+顿号，中文制度/规范常用枚举）
+        r'（[一二三四五六七八九十\d]+）|'  # （一）（二）
+        r'[a-zA-Z][）)、]|'  # a）b) A、 子条款
+        r'\d+\.\d+(?:\.\d+)?(?![A-Za-z])|'  # 9.1 / 4.2.1（无需尾空格；2.5kg 等带单位测量值除外）
+        r'\d{1,2}\.(?=\D)'  # 1.目的 / 2.适用范围（小数守卫：2.5kg 不切）
+        r')',
+        re.MULTILINE,
     )
 
     @staticmethod
@@ -1301,12 +1337,17 @@ class DocumentChunker:
             _PARENT_MAX_TOKENS = 1800
             _total_steps = len(all_step_titles)
             _base_text = parent_text  # 此处 = doc_title + preamble_summary（上方已拼）
+            # 增量维护中/英字符计数，代替对全量候选文本逐次重跑 _estimate_tokens
+            # （O(n²)→O(n)）。计数对拼接严格可加，每步只扫新标题 + 1 个 "\n" 分隔符，
+            # 再套 _estimate_tokens 同一公式换算——判断结果与全量估算逐位一致。
+            _cn, _en = _token_char_counts(_base_text + f"\n…（共 {_total_steps} 个步骤）")
             _included = []
             for _t in all_step_titles:
-                _cand = (_base_text + "\n" + "\n".join(_included + [_t])
-                         + f"\n…（共 {_total_steps} 个步骤）")
-                if _estimate_tokens(_cand) > _PARENT_MAX_TOKENS:
+                _t_cn, _t_en = _token_char_counts(_t)
+                _cand_cn, _cand_en = _cn + _t_cn, _en + _t_en + 1  # +1 = 标题前的 "\n"
+                if _tokens_from_counts(_cand_cn, _cand_en) > _PARENT_MAX_TOKENS:
                     break
+                _cn, _en = _cand_cn, _cand_en
                 _included.append(_t)
             parent_text = _base_text
             if _included:
@@ -1623,27 +1664,7 @@ class DocumentChunker:
         chunk_index = 0
         current_section: Optional[str] = None
 
-        # 条款边界检测 regex
-        # 2026-06-15 L6 clause-routing fix（见 docs/audits/clause_routing_inconsistency_scope_2026-06-15.md）：
-        # 旧 regex 漏掉真实制度编号，导致 ~47% 制度文档 clause 模式空命中 → 静默降级 text_chunk。
-        # 放宽三处（仅影响 clause-mode 门控文档；8 个原工作文档 match-count 字节不变，已离线 A/B 核实）：
-        #   (a) 去掉小数级别尾部 \s —— 真实文档写 `3.1公司办`/`4.2.1检查`（编号后无空格）。
-        #   (b) 新增小数守卫的单级 `\d{1,2}\.(?=\D)` —— 命中 `1.目的`/`2.适用范围`，但 `2.5kg` 不切。
-        #   (c) 字母子项类追加 `、` —— 命中 `A、` 顿号子项（旧版只认 `a）` 括号）。
-        # 小数级别另加单位负向先行 `(?![A-Za-z])`，使行首 `2.5kg` 也不会被当成 3.1 式编号
-        # （对全语料 match-count 与无该守卫时完全一致）。
-        _CLAUSE_RE = re.compile(
-            r'^(?:'
-            r'第[一二三四五六七八九十百零\d]+[章节条款部分编]|'  # 第X章/第X条
-            r'[一二三四五六七八九十]+[、\.]|'  # 一、二、
-            r'\d+[、]|'  # 1、2、…（阿拉伯数字+顿号，中文制度/规范常用枚举）
-            r'（[一二三四五六七八九十\d]+）|'  # （一）（二）
-            r'[a-zA-Z][）)、]|'  # a）b) A、 子条款
-            r'\d+\.\d+(?:\.\d+)?(?![A-Za-z])|'  # 9.1 / 4.2.1（无需尾空格；2.5kg 等带单位测量值除外）
-            r'\d{1,2}\.(?=\D)'  # 1.目的 / 2.适用范围（小数守卫：2.5kg 不切）
-            r')',
-            re.MULTILINE,
-        )
+        # 条款边界检测 regex 见类属性 _CLAUSE_RE（提升为常量，免去每调用重编译）。
 
         # 1. Collect all paragraph text and handle tables/headings
         all_para_texts: List[str] = []
@@ -1704,7 +1725,7 @@ class DocumentChunker:
                 table_chunks, pending_image_refs, doc_id, version_no,
                 chunk_index, meta, current_section)
 
-        matches = list(_CLAUSE_RE.finditer(full_text))
+        matches = list(self._CLAUSE_RE.finditer(full_text))
 
         if not matches:
             # No clause boundaries found — fallback to standard text splitting
@@ -1941,9 +1962,29 @@ class DocumentChunker:
         buffered_source = "native"
         pending_image_refs = []  # 暂存 image_ref 块，等待附加到最近的 chunk
 
+        # 内联图路径的后缀合并缓冲：同一目标 chunk 连续挂多张图时，先收集各图的
+        # [图片内容]/[图片OCR] 后缀行，换目标或落定时一次性拼接并重算 token_count，
+        # 与表格路径（一次 join + 一次 _estimate_tokens）对齐。字节级等价：逐图追加的
+        # 后缀 = "\n"+该图 parts 按 "\n" join，合并后 = "\n"+全部 parts 按序 join，
+        # 完全相同；token_count 收敛为最后一次全量重算，数值不变。
+        deferred_suffix_chunk = None  # 待拼图片后缀的目标 chunk
+        deferred_suffix_parts: List[str] = []
+
+        def _flush_image_suffix():
+            nonlocal deferred_suffix_chunk, deferred_suffix_parts
+            if deferred_suffix_chunk is not None and deferred_suffix_parts:
+                suffix = "\n" + "\n".join(deferred_suffix_parts)
+                deferred_suffix_chunk.chunk_text += suffix
+                deferred_suffix_chunk.token_count = _estimate_tokens(
+                    deferred_suffix_chunk.chunk_text)
+            deferred_suffix_chunk = None
+            deferred_suffix_parts = []
+
         def _attach_pending_images(target_chunk):
             """将 pending_image_refs 附加到目标 chunk。"""
             nonlocal pending_image_refs
+            # 先落定内联图的合并后缀，保证对同一 chunk 的文本追加顺序与逐图追加一致
+            _flush_image_suffix()
             if not pending_image_refs or target_chunk is None:
                 return
             target_chunk.extra["image_refs"] = list(pending_image_refs)
@@ -2105,10 +2146,15 @@ class DocumentChunker:
                         existing.append(img_entry)
                         target_chunk.extra["image_refs"] = existing
 
-                        suffix_parts = []
+                        # 换了目标 chunk（新建 spillover / 中间提交过文本）→ 先落定
+                        # 上一个 chunk 已收集的图片后缀，再开始收集当前 chunk 的
+                        if target_chunk is not deferred_suffix_chunk:
+                            _flush_image_suffix()
+                            deferred_suffix_chunk = target_chunk
+
                         vs = img_entry.get("visual_summary", "")
                         if vs:
-                            suffix_parts.append(f"[图片内容] {vs}")
+                            deferred_suffix_parts.append(f"[图片内容] {vs}")
                         ocr_raw = img_entry.get("ocr_text", "")
                         if ocr_raw:
                             try:
@@ -2117,12 +2163,7 @@ class DocumentChunker:
                             except ImportError:
                                 cleaned = ocr_raw.strip()
                             if cleaned:
-                                suffix_parts.append(f"[图片OCR] {cleaned}")
-
-                        if suffix_parts:
-                            suffix = "\n" + "\n".join(suffix_parts)
-                            target_chunk.chunk_text += suffix
-                            target_chunk.token_count = _estimate_tokens(target_chunk.chunk_text)
+                                deferred_suffix_parts.append(f"[图片OCR] {cleaned}")
                     else:
                         pending_image_refs.append(img_entry)
                 continue
@@ -2196,6 +2237,8 @@ class DocumentChunker:
             buffered_texts.append(text.strip())
 
         commit_buffer()
+        # 块循环结束，不再有内联图追加 → 落定最后一批合并的图片后缀
+        _flush_image_suffix()
 
         # 如果还有未附加的 image_refs（出现在所有文本之后），附加到最后一个 chunk
         if pending_image_refs and chunks:

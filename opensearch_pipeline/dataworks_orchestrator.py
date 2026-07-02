@@ -29,6 +29,16 @@ from opensearch_pipeline.dag_definitions import (
 from opensearch_pipeline.run_simulation import get_test_data
 
 
+def _loader_fetch_concurrency() -> int:
+    """Stage-2 canonical 预取并发度（perf F#54）。RAG_LOADER_FETCH_CONCURRENCY，默认 1=维持
+    串行现状（写路径保守）；DataWorks 节点可自行调大——认领事务已提交，OSS get_object 是
+    无锁纯读，失败回写仍逐条串行。"""
+    try:
+        return max(1, int(os.environ.get("RAG_LOADER_FETCH_CONCURRENCY", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
 def run_stage(stage: int, bizdate: str, simulate: bool):
     """根据 stage 和业务日期运行相应的 DAG。"""
     config = get_config()
@@ -212,7 +222,39 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                         conn.commit()
                         print(f"[Orchestrator] Preempted {preempted_count} documents for processing.")
                     has_load_errors = False
-                    for row in rows:
+
+                    def _fetch_canonical(canonical_json_key):
+                        """只读拉取并解析单篇 canonical JSON（OSS 或本地模拟）→ (content_json, read_error)。
+                        纯读、无 DB/锁副作用——可安全并行；失败回写由主循环逐条串行执行。"""
+                        if is_simulated_oss:
+                            if os.path.exists(canonical_json_key):
+                                try:
+                                    with open(canonical_json_key, "r", encoding="utf-8") as f:
+                                        return json.load(f), None
+                                except Exception as sim_err:
+                                    return {}, f"Failed to parse local canonical file: {sim_err}"
+                            return {}, f"Local canonical file not found: {canonical_json_key}"
+                        try:
+                            oss_data = bucket.get_object(canonical_json_key).read()
+                            return json.loads(oss_data.decode("utf-8")), None
+                        except Exception as oss_err:
+                            return {}, (f"Failed to fetch/parse canonical {canonical_json_key} "
+                                        f"from OSS: {oss_err}")
+
+                    # perf F#54：认领事务已提交（行锁已释放）后的 canonical 拉取是纯读——
+                    # RAG_LOADER_FETCH_CONCURRENCY>1 时线程池并行预取（默认 1=串行现状）；
+                    # 结果按原行序消费，失败回写逻辑保持逐条串行语义不变。
+                    prefetched = {}
+                    _fetch_conc = _loader_fetch_concurrency()
+                    if _fetch_conc > 1 and len(rows) > 1:
+                        from concurrent.futures import ThreadPoolExecutor
+                        _keys = [r[2] for r in rows]
+                        with ThreadPoolExecutor(
+                                max_workers=min(_fetch_conc, len(rows))) as _pool:
+                            for _i, _res in enumerate(_pool.map(_fetch_canonical, _keys)):
+                                prefetched[_i] = _res
+
+                    for row_idx, row in enumerate(rows):
                         doc_id = row[0]
                         version_no = row[1]
                         canonical_json_key = row[2]
@@ -225,26 +267,13 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                         title = row[9] or ""
                         owner_dept = row[10] or "unknown"
                         raw_key = row[11] or ""
-                        
-                        # Load content from OSS or local storage
-                        content_json = {}
-                        read_error = None
-                        if is_simulated_oss:
-                            if os.path.exists(canonical_json_key):
-                                try:
-                                    with open(canonical_json_key, "r", encoding="utf-8") as f:
-                                        content_json = json.load(f)
-                                except Exception as sim_err:
-                                    read_error = f"Failed to parse local canonical file: {sim_err}"
-                            else:
-                                read_error = f"Local canonical file not found: {canonical_json_key}"
+
+                        # Load content from OSS or local storage（预取命中直接用，否则现场拉）
+                        if row_idx in prefetched:
+                            content_json, read_error = prefetched[row_idx]
                         else:
-                            try:
-                                oss_data = bucket.get_object(canonical_json_key).read()
-                                content_json = json.loads(oss_data.decode("utf-8"))
-                            except Exception as oss_err:
-                                read_error = f"Failed to fetch/parse canonical {canonical_json_key} from OSS: {oss_err}"
-                                
+                            content_json, read_error = _fetch_canonical(canonical_json_key)
+
                         if read_error:
                             has_load_errors = True
                             print(f"    ⚠️ OSS/Local canonical read failure: {read_error}")

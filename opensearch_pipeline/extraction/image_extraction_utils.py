@@ -36,6 +36,7 @@ class ImageAsset:
 def extract_images_from_docx(
     local_path: str,
     output_dir: str,
+    document=None,
 ) -> List[ImageAsset]:
     """
     从 DOCX 文件中提取所有嵌入图片。
@@ -48,23 +49,26 @@ def extract_images_from_docx(
     Args:
         local_path: DOCX 文件的本地路径。
         output_dir: 图片导出目标目录。
+        document: 可选，调用方已解析好的 python-docx Document（perf#63 复用，
+            避免同一 DOCX 再做一次完整 OOXML 解包 + lxml 树构建）；
+            None = 自行加载（独立调用兼容，行为同旧版）。
 
     Returns:
         导出的 ImageAsset 列表（已 MD5 去重）。
     """
-    try:
-        import docx
-    except ImportError:
-        return []
-
     assets: List[ImageAsset] = []
     seen_hashes: dict = {}  # md5 -> 首次导出的 ImageAsset
 
-    try:
-        document = docx.Document(local_path)
-    except Exception as e:
-        print(f"      ⚠️ Failed to open DOCX for image extraction: {e}")
-        return []
+    if document is None:
+        try:
+            import docx
+        except ImportError:
+            return []
+        try:
+            document = docx.Document(local_path)
+        except Exception as e:
+            print(f"      ⚠️ Failed to open DOCX for image extraction: {e}")
+            return []
 
     doc_basename = os.path.splitext(os.path.basename(local_path))[0]
     img_index = 0
@@ -398,6 +402,7 @@ def extract_images_from_pdf(
 def extract_images_from_xlsx(
     local_path: str,
     output_dir: str,
+    workbook=None,
 ) -> List[ImageAsset]:
     """
     从 XLSX 文件中提取嵌入图片。
@@ -407,6 +412,12 @@ def extract_images_from_xlsx(
     Args:
         local_path: XLSX 文件的本地路径。
         output_dir: 图片导出目标目录。
+        workbook: 可选，调用方已加载的**普通模式** openpyxl workbook（perf#62 复用，
+            避免同一 xlsx 再次 zip 解包）。read_only workbook 的 worksheet 没有
+            _images（openpyxl 只在普通模式加载 drawing），直接用会静默丢图 →
+            检测到 read_only 一律忽略、回退自行加载。传入的 workbook 不在此关闭
+            （生命周期归调用方）；普通模式 _images 数据在 load 时已读入内存，
+            不依赖 archive 开闭。
 
     Returns:
         导出的 ImageAsset 列表（已 MD5 去重）。
@@ -420,11 +431,17 @@ def extract_images_from_xlsx(
     assets: List[ImageAsset] = []
     seen_hashes: dict = {}  # md5 -> {"asset": 首次导出资产, "anchors": set((sheet_idx, anchor_row))}
 
-    try:
-        wb = load_workbook(local_path, data_only=True)
-    except Exception as e:
-        print(f"      ⚠️ Failed to open XLSX for image extraction: {e}")
-        return []
+    wb = None
+    owns_wb = True
+    if workbook is not None and not getattr(workbook, "read_only", False):
+        wb = workbook
+        owns_wb = False
+    if wb is None:
+        try:
+            wb = load_workbook(local_path, data_only=True)
+        except Exception as e:
+            print(f"      ⚠️ Failed to open XLSX for image extraction: {e}")
+            return []
 
     doc_basename = os.path.splitext(os.path.basename(local_path))[0]
     img_index = 0
@@ -508,7 +525,8 @@ def extract_images_from_xlsx(
             seen_hashes[md5] = {"asset": asset, "anchors": {(sheet_idx, anchor_row)}}
             img_index += 1
 
-    wb.close()
+    if owns_wb:
+        wb.close()
 
     # ── 后处理：从 Drawing XML 提取 group 编号标注 ──
     # openpyxl 的 _images 无法读取 grpSp 里的文字标注（如①②③序号圆圈）

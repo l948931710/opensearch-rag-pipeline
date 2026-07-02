@@ -635,9 +635,11 @@ class UnifiedExtractor:
         result._local_path = local_path  # type: ignore[attr-defined]
 
 
-        # OCR fallback 判断
-        if self._needs_ocr(result):
-            result = self._apply_ocr_fallback(task, result)
+        # OCR fallback 判断（perf#65：needy 单算传递——此前 _needs_ocr / _apply_ocr_fallback
+        # 各算一遍，全 blocks 逐页聚合与 page_count<=0 的 pypdf/pdfplumber 回退探测都跑两遍）
+        needy_pages = self._pages_needing_ocr(result)
+        if needy_pages:
+            result = self._apply_ocr_fallback(task, result, needy_pages)
 
         # ── Increment 1: VLM 版面重建（逐页升级不可提取页）──
         # 默认关闭（cfg.rebuild.enabled=False）→ no-op；开启后受成本熔断器约束。
@@ -668,16 +670,29 @@ class UnifiedExtractor:
 
         local_path = task.get("local_path", "")
 
+        # perf#63：docx.Document 全量解析（OOXML 解包 + lxml 树构建）只做一次，注入给
+        # 文本位置追踪与图片导出两个函数复用（此前各自 load，一个文档解析两遍）。
+        # 依赖缺失/坏文档时传 None → 两函数各自走旧的自行加载路径并产出原有 warning
+        # （"Failed to open DOCX" 3-tuple 留痕行为不变，graceful degradation）。
+        _document = None
+        try:
+            import docx as _docx
+            _document = _docx.Document(local_path)
+        except Exception:
+            _document = None
+
         # ── 方案 B：用 extract_docx_with_images 获得段落级 image_ref 位置 ──
         # 这让 _inject_image_ref_blocks 走精确匹配路径而非启发式均匀分配
-        blocks, inline_image_assets, docx_warnings = extract_docx_with_images(local_path)
+        blocks, inline_image_assets, docx_warnings = extract_docx_with_images(
+            local_path, document=_document)
         warnings = list(docx_warnings)
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
 
         # ── 提取嵌入图片到磁盘 → 三阶段过滤漏斗 ──
+        # perf#63：复用同一 _document，省掉此前这里的第二次全量解析。
         exported_images = extract_images_from_docx(
-            local_path, _safe_image_output_dir(task)
+            local_path, _safe_image_output_dir(task), document=_document
         )
 
         # ── 对齐 image_index：inline_image_assets 按文档顺序，
@@ -794,22 +809,35 @@ class UnifiedExtractor:
         warnings = []
         all_part_candidates: set = set()  # 跨 sheet 收集所有部位名称
 
+        _img_wb = None  # perf#62：普通模式 workbook 供图片提取复用（read_only 无 _images，不可共享）
         try:
             import openpyxl
             # read_only=False 才能读到合并单元格几何（merged_cells），而合并单元格常承载
             # 分组键（清扫基准书的"类别"列、规格书的分区）。
             # 兜底按"行数"而非文件大小判断：图文型 xlsx（清扫基准书/规格书）文件可达数十 MB，
             # 但只有几十行，应当展开合并；真正的数据导出表（数十万~百万行）才保持 read_only 防止内存暴涨。
+            # perf#62：probe 与正式 load 合一——判定走 read_only 时直接复用 probe workbook
+            # （read_only 的 iter_rows 每次调用都从 archive 重新流式解析，探过 max_row 不影响
+            # 后续正文遍历）；判定走普通模式才二次 load，避免同一文件被完整解析两次。
+            wb = None
             _use_ro = True
             try:
                 _fsz = os.path.getsize(local_path)
                 _probe = openpyxl.load_workbook(local_path, read_only=True, data_only=True)
                 _maxr = max((ws.max_row or 0) for ws in _probe.worksheets) if _probe.worksheets else 0
-                _probe.close()
                 _use_ro = (_maxr > 50000) or (_fsz > 100 * 1024 * 1024)
+                if _use_ro:
+                    wb = _probe   # 大表：probe 即正式 workbook，省一次完整 load
+                else:
+                    _probe.close()
             except Exception:
                 _use_ro = True
-            wb = openpyxl.load_workbook(local_path, read_only=_use_ro, data_only=True)
+            if wb is None:
+                wb = openpyxl.load_workbook(local_path, read_only=_use_ro, data_only=True)
+            if not _use_ro:
+                # 普通模式加载的 _images 数据在 load 时已读入内存（BytesIO），与 archive
+                # 开闭无关，后续 wb.close()（普通模式为 no-op）不影响图片提取复用。
+                _img_wb = wb
             for sheet_idx, sheet_name in enumerate(wb.sheetnames):
                 ws = wb[sheet_name]
 
@@ -979,8 +1007,11 @@ class UnifiedExtractor:
             warnings.append(f"Failed to extract Excel file: {e}")
 
         # 提取嵌入图片 → 三阶段过滤漏斗
+        # perf#62：普通模式 wb 直接传给 extract_images_from_xlsx 复用，省第三次 zip 解包；
+        # read_only / 加载失败时 _img_wb=None → 其内部照旧自行加载（graceful degradation）。
         assets, img_blocks = self._process_embedded_images(
-            extract_images_from_xlsx(local_path, _safe_image_output_dir(task)),
+            extract_images_from_xlsx(local_path, _safe_image_output_dir(task),
+                                     workbook=_img_wb),
             task,
         )
 
@@ -1947,12 +1978,19 @@ class UnifiedExtractor:
             return result.text_length < self.OCR_THRESHOLD_CHARS
         return False
 
-    def _apply_ocr_fallback(self, task: dict, result: ExtractionResult) -> ExtractionResult:
-        """应用 OCR fallback。PDF 只 OCR 文本不足的页，并按 page_num 合并回正确位置。"""
+    def _apply_ocr_fallback(self, task: dict, result: ExtractionResult,
+                            needy: Optional[List[int]] = None) -> ExtractionResult:
+        """应用 OCR fallback。PDF 只 OCR 文本不足的页，并按 page_num 合并回正确位置。
+
+        needy: 调用方已算好的 PDF 需 OCR 页列表（perf#65 避免 _pages_needing_ocr 重算，
+               该函数在 page_count<=0 时会重开 pypdf/pdfplumber 探测，可达秒级）；
+               None = 自行计算（独立调用兼容，行为同旧版）。
+        """
         local_path = task.get("local_path", "")
 
         if result.file_ext == "pdf":
-            needy = self._pages_needing_ocr(result)
+            if needy is None:
+                needy = self._pages_needing_ocr(result)
             if not needy:
                 return result
             ocr_result = self.ocr_client.ocr_pdf(

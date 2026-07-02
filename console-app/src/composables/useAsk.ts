@@ -1,4 +1,4 @@
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { apiFetch, apiJson } from '@/lib/api'
 import { createSseDecoder, type SseEvent } from '@/lib/sseDecoder'
 import { renderMd, stripImg } from '@/lib/markdown'
@@ -135,6 +135,7 @@ function _now(): number { return (typeof performance !== 'undefined' && performa
 // 通用"匀速吐字"通道：answer（raw→html）与 reasoning（reasoning→reasoningHtml）共用同一套墙钟节奏泵，
 // 把 bursty 到达解耦成屏幕匀速显现。两者从不同时流式（思考先、答案后），共用逻辑只是渲染目标/状态键不同。
 interface RevealCh {
+  key: 'a' | 'r'                                      // 流式增量缓存槽位（answer / reasoning）
   text: (ai: ChatMessage) => string                  // 源文本
   html: (ai: ChatMessage) => string | undefined      // 当前已渲染 html（判首帧）
   setHtml: (ai: ChatMessage, h: string) => void       // 写回渲染结果
@@ -144,6 +145,7 @@ interface RevealCh {
   ts: '_lastRenderTs' | '_rTs'
 }
 const ANSWER_CH: RevealCh = {
+  key: 'a',
   text: (ai) => stripImg(ai.raw || ''),
   html: (ai) => ai.html,
   setHtml: (ai, h) => { ai.html = h },
@@ -151,16 +153,86 @@ const ANSWER_CH: RevealCh = {
   raf: '_renderRaf', shown: '_shownLen', ts: '_lastRenderTs',
 }
 const REASON_CH: RevealCh = {
+  key: 'r',
   text: (ai) => ai.reasoning || '',
   html: (ai) => ai.reasoningHtml,
   setHtml: (ai, h) => { ai.reasoningHtml = h },
   alive: (ai) => !ai._reasoningDone,
   raf: '_rRaf', shown: '_rShownLen', ts: '_rTs',
 }
+
+// ── 流式渲染增量缓存（H#68）──
+// 旧实现每 tick 对全文跑 stripImg + renderMd（O(n²)）：答案越长每帧越贵。这里把两步都改成只处理增量：
+//  · strip：raw 只追加 → 已定稿前缀的剥离结果缓存复用；末尾"可能长成完整 <<IMG:N>> 标记的半截"持留
+//    不定稿（持留判定与 stripImg 的半截擦除同构，且持留全部完整标记的真前缀 → 标记绝不被定稿边界切开）；
+//  · renderMd：逐行渲染彼此独立（``` 围栏跨行除外）→ 已完结行的 HTML 缓存复用，每 tick 只重渲最后
+//    一个未完结行；若尾部处于未闭合围栏内，回退到从围栏起点所在行整段重渲（表格/列表本就逐行独立）。
+// 任何越界/回退情况一律重置缓存走全量；定稿帧（finishStream/stop/content_blocks 后）永远是全量权威
+// renderMd，流式期的任何视觉瑕疵都会被定稿修正。缓存放 WeakMap（不上消息对象 → 绝不进 localStorage）。
+interface PumpChState {
+  stripLen: number   // raw 已定稿剥离到的位置（保证不切开任何潜在 <<IMG>> 标记）
+  stripOut: string   // raw[0, stripLen) 的剥离结果（只追加）
+  mdLen: number      // 已定稿渲染的源前缀长度（行边界，且前缀内围栏闭合）
+  mdHtml: string     // 该前缀的 HTML（只追加）
+}
+const _pumpStates = new WeakMap<ChatMessage, Partial<Record<'a' | 'r', PumpChState>>>()
+function _pumpState(ai: ChatMessage, key: 'a' | 'r'): PumpChState {
+  let slots = _pumpStates.get(ai)
+  if (!slots) { slots = {}; _pumpStates.set(ai, slots) }
+  let st = slots[key]
+  if (!st) { st = { stripLen: 0, stripOut: '', mdLen: 0, mdHtml: '' }; slots[key] = st }
+  return st
+}
+function _dropPumpState(ai: ChatMessage): void { _pumpStates.delete(ai) }
+
+const IMG_FULL_RE = /<{1,2}IMG:\d+>{1,2}/g
+// 持留判定：末尾可能是半截 <<IMG:N>> 标记（含只差一个 ">" 的 "<<IMG:1>"）——这些是完整标记的真前缀，
+// 先不定稿；等后续字符到齐后要么整体按完整标记删除，要么证伪后原样放行。
+const IMG_HOLD_RE = /<{1,2}(IMG:\d+>?|I?M?G?:?\d*)$/
+function stripImgIncr(st: PumpChState, raw: string): string {
+  if (raw.length < st.stripLen) { st.stripLen = 0; st.stripOut = ''; st.mdLen = 0; st.mdHtml = '' }   // 防御：源只增不减
+  const tail = raw.slice(st.stripLen)
+  const m = IMG_HOLD_RE.exec(tail.length > 64 ? tail.slice(-64) : tail)
+  const upTo = raw.length - (m ? m[0].length : 0)
+  if (upTo > st.stripLen) {
+    st.stripOut += raw.slice(st.stripLen, upTo).replace(IMG_FULL_RE, '')
+    st.stripLen = upTo
+  }
+  return st.stripOut   // 持留区不显示 —— 与 stripImg 擦掉末尾半截标记的口径一致
+}
+
+function renderMdIncr(st: PumpChState, shown: string): string {
+  if (shown.length < st.mdLen) { st.mdLen = 0; st.mdHtml = '' }   // 防御：拿不准回退全量
+  const nl = shown.lastIndexOf('\n') + 1        // 候选定稿边界：最后一个完整行之后
+  if (nl > st.mdLen) {
+    // 不变式：[0, mdLen) 内围栏闭合。只扫增量里的 ``` 定奇偶；未闭合围栏 → 边界退到围栏起点所在行首。
+    let open = false
+    let openPos = -1
+    let i = st.mdLen
+    for (;;) {
+      const p = shown.indexOf('```', i)
+      if (p < 0 || p >= nl) break
+      open = !open
+      if (open) openPos = p
+      i = p + 3
+    }
+    const bound = open ? shown.lastIndexOf('\n', openPos) + 1 : nl
+    if (bound > st.mdLen) {
+      const seg = shown.slice(st.mdLen, bound)
+      if (seg.trim()) st.mdHtml += renderMd(seg)   // 空白段不渲（避免拼进 renderMd 的 <p></p> 空兜底）
+      st.mdLen = bound
+    }
+  }
+  const tailPart = shown.slice(st.mdLen)
+  return (st.mdHtml + (tailPart.trim() ? renderMd(tailPart) : '')) || '<p></p>'
+}
+
 function pumpTick(ai: ChatMessage, seq: number, ch: RevealCh): void {
   ;(ai as any)[ch.raf] = null
   if (seq !== askSeq || !ch.alive(ai)) return            // 作废/定稿/错误/无结果 → 停
-  const target = ch.text(ai).length
+  const st = _pumpState(ai, ch.key)
+  const text = ch.key === 'a' ? stripImgIncr(st, ai.raw || '') : (ai.reasoning || '')
+  const target = text.length
   const shown = ((ai as any)[ch.shown] as number) || 0
   if (shown >= target) return                            // 追平即停；新帧由 ensureReveal 重启
   const now = _now()
@@ -177,7 +249,7 @@ function pumpTick(ai: ChatMessage, seq: number, ch: RevealCh): void {
   const next = shown + Math.max(2, Math.min(remain, Math.ceil(remain * (dt / 200))))
   ;(ai as any)[ch.shown] = next
   ;(ai as any)[ch.ts] = now
-  ch.setHtml(ai, renderMd(ch.text(ai).slice(0, next)))
+  ch.setHtml(ai, renderMdIncr(st, text.slice(0, next)))
   ;(ai as any)[ch.raf] = requestAnimationFrame(() => pumpTick(ai, seq, ch))
 }
 // 帧到达即确保泵在跑。首帧立即同步渲染（内容尽快出现 + 保证 html 是字符串），其后增量交给匀速泵；
@@ -273,6 +345,8 @@ function finishStream(ai: ChatMessage, seq: number): void {
   if (seq !== askSeq) return
   asking.value = false
   abortCtl = null
+  schedulePersist()              // 收尾持久化（deep watch 已移除）：定时器 400ms 后读到的是下面全部定稿态
+  _dropPumpState(ai)             // 流式增量缓存到此为止（下面是全量权威定稿帧）
   if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
   if (ai._renderRaf != null) { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }
   finalizeReasoning(ai, false)   // 思考定稿（若有）：停泵 + 渲染全文，保留展开态
@@ -299,6 +373,7 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
   })
   conv.messages.push(ai)
   asking.value = true
+  schedulePersist()   // 提问即持久化（问句/标题/updatedAt）；流式中间态不逐帧写，收尾再持久化定稿
 
   const seq = ++askSeq
   // 等待态文案由真实流帧驱动（sources 帧 → 有据态；chunk 帧 → 收起）——不再盲目计时翻页。
@@ -335,12 +410,14 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
     if (seq !== askSeq) return   // 已被停止/新提问接管
     asking.value = false
     abortCtl = null
+    _dropPumpState(ai)
     if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
     finalizeReasoning(ai, false)
     ai.loading = false
     ai.streaming = false
     ai.error = true
     ai.errorText = e && e.name === 'AbortError' ? '已取消本次提问。' : '回答失败，请检查网络后重试。'
+    schedulePersist()            // 错误态也入本地历史（与旧 deep watch 行为一致）
   }
 }
 
@@ -350,6 +427,7 @@ function stop(): void {
   asking.value = false
   const ai = messages.value[messages.value.length - 1]
   if (ai && ai.role === 'ai') {
+    _dropPumpState(ai)
     if (ai._stageTimer) { clearTimeout(ai._stageTimer); ai._stageTimer = null }
     if (ai._renderRaf != null) { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }   // 停吐字泵
     finalizeReasoning(ai, false)
@@ -357,12 +435,13 @@ function stop(): void {
     ai.streaming = false
     if (ai.raw && !ai.viewBlocks) ai.html = renderMd(stripImg(ai.raw))   // 保留已生成部分（一次性定稿）
     else if (!ai.raw && !ai.viewBlocks) { ai.error = true; ai.errorText = '已取消本次提问。' }
+    schedulePersist()            // 手动停止后的半截答案/取消卡也入本地历史
   }
 }
 
 function retry(m: ChatMessage): void {
   const idx = messages.value.indexOf(m)
-  if (idx >= 0) messages.value.splice(idx, 1)   // 原位移除错误卡，保留用户问句重发
+  if (idx >= 0) { messages.value.splice(idx, 1); schedulePersist() }   // 原位移除错误卡，保留用户问句重发
   void ask(m.question, true)
 }
 
@@ -373,6 +452,7 @@ function newConversation(): void {
   const c: Conversation = reactive({ id: uuid(), title: '新对话', messages: [], qaSession: '', updatedAt: Date.now() })
   conversations.value.unshift(c)
   activeId.value = c.id
+  schedulePersist()
 }
 const resetThread = newConversation   // 旧名兼容
 
@@ -384,6 +464,7 @@ function switchTo(id: string): void {
   const c = conversations.value.find((x) => x.id === id)
   if (!c) return
   activeId.value = id
+  schedulePersist()
   if (c.messages.length === 0) void loadConversationMessages(c)   // 空（含服务端占位）→ 按需拉取
 }
 
@@ -395,27 +476,48 @@ function removeConversation(id: string): void {
   if (id === activeId.value && asking.value) stop()
   conversations.value.splice(i, 1)
   if (activeId.value === id) activeId.value = conversations.value[0]?.id || ''
+  schedulePersist()
   void apiJson(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE', auth: true }).catch(() => {})
+}
+
+// ── 侧栏会话列表 / 搜索（H#70）──
+// 排序列表做成浅依赖 computed：只读 updatedAt / messages.length / _server，不触碰消息内容 →
+// 流式 raw 每帧追加不再触发重排。
+const sortedConversations = computed(() =>
+  conversations.value
+    .filter((c) => c.messages.length > 0 || c._server)   // 空会话（未提问）不进列表；服务端占位也展示
+    .sort((a, b) => b.updatedAt - a.updatedAt))
+
+// 全文搜索的 lowercase 结果缓存：按（标题+消息数+文本总长）做廉价失效键——raw 只追加、消息只增删，
+// 键不变即复用，避免每次输入/每帧对全部会话重做 toLowerCase 大字符串分配。用 NUL(\u0000) 作拼接分隔符
+// （搜索框输入不可能含 NUL，不会跨消息误匹配）。
+const _searchTextCache = new WeakMap<Conversation, { key: string; text: string }>()
+function convSearchText(c: Conversation): string {
+  let total = 0
+  for (const m of c.messages) total += (m.text || m.raw || m.answer || '').length
+  const key = `${c.title}\u0000${c.messages.length}\u0000${total}`
+  const hit = _searchTextCache.get(c)
+  if (hit && hit.key === key) return hit.text
+  const text = (c.title + '\u0000' + c.messages.map((m) => m.text || m.raw || m.answer || '').join('\u0000')).toLowerCase()
+  _searchTextCache.set(c, { key, text })
+  return text
 }
 
 /** 按标题/消息文本搜索会话（用于侧栏搜索框）。空会话（未提问）不进列表，避免噪声。 */
 function searchConversations(q: string): Conversation[] {
   const k = q.trim().toLowerCase()
-  const list = [...conversations.value]
-    .filter((c) => c.messages.length > 0 || c._server)   // 服务端占位（标题先到、消息未拉）也展示
-    .sort((a, b) => b.updatedAt - a.updatedAt)
+  const list = sortedConversations.value
   if (!k) return list
-  return list.filter((c) =>
-    c.title.toLowerCase().includes(k) ||
-    c.messages.some((m) => (m.text || m.raw || m.answer || '').toLowerCase().includes(k)))
+  return list.filter((c) => convSearchText(c).includes(k))
 }
 
 async function vote(m: ChatMessage, type: 'upvote' | 'downvote'): Promise<void> {
   if (m.voted || !m.messageId) return
   m.voted = type === 'upvote' ? 'up' : 'down'   // 乐观置态
+  schedulePersist()
   try {
     await apiJson('/api/feedback', { method: 'POST', auth: true, body: JSON.stringify({ message_id: m.messageId, feedback_type: type }) })
-  } catch { m.voted = '' }   // 回滚
+  } catch { m.voted = ''; schedulePersist() }   // 回滚
 }
 
 async function handoff(m: ChatMessage): Promise<void> {
@@ -423,12 +525,13 @@ async function handoff(m: ChatMessage): Promise<void> {
   try {
     await apiJson('/api/feedback', { method: 'POST', auth: true, body: JSON.stringify({ message_id: m.messageId, feedback_type: 'handoff' }) })
     m.handoffDone = true
+    schedulePersist()
   } catch { /* 失败保持可重试 */ }
 }
 
 function copyAns(m: ChatMessage): void {
   const txt = m.copyText || m.answer || ''
-  const done = () => { m.copied = true; setTimeout(() => { m.copied = false }, 1500) }
+  const done = () => { m.copied = true; schedulePersist(); setTimeout(() => { m.copied = false; schedulePersist() }, 1500) }
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(txt).then(done, done)
   } else {
@@ -453,11 +556,12 @@ async function resignImage(m: ChatMessage, bi: number): Promise<void> {
     b.reloading = false
     if (u) { b.url = u; b.failed = false }
   } catch { b.reloading = false }
+  schedulePersist()   // viewBlocks 的 url/failed/reloading 是持久化字段
 }
 
 function imgFailed(m: ChatMessage, bi: number): void {
   const b = m.viewBlocks?.[bi]
-  if (b) b.failed = true
+  if (b) { b.failed = true; schedulePersist() }
 }
 
 function preview(b: ViewBlock): void {
@@ -506,6 +610,7 @@ export function syncHistoryForUser(uid: string): void {
     conversations.value = []
     activeId.value = ''
     ensureActive()
+    schedulePersist()   // 以当前用户 uid 戳重写空态（旧 deep watch 对 conversations 重赋值同样会触发）
   } catch { /* 失败不影响功能 */ }
 }
 
@@ -534,10 +639,14 @@ function schedulePersist(): void {
   _persistTimer = setTimeout(persist, 400)
 }
 
-// 模块初始化：从 localStorage 恢复 + 建立持久化 watch（仅浏览器环境）。
+// 模块初始化：从 localStorage 恢复（仅浏览器环境）。
+// H#69：持久化不再走 `watch([conversations, activeId], …, { deep: true })`——那会在流式期每 tick
+// 深遍历整棵会话树。改为在每个会话变更点手动 schedulePersist()（ask 发起 / finishStream 收尾 /
+// ask 异常 / stop / retry / newConversation / switchTo / removeConversation / vote 及回滚 / handoff /
+// copyAns / resignImage / imgFailed / loadConversationMessages 回灌 / syncHistoryForUser 清残留）。
+// persist 本身延迟 400ms 读【实时】状态，故触发点只需落在同一轮同步变更的任意位置。
 if (typeof window !== 'undefined') {
   loadPersisted()
-  watch([conversations, activeId], schedulePersist, { deep: true })
 }
 
 // ── 服务端会话历史（Phase 2/3）：端点 gate 在 RAG_CONVERSATION_HISTORY，关时返回空 → 全部退回 localStorage ──
@@ -591,6 +700,7 @@ async function loadConversationMessages(c: Conversation): Promise<void> {
       const msgs: ChatMessage[] = []
       for (const it of r.items) msgs.push(...serverItemToMessages(it))
       c.messages = msgs
+      schedulePersist()   // 服务端回灌消息后该会话进入持久化范围（messages.length > 0）
     }
   } catch { /* noop */ } finally { c._loading = false }
 }
@@ -602,6 +712,12 @@ export function useAsk() {
     ask, stop, retry, resetThread, newConversation, switchTo, removeConversation, searchConversations,
     vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions, hydrateConversations,
   }
+}
+
+/** 仅供测试：流式增量渲染内部（H#68）——供等价性回归测试对照全量 stripImg/renderMd。 */
+export function __incrRenderTestkit() {
+  const newState = (): PumpChState => ({ stripLen: 0, stripOut: '', mdLen: 0, mdHtml: '' })
+  return { newState, stripImgIncr, renderMdIncr }
 }
 
 /** 仅供测试：重置单例状态。 */

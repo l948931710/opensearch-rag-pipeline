@@ -48,11 +48,27 @@ _DEFAULT_TTL_SECONDS = _default_session_ttl_seconds()  # import 期解析；issu
 # 进程级临时密钥：仅在开发环境且未配置 RAG_SESSION_SIGNING_KEY 时使用
 _ephemeral_key: Optional[str] = None
 
+# perf I#73：签名密钥 bytes 的进程级缓存——每个带 Bearer 的请求（verify/issue 各调一次）此前
+# 都重读 os.environ + str.encode。env 进程内不变，首次成功解析后缓存即可（ephemeral 分支本就
+# 缓存 _ephemeral_key，此处对齐 env 分支）。仅缓存【非空 env key】：未配置时仍每次走原有解析
+# （生产/预发硬报错、开发 ephemeral），语义零变化。
+_signing_key_cache: Optional[bytes] = None
+
+
+def _reset_signing_key_cache() -> None:
+    """测试钩子：清空签名密钥缓存（测试中途换 RAG_SESSION_SIGNING_KEY 时调用；生产无需）。"""
+    global _signing_key_cache
+    _signing_key_cache = None
+
 
 def _get_signing_key() -> bytes:
+    global _signing_key_cache
+    if _signing_key_cache is not None:
+        return _signing_key_cache
     key = os.environ.get("RAG_SESSION_SIGNING_KEY", "").strip()
     if key:
-        return key.encode("utf-8")
+        _signing_key_cache = key.encode("utf-8")
+        return _signing_key_cache
 
     # 未配置：生产/预发严格报错；开发环境降级为进程级临时密钥
     try:

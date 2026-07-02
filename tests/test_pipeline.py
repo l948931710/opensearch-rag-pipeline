@@ -3,15 +3,20 @@
 test_pipeline.py — DAG 端到端集成测试
 """
 
+import copy
+
 import pytest
 from datetime import datetime
 
 from tests.local_stack import requires_local_db, requires_local_opensearch
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def reset_db_state():
-    # 🛡️ 防 sim→prod 泄露（2026-06-13 事故根因）：autouse + 无条件 DELETE chunk_meta，
-    # 远程 host 直接 skip。
+    # 🛡️ 防 sim→prod 泄露（2026-06-13 事故根因）：无条件 DELETE chunk_meta，远程 host 直接 skip。
+    # perf J#78：从模块级 autouse 收窄为按需 fixture——本模块只有 test_bulk_payload_splitting
+    # 真实读写本地 DB，其余 30 个用例纯 simulate（或 monkeypatch 掉 _get_db_conn），无 DML 对象。
+    # 收窄同时解除「结构测试被 DB 可用性劫持」的耦合：本地栈不在线时 simulate 用例照常跑。
+    # 生产目标防线不变：conftest 收集期硬闸 + 每测试 _refuse_prod_targets 仍然全量生效。
     from tests.local_stack import ensure_local_db_wired, local_db_unavailable_reason
     if not ensure_local_db_wired():
         pytest.skip(f"reset_db_state fixture refusing non-local RDS: {local_db_unavailable_reason()}")
@@ -185,8 +190,10 @@ class TestNormalScenario:
         assert ctx.get("index_result", {}).get("status") in ("SIMULATED_SUCCESS", "SUCCESS", "PARTIAL_SUCCESS")
         assert ctx.get("eval_report", {}).get("summary", {}).get("total_queries_tested", 0) > 0
 
-    def test_pipeline_skips_publish_gracefully(self):
-        """测试跳过 node_publish_to_rag_ready 节点时，后续的 chunking 与 rds 写入仍能正常工作，且 rag_ready_key 自动优雅 fallback 补齐。"""
+    def test_pipeline_skips_publish_gracefully(self, reset_db_state):
+        """测试跳过 node_publish_to_rag_ready 节点时，后续的 chunking 与 rds 写入仍能正常工作，且 rag_ready_key 自动优雅 fallback 补齐。
+
+        注：ctx["simulate"]=False 真实写本地 RDS，故显式挂 reset_db_state（无本地栈时 skip）。"""
         from opensearch_pipeline.dag_engine import DAG, DAGNode
         from opensearch_pipeline.pipeline_nodes import (
             node_classify_and_risk_assess,
@@ -295,11 +302,18 @@ class TestSensitiveScenario:
 class TestVersionUpdateScenario:
     """版本更新场景测试。"""
 
-    def test_dag1_dag2_leaves_old_active(self):
+    # perf J#79：DAG1+DAG2 前置状态类内只构建一次（simulate ctx 为纯内存 dict），
+    # 各用例经 deepcopy 隔离消费；test_full_pipeline_version_update 保持从零全跑，
+    # 以保留对 build_full_pipeline() API 本身的覆盖。
+    @pytest.fixture(scope="class")
+    def dag2_ctx(self):
         ctx = get_version_update_data()
-
         ctx = build_dag1_raw_to_canonical().run(ctx)
         ctx = build_dag2_canonical_to_chunk().run(ctx)
+        return ctx
+
+    def test_dag1_dag2_leaves_old_active(self, dag2_ctx):
+        ctx = copy.deepcopy(dag2_ctx)
 
         # 新 chunk 已写入
         assert ctx["chunk_meta_written"] > 0
@@ -308,11 +322,8 @@ class TestVersionUpdateScenario:
         deactivated = ctx.get("deactivated_chunks", [])
         assert len(deactivated) == 0
 
-    def test_dag3_deactivates_old_after_index(self):
-        ctx = get_version_update_data()
-
-        ctx = build_dag1_raw_to_canonical().run(ctx)
-        ctx = build_dag2_canonical_to_chunk().run(ctx)
+    def test_dag3_deactivates_old_after_index(self, dag2_ctx):
+        ctx = copy.deepcopy(dag2_ctx)
         ctx = build_dag3_chunk_to_opensearch().run(ctx)
 
         # 新 chunk 已 indexed, 旧 chunk 已停用
@@ -425,7 +436,7 @@ class TestBulkPayloadSplitting:
 
     @requires_local_db
     @requires_local_opensearch
-    def test_bulk_payload_splitting_over_limit(self):
+    def test_bulk_payload_splitting_over_limit(self, reset_db_state):
         """设定非常小的 max_bulk_size_bytes 触发贪心切分，并验证多 batch 跟踪。
         本地栈集成测试：真实写本地 MySQL（opensearch_bulk_job）+ 真实推送本地 OpenSearch。"""
         from opensearch_pipeline.chunker import Chunk

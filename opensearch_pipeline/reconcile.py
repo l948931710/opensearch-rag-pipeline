@@ -24,6 +24,8 @@ CLI:  python -m opensearch_pipeline.reconcile [--alert] [--json] [--hi N]
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +41,8 @@ def _kb_db() -> str:
 _DEFAULT_BUCKET = 500
 _HI_HEADROOM = 1000  # scan past max(rds.id) so freshly-pushed-but-unrecorded rows still surface
 _OSS_IMAGE_PREFIX = "processing/assets/"  # where active-chunk image_refs[].oss_key live
+_OSS_RAW_PREFIX = "raw/"                  # where document_version.raw_key source files live (CS4b)
+_HEAD_FANOUT_THRESHOLD = 50               # F#58: above this, LIST-build a set instead of per-key HEAD
 _RDS_COLS = ("id", "chunk_id", "doc_id", "version_no", "is_active", "index_status", "chunk_type")
 
 
@@ -153,9 +157,40 @@ def compute_parity(rds_rows: List[Dict[str, Any]],
     }
 
 
+def _scan_concurrency() -> int:
+    """HA3 桶扫描并发度（perf F#51，只读枚举）。RAG_RECONCILE_SCAN_CONCURRENCY，默认 4；<=1 串行。"""
+    try:
+        return max(1, int(os.environ.get("RAG_RECONCILE_SCAN_CONCURRENCY", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _new_ha3_client():
+    """新建一个独立 HA3 client（并发扫描每线程一个，不共享连接状态）。
+
+    与 retriever._get_ha3_client 的进程级单例刻意区分——单例用于 serving 热路径复用，
+    这里的对账扫描需要 per-thread 独立实例（SDK client 未声明线程安全）。配置解析与
+    clients._get_opensearch_client 的 HA3 分支同源。
+    """
+    from alibabacloud_ha3engine_vector.client import Client
+    from alibabacloud_ha3engine_vector.models import Config as _HA3Config
+    from opensearch_pipeline.config import get_config
+    cfg = get_config().alibaba_vector
+    if not cfg.endpoint:
+        raise RuntimeError("HA3 endpoint 未配置，无法进行对账扫描")
+    clean_endpoint = cfg.endpoint.replace("http://", "").replace("https://", "")
+    return Client(_HA3Config(
+        endpoint=clean_endpoint,
+        instance_id=cfg.instance_id,
+        access_user_name=cfg.access_user_name,
+        access_pass_word=cfg.access_pass_word,
+    ))
+
+
 def _scan_ha3_pks(cli, table_name: str, hi: int, *,
                   lo: int = 0, bucket: int = _DEFAULT_BUCKET,
-                  max_rounds: int = 3) -> Dict[str, Any]:
+                  max_rounds: int = 3, concurrency: Optional[int] = None,
+                  client_factory=None) -> Dict[str, Any]:
     """HA3 PK-range enumeration with G30 mitigation. Returns {"rows": {pk: {...}}, "truncated": [...]}.
 
     ⚠️ G30: a single zero-vector range scan is non-deterministic — it can under-return BELOW the cap
@@ -166,31 +201,72 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
     Unioning is safe: the consumer only diffs vs RDS, so more-complete enumeration removes false
     positives, never invents rows. A bucket whose single query reaches its cap is still flagged
     truncated (genuinely > cap rows → caller marks the report incomplete).
+
+    perf F#51：桶间无数据依赖 → RAG_RECONCILE_SCAN_CONCURRENCY（默认 4）线程并发扫桶，
+    每线程经 client_factory 建独立 HA3 client（factory 缺失/失败退回共享 cli——MOCK/测试
+    路径照跑）；桶内 loop-until-stable 仍严格串行，rows 按桶分片后在主线程合并（PK 范围
+    互斥，无锁）。concurrency<=1 或单桶时与旧实现逐字节等价。
     """
     from alibabacloud_ha3engine_vector.models import QueryRequest
-    from opensearch_pipeline.retriever import _DEFAULT_OUTPUT_FIELDS, _parse_ha3_response
+    from opensearch_pipeline import retriever as _retriever   # 动态取名：兼容测试 monkeypatch
 
-    rows: Dict[int, Dict[str, Any]] = {}
-    truncated: List[int] = []
     cap = bucket + 100
-    for start in range(lo, hi, bucket):
+    starts = list(range(lo, hi, bucket))
+
+    def _scan_bucket(bcli, start: int) -> Dict[str, Any]:
+        """单桶 loop-until-stable（G30 语义不变）；返回本桶 rows 分片 + truncated 标记。"""
+        brows: Dict[int, Dict[str, Any]] = {}
+        btrunc = False
         for _ in range(max(1, max_rounds)):
-            before = len(rows)
+            before = len(brows)
             req = QueryRequest(table_name=table_name, vector=[0.0] * 1024, top_k=cap,
-                               include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
+                               include_vector=False,
+                               output_fields=_retriever._DEFAULT_OUTPUT_FIELDS,
                                filter=f"id>={start} AND id<{start + bucket}")
-            parsed = _parse_ha3_response(cli.query(req))
-            if len(parsed) >= cap and start not in truncated:
-                truncated.append(start)
+            parsed = _retriever._parse_ha3_response(bcli.query(req))
+            if len(parsed) >= cap:
+                btrunc = True
             for r in parsed:
                 try:
                     pk = int(r.get("id"))
                 except (TypeError, ValueError):
                     continue
-                rows[pk] = {"chunk_id": r.get("chunk_id", ""), "doc_id": r.get("doc_id", ""),
-                            "chunk_type": r.get("chunk_type", ""), "version_no": r.get("version_no")}
-            if len(rows) == before:   # round surfaced nothing new → bucket stable
+                brows[pk] = {"chunk_id": r.get("chunk_id", ""), "doc_id": r.get("doc_id", ""),
+                             "chunk_type": r.get("chunk_type", ""),
+                             "version_no": r.get("version_no")}
+            if len(brows) == before:   # round surfaced nothing new → bucket stable
                 break
+        return {"start": start, "rows": brows, "truncated": btrunc}
+
+    conc = concurrency if concurrency is not None else _scan_concurrency()
+    conc = max(1, min(int(conc), len(starts) or 1))
+
+    if conc <= 1 or len(starts) <= 1:
+        shards = [_scan_bucket(cli, s) for s in starts]
+    else:
+        # 每线程独立 client（thread-local 懒建）；factory 缺失或建失败 → 退回共享 cli。
+        _tls = threading.local()
+
+        def _thread_cli():
+            c = getattr(_tls, "cli", None)
+            if c is None:
+                try:
+                    c = client_factory() if client_factory is not None else cli
+                except Exception:  # noqa: BLE001 — fail-open：建 client 失败退回共享实例
+                    c = cli
+                _tls.cli = c
+            return c
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=conc) as pool:
+            shards = list(pool.map(lambda s: _scan_bucket(_thread_cli(), s), starts))
+
+    rows: Dict[int, Dict[str, Any]] = {}
+    truncated: List[int] = []
+    for sh in shards:                    # 主线程合并：桶 PK 范围互斥，顺序=桶序（确定性）
+        rows.update(sh["rows"])
+        if sh["truncated"]:
+            truncated.append(sh["start"])
     return {"rows": rows, "truncated": truncated}
 
 
@@ -225,7 +301,9 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
         scan_hi = hi if hi is not None else (
             (max((int(r["id"]) for r in rds_rows), default=0)) + _HI_HEADROOM)
         cli = _get_ha3_client()
-        scan = _scan_ha3_pks(cli, cfg.alibaba_vector.table_name, scan_hi, bucket=bucket)
+        # perf F#51：并发扫桶时每线程经 _new_ha3_client 建独立 client（默认并发 4，只读）。
+        scan = _scan_ha3_pks(cli, cfg.alibaba_vector.table_name, scan_hi, bucket=bucket,
+                             client_factory=_new_ha3_client)
 
         report = compute_parity(rds_rows, scan["rows"])
         report["complete"] = not scan["truncated"]
@@ -355,9 +433,24 @@ def run_oss_parity_check(*, alert: bool = False,
         bucket = _oss_bucket()
         present = _list_oss_keys(bucket, prefix)
 
+        # perf F#58：差集候选异常放大（>50，如整目录被搬走/前缀漂移）时不再逐 key 串行 HEAD——
+        # 与 F#57 同型 list-then-diff：对候选的目录前缀（≥2 个候选共享才值回票价）各做一次分页
+        # LIST 建 set，命中即存在；仅剩余零散候选逐个 HEAD 确认。常态（候选个位数）零行为变化。
+        candidates = set(referenced) - present
+        listed_extra: set = set()
+        if len(candidates) > _HEAD_FANOUT_THRESHOLD:
+            dir_counts = Counter(k.rsplit("/", 1)[0] + "/" for k in candidates if "/" in k)
+            for p in sorted(d for d, n in dir_counts.items() if n >= 2):
+                try:
+                    listed_extra |= _list_oss_keys(bucket, p)
+                except Exception:  # noqa: BLE001 — LIST 失败 → 该前缀退回逐 key HEAD（fail-open）
+                    logger.warning("reconcile(oss): candidate-prefix LIST failed for %s (fallback to HEAD)", p)
+
         # HEAD-verify candidates so a referenced key under a different prefix (e.g. raw/*) is not a
         # false 'missing'; only objects that truly don't exist count. object_exists is read-only.
         def _exists(k):
+            if k in listed_extra:
+                return True
             try:
                 return bool(bucket.object_exists(k))
             except Exception:  # noqa: BLE001 — treat HEAD error conservatively as "exists" (no false alarm)
@@ -416,7 +509,12 @@ def compute_raw_parity(rows: List[Dict[str, Any]], exists_fn) -> Dict[str, Any]:
 
 def run_raw_parity_check(*, alert: bool = False) -> Dict[str, Any]:
     """CS4b: current-version active docs whose raw_key OSS object is missing. Read-only, simulate-safe,
-    fail-open. HEAD-checks each raw_key (bounded to active docs)."""
+    fail-open.
+
+    perf F#57（list-then-diff，与 CS4 的 _list_oss_keys 模式对齐）：先按 raw/ 前缀分页 LIST 一次
+    拉全 key 集合——差集为空即完成（原实现对每篇 active 文档发一次 OSS HEAD，O(文档数×RTT)）；
+    仅对差集候选（含前缀外 raw_key，通常个位数）逐个 HEAD 确认，防误报（与 CS4 verify_fn 同语义）。
+    LIST 失败时整体退回逐 key HEAD（现状行为，fail-open）。"""
     from opensearch_pipeline.config import get_config
     cfg = get_config()
     if cfg.simulate or cfg.simulate_db:
@@ -436,7 +534,15 @@ def run_raw_parity_check(*, alert: bool = False) -> Dict[str, Any]:
             conn.close()
         bucket = _oss_bucket()
 
+        try:
+            listed = _list_oss_keys(bucket, _OSS_RAW_PREFIX)
+        except Exception:  # noqa: BLE001 — LIST 失败 → 退回逐 key HEAD（现状行为）
+            logger.warning("reconcile(raw): raw/ prefix LIST failed, falling back to per-key HEAD")
+            listed = set()
+
         def _exists(k):
+            if k in listed:
+                return True     # LIST 集合命中即存在（覆盖绝大多数 raw_key，零 HEAD）
             try:
                 return bool(bucket.object_exists(k))
             except Exception:  # noqa: BLE001 — conservative: HEAD error → treat as exists (no false alarm)

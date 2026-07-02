@@ -368,6 +368,7 @@ def _has_images(para_element) -> bool:
 
 def extract_docx_with_images(
     local_path: str,
+    document=None,
 ) -> Tuple[List[ExtractedBlock], List["ImageAsset"], List[str]]:
     """
     带图片位置追踪的 DOCX 提取（方案 B — heuristic）。
@@ -384,6 +385,12 @@ def extract_docx_with_images(
 
     Args:
         local_path: DOCX 文件的本地路径。
+        document: 可选，调用方已解析好的 python-docx Document（perf#63 复用：
+            _extract_docx 只做一次 docx.Document 全量解析，注入给本函数与
+            extract_images_from_docx 共用）；None = 自行加载（独立调用兼容，
+            行为同旧版）。
+            ⚠️ 返回值是固定 3-tuple 契约（5 处调用方按 3-tuple 解包），
+            勿为回传 document 改变返回 arity——复用一律走本注入参数。
 
     Returns:
         (blocks, image_assets_in_order)
@@ -400,13 +407,14 @@ def extract_docx_with_images(
     except ImportError:
         return [], [], ["python-docx not installed, cannot extract DOCX"]
 
-    try:
-        document = docx.Document(local_path)
-    except Exception as e:
-        # 损坏 / 加密 / 截断下载的 DOCX：之前静默 return [], [] → 上游 warnings=[]，
-        # 0 chunk 却以 DONE(成功) 收尾，坏文档无任何信号。回传 warning 让其可被
-        # node_write_chunk_meta 的"疑似失败"判定捕获（DOCX 无 OCR 兜底，必须显式留痕）。
-        return [], [], [f"Failed to open DOCX: {e}"]
+    if document is None:
+        try:
+            document = docx.Document(local_path)
+        except Exception as e:
+            # 损坏 / 加密 / 截断下载的 DOCX：之前静默 return [], [] → 上游 warnings=[]，
+            # 0 chunk 却以 DONE(成功) 收尾，坏文档无任何信号。回传 warning 让其可被
+            # node_write_chunk_meta 的"疑似失败"判定捕获（DOCX 无 OCR 兜底，必须显式留痕）。
+            return [], [], [f"Failed to open DOCX: {e}"]
 
     blocks: List[ExtractedBlock] = []
     image_assets: List[ImageAsset] = []

@@ -534,6 +534,12 @@ async function uploadSingle(file: File) {
   } catch (e: any) { uploadErr.value = uploadErrText(e); uploadMsg.value = '' } finally { uploadBusy.value = false }
 }
 
+// 批量上传并发度（E#35）。跨文件小并发池：每文件内部 upload-url → OSS PUT → register 三步顺序不变，
+// 文件之间并发。register 侧已按 raw_key 幂等 + 行锁防撞号（批量恒为 action=new、各文件独立 doc_id/
+// raw_key），无跨文件顺序依赖。取 2 而非 3：upload-url/register 都计入后端 aux 限流（默认 30/分，
+// 每文件吃 2 次），并发越高小文件批越易撞 429——撞上也只影响该行（失败隔离），但保守起见压低突发。
+const BATCH_CONCURRENCY = 2
+
 async function uploadBatch(files: File[]) {
   uploadErr.value = ''; uploadOk.value = false; contentDupMsg.value = ''; uploadMsg.value = ''
   trackSeq++
@@ -541,9 +547,10 @@ async function uploadBatch(files: File[]) {
   uploadQueue.value = rows
   uploadBusy.value = true
   let okN = 0, badN = 0
-  for (let i = 0; i < files.length; i++) {
+  // 单文件全流程（三步顺序不变）；异常只落到本行——与原串行版一致的失败隔离，其余文件照常。
+  const uploadOne = async (i: number) => {
     const f = files[i], row = rows[i]
-    if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; continue }
+    if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; return }
     try {
       row.status = '上传中'
       const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify({ action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: newPerm.value }) })
@@ -555,6 +562,10 @@ async function uploadBatch(files: File[]) {
       okN++
     } catch (e: any) { row.status = '失败'; row.msg = uploadErrText(e); badN++ }
   }
+  // 小并发池：worker 共享游标领任务，按队列顺序开工（uploadOne 自吞异常，Promise.all 不会中途 reject）。
+  let cursor = 0
+  const worker = async () => { for (;;) { const i = cursor++; if (i >= files.length) return; await uploadOne(i) } }
+  await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, files.length) }, () => worker()))
   uploadBusy.value = false
   uploadMsg.value = `${okN} 成功${badN ? `，${badN} 失败/跳过` : ''}`
   void loadDocs(); void loadApprovals()

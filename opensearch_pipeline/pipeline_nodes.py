@@ -583,7 +583,9 @@ def node_build_canonical(ctx: dict):
         simulate_db = _resolve_simulate(ctx, "db")
         bucket, is_simulated_oss = _get_oss_bucket(ctx)
 
-        json_data = json.dumps(canonical, indent=2, ensure_ascii=False)
+        # G#67：canonical JSON 用紧凑分隔符序列化（stage-2 会整包下载解析，indent=2 的缩进空白
+        # 会把块级 OCR/VLM 文本体积放大两到四成；人读用旁边的 .md）。ensure_ascii=False 保留。
+        json_data = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
         md_data = canonical.get("text", "")
 
         canonical_key = canonical["canonical_key"]
@@ -1298,18 +1300,57 @@ def node_classify_and_risk_assess(ctx: dict):
             try:
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
+                    # E#37 认领预占批量化：一批 100 行 = 100 次 UPDATE 往返 → 先发一条
+                    # (doc_id,version_no) 元组 IN 的集合式 UPDATE。pymysql 默认 rowcount=changed
+                    # rows，认领状态迁移必然改行，故 rowcount==键数 ⟺ 全部认领成功（常态路径，
+                    # 1 条语句）。部分认领时集合式 UPDATE 无法区分哪些键被改（回读 PROCESSING 会把
+                    # 他方在处理的行误纳入），回滚后退回逐行认领兜底——认领语义（只认领期望状态的
+                    # 行）与旧实现完全等价。
+                    _claim_keys = []
+                    _seen_keys = set()
                     for doc in canonicals:
-                        cursor.execute("""
+                        _k = (doc["doc_id"], doc["version_no"])
+                        if _k not in _seen_keys:
+                            _seen_keys.add(_k)
+                            _claim_keys.append(_k)
+                    _all_claimed = False
+                    if _claim_keys:
+                        _dv_clause = " OR ".join(
+                            ["(doc_id = %s AND version_no = %s)"] * len(_claim_keys))
+                        _dv_params = tuple(p for k in _claim_keys for p in k)
+                        cursor.execute(f"""
                             UPDATE document_version
                             SET content_process_status = 'PROCESSING'
-                            WHERE doc_id = %s AND version_no = %s
+                            WHERE ({_dv_clause})
                               AND content_process_status IN ('NOT_STARTED', 'LOADING', 'FAILED')
-                        """, (doc["doc_id"], doc["version_no"]))
-                        if cursor.rowcount > 0:
+                        """, _dv_params)
+                        _all_claimed = cursor.rowcount == len(_claim_keys)
+                    if _all_claimed:
+                        _dedup_seen = set()
+                        for doc in canonicals:
+                            _k = (doc["doc_id"], doc["version_no"])
+                            if _k in _dedup_seen:
+                                print(f"    └─ Task {doc['doc_id']} v{doc['version_no']} skipped (preempted or already processing content)")
+                                continue
+                            _dedup_seen.add(_k)
                             valid_canonicals.append(doc)
-                        else:
-                            print(f"    └─ Task {doc['doc_id']} v{doc['version_no']} skipped (preempted or already processing content)")
-                    conn.commit()
+                        conn.commit()
+                    else:
+                        # 兜底：回滚集合式认领后按旧语义逐行认领（rowcount>0 = 本次真的改到了行）
+                        if _claim_keys:
+                            conn.rollback()
+                        for doc in canonicals:
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET content_process_status = 'PROCESSING'
+                                WHERE doc_id = %s AND version_no = %s
+                                  AND content_process_status IN ('NOT_STARTED', 'LOADING', 'FAILED')
+                            """, (doc["doc_id"], doc["version_no"]))
+                            if cursor.rowcount > 0:
+                                valid_canonicals.append(doc)
+                            else:
+                                print(f"    └─ Task {doc['doc_id']} v{doc['version_no']} skipped (preempted or already processing content)")
+                        conn.commit()
                 break  # 预占成功，退出重试循环
             except Exception as e:
                 if conn:
@@ -1770,10 +1811,13 @@ def node_detect_sensitive(ctx: dict):
                         "DELETE FROM document_sensitive_finding WHERE doc_id = %s AND version_no = %s",
                         (doc["doc_id"], doc["version_no"])
                     )
+                    # E#42：命中逐条 INSERT → 组装参数列表后 executemany 一次插入
+                    # （pymysql 会改写为单条多值 INSERT，N 条命中的往返 N→1）。
+                    finding_rows = []
                     for hit in hits:
                         kw = hit.get("keyword", "")
                         kw_hash = hashlib.sha256(kw.encode('utf-8')).hexdigest()
-                        
+
                         if hit.get("type") == "IMAGE_SENSITIVE":
                             finding_type = "IMAGE_SENSITIVE_AUDIT"
                             preview = kw
@@ -1784,10 +1828,16 @@ def node_detect_sensitive(ctx: dict):
                                 preview = "*" * len(kw)
                             else:
                                 preview = kw[:2] + "*" * (len(kw) - 4) + kw[-2:]
-                            
+
                         action = "QUARANTINED" if final_risk == "high" else "REDACTED"
-                        
-                        cursor.execute("""
+
+                        finding_rows.append((
+                            doc["doc_id"], doc["version_no"], finding_type,
+                            hit.get("severity", "high"), hit.get("page_num"), hit.get("block_index"),
+                            kw_hash, preview, action
+                        ))
+                    if finding_rows:
+                        cursor.executemany("""
                             INSERT INTO document_sensitive_finding (
                                 doc_id, version_no, finding_type, severity, page_num, block_index,
                                 matched_text_hash, matched_text_preview, action
@@ -1795,11 +1845,7 @@ def node_detect_sensitive(ctx: dict):
                                 %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s
                             )
-                        """, (
-                            doc["doc_id"], doc["version_no"], finding_type,
-                            hit.get("severity", "high"), hit.get("page_num"), hit.get("block_index"),
-                            kw_hash, preview, action
-                        ))
+                        """, finding_rows)
                 conn.commit()
             except Exception as e:
                 if conn: conn.rollback()
@@ -4351,109 +4397,23 @@ def node_publish_to_rag_ready(ctx: dict):
     simulate_db = _resolve_simulate(ctx, "db")
     bucket, is_simulated_oss = _get_oss_bucket(ctx)
 
-    for doc in canonicals:
-        if doc.get("redaction_action") == "QUARANTINE":
-            print(f"    └─ {doc['doc_id']}: skipped (quarantined)")
-            continue
+    # F#49：① 整个发布循环持有一条池化连接（此前每文档独立取连接/commit/close），每文档
+    # UPDATE+commit 语义不变；② OSS 上传可经 RAG_PUBLISH_CONCURRENCY 并行（默认 1 = 现状
+    # 串行）。DB 写与状态回写全部留在主线程。
+    _pub_conn_box = {"conn": None}
 
-        permission = doc.get("permission_level", "public")
-        dept = doc.get("owner_dept", "unknown")
-        cat_l1 = doc.get("category_l1", "reference")
-        doc_id = doc["doc_id"]
-        version = doc["version_no"]
+    def _publish_conn():
+        """惰性获取共享池化连接（全批隔离/空文本时不开连接）。"""
+        if _pub_conn_box["conn"] is None:
+            _pub_conn_box["conn"] = _get_db_conn(select_db=True)
+        return _pub_conn_box["conn"]
 
-        rag_ready_key = (
-            f"rag-ready/{permission}/{dept}/{cat_l1}/"
-            f"{doc_id}/v{version}/content.md"
-        )
-        metadata_key = (
-            f"rag-ready/{permission}/{dept}/{cat_l1}/"
-            f"{doc_id}/v{version}/metadata.json"
-        )
-
-        doc["rag_ready_key"] = rag_ready_key
-        doc["rag_ready_metadata_key"] = metadata_key
-        doc["publish_status"] = "PUBLISHED"
-
-        redacted_key = None
-        if doc.get("redaction_action") == "REDACTED":
-            redacted_key = rag_ready_key
-        doc["redacted_key"] = redacted_key
-
-        # ─── Physical Persistence of Published Documents (JSON & MD) ───
-        md_data = doc.get("redacted_text")
-        if md_data is None:
-            md_data = doc.get("text", "")
-
-        # ─── 空内容守卫（RD 61D861 修复）───
-        # 抽取层失败或文档本身无文本时，md_data 可能为空字符串。
-        # 之前会把 0 字节 content.md 推到 OSS 并把 publish_status 标成 PUBLISHED，
-        # 导致下游以为已发布、但 chunk 阶段无内容可用。
-        # 改为：跳过 OSS put_object，publish_status='SKIPPED_EMPTY'，
-        # 在 content_process_error 留痕，graceful degrade（不 raise）。
-        # 注意：publish_status 是 VARCHAR(32)，新增枚举值无需 schema 迁移；
-        #      未来若改 ENUM 需把 'SKIPPED_EMPTY' 加入定义。
-        if md_data is None or len(md_data.strip()) == 0:
-            doc["publish_status"] = "SKIPPED_EMPTY"
-            doc["rag_ready_key"] = None
-            doc["rag_ready_metadata_key"] = None
-            doc["redacted_key"] = None
-            print(
-                f"    └─ {doc_id} v{version}: skipped publish (empty text after extraction)"
-            )
-            if not simulate_db:
-                conn = None
-                try:
-                    conn = _get_db_conn(select_db=True)
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET publish_status = 'SKIPPED_EMPTY',
-                                rag_ready_key = NULL,
-                                redacted_key = NULL,
-                                content_process_error = %s
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (
-                            "Empty text after extraction",
-                            doc_id,
-                            version,
-                        ))
-                    conn.commit()
-                    print(
-                        f"    ├─ Marked RDS publish_status='SKIPPED_EMPTY' for {doc_id} v{version}"
-                    )
-                except Exception as e:
-                    if conn:
-                        conn.rollback()
-                    # graceful degrade：不要因状态写失败而打断整批发布。
-                    print(
-                        f"    ⚠️ Failed to mark SKIPPED_EMPTY in RDS for {doc_id} v{version}: {e}"
-                    )
-                finally:
-                    if conn:
-                        conn.close()
-            continue
-
-        metadata_payload = {
-            "doc_id": doc_id,
-            "version_no": version,
-            "permission_level": permission,
-            "owner_dept": dept,
-            "category_l1": cat_l1,
-            "category_l2": doc.get("category_l2"),
-            "rag_ready_key": rag_ready_key,
-            "metadata_key": metadata_key,
-            "published_at": datetime.now().isoformat(),
-            "redaction_action": doc.get("redaction_action", "CLEAN"),
-            "redaction_count": doc.get("redaction_count", 0),
-            "risk_level": doc.get("risk_level", "low"),
-            "title": doc.get("title", ""),
-            "text_length": len(md_data),
-            "block_count": len(doc.get("blocks", []))
-        }
-        json_data = json.dumps(metadata_payload, indent=2, ensure_ascii=False)
-
-        # 1. Write files physically
+    def _upload_published_files(job):
+        """单文档的 2 次 OSS put（或模拟文件写）。只做上传，不碰 DB —— 可安全并行。"""
+        rag_ready_key = job["rag_ready_key"]
+        metadata_key = job["metadata_key"]
+        md_data = job["md_data"]
+        json_data = job["json_data"]
         if is_simulated_oss:
             try:
                 os.makedirs(os.path.dirname(rag_ready_key), exist_ok=True)
@@ -4479,11 +4439,12 @@ def node_publish_to_rag_ready(ctx: dict):
                 print(f"    ⚠️ Failed to upload published files to OSS: {e}")
                 raise RuntimeError(f"OSS upload failed for published document: {e}") from e
 
-        # 2. Update RDS metadata
+    def _persist_publish_status(job):
+        """上传成功后的 RDS 回写 + published 记账（主线程，逐文档 commit 语义不变）。"""
         if not simulate_db:
             conn = None
             try:
-                conn = _get_db_conn(select_db=True)
+                conn = _publish_conn()
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         UPDATE document_version
@@ -4493,26 +4454,162 @@ def node_publish_to_rag_ready(ctx: dict):
                             published_at = NOW()
                         WHERE doc_id = %s AND version_no = %s
                     """, (
-                        rag_ready_key,
-                        redacted_key,
-                        doc_id,
-                        version
+                        job["rag_ready_key"],
+                        job["redacted_key"],
+                        job["doc_id"],
+                        job["version"],
                     ))
                 conn.commit()
-                print(f"    ├─ Saved publish status to RDS for {doc_id} v{version}")
+                print(f"    ├─ Saved publish status to RDS for {job['doc_id']} v{job['version']}")
             except Exception as e:
                 if conn: conn.rollback()
                 print(f"    ⚠️ Failed to save publish status to RDS: {e}")
                 raise RuntimeError(f"Database write failure in node_publish_to_rag_ready: {e}") from e
-            finally:
-                if conn:
-                    conn.close()
 
-        published.append(doc_id)
+        published.append(job["doc_id"])
         print(
-            f"    └─ {doc_id}: published to rag-ready/"
-            f"{permission}/{dept}/{cat_l1}/ (v{version})"
+            f"    └─ {job['doc_id']}: published to rag-ready/"
+            f"{job['permission']}/{job['dept']}/{job['cat_l1']}/ (v{job['version']})"
         )
+
+    try:
+        upload_jobs = []
+        for doc in canonicals:
+            if doc.get("redaction_action") == "QUARANTINE":
+                print(f"    └─ {doc['doc_id']}: skipped (quarantined)")
+                continue
+
+            permission = doc.get("permission_level", "public")
+            dept = doc.get("owner_dept", "unknown")
+            cat_l1 = doc.get("category_l1", "reference")
+            doc_id = doc["doc_id"]
+            version = doc["version_no"]
+
+            rag_ready_key = (
+                f"rag-ready/{permission}/{dept}/{cat_l1}/"
+                f"{doc_id}/v{version}/content.md"
+            )
+            metadata_key = (
+                f"rag-ready/{permission}/{dept}/{cat_l1}/"
+                f"{doc_id}/v{version}/metadata.json"
+            )
+
+            doc["rag_ready_key"] = rag_ready_key
+            doc["rag_ready_metadata_key"] = metadata_key
+            doc["publish_status"] = "PUBLISHED"
+
+            redacted_key = None
+            if doc.get("redaction_action") == "REDACTED":
+                redacted_key = rag_ready_key
+            doc["redacted_key"] = redacted_key
+
+            # ─── Physical Persistence of Published Documents (JSON & MD) ───
+            md_data = doc.get("redacted_text")
+            if md_data is None:
+                md_data = doc.get("text", "")
+
+            # ─── 空内容守卫（RD 61D861 修复）───
+            # 抽取层失败或文档本身无文本时，md_data 可能为空字符串。
+            # 之前会把 0 字节 content.md 推到 OSS 并把 publish_status 标成 PUBLISHED，
+            # 导致下游以为已发布、但 chunk 阶段无内容可用。
+            # 改为：跳过 OSS put_object，publish_status='SKIPPED_EMPTY'，
+            # 在 content_process_error 留痕，graceful degrade（不 raise）。
+            # 注意：publish_status 是 VARCHAR(32)，新增枚举值无需 schema 迁移；
+            #      未来若改 ENUM 需把 'SKIPPED_EMPTY' 加入定义。
+            if md_data is None or len(md_data.strip()) == 0:
+                doc["publish_status"] = "SKIPPED_EMPTY"
+                doc["rag_ready_key"] = None
+                doc["rag_ready_metadata_key"] = None
+                doc["redacted_key"] = None
+                print(
+                    f"    └─ {doc_id} v{version}: skipped publish (empty text after extraction)"
+                )
+                if not simulate_db:
+                    conn = None
+                    try:
+                        conn = _publish_conn()
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET publish_status = 'SKIPPED_EMPTY',
+                                    rag_ready_key = NULL,
+                                    redacted_key = NULL,
+                                    content_process_error = %s
+                                WHERE doc_id = %s AND version_no = %s
+                            """, (
+                                "Empty text after extraction",
+                                doc_id,
+                                version,
+                            ))
+                        conn.commit()
+                        print(
+                            f"    ├─ Marked RDS publish_status='SKIPPED_EMPTY' for {doc_id} v{version}"
+                        )
+                    except Exception as e:
+                        if conn:
+                            conn.rollback()
+                        # graceful degrade：不要因状态写失败而打断整批发布。
+                        print(
+                            f"    ⚠️ Failed to mark SKIPPED_EMPTY in RDS for {doc_id} v{version}: {e}"
+                        )
+                continue
+
+            metadata_payload = {
+                "doc_id": doc_id,
+                "version_no": version,
+                "permission_level": permission,
+                "owner_dept": dept,
+                "category_l1": cat_l1,
+                "category_l2": doc.get("category_l2"),
+                "rag_ready_key": rag_ready_key,
+                "metadata_key": metadata_key,
+                "published_at": datetime.now().isoformat(),
+                "redaction_action": doc.get("redaction_action", "CLEAN"),
+                "redaction_count": doc.get("redaction_count", 0),
+                "risk_level": doc.get("risk_level", "low"),
+                "title": doc.get("title", ""),
+                "text_length": len(md_data),
+                "block_count": len(doc.get("blocks", []))
+            }
+            json_data = json.dumps(metadata_payload, indent=2, ensure_ascii=False)
+
+            upload_jobs.append({
+                "doc_id": doc_id,
+                "version": version,
+                "permission": permission,
+                "dept": dept,
+                "cat_l1": cat_l1,
+                "rag_ready_key": rag_ready_key,
+                "metadata_key": metadata_key,
+                "redacted_key": redacted_key,
+                "md_data": md_data,
+                "json_data": json_data,
+            })
+
+        # 上传 + 逐文档回写：默认串行（=现状）；RAG_PUBLISH_CONCURRENCY>1 时并行上传，
+        # 回写按提交顺序在主线程等待各自 future（任一上传失败 → 原样抛 RuntimeError 中止节点）。
+        try:
+            _publish_conc = int(os.environ.get("RAG_PUBLISH_CONCURRENCY", "1"))
+        except ValueError:
+            _publish_conc = 1
+        if _publish_conc > 1 and len(upload_jobs) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(
+                    max_workers=min(_publish_conc, len(upload_jobs))) as _pool:
+                _futs = [_pool.submit(_upload_published_files, job) for job in upload_jobs]
+                for job, _fut in zip(upload_jobs, _futs):
+                    _fut.result()
+                    _persist_publish_status(job)
+        else:
+            for job in upload_jobs:
+                _upload_published_files(job)
+                _persist_publish_status(job)
+    finally:
+        if _pub_conn_box["conn"] is not None:
+            try:
+                _pub_conn_box["conn"].close()
+            except Exception:
+                pass
 
     ctx["published_count"] = len(published)
 
@@ -4722,7 +4819,17 @@ def node_write_chunk_meta(ctx: dict):
                     ))
 
                 if insert_rows:
-                    cursor.executemany(insert_sql, insert_rows)
+                    # E#43：单次 executemany 携带全批 27 列行（含完整 chunk_text，单行可数 KB）会被
+                    # pymysql 改写成一条巨型多行 INSERT，可能撑爆 max_allowed_packet。改为**同一事务内**
+                    # 每 RAG_CHUNK_META_INSERT_BATCH（默认 500）行一次 executemany；commit 位置不变，
+                    # 任一批失败整体 rollback，原子性不变。
+                    try:
+                        _ins_batch = int(os.environ.get("RAG_CHUNK_META_INSERT_BATCH", "500"))
+                    except ValueError:
+                        _ins_batch = 500
+                    _ins_batch = max(1, _ins_batch)
+                    for _i in range(0, len(insert_rows), _ins_batch):
+                        cursor.executemany(insert_sql, insert_rows[_i:_i + _ins_batch])
                     written = len(insert_rows)
                 conn.commit()
             print(f"    └─ Saved {written} chunk records to RDS chunk_meta (batch insert)")
@@ -4928,45 +5035,68 @@ def node_acquire_index_lock(ctx: dict):
         try:
             conn = _get_db_conn(select_db=True)
             with conn.cursor() as cursor:
-                for doc_id, ver in doc_versions:
-                    cursor.execute("""
+                # E#46 主认领批量化：先发一条 (doc_id,version_no) 元组 IN 的集合式 UPDATE。
+                # pymysql 默认 rowcount=changed rows，NOT_INDEXED/FAILED→PROCESSING 必然改行，
+                # 故 rowcount==键数 ⟺ 全部主认领成功（常态首推路径，1 条语句）。部分认领时
+                # 集合式 UPDATE 无法区分哪些键被改（回读 PROCESSING 会把他方在跑的锁误判为
+                # 己方），回滚后退回逐键三步兜底（主认领 / SUCCESS-relock / stale-takeover），
+                # changed-rows 语义与 updated_at=NOW() 刷新与旧实现完全等价。
+                _all_claimed = False
+                if doc_versions:
+                    _dv_clause = " OR ".join(
+                        ["(doc_id = %s AND version_no = %s)"] * len(doc_versions))
+                    _dv_params = tuple(p for dv in doc_versions for p in dv)
+                    cursor.execute(f"""
                         UPDATE document_version
                         SET index_status = 'PROCESSING'
-                        WHERE doc_id = %s AND version_no = %s
+                        WHERE ({_dv_clause})
                           AND index_status IN ('NOT_INDEXED', 'FAILED')
-                    """, (doc_id, ver))
-                    # ── 修复：如果文档已被标记 SUCCESS（前一批次处理了部分 chunk），
-                    # 仍然需要允许重新进入以处理残留的 NOT_INDEXED chunk。
-                    if cursor.rowcount == 0:
-                        # 尝试从 SUCCESS 状态重新锁定
+                    """, _dv_params)
+                    _all_claimed = cursor.rowcount == len(doc_versions)
+                if _all_claimed:
+                    valid_doc_versions.update(doc_versions)
+                else:
+                    if doc_versions:
+                        conn.rollback()
+                    for doc_id, ver in doc_versions:
                         cursor.execute("""
                             UPDATE document_version
                             SET index_status = 'PROCESSING'
                             WHERE doc_id = %s AND version_no = %s
-                              AND index_status = 'SUCCESS'
+                              AND index_status IN ('NOT_INDEXED', 'FAILED')
                         """, (doc_id, ver))
-                    # ── 接管失效锁：仍处于 PROCESSING 且 >2h 未更新，说明持锁的运行已崩溃。
-                    # 没有这一支，崩溃残留的 PROCESSING 文档永远无法被重新入队（loader 会反复
-                    # 加载其 chunk 再被过滤掉，整批永远排不空）。2h 阈值与 orchestrator 的
-                    # loader / _count_pending_rows 保持一致。
-                    # SET 里的 updated_at = NOW() 不能省略：index_status 是同值更新
-                    # （PROCESSING→PROCESSING），MySQL 对未发生变化的行 changed-rows=0，
-                    # 连接池未开 CLIENT_FOUND_ROWS 时 rowcount 报告的正是 changed-rows，
-                    # 且 ON UPDATE CURRENT_TIMESTAMP 也不会触发。显式刷新 updated_at
-                    # 才会真正改变行（rowcount=1），同时重置失效时钟，保证并发运行中
-                    # 只有第一个能接管。
-                    if cursor.rowcount == 0:
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET index_status = 'PROCESSING', updated_at = NOW()
-                            WHERE doc_id = %s AND version_no = %s
-                              AND index_status = 'PROCESSING'
-                              AND updated_at < NOW() - INTERVAL 2 HOUR
-                        """, (doc_id, ver))
-                    if cursor.rowcount > 0:
-                        valid_doc_versions.add((doc_id, ver))
-                    else:
-                        print(f"    └─ Task {doc_id} v{ver} skipped (preempted or already indexing)")
+                        # ── 修复：如果文档已被标记 SUCCESS（前一批次处理了部分 chunk），
+                        # 仍然需要允许重新进入以处理残留的 NOT_INDEXED chunk。
+                        if cursor.rowcount == 0:
+                            # 尝试从 SUCCESS 状态重新锁定
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET index_status = 'PROCESSING'
+                                WHERE doc_id = %s AND version_no = %s
+                                  AND index_status = 'SUCCESS'
+                            """, (doc_id, ver))
+                        # ── 接管失效锁：仍处于 PROCESSING 且 >2h 未更新，说明持锁的运行已崩溃。
+                        # 没有这一支，崩溃残留的 PROCESSING 文档永远无法被重新入队（loader 会反复
+                        # 加载其 chunk 再被过滤掉，整批永远排不空）。2h 阈值与 orchestrator 的
+                        # loader / _count_pending_rows 保持一致。
+                        # SET 里的 updated_at = NOW() 不能省略：index_status 是同值更新
+                        # （PROCESSING→PROCESSING），MySQL 对未发生变化的行 changed-rows=0，
+                        # 连接池未开 CLIENT_FOUND_ROWS 时 rowcount 报告的正是 changed-rows，
+                        # 且 ON UPDATE CURRENT_TIMESTAMP 也不会触发。显式刷新 updated_at
+                        # 才会真正改变行（rowcount=1），同时重置失效时钟，保证并发运行中
+                        # 只有第一个能接管。
+                        if cursor.rowcount == 0:
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET index_status = 'PROCESSING', updated_at = NOW()
+                                WHERE doc_id = %s AND version_no = %s
+                                  AND index_status = 'PROCESSING'
+                                  AND updated_at < NOW() - INTERVAL 2 HOUR
+                            """, (doc_id, ver))
+                        if cursor.rowcount > 0:
+                            valid_doc_versions.add((doc_id, ver))
+                        else:
+                            print(f"    └─ Task {doc_id} v{ver} skipped (preempted or already indexing)")
                 conn.commit()
             # 仅保留成功抢占锁的版本的 chunks
             chunks = [c for c in chunks if (c.doc_id, c.version_no) in valid_doc_versions]
@@ -4994,6 +5124,47 @@ def node_acquire_index_lock(ctx: dict):
         print(f"    └─ Successfully acquired index lock for {len(valid_doc_versions)} document versions, {len(chunks)} chunks remaining.")
 
 
+def _ha3_push_delete_request(client, config, chunk_ids: list) -> None:
+    """向 HA3 下发一次 cmd:delete pushDocuments 请求（含幂等成功判定）。
+
+    _search_delete_old_chunks（逐 doc）与 node_deactivate_old_chunks 的跨 doc 合并批
+    （E#45）共用，防两份幂等判定漂移。幂等：not_found/no_op 视为成功。失败抛异常。
+    """
+    from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
+    cfg = config.alibaba_vector
+    ha3_deletes = [{"cmd": "delete", "fields": {cfg.pk_field: cid}} for cid in chunk_ids]
+    request = PushDocumentsRequest(body=ha3_deletes)
+
+    resp = client.push_documents(cfg.table_name, cfg.pk_field, request)
+    status_code = getattr(resp, 'status_code', 200)
+    body_msg = str(getattr(resp, 'body', ''))
+    text_msg = str(getattr(resp, 'text', ''))
+    combined_msg = (body_msg + " | " + text_msg).lower()
+
+    is_success = (200 <= status_code < 300)
+    if not is_success:
+        try:
+            if hasattr(resp, "json") and callable(resp.json):
+                resp_json = resp.json()
+                err_code = resp_json.get("code") or resp_json.get("errors", [{}])[0].get("code")
+                err_msg = str(resp_json).lower()
+                if err_code in ["DocumentNotFound", "IndexNotFound", 7504, 7500] or any(ind in err_msg for ind in ["not_found", "not found", "no_op", "no-op"]):
+                    print(f"    ├─ [HA3 Engine] Idempotent success detected in parsed JSON error: {err_msg}")
+                    is_success = True
+        except Exception:
+            pass
+
+        # Fallback to text check if JSON didn't catch it
+        if not is_success:
+            idempotent_indicators = ["not_found", "not found", "no_op", "no-op"]
+            if any(ind in combined_msg for ind in idempotent_indicators):
+                print(f"    ├─ [HA3 Engine] Idempotent success detected in response body: {combined_msg}")
+                is_success = True
+
+    if not is_success:
+        raise RuntimeError(f"HA3 pushDocuments delete failed with status_code {status_code}, response: {combined_msg}")
+
+
 def _search_delete_old_chunks(client, config, index_name: str, doc_id: str, ver: int,
                               old_chunk_ids: list) -> None:
     """从搜索索引删除某文档 version_no < ver 的旧 chunk（node_deactivate_old_chunks 与
@@ -5018,40 +5189,9 @@ def _search_delete_old_chunks(client, config, index_name: str, doc_id: str, ver:
         if not old_chunk_ids:
             print(f"    ├─ [HA3 Engine] No older chunks found in RDS to deactivate for '{doc_id}'")
             return
-        from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
         cfg = config.alibaba_vector
-        ha3_deletes = [{"cmd": "delete", "fields": {cfg.pk_field: cid}} for cid in old_chunk_ids]
-        request = PushDocumentsRequest(body=ha3_deletes)
-
-        resp = client.push_documents(cfg.table_name, cfg.pk_field, request)
-        status_code = getattr(resp, 'status_code', 200)
-        body_msg = str(getattr(resp, 'body', ''))
-        text_msg = str(getattr(resp, 'text', ''))
-        combined_msg = (body_msg + " | " + text_msg).lower()
-
-        is_success = (200 <= status_code < 300)
-        if not is_success:
-            try:
-                if hasattr(resp, "json") and callable(resp.json):
-                    resp_json = resp.json()
-                    err_code = resp_json.get("code") or resp_json.get("errors", [{}])[0].get("code")
-                    err_msg = str(resp_json).lower()
-                    if err_code in ["DocumentNotFound", "IndexNotFound", 7504, 7500] or any(ind in err_msg for ind in ["not_found", "not found", "no_op", "no-op"]):
-                        print(f"    ├─ [HA3 Engine] Idempotent success detected in parsed JSON error: {err_msg}")
-                        is_success = True
-            except Exception:
-                pass
-
-            # Fallback to text check if JSON didn't catch it
-            if not is_success:
-                idempotent_indicators = ["not_found", "not found", "no_op", "no-op"]
-                if any(ind in combined_msg for ind in idempotent_indicators):
-                    print(f"    ├─ [HA3 Engine] Idempotent success detected in response body: {combined_msg}")
-                    is_success = True
-
-        if not is_success:
-            raise RuntimeError(f"HA3 pushDocuments delete failed with status_code {status_code}, response: {combined_msg}")
-        print(f"    ├─ [HA3 Engine] Deactivated {len(old_chunk_ids)} old chunks for '{doc_id}' in table '{cfg.table_name}': status={status_code}")
+        _ha3_push_delete_request(client, config, old_chunk_ids)
+        print(f"    ├─ [HA3 Engine] Deactivated {len(old_chunk_ids)} old chunks for '{doc_id}' in table '{cfg.table_name}'")
     else:
         # Original OpenSearch DELETE BY QUERY
         body = {
@@ -5208,13 +5348,25 @@ def node_deactivate_old_chunks(ctx: dict):
             try:
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
-                    for doc_id, ver in current_versions.items():
-                        cursor.execute(
-                            "SELECT id FROM chunk_meta WHERE doc_id = %s AND version_no < %s AND is_active = 1",
-                            (doc_id, ver)
-                        )
-                        rows = cursor.fetchall()
-                        old_chunk_ids_map[doc_id] = [r[0] for r in rows]
+                    # E#45：旧 id 逐 doc SELECT（N 次往返）→ 一条 (doc_id, version_no) 谓词
+                    # OR-链查询取回并按 doc 分组。谓词与逐 doc 版本逐字对应
+                    # （doc_id = X AND version_no < ver AND is_active = 1），id 集合完全一致。
+                    _dv_items = list(current_versions.items())
+                    _dv_clause = " OR ".join(
+                        ["(doc_id = %s AND version_no < %s)"] * len(_dv_items))
+                    _dv_params = tuple(p for dv in _dv_items for p in dv)
+                    cursor.execute(
+                        f"SELECT doc_id, id FROM chunk_meta WHERE ({_dv_clause}) AND is_active = 1",
+                        _dv_params
+                    )
+                    rows = cursor.fetchall()
+                    old_chunk_ids_map = {doc_id: [] for doc_id, _ in _dv_items}
+                    for r in rows:
+                        if len(r) < 2:
+                            # 防御：真实 SELECT 恒返回 (doc_id, id) 2 列；短行只可能来自宽松的
+                            # 测试桩。跳过 = 不删（安全方向：旧 chunk 保持 active，绝不误删）。
+                            continue
+                        old_chunk_ids_map.setdefault(r[0], []).append(r[1])
             except Exception as e:
                 print(f"    ⚠️ Failed to query old chunk ids from RDS: {e}")
                 raise RuntimeError(f"Database query failure in pre-deactivation phase: {e}")
@@ -5237,11 +5389,37 @@ def node_deactivate_old_chunks(ctx: dict):
             try:
                 client = _get_opensearch_client(ctx)
                 index_name = ctx.get("opensearch_index") or get_config().opensearch.index_name
-                for doc_id, ver in current_versions.items():
-                    _search_delete_old_chunks(
-                        client, config, index_name, doc_id, ver,
-                        old_chunk_ids_map.get(doc_id, []),
-                    )
+                if client != "MOCK_HA3_CLIENT" and hasattr(client, "push_documents"):
+                    # E#45：HA3 删除跨 doc 合并成共享批（100 条/请求）。PK 集合 = 各 doc 旧 id
+                    # 之并集（chunk_meta.id 全局唯一、doc 间不相交），与逐 doc 逐次请求的删除
+                    # 集合完全一致；仅请求切分方式不同。守卫与逐 doc 路径一致：mock 拒绝 +
+                    # 目标指纹断言在删除下发之前。
+                    from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+                    assert_destructive_write_allowed(
+                        "search_delete",
+                        config.alibaba_vector.endpoint or config.alibaba_vector.instance_id or config.opensearch.host,
+                        kind="search")
+                    _all_old_ids = []
+                    for doc_id, ver in current_versions.items():
+                        _doc_ids = old_chunk_ids_map.get(doc_id, [])
+                        if not _doc_ids:
+                            print(f"    ├─ [HA3 Engine] No older chunks found in RDS to deactivate for '{doc_id}'")
+                        else:
+                            _all_old_ids.extend(_doc_ids)
+                    _del_batch = 100  # 与 _push_chunks_to_ha3 的 HA3 单请求上限一致
+                    for _i in range(0, len(_all_old_ids), _del_batch):
+                        _ha3_push_delete_request(client, config, _all_old_ids[_i:_i + _del_batch])
+                    if _all_old_ids:
+                        print(f"    ├─ [HA3 Engine] Deactivated {len(_all_old_ids)} old chunks across "
+                              f"{len(current_versions)} doc(s) in table '{config.alibaba_vector.table_name}' "
+                              f"({(len(_all_old_ids) + _del_batch - 1) // _del_batch} request(s))")
+                else:
+                    # 标准 OpenSearch（delete_by_query 本就整 doc 一次）与 mock 拒绝路径：保持逐 doc
+                    for doc_id, ver in current_versions.items():
+                        _search_delete_old_chunks(
+                            client, config, index_name, doc_id, ver,
+                            old_chunk_ids_map.get(doc_id, []),
+                        )
             except Exception as e:
                 print(f"    ⚠️ Failed to deactivate old chunks in search engine: {e}")
                 # Explicit FAILED status assignment to prevent infinite hanging in NOT_INDEXED
@@ -5309,25 +5487,35 @@ def node_deactivate_old_chunks(ctx: dict):
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
                     # Update older chunks
-                    for doc_id, ver in current_versions.items():
-                        cursor.execute("""
-                            UPDATE chunk_meta
-                            SET is_active = FALSE,
-                                index_status = 'DELETED'
-                            WHERE doc_id = %s AND version_no < %s AND is_active = 1
-                        """, (doc_id, ver))
+                    # E#45：逐 doc UPDATE → 一条 OR-链合并（谓词逐字对应，行集合一致）
+                    _dv_items = list(current_versions.items())
+                    _dv_clause = " OR ".join(
+                        ["(doc_id = %s AND version_no < %s)"] * len(_dv_items))
+                    _dv_params = tuple(p for dv in _dv_items for p in dv)
+                    cursor.execute(f"""
+                        UPDATE chunk_meta
+                        SET is_active = FALSE,
+                            index_status = 'DELETED'
+                        WHERE ({_dv_clause}) AND is_active = 1
+                    """, _dv_params)
                     print("    └─ Updated older versions of chunks in RDS chunk_meta to inactive")
 
-                    # Update document_version status
+                    # Update document_version status（E#45：按 final_status 分组合并 UPDATE）
+                    _status_groups = {}
                     for (doc_id, ver), fail_cnt in failed_counts.items():
                         if (doc_id, ver) in valid_doc_versions:
                             final_status = 'FAILED' if (fail_cnt or (doc_id, ver) in known_failed) else 'SUCCESS'
-                            cursor.execute("""
-                                UPDATE document_version
-                                SET index_status = %s
-                                WHERE doc_id = %s AND version_no = %s
-                            """, (final_status, doc_id, ver))
+                            _status_groups.setdefault(final_status, []).append((doc_id, ver))
                             print(f"    ├─ RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
+                    for final_status, _dvs in _status_groups.items():
+                        _st_clause = " OR ".join(
+                            ["(doc_id = %s AND version_no = %s)"] * len(_dvs))
+                        _st_params = (final_status,) + tuple(p for dv in _dvs for p in dv)
+                        cursor.execute(f"""
+                            UPDATE document_version
+                            SET index_status = %s
+                            WHERE {_st_clause}
+                        """, _st_params)
                 conn.commit()
             except Exception as e:
                 if conn: conn.rollback()
@@ -5766,7 +5954,12 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
     ha3_docs = [{"cmd": "add", "fields": c.to_ha3_doc(cfg.pk_field, include_allowed_depts=_incl_ad)} for c in all_chunks]
 
     start_time = time.time()
-    for sub_start in range(0, len(ha3_docs), ha3_batch_size):
+
+    def _push_one_subbatch(sub_start):
+        """推送一个 ≤100 条子批（重试 + per-doc 结果解析），**原地**改写子批 chunk 状态。
+
+        F#50：子批之间无顺序依赖（cmd:add 按稳定 rds_id upsert 幂等），可并行调度；
+        每个调用只触碰自己的 sub_chunks 切片（跨线程不相交），聚合在全部子批完成后进行。"""
         sub_docs = ha3_docs[sub_start:sub_start + ha3_batch_size]
         sub_chunks = all_chunks[sub_start:sub_start + ha3_batch_size]
 
@@ -5810,7 +6003,7 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
                 sc.index_error_code = "RETRY_EXHAUSTED"
                 sc.index_error_message = err_msg
             print(f"    ├─ [HA3 Error] {err_msg}")
-            continue  # 继续处理下一个 sub-batch
+            return  # 该 sub-batch 结束（并行/串行下等价于旧 continue）
 
         status_code = getattr(resp, "status_code", 200)
         body = getattr(resp, "body", None)
@@ -5866,6 +6059,25 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
                 sc.index_error_code = str(status_code)
                 sc.index_error_message = body_message
             print(f"    ├─ [HA3 Error] Sub-batch {sub_start//ha3_batch_size + 1} failed with HTTP {status_code}: {body_message}")
+
+    _sub_starts = list(range(0, len(ha3_docs), ha3_batch_size))
+    # F#50：RAG_HA3_PUSH_CONCURRENCY（默认 1 = 现状串行）>1 时并行推送子批。
+    # 结果聚合（下方 indexed/failed 统计与调用方的 verify/回写）在全部子批完成后才进行；
+    # deactivate 仍在整个 push+verify 之后，DAG3 顺序不变量不受影响。SDK client 每次
+    # push_documents 独立构造请求、无跨调用可变共享态，多线程共用一个 client 安全
+    # （与 04b parity 并行 point-read 同一前提）；MOCK/simulate 路径不会进入本函数。
+    try:
+        _push_conc = int(os.environ.get("RAG_HA3_PUSH_CONCURRENCY", "1"))
+    except ValueError:
+        _push_conc = 1
+    if _push_conc > 1 and len(_sub_starts) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_push_conc, len(_sub_starts))) as _pool:
+            # list() 物化以传播 worker 内的意外异常（与串行路径抛出行为一致）
+            list(_pool.map(_push_one_subbatch, _sub_starts))
+    else:
+        for _sub_start in _sub_starts:
+            _push_one_subbatch(_sub_start)
 
     took_ms = int((time.time() - start_time) * 1000)
     indexed_count = sum(1 for c in all_chunks if c.index_status == "INDEXED")
@@ -6185,21 +6397,33 @@ def node_update_index_status(ctx: dict):
 
                     # Update individual chunks in chunk_meta
                     index_name = result.get("index_name", "fuling_knowledge_v1")
+                    # E#38/E#44：成功路径的 12 个 SET 字段除时间戳外全批相同 → 按
+                    # (embedding_status, embedding_model, dimension) 分组，合并为一条
+                    # UPDATE ... WHERE chunk_id IN (...)（每 1000 个 id 一条，防语句过长）。
+                    # 失败/带错误详情的 chunk 保留逐条（要写 per-chunk error 详情）。
+                    # opensearch_doc_id 原逐条写的就是自身 chunk_id → 合并版用列自引用等价表达。
+                    _ok_groups = {}
                     for chunk in batch["chunks"]:
                         dim = len(chunk.embedding_vector) if chunk.embedding_vector else None
-                        
-                        # Embedded at timestamp
-                        emb_at = datetime.now() if chunk.embedding_status == "DONE" else None
-                        # Indexed at timestamp
-                        idx_at = datetime.now() if chunk.index_status == "INDEXED" else None
-                        
+
                         # Get optional error properties safely
                         idx_err_code = getattr(chunk, 'index_error_code', None)
                         idx_err_msg = getattr(chunk, 'index_error_message', None)
 
+                        if (chunk.index_status == "INDEXED"
+                                and idx_err_code is None and idx_err_msg is None):
+                            _key = (chunk.embedding_status, chunk.embedding_model, dim)
+                            _ok_groups.setdefault(_key, []).append(chunk.chunk_id)
+                            continue
+
+                        # Embedded at timestamp
+                        emb_at = datetime.now() if chunk.embedding_status == "DONE" else None
+                        # Indexed at timestamp
+                        idx_at = datetime.now() if chunk.index_status == "INDEXED" else None
+
                         cursor.execute("""
                             UPDATE chunk_meta
-                            SET 
+                            SET
                                 embedding_status = %s,
                                 embedding_model = %s,
                                 embedding_version = %s,
@@ -6228,15 +6452,52 @@ def node_update_index_status(ctx: dict):
                             idx_at,
                             chunk.chunk_id
                         ))
-                
+
+                    for (_g_emb_status, _g_emb_model, _g_dim), _g_ids in _ok_groups.items():
+                        _g_emb_at = datetime.now() if _g_emb_status == "DONE" else None
+                        _g_idx_at = datetime.now()
+                        for _i in range(0, len(_g_ids), 1000):
+                            _g_sub = _g_ids[_i:_i + 1000]
+                            _g_ph = ",".join(["%s"] * len(_g_sub))
+                            cursor.execute(f"""
+                                UPDATE chunk_meta
+                                SET
+                                    embedding_status = %s,
+                                    embedding_model = %s,
+                                    embedding_version = %s,
+                                    embedding_dimension = %s,
+                                    embedded_at = %s,
+                                    index_status = 'INDEXED',
+                                    index_name = %s,
+                                    opensearch_doc_id = chunk_id,
+                                    opensearch_bulk_job_id = %s,
+                                    index_error_code = NULL,
+                                    index_error_message = NULL,
+                                    indexed_at = %s
+                                WHERE chunk_id IN ({_g_ph})
+                            """, [
+                                _g_emb_status,
+                                _g_emb_model,
+                                EMBEDDING_MODEL_VERSION,
+                                _g_dim,
+                                _g_emb_at,
+                                index_name,
+                                batch.get("job_id"),
+                                _g_idx_at,
+                            ] + _g_sub)
+
                 # 回写 embedding 失败的 chunk（不在任何 batch 中）为 FAILED：
                 # 下轮 loader 按 index_status IN ('NOT_INDEXED','FAILED') 重新加载并重试。
-                for chunk in embedding_failed_chunks:
-                    cursor.execute("""
+                # E#38：SET 值全同 → 合并为 chunk_id IN (...)（每 1000 个 id 一条）。
+                _emb_failed_ids = [c.chunk_id for c in embedding_failed_chunks]
+                for _i in range(0, len(_emb_failed_ids), 1000):
+                    _ef_sub = _emb_failed_ids[_i:_i + 1000]
+                    _ef_ph = ",".join(["%s"] * len(_ef_sub))
+                    cursor.execute(f"""
                         UPDATE chunk_meta
                         SET embedding_status = 'FAILED', index_status = 'FAILED'
-                        WHERE chunk_id = %s
-                    """, (chunk.chunk_id,))
+                        WHERE chunk_id IN ({_ef_ph})
+                    """, _ef_sub)
 
                 # If there are failed doc versions, update their document_version status to 'FAILED'
                 if failed_doc_versions:
@@ -6443,32 +6704,79 @@ def node_verify_and_repush(ctx: dict):
 
     text_by_pk = {}  # present pk → returned chunk_text_store (for the drift sub-check); side-effect
 
+    # F#56：point-read 只读、QueryRequest 相互独立 → 小线程池并行（默认 4）。SDK client 每次
+    # query 独立构造请求、无跨调用可变共享态，共用一个 client 安全；=1 时严格串行（原行为）。
+    read_conc = _envi("RAG_PARITY_READ_CONCURRENCY", 4)
+
+    def _point_read_one(pk):
+        """单 PK 权威 point-read → ('present'|'missing'|'unknown', chunk_text)。"""
+        try:
+            req = QueryRequest(table_name=cfg.table_name, vector=[0.0] * dim, top_k=1,
+                               include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
+                               filter=f"{cfg.pk_field}={int(pk)}")
+            rows = _parse_ha3_response(client.query(req))
+            match = next((r for r in rows if str(r.get("id")) == str(pk)), None)
+            if match is not None:
+                return "present", match.get("chunk_text")
+            return "missing", None
+        except Exception as e:
+            print(f"    ⚠️ [PARITY] point-read {cfg.pk_field}={pk} UNKNOWN (read failed): {e}")
+            return "unknown", None
+
     def _present_unknown(pks):
         """对一组 PK 逐个权威 point-read。返回 (present:set, unknown:set)。
         PRESENT = 返回行 id 等于目标 pk（非空还不够，须 PK 相符）；read 抛异常 = UNKNOWN
         （无法判定，绝不当作缺失）。read 完成但无匹配行 → MISSING（既不在 present 也不在 unknown）。
         副作用：对 PRESENT 的 pk 把返回的 chunk_text_store 存入 text_by_pk（drift 子检查用）。"""
         present, unknown = set(), set()
-        for pk in pks:
+        pk_list = list(pks)
+        if read_conc > 1 and len(pk_list) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(read_conc, len(pk_list))) as _pool:
+                results = list(_pool.map(_point_read_one, pk_list))
+        else:
+            results = [_point_read_one(pk) for pk in pk_list]
+        for pk, (state, txt) in zip(pk_list, results):
+            if state == "present":
+                present.add(pk)
+                text_by_pk[pk] = txt
+            elif state == "unknown":
+                unknown.add(pk)
+        return present, unknown
+
+    settle_poll = _envf("RAG_STAGE3_PARITY_SETTLE_POLL_SEC", 5.0)
+
+    def _settle_wait(candidate_pks):
+        """F#56：settle 由固定睡眠改为轮询早退——每 settle_poll 秒对一个刚推 PK point-read，
+        present 即提前返回；最长仍等 settle 秒（与旧固定睡眠上限一致，settle<=0 直接跳过）。
+        probe 只做可见性探测（异常按未就绪处理，继续等待），不写 text_by_pk/unknown、
+        不影响后续权威三态结论。"""
+        if settle <= 0:
+            return
+        probe_pk = max(candidate_pks) if candidate_pks else None
+        if probe_pk is None:
+            time.sleep(settle)
+            return
+        deadline = time.time() + settle
+        while True:
             try:
                 req = QueryRequest(table_name=cfg.table_name, vector=[0.0] * dim, top_k=1,
                                    include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
-                                   filter=f"{cfg.pk_field}={int(pk)}")
+                                   filter=f"{cfg.pk_field}={int(probe_pk)}")
                 rows = _parse_ha3_response(client.query(req))
-                match = next((r for r in rows if str(r.get("id")) == str(pk)), None)
-                if match is not None:
-                    present.add(pk)
-                    text_by_pk[pk] = match.get("chunk_text")
-            except Exception as e:
-                unknown.add(pk)
-                print(f"    ⚠️ [PARITY] point-read {cfg.pk_field}={pk} UNKNOWN (read failed): {e}")
-        return present, unknown
+                if any(str(r.get("id")) == str(probe_pk) for r in rows):
+                    return  # 已可见 → 早退
+            except Exception:
+                pass  # 探测失败按未就绪处理，继续等（权威判定在 _present_unknown）
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(max(settle_poll, 0.1), remaining))
 
     t0 = time.time()
 
-    # settle：吸收实时索引滞后，避免对"刚推未可见"的 chunk 误判为丢失
-    if settle > 0:
-        time.sleep(settle)
+    # settle：吸收实时索引滞后，避免对"刚推未可见"的 chunk 误判为丢失（轮询早退，见 _settle_wait）
+    _settle_wait(set(expected))
 
     expected_pks = set(expected)
     # 1) 嫌疑集：小批直接全量 point-read；大批先用 id-range enum 作廉价 hint（G30：仅 hint）
@@ -6503,8 +6811,7 @@ def node_verify_and_repush(ctx: dict):
             c.index_error_code = "NOT_RETURNED"
             c.index_error_message = "parity re-push: awaiting result"
         _push_chunks_to_ha3(client, cfg, repush, max_retries=config.embedding.max_retries)
-        if settle > 0:
-            time.sleep(settle)
+        _settle_wait(still_missing)
         present2, unknown2 = _present_unknown(still_missing)
         healed |= present2
         still_missing = still_missing - present2 - unknown2
@@ -6549,8 +6856,7 @@ def node_verify_and_repush(ctx: dict):
                 break
             _push_chunks_to_ha3(client, cfg, [expected[pk] for pk in sorted(still_drift)],
                                 max_retries=config.embedding.max_retries)
-            if settle > 0:
-                time.sleep(settle)
+            _settle_wait(still_drift)
             present_d, unknown_d = _present_unknown(still_drift)  # 重读刷新 text_by_pk
             # 重算 hash 确认：仍 present 且内容已一致 → 愈合；变 UNKNOWN → 移入 unknown 桶
             healed_d = set()
