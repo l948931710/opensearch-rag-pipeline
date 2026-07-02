@@ -183,6 +183,18 @@ def build_gates(r: Dict) -> Dict:
                 "target": "advisory — 1.0 = no image reuse (lower = bundled/reused markers)",
                 "value": round(di, 4), "pass": (di >= 0.95), "advisory": True,
             }
+        # answer_image_rate — ADVISORY trend (#F-mm1, 2026-07-01): referenced-only 端到端出图率
+        # 主指标（有图可用的答案里卡片实渲 ≥1 张的比例;主臂=生产 cosurface=False 姿态）。
+        # 新指标先 advisory 两轮锁分布再议阈值（项目惯例）;baseline delta 经
+        # ADVISORY_METRICS 同步豁免 strict。
+        air = srv.get("answer_image_rate")
+        if air is not None:
+            gates["answer image rate (L4-srv, advisory)"] = {
+                "target": "advisory — trend (锁分布后再定阈值; 主臂=生产 cosurface=False 姿态)",
+                "value": round(air, 4), "pass": None, "na_reason": "expected_na",
+                "advisory": True,
+                "notes": f"n_image_answers={n_srv}; 对照臂见 l4.arms.cosurface_true",
+            }
 
     l5 = r.get("l5")
     if l5:

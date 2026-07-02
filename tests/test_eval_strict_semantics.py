@@ -108,18 +108,21 @@ def test_baseline_advisory_metric_kept_and_reported(tmp_path):
     assert "l4srv.orphan_rate" in adv["value"]                             # visibly reported
 
 
-def test_baseline_only_orphan_advisory_no_silent_reclassification():
-    """Invariant 4: the advisory registry is EXACTLY {l4srv.orphan_rate}; every other extractable
-    metric (recall/jaccard/dup/marker_validity/dangling/judge/refusal) stays HARD."""
+def test_baseline_advisory_registry_pinned_no_silent_reclassification():
+    """Invariant 4: the advisory registry is EXACTLY {l4srv.orphan_rate, l4srv.answer_image_rate};
+    every other extractable metric (recall/jaccard/dup/marker_validity/dangling/judge/refusal)
+    stays HARD. (answer_image_rate added 2026-07-01 #F-mm1: brand-new端到端出图率主指标,项目惯例
+    新指标先 advisory 锁两轮分布再议升 hard — deliberate registry change, not reclassification.)"""
     from eval_harness.baseline import ADVISORY_METRICS, _is_advisory, extract_metrics
-    assert ADVISORY_METRICS == frozenset({"l4srv.orphan_rate"})
+    assert ADVISORY_METRICS == frozenset({"l4srv.orphan_rate", "l4srv.answer_image_rate"})
     sample = {"l1": {"ranking": {"recall@5": 0.9}, "by_source": {"xlsx": {"recall@5": 0.8}}},
               "l3": {"deterministic": {"positive": {"over_refusal_rate": 0.05, "mean_keyword_coverage": 0.8}}},
               "l4": {"ingestion": {"deterministic": {"binding_jaccard_pdf": 0.8, "img_dup_factor_p95": 1.0}},
-                     "aggregate": {"marker_validity": 1.0, "dangling_ref_rate": 0.0, "orphan_rate": 0.7}},
+                     "aggregate": {"marker_validity": 1.0, "dangling_ref_rate": 0.0, "orphan_rate": 0.7,
+                                   "answer_image_rate": 0.6}},
               "judge": {"aggregate": {"positives": {"faithfulness": {"mean": 4.5}}}}}
     m = extract_metrics(sample)
-    assert {p for p in m if _is_advisory(p)} == {"l4srv.orphan_rate"}       # exactly one advisory
+    assert {p for p in m if _is_advisory(p)} == {"l4srv.orphan_rate", "l4srv.answer_image_rate"}
     for hard in ("l4srv.marker_validity", "l4srv.dangling_ref_rate", "l4ing.jaccard.pdf",
                  "l4ing.img_dup_p95", "l1.ranking.recall@5", "l3.over_refusal_rate", "judge.faithfulness"):
         assert hard in m and not _is_advisory(hard)                         # stays HARD

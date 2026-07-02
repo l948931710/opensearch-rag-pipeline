@@ -389,6 +389,25 @@ class RAGConfig:
     # 家族筛选结果超过该上限时，收缩为「命中卡 + 同 section_title 伙伴 + 文档序
     # ±2 窗口」；≤ 上限的正常 SOP 行为逐字节不变。0 = 关闭防洪（不推荐）。
     step_expand_family_cap: int = 12  # RAG_STEP_EXPAND_FAMILY_CAP
+    # ── 图片标记宽容归一化 ──────────────────────────────────────
+    # True → 解析/清洗 <<IMG:N>> 前先把 LLM 偶发的畸形变体（全角冒号 <<IMG：3>>、
+    #        【IMG:3】等）归一化为标准形式，避免字面残片漏渲染给用户。
+    # False（默认）→ 行为与历史逐字节一致，变体既不出图也不被清除。
+    img_marker_lenient: bool = False  # RAG_IMG_MARKER_LENIENT
+    # ── 步骤扩展的带图兄弟保底 ──────────────────────────────────
+    # K>0 → expand_step_context 意图筛选后若入选兄弟全部无图而家族里有带图
+    #       step_card，按步号最近原则补入最多 K 张带图兄弟（不影响 locate_field
+    #       意图；family-cap 收缩时同样保住带图行）。解决宽泛问题命中概述卡时
+    #       真正带截图的操作步被扩展窗切掉、答案恒无图的召回缺口。
+    # 0（默认）→ 关闭，行为与历史逐字节一致。
+    expand_image_keep: int = 0  # RAG_EXPAND_IMAGE_KEEP
+    # ── procedure_parent 展开子卡的类型归位 ────────────────────
+    # True → expand_step_context 从 procedure_parent 命中展开的子步骤 chunk_type
+    #        归位为 step_card（父卡本体保持 procedure_parent），使子卡进入现有
+    #        step_card 全链路：LLM 获得 [📷 图片]/<<IMG:N>> 标记、渲染层可提图。
+    #        否则子卡继承父类型，其 RDS 装载的 image_refs 在生成与渲染两端均不可达。
+    # False（默认）→ 行为与历史逐字节一致。
+    parent_child_as_stepcard: bool = False  # RAG_PARENT_CHILD_AS_STEPCARD
 
 
 @dataclass
@@ -749,6 +768,9 @@ def load_config() -> PipelineConfig:
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE
             max_answer_images=_env_int("MAX_ANSWER_IMAGES", 6),                 # RAG_MAX_ANSWER_IMAGES
             step_expand_family_cap=_env_int("STEP_EXPAND_FAMILY_CAP", 12),      # RAG_STEP_EXPAND_FAMILY_CAP
+            img_marker_lenient=_env_bool("IMG_MARKER_LENIENT", False),          # RAG_IMG_MARKER_LENIENT
+            expand_image_keep=_env_int("EXPAND_IMAGE_KEEP", 0),                 # RAG_EXPAND_IMAGE_KEEP
+            parent_child_as_stepcard=_env_bool("PARENT_CHILD_AS_STEPCARD", False),  # RAG_PARENT_CHILD_AS_STEPCARD
         ),
     )
 

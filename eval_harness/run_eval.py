@@ -229,8 +229,24 @@ def phase_run(args):
         docs_dir = os.environ.get("EVAL_L4_DOCS_DIR") or os.path.join(_data, "documents")
         # EVAL-2: image-manifest dir for GT preflight; default mirrors the existing CLI heuristic
         manifest_dir = os.environ.get("EVAL_L4_MANIFEST_DIR") or os.path.join(_data, "scratch", "eval_manifest")
+        # ── L4-serving 专用题集并入（#F-mm1c, 2026-07-01）───────────────────
+        # golden_full 的图 case live_scorable 仅 2 题 → L4-srv 硬闸恒 N<5 not_executed;
+        # 25 题专用 golden_l4_serving.json 此前是零引用孤儿。默认并入（qid 去重,
+        # 只影响 serving 支柱）;EVAL_L4_SERVING_GOLDSET=<path> 换题集、置空一键关回。
+        _srv_gs = os.environ.get("EVAL_L4_SERVING_GOLDSET")
+        if _srv_gs is None:
+            _srv_gs = os.path.join(HERE, "goldset", "golden_l4_serving.json")
+        serving_cases = cases
+        if _srv_gs and os.path.exists(_srv_gs):
+            _known_qids = {c.get("qid") for c in cases}
+            _extra = [c for c in _load_goldset(_srv_gs) if c.get("qid") not in _known_qids]
+            if _extra:
+                serving_cases = cases + _extra
+                print(f"   L4-serving goldset 并入: +{len(_extra)} cases from {_srv_gs}")
+        elif _srv_gs:
+            print(f"   ⚠ EVAL_L4_SERVING_GOLDSET 指向不存在的文件,跳过: {_srv_gs}")
         results["l4"] = l4_multimodal.run(
-            cases,
+            serving_cases,
             gt_files=gt_files if gt_files else None,
             docs_dir=docs_dir if os.path.isdir(docs_dir) else None,
             manifest_dir=manifest_dir if os.path.isdir(manifest_dir) else None,

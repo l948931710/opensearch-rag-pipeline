@@ -26,13 +26,18 @@ def _direction(path: str) -> str:
 # ── advisory/trend baseline metrics ───────────────────────────────────────────────────────────
 # The smallest explicit mechanism (the schema stores flat {path: float} with no per-metric advisory
 # flag): a registry of metric paths whose baseline DELTA is REPORTED (visible) but must NEVER hard-
-# block --strict. It mirrors the advisory:True gates in report.py::build_gates — today the only
-# advisory metric extract_metrics yields is the L4-srv orphan rate (its absolute gate is soft/trend:
-# referenced-only rendering means unreferenced candidate images aren't shown to users, so a high
-# orphan rate on photo-dense docs is a trend signal, not a defect). Everything else — recall, jaccard,
-# dup, marker_validity, dangling, judge scores, refusal/leak rates — stays a FULLY blocking hard
-# metric. Keep this in sync with the advisory:True gates in report.py (test pins the exact set).
-ADVISORY_METRICS = frozenset({"l4srv.orphan_rate"})
+# block --strict. It mirrors the advisory:True gates in report.py::build_gates — the advisory
+# metrics extract_metrics yields are:
+#   - l4srv.orphan_rate: its absolute gate is soft/trend (referenced-only rendering means
+#     unreferenced candidate images aren't shown to users, so a high orphan rate on photo-dense
+#     docs is a trend signal, not a defect);
+#   - l4srv.answer_image_rate (#F-mm1, 2026-07-01): brand-new端到端出图率主指标 — 项目惯例
+#     新指标先 advisory 跑两轮锁分布再议升 hard（LLM 非确定性下小样本波动大,冒然 hard 会
+#     把噪声当回退阻断发布）。
+# Everything else — recall, jaccard, dup, marker_validity, dangling, judge scores, refusal/leak
+# rates — stays a FULLY blocking hard metric. Keep this in sync with the advisory:True gates in
+# report.py (test pins the exact set).
+ADVISORY_METRICS = frozenset({"l4srv.orphan_rate", "l4srv.answer_image_rate"})
 
 
 def _is_advisory(path: str) -> bool:
@@ -70,7 +75,7 @@ def extract_metrics(results: Dict) -> Dict[str, float]:
         put(f"l4ing.jaccard.{fmt}", ing.get(f"binding_jaccard_{fmt}"))  # 图文 ingestion subset
     put("l4ing.img_dup_p95", ing.get("img_dup_factor_p95"))
     srv = (results.get("l4") or {}).get("aggregate") or {}
-    for k in ("marker_validity", "dangling_ref_rate", "orphan_rate"):
+    for k in ("marker_validity", "dangling_ref_rate", "orphan_rate", "answer_image_rate"):
         put(f"l4srv.{k}", srv.get(k))
 
     j = (results.get("judge") or {}).get("aggregate") or {}

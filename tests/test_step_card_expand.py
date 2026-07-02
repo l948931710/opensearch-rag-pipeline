@@ -128,3 +128,170 @@ def test_full_procedure_keeps_hit_when_truncated_out():
     assert "S10" in out_ids, f"命中卡 S10 被意图筛选裁掉：{sorted(out_ids)}"
     # 家族 11 ≤ cap(12) 不触发防洪；前 8 步仍在，且命中卡额外保留（共 9）
     assert {"S1", "S8"}.issubset(out_ids)
+
+
+# ═══════════════════════════════════════════════════════════════
+# #F-mm4a 带图兄弟保底（RAG_EXPAND_IMAGE_KEEP）
+# ═══════════════════════════════════════════════════════════════
+
+def _sib(cid, step_no, imgs=False, section=""):
+    return {
+        "chunk_id": cid, "chunk_text": f"步骤{cid}", "step_no": step_no,
+        "section_title": section, "extra_json": None, "parent_chunk_id": "P1",
+        "image_refs_json": json.dumps([{"oss_key": f"{cid}.png"}]) if imgs else None,
+    }
+
+
+def _set_rag(monkeypatch, **kw):
+    from opensearch_pipeline.config import get_config
+    rag = get_config().rag
+    for k, v in kw.items():
+        monkeypatch.setattr(rag, k, v)
+
+
+def _expand(cur, chunks, query):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_conn(cur)):
+        return retriever.expand_step_context(chunks, query=query)
+
+
+def test_image_keep_off_by_default(monkeypatch):
+    """K=0（默认）：general ±1 窗口无图时不补任何带图兄弟——行为与历史一致。"""
+    _set_rag(monkeypatch, expand_image_keep=0)
+    meta = [{"chunk_id": "S05", "parent_chunk_id": "P1", "step_no": 5,
+             "extra_json": None, "image_refs_json": None}]
+    siblings = [_sib(f"S{i:02d}", i, imgs=(i in (2, 9))) for i in range(1, 11)]
+    cur = _RoutingCursor(meta, siblings, [])
+    out = _expand(cur, [{"chunk_type": "step_card", "chunk_id": "S05", "score": 1.0}], "报检作业")
+    assert {c["chunk_id"] for c in out} == {"S04", "S05", "S06"}
+
+
+def test_image_keep_adds_nearest_image_sibling(monkeypatch):
+    """K=1：入选窗口全无图 → 按步号最近补入带图兄弟（S02 距 3 胜 S09 距 4）。"""
+    _set_rag(monkeypatch, expand_image_keep=1)
+    meta = [{"chunk_id": "S05", "parent_chunk_id": "P1", "step_no": 5,
+             "extra_json": None, "image_refs_json": None}]
+    siblings = [_sib(f"S{i:02d}", i, imgs=(i in (2, 9))) for i in range(1, 11)]
+    cur = _RoutingCursor(meta, siblings, [])
+    out = _expand(cur, [{"chunk_type": "step_card", "chunk_id": "S05", "score": 1.0}], "报检作业")
+    out_ids = {c["chunk_id"] for c in out}
+    assert "S02" in out_ids and "S09" not in out_ids
+    s02 = [c for c in out if c["chunk_id"] == "S02"][0]
+    assert s02["image_refs"] and s02["image_refs"][0]["oss_key"] == "S02.png"
+
+
+def test_image_keep_empty_json_not_treated_as_image(monkeypatch):
+    """'[]' / 'null' 是真值字符串——必须不算带图行（裸 truthiness 判定的经典坑）。"""
+    _set_rag(monkeypatch, expand_image_keep=2)
+    meta = [{"chunk_id": "S05", "parent_chunk_id": "P1", "step_no": 5,
+             "extra_json": None, "image_refs_json": None}]
+    siblings = [_sib(f"S{i:02d}", i) for i in range(1, 11)]
+    siblings[1]["image_refs_json"] = "[]"      # S02
+    siblings[2]["image_refs_json"] = "null"    # S03
+    siblings[8]["image_refs_json"] = json.dumps([{"oss_key": "real.png"}])  # S09 真带图
+    cur = _RoutingCursor(meta, siblings, [])
+    out = _expand(cur, [{"chunk_type": "step_card", "chunk_id": "S05", "score": 1.0}], "报检作业")
+    out_ids = {c["chunk_id"] for c in out}
+    assert "S09" in out_ids            # 真带图行补入
+    assert "S02" not in out_ids and "S03" not in out_ids  # 空 JSON 不冒充带图行
+
+
+def test_image_keep_noop_when_window_already_has_image(monkeypatch):
+    """入选窗口已有带图行 → 不再补（宁缺毋滥，保底只救『恒零图』形态）。"""
+    _set_rag(monkeypatch, expand_image_keep=2)
+    meta = [{"chunk_id": "S05", "parent_chunk_id": "P1", "step_no": 5,
+             "extra_json": None, "image_refs_json": None}]
+    siblings = [_sib(f"S{i:02d}", i, imgs=(i in (4, 9))) for i in range(1, 11)]
+    cur = _RoutingCursor(meta, siblings, [])
+    out = _expand(cur, [{"chunk_type": "step_card", "chunk_id": "S05", "score": 1.0}], "报检作业")
+    out_ids = {c["chunk_id"] for c in out}
+    assert "S04" in out_ids and "S09" not in out_ids
+
+
+def test_image_keep_respects_locate_field_intent(monkeypatch):
+    """locate_field 的设计语义=仅保留命中步：保底不得为其扩展。"""
+    _set_rag(monkeypatch, expand_image_keep=2)
+    meta = [{"chunk_id": "S05", "parent_chunk_id": "P1", "step_no": 5,
+             "extra_json": None, "image_refs_json": None}]
+    siblings = [_sib(f"S{i:02d}", i, imgs=(i == 9)) for i in range(1, 11)]
+    cur = _RoutingCursor(meta, siblings, [])
+    out = _expand(cur, [{"chunk_type": "step_card", "chunk_id": "S05", "score": 1.0}], "这个字段在哪里填写")
+    assert {c["chunk_id"] for c in out} == {"S05"}
+
+
+def test_image_keep_survives_family_cap_slice(monkeypatch):
+    """防洪收缩 + 末端 [:_cap] 切片后带图保底行必须存活（被挤出时从尾部替换回来）。"""
+    _set_rag(monkeypatch, expand_image_keep=1, step_expand_family_cap=12)
+    # 20 个兄弟全部 step_no=0（大规模平局）→ general ±1 全家族入选 → 触发防洪。
+    # S01..S15 同 section A（含命中 S01），S19 带图、section B。
+    meta = [{"chunk_id": "S01", "parent_chunk_id": "P1", "step_no": 0,
+             "extra_json": None, "image_refs_json": None}]
+    siblings = [
+        _sib(f"S{i:02d}", 0, imgs=(i == 19), section=("A" if i <= 15 else "B"))
+        for i in range(1, 21)
+    ]
+    cur = _RoutingCursor(meta, siblings, [])
+    out = _expand(cur, [{"chunk_type": "step_card", "chunk_id": "S01", "score": 1.0}], "报检作业")
+    out_ids = {c["chunk_id"] for c in out}
+    assert len(out) == 12                      # cap 生效
+    assert "S01" in out_ids                    # 命中永存
+    assert "S19" in out_ids, f"带图保底行被 cap 切片挤掉：{sorted(out_ids)}"
+    s19 = [c for c in out if c["chunk_id"] == "S19"][0]
+    assert s19["image_refs"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# #F-mm4b procedure_parent 展开子卡归位 step_card
+# ═══════════════════════════════════════════════════════════════
+
+def _parent_fixture():
+    meta = []  # 命中是 parent，不查 step_card 元数据
+    children = [
+        {"chunk_id": "C1", "chunk_text": "子步骤1", "step_no": 1, "section_title": "",
+         "extra_json": None, "parent_chunk_id": "P1",
+         "image_refs_json": json.dumps([{"oss_key": "c1.png", "caption": "子步骤1截图"}])},
+        {"chunk_id": "C2", "chunk_text": "子步骤2", "step_no": 2, "section_title": "",
+         "extra_json": None, "parent_chunk_id": "P1", "image_refs_json": None},
+    ]
+    chunks = [{"chunk_type": "procedure_parent", "chunk_id": "P1", "score": 1.0,
+               "chunk_text": "流程概览"}]
+    return meta, children, chunks
+
+
+def test_parent_children_keep_parent_type_by_default(monkeypatch):
+    """flag OFF（默认）：子卡继承 procedure_parent —— 行为与历史逐字节一致。"""
+    _set_rag(monkeypatch, parent_child_as_stepcard=False)
+    meta, children, chunks = _parent_fixture()
+    cur = _RoutingCursor(meta, children, [])
+    out = _expand(cur, chunks, "入职流程")
+    by_id = {c["chunk_id"]: c for c in out}
+    assert by_id["C1"]["chunk_type"] == "procedure_parent"
+    assert by_id["C1"]["image_refs"][0]["oss_key"] == "c1.png"  # 装载本身一直发生
+
+
+def test_parent_children_become_step_cards_when_enabled(monkeypatch):
+    """flag ON：子卡归位 step_card（可进 <<IMG:N>> 标记与渲染提图链路），父卡本体不动。"""
+    _set_rag(monkeypatch, parent_child_as_stepcard=True)
+    meta, children, chunks = _parent_fixture()
+    cur = _RoutingCursor(meta, children, [])
+    out = _expand(cur, chunks, "入职流程")
+    by_id = {c["chunk_id"]: c for c in out}
+    assert by_id["P1"]["chunk_type"] == "procedure_parent"     # 父卡本体保持
+    assert by_id["C1"]["chunk_type"] == "step_card"
+    assert by_id["C2"]["chunk_type"] == "step_card"
+    assert by_id["C1"]["image_refs"][0]["oss_key"] == "c1.png"
+    assert by_id["C1"]["is_expanded"] and by_id["C1"]["expansion_reason"] == "parent_children"
+
+
+def test_parent_children_stepcard_reaches_render_layer(monkeypatch):
+    """端到端契约：归位后的子卡在 content_blocks_builder 的 step_card 分支可提图。"""
+    _set_rag(monkeypatch, parent_child_as_stepcard=True)
+    meta, children, chunks = _parent_fixture()
+    cur = _RoutingCursor(meta, children, [])
+    out = _expand(cur, chunks, "入职流程")
+    import opensearch_pipeline.content_blocks_builder as cb
+    monkeypatch.setattr(cb, "generate_signed_url", lambda key, expires=None: "https://oss/" + key)
+    # C1 在 out 中的 1-based 位置即 <<IMG:N>> 的 N
+    n = next(i for i, c in enumerate(out, 1) if c["chunk_id"] == "C1")
+    blocks = cb.build_content_blocks(f"第一步如图 <<IMG:{n}>>。", out, max_images=3)
+    imgs = [b for b in blocks if b["type"] == "image"]
+    assert len(imgs) == 1 and imgs[0]["oss_key"] == "c1.png"

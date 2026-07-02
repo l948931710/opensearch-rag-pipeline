@@ -25,6 +25,38 @@ logger = logging.getLogger(__name__)
 # 兼容双尖括号 <<IMG:3>> 和单尖括号 <IMG:3>（LLM 经常简化括号）
 _IMG_PLACEHOLDER_PATTERN = re.compile(r'<{1,2}IMG:(\d+)>{1,2}')
 
+# LLM 偶发的畸形标记变体：全角冒号（<<IMG：3>>）、中文括号（【IMG:3】/《IMG:3》）、
+# 括号内多余空白。标准正则不认识这些变体 → 既不出图也不被 strip 清除，字面残片
+# 直接渲染给用户。宽容归一化（RAG_IMG_MARKER_LENIENT，默认 OFF）在解析/清洗前把
+# 它们重写为标准 <<IMG:N>>。pattern 收紧到 IMG 关键词 + 数字，避免误伤正文。
+_IMG_MARKER_VARIANT_PATTERN = re.compile(r'(?:<{1,2}|【|《)\s*IMG\s*[:：]\s*(\d+)\s*(?:>{1,2}|】|》)')
+
+
+def _marker_lenient_enabled() -> bool:
+    """RAG_IMG_MARKER_LENIENT 开关（fail-open：配置不可用时视为关闭）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return bool(get_config().rag.img_marker_lenient)
+    except Exception:
+        return False
+
+
+def normalize_img_markers(text: str) -> str:
+    """把畸形图片标记变体归一化为标准 <<IMG:N>>（对标准标记幂等）。"""
+    return _IMG_MARKER_VARIANT_PATTERN.sub(lambda m: f'<<IMG:{m.group(1)}>>', text)
+
+
+def _log_render_stats(stats: Dict[str, Any]) -> None:
+    """出图漏斗遥测：单条结构化日志，可按 outcome/计数分桶排查「为什么这题没图」。
+
+    纯旁路观测（fail-open）：遥测自身的任何异常绝不影响答案构建。
+    第一期 log-only，不进 qa_session_log（那是 schema 迁移，F-35 另行走）。
+    """
+    try:
+        logger.info("image_render_stats %s", json.dumps(stats, ensure_ascii=False, sort_keys=True))
+    except Exception:
+        pass
+
 # 句末收尾标点 + 闭合括号：按占位符切分后落在片段开头时，应回挂到上一文本块末尾
 _LEADING_CLOSER_PATTERN = re.compile(r'^[。，、；：！？）】」』]+')
 
@@ -172,6 +204,8 @@ def strip_image_markers(text: Optional[str]) -> str:
     """
     if not text:
         return ""
+    if _marker_lenient_enabled():
+        text = normalize_img_markers(text)
     return _IMG_PLACEHOLDER_PATTERN.sub('', text).strip()
 
 
@@ -280,6 +314,33 @@ def _extract_image_chunks(chunks: List[Dict[str, Any]]) -> Dict[int, List[Dict[s
     return image_map
 
 
+def plan_image_rotation(counts: List[int], max_images: int) -> List[int]:
+    """轮转配额的纯规划函数——build_content_blocks 步骤 3 配额语义的单点文档。
+
+    counts[i] = 第 i 个被引用文档/步骤携带的图片数（按首次引用顺序）；
+    返回每个文档计划渲染的张数：每轮按引用顺序各取 1 张，直到配额（max_images）
+    用尽或全部取完。评测侧（eval_harness/mm_answer_metrics）用它模拟
+    referenced-only 实渲数量，与生产共用同一份语义，防口径漂移；
+    不含签名失败/近重抑制（离线不可知，生产循环里两者不消耗配额）。
+    ⚠️ 改动生产配额循环时必须同步本函数并跑 conformance 测试
+    （tests/test_mm_answer_metrics_referenced_only.py）。
+    """
+    plan = [0] * len(counts)
+    remaining = max_images
+    while remaining > 0:
+        progressed = False
+        for i, c in enumerate(counts):
+            if remaining <= 0:
+                break
+            if plan[i] < c:
+                plan[i] += 1
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+    return plan
+
+
 def build_content_blocks(
     answer: str,
     chunks: List[Dict[str, Any]],
@@ -321,14 +382,32 @@ def build_content_blocks(
     if not answer:
         return []
 
+    if _marker_lenient_enabled():
+        # 畸形变体（全角冒号/中文括号）归一化为标准 <<IMG:N>>，本函数内的解析、
+        # 穿插与 _sanitize_blocks 都基于归一化后的文本，保证位置一致。
+        answer = normalize_img_markers(answer)
+
     if max_images is None:
         from opensearch_pipeline.config import get_config
         max_images = get_config().rag.max_answer_images
 
+    # 出图漏斗遥测（#F-mm2）：纯旁路计数，任何分支 return 前打一条结构化日志
+    stats: Dict[str, Any] = {
+        "outcome": "", "n_chunks": len(chunks), "n_chunks_with_images": 0,
+        "n_images_available": 0, "n_placeholders": 0, "n_invalid_refs": 0,
+        "invalid_ns": [], "n_referenced": 0, "n_neardup_suppressed": 0,
+        "n_sign_failed": 0, "n_quota_dropped": 0, "n_images_out": 0,
+        "max_images": max_images,
+    }
+
     # 1. 提取所有携带图片的 chunk（doc_index → [img dicts]）
     image_map = _extract_image_chunks(chunks)
+    stats["n_chunks_with_images"] = len(image_map)
+    stats["n_images_available"] = sum(len(v) for v in image_map.values())
     if not image_map:
         # 没有任何图片 chunk → 返回空，走 answer 降级
+        stats["outcome"] = "no_image_chunks"
+        _log_render_stats(stats)
         return []
 
     # 2. 扫描 <<IMG:N>> 占位符；只保留指向真实图片的有效引用，
@@ -336,14 +415,28 @@ def build_content_blocks(
     placeholders = list(_IMG_PLACEHOLDER_PATTERN.finditer(answer))
     referenced_order: List[int] = []
     seen_refs = set()
+    invalid_ns = set()
     for match in placeholders:
         doc_idx = int(match.group(1))
-        if doc_idx in image_map and doc_idx not in seen_refs:
-            referenced_order.append(doc_idx)
-            seen_refs.add(doc_idx)
+        if doc_idx in image_map:
+            if doc_idx not in seen_refs:
+                referenced_order.append(doc_idx)
+                seen_refs.add(doc_idx)
+        else:
+            # 越界 / 指向无图 chunk 的引用：历史上完全静默，是「为什么没图」
+            # 排查的首要盲区（幻觉标记、截断残留、历史模仿都落在这一桶）
+            stats["n_invalid_refs"] += 1
+            invalid_ns.add(doc_idx)
+    stats["invalid_ns"] = sorted(invalid_ns)[:10]
+    stats["n_placeholders"] = len(placeholders)
+    stats["n_referenced"] = len(referenced_order)
 
     if not referenced_order:
         # LLM 没有引用任何图片 → 不展示图片（走 answer 降级）
+        # 有图可用却零引用（referenced_none 且 n_images_available>0）= referenced-only
+        # 策略下最常见的丢图形态，此前不可观测
+        stats["outcome"] = "referenced_none"
+        _log_render_stats(stats)
         return []
 
     # 3. 只为“被引用”的图片签名，配额**轮转**分配后再受 max_images 截断：
@@ -370,6 +463,7 @@ def build_content_blocks(
                 dup = _find_duplicate_image(accepted, chunk_doc_id, oss_key, near_dup_text)
                 if dup is not None:
                     # 被抑制的近重图不消耗 max_images 配额
+                    stats["n_neardup_suppressed"] += 1
                     logger.info(
                         "近重图片抑制: 丢弃 '%s' (doc=%s)，与已采纳 '%s' (doc=%s) 描述同屏",
                         oss_key, chunk_doc_id, dup["oss_key"], dup["doc_id"],
@@ -377,6 +471,7 @@ def build_content_blocks(
                     continue
                 url = generate_signed_url(oss_key, expires=url_expires)
                 if not url:
+                    stats["n_sign_failed"] += 1
                     logger.warning(
                         "Skipping image chunk %d: signed URL generation failed for '%s'",
                         doc_idx, oss_key,
@@ -400,9 +495,18 @@ def build_content_blocks(
         if not progressed:
             break
 
+    # 循环退出时仍留在队列里的图 = 因配额（或整轮无进展）未被尝试的图
+    stats["n_quota_dropped"] = sum(len(q) for _, q in queues)
+    stats["n_images_out"] = generated_count
+
     if not signed_images:
         # 被引用图片的签名全部失败 → 返回空，走 answer 降级
+        stats["outcome"] = "no_signed_images"
+        _log_render_stats(stats)
         return []
+
+    stats["outcome"] = "ok"
+    _log_render_stats(stats)
 
     # 4. 按占位符位置把被引用的图片穿插进文本
     blocks = _build_interleaved(answer, placeholders, signed_images)
