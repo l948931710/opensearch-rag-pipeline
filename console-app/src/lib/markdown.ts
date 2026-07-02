@@ -77,12 +77,13 @@ export function renderMd(text: unknown): string {
 }
 
 /**
- * 流式 chunk 是 LLM 原始 token，可能带 <<IMG:N>> 标记（图片以 content_blocks 帧权威定稿）。
- * 去完整标记 + 末尾【未到齐的半截】标记（如 "<<IM" / "<IMG:1"），避免打字途中闪出标记碎片。
+ * 流式 chunk 是 LLM 原始 token，可能带 <<IMG:N>> / <<IMG:N.M>> 标记（图片以 content_blocks
+ * 帧权威定稿）。#F-mm6：图级子下标 .M 也要擦——否则 RAG_IMG_SUBINDEX 开时打字途中闪出
+ * "<<IMG:1.2>>" 碎片。去完整标记 + 末尾【未到齐的半截】标记（如 "<<IM" / "<IMG:1" / "<IMG:1."）。
  * 后端契约：单个标记可能被拆到多帧，前端绝不从流文本解析图片——只擦不解析。
  */
 export function stripImg(s: unknown): string {
   return String(s == null ? '' : s)
-    .replace(/<{1,2}IMG:\d+>{1,2}/g, '')
-    .replace(/<{1,2}I?M?G?:?\d*$/, '')
+    .replace(/<{1,2}IMG:\d+(?:\.\d+)?>{1,2}/g, '')
+    .replace(/<{1,2}I?M?G?:?\d*\.?\d*$/, '')
 }

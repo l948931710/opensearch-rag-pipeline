@@ -63,6 +63,12 @@ _IMG_INTERLEAVE_RULE = """
 _IMG_HISTORY_ANTIMIMIC_RULE = """
 11. 不要模仿历史回答中出现过的 <<IMG:N>> 图片标记；是否插图与编号 N 只依据【本轮】参考文档中的 [📷 图片] 标记决定，历史回答里的图片编号对本轮无效"""
 
+# 图级子下标说明（规则 12，#F-mm6）：仅 RAG_IMG_SUBINDEX 开启且图文 prompt 时由
+# _build_messages 条件追加。多图文档的标记形如 <<IMG:N.1>> <<IMG:N.2>>，每个子下标
+# 对应 header 下「图1/图2」编号 caption 的那一张——不改模块常量，OFF 时 prompt 不变。
+_IMG_SUBINDEX_RULE = """
+12. 当某文档标注了多个带子下标的图片标记（如 <<IMG:3.1>> <<IMG:3.2>>，对应其下方「图1」「图2」的分图说明）时，请按内容相关性把【具体那一张】的标记插到对应段落后——不同步骤可引用同一文档的不同子图（如步骤A后放 <<IMG:3.1>>、步骤B后放 <<IMG:3.2>>），不要把某文档的全部子图堆在一处，也不要凭空编造不存在的子下标"""
+
 # 默认（图文穿插）system prompt
 # 2026-06-10：规则 4 增加「**第N步**」步骤编号 house style（小程序/原型步骤样式
 # 与机器人格式统一）——此后与历史 prompt 不再逐字节一致。
@@ -147,6 +153,31 @@ def score_relevance(chunk: Dict[str, Any]) -> float:
 # Context 组装
 # ═══════════════════════════════════════════════════════════════
 
+def _img_marker_segment(i: int, chunk: Dict[str, Any]) -> str:
+    """非纯文本模式下 chunk 的 [📷 图片] 标记段（#F-mm6：多图 chunk 逐图发 N.M）。
+
+    用渲染侧的 renderable_image_refs（唯一权威）取可渲染图列表，m 与最终渲染的第 m
+    张【同源】。RAG_IMG_SUBINDEX 开且可渲染图 >1 时逐图发 <<IMG:{N}.{m}>> 并列编号
+    caption 帮 LLM 选图；否则（单图 / flag OFF）发纯 <<IMG:{N}>>，与历史逐字节一致。
+    """
+    n = i + 1
+    try:
+        from opensearch_pipeline.content_blocks_builder import (
+            _img_subindex_enabled, renderable_image_refs,
+        )
+        refs = renderable_image_refs(chunk)
+        if _img_subindex_enabled() and len(refs) > 1:
+            markers = " ".join(f"<<IMG:{n}.{m}>>" for m in range(1, len(refs) + 1))
+            cap_lines = "".join(
+                f"\n图{m}：{(r.get('visual_summary') or '').strip()[:80]}"
+                for m, r in enumerate(refs, 1) if (r.get('visual_summary') or '').strip()
+            )
+            return f" [📷 图片] {markers}{cap_lines}"
+    except Exception:
+        pass   # fail-open：退回纯 N（绝不因子下标逻辑丢标记）
+    return f" [📷 图片] <<IMG:{n}>>"
+
+
 def _chunk_header(i: int, chunk: Dict[str, Any], pure_text: bool) -> str:
     """单个 chunk 的 context header（[文档N] 标题 > 章节 [标签] <<IMG:N>> (相关度)）。
 
@@ -165,7 +196,8 @@ def _chunk_header(i: int, chunk: Dict[str, Any], pure_text: bool) -> str:
     if chunk_type == "image":
         visual_summary = chunk.get("visual_summary", "")
         # 纯文本模式只保留 [📷 图片] 标签 + 图片内容描述，不注入 <<IMG:N>> 标记
-        header += " [📷 图片]" if pure_text else f" [📷 图片] <<IMG:{i+1}>>"
+        # （image chunk 恒单图，_img_marker_segment 与旧 " [📷 图片] <<IMG:N>>" 等价）
+        header += " [📷 图片]" if pure_text else _img_marker_segment(i, chunk)
         if visual_summary:
             header += f"\n图片内容：{visual_summary[:120]}"
     elif chunk_type == "step_card":
@@ -187,7 +219,7 @@ def _chunk_header(i: int, chunk: Dict[str, Any], pure_text: bool) -> str:
         if image_refs and not pure_text:
             # [📷 图片] 标签与 image/text_chunk 分支对齐：缺标签时 LLM 引用倾向明显
             # 偏低（2026-06-11 生产复测 J-water_soak/QA-24 带图步骤卡 0 引用实证）。
-            header += f" [📷 图片] <<IMG:{i+1}>>"
+            header += _img_marker_segment(i, chunk)
     elif chunk_type == "procedure_parent":
         header += " [流程概览]"
     elif chunk_type in ("text_chunk", "clause_chunk", "ocr_chunk", "visual_knowledge"):
@@ -195,7 +227,7 @@ def _chunk_header(i: int, chunk: Dict[str, Any], pure_text: bool) -> str:
         # 也要给 LLM 一个 <<IMG:N>> 提示；否则 referenced-only 渲染（只展示被引用图）会漏图。
         # 纯文本模式下不注入标记（也不展示图片）。
         if not pure_text and ((chunk.get("image_refs") or []) or chunk.get("source_image")):
-            header += f" [📷 图片] <<IMG:{i+1}>>"
+            header += _img_marker_segment(i, chunk)
     if isinstance(score, (int, float)):
         # 档位判定与 API sources[].level 同源（score_level），中文标签仅作 prompt 展示
         header += f" (相关度: {_LEVEL_ZH[score_level(chunk)]} {score:.2f})"
@@ -339,7 +371,7 @@ def _source_preview(chunk: Dict[str, Any], limit: int = 140) -> str:
     """
     text = str(chunk.get("chunk_text", "") or "")
     text = re.sub(r"^\s*【[^】]*】\s*", "", text)   # 去「【文档:.. | 章节:..】」上下文前缀
-    text = re.sub(r"<<IMG:\d+>>", "", text)          # 去图片占位符
+    text = re.sub(r"<{1,2}IMG:\d+(?:\.\d+)?>{1,2}", "", text)   # 去图片占位符（#F-mm6 含 .M）
     text = re.sub(r"\s+", " ", text).strip()
     return (text[:limit].rstrip() + "…") if len(text) > limit else text
 
@@ -498,6 +530,15 @@ def _build_messages(
         ]
         if _IMG_INTERLEAVE_RULE in _system and _IMG_HISTORY_ANTIMIMIC_RULE not in _system:
             _system = _system + _IMG_HISTORY_ANTIMIMIC_RULE
+
+    # ── #F-mm6 图级子下标说明（规则 12，RAG_IMG_SUBINDEX，默认 OFF）────
+    # 仅图文 prompt + flag ON 时条件追加；不改模块常量，OFF 时 prompt 逐字节不变。
+    try:
+        if (get_config().rag.img_subindex and _IMG_INTERLEAVE_RULE in _system
+                and _IMG_SUBINDEX_RULE not in _system):
+            _system = _system + _IMG_SUBINDEX_RULE
+    except Exception:
+        pass
 
     messages = [
         {"role": "system", "content": _system},
