@@ -43,6 +43,14 @@ if "/tmp/pydeps" not in sys.path:
 # ═══════════════════════════════════════════════════════════════
 os.environ["RAG_SIMULATE"] = "false"
 os.environ["RAG_ENVIRONMENT"] = "production"
+# retention 是纯 RDS 作业，不碰检索后端/OSS。显式声明这两路走 mock：
+#   ① 短路 config 的 production 完整性守卫 R5（config.py:501「production 必须有检索后端，
+#      否则 EnvironmentMismatchError」）——2026-07-02 首跑即撞它；
+#   ② 免配 HA3/OSS 凭据（本节点不需要）。
+# RDS 仍真实：simulate_db 不设 → 继承 RAG_SIMULATE=false → 真连生产 RDS；retention.py 的
+# `if cfg.simulate or cfg.simulate_db: skip` 也不会误跳（两者均 false）。
+os.environ["RAG_SIMULATE_OPENSEARCH"] = "true"
+os.environ["RAG_SIMULATE_OSS"] = "true"
 
 # 阶段开关：阶段1 = True（dry-run 只报数）；阶段2 = False + 打开 RAG_RETENTION_ENABLE
 DRY_RUN = True
@@ -57,7 +65,7 @@ if not DRY_RUN:
 # os.environ["RAG_RETENTION_FINDING_MONTHS"]      = "24"
 
 # ── 凭据：粘贴【清理stage3】顶部的 RAG_* 赋值（取消注释并填真值）────────────────
-# os.environ["DASHSCOPE_API_KEY"] = "..."   # 本节点不调 LLM，但 config 守卫 R5 要求 production 必配
+# os.environ["DASHSCOPE_API_KEY"] = "..."   # 本节点不调 LLM，但 production 安全守卫要求配 DashScope key（防 Gemini 误用）
 # os.environ["RAG_RDS_HOST"]      = "..."
 # os.environ["RAG_RDS_PORT"]      = "..."
 # os.environ["RAG_RDS_USER"]      = "..."
