@@ -398,10 +398,14 @@ def compute_oss_parity(referenced: Dict[str, str], present: set, *,
 
 
 def _list_oss_keys(bucket, prefix: str = _OSS_IMAGE_PREFIX) -> set:
-    """Paginated read-only ListObjects under prefix → set of object keys."""
+    """Paginated read-only ListObjects under prefix → set of object keys.
+
+    perf#95：max_keys=1000（服务端上限）——ObjectIterator 默认 100/页，全量 LIST 多打 10 倍
+    请求数；CS4 图片前缀与 F#57/58 的 raw/、候选前缀 LIST 共用本函数，一并受益。
+    """
     import oss2
     keys = set()
-    for obj in oss2.ObjectIterator(bucket, prefix=prefix):
+    for obj in oss2.ObjectIterator(bucket, prefix=prefix, max_keys=1000):
         keys.add(obj.key)
     return keys
 

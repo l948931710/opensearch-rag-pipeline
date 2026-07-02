@@ -27,6 +27,9 @@ class ImageAsset:
     # 页面显示 bbox (x0, y0, x1, y1)，页坐标、上原点（PDF/PPTX 可提供；与文本块
     # extra.y0/y1 同坐标系，供按版面位置锚定图片→步骤）
     bbox: Optional[tuple] = None
+    # perf#88：导出时已算过的 blob MD5（xlsx 路径回填；别处构造的旧路径为 None 时
+    # _enrich_xlsx_annotations 回退逐文件读哈希）。避免配对阶段 O(pics×assets) 重读+重哈希。
+    md5: Optional[str] = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -489,6 +492,7 @@ def extract_images_from_xlsx(
                         page_num=sheet_idx + 1,
                         image_index=img_index,
                         original_name=f"sheet{sheet_idx}_image",
+                        md5=md5,  # perf#88：别名与原资产同字节，直接携带同一 MD5
                     )
                     alias.anchor_row = anchor_row
                     assets.append(alias)
@@ -518,6 +522,7 @@ def extract_images_from_xlsx(
                 page_num=sheet_idx + 1,
                 image_index=img_index,
                 original_name=f"sheet{sheet_idx}_image",
+                md5=md5,  # perf#88：导出时已算过的 MD5 直接携带，配对阶段免重读重哈希
             )
             if anchor_row is not None:
                 asset.anchor_row = anchor_row
@@ -568,21 +573,30 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
         col_off = int(from_el.find('xdr:colOff', ns).text)
         return row, col, col_off
 
-    def _find_asset_by_md5(media_blob, sheet_idx):
-        """通过 MD5 找到对应的 ImageAsset。"""
-        if not media_blob:
-            return None
-        media_md5 = hashlib.md5(media_blob).hexdigest()
-        for asset in assets:
-            if asset.page_num != sheet_idx + 1:
-                continue
+    # perf#88：导出循环已算过每个 blob 的 MD5（ImageAsset.md5），此处一次性预建
+    # {md5: [assets 原序]} 索引——方式A/方式B 每次配对从「全量重读文件+重哈希」
+    # （O(pics×assets) 磁盘 IO）降为零额外 IO 的字典查找。asset.md5 为 None
+    # （外部构造的旧路径，如 docx_extractor）时回退现状逐文件读哈希，每文件至多
+    # 一次；读失败按现状跳过该资产。
+    md5_to_assets: dict = {}
+    for asset in assets:
+        asset_md5 = asset.md5
+        if asset_md5 is None:
             try:
                 with open(asset.local_path, 'rb') as f:
                     asset_md5 = hashlib.md5(f.read()).hexdigest()
-                if asset_md5 == media_md5:
-                    return asset
             except Exception:
                 continue
+        md5_to_assets.setdefault(asset_md5, []).append(asset)
+
+    def _find_asset_by_md5(media_blob, sheet_idx):
+        """通过 MD5 找到对应的 ImageAsset（预建索引；assets 原序 first-match 语义不变）。"""
+        if not media_blob:
+            return None
+        media_md5 = hashlib.md5(media_blob).hexdigest()
+        for asset in md5_to_assets.get(media_md5, ()):
+            if asset.page_num == sheet_idx + 1:
+                return asset
         return None
 
     with zipfile.ZipFile(xlsx_path) as z:

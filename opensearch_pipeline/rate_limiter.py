@@ -56,6 +56,9 @@ _MINUTE_WINDOW_S = 60.0
 _WARN_THROTTLE_S = 300.0
 # 计数字典软上限：超过即清理过期项（扫描器轮换 IP 不至于撑爆内存）
 _PRUNE_THRESHOLD = 20000
+# perf#94：全量重建式清理的节流间隔——超阈值期间不再每个放行请求都重建，
+# 代价是过期条目最多多存活 ~30s（阈值以下路径零变化，设计内让步）
+_PRUNE_INTERVAL_S = 30.0
 
 
 def _beijing_day(now: float) -> str:
@@ -180,6 +183,8 @@ class ServingRateLimiter:
         self._global_day: Tuple[str, int] = ("", 0)
         # 拒绝日志节流：key -> 上次告警时间戳
         self._last_warn: Dict[str, float] = {}
+        # perf#94：上次全量清理时间戳（_maybe_prune 节流用）
+        self._last_prune = 0.0
 
     # ── 配置 ─────────────────────────────────────────────────
 
@@ -200,6 +205,7 @@ class ServingRateLimiter:
             self._daily.clear()
             self._global_day = ("", 0)
             self._last_warn.clear()
+            self._last_prune = 0.0
         self._limits = None
 
     def describe(self) -> str:
@@ -331,14 +337,27 @@ class ServingRateLimiter:
         return denial
 
     def _maybe_prune(self, now: float, day: str) -> None:
-        """计数字典超软上限时清理过期项（窗口外/隔日），防扫描器轮换 key 撑爆内存。"""
+        """计数字典超软上限时清理过期项（窗口外/隔日），防扫描器轮换 key 撑爆内存。
+
+        perf#94：重建节流 ≥30s 一次——超阈值期间原本每个放行请求都在持锁路径做
+        全量 dict 重建（O(n) x2）；节流后过期条目最多多存活 ~30s。阈值以下只做
+        三次 len 比较，路径零变化。时间源沿用调用方传入的 self._now()（测试假时钟兼容）。
+        """
+        if now - self._last_prune < _PRUNE_INTERVAL_S:
+            return
+        pruned = False
         if len(self._minute) > _PRUNE_THRESHOLD:
             self._minute = {k: dq for k, dq in self._minute.items()
                             if dq and now - dq[-1] < _MINUTE_WINDOW_S}
+            pruned = True
         if len(self._daily) > _PRUNE_THRESHOLD:
             self._daily = {k: v for k, v in self._daily.items() if v[0] == day}
+            pruned = True
         if len(self._last_warn) > _PRUNE_THRESHOLD:
             self._last_warn.clear()
+            pruned = True
+        if pruned:
+            self._last_prune = now
 
 
 # 模块级单例：api.py 各端点共享（workers=1 → 即全局）

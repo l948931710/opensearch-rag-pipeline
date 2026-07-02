@@ -1114,16 +1114,20 @@ class DocumentChunker:
                 audit_flags = []
 
                 if classify_image_relation is not None:
+                    # perf#86：预建 image_index → (visual_summary, ocr_text) 首个匹配表，替代
+                    # 每图对 sg["image_refs"] 的嵌套线性反查。setdefault 保留 first-wins 语义，
+                    # 与原线性扫描逐字节等价——含 image_index 重复/为 None 时命中首个同键项
+                    # 的现状行为（该潜在错配面原样保留，修行为不属于本项）。
+                    _caption_by_idx = {}
+                    for ie in sg["image_refs"]:
+                        _caption_by_idx.setdefault(
+                            ie.get("image_index"),
+                            (ie.get("visual_summary", ""), ie.get("ocr_text", "")),
+                        )
                     for img_ref in image_refs_list:
                         # 取该图片的 caption（优先 visual_summary，fallback ocr_text）
                         img_idx = img_ref.get("image_index")
-                        img_caption = ""
-                        img_ocr = ""
-                        for ie in sg["image_refs"]:
-                            if ie.get("image_index") == img_idx:
-                                img_caption = ie.get("visual_summary", "")
-                                img_ocr = ie.get("ocr_text", "")
-                                break
+                        img_caption, img_ocr = _caption_by_idx.get(img_idx, ("", ""))
                         caption = img_caption or img_ocr
 
                         rel = classify_image_relation(

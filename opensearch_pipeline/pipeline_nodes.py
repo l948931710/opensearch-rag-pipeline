@@ -513,6 +513,26 @@ def _xd_covers(incumbent, newdoc) -> bool:
     return inc >= new    # incumbent 受众 ⊇ new 受众
 
 
+def _rollback_or_discard(conn):
+    """FAIL-SAFE 阶段出错后清理共享连接上的半途事务（perf#92/#93 共享连接用）。
+
+    能 rollback 则返回原连接继续复用；rollback 也失败（连接已坏）则关闭丢弃并返回
+    None，调用方据此在下一阶段惰性重新获取——保持「单阶段出错不拖垮后续阶段」的
+    既有失败隔离语义。
+    """
+    if conn is None:
+        return None
+    try:
+        conn.rollback()
+        return conn
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return None
+
+
 def node_build_canonical(ctx: dict):
     """
     构建 canonical document（增强版）。
@@ -524,6 +544,14 @@ def node_build_canonical(ctx: dict):
     """
     extractions = ctx["extractions"]
     canonicals = []
+
+    # perf#92：simulate 判定与 OSS bucket 客户端是循环不变量，提升到循环外一次构造
+    # （原先每篇文档各构造一次 oss2.Auth+Bucket）。extractions 为空时不触碰 OSS，
+    # 与原行为一致（零篇即零次构造）。
+    simulate_db = _resolve_simulate(ctx, "db")
+    bucket = is_simulated_oss = None
+    if extractions:
+        bucket, is_simulated_oss = _get_oss_bucket(ctx)
 
     for result in extractions:
         # 兼容旧的 dict 格式和新的 ExtractionResult
@@ -577,12 +605,6 @@ def node_build_canonical(ctx: dict):
             }
 
         # ─── Physical Persistence of Canonical Documents (JSON & MD) ───
-        import json
-        import os
-
-        simulate_db = _resolve_simulate(ctx, "db")
-        bucket, is_simulated_oss = _get_oss_bucket(ctx)
-
         # G#67：canonical JSON 用紧凑分隔符序列化（stage-2 会整包下载解析，indent=2 的缩进空白
         # 会把块级 OCR/VLM 文本体积放大两到四成；人读用旁边的 .md）。ensure_ascii=False 保留。
         json_data = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
@@ -594,20 +616,26 @@ def node_build_canonical(ctx: dict):
         # L2 canonical-text content hash (computed once; reused by the skip-gate + the RDS UPDATE).
         _canonical_sha256 = hashlib.sha256((md_data or "").encode("utf-8")).hexdigest()
 
-        # ── L2 skip-gate (flag-gated, default OFF: RAG_SKIP_UNCHANGED_REINGEST) ──
-        # If this is a re-ingest (version_no>1) whose canonical text is byte-identical to a prior
-        # version's, mark it SKIPPED_DUPLICATE and skip the rest of the pipeline (classify / PII /
-        # chunk / embed / index) — the prior version keeps serving. FAIL-SAFE: skip ONLY on a positive
-        # canonical_sha256 match against a prior version; any miss / NULL / error → process normally.
-        # (Maintenance re-chunks use a different path and create no new version, so they're unaffected.)
-        _skip_unchanged = os.environ.get("RAG_SKIP_UNCHANGED_REINGEST", "").lower() in ("1", "true", "yes")
-        if _skip_unchanged and not simulate_db and (canonical.get("version_no") or 0) > 1:
-            _do_skip = False
-            _prior_v = None
-            try:
-                _sk_conn = _get_db_conn(select_db=True)
+        # perf#92：本篇文档共享一个 DB 连接——skip 判定 SELECT、跨文档去重与最终 canonical-keys
+        # UPDATE 同连接同事务（原先三段各开一连接，每篇最多 3 次借还 + 3 次 commit）。惰性获取：
+        # simulate / 两个门未开时仅最终 UPDATE 才开连接。commit 粒度保持每篇一次（skip/dedup
+        # 短路路径各自 commit 后 continue），不跨文档攒批，失败隔离语义不变。
+        _doc_conn = None
+        try:
+            # ── L2 skip-gate (flag-gated, default OFF: RAG_SKIP_UNCHANGED_REINGEST) ──
+            # If this is a re-ingest (version_no>1) whose canonical text is byte-identical to a prior
+            # version's, mark it SKIPPED_DUPLICATE and skip the rest of the pipeline (classify / PII /
+            # chunk / embed / index) — the prior version keeps serving. FAIL-SAFE: skip ONLY on a positive
+            # canonical_sha256 match against a prior version; any miss / NULL / error → process normally.
+            # (Maintenance re-chunks use a different path and create no new version, so they're unaffected.)
+            _skip_unchanged = os.environ.get("RAG_SKIP_UNCHANGED_REINGEST", "").lower() in ("1", "true", "yes")
+            if _skip_unchanged and not simulate_db and (canonical.get("version_no") or 0) > 1:
+                _do_skip = False
+                _prior_v = None
                 try:
-                    with _sk_conn.cursor() as _sk_cur:
+                    if _doc_conn is None:
+                        _doc_conn = _get_db_conn(select_db=True)
+                    with _doc_conn.cursor() as _sk_cur:
                         _sk_cur.execute(
                             "SELECT version_no, canonical_sha256 FROM document_version "
                             "WHERE doc_id=%s AND version_no<%s AND canonical_sha256 IS NOT NULL "
@@ -627,45 +655,47 @@ def node_build_canonical(ctx: dict):
                                 (_prior[0], canonical["doc_id"]))
                             _do_skip = True
                             _prior_v = _prior[0]
-                    _sk_conn.commit()
-                finally:
-                    _sk_conn.close()
-            except Exception as _skip_err:
-                print(f"    ⚠️ skip-gate check failed (FAIL-SAFE: processing normally): {_skip_err}")
-                _do_skip = False
-            if _do_skip:
-                print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: canonical unchanged "
-                      f"vs v{_prior_v} → SKIPPED_DUPLICATE (prior version keeps serving)")
-                _audit_reingest_skip(
-                    ctx, canonical["doc_id"], canonical["version_no"],
-                    f"intra-doc: canonical unchanged vs prior v{_prior_v} (kept serving)", simulate_db)
-                continue  # exclude from canonicals → skips classify/chunk/embed/index for this doc
+                    # perf#92：仅 skip 短路路径 commit（写了状态行）；未命中不提交——skip 判定
+                    # SELECT 与最终 canonical-keys UPDATE 留在同一事务，消除两者间的窗口。
+                    if _do_skip:
+                        _doc_conn.commit()
+                except Exception as _skip_err:
+                    print(f"    ⚠️ skip-gate check failed (FAIL-SAFE: processing normally): {_skip_err}")
+                    _do_skip = False
+                    _doc_conn = _rollback_or_discard(_doc_conn)
+                if _do_skip:
+                    print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: canonical unchanged "
+                          f"vs v{_prior_v} → SKIPPED_DUPLICATE (prior version keeps serving)")
+                    _audit_reingest_skip(
+                        ctx, canonical["doc_id"], canonical["version_no"],
+                        f"intra-doc: canonical unchanged vs prior v{_prior_v} (kept serving)", simulate_db)
+                    continue  # exclude from canonicals → skips classify/chunk/embed/index for this doc
 
-        # ── Cross-doc dedup (flag-gated, default OFF: RAG_DEDUP_CROSS_DOC) ──
-        # 跨文档 exact-hash 去重：捕获 intra-doc gate 漏掉的 dup-of-public / 跨部门精确副本。
-        # 默认 WARN-and-process（仅告警仍入库）；仅当存在一个"可见性完整覆盖新文档受众"的 active
-        # incumbent 时才 SKIP（避免把文档藏到更受限/受众更窄的 incumbent 后 → ACL 静默降级）。
-        # 多条 exact-dup 时只要任一 incumbent 覆盖即可 SKIP（不取任意首行）。FAIL-SAFE：任何
-        # miss / NULL / 异常 → 正常处理；绝不停用 incumbent。索引 idx_canonical_sha256 是启用前提。
-        # ⚠️ 跳过空/近空 canonical：image-only / 抽取失败的文档其 canonical 文本为空，sha256 全部
-        # 落在空串 hash（e3b0c442…）→ 互相误判为 dup（生产实测的 group-10 假分组）。短文本同理无意义。
-        _xd_min_chars = 32
-        if (os.environ.get("RAG_DEDUP_CROSS_DOC", "").lower() in ("1", "true", "yes")
-                and not simulate_db
-                and md_data and len((md_data or "").strip()) >= _xd_min_chars):
-            try:
-                _xd_conn = _get_db_conn(select_db=True)
-                _cover = None    # an incumbent whose visibility fully covers the new doc's audience
-                _matches = []    # all exact-hash active incumbents (for WARN logging)
+            # ── Cross-doc dedup (flag-gated, default OFF: RAG_DEDUP_CROSS_DOC) ──
+            # 跨文档 exact-hash 去重：捕获 intra-doc gate 漏掉的 dup-of-public / 跨部门精确副本。
+            # 默认 WARN-and-process（仅告警仍入库）；仅当存在一个"可见性完整覆盖新文档受众"的 active
+            # incumbent 时才 SKIP（避免把文档藏到更受限/受众更窄的 incumbent 后 → ACL 静默降级）。
+            # 多条 exact-dup 时只要任一 incumbent 覆盖即可 SKIP（不取任意首行）。FAIL-SAFE：任何
+            # miss / NULL / 异常 → 正常处理；绝不停用 incumbent。索引 idx_canonical_sha256 是启用前提。
+            # ⚠️ 跳过空/近空 canonical：image-only / 抽取失败的文档其 canonical 文本为空，sha256 全部
+            # 落在空串 hash（e3b0c442…）→ 互相误判为 dup（生产实测的 group-10 假分组）。短文本同理无意义。
+            _xd_min_chars = 32
+            if (os.environ.get("RAG_DEDUP_CROSS_DOC", "").lower() in ("1", "true", "yes")
+                    and not simulate_db
+                    and md_data and len((md_data or "").strip()) >= _xd_min_chars):
                 try:
+                    if _doc_conn is None:
+                        _doc_conn = _get_db_conn(select_db=True)
+                    _cover = None    # an incumbent whose visibility fully covers the new doc's audience
+                    _matches = []    # all exact-hash active incumbents (for WARN logging)
                     # new doc's ACL comes from document_meta (set at register; not yet on canonical)
-                    with _xd_conn.cursor() as _xd_cur:
+                    with _doc_conn.cursor() as _xd_cur:
                         _xd_cur.execute(
                             "SELECT permission_level, owner_dept FROM document_meta WHERE doc_id=%s",
                             (canonical["doc_id"],))
                         _self = _xd_cur.fetchone()
                     _new_pl, _new_dept = (_self[0], _self[1]) if _self else (None, None)
-                    with _xd_conn.cursor() as _xd_cur:
+                    with _doc_conn.cursor() as _xd_cur:
                         _xd_cur.execute(
                             "SELECT dv.doc_id, dm.permission_level, dm.owner_dept "
                             "FROM document_version dv JOIN document_meta dm ON dv.doc_id=dm.doc_id "
@@ -679,7 +709,7 @@ def node_build_canonical(ctx: dict):
                         if _cover is None and _xd_covers((_r[1], _r[2]), (_new_pl, _new_dept)):
                             _cover = (_r[0], _r[1], _r[2])
                     if _cover:
-                        with _xd_conn.cursor() as _xd_cur:
+                        with _doc_conn.cursor() as _xd_cur:
                             # write canonical_sha256 on the SKIPPED row (else a later intra-doc match misses)
                             _xd_cur.execute(
                                 "UPDATE document_version SET content_process_status='SKIPPED_DUPLICATE', "
@@ -687,108 +717,108 @@ def node_build_canonical(ctx: dict):
                                 "canonical_sha256=%s, processed_at=NOW() "
                                 "WHERE doc_id=%s AND version_no=%s",
                                 (_canonical_sha256, canonical["doc_id"], canonical["version_no"]))
-                        _xd_conn.commit()
-                finally:
-                    _xd_conn.close()
-                if _cover:
-                    print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: cross-doc duplicate "
-                          f"of {_cover[0]} (covering incumbent) → SKIPPED_DUPLICATE")
-                    _audit_reingest_skip(
-                        ctx, canonical["doc_id"], canonical["version_no"],
-                        f"cross-doc: covered by incumbent {_cover[0]} "
-                        f"(pl={_cover[1]}, owner={_cover[2]})", simulate_db)
-                    continue
-                elif _matches:
-                    _w = (f"{canonical['doc_id']}: cross-doc content match with {_matches[:5]} but no "
-                          f"incumbent covers its audience → WARN, processing normally (ACL review)")
-                    print(f"    ⚠️ {_w}")
-                    ctx.setdefault("validation_warnings", []).append(_w)
-            except Exception as _xd_err:
-                print(f"    ⚠️ cross-doc dedup check failed (FAIL-SAFE: processing normally): {_xd_err}")
+                        _doc_conn.commit()
+                        print(f"    ⏭️ {canonical['doc_id']} v{canonical['version_no']}: cross-doc duplicate "
+                              f"of {_cover[0]} (covering incumbent) → SKIPPED_DUPLICATE")
+                        _audit_reingest_skip(
+                            ctx, canonical["doc_id"], canonical["version_no"],
+                            f"cross-doc: covered by incumbent {_cover[0]} "
+                            f"(pl={_cover[1]}, owner={_cover[2]})", simulate_db)
+                        continue
+                    elif _matches:
+                        _w = (f"{canonical['doc_id']}: cross-doc content match with {_matches[:5]} but no "
+                              f"incumbent covers its audience → WARN, processing normally (ACL review)")
+                        print(f"    ⚠️ {_w}")
+                        ctx.setdefault("validation_warnings", []).append(_w)
+                except Exception as _xd_err:
+                    print(f"    ⚠️ cross-doc dedup check failed (FAIL-SAFE: processing normally): {_xd_err}")
+                    _doc_conn = _rollback_or_discard(_doc_conn)
 
-        # 1. Write files physically
-        if is_simulated_oss:
-            # Local filesystem mock
-            try:
-                os.makedirs(os.path.dirname(canonical_key), exist_ok=True)
-                with open(canonical_key, "w", encoding="utf-8") as f:
-                    f.write(json_data)
-                print(f"    ├─ [SIMULATED] Saved canonical JSON file: {canonical_key}")
+            # 1. Write files physically
+            if is_simulated_oss:
+                # Local filesystem mock
+                try:
+                    os.makedirs(os.path.dirname(canonical_key), exist_ok=True)
+                    with open(canonical_key, "w", encoding="utf-8") as f:
+                        f.write(json_data)
+                    print(f"    ├─ [SIMULATED] Saved canonical JSON file: {canonical_key}")
 
-                if canonical_md_key:
-                    os.makedirs(os.path.dirname(canonical_md_key), exist_ok=True)
-                    with open(canonical_md_key, "w", encoding="utf-8") as f:
-                        f.write(md_data)
-                    print(f"    ├─ [SIMULATED] Saved canonical MD file: {canonical_md_key}")
-            except Exception as e:
-                print(f"    ⚠️ Failed to write simulated canonical files: {e}")
-        else:
-            # Real OSS upload
-            try:
-                bucket.put_object(canonical_key, json_data.encode("utf-8"))
-                print(f"    ├─ Uploaded canonical JSON payload to OSS: {canonical_key}")
+                    if canonical_md_key:
+                        os.makedirs(os.path.dirname(canonical_md_key), exist_ok=True)
+                        with open(canonical_md_key, "w", encoding="utf-8") as f:
+                            f.write(md_data)
+                        print(f"    ├─ [SIMULATED] Saved canonical MD file: {canonical_md_key}")
+                except Exception as e:
+                    print(f"    ⚠️ Failed to write simulated canonical files: {e}")
+            else:
+                # Real OSS upload
+                try:
+                    bucket.put_object(canonical_key, json_data.encode("utf-8"))
+                    print(f"    ├─ Uploaded canonical JSON payload to OSS: {canonical_key}")
 
-                if canonical_md_key:
-                    bucket.put_object(canonical_md_key, md_data.encode("utf-8"))
-                    print(f"    ├─ Uploaded canonical MD payload to OSS: {canonical_md_key}")
-            except Exception as e:
-                print(f"    ⚠️ Failed to upload canonical files to OSS: {e}")
-                raise RuntimeError(f"OSS upload failed for canonical document: {e}") from e
+                    if canonical_md_key:
+                        bucket.put_object(canonical_md_key, md_data.encode("utf-8"))
+                        print(f"    ├─ Uploaded canonical MD payload to OSS: {canonical_md_key}")
+                except Exception as e:
+                    print(f"    ⚠️ Failed to upload canonical files to OSS: {e}")
+                    raise RuntimeError(f"OSS upload failed for canonical document: {e}") from e
 
-        # 2. Update RDS metadata
-        if not simulate_db:
-            # L2: content hashes. canonical_sha256 computed above (reused by the skip-gate); checksum_sha256
-            # = sha256 of raw bytes (from node_extract). Additive; a NULL hash means "process" (fail-safe).
-            _raw_checksum = ctx.get("_raw_checksum", {}).get(
-                (canonical["doc_id"], canonical["version_no"]))
-            conn = None
-            try:
-                conn = _get_db_conn(select_db=True)
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE document_version
-                        SET canonical_json_key = %s,
-                            canonical_md_key = %s,
-                            checksum_sha256 = %s,
-                            canonical_sha256 = %s,
-                            extraction_status = 'COMPLETED',
-                            ocr_status = %s,
-                            page_count = %s,
-                            text_length = %s,
-                            extract_method = %s
-                        WHERE doc_id = %s AND version_no = %s
-                    """, (
-                        canonical_key,
-                        canonical_md_key,
-                        _raw_checksum,
-                        _canonical_sha256,
-                        canonical.get("ocr_status", "NOT_REQUIRED"),
-                        canonical.get("page_count", 0),
-                        canonical.get("text_length", 0),
-                        canonical.get("extract_method", "native"),
-                        canonical["doc_id"],
-                        canonical["version_no"]
-                    ))
-                conn.commit()
-                print(f"    ├─ Saved canonical keys to RDS for {canonical['doc_id']} v{canonical['version_no']}")
-            except Exception as e:
-                if conn: conn.rollback()
-                print(f"    ⚠️ Failed to save canonical keys to RDS: {e}")
-                raise RuntimeError(f"Database write failure in node_build_canonical: {e}") from e
-            finally:
-                if conn:
-                    conn.close()
+            # 2. Update RDS metadata
+            if not simulate_db:
+                # L2: content hashes. canonical_sha256 computed above (reused by the skip-gate); checksum_sha256
+                # = sha256 of raw bytes (from node_extract). Additive; a NULL hash means "process" (fail-safe).
+                _raw_checksum = ctx.get("_raw_checksum", {}).get(
+                    (canonical["doc_id"], canonical["version_no"]))
+                try:
+                    if _doc_conn is None:
+                        _doc_conn = _get_db_conn(select_db=True)
+                    with _doc_conn.cursor() as cursor:
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET canonical_json_key = %s,
+                                canonical_md_key = %s,
+                                checksum_sha256 = %s,
+                                canonical_sha256 = %s,
+                                extraction_status = 'COMPLETED',
+                                ocr_status = %s,
+                                page_count = %s,
+                                text_length = %s,
+                                extract_method = %s
+                            WHERE doc_id = %s AND version_no = %s
+                        """, (
+                            canonical_key,
+                            canonical_md_key,
+                            _raw_checksum,
+                            _canonical_sha256,
+                            canonical.get("ocr_status", "NOT_REQUIRED"),
+                            canonical.get("page_count", 0),
+                            canonical.get("text_length", 0),
+                            canonical.get("extract_method", "native"),
+                            canonical["doc_id"],
+                            canonical["version_no"]
+                        ))
+                    _doc_conn.commit()
+                    print(f"    ├─ Saved canonical keys to RDS for {canonical['doc_id']} v{canonical['version_no']}")
+                except Exception as e:
+                    if _doc_conn is not None:
+                        _doc_conn.rollback()
+                    print(f"    ⚠️ Failed to save canonical keys to RDS: {e}")
+                    raise RuntimeError(f"Database write failure in node_build_canonical: {e}") from e
 
-        block_count = len(canonical.get("blocks", []))
-        warn_count = len(canonical.get("warnings", []))
-        print(
-            f"    └─ {canonical['doc_id']}: canonical built "
-            f"({canonical['text_length']} chars, {block_count} blocks"
-            f"{f', {warn_count} warnings' if warn_count else ''})"
-        )
+            block_count = len(canonical.get("blocks", []))
+            warn_count = len(canonical.get("warnings", []))
+            print(
+                f"    └─ {canonical['doc_id']}: canonical built "
+                f"({canonical['text_length']} chars, {block_count} blocks"
+                f"{f', {warn_count} warnings' if warn_count else ''})"
+            )
 
-        # Append only after a successful (non-skipped) build — the skip-gate `continue`s above.
-        canonicals.append(canonical)
+            # Append only after a successful (non-skipped) build — the skip-gate `continue`s above.
+            canonicals.append(canonical)
+        finally:
+            # perf#92：本篇共享连接统一归还（skip/dedup 的 continue、OSS/DB 的 raise、正常路径皆经此）。
+            if _doc_conn is not None:
+                _doc_conn.close()
 
     ctx["canonicals"] = canonicals
 
@@ -4854,159 +4884,166 @@ def node_write_chunk_meta(ctx: dict):
         version = doc.get("version_no")
         if doc_id and version:
             doc_versions_to_process.add((doc_id, version))
-            
+
+    # perf#93：同一遍按 (doc_id, version_no) 分桶——闭环循环里原先每个 (doc,version) 都对
+    # valid_chunks 做一次全量重扫（O(D×C)），现在 O(1) 查桶；桶内保持 valid_chunks 原序。
+    _chunks_by_dv: Dict[tuple, list] = {}
     for chunk in valid_chunks:
         doc_versions_to_process.add((chunk.doc_id, chunk.version_no))
+        _chunks_by_dv.setdefault((chunk.doc_id, chunk.version_no), []).append(chunk)
 
     # (doc_id, version) → canonical dict, for recovering per-doc flags (e.g. chunk-explosion quarantine)
     _canon_by_dv = {(d.get("doc_id"), d.get("version_no")): d for d in canonicals}
 
-    for doc_id, ver in sorted(doc_versions_to_process):
-        doc_chunks = [c for c in valid_chunks if c.doc_id == doc_id and c.version_no == ver]
-        chunk_cnt = len(doc_chunks)
+    # perf#93：闭环阶段整批共享一个连接（原先每文档最多 2 个短连接：状态 UPDATE 自开自关，
+    # write_audit 再开一个）。commit 粒度保持每文档一次，失败隔离不变：quarantine/0-chunk 分支
+    # fail-open 继续下一文档，DONE 分支 fail-closed raise；单文档出错经 _rollback_or_discard
+    # 清理半途事务（连接坏则丢弃、下一文档惰性重建，等价于原先的每文档新连接隔离）。
+    # write_audit 不复用共享连接：其 cursor 注入模式是 serving 专用原子审计（不吞异常、随调用方
+    # 事务提交，见 audit_log.py 文档），复用会把「审计失败绝不阻断摄取」的 fail-open 契约改成
+    # fail-closed，故保持自开短连接。
+    _closure_conn = None
+    try:
+        for doc_id, ver in sorted(doc_versions_to_process):
+            doc_chunks = _chunks_by_dv.get((doc_id, ver), [])
+            chunk_cnt = len(doc_chunks)
 
-        _exp_reason = _canon_by_dv.get((doc_id, ver), {}).get("chunk_explosion_reason")
-        if chunk_cnt == 0 and _exp_reason:
-            # chunk-explosion quarantine: record a VISIBLE status (not silent EMPTY) + retire the
-            # orphaned rag-ready artifact (publish ran before chunk) — RDS publish_status + NULL
-            # rag_ready_key, mirroring the SKIPPED_EMPTY cleanup, not just in-memory fields.
-            print(f"    🚫 {doc_id} v{ver}: chunk-explosion quarantined — {_exp_reason}")
-            if not simulate_db:
-                conn = None
+            _exp_reason = _canon_by_dv.get((doc_id, ver), {}).get("chunk_explosion_reason")
+            if chunk_cnt == 0 and _exp_reason:
+                # chunk-explosion quarantine: record a VISIBLE status (not silent EMPTY) + retire the
+                # orphaned rag-ready artifact (publish ran before chunk) — RDS publish_status + NULL
+                # rag_ready_key, mirroring the SKIPPED_EMPTY cleanup, not just in-memory fields.
+                print(f"    🚫 {doc_id} v{ver}: chunk-explosion quarantined — {_exp_reason}")
+                if not simulate_db:
+                    try:
+                        if _closure_conn is None:
+                            _closure_conn = _get_db_conn(select_db=True)
+                        with _closure_conn.cursor() as cursor:
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET chunk_status = 'QUARANTINED_EXPLOSION',
+                                    content_process_status = 'QUARANTINED',
+                                    content_process_error = %s,
+                                    publish_status = 'SKIPPED_EXPLOSION',
+                                    rag_ready_key = NULL,
+                                    processed_at = NOW()
+                                WHERE doc_id = %s AND version_no = %s
+                            """, (f"chunk-explosion: {_exp_reason}"[:255], doc_id, ver))
+                            _closure_conn.commit()
+                    except Exception as db_err:
+                        _closure_conn = _rollback_or_discard(_closure_conn)
+                        print(f"    ⚠️ Failed to write explosion-quarantine status for {doc_id} v{ver}: {db_err}")
+                else:
+                    print(f"    └─ [SIMULATED] {doc_id} v{ver} chunk_status='QUARANTINED_EXPLOSION', "
+                          f"publish_status='SKIPPED_EXPLOSION', rag_ready_key=NULL")
+            elif chunk_cnt == 0:
+                # 0 chunk 收尾：区分「真空文档」(合法无文本) 与「疑似失败」(本应有内容却没产出)。
+                # 旧逻辑一律 chunk_status='EMPTY' + content_process_status='DONE'(成功)，使损坏文件 /
+                # 扫描件 OCR 失败 / 抽取异常 的文档与合法空文档无法区分 → 坏 SOP 静默从检索消失且无告警
+                # (known-issues: 77 chunk-EMPTY 中 4 个真 SOP=bug 即此类)。用 canonical 已有信号判定，
+                # 疑似失败 → NEEDS_REVIEW + FAILED（可查询、不被 NOT_STARTED 扫描重新认领 → 不形成
+                # 重试循环），原因写入 content_process_error。无 schema 变更（列均为 VARCHAR）。
+                # 隔离文档 (PII / 成本 QUARANTINE) 不在此重新定级 —— 保留既有 EMPTY/DONE 行为不动。
+                _canon = _canon_by_dv.get((doc_id, ver), {}) or {}
+                _is_quarantine = _canon.get("redaction_action") == "QUARANTINE"
+                _text_len = _canon.get("text_length")
+                if _text_len is None:
+                    _text_len = len(_canon.get("text") or "")
+                _ocr_status = str(_canon.get("ocr_status") or "").upper()
+                _extract_method = str(_canon.get("extract_method") or "")
+                _warns = _canon.get("warnings") or []
                 try:
-                    conn = _get_db_conn(select_db=True)
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET chunk_status = 'QUARANTINED_EXPLOSION',
-                                content_process_status = 'QUARANTINED',
-                                content_process_error = %s,
-                                publish_status = 'SKIPPED_EXPLOSION',
-                                rag_ready_key = NULL,
-                                processed_at = NOW()
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (f"chunk-explosion: {_exp_reason}"[:255], doc_id, ver))
-                        conn.commit()
-                except Exception as db_err:
-                    if conn:
-                        conn.rollback()
-                    print(f"    ⚠️ Failed to write explosion-quarantine status for {doc_id} v{ver}: {db_err}")
-                finally:
-                    if conn:
-                        conn.close()
-            else:
-                print(f"    └─ [SIMULATED] {doc_id} v{ver} chunk_status='QUARANTINED_EXPLOSION', "
-                      f"publish_status='SKIPPED_EXPLOSION', rag_ready_key=NULL")
-        elif chunk_cnt == 0:
-            # 0 chunk 收尾：区分「真空文档」(合法无文本) 与「疑似失败」(本应有内容却没产出)。
-            # 旧逻辑一律 chunk_status='EMPTY' + content_process_status='DONE'(成功)，使损坏文件 /
-            # 扫描件 OCR 失败 / 抽取异常 的文档与合法空文档无法区分 → 坏 SOP 静默从检索消失且无告警
-            # (known-issues: 77 chunk-EMPTY 中 4 个真 SOP=bug 即此类)。用 canonical 已有信号判定，
-            # 疑似失败 → NEEDS_REVIEW + FAILED（可查询、不被 NOT_STARTED 扫描重新认领 → 不形成
-            # 重试循环），原因写入 content_process_error。无 schema 变更（列均为 VARCHAR）。
-            # 隔离文档 (PII / 成本 QUARANTINE) 不在此重新定级 —— 保留既有 EMPTY/DONE 行为不动。
-            _canon = _canon_by_dv.get((doc_id, ver), {}) or {}
-            _is_quarantine = _canon.get("redaction_action") == "QUARANTINE"
-            _text_len = _canon.get("text_length")
-            if _text_len is None:
-                _text_len = len(_canon.get("text") or "")
-            _ocr_status = str(_canon.get("ocr_status") or "").upper()
-            _extract_method = str(_canon.get("extract_method") or "")
-            _warns = _canon.get("warnings") or []
-            try:
-                _text_threshold = int(os.environ.get("RAG_EMPTY_DOC_TEXT_THRESHOLD", "100"))
-            except ValueError:
-                _text_threshold = 100
+                    _text_threshold = int(os.environ.get("RAG_EMPTY_DOC_TEXT_THRESHOLD", "100"))
+                except ValueError:
+                    _text_threshold = 100
 
-            _reasons = []
-            if not _is_quarantine:
-                if _ocr_status == "FAILED":
-                    _reasons.append("ocr_failed")
-                if _text_len >= _text_threshold:
-                    # 有实质正文却 0 chunk → chunker/validator 把所有 chunk 丢光（如超长 table_chunk）
-                    _reasons.append(f"text_present({_text_len}chars)_but_zero_chunks")
-                _em_low = _extract_method.lower()
-                if any(k in _em_low for k in ("unsupported", "failed", "error")):
-                    _reasons.append(f"extract_method={_extract_method}")
-                _faily = [str(w) for w in _warns if any(
-                    k in str(w).lower() for k in ("fail", "error", "cannot", "无法", "错误", "失败"))]
-                if _faily:
-                    _reasons.append("warn:" + " | ".join(_faily))
+                _reasons = []
+                if not _is_quarantine:
+                    if _ocr_status == "FAILED":
+                        _reasons.append("ocr_failed")
+                    if _text_len >= _text_threshold:
+                        # 有实质正文却 0 chunk → chunker/validator 把所有 chunk 丢光（如超长 table_chunk）
+                        _reasons.append(f"text_present({_text_len}chars)_but_zero_chunks")
+                    _em_low = _extract_method.lower()
+                    if any(k in _em_low for k in ("unsupported", "failed", "error")):
+                        _reasons.append(f"extract_method={_extract_method}")
+                    _faily = [str(w) for w in _warns if any(
+                        k in str(w).lower() for k in ("fail", "error", "cannot", "无法", "错误", "失败"))]
+                    if _faily:
+                        _reasons.append("warn:" + " | ".join(_faily))
 
-            if _reasons:
-                # content_process_status='FAILED' 复用既有"毒文档"机制：orchestrator Stage-2 谓词
-                # (content_process_status='FAILED' AND retry_count<3) 会重试 ≤3 次（自愈瞬时
-                # OCR/embedding 整轮故障），到 retry_count=3 自然停在 FAILED 等人工检查。**必须**在此
-                # 自增 retry_count —— claim 本身不自增，否则确定性坏文档(损坏 DOCX 等)会无限重处理。
-                _chunk_status, _cps = "NEEDS_REVIEW", "FAILED"
-                _cpe = ("suspected extraction/chunk failure: " + "; ".join(_reasons))[:255]
-                _retry_clause = ", retry_count = retry_count + 1"
-                print(f"    🚨 {doc_id} v{ver}: 0 chunks + SUSPECTED FAILURE → "
-                      f"chunk_status=NEEDS_REVIEW, content_process_status=FAILED, retry_count+1 ({_cpe})")
-            else:
-                _chunk_status, _cps = "EMPTY", "DONE"
-                _cpe = "No valid chunks generated (empty document)"
-                _retry_clause = ""
-                _tag = "quarantined" if _is_quarantine else "treated as empty"
-                print(f"    ⚠️ No valid chunks generated for document {doc_id} v{ver} ({_tag})")
+                if _reasons:
+                    # content_process_status='FAILED' 复用既有"毒文档"机制：orchestrator Stage-2 谓词
+                    # (content_process_status='FAILED' AND retry_count<3) 会重试 ≤3 次（自愈瞬时
+                    # OCR/embedding 整轮故障），到 retry_count=3 自然停在 FAILED 等人工检查。**必须**在此
+                    # 自增 retry_count —— claim 本身不自增，否则确定性坏文档(损坏 DOCX 等)会无限重处理。
+                    _chunk_status, _cps = "NEEDS_REVIEW", "FAILED"
+                    _cpe = ("suspected extraction/chunk failure: " + "; ".join(_reasons))[:255]
+                    _retry_clause = ", retry_count = retry_count + 1"
+                    print(f"    🚨 {doc_id} v{ver}: 0 chunks + SUSPECTED FAILURE → "
+                          f"chunk_status=NEEDS_REVIEW, content_process_status=FAILED, retry_count+1 ({_cpe})")
+                else:
+                    _chunk_status, _cps = "EMPTY", "DONE"
+                    _cpe = "No valid chunks generated (empty document)"
+                    _retry_clause = ""
+                    _tag = "quarantined" if _is_quarantine else "treated as empty"
+                    print(f"    ⚠️ No valid chunks generated for document {doc_id} v{ver} ({_tag})")
 
-            if not simulate_db:
-                conn = None
-                try:
-                    conn = _get_db_conn(select_db=True)
-                    with conn.cursor() as cursor:
-                        # _retry_clause 是上面二选一的常量字面量（非用户输入）→ 无注入风险。
-                        cursor.execute(f"""
-                            UPDATE document_version
-                            SET chunk_status = %s,
-                                content_process_status = %s,
-                                content_process_error = %s{_retry_clause},
-                                processed_at = NOW()
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (_chunk_status, _cps, _cpe, doc_id, ver))
-                        conn.commit()
-                except Exception as db_err:
-                    if conn: conn.rollback()
-                    print(f"    ⚠️ Failed to update failed status in RDS: {db_err}")
-                finally:
-                    if conn:
-                        conn.close()
+                if not simulate_db:
+                    try:
+                        if _closure_conn is None:
+                            _closure_conn = _get_db_conn(select_db=True)
+                        with _closure_conn.cursor() as cursor:
+                            # _retry_clause 是上面二选一的常量字面量（非用户输入）→ 无注入风险。
+                            cursor.execute(f"""
+                                UPDATE document_version
+                                SET chunk_status = %s,
+                                    content_process_status = %s,
+                                    content_process_error = %s{_retry_clause},
+                                    processed_at = NOW()
+                                WHERE doc_id = %s AND version_no = %s
+                            """, (_chunk_status, _cps, _cpe, doc_id, ver))
+                            _closure_conn.commit()
+                    except Exception as db_err:
+                        _closure_conn = _rollback_or_discard(_closure_conn)
+                        print(f"    ⚠️ Failed to update failed status in RDS: {db_err}")
+                else:
+                    print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} "
+                          f"chunk_status='{_chunk_status}', content_process_status='{_cps}'")
             else:
-                print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} "
-                      f"chunk_status='{_chunk_status}', content_process_status='{_cps}'")
-        else:
-            print(f"    └─ Document {doc_id} v{ver} generated {chunk_cnt} valid chunks.")
-            if not simulate_db:
-                conn = None
-                try:
-                    conn = _get_db_conn(select_db=True)
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET content_process_status = 'DONE',
-                                chunk_status = 'DONE',
-                                chunk_count = %s,
-                                processed_at = NOW(),
-                                content_process_error = NULL
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (chunk_cnt, doc_id, ver))
-                        conn.commit()
-                except Exception as db_err:
-                    if conn: conn.rollback()
-                    print(f"    ⚠️ Failed to update DONE status in RDS for document {doc_id} v{ver}: {db_err}")
-                    raise RuntimeError(f"Database write failure in node_write_chunk_meta status closure: {db_err}") from db_err
-                finally:
-                    if conn:
-                        conn.close()
-            else:
-                print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} content_process_status='DONE', chunk_status='DONE', chunk_count={chunk_cnt}")
+                print(f"    └─ Document {doc_id} v{ver} generated {chunk_cnt} valid chunks.")
+                if not simulate_db:
+                    try:
+                        if _closure_conn is None:
+                            _closure_conn = _get_db_conn(select_db=True)
+                        with _closure_conn.cursor() as cursor:
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET content_process_status = 'DONE',
+                                    chunk_status = 'DONE',
+                                    chunk_count = %s,
+                                    processed_at = NOW(),
+                                    content_process_error = NULL
+                                WHERE doc_id = %s AND version_no = %s
+                            """, (chunk_cnt, doc_id, ver))
+                            _closure_conn.commit()
+                    except Exception as db_err:
+                        _closure_conn = _rollback_or_discard(_closure_conn)
+                        print(f"    ⚠️ Failed to update DONE status in RDS for document {doc_id} v{ver}: {db_err}")
+                        raise RuntimeError(f"Database write failure in node_write_chunk_meta status closure: {db_err}") from db_err
+                else:
+                    print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} content_process_status='DONE', chunk_status='DONE', chunk_count={chunk_cnt}")
 
-            # L5 audit: per-(doc,version) chunk-status transition (DONE/EMPTY), fail-open + sim no-op.
-            from opensearch_pipeline.audit_log import write_audit, audit_trace_id
-            write_audit(doc_id=doc_id, version_no=ver, action_type="CHUNK",
-                        action_result=("DONE" if chunk_cnt > 0 else "EMPTY"),
-                        trace_id=audit_trace_id(ctx), message=f"{chunk_cnt} chunks",
-                        simulate=simulate_db)
+                # L5 audit: per-(doc,version) chunk-status transition (DONE/EMPTY), fail-open + sim no-op.
+                from opensearch_pipeline.audit_log import write_audit, audit_trace_id
+                write_audit(doc_id=doc_id, version_no=ver, action_type="CHUNK",
+                            action_result=("DONE" if chunk_cnt > 0 else "EMPTY"),
+                            trace_id=audit_trace_id(ctx), message=f"{chunk_cnt} chunks",
+                            simulate=simulate_db)
+    finally:
+        # perf#93：闭环共享连接统一归还（fail-open 分支、DONE 分支 raise、正常收尾皆经此）。
+        if _closure_conn is not None:
+            _closure_conn.close()
 
     ctx["chunk_meta_written"] = written
 

@@ -12,6 +12,7 @@ api.py — RAG 问答 FastAPI 应用
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -1334,54 +1335,92 @@ _hot_questions_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 _HOT_Q_EXCLUDE_TEXT = ("新会话", "重新开始")
 _HOT_Q_EXCLUDE_USER_PREFIX = ("miniapp-proto", "eval-", "test-")
 
+# perf#80 serve-stale-while-revalidate：hot-questions / success-pool 两处 1h 缓存
+# 过期后的首个请求原本在 chat 首页热路径上同步扛整个 30 天 GROUP BY 聚合（每小时
+# 一次的冷启动尖峰）。改为：过期且有旧值 → 立即返回旧值，单飞后台线程刷新（防击穿；
+# 刷新异常吞掉保留旧值，下个过期请求再触发重试）；进程启动后首次（无旧值）保持现状
+# 同步计算。--workers 1 单进程，进程内单飞锁即全局权威。
+_swr_refresh_lock = threading.Lock()
 
-@app.get("/api/hot-questions")
-def hot_questions(request: Request,
-                  identity: Optional[Identity] = Depends(current_identity)):
-    """真实高频问题 top-N，驱动 chat 页「示例问题」快捷栏。"""
-    _enforce_rate_limit(request, identity, scope="aux")
+
+def _swr_schedule_refresh(cache: Dict[str, Any], compute, label: str) -> None:
+    """单飞调度一次后台刷新：已有同缓存的刷新在跑则直接返回（防击穿）。"""
+    with _swr_refresh_lock:
+        if cache.get("refreshing"):
+            return
+        cache["refreshing"] = True
+
+    def _worker():
+        try:
+            data = compute()
+            # GIL 下逐键赋值原子；data 先于 ts 写入，读侧不会拿到「新鲜时间戳 + 旧数据」
+            cache["data"] = data
+            cache["ts"] = time.time()
+        except Exception:
+            logger.warning("%s 后台刷新失败，保留旧缓存", label, exc_info=True)
+        finally:
+            with _swr_refresh_lock:
+                cache["refreshing"] = False
+
+    threading.Thread(target=_worker, name=f"swr-{label}", daemon=True).start()
+
+
+def _swr_cached(cache: Dict[str, Any], ttl: float, compute, fallback, label: str):
+    """serve-stale-while-revalidate 读口（perf#80）：新鲜 → 直接返回；过期但有旧值 →
+    返回旧值 + 后台单飞刷新；无旧值（进程首个请求）→ 同步计算（失败回退 fallback）。"""
     now = time.time()
-    cached = _hot_questions_cache["data"]
-    if cached is not None and now - _hot_questions_cache["ts"] < _HOT_QUESTIONS_TTL_S:
-        return {"questions": cached}
+    cached = cache["data"]
+    if cached is not None:
+        if now - cache["ts"] < ttl:
+            return cached
+        _swr_schedule_refresh(cache, compute, label)
+        return cached
+    try:
+        data = compute()
+    except Exception:
+        logger.warning("%s 查询失败，使用兜底", label, exc_info=True)
+        data = fallback()
+    cache["ts"] = time.time()
+    cache["data"] = data
+    return data
 
+
+def _compute_hot_questions() -> List[str]:
+    """近 30 天高频 SUCCESS 问题 top-6 聚合（DB 异常上抛，回退语义由 _swr_cached 决定）。"""
     from opensearch_pipeline.qa_logger import _op_db
+    from opensearch_pipeline.db import _get_db_conn
 
     questions: List[str] = []
+    conn = _get_db_conn()
     try:
-        from opensearch_pipeline.db import _get_db_conn
-        conn = _get_db_conn()
-        try:
-            with conn.cursor() as cursor:
-                user_excludes = " AND ".join(
-                    "user_id NOT LIKE %s" for _ in _HOT_Q_EXCLUDE_USER_PREFIX
-                )
-                cursor.execute(
-                    f"""
-                    SELECT query_text, COUNT(*) AS cnt
-                    FROM {_op_db()}.qa_session_log
-                    WHERE answer_status = 'SUCCESS'
-                      AND created_at >= NOW() - INTERVAL 30 DAY
-                      AND CHAR_LENGTH(query_text) BETWEEN 4 AND 30
-                      AND {user_excludes}
-                    GROUP BY query_text
-                    HAVING cnt >= 2
-                    ORDER BY cnt DESC, MAX(id) DESC
-                    LIMIT 20
-                    """,
-                    tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
-                )
-                for text, _cnt in cursor.fetchall():
-                    t = (text or "").strip()
-                    if not t or t in _HOT_Q_EXCLUDE_TEXT:
-                        continue
-                    questions.append(t)
-                    if len(questions) >= 6:
-                        break
-        finally:
-            conn.close()
-    except Exception:
-        logger.warning("hot-questions 查询失败，使用静态兜底", exc_info=True)
+        with conn.cursor() as cursor:
+            user_excludes = " AND ".join(
+                "user_id NOT LIKE %s" for _ in _HOT_Q_EXCLUDE_USER_PREFIX
+            )
+            cursor.execute(
+                f"""
+                SELECT query_text, COUNT(*) AS cnt
+                FROM {_op_db()}.qa_session_log
+                WHERE answer_status = 'SUCCESS'
+                  AND created_at >= NOW() - INTERVAL 30 DAY
+                  AND CHAR_LENGTH(query_text) BETWEEN 4 AND 30
+                  AND {user_excludes}
+                GROUP BY query_text
+                HAVING cnt >= 2
+                ORDER BY cnt DESC, MAX(id) DESC
+                LIMIT 20
+                """,
+                tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
+            )
+            for text, _cnt in cursor.fetchall():
+                t = (text or "").strip()
+                if not t or t in _HOT_Q_EXCLUDE_TEXT:
+                    continue
+                questions.append(t)
+                if len(questions) >= 6:
+                    break
+    finally:
+        conn.close()
 
     # 不足 3 条时用静态默认补齐（去重保序）
     for q in _HOT_QUESTIONS_FALLBACK:
@@ -1389,9 +1428,17 @@ def hot_questions(request: Request,
             break
         if q not in questions:
             questions.append(q)
+    return questions
 
-    _hot_questions_cache["ts"] = now
-    _hot_questions_cache["data"] = questions
+
+@app.get("/api/hot-questions")
+def hot_questions(request: Request,
+                  identity: Optional[Identity] = Depends(current_identity)):
+    """真实高频问题 top-N，驱动 chat 页「示例问题」快捷栏。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    questions = _swr_cached(
+        _hot_questions_cache, _HOT_QUESTIONS_TTL_S, _compute_hot_questions,
+        lambda: list(_HOT_QUESTIONS_FALLBACK), "hot-questions")
     return {"questions": questions}
 
 
@@ -1408,50 +1455,47 @@ _REPHRASE_NOISE_PREFIX = (
 )
 
 
-def _success_question_pool() -> List[str]:
-    """近 30 天 SUCCESS 问题池（去重、4-40 字、排除控制指令/联调账号；缓存 1h）。"""
-    now = time.time()
-    cached = _success_pool_cache["data"]
-    if cached is not None and now - _success_pool_cache["ts"] < _SUCCESS_POOL_TTL_S:
-        return cached
-
+def _compute_success_pool() -> List[str]:
+    """近 30 天 SUCCESS 问题池聚合（DB 异常上抛，回退语义由 _swr_cached 决定）。"""
     from opensearch_pipeline.qa_logger import _op_db
+    from opensearch_pipeline.db import _get_db_conn
 
     pool: List[str] = []
+    conn = _get_db_conn()
     try:
-        from opensearch_pipeline.db import _get_db_conn
-        conn = _get_db_conn()
-        try:
-            with conn.cursor() as cursor:
-                user_excludes = " AND ".join(
-                    "user_id NOT LIKE %s" for _ in _HOT_Q_EXCLUDE_USER_PREFIX
-                )
-                cursor.execute(
-                    f"""
-                    SELECT query_text, COUNT(*) AS cnt
-                    FROM {_op_db()}.qa_session_log
-                    WHERE answer_status = 'SUCCESS'
-                      AND created_at >= NOW() - INTERVAL 30 DAY
-                      AND CHAR_LENGTH(query_text) BETWEEN 4 AND 40
-                      AND {user_excludes}
-                    GROUP BY query_text
-                    ORDER BY cnt DESC
-                    LIMIT 200
-                    """,
-                    tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
-                )
-                for text, _cnt in cursor.fetchall():
-                    t = (text or "").strip()
-                    if t and t not in _HOT_Q_EXCLUDE_TEXT:
-                        pool.append(t)
-        finally:
-            conn.close()
-    except Exception:
-        logger.warning("success 问题池查询失败（rephrase 退化为仅清洗原问题）", exc_info=True)
-
-    _success_pool_cache["ts"] = now
-    _success_pool_cache["data"] = pool
+        with conn.cursor() as cursor:
+            user_excludes = " AND ".join(
+                "user_id NOT LIKE %s" for _ in _HOT_Q_EXCLUDE_USER_PREFIX
+            )
+            cursor.execute(
+                f"""
+                SELECT query_text, COUNT(*) AS cnt
+                FROM {_op_db()}.qa_session_log
+                WHERE answer_status = 'SUCCESS'
+                  AND created_at >= NOW() - INTERVAL 30 DAY
+                  AND CHAR_LENGTH(query_text) BETWEEN 4 AND 40
+                  AND {user_excludes}
+                GROUP BY query_text
+                ORDER BY cnt DESC
+                LIMIT 200
+                """,
+                tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
+            )
+            for text, _cnt in cursor.fetchall():
+                t = (text or "").strip()
+                if t and t not in _HOT_Q_EXCLUDE_TEXT:
+                    pool.append(t)
+    finally:
+        conn.close()
     return pool
+
+
+def _success_question_pool() -> List[str]:
+    """近 30 天 SUCCESS 问题池（去重、4-40 字、排除控制指令/联调账号；缓存 1h，
+    perf#80 serve-stale：过期返回旧值 + 后台单飞刷新；查询失败退化为空池=仅清洗原问题）。"""
+    return _swr_cached(
+        _success_pool_cache, _SUCCESS_POOL_TTL_S, _compute_success_pool,
+        lambda: [], "success-pool(rephrase)")
 
 
 def _char_bigrams(s: str) -> set:

@@ -13,6 +13,7 @@ reranker.py — 路由式重排序（DashScope rerank），插入在混合检索
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 
@@ -24,6 +25,21 @@ logger = logging.getLogger(__name__)
 
 RERANK_URL_PATH = "/api/v1/services/rerank/text-rerank/text-rerank"
 _DOC_MAX_CHARS = 1200
+
+
+def _vl_min_images() -> int:
+    """RAG_RERANK_VL_MIN_IMAGES：纯文本查询整池路由到 VL 重排所需的最少【带图 chunk】数（perf#81）。
+
+    默认 1 = 与既有行为逐字节等价（20 条池里任意 1 条带图 chunk 即整池走 qwen3-vl-rerank）。
+    调大（如 3 = ≥3 条带图才走 VL）可避免只混入零星图片的池整池走更慢更贵的 VL 重排——但当前
+    路由是 251 题金集 A/B 数据驱动的选择（eval_harness/reports/rerank_findings.md），
+    **调大该阈值前必须重跑 251 题金集验证 recall@1 不回退**。非法值 / <1 一律按 1 处理；
+    multimodal 查询强制 VL 的分支不受本阈值影响。每次调用即时读 env（测试可 monkeypatch）。
+    """
+    try:
+        return max(1, int(os.environ.get("RAG_RERANK_VL_MIN_IMAGES", "1")))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _img_key(chunk: Dict[str, Any]) -> Optional[str]:
@@ -131,8 +147,18 @@ def rerank_chunks(
         base_url = base_url.rstrip("/")[: -len("/api/v1")]
 
     # multimodal path always uses VL; pure-text path uses VL only if the opt-in flag is set
-    # AND the pool actually has images (decided by the rerank A/B).
-    use_images = bool(multimodal) or (bool(cfg.rerank_route_vl) and any(_img_key(c) for c in chunks))
+    # AND the pool has >= RAG_RERANK_VL_MIN_IMAGES image-bearing chunks (default 1 = the exact
+    # A/B-validated behavior; see _vl_min_images — 调阈值前必须重跑 251 题金集).
+    use_images = bool(multimodal)
+    if not use_images and bool(cfg.rerank_route_vl):
+        need = _vl_min_images()
+        n_with_img = 0
+        for c in chunks:                     # 与 any() 同款短路：够数即停
+            if _img_key(c):
+                n_with_img += 1
+                if n_with_img >= need:
+                    break
+        use_images = n_with_img >= need
     model = cfg.rerank_vl_model if use_images else cfg.rerank_text_model
 
     try:

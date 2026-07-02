@@ -40,6 +40,7 @@ apply 脚本落库并记台账。
 | 012_qa_session_log_perf_index.sql | fuling_operation | (answer_status, created_at) 复合索引（性能第一梯队 #1） |
 | 013_qa_retrieved_doc_fact.sql | fuling_operation | 检索/引用文档物化事实表 + 存量回填（perf#3；读侧 RAG_QA_FACT_JOIN 门控） |
 | 014_document_version_raw_key_hash_index.sql | fuling_knowledge | raw_key_hash 回填 + idx_raw_key_hash（perf#5 注册幂等点查） |
+| 015_kb_audit_log_history_index.sql | fuling_knowledge | kb_audit_log (operator_type, action_type, created_at) 复合索引（perf#83/#96 审批历史查询） |
 
 ## 台账（schema_migrations）
 

@@ -1166,6 +1166,10 @@ class UnifiedExtractor:
             for slide_idx, slide in enumerate(prs.slides):
                 page_num = slide_idx + 1
                 slide_title = None  # 当前 slide 的标题
+                # perf#89：记录本 slide 的 blocks 起始下标。page_num 每 slide 唯一、块按序
+                # 追加（notes 在 Phase 3、图片块在循环结束后才 extend），故本 slide 的块
+                # 恒为 blocks[slide_start:] —— Phase 2 免去每 slide 对全量 blocks 的扫描。
+                slide_start = len(blocks)
 
                 # ── Phase 1: 按 shape 类型生成 blocks ──
                 for shape in slide.shapes:
@@ -1248,11 +1252,12 @@ class UnifiedExtractor:
 
                 # ── Phase 2: 如果没有检测到标题占位符，用 slide 序号做 fallback heading ──
                 if slide_title is None:
-                    # 检查此 slide 是否有任何内容 block
-                    slide_blocks = [b for b in blocks if b.page_num == page_num]
-                    if slide_blocks:
-                        # 找第一个有文本的 block 作为 slide 标题
-                        first_text = slide_blocks[0].text[:50] if slide_blocks else ""
+                    # 检查此 slide 是否有任何内容 block（perf#89：本 slide 首块即
+                    # blocks[slide_start]，无新增块时与原全量扫描同为 no-op——
+                    # current_section 保持沿用上一 slide 的值）
+                    if len(blocks) > slide_start:
+                        # 取本 slide 第一个 block 的前 50 字符作为 slide 标题
+                        first_text = blocks[slide_start].text[:50]
                         fallback_title = f"Slide {page_num}" + (f": {first_text}" if first_text else "")
                         current_section = fallback_title
 

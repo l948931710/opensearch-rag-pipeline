@@ -131,8 +131,12 @@ def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = False,
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cur:
-            cur.execute("SELECT id, chunk_id, is_active FROM chunk_meta")
+            # perf#90：消费方 _classify_stale 只需 active 集合（rds_active_ids/rds_active_chunkid），
+            # 历史 inactive 行拉回来只是被下面的 r[2]==1 丢弃 → 在 SQL 侧过滤，与 ~L190 的
+            # 二次确认读对齐。单测 fake cursor 按 SELECT 列形态区分两次读（本读三列，二次读两列）。
+            cur.execute("SELECT id, chunk_id, is_active FROM chunk_meta WHERE is_active=1")
             rows = cur.fetchall()
+            # MAX(id) 仍取全表：孤儿 PK 可能大于 max(active id)，扫描上界必须覆盖 inactive 行
             cur.execute("SELECT MAX(id) FROM chunk_meta")
             max_id = int(cur.fetchone()[0] or 0)
     except Exception as e:

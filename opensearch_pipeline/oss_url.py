@@ -47,11 +47,34 @@ def mime_for_ext(name_or_ext: str) -> str:
     return EXT_MIME.get(ext, "application/octet-stream")
 
 
+def _make_signing_bucket():
+    """构造签名用 oss2.Bucket（公网 endpoint）。凭据缺失/oss2 未装/异常 → None（调用方自行降级）。
+
+    perf#91：oss2.Auth + oss2.Bucket 的构造被批量签名场景反复重建——批量入口构造一次全批复用，
+    单 key 路径不变。返回 None 时调用方退回 generate_signed_url 的原路径（含原日志/告警语义）。
+    """
+    try:
+        from opensearch_pipeline.config import get_config
+        config = get_config()
+        access_id = config.oss.access_key_id
+        access_secret = config.oss.access_key_secret
+        if not access_id or access_id.strip() in ("xxx", ""):
+            return None
+        import oss2
+        public_endpoint = _ensure_public_endpoint(config.oss.endpoint)
+        return oss2.Bucket(oss2.Auth(access_id, access_secret),
+                           public_endpoint, config.oss.bucket_name)
+    except Exception as e:
+        logger.warning("构造共享签名 Bucket 失败（退回逐 key 原路径）: %s", e)
+        return None
+
+
 def generate_signed_url(
     oss_key: str,
     expires: Optional[int] = None,
     method: str = "GET",
     content_type: Optional[str] = None,
+    bucket=None,
 ) -> str:
     """
     将 OSS 对象 key 转为带签名的公开访问 URL。
@@ -64,6 +87,8 @@ def generate_signed_url(
         content_type: 仅 PUT 用——把 Content-Type 签入 URL。给定后客户端 PUT 必须发**完全一致**的
             Content-Type 头，否则 OSS 拒签（403）。用于把上传对象的类型钉死为申报扩展名对应 MIME，
             杜绝持 URL 者上传任意类型 / 与扩展名不符的字节。调用方须把同一值回传客户端（见 upload-url）。
+        bucket: 可选的已构造 oss2.Bucket（perf#91：批量场景经 _make_signing_bucket 复用，
+            免每 key 重建 Auth+Bucket）。None（默认）→ 内部自建，单 key 路径行为不变。
 
     Returns:
         签名 URL 字符串。失败时返回空字符串。
@@ -94,11 +119,12 @@ def generate_signed_url(
         return ""
 
     try:
-        # 确保使用公网 endpoint（钉钉客户端需要公网访问）
-        public_endpoint = _ensure_public_endpoint(endpoint)
+        if bucket is None:
+            # 确保使用公网 endpoint（钉钉客户端需要公网访问）
+            public_endpoint = _ensure_public_endpoint(endpoint)
 
-        auth = oss2.Auth(access_id, access_secret)
-        bucket = oss2.Bucket(auth, public_endpoint, bucket_name)
+            auth = oss2.Auth(access_id, access_secret)
+            bucket = oss2.Bucket(auth, public_endpoint, bucket_name)
 
         # PUT 绑定 Content-Type：签入 headers → 客户端必须发一致的 Content-Type，否则 OSS 403。
         sign_headers = {"Content-Type": content_type} if (content_type and method.upper() == "PUT") else None
@@ -237,6 +263,12 @@ def generate_signed_urls_batch(
         {oss_key: signed_url} 字典。生成失败的 key 值为空字符串。
     """
     result = {}
+    if not oss_keys:
+        return result
+    # perf#91：一次构造 Bucket 全批复用（原实现每个 key 重建 oss2.Auth+Bucket）。
+    # 构造失败 → bucket=None，逐 key 走 generate_signed_url 原路径（含原凭据缺失日志）。
+    # 失败语义不变：单 key 失败仅该 key 为空串，不拖垮整批。
+    bucket = _make_signing_bucket()
     for key in oss_keys:
-        result[key] = generate_signed_url(key, expires=expires)
+        result[key] = generate_signed_url(key, expires=expires, bucket=bucket)
     return result
