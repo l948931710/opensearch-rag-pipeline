@@ -25,336 +25,36 @@ from opensearch_pipeline.chunker import Chunk, DocumentChunker
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.image_binding_reconcile import reconcile_move
 
-# ─── 复用现有模块的敏感检测逻辑 ────────────────────────────────
+# ─── 共享基础设施（F-A1 结构债拆分，2026-07-01）────────────────────────────
+# PII 词表/正则、DB 连接池、客户端工厂已机械搬移到 pii_patterns.py / db.py /
+# clients.py 三个小模块——serving 侧（api/retriever/qa_logger/redaction/...）
+# 直接 import 小模块，不再因一次 QA 落库拖入本 7000+ 行摄取模块。
+# 这里 re-export 全部名字：本文件节点代码与既有 tests 的 monkeypatch 目标
+# （`opensearch_pipeline.pipeline_nodes.<name>`）继续按原样工作。
+# ⚠️ 不 re-export db._db_pool（模块级绑定是导入时快照，会随池重建失联）；
+# 需要读池状态请直接用 opensearch_pipeline.db。
+from opensearch_pipeline.clients import (  # noqa: F401
+    _ensure_opensearch_index,
+    _get_opensearch_client,
+    _get_oss_bucket,
+    _resolve_simulate,
+)
+from opensearch_pipeline.db import (  # noqa: F401
+    _get_db_conn,
+    _init_db_pool,
+    _pool_readonly_declared,
+    _reset_db_pool,
+)
+from opensearch_pipeline.pii_patterns import (  # noqa: F401
+    _MATERIAL_CODE_ANCHORS,
+    _SEVERITY_RANK,
+    ENTITY_PATTERNS,
+    ENTITY_SEVERITY,
+    REDACTION_MAP,
+    SEMANTIC_KEYWORDS,
+    _image_ocr_fp_ignore,
+)
 
-SEMANTIC_KEYWORDS = {
-    "pii": [
-        "身份证", "身份证号", "手机号", "电话号码", "家庭住址",
-        "银行卡", "银行卡号", "社保", "社保号", "护照",
-        "邮箱地址", "紧急联系人", "出生日期", "员工编号",
-        "薪资", "工资", "绩效", "花名册",
-    ],
-    "business": [
-        "客户报价", "供应商价格", "研发配方", "合同机密",
-        "银行流水", "财务报表", "利润表", "资产负债",
-    ],
-    "security": [
-        "账号密码", "数据库密码", "服务器地址", "VPN",
-        "AK/SK", "AccessKey", "SecretKey", "API密钥",
-    ],
-}
-
-# ⚠️ 号码/密钥类实体用显式 lookaround 定界，不用 \b：Python 正则里 CJK 属 \w，\b 只在
-# word/非word 交界成立，故「身份证号110101…」「密钥LTAI…」这类号码紧贴中文时 \b 不成立、
-# 整体漏检（cn_mobile 早已改用 (?<!\d)…(?!\d) 规避）。lookaround 只断言前后不是同类字符，
-# 与中文/空格/标点邻接均能命中，同时仍防止匹配更长数字/标识串的子串。redaction.py 直接
-# 复用本表（_FULL_ID/_ACCESS_KEY = ENTITY_PATTERNS[...]），改这里即同步修复入库脱敏侧。
-ENTITY_PATTERNS = {
-    "cn_id_card": r"(?<![0-9Xx])[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9Xx])",
-    "cn_mobile": r"(?<!\d)1[3-9]\d{9}(?!\d)",
-    "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-    "access_key": r"(?<![A-Za-z0-9])(LTAI|AKIA)[A-Za-z0-9]{12,}(?![A-Za-z0-9])",
-    "secret_like": r"(?i)\b(secret|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)[A-Za-z0-9_\-]{8,}",
-}
-
-REDACTION_MAP = {
-    "cn_id_card": lambda m: m.group()[:6] + "****" + m.group()[-4:],
-    "cn_mobile": lambda m: m.group()[:3] + "****" + m.group()[-4:],
-    "email": lambda m: m.group().split("@")[0][:2] + "***@" + m.group().split("@")[1],
-    "access_key": lambda m: m.group()[:8] + "****",
-    "secret_like": lambda m: m.group(1) + m.group(2) + "****",
-}
-
-# Per-entity severity. high → document QUARANTINE (dropped from index);
-# medium → REDACT (masked in-place via REDACTION_MAP, doc kept + indexed).
-# Internal contact numbers/emails in SOPs are masked (medium), not dropped; true
-# national identifiers and secrets remain high → quarantine.
-ENTITY_SEVERITY = {
-    "cn_id_card": "high",
-    "cn_mobile": "medium",
-    "email": "medium",
-    "access_key": "high",
-    "secret_like": "high",
-}
-_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
-
-# 图像 OCR PII 的已知误报锚点：18 位物料编码会命中 cn_id_card 正则。仅在这一类已确证的
-# FP 上抑制（锚点共现时），绝不抑制密钥/手机号等。⚠️ 启用 RAG_IMAGE_OCR_PII 前须用真实
-# CE38C5 等 OCR 样本验证此 allow-list，避免过度抑制真实身份证号。
-_MATERIAL_CODE_ANCHORS = ("物料编码", "物料号", "料号", "编码", "material code", "material no")
-
-
-def _image_ocr_fp_ignore(entity_name: str, ocr_text: str) -> bool:
-    """图像 OCR 命中是否属已知误报（当前仅：cn_id_card 命中且物料编码锚点共现）。"""
-    if entity_name == "cn_id_card":
-        low = ocr_text.lower()
-        return any(a.lower() in low for a in _MATERIAL_CODE_ANCHORS)
-    return False
-
-
-def _get_db_conn(select_db=True):
-    """从连接池获取一个数据库连接。
-
-    连接池由 DBUtils.PooledDB 管理，conn.close() 会将连接归还到池中而非真正关闭。
-    首次调用时懒初始化池；后续调用直接从池中获取。
-
-    注意: select_db 参数保留用于 API 兼容性。数据库在连接池初始化时已预选。
-
-    返回的不是裸连接，而是 GuardedDBConnection 代理：写语句（INSERT/UPDATE/DELETE/...）
-    在连接层过一次 assert_destructive_write_allowed，读语句直通。这让 RAG_READONLY /
-    非生产→生产 策略对**任何** cursor 写入生效（含 register_metadata、classify 冻结维护、
-    detect_sensitive、redact、publish 等没有显式守卫调用的"裸 cursor"节点），而不拖累
-    serving（retriever/api/dingtalk_identity）共用同一池的读路径。
-    """
-    global _db_pool
-    if _db_pool is None:
-        _init_db_pool()
-    from opensearch_pipeline.env_guard import GuardedDBConnection
-    return GuardedDBConnection(_db_pool.connection(), get_config().rds.host)
-
-
-# ─── 连接池内部实现 ───────────────────────────────────────────────
-
-_db_pool = None  # module-level singleton
-
-def _pool_readonly_declared(full_cfg) -> bool:
-    """连接池是否应以 SESSION READ ONLY 建立（声明式只读，物理 MySQL 边界）。
-
-    True 当：
-      - RAG_READONLY=true（PROD-RO 会话）——无条件只读，ack 不豁免（PROD-RO 硬边界）；或
-      - 非 production 标签却指向生产 RDS 实例，且**没有**当日 RAG_DESTRUCTIVE_PROD_ACK——
-        默认只读诊断形态（config 加载期 R1/R3 已强制 RAG_ALLOW_REMOTE_DB=read_only_ack 才放行连接）。
-    返回 False（可写）当：environment=production、staging 写 _stg 库、本地非生产目标，或
-    非生产标签指向生产 RDS **但带当日 destructive ack**——最后一种与连接层/节点层守卫
-    （assert_destructive_write_allowed 的 ack 策略）保持一致：三层同进同出、绝不互相打架，
-    同时保留 docs/environment_design.md 文档化的 RAG_DESTRUCTIVE_PROD_ACK 逃生口（写生产
-    需当日显式授权）。
-    """
-    if full_cfg.readonly:
-        return True
-    env = (full_cfg.environment or "development").lower()
-    if env == "production":
-        return False
-    if env == "staging" and full_cfg.rds.database.endswith("_stg"):
-        return False
-    from opensearch_pipeline.config import is_prod_target
-    if not is_prod_target("rds", full_cfg.rds.host):
-        return False
-    # 非生产标签 → 生产 RDS：默认只读；唯一放行写的口子 = 当日 destructive ack（与守卫层同源）。
-    from opensearch_pipeline.env_guard import _ack_today
-    return not _ack_today(os.environ.get("RAG_DESTRUCTIVE_PROD_ACK", ""))
-
-
-def _init_db_pool():
-    """懒初始化 MySQL 连接池。"""
-    global _db_pool
-    if _db_pool is not None:
-        return
-
-    import pymysql
-    from dbutils.pooled_db import PooledDB
-
-    full_cfg = get_config()
-    cfg = full_cfg.rds
-
-    # 🛡️ Sim→prod leak guard (added 2026-06-14 after the chunk_meta DELETE incident).
-    # simulate_db=True 表示全局 config 处于"sim 模式"——调用方应该走 mock 路径而非
-    # _get_db_conn。若此时 cfg.host 命中生产 RDS 指纹，几乎一定是 test fixture / sim
-    # 入口绕过了 sim 守卫直接连了 prod。拒绝建池避免 DELETE FROM chunk_meta 误打生产。
-    from opensearch_pipeline.config import is_prod_target
-    if full_cfg.simulate_db and is_prod_target("rds", cfg.host):
-        raise RuntimeError(
-            f"[DB POOL GUARD] simulate_db=True 但 RDS host {cfg.host!r} 命中生产指纹。"
-            f"拒绝建池防误写 prod。\n"
-            f"  - 想在 sim/test 流程里 *读* prod RDS："
-            f"用 opensearch_pipeline.prod_access.get_prod_readonly_conn() 而非 _get_db_conn。\n"
-            f"  - 真要写 prod：export RAG_SIMULATE=false RAG_SIMULATE_DB=false 再来（不推荐）。"
-        )
-
-    # 🛡️ P2 generalization (2026-06-16): 此前 _init_db_pool 的守卫**只在 simulate_db=True
-    # 时触发**。这个池是 ingest 写路径与 serving 读路径（retriever/api/dingtalk_identity）
-    # 共用的句柄，所以**不能**对声明式只读会话拒绝建池（会连读都断）；改为以
-    # SESSION TRANSACTION READ ONLY 建池——读照常，任何写在 MySQL 层直接 ERROR 1792。
-    # 这让 RAG_READONLY 成为池层的**物理**边界（belt），与连接层 cursor 守卫（suspenders）
-    # 互补，并把守卫覆盖面从"simulate_db=True"扩展到声明式只读的真实跑。
-    pool_readonly = _pool_readonly_declared(full_cfg)
-
-    pool_kwargs = dict(
-        creator=pymysql,
-        mincached=2,           # 池中保持的最小空闲连接数
-        maxcached=5,           # 池中保持的最大空闲连接数
-        maxconnections=10,     # 池允许的最大连接数 (0 = 无限制)
-        blocking=True,         # 连接数耗尽时阻塞等待，而非抛异常
-        ping=1,                # 每次取连接时 ping 一次，自动重连 (应对 MySQL wait_timeout)
-        host=cfg.host,
-        port=cfg.port,
-        user=cfg.user,
-        password=cfg.password,
-        database=cfg.database,  # 预选数据库，所有连接自动使用此库
-        charset=cfg.charset,
-        connect_timeout=cfg.connect_timeout,
-        read_timeout=cfg.read_timeout,
-        autocommit=False,
-    )
-    if pool_readonly:
-        # 与 prod_access.get_prod_readonly_conn 同源的会话级只读：对后续所有事务
-        # （含 autocommit 隐式事务）生效，PooledDB 复用连接时保持（session-level，非事务级）。
-        pool_kwargs["init_command"] = "SET SESSION TRANSACTION READ ONLY"
-
-    _db_pool = PooledDB(**pool_kwargs)
-    print(f"    [Pool] MySQL connection pool initialized (min=2, max=10, "
-          f"host={cfg.host}:{cfg.port}, db={cfg.database}"
-          + ("，🔒 SESSION READ ONLY（声明式只读）" if pool_readonly else "") + ")")
-
-
-def _reset_db_pool():
-    """关闭并重置连接池。用于测试清理或配置变更后重新初始化。"""
-    global _db_pool
-    if _db_pool is not None:
-        _db_pool.close()
-        _db_pool = None
-
-
-def _resolve_simulate(ctx: dict, kind: str, default=None) -> bool:
-    """统一解析 simulate 开关：ctx 细粒度键 > ctx 全局 "simulate" > 兜底值。
-
-    兜底值默认取 config.simulate_<kind>；个别调用方（如 OSS 客户端包装）用自身参数
-    兜底时显式传 default。此前这条三层取值在 ~19 处手写复制，并已出现漂移
-    （orchestrator 的 stage-2 loader 少了 ctx["simulate"] 一层）。
-    """
-    if default is None:
-        default = getattr(get_config(), f"simulate_{kind}")
-    return ctx.get(f"simulate_{kind}", ctx.get("simulate", default))
-
-
-def _get_opensearch_client(ctx: dict = None):
-    from opensearch_pipeline.config import get_config
-    config = get_config()
-
-    # 💡 如果是模拟模式，我们不需要真正的客户端，返回 Mock 字符串以允许干跑/Simulation 顺利通过。
-    #    DAG 节点必须传 ctx：开关按 ctx 细粒度 > ctx 全局 > config 解析（与 _get_oss_bucket 一致），
-    #    否则 ctx/config 不一致时真实跑会拿到 mock、假装 INDEXED 后又真删 RDS 旧版本（裂脑）。
-    simulate_opensearch = config.simulate_opensearch
-    if ctx is not None:
-        simulate_opensearch = _resolve_simulate(ctx, "opensearch", default=simulate_opensearch)
-    if simulate_opensearch:
-        return "MOCK_HA3_CLIENT"
-        
-    cfg = config.alibaba_vector
-    
-    # 💡 强健的设计：自适应支持标准开源 OpenSearch 以及阿里云向量检索版（HA3）
-    # 如果配置了 HA3_ENDPOINT 则使用阿里云专用 SDK；否则优雅降级为本地/开发标准 OpenSearch 客户端
-    if cfg and cfg.endpoint:
-        from alibabacloud_ha3engine_vector.client import Client
-        from alibabacloud_ha3engine_vector.models import Config
-        
-        # 去除 endpoint 中的 http:// 或 https:// 前缀保护
-        clean_endpoint = cfg.endpoint.replace("http://", "").replace("https://", "")
-        
-        ha3_config = Config(
-            endpoint=clean_endpoint,
-            instance_id=cfg.instance_id,
-            access_user_name=cfg.access_user_name,
-            access_pass_word=cfg.access_pass_word
-        )
-        return Client(ha3_config)
-    else:
-        # Fallback to standard OpenSearch for local development / testing
-        from opensearchpy import OpenSearch
-        os_cfg = config.opensearch
-        auth = (os_cfg.auth_user, os_cfg.auth_password) if os_cfg.auth_user and os_cfg.auth_password else None
-        client = OpenSearch(
-            hosts=[{'host': os_cfg.host, 'port': os_cfg.port}],
-            http_compress=True,
-            http_auth=auth,
-            use_ssl=os_cfg.use_ssl,
-            verify_certs=os_cfg.verify_certs,
-            ssl_assert_hostname=False,
-            ssl_show_warn=False
-        )
-        return client
-
-
-def _get_oss_bucket(ctx: dict = None):
-    """获取阿里云 OSS Bucket 客户端。"""
-    from opensearch_pipeline.config import get_config
-    config = get_config()
-    
-    # Resolve simulate_oss flag from context or global config
-    simulate_oss = config.simulate_oss
-    if ctx is not None:
-        simulate_oss = _resolve_simulate(ctx, "oss", default=simulate_oss)
-        
-    # Safe fallback: if credentials are dummy or empty, force simulation to prevent developer test errors
-    access_id = config.oss.access_key_id
-    if not access_id or access_id.strip() in ("xxx", ""):
-        return None, True
-        
-    if simulate_oss:
-        return None, True
-
-    # Real mode: oss2 is strictly required!
-    try:
-        import oss2
-    except ImportError:
-        raise ImportError(
-            "oss2 library is not installed, but real Aliyun OSS integration is requested "
-            "(simulate_oss is False and OSS credentials are configured). "
-            "Please ensure 'oss2' is added to requirements.txt."
-        )
-        
-    auth = oss2.Auth(config.oss.access_key_id, config.oss.access_key_secret)
-    bucket = oss2.Bucket(auth, config.oss.endpoint, config.oss.bucket_name)
-    # 写守卫代理：非生产环境写生产桶需当日 ack（读/签名透传）。本地正常形态是
-    # simulate_oss=true 不进此分支——代理只防"误设 simulate_oss=false + 生产桶"的配置漂移。
-    from opensearch_pipeline.env_guard import GuardedBucket
-    return GuardedBucket(bucket, config.oss.bucket_name), False
-
-
-def _ensure_opensearch_index(client, index_name: str, dimension: int):
-    """确保 OpenSearch 索引存在并具有正确的 Lucene KNN 映射。"""
-    # 如果是 HA3 Engine 客户端，其表结构由阿里云控制台可视化配置，不可在此动态创建，直接跳过
-    if hasattr(client, "push_documents") or client == "MOCK_HA3_CLIENT":
-        print(f"    ├─ [HA3 Engine] Table and mappings are fully managed on Alibaba Cloud Web Console. Skipping dynamic creation.")
-        return
-
-    if not client.indices.exists(index=index_name):
-        body = {
-            "settings": {
-                "index": {
-                    "knn": True,
-                    "knn.algo_param.ef_search": 100
-                }
-            },
-            "mappings": {
-                "properties": {
-                    "id": {"type": "keyword"},
-                    "chunk_id": {"type": "keyword"},
-                    "doc_id": {"type": "keyword"},
-                    "version_no": {"type": "integer"},
-                    "chunk_index": {"type": "integer"},
-                    "chunk_text": {"type": "text"},
-                    "source_image": {"type": "keyword"},
-                    "visual_summary": {"type": "text"},
-                    "chunk_vector": {
-                        "type": "knn_vector",
-                        "dimension": dimension,
-                        "method": {
-                            "name": "hnsw",
-                            "space_type": "l2",
-                            "engine": "lucene",
-                            "parameters": {"ef_construction": 128, "m": 24}
-                        }
-                    },
-                    "chunk_type": {"type": "keyword"},
-                    "owner_dept": {"type": "keyword"},
-                    "permission_level": {"type": "keyword"},
-                    "is_active": {"type": "boolean"}
-                }
-            }
-        }
-        client.indices.create(index=index_name, body=body)
-        print(f"    └─ [OpenSearch] Created index '{index_name}' with KNN dimension {dimension}")
 
 
 

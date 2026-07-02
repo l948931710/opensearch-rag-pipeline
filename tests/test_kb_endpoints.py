@@ -88,7 +88,6 @@ class _CaptureCur:
 
 def _stub_capture(monkeypatch):
     sink = {}
-    import opensearch_pipeline.pipeline_nodes as pn
 
     class _Conn:
         def cursor(self):
@@ -97,7 +96,7 @@ def _stub_capture(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
     return sink
 
 
@@ -195,7 +194,6 @@ def test_my_docs_dept_admin_search_keeps_owner_scope(monkeypatch):
 def _stub_rows(monkeypatch, rows):
     """桩游标：execute 捕获 SQL/params，fetchall 返回给定行（用于验 can_manage 映射）。"""
     sink = {}
-    import opensearch_pipeline.pipeline_nodes as pn
 
     class _RowsCur:
         def __enter__(self):
@@ -218,7 +216,7 @@ def _stub_rows(monkeypatch, rows):
         def close(self):
             pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
     return sink
 
 
@@ -300,7 +298,6 @@ def _stub_multi(monkeypatch, fetch_seq):
     """桩游标：execute 累积 calls；fetchone 依次弹 fetch_seq，fetchall 弹一个列表元素。"""
     sink = {"calls": []}
     seq = list(fetch_seq)
-    import opensearch_pipeline.pipeline_nodes as pn
 
     class _Cur:
         lastrowid = 123
@@ -332,7 +329,7 @@ def _stub_multi(monkeypatch, fetch_seq):
         def close(self):
             pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
     return sink
 
 
@@ -747,7 +744,6 @@ def _stub_myreq(monkeypatch, request_rows, doc_state):
     """桩游标（按 SQL 片段分支）：主列表 fetchall 返回 request_rows；per-doc count(fetchone) +
     allowed_depts(fetchall) 由 doc_state 提供。用于验 /api/kb/my-access-requests 派生同步态。"""
     import json
-    import opensearch_pipeline.pipeline_nodes as pn
 
     class _Cur:
         def __enter__(self):
@@ -783,7 +779,7 @@ def _stub_myreq(monkeypatch, request_rows, doc_state):
         def close(self):
             pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
 
 
 def test_my_access_requests_sync_state(monkeypatch):
@@ -957,7 +953,6 @@ def test_governance_kb_admin_shape_and_queries(monkeypatch):
 
 def _stub_all_fail(monkeypatch):
     """桩游标：每条 execute 都抛 → 验「全部子查询失败 → 诚实 500」而非 all-zeros 200。"""
-    import opensearch_pipeline.pipeline_nodes as pn
 
     class _Cur:
         def __enter__(self):
@@ -982,7 +977,7 @@ def _stub_all_fail(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
 
 
 def test_insights_all_queries_fail_raises_500(monkeypatch):
@@ -1010,7 +1005,6 @@ def test_insights_partial_failure_degrades_not_500(monkeypatch):
     """部分子查询失败（首条成功、其余抛）→ 不 500：已取到的指标照常，未取到的诚实空。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    import opensearch_pipeline.pipeline_nodes as pn
 
     class _Cur:
         def __init__(self):
@@ -1040,7 +1034,7 @@ def test_insights_partial_failure_degrades_not_500(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
     from opensearch_pipeline import api
     resp = api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))   # 不抛 500
     assert resp.questions == 12 and resp.success == 9    # 成功子查询的真实指标保留
@@ -1139,7 +1133,6 @@ def test_approval_history_partial_degrades_not_500(monkeypatch):
     """部分子查询失败（access 成功、其余抛）→ 不 500：已取到的照常，操作者名回退 uid。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    import opensearch_pipeline.pipeline_nodes as pn
     access = [("D1", "销售SOP", "marketing", "production", "王伟", "approved", "引用", "", "kb1", "2026-06-28 14:00:00")]
 
     class _Cur:
@@ -1170,7 +1163,7 @@ def test_approval_history_partial_degrades_not_500(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
     from opensearch_pipeline import api
     resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))   # 不抛 500
     assert [it.kind for it in resp.items] == ["access"]

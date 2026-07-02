@@ -78,7 +78,7 @@ def test_xlsx_step_card_without_parent_carries_image_refs():
              "image_refs_json": json.dumps([{"oss_key": "step1.png", "visual_summary": "第一步截图"}])}]
     cur = _RoutingCursor(meta, [], [])
     chunks = [{"chunk_type": "step_card", "chunk_id": "S1", "score": 1.0, "chunk_text": "步骤1"}]
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_conn(cur)):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_conn(cur)):
         out = retriever.expand_step_context(chunks, query="怎么操作")
     refs = out[0].get("image_refs")
     assert refs and refs[0]["oss_key"] == "step1.png"
@@ -101,7 +101,7 @@ def test_step_card_with_parent_expands_siblings_in_one_query():
     ]
     cur = _RoutingCursor(meta, siblings, [])
     chunks = [{"chunk_type": "step_card", "chunk_id": "S1", "score": 1.0}]
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_conn(cur)):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_conn(cur)):
         out = retriever.expand_step_context(chunks, query="完整流程怎么操作")  # full_procedure
     assert {c["chunk_id"] for c in out} == {"S0", "S1"}
     s1 = [c for c in out if c["chunk_id"] == "S1"][0]
@@ -122,7 +122,7 @@ def test_full_procedure_keeps_hit_when_truncated_out():
     ]
     cur = _RoutingCursor(meta, siblings, [])
     chunks = [{"chunk_type": "step_card", "chunk_id": "S10", "score": 1.0}]
-    with patch("opensearch_pipeline.pipeline_nodes._get_db_conn", return_value=_conn(cur)):
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_conn(cur)):
         out = retriever.expand_step_context(chunks, query="完整流程怎么操作")  # full_procedure
     out_ids = {c["chunk_id"] for c in out}
     assert "S10" in out_ids, f"命中卡 S10 被意图筛选裁掉：{sorted(out_ids)}"

@@ -16,14 +16,13 @@ def test_api_ready_simulate_returns_ok_skipped():
 
 def test_api_ready_503_on_rds_failure(monkeypatch):
     from fastapi.testclient import TestClient
-    import opensearch_pipeline.pipeline_nodes as pn
     import opensearch_pipeline.retriever as rt
     from opensearch_pipeline.config import get_config
     from opensearch_pipeline.api import app
 
     cfg = get_config()
     monkeypatch.setattr(cfg, "simulate", False)  # force the live-probe path
-    monkeypatch.setattr(pn, "_get_db_conn", lambda **kw: (_ for _ in ()).throw(RuntimeError("rds down")))
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: (_ for _ in ()).throw(RuntimeError("rds down")))
     monkeypatch.setattr(rt, "_get_ha3_client", lambda: "MOCK_HA3_CLIENT")  # HA3 skipped → only RDS fails
 
     r = TestClient(app).get("/api/ready")
@@ -36,7 +35,6 @@ def test_api_ready_ha3_probe_vector_tracks_config_dim(monkeypatch):
     """readiness-dim 回归：/api/ready 的 HA3 零向量探针维度跟随 config.embedding.dimension，
     不再硬编码 1024（HA3 重建为非默认维度时硬编码会让探针抛错→误报 503→摘掉健康实例）。"""
     from fastapi.testclient import TestClient
-    import opensearch_pipeline.pipeline_nodes as pn
     import opensearch_pipeline.retriever as rt
     from opensearch_pipeline.config import get_config
     from opensearch_pipeline.api import app
@@ -63,7 +61,7 @@ def test_api_ready_ha3_probe_vector_tracks_config_dim(monkeypatch):
         def close(self): pass
 
     monkeypatch.setattr(rt, "_get_ha3_client", lambda: _FakeHa3())
-    monkeypatch.setattr(pn, "_get_db_conn", lambda **kw: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: _Conn())
 
     TestClient(app).get("/api/ready")
     assert captured.get("vector") is not None, "live HA3 probe branch was not exercised"

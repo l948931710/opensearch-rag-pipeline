@@ -131,8 +131,7 @@ def test_run_rollup_fail_open(monkeypatch):
     cfg = get_config()
     monkeypatch.setattr(cfg, "simulate", False)
     monkeypatch.setattr(cfg, "simulate_db", False)
-    import opensearch_pipeline.pipeline_nodes as pn
-    monkeypatch.setattr(pn, "_get_db_conn",
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn",
                         lambda **k: (_ for _ in ()).throw(RuntimeError("db down")))
     rep = qa_rollup.run_rollup()
     assert rep["ok"] is False and "db down" in rep["error"]

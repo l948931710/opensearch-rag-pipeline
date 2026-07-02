@@ -53,6 +53,9 @@ CREATE TABLE IF NOT EXISTS kb_contribution (
 
     source_message_id    VARCHAR(128) DEFAULT NULL COMMENT '若从某条缺口「回答」而来，记录来源提问 message_id',
     gap_query            VARCHAR(512) DEFAULT NULL COMMENT '来源缺口问题原文（去重/溯源）',
+    -- F-35 修复（2026-07-01）：生产表自始有此列（scratch/apply_migration_010.py 建表含它、
+    -- 提交端点 INSERT 依赖它），本 DDL 此前漏写 → 按 schema/ 重建的环境提交贡献必 1054。
+    normalized_gap_query VARCHAR(512) DEFAULT NULL COMMENT 'normalize_question(gap_query)（NFKC+去空白标点+小写），缺口归并展示/比对用',
     gap_query_hash       CHAR(64)     DEFAULT NULL COMMENT 'sha256(normalize(gap_query))，与缺口列表对齐',
 
     created_at           DATETIME     DEFAULT CURRENT_TIMESTAMP,

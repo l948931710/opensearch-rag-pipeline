@@ -170,7 +170,7 @@ def _stub_drain(monkeypatch, *, flag=True, pending=(), status_by_doc=None, mater
         rds = _Rds()
 
     monkeypatch.setattr("opensearch_pipeline.config.get_config", lambda: _Cfg())
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda: _DrainConn(store))
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _DrainConn(store))
 
     def _mat(cur, doc_id, apply=True):
         if doc_id in materialize_raises:
@@ -247,11 +247,13 @@ def test_decide_enqueues_outbox_same_transaction_after_status_change():
     """撤权必达原子性（P0-3）：_kb_access_decide 在改 kb_access_request.status 的同一游标/事务内
     调用 enqueue_acl_projection，且 enqueue 在 status 变更【之后】（权威变更与投影意图原子提交）。
     enqueue 刻意不吞异常 → 失败则整笔回滚，绝不出现权威已改而 outbox 缺行的撕裂。"""
-    from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent
-           / "opensearch_pipeline" / "api.py").read_text(encoding="utf-8")
-    i = src.index("def _kb_access_decide(")
-    body = src[i:i + 4000]   # 函数体（decide 约 80 行，4k 字符足够覆盖）
+    import inspect
+
+    from opensearch_pipeline import api
+
+    # 经 api re-export 取函数源码（F-A2 后实现体在 routes/kb_access.py；inspect 跟随
+    # 函数对象而非源文件路径，后续搬移不再破坏本不变量测试）
+    body = inspect.getsource(api._kb_access_decide)
     assert "SET status=%s" in body, "decide 应改 kb_access_request.status"
     assert "enqueue_acl_projection(cur" in body, "decide 应同游标入队投影 outbox"
     assert body.index("SET status=%s") < body.index("enqueue_acl_projection(cur"), \

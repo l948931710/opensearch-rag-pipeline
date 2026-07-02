@@ -250,7 +250,7 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
         return []
 
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         conn = _get_db_conn()
         try:
@@ -336,6 +336,28 @@ def _resolve_user_dept(staff_id: str) -> List[str]:
         return []
 
 
+# 读时复核的进程内短 TTL 缓存（性能第一梯队 #3）：RAG_LIVE_ACL_REREAD 默认开 →
+# 每个带令牌请求都多付一次阻塞 RDS 往返，且 RDS brownout 时逐请求卡 connect/read
+# timeout、拖住本不依赖 RDS 的回答路径。短 TTL 内复用**DB 真值**（含"无在册行"），
+# 撤销语义几乎不变：TTL 到期即重查，令牌本身 2h 兜底，跨部门授权另有实时拒绝路径。
+# DB 异常不缓存（保持逐请求重试的 fail-open 原语义）。RAG_LIVE_ACL_TTL_SECONDS=0 关闭。
+_LIVE_ACL_MISS = object()   # 区分"缓存的 None（DB 确认无在册行）"与"未缓存"
+_live_acl_cache: dict = {}
+_live_acl_cache_lock = threading.Lock()
+
+
+def _live_acl_ttl_seconds() -> float:
+    try:
+        return float(os.environ.get("RAG_LIVE_ACL_TTL_SECONDS", "45"))
+    except ValueError:
+        return 45.0
+
+
+def _live_acl_cache_clear() -> None:
+    with _live_acl_cache_lock:
+        _live_acl_cache.clear()
+
+
 def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
     """读时实时重查（SELECT-only）：仅查 user_role 缓存，**不调钉钉 API、不 INSERT、无副作用**，
     供 current_identity 读路径对令牌内嵌 acl_groups 做实时复核（部门收紧/放宽即时生效，不等 TTL）。
@@ -344,11 +366,25 @@ def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
       - 命中在册行 → 返回归一化组列表（含放宽/收紧）。
       - 无在册行 或 DB 失败 → 返回 **None**（调用方据此【保留令牌内嵌组】）。绝不因瞬时 DB 抖动或
         未缓存把用户降到仅 public（区别于 _resolve_user_dept 的 []=fail-closed）。撤销窗口由短 TTL 兜底。
+
+    结果带 RAG_LIVE_ACL_TTL_SECONDS（默认 45s）进程内缓存——见 _live_acl_cache 注释。
     """
     if not staff_id or staff_id.startswith("$:"):
         return None
+
+    ttl = _live_acl_ttl_seconds()
+    now = time.time()
+    if ttl > 0:
+        with _live_acl_cache_lock:
+            ent = _live_acl_cache.get(staff_id)
+            if ent is not None and ent[0] > now:
+                val = ent[1]
+                if val is _LIVE_ACL_MISS:
+                    return None
+                return list(val)
+
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         conn = _get_db_conn()
         try:
@@ -363,8 +399,17 @@ def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
         finally:
             conn.close()
         if row and row[0]:
-            return _normalize_dept_to_codes(row[0])
-        return None   # 无在册行：可能只是未缓存，不收紧到 public；保留令牌组，短 TTL 兜底
+            groups = _normalize_dept_to_codes(row[0])
+        else:
+            groups = None   # 无在册行：可能只是未缓存，不收紧到 public；保留令牌组，短 TTL 兜底
+        if ttl > 0:
+            with _live_acl_cache_lock:
+                _live_acl_cache[staff_id] = (
+                    now + ttl, _LIVE_ACL_MISS if groups is None else list(groups))
+                # 粗粒度防胀：条目数超 4096 直接清空（正常在册用户 ~千级，不会触发）
+                if len(_live_acl_cache) > 4096:
+                    _live_acl_cache.clear()
+        return groups
     except Exception as e:
         logger.warning("读时 acl 复核失败（保留令牌组）staff_id=%s: %s", staff_id, e)
         return None
@@ -547,7 +592,7 @@ def _resolve_user_identity(userid: str) -> Dict[str, Any]:
     dept = _resolve_user_dept(userid)  # ACL 权限组列表（含缓存 + API 回退）
     name = ""
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -600,7 +645,7 @@ def resolve_kb_identity(staff_id: str):
     name = ""
     managed: List[str] = []
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         conn = _get_db_conn()
         try:

@@ -880,7 +880,7 @@ def _card_callback_authorized(message_id: str, user_id: str) -> bool:
     if not message_id:
         return False
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
@@ -1018,7 +1018,7 @@ def _rebuild_card_param_map(card_param_map: dict, message_id: str, context: str 
     card_param_map["is_answer_done"] = "true"
     _row_found = False
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cursor:

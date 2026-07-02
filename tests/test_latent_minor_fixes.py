@@ -239,7 +239,6 @@ class TestProcedureParentExpansion:
         """
         import json as _json
 
-        from opensearch_pipeline import pipeline_nodes
         from opensearch_pipeline.retriever import expand_step_context
 
         children_rows = [
@@ -257,7 +256,7 @@ class TestProcedureParentExpansion:
             },
         ]
         cursor = _FakeCursor(children_rows)
-        monkeypatch.setattr(pipeline_nodes, "_get_db_conn", lambda *a, **k: _FakeConn(cursor))
+        monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _FakeConn(cursor))
 
         hit = {
             "chunk_id": "P1", "chunk_type": "procedure_parent",
@@ -448,14 +447,13 @@ class TestStepExpandFamilyCap:
 
     def test_mega_family_trimmed_to_hit_section_and_window(self, monkeypatch):
         """>cap 家族收缩为命中卡+同小节伙伴+文档序±2 窗口，命中卡必在结果内。"""
-        from opensearch_pipeline import pipeline_nodes
         from opensearch_pipeline.retriever import expand_step_context
 
         siblings = self._mega_family()
         meta = [{"chunk_id": "M-t1", "parent_chunk_id": "MEGA", "step_no": 1,
                  "extra_json": None, "image_refs_json": None}]
         cursor = _RoutingCursor(meta, siblings)
-        monkeypatch.setattr(pipeline_nodes, "_get_db_conn", lambda *a, **k: _FakeConn(cursor))
+        monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _FakeConn(cursor))
 
         hit = {"chunk_id": "M-t1", "chunk_type": "step_card", "score": 8.6,
                "chunk_text": "查询人员，可用F2模糊查询", "doc_id": "d-mega",
@@ -472,7 +470,6 @@ class TestStepExpandFamilyCap:
 
     def test_small_family_unchanged(self, monkeypatch):
         """≤cap 的正常 SOP 行为不变：general 意图取 ±1 邻居，全员保留。"""
-        from opensearch_pipeline import pipeline_nodes
         from opensearch_pipeline.retriever import expand_step_context
 
         siblings = [
@@ -484,7 +481,7 @@ class TestStepExpandFamilyCap:
         meta = [{"chunk_id": "S-s3", "parent_chunk_id": "SMALL", "step_no": 3,
                  "extra_json": None, "image_refs_json": None}]
         cursor = _RoutingCursor(meta, siblings)
-        monkeypatch.setattr(pipeline_nodes, "_get_db_conn", lambda *a, **k: _FakeConn(cursor))
+        monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _FakeConn(cursor))
 
         hit = {"chunk_id": "S-s3", "chunk_type": "step_card", "score": 9.0,
                "chunk_text": "第3步", "doc_id": "d-small", "title": "小SOP.docx"}

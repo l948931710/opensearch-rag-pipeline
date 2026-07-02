@@ -181,7 +181,7 @@ def log_qa_session(
         conversation_type: '1'=单聊, '2'=群聊
     """
     try:
-        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        from opensearch_pipeline.db import _get_db_conn
 
         # 查询侧 PII 掩码（OBS-qa-pii）：用户问题与机器人回答在落盘前做不可逆掩码，
         # 避免身份证/手机号/受限文档 PII 明文驻留 qa_session_log。conversation 标题取

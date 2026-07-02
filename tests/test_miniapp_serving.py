@@ -934,7 +934,6 @@ def test_resign_images_entitlement_boundary(monkeypatch):
     """_resign_visible_doc_ids 复用检索权限边界：public 放行 / owner 展开命中放行 /
     其它部门 dept_internal 拒 / restricted 永不 / 未知 doc 拒。"""
     import opensearch_pipeline.api as api
-    import opensearch_pipeline.pipeline_nodes as pn
 
     rows = [
         ("DOC_PUB", "public", "hr"),
@@ -953,7 +952,7 @@ def test_resign_images_entitlement_boundary(monkeypatch):
         def cursor(self): return _Cur()
         def close(self): pass
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _Conn())
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _Conn())
     ident = api.Identity(user_id="u1", acl_groups=["marketing"])
     visible = api._resign_visible_doc_ids(
         {"DOC_PUB", "DOC_MKT", "DOC_HR", "DOC_RES", "DOC_UNKNOWN"}, ident)
@@ -999,13 +998,12 @@ def test_history_requires_token(client):
 
 def test_history_returns_own_rows_marker_stripped(client, monkeypatch):
     import opensearch_pipeline.api as api
-    import opensearch_pipeline.pipeline_nodes as pn
     rows = [
         ("m1", "U8怎么登录", "看这张图<<IMG:1>>操作", '[{"type":"text","format":"plain","text":"看这张图"}]',
          "2026-06-12 09:46:23", "SUCCESS"),
         ("m2", "报销标准", None, None, "2026-06-11 08:00:00", "NO_RESULT"),
     ]
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _FakeConn(rows))
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _FakeConn(rows))
     monkeypatch.setattr(api, "refresh_image_block_urls", lambda j, url_expires=None: j)
     token = auth_token.issue_session_token("U7", dept="行政部", name="李四")
     r = client.get("/api/history", headers={"Authorization": "Bearer " + token})
@@ -1021,7 +1019,6 @@ def test_history_returns_own_rows_marker_stripped(client, monkeypatch):
 
 
 def test_history_query_scoped_to_token_user(client, monkeypatch):
-    import opensearch_pipeline.pipeline_nodes as pn
     captured = {}
 
     class _SpyCursor(_FakeCursor):
@@ -1033,7 +1030,7 @@ def test_history_query_scoped_to_token_user(client, monkeypatch):
         def cursor(self):
             return _SpyCursor(self._rows)
 
-    monkeypatch.setattr(pn, "_get_db_conn", lambda: _SpyConn([]))
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _SpyConn([]))
     token = auth_token.issue_session_token("U-OWNER")
     r = client.get("/api/history?limit=5&offset=10",
                    headers={"Authorization": "Bearer " + token})
@@ -1051,12 +1048,11 @@ def _reset_hot_cache():
 
 
 def test_hot_questions_db_down_falls_back(client, monkeypatch):
-    import opensearch_pipeline.pipeline_nodes as pn
     _reset_hot_cache()
 
     def _boom():
         raise RuntimeError("rds down")
-    monkeypatch.setattr(pn, "_get_db_conn", _boom)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _boom)
     r = client.get("/api/hot-questions")
     assert r.status_code == 200
     qs = r.json()["questions"]
@@ -1064,7 +1060,6 @@ def test_hot_questions_db_down_falls_back(client, monkeypatch):
 
 
 def test_hot_questions_filters_and_caches(client, monkeypatch):
-    import opensearch_pipeline.pipeline_nodes as pn
     _reset_hot_cache()
     rows = [("U8怎么登录", 9), ("新会话", 8), ("请假流程", 5),
             ("访客WiFi密码", 4), ("打印机怎么连", 3), ("模具保养周期", 3),
@@ -1074,7 +1069,7 @@ def test_hot_questions_filters_and_caches(client, monkeypatch):
     def _conn():
         calls["n"] += 1
         return _FakeConn(rows)
-    monkeypatch.setattr(pn, "_get_db_conn", _conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _conn)
 
     r1 = client.get("/api/hot-questions")
     qs = r1.json()["questions"]
@@ -1173,7 +1168,7 @@ def test_stream_payload_thinking_override(monkeypatch):
     cfg = SimpleNamespace(
         llm=SimpleNamespace(api_key="k", api_base_url="https://x/v1",
                             model="m", enable_thinking=False),
-        rag=SimpleNamespace(pure_text=True, low_confidence_guard=False),
+        rag=SimpleNamespace(pure_text=True, low_confidence_guard=False, stream_reasoning=False),
     )
     monkeypatch.setattr(lg, "get_config", lambda: cfg)
 
@@ -1196,7 +1191,7 @@ def test_stream_payload_thinking_override(monkeypatch):
         captured["payload"] = json
         return _Resp()
 
-    monkeypatch.setattr(lg.requests, "post", fake_post)
+    monkeypatch.setattr(lg, "_http_post", fake_post)
 
     list(lg.generate_answer_stream("q", [], thinking=True))
     assert captured["payload"]["enable_thinking"] is True

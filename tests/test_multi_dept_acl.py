@@ -257,7 +257,7 @@ def _stub_deny(monkeypatch, *, flag, authorized=None, db_raises=False):
             raise RuntimeError("DB down")
         return _FakeConn()
 
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", _conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _conn)
     monkeypatch.setattr(
         "opensearch_pipeline.access_grants.resolve_allowed_depts",
         lambda ids, cur: dict(authorized or {}),

@@ -98,7 +98,7 @@ def test_resolve_partial_result_not_cached(monkeypatch):
     """cache-miss + API 返回 is_partial=True → 绝不 INSERT（避免残缺 CSV 永久少授权），
     best-effort 返回本次已解析组。"""
     conn = _FakeConn(cache_row=None)   # cache-miss
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
                         lambda sid: {"user_name": "u", "dept_name": "行政部", "is_partial": True})
     out = di._resolve_user_dept("U1")
@@ -109,7 +109,7 @@ def test_resolve_partial_result_not_cached(monkeypatch):
 def test_resolve_complete_result_is_cached(monkeypatch):
     """cache-miss + API 完整 → 正常 INSERT 落缓存。"""
     conn = _FakeConn(cache_row=None)
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
                         lambda sid: {"user_name": "u", "dept_name": "行政部", "is_partial": False})
     di._resolve_user_dept("U1")
@@ -119,7 +119,7 @@ def test_resolve_complete_result_is_cached(monkeypatch):
 def test_resolve_employee_row_stale_passes_through_to_api(monkeypatch):
     """自动 employee 行过期（age > TTL）→ 穿透重查 API 并刷新缓存。"""
     conn = _FakeConn(cache_row=("行政部", "employee", 999999))   # 远超默认 6h TTL
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     called = {"n": 0}
 
     def _fake_api(sid):
@@ -134,7 +134,7 @@ def test_resolve_employee_row_stale_passes_through_to_api(monkeypatch):
 def test_resolve_seeded_row_stale_never_refetched(monkeypatch):
     """seeded 行（role≠employee）即使过期也永远缓存优先，绝不穿透重查（H3 不被破坏）。"""
     conn = _FakeConn(cache_row=("行政部", "admin", 999999))   # 过期但 role=admin=seeded
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     called = {"n": 0}
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
                         lambda sid: called.__setitem__("n", called["n"] + 1))
@@ -146,7 +146,7 @@ def test_resolve_seeded_row_stale_never_refetched(monkeypatch):
 def test_resolve_employee_row_fresh_returns_cache(monkeypatch):
     """自动 employee 行未过期（age < TTL）→ 直接返回缓存，不打 API。"""
     conn = _FakeConn(cache_row=("行政部", "employee", 100))   # 100s < 默认 TTL
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     called = {"n": 0}
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
                         lambda sid: called.__setitem__("n", called["n"] + 1))
@@ -157,7 +157,7 @@ def test_resolve_employee_row_fresh_returns_cache(monkeypatch):
 def test_resolve_stale_employee_api_failure_falls_back_to_cache(monkeypatch):
     """过期 employee 行穿透重查但 API 失败 → 退回旧缓存，绝不 fail-closed 掉已知部门到 public。"""
     conn = _FakeConn(cache_row=("行政部", "employee", 999999))
-    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info", lambda sid: None)   # API 失败
     expected = di._normalize_dept_to_codes("行政部")
     out = di._resolve_user_dept("U1")

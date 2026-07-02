@@ -59,8 +59,7 @@ class _Conn:
 
 
 def _install(monkeypatch, conn):
-    import opensearch_pipeline.pipeline_nodes as pn
-    monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     return conn
 
 
