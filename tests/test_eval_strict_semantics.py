@@ -114,15 +114,22 @@ def test_baseline_advisory_registry_pinned_no_silent_reclassification():
     stays HARD. (answer_image_rate added 2026-07-01 #F-mm1: brand-new端到端出图率主指标,项目惯例
     新指标先 advisory 锁两轮分布再议升 hard — deliberate registry change, not reclassification.)"""
     from eval_harness.baseline import ADVISORY_METRICS, _is_advisory, extract_metrics
-    assert ADVISORY_METRICS == frozenset({"l4srv.orphan_rate", "l4srv.answer_image_rate"})
+    # #F-mm13 追加 marker_distinctness（report 侧本就 advisory 闸,补 baseline delta 可见性）
+    # 与 judge.mm.image_relevance（全新 judge trend）——deliberate registry change。
+    assert ADVISORY_METRICS == frozenset({
+        "l4srv.orphan_rate", "l4srv.answer_image_rate",
+        "l4srv.marker_distinctness", "judge.mm.image_relevance"})
     sample = {"l1": {"ranking": {"recall@5": 0.9}, "by_source": {"xlsx": {"recall@5": 0.8}}},
               "l3": {"deterministic": {"positive": {"over_refusal_rate": 0.05, "mean_keyword_coverage": 0.8}}},
               "l4": {"ingestion": {"deterministic": {"binding_jaccard_pdf": 0.8, "img_dup_factor_p95": 1.0}},
                      "aggregate": {"marker_validity": 1.0, "dangling_ref_rate": 0.0, "orphan_rate": 0.7,
-                                   "answer_image_rate": 0.6}},
-              "judge": {"aggregate": {"positives": {"faithfulness": {"mean": 4.5}}}}}
+                                   "answer_image_rate": 0.6, "marker_distinctness": 0.9}},
+              "judge": {"aggregate": {"positives": {"faithfulness": {"mean": 4.5}}}},
+              "judge_mm": {"aggregate": {"image_relevance": {"mean": 4.0}, "n": 10}}}
     m = extract_metrics(sample)
-    assert {p for p in m if _is_advisory(p)} == {"l4srv.orphan_rate", "l4srv.answer_image_rate"}
+    assert {p for p in m if _is_advisory(p)} == {
+        "l4srv.orphan_rate", "l4srv.answer_image_rate",
+        "l4srv.marker_distinctness", "judge.mm.image_relevance"}
     for hard in ("l4srv.marker_validity", "l4srv.dangling_ref_rate", "l4ing.jaccard.pdf",
                  "l4ing.img_dup_p95", "l1.ranking.recall@5", "l3.over_refusal_rate", "judge.faithfulness"):
         assert hard in m and not _is_advisory(hard)                         # stays HARD
@@ -369,7 +376,7 @@ def test_run_judge_assembles_panels(monkeypatch, tmp_path):
     _json.dump(bundle, open(tmp_path / "b.json", "w"))
     # mock the claude call: echo a verdict per item
     monkeypatch.setattr(run_judge, "_judge_batch",
-                        lambda rub, items, pi, idk: [{idk: it[idk], "overall": 4} for it in items])
+                        lambda rub, items, pi, idk, schema=None: [{idk: it[idk], "overall": 4} for it in items])
     out = str(tmp_path / "v.json")
     run_judge.run(str(tmp_path / "b.json"), out, panels=3, rubric="answer", batch=1)
     saved = _json.load(open(out))

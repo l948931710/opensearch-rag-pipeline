@@ -1516,6 +1516,91 @@ def _select_with_doc_cap(
     return out
 
 
+def _probe_pool_image_refs(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """#F-mm10：候选池 step_card 的带图探测（rerank/tiebreak 之前）。
+
+    重排发生在 expand_step_context 之前：step_card 此时无 image_refs（RDS 未拉）
+    且 HA3 行无 source_image → reranker._img_key 恒 None，qwen3-vl-rerank 对带图
+    step_card 结构性失明；rerank OFF 的近平局倾斜同样无信号可用。本函数对池内
+    step_card 批量 IN 查 chunk_meta.image_refs_json（PK 索引、一次往返）并经
+    _normalize_image_refs 附到 chunk 上——expand 的 C2/兄弟逻辑对已带 refs 的
+    chunk 幂等（`if meta_row and not chunk.get("image_refs")`），不会重复装载。
+    任何失败原样返回（fail-open，优雅降级铁律）。
+    """
+    ids = [
+        cid for cid in (
+            (c.get("chunk_id") or c.get("id", ""))
+            for c in chunks
+            if c.get("chunk_type") == "step_card" and not c.get("image_refs")
+        ) if cid
+    ]
+    if not ids:
+        return chunks
+    refs_by_id: Dict[str, Any] = {}
+    try:
+        import pymysql.cursors
+        from opensearch_pipeline.db import _get_db_conn
+
+        conn = _get_db_conn()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        ph = ",".join(["%s"] * len(ids))
+        cursor.execute(
+            f"SELECT chunk_id, image_refs_json FROM chunk_meta "
+            f"WHERE chunk_id IN ({ph}) AND is_active = 1",
+            tuple(ids),
+        )
+        for row in cursor.fetchall():
+            refs_by_id[row["chunk_id"]] = row.get("image_refs_json")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.warning("候选池带图探测失败（忽略，fail-open）: %s", e)
+        return chunks
+    out: List[Dict[str, Any]] = []
+    for c in chunks:
+        cid = c.get("chunk_id") or c.get("id", "")
+        if (c.get("chunk_type") == "step_card" and not c.get("image_refs")
+                and cid in refs_by_id):
+            refs = [r for r in _normalize_image_refs(refs_by_id[cid]) if r.get("oss_key")]
+            if refs:
+                c = dict(c)
+                c["image_refs"] = refs
+        out.append(c)
+    return out
+
+
+def _chunk_carries_image(c: Dict[str, Any]) -> bool:
+    """#F-mm10b：候选是否携带可渲染图（探测后的 image_refs 或 image/vk 的 source_image）。"""
+    if c.get("image_refs"):
+        return True
+    return bool(c.get("chunk_type") in ("image", "visual_knowledge") and c.get("source_image"))
+
+
+def _image_tiebreak_reorder(chunks: List[Dict[str, Any]], eps: float) -> List[Dict[str, Any]]:
+    """#F-mm10b：融合分近平局的带图倾斜（稳定相邻交换，只动分差 < eps 的相邻对）。
+
+    只在「无图在前、带图紧随其后、分差 < eps」时交换——绝不跨越真实分差挪位，
+    真实排序信号完整保留；确定性（无随机、有界循环）。eps 取错会用弱文本换图，
+    须按 251 题金集标定（L1/L2 baseline merge --strict 证明文本召回无回退）。
+    """
+    chs = list(chunks)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(chs) - 1):
+            a, b = chs[i], chs[i + 1]
+            if _chunk_carries_image(a) or not _chunk_carries_image(b):
+                continue
+            try:
+                gap = float(a.get("score", 0) or 0) - float(b.get("score", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if gap < eps:
+                chs[i], chs[i + 1] = b, a
+                changed = True
+    return chs
+
+
 def _multi_query_search(
     query: str,
     sub_queries: List[str],
@@ -1534,6 +1619,10 @@ def _multi_query_search(
     单路失败只丢该路（fail-open）；但若所有路都失败（≥1 路异常且无任何结果），
     回退原查询单路检索且**不再捕获异常**——持续性故障必须像单查询路径一样向上
     传播为错误（500/LLM_ERROR），不能被吞成 NO_RESULT"知识库未找到"。
+
+    #F-mm10 已知缺口声明：RAG_RERANK_IMG_PROBE 已接入本路径（每路 rerank 前探测）；
+    RAG_IMAGE_TIEBREAK 仅单查询路径生效——轮转交错合并的排序语义与相邻近平局
+    交换不兼容（每路 top-1/2 保送优先级高于图倾斜），不在此实现。
     """
     queries = [query] + [q for q in sub_queries if q and q.strip() and q != query]
 
@@ -1545,6 +1634,8 @@ def _multi_query_search(
                 query_embedding=query_embedding if idx == 0 else None,
             )
             if rerank_enable and chs:
+                if get_config().rag.rerank_img_probe:
+                    chs = _probe_pool_image_refs(chs)   # 每路重排前探测（#F-mm10a）
                 from .reranker import rerank_chunks
                 chs = rerank_chunks(q, chs, top_k=top_k, multimodal=multimodal)
             return chs[:top_k]
@@ -1567,6 +1658,8 @@ def _multi_query_search(
         chs = search_chunks(query, top_k=fetch_k, user_dept=user_dept,
                             query_embedding=query_embedding)
         if rerank_enable and chs:
+            if get_config().rag.rerank_img_probe:
+                chs = _probe_pool_image_refs(chs)   # 回退单路同样探测（#F-mm10a）
             from .reranker import rerank_chunks
             chs = rerank_chunks(query, chs, top_k=None, multimodal=multimodal)
         return _select_with_doc_cap(chs, top_k, get_config().rag.doc_diversity_cap)
@@ -1635,6 +1728,12 @@ def retrieve_and_enrich(
     # 路由式重排开启时：over-fetch rerank_pool 个候选 → 重排 → 取 top_k；否则直接取 top_k。
     _av = get_config().alibaba_vector
     _fetch_k = max(_av.rerank_pool, top_k) if _av.rerank_enable else top_k
+    # #F-mm10b 近平局带图倾斜（rerank OFF 专用）：over-fetch 绑死在本分支内
+    # （不做独立 fetch env——单独放大 fetch 会把超池直接漏给 stitch/expand/context），
+    # 倾斜后显式截回 top_k。rerank ON 时倾斜让位于重排（互斥）。
+    _tiebreak = (not _av.rerank_enable) and get_config().rag.image_tiebreak
+    if _tiebreak:
+        _fetch_k = max(_fetch_k, get_config().rag.image_tiebreak_pool)
     # query embedding 只算一次，传给 search_chunks 与 cosurface（后者原本会重复嵌入一次）
     _emb = get_query_embedding(query)
     # 多意图查询分解（RAG_MULTI_QUERY_MODE，默认 off；失败/不触发即走原单查询路径）
@@ -1652,11 +1751,24 @@ def retrieve_and_enrich(
         chunks = search_chunks(query, top_k=_fetch_k, user_dept=user_dept, query_embedding=_emb)
         _cap = get_config().rag.doc_diversity_cap
         if _av.rerank_enable and chunks:
+            # #F-mm10a：探测让 VL 重排看见 step_card 的绑定图（_img_key 取
+            # refs[0].oss_key），VL 路由经既有 any(_img_key) 通路自动激活。
+            # ⚠️ 路由切换意味着更多 query 走 qwen3-vl-rerank：0.9/0.8 档位标签按
+            # 模型分布标定，开启前须 rerank_ab 复跑 + 阈值 sanity check。
+            if get_config().rag.rerank_img_probe:
+                chunks = _probe_pool_image_refs(chunks)
             from .reranker import rerank_chunks
             # multimodal 渲染路径（cosurface_images=True）用 VL 重排；纯文本/钉钉机器人用文本重排。
             # 文档限额开启时不在重排内截断，先拿全池重排序，再按 cap 选 top_k。
             chunks = rerank_chunks(query, chunks, top_k=None if _cap > 0 else top_k,
                                    multimodal=bool(cosurface_images))  # 失败自动降级为原始顺序
+        elif _tiebreak and chunks:
+            # #F-mm10b：探测 → 近平局带图前移 → 显式截回 top_k（over-fetch 收口，
+            # 绝不把超池漏给 stitch/expand/context）。cap>0 时由 doc-cap 选择收口。
+            chunks = _probe_pool_image_refs(chunks)
+            chunks = _image_tiebreak_reorder(chunks, get_config().rag.image_tiebreak_eps)
+            if _cap <= 0:
+                chunks = chunks[:top_k]
         if _cap > 0:
             chunks = _select_with_doc_cap(chunks, top_k, _cap)
     if chunks and stitch_window > 0:

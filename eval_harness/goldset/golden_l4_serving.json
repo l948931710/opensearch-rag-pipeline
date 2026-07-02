@@ -1319,5 +1319,193 @@
   ],
   "pass_criteria": "答案覆盖手册/流程主干要点，且至少出 1 张所引文档的界面/实拍图",
   "annotation_note": "live 依据=sibling QA-18 已验证；该文档 2026-06-06 调查存在独立 image chunk（旧路径）"
+ },
+ {
+  "qid": "MT-whs_followup",
+  "source": "multi_turn_authoring_20260701",
+  "module": "mm_history_arm",
+  "subtype": "multi_turn",
+  "dept": null,
+  "query": "第二步在哪个界面操作？",
+  "kind": "positive",
+  "expected_docs": [
+   "富岭U8+成品仓库操作手册"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120634_93B432"
+  ],
+  "expect_images": true,
+  "expected_images": [],
+  "live_scorable": true,
+  "query_breadth": "specific",
+  "multi_turn": true,
+  "history": [
+   {
+    "role": "user",
+    "content": "销售出库单怎么开？"
+   },
+   {
+    "role": "assistant",
+    "content": "**第1步** 登录U8系统，输入用户名和密码。<<IMG:1>>\n**第2步** 进入销售出库单界面，录入出库日期与仓库编号。<<IMG:2>>\n**第3步** 依次点击保存、审核、打印。<<IMG:3>>"
+   }
+  ],
+  "annotation_note": "2026-06-10 实测症状原型（follow-up 附噪声图）；history 臂专用（multi_turn 不进主臂）"
+ },
+ {
+  "qid": "MT-water_followup",
+  "source": "multi_turn_authoring_20260701",
+  "module": "mm_history_arm",
+  "subtype": "multi_turn",
+  "dept": null,
+  "query": "那擦干之后下一步做什么？",
+  "kind": "positive",
+  "expected_docs": [
+   "奶茶杯测水试验作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_PRODUCTION_20260514123027_249CAD"
+  ],
+  "expect_images": true,
+  "expected_images": [],
+  "live_scorable": true,
+  "query_breadth": "specific",
+  "multi_turn": true,
+  "history": [
+   {
+    "role": "user",
+    "content": "奶茶杯测水的泡水和擦干步骤怎么做？"
+   },
+   {
+    "role": "assistant",
+    "content": "**第1步** 将透明杯放入蓝色箱内浸水。<<IMG:1>>\n**第2步** 用蓝色毛巾擦拭杯内壁至干燥。<<IMG:1>>"
+   }
+  ],
+  "annotation_note": "sibling J-water_soak 已验证 live；历史含同 N 复用标记（捆包形态）"
+ },
+ {
+  "qid": "MT-itin_followup",
+  "source": "multi_turn_authoring_20260701",
+  "module": "mm_history_arm",
+  "subtype": "multi_turn",
+  "dept": null,
+  "query": "装完CPU之后呢？",
+  "kind": "positive",
+  "expected_docs": [
+   "电脑安装作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120632_39C29F"
+  ],
+  "expect_images": true,
+  "expected_images": [],
+  "live_scorable": true,
+  "query_breadth": "specific",
+  "multi_turn": true,
+  "history": [
+   {
+    "role": "user",
+    "content": "组装电脑的第一步是安装什么部件？"
+   },
+   {
+    "role": "assistant",
+    "content": "第一步是安装CPU：先打开主板上的LGA775插座拉杆，再放入CPU对准缺口。<<IMG:2>>"
+   }
+  ],
+  "annotation_note": "sibling J-itin_* 已验证 live"
+ },
+ {
+  "qid": "MT-zc_followup",
+  "source": "multi_turn_authoring_20260701",
+  "module": "mm_history_arm",
+  "subtype": "multi_turn",
+  "dept": null,
+  "query": "审批通过之后我还要做什么？",
+  "kind": "positive",
+  "expected_docs": [
+   "富岭U8+资材部操作手册"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120634_8549A8"
+  ],
+  "expect_images": true,
+  "expected_images": [],
+  "live_scorable": true,
+  "query_breadth": "specific",
+  "multi_turn": true,
+  "history": [
+   {
+    "role": "user",
+    "content": "我想给新供应商做资格审批，从进系统到提交给质检部，具体要点击哪些按钮？"
+   },
+   {
+    "role": "assistant",
+    "content": "**第1步** 进入供应商资格审批表界面填写信息。<<IMG:1>>\n**第2步** 点击提交按钮转给质检部审批。<<IMG:4>>"
+   }
+  ],
+  "annotation_note": "sibling J-r120_30/31/36 已验证 live"
+ },
+ {
+  "qid": "MT-hr_followup",
+  "source": "multi_turn_authoring_20260701",
+  "module": "mm_history_arm",
+  "subtype": "multi_turn",
+  "dept": null,
+  "query": "合并之后员工档案需要改吗？",
+  "kind": "positive",
+  "expected_docs": [
+   "富岭U8+人事部操作手册"
+  ],
+  "expected_doc_ids": [
+   "DOC_IT_20260513120634_ED2762"
+  ],
+  "expect_images": true,
+  "expected_images": [],
+  "live_scorable": true,
+  "query_breadth": "specific",
+  "multi_turn": true,
+  "history": [
+   {
+    "role": "user",
+    "content": "我想把某个部门合并到另一个部门里去，具体在系统里怎么操作？"
+   },
+   {
+    "role": "assistant",
+    "content": "在组织机构管理里选中源部门，点击机构划转，选择目标部门后确认。<<IMG:2>>"
+   }
+  ],
+  "annotation_note": "sibling J-r120_21/22/23 已验证 live"
+ },
+ {
+  "qid": "MT-dorm_followup",
+  "source": "multi_turn_authoring_20260701",
+  "module": "mm_history_arm",
+  "subtype": "multi_turn",
+  "dept": null,
+  "query": "入住之后水电费怎么算？",
+  "kind": "positive",
+  "expected_docs": [
+   "结算水电房费作业指导书",
+   "新员工住宿安排作业指导书"
+  ],
+  "expected_doc_ids": [
+   "DOC_ADMIN_20260513120214_6469A5",
+   "DOC_ADMIN_20260509102839_76AFFC"
+  ],
+  "expect_images": true,
+  "expected_images": [],
+  "live_scorable": true,
+  "query_breadth": "specific",
+  "multi_turn": true,
+  "history": [
+   {
+    "role": "user",
+    "content": "新员工住宿怎么安排？"
+   },
+   {
+    "role": "assistant",
+    "content": "持入职单到行政部办理入住手续，由宿管分配床位并领取门禁卡。<<IMG:5>>"
+   }
+  ],
+  "annotation_note": "跨文档 follow-up；sibling QA-112/QA-18 已验证 live"
  }
 ]

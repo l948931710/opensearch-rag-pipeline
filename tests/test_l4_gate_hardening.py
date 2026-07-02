@@ -9,8 +9,22 @@
     必须存在，缺失 = not_executed → --strict FAIL。守卫特意放在 `if l4:` 块之外。
 """
 
-from eval_harness.report import build_gates
-from eval_harness.run_eval import _strict_failures
+import os as _os
+
+# ⚠️ envboot 隔离（#F-mm13 排雷）：eval_harness.run_eval / layers.* 顶部 import envboot,
+# boot() on-import 会把进程 env 强制成 live（RAG_SIMULATE=false + 公网 HA3 端点）——
+# 测试进程内一旦泄漏,任何后续从 env 重建 config 的测试（test_config_loading/guards 族）
+# 都会被 conftest PROD-GUARD 拒跑,且重建出的毒化单例会级联炸掉整个套件。
+# 快照-导入-回滚：envboot 只 boot 一次（模块缓存）,env 写入立即撤销;本文件全部用
+# mock 检索/生成,不需要 live env。
+_env_snapshot = dict(_os.environ)
+from eval_harness.report import build_gates  # noqa: E402
+from eval_harness.run_eval import _strict_failures  # noqa: E402
+
+for _k in set(_os.environ) - set(_env_snapshot):
+    del _os.environ[_k]
+_os.environ.update(_env_snapshot)
+del _env_snapshot
 
 
 def _r(ing=None, applicable=True):

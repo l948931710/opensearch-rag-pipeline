@@ -311,6 +311,22 @@ def build_gates(r: Dict) -> Dict:
                 "target": ">= 4.0 / 5 soft (N>=5 才计闸)", "value": ib_mean, "pass": None,
                 "na_reason": "expected_na", "notes": f"N={ib_n}<5 — soft binding gate, advisory only"}
 
+    # ── mm judge：图文贴题率语义闸（#F-mm13a，ADVISORY 起步先锁分布）──────
+    # 与 answer_image_rate（出没出图，确定性）组成「出没出图 × 出得对不对」双指标
+    # 闭环——拦「补图方案把出图率刷上去但全是噪声图」这类确定性指标不可见的回退。
+    # caption-based proxy（评图注不看像素），advisory 永不阻断。
+    jmm = (r.get("judge_mm") or {}).get("aggregate") or {}
+    ir_mean = _g(jmm, "image_relevance", "mean")
+    if ir_mean is not None:
+        gates["image relevance (judge-mm, advisory)"] = {
+            "target": ">= 3.5 advisory（caption 贴题率;先锁两轮分布再议升 hard）",
+            "value": ir_mean,
+            "pass": (ir_mean >= 3.5),
+            "advisory": True,
+            "notes": (f"n={jmm.get('n')}; noise_image_rate={jmm.get('noise_image_rate')}; "
+                      f"expected_match={_g(jmm, 'image_expected_match', 'mean')}"),
+        }
+
     # ── item 3: fusion/calibration regime guard ── thresholds are weighted-fusion-calibrated;
     # RRF (or an un-accounted fusion change) invalidates the absolute gates even when they "pass".
     rg = r.get("regime_guard")

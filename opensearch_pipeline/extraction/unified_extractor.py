@@ -191,6 +191,159 @@ def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
     return legacy
 
 
+def _funnel1_discard_bound(w, h, kb):
+    """Funnel-1 静态丢弃判据（w<50 / h<50 / <3KB / aspect>8）的单点定义。
+
+    与 _process_embedded_images 的 Funnel-1 过滤及 image_funnel_processor 的
+    heuristic_prefilter 语义一致；DOCX（_stitch_strip_runs）与 PDF
+    （_stitch_pdf_strip_assets）两个缝合器共用 —— 「逐条都是今日 Funnel-1 丢弃
+    对象」是缝合的 load-bearing 闸（只救回本来必死的图，绝不动能存活的图），
+    分头手写第三份会漂移。
+    """
+    aspect = max(w / max(h, 1), h / max(w, 1))
+    return w < 50 or h < 50 or kb < 3.0 or aspect > 8.0
+
+
+def _stitch_pdf_strip_assets(assets):
+    """缝合 PDF 条带切片（#F-mm9，RAG_PDF_STRIP_STITCH 默认 OFF）→ (assets, warnings)。
+
+    PDF 转换器把一张照片存成 N 条 1000×31 全宽横条时，每条 aspect>8 逐条死于
+    Funnel-1，整图彻底消失且零告警（实证：FL-XS-WI-007 PDF 的 23 条横条）。
+    DOCX 版（_stitch_strip_runs）靠 blocks 连续 image_ref run 判连续性；PDF 的
+    ref 是 chunk 期才注入、无 blocks 信号，但资产带 page_num + 显示 bbox ——
+    改用【同页 + bbox 纵向邻接】判据（下一条 y0≈上一条 y1，坐标信号比 DOCX 的
+    连续性推断更强），插在 extract_images_from_pdf 之后、_process_embedded_images
+    之前（资产级，缝合产物照常过漏斗/VLM/上传/绑定）。
+
+    判据（移植 DOCX 版四闸，全部满足才缝合）：
+      - 同页、bbox 纵向邻接（tol 3pt）且 x 区间对齐（纵向堆叠的前提）；
+      - run 内任一条 bbox 缺失（get_image_info 可失败）→ 该 run 整体放弃；
+      - 像素宽完全一致；逐条 height<80 且条状（w≥3h 或 w≥100）；
+      - 逐条都是 Funnel-1 丢弃对象（_funnel1_discard_bound）——只救必死的图；
+      - 缝合总高 [100, 6000]。
+    ⚠️ md5 去重资产洞（已知交互，显式接受）：extract_images_from_pdf 按
+    (md5, 朝向op) 全局去重发生在本函数之前，条带中字节相同的条（纯色带）已被
+    丢弃 → 邻接断裂即视为 run 边界，一张图可能缝成多个各自完整的子段（碎片化
+    子缝合优于整图消失），断裂子 run 仍须各自满足全部判据。
+    缝合产物：bbox=成员并集（正常参与 chunk 期几何 y 锚定）、保留 page_num 与
+    首条 image_index。任何 PIL/IO 失败该 run 原样保留（fail-open）。
+    """
+    if os.environ.get("RAG_PDF_STRIP_STITCH", "").strip().lower() not in ("1", "true", "yes"):
+        return assets, []
+    if not assets:
+        return assets, []
+    try:
+        from PIL import Image
+    except ImportError:
+        return assets, []
+
+    ADJ_TOL = 3.0        # bbox 纵向邻接 / x 对齐容差（pt）
+    MIN_RUN = 4
+    MAX_SLICE_H = 80
+
+    # 逐资产读像素尺寸/大小（失败的资产不参与缝合、原样保留）
+    info = {}   # id(asset) -> (w, h, kb)
+    for a in assets:
+        lp = getattr(a, "local_path", "")
+        if not lp or not os.path.exists(lp):
+            continue
+        try:
+            with Image.open(lp) as im:
+                w, h = im.size
+            info[id(a)] = (w, h, os.path.getsize(lp) / 1024.0)
+        except Exception:
+            continue
+
+    # 按页分组 → 页内按 bbox y0 排序 → 邻接切 run
+    by_page = {}
+    for a in assets:
+        by_page.setdefault(getattr(a, "page_num", None), []).append(a)
+
+    def _eligible(a):
+        """可参与 run 的最低门槛：bbox 齐备 + 像素信息可读 + 逐条判据全过。"""
+        if getattr(a, "bbox", None) is None or id(a) not in info:
+            return False
+        w, h, kb = info[id(a)]
+        return (h < MAX_SLICE_H and (w >= 3 * h or w >= 100)
+                and _funnel1_discard_bound(w, h, kb))
+
+    runs = []
+    for page, page_assets in by_page.items():
+        if page is None:
+            continue
+        cands = sorted((a for a in page_assets if _eligible(a)),
+                       key=lambda a: (a.bbox[1], a.bbox[0]))
+        cur = []
+        for a in cands:
+            if not cur:
+                cur = [a]
+                continue
+            prev = cur[-1]
+            first = cur[0]
+            same_width = info[id(a)][0] == info[id(first)][0]
+            adjacent = abs(a.bbox[1] - prev.bbox[3]) <= ADJ_TOL
+            x_aligned = (abs(a.bbox[0] - first.bbox[0]) <= ADJ_TOL
+                         and abs(a.bbox[2] - first.bbox[2]) <= ADJ_TOL)
+            if same_width and adjacent and x_aligned:
+                cur.append(a)
+            else:
+                if len(cur) >= MIN_RUN:
+                    runs.append(cur)
+                cur = [a]
+        if len(cur) >= MIN_RUN:
+            runs.append(cur)
+
+    if not runs:
+        return assets, []
+
+    warnings = []
+    drop_ids = set()
+    replacement = {}   # id(first_asset) -> composite asset
+    for run in runs:
+        total_h = sum(info[id(a)][1] for a in run)
+        if not (100 <= total_h <= 6000):
+            continue
+        w0 = info[id(run[0])][0]
+        try:
+            canvas = Image.new("RGB", (w0, total_h), (255, 255, 255))
+            y = 0
+            for a in run:
+                with Image.open(a.local_path) as im:
+                    canvas.paste(im.convert("RGB"), (0, y))
+                y += info[id(a)][1]
+            first = run[0]
+            out_path = f"{os.path.splitext(first.local_path)[0]}_pdfstitched{len(run)}.png"
+            canvas.save(out_path)
+        except Exception as e:
+            print(f"      ⚠️ [pdf-strip-stitch] PIL stitch failed (run kept as-is): {e}")
+            continue
+        comp = copy.copy(first)
+        comp.local_path = out_path
+        comp.original_name = f"stitched:{len(run)}slices"
+        comp.bbox = (
+            min(a.bbox[0] for a in run), min(a.bbox[1] for a in run),
+            max(a.bbox[2] for a in run), max(a.bbox[3] for a in run),
+        )
+        replacement[id(first)] = comp
+        for a in run:
+            drop_ids.add(id(a))
+        msg = (f"[pdf-strip-stitch] p{first.page_num}: {len(run)} slices "
+               f"({w0}x{total_h}) → {os.path.basename(out_path)}")
+        warnings.append(msg)
+        print(f"      {msg}")
+
+    if not replacement:
+        return assets, []
+
+    out = []
+    for a in assets:
+        if id(a) in replacement:
+            out.append(replacement[id(a)])   # 首条位置放缝合产物（保持文档序）
+        elif id(a) not in drop_ids:
+            out.append(a)
+    return out, warnings
+
+
 def _stitch_strip_runs(blocks, image_assets, min_run=4, max_slice_height=80):
     """缝合 Word 条带切片：一张照片被存成 N 条同宽窄条时，逐条都会被
     Funnel-1 丢弃（h<50 或 aspect>8），整图彻底丢失。
@@ -240,9 +393,7 @@ def _stitch_strip_runs(blocks, image_assets, min_run=4, max_slice_height=80):
     if not runs:
         return blocks, image_assets
 
-    def _discard_bound(w, h, kb):
-        aspect = max(w / max(h, 1), h / max(w, 1))
-        return w < 50 or h < 50 or kb < 3.0 or aspect > 8.0
+    _discard_bound = _funnel1_discard_bound
 
     drop_block_ids = set()
     drop_asset_idx = set()
@@ -446,11 +597,14 @@ class UnifiedExtractor:
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
 
-        # 提取嵌入图片 → 三阶段过滤漏斗
-        assets, img_blocks = self._process_embedded_images(
-            extract_images_from_pdf(local_path, _safe_image_output_dir(task), max_pages=20),
-            task,
-        )
+        # 提取嵌入图片 →（可选）条带缝合 → 三阶段过滤漏斗
+        # #F-mm9：缝合必须在漏斗之前（条带逐条会死于 Funnel-1 aspect>8），
+        # 缝合产物照常过漏斗/VLM/上传/绑定；默认 OFF 时 _stitch_pdf_strip_assets 原样透传。
+        raw_assets = extract_images_from_pdf(
+            local_path, _safe_image_output_dir(task), max_pages=20)
+        raw_assets, stitch_warnings = _stitch_pdf_strip_assets(raw_assets)
+        warnings.extend(stitch_warnings)
+        assets, img_blocks = self._process_embedded_images(raw_assets, task)
         if img_blocks:
             blocks.extend(img_blocks)
             flat_text = blocks_to_text(blocks)

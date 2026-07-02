@@ -339,6 +339,18 @@ def phase_merge(args):
         cpanels = cverd["panels"] if isinstance(cverd, dict) and "panels" in cverd else cverd
         results.setdefault("l6", {})["judge_chunk"] = merge_chunk_panel(chunk_bundle, cpanels)
 
+    # mm judge merge（#F-mm13a）：L4-serving 图文贴题率语义通道——judge_bundle_mm.json
+    # 此前每轮落盘却从未被消费（run_judge 无 mm rubric、gate 不跑它）。同目录约定：
+    # judge_bundle_mm.json（phase_run 产）+ judge_verdicts_mm.json（panel 产）都在才合并。
+    mb = os.path.join(outdir, "judge_bundle_mm.json")
+    mv = os.path.join(outdir, "judge_verdicts_mm.json")
+    if os.path.exists(mb) and os.path.exists(mv):
+        from .judge import merge_mm_panel
+        mm_bundle = json.load(open(mb, encoding="utf-8"))
+        mverd = json.load(open(mv, encoding="utf-8"))
+        mpanels = mverd["panels"] if isinstance(mverd, dict) and "panels" in mverd else mverd
+        results["judge_mm"] = merge_mm_panel(mm_bundle, mpanels)
+
     if args.baseline and os.path.exists(args.baseline):
         from . import baseline as _bl
         results["baseline_gates"] = _bl.compare(
