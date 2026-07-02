@@ -238,11 +238,17 @@ def phase_run(args):
             _srv_gs = os.path.join(HERE, "goldset", "golden_l4_serving.json")
         serving_cases = cases
         if _srv_gs and os.path.exists(_srv_gs):
+            # serving 题集是 L4-serving 标注的权威（query_breadth/expected_images 只维护在
+            # 这里）：与主 goldset 重叠的 qid 用 serving 版覆盖（只影响 l4 输入,l1/l3 仍用
+            # 原 cases）,其余追加。
+            _srv_by_qid = {c.get("qid"): c for c in _load_goldset(_srv_gs)}
             _known_qids = {c.get("qid") for c in cases}
-            _extra = [c for c in _load_goldset(_srv_gs) if c.get("qid") not in _known_qids]
-            if _extra:
-                serving_cases = cases + _extra
-                print(f"   L4-serving goldset 并入: +{len(_extra)} cases from {_srv_gs}")
+            _extra = [c for q, c in _srv_by_qid.items() if q not in _known_qids]
+            _n_override = sum(1 for c in cases if c.get("qid") in _srv_by_qid)
+            serving_cases = [_srv_by_qid.get(c.get("qid"), c) for c in cases] + _extra
+            if _extra or _n_override:
+                print(f"   L4-serving goldset 并入: +{len(_extra)} 新增, {_n_override} 覆盖标注 "
+                      f"(from {_srv_gs})")
         elif _srv_gs:
             print(f"   ⚠ EVAL_L4_SERVING_GOLDSET 指向不存在的文件,跳过: {_srv_gs}")
         results["l4"] = l4_multimodal.run(
