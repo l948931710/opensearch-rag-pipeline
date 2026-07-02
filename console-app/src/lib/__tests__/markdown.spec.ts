@@ -58,4 +58,13 @@ describe('stripImg（<<IMG:N>> 含跨帧半截）', () => {
   it('正常含尖括号文本不误伤', () => {
     expect(stripImg('a < b 1>2')).toBe('a < b 1>2')
   })
+  // #F-mm6：图级子下标 <<IMG:N.M>> 也要擦（RAG_IMG_SUBINDEX 开时避免闪碎片）
+  it('去完整图级子下标标记', () => {
+    expect(stripImg('a<<IMG:1.2>>b<IMG:3.1>c')).toBe('abc')
+    expect(stripImg('步骤 <<IMG:3.2>> 完成')).toBe('步骤  完成')
+  })
+  it('去末尾未到齐的半截子下标标记', () => {
+    expect(stripImg('文本 <<IMG:1.')).toBe('文本 ')
+    expect(stripImg('x <<IMG:12.3')).toBe('x ')
+  })
 })
