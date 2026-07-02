@@ -14,7 +14,8 @@
 --   · 同时兼容 perf#83 提议的 (action_type, created_at) 场景（operator_type 恒为等值前缀）。
 --
 -- ADDITIVE / 幂等：纯加索引（InnoDB online DDL），无数据变更，查询 fail-open 不依赖索引存在。
--- ⚠️ GATED PROD DDL——apply 后向 fuling_knowledge.schema_migrations 记 '015'。
+-- ✅ APPLIED 2026-07-02（生产 fuling_knowledge，scratch/apply_migration_007_015.py，
+--    schema_migrations v015；SHOW INDEX 三列序 operator_type→action_type→created_at 已确认）。
 -- ════════════════════════════════════════════════════════════════════════════
 
 -- 幂等守卫（沿用 002 的 _add_index_if_not_exists 模式；裸 SQL 版本如下）：

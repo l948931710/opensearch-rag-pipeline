@@ -21,15 +21,18 @@
 > `RAG_CHUNK_META_INSERT_BATCH=500` / `RAG_PARITY_READ_CONCURRENCY=4` / `RAG_STAGE3_PARITY_SETTLE_POLL_SEC=5` /
 > `RAG_RECONCILE_SCAN_CONCURRENCY=4` / `RAG_DEPT_FETCH_CONCURRENCY=4` / `RAG_SPOTCHECK_CONCURRENCY=4` /
 > `RAG_ACL_DENY_CACHE_TTL_S=0`（默认关，机密性兜底） / `RAG_QUERY_EMBED_TIMEOUT_S=8` + `RAG_QUERY_EMBED_RETRIES=1` /
-> `RAG_HISTORY_CHAR_BUDGET=12000`（0=关）。**user-gated 尾巴**：① H#72 = schema/007 idx_etag 生产 DDL 待 apply；
-> ② 摄取侧并发开关（PUBLISH/HA3_PUSH/LOADER_FETCH）由 DataWorks 节点自行 setdefault 开启；③ SAE/DataWorks
-> 重打包部署后线上才生效。
+> `RAG_HISTORY_CHAR_BUDGET=12000`（0=关）。**user-gated 尾巴**：① ~~H#72 = schema/007 idx_etag~~ **已 apply
+> 生产 2026-07-02**（见 K 桶）；② 摄取侧并发开关（PUBLISH/HA3_PUSH/LOADER_FETCH）由 DataWorks 节点自行
+> setdefault 开启；③ SAE/DataWorks 重打包部署后线上才生效。
 >
 > **K 桶落地（2026-07-02，同分支第二 commit）**：#80-96 全部完成（#85 早前已落地；#83+#96 合并为
 > `schema/015_kb_audit_log_history_index.sql`——(operator_type, action_type, created_at) 一个索引覆盖两条
-> 处方，**apply 生产 user-gated**；#97 与 H#72 同一事项=schema/007 apply，不重复计）。新增 env：
+> 处方；#97 与 H#72 同一事项=schema/007 idx_etag，不重复计）。新增 env：
 > `RAG_RERANK_VL_MIN_IMAGES=1`（默认=现状任意 1 图即整池 VL；**调大前必须重跑 251 题金集验证 recall@1**）。
 > #80 采用 serve-stale-while-revalidate 替代原处方的离线物化（同收益零 schema）。
+> **✅ schema/007 + 015 两个索引已 apply 生产 fuling_knowledge（2026-07-02，scratch/apply_migration_007_015.py，
+> schema_migrations v007/v015；SHOW INDEX 已确认列序，idx_etag card=640 / 复合 card 4·8·2975）。**
+> 附带发现并消除既有不一致：007 台账行本是 2026-07-01 台账初始化的 `baseline 基线回填` 预填行，索引却一直未建。
 
 
 **工作量分布**：S 级 70 项 · M 级 27 项。
