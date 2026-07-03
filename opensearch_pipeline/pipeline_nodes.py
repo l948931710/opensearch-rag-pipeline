@@ -5342,6 +5342,10 @@ def node_deactivate_old_chunks(ctx: dict):
     existing_index = ctx.get("existing_opensearch_chunks", [])
     deactivated = []
     retained = []
+    # D1: 生产审计必须由【真实删除集合】驱动。上面的 deactivated 只由 existing_opensearch_chunks 喂养，
+    # 而该 key 仅 tests/ 与 run_simulation 注入 → 生产恒为空、旧版本不可逆删除【零审计】。真实路径
+    # 从 RDS 取回被删旧行的 (doc_id, old_version, rds_id) 存入此列表，停用成功后据此写 DEACTIVATE。#F-D1audit
+    _deact_audit_rows = []
 
     for old_chunk in existing_index:
         old_doc_id = old_chunk.get("doc_id")
@@ -5393,17 +5397,20 @@ def node_deactivate_old_chunks(ctx: dict):
                         ["(doc_id = %s AND version_no < %s)"] * len(_dv_items))
                     _dv_params = tuple(p for dv in _dv_items for p in dv)
                     cursor.execute(
-                        f"SELECT doc_id, id FROM chunk_meta WHERE ({_dv_clause}) AND is_active = 1",
+                        f"SELECT doc_id, version_no, id FROM chunk_meta "
+                        f"WHERE ({_dv_clause}) AND is_active = 1",
                         _dv_params
                     )
                     rows = cursor.fetchall()
                     old_chunk_ids_map = {doc_id: [] for doc_id, _ in _dv_items}
                     for r in rows:
-                        if len(r) < 2:
-                            # 防御：真实 SELECT 恒返回 (doc_id, id) 2 列；短行只可能来自宽松的
-                            # 测试桩。跳过 = 不删（安全方向：旧 chunk 保持 active，绝不误删）。
+                        if len(r) < 3:
+                            # 防御：真实 SELECT 恒返回 (doc_id, version_no, id) 3 列；短行只可能来自宽松
+                            # 的测试桩。跳过 = 不删（安全方向：旧 chunk 保持 active，绝不误删）。#F-D1audit
                             continue
-                        old_chunk_ids_map.setdefault(r[0], []).append(r[1])
+                        old_chunk_ids_map.setdefault(r[0], []).append(r[2])
+                        # D1: 记录真实被删旧行，供停用成功后写 DEACTIVATE 审计（rds_id = chunk_meta.id）。
+                        _deact_audit_rows.append((r[0], r[1], r[2]))
             except Exception as e:
                 print(f"    ⚠️ Failed to query old chunk ids from RDS: {e}")
                 raise RuntimeError(f"Database query failure in pre-deactivation phase: {e}")
@@ -5565,14 +5572,21 @@ def node_deactivate_old_chunks(ctx: dict):
     # L5 audit: append-only DEACTIVATE events for the irreversible old-version retirement.
     # Placed after the RDS is_active=FALSE flip so it logs the realized outcome; fail-open + no-op in
     # simulate (write_audit handles both). kb_audit_log had ZERO writers before this.
-    if deactivated:
+    # D1: 审计由【真实删除集合】驱动（_deact_audit_rows 来自上方 RDS id SELECT）。旧代码只看 sim-only
+    # 的 deactivated（existing_opensearch_chunks，生产从不注入）→ 生产删除全程无审计。仅当真实集合为空
+    # 时回退到 deactivated（sim/测试路径，write_audit 经 simulate=simulate_db 空跑，既有断言不破）。#F-D1audit
+    _audit_deactivations = _deact_audit_rows or [
+        (d["doc_id"], d["old_version"], d["chunk_id"]) for d in deactivated
+    ]
+    if _audit_deactivations:
         from opensearch_pipeline.audit_log import write_audit, audit_trace_id
         _trace = audit_trace_id(ctx)
-        for _d in deactivated:
+        for _doc_id, _old_ver, _ref in _audit_deactivations:
+            _new_ver = current_versions.get(_doc_id)
             write_audit(
-                doc_id=_d["doc_id"], version_no=_d["old_version"],
+                doc_id=_doc_id, version_no=_old_ver,
                 action_type="DEACTIVATE", action_result="SUCCESS", trace_id=_trace,
-                message=f"old v{_d['old_version']} retired by v{_d['new_version']} ({_d['chunk_id']})",
+                message=f"old v{_old_ver} retired by v{_new_ver} (id={_ref})",
                 simulate=simulate_db,
             )
 
