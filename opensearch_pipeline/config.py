@@ -333,6 +333,11 @@ class RAGConfig:
     # ✅ 实测（multi_doc_ab v2，26 负例 + 50 正例生成对照）：负例拦截 0.50→0.654
     # （+4/0 翻转），正例误拒两臂均 0/50，关键词覆盖不变 → 建议生产置 true。
     low_confidence_guard: bool = False
+    # #7：rerank + cosurface 同开时，is_low_confidence_band 只看 rerank 分(0-1)、忽略只带融合分的
+    # cosurface 补图 chunk → 重排文本弱而某图强时过度拒答。开启后把 rerank 分(阈 0.9/0.8)与融合分
+    # (阈 7.7/5.8)各按自量纲的 medium/high 归一到统一 [0,1] 置信度再取 max（medium 线=0.5）。默认
+    # OFF：先 eval A/B（正/负例置信分离 Youden J）验证不回归再灰度。见 llm_generator._confidence_norm。
+    confidence_cross_scale: bool = False    # RAG_CONFIDENCE_CROSS_SCALE
     # ── 多意图查询分解（multi-doc retrieval，见 query_decomposer.py）──
     # off  → 不分解（默认）；auto → 启发式触发后才调 LLM 分解；llm → 每查询都判别。
     # 跨文档综合问题单查询 R@1 仅 ~8%（topk_window_sweep + 251 题 gold 复确认）：
@@ -835,6 +840,7 @@ def load_config() -> PipelineConfig:
             rerank_score_threshold_high=_env_float("RERANK_SCORE_THRESHOLD_HIGH", 0.9),
             rerank_score_threshold_medium=_env_float("RERANK_SCORE_THRESHOLD_MEDIUM", 0.8),
             low_confidence_guard=_env_bool("LOW_CONFIDENCE_GUARD", False),  # RAG_LOW_CONFIDENCE_GUARD
+            confidence_cross_scale=_env_bool("CONFIDENCE_CROSS_SCALE", False),  # RAG_CONFIDENCE_CROSS_SCALE (#7)
             multi_query_mode=_env("MULTI_QUERY_MODE", "off").lower(),       # RAG_MULTI_QUERY_MODE
             multi_query_max=_env_int("MULTI_QUERY_MAX", 3),                 # RAG_MULTI_QUERY_MAX
             decompose_timeout=_env_int("DECOMPOSE_TIMEOUT", 8),             # RAG_DECOMPOSE_TIMEOUT
