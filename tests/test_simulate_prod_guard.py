@@ -213,6 +213,8 @@ def test_layer1_staging_stg_db_is_writable(monkeypatch):
     monkeypatch.setattr(cfg, "readonly", False)
     monkeypatch.setattr(cfg.rds, "host", _FAKE_PROD_HOST)
     monkeypatch.setattr(cfg.rds, "database", "fuling_knowledge_stg")
+    # #F-staging-opdb 合法 staging 主库与运营库同切 _stg,才是可写形态
+    monkeypatch.setattr(cfg.rds, "operation_database", "fuling_operation_stg")
 
     calls = _install_fake_pool(monkeypatch)
     db._init_db_pool()
