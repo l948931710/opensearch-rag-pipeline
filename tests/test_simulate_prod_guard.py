@@ -326,3 +326,35 @@ def test_pool_verdict_agrees_with_guard_verdict(monkeypatch):
         assert pool_ro == guard_blocked == expect_blocked, (
             f"cell readonly={readonly} env={env} db={db} host={host} ack={ack}: "
             f"pool_ro={pool_ro} guard_blocked={guard_blocked} expected={expect_blocked}")
+
+
+def test_pool_and_guard_agree_on_misconfigured_operation_db(monkeypatch):
+    """#F-staging-opdb 跨层一致性（运营库错配案例）：staging 主库 _stg 但运营库仍是生产
+    fuling_operation → _pool_readonly_declared 判只读 与 assert_destructive_write_allowed 判拦写
+    必须同时为 True（两层同进同出，不打架），且合法两库 _stg 时同为可写。"""
+    import opensearch_pipeline.env_guard as eg
+    from opensearch_pipeline.env_guard import DestructiveOpBlocked, assert_destructive_write_allowed
+    from opensearch_pipeline.db import _pool_readonly_declared
+
+    def _verdicts(op_db):
+        cfg = SimpleNamespace(
+            environment="staging", readonly=False,
+            rds=SimpleNamespace(host=_FAKE_PROD_HOST, database="fuling_knowledge_stg",
+                                operation_database=op_db),
+            alibaba_vector=SimpleNamespace(table_name=""),
+            oss=SimpleNamespace(bucket_name="fuling-knowledge-base"),
+        )
+        monkeypatch.setattr(eg, "get_config", lambda c=cfg: c)
+        monkeypatch.delenv("RAG_DESTRUCTIVE_PROD_ACK", raising=False)
+        pool_ro = _pool_readonly_declared(cfg)
+        try:
+            assert_destructive_write_allowed("rds_write", _FAKE_PROD_HOST, kind="rds", any_ack=True)
+            guard_blocked = False
+        except DestructiveOpBlocked:
+            guard_blocked = True
+        return pool_ro, guard_blocked
+
+    # 运营库错配 → 两层都拦
+    assert _verdicts("fuling_operation") == (True, True)
+    # 两库皆 _stg → 两层都放行
+    assert _verdicts("fuling_operation_stg") == (False, False)
