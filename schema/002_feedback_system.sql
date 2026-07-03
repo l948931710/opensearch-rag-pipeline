@@ -245,6 +245,18 @@ ALTER TABLE user_feedback MODIFY COLUMN user_id VARCHAR(128) NOT NULL COMMENT '�
 
 CALL _add_index_if_not_exists('user_feedback', 'idx_message_id', 'message_id');
 
+-- 加唯一键前先按业务规则去重，否则存量若有相同 (message_id, user_id) 多行
+-- （上线本迁移前合法，此前无 uk_message_user），下方 ADD UNIQUE 会报 1062 中止；
+-- DDL autocommit 会让迁移半途而废、临时过程残留、唯一键永远建不上。
+-- 去重范式同 003_user_role_unique.sql：保留最新一行（updated_at 最大，平手取 id 最大），删较旧重复行。
+-- 已在 L234-240 backfill 之后执行：NULL 行已填成互不相同的 legacy_/unknown_，只会删真正的重复对。
+DELETE uf FROM user_feedback uf
+JOIN user_feedback newer
+  ON newer.message_id = uf.message_id
+ AND newer.user_id    = uf.user_id
+ AND (newer.updated_at > uf.updated_at
+      OR (newer.updated_at = uf.updated_at AND newer.id > uf.id));
+
 CALL _add_unique_if_not_exists('user_feedback', 'uk_message_user', 'message_id, user_id');
 
 -- ------------------------------------------------------------

@@ -160,6 +160,23 @@ def test_wiring_tiebreak_overfetch_and_truncate(monkeypatch):
     assert any(c["chunk_id"] == "IMG" for c in out), "近平局带图卡应升入 top_k"
 
 
+def test_wiring_rrf_disables_tiebreak(monkeypatch):
+    """#F-mm10c rrf 融合下 image_tiebreak 必须整体关闭（不 over-fetch、不 reorder）：
+    eps 按 weighted 融合分标定，rrf 分尺度(~0.0x)下会把所有带图 chunk 无差别顶到最前。"""
+    from opensearch_pipeline.config import get_config
+    # weighted 尺度池：末位 T6 与带图 IMG 近平局（gap<eps），weighted 下本会被换进 top_k
+    pool = [_c(f"T{i}", 8.0 - i * 0.3) for i in range(12)]
+    pool.append(_c("IMG", 6.18, img=True))
+    pool.sort(key=lambda c: -c["score"])
+    calls = _wire(monkeypatch, rerank=False, probe=False, tiebreak=True, pool_chunks=pool)
+    monkeypatch.setattr(retriever, "_probe_pool_image_refs", lambda chs: chs)
+    monkeypatch.setattr(get_config().alibaba_vector, "hybrid_fusion", "rrf")
+    out = retriever.retrieve_and_enrich("怎么操作", top_k=7)
+    assert calls["fetch_k"] == 7                             # 未 over-fetch → tiebreak 分支未进
+    assert [c["chunk_id"] for c in out] == [f"T{i}" for i in range(7)]  # 顺序原样、IMG 未被顶前
+    assert not any(c["chunk_id"] == "IMG" for c in out)
+
+
 def test_wiring_flags_off_byte_identical(monkeypatch):
     """两 flag 全 OFF + rerank OFF：fetch_k==top_k，顺序原样（历史行为）。"""
     pool = [_c(f"T{i}", 8.0 - i * 0.3) for i in range(10)]

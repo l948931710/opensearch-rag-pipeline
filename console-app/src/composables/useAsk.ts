@@ -185,10 +185,13 @@ function _pumpState(ai: ChatMessage, key: 'a' | 'r'): PumpChState {
 }
 function _dropPumpState(ai: ChatMessage): void { _pumpStates.delete(ai) }
 
-const IMG_FULL_RE = /<{1,2}IMG:\d+>{1,2}/g
-// 持留判定：末尾可能是半截 <<IMG:N>> 标记（含只差一个 ">" 的 "<<IMG:1>"）——这些是完整标记的真前缀，
-// 先不定稿；等后续字符到齐后要么整体按完整标记删除，要么证伪后原样放行。
-const IMG_HOLD_RE = /<{1,2}(IMG:\d+>?|I?M?G?:?\d*)$/
+// #F-mm6b 必须与 markdown.ts 权威 stripImg 同构：含图级子下标分支 (?:\.\d+)?，否则开
+// RAG_IMG_SUBINDEX 后流式途中 <<IMG:1.2>> 既不被擦除也不被持留，明文碎片外露（收尾才清）。
+const IMG_FULL_RE = /<{1,2}IMG:\d+(?:\.\d+)?>{1,2}/g
+// 持留判定：末尾可能是半截 <<IMG:N>> / <<IMG:N.M>> 标记（含只差一个 ">" 的 "<<IMG:1>"、
+// 只差子下标数字的 "<<IMG:1."）——这些是完整标记的真前缀，先不定稿；等后续字符到齐后
+// 要么整体按完整标记删除，要么证伪后原样放行。
+const IMG_HOLD_RE = /<{1,2}(IMG:\d+(?:\.\d*)?>?|I?M?G?:?\d*\.?\d*)$/
 function stripImgIncr(st: PumpChState, raw: string): string {
   if (raw.length < st.stripLen) { st.stripLen = 0; st.stripOut = ''; st.mdLen = 0; st.mdHtml = '' }   // 防御：源只增不减
   const tail = raw.slice(st.stripLen)

@@ -660,14 +660,17 @@ class UnifiedExtractor:
             print(f"    ⚠️ [table_refine] skipped (non-fatal): {_e}", flush=True)
 
         # P1-09：标注原生抽取页上限截断。page_count 是【真实总页数】（extract_pdf 切片前计算），
-        # 用入口处的 page_count 局部量（OCR/VLM 重建 result 时可能不透传），并回写 result.page_count
-        # 确保总页数落库（document_version.page_count），供治理看板按 page_count>上限 统计截断文档数。
-        if (page_count or 0) > self.PDF_NATIVE_MAX_PAGES:
+        # 但原生抽取全失败时 extract_pdf 返回 page_count=0，_pages_needing_ocr 会用 pypdf/pdfplumber
+        # 恢复真实页数并回写 result.page_count（入口局部 page_count 仍是 0）——若只看局部量，>20 页
+        # 扫描 PDF 会漏判截断被当完整上线。真实总页数优先取 result.page_count，回退入口 page_count，
+        # 并回写 result.page_count 确保总页数落库（document_version.page_count），供治理看板统计截断文档数。
+        effective_page_count = result.page_count or page_count or 0
+        if effective_page_count > self.PDF_NATIVE_MAX_PAGES:
             result.extract_truncated = True
             result.extracted_pages = self.PDF_NATIVE_MAX_PAGES
-            result.page_count = page_count
+            result.page_count = effective_page_count
             result.warnings.append(
-                f"[TRUNCATED] PDF 共 {page_count} 页，仅前 {self.PDF_NATIVE_MAX_PAGES} 页被抽取；"
+                f"[TRUNCATED] PDF 共 {effective_page_count} 页，仅前 {self.PDF_NATIVE_MAX_PAGES} 页被抽取；"
                 f"第 {self.PDF_NATIVE_MAX_PAGES + 1} 页起的内容未进入索引（含 OCR）。"
             )
 

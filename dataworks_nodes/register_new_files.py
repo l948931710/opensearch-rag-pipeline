@@ -366,6 +366,9 @@ twin_warned = 0    # 防重：跨部门同名告警（仍注册）
 with conn.cursor() as cursor:
     for key, size in new_files:
         try:
+            # 单条原子：先立 SAVEPOINT，meta+version 任一失败只回退当前条，
+            # 避免已成功的 document_meta 被周期 commit 落成孤儿元数据 #F-REGROLLBACK
+            cursor.execute("SAVEPOINT reg_item")
             dept = resolve_dept(key)
 
             # ── 注册防重：同部门同 stem（同名异扩展/换路径重传）跳过，防孪生 doc_id；
@@ -421,6 +424,11 @@ with conn.cursor() as cursor:
                 
         except Exception as e:
             errors += 1
+            # 只回退当前条，不动同事务内其它已成功、待周期 commit 的条目 #F-REGROLLBACK
+            try:
+                cursor.execute("ROLLBACK TO SAVEPOINT reg_item")
+            except Exception:
+                pass
             print(f"   ⚠️ 注册失败 {key}: {e}")
 
 conn.commit()

@@ -209,6 +209,12 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
     """
     from alibabacloud_ha3engine_vector.models import QueryRequest
     from opensearch_pipeline import retriever as _retriever   # 动态取名：兼容测试 monkeypatch
+    from opensearch_pipeline.config import get_config
+
+    # #F-recon-vecdim 向量维度读配置、勿硬编码 1024：EMBEDDING_DIMENSION 可设 768/512，
+    # 写死 1024 会让维度不匹配的 HA3 query 报错 → CS3 对账整体 fail-open，召回丢失探针失效
+    # （与 ha3_reconcile._enumerate_ha3_pks 的 get_config().embedding.dimension 单一来源对齐）。
+    _dim = get_config().embedding.dimension
 
     cap = bucket + 100
     starts = list(range(lo, hi, bucket))
@@ -219,7 +225,7 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
         btrunc = False
         for _ in range(max(1, max_rounds)):
             before = len(brows)
-            req = QueryRequest(table_name=table_name, vector=[0.0] * 1024, top_k=cap,
+            req = QueryRequest(table_name=table_name, vector=[0.0] * _dim, top_k=cap,
                                include_vector=False,
                                output_fields=_retriever._DEFAULT_OUTPUT_FIELDS,
                                filter=f"id>={start} AND id<{start + bucket}")

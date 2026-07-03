@@ -1904,7 +1904,10 @@ def retrieve_and_enrich(
     # #F-mm10b 近平局带图倾斜（rerank OFF 专用）：over-fetch 绑死在本分支内
     # （不做独立 fetch env——单独放大 fetch 会把超池直接漏给 stitch/expand/context），
     # 倾斜后显式截回 top_k。rerank ON 时倾斜让位于重排（互斥）。
-    _tiebreak = (not _av.rerank_enable) and get_config().rag.image_tiebreak
+    # #F-mm10c eps 按 251 金集在 weighted 融合分（~0-10）上标定；rrf 融合分尺度（~0.0x）下
+    # 绝对阈值错配 → 几乎所有相邻带图对判为近平局被无差别前移、排序被摧毁，故仅 weighted 启用。
+    _tiebreak = (not _av.rerank_enable) and get_config().rag.image_tiebreak \
+        and _av.hybrid_fusion != "rrf"
     if _tiebreak:
         _fetch_k = max(_fetch_k, get_config().rag.image_tiebreak_pool)
     # query embedding 只算一次，传给 search_chunks 与 cosurface（后者原本会重复嵌入一次）

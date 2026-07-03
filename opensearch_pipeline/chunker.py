@@ -1673,7 +1673,9 @@ class DocumentChunker:
         # 1. Collect all paragraph text and handle tables/headings
         all_para_texts: List[str] = []
         table_chunks: List[Chunk] = []
-        pending_image_refs: List[dict] = []  # 暂存 image_ref 块
+        pending_image_refs: List[dict] = []  # 暂存 image_ref 块（尾部兜底用）
+        image_marks: List[Tuple[int, dict]] = []  # (full_text 偏移, 图元) #F-clause-img
+        full_len = 0  # 已累积 full_text 长度，记录图片文档位置 #F-clause-img
 
         for block in blocks:
             if isinstance(block, dict):
@@ -1694,7 +1696,11 @@ class DocumentChunker:
             # image_ref 块 → 暂存图片元数据
             if block_type == "image_ref":
                 if extra:
-                    pending_image_refs.append(dict(extra))
+                    # 同一 dict 既入尾部兜底列表、又带偏移入就近绑定列表（同一对象，
+                    # 绑定与兜底不分叉）；offset=当前已累积正文长度=该图文档位置。 #F-clause-img
+                    img_meta = dict(extra)
+                    pending_image_refs.append(img_meta)
+                    image_marks.append((full_len, img_meta))
                 continue
 
             if not text:
@@ -1719,6 +1725,11 @@ class DocumentChunker:
                 chunk_index += 1
                 continue
 
+            # 维护 full_len 与 full_text = "\n".join(all_para_texts) 逐字对齐：
+            # 非首段落前有一个 "\n" 分隔符。 #F-clause-img
+            if all_para_texts:
+                full_len += 1
+            full_len += len(text)
             all_para_texts.append(text)
 
         # 2. Join all paragraphs and split by clause boundaries
@@ -1751,27 +1762,28 @@ class DocumentChunker:
                 table_chunks + chunks, pending_image_refs, doc_id, version_no,
                 chunk_index, meta, current_section)
 
-        # 3. Build clause segments
-        clause_segments: List[str] = []
+        # 3. Build clause segments（每段带其在 full_text 中的起始偏移，供图片就近绑定）
+        clause_segments: List[Tuple[int, str]] = []  # (start_offset, text) #F-clause-img
 
         # Preamble before first clause
         if matches[0].start() > 0:
             preamble = full_text[:matches[0].start()].strip()
             if preamble:
-                clause_segments.append(preamble)
+                clause_segments.append((0, preamble))
 
         for i, match in enumerate(matches):
             start = match.start()
             end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
             segment = full_text[start:end].strip()
             if segment:
-                clause_segments.append(segment)
+                clause_segments.append((start, segment))
 
         # 4. Merge short clauses and split oversized ones
-        merged_segments: List[str] = []
+        merged_segments: List[Tuple[int, str]] = []  # (start_offset, text) #F-clause-img
         buffer = ""
+        buffer_start = 0  # 当前 buffer 对应的首个 clause 段起始偏移 #F-clause-img
 
-        for seg in clause_segments:
+        for seg_start, seg in clause_segments:
             if buffer:
                 candidate = buffer + "\n" + seg
             else:
@@ -1779,29 +1791,33 @@ class DocumentChunker:
 
             if len(candidate) <= self.max_chunk_chars:
                 if len(seg) < self.min_chunk_chars and buffer:
-                    # Merge short clause into buffer
+                    # Merge short clause into buffer（buffer_start 保持不变）
                     buffer = candidate
                 elif len(seg) < self.min_chunk_chars and not buffer:
                     buffer = seg
+                    buffer_start = seg_start
                 else:
                     if buffer and buffer != candidate:
-                        merged_segments.append(buffer)
+                        merged_segments.append((buffer_start, buffer))
                     buffer = seg
+                    buffer_start = seg_start
             else:
                 # Current buffer is full, commit it
                 if buffer:
-                    merged_segments.append(buffer)
+                    merged_segments.append((buffer_start, buffer))
                 buffer = seg
+                buffer_start = seg_start
 
         if buffer:
-            merged_segments.append(buffer)
+            merged_segments.append((buffer_start, buffer))
 
         # 5. Create chunks from segments
         # Fix A (2026-06-15 L6 A/B): 不再追加 `[上文] {prev_clause_title}` 跨条款面包屑 ——
         # 离线 A/B 证实该"前一兄弟标题"对可读性净负（self_cont +0.83/+0.89、overall
         # +0.62/+0.72），对 recall/rerank 无贡献（0 回退）。整段移除，section_title 仍由
         # _create_chunk 内的 Fix B 解析。
-        for seg in merged_segments:
+        chunk_spans: List[int] = []  # 与 chunks 一一对应的段起始偏移 #F-clause-img
+        for seg_start, seg in merged_segments:
             if len(seg) > self.max_chunk_chars:
                 sub_texts = self._split_long_text(seg)
                 for sub in sub_texts:
@@ -1816,6 +1832,7 @@ class DocumentChunker:
                         section_title=current_section,
                         metadata=meta,
                     ))
+                    chunk_spans.append(seg_start)
                     chunk_index += 1
             else:
                 if len(seg.strip()) < self.min_chunk_chars:
@@ -1829,10 +1846,14 @@ class DocumentChunker:
                     section_title=current_section,
                     metadata=meta,
                 ))
+                chunk_spans.append(seg_start)
                 chunk_index += 1
 
+        # 就近绑图：每张图按文档位置绑到覆盖它的 clause_chunk（对齐 _chunk_by_step），
+        # 只有真正无归属的尾部图片（chunks 为空）才交给 finalize 兜底，绝不丢图。 #F-clause-img
+        orphan_images = self._bind_clause_images(chunks, chunk_spans, image_marks)
         return self._finalize_clause_with_images(
-            table_chunks + chunks, pending_image_refs, doc_id, version_no,
+            table_chunks + chunks, orphan_images, doc_id, version_no,
             chunk_index, meta, current_section)
 
     def _finalize_clause_with_images(self, result_chunks, pending_image_refs, doc_id,
