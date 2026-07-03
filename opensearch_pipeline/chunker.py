@@ -1696,8 +1696,8 @@ class DocumentChunker:
             # image_ref 块 → 暂存图片元数据
             if block_type == "image_ref":
                 if extra:
-                    # 同一 dict 既入尾部兜底列表、又带偏移入就近绑定列表（同一对象，
-                    # 绑定与兜底不分叉）；offset=当前已累积正文长度=该图文档位置。 #F-clause-img
+                    # 同一 dict 既入尾部兜底列表、又带偏移入就近绑定列表（同一对象，绑定
+                    # 与兜底不分叉）；offset=当前已累积正文长度=该图文档位置。 #F-clause-img
                     img_meta = dict(extra)
                     pending_image_refs.append(img_meta)
                     image_marks.append((full_len, img_meta))
@@ -1855,6 +1855,39 @@ class DocumentChunker:
         return self._finalize_clause_with_images(
             table_chunks + chunks, orphan_images, doc_id, version_no,
             chunk_index, meta, current_section)
+
+    def _bind_clause_images(self, chunks, chunk_spans, image_marks):
+        """把累积的 image_ref 按文档位置就近绑定到覆盖它的 clause_chunk（对齐 _chunk_by_step
+        的逐步就近绑图），而非全部延后挂到末块——修复多条款文档里分散图片全被绑到最后一个
+        clause_chunk 的图文错配。返回无法归属的图片（chunks 为空时），交由
+        _finalize_clause_with_images 兜底，绝不丢图。 #F-clause-img
+
+        chunk_spans[i] 为 chunks[i] 在 full_text 中的起始偏移，随文档顺序单调不减；
+        每张图归到 span<=其偏移的最后一个 chunk（偏移早于首块则归首块）。"""
+        if not image_marks:
+            return []
+        if not chunks:
+            # 无任何文本/表格 chunk（全图或全被过滤）：交回 finalize 建承载块，绝不丢图。
+            return [meta for _, meta in image_marks]
+        buckets: Dict[int, List[dict]] = {}
+        for offset, meta in image_marks:
+            idx = 0
+            for j, span in enumerate(chunk_spans):
+                if span <= offset:
+                    idx = j
+                else:
+                    break
+            buckets.setdefault(idx, []).append(meta)
+        for idx, metas in buckets.items():
+            chunk = chunks[idx]
+            existing = chunk.extra.get("image_refs", [])
+            chunk.extra["image_refs"] = existing + metas
+            captions = [m.get("visual_summary", "") for m in metas
+                        if m.get("visual_summary")]
+            if captions:
+                chunk.chunk_text += "\n[图片内容] " + "；".join(c[:120] for c in captions)
+                chunk.token_count = _estimate_tokens(chunk.chunk_text)
+        return []
 
     def _finalize_clause_with_images(self, result_chunks, pending_image_refs, doc_id,
                                      version_no, chunk_index, meta, section):
