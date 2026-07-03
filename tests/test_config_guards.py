@@ -141,3 +141,22 @@ class TestFingerprints:
     def test_search_fingerprint_substring(self):
         assert is_prod_target("search", PROD_HA3)
         assert not is_prod_target("search", "localhost")
+
+
+class TestRrfThresholdWarning:
+    """#9：rrf 融合 + 未开 rerank 时，7.7/5.8 阈值失配，load_config 必须 loud-warn。"""
+
+    def test_rrf_without_rerank_warns(self, capsys):
+        cfg = _fresh_load(RAG_HA3_HYBRID_FUSION="rrf", RAG_RERANK_ENABLE="false")
+        out = capsys.readouterr().out
+        assert cfg.alibaba_vector.hybrid_fusion == "rrf"
+        assert "HA3_HYBRID_FUSION=rrf" in out and "误标" in out
+
+    def test_weighted_no_warn(self, capsys):
+        _fresh_load(RAG_HA3_HYBRID_FUSION="weighted")
+        assert "HA3_HYBRID_FUSION=rrf" not in capsys.readouterr().out
+
+    def test_rrf_with_rerank_no_warn(self, capsys):
+        """rrf + rerank 开：档位改用 0.9/0.8 rerank 尺度，不属本告警场景。"""
+        _fresh_load(RAG_HA3_HYBRID_FUSION="rrf", RAG_RERANK_ENABLE="true")
+        assert "HA3_HYBRID_FUSION=rrf" not in capsys.readouterr().out

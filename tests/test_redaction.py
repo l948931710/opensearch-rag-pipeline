@@ -63,6 +63,38 @@ def test_id_and_accesskey_redacted_when_glued_to_cjk():
     assert counts2.get("cn_id_card") == 1 and ID1 not in out2
 
 
+def test_secret_like_redacted_when_glued_to_cjk():
+    """回归：password/token/api_key 等口令关键字紧贴中文时必须命中并脱敏（serving/qa-log 侧）。
+
+    secret_like 曾遗留 \\b 定界（其余号码/密钥类已迁移 lookaround）；Python 正则里 CJK 属 \\w，
+    \\b 在中文邻接处不成立 → 明文密钥既写入 qa_session_log 又逃过入库隔离闸门。lookaround 修复。
+    值均为 SYNTHETIC 假密钥，非真实凭据。"""
+    cases = [
+        ("数据库password=Hunter2secret", "Hunter2secret"),   # 中文紧贴（主场景）
+        ("服务器token=abcdefgh1234", "abcdefgh1234"),
+        ("API密钥api_key=Zx90Aa11Bb22", "Zx90Aa11Bb22"),
+        ("the password=Hunter2secret", "Hunter2secret"),      # ASCII 前缀：不得回归
+    ]
+    for text, secret in cases:
+        out, counts = R.redact_text(text)
+        assert counts.get("secret_like", 0) >= 1, f"secret_like 漏检: {text!r}"
+        assert secret not in out, f"明文密钥残留: {text!r} -> {out!r}"
+        assert R.PLACEHOLDERS["secret_like"] in out
+
+
+def test_secret_like_pattern_matches_cjk_glued_for_ingestion_gate():
+    """回归：入库隔离闸门 node_detect_sensitive 用 re.search(ENTITY_PATTERNS[...]) 逐条扫描 —
+    直接断言 secret_like 正则对中文紧贴场景命中并归为 high（→ 文档 QUARANTINE，不入索引），
+    锁定隔离侧而非仅 redact 侧。"""
+    import re
+    from opensearch_pipeline.pii_patterns import ENTITY_PATTERNS, ENTITY_SEVERITY
+    pat = ENTITY_PATTERNS["secret_like"]
+    assert re.search(pat, "数据库password=Hunter2secret")
+    assert re.search(pat, "服务器token=abcdefgh1234")
+    # 命中即 high → 隔离（不入 HA3），与 redact 的 medium 就地掩码区分
+    assert ENTITY_SEVERITY["secret_like"] == "high"
+
+
 def test_long_caseid_and_uscc_not_personal_pii():
     # 21-digit 办件单号 and 18-char-with-letter USCC are not personal PII patterns
     case_id = "120000000000000000009"   # synthetic 21-digit case-number shape

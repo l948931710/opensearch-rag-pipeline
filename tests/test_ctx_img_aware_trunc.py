@@ -13,7 +13,7 @@ import types
 
 import opensearch_pipeline.llm_generator as G
 from opensearch_pipeline.config import RAGConfig
-from opensearch_pipeline.llm_generator import _chunk_header, _format_context
+from opensearch_pipeline.llm_generator import _chunk_header, _format_context  # noqa: F401
 
 
 def _cfg(monkeypatch, on: bool):
@@ -129,3 +129,37 @@ def test_chunk_header_matches_context_output(monkeypatch):
         h = _chunk_header(0, chunk, pure_text=False)
         ctx = _format_context([chunk], max_chars=6000)
         assert ctx.startswith(h), f"header 漂移: {h!r} vs {ctx[:120]!r}"
+
+
+# ═══════════════ (c) sources 只基于实际进入 context 的块（#8） ═══════════════
+
+def test_sources_exclude_truncated_out_docs(monkeypatch):
+    """#8 回归：被 max_context_chars 截断、从未进入 prompt 的尾块，不得列进 sources/cited_docs。
+
+    _format_context_ex 返回 (ctx, included)；sources 只应基于 included。构造一个独立标题的
+    尾块被整体丢弃，断言它不在 included、不在 _extract_sources(included)，而按全量抽取仍会误报。"""
+    _cfg(monkeypatch, False)  # 关 img-aware，尾块不会被压缩条目补回
+    head = {"chunk_type": "text_chunk", "title": "甲文档.docx", "chunk_text": "甲" * 400,
+            "score": 8.0, "doc_id": "docA"}
+    tail = {"chunk_type": "text_chunk", "title": "乙文档.docx", "chunk_text": "乙" * 400,
+            "score": 6.0, "doc_id": "docB"}
+    entry_head = _chunk_header(0, head, pure_text=False) + "\n" + head["chunk_text"] + "\n"
+    max_chars = len(entry_head) + 20  # 头块进、尾块剩余空间 <100 → 整体丢弃（salvage_start=1）
+
+    _ctx, included = G._format_context_ex([head, tail], max_chars=max_chars)
+    inc_titles = {c["title"] for c in included}
+    assert "甲文档.docx" in inc_titles and "乙文档.docx" not in inc_titles
+
+    src_titles = {s["title"] for s in G._extract_sources(included)}
+    assert "乙文档.docx" not in src_titles  # 尾块不再作为幽灵来源
+    # 反证：旧行为（按全量 chunks 抽 sources）会误报截断掉的尾块
+    assert "乙文档.docx" in {s["title"] for s in G._extract_sources([head, tail])}
+
+
+def test_included_is_full_list_without_truncation(monkeypatch):
+    """不截断时 included = 全部 chunks（sources 行为与历史一致，避免误伤常规路径）。"""
+    _cfg(monkeypatch, False)
+    chunks = [{"chunk_type": "text_chunk", "title": f"D{i}.docx", "chunk_text": "字" * 20,
+               "score": 8.0, "doc_id": f"d{i}"} for i in range(3)]
+    _ctx, included = G._format_context_ex(chunks, max_chars=100000)
+    assert len(included) == 3

@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 
 from opensearch_pipeline.http_session import http_post as _http_post
@@ -94,6 +94,31 @@ LOW_CONFIDENCE_RULE = """
 注意：本次检索结果与用户问题的相关度偏低。请先逐条核对参考文档是否真正覆盖用户问题的要点：只有文档内容能直接支撑答案时才作答；若所有文档都只是主题相近但并未回答该问题（例如讲的是另一种产品、另一个流程、另一份制度，或文档编号/名称与所问不符），必须回复"抱歉，当前知识库中未找到相关信息"，不得从相近内容推断或拼凑作答。"""
 
 
+def _confidence_norm(chunk: Dict[str, Any]) -> Optional[float]:
+    """把一个 chunk 的相关度分归一到统一 [0,1] 置信度（#7 跨量纲比较）。
+
+    每个 chunk 用【自己所属量纲】的 medium/high 阈值作锚点分段线性映射：
+      raw<=medium → 0..0.5（medium 线=0.5）；medium<raw<=high → 0.5..1.0（high 线=1.0）；
+      raw>high → 线性外推（>1.0，band 判定只比 0.5 故无碍）。有 rerank_score 用 rerank 阈
+      (0.9/0.8)，否则用融合阈(7.7/5.8)——与 score_level 的按 chunk 选阈同源。
+    这样 rerank 文本分与 cosurface 补图的融合分可在同一尺度比较，避免「重排文本弱→整体判低」时
+    忽略某张强相关融合分图。分数缺失/阈值退化返回 None（调用方跳过，回退旧逻辑）。"""
+    config = get_config()
+    if isinstance(chunk.get("rerank_score"), (int, float)):
+        raw = float(chunk["rerank_score"])
+        med, high = config.rag.rerank_score_threshold_medium, config.rag.rerank_score_threshold_high
+    elif isinstance(chunk.get("score"), (int, float)):
+        raw = float(chunk["score"])
+        med, high = config.rag.score_threshold_medium, config.rag.score_threshold_high
+    else:
+        return None
+    if med <= 0 or high <= med:
+        return None    # 阈值退化 → 无法归一，跳过
+    if raw <= med:
+        return 0.5 * (raw / med)
+    return 0.5 + 0.5 * (raw - med) / (high - med)
+
+
 def is_low_confidence_band(chunks: List[Dict[str, Any]]) -> bool:
     """top 检索分是否落入低置信带（重排分优先，缺失时用融合分；阈值=对应 medium）。
 
@@ -103,6 +128,13 @@ def is_low_confidence_band(chunks: List[Dict[str, Any]]) -> bool:
     config = get_config()
     if not chunks:
         return False
+    # #7：cross-scale 归一（RAG_CONFIDENCE_CROSS_SCALE 开）——rerank+cosurface 同开时旧逻辑只看
+    # rerank 分(0-1)、忽略只带融合分的 cosurface 补图，重排文本弱而某图强时过度拒答。开启后把两种
+    # 量纲各按自阈值归一到 [0,1] 再取 max（medium 线=0.5），强相关融合分图即可阻止误判低置信。
+    # 默认关（旧行为逐字节不变）：须先 eval A/B（正/负例 Youden J 分离）验证不回归再灰度。
+    if config.rag.confidence_cross_scale:
+        norms = [n for n in (_confidence_norm(c) for c in chunks) if n is not None]
+        return bool(norms) and max(norms) < 0.5
     rerank_scores = [c["rerank_score"] for c in chunks
                      if isinstance(c.get("rerank_score"), (int, float))]
     if rerank_scores:
@@ -253,12 +285,25 @@ def _chunk_has_renderable_image(chunk: Dict[str, Any]) -> bool:
     return False
 
 
-def _format_context(
+def _format_context(chunks: List[Dict[str, Any]], max_chars: int = 6000,
+                    pure_text: bool = False) -> str:
+    """向后兼容包装：仅返回 context 字符串（大量调用方/测试按 str 消费）。
+
+    需要【实际进入 context 的 chunk 子集】（修 sources 引用被截断尾块的 #8）时用
+    _format_context_ex —— 单一事实来源，本包装只取其 [0]。"""
+    return _format_context_ex(chunks, max_chars=max_chars, pure_text=pure_text)[0]
+
+
+def _format_context_ex(
     chunks: List[Dict[str, Any]],
     max_chars: int = 6000,
     pure_text: bool = False,
-) -> str:
-    """将检索到的 chunks 组装为 prompt context。
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """将检索到的 chunks 组装为 prompt context，同时返回【实际进入 context 的 chunk 子集】。
+
+    返回 (context_str, included_chunks)。included = 完整/半截纳入的主块 chunks[:salvage_start]
+    ＋ img-aware 压缩条目补回的块。sources/cited_docs 只应基于 included —— 否则被 max_chars
+    截断掉、LLM 从未见到的尾块也会被列进来源面板并污染归属分析（#8）。
 
     pure_text=True（纯文本模式）：不再注入 <<IMG:N>> 图片插入标记，但仍保留
     [📷 图片] 标签与 visual_summary 文本，确保图片的语义内容不丢失（LLM 仍可
@@ -281,6 +326,7 @@ def _format_context(
     n_dropped = 0
     n_dropped_with_images = 0
     salvage_start = len(chunks)   # 首个未进 context 的 chunk 下标
+    salvaged_idx: List[int] = []  # img-aware 压缩条目补回的尾块下标（也算「进了 context」）
 
     for i, chunk in enumerate(chunks):
         header = _chunk_header(i, chunk, pure_text)
@@ -339,6 +385,7 @@ def _format_context(
                 parts.append(centry)
                 budget -= len(centry)
                 n_salvaged += 1
+                salvaged_idx.append(j)
         # 截断可观测（#F-mm11c，独立于 image_render_stats 的 logger 兜底）
         try:
             logger.info(
@@ -348,7 +395,9 @@ def _format_context(
         except Exception:
             pass
 
-    return "\n---\n".join(parts)
+    # included = 主纳入块 + img-aware 补回块（保持检索排序：尾部补回块接在主块之后）
+    included = list(chunks[:salvage_start]) + [chunks[j] for j in salvaged_idx]
+    return "\n---\n".join(parts), included
 
 
 # 来源去重时从标题剥掉的文件扩展名（docx+pdf 双格式 double-ingest 视为同一来源）
@@ -678,7 +727,8 @@ def generate_answer(
         _system = _system + LOW_CONFIDENCE_RULE
 
     # 组装 context
-    context = _format_context(context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    context, _included_chunks = _format_context_ex(
+        context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
 
     # 调用 DashScope (OpenAI compatible-mode)
@@ -710,7 +760,7 @@ def generate_answer(
     # 源头清洗 [文档N] 编号引用（非流式四条消费链路一次覆盖；流式在收集端清理）
     answer = strip_doc_citations(data["choices"][0]["message"]["content"])
     usage = data.get("usage", {})
-    sources = _extract_sources(context_chunks)
+    sources = _extract_sources(_included_chunks)
 
     logger.info("Answer generated: model=%s, tokens=%s", llm.model, usage)
     return {
@@ -786,7 +836,8 @@ def generate_answer_stream(
         logger.info("低置信度护栏触发（top 分低于 medium 阈值），追加强化拒答指令")
         _system = _system + LOW_CONFIDENCE_RULE
 
-    context = _format_context(context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    context, _included_chunks = _format_context_ex(
+        context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
 
     url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
@@ -811,7 +862,7 @@ def generate_answer_stream(
     }
 
     # 先 yield sources 信息
-    sources = _extract_sources(context_chunks)
+    sources = _extract_sources(_included_chunks)
     yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
 
     # 流式请求

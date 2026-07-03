@@ -41,6 +41,17 @@ def test_stage3_drain_runs_pending_delete_reconcile():
     assert "reconcile_stranded_versions" in src
 
 
+def test_stage3_drain_runs_orphan_pk_reconcile_dry_run_default():
+    """#2：stage-3 drain 挂上 HA3 orphan-PK 对账做安全网（同版本 re-chunk strand 的旧 PK）。
+
+    默认 dry-run 只报数——不可逆 HA3 删除必须显式 RAG_STAGE3_ORPHAN_PURGE=true 才执行。"""
+    from opensearch_pipeline import dataworks_orchestrator
+    src = inspect.getsource(dataworks_orchestrator.run_stage_drained)
+    assert "reconcile_ha3_orphan_pks" in src
+    assert "RAG_STAGE3_ORPHAN_PURGE" in src
+    assert "dry_run=not _orphan_purge" in src  # 默认 dry-run，未设 flag 绝不真删
+
+
 def test_reconcile_pending_deletes_returns_shape_on_no_rows(monkeypatch):
     """Sanity: with no PENDING_DELETE rows the drainer returns the {total,success,failed,errors} shape
     and never raises (fail-open). Uses a fake conn so no real DB is needed."""

@@ -38,7 +38,10 @@ ENTITY_PATTERNS = {
     "cn_mobile": r"(?<!\d)1[3-9]\d{9}(?!\d)",
     "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
     "access_key": r"(?<![A-Za-z0-9])(LTAI|AKIA)[A-Za-z0-9]{12,}(?![A-Za-z0-9])",
-    "secret_like": r"(?i)\b(secret|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)[A-Za-z0-9_\-]{8,}",
+    # 与本表其余号码/密钥类一致用 lookaround 定界（见上方 ⚠️）：旧实现遗留 \b，而 Python 正则里
+    # CJK 属 \w → 中文紧贴英文关键字（"数据库password=…"）时 \b 不成立 → 明文密钥既写入
+    # qa_session_log 又逃过入库隔离闸门（node_detect_sensitive 的 re.search）。lookaround 同步修复两侧。
+    "secret_like": r"(?i)(?<![A-Za-z0-9])(secret|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)[A-Za-z0-9_\-]{8,}",
 }
 
 REDACTION_MAP = {
