@@ -694,7 +694,7 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                     "reason": reason
                 })
 
-            elif safety_status == "unsafe":
+            elif (safety_status or "").strip().lower() == "unsafe":
                 # #F-spot-safety 复审判定 unsafe 但未建议收紧权限（如 current==suggest）时，
                 # 原逻辑只看 _suggests_tightening → 该 unsafe verdict 被完全丢弃，文档继续留在
                 # 索引可检索、安全兜底静默失效。此处即便权限未收紧，也登记一条 PENDING 人工审核任务
