@@ -594,9 +594,67 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                 report["mismatch_detected"] += 1
                 
                 # 执行隔离 (Quarantine)
+                # ⚠️ 顺序不变量：先删 HA3（唯一影响检索的动作），成功后才 commit RDS 隔离态。
+                # 检索在 HA3 端做权限过滤（与 RDS is_active 无关），故先 commit is_active=FALSE 并不能
+                # 把文档移出检索——只有 HA3 delete 能。若先 commit RDS 再删 HA3，删失败的窗口里 RDS 报
+                # 「已隔离」而文档仍以【旧的过宽权限】被检索命中（越权泄漏）。与 node_deactivate_old_chunks
+                # / reconcile_stranded_versions 的「先删索引后动 RDS」对齐。_delete_chunks_from_index 按
+                # (doc_id,version_no) 枚举 PK（不看 is_active），此处 is_active 尚为 TRUE 不影响其取键。
+                task_id = f"spot_rev_{doc_id}_v{version_no}"
+                review_reason = f"Spot-check permission level mismatch: current={current_permission}, suggested={suggested_perm}. Reason: {reason}"
+                # Defensively truncate to prevent database column VARCHAR(500) limit issues
+                if review_reason and len(review_reason) > 490:
+                    review_reason = review_reason[:490] + "..."
+                _review_sql = """
+                    INSERT INTO review_task (
+                        task_id, doc_id, version_no, review_key, review_type, review_reason, review_status,
+                        owner_dept, suggested_category_l1, suggested_category_l2, suggested_permission_level, confidence_score
+                    ) VALUES (
+                        %s, %s, %s, %s, 'spot_check_mismatch', %s, 'PENDING',
+                        %s, 'reference', 'unknown', %s, 0.5
+                    ) ON DUPLICATE KEY UPDATE
+                        review_reason = VALUES(review_reason),
+                        review_status = 'PENDING',
+                        suggested_permission_level = VALUES(suggested_permission_level)
+                """
+                _review_params = (task_id, doc_id, version_no,
+                                  f"processing/canonical/{doc_id}/v{version_no}/content.md",
+                                  review_reason, doc["owner_dept"], suggested_perm)
+
+                # Phase 1: 先删 HA3（唯一影响检索的动作）
+                try:
+                    _delete_chunks_from_index(doc_id, version_no, conn, config)
+                except Exception as os_err:
+                    # HA3 删除失败 → 文档仍在检索。不翻 is_active/permission/QUARANTINED（RDS 如实反映
+                    # 「仍在服务」，绝不谎报已隔离），只标 PENDING_DELETE 供重试 + 登记 review_task 供人工
+                    # 介入；下次 spot-check/对账重新命中同一 mismatch 会重试删除。
+                    logger.error(
+                        "Failed to delete chunks from search index for %s v%s: %s",
+                        doc_id, version_no, os_err, exc_info=True,
+                    )
+                    report["errors"].append(f"Search index delete error for {doc_id}: {os_err}")
+                    try:
+                        conn.begin()
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET index_status = 'PENDING_DELETE'
+                                WHERE doc_id = %s AND version_no = %s
+                            """, (doc_id, version_no))
+                            cursor.execute(_review_sql, _review_params)
+                        conn.commit()
+                        print(f"       ⚠️ HA3 删除失败：{doc_id} v{version_no} 标 PENDING_DELETE 待重试（未翻隔离态，文档仍在检索）")
+                    except Exception as mark_err:
+                        conn.rollback()
+                        logger.error(
+                            "Failed to mark PENDING_DELETE for %s v%s: %s",
+                            doc_id, version_no, mark_err,
+                        )
+                    continue
+
+                # Phase 2: HA3 已删（文档此刻起已不在检索）→ 安全 commit RDS 隔离终态
                 try:
                     conn.begin()
-                    # a. 更新 document_version & document_meta
                     with conn.cursor() as cursor:
                         # ⚠️ content_process_status 必须是终态 'QUARANTINED'，不能用 'FAILED'：
                         # 'FAILED' 正好命中 stage-2 的抢占谓词（FAILED AND retry_count<3），
@@ -607,7 +665,8 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                                 publish_status = 'QUARANTINED',
                                 gate_status = 'quarantined',
                                 content_process_status = 'QUARANTINED',
-                                content_process_error = %s
+                                content_process_error = %s,
+                                index_status = 'DELETED'
                             WHERE doc_id = %s AND version_no = %s
                         """, (f"[SPOT CHECK MISMATCH] Spot-check recommends tightening permission to {suggested_perm}", doc_id, version_no))
 
@@ -618,73 +677,22 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                             WHERE doc_id = %s
                         """, (suggested_perm, doc_id))
 
-                        # b. 停用 chunk_meta 记录
                         cursor.execute("""
                             UPDATE chunk_meta
                             SET is_active = FALSE
                             WHERE doc_id = %s AND version_no = %s
                         """, (doc_id, version_no))
 
-                        # c. 注册人工审核任务
-                        task_id = f"spot_rev_{doc_id}_v{version_no}"
-                        review_reason = f"Spot-check permission level mismatch: current={current_permission}, suggested={suggested_perm}. Reason: {reason}"
-                        # Defensively truncate to prevent database column VARCHAR(500) limit issues
-                        if review_reason and len(review_reason) > 490:
-                            review_reason = review_reason[:490] + "..."
-                        cursor.execute("""
-                            INSERT INTO review_task (
-                                task_id, doc_id, version_no, review_key, review_type, review_reason, review_status,
-                                owner_dept, suggested_category_l1, suggested_category_l2, suggested_permission_level, confidence_score
-                            ) VALUES (
-                                %s, %s, %s, %s, 'spot_check_mismatch', %s, 'PENDING',
-                                %s, 'reference', 'unknown', %s, 0.5
-                            ) ON DUPLICATE KEY UPDATE
-                                review_reason = VALUES(review_reason),
-                                review_status = 'PENDING',
-                                suggested_permission_level = VALUES(suggested_permission_level)
-                        """, (task_id, doc_id, version_no, f"processing/canonical/{doc_id}/v{version_no}/content.md",
-                              review_reason, doc["owner_dept"], suggested_perm))
+                        cursor.execute(_review_sql, _review_params)
                     conn.commit()
+                    print(f"       └─ ✅ Chunks deleted from index + RDS quarantined for {doc_id} v{version_no}")
                 except Exception as db_err:
+                    # HA3 已删但 RDS 隔离态提交失败 → 文档已不在检索（无泄漏），仅 RDS 落后；
+                    # CS3 探针/对账检出 is_active=1 而 HA3 缺失并自愈（与 deactivate 同风险面，幂等）。
                     conn.rollback()
-                    print(f"       ⚠️ Failed to update RDS for quarantine: {db_err}")
+                    print(f"       ⚠️ HA3 已删但 RDS 隔离态提交失败（对账自愈）: {db_err}")
                     report["errors"].append(f"RDS quarantine error for {doc_id}: {db_err}")
-                    continue  # Skip OpenSearch delete if RDS failed
-
-                # d. 从搜索索引中彻底 DELETE 这些 chunks
-                try:
-                    _delete_chunks_from_index(doc_id, version_no, conn, config)
-                    # 删除成功 → 标记为 DELETED
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET index_status = 'DELETED'
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (doc_id, version_no))
-                    conn.commit()
-                    print(f"       └─ ✅ Chunks deleted from search index for {doc_id} v{version_no}")
-                except Exception as os_err:
-                    logger.error(
-                        "Failed to delete chunks from search index for %s v%s: %s",
-                        doc_id, version_no, os_err, exc_info=True,
-                    )
-                    report["errors"].append(f"Search index delete error for {doc_id}: {os_err}")
-                    # 关键修复：标记为 PENDING_DELETE，下次 spot-check 或对账任务会重试
-                    try:
-                        with conn.cursor() as cursor:
-                            cursor.execute("""
-                                UPDATE document_version
-                                SET index_status = 'PENDING_DELETE'
-                                WHERE doc_id = %s AND version_no = %s
-                            """, (doc_id, version_no))
-                        conn.commit()
-                        print(f"       ⚠️ Marked {doc_id} v{version_no} as PENDING_DELETE for retry")
-                    except Exception as mark_err:
-                        conn.rollback()
-                        logger.error(
-                            "Failed to mark PENDING_DELETE for %s v%s: %s",
-                            doc_id, version_no, mark_err,
-                        )
+                    continue
 
                 report["quarantined_documents"].append({
                     "doc_id": doc_id,

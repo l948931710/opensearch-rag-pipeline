@@ -684,6 +684,22 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         except Exception as e:
             print(f"[Orchestrator] WARNING: pending-delete reconcile failed (non-fatal): {e}",
                   file=sys.stderr)
+        # #2：同版本 re-chunk / chunk_meta-cleared 重灌会 strand 旧 HA3 PK——version_no 与新块【相同】，
+        # 故既不在 deactivate(version_no<N) 也不在 PENDING_DELETE（按 version 删）覆盖内，此前只有【未
+        # 排期】的 spot-check 会清（漏跑即长期双份/过期召回）。挂进每日 drain 做安全网：**默认 dry-run
+        # 只报数**（不做不可逆 HA3 删除，尊重「HA3 删不可逆」的谨慎），仅 RAG_STAGE3_ORPHAN_PURGE=true
+        # 时才真删。失败不阻断入库（fail-open，与相邻对账一致）。
+        try:
+            from opensearch_pipeline.ha3_reconcile import reconcile_ha3_orphan_pks
+            _orphan_purge = os.environ.get("RAG_STAGE3_ORPHAN_PURGE", "").lower() in ("true", "1", "yes")
+            orp = reconcile_ha3_orphan_pks(dry_run=not _orphan_purge)
+            if orp.get("stale"):
+                _mode = "purged" if _orphan_purge else "DRY-RUN(设 RAG_STAGE3_ORPHAN_PURGE=true 方真删)"
+                print(f"[Orchestrator] HA3 orphan-PK reconcile [{_mode}]: stale={orp['stale']} "
+                      f"deleted={orp.get('deleted', 0)} errors={len(orp.get('errors', []))}")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: HA3 orphan-PK reconcile failed (non-fatal): {e}",
+                  file=sys.stderr)
         # Phase D（flag 开）：投影 outbox 定向 drain——decide 端点同事务入队的受影响 doc，逐文档幂等
         # materialize（标脏 chunk_meta + index_status='NOT_INDEXED'），交本轮 drain 推 HA3。这是
         # 「decide 内联 materialize best-effort（抛/skipped_locked 漏标脏）」的【必达】兜底，先于下面的

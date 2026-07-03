@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 
 from opensearch_pipeline.http_session import http_post as _http_post
@@ -253,12 +253,25 @@ def _chunk_has_renderable_image(chunk: Dict[str, Any]) -> bool:
     return False
 
 
-def _format_context(
+def _format_context(chunks: List[Dict[str, Any]], max_chars: int = 6000,
+                    pure_text: bool = False) -> str:
+    """向后兼容包装：仅返回 context 字符串（大量调用方/测试按 str 消费）。
+
+    需要【实际进入 context 的 chunk 子集】（修 sources 引用被截断尾块的 #8）时用
+    _format_context_ex —— 单一事实来源，本包装只取其 [0]。"""
+    return _format_context_ex(chunks, max_chars=max_chars, pure_text=pure_text)[0]
+
+
+def _format_context_ex(
     chunks: List[Dict[str, Any]],
     max_chars: int = 6000,
     pure_text: bool = False,
-) -> str:
-    """将检索到的 chunks 组装为 prompt context。
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """将检索到的 chunks 组装为 prompt context，同时返回【实际进入 context 的 chunk 子集】。
+
+    返回 (context_str, included_chunks)。included = 完整/半截纳入的主块 chunks[:salvage_start]
+    ＋ img-aware 压缩条目补回的块。sources/cited_docs 只应基于 included —— 否则被 max_chars
+    截断掉、LLM 从未见到的尾块也会被列进来源面板并污染归属分析（#8）。
 
     pure_text=True（纯文本模式）：不再注入 <<IMG:N>> 图片插入标记，但仍保留
     [📷 图片] 标签与 visual_summary 文本，确保图片的语义内容不丢失（LLM 仍可
@@ -281,6 +294,7 @@ def _format_context(
     n_dropped = 0
     n_dropped_with_images = 0
     salvage_start = len(chunks)   # 首个未进 context 的 chunk 下标
+    salvaged_idx: List[int] = []  # img-aware 压缩条目补回的尾块下标（也算「进了 context」）
 
     for i, chunk in enumerate(chunks):
         header = _chunk_header(i, chunk, pure_text)
@@ -339,6 +353,7 @@ def _format_context(
                 parts.append(centry)
                 budget -= len(centry)
                 n_salvaged += 1
+                salvaged_idx.append(j)
         # 截断可观测（#F-mm11c，独立于 image_render_stats 的 logger 兜底）
         try:
             logger.info(
@@ -348,7 +363,9 @@ def _format_context(
         except Exception:
             pass
 
-    return "\n---\n".join(parts)
+    # included = 主纳入块 + img-aware 补回块（保持检索排序：尾部补回块接在主块之后）
+    included = list(chunks[:salvage_start]) + [chunks[j] for j in salvaged_idx]
+    return "\n---\n".join(parts), included
 
 
 # 来源去重时从标题剥掉的文件扩展名（docx+pdf 双格式 double-ingest 视为同一来源）
@@ -678,7 +695,8 @@ def generate_answer(
         _system = _system + LOW_CONFIDENCE_RULE
 
     # 组装 context
-    context = _format_context(context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    context, _included_chunks = _format_context_ex(
+        context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
 
     # 调用 DashScope (OpenAI compatible-mode)
@@ -710,7 +728,7 @@ def generate_answer(
     # 源头清洗 [文档N] 编号引用（非流式四条消费链路一次覆盖；流式在收集端清理）
     answer = strip_doc_citations(data["choices"][0]["message"]["content"])
     usage = data.get("usage", {})
-    sources = _extract_sources(context_chunks)
+    sources = _extract_sources(_included_chunks)
 
     logger.info("Answer generated: model=%s, tokens=%s", llm.model, usage)
     return {
@@ -786,7 +804,8 @@ def generate_answer_stream(
         logger.info("低置信度护栏触发（top 分低于 medium 阈值），追加强化拒答指令")
         _system = _system + LOW_CONFIDENCE_RULE
 
-    context = _format_context(context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    context, _included_chunks = _format_context_ex(
+        context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
 
     url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
@@ -811,7 +830,7 @@ def generate_answer_stream(
     }
 
     # 先 yield sources 信息
-    sources = _extract_sources(context_chunks)
+    sources = _extract_sources(_included_chunks)
     yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
 
     # 流式请求

@@ -889,6 +889,18 @@ def load_config() -> PipelineConfig:
     # 💡 环境守卫第二层：环境标签 ↔ 物理目标交叉校验（规则表见函数 docstring）
     _validate_environment_target_consistency(config)
 
+    # #9：rrf 融合分尺度 ~0.0x，而相关度档位(高/中/低)与低置信护栏阈值(7.7/5.8)按 weighted 融合分
+    # 标定（见 RAGConfig score_threshold_*）。一旦切 rrf 且未开 rerank（rerank 会改用 0.9/0.8 尺度），
+    # llm_generator 的 score_level/score_relevance/is_low_confidence_band 会把几乎所有命中误标为「低」
+    # 并常态触发软拒答——且不报错。当前无 rrf 校准阈值，故此处只 loud-warn，不静默也不硬拦。
+    _av = config.alibaba_vector
+    if getattr(_av, "hybrid_fusion", "weighted") == "rrf" and not getattr(_av, "rerank_enable", False):
+        print(
+            "⚠️ [CONFIG GUARD] HA3_HYBRID_FUSION=rrf 且 rerank 关闭：相关度档位/低置信护栏阈值"
+            "(7.7/5.8) 按 weighted 融合分标定，rrf 分尺度(~0.0x)下会把几乎所有命中误标为「低」并"
+            "触发软拒答。请改回 weighted，或为 rrf 单独标定 score_threshold_*（当前未提供 rrf 校准值）。"
+        )
+
     return config
 
 
