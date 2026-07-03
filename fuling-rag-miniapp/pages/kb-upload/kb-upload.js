@@ -1,5 +1,7 @@
 // 上传文档：web-view 承载 H5 上传页（小程序容器选不了 office 文档，必须 web-view 浏览器上下文）。
-// 免登已由小程序做好 → 把 bearer token 透传给 H5（/console 的 token 模式），H5 无需再 requestAuthCode。
+// 免登在 H5 侧完成：web-view 打开 /console 后，H5 在钉钉容器内自行 requestAuthCode 换取自己的 token。
+// ⚠️ 安全(#F-miniapp-token)：不得把小程序侧长效会话 bearer token 塞进 web-view URL query——
+//   会漏入服务端访问日志/浏览历史/Referer，可被重放冒用全部鉴权接口（含知识库写）。
 // ⚠️ web-view 的 src 域名须在钉钉后台登记为「业务域名」(HTTPS)。裸 IP HTTP 仅 IDE 关闭校验时可测；
 //    线上等 rag.fulingplastics.com.cn 备案+证书+业务域名登记后生效。
 
@@ -20,12 +22,15 @@ Page({
           this.setData({ err: '未登录' });
           return;
         }
-        let url = BASE_URL + '/console?token=' + encodeURIComponent(g.token) +
-          '&name=' + encodeURIComponent(g.displayName || '');
+        // #F-miniapp-token 安全：token 不进 URL query（防日志/历史/Referer 泄露被重放）。
+        //   ensureLogin 仅作登录门槛（未登录→上面直接报错），token 留在小程序侧；
+        //   H5(/console) 在钉钉 web-view 容器内 requestAuthCode 自行换取 token
+        //   （见 console-app useAuth.doLogin 的容器免登兜底路径）。
+        let url = BASE_URL + '/console';
         if (docId) {
           // owner 透传 → 即使目标文档不在 my-docs 首屏，/console 也能据 doc_id+owner 进升版态
           // （可见范围由后端 upload-url 强制继承，前端无需 permission_level）。
-          url += '&doc_id=' + encodeURIComponent(docId) +
+          url += '?doc_id=' + encodeURIComponent(docId) +
             '&title=' + encodeURIComponent(docTitle) +
             '&owner=' + encodeURIComponent(owner);
         }

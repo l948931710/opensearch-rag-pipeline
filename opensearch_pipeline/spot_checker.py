@@ -419,6 +419,7 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
         "sampled_documents": 0,
         "checked_documents": 0,
         "mismatch_detected": 0,
+        "unsafe_flagged": 0,
         "quarantined_documents": [],
         "errors": []
     }
@@ -692,6 +693,39 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                     "suggested_permission": suggested_perm,
                     "reason": reason
                 })
+
+            elif safety_status == "unsafe":
+                # #F-spot-safety 复审判定 unsafe 但未建议收紧权限（如 current==suggest）时，
+                # 原逻辑只看 _suggests_tightening → 该 unsafe verdict 被完全丢弃，文档继续留在
+                # 索引可检索、安全兜底静默失效。此处即便权限未收紧，也登记一条 PENDING 人工审核任务
+                # （不隔离/不删索引，交人工裁决），确保 unsafe 结论不被吞掉。
+                print(f"       ⚠️ SAFETY UNSAFE (无权限收紧建议) for {doc_id}: {reason} → 登记人工审核")
+                report["unsafe_flagged"] += 1
+                try:
+                    conn.begin()
+                    with conn.cursor() as cursor:
+                        task_id = f"spot_unsafe_{doc_id}_v{version_no}"
+                        review_reason = f"Spot-check safety_status=unsafe (permission unchanged={current_permission}). Reason: {reason}"
+                        if review_reason and len(review_reason) > 490:
+                            review_reason = review_reason[:490] + "..."
+                        cursor.execute("""
+                            INSERT INTO review_task (
+                                task_id, doc_id, version_no, review_key, review_type, review_reason, review_status,
+                                owner_dept, suggested_category_l1, suggested_category_l2, suggested_permission_level, confidence_score
+                            ) VALUES (
+                                %s, %s, %s, %s, 'spot_check_unsafe', %s, 'PENDING',
+                                %s, 'reference', 'unknown', %s, 0.5
+                            ) ON DUPLICATE KEY UPDATE
+                                review_reason = VALUES(review_reason),
+                                review_status = 'PENDING',
+                                suggested_permission_level = VALUES(suggested_permission_level)
+                        """, (task_id, doc_id, version_no, f"processing/canonical/{doc_id}/v{version_no}/content.md",
+                              review_reason, doc["owner_dept"], suggested_perm))
+                    conn.commit()
+                except Exception as db_err:
+                    conn.rollback()
+                    print(f"       ⚠️ Failed to register unsafe review task for {doc_id}: {db_err}")
+                    report["errors"].append(f"Unsafe review-task error for {doc_id}: {db_err}")
 
         except Exception as e:
             err_msg = f"Spot-check safety assessment failed for {doc_id}: {e}"

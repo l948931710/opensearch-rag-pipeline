@@ -595,6 +595,11 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
             problems.append(f"RAG_ENVIRONMENT 必须为 staging（当前 {env}）")
         if not config.simulate_db and not config.rds.database.endswith("_stg"):
             problems.append(f"RDS_DATABASE 必须以 _stg 结尾（当前 {config.rds.database}）")
+        # #F-staging-opdb 运营库同样须切 _stg：此前只校主库，漏设 RAG_RDS_OPERATION_DATABASE 时
+        # operation_database 仍是默认 fuling_operation（生产运营库）→ staging 的 QA/反馈/转人工
+        # 会明文写进生产运营库，污染生产审计流水。运营库未切 _stg 一律 fail-fast。
+        if not config.simulate_db and not config.rds.operation_database.endswith("_stg"):
+            problems.append(f"RDS_OPERATION_DATABASE 必须以 _stg 结尾（当前 {config.rds.operation_database}）")
         if not config.simulate_opensearch and config.alibaba_vector.endpoint \
                 and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             problems.append(f"HA3_TABLE_NAME 必须以 _stg 或 _s 结尾"

@@ -956,13 +956,44 @@ class FeedbackRequest(BaseModel):
     feedback_comment: Optional[str] = Field(None, description="反馈备注")
 
 
+def _feedback_owns_message(message_id: str, user_id: str) -> bool:
+    """反馈归属校验：message_id 是否为 user_id 本人的问答（qa_session_log 现查绑定 user_id）。
+
+    REST /api/feedback 无从预取上下文（钉钉卡片回调走 _card_callback_authorized + qa_context），
+    这里补上同等的归属门控：未命中 → 非本人消息（伪造/越权）→ 拒收。查库异常 → fail-open 放行
+    （与卡片回调一致：下游 _save_feedback 写在同一故障下本就会失败，不因瞬时 SELECT 抖动误拒）。"""
+    if not message_id or not user_id:
+        return False
+    from opensearch_pipeline.qa_logger import _op_db
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT 1 FROM {_op_db()}.qa_session_log "
+                    f"WHERE message_id = %s AND user_id = %s LIMIT 1",
+                    (message_id, user_id),
+                )
+                return cursor.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("反馈归属校验查库失败（fail-open 放行）: %s", e)
+        return True
+
+
 @app.post("/api/feedback")
 def submit_feedback(req: FeedbackRequest, request: Request,
                     identity: Optional[Identity] = Depends(current_identity)):
     """反馈接口 — 供前端/管理后台使用。"""
     _enforce_rate_limit(request, identity, scope="aux")
-    # 有令牌时以令牌身份为准，避免客户端伪造 user_id（uk_message_user 去重才可信）
-    uid = identity.user_id if identity else req.user_id
+    # 归属主键：仅令牌身份可作 user_id；匿名一律落 anon:<ip 短哈希>，绝不采信客户端自报的
+    # req.user_id 伪造他人 staffId 覆盖/污染其反馈（与 /api/ask 落库归属一致）。#F-fbk-authz
+    uid = identity.user_id if identity else _anon_uid(request)
+    # 归属门控：反馈只能针对 uid 本人的问答；非本人消息（伪造/越权）拒收。#F-fbk-authz
+    if not _feedback_owns_message(req.message_id, uid):
+        raise HTTPException(status_code=403, detail="无权对该消息反馈")
     success = handle_feedback(
         message_id=req.message_id,
         user_id=uid,

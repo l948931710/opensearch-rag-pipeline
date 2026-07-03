@@ -813,10 +813,13 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
             # 2) REFUSAL（有文档没答好）：本部门命中 OR 全部命中为 public（最保守）
             try:
                 mine_expr = "0"
-                params: List[Any] = [win]
+                # F-kb-gaps-sql 占位符须按 SQL 文本顺序绑定：depts(mine_expr@SELECT) → win(WHERE) → cap(LIMIT)
+                params: List[Any] = []
                 if depts:
                     ph = ",".join(["%s"] * len(depts))
                     mine_expr = f"MAX(CASE WHEN m.owner_dept IN ({ph}) THEN 1 ELSE 0 END)"
+                    params.extend(depts)
+                params.append(win)
                 from opensearch_pipeline.qa_facts import qa_docs_join_sql
                 cur.execute(
                     "SELECT t.query_text, t.message_id, t.days_ago, t.any_dept FROM ("
@@ -832,7 +835,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                     " GROUP BY q.message_id"
                     ") t WHERE t.hit_mine=1 OR t.all_public=1"
                     " ORDER BY t.days_ago ASC LIMIT %s",
-                    tuple(params + (depts if depts else []) + [_CONTRIB_CANDIDATE_CAP]))
+                    tuple(params + [_CONTRIB_CANDIDATE_CAP]))
                 for r in cur.fetchall() or []:
                     _accumulate(r[0], r[1], r[2], r[3], "refusal")
             except Exception as e:

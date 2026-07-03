@@ -45,6 +45,8 @@ def _build_cfg(*, ha3_table: str, rds_db: str = "fuling_knowledge_stg",
         host="rm-bp15j7wekd5738f093o.rwlb.rds.aliyuncs.com",
         port=3306, user="fuling_stg", password="x",
         database=rds_db, charset="utf8mb4",
+        # #F-staging-opdb 运营库也必须切 _stg，否则 staging 会写进生产运营库
+        operation_database="fuling_operation_stg",
     )
     cfg.alibaba_vector = AlibabaVectorSearchConfig(
         endpoint="ha-cn-kgl4slr1n01.public.ha.aliyuncs.com",
@@ -134,6 +136,19 @@ def test_rds_database_still_requires_stg_suffix(monkeypatch):
     # R3 (env=staging 生产实例) 先撞: '非 _stg 库'
     # 不用 'STAGING overlay 强约束' 的 '必须以 _stg 结尾' 那条措辞,因为 R3 先 raise
     with pytest.raises(EnvironmentMismatchError, match=r"_stg"):
+        _validate_environment_target_consistency(cfg)
+
+
+# ─── 运营库后缀守卫 (#F-staging-opdb) ──────────────────────────────
+
+def test_operation_database_must_be_stg(monkeypatch):
+    """运营库未切 _stg（漏设 RAG_RDS_OPERATION_DATABASE）必须 raise：
+    否则 staging 的 QA/反馈/转人工会明文写进生产运营库 fuling_operation。"""
+    monkeypatch.setenv("RAG_ENV", "staging")
+    cfg = _build_cfg(ha3_table="fuling_kb_chunks_s")
+    # 覆盖为默认生产运营库，模拟漏设 RAG_RDS_OPERATION_DATABASE
+    cfg.rds = replace(cfg.rds, operation_database="fuling_operation")
+    with pytest.raises(EnvironmentMismatchError, match=r"RDS_OPERATION_DATABASE"):
         _validate_environment_target_consistency(cfg)
 
 

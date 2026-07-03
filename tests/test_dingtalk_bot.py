@@ -118,8 +118,9 @@ class TestSignatureVerification:
         assert _verify_signature("", "any_sign") is False
 
     def test_boundary_timestamp_within_tolerance(self):
-        """刚好在 3600 秒窗口边缘内的时间戳应通过。"""
-        boundary_ts = str(int((time.time() - 3599) * 1000))
+        """刚好在签名时间窗口边缘内的时间戳应通过（窗口=_TIMESTAMP_TOLERANCE，#F-dingtalk-ssrf 收紧到 300s）。"""
+        from opensearch_pipeline.dingtalk_bot import _TIMESTAMP_TOLERANCE
+        boundary_ts = str(int((time.time() - (_TIMESTAMP_TOLERANCE - 1)) * 1000))
         sign = _compute_valid_signature(boundary_ts, _TEST_SECRET)
         assert _verify_signature(boundary_ts, sign) is True
 

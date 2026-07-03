@@ -50,6 +50,38 @@ RDS_USER     = os.environ.get("RAG_RDS_USER", "root")
 RDS_PASSWORD = os.environ["RAG_RDS_PASSWORD"]
 RDS_DATABASE = os.environ.get("RAG_RDS_DATABASE", "fuling_knowledge")
 
+# 部门映射：OSS 路径前缀 → 部门代码（与 register_new_files.py 保持一致）
+#F-oss-raw-key 用于校验按文件名匹配到的候选 key 与 doc 的 owner_dept 同部门
+DEPT_MAP = {
+    "raw/admin/": "ADMIN",
+    "raw/hr/": "HR",
+    "raw/it/": "IT",
+    "raw/production/": "PRODUCTION",
+    "raw/production_thermoforming/": "PRODUCTION",
+    "raw/production_injection/": "PRODUCTION",
+    "raw/production_papercup/": "PRODUCTION",
+    "raw/production_paper_cup/": "PRODUCTION",  # OSS 实际目录拼写（带下划线），与上行双拼写并存
+    "raw/marketing/": "MARKETING",
+    "raw/pmc/": "PMC",
+    "raw/rd/": "RD",
+    "raw/supply/": "SUPPLY",
+    "raw/finance/": "FINANCE",
+    "raw/quality/": "QUALITY",
+    "raw/sales/": "SALES",
+    "raw/logistics/": "LOGISTICS",
+}
+
+def resolve_dept(raw_key):
+    """从 raw_key 路径推断部门"""
+    for prefix, dept in sorted(DEPT_MAP.items(), key=lambda x: -len(x[0])):
+        if raw_key.startswith(prefix):
+            return dept
+    # 默认用第二级目录名
+    parts = raw_key.split("/")
+    if len(parts) >= 2:
+        return parts[1].upper()
+    return "UNKNOWN"
+
 # ═══════════════════════════════════════════════════════════════
 # 2. 扫描 OSS
 # ═══════════════════════════════════════════════════════════════
@@ -96,9 +128,10 @@ conn = pymysql.connect(
 
 with conn.cursor() as cursor:
     cursor.execute("""
-        SELECT doc_id, version_no, raw_key, file_ext
-        FROM document_version
-        WHERE status = 'active'
+        SELECT dv.doc_id, dv.version_no, dv.raw_key, dv.file_ext, dm.owner_dept
+        FROM document_version dv
+        LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
+        WHERE dv.status = 'active'
     """)
     db_records = cursor.fetchall()
 
@@ -116,7 +149,7 @@ ambiguous = []       # 文件名匹配到多个 OSS 路径
 
 db_raw_keys = set()
 
-for doc_id, version_no, raw_key, file_ext in db_records:
+for doc_id, version_no, raw_key, file_ext, owner_dept in db_records:
     db_raw_keys.add(raw_key)
     
     if raw_key in oss_files:
@@ -126,10 +159,17 @@ for doc_id, version_no, raw_key, file_ext in db_records:
     # raw_key 不存在，尝试按文件名匹配
     basename = os.path.basename(raw_key) if raw_key else ""
     candidates = oss_by_name.get(basename, [])
+    #F-oss-raw-key 仅接受与该 doc owner_dept 同部门的候选：候选 key 经 resolve_dept
+    # 推断的部门须与 owner_dept 一致，才允许改写；否则会把 raw_key 指向他部门同名
+    # 文件 → 抽取/索引到错配内容且越权可见。跨部门/不唯一/owner_dept 缺失一律降级
+    # 人工（ambiguous），绝不静默改写。
+    want_dept = (owner_dept or "").strip().lower()
+    dept_ok = [c for c in candidates if resolve_dept(c).strip().lower() == want_dept]
     
-    if len(candidates) == 1:
-        needs_update.append((doc_id, version_no, raw_key, candidates[0]))
-    elif len(candidates) > 1:
+    if want_dept and len(dept_ok) == 1:
+        needs_update.append((doc_id, version_no, raw_key, dept_ok[0]))
+    elif candidates:
+        # 有同名候选但部门不唯一/不匹配（含 owner_dept 缺失）→ 歧义，交人工
         ambiguous.append((doc_id, version_no, raw_key, candidates))
     else:
         not_found.append((doc_id, version_no, raw_key, file_ext))

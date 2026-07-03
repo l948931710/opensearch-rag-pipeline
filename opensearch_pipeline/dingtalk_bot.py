@@ -24,6 +24,7 @@ import threading
 import uuid
 import time
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 import requests as http_requests
 from fastapi import APIRouter, Request, HTTPException
@@ -93,12 +94,37 @@ def _get_app_secret() -> str:
     return os.environ.get("DINGTALK_APP_SECRET", "")
 
 
-# 签名验证的时间窗口（秒）
-_TIMESTAMP_TOLERANCE = 3600
+# 签名验证的时间窗口（秒）。钉钉签名只绑 timestamp、不绑 body（见 _verify_signature），
+# 捕获一对窗口内有效的 (timestamp,sign) 即可在窗口内伪造任意新 body，故收紧到数分钟以缩小
+# 重放窗口（原 1h 过宽）。line 119 的 msgId 去重 TTL 亦绑定它——300s 足够覆盖钉钉自身重试。#F-dingtalk-ssrf
+_TIMESTAMP_TOLERANCE = 300
+
+
+# sessionWebhook 回投目标白名单（#F-dingtalk-ssrf）：body 不进签名，攻击者可凭捕获的合法
+# (timestamp,sign) 伪造 body、把 sessionWebhook 换成自有/内网 URL，令后台把答案 POST 出去
+# （SSRF + 跨部门数据外泄）。回投前强制校验其 host 为钉钉官方域名，拒绝其它主机 / 内网 / IP。
+_DINGTALK_WEBHOOK_HOST_SUFFIX = ".dingtalk.com"
+
+
+def _is_dingtalk_webhook(url: str) -> bool:
+    """sessionWebhook 是否指向钉钉官方域名（https 且 host 为 dingtalk.com 或其子域）。
+
+    仅放行 https + host 精确等于 dingtalk.com 或以 .dingtalk.com 结尾（oapi/api.dingtalk.com 等）；
+    IP / 内网主机 / 其它域名一律拒绝。空串或解析失败 → False（按【缺失 sessionWebhook】处理）。"""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    return host == "dingtalk.com" or host.endswith(_DINGTALK_WEBHOOK_HOST_SUFFIX)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 事件级防重放（P2-09）：签名只锁 timestamp 且窗口 1h——窗口内被日志/代理/网络设备
+# 事件级防重放（P2-09）：签名只锁 timestamp（窗口数分钟，见 _TIMESTAMP_TOLERANCE）——窗口内被日志/代理/网络设备
 # 捕获的合法请求可重复投递，触发重复 LLM 调用与重复回复。以 msgId 做幂等去重：
 # 同一 msgId 在窗口内二次到达直接忽略。进程内 TTL 表（与 session/限流一致，--workers 1
 # 下即全局权威；多副本需迁 Redis）。
@@ -826,6 +852,12 @@ def _process_webhook_body(body: dict):
     # 3. 提取问题文本
     question = _extract_question(body)
     session_webhook = body.get("sessionWebhook", "")
+    # 回投前强制校验 sessionWebhook 指向钉钉官方域名：签名不绑 body，攻击者可凭捕获的合法
+    # (timestamp,sign) 伪造 body、把 sessionWebhook 换成自有/内网 URL 骗取答案回投（SSRF/数据外泄）。
+    # 非钉钉域名一律按【缺失】处理 → 下游各分支不回投、最终缺 sessionWebhook 分支返回 400。#F-dingtalk-ssrf
+    if session_webhook and not _is_dingtalk_webhook(session_webhook):
+        logger.error("sessionWebhook 非钉钉官方域名，拒绝回投（疑似伪造/SSRF）: %s", session_webhook)
+        session_webhook = ""
     sender_nick = body.get("senderNick", "用户")
     sender_staff_id = body.get("senderStaffId", "") or body.get("senderId", "")
     conversation_id = body.get("conversationId", "")
@@ -961,7 +993,7 @@ def _card_callback_authorized(message_id: str, user_id: str,
         logger.warning("卡片回调引用了不存在的 message_id（疑似伪造），拒绝写入: %s", message_id)
         return False
     owner = (row.get("user_id") if isinstance(row, dict) else row[0]) or ""
-    if owner and user_id and owner != user_id:
+    if owner and owner != user_id:
         logger.warning("卡片回调 userId 与消息归属不符（疑似跨用户伪造），拒绝写入: "
                        "message_id=%s owner=%s caller=%s", message_id, owner, user_id)
         return False
