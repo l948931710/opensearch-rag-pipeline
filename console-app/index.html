@@ -3,6 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <!-- #F-console-urltoken 保守加固：same-origin referrer——页面 URL 若带 ?token=，禁止其经 Referer 漏给
+         跨域子资源（fonts.googleapis / g.alicdn 钉钉 SDK 在 JS 抹除前就已发起）。同源请求不受影响。 -->
+    <meta name="referrer" content="same-origin" />
     <title>富岭知识库</title>
     <!-- 防暗色闪白：渲染前依 localStorage/系统偏好定 data-theme -->
     <script>

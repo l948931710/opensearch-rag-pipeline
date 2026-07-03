@@ -125,6 +125,11 @@ def assert_staging_eval_mode(*, index_name: str = None) -> None:
     if not cfg.rds.database.endswith("_stg"):
         raise EvalModeError(
             f"[EVAL GUARD STAGING] RDS database={cfg.rds.database} 不带 _stg 后缀.")
+    # #F-staging-opdb 运营库(qa_session_log/user_feedback/escalation_ticket)与主库同源守卫,
+    # 未切 _stg 则 staging 评测的 serving 副作用会污染生产运营库——与主库同等 fail-loud。
+    if not cfg.rds.operation_database.endswith("_stg"):
+        raise EvalModeError(
+            f"[EVAL GUARD STAGING] RDS operation_database={cfg.rds.operation_database} 不带 _stg 后缀.")
     if not cfg.oss.bucket_name.endswith("-staging"):
         raise EvalModeError(
             f"[EVAL GUARD STAGING] OSS bucket={cfg.oss.bucket_name} 不带 -staging 后缀.")
@@ -188,7 +193,11 @@ def assert_destructive_write_allowed(op: str, target: str, *, kind: str,
     if cfg.environment == "staging":
         # STAGING 层共享生产实例但写 _stg 后缀资源——这是合法形态
         # （后缀约束已在 config 加载期被 RAG_ENV=staging 强校验）
-        if kind == "rds" and cfg.rds.database.endswith("_stg"):
+        # #F-staging-opdb 主库与运营库共享同一生产 host，target 无法按 schema 区分——
+        # 只有两库都切 _stg 才是合法 staging 形态；operation_database 仍是生产 fuling_operation
+        # 时不 fast-return，落到下面 is_prod_target 判定 → 无当日 ack 即拒写（fail-closed）。
+        if kind == "rds" and cfg.rds.database.endswith("_stg") \
+                and cfg.rds.operation_database.endswith("_stg"):
             return
         # HA3 staging 表接受 _stg 或 _s 后缀（_stg 建表失败后改用 _s,
         # 与 config._STAGING_HA3_SUFFIXES 单一来源对齐）

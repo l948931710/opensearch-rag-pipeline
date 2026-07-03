@@ -20,10 +20,10 @@ PROD_HA3 = "ha-cn-kgl4slr1n01.public.ha.aliyuncs.com"
 
 
 def _cfg(environment="development", readonly=False, rds_db="fuling_knowledge",
-         ha3_table="", oss_bucket="fuling-knowledge-base"):
+         op_db="fuling_operation_stg", ha3_table="", oss_bucket="fuling-knowledge-base"):
     return SimpleNamespace(
         environment=environment, readonly=readonly,
-        rds=SimpleNamespace(host="x", database=rds_db),
+        rds=SimpleNamespace(host="x", database=rds_db, operation_database=op_db),
         alibaba_vector=SimpleNamespace(table_name=ha3_table),
         oss=SimpleNamespace(bucket_name=oss_bucket),
     )
@@ -123,6 +123,24 @@ def test_staging_stg_resources_allowed(patch_cfg):
     assert_destructive_write_allowed("write_chunk_meta",
                                      "rm-bp15j7wekd5738f093o.mysql.rds.aliyuncs.com", kind="rds")
     assert_destructive_write_allowed("push_index", PROD_HA3, kind="search")
+
+
+def test_staging_non_stg_operation_db_blocked(patch_cfg, monkeypatch):
+    """#F-staging-opdb：staging 主库 _stg 但运营库仍是生产 fuling_operation → rds 写不再 fast-return，
+    命中生产 host 指纹、无当日 ack → 拒写（防运营写落进生产运营库）。"""
+    patch_cfg(_cfg(environment="staging", rds_db="fuling_knowledge_stg",
+                   op_db="fuling_operation"))
+    monkeypatch.delenv("RAG_DESTRUCTIVE_PROD_ACK", raising=False)
+    with pytest.raises(DestructiveOpBlocked):
+        assert_destructive_write_allowed(
+            "write_qa_log", "rm-bp15j7wekd5738f093o.mysql.rds.aliyuncs.com", kind="rds")
+
+
+def test_production_operation_db_unaffected(patch_cfg):
+    """production 运营库本应是无 _stg 的 fuling_operation，不得被新守卫误拦（line 186 早返回）。"""
+    patch_cfg(_cfg(environment="production", op_db="fuling_operation"))
+    assert_destructive_write_allowed(
+        "write_qa_log", "rm-bp15j7wekd5738f093o.mysql.rds.aliyuncs.com", kind="rds")
 
 
 def test_staging_non_stg_table_still_blocked(patch_cfg, monkeypatch):

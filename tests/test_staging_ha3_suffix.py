@@ -124,6 +124,28 @@ def test_r3_rejects_production_table_for_staging_label(monkeypatch):
         _validate_environment_target_consistency(cfg)
 
 
+# ─── R3 运营库守卫 (#F-staging-opdb)：覆盖 RAG_ENV 未设、env 直接注入的部署 ────
+
+def test_r3_operation_database_requires_stg_without_ragenv(monkeypatch):
+    """RAG_ENVIRONMENT=staging 但 RAG_ENV 未设（overlay 不跑）：运营库未切 _stg 时 R3 必须兜住。"""
+    monkeypatch.delenv("RAG_ENV", raising=False)
+    monkeypatch.delenv("RAG_ALLOW_REMOTE_DB", raising=False)
+    cfg = _build_cfg(ha3_table="fuling_kb_chunks_s", environment="staging")
+    cfg.rds = replace(cfg.rds, operation_database="fuling_operation")  # 漏设，仍指生产运营库
+    with pytest.raises(EnvironmentMismatchError, match=r"RDS_OPERATION_DATABASE"):
+        _validate_environment_target_consistency(cfg)
+
+
+def test_r3_operation_database_prodro_ack_passes(monkeypatch):
+    """PROD-RO：显式 RAG_ALLOW_REMOTE_DB=read_only_ack 时运营库生产名放行（不破坏只读会话）。"""
+    monkeypatch.delenv("RAG_ENV", raising=False)
+    monkeypatch.setenv("RAG_ALLOW_REMOTE_DB", "read_only_ack")
+    monkeypatch.setenv("RAG_ALLOW_REMOTE_SEARCH", "read_only_ack")
+    cfg = _build_cfg(ha3_table="fuling_kb_chunks_s", environment="staging")
+    cfg.rds = replace(cfg.rds, operation_database="fuling_operation")
+    _validate_environment_target_consistency(cfg)  # 不应 raise
+
+
 # ─── RDS 库名守卫仍只接受 _stg (确认没被误放宽) ─────────────────────
 
 def test_rds_database_still_requires_stg_suffix(monkeypatch):

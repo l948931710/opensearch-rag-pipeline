@@ -82,6 +82,10 @@ export function captureUrlCredential(): void {
   if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name') }
   if (docId) _pendingVersion = { docId, owner: qs('owner'), title: qs('title') }   // 小程序升版深链
   if (urlToken || docId) scrubUrl(['token', 'name', 'doc_id', 'owner', 'title'])   // 先抹除，再发任何请求
+  // #F-console-urltoken 保守加固：?token= 摄取【不可删】——钉钉容器外的桌面浏览器（index.html 无条件载入
+  //   dingtalk SDK，但 requestAuthCode 仅真容器内 dd.ready 触发、桌面必超时失败）此路是【唯一】可登录路径
+  //   （见 kb-upload.onWvError「请在电脑端浏览器打开」）。删摄取即破坏桌面登录。仅告警以便排查残留生产者。
+  if (urlToken) console.warn('[sec] #F-console-urltoken URL 透传 token 已即时抹除；若非预期请排查链接生产者')
   diag(`capture: token=${urlToken ? 'set' : '-'} pendingVer=${docId || '-'}`)
 }
 

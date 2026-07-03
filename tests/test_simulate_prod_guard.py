@@ -302,9 +302,11 @@ def test_pool_verdict_agrees_with_guard_verdict(monkeypatch):
     ]
 
     for readonly, env, db, host, ack, expect_blocked in cases:
+        # #F-staging-opdb 运营库随主库 _stg 派生：合法 staging 两库同切 _stg
+        op_db = "fuling_operation_stg" if db.endswith("_stg") else "fuling_operation"
         cfg = SimpleNamespace(
             environment=env, readonly=readonly,
-            rds=SimpleNamespace(host=host, database=db),
+            rds=SimpleNamespace(host=host, database=db, operation_database=op_db),
             alibaba_vector=SimpleNamespace(table_name=""),
             oss=SimpleNamespace(bucket_name="fuling-knowledge-base"),
         )

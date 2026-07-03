@@ -66,12 +66,25 @@ class TestStagingTestLabelGuards:
         assert cfg.environment == "staging"
 
     def test_staging_stg_suffixed_resources_pass_without_ack(self):
-        """STAGING 形态：生产实例 + _stg 库/表 = 合法，不需要 ack。"""
+        """STAGING 形态：生产实例 + _stg 库/表（含运营库）= 合法，不需要 ack。"""
         cfg = _fresh_load(RAG_ENVIRONMENT="staging", RAG_SIMULATE="false",
                           RAG_RDS_HOST=PROD_RDS, RAG_RDS_DATABASE="fuling_knowledge_stg",
+                          RAG_RDS_OPERATION_DATABASE="fuling_operation_stg",
                           RAG_HA3_ENDPOINT=PROD_HA3, RAG_HA3_TABLE_NAME="fuling_kb_chunks_stg",
                           RAG_DASHSCOPE_API_KEY="x")
         assert cfg.rds.database.endswith("_stg")
+
+    def test_staging_prod_operation_db_needs_ack(self):
+        """#F-staging-opdb：staging + _stg 主库/表，但运营库仍是生产 fuling_operation → 需 ack。"""
+        kw = dict(RAG_ENVIRONMENT="staging", RAG_SIMULATE="false",
+                  RAG_RDS_HOST=PROD_RDS, RAG_RDS_DATABASE="fuling_knowledge_stg",
+                  RAG_RDS_OPERATION_DATABASE="fuling_operation",
+                  RAG_HA3_ENDPOINT=PROD_HA3, RAG_HA3_TABLE_NAME="fuling_kb_chunks_stg",
+                  RAG_DASHSCOPE_API_KEY="x")
+        with pytest.raises(EnvironmentMismatchError, match=r"RDS_OPERATION_DATABASE"):
+            _fresh_load(**kw)
+        cfg = _fresh_load(**kw, RAG_ALLOW_REMOTE_DB="read_only_ack")
+        assert cfg.rds.operation_database == "fuling_operation"
 
 
 class TestProductionLabelGuards:

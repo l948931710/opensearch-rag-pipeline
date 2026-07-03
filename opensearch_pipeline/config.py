@@ -563,6 +563,17 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
                 raise EnvironmentMismatchError(
                     f"[ENV GUARD] environment={env} 指向生产 RDS（database={config.rds.database}，"
                     f"非 _stg 库）。PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
+        # #F-staging-opdb 运营库同样须校 _stg：主库切了 _stg 但 operation_database 仍是生产
+        # fuling_operation 时，上面的主库校验会放行——而运营库共享同一生产 host、无法按 schema
+        # 区分，staging 的 QA/反馈/转人工会写进生产运营库。运营库未切 _stg 亦按 PROD-RO 处理，
+        # 需与主库同源的 RAG_ALLOW_REMOTE_DB 显式声明（覆盖 RAG_ENV 未设、env 直接注入的部署）。
+        if not config.simulate_db and is_prod_target("rds", config.rds.host) \
+                and not config.rds.operation_database.endswith("_stg"):
+            if not _require_ack("RAG_ALLOW_REMOTE_DB"):
+                raise EnvironmentMismatchError(
+                    f"[ENV GUARD] environment={env} 指向生产 RDS 运营库"
+                    f"（RDS_OPERATION_DATABASE={config.rds.operation_database}，非 _stg 库）。"
+                    f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
         if not config.simulate_opensearch and is_prod_target("search", search_targets) \
                 and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             if not _require_ack("RAG_ALLOW_REMOTE_SEARCH"):

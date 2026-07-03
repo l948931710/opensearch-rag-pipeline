@@ -114,7 +114,11 @@ def _pool_readonly_declared(full_cfg) -> bool:
     env = (full_cfg.environment or "development").lower()
     if env == "production":
         return False
-    if env == "staging" and full_cfg.rds.database.endswith("_stg"):
+    # #F-staging-opdb 与 assert_destructive_write_allowed 同步：staging 只有主库与运营库
+    # 都切 _stg 才判可写；运营库仍是生产 fuling_operation 时不 fast-return，落到下面按
+    # 生产 RDS 默认只读（三层同进同出，不与写守卫打架）。
+    if env == "staging" and full_cfg.rds.database.endswith("_stg") \
+            and full_cfg.rds.operation_database.endswith("_stg"):
         return False
     from opensearch_pipeline.config import is_prod_target
     if not is_prod_target("rds", full_cfg.rds.host):

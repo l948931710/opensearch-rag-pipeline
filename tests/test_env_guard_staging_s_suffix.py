@@ -29,6 +29,7 @@ def _fake_cfg(*, environment="staging", readonly=False,
     cfg.environment = environment
     cfg.readonly = readonly
     cfg.rds.database = rds_db
+    cfg.rds.operation_database = "fuling_operation_stg"
     cfg.alibaba_vector.table_name = ha3_table
     cfg.oss.bucket_name = oss_bucket
     return cfg
