@@ -42,70 +42,81 @@ def _resolve(ids, get=_GET, anchors=_ANCHORS, **kw):
 
 
 def test_inherits_from_nearest_ancestor():
-    assert _resolve([12]) == (["production"], False)     # 叶 → 事业部 → 中心锚
-    assert _resolve([11]) == (["production"], False)
+    assert _resolve([12]) == (["production"], False, False)     # 叶 → 事业部 → 中心锚
+    assert _resolve([11]) == (["production"], False, False)
 
 
 def test_exception_anchor_nearer_wins_over_umbrella():
     # 资材部反例零特判：更近的锚天然赢过上层 production
-    assert _resolve([21]) == (["supply", "pmc"], False)
-    assert _resolve([20]) == (["supply", "pmc"], False)
+    assert _resolve([21]) == (["supply", "pmc"], False, False)
+    assert _resolve([20]) == (["supply", "pmc"], False, False)
 
 
 def test_explicit_empty_anchor_blocks_inheritance():
-    # 显式 [] = 「有意仅 public」：截断继承，非 partial（这是决定，不是失败）
-    assert _resolve([30]) == ([], False)
-    assert _resolve([31]) == ([], False)
+    # 显式 [] = 「有意仅 public」：截断继承，非 partial 且 decided（这是决定，不是失败/缺口）
+    assert _resolve([30]) == ([], False, False)
+    assert _resolve([31]) == ([], False, False)
 
 
 def test_unanchored_to_top_is_failclosed_nonpartial():
-    assert _resolve([40]) == ([], False)                 # 真·未决定：空且非 partial
+    assert _resolve([40]) == ([], False, True)           # 真·未决定：空、非 partial、undecided
+
+
+def test_undecided_distinguishes_deny_from_gap():
+    # 接线层靠第三元区分两种「空结果」：显式 [] 锚 = 权威 deny（不落名字口径）；
+    # 到顶无锚 = 覆盖缺口（落名字口径兜底）。混合时缺口优先（保守：兜底不吃授权）。
+    assert _resolve([31]) == ([], False, False)          # 权威 deny
+    assert _resolve([40]) == ([], False, True)           # 缺口
+    assert _resolve([31, 40]) == ([], False, True)       # 混合 → 按缺口兜底
 
 
 def test_multi_dept_union_dedup_keeps_encounter_order():
-    codes, partial = _resolve([12, 21, 31])
-    assert codes == ["production", "supply", "pmc"] and partial is False
+    codes, partial, undecided = _resolve([12, 21, 31])
+    assert codes == ["production", "supply", "pmc"] and partial is False and undecided is False
 
 
 def test_whitelist_filters_bogus_anchor_codes():
-    assert _resolve([60]) == (["production"], False)     # typo_dept 被白名单丢弃
+    # typo_dept 被白名单丢弃；支路仍终结于锚 → decided
+    assert _resolve([60]) == (["production"], False, False)
 
 
 def test_all_groups_sentinel_expands_to_whitelist():
     # "*" 哨兵（总经办类全可见）→ 展开为全量白名单；哨兵本身绝不出现在结果里
     from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
-    codes, partial = resolve_dept_ids([80], parent_getter_from_index({80: 1}), anchors={80: ["*"]})
-    assert sorted(codes) == sorted(_VALID_ACL_GROUPS) and "*" not in codes and partial is False
+    codes, partial, undecided = resolve_dept_ids(
+        [80], parent_getter_from_index({80: 1}), anchors={80: ["*"]})
+    assert sorted(codes) == sorted(_VALID_ACL_GROUPS) and "*" not in codes
+    assert partial is False and undecided is False
 
 
 def test_lookup_failure_marks_partial_and_failscloses_branch():
     # 索引外 id → get 返回 None（等价钉钉 department/get 失败）
-    codes, partial = _resolve([999])
+    codes, partial, _ = _resolve([999])
     assert codes == [] and partial is True
     # 混合：失败支不影响成功支的组，但整体 partial（调用方落回名字口径）
-    codes, partial = _resolve([12, 999])
+    codes, partial, _ = _resolve([12, 999])
     assert codes == ["production"] and partial is True
 
 
 def test_cycle_and_depth_cap_mark_partial():
     get_cyc = parent_getter_from_index({50: 51, 51: 50})
-    assert _resolve([50], get=get_cyc) == ([], True)     # 环 = 数据异常 → partial
-    deep = {i: i + 1 for i in range(100, 200)}           # 100 跳长链，无锚
-    assert _resolve([100], get=parent_getter_from_index(deep), max_hops=15) == ([], True)
+    assert _resolve([50], get=get_cyc) == ([], True, False)     # 环 = 数据异常 → partial
+    deep = {i: i + 1 for i in range(100, 200)}                  # 100 跳长链，无锚
+    assert _resolve([100], get=parent_getter_from_index(deep), max_hops=15) == ([], True, False)
 
 
 def test_root_level_anchor_reachable():
     # 锚在顶层节点（parent=1）也要能命中，不被"到顶即停"提前吃掉
     get = parent_getter_from_index({70: 1, 71: 70})
-    assert resolve_dept_ids([71], get, anchors={70: ["hr"]}) == (["hr"], False)
+    assert resolve_dept_ids([71], get, anchors={70: ["hr"]}) == (["hr"], False, False)
 
 
 def test_invalid_dept_id_marks_partial():
-    assert _resolve(["not-an-id"]) == ([], True)
+    assert _resolve(["not-an-id"]) == ([], True, False)
 
 
 def test_empty_input_ok():
-    assert _resolve([]) == ([], False)
+    assert _resolve([]) == ([], False, True)             # 无部门信息 → 按未决定兜底名字口径
 
 
 # ══ 第二部分：全树对照（现行名字口径 vs 祖先制） ══════════════════
@@ -149,7 +160,7 @@ def test_parity_mapped_depts_resolve_identically(snapshot):
         cur = set(_normalize_dept_to_codes(r["name"]))
         if not cur:
             continue
-        anc, partial = resolve_dept_ids([r["dept_id"]], get)
+        anc, partial, _ = resolve_dept_ids([r["dept_id"]], get)
         assert partial is False, r["path"]
         assert set(anc) == cur, f"{r['path']}: 现行 {sorted(cur)} vs 祖先制 {sorted(anc)}"
         checked += 1
@@ -163,7 +174,7 @@ def test_parity_gap_depts_fixed_exactly_as_designed(snapshot):
     for r in rows:
         if _normalize_dept_to_codes(r["name"]):
             continue
-        anc, partial = resolve_dept_ids([r["dept_id"]], get)
+        anc, partial, _ = resolve_dept_ids([r["dept_id"]], get)
         assert partial is False, r["path"]
         if anc:
             fixed[r["path"]] = set(anc)
@@ -288,6 +299,34 @@ def test_flag_on_ancestry_overrides_partial_names(monkeypatch):
     codes, cacheable = di._resolve_user_dept_live("u3")
     assert codes == ["production"] and cacheable is True
     assert _insert_params(conn)[2] == "production"
+
+
+def test_flag_on_explicit_deny_beats_name_table_collision(monkeypatch):
+    """显式 [] 锚必须压得过名字表撞名：部门名叫「品质部」但挂在「其他」(68112184) 显式仅-public
+    子树下 → 权威 deny（此前 `if _anc:` 把权威空当 falsy 落回名字口径 → 错误授 quality）。
+    缓存存 deny 哨兵（非空可缓存、读回白名单丢弃=[]），不存原名防读回再撞表。"""
+    monkeypatch.setenv("RAG_ACL_ANCESTRY", "1")
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn,
+          {"user_name": "钱七", "dept_name": "品质部", "is_partial": False, "dept_ids": [888]},
+          {888: 68112184})                                  # 父=「其他」显式 [] 锚
+    codes, cacheable = di._resolve_user_dept_live("u4")
+    assert codes == [] and cacheable is True
+    cached = _insert_params(conn)[2]
+    assert cached == di._ACL_PUBLIC_ONLY_SENTINEL
+    assert di._normalize_dept_to_codes(cached) == []        # 读回 round-trip 仍 deny
+
+
+def test_flag_on_undecided_gap_falls_back_to_names(monkeypatch):
+    """真·未决定（父链到顶无锚 = 锚表覆盖缺口）保持名字口径兜底——缺口绝不吃掉名字表授权。"""
+    monkeypatch.setenv("RAG_ACL_ANCESTRY", "1")
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn,
+          {"user_name": "孙八", "dept_name": "财务部", "is_partial": False, "dept_ids": [999]},
+          {999: 1})                                         # 到顶（根）无锚 → undecided
+    codes, cacheable = di._resolve_user_dept_live("u5")
+    assert codes == ["finance"] and cacheable is True
+    assert _insert_params(conn)[2] == "财务部"               # 现行为保留：缓存原名
 
 
 def test_flag_on_sentinel_compresses_cache_to_star(monkeypatch):

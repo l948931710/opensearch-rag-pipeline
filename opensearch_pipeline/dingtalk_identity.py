@@ -52,6 +52,13 @@ def _acl_ancestry_enabled() -> bool:
     return os.environ.get("RAG_ACL_ANCESTRY", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+# 祖先制「权威仅 public」的缓存哨兵：显式 [] 锚（如「其他」）解析出的 deny 结果既不能存
+# 空串（cache-read 把空 dept_code 当 miss → 每条消息重走 API），也不能保留原始部门名
+# （读回 _normalize_dept_to_codes 撞名字表会把显式 deny 悄悄变回授权）。存本哨兵：非空
+# 可缓存、读回被白名单丢弃 = []（fail-closed 方向，round-trip 语义精确）。
+_ACL_PUBLIC_ONLY_SENTINEL = "__public_only__"
+
+
 # ═══════════════════════════════════════════════════════════════
 # 钉钉部门名 → ACL 权限组 映射
 # ───────────────────────────────────────────────────────────────
@@ -365,19 +372,26 @@ def _resolve_user_dept_live(staff_id: str) -> "tuple[List[str], bool]":
                 # —— 最近祖先制（RAG_ACL_ANCESTRY，默认关）——非 partial 即权威：
                 # 组码 CSV 顶替 dept_name 走下方同一缓存/返回路径（_normalize_dept_to_codes
                 # 对组码幂等读回；且不受名字口径 is_partial 影响——id 父链是独立的完整解析）。
-                # 解析为 []（各支到顶未命中锚）与 partial(None) 均落回名字口径：前者在现行
-                # 名字表下同为 []（tests/test_dept_ancestry.py 对照锁定），后者绝不缓存半截。
-                _anc = _resolve_groups_via_ancestry(user_info.get("dept_ids") or []) \
+                # 三态落点：非空=授组；空+全支锚定(decided)=权威「有意仅 public」→ 存 deny
+                # 哨兵、绝不落回名字口径（显式 [] 锚要能压过名字表撞名，否则 deny 腿失效）；
+                # 空+存在未决定支=锚表覆盖缺口 → 名字口径兜底（现行为，tests 对照锁定）；
+                # partial(None)=整体落回名字口径且绝不缓存半截。
+                _anc_res = _resolve_groups_via_ancestry(user_info.get("dept_ids") or []) \
                     if _acl_ancestry_enabled() else None
-                if _anc:
-                    # 全组结果压缩回 "*" 哨兵再落 dept_name/缓存：15 组码 CSV=104 字符会溢出
-                    # user_role.dept_code VARCHAR(64)（strict 模式每次写失败被吞→永不缓存、每个
-                    # TTL 重走全链；非 strict 静默截断→读回被白名单丢尾，总经办静默少 6/15 组）。
-                    # 读侧 _normalize_dept_to_codes 本就把 "*" 展开为全量白名单（与 seeded 行同一
-                    # round-trip），语义无损且加新组自动跟上。
-                    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
-                    _csv = "*" if set(_anc) == set(_VALID_ACL_GROUPS) else ",".join(_anc)
-                    user_info = dict(user_info, dept_name=_csv, is_partial=False)
+                if _anc_res is not None:
+                    _anc, _anc_undecided = _anc_res
+                    if _anc:
+                        # 全组结果压缩回 "*" 哨兵再落 dept_name/缓存：15 组码 CSV=104 字符会溢出
+                        # user_role.dept_code VARCHAR(64)（strict 模式每次写失败被吞→永不缓存、每个
+                        # TTL 重走全链；非 strict 静默截断→读回被白名单丢尾，总经办静默少 6/15 组）。
+                        # 读侧 _normalize_dept_to_codes 本就把 "*" 展开为全量白名单（与 seeded 行同一
+                        # round-trip），语义无损且加新组自动跟上。
+                        from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+                        _csv = "*" if set(_anc) == set(_VALID_ACL_GROUPS) else ",".join(_anc)
+                        user_info = dict(user_info, dept_name=_csv, is_partial=False)
+                    elif not _anc_undecided:
+                        user_info = dict(user_info, dept_name=_ACL_PUBLIC_ONLY_SENTINEL,
+                                         is_partial=False)
                 if user_info.get("is_partial"):
                     # F-22：解析不完整（某 dept 瞬时失败）→ 绝不落缓存，避免残缺 CSV 永久少授权。
                     # 穿透场景退回旧缓存（更全）；纯 cache-miss 返回本次 best-effort 组（仅 public 之上、
@@ -627,11 +641,13 @@ def _fetch_dept_parent(token: str, dept_id: int) -> Optional[int]:
     return None
 
 
-def _resolve_groups_via_ancestry(dept_ids) -> Optional[List[str]]:
+def _resolve_groups_via_ancestry(dept_ids) -> "Optional[tuple]":
     """最近祖先制解析（RAG_ACL_ANCESTRY 开时由 _resolve_user_dept_live 调用）。
 
-    返回组码列表 = 权威结果（含 []=各支到顶未命中锚/显式仅-public）；返回 None =
-    partial（父链任一跳失败/环/异常 id）或无 token —— 调用方【整体落回名字口径】。
+    返回 (组码列表, undecided) = 权威结果：非空=授组；空+undecided=False=全部支路终结于锚
+    （含显式 [] 锚）= 权威「有意仅 public」；空+undecided=True=存在到顶无锚支（锚表覆盖
+    缺口）→ 调用方落回名字口径兜底。返回 None = partial（父链任一跳失败/环/异常 id）
+    或无 token —— 调用方【整体落回名字口径】。
     每跳独立 department/get（仅 cache-miss/穿透路径才走，树深 ≤5，可接受）。
     """
     from opensearch_pipeline.dept_ancestry import resolve_dept_ids
@@ -640,8 +656,9 @@ def _resolve_groups_via_ancestry(dept_ids) -> Optional[List[str]]:
     token = _get_access_token()
     if not token:
         return None
-    codes, partial = resolve_dept_ids(dept_ids or [], lambda did: _fetch_dept_parent(token, did))
-    return None if partial else codes
+    codes, partial, undecided = resolve_dept_ids(
+        dept_ids or [], lambda did: _fetch_dept_parent(token, did))
+    return None if partial else (codes, undecided)
 
 
 # ═══════════════════════════════════════════════════════════════

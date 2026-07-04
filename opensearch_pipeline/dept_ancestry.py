@@ -10,7 +10,8 @@
   - 例外零特判（资材部挂生产中心下但属 [supply,pmc]——它自己就是更近的锚，天然赢）；
   - **三态语义**：锚值为非空列表=授组；锚值为空列表 []=「有意仅 public」（显式决定，
     并【截断】继承——不再上溯）；无锚祖先=真·未决定（fail-closed 仅 public，可被
-    scan_dept_mapping_gaps.py 检出为"漏"）。
+    scan_dept_mapping_gaps.py 检出为"漏"）。后两态由返回值第三元 undecided 区分
+    （decided-空=权威 deny，接线层不得再落回名字口径；undecided-空=名字口径兜底）。
 
 锚点表来源：2026-07-03 全树扫描（scratch/dept_mapping_scan_20260703）+ 权限单口径。
 14 个锚覆盖现行 104 个名字条目的全部语义（对照测试见 tests/test_dept_ancestry.py）。
@@ -84,16 +85,21 @@ def resolve_dept_ids(
     *,
     anchors: Optional[Dict[int, List[str]]] = None,
     max_hops: int = _MAX_HOPS_DEFAULT,
-) -> Tuple[List[str], bool]:
-    """把用户的 dept_id 列表解析为 ACL 组列表（最近祖先制）。返回 (组列表, partial)。
+) -> Tuple[List[str], bool, bool]:
+    """把用户的 dept_id 列表解析为 ACL 组列表（最近祖先制）。返回 (组列表, partial, undecided)。
 
     每个 dept_id：自身即锚 → 取锚值（[] = 有意仅 public，该支到此为止）；否则沿
     get_parent_id 上溯，命中最近锚为止；到顶未命中 → 该支空（fail-closed）。
     partial=True 的情形（调用方据此【落回现行名字口径】，绝不缓存半截结果）：
       - 任一跳 get_parent_id 返回 None（查询失败）；
       - 上溯出现环（数据异常）或超 max_hops。
+    undecided=True：≥1 支上溯到顶（parent∈{0,根}）都没碰到任何锚 = 存在真·未决定支。
+    调用方据此区分两种「空结果」：空 + undecided=False = 全部支路终结于锚（显式 [] 或
+    锚值被白名单滤空）= 权威「有意仅 public」，不得落回名字口径（显式 deny 要能压过
+    名字表撞名）；空 + undecided=True = 锚表覆盖缺口 → 名字口径兜底。partial 支不计入
+    undecided（partial 本身已强制整体回退）。
     输出与 _normalize_dept_to_codes 同口径：过 retriever._VALID_ACL_GROUPS 白名单、
-    按首次出现顺序去重。空输入 → ([], False)（合法"无部门"）。
+    按首次出现顺序去重。空输入 → ([], False, True)（无部门信息=按未决定兜底）。
     """
     table = ANCHOR_GROUPS_BY_DEPT_ID if anchors is None else anchors
     from opensearch_pipeline.retriever import _VALID_ACL_GROUPS  # 惰性：白名单单一来源
@@ -101,7 +107,10 @@ def resolve_dept_ids(
     out: List[str] = []
     seen = set()
     partial = False
+    undecided = False
+    branches = 0
     for raw in dept_ids or []:
+        branches += 1
         try:
             dept_id = int(raw)
         except (TypeError, ValueError):
@@ -140,9 +149,12 @@ def resolve_dept_ids(
                 cur = parent                      # 顶层/根锚也要进 loop 顶命中，不提前 break
                 continue
             if parent in (0, ROOT_DEPT_ID):
-                break                             # 到顶未命中锚：真·未决定，该支空
+                undecided = True                  # 到顶未命中锚：真·未决定，该支空
+                break
             cur = parent
-    return out, partial
+    if branches == 0:
+        undecided = True                          # 空输入：无部门信息，按未决定兜底
+    return out, partial, undecided
 
 
 # ── 测试/离线辅助：用组织树快照构造 ParentGetter ─────────────────────────────
