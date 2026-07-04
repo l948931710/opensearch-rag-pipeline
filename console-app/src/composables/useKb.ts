@@ -268,7 +268,8 @@ async function bulkRetire(): Promise<void> {
 /** 批量改可见范围（复用 set-visibility；public 涉全公司需 kb_admin，调用方按角色限制选项）。 */
 async function bulkSetVisibility(level: string): Promise<void> {
   const targets = selectedDocs.value.filter((d) => d.permission_level !== level)
-  await _bulkRun(targets, '改可见范围', (d) => setVisibility(d, level, '批量调整'))
+  // reload:false——逐篇重拉会 N+1 次全量列表；_bulkRun 批末统一一次权威 loadDocs
+  await _bulkRun(targets, '改可见范围', (d) => setVisibility(d, level, '批量调整', { reload: false }))
 }
 
 function sortBy(key: SortKey) {
@@ -619,8 +620,8 @@ async function uploadSingle(file: File) {
     uploadOk.value = true
     let shareNote = ''
     if (shared && newShareDepts.value.length) {
-      // 共享失败不判上传失败：文档已在库，提示可去台账「共享」补做。
-      try { await createGrants(r.doc_id, [...newShareDepts.value]) ; shareNote = `，已共享 ${newShareDepts.value.length} 部门` }
+      // 共享失败不判上传失败：文档已在库，提示可去台账「共享」补做。文案以响应 granted/skipped 为准。
+      try { shareNote = shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value])) }
       catch { shareNote = '；共享设置失败，可稍后在台账点「共享」重试' }
     }
     uploadMsg.value = `已提交：${r.title || file.name} v${r.version_no}（${r.status_badge}${r.requires_kb_admin_approval ? '，待审批' : ''}）${shareNote}`
@@ -658,7 +659,8 @@ async function uploadBatch(files: File[]) {
       const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
       row.status = '已提交'; row.msg = `v${r.version_no}（${r.status_badge}）`
       if (shared && newShareDepts.value.length) {
-        try { await createGrants(r.doc_id, [...newShareDepts.value]); row.msg += ` · 已共享 ${newShareDepts.value.length} 部门` }
+        // refresh:false：并发 worker 逐文件刷清单会互相覆盖+烧 aux 限流，批末统一拉一次
+        try { row.msg += shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value], '', { refresh: false })).replace(/^，/, ' · ') }
         catch { row.msg += ' · 共享失败可稍后重试' }
       }
       const dm = buildDupMsg(r.content_dups, r.content_dups_other); if (dm) row.dupMsg = dm
@@ -672,6 +674,7 @@ async function uploadBatch(files: File[]) {
   uploadBusy.value = false
   uploadMsg.value = `${okN} 成功${badN ? `，${badN} 失败/跳过` : ''}`
   void loadDocs(); void loadApprovals(true)   // force：批量里可能有待审批单
+  if (shared && okN) void loadAccessGrants()  // 批末一次权威刷新（逐文件已抑制）
 }
 
 function doUpload() {
@@ -754,7 +757,10 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
 }
 
 // 已授权清单（审批人侧 · approved 存量）：后端 /api/kb/access-grants 未上线 → 静默兜底空；DEV ?preview 注入 mock。
+// grantsSeq 竞态守卫（同 docsSeq）：批量上传的并发 worker 各自触发刷新时，仅最新一次落地，防旧响应覆盖新清单。
+let grantsSeq = 0
 async function loadAccessGrants() {
+  const seq = ++grantsSeq
   const s = useSession()
   if (!s.identity?.canManage) { accessGrants.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -767,8 +773,9 @@ async function loadAccessGrants() {
   clearLoadError('accessGrants')
   try {
     const r = await apiJson<{ items: AccessGrantItem[] }>('/api/kb/access-grants', { auth: true })
+    if (seq !== grantsSeq) return          // 竞态守卫：仅最新结果落地
     accessGrants.value = r.items || []
-  } catch (e) { accessGrants.value = []; noteLoadError('accessGrants', e) }   // 404（未上线）静默；5xx 显错
+  } catch (e) { if (seq === grantsSeq) { accessGrants.value = []; noteLoadError('accessGrants', e) } }   // 404（未上线）静默；5xx 显错
 }
 
 // 撤销【已批准】的跨部门授权（approved→revoked）：后端同事务收窄 allowed_depts 投影 + 标脏，stage-3 收回放行。
@@ -806,15 +813,28 @@ function docGrantRows(docId: string): AccessGrantItem[] {
 function openShare(d: DocItem) { shareCtx.value = d }
 function closeShare() { if (!shareBusy.value) shareCtx.value = null }
 
-/** 直接放行：POST /api/kb/access-grants；成功后刷新已授权清单（弹窗/台账随之更新）。 */
-async function createGrants(docId: string, depts: string[], reason = ''): Promise<GrantCreateResp | null> {
+/** 直接放行：POST /api/kb/access-grants；成功后刷新已授权清单（弹窗/台账随之更新）。
+ * opts.refresh=false 供批量路径抑制逐次刷新（批末统一拉一次，防 N 并发 GET 互相覆盖+烧限流）。 */
+async function createGrants(docId: string, depts: string[], reason = '',
+                            opts: { refresh?: boolean } = {}): Promise<GrantCreateResp | null> {
   if (!depts.length) return null
   const r = await apiJson<GrantCreateResp>('/api/kb/access-grants', {
     method: 'POST', auth: true,
     body: JSON.stringify({ doc_id: docId, target_depts: depts, ...(reason ? { reason } : {}) }),
   })
-  void loadAccessGrants()
+  if (opts.refresh !== false) void loadAccessGrants()
   return r
+}
+
+/** 共享结果如实文案：以后端 granted/skipped 为准——skipped（归属自身/伞下冗余/已覆盖）
+ * 没有写任何授权行，不能再按请求数报「已共享 N 部门」。 */
+function shareResultNote(gr: GrantCreateResp | null): string {
+  if (!gr) return ''
+  const g = gr.granted?.length || 0, s = gr.skipped?.length || 0
+  if (g && s) return `，已共享 ${g} 部门（${s} 个已覆盖跳过）`
+  if (g) return `，已共享 ${g} 部门`
+  if (s) return `，${s} 个目标已覆盖无需新授权`
+  return ''
 }
 
 /** 弹窗提交：共享 shareCtx 文档给所选部门。返回 null=成功关闭；string=错误文案（弹窗内联显示）。 */
@@ -833,8 +853,11 @@ async function submitShare(depts: string[], reason: string): Promise<string | nu
 
 /** 重设基础可见范围（dept_internal / public / restricted）：POST /api/kb/set-visibility。
  * 成功后即时反映行的 permission_level + 权威 loadDocs 纠正徽章（restricted 会离开检索）。
+ * opts.reload=false 供批量路径抑制逐篇重拉（_bulkRun 批末已有一次权威 loadDocs——否则
+ * N 篇 = N+1 次全量列表拉取，烧 aux 限流且批中列表反复重置分页/闪动）。
  * 返回 null=成功；string=错误文案。 */
-async function setVisibility(d: DocItem, level: string, reason = ''): Promise<string | null> {
+async function setVisibility(d: DocItem, level: string, reason = '',
+                             opts: { reload?: boolean } = {}): Promise<string | null> {
   return withInflight(`vis:${d.doc_id}`, async () => {
     try {
       const s = useSession()
@@ -844,7 +867,7 @@ async function setVisibility(d: DocItem, level: string, reason = ''): Promise<st
         body: JSON.stringify({ doc_id: d.doc_id, permission_level: level, ...(reason ? { reason } : {}) }),
       })
       d.permission_level = level                     // 乐观即时反映
-      void loadDocs()                                // 权威纠正（restricted→可能掉出列表/改徽章）
+      if (opts.reload !== false) void loadDocs()     // 权威纠正（restricted→可能掉出列表/改徽章）
       return null
     } catch (e: any) {
       return e && e.status === 403 ? (e.detail || '无权修改该文档可见范围')

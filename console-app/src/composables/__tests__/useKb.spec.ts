@@ -295,6 +295,27 @@ describe('useKb 台账筛选 + 多选 + 批量', () => {
     expect(posted).toHaveLength(1)                          // b 已是 restricted → 跳过；只发 a
     expect(posted[0]).toMatchObject({ doc_id: 'a', permission_level: 'restricted' })
   })
+
+  it('bulkSetVisibility：批中不逐篇重拉列表，批末仅一次权威 loadDocs（N+1 防御）', async () => {
+    const items = [mk('a', 'production', 'dept_internal'), mk('b', 'production', 'dept_internal')]
+    const calls: string[] = []
+    const fetchMock = vi.fn(async (path: string) => {
+      calls.push(String(path))
+      if (String(path).startsWith('/api/kb/my-docs')) return jsonResp({ items, has_more: false })
+      if (String(path).startsWith('/api/kb/set-visibility')) return jsonResp({ changed: true })
+      return jsonResp({}, { ok: false, status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const kb = useKb()
+    setIdentity('kb_admin', ['production'])
+    await kb.loadDocs()
+    kb.toggleSelectAllVisible()
+    await kb.bulkSetVisibility('restricted')
+    expect(calls.filter((p) => p.startsWith('/api/kb/set-visibility')).length).toBe(2)
+    await waitFor(() => calls.filter((p) => p.startsWith('/api/kb/my-docs')).length === 2)
+    // 初始 loadDocs 1 次 + 批末权威 1 次；逐篇 setVisibility 不再各自触发（旧行为=4 次）
+    expect(calls.filter((p) => p.startsWith('/api/kb/my-docs')).length).toBe(2)
+  })
 })
 
 describe('useKb 主动共享（多部门可见度）', () => {
@@ -393,6 +414,25 @@ describe('useKb 主动共享（多部门可见度）', () => {
     const post = fetchMock.mock.calls.find(([p, i]) => String(p).startsWith('/api/kb/access-grants') && i?.method === 'POST')!
     expect(JSON.parse(post[1].body)).toMatchObject({ doc_id: 'DOC_S', target_depts: ['rd', 'quality'] })
     expect(kb.uploadMsg.value).toContain('已共享 2 部门')
+  })
+
+  it('共享目标全被后端跳过（已覆盖/伞下冗余）→ 文案如实，不谎报「已共享」', async () => {
+    const fetchMock = routeFetch({
+      uploadUrl: jsonResp({ upload_token: 'UT', put_url: 'https://oss/x', raw_key: 'r', doc_id: 'DOC_S', expires_in: 1800, requires_kb_admin_approval: false }),
+      register: jsonResp({ doc_id: 'DOC_S', version_no: 1, content_process_status: 'NOT_STARTED', requires_kb_admin_approval: false, status_badge: '排队中', idempotent: false, title: '工艺卡', content_dups: [], content_dups_other: 0 }),
+      grantCreate: jsonResp({ doc_id: 'DOC_S', granted: [], skipped: ['rd', 'quality'], ok: true }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const kb = useKb()
+    setIdentity('dept_admin', ['production'])
+    kb.newOwner.value = 'production'
+    kb.newPerm.value = 'shared'
+    kb.newShareDepts.value = ['rd', 'quality']
+    __setSelectedFiles([new File([new Uint8Array(8)], 'p.pdf')])
+    kb.doUpload()
+    await waitFor(() => kb.uploadOk.value === true)
+    expect(kb.uploadMsg.value).toContain('已覆盖')            // granted=0：以响应为准
+    expect(kb.uploadMsg.value).not.toContain('已共享')
   })
 })
 
