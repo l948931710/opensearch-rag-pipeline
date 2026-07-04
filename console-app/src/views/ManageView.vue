@@ -67,7 +67,9 @@ function askHot(q: string) { fillInput(q); void router.push('/') }
 
 onMounted(async () => {
   if (canManage.value) {
-    await loadDocs()
+    // 全并发（Perf-7）：此前 `await loadDocs()` 把后面 8 个加载都挡在 docs 一个 RTT 之后，
+    // 看板/队列白等。docs 的 promise 只留给升版深链（applyPendingVersion 要在 docs 就绪后）。
+    const docsReady = loadDocs()
     void loadStats()
     void loadConfig()
     void loadInsights()                              // 概览看板：使用成效 + 知识缺口（两角色）
@@ -77,6 +79,7 @@ onMounted(async () => {
     void loadAccessGrants()
     void loadApprovalHistory()                       // 审批历史（两角色，只读聚合）
     if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants() }   // 全库治理看板 + 成员管理（kb_admin）
+    await docsReady
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
     if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
   } else {

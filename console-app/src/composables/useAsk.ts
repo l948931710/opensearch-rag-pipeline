@@ -22,6 +22,7 @@ export interface ViewBlock {
   alt?: string
   failed?: boolean
   reloading?: boolean
+  loaded?: boolean    // 图片已完成加载（Perf-6：加载前 figure 撑占位高度，防定稿后弹入抖动）
 }
 
 export interface ChatMessage {
