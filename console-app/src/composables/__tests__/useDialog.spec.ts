@@ -37,4 +37,35 @@ describe('useDialog', () => {
     onConfirm()
     expect(await p).toBe('')
   })
+
+  it('notice：单按钮告知框（cancelText 空），onConfirm resolve 后关闭', async () => {
+    const { notice, dialog, onConfirm } = useDialog()
+    const p = notice({ title: '退役失败', message: '无权退役', danger: true })
+    expect(dialog.value.open).toBe(true)
+    expect(dialog.value.kind).toBe('notice')
+    expect(dialog.value.title).toBe('退役失败')
+    expect(dialog.value.danger).toBe(true)
+    expect(dialog.value.cancelText).toBe('')   // 单按钮：ConfirmDialog 据 kind 隐藏取消键
+    onConfirm()
+    await expect(p).resolves.toBeUndefined()
+    expect(dialog.value.open).toBe(false)
+  })
+
+  it('notice：onCancel（Esc/点遮罩）同样 resolve —— 视为「已知悉」，不落 false 也不悬挂', async () => {
+    const { notice, dialog, onCancel } = useDialog()
+    const p = notice({ message: '仅告知' })
+    onCancel()
+    await expect(p).resolves.toBeUndefined()   // 关键回归：confirm 的 onCancel→false，notice 的必须仍 resolve
+    expect(dialog.value.open).toBe(false)
+  })
+
+  it('notice 默认值：title「提示」/ confirmText「知道了」/ 非危险', async () => {
+    const { notice, dialog, onConfirm } = useDialog()
+    const p = notice({ message: 'x' })
+    expect(dialog.value.title).toBe('提示')
+    expect(dialog.value.confirmText).toBe('知道了')
+    expect(dialog.value.danger).toBe(false)
+    onConfirm()
+    await p
+  })
 })

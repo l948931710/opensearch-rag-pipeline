@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { useKb, __resetKb, __setSelectedFiles, type DocItem } from '@/composables/useKb'
+import { useDialog } from '@/composables/useDialog'
 import { useSession, type Role } from '@/stores/session'
 
 function jsonResp(body: unknown, { ok = true, status = 200 } = {}) {
@@ -610,9 +611,9 @@ describe('useKb.approve/reject — 审批后定向更新（#82）', () => {
     expect(calls.filter((c) => c.startsWith('/api/kb/my-docs'))).toHaveLength(1)             // 保留一次权威刷新
   })
 
-  it('reject 失败：alert、该单保留可重试（现状回退）', async () => {
-    const alertMock = vi.fn()
-    vi.stubGlobal('alert', alertMock)
+  it('reject 失败：notice 告知框（danger）、该单保留可重试（现状回退）', async () => {
+    const { dialog, onConfirm } = useDialog()
+    dialog.value.open = false                      // 防其他用例遗留态假阳性
     vi.stubGlobal('fetch', vi.fn(async (path: string) => {
       if (path.startsWith('/api/kb/reject')) return jsonResp({ detail: 'boom' }, { ok: false, status: 500 })
       return jsonResp({}, { ok: false, status: 404 })
@@ -622,7 +623,11 @@ describe('useKb.approve/reject — 审批后定向更新（#82）', () => {
     ;(kb as any).approvals.value = [P('p1')]
     await kb.reject(P('p1') as any, '理由')
     expect(kb.approvals.value).toHaveLength(1)     // 失败不动队列
-    expect(alertMock).toHaveBeenCalled()
+    expect(dialog.value.open).toBe(true)           // 应用内告知框（不再用原生 alert）
+    expect(dialog.value.kind).toBe('notice')
+    expect(dialog.value.title).toBe('驳回失败')
+    expect(dialog.value.danger).toBe(true)
+    onConfirm()                                    // 收尾关闭，不向后续用例泄漏打开态
   })
 
   it('approveAccess 成功：本地移除该单 + 只刷「已授权清单」（不重拉申请队列）', async () => {

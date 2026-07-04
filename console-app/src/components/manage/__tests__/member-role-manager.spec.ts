@@ -72,7 +72,6 @@ describe('MemberRoleManager 渲染', () => {
 
 describe('grant/revoke 组合式逻辑（DEV preview）', () => {
   it('grantDeptAdmin 新增一行;再次提交同人 = 覆盖其 managed depts', async () => {
-    vi.stubGlobal('alert', vi.fn())
     activate(identity(), 'dev-preview')
     const kb = useKb()
     ;(kb as any).adminGrants.value = []

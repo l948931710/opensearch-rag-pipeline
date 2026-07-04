@@ -1,7 +1,11 @@
 import { computed, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
+import { useDialog } from '@/composables/useDialog'
 import { GROUP_LABEL, deptLabel, uploadErrText } from '@/lib/kb'
+
+// 失败类提示统一走应用内告知框（useDialog 单例状态挂模块作用域，此处直接取用；不再用原生 alert）。
+const { notice } = useDialog()
 
 // 知识贡献单例 store（员工众包问答 → 部门管理员采纳 → 走管线入库）。
 // 后端契约见 api.py /api/kb/gaps · /api/kb/contributions*；身份复用 P1 session（whoami）。
@@ -188,7 +192,7 @@ async function acceptContribution(c: ContributionItem, permissionLevel: 'dept_in
       if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = pendingContribs.value.filter((x) => x.contribution_id !== c.contribution_id); return }
       await apiJson(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({ permission_level: permissionLevel }) })
       await Promise.all([loadPending(), loadMine()])
-    } catch (e: any) { alert('采纳失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '采纳失败', message: uploadErrText(e), danger: true }) }
   })
 }
 async function rejectContribution(c: ContributionItem, note: string) {
@@ -198,7 +202,7 @@ async function rejectContribution(c: ContributionItem, note: string) {
       if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = pendingContribs.value.filter((x) => x.contribution_id !== c.contribution_id); return }
       await apiJson(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/reject`, { method: 'POST', auth: true, body: JSON.stringify({ note: note || null }) })
       await loadPending()
-    } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '驳回失败', message: uploadErrText(e), danger: true }) }
   })
 }
 async function retryContribution(c: ContributionItem) {
@@ -208,7 +212,7 @@ async function retryContribution(c: ContributionItem) {
       if (import.meta.env.DEV && s.token === 'dev-preview') { return }
       await apiJson(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/retry-ingestion`, { method: 'POST', auth: true, body: JSON.stringify({}) })
       await loadMine()
-    } catch (e: any) { alert('重试失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '重试失败', message: uploadErrText(e), danger: true }) }
   })
 }
 
