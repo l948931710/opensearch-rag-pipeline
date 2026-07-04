@@ -24,8 +24,8 @@ async function onReject(c: ContributionItem) {
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题+计数，不再另设分区眉标（消除同文案两遍的噪声） -->
   <section v-if="pendingContribs.length || loadErrors['pending']">
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">贡献审核</p>
     <LoadError class="mb-2.5" :message="loadErrors['pending']" @retry="loadPending()" />
     <div v-if="pendingContribs.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 橙头（待办） -->
@@ -50,7 +50,7 @@ async function onReject(c: ContributionItem) {
           <select
             :value="scopeOf(c.contribution_id)" :aria-label="`可见范围：${c.question}`"
             :disabled="isBusy(`ct:${c.contribution_id}`)"
-            class="cursor-pointer rounded-lg border border-border bg-card px-2 py-[6px] text-[12px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15 disabled:opacity-50"
+            class="ui-select cursor-pointer rounded-lg border border-border bg-card px-2 py-[6px] text-[12px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15 disabled:opacity-50"
             @change="scope[c.contribution_id] = ($event.target as HTMLSelectElement).value as 'dept_internal' | 'public'"
           >
             <option value="dept_internal">部门公开</option>

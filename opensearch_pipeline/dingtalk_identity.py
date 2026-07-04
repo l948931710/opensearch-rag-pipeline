@@ -45,6 +45,20 @@ def _kb_db() -> str:
     return get_config().rds.database
 
 
+def _acl_ancestry_enabled() -> bool:
+    """RAG_ACL_ANCESTRY（默认关）：部门→组解析改走「最近祖先制」（dept_id 锚定，见
+    dept_ancestry.py）。开 = cache-miss/穿透时按父链找最近锚、缓存**组码 CSV**；父链
+    任一跳失败（partial）→ 整体落回现行名字口径，绝不缓存半截。关 = 行为与现行完全一致。"""
+    return os.environ.get("RAG_ACL_ANCESTRY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# 祖先制「权威仅 public」的缓存哨兵：显式 [] 锚（如「其他」）解析出的 deny 结果既不能存
+# 空串（cache-read 把空 dept_code 当 miss → 每条消息重走 API），也不能保留原始部门名
+# （读回 _normalize_dept_to_codes 撞名字表会把显式 deny 悄悄变回授权）。存本哨兵：非空
+# 可缓存、读回被白名单丢弃 = []（fail-closed 方向，round-trip 语义精确）。
+_ACL_PUBLIC_ONLY_SENTINEL = "__public_only__"
+
+
 # ═══════════════════════════════════════════════════════════════
 # 钉钉部门名 → ACL 权限组 映射
 # ───────────────────────────────────────────────────────────────
@@ -73,12 +87,28 @@ _DEPT_NAME_TO_GROUPS = {
     "行政部": ["admin"],
     "人力资源部": ["hr"],
     "生产部": ["production"],
-    "海外中心": ["production"],
     "研发部": ["rd"],
     "实验室": ["rd"],
     "技术部": ["quality"],
     "品质部": ["quality"],
-    "资材部": ["supply", "pmc"],
+    "资材部": ["supply", "pmc", "production"],   # 2026-07-03 拍板：归生产中心下，叠 production 可读
+    # —— 2026-07-03 拍板批（与 dept_ancestry 锚表同步；名字条目让 flag 关时也生效） ——
+    "海外中心": ["overseas", "production"],       # 自有组 + 维持 production 可读
+    "印尼公司": ["overseas", "production"],
+    "获胜工厂": ["overseas", "production"],
+    "墨西哥公司": ["overseas", "production"],
+    "海外生产中心国内办公室": ["overseas", "production"],
+    "总经办": ["*"],                              # 全库可读（"*"=全组哨兵；非 kb_admin，无写权/管理台）
+    "审计部": ["audit"],
+    "审计一部": ["audit"],
+    "审计二部": ["audit"],
+    "法务": ["legal"],
+    "工程": ["engineering"],
+    "玉米环保": ["corn_eco"],
+    "财务中心": ["finance", "it"],           # 2026-07-04 拍板：中心挂点=双职能（子部门有精确映射不受影响）
+    # ⚠️「办公室」（综合管理中心/办公室→[admin,hr]）只在 dept_ancestry 锚表按 dept_id 设锚，
+    #    刻意不进本名字表：通用名全局键控会误伤其他子树同名部门（如车间办公室）。
+    # 「其他」：有意仅 public——名字表"未收录=fail-closed"即该语义；祖先制里是显式 [] 锚。
     # —— 中心级名（历史/兜底；待真钉钉账号确认 _fetch_dept_name 返回叶子还是中心。
     #    仅保留【单组无歧义】的中心名，多组中心名不放以免越权） ——
     "营销中心": ["marketing"],
@@ -224,6 +254,8 @@ def _normalize_dept_to_codes(raw: Union[str, List[str], None]) -> List[str]:
             mapped = ["production"]
         else:
             mapped = [key]                       # 透传（待白名单裁决：未知即 fail-closed）
+        if "*" in mapped:                        # "*"=全组哨兵（总经办类全可见）→ 展开为白名单全量
+            mapped = sorted(_VALID_ACL_GROUPS)
         for code in mapped:
             code = code.strip()
             if code and code in _VALID_ACL_GROUPS and code not in seen:
@@ -337,6 +369,29 @@ def _resolve_user_dept_live(staff_id: str) -> "tuple[List[str], bool]":
             # 2. cache-miss 或 过期 employee 行穿透：调钉钉 API 获取（dept_name 为全部部门名 CSV）
             user_info = _fetch_dingtalk_user_info(staff_id)
             if user_info:
+                # —— 最近祖先制（RAG_ACL_ANCESTRY，默认关）——非 partial 即权威：
+                # 组码 CSV 顶替 dept_name 走下方同一缓存/返回路径（_normalize_dept_to_codes
+                # 对组码幂等读回；且不受名字口径 is_partial 影响——id 父链是独立的完整解析）。
+                # 三态落点：非空=授组；空+全支锚定(decided)=权威「有意仅 public」→ 存 deny
+                # 哨兵、绝不落回名字口径（显式 [] 锚要能压过名字表撞名，否则 deny 腿失效）；
+                # 空+存在未决定支=锚表覆盖缺口 → 名字口径兜底（现行为，tests 对照锁定）；
+                # partial(None)=整体落回名字口径且绝不缓存半截。
+                _anc_res = _resolve_groups_via_ancestry(user_info.get("dept_ids") or []) \
+                    if _acl_ancestry_enabled() else None
+                if _anc_res is not None:
+                    _anc, _anc_undecided = _anc_res
+                    if _anc:
+                        # 全组结果压缩回 "*" 哨兵再落 dept_name/缓存：15 组码 CSV=104 字符会溢出
+                        # user_role.dept_code VARCHAR(64)（strict 模式每次写失败被吞→永不缓存、每个
+                        # TTL 重走全链；非 strict 静默截断→读回被白名单丢尾，总经办静默少 6/15 组）。
+                        # 读侧 _normalize_dept_to_codes 本就把 "*" 展开为全量白名单（与 seeded 行同一
+                        # round-trip），语义无损且加新组自动跟上。
+                        from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+                        _csv = "*" if set(_anc) == set(_VALID_ACL_GROUPS) else ",".join(_anc)
+                        user_info = dict(user_info, dept_name=_csv, is_partial=False)
+                    elif not _anc_undecided:
+                        user_info = dict(user_info, dept_name=_ACL_PUBLIC_ONLY_SENTINEL,
+                                         is_partial=False)
                 if user_info.get("is_partial"):
                     # F-22：解析不完整（某 dept 瞬时失败）→ 绝不落缓存，避免残缺 CSV 永久少授权。
                     # 穿透场景退回旧缓存（更全）；纯 cache-miss 返回本次 best-effort 组（仅 public 之上、
@@ -509,7 +564,10 @@ def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
                         seen_names.add(nm)
                         dept_names.append(nm)
                 dept_name = ",".join(dept_names)
-                return {"user_name": user_name, "dept_name": dept_name, "is_partial": is_partial}
+                # dept_ids：最近祖先制（RAG_ACL_ANCESTRY）用原始 dept_id 列表沿父链找锚；
+                # 名字口径的消费方不读此键（加键纯 additive，既有桩/调用零影响）。
+                return {"user_name": user_name, "dept_name": dept_name, "is_partial": is_partial,
+                        "dept_ids": list(dept_id_list)}
             logger.warning("用户查询业务失败: errcode=%s errmsg=%s", data.get("errcode"), data.get("errmsg"))
             return None
         logger.warning("用户查询 HTTP 失败: %s", resp.text[:300])
@@ -562,6 +620,45 @@ def _fetch_dept_name(token: str, dept_id: int) -> str:
     except Exception:
         pass
     return ""
+
+
+def _fetch_dept_parent(token: str, dept_id: int) -> Optional[int]:
+    """dept_id → 父部门 id（department/get 的 parent_id；根返回 0）。失败 → None
+    （dept_ancestry 契约：None = 该支 partial，调用方落回名字口径）。与 _fetch_dept_name
+    分开：后者是既有名字口径的测试契约（monkeypatch 面），不动。"""
+    try:
+        resp = requests.post(
+            f"https://oapi.dingtalk.com/topapi/v2/department/get?access_token={token}",
+            json={"dept_id": dept_id},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("errcode") == 0:
+                return int(data.get("result", {}).get("parent_id", 0) or 0)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_groups_via_ancestry(dept_ids) -> "Optional[tuple]":
+    """最近祖先制解析（RAG_ACL_ANCESTRY 开时由 _resolve_user_dept_live 调用）。
+
+    返回 (组码列表, undecided) = 权威结果：非空=授组；空+undecided=False=全部支路终结于锚
+    （含显式 [] 锚）= 权威「有意仅 public」；空+undecided=True=存在到顶无锚支（锚表覆盖
+    缺口）→ 调用方落回名字口径兜底。返回 None = partial（父链任一跳失败/环/异常 id）
+    或无 token —— 调用方【整体落回名字口径】。
+    每跳独立 department/get（仅 cache-miss/穿透路径才走，树深 ≤5，可接受）。
+    """
+    from opensearch_pipeline.dept_ancestry import resolve_dept_ids
+    from opensearch_pipeline.dingtalk_card import _get_access_token
+
+    token = _get_access_token()
+    if not token:
+        return None
+    codes, partial, undecided = resolve_dept_ids(
+        dept_ids or [], lambda did: _fetch_dept_parent(token, did))
+    return None if partial else (codes, undecided)
 
 
 # ═══════════════════════════════════════════════════════════════

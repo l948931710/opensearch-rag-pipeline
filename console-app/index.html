@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
     <!-- #F-console-urltoken 保守加固：same-origin referrer——页面 URL 若带 ?token=，禁止其经 Referer 漏给
-         跨域子资源（fonts.googleapis / g.alicdn 钉钉 SDK 在 JS 抹除前就已发起）。同源请求不受影响。 -->
+         跨域子资源（g.alicdn 钉钉 SDK 在 JS 抹除前就已发起）。同源请求不受影响。 -->
     <meta name="referrer" content="same-origin" />
     <title>富岭知识库</title>
     <!-- 防暗色闪白：渲染前依 localStorage/系统偏好定 data-theme -->
@@ -17,12 +17,15 @@
         } catch (e) { document.documentElement.setAttribute('data-theme', 'light'); }
       })();
     </script>
-    <!-- Atlas Chat 字体：Hanken Grotesk / Instrument Serif / JetBrains Mono -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <!-- 仅在此加载钉钉 SDK；免登统一收口到 useAuth.ts（不在多处触发）。 -->
-    <script src="https://g.alicdn.com/dingding/dingtalk-jsapi/3.0.25/dingtalk.open.js"></script>
+    <!-- Atlas Chat 字体（Hanken Grotesk / Instrument Serif / JetBrains Mono）已自托管：
+         见 src/styles/fonts.css（latin woff2 + font-display:swap，经 Vite 指纹进 assets/ 命中
+         immutable 缓存）。此前的 fonts.googleapis.com 阻塞样式表在大陆网络会挂到超时才允许
+         首绘——绝不复加外链字体。 -->
+    <!-- 仅在此加载钉钉 SDK；免登统一收口到 useAuth.ts（不在多处触发）。
+         defer（Perf-2）：同步 script 会阻塞首绘（g.alicdn 抖动=白屏）。defer 后首绘不等它，
+         且 defer 脚本与 type=module 按【文档序】执行 → window.dd 仍先于 main.ts 就绪，
+         免登时序不变；真不在钉钉容器时 useAuth 本就有「非钉钉环境」reject 兜底。 -->
+    <script defer src="https://g.alicdn.com/dingding/dingtalk-jsapi/3.0.25/dingtalk.open.js"></script>
   </head>
   <body>
     <div id="app"></div>

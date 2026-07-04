@@ -24,6 +24,24 @@ describe('renderMd（白名单 markdown，转义优先防注入）', () => {
     expect(renderMd('一\n\n二')).toBe('<p>一</p><p>二</p>')
     expect(renderMd('')).toBe('<p></p>')
   })
+  it('有序列表：1. / 1、 / 1) 带原序号（data-n），不再落成普通段落', () => {
+    expect(renderMd('1. 第一步')).toBe('<p class="md-li md-oli" data-n="1">第一步</p>')
+    expect(renderMd('2、第二步')).toContain('data-n="2"')
+    expect(renderMd('3) 第三步')).toContain('data-n="3"')
+    expect(renderMd('12. 两位序号')).toContain('data-n="12"')
+  })
+  it('引用：> 行渲染成 blockquote，连续行合并，不再露出字面 >', () => {
+    expect(renderMd('> 引用一行')).toBe('<blockquote>引用一行</blockquote>')
+    expect(renderMd('> 甲\n> 乙')).toBe('<blockquote>甲<br>乙</blockquote>')
+    expect(renderMd('正文\n> 引\n后续')).toBe('<p>正文</p><blockquote>引</blockquote><p>后续</p>')
+    expect(renderMd('> 引')).not.toContain('&gt;')
+  })
+  it('链接：仅放行显式 http(s)，其他协议不生成 <a>', () => {
+    expect(renderMd('[门户](https://kb.fuling.com/x)')).toContain('<a href="https://kb.fuling.com/x" target="_blank" rel="noopener noreferrer">门户</a>')
+    expect(renderMd('[x](javascript:alert(1))')).not.toContain('<a')
+    // URL 里带引号也逃不出 href（已被 escapeHtml 转成 &quot;）
+    expect(renderMd('[x](https://e.com/"onmouseover="p())')).not.toContain('onmouseover="')
+  })
 })
 
 describe('renderMd 围栏代码块 + highlightCode', () => {

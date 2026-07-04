@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ShieldCheck, FileText, Loader2 } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
+import { ShieldCheck, FileText, Loader2, Hourglass } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
@@ -12,6 +13,22 @@ const { confirm, promptText } = useDialog()
 
 // requester_depts 为逗号分隔组码（多部门管理员可一次授予多组）→ 逐个 deptLabel 再拼。
 const reqLabel = (csv: string) => csv.split(',').map((c) => deptLabel(c.trim())).filter(Boolean).join('、')
+
+// ── 授权老化治理：授权是永久的（无到期列），至少让"放出去多久了"可见、可筛 ──
+// >STALE_DAYS 天未复核 → 「建议复核」amber 徽章；头部一键只看陈旧授权（定期复核的最小闭环，零 DDL）。
+const STALE_DAYS = 90
+const staleOnly = ref(false)
+function grantAgeDays(g: AccessGrantItem): number | null {
+  const t = Date.parse((g.decided_at || '').replace(' ', 'T'))
+  return Number.isFinite(t) ? Math.floor((Date.now() - t) / 86400000) : null
+}
+const isStale = (g: AccessGrantItem) => (grantAgeDays(g) ?? 0) > STALE_DAYS
+const staleCount = computed(() => accessGrants.value.filter(isStale).length)
+const shown = computed(() => (staleOnly.value ? accessGrants.value.filter(isStale) : accessGrants.value))
+const ageText = (g: AccessGrantItem) => {
+  const d = grantAgeDays(g)
+  return d === null ? '' : d < 1 ? '今天' : `${d} 天`
+}
 
 async function onRevoke(g: AccessGrantItem) {
   const okGo = await confirm({
@@ -26,8 +43,8 @@ async function onRevoke(g: AccessGrantItem) {
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题+计数，不再另设分区眉标 -->
   <section v-if="accessGrants.length || loadErrors['accessGrants']">
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">已授权</p>
     <LoadError class="mb-2.5" :message="loadErrors['accessGrants']" @retry="loadAccessGrants()" />
     <div v-if="accessGrants.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 活跃态头（st-live，区别于待审批的绿/橙头） -->
@@ -35,12 +52,20 @@ async function onRevoke(g: AccessGrantItem) {
         <ShieldCheck :size="16" :stroke-width="1.75" class="text-st-live" />
         <span class="text-sm font-semibold text-foreground">已授权</span>
         <span class="rounded-full bg-st-live px-2 py-px text-[11px] font-bold text-white">{{ accessGrants.length }}</span>
+        <button
+          v-if="staleCount"
+          type="button"
+          class="inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition"
+          :class="staleOnly ? 'border-st-warn bg-st-warn/15 text-st-warn' : 'border-border text-muted-foreground hover:bg-panel'"
+          :title="`授权超过 ${STALE_DAYS} 天未复核`"
+          @click="staleOnly = !staleOnly"
+        ><Hourglass :size="11" :stroke-width="1.75" /> 待复核 {{ staleCount }}</button>
         <div class="flex-1" />
         <span class="hidden text-xs text-muted-foreground sm:inline">本部门文档已放行的跨部门检索授权，可撤销</span>
       </div>
       <!-- 行 -->
       <div
-        v-for="g in accessGrants" :key="g.id"
+        v-for="g in shown" :key="g.id"
         class="flex flex-wrap items-center gap-x-3.5 gap-y-2 border-t border-border px-[18px] py-3 first:border-t-0"
       >
         <span class="grid size-8 shrink-0 place-items-center rounded-lg bg-st-live/10 text-st-live">
@@ -52,7 +77,12 @@ async function onRevoke(g: AccessGrantItem) {
           </div>
           <div class="truncate text-[11.5px] text-faint">
             归属 {{ deptLabel(g.owner_dept) }} · {{ permLabel(g.permission_level) }} · 申请人 {{ g.requester_name }}
-            <span v-if="g.decided_at"> · 授权于 {{ g.decided_at }}</span>
+            <span v-if="g.decided_at"> · 授权于 {{ g.decided_at }}<template v-if="ageText(g)">（{{ ageText(g) }}）</template></span>
+            <span
+              v-if="isStale(g)"
+              class="ml-1 whitespace-nowrap rounded border border-st-warn/40 bg-st-warn/10 px-1.5 py-px text-[10px] font-medium text-st-warn"
+              :title="`已授权超过 ${STALE_DAYS} 天：请确认对方是否仍需检索本文档，不需要即撤销`"
+            >建议复核</span>
           </div>
           <div v-if="g.reason" class="mt-1 line-clamp-2 text-[12px] text-muted-foreground">“{{ g.reason }}”</div>
         </div>

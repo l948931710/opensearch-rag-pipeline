@@ -8,6 +8,11 @@ import LoadError from '@/components/manage/LoadError.vue'
 // 「回答」打开贡献弹窗并预填该问题；已有贡献待入库的标灰提示、不重复发起。
 const { gaps, loadingGaps, loadErrors, gapsHasMore, loadGaps, openModal } = useContribute()
 
+// 缺口种类是最需要一眼分开的信息：缺文档（红）要新建内容，没答好（琥珀）改进已有内容即可。
+const KIND_PILL: Record<string, string> = {
+  no_result: 'bg-st-fail/10 text-st-fail', refusal: 'bg-st-busy/10 text-st-busy',
+}
+
 function onAnswer(g: GapItem) {
   openModal({ question: g.question, dept: g.dept, sourceMessageId: g.source_message_id, gapQuery: g.question })
 }
@@ -28,15 +33,15 @@ function onAnswer(g: GapItem) {
     <div v-if="gaps.length">
       <div
         v-for="g in gaps" :key="g.question_hash"
-        class="flex items-center gap-3 border-t border-border px-[18px] py-3 first:border-t-0"
+        class="flex items-center gap-3 border-t border-border px-[18px] py-3 transition-colors first:border-t-0 hover:bg-panel/50"
       >
         <div class="min-w-0 flex-1">
           <div class="truncate text-[13.5px] font-medium text-foreground">{{ g.question }}</div>
           <div class="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11.5px] text-faint">
-            <span>{{ g.asks }} 次询问</span>
+            <span><span class="font-semibold tabular-nums text-foreground">{{ g.asks }}</span> 次询问</span>
             <span v-if="g.dept">· {{ deptLabel(g.dept) }}</span>
             <span class="inline-flex items-center gap-1"><Clock :size="11" :stroke-width="2" /> {{ g.last_days }} 天未回答</span>
-            <span v-if="gapKindLabel(g.kind)" class="rounded bg-panel px-1.5 py-px text-[10.5px] text-muted-foreground">{{ gapKindLabel(g.kind) }}</span>
+            <span v-if="gapKindLabel(g.kind)" class="rounded px-1.5 py-px text-[10.5px] font-medium" :class="KIND_PILL[g.kind] || 'bg-panel text-muted-foreground'">{{ gapKindLabel(g.kind) }}</span>
           </div>
         </div>
         <span

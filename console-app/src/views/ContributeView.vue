@@ -41,7 +41,7 @@ onMounted(() => {
 
     <!-- 统计卡 -->
     <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
-      <StatCard label="待回答问题" :value="s?.unanswered ?? '—'" :icon="HelpCircle" tone="text-st-warn" hint="等你来贡献" />
+      <StatCard label="待回答问题" :value="s?.unanswered ?? '—'" :icon="HelpCircle" tone="text-st-busy" hint="等你来贡献" />
       <StatCard label="本月贡献" :value="s?.this_month ?? '—'" :icon="Sparkles" hint="含待审核" />
       <StatCard label="已采纳" :value="s?.answered ?? '—'" :icon="CheckCircle2" tone="text-accent-text" hint="已入库可检索" />
       <StatCard label="贡献者" :value="s?.contributors ?? '—'" :icon="Users" hint="本季活跃" />

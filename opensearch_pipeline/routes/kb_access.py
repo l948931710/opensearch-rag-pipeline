@@ -99,6 +99,20 @@ class KbAccessGrantListResponse(BaseModel):
     items: List[KbAccessGrantItem] = Field(default_factory=list)
 
 
+class KbAccessGrantCreate(BaseModel):
+    """Owner 侧主动共享：文档所属部门管理员直接放行指定部门（无需对方先申请）。"""
+    doc_id: str
+    target_depts: List[str] = Field(default_factory=list)
+    reason: Optional[str] = None
+
+
+class KbAccessGrantCreateResponse(BaseModel):
+    doc_id: str = ""
+    granted: List[str] = Field(default_factory=list)   # 本次新放行的组码
+    skipped: List[str] = Field(default_factory=list)   # 已覆盖 / 归属自身 / 伞下冗余而跳过
+    ok: bool = True
+
+
 # ── Phase F：成员/角色管理（kb_admin 维护 dept_admin 写授权；三分授权 读≠管理≠授权）──
 class KbAdminItem(BaseModel):
     user_id: str = ""
@@ -218,6 +232,9 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
     write_audit(doc_id=req.doc_id, version_no=None, action_type="ACCESS_REQUEST_SUBMIT",
                 operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
                 message=f"owner={owner_dept} requester_depts={requester_depts}")
+    # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：归属部门管理员即时知晓待办
+    from opensearch_pipeline.admin_notify import notify_access_request
+    notify_access_request(owner_dept=owner_dept, doc_id=req.doc_id, requester_depts=requester_depts)
     return KbAccessRequestSubmitResponse(id=str(new_id), status="pending", already=False)
 
 
@@ -323,6 +340,215 @@ def kb_access_grants_list(request: Request,
         for r in rows
     ]
     return KbAccessGrantListResponse(items=items)
+
+
+@router.post("/api/kb/access-grants", response_model=KbAccessGrantCreateResponse)
+def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
+                           identity: Optional[Identity] = Depends(current_identity)):
+    """Owner 侧【主动共享】：文档所属部门管理员（或 kb_admin）直接把 dept_internal 文档
+    放行给指定部门检索——被动申请流（submit→approve）的主动式对偶，复用同一张表同一状态机。
+
+    实现 = 直接 INSERT status='approved' 的 kb_access_request 行（requester=授权人自己、
+    decided_by=自己、decided_at=NOW），随后与 approve 完全同款：flag 开则同事务
+    enqueue_acl_projection + materialize 标脏（stage-3 推 HA3）、审计入同事务、
+    commit 后失效 deny 缓存。撤销/清单/审批历史零改动即可用（就是 approved 行）。
+
+    硬规则（fail-closed，与 submit/decide 同口径）：
+    - 只 dept_internal 可共享（public 本就全司可读→400；restricted 绝不外露→403）；
+    - 非在线文档不可共享（400）；
+    - 授权人必须 _kb_can_manage(owner_dept)（403）；
+    - 目标组码过 sanitize 白名单；「目标组本就可读该 owner」→ 冗余 skipped——判定唯一权威是
+      retriever._expand_groups_to_owners 闭集 taxonomy（production 伞 + marketing 共享面），
+      绝不 startswith：闭集外的 production_*（如 papercup 双拼）检索 fail-closed，对它们
+      "共享给 production" 恰是唯一放行通道，前缀判定会把这救济误吞成冗余；
+    - 已被既有 approved 行覆盖的目标 → skipped（幂等，可重复提交）。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import sanitize_owner_depts
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    targets = sanitize_owner_depts(req.target_depts)
+    if not targets:
+        raise HTTPException(status_code=400, detail="无有效目标部门（须为合法组码）")
+    assert_metadata_write_allowed("kb_access_grant_create", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    reason = (req.reason or "管理员主动共享")[:512]
+    granted: List[str] = []
+    skipped: List[str] = []
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
+                            "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm, status = (row[0] or ""), (row[1] or ""), (row[2] or "active")
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权共享该文档（非文档所属部门管理员）")
+                if str(status).lower() != "active":
+                    raise HTTPException(status_code=400, detail="该文档非在线状态，无法共享")
+                if perm == "public":
+                    raise HTTPException(status_code=400, detail="公开文档全公司可检索，无需共享")
+                if perm != "dept_internal":
+                    raise HTTPException(status_code=403, detail="受限文档不可共享")
+                # 既有 approved 覆盖集（含被动审批流写入的 CSV 行）→ 幂等 skip
+                cur.execute(f"SELECT requester_depts FROM {_kb_db()}.kb_access_request "
+                            "WHERE doc_id=%s AND status='approved'", (req.doc_id,))
+                covered = set()
+                for (csv,) in (cur.fetchall() or []):
+                    covered.update(p.strip() for p in str(csv or "").split(",") if p.strip())
+                from opensearch_pipeline.retriever import _expand_groups_to_owners
+                for t in targets:
+                    # 归属自身 / 目标组读者本就覆盖该 owner（闭集 taxonomy：production 伞 +
+                    # marketing 共享面）→ 冗余，跳过。闭集外 owner 不算覆盖（检索 fail-closed）。
+                    if t == owner_dept or owner_dept in _expand_groups_to_owners([t]) or t in covered:
+                        skipped.append(t)
+                        continue
+                    cur.execute(
+                        f"INSERT INTO {_kb_db()}.kb_access_request "
+                        "(doc_id, owner_dept, requester_id, requester_name, requester_depts, reason, "
+                        " status, decided_by, decided_at, decision_note) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,'approved',%s,NOW(),%s)",
+                        (req.doc_id, owner_dept, kb.user_id, kb.name, t, reason, kb.user_id, reason),
+                    )
+                    granted.append(t)
+                if granted:
+                    # 与 _kb_access_decide 同款投影：outbox 同事务持久入队 + 内联标脏 best-effort
+                    if get_config().rag.allowed_depts_acl:
+                        from opensearch_pipeline.access_grants import (
+                            enqueue_acl_projection, materialize_doc_allowed_depts,
+                        )
+                        enqueue_acl_projection(cur, req.doc_id, reason="direct_grant")
+                        try:
+                            materialize_doc_allowed_depts(cur, req.doc_id)
+                        except Exception as _pe:
+                            logger.warning("direct_grant allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
+                                           req.doc_id, _pe)
+                    write_audit(doc_id=req.doc_id, version_no=None, action_type="ACCESS_GRANT_DIRECT",
+                                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                                message=f"owner={owner_dept} targets={','.join(granted)}", cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_access_grant_create 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"共享失败 (trace: {trace_id})")
+    if granted:
+        # 与 decide 同款：主动失效检索侧 deny 缓存（TTL>0 时保「共享即时生效」；失败只记日志）
+        try:
+            from opensearch_pipeline.retriever import invalidate_deny_cache
+            invalidate_deny_cache(req.doc_id or None)
+        except Exception as _ie:   # noqa: BLE001
+            logger.warning("deny 缓存失效失败（忽略，TTL 兜底）doc=%s: %s", req.doc_id, _ie)
+    return KbAccessGrantCreateResponse(doc_id=req.doc_id, granted=granted, skipped=skipped, ok=True)
+
+
+class KbVisibilityReader(BaseModel):
+    """有效可见范围里的一个读者组：dept=组码（前端 deptLabel 转中文），via=来源。"""
+    dept: str = ""
+    via: str = "owner"        # owner=归属部门 / umbrella=生产伞组 / shared_policy=营销共享面 / grant=跨部门授权
+
+
+class KbVisibilityExplainResponse(BaseModel):
+    doc_id: str = ""
+    owner_dept: str = ""
+    permission_level: str = "dept_internal"
+    everyone: bool = False    # public：全公司可检索
+    nobody: bool = False      # restricted / 非在线 / 隔离：不进检索
+    quarantined: bool = False # 安全隔离（chunk 停用；唯一出路=脱敏重灌）
+    active: bool = True
+    readers: List[KbVisibilityReader] = Field(default_factory=list)
+
+
+@router.get("/api/kb/visibility-explain", response_model=KbVisibilityExplainResponse)
+def kb_visibility_explain(request: Request, doc_id: str = "",
+                          identity: Optional[Identity] = Depends(current_identity)):
+    """「谁能看到这篇文档」解释器（只读）：把 基础级别 + 组语义（production 伞组 /
+    marketing 共享面）+ 跨部门授权（approved 行）折叠成一份有效可见范围清单。
+
+    判定与检索侧同源：逐组用 retriever._expand_groups_to_owners 反查「哪些用户组的
+    owner 扩展覆盖本文档 owner_dept」——绝不在这里手写第二份伞组/共享面规则
+    （闭集 taxonomy 变了这里自动跟上）。授权：_kb_can_manage（文档归属部门管理员 /
+    kb_admin）——授权清单含其他部门名单，不对只读浏览者外露。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    trace_id = get_request_id()
+    grant_depts: List[str] = []
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm = (row[0] or ""), (row[1] or "dept_internal")
+                status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权查看该文档的可见范围明细")
+                cur.execute(f"SELECT publish_status, gate_status FROM {_kb_db()}.document_version "
+                            "WHERE doc_id=%s AND version_no=%s", (doc_id, cur_ver))
+                vrow = cur.fetchone()
+                quarantined = bool(vrow and (str(vrow[0] or "").upper() == "QUARANTINED"
+                                             or str(vrow[1] or "").lower() == "quarantined"))
+                if perm == "dept_internal":
+                    cur.execute(f"SELECT requester_depts FROM {_kb_db()}.kb_access_request "
+                                "WHERE doc_id=%s AND status='approved'", (doc_id,))
+                    _seen_g = set()
+                    for (csv,) in (cur.fetchall() or []):
+                        for p in str(csv or "").split(","):
+                            p = p.strip()
+                            if p and p not in _seen_g:
+                                _seen_g.add(p)
+                                grant_depts.append(p)
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_visibility_explain 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"可见范围查询失败 (trace: {trace_id})")
+
+    active = str(status).lower() == "active"
+    resp = KbVisibilityExplainResponse(doc_id=doc_id, owner_dept=owner_dept,
+                                       permission_level=perm, active=active,
+                                       quarantined=quarantined)
+    if quarantined or not active or perm == "restricted":
+        resp.nobody = True        # 隔离/退役/受限：不在检索中（优先级最高，覆盖一切授权）
+        return resp
+    if perm == "public":
+        resp.everyone = True
+        return resp
+    # dept_internal：与检索同源反查——owner 组自身 / production 伞 / marketing 共享面
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS, _expand_groups_to_owners
+    readers: List[KbVisibilityReader] = []
+    covered = set()
+    for g in sorted(_VALID_ACL_GROUPS, key=lambda x: (x != owner_dept, x)):   # 归属组排最前
+        if owner_dept in _expand_groups_to_owners([g]):
+            via = ("owner" if g == owner_dept
+                   else "umbrella" if g == "production" else "shared_policy")
+            readers.append(KbVisibilityReader(dept=g, via=via))
+            covered.add(g)
+    for g in grant_depts:
+        if g not in covered:
+            readers.append(KbVisibilityReader(dept=g, via="grant"))
+            covered.add(g)
+    resp.readers = readers
+    return resp
 
 
 # ─────────────────────────────────────────────────────────────────────────────

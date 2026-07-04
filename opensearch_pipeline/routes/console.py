@@ -7,6 +7,7 @@ SPA 回退与缓存策略逐字保留。api.py re-export `_serve_console_spa`/`_
 （tests 直接引用）。规则见 routes/__init__.py。
 """
 
+import mimetypes
 from pathlib import Path
 from typing import Any, Dict
 
@@ -36,16 +37,32 @@ _NEXT_DIST = _PKG_ROOT / "webconsole" / "next-dist"
 _KB_CONSOLE_HTML_CACHE: Dict[str, Any] = {"html": None}
 
 
-def _serve_console_spa(rel: str) -> Response:
-    """从 next-dist 安全返回文件；越界/不存在 → index.html（SPA 回退，no-cache）。构建 base 须为 /console/。"""
+def _serve_console_spa(rel: str, accept_encoding: str = "") -> Response:
+    """从 next-dist 安全返回文件；越界/不存在 → index.html（SPA 回退，no-cache）。构建 base 须为 /console/。
+
+    assets/ 走预压缩内容协商（Perf-3）：构建期 scripts/compress-dist.mjs 已产 .br/.gz
+    旁路文件，按 Accept-Encoding 直发压缩字节（uvicorn 直出公网无反代，否则 ~350KB 原样
+    下发）。**绝不用全局 GZipMiddleware**——它会缓冲 StreamingResponse，/api/ask/stream
+    的 SSE 逐帧刷出会被攒成坨。旁路文件缺席自动回退原文件，零部署顺序风险。
+    """
     base = _NEXT_DIST
     index = base / "index.html"
     if rel:
         target = (base / rel).resolve()
         # 路径穿越守卫：解析后必须仍落在 next-dist 之内
         if (target == base or base in target.parents) and target.is_file():
-            cache = "public, max-age=31536000, immutable" if rel.startswith("assets/") else "no-cache"
-            return FileResponse(target, headers={"Cache-Control": cache})
+            if rel.startswith("assets/"):
+                headers = {"Cache-Control": "public, max-age=31536000, immutable",
+                           "Vary": "Accept-Encoding"}
+                for enc, suffix in (("br", ".br"), ("gzip", ".gz")):
+                    if enc in (accept_encoding or "").lower():
+                        cand = target.with_name(target.name + suffix)
+                        if cand.is_file():
+                            mt = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                            return FileResponse(cand, media_type=mt,
+                                                headers={**headers, "Content-Encoding": enc})
+                return FileResponse(target, headers=headers)
+            return FileResponse(target, headers={"Cache-Control": "no-cache"})
     if index.is_file():
         return FileResponse(index, headers={"Cache-Control": "no-cache"})
     return HTMLResponse("<h1>/console 尚未构建（在 console-app 下 CONSOLE_BASE=/console/ npm run build）</h1>", status_code=404)
@@ -67,8 +84,8 @@ def kb_console_root(request: Request):
 
 
 @router.get("/console/{path:path}", include_in_schema=False)
-def kb_console_spa(path: str):
-    return _serve_console_spa(path)
+def kb_console_spa(path: str, request: Request):
+    return _serve_console_spa(path, request.headers.get("accept-encoding", ""))
 
 
 @router.get("/console-legacy", response_class=HTMLResponse, include_in_schema=False)

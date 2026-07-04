@@ -1652,11 +1652,14 @@ def _suggest_rephrase(question: str, limit: int = 2) -> List[str]:
 # dept_admin 仅其 dept_admin_grant 授予的 owner_dept（绝不用读组推导）。
 # ═══════════════════════════════════════════════════════════════
 
-# 10 个 ACL 组的中文标签（权限选择器展示用；单一来源 retriever._VALID_ACL_GROUPS）
+# 15 个 ACL 组的中文标签（权限选择器展示用；单一来源 retriever._VALID_ACL_GROUPS；
+# 2026-07-03 扩容 5 组，与 console GROUP_LABEL / dept_ancestry 锚表同步）
 _KB_ACL_GROUP_LABELS = {
     "finance": "财务", "it": "信息技术", "marketing": "营销", "production": "生产",
-    "pmc": "计划 PMC", "admin": "行政", "hr": "人力资源", "rd": "研发",
+    "pmc": "生产计划部", "admin": "行政", "hr": "人力资源", "rd": "研发",
     "quality": "品质技术", "supply": "资材供应",
+    "overseas": "海外", "audit": "审计", "legal": "法务",
+    "engineering": "工程", "corn_eco": "玉米环保",
 }
 
 
@@ -1682,6 +1685,10 @@ class KbDocItem(BaseModel):
     # 可操作性（= 写作用域 managed；my-docs 恒 True，browse 全部门时外部门为 False）。
     # 与"可见"解耦：浏览看得见 ≠ 能管。前端据此决定 升版/退役 还是 申请授权。
     can_manage: bool = True
+    # 利用度（qa_retrieved_doc 事实表，RAG_QA_FACT_JOIN 开且表在才填；None=数据不可用，
+    # 前端不显示——0 与「不知道」必须可区分，0=真·从未被引用，是退役候选信号）。
+    cited_count: Optional[int] = None
+    last_cited_at: str = ""
 
 
 class KbMyDocsResponse(BaseModel):
@@ -1724,8 +1731,8 @@ _KB_MAX_OFFSET = 10000   # 文档列表分页 offset 上界（全库 ~1600 篇�
 
 
 def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
-                     publish_status=None) -> str:
-    """把管线多字段折叠为用户可读态：排队中/处理中/已上线/处理失败/内容未变/已隔离/已退役。"""
+                     publish_status=None, chunk_status=None) -> str:
+    """把管线多字段折叠为用户可读态：排队中/处理中/已上线/未入索引/处理失败/内容未变/已隔离/已退役。"""
     cs = (content_status or "").upper()
     ix = (index_status or "").upper()
     if doc_status and str(doc_status).lower() not in ("active", ""):
@@ -1734,6 +1741,12 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
     # 绝不能显示"已上线"（会被误读为可搜/已脱敏）。统一显示"已隔离"，等脱敏重灌。
     if str(publish_status or "").upper() == "QUARANTINED":
         return "已隔离"
+    # 0-chunk / 版本被跳过终态（chunk_status='EMPTY'、publish_status='SKIPPED_*'——低文本图纸、
+    # 整篇 PII 隔离弃件、chunk 爆炸弃版等）：永远不会进索引，此前一律落到默认「处理中」，
+    # 管理员看不出"传了但永远搜不到"（136 篇未入索引盘点的可见性根因之一）。终态如实显示。
+    if (str(chunk_status or "").upper() == "EMPTY"
+            or str(publish_status or "").upper().startswith("SKIPPED")):
+        return "未入索引"
     # 管线把 document_version.index_status 置 'SUCCESS'（非 'INDEXED'）作为上线成功值。
     if ix in ("INDEXED", "SUCCESS") and (chunk_active is None or chunk_active > 0):
         return "已上线"
@@ -1914,6 +1927,10 @@ KbTopDocItem = _routes_kb_console.KbTopDocItem
 KbGapQueryItem = _routes_kb_console.KbGapQueryItem
 KbInsightsResponse = _routes_kb_console.KbInsightsResponse
 kb_insights = _routes_kb_console.kb_insights
+KbFeedbackDocRef = _routes_kb_console.KbFeedbackDocRef
+KbFeedbackReviewItem = _routes_kb_console.KbFeedbackReviewItem
+KbFeedbackReviewResponse = _routes_kb_console.KbFeedbackReviewResponse
+kb_feedback_review = _routes_kb_console.kb_feedback_review
 KbEmbedRunItem = _routes_kb_console.KbEmbedRunItem
 KbDeptCoverageItem = _routes_kb_console.KbDeptCoverageItem
 KbFeedbackDay = _routes_kb_console.KbFeedbackDay
@@ -1933,12 +1950,15 @@ KbApprovalRequest = _routes_kb_console.KbApprovalRequest
 KbRetireRequest = _routes_kb_console.KbRetireRequest
 KbRetireResponse = _routes_kb_console.KbRetireResponse
 KbRestoreResponse = _routes_kb_console.KbRestoreResponse
+KbSetVisibilityRequest = _routes_kb_console.KbSetVisibilityRequest
+KbSetVisibilityResponse = _routes_kb_console.KbSetVisibilityResponse
 kb_upload_url = _routes_kb_console.kb_upload_url
 kb_register = _routes_kb_console.kb_register
 kb_approve = _routes_kb_console.kb_approve
 kb_reject = _routes_kb_console.kb_reject
 kb_retire = _routes_kb_console.kb_retire
 kb_restore = _routes_kb_console.kb_restore
+kb_set_visibility = _routes_kb_console.kb_set_visibility
 KbPendingItem = _routes_kb_console.KbPendingItem
 KbPendingResponse = _routes_kb_console.KbPendingResponse
 kb_pending_approvals = _routes_kb_console.kb_pending_approvals
@@ -1951,6 +1971,10 @@ KbAccessRequestItem = _routes_kb_access.KbAccessRequestItem
 KbAccessRequestListResponse = _routes_kb_access.KbAccessRequestListResponse
 KbAccessGrantItem = _routes_kb_access.KbAccessGrantItem
 KbAccessGrantListResponse = _routes_kb_access.KbAccessGrantListResponse
+KbAccessGrantCreate = _routes_kb_access.KbAccessGrantCreate
+KbAccessGrantCreateResponse = _routes_kb_access.KbAccessGrantCreateResponse
+KbVisibilityReader = _routes_kb_access.KbVisibilityReader
+KbVisibilityExplainResponse = _routes_kb_access.KbVisibilityExplainResponse
 KbAdminItem = _routes_kb_access.KbAdminItem
 KbAdminListResponse = _routes_kb_access.KbAdminListResponse
 KbAdminGrantRequest = _routes_kb_access.KbAdminGrantRequest
@@ -1961,6 +1985,8 @@ MyAccessRequestListResponse = _routes_kb_access.MyAccessRequestListResponse
 kb_access_request_submit = _routes_kb_access.kb_access_request_submit
 kb_access_requests_list = _routes_kb_access.kb_access_requests_list
 kb_access_grants_list = _routes_kb_access.kb_access_grants_list
+kb_access_grant_create = _routes_kb_access.kb_access_grant_create
+kb_visibility_explain = _routes_kb_access.kb_visibility_explain
 _APPROVAL_HISTORY_LIMIT = _routes_kb_access._APPROVAL_HISTORY_LIMIT
 _TZ_PACIFIC_TO_BJ = _routes_kb_access._TZ_PACIFIC_TO_BJ
 _parse_admin_target = _routes_kb_access._parse_admin_target

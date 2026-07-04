@@ -244,9 +244,13 @@ def _sanitize_ha3_filter_value(value: str) -> str:
 # 合法 ACL 权限组白名单（单一来源；H2 防御纵深）。
 # ⚠️ 语义：这些代码承载的是"ACL 权限组"，不是组织部门——一个组织部门可映射到多个组，
 # 映射见 dingtalk_identity._DEPT_NAME_TO_GROUPS。字段名沿用历史的 dept/owner_dept/user_dept。
+# 2026-07-03 扩容 5 组（用户拍板，映射见 dept_ancestry 锚表）：overseas=海外中心（自有组，
+# 叠加 production 可读）、audit=审计、legal=法务、engineering=工程、corn_eco=玉米环保。
+# 新组当日无 chunk：检索侧零影响，直到有文档以该 owner_dept 入库。
 _VALID_ACL_GROUPS = frozenset({
     "finance", "it", "marketing", "production",
     "pmc", "admin", "hr", "rd", "quality", "supply",
+    "overseas", "audit", "legal", "engineering", "corn_eco",
 })
 
 # ── Owner taxonomy (resource-side) vs user-facing ACL groups ──────────────────

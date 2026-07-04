@@ -17,18 +17,30 @@ export function unsupportedNames(files: Array<{ name: string }>): string[] {
   return files.filter((f) => !UPLOAD_EXTS.includes(extOf(f.name))).map((f) => f.name)
 }
 
-// 部门 ACL 组码 → 中文（owner_dept 存组码）。
+// 部门 ACL 组码 → 中文（owner_dept 存组码）。2026-07-03 扩容 5 组（与 retriever._VALID_ACL_GROUPS 同步）。
 export const GROUP_LABEL: Record<string, string> = {
-  finance: '财务', it: '信息技术', marketing: '营销', production: '生产', pmc: '计划PMC',
+  finance: '财务', it: '信息技术', marketing: '营销', production: '生产', pmc: '生产计划部',
   admin: '行政', hr: '人力资源', rd: '研发', quality: '品质技术', supply: '资材供应',
+  overseas: '海外', audit: '审计', legal: '法务', engineering: '工程', corn_eco: '玉米环保',
 }
-export const deptLabel = (code: string) => GROUP_LABEL[code] || code
+// 生产子线是合法 owner_dept（永不归并回 production）——只做展示映射，
+// 不并入 GROUP_LABEL：CONTRIB_DEPT_OPTS 以 GROUP_LABEL 的键为贡献归属选项，子线不应出现在下拉里。
+export const SUBDEPT_LABEL: Record<string, string> = {
+  production_mold: '生产·模具', production_paper_cup: '生产·纸杯', production_thermoforming: '生产·吸塑',
+}
+export const deptLabel = (code: string) => GROUP_LABEL[code] || SUBDEPT_LABEL[code] || code
 
 // 可见范围。
 export const PERM_LABEL: Record<string, string> = {
   dept_internal: '仅本部门', public: '全公司', restricted: '受限',
 }
 export const permLabel = (p: string) => PERM_LABEL[p] || p
+
+// 「谁能看到」解释器：读者来源 → 中文短标（与后端 KbVisibilityReader.via 对齐）。
+export const VIA_LABEL: Record<string, string> = {
+  owner: '归属部门', umbrella: '生产伞组', shared_policy: '营销共享面', grant: '跨部门授权',
+}
+export const viaLabel = (v: string) => VIA_LABEL[v] || v
 
 // 角色 → 中文。
 export const ROLE_LABEL: Record<string, string> = {
@@ -37,7 +49,7 @@ export const ROLE_LABEL: Record<string, string> = {
 
 // 文档状态徽章 → 色调键（组件据此取 st-* 颜色）。未命中 → muted。
 const BADGE_TONE: Record<string, string> = {
-  已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'warn',
+  已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'warn', 未入索引: 'warn',
   已隔离: 'fail', 处理失败: 'fail', 已驳回: 'fail', 已退役: 'muted', 内容未变: 'muted',
 }
 export const badgeTone = (badge: string) => BADGE_TONE[badge] || 'muted'
@@ -67,7 +79,7 @@ const QBADGE_TONE: Record<string, string> = {
 export const qBadgeTone = (s: string) => QBADGE_TONE[s] || 'queue'
 
 // 轮询终态：命中即停（含已退役，不含待审核——待审核要等人审，根本不轮询）。
-export const TERMINAL_BADGES = ['已上线', '处理失败', '已隔离', '已驳回', '内容未变', '已退役']
+export const TERMINAL_BADGES = ['已上线', '未入索引', '处理失败', '已隔离', '已驳回', '内容未变', '已退役']
 
 /**
  * 直传 OSS：fetch 无法上报上传进度，故用 XHR 接 upload.onprogress。File 必须留闭包、勿进 Vue 响应式

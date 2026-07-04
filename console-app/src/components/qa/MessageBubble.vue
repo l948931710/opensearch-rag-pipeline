@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { RotateCw, Headset, FileText, Sparkles } from 'lucide-vue-next'
+import { RotateCw, Headset, FileText, Sprout } from 'lucide-vue-next'
 import { useAsk, type ChatMessage } from '@/composables/useAsk'
 import AnswerBlocks from './AnswerBlocks.vue'
 import SourceList from './SourceList.vue'
@@ -26,7 +26,7 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
   <!-- AI（Atlas 式：左侧 30px 星标头像 + 内容列） -->
   <div v-else class="msg-row group/msg flex gap-3.5">
     <span class="mt-px grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-accent-strong" aria-hidden="true">
-      <Sparkles :size="16" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
+      <Sprout :size="16" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
     </span>
     <div class="min-w-0 flex-1 pt-0.5">
     <!-- 思考过程披露条（深度思考；仅当有 reasoning 时）：思考期独占显示，答案到来后收起置顶 -->

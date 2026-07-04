@@ -121,6 +121,68 @@ test.describe('UX 硬门 — AI 助手交互', () => {
       r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: [] }) }));
   });
 
+  test('流式双节点拆分：已定稿段落 DOM 不随后续吐字重建（Perf-5 硬门）', async ({ page }) => {
+    // route.fulfill 是一次性交付（done 即刻定稿，观察不到流式窗口）→ 在页内包 fetch，
+    // 用 ReadableStream 按 120ms 间隔逐帧下发，制造真实的多秒流式窗口。
+    await page.addInitScript(() => {
+      const orig = window.fetch.bind(window)
+      ;(window as any).fetch = (input: any, init?: any) => {
+        const url = typeof input === 'string' ? input : (input && input.url) || ''
+        if (!String(url).includes('/api/ask/stream')) return orig(input, init)
+        const frames = [
+          JSON.stringify({ type: 'chunk', content: '第一段内容确立事实基础，先渲染并定稿。\n\n' }),
+          ...Array.from({ length: 24 }, (_, i) => JSON.stringify({ type: 'chunk', content: `第二段持续输出第${i}词，` })),
+          JSON.stringify({ type: 'done' }),
+        ]
+        const enc = new TextEncoder()
+        const stream = new ReadableStream({
+          start(c) {
+            let i = 0
+            const t = setInterval(() => {
+              if (i >= frames.length) { clearInterval(t); c.enqueue(enc.encode('data: [DONE]\n\n')); c.close(); return }
+              c.enqueue(enc.encode(`data: ${frames[i++]}\n\n`))
+            }, 120)
+          },
+        })
+        return Promise.resolve(new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+      }
+    })
+    await page.goto(CHAT_ROUTE)
+    await page.getByTestId('chat-input').fill('请分两段回答')
+    await page.getByTestId('chat-send').click()
+    // 节点身份断言在【页内】同步采样（Playwright expect 轮询往返有百毫秒级延迟，三视口并行
+    // 时容易滑过流式窗口、采到定稿帧的合法重建）：第一段进 stable 段时给 <p> 打标记，
+    // 等尾段推进 ≥3 个采样帧后检查标记仍在同一节点上。
+    const verdict = await page.evaluate(async () => {
+      const deadline = Date.now() + 15000
+      let marked: any = null
+      let tailGrowth = 0
+      let lastTail = -1
+      while (Date.now() < deadline) {
+        const segs = Array.from(document.querySelectorAll('.md [data-seg]'))
+        if (segs.length >= 2) {
+          const p = segs[0].querySelector('p') as any
+          if (p && /第一段/.test(p.textContent || '')) {
+            if (!marked) { p.__mark = 1; marked = p }
+            const tailLen = segs[1].innerHTML.length
+            if (tailLen > lastTail) { if (lastTail >= 0) tailGrowth++; lastTail = tailLen }
+            const cur = segs[0].querySelector('p') as any
+            const alive = !!(cur && cur.__mark) && marked.isConnected
+            if (!alive) return { ok: false, why: 'stable 节点在流式期被重建', tailGrowth }
+            if (tailGrowth >= 3) return { ok: true, why: '', tailGrowth }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 60))
+      }
+      return { ok: false, why: '未观察到双节点流式窗口（split 未生效或流过快）', tailGrowth }
+    })
+    expect(verdict.ok, `已定稿段落节点在尾段推进期间必须原封未动：${verdict.why}`).toBe(true)
+    // 收尾定稿：回单节点权威渲染，全文完整、光标退场
+    await expect(page.locator('.md').last()).toContainText('第23词', { timeout: 20000 })
+    await expect(page.locator('.md.is-streaming')).toHaveCount(0, { timeout: 10000 })
+    await expect(page.locator('.md').last()).toContainText('第一段内容确立事实基础')
+  })
+
   test('流式输出过程中可停止', async ({ page }) => {
     // 慢响应:保持 asking=true 的窗口,期间发送按钮应切到「停止」(aria-label=停止)。
     await page.route('**/api/ask/stream', async (route) => {

@@ -9,8 +9,10 @@ export default defineConfig({
   fullyParallel: true,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
-    // 应用基址在 :5173;具体路由(/console/...)写在各 spec 的 ROUTE 常量里。
-    baseURL: process.env.BASE_URL ?? 'http://localhost:5173',
+    // 专用端口 5177（下方 webServer 自动拉起本树 dev server）。⚠️ 曾踩坑：此前默认 5173
+    // 且 webServer 注释掉 —— e2e 蹭的是环境里碰巧在跑的【另一份 checkout】的 dev server，
+    // 硬门测的根本不是被测代码。BASE_URL 仍可显式覆盖（联调真后端等场景）。
+    baseURL: process.env.BASE_URL ?? 'http://127.0.0.1:5177',
     screenshot: 'only-on-failure',
     trace: 'on-first-retry',
     video: 'retain-on-failure',
@@ -29,12 +31,13 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], viewport: { width: 1024, height: 768 } },
     },
   ],
-  // 可选:让 Playwright 自己拉起 dev server。已在外部起好就删掉这段。
-  // 注意:本项目前端走 /api 代理到 FastAPI:8000,非 mock 的用例还需后端在跑(make api)。
-  // webServer: {
-  //   command: 'npm run dev',
-  //   url: process.env.BASE_URL ?? 'http://localhost:5173',
-  //   reuseExistingServer: !process.env.CI,
-  //   timeout: 120_000,
-  // },
+  // e2e 永远测【本树】代码：专用端口 + 绝不复用外部 server（reuse 会蹭到别的 checkout）。
+  // 显式传 BASE_URL 时跳过自起（联调真后端/远端环境）。硬门 spec 全走 page.route mock，
+  // 不需要 FastAPI 后端。
+  webServer: process.env.BASE_URL ? undefined : {
+    command: 'npm run dev -- --port 5177 --host 127.0.0.1 --strictPort',
+    url: 'http://127.0.0.1:5177/console/',
+    reuseExistingServer: false,
+    timeout: 120_000,
+  },
 });

@@ -21,7 +21,7 @@ def test_leaf_depts_map_to_group_lists():
     assert _normalize_dept_to_codes("国内营销部") == ["marketing", "production"]
     assert _normalize_dept_to_codes("电子商务部") == ["marketing", "production"]
     assert _normalize_dept_to_codes("计划部") == ["marketing", "pmc"]
-    assert _normalize_dept_to_codes("资材部") == ["supply", "pmc"]
+    assert _normalize_dept_to_codes("资材部") == ["supply", "pmc", "production"]   # 2026-07-03 拍板：叠 production
     assert _normalize_dept_to_codes("行政部") == ["admin"]
     assert _normalize_dept_to_codes("人力资源部") == ["hr"]
     assert _normalize_dept_to_codes("技术部") == ["quality"]
@@ -96,10 +96,32 @@ def test_production_workshop_leaves_map_to_production():
 
 
 def test_zicaibu_under_production_keeps_supply_pmc():
-    # 资材部 结构上挂在生产中心下，但权限单口径属 [supply, pmc]——_DEPT_NAME_TO_GROUPS
-    # 精确映射优先，不得被生产子树伞组覆盖；且 资材部 不应出现在生产子树集合里。
-    assert _normalize_dept_to_codes("资材部") == ["supply", "pmc"]
+    # 资材部 结构上挂在生产中心下——_DEPT_NAME_TO_GROUPS 精确映射优先，不得被生产子树
+    # 伞组覆盖（2026-07-03 拍板后值 = [supply,pmc,production]，production 由精确映射
+    # 显式给出而非伞组兜底，故仍不进生产子树集合）。
+    assert _normalize_dept_to_codes("资材部") == ["supply", "pmc", "production"]
     assert "资材部" not in _PRODUCTION_WORKSHOP_DEPTS
+
+
+def test_new_units_20260703_decisions():
+    """2026-07-03 拍板批：海外自有组+production、总经办全可见（"*"哨兵展开）、
+    审计/法务/工程/玉米环保 各自有组；「其他」保持 fail-closed（有意仅 public）。"""
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    assert _normalize_dept_to_codes("海外中心") == ["overseas", "production"]
+    assert _normalize_dept_to_codes("印尼公司") == ["overseas", "production"]
+    assert _normalize_dept_to_codes("墨西哥公司") == ["overseas", "production"]
+    assert _normalize_dept_to_codes("审计部") == ["audit"]
+    assert _normalize_dept_to_codes("审计一部") == ["audit"]
+    assert _normalize_dept_to_codes("审计二部") == ["audit"]
+    assert _normalize_dept_to_codes("法务") == ["legal"]
+    assert _normalize_dept_to_codes("工程") == ["engineering"]
+    assert _normalize_dept_to_codes("玉米环保") == ["corn_eco"]
+    zjb = _normalize_dept_to_codes("总经办")
+    assert sorted(zjb) == sorted(_VALID_ACL_GROUPS) and "*" not in zjb   # 哨兵展开、绝不泄漏
+    assert _normalize_dept_to_codes("其他") == []
+    # 2026-07-04 拍板：财务中心挂点=双职能；「办公室」通用名刻意不进名字表（锚表 dept_id 键控）
+    assert _normalize_dept_to_codes("财务中心") == ["finance", "it"]
+    assert _normalize_dept_to_codes("办公室") == []
 
 
 def test_unknown_workshop_name_fail_closed():

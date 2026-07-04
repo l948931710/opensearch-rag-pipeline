@@ -7,6 +7,7 @@ import StatusDistBar from './StatusDistBar.vue'
 import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
 import LoadError from './LoadError.vue'
+import FeedbackReviewList from './FeedbackReviewList.vue'
 
 // 部门管理员「概览看板」= 本部门视角。/api/kb/stats 已按 managed owner_dept 作用域聚合，
 // 故资产/状态口径只覆盖本部门。「待审核」用 by_badge（= 我提交、待 kb_admin 放行的版本）。
@@ -91,6 +92,12 @@ const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用�
         这些问题命中了本部门文档却未能答好（拒答）—— 多为文档内容缺漏或表述不清，是最直接的补充/改进线索。
         <RouterLink to="/contribute" class="font-semibold text-accent-text transition hover:underline">去知识贡献补充 →</RouterLink>
       </p>
+    </section>
+
+    <!-- 差评复核：引用了本部门文档且被点踩的回答（文档质量 → 答案质量 的直接改进线索） -->
+    <section v-if="kbInsights">
+      <p :class="HEADER">差评复核 · 被点踩的回答（引用了本部门文档）</p>
+      <FeedbackReviewList />
     </section>
 
     <!-- 使用数据尚未就绪（端点未接入/加载中）→ 如实占位，不显 0 误导；真实失败（5xx）→ 错误条 + 重试 -->

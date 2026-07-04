@@ -55,8 +55,8 @@ function metaOf(r: ApprovalHistoryItem): string {
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题+计数，不再另设分区眉标 -->
   <section data-testid="approval-history">
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">审批历史</p>
     <LoadError class="mb-3" :message="loadErrors['approvalHistory']" @retry="loadApprovalHistory()" />
 
     <div class="overflow-hidden rounded-[15px] border border-border bg-card">

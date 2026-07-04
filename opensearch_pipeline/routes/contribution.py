@@ -419,6 +419,9 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
         logger.error("kb_contribution_submit 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"提交失败 (trace: {trace_id})")
     _gaps_cache_clear()   # 缺口的「等待入库」徽标即时可见，不等 TTL
+    # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：归属部门管理员即时知晓待审核贡献
+    from opensearch_pipeline.admin_notify import notify_contribution
+    notify_contribution(category_dept=category_dept, question=req.question)
     return KbContributionItem(
         contribution_id=cid, question=req.question.strip(), content=req.content.strip(),
         category_dept=category_dept, author_id=identity.user_id, author_name=identity.name or "",

@@ -2,7 +2,7 @@ import { computed, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import {
-  MAX_UPLOAD_MB, TERMINAL_BADGES, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
+  GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
 
 // 知识库管理台单例 store。身份/可管部门复用 P1 的 session（whoami 已给 managed_owner_depts），
@@ -13,6 +13,8 @@ export interface DocItem {
   permission_level: string; current_version_no: number; status: string
   status_badge: string; updated_at: string
   can_manage?: boolean   // 可操作（写作用域）；my-docs 恒 true，browse 全部门时外部门为 false
+  cited_count?: number | null   // 利用度：被引用问答数（null/undefined=数据不可用，0=真·从未被引用）
+  last_cited_at?: string        // 最近被引用时间（cited_count>0 时有值）
 }
 export interface PendingItem {
   doc_id: string; version_no: number; title: string; original_filename: string
@@ -122,13 +124,33 @@ const requestedDocIds = ref<Set<string>>(new Set())   // 乐观：本会话刚�
 const myAccessReqs = ref<Map<string, { status: string; sync_state: string }>>(new Map())
 const q = ref('')
 const filter = ref('')                 // status_badge 精确过滤；'' = 全部
+const permFilter = ref('')             // permission_level 精确过滤；'' = 全部
+const ownerFilter = ref('')            // owner_dept（含生产子线）精确过滤；'' = 全部
+const citedFilter = ref('')            // 利用度筛选：'' 全部 / 'never' 从未被引用（退役候选）/ 'used' 有引用
 const sortKey = ref<SortKey>('updated_at')
 const sortDir = ref<1 | -1>(-1)
+// 多选（批量操作）：选中的 doc_id 集合。仅对可管理(can_manage!==false)行有意义；筛选/换源时自动收敛。
+const selectedIds = ref<Set<string>>(new Set())
+const bulkBusy = ref(false)
+const bulkMsg = ref('')
 
 // 上传表单 / 状态
 const newTitle = ref('')
 const newOwner = ref('')
-const newPerm = ref('dept_internal')
+const newPerm = ref('dept_internal')          // dept_internal / shared（=dept_internal+主动授权）/ public / restricted
+const newShareDepts = ref<string[]>([])       // newPerm='shared' 时的共享目标组码
+// 主动共享弹窗（owner 侧）：把自己部门的 dept_internal 文档直接放行给指定部门（POST /api/kb/access-grants）。
+const shareCtx = ref<DocItem | null>(null)
+const shareBusy = ref(false)
+// 「谁能看到这篇文档」解释器弹窗（只读）：GET /api/kb/visibility-explain。
+const visCtx = ref<DocItem | null>(null)
+const visExplain = ref<VisExplain | null>(null)
+const visLoading = ref(false)
+const visErr = ref('')
+// 差评联动复核（看板卡片）：引用了我作用域文档的回答收到 👎。null=尚未加载（显占位不显 0）。
+const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
+// 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
+const SHARE_TARGETS = Object.keys(GROUP_LABEL)
 const verCtx = ref<VerCtx | null>(null)
 const uploadBusy = ref(false)
 const uploadMsg = ref('')
@@ -185,10 +207,82 @@ function sortDocs(list: DocItem[], key: SortKey, dir: 1 | -1): DocItem[] {
 }
 
 const filtered = computed(() =>
-  sortDocs(docs.value.filter((d) => !filter.value || d.status_badge === filter.value), sortKey.value, sortDir.value))
+  sortDocs(docs.value.filter((d) =>
+    (!filter.value || d.status_badge === filter.value)
+    && (!permFilter.value || d.permission_level === permFilter.value)
+    && (!ownerFilter.value || d.owner_dept === ownerFilter.value)
+    // 利用度：never=真·从未被引用（cited_count===0，退役候选）；used=有引用。
+    // 数据不可用（null/undefined，RAG_QA_FACT_JOIN 未开）两个档都不入——0 与「不知道」必须可区分。
+    && (!citedFilter.value || (citedFilter.value === 'never' ? d.cited_count === 0 : (d.cited_count ?? 0) > 0))
+  ), sortKey.value, sortDir.value))
+
+// 归属筛选选项 = 已加载文档里出现过的 owner_dept（含生产子线，如 production_mold）→ 覆盖"按子部门管理"。
+const ownerOptions = computed(() => Array.from(new Set(docs.value.map((d) => d.owner_dept).filter(Boolean))).sort())
 
 function countOf(badge: string): number {
   return badge ? docs.value.filter((d) => d.status_badge === badge).length : docs.value.length
+}
+
+// ── 多选 / 批量 ──────────────────────────────────────────────────
+// 当前可见【且可管理】的行（批量只作用于这些；外部门只读行不可批量操作）。
+const selectableVisible = computed(() => filtered.value.filter((d) => d.can_manage !== false))
+// 选中集与可见集的交集（筛选后自动收敛：切筛选/换源，隐藏行虽仍在 set 里但不参与操作/计数）。
+const selectedDocs = computed(() => selectableVisible.value.filter((d) => selectedIds.value.has(d.doc_id)))
+const selectedCount = computed(() => selectedDocs.value.length)
+const allVisibleSelected = computed(() =>
+  selectableVisible.value.length > 0 && selectedDocs.value.length === selectableVisible.value.length)
+function isSelected(id: string): boolean { return selectedIds.value.has(id) }
+function toggleSelect(id: string) {
+  const n = new Set(selectedIds.value)
+  if (n.has(id)) n.delete(id); else n.add(id)
+  selectedIds.value = n
+}
+function toggleSelectAllVisible() {
+  // 已全选可见 → 清空；否则把当前可见可管理行全选（不动隐藏行的既有选中）。
+  const n = new Set(selectedIds.value)
+  const vis = selectableVisible.value.map((d) => d.doc_id)
+  if (allVisibleSelected.value) vis.forEach((id) => n.delete(id))
+  else vis.forEach((id) => n.add(id))
+  selectedIds.value = n
+}
+function clearSelection() { selectedIds.value = new Set(); bulkMsg.value = '' }
+
+// 批量执行器：顺序跑（aux 限流 30/分，串行最稳）+ 进度回填 bulkMsg；失败隔离，末尾一次 loadDocs。
+async function _bulkRun(docsToRun: DocItem[], label: string,
+                        one: (d: DocItem) => Promise<string | null>): Promise<void> {
+  if (bulkBusy.value || !docsToRun.length) return
+  bulkBusy.value = true
+  let ok = 0; const fails: string[] = []
+  for (let i = 0; i < docsToRun.length; i++) {
+    bulkMsg.value = `${label}中… ${i + 1}/${docsToRun.length}`
+    const err = await one(docsToRun[i])
+    if (err) fails.push(`${docsToRun[i].title || docsToRun[i].doc_id}：${err}`); else ok++
+  }
+  bulkBusy.value = false
+  bulkMsg.value = `${label}完成：成功 ${ok}${fails.length ? `，失败 ${fails.length}` : ''}`
+  if (fails.length) alert(`${label}部分失败：\n` + fails.slice(0, 8).join('\n'))
+  if (ok) { clearSelectionKeepMsg(); void loadDocs() }   // 成功过 → 清选中 + 权威重拉
+}
+function clearSelectionKeepMsg() { selectedIds.value = new Set() }
+
+/** 批量退役（复用单篇 retire 端点，逐篇顺序）。调用方已二次确认。 */
+async function bulkRetire(): Promise<void> {
+  const targets = selectedDocs.value.filter((d) => d.status_badge !== '已退役')
+  await _bulkRun(targets, '退役', async (d) => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') { d.status_badge = '已退役'; return null }
+      await apiJson('/api/kb/retire', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id }) })
+      return null
+    } catch (e: any) { return e && e.status === 403 ? (e.detail || '无权退役') : uploadErrText(e) }
+  })
+}
+
+/** 批量改可见范围（复用 set-visibility；public 涉全公司需 kb_admin，调用方按角色限制选项）。 */
+async function bulkSetVisibility(level: string): Promise<void> {
+  const targets = selectedDocs.value.filter((d) => d.permission_level !== level)
+  // reload:false——逐篇重拉会 N+1 次全量列表；_bulkRun 批末统一一次权威 loadDocs
+  await _bulkRun(targets, '改可见范围', (d) => setVisibility(d, level, '批量调整', { reload: false }))
 }
 
 function sortBy(key: SortKey) {
@@ -221,8 +315,8 @@ async function loadDocs() {
     // DEV ?preview：注入 mock（含外部门 can_manage=false 行）以可视化全部门只读浏览；prod 死代码消除。
     if (import.meta.env.DEV && useSession().token === 'dev-preview') {
       const mine: DocItem[] = [
-        { doc_id: 'm1', title: '营销物料使用规范 v3', original_filename: 'guideline.pdf', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 3, status: 'active', status_badge: '已上线', updated_at: '2026-06-26 10:00', can_manage: true },
-        { doc_id: 'm2', title: '品牌 VI 手册', original_filename: 'vi.pdf', owner_dept: 'marketing', permission_level: 'public', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '2026-06-20 09:00', can_manage: true },
+        { doc_id: 'm1', title: '营销物料使用规范 v3', original_filename: 'guideline.pdf', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 3, status: 'active', status_badge: '已上线', updated_at: '2026-06-26 10:00', can_manage: true, cited_count: 12, last_cited_at: '2026-07-02 09:12' },
+        { doc_id: 'm2', title: '品牌 VI 手册', original_filename: 'vi.pdf', owner_dept: 'marketing', permission_level: 'public', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '2026-06-20 09:00', can_manage: true, cited_count: 0 },
         { doc_id: 'm3', title: '618 活动复盘', original_filename: '618.docx', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 2, status: 'active', status_badge: '处理中', updated_at: '2026-06-25 14:00', can_manage: true },
       ]
       const foreign: DocItem[] = [
@@ -262,7 +356,8 @@ async function loadMoreDocs() {
 function setScope(s: 'managed' | 'all') {
   if (docScope.value === s) return
   docScope.value = s
-  filter.value = ''
+  filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''
+  selectedIds.value = new Set(); bulkMsg.value = ''   // 换源清空选中（旧 doc_id 不再可见）
   void loadDocs()
   if (s === 'all') void loadMyAccessRequests()   // 全部门浏览：回灌我的申请态以渲染 申请授权/审批中/同步中/已放行
 }
@@ -524,9 +619,11 @@ async function uploadSingle(file: File) {
   uploadBusy.value = true
   try {
     const isVer = !!verCtx.value
+    // 「指定部门」模式：登记仍是 dept_internal（可见度基线），随后经主动共享端点放行所选部门。
+    const shared = !isVer && newPerm.value === 'shared'
     const body = isVer
       ? { action: 'version', doc_id: verCtx.value!.doc_id, owner_dept: verCtx.value!.owner_dept, permission_level: verCtx.value!.permission_level, filename: file.name, title: newTitle.value || undefined }
-      : { action: 'new', filename: file.name, owner_dept: newOwner.value, permission_level: newPerm.value, title: newTitle.value || undefined }
+      : { action: 'new', filename: file.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value, title: newTitle.value || undefined }
     uploadMsg.value = '申请上传地址…'
     const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify(body) })
     uploadMsg.value = '上传文件到 OSS… 0%'
@@ -534,7 +631,13 @@ async function uploadSingle(file: File) {
     uploadMsg.value = '登记…'
     const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
     uploadOk.value = true
-    uploadMsg.value = `已提交：${r.title || file.name} v${r.version_no}（${r.status_badge}${r.requires_kb_admin_approval ? '，待审批' : ''}）`
+    let shareNote = ''
+    if (shared && newShareDepts.value.length) {
+      // 共享失败不判上传失败：文档已在库，提示可去台账「共享」补做。文案以响应 granted/skipped 为准。
+      try { shareNote = shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value])) }
+      catch { shareNote = '；共享设置失败，可稍后在台账点「共享」重试' }
+    }
+    uploadMsg.value = `已提交：${r.title || file.name} v${r.version_no}（${r.status_badge}${r.requires_kb_admin_approval ? '，待审批' : ''}）${shareNote}`
     contentDupMsg.value = buildDupMsg(r.content_dups, r.content_dups_other)
     newTitle.value = ''; dupWarn.value = ''; selectedFiles = []; selectedNames.value = []
     if (isVer) exitVersionMode()
@@ -557,16 +660,22 @@ async function uploadBatch(files: File[]) {
   uploadBusy.value = true
   let okN = 0, badN = 0
   // 单文件全流程（三步顺序不变）；异常只落到本行——与原串行版一致的失败隔离，其余文件照常。
+  const shared = newPerm.value === 'shared'   // 「指定部门」模式对批量同样生效（每文件登记后放行同一组目标）
   const uploadOne = async (i: number) => {
     const f = files[i], row = rows[i]
     if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; return }
     try {
       row.status = '上传中'
-      const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify({ action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: newPerm.value }) })
+      const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify({ action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value }) })
       await putWithProgress(u.put_url, f, (pct) => { row.pct = pct; row.msg = `${pct}%` }, u.content_type)
       row.status = '登记中'; row.msg = ''
       const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
       row.status = '已提交'; row.msg = `v${r.version_no}（${r.status_badge}）`
+      if (shared && newShareDepts.value.length) {
+        // refresh:false：并发 worker 逐文件刷清单会互相覆盖+烧 aux 限流，批末统一拉一次
+        try { row.msg += shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value], '', { refresh: false })).replace(/^，/, ' · ') }
+        catch { row.msg += ' · 共享失败可稍后重试' }
+      }
       const dm = buildDupMsg(r.content_dups, r.content_dups_other); if (dm) row.dupMsg = dm
       okN++
     } catch (e: any) { row.status = '失败'; row.msg = uploadErrText(e); badN++ }
@@ -578,6 +687,7 @@ async function uploadBatch(files: File[]) {
   uploadBusy.value = false
   uploadMsg.value = `${okN} 成功${badN ? `，${badN} 失败/跳过` : ''}`
   void loadDocs(); void loadApprovals(true)   // force：批量里可能有待审批单
+  if (shared && okN) void loadAccessGrants()  // 批末一次权威刷新（逐文件已抑制）
 }
 
 function doUpload() {
@@ -660,7 +770,10 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
 }
 
 // 已授权清单（审批人侧 · approved 存量）：后端 /api/kb/access-grants 未上线 → 静默兜底空；DEV ?preview 注入 mock。
+// grantsSeq 竞态守卫（同 docsSeq）：批量上传的并发 worker 各自触发刷新时，仅最新一次落地，防旧响应覆盖新清单。
+let grantsSeq = 0
 async function loadAccessGrants() {
+  const seq = ++grantsSeq
   const s = useSession()
   if (!s.identity?.canManage) { accessGrants.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -673,8 +786,9 @@ async function loadAccessGrants() {
   clearLoadError('accessGrants')
   try {
     const r = await apiJson<{ items: AccessGrantItem[] }>('/api/kb/access-grants', { auth: true })
+    if (seq !== grantsSeq) return          // 竞态守卫：仅最新结果落地
     accessGrants.value = r.items || []
-  } catch (e) { accessGrants.value = []; noteLoadError('accessGrants', e) }   // 404（未上线）静默；5xx 显错
+  } catch (e) { if (seq === grantsSeq) { accessGrants.value = []; noteLoadError('accessGrants', e) } }   // 404（未上线）静默；5xx 显错
 }
 
 // 撤销【已批准】的跨部门授权（approved→revoked）：后端同事务收窄 allowed_depts 投影 + 标脏，stage-3 收回放行。
@@ -687,6 +801,170 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
       await loadAccessGrants()
     } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) }
   })
+}
+
+// ── 主动共享（owner 侧，多部门可见度）───────────────────────────────────────
+// 被动申请流（submit→approve）的主动式对偶：文档所属部门管理员直接放行指定部门，
+// 后端直插 approved 行并复用 Phase D 投影；撤销/清单/审批历史与被动流同一套。
+interface GrantCreateResp { doc_id: string; granted: string[]; skipped: string[]; ok: boolean }
+
+// 差评联动复核（与后端 KbFeedbackReviewItem 对齐；question 已服务端 PII 脱敏）。
+export interface FeedbackDocRef { doc_id: string; title: string; owner_dept: string }
+export interface FeedbackReviewItem { message_id: string; question: string; created_at: string; docs: FeedbackDocRef[] }
+
+/** 拉差评复核队列（看板卡片）：失败静默兜底空 + loadErrors 显错可重试。 */
+async function loadFeedbackReview() {
+  const s = useSession()
+  if (!s.identity?.canManage) { feedbackReview.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    feedbackReview.value = [
+      { message_id: 'fb1', question: '2oz 纸杯的收缩率标准是多少？', created_at: '2026-07-03 14:20',
+        docs: [{ doc_id: 'D1', title: '纸杯工艺参数表', owner_dept: 'production' }] },
+      { message_id: 'fb2', question: '出口美国的 FDA 检测周期？', created_at: '2026-07-02 09:11',
+        docs: [{ doc_id: 'D2', title: '出口检测流程 SOP', owner_dept: 'marketing' }, { doc_id: 'D3', title: '认证台账', owner_dept: 'marketing' }] },
+    ]
+    return
+  }
+  clearLoadError('feedbackReview')
+  try {
+    const r = await apiJson<{ items: FeedbackReviewItem[] }>('/api/kb/feedback-review', { auth: true })
+    feedbackReview.value = r.items || []
+  } catch (e) { feedbackReview.value = feedbackReview.value ?? []; noteLoadError('feedbackReview', e) }
+}
+
+// 「谁能看到这篇文档」解释器响应（与后端 KbVisibilityExplainResponse 对齐；判定与检索同源）。
+export interface VisReader { dept: string; via: 'owner' | 'umbrella' | 'shared_policy' | 'grant' }
+export interface VisExplain {
+  doc_id: string; owner_dept: string; permission_level: string
+  everyone: boolean; nobody: boolean; quarantined: boolean; active: boolean
+  readers: VisReader[]
+}
+
+/** 打开「谁能看到」弹窗并拉取解释（只读；失败在弹窗内显示错误）。 */
+async function openVisibility(d: DocItem): Promise<void> {
+  visCtx.value = d
+  visExplain.value = null
+  visErr.value = ''
+  visLoading.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') {
+      visExplain.value = {
+        doc_id: d.doc_id, owner_dept: d.owner_dept, permission_level: d.permission_level,
+        everyone: d.permission_level === 'public', nobody: d.permission_level === 'restricted',
+        quarantined: false, active: true,
+        readers: d.permission_level === 'dept_internal'
+          ? [{ dept: d.owner_dept, via: 'owner' }, { dept: 'hr', via: 'grant' }] : [],
+      }
+      return
+    }
+    visExplain.value = await apiJson<VisExplain>(
+      `/api/kb/visibility-explain?doc_id=${encodeURIComponent(d.doc_id)}`, { auth: true })
+  } catch (e: any) {
+    visErr.value = e && e.status === 403 ? (e.detail || '无权查看该文档的可见范围明细') : uploadErrText(e)
+  } finally { visLoading.value = false }
+}
+function closeVisibility() { visCtx.value = null; visExplain.value = null; visErr.value = '' }
+
+/** 该文档现行已放行的组码集合（含被动流 CSV 行拆分）——驱动弹窗「已共享」与台账副行计数。 */
+// O(1) 记忆化（perf）：accessGrants 变更才重算一次。此前 grantedDeptsOf 每次调用全量扫
+// grants + CSV 拆分，DocTable 模板每行调 4 次 → 每次重渲染 O(rows×4×grants)，
+// 搜索框逐键/勾选切换都全量重算——grants 一多就卡。
+const grantedDeptsByDoc = computed(() => {
+  const m = new Map<string, string[]>()
+  const sets = new Map<string, Set<string>>()
+  for (const g of accessGrants.value) {
+    let s = sets.get(g.doc_id)
+    if (!s) { s = new Set(); sets.set(g.doc_id, s) }
+    for (const p of String(g.requester_dept || '').split(',')) { const c = p.trim(); if (c) s.add(c) }
+  }
+  for (const [id, s] of sets) m.set(id, [...s].sort())
+  return m
+})
+// 组码 → 中文标签的行级缓存（DocTable 副行直接 .get() O(1)）。
+const grantedLabelsByDoc = computed(() => {
+  const m = new Map<string, string[]>()
+  for (const [id, codes] of grantedDeptsByDoc.value) m.set(id, codes.map(deptLabel))
+  return m
+})
+
+function grantedDeptsOf(docId: string): string[] {
+  return grantedDeptsByDoc.value.get(docId) || []
+}
+
+/** 该文档的授权行（供弹窗逐行撤销）。 */
+function docGrantRows(docId: string): AccessGrantItem[] {
+  return accessGrants.value.filter((g) => g.doc_id === docId)
+}
+
+function openShare(d: DocItem) { shareCtx.value = d }
+function closeShare() { if (!shareBusy.value) shareCtx.value = null }
+
+/** 直接放行：POST /api/kb/access-grants；成功后刷新已授权清单（弹窗/台账随之更新）。
+ * opts.refresh=false 供批量路径抑制逐次刷新（批末统一拉一次，防 N 并发 GET 互相覆盖+烧限流）。 */
+async function createGrants(docId: string, depts: string[], reason = '',
+                            opts: { refresh?: boolean } = {}): Promise<GrantCreateResp | null> {
+  if (!depts.length) return null
+  const r = await apiJson<GrantCreateResp>('/api/kb/access-grants', {
+    method: 'POST', auth: true,
+    body: JSON.stringify({ doc_id: docId, target_depts: depts, ...(reason ? { reason } : {}) }),
+  })
+  if (opts.refresh !== false) void loadAccessGrants()
+  return r
+}
+
+/** 共享结果如实文案：以后端 granted/skipped 为准——skipped（归属自身/伞下冗余/已覆盖）
+ * 没有写任何授权行，不能再按请求数报「已共享 N 部门」。 */
+function shareResultNote(gr: GrantCreateResp | null): string {
+  if (!gr) return ''
+  const g = gr.granted?.length || 0, s = gr.skipped?.length || 0
+  if (g && s) return `，已共享 ${g} 部门（${s} 个已覆盖跳过）`
+  if (g) return `，已共享 ${g} 部门`
+  if (s) return `，${s} 个目标已覆盖无需新授权`
+  return ''
+}
+
+/** 弹窗提交：共享 shareCtx 文档给所选部门。返回 null=成功关闭；string=错误/提示文案（弹窗内联显示）。
+ * 全部目标被后端跳过（伞组/共享面本就可读）→ 不关弹窗、如实提示——不能让用户以为写了授权。 */
+async function submitShare(depts: string[], reason: string): Promise<string | null> {
+  const d = shareCtx.value
+  if (!d || !depts.length) return '请选择要共享的部门'
+  shareBusy.value = true
+  try {
+    const r = await createGrants(d.doc_id, depts, reason)
+    if (r && !r.granted?.length && r.skipped?.length) {
+      return `所选部门本就可读该文档（生产伞组/营销共享面覆盖），无需新增授权：${r.skipped.map(deptLabel).join('、')}`
+    }
+    shareCtx.value = null
+    return null
+  } catch (e: any) {
+    return e && e.status === 403 ? (e.detail || '无权共享该文档') : uploadErrText(e)
+  } finally { shareBusy.value = false }
+}
+
+/** 重设基础可见范围（dept_internal / public / restricted）：POST /api/kb/set-visibility。
+ * 成功后即时反映行的 permission_level + 权威 loadDocs 纠正徽章（restricted 会离开检索）。
+ * opts.reload=false 供批量路径抑制逐篇重拉（_bulkRun 批末已有一次权威 loadDocs——否则
+ * N 篇 = N+1 次全量列表拉取，烧 aux 限流且批中列表反复重置分页/闪动）。
+ * 返回 null=成功；string=错误文案。 */
+async function setVisibility(d: DocItem, level: string, reason = '',
+                             opts: { reload?: boolean } = {}): Promise<string | null> {
+  return withInflight(`vis:${d.doc_id}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') { d.permission_level = level; return null }
+      await apiJson('/api/kb/set-visibility', {
+        method: 'POST', auth: true,
+        body: JSON.stringify({ doc_id: d.doc_id, permission_level: level, ...(reason ? { reason } : {}) }),
+      })
+      d.permission_level = level                     // 乐观即时反映
+      if (opts.reload !== false) void loadDocs()     // 权威纠正（restricted→可能掉出列表/改徽章）
+      return null
+    } catch (e: any) {
+      return e && e.status === 403 ? (e.detail || '无权修改该文档可见范围')
+        : e && e.status === 409 ? (e.detail || '该文档非在线状态') : uploadErrText(e)
+    }
+  }) as Promise<string | null>
 }
 
 // 审批历史（只读聚合）：后端按角色作用域 —— dept_admin 见本部门 access+contribution、kb_admin 见全库四类。
@@ -815,14 +1093,20 @@ export function useKb() {
 
   return {
     // 状态
-    docs, filtered, approvals, accessRequests, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir,
-    newTitle, newOwner, newPerm, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
+    docs, filtered, approvals, accessRequests, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir,
+    // 多选 / 批量
+    selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
+    newTitle, newOwner, newPerm, newShareDepts, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
+    shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
     ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory, loadErrors,
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
+    openShare, closeShare, submitShare, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
+    visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
+    feedbackReview, loadFeedbackReview,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
@@ -834,8 +1118,10 @@ export function useKb() {
 export function __resetKb() {
   docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
-  q.value = ''; filter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
-  newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; verCtx.value = null
+  q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
+  selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''
+  newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; newShareDepts.value = []; verCtx.value = null
+  shareCtx.value = null; shareBusy.value = false
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []
   inflight.value = new Set(); retireBusy.value = false

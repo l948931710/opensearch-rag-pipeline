@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.qa_logger import _op_db
-from opensearch_pipeline.reindex_states import ChunkIndexStatus
+from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus, sql_in_list
 from opensearch_pipeline.request_context import get_request_id
 
 # api 驻留共享件（模型/助手/依赖）。from-import 拷贝绑定在这里是安全的：
@@ -97,6 +97,33 @@ def kb_org_tree(request: Request, identity: Optional[Identity] = Depends(current
     )
 
 
+def _kb_usage_enrich(cur, doc_ids):
+    """页内文档的利用度：doc_id → (被引用问答数, 最近被引用时间)。
+
+    仅在 qa_facts.fact_join_enabled()（RAG_QA_FACT_JOIN 开 + qa_retrieved_doc 表探测通过）
+    时启用——索引点查，页内 ≤50 个 id 一次聚合，成本恒定。不走 JSON_TABLE 回退：那要
+    全表展开 qa_session_log 才能按 doc 过滤，不适合每次列表加载都付。
+    返回 None=数据不可用（flag 关/表缺/查询失败 → cited_count=None，前端不显示）；
+    返回 dict=查询成功（缺席的 doc = 0 次，真·从未被引用）——0 与「不知道」必须可区分。
+    fail-open：任何异常绝不影响台账主查询。"""
+    if not doc_ids:
+        return {}
+    try:
+        from opensearch_pipeline.qa_facts import FACT_TABLE, fact_join_enabled
+        if not fact_join_enabled():
+            return None
+        ph = ",".join(["%s"] * len(doc_ids))
+        cur.execute(
+            f"SELECT jt.doc_id, COUNT(DISTINCT jt.message_id), MAX(jt.created_at) "
+            f"FROM {_op_db()}.{FACT_TABLE} jt "
+            f"WHERE jt.cited=1 AND jt.doc_id IN ({ph}) GROUP BY jt.doc_id",
+            tuple(doc_ids))
+        return {r[0]: (int(r[1] or 0), str(r[2] or "")) for r in (cur.fetchall() or [])}
+    except Exception as e:   # noqa: BLE001
+        logger.debug("利用度 enrich 失败（fail-open）: %s", e)
+        return None
+
+
 @router.get("/api/kb/my-docs", response_model=KbMyDocsResponse)
 def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                identity: Optional[Identity] = Depends(current_identity)):
@@ -127,7 +154,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
-                           v.content_process_status, v.index_status, v.publish_status
+                           v.content_process_status, v.index_status, v.publish_status,
+                           v.chunk_status
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -138,6 +166,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     (*params, *search_params, limit + 1, offset),
                 )
                 rows = cur.fetchall()
+                usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
         finally:
             conn.close()
     except HTTPException:
@@ -150,13 +179,16 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
+        _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs),
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
+            cited_count=(None if usage is None else (_u[0] if _u else 0)),
+            last_cited_at=(_u[1] if _u else ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
 
@@ -212,7 +244,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
-                           v.content_process_status, v.index_status, v.publish_status
+                           v.content_process_status, v.index_status, v.publish_status,
+                           v.chunk_status
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -225,6 +258,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     (*owner_params, *search_params, limit + 1, offset),
                 )
                 rows = cur.fetchall()
+                usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
         finally:
             conn.close()
     except HTTPException:
@@ -237,14 +271,17 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
+        _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", permission_level=perm or "dept_internal",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs),
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
             can_manage=_kb_can_manage(kb, owner or ""),
+            cited_count=(None if usage is None else (_u[0] if _u else 0)),
+            last_cited_at=(_u[1] if _u else ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
 
@@ -534,6 +571,97 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
         raise HTTPException(status_code=500, detail=f"洞察查询失败 (trace: {trace_id})")
     if fails == 0:   # 降级响应（部分子查询失败）不缓存——下一请求重试取全量
         _dashboard_cache_put(cache_key, out)
+    return out
+
+
+class KbFeedbackDocRef(BaseModel):
+    doc_id: str = ""
+    title: str = ""
+    owner_dept: str = ""
+
+
+class KbFeedbackReviewItem(BaseModel):
+    message_id: str = ""
+    question: str = ""                  # 已 PII 脱敏（他人原始提问，与 gap_queries 同纪律）
+    created_at: str = ""                # 差评时间
+    docs: List[KbFeedbackDocRef] = Field(default_factory=list)   # 该回答引用的【作用域内】文档
+
+
+class KbFeedbackReviewResponse(BaseModel):
+    scope: str = "dept"
+    window_days: int = _KB_INSIGHTS_WINDOW_DAYS
+    items: List[KbFeedbackReviewItem] = Field(default_factory=list)
+
+
+@router.get("/api/kb/feedback-review", response_model=KbFeedbackReviewResponse)
+def kb_feedback_review(request: Request, limit: int = 20,
+                       identity: Optional[Identity] = Depends(current_identity)):
+    """差评联动复核队列（只读）：引用了我作用域文档的回答收到 👎 → 逐条列出
+    （脱敏提问 + 涉及的本部门文档）——「文档质量 → 答案质量」最直接的改进线索。
+
+    归属链与 insights 同源（qa_docs_join_sql cited=1：差评回答【实际引用】了谁的文档，
+    谁来复核）；dept_admin 只见涉本部门文档的差评，kb_admin 全库。空=近窗口无差评；
+    连接级失败诚实 500。同一回答多条差评（schema/016 去重前）在按 message 分组时自然合并。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    win = _KB_INSIGHTS_WINDOW_DAYS
+    limit = max(1, min(limit, 50))
+    cache_key = ("fb_review",
+                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL",
+                 win, limit)
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    out = KbFeedbackReviewResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"),
+                                   window_days=win)
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        from opensearch_pipeline.qa_facts import qa_docs_join_sql
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 平铺 (message, doc) 行，Python 侧按 message 分组保序（GROUP_CONCAT 拼结构太脆）。
+                # LIMIT 300 行 ≈ 数十条差评 × 引用文档数，上限后截 limit 条消息。
+                cur.execute(
+                    "SELECT f.message_id, f.created_at, q.question, m.doc_id, m.title, m.owner_dept"
+                    f" FROM {_op_db()}.user_feedback f"
+                    f" JOIN {_op_db()}.qa_session_log q ON q.message_id = f.message_id"
+                    + qa_docs_join_sql(cited=True)
+                    + " WHERE f.feedback_type='downvote'"
+                    "   AND f.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    + (" " + scope_clause if scope_clause else "")
+                    + " ORDER BY f.created_at DESC, f.message_id LIMIT 300",
+                    tuple([win] + scope_params))
+                rows = cur.fetchall() or []
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_feedback_review 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"差评复核查询失败 (trace: {trace_id})")
+
+    from opensearch_pipeline import contribution as _C
+    by_msg: Dict[str, KbFeedbackReviewItem] = {}
+    for (mid, created, question, doc_id, title, owner) in rows:
+        it = by_msg.get(mid)
+        if it is None:
+            if len(by_msg) >= limit:
+                continue
+            # 跨用户展示：他人原始提问无条件 PII 脱敏（与 insights.gap_queries 同一纪律）
+            it = KbFeedbackReviewItem(message_id=str(mid),
+                                      question=_C.redact_query_text(str(question or "")),
+                                      created_at=str(created or ""))
+            by_msg[mid] = it
+        if doc_id and all(d.doc_id != doc_id for d in it.docs):
+            it.docs.append(KbFeedbackDocRef(doc_id=str(doc_id), title=str(title or ""),
+                                            owner_dept=str(owner or "")))
+    out.items = list(by_msg.values())
+    _dashboard_cache_put(cache_key, out)
     return out
 
 
@@ -1134,6 +1262,20 @@ class KbRestoreResponse(BaseModel):
     note: str = ""
 
 
+class KbSetVisibilityRequest(BaseModel):
+    doc_id: str
+    permission_level: str            # dept_internal / public / restricted（受 sanitize）
+    reason: Optional[str] = None
+
+
+class KbSetVisibilityResponse(BaseModel):
+    doc_id: str = ""
+    permission_level: str = ""
+    changed: bool = False
+    already: bool = False
+    note: str = ""
+
+
 @router.post("/api/kb/upload-url", response_model=KbUploadUrlResponse)
 def kb_upload_url(req: KbUploadUrlRequest, request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
@@ -1407,6 +1549,11 @@ def kb_register(req: KbRegisterRequest, request: Request,
     except Exception as e:
         logger.error("kb_register 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"登记失败 (trace: {trace_id})")
+    # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：进了待审批队列就
+    # 即时告知 kb_admin——否则全靠人主动开控制台，公开件在队列里干等。
+    if requires_approval:
+        from opensearch_pipeline.admin_notify import notify_upload_approval
+        notify_upload_approval(owner_dept=owner, title=payload.get("title") or payload.get("filename") or doc_id)
     # 跨部门内容查重（按 ETag 字节指纹）：advisory，命中也不拦上传——仅在响应里提示，让上传者决定是否退役其一。
     # 升版（同 doc_id 换文件）天然不算重复，故仅新建查；fail-open。
     dups, dups_other = ([], 0)
@@ -1584,6 +1731,23 @@ def kb_retire(req: KbRetireRequest, request: Request,
         note="已申请退役：已标记下线、停止作为升版目标；从检索彻底移除将在下次维护完成（本操作可逆）")
 
 
+def _assert_version_not_quarantined(cur, doc_id: str, version_no: int) -> None:
+    """安全隔离防线（restore / set-visibility 共用）：spot_checker/cost_breaker 的追溯隔离只写
+    document_version（publish_status='QUARANTINED' / gate_status='quarantined'）+ 停 chunk
+    （is_active=0），document_meta.status 仍是 'active'、permission_level 被收紧为 'restricted'——
+    在本文件各 guard 眼里与普通"受限/下线"文档不可区分。恢复类分支若盲目重激活
+    （is_active=1 + NOT_INDEXED），stage-3 drain 无隔离过滤，会把未脱敏 chunk 重嵌重推 HA3 → PII 泄漏。
+    故隔离版本一律 409：唯一出路是脱敏重灌（derivative pipeline），不是控制台改可见度/恢复。"""
+    cur.execute(f"SELECT publish_status, gate_status FROM {_kb_db()}.document_version "
+                "WHERE doc_id=%s AND version_no=%s", (doc_id, version_no))
+    vrow = cur.fetchone()
+    if vrow and (str(vrow[0] or "").upper() == "QUARANTINED"
+                 or str(vrow[1] or "").lower() == "quarantined"):
+        raise HTTPException(
+            status_code=409,
+            detail="该文档处于安全隔离（PII/敏感内容），不能经可见范围/恢复操作重新上线；请走脱敏重灌流程")
+
+
 @router.post("/api/kb/restore", response_model=KbRestoreResponse)
 def kb_restore(req: KbRetireRequest, request: Request,
                identity: Optional[Identity] = Depends(current_identity)):
@@ -1626,6 +1790,8 @@ def kb_restore(req: KbRetireRequest, request: Request,
                     conn.commit()       # 幂等：已在线 → 直接回既有态
                     return KbRestoreResponse(doc_id=req.doc_id, restored=False, already=True,
                                              note="该文档已是在线状态")
+                # 退役→恢复 不能成为隔离文档复活通道（隔离 chunk is_active=0 会被下面的重激活扫中）
+                _assert_version_not_quarantined(cur, req.doc_id, cur_ver)
                 cur.execute(f"UPDATE {_kb_db()}.document_meta SET status='active', updated_at=NOW() "
                             "WHERE doc_id=%s", (req.doc_id,))
                 cur.execute(f"UPDATE {_kb_db()}.document_version SET status='active', updated_at=NOW() "
@@ -1648,6 +1814,144 @@ def kb_restore(req: KbRetireRequest, request: Request,
     return KbRestoreResponse(
         doc_id=req.doc_id, restored=True,
         note="已恢复上线：重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复")
+
+
+@router.post("/api/kb/set-visibility", response_model=KbSetVisibilityResponse)
+def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
+                      identity: Optional[Identity] = Depends(current_identity)):
+    """重设【已上线】文档的基础可见范围（dept_internal / public / restricted），无需重新上传。
+
+    被动申请流/主动共享改的是【跨部门授权】(allowed_depts)；本端点改的是文档【自身的基础级别】——
+    两者正交，均汇入同一 Phase D 投影。授权（与 retire/restore 同款不对称）：
+      - _kb_can_manage(owner_dept)（dept_admin 限 managed，kb_admin 全权）；
+      - **涉及 public 需 kb_admin**：目标=public（放宽到全公司）或当前=public（收窄影响全公司可见的文档）
+        时，dept_admin 一律 403——与"上传公开需审批"同一不对称。dept_admin 只能在
+        dept_internal ↔ restricted 之间调本部门文档。
+
+    各方向语义（与 spot_checker 收紧 / retire 下线 / restore 重推 同款机制，绝不新造）：
+      - → restricted（归档下线）：停用【全部活跃版本】chunk（与 retire 同款，收掉双版本残留）+
+        全版本喂 PENDING_DELETE outbox（stage-3 每轮 reconcile_pending_deletes 自动删 HA3）。
+      - restricted → dept_internal/public（重新上线）：重新激活当前版本 chunk + 标脏 NOT_INDEXED
+        （stage-3 重推），并撤销当前版本挂着的 PENDING_DELETE/DELETED（防 reconcile 撤销重上线）。
+      - public ↔ dept_internal（均在检索内）：仅改级别 + 标脏重推，让 HA3 chunk 带上新 permission_level。
+    并同步 chunk_meta.permission_level（检索/gate 读的去规范化副本），再经 materialize 重算 allowed_depts
+    （dept_internal→投影 approved 授权；public/restricted→gate 清空）。RAG_ALLOWED_DEPTS_ACL 关时投影为
+    no-op（仅改 RDS 元数据，dev/test 安全）；提交后失效 deny 缓存。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    # 显式管理动作：严格校验原值（别名 internal/private→dept_internal），未知/垃圾直接 400——不走
+    # normalize_permission_level 的 fail-closed→restricted（那是 ingest 启发式路径），避免一个笔误静默归档文档。
+    target = (req.permission_level or "").strip().lower()
+    target = {"internal": "dept_internal", "private": "dept_internal"}.get(target, target)
+    if target not in ("dept_internal", "public", "restricted"):
+        raise HTTPException(status_code=400, detail="非法可见范围（须为 仅本部门 / 全公司 / 受限）")
+    assert_metadata_write_allowed("kb_set_visibility", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    owner_dept = cur_perm = ""
+    cur_ver = 1
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, cur_perm = (row[0] or ""), (row[1] or "")
+                status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权修改该文档（owner_dept 不在管理范围）")
+                # public 涉及全公司可见 → 收窄/放宽均需 kb_admin（与 retire/restore/上传同款不对称）
+                if (target == "public" or cur_perm == "public") and kb.role != ROLE_KB_ADMIN:
+                    raise HTTPException(status_code=403, detail="涉及全公司公开的可见范围变更需知识库管理员操作")
+                if str(status).lower() != "active":
+                    raise HTTPException(status_code=409, detail="该文档非在线状态，请先恢复上线后再改可见范围")
+                # 隔离文档（status 仍 'active'、级别被隔离流程收紧为 restricted）绝不能经本端点
+                # "改回 dept_internal/public" 复活——那会把未脱敏 chunk 重新送进 stage-3 → HA3。
+                _assert_version_not_quarantined(cur, req.doc_id, cur_ver)
+                if cur_perm == target:
+                    conn.commit()       # 幂等：级别未变
+                    return KbSetVisibilityResponse(doc_id=req.doc_id, permission_level=target,
+                                                   changed=False, already=True, note="可见范围未变化")
+                # 1) 基础级别：document_meta + chunk_meta 去规范化副本（检索/gate 读后者）
+                cur.execute(f"UPDATE {_kb_db()}.document_meta SET permission_level=%s, updated_at=NOW() "
+                            "WHERE doc_id=%s", (target, req.doc_id))
+                cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET permission_level=%s "
+                            "WHERE doc_id=%s AND version_no=%s", (target, req.doc_id, cur_ver))
+                # 2) 检索存续：restricted=离开检索（停用 chunk）；重新上线=激活 chunk + 标脏重推
+                if target == "restricted":
+                    # 与 retire 同款【全部活跃版本】停用（不限当前版本）：双版本 gap 残留的旧版
+                    # is_active=1 行只停当前版本会继续被检索/邻居拼接，且 HA3 清除漏删无限期滞留。
+                    cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=0 "
+                                "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
+                    # 真实检索下线不能只靠 RDS：HA3 行仍带旧 permission_level（原 public 的对全员放行，
+                    # deny gate 跳过 public 行）。喂 PENDING_DELETE outbox——stage-3 每轮
+                    # reconcile_pending_deletes 自动 drain，删 HA3 后落 DELETED（全版本入队，顺带
+                    # 清掉双版本残留）。
+                    cur.execute(f"UPDATE {_kb_db()}.document_version "
+                                f"SET index_status='{DocVersionIndexStatus.PENDING_DELETE}' "
+                                f"WHERE doc_id=%s AND index_status NOT IN "
+                                f"({sql_in_list((DocVersionIndexStatus.DELETED, DocVersionIndexStatus.PENDING_DELETE))})",
+                                (req.doc_id,))
+                else:
+                    cur.execute(f"UPDATE {_kb_db()}.chunk_meta "
+                                f"SET is_active=1, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+                                "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
+                    # 撤销可能在挂的 PENDING_DELETE（restricted→改回 未跑维护的窗口）：否则下轮
+                    # reconcile 会删 HA3 后把 chunk 打回 is_active=0/DELETED，正好撤销这次重新上线。
+                    # DELETED（已删过）也拨回 NOT_INDEXED，交 stage-3 重推。仅当前版本；旧版本照删。
+                    cur.execute(f"UPDATE {_kb_db()}.document_version "
+                                f"SET index_status='{DocVersionIndexStatus.NOT_INDEXED}' "
+                                f"WHERE doc_id=%s AND version_no=%s AND index_status IN "
+                                f"({sql_in_list((DocVersionIndexStatus.PENDING_DELETE, DocVersionIndexStatus.DELETED))})",
+                                (req.doc_id, cur_ver))
+                    if cur_perm != "restricted":
+                        # 双向 public↔dept_internal（本就 is_active=1）：显式标脏，让 stage-3 重推带新级别的 chunk
+                        cur.execute(f"UPDATE {_kb_db()}.chunk_meta "
+                                    f"SET index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+                                    "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
+                # 3) ACL 重投影（flag 门控，与主动共享/decide 同一注入点）：读己写的新 permission_level →
+                #    dept_internal 投影 approved 授权 / public·restricted 清空 allowed_depts。
+                if get_config().rag.allowed_depts_acl:
+                    from opensearch_pipeline.access_grants import (
+                        enqueue_acl_projection, materialize_doc_allowed_depts,
+                    )
+                    enqueue_acl_projection(cur, req.doc_id, reason="set_visibility")
+                    try:
+                        materialize_doc_allowed_depts(cur, req.doc_id)
+                    except Exception as _pe:
+                        logger.warning("set_visibility allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
+                                       req.doc_id, _pe)
+                write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="SET_VISIBILITY",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"owner={owner_dept} {cur_perm}->{target} reason={(req.reason or '')[:200]}",
+                            cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_set_visibility 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"修改可见范围失败 (trace: {trace_id})")
+    try:
+        from opensearch_pipeline.retriever import invalidate_deny_cache
+        invalidate_deny_cache(req.doc_id or None)
+    except Exception as _ie:   # noqa: BLE001
+        logger.warning("deny 缓存失效失败（忽略，TTL 兜底）doc=%s: %s", req.doc_id, _ie)
+    _note = {"restricted": "已归档受限：已停止新收录并排队索引清除；从检索彻底移除将在下次维护完成（可再改回恢复）",
+             "public": "已改为全公司公开：下次维护重推后全员可检索",
+             "dept_internal": "已改为仅本部门：下次维护重推后按部门权限过滤"}.get(target, "")
+    return KbSetVisibilityResponse(doc_id=req.doc_id, permission_level=target, changed=True,
+                                   already=False, note=_note)
 
 
 class KbPendingItem(BaseModel):

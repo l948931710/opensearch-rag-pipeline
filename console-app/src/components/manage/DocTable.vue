@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue'
-import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock } from 'lucide-vue-next'
-import { deptLabel, permLabel } from '@/lib/kb'
+import { computed, ref, watch } from 'vue'
+import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye } from 'lucide-vue-next'
+import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
@@ -11,10 +11,59 @@ import { useDialog } from '@/composables/useDialog'
 const { confirm } = useDialog()
 
 const {
-  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, sortKey, sortDir, isDeptAdmin,
+  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir, isDeptAdmin, isKbAdmin,
   setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
   openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
+  openShare, grantedLabelsByDoc, openVisibility,
+  selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
 } = useKb()
+
+// 「权限」入口条件：可管理 + 非退役 + 非隔离。弹窗内含 基础可见范围（改级别）+ 跨部门共享。
+// 放宽到全部可见级别（不再只 dept_internal）：public 文档也要能被改回本部门/受限。
+// 已隔离 = 安全隔离（PII 等）：后端对可见范围/恢复一律 409（唯一出路是脱敏重灌），入口直接不给。
+function canManagePerm(d: DocItem): boolean {
+  return d.can_manage !== false && d.status_badge !== '已退役' && d.status_badge !== '已隔离'
+}
+
+// 共享部门名（去 count，直接列名字，>2 个折 +N）——回答"文档共享给了哪些部门"。
+// O(1)：useKb 侧 computed Map（grants 变更才重算），模板每行 4 次调用不再各自全量扫。
+function sharedLabels(docId: string): string[] { return grantedLabelsByDoc.value.get(docId) || [] }
+
+// 利用度副行文案：0=真·从未被引用（退役候选，amber 提示）；>0=引用 N 次；null/undefined=数据不可用不显示。
+function usageText(d: DocItem): string {
+  if (d.cited_count === 0) return '从未被引用'
+  if (d.cited_count && d.cited_count > 0) return `引用 ${d.cited_count} 次`
+  return ''
+}
+
+// 可见范围筛选选项（下拉）
+const PERM_OPTS = Object.keys(PERM_LABEL)   // dept_internal / public / restricted
+
+// 批量：可选目标可见范围（public 涉全公司需 kb_admin，dept_admin 只给 本部门/受限）
+const bulkVisMenu = ref(false)
+const bulkVisOpts = computed(() =>
+  (isKbAdmin.value ? ['dept_internal', 'public', 'restricted'] : ['dept_internal', 'restricted']))
+
+async function onBulkRetire() {
+  const n = selectedDocs.value.filter((d) => d.status_badge !== '已退役').length
+  if (!n) return
+  const okGo = await confirm({
+    title: '批量退役', confirmText: `退役 ${n} 篇`, danger: true,
+    message: `确认退役选中的 ${n} 篇文档？\n将逐篇标记下线、停止作为升版目标（可逆，从检索移除在下次维护完成）。`,
+  })
+  if (okGo) void bulkRetire()
+}
+async function onBulkSetVis(level: string) {
+  bulkVisMenu.value = false
+  const n = selectedDocs.value.filter((d) => d.permission_level !== level).length
+  if (!n) return
+  const okGo = await confirm({
+    title: '批量改可见范围', confirmText: `改 ${n} 篇`,
+    danger: level === 'restricted',
+    message: `把选中的 ${n} 篇文档改为「${PERM_LABEL[level]}」？${level === 'restricted' ? '\n受限 = 下线归档、离开检索（可再改回）。' : ''}`,
+  })
+  if (okGo) void bulkSetVisibility(level)
+}
 
 // 状态筛选 chip：从已加载文档里取出现过的徽章（+ 全部）。
 const chips = computed(() => {
@@ -99,24 +148,107 @@ async function onRestore(d: DocItem) {
 
     <LoadError class="mt-3" :message="loadErrors['docs']" @retry="loadDocs()" />
 
-    <!-- 状态筛选 chips -->
-    <div class="mt-3 flex flex-wrap gap-1.5">
+    <!-- 状态筛选 chips + 归属/可见范围下拉 -->
+    <div class="mt-3 flex flex-wrap items-center justify-between gap-2">
+      <div class="flex flex-wrap gap-1.5">
+        <button
+          v-for="c in chips" :key="c || 'all'"
+          type="button"
+          class="rounded-full border px-2.5 py-1 text-xs transition"
+          :class="filter === c ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
+          @click="filter = c"
+        >
+          {{ c || '全部' }} <span class="font-mono">{{ countOf(c) }}</span>
+        </button>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <select
+          v-model="ownerFilter" aria-label="按归属部门筛选"
+          class="ui-select rounded-md border border-input bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground focus:border-ring focus:outline-none"
+        >
+          <option value="">全部归属</option>
+          <option v-for="o in ownerOptions" :key="o" :value="o">{{ deptLabel(o) }}</option>
+        </select>
+        <select
+          v-model="permFilter" aria-label="按可见范围筛选"
+          class="ui-select rounded-md border border-input bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground focus:border-ring focus:outline-none"
+        >
+          <option value="">全部范围</option>
+          <option v-for="p in PERM_OPTS" :key="p" :value="p">{{ PERM_LABEL[p] }}</option>
+        </select>
+        <select
+          v-model="citedFilter" aria-label="按利用度筛选"
+          class="ui-select rounded-md border border-input bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground focus:border-ring focus:outline-none"
+        >
+          <option value="">全部利用度</option>
+          <option value="never">从未被引用</option>
+          <option value="used">有引用</option>
+        </select>
+        <button
+          v-if="ownerFilter || permFilter || filter || citedFilter"
+          type="button" class="rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground"
+          @click="filter = ''; ownerFilter = ''; permFilter = ''; citedFilter = ''"
+        >清除筛选</button>
+      </div>
+    </div>
+
+    <!-- 批量操作条（选中任意行时浮现；仅作用于可见可管理行） -->
+    <div
+      v-if="selectedCount"
+      class="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-accent-strong/40 bg-accent-soft px-3 py-2"
+    >
+      <span class="text-[12.5px] font-semibold text-accent-text">已选 {{ selectedCount }} 篇</span>
+      <span v-if="bulkMsg" class="text-[11.5px] text-muted-foreground">· {{ bulkMsg }}</span>
+      <div class="flex-1" />
       <button
-        v-for="c in chips" :key="c || 'all'"
-        type="button"
-        class="rounded-full border px-2.5 py-1 text-xs transition"
-        :class="filter === c ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
-        @click="filter = c"
-      >
-        {{ c || '全部' }} <span class="font-mono">{{ countOf(c) }}</span>
-      </button>
+        type="button" :disabled="bulkBusy"
+        class="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+        @click="onBulkRetire"
+      ><Archive :size="12" :stroke-width="1.75" /> 批量退役</button>
+      <div class="relative">
+        <button
+          type="button" :disabled="bulkBusy"
+          class="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          @click="bulkVisMenu = !bulkVisMenu"
+        ><Lock :size="12" :stroke-width="1.75" /> 改可见范围</button>
+        <div
+          v-if="bulkVisMenu"
+          class="absolute right-0 top-full z-10 mt-1 w-32 overflow-hidden rounded-lg border border-border bg-card py-1 shadow-lg"
+        >
+          <button
+            v-for="lv in bulkVisOpts" :key="lv" type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs text-foreground transition hover:bg-panel"
+            @click="onBulkSetVis(lv)"
+          >{{ PERM_LABEL[lv] }}</button>
+        </div>
+      </div>
+      <button
+        type="button" :disabled="bulkBusy"
+        class="grid size-6 place-items-center rounded text-muted-foreground transition hover:bg-card hover:text-foreground disabled:opacity-50"
+        aria-label="取消选择" @click="clearSelection"
+      ><X :size="13" :stroke-width="2" /></button>
     </div>
 
     <!-- Atlas 台账网格（< 680px 自动卡片化，由 .led-* 媒体查询接管） -->
     <div class="mt-4 overflow-hidden rounded-xl border border-border bg-card">
       <div class="led-head">
+        <span class="inline-flex items-center gap-2">
+          <button
+            type="button" role="checkbox" :aria-checked="allVisibleSelected"
+            :disabled="!selectableVisible.length"
+            class="grid size-4 shrink-0 place-items-center rounded border transition disabled:opacity-30"
+            :class="allVisibleSelected ? 'border-accent-strong bg-accent-strong text-primary-foreground' : 'border-border-strong bg-surface hover:border-ring'"
+            aria-label="全选可见文档" title="全选可见文档" @click="toggleSelectAllVisible"
+          ><Check v-if="allVisibleSelected" :size="11" :stroke-width="3" /></button>
+          <button
+            type="button" class="led-sort inline-flex items-center gap-1"
+            :aria-label="`按${COLS[0].label}排序`"
+            :aria-sort="sortKey === COLS[0].key ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'"
+            @click="sortBy(COLS[0].key)"
+          >{{ COLS[0].label }}<ArrowUpDown :size="11" :stroke-width="1.75" class="opacity-40" /><span class="text-accent-text">{{ arrow(COLS[0].key) }}</span></button>
+        </span>
         <button
-          v-for="col in COLS" :key="col.key" type="button"
+          v-for="col in COLS.slice(1)" :key="col.key" type="button"
           class="led-sort inline-flex items-center gap-1"
           :aria-label="`按${col.label}排序`"
           :aria-sort="sortKey === col.key ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'"
@@ -130,11 +262,23 @@ async function onRestore(d: DocItem) {
       <div
         v-for="d in filtered" :key="d.doc_id"
         class="led-row" :data-retired="d.status_badge === '已退役' ? '1' : '0'" :data-foreign="d.can_manage === false ? '1' : '0'"
+        :data-selected="isSelected(d.doc_id) ? '1' : '0'"
       >
-        <div class="led-cell led-cell-main min-w-0" data-label="文档名">
-          <div class="truncate text-[13.5px] font-semibold text-foreground" :title="d.title || d.original_filename || d.doc_id">{{ d.title || d.original_filename || d.doc_id }}</div>
-          <div class="truncate text-[11px] text-faint">
-            {{ permLabel(d.permission_level) }}<span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
+        <div class="led-cell led-cell-main flex min-w-0 items-start gap-2.5" data-label="文档名">
+          <!-- 行选择框（仅可管理行；外部门只读行不给选框） -->
+          <button
+            v-if="d.can_manage !== false"
+            type="button" role="checkbox" :aria-checked="isSelected(d.doc_id)"
+            class="mt-0.5 grid size-4 shrink-0 place-items-center rounded border transition"
+            :class="isSelected(d.doc_id) ? 'border-accent-strong bg-accent-strong text-primary-foreground' : 'border-border-strong bg-surface hover:border-ring'"
+            :aria-label="`选择：${d.title || d.doc_id}`" @click="toggleSelect(d.doc_id)"
+          ><Check v-if="isSelected(d.doc_id)" :size="11" :stroke-width="3" /></button>
+          <span v-else class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[13.5px] font-semibold text-foreground" :title="d.title || d.original_filename || d.doc_id">{{ d.title || d.original_filename || d.doc_id }}</div>
+            <div class="truncate text-[11px] text-faint">
+              {{ permLabel(d.permission_level) }}<template v-if="sharedLabels(d.doc_id).length"><span class="text-accent-text"> · 共享 {{ sharedLabels(d.doc_id).slice(0, 2).join('、') }}<span v-if="sharedLabels(d.doc_id).length > 2"> +{{ sharedLabels(d.doc_id).length - 2 }}</span></span></template><template v-if="usageText(d)"> · <span :class="d.cited_count === 0 ? 'text-st-warn' : ''" :title="d.last_cited_at ? `最近被引用 ${d.last_cited_at.slice(0, 16)}` : ''">{{ usageText(d) }}</span></template><span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
+            </div>
           </div>
         </div>
         <div class="led-cell text-sm text-muted-foreground" data-label="归属">
@@ -147,22 +291,37 @@ async function onRestore(d: DocItem) {
         <div class="led-cell led-actions doc-actions" data-label="操作">
           <!-- 可操作（本部门 / kb_admin）：历史 / 升版 / 退役 -->
           <template v-if="d.can_manage !== false">
-            <button type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="openHistory(d)">
+            <button
+              type="button" data-testid="doc-visibility"
+              class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              title="谁能看到这篇文档" @click="openVisibility(d)"
+            >
+              <Eye :size="13" :stroke-width="1.75" /> 可见
+            </button>
+            <button
+              v-if="canManagePerm(d)"
+              type="button" data-testid="doc-share"
+              class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-accent-soft hover:text-accent-text"
+              @click="openShare(d)"
+            >
+              <Share2 :size="13" :stroke-width="1.75" /> 权限
+            </button>
+            <button type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="openHistory(d)">
               <History :size="13" :stroke-width="1.75" /> 历史
             </button>
-            <button type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="enterVersionMode(d)">
+            <button type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="enterVersionMode(d)">
               <FilePlus2 :size="13" :stroke-width="1.75" /> 升版
             </button>
             <button
               v-if="d.status_badge !== '已退役'"
-              type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
+              type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
               @click="onRetire(d)"
             >
               <Archive :size="13" :stroke-width="1.75" /> 退役
             </button>
             <button
               v-else
-              type="button" class="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-st-live transition hover:bg-st-live/10"
+              type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-st-live transition hover:bg-st-live/10"
               @click="onRestore(d)"
             >
               <ArchiveRestore :size="13" :stroke-width="1.75" /> 恢复上线

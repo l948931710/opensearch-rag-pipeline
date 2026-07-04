@@ -1,6 +1,7 @@
 import '@/boot/capture'   // 必须最先：在 @/router 加载前抹除 URL token（修正#4，见该文件注释）
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
+import '@/styles/fonts.css'   // 自托管字体（latin woff2 + swap）——替代 Google Fonts 阻塞链接
 import '@/styles/tokens.css'
 import App from './App.vue'
 import { router } from '@/router'
