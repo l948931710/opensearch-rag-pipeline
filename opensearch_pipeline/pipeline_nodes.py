@@ -1837,8 +1837,11 @@ def node_detect_sensitive(ctx: dict):
         doc["risk_level"] = final_risk
 
         # ─── 敏感检测结果入库 ───
+        # DELETE 不以 hits 为前提：零命中的重跑（源文件已修 / 检测器白名单更新）也要
+        # 清掉上一轮的陈旧 finding 行，否则审计表残留 QUARANTINED 记录与文档实际
+        # CLEAN 处置矛盾（全维度复审 摄取#6）。INSERT 仍按 finding_rows 有无决定。
         simulate_db = _resolve_simulate(ctx, "db")
-        if not simulate_db and hits:
+        if not simulate_db:
             conn = None
             try:
                 conn = _get_db_conn(select_db=True)

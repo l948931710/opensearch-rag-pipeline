@@ -135,3 +135,26 @@ def test_dag2_redact_before_chunk():
     order = dag._topological_sort()
     funcs = [dag.nodes[nid].func for nid in order]
     assert funcs.index(pn.node_redact_or_quarantine) < funcs.index(pn.node_chunk_documents)
+
+
+# ── 零命中重跑清理陈旧 finding 行（全维度复审 摄取#6）─────────────────────────
+def test_zero_hits_rerun_still_deletes_stale_findings(monkeypatch):
+    """源文件已修/白名单更新后的重跑：零命中也必须 DELETE 上一轮 finding 行，
+    否则审计表残留 QUARANTINED 与文档实际 CLEAN 处置矛盾。"""
+    from unittest.mock import MagicMock, patch
+
+    doc = _doc(ocr_text="", text="干净正文，无任何敏感实体")
+    ctx = {"canonicals": [doc], "simulate_db": False}
+
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+    with patch.object(pn, "_get_db_conn", return_value=conn):
+        pn.node_detect_sensitive(ctx)
+
+    assert doc["sensitive_detected"] is False
+    executed_sql = " ".join(str(c.args[0]) for c in cursor.execute.call_args_list)
+    assert "DELETE FROM document_sensitive_finding" in executed_sql
+    cursor.executemany.assert_not_called()   # 零命中：只清不插
+    conn.commit.assert_called_once()
+    conn.close.assert_called_once()
