@@ -75,16 +75,19 @@ describe('ManageView — 按角色分流', () => {
   it('知识库管理员 → 分 tab 管理台（概览看板 / 文档管理），默认全库看板', () => {
     const w = mountWith(ManageView, identity({ canManage: true, role: 'kb_admin', managedOwnerDepts: ['hr'] }))
     expect(w.text()).toContain('知识库管理')
-    expect(w.text()).toContain('hr')
+    // 头部管辖范围收成一枚「全库 · N 个部门」pill（组码只在 title 悬停提示里）
+    expect(w.text()).toContain('全库 · 1 个部门')
+    expect(w.html()).toContain('title="hr"')
     expect(w.text()).toContain('概览看板')        // 子 tab
     expect(w.text()).toContain('文档管理')        // 子 tab
     expect(w.text()).toContain('全库资产概览')     // kb_admin 看板（默认 tab）
     expect(w.text()).not.toContain('知识库概览')   // 员工专属文案
   })
 
-  it('部门管理员 → 默认看板为本部门视图（非全库）', () => {
+  it('部门管理员 → 默认看板为本部门视图（非全库），头部列部门中文名 chips', () => {
     const w = mountWith(ManageView, identity({ canManage: true, role: 'dept_admin', managedOwnerDepts: ['marketing'] }))
     expect(w.text()).toContain('概览看板')
+    expect(w.text()).toContain('营销')            // 管辖范围 chip 用中文名
     expect(w.text()).toContain('文档总数')        // 本部门概览卡
     expect(w.text()).not.toContain('全库资产概览') // 不是 kb_admin 看板
   })

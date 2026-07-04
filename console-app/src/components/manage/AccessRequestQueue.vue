@@ -18,8 +18,8 @@ async function onReject(d: AccessRequestItem) {
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题+计数，不再另设分区眉标 -->
   <section v-if="accessRequests.length || loadErrors['accessRequests']">
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">授权申请</p>
     <LoadError class="mb-2.5" :message="loadErrors['accessRequests']" @retry="loadAccessRequests()" />
     <div v-if="accessRequests.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 绿头（区别于上传审批的橙头） -->

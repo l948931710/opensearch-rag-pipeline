@@ -26,8 +26,8 @@ async function onRevoke(g: AccessGrantItem) {
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题+计数，不再另设分区眉标 -->
   <section v-if="accessGrants.length || loadErrors['accessGrants']">
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">已授权</p>
     <LoadError class="mb-2.5" :message="loadErrors['accessGrants']" @retry="loadAccessGrants()" />
     <div v-if="accessGrants.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 活跃态头（st-live，区别于待审批的绿/橙头） -->

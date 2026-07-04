@@ -99,6 +99,20 @@ class KbAccessGrantListResponse(BaseModel):
     items: List[KbAccessGrantItem] = Field(default_factory=list)
 
 
+class KbAccessGrantCreate(BaseModel):
+    """Owner 侧主动共享：文档所属部门管理员直接放行指定部门（无需对方先申请）。"""
+    doc_id: str
+    target_depts: List[str] = Field(default_factory=list)
+    reason: Optional[str] = None
+
+
+class KbAccessGrantCreateResponse(BaseModel):
+    doc_id: str = ""
+    granted: List[str] = Field(default_factory=list)   # 本次新放行的组码
+    skipped: List[str] = Field(default_factory=list)   # 已覆盖 / 归属自身 / 伞下冗余而跳过
+    ok: bool = True
+
+
 # ── Phase F：成员/角色管理（kb_admin 维护 dept_admin 写授权；三分授权 读≠管理≠授权）──
 class KbAdminItem(BaseModel):
     user_id: str = ""
@@ -323,6 +337,112 @@ def kb_access_grants_list(request: Request,
         for r in rows
     ]
     return KbAccessGrantListResponse(items=items)
+
+
+@router.post("/api/kb/access-grants", response_model=KbAccessGrantCreateResponse)
+def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
+                           identity: Optional[Identity] = Depends(current_identity)):
+    """Owner 侧【主动共享】：文档所属部门管理员（或 kb_admin）直接把 dept_internal 文档
+    放行给指定部门检索——被动申请流（submit→approve）的主动式对偶，复用同一张表同一状态机。
+
+    实现 = 直接 INSERT status='approved' 的 kb_access_request 行（requester=授权人自己、
+    decided_by=自己、decided_at=NOW），随后与 approve 完全同款：flag 开则同事务
+    enqueue_acl_projection + materialize 标脏（stage-3 推 HA3）、审计入同事务、
+    commit 后失效 deny 缓存。撤销/清单/审批历史零改动即可用（就是 approved 行）。
+
+    硬规则（fail-closed，与 submit/decide 同口径）：
+    - 只 dept_internal 可共享（public 本就全司可读→400；restricted 绝不外露→403）；
+    - 非在线文档不可共享（400）；
+    - 授权人必须 _kb_can_manage(owner_dept)（403）；
+    - 目标组码过 sanitize 白名单（10 个用户面组码）；剔除归属部门自身与其伞组
+      （production_mold 的伞 'production' 用户经 umbrella 展开本就可读——写了也是冗余）；
+    - 已被既有 approved 行覆盖的目标 → skipped（幂等，可重复提交）。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import sanitize_owner_depts
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.config import get_config
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    targets = sanitize_owner_depts(req.target_depts)
+    if not targets:
+        raise HTTPException(status_code=400, detail="无有效目标部门（须为合法组码）")
+    assert_metadata_write_allowed("kb_access_grant_create", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    reason = (req.reason or "管理员主动共享")[:512]
+    granted: List[str] = []
+    skipped: List[str] = []
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
+                            "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm, status = (row[0] or ""), (row[1] or ""), (row[2] or "active")
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权共享该文档（非文档所属部门管理员）")
+                if str(status).lower() != "active":
+                    raise HTTPException(status_code=400, detail="该文档非在线状态，无法共享")
+                if perm == "public":
+                    raise HTTPException(status_code=400, detail="公开文档全公司可检索，无需共享")
+                if perm != "dept_internal":
+                    raise HTTPException(status_code=403, detail="受限文档不可共享")
+                # 既有 approved 覆盖集（含被动审批流写入的 CSV 行）→ 幂等 skip
+                cur.execute(f"SELECT requester_depts FROM {_kb_db()}.kb_access_request "
+                            "WHERE doc_id=%s AND status='approved'", (req.doc_id,))
+                covered = set()
+                for (csv,) in (cur.fetchall() or []):
+                    covered.update(p.strip() for p in str(csv or "").split(",") if p.strip())
+                for t in targets:
+                    # 归属自身 / 归属子线的伞组（伞用户经 umbrella 展开本就可读）→ 冗余，跳过
+                    if t == owner_dept or owner_dept.startswith(t + "_") or t in covered:
+                        skipped.append(t)
+                        continue
+                    cur.execute(
+                        f"INSERT INTO {_kb_db()}.kb_access_request "
+                        "(doc_id, owner_dept, requester_id, requester_name, requester_depts, reason, "
+                        " status, decided_by, decided_at, decision_note) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,'approved',%s,NOW(),%s)",
+                        (req.doc_id, owner_dept, kb.user_id, kb.name, t, reason, kb.user_id, reason),
+                    )
+                    granted.append(t)
+                if granted:
+                    # 与 _kb_access_decide 同款投影：outbox 同事务持久入队 + 内联标脏 best-effort
+                    if get_config().rag.allowed_depts_acl:
+                        from opensearch_pipeline.access_grants import (
+                            enqueue_acl_projection, materialize_doc_allowed_depts,
+                        )
+                        enqueue_acl_projection(cur, req.doc_id, reason="direct_grant")
+                        try:
+                            materialize_doc_allowed_depts(cur, req.doc_id)
+                        except Exception as _pe:
+                            logger.warning("direct_grant allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
+                                           req.doc_id, _pe)
+                    write_audit(doc_id=req.doc_id, version_no=None, action_type="ACCESS_GRANT_DIRECT",
+                                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                                message=f"owner={owner_dept} targets={','.join(granted)}", cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_access_grant_create 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"共享失败 (trace: {trace_id})")
+    if granted:
+        # 与 decide 同款：主动失效检索侧 deny 缓存（TTL>0 时保「共享即时生效」；失败只记日志）
+        try:
+            from opensearch_pipeline.retriever import invalidate_deny_cache
+            invalidate_deny_cache(req.doc_id or None)
+        except Exception as _ie:   # noqa: BLE001
+            logger.warning("deny 缓存失效失败（忽略，TTL 兜底）doc=%s: %s", req.doc_id, _ie)
+    return KbAccessGrantCreateResponse(doc_id=req.doc_id, granted=granted, skipped=skipped, ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

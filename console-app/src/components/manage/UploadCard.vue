@@ -1,15 +1,23 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { UploadCloud, FileUp, X } from 'lucide-vue-next'
 import { UPLOAD_ACCEPT, PERM_LABEL, deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 
 const {
-  verCtx, newTitle, newOwner, newPerm, ownerDepts, selectedNames,
+  verCtx, newTitle, newOwner, newPerm, newShareDepts, shareTargets, ownerDepts, selectedNames,
   dupWarn, uploadBusy, uploadMsg, uploadErr, uploadOk, contentDupMsg, uploadQueue,
   onFileSelected, doUpload, exitVersionMode, maxUploadMb,
 } = useKb()
+
+// 「指定部门」模式的目标选项 = 10 组码 − 归属部门自身（本部门本就可读）。
+const shareOpts = computed(() => shareTargets.filter((t) => t !== newOwner.value))
+function toggleShare(t: string) {
+  newShareDepts.value = newShareDepts.value.includes(t)
+    ? newShareDepts.value.filter((x) => x !== t)
+    : [...newShareDepts.value, t]
+}
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const dragging = ref(false)
@@ -88,19 +96,37 @@ function onDrop(e: DragEvent) {
       <p v-else class="text-xs text-faint sm:col-span-3">已选 {{ selectedNames.length }} 个文件，将批量上传，标题各取文件名（如需自定义标题请逐个上传）。</p>
       <label class="flex flex-col gap-1 text-xs text-muted-foreground">
         归属部门
-        <select v-model="newOwner" class="rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
+        <select v-model="newOwner" class="ui-select rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
           <option value="" disabled>选择部门</option>
           <option v-for="o in ownerDepts" :key="o" :value="o">{{ deptLabel(o) }}</option>
         </select>
       </label>
       <label class="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-2">
         可见范围
-        <select v-model="newPerm" class="rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
+        <select v-model="newPerm" class="ui-select rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
           <option value="dept_internal">仅本部门</option>
+          <option value="shared">指定部门（本部门＋所选部门）</option>
           <option value="public">全公司（可能需审批）</option>
           <option value="restricted">受限（仅归档，不进检索）</option>
         </select>
       </label>
+
+      <!-- 指定部门：目标 chips（登记后自动放行所选部门，记录于审批历史、可随时撤销） -->
+      <div v-if="newPerm === 'shared'" class="sm:col-span-3">
+        <div class="mb-1.5 text-xs" :class="newShareDepts.length ? 'text-muted-foreground' : 'text-st-busy'">
+          共享给（多选{{ newShareDepts.length ? `，已选 ${newShareDepts.length} 个` : '，至少选 1 个' }}）
+        </div>
+        <div class="flex flex-wrap gap-1.5">
+          <button
+            v-for="t in shareOpts" :key="t" type="button"
+            class="rounded-full border px-2.5 py-1 text-[12px] transition"
+            :class="newShareDepts.includes(t) ? 'border-accent-strong bg-accent-soft font-medium text-accent-text' : 'border-border text-muted-foreground hover:border-ring'"
+            :aria-pressed="newShareDepts.includes(t)"
+            @click="toggleShare(t)"
+          >{{ deptLabel(t) }}</button>
+        </div>
+        <p class="mt-1.5 text-[11.5px] text-faint">登记后自动放行所选部门（记录于审批历史，可在台账「共享」里随时调整或撤销）。</p>
+      </div>
     </div>
 
     <!-- 提交 + 状态 -->
@@ -108,7 +134,7 @@ function onDrop(e: DragEvent) {
       <button
         type="button"
         class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-        :disabled="uploadBusy || !selectedNames.length || (!verCtx && !newOwner)"
+        :disabled="uploadBusy || !selectedNames.length || (!verCtx && !newOwner) || (!verCtx && newPerm === 'shared' && !newShareDepts.length)"
         @click="doUpload()"
       >
         {{ uploadBusy ? '上传中…' : (verCtx ? '上传新版本' : '上传') }}

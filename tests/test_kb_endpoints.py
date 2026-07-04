@@ -21,8 +21,8 @@ def test_org_tree_kb_admin_sees_all(monkeypatch):
     from opensearch_pipeline import api
     resp = api.kb_org_tree(request=None, identity=api.Identity(user_id="dev1"))
     assert resp.my_role == "kb_admin"
-    assert len(resp.my_managed_owner_depts) == 10            # kb_admin 管理全部 owner_dept
-    assert len(resp.acl_groups) == 10
+    assert len(resp.my_managed_owner_depts) == 15            # kb_admin 管理全部 owner_dept（2026-07-03 扩容至 15 组）
+    assert len(resp.acl_groups) == 15
     # 部门→组映射包含已知条目
     assert resp.dept_name_to_groups.get("财务部") == ["finance"]
 
@@ -555,6 +555,147 @@ def test_access_grants_list_employee_forbidden(monkeypatch):
     with pytest.raises(Exception) as ei:
         api.kb_access_grants_list(request=None, identity=api.Identity(user_id="e1"))
     assert getattr(ei.value, "status_code", None) == 403
+
+
+# ── POST /api/kb/access-grants：owner 侧主动共享（多部门可见度）──────────────
+def test_grant_create_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["hr"]),
+                                   request=None, identity=api.Identity(user_id="e1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_grant_create_no_valid_targets_rejected(monkeypatch):
+    """目标组码全非白名单 → 400（不查库）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["typo_dept"]),
+                                   request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_grant_create_requires_owner_manage(monkeypatch):
+    """共享权 = 文档所属部门管理员：doc 归属 hr、调用者只管 marketing → 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "dept_internal", "active")])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["rd"]),
+                                   request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_grant_create_public_rejected(monkeypatch):
+    """公开文档全公司可读，无需共享 → 400。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("marketing", "public", "active")])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["hr"]),
+                                   request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_grant_create_restricted_rejected(monkeypatch):
+    """受限文档绝不外露 → 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("marketing", "restricted", "active")])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["hr"]),
+                                   request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_grant_create_inactive_rejected(monkeypatch):
+    """非在线文档（退役等）不可共享 → 400。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("marketing", "dept_internal", "retired")])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["hr"]),
+                                   request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_grant_create_happy_inserts_approved(monkeypatch):
+    """本部门 dept_internal + 合法目标 → 逐目标 INSERT status='approved'（decided_by=授权人）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [("marketing", "dept_internal", "active"), []])   # 文档 + 无既有 approved
+    from opensearch_pipeline import api
+    resp = api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["hr", "rd"], reason="巡检需要"),
+                                      request=None, identity=api.Identity(user_id="da1"))
+    assert resp.ok is True and sorted(resp.granted) == ["hr", "rd"] and resp.skipped == []
+    inserts = [c for c in sink["calls"] if "INSERT INTO fuling_knowledge.kb_access_request" in c[0]]
+    assert len(inserts) == 2
+    assert all("'approved'" in c[0] for c in inserts)          # 直插 approved（复用同一状态机）
+    assert all("da1" in c[1] for c in inserts)                 # requester=decided_by=授权人
+    assert {c[1][4] for c in inserts} == {"hr", "rd"}          # 每目标一行（撤销粒度）
+    assert sink.get("committed") is True
+
+
+def test_grant_create_idempotent_covered_and_self_skipped(monkeypatch):
+    """已覆盖目标（含被动流 CSV 行）与归属部门自身 → skipped；其余照常放行。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [
+        ("marketing", "dept_internal", "active"),
+        [("hr,quality",)],                                     # 既有 approved（CSV 覆盖 hr + quality）
+    ])
+    from opensearch_pipeline import api
+    resp = api.kb_access_grant_create(
+        api.KbAccessGrantCreate(doc_id="D1", target_depts=["hr", "marketing", "rd", "quality"]),
+        request=None, identity=api.Identity(user_id="da1"))
+    assert resp.granted == ["rd"]                              # 只有 rd 是新放行
+    assert sorted(resp.skipped) == ["hr", "marketing", "quality"]    # 覆盖×2 + 归属自身×1
+    inserts = [c for c in sink["calls"] if "INSERT INTO fuling_knowledge.kb_access_request" in c[0]]
+    assert len(inserts) == 1 and inserts[0][1][4] == "rd"
+
+
+def test_grant_create_umbrella_of_subline_owner_skipped(monkeypatch):
+    """归属为生产子线（production_mold）时，伞组 production 目标冗余 → skipped（伞用户本就可读）。
+
+    子线 owner 不在 dept_admin 写白名单（sim 会被 sanitize 掉）→ 用 kb_admin（全权）覆盖此分支。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("production_mold", "dept_internal", "active"), []])
+    from opensearch_pipeline import api
+    resp = api.kb_access_grant_create(
+        api.KbAccessGrantCreate(doc_id="D1", target_depts=["production", "hr"]),
+        request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.granted == ["hr"] and resp.skipped == ["production"]
+    inserts = [c for c in sink["calls"] if "INSERT INTO fuling_knowledge.kb_access_request" in c[0]]
+    assert len(inserts) == 1 and inserts[0][1][4] == "hr"
+
+
+def test_grant_create_kb_admin_allowed(monkeypatch):
+    """kb_admin 可对任意归属文档主动共享（_kb_can_manage 全权）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("hr", "dept_internal", "active"), []])
+    from opensearch_pipeline import api
+    resp = api.kb_access_grant_create(api.KbAccessGrantCreate(doc_id="D1", target_depts=["marketing"]),
+                                      request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.granted == ["marketing"]
+    assert any("INSERT INTO fuling_knowledge.kb_access_request" in c[0] for c in sink["calls"])
 
 
 # ── Phase F：成员/角色管理（kb_admin 专属）──

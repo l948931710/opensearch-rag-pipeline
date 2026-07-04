@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { ArrowDown, Sparkles } from 'lucide-vue-next'
+import { ArrowDown, Sprout } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useAsk } from '@/composables/useAsk'
 import Thread from '@/components/qa/Thread.vue'
@@ -9,6 +9,9 @@ import Composer from '@/components/qa/Composer.vue'
 
 const { identity } = storeToRefs(useSession())
 const name = computed(() => identity.value?.name || '')
+// 问候随时段（挂载时算一次即可，不需要跨小时反应式刷新）。
+const h = new Date().getHours()
+const daypart = h < 5 ? '晚上好' : h < 11 ? '早上好' : h < 13 ? '中午好' : h < 18 ? '下午好' : '晚上好'
 
 const { messages, asking, draft, thinking, hotQuestions, ask, stop, loadHotQuestions } = useAsk()
 function toggleThinking() { thinking.value = !thinking.value }
@@ -76,24 +79,26 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
       </div>
     </template>
 
-    <!-- 空态：居中问候 + 输入 + 热门问题 -->
-    <div v-else class="flex flex-1 flex-col items-center justify-center px-4 pb-20">
-      <div class="mb-7 flex items-center gap-3">
-        <span class="grid size-9 place-items-center rounded-[10px] bg-accent-strong">
-          <Sparkles :size="20" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
-        </span>
-        <span class="font-serif text-[34px] leading-none tracking-tight text-foreground">你好{{ name ? '，' + name : '，同事' }}</span>
+    <!-- 空态：居中问候（与登录屏同款竖排 lockup）+ 输入 + 热门问题 -->
+    <div v-else class="flex flex-1 flex-col items-center justify-center px-4 pb-14">
+      <div class="mb-3 grid size-11 place-items-center rounded-[13px] bg-accent-strong shadow-lg shadow-[color-mix(in_srgb,var(--accent)_28%,transparent)]">
+        <Sprout :size="24" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
       </div>
+      <h1 class="font-serif text-[34px] leading-none tracking-tight text-foreground">{{ daypart }}{{ name ? '，' + name : '' }}</h1>
+      <p class="mb-8 mt-3 text-[13px] text-muted-foreground">答案来自富岭内部文档；可见范围按你的部门权限过滤。</p>
       <Composer v-model="draft" :asking="asking" :has-messages="false" :thinking="thinking" @submit="send()" @stop="stop" @toggle-thinking="toggleThinking" />
-      <div v-if="hotQuestions.length" class="mt-5 flex w-full max-w-3xl xl:max-w-4xl flex-wrap justify-center gap-2 px-4">
-        <button
-          v-for="(h, i) in hotQuestions" :key="i"
-          type="button"
-          class="rounded-full border border-border bg-card px-3.5 py-1.5 text-sm text-foreground transition hover:border-ring hover:bg-panel"
-          @click="send(h)"
-        >
-          {{ h }}
-        </button>
+      <div v-if="hotQuestions.length" class="mt-7 w-full max-w-3xl px-4 xl:max-w-4xl">
+        <p class="mb-2.5 text-center text-[11px] font-bold tracking-[0.08em] text-faint">大家在问</p>
+        <div class="flex flex-wrap justify-center gap-2">
+          <button
+            v-for="(q, i) in hotQuestions" :key="i"
+            type="button"
+            class="rounded-full border border-border bg-card px-3.5 py-1.5 text-sm text-foreground transition hover:border-ring hover:bg-panel"
+            @click="send(q)"
+          >
+            {{ q }}
+          </button>
+        </div>
       </div>
     </div>
   </div>

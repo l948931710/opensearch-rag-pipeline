@@ -18,8 +18,8 @@ async function onReject(d: PendingItem) {
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题+计数，不再另设分区眉标 -->
   <section v-if="isKbAdmin && (approvals.length || loadErrors['approvals'])">
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">待审批</p>
     <LoadError class="mb-2.5" :message="loadErrors['approvals']" @retry="loadApprovals()" />
     <div v-if="approvals.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 橙头 -->

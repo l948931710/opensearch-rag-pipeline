@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History } from 'lucide-vue-next'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History, Lightbulb } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
@@ -15,6 +15,7 @@ import AccessGrantList from '@/components/manage/AccessGrantList.vue'
 import DocTable from '@/components/manage/DocTable.vue'
 import VersionHistoryModal from '@/components/manage/VersionHistoryModal.vue'
 import AccessRequestModal from '@/components/manage/AccessRequestModal.vue'
+import ShareDocModal from '@/components/manage/ShareDocModal.vue'
 import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
@@ -40,12 +41,10 @@ const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
 ])
 // 「文档管理」tab 角标 = 待你审核数（reviewCount，与侧栏入口红点同一来源）。
 
-// ── 员工概览卡（只读，可访问数据）──
-const myDepts = computed(() => (identity.value?.aclGroups || []).map(deptLabel).join('、') || '—')
-const empCards = computed(() => [
-  { key: 'dept', label: '我的部门', value: myDepts.value, icon: Building2, mono: false },
-  { key: 'hot', label: '热门问题', value: String(hotQuestions.value.length), icon: Sparkles, mono: true },
-])
+// ── 员工概览（只读，可访问数据）──
+const myDeptChips = computed(() => (identity.value?.aclGroups || []).map(deptLabel))
+// ── 管理员头部的管辖范围：kb_admin 全库收成一枚（10 个组码逐一列出只是噪声），dept_admin 列中文名 chips ──
+const managedDepts = computed(() => identity.value?.managedOwnerDepts || [])
 
 function askHot(q: string) { fillInput(q); void router.push('/') }
 
@@ -76,15 +75,15 @@ onMounted(async () => {
       <p class="mt-1 text-sm text-muted-foreground">你以员工身份访问，可查看概览并直接提问；文档上传与管理由部门管理员负责。</p>
     </header>
 
-    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-      <div v-for="c in empCards" :key="c.key" class="kb-card rounded-xl border border-border bg-card p-4">
-        <div class="flex items-center justify-between">
-          <span class="text-xs text-muted-foreground">{{ c.label }}</span>
-          <component :is="c.icon" :size="15" :stroke-width="1.75" class="text-accent-text" />
-        </div>
-        <div class="mt-1.5 truncate text-lg font-semibold text-foreground" :class="c.mono ? 'font-mono tabular-nums' : ''">{{ c.value }}</div>
+    <!-- 我的可检索范围：部门 chips + 口径说明（替代原先「热门问题 6」这类无信息量的计数卡） -->
+    <section class="kb-card rounded-xl border border-border bg-card p-5">
+      <h2 class="flex items-center gap-2 text-sm font-bold text-foreground"><Building2 :size="15" :stroke-width="1.75" class="text-accent-text" /> 我的可检索范围</h2>
+      <div class="mt-3 flex flex-wrap items-center gap-1.5">
+        <span v-for="d in myDeptChips" :key="d" class="rounded-full bg-accent-soft px-3 py-1 text-[12.5px] font-medium text-accent-text">{{ d }}</span>
+        <span v-if="!myDeptChips.length" class="text-sm text-muted-foreground">—</span>
       </div>
-    </div>
+      <p class="mt-2.5 text-xs text-muted-foreground">可检索以上部门的内部文档，以及全公司公开文档；需要其他部门资料时，答案会提示你找对应管理员。</p>
+    </section>
 
     <section class="rounded-xl border border-border bg-card p-5">
       <h2 class="flex items-center gap-2 text-sm font-bold text-foreground"><Sparkles :size="15" :stroke-width="1.75" class="text-accent-text" /> 热门问题</h2>
@@ -106,13 +105,40 @@ onMounted(async () => {
         <MessagesSquare :size="15" :stroke-width="1.75" /> 去问答
       </button>
     </section>
+
+    <!-- 交叉入口：没答上的问题 → 知识贡献 -->
+    <section class="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-panel/60 px-5 py-4">
+      <span class="grid size-9 shrink-0 place-items-center rounded-[10px] bg-accent-soft text-accent-text"><Lightbulb :size="17" :stroke-width="1.75" /></span>
+      <div class="min-w-0 flex-1">
+        <div class="text-[13.5px] font-semibold text-foreground">遇到没答上来的问题？</div>
+        <div class="mt-0.5 text-xs text-muted-foreground">把你知道的答案贡献出来，采纳后全部门都能搜到。</div>
+      </div>
+      <RouterLink
+        to="/contribute"
+        class="shrink-0 rounded-lg border border-border bg-card px-3.5 py-2 text-[12.5px] font-semibold text-accent-text transition hover:border-accent-strong hover:bg-accent-soft"
+      >去知识贡献</RouterLink>
+    </section>
   </div>
 
   <!-- ───────── 管理员：分 tab 管理台 ───────── -->
   <div v-else class="mx-auto w-full max-w-5xl space-y-6 px-6 py-8">
-    <header class="flex items-baseline justify-between border-b border-border pb-4">
+    <header class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border pb-4">
       <h1 class="font-serif text-2xl tracking-tight text-foreground">知识库管理</h1>
-      <span class="font-mono text-xs text-muted-foreground">{{ identity?.managedOwnerDepts.join(' · ') || '—' }}</span>
+      <!-- 管辖范围：kb_admin 全库收成一枚，dept_admin 逐个列中文名（组码只在悬停提示里） -->
+      <div class="flex flex-wrap items-center justify-end gap-1.5">
+        <span
+          v-if="isKbAdmin"
+          class="rounded-full border border-border bg-panel px-2.5 py-1 text-[11.5px] font-medium text-muted-foreground"
+          :title="managedDepts.join(' · ')"
+        >全库 · {{ managedDepts.length }} 个部门</span>
+        <template v-else>
+          <span
+            v-for="d in managedDepts" :key="d"
+            class="rounded-full border border-border bg-panel px-2.5 py-1 text-[11.5px] font-medium text-muted-foreground" :title="d"
+          >{{ deptLabel(d) }}</span>
+        </template>
+        <span v-if="!managedDepts.length" class="text-xs text-muted-foreground">—</span>
+      </div>
     </header>
 
     <!-- 子 tab：概览看板 / 文档管理 -->
@@ -154,6 +180,7 @@ onMounted(async () => {
 
     <VersionHistoryModal />
     <AccessRequestModal />
+    <ShareDocModal />
     <ConfirmDialog />
   </div>
 </template>

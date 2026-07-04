@@ -1652,11 +1652,14 @@ def _suggest_rephrase(question: str, limit: int = 2) -> List[str]:
 # dept_admin 仅其 dept_admin_grant 授予的 owner_dept（绝不用读组推导）。
 # ═══════════════════════════════════════════════════════════════
 
-# 10 个 ACL 组的中文标签（权限选择器展示用；单一来源 retriever._VALID_ACL_GROUPS）
+# 15 个 ACL 组的中文标签（权限选择器展示用；单一来源 retriever._VALID_ACL_GROUPS；
+# 2026-07-03 扩容 5 组，与 console GROUP_LABEL / dept_ancestry 锚表同步）
 _KB_ACL_GROUP_LABELS = {
     "finance": "财务", "it": "信息技术", "marketing": "营销", "production": "生产",
-    "pmc": "计划 PMC", "admin": "行政", "hr": "人力资源", "rd": "研发",
+    "pmc": "生产计划部", "admin": "行政", "hr": "人力资源", "rd": "研发",
     "quality": "品质技术", "supply": "资材供应",
+    "overseas": "海外", "audit": "审计", "legal": "法务",
+    "engineering": "工程", "corn_eco": "玉米环保",
 }
 
 
@@ -1933,12 +1936,15 @@ KbApprovalRequest = _routes_kb_console.KbApprovalRequest
 KbRetireRequest = _routes_kb_console.KbRetireRequest
 KbRetireResponse = _routes_kb_console.KbRetireResponse
 KbRestoreResponse = _routes_kb_console.KbRestoreResponse
+KbSetVisibilityRequest = _routes_kb_console.KbSetVisibilityRequest
+KbSetVisibilityResponse = _routes_kb_console.KbSetVisibilityResponse
 kb_upload_url = _routes_kb_console.kb_upload_url
 kb_register = _routes_kb_console.kb_register
 kb_approve = _routes_kb_console.kb_approve
 kb_reject = _routes_kb_console.kb_reject
 kb_retire = _routes_kb_console.kb_retire
 kb_restore = _routes_kb_console.kb_restore
+kb_set_visibility = _routes_kb_console.kb_set_visibility
 KbPendingItem = _routes_kb_console.KbPendingItem
 KbPendingResponse = _routes_kb_console.KbPendingResponse
 kb_pending_approvals = _routes_kb_console.kb_pending_approvals
@@ -1951,6 +1957,8 @@ KbAccessRequestItem = _routes_kb_access.KbAccessRequestItem
 KbAccessRequestListResponse = _routes_kb_access.KbAccessRequestListResponse
 KbAccessGrantItem = _routes_kb_access.KbAccessGrantItem
 KbAccessGrantListResponse = _routes_kb_access.KbAccessGrantListResponse
+KbAccessGrantCreate = _routes_kb_access.KbAccessGrantCreate
+KbAccessGrantCreateResponse = _routes_kb_access.KbAccessGrantCreateResponse
 KbAdminItem = _routes_kb_access.KbAdminItem
 KbAdminListResponse = _routes_kb_access.KbAdminListResponse
 KbAdminGrantRequest = _routes_kb_access.KbAdminGrantRequest
@@ -1961,6 +1969,7 @@ MyAccessRequestListResponse = _routes_kb_access.MyAccessRequestListResponse
 kb_access_request_submit = _routes_kb_access.kb_access_request_submit
 kb_access_requests_list = _routes_kb_access.kb_access_requests_list
 kb_access_grants_list = _routes_kb_access.kb_access_grants_list
+kb_access_grant_create = _routes_kb_access.kb_access_grant_create
 _APPROVAL_HISTORY_LIMIT = _routes_kb_access._APPROVAL_HISTORY_LIMIT
 _TZ_PACIFIC_TO_BJ = _routes_kb_access._TZ_PACIFIC_TO_BJ
 _parse_admin_target = _routes_kb_access._parse_admin_target

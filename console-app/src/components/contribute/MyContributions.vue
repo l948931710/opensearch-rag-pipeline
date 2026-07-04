@@ -9,8 +9,8 @@ const { myContribs, loadErrors, isBusy, loadMine, retryContribution } = useContr
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题，不再另设分区眉标 -->
   <section>
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">我的贡献</p>
     <LoadError class="mb-2.5" :message="loadErrors['mine']" @retry="loadMine()" />
     <div class="overflow-hidden rounded-[15px] border border-border bg-card">
       <div class="flex items-center gap-2.5 border-b border-border px-[18px] py-3">

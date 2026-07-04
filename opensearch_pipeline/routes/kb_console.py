@@ -1134,6 +1134,20 @@ class KbRestoreResponse(BaseModel):
     note: str = ""
 
 
+class KbSetVisibilityRequest(BaseModel):
+    doc_id: str
+    permission_level: str            # dept_internal / public / restricted（受 sanitize）
+    reason: Optional[str] = None
+
+
+class KbSetVisibilityResponse(BaseModel):
+    doc_id: str = ""
+    permission_level: str = ""
+    changed: bool = False
+    already: bool = False
+    note: str = ""
+
+
 @router.post("/api/kb/upload-url", response_model=KbUploadUrlResponse)
 def kb_upload_url(req: KbUploadUrlRequest, request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
@@ -1648,6 +1662,120 @@ def kb_restore(req: KbRetireRequest, request: Request,
     return KbRestoreResponse(
         doc_id=req.doc_id, restored=True,
         note="已恢复上线：重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复")
+
+
+@router.post("/api/kb/set-visibility", response_model=KbSetVisibilityResponse)
+def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
+                      identity: Optional[Identity] = Depends(current_identity)):
+    """重设【已上线】文档的基础可见范围（dept_internal / public / restricted），无需重新上传。
+
+    被动申请流/主动共享改的是【跨部门授权】(allowed_depts)；本端点改的是文档【自身的基础级别】——
+    两者正交，均汇入同一 Phase D 投影。授权（与 retire/restore 同款不对称）：
+      - _kb_can_manage(owner_dept)（dept_admin 限 managed，kb_admin 全权）；
+      - **涉及 public 需 kb_admin**：目标=public（放宽到全公司）或当前=public（收窄影响全公司可见的文档）
+        时，dept_admin 一律 403——与"上传公开需审批"同一不对称。dept_admin 只能在
+        dept_internal ↔ restricted 之间调本部门文档。
+
+    各方向语义（与 spot_checker 收紧 / retire 下线 / restore 重推 同款机制，绝不新造）：
+      - → restricted（归档下线）：停用本版本 chunk（is_active=0）→ 离开检索；HA3 清除交 gated 运维。
+      - restricted → dept_internal/public（重新上线）：重新激活 chunk + 标脏 NOT_INDEXED（stage-3 重推）。
+      - public ↔ dept_internal（均在检索内）：仅改级别 + 标脏重推，让 HA3 chunk 带上新 permission_level。
+    并同步 chunk_meta.permission_level（检索/gate 读的去规范化副本），再经 materialize 重算 allowed_depts
+    （dept_internal→投影 approved 授权；public/restricted→gate 清空）。RAG_ALLOWED_DEPTS_ACL 关时投影为
+    no-op（仅改 RDS 元数据，dev/test 安全）；提交后失效 deny 缓存。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    # 显式管理动作：严格校验原值（别名 internal/private→dept_internal），未知/垃圾直接 400——不走
+    # normalize_permission_level 的 fail-closed→restricted（那是 ingest 启发式路径），避免一个笔误静默归档文档。
+    target = (req.permission_level or "").strip().lower()
+    target = {"internal": "dept_internal", "private": "dept_internal"}.get(target, target)
+    if target not in ("dept_internal", "public", "restricted"):
+        raise HTTPException(status_code=400, detail="非法可见范围（须为 仅本部门 / 全公司 / 受限）")
+    assert_metadata_write_allowed("kb_set_visibility", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    owner_dept = cur_perm = ""
+    cur_ver = 1
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, cur_perm = (row[0] or ""), (row[1] or "")
+                status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权修改该文档（owner_dept 不在管理范围）")
+                # public 涉及全公司可见 → 收窄/放宽均需 kb_admin（与 retire/restore/上传同款不对称）
+                if (target == "public" or cur_perm == "public") and kb.role != ROLE_KB_ADMIN:
+                    raise HTTPException(status_code=403, detail="涉及全公司公开的可见范围变更需知识库管理员操作")
+                if str(status).lower() != "active":
+                    raise HTTPException(status_code=409, detail="该文档非在线状态，请先恢复上线后再改可见范围")
+                if cur_perm == target:
+                    conn.commit()       # 幂等：级别未变
+                    return KbSetVisibilityResponse(doc_id=req.doc_id, permission_level=target,
+                                                   changed=False, already=True, note="可见范围未变化")
+                # 1) 基础级别：document_meta + chunk_meta 去规范化副本（检索/gate 读后者）
+                cur.execute(f"UPDATE {_kb_db()}.document_meta SET permission_level=%s, updated_at=NOW() "
+                            "WHERE doc_id=%s", (target, req.doc_id))
+                cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET permission_level=%s "
+                            "WHERE doc_id=%s AND version_no=%s", (target, req.doc_id, cur_ver))
+                # 2) 检索存续：restricted=离开检索（停用 chunk）；重新上线=激活 chunk + 标脏重推
+                if target == "restricted":
+                    cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=0 "
+                                "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
+                else:
+                    cur.execute(f"UPDATE {_kb_db()}.chunk_meta "
+                                f"SET is_active=1, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+                                "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
+                    if cur_perm != "restricted":
+                        # 双向 public↔dept_internal（本就 is_active=1）：显式标脏，让 stage-3 重推带新级别的 chunk
+                        cur.execute(f"UPDATE {_kb_db()}.chunk_meta "
+                                    f"SET index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+                                    "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
+                # 3) ACL 重投影（flag 门控，与主动共享/decide 同一注入点）：读己写的新 permission_level →
+                #    dept_internal 投影 approved 授权 / public·restricted 清空 allowed_depts。
+                if get_config().rag.allowed_depts_acl:
+                    from opensearch_pipeline.access_grants import (
+                        enqueue_acl_projection, materialize_doc_allowed_depts,
+                    )
+                    enqueue_acl_projection(cur, req.doc_id, reason="set_visibility")
+                    try:
+                        materialize_doc_allowed_depts(cur, req.doc_id)
+                    except Exception as _pe:
+                        logger.warning("set_visibility allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
+                                       req.doc_id, _pe)
+                write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="SET_VISIBILITY",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"owner={owner_dept} {cur_perm}->{target} reason={(req.reason or '')[:200]}",
+                            cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_set_visibility 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"修改可见范围失败 (trace: {trace_id})")
+    try:
+        from opensearch_pipeline.retriever import invalidate_deny_cache
+        invalidate_deny_cache(req.doc_id or None)
+    except Exception as _ie:   # noqa: BLE001
+        logger.warning("deny 缓存失效失败（忽略，TTL 兜底）doc=%s: %s", req.doc_id, _ie)
+    _note = {"restricted": "已下线归档：停止进入检索；HA3 清除将在下次维护完成（可再改回恢复）",
+             "public": "已改为全公司公开：下次维护重推后全员可检索",
+             "dept_internal": "已改为仅本部门：下次维护重推后按部门权限过滤"}.get(target, "")
+    return KbSetVisibilityResponse(doc_id=req.doc_id, permission_level=target, changed=True,
+                                   already=False, note=_note)
 
 
 class KbPendingItem(BaseModel):

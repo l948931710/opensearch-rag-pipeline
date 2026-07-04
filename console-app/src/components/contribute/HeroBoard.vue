@@ -7,16 +7,19 @@ import { useContribute } from '@/composables/useContribute'
 // 知识贡献英雄榜：按【已入库(searchable)】贡献数排名（真正闭环才计入）。
 const { heroes } = useContribute()
 const me = computed(() => useSession().identity?.userId || '')
+// 名次奖牌调：金（琥珀）/ 银（灰）/ 铜（暖橙，借调 --c-str），4 名以后素灰。
 const RANK_TONE: Record<number, string> = {
-  1: 'bg-st-warn/15 text-st-warn', 2: 'bg-panel text-muted-foreground', 3: 'bg-accent-soft text-accent-text',
+  1: 'bg-st-busy/15 text-st-busy',
+  2: 'bg-panel text-muted-foreground',
+  3: 'bg-[color-mix(in_srgb,var(--c-str)_13%,transparent)] text-[var(--c-str)]',
 }
-function rankCls(r: number) { return RANK_TONE[r] || 'bg-panel text-muted-foreground' }
+function rankCls(r: number) { return RANK_TONE[r] || 'bg-panel text-faint' }
 function initial(name: string) { return (name || '?').trim().charAt(0) || '?' }
 </script>
 
 <template>
+  <!-- 卡头已带图标+标题，不再另设分区眉标 -->
   <section v-if="heroes.length">
-    <p class="mb-2.5 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint">知识贡献英雄榜</p>
     <div class="overflow-hidden rounded-[15px] border border-border bg-card">
       <div class="flex items-center gap-2.5 border-b border-border px-[18px] py-3">
         <Trophy :size="16" :stroke-width="1.75" class="text-st-warn" />

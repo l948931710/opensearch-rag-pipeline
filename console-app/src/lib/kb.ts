@@ -17,12 +17,18 @@ export function unsupportedNames(files: Array<{ name: string }>): string[] {
   return files.filter((f) => !UPLOAD_EXTS.includes(extOf(f.name))).map((f) => f.name)
 }
 
-// 部门 ACL 组码 → 中文（owner_dept 存组码）。
+// 部门 ACL 组码 → 中文（owner_dept 存组码）。2026-07-03 扩容 5 组（与 retriever._VALID_ACL_GROUPS 同步）。
 export const GROUP_LABEL: Record<string, string> = {
-  finance: '财务', it: '信息技术', marketing: '营销', production: '生产', pmc: '计划PMC',
+  finance: '财务', it: '信息技术', marketing: '营销', production: '生产', pmc: '生产计划部',
   admin: '行政', hr: '人力资源', rd: '研发', quality: '品质技术', supply: '资材供应',
+  overseas: '海外', audit: '审计', legal: '法务', engineering: '工程', corn_eco: '玉米环保',
 }
-export const deptLabel = (code: string) => GROUP_LABEL[code] || code
+// 生产子线是合法 owner_dept（永不归并回 production）——只做展示映射，
+// 不并入 GROUP_LABEL：CONTRIB_DEPT_OPTS 以 GROUP_LABEL 的键为贡献归属选项，子线不应出现在下拉里。
+export const SUBDEPT_LABEL: Record<string, string> = {
+  production_mold: '生产·模具', production_paper_cup: '生产·纸杯', production_thermoforming: '生产·吸塑',
+}
+export const deptLabel = (code: string) => GROUP_LABEL[code] || SUBDEPT_LABEL[code] || code
 
 // 可见范围。
 export const PERM_LABEL: Record<string, string> = {

@@ -2,7 +2,7 @@
 import { onMounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
-import { Sparkles } from 'lucide-vue-next'
+import { Sprout } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useAuth, hasPendingVersion } from '@/composables/useAuth'
 import { useAsk } from '@/composables/useAsk'
@@ -49,7 +49,7 @@ watch(ready, (r) => {
     />
     <div class="relative w-full max-w-sm text-center">
       <div class="mx-auto grid size-14 place-items-center rounded-2xl bg-accent-strong shadow-lg shadow-[color-mix(in_srgb,var(--accent)_35%,transparent)]">
-        <Sparkles :size="30" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
+        <Sprout :size="30" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
       </div>
       <div class="mt-5 font-serif text-3xl tracking-tight">富岭知识库</div>
 

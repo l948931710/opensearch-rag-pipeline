@@ -48,7 +48,7 @@ const {
           <label class="mb-1.5 block text-[11px] font-bold uppercase tracking-[0.04em] text-faint">归属分类</label>
           <select
             v-model="formDept"
-            class="w-full cursor-pointer rounded-[9px] border border-border bg-bg px-[11px] py-[9px] text-[13.5px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15"
+            class="ui-select w-full cursor-pointer rounded-[9px] border border-border bg-bg px-[11px] py-[9px] text-[13.5px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15"
           >
             <option v-for="d in CONTRIB_DEPT_OPTS" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
