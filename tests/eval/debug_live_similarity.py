@@ -4,12 +4,11 @@ import sys
 import json
 import requests
 import numpy as np
-from dotenv import load_dotenv
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(PROJECT_ROOT)
 
-from opensearch_pipeline.config import get_config
+from opensearch_pipeline.config import get_config  # noqa: E402  (path bootstrap above)
 
 def get_live_embedding(text: str, api_key: str, model: str, base_url: str) -> list:
     url = f"{base_url}/embeddings"
@@ -67,7 +66,7 @@ def main():
     q_live_vec = np.array(get_live_embedding(q_text, api_key, model, base_url))
     c_live_vec = np.array(get_live_embedding(c_text, api_key, model, base_url))
     
-    live_sim = np.dot(q_live_vec, q_live_vec) # 1.0
+    _ = np.dot(q_live_vec, q_live_vec)  # 自相似 sanity（应为 1.0）
     sim = np.dot(q_live_vec, c_live_vec) / (np.linalg.norm(q_live_vec) * np.linalg.norm(c_live_vec))
     print(f"\nLive Cosine Similarity: {sim:.6f}")
     
