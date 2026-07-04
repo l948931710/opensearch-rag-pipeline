@@ -157,7 +157,7 @@ def test_non_active_rejected(monkeypatch):
 
 # ── 三向语义 ──────────────────────────────────────────────────────
 def test_to_restricted_deactivates_chunks(monkeypatch):
-    """→ restricted：改级别 + 停用本版本 chunk（离开检索），不激活。"""
+    """→ restricted：改级别 + 停用【全部活跃版本】chunk（与 retire 同款）+ 全版本喂 PENDING_DELETE。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
     monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
@@ -170,6 +170,25 @@ def test_to_restricted_deactivates_chunks(monkeypatch):
     assert "chunk_meta SET is_active=0" in s
     assert "SET is_active=1" not in s                   # 收紧方向绝不激活（区别于 deactivate 的 WHERE is_active=1）
     assert conn.committed is True
+    # 全版本停用：deactivate 的 WHERE 不得限定 version_no（双版本残留一起下线）
+    deact = [(q, p) for q, p in conn.calls if "chunk_meta SET is_active=0" in q]
+    assert deact and all("version_no" not in q for q, _ in deact)
+    # HA3 真下线：喂 PENDING_DELETE outbox（stage-3 reconcile_pending_deletes 每轮 drain）
+    assert "document_version SET index_status='PENDING_DELETE'" in s
+
+
+def test_reonline_clears_pending_delete(monkeypatch):
+    """restricted → dept_internal：撤销当前版本挂着的 PENDING_DELETE/DELETED——否则下轮 reconcile
+    删 HA3 后把 chunk 打回 is_active=0，正好撤销这次重新上线。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    conn = _install(monkeypatch, _Conn(meta_row=("marketing", "restricted", "active", 2)))
+    resp = _call("dept_internal")
+    assert resp.changed is True
+    s = _sql(conn)
+    assert "document_version SET index_status='NOT_INDEXED'" in s
+    assert "SET index_status='PENDING_DELETE'" not in s    # 重上线方向绝不入删除队列
 
 
 def test_restricted_to_dept_internal_reactivates(monkeypatch):

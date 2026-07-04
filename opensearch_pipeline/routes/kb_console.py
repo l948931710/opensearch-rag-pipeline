@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.qa_logger import _op_db
-from opensearch_pipeline.reindex_states import ChunkIndexStatus
+from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus
 from opensearch_pipeline.request_context import get_request_id
 
 # api 驻留共享件（模型/助手/依赖）。from-import 拷贝绑定在这里是安全的：
@@ -1696,8 +1696,10 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
         dept_internal ↔ restricted 之间调本部门文档。
 
     各方向语义（与 spot_checker 收紧 / retire 下线 / restore 重推 同款机制，绝不新造）：
-      - → restricted（归档下线）：停用本版本 chunk（is_active=0）→ 离开检索；HA3 清除交 gated 运维。
-      - restricted → dept_internal/public（重新上线）：重新激活 chunk + 标脏 NOT_INDEXED（stage-3 重推）。
+      - → restricted（归档下线）：停用【全部活跃版本】chunk（与 retire 同款，收掉双版本残留）+
+        全版本喂 PENDING_DELETE outbox（stage-3 每轮 reconcile_pending_deletes 自动删 HA3）。
+      - restricted → dept_internal/public（重新上线）：重新激活当前版本 chunk + 标脏 NOT_INDEXED
+        （stage-3 重推），并撤销当前版本挂着的 PENDING_DELETE/DELETED（防 reconcile 撤销重上线）。
       - public ↔ dept_internal（均在检索内）：仅改级别 + 标脏重推，让 HA3 chunk 带上新 permission_level。
     并同步 chunk_meta.permission_level（检索/gate 读的去规范化副本），再经 materialize 重算 allowed_depts
     （dept_internal→投影 approved 授权；public/restricted→gate 清空）。RAG_ALLOWED_DEPTS_ACL 关时投影为
@@ -1753,12 +1755,31 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                             "WHERE doc_id=%s AND version_no=%s", (target, req.doc_id, cur_ver))
                 # 2) 检索存续：restricted=离开检索（停用 chunk）；重新上线=激活 chunk + 标脏重推
                 if target == "restricted":
+                    # 与 retire 同款【全部活跃版本】停用（不限当前版本）：双版本 gap 残留的旧版
+                    # is_active=1 行只停当前版本会继续被检索/邻居拼接，且 HA3 清除漏删无限期滞留。
                     cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=0 "
-                                "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
+                                "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
+                    # 真实检索下线不能只靠 RDS：HA3 行仍带旧 permission_level（原 public 的对全员放行，
+                    # deny gate 跳过 public 行）。喂 PENDING_DELETE outbox——stage-3 每轮
+                    # reconcile_pending_deletes 自动 drain，删 HA3 后落 DELETED（全版本入队，顺带
+                    # 清掉双版本残留）。
+                    cur.execute(f"UPDATE {_kb_db()}.document_version "
+                                f"SET index_status='{DocVersionIndexStatus.PENDING_DELETE}' "
+                                f"WHERE doc_id=%s AND index_status NOT IN "
+                                f"('{DocVersionIndexStatus.DELETED}', '{DocVersionIndexStatus.PENDING_DELETE}')",
+                                (req.doc_id,))
                 else:
                     cur.execute(f"UPDATE {_kb_db()}.chunk_meta "
                                 f"SET is_active=1, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
                                 "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
+                    # 撤销可能在挂的 PENDING_DELETE（restricted→改回 未跑维护的窗口）：否则下轮
+                    # reconcile 会删 HA3 后把 chunk 打回 is_active=0/DELETED，正好撤销这次重新上线。
+                    # DELETED（已删过）也拨回 NOT_INDEXED，交 stage-3 重推。仅当前版本；旧版本照删。
+                    cur.execute(f"UPDATE {_kb_db()}.document_version "
+                                f"SET index_status='{DocVersionIndexStatus.NOT_INDEXED}' "
+                                f"WHERE doc_id=%s AND version_no=%s AND index_status IN "
+                                f"('{DocVersionIndexStatus.PENDING_DELETE}', '{DocVersionIndexStatus.DELETED}')",
+                                (req.doc_id, cur_ver))
                     if cur_perm != "restricted":
                         # 双向 public↔dept_internal（本就 is_active=1）：显式标脏，让 stage-3 重推带新级别的 chunk
                         cur.execute(f"UPDATE {_kb_db()}.chunk_meta "
@@ -1793,7 +1814,7 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
         invalidate_deny_cache(req.doc_id or None)
     except Exception as _ie:   # noqa: BLE001
         logger.warning("deny 缓存失效失败（忽略，TTL 兜底）doc=%s: %s", req.doc_id, _ie)
-    _note = {"restricted": "已下线归档：停止进入检索；HA3 清除将在下次维护完成（可再改回恢复）",
+    _note = {"restricted": "已归档受限：已停止新收录并排队索引清除；从检索彻底移除将在下次维护完成（可再改回恢复）",
              "public": "已改为全公司公开：下次维护重推后全员可检索",
              "dept_internal": "已改为仅本部门：下次维护重推后按部门权限过滤"}.get(target, "")
     return KbSetVisibilityResponse(doc_id=req.doc_id, permission_level=target, changed=True,
