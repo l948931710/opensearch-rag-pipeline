@@ -161,36 +161,42 @@ def build_dag3_chunk_to_opensearch() -> DAG:
         "01", "生成 Embedding",
         node_generate_embeddings,
         depends_on=["00"],
+        skip_on_truthy="dag3_no_work",
         description="调用 embedding 模型生成向量",
     ))
     dag.add_node(DAGNode(
         "02", "构建 Bulk Payload",
         node_build_opensearch_payload,
         depends_on=["01"],
+        skip_on_truthy="dag3_no_work",
         description="组装 OpenSearch NDJSON 格式",
     ))
     dag.add_node(DAGNode(
         "03", "推送到 OpenSearch",
         node_push_to_opensearch,
         depends_on=["02"],
+        skip_on_truthy="dag3_no_work",
         description="批量写入 OpenSearch 索引",
     ))
     dag.add_node(DAGNode(
         "04", "回写索引状态",
         node_update_index_status,
         depends_on=["03"],
+        skip_on_truthy="dag3_no_work",
         description="更新 chunk_meta.index_status 等字段，索引失败时中断 DAG 防止停用旧版本",
     ))
     dag.add_node(DAGNode(
         "04b", "校验并补推 (parity verify)",
         node_verify_and_repush,
         depends_on=["04"],
+        skip_on_truthy="dag3_no_work",
         description="推送后 HA3 物理存在性校验 + 有界补推；静默丢失补救，补救失败/无法确认则中断防止停用旧版本（RAG_STAGE3_PARITY_VERIFY 默认开启，置 false 可关）",
     ))
     dag.add_node(DAGNode(
         "05", "停用旧版本",
         node_deactivate_old_chunks,
         depends_on=["04b"],
+        skip_on_truthy="dag3_no_work",
         description="在新版本索引确认成功后，停用 RDS 和 OpenSearch 中的旧版本 chunk",
     ))
 

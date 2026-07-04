@@ -39,6 +39,7 @@ class DAGNode:
         depends_on: Optional[List[str]] = None,
         description: str = "",
         skip_on_empty: Optional[str] = None,
+        skip_on_truthy: Optional[str] = None,
     ):
         self.node_id = node_id
         self.name = name
@@ -46,6 +47,7 @@ class DAGNode:
         self.depends_on = depends_on or []
         self.description = description
         self.skip_on_empty = skip_on_empty  # context key: 如果为空则跳过
+        self.skip_on_truthy = skip_on_truthy  # context key: 如果为真则跳过（如 dag3_no_work）
 
         self.status = NodeStatus.PENDING
         self.start_time: Optional[float] = None
@@ -158,12 +160,11 @@ class DAG:
                 _log_node(node, "⏭️")
                 return
 
-        # Check dag3_no_work condition specifically for DAG 3 downstream nodes
-        if (self.dag_id == "dag3_chunk_to_opensearch" and 
-            self.context.get("dag3_no_work") and 
-            node.func.__name__ != "node_acquire_index_lock"):
+        # 检查 skip_on_truthy 条件（领域知识声明在 dag_definitions，引擎保持通用）
+        if node.skip_on_truthy and self.context.get(node.skip_on_truthy):
             node.status = NodeStatus.SKIPPED
-            node.error = f"skipped because ctx['dag3_no_work'] is True. Reason: {self.context.get('skip_reason', 'No work')}"
+            node.error = (f"skipped because ctx['{node.skip_on_truthy}'] is True. "
+                          f"Reason: {self.context.get('skip_reason', 'No work')}")
             _log_node(node, "⏭️")
             return
 
