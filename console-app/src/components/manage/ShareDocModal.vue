@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { X, Loader2, Lock } from 'lucide-vue-next'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem, type DocItem } from '@/composables/useKb'
+import { useDialog } from '@/composables/useDialog'
 
 // 文档权限弹窗（owner 侧）：
 //   上 = 基础可见范围（仅本部门 / 全公司 / 受限，POST set-visibility；公开需 kb_admin）；
 //   下 = 跨部门共享（仅 dept_internal 时显示）：已共享逐行可撤销 + 新增目标 chips。
 const { shareCtx, shareBusy, shareTargets, isBusy, isKbAdmin, grantedDeptsOf, docGrantRows, submitShare, revokeAccess, setVisibility, closeShare } = useKb()
+const { confirm, dialog } = useDialog()
 
 const picked = ref<string[]>([])
 const reason = ref('')
@@ -49,9 +51,24 @@ function toggle(t: string) {
 }
 const rowLabel = (csv: string) => csv.split(',').map((c) => deptLabel(c.trim())).filter(Boolean).join('、')
 
+// 改级别先过确认（与台账批量路径同词表：受限 = danger）。此前单击即生效——
+// 误触「受限」文档立刻离开检索、误触「全公司」立刻全员可见，是全页唯一裸奔的高危写操作。
+const LEVEL_CONFIRM_MSG: Record<string, (title: string) => string> = {
+  restricted: (t) => `把《${t}》改为「受限」？\n受限 = 下线归档、离开检索：所有部门（含本部门）将搜不到本文档（可再改回恢复）。`,
+  public: (t) => `把《${t}》改为「全公司」？\n全员（含仅有公开权限的账号）都将能检索到本文档。`,
+  dept_internal: (t) => `把《${t}》改为「仅本部门」？\n此后仅归属部门与已共享部门可检索。`,
+}
 async function onPickLevel(key: string) {
   const d = shareCtx.value
   if (!d || key === curLevel.value || visBusy.value) return
+  const title = d.title || d.original_filename || d.doc_id
+  const okGo = await confirm({
+    title: '改可见范围',
+    confirmText: `改为「${LEVELS.find((l) => l.key === key)?.label || key}」`,
+    danger: key === 'restricted',
+    message: (LEVEL_CONFIRM_MSG[key] || ((t: string) => `把《${t}》改为「${key}」？`))(title),
+  })
+  if (!okGo) return
   err.value = ''; visBusy.value = key
   const e = await setVisibility(d as DocItem, key, '权限弹窗调整')
   visBusy.value = ''
@@ -73,6 +90,15 @@ async function onRevoke(g: AccessGrantItem) {
 }
 
 function close() { if (!shareBusy.value && !visBusy.value) { err.value = ''; closeShare() } }
+
+// Esc 关闭（对齐 ConfirmDialog/VersionHistoryModal）。全局确认框叠在上层时不响应——
+// stopPropagation 拦不住同一 window target 上的其他监听器，必须显式让位，否则一次 Esc 连关两层。
+function onKey(e: KeyboardEvent) { if (e.key === 'Escape' && shareCtx.value && !dialog.value.open) close() }
+watch(shareCtx, (v) => {
+  if (v) window.addEventListener('keydown', onKey)
+  else window.removeEventListener('keydown', onKey)
+})
+onUnmounted(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>

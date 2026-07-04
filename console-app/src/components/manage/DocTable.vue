@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, ExternalLink } from 'lucide-vue-next'
+import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, ExternalLink, Loader2 } from 'lucide-vue-next'
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
@@ -8,7 +8,7 @@ import AccessSyncPill from './AccessSyncPill.vue'
 import LoadError from './LoadError.vue'
 import { useDialog } from '@/composables/useDialog'
 
-const { confirm } = useDialog()
+const { confirm, notice } = useDialog()
 
 const {
   docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, sortKey, sortDir, isDeptAdmin, isKbAdmin,
@@ -83,14 +83,20 @@ const COLS: { key: SortKey; label: string }[] = [
 
 function arrow(k: SortKey) { return sortKey.value === k ? (sortDir.value === 1 ? '↑' : '↓') : '' }
 
+// 退役/恢复的行级在途态：useKb 侧 retireBusy 只做全局互斥不进模板，此前按钮点了没任何
+// 反馈（网络慢时用户会疑惑再点）。失败提示走 notice()——原生 alert 样式脱节且不可访问。
+const retireRowId = ref('')
+
 async function onRetire(d: DocItem) {
   const okGo = await confirm({
     title: '退役文档', confirmText: '退役', danger: true,
     message: `确认退役《${d.title || d.original_filename || d.doc_id}》？\n将标记下线、停止作为升版目标。从检索彻底移除会在下次维护完成（本操作可逆）。`,
   })
   if (!okGo) return
+  retireRowId.value = d.doc_id
   const r = await retire(d)
-  if (!r.ok && r.msg) alert('退役失败：' + r.msg)
+  retireRowId.value = ''
+  if (!r.ok && r.msg) void notice({ title: '退役失败', message: r.msg, danger: true })
 }
 
 async function onRestore(d: DocItem) {
@@ -99,8 +105,10 @@ async function onRestore(d: DocItem) {
     message: `确认恢复上线《${d.title || d.original_filename || d.doc_id}》？\n将重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复。`,
   })
   if (!okGo) return
+  retireRowId.value = d.doc_id
   const r = await restore(d)
-  if (!r.ok && r.msg) alert('恢复失败：' + r.msg)
+  retireRowId.value = ''
+  if (!r.ok && r.msg) void notice({ title: '恢复失败', message: r.msg, danger: true })
 }
 </script>
 
@@ -322,16 +330,16 @@ async function onRestore(d: DocItem) {
             ><FilePlus2 :size="14" :stroke-width="1.75" /></button>
             <button
               v-if="d.status_badge !== '已退役'"
-              type="button" aria-label="退役下线"
-              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
+              type="button" aria-label="退役下线" :disabled="retireRowId === d.doc_id"
+              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail disabled:opacity-50"
               title="退役下线" @click="onRetire(d)"
-            ><Archive :size="14" :stroke-width="1.75" /></button>
+            ><Loader2 v-if="retireRowId === d.doc_id" :size="14" :stroke-width="1.75" class="animate-spin" /><Archive v-else :size="14" :stroke-width="1.75" /></button>
             <button
               v-else
-              type="button" aria-label="恢复上线"
-              class="grid size-7 place-items-center rounded-md text-st-live transition hover:bg-st-live/10"
+              type="button" aria-label="恢复上线" :disabled="retireRowId === d.doc_id"
+              class="grid size-7 place-items-center rounded-md text-st-live transition hover:bg-st-live/10 disabled:opacity-50"
               title="恢复上线" @click="onRestore(d)"
-            ><ArchiveRestore :size="14" :stroke-width="1.75" /></button>
+            ><Loader2 v-if="retireRowId === d.doc_id" :size="14" :stroke-width="1.75" class="animate-spin" /><ArchiveRestore v-else :size="14" :stroke-width="1.75" /></button>
           </template>
           <!-- 其他部门（只读）：申请授权 / 审批中 / 同步中 / 已放行 -->
           <template v-else>

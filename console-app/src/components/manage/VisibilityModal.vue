@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { onUnmounted, watch } from 'vue'
 import { Eye, Loader2, ShieldAlert, X } from 'lucide-vue-next'
 import { deptLabel, permLabel, viaLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
@@ -7,6 +8,14 @@ import { useKb } from '@/composables/useKb'
 // + 跨部门授权折叠成一份有效可见范围清单。判定在后端与检索同源（visibility-explain），
 // 本组件只展示，绝不在前端复算任何 ACL 规则。
 const { visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility } = useKb()
+
+// Esc 关闭（对齐 ConfirmDialog/VersionHistoryModal；挂 window，焦点不在弹窗内也能关）。
+function onKey(e: KeyboardEvent) { if (e.key === 'Escape') closeVisibility() }
+watch(visCtx, (v) => {
+  if (v) window.addEventListener('keydown', onKey)
+  else window.removeEventListener('keydown', onKey)
+})
+onUnmounted(() => window.removeEventListener('keydown', onKey))
 
 const VIA_TONE: Record<string, string> = {
   owner: 'border-accent-soft bg-accent text-accent-foreground',

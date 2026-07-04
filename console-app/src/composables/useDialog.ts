@@ -4,7 +4,7 @@ import { ref } from 'vue'
 // 单例：状态挂在模块作用域，<ConfirmDialog> 全局挂一份，各处 await confirm()/promptText() 即用。
 export interface DialogState {
   open: boolean
-  kind: 'confirm' | 'prompt'
+  kind: 'confirm' | 'prompt' | 'notice'
   title: string
   message: string
   confirmText: string
@@ -56,8 +56,20 @@ export function useDialog() {
     })
   }
 
-  function onConfirm() { _settle(state.value.kind === 'prompt' ? state.value.value : true) }
-  function onCancel() { _settle(state.value.kind === 'prompt' ? null : false) }
+  /** 告知框（单按钮，替代原生 alert()）：仅确认键，关闭即 resolve。失败/结果类提示用它，别再用 alert。 */
+  function notice(opts: ConfirmOpts): Promise<void> {
+    return new Promise((res) => {
+      _resolve = () => res()
+      state.value = {
+        open: true, kind: 'notice', title: opts.title || '提示', message: opts.message,
+        confirmText: opts.confirmText || '知道了', cancelText: '', placeholder: '', value: '', maxlength: 500, danger: !!opts.danger,
+      }
+    })
+  }
 
-  return { dialog: state, confirm, promptText, onConfirm, onCancel }
+  function onConfirm() { _settle(state.value.kind === 'prompt' ? state.value.value : true) }
+  // notice 只有一个按钮，Esc/遮罩关闭同样视为「已知悉」。
+  function onCancel() { _settle(state.value.kind === 'prompt' ? null : state.value.kind !== 'notice' ? false : true) }
+
+  return { dialog: state, confirm, promptText, notice, onConfirm, onCancel }
 }

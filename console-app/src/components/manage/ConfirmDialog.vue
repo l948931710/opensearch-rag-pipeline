@@ -1,17 +1,33 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { AlertTriangle } from 'lucide-vue-next'
 import { useDialog } from '@/composables/useDialog'
 
-// 全局自定义 确认/输入 对话框（替代原生 confirm/prompt）。在 ManageView 挂一份即可。
+// 全局自定义 确认/输入/告知 对话框（替代原生 confirm/prompt/alert）。在 ManageView 挂一份即可。
 const { dialog, onConfirm, onCancel } = useDialog()
 const taRef = ref<HTMLTextAreaElement | null>(null)
+const cancelRef = ref<HTMLButtonElement | null>(null)
+const confirmRef = ref<HTMLButtonElement | null>(null)
 const showCount = computed(() => dialog.value.kind === 'prompt')
 
-// 打开时聚焦输入框（prompt）；Esc/确认键由模板 @keydown 处理。
+// Esc 监听挂 window：模板 @keydown 只在焦点落于弹窗内时收得到事件——
+// 纯确认框打开时焦点仍留在触发按钮上，Esc 会石沉大海（键盘用户关不掉）。
+function onKey(e: KeyboardEvent) { if (e.key === 'Escape') { e.stopPropagation(); onCancel() } }
+
+// 打开时的初始焦点：prompt→输入框；confirm→「取消」（危险操作的安全默认，回车不误确认）；notice→唯一按钮。
 watch(() => dialog.value.open, (o) => {
-  if (o && dialog.value.kind === 'prompt') nextTick(() => taRef.value?.focus())
+  if (o) {
+    window.addEventListener('keydown', onKey)
+    void nextTick(() => {
+      if (dialog.value.kind === 'prompt') taRef.value?.focus()
+      else if (dialog.value.kind === 'notice') confirmRef.value?.focus()
+      else cancelRef.value?.focus()
+    })
+  } else {
+    window.removeEventListener('keydown', onKey)
+  }
 })
+onUnmounted(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
@@ -19,7 +35,7 @@ watch(() => dialog.value.open, (o) => {
     v-if="dialog.open"
     class="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 p-6"
     role="dialog" aria-modal="true"
-    @click="onCancel" @keydown.esc="onCancel"
+    @click="onCancel"
   >
     <div class="w-[440px] max-w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl" @click.stop>
       <div class="p-[22px] pb-0">
@@ -41,10 +57,15 @@ watch(() => dialog.value.open, (o) => {
         </div>
       </div>
       <div class="flex justify-end gap-2.5 px-[22px] py-4">
-        <button type="button" class="rounded-lg border border-border px-4 py-2 text-[13.5px] font-medium text-foreground transition hover:border-border-strong" @click="onCancel">{{ dialog.cancelText }}</button>
         <button
-          type="button"
-          class="rounded-lg px-4 py-2 text-[13.5px] font-semibold text-white transition hover:opacity-90"
+          v-if="dialog.kind !== 'notice'"
+          ref="cancelRef" type="button"
+          class="rounded-lg border border-border px-4 py-2 text-[13.5px] font-medium text-foreground transition hover:border-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          @click="onCancel"
+        >{{ dialog.cancelText }}</button>
+        <button
+          ref="confirmRef" type="button"
+          class="rounded-lg px-4 py-2 text-[13.5px] font-semibold text-white transition hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           :class="dialog.danger ? 'bg-st-fail' : 'bg-primary text-primary-foreground'"
           @click="onConfirm"
         >{{ dialog.confirmText }}</button>
