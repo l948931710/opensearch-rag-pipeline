@@ -26,6 +26,9 @@ class TestHelpers:
         assert should_append_history("", "SUCCESS") is False
         assert should_append_history(None, "SUCCESS") is False
         assert should_append_history(None, "NO_RESULT") is False
+        # SSE 客户端中途断开：截断回答仍入史（= 用户实际看到的内容），空的不入
+        assert should_append_history("半截回答", "CLIENT_DISCONNECTED") is True
+        assert should_append_history("", "CLIENT_DISCONNECTED") is False
 
     def test_constants(self):
         assert "未找到" in NO_RESULT_MESSAGE

@@ -184,7 +184,8 @@ def log_qa_session(
         latency_ms: 总耗时(ms)
         retrieval_latency_ms: 检索阶段耗时(ms)，第一版暂不填
         llm_latency_ms: LLM 生成阶段耗时(ms)，第一版暂不填
-        answer_status: SUCCESS / NO_RESULT / LLM_ERROR / RETRIEVAL_ERROR / BLOCKED
+        answer_status: SUCCESS / REFUSAL / NO_RESULT / LLM_ERROR / RETRIEVAL_ERROR /
+            BLOCKED / CLIENT_DISCONNECTED（SSE 客户端中途断开，回答截断，仅 /api/ask/stream）
         model_name: 使用的 LLM 模型名称
         error_message: 失败时的错误信息
         opensearch_hit_count: 检索命中数
