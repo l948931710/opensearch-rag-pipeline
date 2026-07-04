@@ -827,7 +827,7 @@ def load_config() -> PipelineConfig:
             # 实际读的是 RAG_RAG_TOP_K —— 文档名（RAG_TOP_K）永远不生效。
             default_top_k=_env_int("TOP_K", 7),                      # RAG_TOP_K
             max_context_chars=_env_int("MAX_CONTEXT_CHARS", 6000),   # RAG_MAX_CONTEXT_CHARS
-            api_port=_env_int("API_PORT", 8000),                     # RAG_API_PORT
+            api_port=_env_int("API_PORT", 8000),                     # RAG_API_PORT（消费方=Makefile api 目标；Dockerfile/SAE 固定 8000）
             max_history_turns=_env_int("MAX_HISTORY_TURNS", 10),     # RAG_MAX_HISTORY_TURNS
             pure_text=_env_bool("PURE_TEXT", False),               # RAG_PURE_TEXT
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。

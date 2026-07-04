@@ -26,8 +26,8 @@ prod: ## 安装生产依赖 (含 opensearch-py, oss2, pymysql)
 api-install: ## 安装 API 依赖 (FastAPI + uvicorn)
 	pip install -e ".[api,production]"
 
-api: ## 启动 RAG 问答 API 服务
-	python -m uvicorn opensearch_pipeline.api:app --host 0.0.0.0 --port 8000 --reload
+api: ## 启动 RAG 问答 API 服务（端口可用 RAG_API_PORT 覆盖，默认 8000）
+	python -m uvicorn opensearch_pipeline.api:app --host 0.0.0.0 --port $${RAG_API_PORT:-8000} --reload
 
 # ── Simulation ──
 
