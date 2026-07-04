@@ -1598,6 +1598,23 @@ def kb_retire(req: KbRetireRequest, request: Request,
         note="已申请退役：已标记下线、停止作为升版目标；从检索彻底移除将在下次维护完成（本操作可逆）")
 
 
+def _assert_version_not_quarantined(cur, doc_id: str, version_no: int) -> None:
+    """安全隔离防线（restore / set-visibility 共用）：spot_checker/cost_breaker 的追溯隔离只写
+    document_version（publish_status='QUARANTINED' / gate_status='quarantined'）+ 停 chunk
+    （is_active=0），document_meta.status 仍是 'active'、permission_level 被收紧为 'restricted'——
+    在本文件各 guard 眼里与普通"受限/下线"文档不可区分。恢复类分支若盲目重激活
+    （is_active=1 + NOT_INDEXED），stage-3 drain 无隔离过滤，会把未脱敏 chunk 重嵌重推 HA3 → PII 泄漏。
+    故隔离版本一律 409：唯一出路是脱敏重灌（derivative pipeline），不是控制台改可见度/恢复。"""
+    cur.execute(f"SELECT publish_status, gate_status FROM {_kb_db()}.document_version "
+                "WHERE doc_id=%s AND version_no=%s", (doc_id, version_no))
+    vrow = cur.fetchone()
+    if vrow and (str(vrow[0] or "").upper() == "QUARANTINED"
+                 or str(vrow[1] or "").lower() == "quarantined"):
+        raise HTTPException(
+            status_code=409,
+            detail="该文档处于安全隔离（PII/敏感内容），不能经可见范围/恢复操作重新上线；请走脱敏重灌流程")
+
+
 @router.post("/api/kb/restore", response_model=KbRestoreResponse)
 def kb_restore(req: KbRetireRequest, request: Request,
                identity: Optional[Identity] = Depends(current_identity)):
@@ -1640,6 +1657,8 @@ def kb_restore(req: KbRetireRequest, request: Request,
                     conn.commit()       # 幂等：已在线 → 直接回既有态
                     return KbRestoreResponse(doc_id=req.doc_id, restored=False, already=True,
                                              note="该文档已是在线状态")
+                # 退役→恢复 不能成为隔离文档复活通道（隔离 chunk is_active=0 会被下面的重激活扫中）
+                _assert_version_not_quarantined(cur, req.doc_id, cur_ver)
                 cur.execute(f"UPDATE {_kb_db()}.document_meta SET status='active', updated_at=NOW() "
                             "WHERE doc_id=%s", (req.doc_id,))
                 cur.execute(f"UPDATE {_kb_db()}.document_version SET status='active', updated_at=NOW() "
@@ -1720,6 +1739,9 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                     raise HTTPException(status_code=403, detail="涉及全公司公开的可见范围变更需知识库管理员操作")
                 if str(status).lower() != "active":
                     raise HTTPException(status_code=409, detail="该文档非在线状态，请先恢复上线后再改可见范围")
+                # 隔离文档（status 仍 'active'、级别被隔离流程收紧为 restricted）绝不能经本端点
+                # "改回 dept_internal/public" 复活——那会把未脱敏 chunk 重新送进 stage-3 → HA3。
+                _assert_version_not_quarantined(cur, req.doc_id, cur_ver)
                 if cur_perm == target:
                     conn.commit()       # 幂等：级别未变
                     return KbSetVisibilityResponse(doc_id=req.doc_id, permission_level=target,

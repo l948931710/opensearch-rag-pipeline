@@ -33,6 +33,8 @@ class _Cur:
     def fetchone(self):
         if "document_meta" in self._last and "FOR UPDATE" in self._last:
             return self.conn.meta_row
+        if "document_version" in self._last and "publish_status" in self._last:
+            return self.conn.version_row   # 隔离防线 SELECT (publish_status, gate_status)
         return None
 
     def fetchall(self):
@@ -40,8 +42,9 @@ class _Cur:
 
 
 class _Conn:
-    def __init__(self, meta_row=None):
+    def __init__(self, meta_row=None, version_row=None):
         self.meta_row = meta_row      # (owner_dept, permission_level, status, current_version_no)
+        self.version_row = version_row  # (publish_status, gate_status)；None = 无隔离标记
         self.calls = []
         self.committed = False
 
@@ -212,6 +215,46 @@ def test_projection_injected_when_flag_on(monkeypatch):
     resp = _call("dept_internal")
     assert resp.changed is True
     assert calls["enqueue"] == 1 and calls["materialize"] == 1
+
+
+def test_quarantined_version_blocked(monkeypatch):
+    """PII 复活防线：隔离文档（publish_status='QUARANTINED'，doc status 仍 'active'、级别被隔离流程
+    收紧为 restricted）→ 一律 409，绝不发出 is_active=1 重激活写。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    conn = _install(monkeypatch, _Conn(meta_row=("marketing", "restricted", "active", 1),
+                                       version_row=("QUARANTINED", "quarantined")))
+    with pytest.raises(Exception) as ei:
+        _call("dept_internal")
+    assert _status(ei) == 409
+    assert "is_active=1" not in _sql(conn)
+
+
+def test_quarantined_gate_status_only_blocked(monkeypatch):
+    """gate_status='quarantined' 单独存在（publish_status 缺省）也要拦（OR 语义）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    conn = _install(monkeypatch, _Conn(meta_row=("hr", "restricted", "active", 2),
+                                       version_row=(None, "quarantined")))
+    with pytest.raises(Exception) as ei:
+        _call("public", user_id="adm1")
+    assert _status(ei) == 409
+    assert "is_active=1" not in _sql(conn)
+
+
+def test_restore_quarantined_blocked(monkeypatch):
+    """退役→恢复 不是隔离复活通道：kb_restore 对隔离版本同样 409（共用 _assert_version_not_quarantined）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    conn = _install(monkeypatch, _Conn(meta_row=("marketing", "restricted", "retired", 1),
+                                       version_row=("QUARANTINED", "quarantined")))
+    with pytest.raises(Exception) as ei:
+        api.kb_restore(req=api.KbRetireRequest(doc_id="DOC_Q"), request=None,
+                       identity=api.Identity(user_id="adm1"))
+    assert _status(ei) == 409
+    assert "is_active=1" not in _sql(conn)
 
 
 def test_kb_admin_any_dept_to_public(monkeypatch):
