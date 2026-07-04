@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.qa_logger import _op_db
-from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus
+from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus, sql_in_list
 from opensearch_pipeline.request_context import get_request_id
 
 # api 驻留共享件（模型/助手/依赖）。from-import 拷贝绑定在这里是安全的：
@@ -1766,7 +1766,7 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                     cur.execute(f"UPDATE {_kb_db()}.document_version "
                                 f"SET index_status='{DocVersionIndexStatus.PENDING_DELETE}' "
                                 f"WHERE doc_id=%s AND index_status NOT IN "
-                                f"('{DocVersionIndexStatus.DELETED}', '{DocVersionIndexStatus.PENDING_DELETE}')",
+                                f"({sql_in_list((DocVersionIndexStatus.DELETED, DocVersionIndexStatus.PENDING_DELETE))})",
                                 (req.doc_id,))
                 else:
                     cur.execute(f"UPDATE {_kb_db()}.chunk_meta "
@@ -1778,7 +1778,7 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                     cur.execute(f"UPDATE {_kb_db()}.document_version "
                                 f"SET index_status='{DocVersionIndexStatus.NOT_INDEXED}' "
                                 f"WHERE doc_id=%s AND version_no=%s AND index_status IN "
-                                f"('{DocVersionIndexStatus.PENDING_DELETE}', '{DocVersionIndexStatus.DELETED}')",
+                                f"({sql_in_list((DocVersionIndexStatus.PENDING_DELETE, DocVersionIndexStatus.DELETED))})",
                                 (req.doc_id, cur_ver))
                     if cur_perm != "restricted":
                         # 双向 public↔dept_internal（本就 is_active=1）：显式标脏，让 stage-3 重推带新级别的 chunk
