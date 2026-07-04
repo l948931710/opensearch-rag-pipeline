@@ -2857,6 +2857,30 @@ class DocumentChunker:
         (["其他指标", "内控要求", "使用性能"], "spec_performance", "spec_performance_card"),
     ]
 
+    # 专用 *_card 类型仅用于内部 section 语义，下游检索/服务只认通用类型
+    # （image / table_chunk / text_chunk / step_card / procedure_parent）。
+    # 因此对外发出通用 chunk_type，把 section 语义保留在 extra["spec_section"]。
+    # ⚠️ 完整性约束：_SPEC_SECTION_PATTERNS / _SPEC_SUB_SECTIONS 里出现的每个
+    # card 类型都必须在此有映射，否则非标 chunk_type 泄漏进 RDS/HA3
+    # （test_product_spec_imaging 钉死该约束）。
+    # product_photo 发出 "image"：serving 渲染 image chunk 只认 chunk 级
+    # source_image（content_blocks_builder / to_ha3_doc），仅改 chunk_type 不够，
+    # 还需绑定阶段把首图提升为 extra["source_image"]（pipeline_nodes 图片绑定）。
+    _SPEC_CARD_TO_GENERIC = {
+        "spec_header_card": "text_chunk",
+        "product_info_card": "text_chunk",
+        "raw_material_card": "table_chunk",
+        "process_ccp_card": "table_chunk",
+        "packaging_card": "text_chunk",
+        "spec_sensory_card": "table_chunk",
+        "spec_dimension_card": "table_chunk",
+        "spec_micro_card": "table_chunk",
+        "spec_chem_card": "table_chunk",
+        "spec_performance_card": "table_chunk",
+        "appendix_card": "text_chunk",
+        "product_photo_card": "image",
+    }
+
     def _detect_spec_section(self, text: str):
         """检测行文本属于哪个 section。返回 (section_type, chunk_type) 或 None。"""
         for keywords, sec_type, chunk_type in self._SPEC_SECTION_PATTERNS:
@@ -2932,32 +2956,14 @@ class DocumentChunker:
             else:
                 merged.append((sec_type, chunk_type, texts, rmin, rmax))
 
-        # 专用 *_card 类型仅用于内部 section 语义，下游检索/服务只认通用类型
-        # （image / table_chunk / text_chunk / step_card / procedure_parent）。
-        # 因此对外发出通用 chunk_type，把 section 语义保留在 extra["spec_section"]。
-        # 额外收益：product_photo 现在发出 "image"，服务端才会按图片渲染（修复历史遗漏）。
-        _CARD_TO_GENERIC = {
-            "spec_header_card": "text_chunk",
-            "product_info_card": "text_chunk",
-            "raw_material_card": "table_chunk",
-            "process_ccp_card": "table_chunk",
-            "packaging_card": "text_chunk",
-            "spec_sensory_card": "table_chunk",
-            "spec_dimension_card": "table_chunk",
-            "spec_chem_card": "table_chunk",
-            "spec_performance_card": "table_chunk",
-            "appendix_card": "text_chunk",
-            "product_photo_card": "image",
-        }
-
-        # 生成 chunks
+        # 生成 chunks（card→通用类型映射见类常量 _SPEC_CARD_TO_GENERIC）
         for sec_type, chunk_type, texts, rmin, rmax in merged:
             combined = "\n".join(texts)
             # 跳过太短的（纯标题行等）
             if len(combined.strip()) < 10:
                 continue
 
-            generic_type = _CARD_TO_GENERIC.get(chunk_type, chunk_type)
+            generic_type = self._SPEC_CARD_TO_GENERIC.get(chunk_type, chunk_type)
             chunk = self._create_chunk(
                 doc_id=doc_id,
                 version_no=version_no,

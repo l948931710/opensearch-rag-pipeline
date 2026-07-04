@@ -3694,14 +3694,23 @@ def node_chunk_documents(ctx: dict):
                             continue
                         fn = asset.get("filename", "")
                         cat = asset.get("image_category", "unknown")
+                        # 上传环节回填的 oss_key 优先（TO_VECTOR 均会上传），构造路径
+                        # 仅作离线/旧数据兜底 —— 与 step_card/slide/image chunk 路径一致
+                        _spec_oss_key = (asset.get("oss_key")
+                                         or f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}")
                         img_entry = {
                             "filename": fn,
-                            "oss_key": f"processing/assets/{dept_code}/{d_id}/v{version}/{fn}",
+                            "oss_key": _spec_oss_key,
+                            # 契约键（CLAUDE.md）：source_image 与 step_card/slide 路径一致，
+                            # 自描述、不依赖检索期 oss_key→source_image 折叠
+                            "source_image": _spec_oss_key,
                             # image_index 契约键：取 asset 抽取序号（与其它版式/DOCX/PDF 同源）。
                             # product_spec_instruction 绑定原先漏设此键（2026-06-15 D6）。
                             "image_index": asset.get("image_index", asset.get("original_index")),
                             "anchor_row": ar,
                             "image_category": cat,
+                            "visual_summary": asset.get("visual_summary", ""),
+                            "ocr_text": asset.get("ocr_text", ""),
                         }
 
                         # 1) VLM category 匹配
@@ -3734,6 +3743,16 @@ def node_chunk_documents(ctx: dict):
                         imgs = chunk_images[id(c)]
                         if imgs:
                             c.extra["image_refs"] = imgs
+                            # image 载体（product_photo 卡）serving 只认 chunk 级
+                            # source_image（content_blocks_builder 的 image 分支 +
+                            # to_ha3_doc 索引），仅存 image_refs 则图片永远渲染不出
+                            # —— 与 PPTX slide 路径同因：首图提升为封面
+                            # source_image（+visual_summary）。
+                            if c.chunk_type == "image":
+                                c.extra["source_image"] = imgs[0]["oss_key"]
+                                if imgs[0].get("visual_summary"):
+                                    c.extra.setdefault(
+                                        "visual_summary", imgs[0]["visual_summary"])
                             layout_bound_fns.update(
                                 e["filename"] for e in imgs if e.get("filename"))
 
