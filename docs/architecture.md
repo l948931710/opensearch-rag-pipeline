@@ -224,7 +224,7 @@ DISCARD（装饰图丢弃） / ROUTE_TO_TEXT（文字图转文本） /
 ROUTE_TO_VECTOR（语义图入向量索引） / QUARANTINE_SENSITIVE（敏感图隔离）
 ```
 
-工程特性：MD5 去重、并发处理（`RAG_VLM_CONCURRENCY=8`）、**跨文档持久化缓存**（`scratch/vlm_cache.json` + OSS 同步），避免重复消耗 VLM 配额。配额本身由 [extraction/cost_breaker.py](../opensearch_pipeline/extraction/cost_breaker.py) 熔断控制。
+工程特性：MD5 去重、并发处理（`RAG_VLM_CONCURRENCY=8`）、**跨文档持久化缓存**（[vlm_cache.py](../opensearch_pipeline/vlm_cache.py)：`scratch/vlm_cache.sqlite3` SQLite WAL KV + OSS `.sqlite` 镜像降频同步，容量上限 `RAG_VLM_CACHE_MAX_ENTRIES`；存量 `scratch/vlm_cache.json` 首开自动迁移、原样保留），避免重复消耗 VLM 配额。配额本身由 [extraction/cost_breaker.py](../opensearch_pipeline/extraction/cost_breaker.py) 熔断控制。
 
 ### 4.2 Step Card 分块
 
