@@ -102,6 +102,8 @@ class TestApiAskBookkeeping:
         assert kw["user_id"] == "U9"
         # 已修复（原 KNOWN BUG）：令牌部门现已落库
         assert kw["user_dept"] == "行政部"
+        # 已修复（原 KNOWN GAP）：API 路径现落令牌姓名（与钉钉路径 sender_nick 对齐）
+        assert kw["user_name"] == "李四"
         # 已修复（原 KNOWN BUG）：成功路径落实际下发的小程序块（序列化 JSON）
         assert kw["content_blocks_json"] and "答案正文" in kw["content_blocks_json"]
 
@@ -144,6 +146,7 @@ class TestApiAskBookkeeping:
         assert kw["user_id"] == "U9"
         # 已修复（原 KNOWN BUG）：NO_RESULT 分支现也落 user_dept
         assert kw["user_dept"] == "行政部"
+        assert kw["user_name"] == "李四"
 
     @patch("opensearch_pipeline.api.build_mini_program_blocks", return_value=[])
     @patch("opensearch_pipeline.api.log_qa_session")
@@ -209,6 +212,33 @@ class TestApiStreamBookkeeping:
         kw = mock_log.call_args.kwargs
         assert kw["user_id"] == "U9"
         assert kw["user_dept"] == "行政部"
+        assert kw["user_name"] == "李四"
+        assert kw["answer_status"] == "SUCCESS"
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api._append_to_history")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=API_CHUNKS)
+    def test_stream_log_cited_docs_from_sources_frame(
+        self, mock_retrieve, mock_append, mock_log, client
+    ):
+        """已修复（原 KNOWN GAP）：流式收尾落库 cited_docs 取自生成器 sources 帧
+        （_extract_sources(included) —— 与 /api/ask 落 result["sources"] 同一计算），
+        不再恒为 NULL。"""
+        srcs = [{"doc_id": "d1", "title": "员工手册", "section": "第三章", "score": 9.0}]
+
+        def _stream_with_sources(*args, **kwargs):
+            yield f'data: {json.dumps({"type": "sources", "sources": srcs}, ensure_ascii=False)}\n\n'
+            yield 'data: {"type": "chunk", "content": "住宿申请"}\n\n'
+            yield 'data: {"type": "done", "model": "qwen-test", "usage": {}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        with patch("opensearch_pipeline.api.generate_answer_stream",
+                   side_effect=_stream_with_sources):
+            resp = client.post("/api/ask/stream", json={"question": "q", "pure_text": True})
+        assert resp.status_code == 200
+        kw = mock_log.call_args.kwargs
+        assert kw["cited_docs"] == srcs
+        assert kw["answer_status"] == "SUCCESS"
 
     @patch("opensearch_pipeline.api.log_qa_session")
     @patch("opensearch_pipeline.api._append_to_history")
@@ -227,6 +257,107 @@ class TestApiStreamBookkeeping:
         assert resp.status_code == 200
         assert mock_log.call_args.kwargs["answer_status"] == "LLM_ERROR"
         mock_append.assert_not_called()
+
+    # ── 客户端中途断开（GeneratorExit）───────────────────────────
+    # TestClient 总是消费完整流，模拟断开须绕过 HTTP 层：直接调用端点函数拿到
+    # StreamingResponse.body_iterator，消费到指定帧后 .close() —— 与 StreamingResponse
+    # 在真实断开时对生成器做的事完全一致（在暂停的 yield 处注入 GeneratorExit）。
+
+    def _run_stream_until_chunk_then_close(self, stream_impl, question="q"):
+        """直调 ask_stream，消费到【第二个】chunk 帧后 close 生成器。
+
+        选第二个而非第一个：event_generator 里 collected_answer.append 在 yield 之后 ——
+        生成器要等下一次被拉动才执行上一帧的 append。收到第 2 帧即断开时，第 1 帧的
+        append 恰已执行，collected = 第 1 帧内容（真实断开同款一帧滞后）。"""
+        from opensearch_pipeline.api import AskRequest, Identity, ask_stream
+
+        # StreamingResponse 会把同步生成器包成 async 迭代器，测试拿不回原生成器 ——
+        # 换成捕获壳直取 event_generator，本体 .close() 即真实断开的同款 GeneratorExit 注入。
+        class _CaptureResponse:
+            def __init__(self, content, **kwargs):
+                self.gen = content
+
+        req = AskRequest(question=question, pure_text=True)
+        ident = Identity(user_id="U9", acl_groups=["行政部"], name="李四")
+        with patch("opensearch_pipeline.api._enforce_rate_limit"), \
+             patch("opensearch_pipeline.api.StreamingResponse", _CaptureResponse), \
+             patch("opensearch_pipeline.api.generate_answer_stream", side_effect=stream_impl):
+            resp = ask_stream(req, MagicMock(), identity=ident)
+            gen = resp.gen
+            seen_chunks = 0
+            for event in gen:
+                if '"chunk"' in event:
+                    seen_chunks += 1
+                    if seen_chunks >= 2:
+                        break
+            gen.close()  # 客户端断开：GeneratorExit 直穿 except Exception 落进 finally
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api._append_to_history")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=API_CHUNKS)
+    def test_stream_client_disconnect_status_and_history(
+        self, mock_retrieve, mock_append, mock_log
+    ):
+        """断开截断 ≠ SUCCESS：落库 CLIENT_DISCONNECTED 分桶；历史仍写入
+        （collected frames = 用户实际看到的内容，follow-up 语境须与所见一致 ——
+        api.py 既有注释钉死的意图，只改状态不改历史）。"""
+
+        def _stream(*args, **kwargs):
+            yield 'data: {"type": "sources", "sources": []}\n\n'
+            yield 'data: {"type": "chunk", "content": "住宿申请流程第一步"}\n\n'
+            yield 'data: {"type": "chunk", "content": "（后半永远发不出去）"}\n\n'
+            yield 'data: {"type": "done", "model": "qwen-test", "usage": {}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        self._run_stream_until_chunk_then_close(_stream)
+
+        mock_log.assert_called_once()
+        kw = mock_log.call_args.kwargs
+        assert kw["answer_status"] == "CLIENT_DISCONNECTED"
+        assert kw["answer_text"] == "住宿申请流程第一步"
+        assert kw["error_message"] is None
+        assert kw["user_id"] == "U9" and kw["user_name"] == "李四"
+        # 历史保留（文档化意图）：断开前已下发的半截回答照常入史
+        mock_append.assert_called_once()
+        assert mock_append.call_args.args[2] == "住宿申请流程第一步"
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api._append_to_history")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=API_CHUNKS)
+    def test_stream_disconnect_truncation_never_flips_refusal(
+        self, mock_retrieve, mock_append, mock_log
+    ):
+        """截断恰止于拒答句式开头时不得误翻 REFUSAL（is_refusal_answer 假命中防护）：
+        CLIENT_DISCONNECTED 跳过 REFUSAL 翻转。"""
+
+        def _stream(*args, **kwargs):
+            # 完整回答本是「抱歉，当前知识库中未收录该表格，但相关流程如下：…」型长答，
+            # 断开恰好截在强拒答句式上（收到第 2 帧即断 → collected 只有第 1 帧）
+            yield 'data: {"type": "chunk", "content": "抱歉，当前知识库中未"}\n\n'
+            yield 'data: {"type": "chunk", "content": "收录该表格，但相关流程如下"}\n\n'
+            yield 'data: {"type": "done", "model": "qwen-test", "usage": {}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        self._run_stream_until_chunk_then_close(_stream)
+        assert mock_log.call_args.kwargs["answer_status"] == "CLIENT_DISCONNECTED"
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api._append_to_history")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=API_CHUNKS)
+    def test_stream_completed_refusal_still_flips(
+        self, mock_retrieve, mock_append, mock_log, client
+    ):
+        """回归：完整发完的拒答回答仍照旧翻 REFUSAL（completed 标记不改变既有分桶）。"""
+
+        def _stream(*args, **kwargs):
+            yield 'data: {"type": "chunk", "content": "抱歉，当前知识库中未找到相关信息。"}\n\n'
+            yield 'data: {"type": "done", "model": "qwen-test", "usage": {}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        with patch("opensearch_pipeline.api.generate_answer_stream", side_effect=_stream):
+            resp = client.post("/api/ask/stream", json={"question": "q", "pure_text": True})
+        assert resp.status_code == 200
+        assert mock_log.call_args.kwargs["answer_status"] == "REFUSAL"
 
 
 # ═══════════════════════════════════════════════════════════════

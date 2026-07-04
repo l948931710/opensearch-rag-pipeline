@@ -68,6 +68,14 @@ def test_api_ready_ha3_probe_vector_tracks_config_dim(monkeypatch):
     assert len(captured["vector"]) == 512, "probe vector dim must track config, not hardcoded 1024"
 
 
+def test_api_ready_is_sync_def_not_coroutine():
+    """/api/ready 必须是 def（线程池执行）而非 async def：探针全是同步阻塞 I/O
+    （_get_db_conn 池签出重试、pymysql SELECT 1、HA3 query）。async 下 RDS/HA3 降级时
+    会把唯一事件循环（workers=1）冻住整个 connect/read 超时，拖垮所有并发请求。"""
+    from opensearch_pipeline import api
+    assert not inspect.iscoroutinefunction(api.readiness_check)
+
+
 def test_api_health_still_dumb_liveness():
     from fastapi.testclient import TestClient
     from opensearch_pipeline.api import app

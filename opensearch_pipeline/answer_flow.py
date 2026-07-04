@@ -60,12 +60,16 @@ def top_score_of(chunks: Optional[List[Dict[str, Any]]]) -> Optional[float]:
 
 
 def should_append_history(answer_text: Optional[str], answer_status: str) -> bool:
-    """统一写历史策略：仅非空且 SUCCESS 的回答进入会话历史。
+    """统一写历史策略：非空且 SUCCESS / CLIENT_DISCONNECTED 的回答进入会话历史。
 
     出错时的部分回答不入史 —— 残句进上下文会污染后续轮次（钉钉流式一直如此，
     API 流式原先会把出错前的半截写进去，已统一）。
+
+    CLIENT_DISCONNECTED（SSE 客户端中途断开）例外入史：collected frames = 用户
+    实际看到的内容，follow-up 轮的语境应与用户所见一致（区别于出错残句 ——
+    用户看到的是错误提示、不是半截回答）。该状态只改落库分桶，不改历史语义。
     """
-    return bool(answer_text) and answer_status == "SUCCESS"
+    return bool(answer_text) and answer_status in ("SUCCESS", "CLIENT_DISCONNECTED")
 
 
 def history_answer_text(answer_text: str) -> str:
@@ -126,6 +130,8 @@ def build_qa_log_kwargs(
                   客户端同样显示"未找到"）→ 语料弱 / 检索未召回
       NO_RESULT — 检索为空 → 语料缺，补文档的直接信号
       LLM_ERROR — 生成异常（error_message 带 trace_id）
+      CLIENT_DISCONNECTED — SSE 客户端中途断开，回答被截断（仅 /api/ask/stream）；
+                  不参与 REFUSAL 翻转（截断恰止于拒答句式会假命中），照常入史
     注意：入史策略（should_append_history）按翻转前的原状态判定 —— REFUSAL 只改
     落库标签，不改变"拒答照旧入史"的既有行为。
     """

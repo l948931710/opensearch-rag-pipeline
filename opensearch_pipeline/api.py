@@ -447,13 +447,18 @@ async def version_info():
 
 
 @app.get("/api/ready")
-async def readiness_check():
+def readiness_check():
     """OBS-1 deep readiness probe: RDS + HA3 (critical) + DashScope (config-only, no live cost).
 
     200 when the critical deps (RDS + HA3) are reachable, else 503 with the failing component — so a
     load balancer / SAE / k8s readiness probe can stop routing to an instance that can't actually
     answer (the old /api/health never probed anything). Simulate mode returns 200/skipped (no live
     calls). DashScope is reported by config presence only (a live ping would cost quota).
+
+    用 def（非 async）声明：探针全是同步阻塞 I/O（_get_db_conn 池签出带重试等待、pymysql
+    SELECT 1、HA3 client.query）。async 下这些阻塞会冻住唯一事件循环（workers=1）——且恰在
+    RDS/HA3 降级、探针最需要工作时冻得最久（connect/read 超时全程）。def 走线程池，与
+    /api/ask 同一理由。
     """
     from fastapi.responses import JSONResponse
     cfg = get_config()
@@ -637,6 +642,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
             message_id=msg_id,
             question=req.question,
             user_id=uid,
+            user_name=(identity.name or None) if identity else None,
             user_dept=user_dept,
             chunks=[],
             latency_ms=latency,
@@ -690,6 +696,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
             message_id=generate_message_id(),
             question=req.question,
             user_id=uid,
+            user_name=(identity.name or None) if identity else None,
             user_dept=user_dept,
             chunks=chunks,
             latency_ms=int((time.time() - t0) * 1000),
@@ -741,6 +748,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         message_id=msg_id,
         question=req.question,
         user_id=uid,
+        user_name=(identity.name or None) if identity else None,
         user_dept=user_dept,
         answer_text=result["answer"],
         chunks=chunks,
@@ -830,6 +838,7 @@ def ask_stream(req: AskRequest, request: Request,
                     message_id=message_id,
                     question=req.question,
                     user_id=uid,
+                    user_name=(identity.name or None) if identity else None,
                     user_dept=user_dept,
                     chunks=[],
                     latency_ms=int((time.time() - t0) * 1000),
@@ -849,6 +858,14 @@ def ask_stream(req: AskRequest, request: Request,
         answer_status = "SUCCESS"
         error_message: Optional[str] = None
         content_blocks_json_str: Optional[str] = None
+        # cited_docs 取自生成器的 sources 帧（_extract_sources(included) —— 截断感知，
+        # 与 /api/ask 落库的 result["sources"] 同一计算），别在这里对全量 chunks 重算。
+        stream_sources: Optional[List[Dict[str, Any]]] = None
+        # 客户端中途断开时 StreamingResponse close 生成器 → GeneratorExit 直穿 except Exception
+        # 落进 finally，answer_status 仍是 "SUCCESS"。completed 标记区分「真发完」与「断开截断」，
+        # 截断的落库状态改 CLIENT_DISCONNECTED（否则半截回答混进 SUCCESS 分析口径，
+        # 还可能被 is_refusal_answer 误翻成 REFUSAL）。
+        completed = False
 
         try:
             try:
@@ -868,6 +885,9 @@ def ask_stream(req: AskRequest, request: Request,
                     if event.strip() == "data: [DONE]":
                         continue
                     frame = parse_sse_data_frame(event)
+                    # sources 帧顺手截留作 cited_docs 落库（帧本身照常透传给客户端）
+                    if frame is not None and frame.get("type") == "sources":
+                        stream_sources = frame.get("sources") or None
                     # done 帧补 guard 后再下发（流式也能显示低置信提示条）；其余帧原样透传
                     if frame is not None and frame.get("type") == "done":
                         model_name = frame.get("model")
@@ -898,6 +918,7 @@ def ask_stream(req: AskRequest, request: Request,
                         logger.warning("content_blocks 构建失败 (non-fatal)", exc_info=True)
 
                 yield "data: [DONE]\n\n"
+                completed = True
 
             except Exception as e:
                 answer_status = "LLM_ERROR"
@@ -907,12 +928,19 @@ def ask_stream(req: AskRequest, request: Request,
                 error_msg = json.dumps({"type": "error", "message": f"回答生成失败，请联系管理员 (trace: {trace_id})"}, ensure_ascii=False)
                 yield f"data: {error_msg}\n\n"
                 yield "data: [DONE]\n\n"
+                completed = True
         finally:
             # 无论正常结束还是客户端中途断开（GeneratorExit），都写历史 + 落库，
             # 保证流式回答可被反馈/分析（落库函数自身吞掉异常，绝不影响回复）
             full_answer = strip_doc_citations("".join(collected_answer))
-            # 统一策略：仅非空 SUCCESS 回答入史 —— 出错前的半截回答不再污染后续轮次上下文
-            # （#F-mm5 入史文本经 history_answer_text；blocks 已在上方用原文构建完毕）
+            # 中途断开（未走到 [DONE] 也未进 except）→ CLIENT_DISCONNECTED：截断回答与
+            # 完整 SUCCESS 分桶，且绝不被 is_refusal_answer 误翻 REFUSAL（截断恰止于拒答
+            # 句式时会假命中）。入史策略见 should_append_history —— 断开仍入史：collected
+            # frames = 用户实际看到的内容，follow-up 语境应与用户所见一致。
+            if not completed and answer_status == "SUCCESS":
+                answer_status = "CLIENT_DISCONNECTED"
+            # 统一策略：非空 SUCCESS / CLIENT_DISCONNECTED 入史 —— 出错的半截回答不污染
+            # 后续轮次上下文（#F-mm5 入史文本经 history_answer_text；blocks 已在上方用原文构建完毕）
             if should_append_history(full_answer, answer_status):
                 _append_to_history(session_id, req.question, history_answer_text(full_answer))
             # 拒答型标 REFUSAL（入史判定在上面、用原状态 —— 历史策略不变）；深思加 model 后缀
@@ -926,9 +954,11 @@ def ask_stream(req: AskRequest, request: Request,
                 message_id=message_id,
                 question=req.question,
                 user_id=uid,
+                user_name=(identity.name or None) if identity else None,
                 user_dept=user_dept,
                 answer_text=full_answer,
                 chunks=chunks,
+                cited_docs=stream_sources,
                 latency_ms=int((time.time() - t0) * 1000),
                 retrieval_latency_ms=retrieval_latency_ms,
                 answer_status=answer_status,
