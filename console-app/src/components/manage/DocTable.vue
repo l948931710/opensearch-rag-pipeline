@@ -11,7 +11,7 @@ import { useDialog } from '@/composables/useDialog'
 const { confirm } = useDialog()
 
 const {
-  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, ownerOptions, sortKey, sortDir, isDeptAdmin, isKbAdmin,
+  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir, isDeptAdmin, isKbAdmin,
   setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
   openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
   openShare, grantedDeptsOf, openVisibility,
@@ -27,6 +27,13 @@ function canManagePerm(d: DocItem): boolean {
 
 // 共享部门名（去 count，直接列名字，>2 个折 +N）——回答"文档共享给了哪些部门"。
 function sharedLabels(docId: string): string[] { return grantedDeptsOf(docId).map(deptLabel) }
+
+// 利用度副行文案：0=真·从未被引用（退役候选，amber 提示）；>0=引用 N 次；null/undefined=数据不可用不显示。
+function usageText(d: DocItem): string {
+  if (d.cited_count === 0) return '从未被引用'
+  if (d.cited_count && d.cited_count > 0) return `引用 ${d.cited_count} 次`
+  return ''
+}
 
 // 可见范围筛选选项（下拉）
 const PERM_OPTS = Object.keys(PERM_LABEL)   // dept_internal / public / restricted
@@ -168,10 +175,18 @@ async function onRestore(d: DocItem) {
           <option value="">全部范围</option>
           <option v-for="p in PERM_OPTS" :key="p" :value="p">{{ PERM_LABEL[p] }}</option>
         </select>
+        <select
+          v-model="citedFilter" aria-label="按利用度筛选"
+          class="ui-select rounded-md border border-input bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground focus:border-ring focus:outline-none"
+        >
+          <option value="">全部利用度</option>
+          <option value="never">从未被引用</option>
+          <option value="used">有引用</option>
+        </select>
         <button
-          v-if="ownerFilter || permFilter || filter"
+          v-if="ownerFilter || permFilter || filter || citedFilter"
           type="button" class="rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground"
-          @click="filter = ''; ownerFilter = ''; permFilter = ''"
+          @click="filter = ''; ownerFilter = ''; permFilter = ''; citedFilter = ''"
         >清除筛选</button>
       </div>
     </div>
@@ -261,7 +276,7 @@ async function onRestore(d: DocItem) {
           <div class="min-w-0 flex-1">
             <div class="truncate text-[13.5px] font-semibold text-foreground" :title="d.title || d.original_filename || d.doc_id">{{ d.title || d.original_filename || d.doc_id }}</div>
             <div class="truncate text-[11px] text-faint">
-              {{ permLabel(d.permission_level) }}<template v-if="sharedLabels(d.doc_id).length"><span class="text-accent-text"> · 共享 {{ sharedLabels(d.doc_id).slice(0, 2).join('、') }}<span v-if="sharedLabels(d.doc_id).length > 2"> +{{ sharedLabels(d.doc_id).length - 2 }}</span></span></template><span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
+              {{ permLabel(d.permission_level) }}<template v-if="sharedLabels(d.doc_id).length"><span class="text-accent-text"> · 共享 {{ sharedLabels(d.doc_id).slice(0, 2).join('、') }}<span v-if="sharedLabels(d.doc_id).length > 2"> +{{ sharedLabels(d.doc_id).length - 2 }}</span></span></template><template v-if="usageText(d)"> · <span :class="d.cited_count === 0 ? 'text-st-warn' : ''" :title="d.last_cited_at ? `最近被引用 ${d.last_cited_at.slice(0, 16)}` : ''">{{ usageText(d) }}</span></template><span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
             </div>
           </div>
         </div>

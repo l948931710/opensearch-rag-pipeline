@@ -13,6 +13,8 @@ export interface DocItem {
   permission_level: string; current_version_no: number; status: string
   status_badge: string; updated_at: string
   can_manage?: boolean   // 可操作（写作用域）；my-docs 恒 true，browse 全部门时外部门为 false
+  cited_count?: number | null   // 利用度：被引用问答数（null/undefined=数据不可用，0=真·从未被引用）
+  last_cited_at?: string        // 最近被引用时间（cited_count>0 时有值）
 }
 export interface PendingItem {
   doc_id: string; version_no: number; title: string; original_filename: string
@@ -124,6 +126,7 @@ const q = ref('')
 const filter = ref('')                 // status_badge 精确过滤；'' = 全部
 const permFilter = ref('')             // permission_level 精确过滤；'' = 全部
 const ownerFilter = ref('')            // owner_dept（含生产子线）精确过滤；'' = 全部
+const citedFilter = ref('')            // 利用度筛选：'' 全部 / 'never' 从未被引用（退役候选）/ 'used' 有引用
 const sortKey = ref<SortKey>('updated_at')
 const sortDir = ref<1 | -1>(-1)
 // 多选（批量操作）：选中的 doc_id 集合。仅对可管理(can_manage!==false)行有意义；筛选/换源时自动收敛。
@@ -206,6 +209,9 @@ const filtered = computed(() =>
     (!filter.value || d.status_badge === filter.value)
     && (!permFilter.value || d.permission_level === permFilter.value)
     && (!ownerFilter.value || d.owner_dept === ownerFilter.value)
+    // 利用度：never=真·从未被引用（cited_count===0，退役候选）；used=有引用。
+    // 数据不可用（null/undefined，RAG_QA_FACT_JOIN 未开）两个档都不入——0 与「不知道」必须可区分。
+    && (!citedFilter.value || (citedFilter.value === 'never' ? d.cited_count === 0 : (d.cited_count ?? 0) > 0))
   ), sortKey.value, sortDir.value))
 
 // 归属筛选选项 = 已加载文档里出现过的 owner_dept（含生产子线，如 production_mold）→ 覆盖"按子部门管理"。
@@ -307,8 +313,8 @@ async function loadDocs() {
     // DEV ?preview：注入 mock（含外部门 can_manage=false 行）以可视化全部门只读浏览；prod 死代码消除。
     if (import.meta.env.DEV && useSession().token === 'dev-preview') {
       const mine: DocItem[] = [
-        { doc_id: 'm1', title: '营销物料使用规范 v3', original_filename: 'guideline.pdf', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 3, status: 'active', status_badge: '已上线', updated_at: '2026-06-26 10:00', can_manage: true },
-        { doc_id: 'm2', title: '品牌 VI 手册', original_filename: 'vi.pdf', owner_dept: 'marketing', permission_level: 'public', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '2026-06-20 09:00', can_manage: true },
+        { doc_id: 'm1', title: '营销物料使用规范 v3', original_filename: 'guideline.pdf', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 3, status: 'active', status_badge: '已上线', updated_at: '2026-06-26 10:00', can_manage: true, cited_count: 12, last_cited_at: '2026-07-02 09:12' },
+        { doc_id: 'm2', title: '品牌 VI 手册', original_filename: 'vi.pdf', owner_dept: 'marketing', permission_level: 'public', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '2026-06-20 09:00', can_manage: true, cited_count: 0 },
         { doc_id: 'm3', title: '618 活动复盘', original_filename: '618.docx', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 2, status: 'active', status_badge: '处理中', updated_at: '2026-06-25 14:00', can_manage: true },
       ]
       const foreign: DocItem[] = [
@@ -348,7 +354,7 @@ async function loadMoreDocs() {
 function setScope(s: 'managed' | 'all') {
   if (docScope.value === s) return
   docScope.value = s
-  filter.value = ''; permFilter.value = ''; ownerFilter.value = ''
+  filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''
   selectedIds.value = new Set(); bulkMsg.value = ''   // 换源清空选中（旧 doc_id 不再可见）
   void loadDocs()
   if (s === 'all') void loadMyAccessRequests()   // 全部门浏览：回灌我的申请态以渲染 申请授权/审批中/同步中/已放行
@@ -1045,7 +1051,7 @@ export function useKb() {
 
   return {
     // 状态
-    docs, filtered, approvals, accessRequests, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, ownerOptions, sortKey, sortDir,
+    docs, filtered, approvals, accessRequests, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir,
     // 多选 / 批量
     selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
     newTitle, newOwner, newPerm, newShareDepts, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
@@ -1069,7 +1075,7 @@ export function useKb() {
 export function __resetKb() {
   docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
-  q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
+  q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; newShareDepts.value = []; verCtx.value = null
   shareCtx.value = null; shareBusy.value = false

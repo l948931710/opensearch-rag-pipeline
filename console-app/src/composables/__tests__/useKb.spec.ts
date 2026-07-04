@@ -279,6 +279,23 @@ describe('useKb 台账筛选 + 多选 + 批量', () => {
     expect(kb.bulkMsg.value).toContain('成功 2')
   })
 
+  it('citedFilter：never=cited_count===0，used=有引用，数据不可用(null)两档都不入', async () => {
+    const items = [
+      { ...mk('a', 'production', 'dept_internal'), cited_count: 0 },
+      { ...mk('b', 'production', 'dept_internal'), cited_count: 7 },
+      mk('c', 'production', 'dept_internal'),                          // cited_count 缺省=不可用
+    ]
+    vi.stubGlobal('fetch', routeFetch({ myDocs: jsonResp({ items, has_more: false }) }))
+    const kb = useKb()
+    await kb.loadDocs()
+    kb.citedFilter.value = 'never'
+    expect(kb.filtered.value.map((d) => d.doc_id)).toEqual(['a'])
+    kb.citedFilter.value = 'used'
+    expect(kb.filtered.value.map((d) => d.doc_id)).toEqual(['b'])
+    kb.citedFilter.value = ''
+    expect(kb.filtered.value.length).toBe(3)
+  })
+
   it('bulkSetVisibility：只对级别不同的行发 set-visibility', async () => {
     const items = [mk('a', 'production', 'dept_internal'), mk('b', 'production', 'restricted')]
     const posted: any[] = []

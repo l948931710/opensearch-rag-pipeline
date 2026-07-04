@@ -726,6 +726,36 @@ def test_grant_create_marketing_on_production_family_skipped(monkeypatch):
     assert len(inserts) == 1 and inserts[0][1][4] == "hr"
 
 
+# ── 利用度 enrich（qa_retrieved_doc 事实表，RAG_QA_FACT_JOIN 门控）──────────────
+def test_my_docs_usage_enrich_when_fact_join_on(monkeypatch):
+    """fact join 可用：页内 doc 一次聚合；命中=次数+时间，未命中=0（真·从未被引用）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: True)
+    docrows = [
+        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE"),
+        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE"),
+    ]
+    _stub_multi(monkeypatch, [docrows, [("D1", 5, "2026-07-01 10:00:00")]])
+    from opensearch_pipeline import api
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
+    by = {i.doc_id: i for i in resp.items}
+    assert by["D1"].cited_count == 5 and by["D1"].last_cited_at.startswith("2026-07-01")
+    assert by["D2"].cited_count == 0 and by["D2"].last_cited_at == ""
+
+
+def test_my_docs_usage_none_when_fact_join_off(monkeypatch):
+    """flag 关（默认）：cited_count=None（不可用），绝不显示成 0——0 与「不知道」必须可区分。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
+    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE")]
+    _stub_multi(monkeypatch, [docrows])
+    from opensearch_pipeline import api
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
+    assert resp.items[0].cited_count is None
+
+
 # ── GET /api/kb/visibility-explain：「谁能看到这篇文档」解释器（只读）──────────
 def test_visibility_explain_dept_internal_with_grants(monkeypatch):
     """dept_internal：owner 组 + 授权部门；与检索同源（marketing 无伞/共享 → 只有自身）。"""

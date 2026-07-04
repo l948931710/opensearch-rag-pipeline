@@ -97,6 +97,33 @@ def kb_org_tree(request: Request, identity: Optional[Identity] = Depends(current
     )
 
 
+def _kb_usage_enrich(cur, doc_ids):
+    """页内文档的利用度：doc_id → (被引用问答数, 最近被引用时间)。
+
+    仅在 qa_facts.fact_join_enabled()（RAG_QA_FACT_JOIN 开 + qa_retrieved_doc 表探测通过）
+    时启用——索引点查，页内 ≤50 个 id 一次聚合，成本恒定。不走 JSON_TABLE 回退：那要
+    全表展开 qa_session_log 才能按 doc 过滤，不适合每次列表加载都付。
+    返回 None=数据不可用（flag 关/表缺/查询失败 → cited_count=None，前端不显示）；
+    返回 dict=查询成功（缺席的 doc = 0 次，真·从未被引用）——0 与「不知道」必须可区分。
+    fail-open：任何异常绝不影响台账主查询。"""
+    if not doc_ids:
+        return {}
+    try:
+        from opensearch_pipeline.qa_facts import FACT_TABLE, fact_join_enabled
+        if not fact_join_enabled():
+            return None
+        ph = ",".join(["%s"] * len(doc_ids))
+        cur.execute(
+            f"SELECT jt.doc_id, COUNT(DISTINCT jt.message_id), MAX(jt.created_at) "
+            f"FROM {_op_db()}.{FACT_TABLE} jt "
+            f"WHERE jt.cited=1 AND jt.doc_id IN ({ph}) GROUP BY jt.doc_id",
+            tuple(doc_ids))
+        return {r[0]: (int(r[1] or 0), str(r[2] or "")) for r in (cur.fetchall() or [])}
+    except Exception as e:   # noqa: BLE001
+        logger.debug("利用度 enrich 失败（fail-open）: %s", e)
+        return None
+
+
 @router.get("/api/kb/my-docs", response_model=KbMyDocsResponse)
 def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                identity: Optional[Identity] = Depends(current_identity)):
@@ -139,6 +166,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     (*params, *search_params, limit + 1, offset),
                 )
                 rows = cur.fetchall()
+                usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
         finally:
             conn.close()
     except HTTPException:
@@ -152,12 +180,15 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     items = []
     for r in rows[:limit]:
         (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
+        _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
+            cited_count=(None if usage is None else (_u[0] if _u else 0)),
+            last_cited_at=(_u[1] if _u else ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
 
@@ -227,6 +258,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     (*owner_params, *search_params, limit + 1, offset),
                 )
                 rows = cur.fetchall()
+                usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
         finally:
             conn.close()
     except HTTPException:
@@ -240,6 +272,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     items = []
     for r in rows[:limit]:
         (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
+        _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", permission_level=perm or "dept_internal",
@@ -247,6 +280,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
             can_manage=_kb_can_manage(kb, owner or ""),
+            cited_count=(None if usage is None else (_u[0] if _u else 0)),
+            last_cited_at=(_u[1] if _u else ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
 

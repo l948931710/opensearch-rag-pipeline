@@ -1685,6 +1685,10 @@ class KbDocItem(BaseModel):
     # 可操作性（= 写作用域 managed；my-docs 恒 True，browse 全部门时外部门为 False）。
     # 与"可见"解耦：浏览看得见 ≠ 能管。前端据此决定 升版/退役 还是 申请授权。
     can_manage: bool = True
+    # 利用度（qa_retrieved_doc 事实表，RAG_QA_FACT_JOIN 开且表在才填；None=数据不可用，
+    # 前端不显示——0 与「不知道」必须可区分，0=真·从未被引用，是退役候选信号）。
+    cited_count: Optional[int] = None
+    last_cited_at: str = ""
 
 
 class KbMyDocsResponse(BaseModel):
