@@ -867,13 +867,29 @@ async function openVisibility(d: DocItem): Promise<void> {
 function closeVisibility() { visCtx.value = null; visExplain.value = null; visErr.value = '' }
 
 /** 该文档现行已放行的组码集合（含被动流 CSV 行拆分）——驱动弹窗「已共享」与台账副行计数。 */
-function grantedDeptsOf(docId: string): string[] {
-  const out = new Set<string>()
+// O(1) 记忆化（perf）：accessGrants 变更才重算一次。此前 grantedDeptsOf 每次调用全量扫
+// grants + CSV 拆分，DocTable 模板每行调 4 次 → 每次重渲染 O(rows×4×grants)，
+// 搜索框逐键/勾选切换都全量重算——grants 一多就卡。
+const grantedDeptsByDoc = computed(() => {
+  const m = new Map<string, string[]>()
+  const sets = new Map<string, Set<string>>()
   for (const g of accessGrants.value) {
-    if (g.doc_id !== docId) continue
-    for (const p of String(g.requester_dept || '').split(',')) { const c = p.trim(); if (c) out.add(c) }
+    let s = sets.get(g.doc_id)
+    if (!s) { s = new Set(); sets.set(g.doc_id, s) }
+    for (const p of String(g.requester_dept || '').split(',')) { const c = p.trim(); if (c) s.add(c) }
   }
-  return [...out].sort()
+  for (const [id, s] of sets) m.set(id, [...s].sort())
+  return m
+})
+// 组码 → 中文标签的行级缓存（DocTable 副行直接 .get() O(1)）。
+const grantedLabelsByDoc = computed(() => {
+  const m = new Map<string, string[]>()
+  for (const [id, codes] of grantedDeptsByDoc.value) m.set(id, codes.map(deptLabel))
+  return m
+})
+
+function grantedDeptsOf(docId: string): string[] {
+  return grantedDeptsByDoc.value.get(docId) || []
 }
 
 /** 该文档的授权行（供弹窗逐行撤销）。 */
@@ -1088,7 +1104,7 @@ export function useKb() {
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
-    openShare, closeShare, submitShare, grantedDeptsOf, docGrantRows, setVisibility,
+    openShare, closeShare, submitShare, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,

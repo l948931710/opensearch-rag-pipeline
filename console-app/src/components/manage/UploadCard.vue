@@ -70,6 +70,7 @@ function onDrop(e: DragEvent) {
         <span class="min-w-0 flex-1">
           <span class="block text-sm font-semibold text-foreground">{{ dragging ? '松开以选择文件' : '拖拽文件到此，或点击选择' }}</span>
           <span class="mt-0.5 block text-xs text-faint">{{ verCtx ? '仅需选择 1 个文件作为新版本' : `支持批量 · PDF / DOCX / XLSX / PPTX / JPG / PNG · 单文件 ≤ ${maxUploadMb}MB` }}</span>
+          <span v-if="!verCtx" class="mt-0.5 block text-[11px] text-faint">扫描件/截图型 PDF 会走 OCR，入库耗时更长；旧版 .xls 不支持，请另存为 .xlsx 再传</span>
         </span>
         <span class="shrink-0 rounded-[9px] border border-border bg-surface px-[15px] py-2 text-[12.5px] font-semibold text-accent-text">选择文件</span>
       </button>

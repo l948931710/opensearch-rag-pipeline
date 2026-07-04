@@ -14,7 +14,7 @@ const {
   docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir, isDeptAdmin, isKbAdmin,
   setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
   openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
-  openShare, grantedDeptsOf, openVisibility,
+  openShare, grantedLabelsByDoc, openVisibility,
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
 } = useKb()
 
@@ -26,7 +26,8 @@ function canManagePerm(d: DocItem): boolean {
 }
 
 // 共享部门名（去 count，直接列名字，>2 个折 +N）——回答"文档共享给了哪些部门"。
-function sharedLabels(docId: string): string[] { return grantedDeptsOf(docId).map(deptLabel) }
+// O(1)：useKb 侧 computed Map（grants 变更才重算），模板每行 4 次调用不再各自全量扫。
+function sharedLabels(docId: string): string[] { return grantedLabelsByDoc.value.get(docId) || [] }
 
 // 利用度副行文案：0=真·从未被引用（退役候选，amber 提示）；>0=引用 N 次；null/undefined=数据不可用不显示。
 function usageText(d: DocItem): string {
