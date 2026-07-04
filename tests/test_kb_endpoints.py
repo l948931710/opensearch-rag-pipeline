@@ -174,6 +174,12 @@ def test_kb_status_badge_recognizes_success():
     assert b("DONE", "SUCCESS", "active", None, "QUARANTINED") == "已隔离"
     assert b("DONE", "NOT_INDEXED", "active", None, "QUARANTINED") == "已隔离"
     assert b("DONE", "SUCCESS", "superseded", None, "QUARANTINED") == "已退役"   # 退役判定仍优先
+    # 0-chunk / 版本被跳过终态 → 未入索引（此前落到"处理中"，管理员看不出永远搜不到）
+    assert b("DONE", None, "active", None, None, "EMPTY") == "未入索引"
+    assert b("DONE", None, "active", None, "SKIPPED_EMPTY") == "未入索引"
+    assert b("QUARANTINED", None, "active", None, "SKIPPED_EXPLOSION", "QUARANTINED_EXPLOSION") == "未入索引"
+    assert b("DONE", None, "active", None, "QUARANTINED", "EMPTY") == "已隔离"   # PII 隔离优先
+    assert b("DONE", "SUCCESS", "active", None, None, "DONE") == "已上线"        # 正常件不受影响
 
 
 def test_my_docs_dept_admin_search_keeps_owner_scope(monkeypatch):
@@ -253,8 +259,8 @@ def test_browse_can_manage_flags_dept_admin(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
     monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
     rows = [
-        ("D1", "营销规范", "a.pdf", "marketing", "dept_internal", 1, "active", "2026-06-26", "DONE", "SUCCESS", None),
-        ("D2", "HR 手册", "b.pdf", "hr", "dept_internal", 2, "active", "2026-06-25", "DONE", "SUCCESS", None),
+        ("D1", "营销规范", "a.pdf", "marketing", "dept_internal", 1, "active", "2026-06-26", "DONE", "SUCCESS", None, "DONE"),
+        ("D2", "HR 手册", "b.pdf", "hr", "dept_internal", 2, "active", "2026-06-25", "DONE", "SUCCESS", None, "DONE"),
     ]
     _stub_rows(monkeypatch, rows)
     from opensearch_pipeline import api
@@ -268,7 +274,7 @@ def test_browse_kb_admin_all_manageable(monkeypatch):
     """kb_admin 全部门皆可管：can_manage 恒 True。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    rows = [("D1", "x", "a.pdf", "hr", "dept_internal", 1, "active", "t", "DONE", "SUCCESS", None)]
+    rows = [("D1", "x", "a.pdf", "hr", "dept_internal", 1, "active", "t", "DONE", "SUCCESS", None, "DONE")]
     _stub_rows(monkeypatch, rows)
     from opensearch_pipeline import api
     resp = api.kb_browse(request=None, scope="all", identity=api.Identity(user_id="dev1"))

@@ -1727,8 +1727,8 @@ _KB_MAX_OFFSET = 10000   # 文档列表分页 offset 上界（全库 ~1600 篇�
 
 
 def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
-                     publish_status=None) -> str:
-    """把管线多字段折叠为用户可读态：排队中/处理中/已上线/处理失败/内容未变/已隔离/已退役。"""
+                     publish_status=None, chunk_status=None) -> str:
+    """把管线多字段折叠为用户可读态：排队中/处理中/已上线/未入索引/处理失败/内容未变/已隔离/已退役。"""
     cs = (content_status or "").upper()
     ix = (index_status or "").upper()
     if doc_status and str(doc_status).lower() not in ("active", ""):
@@ -1737,6 +1737,12 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
     # 绝不能显示"已上线"（会被误读为可搜/已脱敏）。统一显示"已隔离"，等脱敏重灌。
     if str(publish_status or "").upper() == "QUARANTINED":
         return "已隔离"
+    # 0-chunk / 版本被跳过终态（chunk_status='EMPTY'、publish_status='SKIPPED_*'——低文本图纸、
+    # 整篇 PII 隔离弃件、chunk 爆炸弃版等）：永远不会进索引，此前一律落到默认「处理中」，
+    # 管理员看不出"传了但永远搜不到"（136 篇未入索引盘点的可见性根因之一）。终态如实显示。
+    if (str(chunk_status or "").upper() == "EMPTY"
+            or str(publish_status or "").upper().startswith("SKIPPED")):
+        return "未入索引"
     # 管线把 document_version.index_status 置 'SUCCESS'（非 'INDEXED'）作为上线成功值。
     if ix in ("INDEXED", "SUCCESS") and (chunk_active is None or chunk_active > 0):
         return "已上线"

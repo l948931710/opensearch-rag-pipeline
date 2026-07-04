@@ -127,7 +127,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
-                           v.content_process_status, v.index_status, v.publish_status
+                           v.content_process_status, v.index_status, v.publish_status,
+                           v.chunk_status
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -150,12 +151,12 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs),
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
@@ -212,7 +213,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
-                           v.content_process_status, v.index_status, v.publish_status
+                           v.content_process_status, v.index_status, v.publish_status,
+                           v.chunk_status
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -237,12 +239,12 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", permission_level=perm or "dept_internal",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs),
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
             can_manage=_kb_can_manage(kb, owner or ""),
         ))

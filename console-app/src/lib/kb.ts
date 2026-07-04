@@ -43,7 +43,7 @@ export const ROLE_LABEL: Record<string, string> = {
 
 // 文档状态徽章 → 色调键（组件据此取 st-* 颜色）。未命中 → muted。
 const BADGE_TONE: Record<string, string> = {
-  已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'warn',
+  已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'warn', 未入索引: 'warn',
   已隔离: 'fail', 处理失败: 'fail', 已驳回: 'fail', 已退役: 'muted', 内容未变: 'muted',
 }
 export const badgeTone = (badge: string) => BADGE_TONE[badge] || 'muted'
@@ -73,7 +73,7 @@ const QBADGE_TONE: Record<string, string> = {
 export const qBadgeTone = (s: string) => QBADGE_TONE[s] || 'queue'
 
 // 轮询终态：命中即停（含已退役，不含待审核——待审核要等人审，根本不轮询）。
-export const TERMINAL_BADGES = ['已上线', '处理失败', '已隔离', '已驳回', '内容未变', '已退役']
+export const TERMINAL_BADGES = ['已上线', '未入索引', '处理失败', '已隔离', '已驳回', '内容未变', '已退役']
 
 /**
  * 直传 OSS：fetch 无法上报上传进度，故用 XHR 接 upload.onprogress。File 必须留闭包、勿进 Vue 响应式

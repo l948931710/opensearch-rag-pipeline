@@ -18,10 +18,11 @@ const {
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
 } = useKb()
 
-// 「权限」入口条件：可管理 + 非退役。弹窗内含 基础可见范围（改级别）+ 跨部门共享（仅 dept_internal）。
+// 「权限」入口条件：可管理 + 非退役 + 非隔离。弹窗内含 基础可见范围（改级别）+ 跨部门共享。
 // 放宽到全部可见级别（不再只 dept_internal）：public 文档也要能被改回本部门/受限。
+// 已隔离 = 安全隔离（PII 等）：后端对可见范围/恢复一律 409（唯一出路是脱敏重灌），入口直接不给。
 function canManagePerm(d: DocItem): boolean {
-  return d.can_manage !== false && d.status_badge !== '已退役'
+  return d.can_manage !== false && d.status_badge !== '已退役' && d.status_badge !== '已隔离'
 }
 
 // 共享部门名（去 count，直接列名字，>2 个折 +N）——回答"文档共享给了哪些部门"。
