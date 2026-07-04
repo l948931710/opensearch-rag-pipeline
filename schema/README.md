@@ -18,6 +18,8 @@ apply 脚本落库并记台账。
    显式 COLLATE —— staging `_stg` 库曾因缺省漂移到 `_0900_ai_ci` 引发跨库 JOIN 1267。
 5. DDL↔代码列契约由 `tests/test_schema_ddl_parity.py` 钉住（INSERT/SELECT 用到的列
    必须存在于权威 DDL）——新增读写列时同步改 schema 文件，否则测试红。
+6. **新增 schema 文件须同步更新 `scripts/ci_load_schema.sh` 的 file→DB 清单**——CI
+   db-integration job 用它从零建双库跑 DB 集成测试，清单缺文件时该 job 直接红（显式报名）。
 
 ## 文件 → 目标库
 

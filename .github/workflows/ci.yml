@@ -45,6 +45,73 @@ jobs:
         # 复刻 loadfile 语义并把共享本地栈的模块钉到同一 worker（CI 无本地 DB，该组多为 skip）。
         run: python -m pytest tests/ -q -p no:cacheprovider -n auto --dist loadgroup
 
+  # DB 集成门：test job 是纯 simulate（无 MySQL），DB 集成模块（test_pipeline/
+  # test_classification/test_concurrency/test_image_funnel 的 requires_local_db 族）在
+  # 那里整体 self-skip —— routes/、qa_facts、feedback_handler 里成百条 SQL 从未在合并前
+  # 过语法/建表/collation 检查（contribution.py 的跨库 collation JOIN 1267 就是漏到
+  # staging 活测才炸的）。本 job 起 MySQL 8.0 service（对齐 RDS/docker-compose 版本），
+  # 用 scripts/ci_load_schema.sh 按 schema/README.md 矩阵从零建双库（这一步本身就是
+  # "权威 DDL 可从零建库"的门），再只跑 DB 标记的 4 个模块。与 test job 并行，不拖慢它。
+  db-integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: your_password   # 对齐 docker-compose.yml / tests/local_stack.py 的 dev 凭证
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # 与 test job / 本地 make test 同款全局 simulate（LLM/OSS/HA3 均 mock）；
+      # requires_local_db 族在 simulate 下本就对本地栈做真实 DML（见 tests/local_stack.py 文档）。
+      RAG_SIMULATE: "true"
+      RAG_SIMULATE_API: "true"
+      RAG_SIMULATE_DB: "true"
+      RAG_SIMULATE_OSS: "true"
+      RAG_SIMULATE_OPENSEARCH: "true"
+      # 指向 service container —— conftest 的 prod-guard 只放行本机目标，127.0.0.1 合规；
+      # local_stack 探测用 config 内凭证首连即中，无需回退。
+      RAG_RDS_HOST: 127.0.0.1
+      RAG_RDS_PORT: "3306"
+      RAG_RDS_USER: root
+      RAG_RDS_PASSWORD: your_password
+      RAG_RDS_DATABASE: fuling_knowledge
+      RAG_RDS_OPERATION_DATABASE: fuling_operation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,production,ocr,api]"
+      - name: Load authoritative schema (both DBs, numeric order)
+        run: bash scripts/ci_load_schema.sh
+      # 防"绿得发虚"：requires_local_db 族在探测失败时整体 skip（test job 里正是如此），
+      # 若本 job 探测哪天悄悄断线（如驱动/认证依赖变化），pytest 仍会全 skip 变绿。
+      # 这里显式要求探测必须接线成功，否则直接红。
+      - name: Preflight — DB probe must wire (no silent all-skip)
+        run: |
+          python -c "
+          from tests.local_stack import ensure_local_db_wired, local_db_unavailable_reason
+          assert ensure_local_db_wired(), local_db_unavailable_reason()
+          print('DB probe wired OK')
+          "
+      - name: DB integration tests (real MySQL, real DML)
+        # 4 个模块在 conftest 的 xdist 分组里本就同组串行（互相清表），xdist 无收益 → 直接串行跑
+        run: >-
+          python -m pytest tests/test_pipeline.py tests/test_classification.py
+          tests/test_concurrency.py tests/test_image_funnel.py
+          -q --tb=short -p no:cacheprovider
+
   # 供应链/密钥门（P2-03）：secret 扫描 + 依赖 CVE 审计。此前 CI 完全无安全门。
   security:
     runs-on: ubuntu-latest

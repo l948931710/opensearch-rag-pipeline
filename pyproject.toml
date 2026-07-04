@@ -22,7 +22,8 @@ ocr = [
     "PyMuPDF>=1.24",       # fitz: PDF → image for OCR
 ]
 production = [
-    "pymysql>=1.1",
+    "pymysql[rsa]>=1.1",    # [rsa]=cryptography：MySQL 8 默认 caching_sha2_password 非 TLS 连接需 RSA 密钥交换；
+                            #   此前仅靠传递依赖存在（CI db-integration 与本地 dev 栈都依赖它），显式声明消除隐式依赖
     "DBUtils>=3.0",
     "opensearch-py>=2.4",
     "oss2>=2.18",
