@@ -507,6 +507,94 @@ def test_save_feedback_odku_clears_awaiting():
     assert "IF(handled_status = 'AWAITING_COMMENT'" in source
 
 
+# ── PII-at-rest：回调日志 + feedback_comment 写时脱敏 ────────────────────────────
+
+_PII_PHONE = "13812345678"
+_PII_ID = "110101199003077758"
+
+
+def test_card_callback_raw_log_redacts_pii(capsys):
+    """[CALLBACK RAW] 全量回调日志必须先脱敏：官方赞踩模版「踩→内联输入→提交」的 comment
+    是用户自由文本（可能含身份证/手机号），原文进 stdout→SAE 日志即 PII-at-rest 泄漏。"""
+    import json as _json
+    from opensearch_pipeline import dingtalk_bot
+
+    body = {"outTrackId": "m-pii", "userId": "u1",
+            "content": _json.dumps({"cardPrivateData": {"params": {
+                "feedback": "bad",
+                "comment": f"经办人手机{_PII_PHONE}，身份证{_PII_ID}，一直打不通",
+            }}}, ensure_ascii=False)}
+
+    with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True), \
+         patch("opensearch_pipeline.dingtalk_bot._card_callback_authorized", return_value=True):
+        dingtalk_bot._process_card_callback_body(body)
+
+    out = capsys.readouterr().out
+    assert "[CALLBACK RAW]" in out           # 排查日志保留（原生赞踩字段名仍可实测）
+    assert _PII_PHONE not in out and _PII_ID not in out
+    assert "[手机号已脱敏]" in out            # 是脱敏，不是整段丢弃
+
+
+def test_card_callback_missing_action_warning_redacts_pii(caplog):
+    """缺 action 的回调走 warning 分支也打全量 body —— 同样必须脱敏后再打。"""
+    import json as _json
+    import logging
+    from opensearch_pipeline import dingtalk_bot
+
+    body = {"outTrackId": "m-noact", "userId": "u1",
+            "content": _json.dumps({"cardPrivateData": {"params": {
+                "comment": f"联系方式{_PII_PHONE}",
+            }}}, ensure_ascii=False)}
+
+    with caplog.at_level(logging.WARNING, logger="opensearch_pipeline.dingtalk_bot"):
+        dingtalk_bot._process_card_callback_body(body)
+
+    assert _PII_PHONE not in caplog.text
+    assert "[手机号已脱敏]" in caplog.text
+
+
+def test_save_feedback_comment_stored_redacted():
+    """feedback_comment 必须脱敏后落库：同行 query_text/ai_answer 是 qa_session_log 的
+    已脱敏副本，自由文本补充原因不能成为明文 PII-at-rest 漏网 sink（feedback_miner 会导出）。"""
+    from opensearch_pipeline import feedback_handler
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchone.return_value = ("s1", "问题", "答案", None, "行政")
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn):
+        ok = feedback_handler.handle_feedback(
+            message_id="m1", user_id="u1", action="downvote", reason="other",
+            comment=f"打{_PII_PHONE}没人接，身份证{_PII_ID}也办不了")
+    assert ok is True
+
+    insert_call = next(c for c in cur.execute.call_args_list if "INSERT INTO" in c[0][0])
+    params_joined = "|".join(str(p) for p in insert_call[0][1])
+    assert _PII_PHONE not in params_joined and _PII_ID not in params_joined
+    assert "[手机号已脱敏]" in params_joined and "[身份证号已脱敏]" in params_joined
+    assert "没人接" in params_joined         # 非 PII 正文保留
+
+
+def test_take_awaiting_comment_stores_redacted():
+    """「补充原因」回收路径同样是 feedback_comment 写点 —— 存库前必须脱敏。"""
+    from opensearch_pipeline import feedback_handler
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchone.return_value = (42,)
+    conn.cursor.return_value.__enter__.return_value = cur
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn):
+        assert feedback_handler.take_awaiting_comment(
+            user_id="u1", comment=f"  客服电话打不通，我手机{_PII_PHONE}  ") is True
+
+    update_call = next(c for c in cur.execute.call_args_list
+                       if "SET feedback_comment" in c[0][0])
+    stored = update_call[0][1][0]
+    assert _PII_PHONE not in stored
+    assert "[手机号已脱敏]" in stored
+    assert "打不通" in stored               # 非 PII 正文保留
+
+
 def test_webhook_db_outage_degrades_to_normal_question():
     """私聊路径上 take_awaiting_comment 抛异常（RDS 故障）→ 按普通问题继续（ack+起线程），
     绝不向钉钉返回 500。"""

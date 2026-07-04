@@ -209,6 +209,19 @@ def _q_for_log(text: Optional[str]) -> str:
         return "[redact-failed]"
 
 
+def _body_for_log(body: Any) -> str:
+    """卡片回调 body 全量日志前的 PII 脱敏 + 截断。
+
+    content.cardPrivateData.params 可携带用户自由文本（踩→内联输入的 comment），可能含
+    身份证/手机号——整个序列化 JSON 过 redact_query_text：键名保留（原生赞踩字段名排查
+    不受影响），任何位置的 PII 值被占位符替换；失败回退安全占位符，绝不打原文。"""
+    try:
+        from opensearch_pipeline.contribution import redact_query_text as _rq
+        return _rq(json.dumps(body, ensure_ascii=False))[:1500]
+    except Exception:
+        return "[redact-failed]"
+
+
 def _extract_question(body: Dict[str, Any]) -> str:
     """
     从钉钉回调 body 中提取用户问题文本。
@@ -1018,10 +1031,8 @@ def _process_card_callback_body(body: dict):
     )
     # 全量回调体日志：用于抓取钉钉【原生赞踩 Feedback 组件】点击时的真实 payload（action/字段名），
     # 以便把原生赞踩精确落库（自定义按钮已从模板移除，避免 cardParamMap 更新冲掉流式正文→白屏）。
-    try:
-        print(f"[CALLBACK RAW] {json.dumps(body, ensure_ascii=False)[:1500]}", flush=True)
-    except Exception:
-        pass
+    # params.comment 是用户自由文本（可能含身份证/手机号）→ 必须过 _body_for_log 脱敏后再打。
+    print(f"[CALLBACK RAW] {_body_for_log(body)}", flush=True)
 
     # 解析回调数据
     out_track_id = body.get("outTrackId", "")
@@ -1050,7 +1061,7 @@ def _process_card_callback_body(body: dict):
     user_name = body.get("userName") or None
 
     if not message_id or not action:
-        logger.warning("卡片回调缺少 message_id 或 action: body=%s", body)
+        logger.warning("卡片回调缺少 message_id 或 action: body=%s", _body_for_log(body))
         return {}  # ACK-only（不带 cardData）→ 不更新卡片
 
     # ⚠️ 回调一律 ACK-only：响应里【绝不放 cardData】→ 钉钉不重渲染卡片 → 不会冲掉流式写入的正文

@@ -39,6 +39,24 @@ def get_feedback_status_text(action: str) -> str:
     return _FEEDBACK_STATUS_MAP.get(action, "✅ 已反馈")
 
 
+def _redact_comment(comment: Optional[str]) -> Optional[str]:
+    """feedback_comment 落库前的不可逆 PII 脱敏。
+
+    同行的 query_text/ai_answer 是 qa_session_log 的已脱敏副本，唯独用户自由文本
+    补充原因此前明文入库，且读侧无人脱敏（feedback_miner 直接明文导出）。复用
+    redaction.redact_text（纯本地正则、无 LLM/网络）；失败回退安全占位符，绝不明文落库。"""
+    if not comment:
+        return comment
+    try:
+        from opensearch_pipeline.redaction import redact_text
+
+        masked, _counts = redact_text(comment)
+        return masked
+    except Exception as e:  # pragma: no cover - 纯本地正则极少失败
+        logger.warning("feedback_comment 脱敏失败，回退安全占位符 (non-fatal): %s", e)
+        return "[内容已隐藏]"
+
+
 # ═══════════════════════════════════════════════════════════════
 # 核心反馈处理
 # ═══════════════════════════════════════════════════════════════
@@ -191,7 +209,7 @@ def _save_feedback(
                 (
                     feedback_id, session_id, message_id, user_id, user_name, user_dept,
                     query_text, ai_answer, cited_json,
-                    feedback_type, reason, comment,
+                    feedback_type, reason, _redact_comment(comment),
                     "PENDING",
                 ),
             )
@@ -408,7 +426,8 @@ def take_awaiting_comment(*, user_id: str, comment: str, within_seconds: int = 6
                 f"""UPDATE {_op_db()}.user_feedback
                    SET feedback_comment = %s, handled_status = 'PENDING', updated_at = NOW()
                    WHERE id = %s""",
-                (comment.strip()[:1000], fid),
+                # 先脱敏再截断：反过来会把号码截半，残段不再命中正则 → 部分泄漏
+                (_redact_comment(comment.strip())[:1000], fid),
             )
         conn.commit()
         logger.info("已收下补充原因: user_id=%s, len=%d", user_id, len(comment.strip()))

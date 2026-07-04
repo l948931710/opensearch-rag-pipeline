@@ -497,6 +497,9 @@ def test_feedback_uses_token_user(monkeypatch):
         return True
 
     monkeypatch.setattr(api, "handle_feedback", fake_handle)
+    # 归属门控与本测试无关（这里测的是令牌身份压过请求体 SPOOF），且不 mock 时结果取决于
+    # 本地 dev MySQL 是否在跑：可达→查无 m1→403；不可达→fail-open→200。钉死为放行。
+    monkeypatch.setattr(api, "_feedback_owns_message", lambda *a, **k: True)
     tok = auth_token.issue_session_token("U9", dept="行政部")
     c = TestClient(api.app)
     r = c.post("/api/feedback",
