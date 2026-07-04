@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { Clock, FileText, Loader2 } from 'lucide-vue-next'
+import { Clock, FileText, Loader2, ExternalLink } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
 import { useDialog } from '@/composables/useDialog'
 
 // 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
-const { approvals, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors } = useKb()
+const { approvals, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors, openDocPreview } = useKb()
 const { promptText } = useDialog()
 const rowKey = (d: PendingItem) => `appr:${d.doc_id}/${d.version_no}`
 
@@ -45,6 +45,12 @@ async function onReject(d: PendingItem) {
             <span v-if="d.owner_name"> · 上传人 {{ d.owner_name }}</span>
           </div>
         </div>
+        <!-- 预览原件：放行到全公司/跨组前先看一眼实物，别凭标题盲批 -->
+        <button
+          type="button" data-testid="approval-preview"
+          class="inline-flex items-center justify-center gap-1 rounded-lg border border-border px-3 py-[7px] text-[12.5px] font-medium text-muted-foreground transition hover:border-border-strong hover:text-foreground"
+          title="预览原始上传文件" @click="openDocPreview(d.doc_id, d.version_no)"
+        ><ExternalLink :size="13" :stroke-width="1.75" /> 预览</button>
         <button
           type="button"
           class="inline-flex items-center justify-center gap-1 rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"

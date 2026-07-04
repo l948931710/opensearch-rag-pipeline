@@ -126,12 +126,15 @@ const gapItems = computed(() =>
 // ── 用户反馈与回答质量 ──
 const feedbackCards = computed<Card[]>(() => {
   const g = kbGovernance.value
+  // 覆盖率 = 反馈数 / 回答数，两者【同为近 window_days 天】口径（#10 修复：此前分子全量、分母 30 天
+  // 混窗，覆盖率可 >100% 且无意义）。
+  const win = g?.window_days ?? 30
   const coverage = (g && g.answer_total) ? g.feedback_total / g.answer_total : undefined
   return [
-    { label: '点赞', value: fmtN(g?.feedback_up), icon: ThumbsUp, tone: 'text-st-live', hint: '用户认可的回答' },
-    { label: '点踩', value: fmtN(g?.feedback_down), icon: ThumbsDown, tone: 'text-st-fail', hint: '用户标记的问题' },
+    { label: '点赞', value: fmtN(g?.feedback_up), icon: ThumbsUp, tone: 'text-st-live', hint: `近 ${win} 天 · 用户认可` },
+    { label: '点踩', value: fmtN(g?.feedback_down), icon: ThumbsDown, tone: 'text-st-fail', hint: `近 ${win} 天 · 用户标记` },
     { label: '正反馈率', value: pct(g?.helpful_rate), icon: Percent, tone: 'text-accent-text', hint: '赞 /(赞+踩)' },
-    { label: '反馈覆盖率', value: pct(coverage), icon: MessageSquare, tone: 'text-foreground', hint: '反馈数 / 回答数' },
+    { label: '反馈覆盖率', value: pct(coverage), icon: MessageSquare, tone: 'text-foreground', hint: `反馈数 / 回答数（近 ${win} 天）` },
   ]
 })
 const downvoteItems = computed(() =>

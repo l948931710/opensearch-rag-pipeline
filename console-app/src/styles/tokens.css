@@ -211,8 +211,9 @@ body {
 .led-head, .led-row {
   display: grid;
   /* 归属列 110px：容得下「生产·纸杯」等生产子线中文名（原 96px 会挤换行）；
-     更新列 118px = 16 字符等宽时间戳的贴身宽度；操作列 200px：hover 态最多
-     4 个操作（共享/历史/升版/退役，紧凑 px-1.5）一行放下、不压更新列、不竖排。 */
+     更新列 118px = 16 字符等宽时间戳的贴身宽度；操作列 200px：hover 态 6 个【图标】操作
+     （可见/权限/预览/历史/升版/退役，size-7 方形，共约 178px）一行放下、不压更新列、不竖排。
+     （曾用 icon+文字，6 个约 330px 溢出本列、盖住更新时间——故改纯图标 + tooltip。） */
   grid-template-columns: minmax(0, 1fr) 110px 56px 92px 118px 200px;
   align-items: center;
   gap: 12px;

@@ -34,6 +34,7 @@ from opensearch_pipeline.api import (
     KbVersionHistoryResponse,
     KbVersionItem,
     _KB_ACL_GROUP_LABELS,
+    _KB_BADGE_CASE_SQL,
     _KB_MAX_OFFSET,
     _enforce_rate_limit,
     _kb_can_manage,
@@ -124,27 +125,78 @@ def _kb_usage_enrich(cur, doc_ids):
         return None
 
 
+def _kb_like_search_sql(q: str):
+    """文档名搜索片段（标题/原始文件名子串）：显式 '!' 转义 LIKE 通配符（% _ !），
+    不依赖 DB sql_mode（NO_BACKSLASH_ESCAPES 开启时反斜杠转义会失效）。空 q → ('', [])。"""
+    q = (q or "").strip()[:80]
+    if not q:
+        return "", []
+    esc = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    like = "%" + esc + "%"
+    return "AND (m.title LIKE %s ESCAPE '!' OR m.original_filename LIKE %s ESCAPE '!')", [like, like]
+
+
+def _kb_ledger_filter_sql(perm: str = "", badge: str = "", cited: str = ""):
+    """台账结构化筛选（可见范围 / 徽章 / 利用度）→ (SQL 片段, 参数列表)；空参数不产子句。
+    引用 m/v 别名（与 my-docs/browse 主查询一致）。徽章走 _KB_BADGE_CASE_SQL（_kb_status_badge
+    的 SQL 镜像）；利用度用事实表相关 EXISTS（仅 RAG_QA_FACT_JOIN 开时生效，否则忽略——回退
+    JSON_TABLE 做相关子查询太贵）。全部服务端过滤 → 计数/翻页覆盖全库，不再只筛已加载页（#7）。"""
+    from opensearch_pipeline.kb_authz import _SANITIZE_RE
+    clauses: List[str] = []
+    params: list = []
+    if perm:
+        p = _SANITIZE_RE.sub("", perm.strip())[:32]
+        if p:
+            clauses.append("AND m.permission_level = %s")
+            params.append(p)
+    if badge:
+        clauses.append(f"AND ({_KB_BADGE_CASE_SQL}) = %s")
+        params.append(badge.strip()[:16])
+    if cited in ("never", "used"):
+        try:
+            from opensearch_pipeline.qa_facts import FACT_TABLE, fact_join_enabled
+            if fact_join_enabled():
+                exists = (f"EXISTS (SELECT 1 FROM {_op_db()}.{FACT_TABLE} jt"
+                          " WHERE jt.doc_id = m.doc_id AND jt.cited=1)")
+                clauses.append(f"AND {exists}" if cited == "used" else f"AND NOT {exists}")
+        except Exception:   # noqa: BLE001
+            pass   # fact 不可用 → 忽略利用度筛选（fail-open；客户端仍可按已加载页兜底筛）
+    return ((" " + " ".join(clauses)) if clauses else ""), params
+
+
+def _kb_owner_facet_sql(owner_dept: str):
+    """按归属部门精确筛选（含生产子线，如 production_mold）→ (SQL 片段, 参数)。
+    参数化本身防注入，这里再剥离注入字符 + 限长做纵深防御。返回 (None, None) = 非法 facet（fail-closed）。"""
+    from opensearch_pipeline.kb_authz import _SANITIZE_RE
+    facet = _SANITIZE_RE.sub("", (owner_dept or "").strip())[:64]
+    if owner_dept and not facet:
+        return None, None   # 传了但清洗后为空 = 非法 → 调用方 fail-closed 空
+    if facet:
+        return "AND m.owner_dept = %s", [facet]
+    return "", []
+
+
 @router.get("/api/kb/my-docs", response_model=KbMyDocsResponse)
 def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
+               owner_dept: str = "", perm: str = "", badge: str = "", cited: str = "",
                identity: Optional[Identity] = Depends(current_identity)):
     """管理员可管理的文档列表（kb_admin 全量；dept_admin 限其 managed owner_dept）。只读。
 
     q：文档名搜索（标题 / 原始文件名子串匹配），用于"是否已有现存版本"自查。
+    owner_dept/perm/badge/cited：结构化筛选，全部【服务端】执行 → 覆盖全库而非只筛已加载页（#7）。
+      badge = 用户可读徽章（已上线/未入索引/处理失败/…，经 _KB_BADGE_CASE_SQL 镜像判定）；
+      cited = never（从未被引用，退役候选）/ used（有引用）——仅 RAG_QA_FACT_JOIN 开时生效。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     limit = max(1, min(limit, 50))
     offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（全库 ~1600，1万 offset 绰绰有余，G7）
     clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
-    # 文档名搜索：转义 LIKE 通配符（% _ \）防"输入 % 即匹配全部"，作用域过滤仍在前 → 不越权。
-    q = (q or "").strip()[:80]
-    search_clause, search_params = "", []
-    if q:
-        # 用非反斜杠转义符 '!'：不依赖 DB 的 sql_mode（NO_BACKSLASH_ESCAPES 开启时反斜杠转义会失效）。
-        esc = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
-        like = "%" + esc + "%"
-        search_clause = "AND (m.title LIKE %s ESCAPE '!' OR m.original_filename LIKE %s ESCAPE '!')"
-        search_params = [like, like]
+    search_clause, search_params = _kb_like_search_sql(q)
+    owner_clause, owner_params = _kb_owner_facet_sql(owner_dept)
+    if owner_clause is None:
+        return KbMyDocsResponse(items=[], has_more=False)   # 非法 facet → fail-closed 空
+    filter_clause, filter_params = _kb_ledger_filter_sql(perm, badge, cited)
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -159,11 +211,11 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
-                    WHERE 1=1 {clause} {search_clause}
+                    WHERE 1=1 {clause} {search_clause} {owner_clause} {filter_clause}
                     ORDER BY (m.status='active') DESC, m.updated_at DESC
                     LIMIT %s OFFSET %s
                     """,
-                    (*params, *search_params, limit + 1, offset),
+                    (*params, *search_params, *owner_params, *filter_params, limit + 1, offset),
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
@@ -195,6 +247,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
 
 @router.get("/api/kb/browse", response_model=KbMyDocsResponse)
 def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str = "",
+              perm: str = "", badge: str = "", cited: str = "",
               limit: int = 20, offset: int = 0,
               identity: Optional[Identity] = Depends(current_identity)):
     """全部门只读浏览：部门管理员看【其他部门】文档（可见、不可操作）。只读。
@@ -216,24 +269,12 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     limit = max(1, min(limit, 50))
     offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（G7）
 
-    # owner_dept facet（可选）：参数化 = %s 本身防注入，这里再剥离注入字符 + 限长做纵深防御。
-    from opensearch_pipeline.kb_authz import _SANITIZE_RE
-    owner_facet = _SANITIZE_RE.sub("", (owner_dept or "").strip())[:64]
-    owner_clause, owner_params = "", []
-    if owner_dept and not owner_facet:
+    owner_clause, owner_params = _kb_owner_facet_sql(owner_dept)
+    if owner_clause is None:
         return KbMyDocsResponse(items=[], has_more=False)   # 非法 facet → fail-closed 空
-    if owner_facet:
-        owner_clause = "AND m.owner_dept = %s"
-        owner_params = [owner_facet]
-
-    # 文档名搜索：与 my-docs 同款显式 '!' 转义（不依赖 sql_mode 的 NO_BACKSLASH_ESCAPES）。
-    q = (q or "").strip()[:80]
-    search_clause, search_params = "", []
-    if q:
-        esc = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
-        like = "%" + esc + "%"
-        search_clause = "AND (m.title LIKE %s ESCAPE '!' OR m.original_filename LIKE %s ESCAPE '!')"
-        search_params = [like, like]
+    search_clause, search_params = _kb_like_search_sql(q)
+    # perm facet 受浏览白名单收窄：browse 恒只列 public/dept_internal，故 restricted 等即使传入也无效。
+    filter_clause, filter_params = _kb_ledger_filter_sql(perm, badge, cited)
 
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -251,11 +292,11 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE m.status='active'
                       AND m.permission_level IN ('public','dept_internal')
-                      {owner_clause} {search_clause}
+                      {owner_clause} {search_clause} {filter_clause}
                     ORDER BY m.owner_dept ASC, m.updated_at DESC
                     LIMIT %s OFFSET %s
                     """,
-                    (*owner_params, *search_params, limit + 1, offset),
+                    (*owner_params, *search_params, *filter_params, limit + 1, offset),
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
@@ -293,14 +334,19 @@ class KbStatsResponse(BaseModel):
     chunks: int = 0                      # 作用域内当前已索引分块数（is_active=1 AND index_status='INDEXED'）
     new_this_month: int = 0              # 本月新增文档数（document_meta.created_at 落在当月，active）
     by_badge: Dict[str, int] = Field(default_factory=dict)
+    # 归属部门 facet（全作用域去重，含生产子线）：台账「按归属筛选」下拉的全库口径来源，
+    # 不再只从已加载页派生（否则 >50 篇时下拉漏掉未翻到的部门）。#7
+    owner_depts: List[str] = Field(default_factory=list)
 
 
 @router.get("/api/kb/stats", response_model=KbStatsResponse)
 def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_identity)):
-    """管理范围内文档聚合（真实总数 + 状态分布 + 已索引分块数），不受 my-docs 的 50 上限影响。
+    """管理范围内文档聚合（真实总数 + 状态分布 + 已索引分块数 + 归属 facet），不受 my-docs 的 50 上限影响。
 
     只读、按 owner 作用域过滤（与 my-docs 同一 _kb_owner_scope_sql，不会越权统计他部门）；
-    徽章在 Python 端按与 my-docs 相同的 _kb_status_badge 复算，故口径一致。
+    徽章在 Python 端按与 my-docs 相同的 _kb_status_badge 复算（含 chunk_status，故 0-chunk 文档
+    的「未入索引」口径与台账徽章一致，不再分叉）。台账的状态 chip 计数 / 异常文档待办数 / 归属下拉
+    都以此为全库真值源，替代只覆盖已加载页的客户端计数（#7）。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
@@ -317,7 +363,8 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT m.status, v.content_process_status, v.index_status, v.publish_status
+                    SELECT m.status, v.content_process_status, v.index_status, v.publish_status,
+                           v.chunk_status, m.owner_dept
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -356,16 +403,22 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
         raise HTTPException(status_code=500, detail=f"统计查询失败 (trace: {trace_id})")
     active = retired = 0
     by_badge: Dict[str, int] = {}
+    owner_set = set()
     for row in rows:
-        status, cps, ixs, pubs = row[0], row[1], row[2], row[3]
+        status, cps, ixs, pubs, chks, owner = row[0], row[1], row[2], row[3], row[4], row[5]
         if (status or "active") == "active":
             active += 1
         else:
             retired += 1
-        badge = _kb_status_badge(cps, ixs, status, publish_status=pubs)
+        # chunk_status 一并传入 → 0-chunk/跳过版本如实归「未入索引」，与台账徽章口径一致（此前漏传
+        # 会把这些文档误计成「处理中」，看板分布与台账 chip 对同一文档分叉）。
+        badge = _kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks)
         by_badge[badge] = by_badge.get(badge, 0) + 1
+        if owner:
+            owner_set.add(owner)
     return KbStatsResponse(total=len(rows), active=active, retired=retired, chunks=chunks,
-                           new_this_month=new_this_month, by_badge=by_badge)
+                           new_this_month=new_this_month, by_badge=by_badge,
+                           owner_depts=sorted(owner_set))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +440,27 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
 #  · 每个子查询独立 try/except：单指标取数失败只让该指标诚实空，不拖垮整块看板（auxiliary fail-open）。
 # ─────────────────────────────────────────────────────────────────────────────
 _KB_INSIGHTS_WINDOW_DAYS = 30
+
+# 点踩原因码 → 中文标签（差评复核逐条 + 治理聚合「点踩原因分布」共用；null/未知码归「未注明/其他」）。
+# feedback_reason 是逗号拼接的多选码（见 feedback_handler 写侧）。
+_KB_DOWNVOTE_REASON_LABELS = {
+    "inaccurate": "不准确", "irrelevant": "不相关", "incomplete": "不完整",
+    "outdated": "已过时", "not_found": "未找到", "other": "其他",
+}
+
+
+def _kb_reason_labels(reason: str) -> List[str]:
+    """把逗号拼接的原因码翻成中文标签列表（去空、保序、去重）。空 → []。"""
+    out: List[str] = []
+    for code in (reason or "").split(","):
+        code = code.strip()
+        if not code:
+            continue
+        label = _KB_DOWNVOTE_REASON_LABELS.get(code, code)
+        if label not in out:
+            out.append(label)
+    return out
+
 
 # P1-09：PDF 原生抽取页上限（治理看板「截断文档数」判据）。须与
 # extraction.unified_extractor.PDF_NATIVE_MAX_PAGES 一致；此处独立定义避免把重抽取依赖
@@ -584,6 +658,10 @@ class KbFeedbackReviewItem(BaseModel):
     message_id: str = ""
     question: str = ""                  # 已 PII 脱敏（他人原始提问，与 gap_queries 同纪律）
     created_at: str = ""                # 差评时间
+    reasons: List[str] = Field(default_factory=list)   # 点踩原因（中文标签；用户多选，故为列表）
+    comment: str = ""                   # 用户「补充原因」自由文本（已 PII 脱敏，与 question 同纪律）
+    handled: bool = False               # 是否已被管理员复核处置（handled_status ∈ RESOLVED/DISMISSED）
+    handled_status: str = ""            # 原始处置态：''/PENDING/AWAITING_COMMENT/RESOLVED/DISMISSED
     docs: List[KbFeedbackDocRef] = Field(default_factory=list)   # 该回答引用的【作用域内】文档
 
 
@@ -593,15 +671,26 @@ class KbFeedbackReviewResponse(BaseModel):
     items: List[KbFeedbackReviewItem] = Field(default_factory=list)
 
 
+# 管理员对差评的处置态（写入 user_feedback.handled_status）。RESOLVED=已修复/已跟进、
+# DISMISSED=已忽略（无需动作）、PENDING=重开（撤销处置）。AWAITING_COMMENT 是钉钉「补充原因」
+# 流程的中转态（feedback_handler owns），复核处置动作不产出它。
+_KB_FEEDBACK_HANDLED_ACTIONS = {"resolve": "RESOLVED", "dismiss": "DISMISSED", "reopen": "PENDING"}
+_KB_FEEDBACK_HANDLED_DONE = ("RESOLVED", "DISMISSED")
+
+
 @router.get("/api/kb/feedback-review", response_model=KbFeedbackReviewResponse)
-def kb_feedback_review(request: Request, limit: int = 20,
+def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool = False,
                        identity: Optional[Identity] = Depends(current_identity)):
     """差评联动复核队列（只读）：引用了我作用域文档的回答收到 👎 → 逐条列出
-    （脱敏提问 + 涉及的本部门文档）——「文档质量 → 答案质量」最直接的改进线索。
+    （脱敏提问 + 点踩原因 + 用户补充说明 + 涉及的本部门文档）——「文档质量 → 答案质量」
+    最直接的改进线索。原因/补充说明是修文档时该看的关键上下文，缺了它复核者无从判断该改什么。
 
     归属链与 insights 同源（qa_docs_join_sql cited=1：差评回答【实际引用】了谁的文档，
     谁来复核）；dept_admin 只见涉本部门文档的差评，kb_admin 全库。空=近窗口无差评；
     连接级失败诚实 500。同一回答多条差评（schema/016 去重前）在按 message 分组时自然合并。
+
+    include_resolved=False（默认）：只列未处置（handled_status 非 RESOLVED/DISMISSED），
+    即「收件箱」语义——已处置的沉入历史不占屏；True 则连已处置一并返回（供「显示已处理」切换）。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
@@ -609,9 +698,12 @@ def kb_feedback_review(request: Request, limit: int = 20,
     scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
     win = _KB_INSIGHTS_WINDOW_DAYS
     limit = max(1, min(limit, 50))
+    # 处置态过滤：默认只收未处置（handled_status IS NULL / '' / PENDING / AWAITING_COMMENT）。
+    handled_clause = "" if include_resolved else (
+        " AND (f.handled_status IS NULL OR f.handled_status NOT IN ('RESOLVED','DISMISSED'))")
     cache_key = ("fb_review",
                  tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL",
-                 win, limit)
+                 win, limit, include_resolved)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -626,12 +718,14 @@ def kb_feedback_review(request: Request, limit: int = 20,
                 # 平铺 (message, doc) 行，Python 侧按 message 分组保序（GROUP_CONCAT 拼结构太脆）。
                 # LIMIT 300 行 ≈ 数十条差评 × 引用文档数，上限后截 limit 条消息。
                 cur.execute(
-                    "SELECT f.message_id, f.created_at, q.question, m.doc_id, m.title, m.owner_dept"
+                    "SELECT f.message_id, f.created_at, q.question, m.doc_id, m.title, m.owner_dept,"
+                    " f.feedback_reason, f.feedback_comment, f.handled_status"
                     f" FROM {_op_db()}.user_feedback f"
                     f" JOIN {_op_db()}.qa_session_log q ON q.message_id = f.message_id"
                     + qa_docs_join_sql(cited=True)
                     + " WHERE f.feedback_type='downvote'"
                     "   AND f.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    + handled_clause
                     + (" " + scope_clause if scope_clause else "")
                     + " ORDER BY f.created_at DESC, f.message_id LIMIT 300",
                     tuple([win] + scope_params))
@@ -647,15 +741,23 @@ def kb_feedback_review(request: Request, limit: int = 20,
 
     from opensearch_pipeline import contribution as _C
     by_msg: Dict[str, KbFeedbackReviewItem] = {}
-    for (mid, created, question, doc_id, title, owner) in rows:
+    for row in rows:
+        (mid, created, question, doc_id, title, owner, reason, comment, handled_status) = row
         it = by_msg.get(mid)
         if it is None:
             if len(by_msg) >= limit:
                 continue
-            # 跨用户展示：他人原始提问无条件 PII 脱敏（与 insights.gap_queries 同一纪律）
-            it = KbFeedbackReviewItem(message_id=str(mid),
-                                      question=_C.redact_query_text(str(question or "")),
-                                      created_at=str(created or ""))
+            hs = str(handled_status or "").upper()
+            # 跨用户展示：他人原始提问/补充说明无条件 PII 脱敏（与 insights.gap_queries 同一纪律）。
+            it = KbFeedbackReviewItem(
+                message_id=str(mid),
+                question=_C.redact_query_text(str(question or "")),
+                created_at=str(created or ""),
+                reasons=_kb_reason_labels(str(reason or "")),
+                comment=_C.redact_query_text(str(comment or "")) if comment else "",
+                handled=hs in _KB_FEEDBACK_HANDLED_DONE,
+                handled_status=hs,
+            )
             by_msg[mid] = it
         if doc_id and all(d.doc_id != doc_id for d in it.docs):
             it.docs.append(KbFeedbackDocRef(doc_id=str(doc_id), title=str(title or ""),
@@ -663,6 +765,71 @@ def kb_feedback_review(request: Request, limit: int = 20,
     out.items = list(by_msg.values())
     _dashboard_cache_put(cache_key, out)
     return out
+
+
+class KbFeedbackResolveRequest(BaseModel):
+    message_id: str
+    action: Literal["resolve", "dismiss", "reopen"] = "resolve"
+
+
+@router.post("/api/kb/feedback-review/resolve")
+def kb_feedback_resolve(req: KbFeedbackResolveRequest, request: Request,
+                        identity: Optional[Identity] = Depends(current_identity)):
+    """管理员对一条差评的复核处置：RESOLVED（已修复/跟进）/ DISMISSED（忽略）/ PENDING（重开）。
+
+    授权（现查 DB）：kb_admin 任意；dept_admin 仅当该回答【实际引用】了其 managed owner_dept 的
+    文档时才可处置（与 feedback-review 列表可见性同源，防越权改他部门差评）。写入
+    user_feedback.handled_status/handled_by/handled_at；按 message_id 覆盖该回答的全部差评行
+    （schema/016 去重前可能多行）。不触碰 AWAITING_COMMENT 之外的钉钉「补充原因」时序——那由
+    feedback_handler 拥有；这里只写终态/重开态，feedback_handler 的 IF 守卫会保留它。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    if not req.message_id:
+        raise HTTPException(status_code=400, detail="缺少 message_id")
+    new_status = _KB_FEEDBACK_HANDLED_ACTIONS.get(req.action)
+    if not new_status:
+        raise HTTPException(status_code=400, detail="非法处置动作")
+    assert_metadata_write_allowed("kb_feedback_resolve", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        from opensearch_pipeline.qa_facts import qa_docs_join_sql
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # dept_admin 越权守卫：确认该差评回答引用了调用者作用域内文档（kb_admin scope 为空 → 恒过）。
+                if kb.role != ROLE_KB_ADMIN:
+                    cur.execute(
+                        "SELECT 1"
+                        f" FROM {_op_db()}.user_feedback f"
+                        f" JOIN {_op_db()}.qa_session_log q ON q.message_id = f.message_id"
+                        + qa_docs_join_sql(cited=True)
+                        + " WHERE f.message_id=%s AND f.feedback_type='downvote'"
+                        + (" " + scope_clause if scope_clause else "")
+                        + " LIMIT 1",
+                        tuple([req.message_id] + scope_params))
+                    if not cur.fetchone():
+                        conn.rollback()
+                        raise HTTPException(status_code=403, detail="无权处置该差评（不在管理范围内）")
+                n = cur.execute(
+                    f"UPDATE {_op_db()}.user_feedback"
+                    " SET handled_status=%s, handled_by=%s, handled_at=NOW(), updated_at=NOW()"
+                    " WHERE message_id=%s AND feedback_type='downvote'",
+                    (new_status, kb.user_id, req.message_id))
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_feedback_resolve 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"处置失败 (trace: {trace_id})")
+    _dashboard_cache_clear()   # 处置改变了「收件箱」与已处理集，缓存作废重算
+    return {"status": "ok", "message_id": req.message_id, "handled_status": new_status, "updated": n}
 
 
 class KbEmbedRunItem(BaseModel):
@@ -876,12 +1043,16 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 out.pii_redacted_docs, out.pii_quarantined_docs = int(r[0] or 0), int(r[1] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance pii 失败: %s", e)
-            # 7) 用户反馈（二元好评率 + 近7天量，累计；反馈稀疏故不按窗口切薄）
+            # 7) 用户反馈（二元好评率 + 近7天量）：按 win 天窗口切齐——【与 answer_total 同窗】。
+            #    此前 feedback_total 是全历史累计、answer_total 是近 30 天，前端 覆盖率=前者/后者 混窗
+            #    必然失真（可 >100%）。统一窗口后 覆盖率/点赞/点踩/正反馈率 都是「近 win 天」口径（#10）。
             try:
                 cur.execute(
                     "SELECT SUM(feedback_type='upvote'), SUM(feedback_type='downvote'), COUNT(*),"
                     " SUM(created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY))"
-                    f" FROM {_op_db()}.user_feedback WHERE feedback_type IN ('upvote','downvote')")
+                    f" FROM {_op_db()}.user_feedback WHERE feedback_type IN ('upvote','downvote')"
+                    "   AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+                    (win,))
                 r = cur.fetchone() or (0, 0, 0, 0)
                 out.feedback_up, out.feedback_down = int(r[0] or 0), int(r[1] or 0)
                 out.feedback_total = int(r[2] or 0); out.feedback_last7 = int(r[3] or 0)
@@ -901,19 +1072,22 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                                       for row in cur.fetchall()]
             except Exception as e:
                 fails += 1; logger.warning("kb_governance feedback_daily 失败: %s", e)
-            # 7c) 点踩原因分布（feedback_reason 多选逗号拼接 → Python 拆分计数 + 中文标签；null=未注明）
+            # 7c) 点踩原因分布（feedback_reason 多选逗号拼接 → Python 拆分计数 + 中文标签；null=未注明）。
+            #     同样按 win 天窗口切齐（#10）——否则「共 N 条」与已窗口化的 feedback_down 对不上。
+            #     中文标签复用 _KB_DOWNVOTE_REASON_LABELS（与差评复核逐条同源）。
             try:
                 cur.execute(
                     f"SELECT feedback_reason, COUNT(*) FROM {_op_db()}.user_feedback"
-                    " WHERE feedback_type='downvote' GROUP BY feedback_reason")
-                _RLABEL = {"inaccurate": "不准确", "irrelevant": "不相关", "incomplete": "不完整",
-                           "outdated": "已过时", "not_found": "未找到", "other": "其他"}
+                    " WHERE feedback_type='downvote'"
+                    "   AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " GROUP BY feedback_reason",
+                    (win,))
                 rcount: Dict[str, int] = {}
                 for reason, n in cur.fetchall():
                     n = int(n or 0)
                     codes = [x.strip() for x in (reason or "").split(",") if x.strip()] or ["__none__"]
                     for code in codes:
-                        label = "未注明" if code == "__none__" else _RLABEL.get(code, code)
+                        label = "未注明" if code == "__none__" else _KB_DOWNVOTE_REASON_LABELS.get(code, code)
                         rcount[label] = rcount.get(label, 0) + n
                 out.downvote_reasons = sorted(
                     [KbDownvoteReason(reason=k, count=v) for k, v in rcount.items()],
@@ -1183,6 +1357,78 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
         chunk_total=int(total or 0), chunk_active=active, chunk_indexed=int(indexed or 0),
         status_badge=_kb_status_badge(cps, ixs, doc_status, active),
         error_message=err or "",
+    )
+
+
+# 审批预览 TTL：签名 URL 短时有效（管理员看一眼即够，不做长效外链）。
+_KB_PREVIEW_TTL_SECONDS = 300
+
+
+class KbDocPreviewResponse(BaseModel):
+    doc_id: str = ""
+    version_no: int = 0
+    filename: str = ""
+    content_type: str = ""
+    url: str = ""              # 短时签名 GET URL；'' = 原件缺失 / OSS 未配置（前端据 available 提示）
+    expires_in: int = 0
+    available: bool = False
+
+
+@router.get("/api/kb/doc-preview", response_model=KbDocPreviewResponse)
+def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
+                   identity: Optional[Identity] = Depends(current_identity)):
+    """审批/台账「预览原件」：返回该版本原始上传文件（OSS raw_key）的短时签名 GET URL。
+
+    存在意义（补 kb_admin 唯一的把关盲区）：公开/跨组上传在 content_process_status='PENDING_APPROVAL'
+    时【管线尚未跑】，没有 canonical/chunk 可看——此刻唯一的实物就是 raw 文件。签名直看原件，
+    审批人才不是凭标题盲批。台账已入库文档同样可看原件（current 版本）。
+
+    授权（现查 DB）：kb_admin 任意；dept_admin 仅其 managed owner_dept（与 doc-status 同源）——
+    受限/他部门原件不外露。签名 URL 仅 300s 有效、只读。version=0 → current_version_no；否则取指定版本
+    （审批队列传 pending 版本号）。原件缺失 / OSS 未配置 → available=False，前端如实提示不可预览。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 一次 JOIN 取 归属 + 原文件名 + 该版本 raw_key（version=0 → 落到 current_version_no）。
+                cur.execute(
+                    "SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no"
+                    f" FROM {_kb_db()}.document_meta m"
+                    f" JOIN {_kb_db()}.document_version v"
+                    "   ON v.doc_id = m.doc_id AND v.version_no = IF(%s > 0, %s, m.current_version_no)"
+                    " WHERE m.doc_id = %s LIMIT 1",
+                    (int(version or 0), int(version or 0), doc_id),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_doc_preview 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"预览查询失败 (trace: {trace_id})")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="文档或版本不存在")
+    owner_dept, filename, raw_key, vno = (row[0] or ""), (row[1] or ""), (row[2] or ""), int(row[3] or 0)
+    # 授权先于任何 URL 生成：受限/他部门原件绝不外露（dept_admin 越权直接 403）。
+    if not _kb_can_manage(kb, owner_dept):
+        raise HTTPException(status_code=403, detail="无权预览该文档")
+    if not raw_key:
+        return KbDocPreviewResponse(doc_id=doc_id, version_no=vno, filename=filename, available=False)
+    from opensearch_pipeline.oss_url import generate_signed_url, mime_for_ext
+    url = generate_signed_url(raw_key, expires=_KB_PREVIEW_TTL_SECONDS, method="GET")
+    return KbDocPreviewResponse(
+        doc_id=doc_id, version_no=vno, filename=filename,
+        content_type=mime_for_ext(filename), url=url or "",
+        expires_in=_KB_PREVIEW_TTL_SECONDS, available=bool(url),
     )
 
 

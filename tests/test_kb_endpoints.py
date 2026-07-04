@@ -334,6 +334,9 @@ def _stub_multi(monkeypatch, fetch_seq):
         def commit(self):
             sink["committed"] = True
 
+        def rollback(self):
+            sink["rolledback"] = True
+
         def close(self):
             pass
 
@@ -758,15 +761,17 @@ def test_my_docs_usage_none_when_fact_join_off(monkeypatch):
 
 # ── GET /api/kb/feedback-review：差评联动复核队列（部门作用域，只读）────────────
 def test_feedback_review_groups_and_scopes(monkeypatch):
-    """按 message 分组保序 + 文档去重；dept_admin 作用域进 SQL（owner IN）；问题过 PII 脱敏。"""
+    """按 message 分组保序 + 文档去重；dept_admin 作用域进 SQL（owner IN）；问题/补充说明过 PII 脱敏；
+    点踩原因映射中文；默认只收未处置（handled 子句）。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
     monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    # 9 列：message_id, created_at, question, doc_id, title, owner_dept, feedback_reason, feedback_comment, handled_status
     rows = [
-        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D1", "营销物料规范", "marketing"),
-        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D2", "品牌 VI 手册", "marketing"),
-        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D1", "营销物料规范", "marketing"),  # 重复 doc
-        ("M2", "2026-07-02 09:00:00", "退货流程？", "D3", "售后 SOP", "marketing"),
+        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D1", "营销物料规范", "marketing", "inaccurate,outdated", "手机 13812345678 那段过期了", None),
+        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D2", "品牌 VI 手册", "marketing", "inaccurate,outdated", "手机 13812345678 那段过期了", None),
+        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D1", "营销物料规范", "marketing", "inaccurate,outdated", "手机 13812345678 那段过期了", None),  # 重复 doc
+        ("M2", "2026-07-02 09:00:00", "退货流程？", "D3", "售后 SOP", "marketing", None, "", "PENDING"),
     ]
     sink = _stub_multi(monkeypatch, [rows])
     from opensearch_pipeline import api
@@ -775,7 +780,22 @@ def test_feedback_review_groups_and_scopes(monkeypatch):
     assert [i.message_id for i in resp.items] == ["M1", "M2"]          # 保序（差评时间倒序）
     assert [d.doc_id for d in resp.items[0].docs] == ["D1", "D2"]      # 文档去重
     assert "13812345678" not in resp.items[0].question                 # 他人提问必须脱敏
+    assert resp.items[0].reasons == ["不准确", "已过时"]                 # 原因码 → 中文标签（多选）
+    assert "13812345678" not in resp.items[0].comment                  # 补充说明同样脱敏
+    assert resp.items[0].comment and resp.items[0].handled is False
+    assert resp.items[1].reasons == []                                 # 无原因 → 空
     assert "owner_dept IN" in sink["sql"] and "downvote" in sink["sql"]
+    assert "handled_status NOT IN ('RESOLVED','DISMISSED')" in sink["sql"]   # 默认只收未处置
+
+
+def test_feedback_review_include_resolved_drops_handled_filter(monkeypatch):
+    """include_resolved=True → 不加 handled 过滤（连已处置一并返回）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [[]])
+    from opensearch_pipeline import api
+    api.kb_feedback_review(request=None, limit=20, include_resolved=True, identity=api.Identity(user_id="adm1"))
+    assert "handled_status NOT IN" not in sink["sql"]
 
 
 def test_feedback_review_kb_admin_global_empty_ok(monkeypatch):
@@ -1486,3 +1506,233 @@ def test_approval_history_partial_degrades_not_500(monkeypatch):
     resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))   # 不抛 500
     assert [it.kind for it in resp.items] == ["access"]
     assert resp.items[0].decided_by_name == "kb1"    # names 查询也失败 → 回退 uid
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# #7 台账筛选/计数下推服务端 —— 徽章 CASE 奇偶校验 + my-docs 结构化筛选 + stats facet
+# ═══════════════════════════════════════════════════════════════════════════════
+def test_kb_badge_case_sql_parity():
+    """_KB_BADGE_CASE_SQL 必须与 _kb_status_badge 同序同义（结构 + 优先级）。
+    守卫：改 _kb_status_badge 的判定顺序/取值时忘同步 SQL 镜像 → 这里红。"""
+    from opensearch_pipeline import api
+    sql = api._KB_BADGE_CASE_SQL
+    b = api._kb_status_badge
+    # 1) list 路径（chunk_active=None）代表性输入 → Python 徽章必出现在 CASE 里
+    samples = [
+        b("DONE", "SUCCESS", "retired"),                       # 已退役
+        b("DONE", "SUCCESS", "active", None, "QUARANTINED"),   # 已隔离
+        b("DONE", None, "active", None, None, "EMPTY"),        # 未入索引
+        b("DONE", None, "active", None, "SKIPPED_EMPTY"),      # 未入索引（SKIPPED 前缀）
+        b("DONE", "SUCCESS", "active"),                        # 已上线
+        b("FAILED", None, "active"),                           # 处理失败
+        b("REJECTED", None, "active"),                         # 已驳回
+        b("SKIPPED_DUPLICATE", None, "active"),                # 内容未变
+        b("PENDING_APPROVAL", None, "active"),                 # 待审核
+        b("NOT_STARTED", None, "active"),                      # 排队中
+        b("PROCESSING", None, "active"),                       # 处理中（默认）
+    ]
+    for badge in samples:
+        assert f"'{badge}'" in sql, f"徽章 {badge} 未出现在 CASE 里"
+    # 2) 优先级顺序：CASE 里各徽章首次出现的位置必须与 Python if 阶梯同序
+    order = ["已退役", "已隔离", "未入索引", "已上线", "处理失败", "已驳回", "内容未变", "待审核", "排队中", "处理中"]
+    positions = [sql.index(f"'{x}'") for x in order]
+    assert positions == sorted(positions), "CASE 徽章顺序与 _kb_status_badge 优先级阶梯不一致"
+    # 3) SKIPPED 前缀不得用带字面 % 的 LIKE（pymysql 参数化坑）；用 LEFT(...)='SKIPPED'
+    assert "LIKE 'SKIPPED%'" not in sql and "LEFT(" in sql
+
+
+def test_my_docs_badge_filter_uses_case(monkeypatch):
+    """badge 参数 → WHERE 拼 CASE 徽章判定 + 该徽章作为参数（服务端筛选，覆盖全库）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    api.kb_my_docs(request=None, limit=20, offset=0, badge="未入索引", identity=api.Identity(user_id="dev1"))
+    assert "CASE" in sink["sql"] and "END) = %s" in sink["sql"]
+    assert "未入索引" in sink["params"]          # 徽章值作为参数
+    assert sink["params"][-2:] == (21, 0)       # limit+1, offset 仍在末尾
+
+
+def test_my_docs_owner_perm_cited_filters(monkeypatch):
+    """owner_dept + perm + cited 全服务端；参数顺序 = 归属 → 可见范围 →（cited 无参）→ limit/offset。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    api.kb_my_docs(request=None, limit=20, offset=0, owner_dept="production_mold", perm="public",
+                   identity=api.Identity(user_id="dev1"))
+    assert "m.owner_dept = %s" in sink["sql"] and "m.permission_level = %s" in sink["sql"]
+    assert sink["params"][0] == "production_mold" and sink["params"][1] == "public"
+    assert sink["params"][-2:] == (21, 0)
+
+
+def test_my_docs_no_filters_params_unchanged(monkeypatch):
+    """无任何筛选 → 参数仍是 (21, 0)（不因新增筛选形参回归）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="dev1"))
+    assert sink["params"] == (21, 0)
+    assert "CASE" not in sink["sql"] and "permission_level = %s" not in sink["sql"]
+
+
+def test_my_docs_invalid_owner_facet_fail_closed(monkeypatch):
+    """归属 facet 清洗后为空（纯注入字符）→ fail-closed 空，不落库。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_capture(monkeypatch)
+    from opensearch_pipeline import api
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, owner_dept="'; DROP--", identity=api.Identity(user_id="dev1"))
+    assert resp.items == [] and resp.has_more is False
+
+
+def test_stats_owner_depts_facet_and_chunk_status_badge(monkeypatch):
+    """stats 返回全作用域 owner_depts（去重排序）；0-chunk 文档经 chunk_status 归『未入索引』。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    # 主查询 6 列：status, cps, ixs, pubs, chunk_status, owner_dept
+    rows = [
+        ("active", "DONE", "SUCCESS", None, "DONE", "marketing"),      # 已上线
+        ("active", "DONE", None, "active", "EMPTY", "production"),     # 0-chunk → 未入索引
+        ("active", "DONE", "SUCCESS", None, "DONE", "hr"),            # 已上线
+    ]
+    _stub_multi(monkeypatch, [rows, (7,), (2,)])   # 主 fetchall + chunks fetchone + new_month fetchone
+    from opensearch_pipeline import api
+    resp = api.kb_stats(request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.owner_depts == ["hr", "marketing", "production"]      # 去重 + 排序
+    assert resp.by_badge.get("未入索引") == 1                          # chunk_status 生效（此前漏传会误记「处理中」）
+    assert resp.by_badge.get("已上线") == 2
+    assert resp.chunks == 7 and resp.new_this_month == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# #1 差评处置：POST /api/kb/feedback-review/resolve
+# ═══════════════════════════════════════════════════════════════════════════════
+def test_feedback_resolve_kb_admin_updates(monkeypatch):
+    """kb_admin resolve → UPDATE handled_status='RESOLVED' + handled_by=uid，按 message_id 覆盖。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [])   # kb_admin 跳过作用域校验；UPDATE execute 返回 None 无妨
+    from opensearch_pipeline import api
+    r = api.kb_feedback_resolve(api.KbFeedbackResolveRequest(message_id="M9", action="resolve"),
+                                request=None, identity=api.Identity(user_id="adm1"))
+    assert r["handled_status"] == "RESOLVED" and sink.get("committed")
+    assert "SET handled_status=%s" in sink["sql"]
+    assert sink["params"][0] == "RESOLVED" and sink["params"][1] == "adm1" and sink["params"][2] == "M9"
+
+
+def test_feedback_resolve_reopen_sets_pending(monkeypatch):
+    """reopen → handled_status='PENDING'（撤销处置）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [])
+    from opensearch_pipeline import api
+    r = api.kb_feedback_resolve(api.KbFeedbackResolveRequest(message_id="M9", action="reopen"),
+                                request=None, identity=api.Identity(user_id="adm1"))
+    assert r["handled_status"] == "PENDING"
+
+
+def test_feedback_resolve_dept_admin_scope_guard(monkeypatch):
+    """dept_admin：目标差评不涉本部门文档（作用域 SELECT 无命中）→ 403，不 UPDATE。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [None])   # 作用域 SELECT 1 → 无命中
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_feedback_resolve(api.KbFeedbackResolveRequest(message_id="M9", action="resolve"),
+                                request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+    assert sink.get("rolledback") and not sink.get("committed")
+    assert "owner_dept IN" in sink["sql"]   # 作用域进了校验 SQL
+
+
+def test_feedback_resolve_dept_admin_in_scope_ok(monkeypatch):
+    """dept_admin：目标差评涉本部门文档（作用域命中）→ 放行 UPDATE。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [(1,)])   # 作用域 SELECT 1 → 命中
+    from opensearch_pipeline import api
+    r = api.kb_feedback_resolve(api.KbFeedbackResolveRequest(message_id="M9", action="dismiss"),
+                                request=None, identity=api.Identity(user_id="da1"))
+    assert r["handled_status"] == "DISMISSED" and sink.get("committed")
+
+
+def test_feedback_resolve_missing_message_id_400(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_feedback_resolve(api.KbFeedbackResolveRequest(message_id="", action="resolve"),
+                                request=None, identity=api.Identity(user_id="adm1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_feedback_resolve_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_feedback_resolve(api.KbFeedbackResolveRequest(message_id="M9", action="resolve"),
+                                request=None, identity=api.Identity(user_id="e1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# #5 审批内容预览：GET /api/kb/doc-preview
+# ═══════════════════════════════════════════════════════════════════════════════
+def test_doc_preview_signs_raw_key(monkeypatch):
+    """kb_admin：有 raw_key → 返回签名 GET URL（available=True）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [("marketing", "报价单.pdf", "raw/marketing/D1/v2/报价单.pdf", 2)])
+    monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url",
+                        lambda key, expires=None, method="GET": f"https://oss.example/{key}?sig=x")
+    from opensearch_pipeline import api
+    resp = api.kb_doc_preview(request=None, doc_id="D1", version=2, identity=api.Identity(user_id="adm1"))
+    assert resp.available is True and resp.url.startswith("https://oss.example/")
+    assert resp.version_no == 2 and resp.filename == "报价单.pdf"
+    assert resp.content_type and resp.expires_in == 300
+
+
+def test_doc_preview_no_raw_key_unavailable(monkeypatch):
+    """raw_key 缺失 → available=False，url 空（前端如实提示不可预览）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [("marketing", "老文档.pdf", None, 1)])
+    from opensearch_pipeline import api
+    resp = api.kb_doc_preview(request=None, doc_id="D1", identity=api.Identity(user_id="adm1"))
+    assert resp.available is False and resp.url == ""
+
+
+def test_doc_preview_dept_admin_foreign_403(monkeypatch):
+    """dept_admin：他部门文档原件不外露（授权先于任何 URL 生成）→ 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "考勤.pdf", "raw/hr/D9/v1/考勤.pdf", 1)])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_doc_preview(request=None, doc_id="D9", identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_doc_preview_missing_404(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [None])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_doc_preview(request=None, doc_id="ZZZ", identity=api.Identity(user_id="adm1"))
+    assert getattr(ei.value, "status_code", None) == 404
+
+
+def test_doc_preview_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_doc_preview(request=None, doc_id="D1", identity=api.Identity(user_id="e1"))
+    assert getattr(ei.value, "status_code", None) == 403

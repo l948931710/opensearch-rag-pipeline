@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye } from 'lucide-vue-next'
+import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, ExternalLink } from 'lucide-vue-next'
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
@@ -11,8 +11,9 @@ import { useDialog } from '@/composables/useDialog'
 const { confirm } = useDialog()
 
 const {
-  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir, isDeptAdmin, isKbAdmin,
-  setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
+  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, sortKey, sortDir, isDeptAdmin, isKbAdmin,
+  ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
+  setQuery, sortBy, setScope, enterVersionMode, retire, restore, openHistory, openDocPreview,
   openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
   openShare, grantedLabelsByDoc, openVisibility,
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
@@ -65,14 +66,12 @@ async function onBulkSetVis(level: string) {
   if (okGo) void bulkSetVisibility(level)
 }
 
-// 状态筛选 chip：从已加载文档里取出现过的徽章（+ 全部）。
-const chips = computed(() => {
-  const present = Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))
-  return ['', ...present]
-})
+// 状态筛选 chip + 计数：全库口径来自 /api/kb/stats（本部门台账不受 50 页上限影响）；
+// 「全部门」浏览无对应全库聚合 → useKb 内部自动回退已加载页派生（ledgerBadgeChips/ledgerBadgeCount）。
+const chips = ledgerBadgeChips
 
-// 自愈：当前筛选的徽章因状态重载消失（chip 已不在）→ 回退「全部」，避免列表空且无高亮 chip 的死角。
-watch(chips, (c) => { if (filter.value && !c.includes(filter.value)) filter.value = '' })
+// 自愈：当前筛选的徽章不在可选集里（如换 scope 后徽章分布变化）→ 回退「全部」并重载，避免死角。
+watch(chips, (c) => { if (filter.value && !c.includes(filter.value)) setBadgeFilter('') })
 
 const COLS: { key: SortKey; label: string }[] = [
   { key: 'title', label: '文档名' },
@@ -156,29 +155,32 @@ async function onRestore(d: DocItem) {
           type="button"
           class="rounded-full border px-2.5 py-1 text-xs transition"
           :class="filter === c ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
-          @click="filter = c"
+          @click="setBadgeFilter(c)"
         >
-          {{ c || '全部' }} <span class="font-mono">{{ countOf(c) }}</span>
+          {{ c || '全部' }} <span class="font-mono">{{ ledgerBadgeCount(c) }}</span>
         </button>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <select
-          v-model="ownerFilter" aria-label="按归属部门筛选"
+          :value="ownerFilter" aria-label="按归属部门筛选"
           class="ui-select rounded-md border border-input bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground focus:border-ring focus:outline-none"
+          @change="setOwnerFilter(($event.target as HTMLSelectElement).value)"
         >
           <option value="">全部归属</option>
-          <option v-for="o in ownerOptions" :key="o" :value="o">{{ deptLabel(o) }}</option>
+          <option v-for="o in ledgerOwnerOptions" :key="o" :value="o">{{ deptLabel(o) }}</option>
         </select>
         <select
-          v-model="permFilter" aria-label="按可见范围筛选"
+          :value="permFilter" aria-label="按可见范围筛选"
           class="ui-select rounded-md border border-input bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground focus:border-ring focus:outline-none"
+          @change="setPermFilter(($event.target as HTMLSelectElement).value)"
         >
           <option value="">全部范围</option>
           <option v-for="p in PERM_OPTS" :key="p" :value="p">{{ PERM_LABEL[p] }}</option>
         </select>
         <select
-          v-model="citedFilter" aria-label="按利用度筛选"
+          :value="citedFilter" aria-label="按利用度筛选"
           class="ui-select rounded-md border border-input bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground focus:border-ring focus:outline-none"
+          @change="setCitedFilter(($event.target as HTMLSelectElement).value)"
         >
           <option value="">全部利用度</option>
           <option value="never">从未被引用</option>
@@ -187,7 +189,7 @@ async function onRestore(d: DocItem) {
         <button
           v-if="ownerFilter || permFilter || filter || citedFilter"
           type="button" class="rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground"
-          @click="filter = ''; ownerFilter = ''; permFilter = ''; citedFilter = ''"
+          @click="clearLedgerFilters()"
         >清除筛选</button>
       </div>
     </div>
@@ -289,43 +291,47 @@ async function onRestore(d: DocItem) {
         <div class="led-cell" data-label="状态"><StatusPill :badge="d.status_badge" /></div>
         <div class="led-cell font-mono text-xs text-muted-foreground" data-label="更新">{{ (d.updated_at || '').slice(0, 16) }}</div>
         <div class="led-cell led-actions doc-actions" data-label="操作">
-          <!-- 可操作（本部门 / kb_admin）：历史 / 升版 / 退役 -->
+          <!-- 可操作（本部门 / kb_admin）：可见 / 权限 / 预览 / 历史 / 升版 / 退役。
+               6 个操作 → 图标按钮 + tooltip（原 icon+文字 6 个会溢出 200px 操作列、压到「更新」列上）。 -->
           <template v-if="d.can_manage !== false">
             <button
-              type="button" data-testid="doc-visibility"
-              class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              type="button" data-testid="doc-visibility" aria-label="谁能看到这篇文档"
+              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
               title="谁能看到这篇文档" @click="openVisibility(d)"
-            >
-              <Eye :size="13" :stroke-width="1.75" /> 可见
-            </button>
+            ><Eye :size="14" :stroke-width="1.75" /></button>
             <button
               v-if="canManagePerm(d)"
-              type="button" data-testid="doc-share"
-              class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-accent-soft hover:text-accent-text"
-              @click="openShare(d)"
-            >
-              <Share2 :size="13" :stroke-width="1.75" /> 权限
-            </button>
-            <button type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="openHistory(d)">
-              <History :size="13" :stroke-width="1.75" /> 历史
-            </button>
-            <button type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground" @click="enterVersionMode(d)">
-              <FilePlus2 :size="13" :stroke-width="1.75" /> 升版
-            </button>
+              type="button" data-testid="doc-share" aria-label="跨部门共享 / 权限"
+              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-accent-soft hover:text-accent-text"
+              title="跨部门共享 / 权限" @click="openShare(d)"
+            ><Share2 :size="14" :stroke-width="1.75" /></button>
+            <button
+              type="button" data-testid="doc-preview" aria-label="预览原始上传文件"
+              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              title="预览原始上传文件" @click="openDocPreview(d.doc_id)"
+            ><ExternalLink :size="14" :stroke-width="1.75" /></button>
+            <button
+              type="button" aria-label="版本历史"
+              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              title="版本历史" @click="openHistory(d)"
+            ><History :size="14" :stroke-width="1.75" /></button>
+            <button
+              type="button" aria-label="上传新版本"
+              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              title="上传新版本（升版）" @click="enterVersionMode(d)"
+            ><FilePlus2 :size="14" :stroke-width="1.75" /></button>
             <button
               v-if="d.status_badge !== '已退役'"
-              type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
-              @click="onRetire(d)"
-            >
-              <Archive :size="13" :stroke-width="1.75" /> 退役
-            </button>
+              type="button" aria-label="退役下线"
+              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail"
+              title="退役下线" @click="onRetire(d)"
+            ><Archive :size="14" :stroke-width="1.75" /></button>
             <button
               v-else
-              type="button" class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-st-live transition hover:bg-st-live/10"
-              @click="onRestore(d)"
-            >
-              <ArchiveRestore :size="13" :stroke-width="1.75" /> 恢复上线
-            </button>
+              type="button" aria-label="恢复上线"
+              class="grid size-7 place-items-center rounded-md text-st-live transition hover:bg-st-live/10"
+              title="恢复上线" @click="onRestore(d)"
+            ><ArchiveRestore :size="14" :stroke-width="1.75" /></button>
           </template>
           <!-- 其他部门（只读）：申请授权 / 审批中 / 同步中 / 已放行 -->
           <template v-else>
