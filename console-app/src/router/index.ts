@@ -22,3 +22,15 @@ export const router = createRouter({
   routes,
   scrollBehavior: () => ({ top: 0 }),
 })
+
+// 懒载视图的 idle 预取（Perf-4）：首屏（多为问答页）交互就绪后，趁空闲把另两个视图 chunk
+// 拉进 HTTP 缓存——管理员点「知识库」不再现场下 100KB+。动态 import 幂等（模块缓存），
+// 失败静默（预取本就是尽力而为，真导航时会正常再拉）。requestIdleCallback 缺席（Safari）退化 2s 定时。
+router.isReady().then(() => {
+  const prefetch = () => { QaView(); ManageView(); ContributeView() }
+  const idle = (window as any).requestIdleCallback as ((cb: () => void, o?: any) => void) | undefined
+  try {
+    if (idle) idle(prefetch, { timeout: 5000 })
+    else setTimeout(prefetch, 2000)
+  } catch { /* 预取失败无害 */ }
+})

@@ -39,5 +39,16 @@ export default defineConfig({
     // 产物落进 python 包内，便于 SAE 打包 + FastAPI StaticFiles 托管（P5 接入）
     outDir: fileURLToPath(new URL('../opensearch_pipeline/webconsole/next-dist', import.meta.url)),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        // vendor 拆分（Perf-4）：vue/router/pinia 极少随业务变——独立 chunk 后业务发版
+        // 不再打爆最大的可缓存块，二次访问命中 assets/ 的 immutable 缓存。
+        // （本版 vite 类型只收函数式 manualChunks；精确前缀匹配，勿用裸 includes('vue')
+        //  ——会误伤 lucide-vue-next 之类带 vue 字样的业务依赖。）
+        manualChunks(id: string) {
+          if (/node_modules\/(vue|@vue|vue-router|pinia)\//.test(id)) return 'vendor'
+        },
+      },
+    },
   },
 })
