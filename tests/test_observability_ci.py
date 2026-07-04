@@ -168,12 +168,19 @@ def test_ci_workflow_present_and_runs_tests_in_simulate():
 
 
 def test_ci_workflow_has_frontend_test_build_job():
-    """前端门回归：CI 必须有 console-app 的 vitest + build 阻塞 job（此前 135 测试从未在 CI 跑）。"""
+    """前端门回归：CI 必须有 console-app 的 vitest + build 阻塞 job（此前 135 测试从未在 CI 跑）。
+
+    2026-07-04 起前端门拆到独立 workflow（frontend.yml，带 paths 过滤省纯后端推送的
+    ~30s），本测试跟随迁移并加钉两条拆分后的新不变量：paths 过滤存在（否则拆分失去
+    意义）+ 小程序单测 job 存在（node --test，与 make miniapp-test 同款）。"""
     from pathlib import Path
-    txt = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert "setup-node" in txt, "CI must set up Node for the frontend job"
-    assert "working-directory: console-app" in txt, "frontend job must run in console-app"
-    assert "npm run test" in txt and "npm run build" in txt, "frontend job must run vitest + build"
+    txt = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "frontend.yml").read_text(encoding="utf-8")
+    assert "setup-node" in txt, "frontend workflow must set up Node"
+    assert "working-directory: console-app" in txt, "console job must run in console-app"
+    assert "npm run test" in txt and "npm run build" in txt, "console job must run vitest + build"
+    assert "paths:" in txt and "console-app/**" in txt, "frontend workflow must be paths-filtered"
+    assert "node --test fuling-rag-miniapp/tests/units.test.mjs" in txt, \
+        "miniapp unit tests must stay in CI (make miniapp-test parity)"
 
 
 # ── EVAL-2: GT-manifest preflight wired into the L4 run-path ──
