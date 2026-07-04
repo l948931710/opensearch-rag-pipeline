@@ -210,7 +210,13 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
     互斥，无锁）。concurrency<=1 或单桶时与旧实现逐字节等价。
     """
     from alibabacloud_ha3engine_vector.models import QueryRequest
-    from opensearch_pipeline import retriever as _retriever   # 动态取名：兼容测试 monkeypatch
+    # 解析器仍经 retriever 模块动态取名：这是既有测试的 monkeypatch 席位
+    # （test_reconcile.py::test_scan_ha3_pks_loops_until_stable patch 的是
+    # retriever._parse_ha3_response）。该名如今是 clients.parse_ha3_response 的 re-export
+    # 别名（绑定恒等由 tests/test_ha3_client_coupling.py 看住），不再是 serving 私有实现
+    # ——保留此间接层只为 patch 席位，不构成对 serving 内部的语义依赖。
+    from opensearch_pipeline import retriever as _retriever
+    from opensearch_pipeline.clients import HA3_PARITY_OUTPUT_FIELDS
     from opensearch_pipeline.config import get_config
 
     # #F-recon-vecdim 向量维度读配置、勿硬编码 1024：EMBEDDING_DIMENSION 可设 768/512，
@@ -229,7 +235,9 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
             before = len(brows)
             req = QueryRequest(table_name=table_name, vector=[0.0] * _dim, top_k=cap,
                                include_vector=False,
-                               output_fields=_retriever._DEFAULT_OUTPUT_FIELDS,
+                               # 对账扫描 pin 死自己的最小字段集（消费 id/chunk_id/doc_id/
+                               # chunk_type/version_no），serving 调默认清单不影响对账口径。
+                               output_fields=HA3_PARITY_OUTPUT_FIELDS,
                                filter=f"id>={start} AND id<{start + bucket}")
             parsed = _retriever._parse_ha3_response(bcli.query(req))
             if len(parsed) >= cap:

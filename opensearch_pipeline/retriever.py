@@ -16,6 +16,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from opensearch_pipeline.config import get_config
 
+# HA3 响应解析与 serving 默认输出字段清单已上移至 clients.py（HA3 客户端层，serving 与
+# 批处理 parity/对账共用，消除批处理反向依赖 serving 私有名）。此处以旧下划线名 re-export
+# 同一对象：既有 tests 的 import 与 monkeypatch 席位（`opensearch_pipeline.retriever
+# ._parse_ha3_response` / `_DEFAULT_OUTPUT_FIELDS`）全部保留；绑定恒等由
+# tests/test_ha3_client_coupling.py 看住，将来再分叉会立刻红。
+from opensearch_pipeline.clients import (
+    HA3_DEFAULT_OUTPUT_FIELDS as _DEFAULT_OUTPUT_FIELDS,
+    parse_ha3_response as _parse_ha3_response,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -198,56 +208,7 @@ def _get_ha3_client():
     return _ha3_client
 
 
-def _parse_ha3_response(resp) -> List[Dict[str, Any]]:
-    """将 HA3 QueryResponse 解析为标准化的结果列表。"""
-    body = resp.body
-    if isinstance(body, str):
-        body = json.loads(body)
-    elif hasattr(body, "to_map"):
-        body = body.to_map()
-
-    results = []
-    if isinstance(body, dict):
-        raw = body.get("result", body.get("hits", body.get("data", [])))
-        if isinstance(raw, dict):
-            raw = raw.get("hits", raw.get("items", []))
-        if isinstance(raw, list):
-            results = raw
-
-    parsed = []
-    for item in results:
-        fields = item.get("fields", item)
-        # HA3 的 MULTI_STRING 字段返回列表 (e.g. ['image'])，需要归一化为字符串
-        raw_chunk_type = fields.get("chunk_type", "")
-        if isinstance(raw_chunk_type, list):
-            raw_chunk_type = raw_chunk_type[0] if raw_chunk_type else ""
-        parsed.append({
-            # chunk_id 是 step_card/visual_knowledge 的 RDS 重建键，也是 expand_step_context
-            # 末尾去重的唯一键——必须透传，否则去重会把所有无 id 的 chunk 折叠成一个。
-            "chunk_id": fields.get("chunk_id", ""),
-            # HA3 主键：chunk_id 为空（历史 chunk）时各处 `chunk_id or id` 回退键的实体
-            "id": str(item.get("id") or fields.get("id") or ""),
-            "chunk_text": fields.get("chunk_text_store", fields.get("chunk_text", "")),
-            "title": fields.get("title", ""),
-            "section_title": fields.get("section_title", ""),
-            "doc_id": fields.get("doc_id", ""),
-            # version_no：答案血缘——使一条已落库回答能溯源到精确的文档版本(配合 _DEFAULT_OUTPUT_FIELDS)
-            "version_no": fields.get("version_no", 0),
-            "category_l1": fields.get("category_l1", ""),
-            "chunk_index": fields.get("chunk_index", 0),
-            "page_num": fields.get("page_num", 0),
-            "kb_type": fields.get("kb_type", "public"),
-            # P2-02：字段缺失（投影漂移/旧索引/异常文档）时默认按最严的 restricted 兜底，
-            # 绝不把权限未知的命中当 public 处理（fail-closed 标签；真实 restricted 本就被
-            # 引擎端过滤不会返回，故这里只在字段漂移时生效，正常流量零影响）。
-            "permission_level": fields.get("permission_level") or "restricted",
-            "owner_dept": fields.get("owner_dept", ""),
-            "chunk_type": raw_chunk_type,
-            "source_image": fields.get("source_image", ""),
-            "visual_summary": fields.get("visual_summary", ""),
-            "score": item.get("score", item.get("_score", 0)),
-        })
-    return parsed
+# （_parse_ha3_response 见文件头部：re-export 自 clients.parse_ha3_response）
 
 
 def _escape_ha3_query(text: str) -> str:
@@ -277,13 +238,7 @@ def _sanitize_ha3_filter_value(value: str) -> str:
     return re.sub(r'[^\w\-\u4e00-\u9fff]', '', value)
 
 
-# HA3 查询统一返回字段（search_chunks / cosurface_doc_images / 文档展开共用，避免漂移）
-_DEFAULT_OUTPUT_FIELDS = [
-    "id", "chunk_id", "doc_id", "version_no", "chunk_text_store", "title", "section_title",
-    "category_l1", "chunk_index", "page_num", "kb_type",
-    "permission_level", "owner_dept", "chunk_type",
-    "source_image", "visual_summary",
-]
+# （_DEFAULT_OUTPUT_FIELDS 见文件头部：re-export 自 clients.HA3_DEFAULT_OUTPUT_FIELDS）
 
 
 # 合法 ACL 权限组白名单（单一来源；H2 防御纵深）。

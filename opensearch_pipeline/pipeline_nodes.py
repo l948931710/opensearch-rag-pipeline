@@ -6897,7 +6897,15 @@ def node_verify_and_repush(ctx: dict):
     pointread_all_max = _envi("RAG_STAGE3_PARITY_POINTREAD_ALL_MAX", 200)
 
     from alibabacloud_ha3engine_vector.models import QueryRequest
-    from opensearch_pipeline.retriever import _parse_ha3_response, _DEFAULT_OUTPUT_FIELDS
+    # 解析器与字段清单取自 clients（HA3 客户端层），不再反向依赖 serving retriever 的私有名。
+    # 字段清单特意 pin 为 parity 专属最小集（HA3_PARITY_OUTPUT_FIELDS），不共享 serving 默认
+    # 清单：本守卫 gate 的是不可逆的旧版本 deactivate，判定只消费 id（PK 相符）与
+    # chunk_text_store（drift 子检查），enum hint 另需 chunk_id/doc_id——serving 为答案路径
+    # 增删字段/调整默认清单永远不会改变本安全检查的"存在/漂移"口径。
+    from opensearch_pipeline.clients import (
+        HA3_PARITY_OUTPUT_FIELDS as _PARITY_OUTPUT_FIELDS,
+        parse_ha3_response as _parse_ha3_response,
+    )
 
     text_by_pk = {}  # present pk → returned chunk_text_store (for the drift sub-check); side-effect
 
@@ -6909,7 +6917,7 @@ def node_verify_and_repush(ctx: dict):
         """单 PK 权威 point-read → ('present'|'missing'|'unknown', chunk_text)。"""
         try:
             req = QueryRequest(table_name=cfg.table_name, vector=[0.0] * dim, top_k=1,
-                               include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
+                               include_vector=False, output_fields=_PARITY_OUTPUT_FIELDS,
                                filter=f"{cfg.pk_field}={int(pk)}")
             rows = _parse_ha3_response(client.query(req))
             match = next((r for r in rows if str(r.get("id")) == str(pk)), None)
@@ -6958,7 +6966,7 @@ def node_verify_and_repush(ctx: dict):
         while True:
             try:
                 req = QueryRequest(table_name=cfg.table_name, vector=[0.0] * dim, top_k=1,
-                                   include_vector=False, output_fields=_DEFAULT_OUTPUT_FIELDS,
+                                   include_vector=False, output_fields=_PARITY_OUTPUT_FIELDS,
                                    filter=f"{cfg.pk_field}={int(probe_pk)}")
                 rows = _parse_ha3_response(client.query(req))
                 if any(str(r.get("id")) == str(probe_pk) for r in rows):
@@ -6982,7 +6990,7 @@ def node_verify_and_repush(ctx: dict):
     else:
         try:
             from opensearch_pipeline.ha3_reconcile import _enumerate_ha3_pks
-            seen = _enumerate_ha3_pks(client, cfg, _parse_ha3_response, _DEFAULT_OUTPUT_FIELDS,
+            seen = _enumerate_ha3_pks(client, cfg, _parse_ha3_response, _PARITY_OUTPUT_FIELDS,
                                       QueryRequest, id_hi=max(expected_pks) + 1,
                                       id_lo=min(expected_pks))
             suspects = expected_pks - set(seen)

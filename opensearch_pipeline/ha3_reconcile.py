@@ -115,7 +115,13 @@ def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = False,
 
     try:
         from opensearch_pipeline.pipeline_nodes import _get_db_conn, _get_opensearch_client
-        from opensearch_pipeline.retriever import _parse_ha3_response, _DEFAULT_OUTPUT_FIELDS
+        # 解析器/字段清单取自 clients（HA3 客户端层）；对账扫描 pin 自己的最小字段集
+        # （HA3_PARITY_OUTPUT_FIELDS：id/chunk_id/doc_id 为主），serving 调整默认清单不影响
+        # orphan 判定与删除口径（见 clients.py 常量注释）。
+        from opensearch_pipeline.clients import (
+            HA3_PARITY_OUTPUT_FIELDS as _PARITY_OUTPUT_FIELDS,
+            parse_ha3_response as _parse_ha3_response,
+        )
         from alibabacloud_ha3engine_vector.models import QueryRequest, PushDocumentsRequest
     except Exception as e:  # 依赖缺失：fail-open
         result["errors"].append(f"import failed: {e}")
@@ -150,7 +156,7 @@ def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = False,
     cfg = config.alibaba_vector
 
     try:
-        ha3_map = _enumerate_ha3_pks(client, cfg, _parse_ha3_response, _DEFAULT_OUTPUT_FIELDS,
+        ha3_map = _enumerate_ha3_pks(client, cfg, _parse_ha3_response, _PARITY_OUTPUT_FIELDS,
                                      QueryRequest, id_hi=max_id + _ID_SCAN_HEADROOM)
     except Exception as e:
         result["errors"].append(f"HA3 enumerate failed: {e}")
