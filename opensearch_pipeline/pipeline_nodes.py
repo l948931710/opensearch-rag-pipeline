@@ -5885,6 +5885,7 @@ def node_generate_embeddings(ctx: dict):
             print(f"    └─ Embedding cache updated: {_store.count()} total entries")
         elif not is_dashscope and miss_chunks:
             print(f"    └─ Calling Gemini API for {len(miss_chunks)} cache-miss chunks (batch_size={batch_size}, model={embedding_model}, max_retries={max_retries})...")
+            from opensearch_pipeline.vlm_retry import post_json_with_retry
             for i in range(0, len(miss_chunks), batch_size):
                 batch = miss_chunks[i:i+batch_size]
                 url = f"{base_url}/models/{embedding_model}:batchEmbedContents"
@@ -5895,64 +5896,53 @@ def node_generate_embeddings(ctx: dict):
                     ]
                 }
 
-                last_error = None
-                for attempt in range(max_retries + 1):
-                    try:
-                        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, timeout=request_timeout)
-                        if resp.status_code in (400, 401, 403):
-                            resp.raise_for_status()
-                        if resp.status_code in (429, 500, 502, 503, 504):
-                            resp.raise_for_status()
-                        resp.raise_for_status()
-                        data = resp.json()
+                # 瞬时重试（429+全部 5xx+网络异常、数值 Retry-After、退避 1s→2s→4s 同旧
+                # 2**attempt）收敛到共享策略 vlm_retry.post_json_with_retry（与 DashScope
+                # classify/OCR/VLM/embedding_client 同一策略）。post_fn 传 requests.post
+                # ——与全局 requests 模块同对象，tests 对 `requests.post` 的 patch 依旧生效。
+                try:
+                    resp = post_json_with_retry(
+                        url,
+                        json=payload,
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                        timeout=request_timeout,
+                        max_retries=max_retries,
+                        base_backoff=1.0,
+                        label=f"Gemini batch {i//batch_size}",
+                        post_fn=requests.post,
+                    )
+                    # 4xx(≠429) 与重试耗尽后的 429/5xx 在此抛 HTTPError → 下面统一包成 RuntimeError
+                    resp.raise_for_status()
+                    data = resp.json()
 
-                        embeddings = data.get("embeddings", [])
-                        for idx, item in enumerate(embeddings):
-                            if idx >= len(batch):
-                                break
-                            batch[idx].embedding_vector = item["values"]
-                            batch[idx].embedding_model = embedding_model
-                            batch[idx].embedding_status = "DONE"
-                        # 与 DashScope None-slot P0 修复同款：响应未覆盖的尾部槽位必须显式标
-                        # FAILED。reload 的 push-FAILED chunk 从 RDS 带着 embedding_status='DONE'
-                        # + 无向量进来，若部分响应漏掉它的槽位，它会保持 DONE+None 混过 payload
-                        # 的 "!= DONE" 过滤 → vectorless cmd=add 全量替换旧好文档。
-                        if len(embeddings) < len(batch):
-                            for c in batch[len(embeddings):]:
-                                c.embedding_status = "FAILED"
-                            print(
-                                f"    ⚠️ Gemini batch {i//batch_size} partial response: "
-                                f"{len(embeddings)}/{len(batch)} embeddings returned; "
-                                f"marked {len(batch) - len(embeddings)} uncovered slot(s) FAILED for retry"
-                            )
-                        # 写入缓存
-                        _store.put_many({
-                            _cache_key(c.chunk_text): c.embedding_vector
-                            for c in batch if c.embedding_status == "DONE"})
-                        last_error = None
-                        break  # success
-                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                        last_error = e
-                        if attempt < max_retries:
-                            wait = 2 ** attempt
-                            print(f"    ⚠️ Gemini batch {i//batch_size} attempt {attempt+1} failed (network): {e}. Retrying in {wait}s...")
-                            time.sleep(wait)
-                    except requests.exceptions.HTTPError as e:
-                        last_error = e
-                        status = getattr(e.response, 'status_code', None)
-                        if status in (429, 500, 502, 503, 504) and attempt < max_retries:
-                            wait = 2 ** attempt
-                            print(f"    ⚠️ Gemini batch {i//batch_size} attempt {attempt+1} failed (HTTP {status}): {e}. Retrying in {wait}s...")
-                            time.sleep(wait)
-                        else:
-                            break  # non-transient or retries exhausted
-                    except Exception as e:
-                        last_error = e
-                        break  # unknown error, don't retry
-
-                if last_error is not None:
-                    print(f"    ⚠️ Gemini API Error on batch {i//batch_size} after {min(attempt+1, max_retries+1)} attempt(s): {last_error}")
-                    raise RuntimeError(f"Gemini API invocation failed during embedding generation: {last_error}")
+                    embeddings = data.get("embeddings", [])
+                    for idx, item in enumerate(embeddings):
+                        if idx >= len(batch):
+                            break
+                        batch[idx].embedding_vector = item["values"]
+                        batch[idx].embedding_model = embedding_model
+                        batch[idx].embedding_status = "DONE"
+                    # 与 DashScope None-slot P0 修复同款：响应未覆盖的尾部槽位必须显式标
+                    # FAILED。reload 的 push-FAILED chunk 从 RDS 带着 embedding_status='DONE'
+                    # + 无向量进来，若部分响应漏掉它的槽位，它会保持 DONE+None 混过 payload
+                    # 的 "!= DONE" 过滤 → vectorless cmd=add 全量替换旧好文档。
+                    if len(embeddings) < len(batch):
+                        for c in batch[len(embeddings):]:
+                            c.embedding_status = "FAILED"
+                        print(
+                            f"    ⚠️ Gemini batch {i//batch_size} partial response: "
+                            f"{len(embeddings)}/{len(batch)} embeddings returned; "
+                            f"marked {len(batch) - len(embeddings)} uncovered slot(s) FAILED for retry"
+                        )
+                    # 写入缓存
+                    _store.put_many({
+                        _cache_key(c.chunk_text): c.embedding_vector
+                        for c in batch if c.embedding_status == "DONE"})
+                except Exception as e:
+                    # 重试耗尽的瞬时错误 / 非瞬时 HTTP / 网络异常 / 解析错误：与历史行为
+                    # 一致——严格传播，本批失败即整个节点失败（不静默降级）
+                    print(f"    ⚠️ Gemini API Error on batch {i//batch_size}: {e}")
+                    raise RuntimeError(f"Gemini API invocation failed during embedding generation: {e}")
 
                 time.sleep(1)
             _store.finalize(_CACHE_MAX_ENTRIES)
@@ -6162,7 +6152,11 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
 
         request = PushDocumentsRequest(body=sub_docs)
 
-        # 重试循环：瞬时错误指数退避重试
+        # 重试循环：瞬时错误指数退避重试。刻意不并入 vlm_retry.post_json_with_retry
+        # （2026-07-03 DashScope 重试收敛时评估过）：这是 HA3 Tea SDK 调用而非 requests.post
+        # ——没有 Response.headers 可读 Retry-After，真实 SDK 的 4xx/5xx 以 TeaException 抛出
+        # （下方 status_code 分支仅 mock/sim 可达）；且「任意异常都重试」是针对 HA3 网络抖动的
+        # 刻意宽策略（比共享 is_retryable 更宽），保持自有实现。
         last_error = None
         resp = None
         for attempt in range(max_retries + 1):

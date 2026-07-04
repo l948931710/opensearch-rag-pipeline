@@ -6,7 +6,8 @@ embedding_client.py — DashScope 原生 dense+sparse text-embedding HTTP 客户
 原本各有一份调用代码且已经漂移：查询侧缺少 /api/v1 去重、重试与 sparse 兜底，入库侧有。
 这里统一为一个加固实现，两边复用：
   - URL 幂等去重 /api/v1（唯一返回 sparse 的端点）
-  - 429/5xx 指数退避重试；400/401/403 立即失败；重试耗尽抛出
+  - 瞬时重试统一走 vlm_retry.post_json_with_retry（429+全部 5xx、数值 Retry-After、
+    指数退避 1s→2s→4s）；4xx(≠429) 立即失败；重试耗尽抛出
   - sparse_fallback：入库 True（无 sparse 用 [0]/[0.001]，避免 HA3 把文档排除在索引外）；
     查询 False（空 sparse = 该查询不参与 sparse 匹配，更准确）
 
@@ -23,14 +24,12 @@ from typing import List, Optional, Tuple
 import requests
 
 from opensearch_pipeline.http_session import http_post as _http_post
+from opensearch_pipeline.vlm_retry import post_json_with_retry
 
 logger = logging.getLogger(__name__)
 
 # (dense_vector, sparse_indices, sparse_values)
 EmbeddingResult = Tuple[List[float], List[int], List[float]]
-
-_RETRYABLE_STATUS = (429, 500, 502, 503, 504)
-_NON_RETRYABLE_STATUS = (400, 401, 403)
 
 
 def build_native_embedding_url(api_base_url: str) -> str:
@@ -85,41 +84,36 @@ def embed_texts_native(
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    for attempt in range(max_retries + 1):
-        try:
-            resp = _http_post(url, json=payload, headers=headers, timeout=request_timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("output", {}).get("embeddings", [])
-            results: List[Optional[EmbeddingResult]] = [None] * len(texts)
-            for idx, item in enumerate(items):
-                item_idx = item.get("text_index", idx)
-                if 0 <= item_idx < len(texts):
-                    sidx, sval = _parse_sparse(item.get("sparse_embedding", []), fallback=sparse_fallback)
-                    results[item_idx] = (item["embedding"], sidx, sval)
-            return results
-        except requests.exceptions.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status in _NON_RETRYABLE_STATUS:
-                if status == 400:
-                    logger.warning("%s HTTP 400 (non-retryable): %s",
-                                   label, getattr(e.response, "text", "")[:500])
-                raise
-            if status in _RETRYABLE_STATUS and attempt < max_retries:
-                wait = 2 ** attempt
-                logger.warning("%s attempt %d failed (HTTP %s); retrying in %ss",
-                               label, attempt + 1, status, wait)
-                time.sleep(wait)
-                continue
-            raise
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                logger.warning("%s attempt %d failed (%s); retrying in %ss",
-                               label, attempt + 1, type(e).__name__, wait)
-                time.sleep(wait)
-                continue
-            raise
-
-    # 理论不可达（最后一次 attempt 的异常都会 raise）
-    raise RuntimeError(f"{label} failed after {max_retries + 1} attempts")
+    # 瞬时重试（429+全部 5xx+网络异常、数值 Retry-After、退避 1s→2s→4s 同旧 2**attempt）
+    # 收敛到共享策略 post_json_with_retry。post_fn 传本模块的 _http_post：既保留
+    # http_session 连接池，也保留 tests 的 `embedding_client._http_post` patch 接缝
+    # （该名字在此处每次调用时才解析）。sleep_fn 同理走本模块的 time.sleep 接缝。
+    resp = post_json_with_retry(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=request_timeout,
+        max_retries=max_retries,
+        base_backoff=1.0,
+        sleep_fn=time.sleep,
+        label=label,
+        post_fn=_http_post,
+    )
+    try:
+        # 4xx(≠429) 与重试耗尽后的 429/5xx 在此抛 HTTPError（重试期间的瞬时错误已在
+        # post_json_with_retry 内消化）
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if getattr(e.response, "status_code", None) == 400:
+            logger.warning("%s HTTP 400 (non-retryable): %s",
+                           label, getattr(e.response, "text", "")[:500])
+        raise
+    data = resp.json()
+    items = data.get("output", {}).get("embeddings", [])
+    results: List[Optional[EmbeddingResult]] = [None] * len(texts)
+    for idx, item in enumerate(items):
+        item_idx = item.get("text_index", idx)
+        if 0 <= item_idx < len(texts):
+            sidx, sval = _parse_sparse(item.get("sparse_embedding", []), fallback=sparse_fallback)
+            results[item_idx] = (item["embedding"], sidx, sval)
+    return results
