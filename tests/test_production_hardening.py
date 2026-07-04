@@ -1002,3 +1002,114 @@ def test_s_deactivate_skips_known_failed_docs(mock_get_client, mock_get_db_conn)
         "the embedding-failed doc must still be written FAILED (not silent SUCCESS)"
     )
 
+
+# Test T: LIMIT 边界完整性闸（全维复审 2026-07-03 top 项）。stage-3 loader 按 created_at
+# LIMIT 1000 装载、不按文档分组，边界可能把一个文档的新版本切成两批。第一批（头部全 INDEXED、
+# RDS 里同版本还有未 INDEXED 的尾部）绝不能停用旧版本 / 标 SUCCESS——否则旧版本被不可逆删除时
+# 新版本尾部尚不可检索，该内容切片从搜索中消失（违反"先索引后停用"不变量）。第二批（尾部
+# 索引完成、残留清零）才允许正常收尾。
+class _LimitCutCursor:
+    """按【最后一条 SQL】分发 fetchall 结果的假 cursor：node_deactivate_old_chunks 里有两个
+    形状不同的 RDS SELECT（完整性探针 / 旧版本 id 取回），单一 canned fetchall 无法区分。"""
+
+    def __init__(self, residual_rows, old_id_rows):
+        self.residual_rows = residual_rows  # 完整性探针 → 残留未 INDEXED 的 (doc_id, version_no)
+        self.old_id_rows = old_id_rows      # 旧 id SELECT → (doc_id, version_no, id)
+        self.executed = []
+        self._last_sql = ""
+
+    def execute(self, sql, params=None):
+        self._last_sql = sql
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        if "index_status != 'INDEXED'" in self._last_sql:
+            return self.residual_rows
+        if "SELECT doc_id, version_no, id FROM chunk_meta" in self._last_sql:
+            return self.old_id_rows
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _LimitCutConn:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
+@patch("opensearch_pipeline.pipeline_nodes._get_opensearch_client")
+@patch("opensearch_pipeline.audit_log.write_audit")
+def test_t_deactivate_defers_on_limit_boundary_cut(mock_audit, mock_get_client, mock_get_db_conn):
+    mock_client = MagicMock(spec=["push_documents"])
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.body = ""
+    resp.text = ""
+    mock_client.push_documents.return_value = resp
+    mock_get_client.return_value = mock_client
+
+    def mk(cid, idx):
+        c = Chunk(chunk_id=cid, doc_id="docL", version_no=2, chunk_index=idx,
+                  chunk_type="text_chunk", chunk_text="t", token_count=1)
+        c.index_status = "INDEXED"
+        c.embedding_status = "DONE"
+        return c
+
+    def run_batch(chunks, residual_rows):
+        cur = _LimitCutCursor(residual_rows=residual_rows,
+                              old_id_rows=[("docL", 1, 11), ("docL", 1, 12)])
+        mock_get_db_conn.return_value = _LimitCutConn(cur)
+        ctx = {
+            "valid_chunks": chunks,
+            "preempted_doc_versions": {("docL", 2)},
+            "simulate_db": False,
+            "simulate_opensearch": False,
+            "dag3_no_work": False,
+        }
+        node_deactivate_old_chunks(ctx)
+        status_writes = [
+            (sql, p) for sql, p in cur.executed
+            if "UPDATE document_version" in sql and "SET index_status = %s" in sql
+        ]
+        return cur, status_writes
+
+    # ── 批 1：LIMIT 在 docL v2 中间切断——本批头部全 INDEXED，但 RDS 里同版本还有残留尾部 ──
+    cur1, status1 = run_batch([mk("c0", 0), mk("c1", 1)], residual_rows=[("docL", 2)])
+
+    mock_client.push_documents.assert_not_called()  # 旧版本 HA3 删除（不可逆）必须推迟
+    assert not any("is_active = FALSE" in sql for sql, _ in cur1.executed), (
+        "old-version chunk_meta must stay active while the new version has un-INDEXED residuals"
+    )
+    assert status1, "the deferred doc must still get a document_version status closure"
+    assert all(p[0] == "NOT_INDEXED" for _, p in status1), (
+        f"deferred version must be reset to NOT_INDEXED (never SUCCESS), got {status1}"
+    )
+    mock_audit.assert_not_called()
+
+    # ── 批 2：尾部 chunk 全部 INDEXED（残留清零）→ 正常删旧 + SUCCESS 收尾 ──
+    cur2, status2 = run_batch([mk("c2", 2), mk("c3", 3)], residual_rows=[])
+
+    mock_client.push_documents.assert_called()  # 此时才允许删除旧版本
+    assert any("is_active = FALSE" in sql for sql, _ in cur2.executed)
+    assert any(p[0] == "SUCCESS" and p[1] == "docL" for _, p in status2), (
+        f"completed version must be marked SUCCESS on the tail batch, got {status2}"
+    )
+    assert mock_audit.call_count == 2, "both retired old rows must emit a DEACTIVATE audit"
+
