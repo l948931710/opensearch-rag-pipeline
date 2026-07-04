@@ -21,7 +21,6 @@ import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
 import ApprovalHistory from '@/components/manage/ApprovalHistory.vue'
-import ConfirmDialog from '@/components/manage/ConfirmDialog.vue'
 
 // 知识库入口：管理员 → 分 tab 管理台（概览看板 / 文档管理，设计稿 SUB-TAB SWITCHER）；
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
@@ -231,6 +230,6 @@ onMounted(async () => {
     <AccessRequestModal />
     <ShareDocModal />
     <VisibilityModal />
-    <ConfirmDialog />
+    <!-- 确认/输入/告知 框已上移 AppShell 全局挂载（贡献页审核失败等 notice 也要能渲染） -->
   </div>
 </template>

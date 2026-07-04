@@ -1,12 +1,16 @@
 import { computed, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
+import { useDialog } from '@/composables/useDialog'
 import {
   GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
 
 // 知识库管理台单例 store。身份/可管部门复用 P1 的 session（whoami 已给 managed_owner_depts），
 // 不再走旧 console 的 org-tree。所有写接口后端【现查】授权，前端 role 仅作 UI 门禁。
+
+// 失败/结果类提示统一走应用内告知框（useDialog 单例状态挂模块作用域，此处直接取用；不再用原生 alert）。
+const { notice } = useDialog()
 
 export interface DocItem {
   doc_id: string; title: string; original_filename: string; owner_dept: string
@@ -297,7 +301,7 @@ async function _bulkRun(docsToRun: DocItem[], label: string,
   }
   bulkBusy.value = false
   bulkMsg.value = `${label}完成：成功 ${ok}${fails.length ? `，失败 ${fails.length}` : ''}`
-  if (fails.length) alert(`${label}部分失败：\n` + fails.slice(0, 8).join('\n'))
+  if (fails.length) void notice({ title: `${label}部分失败`, message: fails.slice(0, 8).join('\n'), danger: true })
   if (ok) { clearSelectionKeepMsg(); void loadDocs() }   // 成功过 → 清选中 + 权威重拉
 }
 function clearSelectionKeepMsg() { selectedIds.value = new Set() }
@@ -466,7 +470,8 @@ async function submitAccessRequest(reason: string) {
     void loadMyAccessRequests()   // 提交后回灌权威态（pending）；乐观标记保证即时反馈
   } catch (e: any) {
     // 后端（Phase C）未上线 → 404：诚实告知，不伪造「已提交」。
-    alert(e && e.status === 404 ? '授权申请功能即将上线，敬请期待。' : '提交失败：' + uploadErrText(e))
+    if (e && e.status === 404) void notice({ message: '授权申请功能即将上线，敬请期待。' })
+    else void notice({ title: '提交失败', message: uploadErrText(e), danger: true })
   } finally { accessReqBusy.value = false }
 }
 
@@ -574,16 +579,16 @@ function closeHistory() { verHistory.value = null }
 async function openDocPreview(docId: string, version = 0): Promise<void> {
   const s = useSession()
   const w = typeof window !== 'undefined' ? window.open('', '_blank') : null
-  if (import.meta.env.DEV && s.token === 'dev-preview') { w?.close(); alert('预览原件：演示环境无真实文件。'); return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') { w?.close(); void notice({ title: '预览原件', message: '演示环境无真实文件。' }); return }
   try {
     const qs = version ? `&version=${version}` : ''
     const r = await apiJson<{ url: string; available: boolean; filename: string }>(
       `/api/kb/doc-preview?doc_id=${encodeURIComponent(docId)}${qs}`, { auth: true })
     if (r.available && r.url) { if (w) w.location.href = r.url; else window.open(r.url, '_blank', 'noopener') }
-    else { w?.close(); alert('原件暂不可预览（文件缺失或对象存储未配置）。') }
+    else { w?.close(); void notice({ title: '原件暂不可预览', message: '文件缺失或对象存储未配置。', danger: true }) }
   } catch (e: any) {
     w?.close()
-    alert(e && e.status === 403 ? '无权预览该文档' : '预览失败：' + uploadErrText(e))
+    void notice({ title: '预览失败', message: e && e.status === 403 ? '无权预览该文档' : uploadErrText(e), danger: true })
   }
 }
 
@@ -776,7 +781,7 @@ function doUpload() {
 
 // 审批后定向更新（#82）：成功即本地移除该单（reviewCount 红点由 approvals.length 派生，随之同步），
 // 免一次全量审批队列重拉；文档列表真受影响（放行/驳回改变该文档徽章）→ 保留一次权威 loadDocs。
-// 失败路径保持现状：alert 提示、该单留在队列可重试。
+// 失败路径保持现状：notice 告知框提示、该单留在队列可重试。
 function removeApproval(d: PendingItem) {
   approvals.value = approvals.value.filter((x) => !(x.doc_id === d.doc_id && x.version_no === d.version_no))
 }
@@ -787,7 +792,7 @@ async function approve(d: PendingItem) {
       await apiJson('/api/kb/approve', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no }) })
       removeApproval(d)
       await loadDocs()
-    } catch (e: any) { alert('通过失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '通过失败', message: uploadErrText(e), danger: true }) }
   })
 }
 
@@ -797,7 +802,7 @@ async function reject(d: PendingItem, reason: string) {
       await apiJson('/api/kb/reject', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no, reason }) })
       removeApproval(d)
       await loadDocs()
-    } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '驳回失败', message: uploadErrText(e), danger: true }) }
   })
 }
 
@@ -831,7 +836,7 @@ async function approveAccess(d: AccessRequestItem) {
       // 定向更新（#82）：本地移除该单（与 preview 分支同构）；新授权落到「已授权清单」→ 只刷真正受影响的列表。
       accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id)
       void loadAccessGrants()
-    } catch (e: any) { alert('授权失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '授权失败', message: uploadErrText(e), danger: true }) }
   })
 }
 
@@ -842,7 +847,7 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
       if (import.meta.env.DEV && s.token === 'dev-preview') { accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id); return }
       await apiJson('/api/kb/access-requests/reject', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id, reason }) })
       accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id)   // 定向更新（#82）：驳回只影响本队列
-    } catch (e: any) { alert('驳回失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '驳回失败', message: uploadErrText(e), danger: true }) }
   })
 }
 
@@ -876,7 +881,7 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
       if (import.meta.env.DEV && s.token === 'dev-preview') { accessGrants.value = accessGrants.value.filter((x) => x.id !== g.id); return }
       await apiJson('/api/kb/access-requests/revoke', { method: 'POST', auth: true, body: JSON.stringify({ id: g.id, reason }) })
       await loadAccessGrants()
-    } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '撤销失败', message: uploadErrText(e), danger: true }) }
   })
 }
 
@@ -950,7 +955,7 @@ async function resolveFeedback(messageId: string, action: FeedbackResolveAction)
         ? { ...x, handled: done, handled_status: action === 'resolve' ? 'RESOLVED' : action === 'dismiss' ? 'DISMISSED' : 'PENDING' } : x)
     }
     return true
-  } catch (e: any) { alert('处置失败：' + uploadErrText(e)); return false }
+  } catch (e: any) { void notice({ title: '处置失败', message: uploadErrText(e), danger: true }); return false }
   finally { const n = new Set(feedbackResolveBusy.value); n.delete(messageId); feedbackResolveBusy.value = n }
 }
 
@@ -1153,7 +1158,7 @@ async function grantDeptAdmin(userId: string, userName: string, ownerDepts: stri
       await apiJson('/api/kb/admin-grants', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, user_name: userName, owner_depts: ownerDepts, note }) })
       await loadAdminGrants()
       return true
-    } catch (e: any) { alert('授予失败：' + uploadErrText(e)); return false }
+    } catch (e: any) { void notice({ title: '授予失败', message: uploadErrText(e), danger: true }); return false }
   })) ?? false   // 在途（重复点击）→ 视为未提交
 }
 
@@ -1170,7 +1175,7 @@ async function revokeAdminGrant(userId: string, ownerDept = ''): Promise<void> {
       }
       await apiJson('/api/kb/admin-grants/revoke', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, owner_dept: ownerDept }) })
       await loadAdminGrants()
-    } catch (e: any) { alert('撤销失败：' + uploadErrText(e)) }
+    } catch (e: any) { void notice({ title: '撤销失败', message: uploadErrText(e), danger: true }) }
   })
 }
 
