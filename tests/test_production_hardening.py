@@ -1116,3 +1116,216 @@ def test_t_deactivate_defers_on_limit_boundary_cut(mock_audit, mock_get_client, 
     )
     assert mock_audit.call_count == 2, "both retired old rows must emit a DEACTIVATE audit"
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# Tests K4–K7 (vectorless-upsert hardening, 2026-07-03): chunker.to_ha3_doc silently
+# omits dense_vector when embedding_vector is falsy, and HA3 cmd=add on the stable PK
+# is a FULL document replace — so any DONE+None chunk that reaches the payload replaces
+# a previously-good doc with a kNN-invisible zombie. These tests pin the three paths
+# that could ship one: Gemini partial response, embedding-cache literal null, and the
+# payload-build belt-and-braces guard.
+# ═══════════════════════════════════════════════════════════════
+
+class _FakeCacheStore:
+    """embedding_cache.get_embedding_cache() 替身：与真实 get_many 语义一致——
+    字面 null 的行解码为 None 但键仍在返回 dict 里（命中）。"""
+    backend = "mem"
+
+    def __init__(self, preload=None):
+        self.data = dict(preload or {})
+        self.puts = {}
+
+    def get_many(self, keys):
+        return {k: self.data[k] for k in keys if k in self.data}
+
+    def put_many(self, mapping):
+        self.puts.update(mapping)
+        self.data.update(mapping)
+
+    def finalize(self, *a, **k):
+        pass
+
+    def count(self):
+        return len(self.data)
+
+
+def _mk_embed_chunk(cid, text, status="NOT_STARTED", vec=None):
+    c = Chunk(chunk_id=cid, doc_id="docE", version_no=1, chunk_index=0,
+              chunk_type="text_chunk", chunk_text=text, token_count=1)
+    c.embedding_status = status
+    c.embedding_vector = vec
+    return c
+
+
+def _embed_cache_key(model, text):
+    import hashlib
+    return hashlib.md5(f"{model}_{text}".encode("utf-8")).hexdigest()
+
+
+# Test K4: a partial Gemini batchEmbedContents response (fewer embeddings than requests)
+# must mark every uncovered tail slot FAILED — mirroring the DashScope None-slot P0 fix.
+# The dangerous input is a reloaded push-FAILED chunk that arrives carrying
+# embedding_status='DONE' from RDS with embedding_vector=None: without the fix it stays
+# DONE+None, passes the payload "!= DONE" filter, and ships vectorless.
+def test_k4_gemini_partial_response_marks_tail_slots_failed(monkeypatch):
+    from opensearch_pipeline.pipeline_nodes import node_generate_embeddings
+    from opensearch_pipeline.config import get_config
+
+    config = get_config()
+    monkeypatch.setattr(config.embedding, "api_key", "test-key")
+    monkeypatch.setattr(config.embedding, "model", "gemini-embedding-2")
+    monkeypatch.setattr(config.embedding, "api_base_url",
+                        "https://generativelanguage.googleapis.com/v1beta")
+    monkeypatch.setattr(config.embedding, "batch_size", 10)
+
+    c_ok = _mk_embed_chunk("c_ok", "text-ok")
+    # reload 场景：RDS 带回 DONE 状态但没有向量
+    c_reload = _mk_embed_chunk("c_reload", "text-reload", status="DONE", vec=None)
+    ctx = {"valid_chunks": [c_ok, c_reload], "simulate_api": False}
+
+    store = _FakeCacheStore()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status.return_value = None
+    # 部分响应：2 个请求只回 1 个 embedding
+    resp.json.return_value = {"embeddings": [{"values": [0.1] * 8}]}
+
+    with patch("opensearch_pipeline.embedding_cache.get_embedding_cache", return_value=store), \
+         patch("requests.post", return_value=resp), \
+         patch("time.sleep"):
+        node_generate_embeddings(ctx)
+
+    assert c_ok.embedding_status == "DONE"
+    assert c_ok.embedding_vector == [0.1] * 8
+    assert c_reload.embedding_status == "FAILED", (
+        "uncovered tail slot must be demoted to FAILED, not left at reloaded DONE+None"
+    )
+    # 缓存绝不能落 null 值（那正是字面 null 命中的来源）
+    assert all(v is not None for v in store.puts.values()), store.puts
+    assert _embed_cache_key("gemini-embedding-2", "text-reload") not in store.puts
+
+
+# Test K5: a literal JSON null stored under a cache key decodes to None but the key is
+# still present in get_many's result — it must be treated as a MISS (re-embed), never as
+# a DONE hit with embedding_vector=None.
+def test_k5_cached_literal_null_is_treated_as_miss(monkeypatch):
+    from opensearch_pipeline.pipeline_nodes import node_generate_embeddings
+    from opensearch_pipeline.config import get_config
+
+    model = "text-embedding-v4"
+    config = get_config()
+    monkeypatch.setattr(config.embedding, "api_key", "test-key")
+    monkeypatch.setattr(config.embedding, "model", model)
+    monkeypatch.setattr(config.embedding, "api_base_url",
+                        "https://dashscope.aliyuncs.com/api/v1")
+    monkeypatch.setattr(config.embedding, "batch_size", 10)
+
+    c = _mk_embed_chunk("c_null", "null-cached text")
+    ck = _embed_cache_key(model, c.chunk_text)
+    # 字面 null 命中 + sparse 键存在（隔离出纯 null-dense 这一维）
+    store = _FakeCacheStore(preload={
+        ck: None,
+        f"sp_{ck}": {"indices": [1], "values": [0.5]},
+    })
+
+    dashscope_resp = MagicMock()
+    dashscope_resp.status_code = 200
+    dashscope_resp.raise_for_status.return_value = None
+    dashscope_resp.json.return_value = {"output": {"embeddings": [{
+        "text_index": 0, "embedding": [0.2] * 8,
+        "sparse_embedding": [{"index": 3, "value": 0.7}],
+    }]}}
+
+    with patch("opensearch_pipeline.embedding_cache.get_embedding_cache", return_value=store), \
+         patch("opensearch_pipeline.embedding_client._http_post",
+               return_value=dashscope_resp) as mock_post:
+        node_generate_embeddings({"valid_chunks": [c], "simulate_api": False})
+
+    mock_post.assert_called_once()  # null 命中必须触发重嵌，而不是白拿 DONE
+    assert c.embedding_status == "DONE"
+    assert c.embedding_vector == [0.2] * 8
+    assert c.sparse_vector_indices == [3]
+    # 重嵌后缓存被真实向量覆盖，null 自愈
+    assert store.data[ck] == [0.2] * 8
+
+
+# Test K5b: a dense cache hit whose sparse counterpart is missing must also be a MISS on
+# the DashScope path — HA3 may exclude sparse-less docs (embedding_client sparse_fallback
+# comment), so shipping one wedges the drain via parity FAILED + deterministic re-hit.
+# Re-embedding goes through sparse_fallback=True, so the retry cannot loop forever.
+def test_k5b_dense_hit_without_sparse_is_miss_on_dashscope(monkeypatch):
+    from opensearch_pipeline.pipeline_nodes import node_generate_embeddings
+    from opensearch_pipeline.config import get_config
+
+    model = "text-embedding-v4"
+    config = get_config()
+    monkeypatch.setattr(config.embedding, "api_key", "test-key")
+    monkeypatch.setattr(config.embedding, "model", model)
+    monkeypatch.setattr(config.embedding, "api_base_url",
+                        "https://dashscope.aliyuncs.com/api/v1")
+    monkeypatch.setattr(config.embedding, "batch_size", 10)
+
+    c_no_sp = _mk_embed_chunk("c_no_sp", "dense-only cached text")
+    c_full = _mk_embed_chunk("c_full", "fully cached text")
+    ck_no_sp = _embed_cache_key(model, c_no_sp.chunk_text)
+    ck_full = _embed_cache_key(model, c_full.chunk_text)
+    store = _FakeCacheStore(preload={
+        ck_no_sp: [0.9] * 8,  # dense 命中但无 sp_ 键
+        ck_full: [0.8] * 8,
+        f"sp_{ck_full}": {"indices": [2], "values": [0.4]},
+    })
+
+    dashscope_resp = MagicMock()
+    dashscope_resp.status_code = 200
+    dashscope_resp.raise_for_status.return_value = None
+    dashscope_resp.json.return_value = {"output": {"embeddings": [{
+        "text_index": 0, "embedding": [0.3] * 8,
+        "sparse_embedding": [{"index": 7, "value": 0.6}],
+    }]}}
+
+    with patch("opensearch_pipeline.embedding_cache.get_embedding_cache", return_value=store), \
+         patch("opensearch_pipeline.embedding_client._http_post",
+               return_value=dashscope_resp) as mock_post:
+        node_generate_embeddings({"valid_chunks": [c_no_sp, c_full], "simulate_api": False})
+
+    # 完整命中的 chunk 不触发 API；sparse 缺失的按 miss 重嵌
+    mock_post.assert_called_once()
+    sent_texts = mock_post.call_args.kwargs["json"]["input"]["texts"]
+    assert sent_texts == [c_no_sp.chunk_text]
+    assert c_full.embedding_status == "DONE"
+    assert c_full.embedding_vector == [0.8] * 8
+    assert c_full.sparse_vector_indices == [2]
+    assert c_no_sp.embedding_status == "DONE"
+    assert c_no_sp.embedding_vector == [0.3] * 8
+    assert c_no_sp.sparse_vector_indices == [7], (
+        "re-embed must yield a sparse vector so the doc is never pushed sparse-less"
+    )
+
+
+# Test K6 (belt-and-braces): even if some future path produces DONE + embedding_vector=None,
+# node_build_opensearch_payload must demote it to FAILED, keep it out of the payload, and
+# block old-version deactivation — same contract as Tests K/K2.
+def test_k6_done_none_chunk_cannot_enter_push_payload():
+    from opensearch_pipeline.pipeline_nodes import (
+        node_build_opensearch_payload,
+        node_update_index_status,
+    )
+
+    ok = _mk_embed_chunk("c_ok", "good", status="DONE", vec=[0.1, 0.2, 0.3])
+    zombie = _mk_embed_chunk("c_zombie", "vectorless", status="DONE", vec=None)
+    ctx = {"embedded_chunks": [ok, zombie], "dag3_no_work": False}
+
+    node_build_opensearch_payload(ctx)
+
+    assert zombie.embedding_status == "FAILED"
+    assert ctx["embedding_failed_chunks"] == [zombie]
+    pushed_ids = [c.chunk_id for b in ctx["bulk_batches"] for c in b["chunks"]]
+    assert pushed_ids == ["c_ok"], pushed_ids
+
+    ctx["simulate_db"] = True
+    for b in ctx["bulk_batches"]:
+        b["result"] = {"failed": 0, "indexed": len(b["chunks"]), "took_ms": 1, "errors": False}
+    with pytest.raises(RuntimeError) as excinfo:
+        node_update_index_status(ctx)
+    assert "deactivat" in str(excinfo.value).lower()
