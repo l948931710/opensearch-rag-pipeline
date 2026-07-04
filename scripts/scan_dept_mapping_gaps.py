@@ -127,6 +127,8 @@ def walk_tree(token: str):
 def classify(name: str, explicit: dict, umbrella: frozenset, valid: frozenset) -> tuple:
     """按现行 _normalize_dept_to_codes 的裁决顺序分类单个部门名 → (kind, groups)。"""
     if name in explicit:
+        if "*" in explicit[name]:      # 全组哨兵（总经办类）：运行时展开为全量白名单，
+            return "explicit", sorted(valid)   # 报告必须同口径——否则最高权限映射被误报成 []
         return "explicit", [c for c in explicit[name] if c in valid]
     if name in umbrella:
         return "umbrella", ["production"]
@@ -176,11 +178,10 @@ def main() -> None:
     from opensearch_pipeline.dingtalk_identity import (  # noqa: E402
         _DEPT_NAME_TO_GROUPS, _PRODUCTION_WORKSHOP_DEPTS, _normalize_dept_to_codes,
     )
-    try:
-        from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
-    except Exception:
-        _VALID_ACL_GROUPS = frozenset({"finance", "it", "marketing", "production",
-                                       "pmc", "admin", "hr", "rd", "quality", "supply"})
+    # 白名单单一来源，绝不带本地 fallback 副本：漂移检测工具自己拿着一份会漂移的
+    # 复制品（上一版 10 组 fallback 在 15 组扩容后已经陈旧）比 import 失败更糟——
+    # import 失败会硬崩（上面 dingtalk_identity 的 import 本就依赖 retriever），可诊断。
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
 
     print("① 遍历钉钉组织树 …", flush=True)
     token = _access_token()
