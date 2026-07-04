@@ -18,6 +18,8 @@ import re
 import unicodedata
 from typing import Optional
 
+from opensearch_pipeline.reindex_states import DocVersionIndexStatus
+
 logger = logging.getLogger(__name__)
 
 # ── 状态词表（与 schema/010 一致；前端徽章据此分流）─────────────────────────
@@ -31,10 +33,12 @@ INGEST_REGISTERED = "registered"
 INGEST_SEARCHABLE = "searchable"
 INGEST_FAILED = "failed"
 
-# document_version.index_status 中「已成功索引」的取值（生产实际写 SUCCESS；历史/schema 注释另有
-# INDEXED）。reconcile 据此把 registered→searchable。见 [[h5-dept-upload-app]] 徽章词表坑。
-INDEX_OK_STATUSES = ("SUCCESS", "INDEXED")
-INDEX_FAIL_STATUSES = ("INDEXING_ERROR", "ERROR", "FAILED")
+# document_version.index_status 的成功/失败取值——以 reindex_states.DocVersionIndexStatus 词表
+# 为准（成功=SUCCESS，绝不是 'INDEXED'——那是 chunk_meta 词表的成功值，本列从未写过；旧值
+# INDEXED/INDEXING_ERROR/ERROR 只存在于历史 schema 注释，查询它们永远空集，故移除）。
+# reconcile 据此把 registered→searchable/failed。见 [[h5-dept-upload-app]] 徽章词表坑。
+INDEX_OK_STATUSES = (DocVersionIndexStatus.SUCCESS,)
+INDEX_FAIL_STATUSES = (DocVersionIndexStatus.FAILED,)
 
 # 文本长度护栏（防刷 / 防超长；与 schema VARCHAR(512) 对齐）。
 MAX_QUESTION_LEN = 500

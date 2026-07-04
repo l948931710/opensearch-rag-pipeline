@@ -128,8 +128,8 @@ def test_detection_sql_guards():
     source = inspect.getsource(reconcile_stranded_versions)
     assert "QUARANTINED" in source, "被隔离的文档不得参与对账"
     assert "INTERVAL 2 HOUR" in source, "必须避让 2h 内在跑的 stage-3（PROCESSING）"
-    assert "index_status != 'INDEXED'" in source, (
-        "「全量 INDEXED」必须用 NOT EXISTS 非 INDEXED 来证明（部分成功不算）"
+    assert "index_status != '{ChunkIndexStatus.INDEXED}'" in source, (
+        "「全量 INDEXED」必须用 NOT EXISTS 非 INDEXED 来证明（部分成功不算；词表常量渲染）"
     )
     assert "version_no <" in source, "搁浅特征 = 旧版本仍有 active chunk"
     assert "is_active = 1" in source

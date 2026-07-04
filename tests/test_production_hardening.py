@@ -483,9 +483,12 @@ def test_g_stale_recovery_failure_reset():
     assert "raise RuntimeError(\"Stage 2 completed but had partial OSS load failures. Failing the DataWorks task.\")" in source, "Must raise RuntimeError at end of Stage 2 to prevent fake success"
     
     # Stage 3 explicitly handling FAILED chunk_meta (cm. alias prefix after JOIN fix)
-    assert "cm.index_status IN ('NOT_INDEXED', 'FAILED')" in source, "Stage 3 query must retry explicitly FAILED chunks"
+    # 词表重构后 SQL 由 reindex_states 常量渲染（运行时仍是 IN ('NOT_INDEXED', 'FAILED')）
+    assert "cm.index_status IN ({sql_in_list(STAGE3_CHUNK_RESELECT_INDEX_STATUS)})" in source, \
+        "Stage 3 query must retry explicitly FAILED chunks (via STAGE3_CHUNK_RESELECT_INDEX_STATUS)"
     # Stage 3 PROCESSING timeout lease filter (prevents orphaned lock starvation after OOMKill)
-    assert "dv.index_status != 'PROCESSING'" in source, "Stage 3 query must filter out PROCESSING documents"
+    assert "dv.index_status != '{DocVersionIndexStatus.PROCESSING}'" in source, \
+        "Stage 3 query must filter out PROCESSING documents"
     assert "INTERVAL 2 HOUR" in source, "Stage 3 query must have 2-hour timeout lease for stale PROCESSING recovery"
 
 
@@ -495,7 +498,7 @@ def test_g_stale_recovery_failure_reset():
 def test_h_stale_processing_lock_takeover():
     import inspect
     source = inspect.getsource(node_acquire_index_lock)
-    assert "index_status = 'PROCESSING'" in source, "lock claim must touch PROCESSING state"
+    assert "index_status = '{DocVersionIndexStatus.PROCESSING}'" in source, "lock claim must touch PROCESSING state"
     assert "updated_at < NOW() - INTERVAL 2 HOUR" in source, (
         "node_acquire_index_lock must take over stale (>2h) PROCESSING locks, "
         "matching the orchestrator loader's admission window"

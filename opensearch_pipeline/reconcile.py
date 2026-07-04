@@ -29,6 +29,8 @@ import threading
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
+from opensearch_pipeline.reindex_states import ChunkIndexStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,7 +98,7 @@ def compute_parity(rds_rows: List[Dict[str, Any]],
     rds_by_id = {int(r["id"]): r for r in rds_rows}
     active = [r for r in rds_rows if r.get("is_active") == 1]
     active_ids = {int(r["id"]) for r in active}
-    active_indexed = {int(r["id"]): r for r in active if r.get("index_status") == "INDEXED"}
+    active_indexed = {int(r["id"]): r for r in active if r.get("index_status") == ChunkIndexStatus.INDEXED}
     active_chunkids = {r["chunk_id"] for r in active}
     active_by_doc: Dict[str, set] = defaultdict(set)
     for r in active:

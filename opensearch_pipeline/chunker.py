@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from opensearch_pipeline.extraction.schema import STEP_BOUNDARY_PATTERN
+from opensearch_pipeline.reindex_states import ChunkIndexStatus
 
 # 分页标志（页眉/页脚表格识别）：仅含这类标志的短表格才视为可去重的重复页眉表，
 # 真实数据表不含分页短语，因此不会被误删。
@@ -153,7 +154,7 @@ class Chunk:
     is_active: bool = True
     sensitive_redacted: bool = False
     embedding_status: str = "NOT_STARTED"
-    index_status: str = "NOT_INDEXED"
+    index_status: str = ChunkIndexStatus.NOT_INDEXED
     embedding_model: Optional[str] = None
     embedding_vector: Optional[List[float]] = None
     sparse_vector_indices: Optional[List[int]] = None

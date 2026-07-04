@@ -19,8 +19,8 @@ def test_reconcile_pending_deletes_deactivates_chunk_meta():
     src = inspect.getsource(spot_checker.reconcile_pending_deletes)
     assert "UPDATE\n                        chunk_meta" in src or "UPDATE chunk_meta" in src
     assert "is_active = FALSE" in src
-    # still marks the document_version row DELETED
-    assert "index_status = 'DELETED'" in src
+    # still marks the document_version row DELETED (rendered from the DocVersionIndexStatus vocab)
+    assert "index_status = '{DocVersionIndexStatus.DELETED}'" in src
 
 
 def test_node_deactivate_feeds_outbox_on_failure():

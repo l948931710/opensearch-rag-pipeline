@@ -8,6 +8,7 @@ import random
 import requests
 import json
 from opensearch_pipeline.config import get_config
+from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus
 from opensearch_pipeline.pipeline_nodes import (
     _clean_llm_json_response,
     _get_db_conn,
@@ -235,9 +236,9 @@ def reconcile_pending_deletes() -> dict:
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT doc_id, version_no FROM document_version
-                WHERE index_status = 'PENDING_DELETE'
+                WHERE index_status = '{DocVersionIndexStatus.PENDING_DELETE}'
             """)
             rows = cursor.fetchall()
 
@@ -256,15 +257,15 @@ def reconcile_pending_deletes() -> dict:
                 # chunk_meta 落到 is_active=0，避免留下 RDS-active 但 HA3 已删的孤儿（CS3 会报）。
                 # 幂等：再跑命中 0 行。
                 with conn.cursor() as cursor:
-                    cursor.execute("""
+                    cursor.execute(f"""
                         UPDATE document_version
-                        SET index_status = 'DELETED'
+                        SET index_status = '{DocVersionIndexStatus.DELETED}'
                         WHERE doc_id = %s AND version_no = %s
-                          AND index_status = 'PENDING_DELETE'
+                          AND index_status = '{DocVersionIndexStatus.PENDING_DELETE}'
                     """, (doc_id, version_no))
-                    cursor.execute("""
+                    cursor.execute(f"""
                         UPDATE chunk_meta
-                        SET is_active = FALSE, index_status = 'DELETED'
+                        SET is_active = FALSE, index_status = '{ChunkIndexStatus.DELETED}'
                         WHERE doc_id = %s AND version_no = %s AND is_active = 1
                     """, (doc_id, version_no))
                 conn.commit()
@@ -309,7 +310,7 @@ def reconcile_stranded_versions() -> dict:
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT cm_new.doc_id, cm_new.version_no
                 FROM (
                     SELECT doc_id, MAX(version_no) AS version_no
@@ -320,7 +321,7 @@ def reconcile_stranded_versions() -> dict:
                   ON dv.doc_id = cm_new.doc_id AND dv.version_no = cm_new.version_no
                 WHERE dv.status = 'active'
                   AND (dv.publish_status IS NULL OR dv.publish_status != 'QUARANTINED')
-                  AND (dv.index_status != 'PROCESSING'
+                  AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
                        OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
                   AND EXISTS (SELECT 1 FROM chunk_meta o
                               WHERE o.doc_id = cm_new.doc_id
@@ -328,11 +329,11 @@ def reconcile_stranded_versions() -> dict:
                   AND EXISTS (SELECT 1 FROM chunk_meta n
                               WHERE n.doc_id = cm_new.doc_id
                                 AND n.version_no = cm_new.version_no
-                                AND n.is_active = 1 AND n.index_status = 'INDEXED')
+                                AND n.is_active = 1 AND n.index_status = '{ChunkIndexStatus.INDEXED}')
                   AND NOT EXISTS (SELECT 1 FROM chunk_meta n2
                                   WHERE n2.doc_id = cm_new.doc_id
                                     AND n2.version_no = cm_new.version_no
-                                    AND n2.is_active = 1 AND n2.index_status != 'INDEXED')
+                                    AND n2.is_active = 1 AND n2.index_status != '{ChunkIndexStatus.INDEXED}')
                 LIMIT 200
             """)
             # 谓词解读：最新 active 版本的 chunk【全部】INDEXED（≥1 条，"已验证索引成功"）、
@@ -364,14 +365,14 @@ def reconcile_stranded_versions() -> dict:
                 _search_delete_old_chunks(os_client, config, index_name, doc_id, version_no, old_ids)
 
                 with conn.cursor() as cursor:
-                    cursor.execute("""
+                    cursor.execute(f"""
                         UPDATE chunk_meta
-                        SET is_active = FALSE, index_status = 'DELETED'
+                        SET is_active = FALSE, index_status = '{ChunkIndexStatus.DELETED}'
                         WHERE doc_id = %s AND version_no < %s AND is_active = 1
                     """, (doc_id, version_no))
-                    cursor.execute("""
+                    cursor.execute(f"""
                         UPDATE document_version
-                        SET index_status = 'SUCCESS'
+                        SET index_status = '{DocVersionIndexStatus.SUCCESS}'
                         WHERE doc_id = %s AND version_no = %s
                     """, (doc_id, version_no))
                 conn.commit()
@@ -465,11 +466,11 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
     docs_to_check = []
     try:
         with conn.cursor() as cursor:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT dv.doc_id, dv.version_no, dm.permission_level, dm.title, dm.owner_dept
                 FROM document_version dv
                 JOIN document_meta dm ON dv.doc_id = dm.doc_id
-                WHERE dv.index_status = 'SUCCESS' AND dv.status = 'active'
+                WHERE dv.index_status = '{DocVersionIndexStatus.SUCCESS}' AND dv.status = 'active'
             """)
             rows = cursor.fetchall()
             for r in rows:
@@ -636,9 +637,9 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                     try:
                         conn.begin()
                         with conn.cursor() as cursor:
-                            cursor.execute("""
+                            cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = 'PENDING_DELETE'
+                                SET index_status = '{DocVersionIndexStatus.PENDING_DELETE}'
                                 WHERE doc_id = %s AND version_no = %s
                             """, (doc_id, version_no))
                             cursor.execute(_review_sql, _review_params)
@@ -659,14 +660,14 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                         # ⚠️ content_process_status 必须是终态 'QUARANTINED'，不能用 'FAILED'：
                         # 'FAILED' 正好命中 stage-2 的抢占谓词（FAILED AND retry_count<3），
                         # 下一次日跑会重新分块/重新发布，把隔离悄悄撤销掉。
-                        cursor.execute("""
+                        cursor.execute(f"""
                             UPDATE document_version
                             SET risk_level = 'high',
                                 publish_status = 'QUARANTINED',
                                 gate_status = 'quarantined',
                                 content_process_status = 'QUARANTINED',
                                 content_process_error = %s,
-                                index_status = 'DELETED'
+                                index_status = '{DocVersionIndexStatus.DELETED}'
                             WHERE doc_id = %s AND version_no = %s
                         """, (f"[SPOT CHECK MISMATCH] Spot-check recommends tightening permission to {suggested_perm}", doc_id, version_no))
 

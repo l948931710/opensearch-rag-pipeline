@@ -32,9 +32,52 @@ def docset_hash(doc_ids) -> str:
     ids = sorted({str(d) for d in doc_ids})
     return hashlib.sha256(",".join(ids).encode("utf-8")).hexdigest()[:12]
 
+class ChunkIndexStatus:
+    """``chunk_meta.index_status`` 词表——成功值是 **INDEXED**，绝不是 'SUCCESS'。
+
+    与 ``DocVersionIndexStatus`` 是两套不相交的词表（同名列、不同表、不同值集）：把一边的
+    成功值写到另一边是静默 no-op（WHERE 匹配不到任何行），正是 2026-06-15 canary 的事故类。
+    生产代码写/查该列时必须引用这里的常量（f-string 插值进 SQL 即可），不要再写裸字符串——
+    tests/test_index_status_vocab.py 对关键模块做扫描耦合。
+    """
+    NOT_INDEXED = "NOT_INDEXED"      # 初始/标脏值（待 stage-3 推 HA3；ACL outbox 也用它标脏）
+    INDEXED = "INDEXED"              # HA3 push 成功（chunk 级成功终态）
+    FAILED = "FAILED"                # push / embedding / parity 校验失败（下轮 loader 重选）
+    DELETED = "DELETED"              # 旧版本停用 / 隔离清除（伴随 is_active=0）
+    ALL = (NOT_INDEXED, INDEXED, FAILED, DELETED)
+
+
+class DocVersionIndexStatus:
+    """``document_version.index_status`` 词表——成功值是 **SUCCESS**，绝不是 'INDEXED'。
+
+    'INDEXED' 从未被任何代码写入本列（只存在于历史 schema 注释里）；按 'INDEXED' 查本列
+    永远空集。同样，'NOT_STARTED' 属于 content/chunk 生命周期，绝不属于本列（见模块 docstring
+    的 canary 事故）。
+    """
+    NOT_INDEXED = "NOT_INDEXED"      # 初始/复位值（stage-3 锁可抢占）
+    PROCESSING = "PROCESSING"        # stage-3 持锁中（2h 失效接管窗口）
+    SUCCESS = "SUCCESS"              # 索引完成 + 旧版本已停用（文档版本级成功终态）
+    FAILED = "FAILED"                # 本轮索引失败（stage-3 锁可抢占重试）
+    PENDING_DELETE = "PENDING_DELETE"  # HA3 删除失败排队重试（spot_checker 对账 drain）
+    DELETED = "DELETED"              # 索引删除完成 / 隔离清除
+    ALL = (NOT_INDEXED, PROCESSING, SUCCESS, FAILED, PENDING_DELETE, DELETED)
+
+
+def sql_in_list(statuses) -> str:
+    """把状态元组渲染成 SQL IN (...) 的字面量体："'A', 'B'"（含空格分隔，与既有 SQL 逐字一致）。
+
+    只接受本模块的受信常量（[A-Z_]），绝不接受用户输入——调用方直接 f-string 进 SQL。
+    """
+    return ", ".join(f"'{s}'" for s in statuses)
+
+
 # The exact set node_acquire_index_lock (pipeline_nodes.py) preempts on its primary UPDATE.
 # Keep in sync with that node — tests/test_reset_for_rechunk.py asserts the coupling.
-STAGE3_CLAIMABLE_INDEX_STATUS = ("NOT_INDEXED", "FAILED")
+STAGE3_CLAIMABLE_INDEX_STATUS = (DocVersionIndexStatus.NOT_INDEXED, DocVersionIndexStatus.FAILED)
+
+# The chunk_meta re-select set the stage-3 loader (dataworks_orchestrator) keys on —
+# same spelling as the doc-version claimable set but a DIFFERENT table/vocabulary.
+STAGE3_CHUNK_RESELECT_INDEX_STATUS = (ChunkIndexStatus.NOT_INDEXED, ChunkIndexStatus.FAILED)
 
 
 def rechunk_reset_state() -> dict:
@@ -50,6 +93,6 @@ def rechunk_reset_state() -> dict:
     return {
         "content_process_status": "NOT_STARTED",
         "chunk_status": "NOT_STARTED",
-        "index_status": "NOT_INDEXED",
+        "index_status": DocVersionIndexStatus.NOT_INDEXED,
         "retry_count": 0,
     }

@@ -18,6 +18,8 @@ DAG-3 — no new version, no reset of completed state, never bypasses the 04b pa
 import argparse
 import json
 
+from opensearch_pipeline.reindex_states import DocVersionIndexStatus
+
 _STALE = "NOW() - INTERVAL 2 HOUR"
 
 
@@ -57,10 +59,11 @@ def build_resume_report(stage: int) -> dict:
                          f"AND updated_at < {_STALE}")
             elif stage == 3:
                 rep["in_flight"] = _scalar(
-                    cur, "SELECT COUNT(*) FROM document_version WHERE index_status='PROCESSING'")
+                    cur, "SELECT COUNT(*) FROM document_version "
+                         f"WHERE index_status='{DocVersionIndexStatus.PROCESSING}'")
                 rep["stale_locks_2h"] = _scalar(
                     cur, "SELECT COUNT(*) FROM document_version "
-                         f"WHERE index_status='PROCESSING' AND updated_at < {_STALE}")
+                         f"WHERE index_status='{DocVersionIndexStatus.PROCESSING}' AND updated_at < {_STALE}")
     finally:
         if conn:
             conn.close()

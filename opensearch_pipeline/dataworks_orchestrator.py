@@ -21,6 +21,11 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from opensearch_pipeline.config import get_config, load_config
+from opensearch_pipeline.reindex_states import (
+    STAGE3_CHUNK_RESELECT_INDEX_STATUS,
+    DocVersionIndexStatus,
+    sql_in_list,
+)
 from opensearch_pipeline.dag_definitions import (
     build_dag1_raw_to_canonical,
     build_dag2_canonical_to_chunk,
@@ -400,7 +405,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                 
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
-                    cursor.execute("""
+                    cursor.execute(f"""
                         SELECT 
                             cm.id, cm.chunk_id, cm.doc_id, cm.version_no, cm.chunk_index, cm.page_num, cm.section_title,
                             cm.source_url, cm.chunk_type, cm.chunk_text, cm.token_count, cm.source,
@@ -413,10 +418,10 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                           ON cm.doc_id = dv.doc_id AND cm.version_no = dv.version_no
                         LEFT JOIN document_meta dm
                           ON cm.doc_id = dm.doc_id
-                        WHERE cm.index_status IN ('NOT_INDEXED', 'FAILED')
+                        WHERE cm.index_status IN ({sql_in_list(STAGE3_CHUNK_RESELECT_INDEX_STATUS)})
                           AND cm.is_active = 1
                           AND (
-                              dv.index_status != 'PROCESSING'
+                              dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
                               OR dv.updated_at < NOW() - INTERVAL 2 HOUR
                           )
                         ORDER BY cm.created_at ASC
@@ -540,10 +545,10 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                     conn_rb = _get_db_conn(select_db=True)
                     with conn_rb.cursor() as cursor:
                         for doc_id, ver in preempted:
-                            cursor.execute("""
+                            cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = 'FAILED'
-                                WHERE doc_id = %s AND version_no = %s AND index_status = 'PROCESSING'
+                                SET index_status = '{DocVersionIndexStatus.FAILED}'
+                                WHERE doc_id = %s AND version_no = %s AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                             """, (doc_id, ver))
                         conn_rb.commit()
                 except Exception as e:
@@ -627,13 +632,13 @@ def _count_pending_rows(stage: int) -> int:
               AND canonical_json_key IS NOT NULL
               AND (publish_status IS NULL OR publish_status != 'QUARANTINED')
         """,
-        3: """
+        3: f"""
             SELECT COUNT(*) FROM chunk_meta cm
             JOIN document_version dv
               ON cm.doc_id = dv.doc_id AND cm.version_no = dv.version_no
-            WHERE cm.index_status IN ('NOT_INDEXED', 'FAILED')
+            WHERE cm.index_status IN ({sql_in_list(STAGE3_CHUNK_RESELECT_INDEX_STATUS)})
               AND cm.is_active = 1
-              AND (dv.index_status != 'PROCESSING'
+              AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
                    OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
         """,
     }

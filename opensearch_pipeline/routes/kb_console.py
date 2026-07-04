@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.qa_logger import _op_db
+from opensearch_pipeline.reindex_states import ChunkIndexStatus
 from opensearch_pipeline.request_context import get_request_id
 
 # api 驻留共享件（模型/助手/依赖）。from-import 拷贝绑定在这里是安全的：
@@ -292,7 +293,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 try:
                     cur.execute(
                         f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta "
-                        f"WHERE is_active=1 AND index_status='INDEXED' {ck_clause}",
+                        f"WHERE is_active=1 AND index_status='{ChunkIndexStatus.INDEXED}' {ck_clause}",
                         tuple(ck_params),
                     )
                     chunks = int((cur.fetchone() or (0,))[0] or 0)
@@ -656,7 +657,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 cur.execute(
                     f"SELECT (SELECT COUNT(*) FROM {_kb_db()}.document_meta WHERE status='active'),"
                     f" (SELECT COUNT(DISTINCT doc_id) FROM {_kb_db()}.chunk_meta"
-                    "   WHERE is_active=1 AND index_status='INDEXED')")
+                    f"   WHERE is_active=1 AND index_status='{ChunkIndexStatus.INDEXED}')")
                 r = cur.fetchone() or (0, 0)
                 out.docs_active, out.docs_in_index = int(r[0] or 0), int(r[1] or 0)
             except Exception as e:
@@ -665,7 +666,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             try:
                 cur.execute(
                     f"SELECT COUNT(*) FROM (SELECT doc_id FROM {_kb_db()}.chunk_meta"
-                    " WHERE is_active=1 AND index_status='INDEXED'"
+                    f" WHERE is_active=1 AND index_status='{ChunkIndexStatus.INDEXED}'"
                     " GROUP BY doc_id HAVING COUNT(DISTINCT version_no) > 1) t")
                 out.dual_version_docs = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
@@ -1032,7 +1033,7 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
                 )
                 dv = cur.fetchone()
                 cur.execute(
-                    "SELECT COUNT(*), SUM(is_active=1), SUM(index_status='INDEXED') "
+                    f"SELECT COUNT(*), SUM(is_active=1), SUM(index_status='{ChunkIndexStatus.INDEXED}') "
                     f"FROM {_kb_db()}.chunk_meta WHERE doc_id=%s AND version_no=%s",
                     (doc_id, vno),
                 )
@@ -1630,7 +1631,7 @@ def kb_restore(req: KbRetireRequest, request: Request,
                 cur.execute(f"UPDATE {_kb_db()}.document_version SET status='active', updated_at=NOW() "
                             "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
                 # 重新激活本版本 chunk + 标脏 NOT_INDEXED（下次 stage-3 重推 HA3；若 HA3 未删则为幂等重推）。
-                cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=1, index_status='NOT_INDEXED' "
+                cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=1, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
                             "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
                 write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,

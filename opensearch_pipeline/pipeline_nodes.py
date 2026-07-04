@@ -24,6 +24,12 @@ from typing import Any, Dict, List
 from opensearch_pipeline.chunker import Chunk, DocumentChunker
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.image_binding_reconcile import reconcile_move
+from opensearch_pipeline.reindex_states import (
+    STAGE3_CLAIMABLE_INDEX_STATUS,
+    ChunkIndexStatus,
+    DocVersionIndexStatus,
+    sql_in_list,
+)
 
 # ─── 共享基础设施（F-A1 结构债拆分，2026-07-01）────────────────────────────
 # PII 词表/正则、DB 连接池、客户端工厂已机械搬移到 pii_patterns.py / db.py /
@@ -271,12 +277,12 @@ def node_register_metadata(ctx: dict):
                         import hashlib as _hl
                         raw_key = task.get("raw_key", "")
                         raw_key_hash = _hl.sha256(raw_key.encode()).hexdigest() if raw_key else ""
-                        cursor.execute("""
-                            INSERT INTO document_version 
+                        cursor.execute(f"""
+                            INSERT INTO document_version
                             (doc_id, version_no, bucket_name, raw_key, raw_key_hash, file_ext,
                              gate_status, content_process_status, chunk_status, index_status, status)
                             VALUES (%s, %s, %s, %s, %s, %s,
-                                    'pending_clean', 'NOT_STARTED', 'NOT_STARTED', 'NOT_INDEXED', 'active')
+                                    'pending_clean', 'NOT_STARTED', 'NOT_STARTED', '{DocVersionIndexStatus.NOT_INDEXED}', 'active')
                         """, (doc_id, version_no, task.get("bucket_name", ""),
                               raw_key, raw_key_hash, task.get("file_ext", "")))
                 conn.commit()
@@ -4142,7 +4148,7 @@ def node_chunk_documents(ctx: dict):
                         permission_level=doc.get("permission_level", "public"),
                         kb_type=doc.get("kb_type", "public"), risk_level=doc.get("risk_level", "low"),
                         sensitive_redacted=doc.get("redaction_action") == "REDACTED",
-                        is_active=True, embedding_status="NOT_STARTED", index_status="NOT_INDEXED",
+                        is_active=True, embedding_status="NOT_STARTED", index_status=ChunkIndexStatus.NOT_INDEXED,
                         extra={
                             "image_refs": refs,
                             "source_image": refs[0]["oss_key"],
@@ -4307,7 +4313,7 @@ def node_chunk_documents(ctx: dict):
                             is_active=True,
                             sensitive_redacted=doc.get("redaction_action") == "REDACTED",
                             embedding_status="NOT_STARTED",
-                            index_status="NOT_INDEXED",
+                            index_status=ChunkIndexStatus.NOT_INDEXED,
                             extra={
                                 "source_image": source_image_url,
                                 "visual_summary": visual_summary,
@@ -5072,8 +5078,8 @@ def node_acquire_index_lock(ctx: dict):
     乐观锁：在开始处理之前抢占索引锁定，防止并发冲突。
 
     操作：
-      UPDATE document_version SET index_status = 'PROCESSING'
-      WHERE doc_id = X AND version_no = Y AND index_status IN ('NOT_INDEXED', 'FAILED')
+      UPDATE document_version SET index_status = PROCESSING
+      WHERE doc_id = X AND version_no = Y AND index_status IN (STAGE3_CLAIMABLE_INDEX_STATUS)
 
     成功抢占锁的版本保留在 valid_chunks 中，未成功抢占的版本其对应的 chunks 被过滤掉。
     同时，把成功抢占的版本 (doc_id, version_no) 记录在 ctx["preempted_doc_versions"] 中。
@@ -5104,9 +5110,9 @@ def node_acquire_index_lock(ctx: dict):
                     _dv_params = tuple(p for dv in doc_versions for p in dv)
                     cursor.execute(f"""
                         UPDATE document_version
-                        SET index_status = 'PROCESSING'
+                        SET index_status = '{DocVersionIndexStatus.PROCESSING}'
                         WHERE ({_dv_clause})
-                          AND index_status IN ('NOT_INDEXED', 'FAILED')
+                          AND index_status IN ({sql_in_list(STAGE3_CLAIMABLE_INDEX_STATUS)})
                     """, _dv_params)
                     _all_claimed = cursor.rowcount == len(doc_versions)
                 if _all_claimed:
@@ -5115,21 +5121,21 @@ def node_acquire_index_lock(ctx: dict):
                     if doc_versions:
                         conn.rollback()
                     for doc_id, ver in doc_versions:
-                        cursor.execute("""
+                        cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = 'PROCESSING'
+                            SET index_status = '{DocVersionIndexStatus.PROCESSING}'
                             WHERE doc_id = %s AND version_no = %s
-                              AND index_status IN ('NOT_INDEXED', 'FAILED')
+                              AND index_status IN ({sql_in_list(STAGE3_CLAIMABLE_INDEX_STATUS)})
                         """, (doc_id, ver))
                         # ── 修复：如果文档已被标记 SUCCESS（前一批次处理了部分 chunk），
                         # 仍然需要允许重新进入以处理残留的 NOT_INDEXED chunk。
                         if cursor.rowcount == 0:
                             # 尝试从 SUCCESS 状态重新锁定
-                            cursor.execute("""
+                            cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = 'PROCESSING'
+                                SET index_status = '{DocVersionIndexStatus.PROCESSING}'
                                 WHERE doc_id = %s AND version_no = %s
-                                  AND index_status = 'SUCCESS'
+                                  AND index_status = '{DocVersionIndexStatus.SUCCESS}'
                             """, (doc_id, ver))
                         # ── 接管失效锁：仍处于 PROCESSING 且 >2h 未更新，说明持锁的运行已崩溃。
                         # 没有这一支，崩溃残留的 PROCESSING 文档永远无法被重新入队（loader 会反复
@@ -5142,11 +5148,11 @@ def node_acquire_index_lock(ctx: dict):
                         # 才会真正改变行（rowcount=1），同时重置失效时钟，保证并发运行中
                         # 只有第一个能接管。
                         if cursor.rowcount == 0:
-                            cursor.execute("""
+                            cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = 'PROCESSING', updated_at = NOW()
+                                SET index_status = '{DocVersionIndexStatus.PROCESSING}', updated_at = NOW()
                                 WHERE doc_id = %s AND version_no = %s
-                                  AND index_status = 'PROCESSING'
+                                  AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                                   AND updated_at < NOW() - INTERVAL 2 HOUR
                             """, (doc_id, ver))
                         if cursor.rowcount > 0:
@@ -5329,7 +5335,7 @@ def node_deactivate_old_chunks(ctx: dict):
     }
     known_failed |= {
         (c.doc_id, c.version_no) for c in chunks
-        if getattr(c, "index_status", "NOT_INDEXED") == "FAILED"
+        if getattr(c, "index_status", ChunkIndexStatus.NOT_INDEXED) == ChunkIndexStatus.FAILED
     }
     if known_failed:
         skipped_docs = [d for d, v in current_versions.items() if (d, v) in known_failed]
@@ -5352,7 +5358,7 @@ def node_deactivate_old_chunks(ctx: dict):
         (c.doc_id, c.version_no, c.chunk_id, getattr(c, "embedding_status", None))
         for c in chunks
         if (c.doc_id, c.version_no) in _cur_set
-        and getattr(c, "index_status", None) == "INDEXED"
+        and getattr(c, "index_status", None) == ChunkIndexStatus.INDEXED
         and getattr(c, "embedding_status", None) != "DONE"
     ]
     if zombie:
@@ -5388,7 +5394,7 @@ def node_deactivate_old_chunks(ctx: dict):
                     SELECT DISTINCT doc_id, version_no FROM chunk_meta
                     WHERE ({_ck_clause})
                       AND is_active = 1
-                      AND index_status != 'INDEXED'
+                      AND index_status != '{ChunkIndexStatus.INDEXED}'
                 """, _ck_params)
                 _ck_asked = set(_ck_pairs)
                 for r in (cursor.fetchall() or []):
@@ -5552,8 +5558,8 @@ def node_deactivate_old_chunks(ctx: dict):
                         conn_fail = _get_db_conn(select_db=True)
                         with conn_fail.cursor() as cur:
                             for doc_id, ver in current_versions.items():
-                                cur.execute("""
-                                    UPDATE document_version SET index_status = 'FAILED'
+                                cur.execute(f"""
+                                    UPDATE document_version SET index_status = '{DocVersionIndexStatus.FAILED}'
                                     WHERE doc_id = %s AND version_no = %s
                                 """, (doc_id, ver))
                                 new_chunks = [c for c in chunks if getattr(c, "doc_id", "") == doc_id and getattr(c, "version_no", 0) == ver]
@@ -5561,7 +5567,7 @@ def node_deactivate_old_chunks(ctx: dict):
                                 if new_chunk_ids:
                                     format_strings_new = ','.join(['%s'] * len(new_chunk_ids))
                                     cur.execute(f"""
-                                        UPDATE chunk_meta SET index_status = 'FAILED'
+                                        UPDATE chunk_meta SET index_status = '{ChunkIndexStatus.FAILED}'
                                         WHERE chunk_id IN ({format_strings_new})
                                     """, tuple(new_chunk_ids))
                                 # CS5 outbox: durably queue the OLD-version HA3 delete that just failed so
@@ -5570,10 +5576,10 @@ def node_deactivate_old_chunks(ctx: dict):
                                 # (new version fails-safe + retries; never-disappear holds). The old chunks
                                 # stay is_active=1 (still in HA3) until the reconciler deletes them and sets
                                 # is_active=0 (CS5 edit in reconcile_pending_deletes), so no CS3 orphan.
-                                cur.execute("""
-                                    UPDATE document_version SET index_status = 'PENDING_DELETE'
+                                cur.execute(f"""
+                                    UPDATE document_version SET index_status = '{DocVersionIndexStatus.PENDING_DELETE}'
                                     WHERE doc_id = %s AND version_no < %s
-                                      AND index_status NOT IN ('DELETED', 'PENDING_DELETE')
+                                      AND index_status NOT IN ({sql_in_list((DocVersionIndexStatus.DELETED, DocVersionIndexStatus.PENDING_DELETE))})
                                 """, (doc_id, ver))
                         conn_fail.commit()
                         conn_fail.close()
@@ -5590,25 +5596,25 @@ def node_deactivate_old_chunks(ctx: dict):
         failed_counts = {}
         for chunk in chunks:
             key = (chunk.doc_id, chunk.version_no)
-            c_status = getattr(chunk, 'index_status', 'NOT_INDEXED')
-            if c_status == 'FAILED':
+            c_status = getattr(chunk, 'index_status', ChunkIndexStatus.NOT_INDEXED)
+            if c_status == ChunkIndexStatus.FAILED:
                 failed_counts[key] = failed_counts.get(key, 0) + 1
             else:
                 failed_counts[key] = failed_counts.get(key, 0)
 
         if simulate_db:
             if deactivated:
-                print(f"    └─ [SIMULATED] RDS: UPDATE chunk_meta SET is_active=FALSE, index_status='DELETED'")
+                print(f"    └─ [SIMULATED] RDS: UPDATE chunk_meta SET is_active=FALSE, index_status='{ChunkIndexStatus.DELETED}'")
                 for doc_id, ver in current_versions.items():
                     print(f"       WHERE doc_id='{doc_id}' AND version_no < {ver} AND is_active = 1")
             for (doc_id, ver), fail_cnt in failed_counts.items():
                 if (doc_id, ver) in valid_doc_versions:
                     if fail_cnt or (doc_id, ver) in known_failed:
-                        final_status = 'FAILED'
+                        final_status = DocVersionIndexStatus.FAILED
                     elif (doc_id, ver) in incomplete_versions:
-                        final_status = 'NOT_INDEXED'  # LIMIT 边界推迟：残留尾部待下批
+                        final_status = DocVersionIndexStatus.NOT_INDEXED  # LIMIT 边界推迟：残留尾部待下批
                     else:
-                        final_status = 'SUCCESS'
+                        final_status = DocVersionIndexStatus.SUCCESS
                     print(f"    ├─ [SIMULATED] RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
         else:
             conn = None
@@ -5626,7 +5632,7 @@ def node_deactivate_old_chunks(ctx: dict):
                         cursor.execute(f"""
                             UPDATE chunk_meta
                             SET is_active = FALSE,
-                                index_status = 'DELETED'
+                                index_status = '{ChunkIndexStatus.DELETED}'
                             WHERE ({_dv_clause}) AND is_active = 1
                         """, _dv_params)
                         print("    └─ Updated older versions of chunks in RDS chunk_meta to inactive")
@@ -5636,13 +5642,13 @@ def node_deactivate_old_chunks(ctx: dict):
                     for (doc_id, ver), fail_cnt in failed_counts.items():
                         if (doc_id, ver) in valid_doc_versions:
                             if fail_cnt or (doc_id, ver) in known_failed:
-                                final_status = 'FAILED'
+                                final_status = DocVersionIndexStatus.FAILED
                             elif (doc_id, ver) in incomplete_versions:
                                 # LIMIT 边界推迟：复位 NOT_INDEXED，让下一批 loader / 抢锁节点
                                 # 立即重入残留尾部；绝不 SUCCESS（否则尾部只能靠 SUCCESS-relock 兜底）。
-                                final_status = 'NOT_INDEXED'
+                                final_status = DocVersionIndexStatus.NOT_INDEXED
                             else:
-                                final_status = 'SUCCESS'
+                                final_status = DocVersionIndexStatus.SUCCESS
                             _status_groups.setdefault(final_status, []).append((doc_id, ver))
                             print(f"    ├─ RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
                     for final_status, _dvs in _status_groups.items():
@@ -6144,7 +6150,7 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
             # 所有重试耗尽，标记 sub-batch 为失败
             err_msg = f"HA3 pushDocuments failed after {max_retries + 1} attempts: {last_error}"
             for sc in sub_chunks:
-                sc.index_status = "FAILED"
+                sc.index_status = ChunkIndexStatus.FAILED
                 sc.index_error_code = "RETRY_EXHAUSTED"
                 sc.index_error_message = err_msg
             print(f"    ├─ [HA3 Error] {err_msg}")
@@ -6178,7 +6184,7 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
                         err_msg = err_item.get("message", "Unknown HA3 error")
                         err_code = str(err_item.get("code", "HA3_DOC_ERROR"))
                         if err_idx is not None and err_idx < len(sub_chunks):
-                            sub_chunks[err_idx].index_status = "FAILED"
+                            sub_chunks[err_idx].index_status = ChunkIndexStatus.FAILED
                             sub_chunks[err_idx].index_error_code = err_code
                             sub_chunks[err_idx].index_error_message = err_msg
                             error_indices.add(err_idx)
@@ -6186,21 +6192,21 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
                     # 标记未出错的 chunks 为成功
                     for ci, sc in enumerate(sub_chunks):
                         if ci not in error_indices:
-                            sc.index_status = "INDEXED"
+                            sc.index_status = ChunkIndexStatus.INDEXED
                             sc.index_error_code = None
                             sc.index_error_message = None
 
             if not per_doc_parsed:
                 # 无 per-document 错误信息，整批标记成功
                 for sc in sub_chunks:
-                    sc.index_status = "INDEXED"
+                    sc.index_status = ChunkIndexStatus.INDEXED
                     sc.index_error_code = None
                     sc.index_error_message = None
         else:
             # HTTP 级别失败（不可重试的状态码）：整个 sub-batch 标记为失败
             body_message = str(body) if body else f"HTTP {status_code}"
             for sc in sub_chunks:
-                sc.index_status = "FAILED"
+                sc.index_status = ChunkIndexStatus.FAILED
                 sc.index_error_code = str(status_code)
                 sc.index_error_message = body_message
             print(f"    ├─ [HA3 Error] Sub-batch {sub_start//ha3_batch_size + 1} failed with HTTP {status_code}: {body_message}")
@@ -6225,7 +6231,7 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
             _push_one_subbatch(_sub_start)
 
     took_ms = int((time.time() - start_time) * 1000)
-    indexed_count = sum(1 for c in all_chunks if c.index_status == "INDEXED")
+    indexed_count = sum(1 for c in all_chunks if c.index_status == ChunkIndexStatus.INDEXED)
     failed_count = len(all_chunks) - indexed_count
     return {"indexed": indexed_count, "failed": failed_count, "took_ms": took_ms}
 
@@ -6320,13 +6326,13 @@ def node_push_to_opensearch(ctx: dict):
 
             # 更新 chunk 状态
             for chunk in batch["chunks"]:
-                chunk.index_status = "INDEXED"
+                chunk.index_status = ChunkIndexStatus.INDEXED
         else:
             # Real bulk indexing (supports standard OpenSearch client or HA3 Vector client)
             try:
                 # Pre-initialize status for safety in case some are missing in response
                 for chunk in batch["chunks"]:
-                    chunk.index_status = "FAILED"
+                    chunk.index_status = ChunkIndexStatus.FAILED
                     chunk.index_error_code = "NOT_RETURNED"
                     chunk.index_error_message = "No result returned for this chunk from indexing operation"
 
@@ -6371,12 +6377,12 @@ def node_push_to_opensearch(ctx: dict):
                             continue
 
                         if 200 <= status_code < 300:
-                            chunk.index_status = "INDEXED"
+                            chunk.index_status = ChunkIndexStatus.INDEXED
                             chunk.index_error_code = None
                             chunk.index_error_message = None
                             indexed_count += 1
                         else:
-                            chunk.index_status = "FAILED"
+                            chunk.index_status = ChunkIndexStatus.FAILED
                             err = op_details.get("error", {})
                             err_type = err.get("type", "INDEX_ERROR")
                             err_reason = err.get("reason", "Unknown index error")
@@ -6491,7 +6497,7 @@ def node_update_index_status(ctx: dict):
     failed_doc_versions = set()
     for batch in batches:
         for chunk in batch["chunks"]:
-            if getattr(chunk, 'index_status', 'NOT_INDEXED') == 'FAILED':
+            if getattr(chunk, 'index_status', ChunkIndexStatus.NOT_INDEXED) == ChunkIndexStatus.FAILED:
                 failed_doc_versions.add((chunk.doc_id, chunk.version_no))
 
     # embedding 失败的 chunk 未进入 batches（未推送），但必须计入失败：否则其所属 doc 会被
@@ -6555,7 +6561,7 @@ def node_update_index_status(ctx: dict):
                         idx_err_code = getattr(chunk, 'index_error_code', None)
                         idx_err_msg = getattr(chunk, 'index_error_message', None)
 
-                        if (chunk.index_status == "INDEXED"
+                        if (chunk.index_status == ChunkIndexStatus.INDEXED
                                 and idx_err_code is None and idx_err_msg is None):
                             _key = (chunk.embedding_status, chunk.embedding_model, dim)
                             _ok_groups.setdefault(_key, []).append(chunk.chunk_id)
@@ -6564,7 +6570,7 @@ def node_update_index_status(ctx: dict):
                         # Embedded at timestamp
                         emb_at = datetime.now() if chunk.embedding_status == "DONE" else None
                         # Indexed at timestamp
-                        idx_at = datetime.now() if chunk.index_status == "INDEXED" else None
+                        idx_at = datetime.now() if chunk.index_status == ChunkIndexStatus.INDEXED else None
 
                         cursor.execute("""
                             UPDATE chunk_meta
@@ -6612,7 +6618,7 @@ def node_update_index_status(ctx: dict):
                                     embedding_version = %s,
                                     embedding_dimension = %s,
                                     embedded_at = %s,
-                                    index_status = 'INDEXED',
+                                    index_status = '{ChunkIndexStatus.INDEXED}',
                                     index_name = %s,
                                     opensearch_doc_id = chunk_id,
                                     opensearch_bulk_job_id = %s,
@@ -6640,16 +6646,16 @@ def node_update_index_status(ctx: dict):
                     _ef_ph = ",".join(["%s"] * len(_ef_sub))
                     cursor.execute(f"""
                         UPDATE chunk_meta
-                        SET embedding_status = 'FAILED', index_status = 'FAILED'
+                        SET embedding_status = 'FAILED', index_status = '{ChunkIndexStatus.FAILED}'
                         WHERE chunk_id IN ({_ef_ph})
                     """, _ef_sub)
 
                 # If there are failed doc versions, update their document_version status to 'FAILED'
                 if failed_doc_versions:
                     for doc_id, ver in failed_doc_versions:
-                        cursor.execute("""
+                        cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = 'FAILED'
+                            SET index_status = '{DocVersionIndexStatus.FAILED}'
                             WHERE doc_id = %s AND version_no = %s
                         """, (doc_id, ver))
                         print(f"    ├─ RDS: Updated document_version status for {doc_id} v{ver} to 'FAILED' due to indexing failures")
@@ -6720,7 +6726,7 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
     # 内存状态同步（DAG 随后中断，主要为可读性/可测性；RDS 才是下轮重选的事实源）
     for chunks, code, msg in buckets:
         for c in chunks:
-            c.index_status = "FAILED"
+            c.index_status = ChunkIndexStatus.FAILED
             c.index_error_code = code
             c.index_error_message = msg
 
@@ -6734,7 +6740,7 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
                 ids = [c.chunk_id for c in chunks]
                 placeholders = ",".join(["%s"] * len(ids))
                 cursor.execute(
-                    f"UPDATE chunk_meta SET index_status='FAILED', index_error_code=%s, "
+                    f"UPDATE chunk_meta SET index_status='{ChunkIndexStatus.FAILED}', index_error_code=%s, "
                     f"index_error_message=%s WHERE chunk_id IN ({placeholders})",
                     [code, msg] + ids,
                 )
@@ -6821,7 +6827,7 @@ def node_verify_and_repush(ctx: dict):
     expected = {}
     for b in (ctx.get("bulk_batches") or []):
         for c in b.get("chunks", []):
-            if getattr(c, "index_status", None) == "INDEXED" and getattr(c, "rds_id", None) is not None:
+            if getattr(c, "index_status", None) == ChunkIndexStatus.INDEXED and getattr(c, "rds_id", None) is not None:
                 expected[int(c.rds_id)] = c
     if not expected:
         return
@@ -6952,7 +6958,7 @@ def node_verify_and_repush(ctx: dict):
             break
         repush = [expected[pk] for pk in sorted(still_missing)]
         for c in repush:   # 与首推一致：补推前预置 FAILED 兜底
-            c.index_status = "FAILED"
+            c.index_status = ChunkIndexStatus.FAILED
             c.index_error_code = "NOT_RETURNED"
             c.index_error_message = "parity re-push: awaiting result"
         _push_chunks_to_ha3(client, cfg, repush, max_retries=config.embedding.max_retries)
@@ -6965,7 +6971,7 @@ def node_verify_and_repush(ctx: dict):
     # 复确认存在 → 恢复内存 INDEXED（04 已把 RDS 记为 INDEXED，healed 无需再写 RDS）
     for pk in healed:
         c = expected[pk]
-        c.index_status = "INDEXED"
+        c.index_status = ChunkIndexStatus.INDEXED
         c.index_error_code = None
         c.index_error_message = None
 

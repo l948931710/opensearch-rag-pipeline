@@ -32,17 +32,20 @@ def test_rechunk_reset_content_and_chunk_are_not_started():
 
 
 def test_constant_matches_live_stage3_lock_predicate():
-    """Coupling guard: STAGE3_CLAIMABLE_INDEX_STATUS must equal the statuses the lock node preempts on,
-    so the reset target can't drift away from what stage 3 actually claims."""
+    """Coupling guard: the lock node's preemption predicates must be RENDERED from
+    STAGE3_CLAIMABLE_INDEX_STATUS (single source), so the reset target can't drift away
+    from what stage 3 actually claims. (词表重构后不再 regex 抽字面量——源码里就不该有字面量。)"""
     from opensearch_pipeline import pipeline_nodes
 
     src = inspect.getsource(pipeline_nodes.node_acquire_index_lock)
-    # the primary preemption UPDATE: index_status IN ('NOT_INDEXED', 'FAILED')
-    m = re.search(r"index_status\s+IN\s*\(([^)]*)\)", src)
-    assert m, "could not find the index_status IN (...) preemption predicate in node_acquire_index_lock"
-    claimed = set(re.findall(r"'([A-Z_]+)'", m.group(1)))
-    assert claimed == set(STAGE3_CLAIMABLE_INDEX_STATUS), (
-        f"lock node claims {claimed} but STAGE3_CLAIMABLE_INDEX_STATUS={set(STAGE3_CLAIMABLE_INDEX_STATUS)} "
-        "— keep them in sync"
+    # both preemption UPDATEs (batch claim + per-doc retry) interpolate the constant
+    assert src.count("index_status IN ({sql_in_list(STAGE3_CLAIMABLE_INDEX_STATUS)})") == 2, (
+        "node_acquire_index_lock must render its IN (...) preemption predicates from "
+        "STAGE3_CLAIMABLE_INDEX_STATUS via sql_in_list — do not hand-write the status list"
     )
-    assert rechunk_reset_state()["index_status"] in claimed
+    # and no raw literal IN-list may drift back in
+    assert not re.search(r"index_status\s+IN\s*\(\s*'", src), (
+        "raw index_status IN ('...') literal found in node_acquire_index_lock — "
+        "use STAGE3_CLAIMABLE_INDEX_STATUS instead"
+    )
+    assert rechunk_reset_state()["index_status"] in STAGE3_CLAIMABLE_INDEX_STATUS

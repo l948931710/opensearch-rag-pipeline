@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.qa_logger import _op_db
+from opensearch_pipeline.reindex_states import ChunkIndexStatus
 from opensearch_pipeline.request_context import get_request_id
 
 # api 驻留共享件（模型/助手/依赖）。from-import 拷贝绑定在这里是安全的：
@@ -588,7 +589,7 @@ def kb_my_access_requests(request: Request,
                         ph = ",".join(["(%s,%s)"] * len(pairs))
                         flat = [v for p in pairs for v in p]
                         cur.execute(
-                            "SELECT doc_id, version_no, COUNT(*), SUM(index_status='INDEXED') "
+                            f"SELECT doc_id, version_no, COUNT(*), SUM(index_status='{ChunkIndexStatus.INDEXED}') "
                             f"FROM {_kb_db()}.chunk_meta "
                             f"WHERE (doc_id, version_no) IN ({ph}) AND is_active=1 "
                             "GROUP BY doc_id, version_no",
@@ -643,7 +644,7 @@ def kb_my_access_requests(request: Request,
                                 allowed = allowed_map.get((doc_id, ver), set())
                             else:
                                 cur.execute(
-                                    "SELECT COUNT(*), SUM(index_status='INDEXED') "
+                                    f"SELECT COUNT(*), SUM(index_status='{ChunkIndexStatus.INDEXED}') "
                                     f"FROM {_kb_db()}.chunk_meta "
                                     "WHERE doc_id=%s AND version_no=%s AND is_active=1", (doc_id, ver))
                                 cnt_row = cur.fetchone() or (0, 0)

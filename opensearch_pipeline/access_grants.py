@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Dict, Iterable, List
 
+from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -165,7 +167,7 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         f"LEFT JOIN {_kb_db()}.document_version dv "
         "  ON dv.doc_id=dm.doc_id AND dv.version_no=dm.current_version_no "
         "WHERE dm.doc_id=%s AND (dv.index_status IS NULL "
-        "  OR dv.index_status!='PROCESSING' OR dv.updated_at < NOW() - INTERVAL 2 HOUR)",
+        f"  OR dv.index_status!='{DocVersionIndexStatus.PROCESSING}' OR dv.updated_at < NOW() - INTERVAL 2 HOUR)",
         (doc_id,),
     )
     row = cursor.fetchone()
@@ -192,7 +194,7 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         return {"status": status, "reset_chunks": 0, "version_no": ver}
     aj = _json.dumps(want, ensure_ascii=False) if want else None
     cursor.execute(
-        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, index_status='NOT_INDEXED' "
+        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
         (aj, doc_id, ver),
     )
