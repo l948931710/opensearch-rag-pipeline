@@ -27,7 +27,7 @@ import ConfirmDialog from '@/components/manage/ConfirmDialog.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 
@@ -55,6 +55,7 @@ onMounted(async () => {
     void loadStats()
     void loadConfig()
     void loadInsights()                              // 概览看板：使用成效 + 知识缺口（两角色）
+    void loadFeedbackReview()                        // 差评复核（两角色，看板卡片）
     void loadApprovals()                             // 非 force：App ready 已为红点预载，30s 内不重拉（#82）
     void loadAccessRequests()                        // 同上（staleness 门在 useKb 内）
     void loadAccessGrants()

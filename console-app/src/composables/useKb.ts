@@ -147,6 +147,8 @@ const visCtx = ref<DocItem | null>(null)
 const visExplain = ref<VisExplain | null>(null)
 const visLoading = ref(false)
 const visErr = ref('')
+// 差评联动复核（看板卡片）：引用了我作用域文档的回答收到 👎。null=尚未加载（显占位不显 0）。
+const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
 const SHARE_TARGETS = Object.keys(GROUP_LABEL)
 const verCtx = ref<VerCtx | null>(null)
@@ -806,6 +808,30 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
 // 后端直插 approved 行并复用 Phase D 投影；撤销/清单/审批历史与被动流同一套。
 interface GrantCreateResp { doc_id: string; granted: string[]; skipped: string[]; ok: boolean }
 
+// 差评联动复核（与后端 KbFeedbackReviewItem 对齐；question 已服务端 PII 脱敏）。
+export interface FeedbackDocRef { doc_id: string; title: string; owner_dept: string }
+export interface FeedbackReviewItem { message_id: string; question: string; created_at: string; docs: FeedbackDocRef[] }
+
+/** 拉差评复核队列（看板卡片）：失败静默兜底空 + loadErrors 显错可重试。 */
+async function loadFeedbackReview() {
+  const s = useSession()
+  if (!s.identity?.canManage) { feedbackReview.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    feedbackReview.value = [
+      { message_id: 'fb1', question: '2oz 纸杯的收缩率标准是多少？', created_at: '2026-07-03 14:20',
+        docs: [{ doc_id: 'D1', title: '纸杯工艺参数表', owner_dept: 'production' }] },
+      { message_id: 'fb2', question: '出口美国的 FDA 检测周期？', created_at: '2026-07-02 09:11',
+        docs: [{ doc_id: 'D2', title: '出口检测流程 SOP', owner_dept: 'marketing' }, { doc_id: 'D3', title: '认证台账', owner_dept: 'marketing' }] },
+    ]
+    return
+  }
+  clearLoadError('feedbackReview')
+  try {
+    const r = await apiJson<{ items: FeedbackReviewItem[] }>('/api/kb/feedback-review', { auth: true })
+    feedbackReview.value = r.items || []
+  } catch (e) { feedbackReview.value = feedbackReview.value ?? []; noteLoadError('feedbackReview', e) }
+}
+
 // 「谁能看到这篇文档」解释器响应（与后端 KbVisibilityExplainResponse 对齐；判定与检索同源）。
 export interface VisReader { dept: string; via: 'owner' | 'umbrella' | 'shared_policy' | 'grant' }
 export interface VisExplain {
@@ -1064,6 +1090,7 @@ export function useKb() {
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
     openShare, closeShare, submitShare, grantedDeptsOf, docGrantRows, setVisibility,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
+    feedbackReview, loadFeedbackReview,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,

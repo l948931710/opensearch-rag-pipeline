@@ -16,6 +16,7 @@ import FeedbackTrend from './FeedbackTrend.vue'
 import DonutChart from './DonutChart.vue'
 import MiniTrend from './MiniTrend.vue'
 import LoadError from './LoadError.vue'
+import FeedbackReviewList from './FeedbackReviewList.vue'
 
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
@@ -260,6 +261,9 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
           <p v-if="downvoteItems.length" class="mt-1 text-[11px] text-faint">占比 = 该原因 / 点踩总数；点踩可多选，故合计可超 100%。</p>
         </div>
       </div>
+      <!-- 差评复核：逐条被点踩回答 + 涉及文档（全库；与上方聚合互补——这里能落到具体该修哪篇） -->
+      <p :class="SUBHEAD" class="mt-4">差评复核 · 逐条（引用了库内文档）</p>
+      <FeedbackReviewList />
     </section>
 
     <!-- 治理/洞察数据加载中（端点未接入）→ 如实占位；真实失败（5xx）→ 错误条 + 重试 -->

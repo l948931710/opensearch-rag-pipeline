@@ -756,6 +756,39 @@ def test_my_docs_usage_none_when_fact_join_off(monkeypatch):
     assert resp.items[0].cited_count is None
 
 
+# ── GET /api/kb/feedback-review：差评联动复核队列（部门作用域，只读）────────────
+def test_feedback_review_groups_and_scopes(monkeypatch):
+    """按 message 分组保序 + 文档去重；dept_admin 作用域进 SQL（owner IN）；问题过 PII 脱敏。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    rows = [
+        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D1", "营销物料规范", "marketing"),
+        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D2", "品牌 VI 手册", "marketing"),
+        ("M1", "2026-07-03 10:00:00", "物料标准是多少？手机 13812345678", "D1", "营销物料规范", "marketing"),  # 重复 doc
+        ("M2", "2026-07-02 09:00:00", "退货流程？", "D3", "售后 SOP", "marketing"),
+    ]
+    sink = _stub_multi(monkeypatch, [rows])
+    from opensearch_pipeline import api
+    resp = api.kb_feedback_review(request=None, limit=20, identity=api.Identity(user_id="da1"))
+    assert resp.scope == "dept"
+    assert [i.message_id for i in resp.items] == ["M1", "M2"]          # 保序（差评时间倒序）
+    assert [d.doc_id for d in resp.items[0].docs] == ["D1", "D2"]      # 文档去重
+    assert "13812345678" not in resp.items[0].question                 # 他人提问必须脱敏
+    assert "owner_dept IN" in sink["sql"] and "downvote" in sink["sql"]
+
+
+def test_feedback_review_kb_admin_global_empty_ok(monkeypatch):
+    """kb_admin 全库（无 owner 过滤）；近窗口无差评 → 诚实空。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [[]])
+    from opensearch_pipeline import api
+    resp = api.kb_feedback_review(request=None, limit=20, identity=api.Identity(user_id="adm1"))
+    assert resp.scope == "global" and resp.items == []
+    assert "owner_dept IN" not in sink["sql"]
+
+
 # ── GET /api/kb/visibility-explain：「谁能看到这篇文档」解释器（只读）──────────
 def test_visibility_explain_dept_internal_with_grants(monkeypatch):
     """dept_internal：owner 组 + 授权部门；与检索同源（marketing 无伞/共享 → 只有自身）。"""

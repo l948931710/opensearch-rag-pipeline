@@ -574,6 +574,97 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     return out
 
 
+class KbFeedbackDocRef(BaseModel):
+    doc_id: str = ""
+    title: str = ""
+    owner_dept: str = ""
+
+
+class KbFeedbackReviewItem(BaseModel):
+    message_id: str = ""
+    question: str = ""                  # 已 PII 脱敏（他人原始提问，与 gap_queries 同纪律）
+    created_at: str = ""                # 差评时间
+    docs: List[KbFeedbackDocRef] = Field(default_factory=list)   # 该回答引用的【作用域内】文档
+
+
+class KbFeedbackReviewResponse(BaseModel):
+    scope: str = "dept"
+    window_days: int = _KB_INSIGHTS_WINDOW_DAYS
+    items: List[KbFeedbackReviewItem] = Field(default_factory=list)
+
+
+@router.get("/api/kb/feedback-review", response_model=KbFeedbackReviewResponse)
+def kb_feedback_review(request: Request, limit: int = 20,
+                       identity: Optional[Identity] = Depends(current_identity)):
+    """差评联动复核队列（只读）：引用了我作用域文档的回答收到 👎 → 逐条列出
+    （脱敏提问 + 涉及的本部门文档）——「文档质量 → 答案质量」最直接的改进线索。
+
+    归属链与 insights 同源（qa_docs_join_sql cited=1：差评回答【实际引用】了谁的文档，
+    谁来复核）；dept_admin 只见涉本部门文档的差评，kb_admin 全库。空=近窗口无差评；
+    连接级失败诚实 500。同一回答多条差评（schema/016 去重前）在按 message 分组时自然合并。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    win = _KB_INSIGHTS_WINDOW_DAYS
+    limit = max(1, min(limit, 50))
+    cache_key = ("fb_review",
+                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL",
+                 win, limit)
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    out = KbFeedbackReviewResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"),
+                                   window_days=win)
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        from opensearch_pipeline.qa_facts import qa_docs_join_sql
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 平铺 (message, doc) 行，Python 侧按 message 分组保序（GROUP_CONCAT 拼结构太脆）。
+                # LIMIT 300 行 ≈ 数十条差评 × 引用文档数，上限后截 limit 条消息。
+                cur.execute(
+                    "SELECT f.message_id, f.created_at, q.question, m.doc_id, m.title, m.owner_dept"
+                    f" FROM {_op_db()}.user_feedback f"
+                    f" JOIN {_op_db()}.qa_session_log q ON q.message_id = f.message_id"
+                    + qa_docs_join_sql(cited=True)
+                    + " WHERE f.feedback_type='downvote'"
+                    "   AND f.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    + (" " + scope_clause if scope_clause else "")
+                    + " ORDER BY f.created_at DESC, f.message_id LIMIT 300",
+                    tuple([win] + scope_params))
+                rows = cur.fetchall() or []
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_feedback_review 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"差评复核查询失败 (trace: {trace_id})")
+
+    from opensearch_pipeline import contribution as _C
+    by_msg: Dict[str, KbFeedbackReviewItem] = {}
+    for (mid, created, question, doc_id, title, owner) in rows:
+        it = by_msg.get(mid)
+        if it is None:
+            if len(by_msg) >= limit:
+                continue
+            # 跨用户展示：他人原始提问无条件 PII 脱敏（与 insights.gap_queries 同一纪律）
+            it = KbFeedbackReviewItem(message_id=str(mid),
+                                      question=_C.redact_query_text(str(question or "")),
+                                      created_at=str(created or ""))
+            by_msg[mid] = it
+        if doc_id and all(d.doc_id != doc_id for d in it.docs):
+            it.docs.append(KbFeedbackDocRef(doc_id=str(doc_id), title=str(title or ""),
+                                            owner_dept=str(owner or "")))
+    out.items = list(by_msg.values())
+    _dashboard_cache_put(cache_key, out)
+    return out
+
+
 class KbEmbedRunItem(BaseModel):
     bizdate: str = ""
     embedded: int = 0
