@@ -20,7 +20,7 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 
 # Alibaba Cloud Production
-pymysql>=1.1
+pymysql[rsa]>=1.1       # [rsa]=cryptography：MySQL 8 caching_sha2_password 非 TLS 连接需 RSA 密钥交换（与 pyproject 对齐）
 DBUtils>=3.0
 opensearch-py>=2.4
 oss2>=2.18
