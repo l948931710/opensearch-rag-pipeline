@@ -185,7 +185,7 @@ def build_dag3_chunk_to_opensearch() -> DAG:
         "04b", "校验并补推 (parity verify)",
         node_verify_and_repush,
         depends_on=["04"],
-        description="推送后 HA3 物理存在性校验 + 有界补推；静默丢失补救，补救失败/无法确认则中断防止停用旧版本（RAG_STAGE3_PARITY_VERIFY 默认关闭）",
+        description="推送后 HA3 物理存在性校验 + 有界补推；静默丢失补救，补救失败/无法确认则中断防止停用旧版本（RAG_STAGE3_PARITY_VERIFY 默认开启，置 false 可关）",
     ))
     dag.add_node(DAGNode(
         "05", "停用旧版本",

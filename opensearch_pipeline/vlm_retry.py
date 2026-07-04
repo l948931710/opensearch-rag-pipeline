@@ -104,7 +104,8 @@ def post_json_with_retry(
 ):
     """POST with bounded retry on *transient* failures (timeout / conn-abort / 429 / 5xx).
 
-    Why: the embedding path (pipeline_nodes 嵌入重试) already retries on (429,5xx); the
+    Why: the embedding path (pipeline_nodes 嵌入重试) already retries on
+    (429,500,502,503,504) — narrower than here, and without Retry-After; the
     other DashScope call sites — classify / OCR / VLM funnel — had NONE, so a single
     transient 429 (this account's documented fragility) lost a whole document's
     classification or an image's OCR text / caption, making ingest quality
