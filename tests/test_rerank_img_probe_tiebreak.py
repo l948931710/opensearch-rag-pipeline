@@ -199,3 +199,15 @@ def test_wiring_probe_called_before_rerank(monkeypatch):
                         (order.append("rerank"), chs[:top_k] if top_k else chs)[1])
     retriever.retrieve_and_enrich("怎么操作", top_k=7)
     assert order == ["probe", "rerank"]
+
+
+def test_probe_returns_connection_on_query_failure():
+    """F#60 同款：查询中途异常也必须归还池连接（blocking=False 池下不归还会饿死）。"""
+    cur = _ProbeCursor({})
+    cur.execute = MagicMock(side_effect=RuntimeError("query timeout"))
+    conn = _conn(cur)
+    chunks = [{"chunk_type": "step_card", "chunk_id": "S1", "score": 8.0}]
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=conn):
+        out = _probe_pool_image_refs(chunks)
+    assert out == chunks            # fail-open 语义不变
+    conn.close.assert_called_once()  # 关键：异常路径连接已归还

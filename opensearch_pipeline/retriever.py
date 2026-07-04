@@ -1656,6 +1656,8 @@ def _probe_pool_image_refs(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     if not ids:
         return chunks
     refs_by_id: Dict[str, Any] = {}
+    conn = None
+    cursor = None
     try:
         import pymysql.cursors
         from opensearch_pipeline.db import _get_db_conn
@@ -1670,11 +1672,19 @@ def _probe_pool_image_refs(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         )
         for row in cursor.fetchall():
             refs_by_id[row["chunk_id"]] = row.get("image_refs_json")
-        cursor.close()
-        conn.close()
     except Exception as e:
         logger.warning("候选池带图探测失败（忽略，fail-open）: %s", e)
         return chunks
+    finally:
+        # 异常路径也归还连接（同 expand_step_context 的 F#60 修法：
+        # blocking=False 池下不归还会饿死后续请求）
+        try:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
     out: List[Dict[str, Any]] = []
     for c in chunks:
         cid = c.get("chunk_id") or c.get("id", "")
