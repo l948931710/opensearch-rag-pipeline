@@ -27,9 +27,25 @@ import ConfirmDialog from '@/components/manage/ConfirmDialog.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, docs, approvals, accessRequests, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
+
+// ── 「文档管理」信息架构：待办摘要条 + 分区（待办审批 → 上传 → 台账 → 授权治理）──
+// 分区眉标与看板 HEADER 同一视觉语言；各队列组件自带空态自隐，眉标随内容一起隐藏。
+const ZONE = 'mb-3 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint'
+const BAD_BADGES = ['未入索引', '处理失败', '已隔离', '已驳回']
+const anomalyCount = computed(() => docs.value.filter((d) => BAD_BADGES.includes(d.status_badge)).length)
+const hasQueues = computed(() => (isKbAdmin.value && approvals.value.length > 0) || accessRequests.value.length > 0)
+interface TodoChip { key: string; label: string; n: number; anchor: string; tone: string }
+const todoChips = computed<TodoChip[]>(() => {
+  const chips: TodoChip[] = []
+  if (isKbAdmin.value && approvals.value.length) chips.push({ key: 'appr', label: '待审批上传', n: approvals.value.length, anchor: 'kb-sec-queues', tone: 'text-st-busy' })
+  if (accessRequests.value.length) chips.push({ key: 'req', label: '授权申请', n: accessRequests.value.length, anchor: 'kb-sec-queues', tone: 'text-accent-text' })
+  if (anomalyCount.value) chips.push({ key: 'anom', label: '异常文档', n: anomalyCount.value, anchor: 'kb-sec-ledger', tone: 'text-st-warn' })
+  return chips
+})
+function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
 
 // ── 管理台子 tab（成员管理仅 kb_admin 可见）──
 type Tab = 'dash' | 'docs' | 'history' | 'members'
@@ -165,13 +181,42 @@ onMounted(async () => {
     <KbAdminDashboard v-if="activeTab === 'dash' && isKbAdmin" />
     <DeptDashboard v-else-if="activeTab === 'dash'" />
 
-    <!-- 文档管理：待审批队列（上传放行，kb_admin）+ 授权申请队列（跨部门检索，本部门文档归属者）+ 上传 + 台账 -->
+    <!-- 文档管理：待办摘要条 → 待办审批（自隐）→ 上传 → 台账（主体）→ 授权治理（存量参考置底） -->
     <template v-else-if="activeTab === 'docs'">
-      <ApprovalQueue />
-      <AccessRequestQueue />
-      <AccessGrantList />
-      <UploadCard />
-      <DocTable />
+      <!-- 待办摘要条：一眼看清今天要处理什么；点击滚动到对应区块。无待办不渲染。 -->
+      <div
+        v-if="todoChips.length"
+        class="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-panel/60 px-4 py-3"
+      >
+        <span class="text-[12.5px] font-semibold text-foreground">待办</span>
+        <button
+          v-for="c in todoChips" :key="c.key" type="button"
+          class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-[12px] font-medium transition hover:border-border-strong"
+          :class="c.tone"
+          @click="scrollToSec(c.anchor)"
+        >{{ c.label }} <b class="font-mono tabular-nums">{{ c.n }}</b></button>
+      </div>
+
+      <section v-if="hasQueues" id="kb-sec-queues" class="space-y-4 scroll-mt-4">
+        <p :class="ZONE">待办审批</p>
+        <ApprovalQueue />
+        <AccessRequestQueue />
+      </section>
+
+      <section id="kb-sec-upload" class="scroll-mt-4">
+        <p :class="ZONE">上传入库</p>
+        <UploadCard />
+      </section>
+
+      <section id="kb-sec-ledger" class="scroll-mt-4">
+        <p :class="ZONE">文档台账</p>
+        <DocTable />
+      </section>
+
+      <section v-if="accessGrants.length" id="kb-sec-grants" class="scroll-mt-4">
+        <p :class="ZONE">授权治理 · 已放行的跨部门检索</p>
+        <AccessGrantList />
+      </section>
     </template>
 
     <!-- 审批历史（两角色）：四条审批流的历史决策合并时间线（只读） -->
