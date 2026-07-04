@@ -686,6 +686,38 @@ def test_grant_create_umbrella_of_subline_owner_skipped(monkeypatch):
     assert len(inserts) == 1 and inserts[0][1][4] == "hr"
 
 
+def test_grant_create_out_of_taxonomy_subline_not_skipped(monkeypatch):
+    """闭集外 production_*（papercup 双拼）：production 用户检索 fail-closed 读不到 → 共享给
+    production 是唯一放行通道，必须真写 grant 行（此前 startswith 前缀判定会误吞成冗余）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline.retriever import _PRODUCTION_UMBRELLA_OWNERS
+    assert "production_papercup" not in _PRODUCTION_UMBRELLA_OWNERS   # 前提自证：闭集外
+    sink = _stub_multi(monkeypatch, [("production_papercup", "dept_internal", "active"), []])
+    from opensearch_pipeline import api
+    resp = api.kb_access_grant_create(
+        api.KbAccessGrantCreate(doc_id="D1", target_depts=["production"]),
+        request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.granted == ["production"] and resp.skipped == []
+    inserts = [c for c in sink["calls"] if "INSERT INTO fuling_knowledge.kb_access_request" in c[0]]
+    assert len(inserts) == 1 and inserts[0][1][4] == "production"
+
+
+def test_grant_create_marketing_on_production_family_skipped(monkeypatch):
+    """marketing 读者经共享面本就覆盖 production 家族 → 对 production_mold 授 marketing 是冗余，
+    skipped（此前前缀判定漏掉这个非前缀形覆盖，写了冗余行）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("production_mold", "dept_internal", "active"), []])
+    from opensearch_pipeline import api
+    resp = api.kb_access_grant_create(
+        api.KbAccessGrantCreate(doc_id="D1", target_depts=["marketing", "hr"]),
+        request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.granted == ["hr"] and resp.skipped == ["marketing"]
+    inserts = [c for c in sink["calls"] if "INSERT INTO fuling_knowledge.kb_access_request" in c[0]]
+    assert len(inserts) == 1 and inserts[0][1][4] == "hr"
+
+
 def test_grant_create_kb_admin_allowed(monkeypatch):
     """kb_admin 可对任意归属文档主动共享（_kb_can_manage 全权）。"""
     _skip_if_not_sim()

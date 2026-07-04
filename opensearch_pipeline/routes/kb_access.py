@@ -354,8 +354,10 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
     - 只 dept_internal 可共享（public 本就全司可读→400；restricted 绝不外露→403）；
     - 非在线文档不可共享（400）；
     - 授权人必须 _kb_can_manage(owner_dept)（403）；
-    - 目标组码过 sanitize 白名单（10 个用户面组码）；剔除归属部门自身与其伞组
-      （production_mold 的伞 'production' 用户经 umbrella 展开本就可读——写了也是冗余）；
+    - 目标组码过 sanitize 白名单；「目标组本就可读该 owner」→ 冗余 skipped——判定唯一权威是
+      retriever._expand_groups_to_owners 闭集 taxonomy（production 伞 + marketing 共享面），
+      绝不 startswith：闭集外的 production_*（如 papercup 双拼）检索 fail-closed，对它们
+      "共享给 production" 恰是唯一放行通道，前缀判定会把这救济误吞成冗余；
     - 已被既有 approved 行覆盖的目标 → skipped（幂等，可重复提交）。
     """
     _enforce_rate_limit(request, identity, scope="aux")
@@ -399,9 +401,11 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
                 covered = set()
                 for (csv,) in (cur.fetchall() or []):
                     covered.update(p.strip() for p in str(csv or "").split(",") if p.strip())
+                from opensearch_pipeline.retriever import _expand_groups_to_owners
                 for t in targets:
-                    # 归属自身 / 归属子线的伞组（伞用户经 umbrella 展开本就可读）→ 冗余，跳过
-                    if t == owner_dept or owner_dept.startswith(t + "_") or t in covered:
+                    # 归属自身 / 目标组读者本就覆盖该 owner（闭集 taxonomy：production 伞 +
+                    # marketing 共享面）→ 冗余，跳过。闭集外 owner 不算覆盖（检索 fail-closed）。
+                    if t == owner_dept or owner_dept in _expand_groups_to_owners([t]) or t in covered:
                         skipped.append(t)
                         continue
                     cur.execute(
