@@ -10,13 +10,175 @@
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
-  padding: 16rpx 8rpx 20rpx;
+  padding: 16rpx 8rpx 12rpx;
 }
 
 .topbar-title {
   font-size: 30rpx;
   font-weight: 600;
   color: var(--text-1);
+}
+
+/* 管理员身份徽章行（.admin-badge 定义在 app.acss，跨页共享） */
+.role-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 0 8rpx 20rpx;
+}
+
+.role-scope {
+  margin-left: 14rpx;
+  font-size: 23rpx;
+  color: var(--text-3);
+}
+
+/* ---------- 管理范围统计条（/api/kb/stats；取数失败整条隐藏）---------- */
+.stats-strip {
+  display: flex;
+  flex-direction: row;
+  background: var(--surface);
+  border-radius: 28rpx;
+  box-shadow: var(--sh-1);
+  padding: 22rpx 8rpx;
+  margin: 0 8rpx 20rpx;
+}
+
+.stat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border-right: 1px solid var(--line-2);
+}
+
+.stat-last {
+  border-right: none;
+}
+
+.stat-num {
+  font-size: 34rpx;
+  font-weight: 700;
+  color: var(--text-1);
+  line-height: 1.2;
+}
+
+.stat-ok {
+  color: var(--success);
+}
+
+.stat-warn {
+  color: var(--warn);
+}
+
+.stat-label {
+  margin-top: 6rpx;
+  font-size: 21rpx;
+  color: var(--text-3);
+}
+
+/* ---------- 待我审批（kb_admin）---------- */
+.appr-card {
+  background: var(--surface);
+  border: 1px solid var(--warn-bg);
+  border-radius: 28rpx;
+  box-shadow: var(--sh-1);
+  margin: 0 8rpx 20rpx;
+  overflow: hidden;
+}
+
+.appr-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 20rpx 28rpx;
+  background: var(--warn-bg);
+}
+
+.appr-title {
+  font-size: 26rpx;
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.appr-count {
+  margin-left: 12rpx;
+  min-width: 34rpx;
+  text-align: center;
+  font-size: 21rpx;
+  font-weight: 700;
+  color: #ffffff;
+  background: var(--warn);
+  border-radius: 999rpx;
+  padding: 2rpx 10rpx;
+}
+
+.appr-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 20rpx 24rpx;
+  border-top: 1px solid var(--line-2);
+}
+
+.appr-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  margin-right: 16rpx;
+}
+
+.appr-doc {
+  font-size: 27rpx;
+  font-weight: 500;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.appr-meta {
+  margin-top: 6rpx;
+  font-size: 22rpx;
+  color: var(--text-3);
+}
+
+.appr-btn {
+  flex-shrink: 0;
+  border-radius: 999rpx;
+  padding: 12rpx 26rpx;
+  margin-left: 12rpx;
+}
+
+.appr-btn-text {
+  font-size: 24rpx;
+  font-weight: 500;
+}
+
+.appr-reject {
+  border: 1px solid var(--danger-soft);
+}
+
+.appr-reject:active {
+  background: var(--danger-bg);
+}
+
+.appr-reject-text {
+  color: var(--danger);
+}
+
+.appr-approve {
+  background: var(--brand-strong);
+  box-shadow: var(--sh-brand);
+}
+
+.appr-approve:active {
+  background: var(--brand-press);
+}
+
+.appr-approve-text {
+  color: #ffffff;
 }
 
 .btn-upload {
@@ -157,8 +319,8 @@
 }
 
 .badge-ok {
-  color: #15604a;
-  background: rgba(52, 214, 163, 0.18);
+  color: var(--success);
+  background: var(--success-bg);
 }
 
 .badge-busy {
@@ -172,13 +334,13 @@
 }
 
 .badge-warn {
-  color: #b45309;
-  background: rgba(245, 158, 11, 0.16);
+  color: var(--warn);
+  background: var(--warn-bg);
 }
 
 .badge-fail {
-  color: #dc2626;
-  background: rgba(239, 68, 68, 0.14);
+  color: var(--danger);
+  background: var(--danger-bg);
 }
 
 .badge-muted {

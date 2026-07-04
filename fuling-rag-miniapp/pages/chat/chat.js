@@ -1,11 +1,24 @@
-// Chat page: the core Q&A screen (Aurora-Forest v1.1 port).
+// Chat page: the core Q&A screen (藕粉纸 Lotus-Paper v2).
 //
 // /api/ask 契约消费：blocks[]（空时降级 answer）、no_result（空结果卡）、
 // guard（低匹配提示条）、sources[].level（相关度高/中/低徽章 —— rerank 开启后
 // score 是 0-1 量纲，禁止本地按融合阈值重算，仅在 level 缺省时兜底）。
+//
+// 多会话（v2）：与控制台同构 —— 每个会话一个客户端 conversation_id（随 ask 上送）
+// + 一个服务端 session_id（LLM 多轮记忆，首答时由服务端下发并记回）。消息本地
+// 落盘（utils/conversations.js），打开小程序恢复最近会话；抽屉列表合并服务端
+// /api/conversations（RAG_CONVERSATION_HISTORY 开启时），点开云端会话懒加载。
 
 import { ensureLogin } from '../../utils/auth';
-import { ask, feedback as postFeedback, getHotQuestions } from '../../utils/api';
+import {
+  ask, feedback as postFeedback, getHotQuestions,
+  getConversations, getConversationMessages, deleteConversation,
+} from '../../utils/api';
+import {
+  genConvId, deriveTitle, relativeTimeLabel, mergeServerList, leanMessages,
+  ensureOwner, loadIndex, loadMessages, saveMessages, touchConversation,
+  removeConversation,
+} from '../../utils/conversations';
 
 // 静态兜底（/api/hot-questions 不可达时显示；与服务端 _HOT_QUESTIONS_FALLBACK 同源）
 const QUICK = ['U8+ 如何登录？', '请假流程是什么？', '访客 WiFi 密码是多少？', '注塑模具多久保养一次？'];
@@ -18,6 +31,11 @@ function nextId() {
 
 function pad2(n) {
   return n < 10 ? '0' + n : '' + n;
+}
+
+function nowLabel() {
+  const now = new Date();
+  return '今天 ' + pad2(now.getHours()) + ':' + pad2(now.getMinutes());
 }
 
 // level 以服务端下发为准；缺省按加权融合分 7.7/5.8 标定兜底（与原型同款）
@@ -38,6 +56,57 @@ function mapSources(sources) {
   });
 }
 
+// 落盘精简消息 → 页面消息（恢复渲染一律 instant，绝不重播打字机）
+function reviveMessage(m) {
+  if (m.role === 'user') {
+    return { id: nextId(), role: 'user', text: m.text || '' };
+  }
+  if (m.noResult) {
+    return {
+      id: nextId(), role: 'ai', noResult: true,
+      rephrase: m.rephrase || [], messageId: m.messageId || '',
+      question: m.question || '', handoffDone: !!m.handoffDone,
+    };
+  }
+  return {
+    id: nextId(), role: 'ai',
+    blocks: m.blocks || [], guard: !!m.guard,
+    sources: m.sources || [], sourcesOpen: false,
+    messageId: m.messageId || '', copyText: m.copyText || '',
+    question: m.question || '', instant: true,
+  };
+}
+
+// /api/conversations/{id} 的 items（与 /api/history 同构）→ 页面消息对。
+// 服务端不存 sources/guard，恢复视图只还原问答本体；messageId 在则反馈条可用。
+function reviveServerItems(items) {
+  const msgs = [];
+  (items || []).forEach((it) => {
+    if (!it || !it.question) {
+      return;
+    }
+    msgs.push({ id: nextId(), role: 'user', text: it.question });
+    if (it.status === 'NO_RESULT') {
+      msgs.push({
+        id: nextId(), role: 'ai', noResult: true, rephrase: [],
+        messageId: it.message_id || '', question: it.question,
+      });
+      return;
+    }
+    let blocks = (it.blocks && it.blocks.length) ? it.blocks : [];
+    if (!blocks.length) {
+      blocks = [{ type: 'text', format: 'plain', text: it.answer || '（无回答内容）' }];
+    }
+    msgs.push({
+      id: nextId(), role: 'ai', blocks, guard: false,
+      sources: [], sourcesOpen: false,
+      messageId: it.message_id || '', copyText: it.answer || '',
+      question: it.question, instant: true,
+    });
+  });
+  return msgs;
+}
+
 Page({
   data: {
     // { id, role:'user'|'ai', text?, blocks?, guard?, sources?, sourcesOpen?,
@@ -54,9 +123,15 @@ Page({
     startTimeLabel: '',
     quick: QUICK,
     scrollIntoId: '',
+    scrollAnim: false, // 首屏恢复瞬时定位；之后打开平滑滚动
     showToBottom: false,
-    sessionId: '',
-    lastResetAt: 0, // tracks the 清除会话 marker from the settings page
+    // ── 多会话 ──
+    convId: '',        // 当前会话（客户端 conversation_id）
+    sessionId: '',     // 当前会话的服务端 session_id（首答后由服务端下发记回）
+    drawerMounted: false, // 两段式挂载：mounted 控 a:if，open 控滑入动画类
+    drawerOpen: false,
+    convList: [],      // 抽屉展示列表（本地索引 × 服务端合并的装饰行）
+    lastResetAt: 0,    // tracks the 清空会话 marker from the settings page
   },
 
   onLoad() {
@@ -66,11 +141,7 @@ Page({
     } catch (e) {
       sbh = 0;
     }
-    const now = new Date();
-    this.setData({
-      statusBarHeight: sbh,
-      startTimeLabel: '今天 ' + pad2(now.getHours()) + ':' + pad2(now.getMinutes()),
-    });
+    this.setData({ statusBarHeight: sbh });
     this._draft = '';           // 非受控草稿（真值；data.draft 只做程序化覆盖）
     this._pinned = true;        // 钉住才跟滚：用户上翻重读时绝不抢滚动条
     this._listHeight = 0;
@@ -80,11 +151,20 @@ Page({
     this._reqTask = null;       // 当前在途请求的 RequestTask（abort 真取消）
     this._pendingAiId = '';     // 在途请求对应的 AI 消息 id
     this._abortedAiId = '';     // 用户主动取消的消息 id（catch 里区分取消与失败）
+    this._serverConvs = [];     // 最近一次 /api/conversations 结果（仅内存，抽屉合并用）
+    this._loadingConvId = '';   // 正在懒加载的云端会话（防重复点击）
+
+    // 先本地恢复（不等登录网络往返，首屏即见上次会话）；登录归属校验在
+    // ensureLogin 回来后补做，换号即清空重置。
+    this._restoreLast();
 
     ensureLogin()
       .then((g) => {
-        if (g.userId) {
-          this.setData({ sessionId: 'miniapp:' + g.userId });
+        ensureOwner(g.userId || 'anon');
+        // 换号清空后当前会话已不在索引里 → 重置为全新会话
+        const idx = loadIndex();
+        if (this.data.messages.length && !idx.some((c) => c.id === this.data.convId)) {
+          this._freshConversation();
         }
       })
       .catch(() => {
@@ -100,6 +180,11 @@ Page({
         }
       })
       .catch(() => {});
+
+    // 首屏定位完成后再启用平滑滚动
+    setTimeout(() => {
+      this.setData({ scrollAnim: true });
+    }, 600);
   },
 
   onReady() {
@@ -124,9 +209,16 @@ Page({
     this._stageTimers = {};
   },
 
+  onHide() {
+    // 切到别的 tab 时收起抽屉（native tabBar 不被 fixed 层覆盖，可随时切走）
+    if (this.data.drawerMounted) {
+      this.setData({ drawerMounted: false, drawerOpen: false });
+    }
+  },
+
   onShow() {
-    // Honor 清除会话 from the settings page: if the marker advanced, wipe the
-    // visible conversation and let the backend memory start fresh.
+    // Honor 清空会话 from the settings page: if the marker advanced, storage 已被
+    // settings 清空，这里重置可见 UI 并开启全新会话。
     let resetAt = 0;
     try {
       const r = dd.getStorageSync({ key: 'session_reset_at' });
@@ -135,20 +227,212 @@ Page({
       resetAt = 0;
     }
     if (resetAt && resetAt !== this.data.lastResetAt) {
-      this._draft = '';
-      this.setData({
-        messages: [],
-        draft: '',
-        hasDraft: false,
-        sending: false,
-        typing: false,
-        scrollIntoId: '',
-        showToBottom: false,
-        lastResetAt: resetAt,
-      });
-      this._pinned = true;
+      this._serverConvs = [];
+      this._freshConversation();
+      this.setData({ lastResetAt: resetAt });
     }
   },
+
+  // ── 多会话：恢复 / 新建 / 抽屉 ──────────────────────────────────
+
+  // 打开小程序恢复最近会话（索引首行）；无则开新会话（不落盘，首问才落）。
+  _restoreLast() {
+    const idx = loadIndex();
+    const current = idx.length ? idx[0] : null;
+    const lean = current ? loadMessages(current.id) : [];
+    if (current && lean.length) {
+      this.setData({
+        convId: current.id,
+        sessionId: current.sessionId || '',
+        messages: lean.map(reviveMessage),
+        startTimeLabel: relativeTimeLabel(current.updatedAt) || nowLabel(),
+      });
+      this._scrollToBottom(true);
+    } else {
+      this.setData({ convId: genConvId(), startTimeLabel: nowLabel() });
+    }
+  },
+
+  // 重置为全新会话（不动已落盘的其他会话）
+  _freshConversation() {
+    this._draft = '';
+    this.setData({
+      convId: genConvId(),
+      sessionId: '',
+      messages: [],
+      draft: '',
+      hasDraft: false,
+      sending: false,
+      typing: false,
+      scrollIntoId: '',
+      showToBottom: false,
+      startTimeLabel: nowLabel(),
+    });
+    this._pinned = true;
+  },
+
+  // 当前会话落盘：索引置顶（首问定标题）+ 消息精简缓存。逐答调用，无需 flush。
+  _persistCurrent() {
+    const convId = this.data.convId;
+    if (!convId) {
+      return;
+    }
+    const lean = leanMessages(this.data.messages);
+    if (!lean.length) {
+      return; // 空会话不进索引
+    }
+    const firstUser = lean.find((m) => m.role === 'user');
+    touchConversation(convId, {
+      title: firstUser ? deriveTitle(firstUser.text) : '',
+      sessionId: this.data.sessionId,
+    });
+    saveMessages(convId, lean);
+  },
+
+  _buildConvList() {
+    const merged = mergeServerList(loadIndex(), this._serverConvs);
+    return merged.slice(0, 50).map((c) => ({
+      id: c.id,
+      title: c.title || '新会话',
+      timeLabel: relativeTimeLabel(c.updatedAt),
+      active: c.id === this.data.convId,
+      remote: !!c.remote,
+    }));
+  },
+
+  onOpenDrawer() {
+    this.setData({ drawerMounted: true, convList: this._buildConvList() });
+    setTimeout(() => {
+      this.setData({ drawerOpen: true });
+    }, 30);
+    // 服务端会话列表合并（RAG_CONVERSATION_HISTORY 开启时才有数据；匿名/失败静默）
+    ensureLogin()
+      .then(() => getConversations())
+      .then((resp) => {
+        this._serverConvs = (resp && resp.items) || [];
+        if (this.data.drawerMounted) {
+          this.setData({ convList: this._buildConvList() });
+        }
+      })
+      .catch(() => {});
+  },
+
+  onCloseDrawer() {
+    this.setData({ drawerOpen: false });
+    setTimeout(() => {
+      this.setData({ drawerMounted: false });
+    }, 260);
+  },
+
+  onNewConversation() {
+    if (this.data.sending || this.data.typing) {
+      this._toast('正在回答中，请稍候再新建会话');
+      return;
+    }
+    if (this.data.drawerMounted) {
+      this.onCloseDrawer();
+    }
+    if (!this.data.messages.length) {
+      return; // 已是空会话
+    }
+    this._freshConversation();
+  },
+
+  onSelectConv(e) {
+    if (this.data.sending || this.data.typing) {
+      this._toast('正在回答中，请稍候再切换会话');
+      return;
+    }
+    const id = e.currentTarget.dataset.id;
+    if (!id || id === this.data.convId) {
+      this.onCloseDrawer();
+      return;
+    }
+    const row = this._buildConvList().find((c) => c.id === id);
+    const idxRow = loadIndex().find((c) => c.id === id);
+    const lean = loadMessages(id);
+    if (lean.length) {
+      // 本地缓存直开
+      this.setData({
+        convId: id,
+        sessionId: (idxRow && idxRow.sessionId) || '',
+        messages: lean.map(reviveMessage),
+        startTimeLabel: relativeTimeLabel((idxRow && idxRow.updatedAt) || 0) || nowLabel(),
+        sending: false,
+        typing: false,
+      });
+      this._pinned = true;
+      this.onCloseDrawer();
+      this._scrollToBottom(true);
+      return;
+    }
+    // 云端会话懒加载（保持当前会话可见，加载成功才切换）
+    if (this._loadingConvId === id) {
+      return;
+    }
+    this._loadingConvId = id;
+    dd.showLoading({ content: '加载会话…' });
+    getConversationMessages(id)
+      .then((resp) => {
+        this._loadingConvId = '';
+        dd.hideLoading();
+        const msgs = reviveServerItems(resp && resp.items);
+        if (!msgs.length) {
+          this._toast('该会话暂无可显示的消息');
+          return;
+        }
+        this.setData({
+          convId: id,
+          sessionId: '', // 云端会话无本地 LLM session；下一问由服务端新发
+          messages: msgs,
+          startTimeLabel: (row && row.timeLabel) || nowLabel(),
+          sending: false,
+          typing: false,
+        });
+        this._pinned = true;
+        // 转正落盘：下次直开；标题沿用服务端/首问
+        this._persistCurrent();
+        this.onCloseDrawer();
+        this._scrollToBottom(true);
+      })
+      .catch(() => {
+        this._loadingConvId = '';
+        dd.hideLoading();
+        this._toast('会话加载失败，请稍后重试');
+      });
+  },
+
+  onDeleteConv(e) {
+    const id = e.currentTarget.dataset.id;
+    if (!id) {
+      return;
+    }
+    if (id === this.data.convId && (this.data.sending || this.data.typing)) {
+      this._toast('正在回答中，请稍候再删除当前会话');
+      return;
+    }
+    dd.confirm({
+      title: '删除会话',
+      content: '删除后本机与云端列表将不再显示该会话，历史问答记录不受影响。',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      success: (res) => {
+        if (!res.confirm) {
+          return;
+        }
+        removeConversation(id);
+        this._serverConvs = this._serverConvs.filter((s) => s.conversation_id !== id);
+        // 服务端软隐藏 best-effort（flag 关闭时 404，一并忽略）
+        deleteConversation(id).catch(() => {});
+        if (id === this.data.convId) {
+          this._freshConversation();
+        }
+        this.setData({ convList: this._buildConvList() });
+      },
+    });
+  },
+
+  // ── 输入 / 滚动（v1 原样保留，真机踩坑修复勿动） ─────────────────
 
   // 非受控输入：按键绝不 setData 回推 value —— 受控回声在真机上与连续删除赛跑，
   // 旧值把刚删的字"恢复"回来（删除要按好几遍的根因）。草稿存 this._draft，
@@ -356,6 +640,7 @@ Page({
     postFeedback({ message_id: msg.messageId, feedback_type: 'handoff' })
       .then(() => {
         this._updateMessage(id, { handoffDone: true });
+        this._persistCurrent();
         this._toast('已转交管理员跟进，请留意钉钉消息');
       })
       .catch((err) => {
@@ -388,6 +673,7 @@ Page({
   _ask(question, addUserMsg) {
     const aiId = nextId();
     const thinking = !!this.data.thinking; // 发送瞬间定格（骨架文案 + 请求参数同源）
+    const convId = this.data.convId;       // 定格会话（响应回来时校验未被切走）
     const newMsgs = [];
     if (addUserMsg) {
       newMsgs.push({ id: nextId(), role: 'user', text: question });
@@ -416,6 +702,7 @@ Page({
       .catch(() => null)
       .then(() => ask(question, this.data.sessionId, {
         thinking,
+        conversationId: convId,
         onTask: (t) => {
           this._reqTask = t;
         },
@@ -424,9 +711,14 @@ Page({
         this._clearStageTimer(aiId);
         this._reqTask = null;
         this._abortedAiId = '';
+        // 会话在途中被删除/重置（messages 已清）：整个响应静默丢弃，
+        // 绝不把旧会话的 typing/sessionId 状态泼到新会话上。
+        if (convId !== this.data.convId) {
+          return;
+        }
         resp = resp || {};
-        // Adopt a server-issued session id if we did not have one yet.
-        if (resp.session_id && !this.data.sessionId) {
+        // 记回服务端 session_id（首答下发；后续应答原样回显）。
+        if (resp.session_id && resp.session_id !== this.data.sessionId) {
           this.setData({ sessionId: resp.session_id });
         }
 
@@ -440,6 +732,7 @@ Page({
             messageId: resp.message_id || '',
           });
           this.setData({ sending: false, serviceOk: true });
+          this._persistCurrent();
           this._scrollToBottom(true);
           return;
         }
@@ -463,11 +756,15 @@ Page({
         });
         this._skipOnArrive = false;
         this.setData({ sending: false, typing: true, serviceOk: true });
+        this._persistCurrent();
         this._scrollToBottom(true);
       })
       .catch((err) => {
         this._clearStageTimer(aiId);
         this._reqTask = null;
+        if (convId !== this.data.convId) {
+          return; // 会话已被删除/重置，同上静默丢弃
+        }
         // 用户主动取消 ≠ 服务故障：不降级健康态、错误卡文案区分（重试按钮共用）
         const cancelled = this._abortedAiId === aiId;
         this._abortedAiId = '';

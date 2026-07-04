@@ -7,7 +7,7 @@
 ## 这是什么
 
 - 一部 **390px 宽的手机框**，居中显示在中性背景上。
-- **Aurora-Forest 设计系统**（v1 已锁定）：深林绿品牌色 + 极光渐变、棉纸纹理底（feTurbulence）、暖墨文字；浅色/深色双主题（右上角切换，真机走 `prefers-color-scheme`）。设计令牌全部在 `:root` / `html[data-theme=dark]`，port 时即 ACSS 的 `page{}` / `@media (prefers-color-scheme: dark)`。
+- **Aurora-Forest 设计系统**（锁定；2026-07-03 曾试藕粉换肤、用户看后要求改回）：深林绿品牌色 + 极光渐变、棉纸纹理底（feTurbulence）、暖墨文字；浅色/深色双主题（右上角切换，真机走 `prefers-color-scheme`）。设计令牌全部在 `:root` / `html[data-theme=dark]`，port 时即 ACSS 的 `page{}` / `@media (prefers-color-scheme: dark)`。**v0.3 新增**：会话抽屉 mock（导航左侧 ☰ 打开多会话列表：切换/新建/删除/云端行占位，＋ 直接开新会话）+ AI 头像改极光新芽标（不再用「富」字）。
 - AI 回答由一个 **`blocks[]` 数组**渲染（`{type:'text'}` / `{type:'image'}`），文本块渲染为段落（`**…**` 为唯一加粗标记）、图片块渲染为内联图 + 图注行（类型图标 + 说明 + 点按放大提示）。
 - 截图用**内联 SVG** 模拟（U8+ 登录界面、系统管理面板、请假流程图），完全离线、无任何网络依赖。
 

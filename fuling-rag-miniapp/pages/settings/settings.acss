@@ -42,10 +42,20 @@
   flex-direction: column;
 }
 
+.profile-name-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+
 .profile-name {
   font-size: 34rpx;
   font-weight: 600;
   color: var(--text-1);
+}
+
+.profile-name-row .admin-badge {
+  margin-left: 14rpx;
 }
 
 .profile-dept {
@@ -54,9 +64,25 @@
   color: var(--text-3);
 }
 
+.profile-uid {
+  margin-top: 4rpx;
+  font-size: 23rpx;
+  color: var(--text-3);
+  opacity: 0.8;
+}
+
 /* ---------- sections / cells ---------- */
 .section {
-  margin-bottom: 24rpx;
+  margin-bottom: 28rpx;
+}
+
+.section-title {
+  display: block;
+  padding: 0 32rpx 12rpx;
+  font-size: 24rpx;
+  font-weight: 500;
+  color: var(--text-2);
+  letter-spacing: 2rpx;
 }
 
 .card {
@@ -125,10 +151,12 @@
   margin-left: 8rpx;
 }
 
-.role-badge {
-  font-size: 22rpx;
-  color: #ffffff;
-  background: var(--brand);
-  border-radius: 16rpx;
-  padding: 4rpx 14rpx;
+/* 角色徽章现由 app.acss 的 .admin-badge 统一提供（settings / kb-docs 共享） */
+.cell-value-sub {
+  font-size: 24rpx;
+  color: var(--text-3);
+}
+
+.cell-label-danger {
+  color: var(--danger);
 }

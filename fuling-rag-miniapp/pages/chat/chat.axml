@@ -1,8 +1,16 @@
 <view class="chat-page">
   <!-- 自绘导航（transparentTitle）：nav-grad 渐变 + 健康态副标题。
-       右上是钉钉胶囊，导航内不放自定义控件；ghost 占位让标题居中。 -->
+       右上是钉钉胶囊，自定义控件只能放左侧：会话抽屉 + 新会话；
+       ghost 等宽占位让标题居中。 -->
   <view class="navbar {{serviceOk ? '' : 'degraded'}}" style="padding-top:{{statusBarHeight}}px;">
-    <view class="brandmark"><text class="brandmark-text">富</text></view>
+    <view class="nav-actions">
+      <view class="nav-btn" onTap="onOpenDrawer">
+        <view class="glyph-menu"><view class="gm-bar"></view><view class="gm-bar gm-mid"></view><view class="gm-bar"></view></view>
+      </view>
+      <view class="nav-btn" onTap="onNewConversation">
+        <view class="glyph-plus"><view class="gp-h"></view><view class="gp-v"></view></view>
+      </view>
+    </view>
     <view class="title-wrap">
       <text class="nav-title">富岭知识助手</text>
       <view class="subtitle">
@@ -10,14 +18,16 @@
         <text class="subtitle-text">{{serviceOk ? '企业知识库 · 在线' : '企业知识库 · 服务暂不可用'}}</text>
       </view>
     </view>
-    <view class="brandmark-ghost"></view>
+    <view class="nav-ghost"></view>
   </view>
 
+  <!-- scroll-with-animation 绑 scrollAnim：首屏恢复历史会话瞬时定位到底部，
+       600ms 后才开平滑（避免每次打开都从顶部滚一整屏） -->
   <scroll-view
     class="msg-list"
     scroll-y="{{true}}"
     scroll-into-view="{{scrollIntoId}}"
-    scroll-with-animation="{{true}}"
+    scroll-with-animation="{{scrollAnim}}"
     onScroll="onListScroll"
   >
     <view class="msg-list-inner">
@@ -25,7 +35,7 @@
 
       <!-- 欢迎卡（静态） -->
       <view class="row row-ai">
-        <view class="avatar avatar-ai"><text class="avatar-text">富</text></view>
+        <view class="avatar avatar-ai"><view class="avatar-mark"></view></view>
         <view class="ai-card">
           <view class="welcome-body">
             <text class="welcome-text">您好👋 我是</text><text class="welcome-text welcome-b">富岭知识助手</text><text class="welcome-text">。作业指导书（SOP）、U8+ 系统操作、考勤请假等人事行政制度，都可以直接问我。点下面的示例问题试试，或直接输入您的问题。</text>
@@ -42,7 +52,7 @@
 
         <!-- AI message (left) -->
         <view a:else class="row row-ai">
-          <view class="avatar avatar-ai"><text class="avatar-text">富</text></view>
+          <view class="avatar avatar-ai"><view class="avatar-mark"></view></view>
           <view class="ai-col">
 
             <!-- loading skeleton: brand typing dots + 阶段文案（检索→生成/深思）+ shimmer lines -->
@@ -177,4 +187,43 @@
       <text class="send-btn-text">{{(sending || typing) ? '停止' : '发送'}}</text>
     </view>
   </view>
+
+  <!-- 会话抽屉：scrim + 左滑面板。两段式挂载（mounted 控 a:if / open 控动画类），
+       进出场都有滑移；点 scrim 关闭。 -->
+  <block a:if="{{drawerMounted}}">
+    <view class="drawer-scrim {{drawerOpen ? 'scrim-show' : ''}}" onTap="onCloseDrawer"></view>
+    <view class="drawer {{drawerOpen ? 'drawer-open' : ''}}">
+      <view class="drawer-head" style="padding-top:{{statusBarHeight}}px;">
+        <text class="drawer-title">会话</text>
+        <text class="drawer-sub">{{convList.length ? convList.length + ' 个会话' : '每次对话自动保存'}}</text>
+      </view>
+      <view class="drawer-new" onTap="onNewConversation">
+        <view class="glyph-plus gp-onbrand"><view class="gp-h"></view><view class="gp-v"></view></view>
+        <text class="drawer-new-label">开启新会话</text>
+      </view>
+      <scroll-view class="drawer-list" scroll-y="{{true}}">
+        <block a:for="{{convList}}" a:key="id">
+          <view class="conv-item {{item.active ? 'conv-active' : ''}}" data-id="{{item.id}}" onTap="onSelectConv">
+            <view class="conv-dot"></view>
+            <view class="conv-main">
+              <text class="conv-title">{{item.title}}</text>
+              <view class="conv-meta">
+                <text class="conv-time">{{item.timeLabel}}</text>
+                <text a:if="{{item.remote}}" class="conv-cloud">云端</text>
+                <text a:if="{{item.active}}" class="conv-current">当前</text>
+              </view>
+            </view>
+            <view class="conv-del" data-id="{{item.id}}" catchTap="onDeleteConv">
+              <text class="ico ico-x conv-del-ico"></text>
+            </view>
+          </view>
+        </block>
+        <view a:if="{{!convList.length}}" class="conv-empty">
+          <text class="conv-empty-title">还没有会话</text>
+          <text class="conv-empty-desc">提出第一个问题，对话会自动保存在这里</text>
+        </view>
+        <view class="drawer-foot-pad"></view>
+      </scroll-view>
+    </view>
+  </block>
 </view>

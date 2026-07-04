@@ -1,9 +1,10 @@
-// Settings / 我的: read-only profile + 清除会话.
+// Settings / 我的: read-only profile + 清空会话列表.
 
 import { ensureLogin } from '../../utils/auth';
-import { clearSession } from '../../utils/api';
+import { clearSession, deleteConversation } from '../../utils/api';
+import { loadIndex, clearAllLocal } from '../../utils/conversations';
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.3.0';
 
 // 权限组代码 → 中文（"部门"栏友好显示，避免把 marketing,production… 原样铺给用户）
 const GROUP_LABEL = {
@@ -28,11 +29,14 @@ Page({
     displayName: '',
     deptLabel: '',
     userId: '',
-    sessionId: '',
+    convCount: 0,
     avatarChar: '富',
     version: APP_VERSION,
     canManageKb: false,
     roleLabel: '',
+    roleClass: '',   // kb（实心深绿）/ dept（描边绿）—— 与 kb-docs 工作台同一套徽章
+    kbScopeLabel: '',
+    kbTip: '',
   },
 
   onShow() {
@@ -55,14 +59,23 @@ Page({
     const g = getApp().globalData;
     const name = g.displayName || '';
     const ROLE_LABEL = { kb_admin: '知识库管理员', dept_admin: '部门管理员' };
+    // 管辖范围标注：与 kb-docs 工作台角色横幅同词表（kb_admin=全库 / dept_admin=本部门）
+    const KB_SCOPE = { kb_admin: '全库', dept_admin: '本部门' };
+    const KB_TIP = {
+      kb_admin: '全库文档管理：上传 / 升版 / 待审批放行。',
+      dept_admin: '本部门文档管理：上传 / 升版；新文档由知识库管理员审批上线。',
+    };
     this.setData({
       displayName: name,
       deptLabel: friendlyDept(g.dept, g.role),
       userId: g.userId || '',
-      sessionId: g.userId ? 'miniapp:' + g.userId : '',
+      convCount: loadIndex().length,
       avatarChar: name ? name.charAt(0) : '富',
       canManageKb: !!g.canManageKb,
       roleLabel: ROLE_LABEL[g.role] || '',
+      roleClass: g.role === 'kb_admin' ? 'kb' : (g.role === 'dept_admin' ? 'dept' : ''),
+      kbScopeLabel: KB_SCOPE[g.role] || '',
+      kbTip: KB_TIP[g.role] || '',
     });
   },
 
@@ -74,37 +87,35 @@ Page({
     dd.navigateTo({ url: '/pages/kb-docs/kb-docs' });
   },
 
-  onClearSession() {
+  onClearConversations() {
     dd.confirm({
-      title: '清除会话',
-      content: '确定要开始新的会话吗？历史问答记录不受影响。',
-      confirmButtonText: '清除',
+      title: '清空会话列表',
+      content: '将删除本机全部会话，并同步隐藏云端会话列表；历史问答记录不受影响。',
+      confirmButtonText: '清空',
       cancelButtonText: '取消',
       success: (res) => {
-        if (res.confirm) {
-          // 1. Local marker first — the chat page reads it on next onShow and
-          //    resets its UI; this must work even when offline.
-          dd.setStorageSync({ key: 'session_reset_at', data: Date.now() });
-
-          // 2. Best-effort backend clear: without it the server keeps the old
-          //    turns for the 30-min TTL and the "new" conversation inherits
-          //    stale context. Failure degrades to local-only with a hint.
-          const done = (ok) => {
-            const content = ok
-              ? '已清除会话'
-              : '已在本地清除（服务器同步失败，旧上下文 30 分钟后自动过期）';
-            dd.showToast({ type: ok ? 'success' : 'none', content, duration: 2500 });
-          };
-          const sid = this.data.sessionId;
-          if (sid) {
-            ensureLogin()
-              .then(() => clearSession(sid))
-              .then(() => done(true))
-              .catch(() => done(false));
-          } else {
-            done(true);
-          }
+        if (!res.confirm) {
+          return;
         }
+        // 1. 本地为准：清空索引+消息缓存，落 marker（问答页 onShow 读到即重置 UI）。
+        //    离线也必须成立。
+        const cleared = clearAllLocal();
+        dd.setStorageSync({ key: 'session_reset_at', data: Date.now() });
+        this.setData({ convCount: 0 });
+        dd.showToast({ type: 'success', content: '已清空会话', duration: 2000 });
+
+        // 2. Best-effort 云端收尾：软隐藏会话列表（flag 关闭时 404）+ 清各会话
+        //    LLM 记忆（否则旧上下文陪聊到 30 分钟 TTL）。失败静默 —— 本地已清。
+        ensureLogin()
+          .then(() => {
+            cleared.ids.forEach((id) => {
+              deleteConversation(id).catch(() => {});
+            });
+            cleared.sessionIds.forEach((sid) => {
+              clearSession(sid).catch(() => {});
+            });
+          })
+          .catch(() => {});
       },
     });
   },

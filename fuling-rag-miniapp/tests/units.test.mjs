@@ -16,9 +16,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const tmp = mkdtempSync(join(tmpdir(), 'flmini-'));
 copyFileSync(join(here, '../utils/markdown.js'), join(tmp, 'markdown.mjs'));
 copyFileSync(join(here, '../utils/typewriter.js'), join(tmp, 'typewriter.mjs'));
+copyFileSync(join(here, '../utils/conversations.js'), join(tmp, 'conversations.mjs'));
 const { parseTextBlock, plainText, plainLength, sliceParas } =
   await import(pathToFileURL(join(tmp, 'markdown.mjs')));
 const { createTypewriter } = await import(pathToFileURL(join(tmp, 'typewriter.mjs')));
+const {
+  genConvId, deriveTitle, parseServerTime, relativeTimeLabel,
+  mergeServerList, leanMessages, capIndex, MAX_MESSAGES,
+} = await import(pathToFileURL(join(tmp, 'conversations.mjs')));
 
 // ── markdown.parseTextBlock ──────────────────────────────────
 
@@ -158,4 +163,118 @@ test('空 segments：start 直接 onDone', () => {
   let done = 0;
   createTypewriter({ segments: [], onDone: () => { done += 1; } }).start();
   assert.equal(done, 1);
+});
+
+// ── conversations（多会话纯函数；dd 存储包装不在 node 环境测） ──────────
+
+test('genConvId：唯一、契约长度内（<=128）', () => {
+  const seen = new Set();
+  for (let i = 0; i < 500; i++) {
+    const id = genConvId();
+    assert.ok(id.length > 4 && id.length <= 128);
+    assert.ok(!seen.has(id), 'duplicate conv id: ' + id);
+    seen.add(id);
+  }
+});
+
+test('deriveTitle：压空白、截 60 字、空入空出', () => {
+  assert.equal(deriveTitle('  U8+ 如何\n\n登录？  '), 'U8+ 如何 登录？');
+  assert.equal(deriveTitle('长'.repeat(99)).length, 60);
+  assert.equal(deriveTitle(''), '');
+  assert.equal(deriveTitle(null), '');
+});
+
+test('parseServerTime：空格/T 分隔均可解析，非法返回 0（不臆造时间）', () => {
+  const t1 = parseServerTime('2026-07-02 10:11:12');
+  const t2 = parseServerTime('2026-07-02T10:11:12.123');
+  assert.ok(t1 > 0);
+  const d = new Date(t1);
+  assert.equal(d.getHours(), 10);
+  assert.equal(d.getDate(), 2);
+  assert.equal(t2 - t1, 0); // 同秒（毫秒段忽略）
+  assert.equal(parseServerTime('not a date'), 0);
+  assert.equal(parseServerTime(''), 0);
+});
+
+test('relativeTimeLabel：刚刚/分钟/同日 HH:MM/昨天/N天前/跨周 MM-DD', () => {
+  const now = new Date(2026, 6, 2, 15, 0, 0).getTime(); // 2026-07-02 15:00
+  assert.equal(relativeTimeLabel(now - 30 * 1000, now), '刚刚');
+  assert.equal(relativeTimeLabel(now - 5 * 60 * 1000, now), '5分钟前');
+  assert.equal(relativeTimeLabel(new Date(2026, 6, 2, 9, 5).getTime(), now), '09:05');
+  assert.equal(relativeTimeLabel(new Date(2026, 6, 1, 23, 0).getTime(), now), '昨天');
+  assert.equal(relativeTimeLabel(now - 3 * 24 * 3600 * 1000 - 3600 * 1000, now), '3天前');
+  assert.equal(relativeTimeLabel(new Date(2026, 4, 20).getTime(), now), '05-20');
+  assert.equal(relativeTimeLabel(0, now), '');
+});
+
+test('mergeServerList：本地行为准（补标题/取较新时间），服务端独有行 remote 占位，倒序', () => {
+  const local = [
+    { id: 'a', title: '本地标题', updatedAt: 1000, sessionId: 's1' },
+    { id: 'b', title: '', updatedAt: 500, sessionId: 's2' },
+  ];
+  const server = [
+    { conversation_id: 'a', title: '服务端标题', updated_at: '2026-07-02 10:00:00' },
+    { conversation_id: 'b', title: '补上的标题', updated_at: '' },
+    { conversation_id: 'c', title: '云端会话', updated_at: '2026-07-01 08:00:00' },
+    { conversation_id: '', title: '脏行丢弃' },
+  ];
+  const merged = mergeServerList(local, server);
+  assert.equal(merged.length, 3);
+  const a = merged.find((x) => x.id === 'a');
+  assert.equal(a.title, '本地标题');            // 本地已有标题不被覆盖
+  assert.ok(a.updatedAt > 1000);                // 服务端时间较新 → 取之
+  assert.equal(a.sessionId, 's1');              // 本地字段保留
+  const b = merged.find((x) => x.id === 'b');
+  assert.equal(b.title, '补上的标题');          // 本地缺标题 → 补服务端的
+  assert.equal(b.updatedAt, 500);               // 服务端时间无效 → 保本地
+  const c = merged.find((x) => x.id === 'c');
+  assert.equal(c.remote, true);
+  assert.equal(c.sessionId, '');
+  assert.equal(merged[0].id, 'a');              // 倒序：a(2026) > c(7-01) > b(500)
+  assert.equal(merged[1].id, 'c');
+  // 入参不被原地污染
+  assert.equal(local[1].title, '');
+});
+
+test('leanMessages：丢 loading/error 瞬态，保最终答案/NO_RESULT，AI 行恒 instant', () => {
+  const lean = leanMessages([
+    { role: 'user', text: '问题一' },
+    { role: 'ai', loading: true, question: '问题一' },              // 瞬态：丢
+    { role: 'ai', error: true, errorText: '失败', question: 'x' },  // 瞬态：丢
+    { role: 'ai', blocks: [{ type: 'text', text: '答案' }], sources: [{ idx: 1 }],
+      messageId: 'mid1', copyText: '答案', question: '问题一', guard: true },
+    { role: 'ai', noResult: true, rephrase: ['换个说法'], messageId: 'mid2',
+      question: '问题二', handoffDone: true },
+    { role: 'ai' },                                                  // 无 blocks 无 noResult：丢
+  ]);
+  assert.equal(lean.length, 3);
+  assert.deepEqual(lean[0], { role: 'user', text: '问题一' });
+  assert.equal(lean[1].instant, true);
+  assert.equal(lean[1].guard, true);
+  assert.equal(lean[1].messageId, 'mid1');
+  assert.equal(lean[2].noResult, true);
+  assert.equal(lean[2].handoffDone, true);
+});
+
+test('leanMessages：超长会话截尾保最近 MAX_MESSAGES 条', () => {
+  const msgs = [];
+  for (let i = 0; i < MAX_MESSAGES + 10; i++) {
+    msgs.push({ role: 'user', text: 'q' + i });
+  }
+  const lean = leanMessages(msgs);
+  assert.equal(lean.length, MAX_MESSAGES);
+  assert.equal(lean[lean.length - 1].text, 'q' + (MAX_MESSAGES + 9)); // 保尾不保头
+});
+
+test('capIndex：按 updatedAt 倒序裁剪，evictedIds = 被淘汰的最旧行', () => {
+  const list = [
+    { id: 'old', updatedAt: 1 },
+    { id: 'new', updatedAt: 3 },
+    { id: 'mid', updatedAt: 2 },
+  ];
+  const r = capIndex(list, 2);
+  assert.deepEqual(r.list.map((c) => c.id), ['new', 'mid']);
+  assert.deepEqual(r.evictedIds, ['old']);
+  const r2 = capIndex(list, 10);
+  assert.equal(r2.evictedIds.length, 0);
 });

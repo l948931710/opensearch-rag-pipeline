@@ -1,4 +1,4 @@
-/* 图标字形类（Aurora-Forest v1.1 锁定图标集 → iconfont）。
+/* 图标字形类（v1.1 锁定图标集 → iconfont，主题无关）。
    字形来自 Lucide 官方字体的 15 字形子集（与原型 ICON.* 同源图标），
    @font-face 在 app.acss 注册（base64 woff2，2.8KB）。
    组件 acss 各自 @import 本文件 —— 类名在组件作用域内也可命中。

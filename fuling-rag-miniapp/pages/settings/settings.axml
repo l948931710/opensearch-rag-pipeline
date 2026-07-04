@@ -1,63 +1,66 @@
 <view class="settings-page">
+  <!-- 个人卡：身份信息聚合（姓名 + 角色徽章 + 可见范围 + 工号），不再散在下方单元格 -->
   <view class="profile-card">
     <view class="avatar"><text class="avatar-text">{{avatarChar}}</text></view>
     <view class="profile-meta">
-      <text class="profile-name">{{displayName || '未登录'}}</text>
+      <view class="profile-name-row">
+        <text class="profile-name">{{displayName || '未登录'}}</text>
+        <view a:if="{{roleLabel}}" class="admin-badge admin-badge-{{roleClass}}">
+          <view class="admin-badge-dot"></view>
+          <text>{{roleLabel}}</text>
+        </view>
+      </view>
       <text class="profile-dept">{{deptLabel || '部门未知'}}</text>
+      <text a:if="{{userId}}" class="profile-uid">工号 {{userId}}</text>
     </view>
   </view>
 
-  <view class="section card">
-    <view class="cell">
-      <text class="cell-label">部门</text>
-      <text class="cell-value">{{deptLabel || '—'}}</text>
-    </view>
-    <view class="cell">
-      <text class="cell-label">用户 ID</text>
-      <text class="cell-value">{{userId || '—'}}</text>
-    </view>
-    <view class="cell cell-last">
-      <text class="cell-label">会话 ID</text>
-      <text class="cell-value">{{sessionId || '—'}}</text>
-    </view>
-  </view>
-
-  <!-- 知识库管理入口：仅管理员可见（后端每个接口仍会再校验角色） -->
+  <!-- 知识库管理入口：仅管理员可见（后端每个接口仍会再校验角色）；
+       右侧标注管辖范围，与 kb-docs 工作台的角色横幅同词表 -->
   <view a:if="{{canManageKb}}" class="section">
+    <text class="section-title">知识库</text>
     <view class="card">
       <view class="cell cell-last cell-tap" onTap="onOpenKbConsole">
         <text class="cell-label">知识库管理</text>
         <view class="cell-right">
-          <text a:if="{{roleLabel}}" class="role-badge">{{roleLabel}}</text>
+          <text a:if="{{kbScopeLabel}}" class="cell-value-sub">{{kbScopeLabel}}</text>
           <text class="ico ico-chev-r cell-chev"></text>
         </view>
       </view>
     </view>
-    <text class="section-tip">上传 / 升版 / 管理本部门文档。</text>
+    <text class="section-tip">{{kbTip}}</text>
   </view>
 
   <view class="section">
+    <text class="section-title">会话与记录</text>
     <view class="card">
+      <view class="cell">
+        <text class="cell-label">本机会话</text>
+        <text class="cell-value">{{convCount}} 个</text>
+      </view>
       <view class="cell cell-tap" onTap="onOpenHistory">
         <text class="cell-label">历史问答</text>
         <text class="ico ico-chev-r cell-chev"></text>
       </view>
-      <view class="cell cell-last cell-tap" onTap="onClearSession">
-        <text class="cell-label">清除会话</text>
+      <view class="cell cell-last cell-tap" onTap="onClearConversations">
+        <text class="cell-label cell-label-danger">清空会话列表</text>
         <text class="ico ico-chev-r cell-chev"></text>
       </view>
     </view>
-    <text class="section-tip">清除后，下一次提问将开启全新会话（不影响历史问答记录）。</text>
+    <text class="section-tip">清空本机全部会话并开启新会话；历史问答记录不受影响。</text>
   </view>
 
-  <view class="section card">
-    <view class="cell">
-      <text class="cell-label">应用名称</text>
-      <text class="cell-value">富岭知识助手</text>
-    </view>
-    <view class="cell cell-last">
-      <text class="cell-label">版本</text>
-      <text class="cell-value">{{version}}</text>
+  <view class="section">
+    <text class="section-title">关于</text>
+    <view class="card">
+      <view class="cell">
+        <text class="cell-label">应用名称</text>
+        <text class="cell-value">富岭知识助手</text>
+      </view>
+      <view class="cell cell-last">
+        <text class="cell-label">版本</text>
+        <text class="cell-value">{{version}}</text>
+      </view>
     </view>
   </view>
 </view>

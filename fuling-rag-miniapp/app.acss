@@ -1,5 +1,6 @@
 /* ============================================================
-   富岭知识助手 — Aurora-Forest 设计令牌系统（v1.1 原型 1:1 移植）
+   富岭知识助手 — Aurora-Forest 设计令牌系统（v1.1 原型 1:1 移植；
+   2026-07-03 曾试藕粉 Lotus 换肤，用户看后要求改回 —— 本绿版为定稿）。
    浅色放 page{}；深色放 @media (prefers-color-scheme: dark)。
    令牌只放颜色/渐变/阴影/纹理 —— 尺寸一律写字面 rpx：
    rpx 写进 custom property 编译器不换算，是已知坑。
@@ -52,8 +53,8 @@ page {
   --sh-2: 0 1px 3px rgba(60, 50, 30, 0.07), 0 6px 16px rgba(60, 50, 30, 0.08);
   --sh-3: 0 10px 34px rgba(40, 35, 20, 0.16);
   --sh-brand: 0 4px 14px rgba(21, 96, 74, 0.26);
-  /* 棉纸 feTurbulence 纹理（待真机 Android 钉钉冒烟；不行换预栅格化 PNG，
-     分层声明保持 var(--paper), radial-gradient(...), var(--page) 不变，纯色优雅退化） */
+  /* 棉纸 feTurbulence 纹理（分层声明保持 var(--paper), radial-gradient(...), var(--page)，
+     纯色优雅退化） */
   --paper: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%27220%27%20height%3D%27220%27%3E%3Cfilter%20id%3D%27pp%27%3E%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%270.9%27%20numOctaves%3D%272%27%20stitchTiles%3D%27stitch%27%2F%3E%3CfeColorMatrix%20type%3D%27saturate%27%20values%3D%270%27%2F%3E%3CfeComponentTransfer%3E%3CfeFuncA%20type%3D%27linear%27%20slope%3D%270.05%27%2F%3E%3C%2FfeComponentTransfer%3E%3C%2Ffilter%3E%3Crect%20width%3D%27100%25%27%20height%3D%27100%25%27%20filter%3D%27url%28%23pp%29%27%2F%3E%3C%2Fsvg%3E");
   --user-bubble: var(--brand-strong);
   --scrim: rgba(15, 20, 15, 0.92);
@@ -115,4 +116,48 @@ textarea,
 scroll-view,
 image {
   box-sizing: border-box;
+}
+
+/* ---------- 管理员角色徽章（跨页共享：settings / kb-docs 工作台）----------
+   两种管理员一眼区分 = 实心 vs 描边的强对比：
+   · 知识库管理员（kb_admin）= 实心深绿 + 白字：全库最高权限
+   · 部门管理员（dept_admin）= 描边绿 + 绿字：本部门作用域
+   放 app.acss 因为两个页面都用（页面级 acss 不互通）。 */
+.admin-badge {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  font-size: 21rpx;
+  font-weight: 600;
+  line-height: 1.4;
+  border-radius: 999rpx;
+  padding: 4rpx 16rpx;
+  flex-shrink: 0;
+}
+
+/* 徽章前的小圆点：实心徽章用白点、描边徽章用绿点，再加一层区分冗余 */
+.admin-badge-dot {
+  width: 12rpx;
+  height: 12rpx;
+  border-radius: 50%;
+  margin-right: 8rpx;
+}
+
+.admin-badge-kb {
+  color: #ffffff;
+  background: var(--brand-strong);
+}
+
+.admin-badge-kb .admin-badge-dot {
+  background: #ffffff;
+}
+
+.admin-badge-dept {
+  color: var(--brand);
+  background: var(--brand-a16);
+  border: 1px solid var(--brand-a40);
+}
+
+.admin-badge-dept .admin-badge-dot {
+  background: var(--brand);
 }

@@ -12,7 +12,7 @@
      原型用 html[data-theme] 手动切换，便于截图对比两种模式。
      ======================================================================= */
   :root{
-    /* brand — Aurora Forest（深林绿 + 极光绿） */
+    /* brand — Aurora Forest（深林绿 + 极光绿；2026-07-03 曾试藕粉、用户要求改回） */
     --brand:#15604a; --brand-strong:#134f3e; --brand-press:#0e3f31; --brand-soft:#d9ebe2;
     /* 预计算 alpha 变体（替代 color-mix —— 旧版钉钉 WebView 不支持，整条声明会被丢弃） */
     --brand-a16:rgba(21,96,74,.16); --brand-a30:rgba(21,96,74,.30); --brand-a40:rgba(21,96,74,.40);
@@ -96,6 +96,48 @@
   /* 服务健康态：错误后降级（demo 演示；真实端由最近一次请求结果驱动） */
   .navbar.degraded .subtitle::before{background:#e0a93a;animation:none;}
   .navbar .more{font-size:20px;width:30px;text-align:center;opacity:.95;letter-spacing:1px;}
+  /* 导航左侧动作区 + 自绘字形（iconfont 子集无 menu/plus） */
+  .nav-actions{display:flex;align-items:center;gap:7px;flex-shrink:0;}
+  .nav-btn{width:30px;height:30px;border-radius:var(--r-sm);background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.26);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;transition:background var(--dur-2) var(--ease);}
+  .nav-btn:hover{background:rgba(255,255,255,.30);}
+  .nav-btn:focus-visible{outline:2px solid #fff;outline-offset:2px;}
+  .nav-ghost{width:67px;flex-shrink:0;}
+  .glyph-menu{width:15px;display:flex;flex-direction:column;}
+  .gm-bar{display:block;height:2px;border-radius:1px;background:#fff;}
+  .gm-mid{margin:4px 0;width:11px;}
+  .glyph-plus{position:relative;display:block;width:15px;height:15px;}
+  .gp-h,.gp-v{position:absolute;border-radius:1px;background:#fff;}
+  .gp-h{left:0;right:0;top:6.5px;height:2px;}
+  .gp-v{top:0;bottom:0;left:6.5px;width:2px;}
+  /* ---------- 会话抽屉 ---------- */
+  .drawer-scrim{position:absolute;inset:0;background:rgba(15,20,15,.45);opacity:0;pointer-events:none;transition:opacity .24s ease;z-index:90;border-radius:36px;}
+  .screen.drawer-on .drawer-scrim{opacity:1;pointer-events:auto;}
+  .drawer{position:absolute;top:0;bottom:0;left:0;width:78%;max-width:320px;background:var(--paper),var(--page);border-radius:36px 18px 18px 36px;box-shadow:var(--sh-3);transform:translateX(-105%);transition:transform .28s var(--ease);z-index:95;display:flex;flex-direction:column;}
+  .screen.drawer-on .drawer{transform:translateX(0);}
+  .drawer-head{padding:44px 16px 2px;}
+  .drawer-title{font-size:20px;font-weight:700;letter-spacing:1px;color:var(--text-1);}
+  .drawer-sub{margin-top:3px;font-size:var(--fs-xs);color:var(--text-3);}
+  .drawer-new{margin:12px 16px 6px;background:var(--brand-strong);border:0;border-radius:12px;padding:11px 0;display:flex;align-items:center;justify-content:center;gap:7px;box-shadow:var(--sh-brand);cursor:pointer;color:#fff;font-size:14px;font-weight:600;font-family:inherit;transition:background var(--dur-2) var(--ease);}
+  .drawer-new:hover{background:var(--brand-press);}
+  .drawer-new .glyph-plus{width:13px;height:13px;}
+  .drawer-new .gp-h{top:5.5px;}
+  .drawer-new .gp-v{left:5.5px;}
+  .drawer-list{flex:1;overflow-y:auto;padding:4px 10px 20px;}
+  .conv-item{display:flex;align-items:center;padding:11px 9px;border-radius:12px;margin-bottom:3px;cursor:pointer;transition:background var(--dur-2) var(--ease);}
+  .conv-item:hover{background:var(--surface-2);}
+  .conv-item.active{background:var(--brand-soft);}
+  .conv-dot{width:7px;height:7px;border-radius:50%;background:var(--line);margin-right:9px;flex-shrink:0;}
+  .conv-item.active .conv-dot{background:var(--brand);}
+  .conv-main{flex:1;min-width:0;}
+  .conv-title{font-size:13.5px;font-weight:500;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .conv-item.active .conv-title{font-weight:600;}
+  .conv-meta{display:flex;align-items:center;margin-top:3px;gap:5px;}
+  .conv-time{font-size:11px;color:var(--text-3);}
+  .conv-pill{font-size:10px;padding:1px 6px;border-radius:999px;}
+  .conv-pill.cloud{background:var(--surface-3);color:var(--text-3);}
+  .conv-pill.cur{background:var(--brand-a16);color:var(--brand);}
+  .conv-del{width:28px;height:28px;border-radius:50%;border:0;background:transparent;display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:13px;flex-shrink:0;cursor:pointer;transition:all var(--dur-2) var(--ease);}
+  .conv-del:hover{background:var(--danger-bg);color:var(--danger);}
 
   /* ---------- chat area ---------- */
   .chat{flex:1;overflow-y:auto;padding:14px 12px 8px;scroll-behavior:smooth;-webkit-overflow-scrolling:touch;}
@@ -107,6 +149,8 @@
   @keyframes rise{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;}}
   .avatar{width:34px;height:34px;border-radius:var(--r-sm);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;color:#fff;box-shadow:var(--sh-1);}
   .avatar.ai{background:var(--brand-grad);box-shadow:0 0 0 1px rgba(52,214,163,.18),0 4px 12px rgba(21,96,74,.22);}
+  /* AI 头像 · 极光新芽标（Lucide sprout 白描线；弃「富」字） */
+  .avatar-mark{display:block;width:21px;height:21px;background:url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27%23ffffff%27%20stroke-width%3D%272%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M7%2020h10%27%2F%3E%3Cpath%20d%3D%27M10%2020c5.5-2.5.8-6.4%203-10%27%2F%3E%3Cpath%20d%3D%27M9.5%209.4c1.1.8%201.8%202.2%202.3%203.7-2%20.4-3.5.4-4.8-.3-1.2-.6-2.3-1.9-3-4.2%202.8-.5%204.4%200%205.5.8z%27%2F%3E%3Cpath%20d%3D%27M14.1%206a7%207%200%200%200-1.1%204c1.9-.1%203.3-.6%204.3-1.4%201-1%201.6-2.3%201.7-4.6-2.7.1-4%201-4.9%202z%27%2F%3E%3C%2Fsvg%3E") center/contain no-repeat;}
   .avatar.me{background:var(--me-grad);}
 
   .msg.user{flex-direction:row-reverse;}
@@ -309,14 +353,62 @@
     <div class="screen">
       <div class="notch"></div>
 
-      <!-- nav（真实端建议 transparentTitle 自绘；subtitle 状态由最近一次请求结果驱动） -->
+      <!-- nav（真实端建议 transparentTitle 自绘；subtitle 状态由最近一次请求结果驱动；
+           右上被钉钉胶囊占用 → 自定义控件只放左侧：会话抽屉 + 新会话） -->
       <div class="navbar" id="navbar">
-        <div class="brandmark">富</div>
+        <div class="nav-actions">
+          <button class="nav-btn" id="drawerOpenBtn" aria-label="会话列表"><span class="glyph-menu"><span class="gm-bar"></span><span class="gm-bar gm-mid"></span><span class="gm-bar"></span></span></button>
+          <button class="nav-btn" id="newConvBtn" aria-label="新会话"><span class="glyph-plus"><span class="gp-h"></span><span class="gp-v"></span></span></button>
+        </div>
         <div class="title-wrap">
           <div class="title">富岭知识助手</div>
           <div class="subtitle" id="subtitle">企业知识库 · 在线</div>
         </div>
-        <div class="more">···</div>
+        <div class="nav-ghost"></div>
+      </div>
+
+      <!-- 会话抽屉（mock：真实端数据 = 本地缓存 × /api/conversations 合并） -->
+      <div class="drawer-scrim" id="drawerScrim"></div>
+      <div class="drawer" id="drawer">
+        <div class="drawer-head">
+          <div class="drawer-title">会话</div>
+          <div class="drawer-sub">4 个会话 · 每次对话自动保存</div>
+        </div>
+        <button class="drawer-new" id="drawerNewBtn"><span class="glyph-plus"><span class="gp-h"></span><span class="gp-v"></span></span>开启新会话</button>
+        <div class="drawer-list">
+          <div class="conv-item active">
+            <span class="conv-dot"></span>
+            <div class="conv-main">
+              <div class="conv-title">U8+ 如何登录？</div>
+              <div class="conv-meta"><span class="conv-time">刚刚</span><span class="conv-pill cur">当前</span></div>
+            </div>
+            <button class="conv-del" aria-label="删除会话">✕</button>
+          </div>
+          <div class="conv-item">
+            <span class="conv-dot"></span>
+            <div class="conv-main">
+              <div class="conv-title">请假流程是什么？年假额度怎么算</div>
+              <div class="conv-meta"><span class="conv-time">09:12</span></div>
+            </div>
+            <button class="conv-del" aria-label="删除会话">✕</button>
+          </div>
+          <div class="conv-item">
+            <span class="conv-dot"></span>
+            <div class="conv-main">
+              <div class="conv-title">注塑模具多久保养一次？</div>
+              <div class="conv-meta"><span class="conv-time">昨天</span><span class="conv-pill cloud">云端</span></div>
+            </div>
+            <button class="conv-del" aria-label="删除会话">✕</button>
+          </div>
+          <div class="conv-item">
+            <span class="conv-dot"></span>
+            <div class="conv-main">
+              <div class="conv-title">访客 WiFi 密码是多少？</div>
+              <div class="conv-meta"><span class="conv-time">3天前</span></div>
+            </div>
+            <button class="conv-del" aria-label="删除会话">✕</button>
+          </div>
+        </div>
       </div>
 
       <!-- chat -->
@@ -324,7 +416,7 @@
         <div class="day-divider"><span>今天 09:24</span></div>
         <!-- welcome card -->
         <div class="msg ai">
-          <div class="avatar ai">富</div>
+          <div class="avatar ai"><span class="avatar-mark"></span></div>
           <div class="ai-card">
             <div class="body">
               <p>您好👋 我是<strong>富岭知识助手</strong>。作业指导书（SOP）、U8+ 系统操作、考勤请假等人事行政制度，都可以直接问我。点下面的示例问题试试，或直接输入您的问题。</p>
@@ -681,7 +773,7 @@ function addSkeleton(){
   const m = document.createElement('div');
   m.className = 'msg ai';
   m.innerHTML = `
-    <div class="avatar ai">富</div>
+    <div class="avatar ai"><span class="avatar-mark"></span></div>
     <div class="ai-card skel">
       <div class="body">
         <div class="typing"><i></i><i></i><i></i></div>
@@ -702,7 +794,7 @@ function buildAiCard(answer){
   const m = document.createElement('div');
   m.className = 'msg ai';
   m.innerHTML = `
-    <div class="avatar ai">富</div>
+    <div class="avatar ai"><span class="avatar-mark"></span></div>
     <div class="ai-card" data-id="${id}">
       <div class="body">${answer.guard ? renderGuardNote() : ''}</div>
       ${renderSources(answer.sources)}
@@ -730,7 +822,7 @@ function buildErrorCard(){
   const m = document.createElement('div');
   m.className = 'msg ai';
   m.innerHTML = `
-    <div class="avatar ai">富</div>
+    <div class="avatar ai"><span class="avatar-mark"></span></div>
     <div class="ai-card error">
       <div class="body">
         <p>回答失败，请检查网络后重试。</p>
@@ -746,7 +838,7 @@ function buildNoResultCard(answer){
   const m = document.createElement('div');
   m.className = 'msg ai';
   m.innerHTML = `
-    <div class="avatar ai">富</div>
+    <div class="avatar ai"><span class="avatar-mark"></span></div>
     <div class="ai-card no-result">
       <div class="body">
         <div class="nr-ico">${ICON.search}</div>
@@ -1291,6 +1383,35 @@ QUICK.forEach(q=>{
 })();
 
 updateSendState();
+
+/* ── 会话抽屉 mock 交互（真实端：onOpenDrawer/onCloseDrawer/onSelectConv） ── */
+(function(){
+  const screenEl = document.querySelector('.screen');
+  const openBtn = document.getElementById('drawerOpenBtn');
+  const scrim = document.getElementById('drawerScrim');
+  const close = () => screenEl.classList.remove('drawer-on');
+  if (openBtn) openBtn.addEventListener('click', () => screenEl.classList.add('drawer-on'));
+  if (scrim) scrim.addEventListener('click', close);
+  document.querySelectorAll('.conv-item').forEach((row) => {
+    row.addEventListener('click', () => {
+      document.querySelectorAll('.conv-item').forEach((r) => r.classList.remove('active'));
+      row.classList.add('active');
+      close();
+    });
+  });
+  document.querySelectorAll('.conv-del').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const item = btn.closest('.conv-item');
+      if (item && confirm('删除该会话？（mock）')) item.remove();
+    });
+  });
+  const newBtns = [document.getElementById('newConvBtn'), document.getElementById('drawerNewBtn')];
+  newBtns.forEach((b) => b && b.addEventListener('click', () => {
+    document.querySelectorAll('.conv-item').forEach((r) => r.classList.remove('active'));
+    close();
+  }));
+})();
 </script>
 </body>
 </html>

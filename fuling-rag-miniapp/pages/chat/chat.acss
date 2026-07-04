@@ -1,4 +1,4 @@
-/* chat 页 — Aurora-Forest v1.1 原型 1:1 移植（prototype/index.html）。
+/* chat 页 — Aurora-Forest v1.1 原型 1:1 移植 + v0.3 会话抽屉。
    尺寸 = 原型 px × 2 rpx；间距用 margin 不用 gap（老核默默忽略 gap）；
    :hover/:focus-visible/cursor/user-select/scrollbar 等桌面伪类一律不写。 */
 
@@ -23,26 +23,82 @@
   flex-shrink: 0;
 }
 
-.brandmark,
-.brandmark-ghost {
-  width: 60rpx;
-  height: 60rpx;
+/* 导航左侧动作区（右侧被钉钉胶囊占用）：会话抽屉 + 新会话；ghost 等宽让标题居中 */
+.nav-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
   flex-shrink: 0;
 }
 
-.brandmark {
+.nav-ghost {
+  width: 134rpx;
+  flex-shrink: 0;
+}
+
+.nav-btn {
+  width: 60rpx;
+  height: 60rpx;
   border-radius: 20rpx;
-  background: rgba(255, 255, 255, 0.18);
-  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.26);
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 
-.brandmark-text {
-  font-size: 30rpx;
-  font-weight: 700;
-  color: #ffffff;
+.nav-btn + .nav-btn {
+  margin-left: 14rpx;
+}
+
+.nav-btn:active {
+  background: rgba(255, 255, 255, 0.30);
+}
+
+/* 自绘字形（iconfont 子集无 menu/plus，纯 view 绘制主题随动） */
+.glyph-menu {
+  width: 30rpx;
+  display: flex;
+  flex-direction: column;
+}
+
+.gm-bar {
+  height: 4rpx;
+  border-radius: 2rpx;
+  background: #ffffff;
+}
+
+.gm-mid {
+  margin: 8rpx 0;
+  width: 22rpx;
+}
+
+.glyph-plus {
+  position: relative;
+  width: 30rpx;
+  height: 30rpx;
+}
+
+.gp-h,
+.gp-v {
+  position: absolute;
+  border-radius: 2rpx;
+  background: #ffffff;
+}
+
+.gp-h {
+  left: 0;
+  right: 0;
+  top: 13rpx;
+  height: 4rpx;
+}
+
+.gp-v {
+  top: 0;
+  bottom: 0;
+  left: 13rpx;
+  width: 4rpx;
 }
 
 .title-wrap {
@@ -150,6 +206,17 @@
   background: var(--brand-grad);
   box-shadow: 0 0 0 1px rgba(52, 214, 163, 0.18), 0 4px 12px rgba(21, 96, 74, 0.22);
   margin-right: 16rpx;
+}
+
+/* AI 头像 · 极光新芽标（Lucide sprout 白描线，data-URI 与棉纸纹理同技术；
+   2026-07-03 用户拍板弃「富」字改图形标识。白线在深浅两套 brand-grad 上均可读） */
+.avatar-mark {
+  width: 42rpx;
+  height: 42rpx;
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27%23ffffff%27%20stroke-width%3D%272%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M7%2020h10%27%2F%3E%3Cpath%20d%3D%27M10%2020c5.5-2.5.8-6.4%203-10%27%2F%3E%3Cpath%20d%3D%27M9.5%209.4c1.1.8%201.8%202.2%202.3%203.7-2%20.4-3.5.4-4.8-.3-1.2-.6-2.3-1.9-3-4.2%202.8-.5%204.4%200%205.5.8z%27%2F%3E%3Cpath%20d%3D%27M14.1%206a7%207%200%200%200-1.1%204c1.9-.1%203.3-.6%204.3-1.4%201-1%201.6-2.3%201.7-4.6-2.7.1-4%201-4.9%202z%27%2F%3E%3C%2Fsvg%3E");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
 }
 
 .avatar-me {
@@ -733,4 +800,238 @@
 /* 键盘弹起时的附件栏避让：真机上钉钉语音入口条约 90rpx，垫高输入栏让出空间 */
 .input-bar.kb-pad {
   padding-bottom: calc(96rpx + env(safe-area-inset-bottom, 0px));
+}
+
+/* ---------- 会话抽屉（左滑面板 + scrim）---------- */
+.drawer-scrim {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(26, 15, 19, 0.45);
+  opacity: 0;
+  transition: opacity 0.24s ease;
+  z-index: 90;
+}
+
+.scrim-show {
+  opacity: 1;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 78%;
+  max-width: 640rpx;
+  background: var(--paper), var(--page);
+  border-top-right-radius: 36rpx;
+  border-bottom-right-radius: 36rpx;
+  box-shadow: var(--sh-3);
+  transform: translateX(-105%);
+  transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 95;
+  display: flex;
+  flex-direction: column;
+}
+
+.drawer-open {
+  transform: translateX(0);
+}
+
+.drawer-head {
+  padding-left: 32rpx;
+  padding-right: 32rpx;
+  padding-bottom: 4rpx;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.drawer-title {
+  margin-top: 20rpx;
+  font-size: 40rpx;
+  font-weight: 700;
+  letter-spacing: 2rpx;
+  color: var(--text-1);
+}
+
+.drawer-sub {
+  margin-top: 6rpx;
+  font-size: 23rpx;
+  color: var(--text-3);
+}
+
+.drawer-new {
+  margin: 24rpx 32rpx 12rpx;
+  background: var(--brand-strong);
+  border-radius: 24rpx;
+  padding: 22rpx 0;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--sh-brand);
+  flex-shrink: 0;
+}
+
+.drawer-new:active {
+  background: var(--brand-press);
+}
+
+.drawer-new .glyph-plus {
+  width: 26rpx;
+  height: 26rpx;
+}
+
+.drawer-new .gp-h {
+  top: 11rpx;
+}
+
+.drawer-new .gp-v {
+  left: 11rpx;
+}
+
+.drawer-new-label {
+  color: #ffffff;
+  font-size: 28rpx;
+  font-weight: 600;
+  margin-left: 14rpx;
+}
+
+.drawer-list {
+  flex: 1;
+  height: 0;
+  padding: 8rpx 20rpx 0;
+}
+
+.conv-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 22rpx 18rpx;
+  border-radius: 24rpx;
+  margin-bottom: 6rpx;
+}
+
+.conv-item:active {
+  background: var(--surface-2);
+}
+
+.conv-active {
+  background: var(--brand-soft);
+}
+
+.conv-dot {
+  width: 14rpx;
+  height: 14rpx;
+  border-radius: 50%;
+  background: var(--line);
+  margin-right: 18rpx;
+  flex-shrink: 0;
+}
+
+.conv-active .conv-dot {
+  background: var(--brand);
+}
+
+.conv-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.conv-title {
+  font-size: 27rpx;
+  font-weight: 500;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-active .conv-title {
+  font-weight: 600;
+}
+
+.conv-meta {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin-top: 6rpx;
+}
+
+.conv-time {
+  font-size: 22rpx;
+  color: var(--text-3);
+}
+
+.conv-cloud,
+.conv-current {
+  font-size: 20rpx;
+  padding: 2rpx 12rpx;
+  border-radius: 999rpx;
+  margin-left: 10rpx;
+}
+
+.conv-cloud {
+  background: var(--surface-3);
+  color: var(--text-3);
+}
+
+.conv-current {
+  background: var(--brand-a16);
+  color: var(--brand);
+}
+
+.conv-del {
+  width: 56rpx;
+  height: 56rpx;
+  border-radius: 50%;
+  margin-left: 8rpx;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.conv-del:active {
+  background: var(--danger-bg);
+}
+
+.conv-del-ico {
+  font-size: 26rpx;
+  color: var(--text-3);
+}
+
+.conv-del:active .conv-del-ico {
+  color: var(--danger);
+}
+
+.conv-empty {
+  padding: 80rpx 40rpx;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.conv-empty-title {
+  font-size: 27rpx;
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.conv-empty-desc {
+  font-size: 23rpx;
+  color: var(--text-3);
+  margin-top: 10rpx;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.drawer-foot-pad {
+  height: calc(40rpx + env(safe-area-inset-bottom, 0px));
 }

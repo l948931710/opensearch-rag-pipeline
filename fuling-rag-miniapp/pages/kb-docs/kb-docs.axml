@@ -1,9 +1,58 @@
 <view class="kb-page">
-  <!-- 顶部操作条 -->
+  <!-- 顶部操作条：标题 + 上传 -->
   <view class="topbar">
-    <text class="topbar-title">我的文档</text>
+    <text class="topbar-title">文档管理</text>
     <view class="btn-upload" onTap="onUpload">
       <text class="btn-upload-ico">＋</text><text>上传</text>
+    </view>
+  </view>
+
+  <!-- 管理员身份徽章行：知识库管理员=实心深绿 / 部门管理员=描边绿，一眼区分权限层级 -->
+  <view a:if="{{roleLabel}}" class="role-row">
+    <view class="admin-badge admin-badge-{{roleClass}}">
+      <view class="admin-badge-dot"></view>
+      <text>{{roleLabel}}</text>
+    </view>
+    <text a:if="{{scopeDesc}}" class="role-scope">{{scopeDesc}}</text>
+  </view>
+
+  <!-- 管理范围统计（/api/kb/stats，与文档列表同一作用域口径；取数失败整条隐藏 fail-open） -->
+  <view a:if="{{stats}}" class="stats-strip">
+    <view class="stat">
+      <text class="stat-num">{{stats.total}}</text>
+      <text class="stat-label">文档</text>
+    </view>
+    <view class="stat">
+      <text class="stat-num stat-ok">{{stats.online}}</text>
+      <text class="stat-label">已上线</text>
+    </view>
+    <view class="stat">
+      <text class="stat-num {{stats.pending ? 'stat-warn' : ''}}">{{stats.pending}}</text>
+      <text class="stat-label">待审核</text>
+    </view>
+    <view class="stat stat-last">
+      <text class="stat-num">+{{stats.newMonth}}</text>
+      <text class="stat-label">本月新增</text>
+    </view>
+  </view>
+
+  <!-- 待我审批（仅 kb_admin 且有待办时出现）：部门管理员上传的新文档在此放行/驳回 -->
+  <view a:if="{{approvals.length}}" class="appr-card">
+    <view class="appr-head">
+      <text class="appr-title">待我审批</text>
+      <text class="appr-count">{{approvals.length}}</text>
+    </view>
+    <view class="appr-item" a:for="{{approvals}}" a:key="docId">
+      <view class="appr-main">
+        <text class="appr-doc">{{item.title}}</text>
+        <text class="appr-meta">{{item.ownerDept}}{{item.ownerName ? ' · ' + item.ownerName : ''}} · v{{item.versionNo}}{{item.dateLabel ? ' · ' + item.dateLabel : ''}}</text>
+      </view>
+      <view class="appr-btn appr-reject" data-doc-id="{{item.docId}}" data-version-no="{{item.versionNo}}" data-title="{{item.title}}" onTap="onReject">
+        <text class="appr-btn-text appr-reject-text">驳回</text>
+      </view>
+      <view class="appr-btn appr-approve" data-doc-id="{{item.docId}}" data-version-no="{{item.versionNo}}" data-title="{{item.title}}" onTap="onApprove">
+        <text class="appr-btn-text appr-approve-text">通过</text>
+      </view>
     </view>
   </view>
 

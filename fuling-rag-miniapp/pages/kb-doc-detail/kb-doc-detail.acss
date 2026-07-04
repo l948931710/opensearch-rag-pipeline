@@ -113,8 +113,8 @@
 .ver-err {
   margin-top: 12rpx;
   font-size: 23rpx;
-  color: #dc2626;
-  background: rgba(239, 68, 68, 0.1);
+  color: var(--danger);
+  background: var(--danger-bg);
   border-radius: 12rpx;
   padding: 10rpx 16rpx;
   word-break: break-all;
@@ -134,11 +134,11 @@
   border-radius: 14rpx;
   padding: 4rpx 14rpx;
 }
-.badge-ok { color: #15604a; background: rgba(52, 214, 163, 0.18); }
+.badge-ok { color: var(--success); background: var(--success-bg); }
 .badge-busy { color: #2563eb; background: rgba(59, 130, 246, 0.14); }
 .badge-queue { color: var(--text-3); background: var(--surface-2); }
-.badge-warn { color: #b45309; background: rgba(245, 158, 11, 0.16); }
-.badge-fail { color: #dc2626; background: rgba(239, 68, 68, 0.14); }
+.badge-warn { color: var(--warn); background: var(--warn-bg); }
+.badge-fail { color: var(--danger); background: var(--danger-bg); }
 .badge-muted { color: var(--text-3); background: var(--surface-2); }
 
 /* ---------- 状态/骨架 ---------- */

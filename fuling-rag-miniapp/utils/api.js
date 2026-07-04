@@ -87,13 +87,25 @@ export function request(path, opts) {
  * ask(question, sessionId, opts) -> Promise<answer payload>
  * Calls POST /api/ask with the bearer token.
  *
- * opts.thinking: 深度思考（默认关闭，逐问生效）。思考显著更慢（30-90s+），
- * 默认 30s 超时必先爆 —— 该请求的超时放宽到 120s。
- * opts.onTask:   接收 RequestTask（骨架阶段「停止」按它 abort 真取消）。
+ * opts.thinking:       深度思考（默认关闭，逐问生效）。思考显著更慢（30-90s+），
+ *                      默认 30s 超时必先爆 —— 该请求的超时放宽到 120s。
+ * opts.conversationId: 客户端会话 ID（多会话线程归属）。服务端
+ *                      RAG_CONVERSATION_HISTORY 开启时按它落 qa_conversation，
+ *                      关闭时忽略 —— 无条件上送，向后兼容。
+ * opts.onTask:         接收 RequestTask（骨架阶段「停止」按它 abort 真取消）。
+ *
+ * sessionId 为空时不上送：服务端会新建 UUID 会话并在响应里返回 session_id，
+ * 调用方应把它记回当前会话（每个会话独立的 LLM 多轮记忆）。
  */
 export function ask(question, sessionId, opts) {
   const thinking = !!(opts && opts.thinking);
-  const data = { question, session_id: sessionId };
+  const data = { question };
+  if (sessionId) {
+    data.session_id = sessionId;
+  }
+  if (opts && opts.conversationId) {
+    data.conversation_id = opts.conversationId;
+  }
   if (thinking) {
     data.thinking = true;
   }
@@ -103,6 +115,31 @@ export function ask(question, sessionId, opts) {
     data,
     timeout: thinking ? 120000 : undefined,
     onTask: opts && opts.onTask,
+  });
+}
+
+// ── 多会话（与控制台同一组端点；RAG_CONVERSATION_HISTORY 关闭时列表恒空/404，
+//    前端以本地存储为准、服务端数据仅做合并增益）──────────────────────────
+
+/** getConversations() -> Promise<{items:[{conversation_id,title,updated_at}], has_more}> */
+export function getConversations() {
+  return request('/api/conversations?limit=50', { auth: true });
+}
+
+/**
+ * getConversationMessages(conversationId) -> Promise<{items, has_more}>
+ * items 与 /api/history 同构（question/answer/blocks/created_at/status），
+ * 图片 URL 服务端已重签。
+ */
+export function getConversationMessages(conversationId) {
+  return request('/api/conversations/' + encodeURIComponent(conversationId), { auth: true });
+}
+
+/** deleteConversation(conversationId) —— 服务端软隐藏；flag 关闭时 404（调用方按成功清理本地）。 */
+export function deleteConversation(conversationId) {
+  return request('/api/conversations/' + encodeURIComponent(conversationId), {
+    method: 'DELETE',
+    auth: true,
   });
 }
 
@@ -210,4 +247,16 @@ export function approveDoc(payload) {
 }
 export function rejectDoc(payload) {
   return request('/api/kb/reject', { method: 'POST', auth: true, data: payload });
+}
+
+/** 管理范围文档聚合（与 my-docs 同一 owner 作用域：dept_admin=本部门 / kb_admin=全库）。
+ * 返回 {total, active, retired, chunks, new_this_month, by_badge}。 */
+export function getKbStats() {
+  return request('/api/kb/stats', { auth: true });
+}
+
+/** kb_admin 待审批队列（content_process_status='PENDING_APPROVAL' 的版本）；
+ * 非 kb_admin 后端 403 —— 调用方按空列表处理。 */
+export function getPendingApprovals() {
+  return request('/api/kb/pending-approvals', { auth: true });
 }
