@@ -1,0 +1,61 @@
+name: Frontend
+
+# 从 ci.yml 拆出的前端门 + 新增小程序单测门。paths 过滤：纯后端推送不再白跑
+# npm ci + vitest + build（~30s/次）。workflow_dispatch 供手动验证工作流本身。
+# 注意：console/miniapp 任一目录变更会同时跑两个 job——都很便宜，不值得再细分。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "console-app/**"
+      - "fuling-rag-miniapp/**"
+      - ".github/workflows/frontend.yml"
+  pull_request:
+    paths:
+      - "console-app/**"
+      - "fuling-rag-miniapp/**"
+      - ".github/workflows/frontend.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # console-app（Vite/Vue3）：135 个 vitest + vue-tsc 类型检查（build 内含，package.json:8）。
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: console-app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console-app/package-lock.json
+      - name: Install (npm ci)
+        run: npm ci
+      - name: Test (vitest)
+        run: npm run test
+      - name: Build (vue-tsc 类型检查 + vite build)
+        run: npm run build
+
+  # 小程序纯函数单测（markdown/typewriter）：node 内置 runner，零依赖零安装，
+  # 与本地 `make miniapp-test` 完全同款——此前完全不在 CI。
+  miniapp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Test (node --test, 同 make miniapp-test)
+        run: node --test fuling-rag-miniapp/tests/units.test.mjs

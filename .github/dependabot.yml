@@ -1,0 +1,24 @@
+# Dependabot：actions 大版本迁移（Node20 → Node24 这类）与依赖 CVE 修复不再靠人肉发现。
+# 节奏刻意保守（solo 仓库）：每周一次、actions 全组一个 PR、pip/npm 各限 3 个开放 PR。
+# pip-audit 阻塞门（ci.yml security job）是兜底——dependabot 是"提前修"，audit 是"漏了就红"。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: npm
+    directory: /console-app
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

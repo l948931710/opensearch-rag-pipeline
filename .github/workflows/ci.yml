@@ -37,8 +37,8 @@ jobs:
       RAG_SIMULATE_OSS: "true"
       RAG_SIMULATE_OPENSEARCH: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           # perf#21：缓存 pip 下载目录（PyMuPDF/opensearch-py/oss2/dashscope/ha3-sdk 等重依赖树），
@@ -54,7 +54,24 @@ jobs:
       - name: Test (simulate mode — no external services)
         # perf F#48：xdist 并行（ubuntu runner 4 vCPU）；--dist loadgroup + conftest 分组钩子
         # 复刻 loadfile 语义并把共享本地栈的模块钉到同一 worker（CI 无本地 DB，该组多为 skip）。
-        run: python -m pytest tests/ -q -p no:cacheprovider -n auto --dist loadgroup
+        # 覆盖率只在 3.11 腿收集（与生产 serving 版本一致；避免 matrix 双跑重复产物），
+        # 先做可见性不设 fail-under 门槛——有基线可看之后再谈守住。
+        run: >-
+          python -m pytest tests/ -q -p no:cacheprovider -n auto --dist loadgroup
+          --junitxml=pytest-junit.xml
+          ${{ matrix.python-version == '3.11' && '--cov=opensearch_pipeline --cov-report=xml --cov-report=term' || '' }}
+      - name: Upload junit (failure only — 排障用，红了才值得留)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-junit-${{ matrix.python-version }}
+          path: pytest-junit.xml
+      - name: Upload coverage report (3.11)
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-xml
+          path: coverage.xml
 
   # DB 集成门：test job 是纯 simulate（无 MySQL），DB 集成模块（test_pipeline/
   # test_classification/test_concurrency/test_image_funnel 的 requires_local_db 族）在
@@ -95,8 +112,8 @@ jobs:
       RAG_RDS_DATABASE: fuling_knowledge
       RAG_RDS_OPERATION_DATABASE: fuling_operation
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
           cache: pip
@@ -129,16 +146,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # 全历史：gitleaks 既扫工作树也扫历史提交
       # 【阻塞】secret 扫描：默认规则 + .gitleaks.toml 白名单（测试合成假 key + 生产指纹非密钥）。
       # 价值主要在【防未来误提交】真凭证——当前 .mcp.json/.env.* 均 gitignored，工作树本就干净。
       - name: Secret scan (gitleaks)
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
           cache: pip
@@ -152,26 +169,3 @@ jobs:
           python -m pip install --upgrade pip pip-audit
           pip install -e ".[production,api,ocr]"
           python -m pip_audit --desc
-
-  # 前端门（console-app Vite/Vue3）：此前完全无 CI——135 个 vitest 与 vue-tsc 类型检查从未在
-  # 合并前跑过。本 job 把它们设为【阻塞】门：build 含 vue-tsc 类型检查（package.json:8），故无需
-  # 单独 typecheck 步。node 22 对齐本地工具链；构建产物（next-dist/）gitignore，仅作编译校验。
-  frontend:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: console-app
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: console-app/package-lock.json
-      - name: Install (npm ci)
-        run: npm ci
-      - name: Test (vitest)
-        run: npm run test
-      - name: Build (vue-tsc 类型检查 + vite build)
-        run: npm run build
