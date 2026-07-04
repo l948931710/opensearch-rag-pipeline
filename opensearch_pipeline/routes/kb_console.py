@@ -1423,6 +1423,11 @@ def kb_register(req: KbRegisterRequest, request: Request,
     except Exception as e:
         logger.error("kb_register 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"登记失败 (trace: {trace_id})")
+    # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：进了待审批队列就
+    # 即时告知 kb_admin——否则全靠人主动开控制台，公开件在队列里干等。
+    if requires_approval:
+        from opensearch_pipeline.admin_notify import notify_upload_approval
+        notify_upload_approval(owner_dept=owner, title=payload.get("title") or payload.get("filename") or doc_id)
     # 跨部门内容查重（按 ETag 字节指纹）：advisory，命中也不拦上传——仅在响应里提示，让上传者决定是否退役其一。
     # 升版（同 doc_id 换文件）天然不算重复，故仅新建查；fail-open。
     dups, dups_other = ([], 0)

@@ -232,6 +232,9 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
     write_audit(doc_id=req.doc_id, version_no=None, action_type="ACCESS_REQUEST_SUBMIT",
                 operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
                 message=f"owner={owner_dept} requester_depts={requester_depts}")
+    # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：归属部门管理员即时知晓待办
+    from opensearch_pipeline.admin_notify import notify_access_request
+    notify_access_request(owner_dept=owner_dept, doc_id=req.doc_id, requester_depts=requester_depts)
     return KbAccessRequestSubmitResponse(id=str(new_id), status="pending", already=False)
 
 
