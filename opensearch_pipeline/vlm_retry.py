@@ -104,18 +104,19 @@ def post_json_with_retry(
 ):
     """POST with bounded retry on *transient* failures (timeout / conn-abort / 429 / 5xx).
 
-    Why: the embedding path (pipeline_nodes 嵌入重试) already retries on
-    (429,500,502,503,504) — narrower than here, and without Retry-After; the
-    other DashScope call sites — classify / OCR / VLM funnel — had NONE, so a single
-    transient 429 (this account's documented fragility) lost a whole document's
-    classification or an image's OCR text / caption, making ingest quality
-    non-deterministic. This is a drop-in for ``requests.post``: it returns the
-    ``requests.Response`` untouched (the caller still inspects ``status_code``), and
-    only RETRIES transient errors — 4xx(≠429) and terminal exceptions surface
-    immediately. Honors a numeric ``Retry-After`` header.
+    Why: DashScope 瞬时失败（尤其 429，本账户已知脆弱点）曾散落多份手写重试且已漂移。
+    2026-07-03 收敛后这是唯一的 DashScope 瞬时重试策略：classify / OCR / VLM funnel /
+    embedding_client.embed_texts_native / pipeline_nodes Gemini 嵌入循环全部走这里 ——
+    429 + 全部 5xx + 瞬时网络异常重试，4xx(≠429) 与终止性异常立即上抛。This is a
+    drop-in for ``requests.post``: it returns the ``requests.Response`` untouched
+    (the caller still inspects ``status_code`` / calls ``raise_for_status``).
+    Honors a numeric ``Retry-After`` header.
+    （_push_chunks_to_ha3 是 HA3 Tea SDK 调用、非 requests.post，刻意保持自有重试
+    ——见该函数内注释。）
 
     ``post_fn`` defaults to ``requests.post`` but call sites SHOULD pass their own
-    module's ``requests.post`` so existing test monkeypatches keep working.
+    module's patch seam — ``requests.post``, or ``_http_post`` for modules on the
+    http_session 连接池 — so existing test monkeypatches keep working.
     """
     import time as _time
     if post_fn is None:
@@ -138,7 +139,10 @@ def post_json_with_retry(
                 attempt += 1
                 continue
             raise
-        if (resp.status_code == 429 or 500 <= resp.status_code < 600) and attempt < max_retries:
+        # tests/sim 可能给出无 status_code 的响应替身（裸 MagicMock 等）——只有真 int
+        # 才按状态码判瞬时；其余一律当非瞬时原样返回（与 requests.Response 行为无差异）。
+        _st = getattr(resp, "status_code", None)
+        if isinstance(_st, int) and (_st == 429 or 500 <= _st < 600) and attempt < max_retries:
             wait = _retry_after_seconds(resp) or base_backoff * (2 ** attempt)
             if label:
                 print(f"    ⚠️ {label} attempt {attempt + 1} HTTP {resp.status_code} "
