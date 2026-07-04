@@ -103,6 +103,34 @@ def _csv_to_text(raw_csv: str) -> str:
         return raw_csv
 
 
+def _read_text_with_fallback(local_path: str):
+    """读文本文件（txt/md/csv/html）的编码回退链，返回 (text, warnings)。
+
+    utf-8-sig 严格 → gb18030 严格 → utf-8 errors=replace + 可见警告。
+    此前单读 utf-8 errors="ignore"：GBK/GB2312（中文 Windows/Excel 导出默认编码）
+    的 CJK 字节几乎全被静默丢弃 → 文档被误判为空、或以乱码 DONE 入索引。
+    gb18030 是 GBK/GB2312 的超集且对纯 ASCII 无歧义（utf-8 先试保证真 utf-8 不会
+    被误判）；最后一档 replace 保留可解部分并打警告，让文档被标记而非静默糊掉。
+    """
+    with open(local_path, "rb") as f:
+        data = f.read()
+    warnings: List[str] = []
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            text = data.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = data.decode("utf-8", errors="replace")
+        warnings.append(
+            "Text decode fallback: file is neither valid utf-8 nor gb18030; "
+            "decoded with utf-8 errors=replace, content may be corrupted"
+        )
+    # 二进制读 + decode 不做 universal-newline 转换，自补（下游按 \n 分块）
+    return text.replace("\r\n", "\n").replace("\r", "\n"), warnings
+
+
 _VLM_CACHE_VALID_STATUSES = {"DISCARD_DECORATIVE", "ROUTE_TO_TEXT", "ROUTE_TO_VECTOR"}
 
 
@@ -1332,8 +1360,7 @@ class UnifiedExtractor:
         file_ext = task.get("file_ext", "txt").lower()
 
         try:
-            with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
-                raw_text = f.read()
+            raw_text, warnings = _read_text_with_fallback(local_path)
         except Exception as e:
             return ExtractionResult(
                 doc_id=task["doc_id"],
@@ -1371,6 +1398,7 @@ class UnifiedExtractor:
             text=flat_text,
             text_length=len(flat_text),
             blocks=blocks,
+            warnings=warnings,
         )
 
     # ── 嵌入图片通用处理 ──

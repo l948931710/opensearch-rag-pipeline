@@ -139,6 +139,54 @@ class TestUnifiedExtractor:
             assert "<p>" not in res.text and "<h1>" not in res.text
             assert "正文内容在这里" in res.text
 
+    def test_gbk_txt_cjk_survives(self, tmp_path):
+        """GBK 编码 txt（中文 Windows 默认导出）：CJK 内容必须存活，不得静默清空。
+
+        此前 errors="ignore" 单读 utf-8 会丢弃几乎全部 CJK 字节 → 文档被误判为空
+        或以乱码 DONE 入索引。
+        """
+        content = "# 质量检验标准\n\n注塑工艺参数要求：料筒温度 220 度，保压 3 秒。"
+        p = tmp_path / "doc.txt"
+        p.write_bytes(content.encode("gbk"))
+        task = {"doc_id": "d", "version_no": 1, "raw_key": "raw/admin/doc.txt",
+                "filename": "doc.txt", "file_ext": "txt", "local_path": str(p)}
+        res = self.extractor._extract_text(task)
+        assert "质量检验标准" in res.text
+        assert "注塑工艺参数要求" in res.text
+        assert res.warnings == []  # 成功走 gb18030 回退不算异常，不打警告
+
+    def test_gbk_csv_cjk_survives(self, tmp_path):
+        """GBK 编码 csv（中文 Excel 另存 CSV 的默认编码）：单元格 CJK 必须存活。"""
+        p = tmp_path / "doc.csv"
+        p.write_bytes("设备名称,清洗周期\n注塑机,每周一次\n".encode("gbk"))
+        task = {"doc_id": "d", "version_no": 1, "raw_key": "raw/admin/doc.csv",
+                "filename": "doc.csv", "file_ext": "csv", "local_path": str(p)}
+        res = self.extractor._extract_text(task)
+        assert res.extract_method == "csv_table"
+        assert "注塑机" in res.text and "每周一次" in res.text
+        assert res.warnings == []
+
+    def test_utf8_bom_stripped(self, tmp_path):
+        """utf-8-sig 先行：带 BOM 的 utf-8 文件正常解码且 BOM 不进正文。"""
+        p = tmp_path / "doc.txt"
+        p.write_bytes("# 标题\n\n正文内容".encode("utf-8-sig"))
+        task = {"doc_id": "d", "version_no": 1, "raw_key": "raw/admin/doc.txt",
+                "filename": "doc.txt", "file_ext": "txt", "local_path": str(p)}
+        res = self.extractor._extract_text(task)
+        assert "正文内容" in res.text
+        assert "﻿" not in res.text
+        assert res.warnings == []
+
+    def test_undecodable_bytes_flagged_not_silent(self, tmp_path):
+        """既非 utf-8 也非 gb18030 → replace 兜底 + 可见警告，文档被标记而非静默糊掉。"""
+        p = tmp_path / "doc.txt"
+        # 0xFF 在 utf-8 与 gb18030 中都是非法字节
+        p.write_bytes("可读前缀 ".encode("utf-8") + b"\xff\xff\xff")
+        task = {"doc_id": "d", "version_no": 1, "raw_key": "raw/admin/doc.txt",
+                "filename": "doc.txt", "file_ext": "txt", "local_path": str(p)}
+        res = self.extractor._extract_text(task)
+        assert any("decode fallback" in w for w in res.warnings)
+
     def test_mock_blocks_have_headings(self):
         task = {
             "doc_id": "DOC_TEST_002",
