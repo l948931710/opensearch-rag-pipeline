@@ -2343,6 +2343,17 @@ class DocumentChunker:
             chunk_index += 1
             _attach_pending_images(fallback_chunk)
 
+        # ──「绝不丢图」兜底：带 image_refs 的空文本载体补占位文本 ──
+        # 溢出 spillover / OCR-孤儿 fallback 的图片若既无 visual_summary 也无 ocr_text，
+        # 载体 chunk 保持空文本，node_validate_chunks 会按 empty_text/too_few_tokens
+        # 连图一起删（全维度复审 摄取#7）。占位写明张数，长度足以过 5-token 门槛；
+        # clause 路径的 _finalize_clause_with_images 已有同款处理。
+        for _c in chunks:
+            if not (_c.chunk_text or "").strip() and _c.extra.get("image_refs"):
+                _n = len(_c.extra["image_refs"])
+                _c.chunk_text = f"[图片] 本段为图片内容，共 {_n} 张（详见图片）"
+                _c.token_count = _estimate_tokens(_c.chunk_text)
+
         # ── Dedup: 去除重复的 table_chunk（DOCX 页眉表格重复问题）──
         chunks = self._dedup_table_chunks(chunks)
 

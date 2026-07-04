@@ -86,3 +86,33 @@ def test_short_paragraphs_no_image_stays_empty():
     chunker = DocumentChunker(split_mode="text", min_chunk_chars=50)
     chunks = chunker.chunk_from_blocks(blocks, doc_id="DOC_TEST_SHORT", version_no=1)
     assert len(chunks) == 0, f"纯短文无图应 0 chunk, 实际 {len(chunks)}"
+
+
+def test_orphan_images_without_summary_or_ocr_get_placeholder_text():
+    """全维度复审 摄取#7：图片既无 visual_summary 也无 ocr_text（ROUTE_TO_VECTOR 照片
+    常见）时，载体 chunk 原本空文本，node_validate_chunks 会按 empty_text/
+    too_few_tokens 连图一起删——「绝不丢图」兜底须补占位文本并过 5-token 门槛。"""
+    from opensearch_pipeline.pipeline_nodes import node_validate_chunks
+
+    blocks = [
+        {"block_type": "paragraph", "text": "短"},
+        _img_block(0, "", ""),
+        _img_block(1, "", ""),
+    ]
+    chunker = DocumentChunker(split_mode="text", min_chunk_chars=50)
+    chunks = chunker.chunk_from_blocks(
+        blocks, doc_id="DOC_TEST_EMPTY_CARRIER", version_no=1,
+        metadata={"title": "纯图片文档.docx"},
+    )
+    carriers = [c for c in chunks if c.extra.get("image_refs")]
+    assert carriers, f"应有图片载体 chunk, 实际类型: {[c.chunk_type for c in chunks]}"
+    for c in carriers:
+        assert c.chunk_text.strip(), "带图载体不得空文本"
+        assert c.token_count >= 5, f"占位文本须过 too_few_tokens 门槛, 实际 {c.token_count}"
+
+    # 端到端：validate 不丢任何带图载体
+    ctx = {"chunks": chunks}
+    node_validate_chunks(ctx)
+    kept_ids = {c.chunk_id for c in ctx["valid_chunks"]}
+    for c in carriers:
+        assert c.chunk_id in kept_ids, f"带图载体被 validate 丢弃: {c.chunk_id}"
