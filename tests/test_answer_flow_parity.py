@@ -243,6 +243,41 @@ class TestApiStreamBookkeeping:
     @patch("opensearch_pipeline.api.log_qa_session")
     @patch("opensearch_pipeline.api._append_to_history")
     @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=API_CHUNKS)
+    def test_stream_sources_frame_filtered_to_source_info_fields(
+        self, mock_retrieve, mock_append, mock_log, client
+    ):
+        """SSE 下发的 sources 帧须过滤成 SourceInfo 字段集（REST 靠 response_model 收口，
+        SSE 无该层）：内部 OSS key（source_image）/visual_summary/chunk_type 不外泄；
+        落库 cited_docs 保留完整字典（与 /api/ask 同源）。"""
+        srcs = [{"doc_id": "d1", "title": "员工手册", "section": "第三章", "score": 9.0,
+                 "level": "high", "relevance": 1.0, "preview": "正文…",
+                 "chunk_type": "step_card",
+                 "source_image": "processing/assets/hr/D1/img_0001.png",
+                 "visual_summary": "内部摘要"}]
+
+        def _stream_with_sources(*args, **kwargs):
+            yield f'data: {json.dumps({"type": "sources", "sources": srcs}, ensure_ascii=False)}\n\n'
+            yield 'data: {"type": "chunk", "content": "住宿申请"}\n\n'
+            yield 'data: {"type": "done", "model": "qwen-test", "usage": {}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        with patch("opensearch_pipeline.api.generate_answer_stream",
+                   side_effect=_stream_with_sources):
+            resp = client.post("/api/ask/stream", json={"question": "q", "pure_text": True})
+        assert resp.status_code == 200
+        sent = [json.loads(line[len("data: "):]) for line in resp.text.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"]
+        frame = next(f for f in sent if f.get("type") == "sources")
+        assert frame["sources"][0]["doc_id"] == "d1"
+        assert frame["sources"][0]["preview"] == "正文…"
+        for leaked in ("source_image", "visual_summary", "chunk_type"):
+            assert leaked not in frame["sources"][0], leaked
+        # 落库侧保持完整（分析/反馈上下文快照需要）
+        assert mock_log.call_args.kwargs["cited_docs"] == srcs
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api._append_to_history")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich", return_value=API_CHUNKS)
     def test_stream_partial_answer_on_error_history(
         self, mock_retrieve, mock_append, mock_log, client
     ):

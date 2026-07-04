@@ -885,9 +885,19 @@ def ask_stream(req: AskRequest, request: Request,
                     if event.strip() == "data: [DONE]":
                         continue
                     frame = parse_sse_data_frame(event)
-                    # sources 帧顺手截留作 cited_docs 落库（帧本身照常透传给客户端）
+                    # sources 帧：完整字典截留作 cited_docs 落库（与 /api/ask 同源），
+                    # 但下发前过滤成 SourceInfo 字段集——REST 靠 response_model 收口，
+                    # SSE 透传没有那层，原样转发会把内部 OSS key（source_image）、
+                    # visual_summary、chunk_type 泄给任意 SSE 客户端（两前端响应契约也不一致）。
                     if frame is not None and frame.get("type") == "sources":
                         stream_sources = frame.get("sources") or None
+                        _fields = set(SourceInfo.model_fields)
+                        frame["sources"] = [
+                            {k: v for k, v in (s or {}).items() if k in _fields}
+                            for s in (frame.get("sources") or [])
+                        ]
+                        yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
+                        continue
                     # done 帧补 guard 后再下发（流式也能显示低置信提示条）；其余帧原样透传
                     if frame is not None and frame.get("type") == "done":
                         model_name = frame.get("model")
