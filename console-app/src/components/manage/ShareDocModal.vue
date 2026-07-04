@@ -34,12 +34,14 @@ function levelDisabled(l: { key: string; kbAdminOnly?: boolean }): boolean {
 
 const granted = computed(() => (shareCtx.value ? grantedDeptsOf(shareCtx.value.doc_id) : []))
 const rows = computed<AccessGrantItem[]>(() => (shareCtx.value ? docGrantRows(shareCtx.value.doc_id) : []))
-// 可选目标 = 组码 − 归属自身/伞组 − 已放行
+// 可选目标 = 组码 − 归属自身 − 已放行。伞组/共享面冗余判定交后端闭集 taxonomy（不再前端
+// startswith 预判：闭集外子线如 production_papercup 检索 fail-closed，"共享给 production"
+// 恰是唯一放行通道，前缀预判会把救济入口藏掉；真冗余由后端 skipped 返回并如实提示）。
 const options = computed(() => {
   const d = shareCtx.value
   if (!d) return []
   const covered = new Set(granted.value)
-  return shareTargets.filter((t) => t !== d.owner_dept && !d.owner_dept.startsWith(t + '_') && !covered.has(t))
+  return shareTargets.filter((t) => t !== d.owner_dept && !covered.has(t))
 })
 
 function toggle(t: string) {

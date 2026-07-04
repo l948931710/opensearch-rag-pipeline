@@ -2,7 +2,7 @@ import { computed, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import {
-  GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
+  GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
 
 // 知识库管理台单例 store。身份/可管部门复用 P1 的 session（whoami 已给 managed_owner_depts），
@@ -139,6 +139,11 @@ const newShareDepts = ref<string[]>([])       // newPerm='shared' 时的共享�
 // 主动共享弹窗（owner 侧）：把自己部门的 dept_internal 文档直接放行给指定部门（POST /api/kb/access-grants）。
 const shareCtx = ref<DocItem | null>(null)
 const shareBusy = ref(false)
+// 「谁能看到这篇文档」解释器弹窗（只读）：GET /api/kb/visibility-explain。
+const visCtx = ref<DocItem | null>(null)
+const visExplain = ref<VisExplain | null>(null)
+const visLoading = ref(false)
+const visErr = ref('')
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
 const SHARE_TARGETS = Object.keys(GROUP_LABEL)
 const verCtx = ref<VerCtx | null>(null)
@@ -795,6 +800,40 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
 // 后端直插 approved 行并复用 Phase D 投影；撤销/清单/审批历史与被动流同一套。
 interface GrantCreateResp { doc_id: string; granted: string[]; skipped: string[]; ok: boolean }
 
+// 「谁能看到这篇文档」解释器响应（与后端 KbVisibilityExplainResponse 对齐；判定与检索同源）。
+export interface VisReader { dept: string; via: 'owner' | 'umbrella' | 'shared_policy' | 'grant' }
+export interface VisExplain {
+  doc_id: string; owner_dept: string; permission_level: string
+  everyone: boolean; nobody: boolean; quarantined: boolean; active: boolean
+  readers: VisReader[]
+}
+
+/** 打开「谁能看到」弹窗并拉取解释（只读；失败在弹窗内显示错误）。 */
+async function openVisibility(d: DocItem): Promise<void> {
+  visCtx.value = d
+  visExplain.value = null
+  visErr.value = ''
+  visLoading.value = true
+  try {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') {
+      visExplain.value = {
+        doc_id: d.doc_id, owner_dept: d.owner_dept, permission_level: d.permission_level,
+        everyone: d.permission_level === 'public', nobody: d.permission_level === 'restricted',
+        quarantined: false, active: true,
+        readers: d.permission_level === 'dept_internal'
+          ? [{ dept: d.owner_dept, via: 'owner' }, { dept: 'hr', via: 'grant' }] : [],
+      }
+      return
+    }
+    visExplain.value = await apiJson<VisExplain>(
+      `/api/kb/visibility-explain?doc_id=${encodeURIComponent(d.doc_id)}`, { auth: true })
+  } catch (e: any) {
+    visErr.value = e && e.status === 403 ? (e.detail || '无权查看该文档的可见范围明细') : uploadErrText(e)
+  } finally { visLoading.value = false }
+}
+function closeVisibility() { visCtx.value = null; visExplain.value = null; visErr.value = '' }
+
 /** 该文档现行已放行的组码集合（含被动流 CSV 行拆分）——驱动弹窗「已共享」与台账副行计数。 */
 function grantedDeptsOf(docId: string): string[] {
   const out = new Set<string>()
@@ -837,13 +876,17 @@ function shareResultNote(gr: GrantCreateResp | null): string {
   return ''
 }
 
-/** 弹窗提交：共享 shareCtx 文档给所选部门。返回 null=成功关闭；string=错误文案（弹窗内联显示）。 */
+/** 弹窗提交：共享 shareCtx 文档给所选部门。返回 null=成功关闭；string=错误/提示文案（弹窗内联显示）。
+ * 全部目标被后端跳过（伞组/共享面本就可读）→ 不关弹窗、如实提示——不能让用户以为写了授权。 */
 async function submitShare(depts: string[], reason: string): Promise<string | null> {
   const d = shareCtx.value
   if (!d || !depts.length) return '请选择要共享的部门'
   shareBusy.value = true
   try {
-    await createGrants(d.doc_id, depts, reason)
+    const r = await createGrants(d.doc_id, depts, reason)
+    if (r && !r.granted?.length && r.skipped?.length) {
+      return `所选部门本就可读该文档（生产伞组/营销共享面覆盖），无需新增授权：${r.skipped.map(deptLabel).join('、')}`
+    }
     shareCtx.value = null
     return null
   } catch (e: any) {
@@ -1014,6 +1057,7 @@ export function useKb() {
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
     openShare, closeShare, submitShare, grantedDeptsOf, docGrantRows, setVisibility,
+    visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,

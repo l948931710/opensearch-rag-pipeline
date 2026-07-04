@@ -36,6 +36,12 @@ export const PERM_LABEL: Record<string, string> = {
 }
 export const permLabel = (p: string) => PERM_LABEL[p] || p
 
+// 「谁能看到」解释器：读者来源 → 中文短标（与后端 KbVisibilityReader.via 对齐）。
+export const VIA_LABEL: Record<string, string> = {
+  owner: '归属部门', umbrella: '生产伞组', shared_policy: '营销共享面', grant: '跨部门授权',
+}
+export const viaLabel = (v: string) => VIA_LABEL[v] || v
+
 // 角色 → 中文。
 export const ROLE_LABEL: Record<string, string> = {
   kb_admin: '知识库管理员', dept_admin: '部门管理员', employee: '员工',

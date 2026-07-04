@@ -28,6 +28,7 @@ function routeFetch(map: Record<string, any>) {
       return map.grants ?? jsonResp({ items: [] })
     }
     if (path.startsWith('/api/kb/set-visibility')) return map.setVis ?? jsonResp({ doc_id: 'D', permission_level: 'restricted', changed: true })
+    if (path.startsWith('/api/kb/visibility-explain')) return map.visExplain ?? jsonResp({}, { ok: false, status: 404 })
     return jsonResp({}, { ok: false, status: 404 })
   })
 }
@@ -414,6 +415,42 @@ describe('useKb 主动共享（多部门可见度）', () => {
     const post = fetchMock.mock.calls.find(([p, i]) => String(p).startsWith('/api/kb/access-grants') && i?.method === 'POST')!
     expect(JSON.parse(post[1].body)).toMatchObject({ doc_id: 'DOC_S', target_depts: ['rd', 'quality'] })
     expect(kb.uploadMsg.value).toContain('已共享 2 部门')
+  })
+
+  it('openVisibility：拉取解释并落 visExplain；403 → visErr 文案', async () => {
+    const explain = {
+      doc_id: 'D1', owner_dept: 'production_mold', permission_level: 'dept_internal',
+      everyone: false, nobody: false, quarantined: false, active: true,
+      readers: [{ dept: 'production', via: 'umbrella' }, { dept: 'marketing', via: 'shared_policy' }],
+    }
+    vi.stubGlobal('fetch', routeFetch({ visExplain: jsonResp(explain) }))
+    const kb = useKb()
+    setIdentity('kb_admin', ['production'])
+    await kb.openVisibility({ ...doc, doc_id: 'D1', owner_dept: 'production_mold' })
+    expect(kb.visCtx.value?.doc_id).toBe('D1')
+    expect(kb.visExplain.value?.readers.map((r) => r.via)).toEqual(['umbrella', 'shared_policy'])
+    kb.closeVisibility()
+    expect(kb.visCtx.value).toBeNull()
+    expect(kb.visExplain.value).toBeNull()
+    // 403：错误进 visErr（弹窗内联显示，可重试）
+    vi.stubGlobal('fetch', routeFetch({ visExplain: jsonResp({ detail: '无权查看该文档的可见范围明细' }, { ok: false, status: 403 }) }))
+    await kb.openVisibility(doc)
+    expect(kb.visErr.value).toContain('无权查看')
+    expect(kb.visExplain.value).toBeNull()
+    kb.closeVisibility()
+  })
+
+  it('submitShare 全部目标被跳过（伞组/共享面覆盖）→ 不关弹窗、如实提示无新增授权', async () => {
+    vi.stubGlobal('fetch', routeFetch({
+      grantCreate: jsonResp({ doc_id: 'D1', granted: [], skipped: ['production'], ok: true }),
+    }))
+    const kb = useKb()
+    setIdentity('kb_admin', ['production'])
+    kb.openShare(doc)
+    const msg = await kb.submitShare(['production'], '')
+    expect(msg).toContain('无需新增授权')
+    expect(kb.shareCtx.value?.doc_id).toBe('D1')     // 不关闭——用户须知道没写任何行
+    kb.closeShare()
   })
 
   it('共享目标全被后端跳过（已覆盖/伞下冗余）→ 文案如实，不谎报「已共享」', async () => {

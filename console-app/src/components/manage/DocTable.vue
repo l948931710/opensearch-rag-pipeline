@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X } from 'lucide-vue-next'
+import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye } from 'lucide-vue-next'
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
@@ -14,7 +14,7 @@ const {
   docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, ownerOptions, sortKey, sortDir, isDeptAdmin, isKbAdmin,
   setQuery, sortBy, countOf, setScope, enterVersionMode, retire, restore, openHistory,
   openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
-  openShare, grantedDeptsOf,
+  openShare, grantedDeptsOf, openVisibility,
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
 } = useKb()
 
@@ -275,6 +275,13 @@ async function onRestore(d: DocItem) {
         <div class="led-cell led-actions doc-actions" data-label="操作">
           <!-- 可操作（本部门 / kb_admin）：历史 / 升版 / 退役 -->
           <template v-if="d.can_manage !== false">
+            <button
+              type="button" data-testid="doc-visibility"
+              class="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              title="谁能看到这篇文档" @click="openVisibility(d)"
+            >
+              <Eye :size="13" :stroke-width="1.75" /> 可见
+            </button>
             <button
               v-if="canManagePerm(d)"
               type="button" data-testid="doc-share"

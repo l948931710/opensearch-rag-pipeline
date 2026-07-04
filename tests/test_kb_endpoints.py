@@ -726,6 +726,80 @@ def test_grant_create_marketing_on_production_family_skipped(monkeypatch):
     assert len(inserts) == 1 and inserts[0][1][4] == "hr"
 
 
+# ── GET /api/kb/visibility-explain：「谁能看到这篇文档」解释器（只读）──────────
+def test_visibility_explain_dept_internal_with_grants(monkeypatch):
+    """dept_internal：owner 组 + 授权部门；与检索同源（marketing 无伞/共享 → 只有自身）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [
+        ("marketing", "dept_internal", "active", 1),      # document_meta
+        (None, None),                                     # document_version（未隔离）
+        [("hr,rd",), ("quality",)],                       # approved 授权行（含 CSV）
+    ])
+    from opensearch_pipeline import api
+    resp = api.kb_visibility_explain(request=None, doc_id="D1", identity=api.Identity(user_id="da1"))
+    assert resp.everyone is False and resp.nobody is False
+    got = {(r.dept, r.via) for r in resp.readers}
+    assert ("marketing", "owner") in got
+    assert {("hr", "grant"), ("rd", "grant"), ("quality", "grant")} <= got
+    assert resp.readers[0].dept == "marketing"            # 归属组排最前
+
+
+def test_visibility_explain_production_subline_semantics(monkeypatch):
+    """production_mold：读者 = production（伞组）+ marketing（共享面）——与
+    retriever._expand_groups_to_owners 同源反查，绝无第二份规则。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [
+        ("production_mold", "dept_internal", "active", 2),
+        (None, None),
+        [],
+    ])
+    from opensearch_pipeline import api
+    resp = api.kb_visibility_explain(request=None, doc_id="D2", identity=api.Identity(user_id="adm1"))
+    got = {(r.dept, r.via) for r in resp.readers}
+    assert got == {("production", "umbrella"), ("marketing", "shared_policy")}
+
+
+def test_visibility_explain_public_and_restricted(monkeypatch):
+    """public → everyone；restricted → nobody（授权行即便存在也不外露）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [("hr", "public", "active", 1), (None, None)])
+    from opensearch_pipeline import api
+    r1 = api.kb_visibility_explain(request=None, doc_id="D3", identity=api.Identity(user_id="adm1"))
+    assert r1.everyone is True and r1.readers == []
+    _stub_multi(monkeypatch, [("hr", "restricted", "active", 1), (None, None)])
+    r2 = api.kb_visibility_explain(request=None, doc_id="D4", identity=api.Identity(user_id="adm1"))
+    assert r2.nobody is True and r2.readers == []
+
+
+def test_visibility_explain_quarantined_shows_nobody(monkeypatch):
+    """隔离件：nobody + quarantined 旗标（不在检索中，覆盖一切授权）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [
+        ("hr", "dept_internal", "active", 1),
+        ("QUARANTINED", "quarantined"),
+    ])
+    from opensearch_pipeline import api
+    resp = api.kb_visibility_explain(request=None, doc_id="D5", identity=api.Identity(user_id="adm1"))
+    assert resp.nobody is True and resp.quarantined is True and resp.readers == []
+
+
+def test_visibility_explain_foreign_dept_forbidden(monkeypatch):
+    """作用域：非归属部门管理员 403（授权清单不对只读浏览者外露）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _stub_multi(monkeypatch, [("hr", "dept_internal", "active", 1)])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_visibility_explain(request=None, doc_id="D6", identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
 def test_grant_create_kb_admin_allowed(monkeypatch):
     """kb_admin 可对任意归属文档主动共享（_kb_can_manage 全权）。"""
     _skip_if_not_sim()

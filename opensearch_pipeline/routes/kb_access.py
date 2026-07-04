@@ -449,6 +449,105 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
     return KbAccessGrantCreateResponse(doc_id=req.doc_id, granted=granted, skipped=skipped, ok=True)
 
 
+class KbVisibilityReader(BaseModel):
+    """有效可见范围里的一个读者组：dept=组码（前端 deptLabel 转中文），via=来源。"""
+    dept: str = ""
+    via: str = "owner"        # owner=归属部门 / umbrella=生产伞组 / shared_policy=营销共享面 / grant=跨部门授权
+
+
+class KbVisibilityExplainResponse(BaseModel):
+    doc_id: str = ""
+    owner_dept: str = ""
+    permission_level: str = "dept_internal"
+    everyone: bool = False    # public：全公司可检索
+    nobody: bool = False      # restricted / 非在线 / 隔离：不进检索
+    quarantined: bool = False # 安全隔离（chunk 停用；唯一出路=脱敏重灌）
+    active: bool = True
+    readers: List[KbVisibilityReader] = Field(default_factory=list)
+
+
+@router.get("/api/kb/visibility-explain", response_model=KbVisibilityExplainResponse)
+def kb_visibility_explain(request: Request, doc_id: str = "",
+                          identity: Optional[Identity] = Depends(current_identity)):
+    """「谁能看到这篇文档」解释器（只读）：把 基础级别 + 组语义（production 伞组 /
+    marketing 共享面）+ 跨部门授权（approved 行）折叠成一份有效可见范围清单。
+
+    判定与检索侧同源：逐组用 retriever._expand_groups_to_owners 反查「哪些用户组的
+    owner 扩展覆盖本文档 owner_dept」——绝不在这里手写第二份伞组/共享面规则
+    （闭集 taxonomy 变了这里自动跟上）。授权：_kb_can_manage（文档归属部门管理员 /
+    kb_admin）——授权清单含其他部门名单，不对只读浏览者外露。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    trace_id = get_request_id()
+    grant_depts: List[str] = []
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm = (row[0] or ""), (row[1] or "dept_internal")
+                status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权查看该文档的可见范围明细")
+                cur.execute(f"SELECT publish_status, gate_status FROM {_kb_db()}.document_version "
+                            "WHERE doc_id=%s AND version_no=%s", (doc_id, cur_ver))
+                vrow = cur.fetchone()
+                quarantined = bool(vrow and (str(vrow[0] or "").upper() == "QUARANTINED"
+                                             or str(vrow[1] or "").lower() == "quarantined"))
+                if perm == "dept_internal":
+                    cur.execute(f"SELECT requester_depts FROM {_kb_db()}.kb_access_request "
+                                "WHERE doc_id=%s AND status='approved'", (doc_id,))
+                    _seen_g = set()
+                    for (csv,) in (cur.fetchall() or []):
+                        for p in str(csv or "").split(","):
+                            p = p.strip()
+                            if p and p not in _seen_g:
+                                _seen_g.add(p)
+                                grant_depts.append(p)
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_visibility_explain 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"可见范围查询失败 (trace: {trace_id})")
+
+    active = str(status).lower() == "active"
+    resp = KbVisibilityExplainResponse(doc_id=doc_id, owner_dept=owner_dept,
+                                       permission_level=perm, active=active,
+                                       quarantined=quarantined)
+    if quarantined or not active or perm == "restricted":
+        resp.nobody = True        # 隔离/退役/受限：不在检索中（优先级最高，覆盖一切授权）
+        return resp
+    if perm == "public":
+        resp.everyone = True
+        return resp
+    # dept_internal：与检索同源反查——owner 组自身 / production 伞 / marketing 共享面
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS, _expand_groups_to_owners
+    readers: List[KbVisibilityReader] = []
+    covered = set()
+    for g in sorted(_VALID_ACL_GROUPS, key=lambda x: (x != owner_dept, x)):   # 归属组排最前
+        if owner_dept in _expand_groups_to_owners([g]):
+            via = ("owner" if g == owner_dept
+                   else "umbrella" if g == "production" else "shared_policy")
+            readers.append(KbVisibilityReader(dept=g, via=via))
+            covered.add(g)
+    for g in grant_depts:
+        if g not in covered:
+            readers.append(KbVisibilityReader(dept=g, via="grant"))
+            covered.add(g)
+    resp.readers = readers
+    return resp
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 审批历史 (Approval History) — 只读聚合，四条审批流的【历史决策】合并时间线。
 #   dept_admin：见本部门的 access（跨部门检索授权）+ contribution（知识贡献采纳）历史；

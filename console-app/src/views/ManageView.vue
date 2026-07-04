@@ -16,6 +16,7 @@ import DocTable from '@/components/manage/DocTable.vue'
 import VersionHistoryModal from '@/components/manage/VersionHistoryModal.vue'
 import AccessRequestModal from '@/components/manage/AccessRequestModal.vue'
 import ShareDocModal from '@/components/manage/ShareDocModal.vue'
+import VisibilityModal from '@/components/manage/VisibilityModal.vue'
 import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
@@ -181,6 +182,7 @@ onMounted(async () => {
     <VersionHistoryModal />
     <AccessRequestModal />
     <ShareDocModal />
+    <VisibilityModal />
     <ConfirmDialog />
   </div>
 </template>
