@@ -152,8 +152,11 @@ body {
 
 /* 答案 markdown（renderMd 产出，v-html 注入；内容已转义防注入）—— Atlas .md 风格 */
 .md { font-size: 14.5px; line-height: 1.68; color: var(--text); }
-.md > *:first-child { margin-top: 0; }
-.md > *:last-child { margin-bottom: 0; }
+/* [data-seg]：流式双节点拆分的布局透明分段包裹（AnswerBlocks，Perf-5）——display:contents
+   让内部块仍按 .md 直属块排版；首末边距规则同步穿透一层（裸规则对无盒的 seg 本身无效果，无害）。 */
+.md > [data-seg] { display: contents; }
+.md > *:first-child, .md > [data-seg]:first-child > *:first-child { margin-top: 0; }
+.md > *:last-child, .md > [data-seg]:last-child > *:last-child { margin-bottom: 0; }
 .md h3 { font-size: 15px; font-weight: 600; margin: 18px 0 8px; letter-spacing: -.005em; }
 .md p { margin: 0 0 12px; }
 .md .md-li { position: relative; margin: 5px 0; padding-left: 22px; }
@@ -178,8 +181,11 @@ body {
 .md pre code .c-comment { color: var(--c-comment); font-style: italic; }
 .md pre code .c-fn { color: var(--c-fn); }
 
-/* 流式光标：仅生成中（.is-streaming）显示于最后一个块的末尾，随节奏轻闪——"正在书写"的信号。 */
-.md.is-streaming > *:last-child::after {
+/* 流式光标：仅生成中（.is-streaming）显示于最后一个块的末尾，随节奏轻闪——"正在书写"的信号。
+   :not([data-seg]) 防双光标：seg 包裹是 display:contents，其 ::after 会被展平成 .md 的子盒
+   （光标掉到段落下一行）——光标只挂在 seg 内部的最后一个真实块上。 */
+.md.is-streaming > *:last-child:not([data-seg])::after,
+.md.is-streaming > [data-seg]:last-child > *:last-child::after {
   content: "";
   display: inline-block;
   width: 0.5em;
@@ -192,7 +198,8 @@ body {
 }
 @keyframes caret-blink { 0%, 52% { opacity: .9; } 52.01%, 100% { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) {
-  .md.is-streaming > *:last-child::after { animation: none; opacity: .9; }
+  .md.is-streaming > *:last-child:not([data-seg])::after,
+  .md.is-streaming > [data-seg]:last-child > *:last-child::after { animation: none; opacity: .9; }
 }
 
 /* content_blocks 定稿：图片块淡入就位（文本保持不变，避免流式文字重渲闪烁）——平滑"打字→图文定稿"交接。 */

@@ -34,6 +34,11 @@ export interface ChatMessage {
   stageText?: string
   raw?: string             // 累积的流式原始文本
   html?: string            // 渲染后的纯文本答案
+  // 流式双节点拆分（Perf-5）：定稿前缀 / 推进尾段各占一个 v-html 节点——此前每 tick 整段
+  // innerHTML 替换，md 解析已增量化但 DOM 仍全量重建。拆分后每帧只有尾段节点变（stable
+  // 字符串不变 → Vue 跳过 patch）。仅流式期存在；定稿/停止/图文帧后清空回单节点权威渲染。
+  _htmlStable?: string
+  _htmlTail?: string
   viewBlocks?: ViewBlock[] | null   // 图文定稿（content_blocks 帧后）
   copyText?: string
   messageId?: string       // 反馈关联键（来自 session 帧）
@@ -184,7 +189,13 @@ function _pumpState(ai: ChatMessage, key: 'a' | 'r'): PumpChState {
   if (!st) { st = { stripLen: 0, stripOut: '', mdLen: 0, mdHtml: '' }; slots[key] = st }
   return st
 }
-function _dropPumpState(ai: ChatMessage): void { _pumpStates.delete(ai) }
+function _dropPumpState(ai: ChatMessage): void {
+  _pumpStates.delete(ai)
+  // 双节点拆分随泵一起退场：调用方随后必然写权威 ai.html（定稿/停止/历史加载），
+  // 模板据 _htmlTail == null 切回单节点渲染。
+  ai._htmlStable = undefined
+  ai._htmlTail = undefined
+}
 
 // #F-mm6b 必须与 markdown.ts 权威 stripImg 同构：含图级子下标分支 (?:\.\d+)?，否则开
 // RAG_IMG_SUBINDEX 后流式途中 <<IMG:1.2>> 既不被擦除也不被持留，明文碎片外露（收尾才清）。
@@ -253,7 +264,14 @@ function pumpTick(ai: ChatMessage, seq: number, ch: RevealCh): void {
   const next = shown + Math.max(2, Math.min(remain, Math.ceil(remain * (dt / 200))))
   ;(ai as any)[ch.shown] = next
   ;(ai as any)[ch.ts] = now
-  ch.setHtml(ai, renderMdIncr(st, text.slice(0, next)))
+  const fullHtml = renderMdIncr(st, text.slice(0, next))
+  ch.setHtml(ai, fullHtml)                               // ai.html 保持全量（滚动 watch/persist/兜底渲染读它）
+  if (ch.key === 'a') {
+    // 双节点拆分（Perf-5）：st.mdHtml = 已定稿行前缀（只增不改 → Vue 对 stable 节点跳过 patch），
+    // 其余为推进中的尾段——每帧真正被 innerHTML 替换的只有这一小截。
+    ai._htmlStable = st.mdHtml
+    ai._htmlTail = fullHtml.slice(st.mdHtml.length)
+  }
   ;(ai as any)[ch.raf] = requestAnimationFrame(() => pumpTick(ai, seq, ch))
 }
 // 帧到达即确保泵在跑。首帧立即同步渲染（内容尽快出现 + 保证 html 是字符串），其后增量交给匀速泵；
@@ -592,7 +610,7 @@ function persist(): void {
     const data = conversations.value.filter((c) => c.messages.length > 0).slice(0, 30).map((c) => ({
       id: c.id, title: c.title, updatedAt: c.updatedAt,
       // 丢 _stageTimer（计时器句柄）、loading（reload 后无在途流）。
-      messages: c.messages.map((m) => { const { _stageTimer, _renderRaf, _shownLen, _lastRenderTs, _rRaf, _rShownLen, _rTs, _reasoningDone, _reasoningT0, loading, streaming, _thinking, ...rest } = m as any; return rest }),
+      messages: c.messages.map((m) => { const { _stageTimer, _renderRaf, _shownLen, _lastRenderTs, _rRaf, _rShownLen, _rTs, _reasoningDone, _reasoningT0, _htmlStable, _htmlTail, loading, streaming, _thinking, ...rest } = m as any; return rest }),
     }))
     // uid 戳：登录后 syncHistoryForUser 据此判断本地缓存是否属于当前用户（共享设备防残留）。
     localStorage.setItem(LS_KEY, JSON.stringify({ uid, activeId: activeId.value, conversations: data }))
