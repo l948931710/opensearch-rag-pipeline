@@ -63,7 +63,9 @@ def test_dept_admin_org_tree_scope(monkeypatch):
     resp = api.kb_org_tree(request=None, identity=api.Identity(user_id="trade1"))
     assert resp.my_role == "dept_admin"
     assert resp.my_managed_owner_depts == ["marketing"]      # 读≠写：managed 不含 production
-    assert resp.my_grantable_owner_depts == ["marketing"]
+    # 2026-07-04 拍板：共享=归属部门管理员职权 → 共享目标面广告=全量白名单（写权面不变）
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    assert set(resp.my_grantable_owner_depts) == set(_VALID_ACL_GROUPS)
 
 
 # ── my-docs 文档名搜索：子句 + LIKE 通配符转义（防"输入 % 匹配全部"）──────────────

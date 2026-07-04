@@ -63,7 +63,9 @@ def test_managed_owner_depts_by_role():
 
     da = KbIdentity.build(role="dept_admin", granted_owner_depts=["marketing"])
     assert ka.managed_owner_depts(da) == ["marketing"]
-    assert ka.grantable_owner_depts(da) == ["marketing"]      # 免审批共享面 == managed
+    # 2026-07-04 拍板：共享=归属部门管理员职权 → 共享目标面=全量白名单（写权仍只 managed）
+    assert set(ka.grantable_owner_depts(da)) == set(_VALID_ACL_GROUPS)
+    assert ka.grantable_owner_depts(emp) == []                # employee 无共享权
 
     kb = KbIdentity.build(role="kb_admin")
     assert set(ka.managed_owner_depts(kb)) == set(_VALID_ACL_GROUPS)  # kb_admin 全量
@@ -103,19 +105,19 @@ def test_public_requires_kb_admin_approval():
     assert d2.allowed and not d2.requires_kb_admin_approval
 
 
-# ── 跨组共享需审批；同组共享免审批 ───────────────────────────────
-def test_cross_group_share_requires_approval():
+# ── 共享目标（2026-07-04 拍板：跨组共享=归属部门管理员职权，不再转审批）──────
+def test_cross_group_share_is_dept_admin_authority():
     da = KbIdentity.build(role="dept_admin", granted_owner_depts=["marketing"])
-    # 共享给非 managed 的 finance → 需审批
+    # 共享给任意合法目标组（finance）→ 直接允许，不进 kb_admin 队列
     d = ka.authorize_upload(da, "marketing", "dept_internal", share_owner_depts=["finance"])
-    assert d.allowed and d.requires_kb_admin_approval
-    assert d.reason == "cross_group_share_requires_kb_admin"
-    # 共享给自身 managed（marketing）→ 免审批
+    assert d.allowed and not d.requires_kb_admin_approval
+    # 共享给自身 managed（marketing）→ 同样免审批
     d2 = ka.authorize_upload(da, "marketing", "dept_internal", share_owner_depts=["marketing"])
     assert d2.allowed and not d2.requires_kb_admin_approval
-    # 非法共享目标（净化后丢弃，数量减少）→ 也转审批，不静默放行
+    # 非法共享目标（净化后丢弃，数量减少）→ 仍转审批复核，不静默放行
     d3 = ka.authorize_upload(da, "marketing", "dept_internal", share_owner_depts=['x" OR 1=1'])
     assert d3.allowed and d3.requires_kb_admin_approval
+    assert d3.reason == "invalid_share_targets_require_review"
 
 
 # ── 硬拒绝路径 ────────────────────────────────────────────────────

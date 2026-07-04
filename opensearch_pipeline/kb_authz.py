@@ -12,14 +12,20 @@ kb_authz.py — 知识库管理员【写授权】层（上传 / 升版 / 共享 
 三个互不相等的范围（每个 dept_admin）：
   - read_groups → owner_depts   : 能【检索】到哪些 dept_internal（在 retriever，本模块不碰）
   - managed_owner_depts          : 能【上传/升版/退役】的 owner_dept（本模块，来自显式 seed）
-  - grantable_owner_depts        : 能【直接共享】给哪些 owner_dept（跨组一律转 kb_admin 审批）
+  - grantable_owner_depts        : 能【直接共享】给哪些目标组（2026-07-04 起=全量白名单）
 
-锁定决策（2026-06-23）：
+锁定决策（2026-06-23；跨组共享条款已被 2026-07-04 拍板取代，见下）：
   - 生产事业部"伞组共管"：管理范围统一为 owner_dept='production'（无子线写隔离）。
   - 多叶子→单组"共管同一组池"：marketing/quality/rd 等同组多部门共管同一 owner_dept。
-  - 跨组共享 / 公开（permission_level=public）一律需 kb_admin 审批。
+  - 公开（permission_level=public）一律需 kb_admin 审批。
   - 管理员身份与其 managed_owner_depts 由【显式名单】seed（user_role.role +
     dept_admin_grant），本模块只做校验与裁决，不从读组推导。
+
+拍板更新（2026-07-04，取代 2026-06-23 的「跨组共享一律需 kb_admin 审批」）：
+  - **共享与跨部门授权是归属部门管理员的职权，kb_admin 只管入库**（上传审批/公开）。
+    dept_admin 对自己 managed 的文档可直接授权任意目标组（kb_access_grant_create
+    直插 approved + decide 流均是），不再进 kb_admin 审批队列；grantable_owner_depts
+    随之=全量白名单。kb_admin 保留同等运维能力，但不再是共享的必经审批人。
 
 合法 owner_dept 写白名单 = retriever._VALID_ACL_GROUPS（单一来源）。MVP 下新建文档的
 owner_dept 取【伞组/组名】粒度（production 而非 production_mold 等历史子线），故写白名单
@@ -182,12 +188,14 @@ def managed_owner_depts(identity: KbIdentity) -> List[str]:
 
 
 def grantable_owner_depts(identity: KbIdentity) -> List[str]:
-    """该身份可【直接共享】（无需 kb_admin 审批）的 owner_dept 目标集合。
+    """该身份可【直接共享】（无需 kb_admin 审批）的目标组集合。
 
-    锁定决策：跨组共享一律 kb_admin 审批 → dept_admin 的"免审批共享面"= 其 managed 集合本身
-    （即只能在自己管理的 owner_dept 之间共享；向任何其他组共享都转审批）。kb_admin = 全部。
+    2026-07-04 拍板（取代 2026-06-23「跨组共享一律 kb_admin 审批」）：共享/跨部门授权
+    = 归属部门管理员职权，kb_admin 只管入库 → 管理员（dept_admin/kb_admin）的直接共享
+    目标面 = 全量写白名单（能共享【哪份文档】仍由 managed/_kb_can_manage 把关，
+    这里只回答"能共享【给谁】"）。employee 无共享权。
     """
-    return managed_owner_depts(identity)
+    return sorted(_valid_owner_depts()) if is_admin(identity) else []
 
 
 # ── 裁决结果 ──────────────────────────────────────────────────────
@@ -220,8 +228,8 @@ def authorize_upload(
       - permission_level 非法（invalid_permission_level）
     需审批（allowed=True, requires_kb_admin_approval=True）：
       - permission_level=public（防误公开；kb_admin 自身上传除外——其即审批人）
-      - 任一 share 目标不在自己 managed（跨组共享）
-    其余 → 直接允许。
+      - share 目标含非法值（净化后数量缩水）→ 转审批复核，不静默放行
+    跨组共享本身不再转审批（2026-07-04 拍板：共享=归属部门管理员职权）。其余 → 直接允许。
     """
     if not is_admin(identity):
         return AuthzDecision(False, False, "not_admin")
@@ -242,7 +250,8 @@ def authorize_upload(
     if owner not in managed:
         return AuthzDecision(False, False, "owner_dept_not_managed")
 
-    # 跨组共享：任一 share 目标不在 managed → 需审批（净化后比对，非法目标也算越界）。
+    # 共享目标：2026-07-04 拍板后跨组共享不再转审批（目标面=grantable=全量白名单）；
+    # 仅当净化后数量缩水（含非法/注入目标）时转审批复核，不静默放行也不硬拒。
     needs_approval = False
     reason = "ok"
     shares = sanitize_owner_depts(share_owner_depts)
@@ -253,10 +262,10 @@ def authorize_upload(
             if isinstance(share_owner_depts, str)
             else len(list(share_owner_depts))
         )
-    # 净化后数量 < 原始数量 ⇒ 含非法/越界目标；或存在不在 managed 的目标 → 转审批
-    if (shares and not set(shares).issubset(managed)) or (raw_share_count and len(shares) < raw_share_count):
+    grantable = set(grantable_owner_depts(identity))
+    if (shares and not set(shares).issubset(grantable)) or (raw_share_count and len(shares) < raw_share_count):
         needs_approval = True
-        reason = "cross_group_share_requires_kb_admin"
+        reason = "invalid_share_targets_require_review"
 
     # 公开：dept_admin 设 public 需 kb_admin 审批；kb_admin 自身即审批人，免审批。
     if level == PERM_PUBLIC and not is_kb_admin:
