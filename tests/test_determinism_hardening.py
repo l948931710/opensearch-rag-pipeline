@@ -42,7 +42,14 @@ def test_embedding_cache_writes_are_crash_safe():
 
 
 def test_vlm_cache_writes_atomically():
+    """VLM 缓存 SQLite 化（2026-07-03）后：崩溃安全不变量从 temp+os.replace 原子写
+    转由共享 SqliteKVStore 的 WAL 日志承担（与 embedding 缓存同一底座、同款语义迁移）。"""
+    from opensearch_pipeline.embedding_cache import SqliteKVStore
+    from opensearch_pipeline.vlm_cache import VlmCacheStore
+    assert issubclass(VlmCacheStore, SqliteKVStore), (
+        "VLM cache must reuse the crash-safe (WAL) SqliteKVStore base"
+    )
     from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
-    assert "os.replace(_tmp, cls._vlm_cache_file)" in inspect.getsource(UnifiedExtractor._save_vlm_cache), (
-        "VLM cache must write atomically (temp + os.replace)"
+    assert "save_vlm_cache" in inspect.getsource(UnifiedExtractor._save_vlm_cache), (
+        "UnifiedExtractor._save_vlm_cache must delegate to the shared sqlite-backed store"
     )

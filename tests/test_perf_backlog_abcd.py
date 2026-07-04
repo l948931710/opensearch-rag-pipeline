@@ -9,7 +9,6 @@ D#34 LLM 超时可配。D#33（流式清洗挪推送线程）由 test_dingtalk_s
 pusher/finalize 不变量测试覆盖；D#30（提取并发）默认关，串行路径由既有管线测试覆盖。
 """
 import json
-import os
 
 from opensearch_pipeline import qa_facts
 
@@ -245,35 +244,44 @@ def test_embedding_store_falls_back_to_memory_on_bad_path(tmp_path):
 # ─── C#27 VLM 缓存 OSS 上传降频 ─────────────────────────────────────────────
 
 def test_vlm_cache_oss_sync_throttled(monkeypatch, tmp_path):
+    """perf#27 降频节奏在 SQLite 化（2026-07-03）后保持：每 N 次 per-doc 保存推一次
+    OSS 镜像（对象从整包 JSON 换成 checkpoint 后的 .sqlite 文件）+ run 结束 flush 尾巴。
+    旧测试直接操纵 UnifiedExtractor 类属性（_vlm_cache/_vlm_cache_oss_dirty），
+    迁移后状态收敛到 vlm_cache 模块单例——改为对同一批类方法入口打桩单例。"""
+    import opensearch_pipeline.vlm_cache as vc
     from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor as UE
     puts = {"n": 0}
 
     class _B:
-        def put_object(self, key, data):
+        def put_object_from_file(self, key, path):
             puts["n"] += 1
 
     monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_oss_bucket",
                         lambda ctx=None: (_B(), False))
     monkeypatch.setenv("RAG_VLM_CACHE_OSS_SYNC_EVERY", "3")
-    saved = (UE._vlm_cache, UE._vlm_cache_file, UE._vlm_cache_oss_dirty)
+    store = vc.VlmCacheStore(str(tmp_path / "vlm_cache.sqlite3"))
+    cache = vc.TrackedVlmCache(store)
+    monkeypatch.setattr(vc, "_cache", cache)
     try:
-        UE._vlm_cache = {"h1:pub": {"status": "ROUTE_TO_TEXT"}}
-        UE._vlm_cache_file = str(tmp_path / "vlm_cache.json")
-        UE._vlm_cache_oss_dirty = 0
+        cache["h1:pub"] = {"status": "ROUTE_TO_TEXT"}
         UE._save_vlm_cache()
         UE._save_vlm_cache()
-        assert puts["n"] == 0, "未满间隔不传 OSS（本地照写）"
-        assert os.path.exists(UE._vlm_cache_file), "本地原子写每次都落"
+        assert puts["n"] == 0, "未满间隔不推 OSS（本地 sqlite 照常增量落）"
+        assert store.get_many(["h1:pub"]) == {"h1:pub": {"status": "ROUTE_TO_TEXT"}}, (
+            "per-doc 保存即增量落 sqlite")
         UE._save_vlm_cache()
-        assert puts["n"] == 1, "第 3 次触发整包上传"
+        assert puts["n"] == 1, "第 3 次触发镜像上传"
         UE._save_vlm_cache()
         assert puts["n"] == 1
         UE.flush_vlm_cache_to_oss()
-        assert puts["n"] == 2, "run 结束 flush 把尾巴传上去"
+        assert puts["n"] == 2, "run 结束 flush 把尾巴推上去"
         UE.flush_vlm_cache_to_oss()
-        assert puts["n"] == 2, "无脏不重复传"
+        assert puts["n"] == 2, "无账不重复推"
     finally:
-        UE._vlm_cache, UE._vlm_cache_file, UE._vlm_cache_oss_dirty = saved
+        try:
+            store._conn.close()
+        except Exception:
+            pass
 
 
 # ─── D#34 LLM 超时可配 ───────────────────────────────────────────────────────

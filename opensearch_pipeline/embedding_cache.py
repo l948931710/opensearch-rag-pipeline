@@ -26,6 +26,12 @@ embedding_cache.py — 摄取侧 embedding 持久缓存（SQLite KV，perf#18/#1
 
 任何 SQLite/文件系统故障 → 退化为进程内 dict（no-persist），绝不阻断 embedding 主流程
 （graceful degradation 项目惯例）。
+
+2026-07-03（全维度复审「VLM 缓存 SQLite 化」）：把本模块的 store 参数化抽为通用底座
+SqliteKVStore（表名/legacy JSON 名/OSS 镜像键/开关 env/日志标签皆类属性），VLM 图片
+标注缓存（vlm_cache.py）复用同一底座——相比在 vlm_cache.py 复刻 ~150 行同构
+SQLite/迁移/镜像代码，参数化重复最少，崩溃安全与退化语义只需在这一处回归。
+EmbeddingCacheStore 的对外行为（SQL 形态、打印、退化路径）逐字节保留。
 """
 
 import json
@@ -39,16 +45,18 @@ logger = logging.getLogger(__name__)
 OSS_MIRROR_KEY = "processing/cache/embedding_cache.sqlite3"
 
 
-def _mirror_enabled() -> bool:
-    return os.environ.get("RAG_EMBED_CACHE_OSS_MIRROR", "true").strip().lower() in (
-        "1", "true", "yes")
-
-
-class EmbeddingCacheStore:
-    """线程安全 SQLite KV（内部单锁串行化——embedding 负载是网络瓶颈，锁开销可忽略）。
+class SqliteKVStore:
+    """线程安全 SQLite WAL KV 底座（内部单锁串行化——embedding/VLM 负载都是网络瓶颈，
+    锁开销可忽略）。子类通过类属性定制表名/legacy JSON/OSS 镜像/标签。
 
     SQLite 打开/建表失败时自动退化为内存 dict（backend='memory'，无持久化）。
     """
+
+    TABLE = "kv"
+    LEGACY_JSON_BASENAME: Optional[str] = None   # 同目录存量 JSON（首开为空时自动迁移）
+    OSS_MIRROR_KEY: Optional[str] = None         # OSS 上的 .sqlite 镜像对象键
+    MIRROR_ENV = ""                              # 镜像开关 env（空 = 恒开）
+    LABEL = "kv cache"                           # 日志/打印标签
 
     def __init__(self, path: str):
         self.path = path
@@ -63,12 +71,15 @@ class EmbeddingCacheStore:
             self._conn = sqlite3.connect(path, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            # 跨进程并发打开（pytest-xdist 多 worker 同仓 scratch/）时避免立抛 SQLITE_BUSY
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS embedding_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+                f"CREATE TABLE IF NOT EXISTS {self.TABLE} (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
             self._conn.commit()
             self._migrate_legacy_json_if_empty()
         except Exception as e:
-            logger.warning("embedding cache sqlite 打开失败，退化为进程内 dict（本次不持久化）: %s", e)
+            logger.warning("%s sqlite 打开失败，退化为进程内 dict（本次不持久化）: %s",
+                           self.LABEL, e)
             try:
                 if self._conn is not None:
                     self._conn.close()
@@ -76,6 +87,18 @@ class EmbeddingCacheStore:
                 pass
             self._conn = None
             self._mem = {}
+
+    # ── 子类定制点 ──────────────────────────────────────────────────────────
+
+    def _mirror_enabled(self) -> bool:
+        if not self.MIRROR_ENV:
+            return True
+        return os.environ.get(self.MIRROR_ENV, "true").strip().lower() in ("1", "true", "yes")
+
+    def _get_bucket(self):
+        """OSS bucket seam：默认走 clients；子类可换（如 VLM 沿用 pipeline_nodes 老 seam）。"""
+        from opensearch_pipeline.clients import _get_oss_bucket
+        return _get_oss_bucket()
 
     # ── 基本操作 ────────────────────────────────────────────────────────────
 
@@ -87,7 +110,7 @@ class EmbeddingCacheStore:
         with self._lock:
             if self._conn is None:
                 return len(self._mem)
-            return int(self._conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0])
+            return int(self._conn.execute(f"SELECT COUNT(*) FROM {self.TABLE}").fetchone()[0])
 
     def get_many(self, keys: Iterable[str]) -> Dict[str, object]:
         """批量点查；只返回命中项（值已 json 解码）。"""
@@ -104,15 +127,33 @@ class EmbeddingCacheStore:
                 ph = ",".join(["?"] * len(part))
                 try:
                     rows = self._conn.execute(
-                        f"SELECT k, v FROM embedding_cache WHERE k IN ({ph})", part).fetchall()
+                        f"SELECT k, v FROM {self.TABLE} WHERE k IN ({ph})", part).fetchall()
                 except Exception as e:
-                    logger.warning("embedding cache 读失败（视为 miss）: %s", e)
+                    logger.warning("%s 读失败（视为 miss）: %s", self.LABEL, e)
                     return out
                 for k, v in rows:
                     try:
                         out[k] = json.loads(v)
                     except Exception:
                         continue   # 单条坏值当 miss，绝不拖垮整批
+            return out
+
+    def load_all(self) -> Dict[str, object]:
+        """全量读出（VLM 缓存的 dict 门面预载用；条目小且有容量上限，整读可控）。"""
+        with self._lock:
+            if self._conn is None:
+                return dict(self._mem)
+            try:
+                rows = self._conn.execute(f"SELECT k, v FROM {self.TABLE}").fetchall()
+            except Exception as e:
+                logger.warning("%s 全量读失败（按空缓存处理）: %s", self.LABEL, e)
+                return {}
+            out: Dict[str, object] = {}
+            for k, v in rows:
+                try:
+                    out[k] = json.loads(v)
+                except Exception:
+                    continue
             return out
 
     def put_many(self, mapping: Dict[str, object]) -> None:
@@ -126,13 +167,13 @@ class EmbeddingCacheStore:
                 return
             try:
                 self._conn.executemany(
-                    "INSERT OR REPLACE INTO embedding_cache (k, v) VALUES (?, ?)",
+                    f"INSERT OR REPLACE INTO {self.TABLE} (k, v) VALUES (?, ?)",
                     [(k, json.dumps(v, ensure_ascii=False)) for k, v in mapping.items()])
                 self._conn.commit()
                 self._dirty_puts += len(mapping)
             except Exception as e:
-                logger.warning("embedding cache 写失败（跳过 %d 条，不影响主流程）: %s",
-                               len(mapping), e)
+                logger.warning("%s 写失败（跳过 %d 条，不影响主流程）: %s",
+                               self.LABEL, len(mapping), e)
 
     def evict_to(self, max_entries: int) -> int:
         """裁到容量上限，淘汰最旧（rowid 最小；REPLACE 会刷新 rowid → 近似 LRU-on-write）。"""
@@ -149,13 +190,13 @@ class EmbeddingCacheStore:
                 if n <= 0:
                     return 0
                 self._conn.execute(
-                    "DELETE FROM embedding_cache WHERE rowid IN "
-                    "(SELECT rowid FROM embedding_cache ORDER BY rowid ASC LIMIT ?)", (n,))
+                    f"DELETE FROM {self.TABLE} WHERE rowid IN "
+                    f"(SELECT rowid FROM {self.TABLE} ORDER BY rowid ASC LIMIT ?)", (n,))
                 self._conn.commit()
-                print(f"    └─ Evicted {n} oldest embedding cache entries (cap: {max_entries})")
+                print(f"    └─ Evicted {n} oldest {self.LABEL} entries (cap: {max_entries})")
                 return n
             except Exception as e:
-                logger.warning("embedding cache 淘汰失败（忽略）: %s", e)
+                logger.warning("%s 淘汰失败（忽略）: %s", self.LABEL, e)
                 return 0
 
     def finalize(self, max_entries: int) -> None:
@@ -167,9 +208,9 @@ class EmbeddingCacheStore:
     # ── 存量 JSON 迁移 ──────────────────────────────────────────────────────
 
     def _migrate_legacy_json_if_empty(self) -> None:
-        if self._conn is None or self.count() > 0:
+        if self._conn is None or self.count() > 0 or not self.LEGACY_JSON_BASENAME:
             return
-        legacy = os.path.join(os.path.dirname(self.path), "embedding_cache.json")
+        legacy = os.path.join(os.path.dirname(self.path), self.LEGACY_JSON_BASENAME)
         if not os.path.exists(legacy):
             return
         try:
@@ -180,28 +221,27 @@ class EmbeddingCacheStore:
                 return
             with self._lock:
                 self._conn.executemany(
-                    "INSERT OR REPLACE INTO embedding_cache (k, v) VALUES (?, ?)",
+                    f"INSERT OR REPLACE INTO {self.TABLE} (k, v) VALUES (?, ?)",
                     [(k, json.dumps(v, ensure_ascii=False)) for k, v in data.items()])
                 self._conn.commit()
-            print(f"    └─ Migrated {len(data)} entries from legacy embedding_cache.json "
+            print(f"    └─ Migrated {len(data)} entries from legacy {self.LEGACY_JSON_BASENAME} "
                   f"({size_mb:.1f}MB) → sqlite（JSON 原样保留供 eval 脚本使用）")
         except Exception as e:
-            logger.warning("legacy embedding_cache.json 迁移失败（从空缓存开始）: %s", e)
+            logger.warning("legacy %s 迁移失败（从空缓存开始）: %s", self.LEGACY_JSON_BASENAME, e)
 
-    # ── OSS 镜像（serverless 跨运行持久化；仿 VLM cache 模式）────────────────
+    # ── OSS 镜像（serverless 跨运行持久化）──────────────────────────────────
 
     def _pull_oss_mirror_if_absent(self) -> None:
         """本地缺文件时从 OSS 拉镜像；任何失败静默（首次运行/无镜像属正常）。"""
-        if os.path.exists(self.path) or not _mirror_enabled():
+        if os.path.exists(self.path) or not self._mirror_enabled() or not self.OSS_MIRROR_KEY:
             return
         try:
-            from opensearch_pipeline.clients import _get_oss_bucket
-            bucket, is_sim = _get_oss_bucket()
+            bucket, is_sim = self._get_bucket()
             if is_sim or bucket is None:
                 return
-            bucket.get_object_to_file(OSS_MIRROR_KEY, self.path)
+            bucket.get_object_to_file(self.OSS_MIRROR_KEY, self.path)
             size_mb = os.path.getsize(self.path) / 1024 / 1024
-            print(f"    └─ Pulled embedding cache mirror from OSS {OSS_MIRROR_KEY} ({size_mb:.1f}MB)")
+            print(f"    └─ Pulled {self.LABEL} mirror from OSS {self.OSS_MIRROR_KEY} ({size_mb:.1f}MB)")
         except Exception:
             # OSS 上不存在或拉取失败 → 冷启动；确保不留半截文件坑掉 sqlite open
             try:
@@ -210,24 +250,38 @@ class EmbeddingCacheStore:
             except Exception:
                 pass
 
-    def _push_oss_mirror(self) -> None:
-        """checkpoint（把 WAL 折进主文件）后整文件推 OSS；失败仅告警，本地副本仍在。"""
-        if self._conn is None or not _mirror_enabled():
-            return
+    def _push_oss_mirror(self) -> bool:
+        """checkpoint（把 WAL 折进主文件）后整文件推 OSS；失败仅告警，本地副本仍在。
+
+        返回是否真的推成功（VLM 缓存的降频计数以此决定是否清零）。
+        """
+        if self._conn is None or not self._mirror_enabled() or not self.OSS_MIRROR_KEY:
+            return False
         try:
-            from opensearch_pipeline.clients import _get_oss_bucket
-            bucket, is_sim = _get_oss_bucket()
+            bucket, is_sim = self._get_bucket()
             if is_sim or bucket is None:
-                return
+                return False
             with self._lock:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 self._conn.commit()
-                bucket.put_object_from_file(OSS_MIRROR_KEY, self.path)
+                bucket.put_object_from_file(self.OSS_MIRROR_KEY, self.path)
                 self._dirty_puts = 0
             size_mb = os.path.getsize(self.path) / 1024 / 1024
-            print(f"    └─ Pushed embedding cache mirror to OSS {OSS_MIRROR_KEY} ({size_mb:.1f}MB)")
+            print(f"    └─ Pushed {self.LABEL} mirror to OSS {self.OSS_MIRROR_KEY} ({size_mb:.1f}MB)")
+            return True
         except Exception as e:
-            logger.warning("embedding cache OSS 镜像上传失败（本地副本无损）: %s", e)
+            logger.warning("%s OSS 镜像上传失败（本地副本无损）: %s", self.LABEL, e)
+            return False
+
+
+class EmbeddingCacheStore(SqliteKVStore):
+    """embedding 专用 store：表名/JSON/镜像键与 perf#18 落地时逐字节一致。"""
+
+    TABLE = "embedding_cache"
+    LEGACY_JSON_BASENAME = "embedding_cache.json"
+    OSS_MIRROR_KEY = OSS_MIRROR_KEY
+    MIRROR_ENV = "RAG_EMBED_CACHE_OSS_MIRROR"
+    LABEL = "embedding cache"
 
 
 # ── 进程级单例（perf#19：drain 循环同进程反复进 node 只打开/迁移一次）────────────
