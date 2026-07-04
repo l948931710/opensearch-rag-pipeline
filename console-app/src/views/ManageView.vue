@@ -27,15 +27,14 @@ import ConfirmDialog from '@/components/manage/ConfirmDialog.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, docs, approvals, accessRequests, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 
 // ── 「文档管理」信息架构：待办摘要条 + 分区（待办审批 → 上传 → 台账 → 授权治理）──
 // 分区眉标与看板 HEADER 同一视觉语言；各队列组件自带空态自隐，眉标随内容一起隐藏。
 const ZONE = 'mb-3 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint'
-const BAD_BADGES = ['未入索引', '处理失败', '已隔离', '已驳回']
-const anomalyCount = computed(() => docs.value.filter((d) => BAD_BADGES.includes(d.status_badge)).length)
+// 异常文档数取自 useKb 的全库口径（/api/kb/stats by_badge），不再只数已加载页（#7）。
 const hasQueues = computed(() => (isKbAdmin.value && approvals.value.length > 0) || accessRequests.value.length > 0)
 interface TodoChip { key: string; label: string; n: number; anchor: string; tone: string }
 const todoChips = computed<TodoChip[]>(() => {

@@ -56,7 +56,7 @@ export interface QueueRow { name: string; status: string; pct: number; msg: stri
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
 interface MyDocsResp { items: DocItem[]; has_more: boolean }
-export interface KbStats { total: number; active: number; retired: number; chunks: number; new_this_month: number; by_badge: Record<string, number> }
+export interface KbStats { total: number; active: number; retired: number; chunks: number; new_this_month: number; by_badge: Record<string, number>; owner_depts?: string[] }
 // Phase E 概览看板真实数据（镜像 api.py KbInsightsResponse / KbGovernanceResponse，字段一一对应）
 export interface KbTopDoc { title: string; owner_dept: string; hits: number }
 export interface KbGapQuery { query: string; count: number; avg_top: number }
@@ -149,6 +149,8 @@ const visLoading = ref(false)
 const visErr = ref('')
 // 差评联动复核（看板卡片）：引用了我作用域文档的回答收到 👎。null=尚未加载（显占位不显 0）。
 const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
+const showResolvedFeedback = ref(false)   // 「显示已处理」切换：默认只看未处置（收件箱语义）
+const feedbackResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 message_id）
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
 const SHARE_TARGETS = Object.keys(GROUP_LABEL)
 const verCtx = ref<VerCtx | null>(null)
@@ -223,6 +225,41 @@ function countOf(badge: string): number {
   return badge ? docs.value.filter((d) => d.status_badge === badge).length : docs.value.length
 }
 
+// 异常文档徽章（退役候选/需人工处理）：待办摘要条 + 台账速览共用口径。
+const BAD_BADGES = ['未入索引', '处理失败', '已隔离', '已驳回']
+
+// ── #7 全库口径：状态 chip 计数 / 归属下拉 / 异常文档数取自 /api/kb/stats（不受 50 页上限影响）。
+// 仅在「本部门」台账（docScope='managed'，其 owner 作用域与 stats 同源）启用全库口径；
+// 「全部门」浏览（browse，跨部门）无对应全库聚合 → 回退已加载页派生（诚实，不伪造跨部门总数）。
+const fullScopeCounts = computed(() => docScope.value === 'managed' && !!kbStats.value)
+// 状态 chip 列表（含「全部」）：全库口径下取 by_badge 全部出现过的徽章；否则已加载页派生。
+const ledgerBadgeChips = computed<string[]>(() => {
+  if (fullScopeCounts.value) {
+    const bb = kbStats.value!.by_badge || {}
+    return ['', ...Object.keys(bb).filter((k) => bb[k] > 0)]
+  }
+  return ['', ...Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))]
+})
+// 状态 chip 计数：全库口径下取 by_badge / total；否则已加载页计数（countOf）。
+function ledgerBadgeCount(badge: string): number {
+  if (fullScopeCounts.value) {
+    const bb = kbStats.value!.by_badge || {}
+    return badge ? (bb[badge] || 0) : (kbStats.value!.total || 0)
+  }
+  return countOf(badge)
+}
+// 归属下拉选项：全库口径下取 stats.owner_depts；否则已加载页派生。
+const ledgerOwnerOptions = computed<string[]>(() =>
+  (fullScopeCounts.value && kbStats.value!.owner_depts?.length) ? kbStats.value!.owner_depts! : ownerOptions.value)
+// 异常文档数（待办摘要条）：全库口径下 = 各坏徽章之和；否则已加载页计数。
+const anomalyCount = computed<number>(() => {
+  if (fullScopeCounts.value) {
+    const bb = kbStats.value!.by_badge || {}
+    return BAD_BADGES.reduce((s, b) => s + (bb[b] || 0), 0)
+  }
+  return docs.value.filter((d) => BAD_BADGES.includes(d.status_badge)).length
+})
+
 // ── 多选 / 批量 ──────────────────────────────────────────────────
 // 当前可见【且可管理】的行（批量只作用于这些；外部门只读行不可批量操作）。
 const selectableVisible = computed(() => filtered.value.filter((d) => d.can_manage !== false))
@@ -295,15 +332,37 @@ function patchRow(docId: string, badge: string) {
   if (d) d.status_badge = badge
 }
 
-// 台账列表 URL：scope 分流（全部门 browse / 本部门 my-docs）+ 分页（limit/offset）+ 文档名搜索。
+// 台账列表 URL：scope 分流（全部门 browse / 本部门 my-docs）+ 分页（limit/offset）+ 文档名搜索
+// + 结构化筛选（归属/可见范围/徽章/利用度，服务端执行 → 覆盖全库而非只筛已加载页，#7）。
 function docsUrl(offset: number): string {
   const params = new URLSearchParams()
   if (docScope.value === 'all') params.set('scope', 'all')
   params.set('limit', String(DOCS_PAGE))
   params.set('offset', String(offset))
   if (q.value) params.set('q', q.value)
+  if (ownerFilter.value) params.set('owner_dept', ownerFilter.value)
+  if (permFilter.value) params.set('perm', permFilter.value)
+  if (filter.value) params.set('badge', filter.value)
+  if (citedFilter.value) params.set('cited', citedFilter.value)
   const path = docScope.value === 'all' ? '/api/kb/browse' : '/api/kb/my-docs'
   return `${path}?${params.toString()}`
+}
+
+// 结构化筛选变更 → 服务端重载（reset offset）。防抖复用 qTimer 语义但独立 timer，避免与搜索互相取消。
+let filterTimer: ReturnType<typeof setTimeout> | null = null
+function applyLedgerFilter() {
+  if (filterTimer) clearTimeout(filterTimer)
+  filterTimer = setTimeout(() => void loadDocs(), 150)
+}
+// 台账筛选 setter（供 DocTable 绑定）：设值 + 触发服务端重载。单测直接赋 .value（不走 setter）→
+// 保持纯客户端 filtered/countOf 语义不变（spec 锁定），实际 UI 走 setter → 全库服务端筛选。
+function setBadgeFilter(v: string) { filter.value = v; applyLedgerFilter() }
+function setPermFilter(v: string) { permFilter.value = v; applyLedgerFilter() }
+function setOwnerFilter(v: string) { ownerFilter.value = v; applyLedgerFilter() }
+function setCitedFilter(v: string) { citedFilter.value = v; applyLedgerFilter() }
+function clearLedgerFilters() {
+  filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''
+  applyLedgerFilter()
 }
 
 async function loadDocs() {
@@ -509,6 +568,24 @@ async function openHistory(d: DocItem) {
   } catch { verHistory.value = { doc: d, versions: [], loading: false, error: '版本历史加载失败' } }
 }
 function closeHistory() { verHistory.value = null }
+
+// 预览原件（审批盲批的解药 + 台账速览）：拉短时签名 GET URL 并在新标签打开原始上传文件。
+// 同步先开占位标签保住用户手势（防弹窗拦截），拿到 URL 再定向；不可用则关闭占位并提示。
+async function openDocPreview(docId: string, version = 0): Promise<void> {
+  const s = useSession()
+  const w = typeof window !== 'undefined' ? window.open('', '_blank') : null
+  if (import.meta.env.DEV && s.token === 'dev-preview') { w?.close(); alert('预览原件：演示环境无真实文件。'); return }
+  try {
+    const qs = version ? `&version=${version}` : ''
+    const r = await apiJson<{ url: string; available: boolean; filename: string }>(
+      `/api/kb/doc-preview?doc_id=${encodeURIComponent(docId)}${qs}`, { auth: true })
+    if (r.available && r.url) { if (w) w.location.href = r.url; else window.open(r.url, '_blank', 'noopener') }
+    else { w?.close(); alert('原件暂不可预览（文件缺失或对象存储未配置）。') }
+  } catch (e: any) {
+    w?.close()
+    alert(e && e.status === 403 ? '无权预览该文档' : '预览失败：' + uploadErrText(e))
+  }
+}
 
 function setQuery(v: string) {
   q.value = v
@@ -808,28 +885,73 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
 // 后端直插 approved 行并复用 Phase D 投影；撤销/清单/审批历史与被动流同一套。
 interface GrantCreateResp { doc_id: string; granted: string[]; skipped: string[]; ok: boolean }
 
-// 差评联动复核（与后端 KbFeedbackReviewItem 对齐；question 已服务端 PII 脱敏）。
+// 差评联动复核（与后端 KbFeedbackReviewItem 对齐；question/comment 已服务端 PII 脱敏）。
 export interface FeedbackDocRef { doc_id: string; title: string; owner_dept: string }
-export interface FeedbackReviewItem { message_id: string; question: string; created_at: string; docs: FeedbackDocRef[] }
+export interface FeedbackReviewItem {
+  message_id: string; question: string; created_at: string
+  reasons: string[]; comment: string          // 点踩原因（中文标签列表）+ 用户补充说明（脱敏）
+  handled: boolean; handled_status: string     // 是否已处置 + 原始态（RESOLVED/DISMISSED/PENDING/…）
+  docs: FeedbackDocRef[]
+}
+export type FeedbackResolveAction = 'resolve' | 'dismiss' | 'reopen'
 
-/** 拉差评复核队列（看板卡片）：失败静默兜底空 + loadErrors 显错可重试。 */
+/** 拉差评复核队列（看板卡片）：失败静默兜底空 + loadErrors 显错可重试。
+ *  include_resolved 由「显示已处理」切换驱动；默认只收未处置（收件箱语义）。 */
 async function loadFeedbackReview() {
   const s = useSession()
   if (!s.identity?.canManage) { feedbackReview.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
-    feedbackReview.value = [
+    const all: FeedbackReviewItem[] = [
       { message_id: 'fb1', question: '2oz 纸杯的收缩率标准是多少？', created_at: '2026-07-03 14:20',
+        reasons: ['不准确', '已过时'], comment: '参数表里写的是旧机型的数据，龙盛机对不上。', handled: false, handled_status: 'PENDING',
         docs: [{ doc_id: 'D1', title: '纸杯工艺参数表', owner_dept: 'production' }] },
       { message_id: 'fb2', question: '出口美国的 FDA 检测周期？', created_at: '2026-07-02 09:11',
+        reasons: ['不完整'], comment: '', handled: false, handled_status: '',
         docs: [{ doc_id: 'D2', title: '出口检测流程 SOP', owner_dept: 'marketing' }, { doc_id: 'D3', title: '认证台账', owner_dept: 'marketing' }] },
+      { message_id: 'fb3', question: '请假流程走哪个系统？', created_at: '2026-06-30 10:05',
+        reasons: ['不相关'], comment: '答的是报销流程。', handled: true, handled_status: 'RESOLVED',
+        docs: [{ doc_id: 'D4', title: '考勤请假制度', owner_dept: 'hr' }] },
     ]
+    feedbackReview.value = showResolvedFeedback.value ? all : all.filter((x) => !x.handled)
     return
   }
   clearLoadError('feedbackReview')
   try {
-    const r = await apiJson<{ items: FeedbackReviewItem[] }>('/api/kb/feedback-review', { auth: true })
+    const qs = showResolvedFeedback.value ? '?include_resolved=true' : ''
+    const r = await apiJson<{ items: FeedbackReviewItem[] }>(`/api/kb/feedback-review${qs}`, { auth: true })
     feedbackReview.value = r.items || []
   } catch (e) { feedbackReview.value = feedbackReview.value ?? []; noteLoadError('feedbackReview', e) }
+}
+
+/** 切换「显示已处理」并重载。 */
+function toggleShowResolvedFeedback() {
+  showResolvedFeedback.value = !showResolvedFeedback.value
+  void loadFeedbackReview()
+}
+
+/** 差评处置：resolve（已修复/跟进）/ dismiss（忽略）/ reopen（重开）。
+ *  成功后据当前「显示已处理」视图定向更新：收件箱视图里 resolve/dismiss 即移除该条；
+ *  否则本地翻转 handled 态。按 message_id 在途互斥防连点。 */
+async function resolveFeedback(messageId: string, action: FeedbackResolveAction): Promise<boolean> {
+  if (feedbackResolveBusy.value.has(messageId)) return false
+  feedbackResolveBusy.value = new Set(feedbackResolveBusy.value).add(messageId)
+  try {
+    const s = useSession()
+    const done = action !== 'reopen'
+    if (import.meta.env.DEV && s.token === 'dev-preview') { /* 预览：直接本地更新 */ }
+    else {
+      await apiJson('/api/kb/feedback-review/resolve', { method: 'POST', auth: true, body: JSON.stringify({ message_id: messageId, action }) })
+    }
+    const list = feedbackReview.value || []
+    if (done && !showResolvedFeedback.value) {
+      feedbackReview.value = list.filter((x) => x.message_id !== messageId)   // 收件箱：处置即移出
+    } else {
+      feedbackReview.value = list.map((x) => x.message_id === messageId
+        ? { ...x, handled: done, handled_status: action === 'resolve' ? 'RESOLVED' : action === 'dismiss' ? 'DISMISSED' : 'PENDING' } : x)
+    }
+    return true
+  } catch (e: any) { alert('处置失败：' + uploadErrText(e)); return false }
+  finally { const n = new Set(feedbackResolveBusy.value); n.delete(messageId); feedbackResolveBusy.value = n }
 }
 
 // 「谁能看到这篇文档」解释器响应（与后端 KbVisibilityExplainResponse 对齐；判定与检索同源）。
@@ -1094,6 +1216,9 @@ export function useKb() {
   return {
     // 状态
     docs, filtered, approvals, accessRequests, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir,
+    // #7 全库口径 + 服务端筛选 setter
+    ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, anomalyCount,
+    setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
     // 多选 / 批量
     selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
     newTitle, newOwner, newPerm, newShareDepts, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
@@ -1102,11 +1227,11 @@ export function useKb() {
     shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
     ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory, loadErrors,
     // 方法
-    loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, setQuery, loadApprovals, sortBy, countOf,
+    loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, openDocPreview, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
     openShare, closeShare, submitShare, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
-    feedbackReview, loadFeedbackReview,
+    feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
@@ -1125,10 +1250,12 @@ export function __resetKb() {
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []
   inflight.value = new Set(); retireBusy.value = false
+  feedbackReview.value = null; showResolvedFeedback.value = false; feedbackResolveBusy.value = new Set()
   selectedFiles = []; docsOffset = 0; docsSeq = 0; trackSeq = 0
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (trackTimer) { clearTimeout(trackTimer); trackTimer = null }
+  if (filterTimer) { clearTimeout(filterTimer); filterTimer = null }
 }
 
 /** 仅供测试：注入选中文件（绕过 input）。 */

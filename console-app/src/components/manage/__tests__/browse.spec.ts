@@ -56,7 +56,8 @@ describe('DocTable — 全部门只读浏览', () => {
     expect(w.text()).toContain('其他部门')
     const btns = w.findAll('button').map((b) => b.text())
     expect(btns.filter((t) => t.includes('申请授权')).length).toBe(1)   // 仅外部门 1 行
-    expect(btns.filter((t) => t.includes('退役')).length).toBe(1)       // 仅本部门 1 行
+    // 台账操作已改纯图标 → 按 aria-label 断言（退役按钮仅本部门可管理行有）
+    expect(w.findAll('button[aria-label="退役下线"]').length).toBe(1)   // 仅本部门 1 行
   })
 
   it('外部门行不暴露 升版/退役（只读）', () => {
@@ -89,9 +90,9 @@ describe('DocTable — 退役行「恢复上线」', () => {
     const kb = useKb()
     ;(kb as any).docs.value = [doc({ doc_id: 'mine', owner_dept: 'marketing', can_manage: true, status_badge: '已退役' })]
     const w = mount(DocTable, { global: { plugins: [p] } })
-    const btns = w.findAll('button').map((b) => b.text().trim())
-    expect(btns.some((t) => t === '恢复上线')).toBe(true)
-    expect(btns.some((t) => t === '退役')).toBe(false)   // 退役动作按钮隐藏（v-else；状态 chip「已退役」不算）
+    // 台账操作纯图标 → 按 aria-label 断言（退役↔恢复上线 v-if/else 互斥）
+    expect(w.find('button[aria-label="恢复上线"]').exists()).toBe(true)
+    expect(w.find('button[aria-label="退役下线"]').exists()).toBe(false)   // 退役动作按钮隐藏（v-else）
   })
 
   it('restore（DEV preview）→ status_badge 即时变排队中', async () => {

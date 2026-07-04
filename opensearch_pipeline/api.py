@@ -1765,6 +1765,32 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
     return "处理中"
 
 
+# _kb_status_badge 的 SQL 镜像：供台账按徽章【服务端】筛选（全库口径，不再只筛已加载页）。
+# SQL CASE 的「首个 WHEN 命中即返回」语义与上面 Python if 阶梯严格同序同义——**改
+# _kb_status_badge 的判定顺序/取值时必须同步改这里**，parity 测试
+# test_kb_badge_case_sql_parity 会守卫二者一致。约定：
+#   · 引用 m（document_meta）/ v（document_version）别名——my-docs / browse 两处调用都用这对别名。
+#   · list 路径 chunk_active 恒 None（列表不查活跃 chunk 数），故此处不含「SUCCESS 但 0 chunk→处理中」
+#     分支，与 _kb_status_badge 在 chunk_active=None 时的行为一致（ix∈(INDEXED,SUCCESS) 即已上线）。
+#   · SKIPPED 前缀用 LEFT(...,7)='SKIPPED'（**不用 LIKE 'SKIPPED%%'**）——查询带 %s 参数时
+#     SQL 里的字面 % 会被 pymysql paramstyle 误读，LEFT 规避这个坑。
+_KB_BADGE_CASE_SQL = (
+    "CASE"
+    " WHEN m.status IS NOT NULL AND LOWER(m.status) NOT IN ('active','') THEN '已退役'"
+    " WHEN UPPER(COALESCE(v.publish_status,'')) = 'QUARANTINED' THEN '已隔离'"
+    " WHEN UPPER(COALESCE(v.chunk_status,'')) = 'EMPTY'"
+    "      OR LEFT(UPPER(COALESCE(v.publish_status,'')),7) = 'SKIPPED' THEN '未入索引'"
+    " WHEN UPPER(COALESCE(v.index_status,'')) IN ('INDEXED','SUCCESS') THEN '已上线'"
+    " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'FAILED'"
+    "      OR UPPER(COALESCE(v.index_status,'')) = 'FAILED' THEN '处理失败'"
+    " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'REJECTED' THEN '已驳回'"
+    " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'SKIPPED_DUPLICATE' THEN '内容未变'"
+    " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'PENDING_APPROVAL' THEN '待审核'"
+    " WHEN UPPER(COALESCE(v.content_process_status,'')) IN ('','NOT_STARTED') THEN '排队中'"
+    " ELSE '处理中' END"
+)
+
+
 def _require_kb_console(identity: Optional[Identity]):
     """强制：调用者必须是知识库管理员（dept_admin/kb_admin）。返回 DB 现查的 KbIdentity。
 
@@ -1931,6 +1957,8 @@ KbFeedbackDocRef = _routes_kb_console.KbFeedbackDocRef
 KbFeedbackReviewItem = _routes_kb_console.KbFeedbackReviewItem
 KbFeedbackReviewResponse = _routes_kb_console.KbFeedbackReviewResponse
 kb_feedback_review = _routes_kb_console.kb_feedback_review
+KbFeedbackResolveRequest = _routes_kb_console.KbFeedbackResolveRequest
+kb_feedback_resolve = _routes_kb_console.kb_feedback_resolve
 KbEmbedRunItem = _routes_kb_console.KbEmbedRunItem
 KbDeptCoverageItem = _routes_kb_console.KbDeptCoverageItem
 KbFeedbackDay = _routes_kb_console.KbFeedbackDay
@@ -1942,6 +1970,8 @@ KbConfigResponse = _routes_kb_console.KbConfigResponse
 kb_config = _routes_kb_console.kb_config
 kb_version_history = _routes_kb_console.kb_version_history
 kb_doc_status = _routes_kb_console.kb_doc_status
+KbDocPreviewResponse = _routes_kb_console.KbDocPreviewResponse
+kb_doc_preview = _routes_kb_console.kb_doc_preview
 KbUploadUrlRequest = _routes_kb_console.KbUploadUrlRequest
 KbUploadUrlResponse = _routes_kb_console.KbUploadUrlResponse
 KbRegisterRequest = _routes_kb_console.KbRegisterRequest
