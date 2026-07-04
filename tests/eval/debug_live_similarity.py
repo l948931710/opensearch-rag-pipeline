@@ -6,7 +6,8 @@ import requests
 import numpy as np
 from dotenv import load_dotenv
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(PROJECT_ROOT)
 
 from opensearch_pipeline.config import get_config
 
@@ -35,7 +36,9 @@ def main():
     
     q_text = "新员工试用期满要转正，人事部门和员工本人需要在到期前多少天分别完成什么准备？"
     
-    canon_file = "/Users/laijunchen/Downloads/opensearch-rag-pipeline/processing/canonical/hr/eval_hr_manual/v1/content.canonical.json"
+    canon_file = os.path.join(
+        PROJECT_ROOT, "processing/canonical/hr/eval_hr_manual/v1/content.canonical.json"
+    )
     with open(canon_file, "r") as f:
         data = json.load(f)
     
