@@ -230,8 +230,12 @@ body {
 .led-sort:hover { color: var(--text); }
 .led-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
 .led-actions button, .led-actions span { white-space: nowrap; }
-.doc-actions { opacity: 0; transition: opacity .13s; }
+/* 行操作可见性：默认半透明常显（静态浏览/截图/新用户可感知入口），hover/focus 升满。
+   原 opacity:0 纯 hover-reveal 有两个盲区——桌面新用户不知道要悬停；768–1024px 触屏
+   （hover:none）既无悬停又不命中 ≤680px 卡片态媒体查询，操作与「审批中」等状态恒不可见。 */
+.doc-actions { opacity: .45; transition: opacity .13s; }
 .led-row:hover .doc-actions, .led-row:focus-within .doc-actions { opacity: 1; }
+@media (hover: none) { .doc-actions { opacity: 1; } }
 
 /* 会话历史行：hover 显删除 + 当前会话高亮（Atlas） */
 .conv-del { opacity: 0; transition: opacity .13s; }
