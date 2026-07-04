@@ -5260,6 +5260,11 @@ def node_deactivate_old_chunks(ctx: dict):
       DAG 2: classify → detect → redact → publish → chunk → validate → write_chunk_meta
       DAG 3: acquire_lock → generate_embeddings → build_opensearch_payload → push_to_opensearch → update_index_status → deactivate_old
 
+    ⚠️ 完整性前提：本批 chunks 全部 INDEXED ≠ 该 (doc, version) 全部 INDEXED——stage-3 loader
+    按 created_at LIMIT 1000 装载、不按文档分组，边界可能把一个文档切成两批。因此停用前必须
+    按 (doc, ver) 查 RDS 确认同版本无残留未 INDEXED chunk（见下方 LIMIT 边界完整性闸），
+    否则推迟停用并把 document_version 复位 NOT_INDEXED 等待尾批。
+
     操作：
     1. RDS: UPDATE chunk_meta SET is_active=FALSE WHERE doc_id=X AND version_no < current
     2. OpenSearch: DELETE BY QUERY { doc_id=X AND version_no < current }
@@ -5338,6 +5343,59 @@ def node_deactivate_old_chunks(ctx: dict):
             f"Aborting to avoid silent recall loss. Examples (doc,ver,chunk_id,embedding_status): {zombie[:5]}"
         )
 
+    # ── LIMIT 边界完整性闸（全维复审 2026-07-03 top 项）──
+    # stage-3 loader（dataworks_orchestrator）按 created_at LIMIT 1000 取 NOT_INDEXED chunk，
+    # 无按文档分组：边界可能把一个文档的新版本切成两批。本批 chunks 全 INDEXED ≠ 该版本全部
+    # INDEXED——只凭内存 batch 判断就删旧版本，会在尾部 chunk 尚不可检索时执行不可逆的 HA3 删除，
+    # 该内容切片从搜索中消失，违反"先索引后停用"不变量。停用前按 (doc, ver) 查 RDS 是否仍有
+    # 同版本未 INDEXED 的残留 chunk：谓词与 spot_checker.reconcile_stranded_versions 的
+    # NOT EXISTS 完全一致（is_active = 1 AND index_status != 'INDEXED'）。命中版本推迟：
+    # 不删 HA3、不停用旧 chunk、不标 SUCCESS；document_version 复位 NOT_INDEXED，下一批
+    # loader 装入残留尾部、抢锁节点从 NOT_INDEXED 正常重入（若被旁路标了 SUCCESS，则由
+    # SUCCESS-relock 分支 / reconcile_stranded_versions 兜底），尾部索引完成后再由本节点收尾。
+    # 检查集合 = 本批 chunk 的全部 (doc, ver) ∪ current_versions（覆盖 SUCCESS 闸所及的所有版本）。
+    incomplete_versions = set()
+    if not simulate_db and chunks:
+        _ck_pairs = sorted({(c.doc_id, c.version_no) for c in chunks}
+                           | set(current_versions.items()))
+        conn = None
+        try:
+            conn = _get_db_conn(select_db=True)
+            with conn.cursor() as cursor:
+                _ck_clause = " OR ".join(
+                    ["(doc_id = %s AND version_no = %s)"] * len(_ck_pairs))
+                _ck_params = tuple(p for dv in _ck_pairs for p in dv)
+                cursor.execute(f"""
+                    SELECT DISTINCT doc_id, version_no FROM chunk_meta
+                    WHERE ({_ck_clause})
+                      AND is_active = 1
+                      AND index_status != 'INDEXED'
+                """, _ck_params)
+                _ck_asked = set(_ck_pairs)
+                for r in (cursor.fetchall() or []):
+                    # 防御：只认属于本次查询集合的 (doc_id, version_no)；短行/异行只可能来自宽松的
+                    # 测试桩，跳过（真实 WHERE 保证返回行必属查询集合，此过滤不改变生产语义）。
+                    if len(r) >= 2 and (r[0], r[1]) in _ck_asked:
+                        incomplete_versions.add((r[0], r[1]))
+        except Exception as e:
+            # 失败关闭：查不到完整性就绝不放行不可逆删除（与下方旧 id SELECT 的失败语义一致）
+            print(f"    ⚠️ Failed to verify version completeness before deactivation: {e}")
+            raise RuntimeError(f"Version completeness check failed before deactivation: {e}")
+        finally:
+            if conn:
+                conn.close()
+    if incomplete_versions:
+        _deferred_docs = sorted(d for d, v in current_versions.items()
+                                if (d, v) in incomplete_versions)
+        if _deferred_docs:
+            print(f"    ├─ ⚠️ Deferring old-version deactivation for {len(_deferred_docs)} doc(s) "
+                  f"with residual un-INDEXED chunks of the same version (LIMIT-boundary cut): "
+                  f"{_deferred_docs[:5]}")
+            current_versions = {
+                d: v for d, v in current_versions.items()
+                if (d, v) not in incomplete_versions
+            }
+
     # 检查 existing_chunks（模拟已在索引中的旧版本 chunks）
     existing_index = ctx.get("existing_opensearch_chunks", [])
     deactivated = []
@@ -5378,13 +5436,15 @@ def node_deactivate_old_chunks(ctx: dict):
             print(f"       ... and {len(deactivated) - 5} more")
 
     # Real RDS & OpenSearch deactivation
-    if current_versions:
+    # （incomplete_versions 非空时即使 current_versions 被清空也要进入：推迟的版本仍需
+    # document_version 状态收尾——复位 NOT_INDEXED，否则卡在 PROCESSING 等 2h 失效锁。）
+    if current_versions or incomplete_versions:
         # 1. First, retrieve the chunk IDs of all older versions from RDS (if DB is not simulated)
         # ⚠️ HA3 文档主键是 chunk_meta.id（INT64 自增，见 to_ha3_doc 的 rds_id），
         # 不是字符串 chunk_id。删除必须用同一个 id，否则删除永远匹配不到已推送的文档，
         # 旧版本 chunk 会一直留在线上索引（与 spot_checker._delete_chunks_from_index 一致）。
         old_chunk_ids_map = {}
-        if not simulate_db:
+        if not simulate_db and current_versions:
             conn = None
             try:
                 conn = _get_db_conn(select_db=True)
@@ -5424,12 +5484,13 @@ def node_deactivate_old_chunks(ctx: dict):
                 old_chunk_ids_map[doc_id] = [d["chunk_id"] for d in deactivated if d["doc_id"] == doc_id]
 
         # 2. Delete from Search Index (HA3 Engine SDK delete or standard OpenSearch delete_by_query)
+        # （current_versions 为空 = 本批全部被推迟，无可删对象，跳过整段以免空跑客户端/守卫）
         if simulate_opensearch:
             if deactivated:
                 print(f"    └─ [SIMULATED] OpenSearch: DELETE BY QUERY")
                 for doc_id, ver in current_versions.items():
                     print(f"       {{ \"doc_id\": \"{doc_id}\", \"version_no\": {{ \"lt\": {ver} }} }}")
-        else:
+        elif current_versions:
             try:
                 client = _get_opensearch_client(ctx)
                 index_name = ctx.get("opensearch_index") or get_config().opensearch.index_name
@@ -5523,7 +5584,12 @@ def node_deactivate_old_chunks(ctx: dict):
                     print(f"       WHERE doc_id='{doc_id}' AND version_no < {ver} AND is_active = 1")
             for (doc_id, ver), fail_cnt in failed_counts.items():
                 if (doc_id, ver) in valid_doc_versions:
-                    final_status = 'FAILED' if (fail_cnt or (doc_id, ver) in known_failed) else 'SUCCESS'
+                    if fail_cnt or (doc_id, ver) in known_failed:
+                        final_status = 'FAILED'
+                    elif (doc_id, ver) in incomplete_versions:
+                        final_status = 'NOT_INDEXED'  # LIMIT 边界推迟：残留尾部待下批
+                    else:
+                        final_status = 'SUCCESS'
                     print(f"    ├─ [SIMULATED] RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
         else:
             conn = None
@@ -5532,23 +5598,32 @@ def node_deactivate_old_chunks(ctx: dict):
                 with conn.cursor() as cursor:
                     # Update older chunks
                     # E#45：逐 doc UPDATE → 一条 OR-链合并（谓词逐字对应，行集合一致）
+                    # （本批全部被 LIMIT 边界推迟时 current_versions 为空：跳过，仅做状态收尾）
                     _dv_items = list(current_versions.items())
-                    _dv_clause = " OR ".join(
-                        ["(doc_id = %s AND version_no < %s)"] * len(_dv_items))
-                    _dv_params = tuple(p for dv in _dv_items for p in dv)
-                    cursor.execute(f"""
-                        UPDATE chunk_meta
-                        SET is_active = FALSE,
-                            index_status = 'DELETED'
-                        WHERE ({_dv_clause}) AND is_active = 1
-                    """, _dv_params)
-                    print("    └─ Updated older versions of chunks in RDS chunk_meta to inactive")
+                    if _dv_items:
+                        _dv_clause = " OR ".join(
+                            ["(doc_id = %s AND version_no < %s)"] * len(_dv_items))
+                        _dv_params = tuple(p for dv in _dv_items for p in dv)
+                        cursor.execute(f"""
+                            UPDATE chunk_meta
+                            SET is_active = FALSE,
+                                index_status = 'DELETED'
+                            WHERE ({_dv_clause}) AND is_active = 1
+                        """, _dv_params)
+                        print("    └─ Updated older versions of chunks in RDS chunk_meta to inactive")
 
                     # Update document_version status（E#45：按 final_status 分组合并 UPDATE）
                     _status_groups = {}
                     for (doc_id, ver), fail_cnt in failed_counts.items():
                         if (doc_id, ver) in valid_doc_versions:
-                            final_status = 'FAILED' if (fail_cnt or (doc_id, ver) in known_failed) else 'SUCCESS'
+                            if fail_cnt or (doc_id, ver) in known_failed:
+                                final_status = 'FAILED'
+                            elif (doc_id, ver) in incomplete_versions:
+                                # LIMIT 边界推迟：复位 NOT_INDEXED，让下一批 loader / 抢锁节点
+                                # 立即重入残留尾部；绝不 SUCCESS（否则尾部只能靠 SUCCESS-relock 兜底）。
+                                final_status = 'NOT_INDEXED'
+                            else:
+                                final_status = 'SUCCESS'
                             _status_groups.setdefault(final_status, []).append((doc_id, ver))
                             print(f"    ├─ RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
                     for final_status, _dvs in _status_groups.items():

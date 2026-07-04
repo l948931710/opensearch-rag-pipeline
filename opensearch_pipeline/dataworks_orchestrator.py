@@ -422,6 +422,10 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                         ORDER BY cm.created_at ASC
                         LIMIT 1000
                     """)
+                    # ⚠️ LIMIT 1000 不按文档分组，边界可能把一个文档的新版本切成两批。
+                    # 中切安全性由 node_deactivate_old_chunks 的 LIMIT 边界完整性闸保证：
+                    # 同版本仍有残留未 INDEXED chunk 时推迟停用旧版本并把 document_version
+                    # 复位 NOT_INDEXED，尾批在 drain-loop 下一轮被装入后再收尾。
                     rows = cursor.fetchall()
                     for row in rows:
                         rds_id = row[0]
