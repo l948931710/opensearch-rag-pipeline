@@ -15,9 +15,21 @@ on:
 permissions:
   contents: read
 
+# 同 ref 的新 push 取消在跑的旧 run（solo 直推 main 的节奏下，旧 commit 的结论没有价值；
+# 一小时三连推曾三条 pipeline 全量跑完）。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # 3.10=本地 stack-test conda；3.11=生产 serving（Dockerfile python:3.11-slim）。
+      # 套件 ~17s，双版本成本可忽略；版本差异行为（enum/asyncio 语义）不再漏过。
+      matrix:
+        python-version: ["3.10", "3.11"]
     env:
       RAG_SIMULATE: "true"
       RAG_SIMULATE_API: "true"
@@ -28,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
           # perf#21：缓存 pip 下载目录（PyMuPDF/opensearch-py/oss2/dashscope/ha3-sdk 等重依赖树），
           # 与 frontend job 的 npm 缓存对称；键随 pyproject.toml 变化自动失效。
           cache: pip
@@ -37,8 +49,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,production,ocr,api]"
-      - name: Lint (ruff — informational; pre-existing baseline not yet zeroed)
-        continue-on-error: true
+      - name: Lint (ruff — BLOCKING; 存量债 2026-07-04 清零，此后新增即红)
         run: python -m ruff check opensearch_pipeline/ tests/
       - name: Test (simulate mode — no external services)
         # perf F#48：xdist 并行（ubuntu runner 4 vCPU）；--dist loadgroup + conftest 分组钩子
@@ -54,6 +65,7 @@ jobs:
   # "权威 DDL 可从零建库"的门），再只跑 DB 标记的 4 个模块。与 test job 并行，不拖慢它。
   db-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       mysql:
         image: mysql:8.0
@@ -115,6 +127,7 @@ jobs:
   # 供应链/密钥门（P2-03）：secret 扫描 + 依赖 CVE 审计。此前 CI 完全无安全门。
   security:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -144,6 +157,7 @@ jobs:
   # 单独 typecheck 步。node 22 对齐本地工具链；构建产物（next-dist/）gitignore，仅作编译校验。
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: console-app
