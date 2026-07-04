@@ -529,7 +529,7 @@ def main():
         "\n   - *Characteristics*: Administrative and company life FAQs.",
         "\n---",
         "\n## 2. Ingestion & Retrieval Sweep Results",
-        f"\nBelow are the top configurations identified during the parameter sweep over the **12 highly targeted business queries**:",
+        "\nBelow are the top configurations identified during the parameter sweep over the **12 highly targeted business queries**:",
         "\n| Config Rank | SOP (Size/Overlap) | Manual (Size/Overlap) | FAQ (Size/Overlap) | Chunks Generated | Recall@1 | Recall@5 | Recall@10 | MRR |",
         "| :---: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |"
     ]
@@ -583,7 +583,7 @@ def main():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
         
-    print(f"\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_docs_report.md")
+    print("\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_docs_report.md")
 
 if __name__ == "__main__":
     main()

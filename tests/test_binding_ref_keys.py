@@ -9,7 +9,6 @@ import json
 import os
 import tempfile
 
-import pytest
 
 from eval_harness.binding.ref_keys import ImageRef, jaccard, parse_ref_dict, img_dup_factor
 from eval_harness.binding.gt_loader import load_gt, validate_gt_against_manifest

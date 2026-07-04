@@ -551,7 +551,7 @@ def main():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
         
-    print(f"\n✅ Beautiful evaluation report exported successfully to: scratch/evaluation_report.md")
+    print("\n✅ Beautiful evaluation report exported successfully to: scratch/evaluation_report.md")
 
 
 if __name__ == "__main__":

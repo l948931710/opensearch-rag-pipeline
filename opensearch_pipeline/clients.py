@@ -197,7 +197,7 @@ def _ensure_opensearch_index(client, index_name: str, dimension: int):
     """确保 OpenSearch 索引存在并具有正确的 Lucene KNN 映射。"""
     # 如果是 HA3 Engine 客户端，其表结构由阿里云控制台可视化配置，不可在此动态创建，直接跳过
     if hasattr(client, "push_documents") or client == "MOCK_HA3_CLIENT":
-        print(f"    ├─ [HA3 Engine] Table and mappings are fully managed on Alibaba Cloud Web Console. Skipping dynamic creation.")
+        print("    ├─ [HA3 Engine] Table and mappings are fully managed on Alibaba Cloud Web Console. Skipping dynamic creation.")
         return
 
     if not client.indices.exists(index=index_name):

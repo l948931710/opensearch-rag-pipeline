@@ -10,10 +10,9 @@ test_ha3_engine.py — HA3 Engine 推送/删除逻辑的单元测试
 """
 
 import sys
-import time
 import types
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 from opensearch_pipeline.chunker import Chunk
 
 

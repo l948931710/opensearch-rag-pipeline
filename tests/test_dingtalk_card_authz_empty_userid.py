@@ -16,7 +16,6 @@ test_dingtalk_card_authz_empty_userid.py — 卡片回调归属校验回归测�
 不触碰任何真实 DB/SDK/网络。
 """
 
-import unittest.mock as mock
 
 import pytest
 

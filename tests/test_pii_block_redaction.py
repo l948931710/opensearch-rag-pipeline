@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-import pytest
 from opensearch_pipeline.pipeline_nodes import node_redact_or_quarantine
-from opensearch_pipeline.extraction.schema import ExtractionResult, ExtractedBlock
+from opensearch_pipeline.extraction.schema import ExtractedBlock
 
 def test_block_pii_redaction():
     # Construct a document context with medium risk and sensitive data

@@ -6,9 +6,20 @@ test_pipeline.py — DAG 端到端集成测试
 import copy
 
 import pytest
-from datetime import datetime
 
 from tests.local_stack import requires_local_db, requires_local_opensearch
+
+from opensearch_pipeline.dag_definitions import (
+    build_dag1_raw_to_canonical,
+    build_dag2_canonical_to_chunk,
+    build_dag3_chunk_to_opensearch,
+    build_dag4_retrieval_eval,
+    build_full_pipeline,
+)
+from opensearch_pipeline.run_simulation import (
+    get_test_data,
+    get_version_update_data,
+)
 
 @pytest.fixture
 def reset_db_state():
@@ -56,17 +67,6 @@ def force_simulate_api():
     yield
     config.simulate_api = orig_simulate_api
 
-from opensearch_pipeline.dag_definitions import (
-    build_dag1_raw_to_canonical,
-    build_dag2_canonical_to_chunk,
-    build_dag3_chunk_to_opensearch,
-    build_dag4_retrieval_eval,
-    build_full_pipeline,
-)
-from opensearch_pipeline.run_simulation import (
-    get_test_data,
-    get_version_update_data,
-)
 
 
 class TestDAGStructure:

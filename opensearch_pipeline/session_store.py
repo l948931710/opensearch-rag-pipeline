@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from opensearch_pipeline.config import get_config
 

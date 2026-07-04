@@ -1070,7 +1070,6 @@ def evaluate_retrieval_large_hybrid(
 
 def main():
     import sys
-    from opensearch_pipeline.config import get_config
     config = get_config()
     config.simulate = False
     

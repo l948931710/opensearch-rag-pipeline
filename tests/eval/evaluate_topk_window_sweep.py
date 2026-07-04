@@ -243,7 +243,7 @@ def main():
     print("  ✅ RDS 连接成功")
 
     test_results = search_chunks("测试连接", top_k=1)
-    print(f"  ✅ HA3 连接成功")
+    print("  ✅ HA3 连接成功")
 
     # 3. 缓存所有 query 的 HA3 检索结果（共享 embedding，减少 API 调用）
     # 只需要最大 top_k 的结果，较小的 top_k 取前缀即可
@@ -347,7 +347,7 @@ def main():
     rds_conn.close()
 
     # 5. 生成报告
-    print(f"\n  生成报告...")
+    print("\n  生成报告...")
     report = generate_report(all_results, len(queries))
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write(report)
@@ -436,7 +436,7 @@ def generate_report(all_results: Dict, total_queries: int) -> str:
     for m in all_results.values():
         categories.update(m["per_category"].keys())
 
-    report += f"| 类别 | N |"
+    report += "| 类别 | N |"
     for lbl in compare_labels:
         short = lbl.split("(")[1].rstrip(")") if "(" in lbl else lbl
         report += f" {short} CC |"
@@ -457,7 +457,7 @@ def generate_report(all_results: Dict, total_queries: int) -> str:
         report += "\n"
 
     # Recommendation
-    report += f"""
+    report += """
 ---
 
 ## 4. 参数选择建议

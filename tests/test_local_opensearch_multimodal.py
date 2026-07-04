@@ -10,7 +10,6 @@
 """
 
 import json
-import math
 import os
 import sys
 import time
@@ -507,7 +506,7 @@ def run_tests(client: OpenSearch, index_name: str):
         if not results:
             print(f"\n  ❌ Q{i+1}: {tc['query']}")
             print(f"     预期: {tc['description']}")
-            print(f"     结果: 无结果返回")
+            print("     结果: 无结果返回")
             failed += 1
             continue
 
@@ -605,7 +604,7 @@ def main():
         doc = c.to_ha3_doc()
         assert "source_image" not in doc, f"FAIL: text chunk {c.chunk_id} 不应有 source_image"
         assert "visual_summary" not in doc, f"FAIL: text chunk {c.chunk_id} 不应有 visual_summary"
-    print(f"  ✅ 文本 chunks 无多模态字段（正确）")
+    print("  ✅ 文本 chunks 无多模态字段（正确）")
 
     # Step 6: 写入 OpenSearch
     print("\n📤 Step 6: 写入 OpenSearch...")
@@ -620,7 +619,7 @@ def main():
     passed, failed = run_tests(client, TEST_INDEX)
 
     # Step 8: 清理
-    print(f"\n🧹 Step 8: 清理测试索引...")
+    print("\n🧹 Step 8: 清理测试索引...")
     client.indices.delete(index=TEST_INDEX)
     print(f"  ✅ 已删除 {TEST_INDEX}")
 

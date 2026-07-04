@@ -65,3 +65,15 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+
+[tool.ruff.lint]
+# E701/E702（单行冒号/分号复合语句）：仓库既有紧凑风格（`if conn: conn.rollback()` 等
+# ~89 处），封禁只产生无信息量的大面积 churn——按项目约定豁免。其余规则全量生效，
+# CI test job 的 lint 步为【阻塞】门（2026-07-04 存量债清零后翻正）。
+ignore = ["E701", "E702"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests/eval/ 是带 sys.path bootstrap 的独立评测脚本（不进 pytest 收集）：
+# bootstrap 后才能 import 包（E402 刻意）；脚本间复制演化保留了备用 import/变量，
+# 逐个清理无收益。包代码与正式测试不在豁免之列。
+"tests/eval/*" = ["E402", "F401", "F841", "E731"]

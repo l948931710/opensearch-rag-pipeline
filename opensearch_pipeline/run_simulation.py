@@ -14,8 +14,6 @@ run_simulation.py — 端到端管线模拟测试
 """
 
 import argparse
-import json
-import os
 import sys
 from datetime import datetime
 
@@ -446,7 +444,7 @@ def run_pipeline(dag_ids: list, scenario: str = "normal", show_graph: bool = Fal
     }
 
     print(f"\n{'#' * 70}")
-    print(f"  OpenSearch Pipeline Simulation")
+    print("  OpenSearch Pipeline Simulation")
     print(f"  Scenario: {scenario}")
     print(f"  DAGs: {', '.join(dag_ids)}")
     print(f"  Time: {datetime.now().isoformat()}")
@@ -470,7 +468,7 @@ def run_pipeline(dag_ids: list, scenario: str = "normal", show_graph: bool = Fal
 def _print_final_summary(ctx: dict, scenario: str):
     """打印管线最终执行摘要。"""
     print(f"\n{'█' * 70}")
-    print(f"  PIPELINE EXECUTION SUMMARY")
+    print("  PIPELINE EXECUTION SUMMARY")
     print(f"{'█' * 70}")
 
     # 文档处理
@@ -496,7 +494,7 @@ def _print_final_summary(ctx: dict, scenario: str):
     # 索引状态
     result = ctx.get("index_result", {})
     if result:
-        print(f"\n  🔍 Index Result:")
+        print("\n  🔍 Index Result:")
         print(f"     Status: {result.get('status')}")
         print(f"     Indexed: {result.get('indexed')}")
         print(f"     Index: {result.get('index_name')}")
@@ -505,7 +503,7 @@ def _print_final_summary(ctx: dict, scenario: str):
     report = ctx.get("eval_report", {})
     if report:
         summary = report.get("summary", {})
-        print(f"\n  📊 Eval Report:")
+        print("\n  📊 Eval Report:")
         print(f"     Queries tested: {summary.get('total_queries_tested')}")
         print(f"     Avg top-1 score: {summary.get('avg_top1_score')}")
 

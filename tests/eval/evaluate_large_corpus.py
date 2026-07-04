@@ -1790,9 +1790,9 @@ def main():
         f.write("\n".join(report_lines) + "\n")
         
     
-    print(f"\n=== Running Alpha Weight Sweep ===")
+    print("\n=== Running Alpha Weight Sweep ===")
     for alpha in [1.0, 0.7, 0.5, 0.3, 0.0, -1.0]:
-        print(f"\n[RRF Strategy] (Reciprocal Rank Fusion)") if alpha == -1.0 else print(f"\n[Alpha = {alpha:.1f}] (BM25: {alpha*100:.0f}%, Vector: {(1.0-alpha)*100:.0f}%)")
+        print("\n[RRF Strategy] (Reciprocal Rank Fusion)") if alpha == -1.0 else print(f"\n[Alpha = {alpha:.1f}] (BM25: {alpha*100:.0f}%, Vector: {(1.0-alpha)*100:.0f}%)")
         eval_res = evaluate_retrieval_large(sweep_ctx["valid_chunks"], embedding_cache, baseline_ranks=None, alpha=alpha)
         
         # Calculate Strict MRR and Cross-Doc Conf
@@ -1812,7 +1812,7 @@ def main():
         print(f"    └─ [Regr]   Cross-Doc Conf: {confusions/len(eval_res)*100:.2f}%")
 
 
-    print(f"\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_corpus_report.md")
+    print("\n✅ Premium evaluation report exported successfully to: scratch/evaluation_large_corpus_report.md")
 
 if __name__ == "__main__":
     main()

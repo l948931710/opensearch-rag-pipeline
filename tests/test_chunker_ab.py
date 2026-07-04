@@ -21,7 +21,6 @@ from eval_harness.chunker_ab import (
     ComparisonReport,
     Mode,
     SemanticChunkSig,
-    TopologyFingerprint,
     _anchor_hit,
     _chunk_to_sig,
     _compute_anchor_metrics,

@@ -6,7 +6,9 @@ HTML 图文对照报告生成器 v2
 确保 image_index 对齐。
 """
 
-import os, sys, glob, re, base64, shutil
+import os
+import base64
+import shutil
 
 os.environ["RAG_ENV"] = "local"
 
@@ -173,7 +175,7 @@ h1 {{ color:#00d4ff; font-size:22px; }}
         imgs = (sc.extra or {}).get("image_refs", [])
         anno = (sc.extra or {}).get("annotation_map", {})
         circled = (sc.extra or {}).get("circled_refs", [])
-        lines = [l for l in sc.chunk_text.split("\n") if not l.startswith("【文档:")]
+        lines = [ln for ln in sc.chunk_text.split("\n") if not ln.startswith("【文档:")]
         content = "\n".join(lines).strip()
 
         # 显示标签: §3.2.4 for heading steps, 步骤 N for text steps
@@ -184,7 +186,7 @@ h1 {{ color:#00d4ff; font-size:22px; }}
         else:
             step_label = f"步骤 {sno}"
 
-        html.append(f'<div class="step">')
+        html.append('<div class="step">')
         html.append(f'<div class="step-head">{step_label} · {sec[:40]}</div>')
         html.append(f'<div class="step-text">{content[:800]}</div>')
 
@@ -287,4 +289,4 @@ h1 {{ color:#00d4ff; font-size:22px; }}
         f.write("\n".join(html))
     print(f"  ✅ {label}/audit_report.html ({len(step_cards)} steps, pipeline imgs={len(image_assets)}, blobs={len(image_blobs)}, refs={found_refs}/{total_refs})")
 
-print(f"\n  完成。")
+print("\n  完成。")

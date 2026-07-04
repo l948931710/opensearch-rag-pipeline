@@ -682,7 +682,7 @@ def generate_report(
         "",
         f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        f"**Chunk Config:** Clause_1000_150 (locked)",
+        "**Chunk Config:** Clause_1000_150 (locked)",
         f"**Query Count:** {n_queries} (Manual={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='manual')}, "
         f"SOP={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='sop')}, "
         f"FAQ={sum(1 for q in LARGE_EVAL_QUERIES if q['category']=='faq')}, "

@@ -427,7 +427,7 @@ def extract_images_from_xlsx(
     """
     try:
         from openpyxl import load_workbook
-        from openpyxl.drawing.image import Image as XlImage
+        from openpyxl.drawing.image import Image as XlImage  # noqa: F401 — 可用性探测（缺则优雅降级返回 []）
     except ImportError:
         return []
 

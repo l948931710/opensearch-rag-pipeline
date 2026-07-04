@@ -2,7 +2,7 @@
 """F-22：多部门用户首解析时某部门 department/get 瞬时失败 → 不完整 CSV 绝不落缓存（否则永久
 少授权）；缓存命中的自动 employee 行加行级 TTL 复核自愈残缺，seeded 行（role≠employee）永远
 缓存优先（H3）。全程 monkeypatch DB 与钉钉 API，与 simulate 无关。"""
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import opensearch_pipeline.dingtalk_identity as di
 

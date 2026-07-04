@@ -410,7 +410,7 @@ def main():
 
     # Step 5: 写入
     print("\n📤 Step 5: 写入 OpenSearch...")
-    indexed = index_chunks(client, TEST_INDEX, all_chunks)
+    index_chunks(client, TEST_INDEX, all_chunks)
     time.sleep(1)
 
     # Step 6: 检索测试
@@ -480,7 +480,6 @@ def main():
 
     print(f"\n  索引中 image chunks 总数: {len(img_hits)}")
 
-    field_ok = True
     for h in img_hits[:5]:
         src = h["_source"]
         has_si = bool(src.get("source_image"))
@@ -489,7 +488,6 @@ def main():
         print(f"  {icon} {src['doc_id']}: source_image={'有' if has_si else '无'}, "
               f"visual_summary={'有' if has_vs else '无'}, page={src.get('page_num')}")
         if not (has_si and has_vs):
-            field_ok = False
             all_passed = False
 
     if len(img_hits) > 5:
@@ -500,24 +498,24 @@ def main():
         if remaining_ok:
             print(f"  ✅ 其余 {len(img_hits)-5} 个 image chunks 字段也完整")
         else:
-            print(f"  ❌ 部分 image chunks 缺少字段")
+            print("  ❌ 部分 image chunks 缺少字段")
             all_passed = False
 
     # Step 8: 清理
-    print(f"\n🧹 Step 8: 清理...")
+    print("\n🧹 Step 8: 清理...")
     client.indices.delete(index=TEST_INDEX)
     import shutil
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    print(f"  ✅ 已清理索引 + 临时目录")
+    print("  ✅ 已清理索引 + 临时目录")
 
     # 结果
     print(f"\n{'█' * 90}")
     if all_passed:
-        print(f"  ✅ 嵌入图片全链路测试通过！")
-        print(f"     DOCX 嵌入图片 → ImageFunnelProcessor → chunk → embedding → 向量检索 ✅")
-        print(f"     PDF 嵌入图片（带 page_num）→ 同上 ✅")
+        print("  ✅ 嵌入图片全链路测试通过！")
+        print("     DOCX 嵌入图片 → ImageFunnelProcessor → chunk → embedding → 向量检索 ✅")
+        print("     PDF 嵌入图片（带 page_num）→ 同上 ✅")
     else:
-        print(f"  ⚠️  部分检查未通过，请查看上方详情")
+        print("  ⚠️  部分检查未通过，请查看上方详情")
     print(f"{'█' * 90}")
 
     return 0 if all_passed else 1

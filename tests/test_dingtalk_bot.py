@@ -13,11 +13,9 @@ test_dingtalk_bot.py — 钉钉企业机器人回调适配层完整测试套件
 import base64
 import hashlib
 import hmac
-import json
 import os
 import time
-import unittest.mock as mock
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 from starlette.testclient import TestClient

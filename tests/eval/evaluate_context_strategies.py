@@ -406,7 +406,7 @@ def main():
             continue
 
         if not hits:
-            print(f"    ⚠️ 无检索结果，跳过")
+            print("    ⚠️ 无检索结果，跳过")
             continue
 
         # R@1
@@ -528,7 +528,7 @@ def main():
 
     n = max(len(results), 1)
     identical_cnt = sum(1 for r in results if r.get("contexts_identical"))
-    print(f"\n  Neighbor Stitch vs Flat (Context Coverage):")
+    print("\n  Neighbor Stitch vs Flat (Context Coverage):")
     print(f"    提升: {improved} ({improved/n:.1%})")
     print(f"    下降: {degraded} ({degraded/n:.1%})")
     print(f"    不变: {unchanged} ({unchanged/n:.1%})")

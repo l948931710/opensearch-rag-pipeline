@@ -157,7 +157,8 @@ def test_c4_classify_failsafe_bumps_retry_count():
     """F-14：node_classify_and_risk_assess 的 fail-safe（LLM 400/持续 429/缺 key）写 FAILED 时，
     必须自增 retry_count —— 与 orchestrator 的 (FAILED AND retry_count<3) 认领谓词配套，N 次后
     自然停在 FAILED 等人工，不再每日整轮 no-progress raise。"""
-    import inspect, re
+    import inspect
+    import re
     import opensearch_pipeline.pipeline_nodes as pn
     src = inspect.getsource(pn.node_classify_and_risk_assess)
     # 唯一定位 fail-safe UPDATE：含 classification_confidence = 0.0 + content_process_status = 'FAILED'

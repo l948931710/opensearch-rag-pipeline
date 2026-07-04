@@ -16,10 +16,9 @@ import hashlib
 import json
 import os
 import re
-import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from opensearch_pipeline.chunker import Chunk, DocumentChunker
 from opensearch_pipeline.config import get_config
@@ -5515,7 +5514,7 @@ def node_deactivate_old_chunks(ctx: dict):
         # （current_versions 为空 = 本批全部被推迟，无可删对象，跳过整段以免空跑客户端/守卫）
         if simulate_opensearch:
             if deactivated:
-                print(f"    └─ [SIMULATED] OpenSearch: DELETE BY QUERY")
+                print("    └─ [SIMULATED] OpenSearch: DELETE BY QUERY")
                 for doc_id, ver in current_versions.items():
                     print(f"       {{ \"doc_id\": \"{doc_id}\", \"version_no\": {{ \"lt\": {ver} }} }}")
         elif current_versions:
@@ -5737,11 +5736,10 @@ def node_generate_embeddings(ctx: dict):
             # 不再需要独立的多模态向量（实验证明 text-embedding-v4 + visual_summary 效果最优）
             
         print(f"    └─ Generated {len(chunks)} embeddings (model={embedding_model}, dim={embedding_dim})")
-        print(f"       ⚡ Note: using simulated vectors (hash-based) for local testing")
+        print("       ⚡ Note: using simulated vectors (hash-based) for local testing")
     else:
         import requests
         import time
-        import base64
         api_key = config.embedding.api_key
         base_url = config.embedding.api_base_url
         batch_size = config.embedding.batch_size
@@ -6346,7 +6344,6 @@ def node_push_to_opensearch(ctx: dict):
 
     for i, batch in enumerate(batches):
         chunk_count = len(batch["chunks"])
-        payload_size = batch["payload_size"]
         job_id = batch["job_id"]
 
         if simulate_opensearch:
@@ -6556,7 +6553,7 @@ def node_update_index_status(ctx: dict):
 
     if simulate_db:
         print(f"    └─ [SIMULATED] Would update {chunks_count} chunk records in RDS:")
-        print(f"       embedding_status=DONE, index_status=INDEXED")
+        print("       embedding_status=DONE, index_status=INDEXED")
         if failed_doc_versions:
             print(f"       [SIMULATED] Would update document_version status to 'FAILED' for: {list(failed_doc_versions)}")
 
@@ -7358,7 +7355,7 @@ def node_eval_report(ctx: dict):
 
     ctx["eval_report"] = report
 
-    print(f"    └─ Eval Report:")
+    print("    └─ Eval Report:")
     print(f"       Documents: {report['summary']['total_documents']}")
     print(f"       Chunks: {report['summary']['total_chunks']}")
     print(f"       Chunk types: {type_counts}")

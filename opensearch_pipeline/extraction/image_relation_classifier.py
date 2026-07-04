@@ -18,8 +18,7 @@ image_relation_classifier.py — 图片-步骤关系分类器（规则引擎）
 依赖：jieba, re (标准库)
 """
 
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Set
 
 import jieba

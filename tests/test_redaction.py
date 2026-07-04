@@ -215,13 +215,15 @@ def test_v2_over_redaction_guard_stoplist():
 
 def test_v2_name_llm_sweep():
     # the LLM sweep catches names regex misses (no gender/label/ID anchor)
-    fake_llm = lambda prompt: '["孙八"]'
+    def fake_llm(prompt):
+        return '["孙八"]'
     out, counts = R.redact_text("审批人 孙八 负责复核流程", name_llm_fn=fake_llm)
     assert "孙八" not in out and counts.get("name", 0) >= 1
 
 
 def test_v2_name_llm_sweep_ignores_non_names():
-    fake_llm = lambda prompt: '["质量部", "综合管理中心"]'  # org/dept terms, not names
+    def fake_llm(prompt):  # org/dept terms, not names
+        return '["质量部", "综合管理中心"]'
     out, counts = R.redact_text("质量部与综合管理中心协同", name_llm_fn=fake_llm)
     assert "质量部" in out and "name" not in counts  # org-suffix guard preserves them
 
@@ -229,7 +231,8 @@ def test_v2_name_llm_sweep_ignores_non_names():
 def test_v2_llm_sweep_boundary_aware_no_substring_nuke():
     # regression: an LLM-returned token that is a substring of a business phrase
     # must NOT be raw-replaced inside it (v2 bug: 参保人员减员申报 → 参保人[姓名已脱敏]报)
-    fake_llm = lambda p: '["员减员申"]'
+    def fake_llm(p):
+        return '["员减员申"]'
     out, counts = R.redact_text("点击参保人员减员申报按钮", name_llm_fn=fake_llm)
     assert "参保人员减员申报" in out and "name" not in counts
 

@@ -15,7 +15,6 @@ _get_db_conn / _safety_review_llm / get_config / 三个对账任务全部替换�
 故下面对 INSERT 与计数的断言在修复前必然失败。
 """
 import types
-import pytest
 
 from opensearch_pipeline import spot_checker
 from opensearch_pipeline import ha3_reconcile

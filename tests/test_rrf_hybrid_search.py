@@ -102,7 +102,7 @@ def _ensure_ha3_mock_modules():
 
 _ensure_ha3_mock_modules()
 
-from opensearch_pipeline.config import (
+from opensearch_pipeline.config import (  # noqa: E402 — 必须在 _ensure_ha3_mock_modules() 注入 sys.modules 之后
     PipelineConfig, AlibabaVectorSearchConfig, EmbeddingConfig,
 )
 

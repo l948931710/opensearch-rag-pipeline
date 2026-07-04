@@ -233,11 +233,11 @@ def run_large_evaluation():
         "\nThis report benchmark retrieval metrics on a significantly scaled-up corpus of **30 representative corporate documents** containing a total of multiple department SOPs, operator manuals, and FAQ sheets.",
         "\n---",
         "\n## 1. Document Category & Corpus Distribution",
-        f"\nWe classified the 30 representative documents into the following category routing distribution:",
-        f"- **SOPs / Rules (`sop`)**: 16 files",
-        f"- **Job Manuals / Operator Guides (`manual`)**: 12 files",
-        f"- **FAQ Collections (`faq`)**: 2 files",
-        f"\nTotal Corpus Size: **30 Documents**",
+        "\nWe classified the 30 representative documents into the following category routing distribution:",
+        "- **SOPs / Rules (`sop`)**: 16 files",
+        "- **Job Manuals / Operator Guides (`manual`)**: 12 files",
+        "- **FAQ Collections (`faq`)**: 2 files",
+        "\nTotal Corpus Size: **30 Documents**",
         "\n---",
         "\n## 2. Ingestion Benchmark Summary Table",
         "\nBelow are the retrieval evaluation metrics comparing rigid single-configuration strategies against **Category-Aware Dynamic Routing** across the expanded 30-document index:",
@@ -288,7 +288,7 @@ def run_large_evaluation():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
         
-    print(f"\n✅ Large-scale evaluation report exported successfully to: scratch/evaluation_30_docs_report.md")
+    print("\n✅ Large-scale evaluation report exported successfully to: scratch/evaluation_30_docs_report.md")
 
 if __name__ == "__main__":
     run_large_evaluation()
