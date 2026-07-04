@@ -11,9 +11,8 @@ ocr_client.py — Qwen-VL OCR 统一客户端
 
 import os
 import re
-import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from opensearch_pipeline.extraction.schema import ExtractedBlock
 
@@ -234,9 +233,9 @@ class OCRClient:
         """
         真实 PDF OCR (Qwen-VL Vision)。
         流程：
-        1. PDF → 图片（fitz）
+        1. PDF → 图片（fitz，串行——pymupdf 同一 doc 句柄的 page 对象非线程安全）
         2. Base64 编码
-        3. Qwen-VL API 提取文本
+        3. Qwen-VL API 提取文本（有界并发，见 _ocr_rendered_pages）
 
         page_nums: 仅 OCR 这些页（1-based）；None = 前 max_ocr_pages 页。
         """
@@ -249,7 +248,6 @@ class OCRClient:
             return OCRResult(status="FAILED", error="PyMuPDF (fitz) not installed")
 
         import base64
-        pages = []
 
         try:
             doc = fitz.open(local_path)
@@ -265,6 +263,10 @@ class OCRClient:
                 print(f"    ⚠️ [ocr] capped at max_ocr_pages={self.max_ocr_pages}; "
                       f"{dropped} low-text page(s) left un-OCR'd", flush=True)
 
+            # Phase 1（串行）：渲染 + 压缩 + base64。pymupdf 同一 doc 句柄的 page
+            # 对象非线程安全，渲染必须留在单线程；相对 API 调用（秒级）渲染是快路径，
+            # 串行代价可忽略。渲染失败沿用旧语义：异常直接落到外层 except → 整体 FAILED。
+            rendered = []  # [(page_idx, b64_data, mime_type)]，按页序
             for page_idx in page_idxs:
                 page = doc[page_idx]
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -283,25 +285,12 @@ class OCRClient:
                 except Exception:
                     pass
                 b64_data = base64.b64encode(img_data).decode('utf-8')
-
-                try:
-                    page_text = self._call_ocr_api(b64_data, mime_type)
-                    # 反幻觉修剪（不传尺寸：整页渲染只修剪重复，绝不整体丢弃）
-                    page_text, _ = sanitize_ocr_text(page_text)
-                    pages.append(OCRPageResult(
-                        page_num=page_idx + 1,
-                        text=page_text,
-                        status="DONE",
-                    ))
-                except Exception as e:
-                    pages.append(OCRPageResult(
-                        page_num=page_idx + 1,
-                        text="",
-                        status="FAILED",
-                        error=repr(e),
-                    ))
+                rendered.append((page_idx, b64_data, mime_type))
 
             doc.close()
+
+            # Phase 2：API 调用（页间独立）有界并发，结果按页序 keyed 重组。
+            pages = self._ocr_rendered_pages(rendered)
             combined = "\n\n".join(p.text for p in pages if p.text)
             # 聚合状态：之前恒返回 DONE，即使每页都失败也掩盖为成功（扫描件内容全丢却报成功，
             # 下游 node_write_chunk_meta 把它当"真空"以 DONE 收尾）。仅当所有页都 FAILED 时翻成
@@ -312,6 +301,60 @@ class OCRClient:
         except Exception as e:
             return OCRResult(status="FAILED", error=repr(e))
 
+    def _ocr_rendered_pages(self, rendered) -> List[OCRPageResult]:
+        """对已渲染的页面批量做 OCR API 调用 → 按输入页序返回 OCRPageResult 列表。
+
+        rendered: [(page_idx, b64_data, mime_type)]（page_idx 0-based，已按页序排好）。
+
+        并发模型（对齐 unified_extractor 的 VLM 漏斗 RAG_VLM_CONCURRENCY 模式）：
+          - 每页一个任务进有界 ThreadPoolExecutor；单页失败 → 该页 FAILED（text=""、
+            error=repr(e)），不影响邻页——语义与旧串行 try/except 完全一致，
+            全页 FAILED → 聚合 FAILED 的收口逻辑仍在调用方。
+          - 结果按 page_idx keyed 收集，最后按输入顺序重组：page_num = page_idx+1
+            （1-based），与旧串行输出逐字节一致，不受完成顺序影响。
+          - 429/5xx 由 _call_ocr_api 内的 post_json_with_retry 兜底（honors
+            Retry-After）；退避 sleep 发生在各 worker 线程内，天然限制了重试
+            重发速率 ≤ 并发度，不会放大成 stampede。
+        """
+        # RAG_OCR_PAGE_CONCURRENCY：扫描页 OCR 并发度，默认 4（保守）。qwen-vl OCR
+        # 与嵌入图漏斗（RAG_VLM_CONCURRENCY，默认 8）共享同一 DashScope 账号的
+        # QPS 配额，且该账号有已记录的 429 脆弱性；stage-1 里两条路径可能同时在
+        # 跑，默认必须给漏斗留余量——调大前先确认漏斗侧负载。=1 时走纯串行路径
+        # （零线程池，行为与历史串行实现完全一致）。
+        try:
+            max_workers = int(os.environ.get("RAG_OCR_PAGE_CONCURRENCY", "4"))
+        except ValueError:
+            max_workers = 4
+        max_workers = max(1, max_workers)
+
+        def _ocr_one(page_idx, b64_data, mime_type):
+            try:
+                page_text = self._call_ocr_api(b64_data, mime_type)
+                # 反幻觉修剪（不传尺寸：整页渲染只修剪重复，绝不整体丢弃）
+                page_text, _ = sanitize_ocr_text(page_text)
+                return OCRPageResult(
+                    page_num=page_idx + 1,
+                    text=page_text,
+                    status="DONE",
+                )
+            except Exception as e:
+                return OCRPageResult(
+                    page_num=page_idx + 1,
+                    text="",
+                    status="FAILED",
+                    error=repr(e),
+                )
+
+        if max_workers <= 1 or len(rendered) <= 1:
+            return [_ocr_one(*item) for item in rendered]
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = {}  # page_idx -> OCRPageResult
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_idx = {pool.submit(_ocr_one, *item): item[0] for item in rendered}
+            for future in as_completed(future_to_idx):
+                results[future_to_idx[future]] = future.result()  # _ocr_one 不抛异常
+        return [results[item[0]] for item in rendered]
 
     def _real_image_ocr(self, local_path: str, doc_id: str, oss_bucket=None) -> OCRResult:
         """真实图片 OCR (Gemini Vision)。"""
