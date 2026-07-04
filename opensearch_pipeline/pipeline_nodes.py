@@ -5774,17 +5774,31 @@ def node_generate_embeddings(ctx: dict):
         for chunk in chunks:
             ck = _cache_key(chunk.chunk_text)
             sp_ck = f"sp_{ck}"
-            if ck in _found:
-                chunk.embedding_vector = _found[ck]
-                chunk.embedding_model = embedding_model
-                chunk.embedding_status = "DONE"
-                sp_data = _found.get(sp_ck) or {}
-                if sp_data:
-                    chunk.sparse_vector_indices = sp_data.get("indices", [])
-                    chunk.sparse_vector_values = sp_data.get("values", [])
-                cache_hits += 1
-            else:
+            dense = _found.get(ck)
+            sp_data = _found.get(sp_ck)
+            if not isinstance(sp_data, dict):
+                sp_data = {}
+            # 缓存里的字面 null 会 json 解码成 None，但 `ck in _found` 仍算命中 →
+            # chunk 变成 DONE+无向量，混过 payload 的 "!= DONE" 过滤后 vectorless 推上
+            # HA3（cmd=add 同 PK 全量替换 → 打掉旧好文档）。None 一律按 miss 重嵌。
+            if dense is None:
                 miss_chunks.append(chunk)
+                continue
+            # DashScope 入库要求 dense+sparse 成对：HA3 可能把无 sparse 的文档排除
+            # （embedding_client._parse_sparse 的 sparse_fallback 兜底即为此），推了也
+            # 检索不到 → parity FAILED + 下轮确定性 re-hit，排水卡死。dense 命中但 sp_
+            # 缺失/null → 按 miss 重嵌（重嵌走 sparse_fallback=True，且回写含 sp_ 键，
+            # 不会无限 miss）。Gemini 路径本无 sparse，不受此约束。
+            if is_dashscope and not sp_data.get("indices"):
+                miss_chunks.append(chunk)
+                continue
+            chunk.embedding_vector = dense
+            chunk.embedding_model = embedding_model
+            chunk.embedding_status = "DONE"
+            if sp_data:
+                chunk.sparse_vector_indices = sp_data.get("indices", [])
+                chunk.sparse_vector_values = sp_data.get("values", [])
+            cache_hits += 1
 
         if cache_hits > 0:
             print(f"    └─ Embedding cache hit: {cache_hits}/{len(chunks)} chunks (sqlite)")
@@ -5888,9 +5902,23 @@ def node_generate_embeddings(ctx: dict):
 
                         embeddings = data.get("embeddings", [])
                         for idx, item in enumerate(embeddings):
+                            if idx >= len(batch):
+                                break
                             batch[idx].embedding_vector = item["values"]
                             batch[idx].embedding_model = embedding_model
                             batch[idx].embedding_status = "DONE"
+                        # 与 DashScope None-slot P0 修复同款：响应未覆盖的尾部槽位必须显式标
+                        # FAILED。reload 的 push-FAILED chunk 从 RDS 带着 embedding_status='DONE'
+                        # + 无向量进来，若部分响应漏掉它的槽位，它会保持 DONE+None 混过 payload
+                        # 的 "!= DONE" 过滤 → vectorless cmd=add 全量替换旧好文档。
+                        if len(embeddings) < len(batch):
+                            for c in batch[len(embeddings):]:
+                                c.embedding_status = "FAILED"
+                            print(
+                                f"    ⚠️ Gemini batch {i//batch_size} partial response: "
+                                f"{len(embeddings)}/{len(batch)} embeddings returned; "
+                                f"marked {len(batch) - len(embeddings)} uncovered slot(s) FAILED for retry"
+                            )
                         # 写入缓存
                         _store.put_many({
                             _cache_key(c.chunk_text): c.embedding_vector
@@ -5962,6 +5990,24 @@ def node_build_opensearch_payload(ctx: dict):
     # INDEXED、漏出 failed_doc_versions 计数，进而停用旧版本 → 静默非确定性召回丢失。
     # 所有应被索引的 chunk 在 embedding 成功后都会被显式置为 "DONE"（simulate / cache-hit / DashScope /
     # Gemini 四条路径皆然，且无任何 chunk 类型按设计 vectorless 索引），故 "!= DONE" 不会误剔合法 chunk。
+    #
+    # 兜底护栏(2026-07-03)：status=DONE 但无向量的 chunk 一律降级 FAILED。上面 "!= DONE"
+    # 过滤对 DONE+None 无效——它会 vectorless 推上 HA3（to_ha3_doc 对 falsy 向量静默省略
+    # dense_vector，cmd=add 同 PK 是全量替换 → 打掉旧好文档）。已知来源（缓存字面 null、
+    # Gemini 部分响应漏槽位 × RDS reload 的 DONE 状态）已各自修复；此处保证任何未来路径
+    # 都推不出 vectorless 文档。
+    _zombie_done = [
+        c for c in chunks
+        if getattr(c, "embedding_status", None) == "DONE"
+        and not getattr(c, "embedding_vector", None)
+    ]
+    if _zombie_done:
+        for c in _zombie_done:
+            c.embedding_status = "FAILED"
+        print(
+            f"    ⚠️ Demoted {len(_zombie_done)} chunk(s) with embedding_status=DONE but no "
+            f"embedding_vector to FAILED (vectorless docs must never enter the HA3 payload)"
+        )
     embedding_failed_chunks = [
         c for c in chunks if getattr(c, "embedding_status", None) != "DONE"
     ]
