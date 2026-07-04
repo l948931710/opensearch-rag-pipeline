@@ -83,9 +83,27 @@ def _dept_userids(token: str, dept_id: int) -> list:
     return []
 
 
+def _dept_name(token: str, dept_id: int) -> str:
+    """department/get 取部门名（根部门 listsub 不含自身，报告行需要真名）。失败回空。"""
+    r = requests.post(
+        f"https://oapi.dingtalk.com/topapi/v2/department/get?access_token={token}",
+        json={"dept_id": dept_id}, timeout=10,
+    ).json()
+    if r.get("errcode") == 0:
+        return ((r.get("result") or {}).get("name") or "").strip()
+    return ""
+
+
 def walk_tree(token: str):
-    """BFS 全树。返回 [{dept_id, name, path, member_ids}]（含根的直属成员）。"""
+    """BFS 全树。返回 [{dept_id, name, path, member_ids}]（含根部门自身及其直属成员——
+    高管/新员工常直挂公司根节点，listsub 只给子部门，漏掉根行会系统性少算
+    「仅 public」人群，而那正是本扫描要找的）。"""
     out = []
+    root_name = _dept_name(token, ROOT_DEPT_ID) or "（根部门）"
+    root_ids = _dept_userids(token, ROOT_DEPT_ID)
+    time.sleep(SLEEP_S)
+    out.append({"dept_id": ROOT_DEPT_ID, "name": root_name, "path": root_name,
+                "member_ids": root_ids})
     queue = [(ROOT_DEPT_ID, "")]          # (dept_id, parent_path)
     seen = set()
     while queue:
