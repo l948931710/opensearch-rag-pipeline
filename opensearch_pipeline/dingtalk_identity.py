@@ -370,7 +370,14 @@ def _resolve_user_dept_live(staff_id: str) -> "tuple[List[str], bool]":
                 _anc = _resolve_groups_via_ancestry(user_info.get("dept_ids") or []) \
                     if _acl_ancestry_enabled() else None
                 if _anc:
-                    user_info = dict(user_info, dept_name=",".join(_anc), is_partial=False)
+                    # 全组结果压缩回 "*" 哨兵再落 dept_name/缓存：15 组码 CSV=104 字符会溢出
+                    # user_role.dept_code VARCHAR(64)（strict 模式每次写失败被吞→永不缓存、每个
+                    # TTL 重走全链；非 strict 静默截断→读回被白名单丢尾，总经办静默少 6/15 组）。
+                    # 读侧 _normalize_dept_to_codes 本就把 "*" 展开为全量白名单（与 seeded 行同一
+                    # round-trip），语义无损且加新组自动跟上。
+                    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+                    _csv = "*" if set(_anc) == set(_VALID_ACL_GROUPS) else ",".join(_anc)
+                    user_info = dict(user_info, dept_name=_csv, is_partial=False)
                 if user_info.get("is_partial"):
                     # F-22：解析不完整（某 dept 瞬时失败）→ 绝不落缓存，避免残缺 CSV 永久少授权。
                     # 穿透场景退回旧缓存（更全）；纯 cache-miss 返回本次 best-effort 组（仅 public 之上、

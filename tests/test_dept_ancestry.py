@@ -288,3 +288,21 @@ def test_flag_on_ancestry_overrides_partial_names(monkeypatch):
     codes, cacheable = di._resolve_user_dept_live("u3")
     assert codes == ["production"] and cacheable is True
     assert _insert_params(conn)[2] == "production"
+
+
+def test_flag_on_sentinel_compresses_cache_to_star(monkeypatch):
+    """总经办（锚=["*"]）：返回全量白名单，但缓存压缩回 "*"——15 组码 CSV=104 字符会溢出
+    user_role.dept_code VARCHAR(64)（strict 写失败→永不缓存；非 strict 截断→读回丢组）。
+    读侧 _normalize_dept_to_codes("*") 展开为全量，round-trip 无损。"""
+    monkeypatch.setenv("RAG_ACL_ANCESTRY", "1")
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn,
+          {"user_name": "赵总", "dept_name": "总经办", "is_partial": False, "dept_ids": [14930012]},
+          {})                                               # 14930012 自身是锚，不需父链
+    codes, cacheable = di._resolve_user_dept_live("u9")
+    assert set(codes) == set(_VALID_ACL_GROUPS) and cacheable is True
+    cached = _insert_params(conn)[2]
+    assert cached == "*"                                    # 不是 104 字符 CSV
+    assert len(cached) <= 64                                # VARCHAR(64) 契约
+    assert di._normalize_dept_to_codes(cached) == sorted(_VALID_ACL_GROUPS)   # 读回展开无损
