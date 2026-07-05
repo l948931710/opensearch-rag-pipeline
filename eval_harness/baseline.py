@@ -14,8 +14,9 @@ import json
 from typing import Dict, List, Tuple
 
 # metric-name fragments whose VALUE is better when LOWER (rates / latencies / drift)
+# "midsentence"：P2-25 新增 l6.boundary.midsentence_cut_rate（切句率,越低越好）
 _LOWER_BETTER = ("refus", "leak", "dangling", "orphan", "dup", "fabricat", "latency", "drift",
-                 "p95", "p99", "miss", "error")
+                 "p95", "p99", "miss", "error", "midsentence")
 DEFAULT_DELTA = 0.03
 
 
@@ -94,6 +95,52 @@ def extract_metrics(results: Dict) -> Dict[str, float]:
     # mm judge（#F-mm13a）：语义贴题率 advisory trend
     jmm = (results.get("judge_mm") or {}).get("aggregate") or {}
     put("judge.mm.image_relevance", (jmm.get("image_relevance") or {}).get("mean"))
+
+    # ── P2-25：L0 索引健康 / L2 校准 / L5 权限 / L6 chunk 质量 / judge 负例族 ─────────
+    # 此前 baseline 只捕获 l1 / l3 部分 / l4 / judge 正例——以下层级的回退完全没有差量网。
+    # 兼容性：老 baseline.json 缺这些键时,compare 只遍历 baseline 里已有的指标（视为
+    # 无基线,不阻断）,并由末尾的 informational coverage 闸提示 refreeze;新 freeze 起自动纳入。
+    # 只取比率/因子类标量,不取全库计数——L6 跑在活语料上,语料自然增长会让计数漂移误报。
+    l0 = results.get("l0") or {}
+    g2 = l0.get("G2_dense_self_query") or {}
+    if g2.get("total"):
+        put("l0.dense_self_query_rate", (g2.get("healthy") or 0) / g2["total"])
+    g3 = l0.get("G3_sparse_self_query") or {}
+    if g3.get("total"):
+        put("l0.sparse_presence_rate", (g3.get("ok") or 0) / g3["total"])
+    put("l0.vector_fidelity_cos_mean", (l0.get("G4_vector_fidelity") or {}).get("cos_mean"))
+
+    l2 = results.get("l2") or {}
+    put("l2.frac_high", l2.get("frac_高"))
+    put("l2.frac_at_least_med", l2.get("frac_at_least_中"))
+    put("l2.separation_auc_offtopic", l2.get("separation_auc_offtopic"))
+    put("l2.n_offtopic_neg", l2.get("n_offtopic_neg"))  # 负例覆盖信号（同 n_positive_public 先例）
+
+    l5 = results.get("l5") or {}
+    n5 = l5.get("n_gated_docs_tested")
+    if n5:  # applicable=False（全 public 语料）时无此键 → 优雅跳过
+        put("l5.public_exclusion_rate", (l5.get("public_exclusion_ok") or 0) / n5)
+        put("l5.authorized_visibility_rate", (l5.get("authorized_visibility_ok") or 0) / n5)
+        put("l5.n_gated_docs_tested", n5)
+
+    l6 = results.get("l6") or {}
+    fam = l6.get("families") or {}
+    put("l6.boundary.midsentence_cut_rate", (fam.get("boundary") or {}).get("midsentence_cut_rate"))
+    put("l6.self_containedness.dangling_anaphor_rate",
+        (fam.get("self_containedness") or {}).get("dangling_anaphor_rate"))
+    put("l6.dedup.near_dup_cross_factor", (fam.get("dedup") or {}).get("near_dup_cross_factor"))
+    put("l6.image_binding.img_dup_factor_p95",
+        (fam.get("image_binding") or {}).get("img_dup_factor_p95"))
+    put("l6.routing.routing_match_rate", (fam.get("routing") or {}).get("routing_match_rate"))
+    # L6 chunk-judge 代表桶 pass 率（仅 merge 过 chunk 面板的 run 才有该键）
+    put("l6.judge_chunk.repr_pass_rate_ge4",
+        ((l6.get("judge_chunk") or {}).get("representative") or {}).get("pass_rate_overall_ge4"))
+
+    # judge 负例族（拒答质量 + 负例造假率）与正例造假率——四个正例均值硬门之外的回退信号
+    neg = j.get("negatives") or {}
+    put("judge.negatives.fabrication_rate", neg.get("fabrication_rate"))
+    put("judge.negatives.overall", (neg.get("overall") or {}).get("mean"))
+    put("judge.positives_fabrication_rate", j.get("positives_fabrication_rate"))
     return m
 
 
@@ -101,26 +148,45 @@ def regime_of(results: Dict) -> Dict:
     return (results.get("meta") or {}).get("regime") or {}
 
 
+# P2-24：judge 指纹入 regime——judge 是 faithfulness/correctness/completeness/fabrication
+# 四个答案质量硬门的产出者,judge 模型/rubric 升级即换 regime,差量比较必须拒绝跨 judge 对比。
 _REGIME_KEYS = ("eval_set_sha", "fusion", "rerank_enable", "llm_model",
-                "embedding_model", "reranker_models", "threshold_version")
+                "embedding_model", "reranker_models", "threshold_version",
+                "judge_model", "judge_rubric_version")
+# P2-24 向后兼容宽容窗口：judge_model / judge_rubric_version 是 2026-07 新增 regime 键,
+# 存量 baseline.json 里没有——老基线缺该键（None）视为匹配,新 freeze 起自动带上;
+# 一旦 baseline 里有值,就按普通键严格比较。refreeze 需在用户机器上跑 live eval
+# （沙箱 403 打不到生产 HA3）,所以不能因新键让存量基线立即失效。
+_LENIENT_REGIME_KEYS = frozenset({"judge_model", "judge_rubric_version"})
 
 
 def regime_matches(base_regime: Dict, cur_regime: Dict) -> Tuple[bool, List[str]]:
-    diffs = [k for k in _REGIME_KEYS if base_regime.get(k) != cur_regime.get(k)]
+    diffs = [k for k in _REGIME_KEYS
+             if not (k in _LENIENT_REGIME_KEYS and base_regime.get(k) is None)
+             and base_regime.get(k) != cur_regime.get(k)]
     return (not diffs, diffs)
 
 
 def compare(baseline: Dict, results: Dict, delta: float = DEFAULT_DELTA) -> Dict:
-    """Return regression gate(s). Regime mismatch → a single N/A gate (expected_na: can't compare
-    across regimes) — NOT a free pass on the real check, just a loud 'refreeze for this regime'."""
+    """Return regression gate(s). Regime mismatch → a single N/A gate — NOT a free pass on the real
+    check, just a loud 'refreeze for this regime'.
+
+    P2-23：mismatch 的 na_reason 从 expected_na 改为 regime_mismatch——非 strict 路径语义不变
+    （pass=None → 报告里仍是 N/A,容忍跨 regime 比较不可行）,但发布门（merge --strict）把它当
+    硬失败：否则默认 goldset（golden_full）对上冻结在 golden_50 的 baseline 时,唯一的指标下降
+    差量网会被静默关闭而 exit 0。"""
     base_regime = baseline.get("regime") or {}
     ok, diffs = regime_matches(base_regime, regime_of(results))
     if not ok:
+        hint = ("goldset 与冻结基线不匹配：要么用 baseline 的 goldset 跑发布门,"
+                "要么显式 refreeze (run_eval baseline-freeze)"
+                if "eval_set_sha" in diffs else
+                "refreeze the baseline for the current regime (run_eval baseline-freeze)")
         return {"baseline regression (regime)": {
             "target": "baseline regime must match run regime to compare",
             "value": f"REGIME MISMATCH on {diffs} — baseline not comparable",
-            "pass": None, "na_reason": "expected_na",
-            "notes": "refreeze the baseline for the current regime (run_eval baseline-freeze)"}}
+            "pass": None, "na_reason": "regime_mismatch",
+            "notes": hint}}
 
     cur = extract_metrics(results)
     base_m = baseline.get("metrics") or {}
@@ -157,6 +223,16 @@ def compare(baseline: Dict, results: Dict, delta: float = DEFAULT_DELTA) -> Dict
             "value": (f"{len(adv_reg)} advisory drift: {adv_reg[:8]}" if adv_reg else f"clean ({adv_n} advisory metrics)"),
             "pass": (len(adv_reg) == 0),
             "advisory": True}
+    # ── P2-25 informational：本 run 有、冻结基线没有的指标（新增指标族 / 老基线）——
+    # 视为无基线：可见但绝不阻断（advisory + expected_na 双保险,_strict_failures 都跳过）,
+    # 仅提示 refreeze 后这些指标才进差量网。
+    uncovered = sorted(set(cur) - set(base_m))
+    if uncovered:
+        gates["baseline coverage (informational — metrics not in frozen baseline)"] = {
+            "target": f"informational: {len(uncovered)} run metrics lack a frozen baseline",
+            "value": f"uncovered (first 8): {uncovered[:8]}",
+            "pass": None, "na_reason": "expected_na", "advisory": True,
+            "notes": "refreeze (run_eval baseline-freeze) to extend the regression net to these"}
     return gates
 
 

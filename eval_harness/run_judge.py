@@ -34,6 +34,12 @@ from .judge import (
 
 CLAUDE = os.environ.get("RAG_CLAUDE_BIN", "claude")
 
+# P2-24：judge 模型显式 pin。不 pin 时 judge 是环境里 claude CLI 恰好解析到的默认模型,
+# CLI/默认模型升级会静默重基 faithfulness/correctness/completeness/fabrication 四个硬门。
+# RAG_EVAL_JUDGE_MODEL 可覆写——换 judge 模型属于换 regime（run_eval._regime() 把该值记入
+# baseline 指纹）,换后需 refreeze。
+JUDGE_MODEL = os.environ.get("RAG_EVAL_JUDGE_MODEL", "claude-opus-4-8")
+
 # rubric → (rubric 文本, verdict schema, item id 键)。
 # #F-mm13：mm rubric 新增；顺带修存量坑——chunk rubric 此前也用 answer 的
 # VERDICT_ITEM_SCHEMA 列 keys（prompt 里 keys 行与 rubric 文本自相矛盾，全靠
@@ -67,7 +73,9 @@ def _judge_batch(rubric: str, items: list, panel_idx: int, item_id_key: str,
         f"these keys: {keys}. The '{item_id_key}' field MUST equal the item's '{item_id_key}'. "
         f"No prose outside the JSON.\n\nITEMS (JSON):\n{json.dumps(items, ensure_ascii=False)}"
     )
-    r = subprocess.run([CLAUDE, "-p", prompt], cwd="/tmp", capture_output=True, text=True, timeout=900)
+    # --model 显式 pin（P2-24）：判分模型不再跟随 CLI 默认漂移
+    r = subprocess.run([CLAUDE, "-p", prompt, "--model", JUDGE_MODEL],
+                       cwd="/tmp", capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
         raise RuntimeError(f"claude rc={r.returncode}: {(r.stderr or '')[:300]}")
     return _extract_json_array(r.stdout)

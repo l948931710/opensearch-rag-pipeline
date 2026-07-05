@@ -148,6 +148,24 @@ class TestProductionSecurityGuard:
         )
         assert "gemini" in config.llm.model.lower()
 
+    def test_production_pii_redact_off_raises(self):
+        """【P2-27】production/staging 下 RAG_QA_LOG_PII_REDACT=false（QA 日志 PII 不掩码）
+        必须启动即拒——该开关仅限本地调试取证。"""
+        with pytest.raises(ValueError, match="QA_LOG_PII_REDACT"):
+            _fresh_load(
+                RAG_ENVIRONMENT="production",
+                RAG_DASHSCOPE_API_KEY="sk-test",
+                RAG_QA_LOG_PII_REDACT="false",
+            )
+
+    def test_development_pii_redact_off_allowed(self):
+        """【P2-27】dev 标签（本地调试取证）关闭 QA 日志掩码仍然合法，不误伤。"""
+        config = _fresh_load(
+            RAG_ENVIRONMENT="development",
+            RAG_QA_LOG_PII_REDACT="false",
+        )
+        assert config.rag.qa_log_pii_redact is False
+
 
 class TestSingletonWriteback:
     """验证 P0-1 修复：load_config() 后写回 _config 单例。"""

@@ -7,7 +7,13 @@
 只读生产(RAG_ENV=metrics 的 fuling_metrics 账号对这两张表有 SELECT);本脚本不写任何生产数据。
 
 输出: reports/qa_weekly_<最新周一>.{md,pdf}。配套 LaunchAgent: deploy/com.fuling.qa-weekly-report.plist。
-env 覆盖: RAG_CLAUDE_BIN / RAG_PANDOC_BIN / RAG_TEX_DIR / RAG_TZ_SHIFT_HOURS(默认 15)。
+env 覆盖: RAG_CLAUDE_BIN / RAG_PANDOC_BIN / RAG_TEX_DIR / RAG_TZ_SHIFT_HOURS(默认 15,仅回退路径用)。
+
+P2-19(盲区审计 2026-07-05): 样本行的北京业务日分桶改用与 qa_rollup/qa_daily_metrics 同源的
+DST-correct 换算(_beijing_day_pacific_bounds 半开区间 + CONVERT_TZ 日标签),替换旧的固定
+DATE_ADD(created_at, INTERVAL 15 HOUR) —— 旧公式在美国冬令时(PST=+16h)差 1 小时,导致同一周报里
+定性样本与定量总量(读 qa_daily_metrics)用两种日定义,周界行错桶。zoneinfo 不可用时回退旧 +15h
+公式并打 warning(fail-open,与 qa_rollup 同款)。
 """
 from __future__ import annotations
 
@@ -33,6 +39,20 @@ def _rows(cur, sql, args=()):
     cur.execute(sql, args)
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _week_pacific_bounds(wk_start, wk_end):
+    """北京业务日闭区间 [wk_start, wk_end] → 存储时区(太平洋墙钟)的半开区间 [start, end)。
+
+    P2-19: 复用 qa_rollup._beijing_day_pacific_bounds(qa_daily_metrics 的日定义即出自它),
+    使周报样本与日指标共用同一套「北京日」,且谓词 sargable(吃 created_at 索引)。
+    任一端换算失败 → 返回 None,调用方回退旧 +15h 谓词(fail-open)。"""
+    from opensearch_pipeline.qa_rollup import _beijing_day_pacific_bounds
+    b_start = _beijing_day_pacific_bounds(str(wk_start))
+    b_end = _beijing_day_pacific_bounds(str(wk_end))
+    if b_start and b_end:
+        return b_start[0], b_end[1]
+    return None
 
 
 def _agg(days):
@@ -84,12 +104,28 @@ def build():
             wk_start, wk_end = this_wk[0]["metric_date"], this_wk[-1]["metric_date"]
             cur_a, prev_a = _agg(this_wk), _agg(last_wk) if last_wk else None
             # qualitative samples from qa_session_log for this week's Beijing days
-            samp = _rows(cur, f"""SELECT answer_status, risk_blocked, opensearch_hit_count,
-                                  LEFT(query_text,80) q, user_dept,
-                                  DATE(DATE_ADD(created_at, INTERVAL {TZ} HOUR)) d
-                                  FROM fuling_operation.qa_session_log
-                                  WHERE DATE(DATE_ADD(created_at, INTERVAL {TZ} HOUR)) BETWEEN %s AND %s""",
-                         (wk_start, wk_end))
+            # P2-19: 谓词+日标签用与 qa_rollup 同源的 DST-correct 换算(见模块 docstring);
+            # 日标签的 CONVERT_TZ 若因 RDS tz 表缺失返回 NULL 则 COALESCE 回 +15h 公式。
+            bounds = _week_pacific_bounds(wk_start, wk_end)
+            if bounds:
+                samp = _rows(cur, f"""SELECT answer_status, risk_blocked, opensearch_hit_count,
+                                      LEFT(query_text,80) q, user_dept,
+                                      DATE(COALESCE(CONVERT_TZ(created_at,
+                                          'America/Los_Angeles', 'Asia/Shanghai'),
+                                          DATE_ADD(created_at, INTERVAL {TZ} HOUR))) d
+                                      FROM fuling_operation.qa_session_log
+                                      WHERE created_at >= %s AND created_at < %s""",
+                             bounds)
+            else:
+                print("[weekly_report] WARNING: 北京日→太平洋区间换算不可用，回退旧 +15h 分桶"
+                      "（美国冬令时期间周界行可能错桶 1 小时）")
+                samp = _rows(cur, f"""SELECT answer_status, risk_blocked, opensearch_hit_count,
+                                      LEFT(query_text,80) q, user_dept,
+                                      DATE(DATE_ADD(created_at, INTERVAL {TZ} HOUR)) d
+                                      FROM fuling_operation.qa_session_log
+                                      WHERE DATE(DATE_ADD(created_at, INTERVAL {TZ} HOUR))
+                                            BETWEEN %s AND %s""",
+                             (wk_start, wk_end))
     finally:
         conn.close()
 

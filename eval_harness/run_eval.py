@@ -78,6 +78,17 @@ def _regime(cfg, goldset_path: str) -> dict:
     rerank_on = bool(_cfg_get(cfg, "rerank_enable", False))
     thr = (f"sh={getattr(rag,'score_threshold_high',None)},sm={getattr(rag,'score_threshold_medium',None)},"
            f"rh={getattr(rag,'rerank_score_threshold_high',None)},rm={getattr(rag,'rerank_score_threshold_medium',None)}")
+    # P2-24：judge 指纹入 regime——judge 模型 + answer rubric 版本变更即换 regime,
+    # baseline 差量比较拒绝跨 judge 对比。graceful degradation：导入失败不破坏 run
+    # （老 baseline 缺这两键时 baseline._LENIENT_REGIME_KEYS 宽容跳过,兼容窗口见彼处）。
+    try:
+        from .run_judge import JUDGE_MODEL as judge_model
+    except Exception:
+        judge_model = None
+    try:
+        from .judge import JUDGE_RUBRIC_VERSION as judge_rubric_version
+    except Exception:
+        judge_rubric_version = None
     return {
         "eval_set_sha": sha,
         "fusion": _cfg_get(cfg, "hybrid_fusion", None),
@@ -87,6 +98,8 @@ def _regime(cfg, goldset_path: str) -> dict:
         "reranker_models": (f"{getattr(av,'rerank_text_model',None)}/{getattr(av,'rerank_vl_model',None)}"
                             if rerank_on and av is not None else None),
         "threshold_version": thr,
+        "judge_model": judge_model,
+        "judge_rubric_version": judge_rubric_version,
         "code_commit": commit,
     }
 
@@ -114,9 +127,11 @@ def _strict_enabled(args) -> bool:
 def _strict_failures(gates: dict, results: dict, *, requested_layers=None) -> list:
     """Hard-fail reasons under --strict. A gate's ``pass``:
       True → ok ; False → fail ; None → depends on ``na_reason``:
-        - 'not_executed'  (sample / config / verdict shortfall — should have run but didn't) → FAIL.
+        - 'not_executed'    (sample / config / verdict shortfall — should have run but didn't) → FAIL.
           Never silently pass an unmeasured HARD gate.
-        - 'expected_na'   (genuinely inapplicable by design, e.g. L5 with no gated docs) → ok.
+        - 'regime_mismatch' (P2-23: baseline regime != run regime, 差量回归网整体失效) → FAIL.
+          非 strict 路径仍容忍为 N/A——只有发布门要硬失败。
+        - 'expected_na'     (genuinely inapplicable by design, e.g. L5 with no gated docs) → ok.
     Plus: L6 NO_GO_DEFECT; EVAL-2 manifest drift; answer-correctness-not-judged (L3 ran but no judge
     merge); and L6 requested but un-runnable. (L6 NO_GO_INCOMPLETE_EVIDENCE already FAILs via its
     verdict gate's pass=False — once L6 is actually in the run.)"""
@@ -129,6 +144,10 @@ def _strict_failures(gates: dict, results: dict, *, requested_layers=None) -> li
             fails.append(name)
         elif p is None and g.get("na_reason") == "not_executed":
             fails.append(f"{name} [not_executed]")
+        elif p is None and g.get("na_reason") == "regime_mismatch":
+            # P2-23：goldset/regime 与冻结基线不一致 → 发布门硬失败,不再静默放行
+            fails.append(f"{name} [regime_mismatch: 用 baseline 的 goldset/regime 跑门,或显式 "
+                         f"refreeze (run_eval baseline-freeze)]")
     if (results.get("l6") or {}).get("state") == "NO_GO_DEFECT":
         fails.append("l6:NO_GO_DEFECT")
     _errs = ((results.get("l4") or {}).get("ingestion") or {}).get("deterministic", {}).get("errors") or []
@@ -300,7 +319,8 @@ def phase_run(args):
     print(f"\n== PRELIMINARY REPORT -> {outdir}/report.md ==")
     for name, g in gates.items():
         mark = ("PASS" if g["pass"] is True else "FAIL" if g["pass"] is False
-                else "N/A!" if g.get("na_reason") == "not_executed" else "N/A")
+                else "N/A!" if g.get("na_reason") in ("not_executed", "regime_mismatch")
+                else "N/A")
         print(f"   [{mark}] {name}: {g['value']}")
     print(f"\nNext: judge the bundle (Claude panel) -> {outdir}/judge_verdicts.json, then:\n"
           f"  python -m eval_harness.run_eval merge --results {outdir}/report.json "
@@ -361,7 +381,8 @@ def phase_merge(args):
     print(f"== FINAL REPORT -> {outdir}/report.md ==")
     for name, g in gates.items():
         mark = ("PASS" if g["pass"] is True else "FAIL" if g["pass"] is False
-                else "N/A!" if g.get("na_reason") == "not_executed" else "N/A")
+                else "N/A!" if g.get("na_reason") in ("not_executed", "regime_mismatch")
+                else "N/A")
         print(f"   [{mark}] {name}: {g['value']}")
     _enforce_strict(gates, results, _strict_enabled(args),
                     requested_layers=set((results.get("meta") or {}).get("layers") or []))

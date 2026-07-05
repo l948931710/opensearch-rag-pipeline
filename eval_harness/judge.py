@@ -18,6 +18,12 @@ from typing import Dict, List
 
 from .metrics import bootstrap_ci, mean
 
+# P2-24：answer rubric 显式版本号——rubric 语义变更时手动 bump（仿 L6 的 chunk_rubric_v1
+# 先例）。judge 产出 faithfulness/correctness/completeness/fabrication 四个硬门,rubric 变
+# 即 regime 变：该值随 judge_model 一起进 run_eval._regime() / baseline._REGIME_KEYS,
+# 防 rubric 静默改写重基答案质量硬门。
+JUDGE_RUBRIC_VERSION = "answer_rubric_v1"
+
 # Rubric shown to each Claude judge (the Workflow injects per-item bundle data).
 JUDGE_RUBRIC = """You are an impartial QA evaluator for an enterprise Chinese knowledge-base
 assistant (manufacturing company). You are given, per item: the user QUESTION, the retrieved

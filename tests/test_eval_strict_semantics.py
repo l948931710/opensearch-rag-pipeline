@@ -43,11 +43,39 @@ def test_baseline_compare_catches_subset_regression_under_aggregate():
 
 
 def test_baseline_regime_mismatch_is_na_not_a_pass():
+    """P2-23：mismatch 是 N/A（非 strict 容忍）但 na_reason=regime_mismatch（strict 硬失败）。"""
     from eval_harness import baseline
     base = {"regime": {"fusion": "weighted", "eval_set_sha": "x"}, "metrics": {"l1.ranking.recall@5": 0.9}}
     cur = {"meta": {"regime": {"fusion": "rrf", "eval_set_sha": "x"}}, "l1": {"ranking": {"recall@5": 0.5}}}
     g = list(baseline.compare(base, cur).values())[0]
-    assert g["pass"] is None and g["na_reason"] == "expected_na"  # can't compare across regimes
+    assert g["pass"] is None and g["na_reason"] == "regime_mismatch"  # can't compare across regimes
+
+
+def test_baseline_regime_mismatch_blocks_strict_with_goldset_hint():
+    """P2-23：goldset(eval_set_sha)与冻结基线不一致 → merge --strict 硬失败,且报错指明
+    「用 baseline 的 goldset 或 refreeze」;非 strict 语义不变(pass=None → 报告 N/A)。"""
+    from eval_harness import baseline
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    base = {"regime": {"fusion": "weighted", "eval_set_sha": "golden50sha"},
+            "metrics": {"l1.ranking.recall@5": 0.9}}
+    cur = {"meta": {"regime": {"fusion": "weighted", "eval_set_sha": "goldenFULLsha"}},
+           "l1": {"ranking": {"recall@5": 0.95}}}
+    bg = baseline.compare(base, cur)
+    g = list(bg.values())[0]
+    assert g["pass"] is None                                   # 非 strict：仍是 N/A,不误报 FAIL
+    assert "goldset" in g["notes"] and "refreeze" in g["notes"]  # 明确的修复指引
+    fails = _strict_failures(build_gates({"baseline_gates": bg}), {})
+    assert any("regime_mismatch" in f for f in fails)          # strict：硬失败,不再静默 exit 0
+
+
+def test_strict_regime_mismatch_taxonomy():
+    """P2-23：na_reason 三态——not_executed/regime_mismatch 均 FAIL,expected_na 放行。"""
+    from eval_harness.run_eval import _strict_failures
+    gates = {"regimeX": {"pass": None, "na_reason": "regime_mismatch"},
+             "okna": {"pass": None, "na_reason": "expected_na"}}
+    f = _strict_failures(gates, {})
+    assert any("regimeX" in x for x in f) and not any("okna" in x for x in f)
 
 
 _REG = {"fusion": "weighted", "eval_set_sha": "x", "rerank_enable": True, "llm_model": "q",
@@ -473,3 +501,139 @@ def test_judge_calibration_template_blank(tmp_path):
     assert len(t) == 6
     assert all(item["human"][d] is None for item in t for d in SCORE_DIMS)
     assert _j.load(open(out))
+
+
+# ── P2-24：judge 指纹（模型 pin + rubric 版本）入 regime ─────────────────────────
+
+
+def test_run_judge_pins_explicit_model(monkeypatch):
+    """judge 不再落到环境里 claude CLI 的任意默认模型——命令行显式 --model <pin>。"""
+    from eval_harness import run_judge
+    captured = {}
+
+    class _R:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return _R()
+
+    monkeypatch.setattr(run_judge.subprocess, "run", _fake_run)
+    run_judge._judge_batch("rubric", [{"qid": "q1"}], 0, "qid")
+    cmd = captured["cmd"]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == run_judge.JUDGE_MODEL
+    assert run_judge.JUDGE_MODEL  # 非空：显式模型名,默认可被 RAG_EVAL_JUDGE_MODEL 覆写
+
+
+def test_regime_includes_judge_fingerprint():
+    """_regime() 记 judge_model + judge_rubric_version;_REGIME_KEYS 同步纳入。"""
+    from types import SimpleNamespace
+    from eval_harness import baseline, judge, run_judge
+    import eval_harness.run_eval as rev
+    assert "judge_model" in baseline._REGIME_KEYS
+    assert "judge_rubric_version" in baseline._REGIME_KEYS
+    cfg = SimpleNamespace(llm=SimpleNamespace(model="q"), embedding=SimpleNamespace(model="e"),
+                          rag=SimpleNamespace(), alibaba_vector=None)
+    regime = rev._regime(cfg, "/nonexistent/goldset.json")
+    assert regime["judge_model"] == run_judge.JUDGE_MODEL
+    assert regime["judge_rubric_version"] == judge.JUDGE_RUBRIC_VERSION
+
+
+def test_regime_judge_keys_lenient_for_legacy_baseline():
+    """向后兼容窗口：老 baseline 缺 judge 键（None）→ 视为匹配;有值且不同 → mismatch。"""
+    from eval_harness.baseline import regime_matches
+    base_old = {"fusion": "weighted", "eval_set_sha": "x"}          # 存量基线,无 judge 键
+    cur = {"fusion": "weighted", "eval_set_sha": "x",
+           "judge_model": "claude-opus-4-8", "judge_rubric_version": "answer_rubric_v1"}
+    ok, diffs = regime_matches(base_old, cur)
+    assert ok and diffs == []                                       # 老基线宽容
+    base_new = dict(cur, judge_model="claude-old-model")
+    ok2, diffs2 = regime_matches(base_new, cur)
+    assert not ok2 and "judge_model" in diffs2                      # 新基线严格:judge 升级=换 regime
+
+
+# ── P2-25：baseline 覆盖 l0/l2/l5/l6/judge 负例族 + coverage informational ────────
+
+
+def test_extract_metrics_covers_l0_l2_l5_l6_and_judge_negatives():
+    from eval_harness.baseline import _direction, extract_metrics
+    sample = {
+        "l0": {"G2_dense_self_query": {"healthy": 59, "total": 60},
+               "G3_sparse_self_query": {"ok": 38, "total": 40, "embed_sparse_ok": 40},
+               "G4_vector_fidelity": {"cos_mean": 0.9995, "cos_min": 0.997}},
+        "l2": {"frac_高": 0.7, "frac_at_least_中": 0.9,
+               "separation_auc_offtopic": 0.92, "n_offtopic_neg": 6},
+        "l5": {"applicable": True, "n_gated_docs_tested": 5,
+               "public_exclusion_ok": 5, "authorized_visibility_ok": 4},
+        "l6": {"applicable": True,
+               "families": {"boundary": {"midsentence_cut_rate": 0.02},
+                            "self_containedness": {"dangling_anaphor_rate": 0.01},
+                            "dedup": {"near_dup_cross_factor": 1.03},
+                            "image_binding": {"img_dup_factor_p95": 1.0},
+                            "routing": {"routing_match_rate": 0.98}},
+               "judge_chunk": {"representative": {"pass_rate_overall_ge4": 0.9}}},
+        "judge": {"aggregate": {
+            "positives": {"faithfulness": {"mean": 4.5}},
+            "negatives": {"fabrication_rate": 0.0, "overall": {"mean": 4.8}},
+            "positives_fabrication_rate": 0.02}},
+    }
+    m = extract_metrics(sample)
+    assert abs(m["l0.dense_self_query_rate"] - 59 / 60) < 1e-9
+    assert abs(m["l0.sparse_presence_rate"] - 38 / 40) < 1e-9
+    assert m["l0.vector_fidelity_cos_mean"] == 0.9995
+    assert m["l2.frac_high"] == 0.7 and m["l2.frac_at_least_med"] == 0.9
+    assert m["l2.separation_auc_offtopic"] == 0.92 and m["l2.n_offtopic_neg"] == 6
+    assert m["l5.public_exclusion_rate"] == 1.0
+    assert abs(m["l5.authorized_visibility_rate"] - 0.8) < 1e-9
+    assert m["l6.boundary.midsentence_cut_rate"] == 0.02
+    assert m["l6.self_containedness.dangling_anaphor_rate"] == 0.01
+    assert m["l6.dedup.near_dup_cross_factor"] == 1.03
+    assert m["l6.image_binding.img_dup_factor_p95"] == 1.0
+    assert m["l6.routing.routing_match_rate"] == 0.98
+    assert m["l6.judge_chunk.repr_pass_rate_ge4"] == 0.9
+    assert m["judge.negatives.fabrication_rate"] == 0.0
+    assert m["judge.negatives.overall"] == 4.8
+    assert m["judge.positives_fabrication_rate"] == 0.02
+    # 方向推断:率/因子类新指标方向正确,防「越差越 PASS」
+    assert _direction("l6.boundary.midsentence_cut_rate") == "lower"
+    assert _direction("l6.self_containedness.dangling_anaphor_rate") == "lower"
+    assert _direction("l6.dedup.near_dup_cross_factor") == "lower"
+    assert _direction("judge.negatives.fabrication_rate") == "lower"
+    assert _direction("l0.vector_fidelity_cos_mean") == "higher"
+    assert _direction("l2.frac_high") == "higher"
+    assert _direction("l5.public_exclusion_rate") == "higher"
+    assert _direction("l6.routing.routing_match_rate") == "higher"
+
+
+def test_extract_metrics_new_layers_absent_is_graceful():
+    """老报告/部分层缺席（l5 inapplicable、l6 未跑）→ 不崩、不产生伪指标。"""
+    from eval_harness.baseline import extract_metrics
+    m = extract_metrics({})
+    assert not any(p.startswith(("l0.", "l2.", "l5.", "l6.")) for p in m)
+    m2 = extract_metrics({"l5": {"applicable": False, "note": "no gated docs"},
+                          "l6": {"applicable": False}})
+    assert not any(p.startswith(("l5.", "l6.")) for p in m2)
+
+
+def test_baseline_coverage_gate_informational_never_blocks():
+    """老 baseline 缺新指标 → 视为无基线:coverage 闸可见(informational)但绝不阻断 strict;
+    hard 闸仍排第一(callers 取 values()[0] 的契约)。"""
+    from eval_harness import baseline as BL
+    from eval_harness.report import build_gates
+    from eval_harness.run_eval import _strict_failures
+    base = {"regime": {"fusion": "weighted"}, "delta": 0.03,
+            "metrics": {"l1.ranking.recall@5": 0.9}}   # 老基线:只有 l1
+    cur = {"meta": {"regime": {"fusion": "weighted"}},
+           "l1": {"ranking": {"recall@5": 0.91}},
+           "l2": {"frac_高": 0.7},                      # 新指标,baseline 没有
+           "l6": {"families": {"routing": {"routing_match_rate": 0.5}}}}  # 就算烂也不许阻断
+    bg = BL.compare(base, cur)
+    assert list(bg.values())[0]["pass"] is True         # hard 闸第一且干净
+    cov = next(v for k, v in bg.items() if "coverage" in k)
+    assert cov["advisory"] is True and cov["pass"] is None
+    assert cov["na_reason"] == "expected_na"
+    assert "l2.frac_high" in str(cov["value"])          # 可见:告知哪些指标未入网
+    assert _strict_failures(build_gates({"baseline_gates": bg}), {}) == []  # 不阻断

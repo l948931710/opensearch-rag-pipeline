@@ -87,6 +87,35 @@ class TestStagingTestLabelGuards:
         assert cfg.rds.operation_database == "fuling_operation"
 
 
+class TestVendorGuardFingerprintTrigger:
+    """【P2-28/P2-6】供应商守卫（禁 Gemini + 必须 DashScope）触发条件 = 标签 OR 生产物理指纹。
+
+    组合缺口：dev 标签 + read_only_ack 实连生产 RDS/HA3 + 只配 GEMINI key →
+    模型解析全路由 Google，生产 chunk_text/查询内容被 POST 到 Google。现已闭合。
+    """
+
+    def test_dev_label_prod_rds_gemini_only_raises(self):
+        """dev 标签 + ack 连生产 RDS + 仅 Gemini key → 供应商守卫按指纹触发，raise。"""
+        with pytest.raises(ValueError, match="PRODUCTION SECURITY GUARD"):
+            _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="false",
+                        RAG_RDS_HOST=PROD_RDS, RAG_ALLOW_REMOTE_DB="read_only_ack",
+                        RAG_GEMINI_API_KEY="AIza-test")
+
+    def test_dev_label_prod_ha3_dashscope_passes(self):
+        """日常合法用法不误伤：dev 标签 + ack 连生产 HA3 + DashScope key（解析到 Qwen）→ 通过。"""
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="false",
+                          RAG_RDS_HOST="localhost", RAG_HA3_ENDPOINT=PROD_HA3,
+                          RAG_ALLOW_REMOTE_SEARCH="read_only_ack",
+                          RAG_DASHSCOPE_API_KEY="sk-test")
+        assert "qwen" in cfg.llm.model.lower() or "plus" in cfg.llm.model.lower()
+
+    def test_simulate_mode_never_triggers_vendor_guard(self):
+        """模拟模式不碰真实目标：即使 env 里残留生产指纹 + 仅 Gemini key，守卫完全不触发。"""
+        cfg = _fresh_load(RAG_SIMULATE="true", RAG_RDS_HOST=PROD_RDS,
+                          RAG_HA3_ENDPOINT=PROD_HA3, RAG_GEMINI_API_KEY="AIza-test")
+        assert cfg.simulate is True
+
+
 class TestProductionLabelGuards:
     def test_production_localhost_rds_raises_no_exemption(self):
         """R4：production 标签 + localhost RDS 必为配错。"""

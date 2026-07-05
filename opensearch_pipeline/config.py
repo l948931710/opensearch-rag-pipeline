@@ -866,13 +866,45 @@ def load_config() -> PipelineConfig:
 
     # 💡 生产安全守卫：当处于 production 或 staging 环境下，坚决杜绝 fallback 到 Gemini！
     # 强制校验所有大模型/视觉/向量 API 配置必须为阿里云 DashScope（或者是明确的非 Gemini，比如专有端点）
-    if config.environment in ("production", "staging"):
+    _env_label_prod = config.environment in ("production", "staging")
+
+    # 【P2-27】生产安全姿态断言：RAG_QA_LOG_PII_REDACT 仅限本地开发调试取证，
+    # production/staging 下关闭它会把用户问题里的手机号/身份证等 PII 明文写入 qa_session_log
+    # （消费方 qa_logger._qa_log_pii_redact_on），必须与供应商守卫同级 fail-fast。
+    if _env_label_prod and not config.rag.qa_log_pii_redact:
+        raise ValueError(
+            f"🚨 [PRODUCTION SECURITY GUARD] RAG_QA_LOG_PII_REDACT=false 在 '{config.environment}' 环境被禁止！"
+            f"该开关仅限本地开发调试取证使用；生产/预演关闭它会把用户提问中的 PII（手机号/身份证等）"
+            f"明文落盘 qa_session_log。请移除该环境变量（默认即 True=掩码）。"
+        )
+
+    # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
+    # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
+    # 且只配 GEMINI key 时，模型解析全路由 Google，生产 chunk_text/查询内容会被 POST 到 Google。
+    # 现在只要「碰生产物理目标」，供应商约束（必须 DashScope、禁 Gemini）就与 production 同级生效；
+    # 带 DashScope key 的 prod_ro 只读评测（解析到 Qwen）照常通过。
+    # 各目标仅在对应 simulate=False 时评估（与 _validate_environment_target_consistency 同一前置，
+    # make sim / 单测天然跳过）；OSS 因默认 bucket 名即生产指纹（fuling-knowledge-base），
+    # 额外要求 endpoint 非空——未配 endpoint 连不上任何桶，不构成「碰生产」。
+    _search_targets = " ".join(filter(None, (
+        config.alibaba_vector.endpoint, config.alibaba_vector.instance_id,
+        config.opensearch.host)))
+    _touches_prod_target = (
+        (not config.simulate_db and is_prod_target("rds", config.rds.host))
+        or (not config.simulate_opensearch and is_prod_target("search", _search_targets))
+        or (not config.simulate_oss and bool(config.oss.endpoint)
+            and is_prod_target("oss", config.oss.bucket_name))
+    )
+
+    if _env_label_prod or _touches_prod_target:
+        _guard_scope = config.environment if _env_label_prod \
+            else f"{config.environment} + prod-target-fingerprint"
         if not dashscope_key:
             raise ValueError(
-                f"🚨 [PRODUCTION SECURITY GUARD] DashScope API Key is not configured under '{config.environment}' environment! "
+                f"🚨 [PRODUCTION SECURITY GUARD] DashScope API Key is not configured under '{_guard_scope}' environment! "
                 f"To protect privacy & security, falling back to Google Gemini is strictly forbidden in production."
             )
-            
+
         # VLM（caption/审计）模型挂在 ocr 配置上但独立解析（RAG_VLM_MODEL），必须单独纳入守卫，
         # 否则 RAG_VLM_MODEL=gemini-* 会绕过检查直达图像通道；为空时按运行时约定回退 ocr.model。
         checks = [
@@ -888,7 +920,7 @@ def load_config() -> PipelineConfig:
             if "google" in base_url.lower() or "gemini" in model_name.lower():
                 raise ValueError(
                     f"🚨 [PRODUCTION SECURITY GUARD] {name} config resolved to Google Gemini "
-                    f"(base_url='{base_url}', model='{model_name}') under '{config.environment}' environment! "
+                    f"(base_url='{base_url}', model='{model_name}') under '{_guard_scope}' environment! "
                     f"Production runs must strictly utilize Alibaba Cloud (Qwen) services."
                 )
 

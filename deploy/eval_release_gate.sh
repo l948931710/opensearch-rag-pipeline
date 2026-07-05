@@ -40,6 +40,24 @@ command -v "${RAG_CLAUDE_BIN:-claude}" >/dev/null 2>&1 || { echo "FATAL: claude 
 [ -f "$GOLDSET" ] || { echo "FATAL: goldset missing: $GOLDSET"; exit 3; }
 [ -f "$BASELINE" ] || echo "WARN: no baseline ($BASELINE) — regression gate skipped; freeze one after the first clean gate:
   $PY -m eval_harness.run_eval baseline-freeze --results $RUNDIR/report.json --baseline $BASELINE"
+# P2-23 preflight：goldset 与冻结基线的 eval_set_sha 不一致 → 立即 FATAL。
+# 不预检的话要烧完整轮 live run + judge 面板后才被 merge --strict 的 regime_mismatch 拦截。
+# 老 baseline 缺 eval_set_sha 时放行(宽容);预检自身异常降级 WARN —— strict merge 仍是权威兜底。
+if [ -f "$BASELINE" ]; then
+  "$PY" - "$GOLDSET" "$BASELINE" <<'PYEOF' || { echo "FATAL: goldset 与冻结基线不匹配 — 要么 RAG_EVAL_GOLDSET 指向 baseline 的 goldset,要么显式 refreeze (run_eval baseline-freeze)"; exit 3; }
+import hashlib, json, sys
+try:
+    gs, bl = sys.argv[1], sys.argv[2]
+    sha = hashlib.sha256(open(gs, "rb").read()).hexdigest()[:16]
+    base_sha = (json.load(open(bl, encoding="utf-8")).get("regime") or {}).get("eval_set_sha")
+except Exception as e:  # 预检自身故障不拦门（graceful degradation）
+    print(f"WARN: goldset/baseline sha preflight skipped: {type(e).__name__}: {e}")
+    sys.exit(0)
+if base_sha and sha != base_sha:
+    print(f"eval_set_sha mismatch: run goldset={sha} frozen baseline={base_sha}")
+    sys.exit(1)
+PYEOF
+fi
 
 echo "== [2/4] run_eval run (no strict) → $RUNDIR =="
 "$PY" -m eval_harness.run_eval run --goldset "$GOLDSET" --layers "$LAYERS" --outdir "$RUNDIR" \
