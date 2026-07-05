@@ -371,6 +371,28 @@ def phase_merge(args):
         mpanels = mverd["panels"] if isinstance(mverd, dict) and "panels" in mverd else mverd
         results["judge_mm"] = merge_mm_panel(mm_bundle, mpanels)
 
+    # P3-11 judge 校准门接线：report.py 的 calibration_gate 只在 results['judge_calibration']
+    # 存在时出现，而此前【无任何编排路径写它】——门只活在文档片段里，每次自动 gate 都
+    # 静默缺席。现按同目录约定（judge_calibration_labels.json）或 RAG_JUDGE_CAL_LABELS 显式
+    # 路径拾取人工标注并现场 compare；无标注时打印显式 NOT-ACTIVE（不插 not_executed 门——
+    # 人工标注是稀缺产物而非每轮必备，插门会让所有无标注的 strict 跑恒挂）。
+    cal_path = (os.environ.get("RAG_JUDGE_CAL_LABELS")
+                or os.path.join(outdir, "judge_calibration_labels.json"))
+    if os.path.exists(cal_path):
+        from .judge_calibration import compare as _cal_compare
+        _labels = json.load(open(cal_path, encoding="utf-8"))
+        if isinstance(_labels, dict) and "labels" in _labels:
+            _labels = _labels["labels"]
+        results["judge_calibration"] = _cal_compare(_labels, panels)
+        results["judge_calibration"]["labels_path"] = cal_path
+    else:
+        results.setdefault("meta", {})["judge_calibration_status"] = (
+            "NOT ACTIVE — no human labels; judge 绝对效度无锚。生成标注模板见 "
+            "judge_calibration.build_template，标注后放 outdir/judge_calibration_labels.json "
+            "或设 RAG_JUDGE_CAL_LABELS")
+        print("   [note] judge-calibration gate NOT ACTIVE (no human labels) — "
+              "四个答案质量硬门当前建立在未经人工校准的 judge 上")
+
     if args.baseline and os.path.exists(args.baseline):
         from . import baseline as _bl
         results["baseline_gates"] = _bl.compare(

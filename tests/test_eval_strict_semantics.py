@@ -637,3 +637,43 @@ def test_baseline_coverage_gate_informational_never_blocks():
     assert cov["na_reason"] == "expected_na"
     assert "l2.frac_high" in str(cov["value"])          # 可见:告知哪些指标未入网
     assert _strict_failures(build_gates({"baseline_gates": bg}), {}) == []  # 不阻断
+
+
+def test_judge_calibration_auto_wired_in_merge(tmp_path, monkeypatch):
+    """P3-11：phase_merge 按同目录约定/环境变量拾取人工标注并写 results['judge_calibration']
+    （此前该键无任何编排路径写入，校准门在自动路径永不出现）；无标注时报告 meta 显式
+    标注 NOT ACTIVE，且不插会挂掉 strict 的 not_executed 门。"""
+    import json as _json
+    from types import SimpleNamespace
+    from eval_harness import run_eval
+
+    outdir = tmp_path
+    results = {"meta": {"layers": []}}
+    (outdir / "report.json").write_text(_json.dumps(results), encoding="utf-8")
+    panels = [{"panel": 1, "verdicts": []}]
+    (outdir / "judge_verdicts.json").write_text(_json.dumps(panels), encoding="utf-8")
+
+    captured = {}
+    monkeypatch.setattr(run_eval, "_enforce_strict", lambda *a, **k: None)
+    import eval_harness.report as _report
+    monkeypatch.setattr(_report, "write",
+                        lambda r, o: captured.update(results=r) or {})
+
+    args = SimpleNamespace(results=str(outdir / "report.json"),
+                           verdicts=str(outdir / "judge_verdicts.json"),
+                           baseline="", strict=False)
+
+    # 无标注：显式 NOT ACTIVE，无 judge_calibration 键
+    run_eval.phase_merge(args)
+    r = captured["results"]
+    assert "judge_calibration" not in r
+    assert "NOT ACTIVE" in r["meta"]["judge_calibration_status"]
+
+    # 放入同目录约定标注文件：自动 compare 并写键
+    (outdir / "judge_calibration_labels.json").write_text(
+        _json.dumps([{"qid": "q1", "human": {"faithfulness": 5, "fabricated": False}}]),
+        encoding="utf-8")
+    run_eval.phase_merge(args)
+    r2 = captured["results"]
+    assert "judge_calibration" in r2
+    assert r2["judge_calibration"]["labels_path"].endswith("judge_calibration_labels.json")
