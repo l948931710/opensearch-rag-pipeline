@@ -442,6 +442,8 @@ def _stream_answer_to_card(
     collected: List[str] = []
     answer_status = "SUCCESS"
     error_message: Optional[str] = None
+    # P2-20/21/22：生成元数据出参（generate_answer_stream 首帧前回填；mock 不回填 → None）
+    gen_meta_out: Dict[str, Any] = {}
 
     def _clean(text: str) -> str:
         # 与成品卡片一致的清理：去除末尾参考来源段 + [文档N] 编号引用 + <<IMG:N>> 占位符
@@ -501,6 +503,7 @@ def _stream_answer_to_card(
             max_tokens=DEFAULT_MAX_TOKENS,
             temperature=DEFAULT_TEMPERATURE,
             pure_text=True,
+            meta_out=gen_meta_out,
         ):
             frame = parse_sse_data_frame(event)
             if not frame or frame.get("type") != "chunk" or not frame.get("content"):
@@ -591,6 +594,7 @@ def _stream_answer_to_card(
         model_name=model_name,
         conversation_type=conversation_type,
         error_message=error_message,
+        gen_meta=gen_meta_out.get("gen_meta"),
     ))
     return True
 
@@ -719,6 +723,8 @@ def _process_rag_query(
             model_name=result.get("model"),
             conversation_type=conversation_type,
             content_blocks_json=content_blocks_json_str,
+            # P2-20/21/22：LLM 成功路径透传生成元数据（mock 不带该键 → None，不炸）
+            gen_meta=result.get("gen_meta"),
         ))
 
         # 6. 发送互动卡片（失败降级为 Markdown）

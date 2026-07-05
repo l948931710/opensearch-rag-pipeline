@@ -81,6 +81,13 @@ def _kb_db() -> str:
 # FastAPI App
 # ═══════════════════════════════════════════════════════════════
 
+# P2-8（盲区审计）：摄取↔服务 embedding 模型契约失配标志。启动时经 runtime_contract 比对
+# RDS 契约行（stage-3 每次真实嵌入 UPSERT）与本进程 get_config().embedding；失配 →
+# logger.critical + /api/ready 报 degraded/503。刻意不 fail-closed 拒绝启动（本地联调/
+# 未迁移环境零影响）—— 503 的摘流量语义由 readiness 探针承载。
+_EMBEDDING_CONTRACT_MISMATCH = False
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """应用生命周期：启动时注册钉钉互动卡片 HTTP 回调地址（若已配置 DINGTALK_CARD_CALLBACK_URL），
@@ -117,6 +124,22 @@ async def _lifespan(_app: FastAPI):
         logger.info("Serving 限流配置：%s", LIMITER.describe())
     except Exception:
         logger.warning("读取限流配置失败（忽略）", exc_info=True)
+    # P2-8：比对摄取侧写入的 embedding 契约行（模型名/维度，schema/018）。失配 = 查询向量
+    # 与库内向量不同模型/维度 —— 同维升级时相似度是垃圾但不报错，必须喊响并让 readiness
+    # 摘流量。simulate / 表未 apply / 读失败：check 返回 None，零影响。
+    global _EMBEDDING_CONTRACT_MISMATCH
+    try:
+        from opensearch_pipeline.runtime_contract import check_embedding_contract
+        _mm = check_embedding_contract()
+        if _mm:
+            _EMBEDDING_CONTRACT_MISMATCH = True
+            logger.critical(
+                "embedding 摄取↔服务契约失配（%s）—— 查询向量与索引向量不可比，"
+                "/api/ready 已降级 503。请对齐 RAG_EMBEDDING_MODEL/RAG_EMBEDDING_DIMENSION "
+                "或重建索引后重启。", _mm,
+            )
+    except Exception:
+        logger.warning("embedding 契约比对失败（忽略，不影响启动）", exc_info=True)
     yield
 
 
@@ -503,7 +526,12 @@ def readiness_check():
 
     checks["dashscope"] = "configured" if getattr(cfg.embedding, "api_key", None) else "unconfigured"
 
-    critical_ok = checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
+    # P2-8：启动时检出的摄取↔服务 embedding 契约失配 → 关键降级（此实例算出的相似度
+    # 不可信，必须被负载均衡摘出）。失配详情已在启动日志 CRITICAL，此处只报状态词。
+    checks["embedding_contract"] = "mismatch" if _EMBEDDING_CONTRACT_MISMATCH else "ok"
+
+    critical_ok = (checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
+                   and not _EMBEDDING_CONTRACT_MISMATCH)
     body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
     return body if critical_ok else JSONResponse(status_code=503, content=body)
 
@@ -658,7 +686,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
             usage={},
             latency_ms=latency,
             no_result=True,
-            rephrase=_suggest_rephrase(req.question),
+            rephrase=_suggest_rephrase(req.question, user_dept=user_dept),
         )
 
     # 3. LLM 生成。深度思考（req.thinking）走流式通道服务端攒流：DashScope qwen3
@@ -759,6 +787,9 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         answer_status="REFUSAL" if resp_no_result else "SUCCESS",
         model_name=result.get("model"),
         content_blocks_json=content_blocks_to_json(blocks) if blocks else None,
+        # P2-20/21/22：LLM 成功路径透传生成元数据（generate_answer[_via_stream] 返回 dict
+        # 里的 "gen_meta"；测试 mock 不带该键 → .get 得 None，不炸）
+        gen_meta=result.get("gen_meta"),
     ))
 
     return AskResponse(
@@ -772,7 +803,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         latency_ms=latency,
         no_result=resp_no_result,
         guard=resp_guard,
-        rephrase=_suggest_rephrase(req.question) if resp_no_result else [],
+        rephrase=_suggest_rephrase(req.question, user_dept=user_dept) if resp_no_result else [],
     )
 
 
@@ -829,7 +860,7 @@ def ask_stream(req: AskRequest, request: Request,
                 yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'type': 'chunk', 'content': NO_RESULT_MESSAGE}, ensure_ascii=False)}\n\n"
                 # done 帧带 no_result + rephrase：让流式前端也能渲染结构化空结果卡（换个说法 + 转人工）
-                yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(req.question)}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(req.question, user_dept=user_dept)}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 log_qa_session(**build_qa_log_kwargs(
@@ -866,6 +897,10 @@ def ask_stream(req: AskRequest, request: Request,
         # 截断的落库状态改 CLIENT_DISCONNECTED（否则半截回答混进 SUCCESS 分析口径，
         # 还可能被 is_refusal_answer 误翻成 REFUSAL）。
         completed = False
+        # P2-20/21/22：生成元数据出参（generate_answer_stream 首帧前回填 "gen_meta"；
+        # gen_meta 只落库、绝不进 SSE 线协议 —— 内部阈值/模型配置不外泄给 SSE 客户端。
+        # 测试 mock 生成器不回填 → .get 得 None）
+        gen_meta_out: Dict[str, Any] = {}
 
         try:
             try:
@@ -880,6 +915,7 @@ def ask_stream(req: AskRequest, request: Request,
                     temperature=req.temperature or DEFAULT_TEMPERATURE,
                     pure_text=req.pure_text,
                     thinking=req.thinking,
+                    meta_out=gen_meta_out,
                 ):
                     # 截获生成器自带的 [DONE]，改由本函数在 content_blocks 之后统一收尾
                     if event.strip() == "data: [DONE]":
@@ -975,6 +1011,7 @@ def ask_stream(req: AskRequest, request: Request,
                 model_name=model_name,
                 error_message=error_message,
                 content_blocks_json=content_blocks_json_str,
+                gen_meta=gen_meta_out.get("gen_meta"),
             ))
 
     return StreamingResponse(
@@ -1429,10 +1466,36 @@ def delete_conversation(conversation_id: str, request: Request,
 # 与 chat 页静态 chips 保持同一兜底集，客户端取接口失败时显示一致。
 _HOT_QUESTIONS_FALLBACK = ["U8+ 如何登录？", "请假流程是什么？", "访客 WiFi 密码是多少？"]
 _HOT_QUESTIONS_TTL_S = 3600
-_hot_questions_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+# P2-7（盲区审计 2026-07-05）：热门问题/改写池按【请求者部门 cohort】分池。
+# 此前两条聚合查询无 user_dept 谓词，把他部门用户的原始提问文本（暴露该部门在问什么、
+# 内部术语）跨部门下发——尽管每次检索都正确按部门过滤，这条派生特征是独立的泄露通道。
+# cohort 键 = 与 /api/ask 落库同一形态的 user_dept（acl_groups CSV，见 answer_flow）：
+# 同权限组集合的用户互见彼此的高频问题；钉钉 bot 路径落的中文部门名与 CSV 不相交 →
+# 保守不互见（宁可少推荐，不越界）。匿名/无部门 → 只给静态兜底。
+_hot_questions_cache: Dict[str, Dict[str, Any]] = {}    # dept_key -> {ts,data,refreshing}
+_DEPT_CACHE_MAX_KEYS = 128    # cohort 键数软上限（防伪造令牌枚举撑爆内存；超限逐最旧）
 # 不计入热门的控制指令与联调账号
 _HOT_Q_EXCLUDE_TEXT = ("新会话", "重新开始")
 _HOT_Q_EXCLUDE_USER_PREFIX = ("miniapp-proto", "eval-", "test-")
+
+
+def _dept_scope_key(user_dept) -> str:
+    """把 identity.acl_groups / user_dept 归一成与 qa_session_log.user_dept 落库同形的
+    cohort 键（list → CSV，与 answer_flow.build_qa_log_kwargs 逐字一致）。空 = 无部门。"""
+    if isinstance(user_dept, (list, tuple)):
+        return ",".join(str(d) for d in user_dept if d)
+    return str(user_dept or "").strip()
+
+
+def _dept_cache_entry(cache: Dict[str, Dict[str, Any]], key: str) -> Dict[str, Any]:
+    """取/建 cohort 的 SWR 缓存条目；超上限时逐出 ts 最旧的键。"""
+    ent = cache.get(key)
+    if ent is None:
+        if len(cache) >= _DEPT_CACHE_MAX_KEYS:
+            oldest = min(cache, key=lambda k: cache[k].get("ts", 0.0))
+            cache.pop(oldest, None)
+        ent = cache[key] = {"ts": 0.0, "data": None}
+    return ent
 
 # perf#80 serve-stale-while-revalidate：hot-questions / success-pool 两处 1h 缓存
 # 过期后的首个请求原本在 chat 首页热路径上同步扛整个 30 天 GROUP BY 聚合（每小时
@@ -1484,8 +1547,11 @@ def _swr_cached(cache: Dict[str, Any], ttl: float, compute, fallback, label: str
     return data
 
 
-def _compute_hot_questions() -> List[str]:
-    """近 30 天高频 SUCCESS 问题 top-6 聚合（DB 异常上抛，回退语义由 _swr_cached 决定）。"""
+def _compute_hot_questions(dept_key: str) -> List[str]:
+    """近 30 天高频 SUCCESS 问题 top-6 聚合（DB 异常上抛，回退语义由 _swr_cached 决定）。
+
+    P2-7：加 `user_dept = %s` cohort 谓词——聚合池只含与请求者同权限组集合用户的提问，
+    他部门的查询意图/内部术语不再经「示例问题」跨部门下发。"""
     from opensearch_pipeline.qa_logger import _op_db
     from opensearch_pipeline.db import _get_db_conn
 
@@ -1501,6 +1567,7 @@ def _compute_hot_questions() -> List[str]:
                 SELECT query_text, COUNT(*) AS cnt
                 FROM {_op_db()}.qa_session_log
                 WHERE answer_status = 'SUCCESS'
+                  AND user_dept = %s
                   AND created_at >= NOW() - INTERVAL 30 DAY
                   AND CHAR_LENGTH(query_text) BETWEEN 4 AND 30
                   AND {user_excludes}
@@ -1509,7 +1576,7 @@ def _compute_hot_questions() -> List[str]:
                 ORDER BY cnt DESC, MAX(id) DESC
                 LIMIT 20
                 """,
-                tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
+                (dept_key,) + tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
             )
             for text, _cnt in cursor.fetchall():
                 t = (text or "").strip()
@@ -1533,11 +1600,18 @@ def _compute_hot_questions() -> List[str]:
 @app.get("/api/hot-questions")
 def hot_questions(request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
-    """真实高频问题 top-N，驱动 chat 页「示例问题」快捷栏。"""
+    """真实高频问题 top-N，驱动 chat 页「示例问题」快捷栏。
+
+    P2-7：按请求者部门 cohort 分池分缓存；匿名/无部门只给静态兜底（真实提问文本
+    是部门界定的可见范围，不对未登录者聚合下发）。"""
     _enforce_rate_limit(request, identity, scope="aux")
+    dept_key = _dept_scope_key(identity.acl_groups if identity else None)
+    if not dept_key:
+        return {"questions": list(_HOT_QUESTIONS_FALLBACK)}
     questions = _swr_cached(
-        _hot_questions_cache, _HOT_QUESTIONS_TTL_S, _compute_hot_questions,
-        lambda: list(_HOT_QUESTIONS_FALLBACK), "hot-questions")
+        _dept_cache_entry(_hot_questions_cache, dept_key), _HOT_QUESTIONS_TTL_S,
+        lambda: _compute_hot_questions(dept_key),
+        lambda: list(_HOT_QUESTIONS_FALLBACK), f"hot-questions[{dept_key[:24]}]")
     return {"questions": questions}
 
 
@@ -1547,15 +1621,16 @@ def hot_questions(request: Request,
 # 不足时回退「清洗版原问题」。纯启发式、零 LLM 成本、fail open。
 
 _SUCCESS_POOL_TTL_S = 3600
-_success_pool_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+_success_pool_cache: Dict[str, Dict[str, Any]] = {}    # P2-7：dept_key -> SWR 条目
 _REPHRASE_NOISE_PREFIX = (
     "请问一下", "请问", "你好", "您好", "帮我查一下", "帮我查", "帮我",
     "我想知道", "我想问一下", "我想问", "想问一下", "问一下", "请教一下", "请教",
 )
 
 
-def _compute_success_pool() -> List[str]:
-    """近 30 天 SUCCESS 问题池聚合（DB 异常上抛，回退语义由 _swr_cached 决定）。"""
+def _compute_success_pool(dept_key: str) -> List[str]:
+    """近 30 天 SUCCESS 问题池聚合（DB 异常上抛，回退语义由 _swr_cached 决定）。
+    P2-7：同 cohort 谓词——改写建议只从本部门 cohort 的成功问题里选。"""
     from opensearch_pipeline.qa_logger import _op_db
     from opensearch_pipeline.db import _get_db_conn
 
@@ -1571,6 +1646,7 @@ def _compute_success_pool() -> List[str]:
                 SELECT query_text, COUNT(*) AS cnt
                 FROM {_op_db()}.qa_session_log
                 WHERE answer_status = 'SUCCESS'
+                  AND user_dept = %s
                   AND created_at >= NOW() - INTERVAL 30 DAY
                   AND CHAR_LENGTH(query_text) BETWEEN 4 AND 40
                   AND {user_excludes}
@@ -1578,7 +1654,7 @@ def _compute_success_pool() -> List[str]:
                 ORDER BY cnt DESC
                 LIMIT 200
                 """,
-                tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
+                (dept_key,) + tuple(p + "%" for p in _HOT_Q_EXCLUDE_USER_PREFIX),
             )
             for text, _cnt in cursor.fetchall():
                 t = (text or "").strip()
@@ -1589,12 +1665,16 @@ def _compute_success_pool() -> List[str]:
     return pool
 
 
-def _success_question_pool() -> List[str]:
+def _success_question_pool(dept_key: str) -> List[str]:
     """近 30 天 SUCCESS 问题池（去重、4-40 字、排除控制指令/联调账号；缓存 1h，
-    perf#80 serve-stale：过期返回旧值 + 后台单飞刷新；查询失败退化为空池=仅清洗原问题）。"""
+    perf#80 serve-stale：过期返回旧值 + 后台单飞刷新；查询失败退化为空池=仅清洗原问题）。
+    P2-7：按 cohort 分池；无部门 → 空池（只走清洗原问题回退）。"""
+    if not dept_key:
+        return []
     return _swr_cached(
-        _success_pool_cache, _SUCCESS_POOL_TTL_S, _compute_success_pool,
-        lambda: [], "success-pool(rephrase)")
+        _dept_cache_entry(_success_pool_cache, dept_key), _SUCCESS_POOL_TTL_S,
+        lambda: _compute_success_pool(dept_key),
+        lambda: [], f"success-pool(rephrase)[{dept_key[:24]}]")
 
 
 def _char_bigrams(s: str) -> set:
@@ -1603,8 +1683,10 @@ def _char_bigrams(s: str) -> set:
     return {"".join(chars[i:i + 2]) for i in range(len(chars) - 1)}
 
 
-def _suggest_rephrase(question: str, limit: int = 2) -> List[str]:
-    """NO_RESULT 出口的「换个说法」建议（fail open 返回 []）。"""
+def _suggest_rephrase(question: str, limit: int = 2, user_dept=None) -> List[str]:
+    """NO_RESULT 出口的「换个说法」建议（fail open 返回 []）。
+    P2-7：候选池按请求者部门 cohort 取（user_dept=identity.acl_groups）；无部门 →
+    池空，只走清洗原问题回退——他部门的成功问法不再泄给本部门用户。"""
     try:
         q = (question or "").strip()
         if not q:
@@ -1613,7 +1695,7 @@ def _suggest_rephrase(question: str, limit: int = 2) -> List[str]:
         out: List[str] = []
         if q_grams:
             scored = []
-            for cand in _success_question_pool():
+            for cand in _success_question_pool(_dept_scope_key(user_dept)):
                 if cand == q:
                     continue
                 c_grams = _char_bigrams(cand)
@@ -1971,6 +2053,11 @@ KbEscalationsResponse = _routes_kb_console.KbEscalationsResponse
 kb_escalations = _routes_kb_console.kb_escalations
 KbEscalationResolveRequest = _routes_kb_console.KbEscalationResolveRequest
 kb_escalation_resolve = _routes_kb_console.kb_escalation_resolve
+KbReviewTaskItem = _routes_kb_console.KbReviewTaskItem
+KbReviewTasksResponse = _routes_kb_console.KbReviewTasksResponse
+kb_review_tasks = _routes_kb_console.kb_review_tasks
+KbReviewTaskResolveRequest = _routes_kb_console.KbReviewTaskResolveRequest
+kb_review_task_resolve = _routes_kb_console.kb_review_task_resolve
 KbEmbedRunItem = _routes_kb_console.KbEmbedRunItem
 KbDeptCoverageItem = _routes_kb_console.KbDeptCoverageItem
 KbFeedbackDay = _routes_kb_console.KbFeedbackDay

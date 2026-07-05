@@ -12,7 +12,9 @@ def test_run_all_sequences_selected_jobs(monkeypatch):
     monkeypatch.setattr(rec, "run_raw_parity_check", lambda **k: calls.append("raw") or {"ok": True})
     monkeypatch.setattr(qr, "run_rollup", lambda **k: calls.append("rollup") or {"ok": True, "slo_ok": 1})
     out = ops_monitor.run_all(alert=False)
-    assert set(out) == {"reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup"}
+    # P2-34/P2-15 起作业集含 queue_aging/ingest_funnel（模拟态 no-op skipped）
+    assert set(out) == {"reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup",
+                        "queue_aging", "ingest_funnel"}
     assert calls == ["ha3", "oss", "raw", "rollup"]
 
 

@@ -71,6 +71,32 @@ def question_hash(s: Optional[str]) -> str:
     return hashlib.sha256(normalize_question(s).encode("utf-8")).hexdigest()
 
 
+# ── P2-17：图片占位符注入防护 ────────────────────────────────────────────────
+# 服务侧渲染（content_blocks_builder）按 LLM 答案里的 <<IMG:N>> 标记 × 检索位次 N 挂图，
+# 对标记【来源】无任何校验：投稿正文若带字面 <<IMG:N>>，入库成 chunk 后被 LLM 原样转述
+# 进答案，渲染层就会把【其他文档】恰好排在第 N 位的图绑到该答案上（视觉引用伪造）。
+# 摄取管线从不剥离该标记 → 必须在贡献正文入库前剥离（submit 与 accept 两侧都过——防
+# 「先提交干净、采纳前改回」；synthesize_markdown 再兜一道，覆盖修复前已采纳的存量行走
+# retry 续跑）。模式取渲染侧两个解析 regex（_IMG_PLACEHOLDER_PATTERN 标准形 +
+# _IMG_MARKER_VARIANT_PATTERN lenient 变体）的【超集】：单/双尖括号、全角【】《》、
+# 全/半角冒号、可选空白与 N.M 子下标。⚠️ 用全角括号「转义」不安全——《IMG:3》本身就是
+# lenient 模式（RAG_IMG_MARKER_LENIENT）的合法变体，会被归一化回标准标记，故直接删除。
+_IMG_MARKER_INJECTION_RE = re.compile(
+    r"(?:<{1,2}|【|《)\s*IMG\s*[:：]\s*\d+(?:\.\d+)?\s*(?:>{1,2}|】|》)",
+    re.IGNORECASE,
+)
+
+
+def strip_img_markers(text: Optional[str]) -> str:
+    """剥离投稿文本中的字面图片占位符（防注入语义见 _IMG_MARKER_INJECTION_RE 注释）。
+
+    正常投稿没有任何理由手写 <<IMG:N>> 这类渲染内部标记，直接删除不做替换占位。
+    """
+    if not text:
+        return ""
+    return _IMG_MARKER_INJECTION_RE.sub("", str(text))
+
+
 def synthesize_markdown(question: Optional[str], content: Optional[str]) -> str:
     """把采纳的问答合成为可检索 .md 正文（FAQ 形态）。
 
@@ -79,9 +105,10 @@ def synthesize_markdown(question: Optional[str], content: Optional[str]) -> str:
     用「# 标题」会被当 heading 打断 FAQ 配对、丢问题，故不用。【不含提交人姓名/审计信息】（那些只留
     kb_contribution 表，doc_id↔contribution_id 即溯源链）；不加 YAML front matter。
     标题/展示名走 document_meta（采纳时已存问题），不依赖正文里的 heading。
+    P2-17：作为入库前最终关口再剥一次字面 <<IMG:N>>（覆盖修复前已入表的存量行经 retry 续跑）。
     """
-    q = (question or "").strip()
-    c = (content or "").strip()
+    q = strip_img_markers(question).strip()
+    c = strip_img_markers(content).strip()
     return f"问：{q}\n\n答：{c}\n"
 
 

@@ -139,6 +139,13 @@ def _upsert_conversation(conn, user_id: str, conversation_id: str, title) -> Non
         )
 
 
+# schema/018 未 apply 的进程内负缓存（P2-20/21/22）：首次 1054(gen_meta_json) 后本进程
+# 不再尝试携带该列 —— qa_session_log 每问一行，逐行「试写失败再回退」会翻倍 RDS 往返、
+# 刷屏 warning（qa_rollup._upsert_daily 的同款 1054 回退无缓存是因为它每天只跑一次）。
+# apply 迁移后重启 serving 进程即恢复携带。
+_GEN_META_COL_MISSING = False
+
+
 def log_qa_session(
     *,
     session_id: str,
@@ -164,6 +171,7 @@ def log_qa_session(
     conversation_type: Optional[str] = None,
     content_blocks_json: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    gen_meta_json: Optional[str] = None,
 ) -> None:
     """
     写入一条 qa_session_log 记录。
@@ -191,6 +199,8 @@ def log_qa_session(
         opensearch_hit_count: 检索命中数
         top_score: 最高检索得分
         conversation_type: '1'=单聊, '2'=群聊
+        gen_meta_json: 生成元数据 JSON 快照（P2-20/21/22，schema/018 可选列；
+            未 apply 时 1054 自动降级不携带，审计行绝不丢）
     """
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -267,42 +277,76 @@ def log_qa_session(
             # 兼容降级：库未迁移（unknown column 1054）→ 回滚后改 legacy INSERT，核心审计行恒落库、绝不丢。
             enrich = bool(conversation_id) and _conversation_history_on()
             conversation_upserted = False
-            try:
-                if enrich:
-                    # perf E#47：qa_conversation upsert 并入主事务、同一 commit（省一次
-                    # RDS 往返+fsync）。合并事务任何失败 → 回滚后降级为现状两段式：先单独
-                    # 重试主 INSERT（含 conversation_id，1054 由外层 except 继续降级 legacy），
-                    # upsert 交回下方独立小事务 best-effort——核心审计行绝不因 upsert 丢失。
-                    try:
-                        _execute_insert(base_cols + ["conversation_id"],
-                                        base_vals + [conversation_id])
-                        _exec_conversation_upsert(conn, user_id or "", conversation_id, query_text)
-                        conn.commit()
-                        conversation_upserted = True
-                    except Exception as me:
+
+            def _write_row(cols, vals):
+                """一整次落行尝试（列集参数化；cols/vals 不含 conversation_id 增强列）。
+
+                内含既有的 conversation_id 合并事务/两段式/1054-legacy 三级降级，逻辑与
+                历史逐字节等价 —— 仅把 base_cols/base_vals 换成形参，供 gen_meta_json
+                可选列（schema/018）在外层做同款 1054 回退。
+                """
+                nonlocal conversation_upserted
+                try:
+                    if enrich:
+                        # perf E#47：qa_conversation upsert 并入主事务、同一 commit（省一次
+                        # RDS 往返+fsync）。合并事务任何失败 → 回滚后降级为现状两段式：先单独
+                        # 重试主 INSERT（含 conversation_id，1054 由外层 except 继续降级 legacy），
+                        # upsert 交回下方独立小事务 best-effort——核心审计行绝不因 upsert 丢失。
+                        try:
+                            _execute_insert(cols + ["conversation_id"],
+                                            vals + [conversation_id])
+                            _exec_conversation_upsert(conn, user_id or "", conversation_id, query_text)
+                            conn.commit()
+                            conversation_upserted = True
+                        except Exception as me:
+                            logger.warning(
+                                "qa_session_log 合并事务失败，降级两段式 (non-fatal): "
+                                "message_id=%s, %s", message_id, me,
+                            )
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            _insert(cols + ["conversation_id"], vals + [conversation_id])
+                    else:
+                        _insert(cols, vals)
+                except Exception as ie:
+                    ierr = ie.args[0] if getattr(ie, "args", None) and isinstance(ie.args[0], int) else None
+                    if enrich and ierr == 1054:
                         logger.warning(
-                            "qa_session_log 合并事务失败，降级两段式 (non-fatal): "
-                            "message_id=%s, %s", message_id, me,
+                            "conversation_id 列缺失，降级 legacy INSERT（请应用 schema/006）: message_id=%s, %s",
+                            message_id, ie,
                         )
                         try:
                             conn.rollback()
                         except Exception:
                             pass
-                        _insert(base_cols + ["conversation_id"], base_vals + [conversation_id])
-                else:
-                    _insert(base_cols, base_vals)
-            except Exception as ie:
-                ierr = ie.args[0] if getattr(ie, "args", None) and isinstance(ie.args[0], int) else None
-                if enrich and ierr == 1054:
+                        _insert(cols, vals)
+                    else:
+                        raise
+
+            # P2-20/21/22（schema/018 可选列）：gen_meta_json 不进 base_cols —— legacy 回退
+            # 路径绝不携带（test_qa_logger 的 base_cols↔001/002 DDL 契约不变）。未 apply 时
+            # 首次 1054 → 回退旧列集重试并置进程内负缓存，审计行绝不因新列丢失。
+            global _GEN_META_COL_MISSING
+            gm_cols = ["gen_meta_json"] if (gen_meta_json and not _GEN_META_COL_MISSING) else []
+            gm_vals = [gen_meta_json] if gm_cols else []
+            try:
+                _write_row(base_cols + gm_cols, base_vals + gm_vals)
+            except Exception as ge:
+                gerr = ge.args[0] if getattr(ge, "args", None) and isinstance(ge.args[0], int) else None
+                if gm_cols and gerr == 1054:
+                    if "gen_meta_json" in str(ge):
+                        _GEN_META_COL_MISSING = True
                     logger.warning(
-                        "conversation_id 列缺失，降级 legacy INSERT（请应用 schema/006）: message_id=%s, %s",
-                        message_id, ie,
+                        "gen_meta_json 列缺失，回退旧列集（请应用 schema/018；本进程不再携带）: "
+                        "message_id=%s, %s", message_id, ge,
                     )
                     try:
                         conn.rollback()
                     except Exception:
                         pass
-                    _insert(base_cols, base_vals)
+                    _write_row(base_cols, base_vals)
                 else:
                     raise
             logger.info(

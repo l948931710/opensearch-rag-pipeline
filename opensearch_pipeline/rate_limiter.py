@@ -124,6 +124,39 @@ def _persist_rejected(snapshot: Dict[Tuple[str, str], int]) -> bool:
         return False
 
 
+# P2-11：全局熔断准入量的持久化「原因」键（与拒绝共表；__ 前缀 = 非拒绝行，
+# qa_rollup._fetch_rejected 按前缀排除）。落库频率与拒绝同批（≤1 批/60s）。
+_ADMITTED_KEY = "__admitted__"
+
+
+def _load_admitted_today(day: str) -> Optional[int]:
+    """读回当日已持久化的准入量（进程重启回种；盲区审计 P2-11：计数器纯内存，
+    SAE 重启/崩溃循环反复清零 2000/日 的账单保护顶）。fail-open：模拟/表未建/失败 → None。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        cfg = get_config()
+        if cfg.simulate or cfg.simulate_db:
+            return None
+        op_db = cfg.rds.operation_database
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT reject_count FROM {op_db}.qa_admission_reject"
+                    " WHERE stat_date = %s AND reason = %s",
+                    (day, _ADMITTED_KEY))
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                return int((row["reject_count"] if isinstance(row, dict) else row[0]) or 0)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001
+        logger.warning("熔断计数回种读取失败（fail-open，按内存计数）: %s", e)
+        return None
+
+
 def _beijing_day(now: float) -> str:
     """北京时间日期串 YYYY-MM-DD（日配额/熔断的日界）。"""
     return time.strftime("%Y-%m-%d", time.gmtime(now + _BJ_OFFSET_S))
@@ -184,6 +217,9 @@ class Limits:
     aux_per_min: int = 30
     thinking_daily_quota: int = 10
     global_daily_llm_cap: int = 2000
+    # P2-11：深思请求 ~8x token 计费（模块 docstring），对全局熔断按权重计数——
+    # 否则同一顶下真实账单差一个数量级（"准入请求"vs"计费调用"的阻抗失配）
+    thinking_cap_weight: int = 8
 
 
 def _env_int(name: str, default: int) -> int:
@@ -227,6 +263,7 @@ def _load_limits() -> Limits:
         aux_per_min=_env_int("RAG_RATE_AUX_PER_MIN", 30),
         thinking_daily_quota=_env_int("RAG_THINKING_DAILY_QUOTA", 10),
         global_daily_llm_cap=_env_int("RAG_GLOBAL_DAILY_LLM_CAP", 2000),
+        thinking_cap_weight=max(1, _env_int("RAG_GLOBAL_CAP_THINKING_WEIGHT", 8)),
     )
 
 
@@ -255,6 +292,8 @@ class ServingRateLimiter:
         self._reject_flush_ts = 0.0
         # P1-1：触顶告警日界（每北京日至多发一次 critical 告警）
         self._cap_alert_day = ""
+        # P2-11：熔断计数回种日界（进程内每北京日至多回种一次）
+        self._cap_seed_day = ""
 
     # ── 配置 ─────────────────────────────────────────────────
 
@@ -277,6 +316,7 @@ class ServingRateLimiter:
             self._last_warn.clear()
             self._last_prune = 0.0
             self._cap_alert_day = ""
+            self._cap_seed_day = ""
         with self._reject_lock:
             self._rejected.clear()
             self._reject_flush_ts = 0.0
@@ -308,6 +348,14 @@ class ServingRateLimiter:
             return None
         now = self._now()
         day = _beijing_day(now)
+
+        # P2-11 重启回种（锁外触发：_seed 内部要取 _lock，同步测试模式下锁内直调会死锁；
+        # 竞态良性——至多重复派发，回种本身 max() 幂等）：进程首见当日 → 后台读回已持久化
+        # 的准入量（纯内存计数会被 SAE 重部署/崩溃循环反复清零，攻击中崩溃 = 反复重置
+        # 账单保护顶）。
+        if count_llm and lim.global_daily_llm_cap > 0 and self._cap_seed_day != day:
+            self._cap_seed_day = day
+            self._dispatch_cap_seed(day)
 
         with self._lock:
             # 1) 全局日熔断（503：服务层面停摆，与用户行为无关）
@@ -371,10 +419,17 @@ class ServingRateLimiter:
                 self._daily[think_key] = (day, (t_cnt if t_day == day else 0) + 1)
             if count_llm and lim.global_daily_llm_cap > 0:
                 g_day, g_cnt = self._global_day
-                new_cnt = (g_cnt if g_day == day else 0) + 1
+                prev = g_cnt if g_day == day else 0
+                # P2-11：深思按权重计（~8x token 计费），"准入请求"≈"计费量"不再差一个量级
+                weight = lim.thinking_cap_weight if thinking else 1
+                new_cnt = prev + weight
                 self._global_day = (day, new_cnt)
-                if new_cnt == lim.global_daily_llm_cap:
-                    # 最后一个放行的请求触顶：大声记日志 + 运维告警（下一个请求开始全拒）
+                # 准入量与拒绝同批持久化（__admitted__ 行，重启回种数据源）
+                with self._reject_lock:
+                    a_key = (day, _ADMITTED_KEY)
+                    self._rejected[a_key] = self._rejected.get(a_key, 0) + weight
+                if prev < lim.global_daily_llm_cap <= new_cnt:
+                    # 跨越触顶边沿（权重计数可跳过精确等号）：大声记日志 + 运维告警
                     logger.error("全局日熔断触顶：今日问答量已达 %d，后续请求将被拒绝至次日",
                                  lim.global_daily_llm_cap)
                     self._maybe_cap_alert(day, lim.global_daily_llm_cap)
@@ -424,6 +479,26 @@ class ServingRateLimiter:
             return
         self._cap_alert_day = day
         _dispatch_cap_alert(cap)
+
+    def _dispatch_cap_seed(self, day: str) -> None:
+        """P2-11 重启回种（持 _lock 路径调用，DB 读放后台线程）：把当日已持久化的准入量
+        并回内存计数。max() 语义：稳态下内存 ≥ 已落库（落库滞后 ≤60s），回种是 no-op；
+        重启后内存从 0 重积，db 值恢复上一进程的累计（丢失上限 = 最后一批未落库的 ≤60s 尾巴）。
+        fail-open：读失败仅按内存计数（回到修复前行为）。"""
+        def _seed() -> None:
+            db_cnt = _load_admitted_today(day)
+            if not db_cnt:
+                return
+            with self._lock:
+                g_day, g_cnt = self._global_day
+                cur = g_cnt if g_day == day else 0
+                if db_cnt > cur:
+                    self._global_day = (day, db_cnt)
+                    logger.info("全局熔断计数回种：%s 内存 %d → 持久化 %d", day, cur, db_cnt)
+        if _DISPATCH_ASYNC:
+            threading.Thread(target=_seed, daemon=True, name="cap-seed").start()
+        else:
+            _seed()
 
     def _note_reject(self, reason: Optional[str], now: float) -> None:
         """拒绝聚合：reason 非空则 +1；到期（≥60s 且有存量）则快照清零并派发落库。

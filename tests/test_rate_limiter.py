@@ -270,6 +270,8 @@ def sync_dispatch(monkeypatch):
         flushed.append(dict(snap))
         return ok["v"]
     monkeypatch.setattr(rl, "_persist_rejected", _fake_persist)
+    # P2-11 回种默认无历史（单测里 config 是模拟态本就返回 None；显式桩掉防触库）
+    monkeypatch.setattr(rl, "_load_admitted_today", lambda day: None)
     return alerts, flushed, ok
 
 
@@ -338,3 +340,50 @@ def test_persist_rejected_simulate_mode_is_noop(monkeypatch):
         raise AssertionError("simulate 模式不应触库")
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _db_boom)
     assert rl._persist_rejected({("2026-07-05", "per_min"): 1}) is True
+
+
+# ── P2-11：熔断计数持久化（重启回种）+ 深思按权重计 ──────────
+
+def test_admitted_counts_persisted_with_flush(make_limiter, sync_dispatch):
+    """开启熔断层时，准入量以 __admitted__ 行随拒绝同批持久化（重启回种的数据源）。"""
+    _, flushed, _ = sync_dispatch
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_GLOBAL_DAILY_LLM_CAP=100,
+                       RAG_RATE_USER_PER_MIN=1, RAG_RATE_USER_PER_DAY=0)
+    day = rl._beijing_day(clock())
+    assert lim.admit_ask("u:a", is_user=True) is None       # 准入 +1 → 首批立即落（ts=0 视为到期）
+    assert flushed == [{(day, rl._ADMITTED_KEY): 1}]
+    assert lim.admit_ask("u:a", is_user=True).reason == "per_min"   # 60s 内只积累
+    clock.advance(61)
+    assert lim.admit_ask("u:a", is_user=True) is None       # 到期 → 拒绝+准入同批落库
+    assert flushed[-1] == {(day, "per_min"): 1, (day, rl._ADMITTED_KEY): 1}
+
+
+def test_cap_seed_restores_after_restart(make_limiter, sync_dispatch, monkeypatch):
+    """重启回种：DB 已有当日准入 5、cap=6 → 新进程首个准入即触顶告警，第二个被拒——
+    纯内存版本会把保护顶重置为完整一天的量。"""
+    alerts, _, _ = sync_dispatch
+    monkeypatch.setattr(rl, "_load_admitted_today", lambda day: 5)
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_GLOBAL_DAILY_LLM_CAP=6,
+                       RAG_RATE_USER_PER_MIN=0, RAG_RATE_USER_PER_DAY=0)
+    assert lim.admit_ask("u:a", is_user=True) is None       # 5(回种)+1=6 跨越触顶
+    assert alerts == [6]
+    d = lim.admit_ask("u:b", is_user=True)
+    assert d is not None and d.reason == "global_cap"
+
+
+def test_thinking_weighted_toward_global_cap(make_limiter, sync_dispatch):
+    """深思 ~8x token 计费 → 对全局熔断按 RAG_GLOBAL_CAP_THINKING_WEIGHT（默认 8）计；
+    权重计数可跳过精确等号，触顶告警按跨越边沿触发。"""
+    alerts, _, _ = sync_dispatch
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_GLOBAL_DAILY_LLM_CAP=10,
+                       RAG_RATE_USER_PER_MIN=0, RAG_RATE_USER_PER_DAY=0,
+                       RAG_THINKING_DAILY_QUOTA=10)
+    assert lim.admit_ask("u:a", is_user=True, thinking=True) is None    # +8
+    assert lim.admit_ask("u:b", is_user=True) is None                   # +1 → 9
+    assert alerts == []
+    assert lim.admit_ask("u:c", is_user=True) is None                   # +1 → 10 触顶
+    assert alerts == [10]
+    assert lim.admit_ask("u:d", is_user=True).reason == "global_cap"

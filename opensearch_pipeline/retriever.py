@@ -175,6 +175,93 @@ def get_query_embedding(
     return dense, sparse_indices, sparse_values
 
 
+# ── P2-4：查询嵌入降级（DashScope 嵌入中断 ≠ 全部检索硬失败）─────────────────
+# RAG_DEGRADED_BM25_ENABLE（默认 true）：查询嵌入失败（超时 / HTTP 错 / 无 key）时
+# 不再向上抛，改用【零向量占位 + 纯 BM25 文本检索】继续查 HA3 —— 权限过滤
+# （_build_permission_filter，ACL 安全边界）在降级路径【原样保留】，绝不因降级放宽。
+# 设 =false 恢复历史行为：嵌入异常原样上抛（/api/ask → 500）。
+
+
+class _DegradedEmbedding(tuple):
+    """标记「降级查询嵌入」的三元组子类（(dense, sparse_idx, sparse_val) 解构完全兼容）。
+
+    dense=零向量仅作 HA3 payload 占位（HA3 knn/query 必须带 vector 字段，[0]*dim 合法，
+    见 [[hr-batch-pii-screenshot-quarantine]] 的 id 枚举先例），不参与实际排序——降级时
+    knn 路权重清零、只按 BM25 text 路排序。``degraded`` 属性供 search_chunks 识别。
+    """
+
+    degraded = True
+
+
+def _degraded_bm25_enabled() -> bool:
+    """RAG_DEGRADED_BM25_ENABLE 开关（默认开；与 config._env_bool 同词表）。"""
+    val = os.environ.get("RAG_DEGRADED_BM25_ENABLE", "").strip().lower()
+    return val not in ("false", "0", "no")
+
+
+# 降级告警限流（免刷屏）：持续故障下每 60s 最多一条 ERROR，其余降 DEBUG。
+_degraded_log_state = {"ts": 0.0}
+_degraded_log_lock = threading.Lock()
+_DEGRADED_LOG_INTERVAL_S = 60.0
+
+
+def _log_degraded_embedding(exc: BaseException) -> None:
+    now = time.monotonic()
+    with _degraded_log_lock:
+        emit = now - _degraded_log_state["ts"] >= _DEGRADED_LOG_INTERVAL_S
+        if emit:
+            _degraded_log_state["ts"] = now
+    if emit:
+        logger.error(
+            "查询嵌入失败，降级为纯 BM25 文本检索（结果带 degraded_retrieval 标记、"
+            "相关度分级失效；RAG_DEGRADED_BM25_ENABLE=false 可关闭降级）: %s", exc,
+        )
+    else:
+        logger.debug("查询嵌入失败（降级路径，ERROR 已限流省略）: %s", exc)
+
+
+def _get_query_embedding_or_degraded(
+    query: str,
+) -> Tuple[List[float], List[int], List[float]]:
+    """查询嵌入的可降级封装：失败时返回 _DegradedEmbedding（零向量 + 空 sparse）。
+
+    优雅降级铁律：嵌入这类辅助上游故障不得放大为整条检索链路失败——BM25 文本路
+    不依赖向量，仍可给出可用（但分级失效）的结果。flag 关闭时保持原 raise 语义。
+    经模块全局名调用 get_query_embedding（tests 对 retriever.get_query_embedding 的
+    monkeypatch 席位不受影响）。
+    """
+    try:
+        return get_query_embedding(query)
+    except Exception as e:  # noqa: BLE001 — 降级路径需覆盖超时/HTTP/配置各类异常
+        if not _degraded_bm25_enabled():
+            raise
+        _log_degraded_embedding(e)
+        try:
+            dim = int(get_config().embedding.dimension or 1024)
+        except Exception:  # noqa: BLE001 — 配置不可用也不阻断降级
+            dim = 1024
+        return _DegradedEmbedding(([0.0] * dim, [], []))
+
+
+def _mark_degraded_results(results: List[Dict[str, Any]]) -> None:
+    """P2-4：给降级检索结果打标（原地修改）。
+
+    - ``degraded_retrieval=True``：让上游（api / llm_generator / 前端）可见本次命中
+      来自降级检索。
+    - 分级失效处理：score_level 的 高/中/低 阈值（7.7/5.8）按 weighted 融合分标定，
+      降级分＝纯 BM25 分，量纲不可比——不伪造校准分：引擎原始分【保真】挪到
+      ``degraded_raw_score``，``score`` 置 0.0 → llm_generator.score_level 恒判「低」、
+      is_low_confidence_band 恒 True（降级结果本就应触发低置信提示）。下游顺序不受
+      影响：expand 的组间排序 / _select_with_doc_cap 对全 0 分稳定（保持命中顺序）。
+    """
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        r["degraded_retrieval"] = True
+        r["degraded_raw_score"] = r.get("score", 0)
+        r["score"] = 0.0
+
+
 # ═══════════════════════════════════════════════════════════════
 # 2. HA3 Vector Search
 # ═══════════════════════════════════════════════════════════════
@@ -492,6 +579,7 @@ def _search_chunks_opensearch(
     dense: List[float],
     top_k: int,
     user_dept: Union[str, List[str], None] = None,
+    degraded: bool = False,
 ) -> List[Dict[str, Any]]:
     """本地开发回退检索：标准 OpenSearch dense kNN(0.7) + BM25(0.3)。
 
@@ -499,6 +587,8 @@ def _search_chunks_opensearch(
     （生产配置 HA3，本分支不可达）。返回与 _parse_ha3_response 同形的 chunk 字典，
     权限语义与 HA3 过滤一致（public 或 dept_internal+本部门）；
     封面降权逻辑与 HA3 路径保持同款。
+    degraded=True（P2-4 嵌入降级）：dense 是零向量占位 → 去掉 kNN 子句只留 BM25 match
+    （零向量在部分 kNN 引擎下直接报错），权限 filter 原样保留，结果打 degraded 标。
     """
     from opensearchpy import OpenSearch
 
@@ -529,6 +619,14 @@ def _search_chunks_opensearch(
             ]}})
 
     fetch_k = max(top_k * 2, top_k + 5)
+    # P2-4 降级：零向量不进 kNN（部分引擎对零范数向量报错），纯 BM25 match 排序
+    if degraded:
+        rank_should = [{"match": {"chunk_text": {"query": query, "boost": 1.0}}}]
+    else:
+        rank_should = [
+            {"knn": {"chunk_vector": {"vector": dense, "k": fetch_k, "boost": 0.7}}},
+            {"match": {"chunk_text": {"query": query, "boost": 0.3}}},
+        ]
     body = {
         "size": fetch_k,
         "_source": ["chunk_id", "id", "doc_id", "chunk_text", "chunk_type", "title",
@@ -536,10 +634,7 @@ def _search_chunks_opensearch(
                     "permission_level", "owner_dept", "category_l1",
                     "source_image", "visual_summary"],
         "query": {"bool": {
-            "should": [
-                {"knn": {"chunk_vector": {"vector": dense, "k": fetch_k, "boost": 0.7}}},
-                {"match": {"chunk_text": {"query": query, "boost": 0.3}}},
-            ],
+            "should": rank_should,
             "filter": [{"bool": {"should": perm_should, "minimum_should_match": 1}}],
         }},
     }
@@ -567,6 +662,8 @@ def _search_chunks_opensearch(
             "visual_summary": src.get("visual_summary") or "",
             "score": hit.get("_score", 0),
         })
+    if degraded:
+        _mark_degraded_results(parsed)   # P2-4：打标 + 分级失效处理（见 helper 注释）
 
     # 封面降权（与 HA3 路径同款）
     content_results, cover_results = [], []
@@ -617,8 +714,14 @@ def search_chunks(
     config = get_config()
     cfg = config.alibaba_vector
 
-    # 1. 生成 query embedding（retrieve_and_enrich 会预算一次并传入，避免重复嵌入）
-    dense, sparse_idx, sparse_val = query_embedding if query_embedding is not None else get_query_embedding(query)
+    # 1. 生成 query embedding（retrieve_and_enrich 会预算一次并传入，避免重复嵌入）。
+    # P2-4：自算嵌入失败时（RAG_DEGRADED_BM25_ENABLE 默认开）不 raise，拿到
+    # _DegradedEmbedding（零向量占位）→ 下方切换纯 BM25 形态；传入的预算嵌入若本身
+    # 是降级产物（retrieve_and_enrich 同一封装算出）同样经 degraded 属性识别。
+    _emb = (query_embedding if query_embedding is not None
+            else _get_query_embedding_or_degraded(query))
+    degraded = bool(getattr(_emb, "degraded", False))
+    dense, sparse_idx, sparse_val = _emb
 
     # 2. 构建 sparse data
     from alibabacloud_ha3engine_vector.models import QueryRequest, SparseData
@@ -644,12 +747,16 @@ def search_chunks(
     #  生产配置了 HA3 endpoint，此分支不可达 —— 2026-06-10 本地 E2E 引入）
     _full_cfg = get_config()
     if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
-        return _deny_revoked_cross_dept(_search_chunks_opensearch(query, dense, top_k, user_dept), user_dept)
+        return _deny_revoked_cross_dept(
+            _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded),
+            user_dept)
 
     client = _get_ha3_client()
 
-    if cfg.enable_hybrid:
+    if cfg.enable_hybrid or degraded:
         # ── 混合检索: Dense + Sparse + BM25 三路融合 ──
+        # P2-4：degraded 时即便 enable_hybrid=False 也走本分支——纯向量路径没有 BM25
+        # text 路可用，降级检索必须经 text 路（knn 路权重清零仅作 payload 占位）。
         from alibabacloud_ha3engine_vector.models import (
             SearchRequest, TextQuery, RankQuery,
         )
@@ -673,7 +780,14 @@ def search_chunks(
         )
 
         # 融合策略
-        if cfg.hybrid_fusion == "rrf":
+        if degraded:
+            # P2-4 降级＝纯 BM25 形态（对既有 SDK payload 结构侵入最小）：knn 路权重清零、
+            # text 路权重 1.0，等价于只按 chunk_text 倒排排序。不走 rrf——rrf 会把零向量
+            # knn 路的伪名次融进排序。两路 filter（权限边界）均未改动。
+            knn_query.weight = 0.0
+            text_query.weight = 1.0
+            rank = RankQuery()
+        elif cfg.hybrid_fusion == "rrf":
             rank = RankQuery(rrf={"rankConstant": cfg.rrf_rank_constant})
         else:
             # 加权模式：通过 knn.weight 和 text.weight 控制
@@ -692,8 +806,8 @@ def search_chunks(
         )
 
         logger.info(
-            "Hybrid search: fusion=%s, text_field=%s, knn_top_k=%d, size=%d",
-            cfg.hybrid_fusion, cfg.text_search_field, cfg.hybrid_knn_top_k, top_k,
+            "Hybrid search: fusion=%s, text_field=%s, knn_top_k=%d, size=%d, degraded=%s",
+            cfg.hybrid_fusion, cfg.text_search_field, cfg.hybrid_knn_top_k, top_k, degraded,
         )
         resp = client.search(request)
     else:
@@ -713,6 +827,8 @@ def search_chunks(
 
     # 4. 解析结果
     results = _parse_ha3_response(resp)
+    if degraded:
+        _mark_degraded_results(results)   # P2-4：打标 + 分级失效处理（见 helper 注释）
 
     # 4b. 查询侧拒绝（Phase D 读侧 fail-closed 复核）：撤销跨部门授权后即时生效，不等 HA3 投影收回。
     results = _deny_revoked_cross_dept(results, user_dept)
@@ -1879,8 +1995,15 @@ def retrieve_and_enrich(
         and _av.hybrid_fusion != "rrf"
     if _tiebreak:
         _fetch_k = max(_fetch_k, get_config().rag.image_tiebreak_pool)
-    # query embedding 只算一次，传给 search_chunks 与 cosurface（后者原本会重复嵌入一次）
-    _emb = get_query_embedding(query)
+    # query embedding 只算一次，传给 search_chunks 与 cosurface（后者原本会重复嵌入一次）。
+    # P2-4：嵌入失败经 _get_query_embedding_or_degraded 降级（零向量+纯 BM25），
+    # 不再让整条检索链路硬失败；flag 关闭时保持原 raise。
+    _emb = _get_query_embedding_or_degraded(query)
+    _emb_degraded = bool(getattr(_emb, "degraded", False))
+    if _emb_degraded:
+        # 降级分数统一置 0（分级失效）：近平局带图倾斜的「分差 < eps」判定失去意义
+        # （所有相邻对都会被判平局、无差别交换），故降级本次直接关闭 tiebreak。
+        _tiebreak = False
     # 多意图查询分解（RAG_MULTI_QUERY_MODE，默认 off；失败/不触发即走原单查询路径）。
     # F#52：mode 开启时，分解 LLM（decompose_timeout 最坏 8s）与原查询主路检索【并行】——
     # 主路结果两用：不触发分解 → 直接作为单查询路径的检索结果（零重复检索、零回归）；
@@ -1941,8 +2064,11 @@ def retrieve_and_enrich(
     # 【前 max_docs 个去重 doc_id 的顺序】→ cosurface_doc_images 在合并时校验 doc_ids 严格一致
     # 才采用预取，失配则回退串行查询（插入位置/去重语义不变）。「已有 image chunk 则短路」的
     # 判定对 stitch/expand 不变（两者不增删 image 类型 chunk），可安全前置。
+    # P2-4：降级时零向量无法按相关度挑图，cosurface 补图查询无意义 → 跳过（预取与串行
+    # 两处一并跳过；与本模块 fail-open 风格一致：只降增强，不降正文结果）。
     _cos_pref = None
     if chunks and cosurface_images and get_config().rag.image_cosurface \
+            and not _emb_degraded \
             and not any(c.get("chunk_type") == "image" for c in chunks):
         _pre_ids = _cosurface_top_doc_ids(chunks)
         if _pre_ids:
@@ -1982,8 +2108,48 @@ def retrieve_and_enrich(
                     _shared_conn.close()   # 池化连接 close = 归还池
                 except Exception:   # noqa: BLE001
                     pass
-    # 图片召回增强（仅多模态渲染路径 opt-in；可经 RAG_IMAGE_COSURFACE 全局关闭）
-    if chunks and cosurface_images and get_config().rag.image_cosurface:
+    # 图片召回增强（仅多模态渲染路径 opt-in；可经 RAG_IMAGE_COSURFACE 全局关闭；
+    # P2-4 嵌入降级时跳过，理由见上方 _cos_pref 注释）
+    if chunks and cosurface_images and get_config().rag.image_cosurface and not _emb_degraded:
         chunks = cosurface_doc_images(query, chunks, user_dept=user_dept, query_embedding=_emb,
                                       prefetched=_cos_pref)
+    # P2-31（盲区审计）：附文档日期（版本落库日，RDS 现查、fail-open）——此前索引→上下文→
+    # 来源整条链无任何时间信号，模型与用户都无法区分 2023 版与 2025 版 SOP。
+    _attach_doc_dates(chunks)
     return chunks
+
+
+def _attach_doc_dates(chunks: List[Dict[str, Any]]) -> None:
+    """给命中 chunk 就地附 `doc_date`（当前版本 document_version.created_at 的日期部分）。
+
+    P2-31 的 serving 侧半边：HA3 schema 加日期字段需整表重建（user-gated），先用 RDS 现查
+    把日期送进 _chunk_header（模型可推理时效）与 _extract_sources（卡片可渲染）。版本落库日
+    是现有最好的时效近似（真实生效日期语料里没有采集）；fail-open——查不到不附、绝不影响答案。"""
+    try:
+        if not chunks:
+            return
+        from opensearch_pipeline.config import get_config
+        if get_config().simulate_db:
+            return
+        ids = sorted({c.get("doc_id") for c in chunks if c.get("doc_id")})
+        if not ids:
+            return
+        from opensearch_pipeline.db import _get_db_conn   # 惰性：tests monkeypatch db._get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                ph = ",".join(["%s"] * len(ids))
+                cur.execute(
+                    "SELECT dv.doc_id, DATE(dv.created_at) FROM document_version dv"
+                    " JOIN document_meta dm ON dm.doc_id = dv.doc_id"
+                    "  AND dm.current_version_no = dv.version_no"
+                    f" WHERE dv.doc_id IN ({ph})", tuple(ids))
+                dates = {str(r[0]): str(r[1]) for r in (cur.fetchall() or []) if r and r[1]}
+        finally:
+            conn.close()
+        for c in chunks:
+            d = dates.get(str(c.get("doc_id") or ""))
+            if d:
+                c.setdefault("doc_date", d)
+    except Exception:   # noqa: BLE001 — 辅助增强绝不破坏回答主链路
+        logger.debug("doc_date 附加失败（fail-open）", exc_info=True)

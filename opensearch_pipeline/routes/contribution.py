@@ -159,7 +159,9 @@ class KbContributionAcceptRequest(BaseModel):
     content: Optional[str] = None
     category_dept: Optional[str] = None
     # 部门领导采纳时决定可见范围：dept_internal=部门公开（默认）/ public=全员公开。
-    # 用户裁决（2026-06-29）：部门领导直接定，public 不再转 kb_admin 审批。
+    # P2-16（2026-07-04 拍板「kb_admin 只管入库」，取代 2026-06-29「public 直通」裁决）：
+    # dept_admin 选 public → 登记为 PENDING_APPROVAL 进 kb_admin 待审批队列，放行后才入库；
+    # kb_admin 自己采纳 public 照旧直通（其即终审）。dept_internal 完全不变。
     permission_level: Optional[str] = None
     note: Optional[str] = None
 
@@ -177,6 +179,8 @@ class KbContributionActionResponse(BaseModel):
     idempotent: bool = False
     ok: bool = True
     error: str = ""
+    # P2-16：本次采纳/续跑的文档是否已进 kb_admin 待审批队列（前端据此提示"放行后才入库"）
+    requires_kb_admin_approval: bool = False
 
 
 class KbHeroItem(BaseModel):
@@ -249,6 +253,16 @@ def _reconcile_contributions_searchable(conn) -> None:
                 f" JOIN {_kb_db()}.document_version dv ON {_doc_join}"
                 " SET c.ingestion_status='failed', c.ingestion_error='索引失败（管线 index_status 异常）'"
                 f" WHERE c.ingestion_status='registered' AND dv.index_status IN ({fail_in})")
+            # P2-16 闭环：dept_admin 采纳 public 的贡献登记为 PENDING_APPROVAL 后，若被
+            # kb_admin 在既有审批入口驳回（content_process_status='REJECTED'，永不入库），
+            # 把贡献同步翻 failed——否则会永远停在「等待入库」（index_status 永不写入）。
+            cur.execute(
+                f"UPDATE {_op_db()}.kb_contribution c"
+                f" JOIN {_kb_db()}.document_version dv ON {_doc_join}"
+                " SET c.ingestion_status='failed',"
+                " c.ingestion_error='全员公开发布被知识库管理员驳回'"
+                " WHERE c.ingestion_status='registered'"
+                "   AND dv.content_process_status='REJECTED'")
         conn.commit()
     except Exception as e:
         logger.info("contribution reconcile 跳过 (non-fatal): %s", e)
@@ -256,11 +270,18 @@ def _reconcile_contributions_searchable(conn) -> None:
 
 def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: str, bucket: str,
                               title: str, reviewer_id: str, reviewer_name: str, md_text: str,
-                              permission_level: str = "dept_internal") -> None:
+                              permission_level: str = "dept_internal",
+                              requires_approval: bool = False) -> None:
     """把合成 .md 写入 OSS + 登记 document_meta/version（NOT_STARTED，等下一批 DAG 入库）。
 
     全部以【固定 doc_id/raw_key】幂等执行：已登记（raw_key 命中）直接返回；document_version 唯一键
     1062（并发续跑）按幂等放过。失败上抛由调用方记 ingestion_error。
+
+    P2-16：requires_approval=True（dept_admin 采纳 public）时不直通管线——与自助上传同一纪律
+    （kb_console kb_register 同款 cps/appr 写法）：content_process_status='PENDING_APPROVAL'
+    （stage-1 scanner 不认领、永不入索引）+ approval_status='PENDING'，自动进 kb_admin 既有
+    待审批队列（/api/kb/pending-approvals）；kb_admin 在既有入口放行（→NOT_STARTED）后才随
+    下一批 DAG 入库，驳回（→REJECTED）则永不入库（reconcile 把贡献翻 failed）。
     """
     import hashlib
 
@@ -274,6 +295,8 @@ def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: st
     # 与 OSS 对象名严格一致——别另拼 doc_id，否则台账显示名与实际对象对不上。
     oss_filename = raw_key.rsplit("/", 1)[-1]
     kb_type = "public" if permission_level == "public" else "private"
+    cps = "PENDING_APPROVAL" if requires_approval else "NOT_STARTED"
+    appr = "PENDING" if requires_approval else "APPROVED"
 
     if not put_object(raw_key, data, "text/markdown; charset=utf-8"):
         raise RuntimeError("OSS 写入合成文档失败")
@@ -298,12 +321,14 @@ def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: st
              reviewer_id, reviewer_name or "", permission_level, kb_type),
         )
         try:
+            # cps/appr 是本函数内的二值常量（非用户输入），直接内插进 SQL 文本无注入风险，
+            # 且保持状态字面量在 SQL 里可见（tests 按 SQL 关键字断言）。
             cur.execute(
                 f"""
                 INSERT INTO {_kb_db()}.document_version
                   (doc_id, version_no, bucket_name, raw_key, raw_key_hash, etag, file_ext, mime_type,
                    file_size_bytes, content_process_status, approval_status, status, received_at)
-                VALUES (%s,1,%s,%s,%s,%s,'md','text/markdown',%s,'NOT_STARTED','APPROVED','active',NOW())
+                VALUES (%s,1,%s,%s,%s,%s,'md','text/markdown',%s,'{cps}','{appr}','active',NOW())
                 """,
                 (doc_id, bucket, raw_key, raw_key_hash, etag, size),
             )
@@ -317,11 +342,14 @@ def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: st
 
 def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner_dept: str,
                                    question: str, content: str, reviewer_id: str,
-                                   reviewer_name: str, trace_id: str):
+                                   reviewer_name: str, trace_id: str,
+                                   requires_kb_admin_approval: bool = False):
     """采纳后的物化+登记（独立事务，幂等可重试）：成功→registered，失败→failed+ingestion_error。
 
     返回 (ingestion_status, error_or_None)。绝不假设跨系统原子——OSS 与 RDS 任一失败都记 failed，
     固定键留存，retry-ingestion 用同键续跑。
+    P2-16：requires_kb_admin_approval=True → 登记为 PENDING_APPROVAL（见 _materialize_contribution），
+    并 best-effort 通知 kb_admin（notify_upload_approval，no-raise）。
     """
     from opensearch_pipeline import contribution as C
     from opensearch_pipeline.config import get_config
@@ -341,7 +369,8 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
             _materialize_contribution(
                 conn, doc_id=doc_id, owner_dept=owner_dept, raw_key=raw_key,
                 bucket=cfg.oss.bucket_name, title=question, reviewer_id=reviewer_id,
-                reviewer_name=reviewer_name, md_text=md, permission_level=permission_level)
+                reviewer_name=reviewer_name, md_text=md, permission_level=permission_level,
+                requires_approval=requires_kb_admin_approval)
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {_op_db()}.kb_contribution SET ingestion_status='registered', "
@@ -351,7 +380,13 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
             conn.close()
         write_audit(doc_id=doc_id, version_no=1, action_type="CONTRIB_ADOPT",
                     operator_type="user", operator_id=reviewer_id, oss_key=raw_key,
-                    trace_id=trace_id, message=f"contribution={cid} owner={owner_dept}")
+                    trace_id=trace_id,
+                    message=f"contribution={cid} owner={owner_dept}"
+                            + (" pending_kb_approval" if requires_kb_admin_approval else ""))
+        if requires_kb_admin_approval:
+            # P2-16：进待审批队列后即时告知 kb_admin（既有挂点，内部 no-raise，失败只记 warning）
+            from opensearch_pipeline.admin_notify import notify_upload_approval
+            notify_upload_approval(owner_dept=owner_dept, title=question)
         _gaps_cache_clear()   # 采纳物化完成 → 缺口徽标状态变化即时可见
         return C.INGEST_REGISTERED, None
     except Exception as e:
@@ -380,7 +415,11 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
     from opensearch_pipeline import contribution as C, kb_authz
-    verr = C.validate_contribution_text(req.question, req.content)
+    # P2-17：先剥离字面 <<IMG:N>> 图片占位符（防视觉引用伪造，见 contribution.strip_img_markers），
+    # 再校验（剥完为空 → 正常走 400）。accept 侧对最终文本再过同一道（防先提交干净、采纳前改回）。
+    q_clean = C.strip_img_markers(req.question).strip()
+    c_clean = C.strip_img_markers(req.content).strip()
+    verr = C.validate_contribution_text(q_clean, c_clean)
     if verr:
         raise HTTPException(status_code=400, detail=verr)
     depts = kb_authz.sanitize_owner_depts(req.category_dept)
@@ -388,8 +427,8 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
         raise HTTPException(status_code=400, detail="归属分类无效")
     category_dept = depts[0]
     cid = C.new_contribution_id()
-    qhash = C.question_hash(req.question)
-    nq = C.normalize_question(req.question)
+    qhash = C.question_hash(q_clean)
+    nq = C.normalize_question(q_clean)
     gq = (req.gap_query or "").strip() or None
     gqhash = C.question_hash(gq) if gq else None
     ngq = C.normalize_question(gq) if gq else None
@@ -408,7 +447,7 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
                        normalized_gap_query, gap_query_hash)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending','none',%s,%s,%s,%s)
                     """,
-                    (cid, req.question.strip(), req.content.strip(), nq, qhash,
+                    (cid, q_clean, c_clean, nq, qhash,
                      category_dept, category_dept, identity.user_id, identity.name or "",
                      (req.source_message_id or None), gq, ngq, gqhash),
                 )
@@ -421,9 +460,9 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
     _gaps_cache_clear()   # 缺口的「等待入库」徽标即时可见，不等 TTL
     # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：归属部门管理员即时知晓待审核贡献
     from opensearch_pipeline.admin_notify import notify_contribution
-    notify_contribution(category_dept=category_dept, question=req.question)
+    notify_contribution(category_dept=category_dept, question=q_clean)
     return KbContributionItem(
-        contribution_id=cid, question=req.question.strip(), content=req.content.strip(),
+        contribution_id=cid, question=q_clean, content=c_clean,
         category_dept=category_dept, author_id=identity.user_id, author_name=identity.name or "",
         review_status="pending", ingestion_status="none", state="pending")
 
@@ -539,7 +578,10 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             # pending → 采纳（可修订）
             final_q = (req.question if req.question is not None else cur_q) or ""
             final_c = (req.content if req.content is not None else cur_c) or ""
-            final_q, final_c = final_q.strip(), final_c.strip()
+            # P2-17：采纳侧对【最终】文本再剥一次字面 <<IMG:N>>（submit 侧已剥，但采纳前
+            # 可修订 / 存量行可能带标记——防「先提交干净、采纳前改回」的绕过）。
+            final_q = C.strip_img_markers(final_q).strip()
+            final_c = C.strip_img_markers(final_c).strip()
             final_dept = (req.category_dept or cur_dept or "").strip()
             verr = C.validate_contribution_text(final_q, final_c)
             if verr:
@@ -552,11 +594,15 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
                 conn.rollback()
                 raise HTTPException(status_code=400, detail="可见范围只能是 部门公开 或 全员公开")
             # 按【最终】目标部门 + 选定可见范围做写授权（DB 现查的 kb；改部门即按新部门裁决）。
-            # 用户裁决（2026-06-29）：部门领导直接定——public 只校验 allowed，不因 requires_kb_admin_approval 转审批。
+            # P2-16（2026-07-04 拍板「kb_admin 只管入库」，取代 2026-06-29「public 直通」裁决）：
+            # 不再忽略 requires_kb_admin_approval——dept_admin 采纳 public 时物化为
+            # PENDING_APPROVAL 进 kb_admin 既有待审批队列（与自助上传同一纪律），放行后才入库；
+            # kb_admin 自己采纳 public 的 decision 本就不带该标记 → 照旧直通（其即终审）。
             decision = kb_authz.authorize_upload(kb, final_dept, chosen_perm)
             if not decision.allowed:
                 conn.rollback()
                 raise HTTPException(status_code=403, detail=f"无权采纳到部门「{final_dept}」：{decision.reason}")
+            requires_kb_approval = bool(decision.requires_kb_admin_approval)
             # 一次性固定键（raw_key 把可见范围编码进路径段，防管线 stage-2 重解析升/降权）
             doc_id = cur_doc_id or kb_upload.new_doc_id()
             upload_id = cur_upload_id or kb_upload.new_ulid()
@@ -583,7 +629,8 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
                 ingestion_status=r2[1] or "registering",
                 state=C.contribution_state(r2[0], r2[1]), doc_id=r2[2], idempotent=True, ok=True)
         claim = dict(doc_id=doc_id, raw_key=raw_key, owner_dept=final_dept,
-                     question=final_q, content=final_c)
+                     question=final_q, content=final_c,
+                     requires_kb_approval=requires_kb_approval)
     except HTTPException:
         raise
     except Exception as e:
@@ -595,11 +642,13 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
     ing, err = _finish_contribution_ingestion(
         cid, doc_id=claim["doc_id"], raw_key=claim["raw_key"], owner_dept=claim["owner_dept"],
         question=claim["question"], content=claim["content"],
-        reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id)
+        reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id,
+        requires_kb_admin_approval=claim["requires_kb_approval"])
     return KbContributionActionResponse(
         contribution_id=cid, review_status="accepted", ingestion_status=ing,
         state=C.contribution_state("accepted", ing), doc_id=claim["doc_id"],
-        ok=(ing != C.INGEST_FAILED), error=(err or ""))
+        ok=(ing != C.INGEST_FAILED), error=(err or ""),
+        requires_kb_admin_approval=claim["requires_kb_approval"])
 
 
 @router.post("/api/kb/contributions/{cid}/reject", response_model=KbContributionActionResponse)
@@ -657,7 +706,7 @@ def kb_contribution_retry(cid: str, request: Request,
     """重试入库（registering/failed → 用【固定键】续跑物化，绝不新建文档）。仅已采纳行。"""
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline import contribution as C
+    from opensearch_pipeline import contribution as C, kb_authz, kb_upload
     trace_id = get_request_id()
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -697,12 +746,24 @@ def kb_contribution_retry(cid: str, request: Request,
         raise HTTPException(status_code=500, detail=f"重试失败 (trace: {trace_id})")
     finally:
         conn.close()
+    # P2-16：续跑按「谁在完成物化」重裁 public 审批门（perm 以固定 raw_key 为权威；
+    # kb_admin 续跑=其即终审→直通，dept_admin 续跑 public→仍进待审批）。裁决异常/被拒时
+    # fail-closed 取「需审批」——宁可多过一道 kb_admin，绝不静默直通。已登记行（raw_key
+    # 命中）物化幂等早退，该标记不生效，不会改写既有审批状态。
+    try:
+        _perm = kb_upload.perm_from_raw_key(raw_key)
+        _d = kb_authz.authorize_upload(kb, dept, _perm)
+        _requires_approval = (not _d.allowed) or bool(_d.requires_kb_admin_approval)
+    except Exception:  # noqa: BLE001 — 裁决不可用 → 保守转审批（fail-closed）
+        _requires_approval = True
     ing, err = _finish_contribution_ingestion(
         cid, doc_id=doc_id, raw_key=raw_key, owner_dept=dept, question=q, content=content,
-        reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id)
+        reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id,
+        requires_kb_admin_approval=_requires_approval)
     return KbContributionActionResponse(contribution_id=cid, review_status="accepted",
         ingestion_status=ing, state=C.contribution_state("accepted", ing), doc_id=doc_id,
-        ok=(ing != C.INGEST_FAILED), error=(err or ""))
+        ok=(ing != C.INGEST_FAILED), error=(err or ""),
+        requires_kb_admin_approval=_requires_approval)
 
 
 @router.get("/api/kb/contributions/heroes", response_model=KbHeroesResponse)

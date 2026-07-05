@@ -26,7 +26,8 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-_JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup")
+_JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup",
+         "queue_aging", "ingest_funnel")
 
 
 def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
@@ -46,6 +47,21 @@ def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
     if "qa_rollup" in sel:
         from opensearch_pipeline.qa_rollup import run_rollup
         out["qa_rollup"] = run_rollup(alert=alert)
+    # P2-34 / P2-15（盲区审计）：人工队列老化 + 摄取漏斗——此前作业集结构性省略
+    # 每个人工队列与「从未入索引」的文档族
+    if "queue_aging" in sel:
+        from opensearch_pipeline.queue_monitor import run_queue_aging_check
+        out["queue_aging"] = run_queue_aging_check(alert=alert)
+    if "ingest_funnel" in sel:
+        from opensearch_pipeline.queue_monitor import run_ingest_funnel_check
+        out["ingest_funnel"] = run_ingest_funnel_check(alert=alert)
+    # P2-14：监控链路存活证明（fail-open；schema/018 未 apply 时 no-op）。
+    # 心跳随任意子集运行刷新——只要调度还活着，rag_runtime_contract 里就有新鲜时间戳。
+    try:
+        from opensearch_pipeline.queue_monitor import write_heartbeat
+        write_heartbeat()
+    except Exception:  # noqa: BLE001
+        logger.warning("ops 心跳写入异常（忽略）", exc_info=True)
     return out
 
 

@@ -15,6 +15,7 @@ content_blocks_json 三缺一、NO_RESULT 文案三份两样、写历史条件�
 本模块是这些字段的单一事实来源。
 """
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Union
 
@@ -57,6 +58,21 @@ def top_score_of(chunks: Optional[List[Dict[str, Any]]]) -> Optional[float]:
     if not chunks:
         return None
     return max((c.get("score", 0) for c in chunks), default=None)
+
+
+def gen_meta_to_json(gen_meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """gen_meta dict → 紧凑 JSON 串（纯函数，P2-20/21/22）。
+
+    None/空 → None（NO_RESULT/错误路径没跑 LLM，没有 prompt 身份 —— 如实缺席）；
+    不可序列化（测试 MagicMock config 等）→ default=str 兜底，仍失败则 None ——
+    簿记序列化绝不允许炸回答链路。
+    """
+    if not gen_meta:
+        return None
+    try:
+        return json.dumps(gen_meta, ensure_ascii=False, default=str)
+    except Exception:
+        return None
 
 
 def should_append_history(answer_text: Optional[str], answer_status: str) -> bool:
@@ -118,11 +134,16 @@ def build_qa_log_kwargs(
     conversation_type: Optional[str] = None,
     content_blocks_json: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    gen_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """qa_session_log 载荷的单一组装点。永远返回【全字段】（未知处显式 None，
     与 qa_logger.log_qa_session 的参数缺省一致）。
 
     chunks 语义：None = 检索未完成（命中数/分数全 None）；[] = NO_RESULT（命中数 0）。
+
+    gen_meta 语义（P2-20/21/22，schema/018）：LLM 成功路径传 llm_generator 返回的
+    result["gen_meta"]（prompt_sha/prompt_flags/temperature/top_p/model/retrieval 制度
+    快照）；NO_RESULT / 错误路径传 None（没跑 LLM 就没有 prompt 身份，如实缺席优于伪造）。
 
     answer_status 词表（语料排查按此分桶）：
       SUCCESS   — 正常回答
@@ -157,4 +178,5 @@ def build_qa_log_kwargs(
         conversation_type=conversation_type,
         content_blocks_json=content_blocks_json or None,
         conversation_id=conversation_id,
+        gen_meta_json=gen_meta_to_json(gen_meta),
     )

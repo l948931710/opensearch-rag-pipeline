@@ -262,10 +262,11 @@ def test_accept_default_is_dept_internal_internal_path(monkeypatch):
     assert "dept_internal" in meta and "private" in meta
 
 
-def test_accept_public_choice_flat_path_direct(monkeypatch):
-    """部门领导选「全员公开」→ 直接放行（不转 kb_admin）；raw_key 扁平（无 /internal/），meta 写 public。"""
+def test_accept_public_by_dept_admin_gated_pending_approval(monkeypatch):
+    """P2-16（2026-07-04 拍板「kb_admin 只管入库」）：dept_admin 选「全员公开」不再直通——
+    物化登记为 PENDING_APPROVAL/PENDING 进 kb_admin 既有待审批队列；raw_key 仍扁平、meta 仍 public。"""
     _skip_if_not_sim()
-    _dept_admin(monkeypatch, managed="marketing")   # dept_admin 直接定 public（用户裁决 A）
+    _dept_admin(monkeypatch, managed="marketing")
     sink = []
     _capture_put(monkeypatch, ok=True, sink=sink)
     conn = _install_conn(monkeypatch, _FakeConn(
@@ -273,10 +274,47 @@ def test_accept_public_choice_flat_path_direct(monkeypatch):
     from opensearch_pipeline import api
     resp = api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(permission_level="public"),
                                       request=None, identity=_ident())
-    assert resp.ok is True and resp.ingestion_status == "registered"   # 直接入库，无 PENDING_APPROVAL
+    assert resp.ok is True and resp.ingestion_status == "registered"
+    assert resp.requires_kb_admin_approval is True     # 前端提示"放行后才入库"
     assert sink and "/internal/" not in sink[0][0]
     meta = [p for s, p in conn.calls if "INSERT INTO" in s and "document_meta" in s][0]
     assert "public" in meta
+    # document_version 登记为待审批（scanner 不认领），而非 NOT_STARTED 直通
+    dv_sqls = [s for s, _ in conn.calls if "INSERT INTO" in s and "document_version" in s]
+    assert dv_sqls and "PENDING_APPROVAL" in dv_sqls[0] and "'PENDING'" in dv_sqls[0]
+    assert "NOT_STARTED" not in dv_sqls[0]
+
+
+def test_accept_public_by_kb_admin_stays_direct(monkeypatch):
+    """kb_admin 自己采纳 public → 照旧直通（其即终审）：NOT_STARTED/APPROVED，无待审批。"""
+    _skip_if_not_sim()
+    _kb_admin(monkeypatch)
+    sink = []
+    _capture_put(monkeypatch, ok=True, sink=sink)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"), claim_rowcount=1, dv_exists=None))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(permission_level="public"),
+                                      request=None, identity=_ident())
+    assert resp.ok is True and resp.ingestion_status == "registered"
+    assert resp.requires_kb_admin_approval is False
+    dv_sqls = [s for s, _ in conn.calls if "INSERT INTO" in s and "document_version" in s]
+    assert dv_sqls and "NOT_STARTED" in dv_sqls[0] and "PENDING_APPROVAL" not in dv_sqls[0]
+
+
+def test_accept_dept_internal_by_dept_admin_unchanged(monkeypatch):
+    """P2-16 回归护栏：dept_admin 采纳 dept_internal（默认）完全不变——NOT_STARTED 直通。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"), claim_rowcount=1, dv_exists=None))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(),
+                                      request=None, identity=_ident())
+    assert resp.ok is True and resp.requires_kb_admin_approval is False
+    dv_sqls = [s for s, _ in conn.calls if "INSERT INTO" in s and "document_version" in s]
+    assert dv_sqls and "NOT_STARTED" in dv_sqls[0] and "PENDING_APPROVAL" not in dv_sqls[0]
 
 
 def test_accept_invalid_permission_400(monkeypatch):
@@ -552,3 +590,80 @@ def test_reconcile_join_collation_safe(monkeypatch):
     recon = [s for s, _ in conn.calls if "kb_contribution c" in s and "document_version dv" in s]
     assert recon, "reconcile UPDATE 未发出"
     assert all("COLLATE utf8mb4_unicode_ci" in s for s in recon), "reconcile 跨库 doc_id JOIN 必须 collation-cast"
+
+
+def test_reconcile_flips_kb_admin_rejected_public_to_failed(monkeypatch):
+    """P2-16 闭环：PENDING_APPROVAL 的贡献文档被 kb_admin 在既有审批入口驳回
+    （content_process_status='REJECTED'）→ reconcile 把 registered 翻 failed，
+    而非永远停在「等待入库」（REJECTED 的版本 index_status 永不写入）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(list_rows=[]))
+    from opensearch_pipeline import api
+    api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    recon = [s for s, _ in conn.calls if "kb_contribution c" in s and "document_version dv" in s]
+    rejected = [s for s in recon if "content_process_status='REJECTED'" in s]
+    assert rejected, "缺少 kb_admin 驳回 → 贡献翻 failed 的 reconcile 分支"
+    assert all("ingestion_status='failed'" in s and "ingestion_status='registered'" in s
+               for s in rejected)
+
+
+# ── P2-17) 图片占位符注入防护（<<IMG:N>> 视觉引用伪造）──────────────────────
+def test_strip_img_markers_covers_renderer_pattern_superset():
+    """剥离面 ⊇ content_blocks_builder 的标准 + lenient 两个解析 regex：
+    单/双尖括号、全角【】《》、全/半角冒号、空白、N.M 子下标；正常文本不受伤。"""
+    from opensearch_pipeline import contribution as C
+    for evil in ("<<IMG:1>>", "<IMG:2>", "<<IMG:3.2>>", "【IMG:4】", "《IMG:5》",
+                 "<<IMG：6>>", "<< IMG : 7 >>", "<<img:8>>"):
+        assert "IMG" not in C.strip_img_markers(f"点开{evil}按钮").upper(), evil
+        assert C.strip_img_markers(f"点开{evil}按钮") == "点开按钮", evil
+    # 正常内容原样保留（含 <b> 这类非标记尖括号与 IMG 单词本身）
+    keep = "在 U8 里点 <确定>，IMG 格式说明见附件（image:3 不是标记）"
+    assert C.strip_img_markers(keep) == keep
+    assert C.strip_img_markers(None) == "" and C.strip_img_markers("") == ""
+
+
+def test_synthesize_markdown_strips_literal_img_markers():
+    """合成 .md 是入库前最终关口：存量行（修复前已采纳）经 retry 续跑也不得带字面标记。"""
+    from opensearch_pipeline import contribution as C
+    md = C.synthesize_markdown("怎么开发票<<IMG:1>>？", "按【IMG:2】所示，点开票<IMG:3>入口。")
+    assert "IMG" not in md.upper()
+    assert md.startswith("问：怎么开发票？")
+    assert "答：按所示，点开票入口。" in md
+
+
+def test_submit_strips_img_markers_before_persist(monkeypatch):
+    """submit 侧剥离：入表的 question/content 与 question_hash 均基于剥离后的文本。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn())
+    from opensearch_pipeline import api
+    from opensearch_pipeline import contribution as C
+    resp = api.kb_contribution_submit(
+        req=api.KbContributionSubmitRequest(
+            question="如何开发票<<IMG:1>>?", content="点开票入口<IMG:2>。", category_dept="marketing"),
+        request=None, identity=_ident())
+    assert "<<IMG" not in resp.question and "<IMG" not in resp.content
+    ins = [p for s, p in conn.calls if "INSERT INTO" in s and "kb_contribution" in s][0]
+    assert all("IMG:" not in str(v) for v in ins)
+    # hash 基于剥离后的问题（与缺口去重口径一致）
+    assert C.question_hash("如何开发票?") in ins
+
+
+def test_accept_strips_img_markers_even_if_added_after_submit(monkeypatch):
+    """accept 侧剥离（防「先提交干净、采纳前改回」）：修订文本带标记 → 合成 .md 干净。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    sink = []
+    _capture_put(monkeypatch, ok=True, sink=sink)
+    _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"),
+        claim_rowcount=1, dv_exists=None))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(
+        cid="C1",
+        req=api.KbContributionAcceptRequest(question="怎么改密码<<IMG:9>>？",
+                                            content="见《IMG:2》与<<IMG:1.2>>步骤。"),
+        request=None, identity=_ident())
+    assert resp.ok is True
+    assert sink and "IMG" not in sink[0][1].upper()

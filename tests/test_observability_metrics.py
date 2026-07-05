@@ -216,3 +216,157 @@ def test_qa_rollup_cli_breach_exit_code(monkeypatch):
     assert qa_rollup.main([]) == 2  # SLO breach
     monkeypatch.setattr(qa_rollup, "run_rollup", lambda **k: {"ok": False, "error": "x"})
     assert qa_rollup.main([]) == 3  # error
+
+
+# ── P2-18: 存储时区地面真相探测（fail-open 诊断，不改任何存储行为） ──
+
+def test_probe_server_tz_tuple_cursor():
+    """共享池是 tuple cursor：按已知列序映射为 dict，四个键齐全且字符串化。"""
+    class _Cur:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, sql, params=None):
+            assert "@@session.time_zone" in sql and "UTC_TIMESTAMP()" in sql
+        def fetchone(self):
+            return ("SYSTEM", "SYSTEM", "2026-07-05 10:00:00", "2026-07-05 17:00:00")
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    assert qa_rollup._probe_server_tz(_Conn()) == {
+        "session_tz": "SYSTEM", "global_tz": "SYSTEM",
+        "db_now": "2026-07-05 10:00:00", "db_utc": "2026-07-05 17:00:00"}
+
+
+def test_probe_server_tz_dict_cursor():
+    class _Cur:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, sql, params=None):
+            pass
+        def fetchone(self):
+            return {"session_tz": "+08:00", "global_tz": "SYSTEM",
+                    "db_now": "2026-07-05 10:00:00", "db_utc": "2026-07-05 02:00:00"}
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    probe = qa_rollup._probe_server_tz(_Conn())
+    assert probe["session_tz"] == "+08:00" and probe["db_utc"] == "2026-07-05 02:00:00"
+
+
+def test_probe_server_tz_fail_open():
+    """探测失败（如权限不足）→ None，绝不抛出、绝不挡汇总。"""
+    class _Cur:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, sql, params=None):
+            raise RuntimeError("(1227, 'Access denied')")
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    assert qa_rollup._probe_server_tz(_Conn()) is None
+
+
+def test_run_rollup_fail_open_report_carries_tz_probe(monkeypatch):
+    """连接都建不起来时 report 仍带 tz_probe 键（None），--json 输出结构稳定。"""
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(cfg, "simulate_db", False)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn",
+                        lambda **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    rep = qa_rollup.run_rollup()
+    assert rep["ok"] is False and "tz_probe" in rep and rep["tz_probe"] is None
+
+
+# ── P2-19: 周报样本分桶与 qa_rollup 同源（DST-correct） ──
+
+def _load_weekly_report_module():
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "deploy", "weekly_qa_report.py")
+    spec = importlib.util.spec_from_file_location("weekly_qa_report_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_week_pacific_bounds_dst_both_sides():
+    """周区间 = [首日太平洋起点, 末日太平洋终点)，夏令时 09:00 / 冬令时 08:00 边界。"""
+    mod = _load_weekly_report_module()
+    # 夏令时（PDT，北京 00:00 = 太平洋前一日 09:00）
+    assert mod._week_pacific_bounds("2026-07-01", "2026-07-07") == (
+        "2026-06-30 09:00:00", "2026-07-07 09:00:00")
+    # 冬令时（PST，北京 00:00 = 太平洋前一日 08:00）——旧 +15h 公式在此差 1 小时
+    assert mod._week_pacific_bounds("2026-01-12", "2026-01-18") == (
+        "2026-01-11 08:00:00", "2026-01-18 08:00:00")
+
+
+def test_week_pacific_bounds_fail_open(monkeypatch):
+    """任一端换算失败 → None（调用方回退旧 +15h 谓词）。"""
+    mod = _load_weekly_report_module()
+    monkeypatch.setattr(qa_rollup, "_beijing_day_pacific_bounds", lambda t: None)
+    assert mod._week_pacific_bounds("2026-07-01", "2026-07-07") is None
+    assert mod._week_pacific_bounds("not-a-date", "2026-07-07") is None
+
+
+# ── P2-13（盲区审计）：零/塌缩流量不再假绿 ──
+
+def test_zero_traffic_with_history_breaches():
+    """有历史基准（近 4 周同星期日中位数 >0）时，当日 0 行 = zero_traffic breach——
+    死掉的前端不再显示绿。"""
+    m = qa_rollup.compute_daily_metrics([], traffic_median=120)
+    assert m["total_queries"] == 0 and m["traffic_median_ref"] == 120
+    assert m["slo_ok"] == 0
+    assert {b["slo"] for b in m["slo_breaches"]} == {"zero_traffic"}
+
+
+def test_zero_traffic_without_history_no_breach():
+    """无历史（bootstrap/全新部署）→ 不判流量 SLO（既有「零流量不违约」语义保留）。"""
+    m = qa_rollup.compute_daily_metrics([], traffic_median=None)
+    assert m["slo_ok"] == 1
+
+
+def test_traffic_collapse_breaches_and_small_base_tolerant():
+    """当日 < 30% 基准且基准 ≥ min_base → traffic_collapse；小基准（低流量环境）不误报。"""
+    rows = [_row("SUCCESS") for _ in range(20)]
+    m = qa_rollup.compute_daily_metrics(rows, traffic_median=100)   # 20 < 30
+    assert m["slo_ok"] == 0
+    assert {b["slo"] for b in m["slo_breaches"]} == {"traffic_collapse"}
+    # 基准太小（<10）：波动大，不判塌缩
+    m2 = qa_rollup.compute_daily_metrics([_row("SUCCESS")], traffic_median=5)
+    assert m2["slo_ok"] == 1
+    # 正常流量（≥30%）：不判
+    m3 = qa_rollup.compute_daily_metrics(rows, traffic_median=40)   # 20 ≥ 12
+    assert m3["slo_ok"] == 1
+
+
+def test_fetch_rejected_excludes_admitted_rows():
+    """__ 前缀行（__admitted__ 准入量持久化，P2-11）不计入拒绝聚合。"""
+    class _Cur:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, sql, params=None):
+            pass
+        def fetchall(self):
+            return [("per_min", 3), ("__admitted__", 500), ("global_cap", 2)]
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    out = qa_rollup._fetch_rejected(_Conn(), "2026-07-05")
+    assert out == {"per_min": 3, "global_cap": 2}

@@ -1061,6 +1061,149 @@ def kb_escalation_resolve(req: KbEscalationResolveRequest, request: Request,
             "updated": n, "user_notified": user_notified}
 
 
+# ═══ 入库复审任务队列（盲区审计 P2-33）══════════════════════════════════════
+# review_task 此前"只写不读"：三个生产者（spot_checker 权限泄露安全网 / classify 失败 /
+# cost_breaker 隔离登记）INSERT PENDING，全仓无任何端点/worker 出队——被标记为"实时权限比
+# LLM 建议更宽松"的文档持续投放，设计好的人工安全网无人值守。kb_admin 专属（入库/安全职权）。
+
+class KbReviewTaskItem(BaseModel):
+    task_id: str = ""
+    doc_id: str = ""
+    title: str = ""                       # document_meta 现查（缺失回 doc_id）
+    version_no: int = 0
+    review_type: str = ""                 # spot_check_mismatch / classify 失败 / …
+    review_reason: str = ""               # 截断展示
+    owner_dept: str = ""
+    suggested_permission_level: str = ""
+    created_at: str = ""
+    age_days: int = 0
+    status: str = "PENDING"               # PENDING / RESOLVED / DISMISSED
+    closed: bool = False
+    reviewer_name: str = ""
+
+
+class KbReviewTasksResponse(BaseModel):
+    items: List[KbReviewTaskItem] = Field(default_factory=list)
+
+
+_KB_REVIEW_DONE = ("RESOLVED", "DISMISSED")
+_KB_REVIEW_ACTIONS = {"resolve": "RESOLVED", "dismiss": "DISMISSED", "reopen": "PENDING"}
+
+# P2-14：监控心跳 stale 兜底告警的进程内日界节流（governance 端点每次渲染都读心跳）
+_MONITOR_STALE_ALERT_DAY = ""
+
+
+@router.get("/api/kb/review-tasks", response_model=KbReviewTasksResponse)
+def kb_review_tasks(request: Request, limit: int = 20, include_closed: bool = False,
+                    identity: Optional[Identity] = Depends(current_identity)):
+    """入库复审任务队列（只读，kb_admin）。默认只列 PENDING、不设时间窗、按龄升序
+    （安全网任务是承诺不是日志）；include_closed=True 连已处置一并返回（近 90 天）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    _require_kb_admin(identity)
+    limit = max(1, min(limit, 50))
+    cache_key = ("review_tasks", limit, include_closed)
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    open_pred = f"(t.review_status IS NULL OR t.review_status NOT IN ({sql_in_list(_KB_REVIEW_DONE)}))"
+    if include_closed:
+        where = f"(({open_pred}) OR t.created_at >= DATE_SUB(NOW(), INTERVAL 90 DAY))"
+        order = "ORDER BY (" + open_pred + ") DESC, t.created_at DESC"
+    else:
+        where = open_pred
+        order = "ORDER BY t.created_at ASC"
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT t.task_id, t.doc_id, COALESCE(m.title, m.original_filename, t.doc_id),"
+                    " t.version_no, t.review_type, t.review_reason, t.owner_dept,"
+                    " t.suggested_permission_level, t.review_status, t.reviewer_name,"
+                    " t.created_at, DATEDIFF(NOW(), t.created_at)"
+                    f" FROM {_kb_db()}.review_task t"
+                    f" LEFT JOIN {_kb_db()}.document_meta m ON m.doc_id = t.doc_id"
+                    f" WHERE {where} {order} LIMIT %s", (limit,))
+                rows = cur.fetchall() or []
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_review_tasks 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"复审任务查询失败 (trace: {trace_id})")
+    out = KbReviewTasksResponse()
+    for (tid, doc_id, title, ver, rtype, reason, owner, sperm, st, rname, created, age) in rows:
+        st = str(st or "PENDING").upper() or "PENDING"
+        out.items.append(KbReviewTaskItem(
+            task_id=str(tid), doc_id=str(doc_id or ""), title=str(title or ""),
+            version_no=int(ver or 0), review_type=str(rtype or ""),
+            review_reason=str(reason or "")[:300], owner_dept=str(owner or ""),
+            suggested_permission_level=str(sperm or ""),
+            created_at=str(created or ""), age_days=max(0, int(age or 0)),
+            status=st, closed=st in _KB_REVIEW_DONE, reviewer_name=str(rname or "")))
+    _dashboard_cache_put(cache_key, out)
+    return out
+
+
+class KbReviewTaskResolveRequest(BaseModel):
+    task_id: str
+    action: Literal["resolve", "dismiss", "reopen"] = "resolve"
+    comment: str = ""
+
+
+@router.post("/api/kb/review-tasks/resolve")
+def kb_review_task_resolve(req: KbReviewTaskResolveRequest, request: Request,
+                           identity: Optional[Identity] = Depends(current_identity)):
+    """复审任务处置（kb_admin）：resolve（已核实/已修正——实际整改用既有工具：可见范围/退役/
+    重灌）/ dismiss（误报）/ reopen。写 review_status/reviewer_*/reviewed_at。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_admin(identity)
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    if not req.task_id:
+        raise HTTPException(status_code=400, detail="缺少 task_id")
+    new_status = _KB_REVIEW_ACTIONS.get(req.action)
+    if not new_status:
+        raise HTTPException(status_code=400, detail="非法处置动作")
+    assert_metadata_write_allowed("kb_review_task_resolve", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                sets = ["review_status=%s", "reviewer_user_id=%s", "reviewer_name=%s",
+                        "updated_at=NOW()"]
+                params: List = [new_status, kb.user_id, kb.name or kb.user_id]
+                if req.action == "reopen":
+                    sets.append("reviewed_at=NULL")
+                else:
+                    sets.append("reviewed_at=NOW()")
+                comment = (req.comment or "").strip()[:1000]
+                if comment:
+                    sets.append("reviewer_comment=%s")
+                    params.append(comment)
+                params.append(req.task_id)
+                n = cur.execute(
+                    f"UPDATE {_kb_db()}.review_task SET {', '.join(sets)}"
+                    " WHERE task_id=%s", tuple(params))
+                if isinstance(n, int) and n == 0:
+                    conn.rollback()
+                    raise HTTPException(status_code=404, detail="复审任务不存在")
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_review_task_resolve 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"处置失败 (trace: {trace_id})")
+    _dashboard_cache_clear()
+    return {"status": "ok", "task_id": req.task_id, "review_status": new_status}
+
+
 class KbEmbedRunItem(BaseModel):
     bizdate: str = ""
     embedded: int = 0
@@ -1106,6 +1249,11 @@ class KbFileType(BaseModel):
 
 class KbGovernanceResponse(BaseModel):
     window_days: int = _KB_INSIGHTS_WINDOW_DAYS
+    # P2-14（盲区审计）：监控链路存活证明——ops_monitor 每次运行写心跳（rag_runtime_contract），
+    # 这里读回龄（小时）。None=未知（表未建/从未跑）；>26h=监控本身死了（笔记本 cron 停/
+    # 凭据过期），前端亮红。serving 是全系统最活的组件，让它当被动监工。
+    monitor_heartbeat_age_h: Optional[float] = None
+    monitor_stale: bool = False
     # 资产构成
     file_types: List[KbFileType] = Field(default_factory=list)   # 文件类型分布（按扩展名归类）
     # 运行健康
@@ -1162,6 +1310,25 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
     if cached is not None:
         return cached
     out = KbGovernanceResponse(window_days=win)
+    # P2-14：监控心跳（fail-open；表未建 → None 前端显「未知」）。>26h → stale 亮红 +
+    # 兜底告警（serving 作被动死人开关；每进程每日至多一次防刷）。
+    try:
+        from opensearch_pipeline.queue_monitor import read_heartbeat_age_hours
+        out.monitor_heartbeat_age_h = read_heartbeat_age_hours()
+        if out.monitor_heartbeat_age_h is not None and out.monitor_heartbeat_age_h > 26:
+            out.monitor_stale = True
+            global _MONITOR_STALE_ALERT_DAY
+            import datetime as _dt
+            _today = _dt.date.today().isoformat()
+            if _MONITOR_STALE_ALERT_DAY != _today:
+                _MONITOR_STALE_ALERT_DAY = _today
+                from opensearch_pipeline.alerting import send_ops_alert
+                send_ops_alert("监控链路心跳超时",
+                               f"ops_monitor 心跳已 {out.monitor_heartbeat_age_h}h 未刷新——"
+                               "笔记本 crontab/凭据/网络可能失效，所有 parity/SLO 检查处于停摆。",
+                               severity="critical", dedup_key="monitor-heartbeat")
+    except Exception:   # noqa: BLE001
+        logger.debug("monitor heartbeat 读取失败（忽略）", exc_info=True)
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -2137,12 +2304,13 @@ def kb_reject(req: KbApprovalRequest, request: Request,
 @router.post("/api/kb/retire", response_model=KbRetireResponse)
 def kb_retire(req: KbRetireRequest, request: Request,
               identity: Optional[Identity] = Depends(current_identity)):
-    """软退役（可逆，不删 HA3）：把文档标记下线 + 停用本版本 RDS chunk，交现有 gated 运维完成 HA3 移除。
+    """软退役（可逆）：标记下线 + 停用 RDS chunk + 喂 PENDING_DELETE outbox（HA3 自动清除）。
 
     授权：kb_admin 任意；dept_admin 限其 managed owner_dept，且【公开文档需 kb_admin】（影响全公司）。
-    仅改 RDS（document_meta/version.status='retired' + chunk_meta.is_active=0），**不触碰 HA3**——
-    真实检索下线由 gated 运维（带 prod token 的 HA3 删除/reconcile）完成；本接口仅"申请退役 + 即时标记"，
-    文案如实告知。可逆：运维侧把 status 改回 active 即恢复（HA3 未删）。
+    本接口不直接删 HA3，但把全部版本 index_status 置 PENDING_DELETE——stage-3 每轮
+    reconcile_pending_deletes 自动 drain 删 HA3（与 kb_set_visibility→restricted 同一握手；
+    盲区审计 P2-1：此前只写 RDS 且无任何以 status='retired' 为键的清除器，被退役文档的向量
+    永久留在 HA3 可检索）。可逆：kb_restore 撤销 PENDING_DELETE 并标脏重推。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
@@ -2187,6 +2355,15 @@ def kb_retire(req: KbRetireRequest, request: Request,
                 # 漏删而无限期滞留。退役语义是「整篇下线」，故停全部活跃 chunk（stage-3 reconcile 再兜底 HA3）。
                 cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=0 "
                             "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
+                # 真实检索下线不能只靠 RDS（盲区审计 P2-1）：HA3 行仍在且带原 permission_level，
+                # 检索照常命中。喂 PENDING_DELETE outbox——stage-3 每轮 reconcile_pending_deletes
+                # 自动 drain 删 HA3 后落 DELETED（全版本入队，顺带清双版本残留；与
+                # kb_set_visibility→restricted 同一握手，kb_restore 会对称撤销）。
+                cur.execute(f"UPDATE {_kb_db()}.document_version "
+                            f"SET index_status='{DocVersionIndexStatus.PENDING_DELETE}' "
+                            f"WHERE doc_id=%s AND index_status NOT IN "
+                            f"({sql_in_list((DocVersionIndexStatus.DELETED, DocVersionIndexStatus.PENDING_DELETE))})",
+                            (req.doc_id,))
                 # 审计行入【同事务】（commit 前、同 cursor）：与退役变更原子提交，杜绝 commit 与审计之间
                 # 崩溃丢记录的窗口（B1）。失败 → 整笔回滚 → 500 可重试。
                 write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RETIRE_REQUEST",
@@ -2203,7 +2380,7 @@ def kb_retire(req: KbRetireRequest, request: Request,
         raise HTTPException(status_code=500, detail=f"退役失败 (trace: {trace_id})")
     return KbRetireResponse(
         doc_id=req.doc_id, retired=True,
-        note="已申请退役：已标记下线、停止作为升版目标；从检索彻底移除将在下次维护完成（本操作可逆）")
+        note="已退役：已标记下线并加入索引清除队列，下次入库批处理自动从检索移除（本操作可逆）")
 
 
 def _assert_version_not_quarantined(cur, doc_id: str, version_no: int) -> None:
@@ -2274,6 +2451,14 @@ def kb_restore(req: KbRetireRequest, request: Request,
                 # 重新激活本版本 chunk + 标脏 NOT_INDEXED（下次 stage-3 重推 HA3；若 HA3 未删则为幂等重推）。
                 cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=1, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
                             "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))
+                # 撤销退役挂上的 PENDING_DELETE（P2-1 起 retire 喂 outbox）：否则下轮 reconcile 删 HA3
+                # 后把 chunk 打回 is_active=0/DELETED，恰好撤销这次恢复。DELETED（已删过）也拨回
+                # NOT_INDEXED 交 stage-3 重推。仅当前版本；旧版本照删（与 set_visibility 恢复分支同款）。
+                cur.execute(f"UPDATE {_kb_db()}.document_version "
+                            f"SET index_status='{DocVersionIndexStatus.NOT_INDEXED}' "
+                            f"WHERE doc_id=%s AND version_no=%s AND index_status IN "
+                            f"({sql_in_list((DocVersionIndexStatus.PENDING_DELETE, DocVersionIndexStatus.DELETED))})",
+                            (req.doc_id, cur_ver))
                 write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
                             message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}",

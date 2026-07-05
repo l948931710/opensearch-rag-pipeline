@@ -19,6 +19,16 @@ via DST-correct CONVERT_TZ(created_at,'America/Los_Angeles','Asia/Shanghai') (na
 tables verified loaded). tz_shift_hours is now legacy/nominal — recorded in the audit column only, it
 no longer drives bucketing (the old hardcoded +15h was off by one hour in US winter, PST=+16h).
 
+P2-18（盲区审计 2026-07-05，存储时区争议）：机制上 qa_logger 的 INSERT 列表**不含** created_at
+（值走 DDL 的 DEFAULT CURRENT_TIMESTAMP，见 schema/002:105），db.py 连接池也**不** pin session
+time_zone —— 即存储时区由 RDS 服务器时区决定；审计据此推断浙江 RDS 应为 +08:00、上面的
+LA→Shanghai 分桶会整体错桶。但生产多次实测（Phase E data probe / qa-log-analytics）一致表明
+created_at ≈ 太平洋墙钟（北京 +15/16h），分桶与 SLO 阈值正是按实测校准的——若 RDS 真是 +08:00，
+实测差应为 +8h 而非 +15h，两者矛盾（可能 RDS time_zone=SYSTEM 且系统时钟为 UTC-7/-8）。此争议
+未在服务器侧证实前**不改存储、不 pin 时区**（打断历史行连续性，属用户级决策）；run_rollup 每次
+连接后做一次 fail-open 探测（_probe_server_tz：@@time_zone/NOW()/UTC_TIMESTAMP()），结果进日志
+与 report['tz_probe']，供下一次生产运行确认地面真相后再决策是否迁移。
+
 Runner is fail-open + simulate-safe (no-op), read/UPSERT only (no destructive ops). alert=True fires
 one OBS-4 ops alert per breached day.
 """
@@ -65,6 +75,33 @@ def _beijing_day_pacific_bounds(target: str):
         return None
 
 
+def _probe_server_tz(conn) -> Optional[Dict[str, str]]:
+    """P2-18：存储时区地面真相探测（一次连接一查，fail-open）。
+
+    背景见模块 docstring 的 P2-18 段：created_at 由 RDS DEFAULT CURRENT_TIMESTAMP 按服务器/会话
+    时区写入，与生产实测「太平洋墙钟 +15/16h」存在未解释的张力。这里只读取
+    @@session.time_zone / @@global.time_zone / NOW() / UTC_TIMESTAMP() 并 logger.info 记录 +
+    返回 dict（进 report['tz_probe']），不改任何存储行为。探测失败返回 None，绝不影响汇总。"""
+    cols = ["session_tz", "global_tz", "db_now", "db_utc"]
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT @@session.time_zone AS session_tz, @@global.time_zone AS global_tz,"
+                      " NOW() AS db_now, UTC_TIMESTAMP() AS db_utc")
+            row = c.fetchone()
+        if row is None:
+            return None
+        # 共享池是 tuple cursor（无 DictCursor）→ 按已知列序映射；dict cursor 亦兼容。
+        if not isinstance(row, dict):
+            row = dict(zip(cols, row))
+        probe = {k: str(row.get(k)) for k in cols}
+        logger.info("qa_rollup tz_probe: session_tz=%s global_tz=%s NOW()=%s UTC_TIMESTAMP()=%s",
+                    probe["session_tz"], probe["global_tz"], probe["db_now"], probe["db_utc"])
+        return probe
+    except Exception as e:  # noqa: BLE001 — fail-open：探测是诊断增强，绝不挡既有汇总
+        logger.warning("qa_rollup: 存储时区探测失败（non-fatal）: %s", e)
+        return None
+
+
 def _slo_thresholds() -> Dict[str, float]:
     def _f(env, default):
         try:
@@ -76,6 +113,12 @@ def _slo_thresholds() -> Dict[str, float]:
         "no_result_rate_max": _f("RAG_SLO_NO_RESULT_RATE_MAX", 0.15),
         "p95_latency_ms_max": _f("RAG_SLO_P95_LATENCY_MS_MAX", 25000),
         "error_rate_max": _f("RAG_SLO_ERROR_RATE_MAX", 0.05),
+        # P2-13（盲区审计）：流量下限——死掉的前端与健康前端必须可区分。
+        # 基准 = 近 4 周同星期日 total_queries 中位数（同星期对齐吸收工厂周末低谷）；
+        # 基准 ≥ min_base 且当日 < ratio×基准 → traffic_collapse；当日 =0 且基准 >0 → zero_traffic。
+        # 无历史（全新部署/qa_daily_metrics 空）→ 不判（bootstrap 不误报）。
+        "traffic_drop_ratio": _f("RAG_SLO_TRAFFIC_DROP_RATIO", 0.3),
+        "traffic_min_base": _f("RAG_SLO_TRAFFIC_MIN_BASE", 10),
     }
 
 
@@ -100,6 +143,18 @@ def evaluate_slos(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> Dict
     rgc = metrics.get("rejected_global_cap")
     if rgc:
         breaches.append({"slo": "global_cap_rejected", "threshold": 0, "value": rgc})
+    # P2-13：零/塌缩流量判定（基准=近 4 周同星期日中位数，见 _slo_thresholds 注释）。
+    # 「零流量不违约」只对指标缺失成立；流量本身的缺席在有历史基准时就是事件。
+    base = metrics.get("traffic_median_ref")
+    total_q = metrics.get("total_queries")
+    if base is not None and base > 0 and total_q is not None:
+        if total_q == 0:
+            breaches.append({"slo": "zero_traffic", "threshold": base, "value": 0})
+        elif (base >= thresholds.get("traffic_min_base", 10)
+                and total_q < thresholds.get("traffic_drop_ratio", 0.3) * base):
+            breaches.append({"slo": "traffic_collapse",
+                             "threshold": round(thresholds.get("traffic_drop_ratio", 0.3) * base, 1),
+                             "value": total_q})
     ar = metrics.get("answer_rate")
     if ar is not None and ar < thresholds["answer_rate_min"]:
         breaches.append({"slo": "answer_rate_min", "threshold": thresholds["answer_rate_min"], "value": ar})
@@ -117,7 +172,8 @@ def evaluate_slos(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> Dict
 
 def compute_daily_metrics(rows: List[Dict[str, Any]],
                           thresholds: Optional[Dict[str, float]] = None,
-                          rejected: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+                          rejected: Optional[Dict[str, int]] = None,
+                          traffic_median: Optional[int] = None) -> Dict[str, Any]:
     """PURE: aggregate one day's qa_session_log rows → metric dict + SLO verdict. No I/O.
 
     Each row needs: answer_status, risk_blocked, latency_ms, top_score, user_id, session_id,
@@ -190,6 +246,8 @@ def compute_daily_metrics(rows: List[Dict[str, Any]],
         # P1-1：offered vs admitted —— 被拒量单列，不掺进上面比率的分母（docstring 论证）
         "rejected_count": sum(int(v or 0) for v in rejected.values()),
         "rejected_global_cap": int(rejected.get("global_cap", 0) or 0),
+        # P2-13：流量基准（近 4 周同星期日中位数；None=无历史，零/塌缩判定跳过）
+        "traffic_median_ref": traffic_median,
     }
     metrics["offered_queries"] = total + metrics["rejected_count"]
     verdict = evaluate_slos(metrics, thresholds)
@@ -239,6 +297,26 @@ def _upsert_daily(conn, metric_date: str, m: Dict[str, Any], tz_shift: int) -> N
     _do(_BASE_METRIC_COLS)
 
 
+def _fetch_traffic_median(conn, target: str) -> Optional[int]:
+    """P2-13 流量基准：近 4 周同星期日的 qa_daily_metrics.total_queries 中位数。
+    同星期对齐吸收工厂周末低谷；无历史行/查询失败 → None（bootstrap/降级不判流量 SLO）。"""
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                f"SELECT total_queries FROM {_op_db()}.qa_daily_metrics"
+                " WHERE metric_date IN (DATE_SUB(%s, INTERVAL 7 DAY), DATE_SUB(%s, INTERVAL 14 DAY),"
+                "                       DATE_SUB(%s, INTERVAL 21 DAY), DATE_SUB(%s, INTERVAL 28 DAY))",
+                (target, target, target, target))
+            rows = c.fetchall() or []
+        vals = sorted(int((r["total_queries"] if isinstance(r, dict) else r[0]) or 0) for r in rows)
+        if not vals:
+            return None
+        return vals[len(vals) // 2]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("qa_rollup: 流量基准读取失败（跳过流量 SLO）: %s", e)
+        return None
+
+
 def _fetch_rejected(conn, target: str) -> Dict[str, int]:
     """当日限流拒绝聚合 {reason: count}（qa_admission_reject，schema/017，写侧 rate_limiter）。
     表未建/查询失败 → 空 dict（fail-open：P1-1 是增强项，绝不反过来挡住既有汇总）。"""
@@ -250,6 +328,8 @@ def _fetch_rejected(conn, target: str) -> Dict[str, int]:
         out: Dict[str, int] = {}
         for r in rows:
             reason, cnt = (r["reason"], r["reject_count"]) if isinstance(r, dict) else (r[0], r[1])
+            if str(reason).startswith("__"):
+                continue   # __ 前缀 = 非拒绝行（如 __admitted__ 准入量持久化，P2-11）不计入拒绝
             out[str(reason)] = out.get(str(reason), 0) + int(cnt or 0)
         return out
     except Exception as e:  # noqa: BLE001
@@ -267,10 +347,13 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
         logger.info("qa_rollup: simulate mode → skipped no-op")
         return {"ok": True, "skipped": "simulate"}
 
+    tz_probe: Optional[Dict[str, str]] = None
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn(select_db=False)
         try:
+            # P2-18：先做一次存储时区探测（详见 _probe_server_tz），fail-open、只读。
+            tz_probe = _probe_server_tz(conn)
             # resolve target Beijing day; default = yesterday (Beijing), computed by the DB to avoid
             # host-clock skew. Cursor may be tuple- or dict-style → read positionally via the alias.
             if metric_date:
@@ -309,16 +392,17 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
                 raw = c.fetchall()
             rows = [r if isinstance(r, dict) else dict(zip(_cols, r)) for r in raw]
 
-            m = compute_daily_metrics(rows, rejected=_fetch_rejected(conn, target))
+            m = compute_daily_metrics(rows, rejected=_fetch_rejected(conn, target),
+                                      traffic_median=_fetch_traffic_median(conn, target))
             _upsert_daily(conn, target, m, tz_shift_hours)
         finally:
             conn.close()
 
         report = {"ok": True, "metric_date": target, "metrics": m,
-                  "slo_ok": m["slo_ok"], "breaches": m["slo_breaches"]}
+                  "slo_ok": m["slo_ok"], "breaches": m["slo_breaches"], "tz_probe": tz_probe}
     except Exception as e:  # noqa: BLE001 — fail-open
         logger.exception("qa_rollup: failed")
-        report = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        report = {"ok": False, "error": f"{type(e).__name__}: {e}", "tz_probe": tz_probe}
 
     if alert and (not report.get("ok") or report.get("slo_ok") == 0):
         _alert_on_slo(report)

@@ -5,6 +5,7 @@ llm_generator.py — LLM 回答生成模块
 支持普通模式和 SSE 流式输出。使用 DashScope Qwen（OpenAI compatible-mode）。
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -271,6 +272,11 @@ def _chunk_header(i: int, chunk: Dict[str, Any], pure_text: bool) -> str:
     if isinstance(score, (int, float)):
         # 档位判定与 API sources[].level 同源（score_level），中文标签仅作 prompt 展示
         header += f" (相关度: {_LEVEL_ZH[score_level(chunk)]} {score:.2f})"
+    # P2-31：文档日期（版本落库日，retriever._attach_doc_dates 现查附上）——规则 5 要求
+    # 多文档冲突时说明来源，此前模型零时间信号无从判断哪份是现行版
+    doc_date = chunk.get("doc_date", "")
+    if doc_date:
+        header += f" (文档日期: {doc_date})"
     return header
 
 
@@ -466,6 +472,8 @@ def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "chunk_type": chunk.get("chunk_type", ""),
             "source_image": chunk.get("source_image", ""),
             "visual_summary": chunk.get("visual_summary", ""),
+            # P2-31：文档日期（版本落库日；无则空串——前端有则渲染）
+            "doc_date": chunk.get("doc_date", ""),
         })
     return sources
 
@@ -678,6 +686,76 @@ def _build_messages(
     return messages
 
 
+def build_gen_meta(
+    final_system_prompt: str,
+    *,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """生成元数据快照（盲区审计 P2-20/21/22，落 qa_session_log.gen_meta_json，schema/018）。
+
+    纯函数（只读 config，无副作用）。system prompt 是可变模块常量、_build_messages 又按
+    运行时 flag 条件追加规则（低置信度/反模仿/子下标/注入守卫/自定义），历史行的确切
+    prompt 无法重建；temperature 与检索制度（fusion/knn_weight/阈值/rerank/top_k/embedding
+    模型）全部 env 可变 —— 本函数在 prompt 装配完成后把这些身份压成紧凑 dict：
+
+      prompt_sha    装配后完整 system prompt 的 sha256 前 16 位（逐字节身份；对照 git
+                    历史 + prompt_flags 可反查全文）
+      prompt_flags  哪些条件规则生效（按最终 prompt 的子串成员判定，与拼接实现同源，
+                    规则常量演进时无需同步维护第二份清单）
+      temperature / top_p / model   采样参数与解析后模型名；top_p 从不发送 → 恒 null
+                    （P2-21：如实记录缺席，不改采样行为本身）
+      retrieval     当前检索制度快照（P2-22：top_score 的可解释性锚点 —— 配置一变历史
+                    分数量纲即不可比，快照让每行自带量纲）
+
+    fail-open：config 不全（测试 mock 等）→ retrieval 置 None；任何其他异常 → 整体返回
+    None（如实缺席优于伪造）—— 绝不影响回答链路。
+    """
+    try:
+        flags = {
+            "img_interleave": _IMG_INTERLEAVE_RULE in final_system_prompt,
+            "low_confidence": LOW_CONFIDENCE_RULE in final_system_prompt,
+            "history_antimimic": _IMG_HISTORY_ANTIMIMIC_RULE in final_system_prompt,
+            "img_subindex": _IMG_SUBINDEX_RULE in final_system_prompt,
+            "injection_guard": _PROMPT_INJECTION_RULE in final_system_prompt,
+            "custom_base": not final_system_prompt.startswith(_SYSTEM_PROMPT_BASE),
+        }
+        meta: Dict[str, Any] = {
+            "prompt_sha": hashlib.sha256(
+                final_system_prompt.encode("utf-8")).hexdigest()[:16],
+            "prompt_flags": flags,
+            "temperature": temperature,
+            "top_p": None,   # 从不发送（P2-21）；记 null 而非编造缺省值
+            "model": model,
+        }
+        try:
+            cfg = get_config()
+            av, rag, emb = cfg.alibaba_vector, cfg.rag, cfg.embedding
+            rerank_on = bool(av.rerank_enable)
+            meta["retrieval"] = {
+                "fusion": av.hybrid_fusion,
+                "knn_weight": av.knn_weight,
+                # 高/中/低标签的现行量纲：rerank 开 → rerank 阈（0.9/0.8），关 → 融合阈（7.7/5.8）
+                "th_high": (rag.rerank_score_threshold_high if rerank_on
+                            else rag.score_threshold_high),
+                "th_med": (rag.rerank_score_threshold_medium if rerank_on
+                           else rag.score_threshold_medium),
+                "rerank": rerank_on,
+                # 路由式重排是 text/VL 双模型（按池内是否带图动态选路），配置对记全
+                "rerank_model": (f"{av.rerank_text_model}|{av.rerank_vl_model}"
+                                 if rerank_on else None),
+                "top_k": rag.default_top_k,
+                "embedding_model": emb.model,
+                "embedding_dim": emb.dimension,
+            }
+        except Exception:
+            meta["retrieval"] = None   # config 不全（测试 mock 等）→ 如实缺席
+        return meta
+    except Exception:
+        logger.debug("build_gen_meta 失败（fail-open，落 None）", exc_info=True)
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════
 # 非流式生成
 # ═══════════════════════════════════════════════════════════════
@@ -711,6 +789,7 @@ def generate_answer(
             "sources": [{"doc_id", "title", "section", "score"}],
             "model": str,
             "usage": {"prompt_tokens", "completion_tokens", "total_tokens"},
+            "gen_meta": dict | None,   # P2-20/21/22 生成元数据（见 build_gen_meta）
         }
     """
     config = get_config()
@@ -730,6 +809,9 @@ def generate_answer(
     context, _included_chunks = _format_context_ex(
         context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
+    # P2-20/21/22：prompt 装配完成后立刻定格生成元数据（messages[0] 即最终 system prompt，
+    # 含 _build_messages 内条件追加的全部规则）；fail-open，失败落 None
+    gen_meta = build_gen_meta(messages[0]["content"], temperature=temperature, model=llm.model)
 
     # 调用 DashScope (OpenAI compatible-mode)
     url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
@@ -768,6 +850,7 @@ def generate_answer(
         "sources": sources,
         "model": llm.model,
         "usage": usage,
+        "gen_meta": gen_meta,
     }
 
 
@@ -808,6 +891,7 @@ def generate_answer_stream(
     temperature: float = 0.1,
     pure_text: Optional[bool] = None,
     thinking: Optional[bool] = None,
+    meta_out: Optional[Dict[str, Any]] = None,
 ) -> Generator[str, None, None]:
     """
     根据检索结果生成 LLM 回答（SSE 流式）。
@@ -816,6 +900,10 @@ def generate_answer_stream(
     thinking:  思考模式逐次覆盖；None → 取 config.llm.enable_thinking（默认 False）。思考先产
                reasoning_content；仅「thinking 开 + RAG_STREAM_REASONING 开」时作为 reasoning 帧
                下发（否则只读 content、丢弃 reasoning，与历史一致）。
+    meta_out:  可选出参 dict（P2-20/21/22）。生成器没有返回值可携带元数据，且 gen_meta 只该
+               落 qa_session_log、不该进 SSE 线协议（会把内部阈值/模型配置泄给任意 SSE 客户
+               端）——调用方传入 dict，首帧前回填 meta_out["gen_meta"]=build_gen_meta(...)。
+               不传则行为逐字节不变。
 
     Yields SSE-formatted strings:
         data: {"type": "sources", "sources": [...]}
@@ -839,6 +927,10 @@ def generate_answer_stream(
     context, _included_chunks = _format_context_ex(
         context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
+    # P2-20/21/22：经出参回填生成元数据（generate_answer_via_stream / api.ask_stream 落库用）
+    if meta_out is not None:
+        meta_out["gen_meta"] = build_gen_meta(
+            messages[0]["content"], temperature=temperature, model=llm.model)
 
     url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
 
@@ -939,6 +1031,8 @@ def generate_answer_via_stream(
     sources: List[Dict[str, Any]] = []
     model = ""
     usage: Dict[str, Any] = {}
+    # P2-20/21/22：经 meta_out 出参截留生成元数据（mock 生成器不回填 → .get 得 None，不炸）
+    _meta: Dict[str, Any] = {}
     for event in generate_answer_stream(
         query,
         context_chunks,
@@ -949,6 +1043,7 @@ def generate_answer_via_stream(
         temperature=temperature,
         pure_text=pure_text,
         thinking=thinking,
+        meta_out=_meta,
     ):
         frame = parse_sse_data_frame(event)
         if not frame:
@@ -968,4 +1063,5 @@ def generate_answer_via_stream(
         "sources": sources,
         "model": model or get_config().llm.model,
         "usage": usage,
+        "gen_meta": _meta.get("gen_meta"),
     }

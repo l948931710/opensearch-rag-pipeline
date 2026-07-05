@@ -1164,6 +1164,10 @@ def test_retire_deactivates_all_versions(monkeypatch):
     # document_version 仍只退役当前版本（版本表语义保留）
     ver_upd = [c for c in sink["calls"] if "document_version SET status='retired'" in c[0]]
     assert ver_upd and ver_upd[0][1] == ("D1", 3)
+    # P2-1（盲区审计）：退役必须喂 PENDING_DELETE outbox（全版本），否则 HA3 向量永久可检索
+    pd = [c for c in sink["calls"] if "SET index_status='PENDING_DELETE'" in c[0]]
+    assert len(pd) == 1 and pd[0][1] == ("D1",)
+    assert "NOT IN ('DELETED', 'PENDING_DELETE')" in pd[0][0]
 
 
 def test_restore_reactivates_retired(monkeypatch):
@@ -1177,6 +1181,11 @@ def test_restore_reactivates_retired(monkeypatch):
     sqls = " ".join(c[0] for c in sink["calls"])
     assert sqls.count("SET status='active'") == 2                      # document_meta + document_version
     assert "is_active=1, index_status='NOT_INDEXED'" in sqls           # chunk 重激活 + 标脏
+    # P2-1 对称撤销：退役挂上的 PENDING_DELETE/DELETED 拨回 NOT_INDEXED（仅当前版本），
+    # 否则下轮 reconcile 删 HA3 恰好撤销这次恢复
+    rv = [c for c in sink["calls"] if "document_version" in c[0] and "SET index_status='NOT_INDEXED'" in c[0]]
+    assert len(rv) == 1 and rv[0][1] == ("D1", 2)
+    assert "IN ('PENDING_DELETE', 'DELETED')" in rv[0][0]
 
 
 def test_restore_already_active_idempotent(monkeypatch):
@@ -1872,3 +1881,52 @@ def test_doc_preview_employee_forbidden(monkeypatch):
     with pytest.raises(Exception) as ei:
         api.kb_doc_preview(request=None, doc_id="D1", identity=api.Identity(user_id="e1"))
     assert getattr(ei.value, "status_code", None) == 403
+
+
+# ── GET/POST /api/kb/review-tasks：入库复审任务队列（盲区审计 P2-33）────────────
+def test_review_tasks_kb_admin_only_and_age_order(monkeypatch):
+    """kb_admin 专属（dept_admin 403）；收件箱不设时间窗、按龄升序；标题现查 document_meta。"""
+    _skip_if_not_sim()
+    from fastapi import HTTPException
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "hr")
+    from opensearch_pipeline import api
+    with pytest.raises(HTTPException) as ei:
+        api.kb_review_tasks(request=None, limit=20, identity=api.Identity(user_id="da1"))
+    assert ei.value.status_code == 403
+
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    # 12 列：task_id, doc_id, title, version_no, review_type, review_reason, owner_dept,
+    #        suggested_permission_level, review_status, reviewer_name, created_at, age
+    rows = [("RT1", "D1", "员工薪酬发放办法", 2, "spot_check_mismatch",
+             "实时权限 public 比 LLM 建议 restricted 更宽松", "hr", "restricted",
+             "PENDING", None, "2026-06-25 08:10:00", 9)]
+    sink = _stub_multi(monkeypatch, [rows])
+    resp = api.kb_review_tasks(request=None, limit=20, identity=api.Identity(user_id="adm1"))
+    it = resp.items[0]
+    assert it.task_id == "RT1" and it.age_days == 9 and it.closed is False
+    assert it.title == "员工薪酬发放办法" and it.suggested_permission_level == "restricted"
+    list_sql = sink["calls"][0][0]
+    assert "ORDER BY t.created_at ASC" in list_sql and "INTERVAL" not in list_sql
+    assert "LEFT JOIN" in list_sql and "document_meta" in list_sql
+
+
+def test_review_task_resolve_writes_reviewer_fields(monkeypatch):
+    """处置写 review_status/reviewer_*/reviewed_at；reopen 清 reviewed_at；不存在 → 404。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [])
+    from opensearch_pipeline import api
+    r = api.kb_review_task_resolve(
+        api.KbReviewTaskResolveRequest(task_id="RT1", action="resolve", comment="已改回 restricted"),
+        request=None, identity=api.Identity(user_id="adm1"))
+    assert r["review_status"] == "RESOLVED"
+    upd = [c for c in sink["calls"] if "UPDATE" in c[0]][0]
+    assert "reviewer_user_id=%s" in upd[0] and "reviewed_at=NOW()" in upd[0]
+    assert "reviewer_comment=%s" in upd[0] and "已改回 restricted" in upd[1]
+    r2 = api.kb_review_task_resolve(
+        api.KbReviewTaskResolveRequest(task_id="RT1", action="reopen"),
+        request=None, identity=api.Identity(user_id="adm1"))
+    assert r2["review_status"] == "PENDING"
+    upd2 = [c for c in sink["calls"] if "UPDATE" in c[0]][-1]
+    assert "reviewed_at=NULL" in upd2[0]

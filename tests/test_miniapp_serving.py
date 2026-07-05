@@ -1046,8 +1046,7 @@ def test_history_query_scoped_to_token_user(client, monkeypatch):
 
 def _reset_hot_cache():
     import opensearch_pipeline.api as api
-    api._hot_questions_cache["ts"] = 0.0
-    api._hot_questions_cache["data"] = None
+    api._hot_questions_cache.clear()   # P2-7 起按 dept cohort 分键
 
 
 def test_hot_questions_db_down_falls_back(client, monkeypatch):
@@ -1063,6 +1062,8 @@ def test_hot_questions_db_down_falls_back(client, monkeypatch):
 
 
 def test_hot_questions_filters_and_caches(client, monkeypatch):
+    """P2-7 起按登录者部门 cohort 聚合：带令牌请求走 DB 聚合 + 分部门缓存。"""
+    from opensearch_pipeline import auth_token
     _reset_hot_cache()
     rows = [("U8怎么登录", 9), ("新会话", 8), ("请假流程", 5),
             ("访客WiFi密码", 4), ("打印机怎么连", 3), ("模具保养周期", 3),
@@ -1073,14 +1074,59 @@ def test_hot_questions_filters_and_caches(client, monkeypatch):
         calls["n"] += 1
         return _FakeConn(rows)
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _conn)
+    # 令牌 dept 的 DB 现查另有连接开销 → 桩掉，让 calls 只计热门聚合本身
+    monkeypatch.setattr("opensearch_pipeline.dingtalk_identity._resolve_user_dept_cached",
+                        lambda uid: ["hr"])
+    hdr = {"Authorization": f"Bearer {auth_token.issue_session_token('U1', dept=['hr'])}"}
 
-    r1 = client.get("/api/hot-questions")
+    r1 = client.get("/api/hot-questions", headers=hdr)
     qs = r1.json()["questions"]
     assert "新会话" not in qs            # 控制指令不入热门
     assert qs[0] == "U8怎么登录" and len(qs) == 6   # 截到 6 条
-    r2 = client.get("/api/hot-questions")
+    r2 = client.get("/api/hot-questions", headers=hdr)
     assert r2.json()["questions"] == qs
     assert calls["n"] == 1               # 第二次命中进程内缓存
+
+
+def test_hot_questions_anonymous_gets_static_only(client, monkeypatch):
+    """P2-7：匿名请求绝不聚合 qa_session_log（他部门提问文本不外发）→ 只回静态兜底。"""
+    import opensearch_pipeline.api as api
+    _reset_hot_cache()
+
+    def _must_not_query(*a, **k):
+        raise AssertionError("匿名 hot-questions 不应触库")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _must_not_query)
+    r = client.get("/api/hot-questions")
+    assert r.status_code == 200
+    assert r.json()["questions"] == list(api._HOT_QUESTIONS_FALLBACK)
+
+
+def test_hot_questions_dept_predicate_in_sql(monkeypatch):
+    """P2-7：聚合 SQL 必须带 user_dept = %s cohort 谓词，且参数首位是 cohort 键。"""
+    import opensearch_pipeline.api as api
+    seen = {}
+
+    class _Cur:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, sql, params=None):
+            seen["sql"], seen["params"] = sql, params
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+        def close(self):
+            pass
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
+    api._compute_hot_questions("hr,production")
+    assert "user_dept = %s" in seen["sql"] and seen["params"][0] == "hr,production"
+    api._compute_success_pool("hr")
+    assert "user_dept = %s" in seen["sql"] and seen["params"][0] == "hr"
 
 
 # ── 深度思考（thinking）：默认关闭 · 路由 · 攒流收集器 ────────────────
@@ -1206,9 +1252,8 @@ def test_stream_payload_thinking_override(monkeypatch):
 
 def _set_success_pool(monkeypatch, pool):
     import opensearch_pipeline.api as api
-    api._success_pool_cache["ts"] = 0.0
-    api._success_pool_cache["data"] = None
-    monkeypatch.setattr(api, "_success_question_pool", lambda: pool)
+    api._success_pool_cache.clear()   # P2-7 起按 dept cohort 分键
+    monkeypatch.setattr(api, "_success_question_pool", lambda *a, **k: pool)
 
 
 def test_rephrase_prefers_similar_success_questions(monkeypatch):
