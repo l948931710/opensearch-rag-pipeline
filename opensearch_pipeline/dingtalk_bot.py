@@ -1082,7 +1082,10 @@ def _process_card_callback_body(body: dict):
         try:
             handle_feedback(message_id=message_id, user_id=user_id, user_name=user_name, action="handoff")
             if user_id:
-                send_text_to_user(user_id, "🙋 已为你转人工，相关同事会尽快跟进～")
+                # 文案与真实机制对齐（盲区审计 P1-2）：工单进控制台队列 + 管理员钉钉通知，
+                # 管理员答复后由 kb_escalation_resolve 1 对 1 推回提问者。
+                send_text_to_user(user_id, "🙋 已为你转人工：问题已进入人工工单队列并通知管理员，"
+                                           "答复后会通过钉钉消息回复你～")
         except Exception as e:
             logger.error("handoff 处理失败: %s", e, exc_info=True)
         return _ACK

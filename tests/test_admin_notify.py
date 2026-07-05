@@ -37,6 +37,8 @@ class _Cur:
             return self.conn.dept_admins
         if "user_role" in self._last:
             return self.conn.kb_admins
+        if "qa_session_log" in self._last:
+            return self.conn.cited_depts
         return []
 
     def fetchone(self):
@@ -46,10 +48,11 @@ class _Cur:
 
 
 class _Conn:
-    def __init__(self, dept_admins=(), kb_admins=(), doc_row=None):
+    def __init__(self, dept_admins=(), kb_admins=(), doc_row=None, cited_depts=()):
         self.dept_admins = list(dept_admins)
         self.kb_admins = list(kb_admins)
         self.doc_row = doc_row
+        self.cited_depts = list(cited_depts)
         self.calls = []
 
     def cursor(self):
@@ -81,6 +84,7 @@ def test_flag_off_is_total_noop(monkeypatch):
     an.notify_access_request("marketing", "D1", "hr")
     an.notify_contribution("marketing", "q?")
     an.notify_upload_approval("marketing", "t")
+    an.notify_escalation("M1", "q?")
     assert sent == [] and conn.calls == []
 
 
@@ -177,3 +181,63 @@ def test_submit_endpoint_fires_hook(monkeypatch):
         request=None, identity=api.Identity(user_id="da1"))
     assert resp.status == "pending"
     assert len(calls) == 1 and calls[0]["owner_dept"] == "marketing" and calls[0]["doc_id"] == "D9"
+
+
+# ── 转人工工单通知（盲区审计 P1-2：工单不再只写不读）────────────────────────────
+
+def test_escalation_notifies_cited_dept_admins(monkeypatch):
+    """收件人=被引用文档 owner_dept 的 dept_admin（与控制台工单队列可见性同源）；
+    文案含提问节选（40 字截断）。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    _wire(monkeypatch, _Conn(dept_admins=[("mgr1",), ("mgr2",)],
+                             cited_depts=[("production",)]))
+    an.notify_escalation("M1", "注" * 60)
+    assert len(sent) == 1
+    assert sent[0][1]["userid_list"] == "mgr1,mgr2"
+    text = sent[0][1]["msg"]["text"]["content"]
+    assert "转人工工单" in text and ("注" * 40 + "…") in text
+
+
+def test_escalation_no_cited_docs_falls_back_to_kb_admin(monkeypatch):
+    """无引用文档（NO_RESULT 转人工 = 语料缺口）→ kb_admin 兜底，工单不落进虚空。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    _wire(monkeypatch, _Conn(kb_admins=[("adm1",)], cited_depts=[]))
+    an.notify_escalation("M2", "出口欧盟要哪些认证？")
+    assert len(sent) == 1 and sent[0][1]["userid_list"] == "adm1"
+
+
+def test_create_escalation_fires_notify_hook(monkeypatch):
+    """feedback_handler._create_escalation：INSERT+commit 成功后调用 notify_escalation
+    （best-effort：通知炸了不影响返回 True）。"""
+    calls = []
+    monkeypatch.setattr("opensearch_pipeline.admin_notify.notify_escalation",
+                        lambda mid, q: calls.append((mid, q)))
+
+    class _ECur(_Cur):
+        def fetchone(self):
+            if "qa_session_log" in self._last:
+                return ("S1", "怎么冲销入库单？", "AI 的回答", "财务部")
+            return None
+    class _EConn(_Conn):
+        def cursor(self):
+            return _ECur(self)
+        def commit(self):
+            self.committed = True
+        def rollback(self):
+            pass
+    conn = _EConn()
+    _wire(monkeypatch, conn)
+    from opensearch_pipeline.feedback_handler import _create_escalation
+    assert _create_escalation(message_id="M9", user_id="u1", user_name="张三") is True
+    assert calls == [("M9", "怎么冲销入库单？")]
+    assert getattr(conn, "committed", False)
+
+    # 通知炸了 → 主流程不受影响（工单已 commit，仍返回 True）
+    def _boom(mid, q):
+        raise RuntimeError("notify down")
+    monkeypatch.setattr("opensearch_pipeline.admin_notify.notify_escalation", _boom)
+    conn2 = _EConn()
+    _wire(monkeypatch, conn2)
+    assert _create_escalation(message_id="M10", user_id="u1", user_name=None) is True

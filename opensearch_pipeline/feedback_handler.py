@@ -298,6 +298,13 @@ def _create_escalation(
             "escalation_ticket 创建成功: ticket_id=%s, message_id=%s, user_id=%s",
             ticket_id, message_id, user_id,
         )
+        # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise，commit 之后）：
+        # 盲区审计 P1-2——工单不能只写不读，被引用文档归属部门的管理员要即时知晓。
+        try:
+            from opensearch_pipeline.admin_notify import notify_escalation
+            notify_escalation(message_id, query_text)
+        except Exception as notify_err:   # noqa: BLE001
+            logger.warning("escalation 通知失败（忽略）: %s", notify_err)
         return True
 
     except Exception as e:
