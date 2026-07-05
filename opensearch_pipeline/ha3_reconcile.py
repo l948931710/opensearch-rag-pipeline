@@ -23,12 +23,39 @@ ha3_reconcile.py — HA3↔RDS 物理行对账：删除 chunk_meta 已不认账�
 集成：spot_checker.run_spot_check_pipeline 在 reconcile 段调用 reconcile_ha3_orphan_pks()。
 """
 import logging
+import os
+import time
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH = 100
 _ID_SCAN_BUCKET = 500          # PK 区间扫描桶大小（≤500/桶 → 桶内召回完整，不受 ANN 上限影响）
 _ID_SCAN_HEADROOM = 1000       # 扫到 MAX(chunk_meta.id)+headroom，兜住边界
+
+
+def _duration_alert_threshold_s() -> float:
+    """P2-29：全 id 空间扫描时长告警阈值（秒），与 reconcile.py 共用同一 env——
+    RAG_RECONCILE_DURATION_ALERT_S，默认 1800；<=0 停用。（刻意本地小函数而非 import
+    reconcile：本模块保持 standalone、fail-open，不引入横向依赖。）"""
+    try:
+        return float(os.environ.get("RAG_RECONCILE_DURATION_ALERT_S", "1800"))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _alert_scan_duration(elapsed_s: float, buckets: int) -> None:
+    """扫描耗时超阈值 → 一条 warning 级 ops 告警（fail-open；send_ops_alert 自身受配置门控）。"""
+    try:
+        from opensearch_pipeline.alerting import send_ops_alert
+        send_ops_alert(
+            "reconcile 扫描超时长阈值（ha3-orphan）",
+            f"elapsed={elapsed_s:.0f}s > 阈值 {_duration_alert_threshold_s():.0f}s；"
+            f"buckets_scanned={buckets}。id 空间随重切 churn 单调增长（MAX(id) 永增）——"
+            f"孤儿方向必须全扫（见 reconcile_ha3_orphan_pks 注释），扫描成本失控时应"
+            f"清理孤儿收敛 id 空间，或调大 RAG_RECONCILE_DURATION_ALERT_S。",
+            severity="warning", dedup_key="reconcile:duration:ha3-orphan")
+    except Exception:  # noqa: BLE001 — 告警失败绝不影响对账本体
+        logger.warning("[RECONCILE-HA3] duration-alert dispatch failed (non-fatal)", exc_info=True)
 
 
 def _classify_stale(ha3_map: dict, rds_active_ids: set, rds_active_chunkid: dict):
@@ -155,13 +182,26 @@ def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = False,
     rds_active_chunkid = {r[1]: int(r[0]) for r in rows if r[2] == 1}
     cfg = config.alibaba_vector
 
+    # P2-29：孤儿方向必须保持 id_lo=0 全扫——孤儿 PK 正是 DELETE→INSERT churn 后【低于】
+    # 当前 MIN(chunk_meta.id) 的旧 id（node_write_chunk_meta 每次重切给同 chunk_id 分配新 id），
+    # 从 MIN(id) 起扫会永久漏掉本工具存在的意义（低位孤儿永不清）。上界已按 MAX(id)+headroom
+    # 有界；无界的是耗时随 id 空间线性增长 → 记录桶数/耗时进 result，超阈值发 warning 告警。
+    _id_hi = max_id + _ID_SCAN_HEADROOM
+    _t0 = time.monotonic()
     try:
         ha3_map = _enumerate_ha3_pks(client, cfg, _parse_ha3_response, _PARITY_OUTPUT_FIELDS,
-                                     QueryRequest, id_hi=max_id + _ID_SCAN_HEADROOM)
+                                     QueryRequest, id_hi=_id_hi)
     except Exception as e:
         result["errors"].append(f"HA3 enumerate failed: {e}")
+        result["elapsed_s"] = round(time.monotonic() - _t0, 3)
         conn.close()
         return result
+    _elapsed = time.monotonic() - _t0
+    result["buckets_scanned"] = len(range(0, _id_hi, _ID_SCAN_BUCKET))
+    result["elapsed_s"] = round(_elapsed, 3)
+    _thr = _duration_alert_threshold_s()
+    if _thr > 0 and _elapsed > _thr:
+        _alert_scan_duration(_elapsed, result["buckets_scanned"])
 
     result["checked"] = len(ha3_map)
     delete_pks, skipped = _classify_stale(ha3_map, rds_active_ids, rds_active_chunkid)

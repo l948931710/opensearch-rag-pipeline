@@ -37,10 +37,21 @@ document_sensitive_finding、pipeline_run 只进不出——看板窗口查询�
 调度：DataWorks 日任务节点 `dataworks_nodes/retention_node.py`（生产推荐），或
 MySQL EVENT（备选，见 docs；不推荐——绕过应用层守卫与告警）。
 
+────────────────────────────────────────────────────────────────────────────
+数据主体擦除（P2-5，PIPL 第 15/47 条）：`purge_subject(user_id, commit=False)`
+按 user_id 跨 fuling_operation 硬删该主体的全部个人数据行（qa_retrieved_doc →
+user_feedback → escalation_ticket → qa_conversation → qa_session_log，顺序不可倒）。
+dry-run 默认打印各表将删行数；commit 双门 = RAG_SUBJECT_PURGE_ENABLE=true +
+env_guard.assert_destructive_write_allowed。已知边界见 purge_subject docstring
+（离职钩子未接、内存 session_store 需重启或后续接口、knowledge 侧业务台账不在范围）。
+
 CLI：
   python -m opensearch_pipeline.retention                       # dry-run 全作业
   python -m opensearch_pipeline.retention --only qa_blobs,audit # dry-run 指定作业
   RAG_RETENTION_ENABLE=true python -m opensearch_pipeline.retention --commit
+  python -m opensearch_pipeline.retention --purge-user <钉钉userId>   # 擦除 dry-run
+  RAG_SUBJECT_PURGE_ENABLE=true python -m opensearch_pipeline.retention \
+      --purge-user <钉钉userId> --commit                              # 真删（双门）
 """
 
 import argparse
@@ -243,15 +254,157 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
     return reports
 
 
+# ─── P2-5 数据主体擦除（PIPL 第 15/47 条）────────────────────────────────────
+
+def _purge_jobs(user_id: str) -> List[dict]:
+    """主体擦除的表清单（列表顺序 = 删除顺序，⚠️ 不可倒）。
+
+    qa_retrieved_doc（schema/013 事实表）没有 user_id 列，必须经 qa_session_log.message_id
+    关联删除，且必须先于 qa_session_log 本体——先删日志则事实行成永久孤儿、再也定位不到。
+    count 与 act 同谓词；act 为单表 DELETE + LIMIT（子查询指向他表，MySQL 允许 LIMIT）。
+    """
+    op = _op_db()
+    return [
+        {"table": "qa_retrieved_doc", "optional": True,   # schema/013 可选迁移，1146 → skip
+         "count": (f"SELECT COUNT(*) FROM {op}.qa_retrieved_doc WHERE message_id IN "
+                   f"(SELECT message_id FROM {op}.qa_session_log WHERE user_id = %s)"),
+         "act": (f"DELETE FROM {op}.qa_retrieved_doc WHERE message_id IN "
+                 f"(SELECT message_id FROM {op}.qa_session_log WHERE user_id = %s) LIMIT %s")},
+        {"table": "user_feedback", "optional": False,
+         "count": f"SELECT COUNT(*) FROM {op}.user_feedback WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.user_feedback WHERE user_id = %s LIMIT %s"},
+        # 仅删该用户【提出】的工单；user 仅作为 assigned_user_id（处理人）出现的行
+        # 承载的是提单人的主体数据，不删。
+        {"table": "escalation_ticket", "optional": False,
+         "count": f"SELECT COUNT(*) FROM {op}.escalation_ticket WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.escalation_ticket WHERE user_id = %s LIMIT %s"},
+        {"table": "qa_conversation", "optional": True,    # schema/006 可选迁移，1146 → skip
+         "count": f"SELECT COUNT(*) FROM {op}.qa_conversation WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.qa_conversation WHERE user_id = %s LIMIT %s"},
+        {"table": "qa_session_log", "optional": False,    # 最后删（事实行的 message_id 锚点）
+         "count": f"SELECT COUNT(*) FROM {op}.qa_session_log WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.qa_session_log WHERE user_id = %s LIMIT %s"},
+    ]
+
+
+def purge_subject(user_id: str, *, commit: bool = False, batch: int = DEFAULT_BATCH,
+                  max_batches: int = MAX_BATCHES_PER_JOB) -> Dict[str, dict]:
+    """按 user_id 硬删 fuling_operation 内该数据主体的全部个人数据行（dry-run 默认）。
+
+    覆盖表与顺序见 _purge_jobs。dry-run 只 SELECT COUNT 各表将删行数；commit=True 双门：
+    RAG_SUBJECT_PURGE_ENABLE=true（与 retention 的 RAG_RETENTION_ENABLE 同款纪律、刻意
+    独立成两个 env——开日常留存不应连带开主体擦除）**且** env_guard
+    assert_destructive_write_allowed（PROD-RO 拒；非生产→生产需当日 ack）。
+    批量执行与留存作业同参（LIMIT/批、批间 sleep、上限批数，超限次日续跑幂等）。
+
+    已知边界（作为台账留在此处）：
+      · 离职/主体请求钩子未接——目前由管理员人工触发 CLI（--purge-user）；
+      · serving 进程内存会话（session_store，最近对话上下文）不在本作业范围：
+        重启进程即清，或等后续管理接口；
+      · qa_daily_metrics 是无 user_id 的聚合表（非个人数据），不删；
+      · 群聊 `$:LWCP_v1` 合成身份不映射真实 user_id，无法按主体定位（见 qa-log gotchas）；
+      · fuling_knowledge 侧业务台账（kb_contribution / kb_access_request 等）绑定文档
+        生命周期与审批链，暂不在本作业（需要时单独评审擦除口径）。
+
+    Returns: {"user_id":…, "dry_run":…, "ok":…, "tables": {表名: report}}；绝不半途 raise
+    单表失败（记入该表 report["error"]，其余表继续）。
+    """
+    user_id = (user_id or "").strip()
+    if not user_id:
+        # 空 user_id 会让 WHERE user_id='' 命中历史脏行 / 全表——宁可拒绝。
+        raise ValueError("purge_subject: user_id 不能为空")
+
+    cfg = get_config()
+    result: Dict[str, dict] = {"user_id": user_id, "dry_run": not commit,
+                               "ok": True, "tables": {}}
+    if cfg.simulate or cfg.simulate_db:
+        print(f"[purge_subject] simulate 模式：skip（user_id={user_id}）")
+        result["skipped"] = "simulate"
+        return result
+
+    if commit:
+        if os.environ.get("RAG_SUBJECT_PURGE_ENABLE", "").lower() not in ("1", "true", "yes"):
+            raise RuntimeError(
+                "[purge_subject] --commit 需要 RAG_SUBJECT_PURGE_ENABLE=true"
+                "（双闸防误跑，与 retention 的 RAG_RETENTION_ENABLE 同款纪律）")
+        from opensearch_pipeline.env_guard import assert_destructive_write_allowed
+        assert_destructive_write_allowed("subject_purge", cfg.rds.host, kind="rds")
+
+    from opensearch_pipeline.db import _get_db_conn
+
+    for job in _purge_jobs(user_id):
+        table = job["table"]
+        rep: dict = {"ok": False, "affected": 0, "batches": 0}
+        result["tables"][table] = rep
+        try:
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(job["count"], (user_id,))
+                    rep["affected"] = int((cur.fetchone() or (0,))[0] or 0)
+                if not commit:
+                    conn.rollback()   # count-only 读事务收尾
+                    rep["ok"] = True
+                    rep["dry_run"] = True
+                    print(f"[purge_subject] {table}: dry-run，将删 {rep['affected']} 行")
+                    continue
+                deleted = 0
+                for _ in range(max_batches):
+                    with conn.cursor() as cur:
+                        cur.execute(job["act"], (user_id, batch))
+                        n = cur.rowcount
+                    conn.commit()   # 每批短事务提交
+                    rep["batches"] += 1
+                    deleted += max(n, 0)
+                    if n < batch:
+                        break
+                    time.sleep(SLEEP_BETWEEN_BATCHES)
+                else:
+                    rep["capped"] = True   # 打满上限：次日续跑（幂等）
+                rep["deleted"] = deleted
+                rep["ok"] = True
+                print(f"[purge_subject] {table}: 删除 {deleted} 行 / {rep['batches']} 批"
+                      + ("（达单次上限，次日续跑）" if rep.get("capped") else ""))
+            finally:
+                conn.close()
+        except Exception as e:
+            errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
+            if job["optional"] and errno == 1146:
+                # 可选迁移（schema/006、013）未 apply 的环境：表不存在不算失败
+                rep["ok"] = True
+                rep["skipped"] = f"{table} 不存在（可选迁移未应用）"
+                print(f"[purge_subject] {table}: skip（表未建）")
+            else:
+                rep["error"] = str(e)
+                result["ok"] = False
+                print(f"[purge_subject] {table}: ✗ {e}")
+    return result
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="日志/审计表留存（dry-run 默认）")
+    ap = argparse.ArgumentParser(description="日志/审计表留存 + 数据主体擦除（dry-run 默认）")
     ap.add_argument("--commit", action="store_true",
-                    help="真执行（还需 RAG_RETENTION_ENABLE=true 双闸）")
+                    help="真执行（留存需 RAG_RETENTION_ENABLE=true，擦除需 "
+                         "RAG_SUBJECT_PURGE_ENABLE=true 双闸）")
     ap.add_argument("--only", default=None,
                     help=f"逗号分隔作业名子集：{','.join(_JOB_NAMES)}")
+    ap.add_argument("--purge-user", default=None, metavar="USER_ID",
+                    help="P2-5 数据主体擦除：按 user_id 跨 fuling_operation 硬删该主体全部"
+                         "个人数据行（与留存作业互斥；dry-run 默认）")
     ap.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     ap.add_argument("--max-batches", type=int, default=MAX_BATCHES_PER_JOB)
     args = ap.parse_args(argv)
+
+    if args.purge_user is not None:
+        if args.only:
+            ap.error("--purge-user 与 --only 互斥（擦除有固定表清单与顺序）")
+        try:
+            rep = purge_subject(args.purge_user, commit=args.commit,
+                                batch=args.batch, max_batches=args.max_batches)
+        except (RuntimeError, ValueError) as e:
+            print(f"[purge_subject] ✗ {e}")
+            return 3
+        return 0 if rep.get("ok") else 3
 
     only = None
     if args.only:

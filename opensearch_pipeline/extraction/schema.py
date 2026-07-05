@@ -124,6 +124,12 @@ class ExtractionResult:
     # 避免 DAG2 用（重载后丢失的）空 filename 重新分类 → layout 漂移 → step_card 结构静默丢失 (P0-3)。
     xlsx_layout_type: Optional[str] = None
 
+    # P2-32（VLM degraded 传播）：本文档有多少张图片拿到的是 VLM 降级兜底结论
+    # （超时/解析失败 → 占位 caption 或保守隔离，见 image_funnel_processor ~430）。>0 时
+    # stage-2 收尾把 document_version.content_process_status 落 NEEDS_REVIEW 而非 DONE——
+    # 文档留在可复查集合，VLM 恢复后重灌自愈；文本抽取/切块/索引照常（graceful degradation）。
+    vlm_degraded_count: int = 0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "doc_id": self.doc_id,
@@ -144,4 +150,5 @@ class ExtractionResult:
             "assets": self.assets,
             "cost_quarantined": self.cost_quarantined,
             "xlsx_layout_type": self.xlsx_layout_type,
+            "vlm_degraded_count": self.vlm_degraded_count,
         }

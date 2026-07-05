@@ -581,6 +581,9 @@ def node_build_canonical(ctx: dict):
                 "cost_quarantined": getattr(result, "cost_quarantined", False),
                 # DAG1 的 xlsx layout 判定（用真实 filename）→ 持久化供 DAG2 直接消费，不再重分类 (P0-3)
                 "xlsx_layout_type": getattr(result, "xlsx_layout_type", None),
+                # P2-32：VLM degraded 兜底图片数（供应商故障）→ 持久化进 canonical JSON 跨 stage
+                # 边界传递；>0 时 node_write_chunk_meta 收尾落 NEEDS_REVIEW（不 DONE）。
+                "vlm_degraded_count": getattr(result, "vlm_degraded_count", 0),
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result.doc_id}"
@@ -602,6 +605,7 @@ def node_build_canonical(ctx: dict):
                 "ocr_required": result.get("ocr_required", False),
                 "ocr_status": result.get("ocr_status", "NOT_REQUIRED"),
                 "blocks": [],
+                "vlm_degraded_count": result.get("vlm_degraded_count", 0),
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result['doc_id']}"
@@ -5067,6 +5071,49 @@ def node_write_chunk_meta(ctx: dict):
                             action_result=("DONE" if chunk_cnt > 0 else "EMPTY"),
                             trace_id=audit_trace_id(ctx), message=f"{chunk_cnt} chunks",
                             simulate=simulate_db)
+
+                # ── P2-32（VLM 供应商降级传播）：本文档存在 degraded 兜底图片（VLM 超时/解析
+                # 失败 → 占位 caption 或保守隔离，见 image_funnel_processor ~430）→ 收尾在 DONE
+                # 之上追加改写 content_process_status='NEEDS_REVIEW'（0-chunk 疑似失败已有该词先例）。
+                # 取舍（graceful degradation 铁律：辅助失败绝不断答案）：
+                #   · chunk/嵌入/索引【照常】——文本照常可检索，占位图注照常可服务；
+                #   · NEEDS_REVIEW 不在 stage-1/2 任何认领谓词（NOT_STARTED / FAILED&retry<3 /
+                #     LOADING/PROCESSING 失效清扫）中 → 无自动重试循环、不触发未冻结重切守卫；
+                #   · 语义 = 「文档可服务但图注降级、留在可复查集合」：供应商恢复后按
+                #     content_process_status='NEEDS_REVIEW' + content_process_error LIKE 'vlm_degraded%'
+                #     定位，走维护重灌（reset_for_rechunk）即自愈（degraded 结论从不入 VLM 缓存，
+                #     重跑必然重新审计）。标记写失败仅告警不阻断（辅助失败不破坏主流程）。
+                _vlm_degraded_n = 0
+                try:
+                    _vlm_degraded_n = int(
+                        (_canon_by_dv.get((doc_id, ver), {}) or {}).get("vlm_degraded_count") or 0)
+                except (TypeError, ValueError):
+                    _vlm_degraded_n = 0
+                if _vlm_degraded_n > 0:
+                    _vlm_note = (f"vlm_degraded: {_vlm_degraded_n} image(s) got degraded VLM "
+                                 f"fallback (vendor outage/timeouts) — re-ingest after VLM "
+                                 f"recovers")[:255]
+                    print(f"    🚨 {doc_id} v{ver}: {_vlm_degraded_n} 张图片为 VLM 降级兜底 → "
+                          f"content_process_status=NEEDS_REVIEW（chunk/索引照常，VLM 恢复后重灌自愈）")
+                    if not simulate_db:
+                        try:
+                            if _closure_conn is None:
+                                _closure_conn = _get_db_conn(select_db=True)
+                            with _closure_conn.cursor() as cursor:
+                                cursor.execute("""
+                                    UPDATE document_version
+                                    SET content_process_status = 'NEEDS_REVIEW',
+                                        content_process_error = %s
+                                    WHERE doc_id = %s AND version_no = %s
+                                """, (_vlm_note, doc_id, ver))
+                                _closure_conn.commit()
+                        except Exception as db_err:
+                            _closure_conn = _rollback_or_discard(_closure_conn)
+                            print(f"    ⚠️ Failed to mark NEEDS_REVIEW (vlm degraded) for "
+                                  f"{doc_id} v{ver}: {db_err}")
+                    else:
+                        print(f"    └─ [SIMULATED] document_version: doc_id={doc_id} v{ver} "
+                              f"content_process_status='NEEDS_REVIEW' ({_vlm_note})")
     finally:
         # perf#93：闭环共享连接统一归还（fail-open 分支、DONE 分支 raise、正常收尾皆经此）。
         if _closure_conn is not None:
@@ -5657,11 +5704,25 @@ def node_deactivate_old_chunks(ctx: dict):
                         _st_clause = " OR ".join(
                             ["(doc_id = %s AND version_no = %s)"] * len(_dvs))
                         _st_params = (final_status,) + tuple(p for dv in _dvs for p in dv)
+                        # CAS 收尾（盲区审计 P2-2）：只允许 PROCESSING→终态。这里的每个键都在
+                        # node_acquire_index_lock 被 CAS 进 PROCESSING（valid_doc_versions ⊆ 锁集），
+                        # 正常路径谓词恒真、行为不变；若控制台在本批运行中把该版本置为
+                        # PENDING_DELETE（set-visibility→restricted / retire 的删除握手），无条件
+                        # UPDATE 会把握手令牌覆盖成 SUCCESS——受限文档带旧 permission 永久留在
+                        # HA3 被越权投放。CAS 跳过即保住 PENDING_DELETE，下轮 reconcile 把刚推
+                        # 的旧权限行删掉，最终一致。
                         cursor.execute(f"""
                             UPDATE document_version
                             SET index_status = %s
-                            WHERE {_st_clause}
+                            WHERE ({_st_clause})
+                              AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                         """, _st_params)
+                        # 测试桩（MagicMock/自定义 cursor）可能无 int rowcount → 跳过差额告警
+                        _st_rc = getattr(cursor, "rowcount", None)
+                        if isinstance(_st_rc, int) and _st_rc < len(_dvs):
+                            print(f"    ├─ ⚠️ {len(_dvs) - _st_rc} 个版本收尾被跳过"
+                                  f"（index_status 已非 PROCESSING，可能被控制台置 PENDING_DELETE——"
+                                  f"保留其握手令牌，交 reconcile 清除）")
                 conn.commit()
             except Exception as e:
                 if conn: conn.rollback()
@@ -5758,7 +5819,11 @@ def node_generate_embeddings(ctx: dict):
         # ── 本地 embedding 缓存（perf#18/19/20：SQLite KV + 进程级单例 + OSS 镜像）──
         # 旧 scratch/embedding_cache.json 整读整写形态（每批 json.load/重写 ~220MB、
         # serverless 永远冷）的问题、迁移与镜像语义见 embedding_cache.py 模块 docstring。
-        # 键/值契约不变：md5(f"{model}_{text}")，sparse 条目 "sp_" 前缀。DET: 崩溃安全
+        # 键契约（P2-9，2026-07-05 起）：md5(f"{model}_{dimension}_{text}")，sparse 条目
+        # "sp_" 前缀——与查询侧 LRU 键（retriever.get_query_embedding: (query, model, dim)）
+        # 对齐。v4 支持 Matryoshka 多维，键不含 dimension 时改 RAG_EMBEDDING_DIMENSION 会
+        # 静默命中旧维向量、混维推上 HA3。旧格式 md5(f"{model}_{text}") 的存量条目整体
+        # miss（等价冷启动，advisory 缓存可接受），占位直至容量淘汰。DET: 崩溃安全
         # 由 SQLite WAL 日志保证（等价旧实现的 temp + os.replace 原子写不变量）。
         # 存量 JSON 首次自动迁移进 sqlite；JSON 文件原样保留供 tests/eval 脚本独立使用。
         _CACHE_MAX_ENTRIES = int(os.environ.get("RAG_EMBEDDING_CACHE_MAX_ENTRIES", "20000"))
@@ -5767,7 +5832,8 @@ def node_generate_embeddings(ctx: dict):
         print(f"    └─ Embedding cache ready: backend={_store.backend}, {_store.count()} entries")
 
         def _cache_key(text):
-            return hashlib.md5(f"{embedding_model}_{text}".encode("utf-8")).hexdigest()
+            return hashlib.md5(
+                f"{embedding_model}_{embedding_dim}_{text}".encode("utf-8")).hexdigest()
 
         # 分离 cache hit / miss（一次批量点查，dense+sparse 两键族）
         cache_hits = 0
@@ -5957,6 +6023,16 @@ def node_generate_embeddings(ctx: dict):
             print(f"    └─ {len(image_chunks)} image chunks embedded via text-embedding-v4 (visual_summary text, unified path)")
 
         print(f"    └─ Completed real embeddings (model={embedding_model}, dim={embedding_dim}).")
+
+        # P2-8（盲区审计）：真实嵌入成功 → UPSERT RDS 契约行（embedding_model/dimension），
+        # serving 启动时据此比对两平面模型配置（HA3 文档无模型戳，schema 加字段须整表重建，
+        # user-gated）。fail-open：写失败/schema/018 未 apply 绝不影响摄取主流程；simulate
+        # 分支不写（假向量没有契约意义）。
+        try:
+            from opensearch_pipeline.runtime_contract import upsert_embedding_contract
+            upsert_embedding_contract(embedding_model, embedding_dim)
+        except Exception as _ce:
+            print(f"    ⚠️ embedding 契约行写入失败（fail-open）: {_ce}")
 
     ctx["embedded_chunks"] = chunks
 
@@ -6693,12 +6769,21 @@ def node_update_index_status(ctx: dict):
                 # If there are failed doc versions, update their document_version status to 'FAILED'
                 if failed_doc_versions:
                     for doc_id, ver in failed_doc_versions:
+                        # CAS（盲区审计 P2-2 同款）：只允许 PROCESSING→FAILED——控制台中途置
+                        # PENDING_DELETE 的删除握手不被覆盖（覆盖成 FAILED 会让下一批 loader
+                        # 重新认领并把受限文档以旧 permission 重推 HA3）。
                         cursor.execute(f"""
                             UPDATE document_version
                             SET index_status = '{DocVersionIndexStatus.FAILED}'
                             WHERE doc_id = %s AND version_no = %s
+                              AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                         """, (doc_id, ver))
-                        print(f"    ├─ RDS: Updated document_version status for {doc_id} v{ver} to 'FAILED' due to indexing failures")
+                        # 测试桩 cursor 可能无 int rowcount → 按已更新打印（既有行为）
+                        _f_rc = getattr(cursor, "rowcount", None)
+                        if not isinstance(_f_rc, int) or _f_rc:
+                            print(f"    ├─ RDS: Updated document_version status for {doc_id} v{ver} to 'FAILED' due to indexing failures")
+                        else:
+                            print(f"    ├─ ⚠️ {doc_id} v{ver} FAILED 收尾被跳过（已非 PROCESSING，保留现状态）")
 
                 conn.commit()
             print(f"    └─ Updated {len(batches)} opensearch_bulk_job and {chunks_count} chunk_meta records in RDS.")

@@ -241,6 +241,30 @@ def test_embedding_store_falls_back_to_memory_on_bad_path(tmp_path):
     assert store.get_many(["k"]) == {"k": [1.0]}
 
 
+def test_embedding_store_oss_mirror_key_namespaced(tmp_path, monkeypatch):
+    """P2-9(2)：OSS 镜像对象键按 模型+维度 命名空间化——改维/换模型后不再 push/pull 同一
+    对象（last-writer-wins 互覆盖）。旧共享对象留在原 key 不删，新命名空间冷启动即可。"""
+    from opensearch_pipeline.config import get_config
+    from opensearch_pipeline.embedding_cache import (
+        OSS_MIRROR_KEY as LEGACY_SHARED_KEY,
+        EmbeddingCacheStore,
+    )
+    config = get_config()
+    monkeypatch.setattr(config.embedding, "model", "text-embedding-v4")
+    monkeypatch.setattr(config.embedding, "dimension", 1024)
+    s1 = EmbeddingCacheStore(str(tmp_path / "a.sqlite3"))
+    assert "text-embedding-v4" in s1.OSS_MIRROR_KEY and "1024" in s1.OSS_MIRROR_KEY
+    assert s1.OSS_MIRROR_KEY != LEGACY_SHARED_KEY, "不得再落在历史共享对象上"
+
+    monkeypatch.setattr(config.embedding, "dimension", 512)
+    s2 = EmbeddingCacheStore(str(tmp_path / "b.sqlite3"))
+    assert "512" in s2.OSS_MIRROR_KEY
+    assert s2.OSS_MIRROR_KEY != s1.OSS_MIRROR_KEY, "不同维度必须各占镜像对象"
+
+    # 类属性兜底值保持历史共享键（fail-open 回退 + VLM store 基类不受影响）
+    assert EmbeddingCacheStore.OSS_MIRROR_KEY == LEGACY_SHARED_KEY
+
+
 # ─── C#27 VLM 缓存 OSS 上传降频 ─────────────────────────────────────────────
 
 def test_vlm_cache_oss_sync_throttled(monkeypatch, tmp_path):

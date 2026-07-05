@@ -15,14 +15,20 @@ embedding_cache.py — 摄取侧 embedding 持久缓存（SQLite KV，perf#18/#1
   · 进程级单例（get_embedding_cache）——drain 循环同进程反复进 node 只打开一次；
   · 首次打开自动从存量 embedding_cache.json 迁移（仅当 sqlite 为空；JSON 原样保留，
     tests/eval 脚本仍可独立读写它——两边都是 advisory 缓存，允许分叉）；
-  · OSS 镜像（processing/cache/embedding_cache.sqlite3，默认开，RAG_EMBED_CACHE_OSS_MIRROR=false
-    关闭）：打开时本地缺文件则从 OSS 拉，finalize 且本次有增量时 checkpoint 后整文件推回——
-    serverless 跨运行复用已算 embedding。simulate 模式经 clients._get_oss_bucket 的 is_sim
-    短路，绝不触网。
+  · OSS 镜像（默认开，RAG_EMBED_CACHE_OSS_MIRROR=false 关闭）：打开时本地缺文件则从
+    OSS 拉，finalize 且本次有增量时 checkpoint 后整文件推回——serverless 跨运行复用已算
+    embedding。simulate 模式经 clients._get_oss_bucket 的 is_sim 短路，绝不触网。
+    镜像对象键按 模型+维度 命名空间化（P2-9(2)，2026-07-05）：
+    processing/cache/embedding_cache.{model}_{dim}.sqlite3——此前单对象
+    （processing/cache/embedding_cache.sqlite3）跨 模型/维度 共享，换维后互相推拉/覆盖。
+    旧共享对象留在原 key 不删（新命名空间首拉不到 = fail-open 冷启动）。
 
-键/值契约与旧 JSON 完全一致（调用方零迁移）：
-  key   = md5(f"{model}_{text}")，sparse 条目前缀 "sp_"
+键/值契约（P2-9(1)，2026-07-05 起键含 dimension——v4 Matryoshka 多维下与查询侧
+retriever LRU 键 (query, model, dim) 对齐，改维不再静默命中旧维向量）：
+  key   = md5(f"{model}_{dimension}_{text}")，sparse 条目前缀 "sp_"
   value = dense: List[float]；sparse: {"indices": [...], "values": [...]}（JSON 编码存储）
+  旧格式 md5(f"{model}_{text}") 的存量条目（含 legacy JSON 迁移进来的）整体 miss，
+  等价冷启动；键对 store 不透明，迁移/镜像路径不受键格式变化影响，占位条目由容量淘汰回收。
 
 任何 SQLite/文件系统故障 → 退化为进程内 dict（no-persist），绝不阻断 embedding 主流程
 （graceful degradation 项目惯例）。
@@ -37,12 +43,33 @@ EmbeddingCacheStore 的对外行为（SQL 形态、打印、退化路径）逐�
 import json
 import logging
 import os
+import re
 import threading
 from typing import Dict, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
+# 未命名空间的历史镜像键（P2-9(2) 之前的单共享对象）。保留常量：旧对象留在原 key 不删，
+# 且任何异常下作为兜底键（advisory 缓存，宁可退回旧共享对象也不阻断打开）。
 OSS_MIRROR_KEY = "processing/cache/embedding_cache.sqlite3"
+
+
+def _namespaced_mirror_key() -> str:
+    """P2-9(2)：OSS 镜像对象键按 模型+维度 命名空间化。
+
+    此前单对象跨 模型/维度 共享：改 RAG_EMBEDDING_DIMENSION（v4 Matryoshka 多维）或换
+    embedding 模型后，不同配置的运行互相 push/pull 同一 sqlite 镜像。键含 dimension 后
+    （见 pipeline_nodes._cache_key）条目本身不会混维命中，但镜像仍会被 last-writer-wins
+    整文件覆盖、丢掉对方的暖缓存——按配置分对象根治。任何失败回退历史共享键（fail-open）。
+    """
+    try:
+        from opensearch_pipeline.config import get_config
+        emb = get_config().embedding
+        model = re.sub(r"[^A-Za-z0-9._-]", "-", str(emb.model))
+        return f"processing/cache/embedding_cache.{model}_{int(emb.dimension)}.sqlite3"
+    except Exception as e:
+        logger.warning("embedding cache 镜像键命名空间化失败，回退共享键: %s", e)
+        return OSS_MIRROR_KEY
 
 
 class SqliteKVStore:
@@ -275,13 +302,20 @@ class SqliteKVStore:
 
 
 class EmbeddingCacheStore(SqliteKVStore):
-    """embedding 专用 store：表名/JSON/镜像键与 perf#18 落地时逐字节一致。"""
+    """embedding 专用 store：表名/JSON 与 perf#18 落地时逐字节一致；
+    镜像键自 P2-9(2) 起按 模型+维度 命名空间化（实例属性覆盖类属性兜底值）。"""
 
     TABLE = "embedding_cache"
     LEGACY_JSON_BASENAME = "embedding_cache.json"
     OSS_MIRROR_KEY = OSS_MIRROR_KEY
     MIRROR_ENV = "RAG_EMBED_CACHE_OSS_MIRROR"
     LABEL = "embedding cache"
+
+    def __init__(self, path: str):
+        # 必须先于 super().__init__：基类构造内的 _pull_oss_mirror_if_absent 就会读
+        # self.OSS_MIRROR_KEY。实例属性遮蔽类属性，VLM store（共用基类）不受影响。
+        self.OSS_MIRROR_KEY = _namespaced_mirror_key()
+        super().__init__(path)
 
 
 # ── 进程级单例（perf#19：drain 循环同进程反复进 node 只打开/迁移一次）────────────

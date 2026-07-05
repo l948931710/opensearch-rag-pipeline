@@ -44,19 +44,27 @@ def _loader_fetch_concurrency() -> int:
         return 1
 
 
-def run_stage(stage: int, bizdate: str, simulate: bool):
-    """根据 stage 和业务日期运行相应的 DAG。"""
+def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
+    """根据 stage 和业务日期运行相应的 DAG。
+
+    cost_breaker: 可选注入的运行级成本熔断器（P2-10）。drain 循环（run_stage_drained）
+        在循环外建一次并逐批传入，让 run_budget_rmb 覆盖整个 drain——此前每批新建实例
+        把 _run_total_rmb 归零，聚合花费上界=批数×预算。None（单批直调/模拟）时自建，
+        保持既有行为不变。
+    """
     config = get_config()
-    
+
     # 强制将业务日期覆盖到环境变量，以便底层节点代码能够正确感知
     os.environ["RAG_BIZDATE"] = bizdate
     print(f"[Orchestrator] Starting Stage {stage} for business date: {bizdate}")
     print(f"[Orchestrator] Operating Mode: {'SIMULATION' if simulate else 'PRODUCTION'}")
-    
-    # 运行级成本熔断器（VLM 版面重建用）。一次 DataWorks 运行一个实例 → 单次运行累计预算。
+
+    # 运行级成本熔断器（VLM 版面重建用）。一次 DataWorks 运行一个实例 → 单次运行累计预算
+    # （drain 场景由 run_stage_drained 注入共享实例，跨批累计）。
     # 默认 RAG_REBUILD_ENABLED=false 时熔断器为 no-op，不影响现有行为。
-    from opensearch_pipeline.extraction.cost_breaker import CostBreaker
-    cost_breaker = CostBreaker(config)
+    if cost_breaker is None:
+        from opensearch_pipeline.extraction.cost_breaker import CostBreaker
+        cost_breaker = CostBreaker(config)
 
     # 构造运行上下文
     ctx = {
@@ -323,6 +331,10 @@ def run_stage(stage: int, bizdate: str, simulate: bool):
                             # step_card / 图片绑定结构静默丢失。filename 从未写入 canonical JSON，用 RDS
                             # title 兜底供 DAG2 回退分类器（正常路径有 xlsx_layout_type 即不回退）。
                             "xlsx_layout_type": content_json.get("xlsx_layout_type"),
+                            # P2-32：VLM degraded 兜底图片数同样跨 stage 边界回读——stage-2 的
+                            # node_write_chunk_meta 据此把文档收尾改走 NEEDS_REVIEW（不 DONE），
+                            # 丢弃它 = degraded 标志在 DAG1→DAG2 边界静默蒸发、文档照样 INDEXED 终态。
+                            "vlm_degraded_count": content_json.get("vlm_degraded_count", 0),
                             "filename": content_json.get("filename") or title,
                             "canonical_status": "DONE",
                             "canonical_key": canonical_json_key,
@@ -669,6 +681,15 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         run_stage(stage, bizdate, simulate)
         return run_metrics
 
+    # P2-10：drain 全程共享一个运行级成本熔断器。此前每批 run_stage 内部新建实例，
+    # __init__ 把 _run_total_rmb 归零 → run_budget_rmb 门每批重置，整个 drain 的聚合
+    # 花费上界被击穿为 批数×预算。CostBreaker 线程安全（内部 Lock）、无落库副作用
+    # （quarantine 由 gate 调用方触发且按 doc 幂等）；per-doc 预留台账跨批保留正是
+    # 期望语义（同一 doc 的 rebuild+refine 共享 doc_budget），熔断告警也收敛为
+    # 每次 drain 至多一次。
+    from opensearch_pipeline.extraction.cost_breaker import CostBreaker
+    shared_cost_breaker = CostBreaker(get_config())
+
     if stage == 3:
         # ── 搁浅版本对账：上一次部分失败可能留下「新版本已全量 INDEXED 但旧版本仍 active」
         # 的文档（双版本同时被检索）。必须在 drain 循环之前跑：这类文档没有待处理 chunk，
@@ -765,7 +786,7 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
             )
         print(f"[Orchestrator] Stage {stage} drain batch #{iteration} — {remaining} rows pending...")
         prev_remaining = remaining
-        _batch_ctx = run_stage(stage, bizdate, simulate)
+        _batch_ctx = run_stage(stage, bizdate, simulate, cost_breaker=shared_cost_breaker)
         accumulate_metrics(run_metrics, extract_run_metrics(_batch_ctx))
 
     return run_metrics

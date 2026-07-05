@@ -611,7 +611,7 @@ def test_i_drain_loop_raises_on_no_progress():
 
     calls = {"run_stage": 0}
 
-    def fake_run_stage(stage, bizdate, simulate):
+    def fake_run_stage(stage, bizdate, simulate, cost_breaker=None):
         calls["run_stage"] += 1  # no-op: never drains the queue
 
     # remaining stays > 0 and never decreases → no-progress guard
@@ -1160,8 +1160,12 @@ def _mk_embed_chunk(cid, text, status="NOT_STARTED", vec=None):
 
 
 def _embed_cache_key(model, text):
+    # P2-9：与 node_generate_embeddings._cache_key 同构——键含 dimension（读当前 config，
+    # 测试内 monkeypatch config.embedding.dimension 即可切维）。
     import hashlib
-    return hashlib.md5(f"{model}_{text}".encode("utf-8")).hexdigest()
+    from opensearch_pipeline.config import get_config
+    dim = get_config().embedding.dimension
+    return hashlib.md5(f"{model}_{dim}_{text}".encode("utf-8")).hexdigest()
 
 
 # Test K4: a partial Gemini batchEmbedContents response (fewer embeddings than requests)
@@ -1302,6 +1306,60 @@ def test_k5b_dense_hit_without_sparse_is_miss_on_dashscope(monkeypatch):
     assert c_no_sp.sparse_vector_indices == [7], (
         "re-embed must yield a sparse vector so the doc is never pushed sparse-less"
     )
+
+
+# Test K5c (P2-9): 摄取侧缓存键必须含 dimension——text-embedding-v4 支持 Matryoshka 多维，
+# 改 RAG_EMBEDDING_DIMENSION 后旧维向量绝不能再命中（否则静默混维推上 HA3）。查询侧
+# （retriever.get_query_embedding）的 LRU 键早已含 dim，本测试钉死摄取侧对齐。
+def test_k5c_ingest_cache_key_includes_dimension(monkeypatch):
+    from opensearch_pipeline.pipeline_nodes import node_generate_embeddings
+    from opensearch_pipeline.config import get_config
+
+    model = "text-embedding-v4"
+    config = get_config()
+    monkeypatch.setattr(config.embedding, "api_key", "test-key")
+    monkeypatch.setattr(config.embedding, "model", model)
+    monkeypatch.setattr(config.embedding, "api_base_url",
+                        "https://dashscope.aliyuncs.com/api/v1")
+    monkeypatch.setattr(config.embedding, "batch_size", 10)
+    monkeypatch.setattr(config.embedding, "dimension", 1024)
+
+    text = "dimension-keyed text"
+    ck_1024 = _embed_cache_key(model, text)   # helper 读当前 config，此刻 dim=1024
+    store = _FakeCacheStore(preload={
+        ck_1024: [0.5] * 8,
+        f"sp_{ck_1024}": {"indices": [1], "values": [0.9]},
+    })
+
+    # 同维（1024）→ 纯缓存命中，零 API 调用
+    c_same = _mk_embed_chunk("c_dim_same", text)
+    with patch("opensearch_pipeline.embedding_cache.get_embedding_cache", return_value=store), \
+         patch("opensearch_pipeline.embedding_client._http_post") as mock_post:
+        node_generate_embeddings({"valid_chunks": [c_same], "simulate_api": False})
+    mock_post.assert_not_called()
+    assert c_same.embedding_status == "DONE"
+    assert c_same.embedding_vector == [0.5] * 8
+
+    # 换维（512）→ 同一文本必须 miss 并重嵌，绝不能吃到 1024 维的旧向量
+    monkeypatch.setattr(config.embedding, "dimension", 512)
+    ck_512 = _embed_cache_key(model, text)
+    assert ck_512 != ck_1024, "键必须随 dimension 变化"
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"output": {"embeddings": [{
+        "text_index": 0, "embedding": [0.3] * 8,
+        "sparse_embedding": [{"index": 2, "value": 0.4}],
+    }]}}
+    c_other = _mk_embed_chunk("c_dim_other", text)
+    with patch("opensearch_pipeline.embedding_cache.get_embedding_cache", return_value=store), \
+         patch("opensearch_pipeline.embedding_client._http_post", return_value=resp) as mock_post:
+        node_generate_embeddings({"valid_chunks": [c_other], "simulate_api": False})
+    mock_post.assert_called_once()   # 旧维条目不命中 → 触发真实重嵌
+    assert c_other.embedding_vector == [0.3] * 8
+    # 两个维度的条目在缓存里各占其键、互不覆盖
+    assert store.data[ck_1024] == [0.5] * 8
+    assert store.data[ck_512] == [0.3] * 8
 
 
 # Test K6 (belt-and-braces): even if some future path produces DONE + embedding_vector=None,

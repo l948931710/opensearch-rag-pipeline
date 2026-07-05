@@ -22,7 +22,7 @@ USE fuling_operation;
 
 CREATE TABLE IF NOT EXISTS qa_admission_reject (
     stat_date    DATE        NOT NULL COMMENT '北京业务日（rate_limiter 日界同源）',
-    reason       VARCHAR(32) NOT NULL COMMENT '拒绝原因机器码：global_cap/per_min/per_day/thinking_quota/thinking_anon/thinking_off/aux_per_min',
+    reason       VARCHAR(32) NOT NULL COMMENT '拒绝原因机器码：global_cap/per_min/per_day/thinking_quota/thinking_anon/thinking_off/aux_per_min；__ 前缀=非拒绝行（__admitted__=当日准入量持久化，P2-11 重启回种）',
     reject_count INT UNSIGNED NOT NULL DEFAULT 0,
     updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (stat_date, reason)

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -286,11 +287,147 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
     return {"rows": rows, "truncated": truncated}
 
 
+def _rds_batch_width() -> int:
+    """P2-30：RDS↔HA3 对齐分桶宽度（服务端 id-range 分页）。RAG_RECONCILE_RDS_BATCH，默认 5000。"""
+    try:
+        return max(_DEFAULT_BUCKET, int(os.environ.get("RAG_RECONCILE_RDS_BATCH", "5000")))
+    except (TypeError, ValueError):
+        return 5000
+
+
+def _scan_from_min() -> bool:
+    """P2-29 起点优化开关（默认关）。只对 DIRECTION 1（RDS→HA3 缺失/召回丢失）安全：
+    HA3 孤儿 PK 恰恰是 DELETE→INSERT churn 后【低于】当前 MIN(chunk_meta.id) 的旧 id，
+    从 MIN 起扫会漏掉低位 stale/orphan 检出（报告会标 stale_scan_curtailed）。"""
+    return os.environ.get("RAG_RECONCILE_SCAN_FROM_MIN", "").lower() in ("1", "true", "yes")
+
+
+def _duration_alert_threshold_s() -> float:
+    """P2-29：全 id 空间扫描时长告警阈值（秒）。RAG_RECONCILE_DURATION_ALERT_S，默认 1800；
+    <=0 停用。id 空间随重切 churn 只增不减（MAX(id) 永增），超阈值说明扫描成本已失控。"""
+    try:
+        return float(os.environ.get("RAG_RECONCILE_DURATION_ALERT_S", "1800"))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _alert_on_duration(check: str, elapsed_s: float, buckets: int) -> None:
+    """扫描耗时超阈值 → 一条 warning 级 ops 告警（fail-open；send_ops_alert 自身受配置门控）。"""
+    try:
+        from opensearch_pipeline.alerting import send_ops_alert
+        send_ops_alert(
+            f"reconcile 扫描超时长阈值（{check}）",
+            f"elapsed={elapsed_s:.0f}s > 阈值 {_duration_alert_threshold_s():.0f}s；"
+            f"buckets_scanned={buckets}。id 空间随重切 churn 单调增长（MAX(id) 永增）——"
+            f"考虑清理孤儿收敛 id 空间，或调大 RAG_RECONCILE_DURATION_ALERT_S。",
+            severity="warning", dedup_key=f"reconcile:duration:{check}")
+    except Exception:  # noqa: BLE001 — 告警失败绝不影响对账本体
+        logger.warning("reconcile: duration-alert dispatch failed (non-fatal)", exc_info=True)
+
+
+class _ParityAccumulator:
+    """P2-30 流式 parity 累积器：与 compute_parity 同语义，但按对齐 id 桶逐桶喂入、逐桶释放。
+
+    等价性依赖两个不变量：
+      1. RDS 桶与 HA3 桶共用同一 [start, end) id 区间——pk 数值恒等、跨桶不可能互相匹配，
+         故 rds_inactive 子类的「pk 是否存在于 chunk_meta」可用桶内 id 集合等价判定；
+      2. dup 子类（chunk_id 是否 active）与 vanished/orphan 判定（每文档 active 计数 vs
+         HA3 kept 计数）是跨桶属性，由构造时传入的全局【轻量】真相承担——只驻留 int 集合 /
+         chunk_id 字符串集合 / 每文档 Counter，绝不驻留整行 dict（那正是 OOM 的内存大头）。
+    峰值内存 O(单桶行数) + O(active 轻量集合)。compute_parity 保留为纯函数单测核心，
+    tests/test_reconcile_scan_metrics.py 用同一 fixture 断言两者输出逐键一致。
+    """
+
+    def __init__(self, active_ids: set, active_chunkids: set,
+                 active_doc_counts: Counter):
+        self._active_ids = active_ids
+        self._active_chunkids = active_chunkids
+        self._active_doc_counts = active_doc_counts
+        self._rds_rows = 0
+        self._rds_active_indexed = 0
+        self._ha3_pks = 0
+        self._missing: List[Dict[str, Any]] = []
+        self._stale_count = 0
+        self._stale_sample: List[Dict[str, Any]] = []
+        self._stale_subtypes: Counter = Counter()
+        self._ha3_kept_by_doc: Counter = Counter()
+        self._ha3_docs: set = set()
+
+    def add_bucket(self, rds_rows: List[Dict[str, Any]],
+                   ha3_rows: Dict[int, Dict[str, Any]]) -> None:
+        """喂入一个对齐 id 桶的 RDS 行 + HA3 行；调用后两者即可释放。"""
+        self._rds_rows += len(rds_rows)
+        bucket_rds_ids = set()
+        for r in rds_rows:
+            pk = int(r["id"])
+            bucket_rds_ids.add(pk)
+            if r.get("is_active") == 1 and r.get("index_status") == ChunkIndexStatus.INDEXED:
+                self._rds_active_indexed += 1
+                if pk not in ha3_rows:   # DIRECTION 1：召回丢失
+                    self._missing.append({
+                        "id": pk, "chunk_id": r["chunk_id"], "doc_id": r["doc_id"],
+                        "version_no": r.get("version_no"), "chunk_type": r.get("chunk_type")})
+        self._ha3_pks += len(ha3_rows)
+        for pk, h in ha3_rows.items():
+            self._ha3_docs.add(h.get("doc_id"))
+            if pk in self._active_ids:
+                self._ha3_kept_by_doc[h.get("doc_id")] += 1
+                continue
+            cid = h.get("chunk_id", "")
+            subtype = ("dup" if cid in self._active_chunkids
+                       else "rds_inactive" if pk in bucket_rds_ids
+                       else "orphan_chunkid")
+            self._stale_count += 1
+            self._stale_subtypes[subtype] += 1
+            if len(self._stale_sample) < 50:
+                self._stale_sample.append({"id": pk, "chunk_id": cid, "doc_id": h.get("doc_id"),
+                                           "chunk_type": h.get("chunk_type"), "subtype": subtype})
+
+    def finalize(self) -> Dict[str, Any]:
+        """汇总为与 compute_parity 完全同构的报告 dict。"""
+        vanished = [
+            {"doc_id": d, "rds_active": n, "ha3_kept": self._ha3_kept_by_doc.get(d, 0)}
+            for d, n in self._active_doc_counts.items()
+            if n and self._ha3_kept_by_doc.get(d, 0) == 0
+        ]
+        orphan_docs = sorted(self._ha3_docs - set(self._active_doc_counts))
+        ok = not self._missing and not vanished
+        return {
+            "ok": ok,
+            "counts": {
+                "rds_rows": self._rds_rows,
+                "rds_active": len(self._active_ids),
+                "rds_active_indexed": self._rds_active_indexed,
+                "ha3_pks": self._ha3_pks,
+                "rds_active_missing": len(self._missing),
+                "ha3_stale": self._stale_count,
+                "vanished_docs": len(vanished),
+                "orphan_docs": len(orphan_docs),
+            },
+            "stale_subtypes": dict(self._stale_subtypes),
+            "rds_active_missing": self._missing,
+            "vanished_docs": vanished,
+            "ha3_stale_sample": self._stale_sample,
+            "orphan_docs_sample": orphan_docs[:50],
+        }
+
+
 def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
                      bucket: int = _DEFAULT_BUCKET) -> Dict[str, Any]:
     """Top-level CS3 reconcile: read RDS (read-only) + scan HA3 + diff. Fail-open, simulate-safe.
 
-    Returns the compute_parity report enriched with `complete` (False if any HA3 bucket truncated)
+    P2-30（流式分桶）：不再整表 fetchall + 全量 HA3 map 同持内存——RDS 侧按 id 区间服务端
+    分批 SELECT（宽度 RAG_RECONCILE_RDS_BATCH，默认 5000），HA3 侧按同一区间桶扫，对齐桶
+    逐桶 diff、桶用完即释放。报告结构与旧实现一致（下游/测试不破），另附
+    scan_lo / buckets_scanned / elapsed_s / rds_batch。
+
+    P2-29（扫描界与时长告警）：起点默认仍从 0 全扫——本扫描同时负责 DIRECTION 2 的
+    HA3 stale/orphan 检出，而孤儿 PK 恰恰是重切 churn 后低于当前 MIN(chunk_meta.id) 的旧 id，
+    从 MIN 起扫会漏检；只关心召回丢失方向时可设 RAG_RECONCILE_SCAN_FROM_MIN=true
+    （报告标 stale_scan_curtailed）。耗时超 RAG_RECONCILE_DURATION_ALERT_S（默认 1800s）
+    → 一条 warning 级 ops 告警。
+
+    Returns the parity report enriched with `complete` (False if any HA3 bucket truncated)
     and, on failure, `error`. Never raises. When alert=True and drift (recall-loss) is detected — or
     the run errors — fires a single OBS-4 ops alert (itself fail-open / config-gated).
     """
@@ -301,33 +438,90 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
         logger.info("reconcile: simulate mode → skipped no-op")
         return {"ok": True, "skipped": "simulate", "complete": True, "counts": {}}
 
+    t0 = time.monotonic()
+    buckets_scanned = 0
+    conn = None
     try:
         from opensearch_pipeline.retriever import _get_ha3_client
 
+        step = _rds_batch_width()
         conn = _rds_conn()
-        try:
-            with conn.cursor() as c:
-                c.execute(f"""SELECT id, chunk_id, doc_id, version_no, is_active,
-                                    index_status, chunk_type
-                             FROM {_kb_db()}.chunk_meta""")
-                rds_rows = _as_dict_rows(c.fetchall(), _RDS_COLS)
-        finally:
-            conn.close()
+        with conn.cursor() as c:
+            # P2-29：上下界改服务端聚合（旧实现整表 fetchall 后在 Python 求 max）。
+            c.execute(f"SELECT MIN(id), MAX(id) FROM {_kb_db()}.chunk_meta")
+            row = c.fetchone() or (None, None)
+            vals = list(row.values()) if isinstance(row, dict) else list(row)
+            min_id = int(vals[0] or 0)
+            max_id = int(vals[1] or 0)
 
-        scan_hi = hi if hi is not None else (
-            (max((int(r["id"]) for r in rds_rows), default=0)) + _HI_HEADROOM)
+            # 跨桶全局轻量 active 真相（见 _ParityAccumulator 不变量 2）：同样按 id 区间分批读，
+            # 只积累集合/计数——峰值不随全表行数持整行 dict。
+            active_ids: set = set()
+            active_chunkids: set = set()
+            active_doc_counts: Counter = Counter()
+            p = min_id
+            while max_id and p <= max_id:
+                c.execute(
+                    f"SELECT id, chunk_id, doc_id FROM {_kb_db()}.chunk_meta"
+                    f" WHERE is_active=1 AND id>=%s AND id<%s", (p, p + step))
+                for r in _as_dict_rows(c.fetchall(), ("id", "chunk_id", "doc_id")):
+                    active_ids.add(int(r["id"]))
+                    active_chunkids.add(r["chunk_id"])
+                    active_doc_counts[r["doc_id"]] += 1
+                p += step
+
+        scan_hi = hi if hi is not None else (max_id + _HI_HEADROOM)
+        scan_lo = min_id if (_scan_from_min() and min_id) else 0
+
         cli = _get_ha3_client()
-        # perf F#51：并发扫桶时每线程经 _new_ha3_client 建独立 client（默认并发 4，只读）。
-        scan = _scan_ha3_pks(cli, cfg.alibaba_vector.table_name, scan_hi, bucket=bucket,
-                             client_factory=_new_ha3_client)
+        acc = _ParityAccumulator(active_ids, active_chunkids, active_doc_counts)
+        truncated: List[int] = []
 
-        report = compute_parity(rds_rows, scan["rows"])
-        report["complete"] = not scan["truncated"]
-        report["truncated_buckets"] = scan["truncated"]
+        start = scan_lo
+        while start < scan_hi:
+            end = min(start + step, scan_hi)
+            bucket_rds: List[Dict[str, Any]] = []
+            if max_id and start <= max_id and end > min_id:   # 与表 id 域有交集才查 RDS
+                with conn.cursor() as c:
+                    c.execute(
+                        f"""SELECT id, chunk_id, doc_id, version_no, is_active,
+                                  index_status, chunk_type
+                             FROM {_kb_db()}.chunk_meta WHERE id>=%s AND id<%s""",
+                        (start, end))
+                    bucket_rds = _as_dict_rows(c.fetchall(), _RDS_COLS)
+            # perf F#51：并发扫桶时每线程经 _new_ha3_client 建独立 client（默认并发 4，只读）。
+            scan = _scan_ha3_pks(cli, cfg.alibaba_vector.table_name, end, lo=start,
+                                 bucket=bucket, client_factory=_new_ha3_client)
+            acc.add_bucket(bucket_rds, scan["rows"])
+            truncated.extend(scan["truncated"])
+            buckets_scanned += len(range(start, end, bucket))
+            start = end
+
+        report = acc.finalize()
+        report["complete"] = not truncated
+        report["truncated_buckets"] = truncated
         report["scan_hi"] = scan_hi
+        report["scan_lo"] = scan_lo
+        if scan_lo:
+            report["stale_scan_curtailed"] = True   # 低于 min_id 的 stale/orphan 本轮未检
+        report["rds_batch"] = step
     except Exception as e:  # noqa: BLE001 — fail-open by contract
         logger.exception("reconcile: parity check failed")
         report = {"ok": False, "complete": False, "error": f"{type(e).__name__}: {e}", "counts": {}}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # P2-29：耗时/桶数进报告；超阈值一条 warning 告警（不依赖 --alert，fail-open）。
+    elapsed = time.monotonic() - t0
+    report["elapsed_s"] = round(elapsed, 3)
+    report["buckets_scanned"] = buckets_scanned
+    thr = _duration_alert_threshold_s()
+    if thr > 0 and elapsed > thr:
+        _alert_on_duration("rds-ha3-parity", elapsed, buckets_scanned)
 
     if alert and (not report.get("ok") or report.get("error")):
         _alert_on_drift(report)

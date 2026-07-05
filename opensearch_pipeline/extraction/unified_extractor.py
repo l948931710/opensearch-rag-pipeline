@@ -628,7 +628,7 @@ class UnifiedExtractor:
             local_path, _safe_image_output_dir(task), max_pages=20)
         raw_assets, stitch_warnings = _stitch_pdf_strip_assets(raw_assets)
         warnings.extend(stitch_warnings)
-        assets, img_blocks = self._process_embedded_images(raw_assets, task)
+        assets, img_blocks, vlm_degraded = self._process_embedded_images(raw_assets, task)
         if img_blocks:
             blocks.extend(img_blocks)
             flat_text = blocks_to_text(blocks)
@@ -653,6 +653,7 @@ class UnifiedExtractor:
             page_count=page_count,
             warnings=warnings,
             assets=assets,
+            vlm_degraded_count=vlm_degraded,
         )
         # Stash 本地路径，供 _pages_needing_ocr 在 page_count<=0 时
         # 走保守 fallback 重拿真实页数（不暴露成 dataclass field 以避免序列化噪声）
@@ -780,7 +781,7 @@ class UnifiedExtractor:
         except Exception as _e:
             print(f"      ⚠️ [strip-stitch] skipped (non-fatal): {_e}")
 
-        assets, img_blocks = self._process_embedded_images(
+        assets, img_blocks, vlm_degraded = self._process_embedded_images(
             exported_images, task,
         )
         # 不再 extend img_blocks — image_ref 已内联在 blocks 中
@@ -807,6 +808,7 @@ class UnifiedExtractor:
             blocks=blocks,
             warnings=warnings,
             assets=assets,
+            vlm_degraded_count=vlm_degraded,
         )
 
     # ── XLSX / XLS ──
@@ -1048,7 +1050,7 @@ class UnifiedExtractor:
         # 提取嵌入图片 → 三阶段过滤漏斗
         # perf#62：普通模式 wb 直接传给 extract_images_from_xlsx 复用，省第三次 zip 解包；
         # read_only / 加载失败时 _img_wb=None → 其内部照旧自行加载（graceful degradation）。
-        assets, img_blocks = self._process_embedded_images(
+        assets, img_blocks, vlm_degraded = self._process_embedded_images(
             extract_images_from_xlsx(local_path, _safe_image_output_dir(task),
                                      workbook=_img_wb),
             task,
@@ -1165,6 +1167,7 @@ class UnifiedExtractor:
             assets=assets,
             # 持久化 DAG1 的 layout 判定（用真实 task filename 分类），DAG2 直接消费，不再重分类。
             xlsx_layout_type=_layout_type,
+            vlm_degraded_count=vlm_degraded,
         )
 
     # ── PPTX ──
@@ -1323,7 +1326,7 @@ class UnifiedExtractor:
             warnings.append(f"Failed to extract PPTX text: {e}")
 
         # 提取嵌入图片 → 三阶段过滤漏斗
-        assets, img_blocks = self._process_embedded_images(
+        assets, img_blocks, vlm_degraded = self._process_embedded_images(
             extract_images_from_pptx(local_path, _safe_image_output_dir(task)),
             task,
         )
@@ -1346,6 +1349,7 @@ class UnifiedExtractor:
             page_count=slide_count,
             warnings=warnings,
             assets=assets,
+            vlm_degraded_count=vlm_degraded,
         )
 
     # ── Plain text / Markdown ──
@@ -1451,10 +1455,13 @@ class UnifiedExtractor:
             task: 当前文档的 task dict。
 
         Returns:
-            (assets, ocr_blocks): assets 列表和 ROUTE_TO_TEXT 产生的文本块列表。
+            (assets, ocr_blocks, vlm_degraded_count)：assets 列表、ROUTE_TO_TEXT 产生的
+            文本块列表、以及本文档拿到 VLM 降级兜底结论的图片数（P2-32：含 degraded 标记的
+            asset 张数 + 漏斗执行异常整张丢失的唯一图片数）。>0 时调用方经 ExtractionResult
+            → canonical → stage-2 收尾把文档落 NEEDS_REVIEW（不 DONE），供应商恢复后可定位重扫。
         """
         if not image_assets:
-            return [], []
+            return [], [], 0
 
         import hashlib
         import time
@@ -1487,7 +1494,7 @@ class UnifiedExtractor:
             print(f"      [Funnel 1] Pre-filtered: {discard_count} decorative, {len(candidates)} remaining")
 
         if not candidates:
-            return [], []
+            return [], [], 0
 
         # ── Phase 1.5: MD5 Hash 去重 + 跨文档缓存查询 ──
         vlm_cache = self._load_vlm_cache()
@@ -1588,6 +1595,11 @@ class UnifiedExtractor:
         # 合并结果：缓存命中 + 新处理
         hash_to_result = dict(hash_to_cached_result)  # 先放入缓存命中的
 
+        # P2-32：漏斗执行异常（OCR/VLM 供应商故障导致 process_image 整体 raise）→ 该唯一图片
+        # 完全没有结论、不进 assets——与 degraded 兜底同属「供应商降级」，计入文档级降级数，
+        # 使文档收尾走 NEEDS_REVIEW、供应商恢复后重扫可自愈（否则静默 INDEXED 终态无物重扫）。
+        funnel_exception_count = 0
+
         if need_vlm_hashes:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 future_to_hash = {}
@@ -1622,6 +1634,7 @@ class UnifiedExtractor:
                             }
                     except Exception as e:
                         rep = hash_to_representative[file_hash]
+                        funnel_exception_count += 1
                         print(f"      ⚠️ Image funnel failed for {rep.original_name}: {e}")
 
             # 处理完本文档后持久化缓存（simulate 不落盘，防 mock 污染共享缓存）
@@ -1649,6 +1662,7 @@ class UnifiedExtractor:
             x[0].original_name or "",
         ))
 
+        degraded_asset_count = 0
         for img_asset, funnel_res in all_results:
             status = funnel_res["status"]
 
@@ -1684,6 +1698,11 @@ class UnifiedExtractor:
                 asset_dict["annotation_num"] = img_asset.annotation_num
             if hasattr(img_asset, "annotation_label") and img_asset.annotation_label:
                 asset_dict["annotation_label"] = img_asset.annotation_label
+            # P2-32：VLM 降级兜底结论（占位 caption / 保守隔离）逐 asset 透传 + 计入文档级降级数
+            # （只在为真时落键，不膨胀 canonical JSON）。
+            if funnel_res.get("degraded"):
+                asset_dict["degraded"] = True
+                degraded_asset_count += 1
             assets.append(asset_dict)
 
             # ROUTE_TO_TEXT：追加 OCR 文本块（与 _extract_image 行为一致）
@@ -1715,7 +1734,14 @@ class UnifiedExtractor:
             print(f"      [img-funnel] ⚡ VLM calls={vlm_calls}, cache_hits={cache_hit_count}, "
                   f"dedup={dup_count}, time={elapsed:.1f}s ({avg_ms:.0f}ms/call, workers={max_workers})")
 
-        return assets, ocr_blocks
+        # P2-32：文档级降级数 = degraded asset 张数 + 漏斗异常整张丢失的唯一图片数。
+        vlm_degraded_count = degraded_asset_count + funnel_exception_count
+        if vlm_degraded_count:
+            print(f"      🚨 [img-funnel] {doc_id}: {vlm_degraded_count} 张图片为 VLM 降级兜底结论"
+                  f"（degraded assets={degraded_asset_count}, funnel exceptions="
+                  f"{funnel_exception_count}）→ 文档将收尾 NEEDS_REVIEW，供应商恢复后重扫自愈")
+
+        return assets, ocr_blocks, vlm_degraded_count
 
     # ── Image (direct OCR) ──
 
@@ -1756,6 +1782,9 @@ class UnifiedExtractor:
             "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
             "reason": funnel_res.get("reason", "")
         }]
+        # P2-32：独立图片文档的 VLM 降级兜底同样透传（与嵌入图 asset_dict 对齐）
+        if funnel_res.get("degraded"):
+            assets[0]["degraded"] = True
 
         # 根据漏斗决策构建块和全文
         blocks = []
@@ -1803,7 +1832,8 @@ class UnifiedExtractor:
             ocr_required=(status == "ROUTE_TO_TEXT"),
             ocr_status="DONE" if status == "ROUTE_TO_TEXT" else "NOT_REQUIRED",
             warnings=warnings,
-            assets=assets
+            assets=assets,
+            vlm_degraded_count=1 if funnel_res.get("degraded") else 0,
         )
 
 

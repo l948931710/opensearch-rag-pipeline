@@ -207,3 +207,40 @@ def test_thread_safety_record():
     with ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(lambda i: br.record(f"d{i}", est, True), range(n)))
     assert br.run_total_rmb == pytest.approx(n * 0.04)
+
+
+# ── P2-10: drain 循环共享同一 CostBreaker（run 预算跨批累加） ──────
+def test_drain_loop_shares_one_breaker_and_budget_accumulates(monkeypatch):
+    """run_stage_drained 必须在循环外建一次 CostBreaker 并逐批传给 run_stage——
+    此前每批 run_stage 内部新建实例把 _run_total_rmb 归零，run_budget_rmb 门每批
+    重置，整个 drain 的聚合花费上界被击穿为 批数×预算。本测试跑两批：每批预留
+    0.60 RMB（run 预算 1.00），第一批放行、第二批必须因跨批累计超支被拒。"""
+    from unittest.mock import patch
+
+    import opensearch_pipeline.dataworks_orchestrator as orch
+
+    cfg = make_cfg(run_budget_rmb=1.0, doc_budget_rmb=1.0, max_pages=1000)
+    # run_stage_drained 用 get_config() 构造共享熔断器；换成启用了 rebuild 的 stub
+    monkeypatch.setattr(orch, "get_config", lambda: cfg)
+
+    breakers, results = [], []
+
+    def fake_run_stage(stage, bizdate, simulate, cost_breaker=None):
+        assert isinstance(cost_breaker, CostBreaker), "drain 必须注入共享熔断器"
+        breakers.append(cost_breaker)
+        est = estimate_doc_cost("pdf", unit_count=15, cached_count=0, cfg=cfg)  # 0.60 RMB
+        allowed, _reason = cost_breaker.try_reserve(f"doc-batch{len(breakers)}", est)
+        results.append(allowed)
+        return {}
+
+    remaining = iter([2, 1, 0])  # 两批后排空（每批 -1，无 no-progress 触发）
+    with patch.object(orch, "_count_pending_rows", lambda stage: next(remaining)), \
+         patch.object(orch, "run_stage", fake_run_stage):
+        orch.run_stage_drained(stage=1, bizdate="20260705", simulate=False)
+
+    assert len(breakers) == 2
+    assert breakers[0] is breakers[1], "两批必须拿到同一个 CostBreaker 实例"
+    assert results == [True, False], (
+        "0.60 放行后，第二批 0.60+0.60 > 1.00 必须被运行级预算拒绝（旧行为每批归零会双双放行）"
+    )
+    assert breakers[0].run_total_rmb == pytest.approx(0.60)
