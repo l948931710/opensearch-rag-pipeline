@@ -91,8 +91,15 @@ def _percentile(sorted_vals: List[float], q: float) -> Optional[float]:
 
 def evaluate_slos(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> Dict[str, Any]:
     """Return {ok: bool, breaches: [{slo, threshold, value}]}. A None metric (no data) does NOT
-    breach — you can't violate an SLO with zero traffic."""
+    breach — you can't violate an SLO with zero traffic.
+
+    P1-1（盲区审计 2026-07-05）：global_cap 拒绝 > 0 无条件 breach——熔断触顶日全站对外
+    503，但被拒请求不落 qa_session_log，answer_rate 等既有指标只看得见触顶前的成功量；
+    没有这一条，宕机日在看板上是绿的。阈值恒 0：任何一次全局熔断拒绝都是事故级信号。"""
     breaches = []
+    rgc = metrics.get("rejected_global_cap")
+    if rgc:
+        breaches.append({"slo": "global_cap_rejected", "threshold": 0, "value": rgc})
     ar = metrics.get("answer_rate")
     if ar is not None and ar < thresholds["answer_rate_min"]:
         breaches.append({"slo": "answer_rate_min", "threshold": thresholds["answer_rate_min"], "value": ar})
@@ -109,13 +116,21 @@ def evaluate_slos(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> Dict
 
 
 def compute_daily_metrics(rows: List[Dict[str, Any]],
-                          thresholds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+                          thresholds: Optional[Dict[str, float]] = None,
+                          rejected: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """PURE: aggregate one day's qa_session_log rows → metric dict + SLO verdict. No I/O.
 
     Each row needs: answer_status, risk_blocked, latency_ms, top_score, user_id, session_id,
     conversation_type, opensearch_hit_count.
+
+    rejected: 当日限流拒绝聚合 {reason: count}（qa_admission_reject，P1-1）。被拒请求不在
+    rows 里（准入即 503，从不落 qa_session_log），这是唯一的 offered-load 补充来源；
+    global_cap > 0 → SLO breach（见 evaluate_slos）。既有比率指标（answer_rate 等）分母
+    保持"准入量"不变——per_min/per_day 拒绝是反滥用的正常工作，掺进分母会让一个扫描器
+    压垮 answer_rate 产生假告警；熔断日的"红"由 global_cap_rejected 专项 breach 保证。
     """
     thresholds = thresholds or _slo_thresholds()
+    rejected = rejected or {}
     total = len(rows)
     success = refusal = no_result = error = risk_blocked = single = group = 0
     latencies: List[float] = []
@@ -172,33 +187,74 @@ def compute_daily_metrics(rows: List[Dict[str, Any]],
         "answer_rate": round(success / total, 4) if total else None,
         "no_result_rate": round(no_result / total, 4) if total else None,
         "error_rate": round(error / total, 4) if total else None,
+        # P1-1：offered vs admitted —— 被拒量单列，不掺进上面比率的分母（docstring 论证）
+        "rejected_count": sum(int(v or 0) for v in rejected.values()),
+        "rejected_global_cap": int(rejected.get("global_cap", 0) or 0),
     }
+    metrics["offered_queries"] = total + metrics["rejected_count"]
     verdict = evaluate_slos(metrics, thresholds)
     metrics["slo_ok"] = 1 if verdict["ok"] else 0
     metrics["slo_breaches"] = verdict["breaches"]
     return metrics
 
 
+_BASE_METRIC_COLS = ["total_queries", "success_count", "refusal_count", "no_result_count",
+                     "error_count", "risk_blocked_count", "p50_latency_ms", "p95_latency_ms",
+                     "avg_top_score", "distinct_users", "distinct_sessions", "single_chat_count",
+                     "group_chat_count", "answer_rate", "no_result_rate", "error_rate", "slo_ok"]
+# schema/017 新列：生产未 apply 时写入报 1054 → 回退基础列集（拒绝量仍在 slo_breaches_json 里可见）
+_REJECT_METRIC_COLS = ["rejected_count", "rejected_global_cap"]
+
+
 def _upsert_daily(conn, metric_date: str, m: Dict[str, Any], tz_shift: int) -> None:
-    cols = ["total_queries", "success_count", "refusal_count", "no_result_count", "error_count",
-            "risk_blocked_count", "p50_latency_ms", "p95_latency_ms", "avg_top_score",
-            "distinct_users", "distinct_sessions", "single_chat_count", "group_chat_count",
-            "answer_rate", "no_result_rate", "error_rate", "slo_ok"]
-    vals = [m.get(c) for c in cols]
-    breaches_json = json.dumps(m.get("slo_breaches") or [], ensure_ascii=False)
-    set_clause = ", ".join(f"{c}=VALUES({c})" for c in cols) + \
-        ", slo_breaches_json=VALUES(slo_breaches_json), tz_shift_hours=VALUES(tz_shift_hours)"
-    # 显式限定运营库（qa_daily_metrics 定义在 fuling_operation，见 schema/004）。生产 writer
-    # 经 LaunchAgent RAG_ENV=metrics 把连接默认库设为 fuling_operation，非限定写本就落到此库；
-    # 显式 {_op_db()}. 是纵深加固：去掉对 RDS_DATABASE 取值的隐式依赖（不再因默认库变动而错位写
-    # 到知识库），且 staging 自动指向 fuling_operation_stg。生产目标不变（_op_db()=fuling_operation）。
-    sql = (f"INSERT INTO {_op_db()}.qa_daily_metrics (metric_date, {', '.join(cols)}, "
-           f"slo_breaches_json, tz_shift_hours) "
-           f"VALUES (%s, {', '.join(['%s'] * len(cols))}, %s, %s) "
-           f"ON DUPLICATE KEY UPDATE {set_clause}")
-    with conn.cursor() as c:
-        c.execute(sql, [metric_date, *vals, breaches_json, tz_shift])
-    conn.commit()
+    def _do(cols: List[str]) -> None:
+        vals = [m.get(c) for c in cols]
+        breaches_json = json.dumps(m.get("slo_breaches") or [], ensure_ascii=False)
+        set_clause = ", ".join(f"{c}=VALUES({c})" for c in cols) + \
+            ", slo_breaches_json=VALUES(slo_breaches_json), tz_shift_hours=VALUES(tz_shift_hours)"
+        # 显式限定运营库（qa_daily_metrics 定义在 fuling_operation，见 schema/004）。生产 writer
+        # 经 LaunchAgent RAG_ENV=metrics 把连接默认库设为 fuling_operation，非限定写本就落到此库；
+        # 显式 {_op_db()}. 是纵深加固：去掉对 RDS_DATABASE 取值的隐式依赖（不再因默认库变动而错位写
+        # 到知识库），且 staging 自动指向 fuling_operation_stg。生产目标不变（_op_db()=fuling_operation）。
+        sql = (f"INSERT INTO {_op_db()}.qa_daily_metrics (metric_date, {', '.join(cols)}, "
+               f"slo_breaches_json, tz_shift_hours) "
+               f"VALUES (%s, {', '.join(['%s'] * len(cols))}, %s, %s) "
+               f"ON DUPLICATE KEY UPDATE {set_clause}")
+        with conn.cursor() as c:
+            c.execute(sql, [metric_date, *vals, breaches_json, tz_shift])
+        conn.commit()
+
+    try:
+        _do(_BASE_METRIC_COLS + _REJECT_METRIC_COLS)
+        return
+    except Exception as e:  # noqa: BLE001 — 仅未知列（017 未 apply）降级，其余照抛
+        msg = str(e)
+        if "1054" not in msg and "Unknown column" not in msg:
+            raise
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("qa_daily_metrics 缺拒绝列（schema/017 未 apply），回退基础列集写入")
+    _do(_BASE_METRIC_COLS)
+
+
+def _fetch_rejected(conn, target: str) -> Dict[str, int]:
+    """当日限流拒绝聚合 {reason: count}（qa_admission_reject，schema/017，写侧 rate_limiter）。
+    表未建/查询失败 → 空 dict（fail-open：P1-1 是增强项，绝不反过来挡住既有汇总）。"""
+    try:
+        with conn.cursor() as c:
+            c.execute(f"SELECT reason, reject_count FROM {_op_db()}.qa_admission_reject"
+                      " WHERE stat_date = %s", (target,))
+            rows = c.fetchall() or []
+        out: Dict[str, int] = {}
+        for r in rows:
+            reason, cnt = (r["reason"], r["reject_count"]) if isinstance(r, dict) else (r[0], r[1])
+            out[str(reason)] = out.get(str(reason), 0) + int(cnt or 0)
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning("qa_rollup: 读取 qa_admission_reject 失败（按无拒绝处理；schema/017 未 apply?）: %s", e)
+        return {}
 
 
 def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFAULT_TZ_SHIFT_HOURS,
@@ -253,7 +309,7 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
                 raw = c.fetchall()
             rows = [r if isinstance(r, dict) else dict(zip(_cols, r)) for r in raw]
 
-            m = compute_daily_metrics(rows)
+            m = compute_daily_metrics(rows, rejected=_fetch_rejected(conn, target))
             _upsert_daily(conn, target, m, tz_shift_hours)
         finally:
             conn.close()
@@ -307,7 +363,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         m = report["metrics"]
         print(f"[qa_rollup] {report['metric_date']}: queries={m['total_queries']} "
               f"answer_rate={m['answer_rate']} no_result_rate={m['no_result_rate']} "
-              f"p95={m['p95_latency_ms']}ms error_rate={m['error_rate']} slo_ok={m['slo_ok']}")
+              f"p95={m['p95_latency_ms']}ms error_rate={m['error_rate']} "
+              f"rejected={m.get('rejected_count', 0)} slo_ok={m['slo_ok']}")
         for b in report.get("breaches", []):
             print(f"  ⚠️ SLO breach {b['slo']}: {b['value']} (threshold {b['threshold']})")
     return 0 if report.get("ok") and report.get("slo_ok", 1) == 1 else (2 if report.get("ok") else 3)

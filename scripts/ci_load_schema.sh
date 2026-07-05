@@ -88,6 +88,7 @@ MANIFEST="
 014_document_version_raw_key_hash_index.sql knowledge
 015_kb_audit_log_history_index.sql knowledge
 016_user_feedback_dedup_unique.sql operation
+017_qa_admission_reject.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }

@@ -118,6 +118,74 @@ def test_compute_daily_metrics_flags_breach():
     assert "answer_rate_min" in slos and "no_result_rate_max" in slos
 
 
+# ── P1-1（盲区审计 2026-07-05）：限流拒绝并入 SLO ──
+
+def test_compute_daily_metrics_rejected_global_cap_breaches():
+    """熔断日不再假绿：global_cap 拒绝 > 0 → 专项 breach + slo_ok=0；
+    比率指标分母仍是准入量（per_min 反滥用拒绝不该压垮 answer_rate）。"""
+    rows = [_row("SUCCESS"), _row("SUCCESS")]
+    m = qa_rollup.compute_daily_metrics(rows, rejected={"global_cap": 1800, "per_min": 30})
+    assert m["rejected_count"] == 1830
+    assert m["rejected_global_cap"] == 1800
+    assert m["offered_queries"] == 1832
+    assert m["answer_rate"] == 1.0                       # 分母不变（论证见 docstring）
+    assert m["slo_ok"] == 0
+    assert {b["slo"] for b in m["slo_breaches"]} == {"global_cap_rejected"}
+    assert m["slo_breaches"][0]["value"] == 1800
+
+
+def test_compute_daily_metrics_non_cap_rejects_no_breach():
+    """仅 per_min/per_day 拒绝（扫描器被正常拦下）：记录量但不判 breach。"""
+    m = qa_rollup.compute_daily_metrics([_row("SUCCESS")], rejected={"per_min": 500})
+    assert m["rejected_count"] == 500 and m["rejected_global_cap"] == 0
+    assert m["slo_ok"] == 1
+
+
+def test_upsert_daily_falls_back_when_reject_cols_missing():
+    """schema/017 未 apply：写拒绝列报 1054 → 回退基础列集，不炸整个 rollup。"""
+    sqls = []
+
+    class _Cur:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, sql, params=None):
+            sqls.append(sql)
+            if "rejected_count" in sql:
+                raise RuntimeError("(1054, \"Unknown column 'rejected_count' in 'field list'\")")
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
+
+    m = qa_rollup.compute_daily_metrics([_row("SUCCESS")], rejected={"global_cap": 3})
+    qa_rollup._upsert_daily(_Conn(), "2026-07-05", m, 15)
+    assert len(sqls) == 2
+    assert "rejected_count" in sqls[0] and "rejected_count" not in sqls[1]
+
+
+def test_fetch_rejected_missing_table_fail_open():
+    """qa_admission_reject 表未建：读侧按无拒绝处理，绝不挡既有汇总。"""
+    class _Cur:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, sql, params=None):
+            raise RuntimeError("(1146, \"Table 'fuling_operation.qa_admission_reject' doesn't exist\")")
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    assert qa_rollup._fetch_rejected(_Conn(), "2026-07-05") == {}
+
+
 def test_run_rollup_simulate_is_noop(monkeypatch):
     from opensearch_pipeline.config import get_config
     cfg = get_config()

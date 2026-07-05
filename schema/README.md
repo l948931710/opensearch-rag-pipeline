@@ -43,6 +43,8 @@ apply 脚本落库并记台账。
 | 013_qa_retrieved_doc_fact.sql | fuling_operation | 检索/引用文档物化事实表 + 存量回填（perf#3；读侧 RAG_QA_FACT_JOIN 门控） |
 | 014_document_version_raw_key_hash_index.sql | fuling_knowledge | raw_key_hash 回填 + idx_raw_key_hash（perf#5 注册幂等点查） |
 | 015_kb_audit_log_history_index.sql | fuling_knowledge | kb_audit_log (operator_type, action_type, created_at) 复合索引（perf#83/#96 审批历史查询） |
+| 016_user_feedback_dedup_unique.sql | fuling_operation | user_feedback (message_id,user_id) 去重 + uk_message_user 唯一键补建（存量库补救） |
+| 017_qa_admission_reject.sql | fuling_operation | 限流拒绝聚合表 + qa_daily_metrics 拒绝列（盲区审计 P1-1：熔断日 SLO 不再假绿） |
 
 ## 台账（schema_migrations）
 

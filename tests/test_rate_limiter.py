@@ -256,3 +256,85 @@ def test_concurrent_admission_exact(make_limiter):
         t.join()
     # 8 线程 × 20 次 = 160 次尝试，恰好放行 50（锁内检查+计入原子）
     assert len(admitted) == 50
+
+
+# ── P1-1（盲区审计 2026-07-05）：触顶告警 + 拒绝聚合落库 ─────────
+
+@pytest.fixture
+def sync_dispatch(monkeypatch):
+    """告警/落库同步直调 + 双 spy（默认落库成功）。"""
+    monkeypatch.setattr(rl, "_DISPATCH_ASYNC", False)
+    alerts, flushed, ok = [], [], {"v": True}
+    monkeypatch.setattr(rl, "_dispatch_cap_alert", lambda cap: alerts.append(cap))
+    def _fake_persist(snap):
+        flushed.append(dict(snap))
+        return ok["v"]
+    monkeypatch.setattr(rl, "_persist_rejected", _fake_persist)
+    return alerts, flushed, ok
+
+
+def test_cap_trip_edge_alerts_once_per_day(make_limiter, sync_dispatch):
+    """触顶边沿（第 cap 个放行请求）发一次 critical 告警；同日后续拒绝不再发；
+    北京日翻转后再次触顶 → 再发。"""
+    alerts, _, _ = sync_dispatch
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_GLOBAL_DAILY_LLM_CAP=2,
+                       RAG_RATE_USER_PER_MIN=0, RAG_RATE_USER_PER_DAY=0)
+    assert lim.admit_ask("u:a", is_user=True) is None
+    assert alerts == []
+    assert lim.admit_ask("u:b", is_user=True) is None      # 触顶边沿
+    assert alerts == [2]
+    d = lim.admit_ask("u:c", is_user=True)
+    assert d is not None and d.reason == "global_cap"
+    assert alerts == [2]                                    # 每日至多一次
+    clock.advance(86400)                                    # 日界翻转 → 计数清零
+    assert lim.admit_ask("u:a", is_user=True) is None
+    assert lim.admit_ask("u:b", is_user=True) is None
+    assert alerts == [2, 2]
+
+
+def test_cap_deny_path_alerts_without_edge(make_limiter, sync_dispatch):
+    """不经过放行边沿的触顶（重启后计数重积 / 运维中途调低 cap）：首个 global_cap
+    拒绝同样拉响告警。"""
+    alerts, _, _ = sync_dispatch
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_GLOBAL_DAILY_LLM_CAP=2)
+    lim._global_day = (rl._beijing_day(clock()), 5)         # 直接置满（等价形态）
+    d = lim.admit_ask("u:a", is_user=True)
+    assert d is not None and d.reason == "global_cap"
+    assert alerts == [2]
+
+
+def test_rejected_counts_flush_batched_and_merge_back(make_limiter, sync_dispatch):
+    """拒绝按 (北京日, 原因) 聚合：首次拒绝即落一批，60s 内只积累；到期批量落库；
+    落库失败 → 计数并回内存，下一批带上重试。"""
+    _, flushed, ok = sync_dispatch
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_RATE_USER_PER_MIN=1, RAG_RATE_USER_PER_DAY=0,
+                       RAG_GLOBAL_DAILY_LLM_CAP=0)
+    day = rl._beijing_day(clock())
+    assert lim.admit_ask("u:a", is_user=True) is None
+    assert lim.admit_ask("u:a", is_user=True).reason == "per_min"   # 首拒 → 立即落一批
+    assert flushed == [{(day, "per_min"): 1}]
+    assert lim.admit_ask("u:a", is_user=True).reason == "per_min"   # 60s 内：只积累
+    assert lim.admit_ask("u:a", is_user=True).reason == "per_min"
+    assert len(flushed) == 1
+    ok["v"] = False                                          # 模拟表未建/连接失败
+    clock.advance(61)
+    assert lim.admit_ask("u:a", is_user=True) is None        # 窗口过期放行 → 顺带触发 flush
+    assert flushed[-1] == {(day, "per_min"): 2}              # 这批落库失败 → 并回内存
+    ok["v"] = True
+    clock.advance(61)
+    assert lim.admit_ask("u:a", is_user=True) is None
+    assert flushed[-1] == {(day, "per_min"): 2}              # 并回的计数随下一批重试成功
+
+
+def test_persist_rejected_simulate_mode_is_noop(monkeypatch):
+    """模拟模式（无库可写）：丢弃即成功，绝不去连 RDS。"""
+    from opensearch_pipeline.config import get_config
+    if not (get_config().simulate or get_config().simulate_db):
+        pytest.skip("需 RAG_SIMULATE=true")
+    def _db_boom(*a, **k):
+        raise AssertionError("simulate 模式不应触库")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _db_boom)
+    assert rl._persist_rejected({("2026-07-05", "per_min"): 1}) is True

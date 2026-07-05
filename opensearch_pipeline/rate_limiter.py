@@ -36,6 +36,13 @@ rate_limiter.py — serving 公网防刷（进程内四层准入）
 
 注意：全局熔断按"准入的问答请求"计数（含最终 NO_RESULT 的），因为 embedding/
 HA3/rerank 开销在准入后即发生——这正是熔断要兜的上游调用总量。
+
+可观测性（盲区审计 P1-1，2026-07-05）：被拒请求在 log_qa_session 之前就被拒，
+从不落 qa_session_log——此前触顶=静默全站宕机且 SLO 反而全绿。现在：
+  * 触顶边沿（admit 侧 new_cnt==cap）与 global_cap 拒绝侧（进程重启/中途调低 cap
+    不经过边沿）各有一个每日至多一次的 critical 运维告警（OBS-4 send_ops_alert）；
+  * 全部拒绝按 (北京日, 原因) 聚合，~60s 批量 UPSERT 到 qa_admission_reject
+    （schema/017），夜间 qa_rollup 读它把 offered vs admitted 补进 SLO 判定。
 """
 
 import ipaddress
@@ -59,6 +66,62 @@ _PRUNE_THRESHOLD = 20000
 # perf#94：全量重建式清理的节流间隔——超阈值期间不再每个放行请求都重建，
 # 代价是过期条目最多多存活 ~30s（阈值以下路径零变化，设计内让步）
 _PRUNE_INTERVAL_S = 30.0
+# 拒绝聚合落库间隔（盲区审计 P1-1）：60s 一批 → 拒绝风暴期间 RDS 写放大有界（≤1 批/分钟）
+_REJECT_FLUSH_INTERVAL_S = 60.0
+# tests 置 False：触顶告警/拒绝落库同步直调，便于断言；生产恒 True（热路径零阻塞）
+_DISPATCH_ASYNC = True
+
+
+def _dispatch_cap_alert(cap: int) -> None:
+    """全局日熔断触顶 → OBS-4 运维告警（盲区审计 P1-1：此前触顶只有 logger.error，
+    无人被通知，且被拒请求不落 qa_session_log——全站宕机日在 SLO 看板上反而全绿）。
+    fail-open：告警发送失败绝不影响限流主路径。"""
+    def _send() -> None:
+        try:
+            from opensearch_pipeline.alerting import send_ops_alert
+            send_ops_alert(
+                "全局日熔断触顶：问答服务对外全拒",
+                f"今日准入问答量已达 RAG_GLOBAL_DAILY_LLM_CAP={cap}，"
+                "此后所有 /api/ask 将被 503 拒绝至北京时间次日零点。\n\n"
+                "- 正常业务增长 → 调高上限并重启 serving；\n"
+                "- 扫描/重试风暴 → 排查来源 IP（限流拒绝日志 reason=global_cap）。",
+                severity="critical", dedup_key="global-cap")
+        except Exception:   # noqa: BLE001
+            logger.warning("熔断触顶告警发送失败（fail-open）", exc_info=True)
+    if _DISPATCH_ASYNC:
+        threading.Thread(target=_send, daemon=True, name="cap-alert").start()
+    else:
+        _send()
+
+
+def _persist_rejected(snapshot: Dict[Tuple[str, str], int]) -> bool:
+    """拒绝聚合批量落库（qa_admission_reject，schema/017）：(北京日, 原因) → 计数累加。
+    夜间 qa_rollup 读它把「offered vs admitted」补进 SLO——否则被拒请求在唯一的
+    serving 指标里不存在。fail-open：模拟模式丢弃即成功；表未建/连接失败返回 False
+    让调用方把计数并回内存，下一批重试。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        cfg = get_config()
+        if cfg.simulate or cfg.simulate_db:
+            return True
+        op_db = cfg.rds.operation_database
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                for (day, reason), n in snapshot.items():
+                    cur.execute(
+                        f"INSERT INTO {op_db}.qa_admission_reject (stat_date, reason, reject_count)"
+                        " VALUES (%s, %s, %s)"
+                        " ON DUPLICATE KEY UPDATE reject_count = reject_count + VALUES(reject_count)",
+                        (day, reason, int(n)))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001
+        logger.warning("qa_admission_reject 落库失败（fail-open，计数并回内存待重试）: %s", e)
+        return False
 
 
 def _beijing_day(now: float) -> str:
@@ -185,6 +248,13 @@ class ServingRateLimiter:
         self._last_warn: Dict[str, float] = {}
         # perf#94：上次全量清理时间戳（_maybe_prune 节流用）
         self._last_prune = 0.0
+        # P1-1：拒绝聚合 (北京日, 原因) -> 计数，独立小锁（_deny 持主锁时嵌套获取，
+        # 顺序恒 _lock → _reject_lock，flush 线程只取 _reject_lock，无死锁环）
+        self._reject_lock = threading.Lock()
+        self._rejected: Dict[Tuple[str, str], int] = {}
+        self._reject_flush_ts = 0.0
+        # P1-1：触顶告警日界（每北京日至多发一次 critical 告警）
+        self._cap_alert_day = ""
 
     # ── 配置 ─────────────────────────────────────────────────
 
@@ -206,6 +276,10 @@ class ServingRateLimiter:
             self._global_day = ("", 0)
             self._last_warn.clear()
             self._last_prune = 0.0
+            self._cap_alert_day = ""
+        with self._reject_lock:
+            self._rejected.clear()
+            self._reject_flush_ts = 0.0
         self._limits = None
 
     def describe(self) -> str:
@@ -240,6 +314,9 @@ class ServingRateLimiter:
             if count_llm and lim.global_daily_llm_cap > 0:
                 g_day, g_cnt = self._global_day
                 if g_day == day and g_cnt >= lim.global_daily_llm_cap:
+                    # P1-1 兜底告警点：进程重启后计数重积/运维中途调低 cap 等场景不经过
+                    # 下方的 new_cnt==cap 边沿，首个 global_cap 拒绝同样要拉响告警。
+                    self._maybe_cap_alert(day, lim.global_daily_llm_cap)
                     return self._deny(actor, Denial(
                         503, "服务繁忙：今日问答量已达上限，请明天再试或联系管理员",
                         _secs_to_beijing_midnight(now), "global_cap"))
@@ -297,10 +374,13 @@ class ServingRateLimiter:
                 new_cnt = (g_cnt if g_day == day else 0) + 1
                 self._global_day = (day, new_cnt)
                 if new_cnt == lim.global_daily_llm_cap:
-                    # 最后一个放行的请求触顶：大声记日志（下一个请求开始全拒）
+                    # 最后一个放行的请求触顶：大声记日志 + 运维告警（下一个请求开始全拒）
                     logger.error("全局日熔断触顶：今日问答量已达 %d，后续请求将被拒绝至次日",
                                  lim.global_daily_llm_cap)
+                    self._maybe_cap_alert(day, lim.global_daily_llm_cap)
             self._maybe_prune(now, day)
+            # 放行路径顺带检查拒绝聚合是否到期（风暴结束后残留计数靠正常流量冲出去）
+            self._note_reject(None, now)
         return None
 
     def admit_aux(self, actor: str) -> Optional[Denial]:
@@ -326,7 +406,8 @@ class ServingRateLimiter:
     # ── 内部 ─────────────────────────────────────────────────
 
     def _deny(self, actor: str, denial: Denial) -> Denial:
-        """拒绝出口：按 (actor, reason) 节流记日志（持锁路径，只做字典操作）。"""
+        """拒绝出口：按 (actor, reason) 节流记日志 + 拒绝聚合计数（持锁路径，字典操作
+        与至多每 60s 一次的 flush 线程派生）。"""
         now = self._now()
         warn_key = f"{denial.reason}|{actor}"
         last = self._last_warn.get(warn_key, 0.0)
@@ -334,7 +415,43 @@ class ServingRateLimiter:
             self._last_warn[warn_key] = now
             logger.warning("限流拒绝 reason=%s actor=%s status=%d retry_after=%ds",
                            denial.reason, actor, denial.status_code, denial.retry_after)
+        self._note_reject(denial.reason, now)
         return denial
+
+    def _maybe_cap_alert(self, day: str, cap: int) -> None:
+        """触顶告警（持 _lock 路径）：每北京日至多派发一次；发送在后台线程，不阻塞热路径。"""
+        if self._cap_alert_day == day:
+            return
+        self._cap_alert_day = day
+        _dispatch_cap_alert(cap)
+
+    def _note_reject(self, reason: Optional[str], now: float) -> None:
+        """拒绝聚合：reason 非空则 +1；到期（≥60s 且有存量）则快照清零并派发落库。
+        独立 _reject_lock（调用方可能持有 _lock，见 __init__ 的锁序注释）；落库失败由
+        _flush_rejected 把快照并回，下一批重试。"""
+        snapshot = None
+        with self._reject_lock:
+            if reason:
+                key = (_beijing_day(now), reason)
+                self._rejected[key] = self._rejected.get(key, 0) + 1
+            if self._rejected and now - self._reject_flush_ts >= _REJECT_FLUSH_INTERVAL_S:
+                self._reject_flush_ts = now
+                snapshot = self._rejected
+                self._rejected = {}
+        if snapshot:
+            if _DISPATCH_ASYNC:
+                threading.Thread(target=self._flush_rejected, args=(snapshot,),
+                                 daemon=True, name="reject-flush").start()
+            else:
+                self._flush_rejected(snapshot)
+
+    def _flush_rejected(self, snapshot: Dict[Tuple[str, str], int]) -> None:
+        """落库一批拒绝聚合；失败并回内存（键按日聚合，重试无重复计数风险）。"""
+        if _persist_rejected(snapshot):
+            return
+        with self._reject_lock:
+            for key, n in snapshot.items():
+                self._rejected[key] = self._rejected.get(key, 0) + n
 
     def _maybe_prune(self, now: float, day: str) -> None:
         """计数字典超软上限时清理过期项（窗口外/隔日），防扫描器轮换 key 撑爆内存。
