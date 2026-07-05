@@ -26,7 +26,7 @@ import ApprovalHistory from '@/components/manage/ApprovalHistory.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadEscalations, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadEscalations, loadReviewTasks, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
@@ -92,7 +92,7 @@ onMounted(async () => {
     void loadAccessRequests()                        // 同上（staleness 门在 useKb 内）
     void loadAccessGrants()
     void loadApprovalHistory()                       // 审批历史（两角色，只读聚合）
-    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants() }   // 全库治理看板 + 成员管理（kb_admin）
+    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants(); void loadReviewTasks() }   // 全库治理 + 成员管理 + 复审任务（kb_admin）
     await docsReady
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
     if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }

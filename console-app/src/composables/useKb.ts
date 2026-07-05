@@ -78,6 +78,9 @@ export interface KbDownvoteReason { reason: string; count: number }
 export interface KbFileType { ftype: string; count: number }
 export interface KbGovernance {
   window_days: number
+  // P2-14：监控链路心跳（null=未知；stale=ops_monitor >26h 未跑，看板亮红）
+  monitor_heartbeat_age_h?: number | null
+  monitor_stale?: boolean
   file_types: KbFileType[]
   docs_active: number; docs_in_index: number; dual_version_docs: number
   avg_latency_ms: number; p50_latency_ms: number; p95_latency_ms: number
@@ -162,6 +165,10 @@ const feedbackResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 
 const escalations = ref<EscalationItem[] | null>(null)
 const showClosedEscalations = ref(false)
 const escalationResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 ticket_id）
+// 入库复审任务队列（盲区审计 P2-33：review_task 补消费端，kb_admin 专属）。
+const reviewTasks = ref<ReviewTaskItem[] | null>(null)
+const showClosedReviewTasks = ref(false)
+const reviewTaskResolveBusy = ref<Set<string>>(new Set())
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
 const SHARE_TARGETS = Object.keys(GROUP_LABEL)
 const verCtx = ref<VerCtx | null>(null)
@@ -1073,6 +1080,69 @@ async function resolveEscalation(ticketId: string, action: EscalationResolveActi
   finally { const n = new Set(escalationResolveBusy.value); n.delete(ticketId); escalationResolveBusy.value = n }
 }
 
+// 入库复审任务（与后端 KbReviewTaskItem 对齐；P2-33 spot_checker 权限泄露安全网等的消费端）。
+export interface ReviewTaskItem {
+  task_id: string; doc_id: string; title: string; version_no: number
+  review_type: string; review_reason: string; owner_dept: string
+  suggested_permission_level: string
+  created_at: string; age_days: number
+  status: string; closed: boolean; reviewer_name: string
+}
+
+/** 拉入库复审任务队列（kb_admin 专属）：默认只列 PENDING（不设时间窗、老单先出）。 */
+async function loadReviewTasks() {
+  const s = useSession()
+  if (s.role !== 'kb_admin') { reviewTasks.value = []; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    const all: ReviewTaskItem[] = [
+      { task_id: 'rt1', doc_id: 'D1', title: '员工薪酬发放办法', version_no: 2,
+        review_type: 'spot_check_mismatch', review_reason: '实时权限 public 比 LLM 建议 restricted 更宽松',
+        owner_dept: 'hr', suggested_permission_level: 'restricted',
+        created_at: '2026-06-25 08:10', age_days: 9, status: 'PENDING', closed: false, reviewer_name: '' },
+    ]
+    reviewTasks.value = showClosedReviewTasks.value ? all : all.filter((x) => !x.closed)
+    return
+  }
+  clearLoadError('reviewTasks')
+  try {
+    const qs = showClosedReviewTasks.value ? '?include_closed=true' : ''
+    const r = await apiJson<{ items: ReviewTaskItem[] }>(`/api/kb/review-tasks${qs}`, { auth: true })
+    reviewTasks.value = r.items || []
+  } catch (e) { reviewTasks.value = reviewTasks.value ?? []; noteLoadError('reviewTasks', e) }
+}
+
+function toggleShowClosedReviewTasks() {
+  showClosedReviewTasks.value = !showClosedReviewTasks.value
+  void loadReviewTasks()
+}
+
+/** 复审任务处置：resolve（已核实/已修正）/ dismiss（误报）/ reopen；comment 可选。 */
+async function resolveReviewTask(taskId: string, action: EscalationResolveAction,
+                                 comment = ''): Promise<boolean> {
+  if (reviewTaskResolveBusy.value.has(taskId)) return false
+  reviewTaskResolveBusy.value = new Set(reviewTaskResolveBusy.value).add(taskId)
+  try {
+    const s = useSession()
+    const done = action !== 'reopen'
+    if (import.meta.env.DEV && s.token === 'dev-preview') { /* 预览：本地更新 */ }
+    else {
+      await apiJson('/api/kb/review-tasks/resolve', {
+        method: 'POST', auth: true,
+        body: JSON.stringify({ task_id: taskId, action, comment }),
+      })
+    }
+    const list = reviewTasks.value || []
+    if (done && !showClosedReviewTasks.value) {
+      reviewTasks.value = list.filter((x) => x.task_id !== taskId)
+    } else {
+      reviewTasks.value = list.map((x) => x.task_id === taskId
+        ? { ...x, closed: done, status: action === 'resolve' ? 'RESOLVED' : action === 'dismiss' ? 'DISMISSED' : 'PENDING' } : x)
+    }
+    return true
+  } catch (e: any) { void notice({ title: '处置失败', message: uploadErrText(e), danger: true }); return false }
+  finally { const n = new Set(reviewTaskResolveBusy.value); n.delete(taskId); reviewTaskResolveBusy.value = n }
+}
+
 // 「谁能看到这篇文档」解释器响应（与后端 KbVisibilityExplainResponse 对齐；判定与检索同源）。
 export interface VisReader { dept: string; via: 'owner' | 'umbrella' | 'shared_policy' | 'grant' }
 export interface VisExplain {
@@ -1354,6 +1424,7 @@ export function useKb() {
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     escalations, loadEscalations, showClosedEscalations, toggleShowClosedEscalations, resolveEscalation, escalationResolveBusy,
+    reviewTasks, loadReviewTasks, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
@@ -1374,6 +1445,7 @@ export function __resetKb() {
   inflight.value = new Set(); retireBusy.value = false
   feedbackReview.value = null; showResolvedFeedback.value = false; feedbackResolveBusy.value = new Set()
   escalations.value = null; showClosedEscalations.value = false; escalationResolveBusy.value = new Set()
+  reviewTasks.value = null; showClosedReviewTasks.value = false; reviewTaskResolveBusy.value = new Set()
   selectedFiles = []; docsOffset = 0; docsSeq = 0; trackSeq = 0
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }

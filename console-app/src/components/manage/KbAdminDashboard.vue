@@ -18,6 +18,7 @@ import MiniTrend from './MiniTrend.vue'
 import LoadError from './LoadError.vue'
 import FeedbackReviewList from './FeedbackReviewList.vue'
 import EscalationQueue from './EscalationQueue.vue'
+import ReviewTaskQueue from './ReviewTaskQueue.vue'
 
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
@@ -161,6 +162,19 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
 
 <template>
   <div class="space-y-6">
+    <!-- P2-14：监控链路心跳超时红条——ops_monitor >26h 未跑 = 所有 parity/SLO 检查停摆，
+         看板下方的健康数字全是旧的；serving 作被动死人开关，首屏可见。 -->
+    <div
+      v-if="kbGovernance?.monitor_stale"
+      class="flex flex-wrap items-center gap-2 rounded-xl border border-st-fail/40 bg-st-fail/5 px-4 py-3"
+    >
+      <span class="text-[12.5px] font-bold text-st-fail">⚠ 监控链路停摆</span>
+      <span class="text-[12px] text-muted-foreground">
+        ops_monitor 心跳已 {{ kbGovernance?.monitor_heartbeat_age_h }} 小时未刷新——巡检
+        crontab / 凭据 / 网络可能失效，下方健康指标可能已过期。
+      </span>
+    </div>
+
     <!-- 待你处理：有未处理差评时首屏可见、一键直达（看板唯一行动区在页尾，不能只靠滚动发现） -->
     <div
       v-if="feedbackOpenCount"
@@ -289,6 +303,9 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       <!-- 转人工工单：全库队列（含无引用文档的 NO_RESULT 求助 = 语料缺口，本就归 kb_admin） -->
       <p :class="SUBHEAD" class="mt-4">转人工工单 · 待人工答复（全库）</p>
       <EscalationQueue />
+      <!-- 入库复审任务：spot_checker 权限抽查等安全网登记（P2-33 消费端，kb_admin 专属） -->
+      <p :class="SUBHEAD" class="mt-4">入库复审 · 安全网登记的人工任务</p>
+      <ReviewTaskQueue />
     </section>
 
     <!-- 治理/洞察数据加载中（端点未接入）→ 如实占位；真实失败（5xx）→ 错误条 + 重试 -->

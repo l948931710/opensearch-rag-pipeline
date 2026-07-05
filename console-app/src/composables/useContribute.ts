@@ -190,7 +190,9 @@ async function acceptContribution(c: ContributionItem, permissionLevel: 'dept_in
     try {
       const s = useSession()
       if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = pendingContribs.value.filter((x) => x.contribution_id !== c.contribution_id); return }
-      await apiJson(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({ permission_level: permissionLevel }) })
+      const r = await apiJson<{ requires_kb_admin_approval?: boolean }>(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({ permission_level: permissionLevel }) })
+      // P2-16：dept_admin 采纳「全员公开」→ 后端登记为待审批（不再直通入库），提示放行前提
+      if (r?.requires_kb_admin_approval) void notice({ title: '已采纳，等待放行', message: '全员公开的贡献需知识库管理员在「待审批」中放行后才会入库检索。' })
       await Promise.all([loadPending(), loadMine()])
     } catch (e: any) { void notice({ title: '采纳失败', message: uploadErrText(e), danger: true }) }
   })
