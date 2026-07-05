@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ThumbsDown, Check, Ban, RotateCcw, CheckCircle2, MessageSquareText } from 'lucide-vue-next'
 import { deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
@@ -15,6 +16,15 @@ const {
 
 const openCount = computed(() => (feedbackReview.value || []).filter((x) => !x.handled).length)
 function busy(id: string) { return feedbackResolveBusy.value.has(id) }
+
+// 「差评 → 修文档」补断层：涉及文档 chip 点击 = 切「文档管理」tab + 台账按标题定位。
+// 走 URL（tab+q）→ ManageView 路由 watcher 切 tab → DocTable 挂载时从 URL 恢复搜索,零新机制。
+const router = useRouter()
+const route = useRoute()
+function gotoDoc(d: { doc_id: string; title?: string }) {
+  void router?.replace({ query: { ...(route?.query || {}), tab: 'docs', q: d.title || d.doc_id } })
+  setTimeout(() => document.getElementById('kb-sec-ledger')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 400)
+}
 </script>
 
 <template>
@@ -64,13 +74,14 @@ function busy(id: string) { return feedbackResolveBusy.value.has(id) }
               <MessageSquareText :size="12" :stroke-width="1.75" class="mt-0.5 shrink-0 text-faint" />
               <span class="min-w-0">{{ it.comment }}</span>
             </div>
-            <!-- 涉及文档 chips -->
+            <!-- 涉及文档 chips：点击直达台账该文档（修文档是差评闭环的下一步，原先是死文本要自己去搜） -->
             <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
-              <span
-                v-for="d in it.docs" :key="d.doc_id"
-                class="rounded-full border border-border bg-panel px-2 py-0.5 text-[10.5px] text-muted-foreground"
-                :title="d.doc_id"
-              >{{ d.title || d.doc_id }} · {{ deptLabel(d.owner_dept) }}</span>
+              <button
+                v-for="d in it.docs" :key="d.doc_id" type="button"
+                class="rounded-full border border-border bg-panel px-2 py-0.5 text-[10.5px] text-muted-foreground transition hover:border-accent-strong hover:bg-accent-soft hover:text-accent-text"
+                :title="`在文档台账中定位（${d.doc_id}）`"
+                @click="gotoDoc(d)"
+              >{{ d.title || d.doc_id }} · {{ deptLabel(d.owner_dept) }}</button>
             </div>
           </div>
           <span class="shrink-0 font-mono text-[10.5px] text-faint">{{ (it.created_at || '').slice(0, 16) }}</span>

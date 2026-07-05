@@ -34,6 +34,7 @@ from opensearch_pipeline.api import (
     KbVersionHistoryResponse,
     KbVersionItem,
     _KB_ACL_GROUP_LABELS,
+    _KB_BAD_BADGES,
     _KB_BADGE_CASE_SQL,
     _KB_MAX_OFFSET,
     _enforce_rate_limit,
@@ -150,8 +151,15 @@ def _kb_ledger_filter_sql(perm: str = "", badge: str = "", cited: str = ""):
             clauses.append("AND m.permission_level = %s")
             params.append(p)
     if badge:
-        clauses.append(f"AND ({_KB_BADGE_CASE_SQL}) = %s")
-        params.append(badge.strip()[:16])
+        b = badge.strip()[:16]
+        if b == "异常":
+            # 「异常」聚合筛选（前端待办条/台账 chip 同口径）：一次圈出全部坏徽章
+            ph = ",".join(["%s"] * len(_KB_BAD_BADGES))
+            clauses.append(f"AND ({_KB_BADGE_CASE_SQL}) IN ({ph})")
+            params.extend(_KB_BAD_BADGES)
+        else:
+            clauses.append(f"AND ({_KB_BADGE_CASE_SQL}) = %s")
+            params.append(b)
     if cited in ("never", "used"):
         try:
             from opensearch_pipeline.qa_facts import FACT_TABLE, fact_join_enabled
@@ -207,7 +215,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status
+                           v.chunk_status, v.content_process_error
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -231,7 +239,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks, cpe) = r
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
@@ -241,6 +249,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             updated_at=str(updated) if updated else "",
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
             last_cited_at=(_u[1] if _u else ""),
+            # 驳回原因只在被驳回态外露（其他失败态的 content_process_error 是内部诊断文案，不外发）
+            reject_reason=(str(cpe)[:200] if (cps == "REJECTED" and cpe) else ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more)
 

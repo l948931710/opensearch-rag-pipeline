@@ -156,6 +156,9 @@ class MyAccessRequestItem(BaseModel):
     reason: str = ""
     created_at: str = ""
     decided_at: str = ""
+    # 审批人驳回时填写的原因（decision_note）：反馈闭环——原先申请人只看到按钮变回
+    # 「申请授权」，被驳回这件事本身和原因都无从得知。
+    decision_note: str = ""
 
 
 class MyAccessRequestListResponse(BaseModel):
@@ -784,7 +787,7 @@ def kb_my_access_requests(request: Request,
                 cur.execute(
                     f"""
                     SELECT r.id, r.doc_id, m.title, r.owner_dept, r.requester_depts, r.status,
-                           r.reason, r.created_at, r.decided_at, m.current_version_no
+                           r.reason, r.created_at, r.decided_at, m.current_version_no, r.decision_note
                     FROM {_kb_db()}.kb_access_request r
                     LEFT JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id
                     WHERE r.requester_id = %s
@@ -887,7 +890,8 @@ def kb_my_access_requests(request: Request,
                     items.append(MyAccessRequestItem(
                         id=str(r[0]), doc_id=doc_id, doc_title=r[2] or "", owner_dept=r[3] or "",
                         requester_dept=rdepts, status=status, sync_state=sync, reason=r[6] or "",
-                        created_at=str(r[7]) if r[7] else "", decided_at=str(r[8]) if r[8] else ""))
+                        created_at=str(r[7]) if r[7] else "", decided_at=str(r[8]) if r[8] else "",
+                        decision_note=(str(r[10])[:200] if (status == "rejected" and len(r) > 10 and r[10]) else "")))
         finally:
             conn.close()
     except Exception as e:

@@ -19,6 +19,7 @@ export interface DocItem {
   can_manage?: boolean   // 可操作（写作用域）；my-docs 恒 true，browse 全部门时外部门为 false
   cited_count?: number | null   // 利用度：被引用问答数（null/undefined=数据不可用，0=真·从未被引用）
   last_cited_at?: string        // 最近被引用时间（cited_count>0 时有值）
+  reject_reason?: string        // 被驳回原因（仅 已驳回 态有值）：台账副行直出，闭环「为什么被驳回」
 }
 export interface PendingItem {
   doc_id: string; version_no: number; title: string; original_filename: string
@@ -54,8 +55,9 @@ export interface MyAccessRequestItem {
   status: string                 // pending / approved / rejected
   sync_state: string             // n/a | pending_sync | projected
   reason: string; created_at: string; decided_at: string
+  decision_note?: string         // 审批人驳回原因（rejected 时有值）：申请人侧闭环
 }
-export type AccessState = 'none' | 'pending' | 'approved_pending_sync' | 'projected'
+export type AccessState = 'none' | 'pending' | 'approved_pending_sync' | 'projected' | 'rejected'
 export interface QueueRow { name: string; status: string; pct: number; msg: string; dupMsg?: string }
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
@@ -126,7 +128,7 @@ const accessReqDoc = ref<DocItem | null>(null)
 const accessReqBusy = ref(false)
 const requestedDocIds = ref<Set<string>>(new Set())   // 乐观：本会话刚提交、服务端态尚未回灌前临时显「审批中」
 // 申请人侧权威态：doc_id → {status, sync_state}（拉自 /api/kb/my-access-requests；后端未上线则空）
-const myAccessReqs = ref<Map<string, { status: string; sync_state: string }>>(new Map())
+const myAccessReqs = ref<Map<string, { status: string; sync_state: string; note: string }>>(new Map())
 const q = ref('')
 const filter = ref('')                 // status_badge 精确过滤；'' = 全部
 const permFilter = ref('')             // permission_level 精确过滤；'' = 全部
@@ -215,7 +217,7 @@ function sortDocs(list: DocItem[], key: SortKey, dir: 1 | -1): DocItem[] {
 
 const filtered = computed(() =>
   sortDocs(docs.value.filter((d) =>
-    (!filter.value || d.status_badge === filter.value)
+    (!filter.value || (filter.value === ANOMALY_FILTER ? BAD_BADGES.includes(d.status_badge) : d.status_badge === filter.value))
     && (!permFilter.value || d.permission_level === permFilter.value)
     && (!ownerFilter.value || d.owner_dept === ownerFilter.value)
     // 利用度：never=真·从未被引用（cited_count===0，退役候选）；used=有引用。
@@ -232,6 +234,9 @@ function countOf(badge: string): number {
 
 // 异常文档徽章（退役候选/需人工处理）：待办摘要条 + 台账速览共用口径。
 const BAD_BADGES = ['未入索引', '处理失败', '已隔离', '已驳回']
+// 「异常」伪徽章筛选：一次圈出全部 BAD_BADGES(服务端 my-docs 有同名 IN 分支)。
+// 待办条「异常文档」chip 点击即设——原先只滚动到台账,还得自己再挑一个坏徽章点。
+const ANOMALY_FILTER = '异常'
 
 // ── #7 全库口径：状态 chip 计数 / 归属下拉 / 异常文档数取自 /api/kb/stats（不受 50 页上限影响）。
 // 仅在「本部门」台账（docScope='managed'，其 owner 作用域与 stats 同源）启用全库口径；
@@ -239,14 +244,15 @@ const BAD_BADGES = ['未入索引', '处理失败', '已隔离', '已驳回']
 const fullScopeCounts = computed(() => docScope.value === 'managed' && !!kbStats.value)
 // 状态 chip 列表（含「全部」）：全库口径下取 by_badge 全部出现过的徽章；否则已加载页派生。
 const ledgerBadgeChips = computed<string[]>(() => {
-  if (fullScopeCounts.value) {
-    const bb = kbStats.value!.by_badge || {}
-    return ['', ...Object.keys(bb).filter((k) => bb[k] > 0)]
-  }
-  return ['', ...Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))]
+  const base = fullScopeCounts.value
+    ? Object.keys(kbStats.value!.by_badge || {}).filter((k) => (kbStats.value!.by_badge || {})[k] > 0)
+    : Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))
+  // 坏徽章 ≥2 种才值得一枚聚合 chip（只有一种时与单徽章 chip 重复）
+  return ['', ...base, ...(anomalyCount.value > 0 && base.filter((b) => BAD_BADGES.includes(b)).length > 1 ? [ANOMALY_FILTER] : [])]
 })
 // 状态 chip 计数：全库口径下取 by_badge / total；否则已加载页计数（countOf）。
 function ledgerBadgeCount(badge: string): number {
+  if (badge === ANOMALY_FILTER) return anomalyCount.value
   if (fullScopeCounts.value) {
     const bb = kbStats.value!.by_badge || {}
     return badge ? (bb[badge] || 0) : (kbStats.value!.total || 0)
@@ -433,17 +439,22 @@ function accessStateOf(docId: string): AccessState {
   const r = myAccessReqs.value.get(docId)
   if (r?.status === 'approved') return r.sync_state === 'projected' ? 'projected' : 'approved_pending_sync'
   if (r?.status === 'pending') return 'pending'
-  // 服务端无 row 或已驳回 → 看本会话乐观标记（刚提交、态未回灌前）；否则未申请
+  // 已驳回 → 显式反馈态（原先折叠回 none，申请人对"被驳回"这件事和原因都无感）；
+  // 刚重新申请（乐观标记在）→ 审批中。
+  if (r?.status === 'rejected') return requestedDocIds.value.has(docId) ? 'pending' : 'rejected'
+  // 服务端无 row → 看本会话乐观标记（刚提交、态未回灌前）；否则未申请
   return requestedDocIds.value.has(docId) ? 'pending' : 'none'
 }
+// 被驳回原因（rejected 行的 decision_note）：pill 悬停提示用
+function accessNoteOf(docId: string): string { return myAccessReqs.value.get(docId)?.note || '' }
 // 申请人侧权威态：拉我的申请 + 派生同步态。后端未上线 / 无申请 → 静默空（不报错、不打扰）。
 async function loadMyAccessRequests() {
   try {
     const r = await apiJson<{ items: MyAccessRequestItem[] }>('/api/kb/my-access-requests', { auth: true })
-    const m = new Map<string, { status: string; sync_state: string }>()
+    const m = new Map<string, { status: string; sync_state: string; note: string }>()
     // 后端按 created_at DESC（最新在前）返回；每 doc 保留【最新】一行——拒后重申/撤销后重申会留多行，
     // 若 last-write-wins（直接 m.set）会让最旧行覆盖最新 → 误显「申请授权」。首见即最新 → 不覆盖。
-    for (const it of (r.items || [])) if (!m.has(it.doc_id)) m.set(it.doc_id, { status: it.status, sync_state: it.sync_state })
+    for (const it of (r.items || [])) if (!m.has(it.doc_id)) m.set(it.doc_id, { status: it.status, sync_state: it.sync_state, note: it.decision_note || '' })
     myAccessReqs.value = m
     // 权威已有该 doc 的行 → 清掉本会话乐观标记（否则被驳回/撤销的文档因乐观回退仍显「审批中」、抑制「申请授权」按钮）。
     if (requestedDocIds.value.size) {
@@ -1241,7 +1252,7 @@ export function useKb() {
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
-    openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, loadMyAccessRequests,
+    openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
     approve, reject, retire, restore,
   }

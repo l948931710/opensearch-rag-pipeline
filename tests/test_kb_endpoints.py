@@ -736,8 +736,8 @@ def test_my_docs_usage_enrich_when_fact_join_on(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: True)
     docrows = [
-        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE"),
-        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE"),
+        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None),
+        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None),
     ]
     _stub_multi(monkeypatch, [docrows, [("D1", 5, "2026-07-01 10:00:00")]])
     from opensearch_pipeline import api
@@ -752,11 +752,40 @@ def test_my_docs_usage_none_when_fact_join_off(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
-    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE")]
+    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None)]
     _stub_multi(monkeypatch, [docrows])
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
     assert resp.items[0].cited_count is None
+
+
+def test_my_docs_reject_reason_only_when_rejected(monkeypatch):
+    """驳回原因外露口径：仅 content_process_status=REJECTED 时填 reject_reason（反馈闭环）；
+    其他失败态的 content_process_error 是内部诊断文案，不外发。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
+    docrows = [
+        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "REJECTED", None, None, "DONE", "内容过期，已被 v3 取代"),
+        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "FAILED", "FAILED", None, "DONE", "OCR timeout traceback…"),
+    ]
+    _stub_multi(monkeypatch, [docrows])
+    from opensearch_pipeline import api
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
+    by = {i.doc_id: i for i in resp.items}
+    assert by["D1"].status_badge == "已驳回" and by["D1"].reject_reason == "内容过期，已被 v3 取代"
+    assert by["D2"].reject_reason == ""   # 处理失败 ≠ 驳回：内部错误文案不外露
+
+
+def test_ledger_filter_anomaly_badge_in_clause():
+    """「异常」聚合筛选：badge=异常 → 坏徽章 IN 集合（与前端 BAD_BADGES/待办条同口径）；
+    普通徽章仍走单值等号。"""
+    from opensearch_pipeline.routes.kb_console import _kb_ledger_filter_sql
+    from opensearch_pipeline.api import _KB_BAD_BADGES
+    sql, params = _kb_ledger_filter_sql("", "异常", "")
+    assert "IN (%s,%s,%s,%s)" in sql and list(params) == list(_KB_BAD_BADGES)
+    sql1, params1 = _kb_ledger_filter_sql("", "已上线", "")
+    assert sql1.rstrip().endswith("= %s") and params1 == ["已上线"]
 
 
 # ── GET /api/kb/feedback-review：差评联动复核队列（部门作用域，只读）────────────

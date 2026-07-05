@@ -90,20 +90,30 @@ describe('Sidebar — 知识库管理入口待审核角标', () => {
 
 
 describe('accessStateOf — 申请人侧 4 态派生', () => {
-  it('approved+projected→projected · approved+pending_sync→approved_pending_sync · pending · rejected→none', () => {
+  it('approved+projected→projected · approved+pending_sync→approved_pending_sync · pending · rejected→rejected', () => {
     activate(identity({ role: 'dept_admin' }))
     const kb = useKb()
     ;(kb as any).myAccessReqs.value = new Map([
-      ['DA', { status: 'approved', sync_state: 'projected' }],
-      ['DB', { status: 'approved', sync_state: 'pending_sync' }],
-      ['DC', { status: 'pending', sync_state: 'n/a' }],
-      ['DD', { status: 'rejected', sync_state: 'n/a' }],
+      ['DA', { status: 'approved', sync_state: 'projected', note: '' }],
+      ['DB', { status: 'approved', sync_state: 'pending_sync', note: '' }],
+      ['DC', { status: 'pending', sync_state: 'n/a', note: '' }],
+      ['DD', { status: 'rejected', sync_state: 'n/a', note: '涉密暂不外放' }],
     ])
     expect(kb.accessStateOf('DA')).toBe('projected')
     expect(kb.accessStateOf('DB')).toBe('approved_pending_sync')
     expect(kb.accessStateOf('DC')).toBe('pending')
-    expect(kb.accessStateOf('DD')).toBe('none')          // 驳回 → 可重新申请
+    // 反馈闭环：驳回是显式态（原折叠回 none，申请人对被驳回无感）；原因可查，可重申
+    expect(kb.accessStateOf('DD')).toBe('rejected')
+    expect(kb.accessNoteOf('DD')).toBe('涉密暂不外放')
     expect(kb.accessStateOf('DX')).toBe('none')          // 无 row
+  })
+
+  it('rejected 后重新申请（乐观标记）→ 回到 pending（不再卡「已驳回」）', () => {
+    activate(identity({ role: 'dept_admin' }))
+    const kb = useKb()
+    ;(kb as any).myAccessReqs.value = new Map([['DD', { status: 'rejected', sync_state: 'n/a', note: 'x' }]])
+    ;(kb as any).requestedDocIds.value = new Set(['DD'])
+    expect(kb.accessStateOf('DD')).toBe('pending')
   })
 
   it('乐观标记：本会话刚提交（requestedDocIds）→ pending（权威态回灌前）', () => {
@@ -115,20 +125,21 @@ describe('accessStateOf — 申请人侧 4 态派生', () => {
 })
 
 describe('loadMyAccessRequests — 终态清乐观标记（B6）', () => {
-  it('权威回灌「已驳回」→ 清乐观 requestedDocIds，accessStateOf 回 none（不再卡「审批中」）', async () => {
+  it('权威回灌「已驳回」→ 清乐观 requestedDocIds，accessStateOf 显 rejected（原因随行回灌）', async () => {
     activate(identity())
     const kb = useKb()
     ;(kb as any).requestedDocIds.value = new Set(['DZ'])
     expect(kb.accessStateOf('DZ')).toBe('pending')   // 回灌前：乐观显审批中
     vi.stubGlobal('fetch', vi.fn(async (path: string) => {
       if (path.startsWith('/api/kb/my-access-requests')) {
-        return { ok: true, status: 200, json: async () => ({ items: [{ id: 'm1', doc_id: 'DZ', status: 'rejected', sync_state: 'n/a' }] }) }
+        return { ok: true, status: 200, json: async () => ({ items: [{ id: 'm1', doc_id: 'DZ', status: 'rejected', sync_state: 'n/a', decision_note: '本季度不外放' }] }) }
       }
       return { ok: false, status: 404, json: async () => ({}) }
     }))
     await kb.loadMyAccessRequests()
     expect((kb as any).requestedDocIds.value.has('DZ')).toBe(false)   // 乐观标记被清
-    expect(kb.accessStateOf('DZ')).toBe('none')                       // 可重新申请
+    expect(kb.accessStateOf('DZ')).toBe('rejected')                   // 显式驳回态（可重申，原因可查）
+    expect(kb.accessNoteOf('DZ')).toBe('本季度不外放')
   })
 })
 

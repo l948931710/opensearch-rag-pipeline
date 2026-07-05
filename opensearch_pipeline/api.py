@@ -1689,6 +1689,10 @@ class KbDocItem(BaseModel):
     # 前端不显示——0 与「不知道」必须可区分，0=真·从未被引用，是退役候选信号）。
     cited_count: Optional[int] = None
     last_cited_at: str = ""
+    # 驳回原因（仅 content_process_status=REJECTED 时填，取 content_process_error）：
+    # 反馈闭环——原因一直落库但 dept_admin 侧只见红徽章、审批历史 upload 类又只给 kb_admin，
+    # 申请人无从得知为什么被驳回。台账「已驳回」行副行直出。
+    reject_reason: str = ""
 
 
 class KbMyDocsResponse(BaseModel):
@@ -1789,6 +1793,9 @@ _KB_BADGE_CASE_SQL = (
     " WHEN UPPER(COALESCE(v.content_process_status,'')) IN ('','NOT_STARTED') THEN '排队中'"
     " ELSE '处理中' END"
 )
+
+# 「异常」聚合筛选的坏徽章集合（与 console 前端 useKb.BAD_BADGES、待办条「异常文档」同口径）。
+_KB_BAD_BADGES = ("未入索引", "处理失败", "已隔离", "已驳回")
 
 
 def _require_kb_console(identity: Optional[Identity]):

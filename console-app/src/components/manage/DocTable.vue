@@ -15,7 +15,7 @@ const {
   docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, sortKey, sortDir, isDeptAdmin, isKbAdmin,
   ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
   setQuery, sortBy, setScope, enterVersionMode, retire, restore, openHistory, openDocPreview,
-  openAccessRequest, accessStateOf, loadMoreDocs, loadDocs, loadErrors,
+  openAccessRequest, accessStateOf, accessNoteOf, loadMoreDocs, loadDocs, loadErrors,
   openShare, grantedLabelsByDoc, openVisibility,
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
 } = useKb()
@@ -318,6 +318,10 @@ async function onRestore(d: DocItem) {
             <div class="truncate text-[11px] text-faint">
               {{ permLabel(d.permission_level) }}<template v-if="sharedLabels(d.doc_id).length"><span class="text-accent-text"> · 共享 {{ sharedLabels(d.doc_id).slice(0, 2).join('、') }}<span v-if="sharedLabels(d.doc_id).length > 2"> +{{ sharedLabels(d.doc_id).length - 2 }}</span></span></template><template v-if="usageText(d)"> · <span :class="d.cited_count === 0 ? 'text-st-warn' : ''" :title="d.last_cited_at ? `最近被引用 ${d.last_cited_at.slice(0, 16)}` : ''">{{ usageText(d) }}</span></template><span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
             </div>
+            <!-- 驳回原因直出（反馈闭环）：原因一直落库却只有 kb_admin 的审批历史能看到，申请人只见红徽章 -->
+            <div v-if="d.reject_reason" class="mt-0.5 truncate text-[11px] text-st-fail" :title="`驳回原因：${d.reject_reason}`">
+              驳回原因：{{ d.reject_reason }}
+            </div>
           </div>
         </div>
         <div class="led-cell text-sm text-muted-foreground" data-label="归属">
@@ -325,7 +329,11 @@ async function onRestore(d: DocItem) {
           <span v-if="d.can_manage === false" class="ml-1.5 whitespace-nowrap rounded border border-border bg-panel px-1.5 py-px text-[10px] font-medium text-faint">其他部门</span>
         </div>
         <div class="led-cell font-mono text-xs text-muted-foreground" data-label="版本">v{{ d.current_version_no || 1 }}</div>
-        <div class="led-cell" data-label="状态"><StatusPill :badge="d.status_badge" /></div>
+        <!-- 异常态给"下一步"提示：恢复路径其实存在（升版重灌 / 版本历史看原因），但行上原本无任何指引 -->
+        <div
+          class="led-cell" data-label="状态"
+          :title="d.status_badge === '未入索引' || d.status_badge === '处理失败' ? '上传新版本（升版）可重灌；失败原因见「版本历史」' : undefined"
+        ><StatusPill :badge="d.status_badge" /></div>
         <div class="led-cell font-mono text-xs text-muted-foreground" data-label="更新">{{ (d.updated_at || '').slice(0, 16) }}</div>
         <div class="led-cell led-actions doc-actions" data-label="操作">
           <!-- 可操作（本部门 / kb_admin）：可见 / 权限 / 预览 / 历史 / 升版 / 退役。
@@ -382,6 +390,16 @@ async function onRestore(d: DocItem) {
             >
               <Clock :size="12" :stroke-width="2" /> 审批中
             </span>
+            <!-- 已驳回（反馈闭环）：原先折叠回「申请授权」，被驳回这件事和原因都无从得知；悬停出原因，点击重申 -->
+            <button
+              v-else-if="accessStateOf(d.doc_id) === 'rejected'"
+              type="button" data-testid="access-rejected"
+              class="flex items-center gap-1 rounded-md border border-st-fail/30 bg-st-fail/5 px-2 py-1 text-xs font-medium text-st-fail transition hover:border-st-fail/50"
+              :title="accessNoteOf(d.doc_id) ? `驳回原因：${accessNoteOf(d.doc_id)}；可重新申请` : '申请被驳回，可重新申请'"
+              @click="openAccessRequest(d)"
+            >
+              <X :size="12" :stroke-width="2" /> 已驳回 · 重新申请
+            </button>
             <button
               v-else
               type="button"

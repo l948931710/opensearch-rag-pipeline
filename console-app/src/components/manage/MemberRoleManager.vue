@@ -33,7 +33,19 @@ function startEdit(a: AdminItem) {
 async function submit() {
   triedSubmit.value = true
   if (!formUser.value.trim() || !formDepts.value.length) return   // 内联红框 + aria-invalid 已提示，不再弹原生 alert
-  const ok = await grantDeptAdmin(formUser.value.trim(), formName.value.trim(), formDepts.value, formNote.value.trim())
+  // 覆盖式语义防误伤：手输已存在的 staffId 提交 = 整体覆盖其全部授权——若有部门将被移除,
+  // 先列差异确认(走「编辑」预填不会触发,勾选集 ⊇ 现状时也不打扰)。
+  const uid = formUser.value.trim()
+  const existing = deptAdmins.value.find((a) => a.user_id === uid)
+  const removed = existing ? existing.managed_owner_depts.filter((d) => !formDepts.value.includes(d)) : []
+  if (removed.length) {
+    const okGo = await confirm({
+      title: '覆盖既有授权', confirmText: '确认覆盖', danger: true,
+      message: `「${existing!.user_name || uid}」已是部门管理员，提交将【整体覆盖】其授权。\n以下部门的管理权将被移除：${removed.map(deptLabel).join('、')}`,
+    })
+    if (!okGo) return
+  }
+  const ok = await grantDeptAdmin(uid, formName.value.trim(), formDepts.value, formNote.value.trim())
   if (ok) { formUser.value = ''; formName.value = ''; formDepts.value = []; formNote.value = ''; formOpen.value = false; triedSubmit.value = false }
 }
 async function onRevokeAll(a: AdminItem) {

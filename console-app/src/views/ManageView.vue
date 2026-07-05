@@ -26,7 +26,7 @@ import ApprovalHistory from '@/components/manage/ApprovalHistory.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
@@ -45,6 +45,8 @@ const todoChips = computed<TodoChip[]>(() => {
   return chips
 })
 function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
+// 异常 chip：滚动 + 顺带设「异常」聚合筛选（原先只滚动，还得自己再挑一个坏徽章点）
+function onTodoChip(c: TodoChip) { if (c.key === 'anom') setBadgeFilter('异常'); scrollToSec(c.anchor) }
 
 // ── 管理台子 tab（成员管理仅 kb_admin 可见）──
 type Tab = 'dash' | 'docs' | 'history' | 'members'
@@ -57,6 +59,10 @@ const activeTab = ref<Tab>('dash')
   if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (t !== 'members' || isKbAdmin.value)) activeTab.value = t as Tab
 }
 watch(activeTab, (t) => { void router?.replace({ query: { ...(route?.query || {}), tab: t === 'dash' ? undefined : t } }) })
+// 反向：URL tab 变化 → 切 tab（差评复核「定位文档」等站内导航靠它；同值 no-op 防回环）
+watch(() => route?.query?.tab, (t) => {
+  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (t !== 'members' || isKbAdmin.value) && t !== activeTab.value) activeTab.value = t as Tab
+})
 const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
   { key: 'dash', label: '概览看板', icon: LayoutDashboard },
   { key: 'docs', label: '文档管理', icon: FolderOpen },
@@ -204,7 +210,7 @@ onMounted(async () => {
           v-for="c in todoChips" :key="c.key" type="button"
           class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-[12px] font-medium transition hover:border-border-strong"
           :class="c.tone"
-          @click="scrollToSec(c.anchor)"
+          @click="onTodoChip(c)"
         >{{ c.label }} <b class="font-mono tabular-nums">{{ c.n }}</b></button>
         <div class="flex-1" />
         <button
