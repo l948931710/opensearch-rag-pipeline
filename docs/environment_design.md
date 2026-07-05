@@ -49,6 +49,8 @@
 | RAG_ENV | 空 | `local` | `local_ab_new` / `_old` | **`staging`** | `prod_ro`（`test` 为过渡别名） | 不设（平台注入） |
 | RAG_ENVIRONMENT | development | development | development | **staging** | staging | production |
 | RAG_READONLY | — | false | false | false | **true** | false |
+| RAG_PROMPT_INJECTION_GUARD | — | false | false | false | false | **true**（平台注入；code 默认 OFF 保 eval 基线，见 llm_generator.py:77） |
+| RAG_CHUNK_EXPLOSION_GATE | — | false | false | false | false | **true / mode=warn**（平台注入；仅告警不改入库，pipeline_nodes.py:4347） |
 | RDS | 模拟 | docker localhost（补建 fuling_operation 库） | 同左，doc_id 前缀分臂 | 生产实例 **fuling_knowledge_stg + fuling_operation_stg** 库（`fuling_stg` 账号，仅授 `*_stg` 库权限） | 生产 + **`fuling_ro` 只读账号** | 生产 `fuling_admin`（注入） |
 | 检索 | MOCK_HA3_CLIENT | 本地 OpenSearch `fuling_knowledge_v1` | `locale2e_v1` / `locale2e_old_v1` | 生产 HA3 实例 **`fuling_kb_chunks_stg` 表** | 生产 HA3 公网 `fuling_kb_chunks` | 生产 HA3（注入） |
 | OSS | 模拟 | **零 OSS**：管线 `RAG_SIMULATE_OSS=true` 走本地文件；语料用采样脚本（ram-rag-ro 只读 key）从生产拉取；仅 URL 签名用 ro key | 同左 | **新建 `fuling-knowledge-base-staging` 桶** + ram-rag-stg（仅该桶读写） | 生产桶公网 + **ram-rag-ro 只读** | 生产桶内网 + ram-rag-prod（注入） |
