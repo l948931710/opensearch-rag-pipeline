@@ -17,7 +17,10 @@
 ARG BASE=dataworks_pyodps_py311_task_pod:<FILL_EXACT_TAG_FROM_CONSOLE>
 FROM ${BASE}
 
-# ── DEPENDENCIES (pinned; installed for the image's Python so the ABI is correct) ───────────────
+# ── DEPENDENCIES (version-FLOORED `>=`, NOT pinned — P3-12 更正：此前注释谎称 pinned) ────────────
+# 每次 docker build 都会解析到当日最新兼容版：CI pip-audit 审的是它自己的解析结果，不能代表
+# 本镜像里实际装到的版本。要可复现构建需引入 lockfile（pip-tools --generate-hashes / uv.lock）
+# 并改用 --require-hashes 安装——在有 lockfile 之前，重建镜像后请核对关键 SDK 版本变化。
 # The Serverless RG build network may not reach public PyPI — use the Aliyun mirror (or your NAT).
 ARG PIP_INDEX=https://mirrors.cloud.aliyuncs.com/pypi/simple/
 # Superset of the monitor's transitive needs (pyproject core + production + ocr). Installing the full

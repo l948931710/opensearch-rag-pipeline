@@ -9,14 +9,36 @@ This guide outlines the deployment, package installation, environment configurat
 To run standard Python pipeline nodes, a **DataWorks Exclusive Resource Group for Scheduling (独享调度资源组)** must be used. Standard shared resource groups do NOT allow pip package installations or customized Python interpreter configurations.
 
 ### Requirements:
-Add the following packages under the "Resource Group Python Environment Packages" configuration in the DataWorks Console:
+Add the following packages under the "Resource Group Python Environment Packages" configuration in the DataWorks Console.
+
+> ⚠️ **盲区审计 P3-12 更正**：本清单旧版只列了 5 个包，**遗漏了 oss2 / dashscope /
+> alibabacloud-ha3engine-vector 等核心 SDK 与全部抽取依赖**——照旧清单重建资源组会在
+> stage-1/3 直接 ImportError。权威依赖来源是 `pyproject.toml`（core + `production` + `ocr`
+> extras），本清单为其镜像，两者有出入以 pyproject 为准。另注意：全部约束是 `>=` 下限
+> **而非锁定版本**——目前无 lockfile，重建时会解析到当日最新兼容版。
 
 ```text
-opensearch-py>=2.0.0
-pymysql>=1.0.0
-cryptography>=41.0.0
+# core（抽取）
+pypdf>=4.0
+pdfplumber>=0.11
+python-docx>=1.0
+python-pptx>=0.6
+openpyxl>=3.1
+requests>=2.31
+# production（存储/检索/模型 SDK）
+pymysql[rsa]>=1.1
+DBUtils>=3.0
+opensearch-py>=2.4
+oss2>=2.18
+dashscope>=1.14
+alibabacloud-ha3engine-vector>=1.1.18
+dingtalk-stream>=0.24
+jieba>=0.42
+Pillow>=10.0
+# ocr
+PyMuPDF>=1.24
+# 环境装载
 python-dotenv>=1.0.0
-requests>=2.31.0
 ```
 
 > [!IMPORTANT]

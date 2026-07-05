@@ -1,7 +1,7 @@
-# 盲区审计修复台账（P1 + P2）
+# 盲区审计修复台账（P1 + P2 + P3）
 
 > 依据：`docs/architecture_blindspot_audit_2026-07-05.md`（55 条）。本文件跟踪 P1×2 + P2×34
-> 的处置状态；P3 未启动。状态：✅ 已修复（代码合入）· 🟡 部分修复（代码侧可落的最大程度，
+> + P3×19 的处置状态。状态：✅ 已修复（代码合入）· 🟡 部分修复（代码侧可落的最大程度，
 > 剩余 user-gated）· 📋 延期（需用户拍板/基建，附论证）。
 > 全部修复的公共 user-gated 尾巴：**SAE/DataWorks 重打包部署** + **schema/017、018 apply 生产**。
 
@@ -51,6 +51,30 @@
 | P2-33 | review_task 只写不读 | ✅ | console 复审队列（kb_admin，按龄）+ 处置写 reviewer_*；实际整改用既有工具 |
 | P2-34 | 人工队列无老化/SLA 监控 | ✅ | queue_monitor.run_queue_aging_check：三队列积压+最老龄，超 SLA 告警，入 ops_monitor |
 
+## P3（2026-07-05 批：值得修的 13 条已落地，6 条延期立项）
+
+| # | 摘要 | 状态 | 落点 / 论证 |
+|---|---|---|---|
+| P3-1 | 主命中不经 RDS 复核 | ✅ | `retriever._revalidate_main_hits`（RAG_MAIN_HIT_REVALIDATE 默认开）：主命中按 chunk_meta 复核 is_active + permission_level/owner_dept 一致性，漂移即丢弃。**有意不比 allowed_depts**（授权新增先落 RDS 后投影，比对会把授权变更放大成整天不可检索；撤销向已有 `_deny_revoked_cross_dept` fail-closed 兜底）。权威不可达/整体空集 → 保留并告警（HA3 服务端过滤是第一道边界，不把 RDS 故障放大为全站无答案） |
+| P3-2 | 「摄取平面唯一写者」文档谬误 | ✅ | architecture.md §2 改为按列所有权声明（HA3=摄取独写 · chunk_meta ACL/状态列=服务共写经 outbox/PENDING_DELETE 握手 · index_status=CAS 令牌）+ reconciler 推理指引 |
+| P3-3 | kb_audit_log 无防篡改 | 📋 | hash 链（prev_hash+HMAC+密钥隔离）+ 审计清除角色分离 = 独立项目；唯一触发是持 PROD-RW 令牌的带外特权内部人，无应用可达利用（审计自评 PLAUSIBLE）。本批 P3-18 已把 retention 对 audit 的 DELETE 改为**归档后删**——证据不再无痕消失，残余风险=直连 DBA UPDATE，属密钥/角色治理域，建议与云安全加固批次合并 |
+| P3-4 | 无同意/目的/合法性记录 | 📋 | PIPL 同意记录子系统（告知流+同意表+目的校验）= 审计主题三点名的独立治理工作流，跨钉钉认证/schema/挖掘脚本三面，非补丁可达；P2-5 主体擦除已先行落地。建议与「数据治理与可复现性」专项立项 |
+| P3-5 | 部门 ACL 无单一咽喉（4 处重导 2 存储） | 📋 | 单一 `is_doc_visible`/`permission_filter` 权威模块 = load-bearing 检索路径大重构；审计自评 PLAUSIBLE、当前无可达可见性 bug、resign 读的本就是权威存储。重构收益兑现在「下次 ACL 语义变更只改一处」——建议与下一次 ACL 演进（如 dept_id 子树制迁移）合并做，孤立重构纯风险无当期收益 |
+| P3-6 | 会话无身份绑定，钉钉 key 可伪造窃取历史 | ✅ | `_SessionEntry.owner` 绑定：建时存已验证身份、访问校验（他人/匿名→SessionOwnershipError→API 403）；匿名 UUID 条目持有即所有+首个认证者就地绑定；钉钉 bot `trusted=True`（已验签回调=权威身份，抢注条目被丢弃重建而非 DoS 真实用户）；miniapp 前缀检查保留（挡"条目尚不存在时的抢注"） |
+| P3-7 | embedding_version 死常量只写不读 | ✅ | `versions.embedding_regime_version()` 从实时 config 派生 `model@dimension`（仿 acl_policy_version 自变哲学）；stage-3 写侧、/api/version 改用派生值；**读者半边**=`rebuild_from_rds --stale-embedding`（按行级真值列 embedding_model/dimension 比对选重嵌范围——有意不比指纹串，避免历史行格式差异误判全语料陈旧） |
+| P3-8 | Gemini 嵌入兜底制度不兼容 | ✅ | load_config 嵌入制度守卫：真嵌入（非 simulate）+ 已配检索后端 + 解析到非 DashScope 嵌入 → EnvironmentMismatchError（无 sparse/维度错配，索引与 eval 全失真）；RAG_ALLOW_INCOMPATIBLE_EMBEDDING=ack 显式实验放行 |
+| P3-9 | trace 基建定义未接线 | ✅ | `install_request_id_logging()` 真正挂 RequestIdLogFilter（api.py 装配时，bot 同进程一次覆盖）；bot 三入口（webhook body/卡片回调/RAG 线程显式传参——Thread 不复制 ContextVar）ensure/set_request_id；两处本地 uuid trace 改用同一 rid；gen_meta_json 新增 request_id——成功但答错的落库行首次可 grep 关联 |
+| P3-10 | bizdate 名义参数 + 容器本地时钟兜底 | ✅ | 三个 stage 节点兜底改固定 UTC+8 求北京 T-1；orchestrator docstring/CLI help 如实声明「纯状态 drain，bizdate 仅溯源标注，不能按日回填」并指向 reset_for_rechunk/rebuild_from_rds |
+| P3-11 | judge 校准门从不接入自动路径 | ✅ | phase_merge 按同目录约定（judge_calibration_labels.json）/RAG_JUDGE_CAL_LABELS 拾取人工标注→compare→results['judge_calibration']（门自动出现）；无标注时显式打印+report meta 标注 NOT ACTIVE。**有意不插 not_executed 门**——人工标注是稀缺产物，插门会让所有无标注 strict 跑恒挂 |
+| P3-12 | 依赖四清单漂移无 lockfile | 🟡 | 文档侧已修：dataworks_deployment.md 包清单补齐核心 SDK+抽取依赖（旧清单照抄会 ImportError）+ 声明 pyproject 为权威；monitor Dockerfile 谎称 pinned 的注释改如实。**lockfile 本体 user-gated**：pip-tools/uv 锁定+`--require-hashes` 需在有网环境生成并对四个运行时逐一验证，建议单独一次过 |
+| P3-13 | 嵌入缓存 20k 硬上限无信号 | ✅ | 上限本就 env 可配（RAG_EMBEDDING_CACHE_MAX_ENTRIES，E-K 批）；本批补齐信号半边：每次运行记命中率（含 backend/entries/cap），容量压力（本批需求超上限/存量顶上限=驱逐中）发 ops 告警（dedup_key=embed-cache-cap） |
+| P3-14 | effective_date/expiry_date 死列 | 📋 | 语料里**不存在**真实生效/失效日期信号（封面日期未采集），populate 是抽取特征项目而非补丁；P2-31 已用版本落库日给了时效近似。与 P2-8/31 的 HA3 整表重建窗口一并拍板：届时要么接真实日期采集+检索过滤，要么删列（避免暗示不存在的治理保证） |
+| P3-15 | 无跨文档矛盾/取代检测 | 📋 | 语义级冲突检测 = 缺失能力项目（审计自评降级：真实语料以良性格式重复为主，价值级矛盾未被数据佐证）；现有缓解 = twin-governance skill + corpus_cleanup_worklist 人工台账 + 注册侧精确哈希防重。待有真实矛盾案例佐证 ROI 再立项 |
+| P3-16 | 无周期复审/文档老化作业 | 📋 | 依赖两个前置：effective_date 数据（P3-14）与「哪些类别多久复审」的政策拍板（无规范强制）；消费端（console 复审队列，P2-33）已就绪，接线成本低——政策定了即可加 queue_monitor 型作业 |
+| P3-17 | 向量无权威存储 | ✅ | 按审计自评（"至多值 DR runbook 一条"）落文档：architecture.md §10.7 DR 注记——全量 HA3 丢失的恢复路径（rebuild_from_rds→stage-3 重嵌）、成本与模型代差警告、--stale-embedding 核对指引 |
+| P3-18 | retention 删唯一审计流水无归档 | ✅ | qa_rows/audit 两作业 commit 时改 select→OSS gzip JSONL 归档→按已归档 id 精确 DELETE（无 ORDER BY 的 DELETE..LIMIT 与 SELECT 可能选中不同行）；**归档失败即中止（fail-closed，绝不先删后补）**；RAG_RETENTION_ARCHIVE=false 显式退回直删（默认开） |
+| P3-19 | faq_review_queue 死表 | 🟡 | 文档侧如实标注（architecture.md §8.1：零生产者/消费者、闭环从未实现、converted_to_faq 从不置位），并指明将来实现应复用 contribution 管线而非激活死表；**闭环本体延期**——升级→FAQ→语料发布器需产品拍板（谁审、如何去重、何种权限），P1-2 的工单队列+contribution 管线已备齐两端积木 |
+
 ## User-gated 清单（代码已就绪，等待用户动作）
 
 1. **schema/017 + 018 apply 生产**（fuling_operation/fuling_knowledge；随既有 016 待办同批）。
@@ -59,4 +83,10 @@
    `make release-gate` 前先在本机 refreeze 或设 RAG_EVAL_GOLDSET=golden_50.json）。
 4. 生产 env 确认：RAG_OPS_ALERT_WEBHOOK（告警通道）/ RAG_ADMIN_NOTIFY（管理员通知）。
 5. P2-18 时区地面真相：下次生产跑 rollup 看 tz_probe 日志，再决策是否迁移存储时区。
-6. HA3 整表重建窗口（P2-8 模型戳 + P2-31 日期字段一起上）——与下一次索引结构变更合并。
+6. HA3 整表重建窗口（P2-8 模型戳 + P2-31 日期字段一起上；P3-14 日期列去留同窗拍板）。
+7. （P3-12）**Python lockfile**：有网环境跑 pip-tools/uv 生成锁定（`--generate-hashes`），
+   四个运行时（SAE 镜像 / DataWorks 资源组 / monitor 镜像 / CI）改 `--require-hashes` 安装，
+   pip-audit 指向 lock。
+8. （P3 批部署注记）P3-1/6/9 属 serving（随 SAE 重打包生效）；P3-7/10/13/18 属
+   pipeline/DataWorks（随重打包+节点脚本更新生效）；retention 节点如需关闭删前归档
+   （无 OSS 环境）显式设 RAG_RETENTION_ARCHIVE=false。

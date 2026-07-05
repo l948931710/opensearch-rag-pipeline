@@ -133,7 +133,15 @@ flowchart TB
     PERM -.过滤条件.-> HA3
 ```
 
-**两个平面的衔接点**是 HA3 索引和 RDS：摄取平面是唯一的写入者（chunk + 向量 + 元数据），服务平面只读检索；问答日志和反馈则由服务平面写入 `fuling_operation` 库，再由离线脚本（`scripts/feedback_miner.py` 等）反哺语料优化。
+**两个平面的衔接点**是 HA3 索引和 RDS。⚠️ **不要假设"摄取平面是唯一写入者"**（盲区审计 P3-2 更正——旧版文档的这句断言与现实不符，且正是 P2-1/P2-2/P2-3 一类跨平面竞态被漏掉的上游根因）。按列所有权：
+
+- **HA3 向量与 chunk 正文**：唯一写入者是摄取平面（stage-3 推送 + 显式 PK 删除）。服务平面绝不直接写 HA3。
+- **`chunk_meta` 的 ACL/状态列**（`is_active` / `index_status` / `permission_level` / `allowed_depts`）：**服务平面是共写者**——控制台 retire/set-visibility/授权决议（`routes/kb_console.py`、`access_grants.py`）直接改这些列，并经 `kb_acl_projection_outbox` + `PENDING_DELETE` 握手交摄取平面收敛。`index_status` 是两平面共有的握手令牌：批处理收尾必须走 CAS（仅 `PROCESSING`→终态，P2-2 修复），控制台侧对称地不覆盖批处理在途状态。
+- **`document_meta` / `document_version` 的状态列**（`status` / `current_version_no`）：服务平面共写（下线/恢复/版本管理）。
+- **`user_role` / `dept_admin_grant` / `kb_access_request`**：服务平面独写（身份与授权域）。
+- **问答日志与反馈**（`fuling_operation` 库）：服务平面独写，离线脚本（`scripts/feedback_miner.py` 等）只读反哺。
+
+一致性含义：reconciler（`reconcile.py` 等）面对的漂移**并非全是异常**——一部分是服务平面写入后等待批处理收敛的常态中间态；对账/审计逻辑必须按上面的列所有权推理，而不是把任何非批处理写入当作污染。
 
 ---
 
@@ -379,7 +387,9 @@ SAE 公网 EIP（HTTP 测试期形态）已被扫描器探到端口，匿名直�
 | 权限 | `user_role`（userid→dept，003 加 UNIQUE 约束）、`document_acl_rule` |
 | 文档元数据 | `document_meta`、`document_version`、`document_tag`、`tag_taxonomy` |
 | Chunk | `chunk_meta`（含 `index_status`、`image_refs_json`、step card 字段） |
-| 审计/任务 | `kb_audit_log`、`kb_import_job`、`review_task`、`faq_review_queue`、`batch_llm_job/_item`、`opensearch_bulk_job` |
+| 审计/任务 | `kb_audit_log`、`kb_import_job`、`review_task`、`faq_review_queue`†、`batch_llm_job/_item`、`opensearch_bulk_job` |
+
+† `faq_review_queue` 是**死表**（盲区审计 P3-19 如实标注）：schema 为「升级工单→专家答→FAQ→语料回灌」闭环预留，但全仓无任何生产者/消费者，`escalation_ticket.converted_to_faq` 也从不被置位。该闭环**从未实现**——现有的人工知识回灌路径是知识贡献入口（`contribution.py`：员工投稿→管理员采纳→合成 .md 走管线入库）。若将来实现工单转 FAQ，优先复用 contribution 管线而非激活此表；若确认不做，应随下一次 schema 变更删表。
 | 敏感发现 | `document_sensitive_finding`（仅哈希+掩码） |
 | 问答运营（fuling_operation） | `qa_session_log`（所有问答的唯一审计流水）、`user_feedback`、`escalation_ticket` |
 
@@ -442,6 +452,13 @@ quarantine/   高风险隔离区
 4. **会话内存态**：见 §9.3，横向扩容前必须迁 Redis。
 5. **`.xls`（legacy 二进制）明确不支持**（有清晰告警，无静默失败）；HTML 去标签、CSV 解析后再分块。
 6. 上下文上限（6,000 字符截断）与生产 ~11% 错误率为已知待办（详见 eval_harness 报告）。
+7. **向量无权威存储（DR 注记，盲区审计 P3-17）**：dense/sparse 向量只存在于 HA3 与一个
+   **建议性**嵌入缓存（SQLite + OSS 镜像，`RAG_EMBEDDING_CACHE_MAX_ENTRIES` 上限内最旧先驱逐，
+   每 chunk 占 dense+sparse 两条）——`chunk_meta` 只存嵌入元数据不存向量。**全量 HA3 丢失的
+   恢复路径**：`scripts/rebuild_from_rds.py --probe/--from-reconcile` 定位缺失集 → `--commit`
+   置 `NOT_INDEXED` → stage-3 drain 从 `chunk_meta.chunk_text` 重嵌入重推。缓存已驱逐/降级的
+   chunk 将**重付 DashScope 嵌入费**（成本与语料规模成正比）；若恢复时嵌入模型已换代，重建
+   向量与残存旧向量存在模型代差——重建前先核对 `--stale-embedding` 范围，必要时全量重嵌。
 
 ---
 
