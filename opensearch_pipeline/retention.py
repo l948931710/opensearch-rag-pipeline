@@ -31,6 +31,12 @@ document_sensitive_finding、pipeline_run 只进不出——看板窗口查询�
     "哪里被脱敏过"，是活的审计依据；只清理已退役/被取代版本的历史 finding。
   · 批量执行（默认 LIMIT 5000/批、批间 0.2s、单作业单次上限 400 批）：短事务、
     不压 binlog/主备复制；超上限即停，次日续跑（幂等）。
+  · **删前冷归档（盲区审计 P3-18）**：qa_rows / audit 两个作业删的是架构文档指定的
+    "唯一问答审计流水" 与特权操作审计——commit 时每批先 select-PK-then-archive：
+    整行 gzip JSONL 上传 OSS `archive/retention/<table>/<run_ts>/batch-NNNN.jsonl.gz`，
+    **归档上传失败即中止该作业（fail-closed，绝不先删后补）**；随后按已归档 id 精确
+    DELETE（无 ORDER BY 的 DELETE..LIMIT 与 SELECT 可能选中不同行，故必须按 id 删）。
+    RAG_RETENTION_ARCHIVE=false 显式退回旧的直删语义（无 OSS 的环境自担不可逆风险）。
   · 时区注：created_at 存的是 SAE 容器墙钟（太平洋时间），本模块统一用服务端
     `DATE_SUB(NOW(), INTERVAL n MONTH)` 比较——两侧同一时钟，月粒度下时区滑差无意义。
 
@@ -111,11 +117,16 @@ def _job_sqls(job: str) -> Dict[str, str]:
         pred = ("FROM {op}.qa_session_log "
                 "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
         return {"count": f"SELECT COUNT(*) {pred}",
-                "act": (f"DELETE {pred} LIMIT %s")}
+                "act": (f"DELETE {pred} LIMIT %s"),
+                # P3-18 归档路径（select-then-archive-then-delete-by-id）
+                "select_rows": f"SELECT * {pred} LIMIT %s",
+                "act_by_ids": f"DELETE FROM {op}.qa_session_log WHERE id IN ({{ids}})"}
     if job == "audit":
         pred = ("FROM {kb}.kb_audit_log "
                 "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(kb=kb)
-        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s",
+                "select_rows": f"SELECT * {pred} LIMIT %s",
+                "act_by_ids": f"DELETE FROM {kb}.kb_audit_log WHERE id IN ({{ids}})"}
     if job == "qa_facts":
         # qa_retrieved_doc（schema/013，可选迁移）：表未建的环境由 run_retention 按 1146 静默 skip
         pred = ("FROM {op}.qa_retrieved_doc "
@@ -144,6 +155,40 @@ def _job_sqls(job: str) -> Dict[str, str]:
                 "select_ids": f"SELECT f.id {pred} LIMIT %s",
                 "act_by_ids": f"DELETE FROM {kb}.document_sensitive_finding WHERE id IN ({{ids}})"}
     raise ValueError(f"unknown retention job: {job}")
+
+
+# ─── P3-18 删前冷归档（qa_rows / audit）──────────────────────────────────────
+
+_ARCHIVE_TABLES = {"qa_rows": "qa_session_log", "audit": "kb_audit_log"}
+
+
+def _archive_enabled() -> bool:
+    """默认开（治理方向 fail-closed）；无 OSS 的环境显式设 false 退回直删。"""
+    return os.environ.get("RAG_RETENTION_ARCHIVE", "true").lower() in ("1", "true", "yes")
+
+
+def _archive_batch(job: str, rows, cols: List[str], batch_no: int, run_ts: str) -> str:
+    """一批行 → gzip JSONL → OSS 冷归档。返回 OSS key；任何失败 raise（调用方按
+    fail-closed 中止该作业——绝不出现"删了但没归档"）。"""
+    import gzip
+    import io
+    import json as _json
+
+    from opensearch_pipeline.clients import _get_oss_bucket
+    bucket, is_sim = _get_oss_bucket()
+    if is_sim or bucket is None:
+        raise RuntimeError(
+            "OSS 不可用（simulate/占位凭据）——归档不可行，拒绝删除。"
+            "确无归档需求可设 RAG_RETENTION_ARCHIVE=false 显式退回直删。")
+    table = _ARCHIVE_TABLES[job]
+    key = f"archive/retention/{table}/{run_ts}/batch-{batch_no:04d}.jsonl.gz"
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        for r in rows:
+            d = r if isinstance(r, dict) else dict(zip(cols, r))
+            gz.write((_json.dumps(d, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
+    bucket.put_object(key, buf.getvalue())
+    return key
 
 
 def _rollup_alive(cur) -> Optional[str]:
@@ -213,10 +258,28 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
                     print(f"[retention] {job}: dry-run，将影响 {rep['affected']} 行"
                           f"（>{months} 月）")
                     continue
+                # P3-18：qa_rows/audit 是审计流水——commit 且归档开启时走
+                # select→OSS 归档→按 id 删；归档上传失败 raise 中止该作业（fail-closed）。
+                _arch_on = job in _ARCHIVE_TABLES and _archive_enabled()
+                _run_ts = time.strftime("%Y%m%dT%H%M%S")
                 deleted = 0
-                for _ in range(max_batches):
+                for _b in range(max_batches):
                     with conn.cursor() as cur:
-                        if "act_by_ids" in sqls:
+                        if _arch_on:
+                            cur.execute(sqls["select_rows"], (months, batch))
+                            cols = [d[0] for d in (cur.description or [])]
+                            rows = cur.fetchall() or []
+                            if not rows:
+                                break
+                            _id_i = cols.index("id")
+                            ids = [str(int(r["id"] if isinstance(r, dict) else r[_id_i]))
+                                   for r in rows]
+                            key = _archive_batch(job, rows, cols, _b, _run_ts)
+                            rep["archive_objects"] = rep.get("archive_objects", 0) + 1
+                            rep["archive_last_key"] = key
+                            cur.execute(sqls["act_by_ids"].format(ids=",".join(ids)))
+                            n = cur.rowcount
+                        elif "select_ids" in sqls:   # findings：当前版本守卫的两步批
                             cur.execute(sqls["select_ids"], (months, batch))
                             ids = [str(int(r[0])) for r in cur.fetchall()]
                             if not ids:

@@ -22,7 +22,27 @@ from typing import Optional
 EXTRACTOR_VERSION = "1.0.0"
 CHUNKER_VERSION = "1.0.0"
 DETECTOR_VERSION = "1.0.0"          # _CLAUSE_RE / _STEP_DETECT_RE / heading / routing detector revision
+# ⚠️ 手工常量仅作 embedding_regime_version() 的最后兜底（config 完全不可用时）。
+# 盲区审计 P3-7：手工 pin 与运行时 RAG_EMBEDDING_MODEL/DIMENSION 脱钩——模型换代时
+# 必然过期且无人发现。chunk_meta.embedding_version 的写值与 /api/version 均已改用
+# 下面的派生指纹（仿 acl_policy_version 的"内容自变，杜绝忘记 bump"）。
 EMBEDDING_MODEL_VERSION = "text-embedding-v4"
+
+
+def embedding_regime_version() -> str:
+    """嵌入制度指纹 `model@dimension`，从实时 config 解析（P3-7）。
+
+    与 acl_policy_version 同哲学：从真值自动派生，模型/维度一变指纹即变，无需手动 bump。
+    写入 chunk_meta.embedding_version 作行级溯源；重索引范围选择器（rebuild_from_rds
+    --stale-embedding）按行级真值列 embedding_model/embedding_dimension 比对——不比对
+    本指纹串，避免历史行（旧常量格式）被误判为陈旧而触发全语料重嵌入。
+    任何异常回退手工常量（fail-open，与本模块其余 helper 一致）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        emb = get_config().embedding
+        return f"{emb.model}@{emb.dimension}"
+    except Exception:
+        return EMBEDDING_MODEL_VERSION
 
 
 def acl_policy_version() -> str:

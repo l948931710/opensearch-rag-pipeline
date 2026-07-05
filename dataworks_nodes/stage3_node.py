@@ -10,7 +10,7 @@ import os
 import sys
 import subprocess
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ═══════════════════════════════════════════════════════════════
 # 📦 安装 Stage 3 依赖
@@ -83,9 +83,12 @@ if current_dir not in sys.path:
 # 2. 解析调度参数
 # ═══════════════════════════════════════════════════════════════
 print("=== 3. 解析调度参数 ===")
-# 兜底 bizdate = T-1（与 DataWorks ${bizdate} 语义一致）。原先硬编码 '20260521'：
+# 兜底 bizdate = 北京 T-1（与 DataWorks ${bizdate} 语义一致）。原先硬编码 '20260521'：
 # 节点漏配调度参数时会永远跑在那个过期日期上且毫无报错。
-bizdate = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+# P3-10：曾用容器本地 datetime.now()——DataWorks pod 是 UTC，其翻日时刻比北京晚 8h，
+# 北京 00:00-08:00 间兜底会算错业务日 → 改按固定 UTC+8 求北京 T-1（bizdate 仅作
+# 溯源标注，各阶段选行是纯状态 drain，不按日期过滤——见 dataworks_orchestrator docstring）。
+bizdate = (datetime.now(timezone.utc) + timedelta(hours=8) - timedelta(days=1)).strftime("%Y%m%d")
 if len(sys.argv) > 1:
     arg_val = sys.argv[1]
     bizdate = arg_val.split("=")[-1].strip() if "=" in arg_val else arg_val.strip()

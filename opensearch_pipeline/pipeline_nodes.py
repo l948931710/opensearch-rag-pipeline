@@ -5873,8 +5873,28 @@ def node_generate_embeddings(ctx: dict):
                 chunk.sparse_vector_values = sp_data.get("values", [])
             cache_hits += 1
 
-        if cache_hits > 0:
-            print(f"    └─ Embedding cache hit: {cache_hits}/{len(chunks)} chunks (sqlite)")
+        # P3-13：命中率与容量压力显式化。上限（默认 20000 条 = dense+sparse 双条 ≈ 10000
+        # chunk）此前是无信号的规模悬崖：语料/全量重切一旦超容，跨运行 OSS 镜像停止摊薄、
+        # 重复整付 DashScope，唯一症状是账单变大。每次运行都记命中率；容量压力（本批
+        # 需求量超上限 / 存量已顶上限=驱逐进行中）发 ops 告警提示调 RAG_EMBEDDING_CACHE_MAX_ENTRIES。
+        _hit_rate = cache_hits / len(chunks) if chunks else 1.0
+        print(f"    └─ Embedding cache hit-rate: {cache_hits}/{len(chunks)} "
+              f"({_hit_rate:.0%}, backend={_store.backend}, entries={_store.count()}, "
+              f"cap={_CACHE_MAX_ENTRIES})")
+        _cap_pressure = (len(chunks) * 2 > _CACHE_MAX_ENTRIES
+                         or _store.count() >= _CACHE_MAX_ENTRIES)
+        if _cap_pressure and not simulate_api:
+            try:
+                from opensearch_pipeline.alerting import send_ops_alert
+                send_ops_alert(
+                    "嵌入缓存容量压力：跨运行成本摊薄退化",
+                    f"本批 {len(chunks)} chunk（需 {len(chunks) * 2} 条缓存）vs 上限 "
+                    f"{_CACHE_MAX_ENTRIES}（现存 {_store.count()}）。超容后最旧先驱逐，"
+                    f"下次运行将对被驱逐 chunk 重付 DashScope 嵌入费。"
+                    f"请调大 RAG_EMBEDDING_CACHE_MAX_ENTRIES（本批命中率 {_hit_rate:.0%}）。",
+                    severity="warning", dedup_key="embed-cache-cap")
+            except Exception as _e:   # noqa: BLE001 — 告警失败绝不影响摄取
+                print(f"    ⚠️ embed-cache cap alert failed (non-fatal): {_e}")
 
         if not miss_chunks:
             print(f"    └─ All {len(chunks)} chunks served from cache, no API calls needed")
@@ -6587,8 +6607,11 @@ def node_update_index_status(ctx: dict):
         return
 
     from datetime import datetime
-    from opensearch_pipeline.versions import EMBEDDING_MODEL_VERSION  # L3: populate embedding_version
-    
+    # L3: populate embedding_version —— P3-7 后写派生指纹 model@dimension（随 config 自变），
+    # 不再写与运行时脱钩的手工常量（模型换代时常量必然过期、溯源失真）。
+    from opensearch_pipeline.versions import embedding_regime_version
+    _embedding_version = embedding_regime_version()
+
     batches = ctx.get("bulk_batches")
     if batches is None:
         batches = [{
@@ -6707,7 +6730,7 @@ def node_update_index_status(ctx: dict):
                         """, (
                             chunk.embedding_status,
                             chunk.embedding_model,
-                            EMBEDDING_MODEL_VERSION,
+                            _embedding_version,
                             dim,
                             emb_at,
                             chunk.index_status,
@@ -6745,7 +6768,7 @@ def node_update_index_status(ctx: dict):
                             """, [
                                 _g_emb_status,
                                 _g_emb_model,
-                                EMBEDDING_MODEL_VERSION,
+                                _embedding_version,
                                 _g_dim,
                                 _g_emb_at,
                                 index_name,

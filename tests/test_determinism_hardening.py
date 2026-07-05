@@ -53,3 +53,16 @@ def test_vlm_cache_writes_atomically():
     assert "save_vlm_cache" in inspect.getsource(UnifiedExtractor._save_vlm_cache), (
         "UnifiedExtractor._save_vlm_cache must delegate to the shared sqlite-backed store"
     )
+
+
+def test_embedding_cache_hit_rate_and_cap_pressure_signals():
+    """P3-13：20k 上限此前是无信号的规模悬崖——超容后跨运行 OSS 镜像停止摊薄、
+    重复整付 DashScope，唯一症状是账单变大。节点必须每次运行记命中率，且在容量
+    压力（本批需求超上限/存量顶上限）时发 ops 告警（dedup 防风暴）。"""
+    from opensearch_pipeline.pipeline_nodes import node_generate_embeddings
+    src = inspect.getsource(node_generate_embeddings)
+    assert "hit-rate" in src, "必须每次运行记录缓存命中率"
+    assert "send_ops_alert" in src and "embed-cache-cap" in src, (
+        "容量压力必须走 ops 告警（dedup_key=embed-cache-cap）"
+    )
+    assert "RAG_EMBEDDING_CACHE_MAX_ENTRIES" in src, "上限必须保持 env 可配"

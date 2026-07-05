@@ -167,3 +167,22 @@ def test_from_reconcile_refuses_error_report(tmp_path):
     p = tmp_path / "parity.json"
     p.write_text(json.dumps({"ha3": {"error": "HA3 down", "counts": {}}}), encoding="utf-8")
     assert rb.main(["--from-reconcile", str(p)]) == 3
+
+
+# ── P3-7：嵌入制度漂移选择器（embedding_version「只写不读」的读者半边）──
+
+def test_stale_embedding_selector_targets_drifted_rows(monkeypatch, capsys):
+    import opensearch_pipeline.prod_access as pa
+    from opensearch_pipeline.config import get_config
+    ro = _Conn([_row(1), _row(2)])
+    monkeypatch.setattr(pa, "get_prod_readonly_conn", lambda *a, **k: ro)
+    assert rb.main(["--stale-embedding"]) == 0
+    # 选择谓词按行级真值列比对（embedding_model/dimension），有意不比 embedding_version
+    # 指纹串——历史行是旧常量格式，按串比对会把全语料误判为陈旧
+    sel = " ".join(ro.executed[0][0].split())
+    assert "embedding_model" in sel and "embedding_dimension" in sel
+    assert "embedding_version" not in sel
+    emb = get_config().embedding
+    assert ro.executed[0][1] == (emb.model, int(emb.dimension))
+    assert ro.updates == 0                     # dry-run 默认绝不写
+    assert "DRY RUN" in capsys.readouterr().out

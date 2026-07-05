@@ -134,3 +134,16 @@ def test_l3_chunk_meta_extra_json_carries_provenance_and_set_hash(monkeypatch):
     # both chunks of the same (doc,version) share one chunk_set_hash
     extra1 = json.loads(cap.insert_rows[1][22])
     assert extra1["_chunk_set_hash"] == extra0["_chunk_set_hash"]
+
+
+def test_embedding_regime_version_derives_from_live_config(monkeypatch):
+    """P3-7：嵌入制度指纹从实时 config 派生（model@dimension），模型/维度一变即自变——
+    不再依赖必然过期的手工常量。"""
+    from opensearch_pipeline import versions
+    from opensearch_pipeline.config import get_config
+
+    emb = get_config().embedding
+    assert versions.embedding_regime_version() == f"{emb.model}@{emb.dimension}"
+    monkeypatch.setattr(emb, "model", "text-embedding-v5")
+    monkeypatch.setattr(emb, "dimension", 512)
+    assert versions.embedding_regime_version() == "text-embedding-v5@512"

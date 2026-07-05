@@ -13,12 +13,18 @@ allowed_depts_reconcile / access_grants），下一次 stage-3 drain 重嵌入�
 与 deactivate 不变量）。document_version 不需要复位：stage-3 锁对 SUCCESS 有 relock 分支
 （pipeline_nodes.node_acquire_index_lock），残留 NOT_INDEXED chunk 会被照常认领。
 
-三种目标来源（互斥）：
+四种目标来源（互斥）：
   --from-reconcile parity.json   吃 reconcile CLI --json 报告（顶层 {"ha3": {...}} 或裸
                                  parity 报告均可）：rds_active_missing[].id ∪
                                  vanished_docs[].doc_id 的全部 active+INDEXED chunk
   --docs doc1,doc2               显式文档集：这些文档全部 active+INDEXED chunk 复位
   --probe                        现场只读跑一遍 reconcile.run_parity_check() 再按报告定位
+  --stale-embedding              嵌入制度漂移选择器（盲区审计 P3-7 的"读者"半边）：
+                                 行级真值列 embedding_model/embedding_dimension 与当前
+                                 config 解析值不一致的 active+INDEXED chunk。模型/维度
+                                 升级后跑一遍即得精确重嵌入范围（有意不比对
+                                 embedding_version 指纹串——历史行是旧常量格式，
+                                 按串比对会把全语料误判为陈旧）
 
 守卫（house style = reset_for_rechunk 的 prod_access 门 + retention 的双门）：
   · dry-run 默认：只读预览将复位的行（逐文档计数 + skip 原因），不写任何东西；
@@ -174,6 +180,9 @@ def main(argv=None) -> int:
     src.add_argument("--docs", help="逗号分隔的显式 doc_id 集（全部 active+INDEXED chunk 复位）")
     src.add_argument("--probe", action="store_true",
                      help="现场只读跑 reconcile.run_parity_check() 再按报告定位")
+    src.add_argument("--stale-embedding", action="store_true",
+                     help="选出 embedding_model/dimension 与当前 config 不一致的 "
+                          "active+INDEXED chunk（模型/维度升级后的重嵌入范围）")
     ap.add_argument("--commit", action="store_true",
                     help="真写（默认只预览；需 PROD_RW_ACK=PROD-RW:<today> + env_guard 通过）")
     args = ap.parse_args(argv)
@@ -191,6 +200,31 @@ def main(argv=None) -> int:
             return 3
     elif args.docs:
         doc_ids = sorted({d.strip() for d in args.docs.split(",") if d.strip()})
+    elif args.stale_embedding:
+        # P3-7 读者半边：此前 embedding_version/dimension 只写不读，模型/维度换代后
+        # 无任何机制能推导重索引范围。按行级真值列 vs 当前 config 比对（NULL = 老到
+        # 没记录 → 一并算陈旧），走与其余来源相同的资格闸 + dry-run + 双门。
+        from opensearch_pipeline.config import get_config
+        _emb_cfg = get_config().embedding
+        cur_model, cur_dim = _emb_cfg.model, int(_emb_cfg.dimension)
+        print(f"[rebuild] 当前嵌入制度：model={cur_model} dimension={cur_dim}")
+        from opensearch_pipeline import prod_access
+        ro0 = prod_access.get_prod_readonly_conn()
+        try:
+            with ro0.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM chunk_meta WHERE is_active = 1 "
+                    f"AND index_status = '{ChunkIndexStatus.INDEXED}' "
+                    "AND (embedding_model IS NULL OR embedding_model <> %s "
+                    "     OR embedding_dimension IS NULL OR embedding_dimension <> %s)",
+                    (cur_model, cur_dim))
+                pks = sorted(int(r["id"] if isinstance(r, dict) else r[0])
+                             for r in cur.fetchall())
+        finally:
+            ro0.close()
+        if not pks:
+            print("[rebuild] 全部 active+INDEXED chunk 均为当前嵌入制度——无事可做 ✅")
+            return 0
     else:  # --probe：现场只读比对（reconcile 自身 fail-open、simulate-safe）
         from opensearch_pipeline.reconcile import run_parity_check
         report = run_parity_check()

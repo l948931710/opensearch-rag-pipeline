@@ -38,6 +38,11 @@ class _ScriptedCursor:
             batch = self._conn.id_batches.pop(0) if self._conn.id_batches else []
             self._rows = [(i,) for i in batch]
             self._row = None
+        elif s.startswith("SELECT * "):   # P3-18 归档路径的整行拉取
+            batch = self._conn.row_batches.pop(0) if self._conn.row_batches else []
+            self._rows = batch
+            self.description = [(c,) for c in self._conn.row_cols]
+            self._row = None
         elif s.startswith(("DELETE", "UPDATE")):
             self.rowcount = self._conn.act_rowcounts.pop(0) if self._conn.act_rowcounts else 0
             self._conn.acts += 1
@@ -52,12 +57,14 @@ class _ScriptedCursor:
 
 class _ScriptedConn:
     def __init__(self, *, affected=0, act_rowcounts=None, rollup_state=(1, datetime.date.today()),
-                 rollup_lag_days=0, id_batches=None):
+                 rollup_lag_days=0, id_batches=None, row_batches=None, row_cols=("id",)):
         self.affected = affected
         self.act_rowcounts = list(act_rowcounts or [])
         self.rollup_state = rollup_state
         self.rollup_lag_days = rollup_lag_days
         self.id_batches = list(id_batches or [])
+        self.row_batches = list(row_batches or [])
+        self.row_cols = list(row_cols)
         self.executed = []
         self.acts = 0
         self.commits = 0
@@ -105,6 +112,7 @@ def test_commit_requires_enable_flag(monkeypatch, live_db):
 
 def test_commit_batches_until_drained(monkeypatch, live_db):
     monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
+    monkeypatch.setenv("RAG_RETENTION_ARCHIVE", "false")   # 本测覆盖旧直删语义
     conn = _ScriptedConn(affected=7, act_rowcounts=[5, 2])   # 两批：5 + 2(<batch) 止
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.run_retention(commit=True, only=["audit"], batch=5)
@@ -133,10 +141,72 @@ def test_qa_rows_blocked_when_rollup_stale(monkeypatch, live_db):
 
 def test_qa_rows_proceeds_when_rollup_fresh(monkeypatch, live_db):
     monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
+    monkeypatch.setenv("RAG_RETENTION_ARCHIVE", "false")   # 本测覆盖旧直删语义
     conn = _ScriptedConn(affected=3, act_rowcounts=[3], rollup_lag_days=1)
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.run_retention(commit=True, only=["qa_rows"], batch=5000)
     assert rep["qa_rows"]["ok"] and rep["qa_rows"]["deleted"] == 3
+
+
+# ── P3-18：删前冷归档（qa_rows / audit 默认走 select→归档→按 id 删）──
+
+
+def test_archive_before_delete_uploads_then_deletes_by_id(monkeypatch, live_db):
+    monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
+    monkeypatch.delenv("RAG_RETENTION_ARCHIVE", raising=False)   # 默认即开
+    conn = _ScriptedConn(affected=2, rollup_lag_days=1,
+                         row_batches=[[(11, "s1"), (12, "s2")]],
+                         row_cols=("id", "session_id"),
+                         act_rowcounts=[2])
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    archived = []
+    monkeypatch.setattr(retention, "_archive_batch",
+                        lambda job, rows, cols, bno, ts: archived.append((job, rows, cols))
+                        or f"archive/retention/x/batch-{bno:04d}.jsonl.gz")
+    rep = retention.run_retention(commit=True, only=["qa_rows"], batch=5000)
+    assert rep["qa_rows"]["ok"] and rep["qa_rows"]["deleted"] == 2
+    assert rep["qa_rows"]["archive_objects"] == 1
+    assert archived and archived[0][0] == "qa_rows" and len(archived[0][1]) == 2
+    # 删除必须按已归档 id 精确执行（无 ORDER BY 的 DELETE..LIMIT 可能删到未归档行）
+    delete_sqls = [s for s, _ in conn.executed if s.strip().startswith("DELETE")]
+    assert delete_sqls and "IN (11,12)" in " ".join(delete_sqls[0].split())
+
+
+def test_archive_failure_blocks_delete(monkeypatch, live_db):
+    """fail-closed：归档上传失败 → 该作业中止，绝不出现「删了但没归档」。"""
+    monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
+    monkeypatch.delenv("RAG_RETENTION_ARCHIVE", raising=False)
+    conn = _ScriptedConn(affected=2, row_batches=[[(11,)]], row_cols=("id",))
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr(retention, "_archive_batch",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("oss down")))
+    rep = retention.run_retention(commit=True, only=["audit"], batch=5000)
+    assert not rep["audit"]["ok"] and "oss down" in rep["audit"]["error"]
+    assert conn.acts == 0, "归档失败时绝不执行 DELETE"
+
+
+def test_archive_batch_refuses_without_oss(monkeypatch):
+    """OSS 不可用（simulate/占位凭据）→ raise（配合上一条 = 拒删）；真 bucket 收 gzip JSONL。"""
+    import gzip
+    import io
+    import json as _json
+
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (None, True))
+    with pytest.raises(RuntimeError, match="OSS 不可用"):
+        retention._archive_batch("qa_rows", [(1,)], ["id"], 0, "20260705T000000")
+
+    class _Bucket:
+        def put_object(self, key, data):
+            self.key, self.data = key, data
+    b = _Bucket()
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (b, False))
+    key = retention._archive_batch("audit", [(7, "grant")], ["id", "action"],
+                                   3, "20260705T000000")
+    assert key == b.key and "kb_audit_log" in key and key.endswith("batch-0003.jsonl.gz")
+    line = gzip.GzipFile(fileobj=io.BytesIO(b.data)).read().decode("utf-8").strip()
+    assert _json.loads(line) == {"id": 7, "action": "grant"}
 
 
 def test_findings_deletes_by_ids_with_current_version_guard(monkeypatch, live_db):

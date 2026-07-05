@@ -11,6 +11,14 @@ dataworks_orchestrator.py — DataWorks 调度执行主入口
   python3 opensearch_pipeline/dataworks_orchestrator.py --stage 1 --bizdate ${bizdate}
   python3 opensearch_pipeline/dataworks_orchestrator.py --stage 2 --bizdate ${bizdate}
   python3 opensearch_pipeline/dataworks_orchestrator.py --stage 3 --bizdate ${bizdate}
+
+⚠️ bizdate 语义（盲区审计 P3-10 如实声明）：摄取是**纯状态 drain**——各阶段按
+content_process_status / index_status 认领行，bizdate **从不进入任何 WHERE**，只作
+溯源标注（pipeline_run / chunk_meta.extra_json / kb_audit_log）。因此：
+  · `--stage 2 --bizdate 20260701` **不是**「回填 7 月 1 日」——它照常 drain 当前全部
+    待处理行，只是把 20260701 写进本次运行的血缘标注；
+  · 想重处理指定文档集，用 reset_for_rechunk.py / rebuild_from_rds.py 显式定位后重跑；
+  · 各 stage 节点漏配调度参数时的兜底 = 北京 T-1（固定 UTC+8，不随容器时区漂移）。
 """
 
 import argparse
@@ -800,7 +808,9 @@ def main():
     )
     parser.add_argument(
         "--bizdate", type=str, required=True,
-        help="Business date of the execution schedule (format: YYYYMMDD)"
+        help="Business date of the execution schedule (format: YYYYMMDD). "
+             "PROVENANCE LABEL ONLY: stages drain by row status, bizdate never filters "
+             "row selection — it cannot backfill/reprocess a specific day (P3-10)."
     )
     parser.add_argument(
         "--environment", type=str, default=None,
