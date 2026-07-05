@@ -720,6 +720,10 @@ def build_gen_meta(
             "injection_guard": _PROMPT_INJECTION_RULE in final_system_prompt,
             "custom_base": not final_system_prompt.startswith(_SYSTEM_PROMPT_BASE),
         }
+        # P3-9：request_id 随 gen_meta 落库——成功但答错的行此前完全无 trace（error_message
+        # 只在失败路径写），有了它任意一条落库回答都能 grep 到当时的检索/生成日志。
+        from opensearch_pipeline.request_context import get_request_id
+        _rid = get_request_id()
         meta: Dict[str, Any] = {
             "prompt_sha": hashlib.sha256(
                 final_system_prompt.encode("utf-8")).hexdigest()[:16],
@@ -727,6 +731,7 @@ def build_gen_meta(
             "temperature": temperature,
             "top_p": None,   # 从不发送（P2-21）；记 null 而非编造缺省值
             "model": model,
+            "request_id": _rid if _rid != "-" else None,
         }
         try:
             cfg = get_config()

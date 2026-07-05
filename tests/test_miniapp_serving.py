@@ -329,6 +329,45 @@ def test_ask_uuid_session_holder_is_owner(client, monkeypatch):
     assert r.status_code == 200, r.text
 
 
+def test_ask_dingtalk_session_key_forgery_403(client, monkeypatch):
+    """盲区审计 P3-6：钉钉会话 key 是结构化可构造的 `conversationId:staffId`——
+    已绑定身份的会话被他人令牌/匿名伪造 key 访问一律 403；本人令牌放行。"""
+    from opensearch_pipeline import session_store
+
+    captured = {}
+    _stub_ask_pipeline(monkeypatch, captured)
+
+    # 模拟钉钉 bot 已为 U1 建立多轮上下文（owner 绑定来自已验签回调）
+    key = "cidABC==:U1"
+    session_store.get_or_create_session(key, owner="U1", trusted=True)
+    session_store.append_to_history(key, "受限问题", "受限回答", owner="U1")
+
+    # 他人令牌（U2）伪造钉钉会话 key → 403，且不进入检索/生成路径
+    tok_other = auth_token.issue_session_token("U2", dept="行政部")
+    r_other = client.post("/api/ask", json={"question": "总结刚才", "session_id": key},
+                          headers={"Authorization": "Bearer " + tok_other})
+    assert r_other.status_code == 403, r_other.text
+    assert "history" not in captured, "403 必须早于检索/LLM"
+
+    # 匿名携带同 key → 403
+    r_anon = client.post("/api/ask", json={"question": "总结刚才", "session_id": key})
+    assert r_anon.status_code == 403, r_anon.text
+
+    # 本人令牌（U1）→ 放行
+    tok = auth_token.issue_session_token("U1", dept="行政部")
+    r_owner = client.post("/api/ask", json={"question": "总结刚才", "session_id": key},
+                          headers={"Authorization": "Bearer " + tok})
+    assert r_owner.status_code == 200, r_owner.text
+
+    # /api/session/clear 同策略：他人 403、本人放行
+    r_clear_other = client.post("/api/session/clear", json={"session_id": key},
+                                headers={"Authorization": "Bearer " + tok_other})
+    assert r_clear_other.status_code == 403
+    r_clear = client.post("/api/session/clear", json={"session_id": key},
+                          headers={"Authorization": "Bearer " + tok})
+    assert r_clear.status_code == 200
+
+
 # ── /api/session/clear ───────────────────────────────────────
 
 
@@ -788,7 +827,7 @@ def test_ask_doc_citation_stripped(monkeypatch):
     leaked = "**第1步**\n进入机构合并。\n来源：[文档5] 提供了路径参考，[文档3] 明确指出功能。\n\n**第2步**\n执行合并。\n来源：[文档3]"
     captured = {}
     monkeypatch.setattr(api, "_append_to_history",
-                        lambda sid, q, a: captured.setdefault("history_answer", a))
+                        lambda sid, q, a, **kw: captured.setdefault("history_answer", a))
     _wire_ask(monkeypatch, api, chunks, leaked)
     j = TestClient(api.app).post("/api/ask", json={"question": "部门合并怎么操作"}).json()
     assert "[文档" not in j["answer"] and "来源：" not in j["answer"]

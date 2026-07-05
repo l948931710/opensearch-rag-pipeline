@@ -59,9 +59,14 @@ from opensearch_pipeline.answer_flow import (
 )
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.db import DBPoolExhausted
-from opensearch_pipeline.request_context import RequestIdMiddleware, get_request_id
+from opensearch_pipeline.request_context import (
+    RequestIdMiddleware,
+    get_request_id,
+    install_request_id_logging,
+)
 from opensearch_pipeline.session_store import (
     MAX_HISTORY_TURNS,
+    SessionOwnershipError,
     append_to_history,
     clear_session,
     get_or_create_session,
@@ -176,6 +181,9 @@ else:
 # 请求级 correlation id（统一 trace，OBS-trace）：纯 ASGI 中间件，入站读/生成 X-Request-Id 存入
 # ContextVar（端点与嵌套 retriever/llm_generator 调用可见）、响应头回写。最后 add → 最外层 → 最先跑。
 app.add_middleware(RequestIdMiddleware)
+# P3-9：把 RequestIdLogFilter 真正挂上 root handlers（此前定义未安装，全部日志 rid='-'）。
+# bot（HTTP/Stream）与 serving 同进程，这里一次安装即全覆盖。
+install_request_id_logging()
 
 # 钉钉机器人路由
 app.include_router(dingtalk_router)
@@ -460,12 +468,13 @@ async def version_info():
     SHA 即可确认实例跑的是哪个 build；SAE 原生灰度路由 + 健康检查回滚负责流量切换。复用既有
     versions.git_commit()（RAG_GIT_SHA env 优先；Dockerfile 构建期烤入）。仅暴露短 SHA + 模型版本 +
     环境标签，低敏感，与 /api/health、/api/ready、/api/kb/config 同为公开探针。"""
-    from opensearch_pipeline.versions import EMBEDDING_MODEL_VERSION, git_commit
+    from opensearch_pipeline.versions import embedding_regime_version, git_commit
     # P2-05：仅回灰度/回滚必需的 git_commit + 模型版本。此前额外暴露 environment / simulate
     # 给任何匿名调用方——泄露部署形态（是否 sim、prod/staging），无运维价值、增侦察面，故移除。
+    # P3-7：模型版本改报运行时解析的制度指纹（model@dimension），不再报手工常量。
     return {
         "git_commit": git_commit(),
-        "embedding_model_version": EMBEDDING_MODEL_VERSION,
+        "embedding_model_version": embedding_regime_version(),
     }
 
 
@@ -601,15 +610,21 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
     """
     # 会话归属校验：'miniapp:<staffId>' 是可预测命名空间（chat.js 用 'miniapp:'+userId 构造），
     # 必须校验令牌归属，防止匿名/他人读取或污染他人会话上下文（与 /api/session/clear 同策略）。
-    # 其余 session_id（服务端 UUID / 钉钉会话 key，不可枚举）按持有即所有处理。
+    # 前缀检查保留：它挡的是"条目尚不存在时抢注他人 miniapp 命名空间"，owner 绑定挡不了。
     if req.session_id and req.session_id.startswith("miniapp:"):
         if not identity or req.session_id != f"miniapp:{identity.user_id}":
             raise HTTPException(status_code=403, detail="无权访问该会话")
 
     t0 = time.time()
 
-    # 1. 会话管理
-    session_id, session_history = _get_or_create_session(req.session_id)
+    # 1. 会话管理。条目绑定已验证身份（盲区审计 P3-6）：钉钉会话 key 是结构化可构造的
+    #    `conversationId:staffId`，没有归属绑定时任何已认证调用者可伪造 key 读走他人
+    #    多轮上下文；服务端 UUID（匿名创建，owner=None）仍按持有即所有。
+    try:
+        session_id, session_history = _get_or_create_session(
+            req.session_id, owner=identity.user_id if identity else None)
+    except SessionOwnershipError:
+        raise HTTPException(status_code=403, detail="无权访问该会话")
 
     # 合并客户端传入的 history 和服务端 session history（客户端显式传了则优先）
     merged_history = list(session_history)
@@ -743,7 +758,8 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
     #    history_answer_text —— flag ON 时剥 <<IMG:N>> 防 follow-up 标记模仿。
     #    只包裹实参：result["answer"] 保持原文，下方 blocks 构建依赖原始标记）
     if should_append_history(result["answer"], "SUCCESS"):
-        _append_to_history(session_id, req.question, history_answer_text(result["answer"]))
+        _append_to_history(session_id, req.question, history_answer_text(result["answer"]),
+                           owner=identity.user_id if identity else None)
 
     t_llm = time.time()
     llm_latency_ms = int((t_llm - t_retrieval) * 1000)
@@ -988,7 +1004,8 @@ def ask_stream(req: AskRequest, request: Request,
             # 统一策略：非空 SUCCESS / CLIENT_DISCONNECTED 入史 —— 出错的半截回答不污染
             # 后续轮次上下文（#F-mm5 入史文本经 history_answer_text；blocks 已在上方用原文构建完毕）
             if should_append_history(full_answer, answer_status):
-                _append_to_history(session_id, req.question, history_answer_text(full_answer))
+                _append_to_history(session_id, req.question, history_answer_text(full_answer),
+                                   owner=identity.user_id if identity else None)
             # 拒答型标 REFUSAL（入史判定在上面、用原状态 —— 历史策略不变）；深思加 model 后缀
             if answer_status == "SUCCESS" and is_refusal_answer(full_answer):
                 answer_status = "REFUSAL"
@@ -1094,14 +1111,19 @@ def session_clear(req: SessionClearRequest, request: Request,
 
     鉴权与 /api/ask 同为可选 Bearer；但 'miniapp:<staffId>' 是可预测的命名空间
     （chat.js 用 'miniapp:'+userId 构造），必须校验令牌归属，防止匿名清掉他人会话上下文。
-    其余 session_id（服务端 UUID / 钉钉会话 key，不可枚举）按持有即所有处理。
+    其余 session_id 若条目已绑定身份（钉钉/已认证创建），须携带同一身份（P3-6）；
+    匿名创建的服务端 UUID 按持有即所有处理。
     幂等：会话不存在/已过期返回 200 + cleared=false（客户端结果一致：下一轮是全新会话）。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     if req.session_id.startswith("miniapp:"):
         if not identity or req.session_id != f"miniapp:{identity.user_id}":
             raise HTTPException(status_code=403, detail="无权清除该会话")
-    cleared = clear_session(req.session_id)
+    try:
+        cleared = clear_session(req.session_id,
+                                owner=identity.user_id if identity else None)
+    except SessionOwnershipError:
+        raise HTTPException(status_code=403, detail="无权清除该会话")
     return {"status": "ok", "cleared": cleared, "session_id": req.session_id}
 
 

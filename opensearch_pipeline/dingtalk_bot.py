@@ -21,7 +21,6 @@ import logging
 import os
 import re
 import threading
-import uuid
 import time
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
@@ -46,6 +45,7 @@ from opensearch_pipeline.session_store import (
     get_or_create_session,
 )
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
+from opensearch_pipeline.request_context import ensure_request_id, get_request_id, set_request_id
 from opensearch_pipeline.answer_flow import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -547,7 +547,7 @@ def _stream_answer_to_card(
                 logger.warning("定稿持久化 content 到 cardData 失败(忽略，不影响流式正文): %s", _e)
     except Exception as e:
         _stop_pusher()  # 异常路径同样先停推流线程，再写错误定稿帧（避免推流帧覆盖）
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = ensure_request_id()   # P3-9：与入口/检索/生成日志同一 trace（不再另铸本地 id）
         answer_status = "LLM_ERROR"
         error_message = f"[trace={trace_id}] {str(e)[:500]}"
         logger.error("流式生成失败 [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -570,7 +570,8 @@ def _stream_answer_to_card(
     # 写历史（仅成功且有内容时）+ 落库（与非流式路径一致的反馈语义）
     # （#F-mm5 入史文本经 history_answer_text，防 follow-up 标记模仿）
     if should_append_history(full_answer, answer_status):
-        append_to_history(session_key, question, history_answer_text(full_answer))
+        append_to_history(session_key, question, history_answer_text(full_answer),
+                          owner=sender_staff_id or None)
 
     # 拒答型标 REFUSAL（与 NO_RESULT=检索空分桶）。必须在入史判定【之后】翻转 ——
     # 拒答照旧入史，只改落库状态，历史策略不变。
@@ -606,6 +607,7 @@ def _process_rag_query(
     conversation_id: str,
     sender_staff_id: str = "",
     conversation_type: str = "1",
+    request_id: str = "",
 ):
     """
     后台线程：执行 RAG 检索 + LLM 生成，通过 sessionWebhook 回复。
@@ -614,12 +616,21 @@ def _process_rag_query(
     支持多轮对话：使用 conversationId:senderStaffId 作为 session key，
     群聊中每个用户拥有独立的对话上下文。
     """
+    # P3-9 trace：threading.Thread 不复制 ContextVar——入口 rid 由调用方显式传入，
+    # 此处重新落进本线程上下文，检索/生成/落库日志与错误回执共用同一 trace。
+    if request_id:
+        set_request_id(request_id)
+    else:
+        ensure_request_id()
     t0 = time.time()
     message_id = generate_message_id()
 
-    # 构建 session key：群聊中按用户隔离，单聊中按会话隔离
+    # 构建 session key：群聊中按用户隔离，单聊中按会话隔离。
+    # owner 绑定（P3-6）：staffId 来自已验签钉钉回调 = 权威身份，trusted 使抢注
+    # 同 key 的攻击者条目被丢弃重建而非反过来把真实用户拒之门外。
     session_key = f"{conversation_id}:{sender_staff_id}" if sender_staff_id else conversation_id
-    _, history = get_or_create_session(session_key)
+    _, history = get_or_create_session(
+        session_key, owner=sender_staff_id or None, trusted=True)
 
     # except 兜底落库会引用这两个值；必须在 try 外初始化，否则部门解析/检索阶段抛错时 NameError
     user_dept = None
@@ -697,7 +708,8 @@ def _process_rag_query(
         # 3. 追加到会话历史（统一策略：仅非空 SUCCESS 回答入史；#F-mm5 入史文本
         #    经 history_answer_text —— 只包裹实参，下一行 blocks 构建依赖原始标记）
         if should_append_history(result["answer"], "SUCCESS"):
-            append_to_history(session_key, question, history_answer_text(result["answer"]))
+            append_to_history(session_key, question, history_answer_text(result["answer"]),
+                              owner=sender_staff_id or None)
 
         # 4. 构建 content_blocks（图文穿插）；纯文本模式下不展示图片
         from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json
@@ -771,7 +783,7 @@ def _process_rag_query(
             print("[DEBUG] Markdown 回复已发送", flush=True)
 
     except Exception as e:
-        trace_id = uuid.uuid4().hex[:8]
+        trace_id = ensure_request_id()   # P3-9：与入口/检索/生成日志同一 trace（不再另铸本地 id）
         latency_ms = int((time.time() - t0) * 1000)
         # 应用日志是 qa_session_log 之外的另一 PII sink：原始问题可能含身份证/手机号。
         # 无条件脱敏 + 截断后再记（debug 靠 trace_id + error，不需要原文 PII）。
@@ -854,6 +866,9 @@ async def _handle_webhook(request: Request):
 
 def _process_webhook_body(body: dict):
     """webhook 同步处理：日志、问题提取、「补充原因」回收、ack 回复、起后台 RAG 线程。"""
+    # P3-9 trace：HTTP 路径沿用中间件的 rid；Stream 路径经 run_in_executor 进来
+    # （不复制 ContextVar，rid 是 '-'）→ 此处补生成，主渠道消息从入口起就有 trace。
+    ensure_request_id()
     # 只记结构化元数据 —— 完整 body（含用户问题原文，可能带身份证/手机号）绝不整段落日志。
     logger.info(
         "收到钉钉消息: sender=%s, conversationType=%s, msgId=%s",
@@ -910,7 +925,7 @@ def _process_webhook_body(body: dict):
     #    session key 构造必须与 _process_rag_query 完全一致，否则清不到。
     if question.strip() in ("新会话", "重新开始"):
         session_key = f"{conversation_id}:{sender_staff_id}" if sender_staff_id else conversation_id
-        clear_session(session_key)
+        clear_session(session_key, trusted=True)  # 已验签回调 = 对自己命名空间权威
         if session_webhook:
             _send_text_reply(session_webhook, "✅ 已开启新会话，之前的对话上下文已清除。")
         return {"msgtype": "session_reset"}
@@ -926,7 +941,8 @@ def _process_webhook_body(body: dict):
     conv_type = str(body.get("conversationType", "1"))
     thread = threading.Thread(
         target=_process_rag_query,
-        args=(question, session_webhook, sender_nick, conversation_id, sender_staff_id, conv_type),
+        args=(question, session_webhook, sender_nick, conversation_id, sender_staff_id, conv_type,
+              get_request_id()),   # P3-9：显式跨线程传 rid（Thread 不复制 ContextVar）
         daemon=True,
     )
     thread.start()
@@ -1030,6 +1046,7 @@ def _card_callback_authorized(message_id: str, user_id: str,
 
 def _process_card_callback_body(body: dict):
     """卡片回调同步处理：解析 action/feedback → 落库 → 文本提示。一律 ACK-only（不含 cardData）。"""
+    ensure_request_id()   # P3-9：Stream executor 进来无 rid，反馈链路日志也要可关联
     logger.info(
         "收到卡片回调: outTrackId=%s, userId=%s",
         body.get("outTrackId", "?"),

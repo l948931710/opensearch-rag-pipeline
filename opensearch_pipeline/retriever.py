@@ -574,6 +574,72 @@ def _deny_revoked_cross_dept(results, user_dept):
     return [r for i, r in enumerate(results) if i not in drop]
 
 
+def _revalidate_main_hits(results):
+    """主命中 RDS 复核（盲区审计 P3-1）——权限执行不对称的补齐。
+
+    邻居拼接/step 扩展路径一直按 RDS 复核（is_active=1 + _same_permission），而**主 HA3
+    命中**此前直接投放：任何 RDS→HA3 投影延迟（管理员收紧 public→dept_internal、下线
+    置 is_active=0、版本停用后 HA3 删除滞后）窗口内，旧值按旧 ACL 被逐字投放给 LLM。
+    本函数按权威表 chunk_meta 复核每个主命中，丢弃：
+      - is_active=0（已停用：retire / 旧版本 / PENDING_DELETE 延迟）
+      - permission_level / owner_dept 与 HA3 投影不一致（投影陈旧 → 不投放，等 drain 收敛）
+    有意**不**比对 allowed_depts：新增跨部门授权先落 RDS 后投影，比对会把授权变更放大成
+    全 doc 一天不可检索；撤销方向已由 _deny_revoked_cross_dept 按权威表 fail-closed 兜底。
+
+    失败语义：权威表不可达 / 返回整体为空（几乎必然是连错库/桩连接而非全部命中同时失效）
+    → 保留原结果并告警。HA3 服务端过滤是第一道边界，本检查只是投影延迟的防御纵深，
+    不把 RDS 故障放大为全站无答案（与本模块 stitch/expand 的 fail-open 风格一致）。
+    """
+    cfg = get_config()
+    if not cfg.rag.main_hit_revalidate or not results or cfg.simulate_db:
+        return results
+    ids = [str(r.get("chunk_id") or r.get("id") or "") for r in results]
+    ids = sorted({i for i in ids if i})
+    if not ids:
+        return results
+    try:
+        from opensearch_pipeline.db import _get_db_conn   # 惰性：tests monkeypatch db._get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                ph = ",".join(["%s"] * len(ids))
+                cur.execute(
+                    "SELECT chunk_id, is_active, permission_level, owner_dept"
+                    f" FROM chunk_meta WHERE chunk_id IN ({ph})", tuple(ids))
+                rows = cur.fetchall() or []
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 权威不可达 → 保留（第一道边界在 HA3 服务端）
+        logger.warning("主命中 RDS 复核失败（保留 HA3 结果）: %s", e)
+        return results
+    if not rows:
+        logger.warning("主命中 RDS 复核返回空集（%d 个 chunk_id 全部未知）——按权威不可用处理，保留结果", len(ids))
+        return results
+    meta = {str(r[0]): (r[1], r[2], r[3]) for r in rows}
+    kept, dropped = [], 0
+    for r in results:
+        cid = str(r.get("chunk_id") or r.get("id") or "")
+        if not cid:
+            kept.append(r)
+            continue
+        row = meta.get(cid)
+        if row is None:
+            dropped += 1       # RDS 已无此 chunk（purge/删除），HA3 残留
+            continue
+        active, perm, owner = row
+        if not active:
+            dropped += 1
+            continue
+        if (str(perm or "") != str(r.get("permission_level") or "")
+                or str(owner or "") != str(r.get("owner_dept") or "")):
+            dropped += 1       # 投影陈旧：ACL 轴不一致，不投放
+            continue
+        kept.append(r)
+    if dropped:
+        logger.info("主命中 RDS 复核：丢弃 %d/%d 条陈旧/已停用命中", dropped, len(results))
+    return kept
+
+
 def _search_chunks_opensearch(
     query: str,
     dense: List[float],
@@ -747,9 +813,9 @@ def search_chunks(
     #  生产配置了 HA3 endpoint，此分支不可达 —— 2026-06-10 本地 E2E 引入）
     _full_cfg = get_config()
     if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
-        return _deny_revoked_cross_dept(
+        return _revalidate_main_hits(_deny_revoked_cross_dept(
             _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded),
-            user_dept)
+            user_dept))
 
     client = _get_ha3_client()
 
@@ -832,6 +898,9 @@ def search_chunks(
 
     # 4b. 查询侧拒绝（Phase D 读侧 fail-closed 复核）：撤销跨部门授权后即时生效，不等 HA3 投影收回。
     results = _deny_revoked_cross_dept(results, user_dept)
+
+    # 4c. 主命中 RDS 复核（P3-1）：is_active/权限轴与权威表不一致的陈旧投影不投放。
+    results = _revalidate_main_hits(results)
 
     # 5. （F-20）原 max_distance「距离上限」过滤已删除：HA3 索引是 InnerProduct（score 是相似度，
     # 越大越相关），不存在「距离」；旧代码 `score <= max_distance` 方向与内积相反，会把最相关结果全滤掉。

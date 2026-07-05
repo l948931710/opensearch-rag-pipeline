@@ -115,3 +115,69 @@ def test_concurrent_clear_and_append_no_crash(monkeypatch):
     assert not errors, f"并发 clear/append 抛出异常: {errors[:3]}"
     _, hist = session_store.get_or_create_session("race")
     assert len(hist) <= session_store.MAX_HISTORY_TURNS * 2
+
+
+# ── 会话归属绑定（盲区审计 P3-6）───────────────────────────────
+
+
+def test_owner_binding_denies_other_identity(monkeypatch):
+    """已绑定身份的条目：他人身份/匿名访问一律 SessionOwnershipError；本人放行。"""
+    import pytest
+
+    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+
+    sid, _ = session_store.get_or_create_session("cid1:VICTIM", owner="VICTIM")
+    session_store.append_to_history(sid, "受限问题", "受限回答", owner="VICTIM")
+
+    # 他人已认证身份伪造钉钉结构化 key → 拒绝
+    with pytest.raises(session_store.SessionOwnershipError):
+        session_store.get_or_create_session("cid1:VICTIM", owner="ATTACKER")
+    # 匿名持有 key 也不放行（owner=None ≠ 已绑定身份）
+    with pytest.raises(session_store.SessionOwnershipError):
+        session_store.get_or_create_session("cid1:VICTIM")
+    with pytest.raises(session_store.SessionOwnershipError):
+        session_store.append_to_history("cid1:VICTIM", "q", "a", owner="ATTACKER")
+    with pytest.raises(session_store.SessionOwnershipError):
+        session_store.clear_session("cid1:VICTIM", owner="ATTACKER")
+
+    # 本人照常
+    _, hist = session_store.get_or_create_session("cid1:VICTIM", owner="VICTIM")
+    assert len(hist) == 2
+
+
+def test_anonymous_entry_binds_on_first_authenticated_touch(monkeypatch):
+    """匿名创建（服务端 UUID）持有即所有；首个已认证访问者就地绑定，之后他人被拒。"""
+    import pytest
+
+    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+
+    sid, _ = session_store.get_or_create_session(None)  # 匿名创建
+    _, _ = session_store.get_or_create_session(sid)     # 匿名再访问 OK
+    _, _ = session_store.get_or_create_session(sid, owner="U1")  # 首个认证者绑定
+    with pytest.raises(session_store.SessionOwnershipError):
+        session_store.get_or_create_session(sid, owner="U2")
+
+
+def test_trusted_caller_evicts_hijacked_entry(monkeypatch):
+    """trusted（钉钉 bot）：key 被他人抢注时丢弃污染条目重建，真实用户不被 DoS，
+    且抢注者留下的历史不会泄给真实用户。"""
+    import pytest
+
+    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+
+    # 攻击者以自己身份抢注受害者的钉钉会话 key 并塞入历史
+    session_store.get_or_create_session("cidX:VICTIM", owner="ATTACKER")
+    session_store.append_to_history("cidX:VICTIM", "毒问题", "毒回答", owner="ATTACKER")
+
+    # bot 以权威身份进来：得到全新空历史（而非异常/污染历史）
+    sid, hist = session_store.get_or_create_session(
+        "cidX:VICTIM", owner="VICTIM", trusted=True)
+    assert sid == "cidX:VICTIM"
+    assert hist == []
+
+    # 条目现归属真实用户，攻击者再访问被拒
+    with pytest.raises(session_store.SessionOwnershipError):
+        session_store.get_or_create_session("cidX:VICTIM", owner="ATTACKER")
+
+    # trusted 清除对自己命名空间无条件可清
+    assert session_store.clear_session("cidX:VICTIM", trusted=True) is True

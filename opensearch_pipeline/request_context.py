@@ -38,14 +38,57 @@ def get_request_id() -> str:
     return _request_id.get()
 
 
+def ensure_request_id() -> str:
+    """取当前上下文 request_id；未设置则生成并设置一个新的（非 HTTP 入口——钉钉 Stream
+    回调、后台线程——的标准起手式：loop.run_in_executor / threading.Thread 不复制
+    ContextVar，没有这步整条链路都是 '-'）。"""
+    rid = _request_id.get()
+    if rid and rid != "-":
+        return rid
+    return set_request_id("")
+
+
 class RequestIdLogFilter(logging.Filter):
     """把当前 request_id 注入每条日志（record.request_id），供 Formatter 的 %(request_id)s 使用。
-    部署侧把本 filter 挂到 handler 并在 format 串加 %(request_id)s，即可让所有日志带 trace。
-    （不在此处强制安装全局 logging 配置——避免与 uvicorn 既有 logger 冲突；按需在部署侧接入。）"""
+    经 install_request_id_logging() 在 serving 启动时挂到 root handlers（P3-9 之前本类
+    定义后从未被安装，"统一 trace" 只存在于纸面）。"""
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         record.request_id = get_request_id()
         return True
+
+
+_logging_installed = False
+
+
+def install_request_id_logging() -> None:
+    """给 root logger 的现有 handlers 挂 RequestIdLogFilter 并把 [rid=…] 注入 format 串。
+
+    盲区审计 P3-9：过滤器此前定义却无处 addFilter，请求中的 retriever/llm 日志携
+    request_id='-'，失败请求无法端到端 grep 关联。本函数由 api.py 在 app 装配时调用
+    （bot 与 serving 同进程，一次安装全覆盖）。幂等；root 无 handler（裸嵌入场景）时
+    先 basicConfig；uvicorn 自有 "uvicorn.*" logger 的 handlers 不动，我方模块日志经
+    propagate 到 root 出口统一带 rid。失败静默——日志装饰绝不能挡服务启动。"""
+    global _logging_installed
+    if _logging_installed:
+        return
+    try:
+        root = logging.getLogger()
+        if not root.handlers:
+            logging.basicConfig(level=logging.INFO)
+        flt = RequestIdLogFilter()
+        for h in root.handlers:
+            h.addFilter(flt)
+            fmt = h.formatter
+            base = getattr(fmt, "_fmt", None) or "%(levelname)s:%(name)s:%(message)s"
+            if "%(request_id)s" not in base and "%(message)s" in base:
+                h.setFormatter(logging.Formatter(
+                    base.replace("%(message)s", "[rid=%(request_id)s] %(message)s"),
+                    datefmt=getattr(fmt, "datefmt", None) if fmt else None,
+                ))
+        _logging_installed = True
+    except Exception:   # noqa: BLE001
+        pass
 
 
 class RequestIdMiddleware:

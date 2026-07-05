@@ -189,3 +189,37 @@ class TestRrfThresholdWarning:
         """rrf + rerank 开：档位改用 0.9/0.8 rerank 尺度，不属本告警场景。"""
         _fresh_load(RAG_HA3_HYBRID_FUSION="rrf", RAG_RERANK_ENABLE="true")
         assert "HA3_HYBRID_FUSION=rrf" not in capsys.readouterr().out
+
+
+class TestEmbeddingRegimeGuard:
+    """P3-8：非 DashScope 嵌入兜底与 dense+sparse 检索制度不兼容——真嵌入 + 检索后端时 fail-fast。"""
+
+    def test_gemini_fallback_with_search_backend_raises(self):
+        with pytest.raises(EnvironmentMismatchError, match="EMBEDDING REGIME"):
+            _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="false",
+                        RAG_RDS_HOST="localhost", RAG_GEMINI_API_KEY="g",
+                        RAG_OPENSEARCH_HOST="localhost")
+
+    def test_gemini_fallback_without_search_backend_passes(self):
+        """无检索后端（纯抽取/离线脚本形态）不硬拦。"""
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="false",
+                          RAG_RDS_HOST="localhost", RAG_GEMINI_API_KEY="g")
+        assert "gemini" in cfg.embedding.model
+
+    def test_dashscope_embedding_passes(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="false",
+                          RAG_RDS_HOST="localhost", RAG_DASHSCOPE_API_KEY="x",
+                          RAG_OPENSEARCH_HOST="localhost")
+        assert cfg.embedding.model == "text-embedding-v4"
+
+    def test_simulate_mode_skips_guard(self):
+        cfg = _fresh_load(RAG_SIMULATE="true", RAG_GEMINI_API_KEY="g",
+                          RAG_OPENSEARCH_HOST="localhost")
+        assert cfg.simulate is True
+
+    def test_explicit_ack_allows_experiment(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="false",
+                          RAG_RDS_HOST="localhost", RAG_GEMINI_API_KEY="g",
+                          RAG_OPENSEARCH_HOST="localhost",
+                          RAG_ALLOW_INCOMPATIBLE_EMBEDDING="ack")
+        assert "gemini" in cfg.embedding.model

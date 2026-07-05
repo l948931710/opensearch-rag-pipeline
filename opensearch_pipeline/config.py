@@ -305,6 +305,12 @@ class RAGConfig:
     # allowed_depts、入库按 approved 授权聚合写 chunk_meta.allowed_depts。默认关；需先 HA3 加
     # allowed_depts 字段(Step 2) + 回填(Step 3) 再开。flag 关时全链路与现状逐字节一致。
     allowed_depts_acl: bool = False         # RAG_ALLOWED_DEPTS_ACL
+    # 主命中 RDS 复核（盲区审计 P3-1）：邻居/扩展路径一直有 is_active=1 + 同权限复核，
+    # 而主 HA3 命中此前直接投放——ACL 收紧/下线与 HA3 投影之间的延迟窗内，旧值按旧口径
+    # 被逐字投放。开启后主命中按权威表复核 is_active + permission_level/owner_dept 一致性，
+    # 漂移即丢弃（fail-closed 方向）；权威表不可达则保留结果（HA3 服务端过滤仍是第一道
+    # 边界，本检查是投影延迟的防御纵深，不应让 RDS 故障放大为全站无答案）。
+    main_hit_revalidate: bool = True        # RAG_MAIN_HIT_REVALIDATE
     # 思考过程下发（深度思考「思考过程」披露条）：开启后，thinking=True 时把 reasoning_content 作为
     # {"type":"reasoning"} 附加帧流式下发（与 chunk 并行；老客户端忽略未知帧类型 → 向后兼容）。默认关
     # （reasoning 更费带宽且暴露思维链是产品取舍）；仅「thinking 开 + 本 flag 开」时下发，否则照旧丢弃。
@@ -833,6 +839,7 @@ def load_config() -> PipelineConfig:
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
             conversation_history=_env_bool("CONVERSATION_HISTORY", False),
             allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
+            main_hit_revalidate=_env_bool("MAIN_HIT_REVALIDATE", True),         # RAG_MAIN_HIT_REVALIDATE
             stream_reasoning=_env_bool("STREAM_REASONING", False),              # RAG_STREAM_REASONING
             qa_log_pii_redact=_env_bool("QA_LOG_PII_REDACT", True),             # RAG_QA_LOG_PII_REDACT
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
@@ -923,6 +930,23 @@ def load_config() -> PipelineConfig:
                     f"(base_url='{base_url}', model='{model_name}') under '{_guard_scope}' environment! "
                     f"Production runs must strictly utilize Alibaba Cloud (Qwen) services."
                 )
+
+    # 【P3-8】嵌入制度兼容守卫（非生产也生效）：整个检索制度假设 dense+sparse +
+    # EMBEDDING_DIMENSION（HA3 表 1024 维、查询侧 dense&sparse 双路）。无 DashScope key 时
+    # 嵌入静默兜底到 gemini-embedding-2——无 sparse、原生维度不同，此状态下建的索引 / 跑的
+    # eval 与生产制度不兼容且不报错（数悄然失效）。simulate 全程哈希向量不受影响；只有
+    # 「真嵌入（simulate 关）+ 配置了检索后端 + 解析到非 DashScope 嵌入模型」三条同时成立
+    # 才 fail-fast。刻意实验用 RAG_ALLOW_INCOMPATIBLE_EMBEDDING=ack 显式放行。
+    _has_search_backend = bool(config.alibaba_vector.endpoint or config.opensearch.host)
+    if (not rag_simulate and not is_emb_dashscope and _has_search_backend
+            and os.environ.get("RAG_ALLOW_INCOMPATIBLE_EMBEDDING", "") != "ack"):
+        raise EnvironmentMismatchError(
+            f"🚨 [EMBEDDING REGIME GUARD] 嵌入模型解析为 '{emb_model}'（非 DashScope）但已配置"
+            f"检索后端：该兜底无 sparse 向量且原生维度 ≠ EMBEDDING_DIMENSION={config.embedding.dimension}，"
+            f"与 dense+sparse 检索制度不兼容——此状态下建的索引/评测结果全部失真。"
+            f"请配置 DASHSCOPE_API_KEY（或 RAG_EMBEDDING_MODEL=text-embedding-v4），"
+            f"纯本地烟囱测试请用 RAG_SIMULATE=true；刻意实验设 RAG_ALLOW_INCOMPATIBLE_EMBEDDING=ack。"
+        )
 
     # 💡 环境守卫第二层：环境标签 ↔ 物理目标交叉校验（规则表见函数 docstring）
     _validate_environment_target_consistency(config)
