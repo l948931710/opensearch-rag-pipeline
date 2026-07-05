@@ -45,8 +45,9 @@ describe('fileCore / badgeTone / labels', () => {
   it('badgeTone 映射', () => {
     expect(badgeTone('已上线')).toBe('live')
     expect(badgeTone('处理失败')).toBe('fail')
-    expect(badgeTone('已隔离')).toBe('fail')
-    expect(badgeTone('待审核')).toBe('warn')
+    expect(badgeTone('已隔离')).toBe('hold')   // 安全隔离专属紫，与工作流驳回红分家
+    expect(badgeTone('待审核')).toBe('queue')  // 良性等待族，与异常「未入索引」(warn) 分家
+    expect(badgeTone('未入索引')).toBe('warn')
     expect(badgeTone('已退役')).toBe('muted')
     expect(badgeTone('内容未变')).toBe('muted')
     expect(badgeTone('未知态')).toBe('muted')

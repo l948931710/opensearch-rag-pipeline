@@ -18,6 +18,7 @@
   --destructive:#B3261E;
   --st-live:#2F6B4F; --st-busy:#A9760C; --st-queue:#79847A;
   --st-warn:#2563A0; --st-fail:#B3261E; --st-muted:#A3A299;
+  --st-hold:#6C55A3;                   /* 安全隔离（PII 等）专属紫：与工作流失败红分家 */
   --c-key:#2F6B4F; --c-str:#B05A33; --c-num:#8154AD; --c-comment:#A3A299; --c-fn:#2563A0;
   --shadow:0 1px 2px rgba(20,20,15,.05),0 6px 20px rgba(20,20,15,.04);
 }
@@ -33,6 +34,7 @@
   --destructive:#E06A6A;
   --st-live:#74C39A; --st-busy:#E0A06A; --st-queue:#9D998E;
   --st-warn:#7FB0E0; --st-fail:#E06A6A; --st-muted:#6E6A61;
+  --st-hold:#B3A3E0;                   /* 安全隔离专属紫（暗色） */
   --c-key:#83CBA1; --c-str:#E0A06A; --c-num:#C6A0E8; --c-comment:#6E6A61; --c-fn:#7FB0E0;
   --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.32);
 }
@@ -105,6 +107,7 @@
   --color-st-warn:  var(--st-warn);
   --color-st-fail:  var(--st-fail);
   --color-st-muted: var(--st-muted);
+  --color-st-hold:  var(--st-hold);
   --font-sans: var(--font-body);
   --font-serif: var(--font-display);
   --font-mono: var(--font-code);

@@ -48,20 +48,24 @@ export const ROLE_LABEL: Record<string, string> = {
 }
 
 // 文档状态徽章 → 色调键（组件据此取 st-* 颜色）。未命中 → muted。
+// 色彩语义分家（P2 同色复用修复）：待审核=良性管道等待 → 与排队中同 queue 族（原与
+// 未入索引同蓝，异常/正常不可分）；已隔离=安全隔离 → 专属 hold 紫（PII 隔离≠工作流
+// 驳回，原同红）；蓝 warn 从此唯一=未入索引，红 fail=处理失败/已驳回。
 const BADGE_TONE: Record<string, string> = {
-  已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'warn', 未入索引: 'warn',
-  已隔离: 'fail', 处理失败: 'fail', 已驳回: 'fail', 已退役: 'muted', 内容未变: 'muted',
+  已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'queue', 未入索引: 'warn',
+  已隔离: 'hold', 处理失败: 'fail', 已驳回: 'fail', 已退役: 'muted', 内容未变: 'muted',
 }
 export const badgeTone = (badge: string) => BADGE_TONE[badge] || 'muted'
 
 // 知识贡献的 5 态徽章（state 码由后端 contribution_state 折叠 review/ingestion 两生命周期而来）
-// → 文案 + 色调键（与 StatusPill 的 st-* 同一套）。与文档/队列徽章独立，勿合并。
+// → 文案 + 色调键（与 StatusPill 的 st-* 同一套）。与文档/队列徽章独立，勿合并；
+// 但**同词同色**：待审核/已驳回 与文档徽章对齐（原 pending=蓝、rejected=灰，跨页同词不同色打乱心智）。
 export const CONTRIB_STATE: Record<string, { label: string; tone: string }> = {
-  pending: { label: '待审核', tone: 'warn' },
+  pending: { label: '待审核', tone: 'queue' },
   registering: { label: '已采纳·待入库', tone: 'busy' },
   searchable: { label: '已入库', tone: 'live' },
   failed: { label: '入库失败', tone: 'fail' },
-  rejected: { label: '已驳回', tone: 'muted' },
+  rejected: { label: '已驳回', tone: 'fail' },
 }
 export const contribStateLabel = (s: string) => CONTRIB_STATE[s]?.label || s
 export const contribStateTone = (s: string) => CONTRIB_STATE[s]?.tone || 'muted'

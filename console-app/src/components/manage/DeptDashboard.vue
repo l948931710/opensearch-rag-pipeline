@@ -35,7 +35,8 @@ const cards = computed<Card[]>(() => {
     },
     { label: '已上线', value: b('已上线'), icon: CheckCircle2, tone: 'text-st-live', hint: '可被检索' },
     { label: '处理中 / 排队', value: b('处理中') + b('排队中'), icon: Loader, tone: 'text-st-busy', hint: '入库处理中' },
-    { label: '待审核', value: b('待审核'), icon: Clock, tone: 'text-st-warn', hint: '我提交、待放行' },
+    // 与台账徽章新词表同色（待审核=良性等待 queue 族，蓝 warn 留给「未入索引」异常）
+    { label: '待审核', value: b('待审核'), icon: Clock, tone: 'text-st-queue', hint: '我提交、待放行' },
   ]
 })
 
@@ -52,17 +53,21 @@ const topDocItems = computed(() =>
 const gapItems = computed(() =>
   (kbInsights.value?.gap_queries || []).map((g) => ({ label: g.query, sub: `平均相关度 ${g.avg_top.toFixed(2)}`, value: g.count })))
 
-const HEADER = 'mb-3 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint'
+// 与 KbAdminDashboard 同一分区视觉语言（P2 角色间一致性）：区域面板（暖底+描边）+
+// 绿竖条真标题——此前本看板还停在旧 uppercase 眉标，两角色切换视觉断层。
+const SECTION = 'rounded-2xl border border-border bg-panel/60 p-4 sm:p-5'
+const ZONE_HEAD = 'mb-4 flex items-center gap-2 border-b border-border/70 pb-3 text-[13px] font-semibold tracking-tight text-foreground'
+const ZONE_TICK = 'h-3.5 w-1 shrink-0 rounded-full bg-accent-strong'
 const SUBHEAD = 'mb-2 ml-0.5 text-[12.5px] font-medium text-muted-foreground'
 const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
 const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用成效合并为 3 卡后独立网格
 </script>
 
 <template>
-  <div class="space-y-7">
-    <!-- 本部门概览（含状态分布） -->
-    <section>
-      <p :class="HEADER">概览</p>
+  <div class="space-y-6">
+    <!-- 本部门资产概览（含状态分布） -->
+    <section :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>本部门资产概览</header>
       <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
       <div :class="GRID">
         <StatCard v-for="s in cards" :key="s.label" v-bind="s" :loading="statsLoading" />
@@ -72,8 +77,8 @@ const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用�
     </section>
 
     <!-- 使用成效（真实，近 N 天，本部门文档被使用情况） -->
-    <section v-if="kbInsights">
-      <p :class="HEADER">使用成效 · 近 {{ kbInsights.window_days }} 天（本部门文档）</p>
+    <section v-if="kbInsights" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>使用成效 · 近 {{ kbInsights.window_days }} 天（本部门文档）</header>
       <div :class="USAGE_GRID">
         <StatCard v-for="s in usageCards" :key="s.label" v-bind="s" />
       </div>
@@ -82,8 +87,8 @@ const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用�
     </section>
 
     <!-- 知识缺口：未答好的提问（建议补充/改进对应文档） -->
-    <section v-if="kbInsights">
-      <p :class="HEADER">知识缺口 · 未答好的提问</p>
+    <section v-if="kbInsights" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>知识缺口 · 未答好的提问</header>
       <BarList
         :items="gapItems" tone="bg-st-warn" unit=" 次"
         empty="近期本部门文档无「召回但未答好」的提问 —— 覆盖良好。"
@@ -95,16 +100,16 @@ const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用�
     </section>
 
     <!-- 差评复核：引用了本部门文档且被点踩的回答（文档质量 → 答案质量 的直接改进线索） -->
-    <section v-if="kbInsights">
-      <p :class="HEADER">差评复核 · 被点踩的回答（引用了本部门文档）</p>
+    <section v-if="kbInsights" :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>差评复核 · 被点踩的回答（引用了本部门文档）</header>
       <FeedbackReviewList />
     </section>
 
     <!-- 使用数据尚未就绪（端点未接入/加载中）→ 如实占位，不显 0 误导；真实失败（5xx）→ 错误条 + 重试 -->
-    <section v-else>
-      <p :class="HEADER">使用成效 · 知识缺口</p>
+    <section v-else :class="SECTION">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>使用成效 · 知识缺口</header>
       <LoadError :message="loadErrors['insights']" @retry="loadInsights()" />
-      <div v-if="!loadErrors['insights']" class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
+      <div v-if="!loadErrors['insights']" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         使用成效与知识缺口数据加载中（需后端 <code class="font-mono text-[11.5px]">/api/kb/insights</code>）；稍后自动呈现。
       </div>
     </section>

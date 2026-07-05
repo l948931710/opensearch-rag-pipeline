@@ -11,6 +11,7 @@ const TONE: Record<string, string> = {
   warn: 'text-st-warn bg-st-warn/10',
   fail: 'text-st-fail bg-st-fail/10',
   muted: 'text-st-muted bg-st-muted/10',
+  hold: 'text-st-hold bg-st-hold/10',
 }
 const cls = computed(() => TONE[(props.kind === 'queue' ? qBadgeTone : badgeTone)(props.badge)] || TONE.muted)
 </script>

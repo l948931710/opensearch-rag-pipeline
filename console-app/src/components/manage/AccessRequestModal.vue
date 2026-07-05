@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onUnmounted, watch } from 'vue'
 import { Lock } from 'lucide-vue-next'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
@@ -11,6 +11,14 @@ const disabled = computed(() => accessReqBusy.value)
 
 function submit() { void submitAccessRequest(reason.value); reason.value = '' }
 function close() { reason.value = ''; closeAccessRequest() }
+
+// Esc 关闭（对齐其余弹窗；提交在途不关，防止误丢正在送审的申请）。
+function onKey(e: KeyboardEvent) { if (e.key === 'Escape' && !accessReqBusy.value) close() }
+watch(accessReqDoc, (v) => {
+  if (v) window.addEventListener('keydown', onKey)
+  else window.removeEventListener('keydown', onKey)
+})
+onUnmounted(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>

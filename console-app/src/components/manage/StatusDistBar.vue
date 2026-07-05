@@ -8,7 +8,7 @@ const props = defineProps<{ byBadge: Record<string, number> }>()
 
 const TONE_BG: Record<string, string> = {
   live: 'bg-st-live', busy: 'bg-st-busy', queue: 'bg-st-queue',
-  warn: 'bg-st-warn', fail: 'bg-st-fail', muted: 'bg-st-muted',
+  warn: 'bg-st-warn', fail: 'bg-st-fail', muted: 'bg-st-muted', hold: 'bg-st-hold',
 }
 // 稳定展示顺序（未列出的徽章排末尾）。
 const ORDER = ['已上线', '处理中', '排队中', '待审核', '已驳回', '已隔离', '处理失败', '内容未变', '已退役']

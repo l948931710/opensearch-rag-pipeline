@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History, Lightbulb } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
@@ -26,9 +26,10 @@ import ApprovalHistory from '@/components/manage/ApprovalHistory.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
+const route = useRoute()
 
 // ── 「文档管理」信息架构：待办摘要条 + 分区（待办审批 → 上传 → 台账 → 授权治理）──
 // 分区眉标与看板 HEADER 同一视觉语言；各队列组件自带空态自隐，眉标随内容一起隐藏。
@@ -47,7 +48,15 @@ function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({
 
 // ── 管理台子 tab（成员管理仅 kb_admin 可见）──
 type Tab = 'dash' | 'docs' | 'history' | 'members'
+const VALID_TABS = ['dash', 'docs', 'history', 'members'] as const
 const activeTab = ref<Tab>('dash')
+// tab ←→ URL（P2：刷新/深链不再落回默认 tab）。身份在 AppShell ready 后已解析，可安全校验 members。
+// route?. 可选链 = 单测无 router 环境的既有约定（同 Sidebar）。
+{
+  const t = route?.query?.tab
+  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (t !== 'members' || isKbAdmin.value)) activeTab.value = t as Tab
+}
+watch(activeTab, (t) => { void router?.replace({ query: { ...(route?.query || {}), tab: t === 'dash' ? undefined : t } }) })
 const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
   { key: 'dash', label: '概览看板', icon: LayoutDashboard },
   { key: 'docs', label: '文档管理', icon: FolderOpen },
@@ -184,7 +193,8 @@ onMounted(async () => {
 
     <!-- 文档管理：待办摘要条 → 待办审批（自隐）→ 上传 → 台账（主体）→ 授权治理（存量参考置底） -->
     <template v-else-if="activeTab === 'docs'">
-      <!-- 待办摘要条：一眼看清今天要处理什么；点击滚动到对应区块。无待办不渲染。 -->
+      <!-- 待办摘要条：一眼看清今天要处理什么；点击滚动到对应区块。有待办时台账被推下首屏 →
+           条尾常备「跳到台账」一键直达；全空且队列已拉取过 → 一行确认文案（区分「处理完了」与「功能没开」）。 -->
       <div
         v-if="todoChips.length"
         class="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-panel/60 px-4 py-3"
@@ -196,7 +206,16 @@ onMounted(async () => {
           :class="c.tone"
           @click="scrollToSec(c.anchor)"
         >{{ c.label }} <b class="font-mono tabular-nums">{{ c.n }}</b></button>
+        <div class="flex-1" />
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[12px] font-medium text-muted-foreground transition hover:bg-card hover:text-foreground"
+          title="直达文档台账" @click="scrollToSec('kb-sec-ledger')"
+        >跳到台账 ↓</button>
       </div>
+      <p v-else-if="queuesSettled" class="ml-0.5 text-[12px] text-faint">
+        当前无待办 —— 新的{{ isKbAdmin ? '上传审批 / ' : '' }}授权申请会先出现在这里。
+      </p>
 
       <section v-if="hasQueues" id="kb-sec-queues" class="space-y-4 scroll-mt-4">
         <p :class="ZONE">待办审批</p>

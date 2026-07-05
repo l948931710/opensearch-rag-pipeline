@@ -74,26 +74,25 @@ describe('AccessGrantList', () => {
     expect(w.text()).toContain('撤销')
   })
 
-  it('撤销（DEV preview，确认框确认 → 输入理由确认）→ 本地移除该行', async () => {
+  it('撤销（DEV preview，单个 danger 原因弹窗确认）→ 本地移除该行', async () => {
+    // P2 统一：原 confirm+prompt 两段弹窗 → 与驳回同构的单个 danger 原因弹窗（一步说明影响面+采集原因）。
     const pinia = activate(identity(), 'dev-preview')
     const kb = useKb()
     ;(kb as any).accessGrants.value = [GRANT, { ...GRANT, id: 'ag2', doc_title: '另一篇' }]
     const w = mount(AccessGrantList, { global: { plugins: [pinia] } })
     const { dialog, onConfirm } = useDialog()
-    await w.findAll('button')[0].trigger('click')      // onRevoke → 打开确认框
+    await w.findAll('button')[0].trigger('click')      // onRevoke → 打开原因弹窗（单段）
     await flushPromises()
     expect(dialog.value.open).toBe(true)
-    expect(dialog.value.kind).toBe('confirm')
-    onConfirm()                                         // 确认 → 接着打开理由输入框
-    await flushPromises()
     expect(dialog.value.kind).toBe('prompt')
+    expect(dialog.value.danger).toBe(true)
     dialog.value.value = '离职收回'
     onConfirm()                                         // 确认理由 → revokeAccess
     await flushPromises()
     expect(kb.accessGrants.value.map((g: AccessGrantItem) => g.id)).toEqual(['ag2'])
   })
 
-  it('撤销取消（确认框点取消）→ 不动、不进理由框', async () => {
+  it('撤销取消（原因弹窗点取消）→ 不动', async () => {
     const pinia = activate(identity(), 'dev-preview')
     const kb = useKb()
     ;(kb as any).accessGrants.value = [GRANT]
@@ -102,7 +101,7 @@ describe('AccessGrantList', () => {
     await w.findAll('button')[0].trigger('click')
     await flushPromises()
     expect(dialog.value.open).toBe(true)
-    onCancel()                                          // 取消 → confirm(false)，不再弹理由框
+    onCancel()                                          // 取消 → promptText(null)，不执行撤销
     await flushPromises()
     expect(dialog.value.open).toBe(false)
     expect(kb.accessGrants.value.map((g: AccessGrantItem) => g.id)).toEqual(['ag1'])

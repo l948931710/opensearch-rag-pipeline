@@ -112,6 +112,7 @@ const maxUploadMb = computed(() => Math.round(maxUploadBytes.value / 1048576))
 const verHistory = ref<{ doc: DocItem | null; versions: VersionItem[]; loading: boolean; error: string } | null>(null)
 const approvals = ref<PendingItem[]>([])
 const accessRequests = ref<AccessRequestItem[]>([])   // 授权申请队列（审批人侧 · pending）
+const queuesSettled = ref(false)                      // 队列完成过至少一次拉取——空态确认文案靠它区分「真无待办」与「还在加载」
 const accessGrants = ref<AccessGrantItem[]>([])       // 已授权清单（审批人侧 · approved 存量，供撤销）
 const approvalHistory = ref<ApprovalHistoryItem[]>([]) // 审批历史（只读聚合，四流合并时间线）
 const adminGrants = ref<AdminItem[]>([])              // Phase F 现行管理员名单（kb_admin 专属）
@@ -816,15 +817,17 @@ async function loadAccessRequests(force = false) {
       { id: 'ar1', doc_id: 'D1', doc_title: '营销物料使用规范 v3', owner_dept: 'marketing', requester_dept: 'production', requester_name: '王伟', permission_level: 'dept_internal', reason: '生产部包装设计需引用营销规范，确保对外物料一致。', created_at: '2026-06-26' },
       { id: 'ar2', doc_id: 'D2', doc_title: '客户投诉处理 SOP', owner_dept: 'marketing', requester_dept: 'quality', requester_name: '李娜', permission_level: 'dept_internal', reason: '品质部需对照投诉闭环流程。', created_at: '2026-06-25' },
     ]
+    queuesSettled.value = true
     return
   }
-  if (!force && freshEnough('accessRequests')) return   // App ready 刚预载过 → 跳过（#82）
+  if (!force && freshEnough('accessRequests')) { queuesSettled.value = true; return }   // App ready 刚预载过 → 跳过（#82）
   lastLoadedAt['accessRequests'] = Date.now()
   clearLoadError('accessRequests')
   try {
     const r = await apiJson<{ items: AccessRequestItem[] }>('/api/kb/access-requests', { auth: true })
     accessRequests.value = r.items || []
   } catch (e) { lastLoadedAt['accessRequests'] = 0; accessRequests.value = []; noteLoadError('accessRequests', e) }   // 404（未上线）静默；5xx 显错
+  finally { queuesSettled.value = true }
 }
 
 async function approveAccess(d: AccessRequestItem) {
@@ -1220,7 +1223,7 @@ export function useKb() {
 
   return {
     // 状态
-    docs, filtered, approvals, accessRequests, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir,
+    docs, filtered, approvals, accessRequests, queuesSettled, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir,
     // #7 全库口径 + 服务端筛选 setter
     ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, anomalyCount,
     setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,

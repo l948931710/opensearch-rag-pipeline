@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, ExternalLink, Loader2 } from 'lucide-vue-next'
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
@@ -71,7 +72,34 @@ async function onBulkSetVis(level: string) {
 const chips = ledgerBadgeChips
 
 // 自愈：当前筛选的徽章不在可选集里（如换 scope 后徽章分布变化）→ 回退「全部」并重载，避免死角。
-watch(chips, (c) => { if (filter.value && !c.includes(filter.value)) setBadgeFilter('') })
+// 仅在 chips 真正就绪（>1 项）后生效——首帧只有「全部」时会把 URL 恢复的筛选误清掉。
+watch(chips, (c) => { if (c.length > 1 && filter.value && !c.includes(filter.value)) setBadgeFilter('') })
+
+// ── 筛选状态 ←→ URL（P2：刷新/深链不再丢筛选；replace 不产生历史）──
+const route = useRoute()
+const router = useRouter()
+onMounted(() => {
+  const s = (v: unknown) => (typeof v === 'string' ? v : '')
+  const q0 = route?.query || {}   // 单测无 router 环境 → 可选链兜底（与 Sidebar 同约定）
+  // 顺序：先 scope（其重置筛选的语义保留），后各筛选；仅应用与当前不同的值（setter 都会触发服务端重载）。
+  if (isDeptAdmin.value && s(q0.scope) === 'all' && docScope.value !== 'all') setScope('all')
+  if (s(q0.q) && s(q0.q) !== q.value) setQuery(s(q0.q))
+  if (s(q0.badge) && s(q0.badge) !== filter.value) setBadgeFilter(s(q0.badge))
+  if (s(q0.perm) && s(q0.perm) !== permFilter.value) setPermFilter(s(q0.perm))
+  if (s(q0.owner) && s(q0.owner) !== ownerFilter.value) setOwnerFilter(s(q0.owner))
+  if (s(q0.cited) && s(q0.cited) !== citedFilter.value) setCitedFilter(s(q0.cited))
+})
+watch([docScope, q, filter, permFilter, ownerFilter, citedFilter], () => {
+  const query: Record<string, unknown> = { ...(route?.query || {}) }
+  const put = (k: string, v: string, def = '') => { if (v && v !== def) query[k] = v; else delete query[k] }
+  put('scope', docScope.value, 'managed')
+  put('q', q.value)
+  put('badge', filter.value)
+  put('perm', permFilter.value)
+  put('owner', ownerFilter.value)
+  put('cited', citedFilter.value)
+  void router?.replace({ query: query as Record<string, string> })
+})
 
 const COLS: { key: SortKey; label: string }[] = [
   { key: 'title', label: '文档名' },
@@ -96,7 +124,8 @@ async function onRetire(d: DocItem) {
   retireRowId.value = d.doc_id
   const r = await retire(d)
   retireRowId.value = ''
-  if (!r.ok && r.msg) void notice({ title: '退役失败', message: r.msg, danger: true })
+  // 无 msg 的失败 = retireBusy 全局互斥挡下的并发第二单——原先静默丢弃，用户以为点了没生效（P2）。
+  if (!r.ok) void notice({ title: '退役失败', message: r.msg || '另一项退役/恢复操作正在进行中，请稍候片刻再试。', danger: !!r.msg })
 }
 
 async function onRestore(d: DocItem) {
@@ -108,7 +137,7 @@ async function onRestore(d: DocItem) {
   retireRowId.value = d.doc_id
   const r = await restore(d)
   retireRowId.value = ''
-  if (!r.ok && r.msg) void notice({ title: '恢复失败', message: r.msg, danger: true })
+  if (!r.ok) void notice({ title: '恢复失败', message: r.msg || '另一项退役/恢复操作正在进行中，请稍候片刻再试。', danger: !!r.msg })
 }
 </script>
 

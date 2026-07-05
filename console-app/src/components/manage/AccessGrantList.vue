@@ -9,7 +9,7 @@ import { useDialog } from '@/composables/useDialog'
 // 已授权清单（审批人侧）：本部门文档现行有效（approved 存量）的跨部门检索授权，可撤销（approved→revoked）。
 // 与「授权申请」（pending 待审批）区分：此处是已放行的存量，活跃态调（st-live）。空时整块不渲染。
 const { accessGrants, isBusy, revokeAccess, loadAccessGrants, loadErrors } = useKb()
-const { confirm, promptText } = useDialog()
+const { promptText } = useDialog()
 
 // requester_depts 为逗号分隔组码（多部门管理员可一次授予多组）→ 逐个 deptLabel 再拼。
 const reqLabel = (csv: string) => csv.split(',').map((c) => deptLabel(c.trim())).filter(Boolean).join('、')
@@ -30,13 +30,14 @@ const ageText = (g: AccessGrantItem) => {
   return d === null ? '' : d < 1 ? '今天' : `${d} 天`
 }
 
+// 统一撤销授权确认模式（P2）：原为 confirm+prompt 两段弹窗（此处）/行内二段确认（权限弹窗）
+// 两套并存；现统一为与「驳回」同构的单个 danger 原因弹窗——一步说明影响面 + 采集审计原因。
 async function onRevoke(g: AccessGrantItem) {
-  const okGo = await confirm({
-    title: '撤销授权', confirmText: '撤销', danger: true,
+  const reason = await promptText({
+    title: '撤销授权', confirmText: '确认撤销', danger: true,
     message: `撤销「${reqLabel(g.requester_dept)}」对《${g.doc_title}》的检索授权？\n撤销后该部门将不再能检索此文档（即时生效），申请人可重新申请。`,
+    placeholder: '撤销原因（可空，记录于审计）',
   })
-  if (!okGo) return
-  const reason = await promptText({ title: '撤销原因', message: '将记录于审计（可空）。', placeholder: '撤销原因（可空）', confirmText: '确认撤销', danger: true })
   if (reason === null) return   // 取消
   void revokeAccess(g, reason || 'revoked')
 }

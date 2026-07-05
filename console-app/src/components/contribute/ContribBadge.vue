@@ -7,6 +7,7 @@ const props = defineProps<{ state: string }>()
 const TONE: Record<string, string> = {
   live: 'text-st-live bg-st-live/10',
   busy: 'text-st-busy bg-st-busy/10',
+  queue: 'text-st-queue bg-st-queue/10',
   warn: 'text-st-warn bg-st-warn/10',
   fail: 'text-st-fail bg-st-fail/10',
   muted: 'text-st-muted bg-st-muted/10',

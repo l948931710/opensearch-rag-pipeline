@@ -21,7 +21,12 @@ import FeedbackReviewList from './FeedbackReviewList.vue'
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
 // 全部真实口径，无对应数据则如实显空 —— 绝不造数。
-const { kbStats, approvals, kbGovernance, kbInsights, loadStats, loadGovernance, loadInsights, loadErrors } = useKb()
+const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats, loadGovernance, loadInsights, loadErrors } = useKb()
+
+// 「待你处理」置顶条（P2）：差评复核是看板里唯一的行动区，却沉在页尾 ~2900px 深——
+// 有未处理差评时在首屏给一枚计数 chip，点击平滑定位；清零即隐，与文档管理 tab 的待办条同语言。
+const feedbackOpenCount = computed(() => (feedbackReview.value || []).filter((x) => !x.handled).length)
+function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
 // 资产概览卡的加载态：stats 尚未返回且无错误 → 显骨架（避免闪 0）。
 const statsLoading = computed(() => !kbStats.value && !loadErrors.value['stats'])
 const b = (k: string) => kbStats.value?.by_badge?.[k] || 0
@@ -155,6 +160,19 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
 
 <template>
   <div class="space-y-6">
+    <!-- 待你处理：有未处理差评时首屏可见、一键直达（看板唯一行动区在页尾，不能只靠滚动发现） -->
+    <div
+      v-if="feedbackOpenCount"
+      class="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-panel/60 px-4 py-3"
+    >
+      <span class="text-[12.5px] font-semibold text-foreground">待你处理</span>
+      <button
+        type="button"
+        class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-[12px] font-medium text-st-fail transition hover:border-border-strong"
+        @click="scrollToSec('kb-dash-feedback')"
+      >差评未处理 <b class="font-mono tabular-nums">{{ feedbackOpenCount }}</b></button>
+    </div>
+
     <!-- 全库资产概览（含状态分布 + 部门覆盖情况） -->
     <section :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库资产概览</header>
@@ -245,7 +263,7 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
     </section>
 
     <!-- 用户反馈与回答质量（卡 + 趋势|原因 收在同一个框里） -->
-    <section v-if="kbGovernance" :class="SECTION">
+    <section v-if="kbGovernance" id="kb-dash-feedback" :class="SECTION" class="scroll-mt-4">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>用户反馈与回答质量</header>
       <div :class="GRID" class="mb-3">
         <StatCard v-for="s in feedbackCards" :key="s.label" v-bind="s" />

@@ -9,15 +9,14 @@ import { useDialog } from '@/composables/useDialog'
 //   上 = 基础可见范围（仅本部门 / 全公司 / 受限，POST set-visibility；公开需 kb_admin）；
 //   下 = 跨部门共享（仅 dept_internal 时显示）：已共享逐行可撤销 + 新增目标 chips。
 const { shareCtx, shareBusy, shareTargets, isBusy, isKbAdmin, grantedDeptsOf, docGrantRows, submitShare, revokeAccess, setVisibility, closeShare } = useKb()
-const { confirm, dialog } = useDialog()
+const { confirm, promptText, dialog } = useDialog()
 
 const picked = ref<string[]>([])
 const reason = ref('')
 const err = ref('')
-const confirmRevokeId = ref('')   // 行内二段确认：第一次点记 id，再点才真撤销
 const visBusy = ref('')           // 正在切换的目标级别（禁用按钮 + 转圈）
 
-watch(shareCtx, () => { picked.value = []; reason.value = ''; err.value = ''; confirmRevokeId.value = ''; visBusy.value = '' })
+watch(shareCtx, () => { picked.value = []; reason.value = ''; err.value = ''; visBusy.value = '' })
 
 const curLevel = computed(() => shareCtx.value?.permission_level || '')
 const isDeptInternal = computed(() => curLevel.value === 'dept_internal')
@@ -83,10 +82,15 @@ async function onSubmit() {
   if (e) err.value = e
 }
 
+// 与「已授权」清单同一撤销确认模式（P2 统一）：单个 danger 原因弹窗,替代原行内二段确认。
 async function onRevoke(g: AccessGrantItem) {
-  if (confirmRevokeId.value !== g.id) { confirmRevokeId.value = g.id; return }
-  confirmRevokeId.value = ''
-  await revokeAccess(g, '权限弹窗撤销')
+  const r = await promptText({
+    title: '撤销授权', confirmText: '确认撤销', danger: true,
+    message: `撤销「${rowLabel(g.requester_dept)}」对《${shareCtx.value?.title || g.doc_title || g.doc_id}》的检索授权？\n撤销后该部门将不再能检索此文档（即时生效），申请人可重新申请。`,
+    placeholder: '撤销原因（可空，记录于审计）',
+  })
+  if (r === null) return   // 取消
+  await revokeAccess(g, r || 'revoked')
 }
 
 function close() { if (!shareBusy.value && !visBusy.value) { err.value = ''; closeShare() } }
@@ -161,11 +165,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
               </span>
               <button
                 type="button"
-                class="shrink-0 rounded-md px-2 py-1 text-[11.5px] font-medium transition disabled:opacity-50"
-                :class="confirmRevokeId === g.id ? 'bg-st-fail/10 text-st-fail' : 'text-muted-foreground hover:bg-panel hover:text-foreground'"
+                class="shrink-0 rounded-md px-2 py-1 text-[11.5px] font-medium text-muted-foreground transition hover:bg-panel hover:text-foreground disabled:opacity-50"
                 :disabled="isBusy(`grant:${g.id}`)"
                 @click="onRevoke(g)"
-              >{{ isBusy(`grant:${g.id}`) ? '撤销中…' : (confirmRevokeId === g.id ? '确认撤销？' : '撤销') }}</button>
+              >{{ isBusy(`grant:${g.id}`) ? '撤销中…' : '撤销' }}</button>
             </div>
           </div>
         </template>
