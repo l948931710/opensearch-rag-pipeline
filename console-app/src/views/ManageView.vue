@@ -41,7 +41,7 @@ const todoChips = computed<TodoChip[]>(() => {
   const chips: TodoChip[] = []
   if (isKbAdmin.value && approvals.value.length) chips.push({ key: 'appr', label: '待审批上传', n: approvals.value.length, anchor: 'kb-sec-queues', tone: 'text-st-busy' })
   if (accessRequests.value.length) chips.push({ key: 'req', label: '授权申请', n: accessRequests.value.length, anchor: 'kb-sec-queues', tone: 'text-accent-text' })
-  if (anomalyCount.value) chips.push({ key: 'anom', label: '异常文档', n: anomalyCount.value, anchor: 'kb-sec-ledger', tone: 'text-st-warn' })
+  if (anomalyCount.value) chips.push({ key: 'anom', label: '异常文档', n: anomalyCount.value, anchor: 'kb-sec-ledger', tone: 'text-st-fail' })
   return chips
 })
 function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }

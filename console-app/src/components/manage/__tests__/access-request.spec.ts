@@ -23,13 +23,14 @@ const REQ: AccessRequestItem = {
   requester_dept: 'production', requester_name: '王伟', permission_level: 'dept_internal', reason: '需引用', created_at: '2026-06-26',
 }
 
-describe('reviewCount — 待审核单一来源', () => {
-  it('kb_admin = 待审批上传 + 授权申请；dept_admin = 仅授权申请', () => {
+describe('reviewCount — 待审核单一来源（职权分流）', () => {
+  it('kb_admin = 仅上传审批（只管入库）；dept_admin = 仅授权申请（部门管理员之间的事）', () => {
+    // 拍板 2026-07-04：授权申请审批划归 dept_admin，kb_admin 即使 ref 里有数据也不计入待办。
     activate(identity({ role: 'kb_admin' }))
     const kb = useKb()
     ;(kb as any).approvals.value = [{ doc_id: 'x', version_no: 1 }]
     ;(kb as any).accessRequests.value = [REQ]
-    expect(kb.reviewCount.value).toBe(2)
+    expect(kb.reviewCount.value).toBe(1)
 
     __resetKb()
     activate(identity({ role: 'dept_admin' }))
@@ -37,6 +38,16 @@ describe('reviewCount — 待审核单一来源', () => {
     ;(kb2 as any).approvals.value = [{ doc_id: 'x', version_no: 1 }]   // dept_admin 不该有上传审批 → 不计入
     ;(kb2 as any).accessRequests.value = [REQ]
     expect(kb2.reviewCount.value).toBe(1)
+  })
+
+  it('loadAccessRequests：kb_admin 源头 no-op（不拉不显，兜底 API 仍在后端放行）', async () => {
+    activate(identity({ role: 'kb_admin' }))
+    const kb = useKb()
+    const spy = vi.fn()
+    vi.stubGlobal('fetch', spy)
+    await kb.loadAccessRequests(true)
+    expect(spy).not.toHaveBeenCalled()
+    expect((kb as any).accessRequests.value).toEqual([])
   })
 })
 
@@ -77,7 +88,8 @@ describe('Sidebar — 知识库管理入口待审核角标', () => {
     ;(useKb() as any).accessRequests.value = [REQ, { ...REQ, id: 'ar2' }]
     const w = mount(Sidebar, { global: { plugins: [pinia], stubs } })
     expect(w.text()).toContain('知识库管理')
-    expect(w.find('[aria-label="待审核 3 项"]').exists()).toBe(true)   // 1 上传审批 + 2 授权申请
+    // kb_admin 只计上传审批（授权申请已划归 dept_admin 职权，即便 ref 有 2 条也不入角标）
+    expect(w.find('[aria-label="待审核 1 项"]').exists()).toBe(true)
   })
 
   it('reviewCount=0 → 无角标', () => {

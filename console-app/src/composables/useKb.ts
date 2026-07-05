@@ -618,15 +618,18 @@ async function loadApprovals(force = false) {
       { doc_id: 'P1', version_no: 2, title: '2026 客户验厂应答模板', original_filename: '验厂应答.docx', owner_dept: 'quality', permission_level: 'public', owner_name: '李娜', created_at: '2026-06-27' },
       { doc_id: 'P2', version_no: 1, title: '外销报价单（公开版）', original_filename: '报价单.xlsx', owner_dept: 'marketing', permission_level: 'public', owner_name: '王伟', created_at: '2026-06-26' },
     ]
+    queuesSettled.value = true
     return
   }
-  if (!force && freshEnough('approvals')) return   // App ready 刚预载过 → 跳过（#82）
+  if (!force && freshEnough('approvals')) { queuesSettled.value = true; return }   // App ready 刚预载过 → 跳过（#82）
   lastLoadedAt['approvals'] = Date.now()
   clearLoadError('approvals')
   try {
     const r = await apiJson<{ items: PendingItem[] }>('/api/kb/pending-approvals', { auth: true })
     approvals.value = r.items || []
   } catch (e) { lastLoadedAt['approvals'] = 0; approvals.value = []; noteLoadError('approvals', e) }
+  // kb_admin 的待办队列源=上传审批（授权申请已划归 dept_admin），拉取过即视为队列就绪
+  finally { queuesSettled.value = true }
 }
 
 // ── 升版态 ──
@@ -823,6 +826,9 @@ async function reject(d: PendingItem, reason: string) {
 async function loadAccessRequests(force = false) {
   const s = useSession()
   if (!s.identity?.canManage) { accessRequests.value = []; return }
+  // 拍板：授权申请审批 = 部门管理员之间的事（kb_admin 只管入库）→ kb_admin 不拉不显不计数。
+  // 后端仍向 kb_admin 放行（某部门暂无管理员时的救急兜底通道），只是 console 不再呈现为其待办。
+  if (s.role === 'kb_admin') { accessRequests.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
     accessRequests.value = [
       { id: 'ar1', doc_id: 'D1', doc_title: '营销物料使用规范 v3', owner_dept: 'marketing', requester_dept: 'production', requester_name: '王伟', permission_level: 'dept_internal', reason: '生产部包装设计需引用营销规范，确保对外物料一致。', created_at: '2026-06-26' },
@@ -1230,7 +1236,9 @@ export function useKb() {
   const isDeptAdmin = computed(() => session.role === 'dept_admin')
   // 待你审核的数量（红点/角标单一来源）：kb_admin = 待审批上传 + 授权申请；dept_admin = 授权申请（其本部门文档的）。
   // 上传审批仅 kb_admin（/pending-approvals kb-only），故 dept_admin 的 approvals 恒空、不计入。
-  const reviewCount = computed(() => (session.role === 'kb_admin' ? approvals.value.length : 0) + accessRequests.value.length)
+  // 待你审核数（侧栏红点/tab 角标）：kb_admin=上传审批（只管入库）；dept_admin=授权申请
+  // （部门管理员之间的事）。两角色职权不重叠——拍板见 2026-07-04。
+  const reviewCount = computed(() => (session.role === 'kb_admin' ? approvals.value.length : accessRequests.value.length))
 
   return {
     // 状态
