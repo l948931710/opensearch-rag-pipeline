@@ -131,20 +131,27 @@ def _pass1_analyze(pdf, max_pages: int) -> Tuple[_LayoutAnalysis, List[str]]:
             if not text:
                 continue
 
+            # G12：非正立词（旋转/斜置——典型为水印、骑缝章文字）不参与字号统计
+            # 与页眉页脚候选：其字号会污染 body_size 直方图，且水印不该被当成页眉。
+            if not w.get("upright", True):
+                continue
+
             # 字号统计
             size = float(w.get("size", 0))
             if size > 0:
                 bucketed = _bucket_size(size)
                 size_char_counts[bucketed] += len(text)
 
-            # 页眉/页脚候选
+            # 页眉/页脚候选。G12：候选键做数字归一——"第3页/第4页"这类逐页变化的
+            # 页码文本，精确文本键下每页都是新候选、永远达不到 60% 频次阈值，页脚
+            # 裁剪对其失效；归一成模式（"第#页"）后按模式聚合，y 照常参与裁剪边界。
             top_val = float(w.get("top", 0))
             if top_val < header_zone and len(text) > 1:
                 rounded_y = round(top_val / 5) * 5
-                top_candidates[(rounded_y, text)].add(page_idx)
+                top_candidates[(rounded_y, re.sub(r"\d+", "#", text))].add(page_idx)
             elif top_val > footer_zone and len(text) > 1:
                 rounded_y = round(top_val / 5) * 5
-                bottom_candidates[(rounded_y, text)].add(page_idx)
+                bottom_candidates[(rounded_y, re.sub(r"\d+", "#", text))].add(page_idx)
 
     # ── 计算 body_size ──
     if not size_char_counts:
@@ -325,6 +332,11 @@ def _pass2_extract_page(
         )
     except Exception:
         words = []
+
+    # G12：丢弃非正立词——斜置水印（"内部资料""绝密"对角线盖章文字）此前混入正文行分组，
+    # 在行内按 x 排序时把水印字符插进正常句子中间。竖排正文在本语料（横排中文办公文档）中
+    # 不存在，误伤面可忽略；如遇竖排文档该行为可再按页级竖排占比放行。
+    words = [w for w in words if w.get("upright", True)]
 
     if not words and not blocks:
         return blocks, warnings

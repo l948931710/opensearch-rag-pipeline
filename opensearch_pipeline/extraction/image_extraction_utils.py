@@ -36,10 +36,22 @@ class ImageAsset:
 # DOCX — python-docx relationship 遍历
 # ═══════════════════════════════════════════════════════════════
 
+def _note_skipped_vector(stats, ext: str) -> None:
+    """G4：矢量图（WMF/EMF/SVG）跳过计数——此前三处裸 continue 静默丢弃，损失不可见。
+
+    stats 为调用方传入的 dict（None = 不统计，独立调用兼容）；只累计，不改变跳过行为。
+    """
+    if stats is None:
+        return
+    stats["skipped_vector_images"] = stats.get("skipped_vector_images", 0) + 1
+    stats.setdefault("skipped_vector_formats", set()).add(ext.lstrip("."))
+
+
 def extract_images_from_docx(
     local_path: str,
     output_dir: str,
     document=None,
+    stats: Optional[dict] = None,
 ) -> List[ImageAsset]:
     """
     从 DOCX 文件中提取所有嵌入图片。
@@ -105,8 +117,9 @@ def extract_images_from_docx(
         content_type = getattr(rel.target_part, 'content_type', '')
         ext = _content_type_to_ext(content_type, rel.target_ref)
 
-        # 跳过不支持的矢量格式（WMF/EMF）
+        # 跳过不支持的矢量格式（WMF/EMF/SVG）；G4：计数使损失可见
         if ext in (".wmf", ".emf", ".svg"):
+            _note_skipped_vector(stats, ext)
             continue
 
         # 导出到 tmp_dir
@@ -277,6 +290,7 @@ def extract_images_from_pdf(
     local_path: str,
     output_dir: str,
     max_pages: int = 20,
+    stats: Optional[dict] = None,
 ) -> List[ImageAsset]:
     """
     从 PDF 文件中提取嵌入图片，带精确 page_num。
@@ -351,8 +365,9 @@ def extract_images_from_pdf(
             seen_hashes.add(dedup_key)
 
             ext = f".{base_image.get('ext', 'png')}"
-            # 跳过不支持的格式
+            # 跳过不支持的格式；G4：计数使损失可见
             if ext in (".wmf", ".emf", ".svg"):
+                _note_skipped_vector(stats, ext)
                 continue
 
             # 朝向校正：转置失败回退原始字节（不阻断提取）
@@ -747,6 +762,7 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
 def extract_images_from_pptx(
     local_path: str,
     output_dir: str,
+    stats: Optional[dict] = None,
 ) -> List[ImageAsset]:
     """
     从 PPTX 文件中提取所有嵌入图片。
@@ -803,8 +819,9 @@ def extract_images_from_pptx(
             content_type = getattr(rel.target_part, 'content_type', '')
             ext = _content_type_to_ext(content_type, rel.target_ref)
 
-            # 跳过不支持的矢量格式（WMF/EMF）
+            # 跳过不支持的矢量格式（WMF/EMF/SVG）；G4：计数使损失可见
             if ext in (".wmf", ".emf", ".svg"):
+                _note_skipped_vector(stats, ext)
                 continue
 
             # 导出到 tmp_dir

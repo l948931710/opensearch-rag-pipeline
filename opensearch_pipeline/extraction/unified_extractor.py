@@ -39,6 +39,77 @@ def _safe_image_output_dir(task: dict) -> str:
     return _DEFAULT_IMG_DIR
 
 
+def _detect_password_protected(local_path: str, file_ext: str) -> Optional[str]:
+    """G14：加密/带密码文件前置探测（纯本地字节嗅探 + pypdf is_encrypted，零 API 成本）。
+
+    此前加密文件只表现为 pdfplumber/pypdf/python-docx 的通用打开失败：确定性失败
+    仍吃满 ≤3 次重试，加密 PDF 还会被 _pages_needing_ocr 的 [1] 占位空烧一次 OCR。
+    返回 None = 未加密或探测失败（fail-open，走原抽取路径）；返回字符串 = 加密原因。
+    """
+    if not local_path or not os.path.exists(local_path):
+        return None
+    try:
+        if file_ext == "pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(local_path)
+            if not reader.is_encrypted:
+                return None
+            # 空密码可解（仅 owner-password 限权、内容可读）→ 放行走正常抽取
+            try:
+                if int(reader.decrypt("")) != 0:
+                    return None
+            except Exception:
+                pass
+            return "PDF 受用户密码保护，无法解密读取"
+        if file_ext in ("docx", "xlsx", "pptx"):
+            # OOXML 本质是 ZIP（PK 头）；Office 加密后被包进 OLE 复合文档
+            # （EncryptedPackage 流），文件头变为 D0 CF 11 E0 A1 B1 1A E1。
+            with open(local_path, "rb") as f:
+                head = f.read(8)
+            if head == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+                return (f"{file_ext} 文件头为 OLE 复合文档——Office 加密文档"
+                        f"（EncryptedPackage）或旧版二进制格式（doc/xls/ppt）误改后缀")
+            return None
+    except Exception:
+        return None  # 探测自身失败不拦路（fail-open）
+    return None
+
+
+def _iter_pptx_shapes(shapes):
+    """G13：深度优先展开 GroupShape（组合形状）。
+
+    此前主循环只遍历 slide.shapes 顶层：GroupShape 无 .text，被
+    `hasattr(shape, "text")` 静默跳过——组内文本框（中文 SOP/培训 deck 里
+    "框+箭头+说明文字"的主流写法）整体丢失。组内嵌套组递归展开，子形状
+    按 XML 文档序原位替换组本身，表格/占位符判定与顶层同语义。"""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    for shape in shapes:
+        try:
+            is_group = shape.shape_type == MSO_SHAPE_TYPE.GROUP
+        except Exception:
+            is_group = False
+        if is_group:
+            yield from _iter_pptx_shapes(shape.shapes)
+        else:
+            yield shape
+
+
+def _warn_skipped_vector_images(warnings: list, stats: dict) -> None:
+    """G4：矢量图（WMF/EMF/SVG）被跳过时落一条结构化 warning，使内容损失可见。
+
+    此前三处裸 continue 静默丢弃——中文企业 DOCX 里剪贴板粘贴的 ERP 截图/Visio
+    流程图常为 EMF，丢了完全无感知。计数进 result.warnings（随 canonical 落库、
+    可被治理看板/审计聚合）；跳过行为本身不变（栅格化转换是后续工作）。"""
+    n = int(stats.get("skipped_vector_images", 0) or 0)
+    if n <= 0:
+        return
+    formats = "/".join(sorted(stats.get("skipped_vector_formats", ()) or ())) or "vector"
+    warnings.append(
+        f"[VECTOR_IMAGE_SKIPPED] {n} 张矢量图（{formats}）未提取——"
+        f"WMF/EMF/SVG 暂不支持栅格化，图内内容未进入索引。"
+    )
+
+
 def _html_to_text(raw_html: str) -> str:
     """HTML → 纯文本：剥标签、跳过 script/style、块级标签转换行；失败回退原文。"""
     import re
@@ -572,6 +643,25 @@ class UnifiedExtractor:
             return self._extract_mock(task, file_ext)
 
         # ── 生产模式：按文件类型分发 ──
+        # G14：加密/带密码文档前置短路——显式 [PASSWORD_PROTECTED] 警告 + 不触发
+        # OCR/VLM 付费调用；extract_method 复用 unsupported 前缀使 0-chunk 收尾按
+        # 既有关键词落 NEEDS_REVIEW/FAILED 等人工提供解密版本（而非无谓自动重试）。
+        if file_ext in ("pdf", "docx", "xlsx", "pptx"):
+            _enc_reason = _detect_password_protected(task.get("local_path", ""), file_ext)
+            if _enc_reason:
+                return ExtractionResult(
+                    doc_id=task["doc_id"],
+                    version_no=task["version_no"],
+                    source_key=task.get("raw_key", ""),
+                    file_ext=file_ext,
+                    extract_method=f"unsupported:password_protected_{file_ext}",
+                    title=task.get("filename", ""),
+                    text="",
+                    text_length=0,
+                    ocr_required=False,
+                    ocr_status="NOT_REQUIRED",
+                    warnings=[f"[PASSWORD_PROTECTED] {_enc_reason}；请提供解密版本后重新上传"],
+                )
         if file_ext == "pdf":
             return self._extract_pdf(task)
         elif file_ext == "docx":
@@ -631,8 +721,11 @@ class UnifiedExtractor:
         # 提取嵌入图片 →（可选）条带缝合 → 三阶段过滤漏斗
         # #F-mm9：缝合必须在漏斗之前（条带逐条会死于 Funnel-1 aspect>8），
         # 缝合产物照常过漏斗/VLM/上传/绑定；默认 OFF 时 _stitch_pdf_strip_assets 原样透传。
+        img_stats: dict = {}
         raw_assets = extract_images_from_pdf(
-            local_path, _safe_image_output_dir(task), max_pages=self.pdf_image_max_pages)
+            local_path, _safe_image_output_dir(task), max_pages=self.pdf_image_max_pages,
+            stats=img_stats)
+        _warn_skipped_vector_images(warnings, img_stats)
         raw_assets, stitch_warnings = _stitch_pdf_strip_assets(raw_assets)
         warnings.extend(stitch_warnings)
         assets, img_blocks, vlm_degraded = self._process_embedded_images(raw_assets, task)
@@ -738,9 +831,11 @@ class UnifiedExtractor:
 
         # ── 提取嵌入图片到磁盘 → 三阶段过滤漏斗 ──
         # perf#63：复用同一 _document，省掉此前这里的第二次全量解析。
+        img_stats: dict = {}
         exported_images = extract_images_from_docx(
-            local_path, _safe_image_output_dir(task), document=_document
+            local_path, _safe_image_output_dir(task), document=_document, stats=img_stats
         )
+        _warn_skipped_vector_images(warnings, img_stats)
 
         # ── 对齐 image_index：inline_image_assets 按文档顺序，
         #    exported_images 按 rels 遍历顺序，需要通过 target_ref 匹配 ──
@@ -1220,8 +1315,8 @@ class UnifiedExtractor:
                 # 恒为 blocks[slide_start:] —— Phase 2 免去每 slide 对全量 blocks 的扫描。
                 slide_start = len(blocks)
 
-                # ── Phase 1: 按 shape 类型生成 blocks ──
-                for shape in slide.shapes:
+                # ── Phase 1: 按 shape 类型生成 blocks（G13：递归展开组合形状）──
+                for shape in _iter_pptx_shapes(slide.shapes):
 
                     # ── 表格 shape → table block ──
                     if shape.has_table:
@@ -1333,10 +1428,12 @@ class UnifiedExtractor:
             warnings.append(f"Failed to extract PPTX text: {e}")
 
         # 提取嵌入图片 → 三阶段过滤漏斗
+        img_stats: dict = {}
         assets, img_blocks, vlm_degraded = self._process_embedded_images(
-            extract_images_from_pptx(local_path, _safe_image_output_dir(task)),
+            extract_images_from_pptx(local_path, _safe_image_output_dir(task), stats=img_stats),
             task,
         )
+        _warn_skipped_vector_images(warnings, img_stats)
         if img_blocks:
             blocks.extend(img_blocks)
 
