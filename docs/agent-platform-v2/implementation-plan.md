@@ -28,10 +28,16 @@
 - **WS0-Pre-3 SessionMemory owner 归属校验（A2，安全）**：`SessionMemory` 全部方法签名加 owner/ctx；Redis 侧键值存 owner、常量时间比对、不符 fail-closed——**对齐 HEAD `session_store.py` 的 P3-6 修复**（`_verify_owner`/`SessionOwnershipError`，2026-07-05），严禁按基线签名实现而在新链路复活会话越权。同批补 Redis 认证（ACL 密码）/ TLS / VPC 内网访问设计（报告现仅提 AOF）。
 - **WS0-Pre-4 可靠调度地基（E1）——不等 WS5**：应用内后台扫描线程（Redis SETNX 单例锁互斥，分钟级扫 `idx_status_expiry`/`idx_status_hb`），承接审批过期、心跳僵尸 run 回收、死信补偿；审批过期同时改**读时惰性判定**（decide/查询路径即判 `expires_at`），定时对账降级为兜底；DataWorks 仅作日级兜底（其生产不可用是既成事实）。个人 Mac launchd 单点列为运维 debt 关闭项。
 - **WS0-Pre-5 staging 环境建设（E2，即原缺失的 WS0-0）**：staging SAE 应用 + staging 钉钉机器人 + staging Redis + CI staging 发布通道，含建设工时；WS0 全部验收在此执行。staging 未就绪期间的显式降级方案 = 生产影子实例（只读流量复制），不允许"直接拿生产验收"。
-- **WS0-Pre-6 数据出境闸门 + judge 境内化（D2/D3，合规 gate）**：Policy/Gateway 加 `data_classification × provider` allowlist——`confidential` 默认禁送外部 provider（数据分类字段已有，代码量约一天）；DashScope"数据不用于训练"条款确认列入报告 §13 挂 owner + 截止日。评测侧：`eval_harness/run_judge.py` 现用境外 judge 模型，与硬约束 3 冲突——含业务数据的评测层（L7 及以下）换**境内 judge 面板**（保留反自评机制）；judge 服务不可用时人工兜底，不直接阻断发布。
-- **WS0-Pre-7 成本 spend 闸（E5）**：Gateway 加日级/部门级 **RMB spend 上限**（fail-closed），替代仅按请求数计的现有账单保护（agent 单请求成本 ×10–20，请求数闸形同虚设）；报告补单次 agent 对话成本量级估算。
+- **WS0-Pre-6 数据出境闸门（D2，合规 gate）**：Policy/Gateway 加 `data_classification × provider` allowlist 骨架——`confidential` 默认禁送外部 provider（数据分类字段已有，代码量约一天）；DashScope"数据不用于训练"条款确认列入报告 §13 挂 owner + 截止日。〔rev2 测试阶段〕测试期该 allowlist 可先跑"记录+告警"观测态,`confidential` 硬 fail-closed 收紧随境内化一并列入下方"正式上线前 gate"。
 
-**验收**：7 项逐条关闭并在评审报告 §7 对照勾选；v2 报告完成对应修订（§3 执行模型节、§6 owner 签名、§13 补挂 owner 项）。
+> **judge 境内化（D3）〔rev2 测试阶段豁免〕**：测试阶段 `eval_harness/run_judge.py` 沿用境外 `claude-opus-4-8`——用户在国外、系统非正式上线,硬约束 3 的出境冲突在测试期不触发。含业务数据评测层换**境内 judge 面板**(保留反自评 + judge 不可用人工兜底)的设计不变,但**降级为"正式上线前 gate"**(见下),不阻塞开工。
+
+**〔rev2〕正式上线前 gate（测试→正式上线的补齐清单，测试阶段豁免、上线前必关）**
+- **judge 境内化（D3）**：含业务数据评测层从 opus 4.8 切境内 judge 面板;切换前保留 opus 4.8。
+- **成本 spend 闸（E5）**：Gateway 日级/部门级 **RMB spend 上限**(fail-closed)。〔rev2 测试阶段取消,理由:先搭建不正式上线〕——测试期 `model_gateway.py` 仅保留 **token/成本记账(观测态)** 防跑飞误报,不做硬拦;报告仍补单次 agent 对话成本量级估算,供上线前设阈参考。
+- **数据出境 fail-closed 收紧（D2）**：allowlist 从观测态切 `confidential` 默认禁送外部 provider 的硬拦。
+
+**WS0-Pre 验收**：WS0-Pre-1～6 逐条关闭并在评审报告 §7 对照勾选(WS0-Pre-6 测试期以观测态 allowlist + §13 条款 owner 到位为准);"正式上线前 gate"三项挂 owner + 截止日,进正式上线 checklist 而非 WS0-Pre;v2 报告完成对应修订（§3 执行模型节、§6 owner 签名、§13 补挂 owner 项）。
 
 ---
 
@@ -97,7 +103,7 @@
 | `executor.py` | 中间件栈：schema 校验→policy→超时→重试→幂等→熔断→审计→执行 | Repo vlm_retry/cost_breaker 沉淀 |
 | `loop.py` | 自研 DefaultAgentLoop——**按 WS0-Pre-2 定稿的执行模型实现**（有界执行宿主 + Generator.send 或 ToolResultInjector、step 边界 checkpoint、call_id 槽位挂起语义）〔rev B1/B2/B4/B5〕 | Qwen-Agent _run 骨架 + AgentScope 挂起语义 |
 | `adapters/qwen_agent.py` | （可选，P4）QwenAgentLoopAdapter 占位 | — |
-| `model_gateway.py` | ModelProvider Protocol / DashScopeProvider（收敛 http_session）/ 类别路由 / fallback / 熔断 / token 记账 / **日级·部门级 spend 闸（fail-closed）**〔rev E5〕 | OpenAI SDK 接口 + Claw 能力矩阵 + OmO 链形（自写） |
+| `model_gateway.py` | ModelProvider Protocol / DashScopeProvider（收敛 http_session）/ 类别路由 / fallback / 熔断 / **token·成本记账（观测态）**；日级/部门级 RMB 硬 spend 闸〔rev2 移至"正式上线前 gate"，测试期不启用〕 | OpenAI SDK 接口 + Claw 能力矩阵 + OmO 链形（自写） |
 | `run_store.py` | RunStore（RDS）：run/step/checkpoint/invocation 读写 + FOR UPDATE 状态机 + **per-thread active run 串行约束**〔rev C1〕 | LangGraph 三表 + kb_access 事务模式 |
 | `session_memory.py` | SessionMemory Protocol + Redis 实现（WS0-2 之上加 summary 槽位；**全方法带 owner，fail-closed**〔rev A2〕） | OpenAI Session Protocol |
 | `audit.py` | agent_audit_log 写入（HIGH_WRITE fail-closed，普通 fail-open） | Repo audit_log 改造 |
@@ -143,12 +149,12 @@
 - **修改** `qa_logger.py`+`schema/NNN_*`：qa_session_log 加 tokens_prompt/tokens_completion 列（或统一走 llm_call_log JOIN，二选一按 DBA 意见）；同批落 **WS1-0 的会话合流决策**（console 历史页与 L2 重建读取路径）〔rev B9〕。
 
 ### WS2-4 评测与门禁
-- **新增** `eval_harness/layers/l7_agent_tooling.py`：工具选择/参数正确率/权限正确性（越权用例 100% 拒绝为硬门）/E2E 完成率；golden 工具调用集从 qa_session_log 高频问题+SQL 样例构建（≥50 例起步）。〔rev D3〕judge 用 **WS0-Pre-6 定稿的境内 judge 面板**；SQL golden 由口径 owner 验收〔rev F2〕；参数正确性/多步轨迹的 ground truth 标注流程指定 owner〔rev E12〕。
+- **新增** `eval_harness/layers/l7_agent_tooling.py`：工具选择/参数正确率/权限正确性（越权用例 100% 拒绝为硬门）/E2E 完成率；golden 工具调用集从 qa_session_log 高频问题+SQL 样例构建（≥50 例起步）。〔rev D3 · rev2 测试阶段〕judge 测试期用 `claude-opus-4-8`；切**境内 judge 面板**是"正式上线前 gate"(见 WS0-Pre)，上线前完成。SQL golden 由口径 owner 验收〔rev F2〕；参数正确性/多步轨迹的 ground truth 标注流程指定 owner〔rev E12〕。
 - `deploy/eval_release_gate.sh` 接入 deploy.yml 发布前置 job（VPC self-hosted runner，WS0-4 已建）。
 - **新增** console「Agent 运行记录」tab（ManageView 骨架复用）：run 列表/step trace/工具调用明细；后端 `GET /api/agent/runs*` 只读 API（agent_admin/dept_admin 分权）。
 
 ### WS2 验收
-灰度 1–2 个部门（**运行时部门白名单**，非 env 重启〔rev E9〕）；l7 评测达标——权限维度 100%、工具选择 ≥90%、**E2E 完成率 ≥70% / 人工纠正率 ≤20% 作为首发量化线（业主确认后替换，不允许"按业务基线"空转）**〔rev E12〕；token 成本按部门可出报表且 spend 闸演练触发一次；SQL 越权红队用例全拦截。〔rev F3〕UX 最小闭环同批交付：执行中进度反馈（钉钉/console）、失败文案、SQL 答数溯源展示——E2E 完成率/纠正率直接由此决定。**回滚**：工具级 disable / 部门白名单摘除。
+灰度 1–2 个部门（**运行时部门白名单**，非 env 重启〔rev E9〕）；l7 评测达标——权限维度 100%、工具选择 ≥90%、**E2E 完成率 ≥70% / 人工纠正率 ≤20% 作为首发量化线（业主确认后替换，不允许"按业务基线"空转）**〔rev E12〕；token 成本按部门可出报表（观测态，硬 spend 闸移至上线前 gate〔rev2〕）；SQL 越权红队用例全拦截。〔rev F3〕UX 最小闭环同批交付：执行中进度反馈（钉钉/console）、失败文案、SQL 答数溯源展示——E2E 完成率/纠正率直接由此决定。**回滚**：工具级 disable / 部门白名单摘除。
 
 ---
 
