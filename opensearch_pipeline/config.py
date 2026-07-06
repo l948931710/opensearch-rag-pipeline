@@ -530,6 +530,15 @@ class PipelineConfig:
     max_retry_count: int = 3
     scan_batch_size: int = 50
 
+    # ── PDF 抽取页上限（G2：原 20 页硬编码 env 化）──────────────────
+    # 原生文本抽取（pdfplumber/pypdf，本地 CPU、零 API 成本）页上限。旧值 20 使长手册
+    # 第 21 页起既无原生文本也不进 OCR（P1-09 仅标注截断）；默认提升到 200。
+    # 付费路径各有独立上限：OCR=ocr.max_ocr_pages，图片挖掘=pdf_image_max_pages。
+    pdf_native_max_pages: int = 200         # RAG_PDF_NATIVE_MAX_PAGES
+    # PDF 嵌入图片挖掘页上限：挖掘本身是本地操作，但每张产出图都进 OCR+VLM 付费漏斗，
+    # 故保守维持 20；成本熔断/漏斗配额到位后可放大。
+    pdf_image_max_pages: int = 20           # RAG_PDF_IMAGE_MAX_PAGES
+
 
 def _require_ack(var: str) -> bool:
     """读取守卫豁免变量。空=未豁免；read_only_ack=豁免；其他值=拼写错误，直接 raise（R7）。"""
@@ -722,6 +731,8 @@ def load_config() -> PipelineConfig:
         max_concurrent_tasks=_env_int("MAX_CONCURRENT_TASKS", 5),
         max_retry_count=_env_int("MAX_RETRY_COUNT", 3),
         scan_batch_size=_env_int("SCAN_BATCH_SIZE", 50),
+        pdf_native_max_pages=_env_int("PDF_NATIVE_MAX_PAGES", 200),
+        pdf_image_max_pages=_env_int("PDF_IMAGE_MAX_PAGES", 20),
 
         oss=OSSConfig(
             endpoint=_env("OSS_ENDPOINT"),

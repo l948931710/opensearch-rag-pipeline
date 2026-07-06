@@ -81,7 +81,7 @@ def test_dc3_horizontal_merge_not_duplicated(cleanup_files):
     text = _table_text(blocks)
     assert "MERGED" in text
     assert "MERGED | MERGED" not in text          # the bug: duplicated merged cell
-    assert "MERGED | C" in text                    # correct: deduped
+    assert "MERGED |  | C" in text                 # deduped + "" placeholder keeps grid width (G1)
     assert "X | Y | Z" in text                     # non-merged row unaffected
 
 
@@ -102,6 +102,7 @@ def test_dc3_vertical_merge_not_duplicated(cleanup_files):
     text = _table_text(blocks)
     assert text.count("VMERGE") == 1               # appears once, not in both rows
     assert "VMERGE | P" in text
+    assert "|  | Q |" in text                      # continuation row keeps a placeholder slot (G1)
 
 
 def test_dc3_non_merged_table_unaffected(cleanup_files):
@@ -137,4 +138,46 @@ def test_dc3_dedup_in_with_images_path(cleanup_files):
     blocks, _, _ = extract_docx_with_images(path)
     text = _table_text(blocks)
     assert "HDR | HDR" not in text
-    assert "HDR | Z" in text
+    assert "HDR |  | Z" in text                    # dedup + placeholder keeps grid width (G1)
+
+
+# ── G1: empty cells must keep their grid position ──
+
+def test_g1_empty_cell_keeps_column_alignment(cleanup_files):
+    """An empty interior cell must emit a "" placeholder, not shift later columns left."""
+    import docx
+    from opensearch_pipeline.extraction.docx_extractor import extract_docx
+    doc = docx.Document()
+    t = doc.add_table(rows=2, cols=3)
+    t.cell(0, 0).text = "名称"
+    t.cell(0, 1).text = "规格"
+    t.cell(0, 2).text = "数量"
+    t.cell(1, 0).text = "刀叉"
+    # cell(1, 1) intentionally left empty
+    t.cell(1, 2).text = "100"
+    path = _save(doc)
+    cleanup_files.append(path)
+
+    blocks, _ = extract_docx(path)
+    text = _table_text(blocks)
+    assert "名称 | 规格 | 数量" in text
+    assert "刀叉 |  | 100" in text                 # the bug: was "刀叉 | 100" (数量 misread as 规格)
+    assert "刀叉 | 100" not in text.replace("刀叉 |  | 100", "")
+
+
+def test_g1_all_empty_row_still_skipped(cleanup_files):
+    """Rows with no content at all stay dropped (no pipe-only noise rows)."""
+    import docx
+    from opensearch_pipeline.extraction.docx_extractor import extract_docx
+    doc = docx.Document()
+    t = doc.add_table(rows=2, cols=2)
+    t.cell(0, 0).text = "A"
+    t.cell(0, 1).text = "B"
+    # row 1 entirely empty
+    path = _save(doc)
+    cleanup_files.append(path)
+
+    blocks, _ = extract_docx(path)
+    text = _table_text(blocks)
+    assert "A | B" in text
+    assert text.count("\n") == 0                   # single table row emitted

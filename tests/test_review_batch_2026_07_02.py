@@ -132,6 +132,8 @@ def test_pdf_truncation_flag_set_for_oversize(monkeypatch):
     from opensearch_pipeline.extraction.schema import ExtractedBlock
 
     ex = ue.UnifiedExtractor(simulate=True)
+    # G2 后上限是实例属性（RAG_PDF_NATIVE_MAX_PAGES，默认 200）；固定为 20 使测试与默认值解耦。
+    ex.pdf_native_max_pages = 20
     # 桩掉重子步骤：extract_pdf 返回 37 页；无嵌入图；跳过 OCR。
     monkeypatch.setattr(pdf_extractor, "extract_pdf",
                         lambda path, **k: ([ExtractedBlock("paragraph", "前 20 页正文")], 37, []))
@@ -144,7 +146,7 @@ def test_pdf_truncation_flag_set_for_oversize(monkeypatch):
         "filename": "x.pdf", "local_path": "/tmp/x.pdf",
     })
     assert res.extract_truncated is True
-    assert res.extracted_pages == ue.UnifiedExtractor.PDF_NATIVE_MAX_PAGES   # 20
+    assert res.extracted_pages == 20
     assert res.page_count == 37                                             # 真实总页数回写
     assert any("TRUNCATED" in w for w in res.warnings)
 

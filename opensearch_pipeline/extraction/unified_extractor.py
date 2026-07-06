@@ -520,10 +520,14 @@ class UnifiedExtractor:
     # Increment 0b: PDF 逐页 OCR 门槛——原生文本少于此字符数的页视为扫描页/坏字体页，
     # 单独送 OCR；取代旧的"按整文档 text_length 一刀切"（封面有字则整文档跳过 OCR）。
     PER_PAGE_OCR_THRESHOLD = 50
-    # 原生文本抽取的页上限（必须与 pdf_extractor.extract_pdf 的 max_pages 默认值一致）。
+    # 原生文本抽取的页上限（G2 env 化：RAG_PDF_NATIVE_MAX_PAGES）。类属性是默认值，
+    # __init__ 会以 config 值覆盖为实例属性（类级兜底保护 __new__ 构造的 gate-only 用法）；
+    # extract_pdf 调用、截断标注与 OCR 扫描钳位共用同一值。
     # OCR 门槛只考察【原生抽取实际覆盖过】的页：超过此上限的页根本没被抽取（按设计截断），
     # 不能因其"0 原生字符"就误判为需 OCR——那会浪费 Qwen-VL 预算、并把真扫描页挤出 OCR 配额。
-    PDF_NATIVE_MAX_PAGES = 20
+    pdf_native_max_pages = 200
+    # PDF 嵌入图片挖掘页上限（RAG_PDF_IMAGE_MAX_PAGES）：产出图逐张进 OCR+VLM 付费漏斗，保守默认。
+    pdf_image_max_pages = 20
 
     def __init__(
         self,
@@ -548,6 +552,9 @@ class UnifiedExtractor:
             self.ocr_client = ocr_client
         self.simulate = simulate
         self.config = cfg
+        # G2：PDF 页上限从 config 注入（getattr 兜底保护直接构造 PipelineConfig 的旧测试桩）
+        self.pdf_native_max_pages = int(getattr(cfg, "pdf_native_max_pages", 200) or 200)
+        self.pdf_image_max_pages = int(getattr(cfg, "pdf_image_max_pages", 20) or 20)
         # 可选：运行级成本熔断器（由 orchestrator 注入，跨文档累计运行预算）。
         # 为空时 vlm_rebuilder 会按 cfg 现造一个做单文档闸。
         self.cost_breaker = None
@@ -617,7 +624,7 @@ class UnifiedExtractor:
         from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_pdf
 
         local_path = task.get("local_path", "")
-        blocks, page_count, warnings = extract_pdf(local_path)
+        blocks, page_count, warnings = extract_pdf(local_path, max_pages=self.pdf_native_max_pages)
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
 
@@ -625,7 +632,7 @@ class UnifiedExtractor:
         # #F-mm9：缝合必须在漏斗之前（条带逐条会死于 Funnel-1 aspect>8），
         # 缝合产物照常过漏斗/VLM/上传/绑定；默认 OFF 时 _stitch_pdf_strip_assets 原样透传。
         raw_assets = extract_images_from_pdf(
-            local_path, _safe_image_output_dir(task), max_pages=20)
+            local_path, _safe_image_output_dir(task), max_pages=self.pdf_image_max_pages)
         raw_assets, stitch_warnings = _stitch_pdf_strip_assets(raw_assets)
         warnings.extend(stitch_warnings)
         assets, img_blocks, vlm_degraded = self._process_embedded_images(raw_assets, task)
@@ -690,13 +697,13 @@ class UnifiedExtractor:
         # 扫描 PDF 会漏判截断被当完整上线。真实总页数优先取 result.page_count，回退入口 page_count，
         # 并回写 result.page_count 确保总页数落库（document_version.page_count），供治理看板统计截断文档数。
         effective_page_count = result.page_count or page_count or 0
-        if effective_page_count > self.PDF_NATIVE_MAX_PAGES:
+        if effective_page_count > self.pdf_native_max_pages:
             result.extract_truncated = True
-            result.extracted_pages = self.PDF_NATIVE_MAX_PAGES
+            result.extracted_pages = self.pdf_native_max_pages
             result.page_count = effective_page_count
             result.warnings.append(
-                f"[TRUNCATED] PDF 共 {effective_page_count} 页，仅前 {self.PDF_NATIVE_MAX_PAGES} 页被抽取；"
-                f"第 {self.PDF_NATIVE_MAX_PAGES + 1} 页起的内容未进入索引（含 OCR）。"
+                f"[TRUNCATED] PDF 共 {effective_page_count} 页，仅前 {self.pdf_native_max_pages} 页被抽取；"
+                f"第 {self.pdf_native_max_pages + 1} 页起的内容未进入索引（含 OCR）。"
             )
 
         return result
@@ -1928,8 +1935,8 @@ class UnifiedExtractor:
                 continue
             txt = (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")) or ""
             per_page[pg] = per_page.get(pg, 0) + len(txt.strip())
-        # 只考察原生抽取覆盖过的页（≤ PDF_NATIVE_MAX_PAGES）；越界页未被抽取，非"缺文本=需OCR"。
-        scan_upto = min(page_count, self.PDF_NATIVE_MAX_PAGES)
+        # 只考察原生抽取覆盖过的页（≤ pdf_native_max_pages）；越界页未被抽取，非"缺文本=需OCR"。
+        scan_upto = min(page_count, self.pdf_native_max_pages)
         return [pg for pg in range(1, scan_upto + 1)
                 if per_page.get(pg, 0) < self.PER_PAGE_OCR_THRESHOLD]
 

@@ -55,9 +55,11 @@ def test_all_text_pdf_skips_ocr():
 
 
 def test_pages_beyond_native_cap_not_flagged_for_ocr():
-    """原生抽取只覆盖前 PDF_NATIVE_MAX_PAGES(=20) 页；page_count 更大时，越界页（未被抽取、
-    per_page 缺失）不能因"0 原生字符"被误判需 OCR——否则浪费 OCR 预算并挤出真扫描页。"""
+    """原生抽取只覆盖前 pdf_native_max_pages 页；page_count 更大时，越界页（未被抽取、
+    per_page 缺失）不能因"0 原生字符"被误判需 OCR——否则浪费 OCR 预算并挤出真扫描页。
+    G2 后上限可配（默认 200）；此处固定 20 使钳位逻辑测试与默认值解耦。"""
     ux = _gate()
+    ux.pdf_native_max_pages = 20
     # 50 页 PDF，前 20 页都有充足原生文本（21-50 未抽取）→ 不应有任何页需 OCR
     res = _pdf({pg: 200 for pg in range(1, 21)}, page_count=50)
     assert ux._pages_needing_ocr(res) == []
