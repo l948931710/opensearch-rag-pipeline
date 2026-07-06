@@ -1025,15 +1025,23 @@ class UnifiedExtractor:
             for sheet_idx, sheet_name in enumerate(wb.sheetnames):
                 ws = wb[sheet_name]
 
-                # 隐藏/超隐藏 sheet 不入库（B2-1）：常为草稿/中间计算/下拉源/内部辅助数据，
-                # 入库 = 噪声，且可能泄露不该展示的内容。不静默——逐 sheet loud log。enumerate
-                # 不跳号 → 可见 sheet 的 sheet_idx/page_num 与图片路径(同样跳隐藏)保持一致。
-                # getattr 兜底默认 'visible'，odd worksheet 对象不致中断抽取（优雅降级）。
+                # 隐藏 sheet 入库与否走证据制（B2-1 条件化，release-gate 2026-07-06 复盘）：
+                # 带图/大二维表的隐藏正文 sheet 收录，草稿/下拉源仍跳过；veryHidden 恒跳过。
+                # 规则与三档开关 RAG_XLSX_HIDDEN_SHEET_MODE 见 hidden_sheet_should_ingest
+                # docstring。不静默——跳过/收录隐藏 sheet 都逐 sheet loud log。enumerate
+                # 不跳号 → 可见 sheet 的 sheet_idx/page_num 与图片路径(共用同一决策)保持一致。
+                from opensearch_pipeline.extraction.image_extraction_utils import (
+                    hidden_sheet_should_ingest,
+                )
                 _state = getattr(ws, "sheet_state", "visible")
-                if _state != "visible":
+                if not hidden_sheet_should_ingest(ws):
                     warnings.append(f"skipped {_state} sheet: {sheet_name}")
                     print(f"      ⏭️ [xlsx] skip {_state} sheet '{sheet_name}' (not ingested)", flush=True)
                     continue
+                if _state != "visible":
+                    warnings.append(f"ingested {_state} sheet (body evidence): {sheet_name}")
+                    print(f"      👁️ [xlsx] ingest {_state} sheet '{sheet_name}' (body evidence: "
+                          f"images/2-D content mass)", flush=True)
 
                 # 合并单元格"向下填充"：纵向合并的首格值（如"类别"列）传播到该列下方各行，
                 # 避免下游丢失分组键。横向合并不填充（标题只出现一次）。

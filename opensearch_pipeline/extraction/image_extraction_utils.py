@@ -417,6 +417,48 @@ def extract_images_from_pdf(
 # XLSX — openpyxl _images 遍历
 # ═══════════════════════════════════════════════════════════════
 
+def hidden_sheet_should_ingest(ws) -> bool:
+    """B2-1 条件化（release-gate 2026-07-06 复盘）：隐藏 sheet 是否入库。
+
+    B2-1 无条件跳过隐藏 sheet 的初衷（草稿/中间计算/下拉源=噪声+泄露面）成立，但
+    xlsx_clean 设备清扫基准书证明**作者藏 tab ≠ 内容作废**：2/3 的 sheet（30 行×15 列
+    清扫基准表、13/24 张锚定图片）是隐藏的正文主体，无条件跳过使 binding Jaccard
+    0.8917→0.6。本函数改为证据制：
+
+      · visible          → 恒入库（与历史一致）
+      · veryHidden 等    → 恒跳过（程序级深藏 = 明确的"不给人看"意图）
+      · hidden           → 有**正文证据**才入库：带锚定图片（草稿/下拉源几乎不含图），
+                           或 ≥10 非空行 × ≥3 列的二维内容体量（下拉源多为 1-2 列窄表）
+
+    RAG_XLSX_HIDDEN_SHEET_MODE：auto（默认，证据制）| skip（B2-1 原行为，全跳）|
+    ingest（B2-1 前行为，全收）。文本路径与图片路径共用本函数保持决策一致；
+    read_only workbook 无 _images（大表 >50k 行/100MB 才触发）→ 图片证据不可见，
+    但该体量下内容体量 prong 必然命中，两路径决策仍一致。任何读取异常 → 保守跳过。
+    """
+    state = getattr(ws, "sheet_state", "visible")
+    if state == "visible":
+        return True
+    mode = os.environ.get("RAG_XLSX_HIDDEN_SHEET_MODE", "auto").strip().lower()
+    if mode == "ingest":
+        return True
+    if mode == "skip":
+        return False
+    if state != "hidden":          # veryHidden / 未知态：恒跳过
+        return False
+    try:
+        if getattr(ws, "_images", None):
+            return True
+        nonempty = 0
+        for row in ws.iter_rows(max_row=min(ws.max_row or 0, 200)):
+            if any(c.value not in (None, "") for c in row):
+                nonempty += 1
+                if nonempty >= 10:
+                    break
+        return nonempty >= 10 and (ws.max_column or 0) >= 3
+    except Exception:
+        return False               # 读取失败 → 维持 B2-1 保守跳过
+
+
 def extract_images_from_xlsx(
     local_path: str,
     output_dir: str,
@@ -465,9 +507,10 @@ def extract_images_from_xlsx(
     img_index = 0
 
     for sheet_idx, ws in enumerate(wb.worksheets):
-        # 隐藏/超隐藏 sheet 的图片不提取（B2-1，与文本路径一致）。enumerate 不跳号 → sheet_idx
-        # 与文本路径对齐（drawing→sheet 的 MD5 字节匹配仍兜底）。getattr 兜底，优雅降级。
-        if getattr(ws, "sheet_state", "visible") != "visible":
+        # 隐藏 sheet 图片是否提取与文本路径共用 hidden_sheet_should_ingest 证据制决策
+        # （B2-1 条件化）。enumerate 不跳号 → sheet_idx 与文本路径对齐
+        # （drawing→sheet 的 MD5 字节匹配仍兜底）。
+        if not hidden_sheet_should_ingest(ws):
             continue
         if not hasattr(ws, '_images'):
             continue

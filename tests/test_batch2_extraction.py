@@ -54,6 +54,59 @@ def test_b2_1_hidden_sheet_not_ingested(tmp_path):
     assert any("隐藏表" in w for w in res.warnings), f"隐藏 sheet 跳过应有 warning: {res.warnings}"
 
 
+def _make_xlsx_hidden_body(path, *, state="hidden", rows=15, cols=4):
+    """隐藏但有正文体量的 sheet（B2-1 条件化：证据制应收录）。"""
+    openpyxl = pytest.importorskip("openpyxl")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "可见表"
+    ws["A1"] = "VISIBLEMARKER_头"
+    hs = wb.create_sheet("隐藏正文表")
+    for r in range(1, rows + 1):
+        for c in range(1, cols + 1):
+            hs.cell(r, c, f"HIDDENBODY_r{r}c{c}")
+    hs.sheet_state = state
+    wb.save(path)
+
+
+def test_b2_1c_hidden_body_sheet_ingested(tmp_path):
+    """B2-1 条件化：≥10 非空行 × ≥3 列的隐藏 sheet = 正文证据 → 收录（loud log）。"""
+    p = str(tmp_path / "hb.xlsx")
+    _make_xlsx_hidden_body(p)
+    res = UnifiedExtractor(simulate=True).extract(_task(p, "xlsx"))
+    assert "HIDDENBODY_r1c1" in res.text, "有正文体量的隐藏 sheet 应收录"
+    assert any("ingested hidden sheet" in w for w in res.warnings), \
+        f"收录隐藏 sheet 应留痕: {res.warnings}"
+
+
+def test_b2_1c_mode_skip_restores_unconditional(tmp_path, monkeypatch):
+    """RAG_XLSX_HIDDEN_SHEET_MODE=skip → B2-1 原行为（正文体量也不收）。"""
+    p = str(tmp_path / "hbs.xlsx")
+    _make_xlsx_hidden_body(p)
+    monkeypatch.setenv("RAG_XLSX_HIDDEN_SHEET_MODE", "skip")
+    res = UnifiedExtractor(simulate=True).extract(_task(p, "xlsx"))
+    assert "HIDDENBODY_r1c1" not in res.text
+    assert any("skipped hidden sheet" in w for w in res.warnings)
+
+
+def test_b2_1c_veryhidden_always_skipped(tmp_path):
+    """veryHidden（程序级深藏）即便有正文体量也恒跳过。"""
+    p = str(tmp_path / "vh.xlsx")
+    _make_xlsx_hidden_body(p, state="veryHidden")
+    res = UnifiedExtractor(simulate=True).extract(_task(p, "xlsx"))
+    assert "HIDDENBODY_r1c1" not in res.text
+    assert any("veryHidden" in w for w in res.warnings)
+
+
+def test_b2_1c_sparse_hidden_sheet_still_skipped(tmp_path):
+    """窄/稀疏隐藏 sheet（下拉源形态：<3 列）在 auto 下仍跳过——B2-1 初衷保留。"""
+    p = str(tmp_path / "sp.xlsx")
+    _make_xlsx_hidden_body(p, rows=30, cols=2)   # 行够多但只有 2 列
+    res = UnifiedExtractor(simulate=True).extract(_task(p, "xlsx"))
+    assert "HIDDENBODY_r1c1" not in res.text
+    assert any("skipped hidden sheet" in w for w in res.warnings)
+
+
 def test_b2_4_date_cell_renders_clean(tmp_path):
     p = str(tmp_path / "d.xlsx")
     _make_xlsx(p, with_hidden=False, with_date=True)
