@@ -4537,6 +4537,88 @@ def _chunk_text_gibberish(text: str) -> bool:
     return good / denom < 0.40
 
 
+_SENTENCE_FINAL = tuple("。！？；：.!?…”\"）)]】》>|")
+
+
+def _batch_quality_metrics(valid, invalid) -> dict:
+    """G22：本批 chunk 内容质量轻量指标（纯 Python，零 API/IO）。
+
+    这是离线 L6 全量评测的日常哨兵版：不替代 L6（那边有 GT/CI/HA3 对账），
+    只保证坏 PDF 批次当天可见而不是等下次发布门。
+    """
+    from datetime import datetime, timedelta, timezone
+    type_dist: dict = {}
+    tokens: list = []
+    midcut = 0
+    text_like = 0
+    for c in valid:
+        ct = getattr(c, "chunk_type", "") or "unknown"
+        type_dist[ct] = type_dist.get(ct, 0) + 1
+        tokens.append(int(getattr(c, "token_count", 0) or 0))
+        if ct in ("text_chunk", "clause_chunk", "faq_chunk", "step_card"):
+            text_like += 1
+            tail = (getattr(c, "chunk_text", "") or "").rstrip()
+            if tail and not tail.endswith(_SENTENCE_FINAL):
+                midcut += 1
+    tokens.sort()
+
+    def _pct(p):
+        return tokens[min(len(tokens) - 1, int(len(tokens) * p))] if tokens else 0
+
+    gib = sum(1 for inv in invalid if "gibberish_text" in (inv.get("issues") or []))
+    return {
+        "stat_date": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"),
+        "doc_count": len({getattr(c, "doc_id", "") for c in valid}),
+        "chunk_total": len(valid) + len(invalid),
+        "chunk_invalid": len(invalid),
+        "gibberish_cnt": gib,
+        "midcut_rate": round(midcut / text_like, 4) if text_like else 0.0,
+        "p50_tokens": _pct(0.50),
+        "p95_tokens": _pct(0.95),
+        "type_dist_json": json.dumps(type_dist, ensure_ascii=False)[:1024],
+    }
+
+
+def _persist_ingest_quality(ctx: dict, metrics: dict) -> None:
+    """G22：批次质量指标落库 + 阈值告警。全程 fail-open（表未建/RDS 不可达仅日志）。"""
+    if os.environ.get("RAG_INGEST_QUALITY_METRICS", "true").lower() in ("0", "false", "no"):
+        return
+    # 阈值告警先于落库（落库失败也要报）
+    try:
+        inv_ratio = metrics["chunk_invalid"] / max(metrics["chunk_total"], 1)
+        midcut_alert = float(os.environ.get("RAG_INGEST_QUALITY_MIDCUT_ALERT", "0.25"))
+        invalid_alert = float(os.environ.get("RAG_INGEST_QUALITY_INVALID_ALERT", "0.10"))
+        if metrics["midcut_rate"] > midcut_alert or inv_ratio > invalid_alert:
+            from opensearch_pipeline.alerting import send_ops_alert
+            send_ops_alert(
+                "摄取批次质量告警",
+                f"midcut_rate={metrics['midcut_rate']:.2%} (阈 {midcut_alert:.0%}) · "
+                f"invalid={metrics['chunk_invalid']}/{metrics['chunk_total']} "
+                f"(阈 {invalid_alert:.0%}) · gibberish={metrics['gibberish_cnt']} · "
+                f"docs={metrics['doc_count']}",
+                severity="warning")
+    except Exception:
+        pass
+    if _resolve_simulate(ctx, "db"):
+        return
+    try:
+        conn = _get_db_conn(select_db=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ingest_quality_metrics (stat_date, doc_count, chunk_total, "
+                    "chunk_invalid, gibberish_cnt, midcut_rate, p50_tokens, p95_tokens, "
+                    "type_dist_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (metrics["stat_date"], metrics["doc_count"], metrics["chunk_total"],
+                     metrics["chunk_invalid"], metrics["gibberish_cnt"], metrics["midcut_rate"],
+                     metrics["p50_tokens"], metrics["p95_tokens"], metrics["type_dist_json"]))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as _iq_err:
+        print(f"    ⚠️ ingest_quality_metrics write skipped (fail-open): {_iq_err}")
+
+
 def node_validate_chunks(ctx: dict):
     """校验 chunk 质量。"""
     chunks = ctx.get("chunks", [])
@@ -4594,6 +4676,15 @@ def node_validate_chunks(ctx: dict):
 
     ctx["valid_chunks"] = valid
     ctx["invalid_chunks"] = invalid
+
+    # G22：per-batch 内容质量指标（落 ingest_quality_metrics + 阈值告警；fail-open）
+    try:
+        _iq = _batch_quality_metrics(valid, invalid)
+        ctx["ingest_quality_metrics"] = _iq
+        if valid or invalid:
+            _persist_ingest_quality(ctx, _iq)
+    except Exception as _iq_e:
+        print(f"    ⚠️ batch quality metrics skipped (fail-open): {_iq_e}")
 
     print(f"    └─ Valid: {len(valid)}, Invalid: {len(invalid)}")
     for inv in invalid[:3]:

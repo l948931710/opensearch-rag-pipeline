@@ -219,6 +219,54 @@ def test_g19_simhash_properties():
     assert simhash64(base) == simhash64(base.replace("：", "：\n  "))
 
 
+# ═══════════════════ G22: per-batch 摄取质量指标 ═══════════════════
+
+def test_g22_batch_quality_metrics_computed():
+    import opensearch_pipeline.pipeline_nodes as pn
+    from opensearch_pipeline.chunker import Chunk
+
+    def _c(i, text, ctype="text_chunk", tokens=50):
+        return Chunk(chunk_id=f"q{i}", doc_id="DQ", version_no=1, chunk_index=i,
+                     chunk_type=ctype, chunk_text=text, token_count=tokens)
+
+    valid = [
+        _c(0, "完整句子结尾。"),
+        _c(1, "这一句被截断在中间，没有"),          # 疑似句中截断
+        _c(2, "| a | b |", ctype="table_chunk"),   # 表格不计入截断分母
+    ]
+    invalid = [{"chunk_id": "bad", "issues": ["gibberish_text"]},
+               {"chunk_id": "bad2", "issues": ["too_few_tokens"]}]
+    m = pn._batch_quality_metrics(valid, invalid)
+    assert m["chunk_total"] == 5 and m["chunk_invalid"] == 2
+    assert m["gibberish_cnt"] == 1
+    assert m["midcut_rate"] == 0.5                 # 2 个文本块里 1 个疑似截断
+    assert m["doc_count"] == 1
+    assert "table_chunk" in m["type_dist_json"]
+
+
+def test_g22_alert_fires_on_high_invalid(monkeypatch):
+    import opensearch_pipeline.pipeline_nodes as pn
+    import opensearch_pipeline.alerting as alerting
+    sent = []
+    monkeypatch.setattr(alerting, "send_ops_alert",
+                        lambda title, text, **kw: sent.append(title))
+    metrics = {"stat_date": "2026-07-06", "doc_count": 1, "chunk_total": 10,
+               "chunk_invalid": 5, "gibberish_cnt": 5, "midcut_rate": 0.0,
+               "p50_tokens": 50, "p95_tokens": 100, "type_dist_json": "{}"}
+    pn._persist_ingest_quality({"simulate_db": True}, metrics)   # simulate → 不写库仍告警
+    assert sent == ["摄取批次质量告警"]
+
+
+def test_g22_validate_node_attaches_metrics():
+    import opensearch_pipeline.pipeline_nodes as pn
+    from opensearch_pipeline.chunker import Chunk
+    good = Chunk(chunk_id="ok", doc_id="D", version_no=1, chunk_index=0,
+                 chunk_type="text_chunk", chunk_text="正常的中文正文内容。" * 10, token_count=60)
+    ctx = {"chunks": [good], "simulate_db": True}
+    pn.node_validate_chunks(ctx)
+    assert ctx["ingest_quality_metrics"]["chunk_total"] == 1
+
+
 # ═══════════════════ G17: 图表/流程图二次结构抽取 ═══════════════════
 
 def _funnel_with_category(monkeypatch, category, enabled):
