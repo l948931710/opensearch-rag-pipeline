@@ -57,6 +57,7 @@ from opensearch_pipeline.pii_patterns import (  # noqa: F401
     ENTITY_SEVERITY,
     REDACTION_MAP,
     SEMANTIC_KEYWORDS,
+    _body_entity_fp_ignore,
     _image_ocr_fp_ignore,
 )
 
@@ -1831,8 +1832,9 @@ def node_detect_sensitive(ctx: dict):
         entity_risk = "low"
 
         # 1. Regex 实体检测（按实体类型分级：电话/邮箱=medium→脱敏保留；身份证/密钥=high→隔离）
+        # G5：_body_entity_fp_ignore 抑制 bank_card 的订单号/物料号 FP（全命中皆锚点上下文才抑制）
         for name, pattern in ENTITY_PATTERNS.items():
-            if re.search(pattern, text):
+            if re.search(pattern, text) and not _body_entity_fp_ignore(name, text):
                 sev = ENTITY_SEVERITY.get(name, "high")
                 hits.append({
                     "type": "ENTITY", "category": name,

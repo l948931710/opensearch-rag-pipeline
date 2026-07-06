@@ -151,6 +151,54 @@ def test_g9_dead_not_in_stage3_reselect():
     assert ChunkIndexStatus.DEAD not in STAGE3_CHUNK_RESELECT_INDEX_STATUS
 
 
+# ═══════════════════ G5: PII 门扩展实体 ═══════════════════
+
+def _detect_and_redact(text):
+    import opensearch_pipeline.pipeline_nodes as pn
+    doc = {"doc_id": "D5", "version_no": 1, "text": text, "blocks": [], "assets": []}
+    ctx = {"canonicals": [doc]}
+    pn.node_detect_sensitive(ctx)
+    pn.node_redact_or_quarantine(ctx)
+    return doc
+
+
+def test_g5_bank_card_detected_and_masked():
+    """真卡号（正向锚点"卡号"）→ medium 检出 + 前4****后4 掩码——修复此前
+    "语义词命中却无 REDACTION_MAP 条目 → 卡号原样保留且标 CLEAN" 的缺陷。"""
+    doc = _detect_and_redact("报销请汇入银行卡号 6222020200112345678，开户行如下。")
+    assert any(h["category"] == "bank_card" for h in doc["risk_hits"])
+    assert doc["redaction_action"] == "REDACTED"
+    assert "6222020200112345678" not in doc["redacted_text"]
+    assert "6222****5678" in doc["redacted_text"]
+
+
+def test_g5_order_number_fp_suppressed():
+    """ERP 订单号（业务锚点上下文）→ 不检出、不掩码（FP 抑制）。"""
+    doc = _detect_and_redact("U8 采购订单号 1234567890123456 对应物料入库单。")
+    assert not any(h["category"] == "bank_card" for h in doc["risk_hits"])
+    assert "1234567890123456" in (doc.get("redacted_text") or doc["text"])
+
+
+def test_g5_uscc_and_address_detected():
+    import re as _re
+    from opensearch_pipeline.pii_patterns import ENTITY_PATTERNS
+    assert _re.search(ENTITY_PATTERNS["uscc"], "统一社会信用代码 91330281MA2CY7XQ4X 备案")
+    assert _re.search(ENTITY_PATTERNS["address"], "住址：宁波市慈溪市宗汉街道新兴路128号")
+    # USCC 尾校验字母不被 bank_card 半匹配（redact-v2 教训回归）
+    m = _re.search(ENTITY_PATTERNS["bank_card"], "91330281MA2CY7XQ4X")
+    assert m is None
+
+
+def test_g5_redaction_module_shares_patterns():
+    """redaction.py 与摄取门共用同一权威模式（不再双处定义）。"""
+    from opensearch_pipeline import redaction
+    from opensearch_pipeline.pii_patterns import ENTITY_PATTERNS
+    assert redaction._BANK_CARD == ENTITY_PATTERNS["bank_card"]
+    assert redaction._USCC == ENTITY_PATTERNS["uscc"]
+    assert redaction._ADDRESS == ENTITY_PATTERNS["address"]
+    assert redaction._PARTIAL_ID == ENTITY_PATTERNS["masked_id"]
+
+
 # ═══════════════════ G19: simhash 近重复 ═══════════════════
 
 def test_g19_simhash_properties():
