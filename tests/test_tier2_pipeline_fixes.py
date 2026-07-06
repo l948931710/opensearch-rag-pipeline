@@ -151,6 +151,25 @@ def test_g9_dead_not_in_stage3_reselect():
     assert ChunkIndexStatus.DEAD not in STAGE3_CHUNK_RESELECT_INDEX_STATUS
 
 
+# ═══════════════════ G19: simhash 近重复 ═══════════════════
+
+def test_g19_simhash_properties():
+    from opensearch_pipeline.text_similarity import simhash64, hamming64
+    base = "浙江富岭塑胶餐具生产作业指导书：本文件规定了刀叉勺的注塑、检验、包装流程。" * 8
+    # 相同文本 → 距离 0
+    assert hamming64(simhash64(base), simhash64(base)) == 0
+    # 微小改动（重新导出型变化）→ 距离很小
+    tweaked = base.replace("包装流程", "包装流程。", 1) + " 版本V2"
+    assert hamming64(simhash64(base), simhash64(tweaked)) <= 3
+    # 完全不同的文本 → 距离大
+    other = "员工考勤与请假管理制度：迟到早退的界定、年假计算方式、加班审批链。" * 8
+    assert hamming64(simhash64(base), simhash64(other)) > 10
+    # 空/超短文本 → 0 指纹（不参与比对）
+    assert simhash64("") == 0 and simhash64("ab") == 0
+    # 空白归一：排版空白变化不影响指纹
+    assert simhash64(base) == simhash64(base.replace("：", "：\n  "))
+
+
 # ═══════════════════ G3: 多栏页列检测 ═══════════════════
 
 def test_g3_two_column_page_reading_order(tmp_path):

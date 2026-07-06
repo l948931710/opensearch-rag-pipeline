@@ -624,6 +624,14 @@ def node_build_canonical(ctx: dict):
 
         # L2 canonical-text content hash (computed once; reused by the skip-gate + the RDS UPDATE).
         _canonical_sha256 = hashlib.sha256((md_data or "").encode("utf-8")).hexdigest()
+        # G19：64 位 simhash 指纹（近重复检测；<32 字符视为无指纹，同 _xd_min_chars 先例）
+        _content_simhash = None
+        if md_data and len((md_data or "").strip()) >= 32:
+            try:
+                from opensearch_pipeline.text_similarity import simhash64
+                _content_simhash = simhash64(md_data)
+            except Exception:
+                _content_simhash = None
 
         # perf#92：本篇文档共享一个 DB 连接——skip 判定 SELECT、跨文档去重与最终 canonical-keys
         # UPDATE 同连接同事务（原先三段各开一连接，每篇最多 3 次借还 + 3 次 commit）。惰性获取：
@@ -743,6 +751,49 @@ def node_build_canonical(ctx: dict):
                     print(f"    ⚠️ cross-doc dedup check failed (FAIL-SAFE: processing normally): {_xd_err}")
                     _doc_conn = _rollback_or_discard(_doc_conn)
 
+            # ── G19：simhash 近重复 WARN（默认 ON：RAG_NEAR_DUP_DETECT=false 关闭）──
+            # 精确哈希抓不到"重新导出的同一 SOP"（元数据/微小排版变化）。对现役其他文档
+            # 的 content_simhash 做 Hamming ≤ 阈值（默认 3）比对——只告警不拦截（近重复的
+            # ACL 语义比精确副本微妙，拦截留给人工），与跨文档精确去重 WARN-and-process 一致。
+            # 迁移 020 未应用（1054）/任何异常 → 静默跳过（fail-open）。
+            if (_content_simhash
+                    and os.environ.get("RAG_NEAR_DUP_DETECT", "true").lower() not in ("0", "false", "no")
+                    and not simulate_db):
+                try:
+                    from opensearch_pipeline.text_similarity import hamming64
+                    try:
+                        _nd_thresh = int(os.environ.get("RAG_NEAR_DUP_HAMMING", "3"))
+                    except ValueError:
+                        _nd_thresh = 3
+                    if _doc_conn is None:
+                        _doc_conn = _get_db_conn(select_db=True)
+                    with _doc_conn.cursor() as _nd_cur:
+                        _nd_cur.execute(
+                            "SELECT dv.doc_id, dv.content_simhash "
+                            "FROM document_version dv JOIN document_meta dm ON dv.doc_id=dm.doc_id "
+                            "WHERE dv.content_simhash IS NOT NULL AND dv.doc_id<>%s "
+                            "AND dv.status='active' AND dm.status='active' "
+                            "AND dm.current_version_no=dv.version_no LIMIT 5000",
+                            (canonical["doc_id"],))
+                        _nd_rows = _nd_cur.fetchall() or []
+                    _near = []
+                    for _nd_doc, _nd_sh in _nd_rows:
+                        if _nd_sh is None:
+                            continue
+                        _nd_d = hamming64(int(_nd_sh), _content_simhash)
+                        if _nd_d <= _nd_thresh:
+                            _near.append((_nd_doc, _nd_d))
+                    if _near:
+                        _nd_w = (f"{canonical['doc_id']}: near-duplicate content suspected "
+                                 f"(simhash Hamming≤{_nd_thresh}) with "
+                                 f"{[d for d, _ in _near[:5]]} → WARN, processing normally")
+                        print(f"    ⚠️ {_nd_w}")
+                        ctx.setdefault("validation_warnings", []).append(_nd_w)
+                except Exception as _nd_err:
+                    if "1054" not in str(_nd_err):
+                        print(f"    ⚠️ near-dup check skipped (FAIL-SAFE): {_nd_err}")
+                    _doc_conn = _rollback_or_discard(_doc_conn)
+
             # 1. Write files physically
             if is_simulated_oss:
                 # Local filesystem mock
@@ -782,19 +833,7 @@ def node_build_canonical(ctx: dict):
                     if _doc_conn is None:
                         _doc_conn = _get_db_conn(select_db=True)
                     with _doc_conn.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET canonical_json_key = %s,
-                                canonical_md_key = %s,
-                                checksum_sha256 = %s,
-                                canonical_sha256 = %s,
-                                extraction_status = 'COMPLETED',
-                                ocr_status = %s,
-                                page_count = %s,
-                                text_length = %s,
-                                extract_method = %s
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (
+                        _ck_params = (
                             canonical_key,
                             canonical_md_key,
                             _raw_checksum,
@@ -805,7 +844,36 @@ def node_build_canonical(ctx: dict):
                             canonical.get("extract_method", "native"),
                             canonical["doc_id"],
                             canonical["version_no"]
-                        ))
+                        )
+                        _ck_sql_tail = """
+                                extraction_status = 'COMPLETED',
+                                ocr_status = %s,
+                                page_count = %s,
+                                text_length = %s,
+                                extract_method = %s
+                            WHERE doc_id = %s AND version_no = %s
+                        """
+                        try:
+                            # G19：content_simhash 随 canonical keys 一起落库（迁移 020）
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET canonical_json_key = %s,
+                                    canonical_md_key = %s,
+                                    checksum_sha256 = %s,
+                                    canonical_sha256 = %s,
+                                    content_simhash = %s,""" + _ck_sql_tail,
+                                _ck_params[:4] + (_content_simhash,) + _ck_params[4:])
+                        except Exception as _sh_err:
+                            if "1054" not in str(_sh_err):
+                                raise
+                            # 迁移 020 未应用 → 回退旧列集（fail-open，行为与迁移前一致）
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET canonical_json_key = %s,
+                                    canonical_md_key = %s,
+                                    checksum_sha256 = %s,
+                                    canonical_sha256 = %s,""" + _ck_sql_tail,
+                                _ck_params)
                     _doc_conn.commit()
                     print(f"    ├─ Saved canonical keys to RDS for {canonical['doc_id']} v{canonical['version_no']}")
                 except Exception as e:

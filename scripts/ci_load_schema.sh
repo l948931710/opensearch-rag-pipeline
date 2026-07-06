@@ -91,6 +91,7 @@ MANIFEST="
 017_qa_admission_reject.sql operation
 018_gen_meta_runtime_contract.sql split
 019_chunk_meta_index_retry.sql knowledge
+020_document_version_simhash.sql knowledge
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }
