@@ -6479,7 +6479,10 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
     """
     from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
 
-    ha3_batch_size = 100  # HA3 单次 pushDocuments 上限
+    # HA3 单次 pushDocuments 上限。默认 100（历史值，VPC 内链路无压力）；env 可下调——
+    # 2026-07-06 laptop repush 实测：100 chunk ≈ 1.5MB 单 POST 在公网/家庭上行下
+    # 稳定超时（SDK 默认读超时偏紧），73KB 小批秒过 → 远程补推场景设 8-10 即可。
+    ha3_batch_size = max(1, int(os.environ.get("RAG_HA3_PUSH_BATCH_SIZE", "100")))
     all_chunks = list(chunks)
     # Phase D（默认关）：仅 flag 开时推送 allowed_depts(MULTI_STRING)；关时输出与历史逐字节一致，
     # 且 HA3 表加该字段【之前】绝不推未知字段（Step 2 加字段后才会开 flag）。
