@@ -9,8 +9,8 @@
   "corpus": {
     "char_f1": 0.9615,
     "cer": 0.0925,
-    "table_cell_f1": 0.5,
-    "grid_exact_rate": 0.5,
+    "table_cell_f1": 0.9928,
+    "grid_exact_rate": 0.6666,
     "hard_docs": 4
   },
   "real_ocr": false

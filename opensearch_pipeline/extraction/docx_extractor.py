@@ -439,176 +439,131 @@ def extract_docx_with_images(
 
     body = document.element.body
 
-    for child in body.iterchildren():
-        tag = child.tag
+    def _walk(parent_elm, parent_obj) -> None:
+        """按物理阅读序递归遍历 <w:p>/<w:tbl>（G6 修复，2026-07-06）。
 
-        # ── 段落 ──────────────────────────────────────────────
-        if tag.endswith('}p') or tag == 'p':
-            para = Paragraph(child, document)
-            text = para.text.strip()
-            style_name = para.style.name if para.style else "Normal"
+        旧实现的 1×1 解包分支是手写单层循环、只认 }p——**嵌套在排版格里的数据表
+        被静默丢弃**（G6 保真首跑 docx_uniform cell_f1=0/3 抓获：工服 A/B/C 三张
+        规格表全丢；正文段落无损故 goldset/L6 均不可见）。改为与
+        extract_docx._extract_recursive 同构的真递归：1×1 解包任意层级，解包层内
+        的数据表照常发射 markdown table block。image_ref/image_index 的发射顺序与
+        旧实现逐位一致（承重契约：绑定链 image_index 不能漂移）——本修复只
+        【新增】此前被丢的 table block。
+        """
+        nonlocal current_section, image_counter
 
-            has_img = _has_images(child)
+        for child in parent_elm.iterchildren():
+            tag = child.tag
 
-            # 先处理文本部分（如果有）
-            if text:
-                heading_level = _detect_heading_level(style_name, text)
-                if heading_level is not None:
-                    current_section = text
-                    blocks.append(ExtractedBlock(
-                        block_type="heading",
-                        text=text,
-                        level=heading_level,
-                        section_path=current_section,
-                        source="native",
-                        extra={"word_style": style_name},
-                    ))
-                else:
+            # ── 段落 ──────────────────────────────────────────
+            if tag.endswith('}p') or tag == 'p':
+                para = Paragraph(child, parent_obj)
+                text = para.text.strip()
+                style_name = para.style.name if para.style else "Normal"
+
+                has_img = _has_images(child)
+
+                # 先处理文本部分（如果有）
+                if text:
+                    heading_level = _detect_heading_level(style_name, text)
+                    if heading_level is not None:
+                        current_section = text
+                        blocks.append(ExtractedBlock(
+                            block_type="heading",
+                            text=text,
+                            level=heading_level,
+                            section_path=current_section,
+                            source="native",
+                            extra={"word_style": style_name},
+                        ))
+                    else:
+                        blocks.append(ExtractedBlock(
+                            block_type="paragraph",
+                            text=text,
+                            section_path=current_section,
+                            source="native",
+                            extra={"word_style": style_name},
+                        ))
+
+                # 文本框内容（para.text 不含，w:txbxContent）→ 独立 paragraph block
+                for tb in _textbox_texts(child):
                     blocks.append(ExtractedBlock(
                         block_type="paragraph",
-                        text=text,
+                        text=tb,
                         section_path=current_section,
                         source="native",
-                        extra={"word_style": style_name},
+                        extra={"word_style": style_name, "from_textbox": True},
                     ))
 
-            # 文本框内容（para.text 不含，w:txbxContent）→ 独立 paragraph block
-            for tb in _textbox_texts(child):
-                blocks.append(ExtractedBlock(
-                    block_type="paragraph",
-                    text=tb,
-                    section_path=current_section,
-                    source="native",
-                    extra={"word_style": style_name, "from_textbox": True},
-                ))
+                # 再处理图片引用（如果有）
+                if has_img:
+                    rel_ids = _find_image_rel_ids(child)
+                    if not rel_ids:
+                        # 检测到 drawing/pict 元素但无法解析 rel_id，仍记录占位
+                        rel_ids = [""]
 
-            # 再处理图片引用（如果有）
-            if has_img:
-                rel_ids = _find_image_rel_ids(child)
-                if not rel_ids:
-                    # 检测到 drawing/pict 元素但无法解析 rel_id，仍记录占位
-                    rel_ids = [""]
+                    for rid in rel_ids:
+                        target_ref = _rel_id_to_target_ref(rid) if rid else ""
 
-                for rid in rel_ids:
-                    target_ref = _rel_id_to_target_ref(rid) if rid else ""
+                        blocks.append(ExtractedBlock(
+                            block_type="image_ref",
+                            text="",
+                            section_path=current_section,
+                            source="native",
+                            extra={
+                                "image_index": image_counter,
+                                "rel_id": rid,
+                                "target_ref": target_ref,
+                            },
+                        ))
 
-                    blocks.append(ExtractedBlock(
-                        block_type="image_ref",
-                        text="",
-                        section_path=current_section,
-                        source="native",
-                        extra={
-                            "image_index": image_counter,
-                            "rel_id": rid,
-                            "target_ref": target_ref,
-                        },
-                    ))
+                        image_assets.append(ImageAsset(
+                            local_path="",          # 尚未导出到磁盘
+                            page_num=None,          # DOCX 无原生页码
+                            image_index=image_counter,
+                            original_name=target_ref,
+                        ))
+                        image_counter += 1
 
-                    image_assets.append(ImageAsset(
-                        local_path="",          # 尚未导出到磁盘
-                        page_num=None,          # DOCX 无原生页码
-                        image_index=image_counter,
-                        original_name=target_ref,
-                    ))
-                    image_counter += 1
+            # ── 表格 ──────────────────────────────────────────
+            elif tag.endswith('}tbl') or tag == 'tbl':
+                table = Table(child, parent_obj)
 
-        # ── 表格 ──────────────────────────────────────────────
-        elif tag.endswith('}tbl') or tag == 'tbl':
-            table = Table(child, document)
+                # 与 extract_docx 一致：解包 1×1 装饰性外表格（真递归 → 任意层级；
+                # 解包层内的段落/文本框/图片/嵌套数据表均按物理序处理）
+                if len(table.rows) == 1 and len(table.rows[0].cells) == 1:
+                    cell = table.rows[0].cells[0]
+                    _walk(cell._tc, cell)
+                else:
+                    rows_text = []
+                    # DC-3: dedup merged cells (gridSpan/vMerge) — see note in extract_docx above;
+                    # store the <w:tc> element itself (not id()) so lxml's per-node proxy keeps
+                    # identity stable.
+                    # G1: spanned/empty grid positions emit "" placeholders to keep column alignment.
+                    seen_tc = set()
+                    for row in table.rows:
+                        cells = []
+                        for cell in row.cells:
+                            tc = getattr(cell, "_tc", None)
+                            if tc is not None:
+                                if tc in seen_tc:
+                                    cells.append("")
+                                    continue
+                                seen_tc.add(tc)
+                            cells.append(_cell_text_with_textboxes(cell))
+                        if any(cells):
+                            rows_text.append(" | ".join(cells))
 
-            # 与 extract_docx 一致：解包 1×1 装饰性外表格
-            if len(table.rows) == 1 and len(table.rows[0].cells) == 1:
-                cell = table.rows[0].cells[0]
-                # 递归处理单单元格内容：遍历子元素
-                for sub_child in cell._tc.iterchildren():
-                    sub_tag = sub_child.tag
-                    if sub_tag.endswith('}p') or sub_tag == 'p':
-                        sub_para = Paragraph(sub_child, cell)
-                        sub_text = sub_para.text.strip()
-                        sub_style = sub_para.style.name if sub_para.style else "Normal"
-                        sub_has_img = _has_images(sub_child)
+                    if rows_text:
+                        table_md = "\n".join(f"| {row} |" for row in rows_text)
+                        blocks.append(ExtractedBlock(
+                            block_type="table",
+                            text=table_md,
+                            section_path=current_section,
+                            source="native",
+                            extra={"row_count": len(rows_text)},
+                        ))
 
-                        if sub_text:
-                            sub_heading = _detect_heading_level(sub_style, sub_text)
-                            if sub_heading is not None:
-                                current_section = sub_text
-                                blocks.append(ExtractedBlock(
-                                    block_type="heading",
-                                    text=sub_text,
-                                    level=sub_heading,
-                                    section_path=current_section,
-                                    source="native",
-                                    extra={"word_style": sub_style},
-                                ))
-                            else:
-                                blocks.append(ExtractedBlock(
-                                    block_type="paragraph",
-                                    text=sub_text,
-                                    section_path=current_section,
-                                    source="native",
-                                    extra={"word_style": sub_style},
-                                ))
-
-                        for tb in _textbox_texts(sub_child):
-                            blocks.append(ExtractedBlock(
-                                block_type="paragraph",
-                                text=tb,
-                                section_path=current_section,
-                                source="native",
-                                extra={"word_style": sub_style, "from_textbox": True},
-                            ))
-
-                        if sub_has_img:
-                            sub_rel_ids = _find_image_rel_ids(sub_child)
-                            if not sub_rel_ids:
-                                sub_rel_ids = [""]
-                            for rid in sub_rel_ids:
-                                target_ref = _rel_id_to_target_ref(rid) if rid else ""
-                                blocks.append(ExtractedBlock(
-                                    block_type="image_ref",
-                                    text="",
-                                    section_path=current_section,
-                                    source="native",
-                                    extra={
-                                        "image_index": image_counter,
-                                        "rel_id": rid,
-                                        "target_ref": target_ref,
-                                    },
-                                ))
-                                image_assets.append(ImageAsset(
-                                    local_path="",
-                                    page_num=None,
-                                    image_index=image_counter,
-                                    original_name=target_ref,
-                                ))
-                                image_counter += 1
-            else:
-                rows_text = []
-                # DC-3: dedup merged cells (gridSpan/vMerge) — see note in extract_docx above; store
-                # the <w:tc> element itself (not id()) so lxml's per-node proxy keeps identity stable.
-                # G1: spanned/empty grid positions emit "" placeholders to keep column alignment.
-                seen_tc = set()
-                for row in table.rows:
-                    cells = []
-                    for cell in row.cells:
-                        tc = getattr(cell, "_tc", None)
-                        if tc is not None:
-                            if tc in seen_tc:
-                                cells.append("")
-                                continue
-                            seen_tc.add(tc)
-                        cells.append(_cell_text_with_textboxes(cell))
-                    if any(cells):
-                        rows_text.append(" | ".join(cells))
-
-                if rows_text:
-                    table_md = "\n".join(f"| {row} |" for row in rows_text)
-                    blocks.append(ExtractedBlock(
-                        block_type="table",
-                        text=table_md,
-                        section_path=current_section,
-                        source="native",
-                        extra={"row_count": len(rows_text)},
-                    ))
+    _walk(body, document)
 
     return blocks, image_assets, warnings
