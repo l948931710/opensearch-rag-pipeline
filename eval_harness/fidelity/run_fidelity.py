@@ -14,6 +14,11 @@
   # 3) 冻结基线（首次全绿后；此后每次 run 自动与基线比对）
   python -m eval_harness.fidelity.run_fidelity run --freeze
 
+基线分口径（v2，G6 双重 OCR 修复引入）：sim（默认，零 API，只评原生抽取路径）与
+real（--real，含扫描件 hard 守卫）各存一段、各自 --freeze 各自比对——real 口径下
+funnel 会把图内 OCR 文本追加进页文本（对 GT 的原生口径是加性噪声），两口径分数
+不可互比；requires_real_ocr 的 hard 文档在 sim 跑里跳过不算缺测（守卫在 real 段）。
+
 ⚠️ --stub 的输出是【底稿不是真相】：抽取器自己的错误会原样出现在 ref_text 里，
 人工必须对照原文档逐字校对后才算 GT（否则是自己给自己打分——binding GT 循环性
 教训 G23 的同款陷阱）。校对完成前请保持 _doc_meta.degraded=true。
@@ -126,11 +131,13 @@ def run(gt_path: str, real: bool) -> Dict:
     rows, skipped = [], []
     for doc in docs:
         reason = doc.verify_bytes()
+        regime_skip = False
         if reason is None and doc.requires_real_ocr and not real:
             reason = "requires_real_ocr（--real 才计分，避免误用 simulate OCR 桩文本打分）"
+            regime_skip = True  # 口径外跳过 ≠ 缺测：该文档的守卫在 real 段基线
         if reason:
             skipped.append({"label": doc.label, "status": "SKIP", "reason": reason,
-                            "degraded": doc.degraded})
+                            "degraded": doc.degraded, "regime_skip": regime_skip})
             continue
         result = _extract(doc.local_path, doc.file_ext, real)
         rows.append(score_doc(doc, result))
@@ -145,7 +152,8 @@ def run(gt_path: str, real: bool) -> Dict:
         "schema": "fidelity_report_v1", "real_ocr": real,
         "docs": rows + skipped,
         "hard_doc_labels": sorted(r["label"] for r in hard),
-        "hard_skipped": sorted(s["label"] for s in skipped if not s["degraded"]),
+        "hard_skipped": sorted(s["label"] for s in skipped
+                               if not s["degraded"] and not s["regime_skip"]),
         "corpus": {"char_f1": _mean("char_f1"), "cer": _mean("cer"),
                    "table_cell_f1": _mean("table_cell_f1"),
                    "grid_exact_rate": _mean("grid_exact_rate"),
@@ -172,6 +180,19 @@ def compare_to_baseline(report: Dict, baseline: Dict, delta: float) -> Dict:
     if report["hard_skipped"]:
         fails.append(f"hard 文档缺测: {report['hard_skipped']}（缺测不算过——L6 三态门同款语义）")
     return {"verdict": "REGRESSION" if fails else "PASS", "fails": fails, "delta": delta}
+
+
+def _baseline_regime_section(baseline_raw: Dict, regime: str):
+    """从基线文件取指定口径（"sim"/"real"）的段；无该段返回 None。
+
+    v2 = {"schema": "fidelity_baseline_v2", "regimes": {"sim": {...}, "real": {...}}}。
+    legacy v1（单段 + 顶层 real_ocr 布尔）按其 real_ocr 归入对应口径读取，
+    首次 --freeze 时被迁移为 v2（另一口径的段保留）。
+    """
+    if "regimes" in baseline_raw:
+        return baseline_raw["regimes"].get(regime)
+    legacy_regime = "real" if baseline_raw.get("real_ocr") else "sim"
+    return baseline_raw if legacy_regime == regime else None
 
 
 def make_stub(path: str, real: bool) -> Dict:
@@ -229,16 +250,33 @@ def main(argv=None):
             return 2
 
         report = run(args.gt, real=args.real)
-        if os.path.exists(BASELINE_PATH) and not args.freeze:
+        regime = "real" if args.real else "sim"
+        baseline_raw: Dict = {}
+        if os.path.exists(BASELINE_PATH):
             with open(BASELINE_PATH, encoding="utf-8") as f:
-                report["gate"] = compare_to_baseline(report, json.load(f), args.delta)
-        elif args.freeze:
+                baseline_raw = json.load(f)
+        if args.freeze:
+            # 只冻本口径的段；另一口径的段（含 legacy v1 迁移来的）原样保留
+            regimes = dict(baseline_raw.get("regimes") or {})
+            if baseline_raw and "regimes" not in baseline_raw:
+                legacy_regime = "real" if baseline_raw.get("real_ocr") else "sim"
+                regimes.setdefault(legacy_regime, {
+                    "hard_doc_labels": baseline_raw.get("hard_doc_labels"),
+                    "corpus": baseline_raw.get("corpus")})
+            regimes[regime] = {"hard_doc_labels": report["hard_doc_labels"],
+                               "corpus": report["corpus"]}
             with open(BASELINE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"schema": "fidelity_baseline_v1",
-                           "hard_doc_labels": report["hard_doc_labels"],
-                           "corpus": report["corpus"], "real_ocr": report["real_ocr"]},
+                json.dump({"schema": "fidelity_baseline_v2", "regimes": regimes},
                           f, ensure_ascii=False, indent=2)
-            report["gate"] = {"verdict": "FROZEN", "path": BASELINE_PATH}
+            report["gate"] = {"verdict": "FROZEN", "regime": regime, "path": BASELINE_PATH}
+        elif baseline_raw:
+            section = _baseline_regime_section(baseline_raw, regime)
+            if section:
+                report["gate"] = compare_to_baseline(report, section, args.delta)
+                report["gate"]["regime"] = regime
+            else:
+                report["gate"] = {"verdict": "NO_BASELINE", "regime": regime,
+                                  "reason": f"基线无 {regime} 口径段——先 --freeze 冻结该口径"}
 
         out = json.dumps(report, ensure_ascii=False, indent=2)
         if args.out:
