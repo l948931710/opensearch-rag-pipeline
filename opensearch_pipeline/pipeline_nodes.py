@@ -3491,6 +3491,33 @@ def node_chunk_documents(ctx: dict):
             print(f"    └─ {doc['doc_id']}: skipped (quarantined)")
             continue
 
+        # G21 fail-closed：asset ocr_text 的 PII 消费点兜底掩码（默认 ON，
+        # RAG_IMAGE_OCR_PII_FAILCLOSED=false 关闭）。RAG_IMAGE_OCR_PII（node 02/03 的
+        # 检测+脱敏）默认 OFF 且靠 stage2_node setdefault 存续——重部署丢 flag 时，截图里的
+        # 手机号/身份证会原样进入 image_refs/[图片OCR] 合成块并持久化到 chunk_meta/HA3。
+        # 在 chunk 消费点兜底：命中 ENTITY_PATTERNS 的 asset ocr_text 就地掩码（复用
+        # _image_ocr_fp_ignore 物料编码 FP allow-list），与 node 03 就地脱敏幂等（已脱敏
+        # 文本不再命中）。canonical 不改写（canonical_sha256 与跨文档去重/skip-unchanged
+        # 门耦合，改写即破坏哈希语义）；保护随每轮 chunk 消费重建，不依赖 flag 存续。
+        if os.environ.get("RAG_IMAGE_OCR_PII_FAILCLOSED", "true").lower() not in ("0", "false", "no"):
+            _g21_scrubbed = 0
+            for _asset in doc.get("assets", []) or []:
+                _oc = _asset.get("ocr_text")
+                if not _oc:
+                    continue
+                _new = _oc
+                for _pii_name, _pii_pat in ENTITY_PATTERNS.items():
+                    _rep = REDACTION_MAP.get(_pii_name)
+                    if not _rep or _image_ocr_fp_ignore(_pii_name, _oc):
+                        continue
+                    _new = re.sub(_pii_pat, _rep, _new)
+                if _new != _oc:
+                    _asset["ocr_text"] = _new
+                    _g21_scrubbed += 1
+            if _g21_scrubbed:
+                print(f"    ├─ [pii-failclosed] {doc['doc_id']}: {_g21_scrubbed} 个图片 OCR "
+                      f"文本命中 PII，已在消费点掩码（node 03 flag 未生效的兜底）")
+
         text = doc.get("redacted_text") or doc["text"]
         
         # 动态参数匹配
@@ -4381,6 +4408,42 @@ def node_chunk_documents(ctx: dict):
     ctx["chunks"] = all_chunks
 
 
+def _chunk_text_gibberish(text: str) -> bool:
+    """G25：chunk 级乱码判定（保守，纯字符统计）。
+
+    验证器此前只查 空/长度/doc_id——文本层乱码块（坏字体 PUA、latin-1 mojibake、
+    二进制串）直通向量。判 True 的两个独立信号：
+      1. U+FFFD/PUA 密度 >10%；
+      2. 有效字符（CJK/ASCII 字母数字/CJK 标点/全半角）占比 <0.40——分母排除
+         markdown 表格结构符与常见标点，避免管道符密集的表格块误伤。
+    """
+    stripped = "".join(text.split())
+    if not stripped:
+        return False  # 空文本由 empty_text 检查负责
+    junk = good = 0
+    denom = 0
+    _STRUCT_CHARS = set("|-+*#=~_.:,;()[]{}<>/\\\"'`!?%&@^$（）【】《》。，、：；！？·…—")
+    for ch in stripped:
+        cp = ord(ch)
+        if cp == 0xFFFD or 0xE000 <= cp <= 0xF8FF:
+            junk += 1
+            denom += 1
+            continue
+        if ch in _STRUCT_CHARS:
+            continue  # 结构符不进分母（表格/列表的管道横线不该稀释有效占比）
+        denom += 1
+        if (0x30 <= cp <= 0x39 or 0x41 <= cp <= 0x5A or 0x61 <= cp <= 0x7A
+                or 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF
+                or 0x3000 <= cp <= 0x303F or 0xFF00 <= cp <= 0xFFEF
+                or cp == 0x20):
+            good += 1
+    if junk / max(len(stripped), 1) > 0.10:
+        return True
+    if denom < 20:
+        return False  # 样本太小不判（短表格行/纯符号行交给其他检查）
+    return good / denom < 0.40
+
+
 def node_validate_chunks(ctx: dict):
     """校验 chunk 质量。"""
     chunks = ctx.get("chunks", [])
@@ -4399,6 +4462,8 @@ def node_validate_chunks(ctx: dict):
             issues.append("too_many_tokens")
         if not chunk.doc_id:
             issues.append("missing_doc_id")
+        if not issues and _chunk_text_gibberish(chunk.chunk_text):
+            issues.append("gibberish_text")
 
         if issues:
             invalid.append({"chunk_id": chunk.chunk_id, "issues": issues})

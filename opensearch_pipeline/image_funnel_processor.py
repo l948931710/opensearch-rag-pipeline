@@ -239,7 +239,6 @@ class ImageFunnelProcessor:
         import base64
         import requests
         import json
-        import io
 
         try:
             # ── 大图片压缩：避免 base64 过大导致上传超时 ──
@@ -247,20 +246,21 @@ class ImageFunnelProcessor:
             MAX_RAW_BYTES = 500 * 1024  # 500KB 阈值
 
             if file_size > MAX_RAW_BYTES:
-                # 压缩图片到 JPEG quality=60，限制最大边 1280px
+                # G16：复用 vlm_rebuilder.compress_page_png（1568px/q78，生产验证参数；
+                # perf#64 早已呼吁勿手写第二份）。此前这里是 1280px/q60——整页 ERP 截图
+                # /高分辨率条带缝合图的小字段在更激进的降采样下模糊，caption/标注配对劣化。
                 try:
-                    with Image.open(local_path) as img:
-                        if img.mode in ("RGBA", "P"):
-                            img = img.convert("RGB")
-                        max_side = 1280
-                        if max(img.size) > max_side:
-                            img.thumbnail((max_side, max_side), Image.LANCZOS)
-                        buf = io.BytesIO()
-                        img.save(buf, format="JPEG", quality=60)
-                        b64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
-                        mime_type = "image/jpeg"
-                        compressed_kb = len(buf.getvalue()) / 1024
-                        print(f"    [VLM] Compressed {filename}: {file_size/1024:.0f}KB → {compressed_kb:.0f}KB")
+                    from opensearch_pipeline.extraction.vlm_rebuilder import compress_page_png
+                    with open(local_path, "rb") as f:
+                        raw = f.read()
+                    data, mime_type = compress_page_png(raw)
+                    if data is raw:  # PIL 失败 fail-open 原样返回 → 按扩展名回退
+                        ext = os.path.splitext(local_path)[1].lower()
+                        mime_type = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+                    else:
+                        print(f"    [VLM] Compressed {filename}: "
+                              f"{file_size/1024:.0f}KB → {len(data)/1024:.0f}KB (1568px/q78)")
+                    b64_data = base64.b64encode(data).decode("utf-8")
                 except Exception as comp_err:
                     print(f"    ⚠️ Image compression failed: {comp_err}, using raw file")
                     with open(local_path, "rb") as f:

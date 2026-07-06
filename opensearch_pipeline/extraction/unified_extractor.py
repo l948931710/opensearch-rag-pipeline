@@ -11,6 +11,7 @@ DAG 层不需要知道文件类型，只调用 extract() 即可。
 import copy
 import datetime as _dt
 import os
+import re
 import tempfile
 from typing import Dict, List, Optional
 
@@ -37,6 +38,46 @@ def _safe_image_output_dir(task: dict) -> str:
     if _DEFAULT_IMG_DIR is None:
         _DEFAULT_IMG_DIR = tempfile.mkdtemp(prefix="rag_extract_images_")
     return _DEFAULT_IMG_DIR
+
+
+_PUA_RANGE = (0xE000, 0xF8FF)          # Private Use Area：坏字体常映射到此
+_CID_RE = re.compile(r"\(cid:\d+\)")   # pdfminer 对无 ToUnicode 映射字体的输出
+
+
+def _native_text_quality_ok(text: str) -> bool:
+    """G15：原生文本质量谓词（纯字符串数学，零 API）。
+
+    旧门槛只看字符数（≥50 即"有文本"）：坏内嵌字体页吐出的 (cid:123) 串 /
+    U+FFFD / PUA 乱码 ≥50 字符就永不重 OCR，垃圾直接进切块与向量。
+    判 False 的三个独立信号（任一命中即视为乱码页）：
+      1. (cid:N) 模式覆盖原文 >15%；
+      2. U+FFFD 替换符 + PUA 字符密度 >10%；
+      3. CJK/ASCII可打印/中文标点/全半角 合计占比 <0.70。
+    """
+    stripped = "".join(text.split())
+    if not stripped:
+        return True  # 空文本交给字符数门槛处理，此谓词不重复触发
+    cid_chars = sum(len(m.group(0)) for m in _CID_RE.finditer(text))
+    if cid_chars / max(len(text), 1) > 0.15:
+        return False
+    total = len(stripped)
+    junk = good = 0
+    for ch in stripped:
+        cp = ord(ch)
+        if cp == 0xFFFD or _PUA_RANGE[0] <= cp <= _PUA_RANGE[1]:
+            junk += 1
+            continue
+        if (0x20 <= cp <= 0x7E                      # ASCII 可打印
+                or 0x4E00 <= cp <= 0x9FFF           # CJK 统一表意
+                or 0x3400 <= cp <= 0x4DBF           # CJK 扩展 A
+                or 0x3000 <= cp <= 0x303F           # CJK 标点
+                or 0xFF00 <= cp <= 0xFFEF           # 全半角形式
+                or 0x2010 <= cp <= 0x2027           # 常用横线/引号/省略号区
+                or ch in "℃±×÷·—…" ):
+            good += 1
+    if junk / total > 0.10:
+        return False
+    return good / total >= 0.70
 
 
 def _detect_password_protected(local_path: str, file_ext: str) -> Optional[str]:
@@ -2023,6 +2064,7 @@ class UnifiedExtractor:
             page_count = recovered
 
         per_page: Dict[int, int] = {}
+        per_page_text: Dict[int, List[str]] = {}
         for b in result.blocks:
             bt = b.get("block_type", "") if isinstance(b, dict) else getattr(b, "block_type", "")
             if bt in ("image_ref", "ocr_text"):
@@ -2032,10 +2074,28 @@ class UnifiedExtractor:
                 continue
             txt = (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")) or ""
             per_page[pg] = per_page.get(pg, 0) + len(txt.strip())
+            per_page_text.setdefault(pg, []).append(txt)
         # 只考察原生抽取覆盖过的页（≤ pdf_native_max_pages）；越界页未被抽取，非"缺文本=需OCR"。
         scan_upto = min(page_count, self.pdf_native_max_pages)
-        return [pg for pg in range(1, scan_upto + 1)
-                if per_page.get(pg, 0) < self.PER_PAGE_OCR_THRESHOLD]
+        needy: List[int] = []
+        garbled: List[int] = []
+        for pg in range(1, scan_upto + 1):
+            if per_page.get(pg, 0) < self.PER_PAGE_OCR_THRESHOLD:
+                needy.append(pg)
+            elif not _native_text_quality_ok("\n".join(per_page_text.get(pg, ()))):
+                # G15：字符数够但内容是坏字体乱码（(cid:)/PUA/替换符/非常用字符占比超阈）
+                # ——旧门槛下这类页永不重 OCR，垃圾直接进切块与向量。
+                needy.append(pg)
+                garbled.append(pg)
+        if garbled:
+            if isinstance(getattr(result, "warnings", None), list):
+                result.warnings.append(
+                    f"[GARBLED_TEXT] 页 {garbled} 原生文本疑似坏字体乱码，已送 OCR 重取；"
+                    f"OCR 成功后这些页的原生块将被替换")
+            # 供 _apply_ocr_fallback 在 OCR 成功后剔除这些页的乱码原生块
+            # （不暴露成 dataclass field，避免序列化噪声——同 _local_path 先例）
+            result._garbled_pages = set(garbled)  # type: ignore[attr-defined]
+        return needy
 
     def _needs_ocr(self, result: ExtractionResult) -> bool:
         """判断是否需要 OCR fallback。"""
@@ -2072,6 +2132,20 @@ class UnifiedExtractor:
         ocr_blocks = ocr_result.to_blocks()
         if ocr_blocks:
             if result.file_ext == "pdf":
+                # G15：乱码页（质量门标记）在 OCR 成功后剔除其原生文本块——否则
+                # (cid:)/PUA 垃圾会与 OCR 文本并存进入切块。仅剔除有 OCR 产出的页
+                # （fail-open：OCR 没覆盖到的乱码页保留原生块，宁乱勿丢）。
+                garbled = getattr(result, "_garbled_pages", None) or set()
+                if garbled:
+                    ocr_pages = {getattr(b, "page_num", None) for b in ocr_blocks}
+                    drop = garbled & ocr_pages
+                    if drop:
+                        result.blocks = [
+                            b for b in result.blocks
+                            if not (getattr(b, "page_num", None) in drop
+                                    and getattr(b, "source", "") == "native"
+                                    and getattr(b, "block_type", "") != "image_ref")
+                        ]
                 # OCR 的是空白页（原页几乎无块），按 page_num 稳定排序合并保持文档顺序
                 merged = list(result.blocks) + list(ocr_blocks)
                 merged.sort(key=lambda b: (getattr(b, "page_num", 0) or 0))

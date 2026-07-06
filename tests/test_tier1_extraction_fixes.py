@@ -8,10 +8,8 @@ G15: 乱码质量门——坏字体页 ≥50 字符 mojibake 此前永不重 OCR
 """
 import os
 import sys
-import tempfile
 import types
 
-import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("RAG_ENV", "test")
@@ -89,6 +87,75 @@ def test_g13_group_shape_text_extracted(tmp_path):
     assert "嵌套组内文字" in res.text      # recursion depth > 1
 
 
+# ═══════════════════ G15: 乱码质量门 ═══════════════════
+
+def test_g15_quality_predicate():
+    from opensearch_pipeline.extraction.unified_extractor import _native_text_quality_ok
+    # 正常中文/中英混排/表格数字 → OK
+    assert _native_text_quality_ok("一、审核流程：核对发票信息，金额 ¥1,234.56（含税）。" * 3)
+    assert _native_text_quality_ok("Step 1: open U8+ ERP system, click 采购管理 -> 订单。" * 3)
+    # (cid:N) 串 → 坏字体
+    assert not _native_text_quality_ok("(cid:123)(cid:456)(cid:789)" * 10)
+    # PUA 乱码 → 坏字体
+    assert not _native_text_quality_ok("".join(chr(0xE000 + i % 100) for i in range(80)))
+    # 替换符密度超阈
+    assert not _native_text_quality_ok(("正常文字" + "�" * 3) * 20)
+    # 空文本不触发（交给字符数门槛）
+    assert _native_text_quality_ok("   ")
+
+
+def _pdf_result(per_page_texts, page_count):
+    from opensearch_pipeline.extraction.schema import ExtractedBlock, ExtractionResult
+    blocks = [ExtractedBlock(block_type="paragraph", text=t, page_num=pg)
+              for pg, t in per_page_texts.items()]
+    text = "\n".join(per_page_texts.values())
+    return ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="pdf",
+                            extract_method="m", title="t", text=text,
+                            text_length=len(text), blocks=blocks, page_count=page_count)
+
+
+def test_g15_garbled_page_flagged_for_ocr():
+    from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+    ux = UnifiedExtractor.__new__(UnifiedExtractor)
+    res = _pdf_result({1: "正常的中文正文内容，" * 10,
+                       2: "(cid:12)(cid:34)(cid:56)" * 10}, page_count=2)  # ≥50 字符的乱码页
+    assert ux._pages_needing_ocr(res) == [2]
+    assert res._garbled_pages == {2}
+    assert any("[GARBLED_TEXT]" in w for w in res.warnings)
+
+
+def test_g15_clean_pages_unaffected():
+    from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+    ux = UnifiedExtractor.__new__(UnifiedExtractor)
+    res = _pdf_result({1: "正常的中文正文内容，" * 10, 2: "second page body text " * 5},
+                      page_count=2)
+    assert ux._pages_needing_ocr(res) == []
+    assert not hasattr(res, "_garbled_pages")
+
+
+def test_g15_ocr_replaces_garbled_native_blocks(monkeypatch):
+    """OCR 成功后乱码页的原生块被剔除（不与 OCR 文本并存）；OCR 未覆盖的页保留。"""
+    from opensearch_pipeline.extraction.schema import ExtractedBlock
+    from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
+    ux = UnifiedExtractor.__new__(UnifiedExtractor)
+    res = _pdf_result({1: "正常的中文正文内容，" * 10,
+                       2: "(cid:12)(cid:34)(cid:56)" * 10}, page_count=2)
+    needy = ux._pages_needing_ocr(res)
+    assert needy == [2]
+
+    ocr_block = ExtractedBlock(block_type="ocr_text", text="OCR 重取的第二页正文",
+                               page_num=2, source="ocr")
+    fake_ocr = types.SimpleNamespace(
+        to_blocks=lambda: [ocr_block], status="SUCCESS", combined_text="OCR 重取的第二页正文")
+    ux.ocr_client = types.SimpleNamespace(ocr_pdf=lambda *a, **k: fake_ocr)
+    ux.oss_client = None
+
+    out = ux._apply_ocr_fallback({"doc_id": "d", "local_path": "/tmp/x.pdf"}, res, needy=needy)
+    assert "OCR 重取的第二页正文" in out.text
+    assert "(cid:12)" not in out.text                    # 乱码原生块已剔除
+    assert "正常的中文正文内容" in out.text               # 干净页不受影响
+
+
 # ═══════════════════ G14: 加密文件前置探测 ═══════════════════
 
 def _extract_task(path, ext, tmp_path):
@@ -157,6 +224,75 @@ def test_g14_normal_docx_not_flagged(tmp_path):
     d.save(path)
     from opensearch_pipeline.extraction.unified_extractor import _detect_password_protected
     assert _detect_password_protected(path, "docx") is None
+
+
+# ═══════════════════ G21: 图片 OCR 脱敏消费点兜底 ═══════════════════
+
+def _canon_with_asset(ocr_text):
+    body = "这是用于切块的正文内容，描述了操作步骤与注意事项。" * 30
+    return {"doc_id": "D21", "version_no": 1, "file_ext": "pdf",
+            "text": body, "title": "x", "category_l1": "", "category_l2": "",
+            "blocks": [], "assets": [{"ocr_text": ocr_text, "oss_key": "k"}]}
+
+
+def test_g21_failclosed_masks_pii_in_asset_ocr(monkeypatch):
+    """RAG_IMAGE_OCR_PII（node 03）未开时，chunk 消费点兜底掩码 asset ocr_text。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+    monkeypatch.delenv("RAG_IMAGE_OCR_PII", raising=False)
+    monkeypatch.delenv("RAG_IMAGE_OCR_PII_FAILCLOSED", raising=False)  # 默认 ON
+    doc = _canon_with_asset("联系人电话 13812345678，工号 A123")
+    pn.node_chunk_documents({"canonicals": [doc]})
+    assert "13812345678" not in doc["assets"][0]["ocr_text"]
+    assert "138****5678" in doc["assets"][0]["ocr_text"]
+
+
+def test_g21_material_code_fp_not_masked(monkeypatch):
+    """物料编码锚点共现时，18 位编码命中 cn_id_card 属已知 FP，不掩码。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+    monkeypatch.delenv("RAG_IMAGE_OCR_PII_FAILCLOSED", raising=False)
+    fp_text = "物料编码 110101199003071234 规格说明"
+    doc = _canon_with_asset(fp_text)
+    pn.node_chunk_documents({"canonicals": [doc]})
+    assert doc["assets"][0]["ocr_text"] == fp_text
+
+
+def test_g21_failclosed_can_be_disabled(monkeypatch):
+    import opensearch_pipeline.pipeline_nodes as pn
+    monkeypatch.setenv("RAG_IMAGE_OCR_PII_FAILCLOSED", "false")
+    raw = "电话 13812345678"
+    doc = _canon_with_asset(raw)
+    pn.node_chunk_documents({"canonicals": [doc]})
+    assert doc["assets"][0]["ocr_text"] == raw
+
+
+# ═══════════════════ G25: chunk 级乱码过滤 ═══════════════════
+
+def test_g25_gibberish_predicate():
+    import opensearch_pipeline.pipeline_nodes as pn
+    # 正常中文 / 中英混排 / markdown 表格 → 不误伤
+    assert not pn._chunk_text_gibberish("一、审核流程：核对发票信息并签字确认。" * 5)
+    assert not pn._chunk_text_gibberish("| 名称 | 规格 | 数量 |\n| 刀叉 | A-100 | 200 |" * 5)
+    assert not pn._chunk_text_gibberish("Step 1: open ERP -> click 采购订单 (PO-2026-001)" * 5)
+    # PUA 乱码块 / latin-1 mojibake 块 → 拦截
+    assert pn._chunk_text_gibberish("".join(chr(0xE000 + i % 200) for i in range(100)))
+    assert pn._chunk_text_gibberish("ÀÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß" * 5)
+    # 短文本不判
+    assert not pn._chunk_text_gibberish("×÷±")
+
+
+def test_g25_validator_drops_gibberish_chunk():
+    import opensearch_pipeline.pipeline_nodes as pn
+    from opensearch_pipeline.chunker import Chunk
+    good = Chunk(chunk_id="ok", doc_id="D", version_no=1, chunk_index=0,
+                 chunk_type="text_chunk", chunk_text="正常的中文正文内容。" * 20, token_count=100)
+    bad = Chunk(chunk_id="bad", doc_id="D", version_no=1, chunk_index=1,
+                chunk_type="text_chunk",
+                chunk_text="".join(chr(0xE000 + i % 200) for i in range(200)), token_count=100)
+    ctx = {"chunks": [good, bad]}
+    pn.node_validate_chunks(ctx)
+    assert [c.chunk_id for c in ctx["valid_chunks"]] == ["ok"]
+    assert ctx["invalid_chunks"][0]["chunk_id"] == "bad"
+    assert "gibberish_text" in ctx["invalid_chunks"][0]["issues"]
 
 
 # ═══════════════════ G12: 页眉页脚数字归一 + 非正立词过滤 ═══════════════════

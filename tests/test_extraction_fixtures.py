@@ -21,7 +21,7 @@ def test_docx_fixture_merged_cells_deduped():
     from opensearch_pipeline.extraction.docx_extractor import extract_docx
     blocks, _ = extract_docx(os.path.join(FIX, "merged_cells.docx"))
     tbl = "\n".join(b.text for b in blocks if getattr(b, "block_type", "") == "table")
-    assert "合并表头 | 列C" in tbl            # horizontal gridSpan deduped (not 合并表头 | 合并表头)
+    assert "合并表头 |  | 列C" in tbl          # gridSpan deduped + "" 占位保栅格宽度（G1）
     assert "合并表头 | 合并表头" not in tbl
     assert tbl.count("纵向合并") == 1          # vertical vMerge emitted once
     assert "甲 | 乙 | 丙" in tbl               # non-merged row intact
