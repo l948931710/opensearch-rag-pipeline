@@ -75,8 +75,13 @@ python -m eval_harness.fidelity.run_fidelity run --freeze
 
 - `run --freeze` 把 corpus 指标 + hard 文档集写进 `baseline.json`（**可提交**——
   只有分数没有内容；GT 本体永不进仓库）。
-- 之后每次 `run` 自动比对：char_f1/table_cell_f1/grid_exact 跌幅或 cer 涨幅
-  > δ(默认 0.02) → REGRESSION；hard 文档缺测**不算过**；hard 文档集变了 →
+- **基线分口径（v2，G6 双重 OCR 修复起）**：`sim`（默认跑，零 API，只评原生抽取）
+  与 `real`（`--real`，含扫描件 hard 守卫）各存一段、各自 `--freeze` 各自比对——
+  real 口径下 funnel 会把图内 OCR 文本追加进页文本（对原生口径 GT 是加性噪声），
+  两口径分数**不可互比**；`requires_real_ocr` 的 hard 文档在 sim 跑里按口径跳过
+  不算缺测（它的守卫在 real 段）。
+- 之后每次 `run` 自动与本口径的段比对：char_f1/table_cell_f1/grid_exact 跌幅或
+  cer 涨幅 > δ(默认 0.02) → REGRESSION；hard 文档缺测**不算过**；hard 文档集变了 →
   INCOMPARABLE（先补齐或重冻，学 regime-mismatch 不给 GO）。
 - `--strict` 下 REGRESSION/INCOMPARABLE → exit 1，可直接挂进 release-gate 脚本。
 
