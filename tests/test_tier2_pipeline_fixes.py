@@ -218,6 +218,47 @@ def test_g19_simhash_properties():
     assert simhash64(base) == simhash64(base.replace("：", "：\n  "))
 
 
+# ═══════════════════ G20: 版本化文本归一 ═══════════════════
+
+def test_g20_normalize_rules():
+    from opensearch_pipeline.text_normalize import normalize_text
+    # 全角字母数字 → 半角（金集实测失配 case）
+    assert normalize_text("产品编号ＦＣＡ００７３，等待５秒钟") == "产品编号FCA0073，等待5秒钟"
+    # 全角标点不动（中文排版语义）
+    assert normalize_text("（一）总则：适用范围。") == "（一）总则：适用范围。"
+    # 枚举符/圈号不拆（NFKC 会拆坏这些——保守集的存在理由）
+    assert normalize_text("㈠ 概述 ① 开机") == "㈠ 概述 ① 开机"
+    # 零宽字符剔除
+    assert normalize_text("质​检‍员﻿签字") == "质检员签字"
+    # 连片空行折叠
+    assert normalize_text("第一段\n\n\n\n第二段") == "第一段\n\n第二段"
+    # 幂等
+    s = "ＡＢＣ１２３​（测试）\n\n\n正文"
+    assert normalize_text(normalize_text(s)) == normalize_text(s)
+
+
+def test_g20_canonical_carries_version_marker(monkeypatch):
+    import opensearch_pipeline.pipeline_nodes as pn
+    from opensearch_pipeline.extraction.schema import ExtractionResult
+    from opensearch_pipeline.text_normalize import NORMALIZATION_VERSION
+    res = ExtractionResult(doc_id="D20", version_no=1, source_key="raw/x.txt", file_ext="txt",
+                           extract_method="native", title="ＳＯＰ手册",
+                           text="步骤１：登录系统ＥＲＰ​。", text_length=0, blocks=[])
+    ctx = {"extractions": [res], "simulate_db": True, "simulate_oss": True,
+           "_tmp_dir": "/tmp"}
+    monkeypatch.setattr(pn, "_get_oss_bucket", lambda c: (None, True))
+    monkeypatch.setenv("RAG_TEXT_NORMALIZE", "true")
+    # 本地文件写路径：canonical_key 落到 tmp
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    monkeypatch.chdir(tmp)
+    pn.node_build_canonical(ctx)
+    doc = ctx["canonicals"][0]
+    assert doc["normalization_version"] == NORMALIZATION_VERSION
+    assert "步骤1：登录系统ERP。" == doc["text"]
+    assert doc["title"] == "SOP手册"
+
+
 # ═══════════════════ G3: 多栏页列检测 ═══════════════════
 
 def test_g3_two_column_page_reading_order(tmp_path):

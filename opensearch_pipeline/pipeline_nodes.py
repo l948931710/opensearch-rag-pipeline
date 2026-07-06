@@ -585,6 +585,9 @@ def node_build_canonical(ctx: dict):
                 # P2-32：VLM degraded 兜底图片数（供应商故障）→ 持久化进 canonical JSON 跨 stage
                 # 边界传递；>0 时 node_write_chunk_meta 收尾落 NEEDS_REVIEW（不 DONE）。
                 "vlm_degraded_count": getattr(result, "vlm_degraded_count", 0),
+                # G20：文本归一版本标记（canonical_sha256 建立在归一后文本上；规则变更须
+                # bump NORMALIZATION_VERSION，否则 skip-unchanged/去重把规则漂移误判为内容变更）
+                "normalization_version": None,
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result.doc_id}"
@@ -613,6 +616,26 @@ def node_build_canonical(ctx: dict):
                     f"/v{result['version_no']}/content.md"
                 ),
             }
+
+        # ── G20：版本化文本归一（哈希/持久化之前；默认 ON，RAG_TEXT_NORMALIZE=false 直通）──
+        # 去零宽 + 全角字母数字折半角 + 折叠连片空行（保守集，全角标点/㈠圈号不动）。
+        # 金集实测全角 token（ＦＣＡ００７３/５秒钟）此前直进 embedding/BM25 与半角查询失配。
+        try:
+            from opensearch_pipeline.text_normalize import (
+                NORMALIZATION_VERSION, normalization_enabled, normalize_text)
+            if normalization_enabled():
+                _nm_text = normalize_text(canonical.get("text") or "")
+                if _nm_text != (canonical.get("text") or ""):
+                    canonical["text"] = _nm_text
+                    canonical["text_length"] = len(_nm_text)
+                if canonical.get("title"):
+                    canonical["title"] = normalize_text(canonical["title"])
+                for _blk in canonical.get("blocks", []) or []:
+                    if isinstance(_blk, dict) and _blk.get("text"):
+                        _blk["text"] = normalize_text(_blk["text"])
+                canonical["normalization_version"] = NORMALIZATION_VERSION
+        except Exception as _nm_err:  # fail-open：归一失败绝不阻断摄取
+            print(f"    ⚠️ text normalize skipped (FAIL-SAFE): {_nm_err}")
 
         # ─── Physical Persistence of Canonical Documents (JSON & MD) ───
         # G#67：canonical JSON 用紧凑分隔符序列化（stage-2 会整包下载解析，indent=2 的缩进空白
