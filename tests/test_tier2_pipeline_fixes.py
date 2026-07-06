@@ -88,6 +88,69 @@ def test_g11_no_merge_on_column_mismatch():
     assert n == 0
 
 
+# ═══════════════════ G9: 毒 chunk 死信队列 ═══════════════════
+
+class _ScriptedCursor:
+    """记录 SQL 的假 cursor；fetchall 按脚本依次弹出。"""
+
+    def __init__(self, fetch_scripts=None, fail_first_with=None):
+        self.executed = []
+        self._fetch = list(fetch_scripts or [])
+        self._fail_first = fail_first_with
+        self.rowcount = 1
+
+    def execute(self, sql, params=None):
+        if self._fail_first is not None and "index_retry_count" in sql:
+            err, self._fail_first = self._fail_first, None
+            raise Exception(err)
+        self.executed.append((" ".join(sql.split()), list(params or [])))
+        self.rowcount = len([p for p in (params or []) if isinstance(p, str)]) or 1
+
+    def fetchall(self):
+        return self._fetch.pop(0) if self._fetch else []
+
+
+def test_g9_retry_budget_sql_and_dead_detection():
+    import opensearch_pipeline.pipeline_nodes as pn
+    cur = _ScriptedCursor(fetch_scripts=[[("c_poison",)]])
+    dead = pn._fail_chunks_with_retry_budget(
+        cur, ["c_poison", "c_ok"],
+        extra_set_sql=", index_error_code=%s, index_error_message=%s",
+        extra_params=["PARITY_DROP", "gone"])
+    assert dead == ["c_poison"]
+    upd_sql, upd_params = cur.executed[0]
+    assert "index_retry_count = index_retry_count + 1" in upd_sql
+    assert "IF(index_retry_count >= %s, 'DEAD', 'FAILED')" in upd_sql
+    assert upd_params[0] == 3                      # 默认重试上限
+    assert "index_error_code=%s" in upd_sql
+
+
+def test_g9_fallback_when_migration_missing():
+    """迁移 019 未应用（1054 未知列）→ 回退旧 SQL，行为与迁移前一致。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+    cur = _ScriptedCursor(fail_first_with="(1054, \"Unknown column 'index_retry_count'\")")
+    dead = pn._fail_chunks_with_retry_budget(cur, ["c1"])
+    assert dead == []
+    legacy_sql, _ = cur.executed[0]
+    assert "index_status='FAILED'" in legacy_sql
+    assert "index_retry_count" not in legacy_sql
+
+
+def test_g9_dead_chunks_mark_doc_needs_review():
+    import opensearch_pipeline.pipeline_nodes as pn
+    cur = _ScriptedCursor(fetch_scripts=[[("DOC1", 3)]])
+    pn._mark_docs_needs_review_for_dead(cur, ["c_poison"])
+    sqls = [s for s, _ in cur.executed]
+    assert any("chunk_status='NEEDS_REVIEW'" in s for s in sqls)
+    assert any("document_version" in s for s in sqls)
+
+
+def test_g9_dead_not_in_stage3_reselect():
+    from opensearch_pipeline.reindex_states import (
+        STAGE3_CHUNK_RESELECT_INDEX_STATUS, ChunkIndexStatus)
+    assert ChunkIndexStatus.DEAD not in STAGE3_CHUNK_RESELECT_INDEX_STATUS
+
+
 # ═══════════════════ G3: 多栏页列检测 ═══════════════════
 
 def test_g3_two_column_page_reading_order(tmp_path):

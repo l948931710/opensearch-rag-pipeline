@@ -12,7 +12,7 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 019。历史上有三对编号冲突（002/003/006 各两个文件，
+3. **编号严格单调递增**，下一个可用号 = 020。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
 4. **`CREATE DATABASE` 必须显式 `CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci`**，每张新表
    显式 COLLATE —— staging `_stg` 库曾因缺省漂移到 `_0900_ai_ci` 引发跨库 JOIN 1267。
@@ -46,6 +46,7 @@ apply 脚本落库并记台账。
 | 016_user_feedback_dedup_unique.sql | fuling_operation | user_feedback (message_id,user_id) 去重 + uk_message_user 唯一键补建（存量库补救） |
 | 017_qa_admission_reject.sql | fuling_operation | 限流拒绝聚合表 + qa_daily_metrics 拒绝列（盲区审计 P1-1：熔断日 SLO 不再假绿） |
 | 018_gen_meta_runtime_contract.sql | 双库 | qa_session_log.gen_meta_json 生成元数据列（盲区审计 P2-20/21/22）+ rag_runtime_contract 运行时 KV（operation=嵌入契约行 P2-8；knowledge=ops 心跳 P2-14） |
+| 019_chunk_meta_index_retry.sql | fuling_knowledge | chunk_meta.index_retry_count + DEAD 死信终态（G9：毒 chunk 队头阻塞修复；代码侧 1054 fail-open） |
 
 ## 台账（schema_migrations）
 

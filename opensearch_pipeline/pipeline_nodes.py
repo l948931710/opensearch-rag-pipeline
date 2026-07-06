@@ -6843,16 +6843,12 @@ def node_update_index_status(ctx: dict):
 
                 # 回写 embedding 失败的 chunk（不在任何 batch 中）为 FAILED：
                 # 下轮 loader 按 index_status IN ('NOT_INDEXED','FAILED') 重新加载并重试。
-                # E#38：SET 值全同 → 合并为 chunk_id IN (...)（每 1000 个 id 一条）。
+                # G9：带重试预算——持续 embedding 失败的毒 chunk 达上限转 DEAD 死信 +
+                # 文档 NEEDS_REVIEW，不再每轮占用 loader 队头。
                 _emb_failed_ids = [c.chunk_id for c in embedding_failed_chunks]
-                for _i in range(0, len(_emb_failed_ids), 1000):
-                    _ef_sub = _emb_failed_ids[_i:_i + 1000]
-                    _ef_ph = ",".join(["%s"] * len(_ef_sub))
-                    cursor.execute(f"""
-                        UPDATE chunk_meta
-                        SET embedding_status = 'FAILED', index_status = '{ChunkIndexStatus.FAILED}'
-                        WHERE chunk_id IN ({_ef_ph})
-                    """, _ef_sub)
+                _emb_dead = _fail_chunks_with_retry_budget(
+                    cursor, _emb_failed_ids, extra_set_sql=", embedding_status = 'FAILED'")
+                _mark_docs_needs_review_for_dead(cursor, _emb_dead)
 
                 # If there are failed doc versions, update their document_version status to 'FAILED'
                 if failed_doc_versions:
@@ -6911,6 +6907,82 @@ def _parity_content_hash(text) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _stage3_chunk_max_retries() -> int:
+    try:
+        return int(os.environ.get("RAG_STAGE3_CHUNK_MAX_RETRIES", "3"))
+    except ValueError:
+        return 3
+
+
+def _fail_chunks_with_retry_budget(cursor, chunk_ids, extra_set_sql="", extra_params=(),
+                                   expect_all=False):
+    """G9：chunk 级失败回写 + 重试预算。返回本次转 DEAD 的 chunk_id 列表。
+
+    index_retry_count +1；达上限（RAG_STAGE3_CHUNK_MAX_RETRIES，默认 3）→
+    index_status='DEAD'（死信，不再被 loader 重选——消除毒 chunk 队头阻塞整轮
+    drain），否则 'FAILED'（照旧重选）。MySQL SET 从左到右求值：IF 判断读到的是
+    +1 后的新值。迁移 019 未应用（1054 未知列）→ 回退旧 SQL（无计数/无 DEAD，
+    行为与迁移前一致，fail-open）。expect_all=True 时 rowcount 不符即 raise
+    （沿用 parity 全有或全无语义，由调用方 rollback）。
+    """
+    if not chunk_ids:
+        return []
+    max_r = _stage3_chunk_max_retries()
+    dead_ids: list = []
+    for _i in range(0, len(chunk_ids), 1000):
+        sub = list(chunk_ids[_i:_i + 1000])
+        ph = ",".join(["%s"] * len(sub))
+        try:
+            cursor.execute(
+                f"UPDATE chunk_meta SET index_retry_count = index_retry_count + 1, "
+                f"index_status = IF(index_retry_count >= %s, "
+                f"'{ChunkIndexStatus.DEAD}', '{ChunkIndexStatus.FAILED}')"
+                f"{extra_set_sql} WHERE chunk_id IN ({ph})",
+                [max_r] + list(extra_params) + sub,
+            )
+            _rc = getattr(cursor, "rowcount", None)
+            if expect_all and isinstance(_rc, int) and _rc != len(sub):
+                raise RuntimeError(
+                    f"state-persistence failure: marked {_rc} of {len(sub)} chunk_meta rows")
+            cursor.execute(
+                f"SELECT chunk_id FROM chunk_meta WHERE chunk_id IN ({ph}) "
+                f"AND index_status='{ChunkIndexStatus.DEAD}'", sub)
+            dead_ids.extend(r[0] for r in (cursor.fetchall() or []))
+        except Exception as _e:
+            if "1054" in str(_e) or "index_retry_count" in str(_e).lower():
+                cursor.execute(
+                    f"UPDATE chunk_meta SET index_status='{ChunkIndexStatus.FAILED}'"
+                    f"{extra_set_sql} WHERE chunk_id IN ({ph})",
+                    list(extra_params) + sub,
+                )
+                _rc = getattr(cursor, "rowcount", None)
+                if expect_all and isinstance(_rc, int) and _rc != len(sub):
+                    raise RuntimeError(
+                        f"state-persistence failure: marked {_rc} of {len(sub)} chunk_meta rows")
+            else:
+                raise
+    return dead_ids
+
+
+def _mark_docs_needs_review_for_dead(cursor, dead_chunk_ids):
+    """G9：DEAD 死信 chunk 所属文档版本置 NEEDS_REVIEW（人工可见，不再自动重试）。"""
+    if not dead_chunk_ids:
+        return
+    ph = ",".join(["%s"] * len(dead_chunk_ids))
+    cursor.execute(
+        f"SELECT DISTINCT doc_id, version_no FROM chunk_meta WHERE chunk_id IN ({ph})",
+        list(dead_chunk_ids))
+    for _doc_id, _ver in (cursor.fetchall() or []):
+        cursor.execute(
+            "UPDATE document_version SET chunk_status='NEEDS_REVIEW', "
+            "content_process_error=%s WHERE doc_id=%s AND version_no=%s",
+            (f"stage-3 poison chunk(s) exhausted retry budget → DEAD letter "
+             f"(max={_stage3_chunk_max_retries()}); fix & reset to NOT_INDEXED to requeue",
+             _doc_id, _ver))
+        print(f"    🚨 [DEAD-LETTER] {_doc_id} v{_ver}: 毒 chunk 达重试上限转 DEAD，"
+              f"文档置 NEEDS_REVIEW（不再阻塞后续 drain）")
+
+
 def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, max_retries,
                                      drift_chunks=None):
     """把校验失败的 chunk 写回 chunk_meta.index_status='FAILED' 后 raise，阻断
@@ -6947,23 +7019,29 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cursor:
+            _all_dead: list = []
             for chunks, code, msg in buckets:
                 if not chunks:
                     continue
                 ids = [c.chunk_id for c in chunks]
-                placeholders = ",".join(["%s"] * len(ids))
-                cursor.execute(
-                    f"UPDATE chunk_meta SET index_status='{ChunkIndexStatus.FAILED}', index_error_code=%s, "
-                    f"index_error_message=%s WHERE chunk_id IN ({placeholders})",
-                    [code, msg] + ids,
-                )
-                if cursor.rowcount != len(ids):
+                # G9：FAILED 回写带重试预算——达上限转 DEAD 死信（不再被 loader 重选，
+                # 消除毒 chunk 每轮重推→校验失败→raise 的队头阻塞）。全有或全无语义保留
+                # （expect_all；rowcount 不符 → raise → 下方 rollback）。
+                try:
+                    _dead = _fail_chunks_with_retry_budget(
+                        cursor, ids,
+                        extra_set_sql=", index_error_code=%s, index_error_message=%s",
+                        extra_params=[code, msg], expect_all=True)
+                except RuntimeError as _pe:
                     conn.rollback()
                     raise RuntimeError(
-                        f"PARITY state-persistence failure: marked {cursor.rowcount} of "
-                        f"{len(ids)} chunk_meta rows FAILED ({code}); rolled back to avoid a "
-                        f"partial write that strands INDEXED-but-absent chunks (never re-selected)."
-                    )
+                        f"PARITY {_pe} ({code}); rolled back to avoid a partial write "
+                        f"that strands INDEXED-but-absent chunks (never re-selected).") from _pe
+                _all_dead.extend(_dead)
+                for c in chunks:
+                    if c.chunk_id in set(_dead):
+                        c.index_status = ChunkIndexStatus.DEAD
+            _mark_docs_needs_review_for_dead(cursor, _all_dead)
         conn.commit()
     except Exception:
         if conn:

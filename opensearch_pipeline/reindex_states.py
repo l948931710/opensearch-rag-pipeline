@@ -44,7 +44,12 @@ class ChunkIndexStatus:
     INDEXED = "INDEXED"              # HA3 push 成功（chunk 级成功终态）
     FAILED = "FAILED"                # push / embedding / parity 校验失败（下轮 loader 重选）
     DELETED = "DELETED"              # 旧版本停用 / 隔离清除（伴随 is_active=0）
-    ALL = (NOT_INDEXED, INDEXED, FAILED, DELETED)
+    # G9 死信终态：index_retry_count 达上限（默认 3，RAG_STAGE3_CHUNK_MAX_RETRIES）的
+    # 毒 chunk。不在 loader 重选集内（消除队头阻塞整轮 drain），所属 document_version
+    # 会被置 chunk_status='NEEDS_REVIEW' 供人工处理；修复后把该 chunk 复位
+    # NOT_INDEXED + index_retry_count=0 即重新进队（schema/019）。
+    DEAD = "DEAD"
+    ALL = (NOT_INDEXED, INDEXED, FAILED, DELETED, DEAD)
 
 
 class DocVersionIndexStatus:
