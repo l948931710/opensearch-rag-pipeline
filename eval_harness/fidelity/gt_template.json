@@ -1,0 +1,32 @@
+{
+  "_meta": {
+    "schema": "fidelity_v1",
+    "notes": "模板（内容为虚构示例，可提交）。真实 GT 含全文转写 → 放 eval_samples/fidelity_gt/fidelity_gt.json，不进仓库。字段语义见 AUTHORING_GUIDE.md。"
+  },
+  "pdf_sop_example": {
+    "_doc_meta": {
+      "local_path": "eval_samples/docs/某作业指导书.pdf",
+      "doc_sha256": "<sha256 of raw bytes — --stub 自动填>",
+      "file_ext": "pdf",
+      "requires_real_ocr": false,
+      "degraded": true
+    },
+    "pages": [
+      {
+        "page": 1,
+        "scope": "body",
+        "ref_text": "一、目的\n规范注塑车间刀叉产品的外观检验流程。\n二、适用范围\n本规程适用于 FCA0073 系列全部型号。"
+      }
+    ],
+    "tables": [
+      {
+        "page": 2,
+        "ref_grid": [
+          ["名称", "规格", "数量"],
+          ["刀叉", "A-100", "200"],
+          ["吸管", "", "300"]
+        ]
+      }
+    ]
+  }
+}

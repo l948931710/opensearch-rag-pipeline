@@ -36,6 +36,7 @@ latency.
 | **L4** multimodal | image-text interleaving | marker validity, orphan/dangling, availability (reuses `mm_answer_metrics`) |
 | **L5** permission | dept filtering + injection safety | gated docs hidden on public path, visible to authorized dept, injection-safe |
 | **L6** latency | serving speed | p50/p95/p99 of retrieval (folded into L1) and generation (L3) |
+| **fidelity/** (G6) | raw extraction fidelity vs human reference transcription — the layer everything above sits on; parser/OCR 换版的第一道回归网 | char-F1 / CER / table cell-F1 / grid_exact vs frozen baseline (δ=0.02); hard-doc 缺测不算过。见 `fidelity/AUTHORING_GUIDE.md` |
 
 ## Gold set
 
