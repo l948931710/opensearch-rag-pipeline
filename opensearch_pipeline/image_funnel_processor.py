@@ -135,6 +135,23 @@ class ImageFunnelProcessor:
             img_cat = vlm_result.get("image_category", "unknown")
             anno_map = vlm_result.get("annotation_map", {})
 
+            # ── G17：图表/流程图条件化二次结构抽取（默认 OFF：RAG_IMAGE_STRUCT_EXTRACT）──
+            # 通用 caption 只有一句 50-100 字——流程图丢节点/边、数据图表丢轴/数值，检索与
+            # 生成都只能拿到"这是一张流程图"级别的信息。开启后仅对 process_flow/chart 两类
+            # 追加一次 VLM 调用（占比小、成本有界），结构化文本拼进 visual_summary（随
+            # VLM 缓存持久化；开启时建议 bump RAG_VLM_CACHE_VERSION 使旧 caption 缓存失效）。
+            # 失败静默保留原 caption（不设 degraded——caption 本身是完好的）。
+            if (img_cat in ("process_flow", "chart") and not vlm_degraded
+                    and os.environ.get("RAG_IMAGE_STRUCT_EXTRACT", "").lower() in ("1", "true", "yes")):
+                try:
+                    _struct = self._vlm_structure_extract(local_path, img_cat)
+                    if _struct:
+                        caption = f"{caption}\n[结构化解析]\n{_struct}"[:2000]
+                        print(f"    [Funnel 3+] struct-extract ({img_cat}): "
+                              f"+{len(_struct)} chars for {filename}")
+                except Exception as _se:
+                    print(f"    ⚠️ struct-extract skipped (caption kept): {_se}")
+
             # 实物照片类别：即使文字多也保留为图片（包装箱/合格证/标签等）
             _PHOTO_CATS = {"product_photo", "inspection_photo", "test_photo",
                            "packaging_photo", "process_flow"}
@@ -181,6 +198,74 @@ class ImageFunnelProcessor:
             # 兜底返回，如果解析异常则置零，在 Funnel 1 直接丢弃
             print(f"    ⚠️ Warning failed to read image heuristics: {e}")
             return 0, 0, 0.0
+
+    # 结构抽取 prompt（G17）：按类别路由，输出纯文本（非 JSON——结构行本身就是产物）
+    _STRUCT_PROMPTS = {
+        "process_flow": (
+            "这是企业工艺/操作流程图。把流程结构完整还原成文本：\n"
+            "1. 按执行顺序逐行列出节点连接，格式：节点A -> 节点B（连线上的条件/说明放括号里）；\n"
+            "2. 分支/汇合用缩进子行表达；\n"
+            "3. 只依据画面可见文字，看不清的节点写 [不清]，不要编造。\n"
+            "直接输出结构行，不要额外解释。"
+        ),
+        "chart": (
+            "这是数据图表。把它还原成 markdown 数据表：\n"
+            "1. 表头 = 横轴刻度/系列名（以画面可见文字为准）；\n"
+            "2. 单元格 = 能读出的数值，读不清的填 ?；\n"
+            "3. 表格之后用一句话概括趋势/结论（仅基于可见数据）。\n"
+            "直接输出 markdown 表格与结论，不要额外解释。"
+        ),
+    }
+
+    def _vlm_structure_extract(self, local_path: str, img_cat: str) -> str:
+        """G17：对 process_flow/chart 图做第二次 VLM 调用，抽取结构化文本。
+
+        返回结构文本（空串 = 跳过/失败——调用方保留原 caption，不降级）。
+        模拟模式返回确定性桩文本供测试。
+        """
+        prompt = self._STRUCT_PROMPTS.get(img_cat)
+        if not prompt:
+            return ""
+        if self.simulate or self.simulate_api:
+            return f"[Simulated-struct] {img_cat} 结构解析"
+
+        config = get_config()
+        api_key = config.ocr.api_key
+        if not api_key:
+            return ""
+        model_name = config.ocr.vlm_model or config.ocr.model
+
+        import base64
+        import requests
+        from opensearch_pipeline.vlm_endpoint import (
+            auth_headers, build_image_chat_payload, extract_vlm_text,
+            resolve_vlm_url, use_compat_mode,
+        )
+        from opensearch_pipeline.vlm_retry import post_json_with_retry
+
+        with open(local_path, "rb") as f:
+            raw = f.read()
+        mime = "image/png"
+        if len(raw) > 500 * 1024:
+            try:  # 与主审计调用同一压缩（1568/q78，G16 对齐后的实现）
+                from opensearch_pipeline.extraction.vlm_rebuilder import compress_page_png
+                raw, mime = compress_page_png(raw)
+            except Exception:
+                pass
+        elif os.path.splitext(local_path)[1].lower() in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+
+        use_compat = use_compat_mode(model_name, config.ocr.api_base_url)
+        url = resolve_vlm_url(config.ocr.api_base_url, use_compat)
+        payload = build_image_chat_payload(
+            model_name, prompt, base64.b64encode(raw).decode("utf-8"), mime, use_compat,
+            temperature=0)
+        resp = post_json_with_retry(url, json=payload, headers=auth_headers(api_key),
+                                    timeout=(10, 90), label="VLM-struct", post_fn=requests.post)
+        if resp.status_code != 200:
+            raise RuntimeError(f"VLM-struct HTTP {resp.status_code}: {resp.text[:200]}")
+        text = extract_vlm_text(resp.json(), use_compat)
+        return (text or "").strip()[:1500]
 
     def _vlm_audit_and_summary(self, local_path: str, doc_id: str, bypass_safety: bool,
                                 doc_title: str = "", ocr_text: str = "") -> Dict[str, Any]:
@@ -318,6 +403,7 @@ class ImageFunnelProcessor:
                 "   - form_image: 表单/记录单截图（交货单、检验单、入库单）\n"
                 "   - visual_knowledge: 独立知识图（字段说明、缺陷对照、规格对照表）\n"
                 "   - process_flow: 工艺流程图、生产流程图、CCP流程图\n"
+                "   - chart: 数据图表（柱状图、折线图、饼图、趋势图、检测数据曲线）\n"
                 "   - product_photo: 产品实物照片、包装成品照片、外箱照片、标签照片、合格证照片\n"
                 "   - logo_header: 封面Logo、公司标志、页眉装饰\n"
                 "   - decorative: 其他纯装饰图/留白/线条\n"

@@ -7,6 +7,7 @@ G3:  多栏页 x-gap 列检测（先左栏后右栏，单栏页行为不变）�
 """
 import os
 import sys
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("RAG_ENV", "test")
@@ -216,6 +217,60 @@ def test_g19_simhash_properties():
     assert simhash64("") == 0 and simhash64("ab") == 0
     # 空白归一：排版空白变化不影响指纹
     assert simhash64(base) == simhash64(base.replace("：", "：\n  "))
+
+
+# ═══════════════════ G17: 图表/流程图二次结构抽取 ═══════════════════
+
+def _funnel_with_category(monkeypatch, category, enabled):
+    from opensearch_pipeline.image_funnel_processor import ImageFunnelProcessor
+    if enabled:
+        monkeypatch.setenv("RAG_IMAGE_STRUCT_EXTRACT", "true")
+    else:
+        monkeypatch.delenv("RAG_IMAGE_STRUCT_EXTRACT", raising=False)
+    p = ImageFunnelProcessor(simulate=True)
+    monkeypatch.setattr(p, "_static_heuristics", lambda path: (800, 600, 120.0))
+    monkeypatch.setattr(p.ocr_client, "ocr_image",
+                        lambda path, doc_id: types.SimpleNamespace(combined_text="轴标签 数值"))
+    monkeypatch.setattr(p, "_vlm_audit_and_summary",
+                        lambda **kw: {"status": "CLEAN", "caption": "一张产线流程图",
+                                      "image_category": category, "annotation_map": {}})
+    return p
+
+
+def test_g17_struct_extract_appends_to_caption(monkeypatch):
+    p = _funnel_with_category(monkeypatch, "process_flow", enabled=True)
+    res = p.process_image("/tmp/flow.png", "D17", is_public=True)
+    assert res["status"] == "ROUTE_TO_VECTOR"
+    assert "[结构化解析]" in res["visual_summary"]
+    assert "Simulated-struct" in res["visual_summary"]
+
+
+def test_g17_default_off_keeps_caption(monkeypatch):
+    p = _funnel_with_category(monkeypatch, "process_flow", enabled=False)
+    res = p.process_image("/tmp/flow.png", "D17", is_public=True)
+    assert res["visual_summary"] == "一张产线流程图"
+
+
+def test_g17_screenshot_category_never_double_calls(monkeypatch):
+    p = _funnel_with_category(monkeypatch, "step_screenshot", enabled=True)
+    called = []
+    monkeypatch.setattr(p, "_vlm_structure_extract",
+                        lambda path, cat: called.append(cat) or "x")
+    res = p.process_image("/tmp/shot.png", "D17", is_public=True)
+    assert called == []                                    # 截图类不触发二次调用
+    assert res["visual_summary"] == "一张产线流程图"
+
+
+def test_g17_struct_failure_keeps_caption(monkeypatch):
+    p = _funnel_with_category(monkeypatch, "chart", enabled=True)
+
+    def _boom(path, cat):
+        raise RuntimeError("VLM-struct HTTP 500")
+    monkeypatch.setattr(p, "_vlm_structure_extract", _boom)
+    res = p.process_image("/tmp/chart.png", "D17", is_public=True)
+    assert res["status"] == "ROUTE_TO_VECTOR"
+    assert res["visual_summary"] == "一张产线流程图"        # 失败静默，caption 完好
+    assert not res.get("degraded")
 
 
 # ═══════════════════ G8: 日账本 + OCR 页缓存 ═══════════════════
