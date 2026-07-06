@@ -218,6 +218,75 @@ def test_g19_simhash_properties():
     assert simhash64(base) == simhash64(base.replace("：", "：\n  "))
 
 
+# ═══════════════════ G8: 日账本 + OCR 页缓存 ═══════════════════
+
+def _breaker(monkeypatch, daily_cap):
+    from opensearch_pipeline.config import get_config
+    from opensearch_pipeline.extraction.cost_breaker import CostBreaker
+    cfg = get_config()
+    monkeypatch.setattr(cfg.rebuild, "daily_budget_rmb", daily_cap, raising=False)
+    return CostBreaker(cfg, enabled=True)
+
+
+def test_g8_daily_ledger_gate_denies(monkeypatch):
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    from opensearch_pipeline.extraction.cost_breaker import estimate_doc_cost
+    br = _breaker(monkeypatch, daily_cap=10.0)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: 9.9)   # 今日已花 9.9
+    est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=br.cfg)  # 0.4 RMB
+    allowed, reason = br.try_reserve("D8a", est)
+    assert not allowed and "DAILY budget" in reason
+
+
+def test_g8_daily_ledger_failopen(monkeypatch):
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    from opensearch_pipeline.extraction.cost_breaker import estimate_doc_cost
+    br = _breaker(monkeypatch, daily_cap=10.0)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)  # 账本不可用 → fail-open
+    added = []
+    monkeypatch.setattr(cb, "_ledger_add", lambda amt: added.append(amt))
+    est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=br.cfg)
+    allowed, _ = br.try_reserve("D8b", est)
+    assert allowed
+    assert added and abs(added[0] - est.est_cost_rmb) < 1e-6     # 预留成功记账
+    br.refund("D8b", est)
+    assert abs(added[-1] + est.est_cost_rmb) < 1e-6              # 退款负记账
+
+
+def test_g8_ocr_page_cache_hits_skip_api(monkeypatch, tmp_path):
+    from opensearch_pipeline.extraction.ocr_client import OCRClient
+    monkeypatch.chdir(tmp_path)                                  # scratch/ 落 tmp
+    OCRClient._page_cache = None                                 # 隔离类级单例
+    monkeypatch.setenv("RAG_OCR_PAGE_CACHE", "true")
+    client = OCRClient(api_key="k", simulate=False, ocr_model="qwen-vl-test")
+    calls = []
+    monkeypatch.setattr(client, "_call_ocr_api",
+                        lambda b64, mime: calls.append(b64) or f"OCR文本-{b64[:4]}")
+    rendered = [(0, "QUFBQQ==", "image/jpeg"), (1, "QkJCQg==", "image/jpeg")]
+    out1 = client._ocr_rendered_pages(rendered)
+    assert len(calls) == 2 and [p.status for p in out1] == ["DONE", "DONE"]
+    out2 = client._ocr_rendered_pages(rendered)                  # 第二遍全命中缓存
+    assert len(calls) == 2                                       # 零新增 API 调用
+    assert [p.text for p in out2] == [p.text for p in out1]
+    OCRClient._page_cache = None
+
+
+def test_g8_ocr_page_cache_disabled_flag(monkeypatch, tmp_path):
+    from opensearch_pipeline.extraction.ocr_client import OCRClient
+    monkeypatch.chdir(tmp_path)
+    OCRClient._page_cache = None
+    monkeypatch.setenv("RAG_OCR_PAGE_CACHE", "false")
+    client = OCRClient(api_key="k", simulate=False, ocr_model="qwen-vl-test")
+    calls = []
+    monkeypatch.setattr(client, "_call_ocr_api",
+                        lambda b64, mime: calls.append(b64) or "T")
+    rendered = [(0, "Q0NDQw==", "image/jpeg")]
+    client._ocr_rendered_pages(rendered)
+    client._ocr_rendered_pages(rendered)
+    assert len(calls) == 2                                       # 关闭 → 每次都调 API
+    OCRClient._page_cache = None
+
+
 # ═══════════════════ G20: 版本化文本归一 ═══════════════════
 
 def test_g20_normalize_rules():

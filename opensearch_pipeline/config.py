@@ -261,6 +261,10 @@ class RebuildConfig:
     ocr_page_rmb: float = 0.06     # 单页 OCR-fallback 单价
     vlm_image_rmb: float = 0.04    # 单张嵌入式图片 VLM 单价
     refine_tables: bool = False    # Increment 2: 对结构错乱的 PDF 表格做 VLM 精修（数字保真闸把关；需 enabled=True 才生效，以确保成本熔断器在线）
+    # G8：跨进程/跨实例的日累计预算（RDS rag_runtime_contract 共享账本；北京日界）。
+    # 0 = 关闭（仅进程内 run_budget）。进程内预算无法跨 orchestrator 实例聚合的
+    # 已记录限制由此补上；账本不可达时 fail-open 回退进程内行为。
+    daily_budget_rmb: float = 0.0  # RAG_REBUILD_DAILY_BUDGET_RMB
 
 
 @dataclass
@@ -810,6 +814,7 @@ def load_config() -> PipelineConfig:
             ocr_page_rmb=_env_float("REBUILD_COST_PER_PAGE_RMB", 0.06),   # RAG_REBUILD_COST_PER_PAGE_RMB
             vlm_image_rmb=_env_float("REBUILD_COST_PER_IMAGE_RMB", 0.04), # RAG_REBUILD_COST_PER_IMAGE_RMB
             refine_tables=_env_bool("REBUILD_REFINE_TABLES", False),      # RAG_REBUILD_REFINE_TABLES
+            daily_budget_rmb=_env_float("REBUILD_DAILY_BUDGET_RMB", 0.0),  # RAG_REBUILD_DAILY_BUDGET_RMB
         ),
 
         llm=LLMConfig(

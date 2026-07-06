@@ -301,6 +301,38 @@ class OCRClient:
         except Exception as e:
             return OCRResult(status="FAILED", error=repr(e))
 
+    # ── G8：OCR 页级缓存（SqliteKVStore 底座，键=模型+渲染字节 sha256）──────────
+    # 此前 OCR 无任何缓存（cost_breaker 注释自认 ocr_cached_count 恒 0）：同一文档
+    # 重扫/重灌时每个扫描页都重新付费。键含模型名（换 OCR 模型即天然失效）与压缩后
+    # 渲染字节哈希（渲染参数变化 → 字节变化 → 自动 miss，无需手工 bump）。
+    # RAG_OCR_PAGE_CACHE=false 关闭；缓存层任何异常都 fail-open 直接调 API。
+
+    _page_cache = None
+    _page_cache_lock = None
+
+    @classmethod
+    def _get_page_cache(cls):
+        if os.environ.get("RAG_OCR_PAGE_CACHE", "true").lower() in ("0", "false", "no"):
+            return None
+        try:
+            if cls._page_cache is None:
+                from opensearch_pipeline.embedding_cache import SqliteKVStore
+
+                class _OcrPageCache(SqliteKVStore):
+                    TABLE = "ocr_page_cache"
+                    LABEL = "ocr page cache"
+                    OSS_MIRROR_KEY = None  # 本地缓存即可；OSS 镜像留给后续需要时开启
+
+                cls._page_cache = _OcrPageCache(
+                    os.path.join("scratch", "ocr_page_cache.sqlite3"))
+            return cls._page_cache
+        except Exception:
+            return None
+
+    def _page_cache_key(self, b64_data: str) -> str:
+        import hashlib as _h
+        return f"{self.ocr_model}:{_h.sha256(b64_data.encode('ascii')).hexdigest()}"
+
     def _ocr_rendered_pages(self, rendered) -> List[OCRPageResult]:
         """对已渲染的页面批量做 OCR API 调用 → 按输入页序返回 OCRPageResult 列表。
 
@@ -327,11 +359,36 @@ class OCRClient:
             max_workers = 4
         max_workers = max(1, max_workers)
 
+        # G8：页级缓存前置批量点查——命中页零 API 调用（sanitize 后的文本已在缓存里）
+        cache = self._get_page_cache()
+        cached_texts: dict = {}
+        if cache is not None and rendered:
+            try:
+                key_by_idx = {item[0]: self._page_cache_key(item[1]) for item in rendered}
+                hits = cache.get_many(key_by_idx.values())
+                cached_texts = {idx: hits[k] for idx, k in key_by_idx.items() if k in hits}
+                if cached_texts:
+                    print(f"    [ocr-cache] {len(cached_texts)}/{len(rendered)} page(s) served "
+                          f"from cache (0 API calls)", flush=True)
+            except Exception:
+                cached_texts = {}
+
         def _ocr_one(page_idx, b64_data, mime_type):
+            if page_idx in cached_texts:
+                return OCRPageResult(
+                    page_num=page_idx + 1,
+                    text=str(cached_texts[page_idx]),
+                    status="DONE",
+                )
             try:
                 page_text = self._call_ocr_api(b64_data, mime_type)
                 # 反幻觉修剪（不传尺寸：整页渲染只修剪重复，绝不整体丢弃）
                 page_text, _ = sanitize_ocr_text(page_text)
+                if cache is not None:
+                    try:  # 存 sanitize 后文本；缓存写失败绝不影响 OCR 结果
+                        cache.put_many({self._page_cache_key(b64_data): page_text})
+                    except Exception:
+                        pass
                 return OCRPageResult(
                     page_num=page_idx + 1,
                     text=page_text,
