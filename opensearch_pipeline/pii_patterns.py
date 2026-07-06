@@ -34,6 +34,11 @@ SEMANTIC_KEYWORDS = {
 # 与中文/空格/标点邻接均能命中，同时仍防止匹配更长数字/标识串的子串。redaction.py 直接
 # 复用本表（_FULL_ID/_ACCESS_KEY = ENTITY_PATTERNS[...]），改这里即同步修复入库脱敏侧。
 ENTITY_PATTERNS = {
+    # ⚠️ 顺序 load-bearing（node 03 / G21 兜底按 dict 序逐模式 re.sub）：masked_id 必须
+    # 排最前——它只应捕获【上游文档里预先掩码】的标识（如 "3301****1234"）；若排在
+    # cn_mobile/bank_card 之后，会把本轮刚产出的 "138****5678"/"6222****5678" 掩码
+    # 二次吞成 [标识已脱敏]，丢失前后段可读性。
+    "masked_id": r"(?<![\dA-Za-z])\d{3,4}[\*＊✱•·∗●]{2,}[\dXx]{3,4}(?![\dA-Za-z])",
     "cn_id_card": r"(?<![0-9Xx])[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9Xx])",
     "cn_mobile": r"(?<!\d)1[3-9]\d{9}(?!\d)",
     "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
@@ -42,7 +47,46 @@ ENTITY_PATTERNS = {
     # CJK 属 \w → 中文紧贴英文关键字（"数据库password=…"）时 \b 不成立 → 明文密钥既写入
     # qa_session_log 又逃过入库隔离闸门（node_detect_sensitive 的 re.search）。lookaround 同步修复两侧。
     "secret_like": r"(?i)(?<![A-Za-z0-9])(secret|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)[A-Za-z0-9_\-]{8,}",
+    # ── G5 扩展实体（2026-07-06：与 redaction.py 离线脱敏派生合并为同一权威表）──
+    # 此前这四类只存在于离线脱敏模块：摄取门检测不到 → 银行卡/信用代码/地址原样入
+    # 索引；更糟的是语义词"银行卡"命中走 REDACT 路径时，REDACTION_MAP 无 bank_card
+    # 条目 → 卡号原样保留且文档标 CLEAN。redaction.py 直接复用本表（勿再双处定义）。
+    # 银行卡：16-19 位数字、非字母数字邻接（USCC 尾校验字母绝不半匹配——redact-v2 教训）
+    "bank_card": r"(?<![\dA-Za-z])\d{16,19}(?![\dA-Za-z])",
+    # 统一社会信用代码：18 位大写字母数字、数字开头、且至少含一个字母（纯数字 18 位
+    # 归身份证/物料编码/卡号模式管辖——否则 18 位物料编码会被误判 uscc）。整 token
+    # 脱敏防尾校验字符泄露。
+    "uscc": (r"(?<![\dA-Za-z])\d(?=[0-9A-HJ-NP-Z]{17}(?![\dA-Za-z]))"
+             r"(?=[0-9]*[A-HJ-NP-Z])[0-9A-HJ-NP-Z]{17}(?![\dA-Za-z])"),
+    # 住址/通讯地址：市/区/县 + 路名成分 + 门牌号
+    "address": (r"[一-龥]{2,8}(?:市|区|县|自治州|地区)"
+                r"[一-龥0-9（）()]{0,22}?"
+                r"(?:路|街|大道|大街|巷|弄|村|镇|乡|新村|小区|段)"
+                r"[一-龥0-9（）()]{0,15}?\d{1,5}号"),
 }
+
+# G5：bank_card 的已知 FP 面——ERP/生产语料里 16-19 位订单号/物料号/工单号/条码。
+# 正向锚点（卡号/账号/银行）优先：共现即视为真卡号；否则业务锚点共现 → 抑制。
+_BANK_CARD_POSITIVE_ANCHORS = ("卡号", "账号", "账户", "银行", "bank")
+_BANK_CARD_FP_ANCHORS = ("订单", "单号", "物料", "料号", "工单", "编号", "编码",
+                         "流水号", "条码", "追溯码", "batch", "order", "sku", "barcode")
+
+
+def _bank_card_ctx_is_fp(m) -> bool:
+    """bank_card 单个命中的上下文 FP 判定（±24 字符窗口）。"""
+    s = m.string
+    ctx = s[max(0, m.start() - 24): m.end() + 8].lower()
+    if any(p in ctx for p in _BANK_CARD_POSITIVE_ANCHORS):
+        return False
+    return any(a in ctx for a in _BANK_CARD_FP_ANCHORS)
+
+
+def _guarded_bank_card_redact(m):
+    """FP 上下文（订单号/物料号锚点）保留原文；真卡号 前4****后4。"""
+    if _bank_card_ctx_is_fp(m):
+        return m.group()
+    return m.group()[:4] + "****" + m.group()[-4:]
+
 
 REDACTION_MAP = {
     "cn_id_card": lambda m: m.group()[:6] + "****" + m.group()[-4:],
@@ -50,6 +94,11 @@ REDACTION_MAP = {
     "email": lambda m: m.group().split("@")[0][:2] + "***@" + m.group().split("@")[1],
     "access_key": lambda m: m.group()[:8] + "****",
     "secret_like": lambda m: m.group(1) + m.group(2) + "****",
+    # G5 扩展（修复"银行卡命中却无脱敏条目"缺陷）
+    "bank_card": _guarded_bank_card_redact,
+    "uscc": lambda m: m.group()[:4] + "****" + m.group()[-2:],
+    "address": lambda m: "[地址已脱敏]",
+    "masked_id": lambda m: "[标识已脱敏]",
 }
 
 # Per-entity severity. high → document QUARANTINE (dropped from index);
@@ -62,6 +111,14 @@ ENTITY_SEVERITY = {
     "email": "medium",
     "access_key": "high",
     "secret_like": "high",
+    # G5 扩展类型统一 medium（就地脱敏、文档保留可检索）。与 redaction.HIGH_TYPES 的
+    # 分级刻意不同：那边 high 门的是"脱敏派生可否发布"（零残留要求）；摄取门 high=
+    # 整文档隔离（下架），而 bank_card 在本语料的主要命中面是 ERP 订单号/物料号 FP，
+    # 隔离的可用性代价不成比例——就地掩码 + 上下文 FP 抑制是均衡点。
+    "bank_card": "medium",
+    "uscc": "medium",
+    "address": "medium",
+    "masked_id": "medium",
 }
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
 
@@ -72,8 +129,28 @@ _MATERIAL_CODE_ANCHORS = ("物料编码", "物料号", "料号", "编码", "mate
 
 
 def _image_ocr_fp_ignore(entity_name: str, ocr_text: str) -> bool:
-    """图像 OCR 命中是否属已知误报（当前仅：cn_id_card 命中且物料编码锚点共现）。"""
+    """图像 OCR 命中是否属已知误报。
+
+    - cn_id_card：18 位物料编码 + 物料锚点共现（既有）。
+    - bank_card（G5）：所有命中都落在订单号/物料号业务锚点上下文（正向锚点优先）。
+    """
     if entity_name == "cn_id_card":
         low = ocr_text.lower()
         return any(a.lower() in low for a in _MATERIAL_CODE_ANCHORS)
+    if entity_name == "bank_card":
+        return _body_entity_fp_ignore("bank_card", ocr_text)
     return False
+
+
+def _body_entity_fp_ignore(entity_name: str, text: str) -> bool:
+    """正文实体命中的 FP 抑制（G5，当前仅 bank_card）。
+
+    所有命中都在业务锚点（订单/物料/工单…）上下文且无正向锚点（卡号/账号/银行）
+    时判 FP——ERP 手册整篇订单号示例不再把文档推成 medium/REDACTED。任一命中
+    不在锚点上下文 → 不抑制（fail-closed 方向）。
+    """
+    if entity_name != "bank_card":
+        return False
+    import re as _re
+    ms = list(_re.finditer(ENTITY_PATTERNS["bank_card"], text))
+    return bool(ms) and all(_bank_card_ctx_is_fp(m) for m in ms)

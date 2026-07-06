@@ -821,10 +821,16 @@ class DocumentChunker:
                     chunk_index += 1
                 continue
 
-            # ocr_text block → 来自图片 OCR，直接跳过
-            # 这些文本已经通过 image_ref 的 ocr_text/visual_summary 元数据保留
-            # 不应塞入步骤文本（会产生大量垃圾：重复圈号、ERP 菜单项等）
-            if block_type == "ocr_text":
+            # ocr_text block → 区分两类来源（G10）：
+            # 1) 图片 OCR（漏斗 ROUTE_TO_TEXT，extra 带 source_image/local_path）：文本已
+            #    通过 image_ref 的 ocr_text/visual_summary 元数据保留，塞入步骤正文只会
+            #    产生垃圾（重复圈号、ERP 菜单项）→ 照旧跳过；
+            # 2) 整页 OCR fallback（ocr_client.to_blocks，extra 无图片标记）：这是扫描页
+            #    唯一的文本来源——此前一并跳过，原生+扫描混合的 step 文档扫描页内容
+            #    整体静默丢失（纯扫描文档因回落 text 模式不受影响）。页级 OCR 文本
+            #    fallthrough 按普通段落处理，交给下方 _STEP_BOUNDARY_RE 拆步骤。
+            if block_type == "ocr_text" and (
+                    extra.get("source_image") or extra.get("local_path")):
                 continue
 
             # 页面叠加圈号标注（独立"⑧"等标注元素）→ 不入步骤正文。

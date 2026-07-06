@@ -212,6 +212,9 @@ def extract_docx(
                     # <w:tc> across spanned grid positions/rows. Store the element itself (not id():
                     # lxml proxy ids get GC-reused → distinct cells collide & get dropped); holding a
                     # reference keeps lxml's per-node proxy stable so membership is true identity.
+                    # G1: spanned positions and empty cells emit "" placeholders so every row keeps
+                    # the full grid width — dropping them shifts later columns left and breaks
+                    # header↔value alignment (the PDF table path already preserves empties).
                     seen_tc = set()
                     for row in table.rows:
                         cells = []
@@ -219,12 +222,11 @@ def extract_docx(
                             tc = getattr(cell, "_tc", None)
                             if tc is not None:
                                 if tc in seen_tc:
+                                    cells.append("")
                                     continue
                                 seen_tc.add(tc)
-                            cell_text = _cell_text_with_textboxes(cell)
-                            if cell_text:
-                                cells.append(cell_text)
-                        if cells:
+                            cells.append(_cell_text_with_textboxes(cell))
+                        if any(cells):
                             rows_text.append(" | ".join(cells))
 
                     if rows_text:
@@ -584,6 +586,7 @@ def extract_docx_with_images(
                 rows_text = []
                 # DC-3: dedup merged cells (gridSpan/vMerge) — see note in extract_docx above; store
                 # the <w:tc> element itself (not id()) so lxml's per-node proxy keeps identity stable.
+                # G1: spanned/empty grid positions emit "" placeholders to keep column alignment.
                 seen_tc = set()
                 for row in table.rows:
                     cells = []
@@ -591,12 +594,11 @@ def extract_docx_with_images(
                         tc = getattr(cell, "_tc", None)
                         if tc is not None:
                             if tc in seen_tc:
+                                cells.append("")
                                 continue
                             seen_tc.add(tc)
-                        cell_text = _cell_text_with_textboxes(cell)
-                        if cell_text:
-                            cells.append(cell_text)
-                    if cells:
+                        cells.append(_cell_text_with_textboxes(cell))
+                    if any(cells):
                         rows_text.append(" | ".join(cells))
 
                 if rows_text:

@@ -33,7 +33,9 @@ from opensearch_pipeline.reindex_states import (
 # ─────────────────────── 1. 词表取值冻结（线上契约） ───────────────────────
 
 def test_chunk_meta_vocabulary_frozen():
-    assert ChunkIndexStatus.ALL == ("NOT_INDEXED", "INDEXED", "FAILED", "DELETED")
+    # G9（2026-07-06）新增 DEAD 死信终态：index_retry_count 达上限的毒 chunk，
+    # 不在 stage-3 loader 重选集内（schema/019 + _fail_chunks_with_retry_budget）。
+    assert ChunkIndexStatus.ALL == ("NOT_INDEXED", "INDEXED", "FAILED", "DELETED", "DEAD")
 
 
 def test_document_version_vocabulary_frozen():

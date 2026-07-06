@@ -261,6 +261,10 @@ class RebuildConfig:
     ocr_page_rmb: float = 0.06     # 单页 OCR-fallback 单价
     vlm_image_rmb: float = 0.04    # 单张嵌入式图片 VLM 单价
     refine_tables: bool = False    # Increment 2: 对结构错乱的 PDF 表格做 VLM 精修（数字保真闸把关；需 enabled=True 才生效，以确保成本熔断器在线）
+    # G8：跨进程/跨实例的日累计预算（RDS rag_runtime_contract 共享账本；北京日界）。
+    # 0 = 关闭（仅进程内 run_budget）。进程内预算无法跨 orchestrator 实例聚合的
+    # 已记录限制由此补上；账本不可达时 fail-open 回退进程内行为。
+    daily_budget_rmb: float = 0.0  # RAG_REBUILD_DAILY_BUDGET_RMB
 
 
 @dataclass
@@ -530,6 +534,15 @@ class PipelineConfig:
     max_retry_count: int = 3
     scan_batch_size: int = 50
 
+    # ── PDF 抽取页上限（G2：原 20 页硬编码 env 化）──────────────────
+    # 原生文本抽取（pdfplumber/pypdf，本地 CPU、零 API 成本）页上限。旧值 20 使长手册
+    # 第 21 页起既无原生文本也不进 OCR（P1-09 仅标注截断）；默认提升到 200。
+    # 付费路径各有独立上限：OCR=ocr.max_ocr_pages，图片挖掘=pdf_image_max_pages。
+    pdf_native_max_pages: int = 200         # RAG_PDF_NATIVE_MAX_PAGES
+    # PDF 嵌入图片挖掘页上限：挖掘本身是本地操作，但每张产出图都进 OCR+VLM 付费漏斗，
+    # 故保守维持 20；成本熔断/漏斗配额到位后可放大。
+    pdf_image_max_pages: int = 20           # RAG_PDF_IMAGE_MAX_PAGES
+
 
 def _require_ack(var: str) -> bool:
     """读取守卫豁免变量。空=未豁免；read_only_ack=豁免；其他值=拼写错误，直接 raise（R7）。"""
@@ -722,6 +735,8 @@ def load_config() -> PipelineConfig:
         max_concurrent_tasks=_env_int("MAX_CONCURRENT_TASKS", 5),
         max_retry_count=_env_int("MAX_RETRY_COUNT", 3),
         scan_batch_size=_env_int("SCAN_BATCH_SIZE", 50),
+        pdf_native_max_pages=_env_int("PDF_NATIVE_MAX_PAGES", 200),
+        pdf_image_max_pages=_env_int("PDF_IMAGE_MAX_PAGES", 20),
 
         oss=OSSConfig(
             endpoint=_env("OSS_ENDPOINT"),
@@ -799,6 +814,7 @@ def load_config() -> PipelineConfig:
             ocr_page_rmb=_env_float("REBUILD_COST_PER_PAGE_RMB", 0.06),   # RAG_REBUILD_COST_PER_PAGE_RMB
             vlm_image_rmb=_env_float("REBUILD_COST_PER_IMAGE_RMB", 0.04), # RAG_REBUILD_COST_PER_IMAGE_RMB
             refine_tables=_env_bool("REBUILD_REFINE_TABLES", False),      # RAG_REBUILD_REFINE_TABLES
+            daily_budget_rmb=_env_float("REBUILD_DAILY_BUDGET_RMB", 0.0),  # RAG_REBUILD_DAILY_BUDGET_RMB
         ),
 
         llm=LLMConfig(

@@ -57,6 +57,7 @@ from opensearch_pipeline.pii_patterns import (  # noqa: F401
     ENTITY_SEVERITY,
     REDACTION_MAP,
     SEMANTIC_KEYWORDS,
+    _body_entity_fp_ignore,
     _image_ocr_fp_ignore,
 )
 
@@ -584,6 +585,9 @@ def node_build_canonical(ctx: dict):
                 # P2-32：VLM degraded 兜底图片数（供应商故障）→ 持久化进 canonical JSON 跨 stage
                 # 边界传递；>0 时 node_write_chunk_meta 收尾落 NEEDS_REVIEW（不 DONE）。
                 "vlm_degraded_count": getattr(result, "vlm_degraded_count", 0),
+                # G20：文本归一版本标记（canonical_sha256 建立在归一后文本上；规则变更须
+                # bump NORMALIZATION_VERSION，否则 skip-unchanged/去重把规则漂移误判为内容变更）
+                "normalization_version": None,
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result.doc_id}"
@@ -613,6 +617,26 @@ def node_build_canonical(ctx: dict):
                 ),
             }
 
+        # ── G20：版本化文本归一（哈希/持久化之前；默认 ON，RAG_TEXT_NORMALIZE=false 直通）──
+        # 去零宽 + 全角字母数字折半角 + 折叠连片空行（保守集，全角标点/㈠圈号不动）。
+        # 金集实测全角 token（ＦＣＡ００７３/５秒钟）此前直进 embedding/BM25 与半角查询失配。
+        try:
+            from opensearch_pipeline.text_normalize import (
+                NORMALIZATION_VERSION, normalization_enabled, normalize_text)
+            if normalization_enabled():
+                _nm_text = normalize_text(canonical.get("text") or "")
+                if _nm_text != (canonical.get("text") or ""):
+                    canonical["text"] = _nm_text
+                    canonical["text_length"] = len(_nm_text)
+                if canonical.get("title"):
+                    canonical["title"] = normalize_text(canonical["title"])
+                for _blk in canonical.get("blocks", []) or []:
+                    if isinstance(_blk, dict) and _blk.get("text"):
+                        _blk["text"] = normalize_text(_blk["text"])
+                canonical["normalization_version"] = NORMALIZATION_VERSION
+        except Exception as _nm_err:  # fail-open：归一失败绝不阻断摄取
+            print(f"    ⚠️ text normalize skipped (FAIL-SAFE): {_nm_err}")
+
         # ─── Physical Persistence of Canonical Documents (JSON & MD) ───
         # G#67：canonical JSON 用紧凑分隔符序列化（stage-2 会整包下载解析，indent=2 的缩进空白
         # 会把块级 OCR/VLM 文本体积放大两到四成；人读用旁边的 .md）。ensure_ascii=False 保留。
@@ -624,6 +648,14 @@ def node_build_canonical(ctx: dict):
 
         # L2 canonical-text content hash (computed once; reused by the skip-gate + the RDS UPDATE).
         _canonical_sha256 = hashlib.sha256((md_data or "").encode("utf-8")).hexdigest()
+        # G19：64 位 simhash 指纹（近重复检测；<32 字符视为无指纹，同 _xd_min_chars 先例）
+        _content_simhash = None
+        if md_data and len((md_data or "").strip()) >= 32:
+            try:
+                from opensearch_pipeline.text_similarity import simhash64
+                _content_simhash = simhash64(md_data)
+            except Exception:
+                _content_simhash = None
 
         # perf#92：本篇文档共享一个 DB 连接——skip 判定 SELECT、跨文档去重与最终 canonical-keys
         # UPDATE 同连接同事务（原先三段各开一连接，每篇最多 3 次借还 + 3 次 commit）。惰性获取：
@@ -743,6 +775,49 @@ def node_build_canonical(ctx: dict):
                     print(f"    ⚠️ cross-doc dedup check failed (FAIL-SAFE: processing normally): {_xd_err}")
                     _doc_conn = _rollback_or_discard(_doc_conn)
 
+            # ── G19：simhash 近重复 WARN（默认 ON：RAG_NEAR_DUP_DETECT=false 关闭）──
+            # 精确哈希抓不到"重新导出的同一 SOP"（元数据/微小排版变化）。对现役其他文档
+            # 的 content_simhash 做 Hamming ≤ 阈值（默认 3）比对——只告警不拦截（近重复的
+            # ACL 语义比精确副本微妙，拦截留给人工），与跨文档精确去重 WARN-and-process 一致。
+            # 迁移 020 未应用（1054）/任何异常 → 静默跳过（fail-open）。
+            if (_content_simhash
+                    and os.environ.get("RAG_NEAR_DUP_DETECT", "true").lower() not in ("0", "false", "no")
+                    and not simulate_db):
+                try:
+                    from opensearch_pipeline.text_similarity import hamming64
+                    try:
+                        _nd_thresh = int(os.environ.get("RAG_NEAR_DUP_HAMMING", "3"))
+                    except ValueError:
+                        _nd_thresh = 3
+                    if _doc_conn is None:
+                        _doc_conn = _get_db_conn(select_db=True)
+                    with _doc_conn.cursor() as _nd_cur:
+                        _nd_cur.execute(
+                            "SELECT dv.doc_id, dv.content_simhash "
+                            "FROM document_version dv JOIN document_meta dm ON dv.doc_id=dm.doc_id "
+                            "WHERE dv.content_simhash IS NOT NULL AND dv.doc_id<>%s "
+                            "AND dv.status='active' AND dm.status='active' "
+                            "AND dm.current_version_no=dv.version_no LIMIT 5000",
+                            (canonical["doc_id"],))
+                        _nd_rows = _nd_cur.fetchall() or []
+                    _near = []
+                    for _nd_doc, _nd_sh in _nd_rows:
+                        if _nd_sh is None:
+                            continue
+                        _nd_d = hamming64(int(_nd_sh), _content_simhash)
+                        if _nd_d <= _nd_thresh:
+                            _near.append((_nd_doc, _nd_d))
+                    if _near:
+                        _nd_w = (f"{canonical['doc_id']}: near-duplicate content suspected "
+                                 f"(simhash Hamming≤{_nd_thresh}) with "
+                                 f"{[d for d, _ in _near[:5]]} → WARN, processing normally")
+                        print(f"    ⚠️ {_nd_w}")
+                        ctx.setdefault("validation_warnings", []).append(_nd_w)
+                except Exception as _nd_err:
+                    if "1054" not in str(_nd_err):
+                        print(f"    ⚠️ near-dup check skipped (FAIL-SAFE): {_nd_err}")
+                    _doc_conn = _rollback_or_discard(_doc_conn)
+
             # 1. Write files physically
             if is_simulated_oss:
                 # Local filesystem mock
@@ -782,19 +857,7 @@ def node_build_canonical(ctx: dict):
                     if _doc_conn is None:
                         _doc_conn = _get_db_conn(select_db=True)
                     with _doc_conn.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET canonical_json_key = %s,
-                                canonical_md_key = %s,
-                                checksum_sha256 = %s,
-                                canonical_sha256 = %s,
-                                extraction_status = 'COMPLETED',
-                                ocr_status = %s,
-                                page_count = %s,
-                                text_length = %s,
-                                extract_method = %s
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (
+                        _ck_params = (
                             canonical_key,
                             canonical_md_key,
                             _raw_checksum,
@@ -805,7 +868,36 @@ def node_build_canonical(ctx: dict):
                             canonical.get("extract_method", "native"),
                             canonical["doc_id"],
                             canonical["version_no"]
-                        ))
+                        )
+                        _ck_sql_tail = """
+                                extraction_status = 'COMPLETED',
+                                ocr_status = %s,
+                                page_count = %s,
+                                text_length = %s,
+                                extract_method = %s
+                            WHERE doc_id = %s AND version_no = %s
+                        """
+                        try:
+                            # G19：content_simhash 随 canonical keys 一起落库（迁移 020）
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET canonical_json_key = %s,
+                                    canonical_md_key = %s,
+                                    checksum_sha256 = %s,
+                                    canonical_sha256 = %s,
+                                    content_simhash = %s,""" + _ck_sql_tail,
+                                _ck_params[:4] + (_content_simhash,) + _ck_params[4:])
+                        except Exception as _sh_err:
+                            if "1054" not in str(_sh_err):
+                                raise
+                            # 迁移 020 未应用 → 回退旧列集（fail-open，行为与迁移前一致）
+                            cursor.execute("""
+                                UPDATE document_version
+                                SET canonical_json_key = %s,
+                                    canonical_md_key = %s,
+                                    checksum_sha256 = %s,
+                                    canonical_sha256 = %s,""" + _ck_sql_tail,
+                                _ck_params)
                     _doc_conn.commit()
                     print(f"    ├─ Saved canonical keys to RDS for {canonical['doc_id']} v{canonical['version_no']}")
                 except Exception as e:
@@ -1763,8 +1855,9 @@ def node_detect_sensitive(ctx: dict):
         entity_risk = "low"
 
         # 1. Regex 实体检测（按实体类型分级：电话/邮箱=medium→脱敏保留；身份证/密钥=high→隔离）
+        # G5：_body_entity_fp_ignore 抑制 bank_card 的订单号/物料号 FP（全命中皆锚点上下文才抑制）
         for name, pattern in ENTITY_PATTERNS.items():
-            if re.search(pattern, text):
+            if re.search(pattern, text) and not _body_entity_fp_ignore(name, text):
                 sev = ENTITY_SEVERITY.get(name, "high")
                 hits.append({
                     "type": "ENTITY", "category": name,
@@ -3491,6 +3584,33 @@ def node_chunk_documents(ctx: dict):
             print(f"    └─ {doc['doc_id']}: skipped (quarantined)")
             continue
 
+        # G21 fail-closed：asset ocr_text 的 PII 消费点兜底掩码（默认 ON，
+        # RAG_IMAGE_OCR_PII_FAILCLOSED=false 关闭）。RAG_IMAGE_OCR_PII（node 02/03 的
+        # 检测+脱敏）默认 OFF 且靠 stage2_node setdefault 存续——重部署丢 flag 时，截图里的
+        # 手机号/身份证会原样进入 image_refs/[图片OCR] 合成块并持久化到 chunk_meta/HA3。
+        # 在 chunk 消费点兜底：命中 ENTITY_PATTERNS 的 asset ocr_text 就地掩码（复用
+        # _image_ocr_fp_ignore 物料编码 FP allow-list），与 node 03 就地脱敏幂等（已脱敏
+        # 文本不再命中）。canonical 不改写（canonical_sha256 与跨文档去重/skip-unchanged
+        # 门耦合，改写即破坏哈希语义）；保护随每轮 chunk 消费重建，不依赖 flag 存续。
+        if os.environ.get("RAG_IMAGE_OCR_PII_FAILCLOSED", "true").lower() not in ("0", "false", "no"):
+            _g21_scrubbed = 0
+            for _asset in doc.get("assets", []) or []:
+                _oc = _asset.get("ocr_text")
+                if not _oc:
+                    continue
+                _new = _oc
+                for _pii_name, _pii_pat in ENTITY_PATTERNS.items():
+                    _rep = REDACTION_MAP.get(_pii_name)
+                    if not _rep or _image_ocr_fp_ignore(_pii_name, _oc):
+                        continue
+                    _new = re.sub(_pii_pat, _rep, _new)
+                if _new != _oc:
+                    _asset["ocr_text"] = _new
+                    _g21_scrubbed += 1
+            if _g21_scrubbed:
+                print(f"    ├─ [pii-failclosed] {doc['doc_id']}: {_g21_scrubbed} 个图片 OCR "
+                      f"文本命中 PII，已在消费点掩码（node 03 flag 未生效的兜底）")
+
         text = doc.get("redacted_text") or doc["text"]
         
         # 动态参数匹配
@@ -4381,6 +4501,124 @@ def node_chunk_documents(ctx: dict):
     ctx["chunks"] = all_chunks
 
 
+def _chunk_text_gibberish(text: str) -> bool:
+    """G25：chunk 级乱码判定（保守，纯字符统计）。
+
+    验证器此前只查 空/长度/doc_id——文本层乱码块（坏字体 PUA、latin-1 mojibake、
+    二进制串）直通向量。判 True 的两个独立信号：
+      1. U+FFFD/PUA 密度 >10%；
+      2. 有效字符（CJK/ASCII 字母数字/CJK 标点/全半角）占比 <0.40——分母排除
+         markdown 表格结构符与常见标点，避免管道符密集的表格块误伤。
+    """
+    stripped = "".join(text.split())
+    if not stripped:
+        return False  # 空文本由 empty_text 检查负责
+    junk = good = 0
+    denom = 0
+    _STRUCT_CHARS = set("|-+*#=~_.:,;()[]{}<>/\\\"'`!?%&@^$（）【】《》。，、：；！？·…—")
+    for ch in stripped:
+        cp = ord(ch)
+        if cp == 0xFFFD or 0xE000 <= cp <= 0xF8FF:
+            junk += 1
+            denom += 1
+            continue
+        if ch in _STRUCT_CHARS:
+            continue  # 结构符不进分母（表格/列表的管道横线不该稀释有效占比）
+        denom += 1
+        if (0x30 <= cp <= 0x39 or 0x41 <= cp <= 0x5A or 0x61 <= cp <= 0x7A
+                or 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF
+                or 0x3000 <= cp <= 0x303F or 0xFF00 <= cp <= 0xFFEF
+                or cp == 0x20):
+            good += 1
+    if junk / max(len(stripped), 1) > 0.10:
+        return True
+    if denom < 20:
+        return False  # 样本太小不判（短表格行/纯符号行交给其他检查）
+    return good / denom < 0.40
+
+
+_SENTENCE_FINAL = tuple("。！？；：.!?…”\"）)]】》>|")
+
+
+def _batch_quality_metrics(valid, invalid) -> dict:
+    """G22：本批 chunk 内容质量轻量指标（纯 Python，零 API/IO）。
+
+    这是离线 L6 全量评测的日常哨兵版：不替代 L6（那边有 GT/CI/HA3 对账），
+    只保证坏 PDF 批次当天可见而不是等下次发布门。
+    """
+    from datetime import datetime, timedelta, timezone
+    type_dist: dict = {}
+    tokens: list = []
+    midcut = 0
+    text_like = 0
+    for c in valid:
+        ct = getattr(c, "chunk_type", "") or "unknown"
+        type_dist[ct] = type_dist.get(ct, 0) + 1
+        tokens.append(int(getattr(c, "token_count", 0) or 0))
+        if ct in ("text_chunk", "clause_chunk", "faq_chunk", "step_card"):
+            text_like += 1
+            tail = (getattr(c, "chunk_text", "") or "").rstrip()
+            if tail and not tail.endswith(_SENTENCE_FINAL):
+                midcut += 1
+    tokens.sort()
+
+    def _pct(p):
+        return tokens[min(len(tokens) - 1, int(len(tokens) * p))] if tokens else 0
+
+    gib = sum(1 for inv in invalid if "gibberish_text" in (inv.get("issues") or []))
+    return {
+        "stat_date": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"),
+        "doc_count": len({getattr(c, "doc_id", "") for c in valid}),
+        "chunk_total": len(valid) + len(invalid),
+        "chunk_invalid": len(invalid),
+        "gibberish_cnt": gib,
+        "midcut_rate": round(midcut / text_like, 4) if text_like else 0.0,
+        "p50_tokens": _pct(0.50),
+        "p95_tokens": _pct(0.95),
+        "type_dist_json": json.dumps(type_dist, ensure_ascii=False)[:1024],
+    }
+
+
+def _persist_ingest_quality(ctx: dict, metrics: dict) -> None:
+    """G22：批次质量指标落库 + 阈值告警。全程 fail-open（表未建/RDS 不可达仅日志）。"""
+    if os.environ.get("RAG_INGEST_QUALITY_METRICS", "true").lower() in ("0", "false", "no"):
+        return
+    # 阈值告警先于落库（落库失败也要报）
+    try:
+        inv_ratio = metrics["chunk_invalid"] / max(metrics["chunk_total"], 1)
+        midcut_alert = float(os.environ.get("RAG_INGEST_QUALITY_MIDCUT_ALERT", "0.25"))
+        invalid_alert = float(os.environ.get("RAG_INGEST_QUALITY_INVALID_ALERT", "0.10"))
+        if metrics["midcut_rate"] > midcut_alert or inv_ratio > invalid_alert:
+            from opensearch_pipeline.alerting import send_ops_alert
+            send_ops_alert(
+                "摄取批次质量告警",
+                f"midcut_rate={metrics['midcut_rate']:.2%} (阈 {midcut_alert:.0%}) · "
+                f"invalid={metrics['chunk_invalid']}/{metrics['chunk_total']} "
+                f"(阈 {invalid_alert:.0%}) · gibberish={metrics['gibberish_cnt']} · "
+                f"docs={metrics['doc_count']}",
+                severity="warning")
+    except Exception:
+        pass
+    if _resolve_simulate(ctx, "db"):
+        return
+    try:
+        conn = _get_db_conn(select_db=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ingest_quality_metrics (stat_date, doc_count, chunk_total, "
+                    "chunk_invalid, gibberish_cnt, midcut_rate, p50_tokens, p95_tokens, "
+                    "type_dist_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (metrics["stat_date"], metrics["doc_count"], metrics["chunk_total"],
+                     metrics["chunk_invalid"], metrics["gibberish_cnt"], metrics["midcut_rate"],
+                     metrics["p50_tokens"], metrics["p95_tokens"], metrics["type_dist_json"]))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as _iq_err:
+        print(f"    ⚠️ ingest_quality_metrics write skipped (fail-open): {_iq_err}")
+
+
 def node_validate_chunks(ctx: dict):
     """校验 chunk 质量。"""
     chunks = ctx.get("chunks", [])
@@ -4399,6 +4637,8 @@ def node_validate_chunks(ctx: dict):
             issues.append("too_many_tokens")
         if not chunk.doc_id:
             issues.append("missing_doc_id")
+        if not issues and _chunk_text_gibberish(chunk.chunk_text):
+            issues.append("gibberish_text")
 
         if issues:
             invalid.append({"chunk_id": chunk.chunk_id, "issues": issues})
@@ -4436,6 +4676,15 @@ def node_validate_chunks(ctx: dict):
 
     ctx["valid_chunks"] = valid
     ctx["invalid_chunks"] = invalid
+
+    # G22：per-batch 内容质量指标（落 ingest_quality_metrics + 阈值告警；fail-open）
+    try:
+        _iq = _batch_quality_metrics(valid, invalid)
+        ctx["ingest_quality_metrics"] = _iq
+        if valid or invalid:
+            _persist_ingest_quality(ctx, _iq)
+    except Exception as _iq_e:
+        print(f"    ⚠️ batch quality metrics skipped (fail-open): {_iq_e}")
 
     print(f"    └─ Valid: {len(valid)}, Invalid: {len(invalid)}")
     for inv in invalid[:3]:
@@ -6778,16 +7027,12 @@ def node_update_index_status(ctx: dict):
 
                 # 回写 embedding 失败的 chunk（不在任何 batch 中）为 FAILED：
                 # 下轮 loader 按 index_status IN ('NOT_INDEXED','FAILED') 重新加载并重试。
-                # E#38：SET 值全同 → 合并为 chunk_id IN (...)（每 1000 个 id 一条）。
+                # G9：带重试预算——持续 embedding 失败的毒 chunk 达上限转 DEAD 死信 +
+                # 文档 NEEDS_REVIEW，不再每轮占用 loader 队头。
                 _emb_failed_ids = [c.chunk_id for c in embedding_failed_chunks]
-                for _i in range(0, len(_emb_failed_ids), 1000):
-                    _ef_sub = _emb_failed_ids[_i:_i + 1000]
-                    _ef_ph = ",".join(["%s"] * len(_ef_sub))
-                    cursor.execute(f"""
-                        UPDATE chunk_meta
-                        SET embedding_status = 'FAILED', index_status = '{ChunkIndexStatus.FAILED}'
-                        WHERE chunk_id IN ({_ef_ph})
-                    """, _ef_sub)
+                _emb_dead = _fail_chunks_with_retry_budget(
+                    cursor, _emb_failed_ids, extra_set_sql=", embedding_status = 'FAILED'")
+                _mark_docs_needs_review_for_dead(cursor, _emb_dead)
 
                 # If there are failed doc versions, update their document_version status to 'FAILED'
                 if failed_doc_versions:
@@ -6846,6 +7091,82 @@ def _parity_content_hash(text) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _stage3_chunk_max_retries() -> int:
+    try:
+        return int(os.environ.get("RAG_STAGE3_CHUNK_MAX_RETRIES", "3"))
+    except ValueError:
+        return 3
+
+
+def _fail_chunks_with_retry_budget(cursor, chunk_ids, extra_set_sql="", extra_params=(),
+                                   expect_all=False):
+    """G9：chunk 级失败回写 + 重试预算。返回本次转 DEAD 的 chunk_id 列表。
+
+    index_retry_count +1；达上限（RAG_STAGE3_CHUNK_MAX_RETRIES，默认 3）→
+    index_status='DEAD'（死信，不再被 loader 重选——消除毒 chunk 队头阻塞整轮
+    drain），否则 'FAILED'（照旧重选）。MySQL SET 从左到右求值：IF 判断读到的是
+    +1 后的新值。迁移 019 未应用（1054 未知列）→ 回退旧 SQL（无计数/无 DEAD，
+    行为与迁移前一致，fail-open）。expect_all=True 时 rowcount 不符即 raise
+    （沿用 parity 全有或全无语义，由调用方 rollback）。
+    """
+    if not chunk_ids:
+        return []
+    max_r = _stage3_chunk_max_retries()
+    dead_ids: list = []
+    for _i in range(0, len(chunk_ids), 1000):
+        sub = list(chunk_ids[_i:_i + 1000])
+        ph = ",".join(["%s"] * len(sub))
+        try:
+            cursor.execute(
+                f"UPDATE chunk_meta SET index_retry_count = index_retry_count + 1, "
+                f"index_status = IF(index_retry_count >= %s, "
+                f"'{ChunkIndexStatus.DEAD}', '{ChunkIndexStatus.FAILED}')"
+                f"{extra_set_sql} WHERE chunk_id IN ({ph})",
+                [max_r] + list(extra_params) + sub,
+            )
+            _rc = getattr(cursor, "rowcount", None)
+            if expect_all and isinstance(_rc, int) and _rc != len(sub):
+                raise RuntimeError(
+                    f"state-persistence failure: marked {_rc} of {len(sub)} chunk_meta rows")
+            cursor.execute(
+                f"SELECT chunk_id FROM chunk_meta WHERE chunk_id IN ({ph}) "
+                f"AND index_status='{ChunkIndexStatus.DEAD}'", sub)
+            dead_ids.extend(r[0] for r in (cursor.fetchall() or []))
+        except Exception as _e:
+            if "1054" in str(_e) or "index_retry_count" in str(_e).lower():
+                cursor.execute(
+                    f"UPDATE chunk_meta SET index_status='{ChunkIndexStatus.FAILED}'"
+                    f"{extra_set_sql} WHERE chunk_id IN ({ph})",
+                    list(extra_params) + sub,
+                )
+                _rc = getattr(cursor, "rowcount", None)
+                if expect_all and isinstance(_rc, int) and _rc != len(sub):
+                    raise RuntimeError(
+                        f"state-persistence failure: marked {_rc} of {len(sub)} chunk_meta rows")
+            else:
+                raise
+    return dead_ids
+
+
+def _mark_docs_needs_review_for_dead(cursor, dead_chunk_ids):
+    """G9：DEAD 死信 chunk 所属文档版本置 NEEDS_REVIEW（人工可见，不再自动重试）。"""
+    if not dead_chunk_ids:
+        return
+    ph = ",".join(["%s"] * len(dead_chunk_ids))
+    cursor.execute(
+        f"SELECT DISTINCT doc_id, version_no FROM chunk_meta WHERE chunk_id IN ({ph})",
+        list(dead_chunk_ids))
+    for _doc_id, _ver in (cursor.fetchall() or []):
+        cursor.execute(
+            "UPDATE document_version SET chunk_status='NEEDS_REVIEW', "
+            "content_process_error=%s WHERE doc_id=%s AND version_no=%s",
+            (f"stage-3 poison chunk(s) exhausted retry budget → DEAD letter "
+             f"(max={_stage3_chunk_max_retries()}); fix & reset to NOT_INDEXED to requeue",
+             _doc_id, _ver))
+        print(f"    🚨 [DEAD-LETTER] {_doc_id} v{_ver}: 毒 chunk 达重试上限转 DEAD，"
+              f"文档置 NEEDS_REVIEW（不再阻塞后续 drain）")
+
+
 def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, max_retries,
                                      drift_chunks=None):
     """把校验失败的 chunk 写回 chunk_meta.index_status='FAILED' 后 raise，阻断
@@ -6882,23 +7203,29 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cursor:
+            _all_dead: list = []
             for chunks, code, msg in buckets:
                 if not chunks:
                     continue
                 ids = [c.chunk_id for c in chunks]
-                placeholders = ",".join(["%s"] * len(ids))
-                cursor.execute(
-                    f"UPDATE chunk_meta SET index_status='{ChunkIndexStatus.FAILED}', index_error_code=%s, "
-                    f"index_error_message=%s WHERE chunk_id IN ({placeholders})",
-                    [code, msg] + ids,
-                )
-                if cursor.rowcount != len(ids):
+                # G9：FAILED 回写带重试预算——达上限转 DEAD 死信（不再被 loader 重选，
+                # 消除毒 chunk 每轮重推→校验失败→raise 的队头阻塞）。全有或全无语义保留
+                # （expect_all；rowcount 不符 → raise → 下方 rollback）。
+                try:
+                    _dead = _fail_chunks_with_retry_budget(
+                        cursor, ids,
+                        extra_set_sql=", index_error_code=%s, index_error_message=%s",
+                        extra_params=[code, msg], expect_all=True)
+                except RuntimeError as _pe:
                     conn.rollback()
                     raise RuntimeError(
-                        f"PARITY state-persistence failure: marked {cursor.rowcount} of "
-                        f"{len(ids)} chunk_meta rows FAILED ({code}); rolled back to avoid a "
-                        f"partial write that strands INDEXED-but-absent chunks (never re-selected)."
-                    )
+                        f"PARITY {_pe} ({code}); rolled back to avoid a partial write "
+                        f"that strands INDEXED-but-absent chunks (never re-selected).") from _pe
+                _all_dead.extend(_dead)
+                for c in chunks:
+                    if c.chunk_id in set(_dead):
+                        c.index_status = ChunkIndexStatus.DEAD
+            _mark_docs_needs_review_for_dead(cursor, _all_dead)
         conn.commit()
     except Exception:
         if conn:

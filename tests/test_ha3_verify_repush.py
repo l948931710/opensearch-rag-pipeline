@@ -120,9 +120,18 @@ class FakeCursor:
 
     def execute(self, sql, params=None):
         self.executed.append((sql, list(params) if params else []))
-        # 真实 UPDATE: params = [code, msg, id1, id2, ...] → 改动行 = len(ids)
-        self.rowcount = self._override if self._override is not None else (
-            max(0, len(params) - 2) if params else 0)
+        # 真实 UPDATE（G9 后）: params = [max_retries, code, msg, id1, ...] → 改动行 = len(ids)；
+        # 旧 SQL（迁移 019 前）: params = [code, msg, id1, ...]。按 SQL 是否含重试列取前缀数。
+        if self._override is not None:
+            self.rowcount = self._override
+        elif params and "UPDATE" in sql.upper():
+            _prefix = 3 if "index_retry_count" in sql else 2
+            self.rowcount = max(0, len(params) - _prefix)
+        else:
+            self.rowcount = 0
+
+    def fetchall(self):
+        return []  # G9 DEAD-detection SELECT：假 cursor 无死信行
 
     def __enter__(self):
         return self
@@ -250,7 +259,7 @@ def test_persistent_drop_raises_and_persists(monkeypatch):
     assert chunks[1].index_error_code == "PARITY_DROP"
     assert conn.committed and not conn.rolled_back
     upd = [e for e in conn.cur.executed if "UPDATE chunk_meta" in e[0]]
-    assert len(upd) == 1 and upd[0][1][0] == "PARITY_DROP"
+    assert len(upd) == 1 and upd[0][1][1] == "PARITY_DROP"   # params=[max_retries, code, msg, *ids] (G9)
     assert ("doc1", 2) in ctx["failed_doc_versions"]
 
 
@@ -339,7 +348,7 @@ def test_drop_and_unknown_coexist_two_updates(monkeypatch):
         pn.node_verify_and_repush(ctx)
     upd = [e for e in conn.cur.executed if "UPDATE chunk_meta" in e[0]]
     assert len(upd) == 2                        # 两组分开写，保留故障分类
-    codes = [e[1][0] for e in upd]
+    codes = [e[1][1] for e in upd]   # params=[max_retries, code, msg, *ids] (G9)
     assert codes == ["PARITY_DROP", "PARITY_UNKNOWN"]
     assert conn.committed
     assert chunks[1].index_error_code == "PARITY_DROP"     # rds_id 11
@@ -403,7 +412,7 @@ def test_drift_persistent_raises_parity_drift(monkeypatch):
         pn.node_verify_and_repush(ctx)
     assert chunks[1].index_error_code == "PARITY_DRIFT"
     upd = [e for e in conn.cur.executed if "UPDATE chunk_meta" in e[0]]
-    assert any(e[1][0] == "PARITY_DRIFT" for e in upd)
+    assert any(e[1][1] == "PARITY_DRIFT" for e in upd)   # params=[max_retries, code, msg, *ids] (G9)
     assert conn.committed
     assert ("doc1", 2) in ctx["failed_doc_versions"]
 

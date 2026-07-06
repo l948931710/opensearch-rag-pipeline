@@ -14,6 +14,8 @@
 `RAG_ENV=local`（localhost + simulate off）的本地真实库集成测试也照常放行。
 """
 
+import os
+
 import pytest
 
 from tests.local_stack import ensure_local_db_wired, ensure_local_opensearch_wired
@@ -118,6 +120,19 @@ def _dummy_llm_key_in_simulate(monkeypatch):
         llm = getattr(cfg, "llm", None)
         if llm is not None and not getattr(llm, "api_key", ""):
             monkeypatch.setattr(llm, "api_key", "test-dummy-key", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _ocr_page_cache_off(monkeypatch):
+    """G8 OCR 页缓存在测试套件里默认关闭。
+
+    缓存键=模型+渲染字节 sha256——多个 OCR 测试用相同的合成页字节 + 相同桩模型名，
+    默认开缓存会让后跑的测试命中先跑测试写下的条目（如"本页应 FAILED"却拿到缓存
+    DONE 文本），且往仓库 scratch/ 落 sqlite。专门的缓存行为测试显式 setenv true
+    + chdir(tmp_path) 隔离；monkeypatch 自动还原，无跨测试泄漏。"""
+    if os.environ.get("RAG_OCR_PAGE_CACHE") is None:
+        monkeypatch.setenv("RAG_OCR_PAGE_CACHE", "false")
     yield
 
 

@@ -472,10 +472,14 @@ def _kb_reason_labels(reason: str) -> List[str]:
     return out
 
 
-# P1-09：PDF 原生抽取页上限（治理看板「截断文档数」判据）。须与
-# extraction.unified_extractor.PDF_NATIVE_MAX_PAGES 一致；此处独立定义避免把重抽取依赖
-# 拖进 serving 进程（F-A1 拆分意图）。改动上限时两处同步。
-_PDF_NATIVE_MAX_PAGES = 20
+# P1-09：PDF 原生抽取页上限（治理看板「截断文档数」判据）。与抽取侧共用同一
+# config 值（G2 env 化：RAG_PDF_NATIVE_MAX_PAGES），消除此前双处硬编码漂移风险；
+# 经 config 读取而非 import extraction，保持 serving 进程不拖重抽取依赖（F-A1 拆分意图）。
+
+
+def _pdf_native_max_pages() -> int:
+    from opensearch_pipeline.config import get_config
+    return int(getattr(get_config(), "pdf_native_max_pages", 200) or 200)
 
 # 看板聚合 TTL 缓存（性能第一梯队 #6）：insights/governance 每请求现算 4-14 条聚合
 # 子查询（含 JSON_TABLE 跨库 JOIN），30 天窗口对分钟级 staleness 完全不敏感。
@@ -1363,15 +1367,15 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             except Exception as e:
                 fails += 1; logger.warning("kb_governance dual_version 失败: %s", e)
             # 2b) PDF 页上限截断（P1-09）：现役文档的当前版本是 PDF 且真实总页数 > 原生抽取上限，
-            #     即「仅前 N 页上线」的文档——21 页起的内容既无原生文本也未进 OCR，静默丢知识。
-            #     上限值须与 extraction.unified_extractor.PDF_NATIVE_MAX_PAGES 保持一致（当前 20）。
+            #     即「仅前 N 页上线」的文档——超限页的内容既无原生文本也未进 OCR，静默丢知识。
+            #     上限值与抽取侧共用 config.pdf_native_max_pages（G2 env 化）。
             try:
                 cur.execute(
                     f"SELECT COUNT(*) FROM {_kb_db()}.document_meta m"
                     f" JOIN {_kb_db()}.document_version v"
                     "   ON v.doc_id=m.doc_id AND v.version_no=m.current_version_no"
                     " WHERE m.status='active' AND v.file_ext='pdf' AND v.page_count > %s",
-                    (_PDF_NATIVE_MAX_PAGES,))
+                    (_pdf_native_max_pages(),))
                 out.pdf_truncated_docs = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance pdf_truncated 失败: %s", e)

@@ -54,26 +54,25 @@ from opensearch_pipeline.pii_patterns import ENTITY_PATTERNS
 REDACTION_VERSION = "redact-v2"
 
 # ── structural PII patterns ─────────────────────────────────────
+# G5（2026-07-06）：bank_card/uscc/address/masked_id 的模式定义已上移到 pii_patterns
+# （单一权威，摄取门与本模块共用）；本模块保留别名不改下方引用点。
 # Full national ID (18 consecutive digits, date-structured) — from the canonical source.
 _FULL_ID = ENTITY_PATTERNS["cn_id_card"]
 # Partial-masked identifier: digits + 2+ mask glyphs + digits (masked ID / card / phone).
-_PARTIAL_ID = r"(?<![\dA-Za-z])\d{3,4}[\*＊✱•·∗●]{2,}[\dXx]{3,4}(?![\dA-Za-z])"
+_PARTIAL_ID = ENTITY_PATTERNS["masked_id"]
 _MOBILE = ENTITY_PATTERNS["cn_mobile"]
 _EMAIL = ENTITY_PATTERNS["email"]
 _ACCESS_KEY = ENTITY_PATTERNS["access_key"]
 _SECRET = ENTITY_PATTERNS["secret_like"]
 # Bank card: 16–19 digit run NOT embedded in a longer alnum token (so a USCC that
 # ends in a check-letter is never half-matched, leaking the trailing char — v1 bug).
-_BANK_CARD = r"(?<![\dA-Za-z])\d{16,19}(?![\dA-Za-z])"
+_BANK_CARD = ENTITY_PATTERNS["bank_card"]
 # Unified Social Credit Code (company id): 18 upper-alnum, digit-led. Institutional,
 # not personal PII, but redacted as a whole token so the trailing check char can't
 # leak (the v1 bug where bank_card matched only the digit run and left a stray letter).
-_USCC = r"(?<![\dA-Za-z])\d[0-9A-HJ-NP-Z]{17}(?![\dA-Za-z])"
+_USCC = ENTITY_PATTERNS["uscc"]
 # Residential/mailing address: city/district + a road component + a number + 号.
-_ADDRESS = (r"[一-龥]{2,8}(?:市|区|县|自治州|地区)"
-            r"[一-龥0-9（）()]{0,22}?"
-            r"(?:路|街|大道|大街|巷|弄|村|镇|乡|新村|小区|段)"
-            r"[一-龥0-9（）()]{0,15}?\d{1,5}号")
+_ADDRESS = ENTITY_PATTERNS["address"]
 
 # Order matters: most-specific first; USCC before bank_card; full-id before partial.
 _REDACT_ORDER: List[Tuple[str, str]] = [

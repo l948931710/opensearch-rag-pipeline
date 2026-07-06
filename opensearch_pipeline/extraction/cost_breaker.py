@@ -35,6 +35,67 @@ UNIT_VLM_IMAGE = "vlm_image"   # 嵌入式图片：每张一次 VLM (+OCR) 调�
 # 恰好等于上限的预留不应被误拒。
 _BUDGET_EPS = 1e-6
 
+# ── G8：跨进程日累计账本（RDS rag_runtime_contract 共享 KV，schema/018 已建）──
+# 进程内 run_budget 的已记录限制："多个 orchestrator 实例并发运行时各自独立计数"。
+# 账本键按北京业务日滚动；所有账本操作 fail-open（RDS 不可达/模拟模式 → 回退
+# 纯进程内行为），账本只做"日上限"的附加闸，绝不放松既有三道闸。
+_LEDGER_KEY_PREFIX = "vlm_cost_rmb:"
+
+
+def _beijing_date_str() -> str:
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def _ledger_key() -> str:
+    return f"{_LEDGER_KEY_PREFIX}{_beijing_date_str()}"
+
+
+def _ledger_read_today() -> Optional[float]:
+    """读取今日累计花费（RMB）。None = 账本不可用（fail-open）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        if get_config().simulate_db:
+            return None
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn(select_db=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT contract_value FROM rag_runtime_contract WHERE contract_key=%s",
+                    (_ledger_key(),))
+                row = cur.fetchone()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[CostBreaker] daily ledger read unavailable (fail-open): %s", e)
+        return None
+
+
+def _ledger_add(amount_rmb: float) -> None:
+    """今日账本累加（可为负=退款）。失败静默（fail-open）。"""
+    if abs(amount_rmb) < _BUDGET_EPS:
+        return
+    try:
+        from opensearch_pipeline.config import get_config
+        if get_config().simulate_db:
+            return
+        from opensearch_pipeline.pipeline_nodes import _get_db_conn
+        conn = _get_db_conn(select_db=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO rag_runtime_contract (contract_key, contract_value) "
+                    "VALUES (%s, %s) ON DUPLICATE KEY UPDATE contract_value = "
+                    "CAST(GREATEST(0, ROUND(CAST(contract_value AS DECIMAL(14,4)) + %s, 4)) AS CHAR)",
+                    (_ledger_key(), f"{max(0.0, amount_rmb):.4f}", amount_rmb))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[CostBreaker] daily ledger add skipped (fail-open): %s", e)
+
 
 @dataclass
 class CostEstimate:
@@ -144,6 +205,18 @@ class CostBreaker:
             return False, gate_reason
 
         rb = self.cfg.rebuild
+
+        # 闸 4（G8）：跨进程日累计预算（共享账本，锁外读——账本本就是跨实例弱一致，
+        # 轻微超冲可接受；账本不可用 → 跳过本闸，进程内三道闸照常）。
+        daily_cap = float(getattr(rb, "daily_budget_rmb", 0.0) or 0.0)
+        if daily_cap > 0:
+            spent_today = _ledger_read_today()
+            if spent_today is not None and spent_today + est.est_cost_rmb > daily_cap + _BUDGET_EPS:
+                with self._lock:
+                    self._doc_denied += 1
+                return False, (
+                    f"DAILY budget exhausted (shared ledger): today {spent_today:.2f} "
+                    f"+ {est.est_cost_rmb:.2f} > daily cap {daily_cap:.2f} RMB")
         with self._lock:
             if self._run_tripped:
                 self._doc_denied += 1
@@ -172,7 +245,9 @@ class CostBreaker:
             self._doc_allowed += 1
             if self._run_total_rmb >= rb.run_budget_rmb:
                 self._run_tripped = True
-            return True, None
+        # G8：预留成功 → 记入共享日账本（锁外 IO；fail-open）
+        _ledger_add(est.est_cost_rmb)
+        return True, None
 
     def refund(self, doc_id: str, est: CostEstimate) -> None:
         """退还一笔已预留但未实际花费的预算 (渲染失败/无重建块/表格全被拒)。
@@ -193,6 +268,8 @@ class CostBreaker:
             # 退还后回落到上限之下 → 解除熔断 (反映真实可用预算)
             if self._run_tripped and self._run_total_rmb < self.cfg.rebuild.run_budget_rmb:
                 self._run_tripped = False
+        # G8：共享日账本同步退款（锁外 IO；fail-open）
+        _ledger_add(-amount)
 
     def check(self, doc_id: str, est: CostEstimate) -> Tuple[bool, Optional[str]]:
         """只读预判 (不修改任何计数器)：判断该文档此刻是否会被放行。
