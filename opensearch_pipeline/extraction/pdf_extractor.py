@@ -261,14 +261,27 @@ def _pass2_extract_page(
     # 有框表格的行为；text 策略更易误判，故加 2×2 + 单元格填充率(≥0.3) 合理性闸，过闸才接受。fail-open。
     _detect_label = "pdfplumber_lines"
     if not tables:
+        # G3 前置守卫：双栏正文页的左右栏词网格会被 text 策略误判成"表格"
+        # （整页并成一张假表、两栏内容按行交错进单元格）。检出列分隔即跳过
+        # text 策略，让正文走 Step 3/4 的分栏合行路径。
+        _col_guard = None
         try:
-            _cand = cropped.find_tables(table_settings={
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-                "snap_tolerance": 4,
-            })
+            _fw = [w for w in cropped.extract_words(x_tolerance=3, y_tolerance=3)
+                   if w.get("upright", True)]
+            _col_guard = _detect_column_split(_fw, page_width)
         except Exception:
+            _col_guard = None
+        if _col_guard is not None:
             _cand = []
+        else:
+            try:
+                _cand = cropped.find_tables(table_settings={
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                    "snap_tolerance": 4,
+                })
+            except Exception:
+                _cand = []
         _accepted = []
         for _t in _cand:
             try:
@@ -321,6 +334,10 @@ def _pass2_extract_page(
                     "detected_by": _detect_label,
                     "y0": float(table.bbox[1]),
                     "y1": float(table.bbox[3]),
+                    # G11：跨页表格拼接需要 x-span 做同表判定（additive，勿删）
+                    "x0": float(table.bbox[0]),
+                    "x1": float(table.bbox[2]),
+                    "page_height": float(page_height),
                 },
             ))
 
@@ -363,7 +380,18 @@ def _pass2_extract_page(
     if not non_table_words:
         return blocks, warnings
 
-    lines = _group_words_into_lines(non_table_words, y_tolerance=4)
+    # G3：双栏页先分栏再合行（先左栏后右栏），否则同 y 的左右栏文字会被逐词交错。
+    _split_x = _detect_column_split(non_table_words, page_width)
+    if _split_x is not None:
+        _left = [w for w in non_table_words
+                 if (float(w["x0"]) + float(w["x1"])) / 2 < _split_x]
+        _right = [w for w in non_table_words
+                  if (float(w["x0"]) + float(w["x1"])) / 2 >= _split_x]
+        lines = (_group_words_into_lines(_left, y_tolerance=4)
+                 + _group_words_into_lines(_right, y_tolerance=4))
+        warnings.append(f"[MULTI_COLUMN] page {page_num}: two-column layout split at x={_split_x:.0f}")
+    else:
+        lines = _group_words_into_lines(non_table_words, y_tolerance=4)
 
     # ── Step 5: 对每行做 heading 检测 + 生成 blocks ──
     # buffer 记录 (text, top, bottom)：段落块携带 y 区间（extra.y0/y1），
@@ -496,6 +524,145 @@ def _pass2_extract_page(
 
     _flush_paragraph()
     return blocks, warnings
+
+
+def _detect_column_split(words: list, page_width: float) -> Optional[float]:
+    """G3：双栏页 x-gap 列检测。返回分栏线 x 坐标，单栏页返回 None。
+
+    此前全页按 (top, x0) 全局排序合行——双栏页左右两栏同一 y 的文字被逐词交错，
+    正文语序完全破坏后静默入索引。判定（全部满足，保守方向，误判成本高）：
+      1. 页面中部 30%-70% 区间存在宽 ≥20pt 的纵向空隙，无任何词横跨；
+      2. 空隙两侧各承载 ≥25% 的词量（排除"窄栏批注/行首缩进"形态）；
+      3. 两侧文字的纵向范围重叠 ≥60%（真正并排，而非上下两段错位）。
+    检出后先左栏后右栏分别合行。三栏及以上不处理（本语料不存在）。
+    """
+    if len(words) < 30 or page_width <= 0:
+        return None
+    spans = [(float(w["x0"]), float(w["x1"]), float(w["top"]), float(w["bottom"]))
+             for w in words]
+    step = 2.0
+    lo, hi = page_width * 0.30, page_width * 0.70
+    # 逐候选位置检测"无词横跨"，聚合成连续空隙区间
+    gap_runs: List[Tuple[float, float]] = []
+    run_start = None
+    x = lo
+    while x <= hi:
+        straddled = any(s0 < x < s1 for s0, s1, _, _ in spans)
+        if not straddled:
+            if run_start is None:
+                run_start = x
+        elif run_start is not None:
+            gap_runs.append((run_start, x - step))
+            run_start = None
+        x += step
+    if run_start is not None:
+        gap_runs.append((run_start, hi))
+
+    for g0, g1 in sorted(gap_runs, key=lambda r: r[1] - r[0], reverse=True):
+        if g1 - g0 < 20:
+            continue
+        split = (g0 + g1) / 2
+        left = [s for s in spans if (s[0] + s[1]) / 2 < split]
+        right = [s for s in spans if (s[0] + s[1]) / 2 >= split]
+        n = len(spans)
+        if len(left) / n < 0.25 or len(right) / n < 0.25:
+            continue
+        l_top, l_bot = min(s[2] for s in left), max(s[3] for s in left)
+        r_top, r_bot = min(s[2] for s in right), max(s[3] for s in right)
+        overlap = min(l_bot, r_bot) - max(l_top, r_top)
+        min_extent = min(l_bot - l_top, r_bot - r_top)
+        if min_extent <= 0 or overlap / min_extent < 0.6:
+            continue
+        return split
+    return None
+
+
+def _md_table_cols(table_md: str) -> int:
+    """markdown pipe 表首行列数（"| a |  | c |" → 3）。"""
+    first = table_md.split("\n", 1)[0]
+    parts = first.split("|")
+    return max(0, len(parts) - 2)
+
+
+def _norm_row(row: str) -> str:
+    return re.sub(r"\s+", "", row)
+
+
+def _stitch_cross_page_tables(blocks: List[ExtractedBlock]) -> Tuple[List[ExtractedBlock], int]:
+    """G11：跨页表格规则拼接。
+
+    此前严格逐页出表，续表丢表头且行列结构断裂（检索侧 ±1 邻块拼接不恢复结构）。
+    拼接条件（全部满足才并，保守方向；Azure DI 公开的启发式同款思路）：
+      1. 页 N 的最后一张表是"页尾表"：其下方无正文块（y0 > 表 y1+5pt 视为下方）；
+      2. 页 N+1 的第一张表是"页首表"：其上方无正文块；
+      3. 两表列数相等；
+      4. x-span 重叠 ≥80%（同一张表在版面上水平对齐）。
+    并表时若续表首行与主表首行文本一致（重复打印的表头）则剥离。链式处理支持
+    3 页以上长表。任何页缺表/条件不满足 → 完全不动（byte-equal 回归安全）。
+    """
+    stitched = 0
+    # 按页聚块（blocks 页间有序；页内表先文后，用 y 判位置）
+    pages = sorted({b.page_num for b in blocks if b.page_num})
+    by_page: Dict[int, List[ExtractedBlock]] = {p: [] for p in pages}
+    for b in blocks:
+        if b.page_num:
+            by_page[b.page_num].append(b)
+
+    def _tables(p):
+        return [b for b in by_page.get(p, []) if b.block_type == "table"
+                and isinstance(b.extra, dict) and "x0" in b.extra]
+
+    def _texts(p):
+        return [b for b in by_page.get(p, [])
+                if b.block_type in ("paragraph", "heading", "list")]
+
+    to_drop: set = set()
+    for p in pages:
+        if p + 1 not in by_page:
+            continue
+        tails = _tables(p)
+        heads = _tables(p + 1)
+        if not tails or not heads:
+            continue
+        tail = max(tails, key=lambda b: b.extra.get("y1", 0))
+        head = min(heads, key=lambda b: b.extra.get("y0", float("inf")))
+        if id(tail) in to_drop or id(head) in to_drop:
+            continue
+        # 条件 1/2：尾表下方、首表上方不得有正文
+        if any(t.extra and t.extra.get("y0", 0) > tail.extra["y1"] + 5 for t in _texts(p)):
+            continue
+        if any(t.extra and t.extra.get("y1", 0) < head.extra["y0"] - 5 for t in _texts(p + 1)):
+            continue
+        # 条件 3：列数相等
+        cols_a, cols_b = _md_table_cols(tail.text), _md_table_cols(head.text)
+        if cols_a < 2 or cols_a != cols_b:
+            continue
+        # 条件 4：x-span 重叠 ≥80%（以较窄表为基）
+        ax0, ax1 = tail.extra["x0"], tail.extra["x1"]
+        bx0, bx1 = head.extra["x0"], head.extra["x1"]
+        overlap = min(ax1, bx1) - max(ax0, bx0)
+        narrower = min(ax1 - ax0, bx1 - bx0)
+        if narrower <= 0 or overlap / narrower < 0.8:
+            continue
+        # 并表：剥离续表重复表头
+        b_rows = head.text.split("\n")
+        if b_rows and _norm_row(b_rows[0]) == _norm_row(tail.text.split("\n", 1)[0]):
+            b_rows = b_rows[1:]
+        if not b_rows:
+            to_drop.add(id(head))
+            continue
+        tail.text = tail.text + "\n" + "\n".join(b_rows)
+        tail.extra["row_count"] = tail.text.count("\n") + 1
+        tail.extra.setdefault("stitched_pages", [p]).append(p + 1)
+        # 链式：让 p+2 的首表能继续并进来——把并入后的 tail 顶替 head 在 p+1 的位置
+        by_page[p + 1] = [tail if b is head else b for b in by_page[p + 1]]
+        tail.extra["y1"] = head.extra.get("y1", tail.extra["y1"])
+        to_drop.add(id(head))
+        stitched += 1
+
+    if not stitched:
+        return blocks, 0
+    return [b for b in blocks if id(b) not in to_drop], stitched
 
 
 def _group_words_into_lines(
@@ -650,6 +817,14 @@ def _extract_with_pdfplumber(
         warnings.append(
             f"PDF has {page_count} pages, only first {max_pages} extracted"
         )
+
+    # ── G11：跨页表格拼接（列数相等 + x-span 对齐 + 页尾/页首位置证据）──
+    try:
+        all_blocks, _n_stitched = _stitch_cross_page_tables(all_blocks)
+        if _n_stitched:
+            warnings.append(f"[TABLE_STITCH] merged {_n_stitched} cross-page table continuation(s)")
+    except Exception as _st_err:  # fail-open：拼接失败绝不影响既有抽取
+        warnings.append(f"cross-page table stitch skipped: {_st_err}")
 
     # 记录 layout analysis 结果到 warnings（供调试）
     if analysis.heading_size_to_level:
