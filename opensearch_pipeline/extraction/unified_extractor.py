@@ -613,6 +613,62 @@ def _stitch_strip_runs(blocks, image_assets, min_run=4, max_slice_height=80):
     return blocks, image_assets
 
 
+# 双重 OCR 判重阈值：funnel ocr_text 块的字符 3-gram 有 ≥85% 出现在同页页级 OCR
+# 文本里即视为"内容已被整页转写覆盖"。实测（6B37DC 重复对）0.987 / 无关文本 0.0，
+# 两侧余量都大；OCR 双通道字符级差异（换行/全半角标点）被 3-gram+空白归一吸收。
+_DOUBLE_OCR_CONTAINMENT_THRESHOLD = 0.85
+
+
+def _drop_double_ocr_dups(blocks: list, page_ocr_blocks: list) -> tuple:
+    """整页扫描 PDF 双重 OCR 去重（G6 tier-3 决策抓获，docs/tier3_decision_2026-07-06.md）。
+
+    纯扫描页会走两条 OCR 路径：①页面作为嵌入图片被 image funnel ROUTE_TO_TEXT
+    转写一次（blocks 里带 extra.source_image 的 ocr_text 块）②per-page OCR 兜底又
+    对同一页整页转写一次——两份文本只差换行/标点（字节 hash 不同，精确去重不吃），
+    canonical 内容翻倍（生产实锤 6B37DC：1 页 600 字 → 11 chunk/1501 字，"第七条"×4）。
+
+    以页级 OCR 为该页的权威整页转写（整页渲染必然覆盖页内嵌入图），剔除同页 funnel
+    产物中内容已被其覆盖的 ocr_text 块。只剔文本块——asset 本身不动（图片照常
+    上传/绑定/在答案里渲染）。fail-open：文本过短无指纹（gram_containment 返 0）/
+    页级 OCR 未覆盖该页 / 内容确有差异 → 保留 funnel 块（宁重勿丢，遵循 OCR/funnel
+    失败绝不阻断文本抽取的约定）。
+
+    Args:
+        blocks: 当前 result.blocks（含 funnel 产物）。
+        page_ocr_blocks: per-page OCR 兜底新产出的块（page_num 齐全）。
+
+    Returns:
+        (kept_blocks, dropped_pages)：过滤后的 blocks 与被剔除 funnel 块的页码列表。
+    """
+    from opensearch_pipeline.text_similarity import gram_containment
+
+    page_ocr_text: Dict[int, List[str]] = {}
+    for b in page_ocr_blocks:
+        pg = getattr(b, "page_num", None)
+        if pg is not None:
+            page_ocr_text.setdefault(pg, []).append(getattr(b, "text", "") or "")
+    if not page_ocr_text:
+        return blocks, []
+
+    kept, dropped_pages = [], []
+    for b in blocks:
+        extra = getattr(b, "extra", None) or {}
+        pg = getattr(b, "page_num", None)
+        if (getattr(b, "block_type", "") == "ocr_text"
+                and extra.get("source_image")     # funnel ROUTE_TO_TEXT 产物特征
+                and pg in page_ocr_text):
+            try:
+                containment = gram_containment(
+                    getattr(b, "text", "") or "", "\n".join(page_ocr_text[pg]))
+            except Exception:
+                containment = 0.0  # 判重原语异常 → fail-open 保留
+            if containment >= _DOUBLE_OCR_CONTAINMENT_THRESHOLD:
+                dropped_pages.append(pg)
+                continue
+        kept.append(b)
+    return kept, dropped_pages
+
+
 class UnifiedExtractor:
     """
     统一文档提取器。
@@ -2154,6 +2210,15 @@ class UnifiedExtractor:
                                     and getattr(b, "source", "") == "native"
                                     and getattr(b, "block_type", "") != "image_ref")
                         ]
+                # G6 双重 OCR 去重：funnel ROUTE_TO_TEXT 已转写过的整页扫描图，
+                # 其文本被本次页级 OCR 覆盖时剔除 funnel 块（详见 _drop_double_ocr_dups）。
+                result.blocks, _dup_pages = _drop_double_ocr_dups(result.blocks, ocr_blocks)
+                if _dup_pages:
+                    msg = (f"[DOUBLE_OCR_DEDUP] 页 {sorted(set(_dup_pages))} 的嵌入图 OCR 文本"
+                           f"与页级 OCR 近重复，已剔除 {len(_dup_pages)} 个 funnel 文本块"
+                           f"（图片资产保留）")
+                    result.warnings.append(msg)
+                    print(f"      {msg}", flush=True)
                 # OCR 的是空白页（原页几乎无块），按 page_num 稳定排序合并保持文档顺序
                 merged = list(result.blocks) + list(ocr_blocks)
                 merged.sort(key=lambda b: (getattr(b, "page_num", 0) or 0))

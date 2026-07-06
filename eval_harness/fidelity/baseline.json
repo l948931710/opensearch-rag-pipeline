@@ -1,17 +1,36 @@
 {
-  "schema": "fidelity_baseline_v1",
-  "hard_doc_labels": [
-    "docx_uniform",
-    "pdf_sop",
-    "pdf_xs_wi_007",
-    "xlsx_clean"
-  ],
-  "corpus": {
-    "char_f1": 0.9615,
-    "cer": 0.0925,
-    "table_cell_f1": 0.9928,
-    "grid_exact_rate": 0.6666,
-    "hard_docs": 4
-  },
-  "real_ocr": false
+  "schema": "fidelity_baseline_v2",
+  "regimes": {
+    "sim": {
+      "hard_doc_labels": [
+        "docx_uniform",
+        "pdf_sop",
+        "pdf_xs_wi_007",
+        "xlsx_clean"
+      ],
+      "corpus": {
+        "char_f1": 0.9615,
+        "cer": 0.0925,
+        "table_cell_f1": 0.9928,
+        "grid_exact_rate": 0.6666,
+        "hard_docs": 4
+      }
+    },
+    "real": {
+      "hard_doc_labels": [
+        "docx_uniform",
+        "pdf_sop",
+        "pdf_xs_wi_007",
+        "scan_rd_training",
+        "xlsx_clean"
+      ],
+      "corpus": {
+        "char_f1": 0.7735,
+        "cer": 0.9071,
+        "table_cell_f1": 0.9928,
+        "grid_exact_rate": 0.6666,
+        "hard_docs": 5
+      }
+    }
+  }
 }

@@ -49,3 +49,20 @@ def simhash64(text: str) -> int:
 def hamming64(a: int, b: int) -> int:
     """两个 64 位指纹的 Hamming 距离。"""
     return bin((a ^ b) & _MASK64).count("1")
+
+
+def gram_containment(needle: str, haystack: str, n: int = 3) -> float:
+    """needle 的字符 n-gram 有多大比例出现在 haystack 里（空白归一，0.0~1.0）。
+
+    「内容是否已被另一段文本覆盖」的近重复判定原语（G6 双重 OCR 修复）：
+    同一页两次 OCR 只差换行/标点时 containment≈1（实测重复对 0.987），
+    内容无关时接近 0。needle 归一后不足 n 字符视为无指纹返回 0.0——
+    调用方不应据此判重（与 simhash64 空文本返回 0 的语义一致）。
+    """
+    ns = "".join((needle or "").split())
+    hs = "".join((haystack or "").split())
+    if len(ns) < n or len(hs) < n:
+        return 0.0
+    needle_grams = {ns[i:i + n] for i in range(len(ns) - n + 1)}
+    hay_grams = {hs[i:i + n] for i in range(len(hs) - n + 1)}
+    return len(needle_grams & hay_grams) / len(needle_grams)
