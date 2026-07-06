@@ -1864,16 +1864,16 @@
   "query": "住宿管理规定",
   "kind": "positive",
   "expected_docs": [
-   "宿舍管理制度"
+   "富岭《宿舍管理规定》（定稿）"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_CE12F3"
+   "DOC_ADMIN_20260514123015_1B0B2E"
   ],
   "resolution": [
    {
-    "expected": "宿舍管理制度",
-    "title": "宿舍管理制度.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_CE12F3",
+    "expected": "富岭《宿舍管理规定》（定稿）",
+    "title": "富岭《宿舍管理规定》（定稿）.docx",
+    "doc_id": "DOC_ADMIN_20260514123015_1B0B2E",
     "sim": 1.0,
     "permission_level": "public",
     "owner_dept": "admin"
@@ -5097,13 +5097,11 @@
   "kind": "positive",
   "expected_docs": [
    "宿舍管理制度",
-   "关于外来人员来访留宿相关规定（最终版）",
-   "通知（进出厂规定）"
+   "关于外来人员来访留宿相关规定（最终版）"
   ],
   "expected_doc_ids": [
    "DOC_ADMIN_20260514123015_CE12F3",
-   "DOC_ADMIN_20260513120215_233653",
-   "DOC_ADMIN_20260513120215_067E33"
+   "DOC_ADMIN_20260513120215_233653"
   ],
   "resolution": [
    {
@@ -5121,14 +5119,6 @@
     "sim": 1.0,
     "permission_level": "public",
     "owner_dept": "admin"
-   },
-   {
-    "expected": "通知（进出厂规定）",
-    "title": "关于饭卡充值的通知.docx",
-    "doc_id": "DOC_ADMIN_20260513120215_067E33",
-    "sim": 1.0,
-    "permission_level": "public",
-    "owner_dept": "admin"
    }
   ],
   "answer_points": "答案需综合《宿舍管理制度》《关于外来人员来访留宿相关规定（最终版）》《通知（进出厂规定）》",
@@ -5140,7 +5130,10 @@
   "expected_permission": [
    "public"
   ],
-  "live_scorable": true
+  "live_scorable": true,
+  "_audit": [
+   "2026-07-06 gold 更正：删除 067E33《关于饭卡充值的通知》——与『宿舍私留外来人员处罚』查询完全无关（误标）；保留 CE12F3 宿舍管理制度 + 233653 外来人员留宿规定（均 active 且切题）"
+  ]
  },
  {
   "qid": "QA-96",

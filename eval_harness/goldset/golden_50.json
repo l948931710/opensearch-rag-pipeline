@@ -1351,16 +1351,16 @@
   "query": "住宿管理规定",
   "kind": "positive",
   "expected_docs": [
-   "宿舍管理制度"
+   "富岭《宿舍管理规定》（定稿）"
   ],
   "expected_doc_ids": [
-   "DOC_ADMIN_20260514123015_CE12F3"
+   "DOC_ADMIN_20260514123015_1B0B2E"
   ],
   "resolution": [
    {
-    "expected": "宿舍管理制度",
-    "title": "宿舍管理制度.docx",
-    "doc_id": "DOC_ADMIN_20260514123015_CE12F3",
+    "expected": "富岭《宿舍管理规定》（定稿）",
+    "title": "富岭《宿舍管理规定》（定稿）.docx",
+    "doc_id": "DOC_ADMIN_20260514123015_1B0B2E",
     "sim": 1.0,
     "permission_level": "public",
     "owner_dept": "admin"
