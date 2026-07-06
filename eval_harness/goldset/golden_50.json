@@ -643,19 +643,30 @@
   "query": "我们在生产霸王茶姬的大杯红茶PE款时，如果红外检测系统老是误报或者漏报脏污，该怎么调整参数？还有，如果因为调整参数导致产生了大量报废品，后续要怎么处理和分析？",
   "kind": "positive",
   "expected_docs": [
-   "A50消防安全知识"
+   "01 FL-QC-009-082红外检测系统验证作业指导书(启用).docx",
+   "2.FL-QC-009-082红外检测系统验证作业指导书(已受控).docx"
   ],
   "expected_doc_ids": [
-   "DOC_HR_20260514123024_CA1109"
+   "DOC_PRODUCTION_20260611201419_FC83BC",
+   "DOC_PRODUCTION_20260514123027_3F519C"
   ],
   "resolution": [
    {
-    "expected": "A50消防安全知识",
-    "title": "A50消防安全知识.docx",
-    "doc_id": "DOC_HR_20260514123024_CA1109",
+    "expected": "01 FL-QC-009-082红外检测系统验证作业指导书(启用).docx",
+    "title": "01 FL-QC-009-082红外检测系统验证作业指导书(启用).docx",
+    "doc_id": "DOC_PRODUCTION_20260611201419_FC83BC",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "hr"
+    "owner_dept": "production",
+    "note": "2026-07-06 gold 更正：原标 A50消防安全知识(CA1109) 与红外检测调参/报废处理完全无关（8 关键词 0 命中）；红外检测验证作业指导书 8/8 关键词全命中。启用/已受控为孪生对，任一命中即算对"
+   },
+   {
+    "expected": "2.FL-QC-009-082红外检测系统验证作业指导书(已受控).docx",
+    "title": "2.FL-QC-009-082红外检测系统验证作业指导书(已受控).docx",
+    "doc_id": "DOC_PRODUCTION_20260514123027_3F519C",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "production"
    }
   ],
   "answer_points": "",
@@ -1040,19 +1051,20 @@
   "query": "阿德沃成型机每周清扫时，上片架滚柱和预热箱表面要用什么擦？",
   "kind": "positive",
   "expected_docs": [
-   "设备清扫基准书-拉片机"
+   "设备清扫基准书-成型机（阿德沃）.xlsx"
   ],
   "expected_doc_ids": [
-   "DOC_PRODUCTION_20260513120636_9EB1B9"
+   "DOC_PRODUCTION_20260513120636_D49638"
   ],
   "resolution": [
    {
-    "expected": "设备清扫基准书-拉片机",
-    "title": "设备清扫基准书-拉片机（淳迪） - 2拉.xlsx",
-    "doc_id": "DOC_PRODUCTION_20260513120636_9EB1B9",
+    "expected": "设备清扫基准书-成型机（阿德沃）.xlsx",
+    "title": "设备清扫基准书-成型机（阿德沃）.xlsx",
+    "doc_id": "DOC_PRODUCTION_20260513120636_D49638",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "production"
+    "owner_dept": "production",
+    "note": "2026-07-06 gold 更正：查询问『阿德沃成型机』每周清扫，原标拉片机(9EB1B9) 无阿德沃/酒精内容；阿德沃 doc 含 上片架/预热箱/酒精 全部关键词"
    }
   ],
   "answer_points": "",
@@ -1190,12 +1202,11 @@
   ],
   "resolution": [
    {
-    "expected": "A50消防安全知识",
-    "title": "A50消防安全知识.docx",
-    "doc_id": "DOC_HR_20260514123024_CA1109",
-    "sim": 1.0,
-    "permission_level": "public",
-    "owner_dept": "hr"
+    "expected": null,
+    "title": null,
+    "doc_id": null,
+    "sim": 0.0,
+    "note": "2026-07-06 审计：查询问『大杯红茶 PE/PLA 款』胶带颜色与内杯原纸规格，该规格书不在语料（『大杯红茶』『344g太阳双淋』『330g太阳单淋』全库 0 命中）——index-gap 非检索失败；原标 A50消防安全知识(CA1109) 系错标。live_scorable=false=L1/L3 按设计排除，语料补齐后恢复"
    }
   ],
   "answer_points": "",
@@ -1214,7 +1225,7 @@
   "expected_permission": [
    "public"
   ],
-  "live_scorable": true
+  "live_scorable": false
  },
  {
   "qid": "SRC-13",
@@ -1505,19 +1516,20 @@
   "query": "内贴设备中，示波仪点检合格的标准数值是多少？",
   "kind": "positive",
   "expected_docs": [
-   "设备清扫基准书-拉片机"
+   "纸杯设备清扫基准书-内贴机(2).xlsx"
   ],
   "expected_doc_ids": [
-   "DOC_PRODUCTION_20260513120636_9EB1B9"
+   "DOC_PRODUCTION_20260513120642_6AF9D4"
   ],
   "resolution": [
    {
-    "expected": "设备清扫基准书-拉片机",
-    "title": "设备清扫基准书-拉片机（淳迪） - 2拉.xlsx",
-    "doc_id": "DOC_PRODUCTION_20260513120636_9EB1B9",
+    "expected": "纸杯设备清扫基准书-内贴机(2).xlsx",
+    "title": "纸杯设备清扫基准书-内贴机(2).xlsx",
+    "doc_id": "DOC_PRODUCTION_20260513120642_6AF9D4",
     "sim": 1.0,
     "permission_level": "public",
-    "owner_dept": "production"
+    "owner_dept": "production",
+    "note": "2026-07-06 gold 更正：原标 拉片机(9EB1B9) 无『示波仪』内容；查询问『内贴设备』示波仪点检，实际答案在内贴机(6AF9D4) 的『示波仪 点按后数字不超过1』——retrieval 一直是对的"
    }
   ],
   "answer_points": "",
