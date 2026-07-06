@@ -669,6 +669,48 @@ def _drop_double_ocr_dups(blocks: list, page_ocr_blocks: list) -> tuple:
     return kept, dropped_pages
 
 
+_HF_DIGIT_NORM = re.compile(r"\d+")
+
+
+def _strip_hf_lines_from_ocr(ocr_blocks: list, hf_texts: set) -> tuple:
+    """G12-OCR：把原生 Pass-1 检出的页眉/页脚词集应用到页级 OCR 文本（G6 tier-3 决策抓获②）。
+
+    原生 pdfplumber 路径按 y 边界裁页眉页脚，OCR 兜底文本**无坐标**——整页信头
+    （公司名/文件编号/版本/生效日期）被逐字转进 canonical（实测 doc2-p2 页眉字符
+    ≈5 倍于正文）。本函数用 Pass-1 的跨页词集（词级 + 数字归一，"FL-CW-SW-003"→
+    "FL-CW-SW-###"）做行级过滤：某行的全部多字符 token（同款归一后）都 ∈ 词集
+    即视为页眉/页脚行剔除（单字符 token 如 年/月/日/A// 不参与判定，随行走）。
+
+    fail-open 三道保险：①词集为空（纯扫描件原生零文本 → Pass-1 无词集）= no-op；
+    ②词集规模阀：>60 项视为页眉检测器失灵（真实信头是紧凑的），整体放弃过滤——
+    刻意【不用】按块行数比例阀：迷你页（如尾页只有一句话）的 OCR 本来就页眉占
+    多数，比例阀会杀死主修复场景；③过滤后整块为空才移除块（正文块不受影响）。
+    返回 (blocks, dropped_line_count)。
+    """
+    if not hf_texts or len(hf_texts) > 60:
+        return ocr_blocks, 0
+    dropped_total = 0
+    out = []
+    for b in ocr_blocks:
+        text = getattr(b, "text", "") or ""
+        lines = text.splitlines()
+        keep, dropped = [], 0
+        for ln in lines:
+            toks = [t for t in ln.split() if len(t) > 1]
+            if toks and all(_HF_DIGIT_NORM.sub("#", t) in hf_texts for t in toks):
+                dropped += 1
+                continue
+            keep.append(ln)
+        if dropped:
+            dropped_total += dropped
+            new_text = "\n".join(keep).strip()
+            if not new_text:
+                continue           # 整块皆页眉 → 移除块
+            b.text = new_text
+        out.append(b)
+    return out, dropped_total
+
+
 class UnifiedExtractor:
     """
     统一文档提取器。
@@ -811,7 +853,9 @@ class UnifiedExtractor:
         from opensearch_pipeline.extraction.image_extraction_utils import extract_images_from_pdf
 
         local_path = task.get("local_path", "")
-        blocks, page_count, warnings = extract_pdf(local_path, max_pages=self.pdf_native_max_pages)
+        _pdf_meta: dict = {}   # G12-OCR：接 Pass-1 页眉/页脚词集（供 OCR 兜底文本裁剪）
+        blocks, page_count, warnings = extract_pdf(
+            local_path, max_pages=self.pdf_native_max_pages, meta_out=_pdf_meta)
         flat_text = blocks_to_text(blocks)
         title = extract_title_from_blocks(blocks, fallback=task.get("filename", ""))
 
@@ -855,6 +899,10 @@ class UnifiedExtractor:
         # Stash 本地路径，供 _pages_needing_ocr 在 page_count<=0 时
         # 走保守 fallback 重拿真实页数（不暴露成 dataclass field 以避免序列化噪声）
         result._local_path = local_path  # type: ignore[attr-defined]
+        # G12-OCR：页眉/页脚词集随 result 走到 _apply_ocr_fallback（同 _garbled_pages 惯例）
+        _hf = (_pdf_meta.get("header_texts") or set()) | (_pdf_meta.get("footer_texts") or set())
+        if _hf:
+            result._hf_texts = frozenset(_hf)  # type: ignore[attr-defined]
 
 
         # OCR fallback 判断（perf#65：needy 单算传递——此前 _needs_ocr / _apply_ocr_fallback
@@ -2196,6 +2244,16 @@ class UnifiedExtractor:
         ocr_blocks = ocr_result.to_blocks()
         if ocr_blocks:
             if result.file_ext == "pdf":
+                # G12-OCR：先用原生 Pass-1 页眉/页脚词集裁剪 OCR 文本行（OCR 无坐标，
+                # 词集是唯一可迁移的页眉知识；纯扫描件词集为空=no-op，fail-open）
+                _hf = getattr(result, "_hf_texts", None) or set()
+                if _hf:
+                    ocr_blocks, _hf_dropped = _strip_hf_lines_from_ocr(ocr_blocks, _hf)
+                    if _hf_dropped:
+                        msg = (f"[OCR_HF_CROP] 页级 OCR 文本剔除 {_hf_dropped} 行"
+                               f"页眉/页脚（G12 OCR 侧，词集 {len(_hf)} 项）")
+                        result.warnings.append(msg)
+                        print(f"      {msg}", flush=True)
                 # G15：乱码页（质量门标记）在 OCR 成功后剔除其原生文本块——否则
                 # (cid:)/PUA 垃圾会与 OCR 文本并存进入切块。仅剔除有 OCR 产出的页
                 # （fail-open：OCR 没覆盖到的乱码页保留原生块，宁乱勿丢）。
@@ -2210,6 +2268,35 @@ class UnifiedExtractor:
                                     and getattr(b, "source", "") == "native"
                                     and getattr(b, "block_type", "") != "image_ref")
                         ]
+                # G6-③ thin 页原生残文去重：needy 页（原生 <PER_PAGE_OCR_THRESHOLD 字符）
+                # 的原生文本块与页级 OCR 全页转写并存 = 同内容双份（channel #3）。页级
+                # OCR 是该页的权威整页转写——仅当该页 OCR 产出字符数 ≥ 原生残文字符数
+                # 时（OCR 严格更完整，fail-open：OCR 偏短则保留原生，宁重勿丢）剔除
+                # 该页原生文本块（image_ref/表格块不动）。
+                _ocr_chars: Dict[int, int] = {}
+                for _b in ocr_blocks:
+                    _pg = getattr(_b, "page_num", None)
+                    if _pg is not None:
+                        _ocr_chars[_pg] = _ocr_chars.get(_pg, 0) + len(getattr(_b, "text", "") or "")
+                _native_chars: Dict[int, int] = {}
+                for _b in result.blocks:
+                    _pg = getattr(_b, "page_num", None)
+                    if (_pg in _ocr_chars and getattr(_b, "source", "") == "native"
+                            and getattr(_b, "block_type", "") not in ("image_ref", "table")):
+                        _native_chars[_pg] = _native_chars.get(_pg, 0) + len(getattr(_b, "text", "") or "")
+                _thin_drop = {p for p, n in _native_chars.items() if _ocr_chars.get(p, 0) >= n}
+                if _thin_drop:
+                    _before = len(result.blocks)
+                    result.blocks = [
+                        b for b in result.blocks
+                        if not (getattr(b, "page_num", None) in _thin_drop
+                                and getattr(b, "source", "") == "native"
+                                and getattr(b, "block_type", "") not in ("image_ref", "table"))
+                    ]
+                    msg = (f"[THIN_PAGE_OCR_DEDUP] 页 {sorted(_thin_drop)} 原生残文块 "
+                           f"{_before - len(result.blocks)} 个被页级 OCR 全页转写取代（channel #3）")
+                    result.warnings.append(msg)
+                    print(f"      {msg}", flush=True)
                 # G6 双重 OCR 去重：funnel ROUTE_TO_TEXT 已转写过的整页扫描图，
                 # 其文本被本次页级 OCR 覆盖时剔除 funnel 块（详见 _drop_double_ocr_dups）。
                 result.blocks, _dup_pages = _drop_double_ocr_dups(result.blocks, ocr_blocks)

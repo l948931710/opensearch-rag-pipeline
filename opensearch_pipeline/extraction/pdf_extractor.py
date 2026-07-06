@@ -755,7 +755,7 @@ def _build_line(words: list) -> dict:
 
 
 def _extract_with_pdfplumber(
-    local_path: str, max_pages: int
+    local_path: str, max_pages: int, meta_out: Optional[dict] = None
 ) -> Tuple[List[ExtractedBlock], int, List[str]]:
     """
     使用 pdfplumber Layout-Aware 提取 PDF 文本。
@@ -782,6 +782,12 @@ def _extract_with_pdfplumber(
     # ── Pass 1: 文档级分析 ──
     analysis, p1_warnings = _pass1_analyze(pdf, max_pages)
     warnings.extend(p1_warnings)
+    # G12-OCR：把 Pass-1 检出的页眉/页脚词集回传调用方（meta_out 可选出参，kwargs 安全）。
+    # OCR 兜底文本无坐标、y 裁剪不适用——词集是唯一可迁移的页眉知识
+    # （词级 + 数字归一键，见 top_candidates 收集处）。
+    if meta_out is not None:
+        meta_out["header_texts"] = set(analysis.header_texts)
+        meta_out["footer_texts"] = set(analysis.footer_texts)
 
     # 如果字号数据不足，说明可能是扫描件或无法提取
     if analysis.body_size == 0:
@@ -897,11 +903,14 @@ def _extract_with_pypdf(
 def extract_pdf(
     local_path: str,
     max_pages: int = 20,
+    meta_out: Optional[dict] = None,
 ) -> Tuple[List[ExtractedBlock], int, List[str]]:
     """
     从 PDF 文件提取 blocks（带 page_num）。
 
     优先用 pdfplumber layout-aware，失败或 0 chars 则用 pypdf flat fallback。
+    meta_out（可选出参）：pdfplumber 路径回填 Pass-1 页眉/页脚词集
+    （header_texts/footer_texts，G12-OCR 供 OCR 兜底文本裁剪）；pypdf 路径不填。
 
     Returns:
         (blocks, page_count, warnings)
@@ -910,7 +919,8 @@ def extract_pdf(
 
     # 策略 1: pdfplumber layout-aware
     try:
-        blocks, page_count, warnings = _extract_with_pdfplumber(local_path, max_pages)
+        blocks, page_count, warnings = _extract_with_pdfplumber(
+            local_path, max_pages, meta_out=meta_out)
         total_chars = sum(len(b.text) for b in blocks)
         if total_chars > 0:
             return blocks, page_count, warnings
