@@ -81,3 +81,7 @@ reports/
 console-app/node_modules/
 console-app/dist/
 opensearch_pipeline/webconsole/next-dist/
+
+# 编辑期备份文件 (金集/基线手改时的 .bak 快照,本地留档不入远程)
+*.bak
+*.bak_*
