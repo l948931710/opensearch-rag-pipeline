@@ -65,11 +65,14 @@ ENTITY_PATTERNS = {
                 r"[一-龥0-9（）()]{0,15}?\d{1,5}号"),
 }
 
-# G5：bank_card 的已知 FP 面——ERP/生产语料里 16-19 位订单号/物料号/工单号/条码。
-# 正向锚点（卡号/账号/银行）优先：共现即视为真卡号；否则业务锚点共现 → 抑制。
+# G5：bank_card 的已知 FP 面——ERP/生产语料里 16-19 位订单号/物料号/工单号/条码，
+# 外加资质证书/注册号（2026-07-07，106E77：证书编号 17 位数字命中 bank_card）。
+# 正向锚点（卡号/账号/银行）优先：共现即视为真卡号；否则业务/凭证锚点共现 → 抑制。
 _BANK_CARD_POSITIVE_ANCHORS = ("卡号", "账号", "账户", "银行", "bank")
 _BANK_CARD_FP_ANCHORS = ("订单", "单号", "物料", "料号", "工单", "编号", "编码",
-                         "流水号", "条码", "追溯码", "batch", "order", "sku", "barcode")
+                         "流水号", "条码", "追溯码", "batch", "order", "sku", "barcode",
+                         "证书", "证号", "注册号", "许可证", "备案", "certificate",
+                         "license", "licence", "registration")
 
 
 def _bank_card_ctx_is_fp(m) -> bool:
@@ -154,3 +157,51 @@ def _body_entity_fp_ignore(entity_name: str, text: str) -> bool:
     import re as _re
     ms = list(_re.finditer(ENTITY_PATTERNS["bank_card"], text))
     return bool(ms) and all(_bank_card_ctx_is_fp(m) for m in ms)
+
+
+# ── 图片文本（OCR/VLM caption）的凭证号 FP 面（2026-07-07，106E77 事后）──
+# 资质证书类图片的编号常撞号码正则：FDA 注册号 "13889211462" 命中 cn_mobile、
+# 证书编号 17 位数字段命中 bank_card。VLM caption 会照抄这些号码
+# （"FDA注册确认函，显示注册号13889211462"），盲掩会毁掉"我们的 FDA 注册号是
+# 多少"这类合法业务答案。与 bank_card 同款设计：正向锚点（电话/联系/手机）优先
+# ——共现即视为真手机号照掩；否则凭证锚点共现 → 保留原文。
+_CREDENTIAL_ANCHORS = ("注册号", "证书", "证号", "编号", "备案", "许可证", "文号",
+                       "批号", "registration", "certificate", "license", "licence")
+_PHONE_POSITIVE_ANCHORS = ("电话", "手机", "联系", "致电", "微信", "传真",
+                           "tel", "phone", "mobile", "contact", "call")
+
+
+def _mobile_ctx_is_credential(m) -> bool:
+    """cn_mobile 单个命中的凭证号 FP 判定（±24 字符窗口，正向锚点优先）。"""
+    ctx = m.string[max(0, m.start() - 24): m.end() + 8].lower()
+    if any(p in ctx for p in _PHONE_POSITIVE_ANCHORS):
+        return False
+    return any(a in ctx for a in _CREDENTIAL_ANCHORS)
+
+
+def scrub_image_text(text: str) -> str:
+    """图片伴生文本（asset ocr_text / visual_summary）的消费点兜底掩码。
+
+    G21 fail-closed 的共享实现：ENTITY_PATTERNS 全表就地掩码（dict 序 load-bearing，
+    masked_id 必须先跑），带三层 FP 护栏——
+      * cn_id_card：物料编码锚点整文本抑制（_image_ocr_fp_ignore，既有语义）；
+        ⚠️ 绝不加凭证锚点护栏——"身份证号"本身含"证号"，加了会漏真身份证。
+      * bank_card：REDACTION_MAP 内建 _guarded_bank_card_redact 逐命中判定。
+      * cn_mobile：凭证号上下文（注册号/证书/…）逐命中保留，正向锚点（电话/联系）
+        共现则照掩（106E77 FDA 注册号教训）。
+    幂等：已掩码文本（138****5678）被 masked_id 模式先行捕获，不再二次吞。
+    """
+    if not text:
+        return text
+    import re as _re
+    out = text
+    for name, pat in ENTITY_PATTERNS.items():
+        rep = REDACTION_MAP.get(name)
+        if rep is None or _image_ocr_fp_ignore(name, out):
+            continue
+        if name == "cn_mobile":
+            out = _re.sub(pat, lambda m: m.group()
+                          if _mobile_ctx_is_credential(m) else rep(m), out)
+        else:
+            out = _re.sub(pat, rep, out)
+    return out

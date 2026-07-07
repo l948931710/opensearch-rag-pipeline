@@ -59,6 +59,7 @@ from opensearch_pipeline.pii_patterns import (  # noqa: F401
     SEMANTIC_KEYWORDS,
     _body_entity_fp_ignore,
     _image_ocr_fp_ignore,
+    scrub_image_text,
 )
 
 
@@ -3584,32 +3585,29 @@ def node_chunk_documents(ctx: dict):
             print(f"    └─ {doc['doc_id']}: skipped (quarantined)")
             continue
 
-        # G21 fail-closed：asset ocr_text 的 PII 消费点兜底掩码（默认 ON，
+        # G21 fail-closed：asset ocr_text + visual_summary 的 PII 消费点兜底掩码（默认 ON，
         # RAG_IMAGE_OCR_PII_FAILCLOSED=false 关闭）。RAG_IMAGE_OCR_PII（node 02/03 的
         # 检测+脱敏）默认 OFF 且靠 stage2_node setdefault 存续——重部署丢 flag 时，截图里的
         # 手机号/身份证会原样进入 image_refs/[图片OCR] 合成块并持久化到 chunk_meta/HA3。
-        # 在 chunk 消费点兜底：命中 ENTITY_PATTERNS 的 asset ocr_text 就地掩码（复用
-        # _image_ocr_fp_ignore 物料编码 FP allow-list），与 node 03 就地脱敏幂等（已脱敏
-        # 文本不再命中）。canonical 不改写（canonical_sha256 与跨文档去重/skip-unchanged
+        # ⚠️ visual_summary（VLM caption）此前从不脱敏——106E77 事故：VLM 照抄图内 FDA
+        # 注册号/证书编号进 caption，_img_entry 原样带入 image_refs_json（node 03 只碰
+        # ocr_text）。两字段现共走 scrub_image_text（凭证锚点 FP 护栏保住"注册号是多少"
+        # 这类合法答案）。canonical 不改写（canonical_sha256 与跨文档去重/skip-unchanged
         # 门耦合，改写即破坏哈希语义）；保护随每轮 chunk 消费重建，不依赖 flag 存续。
         if os.environ.get("RAG_IMAGE_OCR_PII_FAILCLOSED", "true").lower() not in ("0", "false", "no"):
             _g21_scrubbed = 0
             for _asset in doc.get("assets", []) or []:
-                _oc = _asset.get("ocr_text")
-                if not _oc:
-                    continue
-                _new = _oc
-                for _pii_name, _pii_pat in ENTITY_PATTERNS.items():
-                    _rep = REDACTION_MAP.get(_pii_name)
-                    if not _rep or _image_ocr_fp_ignore(_pii_name, _oc):
+                for _fld in ("ocr_text", "visual_summary"):
+                    _orig = _asset.get(_fld)
+                    if not _orig:
                         continue
-                    _new = re.sub(_pii_pat, _rep, _new)
-                if _new != _oc:
-                    _asset["ocr_text"] = _new
-                    _g21_scrubbed += 1
+                    _new = scrub_image_text(_orig)
+                    if _new != _orig:
+                        _asset[_fld] = _new
+                        _g21_scrubbed += 1
             if _g21_scrubbed:
-                print(f"    ├─ [pii-failclosed] {doc['doc_id']}: {_g21_scrubbed} 个图片 OCR "
-                      f"文本命中 PII，已在消费点掩码（node 03 flag 未生效的兜底）")
+                print(f"    ├─ [pii-failclosed] {doc['doc_id']}: {_g21_scrubbed} 个图片 "
+                      f"OCR/caption 字段命中 PII，已在消费点掩码（node 03 flag 未生效的兜底）")
 
         text = doc.get("redacted_text") or doc["text"]
         

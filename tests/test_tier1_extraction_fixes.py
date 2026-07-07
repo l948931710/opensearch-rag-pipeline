@@ -265,6 +265,45 @@ def test_g21_failclosed_can_be_disabled(monkeypatch):
     assert doc["assets"][0]["ocr_text"] == raw
 
 
+def test_g21_failclosed_masks_pii_in_visual_summary(monkeypatch):
+    """106E77 事故回归：VLM caption（visual_summary）里的真手机号也要兜底掩码。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+    monkeypatch.delenv("RAG_IMAGE_OCR_PII", raising=False)
+    monkeypatch.delenv("RAG_IMAGE_OCR_PII_FAILCLOSED", raising=False)
+    doc = _canon_with_asset("")
+    doc["assets"][0]["visual_summary"] = "名片图片，联系电话 13812345678"
+    pn.node_chunk_documents({"canonicals": [doc]})
+    vs = doc["assets"][0]["visual_summary"]
+    assert "13812345678" not in vs and "138****5678" in vs
+
+
+def test_g21_credential_number_not_masked_in_caption(monkeypatch):
+    """凭证锚点（注册号/证书）上下文的号码是业务事实，不得掩码——106E77 FDA 教训。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+    monkeypatch.delenv("RAG_IMAGE_OCR_PII_FAILCLOSED", raising=False)
+    cap = "FDA注册确认函，显示注册号13889211462、企业名称Fuling"
+    doc = _canon_with_asset("")
+    doc["assets"][0]["visual_summary"] = cap
+    pn.node_chunk_documents({"canonicals": [doc]})
+    assert doc["assets"][0]["visual_summary"] == cap
+
+
+def test_scrub_image_text_unit():
+    """scrub_image_text 直接单测：真手机掩码、凭证号保留、重复处理不泄露。"""
+    from opensearch_pipeline.pii_patterns import scrub_image_text
+    assert scrub_image_text("手机 13812345678") == "手机 138****5678"
+    assert scrub_image_text("注册号 13889211462") == "注册号 13889211462"
+    # 证书编号（17 位数字命中 bank_card）在凭证锚点上下文保留——106E77 教训
+    assert scrub_image_text("certificate number is IDA00220120012001201") \
+        == "certificate number is IDA00220120012001201"
+    # 重复处理的安全契约：绝不重新暴露原始号码，且收敛（masked_id 会把 138****5678
+    # 进一步吞成 [标识已脱敏]——牺牲可读性但不泄露，是既有 masked_id 语义，非 bug）。
+    once = scrub_image_text("手机 13812345678")
+    twice = scrub_image_text(once)
+    assert "13812345678" not in twice
+    assert scrub_image_text(twice) == twice  # 三次收敛
+
+
 # ═══════════════════ G25: chunk 级乱码过滤 ═══════════════════
 
 def test_g25_gibberish_predicate():
