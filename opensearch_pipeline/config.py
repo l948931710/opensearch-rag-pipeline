@@ -229,8 +229,8 @@ class AlibabaVectorSearchConfig:
 class EmbeddingConfig:
     """Embedding 模型配置。"""
     api_key: str = ""
-    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    model: str = "text-embedding-004"
+    api_base_url: str = "https://dashscope.aliyuncs.com"        # 默认 DashScope-native（残留清理；env-loader 仍按 key 动态路由）
+    model: str = "text-embedding-v4"
     dimension: int = 1024
     batch_size: int = 10                    # API limit (DashScope limit is 10)
     max_retries: int = 3
@@ -240,8 +240,8 @@ class EmbeddingConfig:
 class OCRConfig:
     """OCR + VLM 视觉配置。"""
     api_key: str = ""
-    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    model: str = "gemini-3.1-flash-lite"            # OCR 专用模型
+    api_base_url: str = "https://dashscope.aliyuncs.com/api/v1"  # 默认 DashScope-native（残留清理；env-loader 仍按 key 动态路由）
+    model: str = "qwen-vl-ocr-latest"               # OCR 专用模型
     vlm_model: str = ""                              # VLM caption/审计模型（为空则 fallback 到 model）
     max_ocr_pages: int = 50
     ocr_threshold_chars: int = 100
@@ -271,8 +271,8 @@ class RebuildConfig:
 class LLMConfig:
     """分类/风险评估 LLM 配置。"""
     api_key: str = ""
-    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    model: str = "gemini-3.1-flash-lite"
+    api_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # 默认 DashScope-native（残留清理；env-loader 仍按 key 动态路由）
+    model: str = "qwen3.6-plus"
     temperature: float = 0.1
     max_retries: int = 2
     max_tokens: int = 2048

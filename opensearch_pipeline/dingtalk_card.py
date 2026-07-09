@@ -36,48 +36,128 @@ _token_lock = threading.Lock()
 _cached_token: Optional[str] = None
 _token_expires_at: float = 0
 
+# WS0-3：token 缓存双后端。memory=进程内 L1（原行为不变）；redis=多实例共享 L2 + SETNX 防惊群，
+# L1 保留为快路径。此 token 供卡片投递 / 身份解析(dingtalk_identity) / 管理员通知(admin_notify) 共用；
+# 解除 --workers 1 后每实例各自刷新 → 冗余刷新，且若钉钉「刷新即轮换」则 token 互相刷失效 →
+# 卡片投递间歇失败；共享刷新消除之。RAG_TOKEN_CACHE_BACKEND=memory|redis（默认 memory=回滚开关）。
+_TOKEN_REDIS_KEY = "dingtalk:accesstoken"
+_TOKEN_LOCK_KEY = "dingtalk:accesstoken:lock"
+_TOKEN_EARLY_REFRESH_S = 300     # 提前 5 分钟刷新（与原逻辑一致）
+_TOKEN_HERD_WAIT_TRIES = 5       # 未抢到刷新锁时有界等待轮数（防惊群；测试可调）
+_TOKEN_HERD_WAIT_S = 0.3
+
+
+def _token_cache_backend() -> str:
+    return os.environ.get("RAG_TOKEN_CACHE_BACKEND", "memory").strip().lower()
+
+
+def _refresh_token_from_api() -> tuple:
+    """直连钉钉刷新 access_token，返回 (token, expire_in)；失败 (None, 0)。不碰任何缓存。"""
+    client_id = os.environ.get("DINGTALK_CLIENT_ID", "")
+    client_secret = os.environ.get("DINGTALK_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        logger.warning("DINGTALK_CLIENT_ID 或 DINGTALK_CLIENT_SECRET 未配置")
+        return None, 0
+    try:
+        resp = requests.post(
+            "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+            json={"appKey": client_id, "appSecret": client_secret},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.error("获取 access_token 失败: status=%s, body=%s", resp.status_code, resp.text)
+            return None, 0
+        data = resp.json()
+        return data.get("accessToken"), int(data.get("expireIn", 7200))
+    except Exception as e:
+        logger.error("获取 access_token 异常: %s", e, exc_info=True)
+        return None, 0
+
+
+def _l1_valid(now: float) -> Optional[str]:
+    with _token_lock:
+        if _cached_token and now < _token_expires_at - _TOKEN_EARLY_REFRESH_S:
+            return _cached_token
+    return None
+
+
+def _set_l1(token: Optional[str], ttl_s: float) -> None:
+    global _cached_token, _token_expires_at
+    with _token_lock:
+        _cached_token = token
+        _token_expires_at = time.time() + ttl_s
+
+
+def _refresh_and_cache_l1(now: float) -> Optional[str]:
+    """直连刷新 + 写 L1（持锁串行，避免并发重复刷新）。memory 后端与 redis 兜底共用。"""
+    global _cached_token, _token_expires_at
+    with _token_lock:
+        if _cached_token and now < _token_expires_at - _TOKEN_EARLY_REFRESH_S:
+            return _cached_token   # 双检：等锁期间别的线程已刷
+        token, expire_in = _refresh_token_from_api()
+        if token:
+            _cached_token = token
+            _token_expires_at = time.time() + expire_in
+            logger.info("access_token 刷新成功, expires_in=%ds", expire_in)
+        return token
+
+
+def _get_token_via_redis(now: float) -> Optional[str]:
+    """redis L2：命中共享 token → 写 L1 返回；未命中 → SETNX 领刷新锁防惊群，刷新写 Redis+L1。
+    任何异常返回 None，由调用方落直连兜底（fail-open：token 非计费关键，宁刷不阻断）。"""
+    try:
+        from opensearch_pipeline import redis_client
+        r = redis_client.get_client()
+        key = redis_client.key(_TOKEN_REDIS_KEY)
+        token = r.get(key)
+        if token:
+            pttl = r.pttl(key)
+            _set_l1(token, pttl / 1000.0 if isinstance(pttl, int) and pttl > 0 else 3600.0)
+            return token
+        # 未命中 → 领刷新锁（防惊群，短 TTL）
+        lock_key = redis_client.key(_TOKEN_LOCK_KEY)
+        got_lock = r.set(lock_key, "1", nx=True, ex=15)
+        if not got_lock:
+            # 别的实例在刷 → 有界等待它写入 Redis，等不到再自刷兜底
+            for _ in range(_TOKEN_HERD_WAIT_TRIES):
+                time.sleep(_TOKEN_HERD_WAIT_S)
+                token = r.get(key)
+                if token:
+                    pttl = r.pttl(key)
+                    _set_l1(token, pttl / 1000.0 if isinstance(pttl, int) and pttl > 0 else 3600.0)
+                    return token
+        token, expire_in = _refresh_token_from_api()
+        if got_lock:
+            try:
+                r.delete(lock_key)
+            except Exception:   # noqa: BLE001
+                pass
+        if token:
+            r.set(key, token, ex=max(60, expire_in - _TOKEN_EARLY_REFRESH_S))
+            _set_l1(token, expire_in)
+            logger.info("access_token 刷新成功（redis 共享）, expires_in=%ds", expire_in)
+            return token
+        return None
+    except Exception as e:   # noqa: BLE001
+        logger.warning("Redis token 缓存路径失败，回退直连: %s", e)
+        return None
+
 
 def _get_access_token() -> Optional[str]:
-    """
-    获取钉钉 access_token（带缓存，过期前 5 分钟自动刷新）。
+    """获取钉钉 access_token（L1 进程内缓存；redis 后端下 L2 多实例共享，提前 5 分钟刷新）。
 
     POST https://api.dingtalk.com/v1.0/oauth2/accessToken
     """
-    global _cached_token, _token_expires_at
-
-    with _token_lock:
-        # 缓存有效（提前 5 分钟刷新）
-        if _cached_token and time.time() < _token_expires_at - 300:
-            return _cached_token
-
-        client_id = os.environ.get("DINGTALK_CLIENT_ID", "")
-        client_secret = os.environ.get("DINGTALK_CLIENT_SECRET", "")
-        if not client_id or not client_secret:
-            logger.warning("DINGTALK_CLIENT_ID 或 DINGTALK_CLIENT_SECRET 未配置")
-            return None
-
-        try:
-            resp = requests.post(
-                "https://api.dingtalk.com/v1.0/oauth2/accessToken",
-                json={"appKey": client_id, "appSecret": client_secret},
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            )
-            if resp.status_code != 200:
-                logger.error("获取 access_token 失败: status=%s, body=%s", resp.status_code, resp.text)
-                return None
-
-            data = resp.json()
-            _cached_token = data.get("accessToken")
-            expire_in = data.get("expireIn", 7200)
-            _token_expires_at = time.time() + expire_in
-
-            logger.info("access_token 刷新成功, expires_in=%ds", expire_in)
-            return _cached_token
-
-        except Exception as e:
-            logger.error("获取 access_token 异常: %s", e, exc_info=True)
-            return None
+    now = time.time()
+    cached = _l1_valid(now)          # L1 快路径（两后端一致）
+    if cached:
+        return cached
+    if _token_cache_backend() == "redis":
+        token = _get_token_via_redis(now)
+        if token is not None:
+            return token             # redis 路径失败返回 None → 落直连兜底（fail-open）
+    return _refresh_and_cache_l1(now)
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -2038,6 +2038,7 @@ if __name__ == "__main__":
 #   ⚠️ 本块必须保持在文件底部：路由模块顶层 from-import 本模块的共享件，
 #   依赖上方全部名字已定义。
 # ═══════════════════════════════════════════════════════════════
+from opensearch_pipeline.routes import agent as _routes_agent  # noqa: E402  企业 Agent 入口（RAG_AGENT_ENABLE 默认 off；agent_runtime 惰性加载）
 from opensearch_pipeline.routes import console as _routes_console  # noqa: E402
 from opensearch_pipeline.routes import contribution as _routes_contribution  # noqa: E402
 from opensearch_pipeline.routes import kb_access as _routes_kb_access  # noqa: E402
@@ -2048,6 +2049,7 @@ app.include_router(_routes_kb_console.router)
 app.include_router(_routes_kb_access.router)
 app.include_router(_routes_contribution.router)
 app.include_router(_routes_console.router)
+app.include_router(_routes_agent.router)   # /api/agent/ask（独立路由，flag-off 时 404）
 
 # re-export：tests 直接调用 api.<endpoint>(...) / 引用 api.Kb* 模型与域内常量。
 # —— routes/kb_console.py ——

@@ -132,15 +132,42 @@ def _is_dingtalk_webhook(url: str) -> bool:
 _seen_msg_ids: Dict[str, float] = {}
 _seen_msg_lock = threading.Lock()
 _SEEN_MSG_MAX = 20000
+# C4 两阶段去重（redis 后端）：claim「领用」态最长存活；短于此崩溃即由钉钉重投恢复，
+# 成功后 _confirm_msg 升级为 done+完整去重窗（_TIMESTAMP_TOLERANCE）。
+_MSG_DEDUP_CLAIM_TTL_S = int(os.environ.get("RAG_MSG_DEDUP_CLAIM_TTL", "60"))
+
+
+def _msg_dedup_backend() -> str:
+    return os.environ.get("RAG_MSG_DEDUP_BACKEND", "memory").strip().lower()
+
+
+def _redis_msg_key(msg_id: str) -> str:
+    from opensearch_pipeline import redis_client
+    return redis_client.key("dt", "msg", msg_id)
 
 
 def _is_duplicate_msg(msg_id: str) -> bool:
-    """msgId 在防重放窗口内是否已处理过。空 / 缺失 msgId 无法去重 → 一律按新消息放行。
+    """msgId 在防重放窗口内是否已处理过（= claim 领用）。空 / 缺失 → 一律按新消息放行。
 
-    首次见到即登记（now+TTL 过期）并返回 False；窗口内二次见到返回 True。TTL 对齐签名时间窗
-    （_TIMESTAMP_TOLERANCE）。粗粒度防胀：条目超 _SEEN_MSG_MAX 先清过期，仍超则整表清空。"""
+    memory 后端（默认，行为不变）：首见即登记（now+TTL），窗口内二次见到 True。TTL 对齐
+      签名时间窗（_TIMESTAMP_TOLERANCE）；粗粒度防胀：超 _SEEN_MSG_MAX 先清过期，仍超则清空。
+    redis 后端：SET NX「领用」（短 claim TTL）→ 领用成功=新消息(False)，键已存在
+      (processing/done)=重复(True)。处理成功由 _confirm_msg 升级 done+完整窗，失败由
+      _release_msg 释放（评审 C4：先占位后崩溃不永久吞消息）。
+    redis 故障 fail-open（返回 False 放行）：去重是辅助防护，宁可重复处理不丢/不阻断
+      （评审 C4「丢消息 > 重复处理」）。
+    """
     if not msg_id or msg_id == "?":
         return False
+    if _msg_dedup_backend() == "redis":
+        try:
+            from opensearch_pipeline import redis_client
+            claimed = redis_client.get_client().set(
+                _redis_msg_key(msg_id), "processing", nx=True, px=_MSG_DEDUP_CLAIM_TTL_S * 1000)
+            return not claimed
+        except Exception as e:   # noqa: BLE001
+            logger.warning("Redis 去重领用失败，fail-open 放行: %s", e)
+            return False
     now = time.time()
     ttl = _TIMESTAMP_TOLERANCE
     with _seen_msg_lock:
@@ -154,6 +181,28 @@ def _is_duplicate_msg(msg_id: str) -> bool:
                 _seen_msg_ids.clear()
         _seen_msg_ids[msg_id] = now + ttl
         return False
+
+
+def _confirm_msg(msg_id: str) -> None:
+    """处理成功 → 升级为 done + 完整去重窗（评审 C4，仅 redis 后端；memory 无操作）。"""
+    if not msg_id or msg_id == "?" or _msg_dedup_backend() != "redis":
+        return
+    try:
+        from opensearch_pipeline import redis_client
+        redis_client.get_client().set(_redis_msg_key(msg_id), "done", ex=_TIMESTAMP_TOLERANCE)
+    except Exception as e:   # noqa: BLE001
+        logger.warning("Redis 去重确认失败（忽略）: %s", e)
+
+
+def _release_msg(msg_id: str) -> None:
+    """处理失败 → 释放领用，钉钉重投可重试（评审 C4，仅 redis；memory 无操作，保持原语义）。"""
+    if not msg_id or msg_id == "?" or _msg_dedup_backend() != "redis":
+        return
+    try:
+        from opensearch_pipeline import redis_client
+        redis_client.get_client().delete(_redis_msg_key(msg_id))
+    except Exception as e:   # noqa: BLE001
+        logger.warning("Redis 去重释放失败（忽略）: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -877,12 +926,24 @@ def _process_webhook_body(body: dict):
         body.get("msgId", "?"),
     )
 
-    # 事件级幂等（P2-09）：同一 msgId 在签名时间窗内二次投递（重放/网络重试）→ 直接忽略，
-    # 不再触发一次 RAG/LLM 调用与重复回复。放在问题提取/「补充原因」回收/ack 之前。
-    if _is_duplicate_msg(str(body.get("msgId") or "")):
+    # 事件级幂等（P2-09 + 评审 C4 两阶段）：claim 领用 → 处理 → confirm 确认 / release 释放。
+    # 放在问题提取/「补充原因」回收/ack 之前。redis 后端 claim 用短 TTL，处理成功才升级
+    # done+完整去重窗，失败释放领用（不永久吞消息）；memory 后端 confirm/release 为空操作。
+    msg_id = str(body.get("msgId") or "")
+    if _is_duplicate_msg(msg_id):
         logger.info("钉钉消息重复投递已忽略（幂等）: msgId=%s", body.get("msgId", "?"))
         return {"msgtype": "duplicate"}
+    try:
+        result = _process_claimed_body(body)
+    except Exception:
+        _release_msg(msg_id)   # 处理失败 → 释放领用，钉钉重投可重试（评审 C4：不永久吞消息）
+        raise
+    _confirm_msg(msg_id)       # 处理完成才确认（评审 C4）
+    return result
 
+
+def _process_claimed_body(body: dict):
+    """去重领用通过后的实际处理（问题提取 /「补充原因」回收 / 新会话 / ack / 起 RAG 线程）。"""
     # 3. 提取问题文本
     question = _extract_question(body)
     session_webhook = body.get("sessionWebhook", "")

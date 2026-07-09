@@ -12,7 +12,7 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 022。历史上有三对编号冲突（002/003/006 各两个文件，
+3. **编号严格单调递增**，下一个可用号 = 025。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
 4. **`CREATE DATABASE` 必须显式 `CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci`**，每张新表
    显式 COLLATE —— staging `_stg` 库曾因缺省漂移到 `_0900_ai_ci` 引发跨库 JOIN 1267。
@@ -49,6 +49,9 @@ apply 脚本落库并记台账。
 | 019_chunk_meta_index_retry.sql | fuling_knowledge | chunk_meta.index_retry_count + DEAD 死信终态（G9：毒 chunk 队头阻塞修复；代码侧 1054 fail-open） |
 | 020_document_version_simhash.sql | fuling_knowledge | document_version.content_simhash（G19：simhash 近重复 WARN；代码侧 1054 fail-open） |
 | 021_ingest_quality_metrics.sql | fuling_knowledge | ingest_quality_metrics 批次质量指标表（G22 per-batch 质量哨兵；写侧 fail-open） |
+| 022_agent_runtime.sql | fuling_operation | 企业级 Agent Runtime durable 表族：tool_registry + agent_run（单向状态机+心跳）+ agent_step + agent_checkpoint + tool_invocation（uk_tool_idem 幂等）（WS1-2；run_store.py） |
+| 023_llm_call_log.sql | fuling_operation | LLM 调用账本（ModelGateway 每次调用记 token/成本/延迟；成本按 user/dept 归集，E5）（WS1 收尾②） |
+| 024_agent_audit_log.sql | fuling_operation | Agent 合规审计（append-only；执行前 write-ahead 审计，HIGH_WRITE fail-closed / 普通 fail-open；audit.py）（WS1 收尾③） |
 
 ## 台账（schema_migrations）
 
