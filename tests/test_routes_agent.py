@@ -137,6 +137,41 @@ def test_shadow_link_sse(monkeypatch, wired):
         api.app.dependency_overrides.clear()
 
 
+def test_failed_run_logs_agent_error(monkeypatch):
+    """run 失败 → qa_session_log 落 AGENT_ERROR 行（深度审查治理组：此前失败对运维零可见），
+    且失败不进会话记忆。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+
+    class _BoomProvider:
+        name = "dashscope"
+
+        def capabilities(self, m):
+            return None
+
+        def chat(self, model, req):
+            raise RuntimeError("provider down")
+
+    registry = build_default_registry()
+    store = _FakeStore()
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _BoomProvider()},
+                           routes={"light": [("dashscope", "m")]}, max_retries=0)
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime", lambda: (registry, gateway, executor, store))
+    logged = []
+    import opensearch_pipeline.qa_logger as ql
+    monkeypatch.setattr(ql, "log_qa_session", lambda **kw: logged.append(kw))
+    try:
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "会失败的问题"})
+        assert r.status_code == 200 and '"type": "error"' in r.text
+        assert logged, "失败 run 必须落 qa_session_log"
+        assert logged[-1]["answer_status"] == "AGENT_ERROR"
+        assert logged[-1]["model_name"] == "agent" and logged[-1]["error_message"]
+    finally:
+        executor.shutdown()
+        api.app.dependency_overrides.clear()
+
+
 def test_approve_disabled_returns_404(monkeypatch):
     monkeypatch.delenv("RAG_AGENT_ENABLE", raising=False)
     try:
@@ -213,4 +248,212 @@ def test_multi_turn_feeds_prior_history(monkeypatch):
     finally:
         ss.clear_session(tid, owner="u1", trusted=True)
         executor.shutdown()
+        api.app.dependency_overrides.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 审批闭环（schema/025 + 职责分离；深度审查 A 组 P1）：
+# 自批 403 / 发起人撤回 200 / kb_admin·dept_admin scope 裁决 / 决定持久化 / 审批队列
+# ─────────────────────────────────────────────────────────────────────────────
+class _SuspendedStore(_FakeStore):
+    """带内存 CAS 状态机的假 run store（approve 路径用）。"""
+
+    def __init__(self, run_id="r1", user_id="u1"):
+        super().__init__()
+        self.run = {"run_id": run_id, "status": "suspended", "user_id": user_id,
+                    "channel": "console", "agent_profile": "default", "started_at": None,
+                    "ended_at": None, "thread_id": "appr-t1", "conversation_id": None}
+
+    def get_run(self, run_id):
+        return dict(self.run) if run_id == self.run["run_id"] else None
+
+    def load_latest_checkpoint(self, run_id):
+        return None
+
+    def heartbeat(self, run_id):
+        pass
+
+    def transition(self, run_id, frm, to):
+        if self.run["status"] != frm:
+            return False
+        self.run["status"] = to
+        self.transitions.append((run_id, frm, to))
+        return True
+
+
+class _FakeApprovalStore:
+    def __init__(self, areq=None):
+        self.areq = areq
+        self.decisions = []
+
+    def get_latest_by_run(self, run_id):
+        return dict(self.areq) if self.areq and self.areq["run_id"] == run_id else None
+
+    def decide(self, request_id, *, decision, decided_by, reason=None,
+               edited_args=None, idempotency_key=None):
+        self.decisions.append({"request_id": request_id, "decision": decision,
+                               "decided_by": decided_by})
+        self.areq["status"] = decision
+        return "accepted"
+
+    def list_pending(self, scopes=None, *, requested_by=None, limit=100):
+        items = [dict(self.areq)] if self.areq and self.areq["status"] == "pending" else []
+        if scopes is not None:
+            items = [a for a in items if a.get("approver_scope") in set(scopes)]
+        if requested_by:
+            items = [a for a in items if a.get("requested_by") == requested_by]
+        return items
+
+    def expire_stale(self):
+        return 0
+
+
+def _areq(run_id="r1", scope="production", requested_by="u1"):
+    return {"request_id": "req1", "run_id": run_id, "call_id": "c1", "tool_name": "u8_writeback",
+            "tool_version": "1.0", "proposed_args": {"qty": 7}, "args_digest": "d",
+            "render_summary": "u8_writeback(qty)", "requested_by": requested_by,
+            "requested_dept": scope, "approver_scope": scope, "status": "pending",
+            "expires_at": None, "created_at": None, "decided_at": None}
+
+
+def _kb_ident(role, granted=()):
+    from opensearch_pipeline.kb_authz import KbIdentity
+    return KbIdentity.build(user_id="whoever", role=role, granted_owner_depts=list(granted))
+
+
+@pytest.fixture
+def approval_wired(monkeypatch):
+    """approve 路径打桩：挂起 run + 假审批存储 + 假 gateway（terminate 不触模型）。
+    限流打桩为 no-op：本组测授权矩阵，RAG_ENV=local 组合跑时真限流的跨测试计数会误伤。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    monkeypatch.setattr(agent_route, "_enforce_rate_limit", lambda *a, **k: None)
+    registry = build_default_registry()
+    store = _SuspendedStore()
+    astore = _FakeApprovalStore(_areq())
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _FakeProvider()}, routes={"light": [("dashscope", "m")]})
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime", lambda: (registry, gateway, executor, store))
+    monkeypatch.setattr(agent_route, "_get_approval_store", lambda: astore)
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: [
+        {"doc_id": "D1", "chunk_text": "GB/T 包装标准全文…", "doc_title": "包装规范"}])
+    # 发起人身份现解（resume ctx 重建用）
+    import opensearch_pipeline.dingtalk_identity as di
+    monkeypatch.setattr(di, "_resolve_user_identity",
+                        lambda uid: {"dept": ["production"], "name": uid})
+    yield store, astore, executor, monkeypatch
+    from opensearch_pipeline import session_store as ss
+    ss.clear_session("appr-t1", owner="u1", trusted=True)
+    executor.shutdown()
+
+
+def _post_approve(identity, run_id="r1", kind="approved"):
+    return _client(identity).post("/api/agent/approve",
+                                  json={"run_id": run_id, "outcome": {"kind": kind}})
+
+
+def test_approve_self_blocked_403(approval_wired):
+    """发起人自批被拒（职责分离）——深度审查 A 组「审批人=发起人」的硬修。"""
+    try:
+        r = _post_approve(_identity(), kind="approved")       # identity.user_id == run.user_id == u1
+        assert r.status_code == 403
+        assert "职责分离" in r.text
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_self_terminate_allowed(approval_wired):
+    """发起人可撤回自己的申请（rejected_terminate）→ run cancelled + 决定持久化。"""
+    store, astore, _, _ = approval_wired
+    try:
+        r = _post_approve(_identity(), kind="rejected_terminate")
+        assert r.status_code == 200
+        assert store.run["status"] == "cancelled"
+        assert astore.decisions and astore.decisions[0]["decision"] == "rejected_terminate"
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_other_employee_403(approval_wired):
+    """非发起人 + 非管理员（DB 现查 employee）→ 403。"""
+    _, _, _, mp = approval_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    try:
+        other = Identity(user_id="u2", acl_groups=["production"], role="kb_admin")  # 令牌 role 是提示，不可信
+        r = _post_approve(other, kind="approved")
+        assert r.status_code == 403
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_dept_admin_scope_mismatch_403(approval_wired):
+    """dept_admin 但 approver_scope 不在其 managed 集合 → 403。"""
+    _, _, _, mp = approval_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("dept_admin", granted=("hr",)))
+    try:
+        r = _post_approve(Identity(user_id="u2", acl_groups=["hr"], role="employee"))
+        assert r.status_code == 403
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_dept_admin_scope_match_executes(approval_wired):
+    """dept_admin 且 scope 覆盖 → 放行；决定持久化（decided_by=审批人），run 续跑。"""
+    store, astore, _, mp = approval_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity",
+               lambda uid: _kb_ident("dept_admin", granted=("production",)))
+    try:
+        r = _post_approve(Identity(user_id="u2", acl_groups=["production"], role="employee"))
+        assert r.status_code == 200
+        assert astore.decisions and astore.decisions[0]["decided_by"] == "u2"
+        assert ("r1", "suspended", "resuming") in store.transitions
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_already_decided_409(approval_wired):
+    """请求已被处置（非 pending 且与本次处置不同向）→ 409（迟到决策拒绝）。"""
+    _, astore, _, mp = approval_wired
+    astore.areq["status"] = "rejected_terminate"
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+    try:
+        r = _post_approve(Identity(user_id="u2", acl_groups=["production"], role="employee"))
+        assert r.status_code == 409
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approvals_queue_employee_403(approval_wired):
+    _, _, _, mp = approval_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    try:
+        r = _client(_identity()).get("/api/agent/approvals")
+        assert r.status_code == 403
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approvals_queue_scoping(approval_wired):
+    """kb_admin 见全部；dept_admin 只见 scope 覆盖的；?mine=1 给发起人看自己的 pending。"""
+    _, _, _, mp = approval_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    try:
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+        assert len(_client(_identity()).get("/api/agent/approvals").json()["items"]) == 1
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("dept_admin", granted=("hr",)))
+        assert _client(_identity()).get("/api/agent/approvals").json()["items"] == []
+        mp.setattr(di, "resolve_kb_identity",
+                   lambda uid: _kb_ident("dept_admin", granted=("production",)))
+        assert len(_client(_identity()).get("/api/agent/approvals").json()["items"]) == 1
+        # 发起人视角（employee 也可）：只看自己的
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+        assert len(_client(_identity()).get("/api/agent/approvals?mine=1").json()["items"]) == 1
+        other = Identity(user_id="u9", acl_groups=["hr"], role="employee")
+        assert _client(other).get("/api/agent/approvals?mine=1").json()["items"] == []
+    finally:
         api.app.dependency_overrides.clear()

@@ -6,7 +6,6 @@ test_agent_runtime_policy.py — PolicyEngine（deny-first）+ adjudicator（Tas
 scope/role/channel 匹配 · obligations 汇集 · adjudicator 各路径（allow 执行 / deny / 未知 / 停用 /
 schema 违规 / require_approval 挂起不执行）。
 """
-import pytest
 
 from opensearch_pipeline.agent_runtime.context import ExecutionContext
 from opensearch_pipeline.agent_runtime.events import ToolCallProposed

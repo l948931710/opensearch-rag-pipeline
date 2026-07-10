@@ -55,6 +55,7 @@ class RunHandle:
         self._cancel = threading.Event()
         self._done = threading.Event()
         self._on_complete = None            # Callable[[str], None]，由 submit/resume 注入
+        self._on_failure = None             # Callable[[str], None]，失败侧回调（运维可观测，深度审查治理组）
 
     def events(self) -> Iterator[AgentEvent]:
         """阻塞式消费事件流，直到 run 终止（SSE 端点在此迭代并转 SSE 帧）。"""
@@ -85,7 +86,8 @@ class ThreadedRunExecutor:
     """(b) 每进程有界执行器。"""
 
     def __init__(self, run_store: RunStore, adjudicator: Adjudicator,
-                 max_concurrent: int = 4, agent_profile: str = "default", approvals=None):
+                 max_concurrent: int = 4, agent_profile: str = "default", approvals=None,
+                 approval_store=None):
         self._store = run_store
         self._adjudicate = adjudicator
         self._max = max_concurrent
@@ -96,6 +98,9 @@ class ThreadedRunExecutor:
         # WS3 审批：{f"{run_id}:{call_id}": ApprovalOutcome}。resume 写入已批准 call，adjudicator 据此
         # 绕过 require_approval 直接执行。须与 make_adjudicator(approvals=同一 dict) 共享同一引用。
         self._approvals = approvals if approvals is not None else {}
+        # WS3 审批持久化（schema/025）：挂起侧写 approval_request（fail-closed——请求行写不成则
+        # 挂起视为失败，绝不产生审批队列里看不见、只能等过期的黑洞 run）。None = 未接（直驱测试）。
+        self._approval_store = approval_store
 
     def _acquire(self) -> None:
         with self._lock:
@@ -108,12 +113,13 @@ class ThreadedRunExecutor:
             self._active -= 1
 
     def submit(self, ctx: ExecutionContext, loop: AgentLoop,
-               messages: List, tools: List, on_complete=None) -> RunHandle:
+               messages: List, tools: List, on_complete=None, on_failure=None) -> RunHandle:
         self._acquire()
         try:
             run_id = self._store.create_run(ctx, self._profile)
             handle = RunHandle(run_id)
             handle._on_complete = on_complete
+            handle._on_failure = on_failure
             # run_id 建 run 后**就地回填**共享 ctx（route 把同一 ctx 既闭包进 model_fn 又传本方法；
             # 用 with_run_id 造副本会让 model_fn 闭包的 run_id 仍 None → llm_call_log 记账落空。
             # run_id 是"建 run 后回填"字段、非身份/ACL，就地 setattr 不违 frozen 初衷）。
@@ -126,7 +132,7 @@ class ThreadedRunExecutor:
             raise
 
     def resume(self, run_id: str, ctx: ExecutionContext, outcome, loop: AgentLoop,
-               tools: List, on_complete=None) -> RunHandle:
+               tools: List, on_complete=None, on_failure=None) -> RunHandle:
         """WS3 两步 resume：① CAS suspended→resuming（认领，防两审批回调并发重入）② 载 checkpoint +
         记 approvals（批准/改参令 adjudicator 绕过审批执行）+ resuming→running + 驱动 loop.resume。
         返回续跑 run 的 handle。outcome ∈ Approved/Edited/RejectedFeedback/RejectedTerminate。
@@ -171,6 +177,7 @@ class ThreadedRunExecutor:
             claimed = False                               # 已交棒 running：失败恢复归驱动器
             handle = RunHandle(run_id)
             handle._on_complete = on_complete
+            handle._on_failure = on_failure
             gen = loop.resume(ctx, state, outcome, tools)
             base = self._budget_snapshot(run_id, fallback_turns=int(state.get("turn", 0)) + 1)
             self._pool.submit(self._drive_gen, ctx, gen, handle, base)
@@ -232,10 +239,11 @@ class ThreadedRunExecutor:
                     # 对外发**剥离 state_messages** 的干净 RunSuspended（带 approval_request_id/checkpoint_id）。
                     # ⚠️ 迁移必须成功才发 approval 帧：迁移被吞时 run 行仍 running、审批端从此 409，
                     # 成为无驱动僵尸而用户以为在等审批（深度审查 B 组）。
-                    cp_id, aid = self._persist_suspend(run_id, ev)
+                    cp_id, aid = self._persist_suspend(ctx, run_id, ev)
                     if not self._transition_checked(run_id, "running", "suspended"):
                         self._safe_transition(run_id, "running", "failed")
                         handle._emit(RunFailed(error="挂起状态落库失败，请重试", retryable=True))
+                        self._notify_failure(handle, "挂起状态落库失败")
                         break
                     handle._emit(RunSuspended(approval_request_id=aid, checkpoint_id=cp_id,
                                               pending_call=ev.pending_call, turn_index=ev.turn_index))
@@ -253,6 +261,7 @@ class ThreadedRunExecutor:
                 handle._emit(ev)
                 if isinstance(ev, RunFailed):
                     self._safe_transition(run_id, "running", "failed")
+                    self._notify_failure(handle, ev.error)
                     break
                 if handle.cancelled():
                     gen.close()
@@ -265,6 +274,7 @@ class ThreadedRunExecutor:
         except Exception as e:   # noqa: BLE001 — run 内部异常不外泄，落 failed + 事件
             self._safe_transition(run_id, "running", "failed")
             handle._emit(RunFailed(error=str(e), retryable=False))
+            self._notify_failure(handle, str(e))
         finally:
             handle._finish()
             self._release()
@@ -280,8 +290,23 @@ class ThreadedRunExecutor:
             import logging
             logging.getLogger(__name__).warning("run on_complete 回调失败", exc_info=True)
 
-    def _persist_suspend(self, run_id: Optional[str], ev: RunSuspended) -> tuple:
-        """挂起持久化：encode loop 带来的状态 → save_checkpoint；记 approval agent_step；
+    @staticmethod
+    def _notify_failure(handle: RunHandle, error: str) -> None:
+        """失败侧回调（qa_session_log AGENT_ERROR 行等运维可观测挂点）。fail-open。"""
+        cb = handle._on_failure
+        if cb is None:
+            return
+        try:
+            cb(error)
+        except Exception:   # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning("run on_failure 回调失败", exc_info=True)
+
+    def _persist_suspend(self, ctx: ExecutionContext, run_id: Optional[str],
+                         ev: RunSuspended) -> tuple:
+        """挂起持久化：encode loop 带来的状态 → save_checkpoint；写 approval_request（schema/025，
+        接了 approval_store 时 **fail-closed**——写不成即抛，调用方把 run 落 failed，绝不产生
+        审批队列不可见的黑洞 run）；记 approval agent_step（payload 脱敏，022 契约）。
         返回 (checkpoint_id, approval_request_id)。"""
         import uuid
 
@@ -289,11 +314,18 @@ class ThreadedRunExecutor:
         blob, digest = encode_checkpoint(ev.state_messages or [], pending_call=ev.pending_call,
                                          turn=ev.turn_index)
         cp_id = self._store.save_checkpoint(run_id, blob, digest)
-        aid = uuid.uuid4().hex
-        try:                                            # 步骤序含审批点（fail-open）
+        if self._approval_store is not None and ev.pending_call:
+            aid = self._approval_store.create_request(run_id, ctx, ev.pending_call)
+        else:
+            aid = uuid.uuid4().hex                      # 未接持久化（直驱测试）：沿用内存 id
+        try:                                            # 步骤序含审批点（fail-open；参数脱敏后入 payload）
             from opensearch_pipeline.agent_runtime.run_store import AgentStep
+            from opensearch_pipeline.agent_runtime.sanitize import sanitize_args
+            pc = dict(ev.pending_call or {})
+            if "arguments" in pc:
+                pc["arguments"] = sanitize_args(pc["arguments"])
             self._store.append_step(run_id, AgentStep(
-                kind="approval", payload={"pending_call": ev.pending_call, "approval_request_id": aid}))
+                kind="approval", payload={"pending_call": pc, "approval_request_id": aid}))
         except Exception:   # noqa: BLE001
             pass
         return cp_id, aid
@@ -355,6 +387,7 @@ class ThreadedRunExecutor:
             pass
         self._safe_transition(run_id, "running", "failed")
         handle._emit(RunFailed(error=msg, retryable=False))
+        self._notify_failure(handle, msg)
 
     def _safe_transition(self, run_id: Optional[str], frm: str, to: str) -> None:
         try:

@@ -1607,11 +1607,15 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 fails += 1; logger.warning("kb_governance file_types 失败: %s", e)
             # 11) 服务可用性：问答API成功率(非 LLM_ERROR) / 检索API成功率(hit_count 非空) / 近30天总数 / 近24h错误数。
             #     检索错误（HA3 connection refused）在 serving 里落到 LLM_ERROR + hit_count=NULL，故用 NULL 判检索未完成。
+            #     ⚠️ 排除 agent 行（model_name='agent'）：agent 不填 opensearch_hit_count（恒 NULL）——
+            #     不排除则 agent 用量一涨检索成功率就假跌（深度审查治理组「agent 行污染看板」）；
+            #     agent 可用性走 agent_run/AGENT_ERROR 自己的口径。
             try:
                 cur.execute(
                     "SELECT COUNT(*), SUM(answer_status='LLM_ERROR'), SUM(opensearch_hit_count IS NULL)"
                     f" FROM {_op_db()}.qa_session_log"
-                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)", (win,))
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " AND (model_name IS NULL OR model_name <> 'agent')", (win,))
                 r = cur.fetchone() or (0, 0, 0)
                 tot = int(r[0] or 0); llm_err = int(r[1] or 0); hit_null = int(r[2] or 0)
                 out.qa_total_30d = tot
@@ -1619,7 +1623,8 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 out.retrieval_api_success_rate = round((tot - hit_null) / tot, 4) if tot else 0.0
                 cur.execute(
                     f"SELECT SUM(answer_status LIKE '%ERROR%') FROM {_op_db()}.qa_session_log"
-                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)")
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+                    " AND (model_name IS NULL OR model_name <> 'agent')")
                 out.errors_24h = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance availability 失败: %s", e)

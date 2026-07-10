@@ -18,7 +18,6 @@ make_adjudicator 把"schema 校验 → Policy 裁决 → registry.resolve → to
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -132,6 +131,7 @@ def make_adjudicator(registry: "ToolRegistry", policy: PolicyEngine, run_store,
     from opensearch_pipeline.agent_runtime.audit import NULL_AUDIT
     from opensearch_pipeline.agent_runtime.registry import ToolDisabled, ToolNotFound
     from opensearch_pipeline.agent_runtime.run_store import AgentStep
+    from opensearch_pipeline.agent_runtime.sanitize import sanitize_args_json
     from opensearch_pipeline.agent_runtime.tool import ToolArgsError, ToolResult
     from opensearch_pipeline.agent_runtime.tool_executor import ToolExecutor, digest
 
@@ -139,9 +139,10 @@ def make_adjudicator(registry: "ToolRegistry", policy: PolicyEngine, run_store,
     audit_log = audit or NULL_AUDIT
 
     def _rec(ctx, step_no, ev, version, status, decision, policy_id):
+        # args_json 脱敏后入库（022 契约「脱敏后入 JSON，原文只留 digest」）；digest 按原文算
         run_store.record_invocation(
             ctx.run_id, step_no, tool_name=ev.tool_name, tool_version=version,
-            args_json=json.dumps(ev.arguments, ensure_ascii=False), args_digest=digest(ev.arguments),
+            args_json=sanitize_args_json(ev.arguments), args_digest=digest(ev.arguments),
             idempotency_key=None, status=status, policy_decision=decision, policy_id=policy_id)
 
     def _audit_verdict(ctx, ev, decision, policy_id, risk=None):

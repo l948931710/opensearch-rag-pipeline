@@ -96,6 +96,7 @@ MANIFEST="
 022_agent_runtime.sql operation
 023_llm_call_log.sql operation
 024_agent_audit_log.sql operation
+025_approval_workflow.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }

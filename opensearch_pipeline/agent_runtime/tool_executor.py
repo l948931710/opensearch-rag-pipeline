@@ -10,8 +10,8 @@ tool_executor.py — 工具执行中间件栈（v2 报告 §4⑥/§9.3 模块 I�
 
 audit 中间件（agent_audit_log）已挂：ALLOW 执行前写一条合规审计（write-ahead）——HIGH_WRITE
 **fail-closed**（审计不可写→阻断，绝不产生无审计的高风险副作用），READ_ONLY/LOW_WRITE fail-open。
-见 audit.py。args_json 脱敏（报告 §6"脱敏后入 JSON"）为后续（tool_invocation 当前存原文 + digest；
-合规审计只落 digest）。
+见 audit.py。args_json 按 022 契约**脱敏后入库**（sanitize.py；digest 按原文算供关联回放），
+合规审计只落 digest。
 """
 from __future__ import annotations
 
@@ -98,9 +98,10 @@ class ToolExecutor:
             if not idempotency_key:
                 # 契约唯一强制点：key 缺失绝不能静默放行（NULL 键 uk_tool_idem 不去重，
                 # 幂等契约在最需要它的地方形同虚设——深度审查 C 组）。
+                from opensearch_pipeline.agent_runtime.sanitize import sanitize_args_json
                 self._store.record_invocation(
                     run_id, step_no, tool_name=spec.name, tool_version=spec.version,
-                    args_json=json.dumps(args, ensure_ascii=False), args_digest=digest(args),
+                    args_json=sanitize_args_json(args), args_digest=digest(args),
                     idempotency_key=None, status="denied",
                     policy_decision=policy_decision, policy_id=policy_id)
                 return ToolResult.fail(
@@ -118,10 +119,11 @@ class ToolExecutor:
         # 2. 熔断
         if self._breaker.is_open(spec.name):
             return ToolResult.fail(f"工具 {spec.name} 熔断打开，暂不可用")
-        # 记 executing
+        # 记 executing（args_json 脱敏后入库，022 契约；digest 按原文算供关联回放）
+        from opensearch_pipeline.agent_runtime.sanitize import sanitize_args_json
         inv_id = self._store.record_invocation(
             run_id, step_no, tool_name=spec.name, tool_version=spec.version,
-            args_json=json.dumps(args, ensure_ascii=False), args_digest=digest(args),
+            args_json=sanitize_args_json(args), args_digest=digest(args),
             idempotency_key=idempotency_key, status="executing",
             policy_decision=policy_decision, policy_id=policy_id)
         # audit（write-ahead）：执行前记合规审计。HIGH_WRITE fail-closed=审计不可写则阻断执行

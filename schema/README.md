@@ -52,6 +52,7 @@ apply 脚本落库并记台账。
 | 022_agent_runtime.sql | fuling_operation | 企业级 Agent Runtime durable 表族：tool_registry + agent_run（单向状态机+心跳）+ agent_step + agent_checkpoint + tool_invocation（uk_tool_idem 幂等）（WS1-2；run_store.py） |
 | 023_llm_call_log.sql | fuling_operation | LLM 调用账本（ModelGateway 每次调用记 token/成本/延迟；成本按 user/dept 归集，E5）（WS1 收尾②） |
 | 024_agent_audit_log.sql | fuling_operation | Agent 合规审计（append-only；执行前 write-ahead 审计，HIGH_WRITE fail-closed / 普通 fail-open；audit.py）（WS1 收尾③） |
+| 025_approval_workflow.sql | fuling_operation | Agent 审批闭环持久化：approval_request（挂起侧写，approver_scope + 过期即拒）+ approval_decision（决策侧写，uk_req_idem 幂等）——request→decision→invocation→audit 四表回放链（WS3；approval_store.py；深度审查 A 组 P1） |
 
 ## 台账（schema_migrations）
 

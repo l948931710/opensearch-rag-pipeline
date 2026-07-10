@@ -35,8 +35,9 @@ def _db_ready():
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM information_schema.tables "
                         "WHERE table_schema=DATABASE() AND table_name IN "
-                        "('agent_run','agent_step','tool_invocation','llm_call_log')")
-            ok = cur.fetchone()[0] == 4
+                        "('agent_run','agent_step','tool_invocation','llm_call_log',"
+                        "'approval_request')")
+            ok = cur.fetchone()[0] == 5
         conn.close()
         return ok
     except Exception:
@@ -150,7 +151,7 @@ def test_full_run_persists_rows_with_run_id(monkeypatch):
 # 全部确定性（脚本 provider + mock retrieve）、真 RDSRunStore + RDSAuditLog、host-pin 本地。
 # ─────────────────────────────────────────────────────────────────────────────
 _TABLES = ("llm_call_log", "tool_invocation", "agent_checkpoint",
-           "agent_step", "agent_audit_log", "agent_run")
+           "agent_step", "agent_audit_log", "approval_request", "agent_run")
 
 
 def _cleanup_run(run_id):
@@ -430,14 +431,17 @@ def _ws3_loop(gateway, ctx):
 
 
 def _ws3_runtime(registry, policy, responses):
-    """WS3 共享 runtime：run_store + approvals(executor↔adjudicator 同引用) + gateway(脚本 provider)。"""
+    """WS3 共享 runtime：run_store + approvals(executor↔adjudicator 同引用) + gateway(脚本 provider)
+    + approval_store（schema/025：挂起侧落 approval_request，fail-closed）。"""
     from opensearch_pipeline.agent_runtime import ModelGateway, ThreadedRunExecutor, make_adjudicator
+    from opensearch_pipeline.agent_runtime.approval_store import RDSApprovalStore
     from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
     from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
     run_store = RDSRunStore()
     approvals = {}
     adjudicator = make_adjudicator(registry, policy, run_store, audit=RDSAuditLog(), approvals=approvals)
-    executor = ThreadedRunExecutor(run_store, adjudicator, max_concurrent=2, approvals=approvals)
+    executor = ThreadedRunExecutor(run_store, adjudicator, max_concurrent=2, approvals=approvals,
+                                   approval_store=RDSApprovalStore())
     gateway = ModelGateway({"dashscope": _SeqProvider(responses)},
                            routes={"default": [("dashscope", "qwen-test")]},
                            call_logger=run_store.record_llm_call, max_retries=0)
@@ -469,6 +473,11 @@ def test_ws3_suspend_then_approve_executes():
         assert counter["n"] == 0                            # 挂起时工具尚未执行
         assert _fetch("SELECT COUNT(*) FROM agent_step WHERE run_id=%s AND kind='approval'",
                       (run_id,))[0][0] >= 1                  # 审批点入步骤序
+        # schema/025：挂起侧落 approval_request(pending)，scope=发起人主属部门（四表回放链第一环）
+        areq = _fetch("SELECT status, approver_scope, requested_by, tool_name "
+                      "FROM approval_request WHERE run_id=%s", (run_id,))
+        assert areq and areq[0][0] == "pending" and areq[0][1] == "production"
+        assert areq[0][2] == "e2e" and areq[0][3] == "u8_writeback"
         # 批准 → 续跑执行
         ctx2 = _ws3_ctx()
         h2 = executor.resume(run_id, ctx2, Approved(), _ws3_loop(gateway, ctx2), reg.list_specs(ctx2))
