@@ -40,6 +40,7 @@ __all__ = [
     "ResolveResult",
     "Tau",
     "TauTable",
+    "auto_activation_enabled",
     "may_auto_activate",
 ]
 
@@ -73,22 +74,35 @@ class TauTable:
     非法条目跳过并告警（fail-open 到默认）——阈值配置坏了不应让解析瘫掉。
     """
 
+    @staticmethod
+    def _validate(t: Tau, where: str = "全局") -> None:
+        """P0-07：数值域 0 ≤ low ≤ high ≤ 1——负数/大于 1 的 typo 会把低置信规则
+        候选放进 auto（外审动态探针已复现），必须在构造期拦死。"""
+        if not (0.0 <= t.low <= t.high <= 1.0):
+            raise ValueError(f"{where} τ 非法：须 0 ≤ low({t.low}) ≤ high({t.high}) ≤ 1")
+
     def __init__(self, default: Tau = DEFAULT_TAU,
                  layered: Optional[Dict[tuple, Tau]] = None):
-        if default.high < default.low:
-            raise ValueError(f"τ_high({default.high}) 须 ≥ τ_low({default.low})")
+        self._validate(default)
+        for key, t in (layered or {}).items():
+            self._validate(t, where=f"分层 {key}")
         self._default = default
         self._layered = dict(layered or {})
 
     @classmethod
-    def from_env(cls) -> "TauTable":
+    def from_env(cls, *, strict: bool = False) -> "TauTable":
+        """strict=True（P0-07，离线写 worker——seeding/backfill/may_auto_activate）：
+        任何非法 τ 配置 **raise 阻断**，绝不回落到可 auto 的默认值——配置坏了宁可
+        停写，不能拿默认阈值继续 auto。strict=False（在线 resolve，纯读）保持
+        fail-open 回默认：阈值只影响候选标注，配坏不该让查询瘫掉。"""
         try:
             high = float(os.environ.get("RAG_ONTOLOGY_TAU_HIGH", DEFAULT_TAU.high))
             low = float(os.environ.get("RAG_ONTOLOGY_TAU_LOW", DEFAULT_TAU.low))
             default = Tau(high=high, low=low)
-            if high < low:
-                raise ValueError("high < low")
-        except Exception:   # noqa: BLE001 — 全局阈值配坏 → 回落代码默认
+            cls._validate(default)
+        except Exception as e:   # noqa: BLE001
+            if strict:
+                raise ValueError(f"RAG_ONTOLOGY_TAU_HIGH/LOW 非法（strict 模式阻断写 worker）：{e}")
             logger.warning("RAG_ONTOLOGY_TAU_HIGH/LOW 非法，回落默认 %s", DEFAULT_TAU)
             default = DEFAULT_TAU
         layered: Dict[tuple, Tau] = {}
@@ -96,17 +110,22 @@ class TauTable:
         if raw:
             try:
                 table = json.loads(raw)
-                for key, pair in table.items():
-                    try:
-                        prefix, method = key.split("|", 1)
-                        t = Tau(high=float(pair[0]), low=float(pair[1]))
-                        if t.high < t.low:
-                            raise ValueError("high < low")
-                        layered[(prefix.strip(), method.strip())] = t
-                    except Exception:   # noqa: BLE001
-                        logger.warning("RAG_ONTOLOGY_TAU_TABLE 条目非法，跳过: %r", key)
-            except Exception:   # noqa: BLE001
+            except Exception as e:   # noqa: BLE001
+                if strict:
+                    raise ValueError(f"RAG_ONTOLOGY_TAU_TABLE 非法 JSON（strict 模式阻断）：{e}")
                 logger.warning("RAG_ONTOLOGY_TAU_TABLE 非法 JSON，整表忽略")
+                table = {}
+            for key, pair in table.items():
+                try:
+                    prefix, method = key.split("|", 1)
+                    t = Tau(high=float(pair[0]), low=float(pair[1]))
+                    cls._validate(t, where=f"分层 {key}")
+                    layered[(prefix.strip(), method.strip())] = t
+                except Exception as e:   # noqa: BLE001
+                    if strict:
+                        raise ValueError(
+                            f"RAG_ONTOLOGY_TAU_TABLE 条目非法（strict 模式阻断）：{key!r}: {e}")
+                    logger.warning("RAG_ONTOLOGY_TAU_TABLE 条目非法，跳过: %r", key)
         return cls(default=default, layered=layered)
 
     def lookup(self, namespace: str, method: str) -> Tau:
@@ -155,16 +174,44 @@ class ResolveResult:
 
 
 # ── 离线 auto 资格（S1：唯一允许把"自动"变成"落库"的判定点；在线绝不调用）─────────
+def auto_activation_enabled() -> bool:
+    """P0-07 auto 硬关（默认候选-only）：需当日有效的
+    `RAG_ONTOLOGY_AUTO_ACK=<op>:<YYYY-MM-DD>:<gt_manifest_hash>`（**token 只能 Sam 设**，
+    对齐 RAG_ALLOW_UNFROZEN_RECHUNK 的 date-bound 纪律）。GT 分层标定签字前该 token
+    物理上无法合法构造（hash 由 PR14 backtest 工具按 GT manifest 打印）——机器化
+    「签字前 auto 不可能开」。缺失/过期/畸形 → 一切候选（含 0.96 同型同名）进 case。"""
+    raw = os.environ.get("RAG_ONTOLOGY_AUTO_ACK", "").strip()
+    if not raw:
+        return False
+    parts = raw.split(":")
+    if len(parts) != 3:
+        logger.warning("RAG_ONTOLOGY_AUTO_ACK 格式非法（op:date:gt_hash），auto 保持关闭")
+        return False
+    op, date_s, gt_hash = (p.strip() for p in parts)
+    from datetime import date
+    if not op or date_s != date.today().isoformat():
+        logger.warning("RAG_ONTOLOGY_AUTO_ACK 非当日/op 缺失，auto 保持关闭")
+        return False
+    if len(gt_hash) < 8:
+        logger.warning("RAG_ONTOLOGY_AUTO_ACK gt_manifest_hash 过短，auto 保持关闭")
+        return False
+    return True
+
+
 def may_auto_activate(candidates: Sequence[Candidate], *, intent: str, namespace: str,
                       tau_table: Optional[TauTable] = None) -> Optional[Candidate]:
-    """三禁 + 唯一性：write 意图恒否 · embedding 恒否 · 多候选（不同目标且 ≥ 各自 τ_low）恒否；
-    Top 候选 ≥ τ_high 且非 embedding 且目标唯一 → 返回该候选（调用方落库时标 confirmed_by='auto'
-    并入抽检队列）。仅播种/回填等离线路径调用。"""
+    """闸 0（P0-07 硬关）+ 三禁 + 唯一性：auto ack 缺失恒否（候选-only 默认）·
+    write 意图恒否 · embedding 恒否 · 多候选（不同目标且 ≥ 各自 τ_low）恒否；
+    Top 候选 ≥ τ_high 且非 embedding 且目标唯一 → 返回该候选（调用方落库时标
+    confirmed_by='auto' 并入抽检队列）。仅播种/回填等离线路径调用；τ 走 strict
+    校验（非法配置 raise 阻断写 worker，绝不回落可 auto 的默认值）。"""
+    if not auto_activation_enabled():
+        return None
     if intent != "read":
         return None
     if not candidates:
         return None
-    tau_table = tau_table or TauTable.from_env()
+    tau_table = tau_table or TauTable.from_env(strict=True)
     top = max(candidates, key=lambda c: c.confidence)
     if top.method == "embedding":
         return None

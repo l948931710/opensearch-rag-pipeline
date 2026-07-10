@@ -35,6 +35,15 @@ def _rec(raw, title="6.2口径龙虾杯", ns="u8", otype="product", attrs=None, 
                       owner_dept=dept, attrs=dict(attrs or {"材质": "PP"}))
 
 
+
+@pytest.fixture(autouse=True)
+def _auto_ack_for_auto_machinery_tests(monkeypatch):
+    """PR-E（P0-07）：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
+    统一注入有效当日 ack；硬关默认态的独立断言见 test_auto_gate_* 系列。"""
+    from datetime import date
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
+                       f"test:{date.today().isoformat()}:deadbeefcafe")
+
 @pytest.fixture()
 def store():
     return MemoryOntologyStore()

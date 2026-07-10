@@ -36,6 +36,15 @@ def _rec(raw, title="6.2口径龙虾杯", ns="u8", otype="product", attrs=None, 
                       owner_dept=dept, attrs=dict(attrs or {"材质": "PP"}))
 
 
+
+@pytest.fixture(autouse=True)
+def _auto_ack_for_auto_machinery_tests(monkeypatch):
+    """PR-E（P0-07）：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
+    统一注入有效当日 ack；硬关默认态的独立断言见 test_auto_gate_* 系列。"""
+    from datetime import date
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
+                       f"test:{date.today().isoformat()}:deadbeefcafe")
+
 @pytest.fixture()
 def store():
     return MemoryOntologyStore()
@@ -253,3 +262,40 @@ def test_cli_errors_exit_2(store):
 def test_cli_commit_dryrun_mutex(store):
     with pytest.raises(SystemExit):
         _run_cli([str(FIXTURE), "--commit", "--dry-run"], store=store)
+
+
+# ── PR-E（P0-07）：backfill 生产指纹硬拒（第三道闸）──────────────────────────────
+
+
+def test_backfill_commit_prod_fingerprint_rejected(tmp_path, monkeypatch):
+    """--commit + ENABLE=true 但目标是生产 RDS 且无当日 PROD_ACK → exit 2 零写。"""
+    from opensearch_pipeline.ontology import backfill as bf
+    csv = tmp_path / "snap.csv"
+    csv.write_text("namespace,raw_code,object_type,title,owner_dept\n"
+                   "u8,X1,product,测试品,pmc\n", encoding="utf-8")
+    monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_ENABLE", "true")
+    monkeypatch.delenv("RAG_ONTOLOGY_BACKFILL_PROD_ACK", raising=False)
+    monkeypatch.setattr("opensearch_pipeline.config.is_prod_target",
+                        lambda kind, v: kind == "rds")
+    store = MemoryOntologyStore()
+    rc = bf.main([str(csv), "--commit"], store=store, source=None)
+    assert rc == 2
+    assert store.get_active_identifier("u8", "X1") is None      # 零写
+
+
+def test_backfill_commit_prod_ack_same_day_passes_gate(tmp_path, monkeypatch):
+    from datetime import date
+
+    from opensearch_pipeline.ontology import backfill as bf
+    csv = tmp_path / "snap.csv"
+    csv.write_text("namespace,raw_code,object_type,title,owner_dept\n"
+                   "u8,X2,product,测试品2,pmc\n", encoding="utf-8")
+    monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_ENABLE", "true")
+    monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_PROD_ACK",
+                       f"backfill-r1:{date.today().isoformat()}")
+    monkeypatch.setattr("opensearch_pipeline.config.is_prod_target",
+                        lambda kind, v: kind == "rds")
+    store = MemoryOntologyStore()
+    rc = bf.main([str(csv), "--commit"], store=store, source=None)
+    assert rc == 0                                              # 闸过（mention 语义只入 case）
+    assert store.get_open_case("u8", "X2") is not None

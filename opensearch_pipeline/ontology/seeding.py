@@ -386,7 +386,7 @@ def seed_snapshot(store, source: Any, *, dry_run: bool = True,
                   evidence_source: str = "seeding") -> SeedReport:
     """跑一遍快照播种/回填。单条失败只记 errors 不拖垮批（可断点重跑，幂等）。
     mint_new=False = 观测语义（回填 mention 模式：无候选不铸对象，只入 case）。"""
-    tau = tau_table or TauTable.from_env()
+    tau = tau_table or TauTable.from_env(strict=True)   # P0-07：写 worker 非法 τ 即断
     report = SeedReport(dry_run=dry_run)
     sink = _Sink(store, dry_run, report, evidence_source=evidence_source)
     records: Iterable[SeedRecord] = source.iter_records()

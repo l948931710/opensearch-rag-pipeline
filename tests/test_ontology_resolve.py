@@ -28,6 +28,15 @@ def _hash_embedder(text):
     return [b / 255.0 * 2 - 1 for b in h]
 
 
+
+@pytest.fixture(autouse=True)
+def _auto_ack_for_auto_machinery_tests(monkeypatch):
+    """PR-E（P0-07）：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
+    统一注入有效当日 ack；硬关默认态的独立断言见 test_auto_gate_* 系列。"""
+    from datetime import date
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
+                       f"test:{date.today().isoformat()}:deadbeefcafe")
+
 @pytest.fixture()
 def store():
     return MemoryOntologyStore()
@@ -463,3 +472,59 @@ def test_tool_not_wired_into_default_registry():
     from opensearch_pipeline.agent_tools import build_default_registry
     names = {spec.name for spec in build_default_registry().list_specs()}
     assert "ontology_resolve" not in names
+
+
+# ── PR-E（P0-07）：τ 数值域 + auto 硬关（默认候选-only）──────────────────────────
+
+
+@pytest.mark.parametrize("high,low", [(-0.5, -1.0), (5.0, 0.7), (0.95, -0.1), (1.2, 1.1)])
+def test_tau_ctor_rejects_out_of_range(high, low):
+    """负数/大于 1 的 τ 在构造期拦死（外审探针：负阈值可让 0.01 置信 auto）。"""
+    with pytest.raises(ValueError, match="τ 非法"):
+        TauTable(default=Tau(high=high, low=low))
+
+
+def test_tau_from_env_strict_raises_on_invalid(monkeypatch):
+    monkeypatch.setenv("RAG_ONTOLOGY_TAU_HIGH", "-1")
+    monkeypatch.setenv("RAG_ONTOLOGY_TAU_LOW", "-2")
+    with pytest.raises(ValueError, match="strict"):
+        TauTable.from_env(strict=True)
+    # 非 strict（在线纯读）仍回默认——查询不因配置坏瘫掉
+    assert TauTable.from_env().lookup("u8", "rule") == Tau(0.95, 0.70)
+    monkeypatch.delenv("RAG_ONTOLOGY_TAU_HIGH")
+    monkeypatch.delenv("RAG_ONTOLOGY_TAU_LOW")
+    monkeypatch.setenv("RAG_ONTOLOGY_TAU_TABLE", '{"u8|rule": [5.0, 0.1]}')
+    with pytest.raises(ValueError, match="strict"):
+        TauTable.from_env(strict=True)
+
+
+def _auto_candidate():
+    return [Candidate(target_object_id="T1", method="rule", confidence=0.96)]
+
+
+def test_auto_gate_default_closed(monkeypatch):
+    """P0-07 核心：无 ack → 0.96 唯一 rule 候选也不 auto（候选-only 默认）。"""
+    monkeypatch.delenv("RAG_ONTOLOGY_AUTO_ACK", raising=False)
+    assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8") is None
+    from opensearch_pipeline.ontology.resolve import auto_activation_enabled
+    assert auto_activation_enabled() is False
+
+
+@pytest.mark.parametrize("token", [
+    "malformed",                                  # 缺段
+    "op:2020-01-01:deadbeefcafe",                 # 过期
+    ":2099-01-01:deadbeefcafe",                   # op 空（日期也不对，双重非法）
+    "op:TODAY:short",                             # hash 过短（TODAY 占位，下面替换）
+])
+def test_auto_gate_rejects_bad_tokens(monkeypatch, token):
+    from datetime import date
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK", token.replace("TODAY", date.today().isoformat()))
+    assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8") is None
+
+
+def test_auto_gate_valid_token_opens(monkeypatch):
+    from datetime import date
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
+                       f"gt-run:{date.today().isoformat()}:cafebabe1234")
+    winner = may_auto_activate(_auto_candidate(), intent="read", namespace="u8")
+    assert winner is not None and winner.target_object_id == "T1"

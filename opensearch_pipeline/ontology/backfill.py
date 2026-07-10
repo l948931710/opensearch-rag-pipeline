@@ -33,6 +33,17 @@ from typing import Any, Optional
 from opensearch_pipeline.ontology.seeding import CsvSnapshotSource, SeedReport, seed_snapshot
 
 ENABLE_ENV = "RAG_ONTOLOGY_BACKFILL_ENABLE"
+# PR-E（P0-07）：生产回填第三道闸——当日 date-bound token（Sam 专属，gate 签字后才发）
+PROD_ACK_ENV = "RAG_ONTOLOGY_BACKFILL_PROD_ACK"
+
+
+def _prod_ack_valid() -> bool:
+    raw = os.environ.get(PROD_ACK_ENV, "").strip()
+    if not raw or ":" not in raw:
+        return False
+    op, _, date_s = raw.partition(":")
+    from datetime import date
+    return bool(op.strip()) and date_s.strip() == date.today().isoformat()
 _P0_OBJECT_TYPES = ("product", "sku", "mold", "material")
 
 __all__ = ["ENABLE_ENV", "backfill_snapshot", "main"]
@@ -87,6 +98,19 @@ def main(argv=None, *, store=None, source=None) -> int:
         print(f"❌ --commit 需要 {ENABLE_ENV}=true（第二道闸，staged rollout stage-2 才开；"
               "真实回填另须 go/no-go ①③④ 签字）。拒绝执行。", file=sys.stderr)
         return 2
+
+    # PR-E（P0-07）：prod 物理指纹硬拒——对齐 ontology_seed.py。此前 backfill 只有
+    # DRY_RUN 常量 + ENABLE env 双闸（改源码/设 env 即过 = 可伪造）；现在生产 RDS
+    # 的 --commit 还须**当日** PROD_ACK_ENV=<op>:<YYYY-MM-DD>（token 只能 Sam 设，
+    # gate ①③④ 签字后才发）。dry-run 不受限（只读预览）。
+    if args.commit:
+        from opensearch_pipeline.config import get_config as _gc
+        from opensearch_pipeline.config import is_prod_target as _ipt
+        _cfg = _gc()
+        if _ipt("rds", _cfg.rds.host) and not _prod_ack_valid():
+            print(f"❌ 目标是生产 RDS——真实回填须 gate ①③④ 签字后由 Sam 设当日 "
+                  f"{PROD_ACK_ENV}=<op>:<YYYY-MM-DD>。拒绝执行。", file=sys.stderr)
+            return 2
 
     if source is None:
         if not args.csv_path:
