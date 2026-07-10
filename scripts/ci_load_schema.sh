@@ -98,6 +98,9 @@ MANIFEST="
 024_agent_audit_log.sql operation
 025_approval_workflow.sql operation
 026_agent_family_collation_request_id.sql operation
+027_ontology_core.sql operation
+028_ontology_identity.sql operation
+029_ontology_link.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }
@@ -171,12 +174,14 @@ for t in document_meta document_version chunk_meta pipeline_run user_role dept_a
   assert_table fuling_knowledge "$t"
 done
 for t in qa_session_log user_feedback escalation_ticket qa_daily_metrics qa_conversation \
-         kb_contribution qa_retrieved_doc schema_migrations; do
+         kb_contribution qa_retrieved_doc schema_migrations \
+         ontology_object ontology_identifier ontology_resolution_case; do
   assert_table fuling_operation "$t"
 done
 # 错灌金丝雀（qa_session_log/user_feedback 合法地双库都有——001 初版在 knowledge，不做金丝雀）
 assert_absent fuling_knowledge qa_daily_metrics
 assert_absent fuling_knowledge kb_contribution
+assert_absent fuling_knowledge ontology_object
 assert_absent fuling_operation chunk_meta
 
 echo "✅ schema 双库加载完成并通过落库断言"

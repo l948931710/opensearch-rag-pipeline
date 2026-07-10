@@ -12,7 +12,8 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 027。历史上有三对编号冲突（002/003/006 各两个文件，
+3. **编号严格单调递增**，下一个可用号 = 030（030=sem 视图、031=本体事件已被 P1/P2 计划预订，
+   见 docs/ontology_p0_plan_2026-07-10.md）。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
    ⚠️ **本体层文档编号勘误**：《本体层设计 v1.1》《P0-P1 落地细化》所写迁移号 024–028 成文时
    未预见 agent v2 占号，已全部作废——本体表族实际为 **027(core)/028(identity)/029(link)/
@@ -58,6 +59,9 @@ apply 脚本落库并记台账。
 | 024_agent_audit_log.sql | fuling_operation | Agent 合规审计（append-only；执行前 write-ahead 审计，HIGH_WRITE fail-closed / 普通 fail-open；audit.py）（WS1 收尾③） |
 | 025_approval_workflow.sql | fuling_operation | Agent 审批闭环持久化：approval_request（挂起侧写，approver_scope + 过期即拒）+ approval_decision（决策侧写，uk_req_idem 幂等）——request→decision→invocation→audit 四表回放链（WS3；approval_store.py；深度审查 A 组 P1） |
 | 026_agent_family_collation_request_id.sql | fuling_operation | agent 表族 9 表 COLLATE 显式钉到 utf8mb4_unicode_ci（铁律 4；022/025 吃库默认在漂移环境与显式 unicode_ci 的 023/024 混排 → run_id JOIN 1267）+ request_id 加宽 VARCHAR(64)（UUID 36 字符原宽度装不下）（深度审查 schema 组） |
+| 027_ontology_core.sql | fuling_operation | 本体控制面核心：ontology_object（canonical ULID+乐观锁+密级）+ ontology_ref_seq（展示号发号）+ ontology_attribute_source（属性溯源，纯来源治理）+ ontology_stewardship（授权 scope，S5）（本体 P0；docs/ontology_p0_plan_2026-07-10.md） |
+| 028_ontology_identity.sql | fuling_operation | 身份脊柱：ontology_identifier（别名映射，至多一行 active 生成列唯一键 S4；norm 不剥改模后缀）+ ontology_resolution_case/candidate（候选承载层 S2：证据快照+积压统计，一个未解析编号×N 候选）（本体 P0） |
+| 029_ontology_link.sql | fuling_operation | 本体关系：ontology_link（sku_of_product 等；uk_src_dst_type）（本体 P0） |
 
 ## 台账（schema_migrations）
 
