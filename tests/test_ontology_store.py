@@ -1,0 +1,376 @@
+# -*- coding: utf-8 -*-
+"""ontology/store.py —— Memory/RDS 双后端契约测试。
+
+同一套场景 parametrize 到两个后端（Fake 不许说谎——语义由本套契约钉住）；RDS 侧
+host-pin 本地 MySQL（照 test_agent_runtime_e2e_local_db.py 模板），无 027-029 表则 skip。
+RDS-only 并发三例验证 uk/发号/case 聚合在真锁下的行为。
+"""
+import threading
+import uuid
+
+import pytest
+
+from opensearch_pipeline.ontology import attribute_source, stewardship
+from opensearch_pipeline.ontology.store import (
+    DuplicateActiveIdentifier,
+    MemoryOntologyStore,
+    RDSOntologyStore,
+)
+
+# ── RDS 可用性探测（host-pin + 表就位）────────────────────────────────────────────
+
+
+def _rds_ready() -> bool:
+    try:
+        import pymysql
+
+        from opensearch_pipeline.config import _LOCAL_HOSTS, get_config, is_prod_target
+        cfg = get_config()
+        if cfg.rds.host not in _LOCAL_HOSTS or is_prod_target("rds", cfg.rds.host):
+            return False
+        conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
+                               password=cfg.rds.password, database=cfg.rds.operation_database,
+                               autocommit=True, connect_timeout=3)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema=DATABASE() AND table_name IN "
+                "('ontology_object','ontology_identifier','ontology_resolution_case',"
+                "'ontology_resolution_candidate','ontology_ref_seq')")
+            ok = cur.fetchone()[0] == 5
+        conn.close()
+        return ok
+    except Exception:   # noqa: BLE001
+        return False
+
+
+_RDS_OK = _rds_ready()
+_MARK = "__pyt_"           # RDS 测试数据统一打标，teardown 按标清扫
+
+
+def _cleanup_rds():
+    import pymysql
+
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
+                           password=cfg.rds.password, database=cfg.rds.operation_database,
+                           autocommit=True, connect_timeout=3)
+    like = _MARK + "%"
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM ontology_resolution_candidate WHERE case_id IN "
+                    "(SELECT case_id FROM ontology_resolution_case WHERE namespace LIKE %s)",
+                    (like,))
+        cur.execute("DELETE FROM ontology_resolution_case WHERE namespace LIKE %s", (like,))
+        cur.execute("DELETE FROM ontology_identifier WHERE namespace LIKE %s", (like,))
+        cur.execute("DELETE FROM ontology_object WHERE title LIKE %s", (like,))
+    conn.close()
+
+
+@pytest.fixture(params=["memory", "rds"])
+def store(request):
+    if request.param == "memory":
+        yield MemoryOntologyStore()
+        return
+    if not _RDS_OK:
+        pytest.skip("本地 MySQL 无 ontology 表（先 apply schema 027-029）")
+    yield RDSOntologyStore()
+    _cleanup_rds()
+
+
+@pytest.fixture()
+def ns():
+    """每测试唯一命名空间（RDS 侧跨测试隔离 + teardown 按前缀清扫）。"""
+    return f"{_MARK}{uuid.uuid4().hex[:10]}"
+
+
+def _mint(store, object_type="product", title=None, **kw):
+    return store.mint_object(object_type, title or f"{_MARK}对象-{uuid.uuid4().hex[:6]}",
+                             owner_dept="pmc", **kw)
+
+
+# ── 对象与发号 ────────────────────────────────────────────────────────────────────
+
+
+def test_mint_object_ref_format_and_increment(store):
+    a = _mint(store)
+    b = _mint(store)
+    assert a["canonical_ref"].startswith("FLP-P-")
+    assert a["object_id"] != b["object_id"]
+    assert int(a["canonical_ref"].rsplit("-", 1)[1]) < int(b["canonical_ref"].rsplit("-", 1)[1])
+    got = store.get_object(a["object_id"])
+    assert got["title"] == a["title"] if "title" in a else True
+    assert got["status"] == "active" and got["version"] == 1
+
+
+def test_mint_object_unknown_type_raises(store):
+    with pytest.raises(ValueError, match="未在 ontology_ref_seq 登记"):
+        _mint(store, object_type="starship")
+
+
+def test_find_objects_title_like(store):
+    tag = uuid.uuid4().hex[:8]
+    _mint(store, title=f"{_MARK}龙虾杯-{tag}")
+    _mint(store, title=f"{_MARK}方形杯-{tag}")
+    hits = store.find_objects("product", title_like=f"龙虾杯-{tag}")
+    assert len(hits) == 1 and f"龙虾杯-{tag}" in hits[0]["title"]
+
+
+def test_update_golden_cas(store):
+    obj = _mint(store)
+    assert store.update_golden(obj["object_id"], {"口径": "6.2"}, expected_version=1) is True
+    # 旧版本号再写 → 冲突
+    assert store.update_golden(obj["object_id"], {"口径": "7.0"}, expected_version=1) is False
+    assert store.get_object(obj["object_id"])["version"] == 2
+
+
+def test_retire_and_mark_duplicate(store):
+    a, b = _mint(store), _mint(store)
+    assert store.retire_object(a["object_id"]) is True
+    assert store.retire_object(a["object_id"]) is False          # 已非 active，CAS 让位
+    assert store.mark_duplicate(b["object_id"], a["object_id"]) is True
+    got = store.get_object(b["object_id"])
+    assert got["status"] == "merged" and got["merged_into"] == a["object_id"]
+    with pytest.raises(ValueError, match="自身"):
+        store.mark_duplicate(b["object_id"], b["object_id"])
+
+
+# ── 别名：至多一行 active / 纠错 ──────────────────────────────────────────────────
+
+
+def test_identifier_single_active_and_reinsert_after_deactivate(store, ns):
+    obj = _mint(store)
+    i1 = store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="seed")
+    with pytest.raises(DuplicateActiveIdentifier):
+        store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="manual")
+    assert store.get_active_identifier(ns, "ABC123")["identifier_id"] == i1
+    # 纠错：deactivate 后可重新确认
+    assert store.deactivate_identifier(i1) is True
+    assert store.deactivate_identifier(i1) is False               # 二次 CAS 让位
+    assert store.get_active_identifier(ns, "ABC123") is None
+    i2 = store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="manual")
+    assert store.get_active_identifier(ns, "ABC123")["identifier_id"] == i2
+
+
+def test_deactivate_rejects_bad_status(store, ns):
+    obj = _mint(store)
+    iid = store.insert_identifier(ns, "x", "X", obj["object_id"], method="seed")
+    with pytest.raises(ValueError, match="终态"):
+        store.deactivate_identifier(iid, status="active")
+
+
+def test_repoint_identifier_atomic(store, ns):
+    a, b = _mint(store), _mint(store)
+    old_id = store.insert_identifier(ns, "abc123-m", "ABC123-M", a["object_id"], method="rule",
+                                     confidence=0.97)
+    new_id = store.repoint_identifier(old_id, b["object_id"], by="steward_1",
+                                      new_target_revision="r2")
+    active = store.get_active_identifier(ns, "ABC123-M")
+    assert active["identifier_id"] == new_id
+    assert active["target_object_id"] == b["object_id"]
+    assert active["target_revision"] == "r2"
+    assert active["confirmed_by"] == "steward_1"
+    olds = [r for r in store.list_identifiers_for_target(a["object_id"])
+            if r["identifier_id"] == old_id]
+    assert olds[0]["status"] == "superseded" and olds[0]["superseded_by"] == new_id
+    # 非 active 再改指 → 拒绝
+    with pytest.raises(ValueError, match="非 active"):
+        store.repoint_identifier(old_id, a["object_id"], by="steward_1")
+
+
+def test_list_identifiers_for_target(store, ns):
+    obj = _mint(store)
+    store.insert_identifier(ns, "a", "A", obj["object_id"], method="seed")
+    store.insert_identifier(f"{ns}:kfc", "b", "B", obj["object_id"], method="manual")
+    rows = store.list_identifiers_for_target(obj["object_id"])
+    assert {r["norm_value"] for r in rows} == {"A", "B"}
+    assert all(r["status"] == "active" for r in rows)
+
+
+# ── 消解 case / 候选 ──────────────────────────────────────────────────────────────
+
+
+def test_upsert_case_aggregates_observations(store, ns):
+    c1 = store.upsert_case(ns, "u z", "U Z", object_type_hint="sku",
+                           evidence={"source": "pmc_query"})
+    c2 = store.upsert_case(ns, "u z", "U Z")
+    assert c1 == c2                                              # 同 (ns,norm) 聚合到同一 open case
+    case = store.get_case(c1)
+    assert case["seen_count"] == 2 and case["status"] == "open"
+    assert case["evidence_json"] is not None                     # 首次证据快照保留不覆盖
+
+
+def test_case_resolve_and_dismiss_cas(store, ns):
+    obj = _mint(store)
+    c1 = store.upsert_case(ns, "abc", "ABC")
+    iid = store.insert_identifier(ns, "abc", "ABC", obj["object_id"], method="manual",
+                                  confirmed_by="steward_1", source_case_id=c1)
+    assert store.resolve_case(c1, identifier_id=iid, by="steward_1") is True
+    assert store.resolve_case(c1, identifier_id=iid, by="steward_1") is False   # 二次让位
+    # dismiss 必须给理由
+    c2 = store.upsert_case(ns, "xyz", "XYZ")
+    with pytest.raises(ValueError, match="理由"):
+        store.dismiss_case(c2, by="steward_1", note="  ")
+    assert store.dismiss_case(c2, by="steward_1", note="确认为废弃编号") is True
+    # 处置后可重开新 case（历史留档）
+    c3 = store.upsert_case(ns, "xyz", "XYZ")
+    assert c3 != c2 and store.get_case(c3)["seen_count"] == 1
+
+
+def test_candidates_dedupe_and_max_confidence(store, ns):
+    obj = _mint(store)
+    cid = store.upsert_case(ns, "abc-m", "ABC-M")
+    k1 = store.add_candidate(cid, obj["object_id"], method="rule", confidence=0.80)
+    k2 = store.add_candidate(cid, obj["object_id"], method="rule", confidence=0.90,
+                             features={"hint": "剥后缀"})
+    assert k1 == k2                                              # 同 (case,target,method) 幂等
+    k3 = store.add_candidate(cid, obj["object_id"], method="embedding", confidence=0.70)
+    rows = store.list_candidates(cid)
+    assert len(rows) == 2 and k3 in {r["candidate_id"] for r in rows}
+    rule_row = [r for r in rows if r["method"] == "rule"][0]
+    assert float(rule_row["confidence"]) == pytest.approx(0.90)  # 置信取大
+    assert rows[0]["method"] == "rule"                           # 按置信降序
+
+
+def test_list_open_cases_filter_and_order(store, ns):
+    store.upsert_case(ns, "a", "A", object_type_hint="product")
+    cb = store.upsert_case(ns, "b", "B", object_type_hint="sku")
+    store.upsert_case(ns, "b", "B")                              # B 观测两次 → freq 序在前
+    rows = store.list_open_cases(namespace=ns, order="freq")
+    assert [r["case_id"] for r in rows][0] == cb
+    only_sku = store.list_open_cases(namespace=ns, object_type_hint="sku")
+    assert len(only_sku) == 1 and only_sku[0]["case_id"] == cb
+
+
+# ── 溯源目录 / stewardship 种子 ───────────────────────────────────────────────────
+
+
+def test_attribute_source_seeds_idempotent(store):
+    n1 = attribute_source.ensure_seeds(store)
+    n2 = attribute_source.ensure_seeds(store)
+    assert n1 == n2 == len(attribute_source.SEED_ROWS)
+    rows = store.list_attribute_sources()
+    keys = {(r["object_type"], r["attribute"]) for r in rows}
+    assert ("sku", "箱规") in keys and ("sku", "香规") in keys
+
+
+def test_stewardship_seeds_and_resolution(store):
+    stewardship.ensure_seeds(store)
+    rows = store.list_stewardship()
+    # 优先级：namespace 全名 > 前缀 > object_type
+    assert stewardship.resolve_steward(rows, namespace="customer:KFC")["steward_dept"] \
+        == "marketing"
+    assert stewardship.resolve_steward(rows, namespace="lab_sample")["steward_dept"] == "rd"
+    assert stewardship.resolve_steward(rows, object_type="material")["steward_dept"] == "supply"
+    assert stewardship.resolve_steward(
+        rows, namespace="u8", object_type="product")["steward_dept"] == "pmc"
+    # 未命中 → None（调用方 fail-closed 到 kb_admin）
+    assert stewardship.resolve_steward(rows, namespace="unknown_ns") is None
+    # attribute 最高优先
+    store.upsert_stewardship([{"scope_type": "attribute", "scope_key": "sku.箱规",
+                               "steward_dept": "quality"}])
+    rows = store.list_stewardship()
+    assert stewardship.resolve_steward(
+        rows, attribute="sku.箱规", object_type="sku")["steward_dept"] == "quality"
+
+
+def test_stewardship_seed_depts_within_acl_whitelist():
+    """S5 风险护栏：种子 steward 组码必须 ⊆ 既有 ACL 白名单（新组码=独立灰度 PR）。"""
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    for row in stewardship.SEED_SCOPES:
+        assert row["steward_dept"] in _VALID_ACL_GROUPS, row
+        if row.get("backup_dept"):
+            assert row["backup_dept"] in _VALID_ACL_GROUPS, row
+
+
+# ── 覆盖率（memory-only：RDS 侧全局计数受并行测试污染）────────────────────────────
+
+
+def test_coverage_math_memory():
+    store = MemoryOntologyStore()
+    obj = store.mint_object("product", "杯", owner_dept="pmc")
+    store.insert_identifier("u8", "a", "A", obj["object_id"], method="seed",
+                            confirmed_by="auto")
+    store.insert_identifier("u8", "b", "B", obj["object_id"], method="manual",
+                            confirmed_by="steward_1")
+    store.upsert_case("u8", "c", "C", object_type_hint="product")
+    cov = store.coverage()
+    assert cov["active_identifiers"] == 2 and cov["auto_active"] == 1
+    assert cov["open_cases"] == 1
+    assert cov["resolution_coverage"] == pytest.approx(2 / 3)
+    # 按类型过滤：sku 维度无数据
+    empty = store.coverage(object_type="sku")
+    assert empty["active_identifiers"] == 0 and empty["resolution_coverage"] is None
+
+
+# ── RDS-only 并发（真锁/真唯一键）────────────────────────────────────────────────
+
+rds_only = pytest.mark.skipif(not _RDS_OK, reason="本地 MySQL 无 ontology 表")
+
+
+@rds_only
+def test_rds_concurrent_mint_unique_refs():
+    store = RDSOntologyStore()
+    refs, errors = [], []
+
+    def _work():
+        try:
+            for _ in range(5):
+                refs.append(_mint(store)["canonical_ref"])
+        except Exception as e:   # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_work) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    try:
+        assert not errors and len(refs) == 10 and len(set(refs)) == 10
+    finally:
+        _cleanup_rds()
+
+
+@rds_only
+def test_rds_concurrent_case_upsert_single_open():
+    store = RDSOntologyStore()
+    ns_v = f"{_MARK}{uuid.uuid4().hex[:10]}"
+    ids, errors = [], []
+
+    def _work():
+        try:
+            ids.append(store.upsert_case(ns_v, "raw", "NORM"))
+        except Exception as e:   # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_work) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    try:
+        assert not errors and len(set(ids)) == 1
+        assert store.get_case(ids[0])["seen_count"] == 4
+    finally:
+        _cleanup_rds()
+
+
+@rds_only
+def test_rds_concurrent_insert_identifier_single_winner():
+    store = RDSOntologyStore()
+    ns_v = f"{_MARK}{uuid.uuid4().hex[:10]}"
+    obj = _mint(store)
+    outcomes = []
+
+    def _work():
+        try:
+            store.insert_identifier(ns_v, "x", "X", obj["object_id"], method="manual")
+            outcomes.append("ok")
+        except DuplicateActiveIdentifier:
+            outcomes.append("dup")
+        except Exception as e:   # noqa: BLE001
+            outcomes.append(f"err:{e}")
+
+    threads = [threading.Thread(target=_work) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    try:
+        assert sorted(outcomes) == ["dup", "ok"]
+    finally:
+        _cleanup_rds()
