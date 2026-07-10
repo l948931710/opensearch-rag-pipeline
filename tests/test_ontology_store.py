@@ -190,6 +190,15 @@ def test_list_identifiers_for_target(store, ns):
 # ── 消解 case / 候选 ──────────────────────────────────────────────────────────────
 
 
+def test_get_open_case_lookup(store, ns):
+    cid = store.upsert_case(ns, "u z", "U Z")
+    hit = store.get_open_case(ns, "U Z")
+    assert hit and hit["case_id"] == cid
+    assert store.get_open_case(ns, "NOPE") is None
+    store.dismiss_case(cid, by="s1", note="废弃")
+    assert store.get_open_case(ns, "U Z") is None        # 只认 open
+
+
 def test_upsert_case_aggregates_observations(store, ns):
     c1 = store.upsert_case(ns, "u z", "U Z", object_type_hint="sku",
                            evidence={"source": "pmc_query"})

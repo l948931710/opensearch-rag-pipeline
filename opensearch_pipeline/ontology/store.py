@@ -403,6 +403,18 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
+    def get_open_case(self, namespace: str, norm_value: str) -> Optional[Dict[str, Any]]:
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {db}.ontology_resolution_case "
+                            "WHERE namespace=%s AND norm_value=%s AND status='open'",
+                            (namespace, norm_value))
+                rows = self._rows_to_dicts(cur)
+            return rows[0] if rows else None
+        finally:
+            conn.close()
+
     def list_open_cases(self, *, namespace: Optional[str] = None,
                         object_type_hint: Optional[str] = None, order: str = "freq",
                         limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
@@ -761,6 +773,14 @@ class MemoryOntologyStore:
         with self._lock:
             row = self._cases.get(case_id)
             return dict(row) if row else None
+
+    def get_open_case(self, namespace, norm_value):
+        with self._lock:
+            for row in self._cases.values():
+                if (row["namespace"], row["norm_value"], row["status"]) == \
+                        (namespace, norm_value, "open"):
+                    return dict(row)
+            return None
 
     def list_open_cases(self, *, namespace=None, object_type_hint=None, order="freq",
                         limit=50, offset=0):

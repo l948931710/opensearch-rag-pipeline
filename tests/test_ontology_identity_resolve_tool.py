@@ -1,0 +1,297 @@
+# -*- coding: utf-8 -*-
+"""门 A：ontology_identity_resolve 工具 + approval_store approver_scope seam（PR8）。
+
+锁死的不变量：
+- approval_policy="always" → Policy 风险基线把任何授予上收 require_approval（提案必挂起）；
+- 同 (ns,norm,target,revision) 重放幂等；指向其它目标 → 拒绝导流工作台（绝不静默覆盖）；
+- 审批路由走 per-attr steward（seam）；scope 未登记/解析异常 → '' 仅 kb_admin（fail-closed）；
+- 未注册解析器的工具走 derive_approver_scope（既有行为零变化）；
+- 未接线守护：不在 build_default_registry。
+"""
+import pytest
+
+import opensearch_pipeline.agent_runtime.approval_store as approval_store
+from opensearch_pipeline.agent_runtime.approval_store import (
+    RDSApprovalStore,
+    _resolve_scope,
+    register_approver_scope_resolver,
+)
+from opensearch_pipeline.agent_runtime.context import ExecutionContext
+from opensearch_pipeline.agent_runtime.policy import (
+    PolicyEngine,
+    PolicyRule,
+    default_policy_engine,
+)
+from opensearch_pipeline.agent_runtime.tool import RiskLevel
+from opensearch_pipeline.agent_tools.ontology_identity_resolve import (
+    OntologyIdentityResolveTool,
+)
+from opensearch_pipeline.ontology import stewardship
+from opensearch_pipeline.ontology.store import MemoryOntologyStore
+
+
+def _ctx(acl=("marketing",), user="u1"):
+    return ExecutionContext.create(request_id="", user_id=user, acl_groups=list(acl),
+                                   roles=("employee",), channel="console", thread_id="t1")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_resolver_registry(monkeypatch):
+    """seam 注册表逐测隔离（工具 __init__ 全局注册，测试间不得串味）。"""
+    monkeypatch.setattr(approval_store, "_SCOPE_RESOLVERS", {})
+
+
+@pytest.fixture()
+def store():
+    mem = MemoryOntologyStore()
+    stewardship.ensure_seeds(mem)
+    return mem
+
+
+@pytest.fixture()
+def tool(store):
+    return OntologyIdentityResolveTool(store=store)
+
+
+def _target(store, title="6.2口径龙虾杯", otype="product", **kw):
+    return store.mint_object(otype, title, owner_dept=kw.pop("owner_dept", "pmc"), **kw)
+
+
+# ── spec / Policy 契约 ────────────────────────────────────────────────────────────
+
+
+def test_spec_contract(tool):
+    spec = tool.spec
+    assert spec.risk_level == RiskLevel.LOW_WRITE
+    assert spec.approval_policy == "always"
+    assert spec.idempotency == "key_required" and spec.side_effects is True
+    assert spec.permission_scope == "ontology.identity.resolve"
+    assert spec.input_schema["additionalProperties"] is False
+    for forged in ("confirmed_by", "confidence", "intent", "user_dept"):
+        assert forged not in spec.input_schema["properties"]
+
+
+def test_policy_always_escalates_grant_to_approval(tool):
+    engine = PolicyEngine([PolicyRule(effect="allow",
+                                      scopes=("ontology.identity.resolve",), policy_id="g1")])
+    d = engine.authorize_tool_call(_ctx(), tool.spec, {})
+    assert d.decision == "require_approval" and d.policy_id == "risk_baseline"
+
+
+def test_default_policy_engine_denies_unwired(tool):
+    """未接线=未授予：default_policy_engine 对本 scope default-deny（PR13 接线时才加 grant）。"""
+    d = default_policy_engine().authorize_tool_call(_ctx(), tool.spec, {})
+    assert d.decision == "deny"
+
+
+def test_tool_not_wired_into_default_registry():
+    from opensearch_pipeline.agent_tools import build_default_registry
+    names = {spec.name for spec in build_default_registry().list_specs()}
+    assert "ontology_identity_resolve" not in names
+
+
+# ── run：写语义 ───────────────────────────────────────────────────────────────────
+
+
+def test_confirm_happy_path_and_case_closure(tool, store):
+    obj = _target(store)
+    case_id = store.upsert_case("u8", "abc123", "ABC123", object_type_hint="product")
+    res = tool.run(_ctx(user="steward_1"),
+                   {"namespace": "u8", "value": "abc123",
+                    "target_object_id": obj["object_id"], "note": "打样一致"})
+    assert res.status == "succeeded"
+    alias = store.get_active_identifier("u8", "ABC123")
+    assert alias["target_object_id"] == obj["object_id"]
+    assert alias["resolution_method"] == "manual" and alias["confirmed_by"] == "steward_1"
+    assert res.receipt["idempotent"] is False
+    assert res.receipt["closed_case_id"] == case_id                 # open case 顺带闭环
+    assert store.get_case(case_id)["status"] == "resolved"
+    assert "已确认" in res.content[0].text
+
+
+def test_confirm_with_revision(tool, store):
+    obj = _target(store)
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123-m",
+                            "target_object_id": obj["object_id"], "target_revision": "r2"})
+    assert res.status == "succeeded"
+    assert store.get_active_identifier("u8", "ABC123-M")["target_revision"] == "r2"
+
+
+def test_idempotent_replay_same_target(tool, store):
+    obj = _target(store)
+    args = {"namespace": "u8", "value": "abc123", "target_object_id": obj["object_id"]}
+    first = tool.run(_ctx(), args)
+    second = tool.run(_ctx(), args)
+    assert second.status == "succeeded" and second.receipt["idempotent"] is True
+    assert second.receipt["identifier_id"] == first.receipt["identifier_id"]
+    assert len(store.list_identifiers_for_target(obj["object_id"])) == 1   # 零重复副作用
+
+
+def test_conflict_other_target_refused(tool, store):
+    a, b = _target(store), _target(store, title="别的杯")
+    tool.run(_ctx(), {"namespace": "u8", "value": "abc123", "target_object_id": a["object_id"]})
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
+                            "target_object_id": b["object_id"]})
+    assert res.status == "failed" and "工作台" in (res.error or "")
+    assert store.get_active_identifier("u8", "ABC123")["target_object_id"] == a["object_id"]
+
+
+def test_conflict_same_target_different_revision(tool, store):
+    obj = _target(store)
+    tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
+                      "target_object_id": obj["object_id"], "target_revision": "r1"})
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
+                            "target_object_id": obj["object_id"], "target_revision": "r2"})
+    assert res.status == "failed" and "工作台" in (res.error or "")
+
+
+def test_target_missing_or_inactive(tool, store):
+    assert tool.run(_ctx(), {"namespace": "u8", "value": "x",
+                             "target_object_id": "ghost"}).status == "failed"
+    retired = _target(store, title="退役品")
+    store.retire_object(retired["object_id"])
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "x",
+                            "target_object_id": retired["object_id"]})
+    assert res.status == "failed" and "active" in (res.error or "")
+
+
+def test_bad_value_and_forged_params(tool, store):
+    obj = _target(store)
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "   ",
+                            "target_object_id": obj["object_id"]})
+    assert res.status == "failed" and "非法" in (res.error or "")
+    with pytest.raises(Exception):
+        tool.run(_ctx(), {"namespace": "u8", "value": "a",
+                          "target_object_id": obj["object_id"], "confirmed_by": "hacker"})
+
+
+def test_race_duplicate_resolves_to_idempotent(tool, store, monkeypatch):
+    """插入撞 uk（并发赢家先落同目标）→ 重查归入幂等成功。"""
+    from opensearch_pipeline.ontology.store import DuplicateActiveIdentifier
+    obj = _target(store)
+    real_get = store.get_active_identifier
+    state = {"first": True}
+
+    def _get(ns, norm):
+        if state["first"]:
+            state["first"] = False
+            return None                     # 预检未见 → 走 insert
+        return real_get(ns, norm)
+
+    monkeypatch.setattr(store, "get_active_identifier", _get)
+
+    def _insert(*a, **k):
+        state["first"] = False
+        # 并发赢家：直接用真方法落同目标，然后本次插入撞 uk
+        real_insert(*a, **k)
+        raise DuplicateActiveIdentifier("race")
+
+    real_insert = MemoryOntologyStore.insert_identifier.__get__(store)
+    monkeypatch.setattr(store, "insert_identifier", _insert)
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
+                            "target_object_id": obj["object_id"]})
+    assert res.status == "succeeded" and res.receipt["idempotent"] is True
+
+
+def test_case_closure_fail_open(tool, store, monkeypatch):
+    obj = _target(store)
+    store.upsert_case("u8", "abc123", "ABC123")
+    monkeypatch.setattr(store, "get_open_case",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
+                            "target_object_id": obj["object_id"]})
+    assert res.status == "succeeded" and res.receipt["closed_case_id"] is None
+
+
+def test_confidential_title_masked(store):
+    mat = store.mint_object("material", "PP-1100 特惠采购价目", owner_dept="supply",
+                            data_classification="confidential")
+    tool = OntologyIdentityResolveTool(store=store)
+    res = tool.run(_ctx(acl=("pmc",)), {"namespace": "material_grade", "value": "pp-1100",
+                                        "target_object_id": mat["object_id"]})
+    assert res.status == "succeeded"
+    assert "特惠采购价目" not in res.content[0].text
+    assert "[受限对象]" in res.content[0].text
+
+
+# ── approver_scope seam ──────────────────────────────────────────────────────────
+
+
+def test_resolve_scope_default_without_resolver():
+    """未注册解析器：默认推导=发起人主属部门（既有行为零变化）。"""
+    assert _resolve_scope("some_tool", _ctx(acl=("marketing",)), {}) == "marketing"
+    assert _resolve_scope("some_tool", _ctx(acl=("public",)), {}) == ""
+
+
+def test_resolve_scope_with_resolver_and_failures():
+    register_approver_scope_resolver("t1", lambda ctx, args: "pmc")
+    assert _resolve_scope("t1", _ctx(acl=("marketing",)), {}) == "pmc"   # 覆盖发起人部门
+    register_approver_scope_resolver("t1", lambda ctx, args: None)
+    assert _resolve_scope("t1", _ctx(acl=("marketing",)), {}) == ""      # 未登记→仅 kb_admin
+    register_approver_scope_resolver(
+        "t1", lambda ctx, args: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert _resolve_scope("t1", _ctx(acl=("marketing",)), {}) == ""      # 异常 fail-closed
+
+
+def test_tool_registers_steward_scope_resolver(tool, store):
+    """工具构造即注册：product 目标 → steward=pmc（种子）；未登记域 → None→''。"""
+    obj = _target(store)
+    scope = _resolve_scope("ontology_identity_resolve", _ctx(acl=("marketing",)),
+                           {"namespace": "u8", "target_object_id": obj["object_id"]})
+    assert scope == "pmc"                                    # 路由到 steward 而非发起人部门
+    scope2 = _resolve_scope("ontology_identity_resolve", _ctx(acl=("marketing",)),
+                            {"namespace": "lot_code", "target_object_id": "ghost"})
+    assert scope2 == ""                                      # 对象不存在+域未登记 → 仅 kb_admin
+
+
+class _CapturingCur:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self._sink.append((sql, params))
+
+
+class _CapturingConn:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def cursor(self):
+        return _CapturingCur(self._sink)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_create_request_routes_scope_and_keeps_requested_dept(monkeypatch, tool, store):
+    """集成：create_request 的 approver_scope 走 seam（steward），requested_dept 仍是发起人部门。"""
+    sink = []
+    monkeypatch.setattr(RDSApprovalStore, "_conn", lambda self: _CapturingConn(sink))
+    obj = _target(store)
+    RDSApprovalStore().create_request(
+        "run1", _ctx(acl=("marketing",), user="u9"),
+        {"call_id": "c1", "tool_name": "ontology_identity_resolve",
+         "arguments": {"namespace": "u8", "value": "abc123",
+                       "target_object_id": obj["object_id"]}})
+    params = sink[-1][1]
+    assert params[9] == "marketing"                          # requested_dept=发起人主属部门
+    assert params[10] == "pmc"                               # approver_scope=steward 路由
+    # 未注册工具：两者同源（默认推导），行为与 seam 前一致
+    sink.clear()
+    RDSApprovalStore().create_request(
+        "run2", _ctx(acl=("marketing",)),
+        {"call_id": "c1", "tool_name": "u8_writeback", "arguments": {"qty": 1}})
+    params = sink[-1][1]
+    assert params[9] == "marketing" and params[10] == "marketing"

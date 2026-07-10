@@ -18,14 +18,17 @@ DB 访问沿用 run_store 惯例：`db._get_db_conn()`、`%s` 占位、NOW(3)、
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from opensearch_pipeline.config import get_config
 
 if TYPE_CHECKING:
     from opensearch_pipeline.agent_runtime.context import ExecutionContext
+
+logger = logging.getLogger(__name__)
 
 # 审批请求存活窗口（秒）。默认与 suspended run TTL 对齐（3 天）——两边同源过期语义。
 DEFAULT_APPROVAL_TTL_S = 259200
@@ -53,6 +56,33 @@ def derive_approver_scope(ctx: "ExecutionContext") -> str:
     return ""
 
 
+# ── per-tool approver_scope 解析器（本体 P0 PR8 seam）────────────────────────────
+# 有些工具的审批人不该是"发起人部门"而是领域治理方——如 ontology_identity_resolve 按
+# per-attr steward（stewardship scope）路由。工具在构造时注册解析器；未注册的工具
+# 走 derive_approver_scope 默认推导，**既有行为零变化**。
+_SCOPE_RESOLVERS: Dict[str, Callable[..., Optional[str]]] = {}
+
+
+def register_approver_scope_resolver(tool_name: str, fn: Callable[..., Optional[str]]) -> None:
+    """注册 fn(ctx, args) -> Optional[str]。重复注册即覆盖（幂等）。"""
+    _SCOPE_RESOLVERS[str(tool_name)] = fn
+
+
+def _resolve_scope(tool_name: str, ctx: "ExecutionContext", args: Dict[str, Any]) -> str:
+    """审批人裁决键单点：注册了解析器的工具用解析器结果——None/'' → ''（仅 kb_admin 可审），
+    解析器异常 → '' **fail-closed**（scope 算不出宁可收敛到 kb_admin，绝不误路由回发起人
+    部门——那会让发起人的 dept_admin 审到不归他管的领域写）；未注册 → 默认推导。"""
+    fn = _SCOPE_RESOLVERS.get(tool_name)
+    if fn is None:
+        return derive_approver_scope(ctx)
+    try:
+        return str(fn(ctx, args) or "").strip()[:64]
+    except Exception:   # noqa: BLE001
+        logger.warning("approver_scope 解析器失败（fail-closed 到 kb_admin）：%s",
+                       tool_name, exc_info=True)
+        return ""
+
+
 class RDSApprovalStore:
     """approval_request / approval_decision 的 RDS（fuling_operation）实现。"""
 
@@ -75,7 +105,10 @@ class RDSApprovalStore:
         args = pending_call.get("arguments") or {}
         tool_name = str(pending_call.get("tool_name") or "")[:64]
         summary = f"{tool_name}({', '.join(sorted(map(str, args)))})" if args else tool_name
-        scope = derive_approver_scope(ctx)
+        # requested_dept=发起人主属部门（归属展示）；approver_scope=审批路由键——两者在
+        # 有 per-tool 解析器时分道（如本体身份确认路由到 per-attr steward 而非发起人部门）
+        requested_dept = derive_approver_scope(ctx)
+        scope = _resolve_scope(tool_name, ctx, args)
         db = _op_db()
         conn = self._conn()
         try:
@@ -90,7 +123,7 @@ class RDSApprovalStore:
                     (request_id, run_id, str(pending_call.get("call_id") or "")[:64],
                      tool_name, tool_version[:16], sanitize_args_json(args), digest(args),
                      summary[:1000], (ctx.user_id or "-")[:64],
-                     (scope or None), scope, int(ttl_s)),
+                     (requested_dept or None), scope, int(ttl_s)),
                 )
             conn.commit()
             return request_id
