@@ -261,3 +261,38 @@ class RDSApprovalStore:
             raise
         finally:
             conn.close()
+
+    def list_decided_unresumed(self, *, grace_s: int = 120,
+                               limit: int = 20) -> List[Dict[str, Any]]:
+        """B6 对账扫描：**决定已落库但 run 仍挂着**的窗口——resume 在 decide 之后失败/进程
+        崩溃（含 reaper 把 stale resuming 回边 suspended 的场景）。返回 (run + 决定) 候选，
+        由 reconcile 按 approval_decision 重建 outcome 重发 resume。
+
+        grace_s：决定落库后的静默期——避免与正在进行的 resume 赛跑（decide→resume 是
+        同请求内的两步，正常间隔毫秒级；默认 120s 只捞真死单）。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT ar.request_id, ar.run_id, ar.tool_name, ar.call_id, "
+                    f"d.decision, d.reason, d.decided_by, d.decided_at "
+                    f"FROM {db}.approval_request ar "
+                    f"JOIN {db}.agent_run r ON r.run_id = ar.run_id AND r.status='suspended' "
+                    f"JOIN {db}.approval_decision d ON d.request_id = ar.request_id "
+                    "WHERE ar.status IN ('approved','edited','rejected_feedback','rejected_terminate') "
+                    "AND ar.decided_at < DATE_SUB(NOW(3), INTERVAL %s SECOND) "
+                    "ORDER BY ar.decided_at ASC LIMIT %s",
+                    (int(grace_s), int(limit)))
+                rows = cur.fetchall() or []
+            keys = ("request_id", "run_id", "tool_name", "call_id",
+                    "decision", "reason", "decided_by", "decided_at")
+            out = []
+            for r in rows:
+                d = dict(zip(keys, r))
+                if d.get("decided_at") is not None:
+                    d["decided_at"] = str(d["decided_at"])
+                out.append(d)
+            return out
+        finally:
+            conn.close()

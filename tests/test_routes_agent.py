@@ -137,6 +137,101 @@ def test_shadow_link_sse(monkeypatch, wired):
         api.app.dependency_overrides.clear()
 
 
+# ── B6 对账：decided-but-not-resumed 重驱（reaper 循环消费）──────────────────
+class _ReconcileExecutor:
+    def __init__(self, reject=False):
+        self.resumed = []
+        self._reject = reject
+
+    def resume(self, run_id, ctx, outcome, loop, tools, on_complete=None, on_failure=None):
+        from opensearch_pipeline.agent_runtime.executor import RunRejected
+        if self._reject:
+            raise RunRejected("pool full")
+        self.resumed.append((run_id, outcome, ctx.user_id))
+
+        class _H:
+            def events(self):
+                return iter([])
+        return _H()
+
+
+def _candidate(run_id="r1", decision="approved", reason=None):
+    return {"request_id": "req1", "run_id": run_id, "tool_name": "u8_writeback",
+            "call_id": "c1", "decision": decision, "reason": reason,
+            "decided_by": "admin2", "decided_at": "2026-07-09 20:00:00"}
+
+
+class _ReconcileApprovalStore:
+    def __init__(self, candidates):
+        self._c = candidates
+
+    def list_decided_unresumed(self, *, grace_s=120, limit=20):
+        return list(self._c)
+
+
+def _reconcile_run_store(status="suspended"):
+    store = _SuspendedStore()
+    store.run["status"] = status
+    return store
+
+
+def test_reconcile_redrives_approved_as_requester(monkeypatch):
+    """决定落库但 run 仍挂着 → 按 approval_decision 重建 Approved 重驱；ctx=发起人身份。"""
+    import opensearch_pipeline.dingtalk_identity as di
+    from opensearch_pipeline.agent_runtime.approval import Approved
+    monkeypatch.setattr(di, "_resolve_user_identity", lambda uid: {"dept": ["production"], "name": uid})
+    monkeypatch.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    ex = _ReconcileExecutor()
+    registry = build_default_registry()
+    gateway = ModelGateway({"dashscope": _FakeProvider()}, routes={"light": [("dashscope", "m")]})
+    n = agent_route._reconcile_decided(registry, gateway, ex,
+                                       _reconcile_run_store(),
+                                       _ReconcileApprovalStore([_candidate()]))
+    assert n == 1 and len(ex.resumed) == 1
+    run_id, outcome, as_user = ex.resumed[0]
+    assert run_id == "r1" and isinstance(outcome, Approved)
+    assert as_user == "u1", "重驱必须以发起人身份续跑（绝不套对账进程身份）"
+
+
+def test_reconcile_skips_edited_and_feedback_carries_reason(monkeypatch):
+    """EDITED 不自动重驱（库存参数已脱敏，掩码值绝不能执行）；rejected_feedback 带回理由。"""
+    import opensearch_pipeline.dingtalk_identity as di
+    from opensearch_pipeline.agent_runtime.approval import RejectedFeedback
+    monkeypatch.setattr(di, "_resolve_user_identity", lambda uid: {"dept": [], "name": uid})
+    monkeypatch.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    ex = _ReconcileExecutor()
+    registry = build_default_registry()
+    gateway = ModelGateway({"dashscope": _FakeProvider()}, routes={"light": [("dashscope", "m")]})
+    n = agent_route._reconcile_decided(
+        registry, gateway, ex, _reconcile_run_store(),
+        _ReconcileApprovalStore([_candidate(decision="edited"),
+                                 _candidate(run_id="r1", decision="rejected_feedback",
+                                            reason="金额过大")]))
+    assert n == 1 and len(ex.resumed) == 1                      # edited 被跳过
+    _, outcome, _ = ex.resumed[0]
+    assert isinstance(outcome, RejectedFeedback) and outcome.reason == "金额过大"
+
+
+def test_reconcile_pool_full_and_stale_candidates_are_safe(monkeypatch):
+    """池满（RunRejected）吞掉下轮再来；run 已非 suspended（被人工重试抢先）→ 让位不重驱。"""
+    import opensearch_pipeline.dingtalk_identity as di
+    monkeypatch.setattr(di, "_resolve_user_identity", lambda uid: {"dept": [], "name": uid})
+    monkeypatch.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    registry = build_default_registry()
+    gateway = ModelGateway({"dashscope": _FakeProvider()}, routes={"light": [("dashscope", "m")]})
+    # 池满：不抛出、计数 0
+    n = agent_route._reconcile_decided(registry, gateway, _ReconcileExecutor(reject=True),
+                                       _reconcile_run_store(),
+                                       _ReconcileApprovalStore([_candidate()]))
+    assert n == 0
+    # run 已 running（被人工 /approve 抢先认领）→ 不重驱
+    ex = _ReconcileExecutor()
+    n = agent_route._reconcile_decided(registry, gateway, ex,
+                                       _reconcile_run_store(status="running"),
+                                       _ReconcileApprovalStore([_candidate()]))
+    assert n == 0 and ex.resumed == []
+
+
 class _StreamFakeProvider:
     """带 chat_stream 的假 provider：工具轮零增量返回 tool_call；最终轮流式吐字。"""
 

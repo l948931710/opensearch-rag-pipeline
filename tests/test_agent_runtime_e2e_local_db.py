@@ -443,7 +443,9 @@ def _ws3_runtime(registry, policy, responses):
     executor = ThreadedRunExecutor(run_store, adjudicator, max_concurrent=2, approvals=approvals,
                                    approval_store=RDSApprovalStore())
     gateway = ModelGateway({"dashscope": _SeqProvider(responses)},
-                           routes={"default": [("dashscope", "qwen-test")]},
+                           # light = routes/agent 与 B6 对账重驱的生产档位（同一脚本 provider）
+                           routes={"default": [("dashscope", "qwen-test")],
+                                   "light": [("dashscope", "qwen-test")]},
                            call_logger=run_store.record_llm_call, max_retries=0)
     return executor, gateway
 
@@ -540,3 +542,89 @@ def test_ws3_suspend_then_terminate_cancels():
         executor.shutdown()
         if run_id:
             _cleanup_run(run_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# B6 对账（真库全链）：决定已落库但 resume 未发生（进程崩溃窗口）→ 对账捞回执行
+# ─────────────────────────────────────────────────────────────────────────────
+@skipif_no_agent_db
+def test_b6_reconcile_redrives_decided_but_not_resumed(monkeypatch):
+    """挂起 → decide 落 approval_decision（模拟 decide 后进程崩溃、resume 未发生）→
+    _reconcile_decided 按决定重驱 → 被批工具真执行、run succeeded、审批链状态齐。"""
+    import time as _time
+
+    import opensearch_pipeline.dingtalk_identity as di
+    import opensearch_pipeline.routes.agent as agent_route
+    from opensearch_pipeline.agent_runtime.approval_store import (
+        DECIDE_ACCEPTED, RDSApprovalStore)
+    from opensearch_pipeline.kb_authz import KbIdentity
+    monkeypatch.setattr(di, "_resolve_user_identity",
+                        lambda uid: {"dept": ["production"], "name": uid})
+    monkeypatch.setattr(di, "resolve_kb_identity",
+                        lambda uid: KbIdentity.build(user_id=uid, role="employee"))
+    monkeypatch.setenv("RAG_AGENT_RECONCILE_GRACE_S", "0")
+
+    counter = {"n": 0}
+    reg = _ws3_registry(counter)
+    executor, gateway = _ws3_runtime(reg, _grant_writeback_policy(),
+                                     [_tc("u8_writeback", {"qty": 7}), _final("对账后完成")])
+    astore = RDSApprovalStore()
+    run_id = None
+    req_id = None
+    try:
+        run_id, ev1 = _ws3_suspend(executor, gateway, reg)
+        assert "RunSuspended" in ev1 and counter["n"] == 0
+        areq = astore.get_pending_by_run(run_id)
+        assert areq, "挂起侧必须已落 approval_request"
+        req_id = areq["request_id"]
+        # 决定落库——然后「进程崩溃」：不调 executor.resume（这正是 B6 的窗口）
+        assert astore.decide(req_id, decision="approved",
+                             decided_by="admin-x") == DECIDE_ACCEPTED
+        # 对账候选可见
+        cands = astore.list_decided_unresumed(grace_s=0)
+        assert any(c["run_id"] == run_id and c["decision"] == "approved" for c in cands)
+        # 对账重驱（reaper 循环体调用的同一函数）
+        from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+        n = agent_route._reconcile_decided(reg, gateway, executor, RDSRunStore(), astore)
+        assert n == 1
+        for _ in range(100):                                   # 等续跑完成（drain 线程消费事件）
+            st = _fetch("SELECT status FROM agent_run WHERE run_id=%s", (run_id,))[0][0]
+            if st in ("succeeded", "failed", "cancelled"):
+                break
+            _time.sleep(0.1)
+        assert st == "succeeded", f"对账重驱后 run 应完成，实为 {st}"
+        assert counter["n"] == 1, "被批工具必须恰好执行一次"
+        # 重驱后不再是候选（run 已终态）
+        assert not any(c["run_id"] == run_id for c in astore.list_decided_unresumed(grace_s=0))
+    finally:
+        executor.shutdown()
+        if req_id:
+            conn = _local_operation_conn()
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM approval_decision WHERE request_id=%s", (req_id,))
+            conn.close()
+        if run_id:
+            _cleanup_run(run_id)
+
+
+@skipif_no_agent_db
+def test_b6_stale_resuming_resets_to_suspended_not_failed():
+    """认领后崩溃（stale resuming）→ reap 回边 suspended（保已批决定可重驱），绝不 failed 吞单。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+    store = RDSRunStore()
+    ctx = _ws3_ctx()
+    run_id = store.create_run(ctx, "default")
+    try:
+        assert store.transition(run_id, "running", "suspended")
+        assert store.transition(run_id, "suspended", "resuming")    # 认领后「崩溃」
+        conn = _local_operation_conn()
+        with conn.cursor() as cur:                                  # 心跳做旧过 stale 阈值
+            cur.execute("UPDATE agent_run SET heartbeat_at="
+                        "DATE_SUB(NOW(3), INTERVAL 3600 SECOND) WHERE run_id=%s", (run_id,))
+        conn.close()
+        rep = store.reap_stale_runs(running_stale_s=900, suspended_ttl_s=259200)
+        assert rep["resuming_reset"] >= 1
+        st = _fetch("SELECT status FROM agent_run WHERE run_id=%s", (run_id,))[0][0]
+        assert st == "suspended", f"stale resuming 应回边 suspended（可重驱），实为 {st}"
+    finally:
+        _cleanup_run(run_id)

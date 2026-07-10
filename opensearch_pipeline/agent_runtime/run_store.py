@@ -216,7 +216,11 @@ class RDSRunStore:
     def reap_stale_runs(self, *, running_stale_s: int = 900,
                         suspended_ttl_s: int = 259200) -> Dict[str, int]:
         """收尸（对齐主仓 stage-3 的 2h stale-lock takeover 纪律）：
-        - running/resuming 心跳超时（默认 15 分钟）→ failed：崩溃/SAE 滚动发布 SIGKILL 留下的
+        - **resuming 心跳超时 → 回边 suspended**（B6）：resuming 是「已批、执行宿主尚未接手」
+          的中间态——进程在认领后崩溃时直接标 failed 会**吞掉已落库的审批决定**（批准了却
+          永不执行，违背审批闭环承诺）。回边 suspended 保住可重驱性：对账（reconcile）按
+          approval_decision 重发 resume，或由 suspended TTL 兜底过期。
+        - running 心跳超时（默认 15 分钟）→ failed：崩溃/SAE 滚动发布 SIGKILL 留下的
           僵尸，无人收尸则永久滞留 running（B 组 P1「heartbeat 死代码」的另一半）。
         - suspended 超期（默认 3 天）→ expired：审批黑洞的兜底——过期即视为拒绝。
         纯 UPDATE、幂等、跨实例安全（多实例并发跑只会有一个 rowcount>0）。
@@ -226,8 +230,15 @@ class RDSRunStore:
         try:
             with conn.cursor() as cur:
                 cur.execute(
+                    f"UPDATE {db}.agent_run SET status='suspended', heartbeat_at=NOW(3) "
+                    "WHERE status='resuming' "
+                    "AND heartbeat_at < DATE_SUB(NOW(3), INTERVAL %s SECOND)",
+                    (int(running_stale_s),),
+                )
+                resuming_reset = cur.rowcount
+                cur.execute(
                     f"UPDATE {db}.agent_run SET status='failed', ended_at=NOW(3) "
-                    "WHERE status IN ('running','resuming') "
+                    "WHERE status='running' "
                     "AND heartbeat_at < DATE_SUB(NOW(3), INTERVAL %s SECOND)",
                     (int(running_stale_s),),
                 )
@@ -240,7 +251,8 @@ class RDSRunStore:
                 )
                 expired = cur.rowcount
             conn.commit()
-            return {"failed": int(failed), "expired": int(expired)}
+            return {"failed": int(failed), "expired": int(expired),
+                    "resuming_reset": int(resuming_reset)}
         except Exception:
             conn.rollback()
             raise
