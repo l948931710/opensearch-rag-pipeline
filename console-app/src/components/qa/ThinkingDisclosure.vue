@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { Brain, ChevronRight } from 'lucide-vue-next'
 import type { ChatMessage } from '@/composables/useAsk'
 
@@ -14,6 +14,24 @@ const streaming = computed(() =>
 const open = computed(() => m.reasoningOpen !== false)
 function toggle() { m.reasoningOpen = !open.value }
 const durationText = computed(() => (m.reasoningMs ? (m.reasoningMs / 1000).toFixed(1) + 's' : ''))
+
+// 思考中实时计时：整秒、安静地走（0s 不显，满 1s 才出现）。与 useAsk 同源时钟
+// （_reasoningT0=performance.now）；每秒从 t0 重算绝对差 → 中途重挂载/掉帧不累计漂移。
+// 深思常态 30-60s，等待感知靠"数字在走"托底；答案开始即停表，收起态换 reasoningMs 精确值。
+const nowMs = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0
+const elapsedS = ref(0)
+let tick: ReturnType<typeof setInterval> | null = null
+function syncElapsed() {
+  const t0 = m._reasoningT0
+  // 无 performance 的降级里 t0 与 nowMs 恒 0 → 差值 0 → 计数隐藏；负差 clamp 到 0。
+  elapsedS.value = typeof t0 === 'number' ? Math.max(0, Math.floor((nowMs() - t0) / 1000)) : 0
+}
+watch(streaming, (s) => {
+  if (s) { syncElapsed(); if (tick == null) tick = setInterval(syncElapsed, 1000) }
+  else if (tick != null) { clearInterval(tick); tick = null }
+}, { immediate: true })
+onBeforeUnmount(() => { if (tick != null) { clearInterval(tick); tick = null } })
+const elapsedText = computed(() => (elapsedS.value >= 1 ? `${elapsedS.value}s` : ''))
 
 // 思绪流：新念头到达即滚到底（最新一念始终在视野；配合顶部渐隐 = 旧念头上浮消散）。
 const streamEl = ref<HTMLElement | null>(null)
@@ -32,6 +50,10 @@ watch(() => m.reasoningHtml, () => {
       <div class="mb-1.5 flex items-center gap-2 pl-2.5">
         <span class="think-orb" aria-hidden="true" />
         <span class="text-[11px] font-medium tracking-[0.04em] text-accent-text">正在思考</span>
+        <!-- 实时秒数：aria-hidden——每秒变动对读屏是噪声，无障碍口径以收起态的精确耗时为准 -->
+        <span v-if="elapsedText" class="text-[11px] tabular-nums text-faint" aria-hidden="true">
+          · {{ elapsedText }}
+        </span>
       </div>
       <div
         ref="streamEl"
