@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-store.py — 本体表族（schema/027–029）的持久层：RDSOntologyStore + MemoryOntologyStore。
+store.py — 本体表族（schema/027–030）的持久层：RDSOntologyStore + MemoryOntologyStore。
 
 双后端同一契约（沿 session_store Memory/Redis 双后端惯例）：Memory 供单测/SIM 注入，
 RDS 走 `db._get_db_conn()`（池 + GuardedDBConnection 写守卫——PROD-RO/非生产→生产写
@@ -17,16 +17,33 @@ RDS 走 `db._get_db_conn()`（池 + GuardedDBConnection 写守卫——PROD-RO/�
 from __future__ import annotations
 
 import json
+import logging
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from opensearch_pipeline.ontology.ids import format_ref, new_ulid
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DuplicateActiveIdentifier",
     "MemoryOntologyStore",
     "RDSOntologyStore",
+    "SEM_PROJECTIONS",
 ]
+
+# ── PMC-1 语义投影契约（schema/030 视图列 = 内联回退列 = Memory 组装列，三方同形）────
+# fields 即 spec.golden_json 的一级键（视图里 JSON_UNQUOTE(JSON_EXTRACT('$.<f>'))）。
+SEM_PROJECTIONS: Dict[str, Dict[str, Any]] = {
+    "packing": {"view": "sem_packing", "spec_type": "packing_spec",
+                "link_type": "packing_spec_of_sku",
+                "fields": ("box_type", "per_box", "outer_dim")},
+    "stacking": {"view": "sem_stacking", "spec_type": "stacking_spec",
+                 "link_type": "stacking_spec_of_sku",
+                 "fields": ("stack_mode", "per_stack", "container_cbm")},
+}
+_SEM_PROBE_TTL_S = 300.0
 
 _IDENTIFIER_END_STATES = ("rejected", "superseded")
 
@@ -301,6 +318,152 @@ class RDSOntologyStore:
                     sql += " AND status=%s"
                     params.append(status)
                 cur.execute(sql + " ORDER BY first_seen_at", params)
+                return self._rows_to_dicts(cur)
+        finally:
+            conn.close()
+
+    # ── 关系（029 link）与 sem 投影（030；P0 PR10）────────────────────────────
+    def add_link(self, src_object_id: str, dst_object_id: str, link_type: str, *,
+                 attrs: Optional[Dict[str, Any]] = None) -> str:
+        """建关系（src --type--> dst）。幂等：撞 uk_src_dst_type（含 retired 行）→
+        返回现行 link_id，不复活不覆盖（retire/复活语义 P2 再议）。"""
+        db, conn = self._db(), self._conn()
+        try:
+            link_id = new_ulid()
+            dup = False
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        f"INSERT INTO {db}.ontology_link "
+                        "(link_id, src_object_id, dst_object_id, link_type, attrs_json) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (link_id, src_object_id, dst_object_id, link_type, _dump(attrs)))
+                except Exception as e:
+                    if not self._is_dup(e):
+                        raise
+                    dup = True
+            if not dup:
+                conn.commit()
+                return link_id
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT link_id FROM {db}.ontology_link "
+                    "WHERE src_object_id=%s AND dst_object_id=%s AND link_type=%s",
+                    (src_object_id, dst_object_id, link_type))
+                row = cur.fetchone()
+            if row is None:   # 极窄窗口：并发赢家刚被删——交回调用方重试
+                raise RuntimeError("link 唯一键冲突后不可见，请重试")
+            return row[0]
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_links(self, *, src_object_id: Optional[str] = None,
+                   dst_object_id: Optional[str] = None, link_type: Optional[str] = None,
+                   status: Optional[str] = "active", limit: int = 200) -> List[Dict[str, Any]]:
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                sql = f"SELECT * FROM {db}.ontology_link WHERE 1=1"
+                params: List[Any] = []
+                for col, val in (("src_object_id", src_object_id),
+                                 ("dst_object_id", dst_object_id),
+                                 ("link_type", link_type), ("status", status)):
+                    if val is not None:
+                        sql += f" AND {col}=%s"
+                        params.append(val)
+                cur.execute(sql + " ORDER BY created_at LIMIT %s",
+                            (*params, max(1, min(int(limit), 500))))
+                return self._rows_to_dicts(cur)
+        finally:
+            conn.close()
+
+    def get_object_by_ref(self, canonical_ref: str) -> Optional[Dict[str, Any]]:
+        """展示号（FLP-<码>-<序号>）查对象。uk 在 (object_type, canonical_ref)，
+        但类型码内嵌于展示号 → 全局唯一，按 ref 单列等值即可。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {db}.ontology_object "
+                            "WHERE canonical_ref=%s LIMIT 1", (canonical_ref,))
+                rows = self._rows_to_dicts(cur)
+            return rows[0] if rows else None
+        finally:
+            conn.close()
+
+    # 探测缓存跨实例共享（qa_facts 式：flag/调用先于 030 apply 时优雅回退，不硬崩）
+    _sem_probe: Dict[str, tuple] = {}
+    _sem_probe_lock = threading.Lock()
+
+    def _sem_view_ready(self, view: str) -> bool:
+        now = time.time()
+        with self._sem_probe_lock:
+            hit = self._sem_probe.get(view)
+            if hit and now - hit[0] < _SEM_PROBE_TTL_S:
+                return hit[1]
+        ok = True
+        try:
+            conn = self._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT 1 FROM {self._db()}.{view} LIMIT 1")
+                    cur.fetchall()
+            finally:
+                conn.close()
+        except Exception:   # noqa: BLE001
+            ok = False
+            logger.warning("sem 视图 %s 探测失败（schema/030 未 apply？本窗口回退内联投影）", view)
+        with self._sem_probe_lock:
+            self._sem_probe[view] = (now, ok)
+        return ok
+
+    def sem_spec_rows(self, sku_object_id: str, kind: str) -> List[Dict[str, Any]]:
+        """PMC-1 投影行（kind ∈ SEM_PROJECTIONS）。视图在位走视图；未 apply/查询失败
+        回退内联同形 JOIN（qa_facts 式）。**本方法不做 ACL——行过滤是 sem.py 的职责。**"""
+        proj = SEM_PROJECTIONS[kind]
+        db = self._db()
+        if self._sem_view_ready(proj["view"]):
+            try:
+                conn = self._conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT * FROM {db}.{proj['view']} WHERE sku_id=%s",
+                                    (sku_object_id,))
+                        return self._rows_to_dicts(cur)
+                finally:
+                    conn.close()
+            except Exception:   # noqa: BLE001 — 视图刚被删等窄窗口：降级不硬崩
+                logger.warning("sem 视图查询失败，本次回退内联投影", exc_info=True)
+        json_cols = ", ".join(
+            f"JSON_UNQUOTE(JSON_EXTRACT(spec.golden_json,'$.{f}')) AS {f}"
+            for f in proj["fields"])
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT s.object_id AS sku_id, s.canonical_ref AS sku_ref, "
+                    f"s.title AS sku_title, s.owner_dept AS sku_owner_dept, "
+                    f"p.object_id AS product_id, p.canonical_ref AS product_ref, "
+                    f"p.title AS product_name, spec.object_id AS spec_id, "
+                    f"spec.canonical_ref AS spec_ref, {json_cols}, "
+                    f"spec.golden_json AS spec_json, spec.lifecycle_state AS spec_state, "
+                    f"spec.owner_dept AS owner_dept, "
+                    f"spec.data_classification AS data_classification, "
+                    f"spec.updated_at AS spec_updated_at "
+                    f"FROM {db}.ontology_object s "
+                    f"JOIN {db}.ontology_link lk ON lk.dst_object_id=s.object_id "
+                    f"AND lk.link_type=%s AND lk.status='active' "
+                    f"JOIN {db}.ontology_object spec ON spec.object_id=lk.src_object_id "
+                    f"AND spec.object_type=%s AND spec.status='active' "
+                    f"LEFT JOIN {db}.ontology_link lp ON lp.src_object_id=s.object_id "
+                    f"AND lp.link_type='sku_of_product' AND lp.status='active' "
+                    f"LEFT JOIN {db}.ontology_object p ON p.object_id=lp.dst_object_id "
+                    f"AND p.status='active' "
+                    f"WHERE s.object_type='sku' AND s.status='active' AND s.object_id=%s",
+                    (proj["link_type"], proj["spec_type"], sku_object_id))
                 return self._rows_to_dicts(cur)
         finally:
             conn.close()
@@ -590,7 +753,8 @@ class RDSOntologyStore:
 # ══════════════════════════════════════════════════════════════════════════════
 class MemoryOntologyStore:
     _SEED_TYPES = (("product", "P"), ("sku", "S"), ("mold", "M"),
-                   ("material", "MT"), ("calc_rule", "CR"))
+                   ("material", "MT"), ("calc_rule", "CR"),
+                   ("packing_spec", "PS"), ("stacking_spec", "SS"))   # 后两类=030 登记
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -598,6 +762,7 @@ class MemoryOntologyStore:
         self._identifiers: Dict[str, Dict[str, Any]] = {}
         self._cases: Dict[str, Dict[str, Any]] = {}
         self._candidates: Dict[str, Dict[str, Any]] = {}
+        self._links: Dict[str, Dict[str, Any]] = {}
         self._attr_sources: Dict[tuple, Dict[str, Any]] = {}
         self._stewardship: Dict[tuple, Dict[str, Any]] = {}
         self._seq: Dict[str, list] = {t: [code, 0] for t, code in self._SEED_TYPES}
@@ -731,6 +896,81 @@ class MemoryOntologyStore:
                    if r["target_object_id"] == target_object_id
                    and (status is None or r["status"] == status)]
             return sorted(out, key=lambda r: r["first_seen_at"])
+
+    # ── 关系 / sem 投影（与 RDS 同契约）──────────────────────────────────────
+    def add_link(self, src_object_id, dst_object_id, link_type, *, attrs=None):
+        with self._lock:
+            for row in self._links.values():
+                if (row["src_object_id"], row["dst_object_id"], row["link_type"]) == \
+                        (src_object_id, dst_object_id, link_type):
+                    return row["link_id"]
+            link_id = new_ulid()
+            self._links[link_id] = {
+                "link_id": link_id, "src_object_id": src_object_id,
+                "dst_object_id": dst_object_id, "link_type": link_type,
+                "attrs_json": _dump(attrs), "status": "active",
+                "created_at": self._tick()}
+            return link_id
+
+    def list_links(self, *, src_object_id=None, dst_object_id=None, link_type=None,
+                   status="active", limit=200):
+        with self._lock:
+            rows = [dict(r) for r in self._links.values()
+                    if (src_object_id is None or r["src_object_id"] == src_object_id)
+                    and (dst_object_id is None or r["dst_object_id"] == dst_object_id)
+                    and (link_type is None or r["link_type"] == link_type)
+                    and (status is None or r["status"] == status)]
+            rows.sort(key=lambda r: r["created_at"])
+            return rows[: max(1, min(int(limit), 500))]
+
+    def get_object_by_ref(self, canonical_ref):
+        with self._lock:
+            for row in self._objects.values():
+                if row["canonical_ref"] == canonical_ref:
+                    return dict(row)
+            return None
+
+    def sem_spec_rows(self, sku_object_id, kind):
+        proj = SEM_PROJECTIONS[kind]
+        with self._lock:
+            sku = self._objects.get(sku_object_id)
+            if not sku or sku["object_type"] != "sku" or sku["status"] != "active":
+                return []
+            prod = None
+            for lk in self._links.values():
+                if (lk["src_object_id"] == sku_object_id and lk["status"] == "active"
+                        and lk["link_type"] == "sku_of_product"):
+                    cand = self._objects.get(lk["dst_object_id"])
+                    if cand and cand["status"] == "active":
+                        prod = cand
+                        break
+            rows = []
+            for lk in sorted(self._links.values(), key=lambda r: r["created_at"]):
+                if (lk["dst_object_id"] != sku_object_id or lk["status"] != "active"
+                        or lk["link_type"] != proj["link_type"]):
+                    continue
+                sp = self._objects.get(lk["src_object_id"])
+                if not sp or sp["object_type"] != proj["spec_type"] or sp["status"] != "active":
+                    continue
+                try:
+                    golden = json.loads(sp["golden_json"] or "{}")
+                except Exception:   # noqa: BLE001
+                    golden = {}
+                row = {"sku_id": sku_object_id, "sku_ref": sku["canonical_ref"],
+                       "sku_title": sku["title"], "sku_owner_dept": sku["owner_dept"],
+                       "product_id": prod["object_id"] if prod else None,
+                       "product_ref": prod["canonical_ref"] if prod else None,
+                       "product_name": prod["title"] if prod else None,
+                       "spec_id": sp["object_id"], "spec_ref": sp["canonical_ref"]}
+                for f in proj["fields"]:   # JSON_UNQUOTE 语义：值恒为字符串或 None
+                    v = golden.get(f)
+                    row[f] = None if v is None else str(v)
+                row.update(spec_json=sp["golden_json"], spec_state=sp["lifecycle_state"],
+                           owner_dept=sp["owner_dept"],
+                           data_classification=sp["data_classification"],
+                           spec_updated_at=None)
+                rows.append(row)
+            return rows
 
     # ── case / 候选 ─────────────────────────────────────────────────────────
     def upsert_case(self, namespace, raw_value, norm_value, *, object_type_hint=None,

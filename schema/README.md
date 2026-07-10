@@ -12,7 +12,7 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 030（030=sem 视图、031=本体事件已被 P1/P2 计划预订，
+3. **编号严格单调递增**，下一个可用号 = 031（031=本体事件已被 P2 计划预订，
    见 docs/ontology_p0_plan_2026-07-10.md）。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
    ⚠️ **本体层文档编号勘误**：《本体层设计 v1.1》《P0-P1 落地细化》所写迁移号 024–028 成文时
@@ -62,6 +62,7 @@ apply 脚本落库并记台账。
 | 027_ontology_core.sql | fuling_operation | 本体控制面核心：ontology_object（canonical ULID+乐观锁+密级）+ ontology_ref_seq（展示号发号）+ ontology_attribute_source（属性溯源，纯来源治理）+ ontology_stewardship（授权 scope，S5）（本体 P0；docs/ontology_p0_plan_2026-07-10.md） |
 | 028_ontology_identity.sql | fuling_operation | 身份脊柱：ontology_identifier（别名映射，至多一行 active 生成列唯一键 S4；norm 不剥改模后缀）+ ontology_resolution_case/candidate（候选承载层 S2：证据快照+积压统计，一个未解析编号×N 候选）（本体 P0） |
 | 029_ontology_link.sql | fuling_operation | 本体关系：ontology_link（sku_of_product 等；uk_src_dst_type）（本体 P0） |
+| 030_sem_views.sql | fuling_operation | PMC-1 语义投影：sem_packing/sem_stacking 视图（spec↔SKU 走 029 link 非 JSON 关联）+ packing_spec/stacking_spec 发号登记；**S7：不授 fuling_ro，唯一读取口 ontology/sem.py**（本体 P0 PR10） |
 
 ## 台账（schema_migrations）
 
