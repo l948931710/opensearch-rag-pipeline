@@ -59,6 +59,7 @@ from opensearch_pipeline.answer_flow import (
 )
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.db import DBPoolExhausted
+from opensearch_pipeline.https_redirect import HttpsRedirectMiddleware
 from opensearch_pipeline.request_context import (
     RequestIdMiddleware,
     get_request_id,
@@ -177,6 +178,13 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# CLB 80 明文监听 → 应用层 301/308 跳 HTTPS（SAE 管的 CLB 禁止控制台手配监听级跳转，
+# 详见 https_redirect.py 模块 docstring）。仅对 X-Forwarded-Proto: http 生效；本地/EIP
+# 直连/单测无此头，不受影响。RAG_FORCE_HTTPS=false 可停用。先于 RequestIdMiddleware
+# add → 在其内层 → 跳转响应同样经由外层回写 X-Request-Id。
+if os.environ.get("RAG_FORCE_HTTPS", "true").strip().lower() not in ("false", "0", "no"):
+    app.add_middleware(HttpsRedirectMiddleware)
 
 # 请求级 correlation id（统一 trace，OBS-trace）：纯 ASGI 中间件，入站读/生成 X-Request-Id 存入
 # ContextVar（端点与嵌套 retriever/llm_generator 调用可见）、响应头回写。最后 add → 最外层 → 最先跑。
