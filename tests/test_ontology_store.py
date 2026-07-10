@@ -58,11 +58,15 @@ def _cleanup_rds():
                            autocommit=True, connect_timeout=3)
     like = _MARK + "%"
     with conn.cursor() as cur:
+        # FK 后清扫顺序（PR-A）：candidate → case → identifier → link → object（子先父后）
         cur.execute("DELETE FROM ontology_resolution_candidate WHERE case_id IN "
                     "(SELECT case_id FROM ontology_resolution_case WHERE namespace LIKE %s)",
                     (like,))
         cur.execute("DELETE FROM ontology_resolution_case WHERE namespace LIKE %s", (like,))
         cur.execute("DELETE FROM ontology_identifier WHERE namespace LIKE %s", (like,))
+        cur.execute("DELETE l FROM ontology_link l JOIN ontology_object o "
+                    "ON o.object_id IN (l.src_object_id, l.dst_object_id) "
+                    "WHERE o.title LIKE %s", (like,))
         cur.execute("DELETE FROM ontology_object WHERE title LIKE %s", (like,))
     conn.close()
 
@@ -125,14 +129,87 @@ def test_update_golden_cas(store):
 
 
 def test_retire_and_mark_duplicate(store):
-    a, b = _mint(store), _mint(store)
+    a, b, c = _mint(store), _mint(store), _mint(store)
     assert store.retire_object(a["object_id"]) is True
     assert store.retire_object(a["object_id"]) is False          # 已非 active，CAS 让位
-    assert store.mark_duplicate(b["object_id"], a["object_id"]) is True
+    # P0-03：merge 目标必须 active——往退役对象里合并=把身份指进坟墓，拒
+    with pytest.raises(ValueError, match="非 active"):
+        store.mark_duplicate(b["object_id"], a["object_id"])
+    assert store.mark_duplicate(b["object_id"], c["object_id"]) is True
     got = store.get_object(b["object_id"])
-    assert got["status"] == "merged" and got["merged_into"] == a["object_id"]
+    assert got["status"] == "merged" and got["merged_into"] == c["object_id"]
     with pytest.raises(ValueError, match="自身"):
-        store.mark_duplicate(b["object_id"], b["object_id"])
+        store.mark_duplicate(c["object_id"], c["object_id"])
+
+
+def test_retire_cascades_identifiers_and_links(store, ns):
+    """P0-03：退役同事务级联——active 别名→retired、双向 link→retired，不留 active 引用。"""
+    a, b = _mint(store), _mint(store)
+    iid = store.insert_identifier(ns, "abc", "ABC", a["object_id"], method="seed")
+    lid = store.add_link(a["object_id"], b["object_id"], "sku_of_product")
+    assert store.retire_object(a["object_id"]) is True
+    assert store.get_active_identifier(ns, "ABC") is None
+    ident = [r for r in store.list_identifiers_for_target(a["object_id"])
+             if r["identifier_id"] == iid][0]
+    assert ident["status"] == "retired"
+    links = store.list_links(src_object_id=a["object_id"], status=None)
+    assert [r["status"] for r in links if r["link_id"] == lid] == ["retired"]
+
+
+def test_mark_duplicate_repoints_identifiers_same_tx(store, ns):
+    """P0-03：merge 同事务把 source 的 active 别名改指 target（身份连续），source link 退场。"""
+    a, b = _mint(store), _mint(store)
+    old_id = store.insert_identifier(ns, "abc", "ABC", a["object_id"], method="seed")
+    assert store.mark_duplicate(a["object_id"], b["object_id"], by="steward_1") is True
+    active = store.get_active_identifier(ns, "ABC")
+    assert active is not None and active["target_object_id"] == b["object_id"]
+    assert active["identifier_id"] != old_id
+    olds = [r for r in store.list_identifiers_for_target(a["object_id"])
+            if r["identifier_id"] == old_id]
+    assert olds[0]["status"] == "superseded"
+    assert olds[0]["superseded_by"] == active["identifier_id"]
+
+
+def test_mark_duplicate_rejects_cross_type(store):
+    """P0-03：跨类型合并=语义脊柱污染，拒（product 不能 merge 进 material）。"""
+    p = _mint(store, object_type="product")
+    m = _mint(store, object_type="material")
+    with pytest.raises(ValueError, match="跨类型"):
+        store.mark_duplicate(p["object_id"], m["object_id"])
+    assert store.get_object(p["object_id"])["status"] == "active"   # 原子：闸拒后无半状态
+
+
+def test_mark_duplicate_no_cycle(store):
+    """P0-03 防环：A merged→B 后 B 再 merge→A 必拒（A 非 active）——active 目标链长恒 0。"""
+    a, b = _mint(store), _mint(store)
+    assert store.mark_duplicate(a["object_id"], b["object_id"]) is True
+    with pytest.raises(ValueError, match="非 active"):
+        store.mark_duplicate(b["object_id"], a["object_id"])
+
+
+def test_insert_identifier_dangling_target_rejected(store, ns):
+    """P0-03 FK：悬空目标拒绝（RDS=1452→ValueError，Memory=显式存在性校验，同契约）。"""
+    with pytest.raises(ValueError, match="不存在"):
+        store.insert_identifier(ns, "x", "X", "0" * 26, method="seed")
+    with pytest.raises(ValueError, match="不存在"):
+        store.add_link("0" * 26, "1" * 26, "sku_of_product")
+
+
+def test_identifier_binary_collation_case_sensitive(store, ns):
+    """P0-04：customer 归一保大小写 → 唯一键必须 binary 口径——'A(高钙)' 与 'a(高钙)'
+    是两个身份，两后端都必须可同时 active（修复前 RDS unicode_ci 会撞 uk 而 Memory 不撞）。"""
+    obj1, obj2 = _mint(store), _mint(store)
+    cns = f"{ns}:kfc"   # customer 前缀语义：保大小写
+    i_upper = store.insert_identifier(cns, "A(高钙)", "A(高钙)", obj1["object_id"],
+                                      method="manual")
+    i_lower = store.insert_identifier(cns, "a(高钙)", "a(高钙)", obj2["object_id"],
+                                      method="manual")
+    assert i_upper != i_lower
+    assert store.get_active_identifier(cns, "A(高钙)")["target_object_id"] == obj1["object_id"]
+    assert store.get_active_identifier(cns, "a(高钙)")["target_object_id"] == obj2["object_id"]
+    # 同大小写重插仍然撞（唯一键语义不因 binary 而放松）
+    with pytest.raises(DuplicateActiveIdentifier):
+        store.insert_identifier(cns, "A(高钙)", "A(高钙)", obj1["object_id"], method="manual")
 
 
 # ── 别名：至多一行 active / 纠错 ──────────────────────────────────────────────────
@@ -381,5 +458,77 @@ def test_rds_concurrent_insert_identifier_single_winner():
     [t.join() for t in threads]
     try:
         assert sorted(outcomes) == ["dup", "ok"]
+    finally:
+        _cleanup_rds()
+
+
+@rds_only
+def test_rds_global_unique_ref_and_type_code():
+    """P0-04（RDS-only，DB 层强制）：canonical_ref 全局 UNIQUE、ref_seq.type_code 全局 UNIQUE。"""
+    import pymysql
+
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
+                           password=cfg.rds.password, database=cfg.rds.operation_database,
+                           autocommit=True, connect_timeout=3)
+    store = RDSOntologyStore()
+    obj = _mint(store)
+    try:
+        with conn.cursor() as cur:
+            # 同 canonical_ref 换个 object_type 直插 → 撞 uk_ref（旧 uk 只在 (type,ref) 上拦不住）
+            with pytest.raises(Exception) as exc1:
+                cur.execute(
+                    "INSERT INTO ontology_object (object_id, object_type, canonical_ref, "
+                    "title, golden_json, owner_dept) VALUES (%s,'material',%s,%s,'{}','pmc')",
+                    ("Z" * 26, obj["canonical_ref"], f"{_MARK}撞号"))
+            assert exc1.value.args[0] == 1062
+            # 同 type_code 换个 object_type → 撞 uk_type_code
+            with pytest.raises(Exception) as exc2:
+                cur.execute("INSERT INTO ontology_ref_seq (object_type, type_code, next_no) "
+                            "VALUES (%s,'P',0)", (f"{_MARK}fake_type",))
+            assert exc2.value.args[0] == 1062
+    finally:
+        conn.close()
+        _cleanup_rds()
+
+
+@rds_only
+def test_rds_concurrent_retire_vs_resolve_no_zombie():
+    """P0-03 并发：retire 与 exact-resolve 竞态——resolve 要么在退役前 resolved，
+    要么退役后 unresolved，绝不返回指向 retired 对象的 resolved。"""
+    from opensearch_pipeline.ontology.resolve import OntologyResolver
+    store = RDSOntologyStore()
+    ns_v = f"{_MARK}{uuid.uuid4().hex[:10]}"
+    obj = _mint(store)
+    store.insert_identifier(ns_v, "x1", "X1", obj["object_id"], method="seed")
+    resolver = OntologyResolver(store, embedder=None)
+    results, errors = [], []
+
+    def _retire():
+        try:
+            store.retire_object(obj["object_id"])
+        except Exception as e:   # noqa: BLE001
+            errors.append(e)
+
+    def _resolve():
+        try:
+            for _ in range(6):
+                results.append(resolver.resolve(ns_v, "x1"))
+        except Exception as e:   # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_retire), threading.Thread(target=_resolve)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    try:
+        assert not errors
+        for r in results:
+            if r.status == "resolved":
+                continue   # 退役前窗口的合法命中
+            assert r.status == "unresolved"
+        # 终态：退役完成后必 unresolved
+        final = resolver.resolve(ns_v, "x1")
+        assert final.status == "unresolved" and final.requires_hitl is True
     finally:
         _cleanup_rds()

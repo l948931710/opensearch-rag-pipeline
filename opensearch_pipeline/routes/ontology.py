@@ -372,7 +372,7 @@ def ontology_object_mark_duplicate(object_id: str, req: MarkDuplicateRequest, re
     if target["status"] != "active":
         raise HTTPException(status_code=409, detail=f"merged_into 非 active（{target['status']}）")
     try:
-        ok = store.mark_duplicate(object_id, req.merged_into)
+        ok = store.mark_duplicate(object_id, req.merged_into, by=identity.user_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not ok:

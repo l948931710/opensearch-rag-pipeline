@@ -4,6 +4,10 @@
 -- 取号勘误：设计文档所写 024（core）已被 agent v2 占用，实际取 027；详见 schema/README.md 铁律 3。
 -- 定位：身份/关系/来源治理的控制面，非万物 SoR——业务事实（库存/订单/金额/完工）仍以各源系统为准，
 -- 本体只登记「该属性听谁的、多新鲜、谁负责」（ontology_attribute_source / ontology_stewardship）。
+-- P0 收口修订（PR-A，P0-04，2026-07-10 外审）：分支未发布、仅 apply 过一次性本地库，直接修订原文件——
+--   ① canonical_ref 升为全局 UNIQUE（原 uk 只在 (object_type, canonical_ref)，两类型误配同 type_code 时
+--      get_object_by_ref 的单列查会歧义；全局唯一后 LIMIT 1 从「约定」变「DB 强制」）；
+--   ② ontology_ref_seq.type_code 加 UNIQUE（原来只有 PK(object_type)，同码双类型 DB 不拦）。
 
 -- ── 对象主表：canonical 身份由本体铸造（ULID），永不等于任何源系统 ID ────────────────
 CREATE TABLE IF NOT EXISTS ontology_object (
@@ -22,7 +26,7 @@ CREATE TABLE IF NOT EXISTS ontology_object (
   created_at          DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at          DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (object_id),
-  UNIQUE KEY uk_type_ref (object_type, canonical_ref),
+  UNIQUE KEY uk_ref (canonical_ref),                  -- 全局唯一（P0-04：类型码内嵌于展示号，DB 强制而非约定）
   KEY idx_type_status (object_type, status),
   KEY idx_type_title (object_type, title(64))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -32,7 +36,8 @@ CREATE TABLE IF NOT EXISTS ontology_ref_seq (
   object_type VARCHAR(32) NOT NULL,
   type_code   VARCHAR(8)  NOT NULL,                   -- 展示号里的类型码（P/S/M/MT/…）
   next_no     BIGINT      NOT NULL DEFAULT 0,
-  PRIMARY KEY (object_type)
+  PRIMARY KEY (object_type),
+  UNIQUE KEY uk_type_code (type_code)                 -- 全局唯一（P0-04：同码双类型 DB 拦截）
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 首批「物」四类 + P3 参数对象；INSERT IGNORE 幂等（重复执行 no-op）

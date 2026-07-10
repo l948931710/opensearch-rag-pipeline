@@ -81,6 +81,11 @@ class RDSOntologyStore:
     def _is_dup(exc: Exception) -> bool:
         return bool(getattr(exc, "args", None)) and exc.args[0] == 1062
 
+    @staticmethod
+    def _is_fk_violation(exc: Exception) -> bool:
+        # 1452 = Cannot add or update a child row（FK 悬空目标，P0-03）
+        return bool(getattr(exc, "args", None)) and exc.args[0] == 1452
+
     # ── 对象 ────────────────────────────────────────────────────────────────
     def mint_object(self, object_type: str, title: str, *, owner_dept: str,
                     golden: Optional[Dict[str, Any]] = None,
@@ -169,27 +174,86 @@ class RDSOntologyStore:
             conn.close()
 
     def retire_object(self, object_id: str) -> bool:
-        """S3 最小纠错：active→retired（CAS）。审计留痕在调用方（工作台 routes）。"""
-        return self._object_transition(object_id, to_status="retired")
-
-    def mark_duplicate(self, object_id: str, merged_into: str) -> bool:
-        """S3 最小纠错：active→merged + merged_into 标记（**不做关系/黄金记录传播**，全量=P2）。"""
-        if object_id == merged_into:
-            raise ValueError("merged_into 不能指向自身")
-        return self._object_transition(object_id, to_status="merged", merged_into=merged_into)
-
-    def _object_transition(self, object_id: str, *, to_status: str,
-                           merged_into: Optional[str] = None) -> bool:
+        """S3 纠错（P0-03 收口）：**同一事务**内 对象 active→retired + 其全部 active 别名→'retired'
+        + 其双向 active link→retired。退役后不留任何仍指向它的 active 引用（resolve/sem 双闸兜底）。
+        审计留痕在调用方（工作台 routes）。"""
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE {db}.ontology_object SET status=%s, merged_into=%s "
-                    "WHERE object_id=%s AND status='active'",
-                    (to_status, merged_into, object_id))
-                ok = cur.rowcount == 1
+                cur.execute(f"SELECT status FROM {db}.ontology_object "
+                            "WHERE object_id=%s FOR UPDATE", (object_id,))
+                row = cur.fetchone()
+                if row is None or row[0] != "active":
+                    conn.rollback()
+                    return False
+                cur.execute(f"UPDATE {db}.ontology_object SET status='retired' "
+                            "WHERE object_id=%s", (object_id,))
+                cur.execute(f"UPDATE {db}.ontology_identifier SET status='retired' "
+                            "WHERE target_object_id=%s AND status='active'", (object_id,))
+                cur.execute(f"UPDATE {db}.ontology_link SET status='retired' "
+                            "WHERE (src_object_id=%s OR dst_object_id=%s) AND status='active'",
+                            (object_id, object_id))
             conn.commit()
-            return ok
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def mark_duplicate(self, object_id: str, merged_into: str, *,
+                       by: Optional[str] = None) -> bool:
+        """S3 纠错（P0-03 收口）：**同一事务**内 source active→merged(+merged_into) +
+        source 的全部 active 别名改指 target（supersede+插新 active 行，身份连续）+
+        source 的 active link→retired（不搬运——target 自己的关系不受污染，全量传播=P2）。
+
+        闸（均在锁内校验）：同 object_type（跨类型合并=语义脊柱污染，拒）；target 必须
+        active（active 对象 merged_into 恒 NULL → 链长为 0，环构造性不可能）；自指拒。
+        锁序按 object_id 排序取 FOR UPDATE，防对向并发死锁。"""
+        if object_id == merged_into:
+            raise ValueError("merged_into 不能指向自身")
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                first, second = sorted((object_id, merged_into))
+                cur.execute(f"SELECT object_id, object_type, status FROM {db}.ontology_object "
+                            "WHERE object_id IN (%s,%s) ORDER BY object_id FOR UPDATE",
+                            (first, second))
+                rows = {r[0]: {"object_type": r[1], "status": r[2]} for r in cur.fetchall()}
+                src, dst = rows.get(object_id), rows.get(merged_into)
+                if src is None or src["status"] != "active":
+                    conn.rollback()
+                    return False
+                if dst is None or dst["status"] != "active":
+                    raise ValueError(f"merge 目标 {merged_into} 不存在或非 active")
+                if src["object_type"] != dst["object_type"]:
+                    raise ValueError(
+                        f"跨类型合并拒绝：{src['object_type']} → {dst['object_type']}")
+                cur.execute(f"UPDATE {db}.ontology_object SET status='merged', merged_into=%s "
+                            "WHERE object_id=%s", (merged_into, object_id))
+                # source 的 active 别名同事务改指 target（旧行 supersede，新行 active）
+                cur.execute(f"SELECT * FROM {db}.ontology_identifier "
+                            "WHERE target_object_id=%s AND status='active' FOR UPDATE",
+                            (object_id,))
+                for old in self._rows_to_dicts(cur):
+                    new_id = new_ulid()
+                    cur.execute(f"UPDATE {db}.ontology_identifier "
+                                "SET status='superseded', superseded_by=%s "
+                                "WHERE identifier_id=%s", (new_id, old["identifier_id"]))
+                    cur.execute(
+                        f"INSERT INTO {db}.ontology_identifier "
+                        "(identifier_id, namespace, raw_value, norm_value, target_object_id, "
+                        " target_revision, relation, resolution_method, confidence, status, "
+                        " source_case_id, confirmed_by, confirmed_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,'manual',1.000,'active',%s,%s,NOW(3))",
+                        (new_id, old["namespace"], old["raw_value"], old["norm_value"],
+                         merged_into, old["target_revision"], old["relation"],
+                         old["source_case_id"], by or old.get("confirmed_by")))
+                cur.execute(f"UPDATE {db}.ontology_link SET status='retired' "
+                            "WHERE (src_object_id=%s OR dst_object_id=%s) AND status='active'",
+                            (object_id, object_id))
+            conn.commit()
+            return True
         except Exception:
             conn.rollback()
             raise
@@ -246,6 +310,8 @@ class RDSOntologyStore:
             conn.rollback()
             if self._is_dup(e):
                 raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
+            if self._is_fk_violation(e):
+                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
             raise
         finally:
             conn.close()
@@ -339,6 +405,8 @@ class RDSOntologyStore:
                         "VALUES (%s,%s,%s,%s,%s)",
                         (link_id, src_object_id, dst_object_id, link_type, _dump(attrs)))
                 except Exception as e:
+                    if self._is_fk_violation(e):
+                        raise ValueError("link 端点对象不存在（FK 拦截）")
                     if not self._is_dup(e):
                         raise
                     dup = True
@@ -814,20 +882,58 @@ class MemoryOntologyStore:
             return True
 
     def retire_object(self, object_id):
-        return self._object_transition(object_id, to_status="retired")
-
-    def mark_duplicate(self, object_id, merged_into):
-        if object_id == merged_into:
-            raise ValueError("merged_into 不能指向自身")
-        return self._object_transition(object_id, to_status="merged", merged_into=merged_into)
-
-    def _object_transition(self, object_id, *, to_status, merged_into=None):
+        """P0-03 级联（与 RDS 同契约）：对象→retired + active 别名→retired + 双向 link→retired。"""
         with self._lock:
             row = self._objects.get(object_id)
             if not row or row["status"] != "active":
                 return False
-            row["status"] = to_status
-            row["merged_into"] = merged_into
+            row["status"] = "retired"
+            for ident in self._identifiers.values():
+                if ident["target_object_id"] == object_id and ident["status"] == "active":
+                    ident["status"] = "retired"
+            for lk in self._links.values():
+                if lk["status"] == "active" and object_id in (
+                        lk["src_object_id"], lk["dst_object_id"]):
+                    lk["status"] = "retired"
+            return True
+
+    def mark_duplicate(self, object_id, merged_into, *, by=None):
+        """P0-03 级联（与 RDS 同契约）：同类型/目标 active/防自指闸 + source 别名改指 target
+        + source link→retired。"""
+        if object_id == merged_into:
+            raise ValueError("merged_into 不能指向自身")
+        with self._lock:
+            src = self._objects.get(object_id)
+            if not src or src["status"] != "active":
+                return False
+            dst = self._objects.get(merged_into)
+            if not dst or dst["status"] != "active":
+                raise ValueError(f"merge 目标 {merged_into} 不存在或非 active")
+            if src["object_type"] != dst["object_type"]:
+                raise ValueError(
+                    f"跨类型合并拒绝：{src['object_type']} → {dst['object_type']}")
+            src["status"] = "merged"
+            src["merged_into"] = merged_into
+            for ident in list(self._identifiers.values()):
+                if ident["target_object_id"] != object_id or ident["status"] != "active":
+                    continue
+                new_id = new_ulid()
+                ident["status"] = "superseded"
+                ident["superseded_by"] = new_id
+                self._identifiers[new_id] = {
+                    "identifier_id": new_id, "namespace": ident["namespace"],
+                    "raw_value": ident["raw_value"], "norm_value": ident["norm_value"],
+                    "target_object_id": merged_into,
+                    "target_revision": ident["target_revision"],
+                    "relation": ident["relation"], "resolution_method": "manual",
+                    "confidence": 1.0, "status": "active", "superseded_by": None,
+                    "source_case_id": ident["source_case_id"],
+                    "confirmed_by": by or ident.get("confirmed_by"),
+                    "approval_request_id": None, "first_seen_at": self._tick()}
+            for lk in self._links.values():
+                if lk["status"] == "active" and object_id in (
+                        lk["src_object_id"], lk["dst_object_id"]):
+                    lk["status"] = "retired"
             return True
 
     # ── 别名 ────────────────────────────────────────────────────────────────
@@ -845,6 +951,8 @@ class MemoryOntologyStore:
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
                 raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
+            if target_object_id not in self._objects:   # 对齐 RDS FK（P0-03）
+                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
             identifier_id = new_ulid()
             self._identifiers[identifier_id] = {
                 "identifier_id": identifier_id, "namespace": namespace,
@@ -904,6 +1012,8 @@ class MemoryOntologyStore:
                 if (row["src_object_id"], row["dst_object_id"], row["link_type"]) == \
                         (src_object_id, dst_object_id, link_type):
                     return row["link_id"]
+            if src_object_id not in self._objects or dst_object_id not in self._objects:
+                raise ValueError("link 端点对象不存在（FK 拦截）")   # 对齐 RDS FK（P0-03）
             link_id = new_ulid()
             self._links[link_id] = {
                 "link_id": link_id, "src_object_id": src_object_id,

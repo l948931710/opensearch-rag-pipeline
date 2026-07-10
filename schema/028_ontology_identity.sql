@@ -2,6 +2,12 @@
 -- 库：fuling_operation
 -- 身份脊柱：别名映射（ontology_identifier）+ 候选承载层（resolution_case/candidate，外评 S2）。
 -- 取号勘误：设计文档所写 025（identifier）已被 agent v2 占用，实际取 028；见 schema/README.md 铁律 3。
+-- P0 收口修订（PR-A，P0-03/04，2026-07-10 外审）：分支未发布、仅 apply 过一次性本地库，直接修订原文件——
+--   ① namespace/norm_value 列级 COLLATE utf8mb4_bin：normalize() 承诺 customer 保大小写语义，
+--      唯一键必须与 Python 判定同口径（unicode_ci 下 'A'='a' 会把两个身份撞成一行 = 静默 false-merge）；
+--   ② identifier.status 增 'retired'（目标对象退役时级联，区别于 superseded=被改指 / rejected=错映射）；
+--   ③ 加 FK：identifier.target_object_id→object、candidate.case_id→case、candidate.target→object
+--      （同库引用，悬空目标在 DB 层拦截；应用层状态机见 store.py retire/mark_duplicate 级联）。
 --
 -- 分层（S1/S2 读写分离的落库形态）：
 --   · 候选阶段一律在 resolution_case/candidate —— 一个未解析编号可挂 N 个候选目标（uk_ns_norm 装不下）；
@@ -11,15 +17,15 @@
 -- ── 别名脊柱：所有源系统编号（含 U8 货号）都是指向 canonical 对象的别名 ────────────────
 CREATE TABLE IF NOT EXISTS ontology_identifier (
   identifier_id     CHAR(26)     NOT NULL,            -- ULID
-  namespace         VARCHAR(64)  NOT NULL,            -- u8|internal|customer:<客户>|supplier:<名>|material_grade|lab_sample|lot_code|…
+  namespace         VARCHAR(64)  COLLATE utf8mb4_bin NOT NULL,   -- u8|internal|customer:<客户>|supplier:<名>|material_grade|lab_sample|lot_code|…（bin：键判定与 normalize 大小写敏感承诺同口径，P0-04）
   raw_value         VARCHAR(255) NOT NULL,            -- 原始观测值（保真）
-  norm_value        VARCHAR(255) NOT NULL,            -- normalize() 归一值；⚠️ 绝不剥改模后缀（ABC123 ≠ ABC123-M）
+  norm_value        VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,   -- normalize() 归一值；⚠️ 绝不剥改模后缀（ABC123 ≠ ABC123-M）；bin 同上
   target_object_id  CHAR(26)     NOT NULL,
   target_revision   VARCHAR(16)  NULL,                -- 改模变体指到 Product@rN 的版本轴（如 'r2'）
   relation          ENUM('canonical','alias','variant','equivalent') NOT NULL DEFAULT 'alias',
   resolution_method ENUM('seed','rule','kie','embedding','manual') NOT NULL,
   confidence        DECIMAL(4,3) NOT NULL DEFAULT 1.000,
-  status            ENUM('active','superseded','rejected') NOT NULL DEFAULT 'active',
+  status            ENUM('active','superseded','rejected','retired') NOT NULL DEFAULT 'active',   -- retired=目标对象退役级联（P0-03）
   -- S4：至多一行 active——active→1、其余→NULL（MySQL 唯一键中 NULL 不冲突），历史行可共存
   active_key        TINYINT AS (CASE WHEN status = 'active' THEN 1 ELSE NULL END) STORED,
   superseded_by     CHAR(26)     NULL,                -- S3 repoint 链：旧行 → 新行
@@ -33,16 +39,18 @@ CREATE TABLE IF NOT EXISTS ontology_identifier (
   UNIQUE KEY uk_ns_norm_active (namespace, norm_value, active_key),
   KEY idx_ns_norm (namespace, norm_value),            -- 历史/全状态回查（非唯一）
   KEY idx_target (target_object_id, status),
-  KEY idx_method_status (resolution_method, status)   -- auto 抽检队列（method+active 扫描）
+  KEY idx_method_status (resolution_method, status),  -- auto 抽检队列（method+active 扫描）
+  CONSTRAINT fk_identifier_target FOREIGN KEY (target_object_id)
+    REFERENCES ontology_object (object_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── 消解 case：未解析编号的观测聚合 + 证据快照 + 积压统计（S2）──────────────────────
 -- 同一 (namespace, norm) 至多一个 open case（open_key 生成列，模式同上）；resolved/dismissed 留史。
 CREATE TABLE IF NOT EXISTS ontology_resolution_case (
   case_id            CHAR(26)     NOT NULL,           -- ULID
-  namespace          VARCHAR(64)  NOT NULL,
+  namespace          VARCHAR(64)  COLLATE utf8mb4_bin NOT NULL,   -- bin：与 identifier 同口径（跨表 JOIN 防 1267）
   raw_value          VARCHAR(255) NOT NULL,
-  norm_value         VARCHAR(255) NOT NULL,
+  norm_value         VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
   object_type_hint   VARCHAR(32)  NULL,               -- 期望对象类型（product/sku/…），供工作台分栏
   status             ENUM('open','resolved','dismissed') NOT NULL DEFAULT 'open',
   open_key           TINYINT AS (CASE WHEN status = 'open' THEN 1 ELSE NULL END) STORED,
@@ -72,5 +80,9 @@ CREATE TABLE IF NOT EXISTS ontology_resolution_candidate (
   created_at       DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (candidate_id),
   UNIQUE KEY uk_case_target_method (case_id, target_object_id, method),
-  KEY idx_case (case_id, confidence)
+  KEY idx_case (case_id, confidence),
+  CONSTRAINT fk_candidate_case FOREIGN KEY (case_id)
+    REFERENCES ontology_resolution_case (case_id),
+  CONSTRAINT fk_candidate_target FOREIGN KEY (target_object_id)
+    REFERENCES ontology_object (object_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

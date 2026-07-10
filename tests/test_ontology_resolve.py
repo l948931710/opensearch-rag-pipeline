@@ -121,6 +121,40 @@ def test_exact_hit_carries_target_revision(resolver, store):
     assert res.status == "resolved" and res.target_revision == "r2"
 
 
+def test_exact_hit_retired_target_never_resolved(resolver, store):
+    """P0-03：目标对象退役后（含级联前的历史 active 别名窗口），exact 绝不返回 resolved。"""
+    obj = _seed_product(store)
+    # 绕过 retire 级联，直接把对象打成 retired，模拟"别名仍 active 而对象已死"的病态窗口
+    store._objects[obj["object_id"]]["status"] = "retired"
+    res = resolver.resolve("u8", "abc123")
+    assert res.status == "unresolved" and res.requires_hitl is True
+    assert res.object_id is None and res.confidence == 0.0
+
+
+def test_exact_hit_merged_target_never_resolved(resolver, store):
+    """P0-03：merged 残留别名（级联失败/历史脏数据）不得 resolved。"""
+    obj = _seed_product(store)
+    store._objects[obj["object_id"]]["status"] = "merged"
+    res = resolver.resolve("u8", "abc123")
+    assert res.status == "unresolved" and res.requires_hitl is True
+
+
+def test_exact_hit_missing_target_never_resolved(resolver, store):
+    """P0-03：目标对象整行缺失（悬空别名）不得 resolved（FK 加上后 RDS 不可达，Memory 防御）。"""
+    obj = _seed_product(store)
+    del store._objects[obj["object_id"]]
+    res = resolver.resolve("u8", "abc123")
+    assert res.status == "unresolved" and res.requires_hitl is True
+
+
+def test_rule_candidate_skips_retired_base_target(resolver, store):
+    """P0-03：剥后缀候选的基础码目标已退役 → 不作候选。"""
+    obj = _seed_product(store)                        # ABC123 → obj
+    store._objects[obj["object_id"]]["status"] = "retired"
+    res = resolver.resolve("u8", "ABC123-M")
+    assert all(c.target_object_id != obj["object_id"] for c in res.candidates)
+
+
 @pytest.mark.parametrize("bad", ["", "   "])
 def test_resolve_rejects_empty_value(resolver, bad):
     with pytest.raises(ValueError):

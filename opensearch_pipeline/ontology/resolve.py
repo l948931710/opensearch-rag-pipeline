@@ -206,7 +206,14 @@ class OntologyResolver:
 
         hit = self._store.get_active_identifier(namespace, norm)
         if hit is not None:
-            obj = self._store.get_object(hit["target_object_id"]) or {}
+            obj = self._store.get_object(hit["target_object_id"])
+            # P0-03 生命周期闸（对齐 sem.py 的 active 校验）：目标缺失/retired/merged 的
+            # active 别名是治理待处置态，绝不能返回 resolved 把退役身份当权威喂下游。
+            # 纯读契约不变——不落库不建 case，fail-closed 为 unresolved 交人审。
+            if obj is None or obj.get("status") != "active":
+                return ResolveResult(
+                    status="unresolved", namespace=namespace, raw_value=raw,
+                    norm_value=norm, intent=intent, requires_hitl=True)
             return ResolveResult(
                 status="resolved", namespace=namespace, raw_value=raw, norm_value=norm,
                 intent=intent, confidence=1.0, method="exact",
@@ -247,6 +254,8 @@ class OntologyResolver:
             if base_hit is None:
                 continue
             obj = self._store.get_object(base_hit["target_object_id"]) or {}
+            if obj.get("status") != "active":   # P0-03：退役/合并目标不作候选
+                continue
             out.append(Candidate(
                 target_object_id=base_hit["target_object_id"], method="rule",
                 confidence=_RULE_SUFFIX_CONF,
