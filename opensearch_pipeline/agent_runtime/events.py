@@ -80,11 +80,16 @@ class RunSuspended(AgentEvent):
 
 
 class RunCompleted(AgentEvent):
-    """run 正常结束，携带最终答案与用量。"""
+    """run 正常结束，携带最终答案与用量。
+
+    streamed=True：最终轮的文本已经以 ModelDelta 增量下发过（真流式）——SSE 层据此
+    **不再重发** final_text 整段（否则前端看到答案两遍）；final_text 仍然完整携带，
+    供 on_complete 落库/会话记忆（durable 侧永远要全文）。"""
 
     type: Literal["run_completed"] = "run_completed"
     final_text: str
     usage: Usage = Field(default_factory=Usage)
+    streamed: bool = False
 
 
 class RunFailed(AgentEvent):

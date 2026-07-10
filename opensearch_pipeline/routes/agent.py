@@ -9,9 +9,9 @@ routes/agent.py — 企业 Agent 入口（console-first；plan WS1-3）
 api 文件底部）。**agent_runtime 一律惰性 import**（flag-off 时永不加载 → 零启动成本、零回归面）。
 
 ⚠️ 本入口是 agent 代码首次接入 live 服务：加法（独立路由）+ flag-off。B9（agent↔qa_session_log
-合流，console 历史）与真流式（ModelDelta，需 gateway chat_stream）留后续；首批 RunCompleted.final_text
-以单 chunk 帧下发。ModelGateway/RDSRunStore/HA3 检索均为真实依赖——真正跑通需 schema/022 apply +
-配置 DashScope，且 flag=on（均 user-gated）。
+合流）已落地；**真流式已接**（gateway.complete_stream → loop ModelDelta → SSE chunk 打字机，
+RAG_AGENT_STREAM 默认开、=false 回退整段单 chunk）。ModelGateway/RDSRunStore/HA3 检索均为
+真实依赖——真正跑通需 schema/022+ apply + 配置 DashScope，且 flag=on（均 user-gated）。
 """
 import json
 import logging
@@ -175,7 +175,9 @@ def _stream_events(handle, session_id: str, message_id: str):
                 yield _sse({"type": "approval", "approval_request_id": ev.approval_request_id,
                             "checkpoint_id": ev.checkpoint_id, "pending_call": ev.pending_call})
             elif isinstance(ev, RunCompleted):
-                if ev.final_text:
+                # streamed=True：全文已按 ModelDelta 增量下发过（真流式），不重发整段——
+                # 否则前端看到答案两遍；final_text 仍完整进 on_complete（durable/记忆侧要全文）。
+                if ev.final_text and not getattr(ev, "streamed", False):
                     yield _sse({"type": "chunk", "content": ev.final_text})
                 yield _sse({"type": "done", "usage": ev.usage.model_dump()})
             elif isinstance(ev, RunFailed):

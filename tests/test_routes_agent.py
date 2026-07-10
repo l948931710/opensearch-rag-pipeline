@@ -137,6 +137,55 @@ def test_shadow_link_sse(monkeypatch, wired):
         api.app.dependency_overrides.clear()
 
 
+class _StreamFakeProvider:
+    """带 chat_stream 的假 provider：工具轮零增量返回 tool_call；最终轮流式吐字。"""
+
+    name = "dashscope"
+
+    def capabilities(self, m):
+        return None
+
+    def chat(self, model, req):
+        raise AssertionError("流式模式下不应回落到同步 chat")
+
+    def chat_stream(self, model, req):
+        from opensearch_pipeline.agent_runtime.model_gateway import StreamDelta
+        if any(m.get("role") == "tool" for m in req.messages):
+            yield StreamDelta(text="根据")
+            yield StreamDelta(text="检索")
+            return ChatResponse(text="根据检索", tool_calls=[],
+                                usage=Usage(tokens_prompt=6, tokens_completion=4), model=model)
+        return ChatResponse(text="", tool_calls=[ToolCall(id="c1", name="knowledge_search",
+                                                          arguments={"query": "x"})],
+                            usage=Usage(), model=model)
+
+
+def test_streaming_sse_typewriter_no_duplicate_final(monkeypatch):
+    """真流式端到端：模型增量 → ModelDelta → SSE 多个 chunk 帧（打字机）；
+    RunCompleted.streamed=True → 全文**不重发**（否则前端看到答案两遍）；done 帧带 usage。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    registry = build_default_registry()
+    store = _FakeStore()
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _StreamFakeProvider()},
+                           routes={"light": [("dashscope", "m")]})
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime", lambda: (registry, gateway, executor, store))
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: [
+        {"doc_id": "D1", "chunk_text": "GB/T 全文…", "doc_title": "规范"}])
+    try:
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "包装规范?"})
+        assert r.status_code == 200
+        body = r.text
+        assert '"content": "根据"' in body and '"content": "检索"' in body   # 打字机增量
+        assert '"content": "根据检索"' not in body, "streamed=True 时全文不得重发"
+        assert '"type": "tool_call"' in body and '"type": "done"' in body
+        assert body.count('"type": "chunk"') == 2
+    finally:
+        executor.shutdown()
+        api.app.dependency_overrides.clear()
+
+
 def test_failed_run_logs_agent_error(monkeypatch):
     """run 失败 → qa_session_log 落 AGENT_ERROR 行（深度审查治理组：此前失败对运维零可见），
     且失败不进会话记忆。"""

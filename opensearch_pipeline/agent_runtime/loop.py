@@ -110,10 +110,41 @@ class AgentLoop(Protocol):
 
 
 class DefaultAgentLoop:
-    """自研事件流可挂起循环。model_fn 注入（ModelGateway 接缝）。"""
+    """自研事件流可挂起循环。model_fn 注入（ModelGateway 接缝）。
+
+    model_fn 双形态（真流式向后兼容）：
+    - **同步**：直接返回 ModelTurn（既有测试/RAG_AGENT_STREAM=false 回退）；
+    - **生成器**：yield 文本增量（带 .text/.reasoning 的对象）→ 本 loop 逐个转
+      ModelDelta 事件下发（SSE 打字机），StopIteration.value 返回 ModelTurn。
+    """
 
     def __init__(self, model_fn: ModelFn):
         self._model = model_fn
+
+    def _drive_model(self, msgs: List[Msg], tools: List[ToolSpec]
+                     ) -> Generator[AgentEvent, Optional[ToolResult], Tuple[ModelTurn, bool]]:
+        """调一次模型。流式 model_fn → 边收边 yield ModelDelta；返回 (ModelTurn, 是否已流式下发文本)。
+        streamed 只在真的 yield 过**非空文本**增量时为 True——零增量的流（provider 不支持流式
+        退化同步）必须让 RunCompleted 照旧携带全文下发，否则用户看到空答案。"""
+        out = self._model(msgs, tools)
+        if not hasattr(out, "__next__"):
+            return out, False                       # 同步 model_fn（既有契约）
+        from opensearch_pipeline.agent_runtime.events import ModelDelta
+        streamed_text = False
+        while True:
+            try:
+                d = next(out)
+            except StopIteration as fin:
+                mt = fin.value
+                if mt is None:
+                    raise ValueError("流式 model_fn 生成器未返回 ModelTurn")
+                return mt, streamed_text
+            txt = getattr(d, "text", "") or ""
+            rsn = getattr(d, "reasoning", "") or ""
+            if txt:
+                streamed_text = True
+            if txt or rsn:
+                yield ModelDelta(text=txt, reasoning=(rsn or None))
 
     def run(self, ctx: ExecutionContext, messages: List[Msg],
             tools: List[ToolSpec], start_turn: int = 0
@@ -124,9 +155,10 @@ class DefaultAgentLoop:
         msgs: List[Msg] = list(messages)
         max_turns = ctx.budget.max_turns
         for _turn in range(start_turn, max_turns):
-            mt = self._model(msgs, tools)
+            mt, streamed = yield from self._drive_model(msgs, tools)
             if not mt.tool_calls:
-                yield RunCompleted(final_text=mt.text, usage=mt.usage)
+                # streamed=True：全文已按增量下发，SSE 层据此不重发（events.RunCompleted 注）
+                yield RunCompleted(final_text=mt.text, usage=mt.usage, streamed=streamed)
                 return
             msgs.append({"role": "assistant",
                          "tool_calls": [{"call_id": c.call_id, "name": c.tool_name,

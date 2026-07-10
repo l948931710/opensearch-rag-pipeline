@@ -335,3 +335,160 @@ def test_call_logger_failure_is_fail_open():
     p = _FakeProvider("dashscope", responses=[_resp("A")])
     gw = ModelGateway({"dashscope": p}, routes={"default": [("dashscope", "m")]}, call_logger=boom)
     assert gw.complete(_ctx(), "default", ChatRequest(messages=[])).text == "A"   # 记账炸不影响调用
+
+
+# ── 真流式（chat_stream / complete_stream / make_model_fn 流式模式）──────────
+def _drain(gen):
+    """驱动流式生成器：返回 (deltas, 最终 ChatResponse/ModelTurn)。"""
+    deltas = []
+    while True:
+        try:
+            deltas.append(next(gen))
+        except StopIteration as fin:
+            return deltas, fin.value
+
+
+class _SSEResp:
+    status_code = 200
+    text = ""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self.closed = False
+
+    def iter_lines(self, decode_unicode=True):
+        return iter(self._lines)
+
+    def close(self):
+        self.closed = True
+
+
+def test_dashscope_chat_stream_parses_sse(monkeypatch):
+    """SSE 增量：content/reasoning 逐帧 yield；tool_call 分片按 index 重组；usage 终帧入账。"""
+    lines = [
+        'data: {"model":"qwen3.7-plus","choices":[{"delta":{"content":"你"}}]}',
+        '',                                                        # keep-alive 空行
+        'data: {"choices":[{"delta":{"reasoning_content":"思考中"}}]}',
+        'data: {"choices":[{"delta":{"content":"好"}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+        '"function":{"name":"knowledge_search","arguments":"{\\"que"}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        '"function":{"arguments":"ry\\": \\"x\\"}"}}]},"finish_reason":"tool_calls"}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}',
+        'data: [DONE]',
+    ]
+    resp = _SSEResp(lines)
+    monkeypatch.setattr(_GW_MOD, lambda url, **kw: resp)
+    p = DashScopeProvider(api_key="k", base_url="http://x")
+    deltas, final = _drain(p.chat_stream("qwen3.7-plus", ChatRequest(messages=[])))
+    assert [d.text for d in deltas] == ["你", "", "好"]
+    assert deltas[1].reasoning == "思考中"
+    assert final.text == "你好" and final.reasoning == "思考中"
+    assert final.finish_reason == "tool_calls"
+    assert len(final.tool_calls) == 1
+    assert final.tool_calls[0].id == "c1"
+    assert final.tool_calls[0].arguments == {"query": "x"}        # 分片重组后整体 json.loads
+    assert final.usage.tokens_prompt == 11 and final.usage.tokens_completion == 7
+    assert resp.closed
+
+
+def test_dashscope_chat_stream_http_429_retryable(monkeypatch):
+    class _R:
+        status_code = 429
+        text = "throttled"
+
+        def close(self):
+            pass
+    monkeypatch.setattr(_GW_MOD, lambda url, **kw: _R())
+    p = DashScopeProvider(api_key="k", base_url="http://x")
+    with pytest.raises(ModelError) as ei:
+        _drain(p.chat_stream("m", ChatRequest(messages=[])))
+    assert ei.value.retryable
+
+
+class _StreamProvider:
+    """脚本化流式 provider：可在首字节前抛（可 fallback）或流中抛（不可重启）。"""
+
+    def __init__(self, name, deltas=None, final=None, fail_at_start=False, fail_after=None):
+        self.name = name
+        self._deltas = list(deltas or [])
+        self._final = final or _resp(text="".join(getattr(d, "text", "") for d in (deltas or [])))
+        self._fail_at_start = fail_at_start
+        self._fail_after = fail_after
+        self.stream_calls = 0
+
+    def capabilities(self, model):
+        return ModelCapabilities(True, True, False, 8192, True)
+
+    def chat(self, model, req):
+        return self._final
+
+    def chat_stream(self, model, req):
+        self.stream_calls += 1
+        if self._fail_at_start:
+            raise ModelError("prime fail", retryable=True)
+        for i, d in enumerate(self._deltas):
+            if self._fail_after is not None and i == self._fail_after:
+                raise ModelError("stream broken", retryable=True)
+            yield d
+        return self._final
+
+
+def test_complete_stream_fallback_before_first_delta():
+    from opensearch_pipeline.agent_runtime.model_gateway import StreamDelta
+    p1 = _StreamProvider("p1", fail_at_start=True)
+    p2 = _StreamProvider("p2", deltas=[StreamDelta(text="好")], final=_resp(text="好"))
+    gw = ModelGateway({"p1": p1, "p2": p2},
+                      routes={"default": [("p1", "m1"), ("p2", "m2")]}, max_retries=0)
+    deltas, final = _drain(gw.complete_stream(_ctx(), "default", ChatRequest(messages=[])))
+    assert [d.text for d in deltas] == ["好"] and final.text == "好"
+    assert p1.stream_calls == 1 and p2.stream_calls == 1
+
+
+def test_complete_stream_mid_stream_failure_no_restart():
+    """已下发增量后的流中断：直接抛，绝不 fallback 重启（前端会看到答案重播）。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import StreamDelta
+    p1 = _StreamProvider("p1", deltas=[StreamDelta(text="半"), StreamDelta(text="截")],
+                         fail_after=1)
+    p2 = _StreamProvider("p2", deltas=[StreamDelta(text="备")])
+    gw = ModelGateway({"p1": p1, "p2": p2},
+                      routes={"default": [("p1", "m1"), ("p2", "m2")]}, max_retries=2,
+                      sleep_fn=lambda s: None)
+    gen = gw.complete_stream(_ctx(), "default", ChatRequest(messages=[]))
+    assert next(gen).text == "半"                              # 首增量已下发
+    with pytest.raises(ModelError):
+        _drain(gen)
+    assert p2.stream_calls == 0, "已下发增量后绝不能换 provider 重启流"
+
+
+def test_complete_stream_sync_degradation_for_non_stream_provider():
+    """provider 无 chat_stream → 退化同步：零增量、返回全文（假 provider/测试桩零改动）。"""
+    calls = []
+    p = _FakeProvider("dashscope", responses=[ChatResponse(
+        text="整段", tool_calls=[], usage=Usage(tokens_prompt=4, tokens_completion=6), model="m")])
+    gw = ModelGateway({"dashscope": p}, routes={"default": [("dashscope", "m")]},
+                      call_logger=lambda **kw: calls.append(kw))
+    deltas, final = _drain(gw.complete_stream(_ctx(), "default", ChatRequest(messages=[])))
+    assert deltas == [] and final.text == "整段"
+    assert calls and calls[0]["status"] == "ok" and calls[0]["tokens_prompt"] == 4  # 记账不丢
+
+
+def test_make_model_fn_stream_mode_returns_generator_of_deltas():
+    """默认流式（RAG_AGENT_STREAM 未设=开）：model_fn 返回生成器，yield 增量、return ModelTurn。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import StreamDelta
+    p = _StreamProvider("p", deltas=[StreamDelta(text="你"), StreamDelta(text="好")],
+                        final=_resp(text="你好"))
+    gw = ModelGateway({"p": p}, routes={"light": [("p", "m")]})
+    out = make_model_fn(gw, _ctx(), "light")([{"role": "user", "content": "q"}], [])
+    assert hasattr(out, "__next__")
+    deltas, turn = _drain(out)
+    assert [d.text for d in deltas] == ["你", "好"]
+    assert turn.text == "你好" and not turn.tool_calls
+
+
+def test_make_model_fn_stream_false_stays_sync(monkeypatch):
+    monkeypatch.setenv("RAG_AGENT_STREAM", "false")
+    p = _FakeProvider("p", responses=[_resp(text="同步答案")])
+    gw = ModelGateway({"p": p}, routes={"light": [("p", "m")]})
+    mt = make_model_fn(gw, _ctx(), "light")([{"role": "user", "content": "q"}], [])
+    assert not hasattr(mt, "__next__") and mt.text == "同步答案"
