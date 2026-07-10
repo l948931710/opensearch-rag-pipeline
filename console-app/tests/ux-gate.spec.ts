@@ -249,3 +249,101 @@ test.describe('UX 硬门 — AI 助手交互', () => {
     ]);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent 审批 tab（WS3 审批闭环前端；深度审查 A 组 P1 的 console 收口）
+// 进入方式与「AI 助手」组一致：?token= 透传登录 + mock /api/kb/whoami（不用 ?preview，
+// 否则 authed 请求被合成 503、page.route 截不到）。ManageView 挂载会并发拉一串管理接口，
+// 先注册 catch-all 空响应、再注册专属 mock（Playwright 后注册者优先）。
+// ─────────────────────────────────────────────────────────────────────────────
+test.describe('UX 硬门 — Agent 审批队列', () => {
+  const MANAGE_ROUTE = '/console/manage?token=e2e-fake-token';
+
+  const AREQ = (over: Record<string, unknown> = {}) => ({
+    request_id: 'ap1', run_id: 'r1', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0',
+    proposed_args: { qty: 120, item: 'PP 刀叉 8寸' }, args_digest: 'd',
+    render_summary: 'u8_writeback(item, qty)', requested_by: 'user_wang', requested_dept: 'production',
+    approver_scope: 'production', status: 'pending', expires_at: '2026-07-12 20:00:00',
+    created_at: '2026-07-09 20:00:00', decided_at: null, ...over,
+  });
+
+  function mockManage(page: import('@playwright/test').Page, approvalsBody: object | number) {
+    // catch-all：ManageView 的其余 loaders 全部回空（避免 4xx 触发 console guard）
+    return Promise.all([
+      page.route('**/api/**', (r) => r.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ items: [], questions: [], docs: [], total: 0 }),
+      })),
+      page.route('**/api/kb/whoami', (r) => r.fulfill({
+        contentType: 'application/json', body: JSON.stringify({
+          user_id: 'admin1', display_name: '生产部管理员', role: 'dept_admin',
+          can_manage_kb: true, acl_groups: ['production'], managed_owner_depts: ['production'],
+        }),
+      })),
+      page.route('**/api/agent/approvals*', (r) => (
+        typeof approvalsBody === 'number'
+          ? r.fulfill({ status: approvalsBody, contentType: 'application/json', body: JSON.stringify({ detail: 'Not Found' }) })
+          : r.fulfill({ contentType: 'application/json', body: JSON.stringify(approvalsBody) })
+      )),
+    ]);
+  }
+
+  test('tab 出现 + 角标计数 + 队列行与三处置可见，无横向滚动', async ({ page }) => {
+    const guard = attachConsoleGuard(page);
+    await mockManage(page, { items: [AREQ(), AREQ({ request_id: 'ap2', run_id: 'r2', proposed_args: { qty: 40 } })] });
+    await page.goto(MANAGE_ROUTE);
+    const tab = page.getByRole('tab', { name: /Agent 审批/ });
+    await expect(tab, 'RAG_AGENT_ENABLE 开启（端点 200）时 tab 必须出现').toBeVisible();
+    await expect(tab).toContainText('2');                       // 待审批角标
+    await tab.click();
+    await expect(page.getByText('Agent 高风险操作审批')).toBeVisible();
+    const row = page.getByText('u8_writeback').first();
+    await expect(row).toBeVisible();
+    await expect(page.getByText('qty=120')).toBeVisible();      // 脱敏后参数可核对
+    await assertKeyActionsVisible([
+      page.getByRole('button', { name: '批准' }).first(),
+      page.getByRole('button', { name: '驳回' }).first(),
+      page.getByRole('button', { name: '终止' }).first(),
+    ]);
+    await assertNoHorizontalScroll(page);
+    guard.assertClean();
+  });
+
+  test('职责分离：自己发起的申请 → 批准/驳回禁用、动作变「撤回」', async ({ page }) => {
+    await mockManage(page, { items: [AREQ({ requested_by: 'admin1' })] });   // == whoami user_id
+    await page.goto(MANAGE_ROUTE);
+    await page.getByRole('tab', { name: /Agent 审批/ }).click();
+    await expect(page.getByText('我发起的')).toBeVisible();
+    await expect(page.getByRole('button', { name: '批准' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '驳回' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '撤回' })).toBeEnabled();
+  });
+
+  test('批准有二次确认，确认后 POST /api/agent/approve 且行移除', async ({ page }) => {
+    await mockManage(page, { items: [AREQ()] });
+    const posts: string[] = [];
+    await page.route('**/api/agent/approve', (r) => {
+      posts.push(r.request().postData() || '');
+      return r.fulfill({ contentType: 'text/event-stream', body: 'data: [DONE]\n\n' });
+    });
+    await page.goto(MANAGE_ROUTE);
+    await page.getByRole('tab', { name: /Agent 审批/ }).click();
+    await page.getByRole('button', { name: '批准' }).click();
+    const dlg = page.locator('[role="alertdialog"], [role="dialog"]');
+    await expect(dlg, '批准是不可撤回的执行放行，必须有二次确认').toBeVisible();
+    await dlg.getByRole('button', { name: /批准执行/ }).click();
+    await expect(page.getByText('当前没有待审批的 Agent 操作')).toBeVisible();   // 行移除 → 空态
+    expect(posts.length).toBe(1);
+    const body = JSON.parse(posts[0]);
+    expect(body.run_id).toBe('r1');
+    expect(body.outcome.kind).toBe('approved');
+    expect(body.idempotency_key).toBe('ap1:approved');
+  });
+
+  test('RAG_AGENT_ENABLE 未开（端点 404）→ tab 整个不出现，不留死入口', async ({ page }) => {
+    await mockManage(page, 404);
+    await page.goto(MANAGE_ROUTE);
+    await expect(page.getByRole('tab', { name: /概览看板/ })).toBeVisible();   // 页面已就绪
+    await expect(page.getByRole('tab', { name: /Agent 审批/ })).toHaveCount(0);
+  });
+});

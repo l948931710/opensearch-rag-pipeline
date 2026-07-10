@@ -2,10 +2,11 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History, Lightbulb } from 'lucide-vue-next'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History, Lightbulb, Bot } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
+import { useAgentApprovals } from '@/composables/useAgentApprovals'
 import { useAsk } from '@/composables/useAsk'
 import { deptLabel } from '@/lib/kb'
 import UploadCard from '@/components/manage/UploadCard.vue'
@@ -21,12 +22,14 @@ import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
 import ApprovalHistory from '@/components/manage/ApprovalHistory.vue'
+import AgentApprovalQueue from '@/components/manage/AgentApprovalQueue.vue'
 
 // 知识库入口：管理员 → 分 tab 管理台（概览看板 / 文档管理，设计稿 SUB-TAB SWITCHER）；
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
 const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadEscalations, loadReviewTasks, applyPendingVersion } = useKb()
+const { agentApprovalsSupported, agentApprovalCount, loadAgentApprovals } = useAgentApprovals()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
@@ -48,9 +51,9 @@ function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({
 // 异常 chip：滚动 + 顺带设「异常」聚合筛选（原先只滚动，还得自己再挑一个坏徽章点）
 function onTodoChip(c: TodoChip) { if (c.key === 'anom') setBadgeFilter('异常'); scrollToSec(c.anchor) }
 
-// ── 管理台子 tab（成员管理仅 kb_admin 可见）──
-type Tab = 'dash' | 'docs' | 'history' | 'members'
-const VALID_TABS = ['dash', 'docs', 'history', 'members'] as const
+// ── 管理台子 tab（成员管理仅 kb_admin 可见；Agent 审批在端点探测到后出现）──
+type Tab = 'dash' | 'docs' | 'history' | 'agent' | 'members'
+const VALID_TABS = ['dash', 'docs', 'history', 'agent', 'members'] as const
 const activeTab = ref<Tab>('dash')
 // tab ←→ URL（P2：刷新/深链不再落回默认 tab）。身份在 AppShell ready 后已解析，可安全校验 members。
 // route?. 可选链 = 单测无 router 环境的既有约定（同 Sidebar）。
@@ -67,6 +70,8 @@ const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
   { key: 'dash', label: '概览看板', icon: LayoutDashboard },
   { key: 'docs', label: '文档管理', icon: FolderOpen },
   { key: 'history', label: '审批历史', icon: History },
+  // Agent 审批：RAG_AGENT_ENABLE 未开（端点 404）或无审批权（403）→ 整个 tab 不出现
+  ...(agentApprovalsSupported.value === true ? [{ key: 'agent' as Tab, label: 'Agent 审批', icon: Bot }] : []),
   ...(isKbAdmin.value ? [{ key: 'members' as Tab, label: '成员管理', icon: UserCog }] : []),
 ])
 // 「文档管理」tab 角标 = 待你审核数（reviewCount，与侧栏入口红点同一来源）。
@@ -92,6 +97,7 @@ onMounted(async () => {
     void loadAccessRequests()                        // 同上（staleness 门在 useKb 内）
     void loadAccessGrants()
     void loadApprovalHistory()                       // 审批历史（两角色，只读聚合）
+    void loadAgentApprovals()                        // Agent 审批队列（404/403 → tab 自隐）
     if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants(); void loadReviewTasks() }   // 全库治理 + 成员管理 + 复审任务（kb_admin）
     await docsReady
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
@@ -191,6 +197,10 @@ onMounted(async () => {
           v-if="t.key === 'docs' && reviewCount"
           class="grid h-[17px] min-w-[17px] place-items-center rounded-full bg-st-busy px-1.5 text-[10px] font-bold tabular-nums text-white"
         >{{ reviewCount }}</span>
+        <span
+          v-if="t.key === 'agent' && agentApprovalCount"
+          class="grid h-[17px] min-w-[17px] place-items-center rounded-full bg-st-busy px-1.5 text-[10px] font-bold tabular-nums text-white"
+        >{{ agentApprovalCount }}</span>
       </button>
     </div>
 
@@ -248,6 +258,9 @@ onMounted(async () => {
 
     <!-- 审批历史（两角色）：四条审批流的历史决策合并时间线（只读） -->
     <ApprovalHistory v-else-if="activeTab === 'history'" />
+
+    <!-- Agent 审批（两角色）：Agent 高风险操作（HIGH_WRITE）的挂起审批队列（WS3 审批闭环） -->
+    <AgentApprovalQueue v-else-if="activeTab === 'agent'" />
 
     <!-- 成员管理（仅 kb_admin）：维护部门管理员 + 其可管理 owner_dept（写授权） -->
     <MemberRoleManager v-else-if="activeTab === 'members' && isKbAdmin" />
