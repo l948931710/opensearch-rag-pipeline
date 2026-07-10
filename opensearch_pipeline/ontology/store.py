@@ -192,6 +192,17 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
+    def get_identifier(self, identifier_id: str) -> Optional[Dict[str, Any]]:
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {db}.ontology_identifier "
+                            "WHERE identifier_id=%s", (identifier_id,))
+                rows = self._rows_to_dicts(cur)
+            return rows[0] if rows else None
+        finally:
+            conn.close()
+
     def insert_identifier(self, namespace: str, raw_value: str, norm_value: str,
                           target_object_id: str, *, method: str, relation: str = "alias",
                           target_revision: Optional[str] = None, confidence: float = 1.0,
@@ -667,6 +678,11 @@ class MemoryOntologyStore:
                 "source_case_id": source_case_id, "confirmed_by": confirmed_by,
                 "approval_request_id": approval_request_id, "first_seen_at": self._tick()}
             return identifier_id
+
+    def get_identifier(self, identifier_id):
+        with self._lock:
+            row = self._identifiers.get(identifier_id)
+            return dict(row) if row else None
 
     def deactivate_identifier(self, identifier_id, *, status="rejected"):
         if status not in _IDENTIFIER_END_STATES:
