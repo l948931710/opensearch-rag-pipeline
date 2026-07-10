@@ -8,6 +8,7 @@
   「无记录」与「无权限」不可区分（防存在性泄露）· 未消解回落原值标「未确认」·
   verified 优先，draft 标「估算/未验证」。
 """
+import os
 import uuid
 
 import pytest
@@ -50,6 +51,14 @@ def _rds_ready() -> bool:
 
 
 _RDS_OK = _rds_ready()
+
+# PR-D（P0-08）：CI db-integration 设 RAG_ONTOLOGY_TESTS_REQUIRE_RDS=1——真库契约族
+# 绝不许静默 skip（探测断线=收集期硬红，"skipped==0" 机器强制）。
+if not _RDS_OK and os.environ.get("RAG_ONTOLOGY_TESTS_REQUIRE_RDS", "").strip() == "1":
+    raise RuntimeError(
+        "RAG_ONTOLOGY_TESTS_REQUIRE_RDS=1 但本地 MySQL/ontology 表不可用——"
+        "真库契约族不许静默 skip（P0-08）；检查 ci_load_schema 与连接配置")
+
 # 独立打标前缀：xdist loadgroup 按文件分 worker，本文件与 test_ontology_store 会并行
 # 跑同一本地库——各扫各的标（__pys_ vs __pyt_），跨 worker 不互删在飞数据。
 _MARK = "__pys_"

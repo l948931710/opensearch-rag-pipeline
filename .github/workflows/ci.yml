@@ -140,6 +140,15 @@ jobs:
           python -m pytest tests/test_pipeline.py tests/test_classification.py
           tests/test_concurrency.py tests/test_image_funnel.py
           -q --tb=short -p no:cacheprovider
+      - name: Ontology real-DB contract tests (zero-skip enforced)
+        # PR-D（P0-08）：ontology 真库契约族入 CI，且 REQUIRE_RDS=1 把 self-skip 变硬失败——
+        # 探测断线时本步直接红，"真库契约族 skipped==0" 机器强制，不解析 pytest 输出。
+        env:
+          RAG_ONTOLOGY_TESTS_REQUIRE_RDS: "1"
+        run: >-
+          python -m pytest tests/test_ontology_store.py tests/test_ontology_sem.py
+          tests/test_ontology_db_isolation.py tests/test_routes_ontology.py
+          -q --tb=short -p no:cacheprovider
 
   # 供应链/密钥门（P2-03）：secret 扫描 + 依赖 CVE 审计。此前 CI 完全无安全门。
   security:

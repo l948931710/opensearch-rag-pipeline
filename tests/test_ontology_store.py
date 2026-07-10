@@ -6,6 +6,7 @@ host-pin 本地 MySQL（照 test_agent_runtime_e2e_local_db.py 模板），无 0
 RDS-only 并发三例验证 uk/发号/case 聚合在真锁下的行为。
 """
 import threading
+import os
 import uuid
 
 import pytest
@@ -45,6 +46,14 @@ def _rds_ready() -> bool:
 
 
 _RDS_OK = _rds_ready()
+
+# PR-D（P0-08）：CI db-integration 设 RAG_ONTOLOGY_TESTS_REQUIRE_RDS=1——真库契约族
+# 绝不许静默 skip（探测断线=收集期硬红，"skipped==0" 机器强制）。
+if not _RDS_OK and os.environ.get("RAG_ONTOLOGY_TESTS_REQUIRE_RDS", "").strip() == "1":
+    raise RuntimeError(
+        "RAG_ONTOLOGY_TESTS_REQUIRE_RDS=1 但本地 MySQL/ontology 表不可用——"
+        "真库契约族不许静默 skip（P0-08）；检查 ci_load_schema 与连接配置")
+
 _MARK = "__pyt_"           # RDS 测试数据统一打标，teardown 按标清扫
 
 

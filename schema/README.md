@@ -12,7 +12,7 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 031（031=本体事件已被 P2 计划预订，
+3. **编号严格单调递增**，下一个可用号 = 033（031=本体事件已被 P2 计划预订、032=台账 checksum，
    见 docs/ontology_p0_plan_2026-07-10.md）。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
    ⚠️ **本体层文档编号勘误**：《本体层设计 v1.1》《P0-P1 落地细化》所写迁移号 024–028 成文时
@@ -44,6 +44,7 @@ apply 脚本落库并记台账。
 | 009_acl_projection_outbox.sql | fuling_knowledge | ACL 投影 outbox（同事务 enqueue + UNIQUE(doc_id) 复活） |
 | 010_kb_contribution.sql | fuling_operation | 员工知识贡献（010a 修订：补 normalized_gap_query） |
 | 011_schema_migrations.sql | 三库（knowledge/operation/ontology 各一份） | DDL 变更台账（本机制自身） |
+| 032_schema_migrations_checksum.sql | 三库（同 011 分布） | 台账加 checksum 列（PR-D P0-09：同名不同 SHA-256 即中止，防同版本内容漂移；information_schema 守卫幂等） |
 | 012_qa_session_log_perf_index.sql | fuling_operation | (answer_status, created_at) 复合索引（性能第一梯队 #1） |
 | 013_qa_retrieved_doc_fact.sql | fuling_operation | 检索/引用文档物化事实表 + 存量回填（perf#3；读侧 RAG_QA_FACT_JOIN 门控） |
 | 014_document_version_raw_key_hash_index.sql | fuling_knowledge | raw_key_hash 回填 + idx_raw_key_hash（perf#5 注册幂等点查） |

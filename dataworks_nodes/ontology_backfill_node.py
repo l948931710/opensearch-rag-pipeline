@@ -23,9 +23,10 @@ RAG_ONTOLOGY_BACKFILL_ENABLE 第二道闸、单条失败不拖垮批、断点续
   （真实回填=真实播种禁令的延伸，见 docs/ontology_p0_plan_2026-07-10.md Phase 0）。
 退出码：0=ok；2=第二道闸拒绝 / 批内有单条错误（DataWorks 标失败引人来看）；3=作业失败。
 
-凭据：本文件【不含明文密钥】。控制台粘贴时从【清理stage3】节点顶部原样复制
-RAG_* 赋值贴到「凭据」标记处（仅需 RDS 三件套 + DASHSCOPE key 过 config 守卫；
-不碰 OSS/HA3——播种/回填核心只走 rule 候选，不调 embedding）。
+凭据（PR-D P0-09）：本文件【不含明文密钥，也**不得**粘贴明文密钥】——凭据一律经
+DataWorks 平台注入（调度参数/工作空间环境变量/KMS），节点源码只读 os.environ。
+仅需 RDS 三件套 + DASHSCOPE key（过 config 守卫；不碰 OSS/HA3——回填核心只走
+rule 候选，不调 embedding）。缺失即 raise（下方 _required 守卫）。
 """
 import os
 import sys
@@ -35,7 +36,9 @@ import zipfile
 # ═══════════════════════════════════════════════════════════════
 # 0. 安装依赖（PyODPS 3.7 pod 无 pymysql/dbutils；纯 RDS 作业，不装 oss2/ha3）
 # ═══════════════════════════════════════════════════════════════
-DEPS = ["PyMySQL", "DBUtils", "requests"]
+# PR-D（P0-09）：依赖锁版本——公网未锁版本安装 = 供应链面（构建不可复现 +
+# 上游投毒直进生产 pod）。版本对齐 pyproject 生产档；升级须改这里并重跑 staging。
+DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.32.3"]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", *DEPS, "-t", "/tmp/pydeps", "-q"
 ])
@@ -67,19 +70,15 @@ LIMIT = None
 # 输入：DataWorks File 资源名（DataStudio 上传观测 CSV 后填这里）
 CSV_RESOURCE = "ontology_backfill_snapshot.csv"
 
-# ── 凭据：粘贴【清理stage3】顶部的 RAG_* 赋值（取消注释并填真值）────────────────
-# os.environ["DASHSCOPE_API_KEY"] = "..."   # 本节点不调 LLM，但 production 安全守卫要求配 DashScope key（防 Gemini 误用）
-# os.environ["RAG_RDS_HOST"]      = "..."
-# os.environ["RAG_RDS_PORT"]      = "..."
-# os.environ["RAG_RDS_USER"]      = "..."
-# os.environ["RAG_RDS_PASSWORD"]  = "..."
-# os.environ["RAG_RDS_DATABASE"]  = "..."
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── 凭据（PR-D P0-09）：**禁止**在源码里赋值明文密钥——一律经 DataWorks 平台注入
+# （节点「调度参数」/ 工作空间环境变量），本节点只读 os.environ 并守卫缺失。
+# 需要：DASHSCOPE_API_KEY（production 安全守卫，防 Gemini 误用；本节点不调 LLM）、
+# RAG_RDS_HOST / RAG_RDS_PORT / RAG_RDS_USER / RAG_RDS_PASSWORD / RAG_RDS_DATABASE /
+# RAG_RDS_OPERATION_DATABASE / RAG_RDS_ONTOLOGY_DATABASE。
 _required = ["DASHSCOPE_API_KEY", "RAG_RDS_HOST", "RAG_RDS_PASSWORD"]
 _missing = [v for v in _required if not os.environ.get(v)]
 if _missing:
-    raise RuntimeError("缺少生产环境变量（从【清理stage3】顶部复制 RAG_* 赋值）: %s" % _missing)
+    raise RuntimeError("缺少生产环境变量（经 DataWorks 平台注入，禁止粘源码）: %s" % _missing)
 
 # ═══════════════════════════════════════════════════════════════
 # 2. 下载资源：代码包 zip + 观测 CSV（odps 为 PyODPS 隐式入口对象）
@@ -89,8 +88,19 @@ resource = odps.get_resource('opensearch_pipeline_production.zip')  # noqa: F821
 with resource.open(mode='rb') as reader:
     with open('opensearch_pipeline_production.zip', 'wb') as writer:
         writer.write(reader.read())
+def _safe_extractall(zf, dest):
+    """PR-D（P0-09）Zip-Slip 防护：拒绝绝对路径/../ 越界成员——资源包被替换时
+    不能借解压写任意路径。"""
+    dest_root = os.path.abspath(dest)
+    for name in zf.namelist():
+        target = os.path.abspath(os.path.join(dest_root, name))
+        if not (target == dest_root or target.startswith(dest_root + os.sep)):
+            raise RuntimeError("zip 成员越界（Zip-Slip）: %r" % name)
+    zf.extractall(dest_root)
+
+
 with zipfile.ZipFile('opensearch_pipeline_production.zip', 'r') as zf:
-    zf.extractall('.')
+    _safe_extractall(zf, '.')
 _cur = os.path.abspath('.')
 if _cur not in sys.path:
     sys.path.insert(0, _cur)
