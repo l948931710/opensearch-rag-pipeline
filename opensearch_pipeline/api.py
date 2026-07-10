@@ -538,11 +538,28 @@ def readiness_check():
 
     checks["dashscope"] = "configured" if getattr(cfg.embedding, "api_key", None) else "unconfigured"
 
+    # WS0 状态外置：任一状态后端切了 redis → Redis PING 纳入就绪判定（此前 redis_client.ping
+    # 是死代码，深度审查多实例运维组）。判据：限流 redis 后端是 fail-closed（Redis 挂 → ask
+    # 全拒），会话/去重/token 虽 fail-open 也已降级——该实例都不该继续接流量。
+    # 全 memory 后端 → skipped（单实例语义，Redis 与就绪无关）。
+    _redis_backends = ("RAG_SESSION_BACKEND", "RAG_RATE_LIMIT_BACKEND",
+                       "RAG_MSG_DEDUP_BACKEND", "RAG_TOKEN_CACHE_BACKEND")
+    if any(os.environ.get(k, "memory").strip().lower() == "redis" for k in _redis_backends):
+        try:
+            from opensearch_pipeline import redis_client
+            checks["redis"] = "ok" if redis_client.ping() else "error"
+        except Exception as e:  # noqa: BLE001 — 探针必须报告而非抛出
+            logger.warning("readiness: Redis 探针失败 [trace=%s]: %s", trace_id, e)
+            checks["redis"] = "error"
+    else:
+        checks["redis"] = "skipped"
+
     # P2-8：启动时检出的摄取↔服务 embedding 契约失配 → 关键降级（此实例算出的相似度
     # 不可信，必须被负载均衡摘出）。失配详情已在启动日志 CRITICAL，此处只报状态词。
     checks["embedding_contract"] = "mismatch" if _EMBEDDING_CONTRACT_MISMATCH else "ok"
 
     critical_ok = (checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
+                   and checks.get("redis") in ("ok", "skipped")
                    and not _EMBEDDING_CONTRACT_MISMATCH)
     body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
     return body if critical_ok else JSONResponse(status_code=503, content=body)

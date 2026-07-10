@@ -42,6 +42,7 @@ _AGENT_SYSTEM_PROMPT = (
 # 运行时单例（每进程一套；executor 的有界线程池即 B1(b) 执行宿主）。惰性建，flag-off 时永不建。
 _RUNTIME = None
 _APPROVAL_STORE = None
+_REGISTRY_STORE = None
 
 
 def _agent_enabled() -> bool:
@@ -56,6 +57,16 @@ def _get_approval_store():
         from opensearch_pipeline.agent_runtime.approval_store import RDSApprovalStore
         _APPROVAL_STORE = RDSApprovalStore()
     return _APPROVAL_STORE
+
+
+def _get_registry_store():
+    """tool_registry 治理单例（DB 驱动 kill switch；深度审查多实例运维组）。测试 patch 本函数。"""
+    global _REGISTRY_STORE
+    if _REGISTRY_STORE is None:
+        from opensearch_pipeline.agent_runtime.registry_store import RDSToolRegistryStore
+        _REGISTRY_STORE = RDSToolRegistryStore(
+            ttl_s=float(os.environ.get("RAG_AGENT_KILL_SWITCH_TTL_S", "30")))
+    return _REGISTRY_STORE
 
 
 def _start_reaper(run_store, approval_store=None) -> None:
@@ -100,6 +111,19 @@ def _get_runtime():
         from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
         from opensearch_pipeline.agent_tools import build_default_registry
         registry = build_default_registry()
+        # 工具治理接线（深度审查多实例运维组）：①代码内声明 upsert 进 tool_registry
+        # （status 不覆盖——重启后管理员停用的工具保持停用）②DB 驱动 kill switch 挂进
+        # resolve（任一实例停用，全部实例一个 TTL 内生效）③drift 告警。全程 fail-open：
+        # DB 抖动绝不阻断 runtime 建立（Policy/审批仍逐调用兜底）。
+        registry_store = _get_registry_store()
+        try:
+            registry_store.sync_specs(registry)
+            for w in registry_store.drift_warnings(registry):
+                logger.warning("tool_registry 漂移：%s", w)
+        except Exception:   # noqa: BLE001
+            logger.warning("tool_registry 同步/漂移检查失败（fail-open，进程内注册照常）",
+                           exc_info=True)
+        registry.attach_disabled_source(registry_store.disabled_names)
         run_store = RDSRunStore()
         # WS3 审批：executor.resume 写已批准 call → adjudicator 放行执行；两者须共享**同一** approvals dict。
         approvals: dict = {}
@@ -206,7 +230,7 @@ def agent_ask(req: AskRequest, request: Request,
 
     try:
         from opensearch_pipeline.request_context import get_request_id
-        rid = (get_request_id() or "")[:32]   # llm_call_log/agent_audit_log.request_id VARCHAR(32)
+        rid = (get_request_id() or "")[:64]   # llm_call_log/agent_audit_log.request_id VARCHAR(64)（026 加宽；钳制防未迁移环境 1406）
     except Exception:   # noqa: BLE001
         rid = ""
 
@@ -355,7 +379,7 @@ def agent_approve(req: ApproveRequest, request: Request,
 
     try:
         from opensearch_pipeline.request_context import get_request_id
-        rid = (get_request_id() or "")[:32]   # llm_call_log/agent_audit_log.request_id VARCHAR(32)
+        rid = (get_request_id() or "")[:64]   # llm_call_log/agent_audit_log.request_id VARCHAR(64)（026 加宽；钳制防未迁移环境 1406）
     except Exception:   # noqa: BLE001
         rid = ""
     # 审批决定入合规审计（fail-open）：谁、对哪个 run/request、何种处置。只记 kind 不记原文。
@@ -431,6 +455,73 @@ def agent_approve(req: ApproveRequest, request: Request,
     session_id = req.session_id or thread_id
     return StreamingResponse(_stream_events(handle, session_id, message_id),
                              media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+def _require_kb_admin(identity: Optional[Identity]) -> None:
+    """工具治理端点的权限门：kb_admin（DB 权威现查）。报告 §N 设计的 agent_admin 角色
+    尚未建（user_role 无此值）——平台治理先归 kb_admin，加 agent_admin 时在此放行。
+    管理面与工具执行信道物理分离（OpenClaw 铁律）：本组端点绝不注册为工具、绝不经 LLM 触达。"""
+    if identity is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    if resolve_kb_identity(identity.user_id).role != ROLE_KB_ADMIN:
+        raise HTTPException(status_code=403, detail="无权管理 Agent 工具（需 kb_admin）")
+
+
+@router.get("/api/agent/tools")
+def agent_tools(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """工具治理视图（kb_admin）：tool_registry 全行 + 当前停用集 + 代码↔DB 漂移告警。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    _require_kb_admin(identity)
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    registry, _gateway, _executor, _run_store = _get_runtime()
+    store = _get_registry_store()
+    rows = store.list_rows()
+    for r in rows:
+        r.pop("spec_json", None)                     # 治理视图不回灌全量 schema（噪声）
+    return {"items": rows, "disabled": sorted(store.disabled_names()),
+            "drift": store.drift_warnings(registry)}
+
+
+class ToolToggleRequest(BaseModel):
+    """kill switch 开关。disabled=true → 全局停用（所有实例一个 TTL 内生效）。"""
+
+    tool_name: str
+    disabled: bool
+    reason: Optional[str] = None
+
+
+@router.post("/api/agent/tools/toggle")
+def agent_tool_toggle(req: ToolToggleRequest, request: Request,
+                      identity: Optional[Identity] = Depends(current_identity)):
+    """kill switch（kb_admin）：置 tool_registry.status=disabled/active——DB 是治理事实，
+    多实例经 disabled_names TTL 缓存收敛（默认 30s，RAG_AGENT_KILL_SWITCH_TTL_S）。
+    操作入合规审计（fail-open）。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    _require_kb_admin(identity)
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _get_runtime()                                   # 确保 sync_specs 已跑（表内有行可置）
+    store = _get_registry_store()
+    status = "disabled" if req.disabled else "active"
+    try:
+        n = store.set_status(req.tool_name, status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="非法 status")
+    if n == 0:
+        raise HTTPException(status_code=404, detail=f"tool_registry 无工具 {req.tool_name}")
+    try:                                             # 拉闸是高风险治理动作：谁在何时停了什么
+        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
+        RDSAuditLog().record(
+            None, event_type="tool_kill_switch", action=req.tool_name, decision=status,
+            detail={"by": identity.user_id, "reason": (req.reason or "")[:500]})
+    except Exception:   # noqa: BLE001
+        logger.warning("kill switch 审计写失败（fail-open）", exc_info=True)
+    logger.warning("kill switch：%s → %s（by %s，reason=%s）",
+                   req.tool_name, status, identity.user_id, req.reason)
+    return {"tool_name": req.tool_name, "status": status, "rows": n}
 
 
 @router.get("/api/agent/approvals")

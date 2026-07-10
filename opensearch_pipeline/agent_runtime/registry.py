@@ -32,7 +32,11 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._latest: Dict[str, EnterpriseTool] = {}                 # name → 最新版
         self._versioned: Dict[Tuple[str, str], EnterpriseTool] = {}  # (name,version) → tool
-        self._disabled: set = set()                                  # kill switch（name）
+        self._disabled: set = set()                                  # kill switch（进程内，测试/降级用）
+        # DB 驱动的 kill switch 读侧（registry_store.disabled_names，TTL 缓存）：
+        # 多实例部署下任一实例经管理端点停用 → 所有实例一个 TTL 内生效。源本身 fail-open
+        # （store 内已兜），这里再兜一层——源抛错绝不把 resolve 拖垮。
+        self._disabled_source = None                                 # Callable[[], set] | None
 
     # ── 注册 / 解析 ─────────────────────────────────────────────
     def register(self, tool: EnterpriseTool) -> None:
@@ -50,7 +54,7 @@ class ToolRegistry:
 
         授权（该 ctx 能否调）由 PolicyEngine 裁决，不在此——registry 只负责名→工具解析。
         """
-        if name in self._disabled:
+        if name in self._all_disabled():
             raise ToolDisabled(name)
         tool = self.get(name, version)
         if tool is None:
@@ -58,6 +62,20 @@ class ToolRegistry:
         return tool
 
     # ── kill switch ─────────────────────────────────────────────
+    def attach_disabled_source(self, fn) -> None:
+        """注入 DB 驱动的停用名单源（registry_store.disabled_names）。"""
+        self._disabled_source = fn
+
+    def _all_disabled(self) -> set:
+        """进程内 ∪ DB 源。源抛错 fail-open（只按进程内集合）。"""
+        names = self._disabled
+        if self._disabled_source is not None:
+            try:
+                names = names | set(self._disabled_source() or ())
+            except Exception:   # noqa: BLE001 — kill switch 读故障绝不误杀
+                pass
+        return names
+
     def disable(self, name: str) -> None:
         self._disabled.add(name)
 
@@ -65,16 +83,17 @@ class ToolRegistry:
         self._disabled.discard(name)
 
     def is_disabled(self, name: str) -> bool:
-        return name in self._disabled
+        return name in self._all_disabled()
 
     # ── 列举 / 治理 ─────────────────────────────────────────────
     def list_specs(self, ctx: Any = None) -> List[ToolSpec]:
-        """对模型可见的工具契约（active、非 deprecated、非 disabled）。
+        """对模型可见的工具契约（active、非 deprecated、非 disabled——含 DB kill switch）。
 
         ctx 角色可见性过滤留待 PolicyEngine（可见集 = 该 ctx 可能被 ALLOW 的工具），本步先返回全集。
         """
+        disabled = self._all_disabled()
         return [t.spec for t in self._latest.values()
-                if not t.spec.deprecated and t.spec.name not in self._disabled]
+                if not t.spec.deprecated and t.spec.name not in disabled]
 
     def to_registry_rows(self, registered_by: str = "platform") -> List[Dict[str, Any]]:
         """代码内声明 → tool_registry 表行（治理同步用；实际写库走 admin API）。"""

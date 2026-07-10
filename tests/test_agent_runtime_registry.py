@@ -85,3 +85,37 @@ def test_drift_check():
                                 {"tool_name": "z", "version": "1.0.0"}])
     assert any("b@1.0.0" in w for w in warnings)      # 代码有 DB 无
     assert any("z@1.0.0" in w for w in warnings)      # DB 有代码无
+
+
+# ── DB 驱动 kill switch 的读侧钩子（深度审查多实例运维组）─────────────────────
+def test_external_disabled_source_blocks_resolve_and_list():
+    reg = ToolRegistry()
+    reg.register(_Tool("knowledge_search"))
+    reg.register(_Tool("u8_writeback"))
+    reg.attach_disabled_source(lambda: {"u8_writeback"})
+    with pytest.raises(ToolDisabled):
+        reg.resolve("u8_writeback")
+    assert reg.resolve("knowledge_search") is not None       # 其余工具不受影响
+    assert reg.is_disabled("u8_writeback")
+    assert [s.name for s in reg.list_specs()] == ["knowledge_search"]   # 模型不可见被停用工具
+
+
+def test_external_source_failure_is_fail_open():
+    """kill switch 读故障绝不误杀：源抛错 → 只按进程内集合。"""
+    reg = ToolRegistry()
+    reg.register(_Tool("knowledge_search"))
+    def _boom():
+        raise RuntimeError("db down")
+    reg.attach_disabled_source(_boom)
+    assert reg.resolve("knowledge_search") is not None
+    assert not reg.is_disabled("knowledge_search")
+
+
+def test_process_local_and_external_union():
+    reg = ToolRegistry()
+    reg.register(_Tool("a"))
+    reg.register(_Tool("b"))
+    reg.disable("a")                                          # 进程内
+    reg.attach_disabled_source(lambda: {"b"})                 # DB 源
+    assert reg.is_disabled("a") and reg.is_disabled("b")
+    assert reg.list_specs() == []

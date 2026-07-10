@@ -427,6 +427,75 @@ def test_approve_already_decided_409(approval_wired):
         api.app.dependency_overrides.clear()
 
 
+class _FakeRegistryStore:
+    def __init__(self):
+        self.status_calls = []
+        self.rows = [{"tool_name": "u8_writeback", "version": "1.0", "spec_json": "{}",
+                      "risk_level": "HIGH_WRITE", "permission_scope": "u8.writeback",
+                      "owner_team": "platform", "status": "active",
+                      "registered_by": "platform", "created_at": None}]
+
+    def list_rows(self):
+        return [dict(r) for r in self.rows]
+
+    def disabled_names(self):
+        return {r["tool_name"] for r in self.rows if r["status"] == "disabled"}
+
+    def set_status(self, name, status):
+        n = 0
+        for r in self.rows:
+            if r["tool_name"] == name:
+                r["status"] = status
+                n += 1
+        return n
+
+    def drift_warnings(self, registry):
+        return []
+
+    def sync_specs(self, registry):
+        return len(self.rows)
+
+
+def test_tools_endpoints_require_kb_admin(approval_wired):
+    """工具治理端点（kill switch）：employee/dept_admin 403（DB 现查），kb_admin 放行。"""
+    _, _, _, mp = approval_wired
+    fake = _FakeRegistryStore()
+    mp.setattr(agent_route, "_get_registry_store", lambda: fake)
+    import opensearch_pipeline.dingtalk_identity as di
+    try:
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("dept_admin", granted=("production",)))
+        assert _client(_identity()).get("/api/agent/tools").status_code == 403
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+        r = _client(_identity()).get("/api/agent/tools")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["items"][0]["tool_name"] == "u8_writeback"
+        assert "spec_json" not in body["items"][0]            # 治理视图不回灌全量 schema
+        assert body["disabled"] == [] and body["drift"] == []
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_tool_toggle_flips_status_and_404_on_unknown(approval_wired):
+    _, _, _, mp = approval_wired
+    fake = _FakeRegistryStore()
+    mp.setattr(agent_route, "_get_registry_store", lambda: fake)
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+    try:
+        c = _client(_identity())
+        r = c.post("/api/agent/tools/toggle",
+                   json={"tool_name": "u8_writeback", "disabled": True, "reason": "写回事故排查"})
+        assert r.status_code == 200 and r.json()["status"] == "disabled"
+        assert fake.rows[0]["status"] == "disabled"
+        r = c.post("/api/agent/tools/toggle", json={"tool_name": "u8_writeback", "disabled": False})
+        assert r.status_code == 200 and fake.rows[0]["status"] == "active"
+        assert c.post("/api/agent/tools/toggle",
+                      json={"tool_name": "nope", "disabled": True}).status_code == 404
+    finally:
+        api.app.dependency_overrides.clear()
+
+
 def test_approvals_queue_employee_403(approval_wired):
     _, _, _, mp = approval_wired
     import opensearch_pipeline.dingtalk_identity as di

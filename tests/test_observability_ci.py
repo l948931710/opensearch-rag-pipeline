@@ -235,3 +235,66 @@ def test_eval2_strict_fails_on_manifest_drift_error():
     assert any("manifest_drift" in f for f in fails)
     # no drift → no failure
     assert _strict_failures({}, {"l4": {"ingestion": {"deterministic": {"errors": []}}}}) == []
+
+
+def test_api_ready_redis_probe_when_backend_redis(monkeypatch):
+    """WS0：任一状态后端=redis → Redis PING 纳入就绪判定（此前 ping 是死代码）。
+    PING 失败 → 503（限流 redis 后端 fail-closed，实例已无法服务，必须摘出）；成功 → 200。"""
+    from fastapi.testclient import TestClient
+    import opensearch_pipeline.retriever as rt
+    from opensearch_pipeline import redis_client
+    from opensearch_pipeline.config import get_config
+    from opensearch_pipeline.api import app
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(rt, "_get_ha3_client", lambda: "MOCK_HA3_CLIENT")
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a): pass
+        def fetchone(self): return (1,)
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def close(self): pass
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: _Conn())
+    monkeypatch.setenv("RAG_RATE_LIMIT_BACKEND", "redis")
+
+    monkeypatch.setattr(redis_client, "ping", lambda: False)
+    r = TestClient(app).get("/api/ready")
+    assert r.status_code == 503 and r.json()["redis"] == "error"
+
+    monkeypatch.setattr(redis_client, "ping", lambda: True)
+    r = TestClient(app).get("/api/ready")
+    assert r.status_code == 200 and r.json()["redis"] == "ok"
+
+
+def test_api_ready_redis_skipped_when_all_memory(monkeypatch):
+    """全 memory 后端（单实例语义）→ redis=skipped，不参与就绪判定。"""
+    from fastapi.testclient import TestClient
+    import opensearch_pipeline.retriever as rt
+    from opensearch_pipeline.config import get_config
+    from opensearch_pipeline.api import app
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(rt, "_get_ha3_client", lambda: "MOCK_HA3_CLIENT")
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a): pass
+        def fetchone(self): return (1,)
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def close(self): pass
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: _Conn())
+    for k in ("RAG_SESSION_BACKEND", "RAG_RATE_LIMIT_BACKEND",
+              "RAG_MSG_DEDUP_BACKEND", "RAG_TOKEN_CACHE_BACKEND"):
+        monkeypatch.delenv(k, raising=False)
+
+    r = TestClient(app).get("/api/ready")
+    assert r.status_code == 200 and r.json()["redis"] == "skipped"

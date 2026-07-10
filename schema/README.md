@@ -53,6 +53,7 @@ apply 脚本落库并记台账。
 | 023_llm_call_log.sql | fuling_operation | LLM 调用账本（ModelGateway 每次调用记 token/成本/延迟；成本按 user/dept 归集，E5）（WS1 收尾②） |
 | 024_agent_audit_log.sql | fuling_operation | Agent 合规审计（append-only；执行前 write-ahead 审计，HIGH_WRITE fail-closed / 普通 fail-open；audit.py）（WS1 收尾③） |
 | 025_approval_workflow.sql | fuling_operation | Agent 审批闭环持久化：approval_request（挂起侧写，approver_scope + 过期即拒）+ approval_decision（决策侧写，uk_req_idem 幂等）——request→decision→invocation→audit 四表回放链（WS3；approval_store.py；深度审查 A 组 P1） |
+| 026_agent_family_collation_request_id.sql | fuling_operation | agent 表族 9 表 COLLATE 显式钉到 utf8mb4_unicode_ci（铁律 4；022/025 吃库默认在漂移环境与显式 unicode_ci 的 023/024 混排 → run_id JOIN 1267）+ request_id 加宽 VARCHAR(64)（UUID 36 字符原宽度装不下）（深度审查 schema 组） |
 
 ## 台账（schema_migrations）
 
