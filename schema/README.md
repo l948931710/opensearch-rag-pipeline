@@ -12,8 +12,12 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 025。历史上有三对编号冲突（002/003/006 各两个文件，
+3. **编号严格单调递增**，下一个可用号 = 027。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
+   ⚠️ **本体层文档编号勘误**：《本体层设计 v1.1》《P0-P1 落地细化》所写迁移号 024–028 成文时
+   未预见 agent v2 占号，已全部作废——本体表族实际为 **027(core)/028(identity)/029(link)/
+   030(sem_views)/031(event，P2 预留)**；文档所称"018 审批""023 预留 v2 P4"同样以本表为准
+   （018=gen_meta、023=llm_call_log、审批=025）。详见 `docs/ontology_p0_plan_2026-07-10.md`。
 4. **`CREATE DATABASE` 必须显式 `CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci`**，每张新表
    显式 COLLATE —— staging `_stg` 库曾因缺省漂移到 `_0900_ai_ci` 引发跨库 JOIN 1267。
 5. DDL↔代码列契约由 `tests/test_schema_ddl_parity.py` 钉住（INSERT/SELECT 用到的列
