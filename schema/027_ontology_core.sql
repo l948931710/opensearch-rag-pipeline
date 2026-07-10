@@ -1,5 +1,6 @@
 -- schema/027_ontology_core.sql
--- 库：fuling_operation
+-- 库：fuling_ontology（PR-B P0-02 独立库隔离：fuling_ro 持 fuling_operation.* 库级 SELECT，
+--     ontology 表族留在运营库时服务层 ACL 可被直连绕过——独立库不授 fuling_ro，机器可强制）
 -- 本体控制面核心（《本体层设计 v1.1》§B.3 + docs/ontology_p0_plan_2026-07-10.md）。
 -- 取号勘误：设计文档所写 024（core）已被 agent v2 占用，实际取 027；详见 schema/README.md 铁律 3。
 -- 定位：身份/关系/来源治理的控制面，非万物 SoR——业务事实（库存/订单/金额/完工）仍以各源系统为准，

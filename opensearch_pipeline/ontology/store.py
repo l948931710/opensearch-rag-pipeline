@@ -69,8 +69,10 @@ class RDSOntologyStore:
 
     @staticmethod
     def _db() -> str:
+        # PR-B（P0-02）：ontology 表族在独立库——fuling_ro 的库级 wildcard SELECT 只覆盖
+        # fuling_operation，独立库不授即物理隔离（SHOW GRANTS 测试钉住）。
         from opensearch_pipeline.config import get_config
-        return get_config().rds.operation_database
+        return get_config().rds.ontology_database
 
     @staticmethod
     def _rows_to_dicts(cur) -> List[Dict[str, Any]]:
@@ -648,8 +650,14 @@ class RDSOntologyStore:
 
     def list_open_cases(self, *, namespace: Optional[str] = None,
                         object_type_hint: Optional[str] = None, order: str = "freq",
-                        limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
-        """工作台队列：order=freq（高频未解析优先）| recent。"""
+                        limit: int = 50, offset: int = 0,
+                        scope_filter: Optional[Dict[str, List[str]]] = None
+                        ) -> List[Dict[str, Any]]:
+        """工作台队列：order=freq（高频未解析优先）| recent。
+
+        scope_filter（PR-B，P0-01 队列 SQL 层过滤）：None=不过滤（kb_admin）；
+        dict{namespaces, namespace_prefixes, object_types}=按管辖 scope 并集收窄
+        （跨部门行不出库）；三集合全空 → 恒空（fail-closed：什么都不管=什么都看不见）。"""
         db, conn = self._db(), self._conn()
         limit = max(1, min(int(limit), 200))
         order_sql = "seen_count DESC, last_seen_at DESC" if order == "freq" \
@@ -664,6 +672,27 @@ class RDSOntologyStore:
                 if object_type_hint:
                     sql += " AND object_type_hint=%s"
                     params.append(object_type_hint)
+                if scope_filter is not None:
+                    clauses: List[str] = []
+                    nss = scope_filter.get("namespaces") or []
+                    prefixes = scope_filter.get("namespace_prefixes") or []
+                    otypes = scope_filter.get("object_types") or []
+                    if nss:
+                        clauses.append(
+                            "namespace IN (" + ",".join(["%s"] * len(nss)) + ")")
+                        params.extend(nss)
+                    if prefixes:
+                        clauses.append(
+                            "SUBSTRING_INDEX(namespace, ':', 1) IN ("
+                            + ",".join(["%s"] * len(prefixes)) + ")")
+                        params.extend(prefixes)
+                    if otypes:
+                        clauses.append(
+                            "object_type_hint IN (" + ",".join(["%s"] * len(otypes)) + ")")
+                        params.extend(otypes)
+                    if not clauses:
+                        return []   # 管辖空集：SQL 都不必发
+                    sql += " AND (" + " OR ".join(clauses) + ")"
                 cur.execute(sql + f" ORDER BY {order_sql} LIMIT %s OFFSET %s",
                             (*params, limit, max(0, int(offset))))
                 return self._rows_to_dicts(cur)
@@ -1133,11 +1162,22 @@ class MemoryOntologyStore:
             return None
 
     def list_open_cases(self, *, namespace=None, object_type_hint=None, order="freq",
-                        limit=50, offset=0):
+                        limit=50, offset=0, scope_filter=None):
+        def _in_scope(r):
+            if scope_filter is None:
+                return True
+            nss = scope_filter.get("namespaces") or []
+            prefixes = scope_filter.get("namespace_prefixes") or []
+            otypes = scope_filter.get("object_types") or []
+            return (r["namespace"] in nss
+                    or r["namespace"].split(":", 1)[0] in prefixes
+                    or (r["object_type_hint"] or "") in otypes)
+
         with self._lock:
             rows = [dict(r) for r in self._cases.values() if r["status"] == "open"
                     and (namespace is None or r["namespace"] == namespace)
-                    and (object_type_hint is None or r["object_type_hint"] == object_type_hint)]
+                    and (object_type_hint is None or r["object_type_hint"] == object_type_hint)
+                    and _in_scope(r)]
             key = (lambda r: (-r["seen_count"], -r["last_seen_at"])) if order == "freq" \
                 else (lambda r: -r["last_seen_at"])
             rows.sort(key=key)

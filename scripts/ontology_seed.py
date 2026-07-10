@@ -46,7 +46,7 @@ def main(argv=None, *, store=None, source=None) -> int:
             print("❌ 目标是生产 RDS——P0 无 prod 播种路径（真实播种须 go/no-go ①③④ 签字，"
                   "且届时经 prod_access 专门通道）。拒绝执行。", file=sys.stderr)
             return 2
-        print(f"目标库：{cfg.rds.host}/{cfg.rds.operation_database}"
+        print(f"目标库：{cfg.rds.host}/{cfg.rds.ontology_database}"
               f"{'（DRY-RUN 零写库）' if dry else ''}")
         store = RDSOntologyStore()
 

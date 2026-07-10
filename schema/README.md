@@ -43,7 +43,7 @@ apply 脚本落库并记台账。
 | 008_kb_access_request.sql | fuling_knowledge | 跨部门检索授权申请（collation 对齐 _unicode_ci） |
 | 009_acl_projection_outbox.sql | fuling_knowledge | ACL 投影 outbox（同事务 enqueue + UNIQUE(doc_id) 复活） |
 | 010_kb_contribution.sql | fuling_operation | 员工知识贡献（010a 修订：补 normalized_gap_query） |
-| 011_schema_migrations.sql | 双库 | DDL 变更台账（本机制自身） |
+| 011_schema_migrations.sql | 三库（knowledge/operation/ontology 各一份） | DDL 变更台账（本机制自身） |
 | 012_qa_session_log_perf_index.sql | fuling_operation | (answer_status, created_at) 复合索引（性能第一梯队 #1） |
 | 013_qa_retrieved_doc_fact.sql | fuling_operation | 检索/引用文档物化事实表 + 存量回填（perf#3；读侧 RAG_QA_FACT_JOIN 门控） |
 | 014_document_version_raw_key_hash_index.sql | fuling_knowledge | raw_key_hash 回填 + idx_raw_key_hash（perf#5 注册幂等点查） |
@@ -59,10 +59,10 @@ apply 脚本落库并记台账。
 | 024_agent_audit_log.sql | fuling_operation | Agent 合规审计（append-only；执行前 write-ahead 审计，HIGH_WRITE fail-closed / 普通 fail-open；audit.py）（WS1 收尾③） |
 | 025_approval_workflow.sql | fuling_operation | Agent 审批闭环持久化：approval_request（挂起侧写，approver_scope + 过期即拒）+ approval_decision（决策侧写，uk_req_idem 幂等）——request→decision→invocation→audit 四表回放链（WS3；approval_store.py；深度审查 A 组 P1） |
 | 026_agent_family_collation_request_id.sql | fuling_operation | agent 表族 9 表 COLLATE 显式钉到 utf8mb4_unicode_ci（铁律 4；022/025 吃库默认在漂移环境与显式 unicode_ci 的 023/024 混排 → run_id JOIN 1267）+ request_id 加宽 VARCHAR(64)（UUID 36 字符原宽度装不下）（深度审查 schema 组） |
-| 027_ontology_core.sql | fuling_operation | 本体控制面核心：ontology_object（canonical ULID+乐观锁+密级）+ ontology_ref_seq（展示号发号）+ ontology_attribute_source（属性溯源，纯来源治理）+ ontology_stewardship（授权 scope，S5）（本体 P0；docs/ontology_p0_plan_2026-07-10.md） |
-| 028_ontology_identity.sql | fuling_operation | 身份脊柱：ontology_identifier（别名映射，至多一行 active 生成列唯一键 S4；norm 不剥改模后缀）+ ontology_resolution_case/candidate（候选承载层 S2：证据快照+积压统计，一个未解析编号×N 候选）（本体 P0） |
-| 029_ontology_link.sql | fuling_operation | 本体关系：ontology_link（sku_of_product 等；uk_src_dst_type）（本体 P0） |
-| 030_sem_views.sql | fuling_operation | PMC-1 语义投影：sem_packing/sem_stacking 视图（spec↔SKU 走 029 link 非 JSON 关联）+ packing_spec/stacking_spec 发号登记；**S7：不授 fuling_ro，唯一读取口 ontology/sem.py**（本体 P0 PR10） |
+| 027_ontology_core.sql | fuling_ontology | 本体控制面核心：ontology_object（canonical ULID+乐观锁+密级）+ ontology_ref_seq（展示号发号）+ ontology_attribute_source（属性溯源，纯来源治理）+ ontology_stewardship（授权 scope，S5）（本体 P0；docs/ontology_p0_plan_2026-07-10.md） |
+| 028_ontology_identity.sql | fuling_ontology | 身份脊柱：ontology_identifier（别名映射，至多一行 active 生成列唯一键 S4；norm 不剥改模后缀）+ ontology_resolution_case/candidate（候选承载层 S2：证据快照+积压统计，一个未解析编号×N 候选）（本体 P0） |
+| 029_ontology_link.sql | fuling_ontology | 本体关系：ontology_link（sku_of_product 等；uk_src_dst_type）（本体 P0） |
+| 030_sem_views.sql | fuling_ontology | PMC-1 语义投影：sem_packing/sem_stacking 视图（spec↔SKU 走 029 link 非 JSON 关联）+ packing_spec/stacking_spec 发号登记；**S7：本体表族整体在独立库 fuling_ontology（PR-B P0-02），fuling_ro 不授本库——隔离由 DB 授权面强制（tests/test_ontology_db_isolation.py 钉住），唯一读取口 ontology/sem.py** |
 
 ## 台账（schema_migrations）
 

@@ -97,7 +97,7 @@ def main(argv=None, *, store=None, source=None) -> int:
         from opensearch_pipeline.config import get_config
         from opensearch_pipeline.ontology.store import RDSOntologyStore
         cfg = get_config()
-        print(f"目标库：{cfg.rds.host}/{cfg.rds.operation_database}"
+        print(f"目标库：{cfg.rds.host}/{cfg.rds.ontology_database}"
               f"{'（DRY-RUN 零写库）' if dry else ''}")
         store = RDSOntologyStore()
 

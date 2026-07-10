@@ -28,7 +28,11 @@ from opensearch_pipeline.agent_runtime.tool import (
     ToolResult,
     ToolSpec,
 )
-from opensearch_pipeline.agent_tools.ontology_resolve import _visible_title
+from opensearch_pipeline.ontology.authz import visible_title as _authz_visible_title
+
+
+def _visible_title(title, data_classification, owner_dept, acl):
+    return _authz_visible_title(title, data_classification, owner_dept, acl=acl)
 
 if TYPE_CHECKING:
     from opensearch_pipeline.agent_runtime.context import ExecutionContext

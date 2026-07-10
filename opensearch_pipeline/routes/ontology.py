@@ -106,12 +106,80 @@ def _authorize_steward(identity: Identity, kb, steward_dept: Optional[str]) -> N
         detail=f"无权处置该条目（steward={steward_dept or '未登记'}，需 kb_admin 或对应 dept_admin）")
 
 
+# ── 对象级 ACL（PR-B，P0-01）：读侧世界观 = kb_admin bypass / dept_admin 管辖组码 ──
+def _reader_acl(kb):
+    """(acl, bypass)：对象可见性判定输入（ontology.authz 同一世界观）。"""
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    if kb.role == ROLE_KB_ADMIN:
+        return set(), True
+    return set(managed_owner_depts(kb)), False
+
+
+def _can_manage_case(kb, store, case: Dict[str, Any]) -> bool:
+    """case 可见性 = 其 steward scope 是否归调用方管辖（evidence 属处置人，读写同域）。"""
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    if kb.role == ROLE_KB_ADMIN:
+        return True
+    steward = _steward_dept_for(store, namespace=case.get("namespace"),
+                                object_type=case.get("object_type_hint"))
+    return bool(steward) and steward in set(managed_owner_depts(kb))
+
+
+def _managed_scope_filter(kb, store) -> Optional[Dict[str, List[str]]]:
+    """dept_admin 的队列 SQL 粗过滤集（kb_admin → None=不过滤）。
+
+    从 stewardship 表反算调用方管辖的 scope：namespace 全键 / namespace 冒号前缀 /
+    object_type。SQL 层先按并集收窄（跨部门行不出库），返回后仍逐条
+    `_can_manage_case` 精判（attribute > namespace > object_type 的裁决优先级可能
+    在并集内又否掉个别行）——粗筛+精判双层，fail-closed。"""
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    if kb.role == ROLE_KB_ADMIN:
+        return None
+    managed = set(managed_owner_depts(kb))
+    namespaces, prefixes, otypes = [], [], []
+    try:
+        rows = store.list_stewardship()
+    except Exception:   # noqa: BLE001 — 表故障 → 空集（fail-closed：什么都看不见）
+        logger.warning("stewardship 读取失败（队列过滤收敛为空集）", exc_info=True)
+        rows = []
+    for r in rows:
+        if r.get("steward_dept") not in managed:
+            continue
+        key = r.get("scope_key") or ""
+        if r.get("scope_type") == "namespace":
+            (namespaces if ":" in key else prefixes).append(key)
+        elif r.get("scope_type") == "object_type":
+            otypes.append(key)
+    return {"namespaces": namespaces, "namespace_prefixes": prefixes,
+            "object_types": otypes}
+
+
+def _raise_mutation_denied(reason: str) -> None:
+    """authz.can_mutate_identity 的拒绝原因 → HTTP 语义（不可见=404 防存在性泄露）。"""
+    if "不可见" in reason or "不存在" in reason:
+        raise HTTPException(status_code=404, detail="目标对象不存在")
+    if "非 active" in reason:
+        raise HTTPException(status_code=409, detail=reason)
+    raise HTTPException(status_code=400, detail=reason)
+
+
 # ── 读侧：队列 / 覆盖率 / 详情 / 对象搜索 ─────────────────────────────────────
-def _enrich_candidates(store, case_id: str, top_n: int = 3) -> List[Dict[str, Any]]:
+def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
+                       top_n: int = 3) -> List[Dict[str, Any]]:
+    """候选目标对象信息按对象级 ACL 出参（PR-B）：不可读目标只给 target_visible=False，
+    不泄 ref/title/type——跨部门 confidential 候选正是 P0-01 的泄露面。"""
+    from opensearch_pipeline.ontology.authz import can_read_object, visible_title
     out = []
     for c in store.list_candidates(case_id)[:top_n]:
         obj = store.get_object(c["target_object_id"]) or {}
-        out.append({**c, "canonical_ref": obj.get("canonical_ref"), "title": obj.get("title"),
+        if not can_read_object(obj, acl=acl, bypass_acl=bypass):
+            out.append({**c, "target_visible": False, "canonical_ref": None,
+                        "title": None, "object_type": None, "target_status": None})
+            continue
+        out.append({**c, "target_visible": True,
+                    "canonical_ref": obj.get("canonical_ref"),
+                    "title": visible_title(obj.get("title"), obj.get("data_classification"),
+                                           obj.get("owner_dept"), acl=acl, bypass_acl=bypass),
                     "object_type": obj.get("object_type"), "target_status": obj.get("status")})
     return out
 
@@ -123,13 +191,19 @@ def ontology_workbench(request: Request, namespace: Optional[str] = None,
                        identity: Optional[Identity] = Depends(current_identity)):
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
-    _require_reader(identity)
+    kb = _require_reader(identity)
     store = _get_store()
+    acl, bypass = _reader_acl(kb)
+    scope = _managed_scope_filter(kb, store)   # None=kb_admin 不过滤
     items = []
     for case in store.list_open_cases(namespace=namespace, object_type_hint=object_type,
-                                      order=order, limit=limit, offset=offset):
+                                      order=order, limit=limit, offset=offset,
+                                      scope_filter=scope):
+        if not _can_manage_case(kb, store, case):   # 粗筛后的精判（裁决优先级，fail-closed）
+            continue
         items.append({**case,
-                      "candidates": _enrich_candidates(store, case["case_id"]),
+                      "candidates": _enrich_candidates(store, case["case_id"],
+                                                       acl=acl, bypass=bypass),
                       "steward_dept": _steward_dept_for(
                           store, namespace=case.get("namespace"),
                           object_type=case.get("object_type_hint"))})
@@ -153,12 +227,16 @@ def ontology_case_detail(case_id: str, request: Request,
                          identity: Optional[Identity] = Depends(current_identity)):
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
-    _require_reader(identity)
+    kb = _require_reader(identity)
     store = _get_store()
     case = store.get_case(case_id)
-    if case is None:
+    # PR-B（P0-01）：scope 外的 case 与不存在同答 404——evidence_json 属处置人
+    if case is None or not _can_manage_case(kb, store, case):
         raise HTTPException(status_code=404, detail="case 不存在")
-    return {**case, "candidates": _enrich_candidates(store, case_id, top_n=10),
+    acl, bypass = _reader_acl(kb)
+    return {**case,
+            "candidates": _enrich_candidates(store, case_id, acl=acl, bypass=bypass,
+                                             top_n=10),
             "steward_dept": _steward_dept_for(store, namespace=case.get("namespace"),
                                               object_type=case.get("object_type_hint"))}
 
@@ -167,11 +245,15 @@ def ontology_case_detail(case_id: str, request: Request,
 def ontology_objects_search(request: Request, object_type: str, q: Optional[str] = None,
                             limit: int = 20,
                             identity: Optional[Identity] = Depends(current_identity)):
-    """确认/改指时的目标对象选择器。"""
+    """确认/改指时的目标对象选择器（PR-B：结果按对象级 ACL 过滤，不可读对象整行不出）。"""
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
-    _require_reader(identity)
-    return {"items": _get_store().find_objects(object_type, title_like=q, limit=limit)}
+    kb = _require_reader(identity)
+    from opensearch_pipeline.ontology.authz import can_read_object
+    acl, bypass = _reader_acl(kb)
+    items = [o for o in _get_store().find_objects(object_type, title_like=q, limit=limit)
+             if can_read_object(o, acl=acl, bypass_acl=bypass)]
+    return {"items": items}
 
 
 @router.get("/api/ontology/objects/{object_id}")
@@ -179,10 +261,13 @@ def ontology_object_detail(object_id: str, request: Request,
                            identity: Optional[Identity] = Depends(current_identity)):
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
-    _require_reader(identity)
+    kb = _require_reader(identity)
     store = _get_store()
     obj = store.get_object(object_id)
-    if obj is None:
+    from opensearch_pipeline.ontology.authz import can_read_object
+    acl, bypass = _reader_acl(kb)
+    # PR-B（P0-01）：不可读对象与不存在同答 404（identifier 列表随对象门禁）
+    if obj is None or not can_read_object(obj, acl=acl, bypass_acl=bypass):
         raise HTTPException(status_code=404, detail="对象不存在")
     return {**obj, "identifiers": store.list_identifiers_for_target(object_id)}
 
@@ -204,17 +289,21 @@ def ontology_case_confirm(case_id: str, req: ConfirmRequest, request: Request,
     kb = _require_reader(identity)
     store = _get_store()
     case = store.get_case(case_id)
-    if case is None:
+    # PR-B（P0-01）：scope 外 case 与不存在同答 404（先可见性再状态，防 409 泄露存在性）
+    if case is None or not _can_manage_case(kb, store, case):
         raise HTTPException(status_code=404, detail="case 不存在")
     if case["status"] != "open":
         raise HTTPException(status_code=409, detail=f"case 非 open（{case['status']}）")
     _authorize_steward(identity, kb, _steward_dept_for(
         store, namespace=case["namespace"], object_type=case.get("object_type_hint")))
+    # PR-B（P0-01）：目标侧三闸——可读 / active / 与 case 期望类型一致（authz 单一实现）
+    from opensearch_pipeline.ontology.authz import can_mutate_identity
+    acl, bypass = _reader_acl(kb)
     target = store.get_object(req.target_object_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="目标对象不存在")
-    if target["status"] != "active":
-        raise HTTPException(status_code=409, detail=f"目标对象非 active（{target['status']}）")
+    reason = can_mutate_identity(target, acl=acl, bypass_acl=bypass,
+                                 expected_object_type=case.get("object_type_hint"))
+    if reason:
+        _raise_mutation_denied(reason)
     from opensearch_pipeline.ontology.store import DuplicateActiveIdentifier
     try:
         identifier_id = store.insert_identifier(
@@ -249,7 +338,7 @@ def ontology_case_dismiss(case_id: str, req: DismissRequest, request: Request,
     kb = _require_reader(identity)
     store = _get_store()
     case = store.get_case(case_id)
-    if case is None:
+    if case is None or not _can_manage_case(kb, store, case):   # PR-B：scope 外同答 404
         raise HTTPException(status_code=404, detail="case 不存在")
     _authorize_steward(identity, kb, _steward_dept_for(
         store, namespace=case["namespace"], object_type=case.get("object_type_hint")))
@@ -275,8 +364,8 @@ def _load_identifier_scope(store, identifier_id: str):
     if row is None:
         raise HTTPException(status_code=404, detail="identifier 不存在")
     obj = store.get_object(row["target_object_id"]) or {}
-    return row, _steward_dept_for(store, namespace=row["namespace"],
-                                  object_type=obj.get("object_type"))
+    return row, obj, _steward_dept_for(store, namespace=row["namespace"],
+                                       object_type=obj.get("object_type"))
 
 
 @router.post("/api/ontology/identifiers/{identifier_id}/deactivate")
@@ -286,7 +375,7 @@ def ontology_identifier_deactivate(identifier_id: str, req: NoteRequest, request
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     store = _get_store()
-    row, steward = _load_identifier_scope(store, identifier_id)
+    row, _obj, steward = _load_identifier_scope(store, identifier_id)
     _authorize_steward(identity, kb, steward)
     if not store.deactivate_identifier(identifier_id, status="rejected"):
         raise HTTPException(status_code=409, detail=f"identifier 非 active（{row['status']}）")
@@ -309,13 +398,16 @@ def ontology_identifier_repoint(identifier_id: str, req: RepointRequest, request
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     store = _get_store()
-    row, steward = _load_identifier_scope(store, identifier_id)
+    row, old_obj, steward = _load_identifier_scope(store, identifier_id)
     _authorize_steward(identity, kb, steward)
+    # PR-B（P0-01）：新目标三闸——可读 / active / 与旧目标同类型（跨类型改指默认拒）
+    from opensearch_pipeline.ontology.authz import can_mutate_identity
+    acl, bypass = _reader_acl(kb)
     target = store.get_object(req.target_object_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="目标对象不存在")
-    if target["status"] != "active":
-        raise HTTPException(status_code=409, detail=f"目标对象非 active（{target['status']}）")
+    reason = can_mutate_identity(target, acl=acl, bypass_acl=bypass,
+                                 expected_object_type=old_obj.get("object_type"))
+    if reason:
+        _raise_mutation_denied(reason)
     try:
         new_id = store.repoint_identifier(identifier_id, req.target_object_id,
                                           by=identity.user_id,
@@ -337,7 +429,10 @@ def ontology_object_retire(object_id: str, req: NoteRequest, request: Request,
     kb = _require_reader(identity)
     store = _get_store()
     obj = store.get_object(object_id)
-    if obj is None:
+    from opensearch_pipeline.ontology.authz import can_read_object
+    acl, bypass = _reader_acl(kb)
+    # PR-B（P0-01）：不可读对象与不存在同答（先可见性后 steward，防 403 泄露存在性）
+    if obj is None or not can_read_object(obj, acl=acl, bypass_acl=bypass):
         raise HTTPException(status_code=404, detail="对象不存在")
     _authorize_steward(identity, kb,
                        _steward_dept_for(store, object_type=obj["object_type"]))
@@ -362,15 +457,18 @@ def ontology_object_mark_duplicate(object_id: str, req: MarkDuplicateRequest, re
     kb = _require_reader(identity)
     store = _get_store()
     obj = store.get_object(object_id)
-    if obj is None:
+    from opensearch_pipeline.ontology.authz import can_mutate_identity, can_read_object
+    acl, bypass = _reader_acl(kb)
+    if obj is None or not can_read_object(obj, acl=acl, bypass_acl=bypass):
         raise HTTPException(status_code=404, detail="对象不存在")
     _authorize_steward(identity, kb,
                        _steward_dept_for(store, object_type=obj["object_type"]))
+    # PR-B（P0-01）：merge 目标三闸——可读 / active / 与 source 同类型（store 同事务再兜一层）
     target = store.get_object(req.merged_into)
-    if target is None:
-        raise HTTPException(status_code=404, detail="merged_into 对象不存在")
-    if target["status"] != "active":
-        raise HTTPException(status_code=409, detail=f"merged_into 非 active（{target['status']}）")
+    reason = can_mutate_identity(target, acl=acl, bypass_acl=bypass,
+                                 expected_object_type=obj["object_type"])
+    if reason:
+        _raise_mutation_denied(reason)
     try:
         ok = store.mark_duplicate(object_id, req.merged_into, by=identity.user_id)
     except ValueError as e:

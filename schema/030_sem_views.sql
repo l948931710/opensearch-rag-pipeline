@@ -1,5 +1,6 @@
 -- schema/030_sem_views.sql
--- 库：fuling_operation
+-- 库：fuling_ontology（PR-B P0-02 独立库隔离：fuling_ro 持 fuling_operation.* 库级 SELECT，
+--     ontology 表族留在运营库时服务层 ACL 可被直连绕过——独立库不授 fuling_ro，机器可强制）
 -- PMC-1 语义投影（P0 PR10）：sem_packing（箱规）/ sem_stacking（香规/堆叠）。
 -- 取号勘误：设计文档所写 028（sem 视图）已被 agent v2 占用，实际取 030；详见 schema/README.md 铁律 3。
 --

@@ -28,13 +28,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Collection, Dict, List, Optional, Tuple
 
+from opensearch_pipeline.ontology.authz import can_read_object, visible_title
 from opensearch_pipeline.ontology.store import SEM_PROJECTIONS
 
 __all__ = ["SemAnswer", "lookup_specs"]
 
 _ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 _REF_RE = re.compile(r"^FLP-[A-Z]{1,8}-\d{6,}$")
-_MASKED_TITLE = "[受限对象]"   # 与 agent_tools.ontology_resolve 同一掩码文案
 UNRESOLVED_NOTE = "未确认（编号未消解，回落原值）——请经 steward 工作台确认后再作依据"
 DRAFT_NOTE = "为 draft（估算/未验证）——量产前须车间打样确认"
 
@@ -52,23 +52,15 @@ class SemAnswer:
     notes: List[str] = field(default_factory=list)
 
 
+# 行过滤/标题掩码收敛到 authz.py 单一实现（PR-B）；保留薄别名维持本模块内调用点语义
 def _row_visible(row: Dict[str, Any], acl: set, bypass_acl: bool) -> bool:
-    if bypass_acl:
-        return True
-    if row.get("data_classification") == "public":
-        return True
-    dept = row.get("owner_dept")
-    return bool(dept) and dept in acl
+    return can_read_object(row, acl=acl, bypass_acl=bypass_acl)
 
 
 def _visible_title(title: Optional[str], data_classification: Optional[str],
                    owner_dept: Optional[str], acl: set, bypass_acl: bool) -> Optional[str]:
-    """对象标题掩码（与 resolve 工具同规则）：confidential 且无归属部门权限 → 掩码。"""
-    if title is None or bypass_acl:
-        return title
-    if data_classification == "confidential" and owner_dept and owner_dept not in acl:
-        return _MASKED_TITLE
-    return title
+    return visible_title(title, data_classification, owner_dept,
+                         acl=acl, bypass_acl=bypass_acl)
 
 
 def _pick_best(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -126,6 +118,11 @@ def lookup_specs(store, target: str, *, acl_groups: Optional[Collection[str]],
         ans.notes.append(err)
         return ans
     if obj is None or obj.get("status") != "active":
+        ans.notes.append(UNRESOLVED_NOTE)
+        return ans
+    # PR-B（P0-02 验收④）：对象字段出参前先做对象级 ACL——不可读对象与"未消解"同答，
+    # 不返回 object_id/canonical_ref/title/type（掩码标题也不给：ID/ref 本身即泄露）。
+    if not can_read_object(obj, acl=acl, bypass_acl=bypass_acl):
         ans.notes.append(UNRESOLVED_NOTE)
         return ans
 

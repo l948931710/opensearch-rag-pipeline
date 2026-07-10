@@ -403,31 +403,42 @@ def test_tool_unresolved_output(tool):
     assert "无法解析" in res.content[0].text
 
 
-def test_tool_masks_confidential_title_without_acl(store):
+def test_tool_object_gate_confidential_without_acl(store):
+    """PR-B（P0-02 验收④）：解析目标不可读 → 整体降级"无法解析"，零对象字段出参
+    （不再返回掩码标题+代理号——ID/ref 即存在性泄露）。"""
     from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
     obj = store.mint_object("material", "PP-1100 特惠采购价目", owner_dept="supply",
                             data_classification="confidential")
     store.insert_identifier("material_grade", "pp-1100", "PP-1100", obj["object_id"],
                             method="seed")
     tool = OntologyResolveTool(resolver=OntologyResolver(store, embedder=None))
-    masked = tool.run(_ctx(acl=("pmc",)),
+    denied = tool.run(_ctx(acl=("pmc",)),
                       {"namespace": "material_grade", "value": "pp-1100"})
-    assert "PP-1100 特惠采购价目" not in masked.content[0].text
-    assert "[受限对象]" in masked.content[0].text
-    assert masked.receipt["canonical_ref"] == obj["canonical_ref"]   # 代理号仍可引用
+    assert "PP-1100 特惠采购价目" not in denied.content[0].text
+    assert obj["canonical_ref"] not in denied.content[0].text
+    assert denied.receipt["status"] == "unresolved"
+    assert denied.receipt["object_id"] is None
+    assert denied.receipt["canonical_ref"] is None
+    assert denied.receipt["requires_hitl"] is True
     clear = tool.run(_ctx(acl=("supply",)),
                      {"namespace": "material_grade", "value": "pp-1100"})
+    assert clear.receipt["status"] == "resolved"
     assert "PP-1100 特惠采购价目" in clear.content[0].text
 
 
-def test_tool_masks_confidential_in_candidates(store):
+def test_tool_filters_unreadable_candidates(store):
+    """PR-B：不可读候选整条不出参（含 id/ref）；有权调用方候选完整。"""
     from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
-    store.mint_object("material", "机密牌号目录", owner_dept="supply",
-                      data_classification="confidential")
+    obj = store.mint_object("material", "机密牌号目录", owner_dept="supply",
+                            data_classification="confidential")
     tool = OntologyResolveTool(resolver=OntologyResolver(store, embedder=_hash_embedder))
-    res = tool.run(_ctx(acl=("pmc",)), {"namespace": "lab_sample", "value": "机密牌号目录"})
-    assert res.receipt["status"] == "candidate"
-    assert res.receipt["candidates"][0]["title"] == "[受限对象]"
+    denied = tool.run(_ctx(acl=("pmc",)), {"namespace": "lab_sample", "value": "机密牌号目录"})
+    assert denied.receipt["candidates"] == []
+    assert obj["canonical_ref"] not in denied.content[0].text
+    allowed = tool.run(_ctx(acl=("supply",)),
+                       {"namespace": "lab_sample", "value": "机密牌号目录"})
+    assert allowed.receipt["status"] == "candidate"
+    assert allowed.receipt["candidates"][0]["title"] == "机密牌号目录"
 
 
 def test_tool_bad_value_returns_fail(tool):

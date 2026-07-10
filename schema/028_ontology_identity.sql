@@ -1,5 +1,6 @@
 -- schema/028_ontology_identity.sql
--- 库：fuling_operation
+-- 库：fuling_ontology（PR-B P0-02 独立库隔离：fuling_ro 持 fuling_operation.* 库级 SELECT，
+--     ontology 表族留在运营库时服务层 ACL 可被直连绕过——独立库不授 fuling_ro，机器可强制）
 -- 身份脊柱：别名映射（ontology_identifier）+ 候选承载层（resolution_case/candidate，外评 S2）。
 -- 取号勘误：设计文档所写 025（identifier）已被 agent v2 占用，实际取 028；见 schema/README.md 铁律 3。
 -- P0 收口修订（PR-A，P0-03/04，2026-07-10 外审）：分支未发布、仅 apply 过一次性本地库，直接修订原文件——

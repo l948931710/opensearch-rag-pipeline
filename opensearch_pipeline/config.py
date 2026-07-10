@@ -174,6 +174,10 @@ class RDSConfig:
     database: str = "fuling_knowledge"
     # 问答运营库（qa_session_log/user_feedback/escalation_ticket）；STAGING 用 fuling_operation_stg
     operation_database: str = "fuling_operation"
+    # 本体控制面独立库（schema/027-030 表族；PR-B P0-02：fuling_ro 持库级
+    # GRANT SELECT ON fuling_operation.*，ontology 表留在运营库时服务层行过滤可被
+    # 直连绕过——独立库 + 不授 fuling_ro 才是机器可强制的隔离）；STAGING 用 _stg 后缀
+    ontology_database: str = "fuling_ontology"
     charset: str = "utf8mb4"
     connect_timeout: int = 10
     read_timeout: int = 30
@@ -598,6 +602,14 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
                     f"[ENV GUARD] environment={env} 指向生产 RDS 运营库"
                     f"（RDS_OPERATION_DATABASE={config.rds.operation_database}，非 _stg 库）。"
                     f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
+        # 本体库同纪律（PR-B）：生产 host + 非 _stg 本体库 → 同源 ack
+        if not config.simulate_db and is_prod_target("rds", config.rds.host) \
+                and not config.rds.ontology_database.endswith("_stg"):
+            if not _require_ack("RAG_ALLOW_REMOTE_DB"):
+                raise EnvironmentMismatchError(
+                    f"[ENV GUARD] environment={env} 指向生产 RDS 本体库"
+                    f"（RDS_ONTOLOGY_DATABASE={config.rds.ontology_database}，非 _stg 库）。"
+                    f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
         if not config.simulate_opensearch and is_prod_target("search", search_targets) \
                 and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             if not _require_ack("RAG_ALLOW_REMOTE_SEARCH"):
@@ -635,6 +647,8 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
         # 会明文写进生产运营库，污染生产审计流水。运营库未切 _stg 一律 fail-fast。
         if not config.simulate_db and not config.rds.operation_database.endswith("_stg"):
             problems.append(f"RDS_OPERATION_DATABASE 必须以 _stg 结尾（当前 {config.rds.operation_database}）")
+        if not config.simulate_db and not config.rds.ontology_database.endswith("_stg"):
+            problems.append(f"RDS_ONTOLOGY_DATABASE 必须以 _stg 结尾（当前 {config.rds.ontology_database}）")
         if not config.simulate_opensearch and config.alibaba_vector.endpoint \
                 and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             problems.append(f"HA3_TABLE_NAME 必须以 _stg 或 _s 结尾"
@@ -753,6 +767,7 @@ def load_config() -> PipelineConfig:
             password=_env("RDS_PASSWORD"),
             database=_env("RDS_DATABASE", "fuling_knowledge"),
             operation_database=_env("RDS_OPERATION_DATABASE", "fuling_operation"),
+            ontology_database=_env("RDS_ONTOLOGY_DATABASE", "fuling_ontology"),
         ),
 
         opensearch=OpenSearchConfig(

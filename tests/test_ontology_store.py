@@ -29,7 +29,7 @@ def _rds_ready() -> bool:
         if cfg.rds.host not in _LOCAL_HOSTS or is_prod_target("rds", cfg.rds.host):
             return False
         conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
-                               password=cfg.rds.password, database=cfg.rds.operation_database,
+                               password=cfg.rds.password, database=cfg.rds.ontology_database,
                                autocommit=True, connect_timeout=3)
         with conn.cursor() as cur:
             cur.execute(
@@ -54,7 +54,7 @@ def _cleanup_rds():
     from opensearch_pipeline.config import get_config
     cfg = get_config()
     conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
-                           password=cfg.rds.password, database=cfg.rds.operation_database,
+                           password=cfg.rds.password, database=cfg.rds.ontology_database,
                            autocommit=True, connect_timeout=3)
     like = _MARK + "%"
     with conn.cursor() as cur:
@@ -470,7 +470,7 @@ def test_rds_global_unique_ref_and_type_code():
     from opensearch_pipeline.config import get_config
     cfg = get_config()
     conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
-                           password=cfg.rds.password, database=cfg.rds.operation_database,
+                           password=cfg.rds.password, database=cfg.rds.ontology_database,
                            autocommit=True, connect_timeout=3)
     store = RDSOntologyStore()
     obj = _mint(store)

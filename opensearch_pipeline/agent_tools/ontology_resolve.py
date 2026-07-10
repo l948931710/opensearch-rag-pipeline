@@ -7,8 +7,11 @@ ontology_resolve.py — 身份解析工具（本体 P0；docs/ontology_p0_plan_2
 PR8）。`intent` 不是模型可设参数：本工具恒 `read`（`additionalProperties:false` 拒伪造）——
 模型没有任何通道把"写意图"塞进解析来诱导 auto 放行。
 
-密级掩码在**本层**按 ctx 做（服务层 resolver 不感知身份）：confidential 对象且调用者
-acl_groups 不含 owner_dept → title 掩码，只回 canonical_ref 代理号。
+对象级 ACL 在**本层**按 ctx 做（服务层 resolver 不感知身份），规则收敛于
+ontology.authz（PR-B，P0-02 验收④）：解析目标对调用者不可读（internal/confidential
+且 owner_dept ∉ acl_groups）→ 整体降级为"无法解析"，**不返回 object_id/
+canonical_ref/title/type**（ID/ref 本身即存在性泄露，"无害代理号"论已被外审否决）；
+候选列表同样先过 can_read_object 再出参。
 
 ⚠️ 本工具**刻意不进 build_default_registry**——接线与系统提示词/L7 基线重冻集中在 PR13
 一次完成（tests/test_ontology_resolve.py 有未接线守护）。
@@ -26,8 +29,6 @@ from opensearch_pipeline.agent_runtime.tool import (
 
 if TYPE_CHECKING:
     from opensearch_pipeline.agent_runtime.context import ExecutionContext
-
-_MASKED_TITLE = "[受限对象]"
 
 _INPUT_SCHEMA = {
     "type": "object",
@@ -98,20 +99,25 @@ class OntologyResolveTool:
         return ToolResult.ok(content=content, receipt=receipt)
 
 
-def _visible_title(title: Optional[str], data_classification: Optional[str],
-                   owner_dept: Optional[str], acl: set) -> Optional[str]:
-    """confidential 且无归属部门权限 → 掩码（canonical_ref 是无害代理号，保留可引用）。"""
-    if title is None:
-        return None
-    if data_classification == "confidential" and owner_dept and owner_dept not in acl:
-        return _MASKED_TITLE
-    return title
-
-
 def _format_result(res, acl: set):
+    from opensearch_pipeline.ontology.authz import can_read_object, visible_title
+
     lines: List[str] = []
+    resolved_readable = res.status == "resolved" and can_read_object(
+        {"data_classification": res.data_classification, "owner_dept": res.owner_dept},
+        acl=acl)
+    # PR-B（P0-02 验收④）：解析目标不可读 → 与"无法解析"同答，零对象字段出参
+    if res.status == "resolved" and not resolved_readable:
+        lines.append(f"编号 {res.raw_value!r} 无法解析：无正式映射、无可用候选。"
+                     "请确认输入是否正确，或提交 steward 登记。")
+        receipt = {"status": "unresolved", "namespace": res.namespace,
+                   "norm_value": res.norm_value, "object_id": None, "canonical_ref": None,
+                   "target_revision": None, "confidence": 0.0, "method": None,
+                   "requires_hitl": True, "candidates": []}
+        return [ContentBlock.of_text("\n".join(lines))], receipt
+
     if res.status == "resolved":
-        title = _visible_title(res.title, res.data_classification, res.owner_dept, acl)
+        title = visible_title(res.title, res.data_classification, res.owner_dept, acl=acl)
         rev = f"（版本 {res.target_revision}）" if res.target_revision else ""
         lines.append(f"已解析：{title or res.canonical_ref} [{res.canonical_ref}]{rev}，"
                      f"类型 {res.object_type}，置信 1.00（正式映射）。")
@@ -124,7 +130,11 @@ def _format_result(res, acl: set):
 
     shown: List[Dict[str, Any]] = []
     for c in res.candidates[:3]:
-        title = _visible_title(c.title, c.data_classification, c.owner_dept, acl)
+        # 候选同样先过对象级 ACL——不可读候选整条不出参（含 id/ref）
+        if not can_read_object({"data_classification": c.data_classification,
+                                "owner_dept": c.owner_dept}, acl=acl):
+            continue
+        title = visible_title(c.title, c.data_classification, c.owner_dept, acl=acl)
         if res.status != "resolved":
             lines.append(f"- {title or c.canonical_ref} [{c.canonical_ref}] "
                          f"置信 {c.confidence:.2f}（来源 {c.method}）")

@@ -45,6 +45,8 @@ def _build_cfg(*, ha3_table: str, rds_db: str = "fuling_knowledge_stg",
         database=rds_db, charset="utf8mb4",
         # #F-staging-opdb 运营库也必须切 _stg，否则 staging 会写进生产运营库
         operation_database="fuling_operation_stg",
+        # PR-B：本体库同纪律
+        ontology_database="fuling_ontology_stg",
     )
     cfg.alibaba_vector = AlibabaVectorSearchConfig(
         endpoint="ha-cn-kgl4slr1n01.public.ha.aliyuncs.com",

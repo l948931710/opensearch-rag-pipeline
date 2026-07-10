@@ -70,6 +70,7 @@ class TestStagingTestLabelGuards:
         cfg = _fresh_load(RAG_ENVIRONMENT="staging", RAG_SIMULATE="false",
                           RAG_RDS_HOST=PROD_RDS, RAG_RDS_DATABASE="fuling_knowledge_stg",
                           RAG_RDS_OPERATION_DATABASE="fuling_operation_stg",
+                          RAG_RDS_ONTOLOGY_DATABASE="fuling_ontology_stg",
                           RAG_HA3_ENDPOINT=PROD_HA3, RAG_HA3_TABLE_NAME="fuling_kb_chunks_stg",
                           RAG_DASHSCOPE_API_KEY="x")
         assert cfg.rds.database.endswith("_stg")
@@ -85,6 +86,19 @@ class TestStagingTestLabelGuards:
             _fresh_load(**kw)
         cfg = _fresh_load(**kw, RAG_ALLOW_REMOTE_DB="read_only_ack")
         assert cfg.rds.operation_database == "fuling_operation"
+
+    def test_staging_prod_ontology_db_needs_ack(self):
+        """PR-B：staging + _stg 主库/运营库，但本体库仍是生产 fuling_ontology → 需 ack。"""
+        kw = dict(RAG_ENVIRONMENT="staging", RAG_SIMULATE="false",
+                  RAG_RDS_HOST=PROD_RDS, RAG_RDS_DATABASE="fuling_knowledge_stg",
+                  RAG_RDS_OPERATION_DATABASE="fuling_operation_stg",
+                  RAG_RDS_ONTOLOGY_DATABASE="fuling_ontology",
+                  RAG_HA3_ENDPOINT=PROD_HA3, RAG_HA3_TABLE_NAME="fuling_kb_chunks_stg",
+                  RAG_DASHSCOPE_API_KEY="x")
+        with pytest.raises(EnvironmentMismatchError, match=r"RDS_ONTOLOGY_DATABASE"):
+            _fresh_load(**kw)
+        cfg = _fresh_load(**kw, RAG_ALLOW_REMOTE_DB="read_only_ack")
+        assert cfg.rds.ontology_database == "fuling_ontology"
 
 
 class TestVendorGuardFingerprintTrigger:

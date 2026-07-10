@@ -1,5 +1,6 @@
 -- schema/029_ontology_link.sql
--- 库：fuling_operation
+-- 库：fuling_ontology（PR-B P0-02 独立库隔离：fuling_ro 持 fuling_operation.* 库级 SELECT，
+--     ontology 表族留在运营库时服务层 ACL 可被直连绕过——独立库不授 fuling_ro，机器可强制）
 -- 本体关系（Palantir Link Types 语义的最小自建形态）：sku_of_product / mold_of_product /
 -- material_of_product 等。P0 只建结构 + 播种期写 sku_of_product；revision-diff、BOM 串味
 -- 检测等富语义在 P2。取号勘误：文档所写 026 已被 agent v2 占用，实际取 029。

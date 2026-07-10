@@ -175,19 +175,19 @@ def test_confirm_scope_authz(store):
     no_scope = _client(_identity(user_id="d2", role="dept_admin", managed=("finance",)))
     r = no_scope.post(f"/api/ontology/cases/{case_id}/confirm",
                       json={"target_object_id": obj["object_id"]})
-    assert r.status_code == 403
+    assert r.status_code == 404           # PR-B：scope 外与不存在同答（防存在性泄露）
     kb = _client(_identity(user_id="root", role="kb_admin"))
     assert kb.post(f"/api/ontology/cases/{case_id}/confirm",
                    json={"target_object_id": obj["object_id"]}).status_code == 200
 
 
 def test_confirm_unscoped_namespace_fail_closed(store):
-    """scope 未登记（lot_code 无种子）→ dept_admin 403、kb_admin 放行。"""
+    """scope 未登记（lot_code 无种子）→ dept_admin 404（PR-B：scope 外同不存在）、kb_admin 放行。"""
     obj = store.mint_object("product", "托盘", owner_dept="pmc")
     case_id = store.upsert_case("lot_code", "lt1", "LT1", object_type_hint=None)
     dept = _client(_identity(user_id="d3", role="dept_admin", managed=("pmc",)))
     assert dept.post(f"/api/ontology/cases/{case_id}/confirm",
-                     json={"target_object_id": obj["object_id"]}).status_code == 403
+                     json={"target_object_id": obj["object_id"]}).status_code == 404
     kb = _client(_identity(user_id="root", role="kb_admin"))
     assert kb.post(f"/api/ontology/cases/{case_id}/confirm",
                    json={"target_object_id": obj["object_id"]}).status_code == 200
@@ -326,3 +326,79 @@ def test_mark_duplicate_validation(store):
                   json={"merged_into": "nope"}).status_code == 404
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
                   json={"merged_into": b["object_id"]}).status_code == 409   # 目标非 active
+
+
+# ── PR-B（P0-01）：对象级 ACL / 存在性不可泄露矩阵 ─────────────────────────────
+
+
+def test_existence_non_leak_matrix(store):
+    """员工 / 无关 dept_admin / 相关 dept_admin / kb_admin × 队列/case 详情/对象搜索/详情。
+    核心不变量：无权者拿到的响应与"资源不存在"逐位一致（404 / 空列表）。"""
+    obj, case_id = _seed_case(store)                     # steward=pmc, obj internal owner=pmc
+    conf = store.mint_object("material", "机密料", owner_dept="supply",
+                             data_classification="confidential")
+    # 员工：读侧一律 403（连队列入口都没有）
+    emp = _client(_identity(user_id="e1", role="employee"))
+    assert emp.get("/api/ontology/workbench").status_code == 403
+    # 无关 dept_admin（finance）：队列空、case/对象 404、搜索不见
+    other = _client(_identity(user_id="dx", role="dept_admin", managed=("finance",)))
+    assert other.get("/api/ontology/workbench").json()["items"] == []
+    assert other.get(f"/api/ontology/cases/{case_id}").status_code == 404
+    assert other.get(f"/api/ontology/objects/{obj['object_id']}").status_code == 404
+    assert other.get("/api/ontology/objects?object_type=material").json()["items"] == []
+    # 相关 dept_admin（pmc）：本 scope 可见；跨部门 confidential 仍 404
+    mine = _client(_identity(user_id="dp", role="dept_admin", managed=("pmc",)))
+    assert len(mine.get("/api/ontology/workbench").json()["items"]) == 1
+    assert mine.get(f"/api/ontology/cases/{case_id}").status_code == 200
+    assert mine.get(f"/api/ontology/objects/{obj['object_id']}").status_code == 200
+    assert mine.get(f"/api/ontology/objects/{conf['object_id']}").status_code == 404
+    # kb_admin：全可见
+    root = _client(_identity(user_id="root", role="kb_admin"))
+    assert root.get(f"/api/ontology/objects/{conf['object_id']}").status_code == 200
+    assert len(root.get("/api/ontology/workbench").json()["items"]) == 1
+
+
+def test_workbench_candidate_cross_dept_target_masked(store):
+    """case 可见但候选目标跨部门不可读 → target_visible=False，ref/title/type 全空。"""
+    conf = store.mint_object("material", "机密牌号", owner_dept="supply",
+                             data_classification="confidential")
+    case_id = store.upsert_case("u8", "m9", "M9", object_type_hint="product")
+    store.add_candidate(case_id, conf["object_id"], method="embedding", confidence=0.8)
+    mine = _client(_identity(user_id="dp", role="dept_admin", managed=("pmc",)))
+    detail = mine.get(f"/api/ontology/cases/{case_id}").json()
+    cand = detail["candidates"][0]
+    assert cand["target_visible"] is False
+    assert cand["canonical_ref"] is None and cand["title"] is None
+    assert cand["object_type"] is None
+
+
+def test_confirm_cross_dept_confidential_target_denied(store):
+    """P0-01 原始场景：营销 steward 不能把客户编号映射到供应链 confidential material。"""
+    conf = store.mint_object("material", "机密料", owner_dept="supply",
+                             data_classification="confidential")
+    case_id = store.upsert_case("customer:KFC", "K1", "K1", object_type_hint=None)
+    mkt = _client(_identity(user_id="mk", role="dept_admin", managed=("marketing",)))
+    r = mkt.post(f"/api/ontology/cases/{case_id}/confirm",
+                 json={"target_object_id": conf["object_id"]})
+    assert r.status_code == 404                          # 目标不可见 = 不存在
+    assert store.get_active_identifier("customer:KFC", "K1") is None
+
+
+def test_confirm_type_mismatch_denied(store):
+    """case 期望类型与目标不一致 → 400（product hint 不能确认到 material）。"""
+    obj = store.mint_object("material", "PP料", owner_dept="pmc")
+    case_id = store.upsert_case("u8", "m1", "M1", object_type_hint="product")
+    r = _client(_identity()).post(f"/api/ontology/cases/{case_id}/confirm",
+                                  json={"target_object_id": obj["object_id"]})
+    assert r.status_code == 400 and "类型" in r.json()["detail"]
+
+
+def test_repoint_cross_type_denied(store):
+    """改指跨类型默认拒（旧目标 product → 新目标 material = 400）。"""
+    a = store.mint_object("product", "甲", owner_dept="pmc")
+    m = store.mint_object("material", "PP料", owner_dept="pmc")
+    iid = store.insert_identifier("u8", "z9", "Z9", a["object_id"], method="seed")
+    r = _client(_identity()).post(f"/api/ontology/identifiers/{iid}/repoint",
+                                  json={"target_object_id": m["object_id"]})
+    assert r.status_code == 400 and "类型" in r.json()["detail"]
+    assert store.get_active_identifier("u8", "Z9")["target_object_id"] == a["object_id"]

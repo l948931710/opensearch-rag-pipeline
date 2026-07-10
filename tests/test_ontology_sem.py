@@ -31,7 +31,7 @@ def _rds_ready() -> bool:
         if cfg.rds.host not in _LOCAL_HOSTS or is_prod_target("rds", cfg.rds.host):
             return False
         conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
-                               password=cfg.rds.password, database=cfg.rds.operation_database,
+                               password=cfg.rds.password, database=cfg.rds.ontology_database,
                                autocommit=True, connect_timeout=3)
         with conn.cursor() as cur:
             cur.execute(
@@ -61,7 +61,7 @@ def _cleanup_rds():
     from opensearch_pipeline.config import get_config
     cfg = get_config()
     conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
-                           password=cfg.rds.password, database=cfg.rds.operation_database,
+                           password=cfg.rds.password, database=cfg.rds.ontology_database,
                            autocommit=True, connect_timeout=3)
     like = _MARK + "%"
     with conn.cursor() as cur:
@@ -210,7 +210,7 @@ def test_rds_view_and_inline_parity(monkeypatch):
 
 def test_lookup_by_object_id_happy(mstore):
     built = _build_sku(mstore, packing=("verified",), stacking=("verified",))
-    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc",))
+    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc", "marketing"))
     assert ans.resolved and ans.sku["canonical_ref"] == built["sku"]["canonical_ref"]
     assert ans.specs["packing"]["per_box"] == "50"
     assert ans.specs["stacking"]["stack_mode"] == "口对口"
@@ -220,7 +220,7 @@ def test_lookup_by_object_id_happy(mstore):
 
 def test_lookup_verified_beats_draft(mstore):
     built = _build_sku(mstore, packing=("draft", "verified", "draft"))
-    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc",),
+    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc", "marketing"),
                        domains=("packing",))
     assert ans.specs["packing"]["spec_state"] == "verified"
     assert ans.spec_counts["packing"] == 3
@@ -229,7 +229,7 @@ def test_lookup_verified_beats_draft(mstore):
 
 def test_lookup_draft_only_notes_estimate(mstore):
     built = _build_sku(mstore, packing=("draft",))
-    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc",),
+    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc", "marketing"),
                        domains=("packing",))
     assert ans.specs["packing"]["spec_state"] == "draft"
     assert any("打样" in n for n in ans.notes)
@@ -238,11 +238,12 @@ def test_lookup_draft_only_notes_estimate(mstore):
 def test_lookup_by_canonical_ref_and_raw_alias(mstore):
     built = _build_sku(mstore)
     ref = built["sku"]["canonical_ref"]
-    assert lookup_specs(mstore, ref, acl_groups=("pmc",)).resolved
-    assert lookup_specs(mstore, ref.lower(), acl_groups=("pmc",)).resolved   # 大小写宽容
+    grp = ("pmc", "marketing")
+    assert lookup_specs(mstore, ref, acl_groups=grp).resolved
+    assert lookup_specs(mstore, ref.lower(), acl_groups=grp).resolved   # 大小写宽容
     mstore.insert_identifier("u8", "LX620-50", "LX620-50", built["sku"]["object_id"],
                              method="manual", confidence=1.0)
-    ans = lookup_specs(mstore, "lx620-50", namespace="u8", acl_groups=("pmc",))
+    ans = lookup_specs(mstore, "lx620-50", namespace="u8", acl_groups=grp)
     assert ans.resolved and ans.specs["packing"] is not None
 
 
@@ -260,21 +261,27 @@ def test_raw_without_namespace_needs_ns(mstore):
 def test_acl_row_filter_fail_closed(mstore):
     built = _build_sku(mstore, spec_cls="internal", spec_dept="pmc")
     sku_id = built["sku"]["object_id"]
-    for groups in (None, (), ("marketing",)):
+    # PR-B 对象门（P0-02 验收④）：连 SKU 本体都不可读（internal, owner=marketing）→
+    # 整体未消解，零对象字段出参——不再是"resolved 但 spec None"
+    for groups in (None, ()):
         ans = lookup_specs(mstore, sku_id, acl_groups=groups, domains=("packing",))
-        assert ans.resolved and ans.specs["packing"] is None
-        assert ans.spec_counts["packing"] == 0
-    assert lookup_specs(mstore, sku_id, acl_groups=("pmc",),
+        assert not ans.resolved and ans.sku is None
+        assert UNRESOLVED_NOTE in ans.notes
+    # SKU 可读（marketing）但 spec 行不可读（pmc internal）→ resolved + spec None（行过滤）
+    ans = lookup_specs(mstore, sku_id, acl_groups=("marketing",), domains=("packing",))
+    assert ans.resolved and ans.specs["packing"] is None
+    assert ans.spec_counts["packing"] == 0
+    assert lookup_specs(mstore, sku_id, acl_groups=("pmc", "marketing"),
                         domains=("packing",)).specs["packing"] is not None
     assert lookup_specs(mstore, sku_id, acl_groups=None, bypass_acl=True,
                         domains=("packing",)).specs["packing"] is not None
 
 
 def test_public_spec_visible_to_all(mstore):
-    built = _build_sku(mstore, spec_cls="public")
+    built = _build_sku(mstore, spec_cls="public", sku_cls="public")
     ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=(),
                        domains=("packing",))
-    assert ans.specs["packing"] is not None
+    assert ans.resolved and ans.specs["packing"] is not None
 
 
 def test_missing_and_denied_indistinguishable():
@@ -292,18 +299,24 @@ def test_missing_and_denied_indistinguishable():
 
 def test_product_target_notes_non_sku(mstore):
     built = _build_sku(mstore)
-    ans = lookup_specs(mstore, built["product"]["object_id"], acl_groups=("pmc",))
+    ans = lookup_specs(mstore, built["product"]["object_id"], acl_groups=("marketing",))
     assert ans.resolved and ans.specs == {}
     assert any("非 SKU" in n for n in ans.notes)
 
 
-def test_confidential_sku_title_masked(mstore):
+def test_confidential_sku_object_gate(mstore):
+    """PR-B（P0-02 验收④）：confidential SKU 对无权调用方整体不可见——不再返回
+    掩码标题+代理号（ID/ref 本身即存在性泄露，外审否决"无害代理号"论）。"""
     built = _build_sku(mstore, sku_cls="confidential", spec_cls="public")
     ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=(),
                        domains=("packing",))
-    assert ans.sku["title"] == "[受限对象]"
-    assert ans.sku["canonical_ref"] == built["sku"]["canonical_ref"]   # 代理号保留可引用
-    assert ans.specs["packing"] is not None                            # public spec 不受掩码影响
+    assert not ans.resolved and ans.sku is None
+    assert UNRESOLVED_NOTE in ans.notes and ans.specs == {}
+    # 归属部门可读：全字段出参
+    ok = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("marketing",),
+                      domains=("packing",))
+    assert ok.resolved and ok.sku["canonical_ref"] == built["sku"]["canonical_ref"]
+    assert ok.specs["packing"] is not None
 
 
 def test_unknown_domain_raises(mstore):
