@@ -118,3 +118,14 @@ release-gate: ## 部署前评测闸(dim9 闭环): run→auto-judge→merge --str
 eval-baseline-freeze: ## 冻结评测基线(首次可接受 gate 后一次性): make eval-baseline-freeze RESULTS=<rundir>/report.json
 	@test -n "$(RESULTS)" || { echo "用法: make eval-baseline-freeze RESULTS=<rundir>/report.json"; exit 2; }
 	$(RAG_PY) -m eval_harness.run_eval baseline-freeze --results "$(RESULTS)" --baseline eval_harness/goldset/baseline.json
+
+# ── agent 评测门(L7)：模型行为基线(工具触发/克制/审批触发/答案落地) — 见 eval_harness/agent/runner.py ──
+agent-eval: ## agent 行为评测(live 真模型,零 DB;需 DashScope key)
+	$(RAG_PY) -m eval_harness.agent.runner --provider live
+
+agent-eval-gate: ## agent 评测出闸:对冻结基线,硬不变量恒 1.0;exit 2=破门
+	$(RAG_PY) -m eval_harness.agent.runner --provider live --gate
+
+agent-eval-baseline-freeze: ## 冻结 agent 评测基线: make agent-eval-baseline-freeze RESULTS=eval_harness/reports/agent_eval_<ts>.json
+	@test -n "$(RESULTS)" || { echo "用法: make agent-eval-baseline-freeze RESULTS=<report.json>"; exit 2; }
+	$(RAG_PY) -m eval_harness.agent.runner --freeze-baseline "$(RESULTS)"
