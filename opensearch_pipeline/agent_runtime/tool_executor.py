@@ -25,7 +25,12 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Dict, Optional
 
 from opensearch_pipeline.agent_runtime.audit import NULL_AUDIT, AuditWriteError
-from opensearch_pipeline.agent_runtime.tool import EnterpriseTool, RiskLevel, ToolResult
+from opensearch_pipeline.agent_runtime.tool import (
+    ContentBlock,
+    EnterpriseTool,
+    RiskLevel,
+    ToolResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +94,27 @@ class ToolExecutor:
                 idempotency_key: Optional[str] = None) -> ToolResult:
         spec = tool.spec
         # 1. 幂等（key_required）：已成功同键 → 复用回执，不重复副作用
-        if spec.idempotency == "key_required" and idempotency_key:
+        if spec.idempotency == "key_required":
+            if not idempotency_key:
+                # 契约唯一强制点：key 缺失绝不能静默放行（NULL 键 uk_tool_idem 不去重，
+                # 幂等契约在最需要它的地方形同虚设——深度审查 C 组）。
+                self._store.record_invocation(
+                    run_id, step_no, tool_name=spec.name, tool_version=spec.version,
+                    args_json=json.dumps(args, ensure_ascii=False), args_digest=digest(args),
+                    idempotency_key=None, status="denied",
+                    policy_decision=policy_decision, policy_id=policy_id)
+                return ToolResult.fail(
+                    f"工具 {spec.name} 声明 idempotency=key_required 但未提供幂等键，拒绝执行")
             hit = self._store.find_succeeded_invocation(spec.name, idempotency_key)
             if hit:
                 logger.info("工具 %s 幂等命中，复用回执", spec.name)
                 receipt = json.loads(hit["receipt_json"]) if hit.get("receipt_json") else None
-                return ToolResult.ok(receipt=receipt)
+                # 命中必须回**有内容**的 tool 结果——空 content 让模型收到空 tool 消息，
+                # 不知道操作其实已成功，会道歉/重试/编造。
+                text = "（幂等命中）该操作此前已成功执行，本次未重复执行。"
+                if receipt:
+                    text += f" 回执: {json.dumps(receipt, ensure_ascii=False)}"
+                return ToolResult.ok(content=[ContentBlock.of_text(text)], receipt=receipt)
         # 2. 熔断
         if self._breaker.is_open(spec.name):
             return ToolResult.fail(f"工具 {spec.name} 熔断打开，暂不可用")
@@ -119,20 +139,15 @@ class ToolExecutor:
             self._store.finish_invocation(inv_id, status="failed",
                                           error_text=f"audit-blocked: {e}"[:500])
             return ToolResult.fail("审计不可用，高风险操作已阻断")
-        # 3-4. 超时 + 重试
+        # 3-4. 超时 + 重试。⚠️ try 只包工具执行本体：finish_invocation 落库异常绝不能被
+        # 当成"工具失败"而重跑**已产生副作用**的工具（深度审查 C 组）。
         attempts = max(1, spec.max_retries + 1)
         last_exc: Optional[Exception] = None
+        result: Optional[ToolResult] = None
         for i in range(attempts):
             try:
                 result = self._run_with_timeout(tool, ctx, args, idempotency_key, spec.timeout_s)
-                self._breaker.record_ok(spec.name)
-                st = "succeeded" if result.status == "succeeded" else "failed"
-                self._store.finish_invocation(
-                    inv_id, status=st,
-                    result_digest=digest([b.model_dump() for b in result.content]) if result.content else None,
-                    receipt_json=json.dumps(result.receipt, ensure_ascii=False) if result.receipt else None,
-                    error_text=result.error)
-                return result
+                break
             except FuturesTimeout:
                 last_exc = TimeoutError(f"工具 {spec.name} 超时 {spec.timeout_s}s")
                 self._breaker.record_fail(spec.name)
@@ -144,10 +159,37 @@ class ToolExecutor:
                     logger.warning("工具 %s 可重试错误，重试 %d/%d: %s", spec.name, i + 1, attempts - 1, e)
                     continue
                 break
+        if result is not None:
+            # 熔断按 result.status 计数——不能"没抛异常就 record_ok"：catch-all 工具
+            # （如 knowledge_search）内部吞异常返 ToolResult.fail，无条件 record_ok 会把
+            # 失败计数清零，熔断器永远打不开（深度审查 C 组）。denied/pending 不计。
+            if result.status == "succeeded":
+                self._breaker.record_ok(spec.name)
+            elif result.status == "failed":
+                self._breaker.record_fail(spec.name)
+            st = "succeeded" if result.status == "succeeded" else "failed"
+            try:
+                self._store.finish_invocation(
+                    inv_id, status=st,
+                    result_digest=digest([b.model_dump() for b in result.content]) if result.content else None,
+                    receipt_json=json.dumps(result.receipt, ensure_ascii=False) if result.receipt else None,
+                    error_text=result.error)
+            except Exception:   # noqa: BLE001 — trace 落库失败：结果照常返回，绝不重跑工具
+                logger.warning("tool_invocation 收尾落库失败（结果照常返回）", exc_info=True)
+            return result
         err = (str(last_exc)[:500] if last_exc else "unknown")
-        self._store.finish_invocation(inv_id, status="failed", error_text=err)
+        try:
+            self._store.finish_invocation(inv_id, status="failed", error_text=err)
+        except Exception:   # noqa: BLE001
+            logger.warning("tool_invocation 失败收尾落库失败", exc_info=True)
         return ToolResult.fail(f"工具执行失败: {err}")
 
     def _run_with_timeout(self, tool, ctx, args, idempotency_key, timeout_s):
         fut = _get_timeout_pool().submit(tool.run, ctx, args, idempotency_key)
-        return fut.result(timeout=timeout_s)           # 超时抛 FuturesTimeout
+        try:
+            return fut.result(timeout=timeout_s)       # 超时抛 FuturesTimeout
+        except FuturesTimeout:
+            # 仍在排队的任务 cancel 掉——否则超时判定后照样真执行（账面 failed、副作用事后
+            # 发生的"幽灵执行"）；已在跑的线程杀不掉（B1 硬伤，见模块 docstring）。
+            fut.cancel()
+            raise

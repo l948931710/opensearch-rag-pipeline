@@ -85,5 +85,5 @@ def test_toolcall_proposed_is_proposal_only():
     # 语义确认：事件只带提案参数，不带执行结果（结果经 B2 回注通道，不在事件流）
     ev = ToolCallProposed(call_id="c1", tool_name="u8_writeback", arguments={"qty": 5})
     d = dump_event(ev)
-    # turn_index 是提案元数据（第几个模型轮），非执行结果——仍无结果字段
-    assert set(d.keys()) == {"type", "call_id", "tool_name", "arguments", "turn_index"}
+    # turn_index/usage 是提案元数据（第几个模型轮 + 该轮模型用量），非执行结果——仍无结果字段
+    assert set(d.keys()) == {"type", "call_id", "tool_name", "arguments", "turn_index", "usage"}

@@ -58,6 +58,9 @@ class ToolCallProposed(AgentEvent):
     tool_name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
     turn_index: int = 0        # 该提案属第几个模型轮（driver 据此每轮计一次 turn 预算；同批多 call 同值）
+    # 产生本提案的模型轮 usage（loop 只挂在同批**第一个** call 上，其余为零值）——
+    # driver 据此逐轮累加 token 预算；没有它，中间轮 usage 被丢弃、token_budget 全链无比较点。
+    usage: Usage = Field(default_factory=Usage)
 
 
 class RunSuspended(AgentEvent):

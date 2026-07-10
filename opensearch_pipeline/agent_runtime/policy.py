@@ -129,18 +129,30 @@ def make_adjudicator(registry: "ToolRegistry", policy: PolicyEngine, run_store,
     adjudicator 内部自取 step_no（append 一条 tool_call agent_step），故 executor 契约不变。
     audit（可选 AuditLog）透传给 ToolExecutor——执行前写合规审计（HIGH_WRITE fail-closed）。
     """
+    from opensearch_pipeline.agent_runtime.audit import NULL_AUDIT
     from opensearch_pipeline.agent_runtime.registry import ToolDisabled, ToolNotFound
     from opensearch_pipeline.agent_runtime.run_store import AgentStep
     from opensearch_pipeline.agent_runtime.tool import ToolArgsError, ToolResult
     from opensearch_pipeline.agent_runtime.tool_executor import ToolExecutor, digest
 
     tool_executor = ToolExecutor(run_store, audit=audit)
+    audit_log = audit or NULL_AUDIT
 
     def _rec(ctx, step_no, ev, version, status, decision, policy_id):
         run_store.record_invocation(
             ctx.run_id, step_no, tool_name=ev.tool_name, tool_version=version,
             args_json=json.dumps(ev.arguments, ensure_ascii=False), args_digest=digest(ev.arguments),
             idempotency_key=None, status=status, policy_decision=decision, policy_id=policy_id)
+
+    def _audit_verdict(ctx, ev, decision, policy_id, risk=None):
+        """deny / pending_approval 也入合规审计（此前只记 ALLOW authorized→审计半盲）。fail-open。"""
+        try:
+            audit_log.record(
+                ctx, event_type="tool_call", action=ev.tool_name, decision=decision,
+                risk_level=risk, policy_id=policy_id, args_digest=digest(ev.arguments),
+                run_id=ctx.run_id, fail_closed=False)
+        except Exception:   # noqa: BLE001 — 非执行路径的审计失败不阻断
+            pass
 
     def _adjudicate(ctx: "ExecutionContext", ev: "ToolCallProposed") -> "ToolResult":
         step_no = run_store.append_step(ctx.run_id, AgentStep(
@@ -153,28 +165,43 @@ def make_adjudicator(registry: "ToolRegistry", policy: PolicyEngine, run_store,
             return ToolResult.fail(f"未知工具: {ev.tool_name}")
         except ToolDisabled:
             _rec(ctx, step_no, ev, "?", "denied", "disabled", "registry.disabled")
+            _audit_verdict(ctx, ev, "denied", "registry.disabled")
             return ToolResult.denied(f"工具已停用: {ev.tool_name}")
         try:
             tool.spec.validate_args(ev.arguments)     # 伪造越权参数在此被拒
         except ToolArgsError as e:
             _rec(ctx, step_no, ev, tool.spec.version, "denied", "schema", "schema.invalid")
+            _audit_verdict(ctx, ev, "denied", "schema.invalid", tool.spec.risk_level.value)
             return ToolResult.denied(f"参数校验失败: {e}")
         decision = policy.authorize_tool_call(ctx, tool.spec, ev.arguments)
         pdecision = decision.decision
         if pdecision == "deny":
             _rec(ctx, step_no, ev, tool.spec.version, "denied", "deny", decision.policy_id)
+            _audit_verdict(ctx, ev, "denied", decision.policy_id, tool.spec.risk_level.value)
             return ToolResult.denied(decision.reason)
         if pdecision == "require_approval":
-            # WS3：命中审批。approvals 里有本 (run_id, call_id) → 人工已批准 → 绕过挂起直接执行；
-            # 否则真正挂起——loop 侧 yield RunSuspended（本函数只落 pending_approval trace + 回 pending）。
-            approved = approvals.get(f"{ctx.run_id}:{ev.call_id}") if approvals else None
-            if not approved:
+            # WS3：命中审批。凭据（ApprovalGrant）**一次性消费**（pop——用后即销毁，绝不复用）
+            # 且必须绑定 (tool_name, args_digest)：模型复用 call_id / 改参重放 → 凭据不匹配 →
+            # 重新挂起。否则一次批准可放行同 run 内任意后续 HIGH_WRITE（深度审查 A 组 P1）。
+            grant = approvals.pop(f"{ctx.run_id}:{ev.call_id}", None) if approvals else None
+            if grant is not None and (
+                    getattr(grant, "tool_name", None) != ev.tool_name
+                    or getattr(grant, "args_digest", None) != digest(ev.arguments)):
+                grant = None                          # 凭据与实际调用不符 → 作废，重新挂起
+            if grant is None:
                 _rec(ctx, step_no, ev, tool.spec.version, "pending_approval", "require_approval",
                      decision.policy_id)
+                _audit_verdict(ctx, ev, "pending_approval", decision.policy_id,
+                               tool.spec.risk_level.value)
                 return ToolResult.pending()
             pdecision = "approved"
-        # ALLOW / 已批准 → 经中间件栈执行（超时/重试/幂等/熔断 + 记 executing→result）
-        idem = f"{ctx.run_id}:{step_no}" if tool.spec.idempotency == "key_required" else None
+        # ALLOW / 已批准 → 经中间件栈执行（超时/重试/幂等/熔断 + 记 executing→result）。
+        # 幂等键按**逻辑调用**派生（run_id:call_id）：step_no 每裁决 MAX+1 新生成，
+        # 用它做键任何重放/重试永远 miss，幂等层整层空转（深度审查 C 组 P1）。
+        # call_id 缺失（gateway 对缺失兜底空串）→ 退化为按参数摘要派生，仍跨重放稳定。
+        idem = None
+        if tool.spec.idempotency == "key_required":
+            idem = f"{ctx.run_id}:{ev.call_id or digest(ev.arguments)}"
         return tool_executor.execute(ctx, tool, ev.arguments, run_id=ctx.run_id, step_no=step_no,
                                      policy_decision=pdecision, policy_id=decision.policy_id,
                                      idempotency_key=idem)

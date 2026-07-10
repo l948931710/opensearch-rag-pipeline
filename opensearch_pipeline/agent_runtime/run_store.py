@@ -36,7 +36,9 @@ _TERMINAL = frozenset({"succeeded", "failed", "cancelled", "expired"})
 _ALLOWED_TRANSITIONS: Dict[str, frozenset] = {
     "running": frozenset({"suspended", "succeeded", "failed", "cancelled"}),
     "suspended": frozenset({"resuming", "cancelled", "expired", "failed"}),  # 认领走 resuming（非直达 running）
-    "resuming": frozenset({"running", "failed", "cancelled"}),               # 执行器接手 → running
+    # 执行器接手 → running；认领后失败（池满/checkpoint 解码）→ **回边 suspended**——
+    # 没有回边则任何认领后失败把 run 永久钉死在 resuming（/approve 只认 suspended → 409）。
+    "resuming": frozenset({"running", "suspended", "failed", "cancelled"}),
     # 终态无出边（succeeded/failed/cancelled/expired）→ 任何迁移即 InvalidTransition
 }
 
@@ -211,6 +213,40 @@ class RDSRunStore:
         finally:
             conn.close()
 
+    def reap_stale_runs(self, *, running_stale_s: int = 900,
+                        suspended_ttl_s: int = 259200) -> Dict[str, int]:
+        """收尸（对齐主仓 stage-3 的 2h stale-lock takeover 纪律）：
+        - running/resuming 心跳超时（默认 15 分钟）→ failed：崩溃/SAE 滚动发布 SIGKILL 留下的
+          僵尸，无人收尸则永久滞留 running（B 组 P1「heartbeat 死代码」的另一半）。
+        - suspended 超期（默认 3 天）→ expired：审批黑洞的兜底——过期即视为拒绝。
+        纯 UPDATE、幂等、跨实例安全（多实例并发跑只会有一个 rowcount>0）。
+        由 routes/agent 的后台 reaper 线程周期调用。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.agent_run SET status='failed', ended_at=NOW(3) "
+                    "WHERE status IN ('running','resuming') "
+                    "AND heartbeat_at < DATE_SUB(NOW(3), INTERVAL %s SECOND)",
+                    (int(running_stale_s),),
+                )
+                failed = cur.rowcount
+                cur.execute(
+                    f"UPDATE {db}.agent_run SET status='expired', ended_at=NOW(3) "
+                    "WHERE status='suspended' "
+                    "AND heartbeat_at < DATE_SUB(NOW(3), INTERVAL %s SECOND)",
+                    (int(suspended_ttl_s),),
+                )
+                expired = cur.rowcount
+            conn.commit()
+            return {"failed": int(failed), "expired": int(expired)}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def consume_budget(self, run_id: str, *, turns: int = 0, tool_calls: int = 0,
                        tokens: int = 0) -> Dict[str, int]:
         """原子累加预算消耗，返回累计值（B8：消耗跨 suspend/resume 持久 → 落 durable，不放 frozen ctx）。
@@ -271,7 +307,8 @@ class RDSRunStore:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT run_id, status, user_id, channel, agent_profile, started_at, ended_at "
+                    f"SELECT run_id, status, user_id, channel, agent_profile, started_at, ended_at, "
+                    f"thread_id, conversation_id "
                     f"FROM {db}.agent_run WHERE run_id=%s",
                     (run_id,),
                 )
@@ -279,7 +316,8 @@ class RDSRunStore:
             if not row:
                 return None
             return {"run_id": row[0], "status": row[1], "user_id": row[2], "channel": row[3],
-                    "agent_profile": row[4], "started_at": row[5], "ended_at": row[6]}
+                    "agent_profile": row[4], "started_at": row[5], "ended_at": row[6],
+                    "thread_id": row[7], "conversation_id": row[8]}
         finally:
             conn.close()
 

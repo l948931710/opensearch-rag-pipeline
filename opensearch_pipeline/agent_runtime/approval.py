@@ -12,6 +12,7 @@ approval.py — ApprovalOutcome 判别联合（执行模型 §2 / 报告 §5 四
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
@@ -47,6 +48,20 @@ AnyApprovalOutcome = Annotated[
 ]
 
 _OUTCOME_ADAPTER: TypeAdapter = TypeAdapter(AnyApprovalOutcome)
+
+
+@dataclass(frozen=True)
+class ApprovalGrant:
+    """一次性审批放行凭据（executor.resume 写入、adjudicator **消费即销毁**）。
+
+    绑定 (tool_name, args_digest)：凭据只放行「被批的那一次调用」——模型复用 call_id
+    或改参重放时凭据不匹配 → 重新挂起，堵住 call_id 复用绕过审批的洞（深度审查 A 组 P1）。
+    EDITED 的 digest 按人工改后参数计算（loop 重提时用改后参，两侧一致）。
+    """
+
+    outcome: ApprovalOutcome
+    tool_name: str
+    args_digest: str
 
 
 def parse_outcome(data: Dict[str, Any]) -> ApprovalOutcome:

@@ -185,7 +185,9 @@ def test_transition_terminal_sets_ended_at(monkeypatch):
     ("suspended", "cancelled", True), ("suspended", "expired", True),
     ("suspended", "failed", True), ("suspended", "succeeded", False),
     ("resuming", "running", True), ("resuming", "failed", True),
-    ("resuming", "cancelled", True), ("resuming", "suspended", False),
+    # 回边 resuming→suspended：认领后失败（池满/checkpoint 解码）回滚认领，
+    # 否则 run 永久钉死 resuming（/approve 只认 suspended → 409）——深度审查 B 组 P1
+    ("resuming", "cancelled", True), ("resuming", "suspended", True),
     ("succeeded", "running", False), ("failed", "running", False),
     ("cancelled", "running", False), ("expired", "running", False),
 ])

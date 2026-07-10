@@ -42,13 +42,19 @@ class RunRejected(RuntimeError):
 
 
 class RunHandle:
-    """一次 run 的句柄：SSE 经 events() 消费；request_cancel() 协作取消。"""
+    """一次 run 的句柄：SSE 经 events() 消费；request_cancel() 协作取消。
+
+    _on_complete：run 正常完成时驱动器在**run 完成侧**回调（落会话记忆/qa_log）——
+    绝不挂在 SSE 消费侧：客户端断连（GeneratorExit）会让消费侧回调整段被跳过，
+    答案静默不落库（深度审查 D 组）。
+    """
 
     def __init__(self, run_id: str):
         self.run_id = run_id
         self._q: "queue.Queue" = queue.Queue()
         self._cancel = threading.Event()
         self._done = threading.Event()
+        self._on_complete = None            # Callable[[str], None]，由 submit/resume 注入
 
     def events(self) -> Iterator[AgentEvent]:
         """阻塞式消费事件流，直到 run 终止（SSE 端点在此迭代并转 SSE 帧）。"""
@@ -102,11 +108,12 @@ class ThreadedRunExecutor:
             self._active -= 1
 
     def submit(self, ctx: ExecutionContext, loop: AgentLoop,
-               messages: List, tools: List) -> RunHandle:
+               messages: List, tools: List, on_complete=None) -> RunHandle:
         self._acquire()
         try:
             run_id = self._store.create_run(ctx, self._profile)
             handle = RunHandle(run_id)
+            handle._on_complete = on_complete
             # run_id 建 run 后**就地回填**共享 ctx（route 把同一 ctx 既闭包进 model_fn 又传本方法；
             # 用 with_run_id 造副本会让 model_fn 闭包的 run_id 仍 None → llm_call_log 记账落空。
             # run_id 是"建 run 后回填"字段、非身份/ACL，就地 setattr 不违 frozen 初衷）。
@@ -119,20 +126,30 @@ class ThreadedRunExecutor:
             raise
 
     def resume(self, run_id: str, ctx: ExecutionContext, outcome, loop: AgentLoop,
-               tools: List) -> RunHandle:
+               tools: List, on_complete=None) -> RunHandle:
         """WS3 两步 resume：① CAS suspended→resuming（认领，防两审批回调并发重入）② 载 checkpoint +
         记 approvals（批准/改参令 adjudicator 绕过审批执行）+ resuming→running + 驱动 loop.resume。
-        返回续跑 run 的 handle。outcome ∈ Approved/Edited/RejectedFeedback/RejectedTerminate。"""
-        from opensearch_pipeline.agent_runtime.approval import Approved, Edited, RejectedTerminate
+        返回续跑 run 的 handle。outcome ∈ Approved/Edited/RejectedFeedback/RejectedTerminate。
+
+        ⚠️ 死态防护（深度审查 B 组 P1）：**先 _acquire 再认领**——池满时认领已发生而无人续跑，
+        run 会被永久钉死在 resuming（/approve 只认 suspended → 409，无回边无对账）。认领后任何
+        失败（checkpoint 解码/版本不兼容/交棒失败）都回滚 resuming→suspended，保住可重试性。
+        """
+        from opensearch_pipeline.agent_runtime.approval import (
+            ApprovalGrant, Approved, Edited, RejectedTerminate)
         from opensearch_pipeline.agent_runtime.loop import decode_checkpoint_state
-        if not self._store.transition(run_id, "suspended", "resuming"):    # ① 认领
-            raise RunRejected(f"run {run_id} 非 suspended 或已被认领")
-        self._acquire()
+        from opensearch_pipeline.agent_runtime.tool_executor import digest
+        self._acquire()                                   # ① 先占槽：占不到就不动状态机
+        claimed = False
         try:
+            if not self._store.transition(run_id, "suspended", "resuming"):    # ② 认领
+                raise RunRejected(f"run {run_id} 非 suspended 或已被认领")
+            claimed = True
             object.__setattr__(ctx, "run_id", run_id)
             if isinstance(outcome, RejectedTerminate):
                 # 硬终止：resuming→cancelled（非 failed——是有意停止非错误），不续跑
                 self._store.transition(run_id, "resuming", "cancelled")
+                claimed = False
                 handle = RunHandle(run_id)
                 handle._emit(RunFailed(error="审批拒绝并终止", retryable=False))
                 handle._finish()
@@ -143,32 +160,57 @@ class ThreadedRunExecutor:
                      else {"messages": [], "pending_call": None, "turn": 0})
             pending = state.get("pending_call")
             if pending and isinstance(outcome, (Approved, Edited)):
-                self._approvals[f"{run_id}:{pending['call_id']}"] = outcome    # 令 adjudicator 放行该 call
-            if not self._store.transition(run_id, "resuming", "running"):      # ② 接手
+                # 一次性放行凭据：绑定 (tool_name, args_digest)，adjudicator 消费即销毁——
+                # 只放行被批的那一次调用，call_id 复用/改参重放不匹配即重新挂起（A 组 P1）。
+                args = (outcome.edited_args if isinstance(outcome, Edited)
+                        else pending.get("arguments", {}))
+                self._approvals[f"{run_id}:{pending['call_id']}"] = ApprovalGrant(
+                    outcome=outcome, tool_name=pending["tool_name"], args_digest=digest(args))
+            if not self._store.transition(run_id, "resuming", "running"):      # ③ 接手
                 raise RunRejected(f"run {run_id} resuming→running 失败（并发/迟到）")
+            claimed = False                               # 已交棒 running：失败恢复归驱动器
             handle = RunHandle(run_id)
+            handle._on_complete = on_complete
             gen = loop.resume(ctx, state, outcome, tools)
-            self._pool.submit(self._drive_gen, ctx, gen, handle)
+            base = self._budget_snapshot(run_id, fallback_turns=int(state.get("turn", 0)) + 1)
+            self._pool.submit(self._drive_gen, ctx, gen, handle, base)
             return handle
         except Exception:
+            if claimed:
+                self._safe_transition(run_id, "resuming", "suspended")   # 回边：保住可重试
             self._release()
             raise
 
-    def _drive_gen(self, ctx: ExecutionContext, gen, handle: RunHandle) -> None:
+    def _drive_gen(self, ctx: ExecutionContext, gen, handle: RunHandle,
+                   base: Optional[dict] = None) -> None:
+        """驱动器。预算强制走**本地计数**（resume 时由 _budget_snapshot 播种）——
+        consume_budget 落 durable 仍每轮照做（fail-open），但强制判断不依赖它：
+        否则 DB 故障期间记账被吞成 {}、`.get(...,0) > cap` 恒 False，预算整体退化为
+        无限（深度审查 C 组「fail-open 空转」）。本地计数进程内恒可用，不会误杀。"""
         run_id = ctx.run_id
         max_turns = ctx.budget.max_turns
         max_tool_calls = ctx.budget.max_tool_calls
-        turns_counted = 0            # 已计入预算的模型轮数（turn_index 去重，同批多 call 只计一次）
+        token_budget = ctx.budget.token_budget
+        turns_counted = int((base or {}).get("turns_used", 0))       # turn_index 去重，同批多 call 只计一次
+        tool_calls_used = int((base or {}).get("tool_calls_used", 0))
+        tokens_used = int((base or {}).get("tokens_used", 0))
         try:
             ev = next(gen)
             while True:
                 if isinstance(ev, ToolCallProposed):
-                    # 每个模型轮计一次 turn（同一 tool 批 turn_index 相同→只在首次计）；超 max_turns → fail-closed
+                    # 每个模型轮计一次 turn + 累加该轮 usage（同一 tool 批 turn_index 相同→只在首次计）
                     if ev.turn_index >= turns_counted:
                         turns_counted = ev.turn_index + 1
-                        self._record_model_step(run_id, ev.turn_index)     # ④b：模型轮记 model_call step
-                        if self._budget_used(run_id, turns=1).get("turns_used", 0) > max_turns:
+                        tokens_used += ev.usage.total
+                        self._heartbeat(run_id)                            # 活跃心跳（僵尸回收判据）
+                        self._record_model_step(run_id, ev.turn_index, usage=ev.usage)
+                        self._budget_used(run_id, turns=1, tokens=ev.usage.total)
+                        if turns_counted > max_turns:
                             self._fail_over_budget(run_id, gen, handle, f"turns 预算超限（>{max_turns}）")
+                            break
+                        if tokens_used > token_budget:
+                            self._fail_over_budget(run_id, gen, handle,
+                                                   f"token 预算超限（>{token_budget}）")
                             break
                     handle._emit(ev)                                    # trace/SSE tool_call 帧
                     if handle.cancelled():
@@ -177,7 +219,9 @@ class ThreadedRunExecutor:
                         handle._emit(RunFailed(error="用户取消", retryable=False))
                         break
                     # tool_calls 预算：消费后超限即 fail-closed（在 adjudicate 执行副作用**之前**拦住）
-                    if self._budget_used(run_id, tool_calls=1).get("tool_calls_used", 0) > max_tool_calls:
+                    tool_calls_used += 1
+                    self._budget_used(run_id, tool_calls=1)
+                    if tool_calls_used > max_tool_calls:
                         self._fail_over_budget(run_id, gen, handle, f"tool_calls 预算超限（>{max_tool_calls}）")
                         break
                     result = self._adjudicate(ctx, ev)                  # Policy → Executor
@@ -186,20 +230,34 @@ class ThreadedRunExecutor:
                 if isinstance(ev, RunSuspended):
                     # 挂起：持久化 checkpoint（loop 带来 state_messages+pending_call）+ running→suspended，
                     # 对外发**剥离 state_messages** 的干净 RunSuspended（带 approval_request_id/checkpoint_id）。
+                    # ⚠️ 迁移必须成功才发 approval 帧：迁移被吞时 run 行仍 running、审批端从此 409，
+                    # 成为无驱动僵尸而用户以为在等审批（深度审查 B 组）。
                     cp_id, aid = self._persist_suspend(run_id, ev)
-                    self._safe_transition(run_id, "running", "suspended")
+                    if not self._transition_checked(run_id, "running", "suspended"):
+                        self._safe_transition(run_id, "running", "failed")
+                        handle._emit(RunFailed(error="挂起状态落库失败，请重试", retryable=True))
+                        break
                     handle._emit(RunSuspended(approval_request_id=aid, checkpoint_id=cp_id,
                                               pending_call=ev.pending_call, turn_index=ev.turn_index))
                     break
-                handle._emit(ev)
                 if isinstance(ev, RunCompleted):
-                    # 最终答案也是一个模型轮 → 记 model_call step + 计 turn + 记 tokens
+                    # 最终答案也是一个模型轮 → 记 model_call step + 计 turn + 记 tokens。
+                    # on_complete 在 emit 之前跑（run 完成侧）：客户端看到 done 帧时记忆已落，
+                    # 立刻发起的下一轮不会丢上一轮上下文。
                     self._record_model_step(run_id, turns_counted, usage=ev.usage, final=True)
                     self._budget_used(run_id, turns=1, tokens=ev.usage.total)
                     self._safe_transition(run_id, "running", "succeeded")
+                    self._notify_complete(handle, ev)
+                    handle._emit(ev)
                     break
+                handle._emit(ev)
                 if isinstance(ev, RunFailed):
                     self._safe_transition(run_id, "running", "failed")
+                    break
+                if handle.cancelled():
+                    gen.close()
+                    self._safe_transition(run_id, "running", "cancelled")
+                    handle._emit(RunFailed(error="用户取消", retryable=False))
                     break
                 ev = next(gen)
         except StopIteration:
@@ -210,6 +268,17 @@ class ThreadedRunExecutor:
         finally:
             handle._finish()
             self._release()
+
+    @staticmethod
+    def _notify_complete(handle: RunHandle, ev: RunCompleted) -> None:
+        cb = handle._on_complete
+        if cb is None:
+            return
+        try:
+            cb(ev.final_text)
+        except Exception:   # noqa: BLE001 — 记忆/落库失败不影响回答（辅助失败不破主答案）
+            import logging
+            logging.getLogger(__name__).warning("run on_complete 回调失败", exc_info=True)
 
     def _persist_suspend(self, run_id: Optional[str], ev: RunSuspended) -> tuple:
         """挂起持久化：encode loop 带来的状态 → save_checkpoint；记 approval agent_step；
@@ -243,11 +312,40 @@ class ThreadedRunExecutor:
             pass
 
     def _budget_used(self, run_id: Optional[str], **kw) -> dict:
-        """consume_budget 容错包装：返回累计 dict；记账失败→{}（fail-open，不因预算记账崩杀 run）。"""
+        """consume_budget 容错包装：返回累计 dict；记账失败→{}（durable 记账 fail-open——
+        **强制**不依赖它，走 _drive_gen 的本地计数，DB 故障不等于无限预算）。"""
         try:
             return self._store.consume_budget(run_id, **kw) or {}
         except Exception:   # noqa: BLE001
             return {}
+
+    def _budget_snapshot(self, run_id: Optional[str], fallback_turns: int) -> dict:
+        """resume 播种本地预算计数：读 durable 已耗值（零增量 consume 即读取）。
+        读不到 → 按 checkpoint turn 兜底（宁可少计 tool_calls/tokens 也不重复计 turns——
+        修 resume 后 turn 双重计费 + 续跑段逃逸预算，深度审查 C 组 P1）。"""
+        try:
+            snap = self._store.consume_budget(run_id) or {}
+            if snap.get("turns_used") or snap.get("tool_calls_used") or snap.get("tokens_used"):
+                return snap
+        except Exception:   # noqa: BLE001
+            pass
+        return {"turns_used": int(fallback_turns), "tool_calls_used": 0, "tokens_used": 0}
+
+    def _heartbeat(self, run_id: Optional[str]) -> None:
+        """活跃 run 心跳（每模型轮一刷；配合 run_store.reap_stale_runs 收尸）。fail-open。"""
+        try:
+            hb = getattr(self._store, "heartbeat", None)
+            if hb is not None:
+                hb(run_id)
+        except Exception:   # noqa: BLE001
+            pass
+
+    def _transition_checked(self, run_id: Optional[str], frm: str, to: str) -> bool:
+        """关键迁移（如 running→suspended）：CAS False 或 DB 异常都返回 False，由调用方处置。"""
+        try:
+            return bool(self._store.transition(run_id, frm, to))
+        except Exception:   # noqa: BLE001
+            return False
 
     def _fail_over_budget(self, run_id: Optional[str], gen, handle: RunHandle, msg: str) -> None:
         """预算超限 fail-closed：关生成器 + 落 failed + 发 RunFailed 事件。"""

@@ -263,8 +263,10 @@ def test_scenario_policy_deny():
         assert "RunCompleted" in events
         rows = _fetch("SELECT status FROM tool_invocation WHERE run_id=%s", (run_id,))
         assert any(s == "denied" for (s,) in rows), f"应有 denied 调用，实得 {rows}"
-        # deny 发生在 tool_executor 之前 → 不产生合规审计行
-        assert _fetch("SELECT COUNT(*) FROM agent_audit_log WHERE run_id=%s", (run_id,))[0][0] == 0
+        # deny 也入合规审计（深度审查 E 组：此前只记 ALLOW authorized，deny 裁决零审计）
+        deny_rows = _fetch(
+            "SELECT decision FROM agent_audit_log WHERE run_id=%s", (run_id,))
+        assert any(d == "denied" for (d,) in deny_rows), f"deny 裁决应有审计行，实得 {deny_rows}"
     finally:
         _cleanup_run(run_id)
 

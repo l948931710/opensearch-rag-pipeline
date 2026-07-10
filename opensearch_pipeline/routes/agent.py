@@ -47,6 +47,30 @@ def _agent_enabled() -> bool:
     return os.environ.get("RAG_AGENT_ENABLE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _start_reaper(run_store) -> None:
+    """后台收尸线程（每进程一条，daemon）：周期调 run_store.reap_stale_runs——
+    崩溃/滚动发布留下的 running 僵尸标 failed、超期 suspended 标 expired（纯 UPDATE 幂等，
+    多实例并发安全）。失败只告警，绝不影响 serving。"""
+    import threading
+
+    interval = int(os.environ.get("RAG_AGENT_REAPER_INTERVAL_S", "300"))
+    stale_s = int(os.environ.get("RAG_AGENT_STALE_RUNNING_S", "900"))
+    ttl_s = int(os.environ.get("RAG_AGENT_SUSPENDED_TTL_S", "259200"))
+
+    def _loop():
+        while True:
+            threading.Event().wait(interval)
+            try:
+                rep = run_store.reap_stale_runs(running_stale_s=stale_s, suspended_ttl_s=ttl_s)
+                if rep.get("failed") or rep.get("expired"):
+                    logger.warning("agent run 收尸：stale-running→failed %s · suspended→expired %s",
+                                   rep.get("failed"), rep.get("expired"))
+            except Exception:   # noqa: BLE001
+                logger.warning("agent run 收尸失败（下轮重试）", exc_info=True)
+
+    threading.Thread(target=_loop, name="agent-run-reaper", daemon=True).start()
+
+
 def _get_runtime():
     """惰性建运行时单例：(registry, gateway, executor, run_store)。"""
     global _RUNTIME
@@ -70,6 +94,11 @@ def _get_runtime():
         max_runs = int(os.environ.get("RAG_AGENT_MAX_CONCURRENT_RUNS", "4"))
         executor = ThreadedRunExecutor(run_store, adjudicator, max_concurrent=max_runs,
                                        approvals=approvals)
+        # SIGTERM/进程退出排水：非 daemon 线程池被直杀会留下 running 僵尸（reaper 兜底收尸，
+        # 但正常退出应先排水）；收尸线程给崩溃/SIGKILL 场景兜底。
+        import atexit
+        atexit.register(executor.shutdown, wait=False)
+        _start_reaper(run_store)
         _RUNTIME = (registry, gateway, executor, run_store)
     return _RUNTIME
 
@@ -78,14 +107,18 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def _stream_events(handle, session_id: str, message_id: str, on_complete=None):
+def _stream_events(handle, session_id: str, message_id: str):
     """把一个 run 的事件流转成 SSE 帧（/ask 与 /approve 共用）。RunSuspended→approval 帧。
-    on_complete(final_text)：run 正常完成时回调（/ask 用它把本轮 Q&A append 进会话记忆）。"""
+
+    ⚠️ 落库/记忆 append **不在本函数**：挂在 SSE 消费侧会在客户端断连（GeneratorExit）时
+    整段被跳过、答案静默丢失——已移到 run 完成侧（executor.submit/resume 的 on_complete）。
+    GeneratorExit 时 finally 里不得再 yield（RuntimeError），用 closed 旗标跳过 [DONE]。"""
     from opensearch_pipeline.agent_runtime.events import (
         ModelDelta, RunCompleted, RunFailed, RunSuspended, ToolCallProposed)
-    yield _sse({"type": "session", "session_id": session_id, "message_id": message_id,
-                "run_id": handle.run_id})
+    closed = False
     try:
+        yield _sse({"type": "session", "session_id": session_id, "message_id": message_id,
+                    "run_id": handle.run_id})
         for ev in handle.events():
             if isinstance(ev, ModelDelta):
                 yield _sse({"type": "chunk", "content": ev.text})
@@ -98,19 +131,18 @@ def _stream_events(handle, session_id: str, message_id: str, on_complete=None):
             elif isinstance(ev, RunCompleted):
                 if ev.final_text:
                     yield _sse({"type": "chunk", "content": ev.final_text})
-                if on_complete is not None:
-                    try:
-                        on_complete(ev.final_text)
-                    except Exception:   # noqa: BLE001 — 记忆 append 失败不影响回答
-                        logger.warning("多轮记忆 append 失败", exc_info=True)
                 yield _sse({"type": "done", "usage": ev.usage.model_dump()})
             elif isinstance(ev, RunFailed):
                 yield _sse({"type": "error", "message": f"Agent 运行失败: {ev.error[:200]}"})
+    except GeneratorExit:
+        closed = True           # 客户端断连：run 仍在跑、落库在 run 完成侧，此处只安静退出
+        raise
     except Exception:   # noqa: BLE001 — SSE 中断不外泄
         logger.error("agent SSE 中断", exc_info=True)
         yield _sse({"type": "error", "message": "Agent 运行异常"})
     finally:
-        yield "data: [DONE]\n\n"
+        if not closed:
+            yield "data: [DONE]\n\n"
 
 
 @router.post("/api/agent/ask")
@@ -126,9 +158,22 @@ def agent_ask(req: AskRequest, request: Request,
     conv = getattr(req, "conversation_id", None)
     # 多轮记忆键：有 conversation_id → f"{conv}:{user}"（钉钉一致）；否则用 client session_id（缺则新建）。
     thread_key = f"{conv}:{identity.user_id}" if conv else getattr(req, "session_id", None)
+    # miniapp 前缀归属（对齐 api.py /api/ask）：'miniapp:<staffId>' 是可预测命名空间，
+    # 不校验则认证用户可抢注他人 miniapp 会话键
+    if thread_key and thread_key.startswith("miniapp:") and thread_key != f"miniapp:{identity.user_id}":
+        raise HTTPException(status_code=403, detail="会话不属于当前用户")
+    # 长度钳制：agent_run.thread_id VARCHAR(160) / qa_session_log.session_id VARCHAR(128)——
+    # 超长直接拒（截断可能把两个不同会话合并到同一键），否则真库 INSERT 500
+    if thread_key and len(thread_key) > 128:
+        raise HTTPException(status_code=422, detail="session_id/conversation_id 过长")
     from opensearch_pipeline.agent_runtime.session_memory import default_session_memory
+    from opensearch_pipeline.session_store import SessionOwnershipError
     memory = default_session_memory()
-    snapshot = memory.get_snapshot(thread_key, owner=identity.user_id)   # 取最近 N 轮（含 rolling summary）
+    try:
+        snapshot = memory.get_snapshot(thread_key, owner=identity.user_id)   # 最近 N 轮（含 rolling summary）
+    except SessionOwnershipError:
+        # 越权探测回 403（api.py :626/:1125 同款映射）——此前未捕获传他人 session_id 得 500
+        raise HTTPException(status_code=403, detail="会话不属于当前用户")
     thread_id = snapshot.thread_id                                       # 回填新建 sid（客户端下轮回传）
     session_id = thread_id
     message_id = generate_message_id()
@@ -139,7 +184,7 @@ def agent_ask(req: AskRequest, request: Request,
 
     try:
         from opensearch_pipeline.request_context import get_request_id
-        rid = get_request_id() or ""
+        rid = (get_request_id() or "")[:32]   # llm_call_log/agent_audit_log.request_id VARCHAR(32)
     except Exception:   # noqa: BLE001
         rid = ""
 
@@ -154,12 +199,8 @@ def agent_ask(req: AskRequest, request: Request,
                 + snapshot.messages
                 + [{"role": "user", "content": req.question}])
 
-    try:
-        handle = executor.submit(ctx, loop, messages, tools)
-    except RunRejected:
-        raise HTTPException(status_code=429, detail="Agent 并发已满，请稍后再试")
-
     def _remember(final_text: str) -> None:
+        """run 完成侧回调（executor 调，非 SSE 消费侧——客户端断连也照常落库）。"""
         memory.append(thread_id, req.question, final_text, owner=identity.user_id)   # 热态记忆
         # durable：落 qa_session_log（供重启回读重建 + console 会话历史；log_qa_session 自身 fail-safe）
         from opensearch_pipeline.qa_logger import log_qa_session
@@ -168,7 +209,12 @@ def agent_ask(req: AskRequest, request: Request,
                        answer_text=final_text, conversation_id=conv, answer_status="SUCCESS",
                        model_name="agent")
 
-    return StreamingResponse(_stream_events(handle, session_id, message_id, on_complete=_remember),
+    try:
+        handle = executor.submit(ctx, loop, messages, tools, on_complete=_remember)
+    except RunRejected:
+        raise HTTPException(status_code=429, detail="Agent 并发已满，请稍后再试")
+
+    return StreamingResponse(_stream_events(handle, session_id, message_id),
                              media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
@@ -184,7 +230,11 @@ class ApproveRequest(BaseModel):
 @router.post("/api/agent/approve")
 def agent_approve(req: ApproveRequest, request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
-    """WS3：对挂起 run 提交审批决定 → resume 续跑，SSE 复用 /ask 帧格式。归属=本人(自确认高危写)。"""
+    """WS3：对挂起 run 提交审批决定 → resume 续跑，SSE 复用 /ask 帧格式。
+
+    ⚠️ **审批人=发起人本人是占位实现**（职责分离缺位）：正式版须落 approval_request 表 +
+    approver_scope（部门管理员审）+ console 审批队列（报告 §N），届时本端点的归属校验从
+    「本人 run」改为「approver_scope 覆盖该 run」。接第一个 HIGH_WRITE 写型工具前必须完成。"""
     if not _agent_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
     if identity is None:
@@ -210,21 +260,58 @@ def agent_approve(req: ApproveRequest, request: Request,
 
     try:
         from opensearch_pipeline.request_context import get_request_id
-        rid = get_request_id() or ""
+        rid = (get_request_id() or "")[:32]   # llm_call_log/agent_audit_log.request_id VARCHAR(32)
     except Exception:   # noqa: BLE001
         rid = ""
+    # 审批决定入合规审计（fail-open）：谁、对哪个 run、何种处置——此前审批决定零持久化，
+    # 「request→decision→invocation→audit 可关联回放」断在 decision 一环。只记 kind 不记原文。
+    try:
+        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
+        RDSAuditLog().record(
+            None, event_type="approval_decision", action=f"run:{req.run_id}",
+            decision=outcome.kind, run_id=req.run_id,
+            detail={"kind": outcome.kind, "approver": identity.user_id})
+    except Exception:   # noqa: BLE001
+        logger.warning("审批决定审计写失败（fail-open）", exc_info=True)
     # 铁律 5：resume 重建 ctx（重解析身份，不复用 checkpoint 里的旧 ACL 快照）
+    thread_id = run.get("thread_id") or req.session_id or req.run_id
     ctx = ExecutionContext.create(
         request_id=rid, user_id=identity.user_id, acl_groups=identity.acl_groups,
         roles=(identity.role,) if identity.role else ("employee",),
-        channel="console", thread_id=req.run_id, conversation_id=req.conversation_id)
+        channel="console", thread_id=thread_id, conversation_id=req.conversation_id)
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, "light"))   # 默认档=light(不思考/快/省)
     tools = registry.list_specs(ctx)
+
+    # 被批 run 的最终答案也要进会话记忆 + qa_session_log（此前 approve 路径整轮丢失——
+    # 恰是 HIGH_WRITE 高危场景，从多轮记忆与 durable 回读链里静默消失）。
+    # 本轮 user 问题从 checkpoint messages 兜底提取（fail-open）。
+    message_id = generate_message_id()
+    cp_question = "[审批后续跑]"
     try:
-        handle = executor.resume(req.run_id, ctx, outcome, loop, tools)
+        cp = run_store.load_latest_checkpoint(req.run_id)
+        if cp:
+            from opensearch_pipeline.agent_runtime.loop import decode_checkpoint_state
+            for m in reversed(decode_checkpoint_state(cp.state_blob).get("messages", [])):
+                if m.get("role") == "user" and m.get("content"):
+                    cp_question = m["content"]
+                    break
+    except Exception:   # noqa: BLE001
+        pass
+
+    def _remember(final_text: str) -> None:
+        from opensearch_pipeline.agent_runtime.session_memory import default_session_memory
+        default_session_memory().append(thread_id, cp_question, final_text, owner=identity.user_id)
+        from opensearch_pipeline.qa_logger import log_qa_session
+        log_qa_session(session_id=thread_id, message_id=message_id, user_id=identity.user_id,
+                       user_dept=getattr(identity, "dept", None), query_text=cp_question,
+                       answer_text=final_text, conversation_id=run.get("conversation_id"),
+                       answer_status="SUCCESS", model_name="agent")
+
+    try:
+        handle = executor.resume(req.run_id, ctx, outcome, loop, tools, on_complete=_remember)
     except RunRejected:
         raise HTTPException(status_code=409, detail="run 非挂起或已被认领")
 
-    session_id = req.session_id or req.run_id
-    return StreamingResponse(_stream_events(handle, session_id, generate_message_id()),
+    session_id = req.session_id or thread_id
+    return StreamingResponse(_stream_events(handle, session_id, message_id),
                              media_type="text/event-stream", headers=_SSE_HEADERS)
