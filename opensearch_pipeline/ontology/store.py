@@ -1023,8 +1023,44 @@ class RDSOntologyStore:
             conn.close()
 
     # ── 覆盖率 / 积压统计 ────────────────────────────────────────────────────
+    def record_population_snapshot(self, namespace_counts: Dict[str, int], *,
+                                   source: str = "seeding") -> int:
+        """PR-F：源快照分母登记（seeding/backfill 真跑时按 namespace upsert）。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                for ns, n in namespace_counts.items():
+                    cur.execute(
+                        f"INSERT INTO {db}.ontology_source_population "
+                        "(namespace, records, source, snapshot_at) VALUES (%s,%s,%s,NOW(3)) "
+                        "ON DUPLICATE KEY UPDATE records=VALUES(records), "
+                        "source=VALUES(source), snapshot_at=NOW(3)",
+                        (ns, int(n), source[:64]))
+            conn.commit()
+            return len(namespace_counts)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def population_total(self) -> Optional[int]:
+        """最近源快照的总记录数；无快照 → None（coverage 回退 approx 口径）。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*), COALESCE(SUM(records),0) "
+                            f"FROM {db}.ontology_source_population")
+                n_rows, total = cur.fetchone()
+            return int(total) if int(n_rows or 0) else None
+        except Exception:   # noqa: BLE001 — 表未建（旧库）→ 回退 approx，不硬崩
+            return None
+        finally:
+            conn.close()
+
     def coverage(self, object_type: Optional[str] = None) -> Dict[str, Any]:
-        """resolution_coverage = active / (active + open)——分母是"观测到且尚未确认"的近似。
+        """覆盖率双口径（PR-F）：有源快照 → population 分母（真实覆盖率）；
+        无 → active/(active+open) 近似并明标 denominator='approx'（处置率≠覆盖率）。
         auto_active 单列（抽检队列规模）；人工审核率 = 1 - auto/active。"""
         db, conn = self._db(), self._conn()
         try:
@@ -1050,17 +1086,33 @@ class RDSOntologyStore:
                 cur.execute(sql + " GROUP BY status", params)
                 by_status = {row[0]: int(row[1]) for row in cur.fetchall()}
             open_n = by_status.get("open", 0)
-            denom = active + open_n
-            return {
-                "active_identifiers": active,
-                "auto_active": auto_active,
-                "open_cases": open_n,
-                "resolved_cases": by_status.get("resolved", 0),
-                "dismissed_cases": by_status.get("dismissed", 0),
-                "resolution_coverage": (active / denom) if denom else None,
-            }
         finally:
             conn.close()
+        return self._coverage_payload(active, auto_active, open_n,
+                                      by_status.get("resolved", 0),
+                                      by_status.get("dismissed", 0),
+                                      population=(None if object_type
+                                                  else self.population_total()))
+
+    @staticmethod
+    def _coverage_payload(active, auto_active, open_n, resolved, dismissed, population):
+        approx_denom = active + open_n
+        out = {
+            "active_identifiers": active,
+            "auto_active": auto_active,
+            "open_cases": open_n,
+            "resolved_cases": resolved,
+            "dismissed_cases": dismissed,
+        }
+        if population:
+            out["denominator"] = "population"
+            out["population_records"] = population
+            out["resolution_coverage"] = min(1.0, active / population)
+        else:
+            out["denominator"] = "approx"           # 处置率口径，UI 须明示非真实覆盖率
+            out["population_records"] = None
+            out["resolution_coverage"] = (active / approx_denom) if approx_denom else None
+        return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1086,6 +1138,7 @@ class MemoryOntologyStore:
         # （hook 抛异常 = 模拟 agent_audit_log 不可写 → 方法必须零副作用地上抛）
         self.audit_rows: List[Dict[str, Any]] = []
         self.audit_hook = None
+        self._population: Dict[str, Dict[str, Any]] = {}   # PR-F：源快照分母
 
     def _tick(self) -> int:
         self._clock += 1
@@ -1567,6 +1620,19 @@ class MemoryOntologyStore:
             return [dict(v) for k, v in sorted(self._stewardship.items())]
 
     # ── 统计 ────────────────────────────────────────────────────────────────
+    def record_population_snapshot(self, namespace_counts, *, source="seeding"):
+        with self._lock:
+            for ns, n in namespace_counts.items():
+                self._population[ns] = {"records": int(n), "source": source,
+                                        "snapshot_at": self._tick()}
+            return len(namespace_counts)
+
+    def population_total(self):
+        with self._lock:
+            if not self._population:
+                return None
+            return sum(v["records"] for v in self._population.values())
+
     def coverage(self, object_type=None):
         with self._lock:
             def _type_of(target_id):
@@ -1578,12 +1644,8 @@ class MemoryOntologyStore:
             cases = [r for r in self._cases.values()
                      if object_type is None or r["object_type_hint"] == object_type]
             open_n = sum(1 for r in cases if r["status"] == "open")
-            denom = len(act) + open_n
-            return {
-                "active_identifiers": len(act),
-                "auto_active": sum(1 for r in act if r["confirmed_by"] == "auto"),
-                "open_cases": open_n,
-                "resolved_cases": sum(1 for r in cases if r["status"] == "resolved"),
-                "dismissed_cases": sum(1 for r in cases if r["status"] == "dismissed"),
-                "resolution_coverage": (len(act) / denom) if denom else None,
-            }
+        return RDSOntologyStore._coverage_payload(
+            len(act), sum(1 for r in act if r["confirmed_by"] == "auto"), open_n,
+            sum(1 for r in cases if r["status"] == "resolved"),
+            sum(1 for r in cases if r["status"] == "dismissed"),
+            population=(None if object_type else self.population_total()))

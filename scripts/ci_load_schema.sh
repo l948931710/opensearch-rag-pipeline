@@ -185,8 +185,8 @@ done
 # 本体独立库（PR-B P0-02）：表族全量落 fuling_ontology，fuling_ro 不授本库
 for t in ontology_object ontology_identifier ontology_resolution_case \
          ontology_resolution_candidate ontology_link ontology_ref_seq \
-         ontology_attribute_source ontology_stewardship sem_packing sem_stacking \
-         schema_migrations; do
+         ontology_attribute_source ontology_stewardship ontology_source_population \
+         sem_packing sem_stacking schema_migrations; do
   assert_table fuling_ontology "$t"
 done
 # 错灌金丝雀（qa_session_log/user_feedback 合法地双库都有——001 初版在 knowledge，不做金丝雀）

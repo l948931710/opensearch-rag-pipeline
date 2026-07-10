@@ -180,7 +180,10 @@ def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
                     "canonical_ref": obj.get("canonical_ref"),
                     "title": visible_title(obj.get("title"), obj.get("data_classification"),
                                            obj.get("owner_dept"), acl=acl, bypass_acl=bypass),
-                    "object_type": obj.get("object_type"), "target_status": obj.get("status")})
+                    "object_type": obj.get("object_type"), "target_status": obj.get("status"),
+                    # PR-F HITL：处置人须看见目标归属/密级再确认（P0-06 UI 验收⑥）
+                    "owner_dept": obj.get("owner_dept"),
+                    "data_classification": obj.get("data_classification")})
     return out
 
 
@@ -287,6 +290,9 @@ def ontology_case_confirm(case_id: str, req: ConfirmRequest, request: Request,
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
+    # PR-F（P0-06 HITL）：confirm 与 dismiss 同纪律——理由必填（"确认按钮"不许无凭据落身份）
+    if not (req.note or "").strip():
+        raise HTTPException(status_code=400, detail="confirm 必须填写确认理由（note）")
     store = _get_store()
     case = store.get_case(case_id)
     # PR-B（P0-01）：scope 外 case 与不存在同答 404（先可见性再状态，防 409 泄露存在性）

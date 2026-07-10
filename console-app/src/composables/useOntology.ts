@@ -21,6 +21,10 @@ export interface OntologyCandidate {
   title: string | null
   object_type: string | null
   target_status: string | null
+  // PR-F（P0-01/06）：跨部门不可读候选 target_visible=false（零字段）；可读候选带归属/密级
+  target_visible?: boolean | null
+  owner_dept?: string | null
+  data_classification?: string | null
 }
 
 export interface OntologyCase {
@@ -46,6 +50,9 @@ export interface OntologyCoverage {
   dismissed_cases: number
   resolution_coverage: number | null
   manual_review_rate: number | null
+  // PR-F：分母口径——population=源快照真实分母 / approx=处置率近似（UI 必须明示）
+  denominator?: 'population' | 'approx'
+  population_records?: number | null
 }
 
 export interface OntologyObjectHit {
@@ -54,6 +61,8 @@ export interface OntologyObjectHit {
   canonical_ref: string
   title: string
   status: string
+  owner_dept?: string | null
+  data_classification?: string | null
 }
 
 const cases = ref<OntologyCase[]>([])
@@ -149,12 +158,13 @@ async function postDecision(kase: OntologyCase, path: string, body: Record<strin
   return done === true
 }
 
-/** 确认（含改指到搜索选中的对象）：铸 active 别名 + case→resolved。 */
-async function confirmOntologyCase(kase: OntologyCase, target: { target_object_id: string; target_revision?: string | null }, note?: string) {
+/** 确认（含改指到搜索选中的对象）：铸 active 别名 + case→resolved。
+ *  PR-F（P0-06 HITL）：note **必填**（服务端 400 兜底）——确认与驳回同纪律。 */
+async function confirmOntologyCase(kase: OntologyCase, target: { target_object_id: string; target_revision?: string | null }, note: string) {
   return postDecision(kase, 'confirm', {
     target_object_id: target.target_object_id,
     target_revision: target.target_revision || null,
-    note: note || null,
+    note,
   }, '确认失败')
 }
 

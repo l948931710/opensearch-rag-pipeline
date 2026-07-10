@@ -139,7 +139,7 @@ describe('useOntology — 处置提交', () => {
     }))
     const o = useOntology()
     o.ontologyCases.value = [okase()]
-    const done = await o.confirmOntologyCase(okase(), { target_object_id: 'o1' })
+    const done = await o.confirmOntologyCase(okase(), { target_object_id: 'o1' }, '并发验证')
     expect(done).toBe(false)
     expect(calls.some(([p]) => p.startsWith('/api/ontology/workbench'))).toBe(true)   // 强刷
   })
@@ -218,5 +218,70 @@ describe('OntologyWorkbench 组件', () => {
     expect(w.text()).toContain('77%')
     expect(w.text()).toContain('待处置积压')
     expect(w.text()).toContain('60%')
+  })
+})
+
+describe('PR-F HITL 契约（显式点选 / 受限候选 / 分母口径 / 证据展示）', () => {
+  function mountBench(items: OntologyCase[], id = identity()) {
+    const pinia = activate(id)
+    useOntology().ontologyCases.value = items
+    return mount(OntologyWorkbench, { global: { plugins: [pinia] } })
+  }
+
+  it('跨部门不可读候选 → 受限占位 + 确认按钮禁用（零字段泄露）', () => {
+    const k = okase()
+    k.candidates[0] = {
+      ...k.candidates[0], target_visible: false,
+      canonical_ref: null, title: null, object_type: null, target_status: null,
+    }
+    const w = mountBench([k])
+    expect(w.text()).toContain('[受限对象]')
+    expect(w.text()).not.toContain('FLP-P-000123')
+    const btn = w.findAll('button').find((b) => b.text().includes('确认此候选'))!
+    expect(btn.attributes('disabled')).toBeDefined()
+  })
+
+  it('候选行展示目标归属部门与非 internal 密级（处置人看得见再确认）', () => {
+    const k = okase()
+    k.candidates[0] = { ...k.candidates[0], target_visible: true, owner_dept: 'pmc', data_classification: 'confidential' }
+    const w = mountBench([k])
+    expect(w.text()).toContain('confidential')
+  })
+
+  it('evidence_json → 可展开证据快照（pretty JSON）', () => {
+    const k = okase({ evidence_json: '{"source":"u8_export","row":42}' })
+    const w = mountBench([k])
+    expect(w.text()).toContain('证据快照')
+    expect(w.text()).toContain('u8_export')
+  })
+
+  it('coverage 分母口径：population → 展示源快照分母；approx → 明示近似', async () => {
+    activate(identity())
+    const o = useOntology()
+    o.ontologyCases.value = [okase()]
+    o.ontologyCoverage.value = { ...COVERAGE, denominator: 'population', population_records: 500 }
+    const pinia = createTestingPinia({ createSpy: vi.fn, initialState: { session: { identity: identity(), token: 't', ready: true } } })
+    let w = mount(OntologyWorkbench, { global: { plugins: [pinia] } })
+    expect(w.text()).toContain('源快照 500')
+    o.ontologyCoverage.value = { ...COVERAGE, denominator: 'approx', population_records: null }
+    w = mount(OntologyWorkbench, { global: { plugins: [pinia] } })
+    expect(w.text()).toContain('近似口径')
+  })
+
+  it('手动指定搜索结果内联渲染，点选目标（绝不自动取第一条）', async () => {
+    const k = okase()
+    const w = mountBench([k])
+    // 直接驱动组件内部状态：两条搜索结果 → 都渲染成可点按钮
+    ;(w.vm as any).manualHits = { oc1: [
+      { object_id: 'o1', object_type: 'product', canonical_ref: 'FLP-P-000001', title: '龙虾杯A', status: 'active' },
+      { object_id: 'o2', object_type: 'product', canonical_ref: 'FLP-P-000002', title: '龙虾杯B', status: 'active' },
+    ] }
+    await w.vm.$nextTick()
+    expect(w.text()).toContain('搜索结果 2 条')
+    expect(w.text()).toContain('不会自动选第一条')
+    expect(w.text()).toContain('龙虾杯A')
+    expect(w.text()).toContain('龙虾杯B')
+    const rows = w.findAll('button').filter((b) => b.text().includes('龙虾杯'))
+    expect(rows.length).toBe(2)
   })
 })

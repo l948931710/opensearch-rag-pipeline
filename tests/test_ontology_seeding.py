@@ -277,3 +277,28 @@ def test_cli_refuses_prod_target(monkeypatch):
 def test_cli_commit_dryrun_mutex():
     with pytest.raises(SystemExit):
         _run_cli([str(FIXTURE), "--commit", "--dry-run"])
+
+
+def test_real_run_records_population_snapshot(store_factory=None):
+    """PR-F：真跑登记 per-namespace 源快照（dry 零写不登记）——coverage 真实分母。"""
+    from opensearch_pipeline.ontology.seeding import SeedRecord, seed_snapshot
+    from opensearch_pipeline.ontology.store import MemoryOntologyStore
+
+    class _Src:
+        def iter_records(self):
+            yield SeedRecord(namespace="u8", raw_code="P1", object_type="product",
+                             title="甲", owner_dept="pmc")
+            yield SeedRecord(namespace="u8", raw_code="P2", object_type="product",
+                             title="乙", owner_dept="pmc")
+            yield SeedRecord(namespace="internal", raw_code="N1", object_type="product",
+                             title="丙", owner_dept="pmc")
+
+    dry_store = MemoryOntologyStore()
+    seed_snapshot(dry_store, _Src(), dry_run=True)
+    assert dry_store.population_total() is None            # dry 零写铁律
+
+    real_store = MemoryOntologyStore()
+    seed_snapshot(real_store, _Src(), dry_run=False)
+    assert real_store.population_total() == 3
+    cov = real_store.coverage()
+    assert cov["denominator"] == "population" and cov["population_records"] == 3

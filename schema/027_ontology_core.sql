@@ -59,6 +59,18 @@ CREATE TABLE IF NOT EXISTS ontology_attribute_source (
   PRIMARY KEY (object_type, attribute)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ── 源快照 population：coverage 的真实分母（PR-F，P1「覆盖率虚高」修复）──────────────
+-- seeding/backfill 真跑（非 dry）时按 namespace upsert 本轮源记录数；coverage 有快照
+-- 用快照做分母并标 denominator='population'，无快照回退 active/(active+open) 近似并
+-- 明标 'approx'——不再把"处置率"冒充"覆盖率"。
+CREATE TABLE IF NOT EXISTS ontology_source_population (
+  namespace    VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,   -- 与 identifier 同 bin 口径
+  records      INT          NOT NULL,                      -- 该 namespace 最近一次源快照记录数
+  source       VARCHAR(64)  NOT NULL,                      -- seeding|backfill|<CSV 名>
+  snapshot_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (namespace)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ── stewardship：审批/工作台授权的权威源（S5 独立化，最小形态）─────────────────────
 -- scope 三种粒度：object_type（身份确认归谁）/ namespace（某客户别名归谁）/ attribute（属性级）。
 -- 裁决顺序（代码侧）：attribute > namespace > object_type，未命中 → 仅 kb_admin 可处置（fail-closed）。

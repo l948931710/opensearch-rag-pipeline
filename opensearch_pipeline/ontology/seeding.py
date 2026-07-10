@@ -390,11 +390,13 @@ def seed_snapshot(store, source: Any, *, dry_run: bool = True,
     report = SeedReport(dry_run=dry_run)
     sink = _Sink(store, dry_run, report, evidence_source=evidence_source)
     records: Iterable[SeedRecord] = source.iter_records()
+    ns_counts: Dict[str, int] = {}                       # PR-F：coverage 真实分母源快照
     for r in records:
         if limit is not None and report.records >= limit:
             report.add(action="limit_reached", limit=limit)
             break
         report.records += 1
+        ns_counts[r.namespace] = ns_counts.get(r.namespace, 0) + 1
         try:
             _decide(r, sink, tau, report, mint_new=mint_new)
         except Exception as e:   # noqa: BLE001 — 单条脏数据不掀翻整批
@@ -402,4 +404,9 @@ def seed_snapshot(store, source: Any, *, dry_run: bool = True,
             report.add(action="error", namespace=r.namespace, raw=r.raw_code, error=str(e))
             logger.warning("播种单条失败（跳过继续）：%s %s", r.namespace, r.raw_code,
                            exc_info=True)
+    if not dry_run and ns_counts:
+        try:   # 快照登记 fail-open：分母是指标不是事实，登记失败不掀翻批
+            store.record_population_snapshot(ns_counts, source=evidence_source)
+        except Exception:   # noqa: BLE001
+            logger.warning("population 快照登记失败（coverage 回退 approx 口径）", exc_info=True)
     return report

@@ -1,41 +1,63 @@
 <script setup lang="ts">
-import { Fingerprint, Loader2, Search } from 'lucide-vue-next'
+import { ref } from 'vue'
+import { Fingerprint, Loader2, Search, X } from 'lucide-vue-next'
 import { deptLabel } from '@/lib/kb'
-import { useOntology, type OntologyCandidate, type OntologyCase } from '@/composables/useOntology'
+import { useOntology, type OntologyCandidate, type OntologyCase, type OntologyObjectHit } from '@/composables/useOntology'
 import { useDialog } from '@/composables/useDialog'
 import LoadError from './LoadError.vue'
 
 // steward 消解工作台（独立 tab 主体）：覆盖率卡片 + open case 队列。
-// 处置三动作：确认候选 / 手动指定（搜索目标对象后确认=改指）/ 驳回（理由必填）。
+// 处置三动作：确认候选 / 手动指定（搜索 → **人工显式点选**目标 → 确认）/ 驳回。
+// PR-F（P0-06 HITL 验收⑥）：confirm 与 dismiss 同纪律**理由必填**；手动指定
+// 绝不自动取第一条；候选行展示目标归属/密级；evidence_json 可展开核对。
 // 授权由服务端硬校验（kb_admin / stewardship scope 的 dept_admin）；此处只做操作面。
 const {
   ontologyCases, ontologyCoverage, ontologyError, isOntologyBusy,
   loadOntology, confirmOntologyCase, dismissOntologyCase, searchOntologyObjects,
 } = useOntology()
-const { promptText, confirm, notice } = useDialog()
+const { promptText, notice } = useDialog()
+
+// 手动指定：per-case 搜索结果（内联渲染，人工点选——不取 hits[0]）
+const manualHits = ref<Record<string, OntologyObjectHit[]>>({})
 
 function pct(v: number | null | undefined): string {
   return v == null ? '—' : `${Math.round(v * 100)}%`
 }
 function ts(v: string | number | null): string { return typeof v === 'string' ? v.slice(0, 16) : '' }
 function confPct(c: OntologyCandidate): string { return `${Math.round(c.confidence * 100)}%` }
-
-async function onConfirm(kase: OntologyCase, cand: OntologyCandidate) {
-  const ok = await confirm({
-    title: '确认身份映射',
-    message: `把「${kase.namespace}」编号 ${kase.raw_value} 正式映射到 ` +
-      `${cand.title || cand.canonical_ref} [${cand.canonical_ref}]（来源 ${cand.method}，` +
-      `置信 ${confPct(cand)}）？确认后立即生效为检索/计算的依据。`,
-    confirmText: '确认映射',
-  })
-  if (!ok) return
-  void confirmOntologyCase(kase, cand)
+function prettyEvidence(raw: string | null): string {
+  if (!raw) return ''
+  try { return JSON.stringify(JSON.parse(raw), null, 2) } catch { return raw }
 }
 
-async function onManualAssign(kase: OntologyCase) {
+async function askReason(title: string, message: string): Promise<string | null> {
+  const reason = await promptText({
+    title, message, placeholder: '确认理由（必填，审计留痕）', confirmText: '确认映射',
+  })
+  if (reason === null) return null
+  if (!reason.trim()) {
+    void notice({ title: '需要理由', message: '确认必须填写理由（与驳回同纪律，审计留痕）。', danger: true })
+    return null
+  }
+  return reason.trim()
+}
+
+async function onConfirm(kase: OntologyCase, cand: OntologyCandidate) {
+  const reason = await askReason(
+    '确认身份映射',
+    `把「${kase.namespace}」编号 ${kase.raw_value} 正式映射到 ` +
+      `${cand.title || cand.canonical_ref} [${cand.canonical_ref}]（来源 ${cand.method}，` +
+      `置信 ${confPct(cand)}${cand.owner_dept ? `，归属 ${deptLabel(cand.owner_dept)}` : ''}` +
+      `${cand.data_classification ? `，密级 ${cand.data_classification}` : ''}）？` +
+      '确认后立即生效为检索/计算的依据。')
+  if (reason === null) return
+  void confirmOntologyCase(kase, cand, reason)
+}
+
+async function onManualSearch(kase: OntologyCase) {
   const q = await promptText({
     title: '手动指定目标对象',
-    message: '候选都不对时，按名称搜索目标对象（取最匹配一条，确认前会再核对）。',
+    message: '候选都不对时，按名称搜索目标对象；结果列在卡片里，由你**点选**要映射的那一条。',
     placeholder: '对象名称关键词（如：龙虾杯）',
     confirmText: '搜索',
   })
@@ -45,15 +67,22 @@ async function onManualAssign(kase: OntologyCase) {
     void notice({ title: '未找到对象', message: '换个关键词试试；确实没有则该编号可能需要新建对象（走播种/登记流程）。', danger: true })
     return
   }
-  const top = hits[0]
-  const ok = await confirm({
-    title: '确认手动指定',
-    message: `匹配到 ${hits.length} 条，取最匹配：${top.title} [${top.canonical_ref}]。` +
-      `把编号 ${kase.raw_value} 映射到它？`,
-    confirmText: '确认映射',
-  })
-  if (!ok) return
-  void confirmOntologyCase(kase, { target_object_id: top.object_id }, '手动指定')
+  manualHits.value = { ...manualHits.value, [kase.case_id]: hits }
+}
+
+function clearManualHits(caseId: string) {
+  const next = { ...manualHits.value }
+  delete next[caseId]
+  manualHits.value = next
+}
+
+async function onPickManualTarget(kase: OntologyCase, hit: OntologyObjectHit) {
+  const reason = await askReason(
+    '确认手动指定',
+    `把编号 ${kase.raw_value} 映射到你选中的 ${hit.title} [${hit.canonical_ref}]？`)
+  if (reason === null) return
+  const done = await confirmOntologyCase(kase, { target_object_id: hit.object_id }, reason)
+  if (done) clearManualHits(kase.case_id)
 }
 
 async function onDismiss(kase: OntologyCase) {
@@ -77,7 +106,7 @@ async function onDismiss(kase: OntologyCase) {
   <section class="space-y-4">
     <LoadError :message="ontologyError" @retry="loadOntology(true)" />
 
-    <!-- 覆盖率卡片（S9 口径：确认别名 / 覆盖率 / 积压 / 人工审核率） -->
+    <!-- 覆盖率卡片（S9 口径；PR-F：分母口径明示——population=源快照真实分母 / approx=处置率近似） -->
     <div v-if="ontologyCoverage" class="grid grid-cols-2 gap-3 sm:grid-cols-4">
       <div class="rounded-xl border border-border bg-card px-4 py-3">
         <div class="text-[11px] font-medium text-muted-foreground">已确认别名</div>
@@ -87,7 +116,10 @@ async function onDismiss(kase: OntologyCase) {
       <div class="rounded-xl border border-border bg-card px-4 py-3">
         <div class="text-[11px] font-medium text-muted-foreground">消解覆盖率</div>
         <div class="mt-1 text-xl font-bold text-foreground">{{ pct(ontologyCoverage.resolution_coverage) }}</div>
-        <div class="mt-0.5 text-[11px] text-faint">= 已确认 / (已确认+积压)</div>
+        <div v-if="ontologyCoverage.denominator === 'population'" class="mt-0.5 text-[11px] text-faint">
+          = 已确认 / 源快照 {{ ontologyCoverage.population_records }}
+        </div>
+        <div v-else class="mt-0.5 text-[11px] text-faint">≈ 已确认 / (已确认+积压)——近似口径，非真实覆盖率</div>
       </div>
       <div class="rounded-xl border border-border bg-card px-4 py-3">
         <div class="text-[11px] font-medium text-muted-foreground">待处置积压</div>
@@ -126,7 +158,7 @@ async function onDismiss(kase: OntologyCase) {
             type="button"
             class="inline-flex items-center gap-1 self-start rounded-lg border border-border px-3 py-[6px] text-[12px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
             :disabled="isOntologyBusy(`onto:${kase.case_id}`)"
-            @click="onManualAssign(kase)"
+            @click="onManualSearch(kase)"
           ><Search :size="12" :stroke-width="2" /> 手动指定</button>
           <button
             type="button"
@@ -136,27 +168,64 @@ async function onDismiss(kase: OntologyCase) {
           ><Loader2 v-if="isOntologyBusy(`onto:${kase.case_id}`)" :size="12" :stroke-width="2" class="animate-spin" />驳回</button>
         </div>
 
-        <!-- 候选：每条一键确认；无候选给指引 -->
+        <!-- 证据快照（PR-F HITL：处置人看得见依据，不是盲确认按钮） -->
+        <details v-if="kase.evidence_json" class="mt-2 rounded-lg bg-panel px-3 py-2">
+          <summary class="cursor-pointer text-[11.5px] font-medium text-muted-foreground">证据快照（evidence）</summary>
+          <pre class="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-foreground">{{ prettyEvidence(kase.evidence_json) }}</pre>
+        </details>
+
+        <!-- 候选：每条一键确认（理由必填）；跨部门不可读候选只显受限占位；无候选给指引 -->
         <div v-if="kase.candidates.length" class="mt-2 space-y-1.5">
           <div
             v-for="cand in kase.candidates" :key="cand.candidate_id"
             class="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-panel px-3 py-2"
           >
-            <span class="min-w-0 flex-1 truncate text-[12.5px] text-foreground">
+            <span v-if="cand.target_visible === false" class="min-w-0 flex-1 truncate text-[12.5px] text-faint">
+              [受限对象]（目标归属其他部门，无权查看/确认）
+            </span>
+            <span v-else class="min-w-0 flex-1 truncate text-[12.5px] text-foreground">
               {{ cand.title || cand.canonical_ref }}
               <span class="ml-1 font-mono text-[11px] text-faint">[{{ cand.canonical_ref }}]</span>
+              <span v-if="cand.owner_dept" class="ml-1 text-[11px] text-faint">· {{ deptLabel(cand.owner_dept) }}</span>
+              <span v-if="cand.data_classification && cand.data_classification !== 'internal'" class="ml-1 text-[11px] text-faint">· {{ cand.data_classification }}</span>
               <span v-if="cand.target_status && cand.target_status !== 'active'" class="ml-1 text-[11px] text-st-fail">（对象已{{ cand.target_status }}）</span>
             </span>
             <span class="font-mono text-[11px] text-muted-foreground">{{ cand.method }} · {{ confPct(cand) }}</span>
             <button
               type="button"
               class="inline-flex items-center gap-1 rounded-lg bg-primary px-3 py-[5px] text-[12px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-              :disabled="cand.target_status !== 'active' || isOntologyBusy(`onto:${kase.case_id}`)"
+              :disabled="cand.target_visible === false || cand.target_status !== 'active' || isOntologyBusy(`onto:${kase.case_id}`)"
               @click="onConfirm(kase, cand)"
             ><Loader2 v-if="isOntologyBusy(`onto:${kase.case_id}`)" :size="12" :stroke-width="2" class="animate-spin" />确认此候选</button>
           </div>
         </div>
         <p v-else class="mt-2 text-[12px] text-faint">无系统候选——可手动指定目标对象，或驳回留档（如需新建对象走登记流程）。</p>
+
+        <!-- 手动指定：搜索结果内联列出，人工点选（PR-F：绝不自动取第一条） -->
+        <div v-if="manualHits[kase.case_id]?.length" class="mt-2 rounded-lg border border-border bg-panel px-3 py-2">
+          <div class="flex items-center gap-2">
+            <span class="text-[11.5px] font-medium text-muted-foreground">
+              搜索结果 {{ manualHits[kase.case_id].length }} 条——点选要映射的目标（不会自动选第一条）
+            </span>
+            <div class="flex-1" />
+            <button type="button" class="text-faint transition hover:text-foreground" aria-label="关闭搜索结果" @click="clearManualHits(kase.case_id)">
+              <X :size="13" :stroke-width="2" />
+            </button>
+          </div>
+          <div class="mt-1.5 space-y-1">
+            <button
+              v-for="hit in manualHits[kase.case_id]" :key="hit.object_id"
+              type="button"
+              class="flex w-full items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5 text-left text-[12.5px] text-foreground transition hover:border-border-strong disabled:opacity-50"
+              :disabled="isOntologyBusy(`onto:${kase.case_id}`)"
+              @click="onPickManualTarget(kase, hit)"
+            >
+              <span class="min-w-0 flex-1 truncate">{{ hit.title }}</span>
+              <span class="font-mono text-[11px] text-faint">[{{ hit.canonical_ref }}]</span>
+              <span v-if="hit.owner_dept" class="text-[11px] text-faint">{{ deptLabel(hit.owner_dept) }}</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -170,7 +239,7 @@ async function onDismiss(kase: OntologyCase) {
     </div>
 
     <p class="ml-0.5 text-[11.5px] text-faint">
-      确认=铸正式别名（同编号至多一条现行映射，可在对象详情里纠错改指）；驳回必须留理由；auto 通道确认的映射会进抽检队列复核。
+      确认=铸正式别名（同编号至多一条现行映射，可在对象详情里纠错改指）；确认与驳回都必须留理由；auto 通道确认的映射会进抽检队列复核。
     </p>
   </section>
 </template>

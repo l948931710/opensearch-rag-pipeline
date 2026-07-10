@@ -73,7 +73,7 @@ def test_flag_off_hides_all_endpoints(store, monkeypatch):
     c = _client(_identity())
     assert c.get("/api/ontology/workbench").status_code == 404
     assert c.post("/api/ontology/cases/x/confirm",
-                  json={"target_object_id": "o"}).status_code == 404
+                  json={"target_object_id": "o", "note": "测试确认"}).status_code == 404
     assert c.get("/api/ontology/coverage").status_code == 404
 
 
@@ -173,11 +173,11 @@ def test_confirm_scope_authz(store):
     obj, case_id = _seed_case(store)      # steward=pmc
     no_scope = _client(_identity(user_id="d2", role="dept_admin", managed=("finance",)))
     r = no_scope.post(f"/api/ontology/cases/{case_id}/confirm",
-                      json={"target_object_id": obj["object_id"]})
+                      json={"target_object_id": obj["object_id"], "note": "测试确认"})
     assert r.status_code == 404           # PR-B：scope 外与不存在同答（防存在性泄露）
     kb = _client(_identity(user_id="root", role="kb_admin"))
     assert kb.post(f"/api/ontology/cases/{case_id}/confirm",
-                   json={"target_object_id": obj["object_id"]}).status_code == 200
+                   json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 200
 
 
 def test_confirm_unscoped_namespace_fail_closed(store):
@@ -186,10 +186,10 @@ def test_confirm_unscoped_namespace_fail_closed(store):
     case_id = store.upsert_case("lot_code", "lt1", "LT1", object_type_hint=None)
     dept = _client(_identity(user_id="d3", role="dept_admin", managed=("pmc",)))
     assert dept.post(f"/api/ontology/cases/{case_id}/confirm",
-                     json={"target_object_id": obj["object_id"]}).status_code == 404
+                     json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 404
     kb = _client(_identity(user_id="root", role="kb_admin"))
     assert kb.post(f"/api/ontology/cases/{case_id}/confirm",
-                   json={"target_object_id": obj["object_id"]}).status_code == 200
+                   json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 200
 
 
 def test_confirm_conflicts(store):
@@ -197,21 +197,21 @@ def test_confirm_conflicts(store):
     c = _client(_identity())
     # 目标不存在 / 目标非 active
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
-                  json={"target_object_id": "nope"}).status_code == 404
+                  json={"target_object_id": "nope", "note": "测试确认"}).status_code == 404
     retired = store.mint_object("product", "退役品", owner_dept="pmc")
     store.retire_object(retired["object_id"])
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
-                  json={"target_object_id": retired["object_id"]}).status_code == 409
+                  json={"target_object_id": retired["object_id"], "note": "测试确认"}).status_code == 409
     # 已有 active 映射 → 409
     store.insert_identifier("u8", "abc123-m", "ABC123-M", obj["object_id"], method="manual")
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
-                  json={"target_object_id": obj["object_id"]}).status_code == 409
+                  json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 409
     # case 已处置 → 409
     store.dismiss_case(case_id, by="x", note="test")
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
-                  json={"target_object_id": obj["object_id"]}).status_code == 409
+                  json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 409
     assert c.post("/api/ontology/cases/ghost/confirm",
-                  json={"target_object_id": obj["object_id"]}).status_code == 404
+                  json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 404
 
 
 def test_confirm_race_atomic_no_leak(store, monkeypatch):
@@ -222,7 +222,7 @@ def test_confirm_race_atomic_no_leak(store, monkeypatch):
     store.dismiss_case(case_id, by="rival", note="并发方先处置")
     monkeypatch.setattr(store, "get_case", lambda cid: dict(snapshot))
     r = _client(_identity()).post(f"/api/ontology/cases/{case_id}/confirm",
-                                  json={"target_object_id": obj["object_id"]})
+                                  json={"target_object_id": obj["object_id"], "note": "测试确认"})
     assert r.status_code == 409
     assert store.get_active_identifier("u8", "ABC123-M") is None   # 零副作用
     assert all(a["decision"] != "confirm" for a in store.audit_rows)   # 审计也零
@@ -382,7 +382,7 @@ def test_confirm_cross_dept_confidential_target_denied(store):
     case_id = store.upsert_case("customer:KFC", "K1", "K1", object_type_hint=None)
     mkt = _client(_identity(user_id="mk", role="dept_admin", managed=("marketing",)))
     r = mkt.post(f"/api/ontology/cases/{case_id}/confirm",
-                 json={"target_object_id": conf["object_id"]})
+                 json={"target_object_id": conf["object_id"], "note": "测试确认"})
     assert r.status_code == 404                          # 目标不可见 = 不存在
     assert store.get_active_identifier("customer:KFC", "K1") is None
 
@@ -392,7 +392,7 @@ def test_confirm_type_mismatch_denied(store):
     obj = store.mint_object("material", "PP料", owner_dept="pmc")
     case_id = store.upsert_case("u8", "m1", "M1", object_type_hint="product")
     r = _client(_identity()).post(f"/api/ontology/cases/{case_id}/confirm",
-                                  json={"target_object_id": obj["object_id"]})
+                                  json={"target_object_id": obj["object_id"], "note": "测试确认"})
     assert r.status_code == 400 and "类型" in r.json()["detail"]
 
 
@@ -422,7 +422,7 @@ def test_workbench_audit_fail_closed_zero_side_effects(store):
     api.app.dependency_overrides[current_identity] = (lambda i=_identity(): i)
     c = TestClient(api.app, raise_server_exceptions=False)
     r = c.post(f"/api/ontology/cases/{case_id}/confirm",
-               json={"target_object_id": obj["object_id"]})
+               json={"target_object_id": obj["object_id"], "note": "测试确认"})
     assert r.status_code == 500
     assert store.get_case(case_id)["status"] == "open"
     assert store.get_active_identifier("u8", "ABC123-M") is None
@@ -432,5 +432,29 @@ def test_workbench_audit_fail_closed_zero_side_effects(store):
     assert store.audit_rows == []
     store.audit_hook = None
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
-                  json={"target_object_id": obj["object_id"]}).status_code == 200
+                  json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 200
     assert store.audit_rows[-1]["decision"] == "confirm"
+
+
+# ── PR-F：HITL 强制理由 + coverage 真实分母 ────────────────────────────────────
+
+
+def test_confirm_requires_note(store):
+    obj, case_id = _seed_case(store)
+    r = _client(_identity()).post(f"/api/ontology/cases/{case_id}/confirm",
+                                  json={"target_object_id": obj["object_id"], "note": "  "})
+    assert r.status_code == 400 and "理由" in r.json()["detail"]
+    assert store.get_case(case_id)["status"] == "open"
+
+
+def test_coverage_dual_denominator(store):
+    obj, _ = _seed_case(store)
+    store.insert_identifier("u8", "c1", "C1", obj["object_id"], method="seed")
+    c = _client(_identity())
+    cov = c.get("/api/ontology/coverage").json()
+    assert cov["denominator"] == "approx" and cov["population_records"] is None
+    store.record_population_snapshot({"u8": 10}, source="seeding")
+    cov2 = c.get("/api/ontology/coverage").json()
+    assert cov2["denominator"] == "population" and cov2["population_records"] == 10
+    assert cov2["resolution_coverage"] == pytest.approx(
+        cov2["active_identifiers"] / 10)
