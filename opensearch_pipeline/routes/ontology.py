@@ -11,9 +11,11 @@ routes/ontology.py — steward 消解工作台（本体 P0 PR6；docs/ontology_p
 managed_owner_depts（resolve_kb_identity **DB 权威现查**，与 routes/agent.py 审批授权
 同纪律）；scope 未命中 → 仅 kb_admin（fail-closed）。普通员工无入口。
 
-留痕：所有变更动作写 agent_audit_log（event_type='ontology_workbench'，fail-open——
-审计抖动不阻断治理操作；这与 HIGH_WRITE 工具的 fail-closed 语义不同，工作台动作
-本身就是人审）。flag `RAG_ONTOLOGY_ENABLE` 默认 off → 全部端点 404（镜像 agent.py）。
+留痕（PR-C，P0-06 收口）：所有变更动作的审计行与事实变更**同一事务**落
+agent_audit_log（event_type='ontology_workbench'，**fail-closed**——审计不可写 →
+整笔回滚 5xx，绝不出现"身份脊柱已改而审计无痕"）。审计载荷经 `_audit_payload`
+构造、由 store 写方法在事务内落库。flag `RAG_ONTOLOGY_ENABLE` 默认 off →
+全部端点 404（镜像 agent.py）。
 """
 import logging
 import os
@@ -47,14 +49,12 @@ def _get_store():
     return _STORE
 
 
-def _audit(*, action: str, decision: str, by: str, detail: Optional[Dict[str, Any]] = None):
-    """治理留痕（fail-open）；测试 monkeypatch 本函数断言留痕。"""
-    try:
-        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
-        RDSAuditLog().record(None, event_type="ontology_workbench", action=action,
-                             decision=decision, detail={"by": by, **(detail or {})})
-    except Exception:   # noqa: BLE001
-        logger.warning("ontology 工作台审计写失败（fail-open）", exc_info=True)
+def _audit_payload(*, action: str, decision: str, by: str,
+                   detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """治理留痕载荷（PR-C fail-closed）：交给 store 写方法在**同一事务**内落
+    agent_audit_log——审计不可写即整笔回滚，本函数只构造不落库。"""
+    return {"event_type": "ontology_workbench", "action": action,
+            "decision": decision, "by": by, "detail": detail or {}}
 
 
 # ── 门禁 ─────────────────────────────────────────────────────────────────────
@@ -305,24 +305,23 @@ def ontology_case_confirm(case_id: str, req: ConfirmRequest, request: Request,
     if reason:
         _raise_mutation_denied(reason)
     from opensearch_pipeline.ontology.store import DuplicateActiveIdentifier
+    # PR-C（P0-05）：铸别名 + case→resolved + 审计 **一个事务**（store 内 FOR UPDATE），
+    # 并发被抢在事务内即失败整体回滚——不再有"先 commit 别名再补偿 deactivate"的分叉窗口
     try:
-        identifier_id = store.insert_identifier(
-            case["namespace"], case["raw_value"], case["norm_value"], req.target_object_id,
-            method="manual", relation=req.relation, target_revision=req.target_revision,
-            confidence=1.0, confirmed_by=identity.user_id, source_case_id=case_id)
+        identifier_id = store.confirm_case_with_identifier(
+            case_id, target_object_id=req.target_object_id, by=identity.user_id,
+            note=req.note, relation=req.relation, target_revision=req.target_revision,
+            audit=_audit_payload(
+                action=f"case:{case_id}", decision="confirm", by=identity.user_id,
+                detail={"namespace": case["namespace"], "norm_value": case["norm_value"],
+                        "target_object_id": req.target_object_id,
+                        "target_revision": req.target_revision,
+                        "note": (req.note or "")[:200]}))
     except DuplicateActiveIdentifier:
         raise HTTPException(status_code=409,
                             detail="该编号已有正式映射——请先在对象详情里纠错（改指/退役）")
-    if not store.resolve_case(case_id, identifier_id=identifier_id, by=identity.user_id,
-                              note=req.note):
-        # 并发方先处置了 case：补偿刚铸的别名，绝不留「case 已关但别名悄悄生效」
-        store.deactivate_identifier(identifier_id, status="rejected")
-        raise HTTPException(status_code=409, detail="case 已被并发处置（本次确认已回滚）")
-    _audit(action=f"case:{case_id}", decision="confirm", by=identity.user_id,
-           detail={"namespace": case["namespace"], "norm_value": case["norm_value"],
-                   "target_object_id": req.target_object_id,
-                   "target_revision": req.target_revision,
-                   "identifier_id": identifier_id, "note": (req.note or "")[:200]})
+    except ValueError:
+        raise HTTPException(status_code=409, detail="case 已被并发处置（本次确认未生效）")
     return {"case_id": case_id, "status": "resolved", "identifier_id": identifier_id}
 
 
@@ -343,14 +342,17 @@ def ontology_case_dismiss(case_id: str, req: DismissRequest, request: Request,
     _authorize_steward(identity, kb, _steward_dept_for(
         store, namespace=case["namespace"], object_type=case.get("object_type_hint")))
     try:
-        ok = store.dismiss_case(case_id, by=identity.user_id, note=req.note)
+        ok = store.dismiss_case(case_id, by=identity.user_id, note=req.note,
+                                audit=_audit_payload(
+                                    action=f"case:{case_id}", decision="dismiss",
+                                    by=identity.user_id,
+                                    detail={"namespace": case["namespace"],
+                                            "norm_value": case["norm_value"],
+                                            "note": req.note[:200]}))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not ok:
         raise HTTPException(status_code=409, detail=f"case 非 open（{case['status']}）")
-    _audit(action=f"case:{case_id}", decision="dismiss", by=identity.user_id,
-           detail={"namespace": case["namespace"], "norm_value": case["norm_value"],
-                   "note": req.note[:200]})
     return {"case_id": case_id, "status": "dismissed"}
 
 
@@ -377,11 +379,14 @@ def ontology_identifier_deactivate(identifier_id: str, req: NoteRequest, request
     store = _get_store()
     row, _obj, steward = _load_identifier_scope(store, identifier_id)
     _authorize_steward(identity, kb, steward)
-    if not store.deactivate_identifier(identifier_id, status="rejected"):
+    if not store.deactivate_identifier(
+            identifier_id, status="rejected",
+            audit=_audit_payload(action=f"identifier:{identifier_id}", decision="deactivate",
+                                 by=identity.user_id,
+                                 detail={"namespace": row["namespace"],
+                                         "norm_value": row["norm_value"],
+                                         "note": (req.note or "")[:200]})):
         raise HTTPException(status_code=409, detail=f"identifier 非 active（{row['status']}）")
-    _audit(action=f"identifier:{identifier_id}", decision="deactivate", by=identity.user_id,
-           detail={"namespace": row["namespace"], "norm_value": row["norm_value"],
-                   "note": (req.note or "")[:200]})
     return {"identifier_id": identifier_id, "status": "rejected"}
 
 
@@ -409,15 +414,18 @@ def ontology_identifier_repoint(identifier_id: str, req: RepointRequest, request
     if reason:
         _raise_mutation_denied(reason)
     try:
-        new_id = store.repoint_identifier(identifier_id, req.target_object_id,
-                                          by=identity.user_id,
-                                          new_target_revision=req.target_revision)
+        new_id = store.repoint_identifier(
+            identifier_id, req.target_object_id, by=identity.user_id,
+            new_target_revision=req.target_revision,
+            audit=_audit_payload(action=f"identifier:{identifier_id}", decision="repoint",
+                                 by=identity.user_id,
+                                 detail={"namespace": row["namespace"],
+                                         "norm_value": row["norm_value"],
+                                         "old_target": row["target_object_id"],
+                                         "new_target": req.target_object_id,
+                                         "note": (req.note or "")[:200]}))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    _audit(action=f"identifier:{identifier_id}", decision="repoint", by=identity.user_id,
-           detail={"namespace": row["namespace"], "norm_value": row["norm_value"],
-                   "old_target": row["target_object_id"], "new_target": req.target_object_id,
-                   "new_identifier_id": new_id, "note": (req.note or "")[:200]})
     return {"identifier_id": identifier_id, "new_identifier_id": new_id, "status": "superseded"}
 
 
@@ -436,10 +444,13 @@ def ontology_object_retire(object_id: str, req: NoteRequest, request: Request,
         raise HTTPException(status_code=404, detail="对象不存在")
     _authorize_steward(identity, kb,
                        _steward_dept_for(store, object_type=obj["object_type"]))
-    if not store.retire_object(object_id):
+    if not store.retire_object(
+            object_id,
+            audit=_audit_payload(action=f"object:{object_id}", decision="retire",
+                                 by=identity.user_id,
+                                 detail={"canonical_ref": obj.get("canonical_ref"),
+                                         "note": (req.note or "")[:200]})):
         raise HTTPException(status_code=409, detail=f"对象非 active（{obj['status']}）")
-    _audit(action=f"object:{object_id}", decision="retire", by=identity.user_id,
-           detail={"canonical_ref": obj.get("canonical_ref"), "note": (req.note or "")[:200]})
     return {"object_id": object_id, "status": "retired"}
 
 
@@ -470,11 +481,14 @@ def ontology_object_mark_duplicate(object_id: str, req: MarkDuplicateRequest, re
     if reason:
         _raise_mutation_denied(reason)
     try:
-        ok = store.mark_duplicate(object_id, req.merged_into, by=identity.user_id)
+        ok = store.mark_duplicate(
+            object_id, req.merged_into, by=identity.user_id,
+            audit=_audit_payload(action=f"object:{object_id}", decision="mark_duplicate",
+                                 by=identity.user_id,
+                                 detail={"merged_into": req.merged_into,
+                                         "note": (req.note or "")[:200]}))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not ok:
         raise HTTPException(status_code=409, detail=f"对象非 active（{obj['status']}）")
-    _audit(action=f"object:{object_id}", decision="mark_duplicate", by=identity.user_id,
-           detail={"merged_into": req.merged_into, "note": (req.note or "")[:200]})
     return {"object_id": object_id, "status": "merged", "merged_into": req.merged_into}

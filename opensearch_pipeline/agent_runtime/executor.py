@@ -132,7 +132,8 @@ class ThreadedRunExecutor:
             raise
 
     def resume(self, run_id: str, ctx: ExecutionContext, outcome, loop: AgentLoop,
-               tools: List, on_complete=None, on_failure=None) -> RunHandle:
+               tools: List, on_complete=None, on_failure=None,
+               approval_meta: Optional[dict] = None) -> RunHandle:
         """WS3 两步 resume：① CAS suspended→resuming（认领，防两审批回调并发重入）② 载 checkpoint +
         记 approvals（批准/改参令 adjudicator 绕过审批执行）+ resuming→running + 驱动 loop.resume。
         返回续跑 run 的 handle。outcome ∈ Approved/Edited/RejectedFeedback/RejectedTerminate。
@@ -170,8 +171,11 @@ class ThreadedRunExecutor:
                 # 只放行被批的那一次调用，call_id 复用/改参重放不匹配即重新挂起（A 组 P1）。
                 args = (outcome.edited_args if isinstance(outcome, Edited)
                         else pending.get("arguments", {}))
+                meta = approval_meta or {}
                 self._approvals[f"{run_id}:{pending['call_id']}"] = ApprovalGrant(
-                    outcome=outcome, tool_name=pending["tool_name"], args_digest=digest(args))
+                    outcome=outcome, tool_name=pending["tool_name"], args_digest=digest(args),
+                    request_id=meta.get("request_id"), decided_by=meta.get("decided_by"),
+                    approver_scope=meta.get("approver_scope"))
             if not self._store.transition(run_id, "resuming", "running"):      # ③ 接手
                 raise RunRejected(f"run {run_id} resuming→running 失败（并发/迟到）")
             claimed = False                               # 已交棒 running：失败恢复归驱动器

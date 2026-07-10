@@ -55,7 +55,7 @@ _RDS_OK = _rds_ready()
 _MARK = "__pys_"
 
 
-def _cleanup_rds():
+def _cleanup_rds(_retry: bool = True):
     import pymysql
 
     from opensearch_pipeline.config import get_config
@@ -70,7 +70,20 @@ def _cleanup_rds():
                     "WHERE o.title LIKE %s", (like,))
         cur.execute("DELETE FROM ontology_identifier WHERE namespace LIKE %s", (like,))
         cur.execute("DELETE FROM ontology_object WHERE title LIKE %s", (like,))
-    conn.close()
+    try:
+        conn.close()
+    except Exception:   # noqa: BLE001
+        pass
+
+
+def _cleanup_rds_safe():
+    """FK 后并行 worker 清扫可能偶发 1213 死锁——重试一次（PR-C flake 治理）。"""
+    try:
+        _cleanup_rds()
+    except Exception:   # noqa: BLE001
+        import time as _t
+        _t.sleep(0.2)
+        _cleanup_rds()
 
 
 @pytest.fixture(params=["memory", "rds"])
@@ -81,7 +94,7 @@ def store(request):
     if not _RDS_OK:
         pytest.skip("本地 MySQL 无 ontology 表/030 视图（先 apply schema 027-030）")
     yield RDSOntologyStore()
-    _cleanup_rds()
+    _cleanup_rds_safe()
 
 
 @pytest.fixture()
@@ -202,7 +215,7 @@ def test_rds_view_and_inline_parity(monkeypatch):
             key = lambda r: r["spec_id"]   # noqa: E731
             assert sorted(via_view[kind], key=key) == sorted(via_inline[kind], key=key)
     finally:
-        _cleanup_rds()
+        _cleanup_rds_safe()
 
 
 # ── sem.py 服务层（memory；行过滤/回落/挑行规则）──────────────────────────────────

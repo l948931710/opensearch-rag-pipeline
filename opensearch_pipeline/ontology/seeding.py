@@ -204,6 +204,32 @@ class _Sink:
             r.object_type, r.title, owner_dept=r.owner_dept, golden=r.attrs,
             data_classification=r.data_classification)["object_id"]
 
+    def mint_with_alias(self, r: SeedRecord, ns: str, raw: str, norm: str):
+        """铸对象 + 首别名 + （若有）闭 open case **一个事务**（PR-C，P0-05）：
+        别名撞 uk → store 整体回滚（无孤儿对象），返回 (None, False) 由调用方按
+        已激活跳过记账。dry-run 记 planned 账本仿真同一语义。返回 (object_id, ok)。"""
+        case_id = self._open_case_id(ns, norm)
+        if self.dry:
+            oid = self.mint(r)
+            self._planned_alias[(ns, norm)] = oid
+            if case_id:
+                self._note_heal(ns, norm, case_id)
+            return oid, True
+        try:
+            res = self._store.mint_object_with_alias(
+                r.object_type, r.title, owner_dept=r.owner_dept, golden=r.attrs,
+                data_classification=r.data_classification,
+                namespace=ns, raw_value=raw, norm_value=norm,
+                method="seed", relation="canonical", confidence=1.0, confirmed_by="auto",
+                close_open_case=True,
+                case_note=f"离线{self._evidence_source}铸对象落成，case 随之闭环")
+        except DuplicateActiveIdentifier:
+            return None, False
+        if res.get("closed_case_id"):
+            self._healed.add((ns, norm))
+            self._report.cases_healed += 1
+        return res["object_id"], True
+
     def alias(self, ns: str, raw: str, norm: str, target: str, *, method: str,
               confidence: float, relation: str = "alias") -> bool:
         """True=落成；False=撞已激活（并发/重跑），调用方按跳过记账。
@@ -342,16 +368,16 @@ def _decide(r: SeedRecord, sink: _Sink, tau: TauTable, report: SeedReport, *,
         report.add(action="case", namespace=r.namespace, norm=norm, candidates=0)
         return
 
-    # 无候选 → 新物理对象：铸 canonical + 首别名
-    oid = sink.mint(r)
-    if sink.alias(r.namespace, r.raw_code, norm, oid, method="seed", confidence=1.0,
-                  relation="canonical"):
+    # 无候选 → 新物理对象：铸 canonical + 首别名（同事务，P0-05——撞键整体回滚无孤儿）
+    oid, ok = sink.mint_with_alias(r, r.namespace, r.raw_code, norm)
+    if ok:
         report.minted += 1
         report.add(action="mint", namespace=r.namespace, norm=norm, target=oid,
                    title=r.title)
-    else:   # 极窄竞态：铸完对象别名被并发占——对象留着（无别名），入账错误供人查
-        report.errors += 1
-        report.add(action="mint_alias_conflict", namespace=r.namespace, norm=norm, target=oid)
+    else:   # 并发方先占了别名：视同已激活跳过（重跑幂等语义），零残留
+        report.skipped_active += 1
+        report.add(action="skip_active", namespace=r.namespace, norm=norm)
+        sink.heal_if_stale(r.namespace, norm)
 
 
 def seed_snapshot(store, source: Any, *, dry_run: bool = True,

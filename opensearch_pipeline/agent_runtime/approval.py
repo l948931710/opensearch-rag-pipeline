@@ -13,7 +13,7 @@ approval.py — ApprovalOutcome 判别联合（执行模型 §2 / 报告 §5 四
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from typing_extensions import Annotated
@@ -62,6 +62,12 @@ class ApprovalGrant:
     outcome: ApprovalOutcome
     tool_name: str
     args_digest: str
+    # PR-C（P0-06 回链）：审批事实随凭据走到执行点——adjudicator 消费时注入 ctx，
+    # 工具把 request_id 落事实行、confirmed_by 记真实审批人。缺省 None（直驱测试/
+    # 未接持久化路径零变化）。
+    request_id: Optional[str] = None
+    decided_by: Optional[str] = None
+    approver_scope: Optional[str] = None
 
 
 def parse_outcome(data: Dict[str, Any]) -> ApprovalOutcome:

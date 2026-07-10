@@ -309,7 +309,7 @@ def _self_approval_allowed() -> bool:
 
 
 def _authorize_approver(identity: Identity, run: dict, areq: Optional[dict],
-                        outcome_kind: str) -> None:
+                        outcome_kind: str) -> Optional[str]:
     """职责分离 + approver_scope 裁决（深度审查 A 组 P1「审批人=发起人」）。
 
     - 发起人本人：只允许撤回自己的申请（rejected_terminate）；批准/改参/反馈须他人。
@@ -318,18 +318,26 @@ def _authorize_approver(identity: Identity, run: dict, areq: Optional[dict],
     - 请求行缺失（approval_store 故障/历史挂起）→ scope 未知 → 只有 kb_admin 可审（fail-closed）。
     """
     requester = run.get("user_id")
+    scope = (areq or {}).get("approver_scope") or ""
+    # PR-C（P0-06 #4）：注册了 per-tool 解析器的工具在**审批时现算** scope——
+    # 提案后 stewardship 变更即时生效（旧 steward 部门不再能凭快照批准）。
+    # 未注册工具返回 None → 沿用快照（默认推导语义零变化）；现算异常 '' fail-closed。
+    if areq is not None:
+        from opensearch_pipeline.agent_runtime.approval_store import resolve_scope_live
+        live = resolve_scope_live(areq.get("tool_name"), areq.get("proposed_args"))
+        if live is not None:
+            scope = live
     if identity.user_id == requester:
         if outcome_kind == "rejected_terminate" or _self_approval_allowed():
-            return                                     # 撤回自己的申请恒允许
+            return scope                               # 撤回自己的申请恒允许
         raise HTTPException(status_code=403, detail="发起人不能审批自己的请求（职责分离）")
     from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
     from opensearch_pipeline.kb_authz import ROLE_DEPT_ADMIN, ROLE_KB_ADMIN, managed_owner_depts
     kb = resolve_kb_identity(identity.user_id)
     if kb.role == ROLE_KB_ADMIN:
-        return
-    scope = (areq or {}).get("approver_scope") or ""
+        return scope
     if kb.role == ROLE_DEPT_ADMIN and scope and scope in set(managed_owner_depts(kb)):
-        return
+        return scope
     raise HTTPException(status_code=403,
                         detail="无权审批该请求（需 kb_admin 或 approver_scope 覆盖的 dept_admin）")
 
@@ -369,7 +377,7 @@ def agent_approve(req: ApproveRequest, request: Request,
         areq = approval_store.get_latest_by_run(req.run_id)
     except Exception:   # noqa: BLE001 — 读失败按「请求行缺失」处理（授权侧 fail-closed 到 kb_admin）
         logger.warning("approval_request 读取失败（授权收敛到 kb_admin）", exc_info=True)
-    _authorize_approver(identity, run, areq, outcome.kind)
+    effective_scope = _authorize_approver(identity, run, areq, outcome.kind)
 
     # 决定持久化：pending → CAS 决出（first-valid-wins + uk_req_idem 幂等）；
     # 已决同向 → resume 重放（决策已落库、上次 resume 失败回滚 suspended 的重试路径）；
@@ -418,9 +426,17 @@ def agent_approve(req: ApproveRequest, request: Request,
     message_id, _remember, _report_failure = _resume_callbacks(
         run_store, run, thread_id, requester_id, req_groups)
 
+    # PR-C（P0-06 回链）：审批事实随凭据到执行点——工具落 approval_request_id、
+    # confirmed_by 记真实审批人、执行前重验 scope 漂移
+    approval_meta = None
+    if areq is not None:
+        approval_meta = {"request_id": areq.get("request_id"),
+                         "decided_by": identity.user_id,
+                         "approver_scope": effective_scope}
     try:
         handle = executor.resume(req.run_id, ctx, outcome, loop, tools,
-                                 on_complete=_remember, on_failure=_report_failure)
+                                 on_complete=_remember, on_failure=_report_failure,
+                                 approval_meta=approval_meta)
     except RunRejected:
         raise HTTPException(status_code=409, detail="run 非挂起或已被认领")
 
@@ -530,7 +546,9 @@ def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -
             run_store, run, thread_id, requester_id, req_groups)
         try:
             handle = executor.resume(run_id, ctx, outcome, loop, tools,
-                                     on_complete=_remember, on_failure=_report_failure)
+                                     on_complete=_remember, on_failure=_report_failure,
+                                     approval_meta={"request_id": c.get("request_id"),
+                                                    "decided_by": c.get("decided_by")})
         except RunRejected:
             logger.warning("B6 对账：run %s 重驱被拒（池满/已被认领），下轮再试", run_id)
             continue

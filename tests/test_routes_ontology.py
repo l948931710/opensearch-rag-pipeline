@@ -27,9 +27,8 @@ def store(monkeypatch):
     monkeypatch.setattr(onto_route, "_STORE", None)
     monkeypatch.setattr(onto_route, "_get_store", lambda: mem)
     monkeypatch.setenv("RAG_ONTOLOGY_ENABLE", "true")
-    audits = []
-    monkeypatch.setattr(onto_route, "_audit", lambda **kw: audits.append(kw))
-    mem.audits = audits
+    # PR-C：审计随 store 写方法同事务落库（Memory 收进 audit_rows）——不再 monkeypatch 路由层
+    mem.audits = mem.audit_rows
     monkeypatch.setattr("opensearch_pipeline.dingtalk_identity.resolve_kb_identity",
                         lambda uid: SimpleNamespace(role=_ROLES.get(uid, "employee"),
                                                     user_id=uid))
@@ -215,14 +214,18 @@ def test_confirm_conflicts(store):
                   json={"target_object_id": obj["object_id"]}).status_code == 404
 
 
-def test_confirm_race_compensates_identifier(store, monkeypatch):
-    """并发方先处置 case → 刚铸别名必须回滚（绝不留 case 已关但别名生效）。"""
+def test_confirm_race_atomic_no_leak(store, monkeypatch):
+    """PR-C（P0-05）：并发方先处置 case → 确认在**同一事务**内失败整体回滚——
+    不再有"先 commit 别名再补偿"的分叉窗口（旧补偿式已删除）。"""
     obj, case_id = _seed_case(store)
-    monkeypatch.setattr(store, "resolve_case", lambda *a, **k: False)
+    snapshot = dict(store.get_case(case_id))          # 路由读到的"还 open"的旧快照
+    store.dismiss_case(case_id, by="rival", note="并发方先处置")
+    monkeypatch.setattr(store, "get_case", lambda cid: dict(snapshot))
     r = _client(_identity()).post(f"/api/ontology/cases/{case_id}/confirm",
                                   json={"target_object_id": obj["object_id"]})
     assert r.status_code == 409
-    assert store.get_active_identifier("u8", "ABC123-M") is None   # 补偿生效
+    assert store.get_active_identifier("u8", "ABC123-M") is None   # 零副作用
+    assert all(a["decision"] != "confirm" for a in store.audit_rows)   # 审计也零
 
 
 def test_confirm_body_validation(store):
@@ -402,3 +405,32 @@ def test_repoint_cross_type_denied(store):
                                   json={"target_object_id": m["object_id"]})
     assert r.status_code == 400 and "类型" in r.json()["detail"]
     assert store.get_active_identifier("u8", "Z9")["target_object_id"] == a["object_id"]
+
+
+# ── PR-C（P0-06）：工作台审计 fail-closed ──────────────────────────────────────
+
+
+def test_workbench_audit_fail_closed_zero_side_effects(store):
+    """审计不可写 → 5xx 且零副作用（case 仍 open、无别名、对象未退役）。"""
+    obj, case_id = _seed_case(store)
+
+    def _boom(payload):
+        raise RuntimeError("audit db down")
+
+    store.audit_hook = _boom
+    # raise_server_exceptions=False：验证的是"未捕获异常 → 500"的生产语义
+    api.app.dependency_overrides[current_identity] = (lambda i=_identity(): i)
+    c = TestClient(api.app, raise_server_exceptions=False)
+    r = c.post(f"/api/ontology/cases/{case_id}/confirm",
+               json={"target_object_id": obj["object_id"]})
+    assert r.status_code == 500
+    assert store.get_case(case_id)["status"] == "open"
+    assert store.get_active_identifier("u8", "ABC123-M") is None
+    r2 = c.post(f"/api/ontology/objects/{obj['object_id']}/retire", json={})
+    assert r2.status_code == 500
+    assert store.get_object(obj["object_id"])["status"] == "active"
+    assert store.audit_rows == []
+    store.audit_hook = None
+    assert c.post(f"/api/ontology/cases/{case_id}/confirm",
+                  json={"target_object_id": obj["object_id"]}).status_code == 200
+    assert store.audit_rows[-1]["decision"] == "confirm"

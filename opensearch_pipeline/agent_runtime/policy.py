@@ -196,6 +196,18 @@ def make_adjudicator(registry: "ToolRegistry", policy: PolicyEngine, run_store,
                                tool.spec.risk_level.value)
                 return ToolResult.pending()
             pdecision = "approved"
+            # PR-C（P0-06 回链）：审批事实注入 ctx——工具据此落 approval_request_id /
+            # 真实审批人 / 审批时 scope（落库前重验 stewardship 漂移）。ctx 是 frozen
+            # dataclass 用 replace；测试用简化 ctx（无这些字段）时静默跳过。
+            if getattr(grant, "request_id", None) or getattr(grant, "decided_by", None):
+                try:
+                    from dataclasses import replace as _dc_replace
+                    ctx = _dc_replace(
+                        ctx, approval_request_id=getattr(grant, "request_id", None),
+                        approved_by=getattr(grant, "decided_by", None),
+                        approval_scope=getattr(grant, "approver_scope", None))
+                except TypeError:
+                    pass
         # ALLOW / 已批准 → 经中间件栈执行（超时/重试/幂等/熔断 + 记 executing→result）。
         # 幂等键按**逻辑调用**派生（run_id:call_id）：step_no 每裁决 MAX+1 新生成，
         # 用它做键任何重放/重试永远 miss，幂等层整层空转（深度审查 C 组 P1）。

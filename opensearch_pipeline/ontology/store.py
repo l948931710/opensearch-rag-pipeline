@@ -88,6 +88,28 @@ class RDSOntologyStore:
         # 1452 = Cannot add or update a child row（FK 悬空目标，P0-03）
         return bool(getattr(exc, "args", None)) and exc.args[0] == 1452
 
+    @staticmethod
+    def _audit_in_tx(cur, audit: Optional[Dict[str, Any]]) -> None:
+        """同事务合规审计行（PR-C，P0-06 fail-closed）：审计行与事实变更一个事务——
+        写失败异常上抛 → 整笔回滚，**审计不可用时零副作用**。audit=None 跳过
+        （离线播种等非治理路径；工作台/工具路径必传）。跨库同连接（agent_audit_log
+        在 fuling_operation，本体表在 fuling_ontology，同实例单连接事务成立）。"""
+        if not audit:
+            return
+        import uuid as _uuid
+
+        from opensearch_pipeline.config import get_config
+        op_db = get_config().rds.operation_database
+        detail = audit.get("detail") or {}
+        cur.execute(
+            f"INSERT INTO {op_db}.agent_audit_log "
+            "(audit_id, event_type, action, decision, user_id, detail_json, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,NOW(3))",
+            (_uuid.uuid4().hex, audit.get("event_type", "ontology_workbench"),
+             str(audit.get("action") or "-")[:96], str(audit.get("decision") or "-")[:32],
+             str(audit.get("by") or "-")[:64],
+             json.dumps(detail, ensure_ascii=False, default=str)))
+
     # ── 对象 ────────────────────────────────────────────────────────────────
     def mint_object(self, object_type: str, title: str, *, owner_dept: str,
                     golden: Optional[Dict[str, Any]] = None,
@@ -175,10 +197,10 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
-    def retire_object(self, object_id: str) -> bool:
+    def retire_object(self, object_id: str, *, audit: Optional[Dict[str, Any]] = None) -> bool:
         """S3 纠错（P0-03 收口）：**同一事务**内 对象 active→retired + 其全部 active 别名→'retired'
         + 其双向 active link→retired。退役后不留任何仍指向它的 active 引用（resolve/sem 双闸兜底）。
-        审计留痕在调用方（工作台 routes）。"""
+        audit 同事务落 agent_audit_log（P0-06 fail-closed）。"""
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -195,6 +217,7 @@ class RDSOntologyStore:
                 cur.execute(f"UPDATE {db}.ontology_link SET status='retired' "
                             "WHERE (src_object_id=%s OR dst_object_id=%s) AND status='active'",
                             (object_id, object_id))
+                self._audit_in_tx(cur, audit)
             conn.commit()
             return True
         except Exception:
@@ -204,7 +227,8 @@ class RDSOntologyStore:
             conn.close()
 
     def mark_duplicate(self, object_id: str, merged_into: str, *,
-                       by: Optional[str] = None) -> bool:
+                       by: Optional[str] = None,
+                       audit: Optional[Dict[str, Any]] = None) -> bool:
         """S3 纠错（P0-03 收口）：**同一事务**内 source active→merged(+merged_into) +
         source 的全部 active 别名改指 target（supersede+插新 active 行，身份连续）+
         source 的 active link→retired（不搬运——target 自己的关系不受污染，全量传播=P2）。
@@ -254,6 +278,7 @@ class RDSOntologyStore:
                 cur.execute(f"UPDATE {db}.ontology_link SET status='retired' "
                             "WHERE (src_object_id=%s OR dst_object_id=%s) AND status='active'",
                             (object_id, object_id))
+                self._audit_in_tx(cur, audit)
             conn.commit()
             return True
         except Exception:
@@ -318,7 +343,8 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
-    def deactivate_identifier(self, identifier_id: str, *, status: str = "rejected") -> bool:
+    def deactivate_identifier(self, identifier_id: str, *, status: str = "rejected",
+                              audit: Optional[Dict[str, Any]] = None) -> bool:
         """S3：active→rejected|superseded（CAS）。误配纠正的第一动作。"""
         if status not in _IDENTIFIER_END_STATES:
             raise ValueError(f"非法终态 {status!r}（合法：{_IDENTIFIER_END_STATES}）")
@@ -328,6 +354,8 @@ class RDSOntologyStore:
                 cur.execute(f"UPDATE {db}.ontology_identifier SET status=%s "
                             "WHERE identifier_id=%s AND status='active'", (status, identifier_id))
                 ok = cur.rowcount == 1
+                if ok:
+                    self._audit_in_tx(cur, audit)
             conn.commit()
             return ok
         except Exception:
@@ -337,7 +365,8 @@ class RDSOntologyStore:
             conn.close()
 
     def repoint_identifier(self, identifier_id: str, new_target_object_id: str, *,
-                           by: str, new_target_revision: Optional[str] = None) -> str:
+                           by: str, new_target_revision: Optional[str] = None,
+                           audit: Optional[Dict[str, Any]] = None) -> str:
         """S3 原子改指：同一事务内 旧行 active→superseded(+superseded_by) + 插新 active 行。
         返回新行 identifier_id；旧行非 active → ValueError（先查明现状再纠错）。"""
         db, conn = self._db(), self._conn()
@@ -364,6 +393,7 @@ class RDSOntologyStore:
                     (new_id, old["namespace"], old["raw_value"], old["norm_value"],
                      new_target_object_id, new_target_revision, old["relation"],
                      old["source_case_id"], by))
+                self._audit_in_tx(cur, audit)
             conn.commit()
             return new_id
         except Exception as e:
@@ -371,6 +401,188 @@ class RDSOntologyStore:
             if self._is_dup(e):   # 理论不可达（旧 active 刚被本事务 supersede）；防御留位
                 raise DuplicateActiveIdentifier(
                     f"{identifier_id} 改指撞 active 唯一键（并发插入）")
+            raise
+        finally:
+            conn.close()
+
+    # ── 原子复合写（PR-C，P0-05：多步写一个事务，崩溃/竞态不留半状态）────────
+    def mint_object_with_alias(self, object_type: str, title: str, *, owner_dept: str,
+                               namespace: str, raw_value: str, norm_value: str,
+                               golden: Optional[Dict[str, Any]] = None,
+                               data_classification: str = "internal",
+                               source_of_record: str = "ontology",
+                               lifecycle_state: str = "draft",
+                               method: str = "seed", relation: str = "canonical",
+                               confidence: float = 1.0, confirmed_by: Optional[str] = None,
+                               close_open_case: bool = True,
+                               case_note: Optional[str] = None,
+                               audit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """铸对象 + 首别名（+顺手闭同 (ns,norm) 的 open case）**一个事务**。
+
+        别名撞 uk → 整体回滚（对象不留），抛 DuplicateActiveIdentifier——P0-05 的
+        「铸完对象别名被并发占 → 永久孤儿」由此根除。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT type_code FROM {db}.ontology_ref_seq "
+                            "WHERE object_type=%s", (object_type,))
+                row = cur.fetchone()
+                if row is None:
+                    raise ValueError(f"object_type {object_type!r} 未在 ontology_ref_seq 登记类型码")
+                type_code = row[0]
+                cur.execute(f"UPDATE {db}.ontology_ref_seq "
+                            "SET next_no=LAST_INSERT_ID(next_no+1) WHERE object_type=%s",
+                            (object_type,))
+                cur.execute("SELECT LAST_INSERT_ID()")
+                seq_no = int(cur.fetchone()[0])
+                object_id = new_ulid()
+                canonical_ref = format_ref(type_code, seq_no)
+                cur.execute(
+                    f"INSERT INTO {db}.ontology_object "
+                    "(object_id, object_type, canonical_ref, title, golden_json, lifecycle_state, "
+                    " owner_dept, data_classification, source_of_record) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (object_id, object_type, canonical_ref, title, _dump(golden or {}),
+                     lifecycle_state, owner_dept, data_classification, source_of_record))
+                case_id = None
+                if close_open_case:
+                    cur.execute(f"SELECT case_id FROM {db}.ontology_resolution_case "
+                                "WHERE namespace=%s AND norm_value=%s AND status='open' "
+                                "FOR UPDATE", (namespace, norm_value))
+                    hit = cur.fetchone()
+                    case_id = hit[0] if hit else None
+                identifier_id = new_ulid()
+                cur.execute(
+                    f"INSERT INTO {db}.ontology_identifier "
+                    "(identifier_id, namespace, raw_value, norm_value, target_object_id, "
+                    " relation, resolution_method, confidence, status, source_case_id, "
+                    " confirmed_by, confirmed_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,NOW(3))",
+                    (identifier_id, namespace, raw_value, norm_value, object_id,
+                     relation, method, confidence, case_id, confirmed_by))
+                if case_id:
+                    cur.execute(
+                        f"UPDATE {db}.ontology_resolution_case "
+                        "SET status='resolved', resolved_identifier_id=%s, resolved_by=%s, "
+                        "    resolved_at=NOW(3), resolution_note=%s "
+                        "WHERE case_id=%s AND status='open'",
+                        (identifier_id, confirmed_by or "auto",
+                         case_note or "铸对象+首别名同事务闭环", case_id))
+                self._audit_in_tx(cur, audit)
+            conn.commit()
+            return {"object_id": object_id, "object_type": object_type,
+                    "canonical_ref": canonical_ref, "title": title,
+                    "identifier_id": identifier_id, "closed_case_id": case_id}
+        except Exception as e:
+            conn.rollback()
+            if self._is_dup(e):
+                raise DuplicateActiveIdentifier(
+                    f"{namespace}:{norm_value} 已有 active 别名（mint 整体回滚，无孤儿对象）")
+            raise
+        finally:
+            conn.close()
+
+    def confirm_case_with_identifier(self, case_id: str, *, target_object_id: str,
+                                     by: str, note: Optional[str] = None,
+                                     relation: str = "alias",
+                                     target_revision: Optional[str] = None,
+                                     method: str = "manual", confidence: float = 1.0,
+                                     audit: Optional[Dict[str, Any]] = None) -> str:
+        """工作台确认（P0-05）：case 锁定校验 open + 铸别名 + case→resolved + 审计
+        **一个事务**——并发被抢在事务内即失败整体回滚，不再需要"补偿 deactivate"。
+
+        case 不存在/非 open → ValueError；别名撞 uk → DuplicateActiveIdentifier。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {db}.ontology_resolution_case "
+                            "WHERE case_id=%s FOR UPDATE", (case_id,))
+                rows = self._rows_to_dicts(cur)
+                if not rows or rows[0]["status"] != "open":
+                    raise ValueError(f"case {case_id} 不存在或非 open（已被并发处置）")
+                case = rows[0]
+                identifier_id = new_ulid()
+                cur.execute(
+                    f"INSERT INTO {db}.ontology_identifier "
+                    "(identifier_id, namespace, raw_value, norm_value, target_object_id, "
+                    " target_revision, relation, resolution_method, confidence, status, "
+                    " source_case_id, confirmed_by, confirmed_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,NOW(3))",
+                    (identifier_id, case["namespace"], case["raw_value"], case["norm_value"],
+                     target_object_id, target_revision, relation, method, confidence,
+                     case_id, by))
+                cur.execute(
+                    f"UPDATE {db}.ontology_resolution_case "
+                    "SET status='resolved', resolved_identifier_id=%s, resolved_by=%s, "
+                    "    resolved_at=NOW(3), resolution_note=%s "
+                    "WHERE case_id=%s AND status='open'",
+                    (identifier_id, by, note, case_id))
+                if cur.rowcount != 1:   # FOR UPDATE 后理论不可达；防御
+                    raise ValueError(f"case {case_id} 状态竞态，已整体回滚")
+                if audit:   # 审计 detail 补铸出的 identifier_id（同事务内已知）
+                    audit = {**audit, "detail": {**(audit.get("detail") or {}),
+                                                 "identifier_id": identifier_id}}
+                self._audit_in_tx(cur, audit)
+            conn.commit()
+            return identifier_id
+        except Exception as e:
+            conn.rollback()
+            if self._is_dup(e):
+                raise DuplicateActiveIdentifier(
+                    f"{case_id} 对应编号已有 active 别名（确认整体回滚）")
+            if self._is_fk_violation(e):
+                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+            raise
+        finally:
+            conn.close()
+
+    def insert_identifier_closing_case(self, namespace: str, raw_value: str, norm_value: str,
+                                       target_object_id: str, *, method: str = "manual",
+                                       relation: str = "alias",
+                                       target_revision: Optional[str] = None,
+                                       confidence: float = 1.0,
+                                       confirmed_by: Optional[str] = None,
+                                       approval_request_id: Optional[str] = None,
+                                       note: Optional[str] = None,
+                                       audit: Optional[Dict[str, Any]] = None):
+        """受治理 Action 确认（P0-05/06）：铸别名 +（若有）闭同 (ns,norm) open case
+        **一个事务**——正式 identifier 与治理 case 不再可分叉。返回
+        (identifier_id, closed_case_id)。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT case_id FROM {db}.ontology_resolution_case "
+                            "WHERE namespace=%s AND norm_value=%s AND status='open' "
+                            "FOR UPDATE", (namespace, norm_value))
+                hit = cur.fetchone()
+                case_id = hit[0] if hit else None
+                identifier_id = new_ulid()
+                cur.execute(
+                    f"INSERT INTO {db}.ontology_identifier "
+                    "(identifier_id, namespace, raw_value, norm_value, target_object_id, "
+                    " target_revision, relation, resolution_method, confidence, status, "
+                    " source_case_id, confirmed_by, approval_request_id, confirmed_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,%s,NOW(3))",
+                    (identifier_id, namespace, raw_value, norm_value, target_object_id,
+                     target_revision, relation, method, confidence, case_id,
+                     confirmed_by, approval_request_id))
+                if case_id:
+                    cur.execute(
+                        f"UPDATE {db}.ontology_resolution_case "
+                        "SET status='resolved', resolved_identifier_id=%s, resolved_by=%s, "
+                        "    resolved_at=NOW(3), resolution_note=%s "
+                        "WHERE case_id=%s AND status='open'",
+                        (identifier_id, confirmed_by or "-",
+                         note or "经受治理动作确认", case_id))
+                self._audit_in_tx(cur, audit)
+            conn.commit()
+            return identifier_id, case_id
+        except Exception as e:
+            conn.rollback()
+            if self._is_dup(e):
+                raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
+            if self._is_fk_violation(e):
+                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
             raise
         finally:
             conn.close()
@@ -710,18 +922,22 @@ class RDSOntologyStore:
             conn.close()
 
     def resolve_case(self, case_id: str, *, identifier_id: str, by: str,
-                     note: Optional[str] = None) -> bool:
+                     note: Optional[str] = None,
+                     audit: Optional[Dict[str, Any]] = None) -> bool:
         return self._case_transition(case_id, to_status="resolved", by=by, note=note,
-                                     identifier_id=identifier_id)
+                                     identifier_id=identifier_id, audit=audit)
 
-    def dismiss_case(self, case_id: str, *, by: str, note: str) -> bool:
+    def dismiss_case(self, case_id: str, *, by: str, note: str,
+                     audit: Optional[Dict[str, Any]] = None) -> bool:
         """驳回/终止必须给理由（工作台契约）——空 note 直接 ValueError。"""
         if not (note or "").strip():
             raise ValueError("dismiss 必须给 resolution_note（处置理由）")
-        return self._case_transition(case_id, to_status="dismissed", by=by, note=note)
+        return self._case_transition(case_id, to_status="dismissed", by=by, note=note,
+                                     audit=audit)
 
     def _case_transition(self, case_id: str, *, to_status: str, by: str,
-                         note: Optional[str], identifier_id: Optional[str] = None) -> bool:
+                         note: Optional[str], identifier_id: Optional[str] = None,
+                         audit: Optional[Dict[str, Any]] = None) -> bool:
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -732,6 +948,8 @@ class RDSOntologyStore:
                     "WHERE case_id=%s AND status='open'",
                     (to_status, identifier_id, by, note, case_id))
                 ok = cur.rowcount == 1
+                if ok:
+                    self._audit_in_tx(cur, audit)
             conn.commit()
             return ok
         except Exception:
@@ -864,10 +1082,23 @@ class MemoryOntologyStore:
         self._stewardship: Dict[tuple, Dict[str, Any]] = {}
         self._seq: Dict[str, list] = {t: [code, 0] for t, code in self._SEED_TYPES}
         self._clock = 0   # 单调伪时钟：排序用（first/last_seen）
+        # PR-C：同事务审计的 Memory 形态——audit_rows 收集、audit_hook 供测试注入失败
+        # （hook 抛异常 = 模拟 agent_audit_log 不可写 → 方法必须零副作用地上抛）
+        self.audit_rows: List[Dict[str, Any]] = []
+        self.audit_hook = None
 
     def _tick(self) -> int:
         self._clock += 1
         return self._clock
+
+    def _memory_audit(self, audit) -> None:
+        """与 RDS._audit_in_tx 同语义：audit 写失败（hook 抛）→ 调用方在变更前上抛，
+        零副作用。调用点约定：**先审计后变更**（锁内），等价于事务原子性。"""
+        if not audit:
+            return
+        if self.audit_hook is not None:
+            self.audit_hook(audit)
+        self.audit_rows.append(dict(audit))
 
     # ── 对象 ────────────────────────────────────────────────────────────────
     def mint_object(self, object_type, title, *, owner_dept, golden=None,
@@ -910,12 +1141,13 @@ class MemoryOntologyStore:
             row["version"] += 1
             return True
 
-    def retire_object(self, object_id):
+    def retire_object(self, object_id, *, audit=None):
         """P0-03 级联（与 RDS 同契约）：对象→retired + active 别名→retired + 双向 link→retired。"""
         with self._lock:
             row = self._objects.get(object_id)
             if not row or row["status"] != "active":
                 return False
+            self._memory_audit(audit)
             row["status"] = "retired"
             for ident in self._identifiers.values():
                 if ident["target_object_id"] == object_id and ident["status"] == "active":
@@ -926,7 +1158,7 @@ class MemoryOntologyStore:
                     lk["status"] = "retired"
             return True
 
-    def mark_duplicate(self, object_id, merged_into, *, by=None):
+    def mark_duplicate(self, object_id, merged_into, *, by=None, audit=None):
         """P0-03 级联（与 RDS 同契约）：同类型/目标 active/防自指闸 + source 别名改指 target
         + source link→retired。"""
         if object_id == merged_into:
@@ -941,6 +1173,7 @@ class MemoryOntologyStore:
             if src["object_type"] != dst["object_type"]:
                 raise ValueError(
                     f"跨类型合并拒绝：{src['object_type']} → {dst['object_type']}")
+            self._memory_audit(audit)
             src["status"] = "merged"
             src["merged_into"] = merged_into
             for ident in list(self._identifiers.values()):
@@ -998,22 +1231,24 @@ class MemoryOntologyStore:
             row = self._identifiers.get(identifier_id)
             return dict(row) if row else None
 
-    def deactivate_identifier(self, identifier_id, *, status="rejected"):
+    def deactivate_identifier(self, identifier_id, *, status="rejected", audit=None):
         if status not in _IDENTIFIER_END_STATES:
             raise ValueError(f"非法终态 {status!r}（合法：{_IDENTIFIER_END_STATES}）")
         with self._lock:
             row = self._identifiers.get(identifier_id)
             if not row or row["status"] != "active":
                 return False
+            self._memory_audit(audit)
             row["status"] = status
             return True
 
     def repoint_identifier(self, identifier_id, new_target_object_id, *, by,
-                           new_target_revision=None):
+                           new_target_revision=None, audit=None):
         with self._lock:
             row = self._identifiers.get(identifier_id)
             if not row or row["status"] != "active":
                 raise ValueError(f"identifier {identifier_id} 不存在或非 active，无法改指")
+            self._memory_audit(audit)
             row["status"] = "superseded"   # 同锁内先让位再插新行（对齐 RDS 同事务原子性）
             try:
                 new_id = self.insert_identifier(
@@ -1026,6 +1261,106 @@ class MemoryOntologyStore:
                 raise
             row["superseded_by"] = new_id
             return new_id
+
+    # ── 原子复合写（PR-C，与 RDS 同契约）────────────────────────────────────
+    def mint_object_with_alias(self, object_type, title, *, owner_dept, namespace,
+                               raw_value, norm_value, golden=None,
+                               data_classification="internal",
+                               source_of_record="ontology", lifecycle_state="draft",
+                               method="seed", relation="canonical", confidence=1.0,
+                               confirmed_by=None, close_open_case=True, case_note=None,
+                               audit=None):
+        with self._lock:
+            if self.get_active_identifier(namespace, norm_value) is not None:
+                raise DuplicateActiveIdentifier(
+                    f"{namespace}:{norm_value} 已有 active 别名（mint 整体回滚，无孤儿对象）")
+            if object_type not in self._seq:
+                raise ValueError(f"object_type {object_type!r} 未在 ontology_ref_seq 登记类型码")
+            self._memory_audit(audit)
+            obj = self.mint_object(object_type, title, owner_dept=owner_dept, golden=golden,
+                                   data_classification=data_classification,
+                                   source_of_record=source_of_record,
+                                   lifecycle_state=lifecycle_state)
+            case = self.get_open_case(namespace, norm_value) if close_open_case else None
+            identifier_id = new_ulid()
+            self._identifiers[identifier_id] = {
+                "identifier_id": identifier_id, "namespace": namespace,
+                "raw_value": raw_value, "norm_value": norm_value,
+                "target_object_id": obj["object_id"], "target_revision": None,
+                "relation": relation, "resolution_method": method,
+                "confidence": confidence, "status": "active", "superseded_by": None,
+                "source_case_id": case["case_id"] if case else None,
+                "confirmed_by": confirmed_by, "approval_request_id": None,
+                "first_seen_at": self._tick()}
+            closed = None
+            if case:
+                self._case_transition(case["case_id"], to_status="resolved",
+                                      by=confirmed_by or "auto",
+                                      note=case_note or "铸对象+首别名同事务闭环",
+                                      identifier_id=identifier_id)
+                closed = case["case_id"]
+            return {**obj, "identifier_id": identifier_id, "closed_case_id": closed}
+
+    def confirm_case_with_identifier(self, case_id, *, target_object_id, by, note=None,
+                                     relation="alias", target_revision=None,
+                                     method="manual", confidence=1.0, audit=None):
+        with self._lock:
+            case = self._cases.get(case_id)
+            if not case or case["status"] != "open":
+                raise ValueError(f"case {case_id} 不存在或非 open（已被并发处置）")
+            if self.get_active_identifier(case["namespace"], case["norm_value"]) is not None:
+                raise DuplicateActiveIdentifier(
+                    f"{case_id} 对应编号已有 active 别名（确认整体回滚）")
+            if target_object_id not in self._objects:
+                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+            identifier_id = new_ulid()
+            if audit:
+                audit = {**audit, "detail": {**(audit.get("detail") or {}),
+                                             "identifier_id": identifier_id}}
+            self._memory_audit(audit)
+            self._identifiers[identifier_id] = {
+                "identifier_id": identifier_id, "namespace": case["namespace"],
+                "raw_value": case["raw_value"], "norm_value": case["norm_value"],
+                "target_object_id": target_object_id, "target_revision": target_revision,
+                "relation": relation, "resolution_method": method,
+                "confidence": confidence, "status": "active", "superseded_by": None,
+                "source_case_id": case_id, "confirmed_by": by,
+                "approval_request_id": None, "first_seen_at": self._tick()}
+            case.update(status="resolved", resolved_identifier_id=identifier_id,
+                        resolved_by=by, resolution_note=note)
+            return identifier_id
+
+    def insert_identifier_closing_case(self, namespace, raw_value, norm_value,
+                                       target_object_id, *, method="manual",
+                                       relation="alias", target_revision=None,
+                                       confidence=1.0, confirmed_by=None,
+                                       approval_request_id=None, note=None, audit=None):
+        with self._lock:
+            if self.get_active_identifier(namespace, norm_value) is not None:
+                raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
+            if target_object_id not in self._objects:
+                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+            case = self.get_open_case(namespace, norm_value)
+            self._memory_audit(audit)
+            identifier_id = new_ulid()
+            self._identifiers[identifier_id] = {
+                "identifier_id": identifier_id, "namespace": namespace,
+                "raw_value": raw_value, "norm_value": norm_value,
+                "target_object_id": target_object_id, "target_revision": target_revision,
+                "relation": relation, "resolution_method": method,
+                "confidence": confidence, "status": "active", "superseded_by": None,
+                "source_case_id": case["case_id"] if case else None,
+                "confirmed_by": confirmed_by,
+                "approval_request_id": approval_request_id,
+                "first_seen_at": self._tick()}
+            closed = None
+            if case:
+                self._case_transition(case["case_id"], to_status="resolved",
+                                      by=confirmed_by or "-",
+                                      note=note or "经受治理动作确认",
+                                      identifier_id=identifier_id)
+                closed = case["case_id"]
+            return identifier_id, closed
 
     def list_identifiers_for_target(self, target_object_id, status=None):
         with self._lock:
@@ -1189,20 +1524,23 @@ class MemoryOntologyStore:
             rows = [dict(r) for r in self._candidates.values() if r["case_id"] == case_id]
             return sorted(rows, key=lambda r: -r["confidence"])
 
-    def resolve_case(self, case_id, *, identifier_id, by, note=None):
+    def resolve_case(self, case_id, *, identifier_id, by, note=None, audit=None):
         return self._case_transition(case_id, to_status="resolved", by=by, note=note,
-                                     identifier_id=identifier_id)
+                                     identifier_id=identifier_id, audit=audit)
 
-    def dismiss_case(self, case_id, *, by, note):
+    def dismiss_case(self, case_id, *, by, note, audit=None):
         if not (note or "").strip():
             raise ValueError("dismiss 必须给 resolution_note（处置理由）")
-        return self._case_transition(case_id, to_status="dismissed", by=by, note=note)
+        return self._case_transition(case_id, to_status="dismissed", by=by, note=note,
+                                     audit=audit)
 
-    def _case_transition(self, case_id, *, to_status, by, note, identifier_id=None):
+    def _case_transition(self, case_id, *, to_status, by, note, identifier_id=None,
+                         audit=None):
         with self._lock:
             row = self._cases.get(case_id)
             if not row or row["status"] != "open":
                 return False
+            self._memory_audit(audit)
             row.update(status=to_status, resolved_identifier_id=identifier_id,
                        resolved_by=by, resolution_note=note)
             return True

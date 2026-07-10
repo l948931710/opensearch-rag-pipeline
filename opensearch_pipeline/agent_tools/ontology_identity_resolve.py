@@ -64,6 +64,11 @@ _INPUT_SCHEMA = {
             "description": "映射关系（缺省 alias）",
         },
         "note": {"type": "string", "description": "确认理由（留档）"},
+        "expected_version": {
+            "type": "integer", "minimum": 1,
+            "description": "可选：提案时目标对象的 version（乐观锁钉住——审批期间对象被改则"
+                           "拒绝执行要求重新提案；建议随 ontology_resolve 结果携带）",
+        },
     },
     "required": ["namespace", "value", "target_object_id"],
     "additionalProperties": False,   # 身份/置信无模型通道：confirmed_by 恒为发起人，ACL 由 ctx
@@ -81,7 +86,9 @@ class OntologyIdentityResolveTool:
                     "仅在用户明确要求建立/确认编号归属时使用；查询请用 ontology_resolve。",
         input_schema=_INPUT_SCHEMA,
         output_schema={"type": "object"},
-        risk_level=RiskLevel.LOW_WRITE,
+        risk_level=RiskLevel.HIGH_WRITE,   # PR-C（P0-06）：身份映射改变检索与计算依据——
+                                           # 审计必须 fail-closed（executor 现成机制），不按普通低风险写
+
         permission_scope="ontology.identity.resolve",
         data_classification="internal",
         idempotency="key_required",
@@ -137,15 +144,40 @@ class OntologyIdentityResolveTool:
             return ToolResult.fail("目标对象不存在（先用 ontology_resolve 查询候选）")
         if target["status"] != "active":
             return ToolResult.fail(f"目标对象非 active（{target['status']}），不能作为映射目标")
+        # PR-C（P0-06 #4 落库前重验）：
+        # ① 提案钉了 expected_version → 审批期间对象任何变更（golden/密级/状态经 version
+        #    自增体现）即拒绝执行，要求重新提案；
+        # ② 审批放行携带 approval_scope（adjudicator 注入）→ 现算 stewardship 比对，
+        #    审批后 steward 变更即拒绝（旧部门的批准不落到新事实上）。
+        expected_version = args.get("expected_version")
+        if expected_version is not None and int(target.get("version") or 0) != int(expected_version):
+            return ToolResult.fail(
+                f"目标对象已变更（version {target.get('version')} ≠ 提案时 {expected_version}），"
+                "批准失效，请重新发起提案")
+        granted_scope = getattr(ctx, "approval_scope", None)
+        if granted_scope is not None:
+            try:
+                live_scope = self._approver_scope(ctx, args) or ""
+            except Exception:   # noqa: BLE001 — 现算失败按漂移处理（fail-closed）
+                live_scope = None
+            if live_scope is None or (granted_scope or "") != live_scope:
+                return ToolResult.fail(
+                    "stewardship 已变更（审批时 scope 与当前不一致），批准失效，请重新发起提案")
 
         existing = store.get_active_identifier(namespace, norm)
         if existing is not None:
             return self._idempotent_or_conflict(ctx, existing, target, revision)
 
+        # PR-C（P0-05/06）：铸别名 +（若有）闭 open case **一个事务**；approval_request_id
+        # 落事实行（025↔028 双向回链）；confirmed_by 记**真实审批人**（发起人在 receipt）
+        approver = getattr(ctx, "approved_by", None)
         try:
-            identifier_id = store.insert_identifier(
+            identifier_id, closed_case = store.insert_identifier_closing_case(
                 namespace, raw, norm, target_id, method="manual", relation=relation,
-                target_revision=revision, confidence=1.0, confirmed_by=ctx.user_id)
+                target_revision=revision, confidence=1.0,
+                confirmed_by=approver or ctx.user_id,
+                approval_request_id=getattr(ctx, "approval_request_id", None),
+                note=args.get("note") or "经受治理动作确认")
         except DuplicateActiveIdentifier:
             existing = store.get_active_identifier(namespace, norm)   # 竞态：重查归幂等/冲突
             if existing is None:
@@ -153,16 +185,6 @@ class OntologyIdentityResolveTool:
             return self._idempotent_or_conflict(ctx, existing, target, revision)
         except Exception as e:   # noqa: BLE001 — 存储失败以 ToolResult 表达
             return ToolResult.fail(f"身份确认落库失败: {e}")
-
-        closed_case = None
-        try:   # best-effort 闭环工作台 open case（fail-open：闭不掉不影响确认本身）
-            case = store.get_open_case(namespace, norm)
-            if case and store.resolve_case(case["case_id"], identifier_id=identifier_id,
-                                           by=ctx.user_id,
-                                           note=args.get("note") or "经受治理动作确认"):
-                closed_case = case["case_id"]
-        except Exception:   # noqa: BLE001
-            logger.warning("open case 闭环失败（fail-open）", exc_info=True)
 
         title = _visible_title(target.get("title"), target.get("data_classification"),
                                target.get("owner_dept"), set(ctx.acl_groups or ()))
@@ -174,7 +196,9 @@ class OntologyIdentityResolveTool:
             receipt={"identifier_id": identifier_id, "namespace": namespace,
                      "norm_value": norm, "target_object_id": target_id,
                      "target_revision": revision, "relation": relation,
-                     "closed_case_id": closed_case, "idempotent": False})
+                     "closed_case_id": closed_case, "idempotent": False,
+                     "requested_by": ctx.user_id, "approved_by": approver,
+                     "approval_request_id": getattr(ctx, "approval_request_id", None)})
 
     def _idempotent_or_conflict(self, ctx: "ExecutionContext", existing: Dict[str, Any],
                                 target: Dict[str, Any], revision: Optional[str]) -> ToolResult:

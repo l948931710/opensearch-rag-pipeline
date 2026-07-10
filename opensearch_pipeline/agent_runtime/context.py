@@ -67,6 +67,13 @@ class ExecutionContext:
     budget: RunBudget
     run_id: Optional[str] = None          # agent_run 主键；同步问答可为 None
     conversation_id: Optional[str] = None # agent_run 分列存
+    # PR-C（P0-06 回链）：审批放行的调用由 adjudicator 在消费 ApprovalGrant 时注入——
+    # 工具据此把 approval_request_id 落到事实行（如 ontology_identifier）、confirmed_by
+    # 记真实审批人；approval_scope=审批时用的裁决键，供工具落库前重验 stewardship 漂移。
+    # 服务端注入，模型/请求体无通道（铁律 2 不破）。
+    approval_request_id: Optional[str] = None
+    approved_by: Optional[str] = None
+    approval_scope: Optional[str] = None
 
     @classmethod
     def create(cls, *, request_id: str, user_id: str,

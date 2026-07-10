@@ -68,6 +68,23 @@ def register_approver_scope_resolver(tool_name: str, fn: Callable[..., Optional[
     _SCOPE_RESOLVERS[str(tool_name)] = fn
 
 
+def resolve_scope_live(tool_name: str, args: Optional[Dict[str, Any]]) -> Optional[str]:
+    """审批时现算 per-tool approver_scope（PR-C，P0-06 #4：scope 不吃提案快照）。
+
+    未注册解析器的工具 → None（调用方沿用快照/默认——语义零变化）；注册了 →
+    现算结果（''=仅 kb_admin）；解析器异常 → '' fail-closed。ctx 传 None：per-tool
+    解析器按约定只依赖 args（如 ontology 按 target_object_id 查 stewardship）。"""
+    fn = _SCOPE_RESOLVERS.get(str(tool_name or ""))
+    if fn is None:
+        return None
+    try:
+        return str(fn(None, dict(args or {})) or "").strip()[:64]
+    except Exception:   # noqa: BLE001
+        logger.warning("approver_scope 现算失败（fail-closed 到 kb_admin）：%s",
+                       tool_name, exc_info=True)
+        return ""
+
+
 def _resolve_scope(tool_name: str, ctx: "ExecutionContext", args: Dict[str, Any]) -> str:
     """审批人裁决键单点：注册了解析器的工具用解析器结果——None/'' → ''（仅 kb_admin 可审），
     解析器异常 → '' **fail-closed**（scope 算不出宁可收敛到 kb_admin，绝不误路由回发起人

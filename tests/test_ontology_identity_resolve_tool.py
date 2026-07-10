@@ -62,7 +62,8 @@ def _target(store, title="6.2口径龙虾杯", otype="product", **kw):
 
 def test_spec_contract(tool):
     spec = tool.spec
-    assert spec.risk_level == RiskLevel.LOW_WRITE
+    # PR-C（P0-06）：身份映射改变检索与计算依据——HIGH_WRITE（审计 fail-closed）
+    assert spec.risk_level == RiskLevel.HIGH_WRITE
     assert spec.approval_policy == "always"
     assert spec.idempotency == "key_required" and spec.side_effects is True
     assert spec.permission_scope == "ontology.identity.resolve"
@@ -186,21 +187,36 @@ def test_race_duplicate_resolves_to_idempotent(tool, store, monkeypatch):
         real_insert(*a, **k)
         raise DuplicateActiveIdentifier("race")
 
-    real_insert = MemoryOntologyStore.insert_identifier.__get__(store)
-    monkeypatch.setattr(store, "insert_identifier", _insert)
+    real_insert = MemoryOntologyStore.insert_identifier_closing_case.__get__(store)
+    monkeypatch.setattr(store, "insert_identifier_closing_case", _insert)
     res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
                             "target_object_id": obj["object_id"]})
     assert res.status == "succeeded" and res.receipt["idempotent"] is True
 
 
-def test_case_closure_fail_open(tool, store, monkeypatch):
+def test_case_closure_atomic_with_identifier(tool, store, monkeypatch):
+    """PR-C（P0-05）：闭 case 与铸别名**同一事务**——存储层任何失败整体回滚，
+    正式 identifier 与治理 case 不再可分叉（旧 fail-open 契约按外审废除）。"""
     obj = _target(store)
     store.upsert_case("u8", "abc123", "ABC123")
-    monkeypatch.setattr(store, "get_open_case",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    # 正常路径：一次调用同时铸别名 + 闭 case
     res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
                             "target_object_id": obj["object_id"]})
-    assert res.status == "succeeded" and res.receipt["closed_case_id"] is None
+    assert res.status == "succeeded"
+    assert res.receipt["closed_case_id"] is not None
+    assert store.get_open_case("u8", "ABC123") is None
+    # 故障路径：复合写失败 → 工具失败且零副作用（无半状态）
+    store2 = MemoryOntologyStore()
+    obj2 = store2.mint_object("product", "另一目标", owner_dept="pmc")
+    store2.upsert_case("u8", "zz9", "ZZ9")
+    monkeypatch.setattr(store2, "insert_identifier_closing_case",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    tool2 = OntologyIdentityResolveTool(store=store2)
+    res2 = tool2.run(_ctx(), {"namespace": "u8", "value": "zz9",
+                              "target_object_id": obj2["object_id"]})
+    assert res2.status == "failed"
+    assert store2.get_active_identifier("u8", "ZZ9") is None
+    assert store2.get_open_case("u8", "ZZ9") is not None   # case 仍开着，零分叉
 
 
 def test_confidential_title_masked(store):
@@ -295,3 +311,98 @@ def test_create_request_routes_scope_and_keeps_requested_dept(monkeypatch, tool,
         {"call_id": "c1", "tool_name": "u8_writeback", "arguments": {"qty": 1}})
     params = sink[-1][1]
     assert params[9] == "marketing" and params[10] == "marketing"
+
+
+# ── PR-C（P0-06）：approval 回链 + 落库前重验 ──────────────────────────────────
+
+
+def test_approval_chain_lands_on_identifier(store):
+    """ctx 携带审批事实（adjudicator 注入）→ identifier 行落 approval_request_id、
+    confirmed_by=真实审批人；receipt 双向可回放。"""
+    from dataclasses import replace
+    obj = _target(store)
+    ctx = replace(_ctx(), approval_request_id="req_" + "a" * 28,
+                  approved_by="steward_9", approval_scope="pmc")
+    tool = OntologyIdentityResolveTool(store=store)
+    res = tool.run(ctx, {"namespace": "u8", "value": "abc123",
+                         "target_object_id": obj["object_id"]})
+    assert res.status == "succeeded"
+    row = store.get_active_identifier("u8", "ABC123")
+    assert row["approval_request_id"] == "req_" + "a" * 28
+    assert row["confirmed_by"] == "steward_9"           # 审批人，非发起人
+    assert res.receipt["requested_by"] == ctx.user_id
+    assert res.receipt["approved_by"] == "steward_9"
+
+
+def test_expected_version_pin_rejects_drift(store):
+    """提案钉 expected_version → 审批期间对象变更（version 自增）→ 拒绝执行。"""
+    obj = _target(store)
+    tool = OntologyIdentityResolveTool(store=store)
+    store.update_golden(obj["object_id"], {"改": "了"}, expected_version=1)   # version→2
+    res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
+                            "target_object_id": obj["object_id"],
+                            "expected_version": 1})
+    assert res.status == "failed" and "重新发起提案" in (res.error or "")
+    assert store.get_active_identifier("u8", "ABC123") is None
+
+
+def test_scope_drift_rejects_execution(store):
+    """审批时 scope 与执行时现算不一致（stewardship 变更）→ 拒绝执行。"""
+    from dataclasses import replace
+
+    from opensearch_pipeline.ontology import stewardship
+    stewardship.ensure_seeds(store)                      # product→pmc
+    obj = _target(store)
+    ctx = replace(_ctx(), approval_request_id="req_" + "b" * 28,
+                  approved_by="steward_9", approval_scope="pmc")
+    # 审批后 steward 换防：product scope 改归 supply
+    store.upsert_stewardship([{"scope_type": "object_type", "scope_key": "product",
+                               "steward_dept": "supply"}])
+    tool = OntologyIdentityResolveTool(store=store)
+    res = tool.run(ctx, {"namespace": "u8", "value": "abc123",
+                         "target_object_id": obj["object_id"]})
+    assert res.status == "failed" and "stewardship 已变更" in (res.error or "")
+    assert store.get_active_identifier("u8", "ABC123") is None
+
+
+def test_adjudicator_injects_approval_into_ctx(store):
+    """adjudicator 消费 ApprovalGrant → ctx 注入审批事实 → 工具落回链（端到端最短链）。"""
+    from opensearch_pipeline.agent_runtime.approval import Approved, ApprovalGrant
+    from opensearch_pipeline.agent_runtime.events import ToolCallProposed, Usage
+    from opensearch_pipeline.agent_runtime.policy import make_adjudicator, PolicyEngine, PolicyRule
+    from opensearch_pipeline.agent_runtime.registry import ToolRegistry
+    from opensearch_pipeline.agent_runtime.tool_executor import digest
+
+    obj = _target(store)
+    tool = OntologyIdentityResolveTool(store=store)
+    registry = ToolRegistry()
+    registry.register(tool)
+    engine = PolicyEngine([PolicyRule(effect="allow",
+                                      scopes=("ontology.identity.resolve",), policy_id="g1")])
+
+    class _NullRunStore:
+        def append_step(self, *a, **k):
+            return 1
+
+        def record_invocation(self, *a, **k):
+            return "inv1"
+
+        def find_succeeded_invocation(self, *a, **k):
+            return None
+
+        def finish_invocation(self, *a, **k):
+            return None
+
+    args = {"namespace": "u8", "value": "abc123", "target_object_id": obj["object_id"]}
+    ctx = _ctx()
+    approvals = {f"{ctx.run_id}:c1": ApprovalGrant(
+        outcome=Approved(), tool_name="ontology_identity_resolve", args_digest=digest(args),
+        request_id="req_" + "c" * 28, decided_by="steward_7")}
+    adjudicate = make_adjudicator(registry, engine, _NullRunStore(), approvals=approvals)
+    ev = ToolCallProposed(call_id="c1", tool_name="ontology_identity_resolve",
+                          arguments=args, turn_index=0, usage=Usage())
+    result = adjudicate(ctx, ev)
+    assert result.status == "succeeded"
+    row = store.get_active_identifier("u8", "ABC123")
+    assert row["approval_request_id"] == "req_" + "c" * 28
+    assert row["confirmed_by"] == "steward_7"

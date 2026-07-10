@@ -48,7 +48,7 @@ _RDS_OK = _rds_ready()
 _MARK = "__pyt_"           # RDS 测试数据统一打标，teardown 按标清扫
 
 
-def _cleanup_rds():
+def _cleanup_rds(_retry: bool = True):
     import pymysql
 
     from opensearch_pipeline.config import get_config
@@ -68,7 +68,20 @@ def _cleanup_rds():
                     "ON o.object_id IN (l.src_object_id, l.dst_object_id) "
                     "WHERE o.title LIKE %s", (like,))
         cur.execute("DELETE FROM ontology_object WHERE title LIKE %s", (like,))
-    conn.close()
+    try:
+        conn.close()
+    except Exception:   # noqa: BLE001
+        pass
+
+
+def _cleanup_rds_safe():
+    """FK 后并行 worker 清扫可能偶发 1213 死锁——重试一次（PR-C flake 治理）。"""
+    try:
+        _cleanup_rds()
+    except Exception:   # noqa: BLE001
+        import time as _t
+        _t.sleep(0.2)
+        _cleanup_rds()
 
 
 @pytest.fixture(params=["memory", "rds"])
@@ -79,7 +92,7 @@ def store(request):
     if not _RDS_OK:
         pytest.skip("本地 MySQL 无 ontology 表（先 apply schema 027-029）")
     yield RDSOntologyStore()
-    _cleanup_rds()
+    _cleanup_rds_safe()
 
 
 @pytest.fixture()
@@ -412,7 +425,7 @@ def test_rds_concurrent_mint_unique_refs():
     try:
         assert not errors and len(refs) == 10 and len(set(refs)) == 10
     finally:
-        _cleanup_rds()
+        _cleanup_rds_safe()
 
 
 @rds_only
@@ -434,7 +447,7 @@ def test_rds_concurrent_case_upsert_single_open():
         assert not errors and len(set(ids)) == 1
         assert store.get_case(ids[0])["seen_count"] == 4
     finally:
-        _cleanup_rds()
+        _cleanup_rds_safe()
 
 
 @rds_only
@@ -459,7 +472,7 @@ def test_rds_concurrent_insert_identifier_single_winner():
     try:
         assert sorted(outcomes) == ["dup", "ok"]
     finally:
-        _cleanup_rds()
+        _cleanup_rds_safe()
 
 
 @rds_only
@@ -490,7 +503,7 @@ def test_rds_global_unique_ref_and_type_code():
             assert exc2.value.args[0] == 1062
     finally:
         conn.close()
-        _cleanup_rds()
+        _cleanup_rds_safe()
 
 
 @rds_only
@@ -531,4 +544,140 @@ def test_rds_concurrent_retire_vs_resolve_no_zombie():
         final = resolver.resolve(ns_v, "x1")
         assert final.status == "unresolved" and final.requires_hitl is True
     finally:
-        _cleanup_rds()
+        _cleanup_rds_safe()
+
+
+# ── PR-C（P0-05/06）：原子复合写 + 同事务审计 ────────────────────────────────────
+
+
+def test_mint_object_with_alias_atomic_no_orphan(store, ns):
+    """别名撞 uk → 整体回滚：对象数零增长（P0-05 孤儿对象根除）。"""
+    winner = _mint(store)
+    store.insert_identifier(ns, "x", "X", winner["object_id"], method="seed")
+    before = len(store.find_objects("product", limit=200))
+    with pytest.raises(DuplicateActiveIdentifier):
+        store.mint_object_with_alias(
+            "product", f"{_MARK}撞名者-{uuid.uuid4().hex[:6]}", owner_dept="pmc",
+            namespace=ns, raw_value="x", norm_value="X")
+    assert len(store.find_objects("product", limit=200)) == before   # 零孤儿
+
+
+def test_mint_object_with_alias_closes_open_case(store, ns):
+    obj_before = store.upsert_case(ns, "y", "Y")
+    res = store.mint_object_with_alias(
+        "product", f"{_MARK}新品-{uuid.uuid4().hex[:6]}", owner_dept="pmc",
+        namespace=ns, raw_value="y", norm_value="Y", confirmed_by="auto")
+    assert res["closed_case_id"] == obj_before
+    assert store.get_open_case(ns, "Y") is None
+    active = store.get_active_identifier(ns, "Y")
+    assert active["target_object_id"] == res["object_id"]
+    assert active["source_case_id"] == obj_before
+
+
+def test_confirm_case_with_identifier_atomic(store, ns):
+    obj = _mint(store)
+    case_id = store.upsert_case(ns, "z", "Z")
+    iid = store.confirm_case_with_identifier(case_id, target_object_id=obj["object_id"],
+                                             by="steward_1", note="确认")
+    case = store.get_case(case_id)
+    assert case["status"] == "resolved" and case["resolved_identifier_id"] == iid
+    assert store.get_active_identifier(ns, "Z")["source_case_id"] == case_id
+    # 已处置 case 再确认 → ValueError（事务内校验，无半状态）
+    with pytest.raises(ValueError, match="非 open"):
+        store.confirm_case_with_identifier(case_id, target_object_id=obj["object_id"],
+                                           by="steward_1")
+
+
+def test_confirm_case_duplicate_alias_rolls_back_case(store, ns):
+    """铸别名撞 uk → case 保持 open（整体回滚，不出现 case 关了别名没生效）。"""
+    a, b = _mint(store), _mint(store)
+    store.insert_identifier(ns, "w", "W", a["object_id"], method="seed")
+    case_id = store.upsert_case(ns, "w", "W")
+    with pytest.raises(DuplicateActiveIdentifier):
+        store.confirm_case_with_identifier(case_id, target_object_id=b["object_id"],
+                                           by="steward_1")
+    assert store.get_case(case_id)["status"] == "open"
+
+
+def test_insert_identifier_closing_case_atomic(store, ns):
+    obj = _mint(store)
+    case_id = store.upsert_case(ns, "v", "V")
+    iid, closed = store.insert_identifier_closing_case(
+        ns, "v", "V", obj["object_id"], confirmed_by="approver_1",
+        approval_request_id="req_" + "0" * 28)
+    assert closed == case_id
+    assert store.get_case(case_id)["status"] == "resolved"
+    row = store.get_active_identifier(ns, "V")
+    assert row["identifier_id"] == iid
+    assert row["confirmed_by"] == "approver_1"
+    assert row["approval_request_id"] == "req_" + "0" * 28   # 025↔028 回链（P0-06）
+
+
+def test_memory_audit_failure_zero_side_effects():
+    """P0-06：审计不可写 → 变更零副作用（Memory hook 模拟 agent_audit_log 故障）。"""
+    store = MemoryOntologyStore()
+    obj = store.mint_object("product", "审计目标", owner_dept="pmc")
+    store.insert_identifier("u8", "a1", "A1", obj["object_id"], method="seed")
+
+    def _boom(payload):
+        raise RuntimeError("audit db down")
+
+    store.audit_hook = _boom
+    payload = {"action": "object:x", "decision": "retire", "by": "u1"}
+    with pytest.raises(RuntimeError):
+        store.retire_object(obj["object_id"], audit=payload)
+    assert store.get_object(obj["object_id"])["status"] == "active"     # 未退役
+    assert store.get_active_identifier("u8", "A1") is not None          # 别名未级联
+    assert store.audit_rows == []
+    store.audit_hook = None
+    assert store.retire_object(obj["object_id"], audit=payload) is True
+    assert store.audit_rows[-1]["decision"] == "retire"
+
+
+@rds_only
+def test_rds_audit_row_lands_with_confirm():
+    """RDS：confirm 的审计行随事务落 fuling_operation.agent_audit_log（同连接跨库）。"""
+    import pymysql
+
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    store = RDSOntologyStore()
+    ns_v = f"{_MARK}{uuid.uuid4().hex[:10]}"
+    obj = _mint(store)
+    case_id = store.upsert_case(ns_v, "q", "Q")
+    marker = f"{_MARK}{uuid.uuid4().hex[:8]}"
+    try:
+        store.confirm_case_with_identifier(
+            case_id, target_object_id=obj["object_id"], by="steward_1",
+            audit={"event_type": "ontology_workbench", "action": f"case:{case_id}",
+                   "decision": "confirm", "by": marker, "detail": {}})
+        conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
+                               password=cfg.rds.password,
+                               database=cfg.rds.operation_database,
+                               autocommit=True, connect_timeout=3)
+        with conn.cursor() as cur:
+            cur.execute("SELECT decision, detail_json FROM agent_audit_log "
+                        "WHERE user_id=%s", (marker,))
+            rows = cur.fetchall()
+            assert len(rows) == 1 and rows[0][0] == "confirm"
+            assert "identifier_id" in (rows[0][1] or "")
+            cur.execute("DELETE FROM agent_audit_log WHERE user_id=%s", (marker,))
+        conn.close()
+    finally:
+        _cleanup_rds_safe()
+
+
+# ── PR-C：不变量 reaper ───────────────────────────────────────────────────────
+
+
+def test_invariant_scan_clean_and_dirty(store, ns):
+    from opensearch_pipeline.ontology.invariants import scan_invariants
+    obj = _mint(store)
+    store.insert_identifier(ns, "h", "H", obj["object_id"], method="seed")
+    report = scan_invariants(store)
+    ours = {(v.get("namespace"), v.get("norm_value")) for vs in report.values() for v in vs}
+    assert (ns, "H") not in ours                       # 健康态：本测试数据无违例
+    # 制造 alias_open_case 尸案：active 别名与 open case 并存（绕过原子入口直插）
+    case_id = store.upsert_case(ns, "h", "H")
+    report2 = scan_invariants(store)
+    assert any(v["case_id"] == case_id for v in report2["alias_open_case"])
