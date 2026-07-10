@@ -42,7 +42,7 @@ def test_concurrent_get_create_evict_no_crash():
 
 def test_concurrent_module_level_api_no_crash(monkeypatch):
     """模块级 get_or_create_session / append_to_history 的复合操作在并发下保持一致。"""
-    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+    monkeypatch.setattr(session_store, "_backend", _LRUSessionStore(maxsize=50))
     errors = []
 
     def worker(n):
@@ -70,7 +70,7 @@ def test_concurrent_module_level_api_no_crash(monkeypatch):
 
 def test_clear_session_removes_history(monkeypatch):
     """clear_session：清除后 get_or_create 返回全新空历史；幂等；空 id 安全。"""
-    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+    monkeypatch.setattr(session_store, "_backend", _LRUSessionStore(maxsize=50))
 
     sid, _ = session_store.get_or_create_session("sess-clear")
     session_store.append_to_history(sid, "问题", "回答")
@@ -88,7 +88,7 @@ def test_clear_session_removes_history(monkeypatch):
 
 def test_concurrent_clear_and_append_no_crash(monkeypatch):
     """clear 与 append 并发交错：不抛错、不破坏结构（清除点之后历史从零重新累积）。"""
-    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+    monkeypatch.setattr(session_store, "_backend", _LRUSessionStore(maxsize=50))
     errors = []
 
     def appender():
@@ -124,7 +124,7 @@ def test_owner_binding_denies_other_identity(monkeypatch):
     """已绑定身份的条目：他人身份/匿名访问一律 SessionOwnershipError；本人放行。"""
     import pytest
 
-    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+    monkeypatch.setattr(session_store, "_backend", _LRUSessionStore(maxsize=50))
 
     sid, _ = session_store.get_or_create_session("cid1:VICTIM", owner="VICTIM")
     session_store.append_to_history(sid, "受限问题", "受限回答", owner="VICTIM")
@@ -149,7 +149,7 @@ def test_anonymous_entry_binds_on_first_authenticated_touch(monkeypatch):
     """匿名创建（服务端 UUID）持有即所有；首个已认证访问者就地绑定，之后他人被拒。"""
     import pytest
 
-    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+    monkeypatch.setattr(session_store, "_backend", _LRUSessionStore(maxsize=50))
 
     sid, _ = session_store.get_or_create_session(None)  # 匿名创建
     _, _ = session_store.get_or_create_session(sid)     # 匿名再访问 OK
@@ -163,7 +163,7 @@ def test_trusted_caller_evicts_hijacked_entry(monkeypatch):
     且抢注者留下的历史不会泄给真实用户。"""
     import pytest
 
-    monkeypatch.setattr(session_store, "_sessions", _LRUSessionStore(maxsize=50))
+    monkeypatch.setattr(session_store, "_backend", _LRUSessionStore(maxsize=50))
 
     # 攻击者以自己身份抢注受害者的钉钉会话 key 并塞入历史
     session_store.get_or_create_session("cidX:VICTIM", owner="ATTACKER")
@@ -181,3 +181,23 @@ def test_trusted_caller_evicts_hijacked_entry(monkeypatch):
 
     # trusted 清除对自己命名空间无条件可清
     assert session_store.clear_session("cidX:VICTIM", trusted=True) is True
+
+
+def test_owner_verification_non_ascii_ids(monkeypatch):
+    """现网回归守护（深度审查 F 组）：hmac.compare_digest 对含非 ASCII 的 str 抛
+    TypeError——归属比较必须 encode 后进行。钉钉 staffId/中文 user_id 二次访问
+    已绑定会话绝不能 500。"""
+    import pytest
+
+    monkeypatch.setattr(session_store, "_backend", _LRUSessionStore(maxsize=50))
+
+    sid, _ = session_store.get_or_create_session("会话-中文", owner="员工-张三")
+    assert sid == "会话-中文"
+    # 同一非 ASCII owner 第二次访问：必须放行（修复前 TypeError → 500）
+    sid2, _ = session_store.get_or_create_session("会话-中文", owner="员工-张三")
+    assert sid2 == sid
+    session_store.append_to_history(sid, "问", "答", owner="员工-张三")
+    assert len(session_store.get_or_create_session(sid, owner="员工-张三")[1]) == 2
+    # 非 ASCII 不匹配 owner：仍是干净的归属拒绝（而非 TypeError）
+    with pytest.raises(session_store.SessionOwnershipError):
+        session_store.get_or_create_session(sid, owner="员工-李四")

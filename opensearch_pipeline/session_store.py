@@ -44,8 +44,12 @@ class SessionOwnershipError(PermissionError):
 
 
 def _const_eq(a: str, b: str) -> bool:
-    """常量时间字符串比较（re-baseline A2）。两参数均须为 str。"""
-    return hmac.compare_digest(a, b)
+    """常量时间字符串比较（re-baseline A2）。两参数均须为 str。
+
+    ⚠️ 必须先 encode：hmac.compare_digest 对含非 ASCII 的 str 抛 TypeError——
+    钉钉 staffId / 中文 user_id 走到这里会让全部会话路径（bot/console/agent）500。
+    """
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
 def _owner_verdict(stored: Optional[str], presented: Optional[str], trusted: bool) -> str:
@@ -183,6 +187,9 @@ class MemorySessionStore:
         # api.py 的 def 处理器跑在 FastAPI 线程池、dingtalk_bot 每条消息又另起线程，
         # 多线程并发访问同一 store 必须加锁。用 RLock 以便模块级复合操作可跨多次调用持锁。
         self._lock = threading.RLock()
+        # 主动清除的墓碑（sid → 清除时刻）：回读重建据此区分「重启失忆」与「用户主动清除/
+        # 新会话」——没有它，clear 之后下次 get_or_create 会把刚清的上下文原样复活。
+        self._cleared: Dict[str, float] = {}
 
     # ── 低层操作（保持原有私有 API） ──────────────────────────────────────────
     def get(self, key: str) -> Optional[_SessionEntry]:
@@ -247,7 +254,11 @@ class MemorySessionStore:
     def append(
         self, session_id: str, user_msg: str, assistant_msg: str, *, owner: Optional[str] = None
     ) -> None:
-        # 整个读-改-写序列持锁，避免与并发 get/create/淘汰 交错破坏历史
+        max_messages = MAX_HISTORY_TURNS * 2
+        overflow: Optional[List[Dict[str, str]]] = None
+        prev_summary = ""
+        # 读-改-写序列持锁；但 summarizer 是外部 LLM 调用，绝不能在锁内算——
+        # 否则每次溢出让全进程所有会话操作阻塞到 HTTP 返回（redis 后端早已锁外算，对齐）。
         with self._lock:
             entry = self.get(session_id)
             if entry is None:
@@ -256,11 +267,20 @@ class MemorySessionStore:
                 _verify_owner(entry, owner)
             entry.history.append({"role": "user", "content": user_msg})
             entry.history.append({"role": "assistant", "content": assistant_msg})
-            max_messages = MAX_HISTORY_TURNS * 2
             if len(entry.history) > max_messages:
-                if _rolling_enabled():          # 溢出轮滚进摘要而非硬丢（entry 就地改，与 set_history 同一对象）
-                    entry.summary = _roll_summary(entry.summary, entry.history[:-max_messages])
+                if _rolling_enabled():
+                    overflow = entry.history[:-max_messages]
+                    prev_summary = entry.summary
                 self.set_history(session_id, entry.history[-max_messages:])
+        if overflow:
+            # 锁外算摘要（裁剪已先行：摘要失败/进程中断退化为截断，与 fail-open 语义一致）；
+            # 并发 append 交错时 last-write-wins，摘要近似——与 redis 后端同款可接受竞态。
+            new_summary = _roll_summary(prev_summary, overflow)
+            if new_summary != prev_summary:
+                with self._lock:
+                    entry2 = self._store.get(session_id)
+                    if entry2 is not None:
+                        entry2.summary = new_summary
 
     def clear(self, session_id: str, *, owner: Optional[str] = None, trusted: bool = False) -> bool:
         if not session_id:
@@ -269,7 +289,21 @@ class MemorySessionStore:
             entry = self._store.get(session_id)
             if entry is not None and not trusted:
                 _verify_owner(entry, owner)
+            self._mark_cleared(session_id)
             return self.delete(session_id)
+
+    # ── 清除墓碑（回读重建的"主动清除"信号）────────────────────────────────
+    def _mark_cleared(self, session_id: str) -> None:
+        now = time.time()
+        if len(self._cleared) > 4 * self._maxsize:      # 防无界增长：顺手清掉过期墓碑
+            self._cleared = {k: v for k, v in self._cleared.items()
+                             if now - v < SESSION_TIMEOUT_SECONDS}
+        self._cleared[session_id] = now
+
+    def was_recently_cleared(self, session_id: str) -> bool:
+        with self._lock:
+            ts = self._cleared.get(session_id)
+        return bool(ts and time.time() - ts < SESSION_TIMEOUT_SECONDS)
 
     def get_history(self, session_id: str, *, owner: Optional[str] = None) -> List[Dict[str, str]]:
         with self._lock:
@@ -293,6 +327,9 @@ class RedisSessionStore:
     - 归属/2N 裁剪/TTL 语义与 memory 后端对齐（契约测试保证）。
     - owner-check 与写用 WATCH/MULTI 乐观事务，read-modify-write 原子。
     - TTL 滑动刷新（每次访问续期），对齐 memory 的 touch-on-access。
+    - **Redis 故障 fail-open 降级**：会话是辅助上下文，Redis 挂掉绝不能拖垮
+      /api/ask 主回答链路（「辅助失败不破主答案」铁律）——读退化为空历史、写丢弃本轮、
+      clear 返回 False；只有归属校验失败（SessionOwnershipError）照常上抛。
     """
 
     def __init__(self, client, ttl_seconds: int = SESSION_TIMEOUT_SECONDS,
@@ -311,45 +348,65 @@ class RedisSessionStore:
         from opensearch_pipeline import redis_client
         return redis_client.key("sess", sid, "msgs")
 
+    @staticmethod
+    def _ckey(sid: str) -> str:
+        from opensearch_pipeline import redis_client
+        return redis_client.key("sess", sid, "cleared")     # 主动清除墓碑（TTL=会话超时）
+
+    @staticmethod
+    def _skey(sid: str) -> str:
+        from opensearch_pipeline import redis_client
+        return redis_client.key("sess", sid, "seeding")     # 回读回种单飞（SETNX）
+
+    @staticmethod
+    def _degraded(op: str, exc: Exception) -> None:
+        logger.error("RedisSessionStore.%s 失败，fail-open 降级（空历史/丢弃本轮）：%s", op, exc)
+
     def get_or_create(
         self, session_id: Optional[str], *, owner: Optional[str] = None, trusted: bool = False
     ) -> Tuple[str, List[Dict[str, str]]]:
-        if not session_id:
-            sid = str(uuid.uuid4())
-            hkey, mkey = self._hkey(sid), self._mkey(sid)
-            pipe = self._r.pipeline(transaction=True)
-            pipe.hset(hkey, mapping={"owner": owner or "", "created": "1"})
-            pipe.expire(hkey, self._ttl)
-            pipe.execute()
-            return sid, []
-
-        hkey, mkey, ttl = self._hkey(session_id), self._mkey(session_id), self._ttl
-
-        def _op(pipe):
-            if not pipe.exists(hkey):
-                pipe.multi()
+        try:
+            if not session_id:
+                sid = str(uuid.uuid4())
+                hkey, mkey = self._hkey(sid), self._mkey(sid)
+                pipe = self._r.pipeline(transaction=True)
                 pipe.hset(hkey, mapping={"owner": owner or "", "created": "1"})
-                pipe.expire(hkey, ttl)
-                return session_id, []
-            verdict = _owner_verdict(pipe.hget(hkey, "owner"), owner, trusted)
-            if verdict == "reject":
-                raise SessionOwnershipError("会话归属校验失败")
-            if verdict == "rebuild":
-                pipe.multi()
-                pipe.delete(hkey, mkey)
-                pipe.hset(hkey, mapping={"owner": owner or "", "created": "1"})
-                pipe.expire(hkey, ttl)
-                return session_id, []
-            summary = pipe.hget(hkey, "summary") or ""       # multi 前即时读（WATCH 下返回真值）
-            history = [json.loads(x) for x in pipe.lrange(mkey, 0, -1)]
-            pipe.multi()
-            if verdict == "bind" and owner:
-                pipe.hset(hkey, "owner", owner)
-            pipe.expire(hkey, ttl)
-            pipe.expire(mkey, ttl)
-            return session_id, _with_summary(summary, history)
+                pipe.expire(hkey, self._ttl)
+                pipe.execute()
+                return sid, []
 
-        return self._r.transaction(_op, hkey, mkey, value_from_callable=True)
+            hkey, mkey, ttl = self._hkey(session_id), self._mkey(session_id), self._ttl
+
+            def _op(pipe):
+                if not pipe.exists(hkey):
+                    pipe.multi()
+                    pipe.hset(hkey, mapping={"owner": owner or "", "created": "1"})
+                    pipe.expire(hkey, ttl)
+                    return session_id, []
+                verdict = _owner_verdict(pipe.hget(hkey, "owner"), owner, trusted)
+                if verdict == "reject":
+                    raise SessionOwnershipError("会话归属校验失败")
+                if verdict == "rebuild":
+                    pipe.multi()
+                    pipe.delete(hkey, mkey)
+                    pipe.hset(hkey, mapping={"owner": owner or "", "created": "1"})
+                    pipe.expire(hkey, ttl)
+                    return session_id, []
+                summary = pipe.hget(hkey, "summary") or ""       # multi 前即时读（WATCH 下返回真值）
+                history = [json.loads(x) for x in pipe.lrange(mkey, 0, -1)]
+                pipe.multi()
+                if verdict == "bind" and owner:
+                    pipe.hset(hkey, "owner", owner)
+                pipe.expire(hkey, ttl)
+                pipe.expire(mkey, ttl)
+                return session_id, _with_summary(summary, history)
+
+            return self._r.transaction(_op, hkey, mkey, value_from_callable=True)
+        except SessionOwnershipError:
+            raise
+        except Exception as e:      # noqa: BLE001 — Redis 故障不拖垮主回答链路
+            self._degraded("get_or_create", e)
+            return session_id or str(uuid.uuid4()), []
 
     def append(
         self, session_id: str, user_msg: str, assistant_msg: str, *, owner: Optional[str] = None
@@ -390,16 +447,23 @@ class RedisSessionStore:
             pipe.expire(hkey, ttl)
             pipe.expire(mkey, ttl)
 
-        self._r.transaction(_op, hkey, mkey)
+        try:
+            self._r.transaction(_op, hkey, mkey)
+        except SessionOwnershipError:
+            raise
+        except Exception as e:      # noqa: BLE001 — 丢弃本轮记忆，不破主答案
+            self._degraded("append", e)
 
     def clear(self, session_id: str, *, owner: Optional[str] = None, trusted: bool = False) -> bool:
         if not session_id:
             return False
         hkey, mkey = self._hkey(session_id), self._mkey(session_id)
+        ckey, ttl = self._ckey(session_id), self._ttl
 
         def _op(pipe):
             if not pipe.exists(hkey):
                 pipe.multi()
+                pipe.set(ckey, "1", ex=ttl)     # 空条目的显式清除同样立墓碑（"新会话"意图）
                 return False
             if not trusted:
                 verdict = _owner_verdict(pipe.hget(hkey, "owner"), owner, trusted=False)
@@ -407,9 +471,16 @@ class RedisSessionStore:
                     raise SessionOwnershipError("会话归属校验失败")
             pipe.multi()
             pipe.delete(hkey, mkey)
+            pipe.set(ckey, "1", ex=ttl)         # 主动清除墓碑：TTL 内抑制 qa_log 回读复活
             return True
 
-        return self._r.transaction(_op, hkey, mkey, value_from_callable=True)
+        try:
+            return self._r.transaction(_op, hkey, mkey, value_from_callable=True)
+        except SessionOwnershipError:
+            raise
+        except Exception as e:      # noqa: BLE001
+            self._degraded("clear", e)
+            return False
 
     def get_history(self, session_id: str, *, owner: Optional[str] = None) -> List[Dict[str, str]]:
         hkey, mkey = self._hkey(session_id), self._mkey(session_id)
@@ -428,7 +499,27 @@ class RedisSessionStore:
                 pipe.hset(hkey, "owner", owner)
             return _with_summary(summary, history)
 
-        return self._r.transaction(_op, hkey, mkey, value_from_callable=True)
+        try:
+            return self._r.transaction(_op, hkey, mkey, value_from_callable=True)
+        except SessionOwnershipError:
+            raise
+        except Exception as e:      # noqa: BLE001
+            self._degraded("get_history", e)
+            return []
+
+    # ── 回读重建配套（墓碑 / 单飞 claim；均 fail-open）─────────────────────────
+    def was_recently_cleared(self, session_id: str) -> bool:
+        try:
+            return bool(self._r.exists(self._ckey(session_id)))
+        except Exception:   # noqa: BLE001 — Redis 故障时不据此挡回读
+            return False
+
+    def claim_rebuild(self, session_id: str) -> bool:
+        """跨实例回种单飞：SETNX 抢到才回种（30s 自动过期），防多实例并发双重回种。"""
+        try:
+            return bool(self._r.set(self._skey(session_id), "1", nx=True, ex=30))
+        except Exception:   # noqa: BLE001
+            return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,15 +538,14 @@ def _make_backend() -> SessionStore:
 
 
 _backend: SessionStore = _make_backend()
-# 兼容别名：memory 模式下指向真实 store（无外部引用，仅防御性保留）
-_sessions = _backend if isinstance(_backend, MemorySessionStore) else None
+# ⚠️ 门面只走 _backend。历史别名 _sessions 已删除——它曾是 tests 的 monkeypatch 旋钮，
+# 门面改走 _backend 后患成"死旋钮"（patch 了不生效、测试假隔离）；测试请 patch `_backend`。
 
 
 def _set_backend_for_test(backend: SessionStore) -> None:
     """测试用：切换全局后端实例。"""
-    global _backend, _sessions
+    global _backend
     _backend = backend
-    _sessions = backend if isinstance(backend, MemorySessionStore) else None
 
 
 # ── WS0-2 回读重建（Redis/进程重启后从 qa_session_log 恢复会话，修"重启失忆"）─────────────
@@ -469,6 +559,9 @@ def _conversation_history_on() -> bool:
 def _rebuild_from_qa_log(session_id: str, owner: str, n_turns: int) -> List[Dict[str, str]]:
     """从 qa_session_log 回读最近 n_turns 轮重建历史。按 session_id（会话键，与 log_qa_session 写入
     的 session_id 一致）+ user_id（归属，防越权）取，时间正序返回 [{user},{assistant}...]。
+    **与在线入史同一卫生层**：只回 SUCCESS/CLIENT_DISCONNECTED（拒答/NO_RESULT/错误残句不入史，
+    与 answer_flow.should_append_history 同口径）、空答案跳过、答案过 history_answer_text
+    （IMG 标记剥离策略与四个在线入史调用点一致）。
     **fail-safe**：DB 不可达/查询异常 → []（退化为无历史，不影响会话）。"""
     if not session_id or not owner:
         return []
@@ -481,19 +574,27 @@ def _rebuild_from_qa_log(session_id: str, owner: str, n_turns: int) -> List[Dict
                 cur.execute(
                     f"SELECT query_text, answer_text FROM {db}.qa_session_log "
                     "WHERE session_id=%s AND user_id=%s AND query_text IS NOT NULL "
+                    "AND answer_status IN ('SUCCESS','CLIENT_DISCONNECTED') "
                     "ORDER BY created_at DESC, id DESC LIMIT %s",
                     (session_id, owner, int(n_turns)))
                 rows = cur.fetchall()
         finally:
             conn.close()
+        from opensearch_pipeline.answer_flow import history_answer_text
         out: List[Dict[str, str]] = []
         for q, a in reversed(list(rows)):          # DESC 取最近 N，reverse 回时间正序
+            if not a:                              # 空答案不入史（should_append_history 同口径）
+                continue
             out.append({"role": "user", "content": q})
-            out.append({"role": "assistant", "content": a or ""})
+            out.append({"role": "assistant", "content": history_answer_text(a)})
         return out
     except Exception:   # noqa: BLE001 — 回读失败不影响会话（fail-open）
         logger.warning("qa_session_log 回读重建失败（退化为空历史）", exc_info=True)
         return []
+
+
+_seed_lock = threading.Lock()
+_seeding: set = set()               # 进程内单飞：并发首触同一会话只允许一个线程回读回种
 
 
 def get_or_create_session(
@@ -504,6 +605,9 @@ def get_or_create_session(
     session 存在但已超时（默认 30 分钟无活动）→ 自动创建新 session。
     **WS0-2 回读重建**：store 未命中（空历史）且 `RAG_CONVERSATION_HISTORY` 开且调用方给了
     session_id（=续接非新建）→ 从 qa_session_log 回读最近 N 轮并**回种后端**（修重启失忆）。
+    回读三道闸：清除墓碑（主动清除/新会话 ≠ 重启失忆，墓碑期内不复活）· 进程内单飞 +
+    跨实例 SETNX claim（防并发双重回种把历史逐轮复制）· 与在线入史同一卫生层（见
+    _rebuild_from_qa_log）。
 
     owner: 已验证身份（Bearer 令牌 user_id / 钉钉回调 staffId）。创建时绑定；
       访问已绑定他人条目时抛 SessionOwnershipError（API 层映射 403）。
@@ -512,13 +616,38 @@ def get_or_create_session(
       抢注 key 反过来 DoS 真实用户。
     """
     sid, history = _backend.get_or_create(session_id, owner=owner, trusted=trusted)
-    if not history and session_id and owner and _conversation_history_on():
-        rebuilt = _rebuild_from_qa_log(session_id, owner, MAX_HISTORY_TURNS)
+    if history or not (session_id and owner and _conversation_history_on()):
+        return sid, history
+    # 墓碑：主动清除后 TTL 内不回读——否则"新会话"/clear 被 qa_log 静默复活
+    try:
+        was_cleared = getattr(_backend, "was_recently_cleared", None)
+        if was_cleared is not None and was_cleared(sid):
+            return sid, history
+    except Exception:   # noqa: BLE001 — 墓碑检查失败不阻断（宁可回读）
+        pass
+    with _seed_lock:
+        if sid in _seeding:
+            return sid, history
+        _seeding.add(sid)
+    try:
+        claim = getattr(_backend, "claim_rebuild", None)     # redis：跨实例 SETNX 单飞
+        if claim is not None and not claim(sid):
+            return sid, history
+        try:
+            fresh = _backend.get_history(sid, owner=owner)   # 二次检查：别的线程/实例可能已回种
+        except Exception:   # noqa: BLE001
+            fresh = []
+        if fresh:
+            return sid, fresh
+        rebuilt = _rebuild_from_qa_log(sid, owner, MAX_HISTORY_TURNS)
         if rebuilt:                                # 回种后端：后续 append 在其上续写
             for i in range(0, len(rebuilt) - 1, 2):
                 _backend.append(sid, rebuilt[i]["content"], rebuilt[i + 1]["content"], owner=owner)
             return sid, rebuilt
-    return sid, history
+        return sid, history
+    finally:
+        with _seed_lock:
+            _seeding.discard(sid)
 
 
 def clear_session(session_id: str, *, owner: Optional[str] = None, trusted: bool = False) -> bool:

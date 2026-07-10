@@ -47,7 +47,10 @@ from opensearch_pipeline.content_blocks_builder import (
     strip_image_markers,
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
-from opensearch_pipeline.rate_limiter import LIMITER, resolve_client_ip
+# ⚠️ 限流器必须按模块属性访问（rate_limiter.LIMITER），不能 from-import 按值绑定——
+# 否则 _set_limiter_for_test 替换全局后本模块仍持旧引用，测试接缝假绿（深度审查 F 组）。
+from opensearch_pipeline import rate_limiter as _rate_limiter
+from opensearch_pipeline.rate_limiter import resolve_client_ip
 from opensearch_pipeline.answer_flow import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -126,7 +129,7 @@ async def _lifespan(_app: FastAPI):
     except Exception:
         logger.warning("启动钉钉 Stream 客户端失败（忽略，HTTP 回调模式继续可用）", exc_info=True)
     try:
-        logger.info("Serving 限流配置：%s", LIMITER.describe())
+        logger.info("Serving 限流配置：%s", _rate_limiter.LIMITER.describe())
     except Exception:
         logger.warning("读取限流配置失败（忽略）", exc_info=True)
     # P2-8：比对摄取侧写入的 embedding 契约行（模型名/维度，schema/018）。失配 = 查询向量
@@ -435,10 +438,10 @@ def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity]
         else:
             actor, is_user = f"ip:{_client_ip(request)}", False
         if scope == "ask":
-            denial = LIMITER.admit_ask(actor, is_user=is_user,
+            denial = _rate_limiter.LIMITER.admit_ask(actor, is_user=is_user,
                                        thinking=thinking, count_llm=count_llm)
         else:
-            denial = LIMITER.admit_aux(actor)
+            denial = _rate_limiter.LIMITER.admit_aux(actor)
     except Exception:
         if scope == "ask":
             logger.error("限流器内部异常（成本路径 fail-CLOSED 拒绝）", exc_info=True)

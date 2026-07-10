@@ -46,11 +46,27 @@ def test_rebuild_orders_desc_rows_to_chronological(monkeypatch):
     assert [m["role"] for m in out] == ["user", "assistant"] * 3
 
 
-def test_rebuild_null_answer_becomes_empty_string(monkeypatch):
+def test_rebuild_null_answer_skipped(monkeypatch):
+    """卫生层对齐在线入史策略（should_append_history）：空答案的轮不回种——
+    否则拒答/半截轮以空 assistant 消息复活进上下文（深度审查 D 组）。"""
     import opensearch_pipeline.db as db
     monkeypatch.setattr(db, "_get_db_conn", lambda: _Conn([("Q1", None)]))
-    assert ss._rebuild_from_qa_log("s", "u", 10) == [
-        {"role": "user", "content": "Q1"}, {"role": "assistant", "content": ""}]
+    assert ss._rebuild_from_qa_log("s", "u", 10) == []
+
+
+def test_clear_tombstone_suppresses_rebuild(monkeypatch):
+    """主动清除墓碑：clear_session 之后（会话超时窗内）不回读复活刚清掉的上下文——
+    「新会话」/ /api/session/clear 不能被 qa_log 回读静默失效（深度审查 D 组 P1）。"""
+    monkeypatch.setattr(ss, "_backend", ss.MemorySessionStore())
+    monkeypatch.setattr(ss, "_conversation_history_on", lambda: True)
+    monkeypatch.setattr(ss, "_rebuild_from_qa_log",
+                        lambda *a: [{"role": "user", "content": "旧问"},
+                                    {"role": "assistant", "content": "旧答"}])
+    ss.append_to_history("tomb-1", "q", "a", owner="u")
+    assert ss.clear_session("tomb-1", owner="u") is True
+    sid, hist = ss.get_or_create_session("tomb-1", owner="u")
+    assert sid == "tomb-1"
+    assert hist == []          # 墓碑期内不回读复活
 
 
 def test_rebuild_fail_safe_returns_empty_on_db_error(monkeypatch):
