@@ -1037,3 +1037,54 @@ def test_speculative_retrieval_single_fetch(monkeypatch, wired):
         assert calls["n"] == 1
     finally:
         api.app.dependency_overrides.clear()
+
+
+class _CiteProvider:
+    """终答带「文档1」内部编号——驱动清洗断言。"""
+
+    name = "dashscope"
+
+    def capabilities(self, m):
+        return None
+
+    def chat(self, model, req):
+        if any(m.get("role") == "tool" for m in req.messages):
+            return ChatResponse(text="根据[文档1]，应遵循 GB/T 包装标准执行。", tool_calls=[],
+                                usage=Usage(), model=model)
+        return ChatResponse(text="", tool_calls=[ToolCall(id="c1", name="knowledge_search",
+                            arguments={"query": "包装规范"})], usage=Usage(), model=model)
+
+
+def test_budget_sources_included_only_and_citation_strip(monkeypatch):
+    """预算模式（2026-07-11 设计 v2）：sources 帧只列 included（模型没见过的截断尾块
+    不进来源面板）；final_text 落库前清「文档N」内部编号。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "true")
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_CHARS", "600")
+    registry = build_default_registry()
+    store = _FakeStore()
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _CiteProvider()},
+                           routes={"light": [("dashscope", "m")]})
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (registry, gateway, executor, store))
+    rows = [{"doc_id": f"D{i}", "chunk_id": f"C{i}", "title": f"包装文档{i}.docx",
+             "doc_title": f"包装文档{i}.docx", "chunk_text": "正文内容。" * 60,
+             "score": 8.0, "chunk_type": "text_chunk"} for i in (1, 2, 3)]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    logged = {}
+    monkeypatch.setattr("opensearch_pipeline.qa_logger.log_qa_session",
+                        lambda **kw: logged.update(kw))
+    try:
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "富岭包装规范?"})
+        assert r.status_code == 200
+        body = r.text
+        assert '"type": "sources"' in body and "包装文档1.docx" in body
+        assert "包装文档3.docx" not in body          # 预算外尾块不进来源面板（included-only）
+        # 确定性清洗只管括号形态 [文档N]（与普通路径同分工；裸写形态归提示词压制）
+        assert logged and "[文档1]" not in (logged.get("answer_text") or "")
+        assert "GB/T 包装标准" in logged["answer_text"]
+    finally:
+        api.app.dependency_overrides.clear()
+        executor.shutdown()

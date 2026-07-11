@@ -273,6 +273,18 @@ class ThreadedRunExecutor:
                         elapsed_ms=int((time.monotonic() - _t0) * 1000),
                         turn_index=ev.turn_index,
                         artifacts=getattr(result, "artifacts", None)))   # 进程内旁路（exclude 不序列化）
+                    # 去重键【送达点提交】（评审 R②-4）：只有成功送达模型的结果才登记
+                    # seen——超时孤儿/义务扣留的结果永不被消费，keys 永不提交；所有写
+                    # 收敛到本驱动线程（duck-typed，executor 不 import agent_tools）。
+                    if getattr(result, "status", None) == "succeeded":
+                        _keys = (getattr(result, "artifacts", None) or {}).get("dedup_keys")
+                        _sess = getattr(ctx, "search_session", None)
+                        if _keys is not None and _sess is not None \
+                                and hasattr(_sess, "commit_keys"):
+                            try:
+                                _sess.commit_keys(_keys)
+                            except Exception:   # noqa: BLE001 — fail-open
+                                logger.warning("search_session 提交失败（忽略）", exc_info=True)
                     ev = gen.send(result)                               # ← B2：回注结果
                     continue
                 if isinstance(ev, RunSuspended):

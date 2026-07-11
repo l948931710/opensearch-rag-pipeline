@@ -200,7 +200,7 @@ def _run_case(case: Dict[str, Any], provider_factory) -> Dict[str, Any]:
         DefaultAgentLoop, ExecutionContext, make_model_fn)
     from opensearch_pipeline.agent_runtime.events import (
         RunCompleted, RunFailed, RunSuspended, ToolCallProposed)
-    from opensearch_pipeline.routes.agent import _AGENT_SYSTEM_PROMPT   # 与生产同一 prompt
+    from opensearch_pipeline.routes.agent import _agent_system_prompt   # 与生产同一 prompt（含 flag 条件化后缀）
 
     corpus = case.get("corpus")
 
@@ -215,7 +215,7 @@ def _run_case(case: Dict[str, Any], provider_factory) -> Dict[str, Any]:
                                   acl_groups=["production"], roles=["employee"],
                                   channel="console", thread_id=f"eval-{case['id']}")
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, "light"))
-    messages = [{"role": "system", "content": _AGENT_SYSTEM_PROMPT},
+    messages = [{"role": "system", "content": _agent_system_prompt()},
                 {"role": "user", "content": case["question"]}]
 
     orig = retriever_mod.retrieve_and_enrich

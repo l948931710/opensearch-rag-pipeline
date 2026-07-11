@@ -15,7 +15,9 @@ from opensearch_pipeline.agent_runtime.tool import EnterpriseTool, RiskLevel, To
 from opensearch_pipeline.agent_tools import build_default_registry
 from opensearch_pipeline.agent_tools.knowledge_search import (
     KnowledgeSearchTool,
+    SearchSession,
     SpeculativeSearch,
+    _dedup_key,
     query_matches_question,
 )
 
@@ -189,3 +191,104 @@ def test_speculative_miss_and_failure_fall_back(monkeypatch):
         assert res3.status == "succeeded" and res3.receipt.get("speculative") is None
     finally:
         pool.shutdown(wait=False)
+
+
+# ── 上下文预算打包（延迟优化第三刀，2026-07-11；设计 v2 + 三评审条件）──────────────
+
+
+def _mk_chunk(i, text_len=400, title=None, cid=None, parent=None, score=8.0):
+    return {"doc_id": f"D{i}", "chunk_id": cid or f"C{i}", "title": title or f"文档{i}.docx",
+            "doc_title": title or f"文档{i}.docx", "chunk_text": f"块{i}正文。" * (text_len // 5),
+            "score": score, "chunk_type": "text_chunk",
+            **({"parent_chunk_id": parent} if parent else {})}
+
+
+def _budget_ctx(session=None):
+    ns = SimpleNamespace(acl_groups=("production",))
+    ns.search_session = session
+    ns.speculative_search = None
+    return ns
+
+
+def test_budget_flag_off_bytes_identical(monkeypatch):
+    """flag off：工具文本走旧手工格式，artifacts 无 included 键——逐字节回旧行为。"""
+    monkeypatch.delenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", raising=False)
+    rows = [_mk_chunk(1), _mk_chunk(2)]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    res = KnowledgeSearchTool().run(_budget_ctx(), {"query": "q"})
+    assert res.content[0].text.startswith("[1] 文档1.docx")
+    assert "included" not in (res.artifacts or {})
+
+
+def test_budget_packs_with_normal_path_semantics(monkeypatch):
+    """flag on：_format_context_ex 同源打包（[文档N] header + 相关度标签）+ 预算生效
+    + 诚实注记 + artifacts 三键契约 + receipt 计数。"""
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "true")
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_CHARS", "1200")
+    rows = [_mk_chunk(i) for i in range(1, 8)]           # 7×~400 字 ≫ 1200 预算
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    res = KnowledgeSearchTool().run(_budget_ctx(SearchSession()), {"query": "q"})
+    text = res.content[0].text
+    assert "[文档1] 文档1.docx" in text                    # 普通路径 header 同源
+    assert "相关度" in text                                # 标签进文本
+    assert "因篇幅未展开" in text                          # 诚实注记
+    assert res.receipt["chunk_count"] == 7 and res.receipt["dropped"] >= 3
+    assert res.receipt["ctx_chars"] == len(text)
+    arts = res.artifacts
+    assert list(arts) >= ["chunks"] and set(arts) == {"chunks", "included", "dedup_keys"}
+    assert arts["chunks"] == rows                          # 打包列表=IMG 编号基准（首检索全量）
+    assert len(arts["included"]) < 7                       # 预算截断感知
+    # seen 只登记完整展开块：dedup_keys ⊆ included 且不含半截块
+    assert 0 < len(arts["dedup_keys"]) <= len(arts["included"])
+
+
+def test_budget_dedup_byte_equal_and_pagination(monkeypatch):
+    """跨检索去重=字节等同；送达点提交后第二次检索：重复块被聚合、腾出预算让首查
+    被截的尾块完整展开（翻页涌现性质）；第二次 pure_text（无 <<IMG:）。"""
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "true")
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_CHARS", "1200")
+    rows = [_mk_chunk(i) for i in range(1, 8)]
+    rows[0]["image_refs"] = [{"oss_key": "processing/assets/x.png", "source_image": "x.png"}]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    session = SearchSession()
+    tool = KnowledgeSearchTool()
+    r1 = tool.run(_budget_ctx(session), {"query": "q1"})
+    assert "<<IMG:" in r1.content[0].text                  # 首检索有标记
+    session.commit_keys(r1.artifacts["dedup_keys"])        # 模拟 executor 送达点提交
+    n_full_1 = len(r1.artifacts["dedup_keys"])
+    r2 = tool.run(_budget_ctx(session), {"query": "q2"})
+    t2 = r2.content[0].text
+    assert r2.receipt["dedup"] == n_full_1                 # 完整展开过的被去重
+    assert "条与先前检索重复" in t2
+    assert "<<IMG:" not in t2                              # 第 2+ 次 pure_text
+    # 翻页：首查完整展开的 块1/块2 被去重腾出预算，首查被截/被丢的 块3/块4 此次完整展开
+    assert "块1正文" not in t2 and "块4正文" in t2
+    # 字节等同：同 chunk_id 不同文本不去重
+    rows2 = [dict(_mk_chunk(1), chunk_text="块1改写后的不同正文。" * 40)]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows2)
+    r3 = tool.run(_budget_ctx(session), {"query": "q3"})
+    assert r3.receipt["dedup"] == 0 and "块1改写后的不同正文" in r3.content[0].text
+
+
+def test_budget_step_family_note_and_all_dup_edge(monkeypatch):
+    """步骤族形态注记（同 parent 后续步骤 ≠ 较低相关度）；全重复空包给显式说明。"""
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "true")
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_CHARS", "900")
+    rows = [_mk_chunk(1, parent="P1"), _mk_chunk(2, parent="P1"),
+            _mk_chunk(3, parent="P1"), _mk_chunk(4, parent="P1")]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    session = SearchSession()
+    r1 = KnowledgeSearchTool().run(_budget_ctx(session), {"query": "流程"})
+    assert "个后续步骤因篇幅未展开" in r1.content[0].text   # 步骤族措辞
+    # 全重复边界：seen 收下全部 → 第二次同结果全被去重
+    session.commit_keys([_dedup_key(c) for c in rows])
+    r2 = KnowledgeSearchTool().run(_budget_ctx(session), {"query": "流程"})
+    assert "完全重复" in r2.content[0].text and r2.artifacts["chunks"] == []
+
+
+def test_dedup_key_fallback_full_text_hash():
+    """chunk_id 缺失退 (doc_id, sha1(完整文本))——拼接前缀相同、尾部不同的两块不同 key。"""
+    a = {"doc_id": "D", "chunk_text": "同前缀" * 100 + "尾A"}
+    b = {"doc_id": "D", "chunk_text": "同前缀" * 100 + "尾B"}
+    assert _dedup_key(a) != _dedup_key(b)
+    assert _dedup_key(a)[0] == "doc"

@@ -304,6 +304,7 @@ def _format_context_ex(
     chunks: List[Dict[str, Any]],
     max_chars: int = 6000,
     pure_text: bool = False,
+    meta_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """将检索到的 chunks 组装为 prompt context，同时返回【实际进入 context 的 chunk 子集】。
 
@@ -333,6 +334,7 @@ def _format_context_ex(
     n_dropped_with_images = 0
     salvage_start = len(chunks)   # 首个未进 context 的 chunk 下标
     salvaged_idx: List[int] = []  # img-aware 压缩条目补回的尾块下标（也算「进了 context」）
+    halfcut_idx: List[int] = []   # 半截纳入的块下标（至多 1 个；meta_out 消费方用）
 
     for i, chunk in enumerate(chunks):
         header = _chunk_header(i, chunk, pure_text)
@@ -347,6 +349,7 @@ def _format_context_ex(
                 if "\n" in cut:
                     # 切点在正文内：header（含标记）完整，保持原截断行为
                     parts.append(cut + "...(截断)")
+                    halfcut_idx.append(i)
                     salvage_start = i + 1
                 else:
                     # #F-mm11a：header 首行都放不下 → 整条放弃，绝不漏半截标记
@@ -403,6 +406,15 @@ def _format_context_ex(
 
     # included = 主纳入块 + img-aware 补回块（保持检索排序：尾部补回块接在主块之后）
     included = list(chunks[:salvage_start]) + [chunks[j] for j in salvaged_idx]
+    if meta_out is not None:
+        # 消费方契约（agent_tools/knowledge_search 去重登记等）：full_idx=完整正文进过
+        # context 的块下标；半截/salvage 压缩条目【不算完整展开】——去重登记只认 full_idx，
+        # 否则被截块的后半段在同 run 内永久不可再展开（评审 R①-1）。
+        meta_out["full_idx"] = [i for i in range(salvage_start) if i not in halfcut_idx]
+        meta_out["halfcut_idx"] = list(halfcut_idx)
+        meta_out["salvaged_idx"] = list(salvaged_idx)
+        meta_out["dropped_idx"] = [j for j in range(salvage_start, len(chunks))
+                                   if j not in salvaged_idx]
     return "\n---\n".join(parts), included
 
 

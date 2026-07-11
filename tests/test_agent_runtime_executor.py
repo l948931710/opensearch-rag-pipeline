@@ -143,3 +143,57 @@ def test_tool_calls_budget_fail_closed():
     assert ("run1", "running", "failed") in store.transitions
     assert store.budget["turns_used"] == 1           # 同一 tool 批只计一次 turn
     assert store.budget["tool_calls_used"] == 2       # 消费到 2（>1）才拦
+
+
+# ── 去重键送达点提交（2026-07-11 上下文预算，评审 R②-4）────────────────────────────
+def _session_ctx(session):
+    return ExecutionContext.create(request_id="r", user_id="u", acl_groups=["g"],
+                                   roles=["employee"], channel="console", thread_id="t",
+                                   budget=RunBudget(max_turns=8), search_session=session)
+
+
+class _Session:
+    def __init__(self):
+        self.seen = set()
+        self.committed_calls = 0
+
+    def commit_keys(self, keys):
+        self.seen.update(keys or ())
+        self.committed_calls += 1
+
+
+def test_dedup_keys_committed_on_delivery():
+    """成功结果送达（gen.send 前）→ 驱动线程提交 keys；session 状态由 executor 推进。"""
+    store = _FakeStore()
+    res = ToolResult.text_ok("检索结果")
+    res.artifacts = {"chunks": [], "dedup_keys": [("cid", "C1", "h1"), ("cid", "C2", "h2")]}
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: res, max_concurrent=2)
+    loop = DefaultAgentLoop(_scripted([
+        ModelTurn(tool_calls=[ProposedCall(call_id="c1", tool_name="knowledge_search",
+                                           arguments={"query": "x"})]),
+        ModelTurn(text="答案"),
+    ]))
+    session = _Session()
+    handle = ex.submit(_session_ctx(session), loop, [{"role": "user", "content": "q"}], [])
+    list(handle.events())
+    ex.shutdown()
+    assert session.seen == {("cid", "C1", "h1"), ("cid", "C2", "h2")}
+    assert session.committed_calls == 1
+
+
+def test_dedup_keys_not_committed_on_failed_result():
+    """失败结果（如超时被 executor 换成 fail）→ keys 永不提交——毒化路径闭死。"""
+    store = _FakeStore()
+    res = ToolResult.fail("超时")
+    res.artifacts = {"dedup_keys": [("cid", "C1", "h1")]}
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: res, max_concurrent=2)
+    loop = DefaultAgentLoop(_scripted([
+        ModelTurn(tool_calls=[ProposedCall(call_id="c1", tool_name="knowledge_search",
+                                           arguments={"query": "x"})]),
+        ModelTurn(text="答案"),
+    ]))
+    session = _Session()
+    handle = ex.submit(_session_ctx(session), loop, [{"role": "user", "content": "q"}], [])
+    list(handle.events())
+    ex.shutdown()
+    assert session.seen == set() and session.committed_calls == 0

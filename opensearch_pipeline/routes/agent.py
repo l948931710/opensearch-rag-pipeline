@@ -41,8 +41,24 @@ _AGENT_SYSTEM_PROMPT = (
     "段落后原样插入 <<IMG:N>> 标记（N 为条目编号），只引用与回答相关的图，"
     "不要插入无关图片的标记，也不要描述图片内容本身，用户将直接看到图片。"
 )
-# ⚠️ 本提示词同时是 L7 agent 评测门的生产提示词（eval_harness/agent 与此同源）——
-# 任何改动须重跑 make agent-eval 并重冻 baseline.json（见 runner 模块头）。
+# 上下文预算模式（RAG_AGENT_TOOL_CONTEXT_BUDGET）追加段：标签语义 + 禁引内部编号
+# （规则 8 等价）+ 标记编号措辞对齐 [文档N] header。做成 flag 条件化=off 臂提示词
+# 逐字节不变（评审 R③-5/7 臂位一致性前提）。
+_AGENT_PROMPT_BUDGET_SUFFIX = (
+    "检索结果每条标注了相关度（高/中/低）：高/中可直接依据；标注「低」的条目请先核对"
+    "内容再取舍，内容能直接支撑答案时照常引用，不要仅因标签放弃。"
+    "图片标记 <<IMG:N>> 的 N 对应条目的「文档N」编号。"
+    "回答中不要出现「文档1」「文档2」这类内部编号，提及来源时使用文档名称。"
+)
+
+
+def _agent_system_prompt() -> str:
+    from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
+    return _AGENT_SYSTEM_PROMPT + (_AGENT_PROMPT_BUDGET_SUFFIX if _budget_enabled() else "")
+
+
+# ⚠️ 本提示词（含条件化后缀）同时是 L7 agent 评测门的生产提示词（eval_harness/agent
+# 与此同源）——任何改动须重跑 make agent-eval 并重冻 baseline.json（见 runner 模块头）。
 
 # 运行时单例（每进程一套；executor 的有界线程池即 B1(b) 执行宿主）。惰性建，flag-off 时永不建。
 _RUNTIME = None
@@ -212,7 +228,8 @@ def _sources_frame(per_call_chunks: list) -> Optional[dict]:
         from opensearch_pipeline.api import SourceInfo
         from opensearch_pipeline.llm_generator import _extract_sources
         merged, seen = [], set()
-        for chunks in per_call_chunks:
+        for call in per_call_chunks:
+            chunks = call["included"] if isinstance(call, dict) else call
             for c in chunks:
                 key = c.get("chunk_id") or (c.get("doc_id"), (c.get("chunk_text") or "")[:80])
                 if key in seen:
@@ -243,7 +260,15 @@ def _content_blocks_frame(final_text: str, per_call_chunks: list) -> Optional[di
         return None
     try:
         from opensearch_pipeline.content_blocks_builder import build_content_blocks
-        blocks = build_content_blocks(final_text, per_call_chunks[0])
+        call0 = per_call_chunks[0]
+        packed = call0["chunks"] if isinstance(call0, dict) else call0
+        # 预算模式下先清「文档N」内部编号（顺序对齐 api.py：先清引用、blocks 用带
+        # <<IMG:N>> 标记的原文）；off 臂不动（零行为变化）。
+        from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
+        if _budget_enabled():
+            from opensearch_pipeline.llm_generator import strip_doc_citations
+            final_text = strip_doc_citations(final_text)
+        blocks = build_content_blocks(final_text, packed)
         if blocks and any(b.get("type") == "image" for b in blocks):
             return {"type": "content_blocks", "content_blocks": blocks}
         return None
@@ -267,7 +292,7 @@ def _stream_events(handle, session_id: str, message_id: str):
         ModelDelta, RunCompleted, RunFailed, RunSuspended, ToolCallProposed,
         ToolResultEmitted)
     closed = False
-    per_call_chunks: list = []      # 每次 knowledge_search 的 chunks（保序、per-call 分组）
+    per_call_chunks: list = []      # 每次 knowledge_search 的 artifacts（含 chunks/included，保序）
     try:
         yield _sse({"type": "session", "session_id": session_id, "message_id": message_id,
                     "run_id": handle.run_id})
@@ -282,9 +307,12 @@ def _stream_events(handle, session_id: str, message_id: str):
                 yield _sse({"type": "tool_result", "call_id": ev.call_id,
                             "tool_name": ev.tool_name, "status": ev.status,
                             "elapsed_ms": ev.elapsed_ms})
-                chunks = (getattr(ev, "artifacts", None) or {}).get("chunks") or []
-                if chunks:
-                    per_call_chunks.append(list(chunks))
+                arts = getattr(ev, "artifacts", None) or {}
+                if arts.get("chunks"):
+                    # chunks=打包列表（IMG 编号基准）；included=进 context 的子集（sources 用，
+                    # flag-off 无该键→回退 chunks，评审 R②-1/R①-5 契约）
+                    per_call_chunks.append({"chunks": list(arts["chunks"]),
+                                            "included": list(arts.get("included") or arts["chunks"])})
                     frame = _sources_frame(per_call_chunks)
                     if frame:
                         yield _sse(frame)   # 来源 chips：字段收口后的 union（末帧覆盖）
@@ -371,6 +399,14 @@ def agent_ask(req: AskRequest, request: Request,
                 _spec_pool())
         except Exception:   # noqa: BLE001
             logger.warning("投机检索预取启动失败（忽略，走真检索）", exc_info=True)
+    search_session = None
+    try:
+        from opensearch_pipeline.agent_tools.knowledge_search import (
+            SearchSession, _budget_enabled)
+        if _budget_enabled():
+            search_session = SearchSession()   # 跨检索去重 seen（送达点提交，见类注）
+    except Exception:   # noqa: BLE001
+        logger.warning("SearchSession 构建失败（忽略，去重禁用）", exc_info=True)
 
     tier = "high" if thinking else "light"
     ctx = ExecutionContext.create(
@@ -378,16 +414,22 @@ def agent_ask(req: AskRequest, request: Request,
         roles=(identity.role,) if identity.role else ("employee",),
         channel="console", thread_id=thread_id, conversation_id=conv,
         model_profile=tier,   # 档位落 ctx → create_run 记 agent_run.model_profile（运行中心可见）
-        speculative_search=speculative)
+        speculative_search=speculative, search_session=search_session)
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))   # 档位随深度思考：light/high
     tools = registry.list_specs(ctx)
     # 多轮：system + 历史快照（前几轮 Q&A + summary）+ 本轮 user
-    messages = ([{"role": "system", "content": _AGENT_SYSTEM_PROMPT}]
+    messages = ([{"role": "system", "content": _agent_system_prompt()}]
                 + snapshot.messages
                 + [{"role": "user", "content": req.question}])
 
     def _remember(final_text: str) -> None:
         """run 完成侧回调（executor 调，非 SSE 消费侧——客户端断连也照常落库）。"""
+        from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
+        if _budget_enabled():
+            # 预算模式引入 [文档N] header → 落库/记忆前清内部编号（流式增量无法整流
+            # 清洗=已声明残余，靠提示词压制；评审 R①-7/R②-2）
+            from opensearch_pipeline.llm_generator import strip_doc_citations
+            final_text = strip_doc_citations(final_text)
         memory.append(thread_id, req.question, final_text, owner=identity.user_id)   # 热态记忆
         # durable：落 qa_session_log（供重启回读重建 + console 会话历史；log_qa_session 自身 fail-safe）
         from opensearch_pipeline.qa_logger import log_qa_session

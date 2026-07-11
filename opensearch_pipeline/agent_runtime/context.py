@@ -73,6 +73,10 @@ class ExecutionContext:
     # 铁律 2 不破）：submit 时用原问题并行预取，knowledge_search 命中即复用。
     # 不落库不进 checkpoint；resume 重建的 ctx 恒为 None（预取只在 submit 段有意义）。
     speculative_search: Optional[Any] = None
+    # 检索会话（同上瞬态三律）：跨检索去重 seen 集 + 已提交次数；executor 在成功结果
+    # 送达点 commit_keys（见 knowledge_search.SearchSession）。resume 恒 None=fail-open。
+    # TODO(清理)：与 speculative_search 合并为单一 run_scratch 槽位（评审 R②-6 建议）。
+    search_session: Optional[Any] = None
     # PR-C（P0-06 回链）：审批放行的调用由 adjudicator 在消费 ApprovalGrant 时注入——
     # 工具据此把 approval_request_id 落到事实行（如 ontology_identifier）、confirmed_by
     # 记真实审批人；approval_scope=审批时用的裁决键，供工具落库前重验 stewardship 漂移。
@@ -90,6 +94,7 @@ class ExecutionContext:
                conversation_id: Optional[str] = None,
                model_profile: Optional[str] = None,
                speculative_search: Optional[Any] = None,
+               search_session: Optional[Any] = None,
                auth_resolved_at: Optional[datetime] = None) -> "ExecutionContext":
         """服务端构造入口。acl_groups/roles 归一为不可变 tuple；时间/预算给默认。
 
@@ -103,6 +108,7 @@ class ExecutionContext:
             auth_resolved_at=now, budget=budget or RunBudget.with_ttl(now),
             run_id=run_id, conversation_id=conversation_id,
             model_profile=model_profile, speculative_search=speculative_search,
+            search_session=search_session,
         )
 
     def needs_reauth(self, now: datetime, threshold_s: int = DEFAULT_REAUTH_THRESHOLD_S) -> bool:
