@@ -205,7 +205,9 @@ def test_agent_multi_search_suppresses_blocks_keeps_sources(monkeypatch):
         assert r.status_code == 200
         body = r.text
         assert '"type": "sources"' in body and "q1.docx" in body and "q2.docx" in body
-        assert '"type": "content_blocks"' not in body and "never.png" not in body
+        # 多检索出图门：不得有图块（never.png=被压制的图）；预算默认 on 后完成时的
+        # 纯文本替换帧是预期行为，不在压制范围
+        assert "never.png" not in body and '"type": "image"' not in body
     finally:
         api.app.dependency_overrides.clear()
         executor.shutdown()
@@ -385,7 +387,9 @@ def test_streaming_sse_typewriter_no_duplicate_final(monkeypatch):
         assert r.status_code == 200
         body = r.text
         assert '"content": "根据"' in body and '"content": "检索"' in body   # 打字机增量
-        assert '"content": "根据检索"' not in body, "streamed=True 时全文不得重发"
+        # streamed=True 时全文不得以 chunk 帧重发（预算模式的 content_blocks 替换帧
+        # 是刻意的定稿视图，前端替换而非追加，不算重发）
+        assert '"type": "chunk", "content": "根据检索"' not in body
         assert '"type": "tool_call"' in body and '"type": "done"' in body
         assert body.count('"type": "chunk"') == 2
     finally:
@@ -1085,6 +1089,46 @@ def test_budget_sources_included_only_and_citation_strip(monkeypatch):
         # 确定性清洗只管括号形态 [文档N]（与普通路径同分工；裸写形态归提示词压制）
         assert logged and "[文档1]" not in (logged.get("answer_text") or "")
         assert "GB/T 包装标准" in logged["answer_text"]
+    finally:
+        api.app.dependency_overrides.clear()
+        executor.shutdown()
+
+
+def test_budget_text_only_replacement_frame(monkeypatch, wired):
+    """预算模式无图答案：完成时发纯文本 content_blocks 替换帧——流式增量里的
+    [文档N]/<think> 残留被定稿块覆盖（探针实测 1/6 命中的收尾补丁）。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "true")
+
+    class _DirtyProvider(_FakeProvider):
+        def chat(self, model, req):
+            if any(m.get("role") == "tool" for m in req.messages):
+                return ChatResponse(
+                    text="按规程执行[文档2][文档3]。<think>\n</think>", tool_calls=[],
+                    usage=Usage(), model=model)
+            return super().chat(model, req)
+
+    registry = build_default_registry()
+    store = _FakeStore()
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _DirtyProvider()},
+                           routes={"light": [("dashscope", "m")]})
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (registry, gateway, executor, store))
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: [
+        {"doc_id": "D1", "chunk_id": "C1", "title": "规程.docx", "doc_title": "规程.docx",
+         "chunk_text": "正文", "score": 8.0, "chunk_type": "text_chunk"}])
+    try:
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "规程?"})
+        body = r.text
+        assert '"type": "content_blocks"' in body            # 无图也发替换帧
+        import json as _json
+        frames = [_json.loads(ln[6:]) for ln in body.splitlines()
+                  if ln.startswith("data: ") and ln != "data: [DONE]"]
+        cb = next(f for f in frames if f.get("type") == "content_blocks")
+        md = cb["content_blocks"][0]["content"]
+        assert "[文档2]" not in md and "<think>" not in md and "按规程执行" in md
     finally:
         api.app.dependency_overrides.clear()
         executor.shutdown()

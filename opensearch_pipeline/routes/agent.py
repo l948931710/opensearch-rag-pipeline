@@ -16,6 +16,7 @@ RAG_AGENT_STREAM 默认开、=false 回退整段单 chunk）。ModelGateway/RDSR
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -32,6 +33,10 @@ from opensearch_pipeline.api import (  # noqa: E402  顶层 from-import api 共�
 )
 
 logger = logging.getLogger(__name__)
+
+# qwen3.7 light 偶发在答案尾部吐空 <think></think> 残壳（三臂探针 off 也 3/6，预算无关的
+# 既有 serving 缺口）——定稿清洗用；流式增量中的残留由替换帧覆盖。
+_THINK_STUB_PATTERN = re.compile(r"<think>\s*</think>", re.IGNORECASE)
 router = APIRouter()
 
 _AGENT_SYSTEM_PROMPT = (
@@ -253,24 +258,35 @@ def _content_blocks_frame(final_text: str, per_call_chunks: list) -> Optional[di
     v1 边界：**仅单次检索的 run 出图**——<<IMG:N>> 编号按该次工具回包的 [1..k] 平铺序
     对位；多次检索时各批次编号互相冲突，误绑图比没图更糟（xlsx 绑定教训），先跳过留日志。
     纯文本答案/无被引用图 → 构建器返回空 → 不发帧（与普通路径一致）。"""
-    if not (final_text or "").strip() or len(per_call_chunks) != 1:
-        if len(per_call_chunks) > 1:
-            logger.info("agent 多次检索（%s 次）暂不出图（IMG 编号跨批冲突）",
-                        len(per_call_chunks))
+    if not (final_text or "").strip():
         return None
     try:
-        from opensearch_pipeline.content_blocks_builder import build_content_blocks
-        call0 = per_call_chunks[0]
-        packed = call0["chunks"] if isinstance(call0, dict) else call0
-        # 预算模式下先清「文档N」内部编号（顺序对齐 api.py：先清引用、blocks 用带
-        # <<IMG:N>> 标记的原文）；off 臂不动（零行为变化）。
         from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
-        if _budget_enabled():
+        budget_on = _budget_enabled()
+        if budget_on:
+            # 预算模式先清「文档N」内部编号 + 空 <think> 残壳（顺序对齐 api.py：先清引用、
+            # blocks 用带 <<IMG:N>> 标记的原文）；off 臂不动（零行为变化）。
             from opensearch_pipeline.llm_generator import strip_doc_citations
-            final_text = strip_doc_citations(final_text)
-        blocks = build_content_blocks(final_text, packed)
-        if blocks and any(b.get("type") == "image" for b in blocks):
-            return {"type": "content_blocks", "content_blocks": blocks}
+            final_text = _THINK_STUB_PATTERN.sub("", strip_doc_citations(final_text))
+        if len(per_call_chunks) == 1:
+            from opensearch_pipeline.content_blocks_builder import build_content_blocks
+            call0 = per_call_chunks[0]
+            packed = call0["chunks"] if isinstance(call0, dict) else call0
+            blocks = build_content_blocks(final_text, packed)
+            if blocks and any(b.get("type") == "image" for b in blocks):
+                return {"type": "content_blocks", "content_blocks": blocks}
+        elif len(per_call_chunks) > 1:
+            logger.info("agent 多次检索（%s 次）暂不出图（IMG 编号跨批冲突）",
+                        len(per_call_chunks))
+        # 预算模式无图（或多检索）时发【纯文本替换帧】：流式增量无法整流清洗，
+        # [文档N]/<think> 残留会永久留在气泡里（探针实测 1/6 命中）——用定稿块替换，
+        # 与「图文帧替换 html」同一前端机制，零新前端代码。
+        if budget_on:
+            from opensearch_pipeline.content_blocks_builder import strip_image_markers
+            text_only = strip_image_markers(final_text).strip()
+            if text_only:
+                return {"type": "content_blocks",
+                        "content_blocks": [{"type": "markdown", "content": text_only}]}
         return None
     except Exception:   # noqa: BLE001
         logger.warning("agent content_blocks 构建失败（忽略，纯文本照发）", exc_info=True)
@@ -426,10 +442,10 @@ def agent_ask(req: AskRequest, request: Request,
         """run 完成侧回调（executor 调，非 SSE 消费侧——客户端断连也照常落库）。"""
         from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
         if _budget_enabled():
-            # 预算模式引入 [文档N] header → 落库/记忆前清内部编号（流式增量无法整流
-            # 清洗=已声明残余，靠提示词压制；评审 R①-7/R②-2）
+            # 预算模式引入 [文档N] header → 落库/记忆前清内部编号 + 空 <think> 残壳
+            # （流式增量的瞬时残留由 content_blocks 替换帧覆盖；评审 R①-7/R②-2）
             from opensearch_pipeline.llm_generator import strip_doc_citations
-            final_text = strip_doc_citations(final_text)
+            final_text = _THINK_STUB_PATTERN.sub("", strip_doc_citations(final_text))
         memory.append(thread_id, req.question, final_text, owner=identity.user_id)   # 热态记忆
         # durable：落 qa_session_log（供重启回读重建 + console 会话历史；log_qa_session 自身 fail-safe）
         from opensearch_pipeline.qa_logger import log_qa_session

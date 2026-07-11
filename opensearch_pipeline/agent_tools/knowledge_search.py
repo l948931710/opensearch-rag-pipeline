@@ -110,15 +110,18 @@ def _format_chunks(chunks: List[Dict[str, Any]]) -> Tuple[List[ContentBlock], Di
 
 
 # ── 上下文预算打包（延迟优化第三刀，2026-07-11，设计+三评审：docs/agent-platform-v2/
-#    tooltext-context-budget-design_2026-07-11_DRAFT.md）──────────────────────────
+#    tooltext-context-budget-design_2026-07-11.md）───────────────────────────────
 # 复用普通问答路径打包器 _format_context_ex：同预算（缺省 6000=llm_generator 签名默认
 # 同值）、同截断语义、同 header/相关度标签/图标记；agent 增量=诚实注记两行 + 跨检索
-# 字节等同去重。默认 off（RAG_AGENT_TOOL_CONTEXT_BUDGET），质量评测过门才翻。
+# 字节等同去重。RAG_AGENT_TOOL_CONTEXT_BUDGET 默认 on（质量评测过门后翻转，证据见
+# 设计文档 §8）；kill switch=false。
 
 
 def _budget_enabled() -> bool:
-    return os.environ.get("RAG_AGENT_TOOL_CONTEXT_BUDGET", "").strip().lower() \
-        in ("1", "true", "yes", "on")
+    """默认 on（2026-07-11 质量评测过门后翻转：L7 扩展 31 例 grounded 9/9 + staging
+    三臂探针 on@6000 事实零回退/中位 tokens -37%；证据见设计文档 §4.3 结果）。"""
+    return os.environ.get("RAG_AGENT_TOOL_CONTEXT_BUDGET", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
 
 
 def _budget_chars() -> int:

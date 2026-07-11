@@ -1,6 +1,6 @@
 {
-  "frozen_from": "eval_harness/reports/agent_eval_20260711T115107.json",
-  "frozen_at": "2026-07-11T11:51:19",
+  "frozen_from": "eval_harness/reports/agent_eval_20260711T163602.json",
+  "frozen_at": "2026-07-11T16:36:42",
   "provider": "live",
   "metrics": {
     "tool_trigger_rate": 1.0,
@@ -13,8 +13,8 @@
     "approval_suspend_rate": 1.0,
     "n_suspend_denom": 6,
     "grounded_rate": 1.0,
-    "n_grounded": 6,
+    "n_grounded": 9,
     "error_count": 0,
-    "n_total": 28
+    "n_total": 31
   }
 }

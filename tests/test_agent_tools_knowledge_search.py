@@ -40,6 +40,7 @@ def test_spec_readonly_no_user_dept():
 
 
 def test_acl_injected_from_ctx_not_args(monkeypatch):
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "false")   # 旧格式契约测试
     captured = {}
 
     def fake_retrieve(query, *, top_k=None, user_dept=None, **k):
@@ -97,6 +98,7 @@ def test_build_default_registry_has_knowledge_search():
 def test_artifacts_carry_chunks_but_never_serialize(monkeypatch):
     """chunks 经 artifacts 进程内直通（供 serving 构建 sources/content_blocks）；
     exclude=True → model_dump 不带（digest/落库/线协议零泄漏面）。"""
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "false")   # 断言旧 artifacts 形状
     rows = [{"doc_id": "D1", "chunk_text": "内容A", "doc_title": "标准A"}]
     monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
     res = KnowledgeSearchTool().run(_ctx(), {"query": "包装规范"})
@@ -107,6 +109,7 @@ def test_artifacts_carry_chunks_but_never_serialize(monkeypatch):
 def test_img_marker_appended_for_renderable_chunks(monkeypatch):
     """带可渲染图的 chunk → 条目行追加 ` [📷 图片] <<IMG:i>>`（与普通问答同一实现/编号同源）；
     无图 chunk 不加。"""
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "false")   # 旧手工格式专属断言
     rows = [
         {"doc_id": "D1", "chunk_text": "第一步…", "doc_title": "SOP",
          "image_refs": [{"oss_key": "processing/assets/a.png", "source_image": "a.png"}]},
@@ -135,6 +138,7 @@ def test_query_match_rules():
 
 def test_speculative_hit_skips_real_retrieve(monkeypatch):
     """命中：预取结果直接复用，真检索零调用；receipt 打 speculative 标。"""
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "false")   # 断言旧 artifacts 形状
     calls = {"n": 0}
     rows = [{"doc_id": "D1", "chunk_text": "流程内容", "doc_title": "不合格品控制程序"}]
 
@@ -211,8 +215,9 @@ def _budget_ctx(session=None):
 
 
 def test_budget_flag_off_bytes_identical(monkeypatch):
-    """flag off：工具文本走旧手工格式，artifacts 无 included 键——逐字节回旧行为。"""
-    monkeypatch.delenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", raising=False)
+    """kill switch（默认已翻 on）：显式 false → 工具文本走旧手工格式，
+    artifacts 无 included 键——逐字节回旧行为。"""
+    monkeypatch.setenv("RAG_AGENT_TOOL_CONTEXT_BUDGET", "false")
     rows = [_mk_chunk(1), _mk_chunk(2)]
     monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
     res = KnowledgeSearchTool().run(_budget_ctx(), {"query": "q"})

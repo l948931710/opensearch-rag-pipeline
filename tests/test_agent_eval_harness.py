@@ -23,7 +23,7 @@ def test_scripted_ideal_scores_full_marks():
     assert m["approval_suspend_rate"] == 1.0    # 硬不变量：HIGH_WRITE 提案在生产 Policy 路径必挂起
     assert m["grounded_rate"] == 1.0
     assert m["error_count"] == 0
-    assert m["n_total"] == 28
+    assert m["n_total"] == 31
 
 
 class _LazyProvider:
@@ -78,7 +78,7 @@ def test_cli_scripted_and_freeze_baseline(tmp_path, capsys):
         reports = list(rep_dir.glob("agent_eval_*.json"))
         assert reports, "必须落 JSON 报告"
         data = json.loads(reports[0].read_text(encoding="utf-8"))
-        assert data["metrics"]["n_total"] == 28
+        assert data["metrics"]["n_total"] == 31
         baseline = tmp_path / "baseline.json"
         assert R.main(["--freeze-baseline", str(reports[0]), "--baseline", str(baseline)]) == 0
         assert json.loads(baseline.read_text(encoding="utf-8"))["metrics"]["tool_trigger_rate"] == 1.0

@@ -142,7 +142,9 @@ class _ScriptedIdealProvider:
         fam = c["family"]
         if any(m.get("role") == "tool" for m in req.messages):
             corpus = c.get("corpus") or []
-            if fam == "grounded" and not corpus:
+            if c.get("scripted_answer"):
+                text = c["scripted_answer"]          # 新 case（金块非 corpus[0]）的理想答案脚本
+            elif fam == "grounded" and not corpus:
                 text = "知识库中没有找到相关资料，无法回答该问题。"
             elif fam == "grounded":
                 text = f"根据资料：{corpus[0]['chunk_text']}"
@@ -208,12 +210,30 @@ def _run_case(case: Dict[str, Any], provider_factory) -> Dict[str, Any]:
         rows = corpus if corpus is not None else [
             {"doc_title": "评测占位资料",
              "chunk_text": "（评测通用语料）与问题相关的企业资料片段。"}]
-        return [{"doc_id": f"D{i}", **r} for i, r in enumerate(rows)]
+        # 数据面与打包器字段对齐（R③-3b）：title/score/chunk_type 缺省注入，case 行可覆盖
+        # ——否则预算模式下 _chunk_header 渲染成「未知文档 (相关度: 低 0.00)」的畸变面。
+        out = []
+        for i, r in enumerate(rows):
+            row = {"doc_id": f"D{i}", "chunk_id": f"EC{i}", "chunk_type": "text_chunk",
+                   "score": 8.0}
+            row.update(r)
+            row.setdefault("title", row.get("doc_title", ""))
+            out.append(row)
+        return out
 
     registry, executor, gateway = _build_runtime(provider_factory, case)
+    session = None
+    try:
+        from opensearch_pipeline.agent_tools.knowledge_search import (
+            SearchSession, _budget_enabled)
+        if _budget_enabled():
+            session = SearchSession()   # 与 serving 同构造（R③-3a）
+    except Exception:   # noqa: BLE001
+        session = None
     ctx = ExecutionContext.create(request_id=f"eval-{case['id']}", user_id="agent-eval",
                                   acl_groups=["production"], roles=["employee"],
-                                  channel="console", thread_id=f"eval-{case['id']}")
+                                  channel="console", thread_id=f"eval-{case['id']}",
+                                  search_session=session)
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, "light"))
     messages = [{"role": "system", "content": _agent_system_prompt()},
                 {"role": "user", "content": case["question"]}]
@@ -235,7 +255,12 @@ def _run_case(case: Dict[str, Any], provider_factory) -> Dict[str, Any]:
             elif isinstance(ev, RunCompleted):
                 final_text = ev.final_text
             elif isinstance(ev, RunFailed):
-                failed_err = ev.error
+                # 行为性打转（max_turns 超限）是被测行为，不是 infra 故障（R③-1.3）：
+                # 计入族指标（空答案→该族判负），error_count 留给真错误。
+                if ev.error and "max_turns" in ev.error:
+                    failed_err = None
+                else:
+                    failed_err = ev.error
         return {"id": case["id"], "family": case["family"], "proposed": proposed,
                 "suspended": suspended, "final_text": final_text, "error": failed_err,
                 "latency_s": round(time.monotonic() - t0, 2)}
@@ -270,6 +295,10 @@ def _score(case: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
     elif fam == "grounded":
         text = out["final_text"] or ""
         s["grounded"] = any(k in text for k in (case.get("must_contain_any") or []))
+        bad = case.get("must_not_contain") or []
+        if bad and any(b in text for b in bad):
+            s["grounded"] = False
+            s["fabricated"] = True          # 诱饵值出现在答案=编造，判死（R③-1.2）
         s["final_snippet"] = text[:80]
     return s
 

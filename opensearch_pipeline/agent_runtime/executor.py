@@ -14,6 +14,7 @@ run 主体在**专用有界线程池**里执行（绝不复用 Starlette 请求�
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -36,6 +37,8 @@ from opensearch_pipeline.agent_runtime.tool import ToolResult
 
 # 裁决+执行一次工具调用（Policy 裁决 → Executor 中间件执行）。WS1 注入真实实现。
 Adjudicator = Callable[[ExecutionContext, ToolCallProposed], ToolResult]
+
+logger = logging.getLogger(__name__)
 
 _SENTINEL = object()
 
