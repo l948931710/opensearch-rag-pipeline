@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
+import { useAgentApprovals } from '@/composables/useAgentApprovals'
 import {
   GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
@@ -1398,11 +1399,13 @@ export function useKb() {
   const ownerDepts = computed(() => session.identity?.managedOwnerDepts ?? [])
   const isKbAdmin = computed(() => session.role === 'kb_admin')
   const isDeptAdmin = computed(() => session.role === 'dept_admin')
-  // 待你审核的数量（红点/角标单一来源）：kb_admin = 待审批上传 + 授权申请；dept_admin = 授权申请（其本部门文档的）。
-  // 上传审批仅 kb_admin（/pending-approvals kb-only），故 dept_admin 的 approvals 恒空、不计入。
-  // 待你审核数（侧栏红点/tab 角标）：kb_admin=上传审批（只管入库）；dept_admin=授权申请
-  // （部门管理员之间的事）。两角色职权不重叠——拍板见 2026-07-04。
-  const reviewCount = computed(() => (session.role === 'kb_admin' ? approvals.value.length : accessRequests.value.length))
+  // 待你审核数（侧栏红点/「审批」tab 角标单一来源）= 角色职责内 kb 队列 + Agent 高风险审批。
+  // kb 侧沿拍板 2026-07-04：kb_admin=上传审批（只管入库）；dept_admin=授权申请（部门管理员
+  // 之间的事）——两角色职权不重叠，kb_admin 的后端兜底通道有意不呈现。Agent 审批两角色都
+  // 可能是审批人（/api/agent/approvals 服务端按 scope 下发），此前不进任何红点=漏数，现纳入。
+  const { agentApprovalCount } = useAgentApprovals()
+  const reviewCount = computed(() =>
+    (session.role === 'kb_admin' ? approvals.value.length : accessRequests.value.length) + agentApprovalCount.value)
 
   return {
     // 状态

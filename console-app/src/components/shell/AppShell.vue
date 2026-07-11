@@ -26,8 +26,12 @@ const resetSignal = computed(() => route.fullPath + '::' + activeId.value)
           <Transition name="fade" mode="out-in">
             <!-- 包一层带 key 的单根 div：路由视图可能是多根(如 ManageView 有 员工/管理员 两套根 div),
                  直接塞进 mode="out-in" 的 Transition 会因离场元素非单根而卡住、下个视图永不挂载 → 整页白屏
-                 (点「知识库」后再去别的页就空白的根因)。统一包成单根后,任何视图形态都能正确离场/进场。 -->
-            <div :key="route.fullPath" class="h-full">
+                 (点「知识库」后再去别的页就空白的根因)。统一包成单根后,任何视图形态都能正确离场/进场。
+                 key 用 path 而非 fullPath：query 变化(管理台子 tab / 台账筛选写 URL)不整树重挂载——
+                 fullPath 时代每切一次子 tab 都 destroy+recreate ManageView、重发 9~12 个管理接口请求
+                 (且台账翻页进度被重置)。视图内的 query 响应各自有 watcher(ManageView tab watch /
+                 DocTable onMounted 恢复筛选,后者靠切 tab 时 v-if 分支重挂,不受此影响)。 -->
+            <div :key="route.path" class="h-full">
               <component :is="Component" />
             </div>
           </Transition>
