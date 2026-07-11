@@ -458,9 +458,13 @@ def _live_acl_cache_clear() -> None:
         _live_acl_cache.clear()
 
 
-def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
+def _resolve_user_dept_cached(staff_id: str, *, with_status: bool = False):
     """读时实时重查（SELECT-only）：仅查 user_role 缓存，**不调钉钉 API、不 INSERT、无副作用**，
     供 current_identity 读路径对令牌内嵌 acl_groups 做实时复核（部门收紧/放宽即时生效，不等 TTL）。
+
+    with_status（P0-04 fail-closed 需区分「DB 失败」与「无在册行」——两者原都返回 None）：
+    True → 返回 (groups_or_None, db_ok)；db_ok=False 仅当 DB 查询**异常**（连接/查询失败），
+    「无在册行」是成功查询故 db_ok=True。默认 False 时返回旧契约（仅 groups_or_None）。
 
     与 _resolve_user_dept 的关键区别（故意不复用——后者在 cache-miss 时有 API+写副作用，不可放热路径）：
       - 命中在册行 → 返回归一化组列表（含放宽/收紧）。
@@ -469,8 +473,11 @@ def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
 
     结果带 RAG_LIVE_ACL_TTL_SECONDS（默认 45s）进程内缓存——见 _live_acl_cache 注释。
     """
+    def _ret(groups, db_ok=True):
+        return (groups, db_ok) if with_status else groups
+
     if not staff_id or staff_id.startswith("$:"):
-        return None
+        return _ret(None)                      # 群聊/空 uid：非 DB 失败（db_ok=True）
 
     ttl = _live_acl_ttl_seconds()
     now = time.time()
@@ -480,8 +487,8 @@ def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
             if ent is not None and ent[0] > now:
                 val = ent[1]
                 if val is _LIVE_ACL_MISS:
-                    return None
-                return list(val)
+                    return _ret(None)          # 缓存的「无在册行」：成功查询结果
+                return _ret(list(val))
 
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -509,10 +516,10 @@ def _resolve_user_dept_cached(staff_id: str) -> Optional[List[str]]:
                 # 粗粒度防胀：条目数超 4096 直接清空（正常在册用户 ~千级，不会触发）
                 if len(_live_acl_cache) > 4096:
                     _live_acl_cache.clear()
-        return groups
+        return _ret(groups)                    # 成功查询（groups=None 即无在册行，db_ok=True）
     except Exception as e:
-        logger.warning("读时 acl 复核失败（保留令牌组）staff_id=%s: %s", staff_id, e)
-        return None
+        logger.warning("读时 acl 复核失败 staff_id=%s: %s", staff_id, e)
+        return _ret(None, db_ok=False)         # DB 失败：db_ok=False（strict 据此 fail-closed）
 
 
 def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:

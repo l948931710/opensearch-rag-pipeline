@@ -175,6 +175,7 @@ export function clearSession(sessionId) {
 export function resignImages(ossKeys) {
   return request('/api/resign-images', {
     method: 'POST',
+    auth: true,  // P1-10：部门内部图片按文档可见性逐 key 校验，须带 Bearer（否则强制认证下 401）
     data: { oss_keys: ossKeys },
   });
 }

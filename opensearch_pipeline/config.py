@@ -11,6 +11,7 @@ config.py — 管线配置中心
   未设置              → .env                    (默认，向后兼容)
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -177,6 +178,21 @@ class RDSConfig:
     charset: str = "utf8mb4"
     connect_timeout: int = 10
     read_timeout: int = 30
+    # RDS 传输加密（P0-02 报告1，2026-07-10 外审）：默认空 = 现网连接行为不变（不传 ssl）。
+    # 配了 ssl_ca（阿里云 RDS CA 证书路径）→ db.py/prod_access 建连时传 ssl={ca,verify}。
+    # ssl_verify_cert：验证服务端证书（需 ssl_ca）。生产未启用时启动**告警不阻断**
+    # （用户选「先不强制」——拿到 CA 配好后再把告警升为硬断言）。
+    ssl_ca: str = ""
+    ssl_verify_cert: bool = True
+
+    def pymysql_ssl_args(self) -> dict:
+        """P0-02：pymysql.connect 的 ssl 关键字（默认空 → {} 现网不变）。
+        配了 ssl_ca → {"ssl": {"ca": <path>, "check_hostname"/"verify_cert": ...}}。"""
+        ca = (self.ssl_ca or "").strip()
+        if not ca:
+            return {}
+        return {"ssl": {"ca": ca, "check_hostname": bool(self.ssl_verify_cert)},
+                "ssl_verify_cert": bool(self.ssl_verify_cert)}
 
 
 @dataclass
@@ -615,6 +631,12 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
         if not config.simulate_opensearch and not search_targets.strip():
             raise EnvironmentMismatchError(
                 "[ENV GUARD] environment=production 但未配置任何检索后端（HA3/OpenSearch 均为空）")
+        # P0-02（报告1）：生产 RDS 传输加密自检——**告警不阻断**（用户选「先不强制」，
+        # 拿到阿里云 RDS CA 证书配好 RAG_RDS_SSL_CA 后可把本告警升为硬断言）。
+        if not config.simulate_db and not (config.rds.ssl_ca or "").strip():
+            logging.getLogger(__name__).warning(
+                "[P0-02] environment=production 但 RDS 未启用 TLS（RAG_RDS_SSL_CA 未配）——"
+                "RDS 链路承载身份/权限/日志，明文传输是审计缺口；请尽快配 CA 证书。")
 
     # D7：production/staging 实际启用 HA3 时表名必须显式声明（消除历史双标默认值）
     if env in ("production", "staging") and not config.simulate_opensearch \
@@ -753,6 +775,8 @@ def load_config() -> PipelineConfig:
             password=_env("RDS_PASSWORD"),
             database=_env("RDS_DATABASE", "fuling_knowledge"),
             operation_database=_env("RDS_OPERATION_DATABASE", "fuling_operation"),
+            ssl_ca=_env("RDS_SSL_CA", ""),
+            ssl_verify_cert=_env_bool("RDS_SSL_VERIFY_CERT", True),
         ),
 
         opensearch=OpenSearchConfig(

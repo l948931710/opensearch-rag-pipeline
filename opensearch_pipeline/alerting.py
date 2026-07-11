@@ -45,8 +45,12 @@ def send_ops_alert(title: str, text: str, *, severity: str = "warning",
     webhook = (os.environ.get("RAG_OPS_ALERT_WEBHOOK") or "").strip()
     secret = (os.environ.get("RAG_OPS_ALERT_SECRET") or "").strip()
     if not webhook:
-        # config-gated no-op: the alert path is shipped, activates on first env var set
-        logger.info("ops-alert no-op (RAG_OPS_ALERT_WEBHOOK unset): [%s] %s", severity, title)
+        # P0-05（报告1）：webhook 未配时不再静默 no-op——critical 升到 logger.error（运维日志
+        # 至少能看到"本该告警但发不出去"），其余 severity 保持 info。真正的常在线调度/dead-man
+        # 归 DataWorks 部署（代码改不了），但静默这一处代码侧先补上。
+        (logger.error if severity == "critical" else logger.info)(
+            "ops-alert %s (RAG_OPS_ALERT_WEBHOOK unset): [%s] %s",
+            "SUPPRESSED-CRITICAL" if severity == "critical" else "no-op", severity, title)
         return False
 
     # rate-limit identical alerts to prevent storms

@@ -205,6 +205,7 @@ def _init_db_pool():
         connect_timeout=cfg.connect_timeout,
         read_timeout=cfg.read_timeout,
         autocommit=False,
+        **cfg.pymysql_ssl_args(),   # P0-02：RDS_SSL_CA 配了才传 ssl（默认空=现网不变）
     )
     if pool_readonly:
         # 与 prod_access.get_prod_readonly_conn 同源的会话级只读：对后续所有事务

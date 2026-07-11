@@ -382,9 +382,20 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
     # 无在册行 / DB 失败 → live 为 None → 保留令牌组（绝不因瞬时抖动降级）。
     if uid and os.environ.get("RAG_LIVE_ACL_REREAD", "true").lower() in ("1", "true", "yes"):
         from opensearch_pipeline.dingtalk_identity import _resolve_user_dept_cached
-        live = _resolve_user_dept_cached(uid)
-        if live is not None:
-            groups = live
+        strict = os.environ.get("RAG_ACL_FAIL_CLOSED", "").strip().lower() in (
+            "1", "true", "yes", "on")
+        if strict:
+            live, db_ok = _resolve_user_dept_cached(uid, with_status=True)
+            if live is not None:
+                groups = live
+            elif not db_ok:
+                # P0-04 fail-closed：DB **失败**时不信任令牌内嵌组，降级到仅 public
+                # （无在册行 db_ok=True → 保留令牌组，短 TTL 兜底，不因未缓存降级）。
+                groups = []
+        else:
+            live = _resolve_user_dept_cached(uid)
+            if live is not None:
+                groups = live
     return Identity(
         user_id=uid,
         acl_groups=groups,
@@ -392,6 +403,24 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
         name=payload.get("name", ""),
         role=(payload.get("role") or "employee"),
     )
+
+
+def _require_auth_enabled() -> bool:
+    """P0-03（报告1）强制认证总开关。默认 **off** = 现网行为不变（匿名按 public 处理）。
+    开启后知识读取端点对无/无效令牌返回 401——**开 flag 前必须确认所有内部调用方
+    （钉钉 bot / 小程序 / 控制台 / 评测）都带 Bearer**，否则当场 401。建议先 staging 灰度。"""
+    return os.environ.get("RAG_REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def require_identity(identity: Optional[Identity] = Depends(current_identity)) -> Optional[Identity]:
+    """知识读取端点的认证守卫。RAG_REQUIRE_AUTH 开 → 无有效身份返回 401；
+    关（默认）→ 透传 identity（含 None，匿名按 public，历史行为）。
+
+    公司内知识库的 `public` 语义是"全员可见"，不是"全互联网可调用"——本守卫把
+    产品语义对齐到代码。健康探针/版本/钉钉免登入口不挂本守卫（另有公开签名）。"""
+    if _require_auth_enabled() and (identity is None or not identity.user_id):
+        raise HTTPException(status_code=401, detail="需要登录（Bearer 令牌）")
+    return identity
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -577,7 +606,7 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
 
 @app.post("/api/search", response_model=SearchResponse)
 def search(req: SearchRequest, request: Request,
-           identity: Optional[Identity] = Depends(current_identity)):
+           identity: Optional[Identity] = Depends(require_identity)):
     """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""
     # 与问答共享限频/日配额（embedding+HA3 也是真金白银），但不计入全局 LLM 熔断
     _enforce_rate_limit(request, identity, scope="ask", count_llm=False)
@@ -659,7 +688,7 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
 
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
-        identity: Optional[Identity] = Depends(current_identity)):
+        identity: Optional[Identity] = Depends(require_identity)):
     """非流式问答接口 — 检索 + LLM 一次性返回。
 
     用 def（非 async）声明：内部全是同步阻塞 I/O（embedding HTTP、HA3、pymysql、LLM
@@ -832,7 +861,7 @@ _SSE_HEADERS = {
 
 @app.post("/api/ask/stream")
 def ask_stream(req: AskRequest, request: Request,
-               identity: Optional[Identity] = Depends(current_identity)):
+               identity: Optional[Identity] = Depends(require_identity)):
     """SSE 流式问答接口 — 检索 + LLM 逐 token 输出。
 
     SSE 事件格式：
@@ -1206,7 +1235,7 @@ def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
 
 @app.post("/api/resign-images")
 def resign_images(req: ResignImagesRequest, request: Request,
-                  identity: Optional[Identity] = Depends(current_identity)):
+                  identity: Optional[Identity] = Depends(require_identity)):
     """过期图片重签：OSS 签名 URL 默认 1 小时过期，客户端凭 blocks 里的
     oss_key 换取新签名 URL（「图片已过期 · 点按重新加载」的真实后半段）。
 
