@@ -84,3 +84,31 @@ def test_no_results_message(monkeypatch):
 def test_build_default_registry_has_knowledge_search():
     reg = build_default_registry()
     assert reg.resolve("knowledge_search").spec.name == "knowledge_search"
+
+
+# ── 答案契约对齐（2026-07-11）：artifacts 旁路 + [📷 图片] <<IMG:N>> 标记 ──────────
+def test_artifacts_carry_chunks_but_never_serialize(monkeypatch):
+    """chunks 经 artifacts 进程内直通（供 serving 构建 sources/content_blocks）；
+    exclude=True → model_dump 不带（digest/落库/线协议零泄漏面）。"""
+    rows = [{"doc_id": "D1", "chunk_text": "内容A", "doc_title": "标准A"}]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    res = KnowledgeSearchTool().run(_ctx(), {"query": "包装规范"})
+    assert res.artifacts == {"chunks": rows}
+    assert "artifacts" not in res.model_dump()
+
+
+def test_img_marker_appended_for_renderable_chunks(monkeypatch):
+    """带可渲染图的 chunk → 条目行追加 ` [📷 图片] <<IMG:i>>`（与普通问答同一实现/编号同源）；
+    无图 chunk 不加。"""
+    rows = [
+        {"doc_id": "D1", "chunk_text": "第一步…", "doc_title": "SOP",
+         "image_refs": [{"oss_key": "processing/assets/a.png", "source_image": "a.png"}]},
+        {"doc_id": "D2", "chunk_text": "纯文字条款", "doc_title": "制度"},
+    ]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    monkeypatch.setattr("opensearch_pipeline.content_blocks_builder.renderable_image_refs",
+                        lambda c: c.get("image_refs") or [])
+    res = KnowledgeSearchTool().run(_ctx(), {"query": "步骤"})
+    text = res.content[0].text
+    assert "[1] SOP [📷 图片] <<IMG:1>>" in text
+    assert "<<IMG:2>>" not in text and "[2] 制度\n" in text

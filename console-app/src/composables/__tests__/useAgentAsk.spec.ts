@@ -161,6 +161,31 @@ describe('askAgent — 正常流（session→chunk/tool_call/tool_result→done�
       .toEqual(['succeeded', 'failed', 'denied', 'pending_approval'])
   })
 
+  it('sources / content_blocks 帧 → 与旧路径同一渲染数据（来源 chips + 图文块 + copyText）', async () => {
+    const chunks = [
+      frame({ type: 'session', session_id: 's', message_id: 'm', run_id: 'rS' }),
+      frame({ type: 'tool_call', call_id: 'c1', tool_name: 'knowledge_search', arguments: { query: 'x' } }),
+      frame({ type: 'tool_result', call_id: 'c1', tool_name: 'knowledge_search', status: 'succeeded', elapsed_ms: 3 }),
+      frame({ type: 'sources', sources: [{ doc_id: 'D1', title: '包装规范.docx', section: '三、', score: 8.1, level: 'high', relevance: 0.9, preview: '…' }] }),
+      frame({ type: 'chunk', content: '答案正文' }),
+      frame({ type: 'done', usage: {} }),
+      frame({ type: 'content_blocks', content_blocks: [{ type: 'markdown', content: '答案正文' }, { type: 'image', url: 'https://x/i.png', caption: '示意图' }] }),
+      DONE,
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (String(path) === '/api/agent/ask') return streamResp(chunks)
+      return jsonResp(runDetail('succeeded'))
+    }))
+    const { askAgent } = useAgentAsk()
+    await askAgent('包装规范？')
+    const ai = useAsk().messages.value[1]
+    expect(ai.sources?.length).toBe(1)
+    expect(ai.sources?.[0]).toMatchObject({ title: '包装规范.docx', level: 'high', levelLabel: '高' })
+    expect((ai.viewBlocks || []).map((b) => b.type)).toEqual(['text', 'image'])
+    expect((ai.viewBlocks?.[1] as any).url).toBe('https://x/i.png')
+    expect(ai.copyText).toBe('答案正文')
+  })
+
   it('深度思考开 → body 带 thinking:true（服务端映射模型档 high）；关 → 不带该键', async () => {
     const bodies: Array<Record<string, unknown>> = []
     const mkChunks = () => [

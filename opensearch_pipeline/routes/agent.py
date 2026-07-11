@@ -37,7 +37,12 @@ router = APIRouter()
 _AGENT_SYSTEM_PROMPT = (
     "你是富岭企业知识库助手。回答涉及企业资料时，先调用 knowledge_search 检索，"
     "再严格依据检索到的片段作答；检索不到就如实说明没有，不要编造。"
+    "检索结果中标有 [📷 图片] <<IMG:N>> 的条目带配图：请在回答中与该图内容相关的"
+    "段落后原样插入 <<IMG:N>> 标记（N 为条目编号），只引用与回答相关的图，"
+    "不要插入无关图片的标记，也不要描述图片内容本身，用户将直接看到图片。"
 )
+# ⚠️ 本提示词同时是 L7 agent 评测门的生产提示词（eval_harness/agent 与此同源）——
+# 任何改动须重跑 make agent-eval 并重冻 baseline.json（见 runner 模块头）。
 
 # 运行时单例（每进程一套；executor 的有界线程池即 B1(b) 执行宿主）。惰性建，flag-off 时永不建。
 _RUNTIME = None
@@ -182,16 +187,71 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _sources_frame(per_call_chunks: list) -> Optional[dict]:
+    """union 各检索批次 → 与 /api/ask/stream 同源的 sources 帧：`_extract_sources` 同一
+    计算 + **SourceInfo 字段集收口**（SSE 没有 response_model 那层，原样转发会把内部
+    OSS key（source_image）/visual_summary 泄给 SSE 客户端——与 api.py:964 同一防线）。
+    fail-open：构建失败只丢帧不断流。"""
+    try:
+        from opensearch_pipeline.api import SourceInfo
+        from opensearch_pipeline.llm_generator import _extract_sources
+        merged, seen = [], set()
+        for chunks in per_call_chunks:
+            for c in chunks:
+                key = c.get("chunk_id") or (c.get("doc_id"), (c.get("chunk_text") or "")[:80])
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(c)
+        if not merged:
+            return None
+        fields = set(SourceInfo.model_fields)
+        srcs = [{k: v for k, v in (s or {}).items() if k in fields}
+                for s in _extract_sources(merged)]
+        return {"type": "sources", "sources": srcs} if srcs else None
+    except Exception:   # noqa: BLE001
+        logger.warning("agent sources 帧构建失败（忽略）", exc_info=True)
+        return None
+
+
+def _content_blocks_frame(final_text: str, per_call_chunks: list) -> Optional[dict]:
+    """图文帧（与 /api/ask/stream 同一 build_content_blocks，referenced-only 不变量随继承）。
+
+    v1 边界：**仅单次检索的 run 出图**——<<IMG:N>> 编号按该次工具回包的 [1..k] 平铺序
+    对位；多次检索时各批次编号互相冲突，误绑图比没图更糟（xlsx 绑定教训），先跳过留日志。
+    纯文本答案/无被引用图 → 构建器返回空 → 不发帧（与普通路径一致）。"""
+    if not (final_text or "").strip() or len(per_call_chunks) != 1:
+        if len(per_call_chunks) > 1:
+            logger.info("agent 多次检索（%s 次）暂不出图（IMG 编号跨批冲突）",
+                        len(per_call_chunks))
+        return None
+    try:
+        from opensearch_pipeline.content_blocks_builder import build_content_blocks
+        blocks = build_content_blocks(final_text, per_call_chunks[0])
+        if blocks and any(b.get("type") == "image" for b in blocks):
+            return {"type": "content_blocks", "content_blocks": blocks}
+        return None
+    except Exception:   # noqa: BLE001
+        logger.warning("agent content_blocks 构建失败（忽略，纯文本照发）", exc_info=True)
+        return None
+
+
 def _stream_events(handle, session_id: str, message_id: str):
     """把一个 run 的事件流转成 SSE 帧（/ask 与 /approve 共用）。RunSuspended→approval 帧。
 
     ⚠️ 落库/记忆 append **不在本函数**：挂在 SSE 消费侧会在客户端断连（GeneratorExit）时
     整段被跳过、答案静默丢失——已移到 run 完成侧（executor.submit/resume 的 on_complete）。
-    GeneratorExit 时 finally 里不得再 yield（RuntimeError），用 closed 旗标跳过 [DONE]。"""
+    GeneratorExit 时 finally 里不得再 yield（RuntimeError），用 closed 旗标跳过 [DONE]。
+
+    答案契约对齐（sources/content_blocks）：工具回执的进程内 artifacts 带回检索 chunks，
+    每次检索后发 sources 帧（union 递进，前端赋值语义取末帧），RunCompleted 后按普通
+    路径同序（done → content_blocks → [DONE]）发图文帧。事件队列单消费者且保序——
+    RunCompleted 处理时 chunks 必已收齐。"""
     from opensearch_pipeline.agent_runtime.events import (
         ModelDelta, RunCompleted, RunFailed, RunSuspended, ToolCallProposed,
         ToolResultEmitted)
     closed = False
+    per_call_chunks: list = []      # 每次 knowledge_search 的 chunks（保序、per-call 分组）
     try:
         yield _sse({"type": "session", "session_id": session_id, "message_id": message_id,
                     "run_id": handle.run_id})
@@ -206,6 +266,12 @@ def _stream_events(handle, session_id: str, message_id: str):
                 yield _sse({"type": "tool_result", "call_id": ev.call_id,
                             "tool_name": ev.tool_name, "status": ev.status,
                             "elapsed_ms": ev.elapsed_ms})
+                chunks = (getattr(ev, "artifacts", None) or {}).get("chunks") or []
+                if chunks:
+                    per_call_chunks.append(list(chunks))
+                    frame = _sources_frame(per_call_chunks)
+                    if frame:
+                        yield _sse(frame)   # 来源 chips：字段收口后的 union（末帧覆盖）
             elif isinstance(ev, RunSuspended):
                 yield _sse({"type": "approval", "approval_request_id": ev.approval_request_id,
                             "checkpoint_id": ev.checkpoint_id, "pending_call": ev.pending_call})
@@ -215,6 +281,9 @@ def _stream_events(handle, session_id: str, message_id: str):
                 if ev.final_text and not getattr(ev, "streamed", False):
                     yield _sse({"type": "chunk", "content": ev.final_text})
                 yield _sse({"type": "done", "usage": ev.usage.model_dump()})
+                blocks = _content_blocks_frame(ev.final_text or "", per_call_chunks)
+                if blocks:
+                    yield _sse(blocks)   # 图文帧：与普通路径同序（done 之后、[DONE] 之前）
             elif isinstance(ev, RunFailed):
                 yield _sse({"type": "error", "message": f"Agent 运行失败: {ev.error[:200]}"})
     except GeneratorExit:

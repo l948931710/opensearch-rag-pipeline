@@ -137,7 +137,7 @@ const messages = computed<ChatMessage[]>(() => conversations.value.find((c) => c
 
 const LV: Record<Level, string> = { high: '高', mid: '中', low: '低' }
 
-function mapSources(sources: any[]): SourceRow[] {
+export function mapSources(sources: any[]): SourceRow[] {
   return (sources || []).map((s, i) => {
     // 优先服务端 level；缺省时按 weighted 融合阈值兜底（rerank 后量纲是 0-1，故只兜底不重算）。
     const level: Level = (s.level === 'high' || s.level === 'mid' || s.level === 'low')
@@ -145,6 +145,15 @@ function mapSources(sources: any[]): SourceRow[] {
       : (s.score >= 7.7 ? 'high' : s.score >= 5.8 ? 'mid' : 'low')
     return { idx: i + 1, title: s.title || s.doc_id || '', section: s.section || '', levelLabel: LV[level], level, score: Number(s.score) || 0, relevance: Number(s.relevance) || 0, preview: s.preview || '' }
   })
+}
+
+/** content_blocks 帧 → ViewBlock[]（旧 RAG 与 agent transport 共用同一映射，勿分叉）。 */
+export function mapViewBlocks(blocks: any[]): ViewBlock[] {
+  return (blocks || []).map((b) =>
+    b.type === 'image'
+      ? { type: 'image', url: b.url, oss_key: b.oss_key, caption: b.caption || '', alt: b.caption || '', failed: false, reloading: false } as ViewBlock
+      : { type: 'text', html: renderMd(b.content || '') } as ViewBlock,
+  )
 }
 
 // 流式"匀速吐字"泵：把 bursty 的网络到达解耦成屏幕上的匀速显现——已收到的 raw 入缓冲，rAF 以稳定
@@ -356,11 +365,7 @@ function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number)
     case 'content_blocks':
       // 图片只能全文定稿后发；位置在 done 之后、[DONE] 之前。原始格式：
       // text {type:'markdown',content} / image {type:'image',title,url,oss_key,caption}
-      ai.viewBlocks = ((ev.content_blocks as any[]) || []).map((b) =>
-        b.type === 'image'
-          ? { type: 'image', url: b.url, oss_key: b.oss_key, caption: b.caption || '', alt: b.caption || '', failed: false, reloading: false } as ViewBlock
-          : { type: 'text', html: renderMd(b.content || '') } as ViewBlock,
-      )
+      ai.viewBlocks = mapViewBlocks(ev.content_blocks as any[])
       ai.copyText = ((ev.content_blocks as any[]) || [])
         .filter((b) => b.type !== 'image').map((b) => b.content || '').join('\n') || stripImg(ai.raw || '')
       break

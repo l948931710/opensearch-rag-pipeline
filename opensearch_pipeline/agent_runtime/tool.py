@@ -138,6 +138,10 @@ class ToolResult(BaseModel):
     content: List[ContentBlock] = Field(default_factory=list)
     receipt: Optional[Dict[str, Any]] = None       # 写型工具执行回执（对账用）
     error: Optional[str] = None
+    # 进程内旁路载荷（如 knowledge_search 的检索 chunks，供 serving 层构建
+    # sources/content_blocks 帧）。exclude=True：model_dump/digest/落库一律不带——
+    # 只活在事件队列里，绝不进 tool_invocation/SSE 线协议。
+    artifacts: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
     @classmethod
     def ok(cls, content: Optional[List[ContentBlock]] = None,

@@ -77,6 +77,9 @@ class ToolResultEmitted(AgentEvent):
     status: str
     elapsed_ms: int = 0
     turn_index: int = 0
+    # 进程内旁路（ToolResult.artifacts 直通；exclude=True → model_dump/序列化不带）：
+    # serving 层据此构建 sources/content_blocks 帧。线协议 tool_result 帧仍只有状态+耗时。
+    artifacts: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
 
 class RunSuspended(AgentEvent):

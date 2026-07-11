@@ -4,7 +4,7 @@ import { createSseDecoder, type SseEvent } from '@/lib/sseDecoder'
 import { renderMd, stripImg } from '@/lib/markdown'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
-import { agentChatBridge, useAsk, type AgentMsgMeta, type ChatMessage } from '@/composables/useAsk'
+import { agentChatBridge, mapSources, mapViewBlocks, useAsk, type AgentMsgMeta, type ChatMessage } from '@/composables/useAsk'
 import { __resetIdentityScope, identityFingerprint, registerIdentityScopedStore, syncIdentityScope } from '@/composables/identityScope'
 
 // Agent 用户侧 canary（外部审计 P0-F「Agent 尚未形成用户可用链路」/ 报告 §8 P0 user-side）。
@@ -300,6 +300,18 @@ function onAgentEvent(conv: { qaSession: string }, ai: ChatMessage, ev: SseEvent
       if (meta.runId) ensureRunPolling(meta.runId)
       break
     }
+    case 'sources':
+      // 答案契约对齐：与旧路径同一映射/同一 SourceList 渲染（服务端已做 SourceInfo 字段收口）。
+      // union 递进帧，赋值语义 → 末帧即全集。agent 有阶段条，不复用旧路径的有据等待文案。
+      ai.sources = mapSources(ev.sources as any[])
+      ai.sourcesOpen = false
+      break
+    case 'content_blocks':
+      // 图文定稿帧（done 之后、[DONE] 之前）：与旧路径同一 ViewBlock 映射，AnswerBlocks 共渲染。
+      ai.viewBlocks = mapViewBlocks(ev.content_blocks as any[])
+      ai.copyText = ((ev.content_blocks as any[]) || [])
+        .filter((b) => b.type !== 'image').map((b) => b.content || '').join('\n') || stripImg(ai.raw || '')
+      break
     case 'done':
       meta.status = meta.status === 'suspended' ? meta.status : 'succeeded'
       pushStage(ai, 'done', '完成')

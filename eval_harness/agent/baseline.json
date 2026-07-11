@@ -1,6 +1,6 @@
 {
-  "frozen_from": "eval_harness/reports/agent_eval_20260709T230941.json",
-  "frozen_at": "2026-07-09T23:10:55",
+  "frozen_from": "eval_harness/reports/agent_eval_20260711T115107.json",
+  "frozen_at": "2026-07-11T11:51:19",
   "provider": "live",
   "metrics": {
     "tool_trigger_rate": 1.0,
@@ -8,7 +8,7 @@
     "tool_query_relevance": 1.0,
     "no_tool_rate": 1.0,
     "n_no_tool": 6,
-    "write_propose_rate": 0.3333,
+    "write_propose_rate": 0.6667,
     "n_write": 6,
     "approval_suspend_rate": 1.0,
     "n_suspend_denom": 6,

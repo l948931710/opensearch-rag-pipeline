@@ -63,7 +63,11 @@ class KnowledgeSearchTool:
         except Exception as e:   # noqa: BLE001 — 检索失败以 ToolResult 表达，不外泄异常
             return ToolResult.fail(f"知识库检索失败: {e}")
         content, receipt = _format_chunks(chunks)
-        return ToolResult.ok(content=content, receipt=receipt)
+        result = ToolResult.ok(content=content, receipt=receipt)
+        # 进程内旁路（exclude=True 不落库不进线协议）：原样 chunks 供 serving 层
+        # 构建 sources/content_blocks 帧——agent 答案契约与普通问答对齐。
+        result.artifacts = {"chunks": chunks}
+        return result
 
 
 def _format_chunks(chunks: List[Dict[str, Any]]) -> Tuple[List[ContentBlock], Dict[str, Any]]:
@@ -74,9 +78,23 @@ def _format_chunks(chunks: List[Dict[str, Any]]) -> Tuple[List[ContentBlock], Di
     for i, c in enumerate(chunks, 1):
         text = c.get("chunk_text") or c.get("content") or c.get("text") or ""
         title = c.get("doc_title") or c.get("title") or c.get("doc_id") or ""
-        lines.append(f"[{i}] {title}\n{text}".strip())
+        lines.append(f"[{i}] {title}{_img_marker(i, c)}\n{text}".strip())
         did = c.get("doc_id")
         if did:
             doc_ids.append(did)
     receipt = {"doc_ids": doc_ids, "chunk_count": len(chunks)}
     return [ContentBlock.of_text("\n\n".join(lines))], receipt
+
+
+def _img_marker(i: int, chunk: Dict[str, Any]) -> str:
+    """带图 chunk 的 ` [📷 图片] <<IMG:i>>` 段——**复用普通问答同一实现**（含
+    RAG_IMG_SUBINDEX 分图行为与 fail-open），编号与 [i] 平铺序号同源，
+    content_blocks 按此对位穿插图片。无可渲染图返回空串。"""
+    try:
+        from opensearch_pipeline.content_blocks_builder import renderable_image_refs
+        if not renderable_image_refs(chunk):
+            return ""
+        from opensearch_pipeline.llm_generator import _img_marker_segment
+        return _img_marker_segment(i - 1, chunk)   # 0-based 入参，内部 n=i+1 → <<IMG:i>>
+    except Exception:   # noqa: BLE001 — 标记失败绝不影响检索文本本体
+        return ""

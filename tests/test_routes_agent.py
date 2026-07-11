@@ -137,6 +137,80 @@ def test_shadow_link_sse(monkeypatch, wired):
         api.app.dependency_overrides.clear()
 
 
+def test_agent_answer_contract_sources_and_blocks(monkeypatch, wired):
+    """答案契约对齐（2026-07-11）：tool artifacts → sources 帧（SourceInfo 字段收口，
+    绝不泄 source_image OSS key）→ done 之后 content_blocks 帧（单次检索）。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: [
+        {"doc_id": "D1", "chunk_text": "GB/T 包装标准全文…", "title": "包装规范.docx",
+         "doc_title": "包装规范.docx", "score": 8.1,
+         "source_image": "processing/assets/secret.png"}])
+    monkeypatch.setattr(
+        "opensearch_pipeline.content_blocks_builder.build_content_blocks",
+        lambda answer, chunks, **k: [
+            {"type": "markdown", "content": "第一步"},
+            {"type": "image", "url": "https://signed.example/x.png", "caption": "示意图"}])
+    try:
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "富岭包装规范?"})
+        assert r.status_code == 200
+        body = r.text
+        assert '"type": "sources"' in body and "包装规范.docx" in body
+        assert "secret.png" not in body                 # SourceInfo 收口：OSS key 不进线协议
+        assert '"type": "content_blocks"' in body and "https://signed.example/x.png" in body
+        assert body.index('"type": "done"') < body.index('"type": "content_blocks"')
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+class _TwoSearchProvider:
+    """前两轮各提一次 knowledge_search，第三轮出终答——驱动多次检索场景。"""
+
+    name = "dashscope"
+
+    def __init__(self):
+        self._n = 0
+
+    def capabilities(self, m):
+        return None
+
+    def chat(self, model, req):
+        self._n += 1
+        if self._n <= 2:
+            return ChatResponse(text="", tool_calls=[
+                ToolCall(id=f"c{self._n}", name="knowledge_search",
+                         arguments={"query": f"q{self._n}"})], usage=Usage(), model=model)
+        return ChatResponse(text="综合两次检索的答案", tool_calls=[],
+                            usage=Usage(), model=model)
+
+
+def test_agent_multi_search_suppresses_blocks_keeps_sources(monkeypatch):
+    """多次检索：IMG 编号跨批冲突 → 不发 content_blocks（误绑比没图糟）；sources 仍 union 下发。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    registry = build_default_registry()
+    store = _FakeStore()
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _TwoSearchProvider()},
+                           routes={"light": [("dashscope", "m")]})
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (registry, gateway, executor, store))
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: [
+        {"doc_id": f"D-{query}", "chunk_text": f"{query} 相关内容", "title": f"{query}.docx",
+         "doc_title": f"{query}.docx", "score": 8.0}])
+    monkeypatch.setattr(
+        "opensearch_pipeline.content_blocks_builder.build_content_blocks",
+        lambda answer, chunks, **k: [{"type": "image", "url": "https://x/never.png"}])
+    try:
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "对比两个规范?"})
+        assert r.status_code == 200
+        body = r.text
+        assert '"type": "sources"' in body and "q1.docx" in body and "q2.docx" in body
+        assert '"type": "content_blocks"' not in body and "never.png" not in body
+    finally:
+        api.app.dependency_overrides.clear()
+        executor.shutdown()
+
+
 def test_thinking_maps_model_tier(monkeypatch):
     """「深度思考」→ 模型档映射：thinking=true → high（ctx.model_profile 同步落档，
     供 create_run 记 agent_run.model_profile / resume 沿用）；缺省 → light。"""

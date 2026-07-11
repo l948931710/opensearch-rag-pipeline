@@ -271,7 +271,8 @@ class ThreadedRunExecutor:
                         call_id=ev.call_id, tool_name=ev.tool_name,
                         status=getattr(result, "status", "failed") or "failed",
                         elapsed_ms=int((time.monotonic() - _t0) * 1000),
-                        turn_index=ev.turn_index))
+                        turn_index=ev.turn_index,
+                        artifacts=getattr(result, "artifacts", None)))   # 进程内旁路（exclude 不序列化）
                     ev = gen.send(result)                               # ← B2：回注结果
                     continue
                 if isinstance(ev, RunSuspended):
