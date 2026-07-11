@@ -773,6 +773,8 @@ export function agentChatBridge() {
     ensureActive,
     schedulePersist,
     nextMsgId: () => ++mid,
+    /** 深度思考开关（与旧路径同一状态源）：agent 路径读它请求模型档 light→high。 */
+    thinking,
     /** 旧路径回退入口（agent 404 时同问重发；skipUser=true 复用已推的用户气泡）。 */
     askLegacy: (q: string) => ask(q, true),
   }

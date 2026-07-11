@@ -160,6 +160,31 @@ describe('askAgent — 正常流（session→chunk/tool_call/tool_result→done�
     expect((ai.agent?.tools || []).map((t) => t.status))
       .toEqual(['succeeded', 'failed', 'denied', 'pending_approval'])
   })
+
+  it('深度思考开 → body 带 thinking:true（服务端映射模型档 high）；关 → 不带该键', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    const mkChunks = () => [
+      frame({ type: 'session', session_id: 's', message_id: 'm', run_id: 'rT' }),
+      frame({ type: 'chunk', content: '好' }),
+      frame({ type: 'done', usage: {} }),
+      DONE,
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (path: string, init?: { body?: unknown }) => {
+      if (String(path) === '/api/agent/ask') {
+        bodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return streamResp(mkChunks())
+      }
+      return jsonResp(runDetail('succeeded'))
+    }))
+    const { askAgent } = useAgentAsk()
+    const { thinking } = useAsk()
+    thinking.value = true
+    await askAgent('深一点的问题')
+    thinking.value = false
+    await askAgent('普通问题')
+    expect(bodies[0].thinking).toBe(true)
+    expect('thinking' in bodies[1]).toBe(false)   // 仅 true 时带，不覆盖服务端默认
+  })
 })
 
 describe('askAgent — approval 挂起 + 断线恢复轮询', () => {

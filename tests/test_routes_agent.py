@@ -137,6 +137,43 @@ def test_shadow_link_sse(monkeypatch, wired):
         api.app.dependency_overrides.clear()
 
 
+def test_thinking_maps_model_tier(monkeypatch):
+    """「深度思考」→ 模型档映射：thinking=true → high（ctx.model_profile 同步落档，
+    供 create_run 记 agent_run.model_profile / resume 沿用）；缺省 → light。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    registry = build_default_registry()
+    store = _FakeStore()
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _FakeProvider()},
+                           routes={"light": [("dashscope", "m-light")],
+                                   "high": [("dashscope", "m-high")]})
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (registry, gateway, executor, store))
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: [
+        {"doc_id": "D1", "chunk_text": "GB/T 包装标准全文…", "doc_title": "包装规范"}])
+
+    import opensearch_pipeline.agent_runtime as agent_rt
+    seen = []
+    real_make = agent_rt.make_model_fn
+
+    def _spy(gw, ctx, category="light", **kw):
+        seen.append((category, ctx.model_profile))
+        return real_make(gw, ctx, category, **kw)
+
+    monkeypatch.setattr(agent_rt, "make_model_fn", _spy)
+    try:
+        r = _client(_identity()).post(
+            "/api/agent/ask", json={"question": "包装规范?", "thinking": True})
+        assert r.status_code == 200 and '"type": "done"' in r.text
+        r2 = _client(_identity()).post("/api/agent/ask", json={"question": "包装规范?"})
+        assert r2.status_code == 200 and '"type": "done"' in r2.text
+        assert seen == [("high", "high"), ("light", "light")]
+    finally:
+        api.app.dependency_overrides.clear()
+        executor.shutdown()
+
+
 # ── B6 对账：decided-but-not-resumed 重驱（reaper 循环消费）──────────────────
 class _ReconcileExecutor:
     def __init__(self, reject=False):

@@ -4,7 +4,8 @@ import { ArrowUp, Square, Brain, Bot, Activity } from 'lucide-vue-next'
 
 // 输入框：内嵌发送/停止按钮 + 深度思考开关；Enter 发送 / Shift+Enter 换行；单行自增高到上限。
 // Agent canary：agentAvailable（能力探测通过）才渲染「Agent 模式」开关与「运行」入口——
-// flag 未开/无权绝不留死入口；开关开着时隐藏「深度思考」（agent 路径不接该参数，不摆假开关）。
+// flag 未开/无权绝不留死入口。「深度思考」在 agent 模式下同样生效（后端把开关映射为
+// 模型档 light→high，见 routes/agent.py），故两开关并存、不再互斥。
 const props = defineProps<{
   modelValue: string; asking: boolean; hasMessages: boolean; thinking: boolean
   agentAvailable?: boolean; agentMode?: boolean
@@ -61,8 +62,8 @@ defineExpose({ focus: () => ta.value?.focus() })
       <!-- 深度思考 / Agent 模式 开关（内嵌左下）+ 运行中心入口（右下，仅 agent 可用时） -->
       <div class="mt-1 flex items-center gap-1.5">
         <button
-          v-if="!agentMode"
           type="button"
+          data-testid="think-toggle"
           class="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition"
           :class="thinking ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
           :aria-pressed="thinking"

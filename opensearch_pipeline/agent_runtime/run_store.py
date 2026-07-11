@@ -371,7 +371,7 @@ class RDSRunStore:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT run_id, status, user_id, channel, agent_profile, started_at, ended_at, "
-                    f"thread_id, conversation_id "
+                    f"thread_id, conversation_id, model_profile "
                     f"FROM {db}.agent_run WHERE run_id=%s",
                     (run_id,),
                 )
@@ -380,7 +380,7 @@ class RDSRunStore:
                 return None
             return {"run_id": row[0], "status": row[1], "user_id": row[2], "channel": row[3],
                     "agent_profile": row[4], "started_at": row[5], "ended_at": row[6],
-                    "thread_id": row[7], "conversation_id": row[8]}
+                    "thread_id": row[7], "conversation_id": row[8], "model_profile": row[9]}
         finally:
             conn.close()
 
@@ -618,13 +618,15 @@ class RDSRunStore:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT run_id, status, thread_id, conversation_id, agent_profile, "
-                    f"turns_used, tool_calls_used, tokens_used, started_at, ended_at "
+                    f"turns_used, tool_calls_used, tokens_used, started_at, ended_at, "
+                    f"model_profile "
                     f"FROM {db}.agent_run WHERE user_id=%s "
                     "ORDER BY started_at DESC LIMIT %s",
                     (user_id, max(1, min(int(limit), 100))))
                 rows = cur.fetchall() or []
             keys = ("run_id", "status", "thread_id", "conversation_id", "agent_profile",
-                    "turns_used", "tool_calls_used", "tokens_used", "started_at", "ended_at")
+                    "turns_used", "tool_calls_used", "tokens_used", "started_at", "ended_at",
+                    "model_profile")
             out = []
             for r in rows:
                 d = dict(zip(keys, r))

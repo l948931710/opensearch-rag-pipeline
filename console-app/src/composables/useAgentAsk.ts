@@ -26,6 +26,7 @@ export interface AgentRunRow {
   thread_id?: string | null
   conversation_id?: string | null
   agent_profile?: string | null
+  model_profile?: string | null   // 模型档（light/high/…）：深度思考开→high
   turns_used?: number | null
   tool_calls_used?: number | null
   tokens_used?: number | null
@@ -376,6 +377,7 @@ async function askAgent(preset?: string, skipUser = false): Promise<void> {
   const body: Record<string, unknown> = { question: text }
   if (conv.qaSession) body.session_id = conv.qaSession
   body.conversation_id = conv.id
+  if (bridge.thinking.value) body.thinking = true   // 深度思考→服务端模型档 high（仅 true 时带）
 
   try {
     const res = await apiFetch('/api/agent/ask', { method: 'POST', body: JSON.stringify(body), signal: ctl?.signal })

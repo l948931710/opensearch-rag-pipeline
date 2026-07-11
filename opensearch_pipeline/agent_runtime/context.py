@@ -67,6 +67,8 @@ class ExecutionContext:
     budget: RunBudget
     run_id: Optional[str] = None          # agent_run 主键；同步问答可为 None
     conversation_id: Optional[str] = None # agent_run 分列存
+    model_profile: Optional[str] = None   # 模型档（light/high/…）：入口按「深度思考」定档，
+                                          # create_run 落 agent_run.model_profile，resume 沿用
     # PR-C（P0-06 回链）：审批放行的调用由 adjudicator 在消费 ApprovalGrant 时注入——
     # 工具据此把 approval_request_id 落到事实行（如 ontology_identifier）、confirmed_by
     # 记真实审批人；approval_scope=审批时用的裁决键，供工具落库前重验 stewardship 漂移。
@@ -82,6 +84,7 @@ class ExecutionContext:
                budget: Optional[RunBudget] = None,
                run_id: Optional[str] = None,
                conversation_id: Optional[str] = None,
+               model_profile: Optional[str] = None,
                auth_resolved_at: Optional[datetime] = None) -> "ExecutionContext":
         """服务端构造入口。acl_groups/roles 归一为不可变 tuple；时间/预算给默认。
 
@@ -94,6 +97,7 @@ class ExecutionContext:
             channel=channel, thread_id=thread_id,
             auth_resolved_at=now, budget=budget or RunBudget.with_ttl(now),
             run_id=run_id, conversation_id=conversation_id,
+            model_profile=model_profile,
         )
 
     def needs_reauth(self, now: datetime, threshold_s: int = DEFAULT_REAUTH_THRESHOLD_S) -> bool:

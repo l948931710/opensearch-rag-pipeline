@@ -235,8 +235,12 @@ def agent_ask(req: AskRequest, request: Request,
         raise HTTPException(status_code=404, detail="Not Found")   # 隐藏入口
     if identity is None:
         raise HTTPException(status_code=401, detail="需要登录")
+    # 「深度思考」→ 模型档映射：console 复用普通问答的同一开关；档位在服务端定
+    # （ON=high：qwen3.7-plus+思考预算 · OFF=light：不思考/快/省），端上不暴露模型名。
+    # 深思计入与 /api/ask 相同的每日深思配额（同一稀缺资源，不因走 agent 而绕开）。
+    thinking = bool(getattr(req, "thinking", False))
     # 防刷准入：与 /api/ask 同层（在开销与 StreamingResponse 之前拒绝）
-    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=True)
+    _enforce_rate_limit(request, identity, scope="ask", thinking=thinking, count_llm=True)
 
     conv = getattr(req, "conversation_id", None)
     # 多轮记忆键：有 conversation_id → f"{conv}:{user}"（钉钉一致）；否则用 client session_id（缺则新建）。
@@ -271,11 +275,13 @@ def agent_ask(req: AskRequest, request: Request,
     except Exception:   # noqa: BLE001
         rid = ""
 
+    tier = "high" if thinking else "light"
     ctx = ExecutionContext.create(
         request_id=rid, user_id=identity.user_id, acl_groups=identity.acl_groups,
         roles=(identity.role,) if identity.role else ("employee",),
-        channel="console", thread_id=thread_id, conversation_id=conv)
-    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, "light"))   # 默认档=light(不思考/快/省)
+        channel="console", thread_id=thread_id, conversation_id=conv,
+        model_profile=tier)   # 档位落 ctx → create_run 记 agent_run.model_profile（运行中心可见）
+    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))   # 档位随深度思考：light/high
     tools = registry.list_specs(ctx)
     # 多轮：system + 历史快照（前几轮 Q&A + summary）+ 本轮 user
     messages = ([{"role": "system", "content": _AGENT_SYSTEM_PROMPT}]
@@ -490,7 +496,8 @@ def agent_approve(req: ApproveRequest, request: Request,
     thread_id = run.get("thread_id") or req.session_id or req.run_id
     ctx, requester_id, req_groups = _requester_ctx(run, thread_id, rid=rid,
                                                    conversation_id=req.conversation_id)
-    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, "light"))   # 默认档=light(不思考/快/省)
+    # 续跑沿用 submit 时的模型档（agent_run.model_profile；历史行 NULL → light）
+    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light"))
     tools = registry.list_specs(ctx)
     message_id, _remember, _report_failure = _resume_callbacks(
         run_store, run, thread_id, requester_id, req_groups)
@@ -543,7 +550,8 @@ def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=Non
     ctx = ExecutionContext.create(
         request_id=rid, user_id=requester_id, acl_groups=req_groups,
         roles=(req_role,), channel=channel, thread_id=thread_id,
-        conversation_id=run.get("conversation_id") or conversation_id)
+        conversation_id=run.get("conversation_id") or conversation_id,
+        model_profile=run.get("model_profile"))   # 续跑沿用 submit 时的模型档
     return ctx, requester_id, req_groups
 
 
@@ -620,7 +628,7 @@ def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -
                    if kind == "rejected_feedback" else RejectedTerminate())
         thread_id = run.get("thread_id") or run_id
         ctx, requester_id, req_groups = _requester_ctx(run, thread_id)
-        loop = DefaultAgentLoop(make_model_fn(gateway, ctx, "light"))
+        loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light"))
         tools = registry.list_specs(ctx)
         _mid, _remember, _report_failure = _resume_callbacks(
             run_store, run, thread_id, requester_id, req_groups)

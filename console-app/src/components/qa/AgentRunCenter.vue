@@ -53,6 +53,8 @@ function kindIcon(k: string) { return KIND[k]?.icon || Activity }
 
 function ts(v?: string | null): string { return v ? String(v).slice(0, 16) : '—' }
 function shortId(id?: string | null): string { return id ? (id.length > 12 ? id.slice(0, 12) + '…' : id) : '—' }
+/** 模型档标注：light=默认档不标（少即是多）；high 用用户语言「深度思考」；未知档原样透出。 */
+function tierLabel(t?: string | null): string { return !t || t === 'light' ? '' : t === 'high' ? '深度思考' : t }
 function pretty(v: unknown): string {
   if (v == null) return ''
   try { return typeof v === 'string' ? v : JSON.stringify(v, null, 2) } catch { return String(v) }
@@ -124,6 +126,7 @@ function stepSummary(s: AgentRunStep): string {
           <span class="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium" :class="pillCls(runStatusTone(r.status))">{{ runStatusLabel(r.status) }}</span>
           <span class="font-mono text-[12px] text-foreground">{{ shortId(r.run_id) }}</span>
           <span v-if="r.agent_profile" class="text-[11.5px] text-faint">{{ r.agent_profile }}</span>
+          <span v-if="tierLabel(r.model_profile)" class="text-[11.5px] text-accent-text" data-testid="run-tier">{{ tierLabel(r.model_profile) }}</span>
           <span class="ml-auto text-[11.5px] text-faint">{{ ts(r.started_at) }}</span>
           <span class="w-full text-[11.5px] text-faint">
             轮次 {{ r.turns_used ?? '—' }} · 工具 {{ r.tool_calls_used ?? '—' }} · tokens {{ r.tokens_used ?? '—' }}
@@ -156,6 +159,7 @@ function stepSummary(s: AgentRunStep): string {
           <div class="mt-1.5 text-[11.5px] text-faint">
             开始 {{ ts(run?.started_at) }} <template v-if="run?.ended_at">· 结束 {{ ts(run?.ended_at) }}</template>
             <template v-if="run?.agent_profile"> · {{ run.agent_profile }}</template>
+            <template v-if="tierLabel(run?.model_profile)"> · {{ tierLabel(run?.model_profile) }}</template>
           </div>
           <p v-if="run?.status === 'failed'" class="mt-1.5 text-[12px] text-muted-foreground">运行失败：可回到对话调整问法重新提问；反复失败请把本页信息反馈管理员。</p>
           <p v-else-if="run?.status === 'suspended'" class="mt-1.5 text-[12px] text-muted-foreground">挂起等待审批：审批通过后自动继续执行；也可撤回终止本次运行。</p>

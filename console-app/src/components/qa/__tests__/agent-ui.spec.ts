@@ -182,3 +182,18 @@ describe('AgentRunCard — 终态回执（批准≠成功）', () => {
     expect(w.find('[data-testid="agent-run-card"]').exists()).toBe(false)
   })
 })
+
+describe('Composer — 深度思考 × Agent 模式并存（后端映射模型档，不再互斥）', () => {
+  it('agentMode 开着时 think-toggle 仍渲染、可切换（回归：曾 v-if="!agentMode" 隐藏）', async () => {
+    const Composer = (await import('@/components/qa/Composer.vue')).default
+    const w = mount(Composer, {
+      props: { modelValue: '', asking: false, hasMessages: false, thinking: false, agentAvailable: true, agentMode: true },
+      global: { stubs: STUBS },
+    })
+    const think = w.find('[data-testid="think-toggle"]')
+    expect(think.exists()).toBe(true)
+    expect(w.find('[data-testid="agent-toggle"]').exists()).toBe(true)   // 两开关并存
+    await think.trigger('click')
+    expect(w.emitted('toggle-thinking')).toBeTruthy()
+  })
+})
