@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional, Sequence, Tuple
+from typing import Any, Literal, Optional, Sequence, Tuple
 
 Channel = Literal["dingtalk", "console", "miniapp", "api"]
 
@@ -69,6 +69,10 @@ class ExecutionContext:
     conversation_id: Optional[str] = None # agent_run 分列存
     model_profile: Optional[str] = None   # 模型档（light/high/…）：入口按「深度思考」定档，
                                           # create_run 落 agent_run.model_profile，resume 沿用
+    # 投机检索句柄（serving 层瞬态执行辅助，非身份/审计数据；模型/请求体无写入通道，
+    # 铁律 2 不破）：submit 时用原问题并行预取，knowledge_search 命中即复用。
+    # 不落库不进 checkpoint；resume 重建的 ctx 恒为 None（预取只在 submit 段有意义）。
+    speculative_search: Optional[Any] = None
     # PR-C（P0-06 回链）：审批放行的调用由 adjudicator 在消费 ApprovalGrant 时注入——
     # 工具据此把 approval_request_id 落到事实行（如 ontology_identifier）、confirmed_by
     # 记真实审批人；approval_scope=审批时用的裁决键，供工具落库前重验 stewardship 漂移。
@@ -85,6 +89,7 @@ class ExecutionContext:
                run_id: Optional[str] = None,
                conversation_id: Optional[str] = None,
                model_profile: Optional[str] = None,
+               speculative_search: Optional[Any] = None,
                auth_resolved_at: Optional[datetime] = None) -> "ExecutionContext":
         """服务端构造入口。acl_groups/roles 归一为不可变 tuple；时间/预算给默认。
 
@@ -97,7 +102,7 @@ class ExecutionContext:
             channel=channel, thread_id=thread_id,
             auth_resolved_at=now, budget=budget or RunBudget.with_ttl(now),
             run_id=run_id, conversation_id=conversation_id,
-            model_profile=model_profile,
+            model_profile=model_profile, speculative_search=speculative_search,
         )
 
     def needs_reauth(self, now: datetime, threshold_s: int = DEFAULT_REAUTH_THRESHOLD_S) -> bool:

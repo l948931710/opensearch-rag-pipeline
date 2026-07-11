@@ -1017,3 +1017,23 @@ def test_invocation_reconcile_kb_admin_gate_and_resolution(runcenter_wired):
                             "note": "再次"}).status_code == 409
     finally:
         api.app.dependency_overrides.clear()
+
+
+def test_speculative_retrieval_single_fetch(monkeypatch, wired):
+    """投机检索（2026-07-11）：submit 即预取，模型的凝练改写命中 → 全程只发生一次
+    真检索（预取那次），工具侧零二次检索。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    calls = {"n": 0}
+
+    def counting_retrieve(query, **k):
+        calls["n"] += 1
+        return [{"doc_id": "D1", "chunk_text": "GB/T 包装标准全文…", "doc_title": "包装规范"}]
+
+    monkeypatch.setattr(_RETRIEVE, counting_retrieve)
+    try:
+        # FakeProvider 提案 query="包装规范"，是问题「富岭包装规范?」的凝练 → 命中
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "富岭包装规范?"})
+        assert r.status_code == 200 and '"type": "done"' in r.text
+        assert calls["n"] == 1
+    finally:
+        api.app.dependency_overrides.clear()

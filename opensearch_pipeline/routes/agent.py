@@ -48,6 +48,22 @@ _AGENT_SYSTEM_PROMPT = (
 _RUNTIME = None
 _APPROVAL_STORE = None
 _REGISTRY_STORE = None
+_SPEC_POOL = None   # 投机检索预取线程池（独立小池，不占 run executor 槽位）
+
+
+def _spec_retrieval_enabled() -> bool:
+    """投机检索（默认开，RAG_AGENT_SPEC_RETRIEVAL=false 关）：agent 本身在
+    RAG_AGENT_ENABLE 灰度伞下，预取 fail-open 且只读，miss 的代价仅一次多余检索。"""
+    return os.environ.get("RAG_AGENT_SPEC_RETRIEVAL", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _spec_pool():
+    global _SPEC_POOL
+    if _SPEC_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _SPEC_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent-spec-retrieval")
+    return _SPEC_POOL
 
 
 def _agent_enabled() -> bool:
@@ -344,12 +360,25 @@ def agent_ask(req: AskRequest, request: Request,
     except Exception:   # noqa: BLE001
         rid = ""
 
+    # 投机检索（延迟优化）：submit 即用原问题并行预取（与工具侧同一 ACL 推导），
+    # 与第一轮模型调用重叠；启动失败只降速不破功能。
+    speculative = None
+    if _spec_retrieval_enabled():
+        try:
+            from opensearch_pipeline.agent_tools.knowledge_search import SpeculativeSearch
+            speculative = SpeculativeSearch(
+                req.question, list(identity.acl_groups) if identity.acl_groups else None,
+                _spec_pool())
+        except Exception:   # noqa: BLE001
+            logger.warning("投机检索预取启动失败（忽略，走真检索）", exc_info=True)
+
     tier = "high" if thinking else "light"
     ctx = ExecutionContext.create(
         request_id=rid, user_id=identity.user_id, acl_groups=identity.acl_groups,
         roles=(identity.role,) if identity.role else ("employee",),
         channel="console", thread_id=thread_id, conversation_id=conv,
-        model_profile=tier)   # 档位落 ctx → create_run 记 agent_run.model_profile（运行中心可见）
+        model_profile=tier,   # 档位落 ctx → create_run 记 agent_run.model_profile（运行中心可见）
+        speculative_search=speculative)
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))   # 档位随深度思考：light/high
     tools = registry.list_specs(ctx)
     # 多轮：system + 历史快照（前几轮 Q&A + summary）+ 本轮 user
