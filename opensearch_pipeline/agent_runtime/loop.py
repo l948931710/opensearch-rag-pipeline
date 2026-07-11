@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generator, List, Optional, Protocol, Tuple
 
@@ -33,6 +34,8 @@ from opensearch_pipeline.agent_runtime.events import (
     Usage,
 )
 from opensearch_pipeline.agent_runtime.tool import ToolResult, ToolSpec
+
+logger = logging.getLogger(__name__)
 
 Msg = Dict[str, Any]                       # 标准 chat 消息 {role, content, ...}
 CHECKPOINT_VERSION = 1                      # 序列化版本号（跨 CD 版本 resume 兼容，F7）
@@ -123,8 +126,12 @@ class DefaultAgentLoop:
       ModelDelta 事件下发（SSE 打字机），StopIteration.value 返回 ModelTurn。
     """
 
-    def __init__(self, model_fn: ModelFn):
+    def __init__(self, model_fn: ModelFn, empty_final_retries: int = 1):
         self._model = model_fn
+        # 瞬时空生成兜底额度（每 run）：终轮空文本时原地重问的最大次数。
+        # 2026-07-11 staging 实测 post-tool 轮偶发 completion≈2 tokens、status ok
+        # （DashScope 瞬时；小/大上下文四象限 probe 均不复现）——重试一次即恢复。
+        self._empty_final_retries = max(0, int(empty_final_retries))
 
     def _drive_model(self, msgs: List[Msg], tools: List[ToolSpec]
                      ) -> Generator[AgentEvent, Optional[ToolResult], Tuple[ModelTurn, bool]]:
@@ -182,8 +189,21 @@ class DefaultAgentLoop:
         「turn_index >= 已计数」去重会让这些轮**整段逃逸预算与 trace**（深度审查 C 组 P1）。"""
         msgs: List[Msg] = list(messages)
         max_turns = ctx.budget.max_turns
+        retries = self._empty_final_retries
         for _turn in range(start_turn, max_turns):
             mt, streamed = yield from self._drive_model(msgs, tools)
+            if not mt.tool_calls and not (mt.text or "").strip() and retries > 0:
+                # 终轮空文本兜底：既无 tool_calls 也无实文本（⇒ 客户端至多收到过空白增量，
+                # 重问不构成答案重播），原地重试一次——工具已执行过、消息序不动，零副作用重放；
+                # 同一逻辑轮不进 turn 计数，浪费的 usage 合并进重试轮（llm_call_log 两次都有账）。
+                retries -= 1
+                wasted = mt.usage
+                logger.warning("模型终轮空文本（usage=%s/%s），原地重试（剩余额度 %s）",
+                               wasted.tokens_prompt, wasted.tokens_completion, retries)
+                mt, streamed = yield from self._drive_model(msgs, tools)
+                mt.usage = Usage(
+                    tokens_prompt=wasted.tokens_prompt + mt.usage.tokens_prompt,
+                    tokens_completion=wasted.tokens_completion + mt.usage.tokens_completion)
             if not mt.tool_calls:
                 # streamed=True：全文已按增量下发，SSE 层据此不重发（events.RunCompleted 注）
                 yield RunCompleted(final_text=mt.text, usage=mt.usage, streamed=streamed)

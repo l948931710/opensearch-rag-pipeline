@@ -197,3 +197,61 @@ def test_streaming_generator_without_return_value_fails_loud():
         assert "未返回 ModelTurn" in str(e)
     else:
         raise AssertionError("应当 fail loud 而非静默空答案")
+
+
+# ── 终轮空文本兜底（2026-07-11：staging 实测 DashScope 瞬时 completion≈0）────────
+def test_empty_final_retries_once_then_succeeds():
+    """空终轮 → 原地重试一次拿到全文；浪费的 usage 合并进重试轮（run 级记账不缺斤短两）。"""
+    calls = []
+
+    def _fn(msgs, tools):
+        calls.append(1)
+        if len(calls) == 1:
+            return ModelTurn(text="", usage=Usage(tokens_prompt=100, tokens_completion=2))
+        return ModelTurn(text="重试后的答案", usage=Usage(tokens_prompt=101, tokens_completion=50))
+
+    events = list(DefaultAgentLoop(_fn).run(_ctx(), [{"role": "user", "content": "q"}], []))
+    assert len(calls) == 2
+    assert isinstance(events[-1], RunCompleted) and events[-1].final_text == "重试后的答案"
+    assert events[-1].usage.tokens_prompt == 201 and events[-1].usage.tokens_completion == 52
+
+
+def test_empty_final_retry_exhausted_completes_empty():
+    """额度用尽仍空（含纯空白）→ 照旧完成空答案（前端「未返回内容+重试」兜底接手），绝不无限重试。"""
+    calls = []
+
+    def _fn(msgs, tools):
+        calls.append(1)
+        return ModelTurn(text="  ", usage=Usage())
+
+    events = list(DefaultAgentLoop(_fn).run(_ctx(), [{"role": "user", "content": "q"}], []))
+    assert len(calls) == 2                       # 1 原始 + 1 重试
+    assert isinstance(events[-1], RunCompleted) and not events[-1].final_text.strip()
+
+
+def test_empty_final_retry_can_turn_into_tool_call():
+    """重试轮改提工具 → 走正常工具路径续跑，而非硬完成。"""
+    loop = DefaultAgentLoop(_scripted([
+        ModelTurn(text=""),                       # 空终轮 → 触发重试
+        ModelTurn(tool_calls=[ProposedCall(call_id="c1", tool_name="knowledge_search",
+                                           arguments={})]),
+        ModelTurn(text="工具后的答案"),
+    ]))
+    gen = loop.run(_ctx(), [{"role": "user", "content": "q"}], [])
+    ev = next(gen)
+    assert isinstance(ev, ToolCallProposed)
+    ev = gen.send(ToolResult.text_ok("结果"))
+    assert isinstance(ev, RunCompleted) and ev.final_text == "工具后的答案"
+
+
+def test_empty_final_retry_disabled_keeps_old_behavior():
+    """empty_final_retries=0 → 与旧行为一致：一次空文本即完成。"""
+    calls = []
+
+    def _fn(msgs, tools):
+        calls.append(1)
+        return ModelTurn(text="")
+
+    events = list(DefaultAgentLoop(_fn, empty_final_retries=0)
+                  .run(_ctx(), [{"role": "user", "content": "q"}], []))
+    assert len(calls) == 1 and isinstance(events[-1], RunCompleted)
