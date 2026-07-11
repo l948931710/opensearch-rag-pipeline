@@ -25,6 +25,10 @@ document_sensitive_finding、pipeline_run 只进不出——看板窗口查询�
   approval_requests  approval_request (operation)       非 pending DELETE          24 月 RAG_RETENTION_APPROVAL_MONTHS
   agent_runs         agent_run (operation)              终态整行 DELETE（殿后）    18 月 RAG_RETENTION_AGENT_RUN_MONTHS
 
+  本体表族（schema/027-028 可选迁移；PR-G P1「数据与证据无保留策略」）：
+  ontology_case_evidence      ontology_resolution_case (ontology)      已处置 case evidence_json→NULL   6 月 RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS
+  ontology_candidate_features ontology_resolution_candidate (ontology) 已处置 case 候选 features→NULL   6 月 RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS
+
   任一窗口设 0/负数 = 该作业停用。
 
 安全设计（与全仓守卫哲学同源）：
@@ -85,12 +89,17 @@ _JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_fa
               # agent 表族（schema/022/023/024/025，深度审查 2026-07-09 治理组：此前 7 张 agent 表
               # 游离于留存与主体擦除之外）。顺序 load-bearing：子表在前、agent_run 殿后。
               "agent_checkpoints", "agent_steps", "tool_invocations", "llm_calls",
-              "agent_audit", "approval_decisions", "approval_requests", "agent_runs")
+              "agent_audit", "approval_decisions", "approval_requests", "agent_runs",
+              # 本体表族（schema/027-028，PR-G/P1「数据与证据无保留策略」）：case evidence
+              # 与候选 features 携源观测快照（可能含员工查询上下文）——处置后到期擦除
+              # （行留审计骨架，只 NULL 掉证据 blob）。open case 的证据是活依据，永不动。
+              "ontology_case_evidence", "ontology_candidate_features")
 
 # 可选迁移的作业（表未建的环境 1146 → skip 不算失败；基础表缺失仍按事故上报）
 _OPTIONAL_JOBS = frozenset({"qa_facts", "agent_checkpoints", "agent_steps", "tool_invocations",
                             "llm_calls", "agent_audit", "approval_decisions",
-                            "approval_requests", "agent_runs"})
+                            "approval_requests", "agent_runs",
+                            "ontology_case_evidence", "ontology_candidate_features"})
 
 _AGENT_RUN_TERMINAL = "('succeeded','failed','cancelled','expired')"
 
@@ -102,6 +111,10 @@ def _kb_db() -> str:
 def _op_db() -> str:
     from opensearch_pipeline.qa_logger import _op_db as qa_op_db
     return qa_op_db()
+
+
+def _ont_db() -> str:
+    return get_config().rds.ontology_database
 
 
 def _months(env_key: str, default: int) -> int:
@@ -130,6 +143,10 @@ def _retention_windows() -> Dict[str, int]:
         "approval_decisions": _months("RAG_RETENTION_APPROVAL_MONTHS", 24),
         "approval_requests": _months("RAG_RETENTION_APPROVAL_MONTHS", 24),
         "agent_runs": _months("RAG_RETENTION_AGENT_RUN_MONTHS", 18),
+        # 本体证据擦除（同一窗口 env 管两个作业，与 AGENT_TRACE 同款）：evidence/features
+        # 是源观测快照（PII 面），处置后 6 月擦 blob；identifier/case 行本体=审计骨架不删。
+        "ontology_case_evidence": _months("RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS", 6),
+        "ontology_candidate_features": _months("RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS", 6),
     }
 
 
@@ -237,6 +254,30 @@ def _job_sqls(job: str) -> Dict[str, str]:
                 "WHERE status IN " + _AGENT_RUN_TERMINAL + " "
                 "AND ended_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
         return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "ontology_case_evidence":
+        # 已处置 case 的证据快照到期擦除（open=活依据永不动；行留审计骨架）
+        ont = _ont_db()
+        pred = ("FROM {ont}.ontology_resolution_case "
+                "WHERE status <> 'open' AND evidence_json IS NOT NULL "
+                "AND resolved_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(ont=ont)
+        return {"count": f"SELECT COUNT(*) {pred}",
+                "act": (f"UPDATE {ont}.ontology_resolution_case SET evidence_json = NULL "
+                        "WHERE status <> 'open' AND evidence_json IS NOT NULL "
+                        "AND resolved_at < DATE_SUB(NOW(), INTERVAL %s MONTH) LIMIT %s")}
+    if job == "ontology_candidate_features":
+        # 已处置 case 的候选匹配依据到期擦除（多表条件 UPDATE 无 LIMIT → select-PK 两步批）
+        ont = _ont_db()
+        pred = (
+            "FROM {ont}.ontology_resolution_candidate cd "
+            "JOIN {ont}.ontology_resolution_case c ON c.case_id = cd.case_id "
+            "WHERE c.status <> 'open' AND cd.features_json IS NOT NULL "
+            "AND c.resolved_at < DATE_SUB(NOW(), INTERVAL %s MONTH)"
+        ).format(ont=ont)
+        return {"count": f"SELECT COUNT(*) {pred}",
+                "select_ids": f"SELECT cd.candidate_id {pred} LIMIT %s",
+                "act_by_ids": (f"UPDATE {ont}.ontology_resolution_candidate "
+                               "SET features_json = NULL WHERE candidate_id IN ({ids})"),
+                "pk_str": True}
     raise ValueError(f"unknown retention job: {job}")
 
 

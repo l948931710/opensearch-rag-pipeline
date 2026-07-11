@@ -152,6 +152,7 @@ class RDSOntologyStore:
     # ── 对象 ────────────────────────────────────────────────────────────────
     def mint_object(self, object_type: str, title: str, *, owner_dept: str,
                     golden: Optional[Dict[str, Any]] = None,
+                    provenance: Optional[Dict[str, Any]] = None,
                     data_classification: str = "internal",
                     source_of_record: str = "ontology",
                     lifecycle_state: str = "draft") -> Dict[str, Any]:
@@ -177,10 +178,12 @@ class RDSOntologyStore:
                 canonical_ref = format_ref(type_code, seq_no)
                 cur.execute(
                     f"INSERT INTO {db}.ontology_object "
-                    "(object_id, object_type, canonical_ref, title, golden_json, lifecycle_state, "
+                    "(object_id, object_type, canonical_ref, title, golden_json, "
+                    " golden_provenance_json, lifecycle_state, "
                     " owner_dept, data_classification, source_of_record) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (object_id, object_type, canonical_ref, title, _dump(golden or {}),
+                     _dump(provenance),
                      lifecycle_state, owner_dept, data_classification, source_of_record))
             conn.commit()
             return {"object_id": object_id, "object_type": object_type,
@@ -219,16 +222,44 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
-    def update_golden(self, object_id: str, golden: Dict[str, Any], *,
-                      expected_version: int) -> bool:
-        """乐观锁 CAS：版本不匹配返回 False（调用方重取重试）。"""
+    def count_objects(self, object_type: str, *, title_like: Optional[str] = None,
+                      status: str = "active") -> int:
+        """find_objects 同谓词计数（P1「召回截断可观测」：搜索结果告知 total/truncated）。"""
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE {db}.ontology_object SET golden_json=%s, version=version+1 "
-                    "WHERE object_id=%s AND version=%s",
-                    (_dump(golden), object_id, expected_version))
+                sql = (f"SELECT COUNT(*) FROM {db}.ontology_object "
+                       "WHERE object_type=%s AND status=%s")
+                params: List[Any] = [object_type, status]
+                if title_like:
+                    sql += " AND title LIKE %s"
+                    params.append(f"%{title_like}%")
+                cur.execute(sql, params)
+                return int(cur.fetchone()[0])
+        finally:
+            conn.close()
+
+    def update_golden(self, object_id: str, golden: Dict[str, Any], *,
+                      expected_version: int,
+                      provenance: Optional[Dict[str, Any]] = None) -> bool:
+        """乐观锁 CAS：版本不匹配返回 False（调用方重取重试）。
+        provenance（PR-H P1）：本次改动属性的值级溯源，按 attr 合并进
+        golden_provenance_json（不带=保留旧溯源——但新事实值应始终随溯源写入）。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                if provenance:
+                    cur.execute(
+                        f"UPDATE {db}.ontology_object SET golden_json=%s, "
+                        "golden_provenance_json=JSON_MERGE_PATCH("
+                        "COALESCE(golden_provenance_json, JSON_OBJECT()), %s), "
+                        "version=version+1 WHERE object_id=%s AND version=%s",
+                        (_dump(golden), _dump(provenance), object_id, expected_version))
+                else:
+                    cur.execute(
+                        f"UPDATE {db}.ontology_object SET golden_json=%s, version=version+1 "
+                        "WHERE object_id=%s AND version=%s",
+                        (_dump(golden), object_id, expected_version))
                 ok = cur.rowcount == 1
             conn.commit()
             return ok
@@ -451,6 +482,7 @@ class RDSOntologyStore:
     def mint_object_with_alias(self, object_type: str, title: str, *, owner_dept: str,
                                namespace: str, raw_value: str, norm_value: str,
                                golden: Optional[Dict[str, Any]] = None,
+                               provenance: Optional[Dict[str, Any]] = None,
                                data_classification: str = "internal",
                                source_of_record: str = "ontology",
                                lifecycle_state: str = "draft",
@@ -484,10 +516,12 @@ class RDSOntologyStore:
                 canonical_ref = format_ref(type_code, seq_no)
                 cur.execute(
                     f"INSERT INTO {db}.ontology_object "
-                    "(object_id, object_type, canonical_ref, title, golden_json, lifecycle_state, "
+                    "(object_id, object_type, canonical_ref, title, golden_json, "
+                    " golden_provenance_json, lifecycle_state, "
                     " owner_dept, data_classification, source_of_record) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (object_id, object_type, canonical_ref, title, _dump(golden or {}),
+                     _dump(provenance),
                      lifecycle_state, owner_dept, data_classification, source_of_record))
                 case_id = None
                 if close_open_case:
@@ -1236,7 +1270,7 @@ class MemoryOntologyStore:
         self.audit_rows.append(dict(audit))
 
     # ── 对象 ────────────────────────────────────────────────────────────────
-    def mint_object(self, object_type, title, *, owner_dept, golden=None,
+    def mint_object(self, object_type, title, *, owner_dept, golden=None, provenance=None,
                     data_classification="internal", source_of_record="ontology",
                     lifecycle_state="draft"):
         _check_owner_dept(owner_dept)
@@ -1249,7 +1283,9 @@ class MemoryOntologyStore:
             object_id = new_ulid()
             row = {"object_id": object_id, "object_type": object_type,
                    "canonical_ref": format_ref(code, seq_no), "title": title,
-                   "golden_json": _dump(golden or {}), "lifecycle_state": lifecycle_state,
+                   "golden_json": _dump(golden or {}),
+                   "golden_provenance_json": _dump(provenance),
+                   "lifecycle_state": lifecycle_state,
                    "owner_dept": owner_dept, "data_classification": data_classification,
                    "source_of_record": source_of_record, "version": 1,
                    "status": "active", "merged_into": None}
@@ -1269,12 +1305,22 @@ class MemoryOntologyStore:
                    and (title_like is None or title_like in o["title"])]
             return sorted(out, key=lambda o: o["canonical_ref"])[:max(1, min(int(limit), 200))]
 
-    def update_golden(self, object_id, golden, *, expected_version):
+    def count_objects(self, object_type, *, title_like=None, status="active"):
+        with self._lock:
+            return sum(1 for o in self._objects.values()
+                       if o["object_type"] == object_type and o["status"] == status
+                       and (title_like is None or title_like in o["title"]))
+
+    def update_golden(self, object_id, golden, *, expected_version, provenance=None):
         with self._lock:
             row = self._objects.get(object_id)
             if not row or row["version"] != expected_version:
                 return False
             row["golden_json"] = _dump(golden)
+            if provenance:
+                merged = json.loads(row.get("golden_provenance_json") or "{}")
+                merged.update(provenance)
+                row["golden_provenance_json"] = _dump(merged)
             row["version"] += 1
             return True
 
@@ -1402,7 +1448,7 @@ class MemoryOntologyStore:
 
     # ── 原子复合写（PR-C，与 RDS 同契约）────────────────────────────────────
     def mint_object_with_alias(self, object_type, title, *, owner_dept, namespace,
-                               raw_value, norm_value, golden=None,
+                               raw_value, norm_value, golden=None, provenance=None,
                                data_classification="internal",
                                source_of_record="ontology", lifecycle_state="draft",
                                method="seed", relation="canonical", confidence=1.0,
@@ -1419,6 +1465,7 @@ class MemoryOntologyStore:
                 raise ValueError(f"object_type {object_type!r} 未在 ontology_ref_seq 登记类型码")
             self._memory_audit(audit)
             obj = self.mint_object(object_type, title, owner_dept=owner_dept, golden=golden,
+                                   provenance=provenance,
                                    data_classification=data_classification,
                                    source_of_record=source_of_record,
                                    lifecycle_state=lifecycle_state)

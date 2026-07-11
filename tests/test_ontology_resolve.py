@@ -435,19 +435,41 @@ def test_tool_object_gate_confidential_without_acl(store):
     assert "PP-1100 特惠采购价目" in clear.content[0].text
 
 
-def test_tool_filters_unreadable_candidates(store):
-    """PR-B：不可读候选整条不出参（含 id/ref）；有权调用方候选完整。"""
+def test_confidential_never_leaves_domain_via_embedding(store):
+    """PR-H（P1「embedding 出域」）：confidential 标题在调 provider 前就被过滤——
+    机密品名对**任何**调用方都不产生 embedding 候选（消解只走 exact/rule/工作台），
+    embedder 绝不收到机密标题。"""
     from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
     obj = store.mint_object("material", "机密牌号目录", owner_dept="supply",
                             data_classification="confidential")
+    seen_titles = []
+
+    def _spy_embedder(text):
+        seen_titles.append(text)
+        return _hash_embedder(text)
+
+    tool = OntologyResolveTool(resolver=OntologyResolver(store, embedder=_spy_embedder))
+    for acl in (("pmc",), ("supply",)):
+        # 查询词 ≠ 机密标题（用户输入本就出域，不在断言范围）
+        res = tool.run(_ctx(acl=acl), {"namespace": "lab_sample", "value": "牌号目录查询词"})
+        assert res.receipt["candidates"] == []
+        assert obj["canonical_ref"] not in res.content[0].text
+    assert "机密牌号目录" not in seen_titles   # 池标题零出域（修复前会被逐个 embed）
+
+
+def test_tool_filters_unreadable_candidates(store):
+    """PR-B：不可读候选整条不出参（含 id/ref）；有权调用方候选完整（internal 对象）。"""
+    from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
+    obj = store.mint_object("material", "内部牌号目录", owner_dept="supply",
+                            data_classification="internal")
     tool = OntologyResolveTool(resolver=OntologyResolver(store, embedder=_hash_embedder))
-    denied = tool.run(_ctx(acl=("pmc",)), {"namespace": "lab_sample", "value": "机密牌号目录"})
+    denied = tool.run(_ctx(acl=("pmc",)), {"namespace": "lab_sample", "value": "内部牌号目录"})
     assert denied.receipt["candidates"] == []
     assert obj["canonical_ref"] not in denied.content[0].text
     allowed = tool.run(_ctx(acl=("supply",)),
-                       {"namespace": "lab_sample", "value": "机密牌号目录"})
+                       {"namespace": "lab_sample", "value": "内部牌号目录"})
     assert allowed.receipt["status"] == "candidate"
-    assert allowed.receipt["candidates"][0]["title"] == "机密牌号目录"
+    assert allowed.receipt["candidates"][0]["title"] == "内部牌号目录"
 
 
 def test_tool_bad_value_returns_fail(tool):

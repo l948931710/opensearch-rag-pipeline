@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS ontology_object (
   canonical_ref       VARCHAR(32)  NOT NULL,          -- 人读展示号 FLP-<类型码>-<序号>（ontology_ref_seq 发号）
   title               VARCHAR(255) NOT NULL,          -- 人读名称（商务品名/牌号等）
   golden_json         JSON         NOT NULL,          -- 黄金记录属性值；每属性权威来源单独查 attribute_source，不双写
+  golden_provenance_json JSON      NULL,               -- PR-H P1：每属性值级溯源 {attr:{sor_system,source_key,as_of,recorded_by}}——
+                                                       --   没有它 golden 会悄悄变成"业务事实副本"（外审 P1）；写路径经 store 强制随值携带
   lifecycle_state     VARCHAR(16)  NOT NULL DEFAULT 'draft',   -- draft|verified（CHECK 钉死；新状态=治理动作走迁移）
   owner_dept          VARCHAR(64)  NOT NULL,          -- 身份/生命周期唯一 steward 部门（单值；属性级归属见 stewardship）
   data_classification ENUM('public','internal','confidential') NOT NULL DEFAULT 'internal',

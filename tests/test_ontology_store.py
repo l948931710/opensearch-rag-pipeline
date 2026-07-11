@@ -795,3 +795,57 @@ def test_stewardship_desired_state_prunes_stale(store):
     assert not any(r["scope_key"] == "customer:GHOST" for r in rows)
     assert stewardship.resolve_steward(rows, namespace="customer:KFC")["steward_dept"] \
         == "marketing"
+
+
+# ── PR-H：provenance / 召回截断可观测 ─────────────────────────────────────────
+
+
+def test_golden_provenance_write_and_merge(store, ns):
+    """P1「本体不变业务事实副本」：属性值随值级溯源落库；update_golden 按 attr 合并。"""
+    import json as _json
+    obj = store.mint_object(
+        "product", f"{_MARK}溯源品-{uuid.uuid4().hex[:6]}", owner_dept="pmc",
+        golden={"口径": "6.2"},
+        provenance={"口径": {"sor_system": "snapshot:seeding", "source_key": "ABC123",
+                             "as_of": "2026-07-10T00:00:00+00:00", "recorded_by": "seeding"}})
+    row = store.get_object(obj["object_id"])
+    prov = _json.loads(row["golden_provenance_json"])
+    assert prov["口径"]["sor_system"] == "snapshot:seeding"
+    assert store.update_golden(
+        obj["object_id"], {"口径": "6.2", "克重": "12g"}, expected_version=1,
+        provenance={"克重": {"sor_system": "ontology(SpecSheet)", "source_key": "手册",
+                             "as_of": "2026-07-10T01:00:00+00:00",
+                             "recorded_by": "steward_1"}}) is True
+    prov2 = _json.loads(store.get_object(obj["object_id"])["golden_provenance_json"])
+    assert prov2["口径"]["sor_system"] == "snapshot:seeding"      # 旧属性溯源保留
+    assert prov2["克重"]["recorded_by"] == "steward_1"            # 新属性溯源合并
+
+
+def test_seeding_mint_stamps_provenance():
+    """播种铸对象：golden 属性全带 {来源/源键/as-of/记录方} 溯源戳。"""
+    import json as _json
+
+    from opensearch_pipeline.ontology.seeding import SeedRecord, seed_snapshot
+
+    class _Src:
+        def iter_records(self):
+            yield SeedRecord(namespace="u8", raw_code="PV1", object_type="product",
+                             title="溯源验证品", owner_dept="pmc",
+                             attrs={"口径": "6.2", "克重": "12g"})
+
+    mem = MemoryOntologyStore()
+    seed_snapshot(mem, _Src(), dry_run=False)
+    row = mem.get_active_identifier("u8", "PV1")
+    obj = mem.get_object(row["target_object_id"])
+    prov = _json.loads(obj["golden_provenance_json"])
+    assert set(prov) == {"口径", "克重"}
+    for v in prov.values():
+        assert v["sor_system"] == "snapshot:seeding" and v["source_key"] == "PV1"
+        assert v["as_of"] and v["recorded_by"] == "seeding"
+
+
+def test_count_objects_matches_find(store):
+    tag = uuid.uuid4().hex[:8]
+    for i in range(3):
+        _mint(store, title=f"{_MARK}截断-{tag}-{i}")
+    assert store.count_objects("product", title_like=f"截断-{tag}") == 3

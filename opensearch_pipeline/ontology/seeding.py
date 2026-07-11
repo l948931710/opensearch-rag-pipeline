@@ -192,6 +192,18 @@ class _Sink:
         return out
 
     # -- 写 ------------------------------------------------------------------
+    def _provenance(self, r: SeedRecord) -> Optional[Dict[str, Any]]:
+        """PR-H P1：golden 属性值级溯源——没有它 golden 会悄悄变成"业务事实副本"。
+        每个播种属性记 {来源系统, 源键, as-of, 记录方}；答案侧据此回传"数据从哪来、多新鲜"。"""
+        if not r.attrs:
+            return None
+        from datetime import datetime, timezone
+        stamp = {"sor_system": f"snapshot:{self._evidence_source}",
+                 "source_key": r.raw_code,
+                 "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 "recorded_by": self._evidence_source}
+        return {attr: dict(stamp) for attr in r.attrs}
+
     def mint(self, r: SeedRecord) -> str:
         if self.dry:
             self._n += 1
@@ -202,6 +214,7 @@ class _Sink:
             return oid
         return self._store.mint_object(
             r.object_type, r.title, owner_dept=r.owner_dept, golden=r.attrs,
+            provenance=self._provenance(r),
             data_classification=r.data_classification)["object_id"]
 
     def mint_with_alias(self, r: SeedRecord, ns: str, raw: str, norm: str):
@@ -218,6 +231,7 @@ class _Sink:
         try:
             res = self._store.mint_object_with_alias(
                 r.object_type, r.title, owner_dept=r.owner_dept, golden=r.attrs,
+                provenance=self._provenance(r),
                 data_classification=r.data_classification,
                 namespace=ns, raw_value=raw, norm_value=norm,
                 method="seed", relation="canonical", confidence=1.0, confirmed_by="auto",

@@ -458,3 +458,17 @@ def test_coverage_dual_denominator(store):
     assert cov2["denominator"] == "population" and cov2["population_records"] == 10
     assert cov2["resolution_coverage"] == pytest.approx(
         cov2["active_identifiers"] / 10)
+
+
+def test_objects_search_reports_truncation_and_exact_first(store):
+    """PR-H P1「召回截断可观测」：total/truncated 出参；精确同名排最前。"""
+    for i in range(4):
+        store.mint_object("product", f"龙虾杯{i}", owner_dept="pmc")
+    store.mint_object("product", "龙虾杯", owner_dept="pmc")     # 精确同名（铸序最晚）
+    c = _client(_identity())
+    r = c.get("/api/ontology/objects?object_type=product&q=龙虾杯&limit=3").json()
+    assert r["total"] == 5 and r["truncated"] is True
+    assert len(r["items"]) == 3
+    full = c.get("/api/ontology/objects?object_type=product&q=龙虾杯&limit=20").json()
+    assert full["truncated"] is False
+    assert full["items"][0]["title"] == "龙虾杯"                 # 精确命中不再沉底

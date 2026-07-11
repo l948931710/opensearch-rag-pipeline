@@ -27,9 +27,11 @@ SEED_ROWS: List[dict] = [
     {"object_type": "mold", "attribute": "mold_profile", "sor_system": "ontology",
      "sync_mode": "manual", "freshness": None,
      "notes": "腔数/出模数/资产归属——interim 登记；Max 上线切换=独立工作包，非改一行"},
-    {"object_type": "material", "attribute": "采购价", "sor_system": "ontology(PurchasePrice)",
-     "sync_mode": "manual", "freshness": "on-demand",
-     "notes": "confidential；P2 拆 PurchasePrice/QuotePrice 前的占位口径"},
+    {"object_type": "material", "attribute": "采购价", "sor_system": "u8",
+     "sync_mode": "daily_ro", "freshness": "T-1",
+     "notes": "confidential；**事实留 SoR（U8）**——本体不落价、不复制，答案按目录路由到 "
+              "SoR 读取并回传 provenance（PR-H P1：本体绝不变成业务事实副本；"
+              "P2 拆 PurchasePrice/QuotePrice 时沿此口径）"},
 ]
 
 

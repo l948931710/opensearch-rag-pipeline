@@ -375,3 +375,30 @@ def test_purge_jobs_cover_agent_tables_children_first():
     assert "run_id IN" in ck["act"] and "agent_run WHERE user_id" in ck["act"]
     # qa 链原有顺序不被破坏（qa_retrieved_doc 仍先于 qa_session_log）
     assert tables.index("qa_retrieved_doc") < tables.index("qa_session_log")
+
+
+# ── PR-H：本体证据擦除作业（P1「数据与证据无保留策略」/PIPL）──────────────────
+
+
+def test_ontology_retention_jobs_registered():
+    from opensearch_pipeline import retention
+    assert "ontology_case_evidence" in retention._JOB_NAMES
+    assert "ontology_candidate_features" in retention._JOB_NAMES
+    # 可选迁移：无 027/028 的环境 1146 → skip 不算失败
+    assert "ontology_case_evidence" in retention._OPTIONAL_JOBS
+    assert "ontology_candidate_features" in retention._OPTIONAL_JOBS
+    w = retention._retention_windows()
+    assert w["ontology_case_evidence"] == 6 and w["ontology_candidate_features"] == 6
+
+
+def test_ontology_retention_sqls_scrub_not_delete():
+    """擦除语义：行留审计骨架，只 NULL 证据 blob；open case 永不在谓词内。"""
+    from opensearch_pipeline import retention
+    ev = retention._job_sqls("ontology_case_evidence")
+    assert "UPDATE" in ev["act"] and "evidence_json = NULL" in ev["act"]
+    assert "DELETE" not in ev["act"]
+    assert "status <> 'open'" in ev["count"]
+    ft = retention._job_sqls("ontology_candidate_features")
+    assert "UPDATE" in ft["act_by_ids"] and "features_json = NULL" in ft["act_by_ids"]
+    assert ft.get("pk_str") is True
+    assert "status <> 'open'" in ft["count"]

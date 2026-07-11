@@ -332,6 +332,15 @@ class OntologyResolver:
         out: List[Candidate] = []
         for otype in pool_types:
             objs = self._store.find_objects(otype, limit=self._pool_limit)
+            if len(objs) >= self._pool_limit:
+                # P1「召回截断可观测」：池打满=有对象根本没进候选，静默截断读作"覆盖了全部"
+                logger.warning("embedding 候选池 %s 打满上限 %d——超出部分未参与消解"
+                               "（对象量级已超 P0 试点设计，考虑 HA3 子索引）",
+                               otype, self._pool_limit)
+            # P1「embedding 出域」：confidential 标题**默认不出域**——池子在调 provider
+            # 之前先按密级过滤，机密品名/价目名绝不 POST 给外部 embedding 服务
+            #（该类对象的消解只走 exact/rule/工作台人工，不因此丢正确性只丢便利）。
+            objs = [o for o in objs if o.get("data_classification") != "confidential"]
             for obj in objs:
                 tv = self._title_vec(embedder, obj["title"])
                 if tv is None:

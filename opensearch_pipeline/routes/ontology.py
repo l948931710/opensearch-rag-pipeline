@@ -248,15 +248,24 @@ def ontology_case_detail(case_id: str, request: Request,
 def ontology_objects_search(request: Request, object_type: str, q: Optional[str] = None,
                             limit: int = 20,
                             identity: Optional[Identity] = Depends(current_identity)):
-    """确认/改指时的目标对象选择器（PR-B：结果按对象级 ACL 过滤，不可读对象整行不出）。"""
+    """确认/改指时的目标对象选择器（PR-B：结果按对象级 ACL 过滤，不可读对象整行不出；
+    PR-H P1：返回 total/truncated——截断必须可见，且精确同名命中排最前）。"""
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     from opensearch_pipeline.ontology.authz import can_read_object
     acl, bypass = _reader_acl(kb)
-    items = [o for o in _get_store().find_objects(object_type, title_like=q, limit=limit)
+    store = _get_store()
+    items = [o for o in store.find_objects(object_type, title_like=q, limit=limit)
              if can_read_object(o, acl=acl, bypass_acl=bypass)]
-    return {"items": items}
+    if q:   # 精确同名优先（原按 canonical_ref 铸序——最匹配的可能沉底）
+        items.sort(key=lambda o: (o.get("title") != q,))
+    try:
+        total = store.count_objects(object_type, title_like=q)
+    except Exception:   # noqa: BLE001 — 计数失败不影响主结果
+        total = None
+    truncated = bool(total is not None and total > len(items))
+    return {"items": items, "total": total, "truncated": truncated}
 
 
 @router.get("/api/ontology/objects/{object_id}")
