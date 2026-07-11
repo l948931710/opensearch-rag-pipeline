@@ -12,12 +12,14 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 033（031=本体事件已被 P2 计划预订、032=台账 checksum，
-   见 docs/ontology_p0_plan_2026-07-10.md）。历史上有三对编号冲突（002/003/006 各两个文件，
+3. **编号严格单调递增**，下一个可用号 = 034（031=agent 审批/执行硬化【2026-07-11 占用——
+   原「本体事件」的 P2 预订作废顺延，落地时取当时最新号】、032=台账 checksum、033=本体
+   link 不变量）。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
    ⚠️ **本体层文档编号勘误**：《本体层设计 v1.1》《P0-P1 落地细化》所写迁移号 024–028 成文时
    未预见 agent v2 占号，已全部作废——本体表族实际为 **027(core)/028(identity)/029(link)/
-   030(sem_views)/031(event，P2 预留)**；文档所称"018 审批""023 预留 v2 P4"同样以本表为准
+   030(sem_views)/033(link 不变量)**（event 表 P2 落地时取当时最新号；原预订的 031 已被
+   agent 硬化占用）；文档所称"018 审批""023 预留 v2 P4"同样以本表为准
    （018=gen_meta、023=llm_call_log、审批=025）。详见 `docs/ontology_p0_plan_2026-07-10.md`。
 4. **`CREATE DATABASE` 必须显式 `CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci`**，每张新表
    显式 COLLATE —— staging `_stg` 库曾因缺省漂移到 `_0900_ai_ci` 引发跨库 JOIN 1267。
@@ -64,6 +66,8 @@ apply 脚本落库并记台账。
 | 028_ontology_identity.sql | fuling_ontology | 身份脊柱：ontology_identifier（别名映射，至多一行 active 生成列唯一键 S4；norm 不剥改模后缀）+ ontology_resolution_case/candidate（候选承载层 S2：证据快照+积压统计，一个未解析编号×N 候选）（本体 P0） |
 | 029_ontology_link.sql | fuling_ontology | 本体关系：ontology_link（sku_of_product 等；uk_src_dst_type）（本体 P0） |
 | 030_sem_views.sql | fuling_ontology | PMC-1 语义投影：sem_packing/sem_stacking 视图（spec↔SKU 走 029 link 非 JSON 关联）+ packing_spec/stacking_spec 发号登记；**S7：本体表族整体在独立库 fuling_ontology（PR-B P0-02），fuling_ro 不授本库——隔离由 DB 授权面强制（tests/test_ontology_db_isolation.py 钉住），唯一读取口 ontology/sem.py** |
+| 031_agent_approval_execution_hardening.sql | fuling_operation | 重评报告 P0-C/P0-E/P1-11：approval_decision.final_args_digest（决定绑定最终执行参数摘要，堵改参重放）+ tool_invocation.status 增 uncertain（超时/崩溃副作用不可知→人工对账，不再谎报 failed）+ approver_scope 加宽 160（backup steward CSV）（2026-07-11；已 apply 本地） |
+| 033_ontology_link_invariants.sql | fuling_ontology | P1-8/P1-9 link 不变量：active_single_key 生成列 + uk_link_active_single（single 基数 link 型 DB 级拒双活，扩展方式见文件头）+ 三条引用 FK（object.merged_into RESTRICT；identifier.source_case_id / case.resolved_identifier_id 均 ON DELETE SET NULL）；刻意不加 superseded_by FK（repoint 事务序不容）（本体 P1，2026-07-11；已 apply 本地） |
 
 ## 台账（schema_migrations）
 
