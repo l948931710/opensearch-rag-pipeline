@@ -285,3 +285,65 @@ describe('PR-F HITL 契约（显式点选 / 受限候选 / 分母口径 / 证据
     expect(rows.length).toBe(2)
   })
 })
+
+describe('PR-I P2（身份切换重置 / 批量驳回）', () => {
+  it('身份切换 → singleton 状态整体重置（不残留上个管理员的队列/覆盖率/supported）', async () => {
+    activate(identity({ userId: 'admin1' }))
+    const o = useOntology()
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (String(path).startsWith('/api/ontology/workbench')) {
+        return { ok: true, status: 200, json: async () => ({ items: [okase()] }) }
+      }
+      return { ok: true, status: 200, json: async () => COVERAGE }
+    }))
+    await o.loadOntology(true)
+    expect(o.ontologyCases.value.length).toBe(1)
+    expect(o.ontologySupported.value).toBe(true)
+    // 换成另一个无管理权身份：全部清空，supported=false（tab 不显）
+    activate(identity({ userId: 'emp9', role: 'employee', canManage: false, managedOwnerDepts: [] }))
+    await o.loadOntology(true)
+    expect(o.ontologyCases.value).toEqual([])
+    expect(o.ontologyCoverage.value).toBeNull()
+    expect(o.ontologySupported.value).toBe(false)
+  })
+
+  it('批量驳回 → POST batch-dismiss；成功条目本地移除，部分失败强刷', async () => {
+    activate(identity())
+    const calls: any[] = []
+    vi.stubGlobal('fetch', vi.fn(async (path: string, init?: any) => {
+      calls.push([String(path), init])
+      if (String(path).includes('/batch-dismiss')) {
+        return { ok: true, status: 200, json: async () => ({
+          results: [
+            { case_id: 'oc1', status: 'dismissed' },
+            { case_id: 'oc2', status: 'conflict' },
+          ], dismissed: 1,
+        }) }
+      }
+      if (String(path).startsWith('/api/ontology/workbench')) {
+        return { ok: true, status: 200, json: async () => ({ items: [okase({ case_id: 'oc2' })] }) }
+      }
+      return { ok: true, status: 200, json: async () => COVERAGE }
+    }))
+    const o = useOntology()
+    o.ontologyCases.value = [okase(), okase({ case_id: 'oc2', raw_value: 'X9' })]
+    const n = await o.batchDismissOntologyCases(['oc1', 'oc2'], '废弃批次')
+    expect(n).toBe(1)
+    const post = calls.find(([p]) => p.includes('/batch-dismiss'))
+    expect(JSON.parse(post[1].body)).toEqual({ case_ids: ['oc1', 'oc2'], note: '废弃批次' })
+    expect(o.ontologyCases.value.map((x) => x.case_id)).not.toContain('oc1')
+    expect(calls.some(([p]) => p.startsWith('/api/ontology/workbench'))).toBe(true)  // 部分失败强刷
+  })
+
+  it('勾选集渲染批量驳回按钮（默认不显）', async () => {
+    const pinia = activate(identity())
+    useOntology().ontologyCases.value = [okase(), okase({ case_id: 'oc2', raw_value: 'X9' })]
+    const w = mount(OntologyWorkbench, { global: { plugins: [pinia] } })
+    expect(w.text()).not.toContain('批量驳回')
+    const boxes = w.findAll('input[type="checkbox"]')
+    expect(boxes.length).toBe(2)
+    await boxes[0].setValue(true)
+    await boxes[1].setValue(true)
+    expect(w.text()).toContain('批量驳回（2）')
+  })
+})

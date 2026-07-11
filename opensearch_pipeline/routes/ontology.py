@@ -19,6 +19,7 @@ agent_audit_log（event_type='ontology_workbench'，**fail-closed**——审计�
 """
 import logging
 import os
+import re as _re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -187,10 +188,31 @@ def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
     return out
 
 
+def _decode_cursor(raw: Optional[str], order: str) -> Optional[Dict[str, Any]]:
+    """PR-I（P2 cursor 分页）：游标=上一页末行排序键 'seen|last_seen|case_id'
+    （recent 序省 seen）。畸形游标按无游标处理（重新从头，宁可重看不丢行）。"""
+    if not raw:
+        return None
+    try:
+        parts = raw.split("|")
+        if order == "freq":
+            return {"seen_count": int(parts[0]), "last_seen_at": parts[1],
+                    "case_id": parts[2]}
+        return {"last_seen_at": parts[0], "case_id": parts[1]}
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _encode_cursor(case: Dict[str, Any], order: str) -> str:
+    if order == "freq":
+        return f"{case['seen_count']}|{case['last_seen_at']}|{case['case_id']}"
+    return f"{case['last_seen_at']}|{case['case_id']}"
+
+
 @router.get("/api/ontology/workbench")
 def ontology_workbench(request: Request, namespace: Optional[str] = None,
                        object_type: Optional[str] = None, order: str = "freq",
-                       limit: int = 50, offset: int = 0,
+                       limit: int = 50, offset: int = 0, cursor: Optional[str] = None,
                        identity: Optional[Identity] = Depends(current_identity)):
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
@@ -198,10 +220,12 @@ def ontology_workbench(request: Request, namespace: Optional[str] = None,
     store = _get_store()
     acl, bypass = _reader_acl(kb)
     scope = _managed_scope_filter(kb, store)   # None=kb_admin 不过滤
-    items = []
-    for case in store.list_open_cases(namespace=namespace, object_type_hint=object_type,
+    raw_cases = store.list_open_cases(namespace=namespace, object_type_hint=object_type,
                                       order=order, limit=limit, offset=offset,
-                                      scope_filter=scope):
+                                      scope_filter=scope,
+                                      cursor=_decode_cursor(cursor, order))
+    items = []
+    for case in raw_cases:
         if not _can_manage_case(kb, store, case):   # 粗筛后的精判（裁决优先级，fail-closed）
             continue
         items.append({**case,
@@ -210,7 +234,11 @@ def ontology_workbench(request: Request, namespace: Optional[str] = None,
                       "steward_dept": _steward_dept_for(
                           store, namespace=case.get("namespace"),
                           object_type=case.get("object_type_hint"))})
-    return {"items": items, "limit": limit, "offset": offset}
+    # PR-I：keyset 游标——满页才给 next_cursor（不满页=到底）；游标按**未精判前**的
+    # 末行编码（精判滤掉的行也要翻过去，否则会卡在同一页）
+    next_cursor = (_encode_cursor(raw_cases[-1], order)
+                   if len(raw_cases) >= max(1, min(int(limit), 200)) else None)
+    return {"items": items, "limit": limit, "offset": offset, "next_cursor": next_cursor}
 
 
 @router.get("/api/ontology/coverage")
@@ -285,6 +313,35 @@ def ontology_object_detail(object_id: str, request: Request,
 
 
 # ── 写侧：case 处置 ───────────────────────────────────────────────────────────
+# PR-I（P2）：请求字段长度/格式约束——超长 note/revision 此前直穿到 DB 1406/截断。
+# ⚠️ 刻意**不用** pydantic Field 约束：FastAPI 的 body 校验先于 handler 跑，畸形 body
+# 会在 flag-off 时返回 422 → 泄露隐藏端点的存在性。约束改在 handler 内、
+# `_require_enabled_identity` **之后**手动校验（flag-off 恒 404 不破）。
+_ULID_RE = _re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
+_REV_RE = _re.compile(r"^[A-Za-z0-9._-]{1,16}$")
+_RELATIONS = ("alias", "variant", "equivalent")
+
+
+def _check_fields(*, ulid: Optional[Dict[str, str]] = None,
+                  revision: Optional[str] = None,
+                  relation: Optional[str] = None,
+                  notes: Optional[Dict[str, Optional[str]]] = None) -> None:
+    """门后字段校验（422）：ulid={字段名: 值}、notes={字段名: 值}。"""
+    problems = []
+    for name, v in (ulid or {}).items():
+        if not _ULID_RE.match(v or ""):
+            problems.append(f"{name} 须为 26 位 ULID")
+    if revision is not None and not _REV_RE.match(revision):
+        problems.append("target_revision 非法（1-16 位字母数字._-）")
+    if relation is not None and relation not in _RELATIONS:
+        problems.append(f"relation 非法（合法：{_RELATIONS}）")
+    for name, v in (notes or {}).items():
+        if v is not None and len(v) > 255:
+            problems.append(f"{name} 超长（≤255 字符）")
+    if problems:
+        raise HTTPException(status_code=422, detail="；".join(problems))
+
+
 class ConfirmRequest(BaseModel):
     target_object_id: str
     target_revision: Optional[str] = None
@@ -299,6 +356,9 @@ def ontology_case_confirm(case_id: str, req: ConfirmRequest, request: Request,
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
+    _check_fields(ulid={"target_object_id": req.target_object_id},
+                  revision=req.target_revision, relation=req.relation,
+                  notes={"note": req.note})
     # PR-F（P0-06 HITL）：confirm 与 dismiss 同纪律——理由必填（"确认按钮"不许无凭据落身份）
     if not (req.note or "").strip():
         raise HTTPException(status_code=400, detail="confirm 必须填写确认理由（note）")
@@ -351,6 +411,7 @@ def ontology_case_dismiss(case_id: str, req: DismissRequest, request: Request,
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     store = _get_store()
+    _check_fields(notes={"note": req.note})
     case = store.get_case(case_id)
     if case is None or not _can_manage_case(kb, store, case):   # PR-B：scope 外同答 404
         raise HTTPException(status_code=404, detail="case 不存在")
@@ -369,6 +430,67 @@ def ontology_case_dismiss(case_id: str, req: DismissRequest, request: Request,
     if not ok:
         raise HTTPException(status_code=409, detail=f"case 非 open（{case['status']}）")
     return {"case_id": case_id, "status": "dismissed"}
+
+
+class BatchDismissRequest(BaseModel):
+    case_ids: List[str]
+    note: str
+
+
+_BATCH_MAX = 50
+
+
+@router.post("/api/ontology/cases/batch-dismiss")
+def ontology_cases_batch_dismiss(req: BatchDismissRequest, request: Request,
+                                 identity: Optional[Identity] = Depends(current_identity)):
+    """PR-I（P2「无批量处置」）：批量驳回——大积压最常见的处置。逐条独立结果
+    （单条失败不掀翻整批；驳回天然幂等：已处置 → conflict）；每条各自过
+    可见性/steward 授权/同事务审计。**刻意不做批量 confirm**：确认=铸身份映射，
+    每条目标各不相同，批量确认等于放弃逐条核对——与 HITL 纪律相悖。"""
+    identity = _require_enabled_identity(identity)
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    kb = _require_reader(identity)
+    _check_fields(notes={"note": req.note})
+    if not (req.note or "").strip():
+        raise HTTPException(status_code=400, detail="批量驳回必须填写处置理由（note）")
+    ids = list(dict.fromkeys(req.case_ids))          # 去重保序
+    if not ids:
+        raise HTTPException(status_code=400, detail="case_ids 不能为空")
+    if len(ids) > _BATCH_MAX:
+        raise HTTPException(status_code=400, detail=f"单批最多 {_BATCH_MAX} 条（分批提交）")
+    store = _get_store()
+    results: List[Dict[str, Any]] = []
+    for case_id in ids:
+        case = store.get_case(case_id)
+        if case is None or not _can_manage_case(kb, store, case):
+            results.append({"case_id": case_id, "status": "not_found"})   # scope 外同不存在
+            continue
+        try:
+            _authorize_steward(identity, kb, _steward_dept_for(
+                store, namespace=case["namespace"],
+                object_type=case.get("object_type_hint")))
+        except HTTPException:
+            results.append({"case_id": case_id, "status": "not_found"})
+            continue
+        try:
+            ok = store.dismiss_case(
+                case_id, by=identity.user_id, note=req.note,
+                audit=_audit_payload(action=f"case:{case_id}", decision="dismiss",
+                                     by=identity.user_id,
+                                     detail={"namespace": case["namespace"],
+                                             "norm_value": case["norm_value"],
+                                             "batch": True, "note": req.note[:200]}))
+        except ValueError:
+            results.append({"case_id": case_id, "status": "error"})
+            continue
+        except Exception:   # noqa: BLE001 — 审计 fail-closed 等：单条失败不掀批
+            logger.warning("批量驳回单条失败：%s", case_id, exc_info=True)
+            results.append({"case_id": case_id, "status": "error"})
+            continue
+        results.append({"case_id": case_id,
+                        "status": "dismissed" if ok else "conflict"})
+    return {"results": results,
+            "dismissed": sum(1 for r in results if r["status"] == "dismissed")}
 
 
 # ── 写侧：S3 最小纠错 ─────────────────────────────────────────────────────────
@@ -391,6 +513,7 @@ def ontology_identifier_deactivate(identifier_id: str, req: NoteRequest, request
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
+    _check_fields(notes={"note": req.note})
     store = _get_store()
     row, _obj, steward = _load_identifier_scope(store, identifier_id)
     _authorize_steward(identity, kb, steward)
@@ -417,6 +540,8 @@ def ontology_identifier_repoint(identifier_id: str, req: RepointRequest, request
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
+    _check_fields(ulid={"target_object_id": req.target_object_id},
+                  revision=req.target_revision, notes={"note": req.note})
     store = _get_store()
     row, old_obj, steward = _load_identifier_scope(store, identifier_id)
     _authorize_steward(identity, kb, steward)
@@ -450,6 +575,7 @@ def ontology_object_retire(object_id: str, req: NoteRequest, request: Request,
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
+    _check_fields(notes={"note": req.note})
     store = _get_store()
     obj = store.get_object(object_id)
     from opensearch_pipeline.ontology.authz import can_read_object
@@ -481,6 +607,7 @@ def ontology_object_mark_duplicate(object_id: str, req: MarkDuplicateRequest, re
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
+    _check_fields(ulid={"merged_into": req.merged_into}, notes={"note": req.note})
     store = _get_store()
     obj = store.get_object(object_id)
     from opensearch_pipeline.ontology.authz import can_mutate_identity, can_read_object

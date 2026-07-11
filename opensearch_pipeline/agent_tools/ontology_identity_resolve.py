@@ -183,8 +183,10 @@ class OntologyIdentityResolveTool:
             if existing is None:
                 return ToolResult.fail("并发冲突（别名刚被处置），请重试")
             return self._idempotent_or_conflict(ctx, existing, target, revision)
-        except Exception as e:   # noqa: BLE001 — 存储失败以 ToolResult 表达
-            return ToolResult.fail(f"身份确认落库失败: {e}")
+        except Exception:   # noqa: BLE001 — 存储失败以 ToolResult 表达；
+            # PR-I（P2）：异常原文不回模型（可能携 SQL/主机名/驱动细节），详情进日志
+            logger.exception("身份确认落库失败（详情见日志，不回模型）")
+            return ToolResult.fail("身份确认落库失败（存储异常，已记录日志；请稍后重试或联系管理员）")
 
         title = _visible_title(target.get("title"), target.get("data_classification"),
                                target.get("owner_dept"), set(ctx.acl_groups or ()))

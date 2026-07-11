@@ -195,9 +195,11 @@ def test_confirm_unscoped_namespace_fail_closed(store):
 def test_confirm_conflicts(store):
     obj, case_id = _seed_case(store)
     c = _client(_identity())
-    # 目标不存在 / 目标非 active
+    # 畸形 id → 422（PR-I 字段约束，flag 门后校验）；格式合法但不存在 → 404
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
-                  json={"target_object_id": "nope", "note": "测试确认"}).status_code == 404
+                  json={"target_object_id": "nope", "note": "测试确认"}).status_code == 422
+    assert c.post(f"/api/ontology/cases/{case_id}/confirm",
+                  json={"target_object_id": "0" * 26, "note": "测试确认"}).status_code == 404
     retired = store.mint_object("product", "退役品", owner_dept="pmc")
     store.retire_object(retired["object_id"])
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
@@ -283,7 +285,9 @@ def test_repoint_identifier(store):
     assert c.post(f"/api/ontology/identifiers/{iid}/repoint",
                   json={"target_object_id": a["object_id"]}).status_code == 409
     assert c.post(f"/api/ontology/identifiers/{new_id}/repoint",
-                  json={"target_object_id": "nope"}).status_code == 404
+                  json={"target_object_id": "nope"}).status_code == 422
+    assert c.post(f"/api/ontology/identifiers/{iid}/repoint",
+                  json={"target_object_id": "0" * 26}).status_code == 404
 
 
 def test_identifier_scope_authz_uses_object_type(store):
@@ -326,7 +330,9 @@ def test_mark_duplicate_validation(store):
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
                   json={"merged_into": a["object_id"]}).status_code == 400   # 自指
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
-                  json={"merged_into": "nope"}).status_code == 404
+                  json={"merged_into": "nope"}).status_code == 422
+    assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
+                  json={"merged_into": "0" * 26}).status_code == 404
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
                   json={"merged_into": b["object_id"]}).status_code == 409   # 目标非 active
 
@@ -472,3 +478,85 @@ def test_objects_search_reports_truncation_and_exact_first(store):
     full = c.get("/api/ontology/objects?object_type=product&q=龙虾杯&limit=20").json()
     assert full["truncated"] is False
     assert full["items"][0]["title"] == "龙虾杯"                 # 精确命中不再沉底
+
+
+# ── PR-I（P2）：批量驳回 / cursor 分页 / 字段约束 ──────────────────────────────
+
+
+def test_batch_dismiss_mixed_results(store):
+    """逐条独立结果：成功/scope 外(=not_found)/已处置(=conflict) 混合，单条不掀批。"""
+    _, c1 = _seed_case(store, raw="b1")
+    _, c2 = _seed_case(store, raw="b2")
+    _, c3 = _seed_case(store, raw="b3")
+    store.dismiss_case(c3, by="rival", note="先被处置")
+    # c_out：finance scope 的 dept_admin 看不到 pmc case → not_found
+    dept = _client(_identity(user_id="dp", role="dept_admin", managed=("pmc",)))
+    r = dept.post("/api/ontology/cases/batch-dismiss",
+                  json={"case_ids": [c1, c2, c3, "ghost"], "note": "废弃批次"})
+    assert r.status_code == 200
+    by_id = {x["case_id"]: x["status"] for x in r.json()["results"]}
+    assert by_id[c1] == "dismissed" and by_id[c2] == "dismissed"
+    assert by_id[c3] == "conflict" and by_id["ghost"] == "not_found"
+    assert r.json()["dismissed"] == 2
+    assert store.get_case(c1)["status"] == "dismissed"
+    assert store.audit_rows[-1]["detail"]["batch"] is True
+
+
+def test_batch_dismiss_guards(store):
+    c = _client(_identity())
+    assert c.post("/api/ontology/cases/batch-dismiss",
+                  json={"case_ids": [], "note": "x"}).status_code == 400
+    assert c.post("/api/ontology/cases/batch-dismiss",
+                  json={"case_ids": ["a"], "note": "  "}).status_code == 400
+    assert c.post("/api/ontology/cases/batch-dismiss",
+                  json={"case_ids": [f"c{i}" for i in range(51)],
+                        "note": "太多"}).status_code == 400
+
+
+def test_workbench_cursor_pagination_stable(store):
+    """keyset 游标翻页：边处置边翻不跳行不重行（offset 的病根）。"""
+    ids = []
+    for i in range(5):
+        _, cid = _seed_case(store, raw=f"pg{i}", with_candidate=False)
+        ids.append(cid)
+    c = _client(_identity())
+    page1 = c.get("/api/ontology/workbench?limit=2").json()
+    assert len(page1["items"]) == 2 and page1["next_cursor"]
+    seen = {x["case_id"] for x in page1["items"]}
+    # 处置掉第一页的一条（offset 分页此时会跳过一行）
+    store.dismiss_case(page1["items"][0]["case_id"], by="s", note="处置")
+    page2 = c.get(f"/api/ontology/workbench?limit=2&cursor={page1['next_cursor']}").json()
+    seen |= {x["case_id"] for x in page2["items"]}
+    page3 = c.get(f"/api/ontology/workbench?limit=2&cursor={page2['next_cursor']}").json()
+    seen |= {x["case_id"] for x in page3["items"]}
+    assert set(ids) <= seen | {page1["items"][0]["case_id"]}   # 零丢行
+    assert len(seen) == 5                                       # 零重行（5 唯一）
+    # 末页不给游标
+    if page3["next_cursor"]:
+        page4 = c.get(f"/api/ontology/workbench?limit=2&cursor={page3['next_cursor']}").json()
+        assert page4["items"] == [] or page4["next_cursor"] is None
+
+
+def test_field_constraints_422(store):
+    obj, case_id = _seed_case(store)
+    c = _client(_identity())
+    # note 超长
+    assert c.post(f"/api/ontology/cases/{case_id}/confirm",
+                  json={"target_object_id": obj["object_id"],
+                        "note": "长" * 256}).status_code == 422
+    # revision 畸形
+    assert c.post(f"/api/ontology/cases/{case_id}/confirm",
+                  json={"target_object_id": obj["object_id"], "note": "ok",
+                        "target_revision": "r2!@#"}).status_code == 422
+    # relation 非法
+    assert c.post(f"/api/ontology/cases/{case_id}/confirm",
+                  json={"target_object_id": obj["object_id"], "note": "ok",
+                        "relation": "owner"}).status_code == 422
+    # flag off 时畸形 body 仍 404（约束在门后——不泄露隐藏端点存在性）
+    import os as _os
+    _os.environ.pop("RAG_ONTOLOGY_ENABLE", None)
+    try:
+        assert c.post(f"/api/ontology/cases/{case_id}/confirm",
+                      json={"target_object_id": "nope"}).status_code == 404
+    finally:
+        _os.environ["RAG_ONTOLOGY_ENABLE"] = "true"

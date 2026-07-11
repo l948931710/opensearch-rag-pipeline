@@ -13,12 +13,41 @@ import LoadError from './LoadError.vue'
 // 授权由服务端硬校验（kb_admin / stewardship scope 的 dept_admin）；此处只做操作面。
 const {
   ontologyCases, ontologyCoverage, ontologyError, isOntologyBusy,
-  loadOntology, confirmOntologyCase, dismissOntologyCase, searchOntologyObjects,
+  loadOntology, confirmOntologyCase, dismissOntologyCase, batchDismissOntologyCases,
+  searchOntologyObjects,
 } = useOntology()
 const { promptText, notice } = useDialog()
 
 // 手动指定：per-case 搜索结果（内联渲染，人工点选——不取 hits[0]）
 const manualHits = ref<Record<string, OntologyObjectHit[]>>({})
+// PR-I（P2 批量处置）：勾选集——只支持批量**驳回**（批量确认=放弃逐条核对，违 HITL 纪律）
+const selected = ref<Set<string>>(new Set())
+
+function toggleSelect(caseId: string) {
+  const next = new Set(selected.value)
+  if (next.has(caseId)) next.delete(caseId)
+  else next.add(caseId)
+  selected.value = next
+}
+
+async function onBatchDismiss() {
+  const ids = [...selected.value]
+  if (!ids.length) return
+  const reason = await promptText({
+    title: `批量驳回 ${ids.length} 条`,
+    message: '同一理由应用到所有勾选条目（废弃编号/录入错误批次…）；逐条独立留痕，单条失败不影响其余。',
+    placeholder: '驳回理由（必填）',
+    confirmText: '批量驳回',
+    danger: true,
+  })
+  if (reason === null) return
+  if (!reason.trim()) {
+    void notice({ title: '需要理由', message: '驳回必须填写处置理由（审计留痕）。', danger: true })
+    return
+  }
+  const n = await batchDismissOntologyCases(ids, reason.trim())
+  if (n > 0) selected.value = new Set()
+}
 
 function pct(v: number | null | undefined): string {
   return v == null ? '—' : `${Math.round(v * 100)}%`
@@ -139,6 +168,13 @@ async function onDismiss(kase: OntologyCase) {
         <span class="text-sm font-semibold text-foreground">未解析编号（按观测频次）</span>
         <span class="rounded-full bg-accent-strong px-2 py-px text-[11px] font-bold text-primary-foreground">{{ ontologyCases.length }}</span>
         <div class="flex-1" />
+        <button
+          v-if="selected.size"
+          type="button"
+          class="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-[5px] text-[12px] font-semibold text-st-fail transition hover:border-border-strong disabled:opacity-50"
+          :disabled="isOntologyBusy('onto:batch')"
+          @click="onBatchDismiss"
+        ><Loader2 v-if="isOntologyBusy('onto:batch')" :size="12" :stroke-width="2" class="animate-spin" />批量驳回（{{ selected.size }}）</button>
         <span class="hidden text-xs text-muted-foreground sm:inline">确认即成为检索/计算依据；拿不准就驳回留档，绝不猜</span>
       </div>
 
@@ -147,6 +183,13 @@ async function onDismiss(kase: OntologyCase) {
         class="border-t border-border px-[18px] py-3 first:border-t-0"
       >
         <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <input
+            type="checkbox"
+            class="h-3.5 w-3.5 accent-[var(--primary,#4b6bfb)]"
+            :aria-label="`勾选 ${kase.raw_value}`"
+            :checked="selected.has(kase.case_id)"
+            @change="toggleSelect(kase.case_id)"
+          >
           <span class="rounded-md bg-panel px-2 py-px font-mono text-[11px] text-muted-foreground">{{ kase.namespace }}</span>
           <span class="font-mono text-[13.5px] font-semibold text-foreground">{{ kase.raw_value }}</span>
           <span class="rounded-full bg-panel px-2 py-px text-[10.5px] font-medium text-muted-foreground">观测 ×{{ kase.seen_count }}</span>

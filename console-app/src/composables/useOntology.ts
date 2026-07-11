@@ -74,6 +74,10 @@ const inflight = ref<Set<string>>(new Set())
 
 const STALE_MS = 30_000
 let lastLoadedAt = 0
+// PR-I（P2「singleton 跨身份残留」）：模块级状态挂在 app 生命周期上——切换身份
+// （登出/换号）时 cases/coverage/supported 会带着上个管理员的数据泄给下个身份。
+// 按 userId 跟踪，变了就整体重置。
+let lastUserId: string | null = null
 
 function isBusy(key: string): boolean { return inflight.value.has(key) }
 async function withInflight<T>(key: string, fn: () => Promise<T>): Promise<T | undefined> {
@@ -90,7 +94,17 @@ async function refreshOntologyCoverage() {
 
 async function loadOntology(force = false) {
   const s = useSession()
-  if (!s.identity?.canManage) { cases.value = []; return }
+  const uid = s.identity?.userId ?? null
+  if (uid !== lastUserId) {          // 身份切换：上个身份的队列/覆盖率/探测结果全部作废
+    __resetOntology()
+    lastUserId = uid
+  }
+  if (!s.identity?.canManage) {
+    cases.value = []
+    coverage.value = null
+    supported.value = false          // 非管理员：tab 不显，且不残留上个身份的 supported=true
+    return
+  }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
     cases.value = [{
       case_id: 'oc1', namespace: 'u8', raw_value: 'ABC123-M', norm_value: 'ABC123-M',
@@ -173,6 +187,43 @@ async function dismissOntologyCase(kase: OntologyCase, note: string) {
   return postDecision(kase, 'dismiss', { note }, '驳回失败')
 }
 
+/** 批量驳回（PR-I P2：大积压处置）。逐条独立结果；返回成功数（失败条目留在队列）。 */
+async function batchDismissOntologyCases(caseIds: string[], note: string): Promise<number> {
+  const { notice } = useDialog()
+  const done = await withInflight('onto:batch', async () => {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') {
+      cases.value = cases.value.filter((x) => !caseIds.includes(x.case_id))
+      return caseIds.length
+    }
+    try {
+      const res = await apiFetch('/api/ontology/cases/batch-dismiss', {
+        method: 'POST', auth: true, body: JSON.stringify({ case_ids: caseIds, note }),
+      })
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`
+        try { detail = (await res.json())?.detail || detail } catch { /* 非 JSON */ }
+        void notice({ title: '批量驳回失败', message: detail, danger: true })
+        return 0
+      }
+      const body = await res.json() as { results: { case_id: string; status: string }[]; dismissed: number }
+      const okIds = new Set(body.results.filter((r) => r.status === 'dismissed').map((r) => r.case_id))
+      cases.value = cases.value.filter((x) => !okIds.has(x.case_id))
+      void refreshOntologyCoverage()
+      const failed = body.results.length - okIds.size
+      if (failed > 0) {
+        void notice({ title: '部分未驳回', message: `${okIds.size} 条已驳回，${failed} 条失败/已被处置（已刷新队列）`, danger: true })
+        void loadOntology(true)
+      }
+      return okIds.size
+    } catch {
+      void notice({ title: '批量驳回失败', message: '网络异常，请重试', danger: true })
+      return 0
+    }
+  })
+  return done ?? 0
+}
+
 /** 手动指定时的目标对象搜索（确认/改指选择器）。 */
 async function searchOntologyObjects(objectType: string, q: string): Promise<OntologyObjectHit[]> {
   try {
@@ -196,6 +247,7 @@ export function useOntology() {
     loadOntology,
     confirmOntologyCase,
     dismissOntologyCase,
+    batchDismissOntologyCases,
     searchOntologyObjects,
   }
 }
@@ -207,4 +259,5 @@ export function __resetOntology() {
   loadError.value = ''
   inflight.value = new Set()
   lastLoadedAt = 0
+  lastUserId = null
 }

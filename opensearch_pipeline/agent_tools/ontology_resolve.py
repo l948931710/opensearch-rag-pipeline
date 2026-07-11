@@ -91,8 +91,11 @@ class OntologyResolveTool:
                                                object_type_hint=hint)
         except ValueError as e:
             return ToolResult.fail(f"解析参数非法: {e}")
-        except Exception as e:   # noqa: BLE001 — 解析失败以 ToolResult 表达，不外泄异常
-            return ToolResult.fail(f"身份解析失败: {e}")
+        except Exception:   # noqa: BLE001 — 解析失败以 ToolResult 表达；
+            # PR-I（P2）：异常原文不回模型（可能携 SQL/主机名/驱动细节），详情进日志
+            import logging
+            logging.getLogger(__name__).exception("身份解析失败（详情见日志，不回模型）")
+            return ToolResult.fail("身份解析失败（内部异常，已记录日志；请稍后重试）")
 
         acl = set(ctx.acl_groups or ())
         content, receipt = _format_result(res, acl)

@@ -963,17 +963,23 @@ class RDSOntologyStore:
     def list_open_cases(self, *, namespace: Optional[str] = None,
                         object_type_hint: Optional[str] = None, order: str = "freq",
                         limit: int = 50, offset: int = 0,
-                        scope_filter: Optional[Dict[str, List[str]]] = None
+                        scope_filter: Optional[Dict[str, List[str]]] = None,
+                        cursor: Optional[Dict[str, Any]] = None
                         ) -> List[Dict[str, Any]]:
         """工作台队列：order=freq（高频未解析优先）| recent。
 
         scope_filter（PR-B，P0-01 队列 SQL 层过滤）：None=不过滤（kb_admin）；
         dict{namespaces, namespace_prefixes, object_types}=按管辖 scope 并集收窄
-        （跨部门行不出库）；三集合全空 → 恒空（fail-closed：什么都不管=什么都看不见）。"""
+        （跨部门行不出库）；三集合全空 → 恒空（fail-closed：什么都不管=什么都看不见）。
+
+        cursor（PR-I，P2「单条 offset 队列」）：keyset 分页——offset 在边处置边翻页时
+        会跳行/重行，大积压处置必须用游标。freq 序游标=(seen_count, last_seen_at,
+        case_id)，recent 序=(last_seen_at, case_id)；case_id 终极去平局，排序键含
+        case_id DESC 保证游标全序稳定。"""
         db, conn = self._db(), self._conn()
         limit = max(1, min(int(limit), 200))
-        order_sql = "seen_count DESC, last_seen_at DESC" if order == "freq" \
-            else "last_seen_at DESC"
+        order_sql = ("seen_count DESC, last_seen_at DESC, case_id DESC" if order == "freq"
+                     else "last_seen_at DESC, case_id DESC")
         try:
             with conn.cursor() as cur:
                 sql = f"SELECT * FROM {db}.ontology_resolution_case WHERE status='open'"
@@ -984,6 +990,18 @@ class RDSOntologyStore:
                 if object_type_hint:
                     sql += " AND object_type_hint=%s"
                     params.append(object_type_hint)
+                if cursor:
+                    if order == "freq":
+                        sql += (" AND (seen_count < %s OR (seen_count = %s AND last_seen_at < %s)"
+                                " OR (seen_count = %s AND last_seen_at = %s AND case_id < %s))")
+                        params.extend([cursor["seen_count"], cursor["seen_count"],
+                                       cursor["last_seen_at"], cursor["seen_count"],
+                                       cursor["last_seen_at"], cursor["case_id"]])
+                    else:
+                        sql += (" AND (last_seen_at < %s"
+                                " OR (last_seen_at = %s AND case_id < %s))")
+                        params.extend([cursor["last_seen_at"], cursor["last_seen_at"],
+                                       cursor["case_id"]])
                 if scope_filter is not None:
                     clauses: List[str] = []
                     nss = scope_filter.get("namespaces") or []
@@ -1689,7 +1707,7 @@ class MemoryOntologyStore:
             return None
 
     def list_open_cases(self, *, namespace=None, object_type_hint=None, order="freq",
-                        limit=50, offset=0, scope_filter=None):
+                        limit=50, offset=0, scope_filter=None, cursor=None):
         def _in_scope(r):
             if scope_filter is None:
                 return True
@@ -1700,13 +1718,34 @@ class MemoryOntologyStore:
                     or r["namespace"].split(":", 1)[0] in prefixes
                     or (r["object_type_hint"] or "") in otypes)
 
+        def _norm_ls(v):
+            # 路由层游标经字符串编解码；Memory 的 last_seen_at 是 int 伪时钟 → 归一回 int
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return v
+
+        def _after_cursor(r):
+            if not cursor:
+                return True
+            if order == "freq":
+                mine = (r["seen_count"], r["last_seen_at"], r["case_id"])
+                edge = (int(cursor["seen_count"]), _norm_ls(cursor["last_seen_at"]),
+                        cursor["case_id"])
+            else:
+                mine = (r["last_seen_at"], r["case_id"])
+                edge = (_norm_ls(cursor["last_seen_at"]), cursor["case_id"])
+            return mine < edge   # DESC 序：游标之后 = 严格小于
+
         with self._lock:
             rows = [dict(r) for r in self._cases.values() if r["status"] == "open"
                     and (namespace is None or r["namespace"] == namespace)
                     and (object_type_hint is None or r["object_type_hint"] == object_type_hint)
-                    and _in_scope(r)]
-            key = (lambda r: (-r["seen_count"], -r["last_seen_at"])) if order == "freq" \
-                else (lambda r: -r["last_seen_at"])
+                    and _in_scope(r) and _after_cursor(r)]
+            key = (lambda r: (-r["seen_count"], -r["last_seen_at"],
+                              tuple(-ord(c) for c in r["case_id"]))) if order == "freq" \
+                else (lambda r: (-r["last_seen_at"],
+                                 tuple(-ord(c) for c in r["case_id"])))
             rows.sort(key=key)
             lo = max(0, int(offset))
             return rows[lo:lo + max(1, min(int(limit), 200))]
