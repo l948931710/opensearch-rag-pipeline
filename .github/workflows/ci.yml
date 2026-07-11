@@ -135,10 +135,11 @@ jobs:
           print('DB probe wired OK')
           "
       - name: DB integration tests (real MySQL, real DML)
-        # 4 个模块在 conftest 的 xdist 分组里本就同组串行（互相清表），xdist 无收益 → 直接串行跑
+        # 这些模块在 conftest 的 xdist 分组里本就同组串行（互相清表），xdist 无收益 → 直接串行跑
         run: >-
           python -m pytest tests/test_pipeline.py tests/test_classification.py
           tests/test_concurrency.py tests/test_image_funnel.py
+          tests/test_kb_db_integration.py
           -q --tb=short -p no:cacheprovider
       - name: Ontology real-DB contract tests (zero-skip enforced)
         # PR-D（P0-08）：ontology 真库契约族入 CI，且 REQUIRE_RDS=1 把 self-skip 变硬失败——

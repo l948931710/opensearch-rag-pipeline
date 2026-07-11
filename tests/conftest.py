@@ -165,6 +165,7 @@ _LOCAL_STACK_SERIAL_MODULES = {
     "test_classification.py", # RDS 集成用例
     "test_image_funnel.py",   # RDS 集成用例
     "test_simulate_prod_guard.py",  # 操纵 prod-guard/config 全局态
+    "test_kb_db_integration.py",    # kb console 端点真库回归（qa/feedback/doc 真实 DML）
 }
 
 

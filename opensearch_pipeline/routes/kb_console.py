@@ -732,7 +732,7 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
                 # 平铺 (message, doc) 行，Python 侧按 message 分组保序（GROUP_CONCAT 拼结构太脆）。
                 # LIMIT 300 行 ≈ 数十条差评 × 引用文档数，上限后截 limit 条消息。
                 cur.execute(
-                    "SELECT f.message_id, f.created_at, q.question, m.doc_id, m.title, m.owner_dept,"
+                    "SELECT f.message_id, f.created_at, q.query_text, m.doc_id, m.title, m.owner_dept,"
                     " f.feedback_reason, f.feedback_comment, f.handled_status"
                     f" FROM {_op_db()}.user_feedback f"
                     f" JOIN {_op_db()}.qa_session_log q ON q.message_id = f.message_id"
