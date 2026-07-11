@@ -27,7 +27,10 @@ const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats,
 
 // 「待你处理」置顶条（P2）：差评复核是看板里唯一的行动区，却沉在页尾 ~2900px 深——
 // 有未处理差评时在首屏给一枚计数 chip，点击平滑定位；清零即隐，与文档管理 tab 的待办条同语言。
+// 计数来源区分「0 条」与「加载失败」（staging 2026-07-11 P1）：接口真错误时挂「加载失败」chip
+// 而非整条消失——0=真没有，失败=数量未知，两者对管理员是完全不同的信号。
 const feedbackOpenCount = computed(() => (feedbackReview.value || []).filter((x) => !x.handled).length)
+const feedbackLoadFailed = computed(() => !!loadErrors.value['feedbackReview'])
 function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
 // 资产概览卡的加载态：stats 尚未返回且无错误 → 显骨架（避免闪 0）。
 const statsLoading = computed(() => !kbStats.value && !loadErrors.value['stats'])
@@ -175,17 +178,25 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       </span>
     </div>
 
-    <!-- 待你处理：有未处理差评时首屏可见、一键直达（看板唯一行动区在页尾，不能只靠滚动发现） -->
+    <!-- 待你处理：有未处理差评时首屏可见、一键直达（看板唯一行动区在页尾，不能只靠滚动发现）；
+         差评复核接口真错误时同样置顶显「加载失败」——数量未知 ≠ 0 条，点击直达区块内重试。 -->
     <div
-      v-if="feedbackOpenCount"
+      v-if="feedbackOpenCount || feedbackLoadFailed"
       class="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-panel/60 px-4 py-3"
     >
       <span class="text-[12.5px] font-semibold text-foreground">待你处理</span>
       <button
+        v-if="feedbackOpenCount"
         type="button"
         class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-[12px] font-medium text-st-fail transition hover:border-border-strong"
         @click="scrollToSec('kb-dash-feedback')"
       >差评未处理 <b class="font-mono tabular-nums">{{ feedbackOpenCount }}</b></button>
+      <button
+        v-if="feedbackLoadFailed"
+        type="button" data-testid="feedback-load-failed-chip"
+        class="inline-flex items-center gap-1.5 rounded-full border border-st-warn/40 bg-card px-3 py-1 text-[12px] font-medium text-st-warn transition hover:border-st-warn/70"
+        @click="scrollToSec('kb-dash-feedback')"
+      ><AlertTriangle :size="12" :stroke-width="1.75" /> 差评复核加载失败 · 数量未知</button>
     </div>
 
     <!-- 全库资产概览（含状态分布 + 部门覆盖情况） -->
