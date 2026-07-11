@@ -12,20 +12,57 @@ REPO = Path(__file__).resolve().parent.parent
 SCHEMA = REPO / "schema"
 
 
-def _ddl_columns(sql_path: Path, table: str) -> set:
-    """从 CREATE TABLE 语句提取列名集合（行首标识符启发式，够用且稳定）。"""
-    text = sql_path.read_text(encoding="utf-8")
-    m = re.search(rf"CREATE TABLE (?:IF NOT EXISTS )?{table}\s*\((.*?)\)\s*ENGINE",
-                  text, re.S | re.I)
-    assert m, f"{sql_path.name} 里找不到 CREATE TABLE {table}"
+def _parse_create_block_cols(block: str) -> set:
+    """CREATE TABLE 括号体 → 列名集合（行首标识符启发式：列名小写、SQL 关键字大写，够用且稳定）。"""
     cols = set()
-    for line in m.group(1).splitlines():
+    for line in block.splitlines():
         line = line.strip()
         mm = re.match(r"^`?([a-z_][a-z0-9_]*)`?\s", line)
         if mm and mm.group(1).upper() not in (
                 "PRIMARY", "UNIQUE", "INDEX", "KEY", "CONSTRAINT", "FOREIGN"):
             cols.add(mm.group(1))
     return cols
+
+
+def _ddl_columns(sql_path: Path, table: str) -> set:
+    """从单文件的 CREATE TABLE 语句提取列名集合。"""
+    text = sql_path.read_text(encoding="utf-8")
+    m = re.search(rf"CREATE TABLE (?:IF NOT EXISTS )?{table}\s*\((.*?)\)\s*ENGINE",
+                  text, re.S | re.I)
+    assert m, f"{sql_path.name} 里找不到 CREATE TABLE {table}"
+    return _parse_create_block_cols(m.group(1))
+
+
+def _table_columns_across_schema(table: str) -> set:
+    """表在 schema/ 全集里的权威列集合：CREATE TABLE 基线 ∪ 后续迁移增列
+    （002 的 _add_column_if_not_exists 守卫 / 006 式 ALTER TABLE ... ADD COLUMN）。
+
+    列名契约测试用它做「代码引用的列必须存在」的裁判——单文件版 _ddl_columns 看不见
+    跨文件演进（qa_session_log 的 top_score 在 002、conversation_id 在 006）。"""
+    cols = set()
+    for sql_path in sorted(SCHEMA.glob("*.sql")):
+        text = sql_path.read_text(encoding="utf-8")
+        m = re.search(rf"CREATE TABLE (?:IF NOT EXISTS )?`?{table}`?\s*\((.*?)\)\s*ENGINE",
+                      text, re.S | re.I)
+        if m:
+            cols |= _parse_create_block_cols(m.group(1))
+        cols |= set(re.findall(
+            rf"_add_column_if_not_exists\(\s*'{table}'\s*,\s*'([a-z0-9_]+)'", text))
+        cols |= set(re.findall(
+            rf"ALTER TABLE\s+`?{table}`?\s+ADD COLUMN\s+`?([a-z_][a-z0-9_]*)`?", text, re.I))
+    assert cols, f"schema/ 全集里找不到表 {table} 的任何 DDL"
+    return cols
+
+
+def test_qa_session_log_columns_union_across_files():
+    """跨文件联合解析自检 + 2026-07-11 staging P1 事实钉：qa_session_log 的问题文本列
+    是 query_text（001 基线），从来没有 question——kb_console 曾 SELECT q.question，
+    mock 单测全绿、staging 真库 1054。top_score/conversation_id 证明 002/006 的增列
+    形态都被联合集看见。"""
+    cols = _table_columns_across_schema("qa_session_log")
+    for c in ("query_text", "cited_docs_json", "top_score", "conversation_id"):
+        assert c in cols, f"qa_session_log 权威列集缺 {c}——联合解析回归了"
+    assert "question" not in cols
 
 
 def test_kb_contribution_insert_columns_exist_in_ddl():

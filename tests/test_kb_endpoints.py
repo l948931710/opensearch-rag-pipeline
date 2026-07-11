@@ -838,6 +838,38 @@ def test_feedback_review_kb_admin_global_empty_ok(monkeypatch):
     assert "owner_dept IN" not in sink["sql"]
 
 
+def test_feedback_review_sql_columns_exist_in_authoritative_ddl(monkeypatch):
+    """SQL 列名契约（2026-07-11 staging P1 回归）：桩游标不校验列名——本端点曾 SELECT
+    qa_session_log 不存在的 q.question（实列 query_text），单测全绿、staging/prod 真库
+    pymysql 1054 必 500 且前端区块静默隐藏。这里把端点在两种 JOIN 形态下实际拼出的
+    SQL 里 q./f./m./jt. 引用的每一列，钉死在对应表的权威 DDL（schema/ 跨文件联合集）上。"""
+    _skip_if_not_sim()
+    import re as _re
+    from tests.test_schema_ddl_parity import _table_columns_across_schema
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    # 缓存旁路：本测试的断言对象是「真拼出的 SQL」，不能被同 key 的兄弟测试缓存喂饱
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_dashboard_cache_get", lambda k: None)
+    monkeypatch.setattr(kb_console, "_dashboard_cache_put", lambda k, v: None)
+    from opensearch_pipeline import api
+    for fact_on in (False, True):   # JSON_TABLE 回退 / qa_retrieved_doc 事实表 两种形态都锁
+        monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled",
+                            lambda v=fact_on: v)
+        sink = _stub_multi(monkeypatch, [[]])
+        api.kb_feedback_review(request=None, limit=20, identity=api.Identity(user_id="adm1"))
+        sql = sink["sql"]
+        checks = {"q": "qa_session_log", "f": "user_feedback", "m": "document_meta"}
+        if fact_on:
+            checks["jt"] = "qa_retrieved_doc"   # 回退形态的 jt 是 JSON_TABLE 派生列，不查
+        for alias, table in checks.items():
+            refs = set(_re.findall(rf"\b{alias}\.([a-z_][a-z0-9_]*)", sql))
+            assert refs, f"SQL 里没有 {alias}. 引用——查询形状变了，请同步本契约测试"
+            missing = refs - _table_columns_across_schema(table)
+            assert not missing, (f"{table}（别名 {alias}）引用了权威 DDL 不存在的列："
+                                 f"{sorted(missing)}——真库必 1054，先对齐 schema/ 再改代码")
+        assert "q.query_text" in sql   # 问题文本必须取自 query_text（本 bug 的直接钉子）
+
+
 # ── GET /api/kb/escalations + POST resolve：转人工工单队列（盲区审计 P1-2）──────
 def test_escalations_dept_scope_age_and_redaction(monkeypatch):
     """dept_admin 作用域=引用文档归属（EXISTS + owner IN）；收件箱按龄升序且不设时间窗；
