@@ -24,12 +24,16 @@ S7 铁律：sem_packing/sem_stacking 不授通用 fuling_ro——所有读取必
 """
 from __future__ import annotations
 
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Collection, Dict, List, Optional, Tuple
 
 from opensearch_pipeline.ontology.authz import can_read_object, visible_title
 from opensearch_pipeline.ontology.store import SEM_PROJECTIONS
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["SemAnswer", "lookup_specs"]
 
@@ -73,6 +77,30 @@ def _pick_best(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
                        str(r.get("spec_updated_at") or ""),
                        str(r.get("spec_ref") or "")),
         reverse=True)[0]
+
+
+def _spec_provenance_fields(store, row: Dict[str, Any]) -> Dict[str, Any]:
+    """P1-10 读出口：spec 行透出 source/version/as_of——「数据从哪来、多新鲜」随答案走。
+
+    source = 值级溯源（golden_provenance_json）的 sor_system 去重列表；
+    as_of  = 溯源戳最新时点（无溯源回退对象 updated_at；再无 → None，绝不编时间）；
+    version = 对象乐观锁版本（同一 spec 的答案可与后续变更精确对账）。
+    富化 fail-open：溯源读不出不拦答案，三字段置 None（graceful degradation 惯例）。"""
+    out: Dict[str, Any] = {"source": None, "version": None, "as_of": None}
+    try:
+        obj = store.get_object(row.get("spec_id")) or {}
+        out["version"] = obj.get("version")
+        raw = obj.get("golden_provenance_json")
+        prov = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        stamps = [v for v in prov.values() if isinstance(v, dict)]
+        sources = sorted({str(v["sor_system"]) for v in stamps if v.get("sor_system")})
+        as_ofs = sorted(str(v["as_of"]) for v in stamps if v.get("as_of"))
+        out["source"] = sources or None
+        out["as_of"] = (as_ofs[-1] if as_ofs
+                        else (str(obj["updated_at"]) if obj.get("updated_at") else None))
+    except Exception:   # noqa: BLE001 — 溯源富化绝不拦答案
+        logger.warning("spec 溯源富化失败（fail-open，source/as_of 置 None）", exc_info=True)
+    return out
 
 
 def _resolve_target(store, target: str, namespace: Optional[str]) \
@@ -144,6 +172,9 @@ def lookup_specs(store, target: str, *, acl_groups: Optional[Collection[str]],
         visible = [r for r in rows if _row_visible(r, acl, bypass_acl)]
         ans.spec_counts[domain] = len(visible)
         best = _pick_best(visible)
+        if best is not None:   # P1-10：选中行透出 source/version/as_of（浅拷贝不改源行）
+            best = dict(best)
+            best.update(_spec_provenance_fields(store, best))
         ans.specs[domain] = best
         label = "箱规" if domain == "packing" else "香规/堆叠"
         if best is None:

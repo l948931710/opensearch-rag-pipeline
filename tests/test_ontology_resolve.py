@@ -29,13 +29,42 @@ def _hash_embedder(text):
 
 
 
-@pytest.fixture(autouse=True)
-def _auto_ack_for_auto_machinery_tests(monkeypatch):
-    """PR-E（P0-07）：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
-    统一注入有效当日 ack；硬关默认态的独立断言见 test_auto_gate_* 系列。"""
+def _sign_ack_manifest(tmp_path, monkeypatch, *, key="unit-test-ack-key", date_s=None,
+                       omit=(), tamper_after_sign=False, wrong_key_sig=False,
+                       set_key=True) -> str:
+    """P1-13 测试件：签发一份 ack manifest，返回 env 值 `<path>:<sig>`。
+    参数化各种非法形态（缺字段/过期/被篡改/密钥不符/无密钥）供 gate 负例复用。"""
+    import hashlib
+    import hmac as _hmac
+    import json as _json
     from datetime import date
-    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
-                       f"test:{date.today().isoformat()}:deadbeefcafe")
+    doc = {"op": "unit-test", "date": date_s or date.today().isoformat(),
+           "docset": "unit-test fixtures", "gt_summary": "n/a（单测机制验证）",
+           "signer": "pytest"}
+    for k in omit:
+        doc.pop(k, None)
+    body = _json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    manifest = tmp_path / "ack_manifest.json"
+    manifest.write_bytes(body)
+    sign_key = "some-other-key" if wrong_key_sig else key
+    sig = _hmac.new(sign_key.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    if tamper_after_sign:
+        manifest.write_bytes(body + b" ")   # 签名后改动一字节
+    if set_key:
+        monkeypatch.setenv("RAG_ONTOLOGY_ACK_HMAC_KEY", key)
+    else:
+        monkeypatch.delenv("RAG_ONTOLOGY_ACK_HMAC_KEY", raising=False)
+    value = f"{manifest}:{sig}"
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK", value)
+    return value
+
+
+@pytest.fixture(autouse=True)
+def _auto_ack_for_auto_machinery_tests(monkeypatch, tmp_path):
+    """PR-E（P0-07）→ P1-13：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
+    统一签发当日**签名 manifest** ack（HMAC-SHA256 密钥+manifest+签名三件套缺一不可）；
+    硬关默认态与验签负例的独立断言见下方 test_auto_gate_* 系列。"""
+    _sign_ack_manifest(tmp_path, monkeypatch)
 
 @pytest.fixture()
 def store():
@@ -49,8 +78,8 @@ def resolver(store):
 
 def _seed_product(store, title="6.2口径龙虾杯", ns="u8", raw="abc123", **obj_kw):
     obj = store.mint_object("product", title, owner_dept=obj_kw.pop("owner_dept", "pmc"),
-                            **obj_kw)
-    store.insert_identifier(ns, raw, raw.strip().upper(), obj["object_id"], method="seed")
+                            **obj_kw, _caller="test")
+    store.insert_identifier(ns, raw, raw.strip().upper(), obj["object_id"], method="seed", _caller="test")
     return obj
 
 
@@ -123,9 +152,9 @@ def test_exact_hit_write_intent_requires_hitl(resolver, store):
 
 
 def test_exact_hit_carries_target_revision(resolver, store):
-    obj = store.mint_object("product", "改模品", owner_dept="pmc")
+    obj = store.mint_object("product", "改模品", owner_dept="pmc", _caller="test")
     store.insert_identifier("u8", "abc123-m", "ABC123-M", obj["object_id"],
-                            method="manual", target_revision="r2")
+                            method="manual", target_revision="r2", _caller="test")
     res = resolver.resolve("u8", "ABC123-M")
     assert res.status == "resolved" and res.target_revision == "r2"
 
@@ -210,7 +239,7 @@ def test_rule_suffix_only_value_no_candidate(resolver, store):
 
 
 def test_embedding_candidate_capped_below_tau_high(resolver, store):
-    store.mint_object("product", "黑色注塑叉子", owner_dept="rd")
+    store.mint_object("product", "黑色注塑叉子", owner_dept="rd", _caller="test")
     res = resolver.resolve("lab_sample", "黑色注塑叉子")   # 同名 → cos=1.0
     assert res.status == "candidate"
     top = res.candidates[0]
@@ -221,13 +250,13 @@ def test_embedding_candidate_capped_below_tau_high(resolver, store):
 
 
 def test_embedding_dissimilar_title_unresolved(resolver, store):
-    store.mint_object("product", "PP水杯370ml", owner_dept="pmc")
+    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", _caller="test")
     res = resolver.resolve("lab_sample", "黑色注塑叉子")
     assert res.status == "unresolved"                 # 异文本 cos≈0 < τ_low
 
 
 def test_embedding_hint_narrows_pool(resolver, store):
-    store.mint_object("sku", "黑色注塑叉子", owner_dept="pmc")
+    store.mint_object("sku", "黑色注塑叉子", owner_dept="pmc", _caller="test")
     hit = resolver.resolve("lab_sample", "黑色注塑叉子", object_type_hint="sku")
     miss = resolver.resolve("lab_sample", "黑色注塑叉子", object_type_hint="product")
     assert hit.status == "candidate" and hit.candidates[0].object_type == "sku"
@@ -235,14 +264,14 @@ def test_embedding_hint_narrows_pool(resolver, store):
 
 
 def test_embedding_disabled_with_none_embedder(store):
-    store.mint_object("product", "黑色注塑叉子", owner_dept="rd")
+    store.mint_object("product", "黑色注塑叉子", owner_dept="rd", _caller="test")
     r = OntologyResolver(store, embedder=None)
     res = r.resolve("lab_sample", "黑色注塑叉子")
     assert res.status == "unresolved" and res.candidates == []
 
 
 def test_embedding_failure_fails_open(store):
-    store.mint_object("product", "黑色注塑叉子", owner_dept="rd")
+    store.mint_object("product", "黑色注塑叉子", owner_dept="rd", _caller="test")
 
     def _boom(_text):
         raise RuntimeError("dashscope down")
@@ -254,7 +283,7 @@ def test_embedding_failure_fails_open(store):
 
 def test_candidates_truncated_to_cap(store):
     for i in range(7):
-        store.mint_object("product", "黑色注塑叉子", owner_dept="pmc")   # 7 个同名对象
+        store.mint_object("product", "黑色注塑叉子", owner_dept="pmc", _caller="test")   # 7 个同名对象
     r = OntologyResolver(store, embedder=_hash_embedder)
     res = r.resolve("lab_sample", "黑色注塑叉子")
     assert len(res.candidates) == 5                   # _MAX_CANDIDATES
@@ -262,7 +291,7 @@ def test_candidates_truncated_to_cap(store):
 
 def test_tau_env_flips_status(store, monkeypatch):
     """τ_low env 可调：默认 unresolved 的弱候选，调低门槛后变 candidate。"""
-    store.mint_object("product", "完全不相干的品名XYZ", owner_dept="pmc")
+    store.mint_object("product", "完全不相干的品名XYZ", owner_dept="pmc", _caller="test")
     monkeypatch.setenv("RAG_ONTOLOGY_TAU_LOW", "0.0")
     monkeypatch.setenv("RAG_ONTOLOGY_TAU_HIGH", "0.95")
     r = OntologyResolver(store, embedder=_hash_embedder, tau_table=TauTable.from_env())
@@ -291,8 +320,8 @@ class _ReadOnlySpy(MemoryOntologyStore):
 
 def test_resolve_never_writes():
     spy = _ReadOnlySpy()
-    obj = spy.mint_object("product", "黑色注塑叉子", owner_dept="rd")
-    spy.insert_identifier("u8", "abc123", "ABC123", obj["object_id"], method="seed")
+    obj = spy.mint_object("product", "黑色注塑叉子", owner_dept="rd", _caller="test")
+    spy.insert_identifier("u8", "abc123", "ABC123", obj["object_id"], method="seed", _caller="test")
     r = OntologyResolver(spy, embedder=_hash_embedder)
     spy.armed = True
     r.resolve("u8", "ABC123")                          # exact 路径
@@ -417,9 +446,9 @@ def test_tool_object_gate_confidential_without_acl(store):
     （不再返回掩码标题+代理号——ID/ref 即存在性泄露）。"""
     from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
     obj = store.mint_object("material", "PP-1100 特惠采购价目", owner_dept="supply",
-                            data_classification="confidential")
+                            data_classification="confidential", _caller="test")
     store.insert_identifier("material_grade", "pp-1100", "PP-1100", obj["object_id"],
-                            method="seed")
+                            method="seed", _caller="test")
     tool = OntologyResolveTool(resolver=OntologyResolver(store, embedder=None))
     denied = tool.run(_ctx(acl=("pmc",)),
                       {"namespace": "material_grade", "value": "pp-1100"})
@@ -441,7 +470,7 @@ def test_confidential_never_leaves_domain_via_embedding(store):
     embedder 绝不收到机密标题。"""
     from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
     obj = store.mint_object("material", "机密牌号目录", owner_dept="supply",
-                            data_classification="confidential")
+                            data_classification="confidential", _caller="test")
     seen_titles = []
 
     def _spy_embedder(text):
@@ -461,7 +490,7 @@ def test_tool_filters_unreadable_candidates(store):
     """PR-B：不可读候选整条不出参（含 id/ref）；有权调用方候选完整（internal 对象）。"""
     from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
     obj = store.mint_object("material", "内部牌号目录", owner_dept="supply",
-                            data_classification="internal")
+                            data_classification="internal", _caller="test")
     tool = OntologyResolveTool(resolver=OntologyResolver(store, embedder=_hash_embedder))
     denied = tool.run(_ctx(acl=("pmc",)), {"namespace": "lab_sample", "value": "内部牌号目录"})
     assert denied.receipt["candidates"] == []
@@ -527,26 +556,70 @@ def _auto_candidate():
 def test_auto_gate_default_closed(monkeypatch):
     """P0-07 核心：无 ack → 0.96 唯一 rule 候选也不 auto（候选-only 默认）。"""
     monkeypatch.delenv("RAG_ONTOLOGY_AUTO_ACK", raising=False)
+    monkeypatch.delenv("RAG_ONTOLOGY_ACK_HMAC_KEY", raising=False)
     assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8") is None
     from opensearch_pipeline.ontology.resolve import auto_activation_enabled
     assert auto_activation_enabled() is False
 
 
 @pytest.mark.parametrize("token", [
-    "malformed",                                  # 缺段
-    "op:2020-01-01:deadbeefcafe",                 # 过期
-    ":2099-01-01:deadbeefcafe",                   # op 空（日期也不对，双重非法）
-    "op:TODAY:short",                             # hash 过短（TODAY 占位，下面替换）
+    "malformed",                                  # 无签名段
+    "op:2020-01-01:deadbeefcafe",                 # P1-13 前的旧格式：签名非 64 hex → 拒
+    "op:TODAY:deadbeefcafe",                      # 旧格式当日 token 也不再是合法 ack
 ])
-def test_auto_gate_rejects_bad_tokens(monkeypatch, token):
+def test_auto_gate_rejects_legacy_tokens(monkeypatch, token):
+    """P1-13：「能设环境变量」不再等于质量门——旧 op:date:hash 形态一律拒
+    （即使 HMAC 密钥在位，无签名 manifest 即无合法签发）。"""
     from datetime import date
     monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK", token.replace("TODAY", date.today().isoformat()))
     assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8") is None
 
 
-def test_auto_gate_valid_token_opens(monkeypatch):
-    from datetime import date
-    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
-                       f"gt-run:{date.today().isoformat()}:cafebabe1234")
+def test_auto_gate_requires_hmac_key(monkeypatch, tmp_path):
+    """签名正确但环境无 RAG_ONTOLOGY_ACK_HMAC_KEY → 无法验签，保持关闭。"""
+    _sign_ack_manifest(tmp_path, monkeypatch, set_key=False)
+    from opensearch_pipeline.ontology.resolve import auto_activation_enabled
+    assert auto_activation_enabled() is False
+
+
+def test_auto_gate_rejects_tampered_manifest(monkeypatch, tmp_path):
+    """签发后 manifest 被改动一字节 → HMAC 不符，保持关闭。"""
+    _sign_ack_manifest(tmp_path, monkeypatch, tamper_after_sign=True)
+    from opensearch_pipeline.ontology.resolve import auto_activation_enabled
+    assert auto_activation_enabled() is False
+
+
+def test_auto_gate_rejects_foreign_key_signature(monkeypatch, tmp_path):
+    """签名出自别的密钥（伪造者自签）→ 与环境密钥不符，保持关闭。"""
+    _sign_ack_manifest(tmp_path, monkeypatch, wrong_key_sig=True)
+    from opensearch_pipeline.ontology.resolve import auto_activation_enabled
+    assert auto_activation_enabled() is False
+
+
+def test_auto_gate_rejects_stale_date(monkeypatch, tmp_path):
+    """date-bound 纪律保留：合法签名的隔日 manifest 也无效（token 不可囤积复用）。"""
+    _sign_ack_manifest(tmp_path, monkeypatch, date_s="2020-01-01")
+    from opensearch_pipeline.ontology.resolve import auto_activation_enabled
+    assert auto_activation_enabled() is False
+
+
+def test_auto_gate_rejects_missing_fields(monkeypatch, tmp_path):
+    """manifest 缺 gt_summary/signer（签发要件不全）→ 拒（签名对也不放行）。"""
+    _sign_ack_manifest(tmp_path, monkeypatch, omit=("gt_summary", "signer"))
+    from opensearch_pipeline.ontology.resolve import auto_activation_enabled
+    assert auto_activation_enabled() is False
+
+
+def test_auto_gate_rejects_missing_manifest_file(monkeypatch, tmp_path):
+    """ack 指向不存在的 manifest → 拒。"""
+    monkeypatch.setenv("RAG_ONTOLOGY_ACK_HMAC_KEY", "unit-test-ack-key")
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK", f"{tmp_path}/nope.json:" + "0" * 64)
+    from opensearch_pipeline.ontology.resolve import auto_activation_enabled
+    assert auto_activation_enabled() is False
+
+
+def test_auto_gate_valid_manifest_opens(monkeypatch, tmp_path):
+    """密钥+当日 manifest+匹配签名三件齐 → auto 资格判定放行（三禁仍另行生效）。"""
+    _sign_ack_manifest(tmp_path, monkeypatch)
     winner = may_auto_activate(_auto_candidate(), intent="read", namespace="u8")
     assert winner is not None and winner.target_object_id == "T1"

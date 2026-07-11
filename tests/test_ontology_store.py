@@ -76,6 +76,10 @@ def _cleanup_rds(_retry: bool = True):
         cur.execute("DELETE l FROM ontology_link l JOIN ontology_object o "
                     "ON o.object_id IN (l.src_object_id, l.dst_object_id) "
                     "WHERE o.title LIKE %s", (like,))
+        # fk_object_merged_into（schema/033，RESTRICT）：merge 对成批 DELETE 行序不可控，
+        # 先解指针再删（identifier↔case 互指两条 FK 均 ON DELETE SET NULL，顺序不敏感）
+        cur.execute("UPDATE ontology_object SET merged_into=NULL "
+                    "WHERE merged_into IS NOT NULL AND title LIKE %s", (like,))
         cur.execute("DELETE FROM ontology_object WHERE title LIKE %s", (like,))
     try:
         conn.close()
@@ -112,7 +116,7 @@ def ns():
 
 def _mint(store, object_type="product", title=None, **kw):
     return store.mint_object(object_type, title or f"{_MARK}对象-{uuid.uuid4().hex[:6]}",
-                             owner_dept="pmc", **kw)
+                             owner_dept="pmc", **kw, _caller="test")
 
 
 # ── 对象与发号 ────────────────────────────────────────────────────────────────────
@@ -144,9 +148,9 @@ def test_find_objects_title_like(store):
 
 def test_update_golden_cas(store):
     obj = _mint(store)
-    assert store.update_golden(obj["object_id"], {"口径": "6.2"}, expected_version=1) is True
+    assert store.update_golden(obj["object_id"], {"口径": "6.2"}, expected_version=1, allow_missing_provenance=True) is True
     # 旧版本号再写 → 冲突
-    assert store.update_golden(obj["object_id"], {"口径": "7.0"}, expected_version=1) is False
+    assert store.update_golden(obj["object_id"], {"口径": "7.0"}, expected_version=1, allow_missing_provenance=True) is False
     assert store.get_object(obj["object_id"])["version"] == 2
 
 
@@ -166,9 +170,9 @@ def test_retire_and_mark_duplicate(store):
 
 def test_retire_cascades_identifiers_and_links(store, ns):
     """P0-03：退役同事务级联——active 别名→retired、双向 link→retired，不留 active 引用。"""
-    a, b = _mint(store), _mint(store)
-    iid = store.insert_identifier(ns, "abc", "ABC", a["object_id"], method="seed")
-    lid = store.add_link(a["object_id"], b["object_id"], "sku_of_product")
+    a, b = _mint(store, object_type="sku"), _mint(store)   # P1-8 端点类型契约：sku→product
+    iid = store.insert_identifier(ns, "abc", "ABC", a["object_id"], method="seed", _caller="test")
+    lid = store.add_link(a["object_id"], b["object_id"], "sku_of_product", _caller="test")
     assert store.retire_object(a["object_id"]) is True
     assert store.get_active_identifier(ns, "ABC") is None
     ident = [r for r in store.list_identifiers_for_target(a["object_id"])
@@ -181,7 +185,7 @@ def test_retire_cascades_identifiers_and_links(store, ns):
 def test_mark_duplicate_repoints_identifiers_same_tx(store, ns):
     """P0-03：merge 同事务把 source 的 active 别名改指 target（身份连续），source link 退场。"""
     a, b = _mint(store), _mint(store)
-    old_id = store.insert_identifier(ns, "abc", "ABC", a["object_id"], method="seed")
+    old_id = store.insert_identifier(ns, "abc", "ABC", a["object_id"], method="seed", _caller="test")
     assert store.mark_duplicate(a["object_id"], b["object_id"], by="steward_1") is True
     active = store.get_active_identifier(ns, "ABC")
     assert active is not None and active["target_object_id"] == b["object_id"]
@@ -212,9 +216,9 @@ def test_mark_duplicate_no_cycle(store):
 def test_insert_identifier_dangling_target_rejected(store, ns):
     """P0-03 FK：悬空目标拒绝（RDS=1452→ValueError，Memory=显式存在性校验，同契约）。"""
     with pytest.raises(ValueError, match="不存在"):
-        store.insert_identifier(ns, "x", "X", "0" * 26, method="seed")
+        store.insert_identifier(ns, "x", "X", "0" * 26, method="seed", _caller="test")
     with pytest.raises(ValueError, match="不存在"):
-        store.add_link("0" * 26, "1" * 26, "sku_of_product")
+        store.add_link("0" * 26, "1" * 26, "sku_of_product", _caller="test")
 
 
 def test_identifier_binary_collation_case_sensitive(store, ns):
@@ -223,15 +227,15 @@ def test_identifier_binary_collation_case_sensitive(store, ns):
     obj1, obj2 = _mint(store), _mint(store)
     cns = f"{ns}:kfc"   # customer 前缀语义：保大小写
     i_upper = store.insert_identifier(cns, "A(高钙)", "A(高钙)", obj1["object_id"],
-                                      method="manual")
+                                      method="manual", _caller="test")
     i_lower = store.insert_identifier(cns, "a(高钙)", "a(高钙)", obj2["object_id"],
-                                      method="manual")
+                                      method="manual", _caller="test")
     assert i_upper != i_lower
     assert store.get_active_identifier(cns, "A(高钙)")["target_object_id"] == obj1["object_id"]
     assert store.get_active_identifier(cns, "a(高钙)")["target_object_id"] == obj2["object_id"]
     # 同大小写重插仍然撞（唯一键语义不因 binary 而放松）
     with pytest.raises(DuplicateActiveIdentifier):
-        store.insert_identifier(cns, "A(高钙)", "A(高钙)", obj1["object_id"], method="manual")
+        store.insert_identifier(cns, "A(高钙)", "A(高钙)", obj1["object_id"], method="manual", _caller="test")
 
 
 # ── 别名：至多一行 active / 纠错 ──────────────────────────────────────────────────
@@ -239,21 +243,21 @@ def test_identifier_binary_collation_case_sensitive(store, ns):
 
 def test_identifier_single_active_and_reinsert_after_deactivate(store, ns):
     obj = _mint(store)
-    i1 = store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="seed")
+    i1 = store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="seed", _caller="test")
     with pytest.raises(DuplicateActiveIdentifier):
-        store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="manual")
+        store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="manual", _caller="test")
     assert store.get_active_identifier(ns, "ABC123")["identifier_id"] == i1
     # 纠错：deactivate 后可重新确认
     assert store.deactivate_identifier(i1) is True
     assert store.deactivate_identifier(i1) is False               # 二次 CAS 让位
     assert store.get_active_identifier(ns, "ABC123") is None
-    i2 = store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="manual")
+    i2 = store.insert_identifier(ns, "abc123", "ABC123", obj["object_id"], method="manual", _caller="test")
     assert store.get_active_identifier(ns, "ABC123")["identifier_id"] == i2
 
 
 def test_deactivate_rejects_bad_status(store, ns):
     obj = _mint(store)
-    iid = store.insert_identifier(ns, "x", "X", obj["object_id"], method="seed")
+    iid = store.insert_identifier(ns, "x", "X", obj["object_id"], method="seed", _caller="test")
     with pytest.raises(ValueError, match="终态"):
         store.deactivate_identifier(iid, status="active")
 
@@ -261,7 +265,7 @@ def test_deactivate_rejects_bad_status(store, ns):
 def test_repoint_identifier_atomic(store, ns):
     a, b = _mint(store), _mint(store)
     old_id = store.insert_identifier(ns, "abc123-m", "ABC123-M", a["object_id"], method="rule",
-                                     confidence=0.97)
+                                     confidence=0.97, _caller="test")
     new_id = store.repoint_identifier(old_id, b["object_id"], by="steward_1",
                                       new_target_revision="r2")
     active = store.get_active_identifier(ns, "ABC123-M")
@@ -279,8 +283,8 @@ def test_repoint_identifier_atomic(store, ns):
 
 def test_list_identifiers_for_target(store, ns):
     obj = _mint(store)
-    store.insert_identifier(ns, "a", "A", obj["object_id"], method="seed")
-    store.insert_identifier(f"{ns}:kfc", "b", "B", obj["object_id"], method="manual")
+    store.insert_identifier(ns, "a", "A", obj["object_id"], method="seed", _caller="test")
+    store.insert_identifier(f"{ns}:kfc", "b", "B", obj["object_id"], method="manual", _caller="test")
     rows = store.list_identifiers_for_target(obj["object_id"])
     assert {r["norm_value"] for r in rows} == {"A", "B"}
     assert all(r["status"] == "active" for r in rows)
@@ -312,7 +316,7 @@ def test_case_resolve_and_dismiss_cas(store, ns):
     obj = _mint(store)
     c1 = store.upsert_case(ns, "abc", "ABC")
     iid = store.insert_identifier(ns, "abc", "ABC", obj["object_id"], method="manual",
-                                  confirmed_by="steward_1", source_case_id=c1)
+                                  confirmed_by="steward_1", source_case_id=c1, _caller="test")
     assert store.resolve_case(c1, identifier_id=iid, by="steward_1") is True
     assert store.resolve_case(c1, identifier_id=iid, by="steward_1") is False   # 二次让位
     # dismiss 必须给理由
@@ -396,11 +400,11 @@ def test_stewardship_seed_depts_within_acl_whitelist():
 
 def test_coverage_math_memory():
     store = MemoryOntologyStore()
-    obj = store.mint_object("product", "杯", owner_dept="pmc")
+    obj = store.mint_object("product", "杯", owner_dept="pmc", _caller="test")
     store.insert_identifier("u8", "a", "A", obj["object_id"], method="seed",
-                            confirmed_by="auto")
+                            confirmed_by="auto", _caller="test")
     store.insert_identifier("u8", "b", "B", obj["object_id"], method="manual",
-                            confirmed_by="steward_1")
+                            confirmed_by="steward_1", _caller="test")
     store.upsert_case("u8", "c", "C", object_type_hint="product")
     cov = store.coverage()
     assert cov["active_identifiers"] == 2 and cov["auto_active"] == 1
@@ -468,7 +472,7 @@ def test_rds_concurrent_insert_identifier_single_winner():
 
     def _work():
         try:
-            store.insert_identifier(ns_v, "x", "X", obj["object_id"], method="manual")
+            store.insert_identifier(ns_v, "x", "X", obj["object_id"], method="manual", _caller="test")
             outcomes.append("ok")
         except DuplicateActiveIdentifier:
             outcomes.append("dup")
@@ -523,7 +527,7 @@ def test_rds_concurrent_retire_vs_resolve_no_zombie():
     store = RDSOntologyStore()
     ns_v = f"{_MARK}{uuid.uuid4().hex[:10]}"
     obj = _mint(store)
-    store.insert_identifier(ns_v, "x1", "X1", obj["object_id"], method="seed")
+    store.insert_identifier(ns_v, "x1", "X1", obj["object_id"], method="seed", _caller="test")
     resolver = OntologyResolver(store, embedder=None)
     results, errors = [], []
 
@@ -562,7 +566,7 @@ def test_rds_concurrent_retire_vs_resolve_no_zombie():
 def test_mint_object_with_alias_atomic_no_orphan(store, ns):
     """别名撞 uk → 整体回滚：对象数零增长（P0-05 孤儿对象根除）。"""
     winner = _mint(store)
-    store.insert_identifier(ns, "x", "X", winner["object_id"], method="seed")
+    store.insert_identifier(ns, "x", "X", winner["object_id"], method="seed", _caller="test")
     before = len(store.find_objects("product", limit=200))
     with pytest.raises(DuplicateActiveIdentifier):
         store.mint_object_with_alias(
@@ -600,7 +604,7 @@ def test_confirm_case_with_identifier_atomic(store, ns):
 def test_confirm_case_duplicate_alias_rolls_back_case(store, ns):
     """铸别名撞 uk → case 保持 open（整体回滚，不出现 case 关了别名没生效）。"""
     a, b = _mint(store), _mint(store)
-    store.insert_identifier(ns, "w", "W", a["object_id"], method="seed")
+    store.insert_identifier(ns, "w", "W", a["object_id"], method="seed", _caller="test")
     case_id = store.upsert_case(ns, "w", "W")
     with pytest.raises(DuplicateActiveIdentifier):
         store.confirm_case_with_identifier(case_id, target_object_id=b["object_id"],
@@ -625,8 +629,8 @@ def test_insert_identifier_closing_case_atomic(store, ns):
 def test_memory_audit_failure_zero_side_effects():
     """P0-06：审计不可写 → 变更零副作用（Memory hook 模拟 agent_audit_log 故障）。"""
     store = MemoryOntologyStore()
-    obj = store.mint_object("product", "审计目标", owner_dept="pmc")
-    store.insert_identifier("u8", "a1", "A1", obj["object_id"], method="seed")
+    obj = store.mint_object("product", "审计目标", owner_dept="pmc", _caller="test")
+    store.insert_identifier("u8", "a1", "A1", obj["object_id"], method="seed", _caller="test")
 
     def _boom(payload):
         raise RuntimeError("audit db down")
@@ -682,7 +686,7 @@ def test_rds_audit_row_lands_with_confirm():
 def test_invariant_scan_clean_and_dirty(store, ns):
     from opensearch_pipeline.ontology.invariants import scan_invariants
     obj = _mint(store)
-    store.insert_identifier(ns, "h", "H", obj["object_id"], method="seed")
+    store.insert_identifier(ns, "h", "H", obj["object_id"], method="seed", _caller="test")
     report = scan_invariants(store)
     ours = {(v.get("namespace"), v.get("norm_value")) for vs in report.values() for v in vs}
     assert (ns, "H") not in ours                       # 健康态：本测试数据无违例
@@ -718,7 +722,7 @@ def test_service_rejects_out_of_range_confidence(store, ns, bad_conf):
     obj = _mint(store)
     with pytest.raises(ValueError, match="confidence 越界"):
         store.insert_identifier(ns, "x", "X", obj["object_id"], method="seed",
-                                confidence=bad_conf)
+                                confidence=bad_conf, _caller="test")
     cid = store.upsert_case(ns, "y", "Y")
     with pytest.raises(ValueError, match="confidence 越界"):
         store.add_candidate(cid, obj["object_id"], method="rule", confidence=bad_conf)
@@ -727,12 +731,12 @@ def test_service_rejects_out_of_range_confidence(store, ns, bad_conf):
 def test_service_rejects_unregistered_link_type(store):
     a, b = _mint(store), _mint(store)
     with pytest.raises(ValueError, match="未登记的 link_type"):
-        store.add_link(a["object_id"], b["object_id"], "made_up_relation")
+        store.add_link(a["object_id"], b["object_id"], "made_up_relation", _caller="test")
 
 
 def test_service_rejects_bogus_owner_dept_and_lifecycle(store):
     with pytest.raises(ValueError, match="白名单"):
-        store.mint_object("product", f"{_MARK}私造组码", owner_dept="notadept")
+        store.mint_object("product", f"{_MARK}私造组码", owner_dept="notadept", _caller="test")
     with pytest.raises(ValueError, match="lifecycle_state"):
         _mint(store, title=f"{_MARK}怪状态", lifecycle_state="shipped")
 
@@ -807,7 +811,7 @@ def test_golden_provenance_write_and_merge(store, ns):
         "product", f"{_MARK}溯源品-{uuid.uuid4().hex[:6]}", owner_dept="pmc",
         golden={"口径": "6.2"},
         provenance={"口径": {"sor_system": "snapshot:seeding", "source_key": "ABC123",
-                             "as_of": "2026-07-10T00:00:00+00:00", "recorded_by": "seeding"}})
+                             "as_of": "2026-07-10T00:00:00+00:00", "recorded_by": "seeding"}}, _caller="test")
     row = store.get_object(obj["object_id"])
     prov = _json.loads(row["golden_provenance_json"])
     assert prov["口径"]["sor_system"] == "snapshot:seeding"
@@ -849,3 +853,41 @@ def test_count_objects_matches_find(store):
     for i in range(3):
         _mint(store, title=f"{_MARK}截断-{tag}-{i}")
     assert store.count_objects("product", title_like=f"截断-{tag}") == 3
+
+
+# ── P0-A②③：授权版搜索/计数（ACL 谓词下推）双后端契约 ────────────────────────────
+
+
+def test_authorized_search_and_count_push_acl_down(store):
+    """LIMIT/COUNT 只作用授权集合：排前面的不可见行不挤占页位（旧"先 limit 再逐行
+    filter"会被饿死）、不进计数；语义与 authz.can_read_object 单一来源。"""
+    tag = uuid.uuid4().hex[:8]
+    # 先铸 3 个 supply-internal（canonical_ref 铸序最早 → 旧实现 limit=2 全被它们占掉）
+    for i in range(3):
+        store.mint_object("product", f"{_MARK}授权-{tag}-隐藏{i}", owner_dept="supply", _caller="test")
+    for i in range(2):
+        store.mint_object("product", f"{_MARK}授权-{tag}-公开{i}", owner_dept="supply",
+                          data_classification="public", _caller="test")
+    like = f"授权-{tag}"
+    # 无关部门（pmc）：只见 public——分页在授权集合上执行，两条公开件都在第一页
+    hits = store.search_objects_authorized("product", acl={"pmc"}, title_like=like, limit=2)
+    assert [h["data_classification"] for h in hits] == ["public", "public"]
+    assert store.count_objects_authorized("product", acl={"pmc"}, title_like=like) == 2
+    # 归属部门（supply）：internal+public 全见
+    assert store.count_objects_authorized("product", acl={"supply"}, title_like=like) == 5
+    assert len(store.search_objects_authorized("product", acl={"supply"},
+                                               title_like=like, limit=10)) == 5
+    # bypass（kb_admin）：全见；空 acl：只剩 public
+    assert store.count_objects_authorized("product", acl=set(), bypass_acl=True,
+                                          title_like=like) == 5
+    hits_empty = store.search_objects_authorized("product", acl=set(), title_like=like,
+                                                 limit=10)
+    assert {h["data_classification"] for h in hits_empty} == {"public"}
+    # 不可读 == 不存在：全隐藏的查询与查不存在标题，出参逐位一致（空列表 / 计数 0）
+    only_hidden = f"授权-{tag}-隐藏"
+    assert store.search_objects_authorized("product", acl={"pmc"},
+                                           title_like=only_hidden, limit=10) \
+        == store.search_objects_authorized("product", acl={"pmc"},
+                                           title_like=f"授权-{tag}-不存在", limit=10) == []
+    assert store.count_objects_authorized("product", acl={"pmc"},
+                                          title_like=only_hidden) == 0

@@ -160,6 +160,9 @@ class _Sink:
         self.dry = dry_run
         self._report = report
         self._evidence_source = evidence_source
+        # P1-9：裸写原语的调用路径声明（store._check_caller）——播种/回填共用本核心，
+        # 按证据源标注真实路径；未知来源一律按 seeding 申报（仍是 S1 合法离线路径）
+        self._caller = "backfill" if evidence_source == "backfill" else "seeding"
         self._planned_alias: Dict[tuple, str] = {}      # (ns, norm) → target_object_id
         self._planned_objects: List[Dict[str, Any]] = []
         self._planned_cases: set = set()                # (ns, norm)
@@ -215,7 +218,8 @@ class _Sink:
         return self._store.mint_object(
             r.object_type, r.title, owner_dept=r.owner_dept, golden=r.attrs,
             provenance=self._provenance(r),
-            data_classification=r.data_classification)["object_id"]
+            data_classification=r.data_classification,
+            _caller=self._caller)["object_id"]
 
     def mint_with_alias(self, r: SeedRecord, ns: str, raw: str, norm: str):
         """铸对象 + 首别名 + （若有）闭 open case **一个事务**（PR-C，P0-05）：
@@ -258,7 +262,8 @@ class _Sink:
             identifier_id = self._store.insert_identifier(
                 ns, raw, norm, target, method=method, relation=relation,
                 confidence=confidence, confirmed_by="auto",
-                source_case_id=None if case_id == _BATCH_CASE else case_id)
+                source_case_id=None if case_id == _BATCH_CASE else case_id,
+                _caller=self._caller)
         except DuplicateActiveIdentifier:
             return False
         if case_id and case_id != _BATCH_CASE:
@@ -399,18 +404,26 @@ def seed_snapshot(store, source: Any, *, dry_run: bool = True,
                   limit: Optional[int] = None, mint_new: bool = True,
                   evidence_source: str = "seeding") -> SeedReport:
     """跑一遍快照播种/回填。单条失败只记 errors 不拖垮批（可断点重跑，幂等）。
-    mint_new=False = 观测语义（回填 mention 模式：无候选不铸对象，只入 case）。"""
+    mint_new=False = 观测语义（回填 mention 模式：无候选不铸对象，只入 case）。
+
+    population 分母纪律（P1-12）：coverage 的分母是「源里有多少记录」，与本批处理量
+    无关——limit 只截断**处理**，不截断**计数**（此前 limit 批直接 break，把分母覆写成
+    批大小 → active/批大小 覆盖率虚高）。代价是 limit 批也要把源迭代完（纯计数不判定
+    不写库）；快照/CSV 源是本地顺序读，可接受。"""
     tau = tau_table or TauTable.from_env(strict=True)   # P0-07：写 worker 非法 τ 即断
     report = SeedReport(dry_run=dry_run)
     sink = _Sink(store, dry_run, report, evidence_source=evidence_source)
     records: Iterable[SeedRecord] = source.iter_records()
-    ns_counts: Dict[str, int] = {}                       # PR-F：coverage 真实分母源快照
+    ns_counts: Dict[str, int] = {}                # PR-F/P1-12：分母=全量源计数（不吃 limit）
+    limit_noted = False
     for r in records:
-        if limit is not None and report.records >= limit:
-            report.add(action="limit_reached", limit=limit)
-            break
-        report.records += 1
         ns_counts[r.namespace] = ns_counts.get(r.namespace, 0) + 1
+        if limit is not None and report.records >= limit:
+            if not limit_noted:
+                report.add(action="limit_reached", limit=limit)
+                limit_noted = True
+            continue                              # 只计数不处理：分母仍走完全量源
+        report.records += 1
         try:
             _decide(r, sink, tau, report, mint_new=mint_new)
         except Exception as e:   # noqa: BLE001 — 单条脏数据不掀翻整批

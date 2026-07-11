@@ -23,6 +23,8 @@ embedding —— 双保险（"黑色注塑叉子/勺子"式假高置信）。
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -174,26 +176,62 @@ class ResolveResult:
 
 
 # ── 离线 auto 资格（S1：唯一允许把"自动"变成"落库"的判定点；在线绝不调用）─────────
+_ACK_MANIFEST_REQUIRED = ("op", "date", "docset", "gt_summary", "signer")
+
+
 def auto_activation_enabled() -> bool:
-    """P0-07 auto 硬关（默认候选-only）：需当日有效的
-    `RAG_ONTOLOGY_AUTO_ACK=<op>:<YYYY-MM-DD>:<gt_manifest_hash>`（**token 只能 Sam 设**，
-    对齐 RAG_ALLOW_UNFROZEN_RECHUNK 的 date-bound 纪律）。GT 分层标定签字前该 token
-    物理上无法合法构造（hash 由 PR14 backtest 工具按 GT manifest 打印）——机器化
-    「签字前 auto 不可能开」。缺失/过期/畸形 → 一切候选（含 0.96 同型同名）进 case。"""
+    """P0-07 auto 硬关（默认候选-only）+ P1-13 签名 manifest 验签。
+
+    旧闸只校验 op、当天日期、hash 长度≥8——「有人设了个环境变量」不构成质量门（外评
+    P1-13：任何能设 env 的人可随手伪造）。现在 ack 是**持密钥签发**的：
+
+      `RAG_ONTOLOGY_AUTO_ACK=<manifest_path>:<hmac_sha256_hex>`
+
+    manifest 为 JSON 文件，必填 op / date(YYYY-MM-DD，当日有效) / docset(数据集描述) /
+    gt_summary(GT/backtest 结果摘要) / signer；签名 = HMAC-SHA256(密钥, manifest 原始
+    字节)，密钥走 `RAG_ONTOLOGY_ACK_HMAC_KEY`（**密钥与 token 只能 Sam 设**，对齐
+    RAG_ALLOW_UNFROZEN_RECHUNK 的 date-bound 纪律）。无密钥/无 manifest/签名不符/字段
+    缺失/非当日 → 一律拒绝，auto 保持关闭（候选-only 默认不变）。PR14 backtest 工具按
+    GT manifest 打印签名；真实 GT 分层标定是后续组织项，本闸先把「须持密钥签发」立起来。"""
     raw = os.environ.get("RAG_ONTOLOGY_AUTO_ACK", "").strip()
     if not raw:
         return False
-    parts = raw.split(":")
-    if len(parts) != 3:
-        logger.warning("RAG_ONTOLOGY_AUTO_ACK 格式非法（op:date:gt_hash），auto 保持关闭")
+    key = os.environ.get("RAG_ONTOLOGY_ACK_HMAC_KEY", "").strip()
+    if not key:
+        logger.warning("RAG_ONTOLOGY_AUTO_ACK 已设但 RAG_ONTOLOGY_ACK_HMAC_KEY 缺失——"
+                       "无密钥即无合法签发，auto 保持关闭")
         return False
-    op, date_s, gt_hash = (p.strip() for p in parts)
+    path, sep, sig = raw.rpartition(":")
+    if not sep or not path or len(sig) != 64:   # HMAC-SHA256 hex 恒 64 位
+        logger.warning("RAG_ONTOLOGY_AUTO_ACK 格式非法（应为 <manifest_path>:"
+                       "<hmac_sha256_hex>），auto 保持关闭")
+        return False
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError:
+        logger.warning("ack manifest 不可读：%s——auto 保持关闭", path)
+        return False
+    expect = hmac.new(key.encode("utf-8"), blob, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, sig.lower()):
+        logger.warning("ack manifest 签名不符（manifest 被改动或非本密钥签发），auto 保持关闭")
+        return False
+    try:
+        doc = json.loads(blob.decode("utf-8"))
+    except Exception:   # noqa: BLE001
+        logger.warning("ack manifest 非合法 JSON，auto 保持关闭")
+        return False
+    if not isinstance(doc, dict):
+        logger.warning("ack manifest 须为 JSON 对象，auto 保持关闭")
+        return False
+    missing = [k for k in _ACK_MANIFEST_REQUIRED if not str(doc.get(k) or "").strip()]
+    if missing:
+        logger.warning("ack manifest 缺必填字段 %s，auto 保持关闭", missing)
+        return False
     from datetime import date
-    if not op or date_s != date.today().isoformat():
-        logger.warning("RAG_ONTOLOGY_AUTO_ACK 非当日/op 缺失，auto 保持关闭")
-        return False
-    if len(gt_hash) < 8:
-        logger.warning("RAG_ONTOLOGY_AUTO_ACK gt_manifest_hash 过短，auto 保持关闭")
+    if str(doc["date"]).strip() != date.today().isoformat():
+        logger.warning("ack manifest 非当日（date=%s）——date-bound 纪律，auto 保持关闭",
+                       doc["date"])
         return False
     return True
 

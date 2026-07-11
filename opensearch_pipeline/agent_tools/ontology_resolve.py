@@ -102,41 +102,50 @@ class OntologyResolveTool:
         return ToolResult.ok(content=content, receipt=receipt)
 
 
+def _unresolved_payload(res):
+    """"无法解析"的**常量形态**（P0-A：不可读=不存在的唯一出参路径——解析目标不可读、
+    候选全不可读、真无候选三种情况逐字节同答，status/confidence/method 零泄露）。"""
+    text = (f"编号 {res.raw_value!r} 无法解析：无正式映射、无可用候选。"
+            "请确认输入是否正确，或提交 steward 登记。")
+    receipt = {"status": "unresolved", "namespace": res.namespace,
+               "norm_value": res.norm_value, "object_id": None, "canonical_ref": None,
+               "target_revision": None, "confidence": 0.0, "method": None,
+               "requires_hitl": True, "candidates": []}
+    return [ContentBlock.of_text(text)], receipt
+
+
 def _format_result(res, acl: set):
     from opensearch_pipeline.ontology.authz import can_read_object, visible_title
 
-    lines: List[str] = []
     resolved_readable = res.status == "resolved" and can_read_object(
         {"data_classification": res.data_classification, "owner_dept": res.owner_dept},
         acl=acl)
     # PR-B（P0-02 验收④）：解析目标不可读 → 与"无法解析"同答，零对象字段出参
     if res.status == "resolved" and not resolved_readable:
-        lines.append(f"编号 {res.raw_value!r} 无法解析：无正式映射、无可用候选。"
-                     "请确认输入是否正确，或提交 steward 登记。")
-        receipt = {"status": "unresolved", "namespace": res.namespace,
-                   "norm_value": res.norm_value, "object_id": None, "canonical_ref": None,
-                   "target_revision": None, "confidence": 0.0, "method": None,
-                   "requires_hitl": True, "candidates": []}
-        return [ContentBlock.of_text("\n".join(lines))], receipt
+        return _unresolved_payload(res)
 
+    # 候选先过对象级 ACL **再**截断（P0-A：过滤后取前 3——排前面的不可读候选
+    # 不挤占可见位，也不把自己的存在留在出参里）
+    visible_cands = [c for c in res.candidates
+                     if can_read_object({"data_classification": c.data_classification,
+                                         "owner_dept": c.owner_dept}, acl=acl)][:3]
+    # P0-A（candidate 分支漏网）：无可见候选 → 与"无法解析"同答——原实现保留
+    # status="candidate" 与池顶 confidence，等于告诉调用方「系统发现了某个高分隐藏对象」
+    if res.status != "resolved" and not visible_cands:
+        return _unresolved_payload(res)
+
+    lines: List[str] = []
     if res.status == "resolved":
         title = visible_title(res.title, res.data_classification, res.owner_dept, acl=acl)
         rev = f"（版本 {res.target_revision}）" if res.target_revision else ""
         lines.append(f"已解析：{title or res.canonical_ref} [{res.canonical_ref}]{rev}，"
                      f"类型 {res.object_type}，置信 1.00（正式映射）。")
-    elif res.status == "candidate":
+    else:
         lines.append(f"编号 {res.raw_value!r} 尚无正式映射，以下候选**未经确认**"
                      "（需 steward 确认后方可作为依据）：")
-    else:
-        lines.append(f"编号 {res.raw_value!r} 无法解析：无正式映射、无可用候选。"
-                     "请确认输入是否正确，或提交 steward 登记。")
 
     shown: List[Dict[str, Any]] = []
-    for c in res.candidates[:3]:
-        # 候选同样先过对象级 ACL——不可读候选整条不出参（含 id/ref）
-        if not can_read_object({"data_classification": c.data_classification,
-                                "owner_dept": c.owner_dept}, acl=acl):
-            continue
+    for c in visible_cands:
         title = visible_title(c.title, c.data_classification, c.owner_dept, acl=acl)
         if res.status != "resolved":
             lines.append(f"- {title or c.canonical_ref} [{c.canonical_ref}] "
@@ -148,7 +157,11 @@ def _format_result(res, acl: set):
     receipt = {
         "status": res.status, "namespace": res.namespace, "norm_value": res.norm_value,
         "object_id": res.object_id, "canonical_ref": res.canonical_ref,
-        "target_revision": res.target_revision, "confidence": res.confidence,
+        "target_revision": res.target_revision,
+        # P0-A：非 resolved 的置信只报**可见候选**的最高分——池顶是隐藏对象时，
+        # 原样出参的 res.confidence 就是「高分隐藏对象存在」的旁证
+        "confidence": (res.confidence if res.status == "resolved"
+                       else (visible_cands[0].confidence if visible_cands else 0.0)),
         "method": res.method, "requires_hitl": res.requires_hitl, "candidates": shown,
     }
     return [ContentBlock.of_text("\n".join(lines))], receipt

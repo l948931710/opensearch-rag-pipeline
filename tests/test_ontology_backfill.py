@@ -38,12 +38,23 @@ def _rec(raw, title="6.2口径龙虾杯", ns="u8", otype="product", attrs=None, 
 
 
 @pytest.fixture(autouse=True)
-def _auto_ack_for_auto_machinery_tests(monkeypatch):
-    """PR-E（P0-07）：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
-    统一注入有效当日 ack；硬关默认态的独立断言见 test_auto_gate_* 系列。"""
+def _auto_ack_for_auto_machinery_tests(monkeypatch, tmp_path):
+    """PR-E（P0-07）→ P1-13：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
+    统一签发当日**签名 manifest** ack（HMAC-SHA256 密钥+manifest+签名三件套缺一不可）；
+    硬关默认态与验签负例的独立断言见 test_ontology_resolve.py 的 test_auto_gate_* 系列。"""
+    import hashlib
+    import hmac as _hmac
+    import json as _json
     from datetime import date
-    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
-                       f"test:{date.today().isoformat()}:deadbeefcafe")
+    body = _json.dumps({"op": "unit-test", "date": date.today().isoformat(),
+                        "docset": "unit-test fixtures", "gt_summary": "n/a（单测机制验证）",
+                        "signer": "pytest"}, ensure_ascii=False).encode("utf-8")
+    manifest = tmp_path / "ack_manifest.json"
+    manifest.write_bytes(body)
+    key = "unit-test-ack-key"
+    sig = _hmac.new(key.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    monkeypatch.setenv("RAG_ONTOLOGY_ACK_HMAC_KEY", key)
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK", f"{manifest}:{sig}")
 
 @pytest.fixture()
 def store():
@@ -76,7 +87,7 @@ def test_mention_reobservation_aggregates(store):
 
 def test_mention_mode_still_auto_aliases_unique_high_conf(store):
     """观测语义只收铸对象权：同型同名唯一高置信照走 auto 别名（愈合同物多号）。"""
-    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"})
+    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
     rep = backfill_snapshot(store, _ListSource([_rec("LX620-ALT")]), dry_run=False)
     assert (rep.minted, rep.auto_aliased, rep.cases_opened) == (0, 1, 0)
     alias = store.get_active_identifier("u8", "LX620-ALT")
@@ -85,8 +96,8 @@ def test_mention_mode_still_auto_aliases_unique_high_conf(store):
 
 def test_mention_mode_multi_candidate_still_case(store):
     """三禁不因模式而松动：多候选恒 case。"""
-    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"})
-    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"})
+    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
+    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
     rep = backfill_snapshot(store, _ListSource([
         _rec("SQ370", title="PP水杯370ml")]), dry_run=False)
     assert (rep.minted, rep.auto_aliased, rep.cases_opened) == (0, 0, 1)
@@ -113,10 +124,10 @@ def test_seeding_default_still_mints(store):
 def _zombie_store():
     """尸案现场：active 别名已在，open case 还挂着（历史积压/跨路径竞态遗留）。"""
     s = MemoryOntologyStore()
-    obj = s.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"})
+    obj = s.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
     ident_id = s.insert_identifier("u8", "LX620-50", "LX620-50", obj["object_id"],
                                    method="seed", relation="canonical",
-                                   confidence=1.0, confirmed_by="auto")
+                                   confidence=1.0, confirmed_by="auto", _caller="test")
     case_id = s.upsert_case("u8", "LX620-50", "LX620-50", object_type_hint="product",
                             evidence={"source": "legacy"})
     return s, ident_id, case_id
@@ -137,7 +148,7 @@ def test_heal_on_skip_active_closes_zombie_case():
 
 def test_heal_on_alias_landing_links_source_case(store):
     """观测先入 case，后来 auto 别名落成 → case 闭环且 identifier 溯源挂 source_case_id。"""
-    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"})
+    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
     case_id = store.upsert_case("u8", "LX620-ALT", "LX620-ALT",
                                 object_type_hint="product", evidence={"source": "backfill"})
     rep = backfill_snapshot(store, _ListSource([_rec("LX620-ALT")]), dry_run=False)
@@ -160,11 +171,11 @@ def test_dry_real_parity_including_heals():
     """dry 与真跑同账（含批内先后效应：批内 case 被批内后到的 auto 别名愈合）。"""
     def prepped():
         s = MemoryOntologyStore()
-        s.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"})
+        s.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
         obj2 = s.mint_object("product", "PP水杯370ml", owner_dept="pmc",
-                             golden={"材质": "PP"})
+                             golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
         s.insert_identifier("u8", "STALE-1", "STALE-1", obj2["object_id"],
-                            method="manual", confidence=1.0)
+                            method="manual", confidence=1.0, _caller="test")
         s.upsert_case("u8", "STALE-1", "STALE-1", object_type_hint="product",
                       evidence={"source": "legacy"})
         return s
@@ -189,7 +200,7 @@ def test_dry_real_parity_including_heals():
 def test_batch_internal_heal_closes_real_case():
     """真跑批内愈合：J7 先入 case 后被同批 auto 别名闭环，identifier 挂上真 case_id。"""
     store = MemoryOntologyStore()
-    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"})
+    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
     backfill_snapshot(store, _ListSource([
         _rec("J7", title="孤例乙"),
         _rec("J7"),

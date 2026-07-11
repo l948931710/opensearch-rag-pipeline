@@ -21,10 +21,11 @@ authz.py — 本体对象级 ACL 的**单一实现**（PR-B，P0-01/02 收口）
 """
 from __future__ import annotations
 
-from typing import Any, Collection, Dict, Optional
+from typing import Any, Collection, Dict, List, Optional, Tuple
 
 __all__ = [
     "MASKED_TITLE",
+    "acl_read_predicate_sql",
     "can_mutate_identity",
     "can_read_object",
     "visible_title",
@@ -44,6 +45,30 @@ def can_read_object(obj: Optional[Dict[str, Any]], *, acl: Collection[str],
         return True
     dept = obj.get("owner_dept")
     return bool(dept) and dept in set(acl or ())
+
+
+def acl_read_predicate_sql(*, acl: Collection[str], bypass_acl: bool = False,
+                           column_prefix: str = "") -> Tuple[str, List[Any]]:
+    """``can_read_object`` 的 **SQL 谓词形态**（P0-A②③：搜索/计数把 ACL 下推到查询层，
+    LIMIT/COUNT 只作用在授权集合上——绝不"先 limit 再逐行 filter"）。
+
+    与 ``can_read_object`` 同模块互相印照（单一来源，防语义漂移——两者必须同步演进）：
+    - bypass → ``1=1``（kb_admin 等特权，调用方显式声明）；
+    - 其余 → ``data_classification='public' OR owner_dept IN (acl)``；acl 为空只剩 public。
+    - NULL 语义与行级判定一致 fail-closed：``NULL='public'`` 为 UNKNOWN（不可见）、
+      ``NULL IN (...)`` 为 UNKNOWN（不可见）——行缺列宁可少给。
+
+    返回 ``(where_fragment, params)``；fragment 自带括号，可直接 ``AND`` 拼接。
+    column_prefix 供带表别名的查询（如 ``o.``）。
+    """
+    if bypass_acl:
+        return "1=1", []
+    pub = f"{column_prefix}data_classification = 'public'"
+    depts = sorted({str(d) for d in (acl or ()) if d})   # 去空去重排序：SQL 确定性
+    if not depts:
+        return f"({pub})", []
+    marks = ",".join(["%s"] * len(depts))
+    return f"({pub} OR {column_prefix}owner_dept IN ({marks}))", list(depts)
 
 
 def visible_title(title: Optional[str], data_classification: Optional[str],

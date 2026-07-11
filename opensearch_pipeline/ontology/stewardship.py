@@ -89,3 +89,22 @@ def resolve_steward(rows: List[dict], *, object_type: Optional[str] = None,
         if hit:
             return hit
     return None
+
+
+def effective_steward_depts(scope_row: Optional[dict]) -> List[str]:
+    """scope 命中行 → **有效 steward 部门列表**（P1-11：backup_dept 是代理管家，
+    授权语义与 steward_dept 等同——此前 seeds 存了 backup_dept 但授权侧从不认，
+    代理机制实际不可用）。
+
+    顺序固定 [steward_dept, backup_dept]（去重、去空）；未命中/None → []。
+    审批路由把该列表 join 成 CSV 写 approver_scope（如 "pmc,rd"），
+    工作台授权把它与 dept_admin 的 managed 集求交。
+    """
+    if not scope_row:
+        return []
+    out: List[str] = []
+    for key in ("steward_dept", "backup_dept"):
+        dept = scope_row.get(key)
+        if dept and dept not in out:
+            out.append(dept)
+    return out

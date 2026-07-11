@@ -37,12 +37,23 @@ def _rec(raw, title="6.2口径龙虾杯", ns="u8", otype="product", attrs=None, 
 
 
 @pytest.fixture(autouse=True)
-def _auto_ack_for_auto_machinery_tests(monkeypatch):
-    """PR-E（P0-07）：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
-    统一注入有效当日 ack；硬关默认态的独立断言见 test_auto_gate_* 系列。"""
+def _auto_ack_for_auto_machinery_tests(monkeypatch, tmp_path):
+    """PR-E（P0-07）→ P1-13：auto 默认硬关（候选-only）——本文件测的是 auto 机制本身，
+    统一签发当日**签名 manifest** ack（HMAC-SHA256 密钥+manifest+签名三件套缺一不可）；
+    硬关默认态与验签负例的独立断言见 test_ontology_resolve.py 的 test_auto_gate_* 系列。"""
+    import hashlib
+    import hmac as _hmac
+    import json as _json
     from datetime import date
-    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK",
-                       f"test:{date.today().isoformat()}:deadbeefcafe")
+    body = _json.dumps({"op": "unit-test", "date": date.today().isoformat(),
+                        "docset": "unit-test fixtures", "gt_summary": "n/a（单测机制验证）",
+                        "signer": "pytest"}, ensure_ascii=False).encode("utf-8")
+    manifest = tmp_path / "ack_manifest.json"
+    manifest.write_bytes(body)
+    key = "unit-test-ack-key"
+    sig = _hmac.new(key.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    monkeypatch.setenv("RAG_ONTOLOGY_ACK_HMAC_KEY", key)
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK", f"{manifest}:{sig}")
 
 @pytest.fixture()
 def store():
@@ -122,8 +133,8 @@ def test_suffix_without_base_is_plain_mint(store):
 
 def test_multi_title_match_denied_auto(store):
     """库里已有两个同名对象（历史重复品）→ 多候选 → case，绝不 auto 挑一个。"""
-    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"})
-    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"})
+    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
+    store.mint_object("product", "PP水杯370ml", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
     rep = seed_snapshot(store, _ListSource([
         _rec("SQ370", title="PP水杯370ml", attrs={"材质": "PP"})]), dry_run=False)
     assert (rep.minted, rep.auto_aliased, rep.cases_opened) == (0, 0, 1)
@@ -133,7 +144,7 @@ def test_multi_title_match_denied_auto(store):
 
 def test_crash_resume_self_heals_orphan_object(store):
     """崩溃在铸对象后、落别名前：重跑经同名聚类 auto 补上别名，不再铸第二个对象。"""
-    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"})
+    store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", golden={"材质": "PP"}, _caller="test", allow_missing_provenance=True)
     rep = seed_snapshot(store, _ListSource([_rec("LX620-50")]), dry_run=False)
     assert (rep.minted, rep.auto_aliased) == (0, 1)
     assert len(store.find_objects("product")) == 1

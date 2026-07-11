@@ -120,25 +120,25 @@ def _build_sku(store, *, with_product=True, packing=("verified",), stacking=(),
     """product ← sku ← spec×N。返回 ids 便于断言。"""
     out = {"specs": []}
     sku = store.mint_object("sku", _title("龙虾杯50x20"), owner_dept="marketing",
-                            golden={"规格": "50×20"}, data_classification=sku_cls)
+                            golden={"规格": "50×20"}, data_classification=sku_cls, _caller="test", allow_missing_provenance=True)
     out["sku"] = sku
     if with_product:
-        prod = store.mint_object("product", _title("6.2口径龙虾杯"), owner_dept="marketing")
-        store.add_link(sku["object_id"], prod["object_id"], "sku_of_product")
+        prod = store.mint_object("product", _title("6.2口径龙虾杯"), owner_dept="marketing", _caller="test")
+        store.add_link(sku["object_id"], prod["object_id"], "sku_of_product", _caller="test")
         out["product"] = prod
     for state in packing:
         sp = store.mint_object("packing_spec", _title("箱规"), owner_dept=spec_dept,
                                golden={"box_type": "A=T5", "per_box": 50,
                                        "outer_dim": "60×40×50cm"},
-                               data_classification=spec_cls, lifecycle_state=state)
-        store.add_link(sp["object_id"], sku["object_id"], "packing_spec_of_sku")
+                               data_classification=spec_cls, lifecycle_state=state, _caller="test", allow_missing_provenance=True)
+        store.add_link(sp["object_id"], sku["object_id"], "packing_spec_of_sku", _caller="test")
         out["specs"].append(sp)
     for state in stacking:
         st = store.mint_object("stacking_spec", _title("香规"), owner_dept=spec_dept,
                                golden={"stack_mode": "口对口", "per_stack": 25,
                                        "container_cbm": 68},
-                               data_classification=spec_cls, lifecycle_state=state)
-        store.add_link(st["object_id"], sku["object_id"], "stacking_spec_of_sku")
+                               data_classification=spec_cls, lifecycle_state=state, _caller="test", allow_missing_provenance=True)
+        store.add_link(st["object_id"], sku["object_id"], "stacking_spec_of_sku", _caller="test")
         out["stacks"] = out.get("stacks", []) + [st]
     return out
 
@@ -147,20 +147,20 @@ def _build_sku(store, *, with_product=True, packing=("verified",), stacking=(),
 
 
 def test_add_link_idempotent(store):
-    a = store.mint_object("product", _title("甲"), owner_dept="pmc")
-    b = store.mint_object("sku", _title("甲-50"), owner_dept="pmc")
-    l1 = store.add_link(b["object_id"], a["object_id"], "sku_of_product")
-    l2 = store.add_link(b["object_id"], a["object_id"], "sku_of_product")
+    a = store.mint_object("product", _title("甲"), owner_dept="pmc", _caller="test")
+    b = store.mint_object("sku", _title("甲-50"), owner_dept="pmc", _caller="test")
+    l1 = store.add_link(b["object_id"], a["object_id"], "sku_of_product", _caller="test")
+    l2 = store.add_link(b["object_id"], a["object_id"], "sku_of_product", _caller="test")
     assert l1 == l2
     assert len(store.list_links(src_object_id=b["object_id"])) == 1
 
 
 def test_list_links_filters(store):
-    a = store.mint_object("product", _title("甲"), owner_dept="pmc")
-    b = store.mint_object("sku", _title("甲-50"), owner_dept="pmc")
-    c = store.mint_object("packing_spec", _title("箱规"), owner_dept="pmc")
-    store.add_link(b["object_id"], a["object_id"], "sku_of_product")
-    store.add_link(c["object_id"], b["object_id"], "packing_spec_of_sku")
+    a = store.mint_object("product", _title("甲"), owner_dept="pmc", _caller="test")
+    b = store.mint_object("sku", _title("甲-50"), owner_dept="pmc", _caller="test")
+    c = store.mint_object("packing_spec", _title("箱规"), owner_dept="pmc", _caller="test")
+    store.add_link(b["object_id"], a["object_id"], "sku_of_product", _caller="test")
+    store.add_link(c["object_id"], b["object_id"], "packing_spec_of_sku", _caller="test")
     assert len(store.list_links(dst_object_id=b["object_id"])) == 1
     assert len(store.list_links(link_type="sku_of_product",
                                 src_object_id=b["object_id"])) == 1
@@ -169,7 +169,7 @@ def test_list_links_filters(store):
 
 
 def test_get_object_by_ref(store):
-    a = store.mint_object("mold", _title("模-1"), owner_dept="rd")
+    a = store.mint_object("mold", _title("模-1"), owner_dept="rd", _caller="test")
     hit = store.get_object_by_ref(a["canonical_ref"])
     assert hit and hit["object_id"] == a["object_id"]
     assert store.get_object_by_ref("FLP-P-999999") is None
@@ -264,7 +264,7 @@ def test_lookup_by_canonical_ref_and_raw_alias(mstore):
     assert lookup_specs(mstore, ref, acl_groups=grp).resolved
     assert lookup_specs(mstore, ref.lower(), acl_groups=grp).resolved   # 大小写宽容
     mstore.insert_identifier("u8", "LX620-50", "LX620-50", built["sku"]["object_id"],
-                             method="manual", confidence=1.0)
+                             method="manual", confidence=1.0, _caller="test")
     ans = lookup_specs(mstore, "lx620-50", namespace="u8", acl_groups=grp)
     assert ans.resolved and ans.specs["packing"] is not None
 

@@ -57,7 +57,7 @@ def _identity(user_id="admin1", role="kb_admin", managed=(), acl=("pmc",)):
 
 
 def _seed_case(store, ns="u8", raw="abc123-m", hint="product", with_candidate=True):
-    obj = store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc")
+    obj = store.mint_object("product", "6.2口径龙虾杯", owner_dept="pmc", _caller="test")
     case_id = store.upsert_case(ns, raw, raw.upper(), object_type_hint=hint,
                                 evidence={"source": "test"})
     if with_candidate:
@@ -122,9 +122,9 @@ def test_workbench_freq_order(store):
 def test_coverage_with_manual_review_rate(store):
     obj, _ = _seed_case(store)
     store.insert_identifier("u8", "x1", "X1", obj["object_id"], method="seed",
-                            confirmed_by="auto")
+                            confirmed_by="auto", _caller="test")
     store.insert_identifier("u8", "x2", "X2", obj["object_id"], method="manual",
-                            confirmed_by="s1")
+                            confirmed_by="s1", _caller="test")
     cov = _client(_identity()).get("/api/ontology/coverage").json()
     assert cov["active_identifiers"] == 2 and cov["auto_active"] == 1
     assert cov["manual_review_rate"] == pytest.approx(0.5)
@@ -182,7 +182,7 @@ def test_confirm_scope_authz(store):
 
 def test_confirm_unscoped_namespace_fail_closed(store):
     """scope 未登记（lot_code 无种子）→ dept_admin 404（PR-B：scope 外同不存在）、kb_admin 放行。"""
-    obj = store.mint_object("product", "托盘", owner_dept="pmc")
+    obj = store.mint_object("product", "托盘", owner_dept="pmc", _caller="test")
     case_id = store.upsert_case("lot_code", "lt1", "LT1", object_type_hint=None)
     dept = _client(_identity(user_id="d3", role="dept_admin", managed=("pmc",)))
     assert dept.post(f"/api/ontology/cases/{case_id}/confirm",
@@ -200,12 +200,12 @@ def test_confirm_conflicts(store):
                   json={"target_object_id": "nope", "note": "测试确认"}).status_code == 422
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
                   json={"target_object_id": "0" * 26, "note": "测试确认"}).status_code == 404
-    retired = store.mint_object("product", "退役品", owner_dept="pmc")
+    retired = store.mint_object("product", "退役品", owner_dept="pmc", _caller="test")
     store.retire_object(retired["object_id"])
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
                   json={"target_object_id": retired["object_id"], "note": "测试确认"}).status_code == 409
     # 已有 active 映射 → 409
-    store.insert_identifier("u8", "abc123-m", "ABC123-M", obj["object_id"], method="manual")
+    store.insert_identifier("u8", "abc123-m", "ABC123-M", obj["object_id"], method="manual", _caller="test")
     assert c.post(f"/api/ontology/cases/{case_id}/confirm",
                   json={"target_object_id": obj["object_id"], "note": "测试确认"}).status_code == 409
     # case 已处置 → 409
@@ -257,7 +257,7 @@ def test_dismiss_requires_note_and_transitions(store):
 
 def test_deactivate_identifier(store):
     obj, _ = _seed_case(store, with_candidate=False)
-    iid = store.insert_identifier("u8", "z1", "Z1", obj["object_id"], method="seed")
+    iid = store.insert_identifier("u8", "z1", "Z1", obj["object_id"], method="seed", _caller="test")
     c = _client(_identity())
     assert c.post(f"/api/ontology/identifiers/{iid}/deactivate",
                   json={"note": "误配"}).status_code == 200
@@ -268,9 +268,9 @@ def test_deactivate_identifier(store):
 
 
 def test_repoint_identifier(store):
-    a = store.mint_object("product", "杯A", owner_dept="pmc")
-    b = store.mint_object("product", "杯B", owner_dept="pmc")
-    iid = store.insert_identifier("u8", "p1", "P1", a["object_id"], method="seed")
+    a = store.mint_object("product", "杯A", owner_dept="pmc", _caller="test")
+    b = store.mint_object("product", "杯B", owner_dept="pmc", _caller="test")
+    iid = store.insert_identifier("u8", "p1", "P1", a["object_id"], method="seed", _caller="test")
     c = _client(_identity())
     r = c.post(f"/api/ontology/identifiers/{iid}/repoint",
                json={"target_object_id": b["object_id"], "target_revision": "r2"})
@@ -292,23 +292,23 @@ def test_repoint_identifier(store):
 
 def test_identifier_scope_authz_uses_object_type(store):
     """identifier 纠错的 scope 走目标对象类型：material→supply 的 dept_admin 可操作。"""
-    mat = store.mint_object("material", "PP-1100", owner_dept="supply")
+    mat = store.mint_object("material", "PP-1100", owner_dept="supply", _caller="test")
     iid = store.insert_identifier("material_grade", "pp-1100", "PP-1100",
-                                  mat["object_id"], method="seed")
+                                  mat["object_id"], method="seed", _caller="test")
     supply_admin = _client(_identity(user_id="s1", role="dept_admin", managed=("supply",)))
     assert supply_admin.post(f"/api/ontology/identifiers/{iid}/deactivate",
                              json={}).status_code == 200
-    mat2 = store.mint_object("material", "PP-2200", owner_dept="supply")
+    mat2 = store.mint_object("material", "PP-2200", owner_dept="supply", _caller="test")
     iid2 = store.insert_identifier("material_grade", "pp-2200", "PP-2200",
-                                   mat2["object_id"], method="seed")
+                                   mat2["object_id"], method="seed", _caller="test")
     pmc_admin = _client(_identity(user_id="p1", role="dept_admin", managed=("pmc",)))
     assert pmc_admin.post(f"/api/ontology/identifiers/{iid2}/deactivate",
                           json={}).status_code == 403
 
 
 def test_retire_and_mark_duplicate(store):
-    a = store.mint_object("product", "重复品A", owner_dept="pmc")
-    b = store.mint_object("product", "正主B", owner_dept="pmc")
+    a = store.mint_object("product", "重复品A", owner_dept="pmc", _caller="test")
+    b = store.mint_object("product", "正主B", owner_dept="pmc", _caller="test")
     c = _client(_identity())
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
                   json={"merged_into": b["object_id"]}).status_code == 200
@@ -323,8 +323,8 @@ def test_retire_and_mark_duplicate(store):
 
 
 def test_mark_duplicate_validation(store):
-    a = store.mint_object("product", "甲", owner_dept="pmc")
-    b = store.mint_object("product", "乙", owner_dept="pmc")
+    a = store.mint_object("product", "甲", owner_dept="pmc", _caller="test")
+    b = store.mint_object("product", "乙", owner_dept="pmc", _caller="test")
     store.retire_object(b["object_id"])
     c = _client(_identity())
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
@@ -345,7 +345,7 @@ def test_existence_non_leak_matrix(store):
     核心不变量：无权者拿到的响应与"资源不存在"逐位一致（404 / 空列表）。"""
     obj, case_id = _seed_case(store)                     # steward=pmc, obj internal owner=pmc
     conf = store.mint_object("material", "机密料", owner_dept="supply",
-                             data_classification="confidential")
+                             data_classification="confidential", _caller="test")
     # 员工：读侧一律 403（连队列入口都没有）
     emp = _client(_identity(user_id="e1", role="employee"))
     assert emp.get("/api/ontology/workbench").status_code == 403
@@ -370,7 +370,7 @@ def test_existence_non_leak_matrix(store):
 def test_workbench_candidate_cross_dept_target_masked(store):
     """case 可见但候选目标跨部门不可读 → target_visible=False，ref/title/type 全空。"""
     conf = store.mint_object("material", "机密牌号", owner_dept="supply",
-                             data_classification="confidential")
+                             data_classification="confidential", _caller="test")
     case_id = store.upsert_case("u8", "m9", "M9", object_type_hint="product")
     store.add_candidate(case_id, conf["object_id"], method="embedding", confidence=0.8)
     mine = _client(_identity(user_id="dp", role="dept_admin", managed=("pmc",)))
@@ -384,7 +384,7 @@ def test_workbench_candidate_cross_dept_target_masked(store):
 def test_confirm_cross_dept_confidential_target_denied(store):
     """P0-01 原始场景：营销 steward 不能把客户编号映射到供应链 confidential material。"""
     conf = store.mint_object("material", "机密料", owner_dept="supply",
-                             data_classification="confidential")
+                             data_classification="confidential", _caller="test")
     case_id = store.upsert_case("customer:KFC", "K1", "K1", object_type_hint=None)
     mkt = _client(_identity(user_id="mk", role="dept_admin", managed=("marketing",)))
     r = mkt.post(f"/api/ontology/cases/{case_id}/confirm",
@@ -395,7 +395,7 @@ def test_confirm_cross_dept_confidential_target_denied(store):
 
 def test_confirm_type_mismatch_denied(store):
     """case 期望类型与目标不一致 → 400（product hint 不能确认到 material）。"""
-    obj = store.mint_object("material", "PP料", owner_dept="pmc")
+    obj = store.mint_object("material", "PP料", owner_dept="pmc", _caller="test")
     case_id = store.upsert_case("u8", "m1", "M1", object_type_hint="product")
     r = _client(_identity()).post(f"/api/ontology/cases/{case_id}/confirm",
                                   json={"target_object_id": obj["object_id"], "note": "测试确认"})
@@ -404,9 +404,9 @@ def test_confirm_type_mismatch_denied(store):
 
 def test_repoint_cross_type_denied(store):
     """改指跨类型默认拒（旧目标 product → 新目标 material = 400）。"""
-    a = store.mint_object("product", "甲", owner_dept="pmc")
-    m = store.mint_object("material", "PP料", owner_dept="pmc")
-    iid = store.insert_identifier("u8", "z9", "Z9", a["object_id"], method="seed")
+    a = store.mint_object("product", "甲", owner_dept="pmc", _caller="test")
+    m = store.mint_object("material", "PP料", owner_dept="pmc", _caller="test")
+    iid = store.insert_identifier("u8", "z9", "Z9", a["object_id"], method="seed", _caller="test")
     r = _client(_identity()).post(f"/api/ontology/identifiers/{iid}/repoint",
                                   json={"target_object_id": m["object_id"]})
     assert r.status_code == 400 and "类型" in r.json()["detail"]
@@ -455,7 +455,7 @@ def test_confirm_requires_note(store):
 
 def test_coverage_dual_denominator(store):
     obj, _ = _seed_case(store)
-    store.insert_identifier("u8", "c1", "C1", obj["object_id"], method="seed")
+    store.insert_identifier("u8", "c1", "C1", obj["object_id"], method="seed", _caller="test")
     c = _client(_identity())
     cov = c.get("/api/ontology/coverage").json()
     assert cov["denominator"] == "approx" and cov["population_records"] is None
@@ -469,8 +469,8 @@ def test_coverage_dual_denominator(store):
 def test_objects_search_reports_truncation_and_exact_first(store):
     """PR-H P1「召回截断可观测」：total/truncated 出参；精确同名排最前。"""
     for i in range(4):
-        store.mint_object("product", f"龙虾杯{i}", owner_dept="pmc")
-    store.mint_object("product", "龙虾杯", owner_dept="pmc")     # 精确同名（铸序最晚）
+        store.mint_object("product", f"龙虾杯{i}", owner_dept="pmc", _caller="test")
+    store.mint_object("product", "龙虾杯", owner_dept="pmc", _caller="test")     # 精确同名（铸序最晚）
     c = _client(_identity())
     r = c.get("/api/ontology/objects?object_type=product&q=龙虾杯&limit=3").json()
     assert r["total"] == 5 and r["truncated"] is True

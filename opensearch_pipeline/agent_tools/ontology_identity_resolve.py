@@ -5,8 +5,14 @@ ontology_identity_resolve.py — 受治理动作「铸/确认身份别名」（�
 **LOW_WRITE + approval_policy="always"**：Policy 风险基线（policy.py 只减不增）把任何授予
 上收为 REQUIRE_APPROVAL——模型提案本工具**必然挂起**走 v2 审批四处置，绝无绕行。
 审批路由不走"发起人部门"，走 **per-attr steward**（approval_store 的 approver_scope
-解析器 seam：本工具构造时注册，按 stewardship scope 裁决；scope 未登记/解析失败 →
-'' = 仅 kb_admin 可审，fail-closed）。
+解析器 seam：本工具构造时注册，按 stewardship scope 裁决，scope 行带 backup_dept 时
+输出 CSV "steward,backup"（P1-11）；scope 未登记/解析失败 → '' = 仅 kb_admin 可审，
+fail-closed）。
+
+**发起人对象级 ACL（P0-B）**：propose（_approver_scope 携 ctx 时）与真正落库（run）
+都以服务端注入的 ctx.acl_groups 过 **authz.can_mutate_identity**（与工作台
+confirm/repoint/merge 同一实现）——目标不可见与不存在**同答**；审批人的职责范围
+（approval_scope 重验）只是额外条件，绝不替代发起人自身的对象权限。
 
 写语义（服务端受控，S1 四路径之一）：
 - 同 (namespace, norm) 已有 active 且指向同一目标（含 revision 一致）→ **幂等成功**
@@ -28,11 +34,47 @@ from opensearch_pipeline.agent_runtime.tool import (
     ToolResult,
     ToolSpec,
 )
-from opensearch_pipeline.ontology.authz import visible_title as _authz_visible_title
+from opensearch_pipeline.ontology.authz import (
+    MASKED_TITLE,
+    can_mutate_identity,
+    visible_title as _authz_visible_title,
+)
+
+# P0-B②：不可见与不存在**同答**的唯一失败文案（can_mutate_identity 对 None 目标与
+# 不可读目标返回同一原因，这里再归并成同一串出参——错误消息/结构逐字节一致）
+_TARGET_NOT_FOUND_MSG = "目标对象不存在（先用 ontology_resolve 查询候选）"
 
 
-def _visible_title(title, data_classification, owner_dept, acl):
-    return _authz_visible_title(title, data_classification, owner_dept, acl=acl)
+def _requester_acl(ctx) -> set:
+    """requester 对象级 ACL = 服务端注入的 ctx.acl_groups（ExecutionContext 服务端构造、
+    请求体不可伪造）。**无 kb_admin bypass**——agent 通道与 ontology_resolve 读工具同纪律，
+    特权操作走工作台（routes/ontology.py 才有 _reader_acl 的 bypass 语义）。"""
+    return set(getattr(ctx, "acl_groups", ()) or ())
+
+
+def _gate_target(target, acl: set) -> Optional[str]:
+    """P0-B①：发起人对目标对象的写闸——与工作台 confirm/repoint/merge **同一个**
+    authz.can_mutate_identity（单一授权实现）。返回 None=放行，否则统一化的失败文案；
+    不可见/不存在归并为 _TARGET_NOT_FOUND_MSG（防存在性泄露），其余原因原样带出。
+    审批人 scope 校验只是**额外**条件（run 内保留），从不替代发起人自身的对象权限。"""
+    reason = can_mutate_identity(target, acl=acl, bypass_acl=False)
+    if reason is None:
+        return None
+    if "不存在" in reason or "不可见" in reason:
+        return _TARGET_NOT_FOUND_MSG
+    return f"{reason}，不能作为映射目标"
+
+
+def _display_target(target, acl: set) -> str:
+    """成功/幂等消息里的目标展示（P0-B④）：requester ACL 门后仅可读目标可达；
+    纵深防御——标题若仍被掩码（语义漂移兜底），**绝不回退 canonical_ref**
+    （业务语义标识，掩码即为了藏它的业务身份），用不透明 object_id 占位。"""
+    title = _authz_visible_title(target.get("title"), target.get("data_classification"),
+                                 target.get("owner_dept"), acl=acl)
+    if title == MASKED_TITLE:
+        return f"{MASKED_TITLE}（对象 {target.get('object_id')}）"
+    name = title or f"对象 {target.get('object_id')}"
+    return f"{name} [{target.get('canonical_ref')}]"
 
 if TYPE_CHECKING:
     from opensearch_pipeline.agent_runtime.context import ExecutionContext
@@ -110,16 +152,33 @@ class OntologyIdentityResolveTool:
         return self._store
 
     # ── 审批路由（approval_store seam 回调）────────────────────────────────
-    def _approver_scope(self, ctx: "ExecutionContext", args: Dict[str, Any]) -> Optional[str]:
+    def _approver_scope(self, ctx: Optional["ExecutionContext"],
+                        args: Dict[str, Any]) -> Optional[str]:
         """per-attr steward：目标对象类型 + namespace → stewardship 裁决。
-        None（scope 未登记）→ seam 收敛为仅 kb_admin；异常由 seam fail-closed。"""
-        from opensearch_pipeline.ontology.stewardship import resolve_steward
+
+        返回 **CSV**（P1-11）：scope 行带 backup_dept 时为 "steward,backup"
+        （如 "pmc,rd"），否则单部门——审批决策侧（routes/agent.py）按 CSV 拆分后
+        与 managed 求交。None（scope 未登记）→ seam 收敛为仅 kb_admin；异常由 seam
+        fail-closed。
+
+        P0-B（propose 侧同闸）：ctx 非 None（create_request 挂起时点，携发起人身份）
+        且发起人过不了 can_mutate_identity → 返回 None（scope 收敛 ''=仅 kb_admin
+        可审，域 steward 的队列绝不出现发起人本就无权发起的提案）；审批时点的现算
+        （resolve_scope_live）约定传 ctx=None → 跳过该闸，执行侧 run() 的同一
+        can_mutate_identity 闸兜底。"""
+        from opensearch_pipeline.ontology.stewardship import (
+            effective_steward_depts,
+            resolve_steward,
+        )
         store = self._get_store()
-        obj = store.get_object(str(args.get("target_object_id") or "")) or {}
+        target = store.get_object(str(args.get("target_object_id") or ""))
+        if ctx is not None and _gate_target(target, _requester_acl(ctx)) is not None:
+            return None
         hit = resolve_steward(store.list_stewardship(),
                               namespace=str(args.get("namespace") or "") or None,
-                              object_type=obj.get("object_type"))
-        return hit["steward_dept"] if hit else None
+                              object_type=(target or {}).get("object_type"))
+        depts = effective_steward_depts(hit)
+        return ",".join(depts) if depts else None
 
     # ── 执行（审批放行后由 ToolExecutor 驱动）──────────────────────────────
     def run(self, ctx: "ExecutionContext", args: Dict[str, Any],
@@ -140,10 +199,14 @@ class OntologyIdentityResolveTool:
 
         store = self._get_store()
         target = store.get_object(target_id)
-        if target is None:
-            return ToolResult.fail("目标对象不存在（先用 ontology_resolve 查询候选）")
-        if target["status"] != "active":
-            return ToolResult.fail(f"目标对象非 active（{target['status']}），不能作为映射目标")
+        # P0-B①：落库前的发起人对象级 ACL 闸——服务端注入的 ctx.acl_groups 调用与工作台
+        # 同一个 authz.can_mutate_identity（可读 / active 一体裁决）。不可见与不存在同答
+        # （防存在性泄露）；该闸先于 version/scope 重验——那些错误文案会泄露不可见对象的
+        # 存在与版本。批准人的职责范围（下方 scope 校验）只是**额外**条件，不能替代
+        # 发起人自身的对象权限（外审动态探针：pmc 发起人 + supply steward 批准 ≠ 放行）。
+        denial = _gate_target(target, _requester_acl(ctx))
+        if denial is not None:
+            return ToolResult.fail(denial)
         # PR-C（P0-06 #4 落库前重验）：
         # ① 提案钉了 expected_version → 审批期间对象任何变更（golden/密级/状态经 version
         #    自增体现）即拒绝执行，要求重新提案；
@@ -188,13 +251,12 @@ class OntologyIdentityResolveTool:
             logger.exception("身份确认落库失败（详情见日志，不回模型）")
             return ToolResult.fail("身份确认落库失败（存储异常，已记录日志；请稍后重试或联系管理员）")
 
-        title = _visible_title(target.get("title"), target.get("data_classification"),
-                               target.get("owner_dept"), set(ctx.acl_groups or ()))
         rev_txt = f"（版本 {revision}）" if revision else ""
         return ToolResult.ok(
             content=[ContentBlock.of_text(
-                f"已确认：{namespace} 编号 {raw!r} → {title or target.get('canonical_ref')} "
-                f"[{target.get('canonical_ref')}]{rev_txt}，即刻生效为正式映射。")],
+                f"已确认：{namespace} 编号 {raw!r} → "
+                f"{_display_target(target, _requester_acl(ctx))}{rev_txt}，"
+                "即刻生效为正式映射。")],
             receipt={"identifier_id": identifier_id, "namespace": namespace,
                      "norm_value": norm, "target_object_id": target_id,
                      "target_revision": revision, "relation": relation,
@@ -207,12 +269,10 @@ class OntologyIdentityResolveTool:
         same_target = existing["target_object_id"] == target["object_id"]
         same_rev = (existing.get("target_revision") or None) == (revision or None)
         if same_target and same_rev:
-            title = _visible_title(target.get("title"), target.get("data_classification"),
-                                   target.get("owner_dept"), set(ctx.acl_groups or ()))
             return ToolResult.ok(
                 content=[ContentBlock.of_text(
-                    f"该编号已是 {title or target.get('canonical_ref')} "
-                    f"[{target.get('canonical_ref')}] 的正式映射（幂等，无需重复确认）。")],
+                    f"该编号已是 {_display_target(target, _requester_acl(ctx))} "
+                    "的正式映射（幂等，无需重复确认）。")],
                 receipt={"identifier_id": existing["identifier_id"],
                          "target_object_id": target["object_id"],
                          "target_revision": existing.get("target_revision"),

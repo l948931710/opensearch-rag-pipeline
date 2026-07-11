@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DuplicateActiveIdentifier",
+    "LINK_TYPE_SPECS",
+    "LinkCardinalityViolation",
     "MemoryOntologyStore",
     "RDSOntologyStore",
     "SEM_PROJECTIONS",
@@ -48,12 +50,40 @@ _SEM_PROBE_TTL_S = 300.0
 _IDENTIFIER_END_STATES = ("rejected", "superseded")
 
 # ── PR-G 服务层约束（与 027-029 的 CHECK/FK 同口径，双后端一致先行报错）────────────
-# 关系类型白名单：新增关系=受治理变更走代码 PR（DB 只兜格式 CHECK，语义在这里）
-VALID_LINK_TYPES = frozenset({
-    "sku_of_product", "packing_spec_of_sku", "stacking_spec_of_sku",
-    "mold_of_product", "material_of_product",
-})
+# 关系类型白名单 + 端点/基数契约（P1-8）：每个 link_type 声明 src/dst 对象类型与 src 侧
+# 基数。single = 同一 src 同型至多一条 active link（此前无此闸——一个 SKU 可挂两条
+# active sku_of_product，sem 视图直接翻倍/串味）。DB 级兜底见 schema/033 生成列唯一键。
+# 新增关系类型是受治理变更：走代码 PR 扩本表 + 029 注释；single 型还须同步扩 033 的
+# IN 列表（见该文件头「扩展方式」），否则 DB 兜底缺位。
+LINK_TYPE_SPECS: Dict[str, Dict[str, str]] = {
+    # 一个 SKU 只属于一个产品（双 active=同 SKU 挂两个产品的语义错配）
+    "sku_of_product":       {"src_type": "sku", "dst_type": "product",
+                             "src_cardinality": "single"},
+    # 一份箱规/香规只描述一个 SKU；同 SKU 可挂多份 spec（verified/draft 并存由 sem 挑行）
+    "packing_spec_of_sku":  {"src_type": "packing_spec", "dst_type": "sku",
+                             "src_cardinality": "single"},
+    "stacking_spec_of_sku": {"src_type": "stacking_spec", "dst_type": "sku",
+                             "src_cardinality": "single"},
+    # 一副模具对应一个产品几何（家族模/共享模属型录外情形，真出现时走治理 PR 放宽）
+    "mold_of_product":      {"src_type": "mold", "dst_type": "product",
+                             "src_cardinality": "single"},
+    # 同一牌号供多产品：multi
+    "material_of_product":  {"src_type": "material", "dst_type": "product",
+                             "src_cardinality": "multi"},
+}
+VALID_LINK_TYPES = frozenset(LINK_TYPE_SPECS)
 _VALID_LIFECYCLE_STATES = ("draft", "verified")
+
+# P1-9：泛型裸写（mint_object / insert_identifier / add_link）的调用方声明——只应经
+# S1 四路径（播种/回填/工作台/受治理 Action）或测试进入；未声明即拒。这不是加密屏障，
+# 是让每个绕过生命周期方法的写点显式、可 grep、可评审；复合原子写
+# （mint_object_with_alias / confirm_case_with_identifier / insert_identifier_closing_case
+# / repoint_identifier 等 S3 生命周期方法）是受祝福入口，不设此闸。
+_GOVERNED_WRITE_CALLERS = frozenset({
+    "seeding", "backfill", "steward_workbench", "governed_action",
+    "store_internal",   # 仅 store 复合写内部委托（Memory mint_object_with_alias→mint_object）
+    "test",
+})
 
 
 def _check_confidence(v: float) -> None:
@@ -74,21 +104,72 @@ def _check_lifecycle(state: str) -> None:
 
 def _check_owner_dept(dept: str) -> None:
     """owner_dept 必须是既有 ACL 组码（kb_authz 白名单单一来源）——sem/authz 的行过滤
-    按 owner_dept ∈ acl 判定，私造组码=对象对所有人不可见的静默黑洞。白名单加载失败
-    （极简 pod 缺依赖）→ 告警放行（graceful degradation：辅助校验不阻断主流程）。"""
+    按 owner_dept ∈ acl 判定，私造组码=对象对所有人不可见的静默黑洞。
+
+    P2 收口（2026-07-11 外评）：白名单加载失败 → **fail-closed 拒绝写入**。旧行为是
+    告警放行——治理控制面的准入校验被"环境缺依赖"静默关掉，正是审计点名的 fail-open；
+    校验做不了就不写，绝不带病放行。"""
     try:
         from opensearch_pipeline.kb_authz import _valid_owner_depts
         whitelist = _valid_owner_depts()
-    except Exception:   # noqa: BLE001
-        logger.warning("owner_dept 白名单不可用，跳过校验（dept=%s）", dept)
-        return
+    except Exception as e:   # noqa: BLE001
+        raise RuntimeError(
+            f"owner_dept 白名单不可用（kb_authz 加载失败：{e}）——治理控制面 fail-closed，"
+            "拒绝写入；请先修复运行环境（缺依赖/坏配置），不降级放行") from e
     if dept not in whitelist:
         raise ValueError(f"owner_dept {dept!r} 不在 ACL 组码白名单（私造组码会让对象"
                          "对所有人不可见；新组码走 user_role→白名单→灰度 的独立 PR）")
 
 
+def _check_caller(caller: Optional[str], method: str) -> None:
+    """P1-9：裸写原语须显式声明调用路径——bypass 生命周期的写点全部可 grep 可评审。"""
+    if caller not in _GOVERNED_WRITE_CALLERS:
+        raise PermissionError(
+            f"{method} 是绕过生命周期的裸写原语（P1-9）——须显式 _caller ∈ "
+            f"{sorted(_GOVERNED_WRITE_CALLERS - {'store_internal'})}，得到 {caller!r}；"
+            "业务代码请改走 mint_object_with_alias / confirm_case_with_identifier / "
+            "insert_identifier_closing_case 等原子生命周期方法")
+
+
+def _check_link_endpoints(link_type: str, src: Optional[Dict[str, Any]],
+                          dst: Optional[Dict[str, Any]]) -> None:
+    """P1-8 端点校验：存在、active、类型匹配 LINK_TYPE_SPECS（双后端同文案，契约测试钉住）。"""
+    spec = LINK_TYPE_SPECS[link_type]
+    if src is None or dst is None:
+        raise ValueError("link 端点对象不存在（FK 拦截）")
+    for role, row, want in (("src", src, spec["src_type"]), ("dst", dst, spec["dst_type"])):
+        if row.get("status") != "active":
+            raise ValueError(f"link {role} 端点 {row.get('object_id')} 非 active"
+                             f"（status={row.get('status')}）——退役/合并对象不得再建关系")
+        if row.get("object_type") != want:
+            raise ValueError(
+                f"link_type {link_type!r} 要求 {role}={want}，得到 "
+                f"{row.get('object_type')!r}（端点类型错配是 sem 投影串味的根源）")
+
+
+def _check_golden_provenance(golden_attrs, provenance: Optional[Dict[str, Any]], *,
+                             allow_missing: bool, where: str) -> None:
+    """P1-10 fail-closed：golden 属性值必须随值级溯源（sor_system/as_of）落库，缺失即拒。
+    allow_missing_provenance=True 是测试/显式声明无源数据的逃生口——生产调用方
+    （seeding/backfill/工作台）不得使用（评审红线，grep 可查）。"""
+    if allow_missing or not golden_attrs:
+        return
+    prov = provenance or {}
+    missing = sorted(a for a in golden_attrs if not prov.get(a))
+    if missing:
+        raise ValueError(
+            f"{where}: golden 属性 {missing} 缺值级 provenance——没有溯源的黄金值会悄悄"
+            "变成业务事实副本（P1-10 fail-closed）；确属无源数据须显式 "
+            "allow_missing_provenance=True")
+
+
 class DuplicateActiveIdentifier(Exception):
     """同 (namespace, norm_value) 已有 active 别名——撞 uk_ns_norm_active。"""
+
+
+class LinkCardinalityViolation(Exception):
+    """single 基数 link 已有指向其他对象的 active 行（P1-8）——先 retire 旧关系
+    （S3 纠错）再建新，绝不静默双活。"""
 
 
 def _dump(obj: Any) -> Optional[str]:
@@ -155,11 +236,18 @@ class RDSOntologyStore:
                     provenance: Optional[Dict[str, Any]] = None,
                     data_classification: str = "internal",
                     source_of_record: str = "ontology",
-                    lifecycle_state: str = "draft") -> Dict[str, Any]:
+                    lifecycle_state: str = "draft",
+                    allow_missing_provenance: bool = False,
+                    _caller: Optional[str] = None) -> Dict[str, Any]:
         """铸 canonical 对象：ref_seq 原子取号 + INSERT，同一事务。
-        object_type 未在 ontology_ref_seq 登记 → ValueError（登记类型码是治理动作，不静默造号）。"""
+        object_type 未在 ontology_ref_seq 登记 → ValueError（登记类型码是治理动作，不静默造号）。
+        P1-9：裸铸（无别名）须显式 _caller；业务路径请走 mint_object_with_alias。
+        P1-10：golden 非空须随属性级 provenance（fail-closed）。"""
+        _check_caller(_caller, "mint_object")
         _check_owner_dept(owner_dept)
         _check_lifecycle(lifecycle_state)
+        _check_golden_provenance(set(golden or {}), provenance,
+                                 allow_missing=allow_missing_provenance, where="mint_object")
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -239,22 +327,98 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
-    def update_golden(self, object_id: str, golden: Dict[str, Any], *,
-                      expected_version: int,
-                      provenance: Optional[Dict[str, Any]] = None) -> bool:
-        """乐观锁 CAS：版本不匹配返回 False（调用方重取重试）。
-        provenance（PR-H P1）：本次改动属性的值级溯源，按 attr 合并进
-        golden_provenance_json（不带=保留旧溯源——但新事实值应始终随溯源写入）。"""
+    def search_objects_authorized(self, object_type: str, *, acl,
+                                  bypass_acl: bool = False,
+                                  title_like: Optional[str] = None,
+                                  status: str = "active",
+                                  limit: int = 50) -> List[Dict[str, Any]]:
+        """find_objects 的**授权版**（P0-A②③）：对象级 ACL 谓词下推到 SQL——
+        LIMIT 作用在授权集合上，不可见行既不出库也不挤占页位（旧"先 limit 再逐行
+        filter"会被排前面的隐藏行饿死可见结果）。谓词与 authz.can_read_object
+        单一来源（acl_read_predicate_sql 同模块互相印照）。"""
+        from opensearch_pipeline.ontology.authz import acl_read_predicate_sql
+        frag, acl_params = acl_read_predicate_sql(acl=acl, bypass_acl=bypass_acl)
+        db, conn = self._db(), self._conn()
+        limit = max(1, min(int(limit), 200))
+        try:
+            with conn.cursor() as cur:
+                sql = (f"SELECT object_id, object_type, canonical_ref, title, lifecycle_state, "
+                       f"owner_dept, data_classification, status FROM {db}.ontology_object "
+                       "WHERE object_type=%s AND status=%s")
+                params: List[Any] = [object_type, status]
+                if title_like:
+                    sql += " AND title LIKE %s"
+                    params.append(f"%{title_like}%")
+                sql += f" AND {frag}"
+                params.extend(acl_params)
+                cur.execute(sql + " ORDER BY canonical_ref LIMIT %s", (*params, limit))
+                return self._rows_to_dicts(cur)
+        finally:
+            conn.close()
+
+    def count_objects_authorized(self, object_type: str, *, acl,
+                                 bypass_acl: bool = False,
+                                 title_like: Optional[str] = None,
+                                 status: str = "active") -> int:
+        """count_objects 的授权版（P0-A②）：total/truncated 只计**可见集合**——
+        未授权的全量计数会泄露不可见对象的存在与数量。谓词同 search_objects_authorized。"""
+        from opensearch_pipeline.ontology.authz import acl_read_predicate_sql
+        frag, acl_params = acl_read_predicate_sql(acl=acl, bypass_acl=bypass_acl)
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
-                if provenance:
+                sql = (f"SELECT COUNT(*) FROM {db}.ontology_object "
+                       "WHERE object_type=%s AND status=%s")
+                params: List[Any] = [object_type, status]
+                if title_like:
+                    sql += " AND title LIKE %s"
+                    params.append(f"%{title_like}%")
+                sql += f" AND {frag}"
+                params.extend(acl_params)
+                cur.execute(sql, params)
+                return int(cur.fetchone()[0])
+        finally:
+            conn.close()
+
+    def update_golden(self, object_id: str, golden: Dict[str, Any], *,
+                      expected_version: int,
+                      provenance: Optional[Dict[str, Any]] = None,
+                      allow_missing_provenance: bool = False) -> bool:
+        """乐观锁 CAS：版本不匹配返回 False（调用方重取重试）。
+
+        provenance（PR-H → P1-10 收口）：**值变更 fail-closed 强制刷新溯源**——先读
+        expected_version 时点的旧 golden 求 changed（新增/改值）与 removed 属性集：
+        changed 必须由本次 provenance 覆盖（新值挂旧来源=溯源造假，此前允许）；removed
+        属性的溯源行随值一并剪除（不留陈旧来源）。CAS 语义不变：UPDATE 仍带 version
+        谓词，diff 只在 expected_version 快照上成立，竞态输家照旧返回 False。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT golden_json FROM {db}.ontology_object "
+                            "WHERE object_id=%s AND version=%s", (object_id, expected_version))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                try:
+                    old = json.loads(row[0]) if row[0] else {}
+                except Exception:   # noqa: BLE001 — 旧值坏 JSON：全部按变更对待（宁严勿漏）
+                    old = {}
+                new = dict(golden or {})
+                changed = {k for k, v in new.items() if k not in old or old[k] != v}
+                removed = set(old) - set(new)
+                _check_golden_provenance(changed, provenance,
+                                         allow_missing=allow_missing_provenance,
+                                         where="update_golden")
+                prov_patch = dict(provenance or {})
+                for k in removed:      # JSON_MERGE_PATCH：null=删键（RFC 7396）
+                    prov_patch[k] = None
+                if prov_patch:
                     cur.execute(
                         f"UPDATE {db}.ontology_object SET golden_json=%s, "
                         "golden_provenance_json=JSON_MERGE_PATCH("
                         "COALESCE(golden_provenance_json, JSON_OBJECT()), %s), "
                         "version=version+1 WHERE object_id=%s AND version=%s",
-                        (_dump(golden), _dump(provenance), object_id, expected_version))
+                        (_dump(golden), _dump(prov_patch), object_id, expected_version))
                 else:
                     cur.execute(
                         f"UPDATE {db}.ontology_object SET golden_json=%s, version=version+1 "
@@ -388,8 +552,12 @@ class RDSOntologyStore:
                           target_revision: Optional[str] = None, confidence: float = 1.0,
                           confirmed_by: Optional[str] = None,
                           source_case_id: Optional[str] = None,
-                          approval_request_id: Optional[str] = None) -> str:
-        """铸一条 active 别名（持久化确认——仅播种/回填/工作台/受治理 Action 四路径可达，S1）。"""
+                          approval_request_id: Optional[str] = None,
+                          _caller: Optional[str] = None) -> str:
+        """铸一条 active 别名（持久化确认——仅播种/回填/工作台/受治理 Action 四路径可达，S1）。
+        P1-9：裸插（不闭 case、不带审计）须显式 _caller；治理路径请走
+        confirm_case_with_identifier / insert_identifier_closing_case。"""
+        _check_caller(_caller, "insert_identifier")
         _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         identifier_id = new_ulid()
@@ -490,14 +658,19 @@ class RDSOntologyStore:
                                confidence: float = 1.0, confirmed_by: Optional[str] = None,
                                close_open_case: bool = True,
                                case_note: Optional[str] = None,
-                               audit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                               audit: Optional[Dict[str, Any]] = None,
+                               allow_missing_provenance: bool = False) -> Dict[str, Any]:
         """铸对象 + 首别名（+顺手闭同 (ns,norm) 的 open case）**一个事务**。
 
         别名撞 uk → 整体回滚（对象不留），抛 DuplicateActiveIdentifier——P0-05 的
-        「铸完对象别名被并发占 → 永久孤儿」由此根除。"""
+        「铸完对象别名被并发占 → 永久孤儿」由此根除。
+        P1-10：golden 非空须随属性级 provenance（fail-closed，同 mint_object）。"""
         _check_owner_dept(owner_dept)
         _check_lifecycle(lifecycle_state)
         _check_confidence(confidence)
+        _check_golden_provenance(set(golden or {}), provenance,
+                                 allow_missing=allow_missing_provenance,
+                                 where="mint_object_with_alias")
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -685,15 +858,45 @@ class RDSOntologyStore:
 
     # ── 关系（029 link）与 sem 投影（030；P0 PR10）────────────────────────────
     def add_link(self, src_object_id: str, dst_object_id: str, link_type: str, *,
-                 attrs: Optional[Dict[str, Any]] = None) -> str:
-        """建关系（src --type--> dst）。幂等：撞 uk_src_dst_type（含 retired 行）→
-        返回现行 link_id，不复活不覆盖（retire/复活语义 P2 再议）。"""
+                 attrs: Optional[Dict[str, Any]] = None,
+                 _caller: Optional[str] = None) -> str:
+        """建关系（src --type--> dst）。P1-8 语义校验（双后端同契约）：
+        ① 端点存在且 active 且类型匹配 LINK_TYPE_SPECS（FOR UPDATE 锁端点行，与并发
+           retire/merge 串行化）；
+        ② single 基数：同 src 同型已有指向**其他** dst 的 active 行 → 抛
+           LinkCardinalityViolation（DB 级兜底=schema/033 生成列唯一键 uk_link_active_single，
+           服务层被绕过/并发窄窗时 1062 同样拦）。
+        幂等：同 (src,dst,type) 已有行（含 retired）→ 返回现行 link_id，不复活不覆盖
+        （retire/复活语义 P2 再议）。P1-9：须显式 _caller。"""
         _check_link_type(link_type)
+        _check_caller(_caller, "add_link")
+        if src_object_id == dst_object_id:
+            raise ValueError("link 端点不得自指")
+        spec = LINK_TYPE_SPECS[link_type]
         db, conn = self._db(), self._conn()
         try:
             link_id = new_ulid()
             dup = False
             with conn.cursor() as cur:
+                cur.execute(f"SELECT object_id, object_type, status FROM {db}.ontology_object "
+                            "WHERE object_id IN (%s,%s) ORDER BY object_id FOR UPDATE",
+                            (src_object_id, dst_object_id))
+                rows = {r[0]: {"object_id": r[0], "object_type": r[1], "status": r[2]}
+                        for r in cur.fetchall()}
+                _check_link_endpoints(link_type, rows.get(src_object_id),
+                                      rows.get(dst_object_id))
+                if spec["src_cardinality"] == "single":
+                    cur.execute(f"SELECT link_id, dst_object_id FROM {db}.ontology_link "
+                                "WHERE src_object_id=%s AND link_type=%s AND status='active' "
+                                "FOR UPDATE", (src_object_id, link_type))
+                    hit = cur.fetchone()
+                    if hit is not None:
+                        if hit[1] == dst_object_id:   # 同关系重建=幂等
+                            conn.rollback()
+                            return hit[0]
+                        raise LinkCardinalityViolation(
+                            f"{link_type} 为 single 基数：src {src_object_id} 已有 active "
+                            f"关系指向 {hit[1]}——先 retire 旧关系再建新（S3 纠错），拒绝双活")
                 try:
                     cur.execute(
                         f"INSERT INTO {db}.ontology_link "
@@ -716,9 +919,13 @@ class RDSOntologyStore:
                     "WHERE src_object_id=%s AND dst_object_id=%s AND link_type=%s",
                     (src_object_id, dst_object_id, link_type))
                 row = cur.fetchone()
-            if row is None:   # 极窄窗口：并发赢家刚被删——交回调用方重试
-                raise RuntimeError("link 唯一键冲突后不可见，请重试")
-            return row[0]
+            if row is not None:
+                return row[0]
+            # 无同三元组行而 INSERT 仍 1062 ⇒ 撞的是 033 uk_link_active_single：
+            # 并发方抢先占了同 (src,type) 的 active single 位——按基数违例上抛
+            raise LinkCardinalityViolation(
+                f"{link_type} 为 single 基数：src {src_object_id} 的 active 关系位被并发"
+                "占用（DB 生成列唯一键拦截）——先查明现状再纠错")
         except Exception:
             conn.rollback()
             raise
@@ -1237,11 +1444,19 @@ class RDSOntologyStore:
             "open_cases": open_n,
             "resolved_cases": resolved,
             "dismissed_cases": dismissed,
+            "anomaly": None,   # P1-12：超分母异常显式标注，不再 min() 掩盖
         }
         if population:
             out["denominator"] = "population"
             out["population_records"] = population
-            out["resolution_coverage"] = min(1.0, active / population)
+            cov = active / population
+            out["resolution_coverage"] = cov        # 不截顶：>1.0 原样透出 + anomaly
+            if cov > 1.0:
+                out["anomaly"] = "coverage_exceeds_population"
+                logger.warning(
+                    "coverage 超分母：active=%s > population=%s（快照陈旧/源收缩/重复激活）"
+                    "——须重跑全量源快照校准分母；此前 min(1.0,·) 会把该异常掩成 100%%",
+                    active, population)
         else:
             out["denominator"] = "approx"           # 处置率口径，UI 须明示非真实覆盖率
             out["population_records"] = None
@@ -1290,9 +1505,12 @@ class MemoryOntologyStore:
     # ── 对象 ────────────────────────────────────────────────────────────────
     def mint_object(self, object_type, title, *, owner_dept, golden=None, provenance=None,
                     data_classification="internal", source_of_record="ontology",
-                    lifecycle_state="draft"):
+                    lifecycle_state="draft", allow_missing_provenance=False, _caller=None):
+        _check_caller(_caller, "mint_object")
         _check_owner_dept(owner_dept)
         _check_lifecycle(lifecycle_state)
+        _check_golden_provenance(set(golden or {}), provenance,
+                                 allow_missing=allow_missing_provenance, where="mint_object")
         with self._lock:
             if object_type not in self._seq:
                 raise ValueError(f"object_type {object_type!r} 未在 ontology_ref_seq 登记类型码")
@@ -1329,15 +1547,55 @@ class MemoryOntologyStore:
                        if o["object_type"] == object_type and o["status"] == status
                        and (title_like is None or title_like in o["title"]))
 
-    def update_golden(self, object_id, golden, *, expected_version, provenance=None):
+    def _authorized_objects(self, object_type, *, acl, bypass_acl, title_like, status):
+        """行级判定直接走 authz.can_read_object（与 RDS 的 SQL 谓词同一来源）。"""
+        from opensearch_pipeline.ontology.authz import can_read_object
+        return [dict(o) for o in self._objects.values()
+                if o["object_type"] == object_type and o["status"] == status
+                and (title_like is None or title_like in o["title"])
+                and can_read_object(o, acl=acl, bypass_acl=bypass_acl)]
+
+    def search_objects_authorized(self, object_type, *, acl, bypass_acl=False,
+                                  title_like=None, status="active", limit=50):
+        """P0-A②③（与 RDS 同契约）：先 ACL 过滤再排序截断——LIMIT 只作用授权集合。"""
+        with self._lock:
+            out = self._authorized_objects(object_type, acl=acl, bypass_acl=bypass_acl,
+                                           title_like=title_like, status=status)
+            return sorted(out, key=lambda o: o["canonical_ref"])[:max(1, min(int(limit), 200))]
+
+    def count_objects_authorized(self, object_type, *, acl, bypass_acl=False,
+                                 title_like=None, status="active"):
+        with self._lock:
+            return len(self._authorized_objects(object_type, acl=acl, bypass_acl=bypass_acl,
+                                                title_like=title_like, status=status))
+
+    def update_golden(self, object_id, golden, *, expected_version, provenance=None,
+                      allow_missing_provenance=False):
+        """P1-10（与 RDS 同契约）：changed 属性强制随溯源、removed 属性剪除溯源行。"""
         with self._lock:
             row = self._objects.get(object_id)
             if not row or row["version"] != expected_version:
                 return False
+            try:
+                old = json.loads(row.get("golden_json") or "{}")
+            except Exception:   # noqa: BLE001
+                old = {}
+            new = dict(golden or {})
+            changed = {k for k, v in new.items() if k not in old or old[k] != v}
+            removed = set(old) - set(new)
+            _check_golden_provenance(changed, provenance,
+                                     allow_missing=allow_missing_provenance,
+                                     where="update_golden")
             row["golden_json"] = _dump(golden)
-            if provenance:
+            if provenance or removed:
                 merged = json.loads(row.get("golden_provenance_json") or "{}")
-                merged.update(provenance)
+                for k, v in (provenance or {}).items():   # RFC 7396 同语义：null=删键
+                    if v is None:
+                        merged.pop(k, None)
+                    else:
+                        merged[k] = v
+                for k in removed:
+                    merged.pop(k, None)
                 row["golden_provenance_json"] = _dump(merged)
             row["version"] += 1
             return True
@@ -1410,7 +1668,9 @@ class MemoryOntologyStore:
 
     def insert_identifier(self, namespace, raw_value, norm_value, target_object_id, *,
                           method, relation="alias", target_revision=None, confidence=1.0,
-                          confirmed_by=None, source_case_id=None, approval_request_id=None):
+                          confirmed_by=None, source_case_id=None, approval_request_id=None,
+                          _caller=None):
+        _check_caller(_caller, "insert_identifier")
         _check_confidence(confidence)
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
@@ -1457,7 +1717,7 @@ class MemoryOntologyStore:
                     row["namespace"], row["raw_value"], row["norm_value"],
                     new_target_object_id, method="manual", relation=row["relation"],
                     target_revision=new_target_revision, confidence=1.0, confirmed_by=by,
-                    source_case_id=row["source_case_id"])
+                    source_case_id=row["source_case_id"], _caller="store_internal")
             except Exception:
                 row["status"] = "active"   # 回滚让位
                 raise
@@ -1471,10 +1731,13 @@ class MemoryOntologyStore:
                                source_of_record="ontology", lifecycle_state="draft",
                                method="seed", relation="canonical", confidence=1.0,
                                confirmed_by=None, close_open_case=True, case_note=None,
-                               audit=None):
+                               audit=None, allow_missing_provenance=False):
         _check_owner_dept(owner_dept)
         _check_lifecycle(lifecycle_state)
         _check_confidence(confidence)
+        _check_golden_provenance(set(golden or {}), provenance,
+                                 allow_missing=allow_missing_provenance,
+                                 where="mint_object_with_alias")
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
                 raise DuplicateActiveIdentifier(
@@ -1486,7 +1749,9 @@ class MemoryOntologyStore:
                                    provenance=provenance,
                                    data_classification=data_classification,
                                    source_of_record=source_of_record,
-                                   lifecycle_state=lifecycle_state)
+                                   lifecycle_state=lifecycle_state,
+                                   allow_missing_provenance=allow_missing_provenance,
+                                   _caller="store_internal")
             case = self.get_open_case(namespace, norm_value) if close_open_case else None
             identifier_id = new_ulid()
             self._identifiers[identifier_id] = {
@@ -1578,15 +1843,31 @@ class MemoryOntologyStore:
             return sorted(out, key=lambda r: r["first_seen_at"])
 
     # ── 关系 / sem 投影（与 RDS 同契约）──────────────────────────────────────
-    def add_link(self, src_object_id, dst_object_id, link_type, *, attrs=None):
+    def add_link(self, src_object_id, dst_object_id, link_type, *, attrs=None, _caller=None):
+        """P1-8/P1-9（与 RDS 同契约）：端点 active+类型匹配 → single 基数闸 →
+        同三元组幂等返回 → 插入。"""
         _check_link_type(link_type)
+        _check_caller(_caller, "add_link")
+        if src_object_id == dst_object_id:
+            raise ValueError("link 端点不得自指")
+        spec = LINK_TYPE_SPECS[link_type]
         with self._lock:
+            _check_link_endpoints(link_type, self._objects.get(src_object_id),
+                                  self._objects.get(dst_object_id))
+            if spec["src_cardinality"] == "single":
+                for row in self._links.values():
+                    if (row["src_object_id"], row["link_type"], row["status"]) == \
+                            (src_object_id, link_type, "active"):
+                        if row["dst_object_id"] == dst_object_id:   # 同关系重建=幂等
+                            return row["link_id"]
+                        raise LinkCardinalityViolation(
+                            f"{link_type} 为 single 基数：src {src_object_id} 已有 active "
+                            f"关系指向 {row['dst_object_id']}——先 retire 旧关系再建新"
+                            "（S3 纠错），拒绝双活")
             for row in self._links.values():
                 if (row["src_object_id"], row["dst_object_id"], row["link_type"]) == \
                         (src_object_id, dst_object_id, link_type):
-                    return row["link_id"]
-            if src_object_id not in self._objects or dst_object_id not in self._objects:
-                raise ValueError("link 端点对象不存在（FK 拦截）")   # 对齐 RDS FK（P0-03）
+                    return row["link_id"]              # 含 retired 行：不复活不覆盖
             link_id = new_ulid()
             self._links[link_id] = {
                 "link_id": link_id, "src_object_id": src_object_id,

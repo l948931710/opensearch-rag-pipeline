@@ -103,7 +103,9 @@ MANIFEST="
 028_ontology_identity.sql ontology
 029_ontology_link.sql ontology
 030_sem_views.sql ontology
+031_agent_approval_execution_hardening.sql operation
 032_schema_migrations_checksum.sql both
+033_ontology_link_invariants.sql ontology
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }

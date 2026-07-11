@@ -30,7 +30,9 @@ from opensearch_pipeline.ontology import stewardship
 from opensearch_pipeline.ontology.store import MemoryOntologyStore
 
 
-def _ctx(acl=("marketing",), user="u1"):
+def _ctx(acl=("pmc",), user="u1"):
+    """P0-B 后发起人须对目标对象可读（_target 缺省 owner_dept='pmc' internal）——
+    缺省 acl 给 pmc；专测审批路由/scope 推导的用例仍显式传 marketing。"""
     return ExecutionContext.create(request_id="", user_id=user, acl_groups=list(acl),
                                    roles=("employee",), channel="console", thread_id="t1")
 
@@ -54,7 +56,7 @@ def tool(store):
 
 
 def _target(store, title="6.2口径龙虾杯", otype="product", **kw):
-    return store.mint_object(otype, title, owner_dept=kw.pop("owner_dept", "pmc"), **kw)
+    return store.mint_object(otype, title, owner_dept=kw.pop("owner_dept", "pmc"), **kw, _caller="test")
 
 
 # ── spec / Policy 契约 ────────────────────────────────────────────────────────────
@@ -207,7 +209,7 @@ def test_case_closure_atomic_with_identifier(tool, store, monkeypatch):
     assert store.get_open_case("u8", "ABC123") is None
     # 故障路径：复合写失败 → 工具失败且零副作用（无半状态）
     store2 = MemoryOntologyStore()
-    obj2 = store2.mint_object("product", "另一目标", owner_dept="pmc")
+    obj2 = store2.mint_object("product", "另一目标", owner_dept="pmc", _caller="test")
     store2.upsert_case("u8", "zz9", "ZZ9")
     monkeypatch.setattr(store2, "insert_identifier_closing_case",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
@@ -219,15 +221,24 @@ def test_case_closure_atomic_with_identifier(tool, store, monkeypatch):
     assert store2.get_open_case("u8", "ZZ9") is not None   # case 仍开着，零分叉
 
 
-def test_confidential_title_masked(store):
+def test_confidential_unreadable_target_denied_as_not_found(store):
+    """P0-B（外审动态探针场景）：requester 只有 pmc ACL、目标 supply/confidential →
+    工具拒绝且与"目标不存在"**同答**（旧行为：掩码标题后照样铸别名成功=跨 ACL 写洞）。"""
     mat = store.mint_object("material", "PP-1100 特惠采购价目", owner_dept="supply",
-                            data_classification="confidential")
+                            data_classification="confidential", _caller="test")
     tool = OntologyIdentityResolveTool(store=store)
     res = tool.run(_ctx(acl=("pmc",)), {"namespace": "material_grade", "value": "pp-1100",
                                         "target_object_id": mat["object_id"]})
-    assert res.status == "succeeded"
-    assert "特惠采购价目" not in res.content[0].text
-    assert "[受限对象]" in res.content[0].text
+    ghost = tool.run(_ctx(acl=("pmc",)), {"namespace": "material_grade", "value": "pp-1100",
+                                          "target_object_id": "0" * 26})
+    assert res.status == "failed" and res.error == ghost.error   # 不可见 == 不存在
+    assert "特惠采购价目" not in (res.error or "")
+    assert mat["canonical_ref"] not in (res.error or "")
+    assert store.get_active_identifier("material_grade", "PP-1100") is None   # 零副作用
+    # 有权 requester（supply）正常成功，标题原样
+    ok = tool.run(_ctx(acl=("supply",)), {"namespace": "material_grade", "value": "pp-1100",
+                                          "target_object_id": mat["object_id"]})
+    assert ok.status == "succeeded" and "特惠采购价目" in ok.content[0].text
 
 
 # ── approver_scope seam ──────────────────────────────────────────────────────────
@@ -250,11 +261,13 @@ def test_resolve_scope_with_resolver_and_failures():
 
 
 def test_tool_registers_steward_scope_resolver(tool, store):
-    """工具构造即注册：product 目标 → steward=pmc（种子）；未登记域 → None→''。"""
+    """工具构造即注册：product 目标 → steward CSV "pmc,rd"（种子含 backup，P1-11）；
+    未登记域 → None→''。发起人 acl 须覆盖目标（P0-B propose 侧同闸），主属部门仍是
+    marketing——路由到 steward 而非发起人部门。"""
     obj = _target(store)
-    scope = _resolve_scope("ontology_identity_resolve", _ctx(acl=("marketing",)),
+    scope = _resolve_scope("ontology_identity_resolve", _ctx(acl=("marketing", "pmc")),
                            {"namespace": "u8", "target_object_id": obj["object_id"]})
-    assert scope == "pmc"                                    # 路由到 steward 而非发起人部门
+    assert scope == "pmc,rd"                                 # steward+backup CSV，非发起人部门
     scope2 = _resolve_scope("ontology_identity_resolve", _ctx(acl=("marketing",)),
                             {"namespace": "lot_code", "target_object_id": "ghost"})
     assert scope2 == ""                                      # 对象不存在+域未登记 → 仅 kb_admin
@@ -292,18 +305,19 @@ class _CapturingConn:
 
 
 def test_create_request_routes_scope_and_keeps_requested_dept(monkeypatch, tool, store):
-    """集成：create_request 的 approver_scope 走 seam（steward），requested_dept 仍是发起人部门。"""
+    """集成：create_request 的 approver_scope 走 seam（steward CSV），requested_dept
+    仍是发起人主属部门（acl 第二组 pmc 只为过 P0-B propose 闸）。"""
     sink = []
     monkeypatch.setattr(RDSApprovalStore, "_conn", lambda self: _CapturingConn(sink))
     obj = _target(store)
     RDSApprovalStore().create_request(
-        "run1", _ctx(acl=("marketing",), user="u9"),
+        "run1", _ctx(acl=("marketing", "pmc"), user="u9"),
         {"call_id": "c1", "tool_name": "ontology_identity_resolve",
          "arguments": {"namespace": "u8", "value": "abc123",
                        "target_object_id": obj["object_id"]}})
     params = sink[-1][1]
     assert params[9] == "marketing"                          # requested_dept=发起人主属部门
-    assert params[10] == "pmc"                               # approver_scope=steward 路由
+    assert params[10] == "pmc,rd"                            # approver_scope=steward+backup CSV
     # 未注册工具：两者同源（默认推导），行为与 seam 前一致
     sink.clear()
     RDSApprovalStore().create_request(
@@ -322,7 +336,7 @@ def test_approval_chain_lands_on_identifier(store):
     from dataclasses import replace
     obj = _target(store)
     ctx = replace(_ctx(), approval_request_id="req_" + "a" * 28,
-                  approved_by="steward_9", approval_scope="pmc")
+                  approved_by="steward_9", approval_scope="pmc,rd")   # P1-11：CSV 含 backup
     tool = OntologyIdentityResolveTool(store=store)
     res = tool.run(ctx, {"namespace": "u8", "value": "abc123",
                          "target_object_id": obj["object_id"]})
@@ -338,7 +352,7 @@ def test_expected_version_pin_rejects_drift(store):
     """提案钉 expected_version → 审批期间对象变更（version 自增）→ 拒绝执行。"""
     obj = _target(store)
     tool = OntologyIdentityResolveTool(store=store)
-    store.update_golden(obj["object_id"], {"改": "了"}, expected_version=1)   # version→2
+    store.update_golden(obj["object_id"], {"改": "了"}, expected_version=1, allow_missing_provenance=True)   # version→2
     res = tool.run(_ctx(), {"namespace": "u8", "value": "abc123",
                             "target_object_id": obj["object_id"],
                             "expected_version": 1})
@@ -351,10 +365,10 @@ def test_scope_drift_rejects_execution(store):
     from dataclasses import replace
 
     from opensearch_pipeline.ontology import stewardship
-    stewardship.ensure_seeds(store)                      # product→pmc
+    stewardship.ensure_seeds(store)                      # product→pmc（backup rd）
     obj = _target(store)
     ctx = replace(_ctx(), approval_request_id="req_" + "b" * 28,
-                  approved_by="steward_9", approval_scope="pmc")
+                  approved_by="steward_9", approval_scope="pmc,rd")
     # 审批后 steward 换防：product scope 改归 supply
     store.upsert_stewardship([{"scope_type": "object_type", "scope_key": "product",
                                "steward_dept": "supply"}])

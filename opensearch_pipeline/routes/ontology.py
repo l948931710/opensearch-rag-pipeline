@@ -81,30 +81,43 @@ def _require_reader(identity: Identity):
     return kb
 
 
-def _steward_dept_for(store, *, namespace: Optional[str] = None,
-                      object_type: Optional[str] = None) -> Optional[str]:
+def _steward_scope_for(store, *, namespace: Optional[str] = None,
+                       object_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """stewardship 裁决命中的**整行**（含 steward_dept/backup_dept，P1-11 授权要用后者）；
+    表故障 → None（scope 未知，fail-closed 到 kb_admin）。"""
     from opensearch_pipeline.ontology.stewardship import resolve_steward
     try:
         rows = store.list_stewardship()
     except Exception:   # noqa: BLE001 — 表故障 → scope 未知 → fail-closed 到 kb_admin
         logger.warning("stewardship 读取失败（授权收敛到 kb_admin）", exc_info=True)
         return None
-    hit = resolve_steward(rows, namespace=namespace, object_type=object_type)
+    return resolve_steward(rows, namespace=namespace, object_type=object_type)
+
+
+def _steward_dept_for(store, *, namespace: Optional[str] = None,
+                      object_type: Optional[str] = None) -> Optional[str]:
+    """主 steward 部门（展示用；授权一律走 _authorize_steward 的整行裁决）。"""
+    hit = _steward_scope_for(store, namespace=namespace, object_type=object_type)
     return hit["steward_dept"] if hit else None
 
 
-def _authorize_steward(identity: Identity, kb, steward_dept: Optional[str]) -> None:
-    """写侧门：kb_admin 恒可；dept_admin 须 scope 命中且 steward_dept ∈ managed；
-    scope 未命中（steward_dept=None）→ 仅 kb_admin（fail-closed）。"""
+def _authorize_steward(identity: Identity, kb, scope: Optional[Dict[str, Any]]) -> None:
+    """写侧门：kb_admin 恒可；dept_admin 须 scope 命中且 managed 覆盖
+    steward_dept **或 backup_dept**（P1-11：backup 代理与主 steward 同权——
+    此前只认 steward_dept，seeds 里的 backup_dept 形同虚设）；
+    scope 未命中（None）→ 仅 kb_admin（fail-closed）。"""
     from opensearch_pipeline.kb_authz import ROLE_DEPT_ADMIN, ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.ontology.stewardship import effective_steward_depts
     if kb.role == ROLE_KB_ADMIN:
         return
-    if kb.role == ROLE_DEPT_ADMIN and steward_dept \
-            and steward_dept in set(managed_owner_depts(kb)):
+    depts = effective_steward_depts(scope)
+    if kb.role == ROLE_DEPT_ADMIN and depts \
+            and set(depts) & set(managed_owner_depts(kb)):
         return
+    steward = (scope or {}).get("steward_dept")
     raise HTTPException(
         status_code=403,
-        detail=f"无权处置该条目（steward={steward_dept or '未登记'}，需 kb_admin 或对应 dept_admin）")
+        detail=f"无权处置该条目（steward={steward or '未登记'}，需 kb_admin 或对应 dept_admin）")
 
 
 # ── 对象级 ACL（PR-B，P0-01）：读侧世界观 = kb_admin bypass / dept_admin 管辖组码 ──
@@ -117,13 +130,16 @@ def _reader_acl(kb):
 
 
 def _can_manage_case(kb, store, case: Dict[str, Any]) -> bool:
-    """case 可见性 = 其 steward scope 是否归调用方管辖（evidence 属处置人，读写同域）。"""
+    """case 可见性 = 其 steward scope 是否归调用方管辖（evidence 属处置人，读写同域；
+    P1-11：backup_dept 与 steward_dept 同权——代理管家也能看到并处置队列）。"""
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.ontology.stewardship import effective_steward_depts
     if kb.role == ROLE_KB_ADMIN:
         return True
-    steward = _steward_dept_for(store, namespace=case.get("namespace"),
-                                object_type=case.get("object_type_hint"))
-    return bool(steward) and steward in set(managed_owner_depts(kb))
+    scope = _steward_scope_for(store, namespace=case.get("namespace"),
+                               object_type=case.get("object_type_hint"))
+    depts = effective_steward_depts(scope)
+    return bool(depts) and bool(set(depts) & set(managed_owner_depts(kb)))
 
 
 def _managed_scope_filter(kb, store) -> Optional[Dict[str, List[str]]]:
@@ -134,6 +150,7 @@ def _managed_scope_filter(kb, store) -> Optional[Dict[str, List[str]]]:
     `_can_manage_case` 精判（attribute > namespace > object_type 的裁决优先级可能
     在并集内又否掉个别行）——粗筛+精判双层，fail-closed。"""
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.ontology.stewardship import effective_steward_depts
     if kb.role == ROLE_KB_ADMIN:
         return None
     managed = set(managed_owner_depts(kb))
@@ -144,7 +161,8 @@ def _managed_scope_filter(kb, store) -> Optional[Dict[str, List[str]]]:
         logger.warning("stewardship 读取失败（队列过滤收敛为空集）", exc_info=True)
         rows = []
     for r in rows:
-        if r.get("steward_dept") not in managed:
+        # P1-11：backup_dept 与 steward_dept 同权（粗筛与 _can_manage_case 精判同口径）
+        if not (set(effective_steward_depts(r)) & managed):
             continue
         key = r.get("scope_key") or ""
         if r.get("scope_type") == "namespace":
@@ -165,17 +183,33 @@ def _raise_mutation_denied(reason: str) -> None:
 
 
 # ── 读侧：队列 / 覆盖率 / 详情 / 对象搜索 ─────────────────────────────────────
+def _restricted_candidate_stub(c: Dict[str, Any]) -> Dict[str, Any]:
+    """不可读候选的**白名单重建**占位行（P0-A①）：只带 candidate_id/case_id 两个
+    自身定位键（不指向隐藏对象），其余字段全为常量 None。
+
+    绝不 ``{**c}`` 展开 SELECT * 行后再删字段——旧实现只清了 ref/title/type/status
+    四个字段，`target_object_id`/`features_json`/`method`/`confidence` 原样出参，
+    足以推断跨 ACL 对象的存在、特征与匹配强度。"""
+    return {
+        "candidate_id": c.get("candidate_id"), "case_id": c.get("case_id"),
+        "target_visible": False,
+        "target_object_id": None, "target_revision": None,
+        "method": None, "confidence": None, "features_json": None,
+        "canonical_ref": None, "title": None, "object_type": None,
+        "target_status": None, "owner_dept": None, "data_classification": None,
+    }
+
+
 def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
                        top_n: int = 3) -> List[Dict[str, Any]]:
-    """候选目标对象信息按对象级 ACL 出参（PR-B）：不可读目标只给 target_visible=False，
-    不泄 ref/title/type——跨部门 confidential 候选正是 P0-01 的泄露面。"""
+    """候选目标对象信息按对象级 ACL 出参（PR-B / P0-A①）：不可读目标只返回
+    _restricted_candidate_stub 的常量形态——跨部门 confidential 候选正是 P0-01 的泄露面。"""
     from opensearch_pipeline.ontology.authz import can_read_object, visible_title
     out = []
     for c in store.list_candidates(case_id)[:top_n]:
         obj = store.get_object(c["target_object_id"]) or {}
         if not can_read_object(obj, acl=acl, bypass_acl=bypass):
-            out.append({**c, "target_visible": False, "canonical_ref": None,
-                        "title": None, "object_type": None, "target_status": None})
+            out.append(_restricted_candidate_stub(c))
             continue
         out.append({**c, "target_visible": True,
                     "canonical_ref": obj.get("canonical_ref"),
@@ -276,20 +310,25 @@ def ontology_case_detail(case_id: str, request: Request,
 def ontology_objects_search(request: Request, object_type: str, q: Optional[str] = None,
                             limit: int = 20,
                             identity: Optional[Identity] = Depends(current_identity)):
-    """确认/改指时的目标对象选择器（PR-B：结果按对象级 ACL 过滤，不可读对象整行不出；
-    PR-H P1：返回 total/truncated——截断必须可见，且精确同名命中排最前）。"""
+    """确认/改指时的目标对象选择器（PR-B / P0-A②③：对象级 ACL **谓词下推**到 SQL 查询
+    与计数——分页在授权集合上执行（不可见行不挤占页位、不饿死可见结果），total/truncated
+    只计可见集合（未授权全量计数会泄露不可见对象的数量）；行级 can_read_object 复核为
+    纵深防御。PR-H P1：total/truncated 出参——截断必须可见，且精确同名命中排最前）。"""
     identity = _require_enabled_identity(identity)
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     from opensearch_pipeline.ontology.authz import can_read_object
     acl, bypass = _reader_acl(kb)
     store = _get_store()
-    items = [o for o in store.find_objects(object_type, title_like=q, limit=limit)
-             if can_read_object(o, acl=acl, bypass_acl=bypass)]
+    rows = store.search_objects_authorized(object_type, acl=acl, bypass_acl=bypass,
+                                           title_like=q, limit=limit)
+    # 纵深防御：谓词生成与行级判定同源（authz 单模块），此处复核防两者语义漂移
+    items = [o for o in rows if can_read_object(o, acl=acl, bypass_acl=bypass)]
     if q:   # 精确同名优先（原按 canonical_ref 铸序——最匹配的可能沉底）
         items.sort(key=lambda o: (o.get("title") != q,))
     try:
-        total = store.count_objects(object_type, title_like=q)
+        total = store.count_objects_authorized(object_type, acl=acl, bypass_acl=bypass,
+                                               title_like=q)
     except Exception:   # noqa: BLE001 — 计数失败不影响主结果
         total = None
     truncated = bool(total is not None and total > len(items))
@@ -369,7 +408,7 @@ def ontology_case_confirm(case_id: str, req: ConfirmRequest, request: Request,
         raise HTTPException(status_code=404, detail="case 不存在")
     if case["status"] != "open":
         raise HTTPException(status_code=409, detail=f"case 非 open（{case['status']}）")
-    _authorize_steward(identity, kb, _steward_dept_for(
+    _authorize_steward(identity, kb, _steward_scope_for(
         store, namespace=case["namespace"], object_type=case.get("object_type_hint")))
     # PR-B（P0-01）：目标侧三闸——可读 / active / 与 case 期望类型一致（authz 单一实现）
     from opensearch_pipeline.ontology.authz import can_mutate_identity
@@ -415,7 +454,7 @@ def ontology_case_dismiss(case_id: str, req: DismissRequest, request: Request,
     case = store.get_case(case_id)
     if case is None or not _can_manage_case(kb, store, case):   # PR-B：scope 外同答 404
         raise HTTPException(status_code=404, detail="case 不存在")
-    _authorize_steward(identity, kb, _steward_dept_for(
+    _authorize_steward(identity, kb, _steward_scope_for(
         store, namespace=case["namespace"], object_type=case.get("object_type_hint")))
     try:
         ok = store.dismiss_case(case_id, by=identity.user_id, note=req.note,
@@ -466,7 +505,7 @@ def ontology_cases_batch_dismiss(req: BatchDismissRequest, request: Request,
             results.append({"case_id": case_id, "status": "not_found"})   # scope 外同不存在
             continue
         try:
-            _authorize_steward(identity, kb, _steward_dept_for(
+            _authorize_steward(identity, kb, _steward_scope_for(
                 store, namespace=case["namespace"],
                 object_type=case.get("object_type_hint")))
         except HTTPException:
@@ -503,8 +542,8 @@ def _load_identifier_scope(store, identifier_id: str):
     if row is None:
         raise HTTPException(status_code=404, detail="identifier 不存在")
     obj = store.get_object(row["target_object_id"]) or {}
-    return row, obj, _steward_dept_for(store, namespace=row["namespace"],
-                                       object_type=obj.get("object_type"))
+    return row, obj, _steward_scope_for(store, namespace=row["namespace"],
+                                        object_type=obj.get("object_type"))
 
 
 @router.post("/api/ontology/identifiers/{identifier_id}/deactivate")
@@ -584,7 +623,7 @@ def ontology_object_retire(object_id: str, req: NoteRequest, request: Request,
     if obj is None or not can_read_object(obj, acl=acl, bypass_acl=bypass):
         raise HTTPException(status_code=404, detail="对象不存在")
     _authorize_steward(identity, kb,
-                       _steward_dept_for(store, object_type=obj["object_type"]))
+                       _steward_scope_for(store, object_type=obj["object_type"]))
     if not store.retire_object(
             object_id,
             audit=_audit_payload(action=f"object:{object_id}", decision="retire",
@@ -615,7 +654,7 @@ def ontology_object_mark_duplicate(object_id: str, req: MarkDuplicateRequest, re
     if obj is None or not can_read_object(obj, acl=acl, bypass_acl=bypass):
         raise HTTPException(status_code=404, detail="对象不存在")
     _authorize_steward(identity, kb,
-                       _steward_dept_for(store, object_type=obj["object_type"]))
+                       _steward_scope_for(store, object_type=obj["object_type"]))
     # PR-B（P0-01）：merge 目标三闸——可读 / active / 与 source 同类型（store 同事务再兜一层）
     target = store.get_object(req.merged_into)
     reason = can_mutate_identity(target, acl=acl, bypass_acl=bypass,
