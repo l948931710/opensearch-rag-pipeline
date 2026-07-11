@@ -39,6 +39,14 @@ const ADMIN: ApprovalHistoryItem = {
   kind: 'admin_grant', action: 'granted', title: 'mgr002', owner_dept: '', subject: 'mgr002',
   detail: 'grant dept_admin mgr002 → quality', extra: '', decided_by: 'kb1', decided_by_name: '系统管理员', decided_at: '2026-06-25 09:00:00',
 }
+const AGENT: ApprovalHistoryItem = {
+  kind: 'agent', action: 'rejected_terminate', title: 'u8_writeback', owner_dept: 'production', subject: '王伟',
+  detail: '参数有误', extra: '', decided_by: 'da1', decided_by_name: '李娜', decided_at: '2026-07-10 09:00:00',
+}
+const AGENT_EXPIRED: ApprovalHistoryItem = {
+  kind: 'agent', action: 'expired', title: 'u8_writeback', owner_dept: 'production', subject: '王伟',
+  detail: '', extra: '', decided_by: '', decided_by_name: '', decided_at: '2026-07-09 20:00:00',
+}
 
 describe('loadApprovalHistory', () => {
   it('canManage → 拉 /api/kb/approval-history 回填', async () => {
@@ -90,18 +98,38 @@ describe('ApprovalHistory', () => {
     expect(w.text()).toContain('已入库')          // contribution extra=searchable
   })
 
-  it('dept_admin 只见两类 chip（无 上传审批/成员授权）', () => {
+  it('dept_admin 见 访问授权/知识贡献/Agent 操作 三类 chip（无 上传审批/成员授权）', () => {
     const w = mountView([ACCESS])
     expect(w.text()).toContain('访问授权')
     expect(w.text()).toContain('知识贡献')
+    expect(w.text()).toContain('Agent 操作')
     expect(w.text()).not.toContain('上传审批')
     expect(w.text()).not.toContain('成员授权')
   })
 
-  it('kb_admin 见四类 chip', () => {
+  it('kb_admin 见五类 chip', () => {
     const w = mountView([ACCESS, UPLOAD, ADMIN], 'kb_admin')
     expect(w.text()).toContain('上传审批')
     expect(w.text()).toContain('成员授权')
+    expect(w.text()).toContain('Agent 操作')
+  })
+
+  it('agent 行：类型标/动作标/发起人/决策人；expired → 过期未审、无决策人', () => {
+    const w = mountView([AGENT, AGENT_EXPIRED])
+    expect(w.text()).toContain('Agent 操作')
+    expect(w.text()).toContain('终止')                 // rejected_terminate → 终止
+    expect(w.text()).toContain('u8_writeback')
+    expect(w.text()).toContain('发起人 王伟')           // agent 类主体前缀
+    expect(w.text()).toContain('决策人 李娜')
+    expect(w.text()).toContain('过期未审')              // expired 徽标
+  })
+
+  it('Agent 操作 chip 本地过滤', async () => {
+    const w = mountView([ACCESS, AGENT])
+    const chip = w.findAll('button').find((b) => b.text() === 'Agent 操作')!
+    await chip.trigger('click')
+    expect(w.text()).toContain('u8_writeback')
+    expect(w.text()).not.toContain('销售SOP')
   })
 
   it('类型 chip 本地过滤（点「知识贡献」→ 只剩贡献行）', async () => {

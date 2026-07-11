@@ -584,8 +584,9 @@ def _parse_admin_target(msg: str) -> str:
 
 
 class KbApprovalHistoryItem(BaseModel):
-    kind: str = ""            # 'access' | 'contribution' | 'upload' | 'admin_grant'
-    action: str = ""          # approved|rejected|revoked|accepted|granted
+    kind: str = ""            # 'access' | 'contribution' | 'upload' | 'admin_grant' | 'agent'
+    action: str = ""          # approved|rejected|revoked|accepted|granted|
+                              #   edited|rejected_feedback|rejected_terminate|expired|cancelled(agent)
     title: str = ""           # 文档标题 / 贡献问题 / 目标用户
     owner_dept: str = ""      # 作用域部门（contribution=category_dept；admin_grant 无）
     subject: str = ""         # requester_name / author_name / 目标 uid（已存展示名，与队列一致，不脱敏）
@@ -603,10 +604,11 @@ class KbApprovalHistoryResponse(BaseModel):
 @router.get("/api/kb/approval-history", response_model=KbApprovalHistoryResponse)
 def kb_approval_history(request: Request,
                         identity: Optional[Identity] = Depends(current_identity)):
-    """审批历史（只读聚合，owner 作用域）。dept_admin 见本部门 access+contribution；kb_admin 见全库四类。
+    """审批历史（只读聚合，owner 作用域）。dept_admin 见本部门 access+contribution+agent；
+    kb_admin 见全库五类（+upload/admin_grant）。agent 类仅 RAG_AGENT_ENABLE 开启时纳入。
 
     各子查询独立降级（单流取数失败只让该流缺失，不拖垮整块）；跑过的子查询【全部】失败 → 诚实 500。
-    跨用户自由文本（申请理由/贡献问题/审批备注/审计 message）一律 redact_query_text 脱敏。
+    跨用户自由文本（申请理由/贡献问题/审批备注/审计 message/agent 驳回理由）一律 redact_query_text 脱敏。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
@@ -737,6 +739,42 @@ def kb_approval_history(request: Request,
                 except Exception as e:
                     fails += 1
                     logger.warning("approval_history admin_grant 失败: %s", e)
+            # 5) agent —— Agent 高风险操作审批的已决行（两角色，approver_scope 作用域；库=_op_db，
+            #    schema/025，作用域语义与 GET /api/agent/approvals 同：kb_admin 全量 / dept_admin
+            #    按 managed）。RAG_AGENT_ENABLE 未开时整块跳过（表可能未建；与该路由 404 同口径），
+            #    不计入 ran/fails。decision 行由 CAS 赢者同事务写入、每请求 ≤1 行 → LEFT JOIN 无
+            #    扇出；expired/cancelled 无 decision 行 → decided_by 空、时间回退 expires_at。
+            from opensearch_pipeline.routes.agent import _agent_enabled
+            if _agent_enabled():
+                ran += 1
+                try:
+                    scope_agent, scope_agent_params = "", []
+                    if not is_admin:
+                        ph = ",".join(["%s"] * len(scope_owner_params))
+                        scope_agent = f"AND r.approver_scope IN ({ph})"
+                        scope_agent_params = list(scope_owner_params)
+                    cur.execute(
+                        "SELECT r.tool_name, r.approver_scope, r.requested_by, r.status,"
+                        " d.reason, d.decided_by,"
+                        f" COALESCE(CONVERT_TZ(COALESCE(r.decided_at, r.expires_at),{_TZ_PACIFIC_TO_BJ}),"
+                        " r.decided_at, r.expires_at)"
+                        f" FROM {_op_db()}.approval_request r"
+                        f" LEFT JOIN {_op_db()}.approval_decision d ON d.request_id = r.request_id"
+                        " WHERE r.status <> 'pending' " + scope_agent +
+                        " ORDER BY COALESCE(r.decided_at, r.expires_at) DESC LIMIT %s",
+                        tuple(scope_agent_params + [lim]))
+                    for x in cur.fetchall():
+                        out.append(KbApprovalHistoryItem(
+                            kind="agent", action=(x[3] or ""), title=(x[0] or ""),
+                            owner_dept=(x[1] or ""), subject=(x[2] or ""), detail=_rq(x[4]),
+                            decided_by=(x[5] or ""), decided_at=str(x[6]) if x[6] else ""))
+                        if x[5]:
+                            op_ids.add(x[5])
+                        if x[2]:
+                            op_ids.add(x[2])   # 发起人 uid 也走展示名解析（agent 表只存 staffId）
+                except Exception as e:
+                    fails += 1
+                    logger.warning("approval_history agent 失败: %s", e)
             # 操作者 staffId → 展示名（best-effort，enrichment；失败不计入 fails、回退 uid）
             if op_ids:
                 try:
@@ -746,6 +784,8 @@ def kb_approval_history(request: Request,
                     names = {r0: (r1 or "") for (r0, r1) in cur.fetchall()}
                     for it in out:
                         it.decided_by_name = names.get(it.decided_by, "") or it.decided_by
+                        if it.kind == "agent" and it.subject:   # agent 表只存发起人 staffId → 展示名
+                            it.subject = names.get(it.subject, "") or it.subject
                 except Exception as e:
                     logger.warning("approval_history 操作者名解析失败: %s", e)
                     for it in out:

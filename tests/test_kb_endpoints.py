@@ -1587,6 +1587,65 @@ def test_approval_history_kb_admin_all_sources(monkeypatch):
     assert resp.items[0].kind == "access"
 
 
+def test_approval_history_agent_kind_dept_admin_scoped(monkeypatch):
+    """RAG_AGENT_ENABLE 开：dept_admin 多出 agent 流（approver_scope 收窄）；驳回理由脱敏；
+    发起人/决策人 uid→展示名；expired 无 decision 行 → decided_by 空。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "production")
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "1")
+    # fetch 顺序：access(空) → contribution(空) → agent → user_role(名)
+    agent = [
+        ("u8_writeback", "production", "user_wang", "rejected_feedback",
+         "数量异常，联系我13800138000", "da1", "2026-07-10 09:00:00"),
+        ("u8_writeback", "production", "user_wang", "expired", None, None, "2026-07-09 20:00:00"),
+    ]
+    names = [("da1", "李娜"), ("user_wang", "王伟")]
+    sink = _stub_multi(monkeypatch, [[], [], agent, names])
+    from opensearch_pipeline import api
+    resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="da1"))
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "approval_request" in sqls and "approver_scope IN" in sqls   # agent 流 + 作用域收窄
+    ags = [it for it in resp.items if it.kind == "agent"]
+    assert len(ags) == 2
+    fb = next(it for it in ags if it.action == "rejected_feedback")
+    assert fb.title == "u8_writeback" and fb.owner_dept == "production"
+    assert fb.subject == "王伟" and fb.decided_by_name == "李娜"        # uid → 展示名
+    assert "13800138000" not in fb.detail                               # 驳回理由脱敏
+    ex = next(it for it in ags if it.action == "expired")
+    assert ex.decided_by == "" and ex.decided_by_name == ""             # 过期未审：无人决策
+
+
+def test_approval_history_agent_kind_kb_admin_unscoped(monkeypatch):
+    """RAG_AGENT_ENABLE 开：kb_admin 五类全跑，agent 不做 approver_scope 收窄。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "1")
+    # fetch 顺序：access → contribution → upload → admin_grant → agent → names
+    agent = [("kb_doc_retire", "quality", "user_li", "approved", "确认退役", "kb1", "2026-07-10 11:00:00")]
+    names = [("kb1", "系统管理员"), ("user_li", "李强")]
+    sink = _stub_multi(monkeypatch, [[], [], [], [], agent, names])
+    from opensearch_pipeline import api
+    resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "approval_request" in sqls and "approver_scope IN" not in sqls
+    assert [it.kind for it in resp.items] == ["agent"]
+    assert resp.items[0].action == "approved" and resp.items[0].subject == "李强"
+
+
+def test_approval_history_agent_flag_off_not_queried(monkeypatch):
+    """RAG_AGENT_ENABLE 关（默认）：整块跳过——不查 approval_request（表可能未建），
+    也不计入 ran/fails（四类全空 ≠ 500）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.delenv("RAG_AGENT_ENABLE", raising=False)
+    sink = _stub_multi(monkeypatch, [[], [], [], []])
+    from opensearch_pipeline import api
+    resp = api.kb_approval_history(request=None, identity=api.Identity(user_id="dev1"))
+    assert "approval_request" not in " || ".join(s for s, _ in sink["calls"])
+    assert resp.items == []
+
+
 def test_approval_history_pii_redacted(monkeypatch):
     """跨用户自由文本（申请理由 / 贡献问题）必须脱敏，不泄露他人手机号。"""
     _skip_if_not_sim()

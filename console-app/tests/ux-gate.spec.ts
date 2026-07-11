@@ -405,8 +405,13 @@ test.describe('UX 硬门 — 审批中心', () => {
   test('旧深链别名：?tab=agent → 审批待办面；?tab=history → 审批历史面', async ({ page }) => {
     await mockManage(page, {
       agent: { items: [AREQ()] },
-      history: [{ kind: 'access', action: 'approved', title: '营销物料使用规范 v3', subject: '王伟',
-                  owner_dept: 'production', decided_by_name: '生产部管理员', decided_at: '2026-07-08 10:00:00', detail: '', extra: '' }],
+      history: [
+        { kind: 'access', action: 'approved', title: '营销物料使用规范 v3', subject: '王伟',
+          owner_dept: 'production', decided_by_name: '生产部管理员', decided_at: '2026-07-08 10:00:00', detail: '', extra: '' },
+        // agent 类（后端五类扩展）：终止决策 → 时间线要能渲染类型/动作/发起人
+        { kind: 'agent', action: 'rejected_terminate', title: 'u8_writeback', subject: '王伟',
+          owner_dept: 'production', decided_by_name: '生产部管理员', decided_at: '2026-07-07 09:00:00', detail: '', extra: '' },
+      ],
     });
     await page.goto(`${MANAGE_ROUTE}&tab=agent`);
     await expect(approvalsTab(page)).toHaveAttribute('aria-selected', 'true');
@@ -416,6 +421,9 @@ test.describe('UX 硬门 — 审批中心', () => {
     await expect(approvalsTab(page)).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByTestId('approval-history')).toBeVisible();
     await expect(page.getByText('营销物料使用规范 v3')).toBeVisible();   // 时间线有内容，不是空壳
+    await expect(page.getByText('u8_writeback')).toBeVisible();          // agent 决策同列时间线
+    await expect(page.getByText('发起人 王伟')).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'Agent 操作' })).toBeVisible();   // 类型筛选 chip
   });
 
   test('全空 → 聚合空态可见 + 知识贡献跳转 chip 带计数直达贡献页', async ({ page }) => {
@@ -442,6 +450,18 @@ test.describe('UX 硬门 — 审批中心', () => {
     const vp = page.viewportSize();
     expect(box && vp && box.y >= 0 && box.y + box.height <= vp.height,
       `台账表头须在首屏内（y=${box?.y}, 视口高=${vp?.height}）`).toBeTruthy();
+  });
+
+  test('桌面 ?token 刷新不再死胡同：token tab 级续存，reload 后自动重登且 URL 仍无 token', async ({ page }) => {
+    await mockManage(page, { access: [ACCESS_REQ()] });
+    await page.goto(MANAGE_ROUTE);
+    await expect(page.getByRole('tab', { name: /概览看板/ })).toBeVisible();
+    expect(page.url(), '#F-console-urltoken：token 抹除不回退').not.toContain('token=');
+    await page.reload();
+    await expect(page.getByRole('tab', { name: /概览看板/ }),
+      '刷新后应用 sessionStorage 续存 token 自动重登，而非「未能完成免登」死胡同').toBeVisible();
+    await expect(page.getByText('未能完成免登')).toHaveCount(0);
+    expect(page.url()).not.toContain('token=');
   });
 
   test('切子 tab 不整树重挂载：/api/kb/my-docs 全程只请求一次', async ({ page }) => {

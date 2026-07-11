@@ -12,15 +12,21 @@ const { approvalHistory, loadApprovalHistory, loadErrors, isKbAdmin } = useKb()
 
 // 类型 → 中文短标（badge）。
 const KIND_LABEL: Record<string, string> = {
-  access: '访问授权', contribution: '知识贡献', upload: '上传审批', admin_grant: '成员授权',
+  access: '访问授权', contribution: '知识贡献', upload: '上传审批', admin_grant: '成员授权', agent: 'Agent 操作',
 }
 // 决策动作 → 文案 + 徽标色 + 时间线点色。通过/采纳/授予→绿；驳回→红；撤销→琥珀。
+// agent 类动作沿 approval_request.status 原值：批准/改参批准→绿；驳回/终止→红；过期/撤回→琥珀。
 const ACTION: Record<string, { label: string; pill: string; dot: string }> = {
   approved: { label: '通过', pill: 'text-st-live bg-st-live/10', dot: 'bg-st-live' },
   accepted: { label: '采纳', pill: 'text-st-live bg-st-live/10', dot: 'bg-st-live' },
   granted: { label: '授予', pill: 'text-st-live bg-st-live/10', dot: 'bg-st-live' },
   rejected: { label: '驳回', pill: 'text-st-fail bg-st-fail/10', dot: 'bg-st-fail' },
   revoked: { label: '撤销', pill: 'text-st-busy bg-st-busy/10', dot: 'bg-st-busy' },
+  edited: { label: '改参批准', pill: 'text-st-live bg-st-live/10', dot: 'bg-st-live' },
+  rejected_feedback: { label: '驳回', pill: 'text-st-fail bg-st-fail/10', dot: 'bg-st-fail' },
+  rejected_terminate: { label: '终止', pill: 'text-st-fail bg-st-fail/10', dot: 'bg-st-fail' },
+  expired: { label: '过期未审', pill: 'text-st-busy bg-st-busy/10', dot: 'bg-st-busy' },
+  cancelled: { label: '撤回', pill: 'text-st-busy bg-st-busy/10', dot: 'bg-st-busy' },
 }
 const act = (a: string) => ACTION[a] || { label: a || '—', pill: 'text-st-muted bg-st-muted/10', dot: 'bg-border-strong' }
 // 贡献采纳后的入库结果（extra=ingestion_status）→ 次要 pill；仅有意义态才显。
@@ -31,10 +37,14 @@ const INGEST: Record<string, { label: string; pill: string }> = {
   failed: { label: '入库失败', pill: 'text-st-fail bg-st-fail/10' },
 }
 
-// 类型筛选 chip（kb_admin 见四类，dept_admin 只见前两类）。
+// 类型筛选 chip（kb_admin 见五类，dept_admin 见 access/contribution/agent）。
+// agent chip 常显：RAG_AGENT_ENABLE 关时该类无数据，筛选结果空由「当前筛选无记录」兜底。
 const chips = computed(() => {
   const base = [{ key: 'all', label: '全部' }, { key: 'access', label: '访问授权' }, { key: 'contribution', label: '知识贡献' }]
-  return isKbAdmin.value ? [...base, { key: 'upload', label: '上传审批' }, { key: 'admin_grant', label: '成员授权' }] : base
+  const tail = [{ key: 'agent', label: 'Agent 操作' }]
+  return isKbAdmin.value
+    ? [...base, { key: 'upload', label: '上传审批' }, { key: 'admin_grant', label: '成员授权' }, ...tail]
+    : [...base, ...tail]
 })
 const activeKind = ref('all')
 const rows = computed(() =>
@@ -42,7 +52,7 @@ const rows = computed(() =>
 
 // 元信息行：申请人/作者/目标 · 归属部门 · 决策人（缺失项自动省略）。
 function subjectLabel(r: ApprovalHistoryItem): string {
-  const p = r.kind === 'contribution' ? '作者' : r.kind === 'admin_grant' ? '目标' : '申请人'
+  const p = r.kind === 'contribution' ? '作者' : r.kind === 'admin_grant' ? '目标' : r.kind === 'agent' ? '发起人' : '申请人'
   return `${p} ${r.subject}`
 }
 function metaOf(r: ApprovalHistoryItem): string {
