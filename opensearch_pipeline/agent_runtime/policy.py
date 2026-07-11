@@ -108,6 +108,16 @@ class PolicyEngine:
         gid = next((r.policy_id for r in grants if r.effect == "allow"), "rule.allow")
         return PolicyDecision("allow", gid, f"允许 {spec.permission_scope}", obligations)
 
+    def would_grant(self, ctx: "ExecutionContext", spec: ToolSpec) -> bool:
+        """可见集裁决（P1「工具可见集未按 policy 收敛」）：该 ctx 是否存在任何授予
+        （allow/require_approval）且无显式 deny——与 authorize_tool_call 同一规则源的
+        args 无关投影。**必然被拒的工具不该出现在模型可见集**（减少误调用与提示注入面）；
+        调用时 authorize_tool_call 仍逐调用兜底（可见≠放行）。"""
+        matched = [r for r in self._rules if _rule_matches(r, ctx, spec)]
+        if any(r.effect == "deny" for r in matched):
+            return False
+        return any(r.effect in ("allow", "require_approval") for r in matched)
+
 
 def default_policy_engine() -> PolicyEngine:
     """首批基线：只读工具授予任意已认证用户（数据面 ACL 另行过滤）；写型无默认授予→default-deny，
@@ -212,11 +222,13 @@ def make_adjudicator(registry: "ToolRegistry", policy: PolicyEngine, run_store,
         # 幂等键按**逻辑调用**派生（run_id:call_id）：step_no 每裁决 MAX+1 新生成，
         # 用它做键任何重放/重试永远 miss，幂等层整层空转（深度审查 C 组 P1）。
         # call_id 缺失（gateway 对缺失兜底空串）→ 退化为按参数摘要派生，仍跨重放稳定。
+        # obligations 随裁决进执行层（P1：只收集不执行 → 已注册执行器的强制生效、
+        # 无执行器的在副作用前 fail-closed 拒绝，见 tool_executor）。
         idem = None
         if tool.spec.idempotency == "key_required":
             idem = f"{ctx.run_id}:{ev.call_id or digest(ev.arguments)}"
         return tool_executor.execute(ctx, tool, ev.arguments, run_id=ctx.run_id, step_no=step_no,
                                      policy_decision=pdecision, policy_id=decision.policy_id,
-                                     idempotency_key=idem)
+                                     idempotency_key=idem, obligations=decision.obligations)
 
     return _adjudicate

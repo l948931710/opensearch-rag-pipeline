@@ -36,7 +36,9 @@ DEFAULT_APPROVAL_TTL_S = 259200
 # decide() 的返回语义（kb_access 范式：CAS 失败不是异常，是并发/迟到事实）
 DECIDE_ACCEPTED = "accepted"                  # 本次决策生效（pending → 目标态）
 DECIDE_DUPLICATE = "duplicate"                # 同 (request, idempotency_key) 重放 → 幂等返回
-DECIDE_ALREADY_DECIDED = "already_decided"    # 已被他人决出不同结果 / 已过期（迟到决策拒绝）
+DECIDE_ALREADY_DECIDED = "already_decided"    # 已被他人决出不同结果（迟到决策拒绝）
+DECIDE_EXPIRED = "expired"                    # P0-C：pending 但已过 expires_at → 原子转 expired 并拒绝
+                                              # （过期不再依赖 reaper 窗口——决策时刻即裁决）
 
 
 def _op_db() -> str:
@@ -78,7 +80,8 @@ def resolve_scope_live(tool_name: str, args: Optional[Dict[str, Any]]) -> Option
     if fn is None:
         return None
     try:
-        return str(fn(None, dict(args or {})) or "").strip()[:64]
+        # [:160]：backup steward 的 CSV scope（"steward,backup"，schema/031 加宽）
+        return str(fn(None, dict(args or {})) or "").strip()[:160]
     except Exception:   # noqa: BLE001
         logger.warning("approver_scope 现算失败（fail-closed 到 kb_admin）：%s",
                        tool_name, exc_info=True)
@@ -93,7 +96,7 @@ def _resolve_scope(tool_name: str, ctx: "ExecutionContext", args: Dict[str, Any]
     if fn is None:
         return derive_approver_scope(ctx)
     try:
-        return str(fn(ctx, args) or "").strip()[:64]
+        return str(fn(ctx, args) or "").strip()[:160]
     except Exception:   # noqa: BLE001
         logger.warning("approver_scope 解析器失败（fail-closed 到 kb_admin）：%s",
                        tool_name, exc_info=True)
@@ -108,40 +111,53 @@ class RDSApprovalStore:
         return _get_db_conn()
 
     # ── 挂起侧 ───────────────────────────────────────────────────
-    def create_request(self, run_id: str, ctx: "ExecutionContext",
+    def insert_request(self, cur, run_id: str, ctx: "ExecutionContext",
                        pending_call: Dict[str, Any], *, tool_version: str = "",
-                       ttl_s: Optional[int] = None) -> str:
-        """挂起时写一行 pending 请求，返回 request_id。参数**脱敏后**入库（渲染用），
-        原文摘要（args_digest）供与 tool_invocation / agent_audit_log 关联回放。"""
+                       ttl_s: Optional[int] = None,
+                       request_id: Optional[str] = None) -> str:
+        """游标级写 pending 请求（**不 commit**）——供 run_store.suspend_run_atomic 把
+        checkpoint + approval_request + step + running→suspended 收进**同一事务**（P0-E：
+        原 _persist_suspend 三段分事务，中途崩溃留下有 checkpoint 无审批行/有审批行未挂起
+        的半态）。独立使用走 create_request（自带事务，语义不变）。"""
         from opensearch_pipeline.agent_runtime.sanitize import sanitize_args_json
         from opensearch_pipeline.agent_runtime.tool_executor import digest
 
         if ttl_s is None:
             ttl_s = int(os.environ.get("RAG_AGENT_APPROVAL_TTL_S", str(DEFAULT_APPROVAL_TTL_S)))
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         args = pending_call.get("arguments") or {}
         tool_name = str(pending_call.get("tool_name") or "")[:64]
         summary = f"{tool_name}({', '.join(sorted(map(str, args)))})" if args else tool_name
         # requested_dept=发起人主属部门（归属展示）；approver_scope=审批路由键——两者在
-        # 有 per-tool 解析器时分道（如本体身份确认路由到 per-attr steward 而非发起人部门）
+        # 有 per-tool 解析器时分道（如本体身份确认路由到 per-attr steward 而非发起人部门）。
+        # scope 钳制 [:160]（031 加宽；backup steward CSV "steward,backup"）。
         requested_dept = derive_approver_scope(ctx)
         scope = _resolve_scope(tool_name, ctx, args)
         db = _op_db()
+        cur.execute(
+            f"INSERT INTO {db}.approval_request "
+            "(request_id, run_id, call_id, tool_name, tool_version, proposed_args_json, "
+            " args_digest, render_summary, requested_by, requested_dept, approver_scope, "
+            " status, expires_at, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',"
+            " DATE_ADD(NOW(3), INTERVAL %s SECOND), NOW(3))",
+            (request_id, run_id, str(pending_call.get("call_id") or "")[:64],
+             tool_name, tool_version[:16], sanitize_args_json(args), digest(args),
+             summary[:1000], (ctx.user_id or "-")[:64],
+             (requested_dept or None), scope[:160], int(ttl_s)),
+        )
+        return request_id
+
+    def create_request(self, run_id: str, ctx: "ExecutionContext",
+                       pending_call: Dict[str, Any], *, tool_version: str = "",
+                       ttl_s: Optional[int] = None) -> str:
+        """挂起时写一行 pending 请求，返回 request_id。参数**脱敏后**入库（渲染用），
+        原文摘要（args_digest）供与 tool_invocation / agent_audit_log 关联回放。"""
         conn = self._conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO {db}.approval_request "
-                    "(request_id, run_id, call_id, tool_name, tool_version, proposed_args_json, "
-                    " args_digest, render_summary, requested_by, requested_dept, approver_scope, "
-                    " status, expires_at, created_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',"
-                    " DATE_ADD(NOW(3), INTERVAL %s SECOND), NOW(3))",
-                    (request_id, run_id, str(pending_call.get("call_id") or "")[:64],
-                     tool_name, tool_version[:16], sanitize_args_json(args), digest(args),
-                     summary[:1000], (ctx.user_id or "-")[:64],
-                     (requested_dept or None), scope, int(ttl_s)),
-                )
+                request_id = self.insert_request(cur, run_id, ctx, pending_call,
+                                                 tool_version=tool_version, ttl_s=ttl_s)
             conn.commit()
             return request_id
         except Exception:
@@ -155,9 +171,20 @@ class RDSApprovalStore:
                reason: Optional[str] = None, edited_args: Optional[Dict[str, Any]] = None,
                idempotency_key: Optional[str] = None) -> str:
         """FOR UPDATE + pending CAS 决出处置。返回 DECIDE_ACCEPTED / DECIDE_DUPLICATE /
-        DECIDE_ALREADY_DECIDED。decision ∈ approved/edited/rejected_feedback/rejected_terminate。
-        同事务写 approval_decision（重复 idempotency_key → 幂等 DUPLICATE，不重复改状态）。"""
+        DECIDE_ALREADY_DECIDED / DECIDE_EXPIRED。decision ∈ approved/edited/rejected_feedback/
+        rejected_terminate。同事务写 approval_decision（重复 idempotency_key → 幂等 DUPLICATE）。
+
+        P0-C（重评报告 §5C）两处硬化：
+        - **过期在决策时刻裁决**：同一 FOR UPDATE 事务内读 expires_at 与 DB NOW(3) 比较——
+          过期的 pending **原子转 expired** 并拒绝（DECIDE_EXPIRED）。此前只有周期 reaper 置
+          expired，reaper 间隔内/停摆时过期行仍可被批准（动态探针 DECIDE_ACCEPTED 已复现）。
+          CAS UPDATE 条件同时带 `expires_at > NOW(3)`（纵深：即便读后时钟跨界也不放行）。
+        - **决定绑定最终参数摘要**：approval_decision.final_args_digest = approved→请求原
+          args_digest / edited→人工改后参数原文 sha256（digest 无 PII）/ rejected_*→NULL。
+          已决重放（routes 对非 pending 的重试）只认与该摘要一致的参数，堵改参重放。
+        """
         from opensearch_pipeline.agent_runtime.sanitize import sanitize_args_json
+        from opensearch_pipeline.agent_runtime.tool_executor import digest
 
         idem = (idempotency_key or uuid.uuid4().hex)[:64]
         db = _op_db()
@@ -165,13 +192,15 @@ class RDSApprovalStore:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT status FROM {db}.approval_request WHERE request_id=%s FOR UPDATE",
+                    f"SELECT status, args_digest, (expires_at <= NOW(3)) "
+                    f"FROM {db}.approval_request WHERE request_id=%s FOR UPDATE",
                     (request_id,))
                 row = cur.fetchone()
                 if not row:
                     conn.rollback()
                     return DECIDE_ALREADY_DECIDED
-                if row[0] != "pending":
+                status, orig_digest, is_expired = row[0], row[1], bool(row[2])
+                if status != "pending":
                     # 已决/已过期：同 idempotency_key 的重放幂等返回，其余按迟到拒绝
                     cur.execute(
                         f"SELECT decision FROM {db}.approval_decision "
@@ -179,22 +208,63 @@ class RDSApprovalStore:
                     dup = cur.fetchone()
                     conn.rollback()
                     return DECIDE_DUPLICATE if (dup and dup[0] == decision) else DECIDE_ALREADY_DECIDED
+                if is_expired:
+                    # 过期=拒绝（沉默不是同意）——决策时刻原子转 expired，不等 reaper
+                    cur.execute(
+                        f"UPDATE {db}.approval_request SET status='expired', decided_at=NOW(3) "
+                        "WHERE request_id=%s AND status='pending'", (request_id,))
+                    conn.commit()
+                    return DECIDE_EXPIRED
+                if decision == "edited":
+                    final_digest = digest(edited_args or {})
+                elif decision == "approved":
+                    final_digest = orig_digest
+                else:
+                    final_digest = None
                 cur.execute(
                     f"UPDATE {db}.approval_request SET status=%s, decided_at=NOW(3) "
-                    "WHERE request_id=%s AND status='pending'",
+                    "WHERE request_id=%s AND status='pending' AND expires_at > NOW(3)",
                     (decision, request_id))
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return DECIDE_EXPIRED       # 读后跨过期界：宁拒不批
                 cur.execute(
                     f"INSERT INTO {db}.approval_decision "
-                    "(decision_id, request_id, decision, edited_args_json, reason, decided_by, "
-                    " idempotency_key, decided_at) VALUES (%s,%s,%s,%s,%s,%s,%s,NOW(3))",
+                    "(decision_id, request_id, decision, edited_args_json, final_args_digest, "
+                    " reason, decided_by, idempotency_key, decided_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
                     (uuid.uuid4().hex, request_id, decision,
                      sanitize_args_json(edited_args) if edited_args is not None else None,
-                     (reason or None), (decided_by or "-")[:64], idem))
+                     final_digest, (reason or None), (decided_by or "-")[:64], idem))
             conn.commit()
             return DECIDE_ACCEPTED
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def get_decision(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """读该请求的权威决定行（≤1 行：decide 只在 pending CAS 成功时 INSERT 一次）。
+        P0-C：已决重放/对账**只消费这行不可变事实**——decided_by/reason/final_args_digest
+        以库为准，HTTP body 只能携带与 final_args_digest 一致的参数。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT decision_id, request_id, decision, final_args_digest, reason, "
+                    f"decided_by, decided_at FROM {db}.approval_decision "
+                    "WHERE request_id=%s ORDER BY decided_at DESC LIMIT 1",
+                    (request_id,))
+                row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(zip(("decision_id", "request_id", "decision", "final_args_digest",
+                          "reason", "decided_by", "decided_at"), row))
+            if d.get("decided_at") is not None:
+                d["decided_at"] = str(d["decided_at"])
+            return d
         finally:
             conn.close()
 
@@ -268,14 +338,18 @@ class RDSApprovalStore:
 
     def list_pending(self, scopes: Optional[List[str]] = None, *, requested_by: Optional[str] = None,
                      limit: int = 100) -> List[Dict[str, Any]]:
-        """审批队列。scopes=None → 全部（kb_admin）；否则按 approver_scope IN scopes（dept_admin）。
-        requested_by 给「我的申请」视图。"""
+        """审批队列。scopes=None → 全部（kb_admin）；否则按 approver_scope 覆盖匹配（dept_admin）。
+        requested_by 给「我的申请」视图。
+
+        P1-11 backup steward：approver_scope 可为 CSV（"steward,backup"，schema/031 加宽）——
+        队列过滤按**分量**匹配（FIND_IN_SET），managed 覆盖任一分量即入待办；此前 IN 精确
+        匹配会让带 backup 的请求从主/备 steward 的队列同时消失（只剩 kb_admin 可见）。"""
         db = _op_db()
         conds, params = ["status='pending'"], []
         if scopes is not None:
             if not scopes:
                 return []
-            conds.append("approver_scope IN (%s)" % ",".join(["%s"] * len(scopes)))
+            conds.append("(" + " OR ".join(["FIND_IN_SET(%s, approver_scope)"] * len(scopes)) + ")")
             params.extend(scopes)
         if requested_by:
             conds.append("requested_by=%s")

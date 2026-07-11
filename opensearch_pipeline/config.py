@@ -737,6 +737,21 @@ def load_config() -> PipelineConfig:
     if not emb_base:
         emb_base = f"https://{ds_domain}" if is_emb_dashscope else "https://generativelanguage.googleapis.com/v1beta"
 
+    # 【P1-15】纯 RDS 作业的模型解析豁免（重评报告「纯 RDS job 无必要要求 DashScope key」）：
+    # RAG_NO_MODEL_RESOLUTION=ack 时 llm/ocr/vlm/embedding 全部解析为**惰性哨兵**——无供应商
+    # 端点、无 key。比「塞假 key」强的 fail-closed：任何意外模型调用立刻失败在空端点，绝无
+    # 静默兜底到 Gemini 的通道。生产供应商守卫据此豁免「必须有 DashScope key」（禁 Gemini
+    # 名称检查照跑，哨兵天然通过）；嵌入制度守卫同步豁免（声明不嵌入的作业没有污染索引的
+    # 通道）。适用面：DataWorks retention / ontology backfill / invariants 等纯 RDS 节点——
+    # 会真调模型的作业（如 ops_health_monitor 的 embedding 对账）**禁用**本旗标。
+    _no_model_resolution = os.environ.get("RAG_NO_MODEL_RESOLUTION", "").strip().lower() == "ack"
+    if _no_model_resolution:
+        _SENTINEL_MODEL = "model-resolution-disabled"
+        llm_key = ocr_key = emb_key = ""
+        llm_base_url = ocr_base_url = emb_base = ""
+        llm_model = ocr_model = vlm_model = emb_model = _SENTINEL_MODEL
+        is_emb_dashscope = False
+
     config = PipelineConfig(
         simulate=rag_simulate,
         simulate_db=rag_simulate_db,
@@ -916,6 +931,18 @@ def load_config() -> PipelineConfig:
             f"明文落盘 qa_session_log。请移除该环境变量（默认即 True=掩码）。"
         )
 
+    # 【Agent P1】职责分离硬门（重评报告 §6「self-approval 危险开关缺生产启动断言」）：
+    # RAG_AGENT_ALLOW_SELF_APPROVAL 是 dev/单人联调的逃生门——production/staging 打开它
+    # 意味着发起人可自批 HIGH_WRITE，审批闭环整体失效，必须与供应商守卫同级 fail-fast。
+    # routes/agent._self_approval_allowed 另有运行时环境复核（双保险，防启动后注入）。
+    if _env_label_prod and os.environ.get("RAG_AGENT_ALLOW_SELF_APPROVAL",
+                                          "").strip().lower() in ("1", "true", "yes", "on"):
+        raise ValueError(
+            f"🚨 [PRODUCTION SECURITY GUARD] RAG_AGENT_ALLOW_SELF_APPROVAL 在 '{config.environment}' "
+            f"环境被禁止！该开关允许发起人自批高风险写操作（职责分离失效），仅限本地开发联调。"
+            f"请移除该环境变量。"
+        )
+
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
     # 且只配 GEMINI key 时，模型解析全路由 Google，生产 chunk_text/查询内容会被 POST 到 Google。
@@ -937,7 +964,10 @@ def load_config() -> PipelineConfig:
     if _env_label_prod or _touches_prod_target:
         _guard_scope = config.environment if _env_label_prod \
             else f"{config.environment} + prod-target-fingerprint"
-        if not dashscope_key:
+        # P1-15：RAG_NO_MODEL_RESOLUTION=ack（模型全解析为惰性哨兵）时豁免 key 要求——
+        # 「必须有 DashScope key」防的是**兜底到 Gemini**，哨兵状态无任何供应商通道，
+        # 比有 key 更强；下方禁 Gemini 名称检查照跑（哨兵天然通过）。
+        if not dashscope_key and not _no_model_resolution:
             raise ValueError(
                 f"🚨 [PRODUCTION SECURITY GUARD] DashScope API Key is not configured under '{_guard_scope}' environment! "
                 f"To protect privacy & security, falling back to Google Gemini is strictly forbidden in production."
@@ -970,6 +1000,7 @@ def load_config() -> PipelineConfig:
     # 才 fail-fast。刻意实验用 RAG_ALLOW_INCOMPATIBLE_EMBEDDING=ack 显式放行。
     _has_search_backend = bool(config.alibaba_vector.endpoint or config.opensearch.host)
     if (not rag_simulate and not is_emb_dashscope and _has_search_backend
+            and not _no_model_resolution
             and os.environ.get("RAG_ALLOW_INCOMPATIBLE_EMBEDDING", "") != "ack"):
         raise EnvironmentMismatchError(
             f"🚨 [EMBEDDING REGIME GUARD] 嵌入模型解析为 '{emb_model}'（非 DashScope）但已配置"

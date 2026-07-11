@@ -59,11 +59,14 @@ ModelFn = Callable[[List[Msg], List[ToolSpec]], ModelTurn]
 
 
 def encode_checkpoint(messages: List[Msg], *, pending_call: Optional[Dict[str, Any]] = None,
-                      turn: int = 0, version: int = CHECKPOINT_VERSION) -> Tuple[bytes, str]:
-    """(messages[, pending_call, turn]) → (state_blob, digest)。Loop 层拥有 checkpoint 编解码（B4）。
-    pending_call = 挂起时待审批的工具调用（resume APPROVED 据此重执行）。"""
+                      turn: int = 0, version: int = CHECKPOINT_VERSION,
+                      remaining_calls: Optional[List[Dict[str, Any]]] = None) -> Tuple[bytes, str]:
+    """(messages[, pending_call, turn, remaining_calls]) → (state_blob, digest)。Loop 层拥有
+    checkpoint 编解码（B4）。pending_call = 挂起时待审批的工具调用（resume APPROVED 据此重执行）；
+    remaining_calls = 同批中排在其后的未处理 calls（P1 多 call 挂起不丢调用）。"""
     blob = json.dumps({"version": version, "messages": messages,
-                       "pending_call": pending_call, "turn": turn},
+                       "pending_call": pending_call, "turn": turn,
+                       "remaining_calls": list(remaining_calls or [])},
                       ensure_ascii=False).encode("utf-8")
     return blob, hashlib.sha256(blob).hexdigest()
 
@@ -76,11 +79,12 @@ def decode_checkpoint(state_blob: bytes) -> List[Msg]:
 
 
 def decode_checkpoint_state(state_blob: bytes) -> Dict[str, Any]:
-    """完整解码 → {messages, pending_call, turn}（resume 用）。
+    """完整解码 → {messages, pending_call, turn, remaining_calls}（resume 用）。
 
     F7：校验序列化版本——写入 version 但解码忽略等于没有版本机制，跨 CD 发布后
     resume 到不兼容格式会以更隐蔽的方式坏掉。不兼容 → 抛错，executor 回滚认领
     （run 留在 suspended，可由新版本代码或对账处置）。
+    remaining_calls：旧 blob 无此键 → []（形状兼容，无需 bump 版本）。
     """
     if isinstance(state_blob, str):
         state_blob = state_blob.encode("utf-8")
@@ -89,7 +93,8 @@ def decode_checkpoint_state(state_blob: bytes) -> Dict[str, Any]:
     if ver != CHECKPOINT_VERSION:
         raise ValueError(f"checkpoint 版本不兼容: {ver}（当前 {CHECKPOINT_VERSION}）")
     return {"messages": d.get("messages", []), "pending_call": d.get("pending_call"),
-            "turn": int(d.get("turn", 0))}
+            "turn": int(d.get("turn", 0)),
+            "remaining_calls": list(d.get("remaining_calls") or [])}
 
 
 def _result_text(result: Optional[ToolResult]) -> str:
@@ -146,6 +151,29 @@ class DefaultAgentLoop:
             if txt or rsn:
                 yield ModelDelta(text=txt, reasoning=(rsn or None))
 
+    def _process_calls(self, msgs: List[Msg], calls: List[Dict[str, Any]], turn: int,
+                       first_usage: Optional[Usage] = None
+                       ) -> Generator[AgentEvent, Optional[ToolResult], bool]:
+        """顺序处理一批 tool calls（提案→回注→追加 tool 消息）。命中审批 → yield RunSuspended
+        （**携带 remaining_calls=其后未处理的 calls**）并返回 True（调用方就此结束生成器）。
+
+        P1「一轮多 tool call 挂起丢调用」修复核心：此前第一个待批 call 即结束整轮，同批
+        后续 calls 既无 tool response 也不排队——resume 后 assistant 消息里存在没有响应的
+        tool_call，OpenAI 消息序非法（gateway 换真模型即 400）。现在挂起把剩余 calls 序列化
+        进 checkpoint，resume 处置完 pending 后逐个续处理，每个 call 最终都有 tool 消息。"""
+        for i, call in enumerate(calls):
+            usage = first_usage if (first_usage is not None and i == 0) else Usage()
+            result: Optional[ToolResult] = yield ToolCallProposed(
+                call_id=call["call_id"], tool_name=call["tool_name"],
+                arguments=call.get("arguments", {}), turn_index=turn, usage=usage)
+            if result is not None and result.status == "pending_approval":
+                yield RunSuspended(pending_call=dict(call), remaining_calls=list(calls[i + 1:]),
+                                   turn_index=turn, state_messages=msgs)
+                return True
+            msgs.append({"role": "tool", "call_id": call["call_id"],
+                         "content": _result_text(result)})
+        return False
+
     def run(self, ctx: ExecutionContext, messages: List[Msg],
             tools: List[ToolSpec], start_turn: int = 0
             ) -> Generator[AgentEvent, Optional[ToolResult], None]:
@@ -163,33 +191,27 @@ class DefaultAgentLoop:
             msgs.append({"role": "assistant",
                          "tool_calls": [{"call_id": c.call_id, "name": c.tool_name,
                                          "arguments": c.arguments} for c in mt.tool_calls]})
-            for i, call in enumerate(mt.tool_calls):
-                # Loop 只提案；驱动器裁决+执行后经 .send() 把 ToolResult 回注（= yield 表达式的值）。
-                # 本轮 usage 只挂同批第一个 call（驱动器按 turn 去重累加 token 预算）。
-                result: Optional[ToolResult] = yield ToolCallProposed(
-                    call_id=call.call_id, tool_name=call.tool_name, arguments=call.arguments,
-                    turn_index=_turn, usage=(mt.usage if i == 0 else Usage()))
-                if result is not None and result.status == "pending_approval":
-                    # 命中 REQUIRE_APPROVAL → 挂起：状态（含本轮 assistant tool_calls msg）+ 待批 call
-                    # 交驱动器写 checkpoint；生成器就此结束，resume 新建一个从 checkpoint 续跑。
-                    yield RunSuspended(
-                        pending_call={"call_id": call.call_id, "tool_name": call.tool_name,
-                                      "arguments": call.arguments},
-                        turn_index=_turn, state_messages=msgs)
-                    return
-                msgs.append({"role": "tool", "call_id": call.call_id,
-                             "content": _result_text(result)})
+            # Loop 只提案；驱动器裁决+执行后经 .send() 把 ToolResult 回注（= yield 表达式的值）。
+            # 本轮 usage 只挂同批第一个 call（驱动器按 turn 去重累加 token 预算）。
+            calls = [{"call_id": c.call_id, "tool_name": c.tool_name, "arguments": c.arguments}
+                     for c in mt.tool_calls]
+            suspended = yield from self._process_calls(msgs, calls, _turn, first_usage=mt.usage)
+            if suspended:
+                return
         yield RunFailed(error=f"max_turns={max_turns} 超限", retryable=False)
 
     def resume(self, ctx: ExecutionContext, checkpoint_state: Any, outcome: ApprovalOutcome,
                tools: Optional[List[ToolSpec]] = None
                ) -> Generator[AgentEvent, Optional[ToolResult], None]:
-        """从 checkpoint 状态 + 审批结局续跑。checkpoint_state = {messages, pending_call, turn}
-        （驱动器 decode_checkpoint_state 后传入 dict；也容 RunCheckpoint 对象）。tools=续跑时模型可见工具集。"""
+        """从 checkpoint 状态 + 审批结局续跑。checkpoint_state = {messages, pending_call, turn,
+        remaining_calls}（驱动器 decode_checkpoint_state 后传入 dict；也容 RunCheckpoint 对象）。
+        tools=续跑时模型可见工具集。remaining_calls（同批未处理 calls）在 pending 处置后逐个
+        续处理——再命中审批则再次挂起（每个 call 独立裁决）。"""
         state = checkpoint_state if isinstance(checkpoint_state, dict) else \
             decode_checkpoint_state(getattr(checkpoint_state, "state_blob", b"{}"))
         msgs: List[Msg] = list(state.get("messages", []))
         pending = state.get("pending_call")
+        remaining = list(state.get("remaining_calls") or [])
         tools = tools or []
         turn = int(state.get("turn", 0))
 
@@ -204,6 +226,11 @@ class DefaultAgentLoop:
                              "content": f"[审批未通过] {outcome.reason}"})
             else:
                 msgs.append({"role": "user", "content": f"[审批未通过，请换方案] {outcome.reason}"})
+            # 同批剩余 calls 照常处理（独立裁决；被拒的只是 pending 那一个）
+            if remaining:
+                suspended = yield from self._process_calls(msgs, remaining, turn)
+                if suspended:
+                    return
             yield from self.run(ctx, msgs, tools, start_turn=turn + 1)
             return
         # APPROVED / EDITED：重提待批 call（驱动器因已授权而执行；EDITED 用人工改后参）。
@@ -215,4 +242,8 @@ class DefaultAgentLoop:
                 arguments=args, turn_index=turn)
             msgs.append({"role": "tool", "call_id": pending["call_id"],
                          "content": _result_text(result)})
+        if remaining:
+            suspended = yield from self._process_calls(msgs, remaining, turn)
+            if suspended:
+                return
         yield from self.run(ctx, msgs, tools, start_turn=turn + 1)

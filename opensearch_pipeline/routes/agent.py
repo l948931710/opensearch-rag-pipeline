@@ -95,6 +95,16 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
                         rep.get("failed"), rep.get("expired"), rep.get("resuming_reset"))
             except Exception:   # noqa: BLE001
                 logger.warning("agent run 收尸失败（下轮重试）", exc_info=True)
+            # P0-E：stale executing invocation → uncertain（进程崩溃僵尸进人工对账通道，
+            # 不再既无人收尸又阻塞同键重试）
+            try:
+                if hasattr(run_store, "mark_stale_invocations_uncertain"):
+                    n = run_store.mark_stale_invocations_uncertain(
+                        stale_s=int(os.environ.get("RAG_AGENT_INV_STALE_S", "900")))
+                    if n:
+                        logger.warning("tool_invocation 收尸：stale executing→uncertain %s（待对账）", n)
+            except Exception:   # noqa: BLE001
+                logger.warning("tool_invocation 收尸失败（下轮重试）", exc_info=True)
             if approval_store is not None:
                 try:
                     n = approval_store.expire_stale()
@@ -141,7 +151,12 @@ def _get_runtime():
         run_store = RDSRunStore()
         # WS3 审批：executor.resume 写已批准 call → adjudicator 放行执行；两者须共享**同一** approvals dict。
         approvals: dict = {}
-        adjudicator = make_adjudicator(registry, default_policy_engine(), run_store,
+        policy = default_policy_engine()
+        # P1「工具可见集未按 policy 收敛」：模型可见集 = 该 ctx 存在授予的工具
+        # （would_grant），必然被拒的不进 prompt；调用时 Policy 仍逐调用兜底。
+        registry.attach_visibility_filter(
+            lambda c, specs: [s for s in specs if policy.would_grant(c, s)])
+        adjudicator = make_adjudicator(registry, policy, run_store,
                                        audit=RDSAuditLog(), approvals=approvals)   # 执行前合规审计
         gateway = default_gateway(call_logger=run_store.record_llm_call)   # 每次模型调用记 llm_call_log
         # WS2-3：装 rolling summary 真 summarizer（廉价模型压缩超窗历史）；是否生效由
@@ -174,7 +189,8 @@ def _stream_events(handle, session_id: str, message_id: str):
     整段被跳过、答案静默丢失——已移到 run 完成侧（executor.submit/resume 的 on_complete）。
     GeneratorExit 时 finally 里不得再 yield（RuntimeError），用 closed 旗标跳过 [DONE]。"""
     from opensearch_pipeline.agent_runtime.events import (
-        ModelDelta, RunCompleted, RunFailed, RunSuspended, ToolCallProposed)
+        ModelDelta, RunCompleted, RunFailed, RunSuspended, ToolCallProposed,
+        ToolResultEmitted)
     closed = False
     try:
         yield _sse({"type": "session", "session_id": session_id, "message_id": message_id,
@@ -185,6 +201,11 @@ def _stream_events(handle, session_id: str, message_id: str):
             elif isinstance(ev, ToolCallProposed):
                 yield _sse({"type": "tool_call", "call_id": ev.call_id,
                             "tool_name": ev.tool_name, "arguments": ev.arguments})
+            elif isinstance(ev, ToolResultEmitted):
+                # 工具结局（P0-F 阶段化状态）：status+耗时，无内容/参数（敏感面走 run center）
+                yield _sse({"type": "tool_result", "call_id": ev.call_id,
+                            "tool_name": ev.tool_name, "status": ev.status,
+                            "elapsed_ms": ev.elapsed_ms})
             elif isinstance(ev, RunSuspended):
                 yield _sse({"type": "approval", "approval_request_id": ev.approval_request_id,
                             "checkpoint_id": ev.checkpoint_id, "pending_call": ev.pending_call})
@@ -303,9 +324,26 @@ class ApproveRequest(BaseModel):
 
 
 def _self_approval_allowed() -> bool:
-    """dev/单人环境逃生门（默认关）。生产绝不开——开了职责分离即失效。"""
-    return os.environ.get("RAG_AGENT_ALLOW_SELF_APPROVAL",
-                          "").strip().lower() in ("1", "true", "yes", "on")
+    """dev/单人环境逃生门（默认关）。生产绝不开——开了职责分离即失效。
+
+    P1「危险开关缺生产启动断言」双保险：config.py 生产守卫在启动时 hard-raise（见
+    _validate 区 RAG_AGENT_ALLOW_SELF_APPROVAL 断言）；此处运行时再校验一次环境——
+    进程启动后被注入的环境变量也不放行（fail-closed：环境读不出按生产处理）。"""
+    if os.environ.get("RAG_AGENT_ALLOW_SELF_APPROVAL",
+                      "").strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        from opensearch_pipeline.config import get_config
+        return get_config().environment not in ("production", "staging")
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def _scope_covers(scope: str, managed: set) -> bool:
+    """approver_scope 覆盖判定。P1-11 backup steward：scope 可为 CSV（"steward,backup"，
+    schema/031 加宽）——managed 覆盖**任一**分量即可审（备份 steward 代理生效）。"""
+    parts = [s.strip() for s in (scope or "").split(",") if s.strip()]
+    return bool(set(parts) & managed)
 
 
 def _authorize_approver(identity: Identity, run: dict, areq: Optional[dict],
@@ -336,7 +374,8 @@ def _authorize_approver(identity: Identity, run: dict, areq: Optional[dict],
     kb = resolve_kb_identity(identity.user_id)
     if kb.role == ROLE_KB_ADMIN:
         return scope
-    if kb.role == ROLE_DEPT_ADMIN and scope and scope in set(managed_owner_depts(kb)):
+    # P1-11：scope 支持 CSV（steward,backup）——backup steward 的 dept_admin 也可审
+    if kb.role == ROLE_DEPT_ADMIN and scope and _scope_covers(scope, set(managed_owner_depts(kb))):
         return scope
     raise HTTPException(status_code=403,
                         detail="无权审批该请求（需 kb_admin 或 approver_scope 覆盖的 dept_admin）")
@@ -379,11 +418,13 @@ def agent_approve(req: ApproveRequest, request: Request,
         logger.warning("approval_request 读取失败（授权收敛到 kb_admin）", exc_info=True)
     effective_scope = _authorize_approver(identity, run, areq, outcome.kind)
 
-    # 决定持久化：pending → CAS 决出（first-valid-wins + uk_req_idem 幂等）；
-    # 已决同向 → resume 重放（决策已落库、上次 resume 失败回滚 suspended 的重试路径）；
-    # 已决不同向 / 已过期 → 409（迟到决策拒绝，「沉默不是同意」）。
+    # 决定持久化：pending → CAS 决出（first-valid-wins + uk_req_idem 幂等 + **过期在决策
+    # 时刻原子裁决**，P0-C）；已决 → 只允许重放**数据库里那个不可变决定**（同向 + digest
+    # 一致 + decided_by/reason 以库为准）；不同向/改参/已过期 → 409。
+    decided_by_effective = identity.user_id
     if areq is not None:
-        from opensearch_pipeline.agent_runtime.approval_store import DECIDE_ALREADY_DECIDED
+        from opensearch_pipeline.agent_runtime.approval_store import (
+            DECIDE_ALREADY_DECIDED, DECIDE_EXPIRED)
         if areq.get("status") == "pending":
             try:
                 res = approval_store.decide(
@@ -394,12 +435,40 @@ def agent_approve(req: ApproveRequest, request: Request,
             except Exception:   # noqa: BLE001 — 决策落库失败：宁拒不续（无 decision 行不放行执行）
                 logger.error("approval_decision 写失败，拒绝续跑", exc_info=True)
                 raise HTTPException(status_code=503, detail="审批决定落库失败，请重试")
+            if res == DECIDE_EXPIRED:
+                raise HTTPException(status_code=409,
+                                    detail="该审批请求已过期（过期即拒绝，不接受迟到批准）")
             if res == DECIDE_ALREADY_DECIDED:
                 raise HTTPException(status_code=409, detail="该审批请求已被处置或已过期")
             # ACCEPTED / DUPLICATE（同键同向重放）→ 继续 resume
-        elif areq.get("status") != outcome.kind:
-            raise HTTPException(status_code=409,
-                                detail=f"该审批请求已被处置（{areq.get('status')}）")
+        else:
+            # P0-C「edited decision 未绑定」：已决重放不吃 HTTP body 的语义——kind 必须同向，
+            # edited 参数必须与 approval_decision.final_args_digest（决策时刻按原文算的
+            # sha256）完全一致；reason/decided_by 一律以库内不可变决定行为准。
+            if areq.get("status") != outcome.kind:
+                raise HTTPException(status_code=409,
+                                    detail=f"该审批请求已被处置（{areq.get('status')}）")
+            dec = None
+            try:
+                dec = approval_store.get_decision(areq["request_id"])
+            except Exception:   # noqa: BLE001 — 读失败按缺行处理（fail-closed 拒绝重放）
+                logger.warning("approval_decision 读取失败（拒绝重放）", exc_info=True)
+            if dec is None:
+                raise HTTPException(status_code=409,
+                                    detail="该审批请求的决定行缺失，无法安全重放（请联系管理员）")
+            if outcome.kind == "edited":
+                from opensearch_pipeline.agent_runtime.tool_executor import digest as _digest
+                if not dec.get("final_args_digest"):
+                    raise HTTPException(status_code=409,
+                                        detail="历史决定缺最终参数摘要（早于 schema/031），"
+                                               "无法安全重放——请撤回后重新发起")
+                if _digest(getattr(outcome, "edited_args", None) or {}) != dec["final_args_digest"]:
+                    raise HTTPException(status_code=409,
+                                        detail="重放参数与已持久化的审批决定不一致（改参重放被拒）")
+            elif outcome.kind == "rejected_feedback":
+                from opensearch_pipeline.agent_runtime.approval import RejectedFeedback
+                outcome = RejectedFeedback(reason=dec.get("reason") or "审批未通过")
+            decided_by_effective = dec.get("decided_by") or identity.user_id
 
     try:
         from opensearch_pipeline.request_context import get_request_id
@@ -427,11 +496,12 @@ def agent_approve(req: ApproveRequest, request: Request,
         run_store, run, thread_id, requester_id, req_groups)
 
     # PR-C（P0-06 回链）：审批事实随凭据到执行点——工具落 approval_request_id、
-    # confirmed_by 记真实审批人、执行前重验 scope 漂移
+    # confirmed_by 记真实审批人、执行前重验 scope 漂移。已决重放时 decided_by 取
+    # **库内决定行**的审批人（重放者只是重驱者，不冒名决策人；P0-C）。
     approval_meta = None
     if areq is not None:
         approval_meta = {"request_id": areq.get("request_id"),
-                         "decided_by": identity.user_id,
+                         "decided_by": decided_by_effective,
                          "approver_scope": effective_scope}
     try:
         handle = executor.resume(req.run_id, ctx, outcome, loop, tools,
@@ -448,7 +518,14 @@ def agent_approve(req: ApproveRequest, request: Request,
 def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=None):
     """以**发起人**（run.user_id）身份现解 ACL 重建 resume ctx（铁律 5）——既不复用
     checkpoint 旧快照，也绝不套审批人/对账进程的身份（否则续跑段提权 + 归属错人）。
-    解析失败 → 空组（收敛最小权限，绝不放大）。返回 (ctx, requester_id, req_groups)。"""
+    解析失败 → 空组（收敛最小权限，绝不放大）。返回 (ctx, requester_id, req_groups)。
+
+    P1「resume 改变原始执行上下文」：channel / conversation_id 一律取 **agent_run 行**
+    （submit 时落库的原值）——此前 channel 硬编码 console、conversation_id 可被 /approve
+    body 覆盖（挂起期间换 conv 键，答案落错会话）。conversation_id 参数仅在 run 行无值时
+    兜底（历史行）。budget 上限沿全局默认；已耗 turns/tool_calls/tokens 由 _budget_snapshot
+    从 durable 播种；deadline 语义=**每个活跃执行段一个新窗口**（挂起可跨天，沿用原
+    deadline 会让任何跨窗审批的 resume 立即超时——这是有意设计，非漂移）。"""
     from opensearch_pipeline.agent_runtime import ExecutionContext
     requester_id = run.get("user_id") or ""
     req_groups: list = []
@@ -460,10 +537,13 @@ def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=Non
         req_role = resolve_kb_identity(requester_id).role or "employee"
     except Exception:   # noqa: BLE001
         logger.warning("resume 发起人身份现解失败（按最小权限续跑）", exc_info=True)
+    channel = run.get("channel") or "console"
+    if channel not in ("dingtalk", "console", "miniapp", "api"):
+        channel = "console"
     ctx = ExecutionContext.create(
         request_id=rid, user_id=requester_id, acl_groups=req_groups,
-        roles=(req_role,), channel="console", thread_id=thread_id,
-        conversation_id=conversation_id or run.get("conversation_id"))
+        roles=(req_role,), channel=channel, thread_id=thread_id,
+        conversation_id=run.get("conversation_id") or conversation_id)
     return ctx, requester_id, req_groups
 
 
@@ -638,6 +718,121 @@ def agent_tool_toggle(req: ToolToggleRequest, request: Request,
     logger.warning("kill switch：%s → %s（by %s，reason=%s）",
                    req.tool_name, status, identity.user_id, req.reason)
     return {"tool_name": req.tool_name, "status": status, "rows": n}
+
+
+# ── P0-F run center（重评报告 §8「运行中心」后端）───────────────────────────────
+@router.get("/api/agent/runs")
+def agent_runs(request: Request, limit: int = 20,
+               identity: Optional[Identity] = Depends(current_identity)):
+    """我的 runs（运行中心列表）：状态/预算消耗/起止时间。断线、刷新后的重入口——
+    SSE 不在线也能按 run_id 轮询到最终状态（报告 §8：不能依赖原 SSE 一直在线）。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if identity is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _registry, _gateway, _executor, run_store = _get_runtime()
+    if not hasattr(run_store, "list_runs_by_user"):
+        return {"items": []}
+    return {"items": run_store.list_runs_by_user(identity.user_id, limit=max(1, min(int(limit), 100)))}
+
+
+@router.get("/api/agent/runs/{run_id}")
+def agent_run_detail(run_id: str, request: Request,
+                     identity: Optional[Identity] = Depends(current_identity)):
+    """单 run 详情：状态 + 步骤时间线（脱敏 payload）+ 最新审批请求（等谁审/有效期/处置）
+    + 工具调用回执状态（succeeded/failed/uncertain——批准≠成功，用户必须看到真实执行结果，
+    报告 §8⑥）。归属：本人或 kb_admin；他人 run 一律 404（不可见==不存在）。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if identity is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _registry, _gateway, _executor, run_store = _get_runtime()
+    run = run_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    if run.get("user_id") != identity.user_id:
+        from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+        from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+        if resolve_kb_identity(identity.user_id).role != ROLE_KB_ADMIN:
+            raise HTTPException(status_code=404, detail="run 不存在")   # 不可见==不存在
+    for k in ("started_at", "ended_at"):
+        if run.get(k) is not None:
+            run[k] = str(run[k])
+    steps = run_store.list_steps(run_id) if hasattr(run_store, "list_steps") else []
+    invocations = (run_store.list_invocations(run_id=run_id, limit=100)
+                   if hasattr(run_store, "list_invocations") else [])
+    approval = None
+    try:
+        areq = _get_approval_store().get_latest_by_run(run_id)
+        if areq:
+            approval = {k: areq.get(k) for k in
+                        ("request_id", "call_id", "tool_name", "status", "approver_scope",
+                         "render_summary", "proposed_args", "expires_at", "created_at",
+                         "decided_at")}
+    except Exception:   # noqa: BLE001 — 审批读失败不阻断详情（fail-open，None 即无审批信息）
+        logger.warning("run 详情读取审批请求失败（忽略）", exc_info=True)
+    return {"run": run, "steps": steps, "invocations": invocations, "approval": approval}
+
+
+# ── P0-E 人工对账（uncertain invocation 处置）────────────────────────────────────
+@router.get("/api/agent/invocations")
+def agent_invocations(request: Request, status: str = "uncertain", limit: int = 50,
+                      identity: Optional[Identity] = Depends(current_identity)):
+    """对账视图（kb_admin）：默认列 uncertain（超时/崩溃后副作用不可知）的工具调用。
+    处置流：业务侧核实副作用 → POST /api/agent/invocations/resolve。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    _require_kb_admin(identity)
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _registry, _gateway, _executor, run_store = _get_runtime()
+    if status not in ("uncertain", "executing", "failed", "succeeded"):
+        raise HTTPException(status_code=400, detail="非法 status")
+    if not hasattr(run_store, "list_invocations"):
+        return {"items": []}
+    return {"items": run_store.list_invocations(status=status, limit=max(1, min(int(limit), 200)))}
+
+
+class InvocationResolveRequest(BaseModel):
+    """uncertain 对账处置。resolution：confirmed_succeeded=核实副作用已生效（补记成功，
+    幂等命中续生效）；confirmed_failed=核实未生效（放行同键重试）。note 必填（对账依据）。"""
+
+    invocation_id: str
+    resolution: str
+    note: str
+
+
+@router.post("/api/agent/invocations/resolve")
+def agent_invocation_resolve(req: InvocationResolveRequest, request: Request,
+                             identity: Optional[Identity] = Depends(current_identity)):
+    """人工对账处置（kb_admin）：uncertain → succeeded/failed（CAS 单向）。入合规审计。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    _require_kb_admin(identity)
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    to_status = {"confirmed_succeeded": "succeeded", "confirmed_failed": "failed"}.get(req.resolution)
+    if to_status is None:
+        raise HTTPException(status_code=400,
+                            detail="resolution ∈ confirmed_succeeded / confirmed_failed")
+    if not (req.note or "").strip():
+        raise HTTPException(status_code=422, detail="对账处置必须填写核实依据（note）")
+    _registry, _gateway, _executor, run_store = _get_runtime()
+    if not hasattr(run_store, "resolve_uncertain_invocation"):
+        raise HTTPException(status_code=501, detail="当前 run_store 不支持对账处置")
+    ok = run_store.resolve_uncertain_invocation(
+        req.invocation_id, to_status=to_status, note=req.note.strip(), resolved_by=identity.user_id)
+    if not ok:
+        raise HTTPException(status_code=409, detail="该调用不在 uncertain 态（已被处置或状态已变）")
+    try:                                             # 对账是高风险治理动作：谁核实了什么
+        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
+        RDSAuditLog().record(
+            None, event_type="invocation_reconcile", action=req.invocation_id,
+            decision=to_status,
+            detail={"by": identity.user_id, "note": req.note.strip()[:500]})
+    except Exception:   # noqa: BLE001
+        logger.warning("对账处置审计写失败（fail-open）", exc_info=True)
+    return {"invocation_id": req.invocation_id, "status": to_status}
 
 
 @router.get("/api/agent/approvals")

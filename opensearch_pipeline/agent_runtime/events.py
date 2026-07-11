@@ -63,6 +63,22 @@ class ToolCallProposed(AgentEvent):
     usage: Usage = Field(default_factory=Usage)
 
 
+class ToolResultEmitted(AgentEvent):
+    """一次工具调用的裁决/执行**结局**（driver 在 adjudicate 返回后发射）。
+
+    P0-F 运行状态 UX：没有这帧，前端只见「提案了工具」无法区分「执行完了/被拒/挂起」，
+    「正在调用工具」阶段成为无反馈长等待。**只带状态与耗时，不带内容/参数**——工具输出
+    可能含敏感数据，回执详情走 run center（invocations 已脱敏落库）。
+    status ∈ succeeded/failed/denied/pending_approval（与 ToolResult.status 同域）。"""
+
+    type: Literal["tool_result"] = "tool_result"
+    call_id: str
+    tool_name: str
+    status: str
+    elapsed_ms: int = 0
+    turn_index: int = 0
+
+
 class RunSuspended(AgentEvent):
     """命中 REQUIRE_APPROVAL → Runtime 写 checkpoint 并挂起 run，等审批。
 
@@ -77,6 +93,10 @@ class RunSuspended(AgentEvent):
     pending_call: Optional[Dict[str, Any]] = None       # {call_id, tool_name, arguments}——审批 UI + resume
     turn_index: int = 0
     state_messages: Optional[List[Dict[str, Any]]] = None   # loop→driver 内部载荷，driver 存后置 None
+    # P1「一轮多 tool call 挂起丢调用」：同批中排在待批 call 之后、尚未处理的 calls——
+    # 随 checkpoint 持久化，resume 处置完 pending 后逐个续处理（保证 assistant 消息里的
+    # 每个 tool_call 最终都有 tool response，OpenAI 消息序合法）。同为内部载荷不外泄。
+    remaining_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class RunCompleted(AgentEvent):
@@ -102,7 +122,7 @@ class RunFailed(AgentEvent):
 
 # 判别联合 —— 供序列化往返（parse/dump）。子类仍是 AgentEvent 实例（isinstance 可用）。
 AnyAgentEvent = Annotated[
-    Union[ModelDelta, ToolCallProposed, RunSuspended, RunCompleted, RunFailed],
+    Union[ModelDelta, ToolCallProposed, ToolResultEmitted, RunSuspended, RunCompleted, RunFailed],
     Field(discriminator="type"),
 ]
 

@@ -37,6 +37,9 @@ class ToolRegistry:
         # 多实例部署下任一实例经管理端点停用 → 所有实例一个 TTL 内生效。源本身 fail-open
         # （store 内已兜），这里再兜一层——源抛错绝不把 resolve 拖垮。
         self._disabled_source = None                                 # Callable[[], set] | None
+        # P1「工具可见集未按 policy 收敛」：注入式可见集过滤（routes 侧用 PolicyEngine.
+        # would_grant 装配）。registry 保持框架纯净不 import policy——回调注入。
+        self._visibility_filter = None                               # Callable[[ctx, List[ToolSpec]], List[ToolSpec]] | None
 
     # ── 注册 / 解析 ─────────────────────────────────────────────
     def register(self, tool: EnterpriseTool) -> None:
@@ -86,14 +89,27 @@ class ToolRegistry:
         return name in self._all_disabled()
 
     # ── 列举 / 治理 ─────────────────────────────────────────────
-    def list_specs(self, ctx: Any = None) -> List[ToolSpec]:
-        """对模型可见的工具契约（active、非 deprecated、非 disabled——含 DB kill switch）。
+    def attach_visibility_filter(self, fn) -> None:
+        """注入可见集过滤（fn(ctx, specs) -> specs）。routes 侧用 policy.would_grant 装配——
+        必然被拒的工具不进模型可见集（P1：全集暴露增加误调用/提示注入面）。"""
+        self._visibility_filter = fn
 
-        ctx 角色可见性过滤留待 PolicyEngine（可见集 = 该 ctx 可能被 ALLOW 的工具），本步先返回全集。
+    def list_specs(self, ctx: Any = None) -> List[ToolSpec]:
+        """对模型可见的工具契约（active、非 deprecated、非 disabled——含 DB kill switch，
+        再过注入的 policy 可见集过滤）。
+
+        过滤 fail-open：可见集算不出退回全集——Policy 在调用时仍逐调用兜底裁决
+        （可见 ≠ 放行），可见集只是缩小攻击面的第一层。ctx=None（治理/测试直调）不过滤。
         """
         disabled = self._all_disabled()
-        return [t.spec for t in self._latest.values()
-                if not t.spec.deprecated and t.spec.name not in disabled]
+        specs = [t.spec for t in self._latest.values()
+                 if not t.spec.deprecated and t.spec.name not in disabled]
+        if ctx is not None and self._visibility_filter is not None:
+            try:
+                return list(self._visibility_filter(ctx, specs))
+            except Exception:   # noqa: BLE001 — 可见集过滤故障绝不阻断 ask（Policy 调用时兜底）
+                pass
+        return specs
 
     def to_registry_rows(self, registered_by: str = "platform") -> List[Dict[str, Any]]:
         """代码内声明 → tool_registry 表行（治理同步用；实际写库走 admin API）。"""

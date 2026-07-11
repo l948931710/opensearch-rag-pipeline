@@ -671,3 +671,238 @@ def test_approvals_queue_scoping(approval_wired):
         assert _client(other).get("/api/agent/approvals?mine=1").json()["items"] == []
     finally:
         api.app.dependency_overrides.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0-C 已决重放不可变性（重评报告 §5C）：重放只消费 DB decision（同向 + digest 一致 +
+# decided_by/reason 以库为准）；过期在决策时刻原子拒绝。
+# ─────────────────────────────────────────────────────────────────────────────
+class _DecidedApprovalStore(_FakeApprovalStore):
+    """已决请求 + 权威决定行（get_decision）。decide 可脚本化返回（expired 场景）。"""
+
+    def __init__(self, areq=None, decision_row=None, decide_result="accepted"):
+        super().__init__(areq)
+        self.decision_row = decision_row
+        self.decide_result = decide_result
+
+    def get_decision(self, request_id):
+        return dict(self.decision_row) if self.decision_row else None
+
+    def decide(self, request_id, **kw):
+        if self.decide_result != "accepted":
+            return self.decide_result
+        return super().decide(request_id, **kw)
+
+
+def _wire_decided(mp, store, astore):
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(agent_route, "_get_approval_store", lambda: astore)
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+
+
+def test_approve_replay_edited_mismatched_args_409(approval_wired):
+    """DB 批 qty=7、重放带 qty=999999 → 409（改参重放被拒）——动态探针场景的守护。"""
+    store, astore, _, mp = approval_wired
+    from opensearch_pipeline.agent_runtime.tool_executor import digest
+    areq = _areq(); areq["status"] = "edited"
+    astore2 = _DecidedApprovalStore(
+        areq, decision_row={"decision": "edited", "final_args_digest": digest({"qty": 7}),
+                            "decided_by": "admin9", "reason": None})
+    _wire_decided(mp, store, astore2)
+    try:
+        r = _client(Identity(user_id="u2", acl_groups=["production"], role="employee")).post(
+            "/api/agent/approve",
+            json={"run_id": "r1", "outcome": {"kind": "edited",
+                                              "edited_args": {"qty": 999999}}})
+        assert r.status_code == 409
+        assert "不一致" in r.text
+        assert store.run["status"] == "suspended"          # 未被认领
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_replay_edited_matching_args_resumes(approval_wired):
+    """重放带与 DB final_args_digest 完全一致的参数 → 放行续跑。"""
+    store, astore, _, mp = approval_wired
+    from opensearch_pipeline.agent_runtime.tool_executor import digest
+    areq = _areq(); areq["status"] = "edited"
+    astore2 = _DecidedApprovalStore(
+        areq, decision_row={"decision": "edited", "final_args_digest": digest({"qty": 7}),
+                            "decided_by": "admin9", "reason": None})
+    _wire_decided(mp, store, astore2)
+    try:
+        r = _client(Identity(user_id="u2", acl_groups=["production"], role="employee")).post(
+            "/api/agent/approve",
+            json={"run_id": "r1", "outcome": {"kind": "edited", "edited_args": {"qty": 7}}})
+        assert r.status_code == 200
+        assert ("r1", "suspended", "resuming") in store.transitions
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_replay_missing_decision_row_409(approval_wired):
+    """已决但决定行缺失（历史/故障）→ fail-closed 409，绝不按 body 语义重放。"""
+    store, _astore, _, mp = approval_wired
+    areq = _areq(); areq["status"] = "approved"
+    astore2 = _DecidedApprovalStore(areq, decision_row=None)
+    _wire_decided(mp, store, astore2)
+    try:
+        r = _post_approve(Identity(user_id="u2", acl_groups=["production"], role="employee"))
+        assert r.status_code == 409
+        assert "决定行缺失" in r.text
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_replay_edited_legacy_without_digest_409(approval_wired):
+    """031 前的历史 edited 决定（无 final_args_digest）→ 拒绝自动重放（宁停不猜）。"""
+    store, _astore, _, mp = approval_wired
+    areq = _areq(); areq["status"] = "edited"
+    astore2 = _DecidedApprovalStore(
+        areq, decision_row={"decision": "edited", "final_args_digest": None,
+                            "decided_by": "admin9", "reason": None})
+    _wire_decided(mp, store, astore2)
+    try:
+        r = _client(Identity(user_id="u2", acl_groups=["production"], role="employee")).post(
+            "/api/agent/approve",
+            json={"run_id": "r1", "outcome": {"kind": "edited", "edited_args": {"qty": 7}}})
+        assert r.status_code == 409
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_expired_pending_409(approval_wired):
+    """decide 返回 DECIDE_EXPIRED（决策时刻过期原子裁决）→ 409 过期文案。"""
+    store, _astore, _, mp = approval_wired
+    astore2 = _DecidedApprovalStore(_areq(), decide_result="expired")
+    _wire_decided(mp, store, astore2)
+    try:
+        r = _post_approve(Identity(user_id="u2", acl_groups=["production"], role="employee"))
+        assert r.status_code == 409
+        assert "过期" in r.text
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_scope_covers_backup_steward_csv():
+    """P1-11：approver_scope CSV（steward,backup）——backup steward 的 managed 覆盖即可审。"""
+    assert agent_route._scope_covers("pmc,rd", {"rd"}) is True
+    assert agent_route._scope_covers("pmc,rd", {"pmc"}) is True
+    assert agent_route._scope_covers("pmc,rd", {"hr"}) is False
+    assert agent_route._scope_covers("pmc", {"pmc"}) is True
+    assert agent_route._scope_covers("", {"pmc"}) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0-F run center + P0-E 对账端点
+# ─────────────────────────────────────────────────────────────────────────────
+class _RunCenterStore(_SuspendedStore):
+    def __init__(self):
+        super().__init__()
+        self.resolved = []
+        self.uncertain = [{"invocation_id": "inv_u1", "run_id": "r1", "step_no": 2,
+                           "tool_name": "u8_writeback", "status": "uncertain",
+                           "policy_decision": "approved", "approval_request_id": "req1",
+                           "idempotency_key": "r1:c1", "args_digest": "d",
+                           "error_text": "超时", "started_at": None, "ended_at": None}]
+
+    def list_runs_by_user(self, user_id, *, limit=20):
+        return [dict(self.run)] if user_id == self.run["user_id"] else []
+
+    def list_steps(self, run_id, *, limit=200):
+        return [{"step_no": 1, "kind": "model_call", "payload": {"turn_index": 0},
+                 "tokens_prompt": 10, "tokens_completion": 5, "created_at": None}]
+
+    def list_invocations(self, *, status=None, run_id=None, limit=50):
+        if status == "uncertain" or run_id == "r1":
+            return [dict(r) for r in self.uncertain]
+        return []
+
+    def resolve_uncertain_invocation(self, invocation_id, *, to_status, note, resolved_by):
+        if any(r["invocation_id"] == invocation_id for r in self.uncertain):
+            self.resolved.append((invocation_id, to_status, note, resolved_by))
+            self.uncertain = [r for r in self.uncertain if r["invocation_id"] != invocation_id]
+            return True
+        return False
+
+
+@pytest.fixture
+def runcenter_wired(monkeypatch):
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    monkeypatch.setattr(agent_route, "_enforce_rate_limit", lambda *a, **k: None)
+    registry = build_default_registry()
+    store = _RunCenterStore()
+    adjudicator = make_adjudicator(registry, default_policy_engine(), store)
+    gateway = ModelGateway({"dashscope": _FakeProvider()}, routes={"light": [("dashscope", "m")]})
+    executor = ThreadedRunExecutor(store, adjudicator, max_concurrent=2)
+    monkeypatch.setattr(agent_route, "_get_runtime", lambda: (registry, gateway, executor, store))
+    monkeypatch.setattr(agent_route, "_get_approval_store", lambda: _FakeApprovalStore(_areq()))
+    yield store, monkeypatch
+    executor.shutdown()
+
+
+def test_run_center_list_and_detail_owner(runcenter_wired):
+    store, mp = runcenter_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    try:
+        c = _client(_identity())                            # u1 = run 归属人
+        runs = c.get("/api/agent/runs").json()["items"]
+        assert runs and runs[0]["run_id"] == "r1"
+        detail = c.get("/api/agent/runs/r1")
+        assert detail.status_code == 200
+        body = detail.json()
+        assert body["run"]["run_id"] == "r1"
+        assert body["steps"] and body["steps"][0]["kind"] == "model_call"
+        assert body["invocations"] and body["invocations"][0]["status"] == "uncertain"
+        assert body["approval"]["request_id"] == "req1"     # 等谁审/有效期指向
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_run_center_other_user_404_kb_admin_ok(runcenter_wired):
+    """他人 run 一律 404（不可见==不存在）；kb_admin 可见（治理面）。"""
+    _store, mp = runcenter_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    try:
+        other = Identity(user_id="u9", acl_groups=["hr"], role="employee")
+        assert _client(other).get("/api/agent/runs/r1").status_code == 404
+        assert _client(other).get("/api/agent/runs").json()["items"] == []
+        api.app.dependency_overrides.clear()
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+        admin = Identity(user_id="admin", acl_groups=["public"], role="employee")
+        assert _client(admin).get("/api/agent/runs/r1").status_code == 200
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_invocation_reconcile_kb_admin_gate_and_resolution(runcenter_wired):
+    store, mp = runcenter_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    try:
+        # 非 kb_admin 403
+        r = _client(_identity()).get("/api/agent/invocations")
+        assert r.status_code == 403
+        api.app.dependency_overrides.clear()
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+        admin = Identity(user_id="admin", acl_groups=["public"], role="employee")
+        c = _client(admin)
+        items = c.get("/api/agent/invocations").json()["items"]
+        assert items and items[0]["status"] == "uncertain"
+        # note 必填
+        assert c.post("/api/agent/invocations/resolve",
+                      json={"invocation_id": "inv_u1", "resolution": "confirmed_failed",
+                            "note": " "}).status_code == 422
+        r = c.post("/api/agent/invocations/resolve",
+                   json={"invocation_id": "inv_u1", "resolution": "confirmed_failed",
+                         "note": "U8 侧核实未生成单据"})
+        assert r.status_code == 200 and r.json()["status"] == "failed"
+        assert store.resolved[0][:2] == ("inv_u1", "failed")
+        # 已处置再来 → 409
+        assert c.post("/api/agent/invocations/resolve",
+                      json={"invocation_id": "inv_u1", "resolution": "confirmed_failed",
+                            "note": "再次"}).status_code == 409
+    finally:
+        api.app.dependency_overrides.clear()

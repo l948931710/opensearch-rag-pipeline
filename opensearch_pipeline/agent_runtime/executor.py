@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Callable, Iterator, List, Optional
 
 from opensearch_pipeline.agent_runtime.context import ExecutionContext
@@ -26,6 +28,7 @@ from opensearch_pipeline.agent_runtime.events import (
     RunFailed,
     RunSuspended,
     ToolCallProposed,
+    ToolResultEmitted,
 )
 from opensearch_pipeline.agent_runtime.loop import AgentLoop
 from opensearch_pipeline.agent_runtime.run_store import RunStore
@@ -163,6 +166,8 @@ class ThreadedRunExecutor:
                 self._release()
                 return handle
             cp = self._store.load_latest_checkpoint(run_id)
+            if cp is not None:
+                self._verify_checkpoint(cp)           # P1：digest 完整性校验（篡改/损坏不续跑）
             state = (decode_checkpoint_state(cp.state_blob) if cp
                      else {"messages": [], "pending_call": None, "turn": 0})
             pending = state.get("pending_call")
@@ -191,6 +196,23 @@ class ThreadedRunExecutor:
                 self._safe_transition(run_id, "resuming", "suspended")   # 回边：保住可重试
             self._release()
             raise
+
+    @staticmethod
+    def _verify_checkpoint(cp) -> None:
+        """P1「checkpoint 明文且 digest 从不校验」：写入时算了 state_digest 但 load 从不核对，
+        库内被改/损坏的状态会被原样续跑。resume 前核 sha256——不匹配抛错，认领回滚
+        suspended（可由对账/过期处置，绝不带着可疑状态执行）。"""
+        import hashlib
+        digest = getattr(cp, "state_digest", None)
+        if not digest:
+            return                                   # 旧行/简化测试桩无 digest：跳过
+        blob = cp.state_blob
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8", "surrogateescape")
+        if hashlib.sha256(blob).hexdigest() != digest:
+            raise RunRejected(
+                f"checkpoint {getattr(cp, 'checkpoint_id', '?')} 完整性校验失败（digest 不匹配），"
+                "拒绝续跑")
 
     def _drive_gen(self, ctx: ExecutionContext, gen, handle: RunHandle,
                    base: Optional[dict] = None) -> None:
@@ -223,6 +245,11 @@ class ThreadedRunExecutor:
                             self._fail_over_budget(run_id, gen, handle,
                                                    f"token 预算超限（>{token_budget}）")
                             break
+                        # deadline 真比较（此前 is_past_deadline 全链零调用点=deadline 形同虚设；
+                        # resume 语义=每个活跃执行段一个新窗口，见 routes._requester_ctx 注）
+                        if ctx.budget.is_past_deadline(datetime.now(timezone.utc)):
+                            self._fail_over_budget(run_id, gen, handle, "run deadline 超时")
+                            break
                     handle._emit(ev)                                    # trace/SSE tool_call 帧
                     if handle.cancelled():
                         gen.close()
@@ -235,16 +262,27 @@ class ThreadedRunExecutor:
                     if tool_calls_used > max_tool_calls:
                         self._fail_over_budget(run_id, gen, handle, f"tool_calls 预算超限（>{max_tool_calls}）")
                         break
+                    _t0 = time.monotonic()
                     result = self._adjudicate(ctx, ev)                  # Policy → Executor
+                    # 工具结局帧（P0-F 运行状态 UX）：只发 status+耗时，不发内容/参数——
+                    # 前端据此把「调用工具」阶段收敛为「已完成/被拒/等待审批」，
+                    # 兑现「批准≠成功，用户必须看到真实执行结果」的最短路径。
+                    handle._emit(ToolResultEmitted(
+                        call_id=ev.call_id, tool_name=ev.tool_name,
+                        status=getattr(result, "status", "failed") or "failed",
+                        elapsed_ms=int((time.monotonic() - _t0) * 1000),
+                        turn_index=ev.turn_index))
                     ev = gen.send(result)                               # ← B2：回注结果
                     continue
                 if isinstance(ev, RunSuspended):
-                    # 挂起：持久化 checkpoint（loop 带来 state_messages+pending_call）+ running→suspended，
-                    # 对外发**剥离 state_messages** 的干净 RunSuspended（带 approval_request_id/checkpoint_id）。
+                    # 挂起：持久化 checkpoint（loop 带来 state_messages+pending_call+remaining_calls）
+                    # + running→suspended，对外发**剥离内部载荷**的干净 RunSuspended（带
+                    # approval_request_id/checkpoint_id）。P0-E：真库路径 checkpoint/审批行/step/
+                    # 状态迁移收进**同一事务**（suspend_run_atomic）——不再有半态。
                     # ⚠️ 迁移必须成功才发 approval 帧：迁移被吞时 run 行仍 running、审批端从此 409，
                     # 成为无驱动僵尸而用户以为在等审批（深度审查 B 组）。
-                    cp_id, aid = self._persist_suspend(ctx, run_id, ev)
-                    if not self._transition_checked(run_id, "running", "suspended"):
+                    cp_id, aid, transitioned = self._persist_suspend(ctx, run_id, ev)
+                    if not transitioned and not self._transition_checked(run_id, "running", "suspended"):
                         self._safe_transition(run_id, "running", "failed")
                         handle._emit(RunFailed(error="挂起状态落库失败，请重试", retryable=True))
                         self._notify_failure(handle, "挂起状态落库失败")
@@ -308,15 +346,43 @@ class ThreadedRunExecutor:
 
     def _persist_suspend(self, ctx: ExecutionContext, run_id: Optional[str],
                          ev: RunSuspended) -> tuple:
-        """挂起持久化：encode loop 带来的状态 → save_checkpoint；写 approval_request（schema/025，
-        接了 approval_store 时 **fail-closed**——写不成即抛，调用方把 run 落 failed，绝不产生
-        审批队列不可见的黑洞 run）；记 approval agent_step（payload 脱敏，022 契约）。
-        返回 (checkpoint_id, approval_request_id)。"""
+        """挂起持久化：encode loop 带来的状态（messages+pending_call+remaining_calls）；
+        写 approval_request（schema/025，接了 approval_store 时 **fail-closed**——写不成即抛，
+        调用方把 run 落 failed，绝不产生审批队列不可见的黑洞 run）；记 approval agent_step
+        （payload 脱敏，022 契约）。返回 (checkpoint_id, approval_request_id, transitioned)。
+
+        P0-E（重评报告 §5E）：两侧 store 都支持时走 **suspend_run_atomic 单事务**——
+        checkpoint + 审批行 + step + running→suspended 一次 commit（transitioned=True，
+        调用方不再单独迁移）；否则回退旧分事务序（简化测试桩，transitioned=False）。"""
         import uuid
 
         from opensearch_pipeline.agent_runtime.loop import encode_checkpoint
+        from opensearch_pipeline.agent_runtime.sanitize import sanitize_args
         blob, digest = encode_checkpoint(ev.state_messages or [], pending_call=ev.pending_call,
-                                         turn=ev.turn_index)
+                                         turn=ev.turn_index, remaining_calls=ev.remaining_calls)
+        pc = dict(ev.pending_call or {})
+        if "arguments" in pc:
+            pc["arguments"] = sanitize_args(pc["arguments"])
+
+        atomic = (hasattr(self._store, "suspend_run_atomic")
+                  and (self._approval_store is None
+                       or hasattr(self._approval_store, "insert_request")))
+        if atomic:
+            aid = uuid.uuid4().hex
+            extra = None
+            if self._approval_store is not None and ev.pending_call:
+                approval_store, pending_call = self._approval_store, ev.pending_call
+
+                def _extra(cur):
+                    approval_store.insert_request(cur, run_id, ctx, pending_call,
+                                                  request_id=aid)
+                extra = _extra
+            cp_id, ok = self._store.suspend_run_atomic(
+                run_id, blob, digest,
+                step_payload={"pending_call": pc, "approval_request_id": aid},
+                extra_writer=extra)
+            return cp_id, aid, ok
+
         cp_id = self._store.save_checkpoint(run_id, blob, digest)
         if self._approval_store is not None and ev.pending_call:
             aid = self._approval_store.create_request(run_id, ctx, ev.pending_call)
@@ -324,15 +390,11 @@ class ThreadedRunExecutor:
             aid = uuid.uuid4().hex                      # 未接持久化（直驱测试）：沿用内存 id
         try:                                            # 步骤序含审批点（fail-open；参数脱敏后入 payload）
             from opensearch_pipeline.agent_runtime.run_store import AgentStep
-            from opensearch_pipeline.agent_runtime.sanitize import sanitize_args
-            pc = dict(ev.pending_call or {})
-            if "arguments" in pc:
-                pc["arguments"] = sanitize_args(pc["arguments"])
             self._store.append_step(run_id, AgentStep(
                 kind="approval", payload={"pending_call": pc, "approval_request_id": aid}))
         except Exception:   # noqa: BLE001
             pass
-        return cp_id, aid
+        return cp_id, aid, False
 
     def _record_model_step(self, run_id: Optional[str], turn_index: int,
                            usage=None, final: bool = False) -> None:

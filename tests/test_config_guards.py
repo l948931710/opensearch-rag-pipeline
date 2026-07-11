@@ -237,3 +237,62 @@ class TestEmbeddingRegimeGuard:
                           RAG_OPENSEARCH_HOST="localhost",
                           RAG_ALLOW_INCOMPATIBLE_EMBEDDING="ack")
         assert "gemini" in cfg.embedding.model
+
+
+class TestAgentSelfApprovalGuard:
+    """【Agent P1】RAG_AGENT_ALLOW_SELF_APPROVAL 生产启动断言（重评报告 §6）。"""
+
+    def test_production_with_self_approval_raises(self):
+        with pytest.raises(ValueError, match="RAG_AGENT_ALLOW_SELF_APPROVAL"):
+            _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                        RAG_DASHSCOPE_API_KEY="sk-test",
+                        RAG_AGENT_ALLOW_SELF_APPROVAL="true")
+
+    def test_staging_with_self_approval_raises(self):
+        with pytest.raises(ValueError, match="RAG_AGENT_ALLOW_SELF_APPROVAL"):
+            _fresh_load(RAG_ENVIRONMENT="staging", RAG_SIMULATE="true",
+                        RAG_DASHSCOPE_API_KEY="sk-test",
+                        RAG_AGENT_ALLOW_SELF_APPROVAL="1")
+
+    def test_development_with_self_approval_passes(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="true",
+                          RAG_AGENT_ALLOW_SELF_APPROVAL="true")
+        assert cfg.environment == "development"
+
+    def test_production_without_flag_passes(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                          RAG_DASHSCOPE_API_KEY="sk-test")
+        assert cfg.environment == "production"
+
+
+class TestNoModelResolutionFlag:
+    """【P1-15】RAG_NO_MODEL_RESOLUTION=ack：纯 RDS 作业豁免模型解析。
+    llm/ocr/vlm/embedding 全为惰性哨兵（无端点无 key，意外调用立刻失败）；
+    生产供应商守卫不再要求 DashScope key；禁 Gemini 检查照跑（哨兵天然通过）。"""
+
+    def test_production_no_key_with_flag_passes_as_sentinel(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                          RAG_NO_MODEL_RESOLUTION="ack")
+        assert cfg.llm.model == "model-resolution-disabled"
+        assert cfg.embedding.model == "model-resolution-disabled"
+        assert cfg.llm.api_base_url == "" and cfg.llm.api_key == ""
+        assert "gemini" not in cfg.ocr.model.lower()          # 绝无 Gemini 兜底通道
+
+    def test_production_no_key_without_flag_still_raises(self):
+        """旗标不设时守卫原语义不变（回归护栏）。"""
+        with pytest.raises(ValueError, match="PRODUCTION SECURITY GUARD"):
+            _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true")
+
+    def test_flag_value_must_be_ack(self):
+        """值拼写错误不得静默放行（与其它 ack 变量同纪律）。"""
+        with pytest.raises(ValueError, match="PRODUCTION SECURITY GUARD"):
+            _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                        RAG_NO_MODEL_RESOLUTION="yes")
+
+    def test_flag_with_search_backend_skips_embedding_regime_guard(self):
+        """声明不嵌入的作业连着检索后端也不触发嵌入制度守卫（无嵌入通道无污染面）。"""
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="false",
+                          RAG_RDS_HOST="localhost",
+                          RAG_OPENSEARCH_HOST="localhost",
+                          RAG_NO_MODEL_RESOLUTION="ack")
+        assert cfg.embedding.model == "model-resolution-disabled"
