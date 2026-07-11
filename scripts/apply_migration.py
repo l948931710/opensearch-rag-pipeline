@@ -35,13 +35,11 @@ EXIT_CHECKSUM_MISMATCH = 4
 
 
 def _split_statements(sql_text):
-    """按 ; 切分语句；剔除整行 -- 注释，内联注释留给 MySQL 解析；跳过空块。"""
-    out = []
-    for chunk in sql_text.split(";"):
-        code = "\n".join(ln for ln in chunk.splitlines() if not ln.strip().startswith("--")).strip()
-        if code:
-            out.append(code)
-    return out
+    """剔除整行 -- 注释后再按 ; 切分（PR 收口修正：注释行内的分号——如 011 头注的
+    「USE …; 再 …;」——曾把注释后半截切成"SQL"报 1064）；内联注释留给 MySQL 解析。"""
+    body = "\n".join(ln for ln in sql_text.splitlines()
+                     if not ln.strip().startswith("--"))
+    return [chunk.strip() for chunk in body.split(";") if chunk.strip()]
 
 
 def _table_names(statements):

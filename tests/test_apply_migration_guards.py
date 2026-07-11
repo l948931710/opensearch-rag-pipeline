@@ -126,3 +126,20 @@ def test_node_zip_slip_guard(tmp_path):
     with zipfile.ZipFile(ok) as zf:
         ns["_safe_extractall"](zf, str(out))
     assert (out / "pkg" / "mod.py").exists()
+
+
+def test_split_statements_comment_semicolon_safe():
+    """回归（staging 首灌实测 1064）：整行注释里的分号（011 头注「USE …; 再 …;」）
+    不得把注释后半截切成"SQL"——先剥注释再切分。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "apply_migration2", os.path.join(_REPO, "scripts", "apply_migration.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    sql = ("-- 头注：USE fuling_knowledge; 后执行一遍，再 USE fuling_operation; 执行一遍。\n"
+           "CREATE TABLE IF NOT EXISTS t (id INT); -- 内联注释保留\n"
+           "INSERT INTO t VALUES (1);\n")
+    stmts = mod._split_statements(sql)
+    assert len(stmts) == 2
+    assert stmts[0].startswith("CREATE TABLE")
+    assert "后执行一遍" not in " ".join(stmts)
