@@ -3,12 +3,15 @@ import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
 import { useAgentApprovals } from '@/composables/useAgentApprovals'
+import { __resetIdentityScope, identityFingerprint, registerIdentityScopedStore, syncIdentityScope } from '@/composables/identityScope'
 import {
   GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
 
 // 知识库管理台单例 store。身份/可管部门复用 P1 的 session（whoami 已给 managed_owner_depts），
 // 不再走旧 console 的 org-tree。所有写接口后端【现查】授权，前端 role 仅作 UI 门禁。
+// P0-D：全部模块级状态已挂 identityScope——身份/token 一变同步清空（含 30s staleness 门、
+// 上传表单/已选文件/轮询定时器）；各 loader 入口 lazy 对账，敏感队列在途响应按身份指纹判废。
 
 // 失败/结果类提示统一走应用内告知框（useDialog 单例状态挂模块作用域，此处直接取用；不再用原生 alert）。
 const { notice } = useDialog()
@@ -389,6 +392,7 @@ function clearLedgerFilters() {
 }
 
 async function loadDocs() {
+  syncIdentityScope()   // P0-D：身份对账——变了先同步清空（docsSeq 随重置 ++，旧在途列表作废）
   const seq = ++docsSeq
   loadingDocs.value = true
   docsOffset = 0
@@ -421,6 +425,7 @@ async function loadDocs() {
 // 加载下一页并【追加】到当前列表（不自增 docsSeq：追加属于当前列表；期间若 loadDocs/换 scope/搜索
 // 触发，docsSeq 变化 → 本页结果作废丢弃，避免错插到新列表）。
 async function loadMoreDocs() {
+  syncIdentityScope()   // 身份变了 → 重置已把 hasMoreDocs 清 false，下一行直接短路
   if (loadingMoreDocs.value || !hasMoreDocs.value) return
   const seq = docsSeq
   loadingMoreDocs.value = true
@@ -461,8 +466,11 @@ function accessStateOf(docId: string): AccessState {
 function accessNoteOf(docId: string): string { return myAccessReqs.value.get(docId)?.note || '' }
 // 申请人侧权威态：拉我的申请 + 派生同步态。后端未上线 / 无申请 → 静默空（不报错、不打扰）。
 async function loadMyAccessRequests() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   try {
     const r = await apiJson<{ items: MyAccessRequestItem[] }>('/api/kb/my-access-requests', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的申请态不落地
     const m = new Map<string, { status: string; sync_state: string; note: string }>()
     // 后端按 created_at DESC（最新在前）返回；每 doc 保留【最新】一行——拒后重申/撤销后重申会留多行，
     // 若 last-write-wins（直接 m.set）会让最旧行覆盖最新 → 误显「申请授权」。首见即最新 → 不覆盖。
@@ -501,6 +509,8 @@ async function submitAccessRequest(reason: string) {
 
 async function loadStats() {
   // 概览真实口径（总数/状态分布/已索引分块）；失败则前端兜底用已加载文档计数（docs.length / countOf）。
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') {
     kbStats.value = s.role === 'kb_admin'
@@ -509,7 +519,11 @@ async function loadStats() {
     return
   }
   clearLoadError('stats')
-  try { kbStats.value = await apiJson<KbStats>('/api/kb/stats', { auth: true }) } catch (e) { noteLoadError('stats', e) /* 兜底 */ }
+  try {
+    const r = await apiJson<KbStats>('/api/kb/stats', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份口径不落地
+    kbStats.value = r
+  } catch (e) { if (fp === identityFingerprint()) noteLoadError('stats', e) /* 兜底 */ }
 }
 
 async function loadConfig() {
@@ -520,6 +534,8 @@ async function loadConfig() {
 // ── Phase E：概览看板真实数据（缺数据/端点未上线 → 静默兜底 null，由组件如实显空/加载中）──
 // DEV ?preview 注入 mock（取自真实口径量级，便于设计走查）；prod build 死代码消除。
 async function loadInsights() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (!s.identity?.canManage) { kbInsights.value = null; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -539,10 +555,16 @@ async function loadInsights() {
     return
   }
   clearLoadError('insights')
-  try { kbInsights.value = await apiJson<KbInsights>('/api/kb/insights', { auth: true }) } catch (e) { noteLoadError('insights', e) /* 兜底 */ }
+  try {
+    const r = await apiJson<KbInsights>('/api/kb/insights', { auth: true })
+    if (fp !== identityFingerprint()) return
+    kbInsights.value = r
+  } catch (e) { if (fp === identityFingerprint()) noteLoadError('insights', e) /* 兜底 */ }
 }
 
 async function loadGovernance() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (s.role !== 'kb_admin') { kbGovernance.value = null; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -585,7 +607,11 @@ async function loadGovernance() {
     return
   }
   clearLoadError('governance')
-  try { kbGovernance.value = await apiJson<KbGovernance>('/api/kb/governance', { auth: true }) } catch (e) { noteLoadError('governance', e) /* 兜底 */ }
+  try {
+    const r = await apiJson<KbGovernance>('/api/kb/governance', { auth: true })
+    if (fp !== identityFingerprint()) return
+    kbGovernance.value = r
+  } catch (e) { if (fp === identityFingerprint()) noteLoadError('governance', e) /* 兜底 */ }
 }
 
 // 版本历史（点击文档行「历史」）：拉 /api/kb/version-history（后端现成）。
@@ -623,6 +649,8 @@ function setQuery(v: string) {
 }
 
 async function loadApprovals(force = false) {
+  syncIdentityScope()               // P0-D：读取前对账——身份/token 变了同步清空，staleness 门重开
+  const fp = identityFingerprint()  // 在途判废基准
   const s = useSession()
   if (s.role !== 'kb_admin') { approvals.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -638,10 +666,14 @@ async function loadApprovals(force = false) {
   clearLoadError('approvals')
   try {
     const r = await apiJson<{ items: PendingItem[] }>('/api/kb/pending-approvals', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的审批队列整体丢弃
     approvals.value = r.items || []
-  } catch (e) { lastLoadedAt['approvals'] = 0; approvals.value = []; noteLoadError('approvals', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return   // 同上：旧身份的失败不落错误态
+    lastLoadedAt['approvals'] = 0; approvals.value = []; noteLoadError('approvals', e)
+  }
   // kb_admin 的待办队列源=上传审批（授权申请已划归 dept_admin），拉取过即视为队列就绪
-  finally { queuesSettled.value = true }
+  finally { if (fp === identityFingerprint()) queuesSettled.value = true }
 }
 
 // ── 升版态 ──
@@ -836,6 +868,8 @@ async function reject(d: PendingItem, reason: string) {
 // ── 授权申请（Phase C，审批人侧）──
 // 数据源 /api/kb/access-requests 尚未上线 → 静默兜底空（不报错、不打扰）。DEV ?preview 注入 mock 可视化。
 async function loadAccessRequests(force = false) {
+  syncIdentityScope()               // P0-D：读取前对账（同 loadApprovals）
+  const fp = identityFingerprint()
   const s = useSession()
   if (!s.identity?.canManage) { accessRequests.value = []; return }
   // 拍板：授权申请审批 = 部门管理员之间的事（kb_admin 只管入库）→ kb_admin 不拉不显不计数。
@@ -854,9 +888,13 @@ async function loadAccessRequests(force = false) {
   clearLoadError('accessRequests')
   try {
     const r = await apiJson<{ items: AccessRequestItem[] }>('/api/kb/access-requests', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的授权申请队列整体丢弃
     accessRequests.value = r.items || []
-  } catch (e) { lastLoadedAt['accessRequests'] = 0; accessRequests.value = []; noteLoadError('accessRequests', e) }   // 404（未上线）静默；5xx 显错
-  finally { queuesSettled.value = true }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    lastLoadedAt['accessRequests'] = 0; accessRequests.value = []; noteLoadError('accessRequests', e)
+  }   // 404（未上线）静默；5xx 显错
+  finally { if (fp === identityFingerprint()) queuesSettled.value = true }
 }
 
 async function approveAccess(d: AccessRequestItem) {
@@ -887,6 +925,7 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
 // grantsSeq 竞态守卫（同 docsSeq）：批量上传的并发 worker 各自触发刷新时，仅最新一次落地，防旧响应覆盖新清单。
 let grantsSeq = 0
 async function loadAccessGrants() {
+  syncIdentityScope()   // 身份对账（变了 grantsSeq 随重置 ++，旧在途清单作废）
   const seq = ++grantsSeq
   const s = useSession()
   if (!s.identity?.canManage) { accessGrants.value = []; return }
@@ -935,6 +974,8 @@ export type FeedbackResolveAction = 'resolve' | 'dismiss' | 'reopen'
 /** 拉差评复核队列（看板卡片）：失败静默兜底空 + loadErrors 显错可重试。
  *  include_resolved 由「显示已处理」切换驱动；默认只收未处置（收件箱语义）。 */
 async function loadFeedbackReview() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (!s.identity?.canManage) { feedbackReview.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -956,8 +997,12 @@ async function loadFeedbackReview() {
   try {
     const qs = showResolvedFeedback.value ? '?include_resolved=true' : ''
     const r = await apiJson<{ items: FeedbackReviewItem[] }>(`/api/kb/feedback-review${qs}`, { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的差评队列整体丢弃
     feedbackReview.value = r.items || []
-  } catch (e) { feedbackReview.value = feedbackReview.value ?? []; noteLoadError('feedbackReview', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    feedbackReview.value = feedbackReview.value ?? []; noteLoadError('feedbackReview', e)
+  }
 }
 
 /** 切换「显示已处理」并重载。 */
@@ -1006,6 +1051,8 @@ export type EscalationResolveAction = 'resolve' | 'dismiss' | 'reopen'
 /** 拉转人工工单队列：默认只列未处置（不设时间窗、老单先出——工单是承诺不是日志）；
  *  「显示已处理」切换后连已处置一并返回。失败静默兜底空 + loadErrors 显错可重试。 */
 async function loadEscalations() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (!s.identity?.canManage) { escalations.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1033,8 +1080,12 @@ async function loadEscalations() {
   try {
     const qs = showClosedEscalations.value ? '?include_closed=true' : ''
     const r = await apiJson<{ items: EscalationItem[] }>(`/api/kb/escalations${qs}`, { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的工单队列整体丢弃
     escalations.value = r.items || []
-  } catch (e) { escalations.value = escalations.value ?? []; noteLoadError('escalations', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    escalations.value = escalations.value ?? []; noteLoadError('escalations', e)
+  }
 }
 
 /** 切换「显示已处理」并重载。 */
@@ -1092,6 +1143,8 @@ export interface ReviewTaskItem {
 
 /** 拉入库复审任务队列（kb_admin 专属）：默认只列 PENDING（不设时间窗、老单先出）。 */
 async function loadReviewTasks() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (s.role !== 'kb_admin') { reviewTasks.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1108,8 +1161,12 @@ async function loadReviewTasks() {
   try {
     const qs = showClosedReviewTasks.value ? '?include_closed=true' : ''
     const r = await apiJson<{ items: ReviewTaskItem[] }>(`/api/kb/review-tasks${qs}`, { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的复审队列整体丢弃
     reviewTasks.value = r.items || []
-  } catch (e) { reviewTasks.value = reviewTasks.value ?? []; noteLoadError('reviewTasks', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    reviewTasks.value = reviewTasks.value ?? []; noteLoadError('reviewTasks', e)
+  }
 }
 
 function toggleShowClosedReviewTasks() {
@@ -1282,6 +1339,8 @@ async function setVisibility(d: DocItem, level: string, reason = '',
 // 审批历史（只读聚合）：后端按角色作用域 —— dept_admin 见本部门 access+contribution、kb_admin 见全库四类。
 // 404（未上线）静默兜底空；5xx 显错。DEV ?preview 注入 mock（kb_admin 见四类混合、dept_admin 仅两类）。
 async function loadApprovalHistory() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (!s.identity?.canManage) { approvalHistory.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1304,12 +1363,18 @@ async function loadApprovalHistory() {
   clearLoadError('approvalHistory')
   try {
     const r = await apiJson<{ items: ApprovalHistoryItem[] }>('/api/kb/approval-history', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的审批历史整体丢弃
     approvalHistory.value = r.items || []
-  } catch (e) { approvalHistory.value = []; noteLoadError('approvalHistory', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    approvalHistory.value = []; noteLoadError('approvalHistory', e)
+  }
 }
 
 // ── Phase F：成员/角色管理（仅 kb_admin）──
 async function loadAdminGrants() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (s.role !== 'kb_admin') { adminGrants.value = []; grantableDepts.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1324,9 +1389,13 @@ async function loadAdminGrants() {
   clearLoadError('adminGrants')
   try {
     const r = await apiJson<{ items: AdminItem[]; grantable_owner_depts: string[] }>('/api/kb/admin-grants', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的成员名单整体丢弃
     adminGrants.value = r.items || []
     grantableDepts.value = r.grantable_owner_depts || []
-  } catch (e) { adminGrants.value = []; grantableDepts.value = []; noteLoadError('adminGrants', e) }   // 404 静默；5xx 显错
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    adminGrants.value = []; grantableDepts.value = []; noteLoadError('adminGrants', e)
+  }   // 404 静默；5xx 显错
 }
 
 // 授予/更新一名部门管理员（owner_depts = 权威全集,提交即覆盖）。成功返回 true。
@@ -1435,26 +1504,40 @@ export function useKb() {
   }
 }
 
-/** 仅供测试：重置 store。 */
-export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
+/** 重置 store（运行期身份切换与测试复位共用）。P0-D 注意点：
+ *  · 序号计数器【递增】而非归零——在途 loadDocs/loadAccessGrants/轮询按 seq 判废，归零会让
+ *    旧在途请求与切换后的新请求撞号（A 的慢响应落进 B 的列表）；
+ *  · queuesSettled 一并回 false——否则切身份后空态文案在队列重载前误显「真无待办」；
+ *  · 上传表单/已选文件/定时器一并清——半填的表单与选中的 File 同样不跨身份残留。 */
+function _resetKbState() {
+  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; queuesSettled.value = false; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''
   newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; newShareDepts.value = []; verCtx.value = null
   shareCtx.value = null; shareBusy.value = false
+  visCtx.value = null; visExplain.value = null; visLoading.value = false; visErr.value = ''   // 「谁能看到」弹窗（readers 明细）同样不跨身份残留
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []
   inflight.value = new Set(); retireBusy.value = false
   feedbackReview.value = null; showResolvedFeedback.value = false; feedbackResolveBusy.value = new Set()
   escalations.value = null; showClosedEscalations.value = false; escalationResolveBusy.value = new Set()
   reviewTasks.value = null; showClosedReviewTasks.value = false; reviewTaskResolveBusy.value = new Set()
-  selectedFiles = []; docsOffset = 0; docsSeq = 0; trackSeq = 0
+  selectedFiles = []; docsOffset = 0; docsSeq++; trackSeq++; grantsSeq++
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (trackTimer) { clearTimeout(trackTimer); trackTimer = null }
   if (filterTimer) { clearTimeout(filterTimer); filterTimer = null }
 }
+
+/** 仅供测试：重置 store + 忘掉已观测身份（下次 sync 首见采纳，不误清测试预置）。 */
+export function __resetKb() {
+  _resetKbState()
+  __resetIdentityScope()
+}
+
+// P0-D：身份/token 变更 → 同步清空（identityScope 统一触发）。
+registerIdentityScopedStore('kb', _resetKbState)
 
 /** 仅供测试：注入选中文件（绕过 input）。 */
 export function __setSelectedFiles(files: File[]) { selectedFiles = files }

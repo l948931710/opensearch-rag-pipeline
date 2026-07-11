@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { useSession } from '@/stores/session'
 import { ApiError, apiFetch, apiJson } from '@/lib/api'
 import { useDialog } from '@/composables/useDialog'
+import { __resetIdentityScope, identityFingerprint, registerIdentityScopedStore, syncIdentityScope } from '@/composables/identityScope'
 
 // 本体消解工作台（P0 PR7；后端 routes/ontology.py）。
 // GET /api/ontology/workbench（open case 队列，候选已富化）+ /api/ontology/coverage（覆盖率卡片）；
@@ -12,10 +13,11 @@ import { useDialog } from '@/composables/useDialog'
 export interface OntologyCandidate {
   candidate_id: string
   case_id: string
-  target_object_id: string
+  // PR-F 受限候选（target_visible=false）三字段为常量 null 占位（零字段泄露）——UI 不得渲染
+  target_object_id: string | null
   target_revision: string | null
-  method: string
-  confidence: number
+  method: string | null
+  confidence: number | null
   features_json: string | null
   canonical_ref: string | null
   title: string | null
@@ -76,8 +78,8 @@ const STALE_MS = 30_000
 let lastLoadedAt = 0
 // PR-I（P2「singleton 跨身份残留」）：模块级状态挂在 app 生命周期上——切换身份
 // （登出/换号）时 cases/coverage/supported 会带着上个管理员的数据泄给下个身份。
-// 按 userId 跟踪，变了就整体重置。
-let lastUserId: string | null = null
+// P0-D 起改挂共享 identityScope（本文件原有的 per-uid 跟踪即其前身）：键含 userId/role/ACL/token，
+// 变了统一同步清空；loader 入口 lazy 对账，在途响应按身份指纹判废。
 
 function isBusy(key: string): boolean { return inflight.value.has(key) }
 async function withInflight<T>(key: string, fn: () => Promise<T>): Promise<T | undefined> {
@@ -87,18 +89,18 @@ async function withInflight<T>(key: string, fn: () => Promise<T>): Promise<T | u
 }
 
 async function refreshOntologyCoverage() {
+  const fp = identityFingerprint()
   try {
-    coverage.value = await apiJson<OntologyCoverage>('/api/ontology/coverage', { auth: true })
+    const cov = await apiJson<OntologyCoverage>('/api/ontology/coverage', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的覆盖率不落地
+    coverage.value = cov
   } catch { /* 覆盖率是装饰面：失败不置错、不影响队列与 tab 可见性 */ }
 }
 
 async function loadOntology(force = false) {
+  syncIdentityScope()               // 身份切换：上个身份的队列/覆盖率/探测结果全部作废（P0-D 共享设施）
+  const fp = identityFingerprint()  // 在途判废基准
   const s = useSession()
-  const uid = s.identity?.userId ?? null
-  if (uid !== lastUserId) {          // 身份切换：上个身份的队列/覆盖率/探测结果全部作废
-    __resetOntology()
-    lastUserId = uid
-  }
   if (!s.identity?.canManage) {
     cases.value = []
     coverage.value = null
@@ -129,10 +131,12 @@ async function loadOntology(force = false) {
   loadError.value = ''
   try {
     const r = await apiJson<{ items: OntologyCase[] }>('/api/ontology/workbench?limit=50', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的队列整体丢弃
     cases.value = r.items || []
     supported.value = true
     void refreshOntologyCoverage()
   } catch (e) {
+    if (fp !== identityFingerprint()) return   // 同上：旧身份的失败也不落错误/探测态
     lastLoadedAt = 0
     cases.value = []
     if (e instanceof ApiError && e.status === 404) { supported.value = false; return }   // flag 未开：静默隐藏
@@ -143,6 +147,7 @@ async function loadOntology(force = false) {
 
 async function postDecision(kase: OntologyCase, path: string, body: Record<string, unknown>,
                             failTitle: string): Promise<boolean> {
+  syncIdentityScope()   // 处置入口对账（服务端授权仍是硬校验）
   const { notice } = useDialog()
   const done = await withInflight(`onto:${kase.case_id}`, async () => {
     const s = useSession()
@@ -189,6 +194,7 @@ async function dismissOntologyCase(kase: OntologyCase, note: string) {
 
 /** 批量驳回（PR-I P2：大积压处置）。逐条独立结果；返回成功数（失败条目留在队列）。 */
 async function batchDismissOntologyCases(caseIds: string[], note: string): Promise<number> {
+  syncIdentityScope()   // 处置入口对账（服务端授权仍是硬校验）
   const { notice } = useDialog()
   const done = await withInflight('onto:batch', async () => {
     const s = useSession()
@@ -252,12 +258,20 @@ export function useOntology() {
   }
 }
 
-export function __resetOntology() {
+// 队列/覆盖率/探测/错误/在途/freshness 全部作废（运行期身份切换与测试复位共用）。
+function _resetOntologyState() {
   cases.value = []
   coverage.value = null
   supported.value = null
   loadError.value = ''
   inflight.value = new Set()
   lastLoadedAt = 0
-  lastUserId = null
 }
+
+export function __resetOntology() {
+  _resetOntologyState()
+  __resetIdentityScope()   // 测试复位顺带忘掉已观测身份（下次 sync 首见采纳）
+}
+
+// P0-D：身份/token 变更 → 同步清空（identityScope 统一触发）。
+registerIdentityScopedStore('ontology', _resetOntologyState)

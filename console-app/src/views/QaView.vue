@@ -4,10 +4,13 @@ import { storeToRefs } from 'pinia'
 import { ArrowDown, Sprout } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useAsk } from '@/composables/useAsk'
+import { useAgentAsk } from '@/composables/useAgentAsk'
 import Thread from '@/components/qa/Thread.vue'
 import Composer from '@/components/qa/Composer.vue'
+import AgentRunCenter from '@/components/qa/AgentRunCenter.vue'
 
-const { identity } = storeToRefs(useSession())
+const session = useSession()
+const { identity } = storeToRefs(session)
 const name = computed(() => identity.value?.name || '')
 // 问候随时段（挂载时算一次即可，不需要跨小时反应式刷新）。
 const h = new Date().getHours()
@@ -15,6 +18,17 @@ const daypart = h < 5 ? '晚上好' : h < 11 ? '早上好' : h < 13 ? '中午好
 
 const { messages, asking, draft, thinking, hotQuestions, ask, stop, loadHotQuestions } = useAsk()
 function toggleThinking() { thinking.value = !thinking.value }
+
+// ── Agent canary：能力探测（404/403 → 入口不渲染）+ kill switch 路由 ──
+const {
+  agentSupported, agentMode, toggleAgentMode, askAgent, stopAgent, agentStreamActive,
+  probeAgent, openRunCenter,
+} = useAgentAsk()
+const agentOn = computed(() => agentSupported.value === true && agentMode.value)
+// 停止分发：agent 流在途走 agent 停（只断视图、run 轮询兜底），否则旧路径停。
+function onStop() { if (agentStreamActive.value) stopAgent(); else stop() }
+// token 变化（登录落定/重登/换人）→ 重新探测（identityScope 已先清空探测态）
+watch(() => session.token, () => { if (session.token) void probeAgent() })
 
 const scroller = ref<HTMLElement | null>(null)
 const atBottom = ref(true)          // 用户是否贴近底部（决定流式是否跟随；上滚阅读时停跟随）
@@ -44,14 +58,21 @@ watch(
       + ':' + (l.viewBlocks?.length || 0) + ':' + (l.sources?.length || 0)
       + ':' + (l.stageText || '') + ':' + (l.loading ? 1 : 0) + (l.error ? 1 : 0) + (l.noResult ? 1 : 0)
       + (l.sourcesOpen ? 1 : 0) + (l.reasoningOpen ? 1 : 0)
+      // agent 消息的高度变化源：阶段条/工具 chips/挂起卡/run 状态（轮询回写）
+      + (l.agent ? ':' + (l.agent.stages?.length || 0) + ':' + (l.agent.tools?.length || 0)
+        + ':' + (l.agent.approval ? 1 : 0) + ':' + (l.agent.status || '') : '')
   },
   () => { if (atBottom.value) nextTick(() => scrollToBottom(false)) },
 )
 
 // 发起提问：用户期望立刻看到自己的问句与作答 → 强制贴底跟随。
-function send(preset?: string) { atBottom.value = true; void ask(preset) }
+// Agent 模式开着 → 走 agent transport（其 404 会自动回退旧路径并关掉开关）。
+function send(preset?: string) { atBottom.value = true; if (agentOn.value) void askAgent(preset); else void ask(preset) }
 
-onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
+onMounted(() => {
+  if (!hotQuestions.value.length) void loadHotQuestions()
+  void probeAgent()   // 能力探测（30s 幂等；404/403 静默 → 开关不渲染）
+})
 </script>
 
 <template>
@@ -75,7 +96,12 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
         </Transition>
       </div>
       <div class="shrink-0 border-t border-border/60 py-3">
-        <Composer v-model="draft" :asking="asking" :has-messages="true" :thinking="thinking" @submit="send()" @stop="stop" @toggle-thinking="toggleThinking" />
+        <Composer
+          v-model="draft" :asking="asking" :has-messages="true" :thinking="thinking"
+          :agent-available="agentSupported === true" :agent-mode="agentOn"
+          @submit="send()" @stop="onStop" @toggle-thinking="toggleThinking"
+          @toggle-agent="toggleAgentMode" @open-runs="openRunCenter()"
+        />
       </div>
     </template>
 
@@ -86,7 +112,12 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
       </div>
       <h1 class="font-serif text-[34px] leading-none tracking-tight text-foreground">{{ daypart }}{{ name ? '，' + name : '' }}</h1>
       <p class="mb-8 mt-3 text-[13px] text-muted-foreground">答案来自富岭内部文档；可见范围按你的部门权限过滤。</p>
-      <Composer v-model="draft" :asking="asking" :has-messages="false" :thinking="thinking" @submit="send()" @stop="stop" @toggle-thinking="toggleThinking" />
+      <Composer
+        v-model="draft" :asking="asking" :has-messages="false" :thinking="thinking"
+        :agent-available="agentSupported === true" :agent-mode="agentOn"
+        @submit="send()" @stop="onStop" @toggle-thinking="toggleThinking"
+        @toggle-agent="toggleAgentMode" @open-runs="openRunCenter()"
+      />
       <div v-if="hotQuestions.length" class="mt-7 w-full max-w-3xl px-4 xl:max-w-4xl">
         <p class="mb-2.5 text-center text-[11px] font-bold tracking-[0.08em] text-faint">大家在问</p>
         <div class="flex flex-wrap justify-center gap-2">
@@ -101,6 +132,9 @@ onMounted(() => { if (!hotQuestions.value.length) void loadHotQuestions() })
         </div>
       </div>
     </div>
+
+    <!-- Agent 运行中心抽屉（仅能力探测通过时挂载） -->
+    <AgentRunCenter v-if="agentSupported === true" />
   </div>
 </template>
 

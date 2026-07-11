@@ -28,6 +28,19 @@ function argsPreview(d: AgentApprovalItem): string {
   return parts.join(' · ') || '—'
 }
 function ts(v: string | null): string { return v ? v.slice(0, 16) : '' }
+/** 有效期相对化（「3 天后过期」）；绝对时间挂 title。解析失败回退绝对展示（时区兜底）。 */
+function relExpire(v: string | null): string {
+  if (!v) return ''
+  const t = Date.parse(String(v).replace(' ', 'T'))
+  if (Number.isNaN(t)) return `${ts(v)} 过期`
+  const diff = t - Date.now()
+  if (diff <= 0) return '已过期'
+  const m = Math.round(diff / 60000)
+  if (m < 60) return `${Math.max(1, m)} 分钟后过期`
+  const hr = Math.round(m / 60)
+  if (hr < 48) return `${hr} 小时后过期`
+  return `${Math.round(hr / 24)} 天后过期`
+}
 
 async function onApprove(d: AgentApprovalItem) {
   const ok = await confirm({
@@ -37,6 +50,31 @@ async function onApprove(d: AgentApprovalItem) {
   })
   if (!ok) return
   void decideAgentApproval(d, 'approved')
+}
+
+/** 第四处置「修改后批准」：编辑脱敏参数 JSON 后以 kind=edited 放行——服务端重过
+ *  jsonschema+Policy、按改后参数算 digest（重放安全），执行的就是你看到的这份参数。 */
+async function onEdited(d: AgentApprovalItem) {
+  const { notice } = useDialog()
+  const raw = await promptText({
+    title: '修改参数后批准',
+    message: `编辑「${d.tool_name}」的执行参数（JSON 对象）。提交即批准执行改后参数：会重新过参数校验与策略，操作不可撤回。`,
+    placeholder: '{ "qty": 100 }',
+    initial: JSON.stringify(d.proposed_args ?? {}, null, 2),
+    maxlength: 2000,
+    confirmText: '改参并批准',
+  })
+  if (raw === null) return
+  let parsed: Record<string, unknown>
+  try {
+    const v = JSON.parse(raw)
+    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('not object')
+    parsed = v as Record<string, unknown>
+  } catch {
+    void notice({ title: '参数格式错误', message: '需要合法的 JSON 对象（如 {"qty": 100}），本次未提交。', danger: true })
+    return
+  }
+  void decideAgentApproval(d, 'edited', undefined, parsed)
 }
 
 async function onReject(d: AgentApprovalItem) {
@@ -97,7 +135,7 @@ async function onTerminate(d: AgentApprovalItem) {
             <span>发起 {{ d.requested_by }}</span>
             <span v-if="d.approver_scope">· 归属 {{ deptLabel(d.approver_scope) }}</span>
             <span v-if="d.created_at">· {{ ts(d.created_at) }}</span>
-            <span v-if="d.expires_at" class="inline-flex items-center gap-0.5"><Timer :size="11" :stroke-width="2" /> {{ ts(d.expires_at) }} 过期</span>
+            <span v-if="d.expires_at" class="inline-flex items-center gap-0.5" :title="`${d.expires_at} 过期（超时视同拒绝）`"><Timer :size="11" :stroke-width="2" /> {{ relExpire(d.expires_at) }}</span>
           </div>
         </div>
 
@@ -108,6 +146,15 @@ async function onTerminate(d: AgentApprovalItem) {
           :disabled="isAgentApprovalBusy(`agent:${d.request_id}`)"
           @click="onTerminate(d)"
         ><Loader2 v-if="isAgentApprovalBusy(`agent:${d.request_id}`)" :size="13" :stroke-width="2" class="animate-spin" />{{ isMine(d) ? '撤回' : '终止' }}</button>
+        <!-- 修改后批准（第四处置）：own 申请直接不显（职责分离下无可用场景，不摆禁用按钮占位） -->
+        <button
+          v-if="!isMine(d)"
+          type="button"
+          class="inline-flex items-center justify-center gap-1 self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          :disabled="isAgentApprovalBusy(`agent:${d.request_id}`)"
+          title="修改参数后批准执行（重新过校验与策略）"
+          @click="onEdited(d)"
+        >改参</button>
         <button
           type="button"
           class="inline-flex items-center justify-center gap-1 self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
@@ -135,7 +182,7 @@ async function onTerminate(d: AgentApprovalItem) {
     </div>
 
     <p class="ml-0.5 text-[11.5px] text-faint">
-      审批即放行执行：批准后 Agent 立即续跑并执行该操作（一次性凭据，仅放行本次调用）；驳回会把理由回喂 Agent 换方案；终止直接结束该次运行。
+      审批即放行执行：批准后 Agent 立即续跑并执行该操作（一次性凭据，仅放行本次调用）；改参=修改参数后批准（重过校验与策略，执行改后参数）；驳回会把理由回喂 Agent 换方案；终止直接结束该次运行。
     </p>
   </section>
 </template>

@@ -3,6 +3,7 @@ import { apiFetch, apiJson } from '@/lib/api'
 import { createSseDecoder, type SseEvent } from '@/lib/sseDecoder'
 import { renderMd, stripImg } from '@/lib/markdown'
 import { useSession } from '@/stores/session'
+import { __resetIdentityScope, identityFingerprint, registerIdentityScopedStore } from '@/composables/identityScope'
 
 // 问答单一事实来源（模块级单例，等同轻量 store）。多会话（Atlas 式）：每条会话独立 messages +
 // 服务端 qaSession；新建/切换/删除/搜索；localStorage 持久化（reload 仍在，故有会话历史）。
@@ -68,6 +69,19 @@ export interface ChatMessage {
   _rTs?: number            // 思考通道上次渲染时间戳
   _reasoningDone?: boolean // 思考流结束（答案开始/收尾）→ 停思考泵、定稿全文
   _thinking?: boolean      // 本次是否开了「深度思考」（仅影响有据等待态文案）
+  agent?: AgentMsgMeta     // Agent canary：本条 AI 消息走 /api/agent/ask（useAgentAsk 写入/消费；旧路径恒不置）
+}
+
+/** Agent 消息元数据（结构定义放这里避免 useAsk↔useAgentAsk 循环依赖；会随消息持久化，
+ *  reload 后挂起卡按 runId 轮询恢复）。所有字段由 useAgentAsk 写入，useAsk 不读不写。 */
+export interface AgentMsgMeta {
+  runId?: string
+  status?: string          // running/suspended/resuming/succeeded/failed/cancelled/expired（流帧+轮询回写）
+  stages?: { key: string; label: string; at: number }[]   // 阶段化状态条（只映射真实事件，at=Date.now()）
+  tools?: { callId: string; toolName: string; args?: Record<string, unknown> | null; status?: string; elapsedMs?: number }[]
+  approval?: { requestId: string; checkpointId?: string; toolName?: string; args?: Record<string, unknown> | null } | null
+  messageId?: string       // done 后才提升为 m.messageId（挂起/在途不出反馈条）
+  disconnected?: boolean   // 实时流被停止/断开但 run 仍在服务端运行（轮询兜底）
 }
 
 export interface Conversation {
@@ -671,6 +685,19 @@ if (typeof window !== 'undefined') {
   loadPersisted()
 }
 
+// P0-D 身份作用域挂接：与其它 store 不同，问答历史按【uid 戳】处理而非无条件清空——
+// 同一用户换 token/角色刷新（401 重登、whoami 复核）绝不打断在途问答、不动本地历史
+//（否则 apiFetch 的 401 自动重试会被 askSeq++ 误废，答案静默丢失）；真换了人才作废在途流、
+// 清草稿并走 syncHistoryForUser（uid 戳判定，共享设备防残留）。
+registerIdentityScopedStore('ask', (sw) => {
+  if (sw.prevUserId === sw.nextUserId) return   // 同人（仅 token/角色变）：历史/草稿/在途流一律保留
+  askSeq++                                      // 作废上个用户的在途流回调
+  if (abortCtl) { try { abortCtl.abort() } catch { /* noop */ } abortCtl = null }
+  asking.value = false
+  draft.value = ''                              // 未发送草稿不跨身份残留
+  syncHistoryForUser(sw.nextUserId)             // 跨用户：清本地会话历史并以新 uid 重新戳记
+})
+
 // ── 服务端会话历史（Phase 2/3）：端点 gate 在 RAG_CONVERSATION_HISTORY，关时返回空 → 全部退回 localStorage ──
 interface ServerConv { conversation_id: string; title: string; updated_at: string }
 interface ServerMsg { message_id: string; question: string; answer: string; blocks: ViewBlock[]; created_at: string; status: string }
@@ -700,8 +727,10 @@ function serverItemToMessages(it: ServerMsg): ChatMessage[] {
 
 /** 登录后拉服务端会话列表，把本地没有的并进侧栏（占位：标题先到，消息点开再拉）。best-effort。 */
 async function hydrateConversations(): Promise<void> {
+  const fp = identityFingerprint()   // P0-D：在途判废——标题含提问摘要，A 的慢响应不得落进 B 的侧栏
   try {
     const r = await apiJson<{ items: ServerConv[] }>('/api/conversations', { auth: true })
+    if (fp !== identityFingerprint()) return
     for (const sc of (r.items || [])) {
       if (!sc.conversation_id || conversations.value.some((c) => c.id === sc.conversation_id)) continue
       conversations.value.push(reactive({
@@ -736,13 +765,26 @@ export function useAsk() {
   }
 }
 
+// ── Agent canary 桥（useAgentAsk 专用，只加不改）────────────────────────────
+// Agent transport 复用旧路径的会话创建/消息 id/持久化调度/草稿，避免在另一个模块里复刻一份
+// 会漂移的实现。旧 RAG 流程不感知本函数（零行为变化）；agent 侧自持独立 seq/abort，不碰 askSeq。
+export function agentChatBridge() {
+  return {
+    ensureActive,
+    schedulePersist,
+    nextMsgId: () => ++mid,
+    /** 旧路径回退入口（agent 404 时同问重发；skipUser=true 复用已推的用户气泡）。 */
+    askLegacy: (q: string) => ask(q, true),
+  }
+}
+
 /** 仅供测试：流式增量渲染内部（H#68）——供等价性回归测试对照全量 stripImg/renderMd。 */
 export function __incrRenderTestkit() {
   const newState = (): PumpChState => ({ stripLen: 0, stripOut: '', mdLen: 0, mdHtml: '' })
   return { newState, stripImgIncr, renderMdIncr }
 }
 
-/** 仅供测试：重置单例状态。 */
+/** 仅供测试：重置单例状态（顺带忘掉 identityScope 已观测身份，下次 sync 首见采纳）。 */
 export function __resetAsk(): void {
   conversations.value = []
   activeId.value = ''
@@ -753,4 +795,5 @@ export function __resetAsk(): void {
   askSeq = 0
   abortCtl = null
   if (_persistTimer) { clearTimeout(_persistTimer); _persistTimer = null }
+  __resetIdentityScope()
 }

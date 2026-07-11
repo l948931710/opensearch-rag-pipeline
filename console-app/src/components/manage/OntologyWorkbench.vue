@@ -53,7 +53,8 @@ function pct(v: number | null | undefined): string {
   return v == null ? '—' : `${Math.round(v * 100)}%`
 }
 function ts(v: string | number | null): string { return typeof v === 'string' ? v.slice(0, 16) : '' }
-function confPct(c: OntologyCandidate): string { return `${Math.round(c.confidence * 100)}%` }
+// 受限候选（target_visible=false）confidence 是常量 null 占位 → '—'（且模板对受限行整段不渲染）
+function confPct(c: OntologyCandidate): string { return c.confidence == null ? '—' : `${Math.round(c.confidence * 100)}%` }
 function prettyEvidence(raw: string | null): string {
   if (!raw) return ''
   try { return JSON.stringify(JSON.parse(raw), null, 2) } catch { return raw }
@@ -72,15 +73,16 @@ async function askReason(title: string, message: string): Promise<string | null>
 }
 
 async function onConfirm(kase: OntologyCase, cand: OntologyCandidate) {
+  if (!cand.target_object_id) return   // 受限占位行（按钮已禁用，这里兜底）
   const reason = await askReason(
     '确认身份映射',
     `把「${kase.namespace}」编号 ${kase.raw_value} 正式映射到 ` +
-      `${cand.title || cand.canonical_ref} [${cand.canonical_ref}]（来源 ${cand.method}，` +
+      `${cand.title || cand.canonical_ref} [${cand.canonical_ref}]（来源 ${cand.method || '—'}，` +
       `置信 ${confPct(cand)}${cand.owner_dept ? `，归属 ${deptLabel(cand.owner_dept)}` : ''}` +
       `${cand.data_classification ? `，密级 ${cand.data_classification}` : ''}）？` +
       '确认后立即生效为检索/计算的依据。')
   if (reason === null) return
-  void confirmOntologyCase(kase, cand, reason)
+  void confirmOntologyCase(kase, { target_object_id: cand.target_object_id, target_revision: cand.target_revision }, reason)
 }
 
 async function onManualSearch(kase: OntologyCase) {
@@ -233,7 +235,8 @@ async function onDismiss(kase: OntologyCase) {
               <span v-if="cand.data_classification && cand.data_classification !== 'internal'" class="ml-1 text-[11px] text-faint">· {{ cand.data_classification }}</span>
               <span v-if="cand.target_status && cand.target_status !== 'active'" class="ml-1 text-[11px] text-st-fail">（对象已{{ cand.target_status }}）</span>
             </span>
-            <span class="font-mono text-[11px] text-muted-foreground">{{ cand.method }} · {{ confPct(cand) }}</span>
+            <!-- 受限行（target_visible=false）method/confidence 是 null 占位：不渲染，占位文案已表达受限 -->
+            <span v-if="cand.target_visible !== false" class="font-mono text-[11px] text-muted-foreground">{{ cand.method || '—' }} · {{ confPct(cand) }}</span>
             <button
               type="button"
               class="inline-flex items-center gap-1 rounded-lg bg-primary px-3 py-[5px] text-[12px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"

@@ -1,15 +1,22 @@
 <script setup lang="ts">
 import { RotateCw, Headset, FileText, Sprout } from 'lucide-vue-next'
 import { useAsk, type ChatMessage } from '@/composables/useAsk'
+import { useAgentAsk } from '@/composables/useAgentAsk'
 import AnswerBlocks from './AnswerBlocks.vue'
 import SourceList from './SourceList.vue'
 import FeedbackBar from './FeedbackBar.vue'
 import ThinkingDisclosure from './ThinkingDisclosure.vue'
+import AgentFlow from './AgentFlow.vue'
+import AgentRunCard from './AgentRunCard.vue'
 
 // 一条消息：用户气泡 / AI 多态（思考过程披露条 · 加载骨架 · 错误重试 · 无结果卡 · 正常答案）。
+// Agent canary 消息（m.agent 有值）额外挂：答案上方过程条（AgentFlow）+ 下方 run 结局卡（AgentRunCard）。
 const props = defineProps<{ message: ChatMessage }>()
 const { retry, handoff, fillInput } = useAsk()
+const { retryAgent } = useAgentAsk()
 const m = props.message
+// 重试按当前来源分发：agent 消息按当前模式重发（agent 可用走 agent，否则回旧路径），旧消息走旧路径。
+function onRetry(msg: ChatMessage) { if (msg.agent) retryAgent(msg); else retry(msg) }
 
 // 等待态来源预览的档位点颜色（与 SourceList 同口径）。
 const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low: 'bg-st-queue' }
@@ -31,6 +38,9 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
     <div class="min-w-0 flex-1 pt-0.5">
     <!-- 思考过程披露条（深度思考；仅当有 reasoning 时）：思考期独占显示，答案到来后收起置顶 -->
     <ThinkingDisclosure v-if="m.reasoning" :message="m" />
+
+    <!-- Agent 过程条（阶段化状态 + 工具 chips；仅 agent 消息） -->
+    <AgentFlow v-if="m.agent" :message="m" />
 
     <!-- 加载骨架（有据等待态：检索完成即预览"找到了哪些文档"，淡入浮现） -->
     <div v-if="m.loading" class="py-1">
@@ -63,7 +73,7 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
       <button
         type="button"
         class="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground"
-        @click="retry(m)"
+        @click="onRetry(m)"
       >
         <RotateCw :size="14" :stroke-width="1.75" /> 重试
       </button>
@@ -114,11 +124,14 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
         v-if="m.question"
         type="button"
         class="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground"
-        @click="retry(m)"
+        @click="onRetry(m)"
       >
         <RotateCw :size="14" :stroke-width="1.75" /> 重试
       </button>
     </template>
+
+    <!-- Agent run 结局卡（挂起/断线/终态回执；仅 agent 消息，卡内自判显隐） -->
+    <AgentRunCard v-if="m.agent" :message="m" />
     </div>
   </div>
 </template>
