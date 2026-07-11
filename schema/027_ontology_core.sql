@@ -9,6 +9,10 @@
 --   ① canonical_ref 升为全局 UNIQUE（原 uk 只在 (object_type, canonical_ref)，两类型误配同 type_code 时
 --      get_object_by_ref 的单列查会歧义；全局唯一后 LIMIT 1 从「约定」变「DB 强制」）；
 --   ② ontology_ref_seq.type_code 加 UNIQUE（原来只有 PK(object_type)，同码双类型 DB 不拦）。
+-- P1 收口修订（PR-G，「DDL 约束不足」，2026-07-10 外审）：
+--   ③ lifecycle_state CHECK（draft|verified——自由文本会让挑行规则 verified 优先静默失效）；
+--   ④ object_type 加 FK → ontology_ref_seq（登记类型码=治理动作，未登记类型 DB 层拦死）；
+--   ⑤ link/identifier/candidate 的 confidence CHECK 0..1、link_type 格式 CHECK 见 028/029。
 
 -- ── 对象主表：canonical 身份由本体铸造（ULID），永不等于任何源系统 ID ────────────────
 CREATE TABLE IF NOT EXISTS ontology_object (
@@ -17,7 +21,7 @@ CREATE TABLE IF NOT EXISTS ontology_object (
   canonical_ref       VARCHAR(32)  NOT NULL,          -- 人读展示号 FLP-<类型码>-<序号>（ontology_ref_seq 发号）
   title               VARCHAR(255) NOT NULL,          -- 人读名称（商务品名/牌号等）
   golden_json         JSON         NOT NULL,          -- 黄金记录属性值；每属性权威来源单独查 attribute_source，不双写
-  lifecycle_state     VARCHAR(16)  NOT NULL DEFAULT 'draft',   -- draft|verified|…（如 PackingSpec 已验证）
+  lifecycle_state     VARCHAR(16)  NOT NULL DEFAULT 'draft',   -- draft|verified（CHECK 钉死；新状态=治理动作走迁移）
   owner_dept          VARCHAR(64)  NOT NULL,          -- 身份/生命周期唯一 steward 部门（单值；属性级归属见 stewardship）
   data_classification ENUM('public','internal','confidential') NOT NULL DEFAULT 'internal',
   source_of_record    VARCHAR(32)  NOT NULL DEFAULT 'ontology',   -- u8|ontology|max|ha3（对象主档 SoR）
@@ -29,7 +33,8 @@ CREATE TABLE IF NOT EXISTS ontology_object (
   PRIMARY KEY (object_id),
   UNIQUE KEY uk_ref (canonical_ref),                  -- 全局唯一（P0-04：类型码内嵌于展示号，DB 强制而非约定）
   KEY idx_type_status (object_type, status),
-  KEY idx_type_title (object_type, title(64))
+  KEY idx_type_title (object_type, title(64)),
+  CONSTRAINT ck_object_lifecycle CHECK (lifecycle_state IN ('draft','verified'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── canonical_ref 发号器：每类型一行计数，UPDATE …=LAST_INSERT_ID(next_no+1) 原子取号 ──
@@ -70,6 +75,18 @@ CREATE TABLE IF NOT EXISTS ontology_source_population (
   snapshot_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (namespace)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ── object_type FK → ref_seq（PR-G ④；建表序在 ref_seq 之后，故置文件尾 ALTER；
+--    information_schema 守卫幂等——027 支持重复 apply）──────────────────────────────
+SET @has_fk := (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ontology_object'
+                  AND CONSTRAINT_NAME = 'fk_object_type_registered');
+SET @ddl := IF(@has_fk = 0,
+               'ALTER TABLE ontology_object ADD CONSTRAINT fk_object_type_registered FOREIGN KEY (object_type) REFERENCES ontology_ref_seq (object_type)',
+               'SELECT 1');
+PREPARE _s FROM @ddl;
+EXECUTE _s;
+DEALLOCATE PREPARE _s;
 
 -- ── stewardship：审批/工作台授权的权威源（S5 独立化，最小形态）─────────────────────
 -- scope 三种粒度：object_type（身份确认归谁）/ namespace（某客户别名归谁）/ attribute（属性级）。

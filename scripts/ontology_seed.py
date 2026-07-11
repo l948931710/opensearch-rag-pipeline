@@ -57,7 +57,9 @@ def main(argv=None, *, store=None, source=None) -> int:
             from opensearch_pipeline.ontology import attribute_source, stewardship
             n1 = attribute_source.ensure_seeds(store)
             n2 = stewardship.ensure_seeds(store)
-            print(f"governance seeds：attribute_source {n1} 行 · stewardship {n2} 行")
+            print(f"governance seeds：attribute_source {n1} 行 · "
+                  f"stewardship 声明 {n2['declared']} 行"
+                  f"（desired-state 撤销未声明 {len(n2['removed'])} 行）")
 
     report = seed_snapshot(store, source, dry_run=dry, limit=args.limit)
     print(report.summary())

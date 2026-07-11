@@ -47,6 +47,45 @@ _SEM_PROBE_TTL_S = 300.0
 
 _IDENTIFIER_END_STATES = ("rejected", "superseded")
 
+# ── PR-G 服务层约束（与 027-029 的 CHECK/FK 同口径，双后端一致先行报错）────────────
+# 关系类型白名单：新增关系=受治理变更走代码 PR（DB 只兜格式 CHECK，语义在这里）
+VALID_LINK_TYPES = frozenset({
+    "sku_of_product", "packing_spec_of_sku", "stacking_spec_of_sku",
+    "mold_of_product", "material_of_product",
+})
+_VALID_LIFECYCLE_STATES = ("draft", "verified")
+
+
+def _check_confidence(v: float) -> None:
+    if not (0.0 <= float(v) <= 1.0):
+        raise ValueError(f"confidence 越界：{v}（须 0..1——越界置信是 auto 判定的输入污染）")
+
+
+def _check_link_type(t: str) -> None:
+    if t not in VALID_LINK_TYPES:
+        raise ValueError(f"未登记的 link_type {t!r}（合法：{sorted(VALID_LINK_TYPES)}；"
+                         "新增关系类型是受治理变更，走代码 PR 扩 VALID_LINK_TYPES + 029 注释）")
+
+
+def _check_lifecycle(state: str) -> None:
+    if state not in _VALID_LIFECYCLE_STATES:
+        raise ValueError(f"非法 lifecycle_state {state!r}（合法：{_VALID_LIFECYCLE_STATES}）")
+
+
+def _check_owner_dept(dept: str) -> None:
+    """owner_dept 必须是既有 ACL 组码（kb_authz 白名单单一来源）——sem/authz 的行过滤
+    按 owner_dept ∈ acl 判定，私造组码=对象对所有人不可见的静默黑洞。白名单加载失败
+    （极简 pod 缺依赖）→ 告警放行（graceful degradation：辅助校验不阻断主流程）。"""
+    try:
+        from opensearch_pipeline.kb_authz import _valid_owner_depts
+        whitelist = _valid_owner_depts()
+    except Exception:   # noqa: BLE001
+        logger.warning("owner_dept 白名单不可用，跳过校验（dept=%s）", dept)
+        return
+    if dept not in whitelist:
+        raise ValueError(f"owner_dept {dept!r} 不在 ACL 组码白名单（私造组码会让对象"
+                         "对所有人不可见；新组码走 user_role→白名单→灰度 的独立 PR）")
+
 
 class DuplicateActiveIdentifier(Exception):
     """同 (namespace, norm_value) 已有 active 别名——撞 uk_ns_norm_active。"""
@@ -118,6 +157,8 @@ class RDSOntologyStore:
                     lifecycle_state: str = "draft") -> Dict[str, Any]:
         """铸 canonical 对象：ref_seq 原子取号 + INSERT，同一事务。
         object_type 未在 ontology_ref_seq 登记 → ValueError（登记类型码是治理动作，不静默造号）。"""
+        _check_owner_dept(owner_dept)
+        _check_lifecycle(lifecycle_state)
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -318,6 +359,7 @@ class RDSOntologyStore:
                           source_case_id: Optional[str] = None,
                           approval_request_id: Optional[str] = None) -> str:
         """铸一条 active 别名（持久化确认——仅播种/回填/工作台/受治理 Action 四路径可达，S1）。"""
+        _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         identifier_id = new_ulid()
         try:
@@ -421,6 +463,9 @@ class RDSOntologyStore:
 
         别名撞 uk → 整体回滚（对象不留），抛 DuplicateActiveIdentifier——P0-05 的
         「铸完对象别名被并发占 → 永久孤儿」由此根除。"""
+        _check_owner_dept(owner_dept)
+        _check_lifecycle(lifecycle_state)
+        _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -492,6 +537,7 @@ class RDSOntologyStore:
         **一个事务**——并发被抢在事务内即失败整体回滚，不再需要"补偿 deactivate"。
 
         case 不存在/非 open → ValueError；别名撞 uk → DuplicateActiveIdentifier。"""
+        _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -548,6 +594,7 @@ class RDSOntologyStore:
         """受治理 Action 确认（P0-05/06）：铸别名 +（若有）闭同 (ns,norm) open case
         **一个事务**——正式 identifier 与治理 case 不再可分叉。返回
         (identifier_id, closed_case_id)。"""
+        _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -607,6 +654,7 @@ class RDSOntologyStore:
                  attrs: Optional[Dict[str, Any]] = None) -> str:
         """建关系（src --type--> dst）。幂等：撞 uk_src_dst_type（含 retired 行）→
         返回现行 link_id，不复活不覆盖（retire/复活语义 P2 再议）。"""
+        _check_link_type(link_type)
         db, conn = self._db(), self._conn()
         try:
             link_id = new_ulid()
@@ -702,9 +750,19 @@ class RDSOntologyStore:
             self._sem_probe[view] = (now, ok)
         return ok
 
+    @staticmethod
+    def _inline_fallback_allowed() -> bool:
+        """PR-G（P1「sem 静默 inline fallback」收口）：内联回退**仅限本地 host**——
+        共享 staging/prod 上视图缺失=schema drift 或授权失败，静默回退会把事故
+        掩成"能查"，必须 fail-closed 阻断并把 030 未 apply 的事实暴露出来。
+        判定用物理 host（与 apply_migration.classify_target 同纪律），不信自报标签。"""
+        from opensearch_pipeline.config import _LOCAL_HOSTS, get_config
+        return get_config().rds.host in _LOCAL_HOSTS
+
     def sem_spec_rows(self, sku_object_id: str, kind: str) -> List[Dict[str, Any]]:
         """PMC-1 投影行（kind ∈ SEM_PROJECTIONS）。视图在位走视图；未 apply/查询失败
-        回退内联同形 JOIN（qa_facts 式）。**本方法不做 ACL——行过滤是 sem.py 的职责。**"""
+        的内联同形 JOIN 回退**仅限本地开发**（共享环境 fail-closed 抛错——PR-G）。
+        **本方法不做 ACL——行过滤是 sem.py 的职责。**"""
         proj = SEM_PROJECTIONS[kind]
         db = self._db()
         if self._sem_view_ready(proj["view"]):
@@ -717,8 +775,15 @@ class RDSOntologyStore:
                         return self._rows_to_dicts(cur)
                 finally:
                     conn.close()
-            except Exception:   # noqa: BLE001 — 视图刚被删等窄窗口：降级不硬崩
-                logger.warning("sem 视图查询失败，本次回退内联投影", exc_info=True)
+            except Exception:   # noqa: BLE001 — 视图刚被删等窄窗口：本地降级，共享环境下沉到闸
+                logger.warning("sem 视图查询失败，尝试内联投影回退", exc_info=True)
+        if not self._inline_fallback_allowed():
+            logger.error("sem 视图 %s 不可用且目标非本地库——fail-closed 阻断"
+                         "（schema/030 未 apply 或视图授权失败，须先修复，不静默回退）",
+                         proj["view"])
+            raise RuntimeError(
+                f"sem 视图 {proj['view']} 不可用（共享环境禁止内联回退——"
+                "请先 apply schema/030 或排查视图授权）")
         json_cols = ", ".join(
             f"JSON_UNQUOTE(JSON_EXTRACT(spec.golden_json,'$.{f}')) AS {f}"
             for f in proj["fields"])
@@ -812,6 +877,7 @@ class RDSOntologyStore:
                       confidence: float, target_revision: Optional[str] = None,
                       features: Optional[Dict[str, Any]] = None) -> str:
         """候选幂等：同 (case, target, method) 重复提出 → 置信取大、依据取新。返回现行 candidate_id。"""
+        _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:
@@ -1022,6 +1088,22 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
+    def delete_stewardship(self, scope_type: str, scope_key: str) -> bool:
+        """撤销一条 scope（PR-G desired-state：代码声明移除=显式撤权，不再永久残留）。"""
+        db, conn = self._db(), self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {db}.ontology_stewardship "
+                            "WHERE scope_type=%s AND scope_key=%s", (scope_type, scope_key))
+                ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     # ── 覆盖率 / 积压统计 ────────────────────────────────────────────────────
     def record_population_snapshot(self, namespace_counts: Dict[str, int], *,
                                    source: str = "seeding") -> int:
@@ -1157,6 +1239,8 @@ class MemoryOntologyStore:
     def mint_object(self, object_type, title, *, owner_dept, golden=None,
                     data_classification="internal", source_of_record="ontology",
                     lifecycle_state="draft"):
+        _check_owner_dept(owner_dept)
+        _check_lifecycle(lifecycle_state)
         with self._lock:
             if object_type not in self._seq:
                 raise ValueError(f"object_type {object_type!r} 未在 ontology_ref_seq 登记类型码")
@@ -1263,6 +1347,7 @@ class MemoryOntologyStore:
     def insert_identifier(self, namespace, raw_value, norm_value, target_object_id, *,
                           method, relation="alias", target_revision=None, confidence=1.0,
                           confirmed_by=None, source_case_id=None, approval_request_id=None):
+        _check_confidence(confidence)
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
                 raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
@@ -1323,6 +1408,9 @@ class MemoryOntologyStore:
                                method="seed", relation="canonical", confidence=1.0,
                                confirmed_by=None, close_open_case=True, case_note=None,
                                audit=None):
+        _check_owner_dept(owner_dept)
+        _check_lifecycle(lifecycle_state)
+        _check_confidence(confidence)
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
                 raise DuplicateActiveIdentifier(
@@ -1357,6 +1445,7 @@ class MemoryOntologyStore:
     def confirm_case_with_identifier(self, case_id, *, target_object_id, by, note=None,
                                      relation="alias", target_revision=None,
                                      method="manual", confidence=1.0, audit=None):
+        _check_confidence(confidence)
         with self._lock:
             case = self._cases.get(case_id)
             if not case or case["status"] != "open":
@@ -1388,6 +1477,7 @@ class MemoryOntologyStore:
                                        relation="alias", target_revision=None,
                                        confidence=1.0, confirmed_by=None,
                                        approval_request_id=None, note=None, audit=None):
+        _check_confidence(confidence)
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
                 raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
@@ -1424,6 +1514,7 @@ class MemoryOntologyStore:
 
     # ── 关系 / sem 投影（与 RDS 同契约）──────────────────────────────────────
     def add_link(self, src_object_id, dst_object_id, link_type, *, attrs=None):
+        _check_link_type(link_type)
         with self._lock:
             for row in self._links.values():
                 if (row["src_object_id"], row["dst_object_id"], row["link_type"]) == \
@@ -1521,6 +1612,7 @@ class MemoryOntologyStore:
 
     def add_candidate(self, case_id, target_object_id, *, method, confidence,
                       target_revision=None, features=None):
+        _check_confidence(confidence)
         with self._lock:
             for row in self._candidates.values():
                 if (row["case_id"], row["target_object_id"], row["method"]) == \
@@ -1618,6 +1710,10 @@ class MemoryOntologyStore:
     def list_stewardship(self):
         with self._lock:
             return [dict(v) for k, v in sorted(self._stewardship.items())]
+
+    def delete_stewardship(self, scope_type, scope_key):
+        with self._lock:
+            return self._stewardship.pop((scope_type, scope_key), None) is not None
 
     # ── 统计 ────────────────────────────────────────────────────────────────
     def record_population_snapshot(self, namespace_counts, *, source="seeding"):

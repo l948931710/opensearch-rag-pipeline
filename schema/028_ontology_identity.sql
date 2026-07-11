@@ -9,6 +9,8 @@
 --   ② identifier.status 增 'retired'（目标对象退役时级联，区别于 superseded=被改指 / rejected=错映射）；
 --   ③ 加 FK：identifier.target_object_id→object、candidate.case_id→case、candidate.target→object
 --      （同库引用，悬空目标在 DB 层拦截；应用层状态机见 store.py retire/mark_duplicate 级联）。
+-- P1 收口修订（PR-G，「DDL 约束不足」）：confidence CHECK 0..1（identifier/candidate 两表——
+--   越界置信是 auto 判定的输入污染，DB 层兜底；服务层同校验先行报错）。
 --
 -- 分层（S1/S2 读写分离的落库形态）：
 --   · 候选阶段一律在 resolution_case/candidate —— 一个未解析编号可挂 N 个候选目标（uk_ns_norm 装不下）；
@@ -41,6 +43,7 @@ CREATE TABLE IF NOT EXISTS ontology_identifier (
   KEY idx_ns_norm (namespace, norm_value),            -- 历史/全状态回查（非唯一）
   KEY idx_target (target_object_id, status),
   KEY idx_method_status (resolution_method, status),  -- auto 抽检队列（method+active 扫描）
+  CONSTRAINT ck_identifier_confidence CHECK (confidence >= 0 AND confidence <= 1),
   CONSTRAINT fk_identifier_target FOREIGN KEY (target_object_id)
     REFERENCES ontology_object (object_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -82,6 +85,7 @@ CREATE TABLE IF NOT EXISTS ontology_resolution_candidate (
   PRIMARY KEY (candidate_id),
   UNIQUE KEY uk_case_target_method (case_id, target_object_id, method),
   KEY idx_case (case_id, confidence),
+  CONSTRAINT ck_candidate_confidence CHECK (confidence >= 0 AND confidence <= 1),
   CONSTRAINT fk_candidate_case FOREIGN KEY (case_id)
     REFERENCES ontology_resolution_case (case_id),
   CONSTRAINT fk_candidate_target FOREIGN KEY (target_object_id)

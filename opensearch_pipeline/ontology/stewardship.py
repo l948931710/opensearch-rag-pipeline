@@ -32,9 +32,35 @@ SEED_SCOPES: List[dict] = [
 ]
 
 
-def ensure_seeds(store) -> int:
-    """把代码内声明 upsert 进 ontology_stewardship（幂等；代码即权威）。"""
-    return store.upsert_stewardship(SEED_SCOPES)
+def ensure_seeds(store, *, prune: bool = True) -> dict:
+    """desired-state 对账（PR-G，外审 P1「stewardship 不是安全的 desired state」）：
+    代码内声明是**唯一权威**——upsert 声明行之外，把库里**未声明**的 scope 显式撤销
+    （旧行为只 upsert，从代码里删掉的授权在库里永久残留=幽灵授权）。
+
+    scope 的增删改一律走代码 PR（评审即双人批准）；运行期没有任何合法写入口
+    （工作台不写本表），故 prune=True 是安全默认。prune=False 仅供只读 diff 预览。
+    返回 diff：{"declared": n, "removed": [(scope_type, scope_key, steward_dept), ...]}。
+    """
+    import logging
+    declared = {(r["scope_type"], r["scope_key"]) for r in SEED_SCOPES}
+    try:
+        existing = store.list_stewardship()
+    except Exception:   # noqa: BLE001 — 表未建（首灌前）：只播种，不对账
+        existing = []
+    store.upsert_stewardship(SEED_SCOPES)
+    removed = []
+    for row in existing:
+        key = (row["scope_type"], row["scope_key"])
+        if key in declared:
+            continue
+        if prune:
+            store.delete_stewardship(*key)
+        removed.append((row["scope_type"], row["scope_key"], row.get("steward_dept")))
+    if removed:
+        logging.getLogger(__name__).warning(
+            "stewardship desired-state 对账：%s %d 条未声明 scope %s——授权变更须走代码 PR",
+            "已撤销" if prune else "发现（prune=False 未动）", len(removed), removed)
+    return {"declared": len(SEED_SCOPES), "removed": removed}
 
 
 def resolve_steward(rows: List[dict], *, object_type: Optional[str] = None,

@@ -690,3 +690,108 @@ def test_invariant_scan_clean_and_dirty(store, ns):
     case_id = store.upsert_case(ns, "h", "H")
     report2 = scan_invariants(store)
     assert any(v["case_id"] == case_id for v in report2["alias_open_case"])
+
+
+# ── PR-G：sem fallback fail-closed / DDL+服务层约束 / stewardship desired-state ──
+
+
+def test_sem_inline_fallback_local_only(monkeypatch):
+    """共享环境（非本地 host）视图不可用 → fail-closed 抛错，不静默内联回退。"""
+    store = RDSOntologyStore()
+    monkeypatch.setattr(RDSOntologyStore, "_sem_view_ready", lambda self, v: False)
+    monkeypatch.setattr(RDSOntologyStore, "_inline_fallback_allowed", staticmethod(lambda: False))
+    with pytest.raises(RuntimeError, match="禁止内联回退"):
+        store.sem_spec_rows("0" * 26, "packing")
+
+
+@rds_only
+def test_sem_inline_fallback_still_works_locally(monkeypatch):
+    """本地 host：030 缺位仍可内联回退（开发兼容模式不受影响）。"""
+    store = RDSOntologyStore()
+    monkeypatch.setattr(RDSOntologyStore, "_sem_view_ready", lambda self, v: False)
+    assert store._inline_fallback_allowed() is True
+    assert store.sem_spec_rows("0" * 26, "packing") == []   # 内联路径可达（无该 sku → 空）
+
+
+@pytest.mark.parametrize("bad_conf", [-0.1, 1.5])
+def test_service_rejects_out_of_range_confidence(store, ns, bad_conf):
+    obj = _mint(store)
+    with pytest.raises(ValueError, match="confidence 越界"):
+        store.insert_identifier(ns, "x", "X", obj["object_id"], method="seed",
+                                confidence=bad_conf)
+    cid = store.upsert_case(ns, "y", "Y")
+    with pytest.raises(ValueError, match="confidence 越界"):
+        store.add_candidate(cid, obj["object_id"], method="rule", confidence=bad_conf)
+
+
+def test_service_rejects_unregistered_link_type(store):
+    a, b = _mint(store), _mint(store)
+    with pytest.raises(ValueError, match="未登记的 link_type"):
+        store.add_link(a["object_id"], b["object_id"], "made_up_relation")
+
+
+def test_service_rejects_bogus_owner_dept_and_lifecycle(store):
+    with pytest.raises(ValueError, match="白名单"):
+        store.mint_object("product", f"{_MARK}私造组码", owner_dept="notadept")
+    with pytest.raises(ValueError, match="lifecycle_state"):
+        _mint(store, title=f"{_MARK}怪状态", lifecycle_state="shipped")
+
+
+@rds_only
+def test_rds_ddl_checks_enforced():
+    """DB 层兜底（服务层被绕过时）：confidence CHECK 3819、object_type FK 1452。"""
+    import pymysql
+
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
+                           password=cfg.rds.password, database=cfg.rds.ontology_database,
+                           autocommit=True, connect_timeout=3)
+    store = RDSOntologyStore()
+    obj = _mint(store)
+    try:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception) as e1:   # confidence CHECK
+                cur.execute(
+                    "INSERT INTO ontology_identifier (identifier_id, namespace, raw_value, "
+                    "norm_value, target_object_id, resolution_method, confidence) "
+                    "VALUES (%s,%s,%s,%s,%s,'seed',5.0)",
+                    ("C" * 26, f"{_MARK}ck", "x", "X", obj["object_id"]))
+            assert e1.value.args[0] == 3819
+            with pytest.raises(Exception) as e2:   # object_type FK
+                cur.execute(
+                    "INSERT INTO ontology_object (object_id, object_type, canonical_ref, "
+                    "title, golden_json, owner_dept) "
+                    "VALUES (%s,'starship',%s,%s,'{}','pmc')",
+                    ("D" * 26, f"FLP-Z-{uuid.uuid4().int % 999999:06d}", f"{_MARK}fk"))
+            assert e2.value.args[0] == 1452
+            with pytest.raises(Exception) as e3:   # lifecycle CHECK
+                cur.execute(
+                    "UPDATE ontology_object SET lifecycle_state='shipped' WHERE object_id=%s",
+                    (obj["object_id"],))
+            assert e3.value.args[0] == 3819
+    finally:
+        conn.close()
+        _cleanup_rds_safe()
+
+
+def test_stewardship_desired_state_prunes_stale(store):
+    """PR-G：ensure_seeds=desired-state——未声明 scope 被显式撤销（幽灵授权根除）。"""
+    stewardship.ensure_seeds(store)            # 先收敛（RDS 共享表可能有历史残留）
+    diff0 = stewardship.ensure_seeds(store)
+    assert diff0["removed"] == []              # 稳态：desired state 下再对账零撤销
+    # 库里私加一条未声明 scope（模拟历史残留/越权写入）
+    store.upsert_stewardship([{"scope_type": "namespace", "scope_key": "customer:GHOST",
+                               "steward_dept": "finance", "backup_dept": None,
+                               "notes": "幽灵授权"}])
+    # prune=False：只发现不动（diff 预览）
+    diff1 = stewardship.ensure_seeds(store, prune=False)
+    assert ("namespace", "customer:GHOST", "finance") in diff1["removed"]
+    assert any(r["scope_key"] == "customer:GHOST" for r in store.list_stewardship())
+    # prune=True（默认）：显式撤销；声明行原样
+    diff2 = stewardship.ensure_seeds(store)
+    assert ("namespace", "customer:GHOST", "finance") in diff2["removed"]
+    rows = store.list_stewardship()
+    assert not any(r["scope_key"] == "customer:GHOST" for r in rows)
+    assert stewardship.resolve_steward(rows, namespace="customer:KFC")["steward_dept"] \
+        == "marketing"
