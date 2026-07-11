@@ -184,7 +184,11 @@ def _spec(risk=RiskLevel.READ_ONLY, idem="none", name="t"):
 def _call(ex, tool, **kw):
     base = dict(run_id="r", step_no=1, policy_decision="allow", policy_id="p")
     base.update(kw)
-    return ex.execute(None, tool, {"q": "x"}, **base)
+    r = ex.execute(None, tool, {"q": "x"}, **base)
+    # READ_ONLY trace/审计异步化后，audit.calls/store 断言前先排水（同步场景 no-op）
+    from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+    drain_read_trace()
+    return r
 
 
 def test_high_write_audit_failure_blocks_execution():

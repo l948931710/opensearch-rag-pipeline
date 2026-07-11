@@ -160,6 +160,8 @@ def test_adjudicator_allow_executes_and_records():
     adj, store = _adj(reg)
     res = adj(_ctx(), _tcp())
     assert res.status == "succeeded" and tool.ran
+    from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+    assert drain_read_trace()                       # READ_ONLY trace 异步：断言前排水
     assert store.invocations and store.invocations[0]["status"] == "succeeded"   # executing→succeeded
 
 

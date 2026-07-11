@@ -8,7 +8,11 @@ test_agent_runtime_tool_executor.py — ToolExecutor 中间件栈（Task 17 / �
 import time
 
 from opensearch_pipeline.agent_runtime.tool import RiskLevel, ToolResult, ToolSpec
-from opensearch_pipeline.agent_runtime.tool_executor import ToolExecutor, _ToolBreaker
+from opensearch_pipeline.agent_runtime.tool_executor import (
+    ToolExecutor,
+    _ToolBreaker,
+    drain_read_trace,
+)
 
 
 class _Store:
@@ -63,6 +67,7 @@ def test_execute_success_records():
     tool = _Tool(_spec(), lambda a: ToolResult.text_ok("ok"))
     r = _call(_exec(store), tool)
     assert r.status == "succeeded" and tool.calls == 1
+    assert drain_read_trace()                       # READ_ONLY trace 异步：断言前排水
     assert store.invocations[0]["status"] == "succeeded"
 
 
@@ -116,4 +121,79 @@ def test_timeout_fails_and_records():
     store = _Store()
     r = _call(_exec(store), _Tool(_spec(timeout_s=0.1), slow))
     assert r.status == "failed"
+    assert drain_read_trace()                       # READ_ONLY trace 异步：断言前排水
     assert store.invocations[0]["status"] == "failed"
+
+
+# ── READ_ONLY trace/审计异步化（2026-07-11 延迟优化）──────────────────────────────
+class _SlowStore(_Store):
+    """每笔 trace 写 sleep——同步路径会把延迟叠进 execute()，异步路径不会。"""
+
+    def __init__(self, delay=0.15):
+        super().__init__()
+        self._d = delay
+
+    def record_invocation(self, run_id, step_no, **kw):
+        time.sleep(self._d)
+        return super().record_invocation(run_id, step_no, **kw)
+
+    def finish_invocation(self, invocation_id, **kw):
+        time.sleep(self._d)
+        super().finish_invocation(invocation_id, **kw)
+
+
+class _SpyAudit:
+    def __init__(self):
+        self.calls = []
+
+    def record(self, ctx, **kw):
+        self.calls.append(kw)
+
+
+def test_read_trace_async_off_critical_path():
+    """READ_ONLY：慢 trace 店（0.15s×2）不再拖慢 execute()；排水后行齐且 FIFO 保
+    record→finish 顺序（终态 succeeded + 回执在）。"""
+    store = _SlowStore()
+    audit = _SpyAudit()
+    ex = ToolExecutor(store, audit=audit)
+    tool = _Tool(_spec(), lambda a: ToolResult.ok(
+        content=[], receipt={"chunk_count": 3}))
+    t0 = time.monotonic()
+    r = _call(ex, tool)
+    wall = time.monotonic() - t0
+    assert r.status == "succeeded"
+    assert wall < 0.12, f"trace 应已挪出关键路径，实测 {wall:.3f}s"
+    assert drain_read_trace()
+    assert store.invocations[0]["status"] == "succeeded"
+    assert '"chunk_count": 3' in (store.invocations[0].get("receipt_json") or "")
+    assert len(audit.calls) == 1 and audit.calls[0]["risk_level"] == "read_only"
+
+
+def test_read_trace_flag_off_keeps_sync(monkeypatch):
+    """RAG_AGENT_ASYNC_READ_TRACE=false → 与旧行为一致：execute 返回时行已同步落库。"""
+    monkeypatch.setenv("RAG_AGENT_ASYNC_READ_TRACE", "false")
+    store = _Store()
+    r = _call(_exec(store), _Tool(_spec(), lambda a: ToolResult.text_ok("ok")))
+    assert r.status == "succeeded"
+    assert store.invocations[0]["status"] == "succeeded"   # 无需排水
+
+
+def test_key_required_read_tool_stays_sync():
+    """声明 key_required 的读工具：幂等状态机依赖行同步可见 → 不走异步。"""
+    store = _Store()
+    tool = _Tool(_spec(idem="key_required"), lambda a: ToolResult.text_ok("ok"))
+    r = _call(_exec(store), tool, idempotency_key="k1")
+    assert r.status == "succeeded"
+    assert store.invocations[0]["status"] == "succeeded"   # 无需排水=同步落库
+
+
+def test_write_tool_stays_sync_with_flag_on():
+    """写型工具：record 同步（uk 竞态语义）+ write-ahead 审计不动——异步开关与其无关。"""
+    store = _Store()
+    audit = _SpyAudit()
+    ex = ToolExecutor(store, audit=audit)
+    spec = _spec(risk=RiskLevel.HIGH_WRITE, idem="key_required")
+    r = _call(ex, _Tool(spec, lambda a: ToolResult.text_ok("ok")), idempotency_key="k2")
+    assert r.status == "succeeded"
+    assert store.invocations[0]["status"] == "succeeded"   # 无需排水
+    assert len(audit.calls) == 1 and audit.calls[0]["fail_closed"] is True

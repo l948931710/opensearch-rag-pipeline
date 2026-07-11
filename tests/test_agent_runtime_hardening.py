@@ -297,6 +297,8 @@ def test_timeout_readonly_tool_stays_failed():
     res = ex.execute(_ctx(), tool, {}, run_id="r1", step_no=1,
                      policy_decision="allow", policy_id="p")
     assert res.status == "failed"
+    from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+    assert drain_read_trace()                       # READ_ONLY trace 异步：断言前排水
     inv = list(store.rows.values())[0]
     assert inv["status"] == "failed"
 
@@ -444,6 +446,8 @@ def test_output_schema_violation_readonly_failed_write_uncertain():
     res = ToolExecutor(store1).execute(_ctx(), tool_r, {}, run_id="r", step_no=1,
                                        policy_decision="allow", policy_id="p")
     assert res.status == "failed" and "契约" in (res.error or "")
+    from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+    assert drain_read_trace()                       # READ_ONLY trace 异步：断言前排水
     assert list(store1.rows.values())[0]["status"] == "failed"
     # 写工具违约 → uncertain（副作用已发生）
     store2 = _InvStore()

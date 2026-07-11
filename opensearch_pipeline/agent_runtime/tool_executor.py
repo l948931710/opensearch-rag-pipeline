@@ -57,6 +57,53 @@ def _get_timeout_pool() -> ThreadPoolExecutor:
     return _TIMEOUT_POOL
 
 
+# ── READ_ONLY 工具 trace/审计异步化（延迟优化第二刀，2026-07-11）───────────────────
+# 读工具的 record_invocation/audit/finish_invocation 本就 fail-open（trace 失败绝不影响
+# 结果返回），把这 3 笔 RDS 往返挪出关键路径（公网环境省 1-3s/次调用）。
+# 边界：**只限 READ_ONLY 且 idempotency != key_required**——幂等状态机（残行裁决/uk 竞态/
+# CAS 回收）依赖行同步可见；LOW/HIGH_WRITE 与 write-ahead fail-closed 审计一字不动。
+# 单 worker FIFO：record(INSERT) 恒先于 finish(UPDATE) 到库。进程崩溃时在途 trace 可能
+# 丢行（读工具无副作用，纯可观测性损失）；正常退出由非 daemon 线程自然排水。
+_READ_TRACE_POOL: Optional[ThreadPoolExecutor] = None
+
+
+def _async_read_trace_enabled() -> bool:
+    return os.environ.get("RAG_AGENT_ASYNC_READ_TRACE", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _read_trace_pool() -> ThreadPoolExecutor:
+    global _READ_TRACE_POOL
+    if _READ_TRACE_POOL is None:
+        with _POOL_LOCK:
+            if _READ_TRACE_POOL is None:
+                _READ_TRACE_POOL = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="tool-read-trace")
+    return _READ_TRACE_POOL
+
+
+def drain_read_trace(timeout: float = 5.0) -> bool:
+    """等待已入队的读工具 trace 写全部落库（测试断言/优雅退出前用）。"""
+    pool = _READ_TRACE_POOL
+    if pool is None:
+        return True
+    try:
+        pool.submit(lambda: None).result(timeout=timeout)
+        return True
+    except Exception:   # noqa: BLE001
+        return False
+
+
+class _AsyncInv:
+    """异步 trace 的 invocation 句柄：单 worker FIFO 下 finish 任务必在 record 之后执行，
+    届时 id 已就绪；record 失败则 finish 静默跳过（与同步路径 fail-open 同语义）。"""
+
+    __slots__ = ("id",)
+
+    def __init__(self) -> None:
+        self.id: Optional[str] = None
+
+
 def digest(obj: Any) -> str:
     return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
                           .encode("utf-8")).hexdigest()
@@ -231,38 +278,52 @@ class ToolExecutor:
         # 2. 熔断
         if self._breaker.is_open(spec.name):
             return ToolResult.fail(f"工具 {spec.name} 熔断打开，暂不可用")
+        # 异步 trace 切面（READ_ONLY 且非 key_required 且开关开）：三笔 trace 写挪出关键路径。
+        # 幂等状态机分支（key_required）在上方已把 inv_id 置为字符串 → 天然走同步路径。
+        async_trace = (spec.risk_level is RiskLevel.READ_ONLY
+                       and spec.idempotency != "key_required"
+                       and _async_read_trace_enabled())
         # 记 executing（args_json 脱敏后入库，022 契约；digest 按原文算供关联回放）；
         # 回收重试复用原行（inv_id 已置），不再 INSERT。
         if inv_id is None:
-            try:
-                inv_id = self._store.record_invocation(
-                    run_id, step_no, tool_name=spec.name, tool_version=spec.version,
-                    args_json=sanitize_args_json(args), args_digest=digest(args),
-                    idempotency_key=idempotency_key, status="executing",
-                    policy_decision=policy_decision, policy_id=policy_id,
-                    approval_request_id=approval_request_id)
-            except Exception as e:   # noqa: BLE001
-                # 同键并发的插入竞态（两执行同时查无残行→双 INSERT，后者撞 uk_tool_idem）：
-                # 转友好拒绝而非把整个 run 打死——另一执行已认领，本次不重复副作用。
-                if idempotency_key and ("Duplicate entry" in str(e) or "1062" in str(e)):
-                    return ToolResult.fail(
-                        f"工具 {spec.name} 同幂等键并发执行冲突（另一执行已认领），本次不重复执行")
-                raise
+            rec_kw = dict(tool_name=spec.name, tool_version=spec.version,
+                          args_json=sanitize_args_json(args), args_digest=digest(args),
+                          idempotency_key=idempotency_key, status="executing",
+                          policy_decision=policy_decision, policy_id=policy_id,
+                          approval_request_id=approval_request_id)
+            if async_trace:
+                inv_id = _AsyncInv()
+                _read_trace_pool().submit(self._record_async, inv_id, run_id, step_no, rec_kw)
+            else:
+                try:
+                    inv_id = self._store.record_invocation(run_id, step_no, **rec_kw)
+                except Exception as e:   # noqa: BLE001
+                    # 同键并发的插入竞态（两执行同时查无残行→双 INSERT，后者撞 uk_tool_idem）：
+                    # 转友好拒绝而非把整个 run 打死——另一执行已认领，本次不重复副作用。
+                    if idempotency_key and ("Duplicate entry" in str(e) or "1062" in str(e)):
+                        return ToolResult.fail(
+                            f"工具 {spec.name} 同幂等键并发执行冲突（另一执行已认领），本次不重复执行")
+                    raise
         # audit（write-ahead）：执行前记合规审计。HIGH_WRITE fail-closed=审计不可写则阻断执行
         # （绝不产生无审计的高风险副作用）；READ_ONLY/LOW_WRITE fail-open（写失败仅告警不阻断）。
+        # async_trace（恒 READ_ONLY ⇒ fail_closed=False）时审计入队伍随 FIFO 尾随 record。
         fail_closed = spec.risk_level == RiskLevel.HIGH_WRITE
-        try:
-            self._audit.record(
-                ctx, event_type="tool_call", action=spec.qualified_name, decision="authorized",
-                risk_level=spec.risk_level.value, policy_id=policy_id, args_digest=digest(args),
-                detail={"permission_scope": spec.permission_scope,
-                        "data_classification": spec.data_classification,
-                        "policy_decision": policy_decision},
-                run_id=run_id, step_no=step_no, fail_closed=fail_closed)
-        except AuditWriteError as e:
-            self._store.finish_invocation(inv_id, status="failed",
-                                          error_text=f"audit-blocked: {e}"[:500])
-            return ToolResult.fail("审计不可用，高风险操作已阻断")
+        audit_kw = dict(
+            event_type="tool_call", action=spec.qualified_name, decision="authorized",
+            risk_level=spec.risk_level.value, policy_id=policy_id, args_digest=digest(args),
+            detail={"permission_scope": spec.permission_scope,
+                    "data_classification": spec.data_classification,
+                    "policy_decision": policy_decision},
+            run_id=run_id, step_no=step_no, fail_closed=fail_closed)
+        if async_trace:
+            _read_trace_pool().submit(self._audit_quiet, ctx, audit_kw)
+        else:
+            try:
+                self._audit.record(ctx, **audit_kw)
+            except AuditWriteError as e:
+                self._store.finish_invocation(inv_id, status="failed",
+                                              error_text=f"audit-blocked: {e}"[:500])
+                return ToolResult.fail("审计不可用，高风险操作已阻断")
         # 3-4. 超时 + 重试。⚠️ try 只包工具执行本体：finish_invocation 落库异常绝不能被
         # 当成"工具失败"而重跑**已产生副作用**的工具（深度审查 C 组）。
         attempts = max(1, spec.max_retries + 1)
@@ -301,8 +362,8 @@ class ToolExecutor:
                 if schema_err:
                     has_side_effects = spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY
                     st = "uncertain" if has_side_effects else "failed"
-                    self._finish_quiet(inv_id, status=st,
-                                       error_text=f"output schema 违约: {schema_err}"[:500])
+                    self._finish(inv_id, status=st,
+                                 error_text=f"output schema 违约: {schema_err}"[:500])
                     if has_side_effects:
                         return ToolResult.fail(
                             f"工具 {spec.name} 输出不符合契约且副作用可能已发生（已标记待对账）")
@@ -321,26 +382,30 @@ class ToolExecutor:
                             content=[ContentBlock.of_text("[策略义务执行失败，输出已扣留]")],
                             receipt=result.receipt, error=f"obligation-error: {e}"[:200])
             st = "succeeded" if result.status == "succeeded" else "failed"
-            try:
-                self._store.finish_invocation(
-                    inv_id, status=st,
-                    result_digest=digest([b.model_dump() for b in result.content]) if result.content else None,
-                    receipt_json=json.dumps(result.receipt, ensure_ascii=False) if result.receipt else None,
-                    error_text=result.error)
-            except Exception:   # noqa: BLE001 — trace 落库失败：结果照常返回，绝不重跑工具
-                logger.warning("tool_invocation 收尾落库失败（结果照常返回）", exc_info=True)
+            self._finish(
+                inv_id, status=st,
+                result_digest=digest([b.model_dump() for b in result.content]) if result.content else None,
+                receipt_json=json.dumps(result.receipt, ensure_ascii=False) if result.receipt else None,
+                error_text=result.error)
             return result
         err = (str(last_exc)[:500] if last_exc else "unknown")
         # P0-E：有副作用的工具超时 → **uncertain**（副作用可能已发生，failed 是谎报——
         # 下游会盲目重试造成重复副作用）。uncertain 阻断同键自动重试，走人工对账。
         if timed_out and (spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY):
-            self._finish_quiet(inv_id, status="uncertain",
-                               error_text=f"超时 {spec.timeout_s}s（线程无法中止，副作用不可知）")
+            self._finish(inv_id, status="uncertain",
+                         error_text=f"超时 {spec.timeout_s}s（线程无法中止，副作用不可知）")
             return ToolResult.fail(
                 f"工具 {spec.name} 执行超时且结果不确定（副作用可能已发生）——"
                 "已标记待对账，请勿假定失败后重试")
-        self._finish_quiet(inv_id, status="failed", error_text=err)
+        self._finish(inv_id, status="failed", error_text=err)
         return ToolResult.fail(f"工具执行失败: {err}")
+
+    def _finish(self, inv, **kw) -> None:
+        """收尾统一分发：异步句柄（READ_ONLY trace 队列，FIFO 保证在 record 之后）或同步容错。"""
+        if isinstance(inv, _AsyncInv):
+            _read_trace_pool().submit(self._finish_async, inv, kw)
+        else:
+            self._finish_quiet(inv, **kw)
 
     def _finish_quiet(self, inv_id: str, **kw) -> None:
         """收尾落库的容错包装：trace 失败绝不影响结果返回/重跑工具。"""
@@ -348,6 +413,27 @@ class ToolExecutor:
             self._store.finish_invocation(inv_id, **kw)
         except Exception:   # noqa: BLE001
             logger.warning("tool_invocation 收尾落库失败（结果照常返回）", exc_info=True)
+
+    def _record_async(self, inv: "_AsyncInv", run_id: str, step_no: int, kw: dict) -> None:
+        """异步 record（trace 队列 worker 内）：失败仅告警（读工具 trace fail-open）。"""
+        try:
+            inv.id = self._store.record_invocation(run_id, step_no, **kw)
+        except Exception:   # noqa: BLE001
+            logger.warning("读工具 trace record 异步落库失败（fail-open）", exc_info=True)
+
+    def _finish_async(self, inv: "_AsyncInv", kw: dict) -> None:
+        """异步 finish：record 未成功落库（id 缺失）则跳过——与同步 fail-open 同语义。"""
+        if inv.id is None:
+            logger.warning("读工具 trace：record 未落库，收尾跳过（fail-open）")
+            return
+        self._finish_quiet(inv.id, **kw)
+
+    def _audit_quiet(self, ctx, kw: dict) -> None:
+        """异步审计（READ_ONLY 恒 fail-open）：任何异常只告警，绝不影响已返回的结果。"""
+        try:
+            self._audit.record(ctx, **kw)
+        except Exception:   # noqa: BLE001
+            logger.warning("读工具审计异步写失败（fail-open）", exc_info=True)
 
     @staticmethod
     def _validate_output(spec, result: ToolResult) -> Optional[str]:

@@ -116,6 +116,8 @@ def test_full_run_persists_rows_with_run_id(monkeypatch):
             assert tool_calls == 1
 
             # tool_invocation 落库（run_id 关联正确）
+            from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+            assert drain_read_trace()       # READ_ONLY trace 异步：断言前排水
             cur.execute("SELECT tool_name, status FROM tool_invocation WHERE run_id=%s", (run_id,))
             assert ("knowledge_search", "succeeded") in cur.fetchall()
 
@@ -166,6 +168,9 @@ def _cleanup_run(run_id):
 
 
 def _fetch(sql, params):
+    # READ_ONLY 工具 trace 异步化后，断言真库行前先排水（同步场景为无害 no-op）
+    from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+    drain_read_trace()
     conn = _local_operation_conn()
     try:
         with conn.cursor() as cur:
