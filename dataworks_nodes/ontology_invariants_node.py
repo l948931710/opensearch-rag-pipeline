@@ -14,7 +14,7 @@ Asia/Shanghai），资源组 data_process，低优先级。
 
 凭据（同 ontology_backfill_node 纪律，PR-D P0-09）：一律经 DataWorks 平台注入
 （调度参数/工作空间环境变量），源码禁明文密钥。只读作业，只需 RDS 连接件 +
-DASHSCOPE key（production 安全守卫）。
+无需 DASHSCOPE key（RAG_NO_MODEL_RESOLUTION=ack 惰性哨兵豁免，纯 RDS 作业）。
 """
 import os
 import subprocess
@@ -39,7 +39,11 @@ os.environ["RAG_ENVIRONMENT"] = "production"
 os.environ["RAG_SIMULATE_OPENSEARCH"] = "true"   # 纯 RDS 只读作业
 os.environ["RAG_SIMULATE_OSS"] = "true"
 
-_required = ["DASHSCOPE_API_KEY", "RAG_RDS_HOST", "RAG_RDS_PASSWORD"]
+# P1-15：纯 RDS 作业不再要求 DashScope key——RAG_NO_MODEL_RESOLUTION=ack 令 config 把
+# llm/ocr/vlm/embedding 全解析为惰性哨兵（无供应商端点，意外模型调用立刻失败），
+# 生产供应商守卫据此豁免 key 要求（禁 Gemini 检查照跑）。本节点只碰 RDS。
+os.environ.setdefault("RAG_NO_MODEL_RESOLUTION", "ack")
+_required = ["RAG_RDS_HOST", "RAG_RDS_PASSWORD"]
 _missing = [v for v in _required if not os.environ.get(v)]
 if _missing:
     raise RuntimeError("缺少生产环境变量（经 DataWorks 平台注入，禁止粘源码）: %s" % _missing)

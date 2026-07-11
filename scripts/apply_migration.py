@@ -15,6 +15,17 @@ apply_migration.py — schema 迁移 apply 工具（WS0-4；PR-D P0-09 加固）
     "结构已变、台账无记录"必须被调度/操作者看见，不再 warning 后 exit 0。
   - **幂等**：迁移文件用 CREATE TABLE IF NOT EXISTS；应用前后对 information_schema 对比。
 
+语句切分（P1-14 加固）：引号感知（'…' / "…" / `…`、反斜杠转义、'' 双写转义），
+引号内的分号/注释起始符不参与切分；--（后跟空白）/# 行注释与 /* … */ 块注释剔除
+（其中的分号不切分），/*! … */ 与 /*+ … */ 保留原文（可执行 hint）。
+
+限制（fail-closed，绝不静默错切）：
+  - **不支持 DELIMITER / 存储过程类迁移**——DELIMITER 是 mysql 客户端指令，服务端不认；
+    遇到即抛 MigrationSqlError 中止。仓库里用到它的只有 002/003/006/016/017/018 这批
+    已发布的历史迁移（幂等守卫存储过程），它们走 mysql CLI（本地/CI 见
+    scripts/ci_load_schema.sh 头注）。
+  - 未闭合引号 / 未闭合块注释同样抛 MigrationSqlError（文件损坏或解析歧义）。
+
 用法：
   RAG_ENV=staging python scripts/apply_migration.py schema/022_agent_runtime.sql --db operation --dry-run
   RAG_ENV=staging python scripts/apply_migration.py schema/027_ontology_core.sql --db ontology --commit
@@ -34,12 +45,100 @@ EXIT_LEDGER_FAILED = 3
 EXIT_CHECKSUM_MISMATCH = 4
 
 
+class MigrationSqlError(ValueError):
+    """SQL 切分 fail-closed（P1-14）：DELIMITER 指令 / 未闭合引号或块注释。
+
+    宁可响亮中止也绝不静默错切——错切的后半截会以残缺 SQL 落库（报 1064 尚属幸运，
+    更坏的是切点恰好落在合法边界上把语义悄悄改掉）。"""
+
+
 def _split_statements(sql_text):
-    """剔除整行 -- 注释后再按 ; 切分（PR 收口修正：注释行内的分号——如 011 头注的
-    「USE …; 再 …;」——曾把注释后半截切成"SQL"报 1064）；内联注释留给 MySQL 解析。"""
-    body = "\n".join(ln for ln in sql_text.splitlines()
-                     if not ln.strip().startswith("--"))
-    return [chunk.strip() for chunk in body.split(";") if chunk.strip()]
+    """引号/注释感知地按 ; 切分（P1-14 重写；此前只剥整行 -- 注释，引号内分号会错切）。
+
+    - 引号：单引号/双引号/反引号三种；反斜杠转义跨过（反引号内反斜杠是字面量，
+      MySQL 语义）；'' / "" / `` 双写转义跨过；引号内的 ; -- # /* 一律字面量。
+    - 注释：--（MySQL 规则：后必须跟空白/行尾）与 # 行注释、/* … */ 块注释剔除，
+      其中的分号与引号不参与切分；/*! … */ 与 /*+ … */ 保留原文（可执行 hint）。
+    - DELIMITER（语句起点处，大小写不敏感）→ 抛 MigrationSqlError（模块 docstring 限制）。
+    - 未闭合引号 / 块注释 → 抛 MigrationSqlError（fail-closed）。
+    """
+    stmts = []
+    buf = []           # 当前语句已扫过的字符
+    i, n = 0, len(sql_text)
+
+    def _flush():
+        chunk = "".join(buf).strip()
+        if chunk:
+            stmts.append(chunk)
+        del buf[:]
+
+    while i < n:
+        ch = sql_text[i]
+        nxt = sql_text[i + 1] if i + 1 < n else ""
+
+        # ── DELIMITER 指令（仅语句起点能出现；引号/注释内不会走到这里）──
+        if ch in "Dd" and sql_text[i:i + 9].upper() == "DELIMITER" \
+                and (i + 9 >= n or sql_text[i + 9] in " \t\r\n") \
+                and not "".join(buf).strip():
+            raise MigrationSqlError(
+                "迁移文件含 DELIMITER 指令（mysql 客户端指令，服务端不认）——本工具不支持"
+                "存储过程类迁移，拒绝静默错切。请改用 mysql CLI apply"
+                "（本地/CI 走 scripts/ci_load_schema.sh，见其头注）。")
+
+        # ── 引号：整段跨过，内部一切字符都是字面量 ──
+        if ch in ("'", '"', "`"):
+            quote, start = ch, i
+            buf.append(ch)
+            i += 1
+            closed = False
+            while i < n:
+                c = sql_text[i]
+                if c == "\\" and quote != "`":               # 反引号内反斜杠无转义义
+                    buf.append(sql_text[i:i + 2])
+                    i += 2
+                    continue
+                if c == quote:
+                    if i + 1 < n and sql_text[i + 1] == quote:   # '' "" `` 双写转义
+                        buf.append(quote * 2)
+                        i += 2
+                        continue
+                    buf.append(c)
+                    i += 1
+                    closed = True
+                    break
+                buf.append(c)
+                i += 1
+            if not closed:
+                raise MigrationSqlError(
+                    "未闭合的 %s 引号（起始 offset %d）——文件损坏或引号不配对，中止。"
+                    % (quote, start))
+            continue
+
+        # ── 行注释：--（后跟空白/行尾）或 #，剔除到行尾（换行留给主循环）──
+        if (ch == "-" and nxt == "-" and (i + 2 >= n or sql_text[i + 2] in " \t\r\n")) \
+                or ch == "#":
+            j = sql_text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+
+        # ── 块注释：/* … */ 剔除；/*! … */ 与 /*+ … */ 保留原文 ──
+        if ch == "/" and nxt == "*":
+            j = sql_text.find("*/", i + 2)
+            if j < 0:
+                raise MigrationSqlError("未闭合的块注释 /*（起始 offset %d），中止。" % i)
+            if i + 2 < n and sql_text[i + 2] in ("!", "+"):
+                buf.append(sql_text[i:j + 2])
+            i = j + 2
+            continue
+
+        if ch == ";":
+            _flush()
+        else:
+            buf.append(ch)
+        i += 1
+
+    _flush()
+    return stmts
 
 
 def _table_names(statements):

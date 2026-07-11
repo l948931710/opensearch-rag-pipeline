@@ -20,7 +20,7 @@ DataWorks PyODPS 3 节点 — log_retention：日志/审计表留存（F-36）
 退出码：0=ok；2=守卫拦下（rollup 死掉时 qa_rows 被拒——先修 rollup）；3=作业失败。
 
 凭据：本文件【不含明文密钥】。控制台粘贴时从【清理stage3】节点顶部原样复制
-RAG_* 赋值贴到「凭据」标记处（仅需 RDS 三件套 + DASHSCOPE key 过 config 守卫；
+RAG_* 赋值贴到「凭据」标记处（仅需 RDS 三件套，RAG_NO_MODEL_RESOLUTION=ack 豁免模型 key；
 不碰 OSS/HA3）。
 """
 import os
@@ -65,7 +65,6 @@ if not DRY_RUN:
 # os.environ["RAG_RETENTION_FINDING_MONTHS"]      = "24"
 
 # ── 凭据：粘贴【清理stage3】顶部的 RAG_* 赋值（取消注释并填真值）────────────────
-# os.environ["DASHSCOPE_API_KEY"] = "..."   # 本节点不调 LLM，但 production 安全守卫要求配 DashScope key（防 Gemini 误用）
 # os.environ["RAG_RDS_HOST"]      = "..."
 # os.environ["RAG_RDS_PORT"]      = "..."
 # os.environ["RAG_RDS_USER"]      = "..."
@@ -73,7 +72,11 @@ if not DRY_RUN:
 # os.environ["RAG_RDS_DATABASE"]  = "..."
 # ─────────────────────────────────────────────────────────────────────────────
 
-_required = ["DASHSCOPE_API_KEY", "RAG_RDS_HOST", "RAG_RDS_PASSWORD"]
+# P1-15：纯 RDS 作业不再要求 DashScope key——RAG_NO_MODEL_RESOLUTION=ack 令 config 把
+# llm/ocr/vlm/embedding 全解析为惰性哨兵（无供应商端点，意外模型调用立刻失败），
+# 生产供应商守卫据此豁免 key 要求（禁 Gemini 检查照跑）。本节点只碰 RDS。
+os.environ.setdefault("RAG_NO_MODEL_RESOLUTION", "ack")
+_required = ["RAG_RDS_HOST", "RAG_RDS_PASSWORD"]
 _missing = [v for v in _required if not os.environ.get(v)]
 if _missing:
     raise RuntimeError("缺少生产环境变量（从【清理stage3】顶部复制 RAG_* 赋值）: %s" % _missing)

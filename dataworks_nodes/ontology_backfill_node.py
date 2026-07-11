@@ -25,7 +25,7 @@ RAG_ONTOLOGY_BACKFILL_ENABLE 第二道闸、单条失败不拖垮批、断点续
 
 凭据（PR-D P0-09）：本文件【不含明文密钥，也**不得**粘贴明文密钥】——凭据一律经
 DataWorks 平台注入（调度参数/工作空间环境变量/KMS），节点源码只读 os.environ。
-仅需 RDS 三件套 + DASHSCOPE key（过 config 守卫；不碰 OSS/HA3——回填核心只走
+仅需 RDS 三件套（RAG_NO_MODEL_RESOLUTION=ack 豁免模型 key；不碰 OSS/HA3——回填核心只走
 rule 候选，不调 embedding）。缺失即 raise（下方 _required 守卫）。
 """
 import os
@@ -72,10 +72,14 @@ CSV_RESOURCE = "ontology_backfill_snapshot.csv"
 
 # ── 凭据（PR-D P0-09）：**禁止**在源码里赋值明文密钥——一律经 DataWorks 平台注入
 # （节点「调度参数」/ 工作空间环境变量），本节点只读 os.environ 并守卫缺失。
-# 需要：DASHSCOPE_API_KEY（production 安全守卫，防 Gemini 误用；本节点不调 LLM）、
+# 需要：
 # RAG_RDS_HOST / RAG_RDS_PORT / RAG_RDS_USER / RAG_RDS_PASSWORD / RAG_RDS_DATABASE /
 # RAG_RDS_OPERATION_DATABASE / RAG_RDS_ONTOLOGY_DATABASE。
-_required = ["DASHSCOPE_API_KEY", "RAG_RDS_HOST", "RAG_RDS_PASSWORD"]
+# P1-15：纯 RDS 作业不再要求 DashScope key——RAG_NO_MODEL_RESOLUTION=ack 令 config 把
+# llm/ocr/vlm/embedding 全解析为惰性哨兵（无供应商端点，意外模型调用立刻失败），
+# 生产供应商守卫据此豁免 key 要求（禁 Gemini 检查照跑）。本节点只碰 RDS。
+os.environ.setdefault("RAG_NO_MODEL_RESOLUTION", "ack")
+_required = ["RAG_RDS_HOST", "RAG_RDS_PASSWORD"]
 _missing = [v for v in _required if not os.environ.get(v)]
 if _missing:
     raise RuntimeError("缺少生产环境变量（经 DataWorks 平台注入，禁止粘源码）: %s" % _missing)
