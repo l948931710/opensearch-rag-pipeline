@@ -9,22 +9,25 @@ run 主体在**专用有界线程池**里执行（绝不复用 Starlette 请求�
 拓扑无关接缝：本类是"进程内线程池"实现；日后需硬隔离可换"队列+独立 worker 层(c)"，
 接口不变（评审 B1 未选 c，此为升级路径）。
 
-⚠️ stub：adjudicator（Policy→Executor 裁决执行一次工具）由 WS1 注入真实实现；跨实例事件
-中继（Redis Stream）、C1 per-thread 串行化、E3 排水在 WS1 loop 实现时补。
+⚠️ stub：adjudicator（Policy→Executor 裁决执行一次工具）由 WS1 注入真实实现；
+C1 per-thread 串行化待补。跨实例事件中继（event_relay.py，Redis Stream，flag 默认 off）
+与 E3 排水（drain()，ASGI shutdown 挂钩）已落——见 2026-07-11 重审计 §1 修复。
 """
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 from opensearch_pipeline.agent_runtime.context import ExecutionContext
 from opensearch_pipeline.agent_runtime.events import (
     AgentEvent,
+    RunCheckpointReady,
     RunCompleted,
     RunFailed,
     RunSuspended,
@@ -62,6 +65,7 @@ class RunHandle:
         self._done = threading.Event()
         self._on_complete = None            # Callable[[str], None]，由 submit/resume 注入
         self._on_failure = None             # Callable[[str], None]，失败侧回调（运维可观测，深度审查治理组）
+        self._relay = None                  # event_relay 发布器（flag off 恒 None；fail-open 镜像）
 
     def events(self) -> Iterator[AgentEvent]:
         """阻塞式消费事件流，直到 run 终止（SSE 端点在此迭代并转 SSE 帧）。"""
@@ -82,9 +86,13 @@ class RunHandle:
 
     def _emit(self, ev: AgentEvent) -> None:
         self._q.put(ev)
+        if self._relay is not None:
+            self._relay.publish(ev)         # 跨实例镜像（内部 fail-open，绝不影响主路径）
 
     def _finish(self) -> None:
         self._q.put(_SENTINEL)
+        if self._relay is not None:
+            self._relay.end()               # __end__ 哨兵帧：消费侧据此收流
         self._done.set()
 
 
@@ -107,9 +115,15 @@ class ThreadedRunExecutor:
         # WS3 审批持久化（schema/025）：挂起侧写 approval_request（fail-closed——请求行写不成则
         # 挂起视为失败，绝不产生审批队列里看不见、只能等过期的黑洞 run）。None = 未接（直驱测试）。
         self._approval_store = approval_store
+        # E3 排水（重审计 §1）：_live=在跑 run 的句柄表（drain 据此限时等/兜底标失败）；
+        # _draining 置位后拒绝一切新 submit/resume。
+        self._live: Dict[str, RunHandle] = {}
+        self._draining = False
 
     def _acquire(self) -> None:
         with self._lock:
+            if self._draining:
+                raise RunRejected("执行器排水中（实例即将关停），请稍后重试")
             if self._active >= self._max:
                 raise RunRejected(f"并发 run 已达上限 {self._max}")
             self._active += 1
@@ -121,6 +135,7 @@ class ThreadedRunExecutor:
     def submit(self, ctx: ExecutionContext, loop: AgentLoop,
                messages: List, tools: List, on_complete=None, on_failure=None) -> RunHandle:
         self._acquire()
+        run_id = None
         try:
             run_id = self._store.create_run(ctx, self._profile)
             handle = RunHandle(run_id)
@@ -130,10 +145,16 @@ class ThreadedRunExecutor:
             # 用 with_run_id 造副本会让 model_fn 闭包的 run_id 仍 None → llm_call_log 记账落空。
             # run_id 是"建 run 后回填"字段、非身份/ACL，就地 setattr 不违 frozen 初衷）。
             object.__setattr__(ctx, "run_id", run_id)
+            self._attach_relay(handle)
+            with self._lock:
+                self._live[run_id] = handle
             gen = loop.run(ctx, messages, tools)
             self._pool.submit(self._drive_gen, ctx, gen, handle)
             return handle
         except Exception:
+            if run_id:
+                with self._lock:
+                    self._live.pop(run_id, None)
             self._release()
             raise
 
@@ -199,11 +220,16 @@ class ThreadedRunExecutor:
             handle = RunHandle(run_id)
             handle._on_complete = on_complete
             handle._on_failure = on_failure
+            self._attach_relay(handle)
+            with self._lock:
+                self._live[run_id] = handle
             gen = loop.resume(ctx, state, outcome, tools)
             base = self._budget_snapshot(run_id, fallback_turns=int(state.get("turn", 0)) + 1)
             self._pool.submit(self._drive_gen, ctx, gen, handle, base)
             return handle
         except Exception:
+            with self._lock:
+                self._live.pop(run_id, None)
             if claimed:
                 self._safe_transition(run_id, "resuming", "suspended")   # 回边：保住可重试
             self._release()
@@ -290,6 +316,7 @@ class ThreadedRunExecutor:
         max_turns = ctx.budget.max_turns
         max_tool_calls = ctx.budget.max_tool_calls
         token_budget = ctx.budget.token_budget
+        hb_stop = self._start_heartbeat_ticker(run_id, ctx)   # R2：秒级后台心跳（见方法注）
         turns_counted = int((base or {}).get("turns_used", 0))       # turn_index 去重，同批多 call 只计一次
         tool_calls_used = int((base or {}).get("tool_calls_used", 0))
         tokens_used = int((base or {}).get("tokens_used", 0))
@@ -379,15 +406,33 @@ class ThreadedRunExecutor:
                     handle._emit(RunSuspended(approval_request_id=aid, checkpoint_id=cp_id,
                                               pending_call=ev.pending_call, turn_index=ev.turn_index))
                     break
+                if isinstance(ev, RunCheckpointReady):
+                    # R4 运行中 checkpoint（loop 侧 RAG_AGENT_MIDRUN_CHECKPOINT 门控才发）：
+                    # 持久化后即消费，绝不外发（state_messages 是内部载荷）。
+                    self._persist_midrun_checkpoint(run_id, ev)
+                    ev = next(gen)
+                    continue
                 if isinstance(ev, RunCompleted):
                     # 最终答案也是一个模型轮 → 记 model_call step + 计 turn + 记 tokens。
                     # on_complete 在 emit 之前跑（run 完成侧）：客户端看到 done 帧时记忆已落，
                     # 立刻发起的下一轮不会丢上一轮上下文。
                     self._record_model_step(run_id, turns_counted, usage=ev.usage, final=True)
                     self._budget_used(run_id, turns=1, tokens=ev.usage.total)
-                    self._safe_transition(run_id, "running", "succeeded")
-                    self._notify_complete(handle, ev, retrieved_chunks)
-                    handle._emit(ev)
+                    # fencing（重审计 §1 怀疑者 bug）：running→succeeded 的 CAS 成立才证明
+                    # 本线程仍持有该 run。CAS 失败 = 已被 reaper 收尸/用户取消/排水标失败——
+                    # 此前 _safe_transition 静默吞掉失败而 _notify_complete 照跑，答案落
+                    # qa_log/会话记忆而 durable 状态是 failed，两边永久分叉。现在失去所有权
+                    # 即作废结果：不落库、不发 done 帧，响亮 error 日志可观测。
+                    if self._transition_checked(run_id, "running", "succeeded"):
+                        self._notify_complete(handle, ev, retrieved_chunks)
+                        handle._emit(ev)
+                    else:
+                        logger.error(
+                            "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库",
+                            run_id)
+                        handle._emit(RunFailed(
+                            error="run 已被系统收尸或取消（完成结果作废，请重试）",
+                            retryable=True))
                     break
                 handle._emit(ev)
                 if isinstance(ev, RunFailed):
@@ -407,6 +452,10 @@ class ThreadedRunExecutor:
             handle._emit(RunFailed(error=str(e), retryable=False))
             self._notify_failure(handle, str(e))
         finally:
+            hb_stop.set()
+            if run_id:
+                with self._lock:
+                    self._live.pop(run_id, None)
             handle._finish()
             self._release()
 
@@ -542,6 +591,58 @@ class ThreadedRunExecutor:
         except Exception:   # noqa: BLE001
             pass
 
+    def _start_heartbeat_ticker(self, run_id: Optional[str], ctx) -> threading.Event:
+        """R2（重审计 §1）：per-run 后台心跳 ticker。此前心跳只在模型轮边界刷——长工具
+        调用/长最终生成超过 reaper stale 阈值（默认 900s）时，**活着的持有者被误判僵尸**
+        → running→failed，随后完成侧 CAS 失败、结果作废。ticker 让「进程活着」与
+        「模型轮节奏」解耦（默认 30s ≪ 900s）。deadline 之后停止续命：真僵死（挂死在
+        无超时调用里）的 run 不被永久续命，最终仍交还 reaper 收尸。
+        RAG_AGENT_HEARTBEAT_INTERVAL_S<=0 显式关闭（回到轮边界心跳的历史行为）。"""
+        stop = threading.Event()
+        if not run_id:
+            return stop
+        try:
+            interval = float(os.environ.get("RAG_AGENT_HEARTBEAT_INTERVAL_S", "30") or 30)
+        except ValueError:
+            interval = 30.0
+        if interval <= 0:
+            return stop
+
+        def _tick():
+            while not stop.wait(interval):
+                try:
+                    if ctx.budget.is_past_deadline(datetime.now(timezone.utc)):
+                        return
+                except Exception:   # noqa: BLE001 — deadline 读不出不阻断续命
+                    pass
+                self._heartbeat(run_id)
+
+        threading.Thread(target=_tick, name=f"agent-hb-{run_id[:8]}", daemon=True).start()
+        return stop
+
+    def _persist_midrun_checkpoint(self, run_id: Optional[str], ev: RunCheckpointReady) -> None:
+        """R4（重审计 §1「无运行中 checkpoint」）：模型轮边界持久化对话状态——此前
+        save_checkpoint 唯一调用点是审批挂起，非挂起 run 崩溃即全丢（只剩 agent_step
+        局部 trace）。fail-open：写失败绝不阻断 run。
+        ⚠️ 边界诚实：这是**状态保全**（事后取证/人工恢复的底座），不是自动回放——
+        failed 是终态，崩溃 run 的自动续跑需要 failed→resumable 状态机扩展（未做）。"""
+        try:
+            from opensearch_pipeline.agent_runtime.loop import encode_checkpoint
+            blob, digest = encode_checkpoint(ev.state_messages or [], pending_call=None,
+                                             turn=ev.turn_index)
+            self._store.save_checkpoint(run_id, blob, digest)
+        except Exception:   # noqa: BLE001
+            logger.warning("midrun checkpoint 持久化失败（忽略）", exc_info=True)
+
+    def _attach_relay(self, handle: RunHandle) -> None:
+        """R5：跨实例事件中继（Redis Stream，RAG_AGENT_EVENT_RELAY=redis 才生效）。
+        fail-open：中继装不上只降级为进程内单副本语义（历史行为）。"""
+        try:
+            from opensearch_pipeline.agent_runtime.event_relay import attach_relay
+            attach_relay(handle)
+        except Exception:   # noqa: BLE001
+            logger.warning("事件中继挂载失败（降级进程内）", exc_info=True)
+
     def _transition_checked(self, run_id: Optional[str], frm: str, to: str) -> bool:
         """关键迁移（如 running→suspended）：CAS False 或 DB 异常都返回 False，由调用方处置。"""
         try:
@@ -568,6 +669,30 @@ class ThreadedRunExecutor:
     def active_count(self) -> int:
         with self._lock:
             return self._active
+
+    def drain(self, timeout: float = 20.0) -> Dict[str, int]:
+        """E3 排水（重审计 §1「无 SIGTERM drain」）：拒新 run → 限时等在跑 run 收尾 →
+        超时仍在跑的 **诚实标 failed**（durable 不说谎：随后 SIGKILL 就到，这些 run 必然
+        中断；若线程竟在进程死前跑完，完成侧 fencing CAS 会失败 → 结果作废，与标记一致）。
+        幂等可重入；由 ASGI shutdown / atexit 调（routes/agent._drain_runtime）。"""
+        with self._lock:
+            self._draining = True
+            live = dict(self._live)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        waited = 0
+        for _run_id, h in live.items():
+            if h.wait(max(0.0, deadline - time.monotonic())):
+                waited += 1
+        with self._lock:
+            leftovers = list(self._live)
+        force_failed = 0
+        for run_id in leftovers:
+            if self._transition_checked(run_id, "running", "failed"):
+                force_failed += 1
+                logger.error("排水超时：run %s 仍在执行——已标 failed（实例关停，结果将作废）",
+                             run_id)
+        self._pool.shutdown(wait=False)
+        return {"waited": waited, "force_failed": force_failed}
 
     def shutdown(self, wait: bool = True) -> None:
         self._pool.shutdown(wait=wait)

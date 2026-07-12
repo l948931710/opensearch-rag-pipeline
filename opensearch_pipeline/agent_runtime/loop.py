@@ -188,6 +188,15 @@ def _result_text(result: Optional[ToolResult]) -> str:
     return result.error or ""
 
 
+def midrun_checkpoint_enabled() -> bool:
+    """R4（重审计 §1）：运行中 checkpoint 开关（默认 **off**——每轮一次 encode+INSERT 的
+    durable 写开销，生产 rollout 与容量评估一起开）。开 → loop 在每个模型轮边界发
+    RunCheckpointReady（driver 持久化），非挂起 run 崩溃后 durable 侧仍有最近轮边界状态。"""
+    import os
+    return os.environ.get("RAG_AGENT_MIDRUN_CHECKPOINT",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def tool_data_guard_enabled() -> bool:
     """P1-1「Agent 无不可信工具数据边界」：与 RAG 路径共用同一信任姿态开关
     RAG_PROMPT_INJECTION_GUARD（默认 off；生产/启用任何写工具前必须开）。
@@ -298,7 +307,13 @@ class DefaultAgentLoop:
         msgs: List[Msg] = list(messages)
         max_turns = ctx.budget.max_turns
         retries = self._empty_final_retries
+        midrun_cp = midrun_checkpoint_enabled()
         for _turn in range(start_turn, max_turns):
+            if midrun_cp and _turn > start_turn:
+                # R4：上一轮 tool 结果已全部回注 → 轮边界快照（driver 持久化后即消费，
+                # 不外发）。turn_index=_turn-1：resume 语义 start_turn=turn+1 恰好续到本轮。
+                from opensearch_pipeline.agent_runtime.events import RunCheckpointReady
+                yield RunCheckpointReady(turn_index=_turn - 1, state_messages=list(msgs))
             mt, streamed = yield from self._drive_model(msgs, tools)
             while not mt.tool_calls and not (mt.text or "").strip() and retries > 0:
                 # 终轮空文本兜底：既无 tool_calls 也无实文本（⇒ 客户端至多收到过空白增量，

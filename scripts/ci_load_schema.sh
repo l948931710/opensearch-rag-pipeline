@@ -108,6 +108,7 @@ MANIFEST="
 033_ontology_link_invariants.sql ontology
 034_sem_views_product_acl.sql ontology
 035_agent_checkpoint_digest_hmac.sql operation
+036_agent_run_message_id.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }

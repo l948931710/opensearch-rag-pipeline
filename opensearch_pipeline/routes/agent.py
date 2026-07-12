@@ -184,6 +184,41 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
     threading.Thread(target=_loop, name="agent-run-reaper", daemon=True).start()
 
 
+_DRAINED = False
+
+
+def _drain_runtime() -> None:
+    """E3 排水（幂等）：ASGI shutdown 与 atexit 双挂——先到者执行。运行时未建过则 no-op。"""
+    global _DRAINED
+    if _DRAINED:
+        return
+    _DRAINED = True
+    rt = _RUNTIME
+    if rt is None:
+        return
+    executor = rt[2]
+    try:
+        timeout = float(os.environ.get("RAG_AGENT_DRAIN_TIMEOUT_S", "20") or 20)
+    except ValueError:
+        timeout = 20.0
+    try:
+        if hasattr(executor, "drain"):
+            rep = executor.drain(timeout=timeout)
+            if rep.get("waited") or rep.get("force_failed"):
+                logger.warning("agent 执行器排水：等到 %s 个 run 收尾，超时强制标失败 %s 个",
+                               rep.get("waited"), rep.get("force_failed"))
+        else:
+            executor.shutdown(wait=False)
+    except Exception:   # noqa: BLE001 — 排水失败不阻断进程关停
+        logger.warning("agent 执行器排水失败（继续关停）", exc_info=True)
+
+
+@router.on_event("shutdown")
+def _agent_shutdown_drain() -> None:
+    """uvicorn 收 SIGTERM 后进入 lifespan shutdown 时触发（SAE 滚动发布的优雅窗口）。"""
+    _drain_runtime()
+
+
 def _get_runtime():
     """惰性建运行时单例：(registry, gateway, executor, run_store)。"""
     global _RUNTIME
@@ -236,10 +271,12 @@ def _get_runtime():
         approval_store = _get_approval_store()
         executor = ThreadedRunExecutor(run_store, adjudicator, max_concurrent=max_runs,
                                        approvals=approvals, approval_store=approval_store)
-        # SIGTERM/进程退出排水：非 daemon 线程池被直杀会留下 running 僵尸（reaper 兜底收尸，
-        # 但正常退出应先排水）；收尸线程给崩溃/SIGKILL 场景兜底。
+        # E3 排水（重审计 §1）：此前只有 atexit(shutdown, wait=False)——不等在跑 run、
+        # durable 留 running 僵尸等 reaper。现在 ASGI shutdown（uvicorn 收 SIGTERM 的
+        # 优雅关停窗口）+ atexit 双挂 _drain_runtime：拒新 → 限时等收尾 → 超时诚实标
+        # failed（与完成侧 fencing CAS 一致：迟到的完成结果作废）。
         import atexit
-        atexit.register(executor.shutdown, wait=False)
+        atexit.register(_drain_runtime)
         _start_reaper(run_store, approval_store, runtime=(registry, gateway, executor))
         _RUNTIME = (registry, gateway, executor, run_store)
     return _RUNTIME
@@ -519,6 +556,14 @@ def agent_ask(req: AskRequest, request: Request,
     except RunRejected:
         raise HTTPException(status_code=429, detail="Agent 并发已满，请稍后再试")
 
+    # U1/U2（重审计 §5，schema/036）：message_id 落 agent_run——审批续跑复用它落库
+    # （反馈投票不悬空），run 详情经它从 qa_session_log 取回最终答案。fail-open。
+    try:
+        if hasattr(_run_store, "set_message_id"):
+            _run_store.set_message_id(handle.run_id, message_id)
+    except Exception:   # noqa: BLE001
+        logger.warning("agent_run.message_id 回填失败（忽略：续跑将退化为新 id）", exc_info=True)
+
     return StreamingResponse(_stream_events(handle, session_id, message_id),
                              media_type="text/event-stream", headers=_SSE_HEADERS)
 
@@ -783,8 +828,13 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
                       req_groups: list):
     """resume 的完成/失败回调（/approve 与 B6 对账共用）：被批 run 的最终答案进会话记忆 +
     qa_session_log（HIGH_WRITE 高危场景绝不从 durable 回读链静默消失）；失败落 AGENT_ERROR。
-    本轮 user 问题从 checkpoint messages 兜底提取（fail-open）。归属恒为发起人。"""
-    message_id = generate_message_id()
+    本轮 user 问题从 checkpoint messages 兜底提取（fail-open）。归属恒为发起人。
+
+    U2（重审计 §5 怀疑者 bug）：续跑落库复用 **submit 时的原 message_id**（agent_run.
+    message_id，schema/036）——此前每次 resume 生成新 id，而前端反馈投票回填的是原
+    session 帧的旧 id → 续跑场景的 👍/👎 挂在 qa_session_log 里不存在的 message_id 上。
+    历史行（036 前）无值 → 回退新生成（答案读回仍经 run 详情兜住）。"""
+    message_id = run.get("message_id") or generate_message_id()
     cp_question = "[审批后续跑]"
     try:
         cp = run_store.load_latest_checkpoint(run.get("run_id"))
@@ -1008,7 +1058,91 @@ def agent_run_detail(run_id: str, request: Request,
                          "decided_at")}
     except Exception:   # noqa: BLE001 — 审批读失败不阻断详情（fail-open，None 即无审批信息）
         logger.warning("run 详情读取审批请求失败（忽略）", exc_info=True)
-    return {"run": run, "steps": steps, "invocations": invocations, "approval": approval}
+    # U1（重审计 §5「审批后 requester 拿不到答案」）：succeeded run 经 agent_run.message_id
+    # 从 qa_session_log 取回最终答案——断线/审批续跑的发起人此前只能恢复状态不能恢复
+    # 答案文本（本端点已 owner/kb_admin 门禁，答案本就以发起人 ACL 生成）。fail-open：
+    # 历史行无 message_id / qa 行已过留存期 → final=None，前端引导去会话历史。
+    final = None
+    if run.get("status") == "succeeded" and run.get("message_id"):
+        try:
+            from opensearch_pipeline.qa_logger import fetch_answer_by_message_id
+            final = fetch_answer_by_message_id(run["message_id"])
+        except Exception:   # noqa: BLE001
+            logger.warning("run 详情读取最终答案失败（忽略）", exc_info=True)
+    return {"run": run, "steps": steps, "invocations": invocations, "approval": approval,
+            "final": final}
+
+
+@router.get("/api/agent/runs/{run_id}/events")
+def agent_run_events(run_id: str, request: Request,
+                     identity: Optional[Identity] = Depends(current_identity)):
+    """R5 跨实例 SSE 重连（重审计 §1「无 durable event stream」）：从 Redis Stream 回放
+    该 run 的事件到终态——断线重连/多副本下 SSE 消费者不必与执行副本同进程。
+    门禁与 run 详情一致（本人或 kb_admin，他人 404）；RAG_AGENT_EVENT_RELAY 未开 → 404。
+    v1 局限：sources/content_blocks 帧不在中继里（artifacts 进程内旁路），答案依据走
+    run 详情 invocations + qa_session_log.retrieved_docs。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if identity is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    from opensearch_pipeline.agent_runtime.event_relay import (
+        has_stream, relay_enabled, stream_run_events)
+    if not relay_enabled():
+        raise HTTPException(status_code=404, detail="事件中继未启用")
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _registry, _gateway, _executor, run_store = _get_runtime()
+    run = run_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    if run.get("user_id") != identity.user_id:
+        from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+        from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+        if resolve_kb_identity(identity.user_id).role != ROLE_KB_ADMIN:
+            raise HTTPException(status_code=404, detail="run 不存在")   # 不可见==不存在
+    terminal = run.get("status") in ("succeeded", "failed", "cancelled", "expired")
+    if terminal and not has_stream(run_id):
+        # 终态且流已过 TTL：不空等 XREAD，直接给终结提示
+        def _expired():
+            yield _sse({"type": "error",
+                        "message": "该 run 的事件流已过期，请在运行中心/会话历史查看结果"})
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_expired(), media_type="text/event-stream",
+                                 headers=_SSE_HEADERS)
+
+    def _gen():
+        try:
+            for d in stream_run_events(run_id):
+                t = d.get("type")
+                if t == "model_delta":
+                    yield _sse({"type": "chunk", "content": d.get("text") or ""})
+                elif t == "tool_call_proposed":
+                    yield _sse({"type": "tool_call", "call_id": d.get("call_id"),
+                                "tool_name": d.get("tool_name"),
+                                "arguments": d.get("arguments")})
+                elif t == "tool_result":
+                    yield _sse({"type": "tool_result", "call_id": d.get("call_id"),
+                                "tool_name": d.get("tool_name"), "status": d.get("status"),
+                                "elapsed_ms": d.get("elapsed_ms", 0)})
+                elif t == "run_suspended":
+                    yield _sse({"type": "approval",
+                                "approval_request_id": d.get("approval_request_id"),
+                                "checkpoint_id": d.get("checkpoint_id"),
+                                "pending_call": d.get("pending_call")})
+                elif t == "run_completed":
+                    if d.get("final_text") and not d.get("streamed"):
+                        yield _sse({"type": "chunk", "content": d["final_text"]})
+                    yield _sse({"type": "done", "usage": d.get("usage") or {}})
+                elif t == "run_failed":
+                    yield _sse({"type": "error",
+                                "message": f"Agent 运行失败: {(d.get('error') or '')[:200]}"})
+        except GeneratorExit:
+            raise
+        except Exception:   # noqa: BLE001
+            logger.error("agent 事件回放 SSE 中断", exc_info=True)
+            yield _sse({"type": "error", "message": "事件回放异常"})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 # ── P0-E 人工对账（uncertain invocation 处置）────────────────────────────────────
