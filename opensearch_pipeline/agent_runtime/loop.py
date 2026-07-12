@@ -126,11 +126,14 @@ class DefaultAgentLoop:
       ModelDelta 事件下发（SSE 打字机），StopIteration.value 返回 ModelTurn。
     """
 
-    def __init__(self, model_fn: ModelFn, empty_final_retries: int = 1):
+    def __init__(self, model_fn: ModelFn, empty_final_retries: int = 5):
         self._model = model_fn
-        # 瞬时空生成兜底额度（每 run）：终轮空文本时原地重问的最大次数。
-        # 2026-07-11 staging 实测 post-tool 轮偶发 completion≈2 tokens、status ok
-        # （DashScope 瞬时；小/大上下文四象限 probe 均不复现）——重试一次即恢复。
+        # 空生成兜底额度（每 run）：终轮空文本时原地重问的最大次数。这是**应用层**重试——
+        # 退化响应是 HTTP 200 / status=ok（finish=stop、completion≈2、零正文零思考），
+        # gateway 的传输层重试（429/5xx）永远不会触发。2026-07-11 L7 high 臂法证：思考臂
+        # 可复现 ~20-30%/run（docs/audits/l7_high_arm_toolcalling_2026-07-11.md），额度 1
+        # 救单发救不了连发 → 提到 5（残余失败率 p^6 量级）。额度只在真退化时消耗：正常 run
+        # 零成本；退化响应本身 ~2-4s/2 tokens，最坏 5 连发多花十来秒，好过把空答案砸给用户。
         self._empty_final_retries = max(0, int(empty_final_retries))
 
     def _drive_model(self, msgs: List[Msg], tools: List[ToolSpec]
@@ -192,10 +195,12 @@ class DefaultAgentLoop:
         retries = self._empty_final_retries
         for _turn in range(start_turn, max_turns):
             mt, streamed = yield from self._drive_model(msgs, tools)
-            if not mt.tool_calls and not (mt.text or "").strip() and retries > 0:
+            while not mt.tool_calls and not (mt.text or "").strip() and retries > 0:
                 # 终轮空文本兜底：既无 tool_calls 也无实文本（⇒ 客户端至多收到过空白增量，
-                # 重问不构成答案重播），原地重试一次——工具已执行过、消息序不动，零副作用重放；
-                # 同一逻辑轮不进 turn 计数，浪费的 usage 合并进重试轮（llm_call_log 两次都有账）。
+                # 重问不构成答案重播），原地重试——工具已执行过、消息序不动，零副作用重放；
+                # while 而非 if：退化响应会背靠背连发（2026-07-11 high 臂法证），连发各耗
+                # 一次额度直至耗尽。同一逻辑轮不进 turn 计数，浪费的 usage 逐次滚入下一攻
+                # （llm_call_log 每次调用都有独立账）。
                 retries -= 1
                 wasted = mt.usage
                 logger.warning("模型终轮空文本（usage=%s/%s），原地重试（剩余额度 %s）",

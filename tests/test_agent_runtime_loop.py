@@ -224,9 +224,24 @@ def test_empty_final_retry_exhausted_completes_empty():
         calls.append(1)
         return ModelTurn(text="  ", usage=Usage())
 
-    events = list(DefaultAgentLoop(_fn).run(_ctx(), [{"role": "user", "content": "q"}], []))
+    events = list(DefaultAgentLoop(_fn, empty_final_retries=1)
+                  .run(_ctx(), [{"role": "user", "content": "q"}], []))
     assert len(calls) == 2                       # 1 原始 + 1 重试
     assert isinstance(events[-1], RunCompleted) and not events[-1].final_text.strip()
+
+
+def test_empty_final_retry_default_allowance_is_five():
+    """默认额度=5（2026-07-11 high 臂法证：退化 ~20-30%/run、额度 1 挡不住连发）——
+    恒空时恰好 1 原始 + 5 重试后有界完成，绝不无限重试。"""
+    calls = []
+
+    def _fn(msgs, tools):
+        calls.append(1)
+        return ModelTurn(text="", usage=Usage())
+
+    events = list(DefaultAgentLoop(_fn).run(_ctx(), [{"role": "user", "content": "q"}], []))
+    assert len(calls) == 6
+    assert isinstance(events[-1], RunCompleted) and events[-1].final_text == ""
 
 
 def test_empty_final_retry_can_turn_into_tool_call():
