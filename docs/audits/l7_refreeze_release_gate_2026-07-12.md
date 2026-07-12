@@ -100,6 +100,22 @@ vs 基线 0.9273**——40% 正例的 gold 文档 top-10 完全缺席（能命�
 在、可检索索引无**，与 docs/ha3-doc-evaporation-incident-2026-07-06.md 的引擎段合并
 吃索引同签名，这次吃掉的正是 7-06 治愈重推批本身 + 7-07 批。
 
+**机制收口（2026-07-12 深挖，回应"我之前有大量重灌"的再确认）**：
+- 盲人群 = **Sam 7-06 大量重灌批本身**：485 docs 全部 version-bump（maxv 2-4），
+  新代 10,348 chunk 创建于 07-06 16 时（+18 条 07-07 11 时）；RDS 全 SUCCESS。
+- **管道账面基本走完**：HA3 doc store 里新行字段完好（点查返回 chunk_text/perm=public，
+  embedding 真值列 v4/1024 与现役一致，无维度漂移）；旧代 HA3 行已清（ha3_stale=0）；
+  枚举对账仅缺 85（另一小尾巴）。**重灌姿势不背锅。**
+- **失明在引擎侧，字段级三连证**：①dense 自查询盲（4/4+15/15）②**BM25 文号探针**——
+  查 "FL-QC-015-002" 返回 11 个含同号兄弟文档，唯独不含 doc store 里明文含着它的盲行
+  （倒排索引缺行）③同一行 filter 点查字段全返回（store 读路径完好）。
+  = store 有、可检索索引无——7-06 蒸发同族（当时点查也不到；本次变体点查/枚举可达，
+  故点查对账全程假绿）。疑似诱因：~40 分钟窗口灌 1 万 chunk 的实时段构建/合并，
+  内部状态只能阿里查（工单必提）。
+- **附带账面缺口（独立问题）**：document_version **双 active 485/485**——重灌链的
+  版本级 supersede 整体没跑（chunk 级停用已跑，不产生双服务，但台账脏）。修法同
+  2026-06-21 stale-HOLD reconcile（status-only，预览→commit）。
+
 **结论修正链**：
 - 7-06「点查是唯一可靠存在性判定」需修正——**点查只证 doc store 存在；可检索性必须
   抽样自查询**。周期 reconcile 需加自查询抽样通道，否则这种模式永远漏检。
@@ -108,11 +124,14 @@ vs 基线 0.9273**——40% 正例的 gold 文档 top-10 完全缺席（能命�
 
 ### release-gate 当前出口（blocked，三件 Sam-gated）
 
-1. **治愈 485 盲文档**（生产写）：`scripts/rebuild_from_rds.py --docs <485 列表>`
-   --commit（当日 PROD-RW token）→ laptop stage-3 重推（RAG_HA3_PUSH_BATCH_SIZE=8）
-   → **重推后自查询抽样复检**（点查对账不再是终验）。doc 清单已备
-   （scratchpad/blind485_docids.txt）。⚠️ 引擎根因未除（阿里工单仍未提，7-06 遗留）
-   ——重推可能再被吃，工单+周期自查询监控是根治面。
+1. **治愈 485 盲文档**（生产写，四步）：①验证性单行重推（cmd=add 同 PK 整行替换）
+   → 自查询复检——先证明重推能恢复索引再上全量；②全量 `rebuild_from_rds.py --docs
+   <485 列表> --commit`（当日 PROD-RW token）→ stage-3 重推（小 batch）→ **自查询
+   抽样终验**（点查/枚举不再作终验）；③版本台账收尾：485 docs 旧 active 版本 →
+   superseded（status-only，预览→commit）；④阿里工单（7-06 遗留必提）：附
+   store-可达/索引-不可达 行号样本 + 时间窗 + 表名。防复发：周期 reconcile 加
+   自查询抽样通道 + 重灌 runbook 加"推后自查询终验"。doc 清单已备
+   （scratchpad/blind485_docids.txt，重跑 SQL 在上文）。
 2. **claude CLI /login**（judge 面板恢复）。
 3. 治愈+judge 后：重跑 run → 裁决 → freeze → gate；既有绝对阈值缺口
    （xlsx 三连/over-refusal/keyword-coverage/marker validity/docx strong-chunks=0）
