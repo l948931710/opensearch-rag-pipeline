@@ -61,6 +61,31 @@ def _row_visible(row: Dict[str, Any], acl: set, bypass_acl: bool) -> bool:
     return can_read_object(row, acl=acl, bypass_acl=bypass_acl)
 
 
+_PRODUCT_FIELDS = ("product_id", "product_ref", "product_name",
+                   "product_owner_dept", "product_classification")
+
+
+def _mask_product_fields(row: Dict[str, Any], acl: set, bypass_acl: bool) -> Dict[str, Any]:
+    """P0-03：product 三字段按 product **自身** owner_dept/data_classification 独立裁决。
+
+    行过滤键（owner_dept/data_classification）绑的是 spec——公开 SKU + 公开 spec +
+    confidential product 时 product_id/ref/name 会整行透出给未授权方。此处用视图新投的
+    product_owner_dept/product_classification（schema/034）走同一 can_read_object：
+    不可读 → product_* 全部置 None（拒绝=当作不存在，ID/ref 本身即泄露）。
+    旧视图行（034 前无这两列 → None/None）天然 fail-closed：非 bypass 一律遮蔽，
+    升级窗口宁可少给。无关联 product（LEFT JOIN 空）不动。"""
+    if not any(row.get(k) is not None for k in ("product_id", "product_ref", "product_name")):
+        return row
+    prod = {"owner_dept": row.get("product_owner_dept"),
+            "data_classification": row.get("product_classification")}
+    if can_read_object(prod, acl=acl, bypass_acl=bypass_acl):
+        return row
+    out = dict(row)
+    for k in _PRODUCT_FIELDS:
+        out[k] = None
+    return out
+
+
 def _visible_title(title: Optional[str], data_classification: Optional[str],
                    owner_dept: Optional[str], acl: set, bypass_acl: bool) -> Optional[str]:
     return visible_title(title, data_classification, owner_dept,
@@ -175,6 +200,8 @@ def lookup_specs(store, target: str, *, acl_groups: Optional[Collection[str]],
         if best is not None:   # P1-10：选中行透出 source/version/as_of（浅拷贝不改源行）
             best = dict(best)
             best.update(_spec_provenance_fields(store, best))
+            # P0-03：product 字段按 product 自身 ACL 独立遮蔽（spec 行可见 ≠ product 可见）
+            best = _mask_product_fields(best, acl, bypass_acl)
         ans.specs[domain] = best
         label = "箱规" if domain == "packing" else "香规/堆叠"
         if best is None:

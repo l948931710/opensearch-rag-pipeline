@@ -68,6 +68,10 @@ class ApprovalGrant:
     request_id: Optional[str] = None
     decided_by: Optional[str] = None
     approver_scope: Optional[str] = None
+    # P0-B（重评审计）：凭据绑定**已落库的 approval_decision 行**——executor.resume 在建
+    # 凭据前校验决定行存在且同向、final_args_digest 与将执行参数一致（见
+    # _verify_persisted_decision）。未接 approval_store 的直驱路径为 None。
+    decision_id: Optional[str] = None
 
 
 def parse_outcome(data: Dict[str, Any]) -> ApprovalOutcome:

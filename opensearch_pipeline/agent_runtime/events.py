@@ -82,6 +82,17 @@ class ToolResultEmitted(AgentEvent):
     artifacts: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
 
+class RunCheckpointReady(AgentEvent):
+    """Loop→driver **内部**事件（R4 运行中 checkpoint，RAG_AGENT_MIDRUN_CHECKPOINT 门控）：
+    模型轮边界携带当前对话状态，driver 持久化后即消费——绝不外发（state_messages 是
+    内部载荷；刻意不进 AnyAgentEvent 判别联合：它不该出现在任何序列化往返里）。
+    turn_index = 该状态覆盖到的**最后一个已完成轮**（resume 语义 start_turn=turn+1 对齐）。"""
+
+    type: Literal["run_checkpoint_ready"] = "run_checkpoint_ready"
+    turn_index: int = 0
+    state_messages: Optional[List[Dict[str, Any]]] = None
+
+
 class RunSuspended(AgentEvent):
     """命中 REQUIRE_APPROVAL → Runtime 写 checkpoint 并挂起 run，等审批。
 

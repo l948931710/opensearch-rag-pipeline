@@ -69,11 +69,19 @@ export interface AgentRunApproval {
   created_at?: string | null
   decided_at?: string | null
 }
+export interface AgentRunFinal {
+  message_id: string
+  answer_text: string
+  answered_at?: string | null
+}
 export interface AgentRunDetail {
   run: AgentRunRow
   steps: AgentRunStep[]
   invocations: AgentInvocation[]
   approval: AgentRunApproval | null
+  /** U1（schema/036）：succeeded run 经 agent_run.message_id 从 qa_session_log 取回的最终答案；
+   *  历史行/留存期外/后端旧版 → null/undefined（前端引导去会话历史）。 */
+  final?: AgentRunFinal | null
 }
 
 // ── 展示辞典（组件共用，避免各处漂移）────────────────────────────────────────

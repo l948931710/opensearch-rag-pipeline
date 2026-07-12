@@ -623,11 +623,13 @@ def test_approve_self_blocked_403(approval_wired):
 
 
 def test_approve_self_terminate_allowed(approval_wired):
-    """发起人可撤回自己的申请（rejected_terminate）→ run cancelled + 决定持久化。"""
+    """发起人可撤回自己的申请（rejected_terminate）→ run cancelled + 决定持久化。
+    P0-A：/approve 返回 202 JSON 回执（不再是 SSE 流）。"""
     store, astore, _, _ = approval_wired
     try:
         r = _post_approve(_identity(), kind="rejected_terminate")
-        assert r.status_code == 200
+        assert r.status_code == 202
+        assert r.json()["status"] == "cancelled"
         assert store.run["status"] == "cancelled"
         assert astore.decisions and astore.decisions[0]["decision"] == "rejected_terminate"
     finally:
@@ -660,14 +662,20 @@ def test_approve_dept_admin_scope_mismatch_403(approval_wired):
 
 
 def test_approve_dept_admin_scope_match_executes(approval_wired):
-    """dept_admin 且 scope 覆盖 → 放行；决定持久化（decided_by=审批人），run 续跑。"""
+    """dept_admin 且 scope 覆盖 → 放行；决定持久化（decided_by=审批人），run 续跑。
+    P0-A：响应是 202 JSON 受理回执——**不含任何答案内容/SSE 帧**（审批人的审批权
+    ≠ 发起人部门知识的读权，答案只落发起人侧）。"""
     store, astore, _, mp = approval_wired
     import opensearch_pipeline.dingtalk_identity as di
     mp.setattr(di, "resolve_kb_identity",
                lambda uid: _kb_ident("dept_admin", granted=("production",)))
     try:
         r = _post_approve(Identity(user_id="u2", acl_groups=["production"], role="employee"))
-        assert r.status_code == 200
+        assert r.status_code == 202
+        assert "text/event-stream" not in (r.headers.get("content-type") or "")
+        body = r.json()
+        assert body["run_id"] == "r1" and body["status"] == "resuming"
+        assert set(body) <= {"run_id", "outcome", "status", "message"}   # 回执字段收口，无答案通道
         assert astore.decisions and astore.decisions[0]["decided_by"] == "u2"
         assert ("r1", "suspended", "resuming") in store.transitions
     finally:
@@ -849,7 +857,7 @@ def test_approve_replay_edited_matching_args_resumes(approval_wired):
         r = _client(Identity(user_id="u2", acl_groups=["production"], role="employee")).post(
             "/api/agent/approve",
             json={"run_id": "r1", "outcome": {"kind": "edited", "edited_args": {"qty": 7}}})
-        assert r.status_code == 200
+        assert r.status_code == 202
         assert ("r1", "suspended", "resuming") in store.transitions
     finally:
         api.app.dependency_overrides.clear()
@@ -906,6 +914,55 @@ def test_scope_covers_backup_steward_csv():
     assert agent_route._scope_covers("pmc,rd", {"hr"}) is False
     assert agent_route._scope_covers("pmc", {"pmc"}) is True
     assert agent_route._scope_covers("", {"pmc"}) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0-B 审批完整性 fail-closed（重评审计）：读失败 503 / 请求行缺失 409（仅发起人可撤回）
+# ─────────────────────────────────────────────────────────────────────────────
+class _BrokenApprovalStore(_FakeApprovalStore):
+    def get_latest_by_run(self, run_id):
+        raise RuntimeError("db down")
+
+
+def test_approve_store_read_failure_503(approval_wired):
+    """approval_request 读抛异常 → 503 fail-closed（此前吞异常按缺行继续，kb_admin 可盲批）。"""
+    store, _astore, _, mp = approval_wired
+    mp.setattr(agent_route, "_get_approval_store", lambda: _BrokenApprovalStore())
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+    try:
+        r = _post_approve(Identity(user_id="u2", acl_groups=["production"], role="employee"))
+        assert r.status_code == 503
+        assert store.run["status"] == "suspended"          # 未被认领，可重试
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_missing_request_row_409_even_kb_admin(approval_wired):
+    """请求行整体缺失 → 409（scope/参数/过期无从核对）——即便 kb_admin 也不能绕过决策链。"""
+    store, _astore, _, mp = approval_wired
+    mp.setattr(agent_route, "_get_approval_store", lambda: _FakeApprovalStore(None))
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+    try:
+        r = _post_approve(Identity(user_id="u2", acl_groups=["production"], role="employee"))
+        assert r.status_code == 409
+        assert "无审批请求记录" in r.text
+        assert store.run["status"] == "suspended"
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_approve_missing_request_row_requester_withdraw_allowed(approval_wired):
+    """请求行缺失的唯一例外：发起人撤回自己的申请（不产生执行授权，run → cancelled）。"""
+    store, _astore, _, mp = approval_wired
+    mp.setattr(agent_route, "_get_approval_store", lambda: _FakeApprovalStore(None))
+    try:
+        r = _post_approve(_identity(), kind="rejected_terminate")   # u1 = 发起人
+        assert r.status_code == 202
+        assert store.run["status"] == "cancelled"
+    finally:
+        api.app.dependency_overrides.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

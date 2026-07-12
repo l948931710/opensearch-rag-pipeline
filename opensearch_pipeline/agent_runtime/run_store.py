@@ -365,13 +365,14 @@ class RDSRunStore:
             conn.close()
 
     def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        # message_id 列 = schema/036（U1/U2 答案读回 + 续跑反馈锚定）——先 apply 后部署纪律
         db = _op_db()
         conn = self._conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT run_id, status, user_id, channel, agent_profile, started_at, ended_at, "
-                    f"thread_id, conversation_id, model_profile "
+                    f"thread_id, conversation_id, model_profile, message_id "
                     f"FROM {db}.agent_run WHERE run_id=%s",
                     (run_id,),
                 )
@@ -380,7 +381,26 @@ class RDSRunStore:
                 return None
             return {"run_id": row[0], "status": row[1], "user_id": row[2], "channel": row[3],
                     "agent_profile": row[4], "started_at": row[5], "ended_at": row[6],
-                    "thread_id": row[7], "conversation_id": row[8], "model_profile": row[9]}
+                    "thread_id": row[7], "conversation_id": row[8], "model_profile": row[9],
+                    "message_id": row[10]}
+        finally:
+            conn.close()
+
+    def set_message_id(self, run_id: str, message_id: str) -> None:
+        """U1/U2（schema/036）：submit 后回填该 run 的 qa message_id——审批续跑复用它落
+        qa_session_log（前端反馈投票锚定不悬空），run 详情经它取回最终答案。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.agent_run SET message_id=%s WHERE run_id=%s",
+                    ((message_id or "")[:64] or None, run_id),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

@@ -24,6 +24,7 @@ dry-run（CLI 默认）：零写库，用批内账本（planned 对象/别名/ca
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -66,6 +67,17 @@ class CsvSnapshotSource:
 
     def __init__(self, path: str):
         self._path = path
+        self._fingerprint: Optional[str] = None
+
+    def fingerprint(self) -> str:
+        """快照文件 sha256（缓存）——manifest 输入绑定（重审计 §2）的事实指纹。"""
+        if self._fingerprint is None:
+            h = hashlib.sha256()
+            with open(self._path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            self._fingerprint = h.hexdigest()
+        return self._fingerprint
 
     def iter_records(self) -> Iterator[SeedRecord]:
         with open(self._path, encoding="utf-8-sig", newline="") as f:
@@ -334,8 +346,20 @@ class _Sink:
         return first
 
 
+def source_fingerprint(source: Any) -> Optional[str]:
+    """duck-type 取快照源指纹（sha256 hex）。源不支持/读失败 → None（auto 恒关，
+    fail-closed——绑定证明缺失就绝不放行 auto，候选/case 路径不受影响）。"""
+    try:
+        fp = getattr(source, "fingerprint", None)
+        out = fp() if callable(fp) else None
+        return str(out).strip().lower() if out else None
+    except Exception:   # noqa: BLE001
+        logger.warning("快照源指纹计算失败（auto 保持关闭）", exc_info=True)
+        return None
+
+
 def _decide(r: SeedRecord, sink: _Sink, tau: TauTable, report: SeedReport, *,
-            mint_new: bool = True) -> None:
+            mint_new: bool = True, source_fp: Optional[str] = None) -> None:
     norm = normalize(r.namespace, r.raw_code)
     if sink.is_active(r.namespace, norm):
         report.skipped_active += 1
@@ -363,7 +387,7 @@ def _decide(r: SeedRecord, sink: _Sink, tau: TauTable, report: SeedReport, *,
 
     if candidates:
         winner = may_auto_activate(candidates, intent="read", namespace=r.namespace,
-                                   tau_table=tau)
+                                   tau_table=tau, source_fingerprint=source_fp)
         if winner is not None:
             if sink.alias(r.namespace, r.raw_code, norm, winner.target_object_id,
                           method=winner.method, confidence=winner.confidence):
@@ -412,6 +436,7 @@ def seed_snapshot(store, source: Any, *, dry_run: bool = True,
     不写库）；快照/CSV 源是本地顺序读，可接受。"""
     tau = tau_table or TauTable.from_env(strict=True)   # P0-07：写 worker 非法 τ 即断
     report = SeedReport(dry_run=dry_run)
+    src_fp = source_fingerprint(source)   # manifest 输入绑定（重审计 §2）：一次实算全批复用
     sink = _Sink(store, dry_run, report, evidence_source=evidence_source)
     records: Iterable[SeedRecord] = source.iter_records()
     ns_counts: Dict[str, int] = {}                # PR-F/P1-12：分母=全量源计数（不吃 limit）
@@ -425,7 +450,7 @@ def seed_snapshot(store, source: Any, *, dry_run: bool = True,
             continue                              # 只计数不处理：分母仍走完全量源
         report.records += 1
         try:
-            _decide(r, sink, tau, report, mint_new=mint_new)
+            _decide(r, sink, tau, report, mint_new=mint_new, source_fp=src_fp)
         except Exception as e:   # noqa: BLE001 — 单条脏数据不掀翻整批
             report.errors += 1
             report.add(action="error", namespace=r.namespace, raw=r.raw_code, error=str(e))

@@ -52,7 +52,17 @@ os.environ["RAG_ENVIRONMENT"] = "production"
 os.environ["RAG_SIMULATE_OPENSEARCH"] = "true"
 os.environ["RAG_SIMULATE_OSS"] = "true"
 
-# 阶段开关：阶段1 = True（dry-run 只报数）；阶段2 = False + 打开 RAG_RETENTION_ENABLE
+# ⚠️ 归档默认关（2026-07-11 重审计 §2「retention node OSS 死锁」）：本节点 OSS 恒 mock
+# （上一行）——而 retention.py 的 qa_rows/audit/agent_audit 三作业在 --commit 下**默认
+# 删前归档**（_archive_batch 需真 OSS，mock 即 hard-raise → main() 返回 3 → 节点 exit 3，
+# 阶段2 首批到期行就翻车）。docs/blindspot_audit_fix_status.md P3 部署注记早已写明
+# 「无 OSS 环境显式设 RAG_RETENTION_ARCHIVE=false」，此前节点文件没同步——现在对齐：
+# 纯 RDS 形态 = 直删语义（旧 F-36 行为）。要恢复删前归档：本行改 "true" +
+# RAG_SIMULATE_OSS 改 "false" + 凭据区补 OSS 三件套（RAG_OSS_ENDPOINT/AK/SK + bucket）。
+os.environ.setdefault("RAG_RETENTION_ARCHIVE", "false")
+
+# 阶段开关：阶段1 = True（dry-run 只报数）；
+# 阶段2 = False + 打开 RAG_RETENTION_ENABLE（归档语义见上——保持 ARCHIVE=false 即直删）
 DRY_RUN = True
 if not DRY_RUN:
     os.environ["RAG_RETENTION_ENABLE"] = "true"   # retention.py 的第二道闸

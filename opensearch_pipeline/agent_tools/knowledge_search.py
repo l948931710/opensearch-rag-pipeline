@@ -88,6 +88,21 @@ class KnowledgeSearchTool:
             artifacts = {"chunks": chunks}
         if speculative_hit:
             receipt["speculative"] = True   # 落 tool_invocation.receipt_json，命中率可量化
+        # PR12 实体锚定（RAG_ONTOLOGY_ANCHOR_ENABLE 默认 off；不动 retriever.py）：
+        # 问句里的编号 exact-only 消解命中且可读 → 本体档案块前置到检索片段之前。
+        # off 臂逐字节不变（L7 冻结基线不受默认态影响）；on 臂 fail-open——锚定任何
+        # 失败只等于没锚，绝不影响检索结果本身。
+        from opensearch_pipeline.ontology.packing_lookup import anchor_enabled
+        if anchor_enabled():
+            try:
+                from opensearch_pipeline.ontology.packing_lookup import anchor_for_query
+                block, anchor_receipt = anchor_for_query(
+                    query, acl_groups=(ctx.acl_groups or ()))
+                if block:
+                    content = [ContentBlock.of_text(block)] + list(content)
+                    receipt["anchor"] = anchor_receipt
+            except Exception:   # noqa: BLE001
+                logger.warning("实体锚定挂载失败（忽略）", exc_info=True)
         result = ToolResult.ok(content=content, receipt=receipt)
         result.artifacts = artifacts
         return result

@@ -22,9 +22,37 @@ from opensearch_pipeline.ontology.store import MemoryOntologyStore
 FIXTURE = Path(__file__).parent / "fixtures" / "ontology_seed_sample.csv"
 
 
+# 重审计 §2：manifest 绑定输入——测试源统一指纹，与 autouse 签发的 manifest 同值
+_TEST_FP = "ab" * 32
+
+
+def _resign_ack_manifest(monkeypatch, tmp_path, *, source_sha256):
+    """按指定快照指纹重签 ack manifest（真实 CSV 源的用例用）。"""
+    import hashlib
+    import hmac as _hmac
+    import json as _json
+    from datetime import date
+
+    from opensearch_pipeline.config import get_config
+    body = _json.dumps({"op": "unit-test", "date": date.today().isoformat(),
+                        "docset": "unit-test fixtures", "gt_summary": "n/a（单测机制验证）",
+                        "signer": "pytest", "source_sha256": source_sha256,
+                        "environment": get_config().environment},
+                       ensure_ascii=False).encode("utf-8")
+    manifest = tmp_path / "ack_manifest_resigned.json"
+    manifest.write_bytes(body)
+    key = "unit-test-ack-key"
+    sig = _hmac.new(key.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    monkeypatch.setenv("RAG_ONTOLOGY_ACK_HMAC_KEY", key)
+    monkeypatch.setenv("RAG_ONTOLOGY_AUTO_ACK", f"{manifest}:{sig}")
+
+
 class _ListSource:
     def __init__(self, records):
         self._records = records
+
+    def fingerprint(self):
+        return _TEST_FP
 
     def iter_records(self):
         return iter(self._records)
@@ -45,9 +73,12 @@ def _auto_ack_for_auto_machinery_tests(monkeypatch, tmp_path):
     import hmac as _hmac
     import json as _json
     from datetime import date
+    from opensearch_pipeline.config import get_config
     body = _json.dumps({"op": "unit-test", "date": date.today().isoformat(),
                         "docset": "unit-test fixtures", "gt_summary": "n/a（单测机制验证）",
-                        "signer": "pytest"}, ensure_ascii=False).encode("utf-8")
+                        "signer": "pytest", "source_sha256": _TEST_FP,
+                        "environment": get_config().environment},
+                       ensure_ascii=False).encode("utf-8")
     manifest = tmp_path / "ack_manifest.json"
     manifest.write_bytes(body)
     key = "unit-test-ack-key"
@@ -232,8 +263,12 @@ def test_csv_source_skips_blank_raw(tmp_path):
     assert len(list(CsvSnapshotSource(str(p)).iter_records())) == 1
 
 
-def test_fixture_end_to_end_totals(store):
-    rep = seed_snapshot(store, CsvSnapshotSource(str(FIXTURE)), dry_run=False)
+def test_fixture_end_to_end_totals(store, monkeypatch, tmp_path):
+    # 真实 CSV 源：manifest 须绑定该文件的真实 sha256（重审计 §2 输入绑定）——
+    # autouse fixture 签的是 _TEST_FP 常量，此处按 fixture 文件重签
+    src = CsvSnapshotSource(str(FIXTURE))
+    _resign_ack_manifest(monkeypatch, tmp_path, source_sha256=src.fingerprint())
+    rep = seed_snapshot(store, src, dry_run=False)
     assert (rep.minted, rep.auto_aliased, rep.cases_opened, rep.errors) == (3, 1, 2, 0)
 
 

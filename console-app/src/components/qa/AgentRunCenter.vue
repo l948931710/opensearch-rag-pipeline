@@ -165,6 +165,16 @@ function stepSummary(s: AgentRunStep): string {
           <p v-else-if="run?.status === 'suspended'" class="mt-1.5 text-[12px] text-muted-foreground">挂起等待审批：审批通过后自动继续执行；也可撤回终止本次运行。</p>
         </div>
 
+        <!-- 最终答案（U1 答案读回：审批续跑/断线后发起人在此拿到答案文本） -->
+        <div v-if="detail?.final?.answer_text" class="rounded-xl border border-border bg-card p-3.5" data-testid="run-final-answer">
+          <div class="text-[12.5px] font-semibold text-foreground">最终答案</div>
+          <p class="mt-1.5 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed text-foreground">{{ detail.final.answer_text }}</p>
+          <div v-if="detail.final.answered_at" class="mt-1.5 text-[11.5px] text-faint">生成于 {{ ts(detail.final.answered_at) }}</div>
+        </div>
+        <p v-else-if="run?.status === 'succeeded'" class="rounded-xl border border-border bg-panel/50 p-3.5 text-[12px] text-muted-foreground" data-testid="run-final-missing">
+          本次运行已成功；答案文本请在对应会话历史中查看。
+        </p>
+
         <!-- 审批指向 -->
         <div v-if="detail?.approval" class="rounded-xl border border-border bg-card p-3.5">
           <div class="flex items-center gap-2 text-[12.5px] font-semibold text-foreground"><ShieldAlert :size="14" :stroke-width="1.75" class="text-st-warn" />审批</div>

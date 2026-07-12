@@ -23,9 +23,16 @@ from opensearch_pipeline.ontology.store import MemoryOntologyStore
 FIXTURE = Path(__file__).parent / "fixtures" / "ontology_seed_sample.csv"
 
 
+# 重审计 §2：manifest 绑定输入——测试源统一指纹，与 autouse 签发的 manifest 同值
+_TEST_FP = "ab" * 32
+
+
 class _ListSource:
     def __init__(self, records):
         self._records = records
+
+    def fingerprint(self):
+        return _TEST_FP
 
     def iter_records(self):
         return iter(self._records)
@@ -46,9 +53,12 @@ def _auto_ack_for_auto_machinery_tests(monkeypatch, tmp_path):
     import hmac as _hmac
     import json as _json
     from datetime import date
+    from opensearch_pipeline.config import get_config
     body = _json.dumps({"op": "unit-test", "date": date.today().isoformat(),
                         "docset": "unit-test fixtures", "gt_summary": "n/a（单测机制验证）",
-                        "signer": "pytest"}, ensure_ascii=False).encode("utf-8")
+                        "signer": "pytest", "source_sha256": _TEST_FP,
+                        "environment": get_config().environment},
+                       ensure_ascii=False).encode("utf-8")
     manifest = tmp_path / "ack_manifest.json"
     manifest.write_bytes(body)
     key = "unit-test-ack-key"
@@ -295,12 +305,34 @@ def test_backfill_commit_prod_fingerprint_rejected(tmp_path, monkeypatch):
 
 
 def test_backfill_commit_prod_ack_same_day_passes_gate(tmp_path, monkeypatch):
+    """token 三段式（重审计 §2）：<op>:<date>:<docset_hash>，第三段=快照 sha256 前缀。"""
+    import hashlib
     from datetime import date
 
     from opensearch_pipeline.ontology import backfill as bf
     csv = tmp_path / "snap.csv"
     csv.write_text("namespace,raw_code,object_type,title,owner_dept\n"
                    "u8,X2,product,测试品2,pmc\n", encoding="utf-8")
+    docset = hashlib.sha256(csv.read_bytes()).hexdigest()[:12]
+    monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_ENABLE", "true")
+    monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_PROD_ACK",
+                       f"backfill-r1:{date.today().isoformat()}:{docset}")
+    monkeypatch.setattr("opensearch_pipeline.config.is_prod_target",
+                        lambda kind, v: kind == "rds")
+    store = MemoryOntologyStore()
+    rc = bf.main([str(csv), "--commit"], store=store, source=None)
+    assert rc == 0                                              # 闸过（mention 语义只入 case）
+    assert store.get_open_case("u8", "X2") is not None
+
+
+def test_backfill_commit_prod_ack_two_segment_legacy_rejected(tmp_path, monkeypatch):
+    """重审计 §2：旧两段式 <op>:<date>（无 docset 绑定）不再是合法 token → exit 2 零写。"""
+    from datetime import date
+
+    from opensearch_pipeline.ontology import backfill as bf
+    csv = tmp_path / "snap.csv"
+    csv.write_text("namespace,raw_code,object_type,title,owner_dept\n"
+                   "u8,X3,product,测试品3,pmc\n", encoding="utf-8")
     monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_ENABLE", "true")
     monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_PROD_ACK",
                        f"backfill-r1:{date.today().isoformat()}")
@@ -308,5 +340,25 @@ def test_backfill_commit_prod_ack_same_day_passes_gate(tmp_path, monkeypatch):
                         lambda kind, v: kind == "rds")
     store = MemoryOntologyStore()
     rc = bf.main([str(csv), "--commit"], store=store, source=None)
-    assert rc == 0                                              # 闸过（mention 语义只入 case）
-    assert store.get_open_case("u8", "X2") is not None
+    assert rc == 2
+    assert store.get_active_identifier("u8", "X3") is None
+    assert store.get_open_case("u8", "X3") is None
+
+
+def test_backfill_commit_prod_ack_wrong_docset_rejected(tmp_path, monkeypatch):
+    """重审计 §2：同日 token 绑的是另一份快照 → exit 2 零写（token 不得跨数据集复用）。"""
+    from datetime import date
+
+    from opensearch_pipeline.ontology import backfill as bf
+    csv = tmp_path / "snap.csv"
+    csv.write_text("namespace,raw_code,object_type,title,owner_dept\n"
+                   "u8,X4,product,测试品4,pmc\n", encoding="utf-8")
+    monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_ENABLE", "true")
+    monkeypatch.setenv("RAG_ONTOLOGY_BACKFILL_PROD_ACK",
+                       f"backfill-r1:{date.today().isoformat()}:deadbeef1234")
+    monkeypatch.setattr("opensearch_pipeline.config.is_prod_target",
+                        lambda kind, v: kind == "rds")
+    store = MemoryOntologyStore()
+    rc = bf.main([str(csv), "--commit"], store=store, source=None)
+    assert rc == 2
+    assert store.get_active_identifier("u8", "X4") is None

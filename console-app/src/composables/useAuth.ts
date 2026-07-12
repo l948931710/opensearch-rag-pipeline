@@ -21,6 +21,33 @@ export function qs(name: string): string {
 }
 
 /**
+ * 从 URL fragment 取参（#token=…）。U3（2026-07-11 重审计 §5）：后端 /console→/console/
+ * 307 现在把 token 从 query 挪进 fragment（浏览器不把 fragment 发给服务器 → 跟进请求的
+ * uvicorn/SLB 访问日志零 token）；链接生产者也可直接发 #token= 形态（服务端日志全程零暴露）。
+ */
+export function hashParam(name: string): string {
+  const h = window.location.hash.replace(/^#/, '')
+  const m = new RegExp('(?:^|[&#])' + name + '=([^&]+)').exec(h)
+  return m ? decodeURIComponent(m[1]) : ''
+}
+
+/** 从 fragment 抹除敏感参数（与 scrubUrl 同一防线：不进历史/截图/Referer）。 */
+export function scrubHash(params: string[]) {
+  const raw = window.location.hash.replace(/^#/, '')
+  if (!raw) return
+  const kept = raw.split('&').filter((seg) => {
+    const k = seg.split('=')[0]
+    return k !== '' && !params.includes(k)
+  })
+  const nextHash = kept.length ? '#' + kept.join('&') : ''
+  if (nextHash !== window.location.hash) {
+    const url = new URL(window.location.href)
+    const next = url.pathname + (url.searchParams.toString() ? '?' + url.searchParams.toString() : '') + nextHash
+    window.history.replaceState(window.history.state, '', next)
+  }
+}
+
+/**
  * 从地址栏抹除敏感 query 参数（修正#4）：token / name 读取后立即 replaceState 清掉，
  * 防 token 进入浏览器历史、日志、截图、Referer、监控。保留路径/hash/其它参数。
  */
@@ -89,12 +116,16 @@ let _pendingVersion: PendingVersion | null = null
 export function captureUrlCredential(): void {
   if (_captured) return
   _captured = true
-  const urlToken = qs('token')
+  // U3：?token 与 #token 双形态——后端 /console 307 已把 token 挪进 fragment（服务器
+  // 日志零 token），query 形态保留兼容既有深链/e2e。query 优先（同现两处时以显式 query 为准）。
+  const hashToken = hashParam('token')
+  const urlToken = qs('token') || hashToken
   const docId = qs('doc_id')
   if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name'); persistToken(urlToken) }
   else { _stashedToken = restorePersistedToken() }   // 刷新路径：URL 已被抹除 → 从 tab 级续存恢复
   if (docId) _pendingVersion = { docId, owner: qs('owner'), title: qs('title') }   // 小程序升版深链
   if (urlToken || docId) scrubUrl(['token', 'name', 'doc_id', 'owner', 'title'])   // 先抹除，再发任何请求
+  if (hashToken) scrubHash(['token'])                                              // fragment 同防线
   // #F-console-urltoken 保守加固：?token= 摄取【不可删】——钉钉容器外的桌面浏览器（index.html 无条件载入
   //   dingtalk SDK，但 requestAuthCode 仅真容器内 dd.ready 触发、桌面必超时失败）此路是【唯一】可登录路径
   //   （见 kb-upload.onWvError「请在电脑端浏览器打开」）。删摄取即破坏桌面登录。仅告警以便排查残留生产者。

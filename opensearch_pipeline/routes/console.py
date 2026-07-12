@@ -69,12 +69,24 @@ def _serve_console_spa(rel: str, accept_encoding: str = "") -> Response:
 
 
 def _redirect_to_console(path: str, request: Request) -> RedirectResponse:
-    """重定向到 /console/<path>，原样保留 query（小程序 ?token=&doc_id= 深链不可丢）。"""
+    """重定向到 /console/<path>，保留 query 深链（小程序 ?doc_id= 等不可丢）——但
+    **token 挪进 URL fragment**（U3，重审计 §5：此前 307 把 ?token= 原样写进 Location，
+    带 token 的请求被 uvicorn/SLB 访问日志记两遍；fragment 浏览器不回传服务器，
+    跟进请求的日志零 token）。前端 useAuth.captureUrlCredential 同时解析 ?token 与
+    #token（本次配套），旧 ?token 深链行为不变。"""
     target = f"/console/{path}" if path else "/console/"
     q = request.url.query
+    frag = ""
     if q:
-        target += f"?{q}"
-    return RedirectResponse(url=target, status_code=307)
+        from urllib.parse import parse_qsl, quote, urlencode
+        pairs = parse_qsl(q, keep_blank_values=True)
+        token_vals = [v for k, v in pairs if k == "token"]
+        rest = urlencode([(k, v) for k, v in pairs if k != "token"])
+        if rest:
+            target += f"?{rest}"
+        if token_vals:
+            frag = "#token=" + quote(token_vals[0], safe="")
+    return RedirectResponse(url=target + frag, status_code=307)
 
 
 @router.get("/console", include_in_schema=False)

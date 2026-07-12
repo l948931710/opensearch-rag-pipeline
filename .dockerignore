@@ -6,7 +6,6 @@ __pycache__
 *.egg-info
 tests/
 scratch/
-schema/
 rag-ready/
 index-jobs/
 processing/
@@ -22,3 +21,9 @@ README.md
 recover.py
 recovered_pipeline_nodes.py
 scratch.py
+# P0-6 多阶段构建：node_modules 不进上下文（容器内 npm ci 全新装）；本地构建产物
+# next-dist 也排除——镜像里的前端只允许来自 console-build 阶段（防脏产物混入）。
+# schema/ 不再排除：/api/ready 的 schema_migrations checksum 探针要用本地权威 DDL。
+console-app/node_modules/
+console-app/dist/
+opensearch_pipeline/webconsole/next-dist/

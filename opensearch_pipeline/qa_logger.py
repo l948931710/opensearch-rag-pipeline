@@ -28,6 +28,37 @@ def generate_message_id() -> str:
     return str(uuid.uuid4())
 
 
+def fetch_answer_by_message_id(message_id: str) -> Optional[Dict[str, Any]]:
+    """按 message_id 取回最终答案（U1 答案读回，重审计 §5：审批续跑/断线后发起人经
+    run 详情拿到答案文本——agent_run.message_id(schema/036) → 本函数）。
+
+    只取 SUCCESS 行（AGENT_ERROR 行同 id 复用，读回只要答案）；同 id 多行取最新
+    （message_id 无 UNIQUE 约束）。读失败/simulate 无库 → None（fail-open，调用方
+    引导用户走会话历史）。"""
+    if not message_id:
+        return None
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT answer_text, created_at FROM {_op_db()}.qa_session_log "
+                    "WHERE message_id=%s AND answer_status='SUCCESS' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (message_id,))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        return {"message_id": message_id, "answer_text": row[0],
+                "answered_at": str(row[1]) if row[1] is not None else None}
+    except Exception:   # noqa: BLE001 — 读回是辅助路径，绝不外泄异常
+        logger.warning("按 message_id 读回答案失败（忽略）", exc_info=True)
+        return None
+
+
 def _qa_log_pii_redact_on() -> bool:
     """RAG_QA_LOG_PII_REDACT 开关（懒读 config；异常退回 True=安全方向）。"""
     try:

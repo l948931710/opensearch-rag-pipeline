@@ -403,7 +403,7 @@ class _GateConn:
 
 def test_card_callback_authorized_predicate(monkeypatch):
     """Track-2 归属校验：不存在的 message_id 拒；跨用户拒；归属一致放行；群聊(无归属)仅存在性放行；
-    空 id 拒；查库异常 fail-open 放行。"""
+    空 id 拒；查库异常 fail-closed 拒（P1-3 重评审计——原 fail-open 让校验层在 DB 抖动窗口失效）。"""
     from opensearch_pipeline.dingtalk_bot import _card_callback_authorized
 
     def _wire(row, boom=False):
@@ -415,7 +415,7 @@ def test_card_callback_authorized_predicate(monkeypatch):
     _wire((None,));         assert _card_callback_authorized("m1", "u9") is True    # 群聊/无归属 → 存在性门控
     _wire(("",));           assert _card_callback_authorized("m1", "u9") is True    # 同上（空归属）
     _wire(("u1",));         assert _card_callback_authorized("", "u1") is False     # 空 message_id
-    _wire(None, boom=True); assert _card_callback_authorized("m1", "u1") is True    # 查库异常 → fail-open
+    _wire(None, boom=True); assert _card_callback_authorized("m1", "u1") is False   # 查库异常 → fail-closed
 
 
 def test_card_callback_forged_message_id_no_write(monkeypatch):

@@ -809,9 +809,9 @@ def load_config() -> PipelineConfig:
             password=_env("RDS_PASSWORD"),
             database=_env("RDS_DATABASE", "fuling_knowledge"),
             operation_database=_env("RDS_OPERATION_DATABASE", "fuling_operation"),
+            ontology_database=_env("RDS_ONTOLOGY_DATABASE", "fuling_ontology"),
             ssl_ca=_env("RDS_SSL_CA", ""),
             ssl_verify_cert=_env_bool("RDS_SSL_VERIFY_CERT", True),
-            ontology_database=_env("RDS_ONTOLOGY_DATABASE", "fuling_ontology"),
         ),
 
         opensearch=OpenSearchConfig(

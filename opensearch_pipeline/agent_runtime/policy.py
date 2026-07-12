@@ -121,11 +121,24 @@ class PolicyEngine:
 
 def default_policy_engine() -> PolicyEngine:
     """首批基线：只读工具授予任意已认证用户（数据面 ACL 另行过滤）；写型无默认授予→default-deny，
-    且 HIGH_WRITE 即便被授予也走 REQUIRE_APPROVAL。写型授予由部门/角色策略显式追加。"""
-    return PolicyEngine([
+    且 HIGH_WRITE 即便被授予也走 REQUIRE_APPROVAL。写型授予由部门/角色策略显式追加。
+
+    PR13：ontology 工具族的授予与 registry 接线同一把杆（RAG_ONTOLOGY_TOOLS_ENABLE，
+    默认 off）——flag 关时即便工具被意外注册，policy 仍 default-deny（双保险）。
+    ontology.identity.resolve 是 HIGH_WRITE + approval_policy=always：授予只意味着
+    「可提案」，结构性必挂起走 steward 审批（门 A），绝无免批执行路径。"""
+    rules = [
         PolicyRule(effect="allow", scopes=("kb.search", "sql.readonly.*"),
                    policy_id="baseline.readonly"),
-    ])
+    ]
+    from opensearch_pipeline.agent_tools import ontology_tools_enabled
+    if ontology_tools_enabled():
+        rules.append(PolicyRule(
+            effect="allow",
+            scopes=("ontology.resolve", "ontology.packing.calc",
+                    "ontology.identity.resolve"),
+            policy_id="ontology.pmc1"))
+    return PolicyEngine(rules)
 
 
 # ── 策略执行点（adjudicator）：executor 的 Adjudicator 回调 ──────────
