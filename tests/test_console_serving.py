@@ -55,14 +55,16 @@ def test_real_api_still_works():
 # ── /console 切换：默认入口 = SPA，无尾斜杠 + 小程序深链 query 保留 ──
 
 def test_console_no_slash_redirects_preserving_query():
-    """小程序 /console?token=&doc_id=... → 307 到 /console/?...（query 不可丢）。"""
+    """小程序 /console?token=&doc_id=... → 307：非敏感 query 原样保留；**token 挪进
+    fragment**（U3，2026-07-11 重审计 §5——Location 带 ?token 会被跟进请求再写一遍
+    访问日志；fragment 浏览器不回传服务器）。前端 useAuth 双形态摄取。"""
     r = client.get("/console", follow_redirects=False)
     assert r.status_code == 307
     assert r.headers["location"] == "/console/"
 
     r2 = client.get("/console?token=ABC&doc_id=DOC_9&owner=hr", follow_redirects=False)
     assert r2.status_code == 307
-    assert r2.headers["location"] == "/console/?token=ABC&doc_id=DOC_9&owner=hr"
+    assert r2.headers["location"] == "/console/?doc_id=DOC_9&owner=hr#token=ABC"
 
 
 @_needs_build
@@ -109,7 +111,7 @@ def test_console_next_redirects_to_console():
 
     r2 = client.get("/console-next/manage?token=T", follow_redirects=False)
     assert r2.status_code == 307
-    assert r2.headers["location"] == "/console/manage?token=T"
+    assert r2.headers["location"] == "/console/manage#token=T"   # U3：token 只进 fragment
 
 
 # ── 路径穿越守卫 ─────────────────────────────────────────────────

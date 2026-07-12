@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { useAuth, scrubUrl, qs, captureUrlCredential, hasPendingVersion, consumePendingVersion, __resetInitGuard } from '@/composables/useAuth'
+import { useAuth, scrubUrl, scrubHash, qs, hashParam, captureUrlCredential, hasPendingVersion, consumePendingVersion, __resetInitGuard } from '@/composables/useAuth'
 import { useSession } from '@/stores/session'
 
 function jsonRes(body: unknown, status = 200): Response {
@@ -27,6 +27,38 @@ describe('scrubUrl（修正#4：token 读后从 URL 抹除）', () => {
     expect(window.location.search).not.toContain('name')
     expect(window.location.search).toContain('doc_id=DOC_1')
     expect(window.location.pathname).toBe('/console-next/')
+  })
+})
+
+describe('hashParam / scrubHash（U3：#token fragment 形态——307 后服务器日志零 token）', () => {
+  it('读取 #token 并解码；scrubHash 只删指定键、保留其余段', () => {
+    window.history.replaceState(null, '', '/console-next/?doc_id=D1#token=SEC%40RET&keep=1')
+    expect(hashParam('token')).toBe('SEC@RET')
+    expect(hashParam('absent')).toBe('')
+    scrubHash(['token'])
+    expect(window.location.hash).not.toContain('token')
+    expect(window.location.hash).toContain('keep=1')
+    expect(window.location.search).toContain('doc_id=D1')
+  })
+})
+
+describe('captureUrlCredential — #token fragment 摄取（U3）', () => {
+  it('#token 暂存 + 从 fragment 抹除；init 用它走 whoami', async () => {
+    window.history.replaceState(null, '', '/console-next/#token=FRAG1')
+    captureUrlCredential()
+    expect(window.location.hash).not.toContain('FRAG1')
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ user_id: 'u', role: 'employee' }))
+    vi.stubGlobal('fetch', fetchMock)
+    await useAuth().init()
+    expect(useSession().token).toBe('FRAG1')
+  })
+
+  it('query 与 fragment 同现时以显式 ?token 为准', () => {
+    window.history.replaceState(null, '', '/console-next/?token=QUERY1#token=FRAG2')
+    captureUrlCredential()
+    expect(window.location.search).not.toContain('QUERY1')
+    expect(window.location.hash).not.toContain('FRAG2')
+    expect(sessionStorage.getItem('rag.console.token')).toBe('QUERY1')
   })
 })
 
