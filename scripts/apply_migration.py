@@ -176,7 +176,9 @@ def classify_target(host: str, dbname: str):
 def _connect_rw(cfg, prod_ack, is_prod):
     if is_prod:
         from opensearch_pipeline.prod_access import get_prod_rw_conn
-        return get_prod_rw_conn(prod_ack)          # ack + 四账号纪律在 prod_access 内
+        # dict_cursor=False：本脚本全程按 tuple 下标取行（_existing_tables/_ledger_*），
+        # prod_access 默认 DictCursor 会 KeyError 0（首次真跑 prod 路径踩中，2026-07-11）
+        return get_prod_rw_conn(prod_ack, dict_cursor=False)   # ack + 四账号纪律在 prod_access 内
     import pymysql
     return pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
                            password=cfg.rds.password, charset="utf8mb4", connect_timeout=10)
@@ -236,6 +238,11 @@ def main():
     ap.add_argument("--commit", action="store_true", help="实际执行（默认 dry-run 只预览）")
     ap.add_argument("--dry-run", action="store_true", help="只预览（默认行为；显式传更清晰，与 --commit 互斥）")
     ap.add_argument("--prod-ack", default=None, help="生产 apply 确认令牌（对齐 prod_access.get_prod_rw_conn）")
+    ap.add_argument("--bootstrap-database", action="store_true",
+                    help="目标逻辑库不存在时先 CREATE DATABASE IF NOT EXISTS（显式 "
+                         "utf8mb4/utf8mb4_unicode_ci，schema/README 铁律 4）。仅用于全新库"
+                         "首铺（如 fuling_ontology 上 prod）——常规 apply 勿带，库名打错时"
+                         "该失败就失败，不要静默建出错库。")
     ap.add_argument("--applied-by", default="scripts/apply_migration.py")
     args = ap.parse_args()
     if args.dry_run and args.commit:
@@ -292,6 +299,14 @@ def main():
 
     conn = _connect_rw(cfg, args.prod_ack, is_prod)
     try:
+        if args.bootstrap_database:
+            # 全新逻辑库首铺：显式 charset/collation（铁律 4——staging 曾因缺省漂移到
+            # _0900_ai_ci 引发跨库 JOIN 1267）。IF NOT EXISTS 幂等；已存在时是 no-op。
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE DATABASE IF NOT EXISTS `{dbname}` "
+                            "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            conn.commit()
+            print(f"（--bootstrap-database）已确保库存在：{dbname}（utf8mb4/unicode_ci）")
         old = _ledger_conflict(conn, dbname, fn, checksum)
         if old:
             print(f"\n❌ 台账已记 {fn} 且 checksum 不同（台账 {old[:12]}… ≠ 本文件 "
