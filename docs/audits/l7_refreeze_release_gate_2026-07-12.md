@@ -132,6 +132,17 @@ vs 基线 0.9273**——40% 正例的 gold 文档 top-10 完全缺席（能命�
 - 现网用户自 7-07 起对这 485 篇文档检索失明（约 5 天）——L1 坍塌是它的测量像，
   refreeze 在治愈前无意义（会把盲态冻进基线）。
 
+### 治愈进展（2026-07-12，Sam 逐步授权）
+
+**第 1 步 单行验证 = 成功（决定性）**：探针 doc DOC_ADMIN_20260513120214_A8CB90
+（1 chunk，充值饭卡时间.jpeg 图文描述）→ rebuild --commit 复位 NOT_INDEXED（全网仅此
+1 行，范围干净）→ stage-3 重推（indexed=1 failed=0，04b parity verify initial_missing=0，
+node05 自动 superseded 1 旧版本行）→ **自查询 hit_rank=[1]**。**重推能补回索引缺行。**
+- 副产物实锤：stage-3 deactivate 节点本就 supersede 旧版本——485 双活 = 当初重灌批
+  **没走完整 stage-3**，佐证「修管道版本收尾」方向（已挂后台任务）。
+- ⚠️ 延迟丢失签名未消：push 即时 OK 不代表数小时后不再掉——第 2 步收尾加**延迟复验**
+  （推完 +30~60min 抽样自查询），既是终验也是工单证据（再掉=引擎根因坐实）。
+
 ### release-gate 当前出口（blocked，三件 Sam-gated）
 
 1. **治愈 485 盲文档**（生产写，四步）：①验证性单行重推（cmd=add 同 PK 整行替换）
