@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -176,11 +177,14 @@ class ResolveResult:
 
 
 # ── 离线 auto 资格（S1：唯一允许把"自动"变成"落库"的判定点；在线绝不调用）─────────
-_ACK_MANIFEST_REQUIRED = ("op", "date", "docset", "gt_summary", "signer")
+_ACK_MANIFEST_REQUIRED = ("op", "date", "docset", "gt_summary", "signer",
+                          "source_sha256", "environment")
+_SHA256_HEX_LEN = 64
 
 
-def auto_activation_enabled() -> bool:
-    """P0-07 auto 硬关（默认候选-only）+ P1-13 签名 manifest 验签。
+def auto_activation_enabled(source_fingerprint: Optional[str] = None) -> bool:
+    """P0-07 auto 硬关（默认候选-only）+ P1-13 签名 manifest 验签 + **输入/环境绑定**
+    （2026-07-11 重审计 §2）。
 
     旧闸只校验 op、当天日期、hash 长度≥8——「有人设了个环境变量」不构成质量门（外评
     P1-13：任何能设 env 的人可随手伪造）。现在 ack 是**持密钥签发**的：
@@ -188,11 +192,18 @@ def auto_activation_enabled() -> bool:
       `RAG_ONTOLOGY_AUTO_ACK=<manifest_path>:<hmac_sha256_hex>`
 
     manifest 为 JSON 文件，必填 op / date(YYYY-MM-DD，当日有效) / docset(数据集描述) /
-    gt_summary(GT/backtest 结果摘要) / signer；签名 = HMAC-SHA256(密钥, manifest 原始
-    字节)，密钥走 `RAG_ONTOLOGY_ACK_HMAC_KEY`（**密钥与 token 只能 Sam 设**，对齐
-    RAG_ALLOW_UNFROZEN_RECHUNK 的 date-bound 纪律）。无密钥/无 manifest/签名不符/字段
-    缺失/非当日 → 一律拒绝，auto 保持关闭（候选-only 默认不变）。PR14 backtest 工具按
-    GT manifest 打印签名；真实 GT 分层标定是后续组织项，本闸先把「须持密钥签发」立起来。"""
+    gt_summary(GT/backtest 结果摘要) / signer / **source_sha256**(快照文件 sha256) /
+    **environment**(目标环境名)；签名 = HMAC-SHA256(密钥, manifest 原始字节)，密钥走
+    `RAG_ONTOLOGY_ACK_HMAC_KEY`（**密钥与 token 只能 Sam 设**，对齐
+    RAG_ALLOW_UNFROZEN_RECHUNK 的 date-bound + docset-bound 纪律）。
+
+    绑定语义（重审计 §2「manifest 未绑输入」：此前 HMAC 只覆盖 manifest 自身，同一
+    manifest 可复用于任意 CSV/任意环境）：
+    - source_sha256 必须等于**本轮实际读取的快照文件** sha256（source_fingerprint 由
+      seeding/backfill 从 CsvSnapshotSource 实算传入；调用方给不出指纹 → auto 恒关）；
+    - environment 必须等于当前 get_config().environment（跨环境复用同一签发即拒）。
+    无密钥/无 manifest/签名不符/字段缺失/非当日/指纹不符/环境不符 → 一律拒绝，
+    auto 保持关闭（候选-only 默认不变）。"""
     raw = os.environ.get("RAG_ONTOLOGY_AUTO_ACK", "").strip()
     if not raw:
         return False
@@ -233,17 +244,47 @@ def auto_activation_enabled() -> bool:
         logger.warning("ack manifest 非当日（date=%s）——date-bound 纪律，auto 保持关闭",
                        doc["date"])
         return False
+    # 环境绑定（重审计 §2）：staging 签发的 manifest 拿到 prod 复用即拒（fail-closed：
+    # 环境读不出也拒——无法证明绑定成立就不放行）。
+    try:
+        from opensearch_pipeline.config import get_config
+        cur_env = str(get_config().environment or "").strip()
+    except Exception:   # noqa: BLE001
+        cur_env = ""
+    if not cur_env or str(doc["environment"]).strip() != cur_env:
+        logger.warning("ack manifest 环境不符（manifest=%s，当前=%s）——auto 保持关闭",
+                       doc.get("environment"), cur_env or "<读取失败>")
+        return False
+    # 输入绑定（重审计 §2）：manifest.source_sha256 必须与本轮实读快照文件的 sha256
+    # 完全一致。调用方给不出指纹（非文件源/读失败）→ 无从证明绑定 → auto 恒关。
+    man_src = str(doc["source_sha256"]).strip().lower()
+    if len(man_src) != _SHA256_HEX_LEN or any(c not in "0123456789abcdef" for c in man_src):
+        logger.warning("ack manifest source_sha256 非法（须 64 位 hex），auto 保持关闭")
+        return False
+    fp = (source_fingerprint or "").strip().lower()
+    if not fp:
+        logger.warning("调用方未提供快照指纹（source_fingerprint）——manifest 输入绑定"
+                       "无从验证，auto 保持关闭")
+        return False
+    if man_src != fp:
+        logger.warning("ack manifest source_sha256 与实读快照不符（manifest=%s…，实际=%s…）"
+                       "——同一 manifest 不得复用于不同数据集，auto 保持关闭",
+                       man_src[:12], fp[:12])
+        return False
     return True
 
 
 def may_auto_activate(candidates: Sequence[Candidate], *, intent: str, namespace: str,
-                      tau_table: Optional[TauTable] = None) -> Optional[Candidate]:
-    """闸 0（P0-07 硬关）+ 三禁 + 唯一性：auto ack 缺失恒否（候选-only 默认）·
-    write 意图恒否 · embedding 恒否 · 多候选（不同目标且 ≥ 各自 τ_low）恒否；
-    Top 候选 ≥ τ_high 且非 embedding 且目标唯一 → 返回该候选（调用方落库时标
-    confirmed_by='auto' 并入抽检队列）。仅播种/回填等离线路径调用；τ 走 strict
-    校验（非法配置 raise 阻断写 worker，绝不回落可 auto 的默认值）。"""
-    if not auto_activation_enabled():
+                      tau_table: Optional[TauTable] = None,
+                      source_fingerprint: Optional[str] = None) -> Optional[Candidate]:
+    """闸 0（P0-07 硬关 + 输入/环境绑定）+ 三禁 + 唯一性：auto ack 缺失/绑定不符恒否
+    （候选-only 默认）· write 意图恒否 · embedding 恒否 · 多候选（不同目标且 ≥ 各自
+    τ_low）恒否；Top 候选 ≥ τ_high 且非 embedding 且目标唯一 → 返回该候选（调用方
+    落库时标 confirmed_by='auto' 并入抽检队列）。仅播种/回填等离线路径调用；τ 走
+    strict 校验（非法配置 raise 阻断写 worker，绝不回落可 auto 的默认值）。
+    source_fingerprint=本轮实读快照的 sha256（seeding.source_fingerprint 实算）——
+    manifest 绑定校验用；给不出即 auto 恒关（重审计 §2）。"""
+    if not auto_activation_enabled(source_fingerprint=source_fingerprint):
         return None
     if intent != "read":
         return None
@@ -265,6 +306,9 @@ def may_auto_activate(candidates: Sequence[Candidate], *, intent: str, namespace
 
 # ── 解析器 ───────────────────────────────────────────────────────────────────
 _USE_DEFAULT_EMBEDDER = object()
+# in-flight 单飞锁（重审计 §4）：并发 resolve 同时冷启动时只有一个线程去批量补缺，
+# 其余等锁后直接吃热缓存——不重复付 DashScope 调用费
+_TITLE_VEC_LOCK = threading.Lock()
 
 
 class OntologyResolver:
@@ -281,6 +325,7 @@ class OntologyResolver:
         self._tau = tau_table or TauTable.from_env()
         self._pool_limit = max(1, min(int(embed_pool_limit), 200))
         self._title_vecs: Dict[str, Sequence[float]] = {}
+        self._embedder_is_default = False   # 默认 embedder 才走批量+持久缓存（_ensure_title_vecs）
 
     # -- 主入口 ------------------------------------------------------------
     def resolve(self, namespace: str, raw: str, *, intent: str = "read",
@@ -379,6 +424,9 @@ class OntologyResolver:
             # 之前先按密级过滤，机密品名/价目名绝不 POST 给外部 embedding 服务
             #（该类对象的消解只走 exact/rule/工作台人工，不因此丢正确性只丢便利）。
             objs = [o for o in objs if o.get("data_classification") != "confidential"]
+            # 重审计 §4：批量 warmup（持久缓存 → native 批量 API）——此前每个标题走
+            # get_query_embedding 单发一次 HTTP，冷启动上界 1+非机密对象数（≤801 次）。
+            self._ensure_title_vecs(embedder, [o.get("title") or "" for o in objs])
             for obj in objs:
                 tv = self._title_vec(embedder, obj["title"])
                 if tv is None:
@@ -396,6 +444,7 @@ class OntologyResolver:
         return out
 
     def _title_vec(self, embedder, title: str) -> Optional[Sequence[float]]:
+        """逐条兜底路径（warmup 未覆盖/批量失败的标题仍逐条 embed，行为向后兼容）。"""
         if title in self._title_vecs:
             return self._title_vecs[title]
         try:
@@ -403,10 +452,84 @@ class OntologyResolver:
         except Exception:   # noqa: BLE001
             return None
         if vec:
-            if len(self._title_vecs) >= _TITLE_CACHE_CAP:
-                self._title_vecs.pop(next(iter(self._title_vecs)))
-            self._title_vecs[title] = vec
+            self._store_title_vec(title, vec)
         return vec
+
+    def _store_title_vec(self, title: str, vec: Sequence[float]) -> None:
+        if len(self._title_vecs) >= _TITLE_CACHE_CAP:
+            self._title_vecs.pop(next(iter(self._title_vecs)))
+        self._title_vecs[title] = vec
+
+    def _ensure_title_vecs(self, embedder, titles: List[str]) -> None:
+        """批量 warmup（重审计 §4「~801 次冷启动逐条 HTTP」）：持久缓存点查 → miss 走
+        embed_texts_native **批量** API（摄取侧同款；逐对象单发是实现缺口非 API 限制）。
+        仅默认 embedder 生效（注入 embedder 是单文本契约、模型/维度未知，持久键无意义
+        ——逐条路径照旧）。_TITLE_VEC_LOCK 单飞：并发 resolve 不重复付费。纯优化路径：
+        任何失败只留 miss 给 _title_vec 逐条兜底，绝不改变候选结果。"""
+        if not self._embedder_is_default or embedder is None:
+            return
+        want = [t for t in dict.fromkeys(titles) if t and t not in self._title_vecs]
+        if not want:
+            return
+        with _TITLE_VEC_LOCK:
+            want = [t for t in want if t not in self._title_vecs]
+            if not want:
+                return
+            try:
+                from opensearch_pipeline.config import get_config
+                cfg = get_config()
+                model, dim = cfg.embedding.model, cfg.embedding.dimension
+
+                def _key(t: str) -> str:
+                    # 与摄取缓存同一键契约 md5(f"{model}_{dim}_{text}")：同模型同维度的
+                    # 同文本向量完全同值（native API 无 query/document 不对称）
+                    return hashlib.md5(f"{model}_{dim}_{t}".encode("utf-8")).hexdigest()
+
+                cache = self._persistent_cache()
+                if cache is not None:
+                    hits = cache.get_many([_key(t) for t in want])
+                    for t in want:
+                        v = hits.get(_key(t))
+                        if isinstance(v, list) and v:
+                            self._store_title_vec(t, v)
+                    want = [t for t in want if t not in self._title_vecs]
+                    if not want:
+                        return
+                from opensearch_pipeline.embedding_client import embed_texts_native
+                bs = max(1, int(getattr(cfg.embedding, "batch_size", 10) or 10))
+                fresh: Dict[str, List[float]] = {}
+                for i in range(0, len(want), bs):
+                    batch = want[i:i + bs]
+                    try:
+                        res = embed_texts_native(
+                            batch, api_key=cfg.embedding.api_key, model=model,
+                            dimension=dim, api_base_url=cfg.embedding.api_base_url,
+                            sparse_fallback=False, label="ontology title embedding")
+                    except Exception:   # noqa: BLE001 — 单批失败留给逐条兜底
+                        logger.warning("title 批量 embedding 失败（该批走逐条兜底）",
+                                       exc_info=True)
+                        continue
+                    for t, r in zip(batch, res):
+                        if r and r[0]:
+                            self._store_title_vec(t, r[0])
+                            fresh[_key(t)] = list(r[0])
+                if cache is not None and fresh:
+                    try:
+                        cache.put_many(fresh)
+                    except Exception:   # noqa: BLE001 — 持久层是 advisory
+                        pass
+            except Exception:   # noqa: BLE001 — warmup 整体 fail-open
+                logger.warning("title 向量批量 warmup 失败（回退逐条路径）", exc_info=True)
+
+    @staticmethod
+    def _persistent_cache():
+        """持久层复用摄取 embedding 缓存（SqliteKVStore WAL + 进程单例）：跨进程/跨运行
+        复用已算向量。打不开 → None（退化纯进程内 dict，graceful degradation 惯例）。"""
+        try:
+            from opensearch_pipeline.embedding_cache import get_embedding_cache
+            return get_embedding_cache()
+        except Exception:   # noqa: BLE001
+            return None
 
     def _get_embedder(self):
         if self._embedder_resolved:
@@ -418,6 +541,7 @@ class OntologyResolver:
             self._embedder = self._embedder_spec
         else:
             self._embedder = _default_embedder()
+            self._embedder_is_default = self._embedder is not None
         return self._embedder
 
 

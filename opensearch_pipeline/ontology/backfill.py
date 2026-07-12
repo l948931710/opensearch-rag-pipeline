@@ -37,13 +37,23 @@ ENABLE_ENV = "RAG_ONTOLOGY_BACKFILL_ENABLE"
 PROD_ACK_ENV = "RAG_ONTOLOGY_BACKFILL_PROD_ACK"
 
 
-def _prod_ack_valid() -> bool:
+def _prod_ack_valid(source_fp: Optional[str]) -> bool:
+    """`<op>:<YYYY-MM-DD>:<docset_hash>` 三段全要（2026-07-11 重审计 §2：此前只有
+    <op>:<date>，同日 token 可复用于任意 CSV——对齐 RAG_ALLOW_UNFROZEN_RECHUNK 的
+    docset-bound 纪律）。docset_hash = 快照文件 sha256 的前缀（≥8 位 hex），须与
+    本轮实读文件一致；指纹算不出（非文件源）→ 恒 False（fail-closed）。"""
     raw = os.environ.get(PROD_ACK_ENV, "").strip()
-    if not raw or ":" not in raw:
+    parts = raw.split(":")
+    if len(parts) != 3:
         return False
-    op, _, date_s = raw.partition(":")
+    op, date_s, docset = (p.strip() for p in parts)
     from datetime import date
-    return bool(op.strip()) and date_s.strip() == date.today().isoformat()
+    if not op or date_s != date.today().isoformat():
+        return False
+    docset = docset.lower()
+    if len(docset) < 8 or any(c not in "0123456789abcdef" for c in docset):
+        return False
+    return bool(source_fp) and source_fp.lower().startswith(docset)
 _P0_OBJECT_TYPES = ("product", "sku", "mold", "material")
 
 __all__ = ["ENABLE_ENV", "backfill_snapshot", "main"]
@@ -99,23 +109,29 @@ def main(argv=None, *, store=None, source=None) -> int:
               "真实回填另须 go/no-go ①③④ 签字）。拒绝执行。", file=sys.stderr)
         return 2
 
-    # PR-E（P0-07）：prod 物理指纹硬拒——对齐 ontology_seed.py。此前 backfill 只有
-    # DRY_RUN 常量 + ENABLE env 双闸（改源码/设 env 即过 = 可伪造）；现在生产 RDS
-    # 的 --commit 还须**当日** PROD_ACK_ENV=<op>:<YYYY-MM-DD>（token 只能 Sam 设，
-    # gate ①③④ 签字后才发）。dry-run 不受限（只读预览）。
-    if args.commit:
-        from opensearch_pipeline.config import get_config as _gc
-        from opensearch_pipeline.config import is_prod_target as _ipt
-        _cfg = _gc()
-        if _ipt("rds", _cfg.rds.host) and not _prod_ack_valid():
-            print(f"❌ 目标是生产 RDS——真实回填须 gate ①③④ 签字后由 Sam 设当日 "
-                  f"{PROD_ACK_ENV}=<op>:<YYYY-MM-DD>。拒绝执行。", file=sys.stderr)
-            return 2
-
     if source is None:
         if not args.csv_path:
             p.error("缺 csv_path（或经 main(source=...) 注入）")
         source = CsvSnapshotSource(args.csv_path)
+
+    # PR-E（P0-07）：prod 物理指纹硬拒——对齐 ontology_seed.py。此前 backfill 只有
+    # DRY_RUN 常量 + ENABLE env 双闸（改源码/设 env 即过 = 可伪造）；现在生产 RDS
+    # 的 --commit 还须**当日 + docset-bound** PROD_ACK_ENV=<op>:<YYYY-MM-DD>:<docset_hash>
+    # （重审计 §2：第三段 = 快照 sha256 前缀，同日 token 不得复用于另一批数据；token
+    # 只能 Sam 设，gate ①③④ 签字后才发）。dry-run 不受限（只读预览）。
+    if args.commit:
+        from opensearch_pipeline.config import get_config as _gc
+        from opensearch_pipeline.config import is_prod_target as _ipt
+        from opensearch_pipeline.ontology.seeding import source_fingerprint
+        _cfg = _gc()
+        if _ipt("rds", _cfg.rds.host):
+            _fp = source_fingerprint(source)
+            if not _prod_ack_valid(_fp):
+                print(f"❌ 目标是生产 RDS——真实回填须 gate ①③④ 签字后由 Sam 设当日 "
+                      f"{PROD_ACK_ENV}=<op>:<YYYY-MM-DD>:<docset_hash>"
+                      f"（docset_hash=快照 sha256 前 12 位："
+                      f"{(_fp or '<指纹不可得>')[:12]}）。拒绝执行。", file=sys.stderr)
+                return 2
 
     if store is None:
         from opensearch_pipeline.config import get_config

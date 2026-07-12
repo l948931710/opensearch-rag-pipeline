@@ -63,6 +63,7 @@ def derive_approver_scope(ctx: "ExecutionContext") -> str:
 # per-attr steward（stewardship scope）路由。工具在构造时注册解析器；未注册的工具
 # 走 derive_approver_scope 默认推导，**既有行为零变化**。
 _SCOPE_RESOLVERS: Dict[str, Callable[..., Optional[str]]] = {}
+_SNAPSHOT_FALLBACK_WARNED = False   # 快照回退一次性告警（重审计 §3 可观测性）
 
 
 def register_approver_scope_resolver(tool_name: str, fn: Callable[..., Optional[str]]) -> None:
@@ -78,6 +79,17 @@ def resolve_scope_live(tool_name: str, args: Optional[Dict[str, Any]]) -> Option
     解析器按约定只依赖 args（如 ontology 按 target_object_id 查 stewardship）。"""
     fn = _SCOPE_RESOLVERS.get(str(tool_name or ""))
     if fn is None:
+        # 重审计 §3：生产 registry 只有 knowledge_search（READ_ONLY，不产生审批），
+        # 唯一注册点在 HIGH_WRITE ontology 工具的 __init__——PMC-1 工具面（PR11-13）
+        # 接线前 _SCOPE_RESOLVERS 恒空、审批 scope 恒走提案快照。这是组织 gate 签字
+        # 前的**计划内中间态**；一次性告警让「现算未生效」在生产日志里可见而非静默。
+        global _SNAPSHOT_FALLBACK_WARNED
+        if not _SNAPSHOT_FALLBACK_WARNED and not _SCOPE_RESOLVERS:
+            _SNAPSHOT_FALLBACK_WARNED = True
+            logger.warning(
+                "per-tool approver_scope 现算解析器未注册（工具 %s 走提案快照 scope）——"
+                "PMC-1 工具面（PR11-13）接线后自动生效；此前 stewardship 变更不即时"
+                "反映到已挂起审批的 scope", tool_name)
         return None
     try:
         # [:160]：backup steward 的 CSV scope（"steward,backup"，schema/031 加宽）

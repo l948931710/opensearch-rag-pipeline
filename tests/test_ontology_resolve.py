@@ -29,18 +29,28 @@ def _hash_embedder(text):
 
 
 
+# 重审计 §2「manifest 绑定输入」：单测统一快照指纹（64 hex）——manifest.source_sha256
+# 与 may_auto_activate(source_fingerprint=…) 两侧同值即绑定成立
+_TEST_FP = "ab" * 32
+
+
 def _sign_ack_manifest(tmp_path, monkeypatch, *, key="unit-test-ack-key", date_s=None,
                        omit=(), tamper_after_sign=False, wrong_key_sig=False,
-                       set_key=True) -> str:
+                       set_key=True, source_sha256=None, environment=None) -> str:
     """P1-13 测试件：签发一份 ack manifest，返回 env 值 `<path>:<sig>`。
-    参数化各种非法形态（缺字段/过期/被篡改/密钥不符/无密钥）供 gate 负例复用。"""
+    参数化各种非法形态（缺字段/过期/被篡改/密钥不符/无密钥/指纹不符/环境不符）供
+    gate 负例复用。"""
     import hashlib
     import hmac as _hmac
     import json as _json
     from datetime import date
+    if environment is None:
+        from opensearch_pipeline.config import get_config
+        environment = get_config().environment
     doc = {"op": "unit-test", "date": date_s or date.today().isoformat(),
            "docset": "unit-test fixtures", "gt_summary": "n/a（单测机制验证）",
-           "signer": "pytest"}
+           "signer": "pytest", "source_sha256": source_sha256 or _TEST_FP,
+           "environment": environment}
     for k in omit:
         doc.pop(k, None)
     body = _json.dumps(doc, ensure_ascii=False).encode("utf-8")
@@ -340,31 +350,32 @@ def _cand(target="obj1", method="rule", conf=0.97, **kw):
 
 def test_auto_denied_for_write_intent():
     assert may_auto_activate([_cand()], intent="write", namespace="u8",
-                             tau_table=TauTable()) is None
+                             tau_table=TauTable(), source_fingerprint=_TEST_FP) is None
 
 
 def test_auto_denied_for_embedding_top():
     assert may_auto_activate([_cand(method="embedding", conf=0.999)], intent="read",
-                             namespace="u8", tau_table=TauTable()) is None
+                             namespace="u8", tau_table=TauTable(), source_fingerprint=_TEST_FP) is None
 
 
 def test_auto_denied_for_competing_candidates():
     cands = [_cand(target="a", conf=0.97), _cand(target="b", method="kie", conf=0.75)]
     assert may_auto_activate(cands, intent="read", namespace="u8",
-                             tau_table=TauTable()) is None
+                             tau_table=TauTable(), source_fingerprint=_TEST_FP) is None
 
 
 def test_auto_allows_same_target_multi_method():
     cands = [_cand(target="a", conf=0.97), _cand(target="a", method="kie", conf=0.80)]
-    got = may_auto_activate(cands, intent="read", namespace="u8", tau_table=TauTable())
+    got = may_auto_activate(cands, intent="read", namespace="u8", tau_table=TauTable(),
+                            source_fingerprint=_TEST_FP)
     assert got is not None and got.target_object_id == "a"    # 同目标=互相印证
 
 
 def test_auto_denied_below_high_and_boundary():
     assert may_auto_activate([_cand(conf=0.94)], intent="read", namespace="u8",
-                             tau_table=TauTable()) is None
+                             tau_table=TauTable(), source_fingerprint=_TEST_FP) is None
     assert may_auto_activate([_cand(conf=0.95)], intent="read", namespace="u8",
-                             tau_table=TauTable()) is not None   # ≥ 含边界
+                             tau_table=TauTable(), source_fingerprint=_TEST_FP) is not None   # ≥ 含边界
 
 
 def test_auto_denied_for_suffix_rule_design_conf(resolver, store):
@@ -372,17 +383,18 @@ def test_auto_denied_for_suffix_rule_design_conf(resolver, store):
     _seed_product(store)
     res = resolver.resolve("u8", "ABC123-M")
     assert may_auto_activate(res.candidates, intent="read", namespace="u8",
-                             tau_table=TauTable()) is None
+                             tau_table=TauTable(), source_fingerprint=_TEST_FP) is None
 
 
 def test_auto_empty_candidates():
     assert may_auto_activate([], intent="read", namespace="u8",
-                             tau_table=TauTable()) is None
+                             tau_table=TauTable(), source_fingerprint=_TEST_FP) is None
 
 
 def test_auto_ignores_subthreshold_competitor():
     cands = [_cand(target="a", conf=0.96), _cand(target="b", method="kie", conf=0.30)]
-    got = may_auto_activate(cands, intent="read", namespace="u8", tau_table=TauTable())
+    got = may_auto_activate(cands, intent="read", namespace="u8", tau_table=TauTable(),
+                            source_fingerprint=_TEST_FP)
     assert got is not None and got.target_object_id == "a"    # 低于 τ_low 的不算竞争
 
 
@@ -621,5 +633,34 @@ def test_auto_gate_rejects_missing_manifest_file(monkeypatch, tmp_path):
 def test_auto_gate_valid_manifest_opens(monkeypatch, tmp_path):
     """密钥+当日 manifest+匹配签名三件齐 → auto 资格判定放行（三禁仍另行生效）。"""
     _sign_ack_manifest(tmp_path, monkeypatch)
-    winner = may_auto_activate(_auto_candidate(), intent="read", namespace="u8")
+    winner = may_auto_activate(_auto_candidate(), intent="read", namespace="u8",
+                               source_fingerprint=_TEST_FP)
     assert winner is not None and winner.target_object_id == "T1"
+
+
+def test_auto_gate_rejects_fingerprint_mismatch(monkeypatch, tmp_path):
+    """重审计 §2：manifest 合法签发但绑定的是另一份快照 → 拒（同一 manifest 不得复用
+    于不同数据集）。"""
+    _sign_ack_manifest(tmp_path, monkeypatch)
+    assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8",
+                             source_fingerprint="cd" * 32) is None
+
+
+def test_auto_gate_rejects_missing_caller_fingerprint(monkeypatch, tmp_path):
+    """重审计 §2：调用方给不出快照指纹（非文件源/读失败）→ 绑定无从验证，auto 恒关。"""
+    _sign_ack_manifest(tmp_path, monkeypatch)
+    assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8") is None
+
+
+def test_auto_gate_rejects_environment_mismatch(monkeypatch, tmp_path):
+    """重审计 §2：staging 签发的 manifest 拿到别的环境复用 → 拒（环境绑定）。"""
+    _sign_ack_manifest(tmp_path, monkeypatch, environment="staging-somewhere-else")
+    assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8",
+                             source_fingerprint=_TEST_FP) is None
+
+
+def test_auto_gate_rejects_missing_source_field(monkeypatch, tmp_path):
+    """重审计 §2：manifest 缺 source_sha256（旧格式签发件）→ 拒（必填字段收紧）。"""
+    _sign_ack_manifest(tmp_path, monkeypatch, omit=("source_sha256",))
+    assert may_auto_activate(_auto_candidate(), intent="read", namespace="u8",
+                             source_fingerprint=_TEST_FP) is None
