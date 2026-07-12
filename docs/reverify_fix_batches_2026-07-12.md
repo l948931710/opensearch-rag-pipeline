@@ -37,6 +37,18 @@
 
 **闸门**：`RAG_AGENT_ENABLE` 灰度前必须合入。两项都在 ask 准入层，一起改一起测。
 
+> **状态（2026-07-12）：✅ 代码侧完成**（落 claude/ontology-p0；全量 3466+ 绿 + 真库
+> e2e 19 绿 + lint 绿）。schema/037 已 apply **本地**+记台账；staging/prod apply 留批次 7。
+> 两处与原案的实现偏差（均更贴合验收标准）：
+> ① **A2 挂点在 `make_model_fn`（model_gateway.py）而非 executor._drive_gen**——空终轮
+>   重试发生在 loop._drive_model 内部、不产生独立事件，executor 只能看到轮边界；
+>   model_fn 每次调用恰好一次 gateway 调用，多轮/空轮重试/续跑段天然全覆盖。先扣后调
+>   （超帽的那次调用不发出去），超帽 → BudgetExceeded → run 诚实落 failed。
+> ② **/approve 取括号里的备选**：保持 count_llm=False + 显式豁免注释——审批是治理动作
+>   （撤回/拒绝须恒可达，触顶 503 审批=制造审批黑洞），续跑消耗由逐调用计费覆盖。
+> 另：eval_harness/agent 传 `charge_llm=False`（本地跑批不烧准入配额，否则 251 题×多轮
+> 中途撞 user_per_day 帽）；thinking 档按 thinking_cap_weight 加权（对齐准入侧 P2-11）。
+
 ### A1 per-thread run 串行化 【M】
 - `schema/037_agent_run_serialization.sql`：MySQL 不支持部分唯一索引 → 生成列
   `active_thread VARCHAR(128) GENERATED ALWAYS AS (IF(status IN ('running','suspended','resuming'), thread_id, NULL))`
@@ -174,7 +186,7 @@ A3 的 staging 演练排在这批合入之后。
 | A3-演练 | staging 真实 identity_resolve 全链路：suspend→approve/edit/reject→resume→uncertain→reconcile | 批次 3 + gate 签字 + SAE 重打包 |
 | D2-粘贴 | retention 节点新脚本重粘贴到 DataWorks 控制台 | DataWorks 控制台权限 |
 | B2-HA | Redis 双副本/自动切换落地 | infra |
-| 迁移 apply | 批次 1（037）/批次 6（03x）三环境 apply | Sam 授权链 |
+| 迁移 apply | 批次 1（037，本地已 apply+台账 2026-07-12）/批次 6（03x）——staging/prod apply | Sam 授权链 |
 
 ---
 
