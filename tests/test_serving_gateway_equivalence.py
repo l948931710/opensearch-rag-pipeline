@@ -36,10 +36,11 @@ _CHUNKS = [{"doc_id": "d1", "title": "年假制度", "section": "第3条",
 
 
 class _CapturePost:
-    """捕获 _http_post 的完整调用参数并回放同一脚本流（两条路径共用）。"""
+    """捕获 _http_post 的完整调用参数并回放脚本响应（流式回 lines、非流式回 json_body）。"""
 
-    def __init__(self, lines):
-        self._lines = lines
+    def __init__(self, lines=None, json_body=None):
+        self._lines = lines or []
+        self._json_body = json_body
         self.calls = []
 
     def __call__(self, url, **kw):
@@ -50,6 +51,7 @@ class _CapturePost:
         m.__enter__.return_value = m              # 裸路径 with 语境
         m.__exit__.return_value = False
         m.iter_lines.return_value = iter(self._lines)
+        m.json.return_value = self._json_body     # 非流式两路径都走 .json()
         m.close.return_value = None
         return m
 
@@ -109,3 +111,67 @@ def test_done_frame_usage_raw_fidelity():
     done = next(json.loads(f[6:].strip()) for f in frames
                 if f.startswith("data: ") and '"type": "done"' in f)
     assert done["usage"] == _RICH_USAGE, "done 帧必须携带线上原始 usage（含明细字段）"
+
+
+# ── 非流式 generate_answer（Tier B 后半）────────────────────────────
+_NONSTREAM_BODY = {
+    "choices": [{"message": {"content": "根据[文档1]，年假每年5 天。"},
+                 "finish_reason": "stop"}],
+    "usage": _RICH_USAGE,
+    "model": "qwen3.7-plus",
+}
+
+
+def _run_nonstream(flag, *, thinking=None, body=_NONSTREAM_BODY):
+    cfg = get_config()
+    orig_flag = cfg.rag.serving_model_gateway
+    cfg.rag.serving_model_gateway = flag
+    cap = _CapturePost(json_body=body)
+    try:
+        with patch.object(llm_generator, "_http_post", cap), \
+             patch.object(model_gateway, "_http_post", cap):
+            result = llm_generator.generate_answer("年假几天", _CHUNKS, thinking=thinking)
+    finally:
+        cfg.rag.serving_model_gateway = orig_flag
+    assert len(cap.calls) == 1
+    return cap.calls[0], result
+
+
+def test_nonstream_wire_and_result_equivalence():
+    off_call, off_res = _run_nonstream(False)
+    on_call, on_res = _run_nonstream(True)
+    assert on_call["url"] == off_call["url"]
+    assert on_call["json"] == off_call["json"], "非流式线上请求体必须等值（含 stream:False 键）"
+    assert on_call["json"]["stream"] is False
+    assert on_call["headers"] == off_call["headers"]
+    assert on_call["timeout"] == off_call["timeout"]
+    assert "stream" not in on_call and "stream" not in off_call   # kwarg 层面都非流式
+    assert on_res == off_res, "返回 dict（answer/sources/model/usage/gen_meta）必须全等"
+    assert on_res["usage"] == _RICH_USAGE, "usage 必须是线上原始 dict（含明细字段）"
+    assert "[文档1]" not in on_res["answer"], "两路径同过 strip_doc_citations"
+
+
+def test_nonstream_thinking_override_parity():
+    off_call, _ = _run_nonstream(False, thinking=True)
+    on_call, _ = _run_nonstream(True, thinking=True)
+    assert on_call["json"] == off_call["json"]
+    assert on_call["json"]["enable_thinking"] is True
+
+
+def test_nonstream_no_choices_fail_loud_both_paths():
+    """裸路径对「200 但无 choices」KeyError fail-loud；gateway 分支须保持失败模式
+    （空答案绝不静默落台账）。"""
+    import pytest
+
+    cfg = get_config()
+    orig = cfg.rag.serving_model_gateway
+    for flag in (False, True):
+        cfg.rag.serving_model_gateway = flag
+        cap = _CapturePost(json_body={"choices": []})
+        try:
+            with patch.object(llm_generator, "_http_post", cap), \
+                 patch.object(model_gateway, "_http_post", cap), \
+                 pytest.raises(Exception):
+                llm_generator.generate_answer("年假几天", _CHUNKS)
+        finally:
+            cfg.rag.serving_model_gateway = orig

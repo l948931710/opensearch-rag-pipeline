@@ -833,32 +833,44 @@ def generate_answer(
     # 调用 DashScope (OpenAI compatible-mode)
     url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
 
+    # 非流式同样关闭思考（默认 False）：思考拖慢且 DashScope 对 qwen3 非流式+思考支持受限。
+    # thinking 参数允许逐次覆盖（None = 全局配置）。
+    _think = llm.enable_thinking if thinking is None else bool(thinking)
+
     payload = {
         "model": llm.model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
-        # 非流式同样关闭思考（默认 False）：思考拖慢且 DashScope 对 qwen3 非流式+思考支持受限。
-        # thinking 参数允许逐次覆盖（None = 全局配置）。
-        "enable_thinking": llm.enable_thinking if thinking is None else bool(thinking),
+        "enable_thinking": _think,
     }
 
-    resp = _http_post(
-        url,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {llm.api_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=_llm_request_timeout(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    if config.rag.serving_model_gateway:
+        # Tier B-非流式：同一请求体改经 ModelGateway 发出（payload/返回契约等值由
+        # tests/test_serving_gateway_equivalence.py 钉死）；异常类型变为 ModelError/
+        # ModelUnavailable，调用方均宽 except，透明。
+        gresp = _chat_via_gateway(messages, max_tokens=max_tokens,
+                                  temperature=temperature, think=_think)
+        # 源头清洗 [文档N] 编号引用（与裸路径同一入口 strip_doc_citations）
+        answer = strip_doc_citations(gresp.text)
+        usage = gresp.usage_raw
+    else:
+        resp = _http_post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {llm.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=_llm_request_timeout(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
-    # 源头清洗 [文档N] 编号引用（非流式四条消费链路一次覆盖；流式在收集端清理）
-    answer = strip_doc_citations(data["choices"][0]["message"]["content"])
-    usage = data.get("usage", {})
+        # 源头清洗 [文档N] 编号引用（非流式四条消费链路一次覆盖；流式在收集端清理）
+        answer = strip_doc_citations(data["choices"][0]["message"]["content"])
+        usage = data.get("usage", {})
     sources = _extract_sources(_included_chunks)
 
     logger.info("Answer generated: model=%s, tokens=%s", llm.model, usage)
@@ -979,7 +991,7 @@ def generate_answer_stream(
         # tests/test_serving_gateway_equivalence.py 钉死）；异常类型变为 ModelError/
         # ModelUnavailable，调用方（api.ask_stream / dingtalk）均宽 except → error 帧，透明。
         usage_info = yield from _stream_frames_via_gateway(
-            llm, messages, max_tokens=max_tokens, temperature=temperature,
+            messages, max_tokens=max_tokens, temperature=temperature,
             think=_think, emit_reasoning=_emit_reasoning)
     else:
         # 流式请求
@@ -1034,28 +1046,20 @@ def generate_answer_stream(
     yield "data: [DONE]\n\n"
 
 
-def _stream_frames_via_gateway(
-    llm, messages, *, max_tokens: int, temperature: float,
-    think: bool, emit_reasoning: bool,
-) -> Generator[str, None, Dict[str, Any]]:
-    """RAG_SERVING_MODEL_GATEWAY：流式调用改经 ModelGateway.complete_stream。
+def _serving_gateway():
+    """RAG_SERVING_MODEL_GATEWAY 共用构造（流式/非流式两分支同一语义）。
 
-    等值要点：单 provider 单链路（dashscope + config 模型）、max_retries=0（原语义=单次调用、
-    失败即抛给上层出 error 帧）、tier_params={} 不注入档位参数——enable_thinking 由 extra
-    显式携带，请求体键集合与裸 payload 完全一致。call_logger 不接：serving 台账是
-    qa_session_log（api 层落），agent llm_call_log 表（schema 022-024）生产未建，
-    热路径不做逐调用的失败尝试。返回值=线上原始 usage dict（usage_raw），供 done 帧保真。
+    等值要点：单 provider 单链路（dashscope + config 模型）、max_retries=0（原语义=单次
+    调用、失败即抛）、tier_params={} 不注入档位参数——enable_thinking 由调用方 extra 显式
+    携带。call_logger 不接：serving 台账是 qa_session_log（api 层落），agent llm_call_log
+    表（schema 022-024）生产未建，热路径不做逐调用的失败尝试。
     """
     from opensearch_pipeline.agent_runtime.context import ExecutionContext
-    from opensearch_pipeline.agent_runtime.model_gateway import (
-        ChatRequest,
-        DashScopeProvider,
-        ModelGateway,
-    )
+    from opensearch_pipeline.agent_runtime.model_gateway import DashScopeProvider, ModelGateway
 
     gw = ModelGateway(
         {"dashscope": DashScopeProvider(timeout=_llm_request_timeout())},
-        routes={"serving": [("dashscope", llm.model)]},
+        routes={"serving": [("dashscope", get_config().llm.model)]},
         max_retries=0, tier_params={})
     try:
         from opensearch_pipeline.request_context import get_request_id
@@ -1064,7 +1068,35 @@ def _stream_frames_via_gateway(
         rid = ""
     ctx = ExecutionContext.create(
         request_id=rid, user_id="rag-serving", acl_groups=(),
-        roles=("system",), channel="api", thread_id="serving-stream")
+        roles=("system",), channel="api", thread_id="serving")
+    return gw, ctx
+
+
+def _chat_via_gateway(messages, *, max_tokens: int, temperature: float, think: bool):
+    """RAG_SERVING_MODEL_GATEWAY：非流式调用改经 ModelGateway.complete（等值门=
+    tests/test_serving_gateway_equivalence.py）。extra 显式带 stream:False——gateway
+    _body 不加 stream 键，补上保证请求体与裸 payload 逐键一致。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import ChatRequest
+
+    gw, ctx = _serving_gateway()
+    resp = gw.complete(ctx, "serving", ChatRequest(
+        messages=messages, temperature=temperature, max_tokens=max_tokens,
+        extra={"stream": False, "enable_thinking": think}))
+    if not resp.text and not resp.finish_reason:
+        # 裸路径对「200 但无 choices」是 KeyError fail-loud；保持失败模式，空答案不静默落台账
+        raise RuntimeError("LLM 返回空响应（无 choices）")
+    return resp
+
+
+def _stream_frames_via_gateway(
+    messages, *, max_tokens: int, temperature: float,
+    think: bool, emit_reasoning: bool,
+) -> Generator[str, None, Dict[str, Any]]:
+    """RAG_SERVING_MODEL_GATEWAY：流式调用改经 ModelGateway.complete_stream（构造语义
+    见 _serving_gateway）。返回值=线上原始 usage dict（usage_raw），供 done 帧保真。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import ChatRequest
+
+    gw, ctx = _serving_gateway()
     req = ChatRequest(messages=messages, temperature=temperature,
                       max_tokens=max_tokens, extra={"enable_thinking": think})
     gen = gw.complete_stream(ctx, "serving", req)
