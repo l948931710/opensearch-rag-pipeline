@@ -167,6 +167,7 @@ def issue_session_token(
         "acl_groups": groups,        # 权威：权限组数组
         "dept": ",".join(groups),    # 旧·兼容：CSV（单值时与历史标量一致）
         "name": name or "",
+        "iat": int(time.time()),     # 签发时刻——撤销杠杆 RAG_SESSION_TOKEN_MIN_IAT 的判据
         "exp": int(time.time()) + int(ttl),
     }
     if role and isinstance(role, str) and role.strip():
@@ -206,7 +207,32 @@ def verify_session_token(token: str) -> Optional[dict]:
         return None
     if int(payload.get("exp", 0)) < int(time.time()):
         return None
+    if not _passes_revocation(payload):
+        return None
     return payload
+
+
+def _passes_revocation(payload: dict) -> bool:
+    """撤销杠杆（P0-05 报告1「停用用户旧 token 仍持组读到 exp」）。两把都默认不设=零行为变化：
+
+    - ``RAG_SESSION_TOKEN_MIN_IAT``（unix 秒）：iat 早于该时刻的令牌一律拒（含无 iat 的
+      旧令牌——设了 epoch 就是要把存量令牌全部作废，全局登出/密钥疑似泄露时的止血阀）；
+    - ``RAG_REVOKED_USER_IDS``（CSV）：名单内用户的会话令牌一律拒（离职/停用个体，
+      不必等 2h TTL 抽干）。每次校验现读 env——测试/热更新（重启注入）即时生效。
+    """
+    min_iat = os.environ.get("RAG_SESSION_TOKEN_MIN_IAT", "").strip()
+    if min_iat:
+        try:
+            if int(payload.get("iat") or 0) < int(min_iat):
+                return False
+        except (TypeError, ValueError):
+            return False               # epoch 配错宁可全拒（fail-closed），配置错误必须当场暴露
+    revoked = os.environ.get("RAG_REVOKED_USER_IDS", "").strip()
+    if revoked:
+        ids = {s.strip() for s in revoked.split(",") if s.strip()}
+        if str(payload.get("uid") or "") in ids:
+            return False
+    return True
 
 
 def sign_payload(payload: dict, ttl: int = _DEFAULT_TTL_SECONDS) -> str:
