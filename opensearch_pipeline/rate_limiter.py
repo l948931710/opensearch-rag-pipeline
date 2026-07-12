@@ -36,6 +36,11 @@ rate_limiter.py — serving 公网防刷（进程内四层准入）
 
 注意：全局熔断按"准入的问答请求"计数（含最终 NO_RESULT 的），因为 embedding/
 HA3/rerank 开销在准入后即发生——这正是熔断要兜的上游调用总量。
+⚠️ A2（审计复核批次1，2026-07-12）：agent 链路另有**逐模型调用计费**
+（charge_llm_call——多轮 run/空终轮重试/审批续跑段每次真实模型调用都扣全局熔断与
+每用户日计数，准入层的一次性计数只护 ask 边界）。开 RAG_AGENT_ENABLE 后
+RAG_GLOBAL_DAILY_LLM_CAP 的语义从「次/ask」趋向「模型调用数」，阈值需按实测
+倍率重定（批次 7 运营配套）。
 
 可观测性（盲区审计 P1-1，2026-07-05）：被拒请求在 log_qa_session 之前就被拒，
 从不落 qa_session_log——此前触顶=静默全站宕机且 SLO 反而全绿。现在：
@@ -460,6 +465,53 @@ class ServingRateLimiter:
             self._maybe_prune(now, _beijing_day(now))
         return None
 
+    def charge_llm_call(self, actor: str, *, weight: int = 1, thinking: bool = False) -> bool:
+        """A2 逐模型调用计费（审计复核批次1）：**只扣计数、不做准入判定**——每次真实
+        模型调用扣全局日熔断 + 该用户日计数（thinking 档按 thinking_cap_weight 加权，
+        与准入侧 P2-11 同一"cap≈计费量"口径）。返回 True=仍在帽内；False=已超帽
+        （调用方 fail-closed：agent run 以 budget_exceeded 诚实收尾）。
+
+        与 admit_ask 的分工：准入只在 ask 边界计 1 次，多轮 run/空终轮重试/审批续跑段
+        的模型调用此前对熔断零扣减（复核 A2）；本方法补上逐调用扣减。超帽判定取
+        「累计 > cap」——恰好落在 cap 上的那次仍放行，与准入侧「≥cap 拒绝」衔接后
+        总量恒 ≤ cap+权重。"""
+        lim = self.limits()
+        if not lim.enabled:
+            return True
+        now = self._now()
+        day = _beijing_day(now)
+        w = max(1, int(weight)) * (lim.thinking_cap_weight if thinking else 1)
+        # 重启回种（同 admit_ask：锁外触发，_seed 内部要取 _lock）
+        if lim.global_daily_llm_cap > 0 and self._cap_seed_day != day:
+            self._cap_seed_day = day
+            self._dispatch_cap_seed(day)
+        over = False
+        with self._lock:
+            if lim.global_daily_llm_cap > 0:
+                g_day, g_cnt = self._global_day
+                prev = g_cnt if g_day == day else 0
+                new_cnt = prev + w
+                self._global_day = (day, new_cnt)
+                with self._reject_lock:   # __admitted__ 行：SLO offered/admitted + 重启回种数据源
+                    a_key = (day, _ADMITTED_KEY)
+                    self._rejected[a_key] = self._rejected.get(a_key, 0) + w
+                if prev < lim.global_daily_llm_cap <= new_cnt:
+                    logger.error("全局日熔断触顶（逐调用计费）：今日 LLM 调用量已达 %d",
+                                 lim.global_daily_llm_cap)
+                    self._maybe_cap_alert(day, lim.global_daily_llm_cap)
+                if new_cnt > lim.global_daily_llm_cap:
+                    over = True
+            if lim.user_per_day > 0:
+                day_key = f"day:{actor}"
+                d_day, d_cnt = self._daily.get(day_key, (day, 0))
+                if d_day != day:
+                    d_cnt = 0
+                self._daily[day_key] = (day, d_cnt + w)
+                if d_cnt + w > lim.user_per_day:
+                    over = True
+            self._note_reject(None, now)   # 顺带冲刷到期的聚合批（锁序 _lock→_reject_lock）
+        return not over
+
     # ── 内部 ─────────────────────────────────────────────────
 
     def _deny(self, actor: str, denial: Denial) -> Denial:
@@ -595,6 +647,25 @@ local nm=redis.call('INCR',KEYS[1]); if nm==1 then redis.call('EXPIRE',KEYS[1],t
 return {'admit',nm}
 """
 
+# A2 逐模型调用计费：只扣不判（先扣后报超帽，语义与 memory 版 charge_llm_call 一致）。
+# KEYS: 1=global 2=day(用户)   ARGV: 1=cap 2=per_day 3=weight 4=ttl_day
+# 返回 {over, edge}：over=1 已超帽（累计>上限）；edge=1 本次恰好跨过全局 cap（告警一次用）
+_CHARGE_LUA = """
+local cap=tonumber(ARGV[1]); local per_day=tonumber(ARGV[2])
+local w=tonumber(ARGV[3]); local ttl_day=tonumber(ARGV[4])
+local over=0; local edge=0
+if cap>0 then
+  local ng=redis.call('INCRBY',KEYS[1],w); if ng==w then redis.call('EXPIRE',KEYS[1],ttl_day) end
+  if (ng-w)<cap and ng>=cap then edge=1 end
+  if ng>cap then over=1 end
+end
+if per_day>0 then
+  local nd=redis.call('INCRBY',KEYS[2],w); if nd==w then redis.call('EXPIRE',KEYS[2],ttl_day) end
+  if nd>per_day then over=1 end
+end
+return {over, edge}
+"""
+
 
 class RedisRateLimiter:
     """Redis 后端：四层计数**跨实例共享**（全局熔断因此才真正全局，而非每实例各 2000/日
@@ -622,6 +693,7 @@ class RedisRateLimiter:
         self._limits: Optional[Limits] = None
         self._ask_script = client.register_script(_ASK_LUA)   # 客户端侧建 Script，不连服务器
         self._aux_script = client.register_script(_AUX_LUA)
+        self._charge_script = client.register_script(_CHARGE_LUA)
         # 拒绝聚合（每实例缓冲 → RDS UPSERT 合并；与 memory 版同构）
         self._reject_lock = threading.Lock()
         self._rejected: Dict[Tuple[str, str], int] = {}
@@ -737,6 +809,36 @@ class RedisRateLimiter:
             return self._deny(Denial(429, "操作太频繁，请稍后再试", retry, "aux_per_min"), now)
         return None
 
+    def charge_llm_call(self, actor: str, *, weight: int = 1, thinking: bool = False) -> bool:
+        """A2 逐模型调用计费（与 memory 版同一契约，见 ServingRateLimiter.charge_llm_call）。
+        计数键与准入侧共享（rl:g:<day> / rl:d:ask:<actor>:<day>），跨实例扣的是同一份账。
+
+        fail 姿态：**fail-open**（有别于 admit_ask 的 fail-closed）——run 已通过准入且有
+        run 级 max_turns/token 预算兜底，中途 Redis 抖动不该把在跑 run 全体打死（B2
+        「限流 Redis 单点」的爆炸半径控制）；响亮 error 日志保可观测。"""
+        lim = self.limits()
+        if not lim.enabled:
+            return True
+        now = self._now()
+        day = _beijing_day(now)
+        w = max(1, int(weight)) * (lim.thinking_cap_weight if thinking else 1)
+        keys = [redis_client.key("rl", "g", day),
+                redis_client.key("rl", "d", "ask", actor, day)]
+        args = [lim.global_daily_llm_cap, lim.user_per_day, w, _secs_to_beijing_midnight(now)]
+        try:
+            over, edge = self._charge_script(keys=keys, args=args)
+        except Exception as e:   # noqa: BLE001
+            logger.error("限流 Redis 后端故障，charge_llm_call fail-open（run 级预算兜底）: %s", e)
+            return True
+        if edge:
+            self._maybe_cap_alert_once(day, lim.global_daily_llm_cap, now)
+        if lim.global_daily_llm_cap > 0:
+            with self._reject_lock:   # __admitted__ 行：SLO offered/admitted 口径同准入
+                a_key = (day, _ADMITTED_KEY)
+                self._rejected[a_key] = self._rejected.get(a_key, 0) + w
+        self._note_reject(None, now)
+        return not int(over)
+
     # ── 内部（拒绝聚合/告警；与 memory 版同构，复用模块级 _persist_rejected/_dispatch_cap_alert）──
     def _deny(self, denial: Denial, now: float) -> Denial:
         self._note_reject(denial.reason, now)
@@ -793,6 +895,21 @@ def _make_limiter():
 
 # 模块级单例：api.py 各端点共享（workers=1 → 即全局；redis 后端下跨实例共享）
 LIMITER = _make_limiter()
+
+
+def charge_llm_call(user_id: Optional[str], *, weight: int = 1, thinking: bool = False) -> bool:
+    """A2 逐模型调用计费的模块级入口（agent make_model_fn 调用）：actor 键与准入侧
+    同构（``u:<user_id>``，agent 入口强制登录故恒有 user_id）。返回 False=超帽，
+    调用方 fail-closed 收尾 run；本函数自身异常 **fail-open**（不扣减放行）——
+    计费件故障不拖垮在跑 run，上界仍有 run 级 max_turns/token 预算 + ask 准入兜底。"""
+    try:
+        fn = getattr(LIMITER, "charge_llm_call", None)
+        if fn is None:                       # 测试替身/旧单例无此方法 → 不计费
+            return True
+        return bool(fn(f"u:{user_id or 'unknown'}", weight=weight, thinking=thinking))
+    except Exception:   # noqa: BLE001
+        logger.error("charge_llm_call 内部异常（fail-open：本次调用未扣减）", exc_info=True)
+        return True
 
 
 def _set_limiter_for_test(limiter) -> None:

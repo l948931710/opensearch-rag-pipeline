@@ -250,6 +250,24 @@ def test_thinking_maps_model_tier(monkeypatch):
         executor.shutdown()
 
 
+def test_thread_busy_returns_409(monkeypatch, wired):
+    """A1（schema/037）：同 thread 已有非终态 run（uk_thread_active 撞键）→
+    create_run 抛 ThreadBusy → 409「该会话已有回答在进行中」，且并发槽位不泄漏。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
+
+    def _busy(ctx, profile):
+        raise ThreadBusy("thread 已有进行中的 run")
+
+    wired._store.create_run = _busy
+    try:
+        r = _client(_identity()).post("/api/agent/ask", json={"question": "x"})
+        assert r.status_code == 409 and "进行中" in r.json()["detail"]
+        assert wired.active_count() == 0            # submit 异常路径已 _release（槽位不泄漏）
+    finally:
+        api.app.dependency_overrides.clear()
+
+
 # ── B6 对账：decided-but-not-resumed 重驱（reaper 循环消费）──────────────────
 class _ReconcileExecutor:
     def __init__(self, reject=False):

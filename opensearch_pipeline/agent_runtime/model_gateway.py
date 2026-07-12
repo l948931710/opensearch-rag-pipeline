@@ -574,14 +574,37 @@ def _resp_to_turn(resp: ChatResponse) -> ModelTurn:
     return ModelTurn(text=resp.text, usage=resp.usage)
 
 
+# A2：思考档对全局熔断按 thinking_cap_weight 加权（与准入侧 P2-11「cap≈计费量」同口径）
+_THINKING_TIERS = frozenset({"high", "xhigh", "max"})
+
+
+def _charge_model_call(ctx: ExecutionContext, category: str) -> None:
+    """A2 逐模型调用计费（审计复核批次1）：每次真实模型调用**前**扣减全局熔断 +
+    每用户日计数——准入层的一次性 count_llm 只护 ask 边界，多轮 run、空终轮重试与
+    审批续跑段此前对熔断零扣减。先扣后调：超帽的那次调用根本不发出去（账单保护取
+    保守侧），抛 BudgetExceeded → loop→executor 落 failed（状态诚实，同预算超限）。
+    计费件自身故障的 fail-open 在 rate_limiter.charge_llm_call 内部（run 级预算兜底）。
+
+    挂点选这里而非 executor 驱动器：空终轮重试发生在 loop._drive_model 内部、不产生
+    独立事件，executor 只能看到轮边界——per-call 语义唯有 model_fn/gateway 层数得准。"""
+    from opensearch_pipeline import rate_limiter
+    if not rate_limiter.charge_llm_call(getattr(ctx, "user_id", None),
+                                        thinking=category in _THINKING_TIERS):
+        raise BudgetExceeded(
+            "今日模型调用额度已用完（全局或个人日上限），请明天再试或联系管理员")
+
+
 def make_model_fn(gateway: ModelGateway, ctx: ExecutionContext,
                   category: str = "light",
-                  stream: Optional[bool] = None) -> Callable[[List[Msg], List[ToolSpec]], Any]:
+                  stream: Optional[bool] = None,
+                  charge_llm: bool = True) -> Callable[[List[Msg], List[ToolSpec]], Any]:
     """把 Gateway 适配成 DefaultAgentLoop 的 model_fn。
 
     stream=None → 按 RAG_AGENT_STREAM（默认开）。流式模式下 model_fn 返回**生成器**
     （yield StreamDelta，return ModelTurn）——loop._drive_model 双形态识别；provider 没有
     chat_stream 时 complete_stream 自动退化同步（零增量），全部既有测试桩零改动。
+    charge_llm：A2 逐调用计费开关（serving 恒 True）；eval_harness/agent 传 False——
+    本地受控跑批不烧准入配额（251 题×多轮会中途撞每用户日帽把评测打死）。
     """
     if stream is None:
         stream = _stream_enabled()
@@ -596,11 +619,15 @@ def make_model_fn(gateway: ModelGateway, ctx: ExecutionContext,
 
     if not use_stream:
         def _model_fn(msgs: List[Msg], tools: List[ToolSpec]) -> ModelTurn:
+            if charge_llm:
+                _charge_model_call(ctx, category)
             return _resp_to_turn(gateway.complete(ctx, category, _req(msgs, tools)))
         return _model_fn
 
     def _model_stream_fn(msgs: List[Msg], tools: List[ToolSpec]):
         def _gen():
+            if charge_llm:
+                _charge_model_call(ctx, category)   # 生成器体：首个 next() 时（即真调用前）扣
             resp = yield from gateway.complete_stream(ctx, category, _req(msgs, tools))
             return _resp_to_turn(resp)
         return _gen()

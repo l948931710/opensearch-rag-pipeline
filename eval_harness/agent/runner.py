@@ -296,7 +296,9 @@ def _run_case(case: Dict[str, Any], provider_factory, tier: str = "light") -> Di
                                   acl_groups=["production"], roles=["employee"],
                                   channel="console", thread_id=f"eval-{case['id']}",
                                   search_session=session)
-    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))
+    # charge_llm=False（A2）：评测是本地受控跑批，不烧 serving 准入配额——逐调用计费
+    # 若在此生效，251 题×多轮会中途撞 user_per_day 帽把评测打死（账单保护由跑批范围自兜）。
+    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier, charge_llm=False))
     messages = [{"role": "system", "content": _agent_system_prompt()},
                 {"role": "user", "content": case["question"]}]
 

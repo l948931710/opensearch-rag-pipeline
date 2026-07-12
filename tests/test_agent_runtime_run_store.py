@@ -226,3 +226,66 @@ def test_consume_budget_missing_run_returns_zeros(monkeypatch):
     _wire(monkeypatch, state)
     assert RDSRunStore().consume_budget("gone", tokens=10) == {
         "turns_used": 0, "tool_calls_used": 0, "tokens_used": 0}
+
+
+# ── A1 per-thread 串行化（schema/037 uk_thread_active → ThreadBusy）───────────
+def _wire_insert_raises(monkeypatch, exc):
+    """agent_run INSERT 抛 exc 的假连接（1062 撞键路径专用）。"""
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            if "INSERT" in sql and "agent_run" in sql:
+                raise exc
+
+    class _Conn:
+        def __init__(self):
+            self.rolled_back = False
+
+        def cursor(self):
+            return _Cur()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def close(self):
+            pass
+
+    conn = _Conn()
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    return conn
+
+
+def test_create_run_thread_busy_on_uk_thread_active_1062(monkeypatch):
+    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
+    exc = Exception(1062, "Duplicate entry 'conv:staff' for key 'agent_run.uk_thread_active'")
+    conn = _wire_insert_raises(monkeypatch, exc)
+    with pytest.raises(ThreadBusy):
+        RDSRunStore().create_run(_ctx(), "default")
+    assert conn.rolled_back                       # 撞键路径也回滚（不留半事务）
+
+
+def test_create_run_other_1062_not_thread_busy(monkeypatch):
+    """撞的不是 uk_thread_active（如 PRIMARY）→ 原样上抛，不误报会话忙。"""
+    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
+    exc = Exception(1062, "Duplicate entry 'x' for key 'agent_run.PRIMARY'")
+    _wire_insert_raises(monkeypatch, exc)
+    with pytest.raises(Exception) as ei:
+        RDSRunStore().create_run(_ctx(), "default")
+    assert not isinstance(ei.value, ThreadBusy)
+
+
+def test_create_run_non_dup_error_reraises(monkeypatch):
+    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
+    exc = RuntimeError("connection lost")
+    _wire_insert_raises(monkeypatch, exc)
+    with pytest.raises(RuntimeError) as ei:
+        RDSRunStore().create_run(_ctx(), "default")
+    assert not isinstance(ei.value, ThreadBusy)

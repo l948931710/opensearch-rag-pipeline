@@ -49,6 +49,21 @@ class InvalidTransition(ValueError):
     """请求了状态机不允许的迁移（编码错误；并发竞态用 transition 返回 False 表达）。"""
 
 
+class ThreadBusy(RuntimeError):
+    """A1 per-thread 串行化（schema/037）：该 thread 已有非终态（running/suspended/
+    resuming）run——uk_thread_active 生成列唯一键撞 1062。路由层映射 409
+    「该会话已有回答在进行中」；suspended（等审批）同样互斥（non-terminal 一律占坑）。"""
+
+
+def _is_thread_busy_error(exc: BaseException) -> bool:
+    """1062 且撞的是 uk_thread_active 才算 ThreadBusy（PK run_id 的 1062 概率上不存在，
+    但不做键名判定会把任何撞键都误报成会话忙）。"""
+    args = getattr(exc, "args", None) or ()
+    if not args or args[0] != 1062:
+        return False
+    return "uk_thread_active" in str(exc)
+
+
 @dataclass
 class AgentStep:
     kind: str                              # ∈ _STEP_KINDS
@@ -92,6 +107,8 @@ class RDSRunStore:
         """建 run（status=running），返回 run_id（uuid hex，CHAR(32)）。
 
         acl_groups 落 snapshot 仅供审计——resume 时不用它授权，重新解析（铁律 5）。
+        A1（schema/037）：uk_thread_active 撞 1062 → ThreadBusy——同 thread 已有非终态
+        run，并发双 submit 由 DB 唯一键裁决恰一个成功（应用层 check-then-insert 有竞态窗）。
         """
         run_id = uuid.uuid4().hex
         db = _op_db()
@@ -111,8 +128,11 @@ class RDSRunStore:
                 )
             conn.commit()
             return run_id
-        except Exception:
+        except Exception as e:
             conn.rollback()
+            if _is_thread_busy_error(e):
+                raise ThreadBusy(
+                    f"thread {ctx.thread_id!r} 已有进行中的 run（uk_thread_active 串行化）") from e
             raise
         finally:
             conn.close()

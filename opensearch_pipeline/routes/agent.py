@@ -482,7 +482,10 @@ def agent_ask(req: AskRequest, request: Request,
     # （ON=high：qwen3.7-plus+思考预算 · OFF=light：不思考/快/省），端上不暴露模型名。
     # 深思计入与 /api/ask 相同的每日深思配额（同一稀缺资源，不因走 agent 而绕开）。
     thinking = bool(getattr(req, "thinking", False))
-    # 防刷准入：与 /api/ask 同层（在开销与 StreamingResponse 之前拒绝）
+    # 防刷准入：与 /api/ask 同层（在开销与 StreamingResponse 之前拒绝）。count_llm=True
+    # 保留为触顶时的**入口预检**（cap 已满的 ask 在建 run 之前就 503）；run 内每次真实
+    # 模型调用另有逐调用计费（A2，make_model_fn → charge_llm_call），准入这 1 记与首次
+    # 调用轻微重计——宁多勿少（账单保护取保守侧）。
     _enforce_rate_limit(request, identity, scope="ask", thinking=thinking, count_llm=True)
 
     conv = getattr(req, "conversation_id", None)
@@ -511,6 +514,7 @@ def agent_ask(req: AskRequest, request: Request,
     registry, gateway, executor, _run_store = _get_runtime()
     from opensearch_pipeline.agent_runtime import DefaultAgentLoop, ExecutionContext, make_model_fn
     from opensearch_pipeline.agent_runtime.executor import RunRejected
+    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
 
     try:
         from opensearch_pipeline.request_context import get_request_id
@@ -585,6 +589,12 @@ def agent_ask(req: AskRequest, request: Request,
                                  on_complete=_remember, on_failure=_report_failure)
     except RunRejected:
         raise HTTPException(status_code=429, detail="Agent 并发已满，请稍后再试")
+    except ThreadBusy:
+        # A1（schema/037）：同 thread 已有非终态 run（含 suspended 等审批）——DB 唯一键
+        # 裁决的串行化，并发双 submit 恰一个到这里。409 与 429 语义分开：不是容量满，
+        # 是该会话上一问未收尾。
+        raise HTTPException(status_code=409,
+                            detail="该会话已有回答在进行中（或有待审批任务未收尾），请稍后再试")
 
     # U1/U2（重审计 §5，schema/036）：message_id 落 agent_run——审批续跑复用它落库
     # （反馈投票不悬空），run 详情经它从 qa_session_log 取回最终答案。fail-open。
@@ -682,6 +692,10 @@ def agent_approve(req: ApproveRequest, request: Request,
         raise HTTPException(status_code=404, detail="Not Found")
     if identity is None:
         raise HTTPException(status_code=401, detail="需要登录")
+    # A2 复核拍板：/approve 准入**显式豁免** count_llm——审批是治理动作（撤回/拒绝必须
+    # 恒可达，触顶时 503 审批=制造审批黑洞等过期），而续跑段的真实模型消耗已由
+    # **逐模型调用计费**（make_model_fn → rate_limiter.charge_llm_call）覆盖：超帽的
+    # 续跑会在下一次模型调用前 BudgetExceeded → run 诚实落 failed。
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
 
     registry, gateway, executor, run_store = _get_runtime()

@@ -667,3 +667,51 @@ def test_b6_stale_resuming_resets_to_suspended_not_failed():
         assert st == "suspended", f"stale resuming 应回边 suspended（可重驱），实为 {st}"
     finally:
         _cleanup_run(run_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A1 per-thread 串行化（schema/037 uk_thread_active，审计复核批次1）
+# ─────────────────────────────────────────────────────────────────────────────
+def _has_active_thread_col():
+    try:
+        conn = _local_operation_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema=DATABASE() AND table_name='agent_run' "
+                        "AND column_name='active_thread'")
+            ok = cur.fetchone()[0] == 1
+        conn.close()
+        return ok
+    except Exception:
+        return False
+
+
+@skipif_no_agent_db
+@pytest.mark.skipif(not _has_active_thread_col(), reason="本地库未 apply schema/037")
+def test_a1_thread_serialization_unique_key():
+    """A1（schema/037）：同 thread 第二个非终态 run 被 uk_thread_active 拒（ThreadBusy）；
+    suspended（等审批）同样占坑（non-terminal 一律互斥的拍板语义）；到终态后让位可再建。"""
+    from opensearch_pipeline.agent_runtime import ExecutionContext
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore, ThreadBusy
+    store = RDSRunStore()
+    tid = "a1-" + uuid.uuid4().hex[:8]
+
+    def _a1_ctx():
+        return ExecutionContext.create(request_id="a1", user_id="e2e", acl_groups=["g"],
+                                       roles=["employee"], channel="console", thread_id=tid)
+
+    r1 = store.create_run(_a1_ctx(), "default")
+    r3 = None
+    try:
+        with pytest.raises(ThreadBusy):
+            store.create_run(_a1_ctx(), "default")           # running 占坑
+        assert store.transition(r1, "running", "suspended")
+        with pytest.raises(ThreadBusy):
+            store.create_run(_a1_ctx(), "default")           # suspended 同样占坑
+        assert store.transition(r1, "suspended", "cancelled")
+        r3 = store.create_run(_a1_ctx(), "default")          # 终态 active_thread=NULL 让位
+        assert r3 and r3 != r1
+    finally:
+        for rid in (r1, r3):
+            if rid:
+                _cleanup_run(rid)
