@@ -6,7 +6,10 @@
 # ═══════════════════════════════════════════════════════════════
 
 # ── Stage 1: console 前端构建（Vite/Vue3 → opensearch_pipeline/webconsole/next-dist）──
-FROM node:20-slim AS console-build
+# 基础镜像按 digest 固定（2026-07-11 重审计 §6 供应链：tag 可被上游改写，digest 不可）。
+# 升级基础镜像：docker buildx imagetools inspect node:20-slim 取新 digest，连同下方
+# python digest 一起换、一起过 make test + 镜像冒烟。
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS console-build
 
 WORKDIR /build/console-app
 # 依赖清单先拷（层缓存：lock 不变不重装）
@@ -18,7 +21,7 @@ RUN mkdir -p /build/opensearch_pipeline/webconsole \
     && npm run build
 
 # ── Stage 2: python 运行时 ────────────────────────────────────────
-FROM python:3.11-slim AS base
+FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3 AS base
 
 # 部署版本指纹（canary 校验 / 回滚确认）：构建期烤入 git 短 SHA，运行期经 RAG_GIT_SHA 暴露给
 # versions.git_commit() → /api/version。打包步骤传 --build-arg GIT_SHA=$(git rev-parse --short HEAD)；
@@ -32,11 +35,17 @@ ENV RAG_GIT_SHA=$GIT_SHA
 
 WORKDIR /app
 
-# 先拷贝依赖描述文件，利用 Docker 层缓存
-COPY pyproject.toml ./
+# 先拷贝依赖清单，利用 Docker 层缓存
+COPY requirements-prod.lock ./
 
-# 安装 api + production 依赖（不装 dev/test/ocr）
-RUN pip install --no-cache-dir ".[api,production]"
+# 依赖装自带 hash 的 lock（重审计 §6：pyproject 全 >= 无上界，直接 resolve = 每次构建
+# 吃最新上游，供应链投毒/破坏性升级零防线）。lock 由
+#   uv pip compile pyproject.toml --extra api --extra production --generate-hashes \
+#     --python-version 3.11 --python-platform x86_64-unknown-linux-gnu -o requirements-prod.lock
+# 生成；--require-hashes 逐包验 sha256，--no-deps 禁止 pip 自行拉未锁传递依赖。
+# 包代码不装进 site-packages：uvicorn 以 WORKDIR /app 起，opensearch_pipeline 从 cwd 导入
+#（与旧「空包 + extras」形态运行语义一致）。
+RUN pip install --no-cache-dir --require-hashes --no-deps -r requirements-prod.lock
 
 # 拷贝应用代码 + 前端产物（来自 node 构建阶段）
 COPY opensearch_pipeline/ ./opensearch_pipeline/
