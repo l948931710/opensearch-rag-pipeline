@@ -196,7 +196,7 @@ def _build_runtime(provider_factory, case):
     return registry, executor, gateway
 
 
-def _run_case(case: Dict[str, Any], provider_factory) -> Dict[str, Any]:
+def _run_case(case: Dict[str, Any], provider_factory, tier: str = "light") -> Dict[str, Any]:
     import opensearch_pipeline.retriever as retriever_mod
     from opensearch_pipeline.agent_runtime import (
         DefaultAgentLoop, ExecutionContext, make_model_fn)
@@ -234,7 +234,7 @@ def _run_case(case: Dict[str, Any], provider_factory) -> Dict[str, Any]:
                                   acl_groups=["production"], roles=["employee"],
                                   channel="console", thread_id=f"eval-{case['id']}",
                                   search_session=session)
-    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, "light"))
+    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))
     messages = [{"role": "system", "content": _agent_system_prompt()},
                 {"role": "user", "content": case["question"]}]
 
@@ -347,20 +347,20 @@ def _gate(metrics: Dict[str, Any], baseline: Dict[str, Any],
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 def run(cases_path: Path = DEFAULT_CASES, provider: str = "live",
-        only: Optional[List[str]] = None) -> Dict[str, Any]:
+        only: Optional[List[str]] = None, tier: str = "light") -> Dict[str, Any]:
     cases = json.loads(cases_path.read_text(encoding="utf-8"))["cases"]
     if only:
         cases = [c for c in cases if c["id"] in set(only) or c["family"] in set(only)]
     factory = None if provider == "live" else _ScriptedIdealProvider
     scores = []
     for i, c in enumerate(cases, 1):
-        out = _run_case(c, factory)
+        out = _run_case(c, factory, tier)
         sc = _score(c, out)
         scores.append(sc)
         flag = "✓" if not sc.get("error") else "✗"
         print(f"  [{i:2d}/{len(cases)}] {flag} {c['id']} ({c['family']}) {out['latency_s']}s")
     metrics = _aggregate(scores)
-    return {"provider": provider, "model_tier": "light", "cases": len(cases),
+    return {"provider": provider, "model_tier": tier, "cases": len(cases),
             "metrics": metrics, "scores": scores}
 
 
@@ -374,7 +374,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--delta", type=float, default=DEFAULT_DELTA)
     ap.add_argument("--freeze-baseline", default=None, metavar="REPORT_JSON",
                     help="把一份已接受的 report 冻结为基线后退出")
+    ap.add_argument("--tier", choices=("light", "high", "xhigh", "max"), default="light",
+                    help="模型档（对照实验用）；--gate 仅限 light——基线冻在 light 臂")
     args = ap.parse_args(argv)
+
+    if args.gate and args.tier != "light":
+        print(f"⛔ --gate 只能在 light 臂出闸（基线冻在 light），当前 --tier={args.tier}")
+        return 2
 
     if args.freeze_baseline:
         rep = json.loads(Path(args.freeze_baseline).read_text(encoding="utf-8"))
@@ -386,8 +392,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     only = [s.strip() for s in args.only.split(",")] if args.only else None
-    print(f"agent 评测门：provider={args.provider} cases={args.cases}")
-    report = run(Path(args.cases), args.provider, only)
+    print(f"agent 评测门：provider={args.provider} tier={args.tier} cases={args.cases}")
+    report = run(Path(args.cases), args.provider, only, tier=args.tier)
     m = report["metrics"]
     print("\n── 指标 ──")
     for k in (*GATED_METRICS, *HARD_INVARIANTS, "error_count"):
