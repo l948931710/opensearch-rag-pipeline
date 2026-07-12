@@ -375,6 +375,14 @@ def reconcile_stranded_versions() -> dict:
                         SET index_status = '{DocVersionIndexStatus.SUCCESS}'
                         WHERE doc_id = %s AND version_no = %s
                     """, (doc_id, version_no))
+                    # 版本级 supersede 兜底（与 node_deactivate_old_chunks 收尾同语义，2026-07-12
+                    # 双 active 审计缺口）：新版本确证全量 INDEXED、旧 chunk 已停用后，同事务把
+                    # 更旧的 active 版本行降级 superseded。CAS on status='active' 幂等、不碰 retired。
+                    cursor.execute("""
+                        UPDATE document_version
+                        SET status = 'superseded'
+                        WHERE doc_id = %s AND version_no < %s AND status = 'active'
+                    """, (doc_id, version_no))
                 conn.commit()
                 result["success"] += 1
                 logger.info(

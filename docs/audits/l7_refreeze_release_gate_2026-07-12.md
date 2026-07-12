@@ -115,6 +115,16 @@ vs 基线 0.9273**——40% 正例的 gold 文档 top-10 完全缺席（能命�
 - **附带账面缺口（独立问题）**：document_version **双 active 485/485**——重灌链的
   版本级 supersede 整体没跑（chunk 级停用已跑，不产生双服务，但台账脏）。修法同
   2026-06-21 stale-HOLD reconcile（status-only，预览→commit）。
+  **2026-07-12 追记（根因修复已落代码）**：系统性缺位实锤——ingest 链所有 INSERT
+  均写 status='active'（register/console 版本 bump/contribution），而全链**没有任何
+  管道路径**降级旧行（'superseded' 此前只存在于一次性脚本）；schema 也无「单 active」
+  约束（唯一键只有 uk_doc_version）。已在 stage-3 收尾补齐：node_deactivate_old_chunks
+  收尾事务内、仅对 SUCCESS 组文档，把 version_no < 当前 且 status='active' 的旧版本行
+  CAS 置 'superseded'（与「先索引后停用」同序：新版本全量 INDEXED + 旧 chunk 停用之后；
+  FAILED/LIMIT-推迟不碰；幂等、不触 retired 与 PENDING_DELETE 握手）；
+  reconcile_stranded_versions 兜底同语义。单测 tests/test_version_supersede.py（6 例：
+  单 active 不变量重放/幂等/FAILED 与推迟排除/兜底/失败回滚不写）。部署 SAE 后新重灌
+  不再产生双 active；存量清账见下方出口③。
 
 **结论修正链**：
 - 7-06「点查是唯一可靠存在性判定」需修正——**点查只证 doc store 存在；可检索性必须
@@ -127,8 +137,15 @@ vs 基线 0.9273**——40% 正例的 gold 文档 top-10 完全缺席（能命�
 1. **治愈 485 盲文档**（生产写，四步）：①验证性单行重推（cmd=add 同 PK 整行替换）
    → 自查询复检——先证明重推能恢复索引再上全量；②全量 `rebuild_from_rds.py --docs
    <485 列表> --commit`（当日 PROD-RW token）→ stage-3 重推（小 batch）→ **自查询
-   抽样终验**（点查/枚举不再作终验）；③版本台账收尾：485 docs 旧 active 版本 →
-   superseded（status-only，预览→commit）；④阿里工单（7-06 遗留必提）：附
+   抽样终验**（点查/枚举不再作终验）；③版本台账收尾（scratch/
+   version_supersede_reconcile_20260712.py，status-only，预览→commit，自动快照可回滚）
+   ——**两批分开收，先窗口后存量**：③a `--docs-file <485 清单>` 收 7-06 窗口批；
+   ③b `--all` 收窗口外存量（~104 docs，6-22 MARKETING 批等）——存量批未核过 RDS
+   状态，脚本已加 keep 健康闸（keep 版本无 active INDEXED chunk 的 doc 本轮 HOLD、
+   单独打印，人工复核后另行处置；AFTER 校验按 HOLD 数计预期残差）。两批各自
+   --check 预览 → Sam 逐次授权 --commit（当日 PROD-RW token）。注意：③b 之前应
+   先部署含 stage-3 版本级 supersede 根修的包（未部署也不阻塞③，只是此后新重灌
+   会继续产生双 active、需再跑存量批）；④阿里工单（7-06 遗留必提）：附
    store-可达/索引-不可达 行号样本 + 时间窗 + 表名。防复发：周期 reconcile 加
    自查询抽样通道 + 重灌 runbook 加"推后自查询终验"。doc 清单已备
    （scratchpad/blind485_docids.txt，重跑 SQL 在上文）。
