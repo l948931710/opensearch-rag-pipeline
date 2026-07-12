@@ -180,10 +180,19 @@ class ThreadedRunExecutor:
                 args = (outcome.edited_args if isinstance(outcome, Edited)
                         else pending.get("arguments", {}))
                 meta = approval_meta or {}
+                # P0-B：接了 approval_store 时，批准/改参凭据必须对应**已落库的
+                # approval_decision 行**（同向 + final_args_digest 一致）——读失败/缺行/
+                # 不一致一律拒绝续跑（认领回滚 suspended，可重试/对账），堵住「读失败/
+                # 记录缺失时 kb_admin 一批准即产生无落库决策支撑的 grant」。
+                dec = self._verify_persisted_decision(
+                    run_id, outcome, args_digest=digest(args),
+                    request_id=meta.get("request_id"))
                 self._approvals[f"{run_id}:{pending['call_id']}"] = ApprovalGrant(
                     outcome=outcome, tool_name=pending["tool_name"], args_digest=digest(args),
-                    request_id=meta.get("request_id"), decided_by=meta.get("decided_by"),
-                    approver_scope=meta.get("approver_scope"))
+                    request_id=meta.get("request_id") or (dec or {}).get("request_id"),
+                    decided_by=(dec or {}).get("decided_by") or meta.get("decided_by"),
+                    approver_scope=meta.get("approver_scope"),
+                    decision_id=(dec or {}).get("decision_id"))
             if not self._store.transition(run_id, "resuming", "running"):      # ③ 接手
                 raise RunRejected(f"run {run_id} resuming→running 失败（并发/迟到）")
             claimed = False                               # 已交棒 running：失败恢复归驱动器
@@ -199,6 +208,37 @@ class ThreadedRunExecutor:
                 self._safe_transition(run_id, "resuming", "suspended")   # 回边：保住可重试
             self._release()
             raise
+
+    def _verify_persisted_decision(self, run_id: str, outcome, *, args_digest: str,
+                                   request_id: Optional[str] = None) -> Optional[dict]:
+        """P0-B「无落库决策的 grant」：接了 approval_store 时，Approved/Edited 续跑必须能
+        锚定一行**已持久化的 approval_decision**——同向（decision==outcome.kind）且
+        final_args_digest 与将执行参数摘要完全一致。任何一环失败（读库异常/请求行缺失/
+        决定行缺失/方向不符/摘要不符/031 前无摘要历史行）都 RunRejected fail-closed：
+        调用方回滚认领（run 留在 suspended），由重试或人工对账处置，绝不带疑执行。
+        未接 approval_store（直驱单测/简化桩）→ None 跳过——持久化契约只在持久化在场时强制。"""
+        if self._approval_store is None:
+            return None
+        try:
+            rid = request_id
+            if not rid:
+                latest = self._approval_store.get_latest_by_run(run_id)
+                rid = (latest or {}).get("request_id")
+            dec = self._approval_store.get_decision(rid) if rid else None
+        except Exception as e:   # noqa: BLE001 — 审批事实读不出 → 宁停不批
+            raise RunRejected(f"审批决定校验读库失败，拒绝续跑（fail-closed）: {e}")
+        if not rid:
+            raise RunRejected("该 run 无审批请求记录，拒绝续跑（无决策依据）")
+        if not dec:
+            raise RunRejected("无已落库的审批决定行，拒绝续跑（宁停不批）")
+        if dec.get("decision") != outcome.kind:
+            raise RunRejected(
+                f"审批决定方向不符（库={dec.get('decision')}，请求={outcome.kind}），拒绝续跑")
+        if not dec.get("final_args_digest"):
+            raise RunRejected("审批决定缺最终参数摘要（早于 schema/031），拒绝自动续跑")
+        if dec["final_args_digest"] != args_digest:
+            raise RunRejected("将执行参数与已落库审批决定不一致，拒绝续跑（改参重放被拒）")
+        return dec
 
     @staticmethod
     def _verify_checkpoint(cp) -> None:
@@ -230,6 +270,11 @@ class ThreadedRunExecutor:
         turns_counted = int((base or {}).get("turns_used", 0))       # turn_index 去重，同批多 call 只计一次
         tool_calls_used = int((base or {}).get("tool_calls_used", 0))
         tokens_used = int((base or {}).get("tokens_used", 0))
+        # P0-A：本执行段各次检索的 chunks artifacts（与 SSE 侧 per_call_chunks 同构）——
+        # RunCompleted 时随 on_complete 交给完成侧回调落 qa_session_log.retrieved_docs。
+        # 审批续跑无 SSE 消费者，sources 不在完成侧落库即彻底丢失（resume 段只含
+        # 恢复后的检索；挂起前批次已在原 /ask SSE 实时下发过）。
+        retrieved_chunks: list = []
         try:
             ev = next(gen)
             while True:
@@ -276,6 +321,11 @@ class ThreadedRunExecutor:
                         elapsed_ms=int((time.monotonic() - _t0) * 1000),
                         turn_index=ev.turn_index,
                         artifacts=getattr(result, "artifacts", None)))   # 进程内旁路（exclude 不序列化）
+                    _arts = getattr(result, "artifacts", None) or {}
+                    if _arts.get("chunks"):
+                        retrieved_chunks.append({
+                            "chunks": list(_arts["chunks"]),
+                            "included": list(_arts.get("included") or _arts["chunks"])})
                     # 去重键【送达点提交】（评审 R②-4）：只有成功送达模型的结果才登记
                     # seen——超时孤儿/义务扣留的结果永不被消费，keys 永不提交；所有写
                     # 收敛到本驱动线程（duck-typed，executor 不 import agent_tools）。
@@ -313,7 +363,7 @@ class ThreadedRunExecutor:
                     self._record_model_step(run_id, turns_counted, usage=ev.usage, final=True)
                     self._budget_used(run_id, turns=1, tokens=ev.usage.total)
                     self._safe_transition(run_id, "running", "succeeded")
-                    self._notify_complete(handle, ev)
+                    self._notify_complete(handle, ev, retrieved_chunks)
                     handle._emit(ev)
                     break
                 handle._emit(ev)
@@ -338,12 +388,27 @@ class ThreadedRunExecutor:
             self._release()
 
     @staticmethod
-    def _notify_complete(handle: RunHandle, ev: RunCompleted) -> None:
+    def _notify_complete(handle: RunHandle, ev: RunCompleted,
+                         retrieved: Optional[list] = None) -> None:
+        """retrieved=本执行段各检索批次的 chunks artifacts（P0-A sources 落库）。
+        回调双形态兼容：能收第二参的（(final_text, retrieved)）给两参；既有单参回调
+        （历史测试/简化桩）照旧只给 final_text——签名探测失败按单参处理。"""
         cb = handle._on_complete
         if cb is None:
             return
         try:
-            cb(ev.final_text)
+            two_arg = False
+            try:
+                import inspect
+                params = inspect.signature(cb).parameters
+                two_arg = (len(params) >= 2
+                           or any(p.kind == p.VAR_POSITIONAL for p in params.values()))
+            except (TypeError, ValueError):
+                two_arg = False
+            if two_arg:
+                cb(ev.final_text, retrieved)
+            else:
+                cb(ev.final_text)
         except Exception:   # noqa: BLE001 — 记忆/落库失败不影响回答（辅助失败不破主答案）
             import logging
             logging.getLogger(__name__).warning("run on_complete 回调失败", exc_info=True)

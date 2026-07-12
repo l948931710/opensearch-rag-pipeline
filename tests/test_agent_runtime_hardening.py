@@ -271,6 +271,179 @@ def test_resume_rejects_tampered_checkpoint_and_rolls_back():
     ex.shutdown(wait=False)
 
 
+# ═════════════════ P0-B grant 必须锚定已落库的 approval_decision ═════════════════
+
+
+class _ResumeStore:
+    """resume 路径最小假 run_store：带 pending_call 的 checkpoint + 状态机记录。"""
+
+    def __init__(self, args=None):
+        self.transitions = []
+        blob, digest = encode_checkpoint(
+            [{"role": "user", "content": "q"}],
+            pending_call={"call_id": "c1", "tool_name": "w", "arguments": args or {"qty": 7}},
+            turn=0)
+        self._cp = SimpleNamespace(checkpoint_id="cp1", state_blob=blob, state_digest=digest)
+
+    def transition(self, run_id, frm, to):
+        self.transitions.append((frm, to))
+        return True
+
+    def load_latest_checkpoint(self, run_id):
+        return self._cp
+
+    def consume_budget(self, run_id, **kw):
+        return {}
+
+
+class _DecisionStore:
+    """approval_store 假件：get_latest_by_run / get_decision 可脚本化，读可抛。"""
+
+    def __init__(self, decision=None, request_id="req1", raises=False):
+        self.decision = decision
+        self.request_id = request_id
+        self.raises = raises
+
+    def get_latest_by_run(self, run_id):
+        if self.raises:
+            raise RuntimeError("db down")
+        return {"request_id": self.request_id} if self.request_id else None
+
+    def get_decision(self, request_id):
+        if self.raises:
+            raise RuntimeError("db down")
+        return dict(self.decision) if self.decision else None
+
+
+def _resume_with(astore, args=None, outcome=None):
+    import pytest  # noqa: F401
+
+    from opensearch_pipeline.agent_runtime.executor import ThreadedRunExecutor
+    store = _ResumeStore(args=args)
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("x"),
+                             max_concurrent=2, approval_store=astore)
+    try:
+        ex.resume("run1", _ctx(), outcome or Approved(),
+                  DefaultAgentLoop(lambda m, t: ModelTurn(text="a")), [])
+    finally:
+        ex.shutdown(wait=False)
+    return store
+
+
+def test_grant_requires_persisted_decision_missing_row_rejected():
+    """接了 approval_store 但库里无 decision 行 → RunRejected + 回滚 suspended
+    （堵「读失败/缺行时 kb_admin 一批准即产生无落库决策支撑的 grant」）。"""
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.executor import RunRejected
+    with pytest.raises(RunRejected, match="决定行"):
+        _resume_with(_DecisionStore(decision=None))
+
+
+def test_grant_requires_persisted_decision_read_failure_rejected():
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.executor import RunRejected
+    with pytest.raises(RunRejected, match="fail-closed"):
+        _resume_with(_DecisionStore(raises=True))
+
+
+def test_grant_rejects_direction_mismatch_and_digest_mismatch():
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.executor import RunRejected
+    from opensearch_pipeline.agent_runtime.tool_executor import digest as _digest
+    # 方向不符：库=rejected_feedback，请求=approved
+    with pytest.raises(RunRejected, match="方向不符"):
+        _resume_with(_DecisionStore(decision={"decision": "rejected_feedback",
+                                              "final_args_digest": _digest({"qty": 7})}))
+    # 摘要不符：库批的是 qty=7，checkpoint pending 参数被换成 qty=999
+    with pytest.raises(RunRejected, match="不一致"):
+        _resume_with(_DecisionStore(decision={"decision": "approved",
+                                              "final_args_digest": _digest({"qty": 7})}),
+                     args={"qty": 999})
+    # 031 前历史行（无 final_args_digest）：宁停不猜
+    with pytest.raises(RunRejected, match="schema/031"):
+        _resume_with(_DecisionStore(decision={"decision": "approved",
+                                              "final_args_digest": None}))
+
+
+def test_grant_with_matching_persisted_decision_binds_decision_id():
+    """同向 + 摘要一致 → 放行；grant 绑 decision_id/decided_by（库内权威行）。"""
+    from opensearch_pipeline.agent_runtime.executor import ThreadedRunExecutor
+    from opensearch_pipeline.agent_runtime.tool_executor import digest as _digest
+    astore = _DecisionStore(decision={"decision": "approved", "decision_id": "dec9",
+                                      "final_args_digest": _digest({"qty": 7}),
+                                      "decided_by": "admin9", "request_id": "req1"})
+    store = _ResumeStore()
+    approvals = {}
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("x"),
+                             max_concurrent=2, approvals=approvals, approval_store=astore)
+    try:
+        h = ex.resume("run1", _ctx(), Approved(),
+                      DefaultAgentLoop(lambda m, t: ModelTurn(text="a")), [])
+        list(h.events())                                    # 排空（后台驱动完成）
+    finally:
+        ex.shutdown(wait=True)
+    # grant 在 adjudicator 未消费（本测试 adjudicator 直接放行）→ 仍在 approvals 里可断言
+    grant = approvals.get("run1:c1")
+    assert grant is not None
+    assert grant.decision_id == "dec9" and grant.decided_by == "admin9"
+    assert ("resuming", "running") in store.transitions
+
+
+# ═════════════════ P0-A sources 随完成侧回调落库 ═════════════════
+
+
+def test_on_complete_receives_retrieved_chunks_two_arg_callback():
+    """executor 收集工具 artifacts.chunks → RunCompleted 时交给能收第二参的 on_complete
+    （P0-A：审批续跑无 SSE 消费者，sources 不随完成侧落库即彻底丢失）；单参回调照旧。"""
+    from opensearch_pipeline.agent_runtime.executor import ThreadedRunExecutor
+
+    chunks = [{"chunk_id": "ck1", "doc_id": "D1", "chunk_text": "内容"}]
+
+    def _adjudicate(ctx, ev):
+        r = ToolResult.text_ok("找到 1 条")
+        r.artifacts = {"chunks": chunks, "included": chunks}
+        return r
+
+    class _Store:
+        def transition(self, run_id, frm, to):
+            return True
+
+        def consume_budget(self, run_id, **kw):
+            return {}
+
+    turns = [ModelTurn(tool_calls=[ProposedCall(call_id="c1", tool_name="kb",
+                                                arguments={"q": "x"})]),
+             ModelTurn(text="答案")]
+    got = {}
+
+    def _on_complete(final_text, retrieved=None):
+        got["text"], got["retrieved"] = final_text, retrieved
+
+    ex = ThreadedRunExecutor(_Store(), _adjudicate, max_concurrent=2)
+    # 假 store 无 create_run：直接驱动 submit 需要 create_run——补上
+    _Store.create_run = lambda self, ctx, profile: "run-src"
+    _Store.append_step = lambda self, run_id, step: 1
+    h = ex.submit(_ctx(), DefaultAgentLoop(_scripted(turns)),
+                  [{"role": "user", "content": "q"}], [], on_complete=_on_complete)
+    list(h.events())
+    ex.shutdown(wait=True)
+    assert got["text"] == "答案"
+    assert got["retrieved"] and got["retrieved"][0]["included"][0]["chunk_id"] == "ck1"
+
+    # 单参回调（既有契约）：不炸、正常收文本
+    got2 = {}
+    ex2 = ThreadedRunExecutor(_Store(), _adjudicate, max_concurrent=2)
+    h2 = ex2.submit(_ctx(), DefaultAgentLoop(_scripted(list(turns))),
+                    [{"role": "user", "content": "q"}], [],
+                    on_complete=lambda text: got2.setdefault("text", text))
+    list(h2.events())
+    ex2.shutdown(wait=True)
+    assert got2["text"] == "答案"
+
+
 # ═════════════════ P0-E uncertain 状态机 ═════════════════
 
 

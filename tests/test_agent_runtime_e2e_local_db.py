@@ -481,10 +481,15 @@ def test_ws3_suspend_then_approve_executes():
         assert _fetch("SELECT COUNT(*) FROM agent_step WHERE run_id=%s AND kind='approval'",
                       (run_id,))[0][0] >= 1                  # 审批点入步骤序
         # schema/025：挂起侧落 approval_request(pending)，scope=发起人主属部门（四表回放链第一环）
-        areq = _fetch("SELECT status, approver_scope, requested_by, tool_name "
+        areq = _fetch("SELECT status, approver_scope, requested_by, tool_name, request_id "
                       "FROM approval_request WHERE run_id=%s", (run_id,))
         assert areq and areq[0][0] == "pending" and areq[0][1] == "production"
         assert areq[0][2] == "e2e" and areq[0][3] == "u8_writeback"
+        # P0-B：先落 approval_decision 再 resume——executor 现在强制"批准/改参续跑必须锚定
+        # 已落库决定行"（无决定行的直批在下一个测试单独断言被拒）
+        from opensearch_pipeline.agent_runtime.approval_store import RDSApprovalStore
+        assert RDSApprovalStore().decide(areq[0][4], decision="approved",
+                                         decided_by="admin_e2e") == "accepted"
         # 批准 → 续跑执行
         ctx2 = _ws3_ctx()
         h2 = executor.resume(run_id, ctx2, Approved(), _ws3_loop(gateway, ctx2), reg.list_specs(ctx2))
@@ -494,6 +499,35 @@ def test_ws3_suspend_then_approve_executes():
         assert _fetch("SELECT status FROM agent_run WHERE run_id=%s", (run_id,))[0][0] == "succeeded"
         inv = {s for (s,) in _fetch("SELECT status FROM tool_invocation WHERE run_id=%s", (run_id,))}
         assert "pending_approval" in inv and "succeeded" in inv   # 挂起记 pending + 批准执行 succeeded
+    finally:
+        executor.shutdown()
+        if run_id:
+            _cleanup_run(run_id)
+
+
+@skipif_no_agent_db
+def test_ws3_resume_without_persisted_decision_rejected():
+    """P0-B：真库路径上，无 approval_decision 行的 Approved resume 被拒 + run 回边 suspended
+    ——审批闭环的最后一道防线在 executor（routes 被绕过/直接调用也堵得住）。"""
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.approval import Approved
+    from opensearch_pipeline.agent_runtime.executor import RunRejected
+    counter = {"n": 0}
+    reg = _ws3_registry(counter)
+    executor, gateway = _ws3_runtime(reg, _grant_writeback_policy(),
+                                     [_tc("u8_writeback", {"qty": 7}), _final("已完成写回")])
+    run_id = None
+    try:
+        run_id, ev1 = _ws3_suspend(executor, gateway, reg)
+        assert "RunSuspended" in ev1
+        ctx2 = _ws3_ctx()
+        with pytest.raises(RunRejected, match="决定行"):
+            executor.resume(run_id, ctx2, Approved(), _ws3_loop(gateway, ctx2),
+                            reg.list_specs(ctx2))
+        assert counter["n"] == 0                            # 工具从未执行
+        assert _fetch("SELECT status FROM agent_run WHERE run_id=%s",
+                      (run_id,))[0][0] == "suspended"       # 认领已回滚，可走正规审批重试
     finally:
         executor.shutdown()
         if run_id:

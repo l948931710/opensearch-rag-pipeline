@@ -20,7 +20,7 @@ import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from opensearch_pipeline.api import (  # noqa: E402  顶层 from-import api 共享件（同 console.py 惯例）
@@ -224,6 +224,28 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _flatten_retrieved(per_call_chunks) -> Optional[list]:
+    """union 各检索批次的 included chunks（与 _sources_frame 同一去重键）→
+    qa_session_log.retrieved_docs（P0-A：审批续跑无 SSE 消费者，sources 不随
+    完成侧落库即彻底丢失——发起人从会话历史看不到答案依据）。fail-open。"""
+    if not per_call_chunks:
+        return None
+    try:
+        merged, seen = [], set()
+        for call in per_call_chunks:
+            chunks = call.get("included") if isinstance(call, dict) else call
+            for c in chunks or []:
+                key = c.get("chunk_id") or (c.get("doc_id"), (c.get("chunk_text") or "")[:80])
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(c)
+        return merged or None
+    except Exception:   # noqa: BLE001 — sources 落库失败不拦答案
+        logger.warning("retrieved_docs 扁平化失败（忽略）", exc_info=True)
+        return None
+
+
 def _sources_frame(per_call_chunks: list) -> Optional[dict]:
     """union 各检索批次 → 与 /api/ask/stream 同源的 sources 帧：`_extract_sources` 同一
     计算 + **SourceInfo 字段集收口**（SSE 没有 response_model 那层，原样转发会把内部
@@ -294,7 +316,8 @@ def _content_blocks_frame(final_text: str, per_call_chunks: list) -> Optional[di
 
 
 def _stream_events(handle, session_id: str, message_id: str):
-    """把一个 run 的事件流转成 SSE 帧（/ask 与 /approve 共用）。RunSuspended→approval 帧。
+    """把一个 run 的事件流转成 SSE 帧（/ask 专用；/approve 已改 202 回执不再挂 SSE 消费者，
+    P0-A）。RunSuspended→approval 帧。
 
     ⚠️ 落库/记忆 append **不在本函数**：挂在 SSE 消费侧会在客户端断连（GeneratorExit）时
     整段被跳过、答案静默丢失——已移到 run 完成侧（executor.submit/resume 的 on_complete）。
@@ -438,8 +461,9 @@ def agent_ask(req: AskRequest, request: Request,
                 + snapshot.messages
                 + [{"role": "user", "content": req.question}])
 
-    def _remember(final_text: str) -> None:
-        """run 完成侧回调（executor 调，非 SSE 消费侧——客户端断连也照常落库）。"""
+    def _remember(final_text: str, retrieved=None) -> None:
+        """run 完成侧回调（executor 调，非 SSE 消费侧——客户端断连也照常落库）。
+        retrieved=executor 收集的各检索批次 artifacts（P0-A sources 落库）。"""
         from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
         if _budget_enabled():
             # 预算模式引入 [文档N] header → 落库/记忆前清内部编号 + 空 <think> 残壳
@@ -452,7 +476,7 @@ def agent_ask(req: AskRequest, request: Request,
         log_qa_session(session_id=thread_id, message_id=message_id, user_id=identity.user_id,
                        user_dept=getattr(identity, "dept", None), query_text=req.question,
                        answer_text=final_text, conversation_id=conv, answer_status="SUCCESS",
-                       model_name="agent")
+                       model_name="agent", retrieved_docs=_flatten_retrieved(retrieved))
 
     def _report_failure(err: str) -> None:
         """run 失败侧回调：落 AGENT_ERROR 行（此前只记 SUCCESS——agent 失败对运维零可见、
@@ -546,11 +570,14 @@ def _authorize_approver(identity: Identity, run: dict, areq: Optional[dict],
 @router.post("/api/agent/approve")
 def agent_approve(req: ApproveRequest, request: Request,
                   identity: Optional[Identity] = Depends(current_identity)):
-    """WS3：对挂起 run 提交审批决定 → resume 续跑，SSE 复用 /ask 帧格式。
+    """WS3：对挂起 run 提交审批决定 → resume 异步续跑，返回 **202 受理回执**（P0-A：
+    答案绝不 SSE 回流审批人——审批权 ≠ 发起人部门知识的读权；结果 durable 落发起人
+    会话记忆 + qa_session_log，发起人经会话历史/运行中心取回）。
 
     审批闭环（schema/025）：职责分离（发起人只能撤回，批准须 kb_admin / approver_scope 覆盖的
     dept_admin，DB 现查）+ 决定持久化（approval_request CAS pending→处置 + approval_decision
-    幂等键）+ resume 崩溃可重复（decision 已落库、run 回滚 suspended 后重试按「已决同向」续跑）。"""
+    幂等键；P0-B：请求行读失败 503、缺失 409 fail-closed，executor 建 grant 前再验决定行）
+    + resume 崩溃可重复（decision 已落库、run 回滚 suspended 后重试按「已决同向」续跑）。"""
     if not _agent_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
     if identity is None:
@@ -573,11 +600,17 @@ def agent_approve(req: ApproveRequest, request: Request,
         raise HTTPException(status_code=400, detail="审批 outcome 格式非法")
 
     approval_store = _get_approval_store()
-    areq = None
     try:
         areq = approval_store.get_latest_by_run(req.run_id)
-    except Exception:   # noqa: BLE001 — 读失败按「请求行缺失」处理（授权侧 fail-closed 到 kb_admin）
-        logger.warning("approval_request 读取失败（授权收敛到 kb_admin）", exc_info=True)
+    except Exception:   # noqa: BLE001 — P0-B fail-closed：审批事实读不出 → 拒绝服务，绝不盲批
+        logger.error("approval_request 读取失败，拒绝审批（fail-closed）", exc_info=True)
+        raise HTTPException(status_code=503, detail="审批存储不可用，请稍后重试")
+    if areq is None:
+        # P0-B：无审批请求行 = scope/参数/过期均无从核对——唯一例外是发起人撤回自己的
+        # 申请（rejected_terminate：不产生任何执行授权，run → cancelled）；其余处置 409。
+        if not (outcome.kind == "rejected_terminate" and identity.user_id == run.get("user_id")):
+            raise HTTPException(status_code=409,
+                                detail="该 run 无审批请求记录，无法安全审批（仅发起人可撤回）")
     effective_scope = _authorize_approver(identity, run, areq, outcome.kind)
 
     # 决定持久化：pending → CAS 决出（first-valid-wins + uk_req_idem 幂等 + **过期在决策
@@ -670,12 +703,22 @@ def agent_approve(req: ApproveRequest, request: Request,
         handle = executor.resume(req.run_id, ctx, outcome, loop, tools,
                                  on_complete=_remember, on_failure=_report_failure,
                                  approval_meta=approval_meta)
-    except RunRejected:
-        raise HTTPException(status_code=409, detail="run 非挂起或已被认领")
+    except RunRejected as e:
+        raise HTTPException(status_code=409, detail=str(e) or "run 非挂起或已被认领")
 
-    session_id = req.session_id or thread_id
-    return StreamingResponse(_stream_events(handle, session_id, message_id),
-                             media_type="text/event-stream", headers=_SSE_HEADERS)
+    # P0-A（审批答案回流审批人）：/approve 是**审批动作回执**，不是答案通道——审批人的
+    # 审批权 ≠ 发起人所属部门知识的读权，续跑答案以发起人 ACL 生成，绝不 SSE 回流给
+    # 审批人。答案 durable 落发起人会话记忆 + qa_session_log（含 retrieved_docs sources，
+    # _resume_callbacks），发起人经会话历史/运行中心（GET /api/agent/runs/{id}，owner 门禁）
+    # 取回。此处起 daemon 线程排空事件队列（B6 对账同型：无消费者时队列会堆到 run 结束），
+    # HTTP 侧立即返回 202 受理回执。撤回（rejected_terminate）run 已终态，回执同构。
+    import threading
+    threading.Thread(target=lambda h=handle: [None for _ in h.events()],
+                     name=f"approve-drain-{req.run_id[:8]}", daemon=True).start()
+    return JSONResponse(status_code=202, content={
+        "run_id": req.run_id, "outcome": outcome.kind,
+        "status": "cancelled" if outcome.kind == "rejected_terminate" else "resuming",
+        "message": "审批已受理；任务以发起人身份异步续跑，结果对发起人可见（会话历史/运行中心）。"})
 
 
 def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=None):
@@ -729,14 +772,17 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
     except Exception:   # noqa: BLE001
         pass
 
-    def _remember(final_text: str) -> None:
+    def _remember(final_text: str, retrieved=None) -> None:
         from opensearch_pipeline.agent_runtime.session_memory import default_session_memory
         default_session_memory().append(thread_id, cp_question, final_text, owner=requester_id)
         from opensearch_pipeline.qa_logger import log_qa_session
+        # P0-A：sources 随答案落库（审批续跑无 SSE 消费者——retrieved_docs 是发起人事后
+        # 从会话历史/看板核对答案依据的唯一通道）
         log_qa_session(session_id=thread_id, message_id=message_id, user_id=requester_id,
                        user_dept=(req_groups[0] if req_groups else None), query_text=cp_question,
                        answer_text=final_text, conversation_id=run.get("conversation_id"),
-                       answer_status="SUCCESS", model_name="agent")
+                       answer_status="SUCCESS", model_name="agent",
+                       retrieved_docs=_flatten_retrieved(retrieved))
 
     def _report_failure(err: str) -> None:
         from opensearch_pipeline.qa_logger import log_qa_session
