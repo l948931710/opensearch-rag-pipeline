@@ -565,7 +565,19 @@ def readiness_check():
         logger.warning("readiness: HA3 探针失败 [trace=%s]: %s", trace_id, e)
         checks["ha3"] = "error"
 
-    checks["dashscope"] = "configured" if getattr(cfg.embedding, "api_key", None) else "unconfigured"
+    # P0-6（重评审计）④ DashScope：默认 config-only（零外呼零配额，历史行为）；
+    # RAG_READY_DASHSCOPE_LIVE=true → TTL 缓存的 models 列表真探针（密钥有效+服务可达+
+    # 配置模型在列）。live 结果只报告不摘流量（外部全局故障时摘光实例只会雪上加霜）。
+    from opensearch_pipeline import readiness as _readiness
+    checks["dashscope"] = _readiness.dashscope_status(
+        getattr(cfg.embedding, "api_key", None), getattr(cfg.llm, "model", None))
+
+    # P0-6 ①②③：agent/ontology 表族存在（对应 flag 开时判定，off→skipped）、
+    # 工具注册表可构建、schema_migrations checksum 漂移（台账 vs 本地 schema/ 文件）。
+    checks["agent_tables"] = _readiness.agent_tables_status()
+    checks["ontology_tables"] = _readiness.ontology_tables_status()
+    checks["tool_registry"] = _readiness.tool_registry_status()
+    checks["schema_migrations"] = _readiness.schema_migrations_status()
 
     # WS0 状态外置：任一状态后端切了 redis → Redis PING 纳入就绪判定（此前 redis_client.ping
     # 是死代码，深度审查多实例运维组）。判据：限流 redis 后端是 fail-closed（Redis 挂 → ask
@@ -589,7 +601,16 @@ def readiness_check():
 
     critical_ok = (checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
                    and checks.get("redis") in ("ok", "skipped")
-                   and not _EMBEDDING_CONTRACT_MISMATCH)
+                   and not _EMBEDDING_CONTRACT_MISMATCH
+                   # P0-6：flag-on 实例缺 agent/ontology 表或注册表构建即炸 → 对应功能
+                   # 首个请求必 500，该实例不该接流量（flag off 时恒 skipped 不参与判定）
+                   and checks.get("agent_tables") in ("ok", "skipped")
+                   and checks.get("ontology_tables") in ("ok", "skipped")
+                   and checks.get("tool_registry") not in ("error", "empty")
+                   # schema 漂移默认只报告（台账抖动不该全量摘流量）；
+                   # RAG_READY_SCHEMA_STRICT=true 后纳入关键判定
+                   and (not _readiness.schema_strict()
+                        or checks.get("schema_migrations") != "drift"))
     body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
     return body if critical_ok else JSONResponse(status_code=503, content=body)
 

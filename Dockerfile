@@ -1,7 +1,23 @@
 # ═══════════════════════════════════════════════════════════════
 # OpenSearch RAG Pipeline — SAE Production Image
+# P0-6（重评审计 2026-07-11）：多阶段构建——node 阶段产 console 前端 dist，
+# clean 镜像 /console 不再回「尚未构建」404（console-app/dist 与
+# webconsole/next-dist 均 gitignored，此前镜像里根本没有前端产物）。
 # ═══════════════════════════════════════════════════════════════
 
+# ── Stage 1: console 前端构建（Vite/Vue3 → opensearch_pipeline/webconsole/next-dist）──
+FROM node:20-slim AS console-build
+
+WORKDIR /build/console-app
+# 依赖清单先拷（层缓存：lock 不变不重装）
+COPY console-app/package.json console-app/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+# vite.config outDir = ../opensearch_pipeline/webconsole/next-dist（相对 console-app）
+COPY console-app/ ./
+RUN mkdir -p /build/opensearch_pipeline/webconsole \
+    && npm run build
+
+# ── Stage 2: python 运行时 ────────────────────────────────────────
 FROM python:3.11-slim AS base
 
 # 部署版本指纹（canary 校验 / 回滚确认）：构建期烤入 git 短 SHA，运行期经 RAG_GIT_SHA 暴露给
@@ -22,8 +38,13 @@ COPY pyproject.toml ./
 # 安装 api + production 依赖（不装 dev/test/ocr）
 RUN pip install --no-cache-dir ".[api,production]"
 
-# 拷贝应用代码
+# 拷贝应用代码 + 前端产物（来自 node 构建阶段）
 COPY opensearch_pipeline/ ./opensearch_pipeline/
+COPY --from=console-build /build/opensearch_pipeline/webconsole/next-dist \
+     ./opensearch_pipeline/webconsole/next-dist
+# schema/ 随镜像走：/api/ready 的 schema_migrations checksum 漂移探针要用本地权威
+# DDL 与台账比对（readiness.py；不带则报 no_local_files）
+COPY schema/ ./schema/
 
 # 非 root 用户运行
 RUN useradd -m appuser
