@@ -228,9 +228,15 @@ def _build_runtime(provider_factory, case):
         PolicyRule(effect="allow", scopes=("kb.search",), policy_id="eval.readonly"),
         PolicyRule(effect="allow", scopes=("u8.writeback",), policy_id="eval.write.grant"),
     ]   # HIGH_WRITE 即便被授予也走 REQUIRE_APPROVAL（风险基线只减不增）——这正是被测语义
-    if case.get("family") == "ontology_tool_expected":
-        # PR13 增族：本体工具挂 case fixture 内存店（hermetic，不碰 RDS/不依赖
-        # RAG_ONTOLOGY_TOOLS_ENABLE——runner 自建隔离 registry，与 mock 写单同理）
+    from opensearch_pipeline.agent_tools import ontology_tools_enabled
+    if case.get("family") == "ontology_tool_expected" or ontology_tools_enabled():
+        # PR13 增族：本体工具挂 case fixture 内存店（hermetic，不碰 RDS）。两种进入：
+        # ① ontology 族 case 恒注册（判分需要，不依赖 env flag）；
+        # ② RAG_ONTOLOGY_TOOLS_ENABLE=true（flag-on 臂评测）→ **全族注册**——生产
+        #   on 臂里模型对所有问题都看得见这两个 READ_ONLY 工具，评测臂必须同形
+        #   （非 ontology 族 fixture 为空 → 空店回「无法解析」，正是未播种生产的真实形态）。
+        #   identity_resolve（HIGH_WRITE）不进评测 registry：always-approval 行为由
+        #   write_approval 族的 mock 写单覆盖，混入会与 u8_writeback 抢写意图提案。
         registry.register(_ontology_resolve_tool(case))
         registry.register(_ontology_packing_tool(case))
         rules.append(PolicyRule(
@@ -342,13 +348,16 @@ def _score(case: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
     elif fam == "ontology_tool_expected":
         expect = case["expect_tool"]
         s["tool_triggered"] = expect in tools
+        # 参数相关性=**链路感知**：期望实体出现在任一工具调用参数即算落地——
+        # resolve(编号)→packing_calc(object_id) 的接力是理想行为，只查末端工具会把
+        # 最优链路判负（2026-07-12 RUN B 法证：o03/o04 正因此误判）。
         args_s = " ".join(
-            " ".join(str(v) for v in p["args"].values())
-            for p in out["proposed"] if p["tool"] == expect)
+            " ".join(str(v) for v in p["args"].values()) for p in out["proposed"])
         terms = case.get("expect_args_terms") or []
         s["args_relevant"] = bool(s["tool_triggered"]) and (
             not terms or any(t.lower() in args_s.lower() for t in terms))
         s["tools"] = tools
+        s["args_sample"] = args_s[:200]      # 判负可诊断（报告即证据，不用重跑）
     elif fam == "no_tool":
         s["no_tool"] = not tools and bool(out["final_text"]) and out.get("error") is None
     elif fam == "write_approval":

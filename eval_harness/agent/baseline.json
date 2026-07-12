@@ -1,6 +1,6 @@
 {
-  "frozen_from": "eval_harness/reports/agent_eval_20260711T163602.json",
-  "frozen_at": "2026-07-11T16:36:42",
+  "frozen_from": "eval_harness/reports/agent_eval_20260712T011535.json",
+  "frozen_at": "2026-07-12T01:16:31",
   "provider": "live",
   "metrics": {
     "tool_trigger_rate": 1.0,
@@ -8,13 +8,16 @@
     "tool_query_relevance": 1.0,
     "no_tool_rate": 1.0,
     "n_no_tool": 6,
-    "write_propose_rate": 0.6667,
+    "write_propose_rate": 0.5,
     "n_write": 6,
     "approval_suspend_rate": 1.0,
     "n_suspend_denom": 6,
     "grounded_rate": 1.0,
     "n_grounded": 9,
+    "ontology_tool_trigger_rate": 1.0,
+    "n_ontology_tool_expected": 5,
+    "ontology_args_relevance": 0.8,
     "error_count": 0,
-    "n_total": 31
+    "n_total": 36
   }
 }
