@@ -150,6 +150,7 @@ def test_speculative_hit_skips_real_retrieve(monkeypatch):
     pool = ThreadPoolExecutor(max_workers=1)
     try:
         spec = SpeculativeSearch(_Q, ["production"], pool)
+        spec.start()   # 模拟已准入（F1：起跑在 executor 占槽后）
         ctx = _ctx()
         ctx.speculative_search = spec
         res = KnowledgeSearchTool().run(ctx, {"query": "纸杯杯口尺寸超差 处理流程"})
@@ -181,18 +182,48 @@ def test_speculative_miss_and_failure_fall_back(monkeypatch):
         # miss：换主题
         ctx = _ctx()
         ctx.speculative_search = SpeculativeSearch(_Q, None, pool)
+        ctx.speculative_search.start()
         res = KnowledgeSearchTool().run(ctx, {"query": "不合格品评审单 填写要求"})
         assert res.status == "succeeded" and res.receipt.get("speculative") is None
         # miss：显式 top_k
         ctx2 = _ctx()
         ctx2.speculative_search = SpeculativeSearch(_Q, None, pool)
+        ctx2.speculative_search.start()
         res2 = KnowledgeSearchTool().run(ctx2, {"query": _Q, "top_k": 5})
         assert res2.receipt.get("speculative") is None
         # 预取异常 → 命中判定过但 future 抛 → 回退真检索
         ctx3 = _ctx()
         ctx3.speculative_search = SpeculativeSearch("预取会炸的问题", None, pool)
+        ctx3.speculative_search.start()
         res3 = KnowledgeSearchTool().run(ctx3, {"query": "预取会炸的问题"})
         assert res3.status == "succeeded" and res3.receipt.get("speculative") is None
+    finally:
+        pool.shutdown(wait=False)
+
+
+def test_speculative_not_started_falls_back_and_start_idempotent(monkeypatch):
+    """F1 懒启动：构造零成本、从未 start()（= submit 被 429 拒）→ 预取零发生，
+    take_if_match 恒 None、工具照走真检索；start() 幂等（重复调用只提交一次预取）。"""
+    calls = {"n": 0}
+
+    def fake_retrieve(query, **k):
+        calls["n"] += 1
+        return [{"doc_id": "D", "chunk_text": "x", "doc_title": "t"}]
+
+    monkeypatch.setattr(_RETRIEVE, fake_retrieve)
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        ctx = _ctx()
+        spec = SpeculativeSearch(_Q, None, pool)
+        ctx.speculative_search = spec              # 挂上 ctx 但从未准入起跑
+        assert spec.take_if_match(_Q, None) is None
+        res = KnowledgeSearchTool().run(ctx, {"query": _Q})
+        assert res.status == "succeeded" and res.receipt.get("speculative") is None
+        assert calls["n"] == 1                     # 只有回退的真检索——预取零发生
+        spec.start()
+        spec.start()                               # 幂等：第二次是 no-op
+        spec._future.result(timeout=2)
+        assert calls["n"] == 2                     # 预取恰好一次
     finally:
         pool.shutdown(wait=False)
 

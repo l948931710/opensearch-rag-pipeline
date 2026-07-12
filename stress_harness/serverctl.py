@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -86,7 +87,8 @@ class ServerCtl:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         logf = open(self.log_path, "ab")
         level = os.environ.get("STRESS_UVICORN_LOG_LEVEL", "warning")
-        cmd = ["python", "-m", "uvicorn", "opensearch_pipeline.api:app",
+        # sys.executable 而非裸 "python"：与 runner 同解释器（PATH 无 python 的环境照跑）
+        cmd = [sys.executable, "-m", "uvicorn", "opensearch_pipeline.api:app",
                "--host", "127.0.0.1", "--port", str(self.api_port),
                "--workers", "1", "--timeout-keep-alive", "65", "--log-level", level]
         self.proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=self.env,

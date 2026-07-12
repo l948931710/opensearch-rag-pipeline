@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -66,7 +67,10 @@ def _agent_system_prompt() -> str:
 # 与此同源）——任何改动须重跑 make agent-eval 并重冻 baseline.json（见 runner 模块头）。
 
 # 运行时单例（每进程一套；executor 的有界线程池即 B1(b) 执行宿主）。惰性建，flag-off 时永不建。
+# ⚠️ 构造必须持 _RUNTIME_LOCK（F6）：冷实例上并发首请求曾各建一套 executor（4-run 墙旁路，
+# S9 实测 16/16 全接纳）+ 每次竞态泄漏一条 reaper 线程。
 _RUNTIME = None
+_RUNTIME_LOCK = threading.Lock()
 _APPROVAL_STORE = None
 _REGISTRY_STORE = None
 _SPEC_POOL = None   # 投机检索预取线程池（独立小池，不占 run executor 槽位）
@@ -119,8 +123,6 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
     ③**B6 对账**：decided-but-not-resumed 死单按 approval_decision 重驱 resume
       （runtime=(registry, gateway, executor) 提供重驱件；未接则跳过）。
     失败只告警，绝不影响 serving。"""
-    import threading
-
     interval = int(os.environ.get("RAG_AGENT_REAPER_INTERVAL_S", "300"))
     stale_s = int(os.environ.get("RAG_AGENT_STALE_RUNNING_S", "900"))
     ttl_s = int(os.environ.get("RAG_AGENT_SUSPENDED_TTL_S", "259200"))
@@ -168,56 +170,67 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
 
 
 def _get_runtime():
-    """惰性建运行时单例：(registry, gateway, executor, run_store)。"""
+    """惰性建运行时单例：(registry, gateway, executor, run_store)。
+
+    双检锁（F6）：无锁 check-then-act 会让冷实例上的并发首请求各建一整套 runtime
+    （末位赋值成单例，先建的 executor 池仍在服务）——4-run 并发墙在发布/重启的冷窗口
+    内完全失效。锁内首请求串行化正是期望行为：后到者等单例建成后直接复用。"""
     global _RUNTIME
     if _RUNTIME is None:
-        from opensearch_pipeline.agent_runtime import (
-            ThreadedRunExecutor, default_gateway, default_policy_engine, make_adjudicator)
-        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
-        from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
-        from opensearch_pipeline.agent_tools import build_default_registry
-        registry = build_default_registry()
-        # 工具治理接线（深度审查多实例运维组）：①代码内声明 upsert 进 tool_registry
-        # （status 不覆盖——重启后管理员停用的工具保持停用）②DB 驱动 kill switch 挂进
-        # resolve（任一实例停用，全部实例一个 TTL 内生效）③drift 告警。全程 fail-open：
-        # DB 抖动绝不阻断 runtime 建立（Policy/审批仍逐调用兜底）。
-        registry_store = _get_registry_store()
-        try:
-            registry_store.sync_specs(registry)
-            for w in registry_store.drift_warnings(registry):
-                logger.warning("tool_registry 漂移：%s", w)
-        except Exception:   # noqa: BLE001
-            logger.warning("tool_registry 同步/漂移检查失败（fail-open，进程内注册照常）",
-                           exc_info=True)
-        registry.attach_disabled_source(registry_store.disabled_names)
-        run_store = RDSRunStore()
-        # WS3 审批：executor.resume 写已批准 call → adjudicator 放行执行；两者须共享**同一** approvals dict。
-        approvals: dict = {}
-        policy = default_policy_engine()
-        # P1「工具可见集未按 policy 收敛」：模型可见集 = 该 ctx 存在授予的工具
-        # （would_grant），必然被拒的不进 prompt；调用时 Policy 仍逐调用兜底。
-        registry.attach_visibility_filter(
-            lambda c, specs: [s for s in specs if policy.would_grant(c, s)])
-        adjudicator = make_adjudicator(registry, policy, run_store,
-                                       audit=RDSAuditLog(), approvals=approvals)   # 执行前合规审计
-        gateway = default_gateway(call_logger=run_store.record_llm_call)   # 每次模型调用记 llm_call_log
-        # WS2-3：装 rolling summary 真 summarizer（廉价模型压缩超窗历史）；是否生效由
-        # RAG_SESSION_ROLLING_SUMMARY 控（默认 OFF→硬截断），装了也 dormant 直到开关打开。
-        from opensearch_pipeline.agent_runtime import compaction
-        compaction.install(gateway=gateway)
-        max_runs = int(os.environ.get("RAG_AGENT_MAX_CONCURRENT_RUNS", "4"))
-        # WS3 审批持久化：挂起侧 executor 写 approval_request（fail-closed），决策侧 /approve 写
-        # approval_decision——request→decision→invocation→audit 四表回放链（深度审查 A 组 P1）。
-        approval_store = _get_approval_store()
-        executor = ThreadedRunExecutor(run_store, adjudicator, max_concurrent=max_runs,
-                                       approvals=approvals, approval_store=approval_store)
-        # SIGTERM/进程退出排水：非 daemon 线程池被直杀会留下 running 僵尸（reaper 兜底收尸，
-        # 但正常退出应先排水）；收尸线程给崩溃/SIGKILL 场景兜底。
-        import atexit
-        atexit.register(executor.shutdown, wait=False)
-        _start_reaper(run_store, approval_store, runtime=(registry, gateway, executor))
-        _RUNTIME = (registry, gateway, executor, run_store)
+        with _RUNTIME_LOCK:
+            if _RUNTIME is None:
+                _RUNTIME = _build_runtime()
     return _RUNTIME
+
+
+def _build_runtime():
+    """组装 runtime 四元组（仅 _get_runtime 持锁调用）。"""
+    from opensearch_pipeline.agent_runtime import (
+        ThreadedRunExecutor, default_gateway, default_policy_engine, make_adjudicator)
+    from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+    from opensearch_pipeline.agent_tools import build_default_registry
+    registry = build_default_registry()
+    # 工具治理接线（深度审查多实例运维组）：①代码内声明 upsert 进 tool_registry
+    # （status 不覆盖——重启后管理员停用的工具保持停用）②DB 驱动 kill switch 挂进
+    # resolve（任一实例停用，全部实例一个 TTL 内生效）③drift 告警。全程 fail-open：
+    # DB 抖动绝不阻断 runtime 建立（Policy/审批仍逐调用兜底）。
+    registry_store = _get_registry_store()
+    try:
+        registry_store.sync_specs(registry)
+        for w in registry_store.drift_warnings(registry):
+            logger.warning("tool_registry 漂移：%s", w)
+    except Exception:   # noqa: BLE001
+        logger.warning("tool_registry 同步/漂移检查失败（fail-open，进程内注册照常）",
+                       exc_info=True)
+    registry.attach_disabled_source(registry_store.disabled_names)
+    run_store = RDSRunStore()
+    # WS3 审批：executor.resume 写已批准 call → adjudicator 放行执行；两者须共享**同一** approvals dict。
+    approvals: dict = {}
+    policy = default_policy_engine()
+    # P1「工具可见集未按 policy 收敛」：模型可见集 = 该 ctx 存在授予的工具
+    # （would_grant），必然被拒的不进 prompt；调用时 Policy 仍逐调用兜底。
+    registry.attach_visibility_filter(
+        lambda c, specs: [s for s in specs if policy.would_grant(c, s)])
+    adjudicator = make_adjudicator(registry, policy, run_store,
+                                   audit=RDSAuditLog(), approvals=approvals)   # 执行前合规审计
+    gateway = default_gateway(call_logger=run_store.record_llm_call)   # 每次模型调用记 llm_call_log
+    # WS2-3：装 rolling summary 真 summarizer（廉价模型压缩超窗历史）；是否生效由
+    # RAG_SESSION_ROLLING_SUMMARY 控（默认 OFF→硬截断），装了也 dormant 直到开关打开。
+    from opensearch_pipeline.agent_runtime import compaction
+    compaction.install(gateway=gateway)
+    max_runs = int(os.environ.get("RAG_AGENT_MAX_CONCURRENT_RUNS", "4"))
+    # WS3 审批持久化：挂起侧 executor 写 approval_request（fail-closed），决策侧 /approve 写
+    # approval_decision——request→decision→invocation→audit 四表回放链（深度审查 A 组 P1）。
+    approval_store = _get_approval_store()
+    executor = ThreadedRunExecutor(run_store, adjudicator, max_concurrent=max_runs,
+                                   approvals=approvals, approval_store=approval_store)
+    # SIGTERM/进程退出排水：非 daemon 线程池被直杀会留下 running 僵尸（reaper 兜底收尸，
+    # 但正常退出应先排水）；收尸线程给崩溃/SIGKILL 场景兜底。
+    import atexit
+    atexit.register(executor.shutdown, wait=False)
+    _start_reaper(run_store, approval_store, runtime=(registry, gateway, executor))
+    return registry, gateway, executor, run_store
 
 
 def _sse(obj: dict) -> str:
@@ -404,8 +417,9 @@ def agent_ask(req: AskRequest, request: Request,
     except Exception:   # noqa: BLE001
         rid = ""
 
-    # 投机检索（延迟优化）：submit 即用原问题并行预取（与工具侧同一 ACL 推导），
-    # 与第一轮模型调用重叠；启动失败只降速不破功能。
+    # 投机检索（延迟优化）：用原问题并行预取（与工具侧同一 ACL 推导），与第一轮模型调用
+    # 重叠；启动失败只降速不破功能。⚠️ 这里只构造不起跑（F1）——起跑在 executor.submit
+    # 占到并发槽之后（executor 内），被 429 拒绝的 submit 不烧 embedding/检索。
     speculative = None
     if _spec_retrieval_enabled():
         try:
@@ -414,7 +428,7 @@ def agent_ask(req: AskRequest, request: Request,
                 req.question, list(identity.acl_groups) if identity.acl_groups else None,
                 _spec_pool())
         except Exception:   # noqa: BLE001
-            logger.warning("投机检索预取启动失败（忽略，走真检索）", exc_info=True)
+            logger.warning("投机检索预取构造失败（忽略，走真检索）", exc_info=True)
     search_session = None
     try:
         from opensearch_pipeline.agent_tools.knowledge_search import (

@@ -274,18 +274,17 @@ def _make_s2(arm: str):
         res.gates.append(gate(
             "G6-spec-waste", "被拒 submit 的投机检索代价（检索次数/被拒）",
             "≤ 0.05", round(search_per_reject, 3), g6_pass, draft=True,
-            note="预登记预期：spec-on 臂 FAIL（F1）" if spec_on else ""))
+            note="F1 回归门（已修：起跑挪到 executor 准入后）" if spec_on else ""))
         rig.shared[sid] = res.metrics
         if not spec_on and "S2-on" in rig.shared:
             on_m = rig.shared["S2-on"]
             res.findings.append(
-                "F1 投机检索先于并发准入：spec-on 臂 "
+                "F1（已修 2026-07-12，本门转回归守卫）投机预取起跑已挪到 executor._acquire "
+                "占槽成功之后（构造仍在 serving 层、零成本）：spec-on 臂 "
                 f"{on_m['rejected_429']} 个被拒 submit 共触发 {on_m['search_calls']} 次检索"
-                f"（{on_m['search_per_rejected_submit']}/被拒）；spec-off 对照臂 "
+                f"（{on_m['search_per_rejected_submit']}/被拒，修前 ≈1.0）；spec-off 对照臂 "
                 f"{res.metrics['search_per_rejected_submit']}/被拒。同题 embedding 被 "
-                "query-LRU 抹平，真实混合流量下 embedding 面同倍放大。整改选项：把 "
-                "SpeculativeSearch 构造移到 executor.submit 成功之后，或提交前预检 "
-                "executor 空位。")
+                "query-LRU 抹平，若本门回红，真实混合流量下 embedding 面同倍放大。")
         return res
     return s2
 
@@ -816,16 +815,13 @@ async def s9(rig: Rig) -> ScenarioResult:
     res.gates.append(gate(
         "F6-cold-cap", "冷实例并发首请求仍受 4-run 墙约束", "accepted ≤ 4", accepted,
         accepted <= 4, draft=True,
-        note="预登记预期：FAIL——_get_runtime 无锁 check-then-act，竞态各建私有 executor"))
+        note="F6 回归门（已修：_get_runtime 双检锁）"))
     res.findings.append(
-        f"F6（头条·已服务端证实）冷启动并发墙旁路：routes/agent.py::_get_runtime 是无锁 "
-        f"check-then-act 单例。冷实例上 {burst} 个**同刻**首请求实测 {accepted} 个全部被接纳、"
-        f"0 拒绝（agent_run 表实测并发重叠达 {accepted}，墙本应=4）——每个竞态请求各建一整套 "
-        "runtime（4 槽 executor + 熔断器 + reaper 线程），末位赋值成单例、先建的泄漏但其池仍在"
-        "服务。**4-run 并发墙在冷窗口内提供零保护**，而冷窗口正是 SAE 每次发布/扩容/重启撞上"
-        "在途流量的时刻：瞬时并发无上界，×2-17 模型调用/run 直灌 DashScope 与 20 连接 DB 池，"
-        "叠加 F1 每 run 再拉一次投机检索。S1 的「干净 4-run 墙」仅在首请求单发预热单例后成立。"
-        "整改（一行级）：_RUNTIME 构造包 threading.Lock 双检锁。")
+        f"F6（已修 2026-07-12，本门转回归守卫）：_get_runtime 已加 threading.Lock 双检锁"
+        f"（修前无锁 check-then-act，冷实例 16 同刻首请求实测 16/16 全接纳、竞态各建一整套 "
+        f"runtime + 泄漏 reaper 线程——4-run 墙在发布/重启冷窗口零保护）。本轮冷实例 {burst} "
+        f"同刻首请求接纳 {accepted}、拒绝 {rejected}。若本门回红=单例构造再次失锁，"
+        "冷窗口瞬时并发将无上界（×2-17 模型调用/run 直灌 DashScope 与 DB 池）。")
     return res
 
 

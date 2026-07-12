@@ -2,6 +2,9 @@
 
 日期：2026-07-12 · 状态：**已实现并跑通零成本基线**（工具箱 `stress_harness/`，
 基线报告见 §7）· DRAFT 门 G1–G9 待批准（§4 批准提案）
+· **批次 1 整改已合入（2026-07-12）**：F6（`_get_runtime` 双检锁）+ F1（投机预取起跑
+挪到 executor 准入后）——S9 实测 4/16 接纳、S2-on 臂 0.0 检索/被拒，两门转绿并降级为
+回归守卫；下一步=§6.3 步骤 3（staging 档）
 
 ---
 
@@ -34,8 +37,8 @@
 
 | # | 假设 | 验证场景 | 状态 |
 |---|---|---|---|
-| **H0** | **冷启动并发墙旁路**：`routes/agent.py::_get_runtime` 是无锁 check-then-act 单例；冷 worker 上并发首请求各建一套 executor，4-run 墙在冷窗口内完全失效 | S9 | **已证实=F6（头条）**：16 同刻首请求 16/16 接纳、0 拒绝、agent_run 实测并发 16 |
-| H1 | **投机检索先于并发准入**：被 429 拒绝的 submit 仍然各烧一次 embedding+检索（`routes/agent.py` SpeculativeSearch 构造在 `executor.submit` 之前）——拒绝风暴下检索面放大 | S2 双臂 | **已证实=F1**：spec-on 臂 1.0 检索/被拒，off 臂 0.0 |
+| **H0** | **冷启动并发墙旁路**：`routes/agent.py::_get_runtime` 是无锁 check-then-act 单例；冷 worker 上并发首请求各建一套 executor，4-run 墙在冷窗口内完全失效 | S9 | **已证实=F6（头条）→ ✅已修（双检锁）**：修前 16/16 接纳；修后实测 4/16 接纳、12×429，S9 转绿 |
+| H1 | **投机检索先于并发准入**：被 429 拒绝的 submit 仍然各烧一次 embedding+检索（`routes/agent.py` SpeculativeSearch 构造在 `executor.submit` 之前）——拒绝风暴下检索面放大 | S2 双臂 | **已证实=F1 → ✅已修（准入后起跑）**：修前 spec-on 臂 1.0 检索/被拒；修后 0.0，双臂转绿 |
 | H2 | **共享网关熔断跨路径污染**：`RAG_SERVING_MODEL_GATEWAY=true`（Tier B，默认 off）时普通流式与 agent 共用 DashScope 调用面；agent 侧 429 风暴触发的 per-model 熔断是否殃及普通问答 | S4F2 | 探针化=F2 |
 | H3 | **20 连接 DB 池是共享咽喉**：agent 每 run 数十笔短写（run/step/heartbeat/llm_call_log 同步 INSERT）与读路径、live-ACL 重读同池竞争 → 503 DB_POOL_EXHAUSTED | S3/S6 | 已压：稳态未耗尽（瓶颈在 threadpool，见 F7） |
 | H4 | **空补全 5× 重试燃烧**：`empty_final_retries=5` + while 语义，退化窗口内每 run 至多 1+5 次连发模型调用 | S4c | 上限已验 |
@@ -56,7 +59,7 @@ smoke（分钟级/CI）与 full（提交基线，含 30min 浸泡）。mock 模�
 |---|---|---|---|
 | S0 | 单用户基线：帧序/落库/开销 | 1 VU × 20 run（10 深思） | 帧序违规=0；run 成功=100%；每 run 落库 1 agent_run + 2 llm_call_log + 1 tool_invocation + 1 qa_session_log；管线开销 p95 < 1.5s |
 | S1 | 4-run 并发墙干净性 | 开环 0.5→6 rps 爬坡 3min | 超额全部 429（0×5xx）；「Agent 并发已满」文案；被拒不落 agent_run 行 |
-| S2 | **F1 投机放大（头条）** | 同刻 40 并发 × 5 波，spec on/off 双臂 | G6：被拒 submit 的 emb 调用 ≤0.05/个——**预登记 spec-on 臂 FAIL**（实测 ≈1.0） |
+| S2 | **F1 投机放大（头条，✅已修转回归门）** | 同刻 40 并发 × 5 波，spec on/off 双臂 | G6：被拒 submit 的 emb 调用 ≤0.05/个——修前 ≈1.0 FAIL，修后 0.0 PASS |
 | S3 | 顶格浸泡泄漏/漂移 | 6 VU 闭环 × 30min | RSS 漂移<15%；线程平稳；p95 漂移<+20%；MySQL 连接≤25；llm_call_log 记账完整 |
 | S4 | 依赖故障注入 | 时延尖峰 25s；429 风暴 90s→熔断→恢复；空补全 | 风暴期 run 显式 error 帧；熔断后快速失败<1.5s；恢复≤45s；空补全≤6 调用/turn |
 | S4F2 | F2 跨路径污染探针 | flag-on + agent 侧风暴 + 普通流式探针 | 测量型（记录污染形态，不判 PASS/FAIL） |
@@ -64,7 +67,7 @@ smoke（分钟级/CI）与 full（提交基线，含 30min 浸泡）。mock 模�
 | S6 | 混合负载公平性 | 4 agent VU + 20 普通流式 VU + 10 aux GET × 10min，对照臂无 agent | 普通流式 p95 劣化 ≤1.25×；DB_POOL_EXHAUSTED=0；aux p95<0.5s |
 | S7 | 限流治理 | 限流开：6/min、深思配额、全局 cap 触顶 | 第 7 次/分 429；配额后 4xx；触顶 503 + `qa_admission_reject` 台账（≤90s 批量窗）+ 钉钉告警恰 1 次（dedup） |
 | S8 | 崩溃恢复钻演 | 3 弃单长 run + 1 在线挂流 run 中途 SIGKILL → 重启（reaper 5s/10s） | 孤儿=4 被看见；在线客户端 <10s 解挂；新实例 4/4 满额接客；孤儿 ≤25s 收尸 |
-| S9 | **F6 冷启动竞态（头条）** | 16 同刻首请求打冷实例（不预热） | 接纳 ≤4（**预登记 FAIL**：实测 16/16，墙旁路） |
+| S9 | **F6 冷启动竞态（头条，✅已修转回归门）** | 16 同刻首请求打冷实例（不预热） | 接纳 ≤4——修前 16/16 FAIL，修后 4/16 PASS |
 
 ## 4. SLO 门（既定 + DRAFT 批准提案）
 
@@ -80,7 +83,7 @@ no_result_rate≤0.15、p95_latency_ms≤25000、error_rate≤0.05。
 | G3 | 工具段（tool_call→tool_result）p95 | ≤ 12s |
 | G4 | run 总时长 p95 | ≤ 60s light / ≤120s 深思；TTL(600s) 终止数=0 |
 | G5 | 错误率（error 帧+AGENT_ERROR 行 / 提交） | ≤ 0.05 |
-| G6 | 429 正确性：超额全 429、被拒零 DB 行、**被拒零投机检索**（≤0.05/个） | 最后一项现状 FAIL=F1 |
+| G6 | 429 正确性：超额全 429、被拒零 DB 行、**被拒零投机检索**（≤0.05/个） | 最后一项 F1 已修转绿（0.0） |
 | G7 | 熔断恢复：打开期快速失败<1.5s；痊愈后 ≤冷却30s+1 请求恢复 | — |
 | G8 | 弃单代价：浪费模型调用/弃单（观测门，取消-on-断连是产品决策） | 报告数值 |
 | G9 | 浸泡稳定：RSS<+15%/30min、线程平稳、零池耗尽 | — |
@@ -155,12 +158,14 @@ SAE 日志出现 DB_POOL_EXHAUSTED；预算耗尽（runner 自动硬停）。
 
 ### 6.3 上线节奏建议
 
-0. **F6 整改先行（阻断级）**：`_get_runtime` 加 `threading.Lock` 双检锁——冷启动并发墙
-   旁路是唯一让「4 并发」容量假设在发布/重启时刻整体失效的缺陷，必须先修；修后 S9 应转绿
-   （接纳 ≤4）。
-1. 本方案 local 档 full 基线跑通（G6-spec-waste / F6-cold-cap 为预登记 FAIL，其余绿）；
-2. F1 整改合入（一行级：SpeculativeSearch 构造挪到 `executor.submit` 成功之后）→
-   S2 复跑转绿；
+0. ~~**F6 整改先行（阻断级）**~~ ✅**已修（2026-07-12 批次 1）**：`_get_runtime` 双检锁
+   （builder 抽成 `_build_runtime`，16 线程并发首调用单测断言恰建一次）；S9 复跑转绿
+   （16 同刻冷首请求接纳 4、拒绝 12）。
+1. ~~本方案 local 档 full 基线跑通~~ 预登记 FAIL 的两门已随批次 1 转绿；full 基线
+   （含 30min 浸泡）在修后代码上重跑固化即可；
+2. ~~F1 整改合入~~ ✅**已修（同批）**：SpeculativeSearch 构造/起跑分离——构造仍在
+   serving 层（零成本），`start()` 由 executor 在 `_acquire` 占槽成功后调用（happens-before
+   工具消费，无竞态；被拒 submit 零预取）→ S2 双臂复跑转绿（spec-on 0.0/被拒）；
 3. staging 档 500 调用趟：G2/G3/G4 定稿 + H9 排除 + 告警链路实证 + F7 阈值标定；
 4. 灰度（试点部门）期间每日看 `qa_daily_metrics` + `llm_call_log` 对账单口径（F4）；
 5. 全量前把 `RAG_GLOBAL_DAILY_LLM_CAP` 按 F4 的实测倍率重定（按模型调用数或加权）。
@@ -171,7 +176,7 @@ SAE 日志出现 DB_POOL_EXHAUSTED；预算耗尽（runner 自动硬停）。
 各段时延分位、浸泡时间线数组与诚实范围声明）。**首轮 full 基线的数字以该目录
 下最新 run 为准**——本节固化跨轮不变的结论性发现：
 
-- **F6（头条·已服务端证实）**：冷启动并发墙旁路。`routes/agent.py:173-219`
+- **F6（头条·已服务端证实 → ✅已修 2026-07-12）**：冷启动并发墙旁路。修前 `routes/agent.py`
   的 `_get_runtime` 是无锁 check-then-act 单例（`if _RUNTIME is None: … _RUNTIME = (…)`）。
   冷实例上 16 个**同刻**首请求实测 **16/16 全部接纳、0 拒绝**，`agent_run` 表实测并发
   重叠达 16（4-run 墙本应拒绝 12 个），三次复跑稳定复现。机理：竞态线程各建一整套
@@ -179,13 +184,17 @@ SAE 日志出现 DB_POOL_EXHAUSTED；预算耗尽（runner 自动硬停）。
   executor 池仍在服务。**4-run 并发墙在冷窗口内提供零保护**——而冷窗口正是 SAE 每次
   发布/扩容/重启撞上在途流量的时刻：瞬时并发无上界，×2-17 模型调用/run 直灌 DashScope
   与 20 连接 DB 池，还叠加 F1 每 run 再拉一次投机检索、每次竞态泄漏一个 reaper 线程。
-  S1 的「干净 4-run 墙」仅在首请求单发预热单例后成立。**整改（一行级）**：`_RUNTIME`
-  构造包 `threading.Lock` 双检锁。这是上线前第一优先修项。
-- **F1（已证实，headline）**：投机检索在 `_enforce_rate_limit` 之后、
-  `executor.submit` 并发准入**之前**触发——并发墙上的每个 429 拒绝仍各烧
+  S1 的「干净 4-run 墙」仅在首请求单发预热单例后成立。**整改（已落）**：`_RUNTIME`
+  构造包 `threading.Lock` 双检锁（builder 抽 `_build_runtime`）；S9 复跑 4/16 接纳转绿，
+  另有 16 线程并发单测钉住恰建一次。
+- **F1（已证实，headline → ✅已修 2026-07-12）**：投机检索曾在 `_enforce_rate_limit`
+  之后、`executor.submit` 并发准入**之前**起跑——并发墙上的每个 429 拒绝仍各烧
   1 次 embedding + 1 次检索（S2 spec-on 臂实测放大 ≈1.0/被拒；off 对照臂 ≈0）。
-  40 并发突发 = 36 个拒绝但 ~40 次检索面负载。**整改**：构造挪到 submit 成功后，
-  或提交前预检 executor 空位；代价是接纳 run 损失几十 ms 重叠收益。
+  40 并发突发 = 36 个拒绝但 ~40 次检索面负载。**整改（已落）**：构造/起跑分离——
+  `SpeculativeSearch.start()` 由 executor 在 `_acquire` 占槽成功后调用（构造仍在
+  serving 层零成本；比「构造挪到 submit 之后」多解一层：起跑 happens-before 工具
+  消费，测试/极端时序下 take_if_match 不会读到半初始化句柄）。被拒 submit 零预取，
+  S2 双臂 0.0/被拒转绿；代价仅接纳 run 损失 create_run 一笔 DB 写的重叠窗口（<10ms）。
 - **F2**：`RAG_SERVING_MODEL_GATEWAY=true` 时普通流式与 agent 共用 DashScope 调用面
   与 per-model 熔断（S4F2 探针记录污染形态）。翻此 flag 上线前，把跨路径熔断隔离
   （独立 gateway 实例或按 category 分 breaker key）列为前置项。
@@ -209,9 +218,9 @@ SAE 日志出现 DB_POOL_EXHAUSTED；预算耗尽（runner 自动硬停）。
 
 | 风险/欠账 | 处置 |
 |---|---|
-| **F6 整改前上线（阻断级）** | 冷启动并发墙旁路让发布/重启窗口内并发无上界，直接击穿 DashScope 配额与 DB 池——`_get_runtime` 加锁是上线前置硬条件 |
-| F1 整改前上线 | 拒绝风暴放大检索面（embedding QPM + HA3 CU + rerank 账单）；灰度期用户少、突发概率低，可接受但应排第二批修（F6 之后） |
-| workers=1 天花板 | 4 并发 run 是产品容量上限（**前提是 F6 已修**，否则冷窗口无墙）；灰度公告/排队文案按此设计；横向扩容等 WS0 Redis 状态外置 |
+| ~~F6 整改前上线（阻断级）~~ ✅已修（批次 1） | `_get_runtime` 双检锁已合入，S9 转绿（4/16 接纳）+ 并发单测钉住；风险降级为回归风险，由 S9 回归门守 |
+| ~~F1 整改前上线~~ ✅已修（批次 1） | 起跑挪到 executor 准入后，S2 双臂 0.0/被拒转绿；由 G6-spec-waste 回归门守 |
+| workers=1 天花板 | 4 并发 run 是产品容量上限（F6 已修，冷窗口同样受墙约束）；灰度公告/排队文案按此设计；横向扩容等 WS0 Redis 状态外置 |
 | local 档未覆盖 HA3 真容量 | staging 档 S2 单波在真 HA3 上复测放大系数；HA3 CU 告警阈值调低一档过灰度期 |
 | 深思(thinking)真实时延 ~24s | G4 深思档 120s 提案基于 12 轮上限估算，staging 实测后定稿 |
 | 浸泡 30min 只到 G9 分辨率 | 上线后首周每日 cron 跑 smoke 矩阵（stress.yml 可加 schedule），拿 7 天趋势替代长浸泡 |

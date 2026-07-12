@@ -122,6 +122,15 @@ class ThreadedRunExecutor:
                messages: List, tools: List, on_complete=None, on_failure=None) -> RunHandle:
         self._acquire()
         try:
+            # F1：投机检索在**准入成功后**才起跑（构造在 serving 层、零成本）——放在
+            # _acquire 之后、任何 DB 写之前：被 429 拒的 submit 零检索负载，接纳的 run
+            # 预取与 create_run+首轮模型调用最大化重叠。fail-open，起跑失败不碍 run。
+            spec = getattr(ctx, "speculative_search", None)
+            if spec is not None:
+                try:
+                    spec.start()
+                except Exception:   # noqa: BLE001
+                    logger.warning("投机检索起跑失败（忽略，工具侧走真检索）", exc_info=True)
             run_id = self._store.create_run(ctx, self._profile)
             handle = RunHandle(run_id)
             handle._on_complete = on_complete

@@ -259,12 +259,28 @@ class SpeculativeSearch:
 
     只消费一次：首个命中的 knowledge_search 拿走结果；多轮检索的后续 call 与
     显式改 top_k 的 call 恒走真检索。预取失败/超时 → None（fail-open 回退真检索）。
+
+    构造与起跑分离（F1）：构造零成本，`start()` 由 executor 在并发准入（占到 run 槽）
+    之后调用——曾经构造即起跑，让并发墙上每个被 429 拒绝的 submit 仍各烧一次
+    embedding+检索（S2 实测 ≈1.0 次/被拒）。未起跑时 take_if_match 恒 None（回退真检索）。
     """
 
     def __init__(self, question: str, user_dept: Optional[List[str]], pool) -> None:
         self.question = question
         self._used = False
-        self._future = pool.submit(self._fetch, question, user_dept)
+        self._pool = pool
+        self._user_dept = user_dept
+        self._future = None
+
+    def start(self) -> None:
+        """准入后起跑（幂等；executor 单线程调用）。失败不抛——_future 保持 None，
+        工具侧照走真检索。"""
+        if self._future is not None:
+            return
+        try:
+            self._future = self._pool.submit(self._fetch, self.question, self._user_dept)
+        except Exception:   # noqa: BLE001 — 池已关/饱和等：fail-open
+            logger.info("投机检索预取起跑失败（回退真检索）", exc_info=True)
 
     @staticmethod
     def _fetch(question: str, user_dept: Optional[List[str]]):
@@ -274,7 +290,8 @@ class SpeculativeSearch:
     def take_if_match(self, query: str, top_k: Optional[int],
                       timeout: float = 25.0) -> Optional[List[Dict[str, Any]]]:
         # timeout < ToolSpec.timeout_s(30)：预取卡死时留出真检索被执行器统一收尸的余量
-        if self._used or top_k is not None or not query_matches_question(query, self.question):
+        if (self._future is None or self._used or top_k is not None
+                or not query_matches_question(query, self.question)):
             return None
         self._used = True   # 无论成败只消费一次
         try:

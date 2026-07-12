@@ -106,6 +106,49 @@ def test_bounded_rejection_when_full():
     assert ex.active_count() == 0           # 释放后归零，第三次可提交
 
 
+class _FakeSpec:
+    """SpeculativeSearch 形状替身：只记 start 次数。"""
+
+    def __init__(self):
+        self.starts = 0
+
+    def start(self):
+        self.starts += 1
+
+
+def test_speculative_starts_on_admission_never_on_rejection():
+    """F1：投机检索由 submit 在 _acquire 占槽成功后起跑——被拒的 submit 零预取
+    （曾经构造即起跑：并发墙上每个 429 仍各烧一次 embedding+检索）。"""
+    store = _FakeStore()
+    gate = threading.Event()
+
+    def blocking_adjudicate(ctx, ev):
+        gate.wait(2)                        # 占住唯一 slot
+        return ToolResult.text_ok("r")
+
+    def _spec_ctx(spec):
+        return ExecutionContext.create(
+            request_id="r", user_id="u", acl_groups=["g"], roles=["employee"],
+            channel="console", thread_id="t", budget=RunBudget(max_turns=8),
+            speculative_search=spec)
+
+    ex = ThreadedRunExecutor(store, blocking_adjudicate, max_concurrent=1)
+    spec_admitted, spec_rejected = _FakeSpec(), _FakeSpec()
+    loop1 = DefaultAgentLoop(_scripted([
+        ModelTurn(tool_calls=[ProposedCall(call_id="c", tool_name="t")]),
+        ModelTurn(text="done"),
+    ]))
+    h1 = ex.submit(_spec_ctx(spec_admitted), loop1, [{"role": "user", "content": "q"}], [])
+    assert spec_admitted.starts == 1        # 占槽成功即起跑（先于工具消费，无竞态）
+    with pytest.raises(RunRejected):
+        ex.submit(_spec_ctx(spec_rejected),
+                  DefaultAgentLoop(_scripted([ModelTurn(text="x")])), [], [])
+    assert spec_rejected.starts == 0        # 被 429 拒 → 预取从未起跑
+    gate.set()
+    h1.wait(2)
+    ex.shutdown()
+
+
 def test_run_failure_transitions_failed():
     store = _FakeStore()
 

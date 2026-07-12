@@ -1023,9 +1023,41 @@ def test_invocation_reconcile_kb_admin_gate_and_resolution(runcenter_wired):
         api.app.dependency_overrides.clear()
 
 
+def test_get_runtime_double_checked_lock(monkeypatch):
+    """F6：冷实例上并发首调用只建**一套** runtime。曾经的无锁 check-then-act 让竞态
+    线程各建一套 executor（4-run 并发墙旁路，S9 冷启动 16 同刻首请求实测 16/16 全接纳）
+    + 每次竞态泄漏一条 reaper 线程。"""
+    import threading
+    import time
+
+    monkeypatch.setattr(agent_route, "_RUNTIME", None)
+    built = {"n": 0}
+
+    def slow_build():
+        built["n"] += 1
+        time.sleep(0.05)                    # 拉宽竞态窗口：无锁时 16 线程几乎必各建一套
+        return ("registry", "gateway", "executor", "run_store")
+
+    monkeypatch.setattr(agent_route, "_build_runtime", slow_build)
+    results = []
+    barrier = threading.Barrier(16)
+
+    def hit():
+        barrier.wait(5)                     # 同刻起跑
+        results.append(agent_route._get_runtime())
+
+    threads = [threading.Thread(target=hit) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert built["n"] == 1                  # 恰建一次
+    assert len(results) == 16 and all(r is results[0] for r in results)
+
+
 def test_speculative_retrieval_single_fetch(monkeypatch, wired):
-    """投机检索（2026-07-11）：submit 即预取，模型的凝练改写命中 → 全程只发生一次
-    真检索（预取那次），工具侧零二次检索。"""
+    """投机检索（2026-07-11；F1 后改准入起跑）：submit 占到槽即预取，模型的凝练改写
+    命中 → 全程只发生一次真检索（预取那次），工具侧零二次检索。"""
     monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
     calls = {"n": 0}
 
