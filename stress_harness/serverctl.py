@@ -29,6 +29,13 @@ def build_env(api_port: int, mock_port: int, overrides: Optional[Dict[str, str]]
     env = {
         **base,
         "RAG_ENVIRONMENT": "development",
+        # 一切「真」——真库 + 真 HTTP 打 mock。development 环境 simulate* 默认 True，会让
+        # 限流器 _persist_rejected（检查 cfg.simulate_db）静默丢弃台账写、plain-RAG 走假答
+        # 不打 mock。显式关掉四个 simulate 让配置与「真栈打替身外呼」的实际姿态一致。
+        "RAG_SIMULATE": "false",
+        "RAG_SIMULATE_API": "false",
+        "RAG_SIMULATE_DB": "false",
+        "RAG_SIMULATE_OPENSEARCH": "false",
         "RAG_AGENT_ENABLE": "true",
         "RAG_ONTOLOGY_ENABLE": "true",
         "RAG_SESSION_SIGNING_KEY": "stress-local-key",

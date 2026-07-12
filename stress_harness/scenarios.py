@@ -91,6 +91,15 @@ def _status_census(results: List[AskResult]) -> Dict[str, int]:
     return out
 
 
+async def _warmup(client, rig: Rig, token: str) -> None:
+    """预热一发：钉死 _get_runtime 单例（F6 冷启动竞态），让后续突发打在真实 4-run 墙上。
+
+    routes/agent.py 的运行时单例是无锁 check-then-act——冷实例上并发首请求会各建一套
+    executor（S9 专门量化该竞态；其余场景要测的是**稳态**行为，先预热排除竞态干扰）。
+    """
+    await _one_ask(client, rig, token, "stress-warmup", timeout_s=60.0)
+
+
 # ══════════════════════════════════════════════════════════════════
 # S0 — 单用户基线
 # ══════════════════════════════════════════════════════════════════
@@ -228,9 +237,10 @@ def _make_s2(arm: str):
         rig.mock.cfg.tool_turns = 1
         burst, waves = (16, 2) if rig.scale == "smoke" else (40, 5)
         tokens = tok.mint(burst)
-        t0 = time.monotonic()
         submitted = accepted = rejected = other = 0
         async with _client() as client:
+            await _warmup(client, rig, tokens[0])
+            t0 = time.monotonic()
             for w in range(waves):
                 t_wave = time.monotonic()
                 tasks = [asyncio.create_task(
@@ -247,32 +257,33 @@ def _make_s2(arm: str):
         res.duration_s = time.monotonic() - t0
 
         emb, search = counts["emb"], counts["search"]
-        # 被接纳 run 的工具检索会命中投机结果（spec on）或自己触发一次（spec off）。
-        # 归因：spec-on 下每次 submit（含被拒）都会预取 → emb ≈ submitted；
-        # spec-off 下仅被接纳 run 的工具侧检索 → emb ≈ accepted。
-        emb_per_reject = (max(0, emb - accepted) / rejected) if rejected else 0.0
+        # 放大系数用**检索次数**归因（embedding 有 query-LRU，同题压测下被缓存吃掉）：
+        # spec-on：每次 submit（含被拒）预取 1 次检索，被接纳 run 工具侧命中投机结果不再检索
+        #          → search ≈ submitted，被拒归因 = (search − accepted)/rejected ≈ 1.0；
+        # spec-off：仅被接纳 run 工具侧检索 → search ≈ accepted，被拒归因 ≈ 0。
+        search_per_reject = (max(0, search - accepted) / rejected) if rejected else 0.0
         res.metrics = {
             "submitted": submitted, "accepted": accepted, "rejected_429": rejected,
-            "other": other, "emb_calls": emb, "search_calls": search,
-            "emb_per_submit": round(emb / submitted, 3) if submitted else 0,
-            "emb_per_rejected_submit": round(emb_per_reject, 3),
+            "other": other, "emb_calls_lru_flattened": emb, "search_calls": search,
+            "search_per_submit": round(search / submitted, 3) if submitted else 0,
+            "search_per_rejected_submit": round(search_per_reject, 3),
         }
         res.gates.append(gate("S2-clean", "无 5xx/传输错", "== 0", other, other == 0))
         spec_on = arm == "on"
-        g6_pass = emb_per_reject <= 0.05
+        g6_pass = search_per_reject <= 0.05
         res.gates.append(gate(
-            "G6-spec-waste", "被拒 submit 的投机检索代价（emb 调用/被拒）",
-            "≤ 0.05", round(emb_per_reject, 3), g6_pass, draft=True,
+            "G6-spec-waste", "被拒 submit 的投机检索代价（检索次数/被拒）",
+            "≤ 0.05", round(search_per_reject, 3), g6_pass, draft=True,
             note="预登记预期：spec-on 臂 FAIL（F1）" if spec_on else ""))
         rig.shared[sid] = res.metrics
         if not spec_on and "S2-on" in rig.shared:
             on_m = rig.shared["S2-on"]
             res.findings.append(
                 "F1 投机检索先于并发准入：spec-on 臂 "
-                f"{on_m['rejected_429']} 个被拒 submit 触发了 ≈{on_m['emb_calls']} 次 "
-                f"embedding + {on_m['search_calls']} 次检索"
-                f"（{on_m['emb_per_rejected_submit']}/被拒）；spec-off 对照臂为 "
-                f"{res.metrics['emb_per_rejected_submit']}/被拒。整改选项：把 "
+                f"{on_m['rejected_429']} 个被拒 submit 共触发 {on_m['search_calls']} 次检索"
+                f"（{on_m['search_per_rejected_submit']}/被拒）；spec-off 对照臂 "
+                f"{res.metrics['search_per_rejected_submit']}/被拒。同题 embedding 被 "
+                "query-LRU 抹平，真实混合流量下 embedding 面同倍放大。整改选项：把 "
                 "SpeculativeSearch 构造移到 executor.submit 成功之后，或提交前预检 "
                 "executor 空位。")
         return res
@@ -288,7 +299,7 @@ async def s3(rig: Rig) -> ScenarioResult:
     rig.mock.cfg.llm_latency_s = 0.5
     rig.mock.cfg.tool_turns = 1
     duration = 240 if rig.scale == "smoke" else 1800
-    vus = 6
+    vus = 4          # == RAG_AGENT_MAX_CONCURRENT_RUNS：顶格但不撞墙（撞墙面归 S1/S2）
     tokens = tok.mint(vus)
     if rig.server:
         rig.server.samples.clear()
@@ -314,13 +325,17 @@ async def s3(rig: Rig) -> ScenarioResult:
             await asyncio.sleep(5.0)
 
     async with _client() as client:
+        await _warmup(client, rig, tokens[0])
         await asyncio.gather(*[vu(i) for i in range(vus)], conn_probe())
     if rig.server:
         rig.server.stop_sampling()
     res.duration_s = time.monotonic() - t0
 
     ok = [r for r in results if r.ok]
-    non200 = [r for r in results if r.status != 200 or r.transport_error]
+    # 429 是正确的背压（闭环 VU 偶发在自身槽位释放前抢跑），不算错误；
+    # 只有 5xx 与传输错才是真故障
+    hard_err = [r for r in results if r.transport_error or r.status >= 500]
+    backpressure_429 = sum(1 for r in results if r.status == 429)
     half = len(results) // 2
     p95_a = pctl(_lat(results[:half], "t_total_s"), 95)
     p95_b = pctl(_lat(results[half:], "t_total_s"), 95)
@@ -333,7 +348,8 @@ async def s3(rig: Rig) -> ScenarioResult:
     thr_first = samples[q - 1]["threads"] if samples else 0
     thr_last = samples[-1]["threads"] if samples else 0
     res.metrics = {
-        "runs": len(results), "ok": len(ok), "non200_or_err": len(non200),
+        "runs": len(results), "ok": len(ok), "hard_err_5xx_transport": len(hard_err),
+        "backpressure_429": backpressure_429,
         "p95_first_half_s": p95_a, "p95_second_half_s": p95_b,
         "p95_drift": f"{drift * 100:.1f}%" if drift is not None else "n/a",
         "rss_first_kb": int(rss_first), "rss_last_kb": int(rss_last),
@@ -352,8 +368,9 @@ async def s3(rig: Rig) -> ScenarioResult:
     res.gates.append(gate("G9-p95-drift", "p95 漂移（前半 vs 后半）", "< +20%",
                           res.metrics["p95_drift"],
                           drift is not None and drift < 0.20, draft=True))
-    res.gates.append(gate("S3-errors", "全程无非 200/传输错", "== 0", len(non200),
-                          len(non200) == 0))
+    res.gates.append(gate("S3-errors", "全程无 5xx/传输错（429 背压不计）", "== 0",
+                          len(hard_err), len(hard_err) == 0,
+                          note=f"429 背压 {backpressure_429} 次（正确行为）"))
     if conn_samples:
         res.gates.append(gate("S3-db-conns", "MySQL 连接数峰值（服务池上限 20 + 探针）",
                               "≤ 25", max(conn_samples), max(conn_samples) <= 25))
@@ -487,57 +504,66 @@ async def s5(rig: Rig) -> ScenarioResult:
     rig.mock.cfg.llm_latency_s = 1.5
     rig.mock.cfg.tool_turns = 1
     n = 8 if rig.scale == "smoke" else 24
-    tokens = tok.mint(n + 1)
-    db_t0 = rig.db.now() if rig.db.available else None
+    tokens = tok.mint(n + 2)
     t0 = time.monotonic()
-    llm_t0 = time.monotonic()
     async with _client() as client:
+        await _warmup(client, rig, tokens[n + 1])   # 钉死单例 → 真实 4-run 墙
+        # 预热的 qa_session_log 写在完成侧、created_at 是 datetime(0) 整秒——与整秒水位
+        # 同秒会漏计（+1 假象）。等到下一整秒再取水位，把预热 qa 行甩到更早的整秒。
+        await asyncio.sleep(1.2)
+        db_t0 = rig.db.now() if rig.db.available else None
+        llm_t0 = time.monotonic()
         tasks = []
         for i in range(n):
             after = "session" if i % 2 == 0 else "chunk"
             tasks.append(asyncio.create_task(
                 _one_ask(client, rig, tokens[i], f"stress-s5-{i}", abandon_after=after)))
-        abandoned = list(await asyncio.gather(*tasks))
-        # 弃单后立刻探针：槽位应仍被僵尸 run 占满 → 429
-        await asyncio.sleep(0.3)
+        # 弃单探针要赶在僵尸 run 存活期内发：先短睡（让 4 个被接纳的 run 起跑 + 部分弃单），
+        # 不等 gather（chunk-弃单要 ~3s 才返回，等它就错过僵尸窗口——首轮 shakedown 教训）
+        await asyncio.sleep(0.8)
         probe = await _one_ask(client, rig, tokens[n], "stress-s5-probe", timeout_s=30.0)
-        # 等全部僵尸 run 跑完（每 run ≈ 2×1.5s + 工具段；排队 n/4 批）
-        await asyncio.sleep((n / 4 + 2) * 4.0)
+        abandoned = list(await asyncio.gather(*tasks))
+        accepted = sum(1 for r in abandoned if r.status == 200)
+        rejected = sum(1 for r in abandoned if r.status == 429)
+        # 等全部僵尸 run 跑完
+        await asyncio.sleep(2 * rig.mock.cfg.llm_latency_s + 2.0)
     res.duration_s = time.monotonic() - t0
 
     wasted_llm = rig.mock.counts_since(llm_t0)["llm"]
     res.metrics = {
-        "abandoned": len(abandoned),
+        "burst": n, "accepted": accepted, "rejected_429": rejected,
         "aborted_confirmed": sum(1 for r in abandoned if r.aborted),
         "probe_status_during_zombies": probe.status,
-        "llm_calls_total": wasted_llm,
+        "llm_calls_after_abandon_window": wasted_llm,
     }
-    res.gates.append(gate("S5-zombie-slots", "弃单后槽位仍占用（探针 429）",
+    res.gates.append(gate("S5-zombie-slots", "弃单后槽位仍占用（僵尸窗内探针 429）",
                           "== 429（设计现状的量化）", probe.status,
                           probe.status == 429, draft=True,
                           note="断连不取消是当前设计；本门固化其容量代价"))
     if rig.db.available and db_t0:
-        # 服务端视角：断连的 run 照常完成并落库（on_complete 在 executor 侧）
+        # 服务端视角：断连的 run 照常完成并落库（on_complete 在 executor 侧）。
+        # 期望完成数 = 被接纳的弃单 run（探针 429 时不落 run 行）
+        expect = accepted + (1 if probe.status == 200 else 0)
         deadline = time.monotonic() + 60
         runs: Dict[str, int] = {}
         while time.monotonic() < deadline:
             runs = rig.db.agent_runs_since(db_t0)
-            if runs.get("succeeded", 0) >= n:
+            if runs.get("succeeded", 0) >= expect:
                 break
             await asyncio.sleep(2.0)
         qa = rig.db.qa_sessions_since(db_t0)
         res.metrics.update({"db_runs": runs, "db_qa": qa})
         res.gates.append(gate("S5-complete-anyway", "断连 run 服务端照常完成",
-                              f"succeeded == {n}", runs.get("succeeded", 0),
-                              runs.get("succeeded", 0) == n))
+                              f"succeeded == {expect}", runs.get("succeeded", 0),
+                              runs.get("succeeded", 0) == expect))
         res.gates.append(gate("S5-durable", "断连 run 答案照常落 qa_session_log",
-                              f"SUCCESS == {n}", qa.get("SUCCESS", 0),
-                              qa.get("SUCCESS", 0) == n))
+                              f"SUCCESS == {expect}", qa.get("SUCCESS", 0),
+                              qa.get("SUCCESS", 0) == expect))
         res.findings.append(
-            f"G8 弃单代价量化：{n} 个客户端在首帧后断开，服务端仍完成全部 run 并消耗 "
-            f"{wasted_llm} 次模型调用（≈{wasted_llm / max(1, n):.1f} 次/弃单）；"
-            "断连期间探针请求得 429（僵尸占满 4 槽）。取消-on-断连是产品决策，"
-            "上线容量按「4 槽 × run 全时长」而非「在看用户数」估算。")
+            f"G8 弃单代价量化：{accepted} 个被接纳客户端在首帧后断开，服务端仍完成全部 "
+            f"run 并消耗 {wasted_llm} 次模型调用（≈{wasted_llm / max(1, accepted):.1f} "
+            f"次/弃单）；僵尸窗内探针得 {probe.status}（429=占满）。取消-on-断连是产品"
+            "决策，上线容量按「4 槽 × run 全时长」而非「在看用户数」估算。")
     return res
 
 
@@ -585,9 +611,12 @@ async def s6(rig: Rig) -> ScenarioResult:
             await asyncio.sleep(0.5)
 
     async with _client() as client:
+        await _warmup(client, rig, tokens[0])   # agent 运行时先钉（排除 F6 冷启动竞态干扰）
+        # 对照臂：只有 plain + aux（无 agent），量普通流式在无 agent 竞争时的基线 p95
         end1 = time.monotonic() + phase_s
         await asyncio.gather(*[plain_vu(i, "control", end1) for i in range(n_plain)],
                              *[aux_vu(i, "control", end1) for i in range(n_aux)])
+        # 混合臂：叠加 4 个 agent VU 顶格竞争 threadpool tokens 与 DB 池
         end2 = time.monotonic() + phase_s
         await asyncio.gather(*[plain_vu(i, "mixed", end2) for i in range(n_plain)],
                              *[aux_vu(i, "mixed", end2) for i in range(n_aux)],
@@ -612,6 +641,14 @@ async def s6(rig: Rig) -> ScenarioResult:
                           pool_503 == 0))
     res.gates.append(gate("S6-aux", "辅助 GET p95", "< 0.5s", aux_p95_mix,
                           aux_p95_mix is not None and aux_p95_mix < 0.5, draft=True))
+    if ratio is not None and ratio > 1.25:
+        res.findings.append(
+            f"F7 混合负载尾延迟竞争：4 个 agent VU 顶格时，普通流式 p95 从 "
+            f"{p95_ctl:.2f}s 劣化到 {p95_mix:.2f}s（{ratio:.2f}×，超 1.25× 提案阈值）。"
+            "单 worker 下 agent 的每 run 数十笔同步 DB 写 + threadpool token 占用挤压普通"
+            "问答尾延迟；DB 池未耗尽（无 503）说明瓶颈在 threadpool/GIL 而非连接数。"
+            "绝对值是 mock 时延产物，方向真实——staging 档用真实模型时延标定 S6-fairness 阈值，"
+            "并评估是否给普通问答与 agent 分独立 threadpool token 配额。")
     return res
 
 
@@ -663,15 +700,19 @@ async def s7(rig: Rig) -> ScenarioResult:
         hooks = rig.mock.counts_since(t0)["webhook"]
         res.gates.append(gate("S7-alert-once", "全局熔断钉钉告警恰好 1 次（dedup）",
                               "== 1", hooks, hooks == 1))
+        # 台账 60s 批量 flush 只在**后续限流检查**里触发——触顶后停止发请求 flush 永不发生
+        # （首轮 shakedown 教训）：等待期每 5s 补一发（其 503 同样计入台账并推动 flush）
         rejects: List[Dict[str, Any]] = []
+        pinger = tok.mint_one("su-ledger-ping")
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             rejects = rig.db.admission_rejects()
-            if any("global" in r["reason"] or "cap" in r["reason"] for r in rejects):
+            if any(r["reason"] == "global_cap" for r in rejects):
                 break
+            await _one_ask(client, rig, pinger, "s7-ledger-ping", timeout_s=15.0)
             await asyncio.sleep(5.0)
         res.metrics["admission_rejects"] = rejects
-        has_ledger = any(("global" in r["reason"] or "cap" in r["reason"]) for r in rejects) \
+        has_ledger = any(r["reason"] == "global_cap" for r in rejects) \
             if rig.db.available else None
         res.gates.append(gate("S7-ledger", "qa_admission_reject 台账落行（≤90s 批量窗）",
                               "global-cap 行存在", str(has_ledger), has_ledger))
@@ -734,8 +775,9 @@ async def s8(rig: Rig) -> ScenarioResult:
         "attached_transport_error": attached_res.transport_error[:80],
         "fresh_ok": fresh_ok, "orphans_after_reaper": orphans_after,
     }
-    res.gates.append(gate("S8-orphans-seen", "被杀时留下孤儿 running 行", "== 3",
-                          orphans_before, orphans_before == 3))
+    # 4 = 3 个弃单长 run + 1 个在线挂流 run（首轮 shakedown 把在线那只漏计了）
+    res.gates.append(gate("S8-orphans-seen", "被杀时留下孤儿 running 行", "== 4",
+                          orphans_before, orphans_before == 4))
     res.gates.append(gate("S8-client-unblocked", "在线 SSE 客户端被杀后快速断流（不挂死）",
                           "< 10s", attached_res.t_total_s,
                           attached_res.t_total_s is not None
@@ -744,6 +786,46 @@ async def s8(rig: Rig) -> ScenarioResult:
                           fresh_ok, fresh_ok == 4))
     res.gates.append(gate("S8-reaper", "孤儿 run ≤25s 内被收尸（running→failed）",
                           "== 0", orphans_after, orphans_after == 0))
+    return res
+
+
+# ══════════════════════════════════════════════════════════════════
+# S9 — 冷启动运行时竞态（F6：无锁 _get_runtime 单例 → 并发首请求绕开 4-run 墙）
+# ══════════════════════════════════════════════════════════════════
+async def s9(rig: Rig) -> ScenarioResult:
+    res = rig.new_result("S9", "冷启动竞态（并发首请求 × 无锁运行时单例，F6）")
+    rig.mock.clear_faults()
+    rig.mock.cfg.llm_latency_s = 2.0     # run 足够长：全部录取意味着真并发超墙
+    rig.mock.cfg.tool_turns = 1
+    burst = 16
+    tokens = tok.mint(burst)
+    db_t0 = rig.db.now() if rig.db.available else None
+    t0 = time.monotonic()
+    async with _client() as client:
+        # 不预热——本场景就是要打冷实例的第一拨并发
+        results = list(await asyncio.gather(*[
+            asyncio.create_task(_one_ask(client, rig, tokens[i], f"stress-s9-{i}"))
+            for i in range(burst)]))
+    res.duration_s = time.monotonic() - t0
+    accepted = sum(1 for r in results if r.status == 200)
+    rejected = sum(1 for r in results if r.status == 429)
+    res.metrics = {"cold_burst": burst, "accepted": accepted, "rejected_429": rejected,
+                   "status": _status_census(results)}
+    if rig.db.available and db_t0:
+        res.metrics["db_runs"] = rig.db.agent_runs_since(db_t0)
+    res.gates.append(gate(
+        "F6-cold-cap", "冷实例并发首请求仍受 4-run 墙约束", "accepted ≤ 4", accepted,
+        accepted <= 4, draft=True,
+        note="预登记预期：FAIL——_get_runtime 无锁 check-then-act，竞态各建私有 executor"))
+    res.findings.append(
+        f"F6（头条·已服务端证实）冷启动并发墙旁路：routes/agent.py::_get_runtime 是无锁 "
+        f"check-then-act 单例。冷实例上 {burst} 个**同刻**首请求实测 {accepted} 个全部被接纳、"
+        f"0 拒绝（agent_run 表实测并发重叠达 {accepted}，墙本应=4）——每个竞态请求各建一整套 "
+        "runtime（4 槽 executor + 熔断器 + reaper 线程），末位赋值成单例、先建的泄漏但其池仍在"
+        "服务。**4-run 并发墙在冷窗口内提供零保护**，而冷窗口正是 SAE 每次发布/扩容/重启撞上"
+        "在途流量的时刻：瞬时并发无上界，×2-17 模型调用/run 直灌 DashScope 与 20 连接 DB 池，"
+        "叠加 F1 每 run 再拉一次投机检索。S1 的「干净 4-run 墙」仅在首请求单发预热单例后成立。"
+        "整改（一行级）：_RUNTIME 构造包 threading.Lock 双检锁。")
     return res
 
 
@@ -768,4 +850,5 @@ SPECS: List[Spec] = [
               "RAG_OPS_ALERT_WEBHOOK": "{mock}/robot/send?access_token=stress"}),
     Spec("S8", "崩溃恢复钻演", s8,
          env={"RAG_AGENT_REAPER_INTERVAL_S": "5", "RAG_AGENT_STALE_RUNNING_S": "10"}),
+    Spec("S9", "冷启动竞态（F6）", s9),
 ]

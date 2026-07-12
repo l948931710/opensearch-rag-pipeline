@@ -39,8 +39,15 @@ class DBProbe:
             conn.close()
 
     def now(self) -> dt.datetime:
-        """DB 侧时钟（切片水位统一用 DB NOW()，避免容器与 mysqld 时钟漂移）。"""
-        return self._query("SELECT NOW()")[0][0]
+        """DB 侧时钟水位，**下取整到整秒**。
+
+        表精度不一：agent_run/tool_invocation/llm_call_log.created_at 是 datetime(3)，
+        但 qa_session_log.created_at 是 datetime(0)（整秒）——若水位带微秒/毫秒，qa 行
+        （created_at 截到 .000）会掉到水位下方被漏计（S0-db-qa 5/6 假失败）。下取整到整秒
+        后两种精度都 >= 水位。跨场景不误纳：runner 每场景重启服务（>1s 间隔），同场景内的
+        预热 run 早于水位数秒，均落在更早的整秒，不会被整秒水位纳入。"""
+        t = self._query("SELECT NOW(6)")[0][0]
+        return t.replace(microsecond=0)
 
     # ── 断言面 ──────────────────────────────────────────────────
     def agent_runs_since(self, t0: dt.datetime) -> Dict[str, int]:

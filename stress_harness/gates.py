@@ -50,6 +50,8 @@ class ScenarioResult:
 
 def gate(name: str, desc: str, threshold: str, value: Any, passed: Optional[bool],
          draft: bool = False, note: str = "") -> GateResult:
+    if isinstance(value, float):
+        value = round(value, 3)      # 报告可读性：门实测值裁到 3 位小数
     return GateResult(gate=name, description=desc, threshold=threshold,
                       value=str(value), passed=passed, draft=draft, note=note)
 

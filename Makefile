@@ -129,3 +129,16 @@ agent-eval-gate: ## agent 评测出闸:对冻结基线,硬不变量恒 1.0;exit 
 agent-eval-baseline-freeze: ## 冻结 agent 评测基线: make agent-eval-baseline-freeze RESULTS=eval_harness/reports/agent_eval_<ts>.json
 	@test -n "$(RESULTS)" || { echo "用法: make agent-eval-baseline-freeze RESULTS=<report.json>"; exit 2; }
 	$(RAG_PY) -m eval_harness.agent.runner --freeze-baseline "$(RESULTS)"
+
+# ── agent 压测（生产上线 stress test）— 设计/手册见 docs/agent_stress_test_launch_plan_2026-07-12.md ──
+stress-smoke: ## 压测冒烟(mock 单测 + S0 基线;本地 MySQL 缺失时 DB 断言自动降级)
+	$(RAG_PY) -m pytest tests/test_stress_harness_smoke.py -q
+	$(RAG_PY) -m stress_harness.runner --scenario S0 --tier local --scale smoke
+
+stress-local: ## 全场景矩阵 S0-S8(零成本 mock 档;需本地 MySQL): make stress-local SCALE=full
+	$(RAG_PY) -m stress_harness.runner --scenario matrix --tier local --scale $(or $(SCALE),smoke)
+
+stress-staging: ## staging 真实计费档(硬预算中止):需 STRESS_STAGING_ACK/STRESS_TARGET_URL/STRESS_TARGET_TOKEN
+	@test "$(STRESS_STAGING_ACK)" = "I_UNDERSTAND_COSTS" || { echo "需 STRESS_STAGING_ACK=I_UNDERSTAND_COSTS(真实计费,手册见设计文档 §6)"; exit 2; }
+	@test -n "$(STRESS_BUDGET_MODEL_CALLS)" || { echo "需 STRESS_BUDGET_MODEL_CALLS=<N>(模型调用硬预算)"; exit 2; }
+	STRESS_STAGING_ACK=$(STRESS_STAGING_ACK) $(RAG_PY) -m stress_harness.runner --tier staging --budget-model-calls $(STRESS_BUDGET_MODEL_CALLS)

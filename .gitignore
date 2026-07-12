@@ -76,6 +76,11 @@ CLAUDE.md
 一期模型评测集和评测模板_v2.0(1).xlsx
 .env.metrics
 reports/
+# 例外：stress_harness 压测基线报告本体入库（交付物，体量小）；日志/wip 仍忽略
+!stress_harness/reports/
+!stress_harness/reports/*/
+!stress_harness/reports/*/report.json
+!stress_harness/reports/*/report.md
 
 # Vite console build
 console-app/node_modules/

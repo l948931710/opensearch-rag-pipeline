@@ -1,0 +1,51 @@
+# agent 压测（非阻断）：手动触发 workflow_dispatch。零成本 mock 档全矩阵（smoke 规模），
+# MySQL 走 service container + ci_load_schema。不进 required checks——压测门的裁决在
+# 上线手册（docs/agent_stress_test_launch_plan_2026-07-12.md），不在 PR CI。
+name: stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "smoke | full（full 含 30min 浸泡）"
+        default: "smoke"
+        required: false
+
+jobs:
+  stress-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: your_password
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -pyour_password"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install -U pip setuptools wheel
+          pip install -e ".[api,dev,production]"
+      - name: Load schema (both DBs, numeric order)
+        run: bash scripts/ci_load_schema.sh
+      - name: Harness unit smoke
+        run: python -m pytest tests/test_stress_harness_smoke.py -q
+      - name: Stress matrix
+        run: |
+          python -m stress_harness.runner --scenario matrix --tier local \
+            --scale "${{ github.event.inputs.scale || 'smoke' }}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-report
+          path: stress_harness/reports/
+          retention-days: 30

@@ -258,7 +258,10 @@ class MockBackend:
         h.send_header("Content-Type", "text/event-stream; charset=utf-8")
         h.send_header("Content-Length", str(len(payload)))
         h.end_headers()
-        h.wfile.write(payload)
+        try:
+            h.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # S5/S8 弃单场景客户端中途断连——预期内，非错误
 
     # ── Embedding ───────────────────────────────────────────────
     def _handle_embedding(self, h) -> None:
