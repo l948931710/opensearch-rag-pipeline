@@ -5589,6 +5589,8 @@ def node_deactivate_old_chunks(ctx: dict):
     操作：
     1. RDS: UPDATE chunk_meta SET is_active=FALSE WHERE doc_id=X AND version_no < current
     2. OpenSearch: DELETE BY QUERY { doc_id=X AND version_no < current }
+    3. RDS: 版本级 supersede（2026-07-12 双 active 审计补齐）——仅对本批收尾 SUCCESS 的文档，
+       UPDATE document_version SET status='superseded' WHERE version_no < current AND status='active'
     """
     if ctx.get("dag_id") == "dag3_chunk_to_opensearch" and ctx.get("dag3_no_work"):
         print("    [SKIP] node_deactivate_old_chunks skipped because ctx['dag3_no_work'] is True.")
@@ -5912,6 +5914,9 @@ def node_deactivate_old_chunks(ctx: dict):
                     else:
                         final_status = DocVersionIndexStatus.SUCCESS
                     print(f"    ├─ [SIMULATED] RDS: Updated document_version status for {doc_id} v{ver} to '{final_status}'")
+                    if final_status == DocVersionIndexStatus.SUCCESS:
+                        print(f"    ├─ [SIMULATED] RDS: superseded older active document_version rows "
+                              f"for {doc_id} (version_no < {ver})")
         else:
             conn = None
             try:
@@ -5970,6 +5975,28 @@ def node_deactivate_old_chunks(ctx: dict):
                             print(f"    ├─ ⚠️ {len(_dvs) - _st_rc} 个版本收尾被跳过"
                                   f"（index_status 已非 PROCESSING，可能被控制台置 PENDING_DELETE——"
                                   f"保留其握手令牌，交 reconcile 清除）")
+
+                    # 版本级 supersede（2026-07-12 双 active 审计缺口）：chunk 级停用只写 chunk_meta，
+                    # document_version 旧 active 行此前无任何管道路径降级——version-bump 重灌后每 doc
+                    # 留下双 status='active'（7-06 批 485/485 + 窗口外存量 104；纯台账脏，无双服务）。
+                    # 与「先索引后停用」同序、同一事务：只对本批收尾 SUCCESS（新版本全量 INDEXED、
+                    # 旧 chunk 已停用）的文档降级旧版本行；FAILED / LIMIT-推迟（NOT_INDEXED）的文档
+                    # 旧版本仍在服务，绝不提前 supersede。CAS on status='active' 幂等（重跑/SUCCESS-
+                    # relock 无副作用），且不碰 retired（控制台退役）行；只写 status、不动 index_status，
+                    # 不影响 PENDING_DELETE 删除握手。
+                    _sp_dvs = _status_groups.get(DocVersionIndexStatus.SUCCESS, [])
+                    if _sp_dvs:
+                        _sp_clause = " OR ".join(
+                            ["(doc_id = %s AND version_no < %s)"] * len(_sp_dvs))
+                        _sp_params = tuple(p for dv in _sp_dvs for p in dv)
+                        cursor.execute(f"""
+                            UPDATE document_version
+                            SET status = 'superseded'
+                            WHERE ({_sp_clause}) AND status = 'active'
+                        """, _sp_params)
+                        _sp_rc = getattr(cursor, "rowcount", None)
+                        if isinstance(_sp_rc, int) and _sp_rc > 0:
+                            print(f"    ├─ RDS: superseded {_sp_rc} older active document_version row(s)")
                 conn.commit()
             except Exception as e:
                 if conn: conn.rollback()
