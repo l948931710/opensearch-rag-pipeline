@@ -219,7 +219,10 @@ def test_multicall_resume_rejected_feedback_still_processes_remaining():
     assert isinstance(events[-1], RunCompleted)
 
 
-def test_checkpoint_roundtrip_with_remaining_calls():
+def test_checkpoint_roundtrip_with_remaining_calls(monkeypatch):
+    # 钉【无密钥】legacy sha256 路径（HMAC 路径在 test_agent_checkpoint_security 钉）
+    monkeypatch.delenv("RAG_AGENT_CHECKPOINT_KEY", raising=False)
+    monkeypatch.delenv("RAG_SESSION_SIGNING_KEY", raising=False)
     remaining = [{"call_id": "c3", "tool_name": "read_c", "arguments": {"q": 1}}]
     blob, digest = encode_checkpoint([{"role": "user", "content": "q"}],
                                      pending_call={"call_id": "c2", "tool_name": "w",

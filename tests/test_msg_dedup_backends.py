@@ -2,7 +2,8 @@
 """
 test_msg_dedup_backends.py — 钉钉 msgId 去重双后端（WS0-3 + 评审 C4 两阶段）
 
-memory 后端（默认）：首见即登记，行为不变。
+memory 后端（默认）：首见即登记；release 真释放（P1-3 对齐 redis 两阶段——处理失败
+  后重投可重试，不再在 TTL 窗口内被永久吞）。
 redis 后端：claim 领用（短 TTL）→ 处理成功 confirm 升级 done+完整窗 / 处理失败 release
   释放领用（不永久吞消息）。redis 故障 fail-open。
 """
@@ -33,8 +34,11 @@ def test_memory_set_first(monkeypatch):
     assert db._is_duplicate_msg("m1") is False   # 首见
     assert db._is_duplicate_msg("m1") is True     # 二次
     db._confirm_msg("m1")                          # memory 无操作
-    db._release_msg("m1")                          # memory 无操作
-    assert db._is_duplicate_msg("m1") is True     # 仍去重（memory release 不改变语义）
+    assert db._is_duplicate_msg("m1") is True     # confirm 后窗口内仍去重
+    # P1-3：memory 后端 release 也真释放（对齐 redis 两阶段语义）——处理失败后
+    # 钉钉重投可重试，不再被首见登记在 TTL 窗口内永久吞掉
+    db._release_msg("m1")
+    assert db._is_duplicate_msg("m1") is False    # 释放后重投按新消息处理
 
 
 def test_empty_msgid_never_duplicate(monkeypatch):

@@ -77,7 +77,11 @@ def test_max_turns_yields_failed():
     assert any(isinstance(e, RunFailed) and "max_turns" in e.error for e in seen)
 
 
-def test_checkpoint_codec_round_trip():
+def test_checkpoint_codec_round_trip(monkeypatch):
+    # 本测试钉的是【无密钥】legacy 路径（裸 sha256）；xdist 同 worker 的其他测试可能
+    # 留下签名密钥 env → 编码走 hmac1: 前缀（HMAC 路径在 test_agent_checkpoint_security 钉）
+    monkeypatch.delenv("RAG_AGENT_CHECKPOINT_KEY", raising=False)
+    monkeypatch.delenv("RAG_SESSION_SIGNING_KEY", raising=False)
     msgs = [{"role": "user", "content": "你好"}, {"role": "assistant", "content": "在"}]
     blob, digest = encode_checkpoint(msgs)
     assert decode_checkpoint(blob) == msgs and len(digest) == 64
