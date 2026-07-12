@@ -63,6 +63,7 @@ done
 run_sql <<'SQL'
 CREATE DATABASE IF NOT EXISTS fuling_knowledge CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE DATABASE IF NOT EXISTS fuling_operation CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS fuling_ontology CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 SQL
 
 # ── 3. file→目标库清单（权威矩阵见 schema/README.md）─────────────────────────
@@ -93,9 +94,21 @@ MANIFEST="
 019_chunk_meta_index_retry.sql knowledge
 020_document_version_simhash.sql knowledge
 021_ingest_quality_metrics.sql knowledge
+022_agent_runtime.sql operation
+023_llm_call_log.sql operation
+024_agent_audit_log.sql operation
+025_approval_workflow.sql operation
+026_agent_family_collation_request_id.sql operation
+027_ontology_core.sql ontology
+028_ontology_identity.sql ontology
+029_ontology_link.sql ontology
+030_sem_views.sql ontology
+031_agent_approval_execution_hardening.sql operation
+032_schema_migrations_checksum.sql both
+033_ontology_link_invariants.sql ontology
 "
 
-db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }
+db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }
 
 # 完整性闸：schema/ 里出现清单外的编号文件 = 有人加了迁移没更新本脚本 → 直接红
 for f in "$SCHEMA_DIR"/[0-9]*.sql; do
@@ -140,8 +153,9 @@ echo "$MANIFEST" | while read -r base target; do
   file="$SCHEMA_DIR/$base"
   [ -f "$file" ] || die "清单里的 schema/$base 不存在"
   case "$target" in
-    knowledge|operation) apply_whole "$file" "$(db_of "$target")" ;;
-    both)  apply_whole "$file" fuling_knowledge; apply_whole "$file" fuling_operation ;;
+    knowledge|operation|ontology) apply_whole "$file" "$(db_of "$target")" ;;
+    both)  apply_whole "$file" fuling_knowledge; apply_whole "$file" fuling_operation; \
+           apply_whole "$file" fuling_ontology ;;   # 011 台账表：三库各一份（PR-B）
     split) apply_split "$file" ;;
     *) die "schema/$base 目标 '$target' 不合法" ;;
   esac
@@ -161,6 +175,7 @@ assert_absent() { [ "$(table_count "$1" "$2")" = "0" ] || die "表 $1.$2 不该�
 
 assert_collation fuling_knowledge
 assert_collation fuling_operation
+assert_collation fuling_ontology
 for t in document_meta document_version chunk_meta pipeline_run user_role dept_admin_grant \
          kb_access_request kb_acl_projection_outbox schema_migrations; do
   assert_table fuling_knowledge "$t"
@@ -169,9 +184,20 @@ for t in qa_session_log user_feedback escalation_ticket qa_daily_metrics qa_conv
          kb_contribution qa_retrieved_doc schema_migrations; do
   assert_table fuling_operation "$t"
 done
+# 本体独立库（PR-B P0-02）：表族全量落 fuling_ontology，fuling_ro 不授本库
+for t in ontology_object ontology_identifier ontology_resolution_case \
+         ontology_resolution_candidate ontology_link ontology_ref_seq \
+         ontology_attribute_source ontology_stewardship ontology_source_population \
+         sem_packing sem_stacking schema_migrations; do
+  assert_table fuling_ontology "$t"
+done
 # 错灌金丝雀（qa_session_log/user_feedback 合法地双库都有——001 初版在 knowledge，不做金丝雀）
 assert_absent fuling_knowledge qa_daily_metrics
 assert_absent fuling_knowledge kb_contribution
+assert_absent fuling_knowledge ontology_object
 assert_absent fuling_operation chunk_meta
+assert_absent fuling_operation ontology_object
+assert_absent fuling_ontology qa_session_log
+assert_absent fuling_ontology chunk_meta
 
-echo "✅ schema 双库加载完成并通过落库断言"
+echo "✅ schema 三库加载完成并通过落库断言"

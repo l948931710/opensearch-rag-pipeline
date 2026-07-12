@@ -249,3 +249,236 @@ test.describe('UX 硬门 — AI 助手交互', () => {
     ]);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 审批中心（本轮 IA 重构）：三条审批流（Agent 高风险 / 上传入库 / 跨部门授权）收进单一
+// 「审批」tab，待办/历史同址切换；文档管理回归纯台账。旧 tab=agent / tab=history 走别名。
+// 进入方式与「AI 助手」组一致：?token= 透传登录 + mock /api/kb/whoami（不用 ?preview，
+// 否则 authed 请求被合成 503、page.route 截不到）。ManageView 挂载会并发拉一串管理接口，
+// 先注册 catch-all 空响应、再注册专属 mock（Playwright 后注册者优先）。
+// ─────────────────────────────────────────────────────────────────────────────
+test.describe('UX 硬门 — 审批中心', () => {
+  const MANAGE_ROUTE = '/console/manage?token=e2e-fake-token';
+
+  const AREQ = (over: Record<string, unknown> = {}) => ({
+    request_id: 'ap1', run_id: 'r1', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0',
+    proposed_args: { qty: 120, item: 'PP 刀叉 8寸' }, args_digest: 'd',
+    render_summary: 'u8_writeback(item, qty)', requested_by: 'user_wang', requested_dept: 'production',
+    approver_scope: 'production', status: 'pending', expires_at: '2026-07-12 20:00:00',
+    created_at: '2026-07-09 20:00:00', decided_at: null, ...over,
+  });
+  const ACCESS_REQ = (over: Record<string, unknown> = {}) => ({
+    id: 'ar1', doc_id: 'D1', doc_title: '营销物料使用规范 v3', owner_dept: 'production',
+    requester_dept: 'marketing', requester_name: '王伟', permission_level: 'dept_internal',
+    reason: '包装设计需引用营销规范。', created_at: '2026-07-09', ...over,
+  });
+  const UPLOAD_REQ = (over: Record<string, unknown> = {}) => ({
+    doc_id: 'P1', version_no: 2, title: '2026 客户验厂应答模板', original_filename: '验厂应答.docx',
+    owner_dept: 'quality', permission_level: 'public', owner_name: '李娜', created_at: '2026-06-27', ...over,
+  });
+
+  interface MockOpts {
+    role?: 'dept_admin' | 'kb_admin';
+    agent?: object | number;          // /api/agent/approvals 响应体或状态码（404/403）
+    access?: object[];                // 授权申请（dept_admin 职责）
+    uploads?: object[];               // 上传审批（kb_admin 职责）
+    history?: object[];               // 审批历史
+    contribs?: object[];              // 待审核知识贡献（跳转 chip）
+  }
+  function mockManage(page: import('@playwright/test').Page, o: MockOpts = {}) {
+    // catch-all：ManageView 的其余 loaders 全部回空（避免 4xx 触发 console guard）
+    return Promise.all([
+      page.route('**/api/**', (r) => r.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ items: [], questions: [], docs: [], total: 0 }),
+      })),
+      page.route('**/api/kb/whoami', (r) => r.fulfill({
+        contentType: 'application/json', body: JSON.stringify({
+          user_id: 'admin1', display_name: '生产部管理员', role: o.role ?? 'dept_admin',
+          can_manage_kb: true, acl_groups: ['production'], managed_owner_depts: ['production'],
+        }),
+      })),
+      page.route('**/api/agent/approvals*', (r) => (
+        typeof o.agent === 'number'
+          ? r.fulfill({ status: o.agent, contentType: 'application/json', body: JSON.stringify({ detail: 'Not Found' }) })
+          : r.fulfill({ contentType: 'application/json', body: JSON.stringify(o.agent ?? { items: [] }) })
+      )),
+      page.route('**/api/kb/access-requests*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.access ?? [] }) })),
+      page.route('**/api/kb/pending-approvals*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.uploads ?? [] }) })),
+      page.route('**/api/kb/approval-history*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.history ?? [] }) })),
+      page.route('**/api/kb/contributions/pending*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.contribs ?? [], has_more: false }) })),
+    ]);
+  }
+  const approvalsTab = (page: import('@playwright/test').Page) =>
+    page.locator('[aria-label="管理台分区"]').getByRole('tab', { name: /审批/ });
+
+  test('聚合角标 = 授权 + Agent；待办面按风险降序（Agent 区块在授权之上），无横向滚动', async ({ page }) => {
+    const guard = attachConsoleGuard(page);
+    await mockManage(page, {
+      agent: { items: [AREQ(), AREQ({ request_id: 'ap2', run_id: 'r2', proposed_args: { qty: 40 } })] },
+      access: [ACCESS_REQ()],
+    });
+    await page.goto(MANAGE_ROUTE);
+    const tab = approvalsTab(page);
+    await expect(tab, '审批 tab 常驻（不随 Agent 端点探测消失）').toBeVisible();
+    await expect(tab, '角标 = 角色职责队列(授权1) + Agent(2)').toContainText('3');
+    await tab.click();
+    await expect(page.getByText('Agent 高风险操作审批')).toBeVisible();
+    await expect(page.getByText('授权申请', { exact: true })).toBeVisible();
+    // 风险降序：批准即执行的 Agent 区块必须排在常规授权之上
+    const agentBox = await page.getByText('Agent 高风险操作审批').boundingBox();
+    const accessBox = await page.getByText('授权申请', { exact: true }).boundingBox();
+    expect(agentBox && accessBox && agentBox.y < accessBox.y, 'Agent 区块应在授权申请之上').toBeTruthy();
+    await expect(page.getByText('qty=120')).toBeVisible();      // 脱敏后参数可核对
+    await assertKeyActionsVisible([
+      page.getByRole('button', { name: '批准' }).first(),
+      page.getByRole('button', { name: '驳回' }).first(),
+      page.getByRole('button', { name: '终止' }).first(),
+    ]);
+    await assertNoHorizontalScroll(page);
+    guard.assertClean();
+  });
+
+  test('kb_admin 角标 = 上传 + Agent；授权申请按拍板不呈现、不计数', async ({ page }) => {
+    await mockManage(page, {
+      role: 'kb_admin',
+      agent: { items: [AREQ()] },
+      uploads: [UPLOAD_REQ(), UPLOAD_REQ({ doc_id: 'P2', version_no: 1 })],
+      access: [ACCESS_REQ()],   // 后端兜底通道有数据 → console 仍不呈现（拍板 2026-07-04）
+    });
+    await page.goto(MANAGE_ROUTE);
+    const tab = approvalsTab(page);
+    await expect(tab).toContainText('3');                        // 2 上传 + 1 Agent，授权不计
+    await tab.click();
+    await expect(page.getByText('待审批队列')).toBeVisible();     // 上传审批区块
+    await expect(page.getByText('授权申请', { exact: true })).toHaveCount(0);
+  });
+
+  test('职责分离：自己发起的申请 → 批准/驳回禁用、动作变「撤回」', async ({ page }) => {
+    await mockManage(page, { agent: { items: [AREQ({ requested_by: 'admin1' })] } });   // == whoami user_id
+    await page.goto(MANAGE_ROUTE);
+    await approvalsTab(page).click();
+    await expect(page.getByText('我发起的')).toBeVisible();
+    await expect(page.getByRole('button', { name: '批准' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '驳回' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '撤回' })).toBeEnabled();
+  });
+
+  test('批准有二次确认，确认后 POST /api/agent/approve 且行移除 → 聚合空态', async ({ page }) => {
+    await mockManage(page, { agent: { items: [AREQ()] } });
+    const posts: string[] = [];
+    await page.route('**/api/agent/approve', (r) => {
+      posts.push(r.request().postData() || '');
+      return r.fulfill({ contentType: 'text/event-stream', body: 'data: [DONE]\n\n' });
+    });
+    await page.goto(MANAGE_ROUTE);
+    await approvalsTab(page).click();
+    await page.getByRole('button', { name: '批准' }).click();
+    const dlg = page.locator('[role="alertdialog"], [role="dialog"]');
+    await expect(dlg, '批准是不可撤回的执行放行，必须有二次确认').toBeVisible();
+    await dlg.getByRole('button', { name: /批准执行/ }).click();
+    // 最后一件清空 → 全队列空 → 聚合空态（三条流共用，不再各自留空卡）
+    await expect(page.getByTestId('approval-empty')).toBeVisible();
+    await expect(page.getByText('当前没有待你处理的审批')).toBeVisible();
+    expect(posts.length).toBe(1);
+    const body = JSON.parse(posts[0]);
+    expect(body.run_id).toBe('r1');
+    expect(body.outcome.kind).toBe('approved');
+    expect(body.idempotency_key).toBe('ap1:approved');
+  });
+
+  test('RAG_AGENT_ENABLE 未开（端点 404）→ Agent 区块不出现，审批 tab 常驻且角标只数 kb 队列', async ({ page }) => {
+    await mockManage(page, { agent: 404, access: [ACCESS_REQ()] });
+    await page.goto(MANAGE_ROUTE);
+    const tab = approvalsTab(page);
+    await expect(tab).toBeVisible();
+    await expect(tab).toContainText('1');                        // 仅授权申请
+    await tab.click();
+    await expect(page.getByText('Agent 高风险操作审批')).toHaveCount(0);   // 功能未开不造噪声
+    await expect(page.getByText('授权申请', { exact: true })).toBeVisible();
+  });
+
+  test('旧深链别名：?tab=agent → 审批待办面；?tab=history → 审批历史面', async ({ page }) => {
+    await mockManage(page, {
+      agent: { items: [AREQ()] },
+      history: [
+        { kind: 'access', action: 'approved', title: '营销物料使用规范 v3', subject: '王伟',
+          owner_dept: 'production', decided_by_name: '生产部管理员', decided_at: '2026-07-08 10:00:00', detail: '', extra: '' },
+        // agent 类（后端五类扩展）：终止决策 → 时间线要能渲染类型/动作/发起人
+        { kind: 'agent', action: 'rejected_terminate', title: 'u8_writeback', subject: '王伟',
+          owner_dept: 'production', decided_by_name: '生产部管理员', decided_at: '2026-07-07 09:00:00', detail: '', extra: '' },
+      ],
+    });
+    await page.goto(`${MANAGE_ROUTE}&tab=agent`);
+    await expect(approvalsTab(page)).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByText('Agent 高风险操作审批')).toBeVisible();
+
+    await page.goto(`${MANAGE_ROUTE}&tab=history`);
+    await expect(approvalsTab(page)).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('approval-history')).toBeVisible();
+    await expect(page.getByText('营销物料使用规范 v3')).toBeVisible();   // 时间线有内容，不是空壳
+    await expect(page.getByText('u8_writeback')).toBeVisible();          // agent 决策同列时间线
+    await expect(page.getByText('发起人 王伟')).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'Agent 操作' })).toBeVisible();   // 类型筛选 chip
+  });
+
+  test('全空 → 聚合空态可见 + 知识贡献跳转 chip 带计数直达贡献页', async ({ page }) => {
+    await mockManage(page, { contribs: [{ contribution_id: 'c1' }, { contribution_id: 'c2' }] });
+    await page.goto(MANAGE_ROUTE);
+    await approvalsTab(page).click();
+    await expect(page.getByTestId('approval-empty')).toBeVisible();
+    const chip = page.getByTestId('approval-contrib-link');
+    await expect(chip).toContainText('2');
+    await chip.getByRole('link', { name: '去处理' }).click();
+    await expect(page).toHaveURL(/\/contribute/);
+  });
+
+  test('文档管理回归纯台账：无队列区块，台账表头首屏可见（无需滚动）', async ({ page }) => {
+    // 队列非空（审计基线里正是该状态把台账推出首屏 110~283px）——现在队列在审批 tab，不影响台账
+    await mockManage(page, { agent: { items: [AREQ()] }, access: [ACCESS_REQ()] });
+    await page.goto(`${MANAGE_ROUTE}&tab=docs`);
+    await expect(page.getByText('文档台账')).toBeVisible();
+    await expect(page.getByText('待审批队列')).toHaveCount(0);
+    await expect(page.getByText('Agent 高风险操作审批')).toHaveCount(0);
+    const head = page.locator('.led-head');
+    await expect(head).toBeVisible();
+    const box = await head.boundingBox();
+    const vp = page.viewportSize();
+    expect(box && vp && box.y >= 0 && box.y + box.height <= vp.height,
+      `台账表头须在首屏内（y=${box?.y}, 视口高=${vp?.height}）`).toBeTruthy();
+  });
+
+  test('桌面 ?token 刷新不再死胡同：token tab 级续存，reload 后自动重登且 URL 仍无 token', async ({ page }) => {
+    await mockManage(page, { access: [ACCESS_REQ()] });
+    await page.goto(MANAGE_ROUTE);
+    await expect(page.getByRole('tab', { name: /概览看板/ })).toBeVisible();
+    expect(page.url(), '#F-console-urltoken：token 抹除不回退').not.toContain('token=');
+    await page.reload();
+    await expect(page.getByRole('tab', { name: /概览看板/ }),
+      '刷新后应用 sessionStorage 续存 token 自动重登，而非「未能完成免登」死胡同').toBeVisible();
+    await expect(page.getByText('未能完成免登')).toHaveCount(0);
+    expect(page.url()).not.toContain('token=');
+  });
+
+  test('切子 tab 不整树重挂载：/api/kb/my-docs 全程只请求一次', async ({ page }) => {
+    await mockManage(page, { access: [ACCESS_REQ()] });
+    let myDocsHits = 0;
+    await page.route('**/api/kb/my-docs*', (r) => {
+      myDocsHits += 1;
+      return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: [], total: 0 }) });
+    });
+    await page.goto(MANAGE_ROUTE);
+    await expect(page.getByRole('tab', { name: /概览看板/ })).toBeVisible();
+    await page.getByRole('tab', { name: /文档管理/ }).click();
+    await expect(page.getByText('文档台账')).toBeVisible();
+    await approvalsTab(page).click();
+    await expect(page.getByText('授权申请', { exact: true })).toBeVisible();
+    await page.getByRole('tab', { name: /文档管理/ }).click();
+    await expect(page.getByText('文档台账')).toBeVisible();
+    expect(myDocsHits, '子 tab 切换曾整树重挂载 ManageView、每次重发 9~12 个请求（审计问题2）').toBe(1);
+  });
+});

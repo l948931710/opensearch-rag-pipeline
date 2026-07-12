@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
+import { __resetIdentityScope, identityFingerprint, registerIdentityScopedStore, syncIdentityScope } from '@/composables/identityScope'
 import { GROUP_LABEL, deptLabel, uploadErrText } from '@/lib/kb'
 
 // 失败类提示统一走应用内告知框（useDialog 单例状态挂模块作用域，此处直接取用；不再用原生 alert）。
@@ -10,6 +11,7 @@ const { notice } = useDialog()
 // 知识贡献单例 store（员工众包问答 → 部门管理员采纳 → 走管线入库）。
 // 后端契约见 api.py /api/kb/gaps · /api/kb/contributions*；身份复用 P1 session（whoami）。
 // 写接口后端【现查】授权；前端 role 仅作 UI 门禁。SAE 未部署本特性时 → loader 静默兜底空。
+// P0-D：模块级状态挂 identityScope——身份/token 一变同步清空；loader 入口 lazy 对账。
 
 export interface GapItem {
   question: string                  // 已脱敏的提问原文
@@ -103,6 +105,8 @@ function _previewHeroes(): HeroItem[] {
 
 // ── 加载 ──
 async function loadGaps(offset = 0) {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') {
     const r = _previewGaps(); gaps.value = r.items; gapsSummary.value = r.summary; gapsHasMore.value = false; return
@@ -110,35 +114,53 @@ async function loadGaps(offset = 0) {
   loadingGaps.value = true; clearLoadError('gaps')
   try {
     const r = await apiJson<GapsResp>(`/api/kb/gaps?limit=20&offset=${offset}`, { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的缺口数据整体丢弃
     gaps.value = offset ? [...gaps.value, ...(r.items || [])] : (r.items || [])
     gapsSummary.value = r.summary || null
     gapsHasMore.value = !!r.has_more
-  } catch (e) { if (!offset) { gaps.value = []; gapsSummary.value = null } ; noteLoadError('gaps', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    if (!offset) { gaps.value = []; gapsSummary.value = null } ; noteLoadError('gaps', e)
+  }
+  // finally 不设指纹门：身份切换路径上 reset 已把 loadingGaps 置 false，这里再置一次无冲突
   finally { loadingGaps.value = false }
 }
 
 async function loadMine() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') { myContribs.value = _previewMine(); return }
   clearLoadError('mine')
   try {
     const r = await apiJson<ContribListResp>('/api/kb/contributions/mine?limit=50', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的「我的贡献」整体丢弃
     myContribs.value = r.items || []
-  } catch (e) { myContribs.value = []; noteLoadError('mine', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    myContribs.value = []; noteLoadError('mine', e)
+  }
 }
 
 async function loadPending() {
+  syncIdentityScope()               // P0-D：待审贡献是审批面板一员，读取前同样对账
+  const fp = identityFingerprint()
   const s = useSession()
   if (!s.identity?.canManage) { pendingContribs.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = _previewPending(); return }
   clearLoadError('pending')
   try {
     const r = await apiJson<ContribListResp>('/api/kb/contributions/pending?limit=50', { auth: true })
+    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的待审贡献整体丢弃
     pendingContribs.value = r.items || []
-  } catch (e) { pendingContribs.value = []; noteLoadError('pending', e) }
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    pendingContribs.value = []; noteLoadError('pending', e)
+  }
 }
 
 async function loadHeroes() {
+  syncIdentityScope()
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') { heroes.value = _previewHeroes(); return }
   try {
@@ -232,11 +254,20 @@ export function useContribute() {
   }
 }
 
-/** 仅供测试：重置 store。 */
-export function __resetContribute() {
+/** 重置 store（运行期身份切换与测试复位共用；含半填的贡献表单——不跨身份残留）。 */
+function _resetContributeState() {
   gaps.value = []; gapsSummary.value = null; gapsHasMore.value = false
   myContribs.value = []; pendingContribs.value = []; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''
   formSourceMsg.value = ''; formGapQuery.value = ''; submitBusy.value = false; submitErr.value = ''; submitOk.value = false
 }
+
+/** 仅供测试：重置 store + 忘掉已观测身份（下次 sync 首见采纳）。 */
+export function __resetContribute() {
+  _resetContributeState()
+  __resetIdentityScope()
+}
+
+// P0-D：身份/token 变更 → 同步清空（identityScope 统一触发）。
+registerIdentityScopedStore('contribute', _resetContributeState)

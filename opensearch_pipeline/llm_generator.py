@@ -304,6 +304,7 @@ def _format_context_ex(
     chunks: List[Dict[str, Any]],
     max_chars: int = 6000,
     pure_text: bool = False,
+    meta_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """将检索到的 chunks 组装为 prompt context，同时返回【实际进入 context 的 chunk 子集】。
 
@@ -333,6 +334,7 @@ def _format_context_ex(
     n_dropped_with_images = 0
     salvage_start = len(chunks)   # 首个未进 context 的 chunk 下标
     salvaged_idx: List[int] = []  # img-aware 压缩条目补回的尾块下标（也算「进了 context」）
+    halfcut_idx: List[int] = []   # 半截纳入的块下标（至多 1 个；meta_out 消费方用）
 
     for i, chunk in enumerate(chunks):
         header = _chunk_header(i, chunk, pure_text)
@@ -347,6 +349,7 @@ def _format_context_ex(
                 if "\n" in cut:
                     # 切点在正文内：header（含标记）完整，保持原截断行为
                     parts.append(cut + "...(截断)")
+                    halfcut_idx.append(i)
                     salvage_start = i + 1
                 else:
                     # #F-mm11a：header 首行都放不下 → 整条放弃，绝不漏半截标记
@@ -403,6 +406,15 @@ def _format_context_ex(
 
     # included = 主纳入块 + img-aware 补回块（保持检索排序：尾部补回块接在主块之后）
     included = list(chunks[:salvage_start]) + [chunks[j] for j in salvaged_idx]
+    if meta_out is not None:
+        # 消费方契约（agent_tools/knowledge_search 去重登记等）：full_idx=完整正文进过
+        # context 的块下标；半截/salvage 压缩条目【不算完整展开】——去重登记只认 full_idx，
+        # 否则被截块的后半段在同 run 内永久不可再展开（评审 R①-1）。
+        meta_out["full_idx"] = [i for i in range(salvage_start) if i not in halfcut_idx]
+        meta_out["halfcut_idx"] = list(halfcut_idx)
+        meta_out["salvaged_idx"] = list(salvaged_idx)
+        meta_out["dropped_idx"] = [j for j in range(salvage_start, len(chunks))
+                                   if j not in salvaged_idx]
     return "\n---\n".join(parts), included
 
 
@@ -821,32 +833,44 @@ def generate_answer(
     # 调用 DashScope (OpenAI compatible-mode)
     url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
 
+    # 非流式同样关闭思考（默认 False）：思考拖慢且 DashScope 对 qwen3 非流式+思考支持受限。
+    # thinking 参数允许逐次覆盖（None = 全局配置）。
+    _think = llm.enable_thinking if thinking is None else bool(thinking)
+
     payload = {
         "model": llm.model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
-        # 非流式同样关闭思考（默认 False）：思考拖慢且 DashScope 对 qwen3 非流式+思考支持受限。
-        # thinking 参数允许逐次覆盖（None = 全局配置）。
-        "enable_thinking": llm.enable_thinking if thinking is None else bool(thinking),
+        "enable_thinking": _think,
     }
 
-    resp = _http_post(
-        url,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {llm.api_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=_llm_request_timeout(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    if config.rag.serving_model_gateway:
+        # Tier B-非流式：同一请求体改经 ModelGateway 发出（payload/返回契约等值由
+        # tests/test_serving_gateway_equivalence.py 钉死）；异常类型变为 ModelError/
+        # ModelUnavailable，调用方均宽 except，透明。
+        gresp = _chat_via_gateway(messages, max_tokens=max_tokens,
+                                  temperature=temperature, think=_think)
+        # 源头清洗 [文档N] 编号引用（与裸路径同一入口 strip_doc_citations）
+        answer = strip_doc_citations(gresp.text)
+        usage = gresp.usage_raw
+    else:
+        resp = _http_post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {llm.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=_llm_request_timeout(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
-    # 源头清洗 [文档N] 编号引用（非流式四条消费链路一次覆盖；流式在收集端清理）
-    answer = strip_doc_citations(data["choices"][0]["message"]["content"])
-    usage = data.get("usage", {})
+        # 源头清洗 [文档N] 编号引用（非流式四条消费链路一次覆盖；流式在收集端清理）
+        answer = strip_doc_citations(data["choices"][0]["message"]["content"])
+        usage = data.get("usage", {})
     sources = _extract_sources(_included_chunks)
 
     logger.info("Answer generated: model=%s, tokens=%s", llm.model, usage)
@@ -962,56 +986,133 @@ def generate_answer_stream(
     sources = _extract_sources(_included_chunks)
     yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
 
-    # 流式请求
-    with _http_post(
-        url,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {llm.api_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=_llm_request_timeout(),
-        stream=True,
-    ) as resp:
-        resp.raise_for_status()
+    if config.rag.serving_model_gateway:
+        # Tier B-流式：同一请求体改经 ModelGateway 发出（payload/帧序列等值由
+        # tests/test_serving_gateway_equivalence.py 钉死）；异常类型变为 ModelError/
+        # ModelUnavailable，调用方（api.ask_stream / dingtalk）均宽 except → error 帧，透明。
+        usage_info = yield from _stream_frames_via_gateway(
+            messages, max_tokens=max_tokens, temperature=temperature,
+            think=_think, emit_reasoning=_emit_reasoning)
+    else:
+        # 流式请求
+        with _http_post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {llm.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=_llm_request_timeout(),
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
 
-        usage_info = {}
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if not line.startswith("data: "):
-                continue
+            usage_info = {}
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    continue
 
-            payload_str = line[6:]  # strip "data: "
+                payload_str = line[6:]  # strip "data: "
 
-            if payload_str.strip() == "[DONE]":
-                break
+                if payload_str.strip() == "[DONE]":
+                    break
 
-            try:
-                chunk_data = json.loads(payload_str)
-            except json.JSONDecodeError:
-                continue
+                try:
+                    chunk_data = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
 
-            # 提取 usage（通常在最后一个 chunk）
-            if chunk_data.get("usage"):
-                usage_info = chunk_data["usage"]
+                # 提取 usage（通常在最后一个 chunk）
+                if chunk_data.get("usage"):
+                    usage_info = chunk_data["usage"]
 
-            # 提取 delta content
-            choices = chunk_data.get("choices", [])
-            if choices:
-                delta = choices[0].get("delta", {})
-                # 思考阶段先于答案产出 reasoning_content；flag 开时作为 reasoning 帧下发（在 chunk 之前）。
-                if _emit_reasoning:
-                    rc = delta.get("reasoning_content")
-                    if rc:
-                        yield f"data: {json.dumps({'type': 'reasoning', 'content': rc}, ensure_ascii=False)}\n\n"
-                content = delta.get("content")
-                if content:
-                    yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
+                # 提取 delta content
+                choices = chunk_data.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    # 思考阶段先于答案产出 reasoning_content；flag 开时作为 reasoning 帧下发（在 chunk 之前）。
+                    if _emit_reasoning:
+                        rc = delta.get("reasoning_content")
+                        if rc:
+                            yield f"data: {json.dumps({'type': 'reasoning', 'content': rc}, ensure_ascii=False)}\n\n"
+                    content = delta.get("content")
+                    if content:
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
 
     # 结束
     yield f"data: {json.dumps({'type': 'done', 'model': llm.model, 'usage': usage_info}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def _serving_gateway():
+    """RAG_SERVING_MODEL_GATEWAY 共用构造（流式/非流式两分支同一语义）。
+
+    等值要点：单 provider 单链路（dashscope + config 模型）、max_retries=0（原语义=单次
+    调用、失败即抛）、tier_params={} 不注入档位参数——enable_thinking 由调用方 extra 显式
+    携带。call_logger 不接：serving 台账是 qa_session_log（api 层落），agent llm_call_log
+    表（schema 022-024）生产未建，热路径不做逐调用的失败尝试。
+    """
+    from opensearch_pipeline.agent_runtime.context import ExecutionContext
+    from opensearch_pipeline.agent_runtime.model_gateway import DashScopeProvider, ModelGateway
+
+    gw = ModelGateway(
+        {"dashscope": DashScopeProvider(timeout=_llm_request_timeout())},
+        routes={"serving": [("dashscope", get_config().llm.model)]},
+        max_retries=0, tier_params={})
+    try:
+        from opensearch_pipeline.request_context import get_request_id
+        rid = (get_request_id() or "")[:64]
+    except Exception:   # noqa: BLE001
+        rid = ""
+    ctx = ExecutionContext.create(
+        request_id=rid, user_id="rag-serving", acl_groups=(),
+        roles=("system",), channel="api", thread_id="serving")
+    return gw, ctx
+
+
+def _chat_via_gateway(messages, *, max_tokens: int, temperature: float, think: bool):
+    """RAG_SERVING_MODEL_GATEWAY：非流式调用改经 ModelGateway.complete（等值门=
+    tests/test_serving_gateway_equivalence.py）。extra 显式带 stream:False——gateway
+    _body 不加 stream 键，补上保证请求体与裸 payload 逐键一致。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import ChatRequest
+
+    gw, ctx = _serving_gateway()
+    resp = gw.complete(ctx, "serving", ChatRequest(
+        messages=messages, temperature=temperature, max_tokens=max_tokens,
+        extra={"stream": False, "enable_thinking": think}))
+    if not resp.text and not resp.finish_reason:
+        # 裸路径对「200 但无 choices」是 KeyError fail-loud；保持失败模式，空答案不静默落台账
+        raise RuntimeError("LLM 返回空响应（无 choices）")
+    return resp
+
+
+def _stream_frames_via_gateway(
+    messages, *, max_tokens: int, temperature: float,
+    think: bool, emit_reasoning: bool,
+) -> Generator[str, None, Dict[str, Any]]:
+    """RAG_SERVING_MODEL_GATEWAY：流式调用改经 ModelGateway.complete_stream（构造语义
+    见 _serving_gateway）。返回值=线上原始 usage dict（usage_raw），供 done 帧保真。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import ChatRequest
+
+    gw, ctx = _serving_gateway()
+    req = ChatRequest(messages=messages, temperature=temperature,
+                      max_tokens=max_tokens, extra={"enable_thinking": think})
+    gen = gw.complete_stream(ctx, "serving", req)
+    resp = None
+    while True:
+        try:
+            d = next(gen)
+        except StopIteration as fin:
+            resp = fin.value
+            break
+        # 同一 SSE 帧里 reasoning 先于 content（与裸路径逐帧顺序一致）
+        if emit_reasoning and d.reasoning:
+            yield f"data: {json.dumps({'type': 'reasoning', 'content': d.reasoning}, ensure_ascii=False)}\n\n"
+        if d.text:
+            yield f"data: {json.dumps({'type': 'chunk', 'content': d.text}, ensure_ascii=False)}\n\n"
+    return (resp.usage_raw if resp is not None else {}) or {}
 
 
 def generate_answer_via_stream(

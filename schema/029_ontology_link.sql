@@ -1,0 +1,27 @@
+-- schema/029_ontology_link.sql
+-- 库：fuling_ontology（PR-B P0-02 独立库隔离：fuling_ro 持 fuling_operation.* 库级 SELECT，
+--     ontology 表族留在运营库时服务层 ACL 可被直连绕过——独立库不授 fuling_ro，机器可强制）
+-- 本体关系（Palantir Link Types 语义的最小自建形态）：sku_of_product / mold_of_product /
+-- material_of_product 等。P0 只建结构 + 播种期写 sku_of_product；revision-diff、BOM 串味
+-- 检测等富语义在 P2。取号勘误：文档所写 026 已被 agent v2 占用，实际取 029。
+-- P0 收口修订（PR-A，P0-03，2026-07-10 外审）：加 src/dst FK——悬空引用 DB 层拦截（分支未发布，直接修订原文件）。
+-- P1 收口修订（PR-G）：link_type 格式 CHECK（小写蛇形 3-32）——语义白名单在服务层
+--   （store.VALID_LINK_TYPES，新关系类型=受治理变更走代码 PR），DB 只兜格式。
+
+CREATE TABLE IF NOT EXISTS ontology_link (
+  link_id       CHAR(26)    NOT NULL,                 -- ULID
+  src_object_id CHAR(26)    NOT NULL,                 -- 语义：src --type--> dst（如 SKU --sku_of_product--> Product）
+  dst_object_id CHAR(26)    NOT NULL,
+  link_type     VARCHAR(32) NOT NULL,
+  attrs_json    JSON        NULL,                     -- 关系属性（如绑定的 revision 轴）
+  status        ENUM('active','retired') NOT NULL DEFAULT 'active',
+  created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (link_id),
+  UNIQUE KEY uk_src_dst_type (src_object_id, dst_object_id, link_type),
+  KEY idx_dst_type (dst_object_id, link_type, status),
+  KEY idx_src_type (src_object_id, link_type, status),
+  CONSTRAINT ck_link_type_format CHECK (link_type REGEXP '^[a-z][a-z0-9_]{2,31}$'),
+  CONSTRAINT fk_link_src FOREIGN KEY (src_object_id) REFERENCES ontology_object (object_id),
+  CONSTRAINT fk_link_dst FOREIGN KEY (dst_object_id) REFERENCES ontology_object (object_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

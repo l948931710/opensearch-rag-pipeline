@@ -1,10 +1,19 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
-import { ArrowUp, Square, Brain } from 'lucide-vue-next'
+import { ArrowUp, Square, Brain, Bot, Activity } from 'lucide-vue-next'
 
 // 输入框：内嵌发送/停止按钮 + 深度思考开关；Enter 发送 / Shift+Enter 换行；单行自增高到上限。
-const props = defineProps<{ modelValue: string; asking: boolean; hasMessages: boolean; thinking: boolean }>()
-const emit = defineEmits<{ 'update:modelValue': [v: string]; submit: []; stop: []; 'toggle-thinking': [] }>()
+// Agent canary：agentAvailable（能力探测通过）才渲染「Agent 模式」开关与「运行」入口——
+// flag 未开/无权绝不留死入口。「深度思考」在 agent 模式下同样生效（后端把开关映射为
+// 模型档 light→high，见 routes/agent.py），故两开关并存、不再互斥。
+const props = defineProps<{
+  modelValue: string; asking: boolean; hasMessages: boolean; thinking: boolean
+  agentAvailable?: boolean; agentMode?: boolean
+}>()
+const emit = defineEmits<{
+  'update:modelValue': [v: string]; submit: []; stop: []; 'toggle-thinking': []
+  'toggle-agent': []; 'open-runs': []
+}>()
 
 const ta = ref<HTMLTextAreaElement | null>(null)
 
@@ -50,10 +59,11 @@ defineExpose({ focus: () => ta.value?.focus() })
           <ArrowUp v-else :size="18" :stroke-width="2.2" />
         </button>
       </div>
-      <!-- 深度思考开关（逐问，内嵌左下） -->
-      <div class="mt-1 flex items-center">
+      <!-- 深度思考 / Agent 模式 开关（内嵌左下）+ 运行中心入口（右下，仅 agent 可用时） -->
+      <div class="mt-1 flex items-center gap-1.5">
         <button
           type="button"
+          data-testid="think-toggle"
           class="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition"
           :class="thinking ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
           :aria-pressed="thinking"
@@ -61,6 +71,28 @@ defineExpose({ focus: () => ta.value?.focus() })
           @click="emit('toggle-thinking')"
         >
           <Brain :size="14" :stroke-width="1.75" /> 深度思考
+        </button>
+        <button
+          v-if="agentAvailable"
+          type="button"
+          data-testid="agent-toggle"
+          class="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition"
+          :class="agentMode ? 'border-accent-soft bg-accent text-accent-foreground' : 'border-border text-muted-foreground hover:bg-panel'"
+          :aria-pressed="agentMode"
+          title="Agent 模式（试点）：可调用工具作答，高风险操作先送审批；随时可关回普通问答"
+          @click="emit('toggle-agent')"
+        >
+          <Bot :size="14" :stroke-width="1.75" /> Agent 模式
+        </button>
+        <button
+          v-if="agentAvailable"
+          type="button"
+          data-testid="agent-runs-entry"
+          class="ml-auto flex items-center gap-1 rounded-full px-2.5 py-1 text-xs text-muted-foreground transition hover:bg-panel hover:text-foreground"
+          title="Agent 运行中心：我的运行、审批挂起与工具回执"
+          @click="emit('open-runs')"
+        >
+          <Activity :size="13" :stroke-width="1.75" /> 运行
         </button>
       </div>
     </div>

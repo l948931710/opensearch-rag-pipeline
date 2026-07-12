@@ -175,6 +175,10 @@ class RDSConfig:
     database: str = "fuling_knowledge"
     # 问答运营库（qa_session_log/user_feedback/escalation_ticket）；STAGING 用 fuling_operation_stg
     operation_database: str = "fuling_operation"
+    # 本体控制面独立库（schema/027-030 表族；PR-B P0-02：fuling_ro 持库级
+    # GRANT SELECT ON fuling_operation.*，ontology 表留在运营库时服务层行过滤可被
+    # 直连绕过——独立库 + 不授 fuling_ro 才是机器可强制的隔离）；STAGING 用 _stg 后缀
+    ontology_database: str = "fuling_ontology"
     charset: str = "utf8mb4"
     connect_timeout: int = 10
     read_timeout: int = 30
@@ -245,8 +249,8 @@ class AlibabaVectorSearchConfig:
 class EmbeddingConfig:
     """Embedding 模型配置。"""
     api_key: str = ""
-    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    model: str = "text-embedding-004"
+    api_base_url: str = "https://dashscope.aliyuncs.com"        # 默认 DashScope-native（残留清理；env-loader 仍按 key 动态路由）
+    model: str = "text-embedding-v4"
     dimension: int = 1024
     batch_size: int = 10                    # API limit (DashScope limit is 10)
     max_retries: int = 3
@@ -256,8 +260,8 @@ class EmbeddingConfig:
 class OCRConfig:
     """OCR + VLM 视觉配置。"""
     api_key: str = ""
-    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    model: str = "gemini-3.1-flash-lite"            # OCR 专用模型
+    api_base_url: str = "https://dashscope.aliyuncs.com/api/v1"  # 默认 DashScope-native（残留清理；env-loader 仍按 key 动态路由）
+    model: str = "qwen-vl-ocr-latest"               # OCR 专用模型
     vlm_model: str = ""                              # VLM caption/审计模型（为空则 fallback 到 model）
     max_ocr_pages: int = 50
     ocr_threshold_chars: int = 100
@@ -287,8 +291,8 @@ class RebuildConfig:
 class LLMConfig:
     """分类/风险评估 LLM 配置。"""
     api_key: str = ""
-    api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    model: str = "gemini-3.1-flash-lite"
+    api_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # 默认 DashScope-native（残留清理；env-loader 仍按 key 动态路由）
+    model: str = "qwen3.7-plus"
     temperature: float = 0.1
     max_retries: int = 2
     max_tokens: int = 2048
@@ -335,6 +339,11 @@ class RAGConfig:
     # {"type":"reasoning"} 附加帧流式下发（与 chunk 并行；老客户端忽略未知帧类型 → 向后兼容）。默认关
     # （reasoning 更费带宽且暴露思维链是产品取舍）；仅「thinking 开 + 本 flag 开」时下发，否则照旧丢弃。
     stream_reasoning: bool = False          # RAG_STREAM_REASONING
+    # Tier B-流式：generate_answer_stream 的 DashScope 调用改经 agent 底座 ModelGateway 发出。
+    # 请求体与既有裸 _http_post 等值、对外 yield 契约逐字节不变（等值门=
+    # tests/test_serving_gateway_equivalence.py）；max_retries=0 保持原单次调用语义（不引入
+    # 重试/沿链 fallback 的行为变化）。默认 OFF——热路径传输层替换走保守灰度，本 flag 即 kill switch。
+    serving_model_gateway: bool = False     # RAG_SERVING_MODEL_GATEWAY
     # ── QA 日志查询侧 PII 脱敏（OBS-qa-pii 整改）──────────────────
     # qa_session_log.query_text/answer_text 此前明文落盘：用户可能输入身份证/手机号，
     # 答案可能回显受限文档里的 PII。开启后在写库前用 redaction.redact_text（与入库侧
@@ -614,6 +623,14 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
                     f"[ENV GUARD] environment={env} 指向生产 RDS 运营库"
                     f"（RDS_OPERATION_DATABASE={config.rds.operation_database}，非 _stg 库）。"
                     f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
+        # 本体库同纪律（PR-B）：生产 host + 非 _stg 本体库 → 同源 ack
+        if not config.simulate_db and is_prod_target("rds", config.rds.host) \
+                and not config.rds.ontology_database.endswith("_stg"):
+            if not _require_ack("RAG_ALLOW_REMOTE_DB"):
+                raise EnvironmentMismatchError(
+                    f"[ENV GUARD] environment={env} 指向生产 RDS 本体库"
+                    f"（RDS_ONTOLOGY_DATABASE={config.rds.ontology_database}，非 _stg 库）。"
+                    f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_DB={_ACK_VALUE}")
         if not config.simulate_opensearch and is_prod_target("search", search_targets) \
                 and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             if not _require_ack("RAG_ALLOW_REMOTE_SEARCH"):
@@ -657,6 +674,8 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
         # 会明文写进生产运营库，污染生产审计流水。运营库未切 _stg 一律 fail-fast。
         if not config.simulate_db and not config.rds.operation_database.endswith("_stg"):
             problems.append(f"RDS_OPERATION_DATABASE 必须以 _stg 结尾（当前 {config.rds.operation_database}）")
+        if not config.simulate_db and not config.rds.ontology_database.endswith("_stg"):
+            problems.append(f"RDS_ONTOLOGY_DATABASE 必须以 _stg 结尾（当前 {config.rds.ontology_database}）")
         if not config.simulate_opensearch and config.alibaba_vector.endpoint \
                 and not config.alibaba_vector.table_name.endswith(_STAGING_HA3_SUFFIXES):
             problems.append(f"HA3_TABLE_NAME 必须以 _stg 或 _s 结尾"
@@ -717,7 +736,7 @@ def load_config() -> PipelineConfig:
     llm_key = _env("LLM_API_KEY") or dashscope_key or gemini_key
     default_llm_base = f"https://{ds_domain}/compatible-mode/v1" if dashscope_key else "https://generativelanguage.googleapis.com/v1beta"
     llm_base_url = _env("LLM_API_BASE_URL") or default_llm_base
-    default_llm_model = "qwen3.6-plus" if dashscope_key else "gemini-3.1-flash-lite"
+    default_llm_model = "qwen3.7-plus" if dashscope_key else "gemini-3.1-flash-lite"
     llm_model = _env("LLM_MODEL") or default_llm_model
 
     # OCR 动态配置
@@ -744,6 +763,21 @@ def load_config() -> PipelineConfig:
     emb_base = _env("EMBEDDING_API_BASE_URL")
     if not emb_base:
         emb_base = f"https://{ds_domain}" if is_emb_dashscope else "https://generativelanguage.googleapis.com/v1beta"
+
+    # 【P1-15】纯 RDS 作业的模型解析豁免（重评报告「纯 RDS job 无必要要求 DashScope key」）：
+    # RAG_NO_MODEL_RESOLUTION=ack 时 llm/ocr/vlm/embedding 全部解析为**惰性哨兵**——无供应商
+    # 端点、无 key。比「塞假 key」强的 fail-closed：任何意外模型调用立刻失败在空端点，绝无
+    # 静默兜底到 Gemini 的通道。生产供应商守卫据此豁免「必须有 DashScope key」（禁 Gemini
+    # 名称检查照跑，哨兵天然通过）；嵌入制度守卫同步豁免（声明不嵌入的作业没有污染索引的
+    # 通道）。适用面：DataWorks retention / ontology backfill / invariants 等纯 RDS 节点——
+    # 会真调模型的作业（如 ops_health_monitor 的 embedding 对账）**禁用**本旗标。
+    _no_model_resolution = os.environ.get("RAG_NO_MODEL_RESOLUTION", "").strip().lower() == "ack"
+    if _no_model_resolution:
+        _SENTINEL_MODEL = "model-resolution-disabled"
+        llm_key = ocr_key = emb_key = ""
+        llm_base_url = ocr_base_url = emb_base = ""
+        llm_model = ocr_model = vlm_model = emb_model = _SENTINEL_MODEL
+        is_emb_dashscope = False
 
     config = PipelineConfig(
         simulate=rag_simulate,
@@ -777,6 +811,7 @@ def load_config() -> PipelineConfig:
             operation_database=_env("RDS_OPERATION_DATABASE", "fuling_operation"),
             ssl_ca=_env("RDS_SSL_CA", ""),
             ssl_verify_cert=_env_bool("RDS_SSL_VERIFY_CERT", True),
+            ontology_database=_env("RDS_ONTOLOGY_DATABASE", "fuling_ontology"),
         ),
 
         opensearch=OpenSearchConfig(
@@ -881,6 +916,7 @@ def load_config() -> PipelineConfig:
             allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
             main_hit_revalidate=_env_bool("MAIN_HIT_REVALIDATE", True),         # RAG_MAIN_HIT_REVALIDATE
             stream_reasoning=_env_bool("STREAM_REASONING", False),              # RAG_STREAM_REASONING
+            serving_model_gateway=_env_bool("SERVING_MODEL_GATEWAY", False),    # RAG_SERVING_MODEL_GATEWAY
             qa_log_pii_redact=_env_bool("QA_LOG_PII_REDACT", True),             # RAG_QA_LOG_PII_REDACT
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
             score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM
@@ -925,6 +961,18 @@ def load_config() -> PipelineConfig:
             f"明文落盘 qa_session_log。请移除该环境变量（默认即 True=掩码）。"
         )
 
+    # 【Agent P1】职责分离硬门（重评报告 §6「self-approval 危险开关缺生产启动断言」）：
+    # RAG_AGENT_ALLOW_SELF_APPROVAL 是 dev/单人联调的逃生门——production/staging 打开它
+    # 意味着发起人可自批 HIGH_WRITE，审批闭环整体失效，必须与供应商守卫同级 fail-fast。
+    # routes/agent._self_approval_allowed 另有运行时环境复核（双保险，防启动后注入）。
+    if _env_label_prod and os.environ.get("RAG_AGENT_ALLOW_SELF_APPROVAL",
+                                          "").strip().lower() in ("1", "true", "yes", "on"):
+        raise ValueError(
+            f"🚨 [PRODUCTION SECURITY GUARD] RAG_AGENT_ALLOW_SELF_APPROVAL 在 '{config.environment}' "
+            f"环境被禁止！该开关允许发起人自批高风险写操作（职责分离失效），仅限本地开发联调。"
+            f"请移除该环境变量。"
+        )
+
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
     # 且只配 GEMINI key 时，模型解析全路由 Google，生产 chunk_text/查询内容会被 POST 到 Google。
@@ -946,7 +994,10 @@ def load_config() -> PipelineConfig:
     if _env_label_prod or _touches_prod_target:
         _guard_scope = config.environment if _env_label_prod \
             else f"{config.environment} + prod-target-fingerprint"
-        if not dashscope_key:
+        # P1-15：RAG_NO_MODEL_RESOLUTION=ack（模型全解析为惰性哨兵）时豁免 key 要求——
+        # 「必须有 DashScope key」防的是**兜底到 Gemini**，哨兵状态无任何供应商通道，
+        # 比有 key 更强；下方禁 Gemini 名称检查照跑（哨兵天然通过）。
+        if not dashscope_key and not _no_model_resolution:
             raise ValueError(
                 f"🚨 [PRODUCTION SECURITY GUARD] DashScope API Key is not configured under '{_guard_scope}' environment! "
                 f"To protect privacy & security, falling back to Google Gemini is strictly forbidden in production."
@@ -979,6 +1030,7 @@ def load_config() -> PipelineConfig:
     # 才 fail-fast。刻意实验用 RAG_ALLOW_INCOMPATIBLE_EMBEDDING=ack 显式放行。
     _has_search_backend = bool(config.alibaba_vector.endpoint or config.opensearch.host)
     if (not rag_simulate and not is_emb_dashscope and _has_search_backend
+            and not _no_model_resolution
             and os.environ.get("RAG_ALLOW_INCOMPATIBLE_EMBEDDING", "") != "ack"):
         raise EnvironmentMismatchError(
             f"🚨 [EMBEDDING REGIME GUARD] 嵌入模型解析为 '{emb_model}'（非 DashScope）但已配置"

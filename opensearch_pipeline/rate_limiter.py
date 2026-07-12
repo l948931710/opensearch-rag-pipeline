@@ -54,6 +54,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Optional, Tuple
 
+from opensearch_pipeline import redis_client
+
 logger = logging.getLogger(__name__)
 
 # 北京时间固定偏移（中国无夏令时，安全）
@@ -552,5 +554,248 @@ class ServingRateLimiter:
             self._last_prune = now
 
 
-# 模块级单例：api.py 各端点共享（workers=1 → 即全局）
-LIMITER = ServingRateLimiter()
+# ─────────────────────────────────────────────────────────────────────────────
+# Redis 后端（多实例共享计数；Lua 单往返原子四层查-算）
+# ─────────────────────────────────────────────────────────────────────────────
+# 「查四层 → 仅在全部未超限时才计入」必须原子（否则并发下超额放行）。用一段 Lua
+# 在 Redis 服务端一次完成，单次网络往返（性能优先，优于多条 INCR 往返 + WATCH 重试）。
+# KEYS: 1=global 2=minute(固定窗) 3=day 4=think
+# ARGV: 1=cap 2=per_min 3=per_day 4=think_q 5=weight 6=ttl_min 7=ttl_day 8=count_llm 9=thinking
+# 返回统一三元组 {outcome, count, edge}；outcome ∈ admit/global_cap/thinking_quota/per_min/per_day
+_ASK_LUA = """
+local cap=tonumber(ARGV[1]); local per_min=tonumber(ARGV[2]); local per_day=tonumber(ARGV[3])
+local think_q=tonumber(ARGV[4]); local weight=tonumber(ARGV[5])
+local ttl_min=tonumber(ARGV[6]); local ttl_day=tonumber(ARGV[7])
+local count_llm=tonumber(ARGV[8]); local thinking=tonumber(ARGV[9])
+local g=tonumber(redis.call('GET',KEYS[1]) or '0')
+if count_llm==1 and cap>0 and g>=cap then return {'global_cap',g,0} end
+local t=tonumber(redis.call('GET',KEYS[4]) or '0')
+if thinking==1 and think_q>0 and t>=think_q then return {'thinking_quota',t,0} end
+local m=tonumber(redis.call('GET',KEYS[2]) or '0')
+if per_min>0 and m>=per_min then return {'per_min',m,0} end
+local d=tonumber(redis.call('GET',KEYS[3]) or '0')
+if per_day>0 and d>=per_day then return {'per_day',d,0} end
+local nm=redis.call('INCR',KEYS[2]); if nm==1 then redis.call('EXPIRE',KEYS[2],ttl_min) end
+local nd=redis.call('INCR',KEYS[3]); if nd==1 then redis.call('EXPIRE',KEYS[3],ttl_day) end
+if thinking==1 then local nt=redis.call('INCR',KEYS[4]); if nt==1 then redis.call('EXPIRE',KEYS[4],ttl_day) end end
+local edge=0
+if count_llm==1 and cap>0 then
+  local ng=redis.call('INCRBY',KEYS[1],weight); if ng==weight then redis.call('EXPIRE',KEYS[1],ttl_day) end
+  if g<cap and ng>=cap then edge=1 end
+end
+return {'admit',0,edge}
+"""
+
+# 辅助端点：仅每分钟固定窗。KEYS:1=minute ARGV:1=per_min 2=ttl_min
+_AUX_LUA = """
+local per_min=tonumber(ARGV[1]); local ttl_min=tonumber(ARGV[2])
+local m=tonumber(redis.call('GET',KEYS[1]) or '0')
+if per_min>0 and m>=per_min then return {'aux_per_min',m} end
+local nm=redis.call('INCR',KEYS[1]); if nm==1 then redis.call('EXPIRE',KEYS[1],ttl_min) end
+return {'admit',nm}
+"""
+
+
+class RedisRateLimiter:
+    """Redis 后端：四层计数**跨实例共享**（全局熔断因此才真正全局，而非每实例各 2000/日
+    致实际放大 N 倍）；Lua 脚本单往返原子完成「查四层 + 仅全部未超限才计入」。
+
+    与 memory 后端（ServingRateLimiter）的差异（性能优先取舍，已在测试中分别覆盖）：
+    - 每分钟层用**固定窗**（bucket=floor(now/60)）而非滑动窗——省 ZSET/额外往返；边界处
+      突发略宽，账单保护语义不变。retry_after 在 Python 按窗口边界算（不依赖 Redis 时钟，
+      兼容假时钟测试）。
+    - 全局计数在 Redis 共享且 EXPIRE 到北京次日零点自清 → **无需** memory 版的重启回种
+      （_dispatch_cap_seed）与 _maybe_prune。
+    - 触顶告警用 Redis SETNX 每北京日**全局一次**（优于 memory 的每实例一次，顺带缓解评审 E6）。
+
+    fail-closed：ask 成本路径（count_llm）Redis 故障 → 503（plan WS0-3）。⚠️ 评审 C3：这让
+    Redis 成为问答新单点，启用前须 Redis 高可用（双副本/自动切换）。aux 路径 fail-open。
+
+    公有接口与 ServingRateLimiter 对齐（admit_ask/admit_aux/limits/reload_limits/
+    reset_for_tests/describe/_now 可注入），api.py 无感切换。
+    拒绝/准入聚合落库沿用 memory 版同构逻辑（独立实现，刻意不改动 live 的 ServingRateLimiter）。
+    """
+
+    def __init__(self, client) -> None:
+        self._r = client
+        self._now = time.time                       # 假时钟注入点（对齐 memory）
+        self._limits: Optional[Limits] = None
+        self._ask_script = client.register_script(_ASK_LUA)   # 客户端侧建 Script，不连服务器
+        self._aux_script = client.register_script(_AUX_LUA)
+        # 拒绝聚合（每实例缓冲 → RDS UPSERT 合并；与 memory 版同构）
+        self._reject_lock = threading.Lock()
+        self._rejected: Dict[Tuple[str, str], int] = {}
+        self._reject_flush_ts = 0.0
+
+    # ── 配置（与 memory 版一致）───────────────────────────────
+    def limits(self) -> Limits:
+        if self._limits is None:
+            self._limits = _load_limits()
+        return self._limits
+
+    def reload_limits(self) -> Limits:
+        self._limits = None
+        return self.limits()
+
+    def reset_for_tests(self) -> None:
+        with self._reject_lock:
+            self._rejected.clear()
+            self._reject_flush_ts = 0.0
+        self._limits = None
+        # 计数键由测试用全新 fakeredis 实例隔离；刻意不 flushdb（防误清生产共享键）
+
+    def describe(self) -> str:
+        lim = self.limits()
+        if not lim.enabled:
+            return "禁用（模拟模式或 RAG_RATE_LIMIT_ENABLE=false）"
+        return (
+            f"[redis] 用户 {lim.user_per_min}/分·{lim.user_per_day}/日 | "
+            f"匿名IP {lim.anon_per_min}/分·{lim.anon_per_day}/日 | "
+            f"深思 {lim.thinking_daily_quota}/日 | 全局熔断 {lim.global_daily_llm_cap}/日 | "
+            f"辅助 {lim.aux_per_min}/分"
+        )
+
+    # ── 准入 ─────────────────────────────────────────────────
+    def admit_ask(self, actor: str, *, is_user: bool, thinking: bool = False,
+                  count_llm: bool = True) -> Optional[Denial]:
+        lim = self.limits()
+        if not lim.enabled:
+            return None
+        now = self._now()
+        day = _beijing_day(now)
+
+        # 深思 anon/off 策略在 Python（无需 Redis）
+        if thinking:
+            if not is_user:
+                return self._deny(Denial(
+                    403, "深度思考功能需登录后使用，请关闭深度思考或重新登录", 0, "thinking_anon"), now)
+            if lim.thinking_daily_quota <= 0:
+                return self._deny(Denial(
+                    403, "深度思考功能暂未开放，请关闭深度思考后继续提问", 0, "thinking_off"), now)
+
+        bucket = int(now // _MINUTE_WINDOW_S)
+        ttl_day = _secs_to_beijing_midnight(now)
+        per_min = lim.user_per_min if is_user else lim.anon_per_min
+        per_day = lim.user_per_day if is_user else lim.anon_per_day
+        weight = lim.thinking_cap_weight if thinking else 1
+        keys = [redis_client.key("rl", "g", day),
+                redis_client.key("rl", "m", "ask", actor, bucket),
+                redis_client.key("rl", "d", "ask", actor, day),
+                redis_client.key("rl", "t", actor, day)]
+        args = [lim.global_daily_llm_cap, per_min, per_day, lim.thinking_daily_quota,
+                weight, int(2 * _MINUTE_WINDOW_S), ttl_day,
+                1 if count_llm else 0, 1 if thinking else 0]
+        try:
+            outcome, _cnt, edge = self._ask_script(keys=keys, args=args)
+        except Exception as e:   # noqa: BLE001 — fail-closed（评审 C3）
+            logger.error("限流 Redis 后端故障，ask 路径 fail-closed: %s", e)
+            if count_llm:
+                return Denial(503, "服务暂时不可用，请稍后再试", 5, "ratelimit_backend_down")
+            return None          # 非成本路径不因限流器故障拖垮辅助能力
+
+        if outcome == "admit":
+            if edge:
+                self._maybe_cap_alert_once(day, lim.global_daily_llm_cap, now)
+            if count_llm and lim.global_daily_llm_cap > 0:
+                with self._reject_lock:   # __admitted__ 准入量随拒绝同批落库（SLO offered/admitted）
+                    a_key = (day, _ADMITTED_KEY)
+                    self._rejected[a_key] = self._rejected.get(a_key, 0) + weight
+            self._note_reject(None, now)
+            return None
+        if outcome == "global_cap":
+            self._maybe_cap_alert_once(day, lim.global_daily_llm_cap, now)
+            return self._deny(Denial(
+                503, "服务繁忙：今日问答量已达上限，请明天再试或联系管理员",
+                _secs_to_beijing_midnight(now), "global_cap"), now)
+        if outcome == "thinking_quota":
+            return self._deny(Denial(
+                429, f"今日深度思考次数已用完（{lim.thinking_daily_quota} 次/天），可关闭深度思考继续提问",
+                _secs_to_beijing_midnight(now), "thinking_quota"), now)
+        if outcome == "per_min":
+            retry = max(1, int((bucket + 1) * _MINUTE_WINDOW_S - now) + 1)
+            return self._deny(Denial(429, "提问太频繁了，请稍后再试", retry, "per_min"), now)
+        if outcome == "per_day":
+            msg = (f"今日提问次数已达上限（{per_day} 次/天），请明天再来"
+                   if is_user else "未登录状态提问次数已达今日上限，请登录后继续使用")
+            return self._deny(Denial(429, msg, _secs_to_beijing_midnight(now), "per_day"), now)
+        return None
+
+    def admit_aux(self, actor: str) -> Optional[Denial]:
+        lim = self.limits()
+        if not lim.enabled or lim.aux_per_min <= 0:
+            return None
+        now = self._now()
+        bucket = int(now // _MINUTE_WINDOW_S)
+        key = redis_client.key("rl", "m", "aux", actor, bucket)
+        try:
+            outcome, _cnt = self._aux_script(keys=[key], args=[lim.aux_per_min, int(2 * _MINUTE_WINDOW_S)])
+        except Exception as e:   # noqa: BLE001 — aux 非成本路径 fail-open
+            logger.warning("限流 Redis 后端故障，aux 路径 fail-open: %s", e)
+            return None
+        if outcome == "aux_per_min":
+            retry = max(1, int((bucket + 1) * _MINUTE_WINDOW_S - now) + 1)
+            return self._deny(Denial(429, "操作太频繁，请稍后再试", retry, "aux_per_min"), now)
+        return None
+
+    # ── 内部（拒绝聚合/告警；与 memory 版同构，复用模块级 _persist_rejected/_dispatch_cap_alert）──
+    def _deny(self, denial: Denial, now: float) -> Denial:
+        self._note_reject(denial.reason, now)
+        return denial
+
+    def _maybe_cap_alert_once(self, day: str, cap: int, now: float) -> None:
+        """触顶告警：Redis SETNX 每北京日全局一次（跨实例去重，优于 memory 每实例一次）。"""
+        try:
+            akey = redis_client.key("rl", "g", day, "alerted")
+            if self._r.set(akey, "1", nx=True, ex=_secs_to_beijing_midnight(now)):
+                _dispatch_cap_alert(cap)
+        except Exception:   # noqa: BLE001 — 告警去重失败不影响限流主路径
+            logger.warning("触顶告警 SETNX 失败（fail-open）", exc_info=True)
+
+    def _note_reject(self, reason: Optional[str], now: float) -> None:
+        snapshot = None
+        with self._reject_lock:
+            if reason:
+                key = (_beijing_day(now), reason)
+                self._rejected[key] = self._rejected.get(key, 0) + 1
+            if self._rejected and now - self._reject_flush_ts >= _REJECT_FLUSH_INTERVAL_S:
+                self._reject_flush_ts = now
+                snapshot = self._rejected
+                self._rejected = {}
+        if snapshot:
+            if _DISPATCH_ASYNC:
+                threading.Thread(target=self._flush_rejected, args=(snapshot,),
+                                 daemon=True, name="reject-flush-redis").start()
+            else:
+                self._flush_rejected(snapshot)
+
+    def _flush_rejected(self, snapshot: Dict[Tuple[str, str], int]) -> None:
+        if _persist_rejected(snapshot):
+            return
+        with self._reject_lock:
+            for key, n in snapshot.items():
+                self._rejected[key] = self._rejected.get(key, 0) + n
+
+
+def _make_limiter():
+    """按 RAG_RATE_LIMIT_BACKEND 选后端（默认 memory = 回滚开关）。"""
+    backend = os.environ.get("RAG_RATE_LIMIT_BACKEND", "memory").strip().lower()
+    if backend == "redis":
+        try:
+            return RedisRateLimiter(redis_client.get_client())
+        except Exception as e:   # noqa: BLE001
+            # Redis 初始化失败 → 回退 memory（单实例安全默认）。⚠️ 多实例下须确保 Redis 可用，
+            # 否则各实例独立计数使全局熔断实际放大 N 倍——启用前置见评审 C3。
+            logger.error("RAG_RATE_LIMIT_BACKEND=redis 但 Redis 初始化失败，回退 memory: %s", e)
+    elif backend not in ("", "memory"):
+        logger.warning("未知 RAG_RATE_LIMIT_BACKEND=%r，回退 memory", backend)
+    return ServingRateLimiter()
+
+
+# 模块级单例：api.py 各端点共享（workers=1 → 即全局；redis 后端下跨实例共享）
+LIMITER = _make_limiter()
+
+
+def _set_limiter_for_test(limiter) -> None:
+    """测试用：切换全局限流器单例。"""
+    global LIMITER
+    LIMITER = limiter

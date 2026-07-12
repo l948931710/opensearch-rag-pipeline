@@ -83,8 +83,11 @@ def test_dry_run_counts_without_deleting(monkeypatch, live_db):
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.purge_subject("u1")
     assert rep["ok"] and rep["dry_run"]
-    assert set(rep["tables"]) == {"qa_retrieved_doc", "user_feedback", "escalation_ticket",
-                                  "qa_conversation", "qa_session_log"}
+    assert set(rep["tables"]) == {
+        # agent 表族（schema/022/023，深度审查治理组）——checkpoint 明文擦除覆盖
+        "agent_checkpoint", "agent_step", "tool_invocation", "llm_call_log", "agent_run",
+        "qa_retrieved_doc", "user_feedback", "escalation_ticket",
+        "qa_conversation", "qa_session_log"}
     assert all(t["affected"] == 42 and t["dry_run"] for t in rep["tables"].values())
     assert conn.acts == 0 and conn.commits == 0, "dry-run 绝不 DELETE、绝不 commit"
 
@@ -97,14 +100,15 @@ def test_commit_requires_enable_flag(monkeypatch, live_db):
 
 def test_commit_deletes_fact_rows_before_session_log(monkeypatch, live_db):
     monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
-    conn = _Conn(affected=3, act_rowcounts=[3, 0, 0, 0, 3])
+    # 10 表链：agent 5 表（checkpoint/step/invocation/llm_call/run）在前，qa 5 表在后
+    conn = _Conn(affected=3, act_rowcounts=[0, 0, 0, 0, 0, 3, 0, 0, 0, 3])
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.purge_subject("u1", commit=True, batch=100)
     assert rep["ok"]
     assert rep["tables"]["qa_retrieved_doc"]["deleted"] == 3
     assert rep["tables"]["qa_session_log"]["deleted"] == 3
     deletes = [s for s, _ in conn.executed if s.strip().startswith("DELETE")]
-    assert len(deletes) == 5
+    assert len(deletes) == 10
     # ⚠️ 顺序不可倒：事实表（经 message_id 关联）必须先于 qa_session_log 本体
     idx_fact = next(i for i, s in enumerate(deletes) if "qa_retrieved_doc" in s)
     idx_log = next(i for i, s in enumerate(deletes)
@@ -112,6 +116,12 @@ def test_commit_deletes_fact_rows_before_session_log(monkeypatch, live_db):
     assert idx_fact < idx_log
     # 事实表删除经 qa_session_log.message_id 关联（表本身无 user_id 列）
     assert "message_id IN" in deletes[idx_fact]
+    # agent 子表（经 run_id 关联）必须先于 agent_run 本体（同款锚点逻辑）
+    idx_ck = next(i for i, s in enumerate(deletes) if "agent_checkpoint" in s)
+    idx_run = next(i for i, s in enumerate(deletes)
+                   if "FROM" in s and s.rstrip().endswith("LIMIT %s")
+                   and "agent_run WHERE user_id" in s and "run_id IN" not in s)
+    assert idx_ck < idx_run and "run_id IN" in deletes[idx_ck]
 
 
 def test_optional_table_1146_is_skipped_not_failed(monkeypatch, live_db):

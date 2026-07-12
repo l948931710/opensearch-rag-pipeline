@@ -15,6 +15,20 @@ document_sensitive_finding、pipeline_run 只进不出——看板窗口查询�
   pipeline_run   pipeline_run (knowledge)               整行 DELETE                 12 月 RAG_RETENTION_PIPELINE_RUN_MONTHS
   findings       document_sensitive_finding (knowledge) 整行 DELETE（见下守卫）     24 月 RAG_RETENTION_FINDING_MONTHS
 
+  agent 表族（schema/022–025 可选迁移，表未建 1146→skip；深度审查 2026-07-09 治理组）：
+  agent_checkpoints  agent_checkpoint (operation)       终态 run 的 checkpoint DELETE  3 月 RAG_RETENTION_AGENT_CHECKPOINT_MONTHS
+  agent_steps        agent_step (operation)             整行 DELETE                12 月 RAG_RETENTION_AGENT_TRACE_MONTHS
+  tool_invocations   tool_invocation (operation)        整行 DELETE                12 月 RAG_RETENTION_AGENT_TRACE_MONTHS
+  llm_calls          llm_call_log (operation)           整行 DELETE                12 月 RAG_RETENTION_LLM_CALL_MONTHS
+  agent_audit        agent_audit_log (operation)        归档后 DELETE（同 audit）  24 月 RAG_RETENTION_AGENT_AUDIT_MONTHS
+  approval_decisions approval_decision (operation)      整行 DELETE                24 月 RAG_RETENTION_APPROVAL_MONTHS
+  approval_requests  approval_request (operation)       非 pending DELETE          24 月 RAG_RETENTION_APPROVAL_MONTHS
+  agent_runs         agent_run (operation)              终态整行 DELETE（殿后）    18 月 RAG_RETENTION_AGENT_RUN_MONTHS
+
+  本体表族（schema/027-028 可选迁移；PR-G P1「数据与证据无保留策略」）：
+  ontology_case_evidence      ontology_resolution_case (ontology)      已处置 case evidence_json→NULL   6 月 RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS
+  ontology_candidate_features ontology_resolution_candidate (ontology) 已处置 case 候选 features→NULL   6 月 RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS
+
   任一窗口设 0/负数 = 该作业停用。
 
 安全设计（与全仓守卫哲学同源）：
@@ -71,7 +85,23 @@ DEFAULT_BATCH = 5000
 MAX_BATCHES_PER_JOB = 400
 SLEEP_BETWEEN_BATCHES = 0.2
 
-_JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_facts")
+_JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_facts",
+              # agent 表族（schema/022/023/024/025，深度审查 2026-07-09 治理组：此前 7 张 agent 表
+              # 游离于留存与主体擦除之外）。顺序 load-bearing：子表在前、agent_run 殿后。
+              "agent_checkpoints", "agent_steps", "tool_invocations", "llm_calls",
+              "agent_audit", "approval_decisions", "approval_requests", "agent_runs",
+              # 本体表族（schema/027-028，PR-G/P1「数据与证据无保留策略」）：case evidence
+              # 与候选 features 携源观测快照（可能含员工查询上下文）——处置后到期擦除
+              # （行留审计骨架，只 NULL 掉证据 blob）。open case 的证据是活依据，永不动。
+              "ontology_case_evidence", "ontology_candidate_features")
+
+# 可选迁移的作业（表未建的环境 1146 → skip 不算失败；基础表缺失仍按事故上报）
+_OPTIONAL_JOBS = frozenset({"qa_facts", "agent_checkpoints", "agent_steps", "tool_invocations",
+                            "llm_calls", "agent_audit", "approval_decisions",
+                            "approval_requests", "agent_runs",
+                            "ontology_case_evidence", "ontology_candidate_features"})
+
+_AGENT_RUN_TERMINAL = "('succeeded','failed','cancelled','expired')"
 
 
 def _kb_db() -> str:
@@ -81,6 +111,10 @@ def _kb_db() -> str:
 def _op_db() -> str:
     from opensearch_pipeline.qa_logger import _op_db as qa_op_db
     return qa_op_db()
+
+
+def _ont_db() -> str:
+    return get_config().rds.ontology_database
 
 
 def _months(env_key: str, default: int) -> int:
@@ -99,6 +133,20 @@ def _retention_windows() -> Dict[str, int]:
         "findings": _months("RAG_RETENTION_FINDING_MONTHS", 24),
         # perf#3 事实表（schema/013）：与 qa_rows 同窗——瘦行只服务 30 天级看板，跟主日志同期退役
         "qa_facts": _months("RAG_RETENTION_QA_FACTS_MONTHS", 18),
+        # agent 表族：checkpoint 是 PII 最重的明文 blob（完整 messages 含 ACL 受限 chunk 原文）
+        # → 最短窗；trace/账本 12 月；审计/审批链 24 月（对齐 kb_audit_log）；run 主行 18 月殿后。
+        "agent_checkpoints": _months("RAG_RETENTION_AGENT_CHECKPOINT_MONTHS", 3),
+        "agent_steps": _months("RAG_RETENTION_AGENT_TRACE_MONTHS", 12),
+        "tool_invocations": _months("RAG_RETENTION_AGENT_TRACE_MONTHS", 12),
+        "llm_calls": _months("RAG_RETENTION_LLM_CALL_MONTHS", 12),
+        "agent_audit": _months("RAG_RETENTION_AGENT_AUDIT_MONTHS", 24),
+        "approval_decisions": _months("RAG_RETENTION_APPROVAL_MONTHS", 24),
+        "approval_requests": _months("RAG_RETENTION_APPROVAL_MONTHS", 24),
+        "agent_runs": _months("RAG_RETENTION_AGENT_RUN_MONTHS", 18),
+        # 本体证据擦除（同一窗口 env 管两个作业，与 AGENT_TRACE 同款）：evidence/features
+        # 是源观测快照（PII 面），处置后 6 月擦 blob；identifier/case 行本体=审计骨架不删。
+        "ontology_case_evidence": _months("RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS", 6),
+        "ontology_candidate_features": _months("RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS", 6),
     }
 
 
@@ -154,12 +202,101 @@ def _job_sqls(job: str) -> Dict[str, str]:
         return {"count": f"SELECT COUNT(*) {pred}",
                 "select_ids": f"SELECT f.id {pred} LIMIT %s",
                 "act_by_ids": f"DELETE FROM {kb}.document_sensitive_finding WHERE id IN ({{ids}})"}
+    # ── agent 表族（schema/022/023/024/025；深度审查治理组）─────────────────────
+    if job == "agent_checkpoints":
+        # PII 最重的明文 blob：只删**终态** run 的 checkpoint（suspended 的是活恢复依据，
+        # 由 run TTL 3 天先行裁决）；LEFT JOIN 兼收孤儿（run 行已被 agent_runs 作业删除）。
+        # 多表条件删除 MySQL 不允许 LIMIT → select-PK-then-delete（同 findings）；PK 是 uuid hex。
+        pred = (
+            "FROM {op}.agent_checkpoint c "
+            "LEFT JOIN {op}.agent_run r ON r.run_id = c.run_id "
+            "WHERE (r.run_id IS NULL OR r.status IN " + _AGENT_RUN_TERMINAL + ") "
+            "AND c.created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)"
+        ).format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}",
+                "select_ids": f"SELECT c.checkpoint_id {pred} LIMIT %s",
+                "act_by_ids": f"DELETE FROM {op}.agent_checkpoint WHERE checkpoint_id IN ({{ids}})",
+                "pk_str": True}
+    if job == "agent_steps":
+        pred = ("FROM {op}.agent_step "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "tool_invocations":
+        pred = ("FROM {op}.tool_invocation "
+                "WHERE started_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "llm_calls":
+        pred = ("FROM {op}.llm_call_log "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "agent_audit":
+        # 合规审计（与 kb_audit_log 同纪律）：删前冷归档（select→OSS→按 audit_id 删）
+        pred = ("FROM {op}.agent_audit_log "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s",
+                "select_rows": f"SELECT * {pred} LIMIT %s",
+                "act_by_ids": f"DELETE FROM {op}.agent_audit_log WHERE audit_id IN ({{ids}})",
+                "pk_str": True}
+    if job == "approval_decisions":
+        # 审批链事实：agent_audit_log（归档保真）已携 approval_decision 事件 → 这里 24 月直删
+        pred = ("FROM {op}.approval_decision "
+                "WHERE decided_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "approval_requests":
+        # pending 永不删（活状态机；过期由 reaper 置 expired 后进入本作业窗口）
+        pred = ("FROM {op}.approval_request "
+                "WHERE status <> 'pending' "
+                "AND created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "agent_runs":
+        # 主行殿后（18 月 > 子表 12 月/3 月，子行早已清）；只删终态，活 run 永不删
+        pred = ("FROM {op}.agent_run "
+                "WHERE status IN " + _AGENT_RUN_TERMINAL + " "
+                "AND ended_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "ontology_case_evidence":
+        # 已处置 case 的证据快照到期擦除（open=活依据永不动；行留审计骨架）
+        ont = _ont_db()
+        pred = ("FROM {ont}.ontology_resolution_case "
+                "WHERE status <> 'open' AND evidence_json IS NOT NULL "
+                "AND resolved_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(ont=ont)
+        return {"count": f"SELECT COUNT(*) {pred}",
+                "act": (f"UPDATE {ont}.ontology_resolution_case SET evidence_json = NULL "
+                        "WHERE status <> 'open' AND evidence_json IS NOT NULL "
+                        "AND resolved_at < DATE_SUB(NOW(), INTERVAL %s MONTH) LIMIT %s")}
+    if job == "ontology_candidate_features":
+        # 已处置 case 的候选匹配依据到期擦除（多表条件 UPDATE 无 LIMIT → select-PK 两步批）
+        ont = _ont_db()
+        pred = (
+            "FROM {ont}.ontology_resolution_candidate cd "
+            "JOIN {ont}.ontology_resolution_case c ON c.case_id = cd.case_id "
+            "WHERE c.status <> 'open' AND cd.features_json IS NOT NULL "
+            "AND c.resolved_at < DATE_SUB(NOW(), INTERVAL %s MONTH)"
+        ).format(ont=ont)
+        return {"count": f"SELECT COUNT(*) {pred}",
+                "select_ids": f"SELECT cd.candidate_id {pred} LIMIT %s",
+                "act_by_ids": (f"UPDATE {ont}.ontology_resolution_candidate "
+                               "SET features_json = NULL WHERE candidate_id IN ({ids})"),
+                "pk_str": True}
     raise ValueError(f"unknown retention job: {job}")
 
 
 # ─── P3-18 删前冷归档（qa_rows / audit）──────────────────────────────────────
 
-_ARCHIVE_TABLES = {"qa_rows": "qa_session_log", "audit": "kb_audit_log"}
+_ARCHIVE_TABLES = {"qa_rows": "qa_session_log", "audit": "kb_audit_log",
+                   "agent_audit": "agent_audit_log"}
+_ARCHIVE_PK = {"qa_rows": "id", "audit": "id", "agent_audit": "audit_id"}
+
+
+def _fmt_id(v, *, str_pk: bool = False) -> str:
+    """按 id 删除的 SQL 字面量。数值主键严格 int 化；字符串主键（uuid hex）严格校验
+    字母数字后加引号——绝不把未经校验的字符串拼进 DELETE。"""
+    if not str_pk:
+        return str(int(v))
+    s = str(v)
+    if not s.isalnum():
+        raise RuntimeError(f"非字母数字主键，拒绝拼接进 DELETE: {s!r}")
+    return f"'{s}'"
 
 
 def _archive_enabled() -> bool:
@@ -271,17 +408,20 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
                             rows = cur.fetchall() or []
                             if not rows:
                                 break
-                            _id_i = cols.index("id")
-                            ids = [str(int(r["id"] if isinstance(r, dict) else r[_id_i]))
-                                   for r in rows]
+                            pk = _ARCHIVE_PK.get(job, "id")
+                            _id_i = cols.index(pk)
+                            _str_pk = bool(sqls.get("pk_str"))
+                            ids = [_fmt_id(r[pk] if isinstance(r, dict) else r[_id_i],
+                                           str_pk=_str_pk) for r in rows]
                             key = _archive_batch(job, rows, cols, _b, _run_ts)
                             rep["archive_objects"] = rep.get("archive_objects", 0) + 1
                             rep["archive_last_key"] = key
                             cur.execute(sqls["act_by_ids"].format(ids=",".join(ids)))
                             n = cur.rowcount
-                        elif "select_ids" in sqls:   # findings：当前版本守卫的两步批
+                        elif "select_ids" in sqls:   # findings/agent_checkpoints：两步批
                             cur.execute(sqls["select_ids"], (months, batch))
-                            ids = [str(int(r[0])) for r in cur.fetchall()]
+                            _str_pk = bool(sqls.get("pk_str"))
+                            ids = [_fmt_id(r[0], str_pk=_str_pk) for r in cur.fetchall()]
                             if not ids:
                                 break
                             cur.execute(sqls["act_by_ids"].format(ids=",".join(ids)))
@@ -305,12 +445,12 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
                 conn.close()
         except Exception as e:
             errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
-            if job == "qa_facts" and errno == 1146:
-                # schema/013 是可选迁移：未 apply 的环境（staging/本地）表不存在不算失败——
-                # 其余作业的 1146 仍按事故上报（基础表缺失=部署错库）。
+            if job in _OPTIONAL_JOBS and errno == 1146:
+                # 可选迁移（schema/013 事实表、022+ agent 表族）：未 apply 的环境表不存在
+                # 不算失败——其余作业的 1146 仍按事故上报（基础表缺失=部署错库）。
                 rep["ok"] = True
-                rep["skipped"] = "qa_retrieved_doc 不存在（schema/013 未应用）"
-                print(f"[retention] {job}: skip（事实表未建）")
+                rep["skipped"] = "表不存在（可选迁移未应用）"
+                print(f"[retention] {job}: skip（可选迁移表未建）")
             else:
                 rep["error"] = str(e)
                 print(f"[retention] {job}: ✗ {e}")
@@ -325,9 +465,37 @@ def _purge_jobs(user_id: str) -> List[dict]:
     qa_retrieved_doc（schema/013 事实表）没有 user_id 列，必须经 qa_session_log.message_id
     关联删除，且必须先于 qa_session_log 本体——先删日志则事实行成永久孤儿、再也定位不到。
     count 与 act 同谓词；act 为单表 DELETE + LIMIT（子查询指向他表，MySQL 允许 LIMIT）。
+
+    agent 表族（schema/022/023，深度审查治理组）：agent_checkpoint.state_blob 明文存完整
+    messages（含 ACL 受限 chunk 原文）+ user_id——主体擦除必须覆盖，否则擦除后驻留。
+    子表（checkpoint/step/invocation）无 user_id 列，经 agent_run.run_id 关联删且先于
+    agent_run 本体（同 qa_retrieved_doc 的锚点逻辑）；llm_call_log 有 user_id 直删。
+    **刻意不删**：agent_audit_log / approval_request / approval_decision——合规审计与审批
+    职责链（PIPL 47 条法定义务豁免，同 kb_audit_log 口径），由 retention 24 月窗口退役。
     """
     op = _op_db()
     return [
+        {"table": "agent_checkpoint", "optional": True,   # schema/022 可选迁移，1146 → skip
+         "count": (f"SELECT COUNT(*) FROM {op}.agent_checkpoint WHERE run_id IN "
+                   f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s)"),
+         "act": (f"DELETE FROM {op}.agent_checkpoint WHERE run_id IN "
+                 f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s) LIMIT %s")},
+        {"table": "agent_step", "optional": True,
+         "count": (f"SELECT COUNT(*) FROM {op}.agent_step WHERE run_id IN "
+                   f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s)"),
+         "act": (f"DELETE FROM {op}.agent_step WHERE run_id IN "
+                 f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s) LIMIT %s")},
+        {"table": "tool_invocation", "optional": True,
+         "count": (f"SELECT COUNT(*) FROM {op}.tool_invocation WHERE run_id IN "
+                   f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s)"),
+         "act": (f"DELETE FROM {op}.tool_invocation WHERE run_id IN "
+                 f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s) LIMIT %s")},
+        {"table": "llm_call_log", "optional": True,       # schema/023；user_id 直删（含 null-run 行）
+         "count": f"SELECT COUNT(*) FROM {op}.llm_call_log WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.llm_call_log WHERE user_id = %s LIMIT %s"},
+        {"table": "agent_run", "optional": True,          # 最后删（子表的 run_id 锚点）
+         "count": f"SELECT COUNT(*) FROM {op}.agent_run WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.agent_run WHERE user_id = %s LIMIT %s"},
         {"table": "qa_retrieved_doc", "optional": True,   # schema/013 可选迁移，1146 → skip
          "count": (f"SELECT COUNT(*) FROM {op}.qa_retrieved_doc WHERE message_id IN "
                    f"(SELECT message_id FROM {op}.qa_session_log WHERE user_id = %s)"),

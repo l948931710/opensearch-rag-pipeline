@@ -7,6 +7,7 @@ import { useSession } from '@/stores/session'
 import { useAuth, hasPendingVersion } from '@/composables/useAuth'
 import { useAsk } from '@/composables/useAsk'
 import { useKb } from '@/composables/useKb'
+import { useAgentApprovals } from '@/composables/useAgentApprovals'
 import { useContribute } from '@/composables/useContribute'
 import { debugEnabled } from '@/lib/diag'
 import AppShell from '@/components/shell/AppShell.vue'
@@ -21,6 +22,7 @@ const { ready, error } = storeToRefs(session)
 const { init } = useAuth()
 const { hydrateConversations } = useAsk()
 const { loadApprovals, loadAccessRequests } = useKb()
+const { loadAgentApprovals } = useAgentApprovals()
 const { loadPending: loadPendingContribs } = useContribute()
 const router = useRouter()
 onMounted(() => { void init() })
@@ -29,7 +31,8 @@ onMounted(() => { void init() })
 watch(ready, (r) => {
   if (!r) return
   void hydrateConversations()
-  if (session.canManage) { void loadApprovals(); void loadAccessRequests(); void loadPendingContribs() }
+  // Agent 审批一并预载：reviewCount 已聚合其计数，红点在进管理台前就要完整（404/403 自静默）。
+  if (session.canManage) { void loadApprovals(); void loadAccessRequests(); void loadAgentApprovals(); void loadPendingContribs() }
   if (hasPendingVersion() && session.canManage) void router.push('/manage')
 }, { immediate: true })
 </script>

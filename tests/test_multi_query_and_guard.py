@@ -80,6 +80,7 @@ def test_parse_dedupes_caps_and_drops_original():
 # ──────────────────────────────────────────────────────────────
 
 def _qd_cfg(monkeypatch, mode):
+    monkeypatch.setattr(QD, "_call_logger", lambda: None)   # 单测不落 llm_call_log
     cfg = types.SimpleNamespace(
         rag=RAGConfig(multi_query_mode=mode),
         llm=LLMConfig(api_key="sk-test", api_base_url="https://example.invalid/v1",
@@ -93,6 +94,8 @@ class _FakeResp:
     def __init__(self, content):
         self._content = content
 
+    status_code = 200          # gateway 传输层按 status_code 分类瞬时错误
+
     def raise_for_status(self):
         pass
 
@@ -102,21 +105,21 @@ class _FakeResp:
 
 def test_mode_off_never_calls_llm(monkeypatch):
     _qd_cfg(monkeypatch, "off")
-    monkeypatch.setattr(QD.requests, "post",
+    monkeypatch.setattr("opensearch_pipeline.agent_runtime.model_gateway._http_post",
                         lambda *a, **k: pytest.fail("mode=off 不应调用 LLM"))
     assert QD.maybe_decompose("员工手册和行政部职责分别讲什么？") == []
 
 
 def test_mode_auto_skips_llm_when_heuristic_misses(monkeypatch):
     _qd_cfg(monkeypatch, "auto")
-    monkeypatch.setattr(QD.requests, "post",
+    monkeypatch.setattr("opensearch_pipeline.agent_runtime.model_gateway._http_post",
                         lambda *a, **k: pytest.fail("启发式未触发不应调用 LLM"))
     assert QD.maybe_decompose("怎么请假") == []
 
 
 def test_mode_auto_decomposes_on_trigger(monkeypatch):
     _qd_cfg(monkeypatch, "auto")
-    monkeypatch.setattr(QD.requests, "post",
+    monkeypatch.setattr("opensearch_pipeline.agent_runtime.model_gateway._http_post",
                         lambda *a, **k: _FakeResp('["员工入职流程", "宿舍入住安排"]'))
     assert QD.maybe_decompose("新员工从入职到入住宿舍要经过哪些流程？") == \
         ["员工入职流程", "宿舍入住安排"]
@@ -130,7 +133,7 @@ def test_mode_llm_always_asks(monkeypatch):
         calls.append(1)
         return _FakeResp("[]")
 
-    monkeypatch.setattr(QD.requests, "post", _post)
+    monkeypatch.setattr("opensearch_pipeline.agent_runtime.model_gateway._http_post", _post)
     assert QD.maybe_decompose("怎么请假") == []   # 无启发式信号也会问 LLM
     assert calls, "mode=llm 必须调用 LLM"
 
@@ -141,7 +144,7 @@ def test_llm_failure_fails_open(monkeypatch):
     def _post(*a, **k):
         raise RuntimeError("timeout")
 
-    monkeypatch.setattr(QD.requests, "post", _post)
+    monkeypatch.setattr("opensearch_pipeline.agent_runtime.model_gateway._http_post", _post)
     assert QD.maybe_decompose("员工手册和行政部职责分别讲什么？") == []
 
 

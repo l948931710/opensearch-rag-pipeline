@@ -34,7 +34,7 @@ class _ScriptedCursor:
             self._row = (self._conn.rollup_lag_days,)
         elif s.startswith("SELECT COUNT(*)"):
             self._row = (self._conn.affected,)
-        elif s.startswith("SELECT f.id"):
+        elif s.startswith(("SELECT f.id", "SELECT c.checkpoint_id")):
             batch = self._conn.id_batches.pop(0) if self._conn.id_batches else []
             self._rows = [(i,) for i in batch]
             self._row = None
@@ -258,3 +258,147 @@ def test_main_exit_codes(monkeypatch, live_db):
         raise RuntimeError("db down")
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _boom)
     assert retention.main(["--only", "audit"]) == 3
+
+
+# ── agent 表族（schema/022–025；深度审查 2026-07-09 治理组）──────────────────
+
+
+_AGENT_JOBS = ("agent_checkpoints", "agent_steps", "tool_invocations", "llm_calls",
+               "agent_audit", "approval_decisions", "approval_requests", "agent_runs")
+
+
+def test_agent_jobs_registered_with_windows():
+    """agent 组作业全部登记：_JOB_NAMES / 窗口 / SQL 生成不抛，count 与 act 同谓词形态。"""
+    windows = retention._retention_windows()
+    for job in _AGENT_JOBS:
+        assert job in retention._JOB_NAMES
+        assert windows[job] > 0
+        sqls = retention._job_sqls(job)
+        assert sqls["count"].lstrip().startswith("SELECT COUNT(*)")
+        assert ("act" in sqls) or ("select_ids" in sqls)
+    # 顺序：子表在前、agent_run 殿后
+    names = list(retention._JOB_NAMES)
+    assert names.index("agent_checkpoints") < names.index("agent_runs")
+    assert names.index("llm_calls") < names.index("agent_runs")
+
+
+def test_agent_jobs_are_optional_1146_skip(monkeypatch, live_db):
+    """agent 表未建的环境（可选迁移）：1146 → skip 不算失败。"""
+    class _NoTableConn:
+        def cursor(self):
+            raise Exception(1146, "Table 'fuling_operation.agent_step' doesn't exist")
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+    # pymysql err 形态是 e.args[0]==1146
+    class _Err(Exception):
+        pass
+    def _boom(*a, **k):
+        e = _Err("no table")
+        e.args = (1146, "Table doesn't exist")
+        raise e
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _boom)
+    rep = retention.run_retention(only=["agent_steps"])
+    assert rep["agent_steps"]["ok"] and "可选迁移" in rep["agent_steps"]["skipped"]
+    # 非可选作业的 1146 仍是事故
+    rep2 = retention.run_retention(only=["audit"])
+    assert not rep2["audit"]["ok"]
+
+
+def test_fmt_id_str_pk_quotes_and_rejects_injection():
+    assert retention._fmt_id(42) == "42"
+    assert retention._fmt_id("a3f9", str_pk=True) == "'a3f9'"
+    with pytest.raises(RuntimeError, match="拒绝拼接"):
+        retention._fmt_id("x'; DROP TABLE --", str_pk=True)
+
+
+def test_agent_checkpoints_two_step_delete_with_string_ids(monkeypatch, live_db):
+    """checkpoint 两步批（select-PK-then-delete）：uuid hex 主键加引号拼进 DELETE。"""
+    monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
+    conn = _ScriptedConn(affected=2, id_batches=[["aa11", "bb22"]], act_rowcounts=[2])
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    rep = retention.run_retention(commit=True, only=["agent_checkpoints"], batch=5000)
+    assert rep["agent_checkpoints"]["ok"] and rep["agent_checkpoints"]["deleted"] == 2
+    dels = [s for s, _ in conn.executed if s.strip().startswith("DELETE")]
+    assert dels and "checkpoint_id IN ('aa11','bb22')" in dels[0]
+    # 终态守卫 + 孤儿兼收：谓词必须含 LEFT JOIN 与 status 终态集
+    sel = [s for s, _ in conn.executed if "SELECT c.checkpoint_id" in s][0]
+    assert "LEFT JOIN" in sel and "'succeeded'" in sel and "r.run_id IS NULL" in sel
+
+
+def test_agent_audit_archives_before_delete_by_audit_id(monkeypatch, live_db):
+    """agent_audit 与 kb_audit_log 同纪律：先归档再按 audit_id（字符串 PK）删。"""
+    monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
+    monkeypatch.delenv("RAG_RETENTION_ARCHIVE", raising=False)   # 默认即开
+    conn = _ScriptedConn(affected=2,
+                         row_batches=[[("aud1", "tool_call"), ("aud2", "approval_decision")]],
+                         row_cols=("audit_id", "event_type"),
+                         act_rowcounts=[2])
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    archived = []
+    monkeypatch.setattr(retention, "_archive_batch",
+                        lambda job, rows, cols, b, ts: archived.append((job, len(rows))) or "k")
+    rep = retention.run_retention(commit=True, only=["agent_audit"], batch=5000)
+    assert rep["agent_audit"]["ok"] and rep["agent_audit"]["deleted"] == 2
+    assert archived == [("agent_audit", 2)], "删前必归档"
+    dels = [s for s, _ in conn.executed if s.strip().startswith("DELETE")]
+    assert dels and "audit_id IN ('aud1','aud2')" in dels[0]
+
+
+def test_approval_requests_never_delete_pending():
+    sqls = retention._job_sqls("approval_requests")
+    assert "status <> 'pending'" in sqls["count"] and "status <> 'pending'" in sqls["act"]
+
+
+def test_agent_runs_only_terminal():
+    sqls = retention._job_sqls("agent_runs")
+    for kw in ("'succeeded'", "'failed'", "'cancelled'", "'expired'"):
+        assert kw in sqls["act"]
+    assert "ended_at" in sqls["act"]
+
+
+def test_purge_jobs_cover_agent_tables_children_first():
+    """主体擦除覆盖 agent 表族：子表先删、agent_run 殿后且先于 qa 组无碍；
+    审计/审批链（agent_audit_log / approval_*）刻意不在擦除范围（法定义务豁免）。"""
+    jobs = retention._purge_jobs("u-x")
+    tables = [j["table"] for j in jobs]
+    for t in ("agent_checkpoint", "agent_step", "tool_invocation", "llm_call_log", "agent_run"):
+        assert t in tables, f"purge 缺 {t}"
+        assert jobs[tables.index(t)]["optional"] is True
+    assert tables.index("agent_checkpoint") < tables.index("agent_run")
+    assert tables.index("agent_step") < tables.index("agent_run")
+    assert tables.index("tool_invocation") < tables.index("agent_run")
+    assert "agent_audit_log" not in tables and "approval_request" not in tables
+    # 子表经 run_id 关联删（无 user_id 列）
+    ck = jobs[tables.index("agent_checkpoint")]
+    assert "run_id IN" in ck["act"] and "agent_run WHERE user_id" in ck["act"]
+    # qa 链原有顺序不被破坏（qa_retrieved_doc 仍先于 qa_session_log）
+    assert tables.index("qa_retrieved_doc") < tables.index("qa_session_log")
+
+
+# ── PR-H：本体证据擦除作业（P1「数据与证据无保留策略」/PIPL）──────────────────
+
+
+def test_ontology_retention_jobs_registered():
+    from opensearch_pipeline import retention
+    assert "ontology_case_evidence" in retention._JOB_NAMES
+    assert "ontology_candidate_features" in retention._JOB_NAMES
+    # 可选迁移：无 027/028 的环境 1146 → skip 不算失败
+    assert "ontology_case_evidence" in retention._OPTIONAL_JOBS
+    assert "ontology_candidate_features" in retention._OPTIONAL_JOBS
+    w = retention._retention_windows()
+    assert w["ontology_case_evidence"] == 6 and w["ontology_candidate_features"] == 6
+
+
+def test_ontology_retention_sqls_scrub_not_delete():
+    """擦除语义：行留审计骨架，只 NULL 证据 blob；open case 永不在谓词内。"""
+    from opensearch_pipeline import retention
+    ev = retention._job_sqls("ontology_case_evidence")
+    assert "UPDATE" in ev["act"] and "evidence_json = NULL" in ev["act"]
+    assert "DELETE" not in ev["act"]
+    assert "status <> 'open'" in ev["count"]
+    ft = retention._job_sqls("ontology_candidate_features")
+    assert "UPDATE" in ft["act_by_ids"] and "features_json = NULL" in ft["act_by_ids"]
+    assert ft.get("pk_str") is True
+    assert "status <> 'open'" in ft["count"]

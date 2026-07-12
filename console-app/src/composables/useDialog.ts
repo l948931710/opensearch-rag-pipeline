@@ -29,7 +29,8 @@ function _settle(v: boolean | string | null) {
 }
 
 export interface ConfirmOpts { title?: string; message: string; confirmText?: string; cancelText?: string; danger?: boolean }
-export interface PromptOpts extends ConfirmOpts { placeholder?: string; maxlength?: number }
+// initial：输入框预填值（如「修改后批准」预填当前脱敏参数 JSON 供编辑）；缺省空串，旧调用零变化。
+export interface PromptOpts extends ConfirmOpts { placeholder?: string; maxlength?: number; initial?: string }
 
 export function useDialog() {
   /** 确认框：resolve(true=确认 / false=取消)。 */
@@ -51,7 +52,7 @@ export function useDialog() {
       state.value = {
         open: true, kind: 'prompt', title: opts.title || '', message: opts.message,
         confirmText: opts.confirmText || '确认', cancelText: opts.cancelText || '取消',
-        placeholder: opts.placeholder || '', value: '', maxlength: opts.maxlength || 500, danger: !!opts.danger,
+        placeholder: opts.placeholder || '', value: opts.initial || '', maxlength: opts.maxlength || 500, danger: !!opts.danger,
       }
     })
   }

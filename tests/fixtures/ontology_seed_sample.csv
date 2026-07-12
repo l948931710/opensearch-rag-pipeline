@@ -1,0 +1,7 @@
+namespace,raw_code,object_type,title,owner_dept,材质,克重
+u8,LX620-50,product,6.2口径龙虾杯,pmc,PP,12.5
+u8,LX620-ALT,product,6.2口径龙虾杯,pmc,PP,12.5
+u8,LX620-50-M,product,6.2口径龙虾杯改模,pmc,PP,12.5
+u8,SQ370,product,PP水杯370ml,pmc,PP,9.8
+u8,SQ370X,product,PP水杯370ml,pmc,PS,9.8
+material_grade,pp-1100,material,PP-1100,supply,,

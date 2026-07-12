@@ -216,7 +216,9 @@ def test_ratelimit_ask_fail_closed_on_limiter_error(monkeypatch):
         def admit_aux(self, *a, **k):
             raise RuntimeError("limiter broken")
 
-    monkeypatch.setattr(api, "LIMITER", _BoomLimiter())
+    # api 已改按模块属性访问（_rate_limiter.LIMITER）——patch 共享模块全局才真正生效
+    # （此前 patch api.LIMITER 只因 api 按值持有副本才碰巧可用，是假接缝）
+    monkeypatch.setattr(api._rate_limiter, "LIMITER", _BoomLimiter())
 
     with pytest.raises(HTTPException) as ei:
         api._enforce_rate_limit(None, None, scope="ask")

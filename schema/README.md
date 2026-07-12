@@ -12,8 +12,15 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 022。历史上有三对编号冲突（002/003/006 各两个文件，
+3. **编号严格单调递增**，下一个可用号 = 034（031=agent 审批/执行硬化【2026-07-11 占用——
+   原「本体事件」的 P2 预订作废顺延，落地时取当时最新号】、032=台账 checksum、033=本体
+   link 不变量）。历史上有三对编号冲突（002/003/006 各两个文件，
    见下表）——**不改名**（外部引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
+   ⚠️ **本体层文档编号勘误**：《本体层设计 v1.1》《P0-P1 落地细化》所写迁移号 024–028 成文时
+   未预见 agent v2 占号，已全部作废——本体表族实际为 **027(core)/028(identity)/029(link)/
+   030(sem_views)/033(link 不变量)**（event 表 P2 落地时取当时最新号；原预订的 031 已被
+   agent 硬化占用）；文档所称"018 审批""023 预留 v2 P4"同样以本表为准
+   （018=gen_meta、023=llm_call_log、审批=025）。详见 `docs/ontology_p0_plan_2026-07-10.md`。
 4. **`CREATE DATABASE` 必须显式 `CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci`**，每张新表
    显式 COLLATE —— staging `_stg` 库曾因缺省漂移到 `_0900_ai_ci` 引发跨库 JOIN 1267。
 5. DDL↔代码列契约由 `tests/test_schema_ddl_parity.py` 钉住（INSERT/SELECT 用到的列
@@ -38,7 +45,8 @@ apply 脚本落库并记台账。
 | 008_kb_access_request.sql | fuling_knowledge | 跨部门检索授权申请（collation 对齐 _unicode_ci） |
 | 009_acl_projection_outbox.sql | fuling_knowledge | ACL 投影 outbox（同事务 enqueue + UNIQUE(doc_id) 复活） |
 | 010_kb_contribution.sql | fuling_operation | 员工知识贡献（010a 修订：补 normalized_gap_query） |
-| 011_schema_migrations.sql | 双库 | DDL 变更台账（本机制自身） |
+| 011_schema_migrations.sql | 三库（knowledge/operation/ontology 各一份） | DDL 变更台账（本机制自身） |
+| 032_schema_migrations_checksum.sql | 三库（同 011 分布） | 台账加 checksum 列（PR-D P0-09：同名不同 SHA-256 即中止，防同版本内容漂移；information_schema 守卫幂等） |
 | 012_qa_session_log_perf_index.sql | fuling_operation | (answer_status, created_at) 复合索引（性能第一梯队 #1） |
 | 013_qa_retrieved_doc_fact.sql | fuling_operation | 检索/引用文档物化事实表 + 存量回填（perf#3；读侧 RAG_QA_FACT_JOIN 门控） |
 | 014_document_version_raw_key_hash_index.sql | fuling_knowledge | raw_key_hash 回填 + idx_raw_key_hash（perf#5 注册幂等点查） |
@@ -49,6 +57,17 @@ apply 脚本落库并记台账。
 | 019_chunk_meta_index_retry.sql | fuling_knowledge | chunk_meta.index_retry_count + DEAD 死信终态（G9：毒 chunk 队头阻塞修复；代码侧 1054 fail-open） |
 | 020_document_version_simhash.sql | fuling_knowledge | document_version.content_simhash（G19：simhash 近重复 WARN；代码侧 1054 fail-open） |
 | 021_ingest_quality_metrics.sql | fuling_knowledge | ingest_quality_metrics 批次质量指标表（G22 per-batch 质量哨兵；写侧 fail-open） |
+| 022_agent_runtime.sql | fuling_operation | 企业级 Agent Runtime durable 表族：tool_registry + agent_run（单向状态机+心跳）+ agent_step + agent_checkpoint + tool_invocation（uk_tool_idem 幂等）（WS1-2；run_store.py） |
+| 023_llm_call_log.sql | fuling_operation | LLM 调用账本（ModelGateway 每次调用记 token/成本/延迟；成本按 user/dept 归集，E5）（WS1 收尾②） |
+| 024_agent_audit_log.sql | fuling_operation | Agent 合规审计（append-only；执行前 write-ahead 审计，HIGH_WRITE fail-closed / 普通 fail-open；audit.py）（WS1 收尾③） |
+| 025_approval_workflow.sql | fuling_operation | Agent 审批闭环持久化：approval_request（挂起侧写，approver_scope + 过期即拒）+ approval_decision（决策侧写，uk_req_idem 幂等）——request→decision→invocation→audit 四表回放链（WS3；approval_store.py；深度审查 A 组 P1） |
+| 026_agent_family_collation_request_id.sql | fuling_operation | agent 表族 9 表 COLLATE 显式钉到 utf8mb4_unicode_ci（铁律 4；022/025 吃库默认在漂移环境与显式 unicode_ci 的 023/024 混排 → run_id JOIN 1267）+ request_id 加宽 VARCHAR(64)（UUID 36 字符原宽度装不下）（深度审查 schema 组） |
+| 027_ontology_core.sql | fuling_ontology | 本体控制面核心：ontology_object（canonical ULID+乐观锁+密级）+ ontology_ref_seq（展示号发号）+ ontology_attribute_source（属性溯源，纯来源治理）+ ontology_stewardship（授权 scope，S5）（本体 P0；docs/ontology_p0_plan_2026-07-10.md） |
+| 028_ontology_identity.sql | fuling_ontology | 身份脊柱：ontology_identifier（别名映射，至多一行 active 生成列唯一键 S4；norm 不剥改模后缀）+ ontology_resolution_case/candidate（候选承载层 S2：证据快照+积压统计，一个未解析编号×N 候选）（本体 P0） |
+| 029_ontology_link.sql | fuling_ontology | 本体关系：ontology_link（sku_of_product 等；uk_src_dst_type）（本体 P0） |
+| 030_sem_views.sql | fuling_ontology | PMC-1 语义投影：sem_packing/sem_stacking 视图（spec↔SKU 走 029 link 非 JSON 关联）+ packing_spec/stacking_spec 发号登记；**S7：本体表族整体在独立库 fuling_ontology（PR-B P0-02），fuling_ro 不授本库——隔离由 DB 授权面强制（tests/test_ontology_db_isolation.py 钉住），唯一读取口 ontology/sem.py** |
+| 031_agent_approval_execution_hardening.sql | fuling_operation | 重评报告 P0-C/P0-E/P1-11：approval_decision.final_args_digest（决定绑定最终执行参数摘要，堵改参重放）+ tool_invocation.status 增 uncertain（超时/崩溃副作用不可知→人工对账，不再谎报 failed）+ approver_scope 加宽 160（backup steward CSV）（2026-07-11；已 apply 本地） |
+| 033_ontology_link_invariants.sql | fuling_ontology | P1-8/P1-9 link 不变量：active_single_key 生成列 + uk_link_active_single（single 基数 link 型 DB 级拒双活，扩展方式见文件头）+ 三条引用 FK（object.merged_into RESTRICT；identifier.source_case_id / case.resolved_identifier_id 均 ON DELETE SET NULL）；刻意不加 superseded_by FK（repoint 事务序不容）（本体 P1，2026-07-11；已 apply 本地） |
 
 ## 台账（schema_migrations）
 

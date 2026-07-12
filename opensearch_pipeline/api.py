@@ -47,7 +47,10 @@ from opensearch_pipeline.content_blocks_builder import (
     strip_image_markers,
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
-from opensearch_pipeline.rate_limiter import LIMITER, resolve_client_ip
+# ⚠️ 限流器必须按模块属性访问（rate_limiter.LIMITER），不能 from-import 按值绑定——
+# 否则 _set_limiter_for_test 替换全局后本模块仍持旧引用，测试接缝假绿（深度审查 F 组）。
+from opensearch_pipeline import rate_limiter as _rate_limiter
+from opensearch_pipeline.rate_limiter import resolve_client_ip
 from opensearch_pipeline.answer_flow import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -126,7 +129,7 @@ async def _lifespan(_app: FastAPI):
     except Exception:
         logger.warning("启动钉钉 Stream 客户端失败（忽略，HTTP 回调模式继续可用）", exc_info=True)
     try:
-        logger.info("Serving 限流配置：%s", LIMITER.describe())
+        logger.info("Serving 限流配置：%s", _rate_limiter.LIMITER.describe())
     except Exception:
         logger.warning("读取限流配置失败（忽略）", exc_info=True)
     # P2-8：比对摄取侧写入的 embedding 契约行（模型名/维度，schema/018）。失配 = 查询向量
@@ -464,10 +467,10 @@ def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity]
         else:
             actor, is_user = f"ip:{_client_ip(request)}", False
         if scope == "ask":
-            denial = LIMITER.admit_ask(actor, is_user=is_user,
+            denial = _rate_limiter.LIMITER.admit_ask(actor, is_user=is_user,
                                        thinking=thinking, count_llm=count_llm)
         else:
-            denial = LIMITER.admit_aux(actor)
+            denial = _rate_limiter.LIMITER.admit_aux(actor)
     except Exception:
         if scope == "ask":
             logger.error("限流器内部异常（成本路径 fail-CLOSED 拒绝）", exc_info=True)
@@ -564,11 +567,28 @@ def readiness_check():
 
     checks["dashscope"] = "configured" if getattr(cfg.embedding, "api_key", None) else "unconfigured"
 
+    # WS0 状态外置：任一状态后端切了 redis → Redis PING 纳入就绪判定（此前 redis_client.ping
+    # 是死代码，深度审查多实例运维组）。判据：限流 redis 后端是 fail-closed（Redis 挂 → ask
+    # 全拒），会话/去重/token 虽 fail-open 也已降级——该实例都不该继续接流量。
+    # 全 memory 后端 → skipped（单实例语义，Redis 与就绪无关）。
+    _redis_backends = ("RAG_SESSION_BACKEND", "RAG_RATE_LIMIT_BACKEND",
+                       "RAG_MSG_DEDUP_BACKEND", "RAG_TOKEN_CACHE_BACKEND")
+    if any(os.environ.get(k, "memory").strip().lower() == "redis" for k in _redis_backends):
+        try:
+            from opensearch_pipeline import redis_client
+            checks["redis"] = "ok" if redis_client.ping() else "error"
+        except Exception as e:  # noqa: BLE001 — 探针必须报告而非抛出
+            logger.warning("readiness: Redis 探针失败 [trace=%s]: %s", trace_id, e)
+            checks["redis"] = "error"
+    else:
+        checks["redis"] = "skipped"
+
     # P2-8：启动时检出的摄取↔服务 embedding 契约失配 → 关键降级（此实例算出的相似度
     # 不可信，必须被负载均衡摘出）。失配详情已在启动日志 CRITICAL，此处只报状态词。
     checks["embedding_contract"] = "mismatch" if _EMBEDDING_CONTRACT_MISMATCH else "ok"
 
     critical_ok = (checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
+                   and checks.get("redis") in ("ok", "skipped")
                    and not _EMBEDDING_CONTRACT_MISMATCH)
     body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
     return body if critical_ok else JSONResponse(status_code=503, content=body)
@@ -2067,16 +2087,20 @@ if __name__ == "__main__":
 #   ⚠️ 本块必须保持在文件底部：路由模块顶层 from-import 本模块的共享件，
 #   依赖上方全部名字已定义。
 # ═══════════════════════════════════════════════════════════════
+from opensearch_pipeline.routes import agent as _routes_agent  # noqa: E402  企业 Agent 入口（RAG_AGENT_ENABLE 默认 off；agent_runtime 惰性加载）
 from opensearch_pipeline.routes import console as _routes_console  # noqa: E402
 from opensearch_pipeline.routes import contribution as _routes_contribution  # noqa: E402
 from opensearch_pipeline.routes import kb_access as _routes_kb_access  # noqa: E402
 from opensearch_pipeline.routes import kb_console as _routes_kb_console  # noqa: E402
+from opensearch_pipeline.routes import ontology as _routes_ontology  # noqa: E402  本体消解工作台（RAG_ONTOLOGY_ENABLE 默认 off；ontology 惰性加载）
 
 # 注册顺序 = 原文件内出现顺序（路径无重叠，仅求 diff 稳定）。
 app.include_router(_routes_kb_console.router)
 app.include_router(_routes_kb_access.router)
 app.include_router(_routes_contribution.router)
 app.include_router(_routes_console.router)
+app.include_router(_routes_agent.router)   # /api/agent/ask（独立路由，flag-off 时 404）
+app.include_router(_routes_ontology.router)   # /api/ontology/*（steward 工作台，flag-off 时 404）
 
 # re-export：tests 直接调用 api.<endpoint>(...) / 引用 api.Kb* 模型与域内常量。
 # —— routes/kb_console.py ——

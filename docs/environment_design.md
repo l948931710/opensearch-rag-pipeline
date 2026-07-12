@@ -218,6 +218,8 @@
 RDS 控制台 → 实例 rm-bp15j7… → 账号管理 → 创建账号：
 
 - `fuling_ro`：普通账号，授权库勾选 `fuling_knowledge` + `fuling_operation`，权限选**只读**。等价 SQL：`GRANT SELECT ON fuling_knowledge.* TO 'fuling_ro'@'%'; GRANT SELECT ON fuling_operation.* TO 'fuling_ro'@'%';`
+  ⚠️ **绝不授 `fuling_ontology`**（PR-B P0-02）：本体表族在独立库，fuling_ro 的库级 wildcard 不覆盖它——这是「sem 唯一读取口」的 DB 层强制（验证：`mysql -u fuling_ro` 下 `SELECT * FROM fuling_ontology.ontology_object` 应 ERROR 1044/1142；CI 有 tests/test_ontology_db_isolation.py 钉住）。
+- `fuling_ontology` 库（本体控制面，schema/027-030）：**服务账号（fuling_admin/SAE 注入账号）读写**；staging 用 `fuling_ontology_stg`（`fuling_stg` 账号加授该库）；生产建库时显式 `CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`（README 铁律 4）。
 - `fuling_stg`：普通账号，仅授 `fuling_knowledge_stg` + `fuling_operation_stg` **读写**；生产两库不出现在其授权列表。
 - 应用层再加一道：`opensearch_pipeline/prod_access.py`（PR3，§7.4）的只读连接强制 `init_command="SET SESSION TRANSACTION READ ONLY"`，即使误用了写账号，会话级也写不进去。
 

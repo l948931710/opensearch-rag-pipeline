@@ -79,6 +79,7 @@ def test_generate_answer_returns_gen_meta(mock_config, mock_post):
     mock_cfg.llm.model = "qwen3.6-plus"
     mock_cfg.rag.score_threshold_high = 8.0
     mock_cfg.rag.score_threshold_medium = 5.0
+    mock_cfg.rag.serving_model_gateway = False
     mock_config.return_value = mock_cfg
 
     mock_resp = MagicMock()

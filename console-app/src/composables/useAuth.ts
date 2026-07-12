@@ -2,6 +2,7 @@ import { useSession, toIdentity } from '@/stores/session'
 import { apiJson } from '@/lib/api'
 import { diag } from '@/lib/diag'
 import { syncHistoryForUser } from '@/composables/useAsk'
+import { __resetIdentityScope, syncIdentityScope } from '@/composables/identityScope'
 
 // 本企业 corpId（非密钥，可硬编码兜底）。钉钉「PC 端访问地址」注入的 H5 拿不到 corpId 时用它，
 // 否则 requestAuthCode 报 'corpId is illegal'。URL 带 ?corpId= 时优先。
@@ -62,6 +63,17 @@ let _stashedToken = ''
 let _capturedName = ''
 let _captured = false
 
+// ── 桌面 ?token 刷新续存（sessionStorage，tab 级）──
+// #F-console-urltoken 抹除 URL 后 token 只活在内存 → 桌面浏览器（无钉钉容器可重登）一刷新即
+// 永久掉线且无恢复路径（唯一出路=讨新链接）。解法：URL 摄取时同步存 sessionStorage，刷新时恢复。
+// 威胁模型不变差：不进 URL/历史/日志/截图/Referer（抹除照旧）；XSS 可读面与内存 token 等同；
+// tab 关闭即清、不跨 tab；token 本身由服务端签名+TTL 兜底。401 时清除，防过期 token 死循环。
+// 钉钉容器内不依赖此续存（dd 免登可随时重走），容器换证 token 不落存储（少存一处密钥）。
+const SS_TOKEN_KEY = 'rag.console.token'
+function persistToken(t: string) { try { sessionStorage.setItem(SS_TOKEN_KEY, t) } catch { /* 隐私模式等：降级为内存单次 */ } }
+function clearPersistedToken() { try { sessionStorage.removeItem(SS_TOKEN_KEY) } catch { /* 同上 */ } }
+function restorePersistedToken(): string { try { return sessionStorage.getItem(SS_TOKEN_KEY) || '' } catch { return '' } }
+
 /** 升版深链暂存（小程序「上传新版本」→ /console-next/?doc_id=&owner=&title=）。 */
 export interface PendingVersion { docId: string; owner: string; title: string }
 let _pendingVersion: PendingVersion | null = null
@@ -79,7 +91,8 @@ export function captureUrlCredential(): void {
   _captured = true
   const urlToken = qs('token')
   const docId = qs('doc_id')
-  if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name') }
+  if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name'); persistToken(urlToken) }
+  else { _stashedToken = restorePersistedToken() }   // 刷新路径：URL 已被抹除 → 从 tab 级续存恢复
   if (docId) _pendingVersion = { docId, owner: qs('owner'), title: qs('title') }   // 小程序升版深链
   if (urlToken || docId) scrubUrl(['token', 'name', 'doc_id', 'owner', 'title'])   // 先抹除，再发任何请求
   // #F-console-urltoken 保守加固：?token= 摄取【不可删】——钉钉容器外的桌面浏览器（index.html 无条件载入
@@ -110,10 +123,20 @@ async function doLogin(force: boolean): Promise<void> {
   if (!force) {
     if (!session.token && _stashedToken) session.setToken(_stashedToken)
     if (session.token) {
-      diag('login: URL 透传 token → /api/kb/whoami')
-      const who = await apiJson<Record<string, any>>('/api/kb/whoami', { auth: true })
-      session.setIdentity(toIdentity({ ...who, display_name: who.display_name || _capturedName }))
-      return
+      diag('login: URL 透传/续存 token → /api/kb/whoami')
+      try {
+        const who = await apiJson<Record<string, any>>('/api/kb/whoami', { auth: true })
+        session.setIdentity(toIdentity({ ...who, display_name: who.display_name || _capturedName }))
+        syncIdentityScope()   // P0-D：身份落定即对账——上个身份的注册 store（审批队列等）同步清空
+        return
+      } catch (e: any) {
+        // token 失效（401）：清内存+续存后【落穿】到容器免登——钉钉内无感重登；桌面（无容器）
+        // 走到超时报错，且续存已清，下次刷新不再拿同一枚死 token 空转。非 401（网络等）照旧上抛。
+        if (e?.status !== 401) throw e
+        session.setToken(''); _stashedToken = ''; clearPersistedToken()
+        syncIdentityScope()   // P0-D：token 已证失效即对账（fail-closed：下一身份未知，先清旧缓存）
+        diag('login: token 失效(401) → 清续存，回退容器免登')
+      }
     }
   }
 
@@ -127,6 +150,7 @@ async function doLogin(force: boolean): Promise<void> {
   if (!data || !data.token) throw new Error('换取令牌失败')
   session.setToken(data.token)
   session.setIdentity(toIdentity(data))
+  syncIdentityScope()   // P0-D：容器免登换证落定即对账（换号/角色变更 → 旧身份缓存同步清空）
 }
 
 export function useAuth() {
@@ -149,6 +173,7 @@ export function useAuth() {
             : { user_id: 'preview', display_name: '设计预览', role: 'kb_admin', can_manage_kb: true, acl_groups: ['marketing'], managed_owner_depts: ['marketing', 'hr', 'finance', 'production'] }
         session.setToken('dev-preview')
         session.setIdentity(toIdentity(mock))
+        syncIdentityScope()   // P0-D：预览身份同样对账（?preview=kb→dept 切换也不残留）
         session.ready = true; session.error = ''
         diag(`DEV ?preview：注入 mock 身份（${which || 'kb_admin'}，无后端）`)
         return
@@ -177,6 +202,10 @@ export function useAuth() {
     if (import.meta.env.DEV && session.token === 'dev-preview') return false
     try {
       session.setToken('')
+      clearPersistedToken()   // 旧 token 已证失效：续存一并清，防刷新捡回死 token
+      // P0-D：登出时点先对账——旧身份的注册 store（审批队列/台账/看板等）此刻同步清空，
+      // 重登失败也不残留（fail-closed）；重登成功后 doLogin 内部会再对账一次落定新身份。
+      syncIdentityScope()
       await doLogin(true)
       syncHistoryForUser(session.identity?.userId || '')   // 重登为不同用户时清掉前者残留
       return !!session.token
@@ -188,11 +217,13 @@ export function useAuth() {
   return { init, reauth }
 }
 
-/** 仅供测试：重置单次守卫 + 早捕获暂存。 */
+/** 仅供测试：重置单次守卫 + 早捕获暂存 + tab 级 token 续存 + identityScope 已观测身份。 */
 export function __resetInitGuard() {
   _initPromise = null
   _captured = false
   _stashedToken = ''
   _capturedName = ''
   _pendingVersion = null
+  clearPersistedToken()
+  __resetIdentityScope()
 }
