@@ -298,7 +298,10 @@ def test_identifier_scope_authz_uses_object_type(store):
     supply_admin = _client(_identity(user_id="s1", role="dept_admin", managed=("supply",)))
     assert supply_admin.post(f"/api/ontology/identifiers/{iid}/deactivate",
                              json={}).status_code == 200
-    mat2 = store.mint_object("material", "PP-2200", owner_dept="supply", _caller="test")
+    # P0-04 后：403（steward 不符）只在旧目标**可读**时可达——用 public 对象保住本测试
+    # 的 steward 路由语义；不可读旧目标 → 404（见 test_deactivate_repoint_check_old_target_visibility）
+    mat2 = store.mint_object("material", "PP-2200", owner_dept="supply",
+                             data_classification="public", _caller="test")
     iid2 = store.insert_identifier("material_grade", "pp-2200", "PP-2200",
                                    mat2["object_id"], method="seed", _caller="test")
     pmc_admin = _client(_identity(user_id="p1", role="dept_admin", managed=("pmc",)))
@@ -560,3 +563,43 @@ def test_field_constraints_422(store):
                       json={"target_object_id": "nope"}).status_code == 404
     finally:
         _os.environ["RAG_ONTOLOGY_ENABLE"] = "true"
+
+
+# ── P0-04 identifier 写动作的旧目标可见性闸 ──────────────────────────────────────
+
+
+def test_deactivate_repoint_check_old_target_visibility(store):
+    """P0-04：steward scope 命中 ≠ 旧目标可读（scope 按 namespace/object_type 裁决，
+    与 owner_dept 正交）——pmc dept_admin 对 supply confidential 对象的 identifier
+    停用/改指 → 404（与不存在同答，防存在性泄露）；kb_admin（bypass）可正常处置。"""
+    hidden = store.mint_object("product", "供应链密品", owner_dept="supply",
+                               data_classification="confidential", _caller="test")
+    iid = store.insert_identifier("u8", "s1", "S1", hidden["object_id"],
+                                  method="seed", _caller="test")
+    pmc_admin = _client(_identity(user_id="pmcadm", role="dept_admin", managed=("pmc",)))
+    assert pmc_admin.post(f"/api/ontology/identifiers/{iid}/deactivate",
+                          json={"note": "越权尝试"}).status_code == 404
+    tgt = store.mint_object("product", "杯B", owner_dept="pmc", _caller="test")
+    assert pmc_admin.post(f"/api/ontology/identifiers/{iid}/repoint",
+                          json={"target_object_id": tgt["object_id"]}).status_code == 404
+    assert store.get_active_identifier("u8", "S1") is not None   # 身份映射未被动过
+    api.app.dependency_overrides.clear()
+    kb = _client(_identity())
+    assert kb.post(f"/api/ontology/identifiers/{iid}/deactivate",
+                   json={"note": "治理停用"}).status_code == 200
+
+
+def test_deactivate_dangling_identifier_kb_admin_only(store):
+    """dangling identifier（目标对象行缺失 → obj={}）：非 bypass fail-closed 404；
+    kb_admin 可收尾处置。"""
+    obj = store.mint_object("product", "临时", owner_dept="pmc", _caller="test")
+    iid = store.insert_identifier("u8", "d1", "D1", obj["object_id"],
+                                  method="seed", _caller="test")
+    with store._lock:
+        del store._objects[obj["object_id"]]        # 制造 dangling（Memory 后端直删行）
+    pmc_admin = _client(_identity(user_id="pmcadm", role="dept_admin", managed=("pmc",)))
+    assert pmc_admin.post(f"/api/ontology/identifiers/{iid}/deactivate",
+                          json={"note": "x"}).status_code == 404
+    api.app.dependency_overrides.clear()
+    assert _client(_identity()).post(f"/api/ontology/identifiers/{iid}/deactivate",
+                                     json={"note": "收尾"}).status_code == 200

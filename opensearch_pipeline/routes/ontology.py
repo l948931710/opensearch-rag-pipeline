@@ -546,6 +546,23 @@ def _load_identifier_scope(store, identifier_id: str):
                                         object_type=obj.get("object_type"))
 
 
+def _require_old_target_visible(kb, old_obj: Dict[str, Any]) -> None:
+    """P0-04：identifier 写动作（deactivate/repoint）对**旧目标对象**的可见性闸。
+
+    steward scope 由 (namespace, object_type) 裁决，与对象 owner_dept 是**正交轴**——
+    PMC 管理员可以是某 namespace 的 steward，却对 supply 的 confidential 对象无读权；
+    此前旧目标 `_obj` 加载后即丢弃，停用/改指其 identifier 的路径没有闭合。不可见 →
+    404 与「identifier 不存在」同答（identifier 指向即泄露对象存在性）。dangling
+    identifier（目标行缺失 → obj={}）对非 bypass 同样 404，kb_admin（bypass）可处置。"""
+    from opensearch_pipeline.ontology.authz import can_read_object
+    acl, bypass = _reader_acl(kb)
+    # dangling（obj={}）传空 dict 而非 None：非 bypass 缺列 fail-closed 拒，
+    # bypass（kb_admin）放行——悬空身份行必须有人能收尾
+    if not can_read_object(old_obj if old_obj is not None else {},
+                           acl=acl, bypass_acl=bypass):
+        raise HTTPException(status_code=404, detail="identifier 不存在")
+
+
 @router.post("/api/ontology/identifiers/{identifier_id}/deactivate")
 def ontology_identifier_deactivate(identifier_id: str, req: NoteRequest, request: Request,
                                    identity: Optional[Identity] = Depends(current_identity)):
@@ -554,7 +571,9 @@ def ontology_identifier_deactivate(identifier_id: str, req: NoteRequest, request
     kb = _require_reader(identity)
     _check_fields(notes={"note": req.note})
     store = _get_store()
-    row, _obj, steward = _load_identifier_scope(store, identifier_id)
+    row, old_obj, steward = _load_identifier_scope(store, identifier_id)
+    # P0-04：先旧目标可见性（404 防存在性泄露），再 steward 授权（403）
+    _require_old_target_visible(kb, old_obj)
     _authorize_steward(identity, kb, steward)
     if not store.deactivate_identifier(
             identifier_id, status="rejected",
@@ -583,6 +602,8 @@ def ontology_identifier_repoint(identifier_id: str, req: RepointRequest, request
                   revision=req.target_revision, notes={"note": req.note})
     store = _get_store()
     row, old_obj, steward = _load_identifier_scope(store, identifier_id)
+    # P0-04：旧目标可见性闸（steward scope 与 owner_dept 正交——scope 命中 ≠ 旧目标可读）
+    _require_old_target_visible(kb, old_obj)
     _authorize_steward(identity, kb, steward)
     # PR-B（P0-01）：新目标三闸——可读 / active / 与旧目标同类型（跨类型改指默认拒）
     from opensearch_pipeline.ontology.authz import can_mutate_identity
