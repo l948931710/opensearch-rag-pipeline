@@ -66,10 +66,10 @@ apply 脚本落库并记台账。
 | 028_ontology_identity.sql | fuling_ontology | 身份脊柱：ontology_identifier（别名映射，至多一行 active 生成列唯一键 S4；norm 不剥改模后缀）+ ontology_resolution_case/candidate（候选承载层 S2：证据快照+积压统计，一个未解析编号×N 候选）（本体 P0） |
 | 029_ontology_link.sql | fuling_ontology | 本体关系：ontology_link（sku_of_product 等；uk_src_dst_type）（本体 P0） |
 | 030_sem_views.sql | fuling_ontology | PMC-1 语义投影：sem_packing/sem_stacking 视图（spec↔SKU 走 029 link 非 JSON 关联）+ packing_spec/stacking_spec 发号登记；**S7：本体表族整体在独立库 fuling_ontology（PR-B P0-02），fuling_ro 不授本库——隔离由 DB 授权面强制（tests/test_ontology_db_isolation.py 钉住），唯一读取口 ontology/sem.py** |
-| 031_agent_approval_execution_hardening.sql | fuling_operation | 重评报告 P0-C/P0-E/P1-11：approval_decision.final_args_digest（决定绑定最终执行参数摘要，堵改参重放）+ tool_invocation.status 增 uncertain（超时/崩溃副作用不可知→人工对账，不再谎报 failed）+ approver_scope 加宽 160（backup steward CSV）（2026-07-11；已 apply 本地） |
+| 031_agent_approval_execution_hardening.sql | fuling_operation | 重评报告 P0-C/P0-E/P1-11：approval_decision.final_args_digest（决定绑定最终执行参数摘要，堵改参重放）+ tool_invocation.status 增 uncertain（超时/崩溃副作用不可知→人工对账，不再谎报 failed）+ approver_scope 加宽 160（backup steward CSV）（2026-07-11；已 apply 本地+staging+生产） |
 | 033_ontology_link_invariants.sql | fuling_ontology | P1-8/P1-9 link 不变量：active_single_key 生成列 + uk_link_active_single（single 基数 link 型 DB 级拒双活，扩展方式见文件头）+ 三条引用 FK（object.merged_into RESTRICT；identifier.source_case_id / case.resolved_identifier_id 均 ON DELETE SET NULL）；刻意不加 superseded_by FK（repoint 事务序不容）（本体 P1，2026-07-11；已 apply 本地） |
-| 034_sem_views_product_acl.sql | fuling_ontology | 重评审计 P0-03：sem_packing/sem_stacking 补投 product_owner_dept/product_classification——product 三字段（id/ref/name）此前只随 spec 侧行过滤键透出，公开 SKU+公开 spec+confidential product 整行泄露；sem.py 出参前按 product 自身密级独立裁决，旧行（无两列）fail-closed 遮蔽（2026-07-11；已 apply 本地） |
-| 035_agent_checkpoint_digest_hmac.sql | fuling_operation | 重评审计 P1-2：agent_checkpoint.state_digest CHAR(64)→VARCHAR(80)——摘要从裸 sha256 升级 `hmac1:<hmac_sha256>`（带密钥真实性，能写表者重算 sha256 绕不过）；**须在 HMAC 代码之前 apply**（纯加宽零影响，反序 1406 挂起失败）；静态加密 RAG_AGENT_CHECKPOINT_ENCRYPT 默认 off（2026-07-11；已 apply 本地） |
+| 034_sem_views_product_acl.sql | fuling_ontology | 重评审计 P0-03：sem_packing/sem_stacking 补投 product_owner_dept/product_classification——product 三字段（id/ref/name）此前只随 spec 侧行过滤键透出，公开 SKU+公开 spec+confidential product 整行泄露；sem.py 出参前按 product 自身密级独立裁决，旧行（无两列）fail-closed 遮蔽（2026-07-11；已 apply 本地+staging+生产） |
+| 035_agent_checkpoint_digest_hmac.sql | fuling_operation | 重评审计 P1-2：agent_checkpoint.state_digest CHAR(64)→VARCHAR(80)——摘要从裸 sha256 升级 `hmac1:<hmac_sha256>`（带密钥真实性，能写表者重算 sha256 绕不过）；**须在 HMAC 代码之前 apply**（纯加宽零影响，反序 1406 挂起失败）；静态加密 RAG_AGENT_CHECKPOINT_ENCRYPT 默认 off（2026-07-11；已 apply 本地+staging+生产） |
 
 ## 台账（schema_migrations）
 
