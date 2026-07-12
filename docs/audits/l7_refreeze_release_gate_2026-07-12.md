@@ -57,7 +57,66 @@
   环境性翻转）→ freeze → 重跑 gate 出绿。
 - 与 L7 错峰串行（共享 DashScope 配额，避免 429 污染基线）。
 
-【待填：run#1 结果与 diff 裁决 · freeze · run#2 gate 出口】
+### run#1（无基线全链，golden_50=76 题，exit=1）法证
+
+**（勘误）**：本报告初版曾写"79 项聚合零超δ回退"——那次比对读的是 run 报告（merge
+前）不存在的扁平 metrics 键，比了空字典，结论空洞作废。真实对照见 run#2 节。
+
+**strict 失败清单分桶**（11 项）：
+1. **跑法问题（本轮已定位）**：
+   - `fusion/calibration regime` FAIL——**run#1 rerank 没开**（envboot 不管
+     RAG_RERANK_ENABLE；6-19 基线制度=weighted+rerank）→ run#1 的 L1/L2 数字
+     **不代表生产臂，不可用于 refreeze**。→ run#2 已带 RAG_RERANK_ENABLE=true 重跑。
+   - judge 面板全批 `claude rc=1`——**本机 claude CLI 掉登录**（"Not logged in"）。
+     judge 是 strict 的必要件（answer-correctness must be judged）。**只有 Sam 能
+     `/login`**，恢复前任何 run 都到不了绿。
+2. **语料/基建（治愈=生产写，Sam-gated）**：`[L6-hard] RDS↔HA3 missing=85` +
+   `l6:NO_GO_DEFECT`——HA3 静默蒸发复发（7-06 治愈 64 个同款；本次仍集中 6-21/22
+   批、多为单 chunk 文档）。**治愈包已备**：`rebuild_from_rds.py --probe` 只读清单
+   =scratchpad/heal85_dryrun.log；commit 需当日 `PROD-RW:<date>` + stage-3 重推
+   （家庭网须 RAG_HA3_PUSH_BATCH_SIZE=8）。根因侧「提阿里工单 + 周期 reconcile 自动
+   闭环」仍是 7-06 遗留待办。
+3. **既有绝对阈值缺口（先于本分支，flag-off/未部署/待拍板）**：xlsx 检索三连
+   （recall@5 0.5455 / 来源标注 0.6 / clean-gold 0.72）、over-refusal 0.2456、
+   keyword-coverage 0.396、marker validity 0.6863（修复已合 main 但 RAG_IMG_SUBINDEX
+   等 flag 未部署——与 7-06 记录一致「不是回退」）、docx binding not_executed
+   （GT 在、16 docs 跑了但 strong_chunks=0——L4 条件问题待查）。
+   **这些不闭，strict 永远 exit 1**——refreeze 解决不了绝对门。
+
+### run#2（rerank on，只 run 不 judge）→ 引出现网 P0
+
+regime guard 转绿（weighted+rerank ✓）。但 L1 **recall@5=0.5636 / found_rate=0.6
+vs 基线 0.9273**——40% 正例的 gold 文档 top-10 完全缺席（能命中的都在前 3）=
+"不在可检索索引"签名，非排序问题。独立重跑逐字节复现（确定性，非抖动）。
+
+**逐题法证（vs 6-19 基线 run per_query）**：22 题 found→miss（S5 部门内探针全族 7 题
++ json_text 12 题 + QA-02/06/SRC-02），2 题 miss→found。miss 的 gold 文档在 RDS
+全部 active+public+chunk 在册——但 `updated_at` 高度集中 **2026-07-06 17:00–17:37 与
+07-07 10:37**（= 7-06「64 drops 治愈重推」与 7-07 wave-v2 的操作窗口）。
+
+**自查询实锤（现网 P0）**：miss 文档取自身 chunk 原文作查询，4/4 不返回自身；对整个
+7-06/07 窗口人群（**485 docs / 10,366 active chunks，约占语料 37%**）随机抽 15 docs
+自查询 **15/15 全盲**。reconcile 点查 missing 仅 85（且与 gold 零交集）——**doc store
+在、可检索索引无**，与 docs/ha3-doc-evaporation-incident-2026-07-06.md 的引擎段合并
+吃索引同签名，这次吃掉的正是 7-06 治愈重推批本身 + 7-07 批。
+
+**结论修正链**：
+- 7-06「点查是唯一可靠存在性判定」需修正——**点查只证 doc store 存在；可检索性必须
+  抽样自查询**。周期 reconcile 需加自查询抽样通道，否则这种模式永远漏检。
+- 现网用户自 7-07 起对这 485 篇文档检索失明（约 5 天）——L1 坍塌是它的测量像，
+  refreeze 在治愈前无意义（会把盲态冻进基线）。
+
+### release-gate 当前出口（blocked，三件 Sam-gated）
+
+1. **治愈 485 盲文档**（生产写）：`scripts/rebuild_from_rds.py --docs <485 列表>`
+   --commit（当日 PROD-RW token）→ laptop stage-3 重推（RAG_HA3_PUSH_BATCH_SIZE=8）
+   → **重推后自查询抽样复检**（点查对账不再是终验）。doc 清单已备
+   （scratchpad/blind485_docids.txt）。⚠️ 引擎根因未除（阿里工单仍未提，7-06 遗留）
+   ——重推可能再被吃，工单+周期自查询监控是根治面。
+2. **claude CLI /login**（judge 面板恢复）。
+3. 治愈+judge 后：重跑 run → 裁决 → freeze → gate；既有绝对阈值缺口
+   （xlsx 三连/over-refusal/keyword-coverage/marker validity/docx strong-chunks=0）
+   另案拍板（部署 flag 修复 or 调门）。
 
 ## 计费口径
 
