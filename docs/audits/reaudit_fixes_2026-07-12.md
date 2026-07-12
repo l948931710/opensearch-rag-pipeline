@@ -51,8 +51,10 @@
 
 ## §5 UX
 
-- **审批后 requester 拿不到答案** ✅：`schema/036` agent_run 增 `message_id`（**先 apply 后
-  部署**；本地 dev 库已加列+台账，staging/prod 未 apply）——submit 回填、
+- **审批后 requester 拿不到答案** ✅：`schema/036` agent_run 增 `message_id`（**三环境已
+  apply**：本地 dev + staging（scripts/apply_migration.py --commit）+ prod
+  （scratch/apply_migration_036.py，2026-07-12 Sam 授权，PROD-RW 当日令牌，只读会话
+  复核 present=True + 台账落账））——submit 回填、
   `GET /api/agent/runs/{id}` 经 `qa_logger.fetch_answer_by_message_id` 带回
   `final={message_id, answer_text, answered_at}`（owner 门禁不变，fail-open）；
   前端运行中心（AgentRunCenter.vue）新增「最终答案」块 + succeeded 无文本时的引导文案。
@@ -80,7 +82,7 @@
 
 ## 未验证 / user-gated 残留
 
-1. schema/036 staging/prod apply（先 apply 后部署，同 035 纪律）。
+1. ~~schema/036 staging/prod apply~~ ✅ 2026-07-12 Sam 授权后已落三环境（见 §5）。
 2. SAE/DataWorks 重打包部署（本轮全部改动现网生效的前提）；retention 节点脚本重粘贴。
 3. Redis 中继/midrun checkpoint/心跳间隔等新 flag 的生产开启节奏（全部保守默认）。
 4. CI 新增 security 步骤的首跑（推 origin 后看 Actions）。
