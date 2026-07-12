@@ -974,56 +974,113 @@ def generate_answer_stream(
     sources = _extract_sources(_included_chunks)
     yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
 
-    # 流式请求
-    with _http_post(
-        url,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {llm.api_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=_llm_request_timeout(),
-        stream=True,
-    ) as resp:
-        resp.raise_for_status()
+    if config.rag.serving_model_gateway:
+        # Tier B-流式：同一请求体改经 ModelGateway 发出（payload/帧序列等值由
+        # tests/test_serving_gateway_equivalence.py 钉死）；异常类型变为 ModelError/
+        # ModelUnavailable，调用方（api.ask_stream / dingtalk）均宽 except → error 帧，透明。
+        usage_info = yield from _stream_frames_via_gateway(
+            llm, messages, max_tokens=max_tokens, temperature=temperature,
+            think=_think, emit_reasoning=_emit_reasoning)
+    else:
+        # 流式请求
+        with _http_post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {llm.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=_llm_request_timeout(),
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
 
-        usage_info = {}
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if not line.startswith("data: "):
-                continue
+            usage_info = {}
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    continue
 
-            payload_str = line[6:]  # strip "data: "
+                payload_str = line[6:]  # strip "data: "
 
-            if payload_str.strip() == "[DONE]":
-                break
+                if payload_str.strip() == "[DONE]":
+                    break
 
-            try:
-                chunk_data = json.loads(payload_str)
-            except json.JSONDecodeError:
-                continue
+                try:
+                    chunk_data = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
 
-            # 提取 usage（通常在最后一个 chunk）
-            if chunk_data.get("usage"):
-                usage_info = chunk_data["usage"]
+                # 提取 usage（通常在最后一个 chunk）
+                if chunk_data.get("usage"):
+                    usage_info = chunk_data["usage"]
 
-            # 提取 delta content
-            choices = chunk_data.get("choices", [])
-            if choices:
-                delta = choices[0].get("delta", {})
-                # 思考阶段先于答案产出 reasoning_content；flag 开时作为 reasoning 帧下发（在 chunk 之前）。
-                if _emit_reasoning:
-                    rc = delta.get("reasoning_content")
-                    if rc:
-                        yield f"data: {json.dumps({'type': 'reasoning', 'content': rc}, ensure_ascii=False)}\n\n"
-                content = delta.get("content")
-                if content:
-                    yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
+                # 提取 delta content
+                choices = chunk_data.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    # 思考阶段先于答案产出 reasoning_content；flag 开时作为 reasoning 帧下发（在 chunk 之前）。
+                    if _emit_reasoning:
+                        rc = delta.get("reasoning_content")
+                        if rc:
+                            yield f"data: {json.dumps({'type': 'reasoning', 'content': rc}, ensure_ascii=False)}\n\n"
+                    content = delta.get("content")
+                    if content:
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
 
     # 结束
     yield f"data: {json.dumps({'type': 'done', 'model': llm.model, 'usage': usage_info}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def _stream_frames_via_gateway(
+    llm, messages, *, max_tokens: int, temperature: float,
+    think: bool, emit_reasoning: bool,
+) -> Generator[str, None, Dict[str, Any]]:
+    """RAG_SERVING_MODEL_GATEWAY：流式调用改经 ModelGateway.complete_stream。
+
+    等值要点：单 provider 单链路（dashscope + config 模型）、max_retries=0（原语义=单次调用、
+    失败即抛给上层出 error 帧）、tier_params={} 不注入档位参数——enable_thinking 由 extra
+    显式携带，请求体键集合与裸 payload 完全一致。call_logger 不接：serving 台账是
+    qa_session_log（api 层落），agent llm_call_log 表（schema 022-024）生产未建，
+    热路径不做逐调用的失败尝试。返回值=线上原始 usage dict（usage_raw），供 done 帧保真。
+    """
+    from opensearch_pipeline.agent_runtime.context import ExecutionContext
+    from opensearch_pipeline.agent_runtime.model_gateway import (
+        ChatRequest,
+        DashScopeProvider,
+        ModelGateway,
+    )
+
+    gw = ModelGateway(
+        {"dashscope": DashScopeProvider(timeout=_llm_request_timeout())},
+        routes={"serving": [("dashscope", llm.model)]},
+        max_retries=0, tier_params={})
+    try:
+        from opensearch_pipeline.request_context import get_request_id
+        rid = (get_request_id() or "")[:64]
+    except Exception:   # noqa: BLE001
+        rid = ""
+    ctx = ExecutionContext.create(
+        request_id=rid, user_id="rag-serving", acl_groups=(),
+        roles=("system",), channel="api", thread_id="serving-stream")
+    req = ChatRequest(messages=messages, temperature=temperature,
+                      max_tokens=max_tokens, extra={"enable_thinking": think})
+    gen = gw.complete_stream(ctx, "serving", req)
+    resp = None
+    while True:
+        try:
+            d = next(gen)
+        except StopIteration as fin:
+            resp = fin.value
+            break
+        # 同一 SSE 帧里 reasoning 先于 content（与裸路径逐帧顺序一致）
+        if emit_reasoning and d.reasoning:
+            yield f"data: {json.dumps({'type': 'reasoning', 'content': d.reasoning}, ensure_ascii=False)}\n\n"
+        if d.text:
+            yield f"data: {json.dumps({'type': 'chunk', 'content': d.text}, ensure_ascii=False)}\n\n"
+    return (resp.usage_raw if resp is not None else {}) or {}
 
 
 def generate_answer_via_stream(

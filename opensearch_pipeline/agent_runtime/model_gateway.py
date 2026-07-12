@@ -59,6 +59,9 @@ class ChatResponse:
     model: str
     finish_reason: str = ""
     reasoning: str = ""        # 思考模式 reasoning_content（非流式一并返回；light 档为空）
+    # 线上原始 usage dict（含 total_tokens / prompt_tokens_details.cached_tokens 等 Usage
+    # 类型化视图之外的字段）——serving 流式收敛（Tier B）要把 done 帧 usage 逐字节保真下发。
+    usage_raw: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -189,6 +192,7 @@ class DashScopeProvider:
         reason_parts: List[str] = []
         frags: Dict[int, Dict[str, Any]] = {}       # index → {id, name, args(str 累积)}
         usage = Usage()
+        usage_raw: Dict[str, Any] = {}
         finish = ""
         got_model = model
         try:
@@ -210,6 +214,7 @@ class DashScopeProvider:
                 if u:                               # include_usage 终帧（choices 为空）
                     usage = Usage(tokens_prompt=int(u.get("prompt_tokens") or 0),
                                   tokens_completion=int(u.get("completion_tokens") or 0))
+                    usage_raw = u
                 choice = (data.get("choices") or [{}])[0]
                 finish = choice.get("finish_reason") or finish
                 delta = choice.get("delta") or {}
@@ -252,7 +257,7 @@ class DashScopeProvider:
             tool_calls.append(ToolCall(id=slot["id"], name=slot["name"], arguments=args))
         return ChatResponse(text="".join(text_parts), tool_calls=tool_calls, usage=usage,
                             model=got_model, finish_reason=finish,
-                            reasoning="".join(reason_parts))
+                            reasoning="".join(reason_parts), usage_raw=usage_raw)
 
 
 def _parse_openai_response(data: Dict[str, Any], model: str) -> ChatResponse:
@@ -274,7 +279,8 @@ def _parse_openai_response(data: Dict[str, Any], model: str) -> ChatResponse:
     return ChatResponse(text=text, tool_calls=tool_calls, usage=usage,
                         model=data.get("model") or model,
                         finish_reason=choice.get("finish_reason") or "",
-                        reasoning=msg.get("reasoning_content") or "")
+                        reasoning=msg.get("reasoning_content") or "",
+                        usage_raw=u)
 
 
 # ── 熔断器（per provider+model，借 cost_breaker 形态）───────────────

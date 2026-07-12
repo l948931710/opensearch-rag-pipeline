@@ -323,6 +323,11 @@ class RAGConfig:
     # {"type":"reasoning"} 附加帧流式下发（与 chunk 并行；老客户端忽略未知帧类型 → 向后兼容）。默认关
     # （reasoning 更费带宽且暴露思维链是产品取舍）；仅「thinking 开 + 本 flag 开」时下发，否则照旧丢弃。
     stream_reasoning: bool = False          # RAG_STREAM_REASONING
+    # Tier B-流式：generate_answer_stream 的 DashScope 调用改经 agent 底座 ModelGateway 发出。
+    # 请求体与既有裸 _http_post 等值、对外 yield 契约逐字节不变（等值门=
+    # tests/test_serving_gateway_equivalence.py）；max_retries=0 保持原单次调用语义（不引入
+    # 重试/沿链 fallback 的行为变化）。默认 OFF——热路径传输层替换走保守灰度，本 flag 即 kill switch。
+    serving_model_gateway: bool = False     # RAG_SERVING_MODEL_GATEWAY
     # ── QA 日志查询侧 PII 脱敏（OBS-qa-pii 整改）──────────────────
     # qa_session_log.query_text/answer_text 此前明文落盘：用户可能输入身份证/手机号，
     # 答案可能回显受限文档里的 PII。开启后在写库前用 redaction.redact_text（与入库侧
@@ -887,6 +892,7 @@ def load_config() -> PipelineConfig:
             allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
             main_hit_revalidate=_env_bool("MAIN_HIT_REVALIDATE", True),         # RAG_MAIN_HIT_REVALIDATE
             stream_reasoning=_env_bool("STREAM_REASONING", False),              # RAG_STREAM_REASONING
+            serving_model_gateway=_env_bool("SERVING_MODEL_GATEWAY", False),    # RAG_SERVING_MODEL_GATEWAY
             qa_log_pii_redact=_env_bool("QA_LOG_PII_REDACT", True),             # RAG_QA_LOG_PII_REDACT
             score_threshold_high=_env_float("SCORE_THRESHOLD_HIGH", 7.7),       # RAG_SCORE_THRESHOLD_HIGH
             score_threshold_medium=_env_float("SCORE_THRESHOLD_MEDIUM", 5.8),   # RAG_SCORE_THRESHOLD_MEDIUM
