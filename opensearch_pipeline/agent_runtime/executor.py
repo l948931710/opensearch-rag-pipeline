@@ -242,20 +242,43 @@ class ThreadedRunExecutor:
 
     @staticmethod
     def _verify_checkpoint(cp) -> None:
-        """P1「checkpoint 明文且 digest 从不校验」：写入时算了 state_digest 但 load 从不核对，
-        库内被改/损坏的状态会被原样续跑。resume 前核 sha256——不匹配抛错，认领回滚
-        suspended（可由对账/过期处置，绝不带着可疑状态执行）。"""
+        """P1-2 checkpoint 校验（真实性优先）：
+        - ``hmac1:`` 摘要 → 带密钥重算 HMAC（encrypt-then-MAC，对库内 blob 原样计算）——
+          能写表的攻击者改内容后重算裸 sha256 也过不了（没有密钥）；进程无密钥时拒绝续跑；
+        - 裸 sha256（历史行/无密钥环境）→ 沿用完整性核对；密钥在场且
+          RAG_AGENT_CHECKPOINT_REQUIRE_HMAC=true（默认 off，迁移窗口）时直接拒——
+          防降级攻击（攻击者把摘要改回裸 sha256 绕过 HMAC）。
+        任一不匹配抛错，认领回滚 suspended（可由对账/过期处置，绝不带着可疑状态执行）。"""
         import hashlib
+        import hmac as _hmac
+        import os
+
+        from opensearch_pipeline.agent_runtime.loop import checkpoint_hmac_key
         digest = getattr(cp, "state_digest", None)
         if not digest:
             return                                   # 旧行/简化测试桩无 digest：跳过
         blob = cp.state_blob
         if isinstance(blob, str):
             blob = blob.encode("utf-8", "surrogateescape")
+        cp_id = getattr(cp, "checkpoint_id", "?")
+        if str(digest).startswith("hmac1:"):
+            key = checkpoint_hmac_key()
+            if key is None:
+                raise RunRejected(
+                    f"checkpoint {cp_id} 带 HMAC 摘要但当前进程无密钥（配置回退？），拒绝续跑")
+            expect = "hmac1:" + _hmac.new(key, blob, hashlib.sha256).hexdigest()
+            if not _hmac.compare_digest(expect, str(digest)):
+                raise RunRejected(
+                    f"checkpoint {cp_id} 完整性/真实性校验失败（HMAC 不匹配），拒绝续跑")
+            return
+        if checkpoint_hmac_key() is not None and os.environ.get(
+                "RAG_AGENT_CHECKPOINT_REQUIRE_HMAC", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            raise RunRejected(
+                f"checkpoint {cp_id} 只有裸 sha256 摘要（REQUIRE_HMAC 已开，拒绝降级），拒绝续跑")
         if hashlib.sha256(blob).hexdigest() != digest:
             raise RunRejected(
-                f"checkpoint {getattr(cp, 'checkpoint_id', '?')} 完整性校验失败（digest 不匹配），"
-                "拒绝续跑")
+                f"checkpoint {cp_id} 完整性校验失败（digest 不匹配），拒绝续跑")
 
     def _drive_gen(self, ctx: ExecutionContext, gen, handle: RunHandle,
                    base: Optional[dict] = None) -> None:

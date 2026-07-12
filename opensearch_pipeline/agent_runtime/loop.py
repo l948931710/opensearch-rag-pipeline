@@ -61,23 +61,103 @@ class ModelTurn:
 ModelFn = Callable[[List[Msg], List[ToolSpec]], ModelTurn]
 
 
+def checkpoint_hmac_key() -> Optional[bytes]:
+    """checkpoint 真实性密钥（P1-2「digest 是裸 sha256 非 HMAC」）：
+    RAG_AGENT_CHECKPOINT_KEY 优先；缺省从 RAG_SESSION_SIGNING_KEY 派生
+    （sha256(key||":agent-checkpoint")，域分离——不直接复用会话签名密钥本体）。
+    两者都未配置（SIM/本地无密钥）→ None，编解码回退裸 sha256（历史行为）。
+    刻意不走 auth_token._get_signing_key()：dev 的进程级临时密钥每次重启都变，
+    会让跨进程 resume 的 HMAC 恒不匹配。"""
+    import os
+    k = os.environ.get("RAG_AGENT_CHECKPOINT_KEY", "").strip()
+    if k:
+        return k.encode("utf-8")
+    sk = os.environ.get("RAG_SESSION_SIGNING_KEY", "").strip()
+    if sk:
+        return hashlib.sha256((sk + ":agent-checkpoint").encode("utf-8")).digest()
+    return None
+
+
+def _checkpoint_encrypt_enabled() -> bool:
+    """P1-2「checkpoint 明文」：AES-GCM 静态加密（默认 **off**——混合版本部署窗口内
+    旧进程读不了新密文；生产 rollout 时与密钥一起开启）。需 cryptography（随
+    pymysql[rsa] 在基础依赖）+ 密钥可用，缺一回退明文（完整性仍有 HMAC）。"""
+    import os
+    return os.environ.get("RAG_AGENT_CHECKPOINT_ENCRYPT",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_ENC_PREFIX = b"enc1:"
+_ENC_AAD = b"agent-checkpoint-v1"
+
+
+def _encrypt_blob(blob: bytes, key: bytes) -> Optional[bytes]:
+    """AES-256-GCM（AEAD）：密钥 = sha256(hmac_key||":aes")（域分离）；输出
+    enc1: + base64(nonce||ct)——纯 ASCII，任何 str/bytes 往返都安全。失败回退明文。"""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except Exception:   # noqa: BLE001
+        logger.warning("RAG_AGENT_CHECKPOINT_ENCRYPT 开启但 cryptography 不可用——"
+                       "回退明文（完整性仍有 HMAC）")
+        return None
+    import base64
+    import os as _os
+    try:
+        nonce = _os.urandom(12)
+        ct = AESGCM(hashlib.sha256(key + b":aes").digest()).encrypt(nonce, blob, _ENC_AAD)
+        return _ENC_PREFIX + base64.b64encode(nonce + ct)
+    except Exception:   # noqa: BLE001
+        logger.warning("checkpoint 加密失败——回退明文（完整性仍有 HMAC）", exc_info=True)
+        return None
+
+
+def _maybe_decrypt(state_blob: bytes) -> bytes:
+    """enc1: 前缀 → AES-GCM 解密（密钥缺失/密文损坏抛错——executor 回滚认领，
+    run 留 suspended 供人工/换密钥进程处置）；无前缀原样返回（明文/历史行）。"""
+    if isinstance(state_blob, str):
+        state_blob = state_blob.encode("utf-8")
+    if not state_blob.startswith(_ENC_PREFIX):
+        return state_blob
+    key = checkpoint_hmac_key()
+    if key is None:
+        raise ValueError("checkpoint 已加密但当前进程无密钥"
+                         "（RAG_AGENT_CHECKPOINT_KEY / RAG_SESSION_SIGNING_KEY）")
+    import base64
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    raw = base64.b64decode(state_blob[len(_ENC_PREFIX):])
+    return AESGCM(hashlib.sha256(key + b":aes").digest()).decrypt(raw[:12], raw[12:], _ENC_AAD)
+
+
 def encode_checkpoint(messages: List[Msg], *, pending_call: Optional[Dict[str, Any]] = None,
                       turn: int = 0, version: int = CHECKPOINT_VERSION,
                       remaining_calls: Optional[List[Dict[str, Any]]] = None) -> Tuple[bytes, str]:
     """(messages[, pending_call, turn, remaining_calls]) → (state_blob, digest)。Loop 层拥有
     checkpoint 编解码（B4）。pending_call = 挂起时待审批的工具调用（resume APPROVED 据此重执行）；
-    remaining_calls = 同批中排在其后的未处理 calls（P1 多 call 挂起不丢调用）。"""
+    remaining_calls = 同批中排在其后的未处理 calls（P1 多 call 挂起不丢调用）。
+
+    P1-2：密钥可用时 digest = ``hmac1:<hmac_sha256>``（带密钥的**真实性**保护——能写
+    agent_checkpoint 表的攻击者改内容后再算裸 sha256 即可通过旧校验；HMAC 没有密钥算
+    不出）；无密钥回退裸 sha256（SIM/本地零配置）。开 RAG_AGENT_CHECKPOINT_ENCRYPT 且
+    密钥在 → blob 先 AES-GCM 加密（HMAC 对**密文**计算，encrypt-then-MAC）。
+    ⚠️ ``hmac1:``+64hex=70 字符——真库须先 apply schema/035（state_digest 加宽 VARCHAR(80)）。"""
     blob = json.dumps({"version": version, "messages": messages,
                        "pending_call": pending_call, "turn": turn,
                        "remaining_calls": list(remaining_calls or [])},
                       ensure_ascii=False).encode("utf-8")
-    return blob, hashlib.sha256(blob).hexdigest()
+    key = checkpoint_hmac_key()
+    if key is None:
+        return blob, hashlib.sha256(blob).hexdigest()
+    if _checkpoint_encrypt_enabled():
+        enc = _encrypt_blob(blob, key)
+        if enc is not None:
+            blob = enc
+    import hmac as _hmac
+    return blob, "hmac1:" + _hmac.new(key, blob, hashlib.sha256).hexdigest()
 
 
 def decode_checkpoint(state_blob: bytes) -> List[Msg]:
     """向后兼容：只取 messages。"""
-    if isinstance(state_blob, str):
-        state_blob = state_blob.encode("utf-8")
+    state_blob = _maybe_decrypt(state_blob)
     return json.loads(state_blob.decode("utf-8")).get("messages", [])
 
 
@@ -89,8 +169,7 @@ def decode_checkpoint_state(state_blob: bytes) -> Dict[str, Any]:
     （run 留在 suspended，可由新版本代码或对账处置）。
     remaining_calls：旧 blob 无此键 → []（形状兼容，无需 bump 版本）。
     """
-    if isinstance(state_blob, str):
-        state_blob = state_blob.encode("utf-8")
+    state_blob = _maybe_decrypt(state_blob)
     d = json.loads(state_blob.decode("utf-8"))
     ver = int(d.get("version", CHECKPOINT_VERSION))
     if ver != CHECKPOINT_VERSION:
