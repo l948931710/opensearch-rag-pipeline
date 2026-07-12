@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ThumbsDown, Check, Ban, RotateCcw, CheckCircle2, MessageSquareText } from 'lucide-vue-next'
+import { ThumbsDown, Check, Ban, RotateCcw, CheckCircle2, MessageSquareText, AlertTriangle, RotateCw } from 'lucide-vue-next'
 import { deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
@@ -15,6 +15,10 @@ const {
 } = useKb()
 
 const openCount = computed(() => (feedbackReview.value || []).filter((x) => !x.handled).length)
+// 显式降级（staging 2026-07-11 P1 教训）：接口真错误时绝不渲染「已清空/无差评」快乐空态——
+// 无数据可显 → 错误占位卡（含重试）；有旧数据 → 顶部错误条 + 保留旧列表。
+const loadFailed = computed(() => !!loadErrors.value['feedbackReview'])
+const hasRows = computed(() => !!feedbackReview.value?.length)
 function busy(id: string) { return feedbackResolveBusy.value.has(id) }
 
 // 「差评 → 修文档」补断层：涉及文档 chip 点击 = 切「文档管理」tab + 台账按标题定位。
@@ -41,8 +45,27 @@ function gotoDoc(d: { doc_id: string; title?: string }) {
       >{{ showResolvedFeedback ? '只看未处理' : '显示已处理' }}</button>
     </div>
 
-    <LoadError :message="loadErrors['feedbackReview']" @retry="loadFeedbackReview()" />
-    <div v-if="feedbackReview === null && !loadErrors['feedbackReview']" class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
+    <!-- 刷新失败但有旧数据：顶部错误条（自带重试），旧列表照常保留在下方 -->
+    <LoadError v-if="hasRows" :message="loadErrors['feedbackReview']" @retry="loadFeedbackReview()" />
+    <!-- 加载失败且无数据可显：显式错误占位卡——差评可能存在但当前不可见，绝不伪装成「无差评」 -->
+    <div
+      v-if="loadFailed && !hasRows" role="alert" data-testid="feedback-review-error"
+      class="rounded-[14px] border border-st-fail/30 bg-st-fail/5 p-5"
+    >
+      <div class="flex items-center gap-1.5 text-[12.5px] font-semibold text-st-fail">
+        <AlertTriangle :size="14" :stroke-width="1.75" /> 差评复核加载失败
+      </div>
+      <p class="mt-1 text-[12px] text-muted-foreground">
+        列表暂时拉取不到（服务端错误）——差评可能存在但当前不可见，请勿当作「无差评」。可重试；反复失败请联系管理员查
+        <code class="font-mono text-[11px]">/api/kb/feedback-review</code> 服务端日志。
+      </p>
+      <button
+        type="button"
+        class="mt-2.5 inline-flex items-center gap-1 rounded-md border border-st-fail/40 px-2.5 py-1 text-[11.5px] font-medium text-st-fail transition hover:bg-st-fail/10"
+        @click="loadFeedbackReview()"
+      ><RotateCw :size="12" :stroke-width="1.75" /> 重试</button>
+    </div>
+    <div v-else-if="feedbackReview === null" class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
       差评复核拉取中…
     </div>
     <div v-else-if="feedbackReview && !feedbackReview.length" class="rounded-[14px] border border-border bg-card p-5 text-[12.5px] text-muted-foreground">

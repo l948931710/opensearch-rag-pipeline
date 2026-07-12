@@ -199,10 +199,12 @@ let trackTimer: ReturnType<typeof setTimeout> | null = null   // 当前轮询定
 
 // 各分区加载错误（key→提示文案）。诚实区分：404（端点未上线，Phase C/D 可选）→ 静默兜底空；
 // 5xx/网络/其他 → 置错误条，组件显「加载失败 + 重试」，不再把服务端故障伪装成「无数据」。
+// 返回值：true=真错误已置条；false=404 静默（调用方可据此决定是否兜底空数据）。
 const loadErrors = ref<Record<string, string>>({})
-function noteLoadError(key: string, e: unknown) {
-  if (e instanceof ApiError && e.status === 404) { delete loadErrors.value[key]; return }
+function noteLoadError(key: string, e: unknown): boolean {
+  if (e instanceof ApiError && e.status === 404) { delete loadErrors.value[key]; return false }
   loadErrors.value[key] = '加载失败，请重试'
+  return true
 }
 function clearLoadError(key: string) { delete loadErrors.value[key] }
 
@@ -971,7 +973,9 @@ export interface FeedbackReviewItem {
 }
 export type FeedbackResolveAction = 'resolve' | 'dismiss' | 'reopen'
 
-/** 拉差评复核队列（看板卡片）：失败静默兜底空 + loadErrors 显错可重试。
+/** 拉差评复核队列（看板卡片）：404（端点未上线）→ 如实兜底空；真错误（5xx/网络）→ 保留
+ *  null/旧值 + loadErrors 显错可重试——绝不把服务端故障伪装成「无差评」（staging 2026-07-11：
+ *  接口 500 时快乐空态 +「待你处理」chip 双双消失，管理员无从知晓差评存在或功能已坏）。
  *  include_resolved 由「显示已处理」切换驱动；默认只收未处置（收件箱语义）。 */
 async function loadFeedbackReview() {
   syncIdentityScope()
@@ -1001,7 +1005,8 @@ async function loadFeedbackReview() {
     feedbackReview.value = r.items || []
   } catch (e) {
     if (fp !== identityFingerprint()) return
-    feedbackReview.value = feedbackReview.value ?? []; noteLoadError('feedbackReview', e)
+    // 仅 404 兜底空；真错误保留 null（首载）/旧值（重载），组件与 chip 据此显式降级而非伪装成空。
+    if (!noteLoadError('feedbackReview', e)) feedbackReview.value = feedbackReview.value ?? []
   }
 }
 

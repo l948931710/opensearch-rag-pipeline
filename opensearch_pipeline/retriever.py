@@ -574,6 +574,26 @@ def _deny_revoked_cross_dept(results, user_dept):
     return [r for i, r in enumerate(results) if i not in drop]
 
 
+def _acl_fail_closed() -> bool:
+    """P0-04（报告1）ACL 严格模式总开关。默认 **off** = 现网行为不变（权威不可用时
+    fail-open 保留原结果）。开启后主命中 RDS 复核不可用时只保留 public（公司公开）命中，
+    绝不把 HA3 投影当权威投放受限内容——RDS 抖动期会牺牲部门内容可用性换安全，
+    故默认 off、须显式灰度（报告称此项可 P1、需业务签字）。"""
+    return os.environ.get("RAG_ACL_FAIL_CLOSED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _keep_public_only_if_strict(results, reason: str):
+    """严格模式下权威复核不可用 → 只留 public 命中（报告：至少丢弃非公司公开内容）；
+    非严格（默认）→ 原样保留（历史 fail-open）。"""
+    if not _acl_fail_closed():
+        return results
+    kept = [r for r in results if str(r.get("permission_level") or "") == "public"]
+    if len(kept) != len(results):
+        logger.warning("ACL fail-closed（%s）：权威复核不可用，丢弃 %d 非 public 主命中，仅留 %d public",
+                       reason, len(results) - len(kept), len(kept))
+    return kept
+
+
 def _revalidate_main_hits(results):
     """主命中 RDS 复核（盲区审计 P3-1）——权限执行不对称的补齐。
 
@@ -609,12 +629,12 @@ def _revalidate_main_hits(results):
                 rows = cur.fetchall() or []
         finally:
             conn.close()
-    except Exception as e:   # noqa: BLE001 — 权威不可达 → 保留（第一道边界在 HA3 服务端）
-        logger.warning("主命中 RDS 复核失败（保留 HA3 结果）: %s", e)
-        return results
+    except Exception as e:   # noqa: BLE001 — 权威不可达 → 默认保留（HA3 是第一道边界）；strict 只留 public
+        logger.warning("主命中 RDS 复核失败（HA3 结果）: %s", e)
+        return _keep_public_only_if_strict(results, "RDS 不可达")
     if not rows:
-        logger.warning("主命中 RDS 复核返回空集（%d 个 chunk_id 全部未知）——按权威不可用处理，保留结果", len(ids))
-        return results
+        logger.warning("主命中 RDS 复核返回空集（%d 个 chunk_id 全部未知）——按权威不可用处理", len(ids))
+        return _keep_public_only_if_strict(results, "复核返回空集")
     meta = {str(r[0]): (r[1], r[2], r[3]) for r in rows}
     kept, dropped = [], 0
     for r in results:

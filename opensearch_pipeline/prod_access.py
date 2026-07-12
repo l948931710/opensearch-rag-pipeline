@@ -66,6 +66,12 @@ def load_prod_env(overlay: str = None) -> dict:
 
 def _connect(env: dict, *, init_command: str = None, dict_cursor: bool = True):
     import pymysql
+    # P0-02：RDS 传输加密——env 里配了 RAG_RDS_SSL_CA 才传 ssl（默认空=行为不变）
+    ssl_kwargs = {}
+    ca = (env.get("RAG_RDS_SSL_CA") or "").strip()
+    if ca:
+        verify = str(env.get("RAG_RDS_SSL_VERIFY_CERT", "true")).lower() in ("1", "true", "yes")
+        ssl_kwargs = {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
     return pymysql.connect(
         host=env["RAG_RDS_HOST"], port=int(env.get("RAG_RDS_PORT", "3306")),
         user=env["RAG_RDS_USER"], password=env["RAG_RDS_PASSWORD"],
@@ -73,6 +79,7 @@ def _connect(env: dict, *, init_command: str = None, dict_cursor: bool = True):
         charset="utf8mb4", connect_timeout=10,
         init_command=init_command,
         cursorclass=pymysql.cursors.DictCursor if dict_cursor else pymysql.cursors.Cursor,
+        **ssl_kwargs,
     )
 
 

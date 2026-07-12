@@ -117,8 +117,12 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
     </template>
 
     <!-- 兜底：AI 消息既非加载/错误/无结果，又无可渲染内容（如"检索/思考中"被持久化后回灌的半截会话）
-         → 优雅提示而非空白气泡；有原问句则给重试。 -->
-    <template v-else>
+         → 优雅提示而非空白气泡；有原问句则给重试。
+         仅限【非流式】消息：深度思考独占期（reasoning 帧置 loading=false 而答案 html 尚 null）
+         属在途流，披露条已在场，这里必须留白——否则思考流下方同时闪出本兜底和可点的重试
+         （点了会打断在途流）。持久化白名单剥掉 streaming 字段，回灌半截会话恒无它 → 原用途不受影响；
+         stop()/错误/收尾三路都会置 streaming=false，不会留永久空白。 -->
+    <template v-else-if="!m.streaming">
       <div class="text-[15px] text-muted-foreground">这条回答没有内容（可能上次未生成完）。</div>
       <button
         v-if="m.question"
