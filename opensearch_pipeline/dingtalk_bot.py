@@ -100,6 +100,16 @@ def _get_app_secret() -> str:
 _TIMESTAMP_TOLERANCE = 300
 
 
+def _http_endpoints_enabled() -> bool:
+    """P1-3 根因①②的釜底抽薪闸：公网 HTTP 入口（/dingtalk/webhook + /dingtalk/card/callback）
+    总开关，默认 on=历史行为。生产走 Stream（出站 WSS，合法流量根本不经这两个端点）——
+    「签名不绑 body 的窗口内伪造」「card 回调无签名」两个攻击面都随端点下线而消失。
+    存量 HTTP 卡老化归零（看 [CARD-CB-HTTP] 计数）后置 RAG_DINGTALK_HTTP_ENDPOINTS_ENABLE=false；
+    off → 404 隐藏（与 flag-off 端点惯例一致）。"""
+    return os.environ.get("RAG_DINGTALK_HTTP_ENDPOINTS_ENABLE", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
 # sessionWebhook 回投目标白名单（#F-dingtalk-ssrf）：body 不进签名，攻击者可凭捕获的合法
 # (timestamp,sign) 伪造 body、把 sessionWebhook 换成自有/内网 URL，令后台把答案 POST 出去
 # （SSRF + 跨部门数据外泄）。回投前强制校验其 host 为钉钉官方域名，拒绝其它主机 / 内网 / IP。
@@ -156,6 +166,23 @@ def _is_duplicate_msg(msg_id: str) -> bool:
         return False
 
 
+# cherry-pick 适配（e4de9b4→main）：分支版带 Redis 去重后端（_msg_dedup_backend/redis_client，
+# 分支专属基建），main 仅有上面的进程内 _seen_msg_ids 表——此处按 memory 后端语义落地同一对
+# 接缝函数；ontology-p0 合并时以分支版（双后端）收敛。
+def _confirm_msg(msg_id: str) -> None:
+    """处理成功确认（评审 C4 接缝）。memory 后端首见登记即占满去重窗，成功无需升级——空操作。"""
+    return
+
+
+def _release_msg(msg_id: str) -> None:
+    """处理失败 → 释放领用，钉钉重投可重试（P1-3）。
+
+    原先失败后无释放：单副本（现网 --workers 1）处理失败时，TTL 窗口内的重投会被
+    首见登记永久吞掉。现失败即释放。"""
+    if not msg_id or msg_id == "?":
+        return
+    with _seen_msg_lock:
+        _seen_msg_ids.pop(msg_id, None)
 # ═══════════════════════════════════════════════════════════════
 # 签名验证
 # ═══════════════════════════════════════════════════════════════
@@ -190,6 +217,45 @@ def _verify_signature(timestamp: str, sign: str) -> bool:
     ).digest()
     expected_sign = base64.b64encode(hmac_code).decode("utf-8")
     return hmac.compare_digest(sign, expected_sign)
+
+
+def _verify_card_callback_signature(headers) -> Optional[bool]:
+    """卡片回调验签（P1-3 Track-1：此前 /card/callback 无任何签名校验）。
+
+    密钥 = 注册时上送的 apiSecret（DINGTALK_CARD_CALLBACK_API_SECRET，与
+    dingtalk_card.register 同源；未配置回退同一注册默认值）；算法 = 钉钉标准
+    timestamp+secret HMAC（与 webhook 同构、密钥不同）。头名兼容多形态
+    （x-ddpaas-signature / sign；x-ddpaas-signature-timestamp / timestamp）。
+
+    返回三态：True=验签通过；False=带签名但校验失败/时间戳出窗；None=请求不带签名头
+    （存量 HTTP 卡/头名与钉钉实发不符）。**enforcement 分档**在调用方：
+    RAG_DINGTALK_CARD_SIG_REQUIRED=true → 非 True 一律 403；默认 off → shadow 模式
+    只记日志不拒（先在 staging 用真实回调核对头名/算法，再开强制——Track-1 拍板流程）。"""
+    secret = os.environ.get("DINGTALK_CARD_CALLBACK_API_SECRET", "fuling_card_cb").strip()
+    if not secret:
+        return None
+    sign = (headers.get("x-ddpaas-signature") or headers.get("sign") or "").strip()
+    ts = (headers.get("x-ddpaas-signature-timestamp") or headers.get("x-ddpaas-timestamp")
+          or headers.get("timestamp") or "").strip()
+    if not sign:
+        return None
+    if not ts:
+        return False                                  # 带签名却无时间戳：无法防重放，拒
+    try:
+        ts_ms = int(ts)
+        if abs(int(time.time() * 1000) - ts_ms) > _TIMESTAMP_TOLERANCE * 1000:
+            return False
+    except (ValueError, TypeError):
+        return False
+    expected = base64.b64encode(hmac.new(
+        secret.encode("utf-8"), f"{ts}\n{secret}".encode("utf-8"),
+        hashlib.sha256).digest()).decode("utf-8")
+    return hmac.compare_digest(sign, expected)
+
+
+def _card_sig_required() -> bool:
+    return os.environ.get("RAG_DINGTALK_CARD_SIG_REQUIRED",
+                          "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -829,6 +895,8 @@ async def dingtalk_webhook(request: Request):
     钉钉在用户 @机器人 或私聊时，POST 消息到此端点。
     立即返回 200（发送 "查询中" 提示），后台线程处理 RAG 问答。
     """
+    if not _http_endpoints_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")   # P1-3：HTTP 面下线闸
     # 用 try/except 包裹整体逻辑，确保任何异常都有回复
     try:
         return await _handle_webhook(request)
@@ -971,10 +1039,26 @@ async def card_callback(request: Request):
         "content": "{\"cardPrivateData\":{\"actionIds\":[...],\"params\":{\"action\":\"downvote\",\"message_id\":\"xxx\"}}}"
     }
     """
+    if not _http_endpoints_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")   # P1-3：HTTP 面下线闸
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="无法解析请求体")
+
+    # P1-3 Track-1 验签（此前本端点无任何签名校验，可被任意 POST 伪造）：
+    # RAG_DINGTALK_CARD_SIG_REQUIRED=true → 非 True 一律 403；默认 shadow 只记日志
+    # （先用真实回调核对头名/算法再开强制）。Stream 路径不经此路由，不受影响。
+    # getattr 防御：部分测试/内部调用传简化 Request 桩（只有 .json()）。
+    verdict = _verify_card_callback_signature(getattr(request, "headers", None) or {})
+    if _card_sig_required():
+        if verdict is not True:
+            logger.warning("[CARD-CB-HTTP] 卡片回调验签未通过（required 模式拒绝）: verdict=%s "
+                           "outTrackId=%s", verdict, (body or {}).get("outTrackId", "?"))
+            raise HTTPException(status_code=403, detail="签名验证失败")
+    elif verdict is not True:
+        logger.warning("[CARD-CB-HTTP] 卡片回调验签 shadow：verdict=%s（放行；核对头名/算法后开"
+                       " RAG_DINGTALK_CARD_SIG_REQUIRED 强制）", verdict)
 
     # HTTP 专属计数日志：Stream 投递的回调经 _CardCallbackHandler 直达 _process_card_callback_body，
     # 不过本 HTTP 路由。故这行只在【存量 callbackType=HTTP 卡】（旧卡 / Stream 客户端 down 窗口发的卡）
@@ -1022,8 +1106,11 @@ def _card_callback_authorized(message_id: str, user_id: str,
         finally:
             conn.close()
     except Exception as e:
-        logger.warning("卡片回调归属校验查库失败（fail-open 放行）: %s", e)
-        return True
+        # P1-3 fail-closed（重评审计）：此前查库异常放行——归属校验整层在 DB 抖动窗口内
+        # 失效，伪造回调恰在故障期可灌反馈/开工单。改为拒绝：合法反馈在同一故障下的
+        # 下游写本就会失败，拒之无额外损失；钉钉/用户侧可重试。
+        logger.error("卡片回调归属校验查库失败（fail-closed 拒绝）: %s", e)
+        return False
     if row is None:
         logger.warning("卡片回调引用了不存在的 message_id（疑似伪造），拒绝写入: %s", message_id)
         return False
@@ -1044,7 +1131,34 @@ def _card_callback_authorized(message_id: str, user_id: str,
     return True
 
 
+def _card_replay_key(body: dict) -> str:
+    """P1-3 card 路径 replay 去重键：整个回调体的稳定哈希（同一次点击的钉钉重投/攻击者
+    重放 body 完全一致）。窗口 = _TIMESTAMP_TOLERANCE；同参二次点击被窗口吞掉也无损
+    ——同向反馈写本就幂等。构造失败返回 ''（放行，不因去重辅助层拦合法回调）。"""
+    try:
+        raw = json.dumps(body or {}, ensure_ascii=False, sort_keys=True)
+        return "cardcb:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+    except Exception:   # noqa: BLE001
+        return ""
+
+
 def _process_card_callback_body(body: dict):
+    """卡片回调同步处理入口：replay 去重（claim→处理→confirm/release，两阶段与 webhook
+    msgId 同款——P1-3「card 路径无 replay nonce」）→ 实处理。HTTP 与 Stream 投递都经此。"""
+    key = _card_replay_key(body)
+    if _is_duplicate_msg(key):
+        logger.info("卡片回调重复投递已忽略（幂等）: %s", key[:24])
+        return {"msgtype": "duplicate"}
+    try:
+        result = _process_card_callback_inner(body)
+    except Exception:
+        _release_msg(key)          # 处理失败释放领用，重投可重试（不永久吞回调）
+        raise
+    _confirm_msg(key)
+    return result
+
+
+def _process_card_callback_inner(body: dict):
     """卡片回调同步处理：解析 action/feedback → 落库 → 文本提示。一律 ACK-only（不含 cardData）。"""
     ensure_request_id()   # P3-9：Stream executor 进来无 rid，反馈链路日志也要可关联
     logger.info(
