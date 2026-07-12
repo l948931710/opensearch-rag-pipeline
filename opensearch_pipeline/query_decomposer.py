@@ -20,7 +20,6 @@ import logging
 import re
 from typing import List
 
-import requests
 
 from opensearch_pipeline.config import get_config
 
@@ -81,32 +80,50 @@ def _llm_decompose(query: str) -> List[str]:
     if not llm.api_key:
         return []
     max_sub = max(2, config.rag.multi_query_max)
-    url = f"{llm.api_base_url.rstrip('/')}/chat/completions"
-    payload = {
-        "model": llm.model,
-        "messages": [
-            {"role": "system", "content": _DECOMPOSE_SYSTEM.format(max_sub=max_sub)},
-            {"role": "user", "content": query},
-        ],
-        "max_tokens": 200,
-        "temperature": 0,
-        "stream": False,
-        "enable_thinking": False,  # 分解是小判别任务，思考只添延迟
-    }
+    # Tier A 模型层收敛（2026-07-11）：直连 requests → ModelGateway 单点——统一
+    # _http_post 传输缝/超时/llm_call_log 记账（run_id=NULL 的 serving 调用）。
+    # 等价迁移：max_retries=0（原实现无重试）、tier_params={}（thinking 由 extra 显式
+    # 控制）、路由模型=config.llm.model（不借 agent 档位表）。任何失败照旧回退 []。
     try:
-        resp = requests.post(
-            url,
-            json=payload,
-            headers={"Authorization": f"Bearer {llm.api_key}",
-                     "Content-Type": "application/json"},
-            timeout=config.rag.decompose_timeout,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
+        from opensearch_pipeline.agent_runtime.context import ExecutionContext
+        from opensearch_pipeline.agent_runtime.model_gateway import (
+            ChatRequest, DashScopeProvider, ModelGateway)
+        gw = ModelGateway(
+            {"dashscope": DashScopeProvider(timeout=config.rag.decompose_timeout)},
+            routes={"decompose": [("dashscope", llm.model)]},
+            max_retries=0, tier_params={}, call_logger=_call_logger())
+        ctx = ExecutionContext.create(
+            request_id=_serving_rid(), user_id="rag-serving", acl_groups=(),
+            roles=("system",), channel="api", thread_id="decompose")
+        resp = gw.complete(ctx, "decompose", ChatRequest(
+            messages=[
+                {"role": "system", "content": _DECOMPOSE_SYSTEM.format(max_sub=max_sub)},
+                {"role": "user", "content": query},
+            ],
+            temperature=0, max_tokens=200,
+            extra={"enable_thinking": False}))  # 分解是小判别任务，思考只添延迟
+        content = resp.text
+    except Exception as e:   # noqa: BLE001 — 分解失败恒回退单查询（fail-open）
         logger.warning("查询分解调用失败（回退单查询）: %s", e)
         return []
     return _parse_subqueries(content, max_sub=max_sub, original=query)
+
+
+def _call_logger():
+    """llm_call_log 记账（fail-open：op 库不可用则不记账，绝不影响分解）。"""
+    try:
+        from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+        return RDSRunStore().record_llm_call
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _serving_rid() -> str:
+    try:
+        from opensearch_pipeline.request_context import get_request_id
+        return (get_request_id() or "")[:64]
+    except Exception:   # noqa: BLE001
+        return ""
 
 
 def maybe_decompose(query: str) -> List[str]:

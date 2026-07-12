@@ -24,7 +24,7 @@ def main():
         "2. 严禁酒后上岗，工作期间不得嬉戏打闹，严格遵守岗位操作规程。"
     )
     
-    print("\nCalling live DashScope compatible-mode API using qwen3.6-plus...")
+    print(f"\nCalling live DashScope compatible-mode API using {config.llm.model}...")
     try:
         result = run_gemini_classification(
             text=test_text,

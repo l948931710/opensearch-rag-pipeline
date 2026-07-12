@@ -24,7 +24,7 @@ def main():
         "2. 严禁酒后上岗，工作期间不得嬉戏打闹，严格遵守岗位操作规程。"
     )
     
-    models_to_test = ["qwen3.6-plus", "qwen-plus", "qwen-turbo", "qwen-max"]
+    models_to_test = ["qwen3.7-plus", "qwen-plus", "qwen-turbo", "qwen-max"]
     
     for model in models_to_test:
         print(f"\nCalling DashScope API / {model} model...")

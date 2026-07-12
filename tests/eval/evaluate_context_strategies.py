@@ -50,7 +50,7 @@ from opensearch_pipeline.config import get_config
 
 API_KEY = os.environ.get("DASHSCOPE_API_KEY", os.environ.get("RAG_DASHSCOPE_API_KEY", ""))
 API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-LLM_MODEL = "qwen3.6-plus"
+LLM_MODEL = "qwen3.7-plus"
 
 QUERIES_PATH = os.path.join(PROJECT_ROOT, "scratch", "targeted_eval_queries.json")
 RESULTS_PATH = os.path.join(PROJECT_ROOT, "tests", "eval", "context_strategy_results.json")
