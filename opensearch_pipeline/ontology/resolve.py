@@ -44,6 +44,7 @@ __all__ = [
     "Tau",
     "TauTable",
     "auto_activation_enabled",
+    "auto_eligible",
     "may_auto_activate",
 ]
 
@@ -286,6 +287,16 @@ def may_auto_activate(candidates: Sequence[Candidate], *, intent: str, namespace
     manifest 绑定校验用；给不出即 auto 恒关（重审计 §2）。"""
     if not auto_activation_enabled(source_fingerprint=source_fingerprint):
         return None
+    return auto_eligible(candidates, intent=intent, namespace=namespace,
+                         tau_table=tau_table)
+
+
+def auto_eligible(candidates: Sequence[Candidate], *, intent: str, namespace: str,
+                  tau_table: Optional[TauTable] = None) -> Optional[Candidate]:
+    """三禁+唯一性判定的**纯函数部分**（不含 ack/绑定闸）——PR14 backtest 用它离线评估
+    「若放行 auto 会自动铸什么」（would-auto），**绝不落库**。任何生产落库路径必须走
+    may_auto_activate（签名 manifest + 输入/环境绑定闸在那一层）——本函数不是第二个
+    auto 入口，是同一判定的可测切面。"""
     if intent != "read":
         return None
     if not candidates:

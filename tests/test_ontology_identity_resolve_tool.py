@@ -81,13 +81,23 @@ def test_policy_always_escalates_grant_to_approval(tool):
     assert d.decision == "require_approval" and d.policy_id == "risk_baseline"
 
 
-def test_default_policy_engine_denies_unwired(tool):
-    """未接线=未授予：default_policy_engine 对本 scope default-deny（PR13 接线时才加 grant）。"""
+def test_default_policy_engine_denies_unwired(tool, monkeypatch):
+    """默认（flag off）=未授予：default_policy_engine 对本 scope default-deny。"""
+    monkeypatch.delenv("RAG_ONTOLOGY_TOOLS_ENABLE", raising=False)
     d = default_policy_engine().authorize_tool_call(_ctx(), tool.spec, {})
     assert d.decision == "deny"
 
 
-def test_tool_not_wired_into_default_registry():
+def test_policy_flag_on_grants_but_still_requires_approval(tool, monkeypatch):
+    """PR13：flag 开 → 授予（可提案）但 HIGH_WRITE + approval_policy=always 结构性
+    require_approval——绝无免批执行路径（门 A 语义不因接线而松动）。"""
+    monkeypatch.setenv("RAG_ONTOLOGY_TOOLS_ENABLE", "true")
+    d = default_policy_engine().authorize_tool_call(_ctx(), tool.spec, {})
+    assert d.decision == "require_approval"
+
+
+def test_tool_not_wired_into_default_registry(monkeypatch):
+    monkeypatch.delenv("RAG_ONTOLOGY_TOOLS_ENABLE", raising=False)
     from opensearch_pipeline.agent_tools import build_default_registry
     names = {spec.name for spec in build_default_registry().list_specs()}
     assert "ontology_identity_resolve" not in names

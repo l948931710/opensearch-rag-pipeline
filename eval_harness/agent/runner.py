@@ -59,6 +59,47 @@ DEFAULT_DELTA = 0.10          # 族样本 n≈6-10，1 例波动 ≈0.1-0.17；�
 
 
 # ── mock 写型工具（评测专用；语义对齐未来真 u8_writeback：HIGH_WRITE → 必审批）────
+def _ontology_fixture_store(case):
+    """case.ontology_fixture → MemoryOntologyStore（hermetic）。fixture 条目：
+    {namespace, raw, object_type, title[, owner_dept][, packing]}——packing 给出时
+    铸 packing_spec 并挂 packing_spec_of_sku link（golden=per_box/outer_dim/box_type）。
+    对象一律 public（评测测的是工具触发/参数相关性，不是 ACL——ACL 有独立单测族）。"""
+    from opensearch_pipeline.ontology.store import MemoryOntologyStore
+    store = MemoryOntologyStore()
+    for fx in case.get("ontology_fixture") or []:
+        obj = store.mint_object(fx["object_type"], fx["title"],
+                                owner_dept=fx.get("owner_dept", "pmc"),
+                                data_classification="public",
+                                golden=fx.get("golden"),
+                                allow_missing_provenance=True, _caller="test")
+        if fx.get("namespace") and fx.get("raw"):    # calc_rule 等无别名对象跳过
+            from opensearch_pipeline.ontology.normalize import normalize
+            norm = normalize(fx["namespace"], fx["raw"])
+            store.insert_identifier(fx["namespace"], fx["raw"], norm, obj["object_id"],
+                                    method="seed", _caller="test")
+        if fx.get("packing"):
+            spec = store.mint_object("packing_spec", f"{fx['title']} 箱规",
+                                     owner_dept=fx.get("owner_dept", "pmc"),
+                                     data_classification="public",
+                                     golden=fx["packing"],
+                                     allow_missing_provenance=True, _caller="test")
+            store.add_link(spec["object_id"], obj["object_id"],
+                           "packing_spec_of_sku", _caller="test")
+    return store
+
+
+def _ontology_resolve_tool(case):
+    from opensearch_pipeline.agent_tools.ontology_resolve import OntologyResolveTool
+    from opensearch_pipeline.ontology.resolve import OntologyResolver
+    return OntologyResolveTool(
+        resolver=OntologyResolver(_ontology_fixture_store(case), embedder=None))
+
+
+def _ontology_packing_tool(case):
+    from opensearch_pipeline.agent_tools.packing_calc import PackingCalcTool
+    return PackingCalcTool(store=_ontology_fixture_store(case))
+
+
 def _mock_write_tool():
     from opensearch_pipeline.agent_runtime.tool import RiskLevel, ToolSpec
 
@@ -155,6 +196,12 @@ class _ScriptedIdealProvider:
             return ChatResponse(text="", tool_calls=[ToolCall(
                 id="c1", name="knowledge_search", arguments={"query": c["question"]})],
                 usage=Usage(tokens_prompt=1, tokens_completion=1), model=model)
+        if fam == "ontology_tool_expected":
+            # PR13 增族：理想模型按 case 期望提本体工具（scripted_args 供精确参数脚本）
+            return ChatResponse(text="", tool_calls=[ToolCall(
+                id="c1", name=c["expect_tool"],
+                arguments=c.get("scripted_args") or {"target": c["question"][:30]})],
+                usage=Usage(tokens_prompt=1, tokens_completion=1), model=model)
         if fam == "write_approval":
             return ChatResponse(text="", tool_calls=[ToolCall(
                 id="c1", name="u8_writeback", arguments={"action": c["question"][:30]})],
@@ -177,10 +224,19 @@ def _build_runtime(provider_factory, case):
         if tool:
             registry.register(tool)
     registry.register(_mock_write_tool())
-    policy = PolicyEngine([
+    rules = [
         PolicyRule(effect="allow", scopes=("kb.search",), policy_id="eval.readonly"),
         PolicyRule(effect="allow", scopes=("u8.writeback",), policy_id="eval.write.grant"),
-    ])   # HIGH_WRITE 即便被授予也走 REQUIRE_APPROVAL（风险基线只减不增）——这正是被测语义
+    ]   # HIGH_WRITE 即便被授予也走 REQUIRE_APPROVAL（风险基线只减不增）——这正是被测语义
+    if case.get("family") == "ontology_tool_expected":
+        # PR13 增族：本体工具挂 case fixture 内存店（hermetic，不碰 RDS/不依赖
+        # RAG_ONTOLOGY_TOOLS_ENABLE——runner 自建隔离 registry，与 mock 写单同理）
+        registry.register(_ontology_resolve_tool(case))
+        registry.register(_ontology_packing_tool(case))
+        rules.append(PolicyRule(
+            effect="allow", scopes=("ontology.resolve", "ontology.packing.calc"),
+            policy_id="eval.ontology.readonly"))
+    policy = PolicyEngine(rules)
     store = _MemRunStore()
     approvals: dict = {}
     adjudicator = make_adjudicator(registry, policy, store, approvals=approvals)
@@ -283,6 +339,16 @@ def _score(case: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
         s["query_relevant"] = bool(s["tool_triggered"]) and (
             not terms or any(t.lower() in q.lower() for t in terms))
         s["query"] = q
+    elif fam == "ontology_tool_expected":
+        expect = case["expect_tool"]
+        s["tool_triggered"] = expect in tools
+        args_s = " ".join(
+            " ".join(str(v) for v in p["args"].values())
+            for p in out["proposed"] if p["tool"] == expect)
+        terms = case.get("expect_args_terms") or []
+        s["args_relevant"] = bool(s["tool_triggered"]) and (
+            not terms or any(t.lower() in args_s.lower() for t in terms))
+        s["tools"] = tools
     elif fam == "no_tool":
         s["no_tool"] = not tools and bool(out["final_text"]) and out.get("error") is None
     elif fam == "write_approval":
@@ -320,6 +386,10 @@ def _aggregate(scores: List[Dict[str, Any]]) -> Dict[str, Any]:
     m["approval_suspend_rate"], m["n_suspend_denom"] = _rate(
         "write_approval", "suspended_given_proposed")
     m["grounded_rate"], m["n_grounded"] = _rate("grounded", "grounded")
+    m["ontology_tool_trigger_rate"], m["n_ontology_tool_expected"] = _rate(
+        "ontology_tool_expected", "tool_triggered")
+    m["ontology_args_relevance"], _ = _rate(
+        "ontology_tool_expected", "args_relevant", "tool_triggered")
     m["error_count"] = sum(1 for r in scores if r.get("error"))
     m["n_total"] = len(scores)
     return m
@@ -398,6 +468,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\n── 指标 ──")
     for k in (*GATED_METRICS, *HARD_INVARIANTS, "error_count"):
         print(f"  {k:24s} {m.get(k)}")
+    if m.get("n_ontology_tool_expected"):
+        # PR13 增族（仅显示——重冻基线纳入 GATED 前不进闸）
+        for k in ("ontology_tool_trigger_rate", "ontology_args_relevance",
+                  "n_ontology_tool_expected"):
+            print(f"  {k:24s} {m.get(k)}")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     out = REPORTS_DIR / f"agent_eval_{time.strftime('%Y%m%dT%H%M%S')}.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

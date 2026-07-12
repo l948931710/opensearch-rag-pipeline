@@ -530,11 +530,23 @@ def test_tool_resolver_crash_returns_fail(store):
     assert res.status == "failed" and "身份解析失败" in (res.error or "")
 
 
-def test_tool_not_wired_into_default_registry():
-    """未接线守护：接线与 L7 基线重冻集中在 PR13 一次完成——提前注册=连环破门。"""
+def test_tool_not_wired_into_default_registry(monkeypatch):
+    """接线守护（PR13 后双向）：默认（RAG_ONTOLOGY_TOOLS_ENABLE off）恒排除——
+    生产形态维持知识检索 canary，直到 org gate 签字 + L7 对 flag-on 臂重冻。"""
+    monkeypatch.delenv("RAG_ONTOLOGY_TOOLS_ENABLE", raising=False)
     from opensearch_pipeline.agent_tools import build_default_registry
     names = {spec.name for spec in build_default_registry().list_specs()}
     assert "ontology_resolve" not in names
+    assert "packing_calc" not in names
+
+
+def test_tool_wired_when_flag_enabled(monkeypatch):
+    """PR13：flag 开 → 三本体工具进 registry，policy 同杆授予（READ_ONLY allow，
+    HIGH_WRITE 授予仍结构性走审批）。"""
+    monkeypatch.setenv("RAG_ONTOLOGY_TOOLS_ENABLE", "true")
+    from opensearch_pipeline.agent_tools import build_default_registry
+    names = {spec.name for spec in build_default_registry().list_specs()}
+    assert {"ontology_resolve", "ontology_identity_resolve", "packing_calc"} <= names
 
 
 # ── PR-E（P0-07）：τ 数值域 + auto 硬关（默认候选-only）──────────────────────────

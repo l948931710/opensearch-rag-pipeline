@@ -1,0 +1,79 @@
+{
+  "_comment": "PR13 增族（ontology_tool_expected）：本体工具触发/参数相关性金集——身份问题应提 ontology_resolve、箱规/装柜问题应提 packing_calc（expect_args_terms 任一命中任意字符串参数即算相关）。刻意独立成文件（默认 agent-eval/agent-eval-gate 不吃它，冻结基线零影响）：RAG_ONTOLOGY_TOOLS_ENABLE 开启前的重冻流程 = ①python -m eval_harness.agent.runner --provider scripted --cases eval_harness/agent/agent_cases_ontology.json 自检判分 ②对 flag-on 臂 live 跑主金集+本文件 ③--freeze-baseline 重冻（含新增 ontology_* 指标）。fixture=hermetic 内存本体店（对象恒 public——本族测工具触发，ACL 有独立单测族）。",
+  "cases": [
+    {
+      "id": "o01",
+      "family": "ontology_tool_expected",
+      "question": "LX620-50 这个货号对应的是什么产品？",
+      "expect_tool": "ontology_resolve",
+      "expect_args_terms": ["LX620-50"],
+      "scripted_args": {"namespace": "u8", "value": "LX620-50"},
+      "ontology_fixture": [
+        {"namespace": "u8", "raw": "LX620-50", "object_type": "sku",
+         "title": "6.2口径龙虾杯 50只装"}
+      ]
+    },
+    {
+      "id": "o02",
+      "family": "ontology_tool_expected",
+      "question": "客户发来编号 KH-A88，帮我查一下这在我们系统里是哪个 SKU",
+      "expect_tool": "ontology_resolve",
+      "expect_args_terms": ["KH-A88"],
+      "scripted_args": {"namespace": "customer:客户A", "value": "KH-A88"},
+      "ontology_fixture": [
+        {"namespace": "customer:客户A", "raw": "KH-A88", "object_type": "sku",
+         "title": "9寸三格餐盒"}
+      ]
+    },
+    {
+      "id": "o03",
+      "family": "ontology_tool_expected",
+      "question": "LX620-50 的箱规是多少？一个 40HQ 能装多少箱？",
+      "expect_tool": "packing_calc",
+      "expect_args_terms": ["LX620-50"],
+      "scripted_args": {"target": "LX620-50", "namespace": "u8", "container": "40HQ"},
+      "ontology_fixture": [
+        {"namespace": "u8", "raw": "LX620-50", "object_type": "sku",
+         "title": "6.2口径龙虾杯 50只装",
+         "packing": {"box_type": "五层瓦楞", "per_box": "3000",
+                     "outer_dim": "600x400x300"}},
+        {"object_type": "calc_rule", "title": "PMC 装柜参数（评测夹具）",
+         "golden": {"containers": {"40HQ": {"inner_l_mm": 12032, "inner_w_mm": 2352,
+                                             "inner_h_mm": 2698}},
+                    "fill_rate": 0.85, "hem_allowance_mm": 5,
+                    "applicable_object_types": ["sku"],
+                    "source": "评测夹具（非生产参数）"}}
+      ]
+    },
+    {
+      "id": "o04",
+      "family": "ontology_tool_expected",
+      "question": "客户订了 60 万只 LX620-50，按现在的箱规要发几个高柜？",
+      "expect_tool": "packing_calc",
+      "expect_args_terms": ["LX620-50"],
+      "scripted_args": {"target": "LX620-50", "namespace": "u8",
+                        "order_qty_pcs": 600000},
+      "ontology_fixture": [
+        {"namespace": "u8", "raw": "LX620-50", "object_type": "sku",
+         "title": "6.2口径龙虾杯 50只装",
+         "packing": {"box_type": "五层瓦楞", "per_box": "3000",
+                     "outer_dim": "600x400x300"}},
+        {"object_type": "calc_rule", "title": "PMC 装柜参数（评测夹具）",
+         "golden": {"containers": {"40HQ": {"inner_l_mm": 12032, "inner_w_mm": 2352,
+                                             "inner_h_mm": 2698}},
+                    "fill_rate": 0.85, "hem_allowance_mm": 5,
+                    "applicable_object_types": ["sku"],
+                    "source": "评测夹具（非生产参数）"}}
+      ]
+    },
+    {
+      "id": "o05",
+      "family": "ontology_tool_expected",
+      "question": "帮我确认一下 U8 里的 ZZZ-404 是什么料，系统里有没有登记",
+      "expect_tool": "ontology_resolve",
+      "expect_args_terms": ["ZZZ-404"],
+      "scripted_args": {"namespace": "u8", "value": "ZZZ-404"},
+      "ontology_fixture": []
+    }
+  ]
+}

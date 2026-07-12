@@ -70,10 +70,24 @@ _AGENT_TOOL_DATA_BOUNDARY = (
 )
 
 
+# PR13 本体工具族提示词段（RAG_ONTOLOGY_TOOLS_ENABLE 条件化——off 臂逐字节不变，
+# 保 L7 冻结基线；开 flag 前须对 on 臂重跑 make agent-eval 并重冻，见 agent_tools 注）。
+_AGENT_PROMPT_ONTOLOGY_SUFFIX = (
+    "涉及货号/编号/型号的身份问题（这个编号是什么产品、对应哪个 SKU）先用 ontology_resolve "
+    "解析；箱规/装柜/柜容/订单折柜问题用 packing_calc（其结果带计算依据与规则版本，"
+    "引用时保留）。工具返回「未确认/候选」时如实告知需 steward 确认，不要当作已确认事实。"
+    "仅当用户明确要求把某编号正式登记为某对象的别名时才提议 ontology_identity_resolve"
+    "（该操作需人工审批）。"
+)
+
+
 def _agent_system_prompt() -> str:
     from opensearch_pipeline.agent_runtime.loop import tool_data_guard_enabled
+    from opensearch_pipeline.agent_tools import ontology_tools_enabled
     from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
     prompt = _AGENT_SYSTEM_PROMPT + (_AGENT_PROMPT_BUDGET_SUFFIX if _budget_enabled() else "")
+    if ontology_tools_enabled():
+        prompt += _AGENT_PROMPT_ONTOLOGY_SUFFIX
     if tool_data_guard_enabled():
         prompt += _AGENT_TOOL_DATA_BOUNDARY
     return prompt
