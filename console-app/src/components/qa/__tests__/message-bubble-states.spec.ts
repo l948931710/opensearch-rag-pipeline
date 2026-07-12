@@ -8,14 +8,26 @@ import MessageBubble from '@/components/qa/MessageBubble.vue'
 // 且重试此刻可点（会打断在途流）。首个答案帧到 html 首渲之间的窗口同理（无思考也闪一帧）。
 // 持久化白名单剥掉 streaming 字段 → 回灌的半截会话恒无该字段，兜底原用途必须保留。
 
-const retry = vi.fn()
-vi.mock('@/composables/useAsk', () => ({
-  useAsk: () => ({
-    retry, handoff: vi.fn(), fillInput: vi.fn(),
-    vote: vi.fn(), copyAns: vi.fn(),
-    resignImage: vi.fn(), imgFailed: vi.fn(), preview: vi.fn(),
-  }),
-}))
+// vi.hoisted：useAgentAsk 在【模块顶层】就调 useAsk()/agentChatBridge()（分支侧 canary 桥），
+// mock 工厂随 import 立即执行——普通 const 在 TDZ 里会炸（merge 集成缝）。
+const { retry } = vi.hoisted(() => ({ retry: vi.fn() }))
+vi.mock('@/composables/useAsk', async () => {
+  const { ref } = await import('vue')
+  return {
+    useAsk: () => ({
+      retry, handoff: vi.fn(), fillInput: vi.fn(),
+      vote: vi.fn(), copyAns: vi.fn(),
+      resignImage: vi.fn(), imgFailed: vi.fn(), preview: vi.fn(),
+      // useAgentAsk 顶层解构的状态源（本 spec 不驱动 agent 路径，给稳定空值）
+      asking: ref(false), draft: ref(''), messages: ref([]),
+      conversations: ref([]), activeId: ref(''),
+    }),
+    agentChatBridge: () => ({
+      ensureActive: vi.fn(), schedulePersist: vi.fn(), nextMsgId: () => 1,
+      thinking: ref(false), askLegacy: vi.fn(),
+    }),
+  }
+})
 
 const FALLBACK = '这条回答没有内容'
 
