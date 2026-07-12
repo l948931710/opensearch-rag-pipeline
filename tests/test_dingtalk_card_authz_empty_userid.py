@@ -169,12 +169,13 @@ def test_tuple_row_owner_none_allows(patch_db):
 
 
 # ═══════════════════════════════════════════════════════════════
-# (e) 查库异常 → fail-open 放行（有意降级，逐字保留）
+# (e) 查库异常 → fail-closed 拒绝（P1-3 重评审计：原 fail-open 让归属校验整层
+#     在 DB 抖动窗口内失效——伪造回调恰在故障期可灌反馈/开工单）
 # ═══════════════════════════════════════════════════════════════
 
-def test_db_exception_fail_open(patch_db):
+def test_db_exception_fail_closed(patch_db):
     patch_db(raise_exc=RuntimeError("db down"))
-    assert _card_callback_authorized("mid-real", "anyone") is True
+    assert _card_callback_authorized("mid-real", "anyone") is False
 
 
 # ═══════════════════════════════════════════════════════════════
