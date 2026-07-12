@@ -1035,7 +1035,10 @@ class RDSOntologyStore:
                     f"SELECT s.object_id AS sku_id, s.canonical_ref AS sku_ref, "
                     f"s.title AS sku_title, s.owner_dept AS sku_owner_dept, "
                     f"p.object_id AS product_id, p.canonical_ref AS product_ref, "
-                    f"p.title AS product_name, spec.object_id AS spec_id, "
+                    f"p.title AS product_name, "
+                    f"p.owner_dept AS product_owner_dept, "
+                    f"p.data_classification AS product_classification, "
+                    f"spec.object_id AS spec_id, "
                     f"spec.canonical_ref AS spec_ref, {json_cols}, "
                     f"spec.golden_json AS spec_json, spec.lifecycle_state AS spec_state, "
                     f"spec.owner_dept AS owner_dept, "
@@ -1925,6 +1928,9 @@ class MemoryOntologyStore:
                        "product_id": prod["object_id"] if prod else None,
                        "product_ref": prod["canonical_ref"] if prod else None,
                        "product_name": prod["title"] if prod else None,
+                       "product_owner_dept": prod["owner_dept"] if prod else None,
+                       "product_classification": (prod["data_classification"]
+                                                  if prod else None),
                        "spec_id": sp["object_id"], "spec_ref": sp["canonical_ref"]}
                 for f in proj["fields"]:   # JSON_UNQUOTE 语义：值恒为字符串或 None
                     v = golden.get(f)

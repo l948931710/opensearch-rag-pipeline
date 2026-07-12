@@ -116,14 +116,16 @@ def _title(stem):
 
 
 def _build_sku(store, *, with_product=True, packing=("verified",), stacking=(),
-               spec_dept="pmc", spec_cls="internal", sku_cls="internal"):
+               spec_dept="pmc", spec_cls="internal", sku_cls="internal",
+               product_dept="marketing", product_cls="internal"):
     """product ← sku ← spec×N。返回 ids 便于断言。"""
     out = {"specs": []}
     sku = store.mint_object("sku", _title("龙虾杯50x20"), owner_dept="marketing",
                             golden={"规格": "50×20"}, data_classification=sku_cls, _caller="test", allow_missing_provenance=True)
     out["sku"] = sku
     if with_product:
-        prod = store.mint_object("product", _title("6.2口径龙虾杯"), owner_dept="marketing", _caller="test")
+        prod = store.mint_object("product", _title("6.2口径龙虾杯"), owner_dept=product_dept,
+                                 data_classification=product_cls, _caller="test")
         store.add_link(sku["object_id"], prod["object_id"], "sku_of_product", _caller="test")
         out["product"] = prod
     for state in packing:
@@ -353,3 +355,80 @@ def test_retired_object_falls_back_unresolved(mstore):
     mstore.retire_object(built["sku"]["object_id"])
     ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc",))
     assert not ans.resolved and UNRESOLVED_NOTE in ans.notes
+
+
+# ── P0-03 product 独立 ACL（SKU×spec×product 三对象矩阵；双后端）──────────────────
+
+
+def test_product_confidential_masked_from_spec_readers(store):
+    """公开 SKU + 公开 spec + confidential product：spec 行照常可见，但 product
+    三字段对未授权方全遮蔽（P0-03 攻击链——行过滤键绑 spec，product 曾整行透出）。"""
+    built = _build_sku(store, sku_cls="public", spec_cls="public",
+                       product_cls="confidential", product_dept="rd")
+    ans = lookup_specs(store, built["sku"]["object_id"], acl_groups=("marketing",),
+                       domains=("packing",))
+    best = ans.specs["packing"]
+    assert best is not None and best["per_box"] == "50"        # spec 本身可见
+    assert best["product_id"] is None and best["product_ref"] is None
+    assert best["product_name"] is None                        # ID/ref 本身即泄露，全 None
+    assert best.get("product_owner_dept") is None              # helper 列一并抹掉
+    # product 归属部门（rd）：三字段可见
+    ok = lookup_specs(store, built["sku"]["object_id"], acl_groups=("rd",),
+                      domains=("packing",))
+    b2 = ok.specs["packing"]
+    assert b2["product_id"] == built["product"]["object_id"]
+    assert b2["product_name"] == built["product"]["title"]
+
+
+def test_product_internal_masked_for_non_member_visible_for_member(store):
+    built = _build_sku(store, sku_cls="public", spec_cls="public",
+                       product_cls="internal", product_dept="marketing")
+    masked = lookup_specs(store, built["sku"]["object_id"], acl_groups=("hr",),
+                          domains=("packing",)).specs["packing"]
+    assert masked is not None and masked["product_id"] is None
+    member = lookup_specs(store, built["sku"]["object_id"], acl_groups=("marketing",),
+                          domains=("packing",)).specs["packing"]
+    assert member["product_id"] == built["product"]["object_id"]
+
+
+def test_product_public_visible_to_all_and_bypass_sees_confidential(store):
+    built = _build_sku(store, sku_cls="public", spec_cls="public",
+                       product_cls="public", product_dept="rd")
+    ans = lookup_specs(store, built["sku"]["object_id"], acl_groups=("hr",),
+                       domains=("packing",))
+    assert ans.specs["packing"]["product_name"] == built["product"]["title"]
+    built2 = _build_sku(store, sku_cls="public", spec_cls="public",
+                        product_cls="confidential", product_dept="rd")
+    adm = lookup_specs(store, built2["sku"]["object_id"], acl_groups=None,
+                       bypass_acl=True, domains=("packing",))
+    assert adm.specs["packing"]["product_id"] == built2["product"]["object_id"]
+
+
+def test_product_mask_independent_of_spec_visibility(mstore):
+    """矩阵交叉项：spec 行因部门可见（internal+pmc 组）时 product 仍独立裁决。"""
+    built = _build_sku(mstore, sku_cls="public", spec_cls="internal", spec_dept="pmc",
+                       product_cls="confidential", product_dept="rd")
+    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("pmc",),
+                       domains=("packing",))
+    best = ans.specs["packing"]
+    assert best is not None                                    # spec 经 pmc 组可见
+    assert best["product_id"] is None                          # product 仍按自身密级遮蔽
+
+
+def test_legacy_rows_without_product_acl_cols_fail_closed(mstore):
+    """schema/034 前的旧行（无 product ACL 两列）：非 bypass 一律遮蔽（升级窗口宁可少给）。"""
+    built = _build_sku(mstore, sku_cls="public", spec_cls="public",
+                       product_cls="public", product_dept="rd")
+    orig = mstore.sem_spec_rows
+
+    def _legacy(sku_object_id, kind):
+        rows = orig(sku_object_id, kind)
+        for r in rows:
+            r.pop("product_owner_dept", None)
+            r.pop("product_classification", None)
+        return rows
+
+    mstore.sem_spec_rows = _legacy
+    ans = lookup_specs(mstore, built["sku"]["object_id"], acl_groups=("rd", "marketing"),
+                       domains=("packing",))
+    assert ans.specs["packing"]["product_id"] is None          # 列缺失 → fail-closed
