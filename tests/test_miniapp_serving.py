@@ -850,16 +850,29 @@ def test_score_level_rerank_scale():
     assert G.score_level({"score": "n/a"}) == ""
 
 
-def test_score_level_fused_scale():
+def _pin_legacy_thresholds(monkeypatch):
+    """钉住 legacy 融合分档位阈值 7.7/5.8。
+
+    客户端融合默认开后 load_config 会自动标定阈值为 0.57/0.52（见 test_client_fusion
+    TestThresholdAutoCalibration）；下面这些测试锚定的是**档位映射机制**而非标定值，
+    显式钉阈值使其与环境默认解耦。"""
+    from opensearch_pipeline.config import get_config
+    monkeypatch.setattr(get_config().rag, "score_threshold_high", 7.7)
+    monkeypatch.setattr(get_config().rag, "score_threshold_medium", 5.8)
+
+
+def test_score_level_fused_scale(monkeypatch):
     from opensearch_pipeline import llm_generator as G
+    _pin_legacy_thresholds(monkeypatch)
     assert G.score_level({"score": 9.0}) == "high"
     assert G.score_level({"score": 6.0}) == "mid"
     assert G.score_level({"score": 4.0}) == "low"
 
 
-def test_format_context_label_parity():
+def test_format_context_label_parity(monkeypatch):
     """重构后 prompt 中文标签不漂移（相关度: 高 0.91）。"""
     from opensearch_pipeline import llm_generator as G
+    _pin_legacy_thresholds(monkeypatch)
     chunk = {"title": "T", "chunk_text": "正文", "score": 0.91, "rerank_score": 0.91}
     ctx = G._format_context([chunk])
     assert "(相关度: 高 0.91)" in ctx
@@ -887,8 +900,9 @@ def test_format_context_step_card_image_label_parity():
     assert "<<IMG:" not in ctx_pure
 
 
-def test_extract_sources_page_fallback_and_level():
+def test_extract_sources_page_fallback_and_level(monkeypatch):
     from opensearch_pipeline import llm_generator as G
+    _pin_legacy_thresholds(monkeypatch)
     srcs = G._extract_sources([
         {"doc_id": "a", "title": "A", "section_title": "", "page_num": 12,
          "score": 0.91, "rerank_score": 0.91},

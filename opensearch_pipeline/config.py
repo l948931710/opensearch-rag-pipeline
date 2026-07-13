@@ -236,9 +236,11 @@ class AlibabaVectorSearchConfig:
     # /search 不支持 sparse（522 盲行事故根因）后「既救盲行又保 sparse」的正确路径：
     # dense(/query) + sparse(/query) + BM25(/search) 三臂并行、客户端 min-max 归一加权融合
     # （缺席不罚分）。金集 recall@1 +3.6pp vs 去 sparse 服务端混合，盲行 5/5 rank1。
-    # 默认关（保守）；生产开启=SAE 注入 RAG_HA3_CLIENT_FUSION=true。
+    # **默认开（生产语义随包生效，SAE 无需注入 env；同 8fc80f8 先例）**——
+    # RAG_HA3_CLIENT_FUSION=false 为 kill switch（回落去-sparse 服务端混合）。
+    # 档位阈值随之由 load_config 守卫自动套标定值 0.57/0.52（env 显式优先）。
     # sparse 权重 0.1 为金集最优（0.2/0.3 开始反噬），调参须重跑金集 A/B。
-    client_fusion_enable: bool = False        # RAG_HA3_CLIENT_FUSION
+    client_fusion_enable: bool = True         # RAG_HA3_CLIENT_FUSION（=false 为逃生舱）
     client_fusion_dense_weight: float = 0.7   # RAG_HA3_CLIENT_FUSION_DENSE_WEIGHT（D 臂）
     client_fusion_sparse_weight: float = 0.1  # RAG_HA3_CLIENT_FUSION_SPARSE_WEIGHT（S 臂）
     client_fusion_text_weight: float = 0.3    # RAG_HA3_CLIENT_FUSION_TEXT_WEIGHT（B 臂）
@@ -851,7 +853,7 @@ def load_config() -> PipelineConfig:
             text_weight=_env_float("HA3_TEXT_WEIGHT", 0.3),
             text_search_field=_env("HA3_TEXT_SEARCH_FIELD", "chunk_text"),
             hybrid_knn_top_k=_env_int("HA3_HYBRID_KNN_TOP_K", 100),
-            client_fusion_enable=_env_bool("HA3_CLIENT_FUSION", False),
+            client_fusion_enable=_env_bool("HA3_CLIENT_FUSION", True),
             client_fusion_dense_weight=_env_float("HA3_CLIENT_FUSION_DENSE_WEIGHT", 0.7),
             client_fusion_sparse_weight=_env_float("HA3_CLIENT_FUSION_SPARSE_WEIGHT", 0.1),
             client_fusion_text_weight=_env_float("HA3_CLIENT_FUSION_TEXT_WEIGHT", 0.3),

@@ -228,9 +228,10 @@ class TestThresholdAutoCalibration:
     """融合分数域 ~[0.02,0.64]，7.7/5.8 旧阈值会把全部命中标「低」——
     融合开启时 load_config 自动套 2026-07-13 标定值，显式 env 永远优先。"""
 
-    def test_fusion_on_auto_applies_calibrated_thresholds(self):
+    def test_default_load_is_fusion_on_with_calibrated_thresholds(self):
+        """生产语义随包生效：默认（不设任何融合 env）即融合开 + 标定阈值。"""
         from tests.test_config_loading import _fresh_load
-        config = _fresh_load(RAG_SIMULATE="true", RAG_HA3_CLIENT_FUSION="true")
+        config = _fresh_load(RAG_SIMULATE="true")
         assert config.alibaba_vector.client_fusion_enable is True
         assert config.rag.score_threshold_high == pytest.approx(0.57)
         assert config.rag.score_threshold_medium == pytest.approx(0.52)
@@ -242,9 +243,10 @@ class TestThresholdAutoCalibration:
         assert config.rag.score_threshold_high == pytest.approx(9.9)
         assert config.rag.score_threshold_medium == pytest.approx(0.52)
 
-    def test_fusion_off_keeps_legacy_thresholds(self):
+    def test_kill_switch_restores_legacy_thresholds(self):
+        """RAG_HA3_CLIENT_FUSION=false 逃生舱：回落服务端混合 + 旧阈值语义。"""
         from tests.test_config_loading import _fresh_load
-        config = _fresh_load(RAG_SIMULATE="true")
+        config = _fresh_load(RAG_SIMULATE="true", RAG_HA3_CLIENT_FUSION="false")
         assert config.alibaba_vector.client_fusion_enable is False
         assert config.rag.score_threshold_high == pytest.approx(7.7)
         assert config.rag.score_threshold_medium == pytest.approx(5.8)
