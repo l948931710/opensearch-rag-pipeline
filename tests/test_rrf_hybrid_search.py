@@ -12,6 +12,7 @@ test_rrf_hybrid_search.py — RRF 与混合检索请求构造的单元测试
 7. sparse_data 传递到 kNN query
 """
 
+import os
 import sys
 import types
 import pytest
@@ -470,8 +471,11 @@ class TestSparseDataPropagation:
         client.search.return_value = _make_ha3_response()
         mock_client_fn.return_value = client
 
+        # sparse 默认关（2026-07-13：/search 不支持 sparse，见 retriever 注释）；本测试验证
+        # “启用时 sparse 会被正确传入 knn 臂”的机制，故显式打开 RAG_HA3_KNN_SPARSE_ENABLE。
         from opensearch_pipeline.retriever import search_chunks
-        search_chunks("sparse 传递测试")
+        with patch.dict(os.environ, {"RAG_HA3_KNN_SPARSE_ENABLE": "true"}):
+            search_chunks("sparse 传递测试")
 
         knn = _captured_knn_queries[0]
         assert knn.sparse_data is not None, "sparse_data 不应为 None"

@@ -812,8 +812,17 @@ def search_chunks(
     # 2. 构建 sparse data
     from alibabacloud_ha3engine_vector.models import QueryRequest, SparseData
 
+    # 混合 /search 的 knn 臂是否携带 sparse_data。**默认 false（关）** —— 2026-07-13 定论：
+    # /vector-service/search 不支持 sparse 参数（阿里工程师 + 官方 inverted-query 文档确认：
+    # knn 仅 vector/topk/filter/weight）。引擎对该未支持参数做未文档化处理，把"无 sparse 倒排项
+    # 的行"静默排除 —— 6-27 上一次全量之后经 API/Swift 实时推送的行（sparse 仅全量物化）因此
+    # 成片失明（曾达 522 docs / 35% 语料）。251-q 金集 A/B 实证去 sparse 净提升召回（recall@5
+    # 0.776→0.915），故关闭是止血即根治，且为全环境正确的安全默认。
+    # 逃生舱：RAG_HA3_KNN_SPARSE_ENABLE=true 可重启（仅当阿里给出 /search 支持 sparse 的正式路径
+    # 或改走 /query+客户端融合后才有意义）。详见 docs/ha3_sparse_rootcause_and_ab_2026-07-13.md。
+    _knn_sparse_enable = os.environ.get("RAG_HA3_KNN_SPARSE_ENABLE", "false").lower() == "true"
     sparse_data = None
-    if sparse_idx:
+    if sparse_idx and _knn_sparse_enable:
         sparse_data = SparseData(
             count=[len(sparse_idx)],
             indices=sparse_idx,
