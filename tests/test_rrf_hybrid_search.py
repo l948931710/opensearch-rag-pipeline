@@ -135,6 +135,9 @@ def _make_config(
             text_weight=text_weight,
             text_search_field="chunk_text",
             hybrid_knn_top_k=100,
+            # 本文件锚定「服务端混合/纯向量」请求构造语义；客户端融合（现全局默认开）
+            # 的路径由 test_client_fusion.py 覆盖，这里显式关闭以隔离被测路径。
+            client_fusion_enable=False,
         ),
         embedding=EmbeddingConfig(
             api_key="test-key",

@@ -103,5 +103,13 @@ smoke 实测：**去-sparse 服务端路径与融合路径的 top-7 在 7.7/5.8 
 
 ### 生产开启（Sam 执行）
 
-SAE 部署本分支包 + 注入 `RAG_HA3_CLIENT_FUSION=true`（阈值不必设，守卫自动套标定值）→
-部署后 release-gate refreeze。回滚=去掉该 env 即回落去-sparse 服务端混合。
+**默认开（2026-07-13 随包生效，Sam 拍板「env 太多一个个输太麻烦」）**：`client_fusion_enable`
+代码默认 true（dataclass + load_config 工厂双默认，同 8fc80f8 先例），档位阈值由守卫自动套
+0.57/0.52——**SAE 部署本包即生效，一个 env 都不用加**。部署后 release-gate refreeze。
+
+Kill switch：`RAG_HA3_CLIENT_FUSION=false` 回落去-sparse 服务端混合（此时档位阈值恢复
+7.7/5.8 旧值——production/staging 下守卫会 loud-warn 提醒该尺度已失真，参考 0.65/0.60）。
+
+评测注意：默认开意味着 eval harness / release-gate 的 live 检索臂也默认走融合——refreeze
+基线即融合形态；对照旧形态须显式 `RAG_HA3_CLIENT_FUSION=false`。锚定服务端混合请求构造的
+单测（test_rrf_hybrid_search / test_degraded_bm25）已显式关闭融合以隔离被测路径。
