@@ -767,6 +767,158 @@ def _search_chunks_opensearch(
     return results
 
 
+def _client_fusion_search(
+    *,
+    query: str,
+    dense: List[float],
+    sparse_idx: List[int],
+    sparse_val: List[float],
+    filter_expr: Optional[str],
+    top_k: int,
+    output_fields: List[str],
+    client,
+    cfg,
+) -> Optional[List[Dict[str, Any]]]:
+    """三路客户端融合检索（RAG_HA3_CLIENT_FUSION，默认关）。
+
+    /search 不支持 sparse 参数（522 盲行事故根因，docs/ha3_sparse_rootcause_and_ab_2026-07-13.md）
+    之后「既救盲行又保 sparse」的正确路径（金集 A/B 判决 w3_s10，
+    docs/ha3_client_fusion_3way_ab_2026-07-13.md：recall@1 +3.6pp vs 去 sparse 默认，盲行 5/5 rank1）：
+
+      D 臂  /query 纯 dense       —— 主臂：无 sparse 倒排项的行（实时推送批）在此可达（救盲行）
+      S 臂  /query dense+sparse   —— sparse 的官方支持路径，仅作加分信号；无 sparse 行在此臂
+                                     缺席=拿不到加分，而非像 /search 那样被整行排除
+      B 臂  /search 纯 BM25       —— knn 权重清零（P2-4 降级同款 payload），文本兜底
+
+    三臂并行请求，各臂分数 min-max 归一后加权求和（默认 0.7/0.1/0.3，缺席不罚分——
+    RRF 在金集上判死：按名次投票缺席=少一臂票，结构性惩罚无 sparse 行）。
+    对外 score 恢复为服务端加权可比分（knn_weight*dense_IP + text_weight*BM25_raw），
+    保住 7.7/5.8 高/中/低档位与低置信护栏的标定语义；融合名次分存 _fused_score 仅供诊断。
+
+    降级语义（与仓库 fail-open 惯例一致）：S/B 辅臂失败按空臂继续；D 主臂异常返回 None，
+    调用方回落服务端混合检索。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from alibabacloud_ha3engine_vector.models import (
+        QueryRequest, RankQuery, SearchRequest, SparseData, TextQuery,
+    )
+
+    pool = cfg.client_fusion_pool
+
+    def _arm_dense():
+        return client.query(QueryRequest(
+            table_name=cfg.table_name,
+            vector=dense,
+            top_k=pool,
+            include_vector=False,
+            output_fields=output_fields,
+            filter=filter_expr,
+            order="DESC",
+        ))
+
+    def _arm_sparse():
+        return client.query(QueryRequest(
+            table_name=cfg.table_name,
+            vector=dense,
+            sparse_data=SparseData(
+                count=[len(sparse_idx)], indices=sparse_idx, values=sparse_val),
+            top_k=pool,
+            include_vector=False,
+            output_fields=output_fields,
+            filter=filter_expr,
+            order="DESC",
+        ))
+
+    def _arm_bm25():
+        knn_query = QueryRequest(
+            table_name=cfg.table_name,
+            vector=dense,
+            top_k=pool,
+            include_vector=False,
+            filter=filter_expr,
+        )
+        knn_query.weight = 0.0
+        text_query = TextQuery(
+            query_string=f"{cfg.text_search_field}:'{_escape_ha3_query(query)}'",
+            query_params={"default_op": "OR"},
+            filter=filter_expr,
+        )
+        text_query.weight = 1.0
+        return client.search(SearchRequest(
+            table_name=cfg.table_name,
+            knn=knn_query,
+            text=text_query,
+            rank=RankQuery(),
+            size=pool,
+            order="DESC",
+            output_fields=output_fields,
+        ))
+
+    arms: Dict[str, Optional[List[Dict[str, Any]]]] = {}
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ha3fusion") as ex:
+        futures = {"dense": ex.submit(_arm_dense), "bm25": ex.submit(_arm_bm25)}
+        if sparse_idx:
+            futures["sparse"] = ex.submit(_arm_sparse)
+        for name, fut in futures.items():
+            try:
+                arms[name] = _parse_ha3_response(fut.result())
+            except Exception as e:  # 单臂失败不破坏答案（graceful degradation）
+                arms[name] = None
+                logger.warning("Client fusion arm '%s' failed: %s", name, e)
+
+    if arms.get("dense") is None:
+        # 主臂异常（非空结果）：融合失去救盲行意义，回落服务端混合（fail-open）
+        logger.warning("Client fusion dense arm unavailable; falling back to server hybrid")
+        return None
+
+    weights = {
+        "dense": cfg.client_fusion_dense_weight,
+        "sparse": cfg.client_fusion_sparse_weight,
+        "bm25": cfg.client_fusion_text_weight,
+    }
+    fused: Dict[str, float] = {}
+    meta: Dict[str, Dict[str, Any]] = {}
+    raw_dense: Dict[str, float] = {}
+    raw_bm25: Dict[str, float] = {}
+    for name, hits in arms.items():
+        if not hits:
+            continue
+        vals = [float(h.get("score") or 0.0) for h in hits]
+        lo, hi = min(vals), max(vals)
+        rng = hi - lo
+        w = weights[name]
+        for h, v in zip(hits, vals):
+            pk = h.get("id") or h.get("chunk_id")
+            if not pk:
+                continue
+            norm = (v - lo) / rng if rng > 0 else 1.0
+            fused[pk] = fused.get(pk, 0.0) + w * norm
+            meta.setdefault(pk, h)
+            if name == "dense":
+                raw_dense[pk] = v
+            elif name == "bm25":
+                raw_bm25[pk] = v
+
+    ordered = sorted(fused, key=lambda p: -fused[p])[:top_k]
+    results = []
+    for pk in ordered:
+        h = dict(meta[pk])
+        h["_fused_score"] = round(fused[pk], 6)
+        h["score"] = (cfg.knn_weight * raw_dense.get(pk, 0.0)
+                      + cfg.text_weight * raw_bm25.get(pk, 0.0))
+        results.append(h)
+
+    logger.info(
+        "Client 3-way fusion: dense=%s sparse=%s bm25=%s -> fused=%d, top_k=%d",
+        len(arms.get("dense") or []),
+        "off" if "sparse" not in futures else len(arms.get("sparse") or []),
+        len(arms.get("bm25") or []) if arms.get("bm25") is not None else "FAIL",
+        len(fused), len(results),
+    )
+    return results
+
+
 def search_chunks(
     query: str,
     *,
@@ -848,7 +1000,19 @@ def search_chunks(
 
     client = _get_ha3_client()
 
-    if cfg.enable_hybrid or degraded:
+    # 3a. 三路客户端融合（RAG_HA3_CLIENT_FUSION，默认关；生产开启走 SAE env）。
+    # 注意：S 臂走 /query（sparse 官方支持路径），与上面 RAG_HA3_KNN_SPARSE_ENABLE
+    # （只管 /search 的 knn 臂）互不相干——融合开启时 sparse 信号总是可用。
+    # degraded（零向量嵌入）不走融合：D/S 两臂无意义，沿用纯 BM25 降级形态。
+    results: Optional[List[Dict[str, Any]]] = None
+    if cfg.client_fusion_enable and cfg.enable_hybrid and not degraded:
+        results = _client_fusion_search(
+            query=query, dense=dense, sparse_idx=sparse_idx, sparse_val=sparse_val,
+            filter_expr=filter_expr, top_k=top_k, output_fields=_output_fields,
+            client=client, cfg=cfg,
+        )   # None = 主臂失败 → 回落下方服务端混合
+
+    if results is None and (cfg.enable_hybrid or degraded):
         # ── 混合检索: Dense + Sparse + BM25 三路融合 ──
         # P2-4：degraded 时即便 enable_hybrid=False 也走本分支——纯向量路径没有 BM25
         # text 路可用，降级检索必须经 text 路（knn 路权重清零仅作 payload 占位）。
@@ -905,7 +1069,8 @@ def search_chunks(
             cfg.hybrid_fusion, cfg.text_search_field, cfg.hybrid_knn_top_k, top_k, degraded,
         )
         resp = client.search(request)
-    else:
+        results = _parse_ha3_response(resp)
+    elif results is None:
         # ── 纯向量检索（降级 / 兼容旧行为，RAG_HA3_ENABLE_HYBRID=false 才走）──
         request = QueryRequest(
             table_name=cfg.table_name,
@@ -919,9 +1084,9 @@ def search_chunks(
         )
         logger.info("Vector-only search: top_k=%d", top_k)
         resp = client.query(request)
+        results = _parse_ha3_response(resp)
 
-    # 4. 解析结果
-    results = _parse_ha3_response(resp)
+    # 4. 结果后处理（三条路径——客户端融合/服务端混合/纯向量——在此汇合）
     if degraded:
         _mark_degraded_results(results)   # P2-4：打标 + 分级失效处理（见 helper 注释）
 

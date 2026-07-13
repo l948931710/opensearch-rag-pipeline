@@ -228,6 +228,17 @@ class AlibabaVectorSearchConfig:
     text_weight: float = 0.3               # 加权模式下 text (BM25) 权重
     text_search_field: str = "chunk_text"   # BM25 全文检索字段名（需配置 TEXT 倒排索引）
     hybrid_knn_top_k: int = 100             # kNN 路的候选池大小
+    # ── 三路客户端融合（2026-07-13 金集 A/B 判决 w3_s10，docs/ha3_client_fusion_3way_ab_2026-07-13.md）──
+    # /search 不支持 sparse（522 盲行事故根因）后「既救盲行又保 sparse」的正确路径：
+    # dense(/query) + sparse(/query) + BM25(/search) 三臂并行、客户端 min-max 归一加权融合
+    # （缺席不罚分）。金集 recall@1 +3.6pp vs 去 sparse 服务端混合，盲行 5/5 rank1。
+    # 默认关（保守）；生产开启=SAE 注入 RAG_HA3_CLIENT_FUSION=true。
+    # sparse 权重 0.1 为金集最优（0.2/0.3 开始反噬），调参须重跑金集 A/B。
+    client_fusion_enable: bool = False        # RAG_HA3_CLIENT_FUSION
+    client_fusion_dense_weight: float = 0.7   # RAG_HA3_CLIENT_FUSION_DENSE_WEIGHT（D 臂）
+    client_fusion_sparse_weight: float = 0.1  # RAG_HA3_CLIENT_FUSION_SPARSE_WEIGHT（S 臂）
+    client_fusion_text_weight: float = 0.3    # RAG_HA3_CLIENT_FUSION_TEXT_WEIGHT（B 臂）
+    client_fusion_pool: int = 50              # RAG_HA3_CLIENT_FUSION_POOL（每臂候选池）
     # ── 路由式重排序（DashScope rerank，见 reranker.py / eval_harness rerank A/B）──
     # 默认关闭；开启后 retrieve_and_enrich 会 over-fetch rerank_pool 个候选 → 重排 → 取 top_k。
     rerank_enable: bool = False             # RAG_RERANK_ENABLE
@@ -805,6 +816,11 @@ def load_config() -> PipelineConfig:
             text_weight=_env_float("HA3_TEXT_WEIGHT", 0.3),
             text_search_field=_env("HA3_TEXT_SEARCH_FIELD", "chunk_text"),
             hybrid_knn_top_k=_env_int("HA3_HYBRID_KNN_TOP_K", 100),
+            client_fusion_enable=_env_bool("HA3_CLIENT_FUSION", False),
+            client_fusion_dense_weight=_env_float("HA3_CLIENT_FUSION_DENSE_WEIGHT", 0.7),
+            client_fusion_sparse_weight=_env_float("HA3_CLIENT_FUSION_SPARSE_WEIGHT", 0.1),
+            client_fusion_text_weight=_env_float("HA3_CLIENT_FUSION_TEXT_WEIGHT", 0.3),
+            client_fusion_pool=_env_int("HA3_CLIENT_FUSION_POOL", 50),
             rerank_enable=_env_bool("RERANK_ENABLE", False),
             rerank_text_model=_env("RERANK_TEXT_MODEL", "qwen3-rerank"),
             rerank_vl_model=_env("RERANK_VL_MODEL", "qwen3-vl-rerank"),
@@ -1001,6 +1017,36 @@ def load_config() -> PipelineConfig:
             "⚠️ [CONFIG GUARD] HA3_HYBRID_FUSION=rrf 且 rerank 关闭：相关度档位/低置信护栏阈值"
             "(7.7/5.8) 按 weighted 融合分标定，rrf 分尺度(~0.0x)下会把几乎所有命中误标为「低」并"
             "触发软拒答。请改回 weighted，或为 rrf 单独标定 score_threshold_*（当前未提供 rrf 校准值）。"
+        )
+
+    # 三路客户端融合的档位阈值自动标定（2026-07-13 只读标定：40q×top7 对旧含-sparse 分布做
+    # 分位数匹配，scratch/score_threshold_calibration_20260713.json + docs/ha3_client_fusion_
+    # 3way_ab_2026-07-13.md）。融合对外 score=knn_weight*dense_IP+text_weight*BM25_raw，
+    # 分数域 ~[0.02,0.64]，7.7/5.8 旧阈值下全部命中落「低」→ 软拒答常态触发。融合开启且未
+    # 显式设阈值时自动套标定值（env RAG_SCORE_THRESHOLD_HIGH/MEDIUM 显式设置永远优先）；
+    # release-gate refreeze 时应以更大样本复标。
+    if getattr(_av, "client_fusion_enable", False):
+        if "RAG_SCORE_THRESHOLD_HIGH" not in os.environ:
+            config.rag.score_threshold_high = 0.57
+        if "RAG_SCORE_THRESHOLD_MEDIUM" not in os.environ:
+            config.rag.score_threshold_medium = 0.52
+        print(
+            "ℹ️ [CONFIG GUARD] RAG_HA3_CLIENT_FUSION=true：相关度档位阈值套用客户端融合标定值"
+            f"（high={config.rag.score_threshold_high} / medium={config.rag.score_threshold_medium}；"
+            "显式设 RAG_SCORE_THRESHOLD_HIGH/MEDIUM 可覆盖）。"
+        )
+    elif (config.environment in ("production", "staging")
+          and os.environ.get("RAG_HA3_KNN_SPARSE_ENABLE", "false").lower() != "true"
+          and "RAG_SCORE_THRESHOLD_HIGH" not in os.environ
+          and not getattr(_av, "rerank_enable", False)):
+        # 去-sparse 服务端混合（8fc80f8 新默认）上线的同款隐患：/search 分数域塌缩到
+        # ~[0.54,0.71]（sparse 曾是 7.7/5.8 标定母体的分数主体），旧阈值下全部命中标「低」。
+        # 标定参考值 high=0.65/medium=0.60（同一次标定）。沿 rrf 先例只 loud-warn 不自动改
+        # （存量评测/基线锚定 7.7/5.8 语义），正式值随 release-gate refreeze 定。
+        print(
+            "⚠️ [CONFIG GUARD] 去-sparse 服务端混合 + 档位阈值仍为 7.7/5.8（含-sparse 旧尺度）："
+            "分数域塌缩后全部命中会标「低」并常态触发软拒答。部署前请设 "
+            "RAG_SCORE_THRESHOLD_HIGH/MEDIUM（标定参考 0.65/0.60）或开启 rerank/客户端融合。"
         )
 
     return config
