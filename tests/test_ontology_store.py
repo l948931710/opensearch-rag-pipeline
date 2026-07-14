@@ -891,3 +891,55 @@ def test_authorized_search_and_count_push_acl_down(store):
                                            title_like=f"授权-{tag}-不存在", limit=10) == []
     assert store.count_objects_authorized("product", acl={"pmc"},
                                           title_like=only_hidden) == 0
+
+
+# ── C1（复核批次3，写工具安全线）：别名写路径锁定目标对象并断言 active ──────────────
+# FK 只保证存在性；confirm/repoint/insert 与 mark_duplicate/retire 并发交错会让别名
+# 指向 merged/retired 对象。RDS 侧 FOR UPDATE + 断言（_lock_active_target），memory 侧
+# 全局锁内同语义断言（_assert_active_target）。
+
+
+def test_c1_insert_identifier_to_merged_target_rejected(store, ns):
+    a, b = _mint(store), _mint(store)
+    assert store.mark_duplicate(a["object_id"], b["object_id"], by="test")   # a → merged
+    with pytest.raises(ValueError, match="非 active"):
+        store.insert_identifier(ns, "U8-C1A", "u8-c1a", a["object_id"],
+                                method="manual", _caller="test")
+
+
+def test_c1_repoint_to_retired_target_rejected_and_rolled_back(store, ns):
+    a, b = _mint(store), _mint(store)
+    ident = store.insert_identifier(ns, "U8-C1B", "u8-c1b", a["object_id"],
+                                    method="manual", _caller="test")
+    assert store.retire_object(b["object_id"])
+    with pytest.raises(ValueError, match="非 active"):
+        store.repoint_identifier(ident, b["object_id"], by="tester")
+    # 整体回滚：原 active 行不被 supersede 半途丢下
+    assert store.get_identifier(ident)["status"] == "active"
+
+
+def test_c1_confirm_case_to_merged_target_rejected_case_stays_open(store, ns):
+    a, b = _mint(store), _mint(store)
+    assert store.mark_duplicate(b["object_id"], a["object_id"], by="test")   # b → merged
+    cid = store.upsert_case(ns, "u8 c1c", "U8-C1C")
+    with pytest.raises(ValueError, match="非 active"):
+        store.confirm_case_with_identifier(cid, target_object_id=b["object_id"], by="tester")
+    hit = store.get_open_case(ns, "U8-C1C")
+    assert hit and hit["case_id"] == cid                     # case 仍 open（事务回滚）
+
+
+def test_c1_closing_case_write_to_retired_target_rejected(store, ns):
+    b = _mint(store)
+    assert store.retire_object(b["object_id"])
+    with pytest.raises(ValueError, match="非 active"):
+        store.insert_identifier_closing_case(ns, "U8-C1D", "u8-c1d", b["object_id"])
+
+
+def test_c1_active_target_still_writable(store, ns):
+    a = _mint(store)
+    ident = store.insert_identifier(ns, "U8-C1E", "u8-c1e", a["object_id"],
+                                    method="manual", _caller="test")
+    assert store.get_identifier(ident)["status"] == "active"
+    cid = store.upsert_case(ns, "u8 c1f", "U8-C1F")
+    got = store.confirm_case_with_identifier(cid, target_object_id=a["object_id"], by="tester")
+    assert store.get_identifier(got)["status"] == "active"

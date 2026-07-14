@@ -116,6 +116,24 @@
 **闸门**：注册任何 HIGH_WRITE 工具进默认 registry / 开 `RAG_ONTOLOGY_TOOLS_ENABLE` 之前。
 A3 的 staging 演练排在这批合入之后。
 
+> **状态（2026-07-13）：✅ 代码侧完成**（落 claude/ontology-p0；全量 3510 绿 + lint 绿；
+> 测试 test_writetools_safety_batch3.py 7 例 + test_subject_purge 新 3 例 +
+> test_ontology_store C1 5 例×memory/rds 双后端）。与原案的实现说明：
+> ① A4 幂等复核：find_succeeded_invocation 增返 args_digest；命中不匹配 → 拒绝复用 +
+>   告警 + 派生键 `{key}:a{digest(args)[:16]}` 真执行；历史行无摘要沿用复用（fail-open）。
+>   键格式改 `run_id:t{turn}:call_id`（policy 层统一，同轮重放稳定/跨轮不撞）+ gateway
+>   兜底 call_id 加 uuid 片段（`call_{i}_{hex8}`，审批 grant 键同免撞）——采用原案「或」
+>   后方案并两者都做。
+> ② D3：失败侧三处（RunFailed 分支/异常兜底/_fail_over_budget）改 checked CAS——
+>   失去所有权（purge 删行/收尸/取消抢先）不再调 _notify_failure，本地 SSE 事件照发；
+>   purge_subject 前置查非终态 agent_run（running/suspended/resuming），存在即 fail-closed
+>   拒绝（dry-run 报 blocked_by_runs，commit raise）；agent_run 表缺失（1146，未铺 022）
+>   视为无 in-flight。处置顺序=先 cancel（批次2 端点）/处置审批/等收尸再擦除。
+> ③ C1：RDS `_lock_active_target`（FOR UPDATE + status='active' 断言，复用 mark_duplicate
+>   模式）挂 insert_identifier / repoint（新 target）/ confirm_case / closing_case 四路径，
+>   锁序统一「case → object」防死锁；mint_object_with_alias 不需要（target=同事务新建对象，
+>   已注释说明）；memory 后端 `_assert_active_target` 同语义（repoint 经内部 insert 同享）。
+
 ### A4 幂等复核 args + 弃位置序号键 【M】
 - `run_store.find_succeeded_invocation`（run_store.py:468）：SELECT 增返 `args_digest`。
 - `tool_executor`（tool_executor.py:240-249）：命中时比对 args_digest，不匹配 → **拒绝复用**，

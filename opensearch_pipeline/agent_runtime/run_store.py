@@ -477,7 +477,9 @@ class RDSRunStore:
 
     def find_succeeded_invocation(self, tool_name: str,
                                   idempotency_key: Optional[str]) -> Optional[Dict[str, Any]]:
-        """key_required 工具幂等：已成功的同键调用 → 返回回执（重放/重试不重复副作用）。"""
+        """key_required 工具幂等：已成功的同键调用 → 返回回执（重放/重试不重复副作用）。
+        A4（复核批次3）：args_digest 一并返回——命中方必须比对参数摘要，同键不同参
+        =键碰撞/复用，直接复用回执会把 A 操作的结果谎报给 B 操作。"""
         if not idempotency_key:
             return None
         db = _op_db()
@@ -485,7 +487,8 @@ class RDSRunStore:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT invocation_id, result_digest, receipt_json FROM {db}.tool_invocation "
+                    f"SELECT invocation_id, result_digest, receipt_json, args_digest "
+                    f"FROM {db}.tool_invocation "
                     "WHERE tool_name=%s AND idempotency_key=%s AND status='succeeded' "
                     "ORDER BY ended_at DESC LIMIT 1",
                     (tool_name, idempotency_key),
@@ -493,7 +496,8 @@ class RDSRunStore:
                 row = cur.fetchone()
             if not row:
                 return None
-            return {"invocation_id": row[0], "result_digest": row[1], "receipt_json": row[2]}
+            return {"invocation_id": row[0], "result_digest": row[1], "receipt_json": row[2],
+                    "args_digest": row[3]}
         finally:
             conn.close()
 

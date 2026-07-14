@@ -238,6 +238,17 @@ class ToolExecutor:
                 return ToolResult.fail(
                     f"工具 {spec.name} 声明 idempotency=key_required 但未提供幂等键，拒绝执行")
             hit = self._store.find_succeeded_invocation(spec.name, idempotency_key)
+            # A4（复核批次3）：命中必须复核 args_digest——同键不同参=键碰撞/键复用
+            # （位置序号兜底键跨轮撞车、上游误传同键），直接复用会把 A 操作的回执谎报给
+            # B 操作。不匹配 → 拒绝复用，响亮告警，按内容派生新键执行（新键对真重放仍
+            # 稳定：同参数同摘要）。旧行无 args_digest（历史行）沿用复用行为（fail-open）。
+            if hit and hit.get("args_digest") and hit["args_digest"] != digest(args):
+                logger.warning(
+                    "工具 %s 幂等键 %s 命中但参数摘要不一致（库=%s 本次=%s）——键碰撞/复用，"
+                    "拒绝复用回执，按内容派生新键执行",
+                    spec.name, idempotency_key, hit["args_digest"], digest(args))
+                idempotency_key = f"{idempotency_key}:a{digest(args)[:16]}"
+                hit = None
             if hit:
                 logger.info("工具 %s 幂等命中，复用回执", spec.name)
                 receipt = json.loads(hit["receipt_json"]) if hit.get("receipt_json") else None

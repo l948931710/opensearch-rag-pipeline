@@ -563,6 +563,39 @@ def purge_subject(user_id: str, *, commit: bool = False, batch: int = DEFAULT_BA
 
     from opensearch_pipeline.db import _get_db_conn
 
+    # D3 purge quiesce（复核批次3）：该主体仍有**非终态** agent_run（running/suspended/
+    # resuming）时 fail-closed 拒绝擦除——in-flight run 的驱动线程/审批续跑会在删行之后
+    # 继续写 checkpoint/step/qa_session_log，主体擦除刚做完又长回新行（且失败侧回调
+    # 已由 executor D3 fencing 挡掉一半，另一半在这里从源头拒绝）。处置顺序：先
+    # cancel（POST /api/agent/runs/{id}/cancel）/ 等审批处置 / 等 reaper 收尸，再擦除。
+    # dry-run 同样报告（blocked_by_runs），让操作员在真跑前看到会被拒。
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT run_id, status FROM {_op_db()}.agent_run "
+                    "WHERE user_id = %s AND status IN ('running','suspended','resuming') "
+                    "LIMIT 20", (user_id,))
+                inflight = [(r[0], r[1]) for r in cur.fetchall()]
+            conn.rollback()   # 只读收尾
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — agent_run 表缺失（1146，未铺 022）视为无 in-flight
+        if "1146" in str(e) or "doesn't exist" in str(e):
+            inflight = []
+        else:
+            raise
+    if inflight:
+        result["ok"] = False
+        result["blocked_by_runs"] = [{"run_id": rid, "status": st} for rid, st in inflight]
+        msg = ("[purge_subject] 拒绝擦除（fail-closed）：主体仍有非终态 agent_run，"
+               f"先 cancel/处置审批/等收尸——{result['blocked_by_runs']}")
+        print(msg)
+        if commit:
+            raise RuntimeError(msg)
+        return result
+
     for job in _purge_jobs(user_id):
         table = job["table"]
         rep: dict = {"ok": False, "affected": 0, "batches": 0}

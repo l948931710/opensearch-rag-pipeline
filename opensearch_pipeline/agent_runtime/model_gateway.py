@@ -566,10 +566,15 @@ def _stream_enabled() -> bool:
 
 def _resp_to_turn(resp: ChatResponse) -> ModelTurn:
     if resp.tool_calls:
+        # A4（复核批次3）：provider 缺 id 的兜底 call_id 带随机片段消跨轮碰撞——纯位置
+        # 序号（call_0）在多轮 run 里必撞：幂等键与审批 grant 键都按 call_id 组键。
+        # 片段一次生成后随 ProposedCall 稳定传递（checkpoint/resume 原样携带，不再生成）。
+        import uuid
         return ModelTurn(
-            tool_calls=[ProposedCall(call_id=tc.id or f"call_{i}", tool_name=tc.name,
-                                     arguments=tc.arguments)
-                        for i, tc in enumerate(resp.tool_calls)],
+            tool_calls=[ProposedCall(
+                call_id=tc.id or f"call_{i}_{uuid.uuid4().hex[:8]}", tool_name=tc.name,
+                arguments=tc.arguments)
+                for i, tc in enumerate(resp.tool_calls)],
             usage=resp.usage)
     return ModelTurn(text=resp.text, usage=resp.usage)
 

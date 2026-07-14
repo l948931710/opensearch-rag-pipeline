@@ -232,14 +232,17 @@ def make_adjudicator(registry: "ToolRegistry", policy: PolicyEngine, run_store,
                 except TypeError:
                     pass
         # ALLOW / 已批准 → 经中间件栈执行（超时/重试/幂等/熔断 + 记 executing→result）。
-        # 幂等键按**逻辑调用**派生（run_id:call_id）：step_no 每裁决 MAX+1 新生成，
-        # 用它做键任何重放/重试永远 miss，幂等层整层空转（深度审查 C 组 P1）。
+        # 幂等键按**逻辑调用**派生（run_id:t{turn}:call_id——A4 复核批次3 编入轮次）：
+        # step_no 每裁决 MAX+1 新生成，用它做键任何重放/重试永远 miss（深度审查 C 组 P1）；
+        # provider 缺 id 时 gateway 兜底 call_id 此前是纯位置序号（call_0），跨轮同工具
+        # 必撞键——轮次入键后同一逻辑调用（同轮同 call）重放仍稳定、跨轮不再碰撞。
         # call_id 缺失（gateway 对缺失兜底空串）→ 退化为按参数摘要派生，仍跨重放稳定。
+        # 执行层另有 args_digest 复核兜底（同键不同参拒绝复用回执，tool_executor A4）。
         # obligations 随裁决进执行层（P1：只收集不执行 → 已注册执行器的强制生效、
         # 无执行器的在副作用前 fail-closed 拒绝，见 tool_executor）。
         idem = None
         if tool.spec.idempotency == "key_required":
-            idem = f"{ctx.run_id}:{ev.call_id or digest(ev.arguments)}"
+            idem = f"{ctx.run_id}:t{ev.turn_index}:{ev.call_id or digest(ev.arguments)}"
         return tool_executor.execute(ctx, tool, ev.arguments, run_id=ctx.run_id, step_no=step_no,
                                      policy_decision=pdecision, policy_id=decision.policy_id,
                                      idempotency_key=idem, obligations=decision.obligations)

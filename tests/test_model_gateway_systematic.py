@@ -453,4 +453,7 @@ def test_resp_to_turn_synthesizes_call_id_when_missing():
     r = ChatResponse(text="", tool_calls=[ToolCall(id="", name="t", arguments={"a": 1})],
                      usage=Usage(), model="m")
     turn = _resp_to_turn(r)
-    assert turn.tool_calls[0].call_id == "call_0" and turn.tool_calls[0].arguments == {"a": 1}
+    # A4（复核批次3）：兜底 id 带随机片段（call_0_xxxxxxxx）——纯位置序号跨轮必撞
+    # 幂等键/审批 grant 键。碰撞回归锁在 test_writetools_safety_batch3。
+    assert turn.tool_calls[0].call_id.startswith("call_0_")
+    assert turn.tool_calls[0].arguments == {"a": 1}

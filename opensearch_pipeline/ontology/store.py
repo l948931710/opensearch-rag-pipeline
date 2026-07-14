@@ -547,6 +547,23 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
+    def _lock_active_target(self, cur, target_object_id: str, *, what: str = "别名") -> None:
+        """C1（复核批次3，写工具安全线）：别名写路径**事务内**锁定目标对象并断言 active。
+
+        防「confirm/repoint/insert 与 mark_duplicate/retire 并发交错 → 别名指向
+        merged/retired 对象」：FK 只保证存在性，不保证生命周期状态。FOR UPDATE 与
+        mark_duplicate 同款模式——并发的 merge 持锁时本事务在此排队，锁到手后状态
+        已是终值，非 active 即整体回滚。不存在/非 active 均抛 ValueError。"""
+        db = self._db()
+        cur.execute(f"SELECT status FROM {db}.ontology_object "
+                    "WHERE object_id=%s FOR UPDATE", (target_object_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+        if row[0] != "active":
+            raise ValueError(
+                f"target 对象 {target_object_id} 非 active（{row[0]}），拒绝{what}写")
+
     def insert_identifier(self, namespace: str, raw_value: str, norm_value: str,
                           target_object_id: str, *, method: str, relation: str = "alias",
                           target_revision: Optional[str] = None, confidence: float = 1.0,
@@ -563,6 +580,7 @@ class RDSOntologyStore:
         identifier_id = new_ulid()
         try:
             with conn.cursor() as cur:
+                self._lock_active_target(cur, target_object_id)          # C1
                 cur.execute(
                     f"INSERT INTO {db}.ontology_identifier "
                     "(identifier_id, namespace, raw_value, norm_value, target_object_id, "
@@ -620,6 +638,7 @@ class RDSOntologyStore:
                 if not rows or rows[0]["status"] != "active":
                     raise ValueError(f"identifier {identifier_id} 不存在或非 active，无法改指")
                 old = rows[0]
+                self._lock_active_target(cur, new_target_object_id, what="改指")   # C1：新 target 须 active
                 cur.execute(f"UPDATE {db}.ontology_identifier "
                             "SET status='superseded', superseded_by=%s "
                             "WHERE identifier_id=%s AND status='active'", (new_id, identifier_id))
@@ -664,7 +683,9 @@ class RDSOntologyStore:
 
         别名撞 uk → 整体回滚（对象不留），抛 DuplicateActiveIdentifier——P0-05 的
         「铸完对象别名被并发占 → 永久孤儿」由此根除。
-        P1-10：golden 非空须随属性级 provenance（fail-closed，同 mint_object）。"""
+        P1-10：golden 非空须随属性级 provenance（fail-closed，同 mint_object）。
+        C1 说明：本方法的别名 target=同事务内刚 INSERT 的新对象（天然 active、外界
+        不可见），无并发改状态窗口——五个别名写路径中唯一不需要 _lock_active_target 的。"""
         _check_owner_dept(owner_dept)
         _check_lifecycle(lifecycle_state)
         _check_confidence(confidence)
@@ -754,6 +775,7 @@ class RDSOntologyStore:
                 if not rows or rows[0]["status"] != "open":
                     raise ValueError(f"case {case_id} 不存在或非 open（已被并发处置）")
                 case = rows[0]
+                self._lock_active_target(cur, target_object_id, what="确认")   # C1
                 identifier_id = new_ulid()
                 cur.execute(
                     f"INSERT INTO {db}.ontology_identifier "
@@ -810,6 +832,8 @@ class RDSOntologyStore:
                             "FOR UPDATE", (namespace, norm_value))
                 hit = cur.fetchone()
                 case_id = hit[0] if hit else None
+                # C1：锁序统一「case → object」（与 confirm_case_with_identifier 同序防死锁）
+                self._lock_active_target(cur, target_object_id, what="受治理确认")
                 identifier_id = new_ulid()
                 cur.execute(
                     f"INSERT INTO {db}.ontology_identifier "
@@ -1669,6 +1693,16 @@ class MemoryOntologyStore:
                     return dict(row)
             return None
 
+    def _assert_active_target(self, target_object_id, *, what="别名"):
+        """C1（与 RDS _lock_active_target 同语义）：目标对象须存在且 active——
+        memory 后端在全局锁内检查即等价于事务内锁定。"""
+        obj = self._objects.get(target_object_id)
+        if obj is None:
+            raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+        if obj.get("status") != "active":
+            raise ValueError(
+                f"target 对象 {target_object_id} 非 active（{obj.get('status')}），拒绝{what}写")
+
     def insert_identifier(self, namespace, raw_value, norm_value, target_object_id, *,
                           method, relation="alias", target_revision=None, confidence=1.0,
                           confirmed_by=None, source_case_id=None, approval_request_id=None,
@@ -1678,8 +1712,7 @@ class MemoryOntologyStore:
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
                 raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
-            if target_object_id not in self._objects:   # 对齐 RDS FK（P0-03）
-                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+            self._assert_active_target(target_object_id)   # C1（repoint 经内部调用同享）
             identifier_id = new_ulid()
             self._identifiers[identifier_id] = {
                 "identifier_id": identifier_id, "namespace": namespace,
@@ -1786,8 +1819,7 @@ class MemoryOntologyStore:
             if self.get_active_identifier(case["namespace"], case["norm_value"]) is not None:
                 raise DuplicateActiveIdentifier(
                     f"{case_id} 对应编号已有 active 别名（确认整体回滚）")
-            if target_object_id not in self._objects:
-                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+            self._assert_active_target(target_object_id, what="确认")   # C1
             identifier_id = new_ulid()
             if audit:
                 audit = {**audit, "detail": {**(audit.get("detail") or {}),
@@ -1814,8 +1846,7 @@ class MemoryOntologyStore:
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
                 raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")
-            if target_object_id not in self._objects:
-                raise ValueError(f"target 对象 {target_object_id} 不存在（FK 拦截）")
+            self._assert_active_target(target_object_id, what="受治理确认")   # C1
             case = self.get_open_case(namespace, norm_value)
             self._memory_audit(audit)
             identifier_id = new_ulid()

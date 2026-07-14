@@ -454,8 +454,14 @@ class ThreadedRunExecutor:
                     break
                 handle._emit(ev)
                 if isinstance(ev, RunFailed):
-                    self._safe_transition(run_id, "running", "failed")
-                    self._notify_failure(handle, ev.error)
+                    # D3（复核批次3）失败侧 fencing：与完成侧对齐——CAS 成立才证明本线程
+                    # 仍持有 run；失败迁移不成立（已被 purge 删行/收尸/取消抢先）时**不调**
+                    # 失败侧回调，否则 qa_session_log 会在主体擦除后再 INSERT 该用户新行。
+                    if self._transition_checked(run_id, "running", "failed"):
+                        self._notify_failure(handle, ev.error)
+                    else:
+                        logger.error("run %s 失败收尾时已失去所有权（purge/收尸/取消抢先），"
+                                     "跳过失败侧落库", run_id)
                     break
                 if handle.cancelled():
                     gen.close()
@@ -466,9 +472,13 @@ class ThreadedRunExecutor:
         except StopIteration:
             pass
         except Exception as e:   # noqa: BLE001 — run 内部异常不外泄，落 failed + 事件
-            self._safe_transition(run_id, "running", "failed")
             handle._emit(RunFailed(error=str(e), retryable=False))
-            self._notify_failure(handle, str(e))
+            # D3 失败侧 fencing（同 RunFailed 分支）：失去所有权不再落失败侧回调
+            if self._transition_checked(run_id, "running", "failed"):
+                self._notify_failure(handle, str(e))
+            else:
+                logger.error("run %s 异常收尾时已失去所有权（purge/收尸/取消抢先），"
+                             "跳过失败侧落库", run_id)
         finally:
             hb_stop.set()
             if run_id:
@@ -669,14 +679,17 @@ class ThreadedRunExecutor:
             return False
 
     def _fail_over_budget(self, run_id: Optional[str], gen, handle: RunHandle, msg: str) -> None:
-        """预算超限 fail-closed：关生成器 + 落 failed + 发 RunFailed 事件。"""
+        """预算超限 fail-closed：关生成器 + 落 failed + 发 RunFailed 事件。
+        D3：失败侧回调经 checked CAS 门控（失去所有权=purge/收尸/取消抢先 → 不落库）。"""
         try:
             gen.close()
         except Exception:   # noqa: BLE001
             pass
-        self._safe_transition(run_id, "running", "failed")
         handle._emit(RunFailed(error=msg, retryable=False))
-        self._notify_failure(handle, msg)
+        if self._transition_checked(run_id, "running", "failed"):
+            self._notify_failure(handle, msg)
+        else:
+            logger.error("run %s 预算超限收尾时已失去所有权，跳过失败侧落库", run_id)
 
     def _safe_transition(self, run_id: Optional[str], frm: str, to: str) -> None:
         try:

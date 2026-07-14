@@ -29,6 +29,9 @@ class _Cur:
         s = " ".join(sql.split())
         if s.startswith("SELECT COUNT(*)"):
             self._row = (self._conn.affected,)
+        elif s.startswith("SELECT run_id"):
+            # D3 purge quiesce 前置查（非终态 agent_run）
+            self._rows = list(self._conn.inflight_runs)
         elif s.startswith("DELETE"):
             self.rowcount = (self._conn.act_rowcounts.pop(0)
                              if self._conn.act_rowcounts else 0)
@@ -37,12 +40,17 @@ class _Cur:
     def fetchone(self):
         return getattr(self, "_row", None)
 
+    def fetchall(self):
+        return list(getattr(self, "_rows", []))
+
 
 class _Conn:
-    def __init__(self, *, affected=0, act_rowcounts=None, raise_1146_on=None):
+    def __init__(self, *, affected=0, act_rowcounts=None, raise_1146_on=None,
+                 inflight_runs=None):
         self.affected = affected
         self.act_rowcounts = list(act_rowcounts or [])
         self.raise_1146_on = raise_1146_on
+        self.inflight_runs = list(inflight_runs or [])
         self.executed = []
         self.acts = 0
         self.commits = 0
@@ -143,6 +151,35 @@ def test_non_optional_table_error_fails_report(monkeypatch, live_db):
     rep = retention.purge_subject("u1", commit=True, batch=100)
     assert not rep["ok"], "基础表缺失=部署错库，必须按事故上报"
     assert rep["tables"]["user_feedback"].get("error")
+
+
+def test_purge_blocked_by_inflight_runs_dry_run(monkeypatch, live_db):
+    """D3 purge quiesce：主体仍有非终态 agent_run → dry-run 也报告拒绝，不进任何表。"""
+    conn = _Conn(affected=5, inflight_runs=[("r1", "running"), ("r2", "suspended")])
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    rep = retention.purge_subject("u1")
+    assert not rep["ok"]
+    assert rep["blocked_by_runs"] == [{"run_id": "r1", "status": "running"},
+                                      {"run_id": "r2", "status": "suspended"}]
+    assert rep["tables"] == {} and conn.acts == 0
+
+
+def test_purge_blocked_by_inflight_runs_commit_raises(monkeypatch, live_db):
+    """commit 路径 fail-closed：in-flight run 存在即 raise，零删除。"""
+    monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
+    conn = _Conn(affected=5, inflight_runs=[("r1", "running")])
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    with pytest.raises(RuntimeError, match="非终态 agent_run"):
+        retention.purge_subject("u1", commit=True)
+    assert conn.acts == 0
+
+
+def test_purge_quiesce_survives_missing_agent_run_table(monkeypatch, live_db):
+    """未铺 schema/022（agent_run 表缺失，1146）→ 视为无 in-flight，照常擦除。"""
+    conn = _Conn(affected=2, raise_1146_on="status IN")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    rep = retention.purge_subject("u1")
+    assert rep["ok"] and rep["dry_run"] and "blocked_by_runs" not in rep
 
 
 def test_cli_purge_user_dry_run(monkeypatch, live_db, capsys):
