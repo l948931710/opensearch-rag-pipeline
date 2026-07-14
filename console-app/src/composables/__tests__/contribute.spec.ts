@@ -3,8 +3,9 @@ import { mount } from '@vue/test-utils'
 import { createTestingPinia } from '@pinia/testing'
 import { useSession } from '@/stores/session'
 import { useContribute, __resetContribute } from '@/composables/useContribute'
-import { contribStateLabel, contribStateTone, gapKindLabel } from '@/lib/kb'
+import { contribStateLabel, contribStateTone, gapKindLabel, fmtTs } from '@/lib/kb'
 import ContribBadge from '@/components/contribute/ContribBadge.vue'
+import MyContributions from '@/components/contribute/MyContributions.vue'
 
 function stubFetch(json: any) {
   vi.stubGlobal('fetch', vi.fn(async () => ({
@@ -36,6 +37,31 @@ describe('lib/kb — 贡献状态/缺口词表', () => {
   it('缺口来源短标', () => {
     expect(gapKindLabel('no_result')).toBe('没有相关文档')
     expect(gapKindLabel('refusal')).toBe('答案不够好')
+  })
+
+  it('fmtTs 时间戳归一（批次α-⑥）：isoformat T 分隔 / MySQL 空格分隔 / 纯日期 / 相对文案', () => {
+    expect(fmtTs('2026-07-11T08:57:17')).toBe('2026-07-11 08:57')   // 裸 slice(0,16) 会留 T
+    expect(fmtTs('2026-07-09 20:00:00')).toBe('2026-07-09 20:00')
+    expect(fmtTs('2026-06-20')).toBe('2026-06-20')
+    expect(fmtTs('刚刚')).toBe('刚刚')
+    expect(fmtTs(null)).toBe('')
+    expect(fmtTs(undefined)).toBe('')
+  })
+})
+
+describe('MyContributions — 时间戳渲染（批次α-⑥）', () => {
+  it('后端 isoformat（带 T）在列表中显示为 YYYY-MM-DD HH:MM', () => {
+    withSession()
+    const { myContribs } = useContribute()
+    myContribs.value = [{
+      contribution_id: 'c9', question: '宿舍门禁卡丢了怎么补办？', content: '联系前台',
+      category_dept: 'admin', author_id: 'u1', author_name: '张三', review_status: 'pending',
+      ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '',
+      created_at: '2026-07-11T08:57:17', reviewed_at: null,
+    }] as never
+    const w = mount(MyContributions)
+    expect(w.text()).toContain('2026-07-11 08:57')
+    expect(w.text()).not.toContain('2026-07-11T')
   })
 })
 
@@ -85,5 +111,42 @@ describe('useContribute', () => {
     const { loadPending, reviewCount } = useContribute()
     await loadPending()
     expect(reviewCount.value).toBe(1)
+  })
+})
+
+// 批次α-⑤：审核动作后兄弟面板联动——此前 accept 只刷 pending+mine、reject 只刷 pending，
+// 「待回答」徽标/统计卡保持旧值，同一问题会被第二人重复回答（staging 2026-07-11 遗留）。
+describe('useContribute — 审核动作联动兄弟面板（批次α-⑤）', () => {
+  const CONTRIB = {
+    contribution_id: 'c1', question: '如何申请密钥', content: '提交工单', category_dept: 'it',
+    author_id: 'u2', author_name: '李', review_status: 'pending', ingestion_status: 'none',
+    state: 'pending', doc_id: null, review_note: '', created_at: '2026-07-01', reviewed_at: null,
+  }
+  function recordFetch(): string[] {
+    const paths: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (p: string) => {
+      paths.push(String(p))
+      return { ok: true, status: 200, json: async () => ({ items: [], summary: null, has_more: false }), text: async () => '{}' }
+    }))
+    return paths
+  }
+
+  it('acceptContribution 成功 → 重拉 pending + mine + gaps（徽标/统计卡即时翻转）', async () => {
+    withSession({ role: 'dept_admin', canManage: true })
+    const paths = recordFetch()
+    await useContribute().acceptContribution(CONTRIB as never)
+    expect(paths.some((p) => p.includes('/accept'))).toBe(true)
+    expect(paths.some((p) => p.includes('/api/kb/contributions/pending'))).toBe(true)
+    expect(paths.some((p) => p.includes('/api/kb/contributions/mine'))).toBe(true)
+    expect(paths.some((p) => p.includes('/api/kb/gaps')), '缺口列表必须同步刷新').toBe(true)
+  })
+
+  it('rejectContribution 成功 → 同样重拉 mine + gaps（审核人=作者时「我的贡献」即时显驳回）', async () => {
+    withSession({ role: 'dept_admin', canManage: true })
+    const paths = recordFetch()
+    await useContribute().rejectContribution(CONTRIB as never, '与现行制度冲突')
+    expect(paths.some((p) => p.includes('/reject'))).toBe(true)
+    expect(paths.some((p) => p.includes('/api/kb/contributions/mine'))).toBe(true)
+    expect(paths.some((p) => p.includes('/api/kb/gaps'))).toBe(true)
   })
 })

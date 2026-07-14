@@ -193,7 +193,10 @@ async function acceptContribution(c: ContributionItem, permissionLevel: 'dept_in
       const r = await apiJson<{ requires_kb_admin_approval?: boolean }>(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({ permission_level: permissionLevel }) })
       // P2-16：dept_admin 采纳「全员公开」→ 后端登记为待审批（不再直通入库），提示放行前提
       if (r?.requires_kb_admin_approval) void notice({ title: '已采纳，等待放行', message: '全员公开的贡献需知识库管理员在「待审批」中放行后才会入库检索。' })
-      await Promise.all([loadPending(), loadMine()])
+      // 批次α-⑤：兄弟面板联动——loadGaps() 让「待回答」的 has_pending_contribution 徽标与
+      // 统计卡即时翻转（此前采纳后缺口列表原样、同一问题会被第二人重复回答）。回首页语义
+      //（offset 缺省 0），不沿用「加载更多」的偏移。
+      await Promise.all([loadPending(), loadMine(), loadGaps()])
     } catch (e: any) { void notice({ title: '采纳失败', message: uploadErrText(e), danger: true }) }
   })
 }
@@ -203,7 +206,9 @@ async function rejectContribution(c: ContributionItem, note: string) {
       const s = useSession()
       if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = pendingContribs.value.filter((x) => x.contribution_id !== c.contribution_id); return }
       await apiJson(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/reject`, { method: 'POST', auth: true, body: JSON.stringify({ note: note || null }) })
-      await loadPending()
+      // 批次α-⑤：驳回同样联动兄弟面板——loadMine()（审核人=作者时「我的贡献」即时显「已驳回」）
+      // + loadGaps()（该问题回到可回答态，徽标翻回）。
+      await Promise.all([loadPending(), loadMine(), loadGaps()])
     } catch (e: any) { void notice({ title: '驳回失败', message: uploadErrText(e), danger: true }) }
   })
 }

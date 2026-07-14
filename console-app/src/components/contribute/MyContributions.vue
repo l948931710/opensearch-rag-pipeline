@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { FileText, RefreshCw } from 'lucide-vue-next'
 import { useContribute } from '@/composables/useContribute'
+import { fmtTs } from '@/lib/kb'
 import LoadError from '@/components/manage/LoadError.vue'
 import ContribBadge from './ContribBadge.vue'
 
@@ -23,7 +24,7 @@ const { myContribs, loadErrors, isBusy, loadMine, retryContribution } = useContr
       >
         <div class="min-w-0 flex-1">
           <div class="truncate text-[13px] font-medium text-foreground">{{ c.question }}</div>
-          <div class="mt-1 text-[11px] text-faint">{{ c.created_at }}<span v-if="c.review_note"> · {{ c.review_note }}</span></div>
+          <div class="mt-1 text-[11px] text-faint">{{ fmtTs(c.created_at) }}<span v-if="c.review_note"> · {{ c.review_note }}</span></div>
         </div>
         <div class="flex shrink-0 items-center gap-1.5">
           <ContribBadge :state="c.state" />

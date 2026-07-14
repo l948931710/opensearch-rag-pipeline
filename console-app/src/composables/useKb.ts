@@ -348,7 +348,11 @@ async function _bulkRun(docsToRun: DocItem[], label: string,
   }
   bulkBusy.value = false
   bulkMsg.value = `${label}完成：成功 ${ok}${fails.length ? `，失败 ${fails.length}` : ''}`
-  if (fails.length) void notice({ title: `${label}部分失败`, message: fails.slice(0, 8).join('\n'), danger: true })
+  // 明细最多列 8 条防弹窗爆屏；超出部分显式声明数量——绝不让「列出的」被误读成「全部失败原因」。
+  if (fails.length) {
+    const more = fails.length > 8 ? `\n……另有 ${fails.length - 8} 篇失败未列出（共 ${fails.length} 篇，逐篇原因见台账状态）` : ''
+    void notice({ title: `${label}部分失败`, message: fails.slice(0, 8).join('\n') + more, danger: true })
+  }
   if (ok) { clearSelectionKeepMsg(); void loadDocs() }   // 成功过 → 清选中 + 权威重拉
 }
 function clearSelectionKeepMsg() { selectedIds.value = new Set() }

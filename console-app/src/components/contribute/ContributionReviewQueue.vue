@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { ClipboardCheck, User, Loader2 } from 'lucide-vue-next'
-import { deptLabel } from '@/lib/kb'
+import { deptLabel, fmtTs } from '@/lib/kb'
 import { useContribute, type ContributionItem } from '@/composables/useContribute'
 import LoadError from '@/components/manage/LoadError.vue'
 import { useDialog } from '@/composables/useDialog'
@@ -45,7 +45,7 @@ async function onReject(c: ContributionItem) {
             <User :size="11" :stroke-width="2" /> {{ c.author_name || c.author_id }}
           </span>
           <span class="text-[11px] text-faint">· {{ deptLabel(c.category_dept) }}</span>
-          <span v-if="c.created_at" class="text-[11px] text-faint">· {{ c.created_at }}</span>
+          <span v-if="c.created_at" class="text-[11px] text-faint">· {{ fmtTs(c.created_at) }}</span>
           <div class="flex-1" />
           <select
             :value="scopeOf(c.contribution_id)" :aria-label="`可见范围：${c.question}`"
