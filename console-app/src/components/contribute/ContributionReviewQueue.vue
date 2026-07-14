@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { ClipboardCheck, User, Loader2 } from 'lucide-vue-next'
+import { useSession } from '@/stores/session'
 import { deptLabel, fmtTs } from '@/lib/kb'
 import { useContribute, type ContributionItem } from '@/composables/useContribute'
 import LoadError from '@/components/manage/LoadError.vue'
@@ -14,6 +15,9 @@ const { promptText } = useDialog()
 
 // 每行选定的可见范围（默认部门公开）
 const scope = ref<Record<string, 'dept_internal' | 'public'>>({})
+// 批次δ-3：kb_admin 视角=孤儿部门兜底队列（作用域由后端裁决，此处只做语义标注）
+const session = useSession()
+const isKbAdminRole = computed(() => session.role === 'kb_admin')
 function scopeOf(id: string): 'dept_internal' | 'public' { return scope.value[id] || 'dept_internal' }
 
 async function onReject(c: ContributionItem) {
@@ -33,6 +37,11 @@ async function onReject(c: ContributionItem) {
         <ClipboardCheck :size="16" :stroke-width="1.75" class="text-st-warn" />
         <span class="text-sm font-semibold text-foreground">贡献审核</span>
         <span class="rounded-full bg-st-warn px-2 py-px text-[11px] font-bold text-white">{{ pendingContribs.length }}</span>
+        <div class="flex-1" />
+        <!-- 批次δ-3：业务采纳/驳回归 dept_admin（业务标准在部门）；kb_admin 队列=仅孤儿部门兜底 -->
+        <span v-if="isKbAdminRole" class="hidden text-xs text-muted-foreground sm:inline" data-testid="contrib-orphan-hint">
+          仅显示暂无部门管理员管辖的部门（兜底）；有管辖的部门由对应部门管理员审核
+        </span>
       </div>
       <div
         v-for="c in pendingContribs" :key="c.contribution_id"

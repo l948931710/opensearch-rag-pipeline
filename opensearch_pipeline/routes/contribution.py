@@ -496,14 +496,33 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
     return KbContributionListResponse(items=[_contrib_item(r) for r in rows[:limit]], has_more=has_more)
 
 
+def _contrib_pending_scope_sql(kb) -> tuple:
+    """贡献审核队列作用域（批次δ-3 拍板：业务采纳/驳回归 dept_admin——业务标准在部门）。
+
+    dept_admin：本部门 category_dept ∈ managed（不变，复用共享 helper）。
+    kb_admin：**仅孤儿部门**（无任何 active dept_admin 管辖的 category_dept）——日常动线上
+    裁决权移交对应 dept_admin；accept/reject 的权限面**不收紧**（kb_admin 保留经 API 的
+    救急兜底通道，与 2026-07-04 access-request「kb_admin 只管入库、后端留救急通道」拍板同构）。
+    贡献专属函数：绝不改 _kb_owner_scope_sql/_kb_can_manage 共享入口（它们被上传/退役/共享/
+    Agent/本体 20+ 处复用，改了=静默收窄 kb_admin 无关模块的全权能力）。
+    category_dept 恒为 15 伞组之一（authorize_upload 白名单校验，子线进不来）——与
+    dept_admin_grant.managed_owner_dept 同枚举域，精确匹配即可，无需伞形展开。
+    """
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    if kb.role == ROLE_KB_ADMIN:
+        return (" AND category_dept NOT IN (SELECT DISTINCT managed_owner_dept"
+                f" FROM {_kb_db()}.dept_admin_grant WHERE is_active=1)"), []
+    return _kb_owner_scope_sql(kb, "category_dept")
+
+
 @router.get("/api/kb/contributions/pending", response_model=KbContributionListResponse)
 def kb_contributions_pending(request: Request, limit: int = 20, offset: int = 0,
                              identity: Optional[Identity] = Depends(current_identity)):
-    """贡献审核队列（部门管理员：本部门 category_dept ∈ managed；kb_admin 全量）。"""
+    """贡献审核队列（dept_admin：本部门；kb_admin：仅孤儿部门兜底——批次δ-3）。"""
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     limit = max(1, min(int(limit or 20), 100)); offset = max(0, int(offset or 0))
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "category_dept")
+    scope_clause, scope_params = _contrib_pending_scope_sql(kb)
     trace_id = get_request_id()
     try:
         from opensearch_pipeline.db import _get_db_conn

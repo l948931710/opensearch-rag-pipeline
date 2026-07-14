@@ -186,15 +186,23 @@ def notify_access_request(owner_dept: str, doc_id: str, requester_depts: str) ->
 
 
 def notify_contribution(category_dept: str, question: str) -> None:
-    """新知识贡献待审核 → 通知归属部门管理员。"""
+    """新知识贡献待审核 → 通知归属部门管理员；孤儿部门（无 dept_admin）→ kb_admin 兜底。
+
+    批次δ-3 顺带修复的既有缺口：此前孤儿部门收件人为空即静默跳过——兜底审核队列既已
+    归 kb_admin（contributions/pending 的孤儿作用域），新单必须有人被叫到，与
+    notify_escalation 的 kb_admin 兜底同款。"""
     if not _enabled():
         return
     try:
         ids = _dept_admin_ids(category_dept)
+        fallback = not ids
+        if fallback:
+            ids = _kb_admin_ids()
         q = (question or "").strip()
         q = q[:40] + ("…" if len(q) > 40 else "")
+        suffix = "（该部门暂无部门管理员，由你兜底审核）" if fallback else ""
         _dispatch(ids, f"【富岭知识库】新知识贡献待审核：「{q}」"
-                       f"（归属 {_dept_label(category_dept)}）。请到控制台「知识贡献」审核采纳。")
+                       f"（归属 {_dept_label(category_dept)}）{suffix}。请到控制台「知识贡献」审核采纳。")
     except Exception as e:   # noqa: BLE001
         logger.warning("admin_notify: contribution 通知失败（忽略）: %s", e)
 
