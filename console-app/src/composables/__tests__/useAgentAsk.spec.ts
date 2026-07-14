@@ -545,3 +545,42 @@ describe('复核批次4（A7）：流中切会话 / 空 chunk / stop 接服务�
     expect(ai.agent?.disconnected).toBe(true)   // 视图断开语义不变，轮询兜底照旧
   })
 })
+
+// ── 批次β F3：运行详情失败可见（修静默吞错死胡同）+ dev-preview 详情 mock ────────────
+describe('批次β F3 — 运行详情失败态与预览 mock', () => {
+  it('详情 5xx → agentRunDetailErrors 置「拉取失败」；恢复 200 → 清除且 detail 落地', async () => {
+    let fail = true
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      (fail ? jsonResp({ detail: 'boom' }, { ok: false, status: 500 }) : jsonResp(runDetail('succeeded')))))
+    const a = useAgentAsk()
+    await a.refreshRunDetail('r1')
+    expect(a.agentRunDetailErrors.value['r1']).toContain('拉取失败')
+    expect(a.agentRunDetails.value['r1']).toBeUndefined()
+    fail = false
+    await a.refreshRunDetail('r1')
+    expect(a.agentRunDetailErrors.value['r1']).toBeUndefined()
+    expect(a.agentRunDetails.value['r1']?.run?.status).toBe('succeeded')
+  })
+
+  it('详情 404/403 → 终态「不可见」文案（停轮询语义，不再自动重试）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({}, { ok: false, status: 404 })))
+    const a = useAgentAsk()
+    await a.refreshRunDetail('rx')
+    expect(a.agentRunDetailErrors.value['rx']).toContain('不可见')
+  })
+
+  it('dev-preview：详情零网络、合成 mock（成功单含最终答案）——?preview 演示不再永久转圈', async () => {
+    setUser('preview', 'employee', 'dev-preview')
+    const spy = vi.fn()
+    vi.stubGlobal('fetch', spy)
+    const a = useAgentAsk()
+    await a.loadAgentRuns(true)                 // 预览列表 mock（零网络）
+    await a.refreshRunDetail('run_demo2')       // 预览详情 mock（零网络）
+    expect(spy).not.toHaveBeenCalled()
+    expect(a.agentRunDetails.value['run_demo2']?.final?.answer_text).toContain('U8')
+    expect(a.agentRunDetails.value['run_demo1']).toBeUndefined()
+    await a.refreshRunDetail('run_demo1')       // 挂起单：带审批指向、无最终答案
+    expect(a.agentRunDetails.value['run_demo1']?.approval?.status).toBe('pending')
+    expect(a.agentRunDetails.value['run_demo1']?.final).toBeNull()
+  })
+})

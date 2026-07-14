@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
-import { Activity, ArrowLeft, Bot, Brain, Loader2, RefreshCw, ShieldAlert, Wrench, X } from 'lucide-vue-next'
+import { Activity, ArrowLeft, Bot, Brain, Loader2, MessageSquare, RefreshCw, ShieldAlert, Wrench, X } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
+import { useAsk } from '@/composables/useAsk'
 import {
   RUN_TERMINAL, agentToolLabel, invocationStatusLabel, invocationStatusTone,
   runStatusLabel, runStatusTone, useAgentAsk, type AgentRunRow, type AgentRunStep,
@@ -16,13 +17,15 @@ import {
 // 「批准≠成功」：invocations 回执逐条展示，uncertain 显式标注并给对账指引。
 const { identity } = storeToRefs(useSession())
 const {
-  agentRuns, agentRunDetails, runCenterOpen, runCenterRunId,
+  agentRuns, agentRunDetails, agentRunDetailErrors, runCenterOpen, runCenterRunId,
   closeRunCenter, loadAgentRuns, refreshRunDetail, ensureRunPolling, withdrawRun, isAgentBusy,
 } = useAgentAsk()
+const { conversations, switchTo } = useAsk()
 const { confirm } = useDialog()
 
 const focusedId = computed(() => runCenterRunId.value)
 const detail = computed(() => (focusedId.value ? agentRunDetails.value[focusedId.value] : undefined))
+const detailError = computed(() => (focusedId.value ? agentRunDetailErrors.value[focusedId.value] || '' : ''))
 const run = computed<AgentRunRow | undefined>(() =>
   detail.value?.run || agentRuns.value.find((r) => r.run_id === focusedId.value))
 const isMineRun = computed(() => {
@@ -53,6 +56,19 @@ function kindIcon(k: string) { return KIND[k]?.icon || Activity }
 
 function ts(v?: string | null): string { return v ? String(v).slice(0, 16) : '—' }
 function shortId(id?: string | null): string { return id ? (id.length > 12 ? id.slice(0, 12) + '…' : id) : '—' }
+/** 列表行降噪（批次β F3）：run 行首选展示所属会话标题（比 run_id 哈希可读得多）；
+ *  会话不在本地（他人 run / 已删 / 换设备）→ 回退哈希。conversation_id 后端一直有返回，此前零利用。 */
+function convOf(convId?: string | null) {
+  return convId ? conversations.value.find((c) => c.id === convId) : undefined
+}
+function rowTitle(r: AgentRunRow): string {
+  return convOf(r.conversation_id)?.title || shortId(r.run_id)
+}
+/** 回到会话：切到该 run 所属对话并收起抽屉（数据后端早就给了 conversation_id，此前无入口）。 */
+function gotoConversation(convId: string) {
+  switchTo(convId)
+  closeRunCenter()
+}
 /** 模型档标注：light=默认档不标（少即是多）；high 用用户语言「深度思考」；未知档原样透出。 */
 function tierLabel(t?: string | null): string { return !t || t === 'light' ? '' : t === 'high' ? '深度思考' : t }
 function pretty(v: unknown): string {
@@ -124,7 +140,11 @@ function stepSummary(s: AgentRunStep): string {
           @click="focusRun(r)"
         >
           <span class="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium" :class="pillCls(runStatusTone(r.status))">{{ runStatusLabel(r.status) }}</span>
-          <span class="font-mono text-[12px] text-foreground">{{ shortId(r.run_id) }}</span>
+          <span
+            class="min-w-0 max-w-[190px] truncate text-[12px] text-foreground"
+            :class="convOf(r.conversation_id) ? 'font-medium' : 'font-mono'"
+            :title="`run ${r.run_id}`" data-testid="run-row-title"
+          >{{ rowTitle(r) }}</span>
           <span v-if="r.agent_profile" class="text-[11.5px] text-faint">{{ r.agent_profile }}</span>
           <span v-if="tierLabel(r.model_profile)" class="text-[11.5px] text-accent-text" data-testid="run-tier">{{ tierLabel(r.model_profile) }}</span>
           <span class="ml-auto text-[11.5px] text-faint">{{ ts(r.started_at) }}</span>
@@ -161,6 +181,12 @@ function stepSummary(s: AgentRunStep): string {
             <template v-if="run?.agent_profile"> · {{ run.agent_profile }}</template>
             <template v-if="tierLabel(run?.model_profile)"> · {{ tierLabel(run?.model_profile) }}</template>
           </div>
+          <button
+            v-if="run?.conversation_id && convOf(run.conversation_id)"
+            type="button" data-testid="run-goto-conversation"
+            class="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-[5px] text-[12px] font-medium text-foreground transition hover:border-border-strong"
+            @click="gotoConversation(run.conversation_id!)"
+          ><MessageSquare :size="12" :stroke-width="1.75" /> 回到会话「{{ convOf(run.conversation_id)?.title }}」</button>
           <p v-if="run?.status === 'failed'" class="mt-1.5 text-[12px] text-muted-foreground">运行失败：可回到对话调整问法重新提问；反复失败请把本页信息反馈管理员。</p>
           <p v-else-if="run?.status === 'suspended'" class="mt-1.5 text-[12px] text-muted-foreground">挂起等待审批：审批通过后自动继续执行；也可撤回终止本次运行。</p>
         </div>
@@ -231,9 +257,18 @@ function stepSummary(s: AgentRunStep): string {
           </div>
         </div>
 
-        <div v-if="!detail" class="rounded-xl border border-border bg-card px-6 py-10 text-center text-sm text-muted-foreground">
+        <!-- 详情失败态（批次β F3）：此前非 404/403 错误被静默吞掉 → 永久转圈死胡同 -->
+        <div v-if="!detail && detailError" class="rounded-xl border border-st-warn/40 bg-card px-6 py-8 text-center" data-testid="run-detail-error">
+          <p class="text-sm font-medium text-foreground">{{ detailError }}</p>
+          <button
+            type="button"
+            class="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong"
+            @click="void refreshRunDetail(focusedId)"
+          ><RefreshCw :size="13" :stroke-width="1.75" /> 重试</button>
+        </div>
+        <div v-else-if="!detail" class="rounded-xl border border-border bg-card px-6 py-10 text-center text-sm text-muted-foreground">
           <Loader2 :size="16" :stroke-width="2" class="mx-auto animate-spin text-faint" />
-          <p class="mt-2">正在加载运行详情…（他人 run 或功能未开时会提示不可见）</p>
+          <p class="mt-2">正在加载运行详情…</p>
         </div>
       </div>
     </div>

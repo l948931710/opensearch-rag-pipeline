@@ -133,6 +133,9 @@ const supported = ref<boolean | null>(null)
 const agentMode = ref(false)                    // kill switch：OFF=旧 RAG 路径（默认）
 const runs = ref<AgentRunRow[]>([])
 const runDetails = ref<Record<string, AgentRunDetail>>({})
+// 详情拉取失败态（批次β F3）：此前非 404/403 错误被静默吞掉 → 详情面永久停在「正在加载…」
+// 且无任何反馈（死胡同）。key=run_id；成功清除。
+const runDetailErrors = ref<Record<string, string>>({})
 const runCenterOpen = ref(false)
 const runCenterRunId = ref('')                  // 运行中心当前聚焦的 run（''=列表）
 const agentStreamActive = ref(false)            // 当前在途流是否 agent（QaView 据此分发 stop）
@@ -523,9 +526,21 @@ function stopRunPolling(runId: string): void {
 }
 async function _pollRunOnce(runId: string): Promise<void> {
   const fp = identityFingerprint()
+  // 预览 mock（批次β F3）：此前 dev-preview 只 mock 了列表、没 mock 详情——?preview 下点开
+  // 详情必打真实 fetch（无后端时 502 被吞）→ 永久转圈，设计演示直接断链。
+  {
+    const s = useSession()
+    if (import.meta.env.DEV && s.token === 'dev-preview') {
+      runDetails.value = { ...runDetails.value, [runId]: _previewRunDetail(runId) }
+      delete runDetailErrors.value[runId]
+      stopRunPolling(runId)
+      return
+    }
+  }
   try {
     const d = await apiJson<AgentRunDetail>(`/api/agent/runs/${encodeURIComponent(runId)}`, { auth: true })
     if (fp !== identityFingerprint()) { stopRunPolling(runId); return }
+    if (runDetailErrors.value[runId]) { const n = { ...runDetailErrors.value }; delete n[runId]; runDetailErrors.value = n }
     runDetails.value = { ...runDetails.value, [runId]: d }
     const st = d?.run?.status || ''
     // 列表行对齐
@@ -547,8 +562,49 @@ async function _pollRunOnce(runId: string): Promise<void> {
     if (RUN_TERMINAL.has(st)) stopRunPolling(runId)
   } catch (e) {
     if (fp !== identityFingerprint()) { stopRunPolling(runId); return }
-    // 404/403（不可见==不存在，或 flag 被关）→ 停轮询；网络错误保留定时器下轮再试
-    if (e instanceof ApiError && (e.status === 404 || e.status === 403)) stopRunPolling(runId)
+    // 404/403（不可见==不存在，或 flag 被关）→ 停轮询并给终态提示；
+    // 其它（网络/5xx）保留定时器下轮再试，但失败要让用户看见（此前静默吞 → 永久转圈死胡同）。
+    if (e instanceof ApiError && (e.status === 404 || e.status === 403)) {
+      stopRunPolling(runId)
+      runDetailErrors.value = { ...runDetailErrors.value, [runId]: '该运行不可见：可能由他人发起、已被清理，或 Agent 功能未开启。' }
+    } else {
+      runDetailErrors.value = { ...runDetailErrors.value, [runId]: '运行详情拉取失败，将自动重试；也可点右上角刷新。' }
+    }
+  }
+}
+
+/** ?preview=kb 的详情 mock：与预览列表(run_demo1/2)呼应——挂起单带审批指向，成功单带步骤/回执/最终答案。 */
+function _previewRunDetail(runId: string): AgentRunDetail {
+  const row = runs.value.find((r) => r.run_id === runId)
+  const base: AgentRunRow = row || { run_id: runId, status: 'succeeded', conversation_id: null, agent_profile: 'default' }
+  if (base.status === 'suspended') {
+    return {
+      run: { ...base, user_id: 'preview' },
+      steps: [
+        { step_no: 1, kind: 'model_call', payload: { text: '用户要求把 PP 刀叉 8寸 的补货量写回 U8。先检索库存与写回规范。' }, tokens_prompt: 812, tokens_completion: 96, created_at: '2026-07-11 09:30:05' },
+        { step_no: 2, kind: 'tool_call', payload: { tool_name: 'knowledge_search', query: 'U8 写回 补货 规范' }, created_at: '2026-07-11 09:30:09' },
+        { step_no: 3, kind: 'approval', payload: { tool_name: 'u8_writeback', reason: '高风险写操作需审批' }, created_at: '2026-07-11 09:30:14' },
+      ],
+      invocations: [
+        { invocation_id: 'pv_inv1', run_id: runId, step_no: 2, tool_name: 'knowledge_search', status: 'succeeded', started_at: '2026-07-11 09:30:09', ended_at: '2026-07-11 09:30:11' },
+      ],
+      approval: { request_id: 'ap1', tool_name: 'u8_writeback', status: 'pending', approver_scope: 'production', render_summary: 'u8_writeback(item=PP 刀叉 8寸, qty=120)', expires_at: '2026-07-15 20:00', created_at: '2026-07-11 09:30:14', decided_at: null },
+      final: null,
+    }
+  }
+  return {
+    run: { ...base, user_id: 'preview' },
+    steps: [
+      { step_no: 1, kind: 'model_call', payload: { text: '查询 12oz 纸杯库存并按规范写回补货单。' }, tokens_prompt: 903, tokens_completion: 122, created_at: '2026-07-10 16:02:04' },
+      { step_no: 2, kind: 'tool_call', payload: { tool_name: 'knowledge_search', query: '12oz 纸杯 库存 补货规范' }, created_at: '2026-07-10 16:02:08' },
+      { step_no: 3, kind: 'tool_call', payload: { tool_name: 'u8_writeback', item: '纸杯 12oz', qty: 40 }, created_at: '2026-07-10 16:02:41' },
+    ],
+    invocations: [
+      { invocation_id: 'pv_inv2', run_id: runId, step_no: 2, tool_name: 'knowledge_search', status: 'succeeded', started_at: '2026-07-10 16:02:08', ended_at: '2026-07-10 16:02:10' },
+      { invocation_id: 'pv_inv3', run_id: runId, step_no: 3, tool_name: 'u8_writeback', status: 'succeeded', started_at: '2026-07-10 16:02:41', ended_at: '2026-07-10 16:02:52' },
+    ],
+    approval: { request_id: 'ap0', tool_name: 'u8_writeback', status: 'approved', approver_scope: 'production', render_summary: 'u8_writeback(item=纸杯 12oz, qty=40)', expires_at: '2026-07-12 18:30', created_at: '2026-07-10 16:02:20', decided_at: '2026-07-10 16:02:38' },
+    final: { message_id: 'pv_m2', answer_text: '已按规范把补货单写回 U8：纸杯 12oz × 40，单据号 20260710-114；库存联动已确认。', answered_at: '2026-07-10 16:03:10' },
   }
 }
 /** 确保某 run 在轮询（5s 间隔，终态自动停）。挂起卡挂载/断流/运行中心聚焦时调用。 */
@@ -626,6 +682,7 @@ export function useAgentAsk() {
     // 运行中心
     agentRuns: runs,
     agentRunDetails: runDetails,
+    agentRunDetailErrors: runDetailErrors,
     runCenterOpen,
     runCenterRunId,
     openRunCenter,
@@ -646,6 +703,7 @@ function _resetAgentAskState(changedUser: boolean): void {
   supported.value = null                        // 重探测（角色/flag 可能已变）
   runs.value = []
   runDetails.value = {}
+  runDetailErrors.value = {}
   runCenterOpen.value = false
   runCenterRunId.value = ''
   inflight.value = new Set()

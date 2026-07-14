@@ -4,7 +4,7 @@ import { createTestingPinia } from '@pinia/testing'
 import { setActivePinia } from 'pinia'
 import { reactive } from 'vue'
 import type { Identity } from '@/stores/session'
-import type { ChatMessage } from '@/composables/useAsk'
+import { useAsk, __resetAsk, type ChatMessage } from '@/composables/useAsk'
 import { useAgentAsk, __resetAgentAsk } from '@/composables/useAgentAsk'
 import { useDialog } from '@/composables/useDialog'
 import AgentFlow from '@/components/qa/AgentFlow.vue'
@@ -195,5 +195,67 @@ describe('Composer — 深度思考 × Agent 模式并存（后端映射模型�
     expect(w.find('[data-testid="agent-toggle"]').exists()).toBe(true)   // 两开关并存
     await think.trigger('click')
     expect(w.emitted('toggle-thinking')).toBeTruthy()
+  })
+})
+
+// ── 批次β F3：运行中心降噪（会话标题行/回到会话/详情失败态）────────────────────────
+describe('AgentRunCenter — 列表降噪 + 回会话 + 详情失败态（批次β F3）', () => {
+  async function mountCenter(setup: (a: ReturnType<typeof useAgentAsk>, ask: ReturnType<typeof useAsk>) => void) {
+    const pinia = activate(identity())
+    const AgentRunCenter = (await import('@/components/qa/AgentRunCenter.vue')).default
+    const a = useAgentAsk()
+    const ask = useAsk()
+    a.runCenterOpen.value = true
+    setup(a, ask)
+    return mount(AgentRunCenter, { global: { plugins: [pinia], stubs: STUBS } })
+  }
+  afterEach(() => { __resetAsk() })   // 本组种了会话，别泄给其它组
+
+  it('列表行：conversation_id 命中本地会话 → 显示会话标题；未命中 → 回退 run_id 哈希', async () => {
+    const w = await mountCenter((a, ask) => {
+      ask.conversations.value = [{ id: 'c1', title: '如何申请生产环境的访问密钥？', messages: [], qaSession: '', updatedAt: 0 }]
+      a.agentRuns.value = [
+        { run_id: 'run_aaaaaaaaaaaaaaaa', status: 'succeeded', conversation_id: 'c1', agent_profile: 'default', started_at: '2026-07-11 09:00:00' },
+        { run_id: 'run_bbbbbbbbbbbbbbbb', status: 'failed', conversation_id: 'zz_gone', agent_profile: 'default', started_at: '2026-07-10 08:00:00' },
+      ] as never
+    })
+    const titles = w.findAll('[data-testid="run-row-title"]').map((n) => n.text())
+    expect(titles[0]).toBe('如何申请生产环境的访问密钥？')
+    expect(titles[1]).toContain('run_bbbbbbbb')   // 哈希回退（截断）
+  })
+
+  it('详情：回到会话按钮 → switchTo 该会话并收起抽屉', async () => {
+    const w = await mountCenter((a, ask) => {
+      ask.conversations.value = [{ id: 'c1', title: '密钥申请', messages: [], qaSession: '', updatedAt: 0 }]
+      a.runCenterRunId.value = 'r1'
+      a.agentRunDetails.value = { r1: { run: { run_id: 'r1', status: 'succeeded', conversation_id: 'c1' }, steps: [], invocations: [], approval: null } } as never
+    })
+    const btn = w.find('[data-testid="run-goto-conversation"]')
+    expect(btn.exists()).toBe(true)
+    expect(btn.text()).toContain('密钥申请')
+    await btn.trigger('click')
+    expect(useAsk().activeId.value).toBe('c1')
+    expect(useAgentAsk().runCenterOpen.value).toBe(false)
+  })
+
+  it('回会话降级负例：conversation_id 不在本地会话 store → 按钮不渲染（诚实降级）', async () => {
+    const w = await mountCenter((a, ask) => {
+      ask.conversations.value = []   // 本地无该会话（他人 run / 已删 / 换设备）
+      a.runCenterRunId.value = 'r1'
+      a.agentRunDetails.value = { r1: { run: { run_id: 'r1', status: 'succeeded', conversation_id: 'c_gone' }, steps: [], invocations: [], approval: null } } as never
+    })
+    expect(w.find('[data-testid="run-goto-conversation"]').exists()).toBe(false)
+  })
+
+  it('详情失败态：detailError 置位 → 错误卡 + 重试按钮（不再永久转圈）', async () => {
+    const w = await mountCenter((a) => {
+      a.runCenterRunId.value = 'r9'
+      a.agentRunDetailErrors.value = { r9: '运行详情拉取失败，将自动重试；也可点右上角刷新。' }
+    })
+    const err = w.find('[data-testid="run-detail-error"]')
+    expect(err.exists()).toBe(true)
+    expect(err.text()).toContain('拉取失败')
+    expect(err.text()).toContain('重试')
+    expect(w.text()).not.toContain('正在加载运行详情')
   })
 })
