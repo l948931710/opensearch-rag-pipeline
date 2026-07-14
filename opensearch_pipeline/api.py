@@ -62,6 +62,7 @@ from opensearch_pipeline.answer_flow import (
 )
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.db import DBPoolExhausted
+from opensearch_pipeline.http_hardening import HttpsRedirectMiddleware
 from opensearch_pipeline.request_context import (
     RequestIdMiddleware,
     get_request_id,
@@ -180,6 +181,15 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# HTTPS 硬化（rag.fulingplastics.com.cn 域名接入收口）：RAG_FORCE_HTTPS_HOSTS 逗号分隔域名
+# 白名单，默认空 = off。scheme 只认 CLB 注入的 X-Forwarded-Proto（缺失一律放行——直连 IP 的
+# 小程序/钉钉回调不受影响），生效前提与重定向环边界见 http_hardening.py 模块 docstring。
+_force_https_hosts = [
+    h for h in os.environ.get("RAG_FORCE_HTTPS_HOSTS", "").split(",") if h.strip()
+]
+if _force_https_hosts:
+    app.add_middleware(HttpsRedirectMiddleware, hosts=_force_https_hosts)
 
 # 请求级 correlation id（统一 trace，OBS-trace）：纯 ASGI 中间件，入站读/生成 X-Request-Id 存入
 # ContextVar（端点与嵌套 retriever/llm_generator 调用可见）、响应头回写。最后 add → 最外层 → 最先跑。
