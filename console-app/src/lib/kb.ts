@@ -47,6 +47,11 @@ export const ROLE_LABEL: Record<string, string> = {
   kb_admin: '知识库管理员', dept_admin: '部门管理员', employee: '员工',
 }
 
+// 时间戳显示归一 → `YYYY-MM-DD HH:MM`。后端有两种源：MySQL str(datetime) 空格分隔、
+// contribution.py isoformat() T 分隔——裸 `.slice(0,16)` 对后者留 T（'2026-06-20T10:15'），
+// 必须先换空格再截。纯日期（'2026-06-20'）或相对文案（'刚刚'）原样通过。
+export const fmtTs = (v: string | null | undefined): string => (v || '').replace('T', ' ').slice(0, 16)
+
 // 文档状态徽章 → 色调键（组件据此取 st-* 颜色）。未命中 → muted。
 // 色彩语义分家（P2 同色复用修复）：待审核=良性管道等待 → 与排队中同 queue 族（原与
 // 未入索引同蓝，异常/正常不可分）；已隔离=安全隔离 → 专属 hold 紫（PII 隔离≠工作流

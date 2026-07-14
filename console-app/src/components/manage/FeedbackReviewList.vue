@@ -27,7 +27,18 @@ const router = useRouter()
 const route = useRoute()
 function gotoDoc(d: { doc_id: string; title?: string }) {
   void router?.replace({ query: { ...(route?.query || {}), tab: 'docs', q: d.title || d.doc_id } })
-  setTimeout(() => document.getElementById('kb-sec-ledger')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 400)
+  scrollWhenReady('kb-sec-ledger')
+}
+/** 等目标元素真挂载后再滚（切 tab 后 DocTable 渲染时序不定，固定 400ms 延时慢机会静默落空）。
+ *  rAF 逐帧探测，1.5s 截止后放弃（元素仍不存在 = tab 没切成，滚了也没意义）。 */
+function scrollWhenReady(id: string, deadlineMs = 1500) {
+  const t0 = performance.now()
+  const tick = () => {
+    const el = document.getElementById(id)
+    if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); return }
+    if (performance.now() - t0 < deadlineMs) requestAnimationFrame(tick)
+  }
+  requestAnimationFrame(tick)
 }
 </script>
 
