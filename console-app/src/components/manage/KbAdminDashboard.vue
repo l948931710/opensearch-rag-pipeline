@@ -23,14 +23,18 @@ import ReviewTaskQueue from './ReviewTaskQueue.vue'
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
 // 全部真实口径，无对应数据则如实显空 —— 绝不造数。
-const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats, loadGovernance, loadInsights, loadErrors } = useKb()
+const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, escalations, reviewTasks, loadStats, loadGovernance, loadInsights, loadErrors } = useKb()
 
-// 「待你处理」置顶条（P2）：差评复核是看板里唯一的行动区，却沉在页尾 ~2900px 深——
-// 有未处理差评时在首屏给一枚计数 chip，点击平滑定位；清零即隐，与文档管理 tab 的待办条同语言。
-// 计数来源区分「0 条」与「加载失败」（staging 2026-07-11 P1）：接口真错误时挂「加载失败」chip
+// 「待你处理」置顶条（P2，批次α-① 扩为三队列聚合）：页尾 ~2900px 深处实际有三个行动队列——
+// 差评复核 / 转人工工单 / 入库复审（安全网信号），此前 chip 只算差评（覆盖率 40%）。
+// 每队列一枚计数 chip，点击平滑定位到对应区块；清零即隐，与文档管理 tab 的待办条同语言。
+// 计数来源区分「0 条」与「加载失败」（staging 2026-07-11 P1）：差评接口真错误时挂「加载失败」chip
 // 而非整条消失——0=真没有，失败=数量未知，两者对管理员是完全不同的信号。
+// escalations/reviewTasks 初始为 null（未加载/加载中）——(x || []) 兜底后计 0，不误亮。
 const feedbackOpenCount = computed(() => (feedbackReview.value || []).filter((x) => !x.handled).length)
 const feedbackLoadFailed = computed(() => !!loadErrors.value['feedbackReview'])
+const escalationOpenCount = computed(() => (escalations.value || []).filter((x) => !x.closed).length)
+const reviewTaskOpenCount = computed(() => (reviewTasks.value || []).filter((x) => !x.closed).length)
 function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
 // 资产概览卡的加载态：stats 尚未返回且无错误 → 显骨架（避免闪 0）。
 const statsLoading = computed(() => !kbStats.value && !loadErrors.value['stats'])
@@ -181,7 +185,7 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
     <!-- 待你处理：有未处理差评时首屏可见、一键直达（看板唯一行动区在页尾，不能只靠滚动发现）；
          差评复核接口真错误时同样置顶显「加载失败」——数量未知 ≠ 0 条，点击直达区块内重试。 -->
     <div
-      v-if="feedbackOpenCount || feedbackLoadFailed"
+      v-if="feedbackOpenCount || feedbackLoadFailed || escalationOpenCount || reviewTaskOpenCount"
       class="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-panel/60 px-4 py-3"
     >
       <span class="text-[12.5px] font-semibold text-foreground">待你处理</span>
@@ -191,6 +195,18 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
         class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-[12px] font-medium text-st-fail transition hover:border-border-strong"
         @click="scrollToSec('kb-dash-feedback')"
       >差评未处理 <b class="font-mono tabular-nums">{{ feedbackOpenCount }}</b></button>
+      <button
+        v-if="escalationOpenCount"
+        type="button" data-testid="escalation-open-chip"
+        class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-[12px] font-medium text-st-busy transition hover:border-border-strong"
+        @click="scrollToSec('kb-dash-escalations')"
+      >转人工待答复 <b class="font-mono tabular-nums">{{ escalationOpenCount }}</b></button>
+      <button
+        v-if="reviewTaskOpenCount"
+        type="button" data-testid="review-task-open-chip"
+        class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-[12px] font-medium text-st-fail transition hover:border-border-strong"
+        @click="scrollToSec('kb-dash-review-tasks')"
+      >入库复审待处理 <b class="font-mono tabular-nums">{{ reviewTaskOpenCount }}</b></button>
       <button
         v-if="feedbackLoadFailed"
         type="button" data-testid="feedback-load-failed-chip"
@@ -312,10 +328,10 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       <p :class="SUBHEAD" class="mt-4">差评复核 · 逐条（引用了库内文档）</p>
       <FeedbackReviewList />
       <!-- 转人工工单：全库队列（含无引用文档的 NO_RESULT 求助 = 语料缺口，本就归 kb_admin） -->
-      <p :class="SUBHEAD" class="mt-4">转人工工单 · 待人工答复（全库）</p>
+      <p id="kb-dash-escalations" :class="SUBHEAD" class="mt-4 scroll-mt-4">转人工工单 · 待人工答复（全库）</p>
       <EscalationQueue />
       <!-- 入库复审任务：spot_checker 权限抽查等安全网登记（P2-33 消费端，kb_admin 专属） -->
-      <p :class="SUBHEAD" class="mt-4">入库复审 · 安全网登记的人工任务</p>
+      <p id="kb-dash-review-tasks" :class="SUBHEAD" class="mt-4 scroll-mt-4">入库复审 · 安全网登记的人工任务</p>
       <ReviewTaskQueue />
     </section>
 

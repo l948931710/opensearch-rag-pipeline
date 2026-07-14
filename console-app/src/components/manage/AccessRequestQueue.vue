@@ -8,7 +8,19 @@ import { useDialog } from '@/composables/useDialog'
 // 授权申请队列（审批人侧，Phase C）：其他部门申请检索本部门文档 → 由文档所属部门管理员审批。
 // 与「待审批队列」（上传放行，橙头）区分：此处绿头。数据空时整块不渲染（无后端 = 自然隐藏，不造占位噪声）。
 const { accessRequests, isBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
-const { promptText } = useDialog()
+const { promptText, confirm } = useDialog()
+
+// 授权=立即放行跨部门检索——补齐与「驳回」对称的确认（审批面此前唯二裸奔的写操作之一）。
+// 确认落在组件层：useKb.approveAccess 保持「调用即执行」，其直调单测不受影响。
+async function onApprove(d: AccessRequestItem) {
+  const ok = await confirm({
+    title: '授权跨部门检索',
+    message: `授权「${d.requester_name || d.requester_dept}」（${deptLabel(d.requester_dept)}）检索《${d.doc_title}》？授权后该部门成员即可检索此文档；如需收回，可随时在「文档管理 → 授权治理」撤销。`,
+    confirmText: '授权',
+  })
+  if (!ok) return
+  void approveAccess(d)
+}
 
 async function onReject(d: AccessRequestItem) {
   const reason = await promptText({ title: '驳回授权申请', message: `驳回「${d.requester_name || d.requester_dept}」对《${d.doc_title}》的检索授权申请？`, placeholder: '驳回原因（可空，将通知申请人）', confirmText: '驳回', danger: true })
@@ -56,7 +68,7 @@ async function onReject(d: AccessRequestItem) {
         <button
           type="button"
           class="inline-flex items-center justify-center gap-1 self-start rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-          :disabled="isBusy(`acc:${d.id}`)" @click="approveAccess(d)"
+          :disabled="isBusy(`acc:${d.id}`)" @click="onApprove(d)"
         ><Loader2 v-if="isBusy(`acc:${d.id}`)" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(`acc:${d.id}`) ? '授权中…' : '授权' }}</button>
       </div>
     </div>

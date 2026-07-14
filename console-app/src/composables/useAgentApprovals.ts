@@ -56,9 +56,17 @@ async function loadAgentApprovals(force = false) {
   const s = useSession()
   if (!s.identity?.canManage) { items.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
+    // 预览 mock：一条未过期 + 一条已过期——固定日历日期会随真实时间腐坏（曾致两卡全过期，
+    // 预览再也演示不了正常审批态），改相对 Date.now() 生成，顺带演示「过期单禁处置」态。
+    const _fmt = (d: Date) => {
+      const p = (n: number) => String(n).padStart(2, '0')
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+    }
+    const _in2d = _fmt(new Date(Date.now() + 2 * 86_400_000))
+    const _2hAgo = _fmt(new Date(Date.now() - 2 * 3_600_000))
     items.value = [
-      { request_id: 'ap1', run_id: 'r1', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0', proposed_args: { qty: 120, item: 'PP 刀叉 8寸' }, args_digest: 'd', render_summary: 'u8_writeback(item, qty)', requested_by: 'user_wang', requested_dept: 'production', approver_scope: 'production', status: 'pending', expires_at: '2026-07-12 20:00', created_at: '2026-07-09 20:00', decided_at: null },
-      { request_id: 'ap2', run_id: 'r2', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0', proposed_args: { qty: 40, item: '纸杯 12oz' }, args_digest: 'd', render_summary: 'u8_writeback(item, qty)', requested_by: 'user_li', requested_dept: 'production', approver_scope: 'production', status: 'pending', expires_at: '2026-07-12 18:30', created_at: '2026-07-09 18:30', decided_at: null },
+      { request_id: 'ap1', run_id: 'r1', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0', proposed_args: { qty: 120, item: 'PP 刀叉 8寸' }, args_digest: 'd', render_summary: 'u8_writeback(item, qty)', requested_by: 'user_wang', requested_dept: 'production', approver_scope: 'production', status: 'pending', expires_at: _in2d, created_at: '2026-07-09 20:00', decided_at: null },
+      { request_id: 'ap2', run_id: 'r2', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0', proposed_args: { qty: 40, item: '纸杯 12oz' }, args_digest: 'd', render_summary: 'u8_writeback(item, qty)', requested_by: 'user_li', requested_dept: 'production', approver_scope: 'production', status: 'pending', expires_at: _2hAgo, created_at: '2026-07-09 18:30', decided_at: null },
     ]
     supported.value = true
     return

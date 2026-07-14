@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, ClipboardCheck, Lightbulb, Fingerprint } from 'lucide-vue-next'
@@ -62,8 +62,14 @@ function resolveTab(t: unknown): { tab: Tab; view?: 'pending' | 'history' } | nu
   if (r) { activeTab.value = r.tab; if (r.view) approvalsView.value = r.view }
   if (activeTab.value === 'approvals' && route?.query?.view === 'history') approvalsView.value = 'history'
 }
+// 文档管理 tab 的专属筛选键（DocTable 写入 URL / 挂载时恢复）。切到其他 tab 时从 URL 摘除——
+// 深链/分享只携带当前 tab 的状态（staging 2026-07-11 §3-P3「审批 URL 残留 q=」）。白名单式：
+// 只清这六键，绝不触碰 debug/preview/corpId 等全局键。切回 docs 时筛选仍在（useKb 模块态保持），
+// 仅「切走再切回后 F5」不再从 URL 恢复——换取审批深链不携带无关搜索词。
+const DOC_URL_KEYS = ['scope', 'q', 'badge', 'perm', 'owner', 'cited'] as const
 watch([activeTab, approvalsView], ([t, v]) => {
   const q: Record<string, unknown> = { ...(route?.query || {}) }
+  if (t !== 'docs') for (const k of DOC_URL_KEYS) delete q[k]
   if (t === 'dash') delete q.tab; else q.tab = t
   if (t === 'approvals' && v === 'history') q.view = 'history'; else delete q.view
   void router?.replace({ query: q as Record<string, string> })
@@ -117,6 +123,23 @@ onMounted(async () => {
     if (!hotQuestions.value.length) void loadHotQuestions()
   }
 })
+
+// ── 审批/行动队列轻轮询（批次α-②）：此前全部 load-once——挂着管理台整个会话都看不到新单
+// （另一位管理员处置了同一单也不知情）。每 60s 补拉三个审批队列：非 force 调用天然复用各 loader
+// 的 30s staleness 门与身份/角色守卫（与预载、LoadError 手动重试互相去重，语义不变）；页签
+// 后台化（visibilityState）与非管理员不打。只碰审批类队列，绝不触达 loadDocs——
+// 「切子 tab 不整树重挂载：my-docs 恰一次」的硬门断言保持成立。
+const QUEUE_POLL_MS = 60_000
+let queuePollTimer: number | undefined
+function pollQueues() {
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  if (!canManage.value) return
+  void loadApprovals()
+  void loadAccessRequests()
+  void loadAgentApprovals()
+}
+onMounted(() => { queuePollTimer = window.setInterval(pollQueues, QUEUE_POLL_MS) })
+onUnmounted(() => { if (queuePollTimer !== undefined) window.clearInterval(queuePollTimer) })
 </script>
 
 <template>

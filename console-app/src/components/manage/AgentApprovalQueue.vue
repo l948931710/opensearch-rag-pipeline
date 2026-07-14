@@ -41,8 +41,17 @@ function relExpire(v: string | null): string {
   if (hr < 48) return `${hr} 小时后过期`
   return `${Math.round(hr / 24)} 天后过期`
 }
+/** 已过期判定：卡头承诺「过期未审视同拒绝」，故过期单禁用 批准/改参/驳回（放行与留档处置都无意义），
+ *  只留 终止/撤回 清卡。解析失败按未过期处理（fail-open：时区/格式异常不误伤成禁批，交服务端裁决）。 */
+function isExpired(d: AgentApprovalItem): boolean {
+  if (!d.expires_at) return false
+  const t = Date.parse(String(d.expires_at).replace(' ', 'T'))
+  return !Number.isNaN(t) && t <= Date.now()
+}
+const EXPIRED_TITLE = '已过期：超时视同拒绝，无需处置（可「终止」清卡）'
 
 async function onApprove(d: AgentApprovalItem) {
+  if (isExpired(d)) return   // 按钮已禁用；兜底防其它路径触发
   const ok = await confirm({
     title: '批准执行',
     message: `批准 Agent 执行「${d.tool_name}」？参数：${argsPreview(d)}。批准后立即续跑执行，操作不可撤回。`,
@@ -55,6 +64,7 @@ async function onApprove(d: AgentApprovalItem) {
 /** 第四处置「修改后批准」：编辑脱敏参数 JSON 后以 kind=edited 放行——服务端重过
  *  jsonschema+Policy、按改后参数算 digest（重放安全），执行的就是你看到的这份参数。 */
 async function onEdited(d: AgentApprovalItem) {
+  if (isExpired(d)) return   // 同 onApprove：过期单不接受任何放行形态
   const { notice } = useDialog()
   const raw = await promptText({
     title: '修改参数后批准',
@@ -78,6 +88,7 @@ async function onEdited(d: AgentApprovalItem) {
 }
 
 async function onReject(d: AgentApprovalItem) {
+  if (isExpired(d)) return   // 与 onApprove/onEdited 同款兜底：过期即视同拒绝，无需留档驳回
   const reason = await promptText({
     title: '驳回并反馈',
     message: `驳回「${d.tool_name}」的执行申请？理由会回喂给 Agent 换方案续答（不执行该操作）。`,
@@ -135,7 +146,7 @@ async function onTerminate(d: AgentApprovalItem) {
             <span>发起 {{ d.requested_by }}</span>
             <span v-if="d.approver_scope">· 归属 {{ deptLabel(d.approver_scope) }}</span>
             <span v-if="d.created_at">· {{ ts(d.created_at) }}</span>
-            <span v-if="d.expires_at" class="inline-flex items-center gap-0.5" :title="`${d.expires_at} 过期（超时视同拒绝）`"><Timer :size="11" :stroke-width="2" /> {{ relExpire(d.expires_at) }}</span>
+            <span v-if="d.expires_at" class="inline-flex items-center gap-0.5" :class="isExpired(d) ? 'font-medium text-st-fail' : ''" :title="`${d.expires_at} 过期（超时视同拒绝）`"><Timer :size="11" :stroke-width="2" /> {{ relExpire(d.expires_at) }}</span>
           </div>
         </div>
 
@@ -151,22 +162,22 @@ async function onTerminate(d: AgentApprovalItem) {
           v-if="!isMine(d)"
           type="button"
           class="inline-flex items-center justify-center gap-1 self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
-          :disabled="isAgentApprovalBusy(`agent:${d.request_id}`)"
-          title="修改参数后批准执行（重新过校验与策略）"
+          :disabled="isExpired(d) || isAgentApprovalBusy(`agent:${d.request_id}`)"
+          :title="isExpired(d) ? EXPIRED_TITLE : '修改参数后批准执行（重新过校验与策略）'"
           @click="onEdited(d)"
         >改参</button>
         <button
           type="button"
           class="inline-flex items-center justify-center gap-1 self-start rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
-          :disabled="isMine(d) || isAgentApprovalBusy(`agent:${d.request_id}`)"
-          :title="isMine(d) ? '职责分离：不能审批自己发起的申请' : ''"
+          :disabled="isMine(d) || isExpired(d) || isAgentApprovalBusy(`agent:${d.request_id}`)"
+          :title="isMine(d) ? '职责分离：不能审批自己发起的申请' : isExpired(d) ? EXPIRED_TITLE : ''"
           @click="onReject(d)"
         >驳回</button>
         <button
           type="button"
           class="inline-flex items-center justify-center gap-1 self-start rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-          :disabled="isMine(d) || isAgentApprovalBusy(`agent:${d.request_id}`)"
-          :title="isMine(d) ? '职责分离：不能审批自己发起的申请' : ''"
+          :disabled="isMine(d) || isExpired(d) || isAgentApprovalBusy(`agent:${d.request_id}`)"
+          :title="isMine(d) ? '职责分离：不能审批自己发起的申请' : isExpired(d) ? EXPIRED_TITLE : ''"
           @click="onApprove(d)"
         ><Loader2 v-if="isAgentApprovalBusy(`agent:${d.request_id}`)" :size="13" :stroke-width="2" class="animate-spin" />批准</button>
       </div>

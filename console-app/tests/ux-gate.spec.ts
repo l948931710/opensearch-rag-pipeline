@@ -260,11 +260,17 @@ test.describe('UX 硬门 — AI 助手交互', () => {
 test.describe('UX 硬门 — 审批中心', () => {
   const MANAGE_ROUTE = '/console/manage?token=e2e-fake-token';
 
+  // expires_at 用相对时间：固定日历日期会腐坏成「已过期」——过期单禁处置上线后，
+  // 「批准有二次确认」用例点的就是这条数据的批准按钮，硬编码过期日期会让它无预警变红。
+  const fmtTs = (d: Date) => {
+    const p = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  };
   const AREQ = (over: Record<string, unknown> = {}) => ({
     request_id: 'ap1', run_id: 'r1', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0',
     proposed_args: { qty: 120, item: 'PP 刀叉 8寸' }, args_digest: 'd',
     render_summary: 'u8_writeback(item, qty)', requested_by: 'user_wang', requested_dept: 'production',
-    approver_scope: 'production', status: 'pending', expires_at: '2026-07-12 20:00:00',
+    approver_scope: 'production', status: 'pending', expires_at: fmtTs(new Date(Date.now() + 3 * 86_400_000)),
     created_at: '2026-07-09 20:00:00', decided_at: null, ...over,
   });
   const ACCESS_REQ = (over: Record<string, unknown> = {}) => ({
@@ -389,6 +395,39 @@ test.describe('UX 硬门 — 审批中心', () => {
     expect(body.run_id).toBe('r1');
     expect(body.outcome.kind).toBe('approved');
     expect(body.idempotency_key).toBe('ap1:approved');
+  });
+
+  test('批次α-③：上传审批「通过」有二次确认——确认前零请求，确认后 POST /api/kb/approve 且队列清空', async ({ page }) => {
+    await mockManage(page, { role: 'kb_admin', uploads: [UPLOAD_REQ()], agent: 404 });
+    const posts: string[] = [];
+    await page.route('**/api/kb/approve', (r) => {
+      posts.push(r.request().postData() || '');
+      return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+    });
+    await page.goto(MANAGE_ROUTE);
+    await approvalsTab(page).click();
+    await expect(page.getByText('待审批队列')).toBeVisible();
+    await page.getByRole('button', { name: '通过', exact: true }).click();
+    const dlg = page.locator('[role="alertdialog"], [role="dialog"]');
+    await expect(dlg, '放行入库与退役/Agent 批准同级，必须有二次确认').toBeVisible();
+    expect(posts.length, '确认前不得发请求（取消=零副作用）').toBe(0);
+    await dlg.getByRole('button', { name: /通过并放行/ }).click();
+    await expect(page.getByTestId('approval-empty')).toBeVisible();
+    expect(posts.length).toBe(1);
+  });
+
+  test('批次α-⑦：文档管理筛选键不残留到审批深链；切回 docs 筛选（store 态）仍在', async ({ page }) => {
+    await mockManage(page, {});
+    await page.goto(MANAGE_ROUTE);
+    const zone = page.locator('[aria-label="管理台分区"]');
+    await zone.getByRole('tab', { name: /文档管理/ }).click();
+    await page.getByPlaceholder('搜索文档名…').fill('营销规范');
+    await expect(page, 'DocTable 防抖后把 q 写回 URL（既有机制）').toHaveURL(/[?&]q=/);
+    await approvalsTab(page).click();
+    await expect(page).toHaveURL(/tab=approvals/);
+    await expect(page, '审批深链不携带文档筛选词（白名单摘除）').not.toHaveURL(/[?&]q=/);
+    await zone.getByRole('tab', { name: /文档管理/ }).click();
+    await expect(page.getByPlaceholder('搜索文档名…'), '切回 docs：筛选靠 useKb 模块态保持').toHaveValue('营销规范');
   });
 
   test('RAG_AGENT_ENABLE 未开（端点 404）→ Agent 区块不出现，审批 tab 常驻且角标只数 kb 队列', async ({ page }) => {

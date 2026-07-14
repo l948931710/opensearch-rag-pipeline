@@ -140,4 +140,28 @@ describe('KbAdminDashboard「待你处理」chip — 区分「0 条」与「加�
     expect(w.text()).toContain('差评未处理')
     expect(w.find('[data-testid="feedback-load-failed-chip"]').exists()).toBe(false)
   })
+
+  it('批次α-①：转人工/入库复审有未处理 → 各自计数 chip 出现（只计未关单）', () => {
+    const pinia = activePinia(identity())
+    const kb = useKb()
+    kb.feedbackReview.value = []                                  // 差评清零：chip 条仍因另两队列出现
+    kb.escalations.value = [
+      { ticket_id: 'e1', message_id: 'm1', question: '首件检验做哪些项目？', ai_answer_excerpt: '',
+        user_name: '王强', user_dept: '生产部', created_at: '2026-07-10 09:00', age_days: 4,
+        status: 'PENDING', closed: false, expert_answer: '', assigned_user_name: '', docs: [] },
+      { ticket_id: 'e2', message_id: 'm2', question: '已结单', ai_answer_excerpt: '',
+        user_name: '李敏', user_dept: '外贸部', created_at: '2026-07-01 09:00', age_days: 13,
+        status: 'RESOLVED', closed: true, expert_answer: 'done', assigned_user_name: '张', docs: [] },
+    ] as never
+    kb.reviewTasks.value = [
+      { task_id: 't1', doc_id: 'D9', title: '员工薪酬发放办法', review_type: 'PERM_MISMATCH',
+        review_reason: '实时权限比 LLM 建议更宽松', owner_dept: 'hr', suggested_permission_level: 'restricted',
+        age_days: 9, status: 'PENDING', closed: false, reviewer_name: '' },
+    ] as never
+    const w = mount(KbAdminDashboard, { global: { plugins: [pinia], stubs } })
+    expect(w.text()).toContain('待你处理')
+    expect(w.text()).not.toContain('差评未处理')                   // 差评 0 → 差评 chip 不出现
+    expect(w.find('[data-testid="escalation-open-chip"]').text()).toContain('1')   // 只计未关单
+    expect(w.find('[data-testid="review-task-open-chip"]').text()).toContain('1')
+  })
 })

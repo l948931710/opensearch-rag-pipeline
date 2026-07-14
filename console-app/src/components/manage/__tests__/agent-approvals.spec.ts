@@ -20,12 +20,18 @@ function activate(id: Identity, token = 't') {
   setActivePinia(pinia)
   return pinia
 }
+/** 相对时间 fixture（与 agent-approval-edited.spec 同款）：固定日历日期会随真实时间「腐坏」成
+ *  已过期——过期单禁处置上线后，硬编码过期日期的用例会无预警变红。默认给未来 3 天。 */
+function fmtTs(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
 function areq(over: Partial<AgentApprovalItem> = {}): AgentApprovalItem {
   return {
     request_id: 'ap1', run_id: 'r1', call_id: 'c1', tool_name: 'u8_writeback', tool_version: '1.0',
     proposed_args: { qty: 7 }, args_digest: 'd', render_summary: 'u8_writeback(qty)',
     requested_by: 'user_wang', requested_dept: 'production', approver_scope: 'production',
-    status: 'pending', expires_at: '2026-07-12 20:00:00', created_at: '2026-07-09 20:00:00',
+    status: 'pending', expires_at: fmtTs(new Date(Date.now() + 3 * 86_400_000)), created_at: '2026-07-09 20:00:00',
     decided_at: null, ...over,
   }
 }
@@ -145,5 +151,21 @@ describe('AgentApprovalQueue 组件', () => {
     const disabled = w.findAll('button').filter((b) => (b.attributes('disabled') !== undefined))
     // 批准 + 驳回两枚被禁；撤回可用
     expect(disabled.length).toBe(2)
+  })
+
+  it('过期单（批次α-④）：批准/改参/驳回禁用（超时视同拒绝），终止保留可用于清卡', () => {
+    const w = mountQueue([areq({ expires_at: fmtTs(new Date(Date.now() - 3_600_000)) })])
+    expect(w.text()).toContain('已过期')
+    const btn = (name: string) => w.findAll('button').find((b) => b.text().includes(name))!
+    expect(btn('批准').attributes('disabled'), '过期单不得放行').toBeDefined()
+    expect(btn('改参').attributes('disabled'), '过期单不得改参放行').toBeDefined()
+    expect(btn('驳回').attributes('disabled'), '过期即视同拒绝，无需驳回').toBeDefined()
+    expect(btn('终止').attributes('disabled'), '终止保留：清卡路径').toBeUndefined()
+  })
+
+  it('未过期单（回归）：四处置按钮全部可用', () => {
+    const w = mountQueue([areq()])   // fixture 默认 = 未来 3 天过期
+    const disabled = w.findAll('button').filter((b) => (b.attributes('disabled') !== undefined))
+    expect(disabled.length).toBe(0)
   })
 })

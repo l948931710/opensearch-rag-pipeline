@@ -7,8 +7,21 @@ import { useDialog } from '@/composables/useDialog'
 
 // 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
 const { approvals, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors, openDocPreview } = useKb()
-const { promptText } = useDialog()
+const { promptText, confirm } = useDialog()
 const rowKey = (d: PendingItem) => `appr:${d.doc_id}/${d.version_no}`
+
+// 通过=把文档放行给全公司/跨组检索——与退役/批量/Agent 批准同级的放行动作，补齐同款二次确认
+// （审批面此前唯二裸奔的写操作之一）。确认落在组件层：useKb.approve 保持「调用即执行」，
+// 其直调单测（useKb.spec staleness/approve 组）不受影响。
+async function onApprove(d: PendingItem) {
+  const ok = await confirm({
+    title: '通过并放行',
+    message: `通过《${d.title || d.original_filename || d.doc_id}》并放行入库？放行后按「${permLabel(d.permission_level)}」可见范围进入检索（归属 ${deptLabel(d.owner_dept)}）。`,
+    confirmText: '通过并放行',
+  })
+  if (!ok) return
+  void approve(d)
+}
 
 async function onReject(d: PendingItem) {
   const reason = await promptText({ title: '驳回上传', message: `驳回《${d.title || d.original_filename || d.doc_id}》的上传？`, placeholder: '驳回原因（可空）', confirmText: '驳回', danger: true })
@@ -59,7 +72,7 @@ async function onReject(d: PendingItem) {
         <button
           type="button"
           class="inline-flex items-center justify-center gap-1 rounded-lg bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-          :disabled="isBusy(rowKey(d))" @click="approve(d)"
+          :disabled="isBusy(rowKey(d))" @click="onApprove(d)"
         ><Loader2 v-if="isBusy(rowKey(d))" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(rowKey(d)) ? '通过中…' : '通过' }}</button>
       </div>
     </div>
