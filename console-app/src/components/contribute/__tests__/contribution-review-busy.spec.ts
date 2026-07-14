@@ -51,3 +51,31 @@ describe('ContributionReviewQueue — 采纳/驳回 处理中态', () => {
     expect(w.findAll('button').every((b) => b.attributes('disabled') !== undefined)).toBe(true)
   })
 })
+
+// ── 批次δ-3：kb_admin 审核队列=孤儿部门兜底（作用域后端裁决，前端只做语义标注）──────
+describe('ContributionReviewQueue — kb_admin 兜底标注', () => {
+  function activateRole(role: 'dept_admin' | 'kb_admin') {
+    const pinia = createTestingPinia({
+      createSpy: vi.fn,
+      initialState: { session: { identity: { userId: 'a', name: '管理员', role, aclGroups: ['finance'], canManage: true, managedOwnerDepts: role === 'dept_admin' ? ['finance'] : [] }, token: 't', ready: true } },
+    })
+    setActivePinia(pinia)
+    return pinia
+  }
+
+  it('kb_admin → 卡头显「兜底」语义标注（队列已被后端限定为孤儿部门）', () => {
+    const pinia = activateRole('kb_admin')
+    ;(useContribute() as any).pendingContribs.value = [PENDING]
+    const w = mount(ContributionReviewQueue, { global: { plugins: [pinia] } })
+    expect(w.find('[data-testid="contrib-orphan-hint"]').exists()).toBe(true)
+    expect(w.text()).toContain('兜底')
+  })
+
+  it('dept_admin → 不显兜底标注（本部门审核语义不变）', () => {
+    const pinia = activateRole('dept_admin')
+    ;(useContribute() as any).pendingContribs.value = [PENDING]
+    const w = mount(ContributionReviewQueue, { global: { plugins: [pinia] } })
+    expect(w.find('[data-testid="contrib-orphan-hint"]').exists()).toBe(false)
+    expect(w.text()).not.toContain('兜底')
+  })
+})

@@ -667,3 +667,32 @@ def test_accept_strips_img_markers_even_if_added_after_submit(monkeypatch):
         request=None, identity=_ident())
     assert resp.ok is True
     assert sink and "IMG" not in sink[0][1].upper()
+
+
+# ── 批次δ-3：贡献审批权归属 dept_admin（kb_admin 队列=仅孤儿部门兜底）───────────────
+def test_pending_scope_dept_admin_unchanged(monkeypatch):
+    """dept_admin 的审核队列作用域不变：本部门 category_dept ∈ managed。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    conn = _install_conn(monkeypatch, _FakeConn())
+    from opensearch_pipeline import api
+    api.kb_contributions_pending(request=None, identity=_ident())
+    sql = next(s for s, _ in conn.calls if "review_status='pending'" in s)
+    assert "category_dept IN" in sql
+    assert "dept_admin_grant" not in sql               # 孤儿子查询只属于 kb_admin 分支
+
+
+def test_pending_scope_kb_admin_orphan_only(monkeypatch):
+    """kb_admin 的审核队列=仅孤儿部门（无任何 active dept_admin 管辖的 category_dept）——
+    业务采纳/驳回的日常动线移交 dept_admin（业务标准在部门）；accept/reject 权限面不动
+    （救急兜底通道保留，test_accept_public_by_kb_admin_stays_direct 锁定），与 2026-07-04
+    access-request「kb_admin 只管入库、后端留救急通道」拍板同构。"""
+    _skip_if_not_sim()
+    _kb_admin(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn())
+    from opensearch_pipeline import api
+    api.kb_contributions_pending(request=None, identity=_ident())
+    sql = next(s for s, _ in conn.calls if "review_status='pending'" in s)
+    assert "NOT IN" in sql
+    assert "dept_admin_grant" in sql and "is_active=1" in sql
+    assert "managed_owner_dept" in sql

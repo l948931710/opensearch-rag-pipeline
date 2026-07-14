@@ -241,3 +241,24 @@ def test_create_escalation_fires_notify_hook(monkeypatch):
     conn2 = _EConn()
     _wire(monkeypatch, conn2)
     assert _create_escalation(message_id="M10", user_id="u1", user_name=None) is True
+
+
+def test_contribution_orphan_dept_falls_back_to_kb_admin(monkeypatch):
+    """批次δ-3：孤儿部门（无 dept_admin）的新贡献 → kb_admin 兜底通知（含兜底提示语），
+    不再静默落进虚空——与 notify_escalation 兜底同款；兜底队列归 kb_admin，必须有人被叫到。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    _wire(monkeypatch, _Conn(dept_admins=[], kb_admins=[("kbadm1",)]))
+    an.notify_contribution("legal", "海外仓合同模板在哪？")
+    assert len(sent) == 1 and sent[0][1]["userid_list"] == "kbadm1"
+    text = sent[0][1]["msg"]["text"]["content"]
+    assert "兜底" in text and "知识贡献" in text
+
+
+def test_contribution_orphan_and_no_kb_admin_still_silent(monkeypatch):
+    """孤儿部门且连 kb_admin 都查不到（种子缺失/DB 空）→ 仍静默跳过不炸（收件人空的原语义保留）。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    _wire(monkeypatch, _Conn(dept_admins=[], kb_admins=[]))
+    an.notify_contribution("legal", "q?")
+    assert sent == []
