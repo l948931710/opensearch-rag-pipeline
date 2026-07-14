@@ -77,6 +77,21 @@
 **闸门**：同批次 1。都改 `executor.py`/`routes/agent.py`，与批次 1 有文件重叠 →
 **批次 1 合入后再开这批**（或同一人连做）。
 
+> **状态（2026-07-13）：✅ 代码侧完成**（落 claude/ontology-p0；全量 3490 绿 + lint 绿；
+> 测试 tests/test_agent_cancel_and_relay_continuity.py 10 例，含台账验收用例
+> 「FakeRedis 下 suspend→resume→replay 全帧可达」与「cancel 后 cancelled 终态/槽位释放/
+> 中继终态帧」）。与原案的实现说明：
+> ① B3 修在**写侧** `RunHandle._finish(end_relay=...)`——本地队列恒投哨兵（原 /ask SSE
+>   在挂起帧后照常收流），仅真终态写中继 `__end__`；读侧 `stream_run_events` 无需改
+>   （`_TERMINAL_TYPES` 本就不含 run_suspended，不会在挂起帧 return——复核时的读侧
+>   改动项经核实为已然成立）。RejectedTerminate 裸 handle 已补 `_attach_relay`。
+> ② A5 语义分支：running+本实例句柄→202；suspended→409（走审批拒绝/撤回）；
+>   resuming→409 瞬态；终态→409；无本实例句柄→501（跨实例标记留 v2，由 reaper 收尸）。
+>   准入 count_llm=False（治理动作恒可达，同 /approve 豁免理由）。
+> ③ SSE 断连不自动 cancel：GeneratorExit 只记 `handle._client_disconnected_at`（grace-cancel
+>   迭代的输入），显式取消走新端点。cancel 在轮边界生效（阻塞中的模型/工具调用不中断）。
+> ④ 前端 stop 按钮接本端点 = 批次 4 载荷（A7），本批未动前端。
+
 ### B3 挂起-续跑中继断流（复核新发现）【S】
 - 最小修：`RunHandle._finish`（executor.py:94-95）只在**真终态**（succeeded/failed/cancelled）
   时 `relay.end()`；RunSuspended 路径不写 `__end__`。

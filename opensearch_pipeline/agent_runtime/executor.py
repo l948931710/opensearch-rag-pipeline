@@ -89,9 +89,13 @@ class RunHandle:
         if self._relay is not None:
             self._relay.publish(ev)         # 跨实例镜像（内部 fail-open，绝不影响主路径）
 
-    def _finish(self) -> None:
+    def _finish(self, *, end_relay: bool = True) -> None:
+        """收尾。本地队列恒投哨兵（进程内 SSE 消费者收流——挂起时原 /ask 流也该结束）；
+        中继 ``__end__`` 只在**真终态**写（B3，2026-07-13 复核）：挂起不是终态，续跑段
+        与挂起段共用同一 run_id 流，挂起点写 ``__end__`` 会让 /runs/{id}/events 回放在
+        审批处永久收流——续跑段全部事件（含最终答案帧）经中继永不可达。"""
         self._q.put(_SENTINEL)
-        if self._relay is not None:
+        if self._relay is not None and end_relay:
             self._relay.end()               # __end__ 哨兵帧：消费侧据此收流
         self._done.set()
 
@@ -190,10 +194,13 @@ class ThreadedRunExecutor:
             claimed = True
             object.__setattr__(ctx, "run_id", run_id)
             if isinstance(outcome, RejectedTerminate):
-                # 硬终止：resuming→cancelled（非 failed——是有意停止非错误），不续跑
+                # 硬终止：resuming→cancelled（非 failed——是有意停止非错误），不续跑。
+                # B3 顺手修：裸建 handle 也要挂中继——否则拒绝终止的终态帧只进本地队列，
+                # 跨实例回放端点在挂起帧后空等到超时，永远看不到「已被拒绝」。
                 self._store.transition(run_id, "resuming", "cancelled")
                 claimed = False
                 handle = RunHandle(run_id)
+                self._attach_relay(handle)
                 handle._emit(RunFailed(error="审批拒绝并终止", retryable=False))
                 handle._finish()
                 self._release()
@@ -334,6 +341,7 @@ class ThreadedRunExecutor:
         # 审批续跑无 SSE 消费者，sources 不在完成侧落库即彻底丢失（resume 段只含
         # 恢复后的检索；挂起前批次已在原 /ask SSE 实时下发过）。
         retrieved_chunks: list = []
+        suspended = False        # B3：挂起收尾不写中继 __end__（续跑段共用同一流）
         try:
             ev = next(gen)
             while True:
@@ -414,6 +422,7 @@ class ThreadedRunExecutor:
                         break
                     handle._emit(RunSuspended(approval_request_id=aid, checkpoint_id=cp_id,
                                               pending_call=ev.pending_call, turn_index=ev.turn_index))
+                    suspended = True
                     break
                 if isinstance(ev, RunCheckpointReady):
                     # R4 运行中 checkpoint（loop 侧 RAG_AGENT_MIDRUN_CHECKPOINT 门控才发）：
@@ -465,7 +474,7 @@ class ThreadedRunExecutor:
             if run_id:
                 with self._lock:
                     self._live.pop(run_id, None)
-            handle._finish()
+            handle._finish(end_relay=not suspended)
             self._release()
 
     @staticmethod
@@ -674,6 +683,13 @@ class ThreadedRunExecutor:
             self._store.transition(run_id, frm, to)
         except Exception:   # noqa: BLE001 — 状态落库失败不阻断事件投递（普通路径 fail-open）
             pass
+
+    def get_live_handle(self, run_id: str) -> Optional[RunHandle]:
+        """A5 服务端 cancel：取本实例在跑 run 的句柄（None=不在本实例/已收尾）。
+        cancel 是协作式的（handle.request_cancel 置旗标，驱动线程在轮边界检查）——
+        阻塞中的模型/工具调用不被中断，下一个协作检查点收口为 cancelled 终态。"""
+        with self._lock:
+            return self._live.get(run_id)
 
     def active_count(self) -> int:
         with self._lock:

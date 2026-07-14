@@ -462,6 +462,14 @@ def _stream_events(handle, session_id: str, message_id: str):
                 yield _sse({"type": "error", "message": f"Agent 运行失败: {ev.error[:200]}"})
     except GeneratorExit:
         closed = True           # 客户端断连：run 仍在跑、落库在 run 完成侧，此处只安静退出
+        # A5 断连策略（批次2 决策）：**不**自动 cancel——移动网闪断/切后台会误杀长任务；
+        # 只记断连时刻供后续 grace-cancel 迭代（如「断连 N 分钟无重连才取消」）。
+        # 显式取消走 POST /api/agent/runs/{id}/cancel。
+        try:
+            import time as _time
+            handle._client_disconnected_at = _time.time()
+        except Exception:   # noqa: BLE001
+            pass
         raise
     except Exception:   # noqa: BLE001 — SSE 中断不外泄
         logger.error("agent SSE 中断", exc_info=True)
@@ -1115,6 +1123,54 @@ def agent_run_detail(run_id: str, request: Request,
             logger.warning("run 详情读取最终答案失败（忽略）", exc_info=True)
     return {"run": run, "steps": steps, "invocations": invocations, "approval": approval,
             "final": final}
+
+
+@router.post("/api/agent/runs/{run_id}/cancel")
+def agent_run_cancel(run_id: str, request: Request,
+                     identity: Optional[Identity] = Depends(current_identity)):
+    """A5 服务端 cancel（批次2）：请求**协作式**取消——置旗标，驱动线程在轮边界
+    （下一个协作检查点）收口：run 落 cancelled 终态、槽位释放、SSE/中继收到终态帧。
+    阻塞中的模型/工具调用**不被中断**（线程无法安全杀死，语义与工具 timeout 一致）。
+
+    门禁与 run 详情一致：本人或 kb_admin，他人 404（不可见==不存在）。语义分支：
+    - running 且句柄在本实例 → 202 cancel_requested（轮边界生效）
+    - suspended（等审批）→ 409：无驱动线程可协作，请走审批中心拒绝/撤回
+    - resuming（认领中瞬态）→ 409 稍后重试
+    - 终态 → 409 已结束
+    - running 但句柄不在本实例（多副本/实例已重启）→ 501（跨实例 cancel 标记留 v2；
+      此类 run 最终由 reaper 按心跳收尸）
+    准入不计 LLM 配额（治理动作恒可达，与 /approve 同理）。SSE 断连**不**自动触发本端点。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if identity is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _registry, _gateway, _executor, run_store = _get_runtime()
+    run = run_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    if run.get("user_id") != identity.user_id:
+        from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+        from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+        if resolve_kb_identity(identity.user_id).role != ROLE_KB_ADMIN:
+            raise HTTPException(status_code=404, detail="run 不存在")   # 不可见==不存在
+    status = run.get("status")
+    if status in ("succeeded", "failed", "cancelled", "expired"):
+        raise HTTPException(status_code=409, detail=f"run 已结束（{status}），无可取消")
+    if status == "suspended":
+        raise HTTPException(status_code=409,
+                            detail="run 等待审批中：请在审批中心拒绝/撤回，不走 cancel")
+    if status == "resuming":
+        raise HTTPException(status_code=409, detail="run 正在恢复中，请稍后重试")
+    handle = (_executor.get_live_handle(run_id)
+              if hasattr(_executor, "get_live_handle") else None)
+    if handle is None:
+        raise HTTPException(status_code=501,
+                            detail="run 不在本实例（跨实例取消暂不支持，将由系统心跳回收）")
+    handle.request_cancel()
+    return JSONResponse(status_code=202, content={
+        "status": "cancel_requested", "run_id": run_id,
+        "note": "取消在轮边界生效：进行中的模型/工具调用完成后收口为 cancelled"})
 
 
 @router.get("/api/agent/runs/{run_id}/events")
