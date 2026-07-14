@@ -563,6 +563,40 @@ test.describe('UX 硬门 — 审批中心', () => {
     }
   });
 
+  test('批次δ：本体工作台——类型筛选强制重查（30s 门内）、keyset 游标加载更多为追加', async ({ page }) => {
+    await mockManage(page, {});   // dept_admin；catch-all 使 ontology 探测 supported=true（既有现状）
+    const CASE = (id: string, raw: string, hint = 'product') => ({
+      case_id: id, namespace: 'u8', raw_value: raw, norm_value: raw, object_type_hint: hint,
+      status: 'open', seen_count: 3, first_seen_at: '2026-07-09 10:00:00', last_seen_at: '2026-07-10 09:12:00',
+      evidence_json: null, steward_dept: 'pmc',
+      candidates: [{ candidate_id: 'cd-' + id, case_id: id, target_object_id: 'o' + id, target_revision: null, method: 'rule', confidence: 0.85, features_json: null, canonical_ref: 'REF-' + id, title: 'T-' + raw, object_type: hint, target_status: 'active' }],
+    });
+    const reqs: string[] = [];
+    await page.route('**/api/ontology/workbench*', (r) => {
+      const u = new URL(r.request().url()); reqs.push(u.search);
+      if (u.searchParams.get('object_type') === 'mold')
+        return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: [CASE('m1', 'MLD-88A', 'mold')], next_cursor: null }) });
+      if (u.searchParams.get('cursor'))
+        return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: [CASE('c3', 'CC-3')], next_cursor: null }) });
+      return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: [CASE('c1', 'AA-1'), CASE('c2', 'BB-2')], next_cursor: 'CUR1' }) });
+    });
+    await page.goto(MANAGE_ROUTE);
+    await page.locator('[aria-label="管理台分区"]').getByRole('tab', { name: /本体消解/ }).click();
+    // exact:true——raw_value 也会作为子串出现在候选标题（T-AA-1）里，子串匹配会触发 strict mode
+    await expect(page.getByText('AA-1', { exact: true })).toBeVisible();
+    await expect(page.getByText('BB-2', { exact: true })).toBeVisible();
+    await page.getByTestId('onto-load-more').click();
+    await expect(page.getByText('CC-3', { exact: true }), '游标页为追加而非替换').toBeVisible();
+    await expect(page.getByText('AA-1', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('onto-load-more')).toHaveCount(0);   // next_cursor=null → 到底收敛
+    await page.getByRole('button', { name: '模具' }).click();
+    await expect(page.getByText('MLD-88A', { exact: true })).toBeVisible();
+    await expect(page.getByText('AA-1', { exact: true })).toHaveCount(0);   // 筛选=重拉第一页（替换）
+    expect(reqs.some((s) => s.includes('object_type=mold')), '筛选变更强制发查，不被 30s staleness 门吞').toBe(true);
+    expect(reqs.some((s) => s.includes('cursor=CUR1')), '加载更多走 keyset 游标').toBe(true);
+    expect(reqs.every((s) => !s.includes('offset=')), '绝不用 offset（后端测试点名的跳行病根）').toBe(true);
+  });
+
   test('RAG_AGENT_ENABLE 未开（端点 404）→ Agent 区块不出现，审批 tab 常驻且角标只数 kb 队列', async ({ page }) => {
     await mockManage(page, { agent: 404, access: [ACCESS_REQ()] });
     await page.goto(MANAGE_ROUTE);

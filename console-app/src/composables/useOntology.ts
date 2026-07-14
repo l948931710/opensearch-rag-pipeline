@@ -73,6 +73,22 @@ const coverage = ref<OntologyCoverage | null>(null)
 const supported = ref<boolean | null>(null)
 const loadError = ref('')
 const inflight = ref<Set<string>>(new Set())
+// 批次δ F4：object_type 服务端筛选（''=全部）+ keyset 游标分页（PR-I 后端已备，前端此前
+// 硬编码 limit=50 丢弃 next_cursor——积压 >50 静默截断）。
+// 语义纪律：loadOntology=第一页【替换】（探测/强刷/筛选变更共用，游标归零）；
+// loadMoreOntology=【追加】（绝不与 force 布尔糅进同一路径——强刷必须拿从头快照）。
+const objectTypeFilter = ref('')
+const nextCursor = ref<string | null>(null)
+const loadingMore = ref(false)
+
+const PAGE_LIMIT = 50
+function _workbenchQuery(cursor?: string | null): string {
+  const p = new URLSearchParams()
+  p.set('limit', String(PAGE_LIMIT))
+  if (objectTypeFilter.value) p.set('object_type', objectTypeFilter.value)
+  if (cursor) p.set('cursor', cursor)
+  return `/api/ontology/workbench?${p.toString()}`
+}
 
 const STALE_MS = 30_000
 let lastLoadedAt = 0
@@ -97,6 +113,28 @@ async function refreshOntologyCoverage() {
   } catch { /* 覆盖率是装饰面：失败不置错、不影响队列与 tab 可见性 */ }
 }
 
+/** ?preview 满数据 mock（5 条跨两种类型）：3+2 两页演示追加分页；单条候选形态与 oc1 同源。 */
+function _previewCases(): OntologyCase[] {
+  const mk = (id: string, raw: string, hint: string, seen: number, title: string, ref: string): OntologyCase => ({
+    case_id: id, namespace: 'u8', raw_value: raw, norm_value: raw,
+    object_type_hint: hint, status: 'open', seen_count: seen,
+    first_seen_at: '2026-07-09 10:00', last_seen_at: '2026-07-10 09:12', evidence_json: null,
+    steward_dept: 'pmc',
+    candidates: [{
+      candidate_id: 'cd-' + id, case_id: id, target_object_id: 'o-' + id, target_revision: null,
+      method: 'rule', confidence: 0.85, features_json: null, canonical_ref: ref,
+      title, object_type: hint, target_status: 'active',
+    }],
+  })
+  return [
+    mk('oc1', 'ABC123-M', 'product', 4, '6.2口径龙虾杯', 'FLP-P-000123'),
+    mk('oc2', 'CUP-12OZ-B', 'product', 3, '12oz 双淋膜纸杯', 'FLP-P-000208'),
+    mk('oc3', 'MLD-88A', 'mold', 3, '88A 注塑模', 'FLP-M-000031'),
+    mk('oc4', 'PP-T30', 'material', 2, 'PP 改性料 T30', 'FLP-MT-000012'),
+    mk('oc5', 'BOX-660-40', 'packing_spec', 2, '660 箱规 40 只装', 'FLP-PS-000005'),
+  ]
+}
+
 async function loadOntology(force = false) {
   syncIdentityScope()               // 身份切换：上个身份的队列/覆盖率/探测结果全部作废（P0-D 共享设施）
   const fp = identityFingerprint()  // 在途判废基准
@@ -108,17 +146,11 @@ async function loadOntology(force = false) {
     return
   }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
-    cases.value = [{
-      case_id: 'oc1', namespace: 'u8', raw_value: 'ABC123-M', norm_value: 'ABC123-M',
-      object_type_hint: 'product', status: 'open', seen_count: 4,
-      first_seen_at: '2026-07-09 10:00', last_seen_at: '2026-07-10 09:12', evidence_json: null,
-      steward_dept: 'pmc',
-      candidates: [{
-        candidate_id: 'cd1', case_id: 'oc1', target_object_id: 'o1', target_revision: null,
-        method: 'rule', confidence: 0.85, features_json: null, canonical_ref: 'FLP-P-000123',
-        title: '6.2口径龙虾杯', object_type: 'product', target_status: 'active',
-      }],
-    }]
+    // 多页 mock（批次δ）：3+2 两页演示「加载更多」；client 侧套 objectTypeFilter 让筛选也能演示。
+    const all = _previewCases()
+    const filtered = objectTypeFilter.value ? all.filter((c) => c.object_type_hint === objectTypeFilter.value) : all
+    cases.value = filtered.slice(0, 3)
+    nextCursor.value = filtered.length > 3 ? 'preview-page-2' : null
     coverage.value = {
       active_identifiers: 1284, auto_active: 402, open_cases: 57, resolved_cases: 620,
       dismissed_cases: 38, resolution_coverage: 0.72, manual_review_rate: 0.69,
@@ -130,9 +162,10 @@ async function loadOntology(force = false) {
   lastLoadedAt = Date.now()
   loadError.value = ''
   try {
-    const r = await apiJson<{ items: OntologyCase[] }>('/api/ontology/workbench?limit=50', { auth: true })
+    const r = await apiJson<{ items: OntologyCase[]; next_cursor?: string | null }>(_workbenchQuery(), { auth: true })
     if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的队列整体丢弃
     cases.value = r.items || []
+    nextCursor.value = r.next_cursor || null   // 满页才有游标；null=到底
     supported.value = true
     void refreshOntologyCoverage()
   } catch (e) {
@@ -142,6 +175,55 @@ async function loadOntology(force = false) {
     if (e instanceof ApiError && e.status === 404) { supported.value = false; return }   // flag 未开：静默隐藏
     if (e instanceof ApiError && e.status === 403) { supported.value = false; return }   // 员工/无权：不显 tab
     loadError.value = '加载失败，请重试'
+  }
+}
+
+/** 筛选变更：置新值并【强制】重拉第一页——不传 force 会被 30s staleness 门静默吞掉
+ *  （批次δ 审计风险 1：筛选变了列表纹丝不动且无报错）。同值 no-op。 */
+async function setOntologyObjectTypeFilter(t: string) {
+  if (objectTypeFilter.value === t) return
+  objectTypeFilter.value = t
+  nextCursor.value = null
+  await loadOntology(true)
+}
+
+/** 追加下一页（keyset 游标；offset 是后端测试点名的「边处置边翻页跳行/重行」病根，不用）。
+ *  dept_admin 可能拿到「空页但仍有游标」（服务端精判在游标编码之后）——如实追加 0 条并
+ *  保留继续加载的能力，绝不把空页误判成到底/错误。失败 → notice 且游标保留可重试。 */
+async function loadMoreOntology(): Promise<number> {
+  if (loadingMore.value || !nextCursor.value) return 0
+  syncIdentityScope()
+  const fp = identityFingerprint()
+  const filterAtCall = objectTypeFilter.value
+  const s = useSession()
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    const all = _previewCases()
+    const filtered = filterAtCall ? all.filter((c) => c.object_type_hint === filterAtCall) : all
+    const seen = new Set(cases.value.map((c) => c.case_id))
+    const more = filtered.filter((c) => !seen.has(c.case_id))
+    cases.value = [...cases.value, ...more]
+    nextCursor.value = null
+    return more.length
+  }
+  loadingMore.value = true
+  try {
+    const r = await apiJson<{ items: OntologyCase[]; next_cursor?: string | null }>(
+      _workbenchQuery(nextCursor.value), { auth: true })
+    // 身份或筛选中途变了：这页属于旧上下文，整体丢弃（新上下文已由 loadOntology(true) 重建）
+    if (fp !== identityFingerprint() || filterAtCall !== objectTypeFilter.value) return 0
+    const seen = new Set(cases.value.map((c) => c.case_id))
+    const more = (r.items || []).filter((c) => !seen.has(c.case_id))
+    cases.value = [...cases.value, ...more]
+    nextCursor.value = r.next_cursor || null
+    return more.length
+  } catch {
+    if (fp === identityFingerprint()) {
+      const { notice } = useDialog()
+      void notice({ title: '加载更多失败', message: '网络异常，请重试（已加载条目不受影响）。', danger: true })
+    }
+    return -1   // 失败 ≠ 成功空页——调用方据此区分「管辖滤空提示」与「网络失败弹窗」两种语义
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -249,6 +331,11 @@ export function useOntology() {
     ontologySupported: supported,
     ontologyError: loadError,
     ontologyBacklogCount,
+    ontologyObjectTypeFilter: objectTypeFilter,
+    ontologyHasMore: computed(() => !!nextCursor.value),
+    ontologyLoadingMore: loadingMore,
+    setOntologyObjectTypeFilter,
+    loadMoreOntology,
     isOntologyBusy: isBusy,
     loadOntology,
     confirmOntologyCase,
@@ -265,6 +352,9 @@ function _resetOntologyState() {
   supported.value = null
   loadError.value = ''
   inflight.value = new Set()
+  objectTypeFilter.value = ''      // 批次δ：筛选/游标是身份作用域状态——换号不残留上个人的筛选
+  nextCursor.value = null
+  loadingMore.value = false
   lastLoadedAt = 0
 }
 

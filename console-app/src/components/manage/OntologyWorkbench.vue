@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { Fingerprint, Loader2, Search, X } from 'lucide-vue-next'
 import { deptLabel } from '@/lib/kb'
 import { useOntology, type OntologyCandidate, type OntologyCase, type OntologyObjectHit } from '@/composables/useOntology'
@@ -13,6 +13,8 @@ import LoadError from './LoadError.vue'
 // 授权由服务端硬校验（kb_admin / stewardship scope 的 dept_admin）；此处只做操作面。
 const {
   ontologyCases, ontologyCoverage, ontologyError, isOntologyBusy,
+  ontologyObjectTypeFilter, ontologyHasMore, ontologyLoadingMore,
+  setOntologyObjectTypeFilter, loadMoreOntology,
   loadOntology, confirmOntologyCase, dismissOntologyCase, batchDismissOntologyCases,
   searchOntologyObjects,
 } = useOntology()
@@ -22,6 +24,28 @@ const { promptText, notice } = useDialog()
 const manualHits = ref<Record<string, OntologyObjectHit[]>>({})
 // PR-I（P2 批量处置）：勾选集——只支持批量**驳回**（批量确认=放弃逐条核对，违 HITL 纪律）
 const selected = ref<Set<string>>(new Set())
+// 批次δ：勾选交集——强刷（409/批量部分失败=替换整列）后 selected 可能残留不在列的幽灵 id，
+// 角标与提交都以「勾选 ∩ 在列」为准，杜绝「批量驳回(N) 但页面只见 M 条」的错位。
+const selectedVisible = computed(() => {
+  const ids = new Set(ontologyCases.value.map((c) => c.case_id))
+  return [...selected.value].filter((id) => ids.has(id))
+})
+
+// 批次δ F4：object_type 服务端筛选。选项=ontology_ref_seq 登记的 7 类（schema/027+030）+全部；
+// hint 列无 FK 约束，未登记值/NULL 靠「全部」兜底可见，不猜标签。
+const TYPE_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: '全部类型' },
+  { value: 'product', label: '产品' }, { value: 'sku', label: 'SKU' }, { value: 'mold', label: '模具' },
+  { value: 'material', label: '物料' }, { value: 'calc_rule', label: '计算规则' },
+  { value: 'packing_spec', label: '装箱规格' }, { value: 'stacking_spec', label: '堆码规格' },
+]
+// dept_admin 的「空页但有下一页」提示（服务端管辖精判在游标编码之后——空页≠到底≠错误）
+const lastMoreEmpty = ref(false)
+async function onLoadMore() {
+  const n = await loadMoreOntology()
+  // 仅「成功且空页」亮管辖滤空提示；网络失败（-1）已有 notice 弹窗，别双语义混叠
+  lastMoreEmpty.value = n === 0 && !!ontologyHasMore.value
+}
 
 function toggleSelect(caseId: string) {
   const next = new Set(selected.value)
@@ -31,7 +55,7 @@ function toggleSelect(caseId: string) {
 }
 
 async function onBatchDismiss() {
-  const ids = [...selected.value]
+  const ids = selectedVisible.value   // 只提交在列勾选；幽灵 id 不送后端（本就会被判 not_found）
   if (!ids.length) return
   const reason = await promptText({
     title: `批量驳回 ${ids.length} 条`,
@@ -164,19 +188,33 @@ async function onDismiss(kase: OntologyCase) {
       </div>
     </div>
 
+    <!-- 类型筛选（服务端 object_type 精确匹配；变更即强制重拉第一页，游标归零）。
+         纯按钮 pill——绝不用 checkbox（单测锁定复选框数量=case 数）。 -->
+    <div class="flex flex-wrap items-center gap-1.5" data-testid="onto-type-filter">
+      <button
+        v-for="opt in TYPE_OPTIONS" :key="opt.value" type="button"
+        class="rounded-full border px-3 py-[5px] text-[12px] font-medium transition"
+        :class="ontologyObjectTypeFilter === opt.value
+          ? 'border-accent-strong bg-accent-soft text-accent-text'
+          : 'border-border text-muted-foreground hover:border-border-strong hover:text-foreground'"
+        :aria-pressed="ontologyObjectTypeFilter === opt.value"
+        @click="setOntologyObjectTypeFilter(opt.value)"
+      >{{ opt.label }}</button>
+    </div>
+
     <div v-if="ontologyCases.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <div class="flex items-center gap-2.5 border-b border-border bg-accent-soft px-[18px] py-3">
         <Fingerprint :size="16" :stroke-width="1.75" class="text-accent-text" />
         <span class="text-sm font-semibold text-foreground">未解析编号（按观测频次）</span>
-        <span class="rounded-full bg-accent-strong px-2 py-px text-[11px] font-bold text-primary-foreground">{{ ontologyCases.length }}</span>
+        <span class="rounded-full bg-accent-strong px-2 py-px text-[11px] font-bold text-primary-foreground">{{ ontologyCases.length }}{{ ontologyHasMore ? '+' : '' }}</span>
         <div class="flex-1" />
         <button
-          v-if="selected.size"
+          v-if="selectedVisible.length"
           type="button"
           class="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-[5px] text-[12px] font-semibold text-st-fail transition hover:border-border-strong disabled:opacity-50"
           :disabled="isOntologyBusy('onto:batch')"
           @click="onBatchDismiss"
-        ><Loader2 v-if="isOntologyBusy('onto:batch')" :size="12" :stroke-width="2" class="animate-spin" />批量驳回（{{ selected.size }}）</button>
+        ><Loader2 v-if="isOntologyBusy('onto:batch')" :size="12" :stroke-width="2" class="animate-spin" />批量驳回（{{ selectedVisible.length }}）</button>
         <span class="hidden text-xs text-muted-foreground sm:inline">确认即成为检索/计算依据；拿不准就驳回留档，绝不猜</span>
       </div>
 
@@ -273,15 +311,39 @@ async function onDismiss(kase: OntologyCase) {
           </div>
         </div>
       </div>
+
+      <!-- 加载更多（keyset 游标；满页才有下一页）。dept_admin 可能追加到空页但仍有游标
+           （服务端管辖精判在游标编码之后）——如实提示可继续，不装到底、不报错。 -->
+      <div v-if="ontologyHasMore" class="border-t border-border px-[18px] py-3 text-center">
+        <p v-if="lastMoreEmpty" class="mb-2 text-[11.5px] text-faint">上一页均不在你的管辖范围（已翻过），可继续加载。</p>
+        <button
+          type="button" data-testid="onto-load-more"
+          class="inline-flex items-center gap-1.5 rounded-lg border border-border px-4 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          :disabled="ontologyLoadingMore"
+          @click="onLoadMore"
+        ><Loader2 v-if="ontologyLoadingMore" :size="13" :stroke-width="2" class="animate-spin" />{{ ontologyLoadingMore ? '加载中…' : '加载更多' }}</button>
+      </div>
     </div>
 
-    <!-- 显式空态：独立 tab 不自隐 -->
+    <!-- 显式空态：独立 tab 不自隐。带筛选/仍有下一页时空态语义不同，如实区分 -->
     <div v-else-if="!ontologyError" class="rounded-xl border border-border bg-card px-6 py-10 text-center">
       <Fingerprint :size="22" :stroke-width="1.5" class="mx-auto text-faint" />
-      <p class="mt-3 text-sm font-medium text-foreground">当前没有待消解的编号</p>
-      <p class="mt-1 text-xs text-muted-foreground">
-        检索/播种/回填遇到无法自动确认的编号时会挂到这里；确认后即成为全企业统一的身份映射。
-      </p>
+      <template v-if="ontologyObjectTypeFilter">
+        <p class="mt-3 text-sm font-medium text-foreground">该类型下没有待消解的编号</p>
+        <p class="mt-1 text-xs text-muted-foreground">切回「全部类型」查看其它积压。</p>
+      </template>
+      <template v-else>
+        <p class="mt-3 text-sm font-medium text-foreground">当前没有待消解的编号</p>
+        <p class="mt-1 text-xs text-muted-foreground">
+          检索/播种/回填遇到无法自动确认的编号时会挂到这里；确认后即成为全企业统一的身份映射。
+        </p>
+      </template>
+      <button
+        v-if="ontologyHasMore" type="button" data-testid="onto-load-more"
+        class="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-border px-4 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+        :disabled="ontologyLoadingMore"
+        @click="onLoadMore"
+      ><Loader2 v-if="ontologyLoadingMore" :size="13" :stroke-width="2" class="animate-spin" />{{ ontologyLoadingMore ? '加载中…' : '本页无你可处置的条目——继续加载' }}</button>
     </div>
 
     <p class="ml-0.5 text-[11.5px] text-faint">

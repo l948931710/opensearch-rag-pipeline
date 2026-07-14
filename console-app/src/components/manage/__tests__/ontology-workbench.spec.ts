@@ -347,3 +347,98 @@ describe('PR-I P2（身份切换重置 / 批量驳回）', () => {
     expect(w.text()).toContain('批量驳回（2）')
   })
 })
+
+// ── 批次δ F4：keyset 游标分页 + object_type 筛选 + 勾选交集 ────────────────────────
+describe('批次δ — 翻页与筛选', () => {
+  function stubPaged() {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      const p = String(path)
+      calls.push(p)
+      if (p.startsWith('/api/ontology/workbench')) {
+        const u = new URL('http://x' + p)
+        if (u.searchParams.get('object_type') === 'mold') {
+          return { ok: true, status: 200, json: async () => ({ items: [okase({ case_id: 'm1', raw_value: 'MLD-88A', object_type_hint: 'mold' })], next_cursor: null }) }
+        }
+        if (u.searchParams.get('cursor') === 'CUR1') {
+          return { ok: true, status: 200, json: async () => ({ items: [okase({ case_id: 'oc3', raw_value: 'C-3' })], next_cursor: null }) }
+        }
+        return { ok: true, status: 200, json: async () => ({ items: [okase(), okase({ case_id: 'oc2', raw_value: 'B-2' })], next_cursor: 'CUR1' }) }
+      }
+      return { ok: true, status: 200, json: async () => COVERAGE }
+    }))
+    return calls
+  }
+
+  it('首页满页带 next_cursor → hasMore；loadMore 携游标【追加】并收尾（到底后 hasMore=false）', async () => {
+    activate(identity())
+    const calls = stubPaged()
+    const o = useOntology()
+    await o.loadOntology(true)
+    expect(o.ontologyCases.value.map((c) => c.case_id)).toEqual(['oc1', 'oc2'])
+    expect(o.ontologyHasMore.value).toBe(true)
+    const n = await o.loadMoreOntology()
+    expect(n).toBe(1)
+    expect(o.ontologyCases.value.map((c) => c.case_id)).toEqual(['oc1', 'oc2', 'oc3'])   // 追加不替换
+    expect(o.ontologyHasMore.value).toBe(false)
+    expect(calls.some((p) => p.includes('cursor=CUR1'))).toBe(true)                       // keyset 游标而非 offset
+    expect(calls.every((p) => !p.includes('offset='))).toBe(true)
+  })
+
+  it('筛选变更【强制】重拉第一页（30s staleness 门内也发请求）且游标归零、带 object_type 参数', async () => {
+    activate(identity())
+    const calls = stubPaged()
+    const o = useOntology()
+    await o.loadOntology(true)                       // 刚加载（lastLoadedAt=now，30s 门关着）
+    const before = calls.filter((p) => p.includes('/workbench')).length
+    await o.setOntologyObjectTypeFilter('mold')      // 若不 force 会被门吞掉——这是审计风险 1
+    const wb = calls.filter((p) => p.includes('/workbench'))
+    expect(wb.length).toBe(before + 1)
+    expect(wb[wb.length - 1]).toContain('object_type=mold')   // coverage 是 fire-and-forget 后随，不取 calls 末位
+    expect(o.ontologyCases.value.map((c) => c.case_id)).toEqual(['m1'])   // 替换而非追加
+    expect(o.ontologyHasMore.value).toBe(false)
+  })
+
+  it('勾选交集：强刷替换整列后，角标只计仍在列的勾选（幽灵 id 不显不提交）', async () => {
+    const pinia = activate(identity())
+    const o = useOntology()
+    o.ontologyCases.value = [okase(), okase({ case_id: 'oc2', raw_value: 'B-2' })]
+    const w = mount(OntologyWorkbench, { global: { plugins: [pinia] } })
+    const boxes = w.findAll('input[type="checkbox"]')
+    await boxes[0].setValue(true)
+    await boxes[1].setValue(true)
+    expect(w.text()).toContain('批量驳回（2）')
+    o.ontologyCases.value = [okase({ case_id: 'oc2', raw_value: 'B-2' })]   // 模拟 409 强刷替换
+    await w.vm.$nextTick()
+    expect(w.text()).toContain('批量驳回（1）')                              // oc1 成幽灵 → 不计
+    expect(w.text()).not.toContain('批量驳回（2）')
+  })
+
+  it('空列表但仍有游标（dept_admin 首页被管辖精判滤空）→ 空态给「继续加载」而非装到底', async () => {
+    const pinia = activate(identity())
+    const o = useOntology()
+    o.ontologySupported.value = true
+    // hasMore 是 computed 只读——走真实 loadOntology 路径置位（首页空 items + 有游标）
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (String(path).startsWith('/api/ontology/workbench')) {
+        return { ok: true, status: 200, json: async () => ({ items: [], next_cursor: 'CUR9' }) }
+      }
+      return { ok: true, status: 200, json: async () => COVERAGE }
+    }))
+    await o.loadOntology(true)
+    const w = mount(OntologyWorkbench, { global: { plugins: [pinia] } })
+    expect(w.find('[data-testid="onto-load-more"]').exists()).toBe(true)
+    expect(w.text()).toContain('继续加载')
+  })
+
+  it('筛选 pill 不引入 checkbox、静态区不出现「批量驳回」字样（守既有单测契约）', async () => {
+    const pinia = activate(identity())
+    const o = useOntology()
+    o.ontologyCases.value = [okase()]
+    const w = mount(OntologyWorkbench, { global: { plugins: [pinia] } })
+    expect(w.find('[data-testid="onto-type-filter"]').exists()).toBe(true)
+    expect(w.findAll('[data-testid="onto-type-filter"] input').length).toBe(0)
+    expect(w.findAll('input[type="checkbox"]').length).toBe(1)   // 仍=case 数
+    expect(w.text()).not.toContain('批量驳回')                    // 未勾选不出现
+  })
+})
