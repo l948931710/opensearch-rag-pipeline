@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import {
   Database, CheckCircle2, Archive, Clock, GitBranch, Timer, Cpu,
   ShieldAlert, ShieldCheck, ThumbsUp, ThumbsDown, Headset, Percent, Quote, MessageSquare, Ban,
   Search, AlertTriangle,
 } from 'lucide-vue-next'
-import { useKb } from '@/composables/useKb'
+import { useKb, type KbDeptCoverage } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
 import StatusDistBar from './StatusDistBar.vue'
 import StatCard from './StatCard.vue'
@@ -102,10 +102,20 @@ const availabilityCards = computed<Card[]>(() => {
 const deptDocItems = computed(() =>
   [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => c.docs - a.docs)
     .map((d) => ({ label: deptLabel(d.owner_dept), value: d.docs, delta: d.wow_net ?? null, deltaPct: d.wow_total ?? null })))
-// 各部门使用量（命中提问数，近 30 天）+ 使用量周环比（本周 vs 上周）——按使用量降序。
-const deptUsageItems = computed(() =>
-  [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => c.qa_hits - a.qa_hits)
-    .map((d) => ({ label: deptLabel(d.owner_dept), value: d.qa_hits, delta: d.qa_wow_net ?? null, deltaPct: d.qa_wow ?? null })))
+// 各部门使用量（命中提问数）+ 使用量周环比——按当前窗口使用量降序（批次δ-2：7/30 天切换）。
+// ⚠️ 字段窗口语义（别复刻 FeedbackTrend「30=累计」的形状陷阱）：qa_hits 是真·近 30 天
+// （SQL INTERVAL 30 DAY），qa_hits_7d 是真·近 7 天（wow 子查询的 qa7）——两键各自货真价实。
+// 7 天口径缺失（wow 子查询失败 → null=未知）时回落 30 天并在标题如实标注，绝不把 null 画成 0。
+const usageWin = ref<7 | 30>(30)
+const usage7dAvailable = computed(() =>
+  (kbGovernance.value?.dept_coverage || []).some((d) => d.qa_hits_7d != null))
+const usageWinEffective = computed(() => (usageWin.value === 7 && !usage7dAvailable.value ? 30 : usageWin.value))
+const deptUsageItems = computed(() => {
+  const win7 = usageWinEffective.value === 7
+  const val = (d: KbDeptCoverage) => (win7 ? (d.qa_hits_7d ?? 0) : d.qa_hits)
+  return [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => val(c) - val(a))
+    .map((d) => ({ label: deptLabel(d.owner_dept), value: val(d), delta: d.qa_wow_net ?? null, deltaPct: d.qa_wow ?? null }))
+})
 const fileTypeItems = computed(() => (kbGovernance.value?.file_types || []).map((f) => ({ label: f.ftype, value: f.count })))
 const fileTotal = computed(() => (kbGovernance.value?.file_types || []).reduce((s, f) => s + f.count, 0))
 const riskCards = computed<Card[]>(() => {
@@ -282,7 +292,7 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       <!-- 最常被使用 | 高频未答好 —— 一个框两半 -->
       <div v-if="kbInsights" :class="SPLIT">
         <div class="p-[15px]">
-          <p :class="SUBHEAD">最常被使用的知识</p>
+          <p :class="SUBHEAD">最常被使用的知识<span class="ml-1.5 font-normal text-faint">近 30 天</span></p>
           <BarList bare :items="topDocItems" unit=" 问" empty="近期暂无检索记录。" />
         </div>
         <div class="p-[15px]">
@@ -293,13 +303,25 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
           <BarList bare :items="gapItems" tone="bg-st-warn" unit=" 次" empty="近期无「召回但未答好」的提问。" />
         </div>
       </div>
-      <!-- 各部门使用量 + 使用量周环比（命中提问数；柱=近30天、徽标=本周净变化） -->
-      <div v-if="deptUsageItems.length" class="mt-3 rounded-2xl border border-border bg-surface p-[15px]">
-        <div class="mb-2 flex items-baseline justify-between gap-2">
-          <span class="text-[12.5px] font-medium text-muted-foreground">各部门使用量（近 30 天）</span>
-          <span class="text-[11px] text-faint">▲▼ = 本周使用量净变化（次）</span>
+      <!-- 各部门使用量 + 使用量周环比（命中提问数；柱=当前窗口、徽标=本周净变化，两窗口下均为 7 天口径环比） -->
+      <div v-if="deptUsageItems.length" class="mt-3 rounded-2xl border border-border bg-surface p-[15px]" data-testid="dept-usage-block">
+        <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <span class="text-[12.5px] font-medium text-muted-foreground" data-testid="dept-usage-title">各部门使用量（近 {{ usageWinEffective }} 天）</span>
+          <span class="flex items-center gap-2.5">
+            <span class="flex gap-0.5 rounded-lg border border-border bg-panel p-0.5">
+              <button
+                v-for="w in ([7, 30] as const)" :key="w" type="button" :data-testid="`dept-usage-win-${w}`"
+                class="rounded-md px-2.5 py-1 text-[11.5px] font-medium transition"
+                :class="usageWinEffective === w ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                :disabled="w === 7 && !usage7dAvailable"
+                :title="w === 7 && !usage7dAvailable ? '7 天口径未知（环比子查询失败），暂不可切' : ''"
+                @click="usageWin = w"
+              >近 {{ w }} 天</button>
+            </span>
+            <span class="text-[11px] text-faint">▲▼ = 本周使用量净变化（次）</span>
+          </span>
         </div>
-        <ColumnChart :items="deptUsageItems" unit=" 次" empty="近期无检索记录。" />
+        <ColumnChart :items="deptUsageItems" unit=" 次" :empty="`近 ${usageWinEffective} 天无检索记录。`" />
         <p class="mt-1 text-[11px] text-faint">使用量 = 命中本部门文档的提问数；对照「各部门文档数」找覆盖多但用得少的部门。</p>
       </div>
     </section>

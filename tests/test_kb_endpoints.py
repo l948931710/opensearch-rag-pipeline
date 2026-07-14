@@ -2117,3 +2117,71 @@ def test_ops_metrics_slo_and_admission_aggregation(monkeypatch):
     assert d["2026-07-12"].admitted == 450 and d["2026-07-12"].rejected == 0
     assert d["2026-07-13"].admitted == 500 and d["2026-07-13"].rejected == 23
     assert [(r.reason, r.count) for r in resp.admission_reasons] == [("per_min", 20), ("global_cap", 3)]
+
+
+# ── dept_coverage.qa_hits_7d（批次δ-2：看板 7/30 窗口切换的数据面）─────────────────
+def _stub_dept_usage(monkeypatch, wow_rows="ok"):
+    """定向桩：只喂 dept_coverage 的 30 天使用量与 14 天 wow 两条子查询；其余 fetchone→None
+    （governance 各子查询 `or (defaults)` 兜底）、fetchall→[]。wow_rows='raise' 模拟 wow 子查询失败。"""
+    sink = {"calls": []}
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            sink["calls"].append(sql)
+            self._sql = sql
+            if wow_rows == "raise" and "INTERVAL 14 DAY" in sql and "qa_session_log" in sql:
+                raise RuntimeError("wow query down")
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            sql = getattr(self, "_sql", "")
+            if "qa_session_log" in sql and "INTERVAL 14 DAY" in sql:
+                return [("marketing", 9, 5)]          # 近7天=9 · 前7天=5
+            if "qa_session_log" in sql and "GROUP BY m.owner_dept" in sql:
+                return [("marketing", 30, 3)]         # 近30天=30 · REFUSAL=3
+            return []
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: _Conn())
+    return sink
+
+
+def test_governance_dept_qa_hits_7d_exposed(monkeypatch):
+    """qa_hits_7d = wow 子查询现成的 qa7（零新增扫描）：随 30/7 双口径一起吐出。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_dept_usage(monkeypatch)
+    from opensearch_pipeline import api
+    resp = api.kb_governance(request=None, identity=api.Identity(user_id="dev1"))
+    row = next(r for r in resp.dept_coverage if r.owner_dept == "marketing")
+    assert row.qa_hits == 30
+    assert row.qa_hits_7d == 9
+    assert row.qa_wow_net == 4          # 9-5，与 qa_hits_7d 同源
+    assert row.no_answer_rate == 0.1
+
+
+def test_governance_dept_qa_hits_7d_none_on_wow_failure(monkeypatch):
+    """wow 子查询失败 → qa_hits_7d 与 qa_wow_net 同生共死给 None（未知≠零使用）；qa_hits 不受累。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_dept_usage(monkeypatch, wow_rows="raise")
+    from opensearch_pipeline import api
+    resp = api.kb_governance(request=None, identity=api.Identity(user_id="dev1"))
+    row = next(r for r in resp.dept_coverage if r.owner_dept == "marketing")
+    assert row.qa_hits == 30            # 主口径独立存活
+    assert row.qa_hits_7d is None       # 绝不伪装成 0
+    assert row.qa_wow_net is None and row.qa_wow is None

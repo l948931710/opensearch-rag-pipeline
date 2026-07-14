@@ -199,3 +199,33 @@ describe('FeedbackTrend — 7/30 天切换', () => {
     expect(w.text()).not.toContain('108')
   })
 })
+
+// ── 批次δ-2：各部门使用量 7/30 天窗口切换 ─────────────────────────────────────────
+describe('批次δ-2 — 各部门使用量 7/30 天切换', () => {
+  const GOV7 = {
+    ...GOV,
+    dept_coverage: [
+      { owner_dept: 'production', docs: 800, new_month: 711, qa_hits: 303, no_answer_rate: 0.221, pii_docs: 247, qa_wow_net: -10, qa_wow: -0.032, qa_hits_7d: 61 },
+      { owner_dept: 'it', docs: 36, new_month: 0, qa_hits: 384, no_answer_rate: 0.102, pii_docs: 8, qa_wow_net: 22, qa_wow: 0.061, qa_hits_7d: 97 },
+    ],
+  }
+
+  it('默认近 30 天=qa_hits；切近 7 天：标题联动 + 柱值换 qa_hits_7d（块内断言，避开 DeptTable 的 30 天列）', async () => {
+    const w = mountWith(KbAdminDashboard, identity({ role: 'kb_admin' }), { gov: GOV7 as any, insights: INSIGHTS })
+    const block = () => w.find('[data-testid="dept-usage-block"]')
+    expect(w.find('[data-testid="dept-usage-title"]').text()).toContain('近 30 天')
+    expect(block().text()).toContain('384')                       // 30 天口径（it 部门）
+    await w.find('[data-testid="dept-usage-win-7"]').trigger('click')
+    expect(w.find('[data-testid="dept-usage-title"]').text()).toContain('近 7 天')
+    expect(block().text()).toContain('97')                        // 7 天口径
+    expect(block().text()).not.toContain('384')                   // 30 天值不再画柱（DeptTable 不受影响）
+    expect(block().text()).toContain('▲+22')                      // 周环比徽标两窗口同源保留
+  })
+
+  it('qa_hits_7d 全缺（wow 子查询失败=未知）→ 近 7 天禁用、有效窗口回落 30 天——绝不把 null 画成 0', () => {
+    const w = mountWith(KbAdminDashboard, identity({ role: 'kb_admin' }), { gov: GOV as any, insights: INSIGHTS })   // GOV 原 fixture 无 qa_hits_7d
+    const b7 = w.find('[data-testid="dept-usage-win-7"]')
+    expect((b7.element as HTMLButtonElement).disabled).toBe(true)
+    expect(w.find('[data-testid="dept-usage-title"]').text()).toContain('近 30 天')
+  })
+})

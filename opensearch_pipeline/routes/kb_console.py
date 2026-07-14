@@ -1233,6 +1233,9 @@ class KbDeptCoverageItem(BaseModel):
     #   qa_wow_net = 净变化「次」（徽标主显）；qa_wow = 净变化 / 上周使用量（无上周使用→ null）。
     qa_wow_net: Optional[int] = None
     qa_wow: Optional[float] = None
+    # 批次δ-2：近 7 天绝对使用量（看板 7/30 窗口切换）——来自 wow 子查询现成的 qa7，
+    # 与 qa_wow_net 同源同降级（wow 子查询失败 → None=未知，区别于真·零使用）。
+    qa_hits_7d: Optional[int] = None
 
 
 class KbFeedbackDay(BaseModel):
@@ -1585,7 +1588,10 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                         owner_dept=k, docs=v["docs"], new_month=v["new_month"], qa_hits=v["qa_hits"],
                         no_answer_rate=round(v["refusal"] / v["qa_hits"], 4) if v["qa_hits"] else 0.0,
                         pii_docs=v["pii"], wow_net=_wow_net(v), wow_total=_wow_pct(v),
-                        qa_wow_net=_qa_wow_net(v), qa_wow=_qa_wow(v)) for k, v in cov.items()],
+                        qa_wow_net=_qa_wow_net(v), qa_wow=_qa_wow(v),
+                        # 批次δ-2：近 7 天绝对使用量——就是 wow 子查询现成的 qa7（零新增扫描）。
+                        # 与 qa_wow_net/qa_wow 同生共死：子查询失败给 None（未知），绝不伪装成 0。
+                        qa_hits_7d=(v["qa7"] if qa_wow_ok else None)) for k, v in cov.items()],
                     key=lambda x: x.docs, reverse=True)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance dept_coverage 失败: %s", e)
