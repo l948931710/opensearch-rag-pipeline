@@ -18,9 +18,11 @@ const resetSignal = computed(() => route.fullPath + '::' + activeId.value)
 <template>
   <div class="relative flex h-[100dvh] overflow-hidden bg-background text-foreground">
     <Sidebar />
-    <!-- scrollbar-gutter:stable 常驻滚动条槽位：避免短内容页（如成员管理）无滚动条时，
-         mx-auto 居中内容相对长页（概览/文档管理）整体右移 ~半个滚动条宽 → 切 tab 不再位移。 -->
-    <main class="min-w-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+    <!-- overflow-y-scroll 常驻 11px 滚动条槽位（track 透明不可见）：短内容页（审批历史/成员管理）
+         无滚动条时 mx-auto 居中内容相对长页（概览/文档管理）平移 ~半个滚动条宽。
+         此前只靠 [scrollbar-gutter:stable] 兜底，真机（Safari<17.4 等）不认该属性时平移仍现——
+         scroll 常驻是跨浏览器兜底，gutter 声明保留无害。 -->
+    <main class="min-w-0 flex-1 overflow-y-scroll [scrollbar-gutter:stable]">
       <ErrorBoundary :reset-signal="resetSignal">
         <RouterView v-slot="{ Component }">
           <Transition name="fade" mode="out-in">
