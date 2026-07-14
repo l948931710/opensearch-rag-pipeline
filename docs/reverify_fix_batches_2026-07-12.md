@@ -220,6 +220,28 @@ A3 的 staging 演练排在这批合入之后。
 **闸门**：真实 seeding / 任何 auto 路径开启前（与批次 7 的 gate 签字并行推进，
 但 auto 开启必须两者都齐——C2 正是 S9 硬闸测不到的盲区）。
 
+> **状态（2026-07-13）：✅ 代码侧完成**（落 claude/ontology-p0；全量 3537 绿 + lint 绿；
+> **schema/038 已 apply 本地 + 台账**，staging/prod apply 进批次7）。实现说明：
+> ① C2 落列：schema/038 `ontology_object.normalized_title`（聚类键权威实现挪到
+>   `normalize.title_key`，store/seeding/backfill 三处同源）+ (type,status,norm) 索引；
+>   store 两条 mint 路径写入；find_objects 增 `norm_title` 等值臂（双后端）。
+>   存量回填=`scripts/backfill_normalized_title.py`（dry-run 默认）——**真实播种前置
+>   = 038 三环境 apply + backfill remaining=0**（先 apply 后部署；ontology 写路径
+>   生产 flag-off 无风险窗口）。
+> ② C2 召回：`title_matches` 主臂=norm 等值（LIKE 对空白/全半角变体天然漏召回
+>   =false-mint 根源）+ LIKE 辅臂兜 backfill 过渡（辅臂命中主臂 miss → WARNING 报
+>   缺口）；任一臂打满 `_TITLE_MATCH_LIMIT`(50) → WARNING（截断可观测）。
+> ③ C2 回测盲区：候选生成抽取为 `_generate_candidates`（_decide 与仿真共用，测的
+>   即跑的）；新增 `seeding.simulate_seed_decision`（纯读 would-auto 仿真，auto 裁决
+>   用 auto_eligible 绕 ACK 环境闸=「若开 auto 会怎样」，与 resolver 臂同口径）；
+>   `ontology_backtest.py` 增 seed 臂（GT 可选列 title/object_type/owner_dept，缺列行
+>   计 skipped 不静默）**并纳入硬门**：seed_auto_wrong>0 或超率即破门。
+> ④ C3 先 ACL 后截断（**拍板记录**）：`_enrich_candidates` 扫全量候选、可见者填满
+>   top-N、不可读者不占预算且**弃逐行常量 stub 改 `candidates_hidden` 聚合计数**——
+>   计数保留 HITL 告警价值（知道有 N 个被遮蔽）且不可区分性更强（连 candidate_id/
+>   排序位都不暴露）。test_ontology_acl_matrix + test_routes_ontology 两处旧 stub
+>   契约测试已更新到新契约（原契约=复核点名的反模式锁定）。
+
 ### C2 归一化感知召回 【M-L】
 - `schema/03x`：`ontology_object` 加 `normalized_title` 列 + 索引，含存量 backfill 迁移。
 - `store.find_objects` 增归一键等值查询；`seeding.title_matches`（seeding.py:197-207）改等值召回，

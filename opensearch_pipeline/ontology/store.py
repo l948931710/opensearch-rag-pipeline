@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from opensearch_pipeline.ontology.ids import format_ref, new_ulid
+from opensearch_pipeline.ontology.normalize import title_key
 
 logger = logging.getLogger(__name__)
 
@@ -266,12 +267,12 @@ class RDSOntologyStore:
                 canonical_ref = format_ref(type_code, seq_no)
                 cur.execute(
                     f"INSERT INTO {db}.ontology_object "
-                    "(object_id, object_type, canonical_ref, title, golden_json, "
-                    " golden_provenance_json, lifecycle_state, "
+                    "(object_id, object_type, canonical_ref, title, normalized_title, "
+                    " golden_json, golden_provenance_json, lifecycle_state, "
                     " owner_dept, data_classification, source_of_record) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (object_id, object_type, canonical_ref, title, _dump(golden or {}),
-                     _dump(provenance),
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (object_id, object_type, canonical_ref, title, title_key(title),
+                     _dump(golden or {}), _dump(provenance),
                      lifecycle_state, owner_dept, data_classification, source_of_record))
             conn.commit()
             return {"object_id": object_id, "object_type": object_type,
@@ -293,7 +294,11 @@ class RDSOntologyStore:
             conn.close()
 
     def find_objects(self, object_type: str, *, title_like: Optional[str] = None,
+                     norm_title: Optional[str] = None,
                      status: str = "active", limit: int = 50) -> List[Dict[str, Any]]:
+        """norm_title（C2 复核批次6）：normalized_title（038）等值召回——同名聚类的
+        权威臂（LIKE 对空白/全半角变体天然漏召回）。存量行须先跑
+        scripts/backfill_normalized_title.py，否则 NULL 行不参与等值匹配。"""
         db, conn = self._db(), self._conn()
         limit = max(1, min(int(limit), 200))
         try:
@@ -305,6 +310,9 @@ class RDSOntologyStore:
                 if title_like:
                     sql += " AND title LIKE %s"
                     params.append(f"%{title_like}%")
+                if norm_title:
+                    sql += " AND normalized_title=%s"
+                    params.append(norm_title)
                 cur.execute(sql + " ORDER BY canonical_ref LIMIT %s", (*params, limit))
                 return self._rows_to_dicts(cur)
         finally:
@@ -710,12 +718,12 @@ class RDSOntologyStore:
                 canonical_ref = format_ref(type_code, seq_no)
                 cur.execute(
                     f"INSERT INTO {db}.ontology_object "
-                    "(object_id, object_type, canonical_ref, title, golden_json, "
-                    " golden_provenance_json, lifecycle_state, "
+                    "(object_id, object_type, canonical_ref, title, normalized_title, "
+                    " golden_json, golden_provenance_json, lifecycle_state, "
                     " owner_dept, data_classification, source_of_record) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (object_id, object_type, canonical_ref, title, _dump(golden or {}),
-                     _dump(provenance),
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (object_id, object_type, canonical_ref, title, title_key(title),
+                     _dump(golden or {}), _dump(provenance),
                      lifecycle_state, owner_dept, data_classification, source_of_record))
                 case_id = None
                 if close_open_case:
@@ -1546,6 +1554,7 @@ class MemoryOntologyStore:
             object_id = new_ulid()
             row = {"object_id": object_id, "object_type": object_type,
                    "canonical_ref": format_ref(code, seq_no), "title": title,
+                   "normalized_title": title_key(title),
                    "golden_json": _dump(golden or {}),
                    "golden_provenance_json": _dump(provenance),
                    "lifecycle_state": lifecycle_state,
@@ -1561,11 +1570,14 @@ class MemoryOntologyStore:
             row = self._objects.get(object_id)
             return dict(row) if row else None
 
-    def find_objects(self, object_type, *, title_like=None, status="active", limit=50):
+    def find_objects(self, object_type, *, title_like=None, norm_title=None,
+                     status="active", limit=50):
         with self._lock:
             out = [dict(o) for o in self._objects.values()
                    if o["object_type"] == object_type and o["status"] == status
-                   and (title_like is None or title_like in o["title"])]
+                   and (title_like is None or title_like in o["title"])
+                   and (norm_title is None
+                        or (o.get("normalized_title") or title_key(o["title"])) == norm_title)]
             return sorted(out, key=lambda o: o["canonical_ref"])[:max(1, min(int(limit), 200))]
 
     def count_objects(self, object_type, *, title_like=None, status="active"):

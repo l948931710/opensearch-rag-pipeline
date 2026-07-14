@@ -110,6 +110,7 @@ MANIFEST="
 035_agent_checkpoint_digest_hmac.sql operation
 036_agent_run_message_id.sql operation
 037_agent_run_serialization.sql operation
+038_ontology_object_normalized_title.sql ontology
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }

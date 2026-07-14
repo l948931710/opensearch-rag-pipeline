@@ -141,9 +141,14 @@ class SeedReport:
                 f"错误 {self.errors}")
 
 
+_TITLE_MATCH_LIMIT = 50    # 同名聚类召回每臂上限（打满即 WARNING：截断可观测）
+
+
 def _title_key(title: str) -> str:
-    """标题聚类键：借 lab_sample 归一（去全部空白+全半角统一，保内容原样）。"""
-    return normalize("lab_sample", title)
+    """标题聚类键——委托 normalize.title_key（C2：权威实现挪到 normalize.py，
+    与 store 落列 / backfill 脚本三处同源）。"""
+    from opensearch_pipeline.ontology.normalize import title_key
+    return title_key(title)
 
 
 def _attrs_conflict(a: Dict[str, str], golden_json: Optional[str]) -> bool:
@@ -195,12 +200,40 @@ class _Sink:
         return row["target_object_id"] if row else None
 
     def title_matches(self, object_type: str, title: str) -> List[Dict[str, Any]]:
+        """C2 归一化感知召回（复核批次6）。主臂=normalized_title 等值（038 列，
+        LIKE 对空白/全半角变体天然漏召回=false-mint 根源）；辅臂=legacy LIKE +
+        Python 归一过滤，兜住 038 backfill 前的存量 NULL 行——辅臂命中而主臂 miss
+        即 backfill 缺口，WARNING 可观测（回填完成后辅臂恒为主臂子集，零噪声）。
+        任一臂打满 _TITLE_MATCH_LIMIT → WARNING（被截断的同名对象=漏掉的合并候选）。"""
         key = _title_key(title)
+        seen: Dict[str, Dict[str, Any]] = {}
+        try:
+            norm_hits = self._store.find_objects(object_type, norm_title=key,
+                                                 limit=_TITLE_MATCH_LIMIT)
+        except TypeError:   # 旧 store 桩无 norm_title 参数：整程退回辅臂
+            norm_hits = []
+        if len(norm_hits) >= _TITLE_MATCH_LIMIT:
+            logger.warning("title_matches 归一臂打满 LIMIT=%d（type=%s key=%r）——超出部分被"
+                           "截断，可能漏合并候选", _TITLE_MATCH_LIMIT, object_type, key)
+        for obj in norm_hits:
+            seen[obj["object_id"]] = obj
+        legacy = self._store.find_objects(object_type, title_like=title.strip(),
+                                          limit=_TITLE_MATCH_LIMIT)
+        if len(legacy) >= _TITLE_MATCH_LIMIT:
+            logger.warning("title_matches LIKE 辅臂打满 LIMIT=%d（type=%s title=%r）——超出"
+                           "部分被截断", _TITLE_MATCH_LIMIT, object_type, title)
+        gap = [o for o in legacy
+               if _title_key(o["title"]) == key and o["object_id"] not in seen]
+        if gap and norm_hits is not None:
+            logger.warning("title_matches 辅臂命中 %d 行归一臂 miss（type=%s key=%r）——"
+                           "038 backfill 缺口，请跑 scripts/backfill_normalized_title.py",
+                           len(gap), object_type, key)
+        for obj in gap:
+            seen[obj["object_id"]] = obj
         out = []
-        for obj in self._store.find_objects(object_type, title_like=title.strip(), limit=50):
-            if _title_key(obj["title"]) == key:
-                full = self._store.get_object(obj["object_id"]) or obj
-                out.append(full)
+        for oid, obj in seen.items():
+            full = self._store.get_object(oid) or obj
+            out.append(full)
         for p in self._planned_objects:
             if p["object_type"] == object_type and _title_key(p["title"]) == key:
                 out.append(p)
@@ -358,15 +391,9 @@ def source_fingerprint(source: Any) -> Optional[str]:
         return None
 
 
-def _decide(r: SeedRecord, sink: _Sink, tau: TauTable, report: SeedReport, *,
-            mint_new: bool = True, source_fp: Optional[str] = None) -> None:
-    norm = normalize(r.namespace, r.raw_code)
-    if sink.is_active(r.namespace, norm):
-        report.skipped_active += 1
-        report.add(action="skip_active", namespace=r.namespace, norm=norm)
-        sink.heal_if_stale(r.namespace, norm)
-        return
-
+def _generate_candidates(sink: "_Sink", r: SeedRecord, norm: str) -> List[Candidate]:
+    """播种侧候选生成（_decide 与 simulate_seed_decision 共用——C2 复核批次6 抽取，
+    保证回测仿真与真实播种走同一套规则，不出现「测的不是跑的」）。"""
     candidates: List[Candidate] = []
     # rule ①：改模后缀 → 基础码目标（恒人审）
     for suffix in _REVISION_SUFFIXES:
@@ -384,6 +411,49 @@ def _decide(r: SeedRecord, sink: _Sink, tau: TauTable, report: SeedReport, *,
             target_object_id=obj["object_id"], method="rule",
             confidence=_ATTR_CONFLICT_CONF if conflict else _EXACT_TITLE_CONF,
             features={"rule": "exact_title", "attr_conflict": conflict}))
+    return candidates
+
+
+def simulate_seed_decision(store, r: SeedRecord, *, tau_table: Optional[TauTable] = None,
+                           source_fingerprint: Optional[str] = None) -> Dict[str, Any]:
+    """C2（复核批次6）：播种路径 would-auto 仿真——纯读，零写库，供
+    scripts/ontology_backtest.py 的 seed 臂调用。S9 硬闸只回测 resolver 路径；
+    播种侧合并判定走 rule①（改模后缀）/rule②（同型同名聚类），两条路径的
+    false-merge 面不重合（复核确认的覆盖缺口）。
+
+    与真实播种的差异（有意）：auto 裁决用 auto_eligible（绕过 AUTO_ACK 环境闸）——
+    回测回答「若开 auto 会怎样」，与 run_backtest 的 resolver 臂同口径。
+    返回 {"action": skip_active|auto_alias|case|mint, "target", "confidence", "candidates"}。
+    """
+    from opensearch_pipeline.ontology.resolve import auto_eligible
+    tau = tau_table or TauTable.from_env(strict=True)
+    sink = _Sink(store, True, SeedReport())
+    norm = normalize(r.namespace, r.raw_code)
+    if sink.is_active(r.namespace, norm):
+        row = store.get_active_identifier(r.namespace, norm) or {}
+        return {"action": "skip_active", "target": row.get("target_object_id"),
+                "confidence": None, "candidates": 0}
+    candidates = _generate_candidates(sink, r, norm)
+    winner = auto_eligible(candidates, intent="read", namespace=r.namespace, tau_table=tau)
+    if winner is not None:
+        return {"action": "auto_alias", "target": winner.target_object_id,
+                "confidence": winner.confidence, "candidates": len(candidates)}
+    if candidates:
+        return {"action": "case", "target": None, "confidence": None,
+                "candidates": len(candidates)}
+    return {"action": "mint", "target": None, "confidence": None, "candidates": 0}
+
+
+def _decide(r: SeedRecord, sink: _Sink, tau: TauTable, report: SeedReport, *,
+            mint_new: bool = True, source_fp: Optional[str] = None) -> None:
+    norm = normalize(r.namespace, r.raw_code)
+    if sink.is_active(r.namespace, norm):
+        report.skipped_active += 1
+        report.add(action="skip_active", namespace=r.namespace, norm=norm)
+        sink.heal_if_stale(r.namespace, norm)
+        return
+
+    candidates = _generate_candidates(sink, r, norm)
 
     if candidates:
         winner = may_auto_activate(candidates, intent="read", namespace=r.namespace,

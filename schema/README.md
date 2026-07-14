@@ -12,7 +12,7 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 038（031=agent 审批/执行硬化【2026-07-11 占用——
+3. **编号严格单调递增**，下一个可用号 = 039（031=agent 审批/执行硬化【2026-07-11 占用——
    原「本体事件」的 P2 预订作废顺延，落地时取当时最新号】、032=台账 checksum、033=本体
    link 不变量、034=sem 视图 product ACL 列、035=checkpoint 摘要 HMAC 加宽、036=agent_run
    message_id、037=agent_run 串行化生成列）。历史上有三对编号冲突（002/003/006 各两个文件，
@@ -73,6 +73,7 @@ apply 脚本落库并记台账。
 | 035_agent_checkpoint_digest_hmac.sql | fuling_operation | 重评审计 P1-2：agent_checkpoint.state_digest CHAR(64)→VARCHAR(80)——摘要从裸 sha256 升级 `hmac1:<hmac_sha256>`（带密钥真实性，能写表者重算 sha256 绕不过）；**须在 HMAC 代码之前 apply**（纯加宽零影响，反序 1406 挂起失败）；静态加密 RAG_AGENT_CHECKPOINT_ENCRYPT 默认 off（2026-07-11；已 apply 本地+staging+生产） |
 | 036_agent_run_message_id.sql | fuling_operation | 重审计 §5 U1/U2：agent_run.message_id——run 锚定 qa_session_log 答案行（答案读回 + 续跑反馈投票不悬空）；**先 apply 后部署**（get_run SELECT 引用本列） |
 | 037_agent_run_serialization.sql | fuling_operation | 复核批次1 A1：agent_run.active_thread 生成列（非终态=thread_id、终态=NULL）+ uk_thread_active——per-thread 非终态 run DB 级互斥（并发双 submit 恰一个 1062→ThreadBusy→409）；apply 前须核对无同 thread 多非终态残行 |
+| 038_ontology_object_normalized_title.sql | fuling_ontology | 复核批次6 C2：ontology_object.normalized_title 聚类键列（normalize.title_key）+ (type,status,norm) 索引——同名聚类等值召回（LIKE 对空白/全半角变体漏召回=播种侧 false-mint 盲区）；存量回填=scripts/backfill_normalized_title.py，真实播种前置=apply+backfill 完成；先 apply 后部署 |
 
 ## 台账（schema_migrations）
 

@@ -371,17 +371,17 @@ def test_existence_non_leak_matrix(store):
 
 
 def test_workbench_candidate_cross_dept_target_masked(store):
-    """case 可见但候选目标跨部门不可读 → target_visible=False，ref/title/type 全空。"""
+    """case 可见但候选目标跨部门不可读 → 候选列表零行零字段泄露，只剩
+    candidates_hidden 聚合计数（C3 复核批次6：弃逐行 stub 改聚合，拍板记录见
+    routes/ontology._enrich_candidates docstring 与 test_ontology_acl_matrix）。"""
     conf = store.mint_object("material", "机密牌号", owner_dept="supply",
                              data_classification="confidential", _caller="test")
     case_id = store.upsert_case("u8", "m9", "M9", object_type_hint="product")
     store.add_candidate(case_id, conf["object_id"], method="embedding", confidence=0.8)
     mine = _client(_identity(user_id="dp", role="dept_admin", managed=("pmc",)))
     detail = mine.get(f"/api/ontology/cases/{case_id}").json()
-    cand = detail["candidates"][0]
-    assert cand["target_visible"] is False
-    assert cand["canonical_ref"] is None and cand["title"] is None
-    assert cand["object_type"] is None
+    assert detail["candidates"] == []            # 不可读候选不出行（零泄露）
+    assert detail["candidates_hidden"] == 1      # HITL 仍知道有 1 个候选被遮蔽
 
 
 def test_confirm_cross_dept_confidential_target_denied(store):

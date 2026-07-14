@@ -65,3 +65,10 @@ def normalize(namespace: str, raw: str) -> str:
         return "".join(s.split())
     # 未登记命名空间（hr/dingtalk_uid/us_wh/…）：保守默认，不改大小写
     return s
+
+
+def title_key(title: str) -> str:
+    """标题聚类键（C2 复核批次6，唯一权威实现）：借 lab_sample 归一——去全部空白 +
+    全半角统一，内容/大小写原样。store 落 `ontology_object.normalized_title`（038）、
+    seeding 同名聚类召回、backfill 脚本三处共用；改这里=改聚类语义，须重跑 backfill。"""
+    return normalize("lab_sample", title)

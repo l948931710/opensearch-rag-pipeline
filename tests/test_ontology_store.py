@@ -943,3 +943,18 @@ def test_c1_active_target_still_writable(store, ns):
     cid = store.upsert_case(ns, "u8 c1f", "U8-C1F")
     got = store.confirm_case_with_identifier(cid, target_object_id=a["object_id"], by="tester")
     assert store.get_identifier(got)["status"] == "active"
+
+
+# ── C2（复核批次6）：find_objects norm_title 等值召回（038 normalized_title）──────
+
+
+def test_c2_find_objects_by_norm_title(store):
+    from opensearch_pipeline.ontology.normalize import title_key
+    tag = uuid.uuid4().hex[:8]
+    a = _mint(store, title=f"{_MARK}PP 龙虾杯-{tag}")      # 带空格
+    _mint(store, title=f"{_MARK}其他杯-{tag}")
+    key = title_key(f"{_MARK}PP龙虾杯-{tag}")               # 无空格变体 → 同聚类键
+    hits = store.find_objects("product", norm_title=key)
+    assert [h["object_id"] for h in hits] == [a["object_id"]]
+    # LIKE 臂对该变体必 miss（子串不成立）——正是 038 等值臂存在的理由
+    assert store.find_objects("product", title_like=f"{_MARK}PP龙虾杯-{tag}") == []

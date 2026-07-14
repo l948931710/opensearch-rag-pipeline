@@ -103,12 +103,6 @@ def _viewers():
 
 # ══ 1. 工作台候选 enrich（P0-A①）═══════════════════════════════════════════════
 
-_STUB_KEYS = {"candidate_id", "case_id", "target_visible", "target_object_id",
-              "target_revision", "method", "confidence", "features_json",
-              "canonical_ref", "title", "object_type", "target_status",
-              "owner_dept", "data_classification"}
-
-
 def _seed_mixed_case(store):
     """product-hint case（steward=pmc / backup=rd）+ 三个 supply 归属候选目标
     （public/internal/confidential）。返回 (case_id, {cls: obj})。"""
@@ -126,31 +120,45 @@ def _seed_mixed_case(store):
 
 
 @pytest.mark.parametrize("viewer_key", ["steward_admin", "backup_admin"])
-def test_candidate_enrich_restricted_is_constant_stub(store, viewer_key):
-    """steward / backup steward（P1-11 可见队列）都拿不到 supply 的 internal/confidential
-    候选字段：占位行 = 白名单常量形态，且 internal 与 confidential 的占位**互相不可区分**。"""
+def test_candidate_enrich_hidden_is_aggregate_count(store, viewer_key):
+    """C3（复核批次6，拍板记录）：不可读候选不再出逐行 stub，聚合为 candidates_hidden
+    计数——internal 与 confidential 连 candidate_id/排序位都不暴露（不可区分性更强），
+    可见候选独占 top-N 预算。steward / backup steward（P1-11 可见队列）同契约。"""
     case_id, objs = _seed_mixed_case(store)
     viewer = _viewers()[viewer_key]
     detail = _client(viewer).get(f"/api/ontology/cases/{case_id}").json()
-    by_visible = {}
-    for cand in detail["candidates"]:
-        by_visible.setdefault(cand["target_visible"], []).append(cand)
-    # public 候选可见且字段完整
-    vis = by_visible[True]
-    assert len(vis) == 1 and vis[0]["target_object_id"] == objs["public"]["object_id"]
-    assert vis[0]["method"] == "embedding" and vis[0]["confidence"] == 0.9
-    # internal/confidential → 常量占位：键集固定、除定位键外全 None
-    hidden = by_visible[False]
-    assert len(hidden) == 2
-    for cand in hidden:
-        assert set(cand.keys()) == _STUB_KEYS
-        for k in _STUB_KEYS - {"candidate_id", "case_id", "target_visible"}:
-            assert cand[k] is None, f"占位行泄露字段 {k}={cand[k]!r}"
-        assert cand["case_id"] == case_id
-    # 两条占位除 candidate_id 外逐位一致（internal vs confidential 不可区分）
-    a, b = (dict(c) for c in hidden)
-    a.pop("candidate_id"), b.pop("candidate_id")
-    assert a == b
+    # public 候选可见且字段完整；hidden 行零泄露（列表里只有可见行）
+    assert [c["target_object_id"] for c in detail["candidates"]]         == [objs["public"]["object_id"]]
+    vis = detail["candidates"][0]
+    assert vis["target_visible"] is True
+    assert vis["method"] == "embedding" and vis["confidence"] == 0.9
+    # internal/confidential → 只剩一个数（HITL 仍知道有 2 个候选被 ACL 遮蔽）
+    assert detail["candidates_hidden"] == 2
+
+
+@pytest.mark.parametrize("viewer_key", ["steward_admin", "backup_admin"])
+def test_candidate_enrich_acl_before_truncation(store, viewer_key):
+    """C3 主修：先 ACL 后截断——3 个高置信 hidden 候选不再把可见候选挤出 top-N
+    （旧实现 [:top_n] 先截断，处置人明明有可评估候选却看到空列表）。"""
+    case_id, objs = _seed_mixed_case(store)          # 3 hidden 之外再补 1 可见（低置信）
+    # _seed_mixed_case 里 public 可见；再造 2 个 supply confidential 高置信占位 + 1 个低置信 public
+    extra_hidden = []
+    for i in range(2):
+        o = store.mint_object("material", f"supply料-extra{i}", owner_dept="supply",
+                              data_classification="confidential", _caller="test")
+        store.add_candidate(case_id, o["object_id"], method="embedding",
+                            confidence=0.99 - i * 0.01, features={})
+        extra_hidden.append(o)
+    low_vis = store.mint_object("material", "supply料-lowvis", owner_dept="supply",
+                                data_classification="public", _caller="test")
+    store.add_candidate(case_id, low_vis["object_id"], method="embedding",
+                        confidence=0.1, features={})
+    detail = _client(_viewers()[viewer_key]).get(f"/api/ontology/cases/{case_id}").json()
+    got = [c["target_object_id"] for c in detail["candidates"]]
+    # 可见候选（public 0.9 + lowvis 0.1）都在——hidden 不占 top-N 预算（top_n=10 详情口径）
+    assert objs["public"]["object_id"] in got and low_vis["object_id"] in got
+    assert detail["candidates_hidden"] == 4          # internal+confidential+2 extra
+    assert all(c["target_visible"] is True for c in detail["candidates"])
 
 
 def test_candidate_enrich_matrix_other_roles(store):

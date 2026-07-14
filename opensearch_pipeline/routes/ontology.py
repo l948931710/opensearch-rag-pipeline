@@ -183,34 +183,28 @@ def _raise_mutation_denied(reason: str) -> None:
 
 
 # ── 读侧：队列 / 覆盖率 / 详情 / 对象搜索 ─────────────────────────────────────
-def _restricted_candidate_stub(c: Dict[str, Any]) -> Dict[str, Any]:
-    """不可读候选的**白名单重建**占位行（P0-A①）：只带 candidate_id/case_id 两个
-    自身定位键（不指向隐藏对象），其余字段全为常量 None。
-
-    绝不 ``{**c}`` 展开 SELECT * 行后再删字段——旧实现只清了 ref/title/type/status
-    四个字段，`target_object_id`/`features_json`/`method`/`confidence` 原样出参，
-    足以推断跨 ACL 对象的存在、特征与匹配强度。"""
-    return {
-        "candidate_id": c.get("candidate_id"), "case_id": c.get("case_id"),
-        "target_visible": False,
-        "target_object_id": None, "target_revision": None,
-        "method": None, "confidence": None, "features_json": None,
-        "canonical_ref": None, "title": None, "object_type": None,
-        "target_status": None, "owner_dept": None, "data_classification": None,
-    }
-
-
 def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
-                       top_n: int = 3) -> List[Dict[str, Any]]:
-    """候选目标对象信息按对象级 ACL 出参（PR-B / P0-A①）：不可读目标只返回
-    _restricted_candidate_stub 的常量形态——跨部门 confidential 候选正是 P0-01 的泄露面。"""
+                       top_n: int = 3):
+    """候选目标对象信息按对象级 ACL 出参（PR-B / P0-A① + C3 复核批次6）。
+
+    C3「先 ACL 后截断」：旧实现 `list_candidates()[:top_n]` 先截断再逐行 ACL——
+    top-N 全被遮蔽时可见候选被静默挤出（有可评估候选却给处置人看空列表）。
+    现在扫描全部候选，**可见者填满 top-N**（保持置信度序），不可读者不占预算、
+    聚合为 hidden_count 出参（拍板记录：弃逐行常量 stub 改聚合计数——计数同样保留
+    HITL 告警价值「有 N 个候选被 ACL 遮蔽」，且不可区分性更强：连 candidate_id/
+    排序位都不再暴露；跨部门 confidential 候选正是 P0-01 的泄露面）。
+
+    Returns: (visible_rows, hidden_count)。"""
     from opensearch_pipeline.ontology.authz import can_read_object, visible_title
-    out = []
-    for c in store.list_candidates(case_id)[:top_n]:
+    out: List[Dict[str, Any]] = []
+    hidden = 0
+    for c in store.list_candidates(case_id):
         obj = store.get_object(c["target_object_id"]) or {}
         if not can_read_object(obj, acl=acl, bypass_acl=bypass):
-            out.append(_restricted_candidate_stub(c))
+            hidden += 1
             continue
+        if len(out) >= top_n:
+            continue            # 可见预算已满：只继续数 hidden，不再出行
         out.append({**c, "target_visible": True,
                     "canonical_ref": obj.get("canonical_ref"),
                     "title": visible_title(obj.get("title"), obj.get("data_classification"),
@@ -219,7 +213,7 @@ def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
                     # PR-F HITL：处置人须看见目标归属/密级再确认（P0-06 UI 验收⑥）
                     "owner_dept": obj.get("owner_dept"),
                     "data_classification": obj.get("data_classification")})
-    return out
+    return out, hidden
 
 
 def _decode_cursor(raw: Optional[str], order: str) -> Optional[Dict[str, Any]]:
@@ -262,9 +256,10 @@ def ontology_workbench(request: Request, namespace: Optional[str] = None,
     for case in raw_cases:
         if not _can_manage_case(kb, store, case):   # 粗筛后的精判（裁决优先级，fail-closed）
             continue
+        cands, hidden = _enrich_candidates(store, case["case_id"], acl=acl, bypass=bypass)
         items.append({**case,
-                      "candidates": _enrich_candidates(store, case["case_id"],
-                                                       acl=acl, bypass=bypass),
+                      "candidates": cands,
+                      "candidates_hidden": hidden,
                       "steward_dept": _steward_dept_for(
                           store, namespace=case.get("namespace"),
                           object_type=case.get("object_type_hint"))})
@@ -299,9 +294,10 @@ def ontology_case_detail(case_id: str, request: Request,
     if case is None or not _can_manage_case(kb, store, case):
         raise HTTPException(status_code=404, detail="case 不存在")
     acl, bypass = _reader_acl(kb)
+    cands, hidden = _enrich_candidates(store, case_id, acl=acl, bypass=bypass, top_n=10)
     return {**case,
-            "candidates": _enrich_candidates(store, case_id, acl=acl, bypass=bypass,
-                                             top_n=10),
+            "candidates": cands,
+            "candidates_hidden": hidden,
             "steward_dept": _steward_dept_for(store, namespace=case.get("namespace"),
                                               object_type=case.get("object_type_hint"))}
 

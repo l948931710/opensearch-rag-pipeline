@@ -54,7 +54,11 @@ def _read_gt(path: str) -> List[Dict[str, str]]:
                 continue
             rows.append({"namespace": row["namespace"].strip(),
                          "raw_code": row["raw_code"].strip(),
-                         "expected_ref": (row.get("expected_ref") or "").strip().upper()})
+                         "expected_ref": (row.get("expected_ref") or "").strip().upper(),
+                         # C2 seed 臂可选列：两者齐备的行才参与播种路径仿真
+                         "title": (row.get("title") or "").strip(),
+                         "object_type": (row.get("object_type") or "").strip(),
+                         "owner_dept": (row.get("owner_dept") or "").strip()})
         return rows
 
 
@@ -140,6 +144,60 @@ def run_backtest(store, rows: List[Dict[str, str]], *, tau_table=None) -> Dict[s
     return {"metrics": metrics, "strata": per_stratum, "verdicts": verdicts}
 
 
+def run_seed_backtest(store, rows: List[Dict[str, str]], *, tau_table=None) -> Dict[str, Any]:
+    """C2（复核批次6）播种臂：S9 硬闸只回测 resolver 路径，播种侧合并判定
+    （rule① 改模后缀 / rule② 同型同名聚类）是它测不到的 false-merge 盲区。
+    对 GT 里带 title+object_type 的行跑 seeding.simulate_seed_decision（纯读），
+    would-auto 目标与 expected_ref 比对。缺列的行计 skipped（报告可见，不静默）。"""
+    from opensearch_pipeline.ontology.resolve import TauTable
+    from opensearch_pipeline.ontology.seeding import SeedRecord, simulate_seed_decision
+    tau = tau_table or TauTable.from_env(strict=True)
+    counters: Dict[str, int] = defaultdict(int)
+    verdicts: List[Dict[str, Any]] = []
+    for row in rows:
+        title, otype = row.get("title") or "", row.get("object_type") or ""
+        if not title or not otype:
+            counters["skipped_no_title"] += 1
+            continue
+        r = SeedRecord(namespace=row["namespace"], raw_code=row["raw_code"],
+                       object_type=otype, title=title,
+                       owner_dept=row.get("owner_dept") or "pmc")
+        try:
+            sim = simulate_seed_decision(store, r, tau_table=tau)
+        except ValueError as e:
+            counters["input_error"] += 1
+            verdicts.append({**row, "seed_action": "input_error", "detail": str(e)})
+            continue
+        counters[f"action_{sim['action']}"] += 1
+        would = None
+        if sim["action"] == "auto_alias":
+            obj = store.get_object(sim["target"]) or {}
+            would = (obj.get("canonical_ref") or "").upper()
+            counters["would_auto"] += 1
+            if row["expected_ref"] and would == row["expected_ref"]:
+                counters["auto_correct"] += 1
+            else:
+                counters["auto_wrong"] += 1   # 含 GT 判不存在却 would-auto（播种侧误合并）
+        verdicts.append({**row, "seed_action": sim["action"], "seed_would_auto": would,
+                         "seed_confidence": sim["confidence"],
+                         "seed_candidates": sim["candidates"]})
+    evaluated = len(rows) - counters["skipped_no_title"]
+    metrics = {
+        "n_rows": len(rows), "evaluated": evaluated,
+        "skipped_no_title": counters["skipped_no_title"],
+        "action_skip_active": counters["action_skip_active"],
+        "action_auto_alias": counters["action_auto_alias"],
+        "action_case": counters["action_case"],
+        "action_mint": counters["action_mint"],
+        "would_auto": counters["would_auto"],
+        "auto_correct": counters["auto_correct"],
+        "auto_wrong": counters["auto_wrong"],
+        "auto_wrong_rate": (round(counters["auto_wrong"] / evaluated, 4) if evaluated else 0.0),
+        "input_error": counters["input_error"],
+    }
+    return {"metrics": metrics, "verdicts": verdicts}
+
+
 def _manifest_skeleton(gt_path: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
     from datetime import date
 
@@ -207,6 +265,17 @@ def main(argv=None, *, store=None) -> int:
     if len(bad) > args.show:
         print(f"  …（其余 {len(bad) - args.show} 条见 --out 报告）")
 
+    # C2 seed 臂：GT 带 title+object_type 的行参与播种路径仿真（缺列=0 行则整臂 skip）
+    seed_report = None
+    if any((r.get("title") and r.get("object_type")) for r in rows):
+        seed_report = run_seed_backtest(store, rows)
+        sm = seed_report["metrics"]
+        print("── C2 播种臂（would-auto 仿真）──")
+        for k, v in sm.items():
+            print(f"  {k:22s} {v}")
+    else:
+        print("── C2 播种臂：GT 无 title/object_type 列，整臂 skip（resolver 臂不受影响）──")
+
     manifest = _manifest_skeleton(args.gt_csv, m)
     print("── AUTO_ACK manifest 骨架（签名密钥是 Sam 的，本工具不签名）──")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -214,7 +283,7 @@ def main(argv=None, *, store=None) -> int:
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
-            json.dump({**report, "manifest_skeleton": manifest}, f,
+            json.dump({**report, "seed_arm": seed_report, "manifest_skeleton": manifest}, f,
                       ensure_ascii=False, indent=2, default=str)
         print(f"完整报告 → {args.out}")
 
@@ -223,6 +292,12 @@ def main(argv=None, *, store=None) -> int:
         broken.append(f"false_merge_rate {m['false_merge_rate']} > {args.max_false_merge_rate}")
     if m["auto_wrong"] > 0:
         broken.append(f"auto_wrong={m['auto_wrong']}（would-auto 铸错对象）")
+    if seed_report is not None:
+        sm = seed_report["metrics"]
+        if sm["auto_wrong"] > 0:
+            broken.append(f"seed_auto_wrong={sm['auto_wrong']}（播种侧 would-auto 误合并）")
+        if sm["auto_wrong_rate"] > args.max_false_merge_rate:
+            broken.append(f"seed_auto_wrong_rate {sm['auto_wrong_rate']} > {args.max_false_merge_rate}")
     if broken:
         print("❌ 硬门破：" + "；".join(broken), file=sys.stderr)
         return 2
