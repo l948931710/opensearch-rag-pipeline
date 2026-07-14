@@ -20,7 +20,7 @@ const sorted = computed(() => [...(props.rows ?? [])].sort((a, b) => b.qa_hits -
           <th class="px-3.5 py-2.5 text-left font-semibold">部门</th>
           <th class="px-3 py-2.5 text-right font-semibold">已上线</th>
           <th class="px-3 py-2.5 text-right font-semibold">本月新增</th>
-          <th class="px-3 py-2.5 text-right font-semibold">使用量</th>
+          <th class="px-3 py-2.5 text-right font-semibold" title="命中本部门文档的提问数，固定近 30 天口径">使用量<span class="ml-1 font-normal text-faint">30 天</span></th>
           <th class="px-3 py-2.5 text-right font-semibold">无答案率</th>
           <th class="px-3.5 py-2.5 text-right font-semibold">风险</th>
         </tr>
