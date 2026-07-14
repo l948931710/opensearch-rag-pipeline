@@ -8,11 +8,11 @@ const DEV = false;
 const DEV_BASE_URL = 'http://10.0.0.87:8000'; // 电脑局域网 IP（手机需同 WiFi）
 
 // ── 生产 ──
-// 当前 = SAE 弹性公网 IP（HTTP 明文，测试期折衷；地址须在钉钉后台
-// 安全设置 → HTTP 可信域名 白名单内，实测该字段收 IP）。
-// TODO(developer): 接入备案完成后切 https://rag.fulingplastics.com.cn
-// 并同步更新 HTTP 可信域名，发新版本即可无感切换。
-const PROD_BASE_URL = 'http://120.55.69.9:8000';
+// 2026-07-14 起 = HTTPS 域名（CLB 443 终结 TLS → SAE:8000；域名已入钉钉后台
+// 安全设置 → HTTP 可信域名 白名单）。不要带端口。
+// 旧地址 http://120.55.69.9:8000（SAE 弹性 IP 明文）在本版全量覆盖存量客户端
+// 之前必须保持开放；收口节奏见 memory/部署台账。
+const PROD_BASE_URL = 'https://rag.fulingplastics.com.cn';
 
 export const BASE_URL = DEV ? DEV_BASE_URL : PROD_BASE_URL;
 
