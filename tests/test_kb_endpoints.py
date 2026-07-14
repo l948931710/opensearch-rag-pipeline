@@ -1962,3 +1962,99 @@ def test_review_task_resolve_writes_reviewer_fields(monkeypatch):
     assert r2["review_status"] == "PENDING"
     upd2 = [c for c in sink["calls"] if "UPDATE" in c[0]][-1]
     assert "reviewed_at=NULL" in upd2[0]
+
+
+# ── /api/kb/ops-metrics 运营数据面（批次γ，仅 kb_admin）──────────────────────────
+def test_ops_metrics_dept_admin_forbidden(monkeypatch):
+    """运营数据面是 kb_admin 专属：dept_admin（含写授权）也 403。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_ops_metrics(request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_ops_metrics_employee_forbidden(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "employee")
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_ops_metrics(request=None, identity=api.Identity(user_id="emp1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_ops_metrics_kb_admin_shape_and_queries(monkeypatch):
+    """kb_admin + 空桩 → 三块 available=True 且列表空（表可读、无数据 ≠ 失败）；关键查询都在。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [])
+    from opensearch_pipeline import api
+    resp = api.kb_ops_metrics(request=None, identity=api.Identity(user_id="dev1"))
+    assert resp.window_days == 30
+    assert resp.llm_available is True and resp.llm_by_model == [] and resp.llm_total_calls == 0
+    assert resp.llm_cost_estimate is None                 # 价表未配 → 诚实 NULL 绝不编造单价
+    assert resp.slo_available is True and resp.slo_daily == []
+    assert resp.admission_available is True and resp.admission_daily == []
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "llm_call_log" in sqls                         # D1 成本底座
+    assert "qa_daily_metrics" in sqls                     # D2 SLO 日趋势
+    assert "qa_admission_reject" in sqls                  # D3 限流准入
+    assert "PERCENT_RANK()" in sqls                       # 延迟分位与 governance 同款
+    assert "slo_breaches_json" in sqls                    # 违约明细列被读取
+
+
+def test_ops_metrics_all_queries_fail_raises_500(monkeypatch):
+    """全部子查询失败 = 连接级故障 → 诚实 500（绝不 all-zeros 伪装健康）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_all_fail(monkeypatch)
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_ops_metrics(request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 500
+
+
+def test_ops_metrics_slo_and_admission_aggregation(monkeypatch):
+    """种子数据：SLO 违约名解析 + breach 计数；准入 __admitted__ 伪行与拒绝原因分账。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    seq = [
+        (5, 1, 1200, 800, None),          # q1 llm 总量（5 次调用 1 错，token 1200+800，cost NULL）
+        (900, 4200),                       # q2 llm p50/p95
+        [("qwen3.7-plus", 5, 1, 1200, 800, 1100)],                    # q3 by_model
+        [("default", 4, 1500), ("deep", 1, 500)],                     # q4 by_category
+        [("marketing", 3, 1300), ("未归集", 2, 700)],                  # q5 by_dept
+        [("2026-07-13", 5, 2000)],                                    # q6 daily
+        [                                                              # q7 slo
+            ("2026-07-12", 100, 0.90, 0.05, 0.01, 8000, 40, 1, None, 3),
+            ("2026-07-13", 120, 0.80, 0.10, 0.02, 9000, 42, 0,
+             '[{"slo":"answer_rate","threshold":0.85,"value":0.8}]', 5),
+        ],
+        [                                                              # q8 admission
+            ("2026-07-12", "__admitted__", 450),
+            ("2026-07-13", "__admitted__", 500),
+            ("2026-07-13", "per_min", 20),
+            ("2026-07-13", "global_cap", 3),
+        ],
+    ]
+    _stub_multi(monkeypatch, seq)
+    from opensearch_pipeline import api
+    resp = api.kb_ops_metrics(request=None, identity=api.Identity(user_id="dev1"))
+    # LLM 总量与分组
+    assert resp.llm_total_calls == 5 and resp.llm_error_calls == 1
+    assert resp.llm_p95_latency_ms == 4200
+    assert resp.llm_by_model[0].model == "qwen3.7-plus"
+    assert resp.llm_by_dept[0].key == "marketing"
+    # SLO：违约名解析 + breach 天数
+    assert resp.slo_available is True and len(resp.slo_daily) == 2
+    assert resp.slo_daily[0].slo_ok is True and resp.slo_daily[0].breaches == []
+    assert resp.slo_daily[1].slo_ok is False and resp.slo_daily[1].breaches == ["answer_rate"]
+    assert resp.slo_daily[1].rejected_count == 5
+    assert resp.slo_breach_days == 1
+    # 准入：伪行分账（__admitted__ 不算拒绝），原因按量降序
+    d = {r.d: r for r in resp.admission_daily}
+    assert d["2026-07-12"].admitted == 450 and d["2026-07-12"].rejected == 0
+    assert d["2026-07-13"].admitted == 500 and d["2026-07-13"].rejected == 23
+    assert [(r.reason, r.count) for r in resp.admission_reasons] == [("per_min", 20), ("global_cap", 3)]
