@@ -1639,6 +1639,252 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
     return out
 
 
+# ── 运营数据面（批次γ，docs/console_kb_admin_ux_review_2026-07-14.md D1-D3）────────────
+# 三块只读聚合：LLM 用量（llm_call_log，schema/023）/ SLO 日趋势（qa_daily_metrics，schema/004+017）
+# / 限流准入（qa_admission_reject，schema/017）。全部既有表，无 migration；kb_admin 专属。
+class KbOpsLlmModelRow(BaseModel):
+    model: str = ""
+    calls: int = 0
+    error_calls: int = 0
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
+    avg_latency_ms: int = 0
+
+
+class KbOpsBucketRow(BaseModel):
+    """category / dept_group 共用的聚合行（key=桶名）。"""
+    key: str = ""
+    calls: int = 0
+    tokens_total: int = 0
+
+
+class KbOpsDailyLlmRow(BaseModel):
+    d: str = ""
+    calls: int = 0
+    tokens_total: int = 0
+
+
+class KbOpsSloDayRow(BaseModel):
+    d: str = ""
+    total: int = 0
+    answer_rate: Optional[float] = None
+    no_result_rate: Optional[float] = None
+    error_rate: Optional[float] = None
+    p95_latency_ms: Optional[int] = None
+    distinct_users: int = 0
+    slo_ok: Optional[bool] = None                       # None=rollup 未判（历史行）
+    breaches: List[str] = Field(default_factory=list)   # 违约 SLO 名（阈值细节留在库里，看板只点名）
+    rejected_count: Optional[int] = None                # None=017 前历史行
+
+
+class KbOpsAdmissionDayRow(BaseModel):
+    d: str = ""
+    admitted: int = 0          # __admitted__ 伪行：当日准入量
+    rejected: int = 0          # 全部拒绝原因合计
+
+
+class KbOpsAdmissionReasonRow(BaseModel):
+    reason: str = ""
+    count: int = 0
+
+
+class KbOpsMetricsResponse(BaseModel):
+    window_days: int = 30
+    # LLM 用量（成本底座）。cost_estimate 尊重 schema/023 拍板：价表未配=NULL，不编造单价。
+    llm_available: bool = False
+    llm_total_calls: int = 0
+    llm_error_calls: int = 0
+    llm_tokens_prompt: int = 0
+    llm_tokens_completion: int = 0
+    llm_cost_estimate: Optional[float] = None
+    llm_p50_latency_ms: int = 0
+    llm_p95_latency_ms: int = 0
+    llm_by_model: List[KbOpsLlmModelRow] = Field(default_factory=list)
+    llm_by_category: List[KbOpsBucketRow] = Field(default_factory=list)
+    llm_by_dept: List[KbOpsBucketRow] = Field(default_factory=list)
+    llm_daily: List[KbOpsDailyLlmRow] = Field(default_factory=list)
+    # SLO 日趋势（qa_rollup 物化；governance 只有 30 天快照，这里给逐日序列）
+    slo_available: bool = False
+    slo_daily: List[KbOpsSloDayRow] = Field(default_factory=list)
+    slo_breach_days: int = 0
+    # 限流准入（offered vs admitted 的缺失半边——被拒请求不进 qa_session_log）
+    admission_available: bool = False
+    admission_daily: List[KbOpsAdmissionDayRow] = Field(default_factory=list)
+    admission_reasons: List[KbOpsAdmissionReasonRow] = Field(default_factory=list)
+
+
+@router.get("/api/kb/ops-metrics", response_model=KbOpsMetricsResponse)
+def kb_ops_metrics(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """运营数据面（仅 kb_admin）：LLM 用量/成本底座 + SLO 日趋势 + 限流准入。
+
+    三块各自独立降级：表未建/查询失败 → 对应 available=False + 空列表（诚实「未知」，
+    绝不 all-zeros 伪装健康）；全部失败 = 连接级故障 → 500。cost_estimate 价表未配时
+    诚实 NULL（schema/023「不编造模型单价」），前端只展示 token 量。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    _require_kb_admin(identity)
+    win = _KB_INSIGHTS_WINDOW_DAYS
+    cache_key = ("ops_metrics", "GLOBAL", win)
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    out = KbOpsMetricsResponse(window_days=win)
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_ops_metrics 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"运营指标查询失败 (trace: {trace_id})")
+    fails = 0
+    _tok = "COALESCE(tokens_prompt,0)+COALESCE(tokens_completion,0)"
+    try:
+        with conn.cursor() as cur:
+            # 1) LLM 总量（COUNT=0 也算 available：表可读、真没有调用）
+            try:
+                cur.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(status='error'),0),"
+                    " COALESCE(SUM(tokens_prompt),0), COALESCE(SUM(tokens_completion),0), SUM(cost_estimate)"
+                    f" FROM {_op_db()}.llm_call_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)", (win,))
+                r = cur.fetchone() or (0, 0, 0, 0, None)
+                out.llm_total_calls = int(r[0] or 0)
+                out.llm_error_calls = int(r[1] or 0)
+                out.llm_tokens_prompt = int(r[2] or 0)
+                out.llm_tokens_completion = int(r[3] or 0)
+                out.llm_cost_estimate = float(r[4]) if r[4] is not None else None
+                out.llm_available = True
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics llm 总量 失败: %s", e)
+            # 2) LLM 延迟分位（governance 同款 PERCENT_RANK；latency>0 才计）
+            try:
+                cur.execute(
+                    "SELECT MAX(CASE WHEN pr<=0.5 THEN latency_ms END), MAX(CASE WHEN pr<=0.95 THEN latency_ms END)"
+                    " FROM (SELECT latency_ms, PERCENT_RANK() OVER (ORDER BY latency_ms) pr"
+                    f"   FROM {_op_db()}.llm_call_log"
+                    "   WHERE latency_ms > 0 AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)) t", (win,))
+                r = cur.fetchone() or (0, 0)
+                out.llm_p50_latency_ms = int(r[0] or 0); out.llm_p95_latency_ms = int(r[1] or 0)
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics llm 延迟 失败: %s", e)
+            # 3) 按模型（调用量降序，封顶 20——模型是有限集合，防脏数据爆行）
+            try:
+                cur.execute(
+                    "SELECT model, COUNT(*), COALESCE(SUM(status='error'),0),"
+                    " COALESCE(SUM(tokens_prompt),0), COALESCE(SUM(tokens_completion),0), ROUND(COALESCE(AVG(latency_ms),0))"
+                    f" FROM {_op_db()}.llm_call_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " GROUP BY model ORDER BY COUNT(*) DESC LIMIT 20", (win,))
+                out.llm_by_model = [KbOpsLlmModelRow(
+                    model=str(x[0] or ''), calls=int(x[1] or 0), error_calls=int(x[2] or 0),
+                    tokens_prompt=int(x[3] or 0), tokens_completion=int(x[4] or 0), avg_latency_ms=int(x[5] or 0),
+                ) for x in (cur.fetchall() or [])]
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics llm 按模型 失败: %s", e)
+            # 4) 按类别（deep/default/quick/sql；NULL → 未标注）
+            try:
+                cur.execute(
+                    f"SELECT COALESCE(category,'未标注'), COUNT(*), COALESCE(SUM({_tok}),0)"
+                    f" FROM {_op_db()}.llm_call_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " GROUP BY 1 ORDER BY 2 DESC LIMIT 10", (win,))
+                out.llm_by_category = [KbOpsBucketRow(key=str(x[0] or ''), calls=int(x[1] or 0), tokens_total=int(x[2] or 0))
+                                       for x in (cur.fetchall() or [])]
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics llm 按类别 失败: %s", e)
+            # 5) 按部门（成本归集口径 dept_group；NULL → 未归集）
+            try:
+                cur.execute(
+                    f"SELECT COALESCE(dept_group,'未归集'), COUNT(*), COALESCE(SUM({_tok}),0)"
+                    f" FROM {_op_db()}.llm_call_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " GROUP BY 1 ORDER BY 2 DESC LIMIT 15", (win,))
+                out.llm_by_dept = [KbOpsBucketRow(key=str(x[0] or ''), calls=int(x[1] or 0), tokens_total=int(x[2] or 0))
+                                   for x in (cur.fetchall() or [])]
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics llm 按部门 失败: %s", e)
+            # 6) 逐日调用/token（趋势图）
+            try:
+                cur.execute(
+                    f"SELECT DATE(created_at), COUNT(*), COALESCE(SUM({_tok}),0)"
+                    f" FROM {_op_db()}.llm_call_log"
+                    " WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " GROUP BY 1 ORDER BY 1", (win,))
+                out.llm_daily = [KbOpsDailyLlmRow(d=str(x[0] or ''), calls=int(x[1] or 0), tokens_total=int(x[2] or 0))
+                                 for x in (cur.fetchall() or [])]
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics llm 逐日 失败: %s", e)
+            # 7) SLO 日趋势（qa_rollup 物化行；slo_breaches_json 只取违约名）
+            try:
+                cur.execute(
+                    "SELECT metric_date, total_queries, answer_rate, no_result_rate, error_rate,"
+                    " p95_latency_ms, distinct_users, slo_ok, slo_breaches_json, rejected_count"
+                    f" FROM {_op_db()}.qa_daily_metrics"
+                    " WHERE metric_date >= DATE_SUB(CURDATE(), INTERVAL %s DAY)"
+                    " ORDER BY metric_date", (win,))
+                import json as _json
+                rows = []
+                for x in (cur.fetchall() or []):
+                    breaches: List[str] = []
+                    if x[8]:
+                        try:
+                            parsed = _json.loads(x[8]) if isinstance(x[8], (str, bytes)) else x[8]
+                            breaches = [str(b.get('slo', '')) for b in parsed if isinstance(b, dict) and b.get('slo')]
+                        except Exception:   # noqa: BLE001  JSON 脏行不拖垮整列
+                            breaches = []
+                    rows.append(KbOpsSloDayRow(
+                        d=str(x[0] or ''), total=int(x[1] or 0),
+                        answer_rate=float(x[2]) if x[2] is not None else None,
+                        no_result_rate=float(x[3]) if x[3] is not None else None,
+                        error_rate=float(x[4]) if x[4] is not None else None,
+                        p95_latency_ms=int(x[5]) if x[5] is not None else None,
+                        distinct_users=int(x[6] or 0),
+                        slo_ok=bool(x[7]) if x[7] is not None else None,
+                        breaches=breaches,
+                        rejected_count=int(x[9]) if x[9] is not None else None,
+                    ))
+                out.slo_daily = rows
+                out.slo_breach_days = sum(1 for r2 in rows if r2.slo_ok is False)
+                out.slo_available = True
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics slo 失败: %s", e)
+            # 8) 限流准入（__ 前缀=非拒绝伪行：__admitted__=当日准入量）
+            try:
+                cur.execute(
+                    "SELECT stat_date, reason, reject_count"
+                    f" FROM {_op_db()}.qa_admission_reject"
+                    " WHERE stat_date >= DATE_SUB(CURDATE(), INTERVAL %s DAY)"
+                    " ORDER BY stat_date", (win,))
+                day: dict = {}
+                reason_total: dict = {}
+                for x in (cur.fetchall() or []):
+                    d = str(x[0] or ''); reason = str(x[1] or ''); n = int(x[2] or 0)
+                    row = day.setdefault(d, {"admitted": 0, "rejected": 0})
+                    if reason == '__admitted__':
+                        row["admitted"] += n
+                    elif not reason.startswith('__'):
+                        row["rejected"] += n
+                        reason_total[reason] = reason_total.get(reason, 0) + n
+                out.admission_daily = [KbOpsAdmissionDayRow(d=k, admitted=v["admitted"], rejected=v["rejected"])
+                                       for k, v in sorted(day.items())]
+                out.admission_reasons = [KbOpsAdmissionReasonRow(reason=k, count=v)
+                                         for k, v in sorted(reason_total.items(), key=lambda kv: -kv[1])]
+                out.admission_available = True
+            except Exception as e:
+                fails += 1; logger.warning("kb_ops_metrics admission 失败: %s", e)
+    finally:
+        conn.close()
+    if fails >= 8:   # 8 条子查询全失败 = 连接级故障：诚实 500
+        trace_id = get_request_id()
+        logger.error("kb_ops_metrics 全部子查询失败 [trace=%s]", trace_id)
+        raise HTTPException(status_code=500, detail=f"运营指标查询失败 (trace: {trace_id})")
+    if fails == 0:
+        _dashboard_cache_put(cache_key, out)
+    return out
+
+
 class KbConfigResponse(BaseModel):
     max_upload_bytes: int = 0
     accepted_exts: List[str] = Field(default_factory=list)
