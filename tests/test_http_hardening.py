@@ -96,3 +96,43 @@ def test_empty_hosts_is_fully_inert():
     client = _make_client(hosts=())
     resp = client.get("/api/ping", headers={"X-Forwarded-Proto": "http"})
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /docs 文档面收口（api.py::_docs_urls）
+# ---------------------------------------------------------------------------
+
+def test_docs_urls_disabled_in_production_and_staging():
+    from opensearch_pipeline.api import _docs_urls
+
+    off = {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    assert _docs_urls("production", False) == off
+    assert _docs_urls("staging", False) == off
+    assert _docs_urls("PRODUCTION", False) == off  # 大小写不敏感
+
+
+def test_docs_urls_override_and_dev_default():
+    from opensearch_pipeline.api import _docs_urls
+
+    assert _docs_urls("production", True) == {}   # RAG_API_DOCS_ENABLE 逃生门
+    assert _docs_urls("development", False) == {}
+    assert _docs_urls("", False) == {}
+
+
+def test_docs_reachable_in_dev_app_regression():
+    """当前测试环境（development/SIM）下 app 的 /docs 与 /openapi.json 必须照常可达。"""
+    from opensearch_pipeline import api
+
+    client = TestClient(api.app, follow_redirects=False)
+    assert client.get("/docs").status_code == 200
+    assert client.get("/openapi.json").status_code == 200
+
+
+def test_docs_404_when_wired_off():
+    """按生产参数构造的 app：三个文档路由全 404。"""
+    from opensearch_pipeline.api import _docs_urls
+
+    app = FastAPI(**_docs_urls("production", False))
+    client = TestClient(app, follow_redirects=False)
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404, path

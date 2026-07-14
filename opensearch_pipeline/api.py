@@ -152,11 +152,24 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
+def _docs_urls(environment: str, enable_override: bool) -> dict:
+    """生产/staging 默认关闭 OpenAPI 文档面（/docs /redoc /openapi.json → 404），
+    避免公网匿名枚举 API 面（HTTPS 域名接入收口，2026-07-14）。
+    逃生门：RAG_API_DOCS_ENABLE=true 显式恢复；开发/SIM 不受影响。"""
+    if (environment or "").lower() in ("production", "staging") and not enable_override:
+        return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    return {}
+
+
 app = FastAPI(
     title="RAG 知识库问答 API",
     description="基于 OpenSearch HA3 向量检索 + Qwen LLM 的 RAG 问答服务",
     version="0.1.0",
     lifespan=_lifespan,
+    **_docs_urls(
+        get_config().environment,
+        os.environ.get("RAG_API_DOCS_ENABLE", "").strip().lower() in ("1", "true", "yes"),
+    ),
 )
 
 # CORS — 通过环境变量 CORS_ALLOWED_ORIGINS 配置允许的来源（逗号分隔）
