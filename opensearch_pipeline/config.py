@@ -730,7 +730,7 @@ def load_config() -> PipelineConfig:
     llm_key = _env("LLM_API_KEY") or dashscope_key or gemini_key
     default_llm_base = f"https://{ds_domain}/compatible-mode/v1" if dashscope_key else "https://generativelanguage.googleapis.com/v1beta"
     llm_base_url = _env("LLM_API_BASE_URL") or default_llm_base
-    default_llm_model = "qwen3.6-plus" if dashscope_key else "gemini-3.1-flash-lite"
+    default_llm_model = "qwen3.7-plus" if dashscope_key else "gemini-3.1-flash-lite"
     llm_model = _env("LLM_MODEL") or default_llm_model
 
     # OCR 动态配置

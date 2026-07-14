@@ -66,7 +66,7 @@ def test_run_start_inserts_running_row(monkeypatch):
     prov = {"stage": 3, "bizdate": "20260616", "git_commit": "abc123",
             "extractor_version": "1.0.0", "chunker_version": "1.0.0", "detector_version": "1.0.0",
             "embedding_model": "text-embedding-v4", "embedding_model_version": "text-embedding-v4",
-            "llm_model": "qwen3.6-plus"}
+            "llm_model": "qwen3.7-plus"}
     rid = run_start(prov, simulate=False)
     assert rid and rid.startswith("s3_20260616_abc123_")
     sql, params = cap.calls[-1]

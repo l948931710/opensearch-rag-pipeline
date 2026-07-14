@@ -29,11 +29,11 @@ def _fake_stream(*args, **kwargs):
     yield 'data: {"type": "sources", "sources": []}\n\n'
     yield 'data: {"type": "chunk", "content": "住宿申请"}\n\n'
     yield 'data: {"type": "chunk", "content": "见 <<IMG:1>> 图示"}\n\n'
-    yield 'data: {"type": "done", "model": "qwen3.6-plus", "usage": {}}\n\n'
+    yield 'data: {"type": "done", "model": "qwen3.7-plus", "usage": {}}\n\n'
     yield "data: [DONE]\n\n"
 
 
-def _fake_cfg(interval_ms=0, model="qwen3.6-plus"):
+def _fake_cfg(interval_ms=0, model="qwen3.7-plus"):
     cfg = MagicMock()
     cfg.rag.dingtalk_stream_interval_ms = interval_ms
     cfg.llm.model = model
@@ -190,7 +190,7 @@ def test_streaming_nonblocking_pusher_finalize_is_last():
         for w in ["甲", "乙", "丙", "丁", "戊"]:
             yield f'data: {{"type": "chunk", "content": "{w}"}}\n\n'
             _t.sleep(0.25)  # 5×0.25=1.25s > 推流间隔 0.3s → 后台线程必触发
-        yield 'data: {"type": "done", "model": "qwen3.6-plus", "usage": {}}\n\n'
+        yield 'data: {"type": "done", "model": "qwen3.7-plus", "usage": {}}\n\n'
         yield "data: [DONE]\n\n"
 
     with patch("opensearch_pipeline.dingtalk_bot.get_config", return_value=_fake_cfg()), \
@@ -218,7 +218,7 @@ def test_rebuild_card_param_map_restores_is_answer_done_on_db_hit():
     conn = MagicMock()
     cursor = MagicMock()
     # (query, answer, cited_docs, model, latency_ms, retrieval_latency_ms, llm_latency_ms, content_blocks)
-    cursor.fetchone.return_value = ("怎么申请住宿", "住宿申请见附件", None, "qwen3.6-plus", 1500, 800, 1200, None)
+    cursor.fetchone.return_value = ("怎么申请住宿", "住宿申请见附件", None, "qwen3.7-plus", 1500, 800, 1200, None)
     conn.cursor.return_value.__enter__.return_value = cursor
 
     card_param_map = {"feedback_status": "👍 已反馈：有帮助"}
@@ -281,7 +281,7 @@ def test_rebuild_card_param_map_streaming_folds_sources_and_latency_into_content
     # (query, answer, cited_docs, model, latency_ms, retrieval_latency_ms, llm_latency_ms, content_blocks)
     cursor.fetchone.return_value = (
         "怎么申请住宿", "住宿申请见附件",
-        [{"title": "员工手册"}], "qwen3.6-plus", 1500, 800, 1200, None,
+        [{"title": "员工手册"}], "qwen3.7-plus", 1500, 800, 1200, None,
     )
     conn.cursor.return_value.__enter__.return_value = cursor
 

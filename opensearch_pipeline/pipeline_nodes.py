@@ -1181,7 +1181,7 @@ def run_gemini_classification(text: str, model_name: str, api_key: str, api_base
     )
     
     if is_dashscope:
-        # DashScope / 阿里云百炼 OpenAI 兼容接口格式 (支持新版模型如 qwen3.6-plus)
+        # DashScope / 阿里云百炼 OpenAI 兼容接口格式 (支持新版模型如 qwen3.7-plus)
         if "compatible-mode" not in api_base_url and "chat/completions" not in api_base_url:
             url = f"{api_base_url.rstrip('/')}/compatible-mode/v1/chat/completions"
         elif "chat/completions" not in api_base_url:

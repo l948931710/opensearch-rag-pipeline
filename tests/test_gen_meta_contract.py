@@ -76,7 +76,7 @@ def test_generate_answer_returns_gen_meta(mock_config, mock_post):
     mock_cfg = MagicMock()
     mock_cfg.llm.api_key = "test-key"
     mock_cfg.llm.api_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    mock_cfg.llm.model = "qwen3.6-plus"
+    mock_cfg.llm.model = "qwen3.7-plus"
     mock_cfg.rag.score_threshold_high = 8.0
     mock_cfg.rag.score_threshold_medium = 5.0
     mock_config.return_value = mock_cfg
@@ -94,7 +94,7 @@ def test_generate_answer_returns_gen_meta(mock_config, mock_post):
     gm = result["gen_meta"]
     assert gm is not None
     assert gm["temperature"] == 0.42
-    assert gm["model"] == "qwen3.6-plus"
+    assert gm["model"] == "qwen3.7-plus"
     assert len(gm["prompt_sha"]) == 16
 
 
