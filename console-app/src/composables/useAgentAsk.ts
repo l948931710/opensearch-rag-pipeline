@@ -260,12 +260,17 @@ function onAgentEvent(conv: { qaSession: string }, ai: ChatMessage, ev: SseEvent
         runs.value = [{ run_id: meta.runId, status: 'running', started_at: null, ended_at: null }, ...runs.value]
       }
       break
-    case 'chunk':
+    case 'chunk': {
+      // A7（复核批次4）：纯 reasoning 轮可能出空 content 帧——空帧不该熄 loading /
+      // 推进「回答中」阶段 / 触发渲染（后端双端点已加 guard，这里是第三道防线）。
+      const content = (ev.content as string) || ''
+      if (!content) break
       ai.loading = false
-      ai.raw = (ai.raw || '') + ((ev.content as string) || '')
+      ai.raw = (ai.raw || '') + content
       pushStage(ai, 'answering', '回答中')
       scheduleAgentRender(ai, seq)
       break
+    }
     case 'tool_call': {
       ai.loading = false
       meta.tools = meta.tools || []
@@ -454,16 +459,30 @@ async function askAgent(preset?: string, skipUser = false): Promise<void> {
   }
 }
 
-/** 停止观看当前 agent 流。⚠️ 只断【视图】不断 run——服务端 run 继续跑（落库在 run 完成侧），
- *  有 run_id 则转轮询兜底（断线恢复语义）；真要终止 run 用挂起卡/运行中心的「撤回」。 */
-function stopAgent(): void {
+/** A5：请求服务端协作取消（轮边界生效）。尽力而为——409/501/网络错都吞（视图已断，
+ *  轮询会呈现最终真实状态；取消失败最坏=run 跑完，落库在 run 完成侧不丢答案）。 */
+async function cancelRunServerSide(runId: string): Promise<void> {
+  try {
+    await apiJson(`/api/agent/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST', auth: true })
+  } catch { /* 尽力而为：终态 409 / 跨实例 501 / 网络错，均由轮询兜底 */ }
+}
+
+/** 停止观看当前 agent 流。默认只断【视图】不断 run——服务端 run 继续跑（落库在 run
+ *  完成侧），有 run_id 则转轮询兜底（断线恢复语义）；会话切换 watcher 走的就是这个形态。
+ *  cancelRun=true（用户点停止按钮）额外请求服务端协作取消（批次2 cancel 端点，轮边界生效）。 */
+function stopAgent(opts?: { cancelRun?: boolean }): void {
   agentSeq++
   if (abortCtl) { try { abortCtl.abort() } catch { /* noop */ } abortCtl = null }
   asking.value = false
   agentStreamActive.value = false
-  const list = messages.value
+  // A7（复核批次4）：按 streamConvId 反查流所属会话——流中切会话时 activeId 已指向新会话，
+  // messages.value 派生自 activeId：取错列表会把旧会话在途消息冻在 loading，且可能把
+  // 新会话末尾的无关消息误标「已取消本次提问。」。
+  const conv = conversations.value.find((c) => c.id === streamConvId)
+  const list = conv ? conv.messages : messages.value
   const ai = list[list.length - 1]
   if (ai && ai.role === 'ai' && ai.agent) {
+    const wasInflight = !!(ai.loading || ai.streaming)
     if (ai._renderRaf != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }
     ai.loading = false
     ai.streaming = false
@@ -471,8 +490,10 @@ function stopAgent(): void {
     const meta = ai.agent
     if (meta.runId && !RUN_TERMINAL.has(meta.status || '')) {
       meta.disconnected = true                 // 实时流已断，run 仍在后台
+      if (opts?.cancelRun) void cancelRunServerSide(meta.runId)
       ensureRunPolling(meta.runId)
-    } else if (!ai.raw && !meta.approval && !ai.error) {
+    } else if (wasInflight && !ai.raw && !meta.approval && !ai.error && !RUN_TERMINAL.has(meta.status || '')) {
+      // 只有「确实在途且一无所有」的消息才标取消——已完成/已挂起/已终态的消息不误伤
       ai.error = true
       ai.errorText = '已取消本次提问。'
     }

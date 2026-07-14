@@ -433,3 +433,115 @@ describe('撤回（发起人自撤）与身份纪律', () => {
     expect(a.agentMode.value).toBe(true)              // 偏好不清（数据无泄露面）
   })
 })
+
+describe('复核批次4（A7）：流中切会话 / 空 chunk / stop 接服务端 cancel', () => {
+  function hardenEnv() {
+    vi.stubGlobal('requestAnimationFrame', undefined)
+    vi.stubGlobal('cancelAnimationFrame', undefined)
+    vi.stubGlobal('AbortController', class {
+      signal: any = { aborted: false }
+      abort() { this.signal.aborted = true }
+    })
+  }
+  /** 可逐帧推送的悬挂 reader（帧队列空时挂起，push/end 唤醒）。 */
+  function gatedStream() {
+    const q: Array<{ value: Uint8Array | undefined; done: boolean }> = []
+    let notify: (() => void) | null = null
+    return {
+      push(v: Uint8Array) { q.push({ value: v, done: false }); notify?.(); notify = null },
+      end() { q.push({ value: undefined, done: true }); notify?.(); notify = null },
+      resp: {
+        ok: true, status: 200, text: async (): Promise<string> => '',
+        body: {
+          getReader: () => ({
+            async read() {
+              while (!q.length) await new Promise<void>((r) => { notify = r })
+              return q.shift()!
+            },
+            cancel() {},
+          }),
+        },
+      },
+    }
+  }
+
+  it('流中切会话：按 streamConvId 反查旧会话收尾——不冻结、不误标取消、不触发服务端 cancel', async () => {
+    hardenEnv()
+    const gs = gatedStream()
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (path: string, init?: RequestInit) => {
+      calls.push(`${init?.method || 'GET'} ${path}`)
+      if (String(path) === '/api/agent/ask') return gs.resp
+      return jsonResp(runDetail('running'))
+    }))
+    const a = useAgentAsk()
+    const p = a.askAgent('慢问题')
+    gs.push(frame({ type: 'session', session_id: 's', message_id: 'm', run_id: 'rSW' }))
+    gs.push(frame({ type: 'chunk', content: '写到一半' }))
+    await waitFor(() => !!useAsk().messages.value[1]?.agent?.runId)
+    const oldConvId = useAsk().activeId.value
+    const ai = useAsk().messages.value[1]
+
+    useAsk().newConversation()                 // 流中切会话（新建并切换）→ watcher 自动 stopAgent()
+    await waitFor(() => !useAsk().asking.value)
+    gs.end()
+    await p
+
+    expect(useAsk().activeId.value).not.toBe(oldConvId)
+    expect(ai.loading).toBe(false)             // 旧会话在途消息被正确收尾（不冻结）
+    expect(ai.streaming).toBe(false)
+    expect(ai.error).toBeFalsy()               // 有 raw：不误标「已取消本次提问。」
+    expect(ai.agent?.disconnected).toBe(true)  // run 仍在后台 → 轮询兜底
+    expect(calls.some((c) => c.includes('/cancel'))).toBe(false)   // 切会话≠取消 run
+  })
+
+  it('纯 reasoning 空 chunk：不熄 loading、不推进「回答中」、不累积 raw', async () => {
+    hardenEnv()
+    const gs = gatedStream()
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (String(path) === '/api/agent/ask') return gs.resp
+      return jsonResp(runDetail('running'))
+    }))
+    const a = useAgentAsk()
+    const p = a.askAgent('思考题')
+    gs.push(frame({ type: 'session', session_id: 's', message_id: 'm', run_id: 'rE' }))
+    gs.push(frame({ type: 'chunk', content: '' }))            // 纯 reasoning 轮的空帧
+    await waitFor(() => !!useAsk().messages.value[1]?.agent?.runId)
+    const ai = useAsk().messages.value[1]
+    expect(ai.streaming).toBe(true)                            // 空帧不结束在途态
+    expect(ai.raw || '').toBe('')                              // 不累积空内容
+    expect((ai.agent?.stages || []).some((s: any) => s.key === 'answering')).toBe(false)
+
+    gs.push(frame({ type: 'chunk', content: '真内容' }))
+    await waitFor(() => !!ai.raw)
+    gs.push(frame({ type: 'done', usage: {} }))
+    gs.end()
+    await p
+    expect(ai.raw).toBe('真内容')
+  })
+
+  it('stop 按钮（cancelRun:true）→ POST /api/agent/runs/{id}/cancel；默认 stopAgent() 不发', async () => {
+    hardenEnv()
+    const gs = gatedStream()
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (path: string, init?: RequestInit) => {
+      calls.push(`${init?.method || 'GET'} ${path}`)
+      if (String(path) === '/api/agent/ask') return gs.resp
+      if (String(path).includes('/cancel')) return jsonResp({ status: 'cancel_requested' })
+      return jsonResp(runDetail('running'))
+    }))
+    const a = useAgentAsk()
+    const p = a.askAgent('停我')
+    gs.push(frame({ type: 'session', session_id: 's', message_id: 'm', run_id: 'rC' }))
+    gs.push(frame({ type: 'chunk', content: '跑着' }))
+    await waitFor(() => !!useAsk().messages.value[1]?.agent?.runId)
+
+    a.stopAgent({ cancelRun: true })
+    gs.end()
+    await p
+    await waitFor(() => calls.some((c) => c === 'POST /api/agent/runs/rC/cancel'))
+    expect(calls.filter((c) => c.includes('/cancel'))).toHaveLength(1)
+    const ai = useAsk().messages.value[1]
+    expect(ai.agent?.disconnected).toBe(true)   // 视图断开语义不变，轮询兜底照旧
+  })
+})

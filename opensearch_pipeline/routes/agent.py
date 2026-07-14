@@ -428,7 +428,8 @@ def _stream_events(handle, session_id: str, message_id: str):
                     "run_id": handle.run_id})
         for ev in handle.events():
             if isinstance(ev, ModelDelta):
-                yield _sse({"type": "chunk", "content": ev.text})
+                if ev.text:   # A7：纯 reasoning 轮的空 delta 不下发（空 chunk 帧扰动前端阶段机）
+                    yield _sse({"type": "chunk", "content": ev.text})
             elif isinstance(ev, ToolCallProposed):
                 yield _sse({"type": "tool_call", "call_id": ev.call_id,
                             "tool_name": ev.tool_name, "arguments": ev.arguments})
@@ -1214,7 +1215,8 @@ def agent_run_events(run_id: str, request: Request,
             for d in stream_run_events(run_id):
                 t = d.get("type")
                 if t == "model_delta":
-                    yield _sse({"type": "chunk", "content": d.get("text") or ""})
+                    if d.get("text"):   # A7：空 delta 不回放（与 /ask 实时流同 guard）
+                        yield _sse({"type": "chunk", "content": d["text"]})
                 elif t == "tool_call_proposed":
                     yield _sse({"type": "tool_call", "call_id": d.get("call_id"),
                                 "tool_name": d.get("tool_name"),

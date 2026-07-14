@@ -25,8 +25,9 @@ const {
   probeAgent, openRunCenter,
 } = useAgentAsk()
 const agentOn = computed(() => agentSupported.value === true && agentMode.value)
-// 停止分发：agent 流在途走 agent 停（只断视图、run 轮询兜底），否则旧路径停。
-function onStop() { if (agentStreamActive.value) stopAgent(); else stop() }
+// 停止分发：agent 流在途走 agent 停 + 服务端协作取消（批次2 cancel 端点，轮边界生效；
+// 视图断开 + run 轮询兜底照旧），否则旧路径停。会话切换的自动停（watcher）不带取消。
+function onStop() { if (agentStreamActive.value) stopAgent({ cancelRun: true }); else stop() }
 // token 变化（登录落定/重登/换人）→ 重新探测（identityScope 已先清空探测态）
 watch(() => session.token, () => { if (session.token) void probeAgent() })
 

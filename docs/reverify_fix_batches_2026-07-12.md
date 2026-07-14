@@ -160,6 +160,16 @@ A3 的 staging 演练排在这批合入之后。
 
 ## 批次 4：前端小修——A7 【S，无闸门，建议与批次 2 同车】
 
+> **状态（2026-07-13）：✅ 完成**（落 claude/ontology-p0；console 305 绿 + vue-tsc 绿 +
+> Python 3510 绿 + lint 绿；spec 补 3 例：流中切会话/纯 reasoning 空 chunk/stop 接 cancel）。
+> 实现说明：① stopAgent 按 streamConvId 反查会话收尾（不冻结旧会话在途消息）；误标
+> 「已取消」加 wasInflight+非终态双闸（已完成/挂起/终态消息不误伤）。② 空 chunk 三道防线：
+> /ask 实时流 `if ev.text` + 回放端点 `if d.get("text")` + 前端 chunk 分支空 content 直接
+> break（不熄在途态/不推进「回答中」/不触发渲染）。③ stop 按钮（QaView onStop）走
+> `stopAgent({cancelRun:true})` → POST /runs/{id}/cancel（尽力而为，409/501/网络错吞掉由
+> 轮询兜底）；**会话切换 watcher 仍是无参视图断开——切会话≠取消 run**（断线恢复语义不变，
+> spec 锁死）。
+
 - `useAgentAsk.ts:464`：stopAgent 按 `streamConvId` 反查 `conversations` 取消息列表，
   不用 activeId 派生的 `messages.value`；顺修 :475-478 误标「已取消本次提问。」的误伤路径。
 - 空 chunk 帧双端 guard：后端 `routes/agent.py:431` 与回放端点 :1147 加 `if ev.text` guard；
