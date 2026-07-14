@@ -526,14 +526,32 @@ class RedisSessionStore:
 # 后端工厂 + 模块级门面（调用点零改动：api.py / dingtalk_bot.py 继续 import 这三个函数）
 # ─────────────────────────────────────────────────────────────────────────────
 def _make_backend() -> SessionStore:
-    backend = os.environ.get("RAG_SESSION_BACKEND", "memory").strip().lower()
-    if backend == "redis":
-        from opensearch_pipeline import redis_client
+    """B1（复核批次5）：与 rate_limiter._make_limiter 同契约——RAG_REQUIRE_REDIS=true 时
+    redis 初始化失败 raise 拒绝起服 / 后端未切 redis 同样 raise；未置位时初始化失败
+    回退 memory（单实例安全默认；原先是 import 期直接崩，现降级 + 响亮 ERROR）。"""
+    from opensearch_pipeline import redis_client
 
-        logger.info("SessionStore 后端 = redis")
-        return RedisSessionStore(redis_client.get_client())
+    backend = os.environ.get("RAG_SESSION_BACKEND", "memory").strip().lower()
+    require = redis_client.require_redis()
+    if backend == "redis":
+        try:
+            store = RedisSessionStore(redis_client.get_client())
+            logger.info("SessionStore 后端 = redis")
+            return store
+        except Exception as e:   # noqa: BLE001
+            if require:
+                raise RuntimeError(
+                    "RAG_REQUIRE_REDIS=true 且会话 Redis 后端初始化失败——拒绝以 memory "
+                    f"降级起服（多实例下各实例各存各的会话）: {e}") from e
+            logger.error("RAG_SESSION_BACKEND=redis 但 Redis 初始化失败，回退 memory"
+                         "（单实例安全默认）: %s", e)
+            return MemorySessionStore()
     if backend not in ("", "memory"):
         logger.warning("未知 RAG_SESSION_BACKEND=%r，回退 memory", backend)
+    if require:
+        raise RuntimeError(
+            f"RAG_REQUIRE_REDIS=true 但 RAG_SESSION_BACKEND={backend!r} 未切 redis——"
+            "多实例部署契约不满足（memory 会话=各实例各存各的）")
     return MemorySessionStore()
 
 

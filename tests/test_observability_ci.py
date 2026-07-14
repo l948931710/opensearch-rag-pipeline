@@ -238,8 +238,10 @@ def test_eval2_strict_fails_on_manifest_drift_error():
 
 
 def test_api_ready_redis_probe_when_backend_redis(monkeypatch):
-    """WS0：任一状态后端=redis → Redis PING 纳入就绪判定（此前 ping 是死代码）。
-    PING 失败 → 503（限流 redis 后端 fail-closed，实例已无法服务，必须摘出）；成功 → 200。"""
+    """WS0：任一状态后端=redis → Redis PING 纳入就绪探针。
+    B2（复核批次5）后默认宽松（error 报告但不摘实例，防 failover 摘空集群——见
+    test_multi_instance_batch5）；本测试显式开 RAG_READY_REDIS_STRICT=true 锁「摘除」语义。"""
+    monkeypatch.setenv("RAG_READY_REDIS_STRICT", "true")
     from fastapi.testclient import TestClient
     import opensearch_pipeline.retriever as rt
     from opensearch_pipeline import redis_client

@@ -595,12 +595,28 @@ def readiness_check():
     else:
         checks["redis"] = "skipped"
 
+    # B2（复核批次5）ready 与 Redis 解耦：Redis 故障默认**不**摘实例——一次 30s 的
+    # failover 会让所有副本同时 ready=503、LB 把整个集群摘空，比「ask 路径 fail-closed
+    # 503（带 Retry-After，成本护栏保留）」严重得多。默认宽松（报告 error + 每次探针
+    # CRITICAL 响亮告警，alerting 侧按此关键字接告警）；RAG_READY_REDIS_STRICT=true
+    # 恢复旧语义（Redis error 即摘流量）。
+    _redis_ready_ok = checks.get("redis") in ("ok", "skipped")
+    if not _redis_ready_ok:
+        if os.environ.get("RAG_READY_REDIS_STRICT", "").strip().lower() in ("1", "true", "yes", "on"):
+            logger.critical("readiness: Redis error 且 RAG_READY_REDIS_STRICT=true → 摘除本实例 "
+                            "[trace=%s]", trace_id)
+        else:
+            _redis_ready_ok = True
+            logger.critical("readiness: Redis error（非关键放行，RAG_READY_REDIS_STRICT 未开）——"
+                            "限流 ask 路径将 fail-closed 503（Retry-After 5s），会话/去重降级 "
+                            "[trace=%s]", trace_id)
+
     # P2-8：启动时检出的摄取↔服务 embedding 契约失配 → 关键降级（此实例算出的相似度
     # 不可信，必须被负载均衡摘出）。失配详情已在启动日志 CRITICAL，此处只报状态词。
     checks["embedding_contract"] = "mismatch" if _EMBEDDING_CONTRACT_MISMATCH else "ok"
 
     critical_ok = (checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
-                   and checks.get("redis") in ("ok", "skipped")
+                   and _redis_ready_ok
                    and not _EMBEDDING_CONTRACT_MISMATCH
                    # P0-6：flag-on 实例缺 agent/ontology 表或注册表构建即炸 → 对应功能
                    # 首个请求必 500，该实例不该接流量（flag off 时恒 skipped 不参与判定）

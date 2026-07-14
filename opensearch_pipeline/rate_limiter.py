@@ -879,17 +879,31 @@ class RedisRateLimiter:
 
 
 def _make_limiter():
-    """按 RAG_RATE_LIMIT_BACKEND 选后端（默认 memory = 回滚开关）。"""
+    """按 RAG_RATE_LIMIT_BACKEND 选后端（默认 memory = 回滚开关）。
+
+    B1（复核批次5）：RAG_REQUIRE_REDIS=true（多实例部署契约）时 fail-loud——
+    redis 初始化失败 **raise 拒绝起服**（memory 回退=各实例独立计数、全局熔断
+    放大 N 倍且 /ready 仍绿）；后端未切 redis 同样 raise（配置自相矛盾）。"""
     backend = os.environ.get("RAG_RATE_LIMIT_BACKEND", "memory").strip().lower()
+    require = redis_client.require_redis()
     if backend == "redis":
         try:
             return RedisRateLimiter(redis_client.get_client())
         except Exception as e:   # noqa: BLE001
+            if require:
+                raise RuntimeError(
+                    "RAG_REQUIRE_REDIS=true 且限流 Redis 后端初始化失败——拒绝以 memory "
+                    f"降级起服（多实例下各实例独立计数=假绿）: {e}") from e
             # Redis 初始化失败 → 回退 memory（单实例安全默认）。⚠️ 多实例下须确保 Redis 可用，
             # 否则各实例独立计数使全局熔断实际放大 N 倍——启用前置见评审 C3。
             logger.error("RAG_RATE_LIMIT_BACKEND=redis 但 Redis 初始化失败，回退 memory: %s", e)
+            return ServingRateLimiter()
     elif backend not in ("", "memory"):
         logger.warning("未知 RAG_RATE_LIMIT_BACKEND=%r，回退 memory", backend)
+    if require:
+        raise RuntimeError(
+            f"RAG_REQUIRE_REDIS=true 但 RAG_RATE_LIMIT_BACKEND={backend!r} 未切 redis——"
+            "多实例部署契约不满足（memory 限流=各实例独立计数）")
     return ServingRateLimiter()
 
 

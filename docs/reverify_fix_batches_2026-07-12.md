@@ -183,6 +183,24 @@ A3 的 staging 演练排在这批合入之后。
 
 **闸门**：`--workers>1` 或多 SAE 实例部署前。
 
+> **状态（2026-07-13）：✅ 代码侧完成**（落 claude/ontology-p0；全量 3524 绿 + lint 绿；
+> 测试 test_multi_instance_batch5.py 14 例 + 旧 ready 测试适配 strict 语义）。实现说明：
+> ① B1 `redis_client.require_redis()`（RAG_REQUIRE_REDIS）：置位时限流/会话两工厂
+>   redis 初始化失败 **raise 拒绝起服**、后端未切 redis 同样 raise（配置矛盾）；未置位
+>   保持单实例安全默认（限流回退不变；会话由「import 期直接崩」改为回退 memory+响亮
+>   ERROR）。**多实例部署清单三件同出：RAG_RATE_LIMIT_BACKEND=redis +
+>   RAG_SESSION_BACKEND=redis + RAG_REQUIRE_REDIS=true**（+ RAG_REDIS_URL 或 Sentinel）。
+> ② B2 ready 解耦：Redis 探针 error 默认**不摘实例**（防 30s failover 让全部副本同时
+>   503 被 LB 摘空），照实报告 + 每次探针 CRITICAL 响亮告警（alerting 按关键字接）；
+>   `RAG_READY_REDIS_STRICT=true` 恢复摘除旧语义。ask 路径 fail-closed 503 保留且
+>   Retry-After 已在位（Denial(503,…,5) + api.py:482 通用发射——复核确认无需改）。
+> ③ B2 Sentinel/Cluster：`RAG_REDIS_SENTINEL_NODES`(+`_MASTER`/`RAG_REDIS_PASSWORD`/
+>   `RAG_REDIS_DB`) → Sentinel.master_for（failover 自动跟随）；`RAG_REDIS_CLUSTER=true`
+>   → RedisCluster.from_url；is_configured() 认 Sentinel 无 URL 形态。
+> ④ **本批不改 `--workers 1`**：撤销单 worker 是部署动作（批次7/Sam），前置=本批 flags
+>   + Redis HA（批次7 infra）+ agent run 句柄仍进程内的事实（跨实例 cancel 501、durable
+>   worker PR-3 未做）。
+
 ### B1 强制 Redis + fail-loud 【S】
 - 新 env `RAG_REQUIRE_REDIS=true`（生产部署模板默认带）：置位时 `_make_limiter`
   （rate_limiter.py:781-791）init 失败 **raise 拒绝起服**，不再静默回退 memory；session_store 同。
