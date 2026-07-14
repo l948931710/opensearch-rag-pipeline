@@ -169,10 +169,16 @@ app = FastAPI(
     ),
 )
 
+# 生产公网域名（HTTPS 在 CLB 终结）：production 未显式配置时,CORS 与强制 HTTPS
+# 的域名默认均取它——部署零新增 env;换域名时改这里或用 env 覆盖。
+_PROD_PUBLIC_HOST = "rag.fulingplastics.com.cn"
+
 # CORS — 通过环境变量 CORS_ALLOWED_ORIGINS 配置允许的来源（逗号分隔）
-# 生产环境示例: CORS_ALLOWED_ORIGINS=https://kb.fuling.com,https://admin.fuling.com
-# 未配置时默认允许所有来源但禁用 credentials（安全的开发默认值）
+# 未配置时：production 默认锁到公司域名（console 与 API 同源,不受影响;显式设
+# env 可覆盖）；开发默认允许所有来源但禁用 credentials（防 Origin 反射）。
 _cors_origins_raw = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
+if not _cors_origins_raw and (get_config().environment or "").lower() == "production":
+    _cors_origins_raw = f"https://{_PROD_PUBLIC_HOST}"
 if _cors_origins_raw:
     _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
     app.add_middleware(
@@ -192,12 +198,18 @@ else:
         allow_headers=["*"],
     )
 
-# HTTPS 硬化（rag.fulingplastics.com.cn 域名接入收口）：RAG_FORCE_HTTPS_HOSTS 逗号分隔域名
-# 白名单，默认空 = off。scheme 只认 CLB 注入的 X-Forwarded-Proto（缺失一律放行——直连 IP 的
-# 小程序/钉钉回调不受影响），生效前提与重定向环边界见 http_hardening.py 模块 docstring。
-_force_https_hosts = [
-    h for h in os.environ.get("RAG_FORCE_HTTPS_HOSTS", "").split(",") if h.strip()
-]
+def _resolve_force_https_hosts(env_value, environment) -> list:
+    """RAG_FORCE_HTTPS_HOSTS 显式值优先（空串/"off" = 显式关闭）；**未设置时 production
+    默认收口公司域名**（部署零 env）。scheme 判定只认 CLB 注入的 X-Forwarded-Proto
+    （缺失一律放行——直连 IP 的小程序/钉钉回调不受影响），边界见 http_hardening.py。"""
+    if env_value is None:
+        env_value = _PROD_PUBLIC_HOST if (environment or "").lower() == "production" else ""
+    return [h.strip() for h in env_value.split(",") if h.strip() and h.strip().lower() != "off"]
+
+
+_force_https_hosts = _resolve_force_https_hosts(
+    os.environ.get("RAG_FORCE_HTTPS_HOSTS"), get_config().environment
+)
 if _force_https_hosts:
     app.add_middleware(HttpsRedirectMiddleware, hosts=_force_https_hosts)
 

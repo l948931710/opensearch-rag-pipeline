@@ -136,3 +136,52 @@ def test_docs_404_when_wired_off():
     client = TestClient(app, follow_redirects=False)
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert client.get(path).status_code == 404, path
+
+
+# ---------------------------------------------------------------------------
+# 环境化默认（部署零 env）：FORCE_HTTPS 生产默认域名 / QA_FACT_JOIN 生产默认开
+# ---------------------------------------------------------------------------
+
+def test_force_https_hosts_defaults_on_in_production():
+    from opensearch_pipeline.api import _resolve_force_https_hosts
+
+    assert _resolve_force_https_hosts(None, "production") == ["rag.fulingplastics.com.cn"]
+    assert _resolve_force_https_hosts(None, "PRODUCTION") == ["rag.fulingplastics.com.cn"]
+    assert _resolve_force_https_hosts(None, "development") == []
+    assert _resolve_force_https_hosts(None, "staging") == []
+    assert _resolve_force_https_hosts(None, None) == []
+
+
+def test_force_https_hosts_explicit_env_wins():
+    from opensearch_pipeline.api import _resolve_force_https_hosts
+
+    # 显式关闭：空串 / "off"
+    assert _resolve_force_https_hosts("", "production") == []
+    assert _resolve_force_https_hosts("off", "production") == []
+    # 显式自定义列表（去空白）
+    assert _resolve_force_https_hosts("a.example.com, b.example.com", "development") == [
+        "a.example.com", "b.example.com"]
+
+
+def test_fact_join_default_on_in_production_gated_by_probe(monkeypatch):
+    from opensearch_pipeline import qa_facts
+
+    monkeypatch.delenv("RAG_QA_FACT_JOIN", raising=False)
+    monkeypatch.setattr(qa_facts, "_probe_fact_table", lambda: True)
+    monkeypatch.setattr(qa_facts, "_probe_state", {"ts": 0.0, "ok": False})
+
+    class _Cfg:
+        environment = "production"
+
+    monkeypatch.setattr("opensearch_pipeline.config.get_config", lambda: _Cfg())
+    assert qa_facts.fact_join_enabled() is True
+
+    # 非生产未显式设 → 关
+    _Cfg.environment = "development"
+    monkeypatch.setattr(qa_facts, "_probe_state", {"ts": 0.0, "ok": False})
+    assert qa_facts.fact_join_enabled() is False
+
+    # 生产但显式 false → 强制关
+    _Cfg.environment = "production"
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    assert qa_facts.fact_join_enabled() is False
