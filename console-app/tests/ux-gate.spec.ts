@@ -290,6 +290,8 @@ test.describe('UX 硬门 — 审批中心', () => {
     uploads?: object[];               // 上传审批（kb_admin 职责）
     history?: object[];               // 审批历史
     contribs?: object[];              // 待审核知识贡献（跳转 chip）
+    tools?: object | number;          // /api/agent/tools 响应体或状态码；缺省 404（治理 tab 自隐，老用例零扰动）
+    invocations?: object[];           // /api/agent/invocations（uncertain 对账队列）
   }
   function mockManage(page: import('@playwright/test').Page, o: MockOpts = {}) {
     // catch-all：ManageView 的其余 loaders 全部回空（避免 4xx 触发 console guard）
@@ -317,6 +319,15 @@ test.describe('UX 硬门 — 审批中心', () => {
         r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.history ?? [] }) })),
       page.route('**/api/kb/contributions/pending*', (r) =>
         r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.contribs ?? [], has_more: false }) })),
+      // Agent 治理（批次β）：专属 mock 堵住 catch-all 的形状错配（{items,questions,docs,total} 里
+      // 没有 disabled/drift 键）。缺省 404 = flag 未开 → tab 自隐，既有用例零视觉扰动。
+      page.route('**/api/agent/tools*', (r) => (
+        typeof (o.tools ?? 404) === 'number'
+          ? r.fulfill({ status: (o.tools ?? 404) as number, contentType: 'application/json', body: JSON.stringify({ detail: 'Not Found' }) })
+          : r.fulfill({ contentType: 'application/json', body: JSON.stringify(o.tools) })
+      )),
+      page.route('**/api/agent/invocations*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.invocations ?? [] }) })),
     ]);
   }
   const approvalsTab = (page: import('@playwright/test').Page) =>
@@ -428,6 +439,71 @@ test.describe('UX 硬门 — 审批中心', () => {
     await expect(page, '审批深链不携带文档筛选词（白名单摘除）').not.toHaveURL(/[?&]q=/);
     await zone.getByRole('tab', { name: /文档管理/ }).click();
     await expect(page.getByPlaceholder('搜索文档名…'), '切回 docs：筛选靠 useKb 模块态保持').toHaveValue('营销规范');
+  });
+
+  test('批次β：Agent 治理 tab（kb_admin+flag 双门）——停用走必填理由确认，POST toggle 后状态翻转', async ({ page }) => {
+    const TOOLS = {
+      items: [{ tool_name: 'u8_writeback', version: '1.0', risk_level: 'high_write', permission_scope: 'approval', owner_team: 'erp', status: 'active', registered_by: 'system', created_at: '2026-07-05 09:00' }],
+      disabled: [], drift: ['spec 漂移（代码 ≠ DB）: legacy@0.9'],
+    };
+    await mockManage(page, { role: 'kb_admin', agent: 404, tools: TOOLS });
+    const posts: string[] = [];
+    await page.route('**/api/agent/tools/toggle', (r) => {
+      posts.push(r.request().postData() || '');
+      return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ tool_name: 'u8_writeback', status: 'disabled', rows: 1 }) });
+    });
+    await page.goto(MANAGE_ROUTE);
+    const zone = page.locator('[aria-label="管理台分区"]');
+    const tab = zone.getByRole('tab', { name: /Agent 治理/ });
+    await expect(tab, 'kb_admin + tools 端点 200 → 治理 tab 出现').toBeVisible();
+    await tab.click();
+    await expect(page.getByTestId('agent-gov-drift'), '漂移告警条渲染').toContainText('legacy@0.9');
+    await page.getByTestId('tool-toggle-u8_writeback').click();
+    const dlg = page.locator('[role="alertdialog"], [role="dialog"]');
+    await expect(dlg, '全局 kill switch 必须有理由确认').toBeVisible();
+    expect(posts.length, '确认前不得发请求').toBe(0);
+    await dlg.getByRole('textbox').fill('误触发风险，先全局停用');
+    await dlg.getByRole('button', { name: '停用' }).click();
+    await expect(page.getByTestId('tool-toggle-u8_writeback'), '成功后本地翻转为可恢复').toHaveText(/恢复/);
+    expect(posts.length).toBe(1);
+    expect(JSON.parse(posts[0])).toEqual({ tool_name: 'u8_writeback', disabled: true, reason: '误触发风险，先全局停用' });
+  });
+
+  test('批次β：flag 未开（tools 404）→ 治理 tab 自隐；kb_admin 深链 ?tab=agent_gov 落诚实提示页', async ({ page }) => {
+    await mockManage(page, { role: 'kb_admin', agent: 404 });   // tools 缺省 404
+    await page.goto(MANAGE_ROUTE);
+    const zone = page.locator('[aria-label="管理台分区"]');
+    await expect(zone.getByRole('tab', { name: /审批/ })).toBeVisible();
+    await expect(zone.getByRole('tab', { name: /Agent 治理/ }), 'flag 未开不摆死 tab').toHaveCount(0);
+    await page.goto('/console/manage?token=e2e-fake-token&tab=agent_gov');
+    await expect(page.getByText('Agent 治理未开启或无权访问'), '深链兜底=诚实提示，不是空态假象').toBeVisible();
+  });
+
+  test('批次β：uncertain 对账——核实依据必填，回填成功后行移除并 POST resolve', async ({ page }) => {
+    const INV = {
+      invocation_id: 'inv1', run_id: 'run_abc123', step_no: 3, tool_name: 'u8_writeback', status: 'uncertain',
+      policy_decision: 'require_approval', approval_request_id: null, idempotency_key: 'k1', args_digest: 'a1b2c3d4',
+      error_text: 'stale executing（进程崩溃/超时僵尸，900s 无收尾）', started_at: '2026-07-13 16:02', ended_at: null,
+    };
+    await mockManage(page, { role: 'kb_admin', agent: 404, tools: { items: [], disabled: [], drift: [] }, invocations: [INV] });
+    const posts: string[] = [];
+    await page.route('**/api/agent/invocations/resolve', (r) => {
+      posts.push(r.request().postData() || '');
+      return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ invocation_id: 'inv1', status: 'succeeded' }) });
+    });
+    await page.goto(MANAGE_ROUTE);
+    await page.locator('[aria-label="管理台分区"]').getByRole('tab', { name: /Agent 治理/ }).click();
+    await expect(page.getByText('stale executing（进程崩溃/超时僵尸，900s 无收尾）')).toBeVisible();
+    await page.getByRole('button', { name: '核实为成功' }).click();
+    const dlg = page.locator('[role="alertdialog"], [role="dialog"]');
+    await expect(dlg, '对账必须采集核实依据').toBeVisible();
+    expect(posts.length, '确认前不得发请求').toBe(0);
+    await dlg.getByRole('textbox').fill('已到 U8 核实单据 20260713-001 已落库');
+    await dlg.getByRole('button', { name: /回填已成功/ }).click();
+    await expect(page.getByText('当前没有待对账的调用', { exact: false }), '回填后行移除→显式空态').toBeVisible();
+    expect(posts.length).toBe(1);
+    const body = JSON.parse(posts[0]);
+    expect(body).toEqual({ invocation_id: 'inv1', resolution: 'confirmed_succeeded', note: '已到 U8 核实单据 20260713-001 已落库' });
   });
 
   test('RAG_AGENT_ENABLE 未开（端点 404）→ Agent 区块不出现，审批 tab 常驻且角标只数 kb 队列', async ({ page }) => {

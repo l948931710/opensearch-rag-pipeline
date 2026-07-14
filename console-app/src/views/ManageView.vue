@@ -2,12 +2,13 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, ClipboardCheck, Lightbulb, Fingerprint } from 'lucide-vue-next'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, ClipboardCheck, Lightbulb, Fingerprint, ShieldCheck } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
 import { useAgentApprovals } from '@/composables/useAgentApprovals'
 import { useOntology } from '@/composables/useOntology'
+import { useAgentGovernance } from '@/composables/useAgentGovernance'
 import { useAsk } from '@/composables/useAsk'
 import { deptLabel } from '@/lib/kb'
 import UploadCard from '@/components/manage/UploadCard.vue'
@@ -22,6 +23,7 @@ import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
 import ApprovalCenter from '@/components/manage/ApprovalCenter.vue'
 import OntologyWorkbench from '@/components/manage/OntologyWorkbench.vue'
+import AgentGovernance from '@/components/manage/AgentGovernance.vue'
 
 // 知识库入口：管理员 → 分 tab 管理台（概览看板 / 文档管理 / 审批 / [本体消解] / [成员管理]）；
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
@@ -30,6 +32,7 @@ const { canManage, identity } = storeToRefs(useSession())
 const { isKbAdmin, reviewCount, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadEscalations, loadReviewTasks, applyPendingVersion } = useKb()
 const { loadAgentApprovals } = useAgentApprovals()
 const { ontologySupported, loadOntology } = useOntology()
+const { agentGovSupported, loadAgentGovernance } = useAgentGovernance()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
@@ -41,8 +44,8 @@ const ZONE = 'mb-3 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text
 
 // ── 管理台子 tab（成员管理仅 kb_admin 可见）──
 // 「审批」= 审批中心（待办/历史同址），常驻：Agent 区块随端点探测自隐，tab 本身不消失。
-type Tab = 'dash' | 'docs' | 'approvals' | 'ontology' | 'members'
-const VALID_TABS = ['dash', 'docs', 'approvals', 'ontology', 'members'] as const
+type Tab = 'dash' | 'docs' | 'approvals' | 'ontology' | 'agent_gov' | 'members'
+const VALID_TABS = ['dash', 'docs', 'approvals', 'ontology', 'agent_gov', 'members'] as const
 const activeTab = ref<Tab>('dash')
 const approvalsView = ref<'pending' | 'history'>('pending')
 // 旧深链兼容：tab=agent（独立 Agent 审批 tab 时代）→ 审批待办面；tab=history（独立审批
@@ -52,7 +55,9 @@ function resolveTab(t: unknown): { tab: Tab; view?: 'pending' | 'history' } | nu
   if (typeof t !== 'string') return null
   if (t === 'agent') return { tab: 'approvals', view: 'pending' }
   if (t === 'history') return { tab: 'approvals', view: 'history' }
-  if ((VALID_TABS as readonly string[]).includes(t) && (t !== 'members' || isKbAdmin.value)) return { tab: t as Tab }
+  // 客户端角色门在深链处显式校验（members / agent_gov 均 kb_admin 专属）；agent_gov 的
+  // flag 探测门不在此校验（挂载时 supported 尚未知）——非法态由组件内「未开启/无权」诚实页兜底。
+  if ((VALID_TABS as readonly string[]).includes(t) && ((t !== 'members' && t !== 'agent_gov') || isKbAdmin.value)) return { tab: t as Tab }
   return null
 }
 // tab ←→ URL（P2：刷新/深链不再落回默认 tab）。身份在 AppShell ready 后已解析，可安全校验 members。
@@ -87,6 +92,9 @@ const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
   { key: 'approvals', label: '审批', icon: ClipboardCheck },
   // 本体消解：RAG_ONTOLOGY_ENABLE 未开（404）或非管理角色（403）→ tab 自隐
   ...(ontologySupported.value === true ? [{ key: 'ontology' as Tab, label: '本体消解', icon: Fingerprint }] : []),
+  // Agent 治理：kb_admin + RAG_AGENT_ENABLE 双门（404/403 → supported=false 自隐）；
+  // 治理不是审批——不进 reviewCount/侧栏红点，也不进 60s pollQueues（端点共用 ask 限流桶）。
+  ...(isKbAdmin.value && agentGovSupported.value === true ? [{ key: 'agent_gov' as Tab, label: 'Agent 治理', icon: ShieldCheck }] : []),
   ...(isKbAdmin.value ? [{ key: 'members' as Tab, label: '成员管理', icon: UserCog }] : []),
 ])
 // 「审批」tab 角标 = 待你审核数（reviewCount 聚合口径：角色职责队列 + Agent 审批，
@@ -115,7 +123,7 @@ onMounted(async () => {
     void loadApprovalHistory()                       // 审批历史（两角色，只读聚合）
     void loadAgentApprovals()                        // Agent 审批队列（404/403 → tab 自隐）
     void loadOntology()                              // 本体消解工作台（404/403 → tab 自隐）
-    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants(); void loadReviewTasks() }   // 全库治理 + 成员管理 + 复审任务（kb_admin）
+    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants(); void loadReviewTasks(); void loadAgentGovernance() }   // 全库治理 + 成员管理 + 复审任务 + Agent 治理探测（kb_admin；404/403 → tab 自隐）
     await docsReady
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
     if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
@@ -260,6 +268,10 @@ onUnmounted(() => { if (queuePollTimer !== undefined) window.clearInterval(queue
     <!-- 审批中心（两角色）：待办（Agent 高风险 → 上传入库 → 跨部门授权）/ 历史 同址切换 -->
     <ApprovalCenter v-else-if="activeTab === 'approvals'" v-model:view="approvalsView" />
     <OntologyWorkbench v-else-if="activeTab === 'ontology'" />
+
+    <!-- Agent 治理（仅 kb_admin）：工具 kill switch + 漂移告警 + uncertain 对账台；
+         flag 未开时组件内显「未开启/无权」诚实页（深链可达），tab 本身由 supported 探测自隐 -->
+    <AgentGovernance v-else-if="activeTab === 'agent_gov' && isKbAdmin" />
 
     <!-- 成员管理（仅 kb_admin）：维护部门管理员 + 其可管理 owner_dept（写授权） -->
     <MemberRoleManager v-else-if="activeTab === 'members' && isKbAdmin" />
