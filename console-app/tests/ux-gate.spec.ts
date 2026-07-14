@@ -292,6 +292,7 @@ test.describe('UX 硬门 — 审批中心', () => {
     contribs?: object[];              // 待审核知识贡献（跳转 chip）
     tools?: object | number;          // /api/agent/tools 响应体或状态码；缺省 404（治理 tab 自隐，老用例零扰动）
     invocations?: object[];           // /api/agent/invocations（uncertain 对账队列）
+    ops?: object;                     // /api/kb/ops-metrics（运营指标）；缺省三块 available=false（老用例零扰动）
   }
   function mockManage(page: import('@playwright/test').Page, o: MockOpts = {}) {
     // catch-all：ManageView 的其余 loaders 全部回空（避免 4xx 触发 console guard）
@@ -328,6 +329,16 @@ test.describe('UX 硬门 — 审批中心', () => {
       )),
       page.route('**/api/agent/invocations*', (r) =>
         r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.invocations ?? [] }) })),
+      // 运营指标（批次γ）：专属 mock 堵 catch-all 形状错配（缺 *_available 键）。缺省三块不可用。
+      page.route('**/api/kb/ops-metrics*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify(o.ops ?? {
+          window_days: 30, llm_available: false, llm_total_calls: 0, llm_error_calls: 0,
+          llm_tokens_prompt: 0, llm_tokens_completion: 0, llm_cost_estimate: null,
+          llm_p50_latency_ms: 0, llm_p95_latency_ms: 0,
+          llm_by_model: [], llm_by_category: [], llm_by_dept: [], llm_daily: [],
+          slo_available: false, slo_daily: [], slo_breach_days: 0,
+          admission_available: false, admission_daily: [], admission_reasons: [],
+        }) })),
     ]);
   }
   const approvalsTab = (page: import('@playwright/test').Page) =>
@@ -504,6 +515,52 @@ test.describe('UX 硬门 — 审批中心', () => {
     expect(posts.length).toBe(1);
     const body = JSON.parse(posts[0]);
     expect(body).toEqual({ invocation_id: 'inv1', resolution: 'confirmed_succeeded', note: '已到 U8 核实单据 20260713-001 已落库' });
+  });
+
+  test('批次γ：运营指标 tab（kb_admin）——三分区渲染、口径脚注、SLO 停摆哨兵、准入健康语义', async ({ page }) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const OPS = {
+      window_days: 30, llm_available: true, llm_total_calls: 2841, llm_error_calls: 31,
+      llm_tokens_prompt: 3412000, llm_tokens_completion: 861000, llm_cost_estimate: null,
+      llm_p50_latency_ms: 1180, llm_p95_latency_ms: 6400,
+      llm_by_model: [{ model: 'qwen3.7-plus', calls: 2210, error_calls: 24, tokens_prompt: 2900000, tokens_completion: 720000, avg_latency_ms: 1350 }],
+      llm_by_category: [{ key: 'default', calls: 2300, tokens_total: 3400000 }],
+      llm_by_dept: [{ key: 'marketing', calls: 1030, tokens_total: 1500000 }],
+      llm_daily: [{ d: today, calls: 411, tokens_total: 683000 }],
+      slo_available: true,
+      slo_daily: [
+        { d: '2026-07-01', total: 121, answer_rate: 0.78, no_result_rate: 0.14, error_rate: 0.06, p95_latency_ms: 68000, distinct_users: 44, slo_ok: false, breaches: ['answer_rate_min'], rejected_count: 12 },
+      ],   // 最新一天远早于今天 → 停摆哨兵必亮
+      slo_breach_days: 1,
+      admission_available: true,
+      admission_daily: [{ d: today, admitted: 96, rejected: 0 }],
+      admission_reasons: [],
+    };
+    await mockManage(page, { role: 'kb_admin', agent: 404, ops: OPS });
+    await page.goto(MANAGE_ROUTE);
+    const zone = page.locator('[aria-label="管理台分区"]');
+    const tab = zone.getByRole('tab', { name: /运营指标/ });
+    await expect(tab, 'kb_admin 可见运营指标 tab').toBeVisible();
+    await tab.click();
+    await expect(page.getByTestId('ops-llm')).toContainText('价表未配');        // cost NULL 诚实空态
+    await expect(page.getByTestId('ops-llm')).toContainText('qwen3.7-plus');
+    await expect(page.getByTestId('ops-slo-stale'), 'rollup 停摆哨兵').toContainText('qa_rollup');
+    await expect(page.getByTestId('ops-slo-breaches')).toContainText('answer_rate_min');
+    await expect(page.getByTestId('ops-admission')).toContainText('限流未触发，健康');
+    await expect(page.getByText('非同一口径'), 'governance↔SLO 口径脚注').toBeVisible();
+  });
+
+  test('批次γ：非 kb_admin 深链 kb_admin 专属 tab（ops/members）→ 落回概览看板（resolveTab 名单门）', async ({ page }) => {
+    await mockManage(page, {});   // 默认 dept_admin
+    for (const t of ['ops', 'members']) {
+      await page.goto(`/console/manage?token=e2e-fake-token&tab=${t}`);
+      const zone = page.locator('[aria-label="管理台分区"]');
+      await expect(zone.getByRole('tab', { name: /概览看板/ }), `?tab=${t} 被拒 → 默认 dash`).toBeVisible();
+      await expect(zone.getByRole('tab', { name: /运营指标|成员管理/ })).toHaveCount(0);
+      await expect(page.getByTestId('ops-llm')).toHaveCount(0);
+      // dash 真渲染了内容（非空白死页）：两种看板（全库/本部门）标题都含「资产概览」
+      await expect(page.getByText(/资产概览/).first()).toBeVisible();
+    }
   });
 
   test('RAG_AGENT_ENABLE 未开（端点 404）→ Agent 区块不出现，审批 tab 常驻且角标只数 kb 队列', async ({ page }) => {
