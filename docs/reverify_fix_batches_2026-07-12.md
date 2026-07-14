@@ -269,7 +269,7 @@ A3 的 staging 演练排在这批合入之后。
 | A3-演练 | staging 真实 identity_resolve 全链路：suspend→approve/edit/reject→resume→uncertain→reconcile | 批次 3 + gate 签字 + SAE 重打包 |
 | D2-粘贴 | retention 节点新脚本重粘贴到 DataWorks 控制台 | DataWorks 控制台权限 |
 | B2-HA | Redis 双副本/自动切换落地 | infra |
-| 迁移 apply | 批次 1（037，本地已 apply+台账 2026-07-12）/批次 6（03x）——staging/prod apply | Sam 授权链 |
+| 迁移 apply | ✅ **DONE（2026-07-13 Sam 授权）**：037（operation）+038（ontology）三环境齐——staging（fuling_operation_stg/fuling_ontology_stg，apply_migration --commit）+ prod（--prod-ack 当日 RW 令牌，台账已记）；apply 前置核对=两环境 agent_run 零残行；**backfill 实测三环境 ontology_object 全 0 行（还没录产品）= remaining=0 无事可做**，真实播种前置的 038+backfill 杠已闭 | ~~Sam 授权链~~ 已执行 |
 
 ---
 
