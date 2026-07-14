@@ -47,6 +47,20 @@ export const ROLE_LABEL: Record<string, string> = {
   kb_admin: '知识库管理员', dept_admin: '部门管理员', employee: '员工',
 }
 
+// 时间戳显示归一 → `YYYY-MM-DD HH:MM`。后端有两种源：MySQL str(datetime) 空格分隔、
+// contribution.py isoformat() T 分隔——裸 `.slice(0,16)` 对后者留 T（'2026-06-20T10:15'），
+// 必须先换空格再截。纯日期（'2026-06-20'）或相对文案（'刚刚'）原样通过。
+export const fmtTs = (v: string | null | undefined): string => (v || '').replace('T', ' ').slice(0, 16)
+
+// 限流拒绝原因机器码 → 中文（schema/017 qa_admission_reject.reason 枚举；rate_limiter 只落机器码，
+// 前端此前无任何映射层——批次γ D3 首个消费方）。未知码原样透出，不猜。
+export const ADMISSION_REASON_LABEL: Record<string, string> = {
+  global_cap: '全局日熔断', per_min: '单人每分钟上限', per_day: '单人每日上限',
+  thinking_quota: '深度思考日配额', thinking_anon: '匿名深度思考', thinking_off: '深度思考未开放',
+  aux_per_min: '辅助接口每分钟上限',
+}
+export const admissionReasonLabel = (r: string) => ADMISSION_REASON_LABEL[r] || r
+
 // 文档状态徽章 → 色调键（组件据此取 st-* 颜色）。未命中 → muted。
 // 色彩语义分家（P2 同色复用修复）：待审核=良性管道等待 → 与排队中同 queue 族（原与
 // 未入索引同蓝，异常/正常不可分）；已隔离=安全隔离 → 专属 hold 紫（PII 隔离≠工作流

@@ -249,3 +249,137 @@ test.describe('UX 硬门 — AI 助手交互', () => {
     ]);
   });
 });
+// ─────────────────────────────────────────────────────────────────────────────
+// 运营指标（批次γ，摘自分支「审批中心」组并适配 main 的 tab 结构——审批中心 IA 本身
+// 随 ontology-p0 大合并）。进入方式与「AI 助手」组一致：?token= 透传登录 + mock
+// /api/kb/whoami（不用 ?preview，否则 authed 请求被合成 503、page.route 截不到）。
+// ManageView 挂载会并发拉一串管理接口，先注册 catch-all 空响应、再注册专属 mock
+// （Playwright 后注册者优先）。
+// ─────────────────────────────────────────────────────────────────────────────
+test.describe('UX 硬门 — 运营指标（批次γ）', () => {
+  const MANAGE_ROUTE = '/console/manage?token=e2e-fake-token';
+
+  const ACCESS_REQ = (over: Record<string, unknown> = {}) => ({
+    id: 'ar1', doc_id: 'D1', doc_title: '营销物料使用规范 v3', owner_dept: 'production',
+    requester_dept: 'marketing', requester_name: '王伟', permission_level: 'dept_internal',
+    reason: '包装设计需引用营销规范。', created_at: '2026-07-09', ...over,
+  });
+
+  interface MockOpts {
+    role?: 'dept_admin' | 'kb_admin';
+    agent?: object | number;          // /api/agent/approvals 响应体或状态码（404/403）
+    access?: object[];                // 授权申请（dept_admin 职责）
+    uploads?: object[];               // 上传审批（kb_admin 职责）
+    history?: object[];               // 审批历史
+    contribs?: object[];              // 待审核知识贡献（跳转 chip）
+    tools?: object | number;          // /api/agent/tools 响应体或状态码；缺省 404（治理 tab 自隐，老用例零扰动）
+    invocations?: object[];           // /api/agent/invocations（uncertain 对账队列）
+    ops?: object;                     // /api/kb/ops-metrics（运营指标）；缺省三块 available=false（老用例零扰动）
+  }
+  function mockManage(page: import('@playwright/test').Page, o: MockOpts = {}) {
+    // catch-all：ManageView 的其余 loaders 全部回空（避免 4xx 触发 console guard）
+    return Promise.all([
+      page.route('**/api/**', (r) => r.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ items: [], questions: [], docs: [], total: 0 }),
+      })),
+      page.route('**/api/kb/whoami', (r) => r.fulfill({
+        contentType: 'application/json', body: JSON.stringify({
+          user_id: 'admin1', display_name: '生产部管理员', role: o.role ?? 'dept_admin',
+          can_manage_kb: true, acl_groups: ['production'], managed_owner_depts: ['production'],
+        }),
+      })),
+      page.route('**/api/agent/approvals*', (r) => (
+        typeof o.agent === 'number'
+          ? r.fulfill({ status: o.agent, contentType: 'application/json', body: JSON.stringify({ detail: 'Not Found' }) })
+          : r.fulfill({ contentType: 'application/json', body: JSON.stringify(o.agent ?? { items: [] }) })
+      )),
+      page.route('**/api/kb/access-requests*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.access ?? [] }) })),
+      page.route('**/api/kb/pending-approvals*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.uploads ?? [] }) })),
+      page.route('**/api/kb/approval-history*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.history ?? [] }) })),
+      page.route('**/api/kb/contributions/pending*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.contribs ?? [], has_more: false }) })),
+      // Agent 治理（批次β）：专属 mock 堵住 catch-all 的形状错配（{items,questions,docs,total} 里
+      // 没有 disabled/drift 键）。缺省 404 = flag 未开 → tab 自隐，既有用例零视觉扰动。
+      page.route('**/api/agent/tools*', (r) => (
+        typeof (o.tools ?? 404) === 'number'
+          ? r.fulfill({ status: (o.tools ?? 404) as number, contentType: 'application/json', body: JSON.stringify({ detail: 'Not Found' }) })
+          : r.fulfill({ contentType: 'application/json', body: JSON.stringify(o.tools) })
+      )),
+      page.route('**/api/agent/invocations*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: o.invocations ?? [] }) })),
+      // 运营指标（批次γ）：专属 mock 堵 catch-all 形状错配（缺 *_available 键）。缺省三块不可用。
+      page.route('**/api/kb/ops-metrics*', (r) =>
+        r.fulfill({ contentType: 'application/json', body: JSON.stringify(o.ops ?? {
+          window_days: 30, llm_available: false, llm_total_calls: 0, llm_error_calls: 0,
+          llm_tokens_prompt: 0, llm_tokens_completion: 0, llm_cost_estimate: null,
+          llm_p50_latency_ms: 0, llm_p95_latency_ms: 0,
+          llm_by_model: [], llm_by_category: [], llm_by_dept: [], llm_daily: [],
+          slo_available: false, slo_daily: [], slo_breach_days: 0,
+          admission_available: false, admission_daily: [], admission_reasons: [],
+        }) })),
+    ]);
+  }
+
+  test('批次γ：运营指标 tab（kb_admin）——三分区渲染、口径脚注、SLO 停摆哨兵、准入健康语义', async ({ page }) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const OPS = {
+      window_days: 30, llm_available: true, llm_total_calls: 2841, llm_error_calls: 31,
+      llm_tokens_prompt: 3412000, llm_tokens_completion: 861000, llm_cost_estimate: null,
+      llm_p50_latency_ms: 1180, llm_p95_latency_ms: 6400,
+      llm_by_model: [{ model: 'qwen3.7-plus', calls: 2210, error_calls: 24, tokens_prompt: 2900000, tokens_completion: 720000, avg_latency_ms: 1350 }],
+      llm_by_category: [{ key: 'default', calls: 2300, tokens_total: 3400000 }],
+      llm_by_dept: [{ key: 'marketing', calls: 1030, tokens_total: 1500000 }],
+      llm_daily: [{ d: today, calls: 411, tokens_total: 683000 }],
+      slo_available: true,
+      slo_daily: [
+        { d: '2026-07-01', total: 121, answer_rate: 0.78, no_result_rate: 0.14, error_rate: 0.06, p95_latency_ms: 68000, distinct_users: 44, slo_ok: false, breaches: ['answer_rate_min'], rejected_count: 12 },
+      ],   // 最新一天远早于今天 → 停摆哨兵必亮
+      slo_breach_days: 1,
+      admission_available: true,
+      admission_daily: [{ d: today, admitted: 96, rejected: 0 }],
+      admission_reasons: [],
+    };
+    await mockManage(page, { role: 'kb_admin', agent: 404, ops: OPS });
+    await page.goto(MANAGE_ROUTE);
+    const zone = page.locator('[aria-label="管理台分区"]');
+    const tab = zone.getByRole('tab', { name: /运营指标/ });
+    await expect(tab, 'kb_admin 可见运营指标 tab').toBeVisible();
+    await tab.click();
+    await expect(page.getByTestId('ops-llm')).toContainText('价表未配');        // cost NULL 诚实空态
+    await expect(page.getByTestId('ops-llm')).toContainText('qwen3.7-plus');
+    await expect(page.getByTestId('ops-slo-stale'), 'rollup 停摆哨兵').toContainText('qa_rollup');
+    await expect(page.getByTestId('ops-slo-breaches')).toContainText('answer_rate_min');
+    await expect(page.getByTestId('ops-admission')).toContainText('限流未触发，健康');
+    await expect(page.getByText('非同一口径'), 'governance↔SLO 口径脚注').toBeVisible();
+  });
+
+  test('批次γ：非 kb_admin 深链 kb_admin 专属 tab（ops/members）→ 落回概览看板（resolveTab 名单门）', async ({ page }) => {
+    await mockManage(page, {});   // 默认 dept_admin
+    for (const t of ['ops', 'members']) {
+      await page.goto(`/console/manage?token=e2e-fake-token&tab=${t}`);
+      const zone = page.locator('[aria-label="管理台分区"]');
+      await expect(zone.getByRole('tab', { name: /概览看板/ }), `?tab=${t} 被拒 → 默认 dash`).toBeVisible();
+      await expect(zone.getByRole('tab', { name: /运营指标|成员管理/ })).toHaveCount(0);
+      await expect(page.getByTestId('ops-llm')).toHaveCount(0);
+      // dash 真渲染了内容（非空白死页）：两种看板（全库/本部门）标题都含「资产概览」
+      await expect(page.getByText(/资产概览/).first()).toBeVisible();
+    }
+  });
+
+  test('桌面 ?token 刷新不再死胡同：token tab 级续存，reload 后自动重登且 URL 仍无 token', async ({ page }) => {
+    await mockManage(page, { access: [ACCESS_REQ()] });
+    await page.goto(MANAGE_ROUTE);
+    await expect(page.getByRole('tab', { name: /概览看板/ })).toBeVisible();
+    expect(page.url(), '#F-console-urltoken：token 抹除不回退').not.toContain('token=');
+    await page.reload();
+    await expect(page.getByRole('tab', { name: /概览看板/ }),
+      '刷新后应用 sessionStorage 续存 token 自动重登，而非「未能完成免登」死胡同').toBeVisible();
+    await expect(page.getByText('未能完成免登')).toHaveCount(0);
+    expect(page.url()).not.toContain('token=');
+  });
+
+});

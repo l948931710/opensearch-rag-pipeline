@@ -95,6 +95,32 @@ export interface KbGovernance {
   dept_coverage: KbDeptCoverage[]
 }
 export interface KbConfig { max_upload_bytes: number; accepted_exts: string[] }
+
+// ── 运营数据面（批次γ D1-D3，GET /api/kb/ops-metrics，kb_admin 专属）──
+// 三块各自 available：false=该块查询失败（诚实「未知」）；true+空列表=表可读但确实没数据。
+export interface KbOpsLlmModelRow { model: string; calls: number; error_calls: number; tokens_prompt: number; tokens_completion: number; avg_latency_ms: number }
+export interface KbOpsBucketRow { key: string; calls: number; tokens_total: number }
+export interface KbOpsDailyLlmRow { d: string; calls: number; tokens_total: number }
+export interface KbOpsSloDayRow {
+  d: string; total: number
+  answer_rate: number | null; no_result_rate: number | null; error_rate: number | null
+  p95_latency_ms: number | null; distinct_users: number
+  slo_ok: boolean | null; breaches: string[]; rejected_count: number | null
+}
+export interface KbOpsAdmissionDayRow { d: string; admitted: number; rejected: number }
+export interface KbOpsAdmissionReasonRow { reason: string; count: number }
+export interface KbOpsMetrics {
+  window_days: number
+  llm_available: boolean
+  llm_total_calls: number; llm_error_calls: number
+  llm_tokens_prompt: number; llm_tokens_completion: number
+  llm_cost_estimate: number | null
+  llm_p50_latency_ms: number; llm_p95_latency_ms: number
+  llm_by_model: KbOpsLlmModelRow[]; llm_by_category: KbOpsBucketRow[]; llm_by_dept: KbOpsBucketRow[]
+  llm_daily: KbOpsDailyLlmRow[]
+  slo_available: boolean; slo_daily: KbOpsSloDayRow[]; slo_breach_days: number
+  admission_available: boolean; admission_daily: KbOpsAdmissionDayRow[]; admission_reasons: KbOpsAdmissionReasonRow[]
+}
 export interface VersionItem {
   version_no: number; content_process_status: string; chunk_status: string
   index_status: string; publish_status: string; status_badge: string; error_message: string; created_at: string
@@ -112,6 +138,7 @@ const kbStats = ref<KbStats | null>(null)   // 全作用域聚合（真实总数
 const kbInsights = ref<KbInsights | null>(null)     // Phase E：使用成效 + 知识缺口（owner 作用域）
 const kbGovernance = ref<KbGovernance | null>(null) // Phase E：全库运行健康/治理风险/部门覆盖（kb_admin）
 const kbConfig = ref<KbConfig | null>(null) // 后端能力配置（上传上限/类型）；缺省用常量兜底
+const kbOpsMetrics = ref<KbOpsMetrics | null>(null) // 批次γ：运营数据面（kb_admin；null=未加载/无权）
 const maxUploadBytes = computed(() => kbConfig.value?.max_upload_bytes || MAX_UPLOAD_MB * 1048576)
 const maxUploadMb = computed(() => Math.round(maxUploadBytes.value / 1048576))
 const verHistory = ref<{ doc: DocItem | null; versions: VersionItem[]; loading: boolean; error: string } | null>(null)
@@ -587,6 +614,70 @@ async function loadGovernance() {
   }
   clearLoadError('governance')
   try { kbGovernance.value = await apiJson<KbGovernance>('/api/kb/governance', { auth: true }) } catch (e) { noteLoadError('governance', e) /* 兜底 */ }
+}
+
+// 批次γ：运营数据面（governance 同款单门模式——kb_admin 短路 + loadErrors，无 supported 探测：
+// 端点无 flag 语义，「三块各自 available」是业务降级不是功能开关）。
+// （分支侧另有 P0-D 身份指纹判废——随大合并收敛；main 无运行期身份切换，指纹恒等。）
+async function loadOpsMetrics() {
+  const s = useSession()
+  if (s.role !== 'kb_admin') { kbOpsMetrics.value = null; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    // 日期相对 Date.now() 生成（批次β 拆雷同款教训）：硬编码日历日会腐坏——过几天后
+    // 预览里的「rollup 停摆哨兵」会因数据"变旧"而误亮，演示失真。
+    const _day = (off: number) => new Date(Date.now() + off * 86400000).toISOString().slice(0, 10)
+    kbOpsMetrics.value = {
+      window_days: 30,
+      llm_available: true,
+      llm_total_calls: 2841, llm_error_calls: 31,
+      llm_tokens_prompt: 3_412_000, llm_tokens_completion: 861_000,
+      llm_cost_estimate: null,   // 价表未配的诚实空态也要在预览里出现（不能全是开心路径）
+      llm_p50_latency_ms: 1180, llm_p95_latency_ms: 6400,
+      llm_by_model: [
+        { model: 'qwen3.7-plus', calls: 2210, error_calls: 24, tokens_prompt: 2_900_000, tokens_completion: 720_000, avg_latency_ms: 1350 },
+        { model: 'qwen3-vl-plus', calls: 431, error_calls: 7, tokens_prompt: 396_000, tokens_completion: 98_000, avg_latency_ms: 2100 },
+        { model: 'qwen3-rerank', calls: 200, error_calls: 0, tokens_prompt: 116_000, tokens_completion: 43_000, avg_latency_ms: 310 },
+      ],
+      llm_by_category: [
+        { key: 'default', calls: 2300, tokens_total: 3_400_000 },
+        { key: 'deep', calls: 341, tokens_total: 700_000 },
+        { key: '未标注', calls: 200, tokens_total: 173_000 },
+      ],
+      llm_by_dept: [
+        { key: 'marketing', calls: 1030, tokens_total: 1_500_000 },
+        { key: 'production', calls: 890, tokens_total: 1_320_000 },
+        { key: 'hr', calls: 520, tokens_total: 780_000 },
+        { key: '未归集', calls: 401, tokens_total: 673_000 },
+      ],
+      llm_daily: [
+        { d: _day(-6), calls: 350, tokens_total: 520_000 }, { d: _day(-5), calls: 410, tokens_total: 610_000 },
+        { d: _day(-4), calls: 380, tokens_total: 560_000 }, { d: _day(-3), calls: 460, tokens_total: 690_000 },
+        { d: _day(-2), calls: 520, tokens_total: 760_000 }, { d: _day(-1), calls: 310, tokens_total: 450_000 },
+        { d: _day(0), calls: 411, tokens_total: 683_000 },
+      ],
+      slo_available: true,
+      slo_daily: [
+        { d: _day(-6), total: 98, answer_rate: 0.91, no_result_rate: 0.05, error_rate: 0.01, p95_latency_ms: 51_000, distinct_users: 37, slo_ok: true, breaches: [], rejected_count: null },
+        { d: _day(-5), total: 112, answer_rate: 0.89, no_result_rate: 0.07, error_rate: 0.02, p95_latency_ms: 55_000, distinct_users: 41, slo_ok: true, breaches: [], rejected_count: 0 },
+        { d: _day(-4), total: 121, answer_rate: 0.78, no_result_rate: 0.14, error_rate: 0.06, p95_latency_ms: 68_000, distinct_users: 44, slo_ok: false, breaches: ['answer_rate_min', 'error_rate_max'], rejected_count: 12 },
+        { d: _day(-3), total: 105, answer_rate: 0.9, no_result_rate: 0.06, error_rate: 0.01, p95_latency_ms: 52_000, distinct_users: 38, slo_ok: true, breaches: [], rejected_count: 0 },
+        { d: _day(-2), total: 118, answer_rate: 0.92, no_result_rate: 0.05, error_rate: 0.01, p95_latency_ms: 49_000, distinct_users: 45, slo_ok: true, breaches: [], rejected_count: 3 },
+        { d: _day(0), total: 96, answer_rate: 0.9, no_result_rate: 0.07, error_rate: 0.02, p95_latency_ms: 53_000, distinct_users: 35, slo_ok: true, breaches: [], rejected_count: 0 },
+      ],   // 缺 _day(-1)：演示比率图「缺日断线不臆造 0」的诚实语义
+      slo_breach_days: 1,
+      admission_available: true,
+      admission_daily: [
+        { d: _day(-2), admitted: 118, rejected: 3 }, { d: _day(-1), admitted: 84, rejected: 0 },
+        { d: _day(0), admitted: 96, rejected: 0 },
+      ],
+      admission_reasons: [{ reason: 'per_min', count: 2 }, { reason: 'thinking_quota', count: 1 }],
+    }
+    return
+  }
+  clearLoadError('opsMetrics')
+  try {
+    kbOpsMetrics.value = await apiJson<KbOpsMetrics>('/api/kb/ops-metrics', { auth: true })
+  } catch (e) { noteLoadError('opsMetrics', e) /* 兜底 */ }
 }
 
 // 版本历史（点击文档行「历史」）：拉 /api/kb/version-history（后端现成）。
@@ -1423,9 +1514,9 @@ export function useKb() {
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
-    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, maxUploadMb, verHistory, loadErrors,
+    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, kbOpsMetrics, maxUploadMb, verHistory, loadErrors,
     // 方法
-    loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, openHistory, closeHistory, openDocPreview, setQuery, loadApprovals, sortBy, countOf,
+    loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, openHistory, closeHistory, openDocPreview, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
     openShare, closeShare, submitShare, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
@@ -1439,9 +1530,9 @@ export function useKb() {
   }
 }
 
-/** 仅供测试：重置 store。 */
+/** 仅供测试：重置 store。（分支侧 P0-D 已升级为运行期身份切换共用的 _resetKbState——随大合并收敛。） */
 export function __resetKb() {
-  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
+  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbOpsMetrics.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''

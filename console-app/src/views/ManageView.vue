@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History, Lightbulb } from 'lucide-vue-next'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History, Lightbulb, Gauge } from 'lucide-vue-next'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
@@ -21,12 +21,13 @@ import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 import MemberRoleManager from '@/components/manage/MemberRoleManager.vue'
 import ApprovalHistory from '@/components/manage/ApprovalHistory.vue'
+import OpsMetricsPanel from '@/components/manage/OpsMetricsPanel.vue'
 
 // 知识库入口：管理员 → 分 tab 管理台（概览看板 / 文档管理，设计稿 SUB-TAB SWITCHER）；
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadEscalations, loadReviewTasks, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadEscalations, loadReviewTasks, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
@@ -49,24 +50,31 @@ function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({
 function onTodoChip(c: TodoChip) { if (c.key === 'anom') setBadgeFilter('异常'); scrollToSec(c.anchor) }
 
 // ── 管理台子 tab（成员管理仅 kb_admin 可见）──
-type Tab = 'dash' | 'docs' | 'history' | 'members'
-const VALID_TABS = ['dash', 'docs', 'history', 'members'] as const
+type Tab = 'dash' | 'docs' | 'history' | 'ops' | 'members'
+const VALID_TABS = ['dash', 'docs', 'history', 'ops', 'members'] as const
+// kb_admin 专属 tab 名单：深链门与 tab bar 渲染门共用一张表——此前是手写字面量排除
+// 表达式（t !== 'members'），每加一个 kb_admin tab 都要人肉同步，漏一处 = 非管理员
+// 深链直达空白页（批次γ 审计风险 1）。收敛成单一名单。
+const KB_ADMIN_TABS: readonly Tab[] = ['members', 'ops'] as const
 const activeTab = ref<Tab>('dash')
 // tab ←→ URL（P2：刷新/深链不再落回默认 tab）。身份在 AppShell ready 后已解析，可安全校验 members。
 // route?. 可选链 = 单测无 router 环境的既有约定（同 Sidebar）。
 {
   const t = route?.query?.tab
-  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (t !== 'members' || isKbAdmin.value)) activeTab.value = t as Tab
+  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (!(KB_ADMIN_TABS as readonly string[]).includes(t) || isKbAdmin.value)) activeTab.value = t as Tab
 }
 watch(activeTab, (t) => { void router?.replace({ query: { ...(route?.query || {}), tab: t === 'dash' ? undefined : t } }) })
 // 反向：URL tab 变化 → 切 tab（差评复核「定位文档」等站内导航靠它；同值 no-op 防回环）
 watch(() => route?.query?.tab, (t) => {
-  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (t !== 'members' || isKbAdmin.value) && t !== activeTab.value) activeTab.value = t as Tab
+  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (!(KB_ADMIN_TABS as readonly string[]).includes(t) || isKbAdmin.value) && t !== activeTab.value) activeTab.value = t as Tab
 })
 const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
   { key: 'dash', label: '概览看板', icon: LayoutDashboard },
   { key: 'docs', label: '文档管理', icon: FolderOpen },
   { key: 'history', label: '审批历史', icon: History },
+  // 运营指标（批次γ）：members 档纯角色门（端点无 flag 语义，三块 available 是业务降级非功能开关）。
+  // 只读观测面板——绝不并入「待你处理」chip/reviewCount 的行动语义。
+  ...(isKbAdmin.value ? [{ key: 'ops' as Tab, label: '运营指标', icon: Gauge }] : []),
   ...(isKbAdmin.value ? [{ key: 'members' as Tab, label: '成员管理', icon: UserCog }] : []),
 ])
 // 「文档管理」tab 角标 = 待你审核数（reviewCount，与侧栏入口红点同一来源）。
@@ -92,7 +100,7 @@ onMounted(async () => {
     void loadAccessRequests()                        // 同上（staleness 门在 useKb 内）
     void loadAccessGrants()
     void loadApprovalHistory()                       // 审批历史（两角色，只读聚合）
-    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants(); void loadReviewTasks() }   // 全库治理 + 成员管理 + 复审任务（kb_admin）
+    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants(); void loadReviewTasks(); void loadOpsMetrics() }   // 全库治理 + 成员管理 + 复审任务 + 运营指标（kb_admin）
     await docsReady
     const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
     if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
@@ -248,6 +256,9 @@ onMounted(async () => {
 
     <!-- 审批历史（两角色）：四条审批流的历史决策合并时间线（只读） -->
     <ApprovalHistory v-else-if="activeTab === 'history'" />
+
+    <!-- 运营指标（仅 kb_admin，批次γ）：LLM 用量/SLO 日趋势/限流准入——只读观测，独立于看板行动区 -->
+    <OpsMetricsPanel v-else-if="activeTab === 'ops' && isKbAdmin" />
 
     <!-- 成员管理（仅 kb_admin）：维护部门管理员 + 其可管理 owner_dept（写授权） -->
     <MemberRoleManager v-else-if="activeTab === 'members' && isKbAdmin" />
