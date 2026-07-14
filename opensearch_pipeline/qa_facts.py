@@ -129,8 +129,18 @@ def _probe_fact_table() -> bool:
 
 
 def fact_join_enabled() -> bool:
-    """读侧总开关：RAG_QA_FACT_JOIN 显式开启 + 事实表探测通过（防 flag 先于迁移打开）。"""
-    if os.environ.get("RAG_QA_FACT_JOIN", "").strip().lower() not in ("1", "true", "yes"):
+    """读侧总开关：RAG_QA_FACT_JOIN 显式设置优先；**未设置时生产环境默认开**（少填一条
+    SAE env——schema/013 已 apply、写侧 live；表探测闸照常兜底，表缺失自动回退
+    JSON_TABLE，不会因 flag 先于迁移而坏）。显式 false 仍可强制关。"""
+    raw = os.environ.get("RAG_QA_FACT_JOIN")
+    if raw is None:
+        try:
+            from opensearch_pipeline.config import get_config
+            if (get_config().environment or "").lower() != "production":
+                return False
+        except Exception:
+            return False
+    elif raw.strip().lower() not in ("1", "true", "yes"):
         return False
     now = time.time()
     with _probe_lock:
