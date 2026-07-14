@@ -89,6 +89,17 @@ let _stashedToken = ''
 let _capturedName = ''
 let _captured = false
 
+// ── 桌面 ?token 刷新续存（sessionStorage，tab 级）──
+// #F-console-urltoken 抹除 URL 后 token 只活在内存 → 桌面浏览器（无钉钉容器可重登）一刷新即
+// 永久掉线且无恢复路径（唯一出路=讨新链接）。解法：URL 摄取时同步存 sessionStorage，刷新时恢复。
+// 威胁模型不变差：不进 URL/历史/日志/截图/Referer（抹除照旧）；XSS 可读面与内存 token 等同；
+// tab 关闭即清、不跨 tab；token 本身由服务端签名+TTL 兜底。401 时清除，防过期 token 死循环。
+// 钉钉容器内不依赖此续存（dd 免登可随时重走），容器换证 token 不落存储（少存一处密钥）。
+const SS_TOKEN_KEY = 'rag.console.token'
+function persistToken(t: string) { try { sessionStorage.setItem(SS_TOKEN_KEY, t) } catch { /* 隐私模式等：降级为内存单次 */ } }
+function clearPersistedToken() { try { sessionStorage.removeItem(SS_TOKEN_KEY) } catch { /* 同上 */ } }
+function restorePersistedToken(): string { try { return sessionStorage.getItem(SS_TOKEN_KEY) || '' } catch { return '' } }
+
 /** 升版深链暂存（小程序「上传新版本」→ /console-next/?doc_id=&owner=&title=）。 */
 export interface PendingVersion { docId: string; owner: string; title: string }
 let _pendingVersion: PendingVersion | null = null
@@ -109,7 +120,8 @@ export function captureUrlCredential(): void {
   const hashToken = hashParam('token')
   const urlToken = qs('token') || hashToken
   const docId = qs('doc_id')
-  if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name') }
+  if (urlToken) { _stashedToken = urlToken; _capturedName = qs('name'); persistToken(urlToken) }
+  else { _stashedToken = restorePersistedToken() }   // 刷新路径：URL 已被抹除 → 从 tab 级续存恢复
   if (docId) _pendingVersion = { docId, owner: qs('owner'), title: qs('title') }   // 小程序升版深链
   if (urlToken || docId) scrubUrl(['token', 'name', 'doc_id', 'owner', 'title'])   // 先抹除，再发任何请求
   if (hashToken) scrubHash(['token'])                                              // fragment 同防线
@@ -141,10 +153,18 @@ async function doLogin(force: boolean): Promise<void> {
   if (!force) {
     if (!session.token && _stashedToken) session.setToken(_stashedToken)
     if (session.token) {
-      diag('login: URL 透传 token → /api/kb/whoami')
-      const who = await apiJson<Record<string, any>>('/api/kb/whoami', { auth: true })
-      session.setIdentity(toIdentity({ ...who, display_name: who.display_name || _capturedName }))
-      return
+      diag('login: URL 透传/续存 token → /api/kb/whoami')
+      try {
+        const who = await apiJson<Record<string, any>>('/api/kb/whoami', { auth: true })
+        session.setIdentity(toIdentity({ ...who, display_name: who.display_name || _capturedName }))
+        return
+      } catch (e: any) {
+        // token 失效（401）：清内存+续存后【落穿】到容器免登——钉钉内无感重登；桌面（无容器）
+        // 走到超时报错，且续存已清，下次刷新不再拿同一枚死 token 空转。非 401（网络等）照旧上抛。
+        if (e?.status !== 401) throw e
+        session.setToken(''); _stashedToken = ''; clearPersistedToken()
+        diag('login: token 失效(401) → 清续存，回退容器免登')
+      }
     }
   }
 
@@ -208,6 +228,7 @@ export function useAuth() {
     if (import.meta.env.DEV && session.token === 'dev-preview') return false
     try {
       session.setToken('')
+      clearPersistedToken()   // 旧 token 已证失效：续存一并清，防刷新捡回死 token
       await doLogin(true)
       syncHistoryForUser(session.identity?.userId || '')   // 重登为不同用户时清掉前者残留
       return !!session.token
@@ -219,11 +240,12 @@ export function useAuth() {
   return { init, reauth }
 }
 
-/** 仅供测试：重置单次守卫 + 早捕获暂存。 */
+/** 仅供测试：重置单次守卫 + 早捕获暂存 + tab 级 token 续存。 */
 export function __resetInitGuard() {
   _initPromise = null
   _captured = false
   _stashedToken = ''
   _capturedName = ''
   _pendingVersion = null
+  clearPersistedToken()
 }

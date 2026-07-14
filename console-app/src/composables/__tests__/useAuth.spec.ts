@@ -176,6 +176,46 @@ describe('init — 单次守卫（修正#6）', () => {
   })
 })
 
+describe('桌面 ?token 刷新续存（sessionStorage，tab 级）', () => {
+  const KEY = 'rag.console.token'
+
+  it('URL token 捕获时同步续存；模拟刷新（模块态清零 + URL 无 token）→ 从续存恢复并完成 whoami', async () => {
+    setUrl('?token=KEEPME')
+    captureUrlCredential()
+    expect(sessionStorage.getItem(KEY)).toBe('KEEPME')       // 摄取即续存
+    expect(window.location.search).not.toContain('KEEPME')   // URL 抹除照旧（安全面不变差）
+
+    // —— 模拟刷新：模块守卫/暂存清零（__resetInitGuard 会顺带清续存，故重新播种）——
+    __resetInitGuard()
+    sessionStorage.setItem(KEY, 'KEEPME')
+    setUrl('')                                               // 刷新后的真实地址栏：无 token
+    captureUrlCredential()
+    const fetchMock = vi.fn().mockResolvedValue(jsonRes({ user_id: 'u', role: 'dept_admin', can_manage_kb: true }))
+    vi.stubGlobal('fetch', fetchMock)
+    await useAuth().init()
+    expect(useSession().token).toBe('KEEPME')                // 死胡同解除：续存 token 直接可用
+    expect(useSession().ready).toBe(true)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/kb/whoami')
+  })
+
+  it('续存 token 已失效（whoami 401）→ 清续存 + 回退容器免登（桌面无容器 → 报错但不再循环死 token）', async () => {
+    sessionStorage.setItem(KEY, 'STALE')
+    captureUrlCredential()                                   // 无 URL token → 恢复 STALE
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonRes({ detail: 'bad token' }, 401)))
+    await useAuth().init()
+    expect(useSession().ready).toBe(false)                   // 桌面无 dd 容器 → 最终失败
+    expect(useSession().error).toBeTruthy()
+    expect(sessionStorage.getItem(KEY)).toBeNull()           // 关键：死 token 已清，下次刷新不再空转
+  })
+
+  it('reauth（401 重登）清续存，不捡回死 token', async () => {
+    sessionStorage.setItem(KEY, 'DEAD')
+    const ok = await useAuth().reauth()                      // 无 dd → 容器路径立即失败
+    expect(ok).toBe(false)
+    expect(sessionStorage.getItem(KEY)).toBeNull()
+  })
+})
+
 describe('init — 钉钉容器内 requestAuthCode 换证路径', () => {
   it('无 URL token → requestAuthCode → /api/auth/dingtalk 换 token+身份', async () => {
     setUrl('')
