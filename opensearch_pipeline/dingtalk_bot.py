@@ -36,7 +36,7 @@ from opensearch_pipeline.content_blocks_builder import (
 from opensearch_pipeline.retriever import retrieve_and_enrich
 from opensearch_pipeline.llm_generator import (
     generate_answer, generate_answer_stream, parse_sse_data_frame, _extract_sources,
-    strip_doc_citations,
+    is_low_confidence_band, strip_doc_citations,
 )
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.session_store import (
@@ -47,14 +47,35 @@ from opensearch_pipeline.session_store import (
 from opensearch_pipeline.qa_logger import generate_message_id, log_qa_session
 from opensearch_pipeline.request_context import ensure_request_id, get_request_id, set_request_id
 from opensearch_pipeline.answer_flow import (
+    ACTION_GENERAL_LLM,
+    ACTION_PASSTHROUGH,
+    ACTION_SENSITIVE_BLOCK,
+    ACTION_SMALLTALK,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
+    GENERAL_QUOTA_MESSAGE,
+    GENERAL_TIER_OFF_MESSAGE,
     NO_RESULT_MESSAGE,
+    REALTIME_BLOCK_MESSAGE,
+    SENSITIVE_BLOCK_MESSAGE,
+    build_failure_action,
     build_qa_log_kwargs,
     history_answer_text,
     is_refusal_answer,
     should_append_history,
+    suggest_titles,
 )
+from opensearch_pipeline.general_answerer import CANNED_SMALLTALK, answer_general
+from opensearch_pipeline.intent_router import (
+    ROUTE_KB,
+    ROUTE_OFFICE,
+    ROUTE_REALTIME,
+    ROUTE_SENSITIVE,
+    ROUTE_SMALLTALK,
+    pre_route,
+    triage_failed_query,
+)
+from opensearch_pipeline.rate_limiter import LIMITER
 from opensearch_pipeline.dingtalk_card import (
     send_interactive_card,
     update_card_data,
@@ -706,6 +727,113 @@ def _stream_answer_to_card(
     return True
 
 
+# ═══════════════════════════════════════════════════════════════
+# 通用能力分级开放（机器人侧薄适配层；决策/话术/分诊与 API 侧共用
+# intent_router / answer_flow / general_answerer，仅执行器本地化 ——
+# dingtalk_bot 不得反向 import api）。flag 全关时以下函数不进入决策分支。
+# ═══════════════════════════════════════════════════════════════
+
+def _bot_general_flags(conversation_type: str = "1"):
+    """(mode, guided_on, feature_on)。群聊（type='2'）把 office/full 降为 smalltalk ——
+    T2/T3 不进群聊（防刷屏与代答滥用），T1 canned 与引导话术不受限。"""
+    cfg = get_config().rag
+    mode = (cfg.general_ability_mode or "off").lower()
+    if mode not in ("smalltalk", "office", "full"):
+        mode = "off"
+    if conversation_type == "2" and mode in ("office", "full"):
+        mode = "smalltalk"
+    guided_on = bool(cfg.guided_refusal)
+    return mode, guided_on, (mode != "off" or guided_on)
+
+
+def _bot_execute_general_llm(question: str, *, history, tier: str, sender_staff_id: str):
+    """T2/T3 通用回答执行（含日配额）。LLM 异常 → None（回落今日拒答行为）。"""
+    actor = f"u:{sender_staff_id}" if sender_staff_id else "ip:anon"
+    denial = LIMITER.admit_general(actor, is_user=bool(sender_staff_id))
+    if denial is not None:
+        text = GENERAL_QUOTA_MESSAGE if denial.reason == "general_quota" \
+            else GENERAL_TIER_OFF_MESSAGE
+        return {"answer": text, "model": "N/A", "answer_status": None,
+                "intent_type": "refuse_quota", "risk_level": None, "risk_blocked": False,
+                "source": "guard"}
+    try:
+        result = answer_general(question, history=history, tier=tier)
+    except Exception as e:
+        logger.warning("通用回答生成失败（回落知识库拒答行为）: %s", e)
+        return None
+    return {"answer": result["answer"], "model": result["model"],
+            "answer_status": "SUCCESS",
+            "intent_type": "general" if tier == "general" else "office",
+            "risk_level": None, "risk_blocked": False, "source": "general"}
+
+
+def _bot_pre_route(question: str, *, sender_staff_id: str, user_dept,
+                   conversation_type: str):
+    """前置确定性路由（检索之前）。None = 照常走知识库。语义与 api 侧同源。"""
+    mode, _guided, _on = _bot_general_flags(conversation_type)
+    if mode == "off":
+        return None
+    decision = pre_route(question, is_user=bool(sender_staff_id),
+                         user_dept=user_dept, conversation_type=conversation_type)
+    if decision.route == ROUTE_KB:
+        return None
+    if decision.route == ROUTE_SENSITIVE:
+        return {"answer": SENSITIVE_BLOCK_MESSAGE, "model": "N/A",
+                "answer_status": "BLOCKED", "intent_type": "refuse_sensitive",
+                "risk_level": "sensitive", "risk_blocked": True, "source": "guard"}
+    if decision.route == ROUTE_REALTIME:
+        # SUCCESS + intent 标注（非 NO_RESULT/REFUSAL：不污染缺口挖掘口径）
+        return {"answer": REALTIME_BLOCK_MESSAGE, "model": "N/A",
+                "answer_status": "SUCCESS", "intent_type": "refuse_realtime",
+                "risk_level": None, "risk_blocked": False, "source": "guard"}
+    if decision.route == ROUTE_SMALLTALK:
+        text = CANNED_SMALLTALK.get(decision.sub) or CANNED_SMALLTALK["capability"]
+        return {"answer": text, "model": "canned", "answer_status": "SUCCESS",
+                "intent_type": "smalltalk", "risk_level": None, "risk_blocked": False,
+                "source": "smalltalk"}
+    if decision.route == ROUTE_OFFICE:
+        outcome = _bot_execute_general_llm(question, history=None, tier="office",
+                                           sender_staff_id=sender_staff_id)
+        if outcome is not None and outcome["answer_status"] is None:
+            outcome["answer_status"] = "SUCCESS"   # 前置路径无"原状态"可维持
+        return outcome
+    return None
+
+
+def _bot_failure_outcome(question: str, chunks, *, sender_staff_id: str, history,
+                         conversation_type: str):
+    """知识库失败后的统一失败序列（分诊 → 决策 → 执行），语义与 api 侧同源。
+    返回 None = 维持今日行为。不变量 I2 由 build_failure_action 保证。"""
+    mode, guided_on, feature_on = _bot_general_flags(conversation_type)
+    if not feature_on:
+        return None
+    titles = suggest_titles(chunks)
+    category = triage_failed_query(question, titles)
+    act = build_failure_action(category, mode=mode, guided_on=guided_on, titles=titles)
+    if act["action"] == ACTION_PASSTHROUGH:
+        return None
+    if act["action"] == ACTION_SENSITIVE_BLOCK:
+        return {"answer": act["text"], "model": "N/A", "answer_status": "BLOCKED",
+                "intent_type": act["intent_type"], "risk_level": "sensitive",
+                "risk_blocked": True, "source": "guard"}
+    if act["action"] == ACTION_SMALLTALK:
+        return {"answer": CANNED_SMALLTALK["capability"], "model": "canned",
+                "answer_status": "SUCCESS", "intent_type": act["intent_type"],
+                "risk_level": None, "risk_blocked": False, "source": "smalltalk"}
+    if act["action"] == ACTION_GENERAL_LLM:
+        outcome = _bot_execute_general_llm(question, history=history, tier=act["tier"],
+                                           sender_staff_id=sender_staff_id)
+        if outcome is None and guided_on:
+            return {"answer": GENERAL_TIER_OFF_MESSAGE, "model": "N/A",
+                    "answer_status": None, "intent_type": "refuse_uncovered_general",
+                    "risk_level": None, "risk_blocked": False, "source": "guard"}
+        return outcome
+    # ACTION_GUIDED_REFUSAL：answer_status=None —— 空结果维持 NO_RESULT、拒答维持 REFUSAL
+    return {"answer": act["text"], "model": "N/A", "answer_status": None,
+            "intent_type": act["intent_type"], "risk_level": None,
+            "risk_blocked": False, "source": "guard"}
+
+
 def _process_rag_query(
     question: str,
     session_webhook: str,
@@ -746,14 +874,75 @@ def _process_rag_query(
         # 0. 解析用户部门（用于权限过滤）
         user_dept = _resolve_user_dept(sender_staff_id) if sender_staff_id else None
 
+        # 0.5 通用能力前置路由（RAG_GENERAL_ABILITY_MODE，默认 off 恒 None）：
+        #     寒暄/办公祈使/敏感/实时信息在检索之前分流，命中即文本直发（v1 通用路径
+        #     不走流式卡片）。检索未发生 —— 落库 chunks=None。
+        pre = _bot_pre_route(question, sender_staff_id=sender_staff_id,
+                             user_dept=user_dept, conversation_type=conversation_type)
+        if pre is not None:
+            latency_ms = int((time.time() - t0) * 1000)
+            _pre_status = pre["answer_status"] or "SUCCESS"
+            if should_append_history(pre["answer"], _pre_status):
+                append_to_history(session_key, question, history_answer_text(pre["answer"]),
+                                  owner=sender_staff_id or None)
+            log_qa_session(**build_qa_log_kwargs(
+                session_id=session_key,
+                message_id=message_id,
+                question=question,
+                user_id=sender_staff_id,
+                user_name=sender_nick,
+                user_dept=user_dept,
+                answer_text=pre["answer"],
+                chunks=None,
+                latency_ms=latency_ms,
+                answer_status=_pre_status,
+                model_name=pre["model"],
+                conversation_type=conversation_type,
+                intent_type=pre["intent_type"],
+                risk_level=pre["risk_level"],
+                risk_blocked=pre["risk_blocked"],
+            ))
+            _send_text_reply(session_webhook, pre["answer"])
+            return
+
         # 1. 统一检索 + 邻居拼接（top_k=7, stitch window=±1）
         chunks = retrieve_and_enrich(question, user_dept=user_dept)
         t_retrieval = time.time()
         retrieval_latency_ms = int((t_retrieval - t0) * 1000)
 
         if not chunks:
-            # 无结果也要落库
+            # 统一失败序列（检索为空）：分诊 → 通用回答 / 引导式拒答；flag 全关 → None
+            outcome = _bot_failure_outcome(question, [], sender_staff_id=sender_staff_id,
+                                           history=list(history),
+                                           conversation_type=conversation_type)
             latency_ms = int((time.time() - t0) * 1000)
+            if outcome is not None:
+                _status = outcome["answer_status"] or "NO_RESULT"
+                if should_append_history(outcome["answer"], _status):
+                    append_to_history(session_key, question,
+                                      history_answer_text(outcome["answer"]),
+                                      owner=sender_staff_id or None)
+                log_qa_session(**build_qa_log_kwargs(
+                    session_id=session_key,
+                    message_id=message_id,
+                    question=question,
+                    user_id=sender_staff_id,
+                    user_name=sender_nick,
+                    user_dept=user_dept,
+                    answer_text=outcome["answer"],
+                    chunks=[],
+                    latency_ms=latency_ms,
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    answer_status=_status,
+                    model_name=outcome["model"],
+                    conversation_type=conversation_type,
+                    intent_type=outcome["intent_type"],
+                    risk_level=outcome["risk_level"],
+                    risk_blocked=outcome["risk_blocked"],
+                ))
+                _send_text_reply(session_webhook, outcome["answer"])
+                return
+            # 无结果也要落库
             log_qa_session(**build_qa_log_kwargs(
                 session_id=session_key,
                 message_id=message_id,
@@ -775,7 +964,16 @@ def _process_rag_query(
 
         # 2a. 流式 AI 卡片路径（打字机效果）：开关开启且配置了流式模板时启用；
         #     投放失败/未配置时自动降级到下方非流式成品卡片路径（不重复落库）。
-        if get_config().rag.dingtalk_streaming and os.environ.get("DINGTALK_STREAM_CARD_TEMPLATE_ID"):
+        #     低置信带旁路（评审补充 5，钉钉版）：疑似失败路径改走下方同步链路 ——
+        #     拒答一旦流进卡片便无法替换，同步链路可完整走统一失败序列；卡片内部
+        #     管线不动（v1 纪律）。中高置信带照旧流式，主路径零影响。
+        _stream_bypass = (
+            _bot_general_flags(conversation_type)[2]
+            and get_config().rag.general_stream_gate
+            and is_low_confidence_band(chunks)
+        )
+        if (not _stream_bypass) and get_config().rag.dingtalk_streaming \
+                and os.environ.get("DINGTALK_STREAM_CARD_TEMPLATE_ID"):
             if _stream_answer_to_card(
                 question=question,
                 chunks=chunks,
@@ -811,9 +1009,32 @@ def _process_rag_query(
         llm_latency_ms = int((t_llm - t_retrieval) * 1000)
         latency_ms = int((t_llm - t0) * 1000)
 
+        # 2.5 统一失败序列（LLM 拒答）：同步链路回答尚未发出，可完整替换 ——
+        #     分诊 → 通用回答 / 引导式拒答；替换在入史/落库/发卡之前（与用户所见一致）。
+        #     flag 全关 → outcome 恒 None，行为与现状一致。
+        _forced_status = None
+        _log_intent = None
+        _log_risk_level = None
+        _log_risk_blocked = False
+        if is_refusal_answer(result["answer"]):
+            outcome = _bot_failure_outcome(question, chunks,
+                                           sender_staff_id=sender_staff_id,
+                                           history=list(history),
+                                           conversation_type=conversation_type)
+            if outcome is not None:
+                result["answer"] = outcome["answer"]
+                result["model"] = outcome["model"]
+                if outcome["source"] in ("general", "smalltalk"):
+                    result["sources"] = []
+                _forced_status = outcome["answer_status"]
+                _log_intent = outcome["intent_type"]
+                _log_risk_level = outcome["risk_level"]
+                _log_risk_blocked = outcome["risk_blocked"]
+
         # 3. 追加到会话历史（统一策略：仅非空 SUCCESS 回答入史；#F-mm5 入史文本
-        #    经 history_answer_text —— 只包裹实参，下一行 blocks 构建依赖原始标记）
-        if should_append_history(result["answer"], "SUCCESS"):
+        #    经 history_answer_text —— 只包裹实参，下一行 blocks 构建依赖原始标记。
+        #    拒答/引导话术照旧按 "SUCCESS" 入史（原行为）；BLOCKED 不入史）
+        if should_append_history(result["answer"], _forced_status or "SUCCESS"):
             append_to_history(session_key, question, history_answer_text(result["answer"]),
                               owner=sender_staff_id or None)
 
@@ -823,7 +1044,9 @@ def _process_rag_query(
         content_blocks_json_str = content_blocks_to_json(content_blocks)
 
         # 5. 落库（包含 content_blocks_json 供回调重建）。拒答型标 REFUSAL
-        #    （入史在步骤 3、用原状态判定 —— 历史策略不变）
+        #    （入史在步骤 3、用原状态判定 —— 历史策略不变）。失败序列替换后按最终
+        #    文本判形态：引导话术仍命中拒答句式 → REFUSAL（口径不漂移）；通用回答
+        #    → SUCCESS；敏感拦截 _forced_status=BLOCKED 最后覆盖。
         log_qa_session(**build_qa_log_kwargs(
             session_id=session_key,
             message_id=message_id,
@@ -837,12 +1060,16 @@ def _process_rag_query(
             latency_ms=latency_ms,
             retrieval_latency_ms=retrieval_latency_ms,
             llm_latency_ms=llm_latency_ms,
-            answer_status="REFUSAL" if is_refusal_answer(result["answer"]) else "SUCCESS",
+            answer_status=_forced_status or (
+                "REFUSAL" if is_refusal_answer(result["answer"]) else "SUCCESS"),
             model_name=result.get("model"),
             conversation_type=conversation_type,
             content_blocks_json=content_blocks_json_str,
             # P2-20/21/22：LLM 成功路径透传生成元数据（mock 不带该键 → None，不炸）
             gen_meta=result.get("gen_meta"),
+            intent_type=_log_intent,
+            risk_level=_log_risk_level,
+            risk_blocked=_log_risk_blocked,
         ))
 
         # 6. 发送互动卡片（失败降级为 Markdown）
