@@ -2282,6 +2282,8 @@ kb_admin_grant_revoke = _routes_kb_access.kb_admin_grant_revoke
 # —— routes/contribution.py ——
 _CONTRIB_COLS = _routes_contribution._CONTRIB_COLS
 _CONTRIB_WINDOW_DAYS = _routes_contribution._CONTRIB_WINDOW_DAYS
+_GAP_WINDOW_DAYS = _routes_contribution._GAP_WINDOW_DAYS
+_GAP_CANDIDATE_CAP = _routes_contribution._GAP_CANDIDATE_CAP
 _CONTRIB_CANDIDATE_CAP = _routes_contribution._CONTRIB_CANDIDATE_CAP
 KbGapItem = _routes_contribution.KbGapItem
 KbGapsSummary = _routes_contribution.KbGapsSummary

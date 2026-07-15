@@ -213,3 +213,40 @@ test.describe('统计卡口径与窗口标注（批次ε-3 R3）', () => {
     guard.assertClean();
   });
 });
+
+test.describe('待回答 — 高频排行 Top 30（批次ε-4）', () => {
+  const GAPS = (n: number) => Array.from({ length: n }, (_, i) => ({
+    question: `高频问题第${i + 1}号是什么？`, asks: 100 - i, last_days: i + 1, dept: 'finance',
+    kind: 'no_result', question_hash: `h${i + 1}`, source_message_id: `m${i + 1}`, has_pending_contribution: false,
+  }));
+
+  test('截断态：30 行+名次 1..30、卡头徽标=87、尾注两口径、无「加载更多」、卡头「近一年」', async ({ page }) => {
+    const guard = attachConsoleGuard(page);
+    await mockMine(page, { mine: [] });
+    await page.route('**/api/kb/gaps*', (r) => r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ items: GAPS(30), summary: { unanswered: 87, answered: 0, this_month: 0, contributors: 0 }, has_more: true, window_days: 365 }),
+    }));
+    await page.goto(ROUTE);
+    await expect(page.getByTestId('gap-rank')).toHaveCount(30);
+    await expect(page.getByTestId('gap-rank').first()).toHaveText('1');
+    await expect(page.getByTestId('gap-rank').nth(29)).toHaveText('30');
+    await expect(page.getByTestId('gap-total-badge')).toHaveText('87');
+    await expect(page.getByTestId('gap-top-note')).toHaveText('仅显示询问最多的前 30 条 · 共 87 条待回答');
+    await expect(page.getByRole('button', { name: '加载更多' })).toHaveCount(0);
+    await expect(page.getByTestId('gap-window-note')).toContainText('近一年');
+    guard.assertClean();
+  });
+
+  test('未截断（12/12）：尾注自隐、徽标=12（不误导「还有更多被截掉」）', async ({ page }) => {
+    await mockMine(page, { mine: [] });
+    await page.route('**/api/kb/gaps*', (r) => r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ items: GAPS(12), summary: { unanswered: 12, answered: 0, this_month: 0, contributors: 0 }, has_more: false, window_days: 365 }),
+    }));
+    await page.goto(ROUTE);
+    await expect(page.getByTestId('gap-rank')).toHaveCount(12);
+    await expect(page.getByTestId('gap-total-badge')).toHaveText('12');
+    await expect(page.getByTestId('gap-top-note')).toHaveCount(0);
+  });
+});

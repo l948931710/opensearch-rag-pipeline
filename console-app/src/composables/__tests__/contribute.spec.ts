@@ -325,3 +325,45 @@ describe('GapList — 窗口标注（ε-3 R3）', () => {
     expect(gapsWindowDays.value).toBe(30)
   })
 })
+
+// 批次ε-4：「待回答」→ 高频无人回答排行 Top 30（365 天窗）
+describe('GapList — Top 30 排行（ε-4）', () => {
+  const GAP = (i: number) => ({
+    question: `高频问题第${i}号是什么？`, asks: 100 - i, last_days: i, dept: 'it', kind: 'no_result',
+    question_hash: `h${i}`, source_message_id: `m${i}`, has_pending_contribution: false,
+  })
+  function seed(n: number, unanswered: number) {
+    withSession()
+    const c = useContribute()
+    c.gaps.value = Array.from({ length: n }, (_, i) => GAP(i + 1)) as never
+    c.gapsSummary.value = { unanswered, answered: 0, this_month: 0, contributors: 0 } as never
+    return mount(GapList)
+  }
+
+  it('fmtWindowDays：365→「近一年」；其余沿用「近 N 天」全站惯例', async () => {
+    const { fmtWindowDays } = await import('@/lib/kb')
+    expect(fmtWindowDays(365)).toBe('近一年')
+    expect(fmtWindowDays(30)).toBe('近 30 天')
+    expect(fmtWindowDays(400)).toBe('近一年')
+  })
+
+  it('截断态：卡头徽标=全集数（非当页数）、名次 1..N 递增、尾注披露两口径、永无「加载更多」', () => {
+    const w = seed(30, 87)
+    expect(w.find('[data-testid="gap-total-badge"]').text()).toBe('87')   // 与统计卡同口径
+    const ranks = w.findAll('[data-testid="gap-rank"]').map((r) => r.text())
+    expect(ranks.length).toBe(30)
+    expect(ranks[0]).toBe('1'); expect(ranks[29]).toBe('30')
+    expect(w.find('[data-testid="gap-top-note"]').text()).toBe('仅显示询问最多的前 30 条 · 共 87 条待回答')
+    expect(w.text()).not.toContain('加载更多')
+  })
+
+  it('未截断（全集 ≤30）：尾注自隐不误导、徽标=真实条数；窗口 365 → 卡头显「近一年」', () => {
+    withSession()
+    useContribute().gapsWindowDays.value = 365
+    const w = seed(12, 12)
+    expect(w.find('[data-testid="gap-top-note"]').exists()).toBe(false)
+    expect(w.find('[data-testid="gap-total-badge"]').text()).toBe('12')
+    expect(w.find('[data-testid="gap-window-note"]').text()).toContain('近一年')
+    expect(w.find('[data-testid="gap-window-note"]').text()).toContain('按询问次数排序')
+  })
+})

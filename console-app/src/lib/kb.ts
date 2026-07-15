@@ -88,6 +88,10 @@ export const CONTRIB_STATE: Record<string, { label: string; tone: string }> = {
 export const contribStateLabel = (s: string) => CONTRIB_STATE[s]?.label || s
 export const contribStateTone = (s: string) => CONTRIB_STATE[s]?.tone || 'muted'
 
+// 窗口天数 → 展示文案（批次ε-4）：整年折自然单位「近一年」，其余沿用全站「近 N 天」惯例。
+// 收敛成纯函数——别在模板里内联三元（何时特殊化的判断要可单测、不散落成魔法数字）。
+export const fmtWindowDays = (days: number) => (days >= 365 ? '近一年' : `近 ${days} 天`)
+
 // 缺口来源 → 中文短标。no_result=检索没召回（缺文档）；refusal=召回了但没答好（深度/口径差）。
 export const GAP_KIND_LABEL: Record<string, string> = {
   no_result: '没有相关文档', refusal: '答案不够好',

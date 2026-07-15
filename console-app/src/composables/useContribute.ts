@@ -64,7 +64,6 @@ export const CONTRIB_DEPT_OPTS = Object.keys(GROUP_LABEL).map((id) => ({ id, nam
 // ── 状态 ──
 const gaps = ref<GapItem[]>([])
 const gapsSummary = ref<GapsSummary | null>(null)
-const gapsHasMore = ref(false)
 // 缺口滚动窗天数（批次ε-3 R3，后端下发防漂移；老后端缺字段回落 30）——
 // 「待回答」不是完整积压：超窗的老缺口静默消失，卡头/空态必须标注窗口
 const gapsWindowDays = ref(30)
@@ -135,24 +134,25 @@ function _previewHeroes(): HeroItem[] {
 }
 
 // ── 加载 ──
-async function loadGaps(offset = 0) {
+// 批次ε-4：Top 30 排行单页化——后端本就按 asks desc 排序，只取前 30、不再翻页；
+// 全集规模由 summary.unanswered 承载（统计卡+卡头徽标+截断尾注），杜绝静默截断。
+async function loadGaps() {
   syncIdentityScope()
   const fp = identityFingerprint()
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') {
-    const r = _previewGaps(); gaps.value = r.items; gapsSummary.value = r.summary; gapsHasMore.value = false; return
+    const r = _previewGaps(); gaps.value = r.items; gapsSummary.value = r.summary; return
   }
   loadingGaps.value = true; clearLoadError('gaps')
   try {
-    const r = await apiJson<GapsResp>(`/api/kb/gaps?limit=20&offset=${offset}`, { auth: true })
+    const r = await apiJson<GapsResp>('/api/kb/gaps?limit=30', { auth: true })
     if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的缺口数据整体丢弃
-    gaps.value = offset ? [...gaps.value, ...(r.items || [])] : (r.items || [])
+    gaps.value = r.items || []
     gapsSummary.value = r.summary || null
-    gapsHasMore.value = !!r.has_more
-    gapsWindowDays.value = r.window_days || 30
+    gapsWindowDays.value = r.window_days || 30   // 老后端缺字段=其窗口就是 30 天，回落值如实
   } catch (e) {
     if (fp !== identityFingerprint()) return
-    if (!offset) { gaps.value = []; gapsSummary.value = null } ; noteLoadError('gaps', e)
+    gaps.value = []; gapsSummary.value = null; noteLoadError('gaps', e)
   }
   // finally 不设指纹门：身份切换路径上 reset 已把 loadingGaps 置 false，这里再置一次无冲突
   finally { loadingGaps.value = false }
@@ -184,7 +184,7 @@ async function loadPending(offset = 0) {
   try {
     const r = await apiJson<ContribListResp>(`/api/kb/contributions/pending?limit=50&offset=${offset}`, { auth: true })
     if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的待审贡献整体丢弃
-    // 批次ε-1：offset>0=「加载更多」追加；0=回首页替换（与 loadGaps 同语义）
+    // 批次ε-1：offset>0=「加载更多」追加；0=回首页替换（审核队列专属分页——gaps 已 ε-4 单页化）
     pendingContribs.value = offset ? [...pendingContribs.value, ...(r.items || [])] : (r.items || [])
     pendingHasMore.value = !!r.has_more
   } catch (e) {
@@ -293,7 +293,7 @@ export function useContribute() {
   // 待你审核的贡献数（红点/角标单一来源）。
   const reviewCount = computed(() => pendingContribs.value.length)
   return {
-    gaps, gapsSummary, gapsHasMore, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
+    gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
     modalOpen, formQuestion, formContent, formDept, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, loadMine, loadPending, loadHeroes,
@@ -303,7 +303,7 @@ export function useContribute() {
 
 /** 重置 store（运行期身份切换与测试复位共用；含半填的贡献表单——不跨身份残留）。 */
 function _resetContributeState() {
-  gaps.value = []; gapsSummary.value = null; gapsHasMore.value = false; gapsWindowDays.value = 30
+  gaps.value = []; gapsSummary.value = null; gapsWindowDays.value = 30
   myContribs.value = []; pendingContribs.value = []; pendingHasMore.value = false; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''

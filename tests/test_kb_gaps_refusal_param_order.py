@@ -96,8 +96,9 @@ def test_kb_gaps_refusal_execute_binds_params_in_sql_order(monkeypatch):
     groups = ("marketing", "finance")
     depts = kb_authz.sanitize_owner_depts(list(groups))
     assert len(depts) == 2, f"前置：sanitize 后应为 2 个部门，实得 {depts}"
-    win = ctr._CONTRIB_WINDOW_DAYS       # 30（整型时间窗）
-    cap = ctr._CONTRIB_CANDIDATE_CAP     # 400
+    # ε-4 解耦：kb_gaps 走缺口专属常量（365/2000）；_CONTRIB_* 归 asks（30/400），勿在此读
+    win = ctr._GAP_WINDOW_DAYS           # 365（整型时间窗）
+    cap = ctr._GAP_CANDIDATE_CAP         # 2000
 
     # REFUSAL 至少一行，确保聚合路径正常（值本身不参与本断言）
     refusal_rows = [("如何申请密钥", "m1", 3, depts[0])]
@@ -150,3 +151,27 @@ def test_kb_gaps_refusal_execute_binds_params_in_sql_order(monkeypatch):
     # 收口：整段实参顺序恒等于 (*depts, win, cap)
     assert tuple(params) == tuple(depts) + (win, cap), (
         f"REFUSAL params 顺序错位：期望 {tuple(depts) + (win, cap)!r}，实得 {tuple(params)!r}")
+
+
+def test_kb_gaps_no_result_binds_gap_window_and_cap(monkeypatch):
+    """ε-4 补锚：NO_RESULT execute 的 (win, cap) 此前无专门测试锁定——断言绑定缺口专属
+    常量 (365, 2000)，且绝不是 asks 的 (30, 400)（常量解耦的另一半防线）。"""
+    _skip_if_not_sim()
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import contribution as ctr
+
+    conn = _CaptureConn(refusal_rows=[])
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    ctr._gaps_cache.clear()
+    with ctr._reconcile_lock:
+        ctr._reconcile_state["ts"] = 0.0
+
+    api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(("marketing",)))
+
+    nr_calls = [(s, p) for (s, p) in conn.calls if "answer_status='NO_RESULT'" in s]
+    assert len(nr_calls) == 1
+    _sql, params = nr_calls[0]
+    params = list(params)
+    assert params[0] == ctr._GAP_WINDOW_DAYS == 365
+    assert params[-1] == ctr._GAP_CANDIDATE_CAP == 2000
+    assert (params[0], params[-1]) != (ctr._CONTRIB_WINDOW_DAYS, ctr._CONTRIB_CANDIDATE_CAP)

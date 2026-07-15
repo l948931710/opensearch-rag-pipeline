@@ -1003,7 +1003,8 @@ def _pending_row(cid):
 def test_pending_asks_two_sources_merged_dedup(monkeypatch):
     """asks=近 30 天 NO_RESULT+REFUSAL 两源按 COALESCE(gap_query_hash, question_hash) 归并的
     去重 message 数；同 message 重复出现只计一次；无匹配=真 0；SQL 面锁 COALESCE（gap 优先，
-    审核人修订 question 后 hash 变了仍指向原始提问）与 30 天/400 cap 参数（同 kb_gaps 纪律）。"""
+    审核人修订 question 后 hash 变了仍指向原始提问）与 30 天/400 cap 参数（asks 专属口径——
+    ε-4 起与 kb_gaps 的 365 天缺口窗解耦）。"""
     _skip_if_not_sim()
     _dept_admin(monkeypatch, managed="marketing")
     from opensearch_pipeline import contribution as C
@@ -1055,7 +1056,7 @@ def test_gaps_summary_funnel_and_window_days(monkeypatch):
     conn = _install_conn(monkeypatch, _FakeConn(funnel_row=(8, 2, 1584.0)))
     from opensearch_pipeline import api
     resp = api.kb_gaps(request=None, identity=_ident())
-    assert resp.window_days == 30
+    assert resp.window_days == 365
     assert resp.summary.review_accept_rate_30d == 0.8
     assert resp.summary.review_avg_hours_30d == 26.4
     sql = next(s for s, _ in conn.calls if "TIMESTAMPDIFF" in s)
@@ -1081,7 +1082,7 @@ def test_gaps_summary_funnel_failure_not_counted_to_500(monkeypatch):
     from opensearch_pipeline import api
     resp = api.kb_gaps(request=None, identity=_ident())
     assert resp.summary.review_accept_rate_30d is None and resp.summary.review_avg_hours_30d is None
-    assert resp.window_days == 30
+    assert resp.window_days == 365
 
 
 def test_gaps_funnel_admin_only_and_never_cached(monkeypatch):
@@ -1106,3 +1107,41 @@ def test_gaps_funnel_admin_only_and_never_cached(monkeypatch):
     _employee(monkeypatch)
     r3 = api.kb_gaps(request=None, identity=_ident())
     assert r3.summary.review_accept_rate_30d is None and r3.summary.review_avg_hours_30d is None
+
+
+# ── 批次ε-4：缺口窗 365 天与 asks 30 天口径解耦 + Top 30 排行（后端半）─────────────
+def test_gap_window_constants_decoupled():
+    """常量解耦锚点：缺口窗=365/2000、asks=30/400。若有人图省事原地改 _CONTRIB_*，
+    test_pending_asks_two_sources_merged_dedup 的 (30,400) 断言会红——那是真实功能回归
+    （asks 近期热度被拉成 365 天），不是测试该改。"""
+    from opensearch_pipeline.routes import contribution as ctr
+    assert (ctr._GAP_WINDOW_DAYS, ctr._GAP_CANDIDATE_CAP) == (365, 2000)
+    assert (ctr._CONTRIB_WINDOW_DAYS, ctr._CONTRIB_CANDIDATE_CAP) == (30, 400)
+
+
+def test_gaps_window_days_correct_on_cache_hit(monkeypatch):
+    """缓存命中路径 window_days 仍=365（响应字段取自常量默认值而非缓存对象——审计点名的
+    「查询改了、响应还报旧窗」失真面在缓存两路都要锁死）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_KB_GAPS_CACHE_TTL", "60")
+    _employee(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn())
+    from opensearch_pipeline import api
+    r1 = api.kb_gaps(request=None, identity=_ident())
+    r2 = api.kb_gaps(request=None, identity=_ident())   # 第二次=命中缓存
+    assert r1.window_days == r2.window_days == 365
+
+
+def test_gaps_coverage_in_placeholders_match_params(monkeypatch):
+    """覆盖子查询（question_hash IN）拼装自洽：占位符数=实参数=去重 hash 数
+    （窗口放大后 IN 上界从 ≤800 涨到 ≤4000，拼装错位会静默失真）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    rows = [(f"问题变体{i}号怎么办", f"m{i}", 1, "marketing") for i in range(60)]
+    conn = _install_conn(monkeypatch, _FakeConn(no_result_rows=rows))
+    from opensearch_pipeline import api
+    api.kb_gaps(request=None, identity=_ident())
+    cov = [(s, p) for s, p in conn.calls if "kb_contribution WHERE question_hash IN" in s]
+    assert len(cov) == 1
+    sql, params = cov[0]
+    assert sql.count("%s") == len(params) == 60
