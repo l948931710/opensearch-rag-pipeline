@@ -82,6 +82,12 @@ class _FakeCur:
             if c.boom_badges:
                 raise Exception("simulated badge derivation failure")
             return c.dv_badge_rows
+        if "COALESCE(gap_query_hash, question_hash)" in s:   # ε-3 R2 asks：hash 映射
+            if c.boom_asks:
+                raise Exception("simulated asks hash lookup failure")
+            return c.hash_rows
+        if "answer_status='REFUSAL'" in s and "hit_mine" not in s:   # ε-3 R2 asks：REFUSAL 平查
+            return c.refusal_plain_rows
         if "GROUP BY author_id" in s:
             return c.hero_rows
         if "kb_contribution" in s and "ORDER BY" in s:
@@ -105,6 +111,9 @@ class _FakeConn:
         self.boom_hits = kw.get("boom_hits", False)
         self.dv_badge_rows = kw.get("dv_badge_rows", [])
         self.boom_badges = kw.get("boom_badges", False)
+        self.hash_rows = kw.get("hash_rows", [])
+        self.refusal_plain_rows = kw.get("refusal_plain_rows", [])
+        self.boom_asks = kw.get("boom_asks", False)
         self.list_rows = kw.get("list_rows", [])
         self.summary = kw.get("summary", {})
         self.calls = []
@@ -977,3 +986,55 @@ def test_mine_doc_badge_only_queried_for_registering(monkeypatch):
     resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
     assert all(i.doc_badge is None for i in resp.items)
     assert not any("document_version dv" in s and "document_meta dm" in s for s, _ in conn.calls)
+
+
+# ── 批次ε-3 R2：审核队列被问次数（asks 口径归并——不再依赖 gaps 的 acl 口径）─────────────
+def _pending_row(cid):
+    return (cid, f"q-{cid}", "a", "marketing", "u9", "王伟", "pending", "none",
+            None, None, None, None, None, None, None)
+
+
+def test_pending_asks_two_sources_merged_dedup(monkeypatch):
+    """asks=近 30 天 NO_RESULT+REFUSAL 两源按 COALESCE(gap_query_hash, question_hash) 归并的
+    去重 message 数；同 message 重复出现只计一次；无匹配=真 0；SQL 面锁 COALESCE（gap 优先，
+    审核人修订 question 后 hash 变了仍指向原始提问）与 30 天/400 cap 参数（同 kb_gaps 纪律）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    from opensearch_pipeline import contribution as C
+    h_gap = C.question_hash("生产环境密钥在哪申请")
+    conn = _install_conn(monkeypatch, _FakeConn(
+        list_rows=[_pending_row("C_A"), _pending_row("C_B")],
+        hash_rows=[("C_A", h_gap), ("C_B", C.question_hash("完全没人问过的问题"))],
+        no_result_rows=[("生产环境密钥在哪申请", "m1"), ("生产环境密钥在哪申请？", "m2"),
+                        ("生产环境密钥在哪申请", "m2")],       # m2 重复 → 去重
+        refusal_plain_rows=[("生产环境密钥在哪申请！", "m3"), ("别的问题", "m9")]))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_pending(request=None, identity=_ident())
+    assert [(i.contribution_id, i.asks) for i in resp.items] == [("C_A", 3), ("C_B", 0)]
+    sql = next(s for s, _ in conn.calls if "COALESCE(gap_query_hash, question_hash)" in s)
+    assert "kb_contribution" in sql
+    qa_calls = [(s, p) for s, p in conn.calls if "qa_session_log" in s and "INTERVAL" in s]
+    assert len(qa_calls) == 2                                   # NO_RESULT + REFUSAL 两源
+    assert all(p == (30, 400) for _, p in qa_calls)             # 同窗同 cap
+    assert all("hit_mine" not in s for s, _ in qa_calls)        # REFUSAL 平查，不拖 dept JOIN
+
+
+def test_pending_asks_failure_honest_none_queue_intact(monkeypatch):
+    """asks 聚合炸 → 全部 None、审核队列照常返回（热度信号绝不拖垮队列）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _install_conn(monkeypatch, _FakeConn(list_rows=[_pending_row("C_A")], boom_asks=True))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_pending(request=None, identity=_ident())
+    assert len(resp.items) == 1 and resp.items[0].asks is None
+
+
+def test_mine_has_no_asks_aggregation(monkeypatch):
+    """asks 只属于审核队列：mine 端点不触发 hash/qa 聚合（作者侧无此信号，零成本）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(list_rows=[_pending_row("C_A")]))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert resp.items[0].asks is None
+    assert not any("COALESCE(gap_query_hash" in s for s, _ in conn.calls)

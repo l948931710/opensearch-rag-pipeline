@@ -39,6 +39,8 @@ export interface ContributionItem {
   // 管线徽章（批次ε-3 R1，registering 行）：台账 _kb_status_badge 词表——
   // 待审核=卡 kb_admin 放行；已隔离/未入索引=死链；缺省/None → 回落默认「已采纳·待入库」
   doc_badge?: string | null
+  // 被问次数（批次ε-3 R2，仅审核队列）：近 30 天同问题的未答好提问数；null=算不出自隐，0=真零
+  asks?: number | null
 }
 // 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
 // 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。
@@ -110,7 +112,7 @@ function _previewMine(): ContributionItem[] {
 }
 function _previewPending(): ContributionItem[] {
   return [
-    { contribution_id: 'p1', question: '如何申请生产环境的访问密钥？', content: '提交工单到 IT，附部门负责人审批…', category_dept: 'it', author_id: 'u9', author_name: '王伟', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-06-27', reviewed_at: null, source_message_id: 'm1', gap_query: '生产环境访问密钥在哪申请' },
+    { contribution_id: 'p1', question: '如何申请生产环境的访问密钥？', content: '提交工单到 IT，附部门负责人审批…', category_dept: 'it', author_id: 'u9', author_name: '王伟', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-06-27', reviewed_at: null, source_message_id: 'm1', gap_query: '生产环境访问密钥在哪申请', asks: 5 },
     { contribution_id: 'p2', question: '2oz PP 杯的模具保养周期是多久？', content: '标准周期为每生产 30 万模次做一级保养（清洁流道、检查顶针），100 万模次做二级保养（拆模检查型腔磨损、更换密封件）。\n夏季高温连续生产时一级保养提前到 25 万模次。\n保养记录填在《模具保养台账》并由当班班长签字确认，台账每月底交设备科归档。', category_dept: 'production', author_id: 'u12', author_name: '陈强', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-06-28', reviewed_at: null },
   ]
 }

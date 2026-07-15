@@ -132,6 +132,14 @@ async function onReject(c: ContributionItem) {
               class="rounded bg-accent-soft px-1.5 py-px text-[10.5px] font-medium text-accent-text"
               :title="c.gap_query || undefined"
             >来自缺口</span>
+            <!-- 批次ε-3 R2：被问次数（与「来自缺口」独立——自发投稿的高频问题缺口徽标会漏报，
+                 asks 恰好补盲）。>0 强调色；0 弱化照显（真零≠未知）；null=算不出自隐 -->
+            <span
+              v-if="c.asks != null" data-testid="contrib-asks"
+              class="rounded px-1.5 py-px text-[10.5px] font-medium tabular-nums"
+              :class="c.asks > 0 ? 'bg-accent-soft text-accent-text' : 'bg-panel text-faint'"
+              title="近 30 天内检索未命中/未答好的提问里，与此问题相同的去重条数"
+            >近 30 天被问 {{ c.asks }} 次</span>
             <div class="flex-1" />
             <select
               :value="scopeOf(c.contribution_id)" :aria-label="`可见范围：${c.question}`"

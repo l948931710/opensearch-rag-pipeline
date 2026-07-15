@@ -205,3 +205,23 @@ describe('B4 待审队列 has_more', () => {
     expect(w.find('[data-testid="contrib-load-more"]').exists()).toBe(false)
   })
 })
+
+// 批次ε-3 R2：被问次数 chip（asks 口径归并——审核队列自己带热度，不再依赖 gaps 的 acl 口径）
+describe('审核队列 — 被问次数 chip（ε-3 R2）', () => {
+  it('asks>0 强调色；asks=0 弱化照显（真零≠未知）；null/缺字段自隐；与「来自缺口」独立共存', async () => {
+    const w = await mountQueue([
+      { ...PENDING, contribution_id: 'a1', content: '短', asks: 5, gap_query: '原问', source_message_id: 'm1' },
+      { ...PENDING, contribution_id: 'a2', content: '短', asks: 0 },
+      { ...PENDING, contribution_id: 'a3', content: '短', asks: null },
+      { ...PENDING, contribution_id: 'a4', content: '短' },
+    ])
+    const chips = w.findAll('[data-testid="contrib-asks"]')
+    expect(chips.length).toBe(2)
+    expect(chips[0].text()).toBe('近 30 天被问 5 次')
+    expect(chips[0].classes()).toContain('text-accent-text')
+    expect(chips[1].text()).toBe('近 30 天被问 0 次')
+    expect(chips[1].classes()).toContain('text-faint')
+    // 与缺口徽标独立：a1 两者共存；a2 无缺口徽标但有 asks（自发投稿高频问题的补盲）
+    expect(w.findAll('[data-testid="contrib-from-gap"]').length).toBe(1)
+  })
+})
