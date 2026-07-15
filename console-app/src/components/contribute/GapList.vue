@@ -3,12 +3,19 @@ import { computed } from 'vue'
 import { HelpCircle, Clock } from 'lucide-vue-next'
 import { deptLabel, fmtWindowDays, gapKindLabel } from '@/lib/kb'
 import { useContribute, type GapItem } from '@/composables/useContribute'
+import { useDialog } from '@/composables/useDialog'
 import LoadError from '@/components/manage/LoadError.vue'
 
 // 「待回答」= 高频无人回答排行 Top 30（批次ε-4）：后端按询问次数降序，前端只取前 30、
 // 不翻页；全集规模在卡头徽标（=summary.unanswered，与统计卡同口径）与截断尾注如实披露。
 // 「回答」打开贡献弹窗并预填该问题；已有贡献待入库的标灰提示、不重复发起。
-const { gaps, gapsSummary, loadingGaps, loadErrors, gapsWindowDays, loadGaps, openModal } = useContribute()
+// 「忽略」（2026-07-15 拍板交 dept_admin）：仅 canManage 渲染（员工 DOM 零变化，抄
+// MyContributions 重试钮范式）；成功后行内原地翻转「已忽略·撤销」——不重拉列表（误点
+// 有当场回路；撤销窗口=至下次 loadGaps，刷新后被读侧排除属预期）。非破坏性可撤销软删
+// → 弹窗不用 danger 红色态（区别于撤销授权类终态动作），原因可空、记录台账。
+const { gaps, gapsSummary, loadingGaps, loadErrors, gapsWindowDays, loadGaps, openModal,
+        canManage, isBusy, dismissGap, restoreGap } = useContribute()
+const { promptText } = useDialog()
 
 // 缺口种类是最需要一眼分开的信息：缺文档（红）要新建内容，没答好（琥珀）改进已有内容即可。
 const KIND_PILL: Record<string, string> = {
@@ -21,6 +28,16 @@ const truncated = computed(() => totalUnanswered.value > gaps.value.length)
 
 function onAnswer(g: GapItem) {
   openModal({ question: g.question, dept: g.dept, sourceMessageId: g.source_message_id, gapQuery: g.question })
+}
+
+async function onDismiss(g: GapItem) {
+  const reason = await promptText({
+    title: '忽略此缺口',
+    message: '将从「待回答」移除（可撤销，操作记录台账）。若只是暂时无人认领，请保留。',
+    placeholder: '忽略原因（可空，记录于台账）', confirmText: '忽略',
+  })
+  if (reason === null) return   // 取消
+  await dismissGap(g, reason.trim())
 }
 </script>
 
@@ -54,15 +71,34 @@ function onAnswer(g: GapItem) {
             <span v-if="gapKindLabel(g.kind)" class="rounded px-1.5 py-px text-[10.5px] font-medium" :class="KIND_PILL[g.kind] || 'bg-panel text-muted-foreground'">{{ gapKindLabel(g.kind) }}</span>
           </div>
         </div>
-        <span
-          v-if="g.has_pending_contribution"
-          class="shrink-0 rounded-lg bg-st-busy/10 px-3 py-[7px] text-[12px] font-medium text-st-busy"
-        >已有贡献·待入库</span>
-        <button
-          v-else type="button"
-          class="shrink-0 rounded-lg border border-border bg-transparent px-3.5 py-[7px] text-[12.5px] font-semibold text-accent-text transition hover:border-accent-strong hover:bg-accent-soft"
-          @click="onAnswer(g)"
-        >回答</button>
+        <!-- 已忽略态（仅本会话内出现）：末尾动作位整体切换——沿用本文件既有互斥切换惯例 -->
+        <template v-if="g.dismissed">
+          <span class="shrink-0 text-[12px] text-faint" data-testid="gap-dismissed-hint">已忽略</span>
+          <button
+            type="button" data-testid="gap-restore" :disabled="isBusy(`gap:${g.question_hash}`)"
+            class="shrink-0 rounded-lg border border-border bg-transparent px-3 py-[7px] text-[12px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+            @click="restoreGap(g)"
+          >撤销</button>
+        </template>
+        <template v-else>
+          <span
+            v-if="g.has_pending_contribution"
+            class="shrink-0 rounded-lg bg-st-busy/10 px-3 py-[7px] text-[12px] font-medium text-st-busy"
+          >已有贡献·待入库</span>
+          <button
+            v-else type="button"
+            class="shrink-0 rounded-lg border border-border bg-transparent px-3.5 py-[7px] text-[12.5px] font-semibold text-accent-text transition hover:border-accent-strong hover:bg-accent-soft"
+            @click="onAnswer(g)"
+          >回答</button>
+          <!-- 仅 canManage 渲染（员工不渲染任何占位节点——「员工视觉零变化」硬门断言基准） -->
+          <button
+            v-if="canManage" type="button" data-testid="gap-dismiss"
+            :disabled="isBusy(`gap:${g.question_hash}`)"
+            title="从待回答移除（可撤销，记录台账）"
+            class="shrink-0 rounded-lg px-2.5 py-[7px] text-[12px] font-medium text-faint transition hover:bg-panel hover:text-muted-foreground disabled:opacity-50"
+            @click="onDismiss(g)"
+          >忽略</button>
+        </template>
       </div>
     </div>
 
