@@ -176,7 +176,10 @@ jobs:
       # 勿回退 continue-on-error（会重新静默积债）。
       - name: Dependency CVE audit (pip-audit — BLOCKING; baseline clean 2026-07-04)
         run: |
-          python -m pip install --upgrade pip pip-audit
+          # setuptools 显式升级：PYSEC-2026-3447（79.x sdist MANIFEST 排除可被 NFD 文件名
+          # 绕过，修复版 83.0.0）——runner 预装 79.0.1 会被 fresh-resolve 审计抓红；
+          # 本项目 lock 未钉 setuptools，升级仅影响审计环境本身
+          python -m pip install --upgrade pip pip-audit "setuptools>=83"
           pip install -e ".[production,api,ocr]"
           python -m pip_audit --desc
       # 供应链补链（2026-07-11 重审计 §6）：lock 审计 + SBOM + trivy。
