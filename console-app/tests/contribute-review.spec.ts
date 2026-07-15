@@ -185,3 +185,23 @@ test.describe('贡献审核 — δ-3 回归', () => {
     await expect(page.getByTestId('contrib-orphan-hint')).toBeVisible();
   });
 });
+
+test.describe('贡献审核 — 被问次数（批次ε-3 R2）', () => {
+  test('asks 三态：>0 显、0 弱化显、缺失自隐；与「来自缺口」独立共存', async ({ page }) => {
+    await mockContribute(page, {
+      pending: [
+        ITEM({ contribution_id: 'k1', question: '密钥申请流程？', content: '短', asks: 5, gap_query: '密钥在哪申请', source_message_id: 'm1' }),
+        ITEM({ contribution_id: 'k2', question: '自发投稿高频问题？', content: '短', asks: 3 }),
+        ITEM({ contribution_id: 'k3', question: '没人问过的问题？', content: '短', asks: 0 }),
+        ITEM({ contribution_id: 'k4', question: '老后端行？', content: '短' }),
+      ],
+    });
+    await page.goto(ROUTE);
+    const chips = page.getByTestId('contrib-asks');
+    await expect(chips).toHaveCount(3);
+    await expect(chips.nth(0)).toHaveText('近 30 天被问 5 次');
+    await expect(chips.nth(1)).toHaveText('近 30 天被问 3 次');   // 无缺口徽标行也有热度（补盲）
+    await expect(chips.nth(2)).toHaveText('近 30 天被问 0 次');
+    await expect(page.getByTestId('contrib-from-gap')).toHaveCount(1);
+  });
+});

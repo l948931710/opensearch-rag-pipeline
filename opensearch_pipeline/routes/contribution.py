@@ -152,6 +152,10 @@ class KbContributionItem(BaseModel):
     # 作者据此分辨「等人放行」「死局需重投」「正常排队」——此前三者同显「已采纳·待入库」。
     # None=算不出/无对应版本行（P2-16 时序竞态），前端回落默认徽标。纯读侧派生，不动状态机。
     doc_badge: Optional[str] = None
+    # 被问次数（批次ε-3 R2，仅 pending 队列回填）：近 30 天 NO_RESULT+REFUSAL 提问里与本贡献
+    # 同 hash（COALESCE(gap_query_hash, question_hash)）的去重 message 数——审核人据此判优先级。
+    # 有意不按部门过滤（真实提问热度；纯计数不回传原文，无泄露面）。None=算不出，0=真零。
+    asks: Optional[int] = None
 
 
 class KbContributionListResponse(BaseModel):
@@ -606,6 +610,49 @@ def _contrib_pending_scope_sql(kb) -> tuple:
     return _kb_owner_scope_sql(kb, "category_dept")
 
 
+def _pending_asks(cur, cids) -> Optional[dict]:
+    """contribution_id → 近 30 天被问次数（批次ε-3 R2「asks 口径归并」）。
+
+    此前 asks 只存在于 /api/kb/gaps 的实时聚合，且按【提问者 acl_groups】限定可见范围——与
+    审核队列的【managed_owner_depts】不是同一口径（ε-1 审计裁定弱关联路线有口径分裂）。这里
+    按 COALESCE(gap_query_hash, question_hash)（审核人修订过 question 时 gap_query_hash 仍指
+    向原始提问）归并统计 NO_RESULT+REFUSAL 两源、_CONTRIB_WINDOW_DAYS 窗口、每源
+    _CONTRIB_CANDIDATE_CAP 上限（与 kb_gaps 同窗同 cap 纪律）。qa_session_log 无 hash 列，
+    Python 侧 question_hash 归并；REFUSAL 走平查（idx_status_created）——不需要 kb_gaps 的
+    qa_docs_join（那个 JOIN 只为算 dept 可见性，计数场景有意不按部门过滤：审核人要的是真实
+    热度，纯计数不回传原文无泄露面）。失败→None（诚实「算不出」）；同 hash 同 message 去重。"""
+    ids = [c for c in (cids or []) if c]
+    if not ids:
+        return {}
+    from opensearch_pipeline import contribution as C
+    try:
+        ph = ",".join(["%s"] * len(ids))
+        cur.execute(
+            f"SELECT contribution_id, COALESCE(gap_query_hash, question_hash)"
+            f" FROM {_op_db()}.kb_contribution WHERE contribution_id IN ({ph})",
+            tuple(ids))
+        hash_by_cid = {r[0]: r[1] for r in (cur.fetchall() or []) if r and r[1]}
+        counts: dict = {}
+        if hash_by_cid:
+            for status in ("NO_RESULT", "REFUSAL"):
+                cur.execute(
+                    f"SELECT query_text, message_id FROM {_op_db()}.qa_session_log"
+                    f" WHERE answer_status='{status}'"
+                    "   AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    " ORDER BY created_at DESC LIMIT %s",
+                    (_CONTRIB_WINDOW_DAYS, _CONTRIB_CANDIDATE_CAP))
+                for row in cur.fetchall() or []:
+                    qt, mid = row[0], row[1]
+                    h = C.question_hash(qt)
+                    if h:
+                        counts.setdefault(h, set()).add(mid or qt)
+        # hash 缺失的行（历史空 hash）不进 hash_by_cid → 调用方 .get(cid, 0) 归 0
+        return {cid: len(counts.get(h, ())) for cid, h in hash_by_cid.items()}
+    except Exception as e:   # noqa: BLE001 — 热度信号绝不拖垮审核队列
+        logger.info("pending asks 聚合失败（诚实 None）: %s", e)
+        return None
+
+
 @router.get("/api/kb/contributions/pending", response_model=KbContributionListResponse)
 def kb_contributions_pending(request: Request, limit: int = 20, offset: int = 0,
                              identity: Optional[Identity] = Depends(current_identity)):
@@ -630,10 +677,16 @@ def kb_contributions_pending(request: Request, limit: int = 20, offset: int = 0,
                 + " ORDER BY created_at ASC LIMIT %s OFFSET %s",
                 tuple(scope_params + [limit + 1, offset]))
             rows = cur.fetchall() or []
+            items = [_contrib_item(r) for r in rows[:limit]]
+            # 批次ε-3 R2：回填被问次数（None=算不出→前端自隐；随手动加载返回，不引入轮询）
+            asks = _pending_asks(cur, [i.contribution_id for i in items])
+            if asks is not None:
+                for i in items:
+                    i.asks = asks.get(i.contribution_id, 0)
     finally:
         conn.close()
     has_more = len(rows) > limit
-    return KbContributionListResponse(items=[_contrib_item(r) for r in rows[:limit]], has_more=has_more)
+    return KbContributionListResponse(items=items, has_more=has_more)
 
 
 @router.post("/api/kb/contributions/{cid}/accept", response_model=KbContributionActionResponse)
