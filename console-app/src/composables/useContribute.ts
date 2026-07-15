@@ -27,7 +27,13 @@ export interface ContributionItem {
   author_id: string; author_name: string
   review_status: string; ingestion_status: string; state: string
   doc_id: string | null; review_note: string; created_at: string; reviewed_at: string | null
+  // 缺口溯源（批次ε-1，后端 additive 透出）：老后端无此字段 → undefined → 徽标自隐
+  source_message_id?: string | null
+  gap_query?: string | null
 }
+// 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
+// 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。
+export interface ContributionRevision { question?: string; content?: string; category_dept?: string }
 export interface HeroItem { rank: number; author_id: string; author_name: string; count: number }
 
 interface GapsResp { items: GapItem[]; summary: GapsSummary; has_more: boolean }
@@ -42,6 +48,7 @@ const gapsSummary = ref<GapsSummary | null>(null)
 const gapsHasMore = ref(false)
 const myContribs = ref<ContributionItem[]>([])
 const pendingContribs = ref<ContributionItem[]>([])
+const pendingHasMore = ref(false)   // 批次ε-1：>50 条时后端 has_more 此前被静默丢弃（假满员）
 const heroes = ref<HeroItem[]>([])
 const loadingGaps = ref(false)
 const loadErrors = ref<Record<string, string>>({})
@@ -90,7 +97,8 @@ function _previewMine(): ContributionItem[] {
 }
 function _previewPending(): ContributionItem[] {
   return [
-    { contribution_id: 'p1', question: '如何申请生产环境的访问密钥？', content: '提交工单到 IT，附部门负责人审批…', category_dept: 'it', author_id: 'u9', author_name: '王伟', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-06-27', reviewed_at: null },
+    { contribution_id: 'p1', question: '如何申请生产环境的访问密钥？', content: '提交工单到 IT，附部门负责人审批…', category_dept: 'it', author_id: 'u9', author_name: '王伟', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-06-27', reviewed_at: null, source_message_id: 'm1', gap_query: '生产环境访问密钥在哪申请' },
+    { contribution_id: 'p2', question: '2oz PP 杯的模具保养周期是多久？', content: '标准周期为每生产 30 万模次做一级保养（清洁流道、检查顶针），100 万模次做二级保养（拆模检查型腔磨损、更换密封件）。\n夏季高温连续生产时一级保养提前到 25 万模次。\n保养记录填在《模具保养台账》并由当班班长签字确认，台账每月底交设备科归档。', category_dept: 'production', author_id: 'u12', author_name: '陈强', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-06-28', reviewed_at: null },
   ]
 }
 function _previewHeroes(): HeroItem[] {
@@ -127,15 +135,20 @@ async function loadMine() {
   } catch (e) { myContribs.value = []; noteLoadError('mine', e) }
 }
 
-async function loadPending() {
+async function loadPending(offset = 0) {
   const s = useSession()
-  if (!s.identity?.canManage) { pendingContribs.value = []; return }
-  if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = _previewPending(); return }
+  if (!s.identity?.canManage) { pendingContribs.value = []; pendingHasMore.value = false; return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = _previewPending(); pendingHasMore.value = false; return }
   clearLoadError('pending')
   try {
-    const r = await apiJson<ContribListResp>('/api/kb/contributions/pending?limit=50', { auth: true })
-    pendingContribs.value = r.items || []
-  } catch (e) { pendingContribs.value = []; noteLoadError('pending', e) }
+    const r = await apiJson<ContribListResp>(`/api/kb/contributions/pending?limit=50&offset=${offset}`, { auth: true })
+    // 批次ε-1：offset>0=「加载更多」追加；0=回首页替换（与 loadGaps 同语义）
+    pendingContribs.value = offset ? [...pendingContribs.value, ...(r.items || [])] : (r.items || [])
+    pendingHasMore.value = !!r.has_more
+  } catch (e) {
+    if (!offset) pendingContribs.value = []
+    noteLoadError('pending', e)
+  }
 }
 
 async function loadHeroes() {
@@ -185,20 +198,25 @@ async function submitContribution(): Promise<boolean> {
 }
 
 // ── 审核动作（部门管理员/kb_admin）──
-async function acceptContribution(c: ContributionItem, permissionLevel: 'dept_internal' | 'public' = 'dept_internal') {
-  await withInflight(`ct:${c.contribution_id}`, async () => {
+// 批次ε-1：可选 revised=采纳前修订（后端既有契约）；返回是否成功——组件据此决定是否退出修订态
+//（失败保留编辑内容不丢稿）。既有调用点忽略返回值，行为不变。
+async function acceptContribution(c: ContributionItem, permissionLevel: 'dept_internal' | 'public' = 'dept_internal',
+                                  revised?: ContributionRevision): Promise<boolean> {
+  const ok = await withInflight(`ct:${c.contribution_id}`, async () => {
     try {
       const s = useSession()
-      if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = pendingContribs.value.filter((x) => x.contribution_id !== c.contribution_id); return }
-      const r = await apiJson<{ requires_kb_admin_approval?: boolean }>(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({ permission_level: permissionLevel }) })
+      if (import.meta.env.DEV && s.token === 'dev-preview') { pendingContribs.value = pendingContribs.value.filter((x) => x.contribution_id !== c.contribution_id); return true }
+      const r = await apiJson<{ requires_kb_admin_approval?: boolean }>(`/api/kb/contributions/${encodeURIComponent(c.contribution_id)}/accept`, { method: 'POST', auth: true, body: JSON.stringify({ permission_level: permissionLevel, ...(revised || {}) }) })
       // P2-16：dept_admin 采纳「全员公开」→ 后端登记为待审批（不再直通入库），提示放行前提
       if (r?.requires_kb_admin_approval) void notice({ title: '已采纳，等待放行', message: '全员公开的贡献需知识库管理员在「待审批」中放行后才会入库检索。' })
       // 批次α-⑤：兄弟面板联动——loadGaps() 让「待回答」的 has_pending_contribution 徽标与
       // 统计卡即时翻转（此前采纳后缺口列表原样、同一问题会被第二人重复回答）。回首页语义
       //（offset 缺省 0），不沿用「加载更多」的偏移。
       await Promise.all([loadPending(), loadMine(), loadGaps()])
-    } catch (e: any) { void notice({ title: '采纳失败', message: uploadErrText(e), danger: true }) }
+      return true
+    } catch (e: any) { void notice({ title: '采纳失败', message: uploadErrText(e), danger: true }); return false }
   })
+  return ok === true
 }
 async function rejectContribution(c: ContributionItem, note: string) {
   await withInflight(`ct:${c.contribution_id}`, async () => {
@@ -229,7 +247,7 @@ export function useContribute() {
   // 待你审核的贡献数（红点/角标单一来源）。
   const reviewCount = computed(() => pendingContribs.value.length)
   return {
-    gaps, gapsSummary, gapsHasMore, myContribs, pendingContribs, heroes, loadingGaps, loadErrors, isBusy,
+    gaps, gapsSummary, gapsHasMore, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
     modalOpen, formQuestion, formContent, formDept, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, loadMine, loadPending, loadHeroes,
@@ -240,7 +258,7 @@ export function useContribute() {
 /** 仅供测试：重置 store。 */
 export function __resetContribute() {
   gaps.value = []; gapsSummary.value = null; gapsHasMore.value = false
-  myContribs.value = []; pendingContribs.value = []; heroes.value = []
+  myContribs.value = []; pendingContribs.value = []; pendingHasMore.value = false; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''
   formSourceMsg.value = ''; formGapQuery.value = ''; submitBusy.value = false; submitErr.value = ''; submitOk.value = false

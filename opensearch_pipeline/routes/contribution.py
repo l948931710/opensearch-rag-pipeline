@@ -44,7 +44,8 @@ router = APIRouter()
 #      缺口仅在 ingestion_status='searchable' 后关闭；合成 .md 正文不含提交人姓名。见 schema/010。
 # ═══════════════════════════════════════════════════════════════
 _CONTRIB_COLS = ("contribution_id, question, content, category_dept, author_id, author_name, "
-                 "review_status, ingestion_status, doc_id, review_note, created_at, reviewed_at")
+                 "review_status, ingestion_status, doc_id, review_note, created_at, reviewed_at, "
+                 "source_message_id, gap_query")   # 末两列=缺口溯源透出（批次ε-1，写侧一直在存）
 _CONTRIB_WINDOW_DAYS = 30
 _CONTRIB_CANDIDATE_CAP = 400   # 每源（NO_RESULT / REFUSAL）拉取的原始候选行上限，再在 py 内归一去重
 
@@ -138,6 +139,9 @@ class KbContributionItem(BaseModel):
     review_note: str = ""
     created_at: str = ""
     reviewed_at: Optional[str] = None
+    # 缺口溯源（批次ε-1）：来自「待回答」缺口的贡献带原提问上下文，审核队列据此显「来自缺口」。
+    source_message_id: Optional[str] = None
+    gap_query: Optional[str] = None
 
 
 class KbContributionListResponse(BaseModel):
@@ -197,7 +201,7 @@ class KbHeroesResponse(BaseModel):
 def _contrib_item(row) -> "KbContributionItem":
     """把 _CONTRIB_COLS 顺序的 DB 行映射为响应项（state 由两条生命周期折叠）。"""
     from opensearch_pipeline import contribution as C
-    cid, q, content, dept, aid, aname, rs, ing, did, note, created, reviewed = row
+    cid, q, content, dept, aid, aname, rs, ing, did, note, created, reviewed, src_msg, gapq = row
     return KbContributionItem(
         contribution_id=cid or "", question=q or "", content=content or "",
         category_dept=dept or "", author_id=aid or "", author_name=aname or "",
@@ -205,6 +209,7 @@ def _contrib_item(row) -> "KbContributionItem":
         state=C.contribution_state(rs, ing), doc_id=did, review_note=note or "",
         created_at=(created.isoformat() if created else ""),
         reviewed_at=(reviewed.isoformat() if reviewed else None),
+        source_message_id=(src_msg or None), gap_query=(gapq or None),
     )
 
 
@@ -464,7 +469,8 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
     return KbContributionItem(
         contribution_id=cid, question=q_clean, content=c_clean,
         category_dept=category_dept, author_id=identity.user_id, author_name=identity.name or "",
-        review_status="pending", ingestion_status="none", state="pending")
+        review_status="pending", ingestion_status="none", state="pending",
+        source_message_id=(req.source_message_id or None), gap_query=gq)
 
 
 @router.get("/api/kb/contributions/mine", response_model=KbContributionListResponse)

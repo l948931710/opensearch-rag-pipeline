@@ -696,3 +696,26 @@ def test_pending_scope_kb_admin_orphan_only(monkeypatch):
     assert "NOT IN" in sql
     assert "dept_admin_grant" in sql and "is_active=1" in sql
     assert "managed_owner_dept" in sql
+
+
+# ── 批次ε-1：缺口溯源字段透出（source_message_id/gap_query 写侧一直在存，读侧此前不透出）──
+def test_contrib_list_exposes_gap_provenance(monkeypatch):
+    """mine/pending 行带缺口溯源两列：SELECT 列面含 source_message_id/gap_query，
+    响应项透出（前端审核队列据此显「来自缺口」徽标）；空值归一为 None。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    rows = [
+        ("CONTRIB_1", "如何开发票", "按流程", "finance", "u1", "张三",
+         "pending", "none", None, None, None, None, "msg_9", "开发票的抬头怎么填"),
+        ("CONTRIB_2", "自发贡献", "内容", "finance", "u1", "张三",
+         "pending", "none", None, None, None, None, None, ""),
+    ]
+    conn = _install_conn(monkeypatch, _FakeConn(list_rows=rows))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    sql = next(s for s, _ in conn.calls if "SELECT" in s and "author_id=" in s)
+    assert "source_message_id" in sql and "gap_query" in sql
+    assert resp.items[0].source_message_id == "msg_9"
+    assert resp.items[0].gap_query == "开发票的抬头怎么填"
+    assert resp.items[1].source_message_id is None      # 空值归一 None（前端 v-if 判空自隐）
+    assert resp.items[1].gap_query is None
