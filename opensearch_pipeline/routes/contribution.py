@@ -74,6 +74,14 @@ _RECONCILE_THROTTLE_S = 60.0
 _reconcile_state = {"ts": 0.0}
 _reconcile_lock = threading.Lock()
 
+# 内容阶段自动重试上限——与 dataworks_orchestrator 的 stage-2 认领谓词
+# （content_process_status='FAILED' AND retry_count < 3，两处 SQL）同值同义：
+# retry_count < 3 的 FAILED 行下一批 DAG 还会自动续跑（毒文档机制，非死链），
+# reconcile 只对「重试已用尽」的行判死。改那边的上限必须同步改这里，否则
+# 「还会自愈的行被提前判死」（提前翻 failed 后即使 DAG 自愈也不会再翻 searchable）
+# 或「真死行永不翻」。
+_CS_RETRY_EXHAUSTED = 3
+
 
 def _gaps_cache_ttl() -> float:
     try:
@@ -248,7 +256,8 @@ def _contrib_item(row) -> "KbContributionItem":
 
 
 def _reconcile_contributions_searchable(conn) -> None:
-    """懒式对账：registered 的贡献文档若 DAG 已索引成功→searchable，索引失败→failed。
+    """懒式对账：registered 的贡献文档若 DAG 已索引成功→searchable；索引失败 /
+    kb_admin 驳回 / 内容阶段失败且自动重试用尽（ε-5 审计 P0 谓词对齐）→failed。
 
     跨库 UPDATE...JOIN document_version。best-effort、非致命——辅助治理绝不拖垮读端点
     （任何异常只记 info 并放过；读端点仍按持久态展示）。
@@ -302,6 +311,21 @@ def _reconcile_contributions_searchable(conn) -> None:
                 " c.ingestion_error='全员公开发布被知识库管理员驳回'"
                 " WHERE c.ingestion_status='registered'"
                 "   AND dv.content_process_status='REJECTED'")
+            # ε-5 审计 P0 根治（cs=FAILED 谓词对齐）：内容阶段失败且自动重试已用尽的行是
+            # 真死链（orchestrator 认领谓词 retry_count<3 之外的 FAILED 行永不再被拾起，此前
+            # 永停 registered）→ 翻显式 failed 终态。retry_count 守卫是认领谓词的镜像补集：
+            # <3 的行明天还会自愈，绝不提前判死（NULL 不满足 <3、同样不会被认领 → 一并判死）。
+            # 出路：员工「修改重交」自助；管理员「重试入库」（retry 端点对 FAILED 文档同步
+            # 重置 NOT_STARTED+retry_count=0 重新排队，见 _requeue_failed_doc）。不通知、
+            # 不自动重跑——与本函数其余谓词同为读侧诚实化。
+            cur.execute(
+                f"UPDATE {_op_db()}.kb_contribution c"
+                f" JOIN {_kb_db()}.document_version dv ON {_doc_join}"
+                " SET c.ingestion_status='failed',"
+                " c.ingestion_error='内容处理失败且自动重试已用尽——可修改后重新提交，或由管理员重试入库'"
+                " WHERE c.ingestion_status='registered'"
+                "   AND dv.content_process_status='FAILED'"
+                f"   AND (dv.retry_count >= {_CS_RETRY_EXHAUSTED} OR dv.retry_count IS NULL)")
         conn.commit()
     except Exception as e:
         logger.info("contribution reconcile 跳过 (non-fatal): %s", e)
@@ -444,6 +468,44 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
         except Exception as e2:
             logger.error("contribution 置 failed 也失败 cid=%s: %s", cid, e2)
         return C.INGEST_FAILED, err
+
+
+def _requeue_failed_doc(doc_id: str, *, trace_id: str) -> None:
+    """管理员重试入库时，把内容阶段 FAILED 的贡献文档重新排队（ε-5 审计 P0 出路侧）。
+
+    _materialize_contribution 对已登记 raw_key 幂等早退、绝不碰 document_version 状态 →
+    没有这一步，对 cs=FAILED 且重试用尽的文档点「重试」只是把贡献翻回 registered，下次
+    reconcile 又诚实翻回 failed（空转）。重置 NOT_STARTED + retry_count=0 后，下一批 DAG
+    stage-2 按既有认领谓词重新拾起（kb 放行端点已有 serving 侧写 content_process_status
+    的先例）。谓词锁死 content_process_status='FAILED'：物化失败重试（文档行不存在或
+    NOT_STARTED）、待放行（PENDING_APPROVAL）等一概不碰。
+
+    best-effort：失败只记 warning——贡献停在 registered，下次 reconcile 会诚实翻回 failed，
+    不会留下「假 registered」终态（自洽，无需回滚）。人工触发（管理员点按钮），非自动重跑。
+    """
+    from opensearch_pipeline.config import get_config
+    from opensearch_pipeline.db import _get_db_conn
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    try:
+        assert_metadata_write_allowed("kb_contribution_requeue", get_config().rds.host, kind="rds")
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {_kb_db()}.document_version"
+                    " SET content_process_status='NOT_STARTED', retry_count=0"
+                    " WHERE doc_id=%s AND version_no=1"
+                    "   AND content_process_status='FAILED'",
+                    (doc_id,))
+                requeued = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        if requeued:
+            logger.info("contribution retry 重新排队 FAILED 文档 [trace=%s] doc=%s", trace_id, doc_id)
+    except Exception as e:  # noqa: BLE001 — 排队失败不拖垮重试主流程（见 docstring 自洽性）
+        logger.warning("contribution retry 重新排队失败 (non-fatal) [trace=%s] doc=%s: %s",
+                       trace_id, doc_id, e)
 
 
 @router.post("/api/kb/contributions", response_model=KbContributionItem)
@@ -892,7 +954,12 @@ def kb_contribution_reject(cid: str, req: KbContributionRejectRequest, request: 
 @router.post("/api/kb/contributions/{cid}/retry-ingestion", response_model=KbContributionActionResponse)
 def kb_contribution_retry(cid: str, request: Request,
                           identity: Optional[Identity] = Depends(current_identity)):
-    """重试入库（registering/failed → 用【固定键】续跑物化，绝不新建文档）。仅已采纳行。"""
+    """重试入库（registering/failed → 用【固定键】续跑物化，绝不新建文档）。仅已采纳行。
+
+    ε-5 审计 P0 出路侧：物化续跑成功后，若文档停在内容阶段 FAILED（自动重试已用尽的
+    死链，reconcile 已把贡献翻 failed），同步重置为 NOT_STARTED 重新排队（_requeue_failed_doc，
+    谓词锁死 FAILED、其余状态零触碰）——否则对这类行「重试」只是 registered↔failed 空转。
+    """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     from opensearch_pipeline import contribution as C, kb_authz, kb_upload
@@ -949,6 +1016,9 @@ def kb_contribution_retry(cid: str, request: Request,
         cid, doc_id=doc_id, raw_key=raw_key, owner_dept=dept, question=q, content=content,
         reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id,
         requires_kb_admin_approval=_requires_approval)
+    if ing == C.INGEST_REGISTERED:
+        # 内容阶段 FAILED 的死链文档重新排队（谓词内锁死 FAILED，其余状态 no-op）
+        _requeue_failed_doc(doc_id, trace_id=trace_id)
     # 批次ε-2：续跑结果同样通知提交人（作者自己点的重试 actor==author → 模块内跳过不自扰）
     from opensearch_pipeline.admin_notify import notify_contribution_result
     notify_contribution_result(
