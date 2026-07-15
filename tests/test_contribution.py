@@ -39,6 +39,10 @@ class _FakeCur:
                 and self.conn.fail_version_insert > 0):
             self.conn.fail_version_insert -= 1
             raise Exception("simulated DB failure on version insert")
+        # 注入：retry 的 FAILED 文档重新排队 UPDATE 失败（best-effort 断言用）
+        if (self.conn.fail_requeue and "document_version" in sql
+                and "content_process_status='NOT_STARTED'" in sql):
+            raise Exception("simulated requeue failure")
         # 条件认领 UPDATE：rowcount = claim_rowcount（0=竞态被抢）
         if ("UPDATE" in sql and "kb_contribution" in sql
                 and "review_status='accepted'" in sql
@@ -106,6 +110,7 @@ class _FakeConn:
         self.reread_row = kw.get("reread_row")
         self.claim_rowcount = kw.get("claim_rowcount", 1)
         self.fail_version_insert = kw.get("fail_version_insert", 0)
+        self.fail_requeue = kw.get("fail_requeue", False)
         self.no_result_rows = kw.get("no_result_rows", [])
         self.refusal_rows = kw.get("refusal_rows", [])
         self.coverage_rows = kw.get("coverage_rows", [])
@@ -637,6 +642,63 @@ def test_reconcile_flips_kb_admin_rejected_public_to_failed(monkeypatch):
     assert rejected, "缺少 kb_admin 驳回 → 贡献翻 failed 的 reconcile 分支"
     assert all("ingestion_status='failed'" in s and "ingestion_status='registered'" in s
                for s in rejected)
+
+
+def test_reconcile_flips_cs_failed_exhausted_to_failed(monkeypatch):
+    """ε-5 审计 P0 根治（reconcile cs=FAILED 谓词对齐）：内容阶段 FAILED 且自动重试用尽
+    → registered 翻显式 failed。守卫=orchestrator stage-2 认领谓词（retry_count<3 会被
+    自动续跑）的镜像补集：>=3 或 NULL 才判死——无守卫会把明天能自愈的行提前判死
+    （提前翻 failed 后 DAG 自愈也不会再翻 searchable）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(list_rows=[]))
+    from opensearch_pipeline import api
+    api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    recon = [s for s, _ in conn.calls if "kb_contribution c" in s and "document_version dv" in s]
+    failed = [s for s in recon if "content_process_status='FAILED'" in s]
+    assert failed, "缺少 cs=FAILED 死链 → 贡献翻 failed 的 reconcile 分支"
+    for s in failed:
+        assert "ingestion_status='failed'" in s and "ingestion_status='registered'" in s
+        assert "dv.retry_count >= 3" in s and "dv.retry_count IS NULL" in s, \
+            "cs=FAILED 谓词必须带 retry_count 用尽守卫（<3 的行 DAG 还会自动续跑，不是死链）"
+
+
+def test_retry_requeues_cs_failed_doc(monkeypatch):
+    """ε-5 审计 P0 出路侧：对已登记文档（物化幂等早退、绝不碰 document_version）点「重试」
+    必须把内容阶段 FAILED 的死链行重新排队（NOT_STARTED + retry_count=0，谓词锁死 FAILED）
+    ——否则重试只是 registered↔failed 空转，管理员按钮形同虚设。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("accepted", "failed", "DOC_F", "raw/marketing/DOC_F/UP1/contribution-C1.md",
+                     "marketing", "q", "a"),
+        dv_exists=("DOC_F", 1)))   # raw_key 已登记 → 物化幂等早退
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_retry(cid="C1", request=None, identity=_ident())
+    assert resp.ingestion_status == "registered" and resp.ok is True
+    req = [(s, p) for s, p in conn.calls
+           if "document_version" in s and "content_process_status='NOT_STARTED'" in s]
+    assert req, "retry 未重新排队 FAILED 文档"
+    s, p = req[0]
+    assert "retry_count=0" in s
+    assert "content_process_status='FAILED'" in s, "排队谓词必须锁死 FAILED（其余状态零触碰）"
+    assert p == ("DOC_F",)
+
+
+def test_retry_requeue_failure_is_nonfatal(monkeypatch):
+    """重新排队是 best-effort：失败不拖垮重试主流程（贡献停在 registered，下次 reconcile
+    诚实翻回 failed——自洽，无假终态，故无需回滚）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("accepted", "failed", "DOC_F", "raw/marketing/DOC_F/UP1/contribution-C1.md",
+                     "marketing", "q", "a"),
+        dv_exists=("DOC_F", 1), fail_requeue=True))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_retry(cid="C1", request=None, identity=_ident())
+    assert resp.ingestion_status == "registered" and resp.ok is True
 
 
 # ── P2-17) 图片占位符注入防护（<<IMG:N>> 视觉引用伪造）──────────────────────
