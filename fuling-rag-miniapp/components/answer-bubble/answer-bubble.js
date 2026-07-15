@@ -29,6 +29,9 @@ Component({
     blocks: [],
     // 低匹配 guard 提示条（/api/ask resp.guard）
     guard: false,
+    // 通用回答徽标（/api/ask resp.source ∈ general|smalltalk）：
+    // 「通用回答 · 非公司口径」弱样式标识 —— 免责尾注已在正文，徽标只作快速识别
+    general: false,
     // When true, reveal everything immediately (no typewriter animation).
     // 初始为 true = 历史消息直出；运行中翻转 true = 「停止」跳过打字机。
     instant: false,

@@ -127,6 +127,18 @@ export function mergeServerList(localList, serverItems) {
 }
 
 /**
+ * NO_RESULT 卡正文拆行（通用能力分级开放：后端引导式拒答话术为多行文本，
+ * axml 无法运行时拆分 —— 存消息前/恢复时预计算 nrLines）。
+ * 空/非法入参返回 []（axml 据此回退硬编码旧文案，兼容老后端）。
+ */
+export function splitNrLines(answer) {
+  return String(answer || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+/**
  * 页面消息数组 → 可落盘精简形态：丢弃 loading/error 瞬态，保留最终回答与
  * NO_RESULT 卡；AI 行统一带 instant:true（恢复渲染绝不重播打字机）。
  * 截尾保留最近 MAX_MESSAGES 条。
@@ -143,7 +155,9 @@ export function leanMessages(messages) {
     }
     if (m.noResult) {
       out.push({
-        role: 'ai', noResult: true,
+        // answer = 后端引导式拒答话术原文（nrLines 恢复时经 splitNrLines 重算，
+        // 不落盘 —— 省 200KB 本地存储配额）
+        role: 'ai', noResult: true, answer: m.answer || '',
         rephrase: m.rephrase || [], messageId: m.messageId || '',
         question: m.question || '', handoffDone: !!m.handoffDone,
       });
@@ -151,7 +165,7 @@ export function leanMessages(messages) {
     }
     if (m.blocks && m.blocks.length) {
       out.push({
-        role: 'ai', blocks: m.blocks, guard: !!m.guard,
+        role: 'ai', blocks: m.blocks, guard: !!m.guard, general: !!m.general,
         sources: m.sources || [], messageId: m.messageId || '',
         copyText: m.copyText || '', question: m.question || '',
         instant: true,
