@@ -259,9 +259,11 @@ class TestExecuteGeneralQuota:
     """配额拒绝 → 友好话术（不抛 HTTP）。"""
 
     def test_quota_denial_maps_to_quota_message(self, monkeypatch):
+        # 分支契约：api 按模块属性访问限流器（_rate_limiter.LIMITER）→ patch 打 rate_limiter 侧
         import opensearch_pipeline.api as API
+        import opensearch_pipeline.rate_limiter as RL
         monkeypatch.setattr(
-            API.LIMITER, "admit_general",
+            RL.LIMITER, "admit_general",
             lambda actor, is_user: Denial(429, "x", 60, "general_quota"))
         ident = types.SimpleNamespace(user_id="U1", acl_groups=["it"], name="张")
         out = API._execute_general_llm("帮我翻译", history=None, tier="office",
@@ -271,8 +273,9 @@ class TestExecuteGeneralQuota:
 
     def test_off_denial_maps_to_tier_off_message(self, monkeypatch):
         import opensearch_pipeline.api as API
+        import opensearch_pipeline.rate_limiter as RL
         monkeypatch.setattr(
-            API.LIMITER, "admit_general",
+            RL.LIMITER, "admit_general",
             lambda actor, is_user: Denial(403, "x", 0, "general_off"))
         ident = types.SimpleNamespace(user_id="U1", acl_groups=["it"], name="张")
         out = API._execute_general_llm("帮我翻译", history=None, tier="office",

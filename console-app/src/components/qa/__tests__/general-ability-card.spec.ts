@@ -8,14 +8,26 @@ import MessageBubble from '@/components/qa/MessageBubble.vue'
 // ② 正常答案区 source=general/smalltalk 时显示「通用回答 · 非公司口径」弱徽标，
 //    kb（缺省）绝不显示 —— flag 关时视觉与改动前一致。
 
-const fillInput = vi.fn()
-vi.mock('@/composables/useAsk', () => ({
-  useAsk: () => ({
-    retry: vi.fn(), handoff: vi.fn(), fillInput,
-    vote: vi.fn(), copyAns: vi.fn(),
-    resignImage: vi.fn(), imgFailed: vi.fn(), preview: vi.fn(),
-  }),
-}))
+// mock 形状对齐分支版 useAsk 导出面（message-bubble-states.spec 同款）：
+// useAgentAsk 顶层解构 agentChatBridge 与状态源，缺一即整链 import 失败；
+// vi.hoisted——useAgentAsk 模块顶层就调 useAsk()，普通 const 在 TDZ 里会炸
+const { fillInput } = vi.hoisted(() => ({ fillInput: vi.fn() }))
+vi.mock('@/composables/useAsk', async () => {
+  const { ref } = await import('vue')
+  return {
+    useAsk: () => ({
+      retry: vi.fn(), handoff: vi.fn(), fillInput,
+      vote: vi.fn(), copyAns: vi.fn(),
+      resignImage: vi.fn(), imgFailed: vi.fn(), preview: vi.fn(),
+      asking: ref(false), draft: ref(''), messages: ref([]),
+      conversations: ref([]), activeId: ref(''),
+    }),
+    agentChatBridge: () => ({
+      ensureActive: vi.fn(), schedulePersist: vi.fn(), nextMsgId: () => 1,
+      thinking: ref(false), askLegacy: vi.fn(),
+    }),
+  }
+})
 
 import type { ChatMessage } from '@/composables/useAsk'
 
