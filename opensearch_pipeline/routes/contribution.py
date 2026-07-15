@@ -45,7 +45,8 @@ router = APIRouter()
 # ═══════════════════════════════════════════════════════════════
 _CONTRIB_COLS = ("contribution_id, question, content, category_dept, author_id, author_name, "
                  "review_status, ingestion_status, doc_id, review_note, created_at, reviewed_at, "
-                 "source_message_id, gap_query")   # 末两列=缺口溯源透出（批次ε-1，写侧一直在存）
+                 "source_message_id, gap_query, "   # 缺口溯源透出（批次ε-1，写侧一直在存）
+                 "ingestion_error")                 # 失败原因透出（批次ε-2——作者不再瞎重试）
 _CONTRIB_WINDOW_DAYS = 30
 _CONTRIB_CANDIDATE_CAP = 400   # 每源（NO_RESULT / REFUSAL）拉取的原始候选行上限，再在 py 内归一去重
 
@@ -142,6 +143,8 @@ class KbContributionItem(BaseModel):
     # 缺口溯源（批次ε-1）：来自「待回答」缺口的贡献带原提问上下文，审核队列据此显「来自缺口」。
     source_message_id: Optional[str] = None
     gap_query: Optional[str] = None
+    # 失败原因（批次ε-2）：failed 行透出 ingestion_error（DB 自始有列此前不透出，作者只能瞎重试）
+    ingestion_error: Optional[str] = None
 
 
 class KbContributionListResponse(BaseModel):
@@ -201,7 +204,8 @@ class KbHeroesResponse(BaseModel):
 def _contrib_item(row) -> "KbContributionItem":
     """把 _CONTRIB_COLS 顺序的 DB 行映射为响应项（state 由两条生命周期折叠）。"""
     from opensearch_pipeline import contribution as C
-    cid, q, content, dept, aid, aname, rs, ing, did, note, created, reviewed, src_msg, gapq = row
+    (cid, q, content, dept, aid, aname, rs, ing, did, note, created, reviewed,
+     src_msg, gapq, ing_err) = row
     return KbContributionItem(
         contribution_id=cid or "", question=q or "", content=content or "",
         category_dept=dept or "", author_id=aid or "", author_name=aname or "",
@@ -210,6 +214,7 @@ def _contrib_item(row) -> "KbContributionItem":
         created_at=(created.isoformat() if created else ""),
         reviewed_at=(reviewed.isoformat() if reviewed else None),
         source_message_id=(src_msg or None), gap_query=(gapq or None),
+        ingestion_error=(ing_err or None),
     )
 
 
@@ -669,6 +674,13 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
         question=claim["question"], content=claim["content"],
         reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id,
         requires_kb_admin_approval=claim["requires_kb_approval"])
+    # 批次ε-2：审核结果通知提交人（commit+物化之后；模块内 best-effort no-raise，绝不反噬主流程）
+    from opensearch_pipeline.admin_notify import notify_contribution_result
+    notify_contribution_result(
+        cid,
+        ("pending_approval" if claim["requires_kb_approval"]
+         else "failed" if ing == C.INGEST_FAILED else "accepted"),
+        error=(err or ""), actor_id=kb.user_id)
     return KbContributionActionResponse(
         contribution_id=cid, review_status="accepted", ingestion_status=ing,
         state=C.contribution_state("accepted", ing), doc_id=claim["doc_id"],
@@ -721,6 +733,9 @@ def kb_contribution_reject(cid: str, req: KbContributionRejectRequest, request: 
         raise HTTPException(status_code=500, detail=f"驳回失败 (trace: {trace_id})")
     finally:
         conn.close()
+    # 批次ε-2：驳回结果通知提交人（commit 之后；文案含理由，空理由有「未填写理由」兜底）
+    from opensearch_pipeline.admin_notify import notify_contribution_result
+    notify_contribution_result(cid, "rejected", note=(req.note or ""), actor_id=kb.user_id)
     return KbContributionActionResponse(contribution_id=cid, review_status="rejected",
         ingestion_status="none", state="rejected", ok=True)
 
@@ -785,6 +800,13 @@ def kb_contribution_retry(cid: str, request: Request,
         cid, doc_id=doc_id, raw_key=raw_key, owner_dept=dept, question=q, content=content,
         reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id,
         requires_kb_admin_approval=_requires_approval)
+    # 批次ε-2：续跑结果同样通知提交人（作者自己点的重试 actor==author → 模块内跳过不自扰）
+    from opensearch_pipeline.admin_notify import notify_contribution_result
+    notify_contribution_result(
+        cid,
+        ("pending_approval" if _requires_approval
+         else "failed" if ing == C.INGEST_FAILED else "accepted"),
+        error=(err or ""), actor_id=kb.user_id)
     return KbContributionActionResponse(contribution_id=cid, review_status="accepted",
         ingestion_status=ing, state=C.contribution_state("accepted", ing), doc_id=doc_id,
         ok=(ing != C.INGEST_FAILED), error=(err or ""),

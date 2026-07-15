@@ -150,3 +150,75 @@ describe('useContribute — 审核动作联动兄弟面板（批次α-⑤）', (
     expect(paths.some((p) => p.includes('/api/kb/gaps'))).toBe(true)
   })
 })
+
+// 批次ε-2 Round1「告知→行动半环」：被驳回修改重交 + 失败原因透出 + 原稿可见
+describe('useContribute — openModal content 预填（批次ε-2）', () => {
+  it('传 content → 答案框带旧稿；不传（GapList 既有调用形）→ 照旧空白', () => {
+    withSession()
+    const { openModal, formContent, formQuestion } = useContribute()
+    openModal({ question: '如何报销', content: '走 OA 流程提交。', dept: 'hr' })
+    expect(formContent.value).toBe('走 OA 流程提交。')
+    openModal({ question: '如何报销', dept: 'hr', sourceMessageId: 'm1', gapQuery: '如何报销' })
+    expect(formContent.value).toBe('')          // 既有调用点行为不变
+    expect(formQuestion.value).toBe('如何报销')
+  })
+})
+
+describe('MyContributions — 重交/失败原因/原稿展开（批次ε-2）', () => {
+  const BASE = {
+    contribution_id: 'c1', question: '差旅报销保存几年？', content: '至少 5 年，见财务制度。',
+    category_dept: 'finance', author_id: 'u1', author_name: '张三', review_status: 'pending',
+    ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-07-01',
+    reviewed_at: null,
+  }
+  function mountMine(rows: any[]) {
+    withSession()
+    useContribute().myContribs.value = rows as never
+    return mount(MyContributions)
+  }
+
+  it('rejected 行显「修改重交」→ 弹窗带旧稿+原归属，提交体继承溯源；空驳回理由有兜底句', async () => {
+    const w = mountMine([{ ...BASE, state: 'rejected', review_status: 'rejected', review_note: '', source_message_id: 'm9', gap_query: '报销凭证保存年限' }])
+    expect(w.text()).toContain('未填写驳回理由')
+    await w.find('[data-testid="mycontrib-reopen"]').trigger('click')
+    const { modalOpen, formQuestion, formContent, formDept, submitContribution } = useContribute()
+    expect(modalOpen.value).toBe(true)
+    expect(formQuestion.value).toBe(BASE.question)
+    expect(formContent.value).toBe(BASE.content)
+    expect(formDept.value).toBe('finance')
+    // 溯源继承走行为断言：重交提交体带原 source_message_id/gap_query（接上缺口关闭链路）
+    const bodies: any[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_p: string, init?: any) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)))
+      return { ok: true, status: 200, json: async () => ({ items: [], summary: null, has_more: false }), text: async () => '{}' }
+    }))
+    await submitContribution()
+    const submit = bodies.find((b) => 'category_dept' in b)
+    expect(submit).toMatchObject({ source_message_id: 'm9', gap_query: '报销凭证保存年限' })
+  })
+
+  it('非 rejected 行不显重交入口', () => {
+    const w = mountMine([{ ...BASE }])
+    expect(w.find('[data-testid="mycontrib-reopen"]').exists()).toBe(false)
+  })
+
+  it('failed 行透出 ingestion_error；老后端缺字段 → 兜底句不留空白', () => {
+    const w = mountMine([
+      { ...BASE, contribution_id: 'f1', state: 'failed', ingestion_status: 'failed', ingestion_error: 'OSS 写入超时' },
+      { ...BASE, contribution_id: 'f2', state: 'failed', ingestion_status: 'failed' },
+    ])
+    const reasons = w.findAll('[data-testid="mycontrib-fail-reason"]')
+    expect(reasons.length).toBe(2)
+    expect(reasons[0].text()).toBe('OSS 写入超时')
+    expect(reasons[1].text()).toContain('入库失败')
+  })
+
+  it('点行标题展开原稿全文，再点收起', async () => {
+    const w = mountMine([{ ...BASE }])
+    expect(w.find('[data-testid="mycontrib-content"]').exists()).toBe(false)
+    await w.find('[data-testid="mycontrib-toggle"]').trigger('click')
+    expect(w.find('[data-testid="mycontrib-content"]').text()).toBe(BASE.content)
+    await w.find('[data-testid="mycontrib-toggle"]').trigger('click')
+    expect(w.find('[data-testid="mycontrib-content"]').exists()).toBe(false)
+  })
+})
