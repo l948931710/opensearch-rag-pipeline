@@ -460,3 +460,72 @@ describe('台账词表 seam 锁（ε-5 R2）', () => {
     for (const k of DISPLAY_KEYS) expect(k in BADGE_TONE, `特判词 ${k} 不在词表`).toBe(true)
   })
 })
+
+// 「忽略此缺口」（2026-07-15 拍板交 dept_admin）：composable 动作层 + 组件门禁
+describe('GapList — 忽略此缺口', () => {
+  const GAPX = () => ({
+    question: '模具保养周期是多久', asks: 5, last_days: 3, dept: 'production', kind: 'no_result',
+    question_hash: 'a'.repeat(64), source_message_id: 'm1', has_pending_contribution: false,
+  })
+  function seedOne(canManage: boolean) {
+    withSession({ canManage, role: canManage ? 'dept_admin' : 'employee' })
+    const c = useContribute()
+    c.gaps.value = [GAPX()] as never
+    c.gapsSummary.value = { unanswered: 7, answered: 0, this_month: 0, contributors: 0 } as never
+    return c
+  }
+
+  it('dismissGap 成功：POST 带 hash/question/reason，行内翻转 dismissed=true 不重拉', async () => {
+    const c = seedOne(true)
+    stubFetch({ ok: true, affected: 1 })
+    await c.dismissGap(c.gaps.value[0], '闲聊噪音')
+    const fetchMock = (globalThis.fetch as any)
+    expect(fetchMock).toHaveBeenCalledTimes(1)                       // 无 loadGaps 重拉
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(String(url)).toContain('/api/kb/gaps/dismiss')
+    expect(JSON.parse(init.body)).toMatchObject({
+      question_hash: 'a'.repeat(64), question: '模具保养周期是多久', reason: '闲聊噪音',
+    })
+    expect(c.gaps.value[0].dismissed).toBe(true)
+  })
+
+  it('dismissGap 失败：不乐观翻转（dismissed 保持 falsy），行不消失', async () => {
+    const c = seedOne(true)
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false, status: 500, json: async () => ({ detail: 'boom' }), text: async () => 'boom',
+    })))
+    await c.dismissGap(c.gaps.value[0], '')
+    expect(c.gaps.value[0].dismissed).not.toBe(true)
+    expect(c.gaps.value.length).toBe(1)
+  })
+
+  it('restoreGap：POST 同 hash，翻回 dismissed=false', async () => {
+    const c = seedOne(true)
+    c.gaps.value[0].dismissed = true
+    stubFetch({ ok: true, affected: 1 })
+    await c.restoreGap(c.gaps.value[0])
+    const [url, init] = (globalThis.fetch as any).mock.calls[0]
+    expect(String(url)).toContain('/api/kb/gaps/restore')
+    expect(JSON.parse(init.body)).toMatchObject({ question_hash: 'a'.repeat(64) })
+    expect(c.gaps.value[0].dismissed).toBe(false)
+  })
+
+  it('组件门禁：canManage 才渲染忽略钮；员工 DOM 无忽略/撤销节点（零变化）', () => {
+    seedOne(false)
+    let w = mount(GapList)
+    expect(w.find('[data-testid="gap-dismiss"]').exists()).toBe(false)
+    expect(w.find('[data-testid="gap-restore"]').exists()).toBe(false)
+    expect(w.text()).toContain('回答')
+    __resetContribute()
+    const c = seedOne(true)
+    w = mount(GapList)
+    expect(w.find('[data-testid="gap-dismiss"]').exists()).toBe(true)
+    // 已忽略态：末尾动作位互斥切换为「已忽略+撤销」，回答钮隐藏
+    c.gaps.value[0].dismissed = true
+    return w.vm.$nextTick().then(() => {
+      expect(w.find('[data-testid="gap-dismissed-hint"]').exists()).toBe(true)
+      expect(w.find('[data-testid="gap-restore"]').exists()).toBe(true)
+      expect(w.find('[data-testid="gap-dismiss"]').exists()).toBe(false)
+    })
+  })
+})

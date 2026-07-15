@@ -20,6 +20,10 @@ export interface GapItem {
   question_hash: string
   source_message_id: string
   has_pending_contribution: boolean // 已有贡献待入库（缺口仍开放）
+  // 本地 UI 态（非 API 字段）：本会话内刚被管理员忽略——行内原地翻转出「撤销」出路，
+  // 有意不重拉列表（reload 摘除会让误点永久不可寻回：读侧排除且后端无已忽略列表端点）。
+  // 撤销窗口=至下次 loadGaps()（刷新后被读侧排除自然消失，预期语义）。
+  dismissed?: boolean
 }
 export interface GapsSummary {
   unanswered: number; answered: number; this_month: number; contributors: number
@@ -272,6 +276,32 @@ async function retryContribution(c: ContributionItem) {
   })
 }
 
+// ── 「忽略此缺口」（schema/041，2026-07-15 拍板交 dept_admin）────────────────
+// 成功后【行内翻转，不重拉】：本仓撤销类动作的 reload 范式在此不适用——读侧排除 +
+// 后端无已忽略列表端点，reload 摘除会让误点永久不可寻回。失败保持原状（绝不乐观翻转）。
+// 确认弹窗在组件层（工程惯例：confirm 不进 composable，spec 直调用例会挂）。
+// 语义组开启时后端自动联动同组成员，前端不感知。
+async function dismissGap(g: GapItem, reason: string) {
+  await withInflight(`gap:${g.question_hash}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') { g.dismissed = true; return }
+      await apiJson('/api/kb/gaps/dismiss', { method: 'POST', auth: true, body: JSON.stringify({ question_hash: g.question_hash, question: g.question, reason: reason || '' }) })
+      g.dismissed = true
+    } catch (e: any) { void notice({ title: '忽略失败', message: uploadErrText(e), danger: true }) }
+  })
+}
+async function restoreGap(g: GapItem) {
+  await withInflight(`gap:${g.question_hash}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') { g.dismissed = false; return }
+      await apiJson('/api/kb/gaps/restore', { method: 'POST', auth: true, body: JSON.stringify({ question_hash: g.question_hash }) })
+      g.dismissed = false
+    } catch (e: any) { void notice({ title: '恢复失败', message: uploadErrText(e), danger: true }) }
+  })
+}
+
 export function useContribute() {
   const session = useSession()
   const canManage = computed(() => !!session.identity?.canManage)
@@ -283,6 +313,7 @@ export function useContribute() {
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, loadMine, loadPending, loadHeroes,
     openModal, closeModal, submitContribution, acceptContribution, rejectContribution, retryContribution,
+    dismissGap, restoreGap,
   }
 }
 
