@@ -3,8 +3,10 @@ import { X, Plus } from 'lucide-vue-next'
 import { useContribute } from '@/composables/useContribute'
 
 // 贡献弹窗：问题 / 你的答案·知识内容 / 归属分类。提交后需部门管理员采纳才会入库。
+// ε-5 R1：入库受阻行重投时带成因警示（formWarning）——警示色条挂表单顶部，
+// 与 submitErr 的失败红分开（这是提交前的注意事项，不是错误）。
 const {
-  modalOpen, formQuestion, formContent, formDept, submitBusy, submitErr,
+  modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr,
   CONTRIB_DEPT_OPTS, closeModal, submitContribution,
 } = useContribute()
 </script>
@@ -35,6 +37,11 @@ const {
 
         <!-- 表单 -->
         <div class="flex-1 overflow-y-auto px-[22px] py-[18px]">
+          <!-- 重投警示（ε-5 R1）：按成因分流——隔离子态明说「原样重投会再次被隔离」 -->
+          <p
+            v-if="formWarning" data-testid="contribute-warning"
+            class="mb-4 rounded-[9px] bg-st-busy/10 px-3 py-2.5 text-[12px] leading-relaxed text-st-busy"
+          >{{ formWarning }}</p>
           <label class="mb-1.5 block text-[11px] font-bold uppercase tracking-[0.04em] text-faint">问题</label>
           <input
             v-model="formQuestion" type="text" placeholder="要回答的问题，例如：如何申请生产环境密钥？"
