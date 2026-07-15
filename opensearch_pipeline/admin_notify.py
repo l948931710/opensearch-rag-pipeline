@@ -137,6 +137,21 @@ def _kb_admin_ids() -> List[str]:
         conn.close()
 
 
+def _contrib_author_question(contribution_id: str) -> tuple:
+    """贡献行的 (author_id, question)（批次ε-2：审核结果通知提交人用；查不到=(None, '')）。"""
+    from opensearch_pipeline.db import _get_db_conn
+    op_db = get_config().rds.operation_database
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT author_id, question FROM {op_db}.kb_contribution"
+                        " WHERE contribution_id=%s LIMIT 1", (contribution_id,))
+            row = cur.fetchone()
+            return (row[0], row[1] or "") if row else (None, "")
+    finally:
+        conn.close()
+
+
 def _doc_title(doc_id: str) -> str:
     from opensearch_pipeline.db import _get_db_conn
     conn = _get_db_conn()
@@ -205,6 +220,44 @@ def notify_contribution(category_dept: str, question: str) -> None:
                        f"（归属 {_dept_label(category_dept)}）{suffix}。请到控制台「知识贡献」审核采纳。")
     except Exception as e:   # noqa: BLE001
         logger.warning("admin_notify: contribution 通知失败（忽略）: %s", e)
+
+
+def notify_contribution_result(contribution_id: str, outcome: str, note: str = "",
+                               error: str = "", actor_id: str = "") -> None:
+    """审核结果 → 通知【提交人】（批次ε-2 Round1：补齐激励闭环的「告知」半环——此前采纳/
+    待放行/入库失败/驳回四种结果全部静默，作者只能自己回控制台翻「我的贡献」）。
+
+    outcome ∈ accepted | pending_approval | failed | rejected，文案四分支互斥可区分；
+    note/error 空值均有兜底句，绝不拼空串。actor_id=操作人：审核人=作者（自采/自驳/作者自己
+    点重试）时跳过——自己的操作无需通知自己。author/question 模块内自查（_doc_title 同款
+    模式），routes 挂点零 SELECT 负担；全程 best-effort no-raise。"""
+    if not _enabled():
+        return
+    try:
+        author_id, question = _contrib_author_question(contribution_id)
+        if not author_id or author_id == (actor_id or ""):
+            return
+        q = (question or "").strip()
+        q = q[:40] + ("…" if len(q) > 40 else "")
+        if outcome == "accepted":
+            text = (f"【富岭知识库】你的知识贡献「{q}」已被采纳，正在入库，"
+                    "稍后即可被检索到。感谢贡献！")
+        elif outcome == "pending_approval":
+            text = (f"【富岭知识库】你的知识贡献「{q}」已被采纳（全员公开），"
+                    "需知识库管理员放行后入库，请留意后续状态。")
+        elif outcome == "failed":
+            reason = (error or "").strip()[:80] or "系统原因"
+            text = (f"【富岭知识库】你的知识贡献「{q}」已被采纳但入库失败（{reason}），"
+                    "可到控制台「知识贡献」重试。")
+        elif outcome == "rejected":
+            reason = (note or "").strip()[:80] or "未填写理由"
+            text = (f"【富岭知识库】你的知识贡献「{q}」未被采纳（{reason}）。"
+                    "可在控制台「知识贡献」修改后重新提交。")
+        else:
+            return
+        _dispatch([author_id], text)
+    except Exception as e:   # noqa: BLE001
+        logger.warning("admin_notify: contribution_result 通知失败（忽略）: %s", e)
 
 
 def notify_upload_approval(owner_dept: str, title: str) -> None:

@@ -706,9 +706,9 @@ def test_contrib_list_exposes_gap_provenance(monkeypatch):
     _employee(monkeypatch)
     rows = [
         ("CONTRIB_1", "如何开发票", "按流程", "finance", "u1", "张三",
-         "pending", "none", None, None, None, None, "msg_9", "开发票的抬头怎么填"),
+         "pending", "none", None, None, None, None, "msg_9", "开发票的抬头怎么填", None),
         ("CONTRIB_2", "自发贡献", "内容", "finance", "u1", "张三",
-         "pending", "none", None, None, None, None, None, ""),
+         "pending", "none", None, None, None, None, None, "", None),
     ]
     conn = _install_conn(monkeypatch, _FakeConn(list_rows=rows))
     from opensearch_pipeline import api
@@ -719,3 +719,116 @@ def test_contrib_list_exposes_gap_provenance(monkeypatch):
     assert resp.items[0].gap_query == "开发票的抬头怎么填"
     assert resp.items[1].source_message_id is None      # 空值归一 None（前端 v-if 判空自隐）
     assert resp.items[1].gap_query is None
+
+
+# ── 批次ε-2 Round1：审核结果通知提交人（accept/reject/retry 三挂点，commit 之后）─────────
+def _spy_result_notify(monkeypatch, conn=None, boom=False):
+    """替换 notify_contribution_result；记录 (cid, outcome, note, error, actor, committed_at_call)。"""
+    calls = []
+
+    def _fake(cid, outcome, note="", error="", actor_id=""):
+        if boom:
+            raise RuntimeError("notify down")
+        calls.append((cid, outcome, note, error, actor_id,
+                      bool(getattr(conn, "committed", False)) if conn is not None else None))
+    monkeypatch.setattr("opensearch_pipeline.admin_notify.notify_contribution_result", _fake)
+    return calls
+
+
+def test_accept_fires_author_result_notify_after_commit(monkeypatch):
+    """采纳直通 → outcome=accepted、actor=审核人；调用时 conn 已 commit（挂点在事务外）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"),
+        claim_rowcount=1, dv_exists=None))
+    calls = _spy_result_notify(monkeypatch, conn=conn)
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(),
+                                      request=None, identity=_ident())
+    assert resp.ok is True
+    assert len(calls) == 1
+    cid, outcome, _n, _e, actor, committed = calls[0]
+    assert (cid, outcome, actor) == ("C1", "accepted", "u1")
+    assert committed is True, "通知必须发生在业务 commit 之后"
+
+
+def test_accept_public_pending_approval_notifies_author_distinctly(monkeypatch):
+    """P2-16 待放行 ≠ 直通：outcome=pending_approval（两种「采纳成功」文案必须可区分）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"),
+        claim_rowcount=1, dv_exists=None))
+    calls = _spy_result_notify(monkeypatch, conn=conn)
+    from opensearch_pipeline import api
+    api.kb_contribution_accept(cid="C1",
+                               req=api.KbContributionAcceptRequest(permission_level="public"),
+                               request=None, identity=_ident())
+    assert [c[1] for c in calls] == ["pending_approval"]
+
+
+def test_reject_fires_author_result_notify_with_note(monkeypatch):
+    """驳回 → outcome=rejected + 理由透传（空理由的兜底句在 admin_notify 侧验证）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    conn = _install_conn(monkeypatch, _FakeConn(contrib_row=("pending", "none", None, "marketing")))
+    calls = _spy_result_notify(monkeypatch, conn=conn)
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_reject(cid="C2", req=api.KbContributionRejectRequest(note="与现行制度冲突"),
+                                      request=None, identity=_ident())
+    assert resp.review_status == "rejected"
+    assert calls == [("C2", "rejected", "与现行制度冲突", "", "u1", True)]
+
+
+def test_reject_idempotent_does_not_renotify(monkeypatch):
+    """已驳回的幂等重驳 → 无状态变化，不重复通知（防重放骚扰作者）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    conn = _install_conn(monkeypatch, _FakeConn(contrib_row=("rejected", "none", None, "marketing")))
+    calls = _spy_result_notify(monkeypatch, conn=conn)
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_reject(cid="C2", req=api.KbContributionRejectRequest(),
+                                      request=None, identity=_ident())
+    assert resp.idempotent is True
+    assert calls == []
+
+
+def test_notify_boom_never_breaks_review_flow(monkeypatch):
+    """真实现 no-raise 端到端：flag 开 + 模块内部（作者查询）炸 → accept 主流程照常返回。
+    挂点裸调不包 try/except 是有意的——best-effort 兜底在 admin_notify 模块内部，此测试
+    走【真】notify_contribution_result 验证该兜底而非 mock 自证。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+
+    def _boom(_cid):
+        raise RuntimeError("db down")
+    monkeypatch.setattr("opensearch_pipeline.admin_notify._contrib_author_question", _boom)
+    _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"),
+        claim_rowcount=1, dv_exists=None))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(cid="C1", req=api.KbContributionAcceptRequest(),
+                                      request=None, identity=_ident())
+    assert resp.ok is True   # 通知内部炸光，审核结果不受影响
+
+
+def test_retry_fires_author_result_notify(monkeypatch):
+    """重试成功 → outcome=accepted（从 failed 恢复也要告知作者）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    _capture_put(monkeypatch, ok=True)
+    doc_id = "DOC_R"
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("accepted", "failed", doc_id,
+                     f"raw/marketing/{doc_id}/UP1/contribution-C3.md", "marketing", "q", "a"),
+        dv_exists=None))
+    calls = _spy_result_notify(monkeypatch, conn=conn)
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_retry(cid="C3", request=None, identity=_ident())
+    assert resp.ok is True
+    assert len(calls) == 1 and calls[0][1] in ("accepted", "pending_approval")

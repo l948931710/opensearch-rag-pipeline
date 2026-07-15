@@ -32,6 +32,8 @@ export interface ContributionItem {
   // 缺口溯源（批次ε-1，后端 additive 透出）：老后端无此字段 → undefined → 徽标自隐
   source_message_id?: string | null
   gap_query?: string | null
+  // 失败原因（批次ε-2）：failed 行透出，作者不再瞎重试；老后端缺字段 → 兜底句
+  ingestion_error?: string | null
 }
 // 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
 // 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。
@@ -181,10 +183,12 @@ async function loadHeroes() {
 }
 
 // ── 弹窗 / 提交 ──
-function openModal(prefill?: { question?: string; dept?: string; sourceMessageId?: string; gapQuery?: string }) {
+// 批次ε-2：prefill 扩展 content（被驳回「修改重交」带旧稿重开表单）；既有调用点（GapList 等）
+// 不传 content → 照旧空白起草，行为不变。
+function openModal(prefill?: { question?: string; content?: string; dept?: string; sourceMessageId?: string; gapQuery?: string }) {
   const s = useSession()
   formQuestion.value = prefill?.question || ''
-  formContent.value = ''
+  formContent.value = prefill?.content || ''
   // 默认归属：缺口建议部门（若合法）→ 否则员工本部门 → 否则第一项
   const own = s.identity?.aclGroups?.[0] || ''
   const valid = (d: string) => CONTRIB_DEPT_OPTS.some((o) => o.id === d)

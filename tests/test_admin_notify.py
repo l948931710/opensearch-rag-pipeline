@@ -262,3 +262,67 @@ def test_contribution_orphan_and_no_kb_admin_still_silent(monkeypatch):
     _wire(monkeypatch, _Conn(dept_admins=[], kb_admins=[]))
     an.notify_contribution("legal", "q?")
     assert sent == []
+
+
+# ── 批次ε-2 Round1：审核结果 → 通知提交人（notify_contribution_result）──────────────
+def _author_conn(author=("emp7", "如何申请生产环境密钥？")):
+    class _RCur(_Cur):
+        def fetchone(self):
+            if "kb_contribution" in self._last:
+                return author
+            return super().fetchone()
+    class _RConn(_Conn):
+        def cursor(self):
+            return _RCur(self)
+    return _RConn()
+
+
+def test_contribution_result_flag_off_noop(monkeypatch):
+    monkeypatch.delenv("RAG_ADMIN_NOTIFY", raising=False)
+    sent = _spy_http(monkeypatch)
+    conn = _author_conn()
+    _wire(monkeypatch, conn)
+    an.notify_contribution_result("C1", "accepted")
+    assert sent == [] and conn.calls == []
+
+
+def test_contribution_result_recipient_is_author_four_wordings_distinct(monkeypatch):
+    """收件人=提交人本人（非管理员名单）；四种 outcome 文案互斥可区分；
+    驳回空理由/失败空原因均有兜底句（绝不拼空串）。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    _wire(monkeypatch, _author_conn())
+    an.notify_contribution_result("C1", "accepted")
+    an.notify_contribution_result("C1", "pending_approval")
+    an.notify_contribution_result("C1", "failed", error="")            # 空原因 → 兜底
+    an.notify_contribution_result("C1", "rejected", note="")           # 空理由 → 兜底
+    an.notify_contribution_result("C1", "rejected", note="与制度冲突")
+    assert len(sent) == 5
+    assert all(p["userid_list"] == "emp7" for _, p in sent)            # 全部发给作者本人
+    texts = [p["msg"]["text"]["content"] for _, p in sent]
+    assert "正在入库" in texts[0] and "放行" not in texts[0]
+    assert "需知识库管理员放行" in texts[1]
+    assert "入库失败" in texts[2] and "系统原因" in texts[2]
+    assert "未被采纳" in texts[3] and "未填写理由" in texts[3] and "重新提交" in texts[3]
+    assert "与制度冲突" in texts[4]
+    assert all("如何申请生产环境密钥" in t for t in texts)
+
+
+def test_contribution_result_self_action_skipped(monkeypatch):
+    """审核人=作者（自采/自驳/作者自己点重试）→ 跳过，自己的操作不通知自己。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    _wire(monkeypatch, _author_conn())
+    an.notify_contribution_result("C1", "accepted", actor_id="emp7")
+    assert sent == []
+
+
+def test_contribution_result_unknown_outcome_or_missing_row_silent(monkeypatch):
+    """未知 outcome / 贡献行不存在（author 查空）→ 静默不发、不炸。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    _wire(monkeypatch, _author_conn())
+    an.notify_contribution_result("C1", "whatever")
+    _wire(monkeypatch, _Conn())          # fetchone 走不到 kb_contribution 分支 → None
+    an.notify_contribution_result("C_MISSING", "accepted")
+    assert sent == []
