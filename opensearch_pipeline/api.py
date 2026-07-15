@@ -49,6 +49,10 @@ from opensearch_pipeline.content_blocks_builder import (
 )
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
 from opensearch_pipeline.rate_limiter import LIMITER, resolve_client_ip
+# 通用能力路径按模块属性访问限流器（0f1b7ea patch 契约：测试 monkeypatch
+# rate_limiter.LIMITER 须对本文件生效；from-import 按值绑定 patch 不到）。
+# 既有 ask/aux 调用点仍用上面的值绑定——其测试打的就是 api.LIMITER，勿动。
+from opensearch_pipeline import rate_limiter as _rate_limiter
 from opensearch_pipeline.answer_flow import (
     ACTION_GENERAL_LLM,
     ACTION_PASSTHROUGH,
