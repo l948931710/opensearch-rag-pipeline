@@ -45,7 +45,7 @@ onMounted(() => {
       <!-- 批次ε-3 R3 口径修正：标签/hint 对齐真实 SQL 口径——「已采纳」实为 searchable 计数
            （标签混淆双生命周期）；「本月」含已驳回未披露；「本季」实为 90 天滚动窗 -->
       <StatCard label="本月提交" :value="s?.this_month ?? '—'" :icon="Sparkles" hint="含待审核、已驳回" />
-      <StatCard label="已入库" :value="s?.answered ?? '—'" :icon="CheckCircle2" tone="text-accent-text" hint="累计可检索条数" />
+      <StatCard label="已入库" :value="s?.answered ?? '—'" :icon="CheckCircle2" tone="text-accent-text" hint="全部时间累计" />
       <StatCard label="贡献者" :value="s?.contributors ?? '—'" :icon="Users" hint="近 90 天有提交" />
     </div>
 

@@ -192,7 +192,7 @@ test.describe('状态可辨 — 待放行/入库受阻（批次ε-3 R1）', () =
 });
 
 test.describe('统计卡口径与窗口标注（批次ε-3 R3）', () => {
-  test('统计卡：已入库(累计可检索)/本月提交(含待审核、已驳回)/贡献者(近 90 天)；缺口卡头+空态带「近 N 天」', async ({ page }) => {
+  test('统计卡：已入库(全部时间累计)/本月提交(含待审核、已驳回)/贡献者(近 90 天)；缺口卡头+空态带「近 N 天」', async ({ page }) => {
     const guard = attachConsoleGuard(page);
     await mockMine(page, { mine: [] });
     await page.route('**/api/kb/gaps*', (r) => r.fulfill({
@@ -202,14 +202,16 @@ test.describe('统计卡口径与窗口标注（批次ε-3 R3）', () => {
     await page.goto(ROUTE);
     // 口径修正后的标签/hint（标签不再把 searchable 计数叫「已采纳」；隐藏口径如实披露）
     await expect(page.getByText('已入库', { exact: true })).toBeVisible();
-    await expect(page.getByText('累计可检索条数')).toBeVisible();
+    await expect(page.getByText('全部时间累计')).toBeVisible();
     await expect(page.getByText('本月提交', { exact: true })).toBeVisible();
     await expect(page.getByText('含待审核、已驳回')).toBeVisible();
     await expect(page.getByText('近 90 天有提交')).toBeVisible();
     await expect(page.getByText('已采纳', { exact: true })).toHaveCount(0);
     // 缺口窗口标注：卡头 + 空态（「全被回答」vs「老缺口过期出窗」此前文案完全相同）
     await expect(page.getByTestId('gap-window-note')).toContainText('近 30 天');
-    await expect(page.getByText('近 30 天内大家的问题都能在知识库里找到答案。')).toBeVisible();
+    // ε-5 R2 空态：标题纳窗 + 出窗免责副题（「全被回答」vs「过期出窗」两成因不再同文案）
+    await expect(page.getByText('近 30 天内暂无未答出的提问')).toBeVisible();
+    await expect(page.getByText('更早的提问已超出统计窗口——不在此列表，不代表已解决。')).toBeVisible();
     guard.assertClean();
   });
 });

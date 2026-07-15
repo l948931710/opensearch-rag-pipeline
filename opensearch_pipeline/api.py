@@ -1959,9 +1959,20 @@ class KbDocStatusResponse(BaseModel):
 _KB_MAX_OFFSET = 10000   # 文档列表分页 offset 上界（全库 ~1600 篇，1 万足够；防巨大 offset 深分页扫表，G7）
 
 
+# 台账徽章输出词表【封闭集】（批次ε-5 R2 seam 锁）：_kb_status_badge 的全部可能返回值。
+# ⚠️ 三处词表人工同步——改这里必须同步：①下方 if 阶梯与 _KB_BADGE_CASE_SQL（parity 测试守）；
+# ②前端 console-app/src/lib/kb.ts 的 BADGE_TONE（含 MyContributions displayState 特判词）；
+# ③封闭集测试 tests/test_kb_endpoints.py::test_kb_status_badge_closed_set（新增/改名分支
+# 未登记进本集合即红，把「漏同步」从静默行为回归降级为 CI 红）。
+_KB_BADGE_VOCAB = frozenset({
+    "已退役", "已隔离", "未入索引", "已上线", "处理失败",
+    "已驳回", "内容未变", "待审核", "排队中", "处理中",
+})
+
+
 def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
                      publish_status=None, chunk_status=None) -> str:
-    """把管线多字段折叠为用户可读态：排队中/处理中/已上线/未入索引/处理失败/内容未变/已隔离/已退役。"""
+    """把管线多字段折叠为用户可读态（输出恒 ∈ _KB_BADGE_VOCAB，封闭集测试锁定）。"""
     cs = (content_status or "").upper()
     ix = (index_status or "").upper()
     if doc_status and str(doc_status).lower() not in ("active", ""):

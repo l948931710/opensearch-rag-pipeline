@@ -68,9 +68,10 @@ function onAnswer(g: GapItem) {
 
     <div v-else-if="loadingGaps" class="px-[18px] py-10 text-center text-sm text-muted-foreground">加载中…</div>
     <div v-else class="px-[18px] py-12 text-center">
-      <p class="text-sm font-medium text-foreground">太棒了，暂无未答出的提问</p>
-      <!-- 空态同样标注窗口：「全被回答」与「老缺口过期出窗」两种情况此前文案完全相同 -->
-      <p class="mt-1 text-xs text-muted-foreground">{{ fmtWindowDays(gapsWindowDays) }}内大家的问题都能在知识库里找到答案。</p>
+      <!-- 空态两成因区分（ε-5 R2 文案方案；出窗计数需 qa hash 列=远期立项）：标题自带窗口限定
+           （单独读标题不再是「全量已解决」的过度承诺），副题明说出窗语义 -->
+      <p class="text-sm font-medium text-foreground">太棒了，{{ fmtWindowDays(gapsWindowDays) }}内暂无未答出的提问</p>
+      <p class="mt-1 text-xs text-muted-foreground">更早的提问已超出统计窗口——不在此列表，不代表已解决。</p>
     </div>
 
     <!-- 截断尾注（批次ε-4）：仅在全集超出 Top 30 时出现，如实披露两口径——杜绝静默截断 -->

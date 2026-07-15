@@ -65,7 +65,10 @@ export const admissionReasonLabel = (r: string) => ADMISSION_REASON_LABEL[r] || 
 // 色彩语义分家（P2 同色复用修复）：待审核=良性管道等待 → 与排队中同 queue 族（原与
 // 未入索引同蓝，异常/正常不可分）；已隔离=安全隔离 → 专属 hold 紫（PII 隔离≠工作流
 // 驳回，原同红）；蓝 warn 从此唯一=未入索引，红 fail=处理失败/已驳回。
-const BADGE_TONE: Record<string, string> = {
+// ⚠️ 词表 seam（批次ε-5 R2）：键集=后端 api.py::_KB_BADGE_VOCAB 封闭集（测试
+// test_kb_status_badge_closed_set 锁后端、contribute.spec「台账词表 seam 锁」锁本表）——
+// 后端新增/改名徽章词必须同步这里 + MyContributions displayState 特判词。
+export const BADGE_TONE: Record<string, string> = {
   已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'queue', 未入索引: 'warn',
   已隔离: 'hold', 处理失败: 'fail', 已驳回: 'fail', 已退役: 'muted', 内容未变: 'muted',
 }
