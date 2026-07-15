@@ -240,8 +240,9 @@ def notify_contribution_result(contribution_id: str, outcome: str, note: str = "
         q = (question or "").strip()
         q = q[:40] + ("…" if len(q) > 40 else "")
         if outcome == "accepted":
+            # 措辞不做无条件承诺：PII 隔离等管线判定发生在本推送之后的异步 DAG 里（ε-3 审计 B-1）
             text = (f"【富岭知识库】你的知识贡献「{q}」已被采纳，正在入库，"
-                    "稍后即可被检索到。感谢贡献！")
+                    "入库完成后即可被检索到。感谢贡献！")
         elif outcome == "pending_approval":
             text = (f"【富岭知识库】你的知识贡献「{q}」已被采纳（全员公开），"
                     "需知识库管理员放行后入库，请留意后续状态。")

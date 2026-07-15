@@ -36,6 +36,9 @@ export interface ContributionItem {
   ingestion_error?: string | null
   // 被引用数（批次ε-2 R2，cited 口径全期窗）：null/undefined=算不出 → 自隐；0=真零照显
   hits?: number | null
+  // 管线徽章（批次ε-3 R1，registering 行）：台账 _kb_status_badge 词表——
+  // 待审核=卡 kb_admin 放行；已隔离/未入索引=死链；缺省/None → 回落默认「已采纳·待入库」
+  doc_badge?: string | null
 }
 // 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
 // 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。

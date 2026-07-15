@@ -15,6 +15,21 @@ const { myContribs, loadErrors, isBusy, loadMine, retryContribution, openModal }
 const expanded = ref<Record<string, boolean>>({})
 function toggleExpand(id: string) { expanded.value = { ...expanded.value, [id]: !expanded.value[id] } }
 
+// 批次ε-3 R1：registering 的展示细分（后端 state 不变，按 doc_badge=台账词表派生）——
+// 待审核=卡 kb_admin 放行（等人）；已隔离/未入索引=管线死链（重试不自愈）；其余回落默认。
+const STALLED_BADGES = new Set(['已隔离', '未入索引'])
+function displayState(c: ContributionItem): string {
+  if (c.state !== 'registering' || !c.doc_badge) return c.state
+  if (c.doc_badge === '待审核') return 'pending_approval'
+  if (STALLED_BADGES.has(c.doc_badge)) return 'ingest_stalled'
+  return c.state
+}
+function stallHint(c: ContributionItem): string {
+  return c.doc_badge === '已隔离'
+    ? '内容触发敏感信息隔离，未能入库——重试不会自愈，请调整内容后重新提交或联系管理员。'
+    : '未能生成可检索内容（内容被整篇隔离或过短），请修改后重新提交或联系管理员。'
+}
+
 // 修改重交：带旧稿+原归属重开贡献弹窗；继承缺口溯源（rejected 行不占缺口坑位，
 // 新提交接上原缺口的关闭链路）。提交走既有 POST（新 contribution_id）。
 function reopen(c: ContributionItem) {
@@ -60,7 +75,7 @@ function reopen(c: ContributionItem) {
               class="rounded bg-accent-soft px-1.5 py-px text-[10.5px] font-medium tabular-nums text-accent-text"
               :title="`这条知识被引用进 ${c.hits} 次回答（累计）`"
             >被引用 {{ c.hits }} 次</span>
-            <ContribBadge :state="c.state" />
+            <ContribBadge :state="displayState(c)" />
             <button
               v-if="c.state === 'failed'" type="button" :disabled="isBusy(`ct:${c.contribution_id}`)"
               class="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
@@ -78,6 +93,16 @@ function reopen(c: ContributionItem) {
           v-if="c.state === 'failed'" data-testid="mycontrib-fail-reason"
           class="mt-1.5 text-[11.5px] leading-relaxed text-st-fail"
         >{{ c.ingestion_error || '入库失败，可重试；反复失败请联系管理员。' }}</p>
+        <!-- 待放行（批次ε-3 R1）：等 kb_admin 放行，非排队卡顿——告诉作者卡在哪 -->
+        <p
+          v-if="displayState(c) === 'pending_approval'" data-testid="mycontrib-approval-hint"
+          class="mt-1.5 text-[11.5px] leading-relaxed text-muted-foreground"
+        >全员公开的贡献需知识库管理员放行后才会入库检索，请耐心等待。</p>
+        <!-- 入库受阻（批次ε-3 R1）：隔离/空块死链——此前与正常排队同显「待入库」，永远等不来 -->
+        <p
+          v-if="displayState(c) === 'ingest_stalled'" data-testid="mycontrib-stall-reason"
+          class="mt-1.5 text-[11.5px] leading-relaxed text-st-fail"
+        >{{ stallHint(c) }}</p>
         <!-- 展开：原稿全文（被驳回后修改重交前先能看到自己写了什么） -->
         <div
           v-if="expanded[c.contribution_id]" data-testid="mycontrib-content"

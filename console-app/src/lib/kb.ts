@@ -80,6 +80,10 @@ export const CONTRIB_STATE: Record<string, { label: string; tone: string }> = {
   searchable: { label: '已入库', tone: 'live' },
   failed: { label: '入库失败', tone: 'fail' },
   rejected: { label: '已驳回', tone: 'fail' },
+  // 批次ε-3 R1：registering 的两个**展示细分**（后端 state 码不变，由 doc_badge 派生）——
+  // 待放行=卡 kb_admin 审批（等人）；入库受阻=隔离/空块死链（重试不自愈，需改稿重投）。
+  pending_approval: { label: '已采纳·待放行', tone: 'busy' },
+  ingest_stalled: { label: '入库受阻', tone: 'fail' },
 }
 export const contribStateLabel = (s: string) => CONTRIB_STATE[s]?.label || s
 export const contribStateTone = (s: string) => CONTRIB_STATE[s]?.tone || 'muted'

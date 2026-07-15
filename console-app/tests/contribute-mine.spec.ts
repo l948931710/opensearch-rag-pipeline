@@ -154,3 +154,39 @@ test.describe('价值反馈 — 被引用数（批次ε-2 R2）', () => {
     expect(names.findIndex((n) => n.includes('李娜'))).toBeLessThan(names.findIndex((n) => n.includes('王伟')));
   });
 });
+
+test.describe('状态可辨 — 待放行/入库受阻（批次ε-3 R1）', () => {
+  test('同为已采纳未入库的四行：待放行/已隔离/未入索引/正常排队 徽章与提示互异', async ({ page }) => {
+    const guard = attachConsoleGuard(page);
+    const REG = (id: string, badge: string | null) => MINE({
+      contribution_id: id, state: 'registering', review_status: 'accepted',
+      ingestion_status: 'registered', doc_id: `D_${id}`, doc_badge: badge,
+    });
+    await mockMine(page, {
+      mine: [REG('a', '待审核'), REG('b', '已隔离'), REG('c', '未入索引'), REG('d', '排队中')],
+    });
+    await page.goto(ROUTE);
+    // 待放行：徽章 + 「找谁」提示
+    await expect(page.getByText('已采纳·待放行')).toBeVisible();
+    await expect(page.getByTestId('mycontrib-approval-hint')).toContainText('知识库管理员放行');
+    // 死链两态：入库受阻徽章 ×2 + 两种互异提示（隔离 vs 空块）
+    await expect(page.getByText('入库受阻')).toHaveCount(2);
+    const stalls = page.getByTestId('mycontrib-stall-reason');
+    await expect(stalls).toHaveCount(2);
+    await expect(stalls.nth(0)).toContainText('敏感信息隔离');
+    await expect(stalls.nth(1)).toContainText('未能生成可检索内容');
+    // 正常排队：回落默认徽章
+    await expect(page.getByText('已采纳·待入库')).toBeVisible();
+    guard.assertClean();
+  });
+
+  test('老后端缺 doc_badge 字段 → 全部回落默认徽章零提示（前向兼容回归）', async ({ page }) => {
+    await mockMine(page, {
+      mine: [MINE({ contribution_id: 'r9', state: 'registering', review_status: 'accepted', ingestion_status: 'registered', doc_id: 'D9', doc_badge: undefined })],
+    });
+    await page.goto(ROUTE);
+    await expect(page.getByText('已采纳·待入库')).toBeVisible();
+    await expect(page.getByTestId('mycontrib-approval-hint')).toHaveCount(0);
+    await expect(page.getByTestId('mycontrib-stall-reason')).toHaveCount(0);
+  });
+});

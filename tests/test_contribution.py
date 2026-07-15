@@ -77,6 +77,11 @@ class _FakeCur:
             if c.boom_hits:
                 raise Exception("simulated hits aggregation failure")
             return c.doc_hits_rows
+        # ε-3 R1 管线徽章派生（标记=document_meta dm——reconcile 的 UPDATE 也含 document_version dv）
+        if "document_version dv" in s and "document_meta dm" in s:
+            if c.boom_badges:
+                raise Exception("simulated badge derivation failure")
+            return c.dv_badge_rows
         if "GROUP BY author_id" in s:
             return c.hero_rows
         if "kb_contribution" in s and "ORDER BY" in s:
@@ -98,6 +103,8 @@ class _FakeConn:
         self.hero_hits_rows = kw.get("hero_hits_rows", [])
         self.doc_hits_rows = kw.get("doc_hits_rows", [])
         self.boom_hits = kw.get("boom_hits", False)
+        self.dv_badge_rows = kw.get("dv_badge_rows", [])
+        self.boom_badges = kw.get("boom_badges", False)
         self.list_rows = kw.get("list_rows", [])
         self.summary = kw.get("summary", {})
         self.calls = []
@@ -906,3 +913,67 @@ def test_mine_hits_failure_honest_none_list_intact(monkeypatch):
     from opensearch_pipeline import api
     resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
     assert len(resp.items) == 1 and resp.items[0].hits is None
+
+
+# ── 批次ε-3 R1：registering 行管线徽章派生（待放行/死链/正常排队 三分可辨）─────────────
+def _reg_row(cid, doc_id):
+    return (cid, f"q-{cid}", "a", "finance", "u1", "张三", "accepted", "registered",
+            doc_id, None, None, None, None, None, None)
+
+
+def test_mine_doc_badge_three_way_distinguishable(monkeypatch):
+    """同为 registering：PENDING_APPROVAL→待审核（卡 kb_admin 放行）、QUARANTINED→已隔离、
+    EMPTY/SKIPPED→未入索引（死链）、NOT_STARTED→排队中（正常）——四者徽章互异（复用
+    _kb_status_badge 台账词表，勿重造窄谓词；此前全部折叠成同一个「已采纳·待入库」）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    rows = [_reg_row("C1", "D1"), _reg_row("C2", "D2"), _reg_row("C3", "D3"), _reg_row("C4", "D4")]
+    conn = _install_conn(monkeypatch, _FakeConn(list_rows=rows, dv_badge_rows=[
+        ("D1", "PENDING_APPROVAL", "NOT_INDEXED", None, None, "active"),
+        ("D2", "DONE", "SUCCESS", "QUARANTINED", None, "active"),
+        ("D3", "DONE", "NOT_INDEXED", "SKIPPED_EXPLOSION", "EMPTY", "active"),
+        ("D4", "NOT_STARTED", "NOT_INDEXED", None, None, "active"),
+    ]))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert [i.doc_badge for i in resp.items] == ["待审核", "已隔离", "未入索引", "排队中"]
+    sql = next(s for s, _ in conn.calls if "document_version dv" in s and "document_meta dm" in s)
+    assert "IN (" in sql and "dv.version_no=1" in sql
+    assert "COLLATE" not in sql   # IN 绑定参数，非跨库列对列 JOIN，无 1267 面
+
+
+def test_mine_doc_badge_missing_row_none_no_500(monkeypatch):
+    """P2-16 时序竞态：registering 行还没有 document_version 行 → doc_badge=None 不 500。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(list_rows=[_reg_row("C1", "D_GONE")], dv_badge_rows=[]))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert resp.items[0].doc_badge is None
+
+
+def test_mine_doc_badge_failure_honest_none_list_intact(monkeypatch):
+    """徽章派生炸 → doc_badge=None、主列表照常（派生信号绝不拖垮主列表）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(list_rows=[_reg_row("C1", "D1")], boom_badges=True))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert len(resp.items) == 1 and resp.items[0].doc_badge is None
+
+
+def test_mine_doc_badge_only_queried_for_registering(monkeypatch):
+    """searchable/pending/rejected 行不触发徽章查询（零成本原则）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    rows = [
+        ("C_S", "q", "a", "finance", "u1", "张三", "accepted", "searchable",
+         "D_S", None, None, None, None, None, None),
+        ("C_P", "q2", "a2", "finance", "u1", "张三", "pending", "none",
+         None, None, None, None, None, None, None),
+    ]
+    conn = _install_conn(monkeypatch, _FakeConn(list_rows=rows))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert all(i.doc_badge is None for i in resp.items)
+    assert not any("document_version dv" in s and "document_meta dm" in s for s, _ in conn.calls)
