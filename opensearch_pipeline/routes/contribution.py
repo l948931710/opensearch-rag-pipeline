@@ -147,6 +147,11 @@ class KbContributionItem(BaseModel):
     ingestion_error: Optional[str] = None
     # 被引用次数（批次ε-2 R2，仅 mine 端点回填；语义同 KbHeroItem.hits：None=算不出，0=真零）
     hits: Optional[int] = None
+    # 管线徽章（批次ε-3 R1，仅 mine 端点对 registering 行回填）：复用台账 _kb_status_badge
+    # 词表（待审核=卡 kb_admin 待放行 / 已隔离·未入索引=管线死链 / 排队中·处理中=正常）。
+    # 作者据此分辨「等人放行」「死局需重投」「正常排队」——此前三者同显「已采纳·待入库」。
+    # None=算不出/无对应版本行（P2-16 时序竞态），前端回落默认徽标。纯读侧派生，不动状态机。
+    doc_badge: Optional[str] = None
 
 
 class KbContributionListResponse(BaseModel):
@@ -512,6 +517,31 @@ def _doc_cited_hits(cur, doc_ids) -> Optional[dict]:
         return None
 
 
+def _contrib_doc_badges(cur, doc_ids) -> Optional[dict]:
+    """doc_id → 台账管线徽章（批次ε-3 R1）。复用 _kb_status_badge（与「文档管理」台账同词表
+    同判定，勿重造窄谓词——PENDING_APPROVAL 之外还有 QUARANTINED/EMPTY/SKIPPED_* 等 reconcile
+    不碰的卡死终态，窄谓词会漏）。document_version⋈document_meta 同库 JOIN + doc_id IN 绑定
+    参数（非跨库列对列 JOIN，天然无 1267 collation 陷阱）。失败→None（诚实「算不出」）。"""
+    ids = [d for d in (doc_ids or []) if d]
+    if not ids:
+        return {}
+    try:
+        from opensearch_pipeline.api import _kb_status_badge
+        ph = ",".join(["%s"] * len(ids))
+        cur.execute(
+            f"SELECT dv.doc_id, dv.content_process_status, dv.index_status,"
+            f" dv.publish_status, dv.chunk_status, dm.status"
+            f" FROM {_kb_db()}.document_version dv"
+            f" LEFT JOIN {_kb_db()}.document_meta dm ON dm.doc_id = dv.doc_id"
+            f" WHERE dv.version_no=1 AND dv.doc_id IN ({ph})",
+            tuple(ids))
+        return {r[0]: _kb_status_badge(r[1], r[2], r[5], None, r[3], r[4])
+                for r in (cur.fetchall() or [])}
+    except Exception as e:   # noqa: BLE001 — 徽章派生绝不拖垮主列表
+        logger.info("贡献管线徽章派生失败（诚实 None）: %s", e)
+        return None
+
+
 @router.get("/api/kb/contributions/mine", response_model=KbContributionListResponse)
 def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
                           identity: Optional[Identity] = Depends(current_identity)):
@@ -543,6 +573,14 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
                 for i in items:
                     if i.doc_id and i.ingestion_status == "searchable":
                         i.hits = hits.get(i.doc_id, 0)
+            # 批次ε-3 R1：registering（已采纳未入库）行回填管线徽章——分辨 待放行/死链/正常排队。
+            # 仅对该态查询（searchable/failed/pending 行零成本）；行缺失（P2-16 竞态）保持 None。
+            badges = _contrib_doc_badges(cur, [i.doc_id for i in items if i.doc_id
+                                               and i.state == "registering"])
+            if badges:
+                for i in items:
+                    if i.doc_id and i.state == "registering":
+                        i.doc_badge = badges.get(i.doc_id)
     finally:
         conn.close()
     has_more = len(rows) > limit

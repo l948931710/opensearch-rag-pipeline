@@ -253,3 +253,51 @@ describe('被引用数展示（批次ε-2 R2）', () => {
     expect(chips[0].text()).toBe('被引用 6 次')
   })
 })
+
+// 批次ε-3 R1：registering 的展示细分（待放行/入库受阻/正常排队）——此前三者同显「已采纳·待入库」
+describe('MyContributions — 管线徽章细分（批次ε-3 R1）', () => {
+  const REG = {
+    contribution_id: 'r1', question: '车间安全巡检表在哪？', content: '在 OA…', category_dept: 'production',
+    author_id: 'u1', author_name: '张三', review_status: 'accepted', ingestion_status: 'registered',
+    state: 'registering', doc_id: 'D1', review_note: '', created_at: '2026-07-01', reviewed_at: '2026-07-02',
+  }
+  function mountRows(rows: any[]) {
+    withSession()
+    useContribute().myContribs.value = rows as never
+    return mount(MyContributions)
+  }
+
+  it('doc_badge=待审核 → 「已采纳·待放行」+ 放行提示；已隔离/未入索引 → 「入库受阻」+ 死链提示（两种文案互异）', () => {
+    const w = mountRows([
+      { ...REG, contribution_id: 'r1', doc_badge: '待审核' },
+      { ...REG, contribution_id: 'r2', doc_badge: '已隔离' },
+      { ...REG, contribution_id: 'r3', doc_badge: '未入索引' },
+    ])
+    expect(w.text()).toContain('已采纳·待放行')
+    expect(w.find('[data-testid="mycontrib-approval-hint"]').text()).toContain('放行')
+    const stalls = w.findAll('[data-testid="mycontrib-stall-reason"]')
+    expect(stalls.length).toBe(2)
+    expect(stalls[0].text()).toContain('敏感信息隔离')
+    expect(stalls[1].text()).toContain('未能生成可检索内容')
+    expect(w.text()).toContain('入库受阻')
+  })
+
+  it('doc_badge=排队中/缺省（老后端）→ 回落默认「已采纳·待入库」，零提示行', () => {
+    const w = mountRows([
+      { ...REG, contribution_id: 'r4', doc_badge: '排队中' },
+      { ...REG, contribution_id: 'r5' },
+    ])
+    expect(w.text()).toContain('已采纳·待入库')
+    expect(w.text()).not.toContain('待放行')
+    expect(w.find('[data-testid="mycontrib-approval-hint"]').exists()).toBe(false)
+    expect(w.find('[data-testid="mycontrib-stall-reason"]').exists()).toBe(false)
+  })
+
+  it('doc_badge 只对 registering 生效：searchable 行即使带值也不细分（状态机词表不越界）', () => {
+    const w = mountRows([
+      { ...REG, contribution_id: 'r6', review_status: 'accepted', ingestion_status: 'searchable', state: 'searchable', doc_badge: '待审核' },
+    ])
+    expect(w.text()).toContain('已入库')
+    expect(w.text()).not.toContain('待放行')
+  })
+})
