@@ -1249,6 +1249,19 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                             covered_pending.add(hh)
                 except Exception as e:
                     fails += 1; logger.warning("kb_gaps 覆盖查询失败: %s", e)
+            # 3.6) 忽略台账（schema/041）：dept_admin「忽略此缺口」的 active 行排除出列表。
+            # 独立降级不进 fails（041 未 apply 时 fail-open 不排除——宁可噪音回来不丢真缺口）。
+            dismissed: Set[str] = set()
+            if agg:
+                try:
+                    hl = list(agg.keys())
+                    ph = ",".join(["%s"] * len(hl))
+                    cur.execute(
+                        f"SELECT question_hash FROM {_op_db()}.qa_gap_dismissal"
+                        f" WHERE revoked_at IS NULL AND question_hash IN ({ph})", tuple(hl))
+                    dismissed = {r[0] for r in (cur.fetchall() or []) if r[0]}
+                except Exception as e:
+                    logger.info("kb_gaps 忽略台账不可用（不排除，non-fatal）: %s", e)
             # 3.5) 语义组映射（schema/040，RAG_QA_GAP_SEMANTIC 默认关）：相似问法展示层
             # 归并的输入。独立 try、不进 fails 500 阈值（漏斗同款先例）；表缺失/查询失败
             # → 空映射=不归并原样展示（fail-open）。归并本身在组装段（纯函数）。
@@ -1279,7 +1292,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
     # 组装：去掉已 searchable 覆盖的缺口；排序 asks desc, days asc；脱敏 + 分页
     open_gaps = []
     for h, e in agg.items():
-        if h in covered_closed:
+        if h in covered_closed or h in dismissed:
             continue
         open_gaps.append({
             "hash": h, "raw": e["raw"], "asks": len(e["msgs"]) or 1, "days": e["days"],
@@ -1297,3 +1310,128 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
     if fails == 0:   # 降级结果（部分子查询失败）不缓存——下一请求重试取全量
         _gaps_cache_put(cache_key, (open_gaps, summary))
     return _page_response(open_gaps, summary)
+
+
+# ── 「忽略此缺口」（schema/041，ε-4 遗留；2026-07-15 用户拍板：交给 dept_admin）────
+class KbGapDismissRequest(BaseModel):
+    question_hash: str = ""
+    question: str = ""     # 展示快照（可选；落 preview 供审计知道忽略了什么）
+    reason: str = ""       # 忽略原因（可选）
+
+
+class KbGapDismissResponse(BaseModel):
+    ok: bool = True
+    affected: int = 0      # 实际落行/恢复的成员 hash 数（语义组联动时可 >1）
+
+
+def _valid_gap_hash(h: str) -> bool:
+    return len(h) == 64 and all(c in "0123456789abcdef" for c in h)
+
+
+def _expand_gap_targets(conn, h: str) -> Set[str]:
+    """语义组联动（RAG_QA_GAP_SEMANTIC 开时）：把动作扩展到同组全部成员——否则归并卡片
+    摘头后其余成员下轮换头复现（打地鼠）。联动查询失败 → 只动单条（fail-open）。
+    新问法（新 hash）不受既往忽略牵连（语义连坐永久静默有意不做，见 schema/041 头注）。"""
+    targets = {h}
+    from opensearch_pipeline.qa_gap_groups import semantic_groups_on
+    if not semantic_groups_on():
+        return targets
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT group_id FROM {_op_db()}.qa_gap_semantic_group"
+                        " WHERE question_hash=%s", (h,))
+            row = cur.fetchone()
+            if row and row[0]:
+                cur.execute(f"SELECT question_hash FROM {_op_db()}.qa_gap_semantic_group"
+                            " WHERE group_id=%s", (row[0],))
+                targets |= {r[0] for r in (cur.fetchall() or []) if r[0]}
+    except Exception as e:   # noqa: BLE001
+        logger.info("忽略缺口语义联动不可用（只动单条，non-fatal）: %s", e)
+    return targets
+
+
+@router.post("/api/kb/gaps/dismiss", response_model=KbGapDismissResponse)
+def kb_gap_dismiss(req: KbGapDismissRequest, request: Request,
+                   identity: Optional[Identity] = Depends(current_identity)):
+    """忽略「待回答」缺口（dept_admin/kb_admin；员工 403）。可撤销留痕（schema/041），
+    重复忽略幂等复活同一行（last action wins）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline import contribution as C
+    h = (req.question_hash or "").strip().lower()
+    if not _valid_gap_hash(h):
+        raise HTTPException(status_code=400, detail="question_hash 非法")
+    trace_id = get_request_id()
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+    except Exception as e:
+        logger.error("kb_gap_dismiss 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"忽略失败 (trace: {trace_id})")
+    try:
+        targets = _expand_gap_targets(conn, h)
+        preview = (C.redact_query_text(req.question) or "")[:512] or None
+        reason = (req.reason or "").strip()[:255] or None
+        with conn.cursor() as cur:
+            for t in sorted(targets):
+                cur.execute(
+                    f"INSERT INTO {_op_db()}.qa_gap_dismissal"
+                    " (question_hash, question_preview, reason, dismissed_by, dismissed_by_name)"
+                    " VALUES (%s,%s,%s,%s,%s)"
+                    " ON DUPLICATE KEY UPDATE revoked_at=NULL, revoked_by=NULL,"
+                    "   reason=VALUES(reason), dismissed_by=VALUES(dismissed_by),"
+                    "   dismissed_by_name=VALUES(dismissed_by_name),"
+                    "   question_preview=COALESCE(VALUES(question_preview), question_preview)",
+                    (t, preview if t == h else None, reason, kb.user_id, kb.name or ""))
+        conn.commit()
+    except Exception as e:
+        logger.error("kb_gap_dismiss 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"忽略失败 (trace: {trace_id})")
+    finally:
+        conn.close()
+    _gaps_cache_clear()   # 忽略即时生效（写路径清缓存惯例）
+    return KbGapDismissResponse(ok=True, affected=len(targets))
+
+
+@router.post("/api/kb/gaps/restore", response_model=KbGapDismissResponse)
+def kb_gap_restore(req: KbGapDismissRequest, request: Request,
+                   identity: Optional[Identity] = Depends(current_identity)):
+    """恢复被忽略的缺口（撤销动作同权限；语义联动与 dismiss 对称——否则撤销只回半组）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    h = (req.question_hash or "").strip().lower()
+    if not _valid_gap_hash(h):
+        raise HTTPException(status_code=400, detail="question_hash 非法")
+    trace_id = get_request_id()
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+    except Exception as e:
+        logger.error("kb_gap_restore 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"恢复失败 (trace: {trace_id})")
+    try:
+        targets = sorted(_expand_gap_targets(conn, h))
+        with conn.cursor() as cur:
+            ph = ",".join(["%s"] * len(targets))
+            cur.execute(
+                f"UPDATE {_op_db()}.qa_gap_dismissal"
+                " SET revoked_at=NOW(), revoked_by=%s"
+                f" WHERE question_hash IN ({ph}) AND revoked_at IS NULL",
+                tuple([kb.user_id] + targets))
+            affected = int(cur.rowcount or 0)
+        conn.commit()
+    except Exception as e:
+        logger.error("kb_gap_restore 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"恢复失败 (trace: {trace_id})")
+    finally:
+        conn.close()
+    _gaps_cache_clear()
+    return KbGapDismissResponse(ok=True, affected=affected)

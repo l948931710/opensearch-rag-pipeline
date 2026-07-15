@@ -113,6 +113,7 @@ MANIFEST="
 038_ontology_object_normalized_title.sql ontology
 039_qa_question_hash.sql operation
 040_qa_gap_semantic_group.sql operation
+041_qa_gap_dismissal.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }
