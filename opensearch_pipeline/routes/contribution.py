@@ -118,8 +118,10 @@ class KbGapsSummary(BaseModel):
     answered: int = 0              # 已入库（searchable）贡献数
     this_month: int = 0           # 本月提交数（含待审核/已驳回——UI hint 如实标注，批次ε-3 R3）
     contributors: int = 0         # 近 90 天有提交的贡献者数
-    # 审核漏斗（批次ε-3 R3，近 30 天按 reviewed_at；列现成纯聚合）：None=算不出/无样本自隐。
-    # 展示位=审核队列头（管理员语境）——员工侧统计卡不放，避免部门审核效率的横向比较联想。
+    # 审核漏斗（批次ε-3 R3；2026-07-15 拍板收敛：**API 层只给管理员**，员工响应恒 None）：
+    # 近 30 天按 reviewed_at，列现成纯聚合；None=算不出/无样本/非管理员。按请求身份在
+    # _page_response 补注，**绝不进共享缓存**（gaps 缓存按 sorted(depts) 跨用户共享，
+    # 进缓存=管理员填的数字漏给同部门员工）。
     review_accept_rate_30d: Optional[float] = None    # accepted/(accepted+rejected)，分母 0→None
     review_avg_hours_30d: Optional[float] = None      # AVG(created_at→reviewed_at)，小时
 
@@ -1001,6 +1003,41 @@ def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depe
     return KbHeroesResponse(items=items)
 
 
+def _gaps_review_funnel(identity) -> dict:
+    """审核漏斗字段（2026-07-15 拍板：API 层只给管理员）。非管理员/算不出 → {}。
+
+    独立小连接、按请求计算——绝不写进 gaps 共享缓存（cache_key 只按 depts，同部门
+    管理员与员工共享缓存条目，进缓存必跨角色泄漏）。失败静默 {}，绝不拖垮 gaps 主路径。"""
+    try:
+        from opensearch_pipeline.api import _require_kb_console
+        _require_kb_console(identity)          # 非管理员 → HTTPException → 走 except 返回 {}
+    except Exception:   # noqa: BLE001
+        return {}
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT SUM(review_status='accepted'), SUM(review_status='rejected'),"
+                    " AVG(TIMESTAMPDIFF(MINUTE, created_at, reviewed_at))"
+                    f" FROM {_op_db()}.kb_contribution"
+                    " WHERE reviewed_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")
+                row = cur.fetchone() or (None, None, None)
+        finally:
+            conn.close()
+        acc, rej = int(row[0] or 0), int(row[1] or 0)
+        out: dict = {}
+        if acc + rej > 0:
+            out["review_accept_rate_30d"] = acc / (acc + rej)
+        if row[2] is not None:
+            out["review_avg_hours_30d"] = round(float(row[2]) / 60.0, 1)
+        return out
+    except Exception as e:   # noqa: BLE001
+        logger.info("kb_gaps 审核漏斗聚合失败（诚实缺省）: %s", e)
+        return {}
+
+
 @router.get("/api/kb/gaps", response_model=KbGapsResponse)
 def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
             identity: Optional[Identity] = Depends(current_identity)):
@@ -1020,12 +1057,17 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
     trace_id = get_request_id()
 
     def _page_response(open_gaps, summary):
-        """分页前全集 → 本页响应（PII 脱敏只做本页，供缓存命中/未命中两路共用）。"""
+        """分页前全集 → 本页响应（PII 脱敏只做本页，供缓存命中/未命中两路共用）。
+        审核漏斗在这里按【请求身份】补注（model_copy 不改缓存对象）——缓存里的 summary
+        永远不带漏斗字段。"""
         page = open_gaps[offset:offset + limit]
         items = [KbGapItem(
             question=C.redact_query_text(g["raw"]), asks=g["asks"], last_days=g["days"],
             dept=g["dept"], kind=g["kind"], question_hash=g["hash"],
             source_message_id=g["msg"], has_pending_contribution=g["pending"]) for g in page]
+        funnel = _gaps_review_funnel(identity)
+        if funnel:
+            summary = summary.model_copy(update=funnel)
         return KbGapsResponse(items=items, summary=summary, has_more=(offset + limit) < len(open_gaps))
 
     # 可见范围只由 depts 决定 → 按 sorted(depts) 键取缓存（同部门用户共享；权限判定在键构造前已完成）
@@ -1140,21 +1182,6 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                 summary.contributors = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_gaps summary 失败: %s", e)
-            # 5) 审核漏斗（批次ε-3 R3；辅助信号——失败只置 None，不计入 fails 的 500 阈值）
-            try:
-                cur.execute(
-                    "SELECT SUM(review_status='accepted'), SUM(review_status='rejected'),"
-                    " AVG(TIMESTAMPDIFF(MINUTE, created_at, reviewed_at))"
-                    f" FROM {_op_db()}.kb_contribution"
-                    " WHERE reviewed_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")
-                row = cur.fetchone() or (None, None, None)
-                acc, rej = int(row[0] or 0), int(row[1] or 0)
-                if acc + rej > 0:
-                    summary.review_accept_rate_30d = acc / (acc + rej)
-                if row[2] is not None:
-                    summary.review_avg_hours_30d = round(float(row[2]) / 60.0, 1)
-            except Exception as e:   # noqa: BLE001
-                logger.info("kb_gaps 审核漏斗聚合失败（诚实 None）: %s", e)
     finally:
         conn.close()
     if fails >= 4:

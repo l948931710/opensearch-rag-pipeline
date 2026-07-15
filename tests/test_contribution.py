@@ -1051,7 +1051,7 @@ def test_gaps_summary_funnel_and_window_days(monkeypatch):
     """近 30 天（按 reviewed_at）采纳率与平均审核时长（分钟→小时）；window_days 下发
     =_CONTRIB_WINDOW_DAYS（前端卡头/空态标注据此渲染，防文案与后端漂移）。"""
     _skip_if_not_sim()
-    _employee(monkeypatch)
+    _dept_admin(monkeypatch)
     conn = _install_conn(monkeypatch, _FakeConn(funnel_row=(8, 2, 1584.0)))
     from opensearch_pipeline import api
     resp = api.kb_gaps(request=None, identity=_ident())
@@ -1065,7 +1065,7 @@ def test_gaps_summary_funnel_and_window_days(monkeypatch):
 def test_gaps_summary_funnel_no_samples_none(monkeypatch):
     """近 30 天无任何审核样本（分母 0）→ 两字段 None 自隐，绝不显 0%/0 小时误导。"""
     _skip_if_not_sim()
-    _employee(monkeypatch)
+    _dept_admin(monkeypatch)
     _install_conn(monkeypatch, _FakeConn(funnel_row=(0, 0, None)))
     from opensearch_pipeline import api
     resp = api.kb_gaps(request=None, identity=_ident())
@@ -1076,9 +1076,33 @@ def test_gaps_summary_funnel_no_samples_none(monkeypatch):
 def test_gaps_summary_funnel_failure_not_counted_to_500(monkeypatch):
     """漏斗聚合炸 → 字段 None、端点照常 200（辅助信号不计入 fails>=4 的 500 阈值）。"""
     _skip_if_not_sim()
-    _employee(monkeypatch)
+    _dept_admin(monkeypatch)
     _install_conn(monkeypatch, _FakeConn(boom_funnel=True))
     from opensearch_pipeline import api
     resp = api.kb_gaps(request=None, identity=_ident())
     assert resp.summary.review_accept_rate_30d is None and resp.summary.review_avg_hours_30d is None
     assert resp.window_days == 30
+
+
+def test_gaps_funnel_admin_only_and_never_cached(monkeypatch):
+    """2026-07-15 拍板：漏斗字段 API 层只给管理员。员工响应恒 None 且不触发聚合查询；
+    共享缓存（按 depts 键，同部门管理员/员工同条目）绝不携带漏斗——按请求身份补注：
+    员工先填缓存 → 管理员命中同一缓存仍拿到漏斗；管理员之后员工再读 → 仍 None。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_KB_GAPS_CACHE_TTL", "60")
+    conn = _install_conn(monkeypatch, _FakeConn(funnel_row=(8, 2, 1584.0)))
+    from opensearch_pipeline import api
+    # ① 员工请求（填缓存）：无漏斗、无聚合查询
+    _employee(monkeypatch)
+    r1 = api.kb_gaps(request=None, identity=_ident())
+    assert r1.summary.review_accept_rate_30d is None
+    assert not any("TIMESTAMPDIFF" in s for s, _ in conn.calls)
+    # ② 管理员命中同一缓存条目（同 depts 键）→ 漏斗按请求身份补注
+    _dept_admin(monkeypatch, managed="marketing")
+    r2 = api.kb_gaps(request=None, identity=_ident())
+    assert r2.summary.review_accept_rate_30d == 0.8
+    assert r2.summary.review_avg_hours_30d == 26.4
+    # ③ 员工再读（缓存已被管理员访问过）→ 仍 None（缓存对象未被污染）
+    _employee(monkeypatch)
+    r3 = api.kb_gaps(request=None, identity=_ident())
+    assert r3.summary.review_accept_rate_30d is None and r3.summary.review_avg_hours_30d is None
