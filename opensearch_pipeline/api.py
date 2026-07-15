@@ -2776,8 +2776,11 @@ kb_contribution_heroes = _routes_contribution.kb_contribution_heroes
 kb_gaps = _routes_contribution.kb_gaps
 KbGapDismissRequest = _routes_contribution.KbGapDismissRequest
 KbGapDismissResponse = _routes_contribution.KbGapDismissResponse
+KbGapDismissedItem = _routes_contribution.KbGapDismissedItem
+KbGapDismissedResponse = _routes_contribution.KbGapDismissedResponse
 kb_gap_dismiss = _routes_contribution.kb_gap_dismiss
 kb_gap_restore = _routes_contribution.kb_gap_restore
+kb_gaps_dismissed = _routes_contribution.kb_gaps_dismissed
 # —— routes/console.py ——
 _NEXT_DIST = _routes_console._NEXT_DIST
 _KB_CONSOLE_HTML_CACHE = _routes_console._KB_CONSOLE_HTML_CACHE

@@ -752,6 +752,33 @@ def test_gap_dismiss_semantic_expansion(monkeypatch):
     assert set(upd[0][1][1:]) == {h1, h2, h3}   # IN 列表覆盖全组
 
 
+def test_gaps_dismissed_list_admin_only_and_rows(monkeypatch):
+    """「已忽略」折叠区数据源：console 管理员可列 active 行（员工 403）；
+    041 未 apply → 诚实空列表不 500。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from opensearch_pipeline import api
+    _install_conn(monkeypatch, _FakeConn())
+    with pytest.raises(Exception) as ei:
+        api.kb_gaps_dismissed(request=None, identity=_ident())
+    assert getattr(ei.value, "status_code", None) == 403
+    _dept_admin(monkeypatch, managed="marketing")
+    import datetime
+    at = datetime.datetime(2026, 7, 15, 10, 0, 0)
+    _install_conn(monkeypatch, _FakeConn(
+        gap_dismissal_rows=[("a" * 64, "怎么开发票", "闲聊噪音", "生产部管理员", at)]))
+    resp = api.kb_gaps_dismissed(request=None, identity=_ident())
+    assert len(resp.items) == 1
+    it = resp.items[0]
+    assert it.question_hash == "a" * 64 and it.question_preview == "怎么开发票"
+    assert it.reason == "闲聊噪音" and it.dismissed_by_name == "生产部管理员"
+    assert it.dismissed_at.startswith("2026-07-15")
+    # 041 未 apply / 查询失败 → 空列表（fail-open）
+    _install_conn(monkeypatch, _FakeConn(boom_dismissal=True))
+    resp2 = api.kb_gaps_dismissed(request=None, identity=_ident())
+    assert resp2.items == []
+
+
 def test_gaps_dismissal_lookup_fails_open(monkeypatch):
     """041 未 apply/查询失败 → 不排除原样展示（宁噪音回来不丢真缺口），绝不 500。"""
     _skip_if_not_sim()

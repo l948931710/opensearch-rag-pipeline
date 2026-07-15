@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { HelpCircle, Clock } from 'lucide-vue-next'
-import { deptLabel, fmtWindowDays, gapKindLabel } from '@/lib/kb'
+import { computed, ref } from 'vue'
+import { HelpCircle, Clock, ChevronRight } from 'lucide-vue-next'
+import { deptLabel, fmtTs, fmtWindowDays, gapKindLabel } from '@/lib/kb'
 import { useContribute, type GapItem } from '@/composables/useContribute'
 import { useDialog } from '@/composables/useDialog'
 import LoadError from '@/components/manage/LoadError.vue'
@@ -14,8 +14,17 @@ import LoadError from '@/components/manage/LoadError.vue'
 // 有当场回路；撤销窗口=至下次 loadGaps，刷新后被读侧排除属预期）。非破坏性可撤销软删
 // → 弹窗不用 danger 红色态（区别于撤销授权类终态动作），原因可空、记录台账。
 const { gaps, gapsSummary, loadingGaps, loadErrors, gapsWindowDays, loadGaps, openModal,
-        canManage, isBusy, dismissGap, restoreGap } = useContribute()
+        canManage, isBusy, dismissGap, restoreGap,
+        dismissedGaps, loadDismissed, restoreDismissed } = useContribute()
 const { promptText } = useDialog()
+
+// 「已忽略」折叠区（2026-07-15 拍板补齐）：刷新后撤销的唯一 UI 入口（行内「撤销」只覆盖
+// 本会话即时误点）。默认收起、展开时才拉取（低频审计动线不抢主列表注意力）；仅 canManage。
+const dismissedOpen = ref(false)
+async function toggleDismissed() {
+  dismissedOpen.value = !dismissedOpen.value
+  if (dismissedOpen.value) await loadDismissed()   // 每次展开取现值（含刚忽略的行）
+}
 
 // 缺口种类是最需要一眼分开的信息：缺文档（红）要新建内容，没答好（琥珀）改进已有内容即可。
 const KIND_PILL: Record<string, string> = {
@@ -115,5 +124,40 @@ async function onDismiss(g: GapItem) {
       v-if="truncated" data-testid="gap-top-note"
       class="border-t border-border px-[18px] py-2.5 text-center text-[11.5px] tabular-nums text-muted-foreground"
     >仅显示询问最多的前 {{ gaps.length }} 条 · 共 {{ totalUnanswered }} 条待回答</div>
+
+    <!-- 「已忽略」折叠区（仅 canManage；员工零节点）：刷新后撤销的唯一 UI 入口。
+         默认收起、展开即拉现值；恢复=restore + 移出本区 + 重拉缺口列表（回到待回答） -->
+    <div v-if="canManage" class="border-t border-border">
+      <button
+        type="button" data-testid="gap-dismissed-toggle" :aria-expanded="dismissedOpen"
+        class="flex w-full items-center gap-1.5 px-[18px] py-2.5 text-left text-[11.5px] font-medium text-faint transition hover:text-muted-foreground"
+        @click="toggleDismissed()"
+      >
+        <ChevronRight :size="12" :stroke-width="2" class="transition-transform" :class="dismissedOpen && 'rotate-90'" />
+        已忽略<template v-if="dismissedOpen">（{{ dismissedGaps.length }}）</template>
+      </button>
+      <div v-if="dismissedOpen">
+        <LoadError class="mx-[18px] mb-2.5" :message="loadErrors['dismissed']" @retry="loadDismissed()" />
+        <div
+          v-for="d in dismissedGaps" :key="d.question_hash" data-testid="gap-dismissed-row"
+          class="flex items-center gap-3 border-t border-border/60 px-[18px] py-2.5"
+        >
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[12.5px] text-muted-foreground">{{ d.question_preview || '（未留问法快照）' }}</div>
+            <div class="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-faint">
+              <span v-if="d.dismissed_by_name">{{ d.dismissed_by_name }} 忽略</span>
+              <span v-if="d.dismissed_at">· {{ fmtTs(d.dismissed_at) }}</span>
+              <span v-if="d.reason" class="truncate">· {{ d.reason }}</span>
+            </div>
+          </div>
+          <button
+            type="button" data-testid="gap-dismissed-restore" :disabled="isBusy(`gap:${d.question_hash}`)"
+            class="shrink-0 rounded-lg border border-border px-3 py-[6px] text-[12px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+            @click="restoreDismissed(d)"
+          >恢复</button>
+        </div>
+        <p v-if="!dismissedGaps.length && !loadErrors['dismissed']" class="px-[18px] pb-3 pt-1 text-[11.5px] text-faint">没有被忽略的缺口。</p>
+      </div>
+    </div>
   </section>
 </template>
