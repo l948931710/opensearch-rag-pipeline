@@ -47,8 +47,14 @@ _CONTRIB_COLS = ("contribution_id, question, content, category_dept, author_id, 
                  "review_status, ingestion_status, doc_id, review_note, created_at, reviewed_at, "
                  "source_message_id, gap_query, "   # 缺口溯源透出（批次ε-1，写侧一直在存）
                  "ingestion_error")                 # 失败原因透出（批次ε-2——作者不再瞎重试）
-_CONTRIB_WINDOW_DAYS = 30
-_CONTRIB_CANDIDATE_CAP = 400   # 每源（NO_RESULT / REFUSAL）拉取的原始候选行上限，再在 py 内归一去重
+# 批次ε-4 拍板解耦：缺口列表与 asks 热度是两套口径，绝不共享常量——
+#   缺口窗 365 天（去「老缺口静默过期」；当下=系统 QA 全量历史，长期保留为增长边界；
+#   真·无窗需 qa_session_log 加 hash 列/缺口物化表=远期立项）；cap 随窗放大。
+#   asks（审核队列「近 30 天被问 N 次」chip）语义=近期热度，必须钉 30 天/400。
+_GAP_WINDOW_DAYS = 365
+_GAP_CANDIDATE_CAP = 2000      # 每源（NO_RESULT / REFUSAL）拉取的原始候选行上限，再在 py 内归一去重
+_CONTRIB_WINDOW_DAYS = 30      # asks 专属（_pending_asks）；勿再喂 kb_gaps
+_CONTRIB_CANDIDATE_CAP = 400   # asks 专属候选上限
 
 # 缺口清单 TTL 缓存（perf#16）：kb_gaps 每次打开贡献页都全量重算两条重查询 + Python 聚合归并，
 # 而可见范围只由用户的 depts 集决定 → 按 sorted(depts) 键缓存分页前的 open_gaps 全集 + summary，
@@ -130,9 +136,9 @@ class KbGapsResponse(BaseModel):
     items: List[KbGapItem] = Field(default_factory=list)
     summary: KbGapsSummary = Field(default_factory=KbGapsSummary)
     has_more: bool = False
-    # 缺口滚动窗（批次ε-3 R3）：后端下发防前端文案与 _CONTRIB_WINDOW_DAYS 漂移——
-    # 老缺口超窗静默消失，「待回答」不是完整积压，卡头/空态据此标注。
-    window_days: int = _CONTRIB_WINDOW_DAYS
+    # 缺口滚动窗（批次ε-3 R3 下发防漂移；ε-4 拍板 365）：默认值必须与查询侧同源同常量——
+    # 只改查询不改这里=「实际查 365 天、响应报 30」的静默失真（ε-4 审计点名的地雷）。
+    window_days: int = _GAP_WINDOW_DAYS
 
 
 class KbContributionItem(BaseModel):
@@ -626,7 +632,8 @@ def _pending_asks(cur, cids) -> Optional[dict]:
     审核队列的【managed_owner_depts】不是同一口径（ε-1 审计裁定弱关联路线有口径分裂）。这里
     按 COALESCE(gap_query_hash, question_hash)（审核人修订过 question 时 gap_query_hash 仍指
     向原始提问）归并统计 NO_RESULT+REFUSAL 两源、_CONTRIB_WINDOW_DAYS 窗口、每源
-    _CONTRIB_CANDIDATE_CAP 上限（与 kb_gaps 同窗同 cap 纪律）。qa_session_log 无 hash 列，
+    _CONTRIB_CANDIDATE_CAP 上限（asks 专属 30 天/400——ε-4 起与 kb_gaps 的 365 天缺口窗解耦，
+    近期热度语义必须钉 30）。qa_session_log 无 hash 列，
     Python 侧 question_hash 归并；REFUSAL 走平查（idx_status_created）——不需要 kb_gaps 的
     qa_docs_join（那个 JOIN 只为算 dept 可见性，计数场景有意不按部门过滤：审核人要的是真实
     热度，纯计数不回传原文无泄露面）。失败→None（诚实「算不出」）；同 hash 同 message 去重。"""
@@ -1052,7 +1059,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
         raise HTTPException(status_code=401, detail="需要登录")
     from opensearch_pipeline import contribution as C, kb_authz
     limit = max(1, min(int(limit or 20), 100)); offset = max(0, int(offset or 0))
-    win = _CONTRIB_WINDOW_DAYS
+    win = _GAP_WINDOW_DAYS
     depts = kb_authz.sanitize_owner_depts(identity.acl_groups)
     trace_id = get_request_id()
 
@@ -1118,7 +1125,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                         "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                         f"   AND q.user_dept IN ({ph})"
                         " ORDER BY q.created_at DESC LIMIT %s",
-                        tuple([win] + depts + [_CONTRIB_CANDIDATE_CAP]))
+                        tuple([win] + depts + [_GAP_CANDIDATE_CAP]))
                     for r in cur.fetchall() or []:
                         _accumulate(r[0], r[1], r[2], r[3], "no_result")
                 except Exception as e:
@@ -1148,7 +1155,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                     " GROUP BY q.message_id"
                     ") t WHERE t.hit_mine=1 OR t.all_public=1"
                     " ORDER BY t.days_ago ASC LIMIT %s",
-                    tuple(params + [_CONTRIB_CANDIDATE_CAP]))
+                    tuple(params + [_GAP_CANDIDATE_CAP]))
                 for r in cur.fetchall() or []:
                     _accumulate(r[0], r[1], r[2], r[3], "refusal")
             except Exception as e:
