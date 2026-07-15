@@ -42,9 +42,11 @@ onMounted(() => {
     <!-- 统计卡 -->
     <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <StatCard label="待回答问题" :value="s?.unanswered ?? '—'" :icon="HelpCircle" tone="text-st-busy" hint="等你来贡献" />
-      <StatCard label="本月贡献" :value="s?.this_month ?? '—'" :icon="Sparkles" hint="含待审核" />
-      <StatCard label="已采纳" :value="s?.answered ?? '—'" :icon="CheckCircle2" tone="text-accent-text" hint="已入库可检索" />
-      <StatCard label="贡献者" :value="s?.contributors ?? '—'" :icon="Users" hint="本季活跃" />
+      <!-- 批次ε-3 R3 口径修正：标签/hint 对齐真实 SQL 口径——「已采纳」实为 searchable 计数
+           （标签混淆双生命周期）；「本月」含已驳回未披露；「本季」实为 90 天滚动窗 -->
+      <StatCard label="本月提交" :value="s?.this_month ?? '—'" :icon="Sparkles" hint="含待审核、已驳回" />
+      <StatCard label="已入库" :value="s?.answered ?? '—'" :icon="CheckCircle2" tone="text-accent-text" hint="累计可检索条数" />
+      <StatCard label="贡献者" :value="s?.contributors ?? '—'" :icon="Users" hint="近 90 天有提交" />
     </div>
 
     <!-- 主区：左缺口列表 / 右审核+我的+英雄榜 -->

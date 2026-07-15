@@ -10,7 +10,7 @@ import { useDialog } from '@/composables/useDialog'
 // 贡献审核队列（审批人侧）：本部门/全库待采纳的员工贡献 → 采纳即合成文档走管线入库，或驳回。
 // 与「待回答」是两件事：这里是【管理员】审别人提交的答案。橙头（待办性质）。
 // 采纳时由部门领导定可见范围：部门公开(dept_internal，默认) / 全员公开(public)。
-const { pendingContribs, pendingHasMore, loadErrors, isBusy, loadPending, acceptContribution, rejectContribution } = useContribute()
+const { pendingContribs, pendingHasMore, gapsSummary, loadErrors, isBusy, loadPending, acceptContribution, rejectContribution } = useContribute()
 const { promptText } = useDialog()
 
 // 每行选定的可见范围（默认部门公开）
@@ -19,6 +19,20 @@ const scope = ref<Record<string, 'dept_internal' | 'public'>>({})
 const session = useSession()
 const isKbAdminRole = computed(() => session.role === 'kb_admin')
 function scopeOf(id: string): 'dept_internal' | 'public' { return scope.value[id] || 'dept_internal' }
+
+// ── 审核漏斗（批次ε-3 R3）：近 30 天采纳率/平均时长——放审核队列头（管理员语境），
+// 有意不进员工侧统计卡（部门审核效率的横向比较联想，展示位留人判断）。算不出→整行自隐。
+const funnelText = computed(() => {
+  const s = gapsSummary.value
+  if (!s) return ''
+  const parts: string[] = []
+  if (s.review_accept_rate_30d != null) parts.push(`采纳率 ${Math.round(s.review_accept_rate_30d * 100)}%`)
+  if (s.review_avg_hours_30d != null) {
+    const h = s.review_avg_hours_30d
+    parts.push(`平均审核 ${h < 48 ? `${Math.round(h)} 小时` : `${(h / 24).toFixed(1)} 天`}`)
+  }
+  return parts.length ? `近 30 天：${parts.join(' · ')}` : ''
+})
 
 // ── 展开全文（批次ε-1 B1）：内容溢出两行截断时才显展开控件（短内容零噪声）。
 // 纯前端态零网络请求；溢出量在挂载/列表变更后量测（无 ResizeObserver——e2e 视口固定，够用）。
@@ -102,6 +116,11 @@ async function onReject(c: ContributionItem) {
           仅显示暂无部门管理员管辖的部门（兜底）；有管辖的部门由对应部门管理员审核
         </span>
       </div>
+      <!-- 审核漏斗（批次ε-3 R3）：管理员语境的效率信号；无样本/算不出 → 整行自隐 -->
+      <div
+        v-if="funnelText" data-testid="contrib-funnel"
+        class="border-b border-border px-[18px] py-2 text-[11.5px] tabular-nums text-muted-foreground"
+      >{{ funnelText }}</div>
       <div
         v-for="c in pendingContribs" :key="c.contribution_id"
         class="border-t border-border px-[18px] py-3 first:border-t-0"

@@ -6,6 +6,7 @@ import { useContribute, __resetContribute } from '@/composables/useContribute'
 import { contribStateLabel, contribStateTone, gapKindLabel, fmtTs } from '@/lib/kb'
 import ContribBadge from '@/components/contribute/ContribBadge.vue'
 import MyContributions from '@/components/contribute/MyContributions.vue'
+import GapList from '@/components/contribute/GapList.vue'
 
 function stubFetch(json: any) {
   vi.stubGlobal('fetch', vi.fn(async () => ({
@@ -299,5 +300,28 @@ describe('MyContributions — 管线徽章细分（批次ε-3 R1）', () => {
     ])
     expect(w.text()).toContain('已入库')
     expect(w.text()).not.toContain('待放行')
+  })
+})
+
+// 批次ε-3 R3：缺口窗口标注（后端下发防漂移）——「待回答」不是完整积压，超窗老缺口静默消失
+describe('GapList — 窗口标注（ε-3 R3）', () => {
+  it('卡头显「近 N 天」（读后端 window_days）；空态同样带窗口语义', async () => {
+    withSession()
+    const { gapsWindowDays } = useContribute()
+    gapsWindowDays.value = 30
+    const w = mount(GapList)
+    expect(w.find('[data-testid="gap-window-note"]').text()).toContain('近 30 天')
+    expect(w.text()).toContain('近 30 天内大家的问题都能在知识库里找到答案')
+  })
+
+  it('loadGaps 收 window_days=14 → 标注跟随；老后端缺字段 → 回落 30', async () => {
+    withSession()
+    stubFetch({ items: [], summary: { unanswered: 0, answered: 0, this_month: 0, contributors: 0 }, has_more: false, window_days: 14 })
+    const { loadGaps, gapsWindowDays } = useContribute()
+    await loadGaps()
+    expect(gapsWindowDays.value).toBe(14)
+    stubFetch({ items: [], summary: { unanswered: 0, answered: 0, this_month: 0, contributors: 0 }, has_more: false })
+    await loadGaps()
+    expect(gapsWindowDays.value).toBe(30)
   })
 })

@@ -116,14 +116,21 @@ class KbGapItem(BaseModel):
 class KbGapsSummary(BaseModel):
     unanswered: int = 0
     answered: int = 0              # 已入库（searchable）贡献数
-    this_month: int = 0           # 本月贡献数（含待审核）
-    contributors: int = 0         # 本季活跃贡献者
+    this_month: int = 0           # 本月提交数（含待审核/已驳回——UI hint 如实标注，批次ε-3 R3）
+    contributors: int = 0         # 近 90 天有提交的贡献者数
+    # 审核漏斗（批次ε-3 R3，近 30 天按 reviewed_at；列现成纯聚合）：None=算不出/无样本自隐。
+    # 展示位=审核队列头（管理员语境）——员工侧统计卡不放，避免部门审核效率的横向比较联想。
+    review_accept_rate_30d: Optional[float] = None    # accepted/(accepted+rejected)，分母 0→None
+    review_avg_hours_30d: Optional[float] = None      # AVG(created_at→reviewed_at)，小时
 
 
 class KbGapsResponse(BaseModel):
     items: List[KbGapItem] = Field(default_factory=list)
     summary: KbGapsSummary = Field(default_factory=KbGapsSummary)
     has_more: bool = False
+    # 缺口滚动窗（批次ε-3 R3）：后端下发防前端文案与 _CONTRIB_WINDOW_DAYS 漂移——
+    # 老缺口超窗静默消失，「待回答」不是完整积压，卡头/空态据此标注。
+    window_days: int = _CONTRIB_WINDOW_DAYS
 
 
 class KbContributionItem(BaseModel):
@@ -1133,6 +1140,21 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                 summary.contributors = int((cur.fetchone() or (0,))[0] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_gaps summary 失败: %s", e)
+            # 5) 审核漏斗（批次ε-3 R3；辅助信号——失败只置 None，不计入 fails 的 500 阈值）
+            try:
+                cur.execute(
+                    "SELECT SUM(review_status='accepted'), SUM(review_status='rejected'),"
+                    " AVG(TIMESTAMPDIFF(MINUTE, created_at, reviewed_at))"
+                    f" FROM {_op_db()}.kb_contribution"
+                    " WHERE reviewed_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")
+                row = cur.fetchone() or (None, None, None)
+                acc, rej = int(row[0] or 0), int(row[1] or 0)
+                if acc + rej > 0:
+                    summary.review_accept_rate_30d = acc / (acc + rej)
+                if row[2] is not None:
+                    summary.review_avg_hours_30d = round(float(row[2]) / 60.0, 1)
+            except Exception as e:   # noqa: BLE001
+                logger.info("kb_gaps 审核漏斗聚合失败（诚实 None）: %s", e)
     finally:
         conn.close()
     if fails >= 4:

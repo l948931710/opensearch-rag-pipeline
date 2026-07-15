@@ -6,7 +6,7 @@ import LoadError from '@/components/manage/LoadError.vue'
 
 // 「待回答」缺口列表：答不出的提问（NO_RESULT 缺文档 / REFUSAL 没答好）。
 // 「回答」打开贡献弹窗并预填该问题；已有贡献待入库的标灰提示、不重复发起。
-const { gaps, loadingGaps, loadErrors, gapsHasMore, loadGaps, openModal } = useContribute()
+const { gaps, loadingGaps, loadErrors, gapsHasMore, gapsWindowDays, loadGaps, openModal } = useContribute()
 
 // 缺口种类是最需要一眼分开的信息：缺文档（红）要新建内容，没答好（琥珀）改进已有内容即可。
 const KIND_PILL: Record<string, string> = {
@@ -25,7 +25,8 @@ function onAnswer(g: GapItem) {
       <span class="text-sm font-semibold text-foreground">待回答</span>
       <span v-if="gaps.length" class="rounded-full bg-panel px-2 py-px text-[11px] font-bold tabular-nums text-muted-foreground">{{ gaps.length }}</span>
       <div class="flex-1" />
-      <span class="hidden text-xs text-muted-foreground sm:inline">来自检索未命中 / 低置信度回答的聚合</span>
+      <!-- 批次ε-3 R3：窗口标注（后端下发防漂移）——超窗老缺口静默过期消失，这不是完整积压 -->
+      <span class="hidden text-xs text-muted-foreground sm:inline" data-testid="gap-window-note">近 {{ gapsWindowDays }} 天检索未命中 / 低置信度回答的聚合</span>
     </div>
 
     <LoadError class="m-[18px]" :message="loadErrors['gaps']" @retry="loadGaps()" />
@@ -59,7 +60,8 @@ function onAnswer(g: GapItem) {
     <div v-else-if="loadingGaps" class="px-[18px] py-10 text-center text-sm text-muted-foreground">加载中…</div>
     <div v-else class="px-[18px] py-12 text-center">
       <p class="text-sm font-medium text-foreground">太棒了，暂无未答出的提问</p>
-      <p class="mt-1 text-xs text-muted-foreground">大家的问题目前都能在知识库里找到答案。</p>
+      <!-- 空态同样标注窗口：「全被回答」与「老缺口过期出窗」两种情况此前文案完全相同 -->
+      <p class="mt-1 text-xs text-muted-foreground">近 {{ gapsWindowDays }} 天内大家的问题都能在知识库里找到答案。</p>
     </div>
 
     <div v-if="gapsHasMore" class="border-t border-border p-3 text-center">

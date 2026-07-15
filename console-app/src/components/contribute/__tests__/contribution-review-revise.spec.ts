@@ -225,3 +225,28 @@ describe('审核队列 — 被问次数 chip（ε-3 R2）', () => {
     expect(w.findAll('[data-testid="contrib-from-gap"]').length).toBe(1)
   })
 })
+
+// 批次ε-3 R3：审核漏斗行（管理员语境；员工侧统计卡有意不放——横向比较联想留人判断）
+describe('审核队列 — 漏斗行（ε-3 R3）', () => {
+  it('有漏斗字段 → 「近 30 天：采纳率 80% · 平均审核 26 小时」；≥48h 换算成天', async () => {
+    const w = await mountQueue([{ ...PENDING, content: '短' }])
+    const { gapsSummary } = useContribute()
+    gapsSummary.value = { unanswered: 0, answered: 0, this_month: 0, contributors: 0, review_accept_rate_30d: 0.8, review_avg_hours_30d: 26.4 }
+    await flushPromises(); await nextTick()
+    expect(w.find('[data-testid="contrib-funnel"]').text()).toBe('近 30 天：采纳率 80% · 平均审核 26 小时')
+    gapsSummary.value = { ...gapsSummary.value!, review_avg_hours_30d: 60 }
+    await nextTick()
+    expect(w.find('[data-testid="contrib-funnel"]').text()).toContain('平均审核 2.5 天')
+  })
+
+  it('字段 null/老后端缺省 → 整行自隐；单字段可算 → 只显可算的半句（诚实降级）', async () => {
+    const w = await mountQueue([{ ...PENDING, content: '短' }])
+    const { gapsSummary } = useContribute()
+    gapsSummary.value = { unanswered: 0, answered: 0, this_month: 0, contributors: 0, review_accept_rate_30d: null, review_avg_hours_30d: null }
+    await nextTick()
+    expect(w.find('[data-testid="contrib-funnel"]').exists()).toBe(false)
+    gapsSummary.value = { ...gapsSummary.value!, review_accept_rate_30d: 0.5 }
+    await nextTick()
+    expect(w.find('[data-testid="contrib-funnel"]').text()).toBe('近 30 天：采纳率 50%')
+  })
+})

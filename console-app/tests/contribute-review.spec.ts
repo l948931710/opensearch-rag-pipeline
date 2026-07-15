@@ -205,3 +205,22 @@ test.describe('贡献审核 — 被问次数（批次ε-3 R2）', () => {
     await expect(page.getByTestId('contrib-from-gap')).toHaveCount(1);
   });
 });
+
+test.describe('贡献审核 — 漏斗行（批次ε-3 R3）', () => {
+  test('gaps summary 带漏斗字段 → 队列头显「近 30 天：采纳率 · 平均审核」；老后端缺字段自隐', async ({ page }) => {
+    await mockContribute(page, { pending: [ITEM({ content: '短' })] });
+    await page.route('**/api/kb/gaps*', (r) => r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ items: [], summary: { unanswered: 0, answered: 0, this_month: 0, contributors: 0, review_accept_rate_30d: 0.78, review_avg_hours_30d: 26.4 }, has_more: false, window_days: 30 }),
+    }));
+    await page.goto(ROUTE);
+    await expect(page.getByTestId('contrib-funnel')).toHaveText('近 30 天：采纳率 78% · 平均审核 26 小时');
+  });
+
+  test('老后端 summary 无漏斗字段 → 漏斗行自隐（前向兼容回归）', async ({ page }) => {
+    await mockContribute(page, { pending: [ITEM({ content: '短' })] });
+    await page.goto(ROUTE);
+    await expect(page.getByText('贡献审核')).toBeVisible();
+    await expect(page.getByTestId('contrib-funnel')).toHaveCount(0);
+  });
+});
