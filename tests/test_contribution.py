@@ -85,6 +85,10 @@ class _FakeCur:
             if c.boom_hits:
                 raise Exception("simulated hits aggregation failure")
             return c.doc_hits_rows
+        if "qa_gap_semantic_group" in s:       # 语义组映射（schema/040）
+            if c.boom_gap_groups:
+                raise Exception("simulated gap group lookup failure")
+            return c.gap_group_rows
         # ε-3 R1 管线徽章派生（标记=document_meta dm——reconcile 的 UPDATE 也含 document_version dv）
         if "document_version dv" in s and "document_meta dm" in s:
             if c.boom_badges:
@@ -125,6 +129,8 @@ class _FakeConn:
         self.boom_asks = kw.get("boom_asks", False)
         self.funnel_row = kw.get("funnel_row", (None, None, None))
         self.boom_funnel = kw.get("boom_funnel", False)
+        self.gap_group_rows = kw.get("gap_group_rows", [])
+        self.boom_gap_groups = kw.get("boom_gap_groups", False)
         self.list_rows = kw.get("list_rows", [])
         self.summary = kw.get("summary", {})
         self.calls = []
@@ -604,6 +610,63 @@ def test_gaps_redaction_and_distinct_and_coverage(monkeypatch):
     assert resp.summary.answered == 7 and resp.summary.this_month == 3
     # 脱敏：手机号那条已关闭，但确保任何展示 question 不含明文手机号
     assert all("13800138000" not in it.question for it in resp.items)
+
+
+def test_gaps_semantic_merge_flag_on(monkeypatch):
+    """语义组归并（schema/040，RAG_QA_GAP_SEMANTIC 开）：相似问法并为一张卡——
+    asks 求和/days 取 min/refusal 优先/phrasings=成员数；卡片 hash=组代表（真实成员，
+    贡献关闭语义不变）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_GAP_SEMANTIC", "true")
+    from opensearch_pipeline import api, contribution as C
+    h1 = C.question_hash("怎么开发票")
+    h2 = C.question_hash("发票怎么开")
+    conn = _install_conn(monkeypatch, _FakeConn(
+        no_result_rows=[("怎么开发票", "n1", 5, "marketing")],
+        refusal_rows=[("发票怎么开", "m1", 2, "marketing")],
+        gap_group_rows=[(h1, h1), (h2, h1)]))
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert len(resp.items) == 1
+    it = resp.items[0]
+    assert it.question_hash == h1                 # 组代表=真实成员 hash
+    assert it.asks == 2 and it.last_days == 2     # 求和 / 取 min
+    assert it.kind == "refusal"                   # refusal 优先
+    assert it.phrasings == 2
+    assert resp.summary.unanswered == 1           # 计数按归并后
+    assert any("qa_gap_semantic_group" in s for s, _ in conn.calls)
+
+
+def test_gaps_semantic_off_by_default(monkeypatch):
+    """flag 缺省关：零行为变化——不发映射查询、不归并（phrasings 恒 1）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.delenv("RAG_QA_GAP_SEMANTIC", raising=False)
+    from opensearch_pipeline import api, contribution as C
+    h1 = C.question_hash("怎么开发票")
+    h2 = C.question_hash("发票怎么开")
+    conn = _install_conn(monkeypatch, _FakeConn(
+        no_result_rows=[("怎么开发票", "n1", 5, "marketing"),
+                        ("发票怎么开", "n2", 2, "marketing")],
+        gap_group_rows=[(h1, h1), (h2, h1)]))   # 有映射也不该被查
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert len(resp.items) == 2
+    assert all(it.phrasings == 1 for it in resp.items)
+    assert not any("qa_gap_semantic_group" in s for s, _ in conn.calls)
+
+
+def test_gaps_semantic_lookup_failure_fails_open(monkeypatch):
+    """映射查询失败（表未 apply/040 缺失）→ 不归并原样展示，绝不 500（漏斗同款独立降级）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_GAP_SEMANTIC", "true")
+    from opensearch_pipeline import api
+    _install_conn(monkeypatch, _FakeConn(
+        no_result_rows=[("怎么开发票", "n1", 5, "marketing"),
+                        ("发票怎么开", "n2", 2, "marketing")],
+        boom_gap_groups=True))
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert len(resp.items) == 2   # 未归并、未 500
 
 
 def test_gaps_requires_login_401(monkeypatch):

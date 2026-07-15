@@ -93,6 +93,8 @@ MANIFEST="
 019_chunk_meta_index_retry.sql knowledge
 020_document_version_simhash.sql knowledge
 021_ingest_quality_metrics.sql knowledge
+039_qa_question_hash.sql operation
+040_qa_gap_semantic_group.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }

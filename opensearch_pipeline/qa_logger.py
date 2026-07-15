@@ -144,6 +144,8 @@ def _upsert_conversation(conn, user_id: str, conversation_id: str, title) -> Non
 # 刷屏 warning（qa_rollup._upsert_daily 的同款 1054 回退无缓存是因为它每天只跑一次）。
 # apply 迁移后重启 serving 进程即恢复携带。
 _GEN_META_COL_MISSING = False
+# schema/039 未 apply 时的进程内负缓存（question_hash 可选列，与 gen_meta 同款纪律）
+_QUESTION_HASH_COL_MISSING = False
 
 
 def log_qa_session(
@@ -325,30 +327,57 @@ def log_qa_session(
                     else:
                         raise
 
-            # P2-20/21/22（schema/018 可选列）：gen_meta_json 不进 base_cols —— legacy 回退
-            # 路径绝不携带（test_qa_logger 的 base_cols↔001/002 DDL 契约不变）。未 apply 时
-            # 首次 1054 → 回退旧列集重试并置进程内负缓存，审计行绝不因新列丢失。
-            global _GEN_META_COL_MISSING
-            gm_cols = ["gen_meta_json"] if (gen_meta_json and not _GEN_META_COL_MISSING) else []
-            gm_vals = [gen_meta_json] if gm_cols else []
-            try:
-                _write_row(base_cols + gm_cols, base_vals + gm_vals)
-            except Exception as ge:
-                gerr = ge.args[0] if getattr(ge, "args", None) and isinstance(ge.args[0], int) else None
-                if gm_cols and gerr == 1054:
-                    if "gen_meta_json" in str(ge):
-                        _GEN_META_COL_MISSING = True
+            # 可选列阶梯（不进 base_cols —— legacy 回退路径绝不携带，test_qa_logger 的
+            # base_cols↔001/002 DDL 契约不变）。未 apply 时 1054 → 摘除该列重试并置进程内
+            # 负缓存，审计行绝不因新列丢失：
+            #   gen_meta_json（P2-20/21/22，schema/018）
+            #   question_hash（缺口语义去重 Layer-1，schema/039）——对【脱敏后落库文本】
+            #     计算 contribution.question_hash（与 kb_gaps Python 归并/asks 平查同口径，
+            #     绝不能挪到 _redact_for_log 之前）。
+            global _GEN_META_COL_MISSING, _QUESTION_HASH_COL_MISSING
+            _OPT_SCHEMA = {"gen_meta_json": "018", "question_hash": "039"}
+            opt_cols: List[str] = []
+            opt_vals: List[Any] = []
+            if gen_meta_json and not _GEN_META_COL_MISSING:
+                opt_cols.append("gen_meta_json")
+                opt_vals.append(gen_meta_json)
+            if query_text and not _QUESTION_HASH_COL_MISSING:
+                try:
+                    from opensearch_pipeline.contribution import question_hash as _qhash_fn
+                    opt_cols.append("question_hash")
+                    opt_vals.append(_qhash_fn(query_text))
+                except Exception:   # noqa: BLE001 — 哈希派生绝不拖垮审计行
+                    pass
+            while True:
+                try:
+                    _write_row(base_cols + opt_cols, base_vals + opt_vals)
+                    break
+                except Exception as ge:
+                    gerr = ge.args[0] if getattr(ge, "args", None) and isinstance(ge.args[0], int) else None
+                    if not opt_cols or gerr != 1054:
+                        raise
+                    # 报错文本点名则精确摘除并置负缓存；未点名（驱动/桩差异）→ 摘除
+                    # 末位可选列重试、不置负缓存（下条日志再探测）——与旧 gen_meta 行为
+                    # 一致（旧代码任意 1054 均回退 base，仅点名时置缓存）。
+                    msg = str(ge)
+                    idx = next((i for i, c in enumerate(opt_cols) if c in msg), len(opt_cols) - 1)
+                    cname = opt_cols.pop(idx)
+                    opt_vals.pop(idx)
+                    if cname in msg:
+                        if cname == "gen_meta_json":
+                            _GEN_META_COL_MISSING = True
+                        else:
+                            _QUESTION_HASH_COL_MISSING = True
                     logger.warning(
-                        "gen_meta_json 列缺失，回退旧列集（请应用 schema/018；本进程不再携带）: "
-                        "message_id=%s, %s", message_id, ge,
+                        "%s 列缺失，回退旧列集（请应用 schema/%s%s）: message_id=%s, %s",
+                        cname, _OPT_SCHEMA.get(cname, "?"),
+                        "；本进程不再携带" if cname in msg else "",
+                        message_id, ge,
                     )
                     try:
                         conn.rollback()
                     except Exception:
                         pass
-                    _write_row(base_cols, base_vals)
-                else:
-                    raise
             logger.info(
                 "qa_session_log 写入成功: message_id=%s, status=%s",
                 message_id, answer_status,
