@@ -837,7 +837,8 @@ def _execute_general_llm(question: str, *, history, tier: str,
       risk_level/risk_blocked · no_result（响应 flag）· source（AskResponse.source）
     """
     actor = f"u:{identity.user_id}" if identity else "ip:anon"
-    denial = LIMITER.admit_general(actor, is_user=bool(identity))
+    # 本文件铁律（见头部注释）：限流器按模块属性访问，不 from-import 按值绑定
+    denial = _rate_limiter.LIMITER.admit_general(actor, is_user=bool(identity))
     if denial is not None:
         text = GENERAL_QUOTA_MESSAGE if denial.reason == "general_quota" \
             else GENERAL_TIER_OFF_MESSAGE
