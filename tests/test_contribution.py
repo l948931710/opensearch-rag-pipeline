@@ -69,6 +69,8 @@ class _FakeCur:
             if c.boom_funnel:
                 raise Exception("simulated funnel failure")
             return c.funnel_row
+        if "SELECT group_id" in s and "qa_gap_semantic_group" in s:   # 忽略联动：查组头
+            return c.gap_group_head_row
         return None
 
     def fetchall(self):
@@ -85,6 +87,12 @@ class _FakeCur:
             if c.boom_hits:
                 raise Exception("simulated hits aggregation failure")
             return c.doc_hits_rows
+        if "qa_gap_dismissal" in s:            # 忽略台账（schema/041）
+            if c.boom_dismissal:
+                raise Exception("simulated dismissal lookup failure")
+            return c.gap_dismissal_rows
+        if "qa_gap_semantic_group" in s and "WHERE group_id=" in s:   # 联动成员展开
+            return c.gap_group_member_rows
         if "qa_gap_semantic_group" in s:       # 语义组映射（schema/040）
             if c.boom_gap_groups:
                 raise Exception("simulated gap group lookup failure")
@@ -131,6 +139,10 @@ class _FakeConn:
         self.boom_funnel = kw.get("boom_funnel", False)
         self.gap_group_rows = kw.get("gap_group_rows", [])
         self.boom_gap_groups = kw.get("boom_gap_groups", False)
+        self.gap_dismissal_rows = kw.get("gap_dismissal_rows", [])
+        self.boom_dismissal = kw.get("boom_dismissal", False)
+        self.gap_group_head_row = kw.get("gap_group_head_row")
+        self.gap_group_member_rows = kw.get("gap_group_member_rows", [])
         self.list_rows = kw.get("list_rows", [])
         self.summary = kw.get("summary", {})
         self.calls = []
@@ -667,6 +679,88 @@ def test_gaps_semantic_lookup_failure_fails_open(monkeypatch):
         boom_gap_groups=True))
     resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
     assert len(resp.items) == 2   # 未归并、未 500
+
+
+def test_gap_dismiss_employee_403_and_bad_hash_400(monkeypatch):
+    """「忽略此缺口」权限=console 管理员（2026-07-15 拍板交 dept_admin）：员工恒 403；
+    非法 hash 400（不落库）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from opensearch_pipeline import api
+    _install_conn(monkeypatch, _FakeConn())
+    with pytest.raises(Exception) as ei:
+        api.kb_gap_dismiss(req=api.KbGapDismissRequest(question_hash="a" * 64),
+                           request=None, identity=_ident())
+    assert getattr(ei.value, "status_code", None) == 403
+    _dept_admin(monkeypatch, managed="marketing")
+    with pytest.raises(Exception) as ei:
+        api.kb_gap_dismiss(req=api.KbGapDismissRequest(question_hash="不是hash"),
+                           request=None, identity=_ident())
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_gap_dismiss_then_gaps_excluded(monkeypatch):
+    """dept_admin 忽略：落台账（可撤销 upsert）+ kb_gaps 排除 active 行。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    monkeypatch.delenv("RAG_QA_GAP_SEMANTIC", raising=False)
+    from opensearch_pipeline import api, contribution as C
+    h1 = C.question_hash("怎么开发票")
+    conn = _install_conn(monkeypatch, _FakeConn())
+    resp = api.kb_gap_dismiss(
+        req=api.KbGapDismissRequest(question_hash=h1, question="怎么开发票", reason="闲聊噪音"),
+        request=None, identity=_ident())
+    assert resp.ok is True and resp.affected == 1
+    ins = [(s, p) for s, p in conn.calls if "qa_gap_dismissal" in s and "INSERT" in s]
+    assert len(ins) == 1
+    s, p = ins[0]
+    assert "ON DUPLICATE KEY UPDATE revoked_at=NULL" in s   # 重复忽略=复活同一行
+    assert p[0] == h1 and p[3] == "u1"                      # hash + 操作人
+    # 读侧排除：忽略台账返回该 hash → 不再出现在待回答
+    _employee(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(
+        no_result_rows=[("怎么开发票", "n1", 2, "marketing"),
+                        ("食堂几点开门", "n2", 1, "marketing")],
+        gap_dismissal_rows=[(h1,)]))
+    gaps = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    hashes = {it.question_hash for it in gaps.items}
+    assert h1 not in hashes and len(gaps.items) == 1
+    assert gaps.summary.unanswered == 1
+
+
+def test_gap_dismiss_semantic_expansion(monkeypatch):
+    """语义组开：忽略扩展到同组全部成员（否则归并卡摘头后换头复现=打地鼠）；
+    restore 对称扩展。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    monkeypatch.setenv("RAG_QA_GAP_SEMANTIC", "true")
+    from opensearch_pipeline import api
+    h1, h2, h3 = "1" * 64, "2" * 64, "3" * 64
+    conn = _install_conn(monkeypatch, _FakeConn(
+        gap_group_head_row=(h1,), gap_group_member_rows=[(h1,), (h2,), (h3,)]))
+    resp = api.kb_gap_dismiss(req=api.KbGapDismissRequest(question_hash=h1),
+                              request=None, identity=_ident())
+    assert resp.affected == 3
+    ins = [s for s, _ in conn.calls if "qa_gap_dismissal" in s and "INSERT" in s]
+    assert len(ins) == 3
+    conn2 = _install_conn(monkeypatch, _FakeConn(
+        gap_group_head_row=(h1,), gap_group_member_rows=[(h1,), (h2,), (h3,)]))
+    api.kb_gap_restore(req=api.KbGapDismissRequest(question_hash=h1),
+                       request=None, identity=_ident())
+    upd = [(s, p) for s, p in conn2.calls if "qa_gap_dismissal" in s and "revoked_at=NOW()" in s]
+    assert len(upd) == 1
+    assert set(upd[0][1][1:]) == {h1, h2, h3}   # IN 列表覆盖全组
+
+
+def test_gaps_dismissal_lookup_fails_open(monkeypatch):
+    """041 未 apply/查询失败 → 不排除原样展示（宁噪音回来不丢真缺口），绝不 500。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from opensearch_pipeline import api
+    _install_conn(monkeypatch, _FakeConn(
+        no_result_rows=[("怎么开发票", "n1", 2, "marketing")], boom_dismissal=True))
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert len(resp.items) == 1
 
 
 def test_gaps_requires_login_401(monkeypatch):

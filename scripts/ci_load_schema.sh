@@ -95,6 +95,7 @@ MANIFEST="
 021_ingest_quality_metrics.sql knowledge
 039_qa_question_hash.sql operation
 040_qa_gap_semantic_group.sql operation
+041_qa_gap_dismissal.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }
