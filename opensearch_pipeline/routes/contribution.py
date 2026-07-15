@@ -683,7 +683,10 @@ def _contrib_pending_scope_sql(kb) -> tuple:
     """
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
     if kb.role == ROLE_KB_ADMIN:
-        return (" AND category_dept NOT IN (SELECT DISTINCT managed_owner_dept"
+        # 跨库比较（category_dept 在 fuling_operation / dept_admin_grant 在 fuling_knowledge）：
+        # 显式 COLLATE 钉死子查询输出为 unicode_ci，防任一表 collation 漂移触发 1267
+        # （2026-07-15 现网：生产 dept_admin_grant 历史建于 0900_ai_ci，kb_admin 看审核队列全 500）。
+        return (" AND category_dept NOT IN (SELECT DISTINCT managed_owner_dept COLLATE utf8mb4_unicode_ci"
                 f" FROM {_kb_db()}.dept_admin_grant WHERE is_active=1)"), []
     return _kb_owner_scope_sql(kb, "category_dept")
 
