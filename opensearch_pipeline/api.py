@@ -9,6 +9,7 @@ api.py — RAG 问答 FastAPI 应用
   GET  /api/health        健康检查
 """
 
+import itertools
 import json
 import logging
 import os
@@ -49,13 +50,33 @@ from opensearch_pipeline.content_blocks_builder import (
 from opensearch_pipeline.auth_token import issue_session_token, verify_session_token
 from opensearch_pipeline.rate_limiter import LIMITER, resolve_client_ip
 from opensearch_pipeline.answer_flow import (
+    ACTION_GENERAL_LLM,
+    ACTION_PASSTHROUGH,
+    ACTION_SENSITIVE_BLOCK,
+    ACTION_SMALLTALK,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
+    GENERAL_QUOTA_MESSAGE,
+    GENERAL_TIER_OFF_MESSAGE,
     NO_RESULT_MESSAGE,
+    REALTIME_BLOCK_MESSAGE,
+    SENSITIVE_BLOCK_MESSAGE,
+    build_failure_action,
     build_qa_log_kwargs,
     history_answer_text,
     is_refusal_answer,
     should_append_history,
+    suggest_titles,
+)
+from opensearch_pipeline.general_answerer import CANNED_SMALLTALK, answer_general
+from opensearch_pipeline.intent_router import (
+    ROUTE_KB,
+    ROUTE_OFFICE,
+    ROUTE_REALTIME,
+    ROUTE_SENSITIVE,
+    ROUTE_SMALLTALK,
+    pre_route,
+    triage_failed_query,
 )
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.db import DBPoolExhausted
@@ -328,6 +349,9 @@ class AskResponse(BaseModel):
     # 「换个说法」建议（仅 no_result=True 时非空）：优先近 30 天 SUCCESS 过的相似
     # 真实问题（可答性有保证），不足回退清洗版原问题。空结果卡的逃生出口。
     rephrase: List[str] = []
+    # 回答来源（通用能力分级开放）："kb" 知识库（默认，存量客户端无感）｜"smalltalk" 寒暄
+    # 模板｜"general" 通用助手（含确定性计算）｜"guard" 引导/拦截话术。
+    source: str = "kb"
 
 
 class SearchResult(BaseModel):
@@ -664,14 +688,10 @@ def search(req: SearchRequest, request: Request,
     )
 
 
-def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
-                 request: Optional[Request] = None, cosurface_images: bool = False):
-    """/api/ask 与 /api/ask/stream 共用的前置段：会话管理、客户端历史合并、
-    身份/部门解析（仅信 Bearer 令牌）、检索 + 计时。
-
-    检索失败统一抛 HTTPException(500)（流式端点也要求在返回 StreamingResponse 之前抛出）。
-    retrieve_and_enrich 经本模块全局名调用，保持测试 monkeypatch(api.retrieve_and_enrich) 接缝。
-    """
+def _prepare_session(req: AskRequest, identity: Optional["Identity"], *,
+                     request: Optional[Request] = None):
+    """_prepare_ask 的检索前段：会话管理、客户端历史合并、身份/部门解析（仅信 Bearer
+    令牌）。单独成函数供通用能力前置路由复用（命中 T0/T1/T2 时跳过检索但会话语义不变）。"""
     # 会话归属校验：'miniapp:<staffId>' 是可预测命名空间（chat.js 用 'miniapp:'+userId 构造），
     # 必须校验令牌归属，防止匿名/他人读取或污染他人会话上下文（与 /api/session/clear 同策略）。
     # 前缀检查保留：它挡的是"条目尚不存在时抢注他人 miniapp 命名空间"，owner 绑定挡不了。
@@ -704,6 +724,19 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
     uid = identity.user_id if identity else _anon_uid(request)
     # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
     user_dept = identity.acl_groups if identity else None
+    return t0, session_id, merged_history, uid, user_dept
+
+
+def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
+                 request: Optional[Request] = None, cosurface_images: bool = False):
+    """/api/ask 与 /api/ask/stream 共用的前置段：会话管理、客户端历史合并、
+    身份/部门解析（仅信 Bearer 令牌）、检索 + 计时。
+
+    检索失败统一抛 HTTPException(500)（流式端点也要求在返回 StreamingResponse 之前抛出）。
+    retrieve_and_enrich 经本模块全局名调用，保持测试 monkeypatch(api.retrieve_and_enrich) 接缝。
+    """
+    (t0, session_id, merged_history, uid, user_dept) = _prepare_session(
+        req, identity, request=request)
 
     # 2. 检索
     try:
@@ -719,6 +752,176 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
     t_retrieval = time.time()
     retrieval_latency_ms = int((t_retrieval - t0) * 1000)
     return t0, session_id, merged_history, uid, user_dept, chunks, t_retrieval, retrieval_latency_ms
+
+
+# ═══════════════════════════════════════════════════════════════
+# 通用能力分级开放（intent_router / general_answerer / answer_flow 的链路适配层，
+# 设计见 docs/general_ability_opening_design.md）。RAG_GENERAL_ABILITY_MODE 与
+# RAG_GUIDED_REFUSAL 双关时以下任何函数都不进入决策分支 —— 行为与现状一致。
+# ═══════════════════════════════════════════════════════════════
+
+def _general_flags():
+    """(mode, guided_on, feature_on) 快照。mode 非法值视同 off。"""
+    cfg = get_config().rag
+    mode = (cfg.general_ability_mode or "off").lower()
+    if mode not in ("smalltalk", "office", "full"):
+        mode = "off"
+    guided_on = bool(cfg.guided_refusal)
+    return mode, guided_on, (mode != "off" or guided_on)
+
+
+def _execute_general_llm(question: str, *, history, tier: str,
+                         identity: Optional[Identity]) -> Optional[Dict[str, Any]]:
+    """T2/T3 通用 LLM 回答执行（含日配额准入）。返回 outcome dict；
+    LLM 异常 → None（调用方回落今日行为 —— fail-safe）。
+
+    outcome 契约（本文件三处消费：/api/ask、/api/ask/stream、失败序列）：
+      answer/model/usage · answer_status（None=调用方维持原状态）· intent_type ·
+      risk_level/risk_blocked · no_result（响应 flag）· source（AskResponse.source）
+    """
+    actor = f"u:{identity.user_id}" if identity else "ip:anon"
+    denial = LIMITER.admit_general(actor, is_user=bool(identity))
+    if denial is not None:
+        text = GENERAL_QUOTA_MESSAGE if denial.reason == "general_quota" \
+            else GENERAL_TIER_OFF_MESSAGE
+        return {"answer": text, "model": "N/A", "usage": {},
+                "answer_status": None, "intent_type": "refuse_quota",
+                "risk_level": None, "risk_blocked": False,
+                "no_result": True, "source": "guard"}
+    try:
+        result = answer_general(question, history=history, tier=tier)
+    except Exception as e:
+        logger.warning("通用回答生成失败（回落知识库拒答行为）: %s", e)
+        return None
+    intent = "general" if tier == "general" else "office"
+    return {"answer": result["answer"], "model": result["model"],
+            "usage": result.get("usage") or {},
+            "answer_status": "SUCCESS", "intent_type": intent,
+            "risk_level": None, "risk_blocked": False,
+            "no_result": False, "source": "general"}
+
+
+def _general_pre_route_decision(req: AskRequest,
+                                identity: Optional[Identity]) -> Optional[Dict[str, Any]]:
+    """前置确定性路由（检索之前，KB 主路径零延迟）。None = 照常走知识库。
+
+    命中路由的执行：T0① 敏感 → BLOCKED canned；T0③ 实时信息 → 边界说明；
+    T1 → canned 模板（零 LLM）；T2 → 确定性计算 / quick 档通用回答（经日配额）。
+    T2 执行失败回落知识库（返回 None）。检索从未发生 —— 落库 chunks=None。
+    """
+    mode, _guided_on, _on = _general_flags()
+    if mode == "off":
+        return None
+    user_dept = identity.acl_groups if identity else None
+    decision = pre_route(req.question, is_user=bool(identity), user_dept=user_dept)
+    if decision.route == ROUTE_KB:
+        return None
+    if decision.route == ROUTE_SENSITIVE:
+        return {"answer": SENSITIVE_BLOCK_MESSAGE, "model": "N/A", "usage": {},
+                "answer_status": "BLOCKED", "intent_type": "refuse_sensitive",
+                "risk_level": "sensitive", "risk_blocked": True,
+                "no_result": False, "source": "guard"}
+    if decision.route == ROUTE_REALTIME:
+        # SUCCESS + intent 标注（非 NO_RESULT/REFUSAL：实时信息不是知识库缺口，
+        # 不能污染 contribution 缺口挖掘与 SLO 口径；下同 refuse_quota）
+        return {"answer": REALTIME_BLOCK_MESSAGE, "model": "N/A", "usage": {},
+                "answer_status": "SUCCESS", "intent_type": "refuse_realtime",
+                "risk_level": None, "risk_blocked": False,
+                "no_result": False, "source": "guard"}
+    if decision.route == ROUTE_SMALLTALK:
+        text = CANNED_SMALLTALK.get(decision.sub) or CANNED_SMALLTALK["capability"]
+        return {"answer": text, "model": "canned", "usage": {},
+                "answer_status": "SUCCESS", "intent_type": "smalltalk",
+                "risk_level": None, "risk_blocked": False,
+                "no_result": False, "source": "smalltalk"}
+    if decision.route == ROUTE_OFFICE:
+        outcome = _execute_general_llm(req.question, history=None, tier="office",
+                                       identity=identity)
+        if outcome is not None and outcome["answer_status"] is None:
+            outcome["answer_status"] = "SUCCESS"   # 前置路径无"原状态"可维持（配额话术）
+        return outcome
+    return None
+
+
+def _general_failure_outcome(question: str, chunks, *, identity: Optional[Identity],
+                             user_dept, history) -> Optional[Dict[str, Any]]:
+    """知识库失败（检索为空 / LLM 拒答）后的统一失败序列：
+    分诊（intent_router，fail-closed）→ 决策（answer_flow.build_failure_action，纯函数）
+    → 执行（canned / 通用 LLM / 引导话术）。返回 None = 维持今日行为。
+
+    不变量 I2 由 build_failure_action 保证：enterprise 永不产生 general_llm。
+    """
+    mode, guided_on, feature_on = _general_flags()
+    if not feature_on:
+        return None
+    titles = suggest_titles(chunks)
+    category = triage_failed_query(question, titles)
+    rephrase = [] if titles else _suggest_rephrase(question, user_dept=user_dept)
+    act = build_failure_action(category, mode=mode, guided_on=guided_on,
+                               titles=titles, rephrase=rephrase)
+    if act["action"] == ACTION_PASSTHROUGH:
+        return None
+    if act["action"] == ACTION_SENSITIVE_BLOCK:
+        return {"answer": act["text"], "model": "N/A", "usage": {},
+                "answer_status": "BLOCKED", "intent_type": act["intent_type"],
+                "risk_level": "sensitive", "risk_blocked": True,
+                "no_result": False, "source": "guard"}
+    if act["action"] == ACTION_SMALLTALK:
+        return {"answer": CANNED_SMALLTALK["capability"], "model": "canned", "usage": {},
+                "answer_status": "SUCCESS", "intent_type": act["intent_type"],
+                "risk_level": None, "risk_blocked": False,
+                "no_result": False, "source": "smalltalk"}
+    if act["action"] == ACTION_GENERAL_LLM:
+        outcome = _execute_general_llm(question, history=history, tier=act["tier"],
+                                       identity=identity)
+        if outcome is None and guided_on:
+            # LLM 失败且引导话术开启：给引导出口而非干拒（answer_status 维持原状态）
+            return {"answer": GENERAL_TIER_OFF_MESSAGE, "model": "N/A", "usage": {},
+                    "answer_status": None, "intent_type": "refuse_uncovered_general",
+                    "risk_level": None, "risk_blocked": False,
+                    "no_result": True, "source": "guard"}
+        return outcome
+    # ACTION_GUIDED_REFUSAL：answer_status=None —— 空结果分支维持 NO_RESULT、
+    # 拒答分支维持 REFUSAL（contribution 缺口挖掘口径零漂移）
+    return {"answer": act["text"], "model": "N/A", "usage": {},
+            "answer_status": None, "intent_type": act["intent_type"],
+            "risk_level": None, "risk_blocked": False,
+            "no_result": True, "source": "guard"}
+
+
+_STREAM_GATE_HEAD_CHARS = 48
+
+
+def _gate_probe(event_iter):
+    """低置信带流式门控探针（评审补充 5）：消费事件直到能裁决"开场是否拒答句式"。
+
+    拒答开场判定窗是前 30 字符（answer_flow.is_refusal_answer），缓冲 48 字符足够裁决；
+    正常回答（低置信带小流量段）仅首帧延迟到 48 字符/生成结束，其后逐帧透传。
+    返回 (verdict, held_events, event_iter)；verdict=True 表示开场命中拒答句式，
+    调用方走统一失败序列改道（held 事件丢弃），False 则按原序 flush held + 透传。
+    parse_sse_data_frame / is_refusal_answer 均为纯函数不抛异常 —— 探针自身不引入新故障面。
+    """
+    held: List[str] = []
+    head_parts: List[str] = []
+    decided = False
+    verdict = False
+    for event in event_iter:
+        held.append(event)
+        frame = parse_sse_data_frame(event)
+        if frame is not None and frame.get("type") == "chunk" and frame.get("content"):
+            head_parts.append(frame["content"])
+            if len("".join(head_parts)) >= _STREAM_GATE_HEAD_CHARS:
+                verdict = is_refusal_answer("".join(head_parts))
+                decided = True
+                break
+        elif frame is not None and frame.get("type") in ("done", "error"):
+            # 未攒够 48 字符流就结束（短回答/异常帧）：按已有开场裁决
+            verdict = is_refusal_answer("".join(head_parts))
+            decided = True
+            break
+    if not decided:
+        verdict = is_refusal_answer("".join(head_parts))
+    return verdict, held, event_iter
 
 
 @app.post("/api/ask", response_model=AskResponse)
@@ -737,12 +940,94 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
     # 防刷准入：须在 _prepare_ask（embedding/HA3/rerank 开销）之前拒绝
     _enforce_rate_limit(request, identity, scope="ask",
                         thinking=bool(req.thinking), count_llm=True)
+
+    # 通用能力前置路由（RAG_GENERAL_ABILITY_MODE，默认 off 时 _general_pre_route_decision
+    # 恒 None）：显而易见的寒暄/办公祈使/敏感/实时信息在检索之前分流 —— KB 主路径零延迟。
+    _t0_pre = time.time()   # T2 的 LLM 调用发生在 _prepare_session 之前，计时起点在此
+    pre = _general_pre_route_decision(req, identity)
+    if pre is not None:
+        (_t0_sess, session_id, _merged_history, uid, user_dept) = _prepare_session(
+            req, identity, request=request)
+        latency = int((time.time() - _t0_pre) * 1000)
+        msg_id = generate_message_id()
+        if should_append_history(pre["answer"], pre["answer_status"] or "SUCCESS"):
+            _append_to_history(session_id, req.question, history_answer_text(pre["answer"]),
+                               owner=identity.user_id if identity else None)
+        background_tasks.add_task(log_qa_session, **build_qa_log_kwargs(
+            session_id=session_id,
+            conversation_id=req.conversation_id,
+            message_id=msg_id,
+            question=req.question,
+            user_id=uid,
+            user_name=(identity.name or None) if identity else None,
+            user_dept=user_dept,
+            answer_text=pre["answer"],
+            chunks=None,   # 检索未发生（命中数/分数如实缺席）
+            latency_ms=latency,
+            answer_status=pre["answer_status"] or "SUCCESS",
+            model_name=pre["model"],
+            intent_type=pre["intent_type"],
+            risk_level=pre["risk_level"],
+            risk_blocked=pre["risk_blocked"],
+        ))
+        return AskResponse(
+            answer=pre["answer"],
+            sources=[],
+            session_id=session_id,
+            message_id=msg_id,
+            model=pre["model"],
+            usage=pre["usage"],
+            latency_ms=latency,
+            no_result=pre["no_result"],
+            source=pre["source"],
+        )
+
     (t0, session_id, merged_history, uid, user_dept,
      chunks, t_retrieval, retrieval_latency_ms) = _prepare_ask(req, identity, request=request)
 
     if not chunks:
+        # 统一失败序列（检索为空）：分诊 → 通用回答 / 引导式拒答；flag 全关 → None（现状）
+        outcome = _general_failure_outcome(req.question, [], identity=identity,
+                                           user_dept=user_dept, history=merged_history)
         latency = int((time.time() - t0) * 1000)
         msg_id = generate_message_id()
+        if outcome is not None:
+            status = outcome["answer_status"] or "NO_RESULT"
+            if should_append_history(outcome["answer"], status):
+                _append_to_history(session_id, req.question,
+                                   history_answer_text(outcome["answer"]),
+                                   owner=identity.user_id if identity else None)
+            background_tasks.add_task(log_qa_session, **build_qa_log_kwargs(
+                session_id=session_id,
+                conversation_id=req.conversation_id,
+                message_id=msg_id,
+                question=req.question,
+                user_id=uid,
+                user_name=(identity.name or None) if identity else None,
+                user_dept=user_dept,
+                answer_text=outcome["answer"],
+                chunks=[],
+                latency_ms=latency,
+                retrieval_latency_ms=retrieval_latency_ms,
+                answer_status=status,
+                model_name=outcome["model"],
+                intent_type=outcome["intent_type"],
+                risk_level=outcome["risk_level"],
+                risk_blocked=outcome["risk_blocked"],
+            ))
+            return AskResponse(
+                answer=outcome["answer"],
+                sources=[],
+                session_id=session_id,
+                message_id=msg_id,
+                model=outcome["model"],
+                usage=outcome["usage"],
+                latency_ms=int((time.time() - t0) * 1000),
+                no_result=outcome["no_result"],
+                rephrase=(_suggest_rephrase(req.question, user_dept=user_dept)
+                          if outcome["no_result"] else []),
+                source=outcome["source"],
+            )
         background_tasks.add_task(log_qa_session, **build_qa_log_kwargs(
             session_id=session_id,
             conversation_id=req.conversation_id,
@@ -818,10 +1103,45 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
     # 都没有下游用途，且入史会诱导后续轮模仿 → 在一切消费之前清理。
     result["answer"] = strip_doc_citations(result["answer"])
 
+    # 拒答判定（提前到入史之前：统一失败序列可能替换回答，历史必须与用户所见一致）
+    answer_out = strip_image_markers(result["answer"])
+    resp_no_result = is_refusal_answer(answer_out)   # 拒答形态（可伴随弱相关来源）
+    resp_guard = is_low_confidence_band(chunks)      # 不依赖 RAG_LOW_CONFIDENCE_GUARD 开关
+    was_refusal = resp_no_result
+    resp_source = "kb"
+    _log_intent = None
+    _log_risk_level = None
+    _log_risk_blocked = False
+    if resp_no_result:
+        # 统一失败序列（LLM 拒答）：分诊 → 通用回答 / 引导式拒答替换；flag 全关 → None
+        outcome = _general_failure_outcome(req.question, chunks, identity=identity,
+                                           user_dept=user_dept, history=merged_history)
+        if outcome is not None:
+            result["answer"] = outcome["answer"]     # 替换文本均为纯文本（无 <<IMG>> 标记）
+            answer_out = outcome["answer"]
+            result["model"] = outcome["model"]
+            result["usage"] = outcome["usage"]
+            if outcome["source"] in ("general", "smalltalk"):
+                result["sources"] = []
+            resp_no_result = outcome["no_result"]
+            resp_source = outcome["source"]
+            _log_intent = outcome["intent_type"]
+            _log_risk_level = outcome["risk_level"]
+            _log_risk_blocked = outcome["risk_blocked"]
+            if outcome["answer_status"] is not None:
+                _forced_status = outcome["answer_status"]
+            else:
+                _forced_status = None
+        else:
+            _forced_status = None
+    else:
+        _forced_status = None
+
     # 4. 更新会话历史（统一策略：仅非空 SUCCESS 回答入史；#F-mm5 入史文本经
     #    history_answer_text —— flag ON 时剥 <<IMG:N>> 防 follow-up 标记模仿。
-    #    只包裹实参：result["answer"] 保持原文，下方 blocks 构建依赖原始标记）
-    if should_append_history(result["answer"], "SUCCESS"):
+    #    只包裹实参：result["answer"] 保持原文，下方 blocks 构建依赖原始标记。
+    #    拒答照旧按 "SUCCESS" 入史（原行为）；BLOCKED（敏感拦截）不入史。）
+    if should_append_history(result["answer"], _forced_status or "SUCCESS"):
         _append_to_history(session_id, req.question, history_answer_text(result["answer"]),
                            owner=identity.user_id if identity else None)
 
@@ -838,17 +1158,11 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         logger.warning("mini-program blocks 构建失败 (non-fatal)", exc_info=True)
         blocks = []
 
-    # 响应契约：blocks 必须先用【原始 answer】构建（穿插位置依赖占位符），
-    # 之后才清理客户端可见文本 —— blocks 为空时小程序把 answer 当纯文本渲染，
-    # 残留 <<IMG:N>> 会原样打给用户。qa_session_log 仍存原始 answer（日志保真）；
-    # 会话历史默认同原文，RAG_HISTORY_STRIP_IMG_MARKERS 开启时入史前剥标记（#F-mm5）。
-    answer_out = strip_image_markers(result["answer"])
-    resp_no_result = is_refusal_answer(answer_out)   # 拒答形态（可伴随弱相关来源）
-    resp_guard = is_low_confidence_band(chunks)      # 不依赖 RAG_LOW_CONFIDENCE_GUARD 开关
-
     # 5. 落库。拒答型回答（检索有候选但 LLM 按护栏拒答）标 REFUSAL，与 NO_RESULT
     #    （检索为空，前面已 return）分桶 —— 语料排查一句 SQL 区分「缺语料」vs
     #    「语料弱/未召回」。入史策略不变（拒答照旧入史，只改落库状态）。
+    #    失败序列替换过的回答按 outcome 状态落库（引导话术维持 REFUSAL —— 口径不漂移；
+    #    通用回答 SUCCESS + intent_type；敏感拦截 BLOCKED + risk_blocked）。
     #    kwargs 在请求内构建（纯簿记，µs 级），掩码+INSERT 推迟到响应发出后。
     background_tasks.add_task(log_qa_session, **build_qa_log_kwargs(
         session_id=session_id,
@@ -864,12 +1178,15 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         latency_ms=latency,
         retrieval_latency_ms=retrieval_latency_ms,
         llm_latency_ms=llm_latency_ms,
-        answer_status="REFUSAL" if resp_no_result else "SUCCESS",
+        answer_status=_forced_status or ("REFUSAL" if was_refusal else "SUCCESS"),
         model_name=result.get("model"),
         content_blocks_json=content_blocks_to_json(blocks) if blocks else None,
         # P2-20/21/22：LLM 成功路径透传生成元数据（generate_answer[_via_stream] 返回 dict
         # 里的 "gen_meta"；测试 mock 不带该键 → .get 得 None，不炸）
         gen_meta=result.get("gen_meta"),
+        intent_type=_log_intent,
+        risk_level=_log_risk_level,
+        risk_blocked=_log_risk_blocked,
     ))
 
     return AskResponse(
@@ -884,6 +1201,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         no_result=resp_no_result,
         guard=resp_guard,
         rephrase=_suggest_rephrase(req.question, user_dept=user_dept) if resp_no_result else [],
+        source=resp_source,
     )
 
 
@@ -920,6 +1238,47 @@ def ask_stream(req: AskRequest, request: Request,
     _enforce_rate_limit(request, identity, scope="ask",
                         thinking=bool(req.thinking), count_llm=True)
 
+    # 通用能力前置路由（与 /api/ask 同一决策；默认 off 恒 None）。命中即以复用帧协议
+    # 直接下发：session → chunk（全文含免责尾注）→ done(source) → [DONE]，客户端零改造。
+    _t0_pre = time.time()
+    pre = _general_pre_route_decision(req, identity)
+    if pre is not None:
+        (_t0_sess, _pre_session_id, _mh, _pre_uid, _pre_dept) = _prepare_session(
+            req, identity, request=request)
+        _pre_msg_id = generate_message_id()
+
+        def general_pre_gen():
+            try:
+                yield f"data: {json.dumps({'type': 'session', 'session_id': _pre_session_id, 'message_id': _pre_msg_id}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'chunk', 'content': pre['answer']}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'model': pre['model'], 'usage': pre['usage'], 'no_result': pre['no_result'], 'source': pre['source']}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                if should_append_history(pre["answer"], pre["answer_status"] or "SUCCESS"):
+                    _append_to_history(_pre_session_id, req.question,
+                                       history_answer_text(pre["answer"]),
+                                       owner=identity.user_id if identity else None)
+                log_qa_session(**build_qa_log_kwargs(
+                    session_id=_pre_session_id,
+                    conversation_id=req.conversation_id,
+                    message_id=_pre_msg_id,
+                    question=req.question,
+                    user_id=_pre_uid,
+                    user_name=(identity.name or None) if identity else None,
+                    user_dept=_pre_dept,
+                    answer_text=pre["answer"],
+                    chunks=None,   # 检索未发生
+                    latency_ms=int((time.time() - _t0_pre) * 1000),
+                    answer_status=pre["answer_status"] or "SUCCESS",
+                    model_name=pre["model"],
+                    intent_type=pre["intent_type"],
+                    risk_level=pre["risk_level"],
+                    risk_blocked=pre["risk_blocked"],
+                ))
+
+        return StreamingResponse(general_pre_gen(), media_type="text/event-stream",
+                                 headers=_SSE_HEADERS)
+
     # 图文模式才补充图片（纯文本模式不展示图片，跳过 co-surfacing 的额外 HA3 查询）
     _pure = req.pure_text if req.pure_text is not None else get_config().rag.pure_text
 
@@ -931,18 +1290,38 @@ def ask_stream(req: AskRequest, request: Request,
 
     # 无结果：仍发出 message_id 并落库（NO_RESULT），与 /api/ask 空结果分支保持一致
     if not chunks:
+        # 统一失败序列（检索为空）：分诊 → 通用回答 / 引导式拒答；flag 全关 → None（现状）
+        _empty_outcome = _general_failure_outcome(req.question, [], identity=identity,
+                                                  user_dept=user_dept, history=merged_history)
 
         def empty_gen():
             # 同步生成器：StreamingResponse 会在线程池迭代它，finally 里的阻塞 log_qa_session
             # 不会阻塞事件循环。落库放 finally：客户端中途断开（GeneratorExit）时仍保证 NO_RESULT
             # 落库，与主流式路径的 finally 收尾保持一致。
+            _status = (_empty_outcome["answer_status"] or "NO_RESULT") \
+                if _empty_outcome is not None else "NO_RESULT"
             try:
                 yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'chunk', 'content': NO_RESULT_MESSAGE}, ensure_ascii=False)}\n\n"
-                # done 帧带 no_result + rephrase：让流式前端也能渲染结构化空结果卡（换个说法 + 转人工）
-                yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(req.question, user_dept=user_dept)}, ensure_ascii=False)}\n\n"
+                if _empty_outcome is not None:
+                    yield f"data: {json.dumps({'type': 'chunk', 'content': _empty_outcome['answer']}, ensure_ascii=False)}\n\n"
+                    done_frame = {"type": "done", "model": _empty_outcome["model"],
+                                  "usage": _empty_outcome["usage"],
+                                  "no_result": _empty_outcome["no_result"],
+                                  "source": _empty_outcome["source"]}
+                    if _empty_outcome["no_result"]:
+                        done_frame["rephrase"] = _suggest_rephrase(req.question, user_dept=user_dept)
+                    yield f"data: {json.dumps(done_frame, ensure_ascii=False)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'chunk', 'content': NO_RESULT_MESSAGE}, ensure_ascii=False)}\n\n"
+                    # done 帧带 no_result + rephrase：让流式前端也能渲染结构化空结果卡（换个说法 + 转人工）
+                    yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(req.question, user_dept=user_dept)}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
+                if _empty_outcome is not None and should_append_history(
+                        _empty_outcome["answer"], _status):
+                    _append_to_history(session_id, req.question,
+                                       history_answer_text(_empty_outcome["answer"]),
+                                       owner=identity.user_id if identity else None)
                 log_qa_session(**build_qa_log_kwargs(
                     session_id=session_id,
                     conversation_id=req.conversation_id,
@@ -951,10 +1330,15 @@ def ask_stream(req: AskRequest, request: Request,
                     user_id=uid,
                     user_name=(identity.name or None) if identity else None,
                     user_dept=user_dept,
+                    answer_text=(_empty_outcome["answer"] if _empty_outcome is not None else None),
                     chunks=[],
                     latency_ms=int((time.time() - t0) * 1000),
                     retrieval_latency_ms=retrieval_latency_ms,
-                    answer_status="NO_RESULT",
+                    answer_status=_status,
+                    model_name=(_empty_outcome["model"] if _empty_outcome is not None else None),
+                    intent_type=(_empty_outcome["intent_type"] if _empty_outcome is not None else None),
+                    risk_level=(_empty_outcome["risk_level"] if _empty_outcome is not None else None),
+                    risk_blocked=bool(_empty_outcome and _empty_outcome["risk_blocked"]),
                 ))
 
         return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
@@ -981,11 +1365,16 @@ def ask_stream(req: AskRequest, request: Request,
         # gen_meta 只落库、绝不进 SSE 线协议 —— 内部阈值/模型配置不外泄给 SSE 客户端。
         # 测试 mock 生成器不回填 → .get 得 None）
         gen_meta_out: Dict[str, Any] = {}
+        # 通用能力分级开放的落库标注（默认全 None/False = 存量载荷逐字节不变）
+        intent_type_out: Optional[str] = None
+        risk_level_out: Optional[str] = None
+        risk_blocked_out = False
+        forced_status: Optional[str] = None
 
         try:
             try:
                 _stream_guard = bool(is_low_confidence_band(chunks))   # 低置信带：补进 done 帧供前端渲染提示条
-                for event in generate_answer_stream(
+                _llm_events = generate_answer_stream(
                     req.question,
                     chunks,
                     history=merged_history if merged_history else None,
@@ -996,55 +1385,113 @@ def ask_stream(req: AskRequest, request: Request,
                     pure_text=req.pure_text,
                     thinking=req.thinking,
                     meta_out=gen_meta_out,
-                ):
-                    # 截获生成器自带的 [DONE]，改由本函数在 content_blocks 之后统一收尾
-                    if event.strip() == "data: [DONE]":
-                        continue
-                    frame = parse_sse_data_frame(event)
-                    # sources 帧：完整字典截留作 cited_docs 落库（与 /api/ask 同源），
-                    # 但下发前过滤成 SourceInfo 字段集——REST 靠 response_model 收口，
-                    # SSE 透传没有那层，原样转发会把内部 OSS key（source_image）、
-                    # visual_summary、chunk_type 泄给任意 SSE 客户端（两前端响应契约也不一致）。
-                    if frame is not None and frame.get("type") == "sources":
-                        stream_sources = frame.get("sources") or None
-                        _fields = set(SourceInfo.model_fields)
-                        frame["sources"] = [
-                            {k: v for k, v in (s or {}).items() if k in _fields}
-                            for s in (frame.get("sources") or [])
-                        ]
-                        yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
-                        continue
-                    # done 帧补 guard 后再下发（流式也能显示低置信提示条）；其余帧原样透传
-                    if frame is not None and frame.get("type") == "done":
-                        model_name = frame.get("model")
-                        frame["guard"] = _stream_guard
-                        yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
-                        continue
-                    # 思考过程帧只下发给【显式请求 thinking】的调用方：防 RAG_STREAM_REASONING 全局 flag
-                    # 把思维链广播给任何 SSE 客户端（小程序走 /api/ask 不受影响；钉钉只收 chunk；但杜绝未知
-                    # SSE 调用方拿到 CoT）。reasoning 只在 thinking 时产生，故此处按 req.thinking 收口即可。
-                    if frame is not None and frame.get("type") == "reasoning" and not req.thinking:
-                        continue
-                    yield event
-                    # 收集完整回答（用于写历史 & 落库）
-                    if frame is not None and frame.get("type") == "chunk" and frame.get("content"):
-                        collected_answer.append(frame["content"])
+                )
+                _held_events: List[str] = []
+                _replaced: Optional[Dict[str, Any]] = None
+                # 低置信带 stream gate（评审补充 5）：拒答文本一旦流出便无法替换 ——
+                # 仅在疑似失败路径（低置信带）缓冲开场 ~48 字符裁决；命中拒答句式则吞掉
+                # 拒答流、改道统一失败序列；未命中按原序 flush + 透传（该小流量段仅首帧
+                # 延迟）。中高置信带完全不进此分支，KB 流式主路径零影响。
+                if (_stream_guard and get_config().rag.general_stream_gate
+                        and _general_flags()[2]):
+                    _verdict, _held_events, _llm_events = _gate_probe(_llm_events)
+                    if _verdict:
+                        _replaced = _general_failure_outcome(
+                            req.question, chunks, identity=identity,
+                            user_dept=user_dept, history=merged_history)
+                        if _replaced is not None:
+                            for _ev in _llm_events:   # 吞掉剩余拒答流（不下发）
+                                pass
+                            _held_events = []
 
-                # 正常完成：图文模式下补发 content_blocks 帧（图片须在全文完成后定稿）。
-                # [文档N] 引用清洗只能作用在定稿（chunk 帧已流出，标记可能跨帧切断）：
-                # 流中残留靠 prompt 规则 8 压制，blocks/历史/落库由这里兜底。
-                full_answer = strip_doc_citations("".join(collected_answer))
-                if full_answer and not _pure:
-                    try:
-                        blocks = build_content_blocks(full_answer, chunks)
-                        if blocks:
-                            yield f"data: {json.dumps({'type': 'content_blocks', 'content_blocks': blocks}, ensure_ascii=False)}\n\n"
-                            content_blocks_json_str = content_blocks_to_json(blocks)
-                    except Exception:
-                        logger.warning("content_blocks 构建失败 (non-fatal)", exc_info=True)
+                if _replaced is not None:
+                    # 改道：以复用帧协议下发替代内容（chunk → done → [DONE]）。
+                    # forced_status=None（引导话术）时让 finally 的拒答翻转按句式定 REFUSAL
+                    # —— 与非流式口径一致；通用回答显式 SUCCESS；敏感拦截显式 BLOCKED。
+                    collected_answer.append(_replaced["answer"])
+                    model_name = _replaced["model"]
+                    intent_type_out = _replaced["intent_type"]
+                    risk_level_out = _replaced["risk_level"]
+                    risk_blocked_out = _replaced["risk_blocked"]
+                    forced_status = _replaced["answer_status"]
+                    yield f"data: {json.dumps({'type': 'chunk', 'content': _replaced['answer']}, ensure_ascii=False)}\n\n"
+                    done_frame = {"type": "done", "model": _replaced["model"],
+                                  "usage": _replaced["usage"], "guard": _stream_guard,
+                                  "no_result": _replaced["no_result"],
+                                  "source": _replaced["source"]}
+                    if _replaced["no_result"]:
+                        _ts = suggest_titles(chunks)
+                        if _ts:
+                            done_frame["suggest_titles"] = _ts
+                        else:
+                            done_frame["rephrase"] = _suggest_rephrase(
+                                req.question, user_dept=user_dept)
+                    yield f"data: {json.dumps(done_frame, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    completed = True
+                else:
+                    for event in itertools.chain(_held_events, _llm_events):
+                        # 截获生成器自带的 [DONE]，改由本函数在 content_blocks 之后统一收尾
+                        if event.strip() == "data: [DONE]":
+                            continue
+                        frame = parse_sse_data_frame(event)
+                        # sources 帧：完整字典截留作 cited_docs 落库（与 /api/ask 同源），
+                        # 但下发前过滤成 SourceInfo 字段集——REST 靠 response_model 收口，
+                        # SSE 透传没有那层，原样转发会把内部 OSS key（source_image）、
+                        # visual_summary、chunk_type 泄给任意 SSE 客户端（两前端响应契约也不一致）。
+                        if frame is not None and frame.get("type") == "sources":
+                            stream_sources = frame.get("sources") or None
+                            _fields = set(SourceInfo.model_fields)
+                            frame["sources"] = [
+                                {k: v for k, v in (s or {}).items() if k in _fields}
+                                for s in (frame.get("sources") or [])
+                            ]
+                            yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
+                            continue
+                        # done 帧补 guard 后再下发（流式也能显示低置信提示条）；其余帧原样透传
+                        if frame is not None and frame.get("type") == "done":
+                            model_name = frame.get("model")
+                            frame["guard"] = _stream_guard
+                            # 引导式拒答富化（RAG_GUIDED_REFUSAL）：拒答文本已流出无法替换，
+                            # done 帧补结构化字段（与空结果 done 帧字段对齐，前端已有渲染路径）。
+                            # done 是最后一个生成帧，此刻 collected_answer 即全文。
+                            if _general_flags()[1]:
+                                _cur = strip_doc_citations("".join(collected_answer))
+                                if _cur and is_refusal_answer(_cur):
+                                    frame["no_result"] = True
+                                    _ts = suggest_titles(chunks)
+                                    if _ts:
+                                        frame["suggest_titles"] = _ts
+                                    else:
+                                        frame["rephrase"] = _suggest_rephrase(
+                                            req.question, user_dept=user_dept)
+                            yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
+                            continue
+                        # 思考过程帧只下发给【显式请求 thinking】的调用方：防 RAG_STREAM_REASONING 全局 flag
+                        # 把思维链广播给任何 SSE 客户端（小程序走 /api/ask 不受影响；钉钉只收 chunk；但杜绝未知
+                        # SSE 调用方拿到 CoT）。reasoning 只在 thinking 时产生，故此处按 req.thinking 收口即可。
+                        if frame is not None and frame.get("type") == "reasoning" and not req.thinking:
+                            continue
+                        yield event
+                        # 收集完整回答（用于写历史 & 落库）
+                        if frame is not None and frame.get("type") == "chunk" and frame.get("content"):
+                            collected_answer.append(frame["content"])
 
-                yield "data: [DONE]\n\n"
-                completed = True
+                    # 正常完成：图文模式下补发 content_blocks 帧（图片须在全文完成后定稿）。
+                    # [文档N] 引用清洗只能作用在定稿（chunk 帧已流出，标记可能跨帧切断）：
+                    # 流中残留靠 prompt 规则 8 压制，blocks/历史/落库由这里兜底。
+                    full_answer = strip_doc_citations("".join(collected_answer))
+                    if full_answer and not _pure:
+                        try:
+                            blocks = build_content_blocks(full_answer, chunks)
+                            if blocks:
+                                yield f"data: {json.dumps({'type': 'content_blocks', 'content_blocks': blocks}, ensure_ascii=False)}\n\n"
+                                content_blocks_json_str = content_blocks_to_json(blocks)
+                        except Exception:
+                            logger.warning("content_blocks 构建失败 (non-fatal)", exc_info=True)
+
+                    yield "data: [DONE]\n\n"
+                    completed = True
 
             except Exception as e:
                 answer_status = "LLM_ERROR"
@@ -1073,6 +1520,10 @@ def ask_stream(req: AskRequest, request: Request,
             # 拒答型标 REFUSAL（入史判定在上面、用原状态 —— 历史策略不变）；深思加 model 后缀
             if answer_status == "SUCCESS" and is_refusal_answer(full_answer):
                 answer_status = "REFUSAL"
+            # 失败序列改道的显式状态（SUCCESS/BLOCKED）最后覆盖；引导话术 forced_status=None
+            # → 上面的句式翻转已把它标成 REFUSAL（与非流式口径一致）。断开截断不覆盖。
+            if forced_status and answer_status != "CLIENT_DISCONNECTED":
+                answer_status = forced_status
             if req.thinking and model_name:
                 model_name = f"{model_name}+thinking"
             log_qa_session(**build_qa_log_kwargs(
@@ -1093,6 +1544,9 @@ def ask_stream(req: AskRequest, request: Request,
                 error_message=error_message,
                 content_blocks_json=content_blocks_json_str,
                 gen_meta=gen_meta_out.get("gen_meta"),
+                intent_type=intent_type_out,
+                risk_level=risk_level_out,
+                risk_blocked=risk_blocked_out,
             ))
 
     return StreamingResponse(
