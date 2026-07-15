@@ -53,6 +53,139 @@ DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.1
 
 
+# ═══════════════════════════════════════════════════════════════
+# 通用能力分级开放：话术常量 + 知识库失败统一抽象（纯函数，见
+# docs/general_ability_opening_design.md；路由/分诊在 intent_router，
+# 通用回答在 general_answerer —— 本模块保持零副作用、零重依赖）
+# ═══════════════════════════════════════════════════════════════
+
+# T0① 敏感硬红线（BLOCKED）
+SENSITIVE_BLOCK_MESSAGE = (
+    "抱歉，这个问题涉及敏感信息，我无法回答。"
+    "如有薪酬、人事、法务等方面的疑问，请咨询对应部门或您的主管。"
+)
+# T0③ 实时公共信息（v1 恒拒，诚实说明能力边界）
+REALTIME_BLOCK_MESSAGE = (
+    "我目前没有实时信息来源，无法提供天气、汇率、新闻等实时内容。"
+    "公司制度、流程与操作类问题随时可以问我。"
+)
+# 通用问题但通用层未开档/未放开
+GENERAL_TIER_OFF_MESSAGE = (
+    "这个问题不在公司知识库范围内，我目前主要解答公司制度、流程与操作类问题。"
+)
+# 通用 LLM 日配额用尽（rate_limiter general_quota）
+GENERAL_QUOTA_MESSAGE = (
+    "今日的通用问答额度已用完，明天可以继续；"
+    "公司知识库相关的问题不受限制，随时可以问我。"
+)
+
+
+def suggest_titles(chunks: Optional[List[Dict[str, Any]]], limit: int = 2) -> List[str]:
+    """从手头检索结果提取去重文档标题（引导式拒答"您是不是想问"用，零额外检索）。"""
+    out: List[str] = []
+    seen = set()
+    for c in chunks or []:
+        title = (c.get("title") or "").strip()
+        if title and title not in seen:
+            seen.add(title)
+            out.append(title)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def build_guided_refusal(
+    titles: Optional[List[str]] = None,
+    rephrase: Optional[List[str]] = None,
+) -> str:
+    """升级版引导式拒答话术（RAG_GUIDED_REFUSAL）。两个变体开头都保持"抱歉，…知识库…"
+    句式 —— 仍命中 _REFUSAL_STRONG_PATTERN，eval/看板的拒答口径自动兼容。"""
+    if titles:
+        lines = ["抱歉，知识库中暂时没有找到能直接回答这个问题的资料。", "您是不是想问："]
+        lines += [f"· 《{t}》" for t in titles[:3]]
+        lines.append(
+            "可以换一种说法再试试（例如带上制度、流程或系统的名称）。"
+            "如果确认知识库缺少这方面内容，欢迎通过「知识贡献」提交资料，帮助我们完善知识库。"
+        )
+        return "\n".join(lines)
+    hint = f"（如：{rephrase[0]}）" if rephrase else ""
+    return (
+        "抱歉，当前知识库中未找到与您问题相关的信息。您可以：\n"
+        f"· 换一种说法描述问题{hint}\n"
+        "· 若知识库缺少该内容，欢迎通过「知识贡献」提交资料\n"
+        "· 紧急事项请直接联系对应部门同事确认"
+    )
+
+
+# 知识库失败形态（统一抽象：四条链路的失败分支共用同一分类与决策，不再各自维护）。
+# ACL 滤空与真零命中在服务侧不可区分，统一按 EMPTY_RETRIEVAL（话术不泄露权限信息）。
+KB_FAILURE_EMPTY = "EMPTY_RETRIEVAL"
+KB_FAILURE_REFUSAL = "LLM_REFUSAL"
+
+
+def classify_kb_failure(
+    chunks: Optional[List[Dict[str, Any]]],
+    answer_text: Optional[str] = None,
+) -> Optional[str]:
+    """判定本次知识库回答是否失败及失败形态；成功回答 → None。"""
+    if not chunks:
+        return KB_FAILURE_EMPTY
+    if answer_text is not None and is_refusal_answer(answer_text):
+        return KB_FAILURE_REFUSAL
+    return None
+
+
+# 失败决策动作（build_failure_action 返回值的 action 字段）
+ACTION_PASSTHROUGH = "passthrough"        # 维持今日行为（原拒答/NO_RESULT 文案原样）
+ACTION_GUIDED_REFUSAL = "guided_refusal"  # 替换为 text 字段的引导话术
+ACTION_GENERAL_LLM = "general_llm"        # 走 general_answerer（tier 字段给档位）
+ACTION_SMALLTALK = "smalltalk"            # 走 canned 模板（调用方取 general_answerer）
+ACTION_SENSITIVE_BLOCK = "sensitive_block"  # BLOCKED（risk_blocked=1）
+
+
+def build_failure_action(
+    category: str,
+    *,
+    mode: str,
+    guided_on: bool,
+    titles: Optional[List[str]] = None,
+    rephrase: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """失败分诊类别 → 处置决策（纯函数；config 快照经参数传入）。
+
+    不变量 I2：category=enterprise 永远只有 guided_refusal/passthrough 两种出路，
+    任何 mode 下都不产生 general_llm —— 企业相关未覆盖绝不让通用模型按常识补齐。
+    返回 {"action", "text", "tier", "intent_type"}（不适用字段为 None/""）。
+    """
+    mode = (mode or "off").lower()
+    if category == "sensitive":
+        return {"action": ACTION_SENSITIVE_BLOCK, "text": SENSITIVE_BLOCK_MESSAGE,
+                "tier": "", "intent_type": "refuse_sensitive"}
+    if category == "smalltalk" and mode in ("smalltalk", "office", "full"):
+        return {"action": ACTION_SMALLTALK, "text": "", "tier": "",
+                "intent_type": "smalltalk"}
+    if category == "office" and mode in ("office", "full"):
+        return {"action": ACTION_GENERAL_LLM, "text": "", "tier": "office",
+                "intent_type": "office"}
+    if category == "general" and mode == "full":
+        return {"action": ACTION_GENERAL_LLM, "text": "", "tier": "general",
+                "intent_type": "general"}
+    if category in ("office", "general", "smalltalk"):
+        # 类别是通用但档位未放开：引导话术开着就给"范围说明"，否则维持现状
+        if guided_on:
+            return {"action": ACTION_GUIDED_REFUSAL, "text": GENERAL_TIER_OFF_MESSAGE,
+                    "tier": "", "intent_type": "refuse_uncovered_general"}
+        return {"action": ACTION_PASSTHROUGH, "text": "", "tier": "",
+                "intent_type": "refuse_uncovered_general"}
+    # enterprise（含一切 fail-closed 回落）：只有引导拒答/维持现状两种出路（I2）
+    if guided_on:
+        return {"action": ACTION_GUIDED_REFUSAL,
+                "text": build_guided_refusal(titles=titles, rephrase=rephrase),
+                "tier": "", "intent_type": "refuse_uncovered_enterprise"}
+    return {"action": ACTION_PASSTHROUGH, "text": "", "tier": "",
+            "intent_type": "refuse_uncovered_enterprise"}
+
+
 def top_score_of(chunks: Optional[List[Dict[str, Any]]]) -> Optional[float]:
     """检索结果最高分；空/None → None。"""
     if not chunks:
@@ -135,6 +268,9 @@ def build_qa_log_kwargs(
     content_blocks_json: Optional[str] = None,
     conversation_id: Optional[str] = None,
     gen_meta: Optional[Dict[str, Any]] = None,
+    intent_type: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    risk_blocked: bool = False,
 ) -> Dict[str, Any]:
     """qa_session_log 载荷的单一组装点。永远返回【全字段】（未知处显式 None，
     与 qa_logger.log_qa_session 的参数缺省一致）。
@@ -153,8 +289,17 @@ def build_qa_log_kwargs(
       LLM_ERROR — 生成异常（error_message 带 trace_id）
       CLIENT_DISCONNECTED — SSE 客户端中途断开，回答被截断（仅 /api/ask/stream）；
                   不参与 REFUSAL 翻转（截断恰止于拒答句式会假命中），照常入史
+      BLOCKED   — 敏感硬红线拦截（通用能力分级开放 T0①；risk_blocked=1 +
+                  risk_level='sensitive'，qa_rollup 已按 risk_blocked 归入拒答桶）
     注意：入史策略（should_append_history）按翻转前的原状态判定 —— REFUSAL 只改
     落库标签，不改变"拒答照旧入史"的既有行为。
+
+    intent_type 词表（通用能力分级开放的新维度；NULL = 知识库默认路径 ——
+    存量行为不写 'kb'，保证 flag off 时落库载荷逐字节不变）：
+      smalltalk / office / general / refuse_sensitive / refuse_uncovered_enterprise /
+      refuse_uncovered_general / refuse_realtime / refuse_quota
+    企业相关未覆盖仍落 NO_RESULT/REFUSAL（contribution 缺口挖掘与 SLO 口径零漂移），
+    只多 intent_type 标签。
     """
     return dict(
         session_id=session_id,
@@ -179,4 +324,7 @@ def build_qa_log_kwargs(
         content_blocks_json=content_blocks_json or None,
         conversation_id=conversation_id,
         gen_meta_json=gen_meta_to_json(gen_meta),
+        intent_type=intent_type,
+        risk_level=risk_level,
+        risk_blocked=risk_blocked,
     )

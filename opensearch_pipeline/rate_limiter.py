@@ -216,6 +216,9 @@ class Limits:
     anon_per_day: int = 30
     aux_per_min: int = 30
     thinking_daily_quota: int = 10
+    # 通用能力（T2/T3 通用 LLM 回答）每日配额（通用能力分级开放，intent_router/
+    # general_answerer）。canned 寒暄与确定性计算零成本不经此；0 = 通用 LLM 层整体关闭。
+    general_daily_quota: int = 20
     global_daily_llm_cap: int = 2000
     # P2-11：深思请求 ~8x token 计费（模块 docstring），对全局熔断按权重计数——
     # 否则同一顶下真实账单差一个数量级（"准入请求"vs"计费调用"的阻抗失配）
@@ -262,6 +265,7 @@ def _load_limits() -> Limits:
         anon_per_day=_env_int("RAG_RATE_ANON_PER_DAY", 30),
         aux_per_min=_env_int("RAG_RATE_AUX_PER_MIN", 30),
         thinking_daily_quota=_env_int("RAG_THINKING_DAILY_QUOTA", 10),
+        general_daily_quota=_env_int("RAG_GENERAL_DAILY_QUOTA", 20),
         global_daily_llm_cap=_env_int("RAG_GLOBAL_DAILY_LLM_CAP", 2000),
         thinking_cap_weight=max(1, _env_int("RAG_GLOBAL_CAP_THINKING_WEIGHT", 8)),
     )
@@ -436,6 +440,38 @@ class ServingRateLimiter:
             self._maybe_prune(now, day)
             # 放行路径顺带检查拒绝聚合是否到期（风暴结束后残留计数靠正常流量冲出去）
             self._note_reject(None, now)
+        return None
+
+    def admit_general(self, actor: str, *, is_user: bool) -> Optional[Denial]:
+        """通用能力层（T2/T3 通用 LLM 回答）每日配额准入（通用能力分级开放）。
+
+        发生在已通过 admit_ask 的请求内部（常规限频/日配额/全局熔断已在外层计过），
+        只管 gen: 日配额这一件事。被拒不翻译成 HTTP 错误 —— 调用方转为友好话术
+        （answer_flow.GENERAL_QUOTA_MESSAGE / GENERAL_TIER_OFF_MESSAGE）。
+        canned 寒暄与确定性计算零 LLM 成本，不经此配额。匿名一律拒绝（reason 区分）。
+        """
+        lim = self.limits()
+        if not lim.enabled:
+            return None
+        now = self._now()
+        day = _beijing_day(now)
+        with self._lock:
+            if not is_user:
+                return self._deny(actor, Denial(
+                    403, "通用问答需登录后使用", 0, "general_anon"))
+            if lim.general_daily_quota <= 0:
+                return self._deny(actor, Denial(
+                    403, "通用问答未开放", 0, "general_off"))
+            key = f"gen:{actor}"
+            g_day, g_cnt = self._daily.get(key, (day, 0))
+            if g_day != day:
+                g_cnt = 0
+            if g_cnt >= lim.general_daily_quota:
+                return self._deny(actor, Denial(
+                    429,
+                    f"今日通用问答次数已用完（{lim.general_daily_quota} 次/天）",
+                    _secs_to_beijing_midnight(now), "general_quota"))
+            self._daily[key] = (day, g_cnt + 1)
         return None
 
     def admit_aux(self, actor: str) -> Optional[Denial]:

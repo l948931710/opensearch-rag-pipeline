@@ -397,6 +397,28 @@ class RAGConfig:
     # 单文档丢 1 个 recall@1 —— 轻度有害，保持 0。根因：近重复文档家族（告知书
     # （新）/（松门）是不同 doc_id）使文档级限额错位换出 gold chunk。
     doc_diversity_cap: int = 0      # RAG_DOC_DIVERSITY_CAP
+    # ── 通用能力分级开放（general ability tiers，见 intent_router/general_answerer）──
+    # off（默认，行为与现状逐字节一致）| smalltalk（T1 寒暄/元问题 canned）
+    # | office（T1+T2 办公辅助：翻译/润色/摘要/写作/办公软件用法/简单计算）
+    # | full（T1+T2+T3 通识问答；实时信息类天气/汇率/新闻恒拒）。
+    # 硬性不变量（tests/test_intent_router.py 钉死）：公司信号一票否决先于办公白名单
+    # （I1 宁拒不编）；企业相关未覆盖只走引导式拒答、绝不让通用模型按常识补齐（I2）；
+    # 失败路径分诊 fail-closed（I3）。每用户日配额在 rate_limiter（RAG_GENERAL_DAILY_QUOTA，
+    # 照 RAG_THINKING_DAILY_QUOTA 先例由 _load_limits 直读环境变量）。
+    general_ability_mode: str = "off"   # RAG_GENERAL_ABILITY_MODE
+    # T2/T3 灰度部门白名单（acl 组 code CSV，如 "it,admin"；空 = 全员）。T1 canned 不受限。
+    general_ability_depts: str = ""     # RAG_GENERAL_ABILITY_DEPTS
+    # 通用层模型（ModelGateway quick 档前身）。空 = 复用 config.llm.model（保证开箱可用）；
+    # 生产建议设为 turbo 档型号降本（以百炼当期型号名为准）。
+    general_llm_model: str = ""         # RAG_GENERAL_LLM_MODEL
+    general_max_tokens: int = 800       # RAG_GENERAL_MAX_TOKENS：通用回答 token 上限
+    triage_timeout: int = 6             # RAG_TRIAGE_TIMEOUT：失败路径分诊超时（秒），失败即按 enterprise 拒答
+    # 引导式拒答话术（独立于通用层，可单独先行灰度）：拒答时附换说法建议/相近文档标题/知识贡献入口。
+    guided_refusal: bool = False        # RAG_GUIDED_REFUSAL
+    # 低置信带流式门控：SSE 缓冲开场 ~48 字符，命中拒答句式则改道失败序列（仅 mode!=off 时参与）。
+    general_stream_gate: bool = True    # RAG_GENERAL_STREAM_GATE
+    # 敏感词运维追加（CSV，逐词按字面匹配并入前置硬红线与禁兜底词表）。
+    sensitive_extra_words: str = ""     # RAG_SENSITIVE_EXTRA_WORDS
     # ── 纯文本生成开关（pure-text mode） ─────────────────────────
     # True  → 生成纯文字回答：system prompt 去掉 <<IMG:N>> 图片插入规则，
     #         context 不再注入 <<IMG:N>> 标记，卡片只展示文字（图片语义仍以
@@ -910,6 +932,14 @@ def load_config() -> PipelineConfig:
             multi_query_max=_env_int("MULTI_QUERY_MAX", 3),                 # RAG_MULTI_QUERY_MAX
             decompose_timeout=_env_int("DECOMPOSE_TIMEOUT", 8),             # RAG_DECOMPOSE_TIMEOUT
             doc_diversity_cap=_env_int("DOC_DIVERSITY_CAP", 0),             # RAG_DOC_DIVERSITY_CAP
+            general_ability_mode=_env("GENERAL_ABILITY_MODE", "off").lower(),   # RAG_GENERAL_ABILITY_MODE
+            general_ability_depts=_env("GENERAL_ABILITY_DEPTS", ""),            # RAG_GENERAL_ABILITY_DEPTS
+            general_llm_model=_env("GENERAL_LLM_MODEL", ""),                    # RAG_GENERAL_LLM_MODEL
+            general_max_tokens=_env_int("GENERAL_MAX_TOKENS", 800),             # RAG_GENERAL_MAX_TOKENS
+            triage_timeout=_env_int("TRIAGE_TIMEOUT", 6),                       # RAG_TRIAGE_TIMEOUT
+            guided_refusal=_env_bool("GUIDED_REFUSAL", False),                  # RAG_GUIDED_REFUSAL
+            general_stream_gate=_env_bool("GENERAL_STREAM_GATE", True),         # RAG_GENERAL_STREAM_GATE
+            sensitive_extra_words=_env("SENSITIVE_EXTRA_WORDS", ""),            # RAG_SENSITIVE_EXTRA_WORDS
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE
