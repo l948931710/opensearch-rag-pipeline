@@ -31,6 +31,7 @@ interface MockOpts {
   canManage?: boolean;
   dismiss?: (r: Route) => Promise<void> | void;   // 缺省 200 {ok:true,affected:1}
   restore?: (r: Route) => Promise<void> | void;
+  dismissed?: object[];                            // GET /gaps/dismissed 的 items
 }
 async function mockGaps(page: Page, o: MockOpts = {}) {
   const seen = { gapsGet: 0, dismiss: 0, restore: 0, dismissBodies: [] as unknown[], restoreBodies: [] as unknown[] };
@@ -62,6 +63,9 @@ async function mockGaps(page: Page, o: MockOpts = {}) {
     if (o.restore) return o.restore(r);
     return r.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, affected: 1 }) });
   });
+  await page.route('**/api/kb/gaps/dismissed', (r) => r.fulfill({
+    contentType: 'application/json', body: JSON.stringify({ items: o.dismissed ?? [] }),
+  }));
   return seen;
 }
 
@@ -115,7 +119,30 @@ test.describe('待回答 — 忽略此缺口', () => {
     await expect(page.getByTestId('gap-dismiss')).toHaveCount(0);
     await expect(page.getByTestId('gap-restore')).toHaveCount(0);
     await expect(page.getByTestId('gap-dismissed-hint')).toHaveCount(0);
+    await expect(page.getByTestId('gap-dismissed-toggle')).toHaveCount(0);   // 折叠区零节点
     await expect(page.getByRole('button', { name: '回答' })).toHaveCount(2); // 既有动作原样
+  });
+
+  test('AC11：「已忽略」折叠区——展开拉现值，恢复=restore+移出+重拉缺口列表', async ({ page }) => {
+    const seen = await mockGaps(page, {
+      canManage: true,
+      dismissed: [{ question_hash: 'c'.repeat(64), question_preview: '今天食堂有什么菜',
+                    reason: '闲聊噪音', dismissed_by_name: '生产部管理员',
+                    dismissed_at: '2026-07-15T10:00:00' }],
+    });
+    await page.goto(ROUTE);
+    const toggle = page.getByTestId('gap-dismissed-toggle');
+    await expect(toggle).toBeVisible();                       // 管理员可见折叠头
+    await expect(page.getByTestId('gap-dismissed-row')).toHaveCount(0);  // 默认收起
+    await toggle.click();
+    await expect(page.getByTestId('gap-dismissed-row')).toHaveCount(1);  // 展开拉现值
+    await expect(page.getByTestId('gap-dismissed-row')).toContainText('今天食堂有什么菜');
+    await expect(page.getByTestId('gap-dismissed-row')).toContainText('闲聊噪音');
+    await page.getByTestId('gap-dismissed-restore').click();
+    await expect(page.getByTestId('gap-dismissed-row')).toHaveCount(0);  // 恢复后移出本区
+    expect(seen.restore).toBe(1);
+    expect(seen.restoreBodies[0]).toMatchObject({ question_hash: 'c'.repeat(64) });
+    expect(seen.gapsGet).toBe(2);   // 恢复触发一次重拉（缺口回到「待回答」的诚实闭环）
   });
 
   test('AC5：后端 403 → 失败提示 + 行保持原状（不悄悄移除/不死等）', async ({ page }) => {

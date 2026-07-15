@@ -302,6 +302,45 @@ async function restoreGap(g: GapItem) {
   })
 }
 
+// ── 「已忽略」折叠区（2026-07-15 拍板补齐）：刷新后撤销的唯一 UI 入口 ─────────
+export interface DismissedGap {
+  question_hash: string; question_preview: string; reason: string
+  dismissed_by_name: string; dismissed_at: string
+}
+const dismissedGaps = ref<DismissedGap[]>([])
+async function loadDismissed() {
+  syncIdentityScope()
+  const fp = identityFingerprint()
+  const s = useSession()
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    dismissedGaps.value = [{ question_hash: 'hd1', question_preview: '今天食堂有什么菜', reason: '闲聊噪音', dismissed_by_name: '设计预览', dismissed_at: '2026-07-14T10:00:00' }]
+    return
+  }
+  try {
+    const r = await apiJson<{ items: DismissedGap[] }>('/api/kb/gaps/dismissed', { auth: true })
+    if (fp !== identityFingerprint()) return
+    dismissedGaps.value = r.items || []
+  } catch (e) {
+    if (fp !== identityFingerprint()) return
+    dismissedGaps.value = []; noteLoadError('dismissed', e)   // 404=老后端静默（noteLoadError 内建）
+  }
+}
+// 从折叠区恢复：restore 成功 → 移出折叠区 + 重拉缺口列表（该缺口回到「待回答」——
+// 与行内「撤销」的本地翻转不同，这里的行早已不在 gaps 数组里，重拉才是诚实闭环）。
+async function restoreDismissed(d: DismissedGap) {
+  await withInflight(`gap:${d.question_hash}`, async () => {
+    try {
+      const s = useSession()
+      if (import.meta.env.DEV && s.token === 'dev-preview') {
+        dismissedGaps.value = dismissedGaps.value.filter((x) => x.question_hash !== d.question_hash); return
+      }
+      await apiJson('/api/kb/gaps/restore', { method: 'POST', auth: true, body: JSON.stringify({ question_hash: d.question_hash }) })
+      dismissedGaps.value = dismissedGaps.value.filter((x) => x.question_hash !== d.question_hash)
+      await loadGaps()
+    } catch (e: any) { void notice({ title: '恢复失败', message: uploadErrText(e), danger: true }) }
+  })
+}
+
 export function useContribute() {
   const session = useSession()
   const canManage = computed(() => !!session.identity?.canManage)
@@ -313,13 +352,13 @@ export function useContribute() {
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, loadMine, loadPending, loadHeroes,
     openModal, closeModal, submitContribution, acceptContribution, rejectContribution, retryContribution,
-    dismissGap, restoreGap,
+    dismissGap, restoreGap, dismissedGaps, loadDismissed, restoreDismissed,
   }
 }
 
 /** 仅供测试：重置 store。（分支侧 P0-D 已升级为身份切换共用 _resetContributeState——随大合并收敛。） */
 export function __resetContribute() {
-  gaps.value = []; gapsSummary.value = null; gapsWindowDays.value = 30
+  gaps.value = []; gapsSummary.value = null; gapsWindowDays.value = 30; dismissedGaps.value = []
   myContribs.value = []; pendingContribs.value = []; pendingHasMore.value = false; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''

@@ -1350,6 +1350,52 @@ def _expand_gap_targets(conn, h: str) -> Set[str]:
     return targets
 
 
+class KbGapDismissedItem(BaseModel):
+    question_hash: str = ""
+    question_preview: str = ""     # 忽略时的问法快照（已脱敏；老行可能为空）
+    reason: str = ""
+    dismissed_by_name: str = ""
+    dismissed_at: str = ""         # 最近一次忽略时间（updated_at）
+
+
+class KbGapDismissedResponse(BaseModel):
+    items: List[KbGapDismissedItem] = Field(default_factory=list)
+
+
+@router.get("/api/kb/gaps/dismissed", response_model=KbGapDismissedResponse)
+def kb_gaps_dismissed(request: Request,
+                      identity: Optional[Identity] = Depends(current_identity)):
+    """已忽略缺口列表（「已忽略」折叠区，2026-07-15 拍板补齐）：刷新后撤销的唯一 UI 入口
+    ——此前 restore 端点在而无处可点（忽略行被读侧排除后不可寻回）。仅 active 行
+    （revoked_at IS NULL）；console 管理员专属；最近忽略在前，LIMIT 100 兜底。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    _require_kb_console(identity)
+    trace_id = get_request_id()
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+    except Exception as e:
+        logger.error("kb_gaps_dismissed 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询失败 (trace: {trace_id})")
+    items: List[KbGapDismissedItem] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT question_hash, question_preview, reason, dismissed_by_name, updated_at"
+                f" FROM {_op_db()}.qa_gap_dismissal WHERE revoked_at IS NULL"
+                " ORDER BY updated_at DESC LIMIT 100")
+            for h, prev, reason, by_name, at in cur.fetchall() or []:
+                items.append(KbGapDismissedItem(
+                    question_hash=h or "", question_preview=prev or "", reason=reason or "",
+                    dismissed_by_name=by_name or "",
+                    dismissed_at=(at.isoformat() if at else "")))
+    except Exception as e:   # noqa: BLE001 — 041 未 apply 的环境诚实空列表（fail-open）
+        logger.info("kb_gaps_dismissed 查询失败（空列表，non-fatal）: %s", e)
+    finally:
+        conn.close()
+    return KbGapDismissedResponse(items=items)
+
+
 @router.post("/api/kb/gaps/dismiss", response_model=KbGapDismissResponse)
 def kb_gap_dismiss(req: KbGapDismissRequest, request: Request,
                    identity: Optional[Identity] = Depends(current_identity)):

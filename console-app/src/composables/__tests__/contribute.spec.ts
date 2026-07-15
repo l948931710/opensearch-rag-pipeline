@@ -529,3 +529,54 @@ describe('GapList — 忽略此缺口', () => {
     })
   })
 })
+
+// 「已忽略」折叠区（2026-07-15 拍板补齐）：composable 层
+describe('GapList — 已忽略折叠区', () => {
+  it('loadDismissed 拉取 active 行；restoreDismissed=restore+移出+重拉 gaps', async () => {
+    withSession({ canManage: true, role: 'dept_admin' })
+    const c = useContribute()
+    const D = { question_hash: 'd'.repeat(64), question_preview: '今天食堂有什么菜',
+                reason: '闲聊', dismissed_by_name: '管理员', dismissed_at: '2026-07-15T10:00:00' }
+    stubFetch({ items: [D] })
+    await c.loadDismissed()
+    expect(c.dismissedGaps.value.length).toBe(1)
+    // restore：POST 同 hash → 移出折叠区 → 触发 loadGaps 重拉（回到待回答的诚实闭环）
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: any) => {
+      calls.push(String(url))
+      return { ok: true, status: 200, json: async () => ({ ok: true, items: [], summary: null }), text: async () => '{}' }
+    }))
+    await c.restoreDismissed(c.dismissedGaps.value[0])
+    expect(c.dismissedGaps.value.length).toBe(0)
+    expect(calls.some((u) => u.includes('/api/kb/gaps/restore'))).toBe(true)
+    expect(calls.some((u) => u.includes('/api/kb/gaps?limit=30'))).toBe(true)
+  })
+
+  it('restore 失败：行留在折叠区（不乐观移除）', async () => {
+    withSession({ canManage: true, role: 'dept_admin' })
+    const c = useContribute()
+    c.dismissedGaps.value = [{ question_hash: 'e'.repeat(64), question_preview: 'x',
+                               reason: '', dismissed_by_name: '', dismissed_at: '' }] as never
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false, status: 500, json: async () => ({ detail: 'boom' }), text: async () => 'boom',
+    })))
+    await c.restoreDismissed(c.dismissedGaps.value[0])
+    expect(c.dismissedGaps.value.length).toBe(1)
+  })
+
+  it('组件门禁：员工无折叠区节点；管理员默认收起', () => {
+    withSession({ canManage: false })
+    const c = useContribute()
+    c.gaps.value = [{ question: 'q', asks: 1, last_days: 1, dept: '', kind: 'no_result',
+                      question_hash: 'f'.repeat(64), source_message_id: '', has_pending_contribution: false }] as never
+    let w = mount(GapList)
+    expect(w.find('[data-testid="gap-dismissed-toggle"]').exists()).toBe(false)
+    __resetContribute()
+    withSession({ canManage: true, role: 'dept_admin' })
+    const c2 = useContribute()
+    c2.gaps.value = [] as never
+    w = mount(GapList)
+    expect(w.find('[data-testid="gap-dismissed-toggle"]').exists()).toBe(true)
+    expect(w.find('[data-testid="gap-dismissed-row"]').exists()).toBe(false)   // 默认收起
+  })
+})
