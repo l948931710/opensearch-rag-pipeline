@@ -201,3 +201,71 @@ def test_retrieved_docs_json_carries_chunk_id_and_version_no(mock_get_conn):
     docs = _json.loads(rj)
     assert docs[0]["chunk_id"] == "DOC_HR_x_v3_c0007_ABCD1234"
     assert docs[0]["version_no"] == 3
+
+
+# ── 缺口语义去重 Layer-1（schema/039 question_hash 可选列）────────────────────
+@patch("opensearch_pipeline.db._get_db_conn")
+def test_question_hash_carried_when_column_exists(mock_get_conn, monkeypatch):
+    """写侧落列：INSERT 携带 question_hash，值=contribution.question_hash(脱敏后 query_text)
+    ——与 kb_gaps Python 归并 / asks 平查同口径。"""
+    import opensearch_pipeline.qa_logger as QL
+    from opensearch_pipeline.contribution import question_hash as qh
+    monkeypatch.setattr(QL, "_QUESTION_HASH_COL_MISSING", False)
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    log_qa_session(session_id="s1", message_id="m1", query_text="怎么开发票？")
+    sql, params = cur.execute.call_args[0]
+    assert "question_hash" in sql
+    assert qh("怎么开发票？") in params
+
+
+@patch("opensearch_pipeline.db._get_db_conn")
+def test_question_hash_1054_falls_back_and_caches(mock_get_conn, monkeypatch, caplog):
+    """schema/039 未 apply：1054 点名 question_hash → 摘除重试（审计行绝不丢）+
+    进程内负缓存（本进程不再携带）——gen_meta/018 同款纪律。"""
+    import opensearch_pipeline.qa_logger as QL
+    monkeypatch.setattr(QL, "_QUESTION_HASH_COL_MISSING", False)
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.execute.side_effect = [
+        Exception(1054, "Unknown column 'question_hash' in 'field list'"),
+        None,
+    ]
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    with caplog.at_level(logging.DEBUG, logger="opensearch_pipeline.qa_logger"):
+        log_qa_session(session_id="s1", message_id="m1", query_text="q")   # 必须不 raise
+
+    assert QL._QUESTION_HASH_COL_MISSING is True
+    retry_sql = cur.execute.call_args[0][0]
+    assert "question_hash" not in retry_sql          # 回退列集不再携带
+    assert any("schema/039" in r.getMessage() for r in caplog.records)
+    monkeypatch.setattr(QL, "_QUESTION_HASH_COL_MISSING", False)   # 还原进程态
+
+
+@patch("opensearch_pipeline.db._get_db_conn")
+def test_gen_meta_and_question_hash_independent_fallback(mock_get_conn, monkeypatch):
+    """双可选列并存：只缺 gen_meta_json 时摘 gen_meta 保 question_hash（互不牵连）。"""
+    import opensearch_pipeline.qa_logger as QL
+    monkeypatch.setattr(QL, "_QUESTION_HASH_COL_MISSING", False)
+    monkeypatch.setattr(QL, "_GEN_META_COL_MISSING", False)
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.execute.side_effect = [
+        Exception(1054, "Unknown column 'gen_meta_json' in 'field list'"),
+        None,
+    ]
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    log_qa_session(session_id="s1", message_id="m1", query_text="q",
+                   gen_meta_json='{"a":1}')
+    assert QL._GEN_META_COL_MISSING is True
+    retry_sql = cur.execute.call_args[0][0]
+    assert "gen_meta_json" not in retry_sql
+    assert "question_hash" in retry_sql              # 未受牵连
+    monkeypatch.setattr(QL, "_GEN_META_COL_MISSING", False)

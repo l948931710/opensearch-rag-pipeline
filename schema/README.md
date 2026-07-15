@@ -74,6 +74,8 @@ apply 脚本落库并记台账。
 | 036_agent_run_message_id.sql | fuling_operation | 重审计 §5 U1/U2：agent_run.message_id——run 锚定 qa_session_log 答案行（答案读回 + 续跑反馈投票不悬空）；**先 apply 后部署**（get_run SELECT 引用本列） |
 | 037_agent_run_serialization.sql | fuling_operation | 复核批次1 A1：agent_run.active_thread 生成列（非终态=thread_id、终态=NULL）+ uk_thread_active——per-thread 非终态 run DB 级互斥（并发双 submit 恰一个 1062→ThreadBusy→409）；apply 前须核对无同 thread 多非终态残行 |
 | 038_ontology_object_normalized_title.sql | fuling_ontology | 复核批次6 C2：ontology_object.normalized_title 聚类键列（normalize.title_key）+ (type,status,norm) 索引——同名聚类等值召回（LIKE 对空白/全半角变体漏召回=播种侧 false-mint 盲区）；存量回填=scripts/backfill_normalized_title.py，真实播种前置=apply+backfill 完成；先 apply 后部署 |
+| 039_qa_question_hash.sql | fuling_operation | 缺口语义去重 Layer-1（pmc 远期立项，2026-07-15）：qa_session_log.question_hash 归一化哈希列 + 索引——写侧 qa_logger 落列（对脱敏后文本，contribution.question_hash 同口径；1054 负缓存降级，**代码可先行**）；存量回填=scratch/backfill_qa_question_hash_20260715.py |
+| 040_qa_gap_semantic_group.sql | fuling_operation | 缺口语义去重 Layer-2：qa_gap_semantic_group 相似问法语义组映射表——生成=scratch/build_qa_gap_semantic_groups_20260715.py（embedding 贪心归组，阈值 0.90 保守）；读侧 RAG_QA_GAP_SEMANTIC 默认关且 fail-open；**预注册边界：仅展示层归并，绝不驱动缺口自动关闭** |
 
 ## 台账（schema_migrations）
 

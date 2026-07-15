@@ -125,6 +125,7 @@ class KbGapItem(BaseModel):
     question_hash: str = ""
     source_message_id: str = ""    # 代表性 message_id（「回答」预填溯源）
     has_pending_contribution: bool = False   # 已有贡献待入库（缺口仍开放，标「等待入库」）
+    phrasings: int = 1             # 语义组归并后的成员问法数（RAG_QA_GAP_SEMANTIC 关时恒 1；additive）
 
 
 class KbGapsSummary(BaseModel):
@@ -1141,7 +1142,8 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
         items = [KbGapItem(
             question=C.redact_query_text(g["raw"]), asks=g["asks"], last_days=g["days"],
             dept=g["dept"], kind=g["kind"], question_hash=g["hash"],
-            source_message_id=g["msg"], has_pending_contribution=g["pending"]) for g in page]
+            source_message_id=g["msg"], has_pending_contribution=g["pending"],
+            phrasings=int(g.get("phrasings") or 1)) for g in page]
         funnel = _gaps_review_funnel(identity)
         if funnel:
             summary = summary.model_copy(update=funnel)
@@ -1247,6 +1249,17 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
                             covered_pending.add(hh)
                 except Exception as e:
                     fails += 1; logger.warning("kb_gaps 覆盖查询失败: %s", e)
+            # 3.5) 语义组映射（schema/040，RAG_QA_GAP_SEMANTIC 默认关）：相似问法展示层
+            # 归并的输入。独立 try、不进 fails 500 阈值（漏斗同款先例）；表缺失/查询失败
+            # → 空映射=不归并原样展示（fail-open）。归并本身在组装段（纯函数）。
+            group_map: Dict[str, str] = {}
+            if agg:
+                from opensearch_pipeline.qa_gap_groups import load_group_map, semantic_groups_on
+                if semantic_groups_on():
+                    try:
+                        group_map = load_group_map(cur, _op_db(), list(agg.keys()))
+                    except Exception as e:
+                        logger.info("kb_gaps 语义组映射不可用（不归并，non-fatal）: %s", e)
             # 4) summary（各自独立降级）
             try:
                 cur.execute(f"SELECT COUNT(*) FROM {_op_db()}.kb_contribution WHERE ingestion_status='searchable'")
@@ -1273,6 +1286,12 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
             "dept": e["dept"], "kind": e["kind"], "msg": next(iter(e["msgs"]), ""),
             "pending": h in covered_pending,
         })
+    # 语义组归并（纯函数；关闭判定已按 exact hash 在上方逐成员完成，归并只影响展示）：
+    # 同组开放成员并为一张卡（asks 求和/days 取 min/refusal 优先），卡片 hash 恒为真实
+    # 成员 hash——贡献提交仍只关闭该成员，绝不跨问法自动关闭（schema/040 预注册边界）。
+    if group_map:
+        from opensearch_pipeline.qa_gap_groups import merge_semantic_gaps
+        open_gaps = merge_semantic_gaps(open_gaps, group_map)
     open_gaps.sort(key=lambda g: (-g["asks"], g["days"]))
     summary.unanswered = len(open_gaps)
     if fails == 0:   # 降级结果（部分子查询失败）不缓存——下一请求重试取全量
