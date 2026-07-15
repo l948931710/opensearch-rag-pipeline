@@ -71,6 +71,12 @@ class _FakeCur:
             return c.refusal_rows
         if "kb_contribution WHERE question_hash IN" in s:
             return c.coverage_rows
+        if "GROUP BY c.author_id" in s:        # ε-2 R2 heroes 引用数聚合（先于泛 author_id 分支）
+            return c.hero_hits_rows
+        if "GROUP BY jt.doc_id" in s:          # ε-2 R2 mine 逐文档引用数
+            if c.boom_hits:
+                raise Exception("simulated hits aggregation failure")
+            return c.doc_hits_rows
         if "GROUP BY author_id" in s:
             return c.hero_rows
         if "kb_contribution" in s and "ORDER BY" in s:
@@ -89,6 +95,9 @@ class _FakeConn:
         self.refusal_rows = kw.get("refusal_rows", [])
         self.coverage_rows = kw.get("coverage_rows", [])
         self.hero_rows = kw.get("hero_rows", [])
+        self.hero_hits_rows = kw.get("hero_hits_rows", [])
+        self.doc_hits_rows = kw.get("doc_hits_rows", [])
+        self.boom_hits = kw.get("boom_hits", False)
         self.list_rows = kw.get("list_rows", [])
         self.summary = kw.get("summary", {})
         self.calls = []
@@ -832,3 +841,68 @@ def test_retry_fires_author_result_notify(monkeypatch):
     resp = api.kb_contribution_retry(cid="C3", request=None, identity=_ident())
     assert resp.ok is True
     assert len(calls) == 1 and calls[0][1] in ("accepted", "pending_approval")
+
+
+# ── 批次ε-2 R2：被引用数（cited=True 口径、全期窗口、事实表路径、诚实 None）──────────
+def test_heroes_hits_cited_alltime_fact_path(monkeypatch):
+    """榜上作者回填 hits：cited=1 口径 + COUNT(DISTINCT message_id) + 无时间窗（全期）+
+    同库直连事实表（不经 document_meta 零 collation cast）；无引用行的作者=真 0；
+    排名仍按入库篇数（hits 不改序）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "true")
+    conn = _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("u2", "王伟", 2)],
+        hero_hits_rows=[("u1", 6)]))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert [(i.author_id, i.count, i.hits) for i in resp.items] == [("u1", 3, 6), ("u2", 2, 0)]
+    sql = next(s for s, _ in conn.calls if "GROUP BY c.author_id" in s)
+    assert "jt.cited=1" in sql and "COUNT(DISTINCT jt.message_id)" in sql
+    assert "qa_retrieved_doc" in sql and "document_meta" not in sql   # 同库直连，零 cast
+    assert "created_at" not in sql                                    # 全期窗口（同榜同口径）
+
+
+def test_heroes_hits_none_when_fact_disabled(monkeypatch):
+    """事实表路径关（flag off / 未迁移环境）→ hits=None（诚实「算不出」，绝不 0 顶替），
+    且不发任何 JSON_TABLE 兜底查询（有意不做：无界表全解析不值得为激励信号冒险）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    conn = _install_conn(monkeypatch, _FakeConn(hero_rows=[("u1", "李娜", 3)]))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert resp.items[0].hits is None
+    assert not any("JSON_TABLE" in s or "qa_retrieved_doc" in s for s, _ in conn.calls)
+
+
+def test_mine_hits_backfill_only_searchable(monkeypatch):
+    """mine：仅已入库(searchable 且有 doc_id)行回填 hits；命中缺席=真 0；pending 行保持 None。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "true")
+    rows = [
+        ("C_A", "q1", "a1", "finance", "u1", "张三", "accepted", "searchable",
+         "DOC_1", None, None, None, None, None, None),
+        ("C_B", "q2", "a2", "finance", "u1", "张三", "accepted", "searchable",
+         "DOC_2", None, None, None, None, None, None),
+        ("C_C", "q3", "a3", "finance", "u1", "张三", "pending", "none",
+         None, None, None, None, None, None, None),
+    ]
+    _install_conn(monkeypatch, _FakeConn(list_rows=rows, doc_hits_rows=[("DOC_1", 4)]))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert [(i.contribution_id, i.hits) for i in resp.items] == [("C_A", 4), ("C_B", 0), ("C_C", None)]
+
+
+def test_mine_hits_failure_honest_none_list_intact(monkeypatch):
+    """引用数聚合炸 → 全部 hits=None、主列表照常返回（激励信号绝不拖垮主列表）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "true")
+    rows = [("C_A", "q1", "a1", "finance", "u1", "张三", "accepted", "searchable",
+             "DOC_1", None, None, None, None, None, None)]
+    _install_conn(monkeypatch, _FakeConn(list_rows=rows, boom_hits=True))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert len(resp.items) == 1 and resp.items[0].hits is None

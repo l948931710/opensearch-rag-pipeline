@@ -33,7 +33,13 @@ function initial(name: string) { return (name || '?').trim().charAt(0) || '?' }
         <span class="grid size-6 shrink-0 place-items-center rounded-md font-mono text-[12px] font-bold tabular-nums" :class="rankCls(h.rank)">{{ h.rank }}</span>
         <span class="grid size-7 shrink-0 place-items-center rounded-full bg-accent-soft text-[12px] font-semibold text-accent-text">{{ initial(h.author_name) }}</span>
         <span class="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground">{{ h.author_name || h.author_id }}<span v-if="h.author_id === me" class="ml-1 text-[11px] text-accent-text">（我）</span></span>
-        <span class="shrink-0 font-mono text-[13px] font-bold tabular-nums text-foreground">{{ h.count }}</span>
+        <!-- 被引用数（批次ε-2 R2）：次级价值信号，排名仍按入库篇数；算不出（null）自隐不用 0 顶替 -->
+        <span
+          v-if="h.hits != null" data-testid="hero-hits"
+          class="shrink-0 rounded bg-accent-soft px-1.5 py-px text-[10.5px] font-medium tabular-nums text-accent-text"
+          :title="`TA 的贡献被引用进 ${h.hits} 次回答（累计）`"
+        >引用 {{ h.hits }}</span>
+        <span class="shrink-0 font-mono text-[13px] font-bold tabular-nums text-foreground" title="已入库篇数（排名依据）">{{ h.count }}</span>
       </div>
     </div>
   </section>

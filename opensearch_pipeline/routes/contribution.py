@@ -145,6 +145,8 @@ class KbContributionItem(BaseModel):
     gap_query: Optional[str] = None
     # 失败原因（批次ε-2）：failed 行透出 ingestion_error（DB 自始有列此前不透出，作者只能瞎重试）
     ingestion_error: Optional[str] = None
+    # 被引用次数（批次ε-2 R2，仅 mine 端点回填；语义同 KbHeroItem.hits：None=算不出，0=真零）
+    hits: Optional[int] = None
 
 
 class KbContributionListResponse(BaseModel):
@@ -195,6 +197,9 @@ class KbHeroItem(BaseModel):
     author_id: str = ""
     author_name: str = ""
     count: int = 0
+    # 被引用次数（批次ε-2 R2）：cited=True 口径（与 Phase E 价值类看板同源）、全期窗口。
+    # None=算不出（事实表路径不可用/查询失败——诚实 NULL 纪律，绝不用 0 顶替）；0=真零引用。
+    hits: Optional[int] = None
 
 
 class KbHeroesResponse(BaseModel):
@@ -478,6 +483,35 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
         source_message_id=(req.source_message_id or None), gap_query=gq)
 
 
+def _doc_cited_hits(cur, doc_ids) -> Optional[dict]:
+    """doc_id → 被引用的回答数（批次ε-2 R2）。口径=cited=True（与 Phase E 价值类看板同源，
+    「被引用进答案」才是帮到人的信号；retrieved 只是曝光）、全期窗口（与英雄榜 searchable
+    COUNT 同窗，避免同榜两套时间口径）。COUNT(DISTINCT message_id)=同一回答引用同作者多
+    chunk/多文档只计一次回答。
+
+    仅事实表路径（qa_retrieved_doc 与 kb_contribution 同库同 collation，索引 JOIN 零 cast）；
+    fact 路径不可用/查询失败 → None=「算不出」（诚实 NULL 纪律，绝不用 0 顶替——0 是真零）。
+    JSON_TABLE 回退**有意不做**：qa_session_log 无界增长，heroes/mine 只有 aux 限流保护，
+    不值得为次要激励信号冒全表 JSON 解析的成本。"""
+    ids = [d for d in (doc_ids or []) if d]
+    if not ids:
+        return {}
+    from opensearch_pipeline.qa_facts import FACT_TABLE, fact_join_enabled
+    if not fact_join_enabled():
+        return None
+    try:
+        ph = ",".join(["%s"] * len(ids))
+        cur.execute(
+            f"SELECT jt.doc_id, COUNT(DISTINCT jt.message_id)"
+            f" FROM {_op_db()}.{FACT_TABLE} jt"
+            f" WHERE jt.cited=1 AND jt.doc_id IN ({ph}) GROUP BY jt.doc_id",
+            tuple(ids))
+        return {r[0]: int(r[1] or 0) for r in (cur.fetchall() or [])}
+    except Exception as e:   # noqa: BLE001 — 激励信号绝不拖垮主列表
+        logger.info("贡献引用数聚合失败（诚实 None）: %s", e)
+        return None
+
+
 @router.get("/api/kb/contributions/mine", response_model=KbContributionListResponse)
 def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
                           identity: Optional[Identity] = Depends(current_identity)):
@@ -501,10 +535,18 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
                 " ORDER BY created_at DESC LIMIT %s OFFSET %s",
                 (identity.user_id, limit + 1, offset))
             rows = cur.fetchall() or []
+            items = [_contrib_item(r) for r in rows[:limit]]
+            # 批次ε-2 R2：已入库行回填被引用数（None=算不出→前端自隐；无 doc_id 行保持 None）
+            hits = _doc_cited_hits(cur, [i.doc_id for i in items if i.doc_id
+                                         and i.ingestion_status == "searchable"])
+            if hits is not None:
+                for i in items:
+                    if i.doc_id and i.ingestion_status == "searchable":
+                        i.hits = hits.get(i.doc_id, 0)
     finally:
         conn.close()
     has_more = len(rows) > limit
-    return KbContributionListResponse(items=[_contrib_item(r) for r in rows[:limit]], has_more=has_more)
+    return KbContributionListResponse(items=items, has_more=has_more)
 
 
 def _contrib_pending_scope_sql(kb) -> tuple:
@@ -834,6 +876,26 @@ def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depe
             for i, r in enumerate(cur.fetchall() or []):
                 items.append(KbHeroItem(rank=i + 1, author_id=r[0] or "",
                                         author_name=r[1] or "", count=int(r[2] or 0)))
+            # 批次ε-2 R2：榜上作者回填被引用数（**排名仍按入库篇数，hits 只是次级信号**——
+            # 改排名=行为变更，本轮不做）。一条聚合查询覆盖 TOP10 全员，author 无引用=真 0。
+            if items:
+                from opensearch_pipeline.qa_facts import FACT_TABLE, fact_join_enabled
+                if fact_join_enabled():
+                    try:
+                        ph = ",".join(["%s"] * len(items))
+                        cur.execute(
+                            f"SELECT c.author_id, COUNT(DISTINCT jt.message_id)"
+                            f" FROM {_op_db()}.kb_contribution c"
+                            f" JOIN {_op_db()}.{FACT_TABLE} jt"
+                            f"   ON jt.doc_id = c.doc_id AND jt.cited=1"
+                            f" WHERE c.ingestion_status='searchable' AND c.author_id IN ({ph})"
+                            " GROUP BY c.author_id",
+                            tuple(it.author_id for it in items))
+                        by_author = {r[0]: int(r[1] or 0) for r in (cur.fetchall() or [])}
+                        for it in items:
+                            it.hits = by_author.get(it.author_id, 0)
+                    except Exception as e:   # noqa: BLE001 — 激励信号绝不拖垮榜单
+                        logger.info("heroes 引用数聚合失败（诚实 None）: %s", e)
     except Exception as e:
         logger.info("heroes 查询失败（fail-open 空榜）: %s", e)
     finally:

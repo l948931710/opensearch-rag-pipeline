@@ -117,3 +117,40 @@ test.describe('我的贡献 — 原稿可见 / 失败原因', () => {
     guard.assertClean();
   });
 });
+
+test.describe('价值反馈 — 被引用数（批次ε-2 R2）', () => {
+  test('我的贡献：searchable 行显「被引用 N 次」（含 0）；hits 缺失/非入库行自隐', async ({ page }) => {
+    const guard = attachConsoleGuard(page);
+    await mockMine(page, {
+      mine: [
+        MINE({ contribution_id: 'h1', state: 'searchable', review_status: 'accepted', ingestion_status: 'searchable', doc_id: 'D1', hits: 6 }),
+        MINE({ contribution_id: 'h2', state: 'searchable', review_status: 'accepted', ingestion_status: 'searchable', doc_id: 'D2', hits: null }),
+        MINE({ contribution_id: 'h3', state: 'pending', review_status: 'pending' }),
+      ],
+    });
+    await page.goto(ROUTE);
+    const chips = page.getByTestId('mycontrib-hits');
+    await expect(chips).toHaveCount(1);
+    await expect(chips).toHaveText('被引用 6 次');
+    guard.assertClean();
+  });
+
+  test('英雄榜：hits 非空显「引用 N」（0=真零照显）；null=算不出自隐；榜序仍按入库篇数', async ({ page }) => {
+    await mockMine(page, { mine: [] });
+    await page.route('**/api/kb/contributions/heroes*', (r) => r.fulfill({
+      contentType: 'application/json', body: JSON.stringify({ items: [
+        { rank: 1, author_id: 'u1', author_name: '李娜', count: 8, hits: 41 },
+        { rank: 2, author_id: 'u2', author_name: '王伟', count: 5, hits: 0 },
+        { rank: 3, author_id: 'u3', author_name: '陈强', count: 3, hits: null },
+      ] }),
+    }));
+    await page.goto(ROUTE);
+    const chips = page.getByTestId('hero-hits');
+    await expect(chips).toHaveCount(2);
+    await expect(chips.nth(0)).toHaveText('引用 41');
+    await expect(chips.nth(1)).toHaveText('引用 0');
+    // 榜序=入库篇数（hits 不改序）：李娜(8) 在 王伟(5) 前
+    const names = await page.locator('section:has-text("英雄榜") .truncate').allInnerTexts();
+    expect(names.findIndex((n) => n.includes('李娜'))).toBeLessThan(names.findIndex((n) => n.includes('王伟')));
+  });
+});
