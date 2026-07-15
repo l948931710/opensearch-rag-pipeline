@@ -222,3 +222,34 @@ describe('MyContributions — 重交/失败原因/原稿展开（批次ε-2）',
     expect(w.find('[data-testid="mycontrib-content"]').exists()).toBe(false)
   })
 })
+
+// 批次ε-2 R2「价值反馈」：被引用数（cited 口径全期窗；null=算不出自隐、0=真零照显；排名不变）
+describe('被引用数展示（批次ε-2 R2）', () => {
+  it('HeroBoard：hits 非空显「引用 N」（含 0=真零）；null/缺字段（老后端）自隐', async () => {
+    withSession()
+    useContribute().heroes.value = [
+      { rank: 1, author_id: 'u1', author_name: '李娜', count: 8, hits: 41 },
+      { rank: 2, author_id: 'u2', author_name: '张三', count: 5, hits: 0 },
+      { rank: 3, author_id: 'u3', author_name: '王五', count: 3, hits: null },
+      { rank: 4, author_id: 'u4', author_name: '赵六', count: 1 },
+    ] as never
+    const HeroBoard = (await import('@/components/contribute/HeroBoard.vue')).default
+    const w = mount(HeroBoard)
+    const chips = w.findAll('[data-testid="hero-hits"]')
+    expect(chips.map((c) => c.text())).toEqual(['引用 41', '引用 0'])   // null/缺字段两行自隐
+    expect(w.text()).toContain('8')                                     // 排名主数字（入库篇数）仍在
+  })
+
+  it('MyContributions：仅已入库行显「被引用 N 次」；非 searchable / hits 缺失自隐', () => {
+    withSession()
+    useContribute().myContribs.value = [
+      { contribution_id: 'h1', question: 'q1', content: 'a', category_dept: 'hr', author_id: 'u1', author_name: '', review_status: 'accepted', ingestion_status: 'searchable', state: 'searchable', doc_id: 'D1', review_note: '', created_at: '2026-07-01', reviewed_at: null, hits: 6 },
+      { contribution_id: 'h2', question: 'q2', content: 'a', category_dept: 'hr', author_id: 'u1', author_name: '', review_status: 'accepted', ingestion_status: 'searchable', state: 'searchable', doc_id: 'D2', review_note: '', created_at: '2026-07-01', reviewed_at: null, hits: null },
+      { contribution_id: 'h3', question: 'q3', content: 'a', category_dept: 'hr', author_id: 'u1', author_name: '', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-07-01', reviewed_at: null, hits: 9 },
+    ] as never
+    const w = mount(MyContributions)
+    const chips = w.findAll('[data-testid="mycontrib-hits"]')
+    expect(chips.length).toBe(1)
+    expect(chips[0].text()).toBe('被引用 6 次')
+  })
+})

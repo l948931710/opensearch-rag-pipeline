@@ -54,6 +54,12 @@ function reopen(c: ContributionItem) {
             </div>
           </button>
           <div class="flex shrink-0 items-center gap-1.5">
+            <!-- 被引用数（批次ε-2 R2）：已入库行的价值反馈；算不出（null/老后端）自隐，0=真零照显 -->
+            <span
+              v-if="c.state === 'searchable' && c.hits != null" data-testid="mycontrib-hits"
+              class="rounded bg-accent-soft px-1.5 py-px text-[10.5px] font-medium tabular-nums text-accent-text"
+              :title="`这条知识被引用进 ${c.hits} 次回答（累计）`"
+            >被引用 {{ c.hits }} 次</span>
             <ContribBadge :state="c.state" />
             <button
               v-if="c.state === 'failed'" type="button" :disabled="isBusy(`ct:${c.contribution_id}`)"

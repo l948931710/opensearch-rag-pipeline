@@ -34,11 +34,16 @@ export interface ContributionItem {
   gap_query?: string | null
   // 失败原因（批次ε-2）：failed 行透出，作者不再瞎重试；老后端缺字段 → 兜底句
   ingestion_error?: string | null
+  // 被引用数（批次ε-2 R2，cited 口径全期窗）：null/undefined=算不出 → 自隐；0=真零照显
+  hits?: number | null
 }
 // 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
 // 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。
 export interface ContributionRevision { question?: string; content?: string; category_dept?: string }
-export interface HeroItem { rank: number; author_id: string; author_name: string; count: number }
+export interface HeroItem {
+  rank: number; author_id: string; author_name: string; count: number
+  hits?: number | null   // 被引用数（批次ε-2 R2）：null=算不出 → 自隐；排名仍按 count
+}
 
 interface GapsResp { items: GapItem[]; summary: GapsSummary; has_more: boolean }
 interface ContribListResp { items: ContributionItem[]; has_more: boolean }
@@ -95,8 +100,9 @@ function _previewGaps(): GapsResp {
 }
 function _previewMine(): ContributionItem[] {
   return [
-    { contribution_id: 'c1', question: '宿舍门禁卡丢了怎么补办？', content: '联系行政前台…', category_dept: 'admin', author_id: 'preview', author_name: '设计预览', review_status: 'accepted', ingestion_status: 'searchable', state: 'searchable', doc_id: 'DOC_1', review_note: '', created_at: '2026-06-20', reviewed_at: '2026-06-21' },
+    { contribution_id: 'c1', question: '宿舍门禁卡丢了怎么补办？', content: '联系行政前台…', category_dept: 'admin', author_id: 'preview', author_name: '设计预览', review_status: 'accepted', ingestion_status: 'searchable', state: 'searchable', doc_id: 'DOC_1', review_note: '', created_at: '2026-06-20', reviewed_at: '2026-06-21', hits: 6 },
     { contribution_id: 'c2', question: '年假怎么申请？', content: '在 OA…', category_dept: 'hr', author_id: 'preview', author_name: '设计预览', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '2026-06-26', reviewed_at: null },
+    { contribution_id: 'c3', question: '模具验收单在哪下载？', content: '在 OA 表单中心搜「模具验收」…', category_dept: 'production', author_id: 'preview', author_name: '设计预览', review_status: 'rejected', ingestion_status: 'none', state: 'rejected', doc_id: null, review_note: '', created_at: '2026-06-25', reviewed_at: '2026-06-26' },
   ]
 }
 function _previewPending(): ContributionItem[] {
@@ -107,9 +113,9 @@ function _previewPending(): ContributionItem[] {
 }
 function _previewHeroes(): HeroItem[] {
   return [
-    { rank: 1, author_id: 'u1', author_name: '李娜', count: 8 },
-    { rank: 2, author_id: 'u2', author_name: '张三', count: 5 },
-    { rank: 3, author_id: 'preview', author_name: '设计预览', count: 3 },
+    { rank: 1, author_id: 'u1', author_name: '李娜', count: 8, hits: 41 },
+    { rank: 2, author_id: 'u2', author_name: '张三', count: 5, hits: 0 },
+    { rank: 3, author_id: 'preview', author_name: '设计预览', count: 3, hits: 12 },
   ]
 }
 
