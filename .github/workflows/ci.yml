@@ -196,7 +196,9 @@ jobs:
       # ③ trivy fs 扫描【阻塞，HIGH/CRITICAL 且有修复版才红】：npm lock + Python lock +
       #    Dockerfile 配置面（digest 固定/USER 非 root 等）。与 pip-audit 互补：trivy 管
       #    npm 侧与镜像配置，pip-audit 管 Python 侧语义更细。
-      - name: Trivy scan (fs: lockfiles + Dockerfile config — BLOCKING on fixable HIGH/CRITICAL)
+      # ⚠️ step name 含「冒号+空格」必须整体加引号——未引号的 `fs:` 会把 name 解析成
+      # 嵌套映射 → 整个 workflow 无效 → 每次 push 0 秒 startup failure（2026-07-12..15 实翻）
+      - name: "Trivy scan (fs: lockfiles + Dockerfile config — BLOCKING on fixable HIGH/CRITICAL)"
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: fs
