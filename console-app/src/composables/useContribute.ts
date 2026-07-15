@@ -170,12 +170,7 @@ async function loadPending(offset = 0) {
   clearLoadError('pending')
   try {
     const r = await apiJson<ContribListResp>(`/api/kb/contributions/pending?limit=50&offset=${offset}`, { auth: true })
-<<<<<<< HEAD
-    // 批次ε-1：offset>0=「加载更多」追加；0=回首页替换（与 loadGaps 同语义）
-=======
-    if (fp !== identityFingerprint()) return   // 身份已切换：旧身份的待审贡献整体丢弃
     // 批次ε-1：offset>0=「加载更多」追加；0=回首页替换（审核队列专属分页——gaps 已 ε-4 单页化）
->>>>>>> e701b13 (ux(console): 批次ε-4 待回答改高频无人回答排行 Top 30——365 天窗与 asks 口径解耦)
     pendingContribs.value = offset ? [...pendingContribs.value, ...(r.items || [])] : (r.items || [])
     pendingHasMore.value = !!r.has_more
   } catch (e) {
@@ -291,15 +286,9 @@ export function useContribute() {
   }
 }
 
-<<<<<<< HEAD
 /** 仅供测试：重置 store。（分支侧 P0-D 已升级为身份切换共用 _resetContributeState——随大合并收敛。） */
 export function __resetContribute() {
   gaps.value = []; gapsSummary.value = null; gapsWindowDays.value = 30
-=======
-/** 重置 store（运行期身份切换与测试复位共用；含半填的贡献表单——不跨身份残留）。 */
-function _resetContributeState() {
-  gaps.value = []; gapsSummary.value = null; gapsWindowDays.value = 30
->>>>>>> e701b13 (ux(console): 批次ε-4 待回答改高频无人回答排行 Top 30——365 天窗与 asks 口径解耦)
   myContribs.value = []; pendingContribs.value = []; pendingHasMore.value = false; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''
