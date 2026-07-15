@@ -311,7 +311,10 @@ describe('GapList — 窗口标注（ε-3 R3）', () => {
     gapsWindowDays.value = 30
     const w = mount(GapList)
     expect(w.find('[data-testid="gap-window-note"]').text()).toContain('近 30 天')
-    expect(w.text()).toContain('近 30 天内大家的问题都能在知识库里找到答案')
+    // ε-5 R2 空态两成因：标题自带窗口限定 + 副题明说出窗语义（出窗计数=远期立项，文案方案）
+    expect(w.text()).toContain('近 30 天内暂无未答出的提问')
+    expect(w.text()).toContain('超出统计窗口')
+    expect(w.text()).toContain('不代表已解决')
   })
 
   it('loadGaps 收 window_days=14 → 标注跟随；老后端缺字段 → 回落 30', async () => {
@@ -435,5 +438,25 @@ describe('MyContributions — 隐形态补全与分流重投（ε-5 R1）', () =
     useContribute().myContribs.value = [FAILED] as never
     w = mount(MyContributions)
     expect(retryBtns(w).length).toBe(1)
+  })
+})
+
+// 批次ε-5 R2：台账词表 seam 锁——后端封闭集(_KB_BADGE_VOCAB, test_kb_status_badge_closed_set 锁)
+// ↔ 前端 BADGE_TONE ↔ MyContributions displayState 特判词，三处人工同步靠双侧测试互指兜底
+describe('台账词表 seam 锁（ε-5 R2）', () => {
+  // 与 opensearch_pipeline/api.py::_KB_BADGE_VOCAB 逐字镜像——改词表两边测试都得动（有意的摩擦）
+  const BACKEND_VOCAB = ['已退役', '已隔离', '未入索引', '已上线', '处理失败',
+                         '已驳回', '内容未变', '待审核', '排队中', '处理中']
+
+  it('BADGE_TONE 键集 = 后端封闭集镜像（漂移=可见性静默回归，先在这里红）', async () => {
+    const { BADGE_TONE } = await import('@/lib/kb')
+    expect(new Set(Object.keys(BADGE_TONE))).toEqual(new Set(BACKEND_VOCAB))
+  })
+
+  it('MyContributions displayState 特判词 ⊆ 词表（新增徽章词没做分流决策 → 这里红）', async () => {
+    const { BADGE_TONE } = await import('@/lib/kb')
+    // 与 MyContributions.vue 的 STALLED_BADGES + 待审核/内容未变 特判逐字对齐
+    const DISPLAY_KEYS = ['待审核', '内容未变', '已隔离', '未入索引', '处理失败']
+    for (const k of DISPLAY_KEYS) expect(k in BADGE_TONE, `特判词 ${k} 不在词表`).toBe(true)
   })
 })

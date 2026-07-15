@@ -2126,3 +2126,29 @@ def test_governance_dept_qa_hits_7d_none_on_wow_failure(monkeypatch):
     assert row.qa_hits == 30            # 主口径独立存活
     assert row.qa_hits_7d is None       # 绝不伪装成 0
     assert row.qa_wow_net is None and row.qa_wow is None
+
+
+# ── 批次ε-5 R2：台账徽章词表封闭集锁（跨层 seam——前端按字面量映射，词表漂移=可见性静默回归）──
+def test_kb_status_badge_closed_set():
+    """枚举驱动全组合：_kb_status_badge 输出 ⊆ _KB_BADGE_VOCAB 且每个词都可达（双向收紧）。
+    新增/改名一个分支而未登记进 _KB_BADGE_VOCAB → 本测试红，倒逼同步前端
+    console-app/src/lib/kb.ts BADGE_TONE 与 MyContributions displayState 特判词
+    （前端侧对应锁=contribute.spec.ts「台账词表 seam 锁」）。"""
+    import itertools
+    from opensearch_pipeline.api import _kb_status_badge, _KB_BADGE_VOCAB
+
+    content_vals = ["", "NOT_STARTED", "DONE", "FAILED", "REJECTED",
+                    "SKIPPED_DUPLICATE", "PENDING_APPROVAL", "RUNNING", "whatever"]
+    index_vals = ["", "NOT_INDEXED", "SUCCESS", "INDEXED", "FAILED"]
+    doc_vals = [None, "active", "retired"]
+    publish_vals = [None, "PUBLISHED", "QUARANTINED", "SKIPPED_EXPLOSION"]
+    chunk_status_vals = [None, "OK", "EMPTY"]
+    chunk_active_vals = [None, 0, 3]
+
+    seen = set()
+    for cs, ix, ds, ps, cks, ca in itertools.product(
+            content_vals, index_vals, doc_vals, publish_vals, chunk_status_vals, chunk_active_vals):
+        out = _kb_status_badge(cs, ix, ds, ca, ps, cks)
+        assert out in _KB_BADGE_VOCAB, f"未登记的新徽章词 {out!r}（inputs cs={cs} ix={ix} ds={ds} ps={ps} cks={cks} ca={ca}）"
+        seen.add(out)
+    assert seen == _KB_BADGE_VOCAB, f"词表不再全可达（死词该从封闭集摘除）：缺 {_KB_BADGE_VOCAB - seen}"
