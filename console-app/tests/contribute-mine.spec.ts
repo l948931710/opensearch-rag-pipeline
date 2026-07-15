@@ -82,7 +82,7 @@ test.describe('我的贡献 — 修改重交', () => {
     guard.assertClean();
   });
 
-  test('非 rejected 行不显重交入口（回归）', async ({ page }) => {
+  test('非 rejected/非入库受阻 行不显重交入口（回归）', async ({ page }) => {
     await mockMine(page, { mine: [MINE({ state: 'pending', review_status: 'pending' })] });
     await page.goto(ROUTE);
     await expect(page.getByTestId('mycontrib-toggle')).toBeVisible();
@@ -248,5 +248,55 @@ test.describe('待回答 — 高频排行 Top 30（批次ε-4）', () => {
     await expect(page.getByTestId('gap-rank')).toHaveCount(12);
     await expect(page.getByTestId('gap-total-badge')).toHaveText('12');
     await expect(page.getByTestId('gap-top-note')).toHaveCount(0);
+  });
+});
+
+test.describe('状态可辨收尾 — 隐形态补全与分流重投（批次ε-5 R1）', () => {
+  const REG5 = (over: Record<string, unknown> = {}) => MINE({
+    contribution_id: 'r5', state: 'registering', review_status: 'accepted',
+    ingestion_status: 'registered', doc_id: 'D5', review_note: '', ...over,
+  });
+
+  test('已隔离行重投：弹窗顶警示明说「再次被隔离」+ 旧稿预填保留（底稿改）', async ({ page }) => {
+    const guard = attachConsoleGuard(page);
+    await mockMine(page, { mine: [REG5({ doc_badge: '已隔离' })] });
+    await page.goto(ROUTE);
+    await expect(page.getByTestId('mycontrib-stall-reason')).toContainText('敏感信息隔离');
+    await page.getByTestId('mycontrib-reopen').click();
+    await expect(page.getByTestId('contribute-warning')).toContainText('再次被隔离');
+    await expect(page.getByPlaceholder(/写下步骤或要点/)).toHaveValue('至少 5 年，依据财务档案管理制度第 3 章。');
+    guard.assertClean();
+  });
+
+  test('未入索引行重投：常规改稿警示（无「隔离」措辞）——按成因分流', async ({ page }) => {
+    await mockMine(page, { mine: [REG5({ doc_badge: '未入索引' })] });
+    await page.goto(ROUTE);
+    await page.getByTestId('mycontrib-reopen').click();
+    const warning = page.getByTestId('contribute-warning');
+    await expect(warning).toContainText('修改完善');
+    await expect(warning).not.toContainText('隔离');
+  });
+
+  test('处理失败（隐形态补全）→「入库受阻」+专属提示+重投；内容未变 →「同内容已在库」+去重提示、无重投', async ({ page }) => {
+    await mockMine(page, {
+      mine: [REG5({ contribution_id: 'pf', doc_badge: '处理失败' }),
+             REG5({ contribution_id: 'dup', doc_badge: '内容未变' })],
+    });
+    await page.goto(ROUTE);
+    await expect(page.getByText('入库受阻')).toBeVisible();
+    await expect(page.getByTestId('mycontrib-stall-reason')).toContainText('入库处理失败');
+    await expect(page.getByText('同内容已在库')).toBeVisible();
+    await expect(page.getByTestId('mycontrib-duplicate-hint')).toContainText('完全相同');
+    await expect(page.getByTestId('mycontrib-reopen')).toHaveCount(1);   // 仅处理失败行有
+    await expect(page.getByText('已采纳·待入库')).toHaveCount(0);        // 两个隐形态都不再冒充排队
+  });
+
+  test('rejected 行重投弹窗无警示条（警示只属于入库受阻成因）', async ({ page }) => {
+    await mockMine(page, { mine: [MINE()] });
+    await page.goto(ROUTE);
+    await page.getByTestId('mycontrib-reopen').click();
+    // 「提交贡献」全 src 唯一（弹窗提交钮）——'贡献知识' 会 strict-mode 多命中页头按钮+弹窗标题
+    await expect(page.getByRole('button', { name: '提交贡献' })).toBeVisible();
+    await expect(page.getByTestId('contribute-warning')).toHaveCount(0);
   });
 });

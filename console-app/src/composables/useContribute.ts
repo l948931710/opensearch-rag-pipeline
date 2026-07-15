@@ -82,6 +82,8 @@ const formContent = ref('')
 const formDept = ref('')
 const formSourceMsg = ref('')
 const formGapQuery = ref('')
+// 重投警示（ε-5 R1）：入库受阻行「修改重交」按成因带警示进弹窗（行内警示在弹窗打开后已离开视野）
+const formWarning = ref('')
 const submitBusy = ref(false)
 const submitErr = ref('')
 const submitOk = ref(false)
@@ -207,7 +209,7 @@ async function loadHeroes() {
 // ── 弹窗 / 提交 ──
 // 批次ε-2：prefill 扩展 content（被驳回「修改重交」带旧稿重开表单）；既有调用点（GapList 等）
 // 不传 content → 照旧空白起草，行为不变。
-function openModal(prefill?: { question?: string; content?: string; dept?: string; sourceMessageId?: string; gapQuery?: string }) {
+function openModal(prefill?: { question?: string; content?: string; dept?: string; sourceMessageId?: string; gapQuery?: string; warning?: string }) {
   const s = useSession()
   formQuestion.value = prefill?.question || ''
   formContent.value = prefill?.content || ''
@@ -218,6 +220,7 @@ function openModal(prefill?: { question?: string; content?: string; dept?: strin
     : (valid(own) ? own : (CONTRIB_DEPT_OPTS[0]?.id || ''))
   formSourceMsg.value = prefill?.sourceMessageId || ''
   formGapQuery.value = prefill?.gapQuery || ''
+  formWarning.value = prefill?.warning || ''
   submitErr.value = ''; submitOk.value = false
   modalOpen.value = true
 }
@@ -294,7 +297,7 @@ export function useContribute() {
   const reviewCount = computed(() => pendingContribs.value.length)
   return {
     gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
-    modalOpen, formQuestion, formContent, formDept, submitBusy, submitErr, submitOk,
+    modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, loadMine, loadPending, loadHeroes,
     openModal, closeModal, submitContribution, acceptContribution, rejectContribution, retryContribution,
@@ -307,7 +310,7 @@ function _resetContributeState() {
   myContribs.value = []; pendingContribs.value = []; pendingHasMore.value = false; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''
-  formSourceMsg.value = ''; formGapQuery.value = ''; submitBusy.value = false; submitErr.value = ''; submitOk.value = false
+  formSourceMsg.value = ''; formGapQuery.value = ''; formWarning.value = ''; submitBusy.value = false; submitErr.value = ''; submitOk.value = false
 }
 
 /** 仅供测试：重置 store + 忘掉已观测身份（下次 sync 首见采纳）。 */

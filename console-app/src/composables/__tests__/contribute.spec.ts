@@ -198,7 +198,7 @@ describe('MyContributions — 重交/失败原因/原稿展开（批次ε-2）',
     expect(submit).toMatchObject({ source_message_id: 'm9', gap_query: '报销凭证保存年限' })
   })
 
-  it('非 rejected 行不显重交入口', () => {
+  it('非 rejected/非入库受阻 行不显重交入口', () => {
     const w = mountMine([{ ...BASE }])
     expect(w.find('[data-testid="mycontrib-reopen"]').exists()).toBe(false)
   })
@@ -365,5 +365,75 @@ describe('GapList — Top 30 排行（ε-4）', () => {
     expect(w.find('[data-testid="gap-total-badge"]').text()).toBe('12')
     expect(w.find('[data-testid="gap-window-note"]').text()).toContain('近一年')
     expect(w.find('[data-testid="gap-window-note"]').text()).toContain('按询问次数排序')
+  })
+})
+
+// 批次ε-5 R1：状态可辨收尾——隐形态补全（处理失败/内容未变）+ 入库受阻行分流重投
+describe('MyContributions — 隐形态补全与分流重投（ε-5 R1）', () => {
+  const REG5 = (over: Record<string, unknown> = {}) => ({
+    contribution_id: 'r1', question: '车间安全巡检表在哪？', content: '在 OA…', category_dept: 'production',
+    author_id: 'u1', author_name: '张三', review_status: 'accepted', ingestion_status: 'registered',
+    state: 'registering', doc_id: 'D1', review_note: '', created_at: '2026-07-01', reviewed_at: '2026-07-02',
+    source_message_id: 'm7', gap_query: '巡检表原问', ...over,
+  })
+
+  it('doc_badge=处理失败 → 「入库受阻」+专属提示（非排队措辞）+重投入口（作者无重试权的出路）', () => {
+    withSession()
+    useContribute().myContribs.value = [REG5({ doc_badge: '处理失败' })] as never
+    const w = mount(MyContributions)
+    expect(w.text()).toContain('入库受阻')
+    expect(w.find('[data-testid="mycontrib-stall-reason"]').text()).toContain('入库处理失败')
+    expect(w.find('[data-testid="mycontrib-reopen"]').exists()).toBe(true)
+  })
+
+  it('doc_badge=内容未变 → 「同内容已在库」muted+去重事实提示，无重投（原样重投仍判重复）', () => {
+    withSession()
+    useContribute().myContribs.value = [REG5({ doc_badge: '内容未变' })] as never
+    const w = mount(MyContributions)
+    expect(w.text()).toContain('同内容已在库')
+    expect(w.find('[data-testid="mycontrib-duplicate-hint"]').text()).toContain('完全相同')
+    expect(w.find('[data-testid="mycontrib-reopen"]').exists()).toBe(false)
+    expect(w.find('[data-testid="mycontrib-stall-reason"]').exists()).toBe(false)
+    expect(w.text()).not.toContain('待入库')
+  })
+
+  it('入库受阻重投：已隔离 → 弹窗警示明说「再次被隔离」；未入索引 → 常规改稿措辞（分流）', async () => {
+    withSession()
+    const c = useContribute()
+    c.myContribs.value = [REG5({ contribution_id: 'q1', doc_badge: '已隔离' }),
+                          REG5({ contribution_id: 'q2', doc_badge: '未入索引' })] as never
+    const w = mount(MyContributions)
+    const btns = w.findAll('[data-testid="mycontrib-reopen"]')
+    expect(btns.length).toBe(2)
+    await btns[0].trigger('click')
+    expect(c.formWarning.value).toContain('再次被隔离')
+    expect(c.formContent.value).toBe('在 OA…')          // 预填保留：旧稿做底稿
+    expect(c.formQuestion.value).toContain('巡检表')
+    await btns[1].trigger('click')
+    expect(c.formWarning.value).toContain('修改完善')
+    expect(c.formWarning.value).not.toContain('隔离')
+  })
+
+  it('rejected 行重投不带警示；openModal 无 warning 清残留（不跨行泄漏）', async () => {
+    withSession()
+    const c = useContribute()
+    c.formWarning.value = '残留警示'
+    c.openModal({ question: 'Q' })
+    expect(c.formWarning.value).toBe('')
+  })
+
+  it('重试按钮按角色收敛：员工不显死按钮（端点管理员专属，点了恒 403），但有「修改重交」自助出路；canManage 显重试', () => {
+    withSession({ canManage: false })
+    const FAILED = REG5({ review_status: 'accepted', ingestion_status: 'failed', state: 'failed', doc_badge: undefined })
+    useContribute().myContribs.value = [FAILED] as never
+    let w = mount(MyContributions)
+    const retryBtns = (x: ReturnType<typeof mount>) => x.findAll('button').filter((b) => b.text().trim() === '重试')
+    expect(retryBtns(w).length).toBe(0)
+    expect(w.find('[data-testid="mycontrib-reopen"]').exists()).toBe(true)   // 自助出路
+    __resetContribute()
+    withSession({ canManage: true, role: 'dept_admin' })
+    useContribute().myContribs.value = [FAILED] as never
+    w = mount(MyContributions)
+    expect(retryBtns(w).length).toBe(1)
   })
 })

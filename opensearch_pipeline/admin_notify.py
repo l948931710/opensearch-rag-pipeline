@@ -248,8 +248,9 @@ def notify_contribution_result(contribution_id: str, outcome: str, note: str = "
                     "需知识库管理员放行后入库，请留意后续状态。")
         elif outcome == "failed":
             reason = (error or "").strip()[:80] or "系统原因"
+            # ε-5 R1 措辞修正：重试端点是管理员专属，对作者说「你可重试」是假承诺
             text = (f"【富岭知识库】你的知识贡献「{q}」已被采纳但入库失败（{reason}），"
-                    "可到控制台「知识贡献」重试。")
+                    "可到控制台「知识贡献」修改后重新提交，或联系管理员重试。")
         elif outcome == "rejected":
             reason = (note or "").strip()[:80] or "未填写理由"
             text = (f"【富岭知识库】你的知识贡献「{q}」未被采纳（{reason}）。"
