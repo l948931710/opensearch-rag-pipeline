@@ -115,6 +115,9 @@ RAG_PY ?= python3
 release-gate: ## 部署前评测闸(dim9 闭环): run→auto-judge→merge --strict; exit≠0 阻断发布
 	bash deploy/eval_release_gate.sh
 
+general-ability-eval: ## 通用能力评测门(门2防劫持+门3分级路由,离线零网络; LIVE=1 加真实分诊/生成核验)
+	$(RAG_PY) -m eval_harness.general_ability_eval $(if $(LIVE),--live,)
+
 eval-baseline-freeze: ## 冻结评测基线(首次可接受 gate 后一次性): make eval-baseline-freeze RESULTS=<rundir>/report.json
 	@test -n "$(RESULTS)" || { echo "用法: make eval-baseline-freeze RESULTS=<rundir>/report.json"; exit 2; }
 	$(RAG_PY) -m eval_harness.run_eval baseline-freeze --results "$(RESULTS)" --baseline eval_harness/goldset/baseline.json
