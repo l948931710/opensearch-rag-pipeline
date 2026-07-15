@@ -19,6 +19,21 @@
   align-items: flex-start;
 }
 
+/* ---------- 通用回答来源徽标（中性弱样式，比 guard 更淡） ---------- */
+.general-note {
+  align-self: flex-start;
+  background: var(--surface-3);
+  border-radius: 999rpx;
+  padding: 6rpx 18rpx;
+  margin-bottom: 16rpx;
+}
+
+.general-text {
+  font-size: 22rpx;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
 .guard-ico {
   font-size: 30rpx;
   color: var(--warn);

@@ -414,6 +414,25 @@
   margin-bottom: 24rpx;
 }
 
+/* 引导式拒答话术（多行逐行渲染）：单行沿用居中 = 与旧 nr-desc 视觉一致；
+   多行（含「· 《标题》」列表行）左对齐更可读 */
+.nr-desc-block {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 24rpx;
+}
+
+.nr-desc-line {
+  font-size: 25rpx;
+  color: var(--text-3);
+  line-height: 1.6;
+  text-align: center;
+}
+
+.nr-line-left {
+  text-align: left;
+}
+
 /* 「换个说法」chips：点按回填输入框（不自动发送）；老核无 gap，间距用 margin */
 .nr-chips {
   display: flex;
