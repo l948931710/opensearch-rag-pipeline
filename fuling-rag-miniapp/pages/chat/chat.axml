@@ -82,7 +82,13 @@
               <view class="nr-body">
                 <text class="ico ico-search nr-ico"></text>
                 <text class="nr-title">未找到相关内容</text>
-                <text class="nr-desc">抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。</text>
+                <!-- 引导式拒答话术（后端 answer 多行文本逐行渲染；a:for-item 必须显式命名
+                     防遮蔽外层消息变量 item）；nrLines 空 = 老后端/flag 关 → 回退旧文案 -->
+                <view a:if="{{item.nrLines && item.nrLines.length}}" class="nr-desc-block">
+                  <text class="nr-desc-line {{item.nrLines.length > 1 ? 'nr-line-left' : ''}}"
+                        a:for="{{item.nrLines}}" a:for-item="ln" a:key="*this">{{ln}}</text>
+                </view>
+                <text a:else class="nr-desc">抱歉，当前知识库中未找到与您问题相关的信息。请尝试换一种方式描述您的问题。</text>
                 <view a:if="{{item.rephrase && item.rephrase.length}}" class="nr-chips">
                   <text class="nr-chips-label">试试这样问：</text>
                   <view class="nr-chip" a:for="{{item.rephrase}}" a:key="*this" data-q="{{item}}" onTap="onNrChipTap">
@@ -101,6 +107,7 @@
               <answer-bubble
                 blocks="{{item.blocks}}"
                 guard="{{item.guard}}"
+                general="{{item.general}}"
                 instant="{{item.instant}}"
                 onGrow="onAnswerGrow"
                 onTypingEnd="onTypingEnd"

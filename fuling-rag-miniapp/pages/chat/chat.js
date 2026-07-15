@@ -17,7 +17,7 @@ import {
 import {
   genConvId, deriveTitle, relativeTimeLabel, mergeServerList, leanMessages,
   ensureOwner, loadIndex, loadMessages, saveMessages, touchConversation,
-  removeConversation,
+  removeConversation, splitNrLines,
 } from '../../utils/conversations';
 
 // 静态兜底（/api/hot-questions 不可达时显示；与服务端 _HOT_QUESTIONS_FALLBACK 同源）
@@ -64,13 +64,14 @@ function reviveMessage(m) {
   if (m.noResult) {
     return {
       id: nextId(), role: 'ai', noResult: true,
+      answer: m.answer || '', nrLines: splitNrLines(m.answer),
       rephrase: m.rephrase || [], messageId: m.messageId || '',
       question: m.question || '', handoffDone: !!m.handoffDone,
     };
   }
   return {
     id: nextId(), role: 'ai',
-    blocks: m.blocks || [], guard: !!m.guard,
+    blocks: m.blocks || [], guard: !!m.guard, general: !!m.general,
     sources: m.sources || [], sourcesOpen: false,
     messageId: m.messageId || '', copyText: m.copyText || '',
     question: m.question || '', instant: true,
@@ -89,6 +90,8 @@ function reviveServerItems(items) {
     if (it.status === 'NO_RESULT') {
       msgs.push({
         id: nextId(), role: 'ai', noResult: true, rephrase: [],
+        // 服务端历史里引导式拒答话术落在 answer_text —— 恢复时同样可见
+        answer: it.answer || '', nrLines: splitNrLines(it.answer),
         messageId: it.message_id || '', question: it.question,
       });
       return;
@@ -723,11 +726,17 @@ Page({
         }
 
         // 知识库未命中（检索为空或 LLM 拒答）：空结果卡，隐藏来源/赞踩；
-        // rephrase = 服务端「换个说法」建议（相似 SUCCESS 问题优先，可答性有保证）
+        // rephrase = 服务端「换个说法」建议（相似 SUCCESS 问题优先，可答性有保证）。
+        // answer = 引导式拒答话术（RAG_GUIDED_REFUSAL：换说法/相近文档标题/知识贡献
+        // 入口，多行文本）；nrLines 预拆行供 axml 逐行渲染，空则回退硬编码旧文案
+        // —— flag 关时 answer 即旧固定文案，视觉等价。
         if (resp.no_result) {
+          const nrAnswer = String(resp.answer || '').trim();
           this._updateMessage(aiId, {
             loading: false,
             noResult: true,
+            answer: nrAnswer,
+            nrLines: splitNrLines(nrAnswer),
             rephrase: resp.rephrase || [],
             messageId: resp.message_id || '',
           });
@@ -747,6 +756,8 @@ Page({
           loading: false,
           blocks,
           guard: !!resp.guard,
+          // 通用回答徽标（resp.source ∈ general|smalltalk）：与正文免责尾注双保险
+          general: resp.source === 'general' || resp.source === 'smalltalk',
           sources: mapSources(resp.sources),
           sourcesOpen: false,
           messageId: resp.message_id || '',

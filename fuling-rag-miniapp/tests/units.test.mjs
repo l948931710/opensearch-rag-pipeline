@@ -22,7 +22,7 @@ const { parseTextBlock, plainText, plainLength, sliceParas } =
 const { createTypewriter } = await import(pathToFileURL(join(tmp, 'typewriter.mjs')));
 const {
   genConvId, deriveTitle, parseServerTime, relativeTimeLabel,
-  mergeServerList, leanMessages, capIndex, MAX_MESSAGES,
+  mergeServerList, leanMessages, capIndex, MAX_MESSAGES, splitNrLines,
 } = await import(pathToFileURL(join(tmp, 'conversations.mjs')));
 
 // ── markdown.parseTextBlock ──────────────────────────────────
@@ -242,18 +242,40 @@ test('leanMessages：丢 loading/error 瞬态，保最终答案/NO_RESULT，AI �
     { role: 'ai', loading: true, question: '问题一' },              // 瞬态：丢
     { role: 'ai', error: true, errorText: '失败', question: 'x' },  // 瞬态：丢
     { role: 'ai', blocks: [{ type: 'text', text: '答案' }], sources: [{ idx: 1 }],
-      messageId: 'mid1', copyText: '答案', question: '问题一', guard: true },
+      messageId: 'mid1', copyText: '答案', question: '问题一', guard: true, general: true },
     { role: 'ai', noResult: true, rephrase: ['换个说法'], messageId: 'mid2',
-      question: '问题二', handoffDone: true },
+      question: '问题二', handoffDone: true,
+      answer: '抱歉，知识库中暂时没有找到能直接回答这个问题的资料。\n您是不是想问：\n· 《考勤管理制度》' },
     { role: 'ai' },                                                  // 无 blocks 无 noResult：丢
   ]);
   assert.equal(lean.length, 3);
   assert.deepEqual(lean[0], { role: 'user', text: '问题一' });
   assert.equal(lean[1].instant, true);
   assert.equal(lean[1].guard, true);
+  assert.equal(lean[1].general, true);   // 通用回答徽标随会话落盘往返
   assert.equal(lean[1].messageId, 'mid1');
   assert.equal(lean[2].noResult, true);
   assert.equal(lean[2].handoffDone, true);
+  // 引导式拒答话术原文随 NO_RESULT 卡落盘（nrLines 不落盘，恢复时重算）
+  assert.ok(lean[2].answer.includes('《考勤管理制度》'));
+  assert.equal(lean[2].nrLines, undefined);
+});
+
+test('leanMessages：NO_RESULT 无 answer（老后端/flag 关）落空串', () => {
+  const lean = leanMessages([
+    { role: 'ai', noResult: true, rephrase: [], messageId: 'm', question: 'q' },
+  ]);
+  assert.equal(lean[0].answer, '');
+});
+
+test('splitNrLines：多行拆行滤空、单行原样、空入参返回 []', () => {
+  assert.deepEqual(
+    splitNrLines('第一行\n\n· 《标题》 \n第三行'),
+    ['第一行', '· 《标题》', '第三行'],
+  );
+  assert.deepEqual(splitNrLines('只有一行'), ['只有一行']);
+  assert.deepEqual(splitNrLines(''), []);
+  assert.deepEqual(splitNrLines(undefined), []);
 });
 
 test('leanMessages：超长会话截尾保最近 MAX_MESSAGES 条', () => {
