@@ -82,7 +82,22 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
     <!-- 无结果卡 -->
     <div v-else-if="m.noResult" class="rounded-xl border border-border bg-secondary/40 p-4">
       <div class="text-sm font-semibold text-foreground">未找到相关内容</div>
-      <div class="mt-1.5 text-sm text-muted-foreground">{{ m.answer }}</div>
+      <!-- whitespace-pre-wrap：引导式拒答话术为多行文本（换说法建议/「· 《标题》」列表/
+           知识贡献入口），塌行会揉成一团；单行旧文案无视觉变化 -->
+      <div class="mt-1.5 whitespace-pre-wrap text-sm text-muted-foreground">{{ m.answer }}</div>
+      <div v-if="m.suggestTitles && m.suggestTitles.length" class="mt-3">
+        <div class="mb-1.5 text-xs text-muted-foreground">您是不是想问：</div>
+        <div class="flex flex-wrap gap-1.5">
+          <button
+            v-for="(t, i) in m.suggestTitles" :key="i"
+            type="button"
+            class="rounded-full border border-border bg-card px-2.5 py-1 text-xs text-foreground transition hover:border-ring hover:bg-secondary"
+            @click="fillInput(t)"
+          >
+            《{{ t }}》
+          </button>
+        </div>
+      </div>
       <div v-if="m.rephrase && m.rephrase.length" class="mt-3">
         <div class="mb-1.5 text-xs text-muted-foreground">试试这样问</div>
         <div class="flex flex-wrap gap-1.5">
@@ -110,6 +125,13 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
     <template v-else-if="m.html != null || m.viewBlocks">
       <div v-if="m.guard" class="mb-2 rounded-lg border border-st-busy/30 bg-st-busy/10 px-3 py-2 text-xs text-st-busy">
         ⚠️ 相关资料匹配度较低，以下回答仅供参考，请核对原文或转人工确认。
+      </div>
+      <!-- 通用回答来源徽标（弱样式，比 guard 警示条更淡——免责尾注已在正文，徽标只作快速识别） -->
+      <div
+        v-if="m.source === 'general' || m.source === 'smalltalk'"
+        class="mb-2 inline-flex items-center rounded-full border border-border bg-secondary/50 px-2 py-0.5 text-xs text-muted-foreground"
+      >
+        通用回答 · 非公司口径
       </div>
       <AnswerBlocks :message="m" />
       <SourceList v-if="m.sources && m.sources.length" :sources="m.sources" />

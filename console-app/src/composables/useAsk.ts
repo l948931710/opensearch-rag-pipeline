@@ -49,6 +49,10 @@ export interface ChatMessage {
   noResult?: boolean
   answer?: string          // no_result 文案
   rephrase?: string[]      // no_result 改写建议
+  suggestTitles?: string[] // no_result「您是不是想问」相近文档标题（done 帧 suggest_titles，
+                           // 与 rephrase 后端二选一下发；通用能力分级开放引导式拒答）
+  source?: string          // 回答来源 kb|smalltalk|general|guard（done 帧 source；
+                           // general/smalltalk 时正常答案区显示「通用回答·非公司口径」徽标）
   voted?: '' | 'up' | 'down'
   handoffDone?: boolean
   copied?: boolean
@@ -356,10 +360,14 @@ function onEvent(conv: Conversation, ai: ChatMessage, ev: SseEvent, seq: number)
       break
     case 'done':
       ai.guard = !!ev.guard
+      // 通用能力分级开放：done 帧可带 source（回答来源徽标）；旧协议/flag 关缺省不置
+      if (typeof ev.source === 'string') ai.source = ev.source
       if (ev.no_result) {
         ai.noResult = true
         ai.answer = stripImg(ai.raw || '') || NO_RESULT_FALLBACK
         ai.rephrase = (ev.rephrase as string[]) || []
+        // 「您是不是想问」相近文档标题（与 rephrase 后端二选一下发）
+        ai.suggestTitles = (ev.suggest_titles as string[]) || []
       }
       break
     case 'content_blocks':

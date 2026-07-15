@@ -100,6 +100,49 @@ describe('useAsk.ask — 无结果分支（done 带 no_result+rephrase，无 sou
     expect(ai.noResult).toBe(true)
     expect(ai.answer).toContain('未找到')
     expect(ai.rephrase).toEqual(['换个说法A', '换个说法B'])
+    // 旧协议（flag 关）done 无 suggest_titles/source → 空数组/未定义（回归护栏）
+    expect(ai.suggestTitles).toEqual([])
+    expect(ai.source).toBeUndefined()
+  })
+
+  it('引导式拒答：done 带 suggest_titles（与 rephrase 二选一），流出话术保留', async () => {
+    const guided = '抱歉，知识库中暂时没有找到能直接回答这个问题的资料。\n您是不是想问：\n· 《考勤管理制度》'
+    const chunks = [
+      frame({ type: 'session', session_id: 's', message_id: 'm3t' }),
+      frame({ type: 'chunk', content: guided }),
+      frame({ type: 'done', model: 'N/A', usage: {}, guard: true, no_result: true,
+              suggest_titles: ['考勤管理制度', '请假管理规定'], source: 'guard' }),
+      DONE,
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp(chunks)))
+    const { ask, messages } = useAsk()
+
+    await ask('外派驻场怎么打卡')
+    const ai = messages.value[1]
+    expect(ai.noResult).toBe(true)
+    expect(ai.answer).toContain('《考勤管理制度》')   // 流出的引导话术进 answer，不被吞
+    expect(ai.suggestTitles).toEqual(['考勤管理制度', '请假管理规定'])
+    expect(ai.rephrase).toEqual([])
+    expect(ai.source).toBe('guard')
+  })
+})
+
+describe('useAsk.ask — 通用回答（done 带 source，正常答案路径）', () => {
+  it('source 落消息供徽标渲染，答案照常收尾', async () => {
+    const chunks = [
+      frame({ type: 'session', session_id: 's', message_id: 'm3g' }),
+      frame({ type: 'chunk', content: 'Meeting tomorrow.\n\n> 以上为通用办公辅助内容，不代表公司口径。' }),
+      frame({ type: 'done', model: 'qwen-turbo', usage: {}, no_result: false, source: 'general' }),
+      DONE,
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp(chunks)))
+    const { ask, messages } = useAsk()
+
+    await ask('帮我翻译：明天开会')
+    const ai = messages.value[1]
+    expect(ai.source).toBe('general')
+    expect(ai.noResult).toBeFalsy()
+    expect(ai.html).toContain('Meeting tomorrow')
   })
 })
 
