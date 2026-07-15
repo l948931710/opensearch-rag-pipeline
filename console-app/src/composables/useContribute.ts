@@ -308,9 +308,8 @@ export interface DismissedGap {
   dismissed_by_name: string; dismissed_at: string
 }
 const dismissedGaps = ref<DismissedGap[]>([])
+// （分支侧 P0-D 身份指纹判废随大合并收敛；main 无运行期身份切换，指纹恒等。）
 async function loadDismissed() {
-  syncIdentityScope()
-  const fp = identityFingerprint()
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') {
     dismissedGaps.value = [{ question_hash: 'hd1', question_preview: '今天食堂有什么菜', reason: '闲聊噪音', dismissed_by_name: '设计预览', dismissed_at: '2026-07-14T10:00:00' }]
@@ -318,10 +317,8 @@ async function loadDismissed() {
   }
   try {
     const r = await apiJson<{ items: DismissedGap[] }>('/api/kb/gaps/dismissed', { auth: true })
-    if (fp !== identityFingerprint()) return
     dismissedGaps.value = r.items || []
   } catch (e) {
-    if (fp !== identityFingerprint()) return
     dismissedGaps.value = []; noteLoadError('dismissed', e)   // 404=老后端静默（noteLoadError 内建）
   }
 }
