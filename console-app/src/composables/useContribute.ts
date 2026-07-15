@@ -23,7 +23,12 @@ export interface GapItem {
   source_message_id: string
   has_pending_contribution: boolean // 已有贡献待入库（缺口仍开放）
 }
-export interface GapsSummary { unanswered: number; answered: number; this_month: number; contributors: number }
+export interface GapsSummary {
+  unanswered: number; answered: number; this_month: number; contributors: number
+  // 审核漏斗（批次ε-3 R3，近 30 天按 reviewed_at）：null/缺省=算不出自隐（老后端兼容）
+  review_accept_rate_30d?: number | null
+  review_avg_hours_30d?: number | null
+}
 export interface ContributionItem {
   contribution_id: string; question: string; content: string; category_dept: string
   author_id: string; author_name: string
@@ -50,7 +55,7 @@ export interface HeroItem {
   hits?: number | null   // 被引用数（批次ε-2 R2）：null=算不出 → 自隐；排名仍按 count
 }
 
-interface GapsResp { items: GapItem[]; summary: GapsSummary; has_more: boolean }
+interface GapsResp { items: GapItem[]; summary: GapsSummary; has_more: boolean; window_days?: number }
 interface ContribListResp { items: ContributionItem[]; has_more: boolean }
 
 // 归属分类下拉项（= 10 个 ACL 组码 → 中文）。后端 sanitize_owner_depts 为权威。
@@ -60,6 +65,9 @@ export const CONTRIB_DEPT_OPTS = Object.keys(GROUP_LABEL).map((id) => ({ id, nam
 const gaps = ref<GapItem[]>([])
 const gapsSummary = ref<GapsSummary | null>(null)
 const gapsHasMore = ref(false)
+// 缺口滚动窗天数（批次ε-3 R3，后端下发防漂移；老后端缺字段回落 30）——
+// 「待回答」不是完整积压：超窗的老缺口静默消失，卡头/空态必须标注窗口
+const gapsWindowDays = ref(30)
 const myContribs = ref<ContributionItem[]>([])
 const pendingContribs = ref<ContributionItem[]>([])
 const pendingHasMore = ref(false)   // 批次ε-1：>50 条时后端 has_more 此前被静默丢弃（假满员）
@@ -99,7 +107,9 @@ function _previewGaps(): GapsResp {
       { question: '2oz PP 杯在龙盛机上的标准速度是多少？', asks: 3, last_days: 6, dept: 'production', kind: 'refusal', question_hash: 'h2', source_message_id: 'm2', has_pending_contribution: true },
       { question: '差旅报销的发票抬头怎么填？', asks: 2, last_days: 1, dept: 'finance', kind: 'no_result', question_hash: 'h3', source_message_id: 'm3', has_pending_contribution: false },
     ],
-    summary: { unanswered: 3, answered: 12, this_month: 4, contributors: 6 },
+    summary: { unanswered: 3, answered: 12, this_month: 4, contributors: 6,
+               review_accept_rate_30d: 0.78, review_avg_hours_30d: 26.4 },
+    window_days: 30,
     has_more: false,
   }
 }
@@ -139,6 +149,7 @@ async function loadGaps(offset = 0) {
     gaps.value = offset ? [...gaps.value, ...(r.items || [])] : (r.items || [])
     gapsSummary.value = r.summary || null
     gapsHasMore.value = !!r.has_more
+    gapsWindowDays.value = r.window_days || 30
   } catch (e) {
     if (fp !== identityFingerprint()) return
     if (!offset) { gaps.value = []; gapsSummary.value = null } ; noteLoadError('gaps', e)
@@ -282,7 +293,7 @@ export function useContribute() {
   // 待你审核的贡献数（红点/角标单一来源）。
   const reviewCount = computed(() => pendingContribs.value.length)
   return {
-    gaps, gapsSummary, gapsHasMore, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
+    gaps, gapsSummary, gapsHasMore, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
     modalOpen, formQuestion, formContent, formDept, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, loadMine, loadPending, loadHeroes,
@@ -292,7 +303,7 @@ export function useContribute() {
 
 /** 重置 store（运行期身份切换与测试复位共用；含半填的贡献表单——不跨身份残留）。 */
 function _resetContributeState() {
-  gaps.value = []; gapsSummary.value = null; gapsHasMore.value = false
+  gaps.value = []; gapsSummary.value = null; gapsHasMore.value = false; gapsWindowDays.value = 30
   myContribs.value = []; pendingContribs.value = []; pendingHasMore.value = false; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''

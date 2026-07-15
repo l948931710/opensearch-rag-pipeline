@@ -61,6 +61,10 @@ class _FakeCur:
             return (c.summary.get("this_month", 0),)
         if "COUNT(DISTINCT author_id)" in s:
             return (c.summary.get("contributors", 0),)
+        if "TIMESTAMPDIFF(MINUTE, created_at, reviewed_at)" in s:   # ε-3 R3 审核漏斗
+            if c.boom_funnel:
+                raise Exception("simulated funnel failure")
+            return c.funnel_row
         return None
 
     def fetchall(self):
@@ -114,6 +118,8 @@ class _FakeConn:
         self.hash_rows = kw.get("hash_rows", [])
         self.refusal_plain_rows = kw.get("refusal_plain_rows", [])
         self.boom_asks = kw.get("boom_asks", False)
+        self.funnel_row = kw.get("funnel_row", (None, None, None))
+        self.boom_funnel = kw.get("boom_funnel", False)
         self.list_rows = kw.get("list_rows", [])
         self.summary = kw.get("summary", {})
         self.calls = []
@@ -1038,3 +1044,41 @@ def test_mine_has_no_asks_aggregation(monkeypatch):
     resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
     assert resp.items[0].asks is None
     assert not any("COALESCE(gap_query_hash" in s for s, _ in conn.calls)
+
+
+# ── 批次ε-3 R3：summary 审核漏斗 + 缺口窗口下发（统计卡口径修正的后端半）─────────────
+def test_gaps_summary_funnel_and_window_days(monkeypatch):
+    """近 30 天（按 reviewed_at）采纳率与平均审核时长（分钟→小时）；window_days 下发
+    =_CONTRIB_WINDOW_DAYS（前端卡头/空态标注据此渲染，防文案与后端漂移）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(funnel_row=(8, 2, 1584.0)))
+    from opensearch_pipeline import api
+    resp = api.kb_gaps(request=None, identity=_ident())
+    assert resp.window_days == 30
+    assert resp.summary.review_accept_rate_30d == 0.8
+    assert resp.summary.review_avg_hours_30d == 26.4
+    sql = next(s for s, _ in conn.calls if "TIMESTAMPDIFF" in s)
+    assert "reviewed_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)" in sql   # 按审核时刻窗
+
+
+def test_gaps_summary_funnel_no_samples_none(monkeypatch):
+    """近 30 天无任何审核样本（分母 0）→ 两字段 None 自隐，绝不显 0%/0 小时误导。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(funnel_row=(0, 0, None)))
+    from opensearch_pipeline import api
+    resp = api.kb_gaps(request=None, identity=_ident())
+    assert resp.summary.review_accept_rate_30d is None
+    assert resp.summary.review_avg_hours_30d is None
+
+
+def test_gaps_summary_funnel_failure_not_counted_to_500(monkeypatch):
+    """漏斗聚合炸 → 字段 None、端点照常 200（辅助信号不计入 fails>=4 的 500 阈值）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(boom_funnel=True))
+    from opensearch_pipeline import api
+    resp = api.kb_gaps(request=None, identity=_ident())
+    assert resp.summary.review_accept_rate_30d is None and resp.summary.review_avg_hours_30d is None
+    assert resp.window_days == 30
