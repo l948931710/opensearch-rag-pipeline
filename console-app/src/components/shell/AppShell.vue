@@ -12,7 +12,8 @@ import { useAsk } from '@/composables/useAsk'
 // 侧栏在边界外，永远可用（切路由/切会话即 resetSignal 变化 → 自愈重渲）。
 const route = useRoute()
 const { activeId } = useAsk()
-const resetSignal = computed(() => route.fullPath + '::' + activeId.value)
+// route.path(非 fullPath)：切路由 / 切会话才重置错误边界;同页 query 抖动(tab/搜索/筛选)不应触发。
+const resetSignal = computed(() => route.path + '::' + activeId.value)
 </script>
 
 <template>
@@ -29,7 +30,10 @@ const resetSignal = computed(() => route.fullPath + '::' + activeId.value)
             <!-- 包一层带 key 的单根 div：路由视图可能是多根(如 ManageView 有 员工/管理员 两套根 div),
                  直接塞进 mode="out-in" 的 Transition 会因离场元素非单根而卡住、下个视图永不挂载 → 整页白屏
                  (点「知识库」后再去别的页就空白的根因)。统一包成单根后,任何视图形态都能正确离场/进场。 -->
-            <div :key="route.fullPath" class="h-full">
+            <!-- key 必须用 route.path 而非 fullPath：区分 /·/manage·/contribute 三视图即可正确触发 out-in
+                 离场;用 fullPath(含 query) 会让同页内 tab 切换 / 搜索 / 筛选等 query 变动都改 key、整个视图被
+                 销毁重建 → 切 tab 黑屏闪、搜索框每输入一字就重挂失焦、数据全量重拉(d712305 回归,勿改回)。 -->
+            <div :key="route.path" class="h-full">
               <component :is="Component" />
             </div>
           </Transition>

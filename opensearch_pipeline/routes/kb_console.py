@@ -184,6 +184,26 @@ def _kb_owner_facet_sql(owner_dept: str):
     return "", []
 
 
+def _kb_badge_counts(cur, base_from_where: str, base_params: tuple,
+                     perm: str, cited: str):
+    """faceted 状态计数（2026-07-16 Sam 实测反馈）：与主查询**同一套筛选**（归属/范围/
+    利用度/搜索/作用域，唯独不含 badge 自身）按徽章 GROUP BY——状态 chips 与标题计数
+    跟随下拉筛选走（此前 chips 取全库 stats：选了「生产」归属，chip 数字纹丝不动；
+    标题旁数字更是已加载页行数，全库场景恒显分页上限 50）。
+    fail-open：计数失败返回 None（前端回退 stats/页派生口径），绝不影响列表主查询。"""
+    fc, fp = _kb_ledger_filter_sql(perm, "", cited)   # 除 badge 外全部筛选照抄
+    try:
+        cur.execute(
+            f"SELECT ({_KB_BADGE_CASE_SQL}) AS b, COUNT(*) "
+            f"{base_from_where} {fc} GROUP BY b",
+            (*base_params, *fp),
+        )
+        return {str(b or ""): int(n) for b, n in cur.fetchall()}
+    except Exception:   # noqa: BLE001 — 计数是增强项，失败不拖累列表
+        logger.warning("kb 台账 faceted 计数失败（前端回退全库口径）", exc_info=True)
+        return None
+
+
 @router.get("/api/kb/my-docs", response_model=KbMyDocsResponse)
 def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                owner_dept: str = "", perm: str = "", badge: str = "", cited: str = "",
@@ -210,6 +230,14 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
+                badge_counts = _kb_badge_counts(
+                    cur,
+                    f"FROM {_kb_db()}.document_meta m "
+                    f"LEFT JOIN {_kb_db()}.document_version v "
+                    "ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no "
+                    f"WHERE 1=1 {clause} {search_clause} {owner_clause}",
+                    (*params, *search_params, *owner_params), perm, cited)
                 cur.execute(
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
@@ -252,7 +280,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             # 驳回原因只在被驳回态外露（其他失败态的 content_process_error 是内部诊断文案，不外发）
             reject_reason=(str(cpe)[:200] if (cps == "REJECTED" and cpe) else ""),
         ))
-    return KbMyDocsResponse(items=items, has_more=has_more)
+    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
 
 
 @router.get("/api/kb/browse", response_model=KbMyDocsResponse)
@@ -291,6 +319,16 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
+                badge_counts = _kb_badge_counts(
+                    cur,
+                    f"FROM {_kb_db()}.document_meta m "
+                    f"LEFT JOIN {_kb_db()}.document_version v "
+                    "ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no "
+                    "WHERE m.status='active' "
+                    "AND m.permission_level IN ('public','dept_internal') "
+                    f"{owner_clause} {search_clause}",
+                    (*owner_params, *search_params), perm, cited)
                 cur.execute(
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
@@ -334,7 +372,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
             last_cited_at=(_u[1] if _u else ""),
         ))
-    return KbMyDocsResponse(items=items, has_more=has_more)
+    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
 
 
 class KbStatsResponse(BaseModel):
@@ -361,24 +399,34 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    # perf（2026-07-16）：stats 接入既有看板 TTL 缓存（键按作用域分片，永不跨权限串数据）——
+    # 此前 stats 是管理台首屏最慢端点（实测 4.6-5.2s）且每请求现算。
+    cache_key = ("stats", tuple(sorted(str(p) for p in params)) if clause else "GLOBAL")
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
     ck_clause, ck_params = _kb_owner_scope_sql(kb, "owner_dept")   # chunk_meta.owner_dept 同口径作用域
     dm_clause, dm_params = _kb_owner_scope_sql(kb, "owner_dept")   # document_meta.owner_dept（本月新增计数）
     from datetime import date
     month_start = date.today().replace(day=1).isoformat()         # 当月首日；以参数传入避免 % 转义坑
     chunks = new_this_month = 0
+    aux_fails = 0
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # perf（2026-07-16）：状态分布改【服务端 GROUP BY】——此前整表 1936 行拉回
+                # Python 分桶（实测该查询 1.2s，传输占大头），现只回 status×徽章×归属 的几十行。
+                # 徽章走 _KB_BADGE_CASE_SQL（与 _kb_status_badge 的奇偶校验测试钉死同义）。
                 cur.execute(
                     f"""
-                    SELECT m.status, v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status, m.owner_dept
+                    SELECT m.status, ({_KB_BADGE_CASE_SQL}) AS b, m.owner_dept, COUNT(*)
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE 1=1 {clause}
+                    GROUP BY m.status, b, m.owner_dept
                     """,
                     tuple(params),
                 )
@@ -392,6 +440,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                     )
                     chunks = int((cur.fetchone() or (0,))[0] or 0)
                 except Exception as e:
+                    aux_fails += 1
                     logger.warning("kb_stats 分块计数失败: %s", e)
                 # 本月新增文档数（设计「+N 本月新增」徽标）；月首日以参数传入；取数失败仅置 0。
                 try:
@@ -402,6 +451,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                     )
                     new_this_month = int((cur.fetchone() or (0,))[0] or 0)
                 except Exception as e:
+                    aux_fails += 1
                     logger.warning("kb_stats 本月新增计数失败: %s", e)
         finally:
             conn.close()
@@ -411,24 +461,27 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
         trace_id = get_request_id()
         logger.error("kb_stats 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"统计查询失败 (trace: {trace_id})")
-    active = retired = 0
+    total = active = retired = 0
     by_badge: Dict[str, int] = {}
     owner_set = set()
-    for row in rows:
-        status, cps, ixs, pubs, chks, owner = row[0], row[1], row[2], row[3], row[4], row[5]
+    for status, badge, owner, n in rows:
+        n = int(n or 0)
+        total += n
+        # 语义与旧 Python 逐行分桶逐字节一致：active 判定 (status or 'active')=='active'；
+        # 徽章由 SQL CASE 计算（含 chunk_status → 0-chunk 归「未入索引」，与台账 chip 同口径）。
         if (status or "active") == "active":
-            active += 1
+            active += n
         else:
-            retired += 1
-        # chunk_status 一并传入 → 0-chunk/跳过版本如实归「未入索引」，与台账徽章口径一致（此前漏传
-        # 会把这些文档误计成「处理中」，看板分布与台账 chip 对同一文档分叉）。
-        badge = _kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks)
-        by_badge[badge] = by_badge.get(badge, 0) + 1
+            retired += n
+        by_badge[str(badge or "")] = by_badge.get(str(badge or ""), 0) + n
         if owner:
             owner_set.add(owner)
-    return KbStatsResponse(total=len(rows), active=active, retired=retired, chunks=chunks,
-                           new_this_month=new_this_month, by_badge=by_badge,
-                           owner_depts=sorted(owner_set))
+    out = KbStatsResponse(total=total, active=active, retired=retired, chunks=chunks,
+                          new_this_month=new_this_month, by_badge=by_badge,
+                          owner_depts=sorted(owner_set))
+    if aux_fails == 0:   # 与 insights 同纪律：降级响应（辅计数失败置 0）不缓存，下一请求重试全量
+        _dashboard_cache_put(cache_key, out)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

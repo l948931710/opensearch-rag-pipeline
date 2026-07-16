@@ -2325,6 +2325,9 @@ class KbDocItem(BaseModel):
 class KbMyDocsResponse(BaseModel):
     items: List[KbDocItem] = Field(default_factory=list)
     has_more: bool = False
+    # faceted 状态计数（2026-07-16）：与本次查询同筛选（除 badge 自身）的按徽章计数——
+    # 前端 chips/标题总数跟随下拉筛选。None=计数失败/旧后端（前端回退全库口径）。additive。
+    badge_counts: Optional[Dict[str, int]] = None
 
 
 class KbVersionItem(BaseModel):

@@ -103,3 +103,18 @@ describe('DocTable — 退役行「恢复上线」', () => {
     expect(d.status_badge).toBe('排队中')
   })
 })
+
+describe('DocTable — 筛选归位（2026-07-16 生产实测：跳到页面底部）', () => {
+  it('筛选变更 → 台账区 scrollIntoView 归位（结果骤缩时不再钳在底部）', async () => {
+    const p = activate(identity({ role: 'kb_admin', managedOwnerDepts: ['marketing', 'hr'] }))
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ items: [], has_more: false }), text: async () => '{}' })))
+    const spy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {})
+    mount(DocTable, { global: { plugins: [p] } })
+    const kb = useKb()
+    spy.mockClear()                       // 掐掉挂载期 URL 恢复可能触发的调用，只看筛选动作
+    kb.setOwnerFilter('hr')
+    await new Promise((r) => setTimeout(r, 0))   // watch flush（默认 pre → 微任务后已跑）
+    expect(spy).toHaveBeenCalled()
+    expect(spy.mock.calls[0][0]).toMatchObject({ block: 'start' })
+  })
+})

@@ -86,24 +86,45 @@ const managedDepts = computed(() => identity.value?.managedOwnerDepts || [])
 
 function askHot(q: string) { fillInput(q); void router.push('/') }
 
+// ── 按 tab 惰性加载（perf 2026-07-16 ①）：此前挂载即并发拉全部 ~13 个接口——首屏被最慢
+// 端点拖住（stats 实测 4.6-5.2s），还制造了 429 雪崩的请求源。现在挂载只拉三类：
+//   a) 探测（tab 自隐判据，不拉就没入口）：ontology / agent 审批 / agent 治理；
+//   b) 角标（「审批」badge + 侧栏红点，60s pollQueues 同款三队列）；
+//   c) 当前 tab 所需数据。
+// 其余 tab 首次激活时补拉（ensureTabLoaded；loader 各自的 30s staleness/LoadError 手动
+// 重试语义不变——失败后面板内重试按钮直调 load*，不经本表）。
+const _loadedTabs = new Set<Tab>()
+function ensureTabLoaded(t: Tab): Promise<unknown> {
+  if (_loadedTabs.has(t)) return Promise.resolve()
+  _loadedTabs.add(t)
+  const jobs: unknown[] = []
+  if (t === 'dash') {
+    jobs.push(loadStats(), loadInsights(), loadFeedbackReview(), loadEscalations())
+    if (isKbAdmin.value) jobs.push(loadGovernance(), loadReviewTasks())
+  } else if (t === 'docs') {
+    // stats 兼供台账（归属下拉全库口径）；accessGrants=台账底部「授权治理」区
+    jobs.push(loadDocs(), loadConfig(), loadStats(), loadAccessGrants())
+  } else if (t === 'history') {                      // main 旧 IA：独立「审批历史」tab
+    jobs.push(loadApprovalHistory())                 // 待办队列已全局预载+轮询
+  } else if (t === 'ops') {
+    if (isKbAdmin.value) jobs.push(loadOpsMetrics())
+  } else if (t === 'members') {
+    if (isKbAdmin.value) jobs.push(loadAdminGrants())
+  }
+  // （main 版无 ontology/agent_gov tab）
+  return Promise.allSettled(jobs.map((j) => Promise.resolve(j)))
+}
+watch(activeTab, (t) => { if (canManage.value) void ensureTabLoaded(t) })
+
 onMounted(async () => {
   if (canManage.value) {
-    // 全并发（Perf-7）：此前 `await loadDocs()` 把后面 8 个加载都挡在 docs 一个 RTT 之后，
-    // 看板/队列白等。docs 的 promise 只留给升版深链（applyPendingVersion 要在 docs 就绪后）。
-    const docsReady = loadDocs()
-    void loadStats()
-    void loadConfig()
-    void loadInsights()                              // 概览看板：使用成效 + 知识缺口（两角色）
-    void loadFeedbackReview()                        // 差评复核（两角色，看板卡片）
-    void loadEscalations()                           // 转人工工单队列（两角色，看板卡片）
-    void loadApprovals()                             // 非 force：App ready 已为红点预载，30s 内不重拉（#82）
-    void loadAccessRequests()                        // 同上（staleness 门在 useKb 内）
-    void loadAccessGrants()
-    void loadApprovalHistory()                       // 审批历史（两角色，只读聚合）
-    if (isKbAdmin.value) { void loadGovernance(); void loadAdminGrants(); void loadReviewTasks(); void loadOpsMetrics() }   // 全库治理 + 成员管理 + 复审任务 + 运营指标（kb_admin）
-    await docsReady
-    const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费
-    if (p) { activeTab.value = 'docs'; applyPendingVersion(p) }
+    // （main 热应用版：无 agent/ontology 探测——该 IA 在 ontology-p0 分支）
+    void loadApprovals()                             // 角标/红点队列（非 force：ready 预载 30s 内不重拉，#82）
+    void loadAccessRequests()
+    const tabReady = ensureTabLoaded(activeTab.value)
+    const p = consumePendingVersion()   // 升版深链：切到「文档管理」tab 后再消费（docs 就绪后）
+    if (p) { activeTab.value = 'docs'; await ensureTabLoaded('docs'); applyPendingVersion(p) }
+    await tabReady
   } else {
     if (!hotQuestions.value.length) void loadHotQuestions()
   }
