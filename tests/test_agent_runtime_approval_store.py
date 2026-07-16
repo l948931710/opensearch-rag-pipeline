@@ -7,6 +7,7 @@ decide 状态机（pending CAS / 幂等重放 / 迟到拒绝）、expire_stale�
 get_latest_by_run（resume 崩溃重放锚点）。无本地库/无 025 表 → skip（同 e2e 惯例）；
 host-pin 本地，绝不写 staging/prod。
 """
+import os
 import uuid
 
 import pytest
@@ -38,8 +39,17 @@ def _db_ready():
         return False
 
 
+_AGENT_DB_OK = _db_ready()
+
+# 批次6（unknown-unknowns P1-06）：RAG_AGENT_TESTS_REQUIRE_RDS=1 → 探测断线收集期硬红
+# （与 ontology 家族 REQUIRE_RDS 同纪律，CI db-integration 的零跳过机器强制）。
+if not _AGENT_DB_OK and os.environ.get("RAG_AGENT_TESTS_REQUIRE_RDS", "").strip() == "1":
+    raise RuntimeError(
+        "RAG_AGENT_TESTS_REQUIRE_RDS=1 但本地 MySQL/审批表不可用——"
+        "真库契约族不许静默 skip（P1-06）；检查 ci_load_schema 与连接配置")
+
 skipif_no_approval_db = pytest.mark.skipif(
-    not _db_ready(), reason="本地 MySQL 无审批表（先 apply schema 025）")
+    not _AGENT_DB_OK, reason="本地 MySQL 无审批表（先 apply schema 025）")
 
 
 def _ctx(user="appr-u1", groups=("production", "marketing")):

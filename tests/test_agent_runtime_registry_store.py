@@ -8,6 +8,7 @@ registry 挂 DB 源后 resolve 真被拦。无本地库/无表 → skip；host-p
 测试工具名带 `zztest_` 前缀，收尾清理，不碰真实注册行。
 """
 import json
+import os
 import uuid
 
 import pytest
@@ -38,7 +39,17 @@ def _db_ready():
         return False
 
 
-skipif_no_db = pytest.mark.skipif(not _db_ready(), reason="本地 MySQL 无 tool_registry（先 apply 022）")
+_AGENT_DB_OK = _db_ready()
+
+# 批次6（unknown-unknowns P1-06）：RAG_AGENT_TESTS_REQUIRE_RDS=1 → 探测断线收集期硬红
+# （与 ontology 家族 REQUIRE_RDS 同纪律，CI db-integration 的零跳过机器强制）。
+if not _AGENT_DB_OK and os.environ.get("RAG_AGENT_TESTS_REQUIRE_RDS", "").strip() == "1":
+    raise RuntimeError(
+        "RAG_AGENT_TESTS_REQUIRE_RDS=1 但本地 MySQL/tool_registry 不可用——"
+        "真库契约族不许静默 skip（P1-06）；检查 ci_load_schema 与连接配置")
+
+skipif_no_db = pytest.mark.skipif(not _AGENT_DB_OK,
+                                  reason="本地 MySQL 无 tool_registry（先 apply 022）")
 
 
 def _registry(*names):

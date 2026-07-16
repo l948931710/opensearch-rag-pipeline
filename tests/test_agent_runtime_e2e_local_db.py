@@ -11,6 +11,7 @@ knowledge_search→RDSRunStore，用脚本化 provider（2 轮：提工具→出
 无本地 MySQL / 无 agent 表 → 整体 skip（同 test_concurrency）；**host-pin 本地**，绝不写 staging/prod。
 确定性：provider 脚本化、retrieve mock、无外部模型/HA3 → 可进 CI db-integration job。
 """
+import os
 import uuid
 
 import pytest
@@ -44,8 +45,18 @@ def _db_ready():
         return False
 
 
+_AGENT_DB_OK = _db_ready()
+
+# 批次6（unknown-unknowns P1-06）：CI db-integration 设 RAG_AGENT_TESTS_REQUIRE_RDS=1——
+# agent 真库契约族与 ontology 家族（RAG_ONTOLOGY_TESTS_REQUIRE_RDS）同纪律：
+# 探测断线=收集期硬红，「skipped==0」机器强制，绝不许静默 skip 假绿。
+if not _AGENT_DB_OK and os.environ.get("RAG_AGENT_TESTS_REQUIRE_RDS", "").strip() == "1":
+    raise RuntimeError(
+        "RAG_AGENT_TESTS_REQUIRE_RDS=1 但本地 MySQL/agent 表不可用——"
+        "真库契约族不许静默 skip（P1-06）；检查 ci_load_schema 与连接配置")
+
 skipif_no_agent_db = pytest.mark.skipif(
-    not _db_ready(), reason="本地 MySQL 无 agent 表（先 apply schema 022/023/024）")
+    not _AGENT_DB_OK, reason="本地 MySQL 无 agent 表（先 apply schema 022/023/024）")
 
 
 class _ScriptedProvider:

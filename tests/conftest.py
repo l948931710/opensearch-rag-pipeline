@@ -166,6 +166,12 @@ _LOCAL_STACK_SERIAL_MODULES = {
     "test_image_funnel.py",   # RDS 集成用例
     "test_simulate_prod_guard.py",  # 操纵 prod-guard/config 全局态
     "test_kb_db_integration.py",    # kb console 端点真库回归（qa/feedback/doc 真实 DML）
+    # 批次6（P1-06）：agent 真库契约族——共享 fuling_operation 真实 DML（agent_run/
+    # tool_registry/approval_*），并发 worker 互跑会串状态/互删治理行
+    "test_agent_runtime_e2e_local_db.py",
+    "test_agent_runtime_registry_store.py",
+    "test_agent_runtime_approval_store.py",
+    "test_agent_approval_integrity_db.py",
 }
 
 
