@@ -947,6 +947,29 @@ def test_extract_sources_page_fallback_and_level(monkeypatch):
     assert by_id["d"]["level"] == "high"
 
 
+def test_extract_sources_rank_order_and_best_chunk_representative(monkeypatch):
+    """来源按 rank 出参（2026-07-16 生产实测：60 行抽样 40 行 chunk 乱序——缝合/扩展/补图
+    打破「首现=最相关」假设）：relevance 降序 + 同文档取最高分块做代表（preview/level 随代表块）。"""
+    from opensearch_pipeline import llm_generator as G
+    _pin_legacy_thresholds(monkeypatch)
+    srcs = G._extract_sources([
+        # 检索序被缝合打乱：低分块在前、高分块在后；B 文档的高分块出现在第 4 位
+        {"doc_id": "a", "title": "A", "section_title": "", "page_num": 0,
+         "score": 0.62, "rerank_score": 0.62, "chunk_text": "A低分块"},
+        {"doc_id": "b", "title": "B", "section_title": "", "page_num": 0,
+         "score": 0.70, "rerank_score": 0.70, "chunk_text": "B低分块"},
+        {"doc_id": "c", "title": "C", "section_title": "", "page_num": 0,
+         "score": 0.95, "rerank_score": 0.95, "chunk_text": "C高分块"},
+        {"doc_id": "b", "title": "B", "section_title": "第3章", "page_num": 0,
+         "score": 0.88, "rerank_score": 0.88, "chunk_text": "B高分块"},
+    ])
+    assert [s["doc_id"] for s in srcs] == ["c", "b", "a"]      # relevance 降序
+    b = srcs[1]
+    assert b["score"] == 0.88 and b["preview"] == "B高分块"     # 同文档以最高分块为代表
+    assert b["section"] == "第3章"                              # 定位随代表块
+    assert srcs[0]["relevance"] >= srcs[1]["relevance"] >= srcs[2]["relevance"]
+
+
 def test_low_confidence_band_vs_guard_flag():
     """is_low_confidence_band 不看开关；_is_low_confidence = 开关 AND 带内（默认开关 off → False）。"""
     from opensearch_pipeline import llm_generator as G

@@ -456,9 +456,17 @@ def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     去重按【标题去扩展名】而非 doc_id：语料中同一文件被重复注册成多个 doc_id
     （跨部门重复上传，如 A1员工行为管理标准 4 次注册）或 docx+pdf 双格式 double-ingest
-    时，用户不应看到同一文档出现两行。chunks 已按检索排序，保留首次出现（排名最高）；
-    被折叠行仅用于回填定位信息（docx 首位无页码、pdf 孪生有 第N页 时不丢失定位）。
-    无标题文档退回 doc_id 区分，避免互不相关的空标题文档被折叠。
+    时，用户不应看到同一文档出现两行。被折叠行仅用于回填定位信息（docx 首位无页码、
+    pdf 孪生有 第N页 时不丢失定位）。无标题文档退回 doc_id 区分，避免互不相关的
+    空标题文档被折叠。
+
+    排序（2026-07-16 生产实测修正）：老口径假设「chunks 已按检索排序，保留首次出现
+    即排名最高」——现网 60 行抽样 40 行乱序（邻块缝合 ±1、步骤卡扩展、补图混入，
+    甚至融合分与重排分两种量纲夹杂），首现≠最相关。现改为：同文档以**最高
+    relevance 的块**为代表（score/level/preview/定位随代表块），出参按 relevance
+    降序（score_relevance 已按各自量纲 high 阈归一 0-1，跨量纲可比；同分保持
+    检索先后的稳定序）。前端来源徽标编号是纯展示位次，无正文引用锚定，重排安全
+    （[文档N] 内部编号泄漏另有清洗）。
     """
     sources: List[Dict[str, Any]] = []
     key_to_idx: Dict[str, int] = {}
@@ -467,9 +475,17 @@ def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         title = chunk.get("title", "")
         key = _TITLE_EXT_PATTERN.sub('', title).strip() or doc_id
         if key in key_to_idx:
-            # 折叠重复行，但若保留行缺定位而本行有（docx 无原生页码、pdf 孪生有），回填
             kept = sources[key_to_idx[key]]
-            if not kept["section"]:
+            if score_relevance(chunk) > kept["relevance"]:
+                # 同文档更相关的块 → 升级为代表块（预览/分数/档位与用户点开看到的正文一致）
+                kept.update(score=chunk.get("score", 0), level=score_level(chunk),
+                            relevance=score_relevance(chunk), preview=_source_preview(chunk),
+                            chunk_type=chunk.get("chunk_type", ""),
+                            source_image=chunk.get("source_image", ""),
+                            visual_summary=chunk.get("visual_summary", ""))
+                kept["section"] = _section_of(chunk) or kept["section"]
+            elif not kept["section"]:
+                # 折叠重复行，但若保留行缺定位而本行有（docx 无原生页码、pdf 孪生有），回填
                 kept["section"] = _section_of(chunk)
             continue
         key_to_idx[key] = len(sources)
@@ -487,6 +503,8 @@ def _extract_sources(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # P2-31：文档日期（版本落库日；无则空串——前端有则渲染）
             "doc_date": chunk.get("doc_date", ""),
         })
+    # 按 rank 出参（见 docstring）：relevance 降序，同分保持检索先后（稳定排序）
+    sources.sort(key=lambda s: -(s.get("relevance") or 0.0))
     return sources
 
 
