@@ -247,10 +247,13 @@ def kb_access_requests_list(request: Request,
     """审批方待办：列出【我有权审批】的 pending 申请（owner_dept ∈ 我 managed；kb_admin 全部）。只读。"""
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.kb_authz import (
+        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
+    )
     clause, params = "", []
     if kb.role != ROLE_KB_ADMIN:
-        owners = managed_owner_depts(kb)
+        # production 伞组展开：子线 owner 的文档也归 production 管理员审批。
+        owners = expand_managed_owner_depts(managed_owner_depts(kb))
         if not owners:
             return KbAccessRequestListResponse(items=[])
         clause = "AND r.owner_dept IN (" + ",".join(["%s"] * len(owners)) + ")"
@@ -301,10 +304,13 @@ def kb_access_grants_list(request: Request,
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.kb_authz import (
+        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
+    )
     clause, params = "", []
     if kb.role != ROLE_KB_ADMIN:
-        owners = managed_owner_depts(kb)
+        # production 伞组展开：子线 owner 文档的存量授权也归 production 管理员管辖。
+        owners = expand_managed_owner_depts(managed_owner_depts(kb))
         if not owners:
             return KbAccessGrantListResponse(items=[])
         clause = "AND r.owner_dept IN (" + ",".join(["%s"] * len(owners)) + ")"
@@ -610,12 +616,16 @@ def kb_approval_history(request: Request,
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.kb_authz import (
+        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
+    )
     is_admin = (kb.role == ROLE_KB_ADMIN)
     scope_owner, scope_owner_params = "", []
     scope_cat, scope_cat_params = "", []
     if not is_admin:
-        owners = managed_owner_depts(kb)
+        # production 伞组展开：子线 owner 文档的审批历史归 production 管理员可见。
+        # category_dept 侧复用同一集合是无害超集（贡献类目恒为伞组码，子线值匹配不到行）。
+        owners = expand_managed_owner_depts(managed_owner_depts(kb))
         if not owners:
             return KbApprovalHistoryResponse(items=[])   # 无管理部门 → 空（fail-closed，绝不当全量）
         ph = ",".join(["%s"] * len(owners))

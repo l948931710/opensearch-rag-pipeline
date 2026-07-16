@@ -9,11 +9,12 @@ dept_internal ACL simulation across each subline.
 """
 from opensearch_pipeline import retriever as R
 
-# the APPROVED + live umbrella owners (matches _PRODUCTION_UMBRELLA_OWNERS)
-SUBLINES = ["production", "production_mold", "production_paper_cup",
-            "production_thermoforming"]
-# production_injection / production_papercup are NOT yet approved → must fail closed
-UNAPPROVED = ["production_injection", "production_papercup", "production_secret", "production_"]
+# the APPROVED umbrella owners (matches _PRODUCTION_UMBRELLA_OWNERS; injection+straw
+# approved 2026-07-16 — both OSS dirs exist with registered docs)
+SUBLINES = ["production", "production_injection", "production_mold",
+            "production_paper_cup", "production_straw", "production_thermoforming"]
+# production_papercup double-spelling etc. are NOT approved → must fail closed
+UNAPPROVED = ["production_papercup", "production_secret", "production_"]
 
 
 # ── _expand_groups_to_owners (the single expansion point) ────────────────────
@@ -44,7 +45,7 @@ def test_unknown_subline_not_in_umbrella_fail_closed():
         assert unknown not in owners, f"fail-closed breach: {unknown} granted"
 
 
-def test_umbrella_owner_set_is_exactly_approved_four():
+def test_umbrella_owner_set_is_exactly_approved_six():
     assert set(R._PRODUCTION_UMBRELLA_OWNERS) == set(SUBLINES)
 
 
@@ -106,11 +107,12 @@ def test_public_clause_always_present():
 # ── audit (fail-closed reporting of unknown production-like owners) ───────────
 def test_audit_flags_unknown_production_owners():
     sus = R.audit_production_owner_taxonomy(
-        ["production", "production_mold", "production_unknown", "production_injection",
-         "productionx", "hr", "quality"])
+        ["production", "production_mold", "production_injection", "production_straw",
+         "production_unknown", "production_papercup", "productionx", "hr", "quality"])
     assert "production_unknown" in sus and "productionx" in sus
-    assert "production_injection" in sus  # not-yet-approved subline → flagged, fail-closed
+    assert "production_papercup" in sus  # unapproved double-spelling → flagged, fail-closed
     assert "production" not in sus and "production_mold" not in sus
+    assert "production_injection" not in sus and "production_straw" not in sus  # approved 07-16
     assert "hr" not in sus and "quality" not in sus
 
 

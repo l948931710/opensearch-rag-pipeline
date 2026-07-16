@@ -352,14 +352,20 @@ _VALID_ACL_GROUPS = frozenset({
 # taxonomy-driven EXPLICIT allow-list (NOT an open startswith): a production-like
 # owner not listed here is NOT granted (fail-closed) and is surfaced by
 # audit_production_owner_taxonomy(). Add a new subline here (single source of truth).
-# Only APPROVED + real (live-in-data) owners. Unapproved production_* owners (incl.
-# the production_papercup double-spelling and not-yet-live production_injection) are
-# deliberately excluded → they fail closed and surface via audit_production_owner_taxonomy()
-# until explicitly approved + added here. Mirrors the live active-chunk owner set.
+# Only APPROVED + real owners. Unapproved production_* owners (incl. the
+# production_papercup double-spelling) are deliberately excluded → they fail closed
+# and surface via audit_production_owner_taxonomy() until explicitly approved + added
+# here. Mirrors the approved OSS raw/production_*/ directory taxonomy: injection and
+# straw were approved 2026-07-16 (both dirs exist in OSS with registered docs; without
+# this entry any future dept_internal doc ingested from them would silently vanish
+# from production users' retrieval — the fail-closed trap found in the 07-16
+# subline exploration, docs/production_subline_exploration_2026-07-16_DRAFT.md).
 _PRODUCTION_UMBRELLA_OWNERS = frozenset({
     "production",                 # the umbrella owner itself (exact)
+    "production_injection",
     "production_mold",
     "production_paper_cup",
+    "production_straw",
     "production_thermoforming",
 })
 # user-facing group -> owner_dept set it grants. Absent group => exact {group}.

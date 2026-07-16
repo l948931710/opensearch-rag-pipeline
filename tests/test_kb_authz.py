@@ -149,3 +149,52 @@ def test_normalize_permission_level_fail_closed():
     assert ka.normalize_permission_level("internal") == ka.PERM_DEPT_INTERNAL   # 别名仍生效
     assert ka.normalize_permission_level("public") == ka.PERM_PUBLIC
     assert ka.normalize_permission_level("RESTRICTED") == ka.PERM_RESTRICTED
+
+
+# ── 管理作用域伞形展开（2026-07-16 子部门探索）─────────────────────
+def test_expand_managed_production_umbrella_covers_family():
+    from opensearch_pipeline.retriever import _PRODUCTION_UMBRELLA_OWNERS
+
+    out = ka.expand_managed_owner_depts(["production"])
+    assert set(out) == set(_PRODUCTION_UMBRELLA_OWNERS)
+    assert "production_paper_cup" in out and "production_straw" in out
+
+
+def test_expand_managed_marketing_stays_exact_read_ne_manage():
+    # ⭐ 读≠管理：marketing 读侧共享 production 家族，但管理作用域绝不因此扩大
+    assert ka.expand_managed_owner_depts(["marketing"]) == ["marketing"]
+
+
+def test_expand_managed_mixed_and_empty():
+    out = ka.expand_managed_owner_depts(["hr", "production"])
+    assert "hr" in out and "production_mold" in out and "marketing" not in out
+    assert ka.expand_managed_owner_depts([]) == []
+    assert ka.expand_managed_owner_depts(None) == []
+
+
+def test_kb_can_manage_subline_docs_via_umbrella():
+    """production dept_admin 可管理子线 owner 的既有文档；marketing 不行（读≠管理）。"""
+    from opensearch_pipeline.api import _kb_can_manage
+
+    prod_da = KbIdentity.build(role="dept_admin", granted_owner_depts=["production"])
+    mkt_da = KbIdentity.build(role="dept_admin", granted_owner_depts=["marketing"])
+    kb = KbIdentity.build(role="kb_admin")
+    for sub in ("production_paper_cup", "production_thermoforming",
+                "production_injection", "production_straw", "production_mold"):
+        assert _kb_can_manage(prod_da, sub), f"production 管理员应可管理 {sub}"
+        assert _kb_can_manage(kb, sub)
+        assert not _kb_can_manage(mkt_da, sub), f"marketing 管理员不得管理 {sub}"
+    assert not _kb_can_manage(prod_da, "production_papercup")   # 未批准拼写仍 fail-closed
+
+
+def test_kb_owner_scope_sql_expands_umbrella():
+    from opensearch_pipeline.api import _kb_owner_scope_sql
+
+    prod_da = KbIdentity.build(role="dept_admin", granted_owner_depts=["production"])
+    clause, params = _kb_owner_scope_sql(prod_da)
+    assert "owner_dept IN" in clause
+    assert "production_paper_cup" in params and "production_straw" in params
+    # 非 production 管理员保持精确集合
+    hr_da = KbIdentity.build(role="dept_admin", granted_owner_depts=["hr"])
+    _, hr_params = _kb_owner_scope_sql(hr_da)
+    assert hr_params == ["hr"]

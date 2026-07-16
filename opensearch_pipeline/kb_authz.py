@@ -187,6 +187,31 @@ def managed_owner_depts(identity: KbIdentity) -> List[str]:
     return []
 
 
+def expand_managed_owner_depts(depts: Iterable[str]) -> List[str]:
+    """管理【作用域比对】展开：granted 的 production 伞组 → production 家族全部已批准子线。
+
+    背景（2026-07-16 子部门探索）：既有 9 篇文档 + 未来从 raw/production_<子线>/ 目录
+    入库的文档，owner_dept 是子线值（production_paper_cup 等，资源侧合法、永不归一）。
+    managed_owner_depts 存的是伞组粒度 → 精确比对会让 production 管理员管不了子线文档。
+
+    边界（与读侧刻意不同）：
+    - 只做 production 伞形（单一来源 retriever._PRODUCTION_UMBRELLA_OWNERS）；
+      绝不复用 retriever._DEPT_OWNER_EXPANSION——那是【读】侧策略（marketing 共享读
+      production 家族），读≠管理：marketing 管理员不得因此获得 production 文档的
+      管理/审批权。
+    - 输出含子线（子线不在写白名单）→ 本函数只用于【比对既有文档 owner_dept】的
+      管理判定 / 列表 SQL 作用域，不得喂给上传目标下拉或 authorize_upload 的写白名单。
+    """
+    from opensearch_pipeline.retriever import _PRODUCTION_UMBRELLA_OWNERS
+
+    out = set()
+    for d in depts or []:
+        out.add(d)
+        if d == "production":
+            out |= set(_PRODUCTION_UMBRELLA_OWNERS)
+    return sorted(out)
+
+
 def grantable_owner_depts(identity: KbIdentity) -> List[str]:
     """该身份可【直接共享】（无需 kb_admin 审批）的目标组集合。
 
