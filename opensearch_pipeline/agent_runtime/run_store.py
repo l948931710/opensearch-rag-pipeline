@@ -163,6 +163,61 @@ class RDSRunStore:
         finally:
             conn.close()
 
+    def record_turn(self, run_id: str, *, turn_index: int, tokens_prompt=None,
+                    tokens_completion=None, tokens_total: int = 0,
+                    final: bool = False) -> None:
+        """原子记一个模型轮（perf 批次 C §4.5）：model_call step + 预算累加 + 心跳，
+        **单连接单事务**——取代此前 heartbeat / append_step / consume_budget 三次
+        连接+提交（每轮 4-5 次往返 → 1 次）。step_no 取号与 append_step 同式
+        （MAX+1；同 run 由 executor 单线程驱动，无并发取号）。失败整体回滚——
+        executor 侧包 fail-open 并回退分段写，预算强制仍走本地计数。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT COALESCE(MAX(step_no),0)+1 FROM {db}.agent_step WHERE run_id=%s",
+                    (run_id,))
+                step_no = int(cur.fetchone()[0])
+                cur.execute(
+                    f"INSERT INTO {db}.agent_step "
+                    "(run_id, step_no, kind, payload_json, tokens_prompt, tokens_completion, created_at) "
+                    "VALUES (%s,%s,'model_call',%s,%s,%s,NOW(3))",
+                    (run_id, step_no,
+                     json.dumps({"turn_index": turn_index, "final": final}, ensure_ascii=False),
+                     tokens_prompt, tokens_completion))
+                cur.execute(
+                    f"UPDATE {db}.agent_run SET turns_used=turns_used+1, "
+                    "tokens_used=tokens_used+%s, heartbeat_at=NOW(3) WHERE run_id=%s",
+                    (int(tokens_total), run_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def increment_budget(self, run_id: str, *, turns: int = 0, tool_calls: int = 0,
+                         tokens: int = 0) -> None:
+        """预算累加的**只写版**（perf 批次 C §4.5）：单条 UPDATE、无 SELECT 读回。
+        执行器的强制判断走 _drive_gen 本地计数，逐次读回累计值纯属浪费；
+        resume 播种仍走 consume_budget（零增量即读，语义不变）。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.agent_run SET turns_used=turns_used+%s, "
+                    "tool_calls_used=tool_calls_used+%s, tokens_used=tokens_used+%s "
+                    "WHERE run_id=%s",
+                    (int(turns), int(tool_calls), int(tokens), run_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def save_checkpoint(self, run_id: str, state_blob: bytes, state_digest: str) -> str:
         """写挂起 checkpoint，返回 checkpoint_id。"""
         cp_id = uuid.uuid4().hex
@@ -760,6 +815,36 @@ class RDSRunStore:
                 )
             conn.commit()
             return call_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    _LLM_CALL_COLS = ("run_id", "request_id", "provider", "model", "category",
+                      "prompt_version", "tokens_prompt", "tokens_completion",
+                      "cost_estimate", "latency_ms", "status", "user_id", "dept_group")
+
+    def record_llm_calls(self, rows: "list") -> int:
+        """llm_call_log **批量**落库（perf 批次 C §4.5：llm_log_outbox 冲刷用）：
+        单连接单事务 executemany。rows = record_llm_call 同名 kwargs 的 dict 列表；
+        created_at 取冲刷时刻（账本按日对账，亚秒偏移无关紧要）。返回写入行数。"""
+        if not rows:
+            return 0
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f"INSERT INTO {db}.llm_call_log "
+                    "(call_id, run_id, request_id, provider, model, category, prompt_version, "
+                    " tokens_prompt, tokens_completion, cost_estimate, latency_ms, status, "
+                    " user_id, dept_group, created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
+                    [(uuid.uuid4().hex, *[r.get(c) for c in self._LLM_CALL_COLS])
+                     for r in rows])
+            conn.commit()
+            return len(rows)
         except Exception:
             conn.rollback()
             raise

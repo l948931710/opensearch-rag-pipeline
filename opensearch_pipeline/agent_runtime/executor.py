@@ -350,9 +350,8 @@ class ThreadedRunExecutor:
                     if ev.turn_index >= turns_counted:
                         turns_counted = ev.turn_index + 1
                         tokens_used += ev.usage.total
-                        self._heartbeat(run_id)                            # 活跃心跳（僵尸回收判据）
-                        self._record_model_step(run_id, ev.turn_index, usage=ev.usage)
-                        self._budget_used(run_id, turns=1, tokens=ev.usage.total)
+                        # perf 批次 C §4.5：心跳+step+预算 单事务合并（fail-open，回退分段写）
+                        self._record_turn(run_id, ev.turn_index, usage=ev.usage)
                         if turns_counted > max_turns:
                             self._fail_over_budget(run_id, gen, handle, f"turns 预算超限（>{max_turns}）")
                             break
@@ -434,8 +433,8 @@ class ThreadedRunExecutor:
                     # 最终答案也是一个模型轮 → 记 model_call step + 计 turn + 记 tokens。
                     # on_complete 在 emit 之前跑（run 完成侧）：客户端看到 done 帧时记忆已落，
                     # 立刻发起的下一轮不会丢上一轮上下文。
-                    self._record_model_step(run_id, turns_counted, usage=ev.usage, final=True)
-                    self._budget_used(run_id, turns=1, tokens=ev.usage.total)
+                    # perf 批次 C §4.5：step+预算(+心跳)单事务合并（fail-open，回退分段写）
+                    self._record_turn(run_id, turns_counted, usage=ev.usage, final=True)
                     # fencing（重审计 §1 怀疑者 bug）：running→succeeded 的 CAS 成立才证明
                     # 本线程仍持有该 run。CAS 失败 = 已被 reaper 收尸/用户取消/排水标失败——
                     # 此前 _safe_transition 静默吞掉失败而 _notify_complete 照跑，答案落
@@ -600,9 +599,38 @@ class ThreadedRunExecutor:
         except Exception:   # noqa: BLE001
             pass
 
+    def _record_turn(self, run_id: Optional[str], turn_index: int,
+                     usage=None, final: bool = False) -> None:
+        """每模型轮 durable 记账（perf 批次 C §4.5）：优先 store.record_turn 单事务
+        （step+预算+心跳 1 次连接，取代 3 次）；store 无此法（测试桩/旧实现）或单事务
+        失败 → 回退老三样（各自 fail-open）。预算强制恒走 _drive_gen 本地计数。"""
+        rt = getattr(self._store, "record_turn", None)
+        if rt is not None:
+            try:
+                rt(run_id, turn_index=turn_index,
+                   tokens_prompt=(usage.tokens_prompt if usage else None),
+                   tokens_completion=(usage.tokens_completion if usage else None),
+                   tokens_total=(usage.total if usage else 0), final=final)
+                return
+            except Exception:   # noqa: BLE001 — 单事务失败 → 回退分段写（不阻断 run）
+                logger.warning("record_turn 单事务失败（回退分段写）", exc_info=True)
+        if not final:
+            self._heartbeat(run_id)   # 轮边界活跃心跳；final 轮沿旧行为不单发（transition 随即刷）
+        self._record_model_step(run_id, turn_index, usage=usage, final=final)
+        self._budget_used(run_id, turns=1, tokens=(usage.total if usage else 0))
+
     def _budget_used(self, run_id: Optional[str], **kw) -> dict:
-        """consume_budget 容错包装：返回累计 dict；记账失败→{}（durable 记账 fail-open——
-        **强制**不依赖它，走 _drive_gen 的本地计数，DB 故障不等于无限预算）。"""
+        """durable 预算累加的容错包装（记账失败→{}，fail-open——**强制**不依赖它，
+        走 _drive_gen 的本地计数，DB 故障不等于无限预算）。
+        perf 批次 C §4.5：优先只写版 increment_budget（单 UPDATE、免 SELECT 读回——
+        调用点全都丢弃返回值）；store 无此法回退 consume_budget（老语义）。"""
+        inc = getattr(self._store, "increment_budget", None)
+        if inc is not None:
+            try:
+                inc(run_id, **kw)
+                return {}
+            except Exception:   # noqa: BLE001
+                return {}
         try:
             return self._store.consume_budget(run_id, **kw) or {}
         except Exception:   # noqa: BLE001

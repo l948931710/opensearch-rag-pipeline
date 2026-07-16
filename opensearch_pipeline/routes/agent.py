@@ -235,6 +235,11 @@ def _drain_runtime() -> None:
 def _agent_shutdown_drain() -> None:
     """uvicorn 收 SIGTERM 后进入 lifespan shutdown 时触发（SAE 滚动发布的优雅窗口）。"""
     _drain_runtime()
+    try:   # perf 批次 C §4.5：llm 账本 outbox 冲干净再关（flag off 时为 no-op）
+        from opensearch_pipeline.agent_runtime.llm_log_outbox import drain_llm_log
+        drain_llm_log(timeout=5.0)
+    except Exception:   # noqa: BLE001 — 排水失败不阻断进程关停
+        logger.warning("llm_call_log outbox 排水失败（继续关停）", exc_info=True)
 
 
 def _get_runtime():
@@ -290,7 +295,10 @@ def _build_runtime():
         lambda c, specs: [s for s in specs if policy.would_grant(c, s)])
     adjudicator = make_adjudicator(registry, policy, run_store,
                                    audit=RDSAuditLog(), approvals=approvals)   # 执行前合规审计
-    gateway = default_gateway(call_logger=run_store.record_llm_call)   # 每次模型调用记 llm_call_log
+    # 每次模型调用记 llm_call_log；RAG_AGENT_LLM_LOG_ASYNC（默认 off）开 → 有界 outbox
+    # 攒批落库（perf 批次 C §4.5：热路径省一次连接+提交；满则同步兜底不丢账）
+    from opensearch_pipeline.agent_runtime.llm_log_outbox import wrap_call_logger
+    gateway = default_gateway(call_logger=wrap_call_logger(run_store))
     # WS2-3：装 rolling summary 真 summarizer（廉价模型压缩超窗历史）；是否生效由
     # RAG_SESSION_ROLLING_SUMMARY 控（默认 OFF→硬截断），装了也 dormant 直到开关打开。
     from opensearch_pipeline.agent_runtime import compaction
