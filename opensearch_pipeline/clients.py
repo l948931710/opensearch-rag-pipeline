@@ -15,6 +15,7 @@ monkeypatch 目标（`opensearch_pipeline.pipeline_nodes._get_opensearch_client`
 """
 
 import json
+import os
 from typing import Any, Dict, List
 
 from opensearch_pipeline.config import get_config
@@ -52,15 +53,24 @@ def _get_opensearch_client(ctx: dict = None):
     if cfg and cfg.endpoint:
         from alibabacloud_ha3engine_vector.client import Client
         from alibabacloud_ha3engine_vector.models import Config
+        from alibabacloud_tea_util.models import RuntimeOptions
 
         # 去除 endpoint 中的 http:// 或 https:// 前缀保护
         clean_endpoint = cfg.endpoint.replace("http://", "").replace("https://", "")
 
+        # 2026-07-16(100 条丢件重推现场):SDK 不传 runtime_options 时默认读超时过短,
+        # pushDocuments 的大 payload(百级 chunk×dense1024+sparse ≈ MB 级)在公网/家宽
+        # 稳定超时→整批 failed(查询 API 小响应不受影响,故检索一直正常)。显式给足
+        # 读超时;env 可调,单位毫秒。查询路径共用此客户端,读超时放宽无副作用
+        # (真挂死由重试层兜底)。
+        _read_to = int(os.environ.get("RAG_HA3_READ_TIMEOUT_MS", "60000"))
+        _conn_to = int(os.environ.get("RAG_HA3_CONNECT_TIMEOUT_MS", "10000"))
         ha3_config = Config(
             endpoint=clean_endpoint,
             instance_id=cfg.instance_id,
             access_user_name=cfg.access_user_name,
-            access_pass_word=cfg.access_pass_word
+            access_pass_word=cfg.access_pass_word,
+            runtime_options=RuntimeOptions(read_timeout=_read_to, connect_timeout=_conn_to),
         )
         return Client(ha3_config)
     else:
