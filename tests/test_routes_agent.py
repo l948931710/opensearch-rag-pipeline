@@ -275,7 +275,7 @@ class _ReconcileExecutor:
         self._reject = reject
 
     def resume(self, run_id, ctx, outcome, loop, tools, on_complete=None, on_failure=None,
-               approval_meta=None):
+               approval_meta=None, on_complete_durable=None):
         from opensearch_pipeline.agent_runtime.executor import RunRejected
         if self._reject:
             raise RunRejected("pool full")

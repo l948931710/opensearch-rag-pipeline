@@ -112,6 +112,10 @@ def test_shadow_link_end_to_end(monkeypatch):
     handle = executor.submit(ctx, loop, [{"role": "user", "content": "富岭包装规范?"}], tools)
     events = list(handle.events())
     executor.shutdown()
+    # P1-07（unknown-unknowns 批次1）：read-trace 默认异步（单线程池）——run 终态与
+    # invocation 收尾存在竞态（本用例此前 ~1/10 flake），断言前显式冲队列。
+    from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+    drain_read_trace()
 
     # 工具被提案并执行、ACL 一路注入、最终答案产出、run 成功
     assert any(isinstance(e, ToolCallProposed) and e.tool_name == "knowledge_search" for e in events)

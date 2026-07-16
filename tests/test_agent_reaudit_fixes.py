@@ -318,7 +318,7 @@ def test_resume_callbacks_reuse_run_message_id():
             return None
 
     run = {"run_id": "r1", "message_id": "mid-original", "conversation_id": None}
-    mid, _remember, _fail = agent_route._resume_callbacks(_RS(), run, "t1", "u1", ["g"])
+    mid, _remember, _fail, _persist = agent_route._resume_callbacks(_RS(), run, "t1", "u1", ["g"])
     assert mid == "mid-original"
 
 
@@ -330,7 +330,7 @@ def test_resume_callbacks_fallback_for_legacy_rows():
             return None
 
     run = {"run_id": "r1", "message_id": None, "conversation_id": None}
-    mid, _remember, _fail = agent_route._resume_callbacks(_RS(), run, "t1", "u1", ["g"])
+    mid, _remember, _fail, _persist = agent_route._resume_callbacks(_RS(), run, "t1", "u1", ["g"])
     assert mid                                              # 036 前历史行：回退新生成
 
 

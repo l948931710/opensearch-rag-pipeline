@@ -174,6 +174,145 @@ def _upsert_conversation(conn, user_id: str, conversation_id: str, title) -> Non
 # 不再尝试携带该列 —— qa_session_log 每问一行，逐行「试写失败再回退」会翻倍 RDS 往返、
 # 刷屏 warning（qa_rollup._upsert_daily 的同款 1054 回退无缓存是因为它每天只跑一次）。
 # apply 迁移后重启 serving 进程即恢复携带。
+def _serialize_retrieved(retrieved_docs: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """retrieved_docs → 瘦身 JSON（只保留溯源关键字段，避免存储过大）。
+
+    答案血缘：chunk_id(内嵌 version) + version_no,使一条回答可溯源到精确 chunk/版本。
+    不带它们时,re-chunk 后 chunk_index 漂移 → 历史答案无法定位到原始来源(L7-01/INC-6)。"""
+    if not retrieved_docs:
+        return None
+    return json.dumps(
+        [
+            {
+                "doc_id": d.get("doc_id", ""),
+                "chunk_id": d.get("chunk_id", ""),
+                "version_no": d.get("version_no"),
+                "title": d.get("title", ""),
+                "section_title": d.get("section_title", ""),
+                "score": d.get("score", 0),
+                "chunk_index": d.get("chunk_index", 0),
+            }
+            for d in retrieved_docs
+        ],
+        ensure_ascii=False,
+    )
+
+
+def insert_qa_row_tx(
+    cur,
+    *,
+    session_id: str,
+    message_id: str,
+    query_text: str,
+    user_id: Optional[str] = None,
+    user_dept: Optional[str] = None,
+    answer_text: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    answer_status: str = "SUCCESS",
+    model_name: Optional[str] = None,
+    error_message: Optional[str] = None,
+    retrieved_docs: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """qa_session_log 行的**事务内**写入变体（P0-01，unknown-unknowns 批次1）。
+
+    executor.complete_run_atomic 在 running→succeeded 同一事务里回调本函数——答案与
+    succeeded 原子共存亡。与 log_qa_session 的关键差异：
+    - **会抛异常**（fail-closed）：写不进 → 调用方回滚整个完成事务、run 落 failed，
+      绝不发 done。log_qa_session 的「绝不抛出」契约只适用于辅助性落库，真值写必须响。
+    - 不 commit（骑调用方事务）；不做 conversation upsert / qa_retrieved_doc 物化——
+      那些是增强，commit 后由 qa_answer_post_commit best-effort 补。
+    - 可选列（conversation_id / question_hash）沿用 1054 摘除重试阶梯（语句级错误不
+      终止 InnoDB 事务，行锁与已写语句保持）——列缺失绝不让整个 run 失败。
+    PII 掩码与主路径同口径（_redact_for_log）。"""
+    query_text = _redact_for_log(query_text)
+    answer_text = _redact_for_log(answer_text)
+    base_cols = [
+        "session_id", "message_id", "user_id", "user_name", "user_dept",
+        "query_text", "answer_text", "intent_type", "risk_level", "risk_blocked",
+        "retrieved_docs_json", "cited_docs_json",
+        "latency_ms", "retrieval_latency_ms", "llm_latency_ms",
+        "answer_status", "model_name", "error_message",
+        "opensearch_hit_count", "top_score", "conversation_type",
+        "content_blocks_json",
+    ]
+    base_vals: List[Any] = [
+        session_id, message_id, user_id or "", None, user_dept,
+        query_text, answer_text, None, None, 0,
+        _serialize_retrieved(retrieved_docs), None,
+        0, None, None,
+        answer_status, model_name, error_message,
+        None, None, None,
+        None,
+    ]
+    global _QUESTION_HASH_COL_MISSING
+    opt_cols: List[str] = []
+    opt_vals: List[Any] = []
+    if conversation_id and _conversation_history_on():
+        opt_cols.append("conversation_id")
+        opt_vals.append(conversation_id)
+    if query_text and not _QUESTION_HASH_COL_MISSING:
+        try:
+            from opensearch_pipeline.contribution import question_hash as _qhash_fn
+            opt_cols.append("question_hash")
+            opt_vals.append(_qhash_fn(query_text))
+        except Exception:   # noqa: BLE001 — 哈希派生绝不拖垮真值写
+            pass
+    while True:
+        cols, vals = base_cols + opt_cols, base_vals + opt_vals
+        try:
+            cur.execute(
+                f"INSERT INTO {_op_db()}.qa_session_log ({', '.join(cols)}) "
+                f"VALUES ({', '.join(['%s'] * len(cols))})",
+                tuple(vals),
+            )
+            return
+        except Exception as ge:
+            gerr = ge.args[0] if getattr(ge, "args", None) and isinstance(ge.args[0], int) else None
+            if not opt_cols or gerr != 1054:
+                raise
+            msg = str(ge)
+            idx = next((i for i, c in enumerate(opt_cols) if c in msg), len(opt_cols) - 1)
+            cname = opt_cols.pop(idx)
+            opt_vals.pop(idx)
+            if cname == "question_hash" and cname in msg:
+                _QUESTION_HASH_COL_MISSING = True
+            logger.warning(
+                "insert_qa_row_tx：%s 列缺失，摘除后事务内重试（请应用对应 schema）: message_id=%s",
+                cname, message_id,
+            )
+
+
+def qa_answer_post_commit(
+    message_id: str,
+    *,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    query_text: Optional[str] = None,
+    retrieved_docs: Optional[List[Dict[str, Any]]] = None,
+    cited_docs: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """P0-01 配套：qa 行已随 complete_run_atomic 事务落库之后的 best-effort 增强——
+    qa_retrieved_doc 物化（perf#3）+ conversation upsert（schema/006）。全程吞异常：
+    增强绝不影响已成真的 run（与 log_qa_session 内联时的容错语义一致）。"""
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+
+        conn = _get_db_conn()
+        try:
+            try:
+                from opensearch_pipeline.qa_facts import insert_qa_doc_facts
+                insert_qa_doc_facts(conn, message_id, retrieved_docs, cited_docs)
+            except Exception as fe:   # noqa: BLE001
+                logger.warning("qa_retrieved_doc 物化异常 (non-fatal): %s", fe)
+            if conversation_id and _conversation_history_on():
+                _upsert_conversation(conn, user_id or "", conversation_id,
+                                     _redact_for_log(query_text))
+        finally:
+            conn.close()
+    except Exception:   # noqa: BLE001
+        logger.warning("qa 完成后增强失败 (non-fatal): message_id=%s", message_id, exc_info=True)
+
+
 _GEN_META_COL_MISSING = False
 # schema/039 未 apply 时的进程内负缓存（question_hash 可选列，与 gen_meta 同款纪律）
 _QUESTION_HASH_COL_MISSING = False
@@ -246,27 +385,8 @@ def log_qa_session(
         # content_blocks_json 同为 PII sink（图文块里可能复述号码），结构感知掩码后再落库。
         content_blocks_json = _redact_content_blocks_for_log(content_blocks_json)
 
-        # 序列化 JSON 字段
-        retrieved_json = None
-        if retrieved_docs:
-            # 只保留关键字段，避免存储过大
-            retrieved_json = json.dumps(
-                [
-                    {
-                        "doc_id": d.get("doc_id", ""),
-                        # 答案血缘：chunk_id(内嵌 version) + version_no,使一条回答可溯源到精确 chunk/版本。
-                        # 不带它们时,re-chunk 后 chunk_index 漂移 → 历史答案无法定位到原始来源(L7-01/INC-6)。
-                        "chunk_id": d.get("chunk_id", ""),
-                        "version_no": d.get("version_no"),
-                        "title": d.get("title", ""),
-                        "section_title": d.get("section_title", ""),
-                        "score": d.get("score", 0),
-                        "chunk_index": d.get("chunk_index", 0),
-                    }
-                    for d in retrieved_docs
-                ],
-                ensure_ascii=False,
-            )
+        # 序列化 JSON 字段（瘦身逻辑提为 _serialize_retrieved——insert_qa_row_tx 同口径复用）
+        retrieved_json = _serialize_retrieved(retrieved_docs)
 
         cited_json = None
         if cited_docs:

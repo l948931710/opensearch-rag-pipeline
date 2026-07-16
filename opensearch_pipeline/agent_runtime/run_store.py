@@ -290,6 +290,42 @@ class RDSRunStore:
         finally:
             conn.close()
 
+    def complete_run_atomic(self, run_id: str, extra_writer=None) -> bool:
+        """P0-01（unknown-unknowns 批次1）：完成持久化**单事务**——最终答案落库
+        （extra_writer 游标回调，serving 层写 qa_session_log 行）+ running→succeeded CAS
+        一次 commit。此前两段分事务：succeeded 先 commit、答案写在回调里 best-effort——
+        回调失败时 durable 说「成功」而答案永不可恢复（断流用户经 run 详情/会话历史
+        全部读空）。与 suspend_run_atomic 同构：
+        - 返回 False = run 已不在 running（收尸/取消/排水抢先），**未提交任何写**——
+          调用方沿用完成侧 fencing 语义（结果作废）；
+        - extra_writer 异常 → 整体回滚后原样抛出——调用方落 failed，绝不发 done。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT status FROM {db}.agent_run WHERE run_id=%s FOR UPDATE",
+                            (run_id,))
+                row = cur.fetchone()
+                if not row or row[0] != "running":
+                    conn.rollback()
+                    return False
+                if extra_writer is not None:
+                    extra_writer(cur)
+                cur.execute(
+                    f"UPDATE {db}.agent_run SET status='succeeded', heartbeat_at=NOW(3), "
+                    "ended_at=NOW(3) WHERE run_id=%s AND status='running'", (run_id,))
+                ok = cur.rowcount == 1
+            if ok:
+                conn.commit()
+            else:
+                conn.rollback()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def transition(self, run_id: str, from_status: str, to_status: str) -> bool:
         """单向状态机迁移（CAS）。合法且当前==from → 迁移并 True；否则 False；非法 pair → 抛。"""
         if to_status not in _ALLOWED_TRANSITIONS.get(from_status, frozenset()):

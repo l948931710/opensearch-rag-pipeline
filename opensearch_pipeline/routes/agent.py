@@ -229,6 +229,14 @@ def _drain_runtime() -> None:
             executor.shutdown(wait=False)
     except Exception:   # noqa: BLE001 — 排水失败不阻断进程关停
         logger.warning("agent 执行器排水失败（继续关停）", exc_info=True)
+    try:
+        # P1-07（unknown-unknowns 批次1）：run 收尾后冲干净异步 read-trace 队列——
+        # 此前优雅关停只排 run 不排 trace，SIGTERM 窗口内最后一批只读 tool_invocation
+        # 行可能停在 executing（succeeded run 挂着 executing 调用，对账视图误报）。
+        from opensearch_pipeline.agent_runtime.tool_executor import drain_read_trace
+        drain_read_trace(timeout=5.0)
+    except Exception:   # noqa: BLE001 — trace 排水失败不阻断进程关停
+        logger.warning("read-trace 排水失败（继续关停）", exc_info=True)
 
 
 @router.on_event("shutdown")
@@ -574,22 +582,53 @@ def agent_ask(req: AskRequest, request: Request,
                 + snapshot.messages
                 + [{"role": "user", "content": req.question}])
 
-    def _remember(final_text: str, retrieved=None) -> None:
-        """run 完成侧回调（executor 调，非 SSE 消费侧——客户端断连也照常落库）。
-        retrieved=executor 收集的各检索批次 artifacts（P0-A sources 落库）。"""
+    def _clean_final(final_text: str) -> str:
         from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
         if _budget_enabled():
             # 预算模式引入 [文档N] header → 落库/记忆前清内部编号 + 空 <think> 残壳
             # （流式增量的瞬时残留由 content_blocks 替换帧覆盖；评审 R①-7/R②-2）
             from opensearch_pipeline.llm_generator import strip_doc_citations
-            final_text = _THINK_STUB_PATTERN.sub("", strip_doc_citations(final_text))
-        memory.append(thread_id, req.question, final_text, owner=identity.user_id)   # 热态记忆
-        # durable：落 qa_session_log（供重启回读重建 + console 会话历史；log_qa_session 自身 fail-safe）
-        from opensearch_pipeline.qa_logger import log_qa_session
-        log_qa_session(session_id=thread_id, message_id=message_id, user_id=identity.user_id,
-                       user_dept=getattr(identity, "dept", None), query_text=req.question,
-                       answer_text=final_text, conversation_id=conv, answer_status="SUCCESS",
-                       model_name="agent", retrieved_docs=_flatten_retrieved(retrieved))
+            return _THINK_STUB_PATTERN.sub("", strip_doc_citations(final_text))
+        return final_text
+
+    # P0-01（unknown-unknowns 批次1）：完成写一分为二——
+    # ① _persist_answer：durable 真值写。executor 在 running→succeeded **同一事务**内
+    #    回调（cur=事务游标）；写不进 → 事务回滚、run 落 failed，绝不发 done。
+    #    cur=None（简化测试桩 store 无 complete_run_atomic）→ 回退 log_qa_session 老语义。
+    # ② _remember：commit 后的缓存/增强副作用（会话记忆 + conversation upsert +
+    #    qa_retrieved_doc 物化），fail-open——它们失败绝不影响已成真的 run。
+    _persisted_tx = {"v": False}
+
+    def _persist_answer(cur, final_text: str, retrieved=None) -> None:
+        final_text = _clean_final(final_text)
+        if cur is None:
+            from opensearch_pipeline.qa_logger import log_qa_session
+            log_qa_session(session_id=thread_id, message_id=message_id, user_id=identity.user_id,
+                           user_dept=getattr(identity, "dept", None), query_text=req.question,
+                           answer_text=final_text, conversation_id=conv, answer_status="SUCCESS",
+                           model_name="agent", retrieved_docs=_flatten_retrieved(retrieved))
+            return
+        _persisted_tx["v"] = True
+        from opensearch_pipeline.qa_logger import insert_qa_row_tx
+        insert_qa_row_tx(cur, session_id=thread_id, message_id=message_id,
+                         user_id=identity.user_id, user_dept=getattr(identity, "dept", None),
+                         query_text=req.question, answer_text=final_text, conversation_id=conv,
+                         answer_status="SUCCESS", model_name="agent",
+                         retrieved_docs=_flatten_retrieved(retrieved))
+
+    def _remember(final_text: str, retrieved=None) -> None:
+        """run 完成侧缓存回调（executor 在 durable commit 之后调，非 SSE 消费侧）。"""
+        final_text = _clean_final(final_text)
+        try:
+            memory.append(thread_id, req.question, final_text, owner=identity.user_id)   # 热态记忆
+        except Exception:   # noqa: BLE001 — P0-01c：记忆失败绝不再吞掉后续增强
+            logger.warning("agent 会话记忆写入失败（答案已 durable，跳过热态记忆）", exc_info=True)
+        if _persisted_tx["v"]:
+            # 事务路径：qa 行已随 succeeded 落库，这里补 best-effort 增强
+            from opensearch_pipeline.qa_logger import qa_answer_post_commit
+            qa_answer_post_commit(message_id, user_id=identity.user_id, conversation_id=conv,
+                                  query_text=req.question,
+                                  retrieved_docs=_flatten_retrieved(retrieved))
 
     def _report_failure(err: str) -> None:
         """run 失败侧回调：落 AGENT_ERROR 行（此前只记 SUCCESS——agent 失败对运维零可见、
@@ -603,7 +642,8 @@ def agent_ask(req: AskRequest, request: Request,
 
     try:
         handle = executor.submit(ctx, loop, messages, tools,
-                                 on_complete=_remember, on_failure=_report_failure)
+                                 on_complete=_remember, on_failure=_report_failure,
+                                 on_complete_durable=_persist_answer)
     except RunRejected:
         raise HTTPException(status_code=429, detail="Agent 并发已满，请稍后再试")
     except ThreadBusy:
@@ -819,7 +859,7 @@ def agent_approve(req: ApproveRequest, request: Request,
     # 续跑沿用 submit 时的模型档（agent_run.model_profile；历史行 NULL → light）
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light"))
     tools = registry.list_specs(ctx)
-    message_id, _remember, _report_failure = _resume_callbacks(
+    message_id, _remember, _report_failure, _persist_answer = _resume_callbacks(
         run_store, run, thread_id, requester_id, req_groups)
 
     # PR-C（P0-06 回链）：审批事实随凭据到执行点——工具落 approval_request_id、
@@ -833,7 +873,8 @@ def agent_approve(req: ApproveRequest, request: Request,
     try:
         handle = executor.resume(req.run_id, ctx, outcome, loop, tools,
                                  on_complete=_remember, on_failure=_report_failure,
-                                 approval_meta=approval_meta)
+                                 approval_meta=approval_meta,
+                                 on_complete_durable=_persist_answer)
     except RunRejected as e:
         raise HTTPException(status_code=409, detail=str(e) or "run 非挂起或已被认领")
 
@@ -908,17 +949,44 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
     except Exception:   # noqa: BLE001
         pass
 
+    # P0-01（unknown-unknowns 批次1）：与 agent_ask 同款一分为二——durable 真值写
+    # （_persist_answer，随 running→succeeded 同一事务）+ commit 后缓存/增强（_remember）。
+    # P0-A：sources 随答案落库（审批续跑无 SSE 消费者——retrieved_docs 是发起人事后
+    # 从会话历史/看板核对答案依据的唯一通道）。
+    _persisted_tx = {"v": False}
+
+    def _persist_answer(cur, final_text: str, retrieved=None) -> None:
+        if cur is None:
+            from opensearch_pipeline.qa_logger import log_qa_session
+            log_qa_session(session_id=thread_id, message_id=message_id, user_id=requester_id,
+                           user_dept=(req_groups[0] if req_groups else None),
+                           query_text=cp_question, answer_text=final_text,
+                           conversation_id=run.get("conversation_id"),
+                           answer_status="SUCCESS", model_name="agent",
+                           retrieved_docs=_flatten_retrieved(retrieved))
+            return
+        _persisted_tx["v"] = True
+        from opensearch_pipeline.qa_logger import insert_qa_row_tx
+        insert_qa_row_tx(cur, session_id=thread_id, message_id=message_id, user_id=requester_id,
+                         user_dept=(req_groups[0] if req_groups else None),
+                         query_text=cp_question, answer_text=final_text,
+                         conversation_id=run.get("conversation_id"), answer_status="SUCCESS",
+                         model_name="agent", retrieved_docs=_flatten_retrieved(retrieved))
+
     def _remember(final_text: str, retrieved=None) -> None:
-        from opensearch_pipeline.agent_runtime.session_memory import default_session_memory
-        default_session_memory().append(thread_id, cp_question, final_text, owner=requester_id)
-        from opensearch_pipeline.qa_logger import log_qa_session
-        # P0-A：sources 随答案落库（审批续跑无 SSE 消费者——retrieved_docs 是发起人事后
-        # 从会话历史/看板核对答案依据的唯一通道）
-        log_qa_session(session_id=thread_id, message_id=message_id, user_id=requester_id,
-                       user_dept=(req_groups[0] if req_groups else None), query_text=cp_question,
-                       answer_text=final_text, conversation_id=run.get("conversation_id"),
-                       answer_status="SUCCESS", model_name="agent",
-                       retrieved_docs=_flatten_retrieved(retrieved))
+        try:
+            from opensearch_pipeline.agent_runtime.session_memory import default_session_memory
+            default_session_memory().append(thread_id, cp_question, final_text,
+                                            owner=requester_id)
+        except Exception:   # noqa: BLE001 — P0-01c：记忆失败绝不再吞掉后续增强
+            logger.warning("resume 会话记忆写入失败（答案已 durable，跳过热态记忆）",
+                           exc_info=True)
+        if _persisted_tx["v"]:
+            from opensearch_pipeline.qa_logger import qa_answer_post_commit
+            qa_answer_post_commit(message_id, user_id=requester_id,
+                                  conversation_id=run.get("conversation_id"),
+                                  query_text=cp_question,
+                                  retrieved_docs=_flatten_retrieved(retrieved))
 
     def _report_failure(err: str) -> None:
         from opensearch_pipeline.qa_logger import log_qa_session
@@ -928,7 +996,7 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
                        answer_status="AGENT_ERROR", model_name="agent",
                        error_message=(err or "")[:500])
 
-    return message_id, _remember, _report_failure
+    return message_id, _remember, _report_failure, _persist_answer
 
 
 def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -> int:
@@ -968,13 +1036,14 @@ def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -
         ctx, requester_id, req_groups = _requester_ctx(run, thread_id)
         loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light"))
         tools = registry.list_specs(ctx)
-        _mid, _remember, _report_failure = _resume_callbacks(
+        _mid, _remember, _report_failure, _persist_answer = _resume_callbacks(
             run_store, run, thread_id, requester_id, req_groups)
         try:
             handle = executor.resume(run_id, ctx, outcome, loop, tools,
                                      on_complete=_remember, on_failure=_report_failure,
                                      approval_meta={"request_id": c.get("request_id"),
-                                                    "decided_by": c.get("decided_by")})
+                                                    "decided_by": c.get("decided_by")},
+                                     on_complete_durable=_persist_answer)
         except RunRejected:
             logger.warning("B6 对账：run %s 重驱被拒（池满/已被认领），下轮再试", run_id)
             continue

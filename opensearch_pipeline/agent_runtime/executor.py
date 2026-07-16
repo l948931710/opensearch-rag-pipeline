@@ -27,6 +27,7 @@ from typing import Callable, Dict, Iterator, List, Optional
 from opensearch_pipeline.agent_runtime.context import ExecutionContext
 from opensearch_pipeline.agent_runtime.events import (
     AgentEvent,
+    ModelDelta,
     RunCheckpointReady,
     RunCompleted,
     RunFailed,
@@ -60,11 +61,24 @@ class RunHandle:
 
     def __init__(self, run_id: str):
         self.run_id = run_id
-        self._q: "queue.Queue" = queue.Queue()
+        # P1-05（unknown-unknowns 批次1）：事件队列**有界**——慢客户端/断连后 run 仍在
+        # 产出 delta，无界队列 = 每 run 一个内存放大器（×max_concurrent）。上限内正常
+        # 缓冲；满则丢 ModelDelta（断流恢复走 durable 轮询，答案本体在完成侧落库）；
+        # 非 delta 事件（终态/审批/工具帧）挤掉最旧事件也要入队。<=0 回退无界（历史行为）。
+        try:
+            _qmax = int(os.environ.get("RAG_AGENT_EVENT_QUEUE_MAX", "10000") or 10000)
+        except ValueError:
+            _qmax = 10000
+        self._q: "queue.Queue" = queue.Queue(maxsize=max(0, _qmax))
+        self._dropped_deltas = 0
         self._cancel = threading.Event()
         self._done = threading.Event()
         self._on_complete = None            # Callable[[str], None]，由 submit/resume 注入
         self._on_failure = None             # Callable[[str], None]，失败侧回调（运维可观测，深度审查治理组）
+        # P0-01：durable 完成写回调 Callable[[cursor, str, Optional[list]], None]——
+        # complete_run_atomic 在 running→succeeded 同一事务内调用（写 qa_session_log 行）。
+        self._on_complete_durable = None
+        self._client_disconnected_at = None   # SSE 消费者断连时刻（routes GeneratorExit 写入）
         self._relay = None                  # event_relay 发布器（flag off 恒 None；fail-open 镜像）
 
     def events(self) -> Iterator[AgentEvent]:
@@ -85,16 +99,42 @@ class RunHandle:
         return self._done.wait(timeout)
 
     def _emit(self, ev: AgentEvent) -> None:
-        self._q.put(ev)
+        self._put_local(ev)
         if self._relay is not None:
             self._relay.publish(ev)         # 跨实例镜像（内部 fail-open，绝不影响主路径）
+
+    def _put_local(self, ev) -> None:
+        """P1-05 有界入队。队列满时：ModelDelta 直接丢弃（计数告警）；其余事件
+        （终态/审批/工具帧/哨兵）挤掉最旧事件腾位后入队——消费者已停摆时保终态语义
+        比保早期增量重要。绝不阻塞驱动线程（put_nowait only）。"""
+        try:
+            self._q.put_nowait(ev)
+            return
+        except queue.Full:
+            pass
+        if isinstance(ev, ModelDelta):
+            self._dropped_deltas += 1
+            if self._dropped_deltas in (1, 1000) or self._dropped_deltas % 10000 == 0:
+                logger.warning("run %s 事件队列已满，累计丢弃 %s 个文本增量（消费者过慢/已断连；"
+                               "答案本体在完成侧落库，不受影响）", self.run_id, self._dropped_deltas)
+            return
+        while True:
+            try:
+                self._q.get_nowait()        # 挤掉最旧事件（有界队列必然在有限步内腾出位）
+            except queue.Empty:
+                pass
+            try:
+                self._q.put_nowait(ev)
+                return
+            except queue.Full:
+                continue
 
     def _finish(self, *, end_relay: bool = True) -> None:
         """收尾。本地队列恒投哨兵（进程内 SSE 消费者收流——挂起时原 /ask 流也该结束）；
         中继 ``__end__`` 只在**真终态**写（B3，2026-07-13 复核）：挂起不是终态，续跑段
         与挂起段共用同一 run_id 流，挂起点写 ``__end__`` 会让 /runs/{id}/events 回放在
         审批处永久收流——续跑段全部事件（含最终答案帧）经中继永不可达。"""
-        self._q.put(_SENTINEL)
+        self._put_local(_SENTINEL)          # P1-05：满队列也绝不阻塞收尾（挤最旧事件入哨兵）
         if self._relay is not None and end_relay:
             self._relay.end()               # __end__ 哨兵帧：消费侧据此收流
         self._done.set()
@@ -137,7 +177,8 @@ class ThreadedRunExecutor:
             self._active -= 1
 
     def submit(self, ctx: ExecutionContext, loop: AgentLoop,
-               messages: List, tools: List, on_complete=None, on_failure=None) -> RunHandle:
+               messages: List, tools: List, on_complete=None, on_failure=None,
+               on_complete_durable=None) -> RunHandle:
         self._acquire()
         run_id = None
         try:
@@ -154,6 +195,7 @@ class ThreadedRunExecutor:
             handle = RunHandle(run_id)
             handle._on_complete = on_complete
             handle._on_failure = on_failure
+            handle._on_complete_durable = on_complete_durable
             # run_id 建 run 后**就地回填**共享 ctx（route 把同一 ctx 既闭包进 model_fn 又传本方法；
             # 用 with_run_id 造副本会让 model_fn 闭包的 run_id 仍 None → llm_call_log 记账落空。
             # run_id 是"建 run 后回填"字段、非身份/ACL，就地 setattr 不违 frozen 初衷）。
@@ -173,7 +215,8 @@ class ThreadedRunExecutor:
 
     def resume(self, run_id: str, ctx: ExecutionContext, outcome, loop: AgentLoop,
                tools: List, on_complete=None, on_failure=None,
-               approval_meta: Optional[dict] = None) -> RunHandle:
+               approval_meta: Optional[dict] = None,
+               on_complete_durable=None) -> RunHandle:
         """WS3 两步 resume：① CAS suspended→resuming（认领，防两审批回调并发重入）② 载 checkpoint +
         记 approvals（批准/改参令 adjudicator 绕过审批执行）+ resuming→running + 驱动 loop.resume。
         返回续跑 run 的 handle。outcome ∈ Approved/Edited/RejectedFeedback/RejectedTerminate。
@@ -236,6 +279,7 @@ class ThreadedRunExecutor:
             handle = RunHandle(run_id)
             handle._on_complete = on_complete
             handle._on_failure = on_failure
+            handle._on_complete_durable = on_complete_durable
             self._attach_relay(handle)
             with self._lock:
                 self._live[run_id] = handle
@@ -431,25 +475,22 @@ class ThreadedRunExecutor:
                     continue
                 if isinstance(ev, RunCompleted):
                     # 最终答案也是一个模型轮 → 记 model_call step + 计 turn + 记 tokens。
-                    # on_complete 在 emit 之前跑（run 完成侧）：客户端看到 done 帧时记忆已落，
-                    # 立刻发起的下一轮不会丢上一轮上下文。
                     # perf 批次 C §4.5：step+预算(+心跳)单事务合并（fail-open，回退分段写）
                     self._record_turn(run_id, turns_counted, usage=ev.usage, final=True)
-                    # fencing（重审计 §1 怀疑者 bug）：running→succeeded 的 CAS 成立才证明
-                    # 本线程仍持有该 run。CAS 失败 = 已被 reaper 收尸/用户取消/排水标失败——
-                    # 此前 _safe_transition 静默吞掉失败而 _notify_complete 照跑，答案落
-                    # qa_log/会话记忆而 durable 状态是 failed，两边永久分叉。现在失去所有权
-                    # 即作废结果：不落库、不发 done 帧，响亮 error 日志可观测。
-                    if self._transition_checked(run_id, "running", "succeeded"):
-                        self._notify_complete(handle, ev, retrieved_chunks)
-                        handle._emit(ev)
-                    else:
-                        logger.error(
-                            "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库",
-                            run_id)
-                        handle._emit(RunFailed(
-                            error="run 已被系统收尸或取消（完成结果作废，请重试）",
-                            retryable=True))
+                    # P0-02（unknown-unknowns 批次1）：最终模型轮此前完全绕过强制——
+                    # token_budget/deadline 不是硬上限。费用已发生 → 诚实记账（上一行）后
+                    # post-call 复判：超限落 failed，绝不发 done。turns 语义**有意**维持
+                    # 「工具轮循环上界」：final 恰一轮、不可能经它无界增长，不计 turns cap
+                    # （否则「恰用满 max_turns 个工具轮再作答」的正常 run 必败）。
+                    tokens_used += ev.usage.total
+                    if tokens_used > token_budget:
+                        self._fail_over_budget(run_id, gen, handle,
+                                               f"token 预算超限（>{token_budget}，最终轮后判）")
+                        break
+                    if ctx.budget.is_past_deadline(datetime.now(timezone.utc)):
+                        self._fail_over_budget(run_id, gen, handle, "run deadline 超时（最终轮后判）")
+                        break
+                    self._complete_run(run_id, handle, ev, retrieved_chunks)
                     break
                 handle._emit(ev)
                 if isinstance(ev, RunFailed):
@@ -495,6 +536,67 @@ class ThreadedRunExecutor:
                     pass
             handle._finish(end_relay=not suspended)
             self._release()
+
+    def _complete_run(self, run_id: Optional[str], handle: RunHandle,
+                      ev: RunCompleted, retrieved: Optional[list]) -> None:
+        """P0-01（unknown-unknowns 批次1）完成真值：durable 答案写与 running→succeeded
+        **同一事务**（run_store.complete_run_atomic + handle._on_complete_durable 游标回调），
+        此前 succeeded 先 commit、答案写在回调里 best-effort 被吞——durable 说「成功」而
+        答案永不可恢复。语义分支：
+        - 事务成功 → 先跑缓存性回调（_notify_complete：会话记忆/conversation 增强，
+          fail-open——commit 后的副作用失败不再影响真值）再发 done 帧；
+        - extra_writer/事务异常 → **落 failed，绝不发 done**（费用已发生也不谎报成功；
+          retryable=True，用户重问即可）；
+        - CAS False = 失去所有权（收尸/取消/排水抢先）→ 结果作废（原 fencing 语义，
+          见 2026-07 重审计 §1——CAS 先于答案落库不是缺陷而是所有权证明，本修复把
+          答案写**并入** CAS 事务而非调换顺序）。
+        store 无 complete_run_atomic（简化测试桩）→ 回退旧序：CAS → durable 回调以
+        cur=None 调用（best-effort，桩环境无原子性可言）→ 缓存回调。"""
+        if hasattr(self._store, "complete_run_atomic"):
+            writer = handle._on_complete_durable
+            extra = None
+            if writer is not None:
+                def extra(cur):   # noqa: E306
+                    writer(cur, ev.final_text, retrieved)
+            try:
+                ok = self._store.complete_run_atomic(run_id, extra_writer=extra)
+            except Exception as e:   # noqa: BLE001 — durable 答案写失败：诚实落 failed
+                logger.error("run %s 最终答案落库失败——落 failed，绝不发 done（P0-01）",
+                             run_id, exc_info=True)
+                handle._emit(RunFailed(
+                    error=f"最终答案落库失败，请重试（answer_persist_failed）: {str(e)[:200]}",
+                    retryable=True))
+                if self._transition_checked(run_id, "running", "failed"):
+                    self._notify_failure(handle, f"answer_persist_failed: {e}")
+                else:
+                    logger.error("run %s 答案落库失败收尾时已失去所有权，跳过失败侧落库", run_id)
+                return
+            if ok:
+                self._notify_complete(handle, ev, retrieved)
+                handle._emit(ev)
+            else:
+                logger.error(
+                    "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库",
+                    run_id)
+                handle._emit(RunFailed(
+                    error="run 已被系统收尸或取消（完成结果作废，请重试）", retryable=True))
+            return
+        # 旧路径（测试桩）：CAS 成立后 durable 回调降级为 best-effort（无事务缝可用）
+        if self._transition_checked(run_id, "running", "succeeded"):
+            writer = handle._on_complete_durable
+            if writer is not None:
+                try:
+                    writer(None, ev.final_text, retrieved)
+                except Exception:   # noqa: BLE001
+                    logger.warning("run %s durable 完成回调失败（桩路径 best-effort）",
+                                   run_id, exc_info=True)
+            self._notify_complete(handle, ev, retrieved)
+            handle._emit(ev)
+        else:
+            logger.error(
+                "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库", run_id)
+            handle._emit(RunFailed(
+                error="run 已被系统收尸或取消（完成结果作废，请重试）", retryable=True))
 
     @staticmethod
     def _notify_complete(handle: RunHandle, ev: RunCompleted,
