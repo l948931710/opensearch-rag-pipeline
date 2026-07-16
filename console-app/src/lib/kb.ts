@@ -27,6 +27,7 @@ export const GROUP_LABEL: Record<string, string> = {
 // 不并入 GROUP_LABEL：CONTRIB_DEPT_OPTS 以 GROUP_LABEL 的键为贡献归属选项，子线不应出现在下拉里。
 export const SUBDEPT_LABEL: Record<string, string> = {
   production_mold: '生产·模具', production_paper_cup: '生产·纸杯', production_thermoforming: '生产·吸塑',
+  production_injection: '生产·注塑', production_straw: '生产·吸管',
 }
 export const deptLabel = (code: string) => GROUP_LABEL[code] || SUBDEPT_LABEL[code] || code
 

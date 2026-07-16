@@ -2525,11 +2525,14 @@ def _require_kb_admin(identity: Optional[Identity]):
 
 
 def _kb_owner_scope_sql(kb, col: str = "owner_dept"):
-    """owner_dept 作用域 SQL：kb_admin 不限；dept_admin 限其 managed；无授权 → 匹配空集。"""
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    """owner_dept 作用域 SQL：kb_admin 不限；dept_admin 限其 managed（production 伞组
+    展开覆盖子线 owner——比对既有文档归属，非写目标面）；无授权 → 匹配空集。"""
+    from opensearch_pipeline.kb_authz import (
+        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
+    )
     if kb.role == ROLE_KB_ADMIN:
         return "", []
-    owners = managed_owner_depts(kb)
+    owners = expand_managed_owner_depts(managed_owner_depts(kb))
     if not owners:
         return "AND 1=0", []
     placeholders = ",".join(["%s"] * len(owners))
@@ -2537,10 +2540,12 @@ def _kb_owner_scope_sql(kb, col: str = "owner_dept"):
 
 
 def _kb_can_manage(kb, owner_dept: str) -> bool:
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
+    from opensearch_pipeline.kb_authz import (
+        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
+    )
     if kb.role == ROLE_KB_ADMIN:
         return True
-    return (owner_dept or "") in set(managed_owner_depts(kb))
+    return (owner_dept or "") in set(expand_managed_owner_depts(managed_owner_depts(kb)))
 
 
 def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
