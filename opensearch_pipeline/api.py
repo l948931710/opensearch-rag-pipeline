@@ -388,6 +388,11 @@ class DingtalkAuthResponse(BaseModel):
     dept: Optional[str] = None  # 旧·兼容：acl_groups 的 CSV
     role: str = Field(default="employee", description="知识库写授权角色：employee/dept_admin/kb_admin")
     can_manage_kb: bool = Field(default=False, description="是否显示「知识库管理」入口（角色为管理员）")
+    # 与 /api/kb/whoami 同源（kb_authz.managed_owner_depts）。缺席即前端上传「归属部门」下拉为空：
+    # 钉钉容器免登路径 setIdentity 直接用本响应、不再补拉 whoami，字段必须在此路径也齐全。
+    managed_owner_depts: List[str] = Field(
+        default_factory=list,
+        description="可上传/升版/退役的 owner_dept（kb_admin=全量写白名单；仅 UI 提示，特权接口仍服务端再裁决）")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -653,7 +658,7 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
     groups = ident.get("dept") or []  # _resolve_user_identity 现返回 ACL 组列表
     # 知识库写授权角色（DB 现查；写入令牌仅作入口可见性 UI 提示，特权接口仍会再现查裁决）
     from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
-    from opensearch_pipeline.kb_authz import can_access_console
+    from opensearch_pipeline.kb_authz import can_access_console, managed_owner_depts
     kb_ident = resolve_kb_identity(userid)
     token = issue_session_token(userid, dept=groups, name=ident.get("name"), role=kb_ident.role)
     return DingtalkAuthResponse(
@@ -664,6 +669,7 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
         dept=",".join(groups) if isinstance(groups, list) else (groups or None),
         role=kb_ident.role,
         can_manage_kb=can_access_console(kb_ident),
+        managed_owner_depts=managed_owner_depts(kb_ident),
     )
 
 
