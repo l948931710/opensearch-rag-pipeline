@@ -421,6 +421,35 @@ class RDSRunStore:
         finally:
             conn.close()
 
+    def expire_suspended_with_expired_approval(self) -> int:
+        """批次5 cross-heal（unknown-unknowns P1-08）：审批先过期而 run 仍 suspended——
+        schema/037 的 active_thread 生成列让该 thread 一直 409 新提问，直到 run 自身
+        TTL（reaper 的 resuming→suspended 回边还会重置 heartbeat 时钟，双 TTL 即便
+        数值相等也会漂移）。审批过期=拒绝已成事实 → run 提前收口 expired 释放线程。
+        只清「全部审批行均已 expired/rejected_terminate」的挂起 run；已决
+        （approved/edited/rejected_feedback）的挂起 run 归 B6 对账重驱，绝不误杀。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.agent_run r "
+                    "SET r.status='expired', r.ended_at=NOW(3), r.heartbeat_at=NOW(3) "
+                    "WHERE r.status='suspended' "
+                    f"AND EXISTS (SELECT 1 FROM {db}.approval_request a "
+                    "  WHERE a.run_id=r.run_id AND a.status='expired') "
+                    f"AND NOT EXISTS (SELECT 1 FROM {db}.approval_request p "
+                    "  WHERE p.run_id=r.run_id "
+                    "  AND p.status NOT IN ('expired','rejected_terminate'))")
+                n = cur.rowcount
+            conn.commit()
+            return int(n)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def consume_budget(self, run_id: str, *, turns: int = 0, tool_calls: int = 0,
                        tokens: int = 0) -> Dict[str, int]:
         """原子累加预算消耗，返回累计值（B8：消耗跨 suspend/resume 持久 → 落 durable，不放 frozen ctx）。

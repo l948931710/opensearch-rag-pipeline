@@ -74,6 +74,9 @@ def _fresh_load(**env_overrides):
     cfg_module._config = None
 
     try:
+        # 批次5 P0-07d：production 姿态断言（REQUIRE_AUTH/ACL_FAIL_CLOSED）——本文件测
+        # 的是其它守卫，默认注入过渡 ack（与 test_config_loading._fresh_load 同款）。
+        env_overrides.setdefault("RAG_ALLOW_LEGACY_OPEN_PROD", "ack")
         os.environ.update(env_overrides)
         return cfg_module.load_config()
     finally:

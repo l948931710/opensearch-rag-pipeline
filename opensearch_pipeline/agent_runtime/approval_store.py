@@ -33,6 +33,39 @@ logger = logging.getLogger(__name__)
 # 审批请求存活窗口（秒）。默认与 suspended run TTL 对齐（3 天）——两边同源过期语义。
 DEFAULT_APPROVAL_TTL_S = 259200
 
+_TTL_MISMATCH_WARNED = False
+
+
+def approval_ttl_s() -> int:
+    """批次5（unknown-unknowns P1-08）：TTL 单源派生——RAG_AGENT_APPROVAL_TTL_S 未设时
+    **跟随** RAG_AGENT_SUSPENDED_TTL_S（此前两个独立 env 只靠注释「默认对齐」维系，
+    改一处忘另一处即漂移；且 reaper 的 resuming→suspended 回边会重置 run 的 heartbeat
+    时钟，即便数值相等两边也会漂）。两者都显式设置且不等 → 启动期 warning 一次
+    （允许有意错开——先过期一侧的半状态由 reaper cross-heal 收口：
+    expire_for_terminal_runs + run_store.expire_suspended_with_expired_approval）。"""
+    global _TTL_MISMATCH_WARNED
+    raw_a = os.environ.get("RAG_AGENT_APPROVAL_TTL_S", "").strip()
+    raw_s = os.environ.get("RAG_AGENT_SUSPENDED_TTL_S", "").strip()
+    if raw_a:
+        try:
+            v = int(raw_a)
+        except ValueError:
+            return DEFAULT_APPROVAL_TTL_S
+        if raw_s and raw_s != raw_a and not _TTL_MISMATCH_WARNED:
+            _TTL_MISMATCH_WARNED = True
+            logger.warning(
+                "RAG_AGENT_APPROVAL_TTL_S=%s ≠ RAG_AGENT_SUSPENDED_TTL_S=%s——审批与挂起 "
+                "run 的过期时钟将漂移（先过期一侧的半状态由 reaper cross-heal 收口）",
+                raw_a, raw_s)
+        return v
+    if raw_s:
+        try:
+            return int(raw_s)      # 单源：审批 TTL 未显式设置时跟随 suspended TTL
+        except ValueError:
+            return DEFAULT_APPROVAL_TTL_S
+    return DEFAULT_APPROVAL_TTL_S
+
+
 # decide() 的返回语义（kb_access 范式：CAS 失败不是异常，是并发/迟到事实）
 DECIDE_ACCEPTED = "accepted"                  # 本次决策生效（pending → 目标态）
 DECIDE_DUPLICATE = "duplicate"                # 同 (request, idempotency_key) 重放 → 幂等返回
@@ -135,7 +168,7 @@ class RDSApprovalStore:
         from opensearch_pipeline.agent_runtime.tool_executor import digest
 
         if ttl_s is None:
-            ttl_s = int(os.environ.get("RAG_AGENT_APPROVAL_TTL_S", str(DEFAULT_APPROVAL_TTL_S)))
+            ttl_s = approval_ttl_s()   # 批次5 P1-08：单源派生（未设时跟随 suspended TTL）
         request_id = request_id or uuid.uuid4().hex
         args = pending_call.get("arguments") or {}
         tool_name = str(pending_call.get("tool_name") or "")[:64]
@@ -389,6 +422,29 @@ class RDSApprovalStore:
                 cur.execute(
                     f"UPDATE {db}.approval_request SET status='expired', decided_at=NOW(3) "
                     "WHERE status='pending' AND expires_at < NOW(3)")
+                n = cur.rowcount
+            conn.commit()
+            return int(n)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def expire_for_terminal_runs(self) -> int:
+        """批次5 cross-heal（unknown-unknowns P1-08）：run 已终态而审批仍 pending 的
+        孤儿行——审批队列里看起来可处置、点开必 409（/approve 只认 suspended），
+        此前一直挂到自身 expires_at。随 reaper 周期提前收口。幂等、跨实例安全。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.approval_request a "
+                    f"JOIN {db}.agent_run r ON a.run_id = r.run_id "
+                    "SET a.status='expired', a.decided_at=NOW(3) "
+                    "WHERE a.status='pending' "
+                    "AND r.status IN ('succeeded','failed','cancelled','expired')")
                 n = cur.rowcount
             conn.commit()
             return int(n)

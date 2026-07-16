@@ -189,6 +189,19 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
                         logger.warning("agent 审批请求过期收尸：pending→expired %s", n)
                 except Exception:   # noqa: BLE001
                     logger.warning("审批请求过期收尸失败（下轮重试）", exc_info=True)
+                # 批次5 cross-heal（unknown-unknowns P1-08）：双 TTL 漂移的两类半状态互收——
+                # run 终态而审批仍 pending（队列幽灵）/ 审批已过期而 run 仍 suspended
+                # （active_thread 占坑到自身 TTL）。已决待重驱的归 B6，不在此列。
+                try:
+                    n1 = (approval_store.expire_for_terminal_runs()
+                          if hasattr(approval_store, "expire_for_terminal_runs") else 0)
+                    n2 = (run_store.expire_suspended_with_expired_approval()
+                          if hasattr(run_store, "expire_suspended_with_expired_approval") else 0)
+                    if n1 or n2:
+                        logger.warning("TTL cross-heal：终态 run 的孤儿 pending 审批→expired %s"
+                                       " · 审批过期的挂起 run→expired %s", n1, n2)
+                except Exception:   # noqa: BLE001
+                    logger.warning("TTL cross-heal 失败（下轮重试）", exc_info=True)
                 if runtime is not None:
                     try:
                         registry, gateway, executor = runtime

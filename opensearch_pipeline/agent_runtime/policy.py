@@ -131,13 +131,17 @@ def default_policy_engine() -> PolicyEngine:
         PolicyRule(effect="allow", scopes=("kb.search", "sql.readonly.*"),
                    policy_id="baseline.readonly"),
     ]
-    from opensearch_pipeline.agent_tools import ontology_tools_enabled
+    from opensearch_pipeline.agent_tools import (
+        ontology_tools_enabled, ontology_write_tools_enabled)
     if ontology_tools_enabled():
-        rules.append(PolicyRule(
-            effect="allow",
-            scopes=("ontology.resolve", "ontology.packing.calc",
-                    "ontology.identity.resolve"),
-            policy_id="ontology.pmc1"))
+        # 批次5（P0-07b）：HIGH_WRITE scope 的授予与写工具开关联动——读开关只授只读
+        # 两 scope；ontology.identity.resolve 另需 RAG_ONTOLOGY_WRITE_TOOLS_ENABLE
+        # （与 registry 注册同两杆；flag 关时即便工具被意外注册，policy 仍 default-deny）。
+        scopes = ["ontology.resolve", "ontology.packing.calc"]
+        if ontology_write_tools_enabled():
+            scopes.append("ontology.identity.resolve")
+        rules.append(PolicyRule(effect="allow", scopes=tuple(scopes),
+                                policy_id="ontology.pmc1"))
     return PolicyEngine(rules)
 
 

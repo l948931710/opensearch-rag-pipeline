@@ -644,6 +644,11 @@ def readiness_check():
     checks["ontology_tables"] = _readiness.ontology_tables_status()
     checks["tool_registry"] = _readiness.tool_registry_status()
     checks["schema_migrations"] = _readiness.schema_migrations_status()
+    # 批次5（unknown-unknowns P0-06）：关键列契约（表在≠契约在，critical）、
+    # kill-switch 读路径（HIGH_WRITE 开时 critical）、038 回填缺口（report-only）
+    checks["schema_contract"] = _readiness.schema_contract_status()
+    checks["kill_switch"] = _readiness.kill_switch_status()
+    checks["ontology_backfill"] = _readiness.ontology_backfill_status()
 
     # WS0 状态外置：任一状态后端切了 redis → Redis PING 纳入就绪判定（此前 redis_client.ping
     # 是死代码，深度审查多实例运维组）。判据：限流 redis 后端是 fail-closed（Redis 挂 → ask
@@ -689,10 +694,16 @@ def readiness_check():
                    and checks.get("agent_tables") in ("ok", "skipped")
                    and checks.get("ontology_tables") in ("ok", "skipped")
                    and checks.get("tool_registry") not in ("error", "empty")
-                   # schema 漂移默认只报告（台账抖动不该全量摘流量）；
-                   # RAG_READY_SCHEMA_STRICT=true 后纳入关键判定
+                   # 批次5 P0-06：关键列缺失=功能首次触库必 500（与缺表同级）；
+                   # kill-switch 读退化仅在 HIGH_WRITE 工具启用时摘流量
+                   and checks.get("schema_contract") in ("ok", "skipped")
+                   and (checks.get("kill_switch") in ("ok", "skipped")
+                        or not _readiness.kill_switch_critical())
+                   # schema 台账健康默认只报告（台账抖动不该全量摘流量）；
+                   # RAG_READY_SCHEMA_STRICT=true 后要求 **ok**——drift/unapplied/
+                   # unavailable/no_local_files 一律不就绪（批次5 P0-06d 收紧）
                    and (not _readiness.schema_strict()
-                        or checks.get("schema_migrations") != "drift"))
+                        or checks.get("schema_migrations") == "ok"))
     body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
     return body if critical_ok else JSONResponse(status_code=503, content=body)
 

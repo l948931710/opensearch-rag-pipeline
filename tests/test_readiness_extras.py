@@ -103,9 +103,10 @@ def test_schema_drift_detection(monkeypatch, tmp_path):
     # 台账 checksum 不同 → drift（同名内容漂移）
     _wire_db(monkeypatch, {"schema_migrations": [("001_demo.sql", "deadbeef" * 8)]})
     assert readiness._schema_drift_once() == "drift"
-    # 台账没这个文件 / 本地新增未 apply → 不算漂移
+    # 批次5 P0-06c：本地存在但台账未记 → unapplied:N（旧语义「不算漂移→ok」正是
+    # 「缺 apply 仍绿」的假健康主通道，strict 下应摘流量）
     _wire_db(monkeypatch, {"schema_migrations": [("999_other.sql", "deadbeef" * 8)]})
-    assert readiness._schema_drift_once() == "ok"
+    assert readiness._schema_drift_once() == "unapplied:1"
     # 修订标记 filename@NNNa：取 @ 前基名比对
     _wire_db(monkeypatch, {"schema_migrations": [("001_demo.sql@001a", good)]})
     assert readiness._schema_drift_once() == "ok"

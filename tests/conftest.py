@@ -172,6 +172,7 @@ _LOCAL_STACK_SERIAL_MODULES = {
     "test_agent_runtime_registry_store.py",
     "test_agent_runtime_approval_store.py",
     "test_agent_approval_integrity_db.py",
+    "test_unknown_unknowns_batch5.py",   # 批次5 cross-heal 真库用例（agent_run/approval DML）
 }
 
 

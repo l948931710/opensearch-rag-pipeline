@@ -29,6 +29,11 @@ def _fresh_load(**env_overrides):
     cfg_module._config = None
 
     try:
+        # 批次5 P0-07d：生产姿态断言（REQUIRE_AUTH/ACL_FAIL_CLOSED 缺失即 raise）会击中
+        # 所有构造 production/staging 形态的既有守卫测试——本 helper 默认注入过渡 ack
+        # （这些测试测的是**其它**守卫）；姿态断言自身的测试显式传
+        # RAG_ALLOW_LEGACY_OPEN_PROD="" 覆盖即可触发。
+        env_overrides.setdefault("RAG_ALLOW_LEGACY_OPEN_PROD", "ack")
         os.environ.update(env_overrides)
         return cfg_module.load_config()
     finally:

@@ -343,10 +343,12 @@ class TestGeminiFallbackSafeguard:
         """测试在 production 或 staging 环境下，若使用 Google Gemini 模型或 API Endpoint，启动过程直接抛出 ValueError 强行崩溃。"""
         # 保存原有的环境变量，以便后续恢复
         orig_env_vars = {}
-        for key in ["RAG_ENVIRONMENT", "RAG_DASHSCOPE_API_KEY", "GEMINI_API_KEY", "LLM_API_KEY", "OCR_API_KEY", "EMBEDDING_API_KEY"]:
+        for key in ["RAG_ENVIRONMENT", "RAG_DASHSCOPE_API_KEY", "GEMINI_API_KEY", "LLM_API_KEY", "OCR_API_KEY", "EMBEDDING_API_KEY", "RAG_ALLOW_LEGACY_OPEN_PROD"]:
             orig_env_vars[key] = os.environ.get(key)
 
         try:
+            # 批次5 P0-07d：本测试测的是供应商守卫——姿态断言给过渡 ack 让路
+            os.environ["RAG_ALLOW_LEGACY_OPEN_PROD"] = "ack"
             # 1. 模拟 staging 环境下没配 DashScope KEY，直接报错
             os.environ["RAG_ENVIRONMENT"] = "staging"
             if "RAG_DASHSCOPE_API_KEY" in os.environ:

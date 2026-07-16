@@ -541,12 +541,27 @@ def test_tool_not_wired_into_default_registry(monkeypatch):
 
 
 def test_tool_wired_when_flag_enabled(monkeypatch):
-    """PR13：flag 开 → 三本体工具进 registry，policy 同杆授予（READ_ONLY allow，
-    HIGH_WRITE 授予仍结构性走审批）。"""
+    """PR13 + 批次5 P0-07a 拆杆：读 flag 只接两只读工具；HIGH_WRITE
+    （ontology_identity_resolve）另需写 flag + injection guard（缺 guard 硬失败）。"""
     monkeypatch.setenv("RAG_ONTOLOGY_TOOLS_ENABLE", "true")
+    monkeypatch.delenv("RAG_ONTOLOGY_WRITE_TOOLS_ENABLE", raising=False)
     from opensearch_pipeline.agent_tools import build_default_registry
     names = {spec.name for spec in build_default_registry().list_specs()}
+    assert {"ontology_resolve", "packing_calc"} <= names
+    assert "ontology_identity_resolve" not in names        # 读杆不再连带写工具
+
+    # guard 读的是缓存 config（loop.tool_data_guard_enabled）——测试直接 patch 函数
+    import opensearch_pipeline.agent_runtime.loop as _loop
+    monkeypatch.setenv("RAG_ONTOLOGY_WRITE_TOOLS_ENABLE", "true")
+    monkeypatch.setattr(_loop, "tool_data_guard_enabled", lambda: True)
+    names = {spec.name for spec in build_default_registry().list_specs()}
     assert {"ontology_resolve", "ontology_identity_resolve", "packing_calc"} <= names
+
+    # P0-07c 机器强制：写工具开而 guard 关 → 拒绝注册（不再只是 warning）
+    monkeypatch.setattr(_loop, "tool_data_guard_enabled", lambda: False)
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError, match="RAG_PROMPT_INJECTION_GUARD"):
+        build_default_registry()
 
 
 # ── PR-E（P0-07）：τ 数值域 + auto 硬关（默认候选-only）──────────────────────────

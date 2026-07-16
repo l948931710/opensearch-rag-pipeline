@@ -43,6 +43,10 @@ class RDSToolRegistryStore:
         self._lock = threading.Lock()
         self._cached_disabled: Optional[Set[str]] = None
         self._cached_at = 0.0
+        # 批次5（unknown-unknowns P1-03）：sync_specs 时从**代码内声明**捕获 HIGH_WRITE
+        # 工具名（不依赖 DB 读成功）——冷实例 + DB 故障叠加时 kill switch 对写工具
+        # fail-closed（见 disabled_names），只读工具维持 fail-open。
+        self._high_write_names: Set[str] = set()
 
     def _conn(self):
         from opensearch_pipeline.db import _get_db_conn
@@ -53,6 +57,12 @@ class RDSToolRegistryStore:
         """代码内声明 upsert 进表（spec_json/risk/scope/owner 跟代码走，**status 不覆盖**）。
         返回 upsert 行数。失败上抛由调用方决定 fail-open（runtime 建立不因 DB 抖动失败）。"""
         rows = registry.to_registry_rows(registered_by=registered_by)
+        # P1-03：HIGH_WRITE 名单在任何 DB 写**之前**捕获（纯本地信息）——sync 失败
+        # （fail-open 路径）也要拿到，否则冷实例 DB 故障时写工具的 fail-closed 无名单可依。
+        with self._lock:
+            self._high_write_names = {
+                r["tool_name"] for r in rows
+                if str(r.get("risk_level", "")).lower() == "high_write"}
         if not rows:
             return 0
         db = _op_db()
@@ -102,10 +112,40 @@ class RDSToolRegistryStore:
                 self._cached_disabled = names
                 self._cached_at = now
             return names
-        except Exception:   # noqa: BLE001 — fail-open：kill switch 读故障绝不误杀全部工具
+        except Exception:   # noqa: BLE001 — 读故障：只读 fail-open / HIGH_WRITE fail-closed
             logger.warning("tool_registry kill switch 读取失败（沿用上次快照）", exc_info=True)
             with self._lock:
-                return self._cached_disabled if self._cached_disabled is not None else set()
+                if self._cached_disabled is not None:
+                    return self._cached_disabled          # warm：沿用上次快照（原语义）
+                # 批次5（unknown-unknowns P1-03）：冷实例 + DB 故障——事故里最需要
+                # kill switch 的场景，此前返回空禁用集 = HIGH_WRITE 工具恰在此时重新
+                # 出现。无可信快照时把 HIGH_WRITE 名单视为禁用（fail-closed；Policy/
+                # 审批仍逐调用兜底），只读工具维持 fail-open 不误杀；首次成功读取后
+                # 自动恢复 DB 事实。
+                if self._high_write_names:
+                    logger.critical(
+                        "tool_registry 冷启动且 DB 不可读——HIGH_WRITE 工具 fail-closed "
+                        "禁用：%s", sorted(self._high_write_names))
+                return set(self._high_write_names)
+
+    def probe_health(self) -> str:
+        """readiness 探针（批次5 P0-06b）：**绕缓存**直读 disabled 集一次——
+        「表在但 kill-switch 读退化」（权限被收/行损坏）此前只活在 warning 日志里。
+        返回 ok / error；绝不抛出。"""
+        try:
+            db = _op_db()
+            conn = self._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM {db}.tool_registry WHERE status='disabled'")
+                    cur.fetchone()
+            finally:
+                conn.close()
+            return "ok"
+        except Exception as e:   # noqa: BLE001
+            logger.warning("readiness: kill switch 读探针失败: %s", e)
+            return "error"
 
     def invalidate_cache(self) -> None:
         with self._lock:

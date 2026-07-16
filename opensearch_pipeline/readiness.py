@@ -134,9 +134,12 @@ def _schema_dir() -> Optional[Path]:
 def _schema_drift_once() -> str:
     """三库台账 checksum vs 本地 schema/ 文件 sha256。
     - 台账里有该文件名 且 本地存在 且 sha256 不同 → drift（同名内容漂移，032 语义）；
+    - **本地存在但三库台账均未记 → unapplied:N**（批次5 P0-06c，unknown-unknowns 外审：
+      旧语义把「缺 apply」当不算漂移——蓝绿/回滚窗口「表在、契约不在」的假健康主通道；
+      修订行 `NNN_xxx.sql@NNNa` 计入其基名的已应用证据）；
     - 台账无 checksum 列/表不存在（未迁移环境）→ unavailable；
     - 本地无 schema/ 目录（旧镜像）→ no_local_files。
-    只比【台账里记过的】文件——本地新增未 apply 的迁移不是漂移。"""
+    优先级 drift > unapplied > ok；strict（RAG_READY_SCHEMA_STRICT）下非 ok 即不就绪。"""
     d = _schema_dir()
     if d is None:
         return "no_local_files"
@@ -155,23 +158,31 @@ def _schema_drift_once() -> str:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         drifted: List[str] = []
+        applied_bases: set = set()
         checked = False
         try:
             with conn.cursor() as cur:
                 for dbname in dbs:
                     try:
                         cur.execute(
-                            f"SELECT filename, checksum FROM {dbname}.schema_migrations "
-                            "WHERE checksum IS NOT NULL")
+                            f"SELECT filename, checksum FROM {dbname}.schema_migrations")
                         rows = cur.fetchall() or []
-                    except Exception:   # noqa: BLE001 — 库/表/列不存在：跳过该库
-                        continue
+                    except Exception:   # noqa: BLE001 — 缺 checksum 列（pre-032）：退只取文件名
+                        try:
+                            cur.execute(
+                                f"SELECT filename FROM {dbname}.schema_migrations")
+                            rows = [(r["filename"] if isinstance(r, dict) else r[0], None)
+                                    for r in (cur.fetchall() or [])]
+                        except Exception:   # noqa: BLE001 — 库/表不存在：跳过该库
+                            continue
                     checked = True
                     for r in rows:
                         fn = r["filename"] if isinstance(r, dict) else r[0]
-                        cs = r["checksum"] if isinstance(r, dict) else r[1]
+                        cs = (r.get("checksum") if isinstance(r, dict)
+                              else (r[1] if len(r) > 1 else None))
                         # 台账 filename 可能带修订标记 `NNN_xxx.sql@NNNa`——取 @ 前基名
                         base = str(fn).split("@", 1)[0]
+                        applied_bases.add(base)
                         if base in local and cs and local[base] != cs:
                             drifted.append(f"{dbname}:{base}")
         finally:
@@ -179,7 +190,14 @@ def _schema_drift_once() -> str:
         if drifted:
             logger.error("readiness: schema_migrations checksum 漂移：%s", drifted[:10])
             return "drift"
-        return "ok" if checked else "unavailable"
+        if not checked:
+            return "unavailable"
+        unapplied = sorted(set(local) - applied_bases)
+        if unapplied:
+            logger.warning("readiness: 本地迁移未见于任何台账（unapplied）：%s%s",
+                           unapplied[:10], "…" if len(unapplied) > 10 else "")
+            return f"unapplied:{len(unapplied)}"
+        return "ok"
     except Exception as e:   # noqa: BLE001
         logger.warning("readiness: schema_migrations 校验失败: %s", e)
         return "unavailable"
@@ -191,8 +209,134 @@ def schema_migrations_status() -> str:
 
 
 def schema_strict() -> bool:
-    """drift 是否计入关键就绪（默认 off——台账抖动不该全量摘流量；staging 验证后再开）。"""
+    """schema 台账健康是否计入关键就绪（默认 off——台账抖动不该全量摘流量；staging
+    验证后再开）。批次5（P0-06d）收紧 strict 语义：开着时要求状态为 **ok**——
+    drift / unapplied / unavailable / no_local_files 全部不就绪（此前只拒 drift，
+    「缺迁移仍绿」正是外审复现的假健康）。"""
     return _flag_on("RAG_READY_SCHEMA_STRICT")
+
+
+# ── 批次5（unknown-unknowns P0-06）：列契约 / kill-switch / 038 回填探针 ────────────
+# 「表在、列不在」是蓝绿/回滚窗口的典型假健康：下列列缺失时对应功能首次触库即
+# 500/静默降级，但表存在性探针全绿。
+_AGENT_CONTRACT_COLUMNS = [   # (table, column, 来源迁移)
+    ("agent_run", "message_id", "036"),
+    ("agent_run", "active_thread", "037"),
+    ("approval_decision", "final_args_digest", "031"),
+    ("agent_checkpoint", "state_digest", "022"),
+]
+_ONTOLOGY_CONTRACT_COLUMNS = [
+    ("ontology_object", "normalized_title", "038"),
+]
+
+
+def _columns_exist(dbname: str, cols) -> str:
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        missing: List[str] = []
+        try:
+            with conn.cursor() as cur:
+                for table, col, mig in cols:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
+                        (dbname, table, col))
+                    row = cur.fetchone()
+                    n = row[0] if not isinstance(row, dict) else list(row.values())[0]
+                    if not int(n):
+                        missing.append(f"{table}.{col}(schema/{mig})")
+        finally:
+            conn.close()
+        if missing:
+            logger.error("readiness: 关键列契约缺失（%s）：%s", dbname, missing)
+            return "missing:" + ",".join(missing)
+        return "ok"
+    except Exception as e:   # noqa: BLE001
+        logger.warning("readiness: 列契约探针失败（%s）: %s", dbname, e)
+        return "error"
+
+
+def schema_contract_status() -> str:
+    """flag-on 面的关键列契约（表存在 ≠ 契约在位；critical 与 agent_tables 同级）。
+    对应 flag 全 off → skipped。"""
+    if not (_flag_on("RAG_AGENT_ENABLE") or _flag_on("RAG_ONTOLOGY_ENABLE")):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        cfg = get_config()
+        parts: List[str] = []
+        if _flag_on("RAG_AGENT_ENABLE"):
+            parts.append(_columns_exist(cfg.rds.operation_database, _AGENT_CONTRACT_COLUMNS))
+        if _flag_on("RAG_ONTOLOGY_ENABLE"):
+            parts.append(_columns_exist(cfg.rds.ontology_database, _ONTOLOGY_CONTRACT_COLUMNS))
+        bad = [p for p in parts if p != "ok"]
+        if not bad:
+            return "ok"
+        miss = [p for p in bad if p.startswith("missing:")]
+        return miss[0] if miss else "error"
+
+    return _cached("schema_contract", 60, _compute)
+
+
+def kill_switch_status() -> str:
+    """DB 驱动 kill switch 的读路径健康（批次5 P0-06b）：绕缓存直读一次——
+    「表在但读退化」（权限被收/行损坏）此前只活在 warning 日志，readiness 恒绿。
+    agent off → skipped；error 是否摘流量由 kill_switch_critical 决定。"""
+    if not _flag_on("RAG_AGENT_ENABLE"):
+        return "skipped"
+
+    def _compute() -> str:
+        try:
+            from opensearch_pipeline.agent_runtime.registry_store import RDSToolRegistryStore
+            return RDSToolRegistryStore().probe_health()
+        except Exception as e:   # noqa: BLE001
+            logger.warning("readiness: kill switch 探针构建失败: %s", e)
+            return "error"
+
+    return _cached("kill_switch", 60, _compute)
+
+
+def kill_switch_critical() -> bool:
+    """kill switch error 是否摘流量：HIGH_WRITE 工具启用时 critical（写工具的治理
+    控制面失联不该继续接流量）；只读窗口 error 仅报告——readiness 红把全部实例
+    摘空比「读工具照跑+Policy/审批兜底」更糟。"""
+    try:
+        from opensearch_pipeline.agent_tools import ontology_write_tools_enabled
+        return ontology_write_tools_enabled()
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def ontology_backfill_status() -> str:
+    """038 normalized_title 回填缺口（批次5 P0-06e）：active 对象 NULL 计数——NULL 行
+    不参与等值召回（同名漏归并→误铸重复品）。**report-only**：治理指标而非摘流量判据
+    （真实播种开闸前置=回填清零，由 gate 流程核对本状态词）。"""
+    if not _flag_on("RAG_ONTOLOGY_ENABLE"):
+        return "skipped"
+
+    def _compute() -> str:
+        try:
+            from opensearch_pipeline.config import get_config
+            from opensearch_pipeline.db import _get_db_conn
+            db = get_config().rds.ontology_database
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM {db}.ontology_object "
+                        "WHERE status='active' AND normalized_title IS NULL")
+                    row = cur.fetchone()
+                    n = row[0] if not isinstance(row, dict) else list(row.values())[0]
+            finally:
+                conn.close()
+            return "ok" if not int(n) else f"pending({int(n)})"
+        except Exception as e:   # noqa: BLE001
+            logger.warning("readiness: normalized_title 回填探针失败: %s", e)
+            return "error"
+
+    return _cached("ontology_backfill", 300, _compute)
 
 
 # ── DashScope 模型在线 ─────────────────────────────────────────────────────────

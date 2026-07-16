@@ -1021,6 +1021,46 @@ def load_config() -> PipelineConfig:
             f"请移除该环境变量。"
         )
 
+    # 【批次5 P0-07d，unknown-unknowns 外审】生产安全姿态断言：强制认证与 ACL fail-closed
+    # 是 main P0 加固（0cbb0f8）的两根梁，代码默认 off 是「代码先行、部署后开」的过渡态——
+    # production/staging 启动时必须显式表态：要么把两个 flag 打开，要么设
+    # RAG_ALLOW_LEGACY_OPEN_PROD=ack 显式承认延续旧开放姿态（过渡逃生口，环境变量到位后
+    # 应删除）。「部署漏配安全变量 → 告警后继续」到此收口为 fail-closed。
+    # ⚠️ RDS TLS（RAG_RDS_SSL_CA）维持告警不阻断——记录在案的用户决策（本文件 P0-02 注），
+    # CA 证书到位后再升硬断言，不在本断言范围。
+    if _env_label_prod:
+        _posture_missing = [
+            env for env in ("RAG_REQUIRE_AUTH", "RAG_ACL_FAIL_CLOSED")
+            if os.environ.get(env, "").strip().lower() not in ("1", "true", "yes", "on")]
+        if _posture_missing and \
+                os.environ.get("RAG_ALLOW_LEGACY_OPEN_PROD", "").strip().lower() != "ack":
+            raise ValueError(
+                f"🚨 [PRODUCTION SECURITY GUARD] '{config.environment}' 环境未开启 "
+                f"{'/'.join(_posture_missing)}（强制认证 / ACL fail-closed）。"
+                f"请在部署环境变量中开启它们；确需延续旧开放姿态（过渡期）须显式设 "
+                f"RAG_ALLOW_LEGACY_OPEN_PROD=ack（unknown-unknowns 批次5 P0-07d）。")
+
+    # 【批次5 P1-10，unknown-unknowns 外审】拓扑防呆：单 worker + 进程内内存态是隐藏
+    # 约束（Dockerfile 钉 --workers 1）——声明多副本（RAG_EXPECTED_REPLICAS>1）而
+    # 会话/限流/去重/token 四态仍是 memory 后端时，语义会按副本分裂（会话丢、限流
+    # 失效、cancel 跨实例失联）。副本数无法自动感知，靠部署侧显式声明触发断言。
+    if _env_label_prod:
+        try:
+            _replicas = int(os.environ.get("RAG_EXPECTED_REPLICAS", "1") or 1)
+        except ValueError:
+            _replicas = 1
+        if _replicas > 1:
+            _mem_backends = [
+                k for k in ("RAG_SESSION_BACKEND", "RAG_RATE_LIMIT_BACKEND",
+                            "RAG_MSG_DEDUP_BACKEND", "RAG_TOKEN_CACHE_BACKEND")
+                if os.environ.get(k, "memory").strip().lower() != "redis"]
+            if _mem_backends:
+                raise ValueError(
+                    f"🚨 [PRODUCTION SECURITY GUARD] RAG_EXPECTED_REPLICAS={_replicas}>1 "
+                    f"而 {_mem_backends} 仍为内存后端——多副本下会话/限流/去重/token 语义"
+                    f"将按副本分裂。请切换 redis 后端（配 RAG_REDIS_URL 三件同出）或移除"
+                    f"副本声明（unknown-unknowns 批次5 P1-10）。")
+
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
     # 且只配 GEMINI key 时，模型解析全路由 Google，生产 chunk_text/查询内容会被 POST 到 Google。

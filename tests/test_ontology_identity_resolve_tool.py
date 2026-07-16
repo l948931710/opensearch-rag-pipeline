@@ -89,15 +89,26 @@ def test_default_policy_engine_denies_unwired(tool, monkeypatch):
 
 
 def test_policy_flag_on_grants_but_still_requires_approval(tool, monkeypatch):
-    """PR13：flag 开 → 授予（可提案）但 HIGH_WRITE + approval_policy=always 结构性
-    require_approval——绝无免批执行路径（门 A 语义不因接线而松动）。"""
+    """PR13 + 批次5 P0-07b：**双杆**（读 flag + 写 flag）才授予（可提案），且 HIGH_WRITE
+    + approval_policy=always 结构性 require_approval——绝无免批执行路径。"""
     monkeypatch.setenv("RAG_ONTOLOGY_TOOLS_ENABLE", "true")
+    monkeypatch.setenv("RAG_ONTOLOGY_WRITE_TOOLS_ENABLE", "true")
     d = default_policy_engine().authorize_tool_call(_ctx(), tool.spec, {})
     assert d.decision == "require_approval"
 
 
+def test_policy_read_flag_alone_does_not_grant_write_scope(tool, monkeypatch):
+    """批次5 P0-07b 拆杆：只开读 flag → 写 scope 仍 default-deny（运维为开只读解析
+    翻一杆，不再连带扩大到身份事实写入）。"""
+    monkeypatch.setenv("RAG_ONTOLOGY_TOOLS_ENABLE", "true")
+    monkeypatch.delenv("RAG_ONTOLOGY_WRITE_TOOLS_ENABLE", raising=False)
+    d = default_policy_engine().authorize_tool_call(_ctx(), tool.spec, {})
+    assert d.decision == "deny"
+
+
 def test_tool_not_wired_into_default_registry(monkeypatch):
     monkeypatch.delenv("RAG_ONTOLOGY_TOOLS_ENABLE", raising=False)
+    monkeypatch.delenv("RAG_ONTOLOGY_WRITE_TOOLS_ENABLE", raising=False)
     from opensearch_pipeline.agent_tools import build_default_registry
     names = {spec.name for spec in build_default_registry().list_specs()}
     assert "ontology_identity_resolve" not in names
