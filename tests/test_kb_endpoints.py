@@ -739,7 +739,7 @@ def test_my_docs_usage_enrich_when_fact_join_on(monkeypatch):
         ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None),
         ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None),
     ]
-    _stub_multi(monkeypatch, [docrows, [("D1", 5, "2026-07-01 10:00:00")]])
+    _stub_multi(monkeypatch, [[], docrows, [("D1", 5, "2026-07-01 10:00:00")]])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
     by = {i.doc_id: i for i in resp.items}
@@ -753,7 +753,7 @@ def test_my_docs_usage_none_when_fact_join_off(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
     docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None)]
-    _stub_multi(monkeypatch, [docrows])
+    _stub_multi(monkeypatch, [[], docrows])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
     assert resp.items[0].cited_count is None
@@ -769,7 +769,7 @@ def test_my_docs_reject_reason_only_when_rejected(monkeypatch):
         ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "REJECTED", None, None, "DONE", "内容过期，已被 v3 取代"),
         ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "FAILED", "FAILED", None, "DONE", "OCR timeout traceback…"),
     ]
-    _stub_multi(monkeypatch, [docrows])
+    _stub_multi(monkeypatch, [[], docrows])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
     by = {i.doc_id: i for i in resp.items}
@@ -2211,3 +2211,25 @@ def test_kb_status_badge_closed_set():
         assert out in _KB_BADGE_VOCAB, f"未登记的新徽章词 {out!r}（inputs cs={cs} ix={ix} ds={ds} ps={ps} cks={cks} ca={ca}）"
         seen.add(out)
     assert seen == _KB_BADGE_VOCAB, f"词表不再全可达（死词该从封闭集摘除）：缺 {_KB_BADGE_VOCAB - seen}"
+
+
+def test_my_docs_badge_counts_faceted(monkeypatch):
+    """faceted 计数（2026-07-16 Sam 反馈）：badge_counts 与主查询同筛选（除 badge 自身）——
+    计数查询不含 badge 谓词参数、按徽章 GROUP BY；响应携带映射供 chips/标题总数跟随筛选。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
+    counts_rows = [("已上线", 12), ("未入索引", 3), ("已退役", 5)]
+    docrows = [("D1", "t1", "a.pdf", "production", "dept_internal", 1, "active", "ts",
+                "DONE", "SUCCESS", None, "DONE", None)]
+    sink = _stub_multi(monkeypatch, [counts_rows, docrows])
+    from opensearch_pipeline import api
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, owner_dept="production",
+                          badge="已上线", identity=api.Identity(user_id="adm1"))
+    assert resp.badge_counts == {"已上线": 12, "未入索引": 3, "已退役": 5}
+    counts_sql, counts_params = sink["calls"][0]
+    main_sql, _ = sink["calls"][1]
+    assert "GROUP BY b" in counts_sql
+    assert "owner_dept = %s" in counts_sql and "production" in (counts_params or ())
+    # 计数查询不含 badge 自身的筛选（faceted 语义：各状态的数在当前其他筛选下可见）
+    assert counts_sql.count("CASE") <= main_sql.count("CASE") and "已上线" not in str(counts_params)

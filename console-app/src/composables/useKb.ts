@@ -65,7 +65,7 @@ export type AccessState = 'none' | 'pending' | 'approved_pending_sync' | 'projec
 export interface QueueRow { name: string; status: string; pct: number; msg: string; dupMsg?: string }
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
-interface MyDocsResp { items: DocItem[]; has_more: boolean }
+interface MyDocsResp { items: DocItem[]; has_more: boolean; badge_counts?: Record<string, number> | null }
 export interface KbStats { total: number; active: number; retired: number; chunks: number; new_this_month: number; by_badge: Record<string, number>; owner_depts?: string[] }
 // Phase E 概览看板真实数据（镜像 api.py KbInsightsResponse / KbGovernanceResponse，字段一一对应）
 export interface KbTopDoc { title: string; owner_dept: string; hits: number }
@@ -286,28 +286,47 @@ const ANOMALY_FILTER = '异常'
 // 仅在「本部门」台账（docScope='managed'，其 owner 作用域与 stats 同源）启用全库口径；
 // 「全部门」浏览（browse，跨部门）无对应全库聚合 → 回退已加载页派生（诚实，不伪造跨部门总数）。
 const fullScopeCounts = computed(() => docScope.value === 'managed' && !!kbStats.value)
-// 状态 chip 列表（含「全部」）：全库口径下取 by_badge 全部出现过的徽章；否则已加载页派生。
+// faceted 计数（2026-07-16 Sam 反馈）：my-docs/browse 响应带与当前筛选（归属/范围/利用度/搜索，
+// 除状态自身）同口径的按徽章计数——chips 与标题总数跟随下拉筛选。三级口径：faceted > stats 全库 > 页派生。
+const serverBadgeCounts = ref<Record<string, number> | null>(null)
+const _sumCounts = (keys: string[]) => keys.reduce((s, k) => s + ((serverBadgeCounts.value || {})[k] || 0), 0)
+// 状态 chip 列表（含「全部」）：faceted/全库口径取计数键；否则已加载页派生。
 const ledgerBadgeChips = computed<string[]>(() => {
-  const base = fullScopeCounts.value
-    ? Object.keys(kbStats.value!.by_badge || {}).filter((k) => (kbStats.value!.by_badge || {})[k] > 0)
-    : Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))
+  const base = serverBadgeCounts.value
+    ? Object.keys(serverBadgeCounts.value).filter((k) => k && serverBadgeCounts.value![k] > 0)
+    : fullScopeCounts.value
+      ? Object.keys(kbStats.value!.by_badge || {}).filter((k) => (kbStats.value!.by_badge || {})[k] > 0)
+      : Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))
   // 坏徽章 ≥2 种才值得一枚聚合 chip（只有一种时与单徽章 chip 重复）
   return ['', ...base, ...(anomalyCount.value > 0 && base.filter((b) => BAD_BADGES.includes(b)).length > 1 ? [ANOMALY_FILTER] : [])]
 })
-// 状态 chip 计数：全库口径下取 by_badge / total；否则已加载页计数（countOf）。
+// 状态 chip 计数：faceted 口径优先（跟随筛选）；退 stats 全库；再退已加载页计数（countOf）。
 function ledgerBadgeCount(badge: string): number {
   if (badge === ANOMALY_FILTER) return anomalyCount.value
+  if (serverBadgeCounts.value) {
+    return badge ? (serverBadgeCounts.value[badge] || 0) : _sumCounts(Object.keys(serverBadgeCounts.value))
+  }
   if (fullScopeCounts.value) {
     const bb = kbStats.value!.by_badge || {}
     return badge ? (bb[badge] || 0) : (kbStats.value!.total || 0)
   }
   return countOf(badge)
 }
+// 台账标题总数（当前全部筛选含状态 chip 生效后的真实总数）：faceted 口径才可得；
+// 无 faceted（旧后端/计数失败）→ null，模板回退 docs.length（老行为：已加载行数）。
+const ledgerTotal = computed<number | null>(() => {
+  const c = serverBadgeCounts.value
+  if (!c) return null
+  if (filter.value === ANOMALY_FILTER) return _sumCounts(BAD_BADGES)
+  if (filter.value) return c[filter.value] || 0
+  return _sumCounts(Object.keys(c))
+})
 // 归属下拉选项：全库口径下取 stats.owner_depts；否则已加载页派生。
 const ledgerOwnerOptions = computed<string[]>(() =>
   (fullScopeCounts.value && kbStats.value!.owner_depts?.length) ? kbStats.value!.owner_depts! : ownerOptions.value)
-// 异常文档数（待办摘要条）：全库口径下 = 各坏徽章之和；否则已加载页计数。
+// 异常文档数（待办摘要条）：faceted 口径优先（跟随筛选）；退 stats 全库；再退已加载页计数。
 const anomalyCount = computed<number>(() => {
+  if (serverBadgeCounts.value) return _sumCounts(BAD_BADGES)
   if (fullScopeCounts.value) {
     const bb = kbStats.value!.by_badge || {}
     return BAD_BADGES.reduce((s, b) => s + (bb[b] || 0), 0)
@@ -445,6 +464,7 @@ async function loadDocs() {
       ]
       docs.value = docScope.value === 'all' ? [...mine, ...foreign] : mine
       hasMoreDocs.value = false
+      serverBadgeCounts.value = null   // 预览 mock 无 faceted 计数 → 页派生口径
       return
     }
     // 作用域分流：全部门走只读 browse（排除 restricted、带 can_manage），本部门走 my-docs。
@@ -452,6 +472,7 @@ async function loadDocs() {
     if (seq !== docsSeq) return            // 竞态守卫：仅最新结果落地
     docs.value = r.items || []
     hasMoreDocs.value = !!r.has_more       // 服务端探测到下一页 → 显「加载更多」
+    serverBadgeCounts.value = r.badge_counts || null   // faceted 计数（旧后端无此键 → 回退口径）
   } catch (e) { if (seq === docsSeq) noteLoadError('docs', e) /* 保留旧表 */ } finally { if (seq === docsSeq) loadingDocs.value = false }
 }
 
@@ -1583,7 +1604,7 @@ export function useKb() {
     // 状态
     docs, filtered, approvals, accessRequests, queuesSettled, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir,
     // #7 全库口径 + 服务端筛选 setter
-    ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, anomalyCount,
+    ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, anomalyCount, ledgerTotal,
     setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
     // 多选 / 批量
     selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
@@ -1613,7 +1634,7 @@ export function useKb() {
  *  · queuesSettled 一并回 false——否则切身份后空态文案在队列重载前误显「真无待办」；
  *  · 上传表单/已选文件/定时器一并清——半填的表单与选中的 File 同样不跨身份残留。 */
 function _resetKbState() {
-  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbOpsMetrics.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; queuesSettled.value = false; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}
+  docs.value = []; kbStats.value = null; kbInsights.value = null; kbGovernance.value = null; kbOpsMetrics.value = null; kbConfig.value = null; verHistory.value = null; approvals.value = []; accessRequests.value = []; queuesSettled.value = false; accessGrants.value = []; approvalHistory.value = []; adminGrants.value = []; grantableDepts.value = []; loadingDocs.value = false; loadingMoreDocs.value = false; hasMoreDocs.value = false; loadErrors.value = {}; serverBadgeCounts.value = null
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''

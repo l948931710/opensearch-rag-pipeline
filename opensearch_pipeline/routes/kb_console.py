@@ -184,6 +184,26 @@ def _kb_owner_facet_sql(owner_dept: str):
     return "", []
 
 
+def _kb_badge_counts(cur, base_from_where: str, base_params: tuple,
+                     perm: str, cited: str):
+    """faceted 状态计数（2026-07-16 Sam 实测反馈）：与主查询**同一套筛选**（归属/范围/
+    利用度/搜索/作用域，唯独不含 badge 自身）按徽章 GROUP BY——状态 chips 与标题计数
+    跟随下拉筛选走（此前 chips 取全库 stats：选了「生产」归属，chip 数字纹丝不动；
+    标题旁数字更是已加载页行数，全库场景恒显分页上限 50）。
+    fail-open：计数失败返回 None（前端回退 stats/页派生口径），绝不影响列表主查询。"""
+    fc, fp = _kb_ledger_filter_sql(perm, "", cited)   # 除 badge 外全部筛选照抄
+    try:
+        cur.execute(
+            f"SELECT ({_KB_BADGE_CASE_SQL}) AS b, COUNT(*) "
+            f"{base_from_where} {fc} GROUP BY b",
+            (*base_params, *fp),
+        )
+        return {str(b or ""): int(n) for b, n in cur.fetchall()}
+    except Exception:   # noqa: BLE001 — 计数是增强项，失败不拖累列表
+        logger.warning("kb 台账 faceted 计数失败（前端回退全库口径）", exc_info=True)
+        return None
+
+
 @router.get("/api/kb/my-docs", response_model=KbMyDocsResponse)
 def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                owner_dept: str = "", perm: str = "", badge: str = "", cited: str = "",
@@ -210,6 +230,14 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
+                badge_counts = _kb_badge_counts(
+                    cur,
+                    f"FROM {_kb_db()}.document_meta m "
+                    f"LEFT JOIN {_kb_db()}.document_version v "
+                    "ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no "
+                    f"WHERE 1=1 {clause} {search_clause} {owner_clause}",
+                    (*params, *search_params, *owner_params), perm, cited)
                 cur.execute(
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
@@ -252,7 +280,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             # 驳回原因只在被驳回态外露（其他失败态的 content_process_error 是内部诊断文案，不外发）
             reject_reason=(str(cpe)[:200] if (cps == "REJECTED" and cpe) else ""),
         ))
-    return KbMyDocsResponse(items=items, has_more=has_more)
+    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
 
 
 @router.get("/api/kb/browse", response_model=KbMyDocsResponse)
@@ -291,6 +319,16 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
+                badge_counts = _kb_badge_counts(
+                    cur,
+                    f"FROM {_kb_db()}.document_meta m "
+                    f"LEFT JOIN {_kb_db()}.document_version v "
+                    "ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no "
+                    "WHERE m.status='active' "
+                    "AND m.permission_level IN ('public','dept_internal') "
+                    f"{owner_clause} {search_clause}",
+                    (*owner_params, *search_params), perm, cited)
                 cur.execute(
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
@@ -334,7 +372,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
             last_cited_at=(_u[1] if _u else ""),
         ))
-    return KbMyDocsResponse(items=items, has_more=has_more)
+    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
 
 
 class KbStatsResponse(BaseModel):

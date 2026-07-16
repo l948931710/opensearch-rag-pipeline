@@ -13,7 +13,7 @@ const { confirm, notice } = useDialog()
 
 const {
   docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, sortKey, sortDir, isDeptAdmin, isKbAdmin,
-  ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
+  ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, ledgerTotal, setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
   setQuery, sortBy, setScope, enterVersionMode, retire, restore, openHistory, openDocPreview,
   openAccessRequest, accessStateOf, accessNoteOf, loadMoreDocs, loadDocs, loadErrors,
   openShare, grantedLabelsByDoc, openVisibility,
@@ -152,7 +152,8 @@ async function onRestore(d: DocItem) {
       <div class="flex items-center gap-3">
         <h2 class="text-[15px] font-semibold text-foreground">
           {{ docScope === 'all' ? '全部门文档' : '我的文档' }}
-          <span class="font-mono text-xs text-muted-foreground">{{ docs.length }}</span>
+          <!-- faceted 真实总数（跟随全部筛选；此前显示已加载页行数——全库场景恒显分页上限 50，误导） -->
+          <span class="font-mono text-xs text-muted-foreground">{{ ledgerTotal ?? docs.length }}</span>
         </h2>
         <!-- 本部门 / 全部门 切换（仅部门管理员；kb_admin 本就全见，无需切换） -->
         <div v-if="isDeptAdmin" class="flex gap-0.5 rounded-lg border border-border bg-panel p-0.5">
