@@ -87,6 +87,8 @@ export interface AgentMsgMeta {
   approval?: { requestId: string; checkpointId?: string; toolName?: string; args?: Record<string, unknown> | null } | null
   messageId?: string       // done 后才提升为 m.messageId（挂起/在途不出反馈条）
   disconnected?: boolean   // 实时流被停止/断开但 run 仍在服务端运行（轮询兜底）
+  gotTerminal?: boolean    // 批次2（P0-03f）：收到过终局帧（done/approval/error）——
+                           // clean EOF 而无终局帧=传输被切，绝不把 partial 当定稿
 }
 
 export interface Conversation {

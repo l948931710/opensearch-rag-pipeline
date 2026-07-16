@@ -1298,3 +1298,37 @@ def test_budget_text_only_replacement_frame(monkeypatch, wired):
     finally:
         api.app.dependency_overrides.clear()
         executor.shutdown()
+
+
+# ── 批次2（unknown-unknowns P0-03）：run 读端点走 aux 宽档 ─────────────────────────
+
+
+def test_run_read_endpoints_use_aux_scope(monkeypatch):
+    """轮询端点（列表/status/detail）绝不再消耗 ask 分钟/日额——running 轮询曾 <1min
+    自我 429、suspended 挂等 ~3h45m 烧光 300/day 连真问题一起拖死。approve/cancel
+    是动作，维持 ask（治理动作的准入语义不变）。"""
+    monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    scopes = []
+
+    def _cap(request, identity, *, scope, thinking=False, count_llm=False):
+        scopes.append(scope)
+
+    class _ReadStore:
+        def get_run(self, run_id):
+            return {"run_id": run_id, "status": "succeeded", "user_id": "u1",
+                    "channel": "console", "agent_profile": "default", "started_at": None,
+                    "ended_at": None, "thread_id": "t1", "conversation_id": None,
+                    "model_profile": None, "message_id": None, "heartbeat_at": None,
+                    "turns_used": 1, "tool_calls_used": 0, "tokens_used": 10}
+
+    monkeypatch.setattr(agent_route, "_enforce_rate_limit", _cap)
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (None, None, None, _ReadStore()))
+    try:
+        c = _client(_identity())
+        c.get("/api/agent/runs")
+        c.get("/api/agent/runs/r1/status")
+        c.get("/api/agent/runs/r1")
+        assert scopes == ["aux", "aux", "aux"]
+    finally:
+        api.app.dependency_overrides.clear()

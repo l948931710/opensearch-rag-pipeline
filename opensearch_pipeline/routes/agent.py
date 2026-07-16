@@ -1145,7 +1145,10 @@ def agent_runs(request: Request, limit: int = 20,
         raise HTTPException(status_code=404, detail="Not Found")
     if identity is None:
         raise HTTPException(status_code=401, detail="需要登录")
-    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    # 批次2（unknown-unknowns P0-03）：run 读端点改 aux 宽档（120/min 登录档、无日额）——
+    # 此前 scope="ask" 与真实提问同桶：running 轮询 <1min 自我 429、suspended 挂等
+    # ~3h45m 烧光 300/day，此后连真问题都 429 到北京午夜。approve/cancel 是动作，维持 ask。
+    _enforce_rate_limit(request, identity, scope="aux", thinking=False, count_llm=False)
     _registry, _gateway, _executor, run_store = _get_runtime()
     if not hasattr(run_store, "list_runs_by_user"):
         return {"items": []}
@@ -1172,7 +1175,7 @@ def agent_run_status(run_id: str, request: Request,
         raise HTTPException(status_code=404, detail="Not Found")
     if identity is None:
         raise HTTPException(status_code=401, detail="需要登录")
-    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _enforce_rate_limit(request, identity, scope="aux", thinking=False, count_llm=False)   # 批次2：读走 aux
     _registry, _gateway, _executor, run_store = _get_runtime()
     if not hasattr(run_store, "get_run_status"):   # 测试桩等无此法 → 视同无状态探针
         raise HTTPException(status_code=404, detail="Not Found")
@@ -1202,7 +1205,7 @@ def agent_run_detail(run_id: str, request: Request,
         raise HTTPException(status_code=404, detail="Not Found")
     if identity is None:
         raise HTTPException(status_code=401, detail="需要登录")
-    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _enforce_rate_limit(request, identity, scope="aux", thinking=False, count_llm=False)   # 批次2：读走 aux
     _registry, _gateway, _executor, run_store = _get_runtime()
     run = run_store.get_run(run_id)
     if run is None:

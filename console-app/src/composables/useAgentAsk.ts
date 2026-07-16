@@ -354,6 +354,7 @@ function onAgentEvent(conv: { qaSession: string }, ai: ChatMessage, ev: SseEvent
         args: (pc.arguments as Record<string, unknown>) ?? null,
       }
       meta.status = 'suspended'
+      meta.gotTerminal = true   // 批次2（P0-03f）：approval 是合法的流终局
       const t = (meta.tools || []).find((x) => x.callId === (pc.call_id as string))
       if (t && (t.status === 'proposed' || !t.status)) t.status = 'pending_approval'
       pushStage(ai, 'awaiting_approval', '等待审批')
@@ -376,6 +377,7 @@ function onAgentEvent(conv: { qaSession: string }, ai: ChatMessage, ev: SseEvent
       break
     case 'done':
       meta.status = meta.status === 'suspended' ? meta.status : 'succeeded'
+      meta.gotTerminal = true
       pushStage(ai, 'done', '完成')
       break
     case 'error':
@@ -384,6 +386,7 @@ function onAgentEvent(conv: { qaSession: string }, ai: ChatMessage, ev: SseEvent
       ai.error = true
       ai.errorText = (ev.message as string) || 'Agent 运行失败，请重试。'
       if (meta.status !== 'suspended') meta.status = 'failed'
+      meta.gotTerminal = true
       pushStage(ai, 'error', '失败')
       break
     // '__done'（[DONE] 哨兵）与未知类型：忽略，finishAgentStream 在 reader 结束时收尾
@@ -402,6 +405,22 @@ function finishAgentStream(ai: ChatMessage, seq: number): void {
   ai.streaming = false
   bridge.schedulePersist()
   if (ai.error) return
+  // 批次2（P0-03f）：clean EOF 而没收到任何终局帧（done/approval/error）= 传输被切
+  // （代理空闲超时/网关重启的干净断连）——绝不把 partial 增量当定稿呈现：已有片段先
+  // 渲染出来，转断线恢复态，轮询兜底（succeeded 时 _pollRunOnce 会用 durable final 水合）。
+  if (!meta.gotTerminal && meta.runId && meta.status !== 'suspended'
+      && !RUN_TERMINAL.has(meta.status || '')) {
+    if (ai.raw) {
+      ai.html = renderMd(stripImg(ai.raw))
+      ai.copyText = stripImg(ai.raw)
+    }
+    ensureHtmlString(ai)
+    meta.disconnected = true
+    pushStage(ai, 'reconnecting', '连接中断，转后台跟踪')
+    ensureRunPolling(meta.runId)
+    bridge.schedulePersist()
+    return
+  }
   if (ai.raw) {
     ai.html = renderMd(stripImg(ai.raw))
     ai.copyText = stripImg(ai.raw)
@@ -500,6 +519,23 @@ async function askAgent(preset?: string, skipUser = false): Promise<void> {
     if (ai._renderRaf != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }
     ai.loading = false
     ai.streaming = false
+    const meta = ai.agent as AgentMsgMeta
+    // 批次2（P0-03e）：中途断网但 run 已建（收到过 session 帧的 runId）→ 断线恢复而非
+    // 报错卡——服务端 run 照跑、答案在完成侧 durable 落库，报「回答失败」是假话且
+    // 丢掉可恢复的答案。AbortError（用户主动取消）不在此列。镜像 stopAgent 的现成形态。
+    if (e?.name !== 'AbortError' && meta?.runId && !RUN_TERMINAL.has(meta.status || '')
+        && meta.status !== 'suspended') {
+      if (ai.raw) {
+        ai.html = renderMd(stripImg(ai.raw))
+        ai.copyText = stripImg(ai.raw)
+      }
+      ensureHtmlString(ai)
+      meta.disconnected = true
+      pushStage(ai, 'reconnecting', '连接中断，转后台跟踪')
+      ensureRunPolling(meta.runId)
+      bridge.schedulePersist()
+      return
+    }
     ai.error = true
     ai.errorText = e && e.name === 'AbortError'
       ? '已取消本次提问。'
@@ -638,6 +674,20 @@ async function _pollRunOnce(runId: string): Promise<void> {
         if (msg.agent.disconnected) { msg.agent.disconnected = false; msgChanged = true }
         if (st === 'succeeded' && !msg.messageId && msg.agent.messageId) {
           msg.messageId = msg.agent.messageId
+          msgChanged = true
+        }
+        // 批次2（P0-03d）：succeeded → 气泡水合 durable 最终答案（qa_session_log 读回，
+        // detail.final 权威）。审批续跑/断流恢复的答案此前只在运行中心，聊天气泡永远
+        // 停在审批前残稿/空白。final 覆盖增量残稿；无 final（历史行/留存过期）不动。
+        const finalText = st === 'succeeded' ? ((d?.final?.answer_text as string) || '') : ''
+        if (finalText && finalText !== msg.raw) {
+          msg.raw = finalText
+          msg.html = renderMd(stripImg(finalText))
+          msg.copyText = stripImg(finalText)
+          msg.loading = false
+          msg.error = false
+          msg.errorText = ''
+          if (!msg.messageId && d?.final?.message_id) msg.messageId = d.final.message_id as string
           msgChanged = true
         }
       }

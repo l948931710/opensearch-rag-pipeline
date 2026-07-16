@@ -705,3 +705,85 @@ describe('perf 批次 B — 两段式轮询 / run 索引 / 增量渲染', () => 
     expect(__agentAskTestkit().pollTimerCount()).toBe(0)
   })
 })
+
+describe('批次2 断线恢复协议（unknown-unknowns P0-03d/e/f）', () => {
+  const finalDetail = (over: Record<string, unknown> = {}) => ({
+    ...runDetail('succeeded'),
+    final: { message_id: 'm9', answer_text: '完整最终答案全文', answered_at: null },
+    state_key: 'kf',
+    ...over,
+  })
+
+  it('03f：clean EOF 无终局帧 → 不当定稿不报错，转断线恢复并用 durable final 水合气泡', async () => {
+    __agentAskTestkit().setPollMs(15)
+    const chunks = [
+      frame({ type: 'session', session_id: 's1', message_id: 'm1', run_id: 'r9' }),
+      frame({ type: 'chunk', content: '部分答' }),
+      // 无 done/approval/error —— 代理空闲超时式的干净断流
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      const p = String(path)
+      if (p === '/api/agent/ask') return streamResp(chunks)
+      if (p.startsWith('/api/agent/runs/') && p.endsWith('/status'))
+        return jsonResp({ run_id: 'r9', status: 'succeeded', state_key: 'kf' })
+      if (p.startsWith('/api/agent/runs/')) return jsonResp(finalDetail())
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const a = useAgentAsk()
+    await a.askAgent('会被掐断的问题')
+    const ai = useAsk().messages.value[1]
+    expect(ai.error).toBeFalsy()                          // 不再谎报「回答失败」
+    expect((ai.agent?.stages || []).some((s) => s.key === 'reconnecting')).toBe(true)
+    await waitFor(() => ai.raw === '完整最终答案全文')      // durable final 覆盖 partial
+    expect(ai.agent?.status).toBe('succeeded')
+    expect(ai.agent?.disconnected).toBeFalsy()            // 终态回写清断线
+    expect(ai.messageId).toBe('m1')                       // 反馈锚定提升
+    expect(String(ai.html)).toContain('完整最终答案全文')
+    await waitFor(() => __agentAskTestkit().pollTimerCount() === 0)
+  })
+
+  it('03e：中途网络异常且已有 run_id → 断线恢复而非报错卡，答案由轮询水合', async () => {
+    __agentAskTestkit().setPollMs(15)
+    let sent = 0
+    const reader = {
+      read: async () => {
+        sent++
+        if (sent === 1)
+          return { value: frame({ type: 'session', session_id: 's1', message_id: 'm1', run_id: 'r8' }), done: false }
+        throw new TypeError('network reset')
+      },
+      cancel() {},
+    }
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      const p = String(path)
+      if (p === '/api/agent/ask')
+        return { ok: true, status: 200, body: { getReader: () => reader }, text: async (): Promise<string> => '' }
+      if (p.startsWith('/api/agent/runs/') && p.endsWith('/status'))
+        return jsonResp({ run_id: 'r8', status: 'succeeded', state_key: 'kf' })
+      if (p.startsWith('/api/agent/runs/')) return jsonResp(finalDetail())
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const a = useAgentAsk()
+    await a.askAgent('断网问题')
+    const ai = useAsk().messages.value[1]
+    expect(ai.error).toBeFalsy()
+    expect((ai.agent?.stages || []).some((s) => s.key === 'reconnecting')).toBe(true)
+    await waitFor(() => ai.raw === '完整最终答案全文')
+    expect(ai.agent?.status).toBe('succeeded')
+    await waitFor(() => __agentAskTestkit().pollTimerCount() === 0)
+  })
+
+  it('03e 边界：session 帧前即断（无 run_id 锚点）→ 维持报错卡（无从恢复）', async () => {
+    const reader = { read: async () => { throw new TypeError('network reset') }, cancel() {} }
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (String(path) === '/api/agent/ask')
+        return { ok: true, status: 200, body: { getReader: () => reader }, text: async (): Promise<string> => '' }
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const a = useAgentAsk()
+    await a.askAgent('立即断')
+    const ai = useAsk().messages.value[1]
+    expect(ai.error).toBe(true)
+    expect(ai.errorText).toContain('检查网络')
+  })
+})
