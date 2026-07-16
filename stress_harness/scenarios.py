@@ -683,7 +683,12 @@ async def s7(rig: Rig) -> ScenarioResult:
                               "前3=200 后2=4xx", str(got_t),
                               got_t[:3] == [200] * 3 and all(s != 200 for s in got_t[3:])))
 
-        # ③ 全局日熔断（cap=25，含上面已计入的量）→ 503 + 台账 + 告警一次
+        # ③ 全局日熔断（cap=80，含上面已计入的量）→ 503 + 台账 + 告警一次
+        # 重标定（2026-07-16）：A2 逐调用计费（95e7d0e）+ 准入 count_llm 预检**有意双计**
+        # （routes/agent.py 拍板「宁多勿少」）后，本场景 agent ask 的计费口径 = plain
+        # 2 记/run、深思 16 记/run（thinking_cap_weight=8 两侧各计一次）。旧 cap=25 在
+        # 深思②第 2 发就被 cap 503 抢在深思配额（3/日）前面——门测不到它声称的东西。
+        # 80 = ①12 + ②48 之上留 ③ 风暴触顶余量（30 用户×2 记，~10 发触顶）。
         users = [tok.mint_one(f"su-cap{i:03d}") for i in range(30)]
         cap_hits: List[int] = []
         for i, u in enumerate(users):
@@ -841,7 +846,7 @@ SPECS: List[Spec] = [
     Spec("S5", "弃单风暴", s5),
     Spec("S6", "混合负载", s6),
     Spec("S7", "限流治理", s7,
-         env={"RAG_RATE_LIMIT_ENABLE": "true", "RAG_GLOBAL_DAILY_LLM_CAP": "25",
+         env={"RAG_RATE_LIMIT_ENABLE": "true", "RAG_GLOBAL_DAILY_LLM_CAP": "80",
               "RAG_THINKING_DAILY_QUOTA": "3",
               "RAG_OPS_ALERT_WEBHOOK": "{mock}/robot/send?access_token=stress"}),
     Spec("S8", "崩溃恢复钻演", s8,
