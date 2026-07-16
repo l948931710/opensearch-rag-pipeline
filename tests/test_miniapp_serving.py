@@ -174,6 +174,35 @@ def test_auth_dingtalk_simulate(client):
     assert j["token"]            # 已签发令牌
     # 令牌可被服务端校验
     assert auth_token.verify_session_token(j["token"])["uid"] == j["user_id"]
+    # 契约：managed_owner_depts 必须在响应里（缺席=钉钉容器免登路径上传「归属部门」下拉为空——
+    # 该路径 setIdentity 直接用本响应、不补拉 whoami）。员工无写权 → []。
+    assert j["managed_owner_depts"] == []
+
+
+def test_auth_dingtalk_returns_managed_owner_depts_for_admin(client, monkeypatch):
+    """管理员经钉钉容器免登：managed_owner_depts 必须与 whoami 同源同值。
+
+    回归背景：DingtalkAuthResponse 此前无此字段，kb_admin/dept_admin 在 PC 钉钉内嵌
+    console（免登路径）看到的上传「归属部门」下拉恒空、上传按钮永久禁用；
+    小程序 web-view（?token→whoami 路径）却正常——两路径身份字段必须对齐。
+    """
+    from opensearch_pipeline import dingtalk_identity, kb_authz
+
+    # kb_admin → 全量写白名单（与 kb_authz.managed_owner_depts 同源）
+    kb = kb_authz.KbIdentity(user_id="A1", name="管理员", role=kb_authz.ROLE_KB_ADMIN,
+                             acl_groups=("marketing",))
+    monkeypatch.setattr(dingtalk_identity, "resolve_kb_identity", lambda _uid: kb)
+    j = client.post("/api/auth/dingtalk", json={"auth_code": "x"}).json()
+    assert j["role"] == "kb_admin" and j["can_manage_kb"] is True
+    assert j["managed_owner_depts"] == kb_authz.managed_owner_depts(kb)
+    assert len(j["managed_owner_depts"]) > 0   # 全量白名单绝非空
+
+    # dept_admin → 显式 seed 的 granted_owner_depts
+    da = kb_authz.KbIdentity(user_id="A2", name="部管", role=kb_authz.ROLE_DEPT_ADMIN,
+                             acl_groups=("production",), granted_owner_depts=("production",))
+    monkeypatch.setattr(dingtalk_identity, "resolve_kb_identity", lambda _uid: da)
+    j2 = client.post("/api/auth/dingtalk", json={"auth_code": "x"}).json()
+    assert j2["managed_owner_depts"] == ["production"]
 
 
 def test_ask_uses_token_dept_not_body(monkeypatch):
