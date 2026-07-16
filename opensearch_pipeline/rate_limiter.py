@@ -30,7 +30,9 @@ rate_limiter.py — serving 公网防刷（进程内四层准入）
   RAG_RATE_USER_PER_DAY=300   登录用户 每日提问上限
   RAG_RATE_ANON_PER_MIN=3     匿名 IP  每分钟提问上限
   RAG_RATE_ANON_PER_DAY=30    匿名 IP  每日提问上限
-  RAG_RATE_AUX_PER_MIN=30     辅助端点（auth/feedback/重签/历史/热门）每分钟上限
+  RAG_RATE_AUX_PER_MIN=30     辅助端点（auth/feedback/重签/历史/热门）匿名每分钟上限
+  RAG_RATE_AUX_USER_PER_MIN=120  辅助端点 登录用户每分钟上限（管理台单次挂载即 ~13 个
+                              /api/kb/* 并发加载，与匿名同档 30/分时切几次 tab 就全面 429）
   RAG_THINKING_DAILY_QUOTA=10 登录用户 深思每日配额（匿名一律拒绝）
   RAG_GLOBAL_DAILY_LLM_CAP=2000  全局每日问答熔断阈值（/api/ask + /api/ask/stream）
 
@@ -222,6 +224,10 @@ class Limits:
     anon_per_min: int = 3
     anon_per_day: int = 30
     aux_per_min: int = 30
+    # 登录用户辅助端点单列宽档（管理台雪崩修复，2026-07-15）：aux 层防的是匿名扫描器
+    # 洪泛（端点不调 LLM，成本只是 DB/OSS 读）；持 Bearer 令牌的内部用户合法就有
+    # 挂载即 ~13 连发的管理台，与匿名同档必然误伤。匿名档维持 30/分不动。
+    aux_user_per_min: int = 120
     thinking_daily_quota: int = 10
     # 通用能力（T2/T3 通用 LLM 回答）每日配额（通用能力分级开放，intent_router/
     # general_answerer）。canned 寒暄与确定性计算零成本不经此；0 = 通用 LLM 层整体关闭。
@@ -271,6 +277,7 @@ def _load_limits() -> Limits:
         anon_per_min=_env_int("RAG_RATE_ANON_PER_MIN", 3),
         anon_per_day=_env_int("RAG_RATE_ANON_PER_DAY", 30),
         aux_per_min=_env_int("RAG_RATE_AUX_PER_MIN", 30),
+        aux_user_per_min=_env_int("RAG_RATE_AUX_USER_PER_MIN", 120),
         thinking_daily_quota=_env_int("RAG_THINKING_DAILY_QUOTA", 10),
         general_daily_quota=_env_int("RAG_GENERAL_DAILY_QUOTA", 20),
         global_daily_llm_cap=_env_int("RAG_GLOBAL_DAILY_LLM_CAP", 2000),
@@ -342,7 +349,8 @@ class ServingRateLimiter:
             f"用户 {lim.user_per_min}/分·{lim.user_per_day}/日 | "
             f"匿名IP {lim.anon_per_min}/分·{lim.anon_per_day}/日 | "
             f"深思 {lim.thinking_daily_quota}/日(匿名拒绝) | "
-            f"全局熔断 {lim.global_daily_llm_cap}/日 | 辅助 {lim.aux_per_min}/分"
+            f"全局熔断 {lim.global_daily_llm_cap}/日 | "
+            f"辅助 匿名{lim.aux_per_min}/分·登录{lim.aux_user_per_min}/分"
         )
 
     # ── 准入 ─────────────────────────────────────────────────
@@ -481,19 +489,23 @@ class ServingRateLimiter:
             self._daily[key] = (day, g_cnt + 1)
         return None
 
-    def admit_aux(self, actor: str) -> Optional[Denial]:
-        """辅助端点准入（auth/feedback/resign-images/history/hot-questions/session-clear）：
-        仅每分钟滑动窗——它们不调 LLM，防的是连接洪泛与 DB/OSS/钉钉 API 滥用。
+    def admit_aux(self, actor: str, *, is_user: bool = False) -> Optional[Denial]:
+        """辅助端点准入（auth/feedback/resign-images/history/hot-questions/session-clear
+        及全部 /api/kb/* 控制台读接口）：仅每分钟滑动窗——它们不调 LLM，防的是连接
+        洪泛与 DB/OSS/钉钉 API 滥用。登录用户走宽档 aux_user_per_min（管理台单次挂载
+        ~13 个面板并发加载，与匿名同档 30/分时 kb_admin 切几次 tab 即全面 429，连 QA 侧
+        同桶请求一起被拒）；匿名维持严格档，扫描器姿态不变。默认 is_user=False = 严格档。
         """
         lim = self.limits()
-        if not lim.enabled or lim.aux_per_min <= 0:
+        per_min = lim.aux_user_per_min if is_user else lim.aux_per_min
+        if not lim.enabled or per_min <= 0:
             return None
         now = self._now()
         with self._lock:
             dq = self._minute.setdefault(f"aux:{actor}", deque())
             while dq and now - dq[0] >= _MINUTE_WINDOW_S:
                 dq.popleft()
-            if len(dq) >= lim.aux_per_min:
+            if len(dq) >= per_min:
                 retry = max(1, int(_MINUTE_WINDOW_S - (now - dq[0])) + 1)
                 return self._deny(actor, Denial(
                     429, "操作太频繁，请稍后再试", retry, "aux_per_min"))
@@ -760,7 +772,7 @@ class RedisRateLimiter:
             f"[redis] 用户 {lim.user_per_min}/分·{lim.user_per_day}/日 | "
             f"匿名IP {lim.anon_per_min}/分·{lim.anon_per_day}/日 | "
             f"深思 {lim.thinking_daily_quota}/日 | 全局熔断 {lim.global_daily_llm_cap}/日 | "
-            f"辅助 {lim.aux_per_min}/分"
+            f"辅助 匿名{lim.aux_per_min}/分·登录{lim.aux_user_per_min}/分"
         )
 
     # ── 准入 ─────────────────────────────────────────────────
@@ -828,15 +840,18 @@ class RedisRateLimiter:
             return self._deny(Denial(429, msg, _secs_to_beijing_midnight(now), "per_day"), now)
         return None
 
-    def admit_aux(self, actor: str) -> Optional[Denial]:
+    def admit_aux(self, actor: str, *, is_user: bool = False) -> Optional[Denial]:
+        # 登录/匿名分档语义同 memory 版（管理台 ~13 连发雪崩修复）；档位在 Python 选定，
+        # Lua 只收最终 per_min，脚本不变。
         lim = self.limits()
-        if not lim.enabled or lim.aux_per_min <= 0:
+        per_min = lim.aux_user_per_min if is_user else lim.aux_per_min
+        if not lim.enabled or per_min <= 0:
             return None
         now = self._now()
         bucket = int(now // _MINUTE_WINDOW_S)
         key = redis_client.key("rl", "m", "aux", actor, bucket)
         try:
-            outcome, _cnt = self._aux_script(keys=[key], args=[lim.aux_per_min, int(2 * _MINUTE_WINDOW_S)])
+            outcome, _cnt = self._aux_script(keys=[key], args=[per_min, int(2 * _MINUTE_WINDOW_S)])
         except Exception as e:   # noqa: BLE001 — aux 非成本路径 fail-open
             logger.warning("限流 Redis 后端故障，aux 路径 fail-open: %s", e)
             return None

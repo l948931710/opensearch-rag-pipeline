@@ -137,6 +137,19 @@ def test_aux_window(make_backend):
     assert d is not None and d.status_code == 429 and d.reason == "aux_per_min"
 
 
+def test_aux_user_tier_wider_than_anon(make_backend):
+    # 管理台雪崩回归（2026-07-15，与 memory 版同语义）：登录用户走
+    # RAG_RATE_AUX_USER_PER_MIN 宽档；匿名维持 RAG_RATE_AUX_PER_MIN 严格档。
+    lim = make_backend(FakeClock(), RAG_RATE_AUX_PER_MIN=2, RAG_RATE_AUX_USER_PER_MIN=5)
+    for _ in range(5):
+        assert lim.admit_aux("u:admin", is_user=True) is None
+    d = lim.admit_aux("u:admin", is_user=True)
+    assert d is not None and d.status_code == 429 and d.reason == "aux_per_min"
+    assert lim.admit_aux("ip:1.2.3.4") is None
+    assert lim.admit_aux("ip:1.2.3.4") is None
+    assert lim.admit_aux("ip:1.2.3.4").reason == "aux_per_min"
+
+
 def test_master_switch_off(make_backend):
     lim = make_backend(FakeClock(), RAG_RATE_LIMIT_ENABLE="false", RAG_RATE_USER_PER_MIN=1)
     for _ in range(10):

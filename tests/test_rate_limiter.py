@@ -201,6 +201,35 @@ def test_aux_window_independent_from_ask(make_limiter):
     assert lim.admit_ask("ip:1.2.3.4", is_user=False) is None
 
 
+def test_aux_user_tier_survives_manage_mount_fanout(make_limiter):
+    # 管理台雪崩回归（2026-07-15）：ManageView 单次挂载并发 ~13 个 /api/kb/* 辅助请求，
+    # kb_admin 切几次 tab（remount）≈ 3 轮连发。登录用户走 RAG_RATE_AUX_USER_PER_MIN
+    # 宽档必须全放行；匿名维持 RAG_RATE_AUX_PER_MIN 严格档，扫描器姿态不变。
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_RATE_AUX_PER_MIN=30, RAG_RATE_AUX_USER_PER_MIN=120)
+    for _ in range(3 * 13):
+        assert lim.admit_aux("u:admin", is_user=True) is None
+    # 同窗口内匿名照旧 30/分被拒
+    for _ in range(30):
+        assert lim.admit_aux("ip:9.9.9.9") is None
+    d = lim.admit_aux("ip:9.9.9.9")
+    assert d is not None and d.status_code == 429 and d.reason == "aux_per_min"
+
+
+def test_aux_user_tier_still_capped_and_zero_disables(make_limiter):
+    # 宽档不是无限档：超过 aux_user_per_min 照拒；0=关闭登录档，匿名档独立不受影响。
+    lim = make_limiter(FakeClock(), RAG_RATE_AUX_USER_PER_MIN=2)
+    assert lim.admit_aux("u:U1", is_user=True) is None
+    assert lim.admit_aux("u:U1", is_user=True) is None
+    d = lim.admit_aux("u:U1", is_user=True)
+    assert d is not None and d.status_code == 429 and d.reason == "aux_per_min"
+    lim2 = make_limiter(FakeClock(), RAG_RATE_AUX_USER_PER_MIN=0, RAG_RATE_AUX_PER_MIN=1)
+    for _ in range(5):
+        assert lim2.admit_aux("u:U1", is_user=True) is None
+    assert lim2.admit_aux("ip:1.2.3.4") is None
+    assert lim2.admit_aux("ip:1.2.3.4") is not None
+
+
 # ── 总开关与默认值 ───────────────────────────────────────────
 
 def test_master_switch_off(monkeypatch):

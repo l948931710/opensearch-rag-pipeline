@@ -173,6 +173,20 @@ def test_aux_resign_images_limited(client):
     assert c.post("/api/resign-images", json=body).status_code == 429
 
 
+def test_aux_user_tier_survives_manage_mount_fanout(client):
+    # 管理台雪崩回归（2026-07-15）：kb_admin 挂载 ManageView 即并发 ~13 个 /api/kb/*
+    # 辅助请求，切 tab 重挂再来一轮——持令牌用户走 RAG_RATE_AUX_USER_PER_MIN 宽档
+    # 全放行；同一进程内匿名仍按 RAG_RATE_AUX_PER_MIN 严格档 429（扫描器姿态不变）。
+    c = client(RAG_RATE_AUX_PER_MIN=2, RAG_RATE_AUX_USER_PER_MIN=30)
+    h = _bearer("ADMIN1")
+    for _ in range(2 * 13):
+        assert c.get("/api/hot-questions", headers=h).status_code == 200
+    assert c.get("/api/hot-questions").status_code == 200
+    assert c.get("/api/hot-questions").status_code == 200
+    r = c.get("/api/hot-questions")
+    assert r.status_code == 429 and "频繁" in r.json()["detail"]
+
+
 # ── 总开关 ───────────────────────────────────────────────────
 
 def test_limits_disabled_all_pass(client):

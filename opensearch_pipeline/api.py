@@ -534,7 +534,9 @@ def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity]
             denial = _rate_limiter.LIMITER.admit_ask(actor, is_user=is_user,
                                        thinking=thinking, count_llm=count_llm)
         else:
-            denial = _rate_limiter.LIMITER.admit_aux(actor)
+            # 登录用户走 aux 宽档（RAG_RATE_AUX_USER_PER_MIN）：管理台单次挂载 ~13 个
+            # /api/kb/* 并发加载，与匿名同档时 kb_admin 切几次 tab 即全面 429（雪崩修复）。
+            denial = _rate_limiter.LIMITER.admit_aux(actor, is_user=is_user)
     except Exception:
         if scope == "ask":
             logger.error("限流器内部异常（成本路径 fail-CLOSED 拒绝）", exc_info=True)
