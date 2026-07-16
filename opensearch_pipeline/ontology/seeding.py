@@ -303,17 +303,20 @@ class _Sink:
             if case_id:
                 self._note_heal(ns, norm, case_id)
             return True
+        # P1-01（unknown-unknowns 批次4）：改走 insert_identifier_closing_case——铸别名与
+        # 闭同 (ns,norm) open case **一个事务**（store 内 FOR UPDATE 自发现 case）。此前
+        # insert_identifier 先 commit、_close_case 再单独事务且 fail-open：第二步失败留下
+        # 「identifier active 而 case 仍 open」半态（故障注入已复现）。heal_if_stale 保留为
+        # 重跑对账兜底，但不再是本路径的一致性来源。
         try:
-            identifier_id = self._store.insert_identifier(
+            _iid, closed_case = self._store.insert_identifier_closing_case(
                 ns, raw, norm, target, method=method, relation=relation,
                 confidence=confidence, confirmed_by="auto",
-                source_case_id=None if case_id == _BATCH_CASE else case_id,
-                _caller=self._caller)
+                note=f"离线{self._evidence_source}自动确认落成，case 随之闭环")
         except DuplicateActiveIdentifier:
             return False
-        if case_id and case_id != _BATCH_CASE:
-            self._close_case(ns, norm, case_id, identifier_id,
-                             note=f"离线{self._evidence_source}自动确认落成，case 随之闭环")
+        if closed_case:
+            self._note_heal(ns, norm, closed_case)
         return True
 
     def heal_if_stale(self, ns: str, norm: str) -> None:
@@ -496,14 +499,22 @@ def _decide(r: SeedRecord, sink: _Sink, tau: TauTable, report: SeedReport, *,
 def seed_snapshot(store, source: Any, *, dry_run: bool = True,
                   tau_table: Optional[TauTable] = None,
                   limit: Optional[int] = None, mint_new: bool = True,
-                  evidence_source: str = "seeding") -> SeedReport:
+                  evidence_source: str = "seeding",
+                  population_authoritative: Optional[bool] = None) -> SeedReport:
     """跑一遍快照播种/回填。单条失败只记 errors 不拖垮批（可断点重跑，幂等）。
     mint_new=False = 观测语义（回填 mention 模式：无候选不铸对象，只入 case）。
 
     population 分母纪律（P1-12）：coverage 的分母是「源里有多少记录」，与本批处理量
     无关——limit 只截断**处理**，不截断**计数**（此前 limit 批直接 break，把分母覆写成
     批大小 → active/批大小 覆盖率虚高）。代价是 limit 批也要把源迭代完（纯计数不判定
-    不写库）；快照/CSV 源是本地顺序读，可接受。"""
+    不写库）；快照/CSV 源是本地顺序读，可接受。
+
+    population 只认 master 语义（P0-05，unknown-unknowns 批次4）：
+    ontology_source_population 按 namespace upsert（后写覆盖前写），而 mention 观测
+    （回填默认）的输入可以是局部历史导出——一次局部 backfill 曾能把 master 10,000 的
+    分母覆写成 100，覆盖率虚高假绿过 gate。现在只有全量主数据语义才登记分母：
+    - population_authoritative=None（默认）→ 跟随 mint_new（master 播种记、mention 不记）；
+    - 显式 True/False 覆盖（例：已知全量的观测导出可显式 True；试验性 master 灌注可 False）。"""
     tau = tau_table or TauTable.from_env(strict=True)   # P0-07：写 worker 非法 τ 即断
     report = SeedReport(dry_run=dry_run)
     src_fp = source_fingerprint(source)   # manifest 输入绑定（重审计 §2）：一次实算全批复用
@@ -526,9 +537,14 @@ def seed_snapshot(store, source: Any, *, dry_run: bool = True,
             report.add(action="error", namespace=r.namespace, raw=r.raw_code, error=str(e))
             logger.warning("播种单条失败（跳过继续）：%s %s", r.namespace, r.raw_code,
                            exc_info=True)
-    if not dry_run and ns_counts:
+    authoritative = mint_new if population_authoritative is None else bool(population_authoritative)
+    if not dry_run and ns_counts and authoritative:
         try:   # 快照登记 fail-open：分母是指标不是事实，登记失败不掀翻批
             store.record_population_snapshot(ns_counts, source=evidence_source)
         except Exception:   # noqa: BLE001
             logger.warning("population 快照登记失败（coverage 回退 approx 口径）", exc_info=True)
+    elif not dry_run and ns_counts:
+        logger.info("mention 观测语义：不登记 population 分母（%s 个 namespace 仅处理不计数；"
+                    "P0-05 master-only 纪律，--population-authoritative 可显式覆盖）",
+                    len(ns_counts))
     return report

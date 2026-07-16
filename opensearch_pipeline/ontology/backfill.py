@@ -61,28 +61,40 @@ __all__ = ["ENABLE_ENV", "backfill_snapshot", "main"]
 
 def backfill_snapshot(store, source: Any, *, dry_run: bool = True,
                       tau_table=None, limit: Optional[int] = None,
-                      mint_new: bool = False) -> SeedReport:
-    """跑一轮回填。默认 mention 观测语义（mint_new=False）；决策核心与播种同源。"""
+                      mint_new: bool = False,
+                      population_authoritative: Optional[bool] = None) -> SeedReport:
+    """跑一轮回填。默认 mention 观测语义（mint_new=False）；决策核心与播种同源。
+    P0-05（批次4）：mention 回填**不登记** population 分母（局部观测导出会把 master
+    全量分母覆写虚高）；已知全量的源可显式 population_authoritative=True。"""
     return seed_snapshot(store, source, dry_run=dry_run, tau_table=tau_table,
-                         limit=limit, mint_new=mint_new, evidence_source="backfill")
+                         limit=limit, mint_new=mint_new, evidence_source="backfill",
+                         population_authoritative=population_authoritative)
 
 
 def _print_coverage(store) -> None:
-    """轮末覆盖率播报（M2 门指标）。纯播报：失败不影响退出码。"""
+    """轮末覆盖率播报（M2 门指标）。纯播报：失败不影响退出码。
+    P0-05（批次4）：逐行打印分母口径——payload 一直自带 denominator/anomaly 字段，
+    此前播报把口径丢掉，approx 处置率会被当成真实覆盖率读。"""
     try:
         total = store.coverage()
         cov = total.get("resolution_coverage")
+        if total.get("denominator") == "population":
+            basis = f"分母=population({total.get('population_records')})"
+        else:
+            basis = "分母=approx（处置率口径，非真实覆盖率——无全量源快照）"
+        anomaly = f" ⚠️ {total['anomaly']}" if total.get("anomaly") else ""
         print(f"resolution_coverage(总): {cov:.4f}" if cov is not None
               else "resolution_coverage(总): —（尚无观测）",
               f"| active {total.get('active_identifiers')} · open {total.get('open_cases')}"
-              f" · auto {total.get('auto_active')}")
+              f" · auto {total.get('auto_active')} [{basis}]{anomaly}")
         for ot in _P0_OBJECT_TYPES:
             c = store.coverage(ot)
             if not (c.get("active_identifiers") or c.get("open_cases")):
                 continue
             cv = c.get("resolution_coverage")
             print(f"  · {ot}: {cv:.4f}" if cv is not None else f"  · {ot}: —",
-                  f"(active {c.get('active_identifiers')} / open {c.get('open_cases')})")
+                  f"(active {c.get('active_identifiers')} / open {c.get('open_cases')}"
+                  f" · {c.get('denominator', 'approx')} 口径)")
     except Exception as e:   # noqa: BLE001 — 播报失败不掀翻作业
         print(f"（覆盖率播报失败：{e}）")
 
@@ -98,6 +110,9 @@ def main(argv=None, *, store=None, source=None) -> int:
                    help="mention=观测语义不铸对象（默认）；master=主数据语义可铸（档案类快照）")
     p.add_argument("--limit", type=int, default=None, help="最多处理前 N 条（安全阀，断点续跑用）")
     p.add_argument("--show-actions", type=int, default=20, help="打印前 N 条动作明细")
+    p.add_argument("--population-authoritative", action="store_true",
+                   help="声明本源为该 namespace 的**全量**记录，登记 population 分母"
+                        "（P0-05：mention 观测默认不登记——局部导出会覆写 master 分母）")
     args = p.parse_args(argv)
 
     if args.commit and args.dry_run:
@@ -142,7 +157,9 @@ def main(argv=None, *, store=None, source=None) -> int:
         store = RDSOntologyStore()
 
     report = backfill_snapshot(store, source, dry_run=dry,
-                               limit=args.limit, mint_new=(args.mode == "master"))
+                               limit=args.limit, mint_new=(args.mode == "master"),
+                               population_authoritative=(True if args.population_authoritative
+                                                         else None))
     print(report.summary())
     for a in report.actions[: max(0, args.show_actions)]:
         print("  ·", a)

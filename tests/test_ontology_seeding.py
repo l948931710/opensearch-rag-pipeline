@@ -348,3 +348,84 @@ def test_real_run_records_population_snapshot(store_factory=None):
     assert real_store.population_total() == 3
     cov = real_store.coverage()
     assert cov["denominator"] == "population" and cov["population_records"] == 3
+
+
+def test_population_master_only_semantics():
+    """P0-05（unknown-unknowns 批次4）：mention 回填**不登记**分母——局部观测导出曾能把
+    master 全量分母覆写虚高（10,000→100 false green 过 ≥70% gate）；
+    显式 population_authoritative=True 才允许覆盖。"""
+    from opensearch_pipeline.ontology.seeding import SeedRecord, seed_snapshot
+    from opensearch_pipeline.ontology.store import MemoryOntologyStore
+
+    def _rec(i):
+        return SeedRecord(namespace="u8", raw_code=f"M{i}", object_type="product",
+                          title=f"品{i}", owner_dept="pmc")
+
+    class _Master:
+        def iter_records(self):
+            for i in range(5):
+                yield _rec(i)
+
+    class _PartialMention:
+        def iter_records(self):
+            yield _rec(0)
+
+    store = MemoryOntologyStore()
+    seed_snapshot(store, _Master(), dry_run=False)                    # master 语义：登记
+    assert store.population_total() == 5
+    seed_snapshot(store, _PartialMention(), dry_run=False, mint_new=False,
+                  evidence_source="backfill")                         # mention：绝不覆盖
+    assert store.population_total() == 5
+    seed_snapshot(store, _PartialMention(), dry_run=False, mint_new=False,
+                  evidence_source="backfill", population_authoritative=True)
+    assert store.population_total() == 1                              # 显式声明才覆盖
+    seed_snapshot(store, _Master(), dry_run=False, population_authoritative=False)
+    assert store.population_total() == 1                              # master 也可显式关
+
+
+def test_alias_path_uses_atomic_close(monkeypatch):
+    """P1-01（unknown-unknowns 批次4）：_Sink.alias 走 insert_identifier_closing_case——
+    别名铸造与 case 闭环一个事务；绝不再走「insert_identifier 先 commit + _close_case
+    fail-open 第二事务」的可分叉序。"""
+    import pytest as _pytest
+
+    from opensearch_pipeline.ontology.seeding import SeedReport, _Sink
+    from opensearch_pipeline.ontology.store import MemoryOntologyStore
+
+    store = MemoryOntologyStore()
+    obj = store.mint_object("product", "杯", owner_dept="pmc", _caller="test")
+    store.upsert_case("u8", "x1", "X1", object_type_hint="product",
+                      evidence={"source": "test"})
+    assert store.get_open_case("u8", "X1") is not None
+
+    calls = {"atomic": 0}
+    orig = store.insert_identifier_closing_case
+
+    def _spy(*a, **k):
+        calls["atomic"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(store, "insert_identifier_closing_case", _spy)
+    monkeypatch.setattr(store, "insert_identifier",
+                        lambda *a, **k: _pytest.fail("alias 路径不得再走非原子 insert_identifier"))
+    rep = SeedReport(dry_run=False)
+    sink = _Sink(store, False, rep)
+    assert sink.alias("u8", "x1", "X1", obj["object_id"],
+                      method="exact_code", confidence=0.99)
+    assert calls["atomic"] == 1
+    assert store.get_open_case("u8", "X1") is None          # case 随同一事务闭环
+    assert store.get_active_identifier("u8", "X1") is not None
+    assert rep.cases_healed == 1                            # 愈合记账走原子返回值
+
+    # 注入：原子 API 整体失败 → 别名与 case 双双不落（无半态）
+    store2 = MemoryOntologyStore()
+    obj2 = store2.mint_object("product", "碗", owner_dept="pmc", _caller="test")
+    store2.upsert_case("u8", "y1", "Y1", object_type_hint="product",
+                       evidence={"source": "test"})
+    monkeypatch.setattr(store2, "insert_identifier_closing_case",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("事务失败注入")))
+    sink2 = _Sink(store2, False, SeedReport(dry_run=False))
+    with _pytest.raises(RuntimeError):
+        sink2.alias("u8", "y1", "Y1", obj2["object_id"], method="exact_code", confidence=0.99)
+    assert store2.get_active_identifier("u8", "Y1") is None
+    assert store2.get_open_case("u8", "Y1") is not None     # 双双不落，一致

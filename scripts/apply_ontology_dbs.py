@@ -20,9 +20,12 @@ apply_ontology_dbs.py — ontology 库建库 + 本体迁移族按序 apply（可
   - **--dry-run 默认**：只读连接预览（连不上降级纯解析），绝不写；--commit 才执行；
   - 环境判定物理指纹优先（classify_target）：local / _stg 放行；生产 --commit 须
     --prod-ack 当日 RW 令牌（经 prod_access，exit 2）；
-  - 幂等：迁移文件自身 IF NOT EXISTS / INSERT IGNORE / information_schema+PREPARE
-    守卫（027 尾注「支持重复 apply」），重放即全量重执行、已就位对象 no-op；
-  - 台账同名不同 checksum → 中止（同版本内容被改过=漂移，exit 4，README 铁律 2）；
+  - **台账跳过（批次4 P1-02）**：台账已记且 checksum 一致的文件 SKIP 不重执行
+    （--force-replay 恢复全量重执行；文件自身仍须幂等守卫，重放才安全）；
+  - **NNNa 修订感知（README 铁律 2）**：文件头 `-- revision: NNNa` 声明修订——
+    原行 checksum 不同且修订行未记 → 执行守卫化文件并记 `<fn>@NNNa` 台账行
+    （不改原行）；修订行已记但 checksum 又不同 → 中止（须再升修订号）；
+  - 台账同名不同 checksum 且**无**修订声明 → 中止（漂移，exit 4）；
   - 台账 fail-closed：DDL 落定但台账写失败 → exit 3（人工补记后再继续）；
   - 台账缺表容错：schema_migrations 未建时冲突检查按「无记录」处理（011 会建它）。
 
@@ -101,14 +104,24 @@ def discover_ontology_migrations():
     return files
 
 
+_REVISION_RE = re.compile(r"^--\s*revision:\s*([0-9a-zA-Z]+)\s*$", re.M)
+
+
+def _declared_revision(text):
+    """文件头 `-- revision: NNNa` 修订声明（铁律 2）；无声明 → None。"""
+    m = _REVISION_RE.search(text)
+    return m.group(1) if m else None
+
+
 def _build_plan(files):
-    """[(fn, sha256, statements)]；切分复用 _am._split_statements（引号感知 +
+    """[(fn, sha256, statements, revision)]；切分复用 _am._split_statements（引号感知 +
     DELIMITER fail-closed——本体族不用存储过程，撞到即说明文件族变质，照抛）。"""
     plan = []
     for fn in files:
         raw = open(os.path.join(SCHEMA_DIR, fn), "rb").read()
+        text = raw.decode("utf-8")
         plan.append((fn, hashlib.sha256(raw).hexdigest(),
-                     _am._split_statements(raw.decode("utf-8"))))
+                     _am._split_statements(text), _declared_revision(text)))
     return plan
 
 
@@ -121,21 +134,39 @@ def _db_collation(conn, dbname):
     return row[0] if row else None
 
 
-def _ledger_row(conn, dbname, fn):
-    """台账现状 (row_exists, checksum|None)；表缺失等异常 → (False, None)（011 会建表）。"""
+def _ledger_rows(conn, dbname, fn):
+    """台账现状 {filename: checksum|None}——含原行与全部修订行（fn@NNNa）。
+    表缺失等异常 → {}（011 会建表；fail-open 仅限读现状）。"""
     try:
         has_col = _am._ledger_has_checksum_col(conn, dbname)
         with conn.cursor() as cur:
-            if has_col:
-                cur.execute(f"SELECT checksum FROM `{dbname}`.schema_migrations "
-                            "WHERE filename=%s", (fn,))
-            else:
-                cur.execute(f"SELECT NULL FROM `{dbname}`.schema_migrations "
-                            "WHERE filename=%s", (fn,))
-            row = cur.fetchone()
-    except Exception:   # noqa: BLE001 — 缺表/缺库：按无记录（fail-open 仅限读现状）
-        return (False, None)
-    return (False, None) if row is None else (True, row[0])
+            col = "checksum" if has_col else "NULL"
+            cur.execute(f"SELECT filename, {col} FROM `{dbname}`.schema_migrations "
+                        "WHERE filename=%s OR filename LIKE %s", (fn, fn + "@%"))
+            return {r[0]: r[1] for r in (cur.fetchall() or [])}
+    except Exception:   # noqa: BLE001 — 缺表/缺库：按无记录
+        return {}
+
+
+def _plan_action(rows, fn, checksum, rev):
+    """裁决单文件动作（批次4 P1-02）。返回 (action, detail)：
+    - skip   任一台账行（原行或修订行）checksum 与本文件一致 → 已应用，跳过；
+    - apply  无台账行（全新）/ 仅有 pre-032 无 checksum 行（无从校验，按幂等重放）；
+    - revise 原行在但内容已修订且声明了 `-- revision:`、该修订行未记
+             → 执行守卫化文件并记 `<fn>@<rev>` 行（detail=修订行 filename）；
+    - drift  内容变了但无修订声明 / 声明的修订行已记而 checksum 又不同 → 中止 exit 4。"""
+    if not rows:
+        return "apply", None
+    if any(ck == checksum for ck in rows.values() if ck):
+        return "skip", None
+    if all(ck is None for ck in rows.values()):
+        return "apply", "台账行无 checksum（pre-032）——按幂等重放"
+    if rev:
+        rev_fn = f"{fn}@{rev}"
+        if rev_fn in rows:
+            return "drift", f"修订 {rev} 已记但 checksum 又不同——须再升修订号（铁律 2）"
+        return "revise", rev_fn
+    return "drift", None
 
 
 def main(argv=None):
@@ -147,6 +178,9 @@ def main(argv=None):
     ap.add_argument("--prod-ack", default=None,
                     help="生产 apply 确认令牌（对齐 prod_access.get_prod_rw_conn）")
     ap.add_argument("--applied-by", default="scripts/apply_ontology_dbs.py")
+    ap.add_argument("--force-replay", action="store_true",
+                    help="忽略台账跳过、全量重执行（旧行为；文件自身幂等守卫兜底。"
+                         "漂移中止不受本开关影响）")
     args = ap.parse_args(argv)
     if args.dry_run and args.commit:
         ap.error("--dry-run 与 --commit 互斥")
@@ -167,7 +201,7 @@ def main(argv=None):
     plan = _build_plan(files)
 
     print(f"目标     : {dbname}  host={host}  环境={env_label}（物理指纹判定）")
-    print(f"迁移序列 : {' → '.join(fn.split('_')[0] for fn, _, _ in plan)}"
+    print(f"迁移序列 : {' → '.join(fn.split('_')[0] for fn, _, _, _ in plan)}"
           f"（{len(plan)} 个文件，MANIFEST 自动发现）")
     print(f"模式     : {'COMMIT（真写）' if args.commit else 'DRY-RUN（只预览，只读连接）'}")
 
@@ -184,7 +218,7 @@ def main(argv=None):
                           f"（应为 {REQUIRED_COLLATION}，铁律 4）——--commit 会中止。")
                 else:
                     print(f"库现状   : {dbname} 已存在（collation ✓）")
-            for fn, checksum, statements in plan:
+            for fn, checksum, statements, rev in plan:
                 tables = _am._table_names(statements)
                 line = f"  · {fn}  语句 {len(statements)} 条"
                 if tables:
@@ -192,17 +226,20 @@ def main(argv=None):
                 if conn is not None:
                     existing = _am._existing_tables(conn, dbname, tables)
                     todo = [t for t in tables if t not in existing]
-                    row_exists, old_ck = _ledger_row(conn, dbname, fn)
-                    if row_exists and old_ck and old_ck != checksum:
-                        line += f"\n    ⚠️ 台账已记且 checksum 不同（旧 {old_ck[:12]}…）" \
-                                f"——--commit 会中止（漂移）。"
-                    elif row_exists:
-                        line += "  [台账已记——重放为幂等重执行]"
+                    action, detail = _plan_action(_ledger_rows(conn, dbname, fn),
+                                                  fn, checksum, rev)
+                    if action == "drift":
+                        line += f"\n    ⚠️ 台账 checksum 漂移（{detail or '无修订声明'}）" \
+                                f"——--commit 会中止。"
+                    elif action == "skip":
+                        line += "  [台账已记 checksum ✓——SKIP（--force-replay 可重执行）]"
+                    elif action == "revise":
+                        line += f"  [修订 {rev}：将重放守卫化文件并记 {detail}]"
                     if tables:
                         line += f"\n    已存在 {sorted(existing)} | 待建 {todo}"
                 print(line)
-            print(f"\n[DRY-RUN] 不写库。--commit 将：建库(若缺) + 按序执行以上 {len(plan)} 个"
-                  f"文件 + 统一记 {dbname}.schema_migrations（含 SHA-256）。")
+            print(f"\n[DRY-RUN] 不写库。--commit 将：建库(若缺) + 按上列动作执行 {len(plan)} 个"
+                  f"文件（skip 不重执行）+ 记 {dbname}.schema_migrations（含 SHA-256）。")
         finally:
             if conn is not None:
                 conn.close()
@@ -229,46 +266,62 @@ def main(argv=None):
         else:
             print(f"库已存在 : {dbname}（collation ✓）")
 
-        # 2) 漂移预检（全序列先检后写：中途才发现漂移会留下半截 apply）
-        for fn, checksum, _statements in plan:
-            row_exists, old_ck = _ledger_row(conn, dbname, fn)
-            if row_exists and old_ck and old_ck != checksum:
-                print(f"\n❌ 台账已记 {fn} 且 checksum 不同（台账 {old_ck[:12]}… ≠ 本文件 "
-                      f"{checksum[:12]}…）——同版本内容被改过（漂移预备役），中止。"
-                      f"修订已发布文件须走 NNNa 修订号（README 铁律 2）。")
+        # 2) 动作裁决预检（全序列先检后写：中途才发现漂移会留下半截 apply）
+        actions = {}
+        for fn, checksum, _statements, rev in plan:
+            action, detail = _plan_action(_ledger_rows(conn, dbname, fn), fn, checksum, rev)
+            if action == "drift":
+                print(f"\n❌ 台账已记 {fn} 且 checksum 不同（{detail or '同版本内容被改过'}）"
+                      f"——中止。修订已发布文件须走 NNNa 修订号 + 文件头 `-- revision:` 声明"
+                      f"（README 铁律 2）。")
                 sys.exit(_am.EXIT_CHECKSUM_MISMATCH)
+            actions[fn] = (action, detail)
 
-        # 3) 按序执行（文件自身幂等：IF NOT EXISTS / INSERT IGNORE / PREPARE 守卫）
-        for fn, checksum, statements in plan:
+        # 3) 按动作执行（skip=台账已记且 checksum 一致，批次4 P1-02；--force-replay 全量重放。
+        #    执行路径仍要求文件自身幂等：IF NOT EXISTS / INSERT IGNORE / PREPARE 守卫）
+        skipped = 0
+        for fn, checksum, statements, _rev in plan:
+            action, _detail = actions[fn]
+            if action == "skip" and not args.force_replay:
+                skipped += 1
+                print(f"⏭️  {dbname} ← {fn} SKIP（台账已记 checksum ✓；--force-replay 可重执行）")
+                continue
             with conn.cursor() as cur:
                 cur.execute(f"USE `{dbname}`")
                 for s in statements:
                     cur.execute(s)
             conn.commit()
-            print(f"✅ {dbname} ← {fn}（{len(statements)} 条, sha256={checksum[:12]}…）")
+            tag = "（修订重放）" if action == "revise" else ""
+            print(f"✅ {dbname} ← {fn}{tag}（{len(statements)} 条, sha256={checksum[:12]}…）")
 
-        # 4) 台账殿后（032 已就位 → 全部带 checksum；写失败 → exit 3 fail-closed）
+        # 4) 台账殿后（032 已就位 → 全部带 checksum；写失败 → exit 3 fail-closed）。
+        #    revise 文件记 `<fn>@<rev>` 修订行（version=rev；原行不动，铁律 2）。
         try:
             has_col = _am._ledger_has_checksum_col(conn, dbname)
             with conn.cursor() as cur:
                 cur.execute(f"USE `{dbname}`")
-                for fn, checksum, _statements in plan:
-                    version = fn.split("_", 1)[0]
+                for fn, checksum, _statements, rev in plan:
+                    action, detail = actions[fn]
+                    if action == "revise":
+                        row_fn, version = detail, rev
+                    else:
+                        row_fn, version = fn, fn.split("_", 1)[0]
                     if has_col:
                         cur.execute(
                             "INSERT IGNORE INTO schema_migrations "
                             "(filename, version, applied_by, notes, checksum) "
                             "VALUES (%s,%s,%s,%s,%s)",
-                            (fn, version, args.applied_by,
+                            (row_fn, version, args.applied_by,
                              f"apply via script ({env_label})", checksum))
                     else:
                         cur.execute(
                             "INSERT IGNORE INTO schema_migrations "
                             "(filename, version, applied_by, notes) VALUES (%s,%s,%s,%s)",
-                            (fn, version, args.applied_by,
+                            (row_fn, version, args.applied_by,
                              f"apply via script ({env_label}); sha256={checksum}"))
             conn.commit()
             print(f"✅ 台账 {len(plan)} 行 → {dbname}.schema_migrations"
+                  f"（本轮 SKIP {skipped} 个文件）"
                   f"{'' if has_col else '（无 checksum 列——032 未生效？请人工核查）'}")
         except Exception as e:   # noqa: BLE001
             print(f"❌ DDL 已落定但台账写失败（{e}）——**exit {_am.EXIT_LEDGER_FAILED}**："
