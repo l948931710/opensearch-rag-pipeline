@@ -18,7 +18,7 @@ import logging
 import os
 import re
 import threading
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -1075,6 +1075,46 @@ def agent_runs(request: Request, limit: int = 20,
     return {"items": run_store.list_runs_by_user(identity.user_id, limit=max(1, min(int(limit), 100)))}
 
 
+# perf 批次 B §4.3：run 状态变更指纹——status 变迁/心跳 tick 推进 heartbeat_at（覆盖
+# 「运行中」与状态切换），step_no 在轮内逐步推进（覆盖心跳间隙里的工具/模型步进），
+# 预算计数器兜底。前端只做不透明字符串比较，勿解析内部结构。
+def _run_state_key(run: Dict[str, Any], max_step_no) -> str:
+    return "|".join(str(run.get(k)) for k in
+                    ("status", "heartbeat_at", "turns_used", "tool_calls_used")) \
+        + f"|{max_step_no}"
+
+
+@router.get("/api/agent/runs/{run_id}/status")
+def agent_run_status(run_id: str, request: Request,
+                     identity: Optional[Identity] = Depends(current_identity)):
+    """轻量状态探针（perf 批次 B §4.3）：单条 SQL 返回状态摘要 + state_key。前端两段式
+    轮询每拍先打这里，state_key 与上次相同且非终态 → 本拍结束（不拉 detail、不写状态）；
+    变化/终态才追打 detail 全量。挂起数小时的 run 由此从每拍 4-5 次读降到 1 次。
+    归属门禁与 detail 同口径：本人或 kb_admin，他人一律 404（不可见==不存在）。"""
+    if not _agent_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    if identity is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
+    _registry, _gateway, _executor, run_store = _get_runtime()
+    if not hasattr(run_store, "get_run_status"):   # 测试桩等无此法 → 视同无状态探针
+        raise HTTPException(status_code=404, detail="Not Found")
+    st = run_store.get_run_status(run_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    if st.get("user_id") != identity.user_id:
+        from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+        from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+        if resolve_kb_identity(identity.user_id).role != ROLE_KB_ADMIN:
+            raise HTTPException(status_code=404, detail="run 不存在")   # 不可见==不存在
+    return {"run_id": st["run_id"], "status": st["status"],
+            "started_at": str(st["started_at"]) if st.get("started_at") is not None else None,
+            "ended_at": str(st["ended_at"]) if st.get("ended_at") is not None else None,
+            "turns_used": st.get("turns_used"), "tool_calls_used": st.get("tool_calls_used"),
+            "tokens_used": st.get("tokens_used"),
+            "state_key": _run_state_key(st, st.get("max_step_no"))}
+
+
 @router.get("/api/agent/runs/{run_id}")
 def agent_run_detail(run_id: str, request: Request,
                      identity: Optional[Identity] = Depends(current_identity)):
@@ -1095,7 +1135,7 @@ def agent_run_detail(run_id: str, request: Request,
         from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
         if resolve_kb_identity(identity.user_id).role != ROLE_KB_ADMIN:
             raise HTTPException(status_code=404, detail="run 不存在")   # 不可见==不存在
-    for k in ("started_at", "ended_at"):
+    for k in ("started_at", "ended_at", "heartbeat_at"):
         if run.get(k) is not None:
             run[k] = str(run[k])
     steps = run_store.list_steps(run_id) if hasattr(run_store, "list_steps") else []
@@ -1122,8 +1162,12 @@ def agent_run_detail(run_id: str, request: Request,
             final = fetch_answer_by_message_id(run["message_id"])
         except Exception:   # noqa: BLE001
             logger.warning("run 详情读取最终答案失败（忽略）", exc_info=True)
+    # perf 批次 B §4.3：state_key 与 /status 同口径，供前端拉完 detail 后 seed 比较基准。
+    # max_step_no 取自本响应的 steps（list_steps 有 limit 上限，>上限时偏小——方向安全：
+    # 只会让下拍多拉一次 detail，绝不漏更新）。
     return {"run": run, "steps": steps, "invocations": invocations, "approval": approval,
-            "final": final}
+            "final": final,
+            "state_key": _run_state_key(run, steps[-1]["step_no"] if steps else None)}
 
 
 @router.post("/api/agent/runs/{run_id}/cancel")

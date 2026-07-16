@@ -203,6 +203,53 @@ def test_streaming_generator_without_return_value_fails_loud():
         raise AssertionError("应当 fail loud 而非静默空答案")
 
 
+# ── perf 批次 B §4.4：ModelDelta 惰性合并（默认 off；on=首帧即时+攒批+尾巴清空）────
+def _run_stream_deltas(monkeypatch, deltas, final_text, *, ms, chars=None):
+    from opensearch_pipeline.agent_runtime.events import ModelDelta
+    monkeypatch.setenv("RAG_AGENT_DELTA_COALESCE_MS", str(ms))
+    if chars is not None:
+        monkeypatch.setenv("RAG_AGENT_DELTA_COALESCE_CHARS", str(chars))
+    loop = DefaultAgentLoop(_stream_fn(deltas, ModelTurn(text=final_text)))
+    events = list(loop.run(_ctx(), [{"role": "user", "content": "q"}], []))
+    return [e for e in events if isinstance(e, ModelDelta)], events[-1]
+
+
+def test_delta_coalesce_first_immediate_tail_flushed(monkeypatch):
+    """窗口极大（永不到期、字符上限极大）：首增量必须立即单发（首 token 延迟不变），
+    其余全部攒到流终强制清尾——拼接文本与逐帧下发逐字节一致。"""
+    ds, done = _run_stream_deltas(
+        monkeypatch, [_delta("你"), _delta("好"), _delta("世"), _delta("界")], "你好世界",
+        ms=10_000_000, chars=100_000)
+    assert [d.text for d in ds] == ["你", "好世界"]
+    assert "".join(d.text for d in ds) == "你好世界"
+    assert isinstance(done, RunCompleted) and done.streamed is True
+
+def test_delta_coalesce_char_threshold_flush(monkeypatch):
+    """字符上限先于窗口触发：缓冲攒满即 flush，不等窗口到期。"""
+    ds, _ = _run_stream_deltas(
+        monkeypatch, [_delta(t) for t in ("a", "b", "c", "d", "e")], "abcde",
+        ms=10_000_000, chars=3)
+    assert [d.text for d in ds] == ["a", "bcd", "e"]
+
+def test_delta_coalesce_window_elapsed_flush_and_reasoning_merge(monkeypatch):
+    """窗口极小（到达即视为过期）→ 每帧照发（合并不惜牺牲时效）；reasoning 与 text
+    同缓冲合并，None/空语义与逐帧路径一致。"""
+    ds, _ = _run_stream_deltas(
+        monkeypatch, [_delta("x"), _delta("y", reasoning="思"), _delta(reasoning="考")], "xy",
+        ms=0.0001, chars=100_000)
+    assert [d.text for d in ds] == ["x", "y", ""]
+    assert [d.reasoning for d in ds] == [None, "思", "考"]
+
+def test_delta_coalesce_off_by_default_byte_identical(monkeypatch):
+    """默认（未设 env / =0）逐帧直发——与既有行为逐字节一致（回归锚）。"""
+    monkeypatch.delenv("RAG_AGENT_DELTA_COALESCE_MS", raising=False)
+    ds, done = _run_stream_deltas(
+        monkeypatch, [_delta("你"), _delta("好"), _delta(reasoning="思考中")], "你好", ms=0)
+    assert [d.text for d in ds] == ["你", "好", ""]
+    assert ds[2].reasoning == "思考中"
+    assert done.streamed is True
+
+
 # ── 终轮空文本兜底（2026-07-11：staging 实测 DashScope 瞬时 completion≈0）────────
 def test_empty_final_retries_once_then_succeeds():
     """空终轮 → 原地重试一次拿到全文；浪费的 usage 合并进重试轮（run 级记账不缺斤短两）。"""

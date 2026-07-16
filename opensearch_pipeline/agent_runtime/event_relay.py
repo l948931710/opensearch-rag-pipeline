@@ -68,6 +68,7 @@ class _RedisRelay:
         self._maxlen = _int_env("RAG_AGENT_EVENT_RELAY_MAXLEN", 4096)
         self._ttl_s = _int_env("RAG_AGENT_EVENT_RELAY_TTL_S", 7200)
         self._dead = False
+        self._ttl_set = False
 
     def _xadd(self, payload: Dict[str, Any]) -> None:
         if self._dead:
@@ -77,7 +78,13 @@ class _RedisRelay:
             cli = redis_client.get_client()
             cli.xadd(self._key, {"data": json.dumps(payload, ensure_ascii=False)},
                      maxlen=self._maxlen, approximate=True)
-            cli.expire(self._key, self._ttl_s)
+            # perf 批次 B §4.4：EXPIRE 不再逐帧发——model_delta 是帧量大头（长答案数百帧），
+            # 逐帧 EXPIRE 纯属重复续期。首帧 + 一切非 delta 帧（tool/审批/终态/__end__，低频）
+            # 仍续期，TTL 语义≈「自最后一个控制帧起 _ttl_s」，与旧行为在所有真实 run 形态下
+            # 等效（任何 run 的 delta 之后必有控制帧收尾）。
+            if not self._ttl_set or payload.get("type") != "model_delta":
+                cli.expire(self._key, self._ttl_s)
+                self._ttl_set = True
         except Exception:   # noqa: BLE001
             self._dead = True
             logger.warning("run %s 事件中继发布失败（本 run 降级单副本，进程内 SSE 不受影响）",

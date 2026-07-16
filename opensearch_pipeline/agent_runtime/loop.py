@@ -197,6 +197,24 @@ def midrun_checkpoint_enabled() -> bool:
                           "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _delta_coalesce_cfg() -> Tuple[float, int]:
+    """perf 批次 B §4.4：ModelDelta 惰性合并——(窗口 ms, 字符上限)。默认 **0=off**（逐
+    delta 直发，行为逐字节不变）；>0 时首增量仍立即发（首 token 延迟不变），其后按
+    窗口/字符阈值攒批。合并点选在 loop 的 StreamDelta→ModelDelta 转换处：进程内
+    queue、Redis 中继 XADD、SSE 帧三个下游同时减量。控制事件（tool/approval/终态）
+    不经此路径，天然即时。"""
+    import os
+    try:
+        ms = float(os.environ.get("RAG_AGENT_DELTA_COALESCE_MS", "0") or 0)
+    except ValueError:
+        ms = 0.0
+    try:
+        chars = int(os.environ.get("RAG_AGENT_DELTA_COALESCE_CHARS", "128") or 128)
+    except ValueError:
+        chars = 128
+    return max(0.0, ms), max(1, chars)
+
+
 def tool_data_guard_enabled() -> bool:
     """P1-1「Agent 无不可信工具数据边界」：与 RAG 路径共用同一信任姿态开关
     RAG_PROMPT_INJECTION_GUARD（默认 off；生产/启用任何写工具前必须开）。
@@ -258,8 +276,18 @@ class DefaultAgentLoop:
         out = self._model(msgs, tools)
         if not hasattr(out, "__next__"):
             return out, False                       # 同步 model_fn（既有契约）
+        import time
         from opensearch_pipeline.agent_runtime.events import ModelDelta
+        coalesce_ms, coalesce_chars = _delta_coalesce_cfg()
         streamed_text = False
+        first_sent = False
+        # perf 批次 B §4.4 惰性合并缓冲：拉模式生成器无计时器线程——「下一个增量到达时
+        # 检查 elapsed/字符阈值」决定 flush。窗口内消费者收不到帧（provider 卡顿时最后
+        # 一段增量的下发延迟 ≤ 下一增量到达间隔），StopIteration 强制清尾保证零丢失。
+        buf_txt: List[str] = []
+        buf_rsn: List[str] = []
+        buf_chars = 0
+        win_start = 0.0
         while True:
             try:
                 d = next(out)
@@ -267,13 +295,33 @@ class DefaultAgentLoop:
                 mt = fin.value
                 if mt is None:
                     raise ValueError("流式 model_fn 生成器未返回 ModelTurn")
+                if buf_txt or buf_rsn:              # 尾巴强制 flush——最后增量绝不滞留
+                    yield ModelDelta(text="".join(buf_txt),
+                                     reasoning=("".join(buf_rsn) or None))
                 return mt, streamed_text
             txt = getattr(d, "text", "") or ""
             rsn = getattr(d, "reasoning", "") or ""
             if txt:
                 streamed_text = True
-            if txt or rsn:
+            if not (txt or rsn):
+                continue
+            if coalesce_ms <= 0:                    # off（默认）：逐 delta 直发，原行为
                 yield ModelDelta(text=txt, reasoning=(rsn or None))
+                continue
+            if not first_sent:                      # 首增量立即发——首 token 延迟不变
+                first_sent = True
+                yield ModelDelta(text=txt, reasoning=(rsn or None))
+                win_start = time.monotonic()
+                continue
+            buf_txt.append(txt)
+            buf_rsn.append(rsn)
+            buf_chars += len(txt) + len(rsn)
+            if (buf_chars >= coalesce_chars
+                    or (time.monotonic() - win_start) * 1000.0 >= coalesce_ms):
+                yield ModelDelta(text="".join(buf_txt),
+                                 reasoning=("".join(buf_rsn) or None))
+                buf_txt, buf_rsn, buf_chars = [], [], 0
+                win_start = time.monotonic()
 
     def _process_calls(self, msgs: List[Msg], calls: List[Dict[str, Any]], turn: int,
                        first_usage: Optional[Usage] = None

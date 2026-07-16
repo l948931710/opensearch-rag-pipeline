@@ -6,6 +6,8 @@ test_agent_tools_knowledge_search.py — 首工具（Task 13 / 报告 §4）
 伪造 user_dept 参数经 schema additionalProperties:false 被拒（越权护栏）。
 retrieve_and_enrich 以 mock 隔离，不碰真检索。
 """
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -244,13 +246,28 @@ def test_speculative_finalize_observability(monkeypatch):
         assert f1["spec_miss"] is False and f1["spec_wasted_ms"] == 0
         assert isinstance(f1["spec_arms_est"], int) and f1["spec_arms_est"] >= 1
 
-        # 2) 起跑但从未消费（换主题 miss）→ spec_miss + wasted_ms>=0
+        # 2) 起跑但从未消费（换主题 miss）→ spec_miss + wasted_ms=检索**真实耗时**
+        #    （批次 B 口径修正：模拟 run 已跑 100s——wasted 必须取 _fetch_ms 而非整窗）
         miss = SpeculativeSearch(_Q, None, pool)
         miss.start()
-        miss._future.result(timeout=2)             # 等预取完成，wasted 计时确定
+        miss._future.result(timeout=2)             # 等预取完成，_fetch_ms 已回写
+        miss._started_at = time.monotonic() - 100.0
         f2 = miss.finalize()
         assert f2["spec_started"] is True and f2["spec_hit"] is False
-        assert f2["spec_miss"] is True and f2["spec_wasted_ms"] >= 0
+        assert f2["spec_miss"] is True
+        assert f2["spec_wasted_ms"] == miss._fetch_ms and f2["spec_wasted_ms"] < 100_000
+
+        # 2b) 检索仍在途（run 先收尾）→ 退回「起跑至今」在途上界估计
+        gate = threading.Event()
+        monkeypatch.setattr(_RETRIEVE, lambda query, **k: (gate.wait(5), rows)[1])
+        inflight = SpeculativeSearch(_Q, None, pool)
+        inflight.start()
+        inflight._started_at = time.monotonic() - 7.0
+        f2b = inflight.finalize()
+        assert f2b["spec_miss"] is True and f2b["spec_wasted_ms"] >= 7_000
+        gate.set()
+        inflight._future.result(timeout=2)
+        monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
 
         # 3) 从未起跑（submit 被 429 拒）→ 全 False，无浪费
         never = SpeculativeSearch(_Q, None, pool)

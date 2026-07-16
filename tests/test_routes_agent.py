@@ -999,6 +999,16 @@ class _RunCenterStore(_SuspendedStore):
     def list_runs_by_user(self, user_id, *, limit=20):
         return [dict(self.run)] if user_id == self.run["user_id"] else []
 
+    def get_run_status(self, run_id):
+        # perf 批次 B §4.3：与 RDSRunStore.get_run_status 同契约（run 行摘要 + max_step_no）
+        if run_id != self.run["run_id"]:
+            return None
+        return {**{k: self.run.get(k) for k in
+                   ("run_id", "status", "user_id", "started_at", "ended_at", "heartbeat_at",
+                    "turns_used", "tool_calls_used", "tokens_used")},
+                "max_step_no": max((s["step_no"] for s in self.list_steps(run_id)),
+                                   default=None)}
+
     def list_steps(self, run_id, *, limit=200):
         return [{"step_no": 1, "kind": "model_call", "payload": {"turn_index": 0},
                  "tokens_prompt": 10, "tokens_completion": 5, "created_at": None}]
@@ -1063,6 +1073,55 @@ def test_run_center_other_user_404_kb_admin_ok(runcenter_wired):
         mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
         admin = Identity(user_id="admin", acl_groups=["public"], role="employee")
         assert _client(admin).get("/api/agent/runs/r1").status_code == 200
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_run_status_probe_state_key_and_detail_parity(runcenter_wired):
+    """perf 批次 B §4.3：轻量状态探针——state_key 稳定可比、随状态推进而变；
+    detail 响应带**同口径** state_key（前端拉完 detail 直接 seed 比较基准）。"""
+    store, mp = runcenter_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    try:
+        c = _client(_identity())
+        b1 = c.get("/api/agent/runs/r1/status").json()
+        assert b1["run_id"] == "r1" and b1["status"] == "suspended" and b1["state_key"]
+        assert "user_id" not in b1                       # 摘要不回吐归属列
+        # 无变化 → 指纹逐字节稳定（前端「未变即止」的根契约）
+        assert c.get("/api/agent/runs/r1/status").json()["state_key"] == b1["state_key"]
+        # detail 的 state_key 与 /status 同口径（桩 steps 恒 max_step_no=1，两侧一致）
+        assert c.get("/api/agent/runs/r1").json()["state_key"] == b1["state_key"]
+        # 状态推进 → 指纹变化（驱动前端追打 detail）
+        store.run["status"] = "running"
+        assert c.get("/api/agent/runs/r1/status").json()["state_key"] != b1["state_key"]
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_run_status_probe_authz_mirrors_detail(runcenter_wired):
+    """探针门禁与 detail 同口径：他人 404 不可区分；kb_admin 可见；桩无 get_run_status
+    方法 → 404（探针缺席=Not Found，前端自动回退全量 detail 轮询）。"""
+    store, mp = runcenter_wired
+    import opensearch_pipeline.dingtalk_identity as di
+    mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+    try:
+        other = Identity(user_id="u9", acl_groups=["hr"], role="employee")
+        assert _client(other).get("/api/agent/runs/r1/status").status_code == 404
+        assert _client(_identity()).get("/api/agent/runs/nope/status").status_code == 404
+        api.app.dependency_overrides.clear()
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("kb_admin"))
+        admin = Identity(user_id="admin", acl_groups=["public"], role="employee")
+        assert _client(admin).get("/api/agent/runs/r1/status").status_code == 200
+        # 无 get_run_status 的 store（旧桩/降级实现）→ 404
+        api.app.dependency_overrides.clear()
+        mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
+        _saved = _RunCenterStore.__dict__["get_run_status"]
+        delattr(type(store), "get_run_status")
+        try:
+            assert _client(_identity()).get("/api/agent/runs/r1/status").status_code == 404
+        finally:
+            type(store).get_run_status = _saved
     finally:
         api.app.dependency_overrides.clear()
 

@@ -304,6 +304,7 @@ class SpeculativeSearch:
         self._started_at: Optional[float] = None
         self._consumed = False
         self._arms_est = _spec_arms_estimate()
+        self._fetch_ms: Optional[int] = None   # 批次 B 口径修正：真实检索耗时（worker 线程回写）
 
     def start(self) -> None:
         """准入后起跑（幂等；executor 单线程调用）。失败不抛——_future 保持 None，
@@ -311,10 +312,20 @@ class SpeculativeSearch:
         if self._future is not None:
             return
         try:
-            self._future = self._pool.submit(self._fetch, self.question, self._user_dept)
+            self._future = self._pool.submit(self._timed_fetch, self.question, self._user_dept)
             self._started_at = time.monotonic()   # §4.8：真起跑才记时（成功 submit 之后）
         except Exception:   # noqa: BLE001 — 池已关/饱和等：fail-open
             logger.info("投机检索预取起跑失败（回退真检索）", exc_info=True)
+
+    def _timed_fetch(self, question: str, user_dept: Optional[List[str]]):
+        """_fetch + 真实耗时回写（perf 批次 B：spec_wasted_ms 口径修正——miss 浪费的是
+        检索本身烧掉的时间，不是「起跑→run 结束」整窗；run 跑 5 分钟而检索 2s 完成时，
+        浪费=2s 而非 300s。将来命中率意图门控按此口径决策，整窗口径会系统性高估）。"""
+        t0 = time.monotonic()
+        try:
+            return self._fetch(question, user_dept)
+        finally:
+            self._fetch_ms = int((time.monotonic() - t0) * 1000)
 
     @staticmethod
     def _fetch(question: str, user_dept: Optional[List[str]]):
@@ -339,11 +350,17 @@ class SpeculativeSearch:
     def finalize(self) -> Dict[str, Any]:
         """run 末观测汇总（executor finally 以 getattr 保护调用，§4.8）：started/hit/miss/
         wasted_ms/arms_est。绝不抛（观测不得污染 run 收尾）。命中率另有 receipt
-        ['speculative'] 落 tool_invocation，此处补 started/miss/wasted 的 run 级事实。"""
+        ['speculative'] 落 tool_invocation，此处补 started/miss/wasted 的 run 级事实。
+
+        wasted_ms 口径（批次 B 修正）：miss 时=检索**真实耗时**（_timed_fetch 回写）；
+        检索仍在途（run 先结束）时才退回「起跑至今」的在途上界估计。hit 恒 0。"""
         try:
             started = self._started_at is not None
             miss = started and not self._consumed
-            wasted_ms = int((time.monotonic() - self._started_at) * 1000) if miss else 0
+            wasted_ms = 0
+            if miss:
+                wasted_ms = (self._fetch_ms if self._fetch_ms is not None
+                             else int((time.monotonic() - self._started_at) * 1000))
             return {"spec_started": started, "spec_hit": self._consumed, "spec_miss": miss,
                     "spec_wasted_ms": wasted_ms, "spec_arms_est": self._arms_est}
         except Exception:   # noqa: BLE001 — 观测辅助绝不抛

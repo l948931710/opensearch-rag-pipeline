@@ -2,6 +2,7 @@ import { reactive, ref, watch } from 'vue'
 import { ApiError, apiFetch, apiJson } from '@/lib/api'
 import { createSseDecoder, type SseEvent } from '@/lib/sseDecoder'
 import { renderMd, stripImg } from '@/lib/markdown'
+import { newPumpState, renderMdIncr, stripImgIncr, type PumpChState } from '@/lib/mdIncr'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
 import { agentChatBridge, mapSources, mapViewBlocks, useAsk, type AgentMsgMeta, type ChatMessage } from '@/composables/useAsk'
@@ -82,6 +83,20 @@ export interface AgentRunDetail {
   /** U1（schema/036）：succeeded run 经 agent_run.message_id 从 qa_session_log 取回的最终答案；
    *  历史行/留存期外/后端旧版 → null/undefined（前端引导去会话历史）。 */
   final?: AgentRunFinal | null
+  /** perf 批次 B §4.3：服务端状态变更指纹（与 /status 探针同口径；不透明字符串，仅比较）。
+   *  后端旧版无此字段 → 前端退回每拍全量 detail（行为同批次 B 之前）。 */
+  state_key?: string | null
+}
+/** GET /api/agent/runs/{id}/status 轻量探针响应（perf 批次 B §4.3）。 */
+interface AgentRunStatusProbe {
+  run_id: string
+  status: string
+  state_key: string
+  started_at?: string | null
+  ended_at?: string | null
+  turns_used?: number | null
+  tool_calls_used?: number | null
+  tokens_used?: number | null
 }
 
 // ── 展示辞典（组件共用，避免各处漂移）────────────────────────────────────────
@@ -156,6 +171,12 @@ let lastLoadedAt = 0
 const _pollTimers = new Map<string, ReturnType<typeof setTimeout>>()   // 自续 setTimeout 句柄（每 run ≤1）
 const _pollActive = new Set<string>()            // 应继续轮询的 run（与 timer 句柄解耦，避免重复起表/孤儿表）
 const _pollBackoff = new Map<string, number>()   // 每 run 连续网络/5xx 失败次数（成功清零，驱动指数退避）
+// perf 批次 B §6.3：run→聊天消息索引（O(1) 定位，取代每拍全会话×全消息扫描）。session 帧
+// 学到 runId 即注册；LS 恢复等索引缺失场景由 _runMessage 懒回扫回填；reset 全清。
+const _runMsgIndex = new Map<string, ChatMessage>()
+// perf 批次 B §4.3：上次观察到的服务端 state_key（两段式轮询的比较基准；detail 成功时回填，
+// stopRunPolling 清除——手动 refreshRunDetail 恒走全量）。
+const _runStateKeys = new Map<string, string>()
 
 const bridge = agentChatBridge()
 const { asking, draft, messages, conversations, activeId } = useAsk()
@@ -233,12 +254,30 @@ function pushStage(ai: ChatMessage, key: string, label: string): void {
   meta.stages.push({ key, label, at: Date.now() })
 }
 
-// ── 流式渲染（canary 简化版）：raw 累积 + rAF/80ms 节流全量渲染，收尾权威定稿。
-// 不复用 useAsk 的匀速吐字泵（其增量缓存/双节点拆分与 askSeq 深绑）；canary 流量低、
-// 答案短，节流全量渲染足够；无 rAF 环境（测试/SSR）退化为即时渲染。
+// ── 流式渲染（perf 批次 B §6.2）：复用 @/lib/mdIncr 增量内核——每拍只 strip/render 新增
+// 片段（旧「canary 简化版」每 80ms 对全文 renderMd(stripImg)，长答案 O(n²)）。等价性由
+// useAskIncrRender.spec 的「任意前缀 incremental===全量」契约背书；不接 useAsk 的匀速
+// 吐字泵/双节点拆分（与 askSeq 深绑），保持单 ai.html 渲染；收尾仍全量权威定稿。
+// rAF/80ms 节流与无 rAF 环境（测试/SSR）即时渲染的调度行为不变。
+const _agentPumpStates = new WeakMap<ChatMessage, PumpChState>()
+// 轻量渲染埋点（§6.2 要求 render duration / answer length 可观测）：模块内累计，
+// __agentAskTestkit 只读暴露；不上报、不进生产日志。
+const _renderStats = { frames: 0, totalMs: 0, maxMs: 0, lastLen: 0 }
+
+function _agentRenderNow(ai: ChatMessage): void {
+  const t0 = Date.now()
+  let st = _agentPumpStates.get(ai)
+  if (!st) { st = newPumpState(); _agentPumpStates.set(ai, st) }
+  ai.html = renderMdIncr(st, stripImgIncr(st, ai.raw || ''))
+  const d = Date.now() - t0
+  _renderStats.frames += 1
+  _renderStats.totalMs += d
+  if (d > _renderStats.maxMs) _renderStats.maxMs = d
+  _renderStats.lastLen = (ai.raw || '').length
+}
+
 function scheduleAgentRender(ai: ChatMessage, seq: number): void {
-  const renderNow = () => { ai.html = renderMd(stripImg(ai.raw || '')) }
-  if (typeof requestAnimationFrame !== 'function') { renderNow(); return }
+  if (typeof requestAnimationFrame !== 'function') { _agentRenderNow(ai); return }
   if (ai._renderRaf != null) return
   ai._renderRaf = requestAnimationFrame(() => {
     ai._renderRaf = null
@@ -246,7 +285,7 @@ function scheduleAgentRender(ai: ChatMessage, seq: number): void {
     const now = Date.now()
     if (ai._lastRenderTs && now - ai._lastRenderTs < 80) { scheduleAgentRender(ai, seq); return }
     ai._lastRenderTs = now
-    renderNow()
+    _agentRenderNow(ai)
   })
 }
 
@@ -262,6 +301,7 @@ function onAgentEvent(conv: { qaSession: string }, ai: ChatMessage, ev: SseEvent
     case 'session':
       meta.messageId = (ev.message_id as string) || ''
       meta.runId = (ev.run_id as string) || ''
+      if (meta.runId) _runMsgIndex.set(meta.runId, ai)   // §6.3：学到 runId 即注册索引
       if (ev.session_id) conv.qaSession = ev.session_id as string
       pushStage(ai, 'submitted', '已提交')
       // 运行中心列表即时可见（服务端行随后轮询/刷新对齐）
@@ -357,6 +397,7 @@ function finishAgentStream(ai: ChatMessage, seq: number): void {
   abortCtl = null
   const meta = ai.agent as AgentMsgMeta
   if (ai._renderRaf != null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(ai._renderRaf); ai._renderRaf = null }
+  _agentPumpStates.delete(ai)   // 增量状态随定稿退场（下面的全量渲染是权威兜底）
   ai.loading = false
   ai.streaming = false
   bridge.schedulePersist()
@@ -529,8 +570,22 @@ watch(activeId, (id) => { if (agentStreamActive.value && id !== streamConvId) st
 function stopRunPolling(runId: string): void {
   _pollActive.delete(runId)
   _pollBackoff.delete(runId)
+  _runStateKeys.delete(runId)   // 停表即弃比较基准：手动 refreshRunDetail 恒走全量 detail
   const t = _pollTimers.get(runId)
   if (t) { clearTimeout(t); _pollTimers.delete(runId) }
+}
+/** run → 聊天消息 O(1) 定位（perf 批次 B §6.3）：索引命中且 runId 仍对得上直接用；
+ *  缺失/失效（LS 恢复重建了消息对象）→ 一次全扫回填；找不到 → 清索引项。 */
+function _runMessage(runId: string): ChatMessage | null {
+  const hit = _runMsgIndex.get(runId)
+  if (hit && hit.role === 'ai' && hit.agent?.runId === runId) return hit
+  for (const c of conversations.value) {
+    for (const m of c.messages) {
+      if (m.role === 'ai' && m.agent?.runId === runId) { _runMsgIndex.set(runId, m); return m }
+    }
+  }
+  _runMsgIndex.delete(runId)
+  return null
 }
 async function _pollRunOnce(runId: string): Promise<void> {
   const fp = identityFingerprint()
@@ -546,28 +601,48 @@ async function _pollRunOnce(runId: string): Promise<void> {
     }
   }
   try {
+    // 两段式（perf 批次 B §4.3）：已有比较基准 → 先打轻量 /status；state_key 未变且非终态
+    // 即止（服务端 1 次读、前端零写零 persist）。探针任何失败（后端旧版 404 / 网络）→ 照走
+    // detail 全量，错误处理统一归 detail 路径（探针绝不新增失败面）。
+    const cachedKey = _runStateKeys.get(runId)
+    if (cachedKey) {
+      let probe: AgentRunStatusProbe | null = null
+      try {
+        probe = await apiJson<AgentRunStatusProbe>(
+          `/api/agent/runs/${encodeURIComponent(runId)}/status`, { auth: true })
+      } catch { probe = null }
+      if (fp !== identityFingerprint()) { stopRunPolling(runId); return }
+      if (probe && probe.state_key === cachedKey && !RUN_TERMINAL.has(probe.status || '')) {
+        _pollBackoff.delete(runId)   // 探针成功=链路通（清退避/清错误横幅），状态未变本拍结束
+        if (runDetailErrors.value[runId]) { const n = { ...runDetailErrors.value }; delete n[runId]; runDetailErrors.value = n }
+        return
+      }
+    }
     const d = await apiJson<AgentRunDetail>(`/api/agent/runs/${encodeURIComponent(runId)}`, { auth: true })
     if (fp !== identityFingerprint()) { stopRunPolling(runId); return }
     if (runDetailErrors.value[runId]) { const n = { ...runDetailErrors.value }; delete n[runId]; runDetailErrors.value = n }
     _pollBackoff.delete(runId)   // 成功一次即清退避（下拍恢复正常节拍）
+    if (typeof d.state_key === 'string' && d.state_key) _runStateKeys.set(runId, d.state_key)
     runDetails.value = { ...runDetails.value, [runId]: d }
     const st = d?.run?.status || ''
     // 列表行对齐
     const i = runs.value.findIndex((r) => r.run_id === runId)
     if (i >= 0) runs.value.splice(i, 1, { ...runs.value[i], ...d.run })
-    // 聊天消息回写（挂起卡/断流卡不依赖原 SSE 更新；审批通过→执行→回执全程可见）
-    for (const c of conversations.value) {
-      for (const m of c.messages) {
-        if (m.role === 'ai' && m.agent?.runId === runId) {
-          m.agent.status = st
-          if (RUN_TERMINAL.has(st)) {
-            m.agent.disconnected = false
-            if (st === 'succeeded' && !m.messageId && m.agent.messageId) m.messageId = m.agent.messageId
-          }
+    // 聊天消息回写（挂起卡/断流卡不依赖原 SSE 更新；审批通过→执行→回执全程可见）。
+    // §6.3：O(1) 索引定位 + 变更才 persist（此前每拍无条件 schedulePersist → 全量写 LS）。
+    const msg = _runMessage(runId)
+    let msgChanged = false
+    if (msg && msg.agent) {
+      if (msg.agent.status !== st) { msg.agent.status = st; msgChanged = true }
+      if (RUN_TERMINAL.has(st)) {
+        if (msg.agent.disconnected) { msg.agent.disconnected = false; msgChanged = true }
+        if (st === 'succeeded' && !msg.messageId && msg.agent.messageId) {
+          msg.messageId = msg.agent.messageId
+          msgChanged = true
         }
       }
     }
-    bridge.schedulePersist()
+    if (msgChanged) bridge.schedulePersist()
     if (RUN_TERMINAL.has(st)) stopRunPolling(runId)
   } catch (e) {
     if (fp !== identityFingerprint()) { stopRunPolling(runId); return }
@@ -645,7 +720,21 @@ async function _tick(runId: string): Promise<void> {
     _scheduleNext(runId)
   }
 }
-/** 确保某 run 在轮询（终态自动停；隐藏页暂停；suspended 慢拍；网络失败指数退避）。
+// perf 批次 B（批次 A 复核微改进①）：隐藏页恢复可见时立即补拍——不等下一拍（suspended
+// 慢拍最长 45s、叠加退避可到分钟级）。清掉待发 timer 后直接 _tick（其 finally 会重排下一拍，
+// pollTimerCount 每 run 仍恒 ≤1）；模块单例、document 同生命周期，监听器不摘除。
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return
+    for (const runId of Array.from(_pollActive)) {
+      const t = _pollTimers.get(runId)
+      if (t) { clearTimeout(t); _pollTimers.delete(runId) }
+      void _tick(runId)
+    }
+  })
+}
+/** 确保某 run 在轮询（终态自动停；隐藏页暂停、恢复可见立即补拍；suspended 慢拍；
+ *  网络失败指数退避；state_key 未变的拍只打轻量 /status）。
  *  挂起卡挂载/断流/运行中心聚焦时调用。 */
 function ensureRunPolling(runId: string): void {
   if (!runId) return
@@ -750,6 +839,8 @@ function _resetAgentAskState(changedUser: boolean): void {
   _pollTimers.clear()
   _pollActive.clear()
   _pollBackoff.clear()
+  _runMsgIndex.clear()
+  _runStateKeys.clear()
   if (changedUser) {
     agentMode.value = false
     try { localStorage.removeItem(LS_MODE_KEY) } catch { /* noop */ }
@@ -771,5 +862,8 @@ export function __agentAskTestkit() {
   return {
     setPollMs(ms?: number) { _pollMs = ms ?? 5_000 },
     pollTimerCount(): number { return _pollTimers.size },
+    // perf 批次 B：run→消息索引规模（O(1) 定位断言）+ 渲染埋点只读（§6.2 render duration）
+    runIndexSize(): number { return _runMsgIndex.size },
+    renderStats() { return { ..._renderStats } },
   }
 }

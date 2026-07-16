@@ -584,3 +584,124 @@ describe('批次β F3 — 运行详情失败态与预览 mock', () => {
     expect(a.agentRunDetails.value['run_demo1']?.final).toBeNull()
   })
 })
+
+describe('perf 批次 B — 两段式轮询 / run 索引 / 增量渲染', () => {
+  function suspendChunks() {
+    return [
+      frame({ type: 'session', session_id: 's2', message_id: 'm2', run_id: 'r2' }),
+      frame({ type: 'chunk', content: '需要写回 U8。' }),
+      frame({ type: 'approval', approval_request_id: 'ap9', checkpoint_id: 'ck1', pending_call: { call_id: 'c9', tool_name: 'u8_writeback', arguments: { qty: 120 } } }),
+      DONE,
+    ]
+  }
+
+  it('state_key 未变 → 之后的拍只打 /status（零 detail、零 persist）；变化 → 追打 detail 并终态停', async () => {
+    __agentAskTestkit().setPollMs(15)
+    let detailCalls = 0
+    let statusCalls = 0
+    let key = 'k1'
+    let phase: 'suspended' | 'succeeded' = 'suspended'
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      const p = String(path)
+      if (p === '/api/agent/ask') return streamResp(suspendChunks())
+      if (p.startsWith('/api/agent/runs/') && p.endsWith('/status')) {
+        statusCalls++
+        return jsonResp({ run_id: 'r2', status: phase, state_key: key })
+      }
+      if (p.startsWith('/api/agent/runs/')) {
+        detailCalls++
+        return jsonResp({ ...runDetail(phase), state_key: key })
+      }
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const a = useAgentAsk()
+    await a.askAgent('写回并挂起')
+    expect(__agentAskTestkit().runIndexSize()).toBe(1)   // session 帧注册 run→消息索引
+    await waitFor(() => detailCalls >= 1)                // 首拍全量 detail（seed state_key 基准）
+    const seeded = detailCalls
+    await new Promise((r) => setTimeout(r, 450))         // 放掉 ask/finishStream 的 400ms persist 债
+    const snapA = localStorage.getItem('fl-conversations') || ''
+    expect(snapA).toContain('"suspended"')               // ask 期 persist 已落（观察基线）
+    const s0 = statusCalls
+    await waitFor(() => statusCalls >= s0 + 2)           // 其后的拍全走探针
+    expect(detailCalls).toBe(seeded)                     // 未变化：一次 detail 都不多打
+    await new Promise((r) => setTimeout(r, 450))         // 覆盖 persist debounce 窗口
+    expect(localStorage.getItem('fl-conversations')).toBe(snapA)   // 零 persist：LS 原封不动
+
+    key = 'k2'; phase = 'succeeded'                      // 服务端推进 → 指纹变化 → 追打 detail
+    await waitFor(() => useAsk().messages.value[1].agent?.status === 'succeeded')
+    expect(detailCalls).toBeGreaterThan(seeded)
+    expect(useAsk().messages.value[1].messageId).toBe('m2')   // 终态提升 messageId（回写走索引路径）
+    await waitFor(() => __agentAskTestkit().pollTimerCount() === 0)   // 终态停表
+    await new Promise((r) => setTimeout(r, 450))         // 等 400ms persist debounce 真落盘
+    // 变化才 persist：终态状态已写进 LS（messageId 提升 + status=succeeded）
+    expect(String(localStorage.getItem('fl-conversations'))).toContain('"status":"succeeded"')
+  })
+
+  it('后端旧版（detail 无 state_key / 探针 404）→ 恒走全量 detail（行为同批次 B 之前）', async () => {
+    __agentAskTestkit().setPollMs(15)
+    let detailCalls = 0
+    let statusCalls = 0
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      const p = String(path)
+      if (p === '/api/agent/ask') return streamResp(suspendChunks())
+      if (p.startsWith('/api/agent/runs/') && p.endsWith('/status')) {
+        statusCalls++
+        return jsonResp({ detail: 'Not Found' }, { ok: false, status: 404 })
+      }
+      if (p.startsWith('/api/agent/runs/')) {
+        detailCalls++
+        return jsonResp(runDetail('suspended'))          // 无 state_key → 不 seed 基准
+      }
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const a = useAgentAsk()
+    await a.askAgent('写回并挂起')
+    await waitFor(() => detailCalls >= 3)                // 每拍都是全量 detail
+    expect(statusCalls).toBe(0)                          // 无基准 → 探针从不出手
+  })
+
+  it('增量渲染（§6.2）：无 rAF 环境逐 chunk 即时渲染，输出与全量一致，renderStats 记帧', async () => {
+    const origRaf = globalThis.requestAnimationFrame
+    vi.stubGlobal('requestAnimationFrame', undefined)
+    try {
+      const before = __agentAskTestkit().renderStats().frames
+      const chunks = [
+        frame({ type: 'session', session_id: 's1', message_id: 'm1', run_id: 'r1' }),
+        frame({ type: 'chunk', content: '# 标题\n' }),
+        frame({ type: 'chunk', content: '正文 **加粗**' }),
+        frame({ type: 'done', usage: {} }),
+        DONE,
+      ]
+      vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+        if (String(path) === '/api/agent/ask') return streamResp(chunks)
+        if (String(path).startsWith('/api/agent/runs/')) return jsonResp(runDetail('succeeded'))
+        return jsonResp({}, { ok: false, status: 404 })
+      }))
+      const { askAgent } = useAgentAsk()
+      await askAgent('渲染测试')
+      const ai = useAsk().messages.value[1]
+      expect(ai.html).toContain('<h3>标题</h3>')   // renderMd 白名单把 # 映射为 h3（既有口径）
+      expect(ai.html).toContain('<strong>加粗</strong>')
+      const stats = __agentAskTestkit().renderStats()
+      expect(stats.frames).toBeGreaterThan(before)       // 增量路径真被走到
+      expect(stats.lastLen).toBeGreaterThan(0)
+    } finally {
+      vi.stubGlobal('requestAnimationFrame', origRaf)
+    }
+  })
+
+  it('身份重置清空 run 索引与 state_key 基准', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (path: string) => {
+      if (String(path) === '/api/agent/ask') return streamResp(suspendChunks())
+      if (String(path).startsWith('/api/agent/runs/')) return jsonResp(runDetail('suspended'))
+      return jsonResp({}, { ok: false, status: 404 })
+    }))
+    const a = useAgentAsk()
+    await a.askAgent('写回并挂起')
+    expect(__agentAskTestkit().runIndexSize()).toBe(1)
+    __resetAgentAsk()
+    expect(__agentAskTestkit().runIndexSize()).toBe(0)
+    expect(__agentAskTestkit().pollTimerCount()).toBe(0)
+  })
+})

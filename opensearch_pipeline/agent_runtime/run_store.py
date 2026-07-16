@@ -386,13 +386,16 @@ class RDSRunStore:
 
     def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         # message_id 列 = schema/036（U1/U2 答案读回 + 续跑反馈锚定）——先 apply 后部署纪律
+        # heartbeat_at/turns_used/tool_calls_used/tokens_used：perf 批次 B §4.3——detail 端点
+        # 用它们合成 state_key（与 /status 同口径），同行读取零额外成本
         db = _op_db()
         conn = self._conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT run_id, status, user_id, channel, agent_profile, started_at, ended_at, "
-                    f"thread_id, conversation_id, model_profile, message_id "
+                    f"thread_id, conversation_id, model_profile, message_id, "
+                    f"heartbeat_at, turns_used, tool_calls_used, tokens_used "
                     f"FROM {db}.agent_run WHERE run_id=%s",
                     (run_id,),
                 )
@@ -402,7 +405,32 @@ class RDSRunStore:
             return {"run_id": row[0], "status": row[1], "user_id": row[2], "channel": row[3],
                     "agent_profile": row[4], "started_at": row[5], "ended_at": row[6],
                     "thread_id": row[7], "conversation_id": row[8], "model_profile": row[9],
-                    "message_id": row[10]}
+                    "message_id": row[10], "heartbeat_at": row[11], "turns_used": row[12],
+                    "tool_calls_used": row[13], "tokens_used": row[14]}
+        finally:
+            conn.close()
+
+    def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """轻量状态摘要（perf 批次 B §4.3）：/api/agent/runs/{id}/status 专用——单次往返
+        （agent_run 行 + MAX(step_no) 关联子查询走 (run_id,step_no) PK 前缀），供前端两段式
+        轮询先比 state_key、未变化即止，取代每拍 4-5 次读的 detail 全量。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT r.run_id, r.status, r.user_id, r.started_at, r.ended_at, "
+                    f"r.heartbeat_at, r.turns_used, r.tool_calls_used, r.tokens_used, "
+                    f"(SELECT MAX(s.step_no) FROM {db}.agent_step s WHERE s.run_id=r.run_id) "
+                    f"FROM {db}.agent_run r WHERE r.run_id=%s",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            return {"run_id": row[0], "status": row[1], "user_id": row[2], "started_at": row[3],
+                    "ended_at": row[4], "heartbeat_at": row[5], "turns_used": row[6],
+                    "tool_calls_used": row[7], "tokens_used": row[8], "max_step_no": row[9]}
         finally:
             conn.close()
 

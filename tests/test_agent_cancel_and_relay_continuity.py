@@ -277,3 +277,35 @@ def test_sse_disconnect_records_time_not_cancel():
     gen.close()                                      # 模拟客户端断连（GeneratorExit）
     assert h.cancelled() is False
     assert getattr(h, "_client_disconnected_at", None) is not None
+
+
+# ═══════════════════════════════════════════════════════════════
+# perf 批次 B §4.4：EXPIRE 降频——delta 帧不逐帧续期（XADD 照发帧帧不丢）
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_relay_expire_throttled_to_non_delta_frames(relay_env):
+    """model_delta 是帧量大头：仅首帧续期一次；控制帧（tool/终态/__end__，低频）照旧
+    逐帧续期——TTL 语义≈「自最后一个控制帧起」，与旧行为在真实 run 形态下等效。"""
+    from opensearch_pipeline.agent_runtime.event_relay import _RedisRelay
+    fake = relay_env
+    n_expire = {"n": 0}
+    _orig_expire = fake.expire
+
+    def _counting_expire(key, ttl):
+        n_expire["n"] += 1
+        return _orig_expire(key, ttl)
+
+    fake.expire = _counting_expire
+    relay = _RedisRelay("rx-expire-1")
+    relay._xadd({"type": "model_delta", "text": "a"})   # 首帧 → 续期
+    relay._xadd({"type": "model_delta", "text": "b"})   # delta → 不续期
+    relay._xadd({"type": "model_delta", "text": "c"})   # delta → 不续期
+    relay._xadd({"type": "tool_result"})                # 控制帧 → 续期
+    relay._xadd({"type": "model_delta", "text": "d"})   # delta → 不续期
+    relay._xadd({"type": "run_completed"})              # 终态 → 续期
+    relay.end()                                         # __end__ → 续期
+    key = [k for k in fake.streams if "rx-expire-1" in k][0]
+    assert len(fake.streams[key]) == 7                  # XADD 每帧照发（零丢帧）
+    assert n_expire["n"] == 4                           # 首帧 + tool_result + 终态 + __end__
+    assert fake.ttls.get(key) is not None               # TTL 始终在

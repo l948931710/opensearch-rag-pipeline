@@ -136,6 +136,14 @@ def test_full_run_persists_rows_with_run_id(monkeypatch):
             cur.execute("SELECT COUNT(*) FROM llm_call_log WHERE run_id=%s AND status='ok'", (run_id,))
             n_llm = cur.fetchone()[0]
             assert n_llm >= 1, "llm_call_log 应带正确 run_id（executor 就地回填 run_id 回归守护）"
+
+            # perf 批次 B §4.3：get_run_status 真库单查与全量行一致（状态/预算/max_step_no）
+            st = run_store.get_run_status(run_id)
+            assert st["status"] == "succeeded" and st["user_id"] == "e2e-tester"
+            assert st["turns_used"] == 2 and st["tool_calls_used"] == 1
+            cur.execute("SELECT MAX(step_no) FROM agent_step WHERE run_id=%s", (run_id,))
+            assert st["max_step_no"] == cur.fetchone()[0]
+            assert run_store.get_run_status("run-不存在") is None
     finally:
         # 清理本 run 所有测试行，保持本地库干净
         with conn.cursor() as cur:
