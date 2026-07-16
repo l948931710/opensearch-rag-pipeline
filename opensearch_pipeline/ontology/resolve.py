@@ -281,7 +281,7 @@ def may_auto_activate(candidates: Sequence[Candidate], *, intent: str, namespace
     """闸 0（P0-07 硬关 + 输入/环境绑定）+ 三禁 + 唯一性：auto ack 缺失/绑定不符恒否
     （候选-only 默认）· write 意图恒否 · embedding 恒否 · 多候选（不同目标且 ≥ 各自
     τ_low）恒否；Top 候选 ≥ τ_high 且非 embedding 且目标唯一 → 返回该候选（调用方
-    落库时标 confirmed_by='auto' 并入抽检队列）。仅播种/回填等离线路径调用；τ 走
+    落库时标 confirmed_by='auto'；抽检复核闭环未建——批次3b）。仅播种/回填等离线路径调用；τ 走
     strict 校验（非法配置 raise 阻断写 worker，绝不回落可 auto 的默认值）。
     source_fingerprint=本轮实读快照的 sha256（seeding.source_fingerprint 实算）——
     manifest 绑定校验用；给不出即 auto 恒关（重审计 §2）。"""

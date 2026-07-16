@@ -289,8 +289,10 @@ def test_deactivate_identifier(store):
                   json={"note": "误配"}).status_code == 200
     assert store.get_active_identifier("u8", "Z1") is None
     assert store.audits[-1]["decision"] == "deactivate"
-    assert c.post(f"/api/ontology/identifiers/{iid}/deactivate", json={}).status_code == 409
-    assert c.post("/api/ontology/identifiers/none/deactivate", json={}).status_code == 404
+    assert c.post(f"/api/ontology/identifiers/{iid}/deactivate",
+                  json={"note": "再停一次"}).status_code == 409
+    assert c.post("/api/ontology/identifiers/none/deactivate",
+                  json={"note": "x"}).status_code == 404
 
 
 def test_repoint_identifier(store):
@@ -299,7 +301,8 @@ def test_repoint_identifier(store):
     iid = store.insert_identifier("u8", "p1", "P1", a["object_id"], method="seed", _caller="test")
     c = _client(_identity())
     r = c.post(f"/api/ontology/identifiers/{iid}/repoint",
-               json={"target_object_id": b["object_id"], "target_revision": "r2"})
+               json={"target_object_id": b["object_id"], "target_revision": "r2",
+                     "note": "改指正主"})
     assert r.status_code == 200
     new_id = r.json()["new_identifier_id"]
     active = store.get_active_identifier("u8", "P1")
@@ -307,13 +310,13 @@ def test_repoint_identifier(store):
     assert active["target_object_id"] == b["object_id"]
     assert store.audits[-1]["decision"] == "repoint"
     assert store.audits[-1]["detail"]["old_target"] == a["object_id"]
-    # 已 superseded 再改指 → 409；坏目标 → 404
+    # 已 superseded 再改指 → 409；坏目标 → 404（422=ULID 校验先于 note 检查）
     assert c.post(f"/api/ontology/identifiers/{iid}/repoint",
-                  json={"target_object_id": a["object_id"]}).status_code == 409
+                  json={"target_object_id": a["object_id"], "note": "再改"}).status_code == 409
     assert c.post(f"/api/ontology/identifiers/{new_id}/repoint",
                   json={"target_object_id": "nope"}).status_code == 422
     assert c.post(f"/api/ontology/identifiers/{iid}/repoint",
-                  json={"target_object_id": "0" * 26}).status_code == 404
+                  json={"target_object_id": "0" * 26, "note": "x"}).status_code == 404
 
 
 def test_identifier_scope_authz_uses_object_type(store):
@@ -323,7 +326,7 @@ def test_identifier_scope_authz_uses_object_type(store):
                                   mat["object_id"], method="seed", _caller="test")
     supply_admin = _client(_identity(user_id="s1", role="dept_admin", managed=("supply",)))
     assert supply_admin.post(f"/api/ontology/identifiers/{iid}/deactivate",
-                             json={}).status_code == 200
+                             json={"note": "scope 内治理"}).status_code == 200
     # P0-04 后：403（steward 不符）只在旧目标**可读**时可达——用 public 对象保住本测试
     # 的 steward 路由语义；不可读旧目标 → 404（见 test_deactivate_repoint_check_old_target_visibility）
     mat2 = store.mint_object("material", "PP-2200", owner_dept="supply",
@@ -332,7 +335,7 @@ def test_identifier_scope_authz_uses_object_type(store):
                                    mat2["object_id"], method="seed", _caller="test")
     pmc_admin = _client(_identity(user_id="p1", role="dept_admin", managed=("pmc",)))
     assert pmc_admin.post(f"/api/ontology/identifiers/{iid2}/deactivate",
-                          json={}).status_code == 403
+                          json={"note": "越 scope 尝试"}).status_code == 403
 
 
 def test_retire_and_mark_duplicate(store):
@@ -340,12 +343,12 @@ def test_retire_and_mark_duplicate(store):
     b = store.mint_object("product", "正主B", owner_dept="pmc", _caller="test")
     c = _client(_identity())
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
-                  json={"merged_into": b["object_id"]}).status_code == 200
+                  json={"merged_into": b["object_id"], "note": "同物"}).status_code == 200
     assert store.get_object(a["object_id"])["merged_into"] == b["object_id"]
     assert store.audits[-1]["decision"] == "mark_duplicate"
     # 已 merged 再 retire → 409（CAS 只认 active）
     assert c.post(f"/api/ontology/objects/{a['object_id']}/retire",
-                  json={}).status_code == 409
+                  json={"note": "再退"}).status_code == 409
     assert c.post(f"/api/ontology/objects/{b['object_id']}/retire",
                   json={"note": "停产"}).status_code == 200
     assert store.get_object(b["object_id"])["status"] == "retired"
@@ -357,13 +360,37 @@ def test_mark_duplicate_validation(store):
     store.retire_object(b["object_id"])
     c = _client(_identity())
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
-                  json={"merged_into": a["object_id"]}).status_code == 400   # 自指
+                  json={"merged_into": a["object_id"], "note": "n"}).status_code == 400   # 自指
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
                   json={"merged_into": "nope"}).status_code == 422
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
-                  json={"merged_into": "0" * 26}).status_code == 404
+                  json={"merged_into": "0" * 26, "note": "n"}).status_code == 404
     assert c.post(f"/api/ontology/objects/{a['object_id']}/mark-duplicate",
-                  json={"merged_into": b["object_id"]}).status_code == 409   # 目标非 active
+                  json={"merged_into": b["object_id"], "note": "n"}).status_code == 409   # 目标非 active
+
+
+def test_correction_routes_require_note(store):
+    """批次3a（P0-04）：四个纠错路由与 confirm/dismiss 同纪律——note 缺失/空白 → 400，
+    且不触达任何状态变更（400 先于存在性/授权判定，响应统一不泄露存在性）。"""
+    obj = store.mint_object("product", "需理由", owner_dept="pmc", _caller="test")
+    other = store.mint_object("product", "正主", owner_dept="pmc", _caller="test")
+    iid = store.insert_identifier("u8", "n1", "N1", obj["object_id"],
+                                  method="seed", _caller="test")
+    c = _client(_identity())
+    for path, payload in [
+        (f"/api/ontology/identifiers/{iid}/deactivate", {}),
+        (f"/api/ontology/identifiers/{iid}/deactivate", {"note": "  "}),
+        (f"/api/ontology/identifiers/{iid}/repoint",
+         {"target_object_id": other["object_id"]}),
+        (f"/api/ontology/objects/{obj['object_id']}/retire", {}),
+        (f"/api/ontology/objects/{obj['object_id']}/mark-duplicate",
+         {"merged_into": other["object_id"]}),
+        ("/api/ontology/identifiers/none-such/deactivate", {}),   # 不存在同答 400（不泄露）
+    ]:
+        r = c.post(path, json=payload)
+        assert r.status_code == 400 and "note" in r.json()["detail"], path
+    assert store.get_active_identifier("u8", "N1") is not None    # 状态未被动过
+    assert store.get_object(obj["object_id"])["status"] == "active"
 
 
 # ── PR-B（P0-01）：对象级 ACL / 存在性不可泄露矩阵 ─────────────────────────────
@@ -437,7 +464,7 @@ def test_repoint_cross_type_denied(store):
     m = store.mint_object("material", "PP料", owner_dept="pmc", _caller="test")
     iid = store.insert_identifier("u8", "z9", "Z9", a["object_id"], method="seed", _caller="test")
     r = _client(_identity()).post(f"/api/ontology/identifiers/{iid}/repoint",
-                                  json={"target_object_id": m["object_id"]})
+                                  json={"target_object_id": m["object_id"], "note": "跨类型"})
     assert r.status_code == 400 and "类型" in r.json()["detail"]
     assert store.get_active_identifier("u8", "Z9")["target_object_id"] == a["object_id"]
 
@@ -461,7 +488,7 @@ def test_workbench_audit_fail_closed_zero_side_effects(store):
     assert r.status_code == 500
     assert store.get_case(case_id)["status"] == "open"
     assert store.get_active_identifier("u8", "ABC123-M") is None
-    r2 = c.post(f"/api/ontology/objects/{obj['object_id']}/retire", json={})
+    r2 = c.post(f"/api/ontology/objects/{obj['object_id']}/retire", json={"note": "退役"})
     assert r2.status_code == 500
     assert store.get_object(obj["object_id"])["status"] == "active"
     assert store.audit_rows == []
@@ -607,7 +634,8 @@ def test_deactivate_repoint_check_old_target_visibility(store):
                           json={"note": "越权尝试"}).status_code == 404
     tgt = store.mint_object("product", "杯B", owner_dept="pmc", _caller="test")
     assert pmc_admin.post(f"/api/ontology/identifiers/{iid}/repoint",
-                          json={"target_object_id": tgt["object_id"]}).status_code == 404
+                          json={"target_object_id": tgt["object_id"],
+                                "note": "越权改指"}).status_code == 404
     assert store.get_active_identifier("u8", "S1") is not None   # 身份映射未被动过
     api.app.dependency_overrides.clear()
     kb = _client(_identity())

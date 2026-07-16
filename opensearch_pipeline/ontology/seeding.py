@@ -13,7 +13,7 @@ seeding.py — 从源系统快照播种 canonical 对象与别名（P0 PR5；离
   这就是"同物多货号"的愈合路径）；任一共有属性冲突 conf=0.80（压进 HITL 区间）；
 - **auto 资格判定唯一入口 = resolve.may_auto_activate**（三禁共享，播种不得自铸第二套判定）；
 - **无任何候选**：主数据语义（mint_new=True，播种默认）→ 铸新对象 + canonical 别名
-  （标 confirmed_by='auto' 入抽检）——方向刻意保守：标题微差会多铸重复品（宁多建，
+  （标 confirmed_by='auto'——抽检复核闭环未建，见批次3b）——方向刻意保守：标题微差会多铸重复品（宁多建，
   steward 用 mark_duplicate 纠错），绝不静默合并；观测语义（mint_new=False，回填默认）
   → **不铸对象**，入 resolution_case 聚合观测（脏观测无铸对象权，防重复品繁殖）；
 - **低置信/多候选一律入 case，不铸新对象**（防"U8 货号逐条建品"式重复品繁殖）。

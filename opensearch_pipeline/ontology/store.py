@@ -1513,7 +1513,9 @@ class RDSOntologyStore:
     def coverage(self, object_type: Optional[str] = None) -> Dict[str, Any]:
         """覆盖率双口径（PR-F）：有源快照 → population 分母（真实覆盖率）；
         无 → active/(active+open) 近似并明标 denominator='approx'（处置率≠覆盖率）。
-        auto_active 单列（抽检队列规模）；人工审核率 = 1 - auto/active。"""
+        auto_active 单列 = auto 通道确认数（批次3a 口径诚实化：抽检复核数据模型未建，
+        它不是「抽检队列规模」；manual_review_rate=1-auto/active 只是**非 auto 来源
+        占比**、不是审核完成率——真实抽检闭环待批次3b）。"""
         db, conn = self._db(), self._conn()
         try:
             with conn.cursor() as cur:

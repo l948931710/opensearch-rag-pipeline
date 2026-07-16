@@ -166,7 +166,7 @@ async function onDismiss(kase: OntologyCase) {
       <div class="rounded-xl border border-border bg-card px-4 py-3">
         <div class="text-[11px] font-medium text-muted-foreground">已确认别名</div>
         <div class="mt-1 text-xl font-bold text-foreground">{{ ontologyCoverage.active_identifiers }}</div>
-        <div class="mt-0.5 text-[11px] text-faint">auto {{ ontologyCoverage.auto_active }}（抽检面）</div>
+        <div class="mt-0.5 text-[11px] text-faint">auto {{ ontologyCoverage.auto_active }}（未复核）</div>
       </div>
       <div class="rounded-xl border border-border bg-card px-4 py-3">
         <div class="text-[11px] font-medium text-muted-foreground">消解覆盖率</div>
@@ -347,7 +347,7 @@ async function onDismiss(kase: OntologyCase) {
     </div>
 
     <p class="ml-0.5 text-[11.5px] text-faint">
-      确认=铸正式别名（同编号至多一条现行映射，可在对象详情里纠错改指）；确认与驳回都必须留理由；auto 通道确认的映射会进抽检队列复核。
+      确认=铸正式别名（同编号至多一条现行映射）；确认与驳回都必须留理由；已铸映射的纠错（改指/停用）暂需管理员经后台 API 处理；auto 通道确认数当前仅为占比指标，抽检复核闭环未上线。
     </p>
   </section>
 </template>

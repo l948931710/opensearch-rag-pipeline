@@ -314,7 +314,10 @@ def ontology_coverage(request: Request, object_type: Optional[str] = None,
     _require_reader(identity)
     cov = _get_store().coverage(object_type=object_type)
     active, auto = cov["active_identifiers"], cov["auto_active"]
-    cov["manual_review_rate"] = (1 - auto / active) if active else None   # 人工审核率（S9）
+    # 批次3a 口径诚实化（P0-04）：本值实为**非 auto 来源占比**（1 - auto/active），不是
+    # 审核完成率——auto 映射的抽检数据模型（review_status 等）未建（批次3b）。字段名保留
+    # 兼容既有前端/看板消费者，勿按「人工已复核比例」解读。
+    cov["manual_review_rate"] = (1 - auto / active) if active else None
     return cov
 
 
@@ -471,8 +474,11 @@ def ontology_case_confirm(case_id: str, req: ConfirmRequest, request: Request,
                         "target_revision": req.target_revision,
                         "note": (req.note or "")[:200]}))
     except DuplicateActiveIdentifier:
+        # 批次3a 文案诚实化（P0-04）：改指/停用入口尚无 UI（对象详情页未建），不再指路
+        # 不存在的页面——纠错走后台 API（identifiers/{id}/deactivate|repoint）或联系 kb_admin。
         raise HTTPException(status_code=409,
-                            detail="该编号已有正式映射——请先在对象详情里纠错（改指/退役）")
+                            detail="该编号已有正式映射——请先停用/改指既有映射"
+                                   "（暂需管理员经后台 API 处理）")
     except ValueError:
         raise HTTPException(status_code=409, detail="case 已被并发处置（本次确认未生效）")
     return {"case_id": case_id, "status": "resolved", "identifier_id": identifier_id}
@@ -609,6 +615,11 @@ def ontology_identifier_deactivate(identifier_id: str, req: NoteRequest, request
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     _check_fields(notes={"note": req.note})
+    # 批次3a（P0-04）：破坏性纠错与 confirm/dismiss 同纪律——理由必填（此前四个纠错
+    # 路由 note 可空，破坏性最强的动作反而无审计凭据）。400 先于存在性判定：有无 note
+    # 与目标存在与否无关，统一 400 不泄露存在性。
+    if not (req.note or "").strip():
+        raise HTTPException(status_code=400, detail="deactivate 必须填写理由（note）")
     store = _get_store()
     row, old_obj, steward = _load_identifier_scope(store, identifier_id)
     # P0-04：先旧目标可见性（404 防存在性泄露），再 steward 授权（403）
@@ -639,6 +650,8 @@ def ontology_identifier_repoint(identifier_id: str, req: RepointRequest, request
     kb = _require_reader(identity)
     _check_fields(ulid={"target_object_id": req.target_object_id},
                   revision=req.target_revision, notes={"note": req.note})
+    if not (req.note or "").strip():   # 批次3a：改指重写身份指向，理由必填（同 confirm 纪律）
+        raise HTTPException(status_code=400, detail="repoint 必须填写理由（note）")
     store = _get_store()
     row, old_obj, steward = _load_identifier_scope(store, identifier_id)
     # P0-04：旧目标可见性闸（steward scope 与 owner_dept 正交——scope 命中 ≠ 旧目标可读）
@@ -675,6 +688,8 @@ def ontology_object_retire(object_id: str, req: NoteRequest, request: Request,
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     _check_fields(notes={"note": req.note})
+    if not (req.note or "").strip():   # 批次3a：退役级联停用其 identifiers，理由必填
+        raise HTTPException(status_code=400, detail="retire 必须填写理由（note）")
     store = _get_store()
     obj = store.get_object(object_id)
     from opensearch_pipeline.ontology.authz import can_read_object
@@ -707,6 +722,8 @@ def ontology_object_mark_duplicate(object_id: str, req: MarkDuplicateRequest, re
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
     kb = _require_reader(identity)
     _check_fields(ulid={"merged_into": req.merged_into}, notes={"note": req.note})
+    if not (req.note or "").strip():   # 批次3a：标记重复改写身份归并，理由必填
+        raise HTTPException(status_code=400, detail="mark-duplicate 必须填写理由（note）")
     store = _get_store()
     obj = store.get_object(object_id)
     from opensearch_pipeline.ontology.authz import can_mutate_identity, can_read_object
