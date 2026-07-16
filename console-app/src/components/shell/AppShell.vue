@@ -12,7 +12,8 @@ import { useAsk } from '@/composables/useAsk'
 // 侧栏在边界外，永远可用（切路由/切会话即 resetSignal 变化 → 自愈重渲）。
 const route = useRoute()
 const { activeId } = useAsk()
-const resetSignal = computed(() => route.fullPath + '::' + activeId.value)
+// route.path(非 fullPath)：切路由 / 切会话才重置错误边界;同页 query 抖动(tab/搜索/筛选)不应触发。
+const resetSignal = computed(() => route.path + '::' + activeId.value)
 </script>
 
 <template>
