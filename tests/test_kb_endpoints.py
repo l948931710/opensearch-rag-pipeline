@@ -1827,11 +1827,13 @@ def test_stats_owner_depts_facet_and_chunk_status_badge(monkeypatch):
     """stats 返回全作用域 owner_depts（去重排序）；0-chunk 文档经 chunk_status 归『未入索引』。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    # 主查询 6 列：status, cps, ixs, pubs, chunk_status, owner_dept
+    # perf 2026-07-16：主查询改服务端 GROUP BY，4 列：status, badge(SQL CASE), owner_dept, n。
+    # 徽章判定（含 chunk_status→未入索引）由 _KB_BADGE_CASE_SQL 计算——其与 Python 版的
+    # 同义性另由 test_kb_badge_case_sql_parity 钉死，此处只验分桶聚合与出参。
     rows = [
-        ("active", "DONE", "SUCCESS", None, "DONE", "marketing"),      # 已上线
-        ("active", "DONE", None, "active", "EMPTY", "production"),     # 0-chunk → 未入索引
-        ("active", "DONE", "SUCCESS", None, "DONE", "hr"),            # 已上线
+        ("active", "已上线", "marketing", 1),
+        ("active", "未入索引", "production", 1),   # 0-chunk 经 CASE 归「未入索引」
+        ("active", "已上线", "hr", 1),
     ]
     _stub_multi(monkeypatch, [rows, (7,), (2,)])   # 主 fetchall + chunks fetchone + new_month fetchone
     from opensearch_pipeline import api
