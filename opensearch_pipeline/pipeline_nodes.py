@@ -335,6 +335,25 @@ def node_extract_text_with_ocr(ctx: dict):
     simulate_api = _resolve_simulate(ctx, "api")
     simulate_oss = _resolve_simulate(ctx, "oss")
 
+    # ── 环境预检（fail-fast，默认开）──
+    # xlsx/pptx/docx 的基础抽取器 100% 依赖 openpyxl/python-pptx/python-docx；缺失时
+    # 下游优雅降级会把 ImportError 吞成 warning → 0 块空 canonical 且 stage-1 全绿，
+    # 根因（环境缺依赖）被掩盖（2026-07-16 现场）。在任何下载/抽取发生前、只对本批
+    # 任务真实涉及的类型炸出来——此刻尚未写任何状态（stage-1 认领无 LOADING 标记），
+    # 修好依赖直接重跑即全量自愈。mock_text 任务不走真实抽取器，不参与预检。
+    # RAG_EXTRACT_DEP_PREFLIGHT=off 为应急旁路（此时兜底 = node_build_canonical 的
+    # 「空 canonical + 缺模块警告」守卫）。辅助依赖（PIL/OCR）有意不预检。
+    if os.environ.get("RAG_EXTRACT_DEP_PREFLIGHT", "on").lower() not in ("off", "0", "false", "no"):
+        from opensearch_pipeline.extraction.unified_extractor import preflight_extractor_deps
+        _dep_missing = preflight_extractor_deps(
+            {t.get("file_ext", "") for t in tasks if "mock_text" not in t})
+        if _dep_missing:
+            _detail = "; ".join(
+                f".{ext} 需要 {mod}（pip install {pip}）" for ext, mod, pip in _dep_missing)
+            raise RuntimeError(
+                f"[ENV-DEP] 基础抽取器依赖缺失，拒绝启动抽取（fail-fast，未写任何状态；"
+                f"装好依赖后重跑 stage-1 即可）: {_detail}")
+
     # 生产模式需要 OSS bucket 来下载原始文件
     bucket = None
     if not simulate_oss:
@@ -551,6 +570,7 @@ def node_build_canonical(ctx: dict):
     """
     extractions = ctx["extractions"]
     canonicals = []
+    env_dep_failures = []  # ENV-DEP 守卫命中清单（doc 级；循环后统一 raise 炸红本次运行）
 
     # perf#92：simulate 判定与 OSS bucket 客户端是循环不变量，提升到循环外一次构造
     # （原先每篇文档各构造一次 oss2.Auth+Bucket）。extractions 为空时不触碰 OSS，
@@ -617,6 +637,51 @@ def node_build_canonical(ctx: dict):
                     f"/v{result['version_no']}/content.md"
                 ),
             }
+
+        # ── ENV-DEP 守卫：空 canonical + 缺模块警告 = 环境性抽取失败，绝不标 SUCCESS ──
+        # /usr/bin/python3 缺 openpyxl/python-pptx 时，基础抽取器的优雅降级把 ImportError
+        # 吞成 "Failed to extract ...: No module named '...'"，产出 0 chars/0 blocks 的空
+        # canonical——若照常写 keys + extraction_status='COMPLETED'，空文档只会在 stage-2
+        # 落 SKIPPED_EMPTY，根因被彻底掩盖（2026-07-16 现场）。组合判据（全空 且 warnings
+        # 含缺模块）只可能来自环境缺依赖：内容合法为空的文档无该警告仍走原 SUCCESS 路径；
+        # 辅助依赖（PIL/OCR 等）失败要么无此警告、要么文本块仍在（blocks>0），均不误伤——
+        # 「图片/OCR 辅助失败不破坏文本抽取」的既有优雅降级保持不变。
+        # 处置：不写 canonical 文件/keys（canonical_json_key 保持 NULL → stage-2 永不认领
+        # 这个空壳），标 extraction_status='FAILED' + content_process_error 留痕；
+        # content_process_status 保持 NOT_STARTED → 依赖装好后下一次 stage-1 按既有扫描
+        # 谓词（NOT_STARTED 且 keys IS NULL）自动重捡自愈。循环后统一 raise 炸红本次运行。
+        # 两种真实文案：xlsx/pptx 兜底 except 透传原始异常串（"No module named 'openpyxl'"）；
+        # docx_extractor 的 ImportError 分支返回自定义串（"python-docx not installed"）。
+        _env_missing_warns = [
+            w for w in (canonical.get("warnings") or [])
+            if isinstance(w, str)
+            and ("No module named" in w or "not installed" in w)
+        ]
+        if (_env_missing_warns and not canonical.get("blocks")
+                and not (canonical.get("text") or "").strip()):
+            _env_reason = ("[ENV-DEP] empty canonical with missing python module: "
+                           + "; ".join(_env_missing_warns)[:500])
+            print(f"    ❌ ERROR {canonical['doc_id']} v{canonical['version_no']}: {_env_reason}")
+            if not simulate_db:
+                _f_conn = None
+                try:
+                    _f_conn = _get_db_conn(select_db=True)
+                    with _f_conn.cursor() as _f_cur:
+                        _f_cur.execute(
+                            "UPDATE document_version SET extraction_status='FAILED', "
+                            "content_process_error=%s, processed_at=NOW() "
+                            "WHERE doc_id=%s AND version_no=%s",
+                            (_env_reason, canonical["doc_id"], canonical["version_no"]))
+                    _f_conn.commit()
+                except Exception as _f_err:
+                    # 留痕失败不吞守卫本身——循环后的 raise 仍会炸红运行
+                    print(f"    ⚠️ failed to mark extraction_status=FAILED in RDS: {_f_err}")
+                finally:
+                    if _f_conn is not None:
+                        _f_conn.close()
+            env_dep_failures.append(
+                f"{canonical['doc_id']} v{canonical['version_no']}: {_env_reason}")
+            continue
 
         # ── G20：版本化文本归一（哈希/持久化之前；默认 ON，RAG_TEXT_NORMALIZE=false 直通）──
         # 去零宽 + 全角字母数字折半角 + 折叠连片空行（保守集，全角标点/㈠圈号不动）。
@@ -923,6 +988,18 @@ def node_build_canonical(ctx: dict):
                 _doc_conn.close()
 
     ctx["canonicals"] = canonicals
+
+    # ENV-DEP 守卫收尾：受影响 doc 已逐条标 FAILED 并被排除出 canonicals（健康文档的
+    # canonical/COMPLETED 均已逐篇落库，不受影响）；这里统一 raise 让 DAG/DataWorks
+    # 任务变红——环境性失败必须炸出来，而不是留一批静默空产出。
+    if env_dep_failures:
+        _shown = " | ".join(env_dep_failures[:10])
+        if len(env_dep_failures) > 10:
+            _shown += f" | ...(+{len(env_dep_failures) - 10} more)"
+        raise RuntimeError(
+            f"[ENV-DEP] {len(env_dep_failures)} doc(s) produced EMPTY canonical due to missing "
+            f"python modules (marked extraction_status=FAILED, canonical withheld). "
+            f"Fix the environment (pip install the missing modules) and re-run stage-1: {_shown}")
 
 
 # ═══════════════════════════════════════════════════════════════

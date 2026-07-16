@@ -40,6 +40,47 @@ def _safe_image_output_dir(task: dict) -> str:
     return _DEFAULT_IMG_DIR
 
 
+# ── 基础抽取器依赖表：这三类文档的【文本抽取】100% 依赖对应第三方库 ──
+# 缺失时 _extract_xlsx/_extract_pptx/_extract_docx 的兜底 except 会把 ImportError
+# 吞成 "Failed to extract ...: No module named '...'" warning，产出 0 块空 canonical
+# 且 stage-1 照常全绿——环境性失败被优雅降级掩盖（2026-07-16 现场：/usr/bin/python3
+# 缺 openpyxl）。preflight_extractor_deps 供 stage-1 抽取节点在处理任何文档前
+# fail-fast。PIL/OCR/图片导出等辅助依赖有意不在此列：辅助失败不破坏文本抽取
+# （graceful degradation 铁律）。pdf 也有意不预检：pdfplumber→pypdf 双库互为降级、
+# 之后还有 OCR 兜底，单库缺失不构成总损；双库全缺产出的 "pypdf/PyPDF2 not installed"
+# 空 canonical 由 node_build_canonical 的 ENV-DEP 守卫兜住。
+BASE_EXTRACTOR_DEPS = {
+    "xlsx": ("openpyxl", "openpyxl"),
+    "pptx": ("pptx", "python-pptx"),
+    "docx": ("docx", "python-docx"),
+}
+
+
+def preflight_extractor_deps(file_exts, _import=None) -> List[tuple]:
+    """对将要处理的文件类型预检基础抽取器依赖。
+
+    Args:
+        file_exts: 本批任务涉及的扩展名集合（大小写/前导点均容忍）。
+        _import: 测试注入点，默认 importlib.import_module。
+    Returns:
+        缺失清单 [(ext, module_name, pip_name), ...]（按 ext 排序）；全可用时为 []。
+        只查 import 可用性，不做版本校验；fail-fast 还是告警由调用方决定。
+    """
+    import importlib
+    imp = _import or importlib.import_module
+    missing = []
+    for ext in sorted({(e or "").lower().strip().lstrip(".") for e in file_exts}):
+        dep = BASE_EXTRACTOR_DEPS.get(ext)
+        if not dep:
+            continue
+        module_name, pip_name = dep
+        try:
+            imp(module_name)
+        except ImportError:
+            missing.append((ext, module_name, pip_name))
+    return missing
+
+
 _PUA_RANGE = (0xE000, 0xF8FF)          # Private Use Area：坏字体常映射到此
 _CID_RE = re.compile(r"\(cid:\d+\)")   # pdfminer 对无 ToUnicode 映射字体的输出
 
