@@ -20,7 +20,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from opensearch_pipeline.ontology.ids import format_ref, new_ulid
 from opensearch_pipeline.ontology.normalize import title_key
@@ -352,6 +352,38 @@ class RDSOntologyStore:
             with conn.cursor() as cur:
                 sql = (f"SELECT object_id, object_type, canonical_ref, title, lifecycle_state, "
                        f"owner_dept, data_classification, status FROM {db}.ontology_object "
+                       "WHERE object_type=%s AND status=%s")
+                params: List[Any] = [object_type, status]
+                if title_like:
+                    sql += " AND title LIKE %s"
+                    params.append(f"%{title_like}%")
+                sql += f" AND {frag}"
+                params.extend(acl_params)
+                cur.execute(sql + " ORDER BY canonical_ref LIMIT %s", (*params, limit))
+                return self._rows_to_dicts(cur)
+        finally:
+            conn.close()
+
+    def search_objects_authorized_full(self, object_type: str, *, acl,
+                                       bypass_acl: bool = False,
+                                       title_like: Optional[str] = None,
+                                       status: str = "active",
+                                       limit: int = 50) -> List[Dict[str, Any]]:
+        """search_objects_authorized 的**全列版**（perf 批次 A §4.2）：SELECT 追加
+        version / golden_json / golden_provenance_json，供 CalcRule.from_object 直接
+        消费——消除 packing_calc._select_rule 逐规则 get_object 的 +1。ACL 谓词与
+        search_objects_authorized 同源（acl_read_predicate_sql），可见集逐字节一致
+        （LIMIT 作用在授权集合上，post-ACL）。⚠️ golden_json 是重列，勿替换轻量
+        list/search 路径。"""
+        from opensearch_pipeline.ontology.authz import acl_read_predicate_sql
+        frag, acl_params = acl_read_predicate_sql(acl=acl, bypass_acl=bypass_acl)
+        db, conn = self._db(), self._conn()
+        limit = max(1, min(int(limit), 200))
+        try:
+            with conn.cursor() as cur:
+                sql = (f"SELECT object_id, object_type, canonical_ref, title, lifecycle_state, "
+                       f"owner_dept, data_classification, status, version, golden_json, "
+                       f"golden_provenance_json FROM {db}.ontology_object "
                        "WHERE object_type=%s AND status=%s")
                 params: List[Any] = [object_type, status]
                 if title_like:
@@ -1281,6 +1313,50 @@ class RDSOntologyStore:
         finally:
             conn.close()
 
+    def list_candidates_for_cases(
+            self, case_ids: List[str]) -> Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]]:
+        """批量取多 case 的候选 + 目标对象 6 字段切片（perf 批次 A §4.1）：单条 LEFT JOIN
+        替代 workbench 逐 case list_candidates + 逐候选 get_object 的 N+1。
+
+        返回 {case_id: [(cand_row, obj_slice), ...]}，每 case 内按 confidence DESC。
+        · cand_row 与 list_candidates 逐字段一致（只剔除 JOIN 侧 _obj_* 列，不掺入对象列）。
+        · obj_slice 仅 6 字段 {canonical_ref,title,object_type,status,owner_dept,
+          data_classification}；目标悬空(o.object_id IS NULL)→ {}（复刻 `get_object() or {}`
+          的 can_read_object({}) fail-closed 语义）。RDS FK 保证不悬空，仅 Memory 测试可造。
+        空 case_ids → {}（绝不发 `IN ()`）。无候选的 case 不出现在返回 dict。"""
+        ids = list(dict.fromkeys(case_ids or []))   # 去重保序；空 → 不查库
+        if not ids:
+            return {}
+        db, conn = self._db(), self._conn()
+        try:
+            placeholders = ",".join(["%s"] * len(ids))
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT c.candidate_id, c.case_id, c.target_object_id, c.target_revision, "
+                    "c.method, c.confidence, c.features_json, c.created_at, "
+                    "o.object_id AS _obj_present, o.canonical_ref AS _obj_canonical_ref, "
+                    "o.title AS _obj_title, o.object_type AS _obj_object_type, "
+                    "o.status AS _obj_status, o.owner_dept AS _obj_owner_dept, "
+                    "o.data_classification AS _obj_data_classification "
+                    f"FROM {db}.ontology_resolution_candidate c "
+                    f"LEFT JOIN {db}.ontology_object o ON o.object_id = c.target_object_id "
+                    f"WHERE c.case_id IN ({placeholders}) "
+                    "ORDER BY c.case_id, c.confidence DESC",
+                    tuple(ids))
+                rows = self._rows_to_dicts(cur)
+        finally:
+            conn.close()
+        grouped: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+        for r in rows:
+            cand = {k: v for k, v in r.items() if not k.startswith("_obj_")}
+            obj: Dict[str, Any] = {} if r.get("_obj_present") is None else {
+                "canonical_ref": r["_obj_canonical_ref"], "title": r["_obj_title"],
+                "object_type": r["_obj_object_type"], "status": r["_obj_status"],
+                "owner_dept": r["_obj_owner_dept"],
+                "data_classification": r["_obj_data_classification"]}
+            grouped.setdefault(r["case_id"], []).append((cand, obj))
+        return grouped
+
     def resolve_case(self, case_id: str, *, identifier_id: str, by: str,
                      note: Optional[str] = None,
                      audit: Optional[Dict[str, Any]] = None) -> bool:
@@ -1597,6 +1673,15 @@ class MemoryOntologyStore:
     def search_objects_authorized(self, object_type, *, acl, bypass_acl=False,
                                   title_like=None, status="active", limit=50):
         """P0-A②③（与 RDS 同契约）：先 ACL 过滤再排序截断——LIMIT 只作用授权集合。"""
+        with self._lock:
+            out = self._authorized_objects(object_type, acl=acl, bypass_acl=bypass_acl,
+                                           title_like=title_like, status=status)
+            return sorted(out, key=lambda o: o["canonical_ref"])[:max(1, min(int(limit), 200))]
+
+    def search_objects_authorized_full(self, object_type, *, acl, bypass_acl=False,
+                                       title_like=None, status="active", limit=50):
+        """与 RDS search_objects_authorized_full 同契约（perf 批次 A §4.2）：Memory 行本就
+        整行（含 golden_json/version/golden_provenance_json），复用同一授权过滤即可。"""
         with self._lock:
             out = self._authorized_objects(object_type, acl=acl, bypass_acl=bypass_acl,
                                            title_like=title_like, status=status)
@@ -2084,6 +2169,28 @@ class MemoryOntologyStore:
         with self._lock:
             rows = [dict(r) for r in self._candidates.values() if r["case_id"] == case_id]
             return sorted(rows, key=lambda r: -r["confidence"])
+
+    def list_candidates_for_cases(self, case_ids):
+        """与 RDS list_candidates_for_cases 同契约（perf 批次 A §4.1）：{case_id:
+        [(cand_row, obj_slice), ...]}，每 case 内 confidence DESC。cand_row 复刻
+        Memory list_candidates 形（无 created_at）；目标缺失 → obj_slice={}；空 → {}。"""
+        wanted = set(case_ids or [])
+        if not wanted:
+            return {}
+        grouped: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+        with self._lock:
+            for r in self._candidates.values():
+                cid = r["case_id"]
+                if cid not in wanted:
+                    continue
+                obj = self._objects.get(r["target_object_id"])
+                obj_slice = {} if obj is None else {
+                    k: obj.get(k) for k in ("canonical_ref", "title", "object_type",
+                                            "status", "owner_dept", "data_classification")}
+                grouped.setdefault(cid, []).append((dict(r), obj_slice))
+        for cid in grouped:
+            grouped[cid].sort(key=lambda p: -p[0]["confidence"])
+        return grouped
 
     def resolve_case(self, case_id, *, identifier_id, by, note=None, audit=None):
         return self._case_transition(case_id, to_status="resolved", by=by, note=note,

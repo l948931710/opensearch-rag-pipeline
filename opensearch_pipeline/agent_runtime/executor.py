@@ -484,6 +484,16 @@ class ThreadedRunExecutor:
             if run_id:
                 with self._lock:
                     self._live.pop(run_id, None)
+            # perf 批次 A §4.8：run 末投机检索观测（started/hit/miss/wasted_ms/arms_est）——
+            # 唯一「已消费 vs 空跑」终点，覆盖成功/失败/取消/挂起。命中率另有 receipt 落库；
+            # getattr 保护（_FakeSpec 等桩无 finalize）+ 整体 fail-open（观测绝不污染收尾）。
+            _spec = getattr(ctx, "speculative_search", None)
+            _fin = getattr(_spec, "finalize", None)
+            if _fin is not None:
+                try:
+                    logger.info("spec_retrieval run=%s %s", run_id, _fin())
+                except Exception:   # noqa: BLE001 — 观测绝不抛进 run 收尾
+                    pass
             handle._finish(end_relay=not suspended)
             self._release()
 

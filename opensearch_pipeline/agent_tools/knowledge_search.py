@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from opensearch_pipeline.agent_runtime.tool import (
@@ -269,6 +270,19 @@ def query_matches_question(query: str, question: str, threshold: float = 0.8) ->
     return len(bq & _bigrams(nu)) / len(bq) >= threshold
 
 
+def _spec_arms_estimate() -> int:
+    """投机检索的 HA3 检索臂数**估算**（config 派生，零运行成本，绝不碰 retriever，§4.8）：
+    client fusion + hybrid 同开 → 上界 3 路（dense+bm25[+sparse]）；否则 1 路。真 sparse 臂
+    是否在场按 query 定，此处取上界；dense 臂失败会静默回退 server hybrid=1（故为估算）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        cfg = get_config().retrieval
+        return 3 if (getattr(cfg, "client_fusion_enable", False)
+                     and getattr(cfg, "enable_hybrid", False)) else 1
+    except Exception:   # noqa: BLE001 — 观测辅助绝不抛进检索路径
+        return 1
+
+
 class SpeculativeSearch:
     """一次性投机预取句柄（挂在 ctx.speculative_search，serving 层构造）。
 
@@ -286,6 +300,10 @@ class SpeculativeSearch:
         self._pool = pool
         self._user_dept = user_dept
         self._future = None
+        # perf 批次 A §4.8：投机检索可观测性（纯观测，零行为影响，全程 fail-open）
+        self._started_at: Optional[float] = None
+        self._consumed = False
+        self._arms_est = _spec_arms_estimate()
 
     def start(self) -> None:
         """准入后起跑（幂等；executor 单线程调用）。失败不抛——_future 保持 None，
@@ -294,6 +312,7 @@ class SpeculativeSearch:
             return
         try:
             self._future = self._pool.submit(self._fetch, self.question, self._user_dept)
+            self._started_at = time.monotonic()   # §4.8：真起跑才记时（成功 submit 之后）
         except Exception:   # noqa: BLE001 — 池已关/饱和等：fail-open
             logger.info("投机检索预取起跑失败（回退真检索）", exc_info=True)
 
@@ -310,10 +329,25 @@ class SpeculativeSearch:
             return None
         self._used = True   # 无论成败只消费一次
         try:
-            return self._future.result(timeout=timeout)
+            out = self._future.result(timeout=timeout)
+            self._consumed = True   # §4.8：预取结果真被采用（命中，与 receipt['speculative'] 同义）
+            return out
         except Exception:   # noqa: BLE001 — 预取失败/超时 → 回退真检索
             logger.info("投机检索预取失败/超时（回退真检索）", exc_info=True)
             return None
+
+    def finalize(self) -> Dict[str, Any]:
+        """run 末观测汇总（executor finally 以 getattr 保护调用，§4.8）：started/hit/miss/
+        wasted_ms/arms_est。绝不抛（观测不得污染 run 收尾）。命中率另有 receipt
+        ['speculative'] 落 tool_invocation，此处补 started/miss/wasted 的 run 级事实。"""
+        try:
+            started = self._started_at is not None
+            miss = started and not self._consumed
+            wasted_ms = int((time.monotonic() - self._started_at) * 1000) if miss else 0
+            return {"spec_started": started, "spec_hit": self._consumed, "spec_miss": miss,
+                    "spec_wasted_ms": wasted_ms, "spec_arms_est": self._arms_est}
+        except Exception:   # noqa: BLE001 — 观测辅助绝不抛
+            return {}
 
 
 def _img_marker(i: int, chunk: Dict[str, Any]) -> str:

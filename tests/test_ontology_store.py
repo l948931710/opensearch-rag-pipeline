@@ -354,6 +354,74 @@ def test_list_open_cases_filter_and_order(store, ns):
     assert len(only_sku) == 1 and only_sku[0]["case_id"] == cb
 
 
+def test_list_candidates_for_cases_batched(store, ns):
+    """§4.1 批量候选+对象切片（perf 批次 A）：分组按 case_id、组内 confidence DESC、
+    对象 6 字段切片、cand 行与 list_candidates 逐字段一致、空入参→{}、无候选 case 不出现。
+    Memory/RDS 同契约。"""
+    o1 = _mint(store, title=f"{_MARK}甲")
+    o2 = _mint(store, title=f"{_MARK}乙")
+    o3 = _mint(store, title=f"{_MARK}丙")
+    ca = store.upsert_case(ns, "caseA", "CASEA", object_type_hint="product")
+    cb = store.upsert_case(ns, "caseB", "CASEB", object_type_hint="product")
+    cc = store.upsert_case(ns, "caseC", "CASEC", object_type_hint="product")   # 无候选
+    store.add_candidate(ca, o1["object_id"], method="rule", confidence=0.70)
+    store.add_candidate(ca, o2["object_id"], method="embedding", confidence=0.95)
+    store.add_candidate(cb, o3["object_id"], method="rule", confidence=0.50)
+
+    grouped = store.list_candidates_for_cases([ca, cb, cc])
+    assert set(grouped) == {ca, cb}                          # cc 无候选 → 不出现
+    a_pairs = grouped[ca]
+    assert [float(c["confidence"]) for c, _ in a_pairs] == pytest.approx([0.95, 0.70])
+    top_cand, top_obj = a_pairs[0]
+    assert top_cand == store.list_candidates(ca)[0]          # cand 行与 list_candidates 逐字段一致
+    assert not any(k.startswith("_obj_") for k in top_cand)  # 不掺 JOIN 侧对象列
+    assert set(top_obj) == {"canonical_ref", "title", "object_type", "status",
+                            "owner_dept", "data_classification"}
+    assert top_obj["title"] == f"{_MARK}乙" and top_obj["object_type"] == "product"
+
+    assert store.list_candidates_for_cases([]) == {}         # 空入参短路
+
+
+def test_list_candidates_for_cases_is_single_query_rds(monkeypatch):
+    """§4.1：RDS 后端 N case 只发一条 LEFT JOIN（去重 IN 占位），消除逐 case+逐候选 N+1。"""
+    import opensearch_pipeline.db as _db
+
+    calls = []
+
+    class _Cur:
+        description: list = []
+
+        def execute(self, sql, params=None):
+            calls.append((sql, list(params) if params is not None else None))
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_db, "_get_db_conn", lambda *a, **k: _Conn())
+    out = RDSOntologyStore().list_candidates_for_cases(["A", "B", "A", "C"])
+    assert out == {}                                          # 无行 → 空分组
+    assert len(calls) == 1                                    # 3 去重 case 一条 SQL（非 N+1）
+    sql, params = calls[0]
+    assert "LEFT JOIN" in sql and "IN (%s,%s,%s)" in sql      # A/B/C 去重 3 占位
+    assert params == ["A", "B", "C"]                          # 去重保序
+    calls.clear()
+    assert RDSOntologyStore().list_candidates_for_cases([]) == {}   # 空入参不发查询
+    assert calls == []
+
+
 # ── 溯源目录 / stewardship 种子 ───────────────────────────────────────────────────
 
 

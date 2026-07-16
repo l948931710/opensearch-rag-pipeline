@@ -228,6 +228,39 @@ def test_speculative_not_started_falls_back_and_start_idempotent(monkeypatch):
         pool.shutdown(wait=False)
 
 
+def test_speculative_finalize_observability(monkeypatch):
+    """§4.8（perf 批次 A）：finalize() 汇报 started/hit/miss/wasted_ms/arms_est（纯观测，
+    四态覆盖：命中 / 起跑未消费 / 从未起跑 / arms 来自 config）。"""
+    rows = [{"doc_id": "D", "chunk_text": "x", "doc_title": "t"}]
+    monkeypatch.setattr(_RETRIEVE, lambda query, **k: rows)
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        # 1) 起跑 + 命中 → spec_hit，无浪费
+        hit = SpeculativeSearch(_Q, None, pool)
+        hit.start()
+        assert hit.take_if_match(_Q, None) == rows
+        f1 = hit.finalize()
+        assert f1["spec_started"] is True and f1["spec_hit"] is True
+        assert f1["spec_miss"] is False and f1["spec_wasted_ms"] == 0
+        assert isinstance(f1["spec_arms_est"], int) and f1["spec_arms_est"] >= 1
+
+        # 2) 起跑但从未消费（换主题 miss）→ spec_miss + wasted_ms>=0
+        miss = SpeculativeSearch(_Q, None, pool)
+        miss.start()
+        miss._future.result(timeout=2)             # 等预取完成，wasted 计时确定
+        f2 = miss.finalize()
+        assert f2["spec_started"] is True and f2["spec_hit"] is False
+        assert f2["spec_miss"] is True and f2["spec_wasted_ms"] >= 0
+
+        # 3) 从未起跑（submit 被 429 拒）→ 全 False，无浪费
+        never = SpeculativeSearch(_Q, None, pool)
+        f3 = never.finalize()
+        assert f3 == {"spec_started": False, "spec_hit": False, "spec_miss": False,
+                      "spec_wasted_ms": 0, "spec_arms_est": never._arms_est}
+    finally:
+        pool.shutdown(wait=False)
+
+
 # ── 上下文预算打包（延迟优化第三刀，2026-07-11；设计 v2 + 三评审条件）──────────────
 
 

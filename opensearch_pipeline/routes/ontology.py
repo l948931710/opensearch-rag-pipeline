@@ -81,23 +81,46 @@ def _require_reader(identity: Identity):
     return kb
 
 
-def _steward_scope_for(store, *, namespace: Optional[str] = None,
-                       object_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """stewardship 裁决命中的**整行**（含 steward_dept/backup_dept，P1-11 授权要用后者）；
-    表故障 → None（scope 未知，fail-closed 到 kb_admin）。"""
-    from opensearch_pipeline.ontology.stewardship import resolve_steward
+# perf 批次 A §4.1：区分「rows 未传入(下游自取，写侧向后兼容)」与「rows=None(调用方已读且失败)」
+_UNSET = object()
+
+
+def _load_steward_rows(store):
+    """每请求单次 stewardship 加载（perf 批次 A §4.1）：喂给本请求所有 scope 判定，
+    workbench/case_detail 逐 case 复用，取代此前每 case 各自重读（2N 次）。
+
+    读失败 → None 哨兵：下游 _steward_scope_for(None)→fail-closed 到 kb_admin；
+    _managed_scope_filter(None)→空集（各按各自既有 fail-closed 语义收敛，行为不变）。"""
     try:
-        rows = store.list_stewardship()
-    except Exception:   # noqa: BLE001 — 表故障 → scope 未知 → fail-closed 到 kb_admin
-        logger.warning("stewardship 读取失败（授权收敛到 kb_admin）", exc_info=True)
+        return store.list_stewardship()
+    except Exception:   # noqa: BLE001 — 表故障 → None 哨兵（下游各自 fail-closed）
+        logger.warning("stewardship 读取失败（本请求授权按 fail-closed 收敛）", exc_info=True)
+        return None
+
+
+def _steward_scope_for(store, *, namespace: Optional[str] = None,
+                       object_type: Optional[str] = None, rows=_UNSET) -> Optional[Dict[str, Any]]:
+    """stewardship 裁决命中的**整行**（含 steward_dept/backup_dept，P1-11 授权要用后者）；
+    表故障 → None（scope 未知，fail-closed 到 kb_admin）。
+
+    perf 批次 A §4.1：可传入本请求已加载的 stewardship 行（rows）以免逐 case 重读——
+    _UNSET=未传入(自取，写侧原样)；None=调用方已读且失败(fail-closed None)；list=直接用。"""
+    from opensearch_pipeline.ontology.stewardship import resolve_steward
+    if rows is _UNSET:
+        try:
+            rows = store.list_stewardship()
+        except Exception:   # noqa: BLE001 — 表故障 → scope 未知 → fail-closed 到 kb_admin
+            logger.warning("stewardship 读取失败（授权收敛到 kb_admin）", exc_info=True)
+            return None
+    if rows is None:            # 调用方读取已失败 → scope 未知 → fail-closed 到 kb_admin
         return None
     return resolve_steward(rows, namespace=namespace, object_type=object_type)
 
 
 def _steward_dept_for(store, *, namespace: Optional[str] = None,
-                      object_type: Optional[str] = None) -> Optional[str]:
+                      object_type: Optional[str] = None, rows=_UNSET) -> Optional[str]:
     """主 steward 部门（展示用；授权一律走 _authorize_steward 的整行裁决）。"""
-    hit = _steward_scope_for(store, namespace=namespace, object_type=object_type)
+    hit = _steward_scope_for(store, namespace=namespace, object_type=object_type, rows=rows)
     return hit["steward_dept"] if hit else None
 
 
@@ -129,36 +152,42 @@ def _reader_acl(kb):
     return set(managed_owner_depts(kb)), False
 
 
-def _can_manage_case(kb, store, case: Dict[str, Any]) -> bool:
+def _can_manage_case(kb, store, case: Dict[str, Any], *, rows=_UNSET) -> bool:
     """case 可见性 = 其 steward scope 是否归调用方管辖（evidence 属处置人，读写同域；
-    P1-11：backup_dept 与 steward_dept 同权——代理管家也能看到并处置队列）。"""
+    P1-11：backup_dept 与 steward_dept 同权——代理管家也能看到并处置队列）。
+    perf 批次 A §4.1：rows=本请求已加载的 stewardship（None=读失败 fail-closed）。"""
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
     from opensearch_pipeline.ontology.stewardship import effective_steward_depts
     if kb.role == ROLE_KB_ADMIN:
         return True
     scope = _steward_scope_for(store, namespace=case.get("namespace"),
-                               object_type=case.get("object_type_hint"))
+                               object_type=case.get("object_type_hint"), rows=rows)
     depts = effective_steward_depts(scope)
     return bool(depts) and bool(set(depts) & set(managed_owner_depts(kb)))
 
 
-def _managed_scope_filter(kb, store) -> Optional[Dict[str, List[str]]]:
+def _managed_scope_filter(kb, store, *, rows=_UNSET) -> Optional[Dict[str, List[str]]]:
     """dept_admin 的队列 SQL 粗过滤集（kb_admin → None=不过滤）。
 
     从 stewardship 表反算调用方管辖的 scope：namespace 全键 / namespace 冒号前缀 /
     object_type。SQL 层先按并集收窄（跨部门行不出库），返回后仍逐条
     `_can_manage_case` 精判（attribute > namespace > object_type 的裁决优先级可能
-    在并集内又否掉个别行）——粗筛+精判双层，fail-closed。"""
+    在并集内又否掉个别行）——粗筛+精判双层，fail-closed。
+
+    perf 批次 A §4.1：rows=本请求已加载的 stewardship（_UNSET=自取；None=读失败→空集）。"""
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, managed_owner_depts
     from opensearch_pipeline.ontology.stewardship import effective_steward_depts
     if kb.role == ROLE_KB_ADMIN:
         return None
     managed = set(managed_owner_depts(kb))
     namespaces, prefixes, otypes = [], [], []
-    try:
-        rows = store.list_stewardship()
-    except Exception:   # noqa: BLE001 — 表故障 → 空集（fail-closed：什么都看不见）
-        logger.warning("stewardship 读取失败（队列过滤收敛为空集）", exc_info=True)
+    if rows is _UNSET:
+        try:
+            rows = store.list_stewardship()
+        except Exception:   # noqa: BLE001 — 表故障 → 空集（fail-closed：什么都看不见）
+            logger.warning("stewardship 读取失败（队列过滤收敛为空集）", exc_info=True)
+            rows = []
+    elif rows is None:      # 调用方读取已失败 → 空集（fail-closed：什么都看不见）
         rows = []
     for r in rows:
         # P1-11：backup_dept 与 steward_dept 同权（粗筛与 _can_manage_case 精判同口径）
@@ -183,9 +212,12 @@ def _raise_mutation_denied(reason: str) -> None:
 
 
 # ── 读侧：队列 / 覆盖率 / 详情 / 对象搜索 ─────────────────────────────────────
-def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
-                       top_n: int = 3):
+def _enrich_candidates(pairs, *, acl: set, bypass: bool, top_n: int = 3):
     """候选目标对象信息按对象级 ACL 出参（PR-B / P0-A① + C3 复核批次6）。
+
+    perf 批次 A §4.1：入参改为预分组的 (cand, obj) 对——候选+目标对象已由
+    store.list_candidates_for_cases 一次 JOIN 取回，消除逐 case list_candidates +
+    逐候选 get_object 的 N+1；ACL-先-截断 / hidden 聚合 / 出参键全部不变。
 
     C3「先 ACL 后截断」：旧实现 `list_candidates()[:top_n]` 先截断再逐行 ACL——
     top-N 全被遮蔽时可见候选被静默挤出（有可评估候选却给处置人看空列表）。
@@ -198,8 +230,7 @@ def _enrich_candidates(store, case_id: str, *, acl: set, bypass: bool,
     from opensearch_pipeline.ontology.authz import can_read_object, visible_title
     out: List[Dict[str, Any]] = []
     hidden = 0
-    for c in store.list_candidates(case_id):
-        obj = store.get_object(c["target_object_id"]) or {}
+    for c, obj in pairs:
         if not can_read_object(obj, acl=acl, bypass_acl=bypass):
             hidden += 1
             continue
@@ -247,22 +278,27 @@ def ontology_workbench(request: Request, namespace: Optional[str] = None,
     kb = _require_reader(identity)
     store = _get_store()
     acl, bypass = _reader_acl(kb)
-    scope = _managed_scope_filter(kb, store)   # None=kb_admin 不过滤
+    steward_rows = _load_steward_rows(store)   # perf 批次 A §4.1：每请求单读，逐 case 复用
+    scope = _managed_scope_filter(kb, store, rows=steward_rows)   # None=kb_admin 不过滤
     raw_cases = store.list_open_cases(namespace=namespace, object_type_hint=object_type,
                                       order=order, limit=limit, offset=offset,
                                       scope_filter=scope,
                                       cursor=_decode_cursor(cursor, order))
+    # perf 批次 A §4.1：一把 LEFT JOIN 取回全部 case 的候选+目标对象（取代逐 case N+1）
+    grouped = store.list_candidates_for_cases([c["case_id"] for c in raw_cases])
     items = []
     for case in raw_cases:
-        if not _can_manage_case(kb, store, case):   # 粗筛后的精判（裁决优先级，fail-closed）
+        # 粗筛后的精判（裁决优先级，fail-closed）；复用本请求 steward_rows
+        if not _can_manage_case(kb, store, case, rows=steward_rows):
             continue
-        cands, hidden = _enrich_candidates(store, case["case_id"], acl=acl, bypass=bypass)
+        cands, hidden = _enrich_candidates(grouped.get(case["case_id"], []),
+                                           acl=acl, bypass=bypass)
         items.append({**case,
                       "candidates": cands,
                       "candidates_hidden": hidden,
                       "steward_dept": _steward_dept_for(
                           store, namespace=case.get("namespace"),
-                          object_type=case.get("object_type_hint"))})
+                          object_type=case.get("object_type_hint"), rows=steward_rows)})
     # PR-I：keyset 游标——满页才给 next_cursor（不满页=到底）；游标按**未精判前**的
     # 末行编码（精判滤掉的行也要翻过去，否则会卡在同一页）
     next_cursor = (_encode_cursor(raw_cases[-1], order)
@@ -290,16 +326,23 @@ def ontology_case_detail(case_id: str, request: Request,
     kb = _require_reader(identity)
     store = _get_store()
     case = store.get_case(case_id)
+    if case is None:                                       # 不存在 → 404（短路，不读 stewardship）
+        raise HTTPException(status_code=404, detail="case 不存在")
+    steward_rows = _load_steward_rows(store)               # perf 批次 A §4.1：单读复用
     # PR-B（P0-01）：scope 外的 case 与不存在同答 404——evidence_json 属处置人
-    if case is None or not _can_manage_case(kb, store, case):
+    if not _can_manage_case(kb, store, case, rows=steward_rows):
         raise HTTPException(status_code=404, detail="case 不存在")
     acl, bypass = _reader_acl(kb)
-    cands, hidden = _enrich_candidates(store, case_id, acl=acl, bypass=bypass, top_n=10)
+    # perf 批次 A §4.1：一次 JOIN，消除逐候选 get_object
+    grouped = store.list_candidates_for_cases([case_id])
+    cands, hidden = _enrich_candidates(grouped.get(case_id, []),
+                                       acl=acl, bypass=bypass, top_n=10)
     return {**case,
             "candidates": cands,
             "candidates_hidden": hidden,
             "steward_dept": _steward_dept_for(store, namespace=case.get("namespace"),
-                                              object_type=case.get("object_type_hint"))}
+                                              object_type=case.get("object_type_hint"),
+                                              rows=steward_rows)}
 
 
 @router.get("/api/ontology/objects")

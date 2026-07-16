@@ -213,6 +213,32 @@ def test_packing_calc_multiple_rules_require_explicit_ref():
     assert res2.receipt["status"] == "ok"
 
 
+def test_packing_calc_rule_selection_no_n_plus_1():
+    """§4.2（perf 批次 A）：无 rule_ref 的规则选取走批量授权全列查询一把取，
+    不再 find_objects('calc_rule') + 逐规则 get_object。"""
+    store = MemoryOntologyStore()
+    _seed_sku_with_packing(store)
+    _seed_rule(store)
+    calls = {"find_objects": 0, "search_objects_authorized_full": 0}
+
+    def _spy(name):
+        orig = getattr(store, name)
+
+        def w(*a, **k):
+            if a and a[0] == "calc_rule":
+                calls[name] += 1
+            return orig(*a, **k)
+        setattr(store, name, w)
+
+    for n in list(calls):
+        _spy(n)
+    res = _calc_tool(store).run(_ctx(), {"target": "LX620-50", "namespace": "u8",
+                                         "container": "40HQ", "order_qty_pcs": 600000})
+    assert res.receipt["status"] == "ok"
+    assert calls["search_objects_authorized_full"] == 1   # 批量授权全列一把取
+    assert calls["find_objects"] == 0                     # 旧 find_objects+逐条 get_object 已弃
+
+
 # ── PR12 实体锚定 ────────────────────────────────────────────────────────────
 
 

@@ -114,6 +114,7 @@ MANIFEST="
 039_qa_question_hash.sql operation
 040_qa_gap_semantic_group.sql operation
 041_qa_gap_dismissal.sql operation
+042_agent_run_user_index.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }

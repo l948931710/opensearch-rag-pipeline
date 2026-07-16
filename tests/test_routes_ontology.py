@@ -99,6 +99,32 @@ def test_admins_can_read_queue(store, role, managed):
     assert items[0]["candidates"][0]["method"] == "rule"
 
 
+def test_workbench_query_shape_no_n_plus_1(store, monkeypatch):
+    """§4.1（perf 批次 A）：工作台不再逐 case list_candidates / 逐候选 get_object /
+    逐 case 重读 stewardship——一把 list_candidates_for_cases + 每请求单次 list_stewardship。"""
+    for i in range(3):
+        _seed_case(store, raw=f"nn{i}")
+    counts = {k: 0 for k in ("list_candidates", "get_object", "list_stewardship",
+                             "list_candidates_for_cases")}
+
+    def _spy(name):
+        orig = getattr(store, name)
+
+        def w(*a, **k):
+            counts[name] += 1
+            return orig(*a, **k)
+        monkeypatch.setattr(store, name, w)
+
+    for n in list(counts):
+        _spy(n)
+    r = _client(_identity()).get("/api/ontology/workbench")
+    assert r.status_code == 200 and len(r.json()["items"]) == 3
+    assert counts["list_candidates"] == 0            # 旧逐 case 路径已消除
+    assert counts["get_object"] == 0                 # 旧逐候选路径已消除
+    assert counts["list_candidates_for_cases"] == 1  # 一把 JOIN
+    assert counts["list_stewardship"] == 1           # 每请求单读（此前 2N+）
+
+
 # ── 队列 / 覆盖率 / 详情 / 搜索 ────────────────────────────────────────────────
 
 

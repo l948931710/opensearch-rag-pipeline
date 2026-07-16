@@ -143,13 +143,19 @@ const inflight = ref<Set<string>>(new Set())    // 撤回等处置的防重
 
 const STALE_MS = 30_000
 let _pollMs = 5_000            // 轮询节拍（生产 5s；测试经 __agentAskTestkit 缩短，避免 fake-timers 与 happy-dom 互踩）
+// perf 批次 A §4.3/§6.3：suspended 走慢拍（=_pollMs 的倍数，非绝对常量——测试 setPollMs 后仍成比例
+// 缩短）；网络/5xx 指数退避（上限 BACKOFF_MAX_MULT）；隐藏页整拍跳过（守卫在 _tick 内，镜像 ManageView）。
+const SUSPENDED_MULT = 9       // suspended：5s×9≈45s（挂起 run 不需 5s 抢拍，省一截读放大）
+const BACKOFF_MAX_MULT = 8     // 退避倍率上限（避免故障时无限拉长）
 const LS_MODE_KEY = 'fl-agent-mode'
 
 let agentSeq = 0                                // 竞态锁：停止/新提问/身份切换递增，作废在途流回调
 let abortCtl: AbortController | null = null
 let streamConvId = ''                           // 在途 agent 流所属会话（activeId 守卫的比较基准）
 let lastLoadedAt = 0
-const _pollTimers = new Map<string, ReturnType<typeof setInterval>>()
+const _pollTimers = new Map<string, ReturnType<typeof setTimeout>>()   // 自续 setTimeout 句柄（每 run ≤1）
+const _pollActive = new Set<string>()            // 应继续轮询的 run（与 timer 句柄解耦，避免重复起表/孤儿表）
+const _pollBackoff = new Map<string, number>()   // 每 run 连续网络/5xx 失败次数（成功清零，驱动指数退避）
 
 const bridge = agentChatBridge()
 const { asking, draft, messages, conversations, activeId } = useAsk()
@@ -521,8 +527,10 @@ watch(activeId, (id) => { if (agentStreamActive.value && id !== streamConvId) st
 
 // ── run 轮询（断线恢复核心）───────────────────────────────────────────────────
 function stopRunPolling(runId: string): void {
+  _pollActive.delete(runId)
+  _pollBackoff.delete(runId)
   const t = _pollTimers.get(runId)
-  if (t) { clearInterval(t); _pollTimers.delete(runId) }
+  if (t) { clearTimeout(t); _pollTimers.delete(runId) }
 }
 async function _pollRunOnce(runId: string): Promise<void> {
   const fp = identityFingerprint()
@@ -541,6 +549,7 @@ async function _pollRunOnce(runId: string): Promise<void> {
     const d = await apiJson<AgentRunDetail>(`/api/agent/runs/${encodeURIComponent(runId)}`, { auth: true })
     if (fp !== identityFingerprint()) { stopRunPolling(runId); return }
     if (runDetailErrors.value[runId]) { const n = { ...runDetailErrors.value }; delete n[runId]; runDetailErrors.value = n }
+    _pollBackoff.delete(runId)   // 成功一次即清退避（下拍恢复正常节拍）
     runDetails.value = { ...runDetails.value, [runId]: d }
     const st = d?.run?.status || ''
     // 列表行对齐
@@ -568,6 +577,8 @@ async function _pollRunOnce(runId: string): Promise<void> {
       stopRunPolling(runId)
       runDetailErrors.value = { ...runDetailErrors.value, [runId]: '该运行不可见：可能由他人发起、已被清理，或 Agent 功能未开启。' }
     } else {
+      // 网络/5xx：保留轮询，指数退避（下拍延时经 _cadenceFor 自增），但失败要让用户看见
+      _pollBackoff.set(runId, (_pollBackoff.get(runId) || 0) + 1)
       runDetailErrors.value = { ...runDetailErrors.value, [runId]: '运行详情拉取失败，将自动重试；也可点右上角刷新。' }
     }
   }
@@ -607,16 +618,43 @@ function _previewRunDetail(runId: string): AgentRunDetail {
     final: { message_id: 'pv_m2', answer_text: '已按规范把补货单写回 U8：纸杯 12oz × 40，单据号 20260710-114；库存联动已确认。', answered_at: '2026-07-10 16:03:10' },
   }
 }
-/** 确保某 run 在轮询（5s 间隔，终态自动停）。挂起卡挂载/断流/运行中心聚焦时调用。 */
+/** run 详情轮询节拍（perf 批次 A §4.3）：suspended 走慢拍（_pollMs×SUSPENDED_MULT），其余
+ *  （running/resuming/未知）走 _pollMs（未知按快拍尽快学到状态）；叠加网络/5xx 指数退避。 */
+function _cadenceFor(runId: string): number {
+  const st = runDetails.value[runId]?.run?.status || ''
+  const base = st === 'suspended' ? _pollMs * SUSPENDED_MULT : _pollMs
+  const b = _pollBackoff.get(runId) || 0
+  return base * Math.min(2 ** b, BACKOFF_MAX_MULT)
+}
+/** 自续定时：仅当该 run 仍在 _pollActive 时排下一拍（终态/404/403/身份切换经 stopRunPolling
+ *  清除 _pollActive → 不再续）；始终每 run 至多一个 timer 句柄，pollTimerCount 恒 0/1。 */
+function _scheduleNext(runId: string): void {
+  if (!_pollActive.has(runId)) return
+  if (typeof setTimeout !== 'function') return
+  _pollTimers.set(runId, setTimeout(() => { void _tick(runId) }, _cadenceFor(runId)))
+}
+/** 单拍：隐藏页整拍跳过（不发网络、不推进退避，下拍可见即恢复——镜像 ManageView 的
+ *  visibilityState 守卫），否则拉一次详情再排下一拍。_pollRunOnce 在终态/404/403 会 stopRunPolling。 */
+async function _tick(runId: string): Promise<void> {
+  if (typeof document !== 'undefined' && document.hidden) { _scheduleNext(runId); return }
+  // finally 续拍：即便 _pollRunOnce 意外抛出也自愈（保留旧 setInterval 的自愈性；终态/404/403
+  // 已在 _pollRunOnce 内 stopRunPolling 清除 _pollActive → _scheduleNext 自然不续）。
+  try {
+    await _pollRunOnce(runId)
+  } finally {
+    _scheduleNext(runId)
+  }
+}
+/** 确保某 run 在轮询（终态自动停；隐藏页暂停；suspended 慢拍；网络失败指数退避）。
+ *  挂起卡挂载/断流/运行中心聚焦时调用。 */
 function ensureRunPolling(runId: string): void {
   if (!runId) return
   const known = runDetails.value[runId]?.run?.status
   if (known && RUN_TERMINAL.has(known)) return
-  if (_pollTimers.has(runId)) return
-  if (typeof setInterval === 'function') {
-    _pollTimers.set(runId, setInterval(() => { void _pollRunOnce(runId) }, _pollMs))
-  }
-  void _pollRunOnce(runId)
+  if (_pollActive.has(runId)) return
+  _pollActive.add(runId)
+  void _pollRunOnce(runId)     // 立即拉一次（断线恢复即时反馈；测试依赖立即填充 agentRunDetails）
+  _scheduleNext(runId)
 }
 /** 单次详情刷新（终态 run 的回执查看；不起定时器）。 */
 function refreshRunDetail(runId: string): Promise<void> { return _pollRunOnce(runId) }
@@ -708,8 +746,10 @@ function _resetAgentAskState(changedUser: boolean): void {
   runCenterRunId.value = ''
   inflight.value = new Set()
   lastLoadedAt = 0
-  for (const t of _pollTimers.values()) clearInterval(t)
+  for (const t of _pollTimers.values()) clearTimeout(t)
   _pollTimers.clear()
+  _pollActive.clear()
+  _pollBackoff.clear()
   if (changedUser) {
     agentMode.value = false
     try { localStorage.removeItem(LS_MODE_KEY) } catch { /* noop */ }

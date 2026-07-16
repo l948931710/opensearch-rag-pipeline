@@ -203,10 +203,11 @@ def _select_rule(store, acl: set, *, rule_ref: Optional[str] = None):
         rule.assert_effective()
         return rule
     candidates: List[Any] = []
-    for obj in store.find_objects("calc_rule", status="active", limit=200):
-        if not can_read_object(obj, acl=acl):
-            continue
-        full = store.get_object(obj["object_id"]) or obj   # find_objects 不带 golden_json
+    # perf 批次 A §4.2：授权版全列查询一把取回 golden_json——消除逐规则 get_object 的 N+1
+    # （旧实现 find_objects 不带 golden_json 故逐条回查）。ACL 谓词下推与 can_read_object 同源，
+    # 可见集逐字节一致；>200 授权规则时 post-ACL LIMIT 反而更正确（治理对象仅个位数，实务 moot）。
+    for full in store.search_objects_authorized_full(
+            "calc_rule", acl=acl, status="active", limit=200):
         try:
             rule = CalcRule.from_object(full)
             rule.assert_effective()
