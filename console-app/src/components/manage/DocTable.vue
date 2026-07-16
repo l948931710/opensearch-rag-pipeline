@@ -78,6 +78,7 @@ watch(chips, (c) => { if (c.length > 1 && filter.value && !c.includes(filter.val
 // ── 筛选状态 ←→ URL（P2：刷新/深链不再丢筛选；replace 不产生历史）──
 const route = useRoute()
 const router = useRouter()
+const rootEl = ref<HTMLElement | null>(null)   // 台账区根节点（筛选归位滚动锚点）
 onMounted(() => {
   const s = (v: unknown) => (typeof v === 'string' ? v : '')
   const q0 = route?.query || {}   // 单测无 router 环境 → 可选链兜底（与 Sidebar 同约定）
@@ -99,6 +100,10 @@ watch([docScope, q, filter, permFilter, ownerFilter, citedFilter], () => {
   put('owner', ownerFilter.value)
   put('cited', citedFilter.value)
   void router?.replace({ query: query as Record<string, string> })
+  // 筛选归位（2026-07-16 生产实测）：筛完结果变短 → 内层滚动容器保留旧 scrollTop 被钳到
+  // 新内容底部——用户视口「跳到最下面」，筛选行反而滚出视野。任何筛选/搜索/范围变更后把
+  // 台账区滚回容器顶（搜索框/筛选行保持可见；深链恢复时同样落到台账区，符合预期）。
+  rootEl.value?.scrollIntoView({ block: 'start' })
 })
 
 const COLS: { key: SortKey; label: string }[] = [
@@ -142,7 +147,7 @@ async function onRestore(d: DocItem) {
 </script>
 
 <template>
-  <section class="rounded-xl border border-border bg-card p-5">
+  <section ref="rootEl" class="rounded-xl border border-border bg-card p-5">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div class="flex items-center gap-3">
         <h2 class="text-[15px] font-semibold text-foreground">
