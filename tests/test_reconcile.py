@@ -338,3 +338,62 @@ def test_scan_ha3_pks_loops_until_stable(monkeypatch):
     assert set(out["rows"].keys()) == {1, 2}   # 并集完整：首轮漏掉的 id=2 被后续轮补齐
     assert out["truncated"] == []
     assert calls["n"] >= 2                      # 首轮不完整 → 至少又扫了一轮
+
+
+# ── CS4c compute_unregistered_raw（2026-07-16 扫描停摆调查）──
+
+_NOW = 1_700_000_000.0
+_OLD = _NOW - 48 * 3600   # 超龄(>24h)
+_NEW = _NOW - 1 * 3600    # 新鲜(<24h)
+
+
+def _obj(key, ts=_OLD):
+    return {"key": key, "last_modified_ts": ts}
+
+
+def test_unregistered_raw_clean_when_all_registered():
+    objs = [_obj("raw/hr/a.pdf"), _obj("raw/production/internal/b.xlsx")]
+    rep = reconcile.compute_unregistered_raw(objs, {"raw/hr/a.pdf",
+                                                    "raw/production/internal/b.xlsx"}, now_ts=_NOW)
+    assert rep["ok"] is True
+    assert rep["counts"]["unregistered_ingestible_stale"] == 0
+
+
+def test_unregistered_raw_stale_ingestible_fails_ok():
+    rep = reconcile.compute_unregistered_raw(
+        [_obj("raw/production_straw/新SOP.xlsx")], set(), now_ts=_NOW)
+    assert rep["ok"] is False
+    assert rep["ingestible_stale_sample"] == ["raw/production_straw/新SOP.xlsx"]
+
+
+def test_unregistered_raw_recent_and_unsupported_do_not_fail():
+    objs = [
+        _obj("raw/hr/刚上传.docx", _NEW),                 # 新鲜:可能正被手工批处理
+        _obj("raw/production_straw/旧格式.xlsb"),          # 旧格式:另一条待办,不驱动红
+        _obj("raw/production_straw/老文档.doc"),
+    ]
+    rep = reconcile.compute_unregistered_raw(objs, set(), now_ts=_NOW)
+    assert rep["ok"] is True
+    assert rep["counts"]["unregistered_ingestible_recent"] == 1
+    assert rep["counts"]["unregistered_unsupported"] == 2
+
+
+def test_unregistered_raw_exclusions():
+    objs = [
+        _obj("raw/production/"),                                    # 目录 marker
+        _obj("raw/production/_quarantine/规格书.pdf"),               # 隔离区 staging
+        _obj("raw/_archive/旧件.pdf"),                               # 归档区
+        _obj("raw/production/_quarantine/汉堡王/Thumbs.db"),         # 系统垃圾+隔离区
+        _obj("raw/hr/Thumbs.db"),                                    # 系统垃圾
+        _obj("raw/hr/DOC_01HZXW8Q2M3N4P5Q6R7S8T9V0A/u1/自助.pdf"),  # 自助上传形状
+    ]
+    rep = reconcile.compute_unregistered_raw(objs, set(), now_ts=_NOW)
+    assert rep["ok"] is True
+    assert rep["counts"]["unregistered_ingestible_stale"] == 0
+    assert rep["counts"]["excluded"] == len(objs)
+
+
+def test_run_unregistered_raw_check_simulate_is_noop():
+    # pytest 全程 RAG_SIMULATE=true → runner 必须 no-op(不碰 RDS/OSS)
+    rep = reconcile.run_unregistered_raw_check()
+    assert rep["skipped"] == "simulate" and rep["ok"] is True

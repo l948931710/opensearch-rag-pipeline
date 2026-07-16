@@ -26,8 +26,8 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-_JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup",
-         "queue_aging", "ingest_funnel")
+_JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "unregistered_raw",
+         "qa_rollup", "queue_aging", "ingest_funnel")
 
 
 def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
@@ -44,6 +44,11 @@ def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
     if "reconcile_raw" in sel:
         from opensearch_pipeline.reconcile import run_raw_parity_check
         out["reconcile_raw"] = run_raw_parity_check(alert=alert)
+    # CS4c（2026-07-16 扫描停摆调查）：raw/ 新文件未注册检测——摄取无周期调度,
+    # 全靠手工批,这个作业替人每天看一眼「OSS 有、RDS 无」的可摄取新文件。
+    if "unregistered_raw" in sel:
+        from opensearch_pipeline.reconcile import run_unregistered_raw_check
+        out["unregistered_raw"] = run_unregistered_raw_check(alert=alert)
     if "qa_rollup" in sel:
         from opensearch_pipeline.qa_rollup import run_rollup
         out["qa_rollup"] = run_rollup(alert=alert)

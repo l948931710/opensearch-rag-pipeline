@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from collections import Counter, defaultdict
@@ -770,6 +771,121 @@ def run_raw_parity_check(*, alert: bool = False) -> Dict[str, Any]:
     if alert and (not report.get("ok") or report.get("error")):
         _alert_on_raw_drift(report)
     return report
+
+
+# ── CS4c（2026-07-16 扫描停摆调查）：raw/ 新文件未注册检测 ──────────────────────
+# 背景：摄取管线无周期调度（DataWorks stage 节点全 Manual），入库只发生在手工批——
+# raw/ 里落了新文件没人知道（production_straw 06-16 批 15 个文件账外一个月）。本作业
+# 让 ops_health_monitor 每天替人看一眼:「OSS raw/ 有、document_version.raw_key 无」。
+#
+# 口径（防"永远红"淹没信号）：ok 只看【可摄取扩展名】且【落盘超过 min_age_hours】的
+# 未注册文件——旧格式(.xls/.xlsb/.doc…)是「部门转格式重传」的另一条待办（有移交清单），
+# 只进 counts 不驱动告警；_quarantine/（scanner-skipped staging）、目录 marker、系统垃圾、
+# 自助上传形状（raw/<dept>/DOC_<ULID26>/…，由 /api/kb/register 事务收编）一律排除。
+_INGESTIBLE_EXTS = frozenset({
+    "pdf", "docx", "xlsx", "pptx", "txt", "md", "csv", "html", "htm",
+    "png", "jpg", "jpeg", "webp", "tif", "tiff", "gif", "bmp",
+})
+_JUNK_BASENAMES = frozenset({"thumbs.db", ".ds_store", "desktop.ini"})
+_SELF_SERVE_SEG = re.compile(r"^DOC_[0-9ABCDEFGHJKMNPQRSTVWXYZ]{26}$")
+
+
+def compute_unregistered_raw(oss_objects: List[Dict[str, Any]], registered_keys,
+                             *, now_ts: float, min_age_hours: float = 24.0) -> Dict[str, Any]:
+    """Pure: which raw/ OSS objects have no document_version.raw_key row.
+
+    oss_objects: [{key, last_modified_ts}]; registered_keys: set of raw_key。
+    分桶：ingestible_stale（可摄取+超龄 → 驱动 ok/告警）/ ingestible_recent（可摄取但
+    新鲜，可能正被手工批处理中，只报数）/ unsupported（旧格式，另一条待办）/ excluded。
+    """
+    reg = set(registered_keys or ())
+    cutoff = now_ts - min_age_hours * 3600.0
+    stale, recent, unsupported = [], [], []
+    excluded = 0
+    for o in oss_objects or []:
+        k = o.get("key") or ""
+        parts = k.split("/")
+        base = parts[-1].lower() if parts else ""
+        if (not k or k.endswith("/") or "_quarantine" in parts or "_archive" in parts
+                or base in _JUNK_BASENAMES
+                or (len(parts) >= 5 and parts[0] == "raw" and _SELF_SERVE_SEG.match(parts[2] or ""))):
+            excluded += 1
+            continue
+        if k in reg:
+            continue
+        ext = base.rsplit(".", 1)[-1] if "." in base else ""
+        if ext not in _INGESTIBLE_EXTS:
+            unsupported.append(k)
+        elif float(o.get("last_modified_ts") or 0) <= cutoff:
+            stale.append(k)
+        else:
+            recent.append(k)
+    return {
+        "ok": not stale,
+        "counts": {"oss_scanned": len(oss_objects or []), "registered": len(reg),
+                   "unregistered_ingestible_stale": len(stale),
+                   "unregistered_ingestible_recent": len(recent),
+                   "unregistered_unsupported": len(unsupported), "excluded": excluded},
+        "ingestible_stale_sample": stale[:50],
+        "ingestible_recent_sample": recent[:20],
+        "unsupported_sample": unsupported[:20],
+    }
+
+
+def run_unregistered_raw_check(*, alert: bool = False, min_age_hours: float = 24.0) -> Dict[str, Any]:
+    """CS4c: raw/ 未注册新文件检测（只读、simulate-safe、fail-open）。
+
+    与 run_raw_parity_check（RDS 有→OSS 404）互为反向；本作业抓「OSS 有→RDS 无」。
+    """
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    if cfg.simulate or cfg.simulate_db:
+        logger.info("reconcile(unregistered_raw): simulate mode → skipped no-op")
+        return {"ok": True, "skipped": "simulate", "complete": True, "counts": {}}
+    try:
+        conn = _rds_conn()
+        try:
+            with conn.cursor() as c:
+                c.execute(f"SELECT DISTINCT raw_key FROM {_kb_db()}.document_version "
+                          f"WHERE raw_key IS NOT NULL AND raw_key <> ''")
+                registered = {r[0] if not isinstance(r, dict) else r.get("raw_key")
+                              for r in c.fetchall()}
+        finally:
+            conn.close()
+        bucket = _oss_bucket()
+        import oss2  # noqa: PLC0415 — 惰性:与本模块其他 OSS 依赖同策略
+        objs: List[Dict[str, Any]] = []
+        for obj in oss2.ObjectIteratorV2(bucket, prefix=_OSS_RAW_PREFIX):
+            objs.append({"key": obj.key, "last_modified_ts": float(obj.last_modified or 0)})
+        report = compute_unregistered_raw(objs, registered,
+                                          now_ts=time.time(), min_age_hours=min_age_hours)
+        report["complete"] = True
+    except Exception as e:  # noqa: BLE001 — fail-open
+        logger.exception("reconcile(unregistered_raw): check failed")
+        report = {"ok": False, "complete": False, "error": f"{type(e).__name__}: {e}", "counts": {}}
+    if alert and (not report.get("ok") or report.get("error")):
+        _alert_on_unregistered_raw(report)
+    return report
+
+
+def _alert_on_unregistered_raw(report: Dict[str, Any]) -> None:
+    """Fire one OBS-4 ops alert for unregistered raw/ files (fail-open)."""
+    try:
+        from opensearch_pipeline.alerting import send_ops_alert
+        c = report.get("counts", {})
+        if report.get("error"):
+            text = f"unregistered-raw check errored: {report['error']}"
+        else:
+            sample = "\n".join(f"- {k}" for k in report.get("ingestible_stale_sample", [])[:10])
+            text = (f"raw/ 下有 **{c.get('unregistered_ingestible_stale', 0)}** 个可摄取文件"
+                    f"落盘超 24h 仍未注册入库（另有旧格式 {c.get('unregistered_unsupported', 0)} 个"
+                    f"待部门转格式）。样例:\n{sample}\n"
+                    f"处置:点名注册 → orchestrator stage 1→2→3（勿全量扫描）。")
+        send_ops_alert("raw/ 新文件未入库", text, severity="warning",
+                       dedup_key="reconcile:unregistered-raw")
+    except Exception:  # noqa: BLE001
+        logger.warning("reconcile(unregistered_raw): ops-alert dispatch failed (non-fatal)",
+                       exc_info=True)
 
 
 def _alert_on_raw_drift(report: Dict[str, Any]) -> None:

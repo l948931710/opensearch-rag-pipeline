@@ -62,9 +62,12 @@ os.environ["RAG_ENVIRONMENT"] = "production"
 # os.environ["RAG_OSS_BUCKET_NAME"]       = "..."
 # os.environ["RAG_HA3_ENDPOINT"]          = "..."
 # os.environ["RAG_HA3_TABLE_NAME"]        = "..."
-# ── 告警 webhook（不配则 OBS-4 告警是【静默 no-op】——退出码仍会置位，但不会推送）──────
-# os.environ["RAG_OPS_ALERT_WEBHOOK"]     = "..."
-# os.environ["RAG_OPS_ALERT_SECRET"]      = "..."
+# ── 告警 webhook（不配则 OBS-4 告警是【静默 no-op】——2026-07-15 实锤:reconcile_ha3 的
+#    CRITICAL 每天被 SUPPRESSED,节点日日 Failure 无人收。⚠️ 必填。铸造步骤:
+#    钉钉运维群 → 群设置 → 智能群助手 → 添加机器人 → 自定义(Webhook) → 安全设置选「加签」→
+#    把 Webhook URL 填 RAG_OPS_ALERT_WEBHOOK、加签密钥(SEC 开头)填 RAG_OPS_ALERT_SECRET ──────
+# os.environ["RAG_OPS_ALERT_WEBHOOK"]     = "https://oapi.dingtalk.com/robot/send?access_token=<TODO>"
+# os.environ["RAG_OPS_ALERT_SECRET"]      = "SEC<TODO>"
 # ────────────────────────────────────────────────────────────────────────────────────
 
 _required = ["DASHSCOPE_API_KEY", "RAG_RDS_HOST", "RAG_RDS_PASSWORD",
@@ -96,7 +99,12 @@ import opensearch_pipeline  # noqa: E402
 print("opensearch_pipeline:", opensearch_pipeline.__file__)
 from opensearch_pipeline.ops_monitor import main  # noqa: E402
 
-# 阶段1（先上，只读、零写风险）：
-sys.exit(main(["--only", "reconcile_ha3", "reconcile_oss"]))
-# 阶段2（验稳后换成全量，含 qa_rollup 写 qa_daily_metrics）：
+# 阶段1.5（2026-07-16 扫描停摆调查后口径）：三个只读对账 + 队列老化 + 摄取漏斗。
+# unregistered_raw = raw/ 新文件未注册检测（摄取无周期调度、全靠手工批——这是"替人看一眼"的
+# 那只眼睛;可摄取+超24h 未注册才告警,旧格式/隔离区/自助上传形状不驱动红）。
+# ⚠️ unregistered_raw 需要 opensearch_pipeline_production.zip ≥ 2026-07-16(含 CS4c)——
+#    旧 zip 下该作业名会被静默忽略(不报错),重打包后自动生效。
+sys.exit(main(["--only", "reconcile_ha3", "reconcile_oss", "unregistered_raw",
+               "queue_aging", "ingest_funnel"]))
+# 阶段2（验稳后换成全量，含 qa_rollup 写 qa_daily_metrics + reconcile_raw）：
 # sys.exit(main([]))
