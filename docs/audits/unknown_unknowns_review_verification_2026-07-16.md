@@ -114,3 +114,36 @@ Scope：`routes/agent.py`（3 个 `_enforce_rate_limit` 调用点）、`console-
 **批次1 → 批次2 →（3a + 4 + 6 并行）→ 批次5 → 3b/3c**；批次7 与代码批次解耦、随时可推进。理由：批次1 消灭「错误的成功状态」这一最大真值风险；批次2 是用户可感知面；3a/4/6 全是小而独立的收口；批次5 动 config/readiness 语义面最广、放后集中评审；3b 是唯一 L 级、且 workbench 本就 staging-only 不阻塞其他面。
 
 外审「0-24h 保持关闭」项核对：RAG_ONTOLOGY_TOOLS_ENABLE、ontology auto ack、Redis relay 在 HEAD 均默认 OFF——**现状已满足，无需动作**。
+
+## 6. 执行状态（2026-07-16 同日落地）
+
+| 批次 | 提交 | 状态 |
+|---|---|---|
+| 批次1 run 完成真值+预算硬上限 | 0cb132a | ✅ |
+| 批次2 轮询配额+断流恢复协议 | 07a3037 | ✅ |
+| 批次3a 文案诚实化+note 强制 | 2908434 | ✅ |
+| 批次3c invariants 扩面 4→8 族 | ae54385 | ✅ |
+| 批次4 coverage 分母+原子播种+迁移可重放 | c5b30e8 | ✅ |
+| 批次5 readiness/flag 拆杆/kill-switch/TTL/拓扑 | 733d2c4 | ✅ |
+| 批次6 CI agent 真库契约门 | 36ce43e | ✅ |
+| 批次3b 对象详情+抽检数据模型（L） | 未动工 | ⏳ 等 PMC gate 有眉目再排 |
+| 批次7 user-gated（签字/部署证据/attestation） | — | ⏳ Sam/组织侧 |
+
+落地基线：本地全量 pytest **3803 passed / 1 skipped**（本地 MySQL 接线，含 agent/ontology
+真库契约与新增故障注入/预算边界/cross-heal/双跑重放族）；console vitest 412 绿 +
+vue-tsc 0 错；ruff 全绿。
+
+### 部署注意（下次 SAE 重打包生效清单）
+
+1. **P0-07d 姿态断言（行为变化）**：production/staging 启动要求
+   `RAG_REQUIRE_AUTH=true` + `RAG_ACL_FAIL_CLOSED=true`，或过渡期显式
+   `RAG_ALLOW_LEGACY_OPEN_PROD=ack`——**环境变量不加，新包起不来**（有意 fail-closed）。
+2. 新 env（默认全保守，不加=现状语义）：`RAG_ONTOLOGY_WRITE_TOOLS_ENABLE`(off，HIGH_WRITE
+   独立杆)、`RAG_AGENT_EVENT_QUEUE_MAX`(10000，<=0 回退无界)、`RAG_EXPECTED_REPLICAS`(1)、
+   `RAG_ONTOLOGY_POPULATION_MAX_AGE_D`(35)；`RAG_AGENT_APPROVAL_TTL_S` 未设时自动跟随
+   `RAG_AGENT_SUSPENDED_TTL_S`。
+3. readiness 新状态词：`schema_migrations=unapplied:N`、`schema_contract`、`kill_switch`、
+   `ontology_backfill`——strict（RAG_READY_SCHEMA_STRICT）仍默认 off，staging 验证后再开
+   （开后 unapplied/unavailable 一律摘流量）。
+4. 038a：staging/prod 重跑 `apply_ontology_dbs.py --commit` 会对已记原行的库自动重放
+   守卫化 038 并记 `@038a` 台账行（no-op DDL）；台账跳过默认开，`--force-replay` 可全量。
