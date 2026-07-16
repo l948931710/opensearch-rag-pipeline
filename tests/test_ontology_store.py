@@ -764,6 +764,84 @@ def test_invariant_scan_clean_and_dirty(store, ns):
     assert any(v["case_id"] == case_id for v in report2["alias_open_case"])
 
 
+def test_invariant_scan_batch3c_new_families(store, ns):
+    """批次3c（unknown-unknowns P1-09）扩面四族：superseded_by 悬空/环 · active link
+    死端点 · normalized_title NULL（038 回填缺口）· population 快照陈旧（RDS 臂；
+    memory twin 的 snapshot_at 是逻辑 tick，恒空）。违例状态绕过服务层直改内部
+    状态/直发 SQL 制造——这正是扫描器存在的理由（写路径已有闸，扫的是绕闸与历史）。"""
+    from opensearch_pipeline.ontology.invariants import scan_invariants
+    from opensearch_pipeline.ontology.store import MemoryOntologyStore
+
+    prod = _mint(store, "product")
+    sku = _mint(store, "sku")
+    nulled = _mint(store, "product")
+    iid = store.insert_identifier(ns, "s1", "S1", prod["object_id"],
+                                  method="seed", _caller="test")
+    i_a = store.insert_identifier(ns, "s2", "S2", prod["object_id"],
+                                  method="seed", _caller="test")
+    i_b = store.insert_identifier(ns, "s3", "S3", prod["object_id"],
+                                  method="seed", _caller="test")
+    lid = store.add_link(sku["object_id"], prod["object_id"], "sku_of_product",
+                         _caller="test")
+    stale_ns = f"{ns}_stalepop"
+
+    if isinstance(store, MemoryOntologyStore):
+        with store._lock:
+            store._identifiers[iid]["superseded_by"] = "0" * 26          # 悬空
+            store._identifiers[i_a]["superseded_by"] = i_b               # 二元环
+            store._identifiers[i_b]["superseded_by"] = i_a
+            store._objects[prod["object_id"]]["status"] = "retired"      # 绕过级联退役
+            store._objects[nulled["object_id"]]["normalized_title"] = None
+    else:
+        conn = store._conn()
+        db = store._db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE {db}.ontology_identifier SET superseded_by=%s "
+                            "WHERE identifier_id=%s", ("0" * 26, iid))
+                cur.execute(f"UPDATE {db}.ontology_identifier SET superseded_by=%s "
+                            "WHERE identifier_id=%s", (i_b, i_a))
+                cur.execute(f"UPDATE {db}.ontology_identifier SET superseded_by=%s "
+                            "WHERE identifier_id=%s", (i_a, i_b))
+                cur.execute(f"UPDATE {db}.ontology_object SET status='retired' "
+                            "WHERE object_id=%s", (prod["object_id"],))
+                cur.execute(f"UPDATE {db}.ontology_object SET normalized_title=NULL "
+                            "WHERE object_id=%s", (nulled["object_id"],))
+                cur.execute(f"INSERT INTO {db}.ontology_source_population "
+                            "(namespace, records, source, snapshot_at) "
+                            "VALUES (%s, 10, 'seeding', DATE_SUB(NOW(3), INTERVAL 40 DAY)) "
+                            "ON DUPLICATE KEY UPDATE "
+                            "snapshot_at=DATE_SUB(NOW(3), INTERVAL 40 DAY)", (stale_ns,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    try:
+        rep = scan_invariants(store)
+        assert any(v["identifier_id"] == iid and v["reason"] == "dangling"
+                   for v in rep["superseded_broken"])
+        assert any(v["reason"] == "cycle" and v["identifier_id"] in (i_a, i_b)
+                   for v in rep["superseded_broken"])
+        assert any(v["link_id"] == lid for v in rep["active_link_dead_endpoint"])
+        assert any(v["object_id"] == nulled["object_id"]
+                   for v in rep["normalized_title_null_active"])
+        if isinstance(store, MemoryOntologyStore):
+            assert rep["population_snapshot_stale"] == []   # tick 语义不可判，恒空
+        else:
+            assert any(v["namespace"] == stale_ns
+                       for v in rep["population_snapshot_stale"])
+    finally:
+        if not isinstance(store, MemoryOntologyStore):
+            conn = store._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"DELETE FROM {store._db()}.ontology_source_population "
+                                "WHERE namespace=%s", (stale_ns,))
+                conn.commit()
+            finally:
+                conn.close()
+
+
 # ── PR-G：sem fallback fail-closed / DDL+服务层约束 / stewardship desired-state ──
 
 

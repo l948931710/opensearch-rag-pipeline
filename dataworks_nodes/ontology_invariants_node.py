@@ -2,8 +2,10 @@
 """
 DataWorks PyODPS 3 节点 — ontology_invariants：本体不变量对账 reaper（PR-H，P1「可观测闭环」）
 
-  · 动作   只读扫描四类不变量（孤儿对象 / active 别名×open case 并存 / resolved case
-           断链 / active 别名指非 active 对象）——原子化（PR-C）之后这些半状态只能来自
+  · 动作   只读扫描八类不变量（孤儿对象 / active 别名×open case 并存 / resolved case
+           断链 / active 别名指非 active 对象 / superseded_by 悬空·环 / active link 端点
+           非 active / normalized_title 回填缺口 / population 快照陈旧——后四类=
+           unknown-unknowns 批次3c 扩面）——原子化（PR-C）之后这些半状态只能来自
            历史脏数据或未知 bug，出现即应有人来看。
   · 播报   JSON 报告进节点日志；违例 → exit 1（DataWorks 标失败=告警面），零违例 exit 0。
   · 纪律   **绝不修数**（处置权在工作台/人工——reaper 自动改数会把 bug 掩埋成"自愈"）。
