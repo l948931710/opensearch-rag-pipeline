@@ -238,6 +238,32 @@ class AuthzDecision:
     reason: str = "ok"
 
 
+def _production_sublines() -> List[str]:
+    """已批准生产子线(不含伞值自身)。单一来源:retriever._PRODUCTION_UMBRELLA_OWNERS。"""
+    from opensearch_pipeline.retriever import _PRODUCTION_UMBRELLA_OWNERS
+
+    return sorted(x for x in _PRODUCTION_UMBRELLA_OWNERS if x != "production")
+
+
+def upload_target_depts(identity: KbIdentity) -> List[str]:
+    """上传/升版「目标 owner_dept」选项(2026-07-17 Sam 拍板:生产子线开放为写目标)。
+
+    = managed_owner_depts,其中 'production' 展开为 [伞值 + 全部已批准子线]。要点:
+    - 【不】扩大 writer 受众:仍要求 production 在 managed 集合,只细化目标粒度;
+    - 与 expand_managed_owner_depts(管理面【比对】用)刻意分函数——cfc1bb9 的
+      "不得喂给上传下拉"禁令针对的是复用读侧共享展开(marketing 面),本函数
+      只做 production 家族内细化,不含任何共享面;
+    - 子线不在 _VALID_ACL_GROUPS(那是读组白名单):authorize_upload 对上传目标
+      单独放行子线。
+    """
+    out: List[str] = []
+    for d in managed_owner_depts(identity):
+        out.append(d)
+        if d == "production":
+            out.extend(_production_sublines())
+    return out
+
+
 def authorize_upload(
     identity: KbIdentity,
     owner_dept: str,
@@ -260,7 +286,8 @@ def authorize_upload(
         return AuthzDecision(False, False, "not_admin")
 
     owner = _SANITIZE_RE.sub("", (owner_dept or "").strip())
-    if not owner or owner not in _valid_owner_depts():
+    # 合法目标 = 读组白名单 ∪ 生产子线(2026-07-17 写目标细化;子线永不归一回伞值)
+    if not owner or (owner not in _valid_owner_depts() and owner not in _production_sublines()):
         return AuthzDecision(False, False, "invalid_owner_dept")
 
     level = (permission_level or "").strip().lower()
@@ -269,9 +296,10 @@ def authorize_upload(
         return AuthzDecision(False, False, "invalid_permission_level")
 
     is_kb_admin = identity.role == ROLE_KB_ADMIN
-    managed = set(managed_owner_depts(identity))
+    managed = set(upload_target_depts(identity))
 
-    # 写目标必须在管理范围内（kb_admin 拥有全部，已含于 managed）。
+    # 写目标必须在管理范围内（kb_admin 拥有全部，已含于 managed；
+    # 管 production 伞组 ⇒ 家族子线亦为合法目标,见 upload_target_depts）。
     if owner not in managed:
         return AuthzDecision(False, False, "owner_dept_not_managed")
 

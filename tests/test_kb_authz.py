@@ -198,3 +198,35 @@ def test_kb_owner_scope_sql_expands_umbrella():
     hr_da = KbIdentity.build(role="dept_admin", granted_owner_depts=["hr"])
     _, hr_params = _kb_owner_scope_sql(hr_da)
     assert hr_params == ["hr"]
+
+
+def test_upload_target_depts_production_sublines():
+    """2026-07-17 拍板:生产子线开放为上传目标——只细化目标粒度,不扩 writer 受众。"""
+    prod_admin = KbIdentity(user_id="p1", role=ka.ROLE_DEPT_ADMIN,
+                            granted_owner_depts=("production",))
+    hr_admin = KbIdentity(user_id="h1", role=ka.ROLE_DEPT_ADMIN, granted_owner_depts=("hr",))
+    kb_admin = KbIdentity(user_id="k1", role=ka.ROLE_KB_ADMIN)
+    employee = KbIdentity(user_id="e1", role=ka.ROLE_EMPLOYEE)
+
+    # 下拉选项 = 伞值 + 5 个已批准子线(与 retriever 伞形白名单单一来源)
+    opts = ka.upload_target_depts(prod_admin)
+    assert opts[0] == "production"
+    assert set(o for o in opts if o.startswith("production_")) == {
+        "production_mold", "production_paper_cup", "production_thermoforming",
+        "production_injection", "production_straw"}
+    # 非 production 管理员:无子线
+    assert all(not o.startswith("production_") for o in ka.upload_target_depts(hr_admin))
+    # kb_admin:全量写白名单 + 子线
+    assert "production_straw" in ka.upload_target_depts(kb_admin)
+
+    # 裁决:管 production → 子线放行
+    assert ka.authorize_upload(prod_admin, "production_straw", "dept_internal").allowed
+    assert ka.authorize_upload(kb_admin, "production_injection", "dept_internal").allowed
+    # 不管 production → 子线拒(受众未扩大)
+    d = ka.authorize_upload(hr_admin, "production_straw", "dept_internal")
+    assert not d.allowed and d.reason == "owner_dept_not_managed"
+    # 员工恒拒
+    assert not ka.authorize_upload(employee, "production_straw", "dept_internal").allowed
+    # 双拼写/未批准值仍非法(白名单外 fail-closed)
+    bad = ka.authorize_upload(prod_admin, "production_papercup", "dept_internal")
+    assert not bad.allowed and bad.reason == "invalid_owner_dept"

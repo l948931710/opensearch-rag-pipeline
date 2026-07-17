@@ -6,7 +6,7 @@ import { useKb } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 
 const {
-  verCtx, newTitle, newOwner, newPerm, newShareDepts, shareTargets, ownerDepts, selectedNames,
+  verCtx, newTitle, newOwner, newPerm, newShareDepts, shareTargets, uploadTargetDepts, selectedNames,
   dupWarn, uploadBusy, uploadMsg, uploadErr, uploadOk, contentDupMsg, uploadQueue,
   onFileSelected, doUpload, exitVersionMode, maxUploadMb,
 } = useKb()
@@ -99,7 +99,7 @@ function onDrop(e: DragEvent) {
         归属部门
         <select v-model="newOwner" class="ui-select rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
           <option value="" disabled>选择部门</option>
-          <option v-for="o in ownerDepts" :key="o" :value="o">{{ deptLabel(o) }}</option>
+          <option v-for="o in uploadTargetDepts" :key="o" :value="o">{{ deptLabel(o) }}</option>
         </select>
       </label>
       <label class="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-2">

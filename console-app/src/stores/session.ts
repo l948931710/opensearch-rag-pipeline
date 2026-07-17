@@ -10,6 +10,9 @@ export interface Identity {
   aclGroups: string[]
   canManage: boolean
   managedOwnerDepts: string[]
+  /** 上传「归属部门」下拉选项(= managed + 生产子线细化);旧后端缺字段时回退 managed。
+   *  可选:测试夹具/旧调用点可缺省,消费侧(useKb.uploadTargetDepts)已兜底回退。 */
+  uploadTargetDepts?: string[]
 }
 
 /** 会话单一事实来源：token + 身份 + 就绪/错误态。token 只存内存（不落 localStorage，避免持久泄露）。 */
@@ -38,5 +41,8 @@ export function toIdentity(d: Record<string, any>): Identity {
     aclGroups: Array.isArray(d.acl_groups) ? d.acl_groups : [],
     canManage: !!d.can_manage_kb,
     managedOwnerDepts: Array.isArray(d.managed_owner_depts) ? d.managed_owner_depts : [],
+    uploadTargetDepts: Array.isArray(d.upload_target_depts) && d.upload_target_depts.length
+      ? d.upload_target_depts
+      : (Array.isArray(d.managed_owner_depts) ? d.managed_owner_depts : []),
   }
 }
