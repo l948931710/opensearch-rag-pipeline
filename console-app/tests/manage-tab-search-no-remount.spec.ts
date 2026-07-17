@@ -34,9 +34,11 @@ async function mockKbAdmin(page: import('@playwright/test').Page) {
 test.describe('回归门 — 管理台切 tab / 搜索不整页重建', () => {
   test.beforeEach(async ({ page }) => { await mockKbAdmin(page); });
 
-  test('切 tab 不重挂视图、不重新全量拉取数据（黑屏 + 全量重载根因）', async ({ page }) => {
-    // /api/kb/stats 只由 ManageView onMounted 触发、DocTable 不碰它 → 用作「视图是否被重挂」的探针：
-    // key=path（修复）切 tab 不重挂 → 不再请求；key=fullPath（bug）切 tab 重挂 onMounted → 再请求一次。
+  test('切 tab / 搜索抖动不重挂视图（黑屏 + 全量重载根因）', async ({ page }) => {
+    // /api/kb/stats 作「视图是否被重挂」的探针。注意 9ba0f90 起 ManageView 按 tab 惰性加载：
+    // 【首次】激活某 tab 会合法补拉一次（_loadedTabs 记账）——门只断言首次激活之后的
+    // query 抖动（搜索输入）与 tab 二次往返不再触发任何 stats 拉取：
+    // key=path（修复）→ 0；key=fullPath（bug）→ 每次 query 变化都重挂 onMounted 重拉。
     let statsHits = 0;
     page.on('request', (r) => { if (r.url().includes('/api/kb/stats')) statsHits++; });
 
@@ -45,17 +47,26 @@ test.describe('回归门 — 管理台切 tab / 搜索不整页重建', () => {
     await expect(zone.getByRole('tab', { name: /概览看板/ })).toBeVisible();
     // 初次挂载已拉过一次概览统计 → 建立基线。
     await expect.poll(() => statsHits, { message: '初始应拉取一次 /api/kb/stats' }).toBeGreaterThan(0);
-    const before = statsHits;
 
-    // 切到「文档管理」——只改 URL query（tab=docs），路由仍是 /manage。
+    // 首次进「文档管理」：允许惰性加载的一次性补拉。
     await zone.getByRole('tab', { name: /文档管理/ }).click();
     await expect(page).toHaveURL(/tab=docs/);
     await expect(page.getByPlaceholder('搜索文档名…')).toBeVisible();   // 文档管理页确已渲染
-    await page.waitForTimeout(400);   // 留足「若重挂则 onMounted 会再次拉取」的时间窗
+    await page.waitForTimeout(400);
+    const afterFirstEntry = statsHits;
+
+    // 探针①：搜索输入只改 URL query——fullPath key（bug）会每字销毁重建整个视图。
+    await page.getByPlaceholder('搜索文档名…').fill('sop');
+    await page.waitForTimeout(400);
+    // 探针②：tab 二次往返——docs 已在 _loadedTabs，重挂（onMounted 重跑）才会再拉。
+    await zone.getByRole('tab', { name: /概览看板/ }).click();
+    await zone.getByRole('tab', { name: /文档管理/ }).click();
+    await expect(page.getByPlaceholder('搜索文档名…')).toBeVisible();
+    await page.waitForTimeout(400);
 
     expect(
-      statsHits - before,
-      '切 tab 只改 query，不应重挂 ManageView 重跑 onMounted 重拉全部数据（fullPath key → 重建 → 黑屏闪 + 全量重载）',
+      statsHits - afterFirstEntry,
+      '首次激活后的搜索输入 / tab 往返只改 query，不应重挂 ManageView 重拉数据（fullPath key → 重建 → 黑屏闪 + 全量重载）',
     ).toBe(0);
   });
 
