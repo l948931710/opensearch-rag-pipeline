@@ -125,6 +125,7 @@ class LeaseSet:
         self._lock = threading.Lock()
         self._epochs = {}       # type: Dict[DocVersionKey, int]
         self._last_renew = {}   # type: Dict[DocVersionKey, float]
+        self._last_renew_all = 0.0
 
     # -- 注册 --------------------------------------------------------------
     def fetch_and_register(self, cursor, keys: Iterable[DocVersionKey]) -> int:
@@ -184,6 +185,52 @@ class LeaseSet:
                             % (key[0], key[1], ep))
         with self._lock:
             self._last_renew[key] = time.monotonic()
+
+    def should_renew(self) -> bool:
+        """批量续租的免 DB 节流预判——调用点先问这句，到期才开池连接跑 renew_all。"""
+        if not lease_enabled():
+            return False
+        with self._lock:
+            if not self._epochs:
+                return False
+            return time.monotonic() - self._last_renew_all >= lease_renew_s()
+
+    def renew_all(self, cursor) -> int:
+        """批量续租本集全部 key（认领是批语义——逐 key 完成时续租护不住还在排队的
+        文档，故按整集续）。谓词只按 holder（epoch 不进谓词：epoch 只在认领时变，
+        变则 holder 必被改写，holder=me 即足判自有）。rowcount 短缺 ⇒ 部分被接管
+        ⇒ 回读 holder=me 存活集、丢弃已失 key（不 raise——失主文档走到栅栏写时
+        自然 LeaseLost 弃单文档）。返回丢弃数。"""
+        if not lease_enabled():
+            return 0
+        with self._lock:
+            keys = list(self._epochs.keys())
+        if not keys:
+            return 0
+        clause = " OR ".join(["(doc_id = %s AND version_no = %s)"] * len(keys))
+        params = (lease_ttl_s(),) + tuple(p for k in keys for p in k) + (holder_id(),)
+        cursor.execute(
+            "UPDATE document_version SET lease_expires_at = NOW(3) + INTERVAL %s SECOND"
+            " WHERE (" + clause + ") AND lease_holder = %s", params)
+        lost = 0
+        if cursor.rowcount < len(keys):
+            cursor.execute(
+                "SELECT doc_id, version_no FROM document_version"
+                " WHERE (" + clause + ") AND lease_holder = %s",
+                tuple(p for k in keys for p in k) + (holder_id(),))
+            alive = {(r[0], int(r[1])) for r in (cursor.fetchall() or ())}
+            for k in keys:
+                if k not in alive:
+                    self.discard(k)
+                    lost += 1
+                    logger.warning("ingest lease lost (renew_all): doc=%s v=%s", k[0], k[1])
+        now = time.monotonic()
+        with self._lock:
+            self._last_renew_all = now
+            for k in keys:
+                if k in self._epochs:
+                    self._last_renew[k] = now
+        return lost
 
     # -- 栅栏 --------------------------------------------------------------
     def fence_where_sql(self, key: DocVersionKey) -> str:

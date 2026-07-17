@@ -29,6 +29,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from opensearch_pipeline.config import get_config, load_config
+from opensearch_pipeline import ingest_lease
 from opensearch_pipeline.reindex_states import (
     STAGE3_CHUNK_RESELECT_INDEX_STATUS,
     DocVersionIndexStatus,
@@ -233,13 +234,18 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                         print("[Orchestrator] No pending canonical documents found (or all preempted by another instance).")
                     else:
                         # 仅对本实例锁定到的行置 LOADING（按 id），提交后释放行锁。
+                        # PR-4：认领顺带盖租约戳（flag off 时片段为空=SQL 逐字节现状），
+                        # 并在同一认领事务内回读 epoch 登记——后续 DAG-2 节点经共享 ctx
+                        # 的 LeaseSet 续租/栅栏（dag.run 浅拷贝 ctx，对象共享）。
                         claimed_ids = [r[12] for r in rows]
                         _ph = ",".join(["%s"] * len(claimed_ids))
                         cursor.execute(
                             "UPDATE document_version SET content_process_status = 'LOADING', "
-                            f"updated_at = NOW() WHERE id IN ({_ph})",
-                            claimed_ids,
+                            f"updated_at = NOW(){ingest_lease.claim_set_sql()} WHERE id IN ({_ph})",
+                            ingest_lease.claim_set_params() + tuple(claimed_ids),
                         )
+                        ingest_lease.get_lease_set(ctx).fetch_and_register(
+                            cursor, [(r[0], int(r[1])) for r in rows])
                         conn.commit()
                         print(f"[Orchestrator] Preempted {preempted_count} documents for processing.")
                     has_load_errors = False
@@ -299,16 +305,27 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             has_load_errors = True
                             print(f"    ⚠️ OSS/Local canonical read failure: {read_error}")
                             if not simulate_db:
+                                # PR-4：终态写带栅栏+清租约（off/未登记时片段为空=现状）；
+                                # 被接管的行 rowcount=0 → LeaseLost → 该文档归新持有者，跳过。
+                                _lk = (doc_id, int(version_no))
+                                _ls = ingest_lease.get_lease_set(ctx)
                                 try:
-                                    cursor.execute("""
+                                    cursor.execute(f"""
                                         UPDATE document_version
                                         SET content_process_status = 'FAILED',
                                             content_process_error = %s,
                                             retry_count = retry_count + 1,
-                                            processed_at = NOW()
-                                        WHERE doc_id = %s AND version_no = %s
-                                    """, (read_error, doc_id, version_no))
+                                            processed_at = NOW(){ingest_lease.clear_set_sql()}
+                                        WHERE doc_id = %s AND version_no = %s{_ls.fence_where_sql(_lk)}
+                                    """, (read_error, doc_id, version_no)
+                                       + _ls.fence_where_params(_lk))
+                                    _ls.check_fenced_write(cursor, _lk)
                                     conn.commit()
+                                    _ls.discard(_lk)  # 终态已落，本地释放
+                                except ingest_lease.LeaseLost:
+                                    conn.rollback()
+                                    print(f"    ⚠️ Lease lost on {doc_id} v{version_no} — "
+                                          f"skipped (preempted by another holder)")
                                 except Exception as db_err:
                                     print(f"    ⚠️ Failed to update document_version status for OSS read error: {db_err}")
                             continue
@@ -596,22 +613,24 @@ def _reset_stale_stage2_locks() -> int:
     （静默 wedge）。复用 node_acquire_index_lock 的 2h 失效约定：重置为 FAILED 并
     retry_count+1，由既有抢占谓词 (FAILED AND retry_count<3) 自然重新入队；持续把进程
     搞崩的"毒文档"3 次后停在 FAILED 等人工检查，不会无限崩溃循环。
-    updated_at=NOW() 显式刷新：并发实例中只有第一个接管成功（changed-rows 语义）。"""
+    updated_at=NOW() 显式刷新：并发实例中只有第一个接管成功（changed-rows 语义）。
+    PR-4：flag 开时判死改「租约到期」（带租约行 TTL 级恢复、按时续租的存活运行绝不
+    被接管）；无租约行（旧包/裸跑认领）维持 2h 年龄兜底——takeover_where_sql 双臂。"""
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
     conn = None
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 UPDATE document_version
                 SET content_process_status = 'FAILED',
                     content_process_error = CONCAT('[STALE_LOCK_TAKEOVER] was ',
-                        content_process_status, ' >2h without progress; reset for retry'),
+                        content_process_status, ' stale (lease expired / >2h no progress); reset for retry'),
                     retry_count = retry_count + 1,
-                    updated_at = NOW()
+                    updated_at = NOW(){ingest_lease.clear_set_sql()}
                 WHERE content_process_status IN ('LOADING', 'PROCESSING')
                   AND status = 'active'
-                  AND updated_at < NOW() - INTERVAL 2 HOUR
+                  AND {ingest_lease.takeover_where_sql()}
             """)
             n = cur.rowcount
             conn.commit()
