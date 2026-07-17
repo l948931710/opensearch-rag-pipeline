@@ -148,6 +148,28 @@ def _get_registry_store():
     return _REGISTRY_STORE
 
 
+_DISPATCH_OUTBOX = None
+_DISPATCHER = None
+
+
+def _get_dispatch_outbox():
+    """PR-3 Stage A：durable dispatch 命令表单例。测试 patch 本函数。"""
+    global _DISPATCH_OUTBOX
+    if _DISPATCH_OUTBOX is None:
+        from opensearch_pipeline.agent_runtime.dispatch_outbox import RDSDispatchOutbox
+        _DISPATCH_OUTBOX = RDSDispatchOutbox()
+    return _DISPATCH_OUTBOX
+
+
+def _get_dispatcher():
+    """PR-3 Stage A：durable dispatcher 单例（fast-path 认领 + 恢复扫描共用一个 holder）。"""
+    global _DISPATCHER
+    if _DISPATCHER is None:
+        from opensearch_pipeline.agent_runtime.durable_dispatcher import DurableDispatcher
+        _DISPATCHER = DurableDispatcher(_get_dispatch_outbox(), _dispatch_recovered_submit)
+    return _DISPATCHER
+
+
 def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
     """后台收尸+对账线程（每进程一条，daemon），每轮三步：
     ①run_store.reap_stale_runs——stale running→failed、**stale resuming→回边 suspended**
@@ -213,6 +235,25 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
                         logger.warning("B6 对账失败（下轮重试）", exc_info=True)
 
     threading.Thread(target=_loop, name="agent-run-reaper", daemon=True).start()
+
+
+_DISPATCHER_STARTED = False
+
+
+def _start_dispatcher() -> None:
+    """PR-3 Stage A：durable dispatch 恢复扫描线程（flag 开时随 runtime 启动，每进程一条
+    daemon）。启动即先跑一轮——把进程重启前的欠账（queued/lease 过期命令）先补上。"""
+    global _DISPATCHER_STARTED
+    from opensearch_pipeline.agent_runtime.durable_dispatcher import durable_dispatch_enabled
+    if _DISPATCHER_STARTED or not durable_dispatch_enabled():
+        return
+    _DISPATCHER_STARTED = True
+    dispatcher = _get_dispatcher()
+    stop = threading.Event()
+    threading.Thread(target=lambda: dispatcher.run_forever(stop),
+                     name="agent-durable-dispatch", daemon=True).start()
+    logger.warning("durable dispatch 恢复扫描已启动（holder=%s，lease=%ss）",
+                   dispatcher.holder, dispatcher.lease_s)
 
 
 _DRAINED = False
@@ -337,11 +378,23 @@ def _build_runtime():
     import atexit
     atexit.register(_drain_runtime)
     _start_reaper(run_store, approval_store, runtime=(registry, gateway, executor))
+    _start_dispatcher()
     return registry, gateway, executor, run_store
 
 
 def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _clean_answer_text(final_text: str) -> str:
+    """最终答案落库/记忆前的清洗（agent_ask 与 PR-3 恢复重驱共用）：预算模式引入的
+    [文档N] header 内部编号 + 空 <think> 残壳（流式增量的瞬时残留由 content_blocks
+    替换帧覆盖；评审 R①-7/R②-2）。"""
+    from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
+    if _budget_enabled():
+        from opensearch_pipeline.llm_generator import strip_doc_citations
+        return _THINK_STUB_PATTERN.sub("", strip_doc_citations(final_text))
+    return final_text
 
 
 def _flatten_retrieved(per_call_chunks) -> Optional[list]:
@@ -650,14 +703,7 @@ def agent_ask(req: AskRequest, request: Request,
                 + snapshot.messages
                 + [{"role": "user", "content": req.question}])
 
-    def _clean_final(final_text: str) -> str:
-        from opensearch_pipeline.agent_tools.knowledge_search import _budget_enabled
-        if _budget_enabled():
-            # 预算模式引入 [文档N] header → 落库/记忆前清内部编号 + 空 <think> 残壳
-            # （流式增量的瞬时残留由 content_blocks 替换帧覆盖；评审 R①-7/R②-2）
-            from opensearch_pipeline.llm_generator import strip_doc_citations
-            return _THINK_STUB_PATTERN.sub("", strip_doc_citations(final_text))
-        return final_text
+    _clean_final = _clean_answer_text          # PR-3：与恢复重驱路径共用同一清洗（模块级）
 
     # P0-01（unknown-unknowns 批次1）：完成写一分为二——
     # ① _persist_answer：durable 真值写。executor 在 running→succeeded **同一事务**内
@@ -708,18 +754,48 @@ def agent_ask(req: AskRequest, request: Request,
                        answer_text=None, conversation_id=conv, answer_status="AGENT_ERROR",
                        model_name="agent", error_message=(err or "")[:500])
 
+    # PR-3 Stage A（RAG_AGENT_DURABLE_DISPATCH，默认 off）：受理即落 durable 命令
+    # （command-as-truth）——API 返回后进程崩溃/滚动发布，恢复扫描按命令重驱，用户
+    # 的问题不再静默蒸发。enqueue/认领失败回退直通路径（可用性优先，最常见原因=
+    # 043 未 apply，响亮告警）；容量/会话忙沿用 429/409（命令诚实收口 failed，UX 零变化）。
+    durable_cmd = None
+    from opensearch_pipeline.agent_runtime.durable_dispatcher import durable_dispatch_enabled
+    if durable_dispatch_enabled():
+        try:
+            _dispatcher = _get_dispatcher()
+            _cmd_id = _get_dispatch_outbox().enqueue(
+                thread_id=thread_id, user_id=identity.user_id, channel="console",
+                payload={"question": req.question, "thinking": thinking,
+                         "conversation_id": conv, "message_id": message_id,
+                         "request_id": rid})
+            if _dispatcher.claim_for_request(_cmd_id):
+                durable_cmd = (_dispatcher, _cmd_id)
+            else:
+                logger.warning("durable dispatch 命令 %s 认领失败（他方抢先？）——直通执行",
+                               _cmd_id)
+        except Exception:   # noqa: BLE001 — 受理面故障不拦 ask（检查 043 是否已 apply）
+            logger.error("durable dispatch 受理失败——回退直通路径", exc_info=True)
+
     try:
         handle = executor.submit(ctx, loop, messages, tools,
                                  on_complete=_remember, on_failure=_report_failure,
                                  on_complete_durable=_persist_answer)
     except RunRejected:
+        if durable_cmd:
+            durable_cmd[0].fail_fast(durable_cmd[1], "容量已满（429）")
         raise HTTPException(status_code=429, detail="Agent 并发已满，请稍后再试")
     except ThreadBusy:
         # A1（schema/037）：同 thread 已有非终态 run（含 suspended 等审批）——DB 唯一键
         # 裁决的串行化，并发双 submit 恰一个到这里。409 与 429 语义分开：不是容量满，
         # 是该会话上一问未收尾。
+        if durable_cmd:
+            durable_cmd[0].fail_fast(durable_cmd[1], "会话忙（409）")
         raise HTTPException(status_code=409,
                             detail="该会话已有回答在进行中（或有待审批任务未收尾），请稍后再试")
+    if durable_cmd:
+        # 绑 run（at-most-once 分界）+ 收口 done——此后崩溃由 run 机器（心跳/reaper/
+        # 完成事务）负责，命令绝不重执行。fail-open：收口失败恢复扫描按已绑收敛。
+        durable_cmd[0].bind_and_done(durable_cmd[1], handle.run_id)
 
     # U1/U2（重审计 §5，schema/036）：message_id 落 agent_run——审批续跑复用它落库
     # （反馈投票不悬空），run 详情经它从 qa_session_log 取回最终答案。
@@ -1167,6 +1243,111 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
                        error_message=(err or "")[:500])
 
     return message_id, _remember, _report_failure, _persist_answer
+
+
+def _dispatch_recovered_submit(cmd: dict):
+    """PR-3 Stage A：恢复重驱一条 submit 命令（进程崩溃/滚动发布留下的欠账）。
+    返回 run_id（dispatcher 据此 bind+done）；抛 DispatchRetryLater=本轮不可重建
+    （租约到期自然重试）；其余异常=不可重建（dispatcher 收口 failed）。
+
+    语义（设计 D4）：
+    - **身份现解**（铁律 5）：ACL 绝不用提交时快照——解析异常=瞬断可重试；
+      解析为空=最小权限继续（只读 ask 的安全下界，与 resume 只读向同款）；
+    - 无 SSE 消费者：答案走完成事务落库（B6 同款 daemon 排空），发起人从会话
+      历史/运行中心取回；message_id 沿 payload 原值（反馈投票/读回锚点不漂移）。"""
+    from opensearch_pipeline.agent_runtime import (
+        DefaultAgentLoop, ExecutionContext, make_model_fn)
+    from opensearch_pipeline.agent_runtime.durable_dispatcher import DispatchRetryLater
+    from opensearch_pipeline.agent_runtime.executor import RunRejected
+    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
+
+    payload = cmd.get("payload") or {}
+    question = (payload.get("question") or "").strip()
+    if not question:
+        raise ValueError("payload 缺 question（不可重建）")
+    user_id = cmd.get("user_id") or ""
+    thread_id = cmd.get("thread_id") or ""
+    conv = payload.get("conversation_id")
+    message_id = payload.get("message_id") or generate_message_id()
+    registry, gateway, executor, _run_store = _get_runtime()
+
+    groups: list = []
+    role = "employee"
+    try:
+        from opensearch_pipeline.dingtalk_identity import (
+            _resolve_user_identity, resolve_kb_identity)
+        groups = list((_resolve_user_identity(user_id) or {}).get("dept") or [])
+        role = resolve_kb_identity(user_id).role or "employee"
+    except Exception as e:   # noqa: BLE001 — 瞬断：留 claimed 等租约到期重试
+        raise DispatchRetryLater(f"发起人身份现解瞬断: {str(e)[:120]}")
+
+    from opensearch_pipeline.agent_runtime.session_memory import default_session_memory
+    from opensearch_pipeline.session_store import SessionOwnershipError
+    memory = default_session_memory()
+    try:
+        snapshot = memory.get_snapshot(thread_id, owner=user_id)
+    except SessionOwnershipError:
+        raise ValueError("会话键与发起人不符（不可重驱）")
+
+    tier = "high" if payload.get("thinking") else "light"
+    ctx = ExecutionContext.create(
+        request_id=(payload.get("request_id") or "")[:64], user_id=user_id,
+        acl_groups=groups, roles=(role,), channel=cmd.get("channel") or "console",
+        thread_id=snapshot.thread_id, conversation_id=conv, model_profile=tier)
+    object.__setattr__(ctx, "message_id", message_id)   # P1-12：随 create_run 同事务
+    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))
+    tools = registry.list_specs(ctx)
+    messages = ([{"role": "system", "content": _agent_system_prompt()}]
+                + snapshot.messages
+                + [{"role": "user", "content": question}])
+
+    user_dept = groups[0] if groups else None
+    _persisted_tx = {"v": False}
+
+    def _persist_answer(cur, final_text: str, retrieved=None) -> None:
+        final_text = _clean_answer_text(final_text)
+        if cur is None:
+            from opensearch_pipeline.qa_logger import log_qa_session
+            log_qa_session(session_id=thread_id, message_id=message_id, user_id=user_id,
+                           user_dept=user_dept, query_text=question, answer_text=final_text,
+                           conversation_id=conv, answer_status="SUCCESS", model_name="agent",
+                           retrieved_docs=_flatten_retrieved(retrieved))
+            return
+        _persisted_tx["v"] = True
+        from opensearch_pipeline.qa_logger import insert_qa_row_tx
+        insert_qa_row_tx(cur, session_id=thread_id, message_id=message_id, user_id=user_id,
+                         user_dept=user_dept, query_text=question, answer_text=final_text,
+                         conversation_id=conv, answer_status="SUCCESS", model_name="agent",
+                         retrieved_docs=_flatten_retrieved(retrieved))
+
+    def _remember(final_text: str, retrieved=None) -> None:
+        final_text = _clean_answer_text(final_text)
+        try:
+            memory.append(thread_id, question, final_text, owner=user_id)
+        except Exception:   # noqa: BLE001
+            logger.warning("恢复重驱会话记忆写入失败（答案已 durable）", exc_info=True)
+        if _persisted_tx["v"]:
+            from opensearch_pipeline.qa_logger import qa_answer_post_commit
+            qa_answer_post_commit(message_id, user_id=user_id, conversation_id=conv,
+                                  query_text=question,
+                                  retrieved_docs=_flatten_retrieved(retrieved))
+
+    def _report_failure(err: str) -> None:
+        from opensearch_pipeline.qa_logger import log_qa_session
+        log_qa_session(session_id=thread_id, message_id=message_id, user_id=user_id,
+                       user_dept=user_dept, query_text=question, answer_text=None,
+                       conversation_id=conv, answer_status="AGENT_ERROR", model_name="agent",
+                       error_message=(err or "")[:500])
+
+    try:
+        handle = executor.submit(ctx, loop, messages, tools, on_complete=_remember,
+                                 on_failure=_report_failure,
+                                 on_complete_durable=_persist_answer)
+    except (RunRejected, ThreadBusy) as e:
+        raise DispatchRetryLater(f"执行器暂不可用: {str(e)[:120]}")
+    threading.Thread(target=lambda h=handle: [None for _ in h.events()],
+                     name=f"pr3-drain-{handle.run_id[:8]}", daemon=True).start()
+    return handle.run_id
 
 
 def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -> int:
