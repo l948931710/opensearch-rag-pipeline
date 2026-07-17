@@ -366,6 +366,39 @@ def _flatten_retrieved(per_call_chunks) -> Optional[list]:
         return None
 
 
+def _union_invocation_doc_ids(cur, run_id: Optional[str], docs: Optional[list]) -> Optional[list]:
+    """P1-06（外审核查 2026-07-16）：审批续跑的 durable retrieved_docs 此前只含**续跑段**
+    ——挂起前段的检索来源只活在 tool_invocation.receipt_json（doc_ids），completion 后
+    看板归属/发起人核对链就缺了前段依据。completion 事务**同游标**把本 run 全部成功
+    检索调用的 doc_id 并集进来：只补 doc_id 级条目（qa_facts 归属 JOIN 只需 doc_id），
+    不复制 chunk 载荷（checkpoint 不存 chunk 的 P0-A 决定不动）。fail-open。"""
+    if cur is None or not run_id:
+        return docs
+    try:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        cur.execute(
+            f"SELECT receipt_json FROM {db}.tool_invocation "
+            "WHERE run_id=%s AND status='succeeded' AND receipt_json IS NOT NULL",
+            (run_id,))
+        rows = cur.fetchall() or []
+        seen = {d.get("doc_id") for d in (docs or []) if isinstance(d, dict) and d.get("doc_id")}
+        merged = list(docs or [])
+        for (rj,) in rows:
+            try:
+                receipt = json.loads(rj) if isinstance(rj, (str, bytes)) else (rj or {})
+                for doc_id in (receipt.get("doc_ids") or []):
+                    if doc_id and doc_id not in seen:
+                        seen.add(doc_id)
+                        merged.append({"doc_id": doc_id, "source": "tool_receipt"})
+            except Exception:   # noqa: BLE001 — 单条回执坏不拖垮并集
+                continue
+        return merged or docs
+    except Exception:   # noqa: BLE001 — 并集失败沿用段内来源（绝不拦答案落库）
+        logger.warning("续跑 sources 并集失败（沿用段内来源）", exc_info=True)
+        return docs
+
+
 def _sources_frame(per_call_chunks: list) -> Optional[dict]:
     """union 各检索批次 → 与 /api/ask/stream 同源的 sources 帧：`_extract_sources` 同一
     计算 + **SourceInfo 字段集收口**（SSE 没有 response_model 那层，原样转发会把内部
@@ -689,6 +722,46 @@ class ApproveRequest(BaseModel):
     idempotency_key: Optional[str] = None
 
 
+class IdentityUnresolvable(RuntimeError):
+    """P1-08（外审核查 2026-07-16）：Approved/Edited 续跑时发起人身份**不可解析或已停用**
+    ——已批写操作绝不带疑执行。retryable=True（解析瞬断，503 重试）；False（墓碑停用，
+    403 终局——run 留 suspended 由 TTL 过期收口）。"""
+
+    def __init__(self, msg: str, *, retryable: bool):
+        super().__init__(msg)
+        self.retryable = retryable
+
+
+def _replay_decided_response(req: "ApproveRequest", run: dict):
+    """P1-07（外审核查 2026-07-16）：已受理审批命令的 HTTP 重试幂等回放。
+    202 受理后网络层重试此前恒 409——客户端无法区分「我的命令已生效」与「真冲突」。
+    run 已离开 suspended 且库内决定行与本次请求**同 idempotency_key 或同向 outcome**
+    → 回放 202（内容以库内不可变决定为准），零状态改动。其余情况维持 409（诚实冲突）。
+    判定链任一环读失败 → None（按 409 处理，绝不放大成功语义）。"""
+    try:
+        kind = str((req.outcome or {}).get("kind") or "")
+        store = _get_approval_store()
+        areq = store.get_latest_by_run(req.run_id)
+        if not areq:
+            return None
+        dec = store.get_decision(areq["request_id"])
+        if not dec:
+            return None
+        same_key = bool(req.idempotency_key) and dec.get("idempotency_key") == req.idempotency_key
+        same_direction = bool(kind) and dec.get("decision") == kind
+        if not (same_key or same_direction):
+            return None
+        status = ("cancelled" if dec.get("decision") == "rejected_terminate"
+                  else str(run.get("status") or ""))
+        return JSONResponse(status_code=202, content={
+            "run_id": req.run_id, "outcome": dec.get("decision"), "status": status,
+            "replayed": True,
+            "message": "该审批命令此前已受理（幂等回放，以库内不可变决定为准），未重复执行任何动作。"})
+    except Exception:   # noqa: BLE001 — 回放判定失败按原 409 语义
+        logger.warning("审批命令幂等回放判定失败（按 409 处理）", exc_info=True)
+        return None
+
+
 def _self_approval_allowed() -> bool:
     """dev/单人环境逃生门（默认关）。生产绝不开——开了职责分离即失效。
 
@@ -777,6 +850,10 @@ def agent_approve(req: ApproveRequest, request: Request,
     if run is None:
         raise HTTPException(status_code=404, detail="run 不存在")
     if run.get("status") != "suspended":
+        # P1-07（外审核查 2026-07-16）：已受理命令的 HTTP 重试 → 幂等回放 202 而非 409
+        replay = _replay_decided_response(req, run)
+        if replay is not None:
+            return replay
         raise HTTPException(status_code=409, detail=f"run 非挂起态（{run.get('status')}）")
     try:
         outcome = parse_outcome(req.outcome)
@@ -866,11 +943,20 @@ def agent_approve(req: ApproveRequest, request: Request,
         logger.warning("审批决定审计写失败（fail-open）", exc_info=True)
     # 铁律 5：resume 重建 ctx——以**发起人**（run.user_id）身份现解 ACL 续跑（共享助手，
     # /approve 与 B6 对账同一套语义：绝不套审批人/对账进程的权限组）。
+    # P1-08：Approved/Edited（写操作将执行）身份不可解析/已停用 → fail-closed。
     thread_id = run.get("thread_id") or req.session_id or req.run_id
-    ctx, requester_id, req_groups = _requester_ctx(run, thread_id, rid=rid,
-                                                   conversation_id=req.conversation_id)
-    # 续跑沿用 submit 时的模型档（agent_run.model_profile；历史行 NULL → light）
-    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light"))
+    try:
+        ctx, requester_id, req_groups = _requester_ctx(
+            run, thread_id, rid=rid, conversation_id=req.conversation_id,
+            fail_closed_on_error=outcome.kind in ("approved", "edited"))
+    except IdentityUnresolvable as e:
+        # 决定已落库、run 未认领仍 suspended：503 重试走已决同向重放接住；403 终局
+        # （停用发起人）留 suspended 由 3 天 TTL 过期收口。
+        raise HTTPException(status_code=503 if e.retryable else 403, detail=str(e))
+    # 续跑沿用 submit 时的模型档（agent_run.model_profile；历史行 NULL → light）。
+    # P1-05：tokens_used_seed 从 durable 播种——resume 段的 pre-call 预算闸不从零起数。
+    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light",
+                                          tokens_used_seed=int(run.get("tokens_used") or 0)))
     tools = registry.list_specs(ctx)
     message_id, _remember, _report_failure, _persist_answer = _resume_callbacks(
         run_store, run, thread_id, requester_id, req_groups)
@@ -906,10 +992,19 @@ def agent_approve(req: ApproveRequest, request: Request,
         "message": "审批已受理；任务以发起人身份异步续跑，结果对发起人可见（会话历史/运行中心）。"})
 
 
-def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=None):
+def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=None,
+                   fail_closed_on_error: bool = False):
     """以**发起人**（run.user_id）身份现解 ACL 重建 resume ctx（铁律 5）——既不复用
     checkpoint 旧快照，也绝不套审批人/对账进程的身份（否则续跑段提权 + 归属错人）。
     解析失败 → 空组（收敛最小权限，绝不放大）。返回 (ctx, requester_id, req_groups)。
+
+    P1-08（外审核查 2026-07-16）fail_closed_on_error：Approved/Edited 续跑（写操作将
+    以发起人名义执行）时 True——① 解析**异常**（DingTalk API/DB 瞬断）→ 抛
+    IdentityUnresolvable(retryable=True)，run 留 suspended 可重试，绝不带疑执行已批
+    写操作；② 发起人 user_role **墓碑**（有行且全部 is_active=0=显式停用）→
+    retryable=False，已停用用户的已批写操作不再执行（此前空组最小权限继续——对
+    读是安全收敛，对「以其名义落库的写」不是）。只读向处置（拒绝/反馈/撤回）维持
+    最小权限继续（空组本就是权限下界，且撤回必须恒可达）。
 
     P1「resume 改变原始执行上下文」：channel / conversation_id 一律取 **agent_run 行**
     （submit 时落库的原值）——此前 channel 硬编码 console、conversation_id 可被 /approve
@@ -926,8 +1021,24 @@ def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=Non
             _resolve_user_identity, resolve_kb_identity)
         req_groups = list((_resolve_user_identity(requester_id) or {}).get("dept") or [])
         req_role = resolve_kb_identity(requester_id).role or "employee"
-    except Exception:   # noqa: BLE001
+    except Exception as e:   # noqa: BLE001
+        if fail_closed_on_error:
+            raise IdentityUnresolvable(
+                f"resume 发起人 {requester_id} 身份解析失败，暂不续跑（可重试）: "
+                f"{str(e)[:200]}", retryable=True)
         logger.warning("resume 发起人身份现解失败（按最小权限续跑）", exc_info=True)
+    if fail_closed_on_error:
+        # P1-08 墓碑：显式停用的发起人不再以其名义执行已批写操作（读失败 fail-open
+        # 到既有语义——上面的解析已成功，墓碑读瞬断不该反而把 run 拒了）。
+        try:
+            from opensearch_pipeline.dingtalk_identity import user_row_revoked
+            revoked = user_row_revoked(requester_id)
+        except Exception:   # noqa: BLE001
+            revoked = False
+        if revoked:
+            raise IdentityUnresolvable(
+                f"resume 发起人 {requester_id} 已停用（tombstone），拒绝以其名义执行已批操作",
+                retryable=False)
     channel = run.get("channel") or "console"
     if channel not in ("dingtalk", "console", "miniapp", "api"):
         channel = "console"
@@ -980,11 +1091,14 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
             return
         _persisted_tx["v"] = True
         from opensearch_pipeline.qa_logger import insert_qa_row_tx
+        # P1-06：续跑段来源 ∪ 本 run 全部检索回执 doc_ids（同事务同游标，fail-open）
+        docs = _union_invocation_doc_ids(
+            cur, run.get("run_id"), _flatten_retrieved(retrieved))
         insert_qa_row_tx(cur, session_id=thread_id, message_id=message_id, user_id=requester_id,
                          user_dept=(req_groups[0] if req_groups else None),
                          query_text=cp_question, answer_text=final_text,
                          conversation_id=run.get("conversation_id"), answer_status="SUCCESS",
-                         model_name="agent", retrieved_docs=_flatten_retrieved(retrieved))
+                         model_name="agent", retrieved_docs=docs)
 
     def _remember(final_text: str, retrieved=None) -> None:
         try:
@@ -1046,8 +1160,18 @@ def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -
                    else RejectedFeedback(reason=c.get("reason") or "审批未通过")
                    if kind == "rejected_feedback" else RejectedTerminate())
         thread_id = run.get("thread_id") or run_id
-        ctx, requester_id, req_groups = _requester_ctx(run, thread_id)
-        loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light"))
+        try:
+            # P1-08：对账重驱同 /approve 语义——approved 向身份不可解析/停用即跳过本轮
+            ctx, requester_id, req_groups = _requester_ctx(
+                run, thread_id, fail_closed_on_error=(kind == "approved"))
+        except IdentityUnresolvable as e:
+            (logger.warning if e.retryable else logger.error)(
+                "B6 对账：run %s 发起人身份 fail-closed（%s）——%s", run_id,
+                "瞬断，下轮重试" if e.retryable else "已停用，留 suspended 等 TTL 过期", e)
+            continue
+        # P1-05：resume 段预算闸从 durable tokens_used 播种
+        loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light",
+                                              tokens_used_seed=int(run.get("tokens_used") or 0)))
         tools = registry.list_specs(ctx)
         _mid, _remember, _report_failure, _persist_answer = _resume_callbacks(
             run_store, run, thread_id, requester_id, req_groups)

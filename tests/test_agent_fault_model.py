@@ -332,8 +332,18 @@ class _FakeConn:
 
 
 def _patch_conns(monkeypatch, conns):
+    """假连接序列**只服务测试线程**：同进程遗留的后台线程（路由测试起的 reaper 等）
+    也走 db._get_db_conn，不设防会偷走序列里的连接、打乱主线程的 conn 顺序（batch 内
+    偶发红、单跑绿的典型形态）。后台线程拿到的异常由其自身 fail-open 路径消化。"""
     seq = list(conns)
-    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: seq.pop(0))
+    owner = threading.get_ident()
+
+    def _factory():
+        if threading.get_ident() != owner:
+            raise RuntimeError("fake conn: 非测试线程的后台 DB 访问（有意拒绝）")
+        return seq.pop(0)
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _factory)
 
 
 def test_p0_03_commit_ack_loss_read_back_confirms_success(monkeypatch):

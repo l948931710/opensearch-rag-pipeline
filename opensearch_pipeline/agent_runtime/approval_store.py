@@ -299,14 +299,15 @@ class RDSApprovalStore:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT decision_id, request_id, decision, final_args_digest, reason, "
-                    f"decided_by, decided_at FROM {db}.approval_decision "
+                    f"decided_by, decided_at, idempotency_key FROM {db}.approval_decision "
                     "WHERE request_id=%s ORDER BY decided_at DESC LIMIT 1",
                     (request_id,))
                 row = cur.fetchone()
             if not row:
                 return None
+            # idempotency_key 供 P1-07 已受理命令的 HTTP 重试幂等回放（同键 → 202 回放）
             d = dict(zip(("decision_id", "request_id", "decision", "final_args_digest",
-                          "reason", "decided_by", "decided_at"), row))
+                          "reason", "decided_by", "decided_at", "idempotency_key"), row))
             if d.get("decided_at") is not None:
                 d["decided_at"] = str(d["decided_at"])
             return d

@@ -81,7 +81,12 @@
   1. **P1-03**：副作用工具**任何**耗尽异常收 uncertain（不只 timeout/schema 违约——requests.ReadTimeout/connection reset 正是「下游已提交、响应阶段抛」形态），并禁 in-loop 自动重试（核查发现的加码项：可重试白名单恰与已提交形态重合）；`ToolResult.fail` 维持 failed（工具作者预边界声明，有意不变）。
   2. **P1-04**：幂等命中 apply-on-hit——回执渲染进模型可见文本前过当前决策 obligations（策略收紧后回放按新姿态，不固化写入时姿态）+ 当前 output_schema 复验（版本漂移拒绝复用并告警；无回执历史行跳过不误伤）；派生键真重放复用回执（不再误报「同幂等键并发执行冲突」）；义务强制点抽 `_apply_obligations_safe` 两路共用。
   3. **P1-02 过渡**：per-tool 并发舱壁（`RAG_AGENT_TOOL_MAX_CONCURRENCY` 默认 4，满则 fail-fast=确定无副作用绝不进对账；配额随 future 真正完成才释放——挂死线程持续占本工具配额不外溢）+ 超时池大小可配（`RAG_AGENT_TOOL_TIMEOUT_POOL_SIZE` 默认 8）。durable worker 全量迁移维持 PR-3。
-- 批次 3/4：未动工。
+- **批次 3：✅ 已落地（2026-07-17，ontology-p0）**。四项全修 + `tests/test_agent_batch3_fixes.py` 17 项回归（16 项在旧代码上必红，1 项为零快照回退守卫）；全量 3854 绿 + lint 绿：
+  1. **P1-05**：model_fn pre-call 预算闸（种子+段内已耗+本轮 prompt 估算 ≥ token_budget → BudgetExceeded 费用未发生；估算刻意低估导向 chars//4，post-call 复判仍是权威兜底）；临近耗尽（余额<16384）才给 max_tokens 设余额上限（FLOOR 1024 防截碎答案，正常调用行为零变化）；resume 段种子从 agent_run.tokens_used 播种；`_budget_snapshot` 读取异常 fail-closed（RunRejected→回滚 suspended 可重试，且移到接手 running 之前），合法全零快照维持回退（核查拍板：防重演双计+瞬断钉死）。
+  2. **P1-06**：`_union_invocation_doc_ids`——completion 事务同游标把本 run 全部成功检索回执的 doc_ids 并进 retrieved_docs（只补 doc_id 级条目不复制 chunk 载荷，checkpoint 不存 chunk 的 P0-A 决定不动；fail-open）。已知残留：回执补差条目无 title（历史 UI 渲染朴素）。
+  3. **P1-07**：`/approve` 已受理命令的 HTTP 重试幂等回放——run 已离开 suspended 且库内决定同 idempotency_key 或同向 → 202 回放（get_decision 补返 idempotency_key），其余维持 409；**不做** edited executable envelope（维持拒绝）。
+  4. **P1-08**：Approved/Edited 续跑身份 fail-closed——解析异常→503 可重试（decided 重放接住）、墓碑→403 终局（留 suspended 等 TTL）；对账同语义（approved 向跳过+告警）；**墓碑用既有 user_role.is_active 列零 schema 变更**（有行且全 0=显式停用）：api strict 分支令牌立即失效（此前只能等 2h TTL），真无行维持文档化保留令牌组语义。authz-version-in-token 按核查建议不做（TTL+墓碑+跨部门实时拒已覆盖撤销目标）。已知残留：停用发起人的 decided run 在 TTL 前每轮对账各一条 error 日志（可告警特征，有意保留）。
+- 批次 4：未动工。
 
 ## 评审建议中被拒绝/修正的部分（核查结论）
 - "不可绕过的 production profile"（P1-14）：**拒绝**——ack 存在正是因为现网 SAE 包先于 flag 存在，硬断言会 brick 重部署/回滚；改为日期绑定。

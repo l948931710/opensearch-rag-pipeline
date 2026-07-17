@@ -319,6 +319,10 @@ class ThreadedRunExecutor:
                     decided_by=(dec or {}).get("decided_by") or meta.get("decided_by"),
                     approver_scope=meta.get("approver_scope"),
                     decision_id=(dec or {}).get("decision_id"))
+            # P1-05（外审核查 2026-07-16）：预算播种移到接手 running **之前**——读取异常
+            # fail-closed（_budget_snapshot 抛 RunRejected），此时 claimed 仍 True，走回边
+            # suspended 保住可重试；接手后才抛会把已批 run 打成 failed（审批凭据白耗）。
+            base = self._budget_snapshot(run_id, fallback_turns=int(state.get("turn", 0)) + 1)
             if not self._store.transition(run_id, "resuming", "running"):      # ③ 接手
                 raise RunRejected(f"run {run_id} resuming→running 失败（并发/迟到）")
             claimed = False                               # 已交棒 running：失败恢复归驱动器
@@ -331,7 +335,6 @@ class ThreadedRunExecutor:
             with self._lock:
                 self._live[run_id] = handle
             gen = loop.resume(ctx, state, outcome, tools)
-            base = self._budget_snapshot(run_id, fallback_turns=int(state.get("turn", 0)) + 1)
             try:
                 self._pool.submit(self._drive_gen, ctx, gen, handle, base)
             except Exception:
@@ -817,14 +820,21 @@ class ThreadedRunExecutor:
 
     def _budget_snapshot(self, run_id: Optional[str], fallback_turns: int) -> dict:
         """resume 播种本地预算计数：读 durable 已耗值（零增量 consume 即读取）。
-        读不到 → 按 checkpoint turn 兜底（宁可少计 tool_calls/tokens 也不重复计 turns——
-        修 resume 后 turn 双重计费 + 续跑段逃逸预算，深度审查 C 组 P1）。"""
-        try:
-            snap = self._store.consume_budget(run_id) or {}
+        P1-05（外审核查 2026-07-16）：**读取异常 fail-closed**——DB 瞬断时按零播种会让
+        续跑段整段逃逸 token/tool_calls 预算；抛 RunRejected，调用方回滚 suspended
+        （可重试）。**合法全零快照维持回退**：首段 increment_budget fail-open 被吞时
+        零值是真实库况，硬拒会把已批 run 钉死在瞬时抖动上；宁少计 tool_calls/tokens
+        也不重复计 turns（深度审查 C 组双计修复的语义不动）。store 无 consume_budget
+        （简化桩）→ 直接回退。"""
+        fn = getattr(self._store, "consume_budget", None)
+        if fn is not None:
+            try:
+                snap = fn(run_id) or {}
+            except Exception as e:   # noqa: BLE001 — fail-closed：绝不按零播种续跑
+                raise RunRejected(
+                    f"run {run_id} resume 预算读取失败，拒绝按零播种续跑（可重试）: {e}")
             if snap.get("turns_used") or snap.get("tool_calls_used") or snap.get("tokens_used"):
                 return snap
-        except Exception:   # noqa: BLE001
-            pass
         return {"turns_used": int(fallback_turns), "tool_calls_used": 0, "tokens_used": 0}
 
     def _heartbeat(self, run_id: Optional[str]) -> None:

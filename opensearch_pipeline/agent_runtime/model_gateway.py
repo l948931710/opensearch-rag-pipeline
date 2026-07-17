@@ -599,10 +599,37 @@ def _charge_model_call(ctx: ExecutionContext, category: str) -> None:
             "今日模型调用额度已用完（全局或个人日上限），请明天再试或联系管理员")
 
 
+# P1-05（外审核查 2026-07-16）预算 pre-call 闸参数：临近耗尽（余额 < CAP）才给请求体
+# 设 max_tokens（正常调用维持 None=provider 默认，行为零变化）；FLOOR 防 min() 逼近 0
+# 把答案硬截成碎片——宁可小幅越过预算由 post-call 复判收口，也不产出不可用的半截答案。
+_NEAR_EXHAUST_COMPLETION_CAP = 16384
+_COMPLETION_FLOOR = 1024
+
+
+def _estimate_prompt_tokens(messages) -> int:
+    """粗估 prompt tokens（chars//4）。刻意**低估导向**（CJK 实际 ~2 chars/token）：
+    估算只用于「费用未发生」的调用前拦截，post-call 复判仍是权威兜底——绝不因高估
+    误拦一个本可完成的调用。估不出（结构异常）按 0（放行）。"""
+    try:
+        total = 0
+        for m in messages or []:
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, str):
+                total += len(c)
+            elif isinstance(c, list):           # 多模态分块：只累文本块
+                for part in c:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        total += len(part["text"])
+        return total // 4
+    except Exception:   # noqa: BLE001
+        return 0
+
+
 def make_model_fn(gateway: ModelGateway, ctx: ExecutionContext,
                   category: str = "light",
                   stream: Optional[bool] = None,
-                  charge_llm: bool = True) -> Callable[[List[Msg], List[ToolSpec]], Any]:
+                  charge_llm: bool = True,
+                  tokens_used_seed: int = 0) -> Callable[[List[Msg], List[ToolSpec]], Any]:
     """把 Gateway 适配成 DefaultAgentLoop 的 model_fn。
 
     stream=None → 按 RAG_AGENT_STREAM（默认开）。流式模式下 model_fn 返回**生成器**
@@ -610,10 +637,22 @@ def make_model_fn(gateway: ModelGateway, ctx: ExecutionContext,
     chat_stream 时 complete_stream 自动退化同步（零增量），全部既有测试桩零改动。
     charge_llm：A2 逐调用计费开关（serving 恒 True）；eval_harness/agent 传 False——
     本地受控跑批不烧准入配额（251 题×多轮会中途撞每用户日帽把评测打死）。
-    """
+    tokens_used_seed：P1-05——resume 段闭包从 0 起数会漏掉挂起前段的消耗，routes 从
+    agent_run.tokens_used 播种（submit 段恒 0）。
+
+    P1-05 pre-call 预算闸（外审核查 2026-07-16）：此前 token_budget 只在调用后复判，
+    一轮巨 prompt（累积历史/工具结果）可一次性大幅越过 200k 预算——「失败」只保证不
+    继续，费用已发生。现调用前判「种子+段内已耗+本轮估算 ≥ 预算」→ BudgetExceeded
+    （费用未发生，loop→executor 落 failed 同既有语义）；临近耗尽时给 max_tokens 设
+    余额上限（带 FLOOR，绝不把答案截成碎片）。"""
     if stream is None:
         stream = _stream_enabled()
     use_stream = bool(stream) and hasattr(gateway, "complete_stream")
+    used = {"total": max(0, int(tokens_used_seed or 0))}
+    try:
+        budget_cap = int(getattr(ctx.budget, "token_budget", 0) or 0)
+    except Exception:   # noqa: BLE001 — 简化桩 ctx 无 budget：闸退化为不设防（历史行为）
+        budget_cap = 0
 
     def _req(msgs: List[Msg], tools: List[ToolSpec]) -> ChatRequest:
         return ChatRequest(
@@ -622,18 +661,44 @@ def make_model_fn(gateway: ModelGateway, ctx: ExecutionContext,
             max_tokens=None,
         )
 
+    def _precall_guard(creq: ChatRequest) -> ChatRequest:
+        if budget_cap <= 0:
+            return creq
+        est = _estimate_prompt_tokens(creq.messages)
+        if used["total"] + est >= budget_cap:
+            raise BudgetExceeded(
+                f"run token 预算耗尽（已耗~{used['total']} + 本轮 prompt 估算~{est} ≥ "
+                f"{budget_cap}），调用前拦截（费用未发生）")
+        remaining = budget_cap - used["total"] - est
+        if creq.max_tokens is None and remaining < _NEAR_EXHAUST_COMPLETION_CAP:
+            import dataclasses
+            creq = dataclasses.replace(creq, max_tokens=max(_COMPLETION_FLOOR, remaining))
+        return creq
+
+    def _track(resp) -> None:
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            try:
+                used["total"] += int(getattr(u, "total", 0) or 0)
+            except Exception:   # noqa: BLE001 — 记数失败不碍调用（post-call 复判仍在）
+                pass
+
     if not use_stream:
         def _model_fn(msgs: List[Msg], tools: List[ToolSpec]) -> ModelTurn:
             if charge_llm:
                 _charge_model_call(ctx, category)
-            return _resp_to_turn(gateway.complete(ctx, category, _req(msgs, tools)))
+            resp = gateway.complete(ctx, category, _precall_guard(_req(msgs, tools)))
+            _track(resp)
+            return _resp_to_turn(resp)
         return _model_fn
 
     def _model_stream_fn(msgs: List[Msg], tools: List[ToolSpec]):
         def _gen():
             if charge_llm:
                 _charge_model_call(ctx, category)   # 生成器体：首个 next() 时（即真调用前）扣
-            resp = yield from gateway.complete_stream(ctx, category, _req(msgs, tools))
+            resp = yield from gateway.complete_stream(ctx, category,
+                                                      _precall_guard(_req(msgs, tools)))
+            _track(resp)
             return _resp_to_turn(resp)
         return _gen()
 

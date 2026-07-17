@@ -459,6 +459,15 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
                 # P0-04 fail-closed：DB **失败**时不信任令牌内嵌组，降级到仅 public
                 # （无在册行 db_ok=True → 保留令牌组，短 TTL 兜底，不因未缓存降级）。
                 groups = []
+            else:
+                # P1-08（外审核查 2026-07-16）墓碑：查询成功但无活跃行——区分两态：
+                # 有行且全部 is_active=0 = 显式停用 → 令牌立即失效（此前只能等 2h TTL
+                # 自然过期，停用用户拿旧令牌可继续用令牌内嵌组）；真无行维持文档化的
+                # 保留令牌组语义（未缓存 ≠ 停用）。用既有 is_active 列，零 schema 变更。
+                from opensearch_pipeline.dingtalk_identity import user_row_revoked
+                if user_row_revoked(uid):
+                    logger.warning("已停用用户 %s 持有效令牌访问——拒绝（tombstone）", uid)
+                    return None
         else:
             live = _resolve_user_dept_cached(uid)
             if live is not None:
