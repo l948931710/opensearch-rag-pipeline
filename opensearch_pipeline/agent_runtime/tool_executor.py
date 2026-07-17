@@ -14,7 +14,14 @@ stale executing 行由 reaper（mark_stale_invocations_uncertain）收进同一�
 P1-03（外审核查 2026-07-16）把该语义扩到**任何耗尽的异常**（普通异常 ≠ 确定未生效），
 并禁掉副作用工具的 in-loop 自动重试；P1-02 过渡加固补 per-tool 并发舱壁
 （RAG_AGENT_TOOL_MAX_CONCURRENCY，默认 4）+ 池大小可配（RAG_AGENT_TOOL_TIMEOUT_POOL_SIZE）。
-HIGH_WRITE 迁独立 durable worker（lease+outbox）是重评报告 PR-3 的范围，不在本层。
+
+PR-3 Stage C（操作台账，schema/045）本层两刀：① 副作用工具执行前把 **operation_id
+（= invocation_id）注入 ctx** 透传下游——工具把台账行与副作用同事务提交
+（operation_ledger.py），uncertain 从此可查证（check_operation→operation_reconciler
+自动对账）；reclaim 重试复用同 invocation 行 ⇒ 同 operation_id，台账 PK 兜底 fencing。
+② 副作用工具改跑 **per-tool 专属线程池**（tool-iso-<name>，容量=舱壁配额；kill switch
+RAG_AGENT_TOOL_ISOLATED_POOL）——挂死写线程只占自己池，共享超时池归读工具，互不蚕食。
+多副本 worker 形态（dispatcher 拆独立部署）是 PR-3 Stage D 的活，不在本层。
 
 audit 中间件（agent_audit_log）已挂：ALLOW 执行前写一条合规审计（write-ahead）——HIGH_WRITE
 **fail-closed**（审计不可写→阻断，绝不产生无审计的高风险副作用），READ_ONLY/LOW_WRITE fail-open。
@@ -68,6 +75,43 @@ def _get_timeout_pool() -> ThreadPoolExecutor:
                 _TIMEOUT_POOL = ThreadPoolExecutor(
                     max_workers=_timeout_pool_size(), thread_name_prefix="tool-timeout")
     return _TIMEOUT_POOL
+
+
+# ── per-tool 专属池（PR-3 Stage C「per-tool worker 隔离」）────────────────────────
+# 副作用工具的执行线程从共享超时池搬进按工具名分配的专属池：挂死的写线程（B1 硬伤：
+# 杀不掉）最多占满**本工具**的池（容量=舱壁配额，舱壁 fail-fast 在前，池内永不排队），
+# 共享池自此只服务读工具——写挂死不再挤占读、读洪峰也占不到写的额度。
+# 模块级按工具名复用（ToolExecutor 每 runtime 一个、测试大量新建实例——池挂实例上
+# 会随测试泄漏线程）；进程生命周期不回收（与共享池同款约定）。
+
+
+_TOOL_POOLS: Dict[str, ThreadPoolExecutor] = {}
+
+
+def _isolated_pool_enabled() -> bool:
+    return os.environ.get("RAG_AGENT_TOOL_ISOLATED_POOL", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _tool_quota() -> int:
+    """per-tool 并发配额（舱壁与专属池共用同一数）。"""
+    try:
+        quota = int(os.environ.get("RAG_AGENT_TOOL_MAX_CONCURRENCY", "4") or 4)
+    except ValueError:
+        quota = 4
+    return max(1, quota)
+
+
+def _get_tool_pool(name: str) -> ThreadPoolExecutor:
+    pool = _TOOL_POOLS.get(name)
+    if pool is None:
+        with _POOL_LOCK:
+            pool = _TOOL_POOLS.get(name)
+            if pool is None:
+                pool = ThreadPoolExecutor(max_workers=_tool_quota(),
+                                          thread_name_prefix=f"tool-iso-{name}")
+                _TOOL_POOLS[name] = pool
+    return pool
 
 
 # ── READ_ONLY 工具 trace/审计异步化（延迟优化第二刀，2026-07-11）───────────────────
@@ -224,8 +268,9 @@ class ToolExecutor:
         # P1-02 过渡加固（外审核查 2026-07-16）：per-tool 并发舱壁——共享超时池没有配额时
         # 单个慢挂工具即可蚕食整池（熔断只按失败计数，慢而不败不触发），后续无关工具排队
         # 后一起超时。配额在 future **真正完成**时才释放（挂死线程持续占用本工具配额，
-        # 这正是舱壁语义：最多吃掉本工具的额度，绝不外溢）。HIGH_WRITE 迁独立 durable
-        # worker 仍是 PR-3 的活，本层只做进程内隔离。
+        # 这正是舱壁语义：最多吃掉本工具的额度，绝不外溢）。PR-3 Stage C 在此之上把
+        # 副作用工具搬进 per-tool 专属池（见 _get_tool_pool）——写挂死连共享池的线程
+        # 都不再占；多副本 worker 形态是 Stage D 的活。
         self._tool_sems: Dict[str, threading.Semaphore] = {}
         self._sems_lock = threading.Lock()
 
@@ -233,11 +278,7 @@ class ToolExecutor:
         with self._sems_lock:
             sem = self._tool_sems.get(name)
             if sem is None:
-                try:
-                    quota = int(os.environ.get("RAG_AGENT_TOOL_MAX_CONCURRENCY", "4") or 4)
-                except ValueError:
-                    quota = 4
-                sem = threading.Semaphore(max(1, quota))
+                sem = threading.Semaphore(_tool_quota())
                 self._tool_sems[name] = sem
             return sem
 
@@ -372,6 +413,31 @@ class ToolExecutor:
                         return ToolResult.fail(
                             f"工具 {spec.name} 同幂等键并发执行冲突（另一执行已认领），本次不重复执行")
                     raise
+        # PR-3 Stage C：副作用工具注入 ctx.operation_id（= invocation_id；reclaim 重试
+        # 复用同行 ⇒ 同 id）。工具把台账行与副作用同事务提交（operation_ledger.py），
+        # 「台账行存在 ⇔ 副作用已提交」成为 check_operation 可查证事实；台账 PK 兜底
+        # fencing——僵尸线程与对账放行后的重试并发提交至多一个 commit。ctx=None /
+        # 简化 ctx（测试 SimpleNamespace 等，replace 抛 TypeError）静默跳过（fail-open：
+        # 未注入=工具不写台账，回落人工对账，行为与 Stage C 之前一致）。
+        has_side_effects = spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY
+        if has_side_effects and ctx is not None and isinstance(inv_id, str):
+            try:
+                from dataclasses import replace as _dc_replace
+                ctx = _dc_replace(ctx, operation_id=inv_id)
+            except TypeError:
+                pass
+            else:
+                # 注入成功才盖对账资格章（schema/046 operation_id 列）：自动对账只对
+                # 「工具确实拿到 operation_id」的执行把台账无行读作 not_applied；
+                # 老行/未注入执行恒 NULL → 永留人工通道（绝不误判 failed）。盖章
+                # fail-open：少个章=该调用少条自动化（方向保守），绝不挡执行。
+                try:
+                    marker = getattr(self._store, "mark_invocation_operation", None)
+                    if marker is not None:
+                        marker(inv_id)
+                except Exception:   # noqa: BLE001
+                    logger.warning("operation_id 资格章回填失败（该调用留人工对账通道）",
+                                   exc_info=True)
         # audit（write-ahead）：执行前记合规审计。HIGH_WRITE fail-closed=审计不可写则阻断执行
         # （绝不产生无审计的高风险副作用）；READ_ONLY/LOW_WRITE fail-open（写失败仅告警不阻断）。
         # async_trace（恒 READ_ONLY ⇒ fail_closed=False）时审计入队伍随 FIFO 尾随 record。
@@ -399,7 +465,6 @@ class ToolExecutor:
         result: Optional[ToolResult] = None
         timed_out = False
         bulkhead_full = False
-        has_side_effects = spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY
         for i in range(attempts):
             try:
                 result = self._run_with_timeout(tool, ctx, args, idempotency_key, spec.timeout_s)
@@ -561,8 +626,15 @@ class ToolExecutor:
                 released.set()
                 sem.release()
 
+        # PR-3 Stage C「per-tool worker 隔离」：副作用工具跑专属池（容量=舱壁配额，
+        # 舱壁 fail-fast 在前 ⇒ 池内永不排队）——挂死写线程只占本工具的池；共享超时池
+        # 归读工具。舱壁语义（配额、fail-fast、随 future 完成释放）一字不动。
+        spec = tool.spec
+        isolated = _isolated_pool_enabled() and (
+            spec.side_effects or spec.risk_level is not RiskLevel.READ_ONLY)
+        pool = _get_tool_pool(spec.name) if isolated else _get_timeout_pool()
         try:
-            fut = _get_timeout_pool().submit(tool.run, ctx, args, idempotency_key)
+            fut = pool.submit(tool.run, ctx, args, idempotency_key)
         except Exception:
             _release_once()
             raise

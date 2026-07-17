@@ -84,6 +84,11 @@ class ExecutionContext:
     approval_request_id: Optional[str] = None
     approved_by: Optional[str] = None
     approval_scope: Optional[str] = None
+    # PR-3 Stage C（操作台账）：executor 对副作用工具注入（= tool_invocation.invocation_id；
+    # 同键 reclaim 重试复用同一 invocation 行 ⇒ 同 id=fencing 键）。工具把台账行与副作用
+    # 同一事务落库（operation_ledger.insert_operation_tx），「行存在⇔副作用已提交」从此
+    # 可查证（check_operation→自动对账）。服务端注入，模型/请求体无通道（铁律 2 不破）。
+    operation_id: Optional[str] = None
 
     @classmethod
     def create(cls, *, request_id: str, user_id: str,

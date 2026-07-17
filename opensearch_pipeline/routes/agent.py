@@ -233,6 +233,22 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
                             logger.warning("B6 对账：本轮重驱 %s 个 decided-but-not-resumed run", n)
                     except Exception:   # noqa: BLE001
                         logger.warning("B6 对账失败（下轮重试）", exc_info=True)
+                    # PR-3 Stage C：uncertain 自动对账（回执查证；flag 默认 off）——
+                    # 上面 mark_stale 产出的 uncertain 静置 min_age 后按台账三态处置，
+                    # unknown/无 check_operation 的照旧留人工通道。
+                    try:
+                        from opensearch_pipeline.agent_runtime.operation_reconciler import (
+                            op_reconcile_enabled,
+                            reconcile_uncertain_invocations,
+                        )
+                        if op_reconcile_enabled():
+                            rep2 = reconcile_uncertain_invocations(run_store, runtime[0])
+                            if rep2.get("succeeded") or rep2.get("failed"):
+                                logger.warning("uncertain 自动对账：succeeded %s · failed %s"
+                                               "（unknown %s 留人工）", rep2["succeeded"],
+                                               rep2["failed"], rep2["unknown"])
+                    except Exception:   # noqa: BLE001
+                        logger.warning("uncertain 自动对账失败（下轮重试）", exc_info=True)
 
     threading.Thread(target=_loop, name="agent-run-reaper", daemon=True).start()
 

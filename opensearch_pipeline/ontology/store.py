@@ -882,10 +882,17 @@ class RDSOntologyStore:
                                        confirmed_by: Optional[str] = None,
                                        approval_request_id: Optional[str] = None,
                                        note: Optional[str] = None,
-                                       audit: Optional[Dict[str, Any]] = None):
+                                       audit: Optional[Dict[str, Any]] = None,
+                                       operation_writer=None):
         """受治理 Action 确认（P0-05/06）：铸别名 +（若有）闭同 (ns,norm) open case
         **一个事务**——正式 identifier 与治理 case 不再可分叉。返回
-        (identifier_id, closed_case_id)。"""
+        (identifier_id, closed_case_id)。
+
+        operation_writer（PR-3 Stage C 座缝，形态同 Stage B outbox_writer）：
+        `(cur, identifier_id, closed_case_id) -> None`，在同一事务内把操作台账行
+        （agent_tool_operation）随副作用一并提交——「台账行存在⇔别名已铸」从此可查证。
+        它抛的 OperationAlreadyApplied（台账 PK fencing：另一执行已提交同操作）随
+        rollback 原样上抛（args[0] 非 1062，_is_dup 不误译），由工具层按幂等成功收口。"""
         _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         _begin(conn)
@@ -917,6 +924,8 @@ class RDSOntologyStore:
                         (identifier_id, confirmed_by or "-",
                          note or "经受治理动作确认", case_id))
                 self._audit_in_tx(cur, audit)
+                if operation_writer is not None:
+                    operation_writer(cur, identifier_id, case_id)
             conn.commit()
             return identifier_id, case_id
         except Exception as e:
@@ -1973,7 +1982,8 @@ class MemoryOntologyStore:
                                        target_object_id, *, method="manual",
                                        relation="alias", target_revision=None,
                                        confidence=1.0, confirmed_by=None,
-                                       approval_request_id=None, note=None, audit=None):
+                                       approval_request_id=None, note=None, audit=None,
+                                       operation_writer=None):
         _check_confidence(confidence)
         with self._lock:
             if self.get_active_identifier(namespace, norm_value) is not None:
@@ -1982,6 +1992,11 @@ class MemoryOntologyStore:
             case = self.get_open_case(namespace, norm_value)
             self._memory_audit(audit)
             identifier_id = new_ulid()
+            # PR-3 Stage C 座缝（与 RDS 同契约，cur 传 None）：内存后端无事务，fence
+            # 语义靠「写台账先于 mutation」——writer 抛 OperationAlreadyApplied 时
+            # identifier/case 均未动（_memory_audit 已记：测试后端已知微差，RDS 为准）。
+            if operation_writer is not None:
+                operation_writer(None, identifier_id, case["case_id"] if case else None)
             self._identifiers[identifier_id] = {
                 "identifier_id": identifier_id, "namespace": namespace,
                 "raw_value": raw_value, "norm_value": norm_value,

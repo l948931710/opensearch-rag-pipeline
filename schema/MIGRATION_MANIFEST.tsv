@@ -51,3 +51,5 @@
 042_agent_run_user_index.sql operation
 043_agent_dispatch_outbox.sql operation
 044_agent_dispatch_resume.sql operation
+045_agent_tool_operation.sql operation
+046_tool_invocation_operation_id.sql operation

@@ -21,10 +21,17 @@ confirm/repoint/merge 同一实现）——目标不可见与不存在**同答**
   受治理动作绝不静默覆盖既有事实；
 - 落成后 best-effort 闭环同 (ns,norm) 的 open resolution_case（fail-open）。
 
+操作台账（PR-3 Stage C）：executor 注入 ctx.operation_id 时，铸别名事务**同事务**写
+agent_tool_operation 行（operation_writer 座缝）——超时/崩溃后 check_operation 按
+「台账行存在⇔已提交」三态作答，uncertain 自动对账（operation_reconciler）。台账 PK
+即 fencing：僵尸线程与对账放行后的重试并发提交至多一个 commit，输家读现行台账回执
+按幂等成功返回。未注入 operation_id（flag 关/旧 executor/直调）＝不写台账，行为不变。
+
 ⚠️ 刻意不进 build_default_registry——接线+提示词+L7 重冻集中 PR13（有未接线守护单测）。
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -139,8 +146,9 @@ class OntologyIdentityResolveTool:
         owner_team="platform",
     )
 
-    def __init__(self, store=None):
+    def __init__(self, store=None, operation_ledger=None):
         self._store = store            # 测试注入；缺省惰性 RDS
+        self._op_ledger = operation_ledger   # 测试注入 InMemoryOperationLedger；缺省惰性 RDS
         from opensearch_pipeline.agent_runtime.approval_store import (
             register_approver_scope_resolver)
         register_approver_scope_resolver(self.spec.name, self._approver_scope)
@@ -150,6 +158,18 @@ class OntologyIdentityResolveTool:
             from opensearch_pipeline.ontology.store import RDSOntologyStore
             self._store = RDSOntologyStore()
         return self._store
+
+    def _get_ledger(self):
+        if self._op_ledger is None:
+            from opensearch_pipeline.agent_runtime.operation_ledger import RDSOperationLedger
+            self._op_ledger = RDSOperationLedger()
+        return self._op_ledger
+
+    # ── 回执查询协议（PR-3 Stage C）：operation_reconciler 自动对账入口 ─────────
+    def check_operation(self, operation_id: str) -> Dict[str, Any]:
+        """按 operation_id 查证副作用是否已提交（台账三态：applied/not_applied/unknown）。
+        只读、系统侧调用（reaper 周期对账），不是模型可提案的工具动作。"""
+        return self._get_ledger().check(self.spec.name, operation_id)
 
     # ── 审批路由（approval_store seam 回调）────────────────────────────────
     def _approver_scope(self, ctx: Optional["ExecutionContext"],
@@ -234,18 +254,58 @@ class OntologyIdentityResolveTool:
         # PR-C（P0-05/06）：铸别名 +（若有）闭 open case **一个事务**；approval_request_id
         # 落事实行（025↔028 双向回链）；confirmed_by 记**真实审批人**（发起人在 receipt）
         approver = getattr(ctx, "approved_by", None)
+
+        def _mint_receipt(identifier_id, closed_case):
+            """成功回执（返回值与台账行**同构**——同一构造点，绝无两份口径）。"""
+            return {"identifier_id": identifier_id, "namespace": namespace,
+                    "norm_value": norm, "target_object_id": target_id,
+                    "target_revision": revision, "relation": relation,
+                    "closed_case_id": closed_case, "idempotent": False,
+                    "requested_by": ctx.user_id, "approved_by": approver,
+                    "approval_request_id": getattr(ctx, "approval_request_id", None)}
+
+        # PR-3 Stage C：executor 注入了 operation_id → 台账行随铸别名**同事务**提交
+        # （operation_writer 座缝）。未注入（flag 关/直调/测试简化 ctx）→ 不写台账，
+        # 行为与 Stage C 之前逐字节一致。
+        from opensearch_pipeline.agent_runtime.operation_ledger import OperationAlreadyApplied
+        operation_id = getattr(ctx, "operation_id", None)
+        op_writer = None
+        if operation_id:
+            ledger = self._get_ledger()
+
+            def op_writer(cur, identifier_id, closed_case):
+                ledger.insert_tx(cur, operation_id=operation_id, tool_name=self.spec.name,
+                                 run_id=getattr(ctx, "run_id", None),
+                                 receipt=_mint_receipt(identifier_id, closed_case))
         try:
             identifier_id, closed_case = store.insert_identifier_closing_case(
                 namespace, raw, norm, target_id, method="manual", relation=relation,
                 target_revision=revision, confidence=1.0,
                 confirmed_by=approver or ctx.user_id,
                 approval_request_id=getattr(ctx, "approval_request_id", None),
-                note=args.get("note") or "经受治理动作确认")
+                note=args.get("note") or "经受治理动作确认",
+                operation_writer=op_writer)
         except DuplicateActiveIdentifier:
             existing = store.get_active_identifier(namespace, norm)   # 竞态：重查归幂等/冲突
             if existing is None:
                 return ToolResult.fail("并发冲突（别名刚被处置），请重试")
             return self._idempotent_or_conflict(ctx, existing, target, revision)
+        except OperationAlreadyApplied:
+            # fencing 输家：同 operation_id 的台账行已在（僵尸线程先提交/对账误判 failed
+            # 后重试撞上真身）——本次事务已整体回滚（零副作用），读现行台账回执按幂等
+            # 成功收口，绝不重复铸号。
+            receipt = None
+            try:
+                row = self._get_ledger().fetch(operation_id)
+                receipt = (row or {}).get("receipt")
+            except Exception:   # noqa: BLE001 — 回执读取失败不翻案（提交事实由 fence 证明）
+                logger.warning("操作 %s 台账回执读取失败（提交事实不受影响）",
+                               operation_id, exc_info=True)
+            return ToolResult.ok(
+                content=[ContentBlock.of_text(
+                    "（操作台账确认）该操作已由先前执行提交，本次未重复执行。"
+                    + (f" 回执: {json.dumps(receipt, ensure_ascii=False)}" if receipt else ""))],
+                receipt=receipt)
         except Exception:   # noqa: BLE001 — 存储失败以 ToolResult 表达；
             # PR-I（P2）：异常原文不回模型（可能携 SQL/主机名/驱动细节），详情进日志
             logger.exception("身份确认落库失败（详情见日志，不回模型）")
@@ -257,12 +317,7 @@ class OntologyIdentityResolveTool:
                 f"已确认：{namespace} 编号 {raw!r} → "
                 f"{_display_target(target, _requester_acl(ctx))}{rev_txt}，"
                 "即刻生效为正式映射。")],
-            receipt={"identifier_id": identifier_id, "namespace": namespace,
-                     "norm_value": norm, "target_object_id": target_id,
-                     "target_revision": revision, "relation": relation,
-                     "closed_case_id": closed_case, "idempotent": False,
-                     "requested_by": ctx.user_id, "approved_by": approver,
-                     "approval_request_id": getattr(ctx, "approval_request_id", None)})
+            receipt=_mint_receipt(identifier_id, closed_case))
 
     def _idempotent_or_conflict(self, ctx: "ExecutionContext", existing: Dict[str, Any],
                                 target: Dict[str, Any], revision: Optional[str]) -> ToolResult:

@@ -821,9 +821,13 @@ class RDSRunStore:
             conn.close()
 
     def resolve_uncertain_invocation(self, invocation_id: str, *, to_status: str,
-                                     note: str, resolved_by: str, audit_writer=None) -> bool:
-        """人工对账处置：uncertain → succeeded（业务侧核实副作用已生效）/ failed（核实未生效，
-        放行同键重试）。CAS 单向、审计信息进 error_text（[人工对账] 前缀）。
+                                     note: str, resolved_by: str, audit_writer=None,
+                                     receipt_json: Optional[str] = None) -> bool:
+        """对账处置（人工=console 端点 / 自动=operation_reconciler，PR-3 Stage C）：
+        uncertain → succeeded（核实副作用已生效）/ failed（核实未生效，放行同键重试）。
+        CAS 单向、处置人与依据进 error_text（[对账 by <resolved_by>] 前缀——人工/自动
+        由 resolved_by 区分）。receipt_json（Stage C）：自动查证到的台账回执随处置补进
+        invocation 行——幂等命中/运行中心从此见真实回执（仅 succeeded 方向有意义）。
         P1-13（外审核查 2026-07-16）：agent_audit_log 行经 audit_writer(cur) **同事务**写——
         此前先改状态后路由 best-effort 补审计，「uncertain→succeeded 已翻、审计缺失」
         静默发生。审计写失败=整体回滚（状态不翻），处置与审计要么都在、要么都不在。"""
@@ -834,10 +838,15 @@ class RDSRunStore:
         _begin(conn)                        # 多语句事务（UPDATE+审计 INSERT）：钉住连接
         try:
             with conn.cursor() as cur:
+                sets = "status=%s, ended_at=NOW(3), error_text=%s"
+                params = [to_status, f"[对账 by {resolved_by}] {note}"[:500]]
+                if receipt_json is not None and to_status == "succeeded":
+                    sets += ", receipt_json=%s"
+                    params.append(receipt_json)
                 cur.execute(
-                    f"UPDATE {db}.tool_invocation SET status=%s, ended_at=NOW(3), "
-                    "error_text=%s WHERE invocation_id=%s AND status='uncertain'",
-                    (to_status, f"[人工对账 by {resolved_by}] {note}"[:500], invocation_id))
+                    f"UPDATE {db}.tool_invocation SET {sets} "
+                    "WHERE invocation_id=%s AND status='uncertain'",
+                    (*params, invocation_id))
                 ok = cur.rowcount == 1
                 if ok and audit_writer is not None:
                     audit_writer(cur)
@@ -849,6 +858,49 @@ class RDSRunStore:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def mark_invocation_operation(self, invocation_id: str) -> None:
+        """Stage C 对账资格章（schema/046）：executor 对副作用工具**注入成功后**回填
+        operation_id=invocation_id。只有盖过章的行才进自动对账——「台账无行 ⇒ 未提交」
+        的推断只对确实拿到 operation_id 的执行成立；老行/未注入执行恒 NULL 永留人工通道。
+        调用方 fail-open（盖章失败=少条自动化，绝不挡执行）。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.tool_invocation SET operation_id=%s WHERE invocation_id=%s",
+                    (invocation_id, invocation_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_uncertain_invocations_for_reconcile(self, *, min_age_s: int = 300,
+                                                 limit: int = 50) -> "list":
+        """自动对账扫描面（PR-3 Stage C）：uncertain、**已盖资格章**（operation_id 非
+        NULL，见 mark_invocation_operation——未盖章的行「台账无行」证明不了未提交，
+        永留人工通道）且标记后已静置 min_age_s 的调用（最老优先）。静置期让「刚超时、
+        僵尸线程可能还在跑」的窗口先过去——台账 PK 对同事务写台账的工具本已 fencing
+        兜底，静置是对非台账 check_operation 实现（日后外部系统查证）的保守面。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT invocation_id, tool_name, run_id, operation_id "
+                    f"FROM {db}.tool_invocation "
+                    "WHERE status='uncertain' AND operation_id IS NOT NULL "
+                    "AND ended_at < DATE_SUB(NOW(3), INTERVAL %s SECOND) "
+                    "ORDER BY ended_at LIMIT %s",
+                    (int(min_age_s), max(1, min(int(limit), 200))))
+                rows = cur.fetchall() or []
+            return [{"invocation_id": r[0], "tool_name": r[1], "run_id": r[2],
+                     "operation_id": r[3]} for r in rows]
         finally:
             conn.close()
 

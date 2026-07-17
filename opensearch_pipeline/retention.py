@@ -24,6 +24,8 @@ document_sensitive_finding、pipeline_run 只进不出——看板窗口查询�
   approval_decisions approval_decision (operation)      整行 DELETE                24 月 RAG_RETENTION_APPROVAL_MONTHS
   approval_requests  approval_request (operation)       非 pending DELETE          24 月 RAG_RETENTION_APPROVAL_MONTHS
   agent_runs         agent_run (operation)              终态整行 DELETE（殿后）    18 月 RAG_RETENTION_AGENT_RUN_MONTHS
+  dispatch_commands  agent_dispatch_command (operation) 终态整行 DELETE             6 月 RAG_RETENTION_DISPATCH_COMMAND_MONTHS
+  tool_operations    agent_tool_operation (operation)   整行 DELETE                12 月 RAG_RETENTION_AGENT_TRACE_MONTHS
 
   本体表族（schema/027-028 可选迁移；PR-G P1「数据与证据无保留策略」）：
   ontology_case_evidence      ontology_resolution_case (ontology)      已处置 case evidence_json→NULL   6 月 RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS
@@ -93,6 +95,10 @@ _JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_fa
               # PR-3 Stage B（schema/043）：dispatch 命令表——payload_json 含用户问题原文
               # （敏感级=qa_session_log）。终态命令（done/failed/cancelled）到期整行删。
               "dispatch_commands",
+              # PR-3 Stage C（schema/045）：操作台账——回执含主体字段（requested_by 等），
+              # 与 tool_invocation 同窗退役（invocation 没了，台账只剩审计价值，
+              # agent_audit 24 月另有归档）。
+              "tool_operations",
               # 本体表族（schema/027-028，PR-G/P1「数据与证据无保留策略」）：case evidence
               # 与候选 features 携源观测快照（可能含员工查询上下文）——处置后到期擦除
               # （行留审计骨架，只 NULL 掉证据 blob）。open case 的证据是活依据，永不动。
@@ -102,6 +108,7 @@ _JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_fa
 _OPTIONAL_JOBS = frozenset({"qa_facts", "agent_checkpoints", "agent_steps", "tool_invocations",
                             "llm_calls", "agent_audit", "approval_decisions",
                             "approval_requests", "agent_runs", "dispatch_commands",
+                            "tool_operations",
                             "ontology_case_evidence", "ontology_candidate_features"})
 
 _AGENT_RUN_TERMINAL = "('succeeded','failed','cancelled','expired')"
@@ -149,6 +156,8 @@ def _retention_windows() -> Dict[str, int]:
         # PR-3 Stage B dispatch 命令（含问题原文）：与 qa_blobs 同短窗——纯执行控制面，
         # 终态后无长期价值，问题原文已在 qa_session_log 按其窗口治理。
         "dispatch_commands": _months("RAG_RETENTION_DISPATCH_COMMAND_MONTHS", 6),
+        # PR-3 Stage C 操作台账：与 tool_invocation 同窗同 env（对账真相跟 trace 同期退役）
+        "tool_operations": _months("RAG_RETENTION_AGENT_TRACE_MONTHS", 12),
         # 本体证据擦除（同一窗口 env 管两个作业，与 AGENT_TRACE 同款）：evidence/features
         # 是源观测快照（PII 面），处置后 6 月擦 blob；identifier/case 行本体=审计骨架不删。
         "ontology_case_evidence": _months("RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS", 6),
@@ -266,6 +275,13 @@ def _job_sqls(job: str) -> Dict[str, str]:
         pred = ("FROM {op}.agent_dispatch_command "
                 "WHERE status IN ('done','failed','cancelled') "
                 "AND created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "tool_operations":
+        # PR-3 Stage C（schema/045）：操作台账行=已提交操作（无在途态，created_at 即
+        # commit 时刻），与 tool_invocation 同窗整行删——对账窗口早于两者退役数月，
+        # uncertain 行等不到台账被删（INV_STALE 900s + reconcile min_age 300s 级）。
+        pred = ("FROM {op}.agent_tool_operation "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
         return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
     if job == "ontology_case_evidence":
         # 已处置 case 的证据快照到期擦除（open=活依据永不动；行留审计骨架）
@@ -502,6 +518,11 @@ def _purge_jobs(user_id: str) -> List[dict]:
          "count": (f"SELECT COUNT(*) FROM {op}.tool_invocation WHERE run_id IN "
                    f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s)"),
          "act": (f"DELETE FROM {op}.tool_invocation WHERE run_id IN "
+                 f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s) LIMIT %s")},
+        {"table": "agent_tool_operation", "optional": True,   # schema/045；回执含主体字段，run_id 归属链
+         "count": (f"SELECT COUNT(*) FROM {op}.agent_tool_operation WHERE run_id IN "
+                   f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s)"),
+         "act": (f"DELETE FROM {op}.agent_tool_operation WHERE run_id IN "
                  f"(SELECT run_id FROM {op}.agent_run WHERE user_id = %s) LIMIT %s")},
         {"table": "llm_call_log", "optional": True,       # schema/023；user_id 直删（含 null-run 行）
          "count": f"SELECT COUNT(*) FROM {op}.llm_call_log WHERE user_id = %s",

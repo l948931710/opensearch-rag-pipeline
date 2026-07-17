@@ -90,8 +90,34 @@ inline dispatch + 后台恢复扫描（随既有 reaper 线程节奏）。灰度
     兜底——覆盖 Stage B 之前的历史决定、edited 人工流、flag off 环境）；
   - `agent_dispatch_command` 纳入 F-36 retention（终态命令 6 月删）+ purge_subject
     主体擦除（user_id 直删，payload 含问题原文）。
-- **Stage C**：HIGH_WRITE tool task ledger——operation_id 透传下游 + 回执查询协议
-  （`check_operation`），uncertain 对账从人工升级为自动查证；per-tool worker 隔离。
+- **Stage C ✅ 已落地（2026-07-17）**：HIGH_WRITE tool task ledger——
+  - **操作台账** schema/045 `agent_tool_operation`（fuling_operation，纯增量）：工具把
+    台账行与副作用**同一事务**提交（`operation_writer` 游标座缝，形态同 Stage B
+    insert_command_tx；ontology store 双后端同契约），「行存在⇔副作用已提交」成为
+    可查证事实；**PK 即 fencing**——僵尸线程与对账放行后的重试并发提交至多一个
+    commit，输家撞 `OperationAlreadyApplied` 整事务回滚、读现行台账回执按幂等成功收口；
+  - **operation_id 透传**：executor 对副作用工具注入 `ctx.operation_id`
+    （= invocation_id；reclaim 重试复用同行 ⇒ 同 id）；注入成功后回填
+    `tool_invocation.operation_id` **对账资格章**（schema/046，纯增量 ALTER）——
+    「台账无行 ⇒ 未提交」只对确实拿到 operation_id 的执行成立，Stage C 之前的遗留
+    uncertain 行/未注入执行恒 NULL，永留人工通道，绝不误判 failed；
+  - **回执查询协议 `check_operation(operation_id)`**：工具级三态（applied /
+    not_applied / unknown）；`ontology_identity_resolve`（现网唯一 HIGH_WRITE 工具）
+    已接线（台账后端 `operation_ledger.py`，可注入 InMemory 测试后端）；
+  - **uncertain 自动对账**（`operation_reconciler.py`，随 reaper 周期）：
+    applied→succeeded（台账回执补进 invocation 行 + P1-13 同事务审计
+    event_type=invocation_reconcile）/ not_applied→failed（放行同键重试）/
+    unknown→留人工；flag `RAG_AGENT_OP_RECONCILE_ENABLE` **默认 off**
+    （RAG_AGENT_OP_RECONCILE_MIN_AGE_S=300 / RAG_AGENT_OP_RECONCILE_LIMIT=50）。
+    已知残窗（如实记录）：非台账的 check_operation 实现（日后外部系统查证）下，
+    not_applied→failed 后僵尸迟提交=invocation 行与事实漂移——同键重试经台账 fence
+    幂等自愈，台账后端无此窗；
+  - **per-tool worker 隔离**：副作用工具跑 `tool-iso-<name>` 专属线程池（容量=P1-02
+    舱壁配额，舱壁 fail-fast 在前 ⇒ 池内永不排队），共享超时池归读工具——写挂死
+    不再蚕食读、读洪峰占不到写额度；kill switch `RAG_AGENT_TOOL_ISOLATED_POOL`
+    （默认 on，纯进程内资源编排无语义变化）；
+  - **retention/purge**：`tool_operations` 作业（12 月，随 RAG_RETENTION_AGENT_TRACE_MONTHS
+    与 tool_invocation 同窗）+ purge_subject 12 表链覆盖（run_id 归属链）。
 - **Stage D**：多副本形态（dispatcher 拆独立部署、distributed admission、durable
   cancel、事件 durable log）——与外审 P1-10 前置条件合流。
 
