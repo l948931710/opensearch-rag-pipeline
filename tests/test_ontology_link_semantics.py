@@ -7,7 +7,8 @@
 - P2：owner_dept 白名单加载失败 → fail-closed 拒写（不再告警放行）。
 
 RDS 侧 host-pin 本地 MySQL（照 test_ontology_store.py 模板），无表则 skip；
-独立打标前缀 __pyl_（xdist 并行下与其他 ontology 测试文件各扫各的标）。
+独立打标前缀 __pyl_（与其他 ontology 测试文件各扫各的标——但打标只隔数据不隔锁，
+本文件已随 ontology 真库族并入 conftest 串行组，2026-07-17 flake 根治）。
 """
 import os
 import uuid

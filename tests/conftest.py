@@ -173,6 +173,15 @@ _LOCAL_STACK_SERIAL_MODULES = {
     "test_agent_runtime_approval_store.py",
     "test_agent_approval_integrity_db.py",
     "test_unknown_unknowns_batch5.py",   # 批次5 cross-heal 真库用例（agent_run/approval DML）
+    # 2026-07-17 flake 根治：ontology 真库契约族——三文件共享 fuling_ontology 真实 DML。
+    # 此前各自打标（__pyt_/__pyl_/__pys_）只隔离了「数据互删」，隔不开 InnoDB 锁：清扫的
+    # LIKE 全扫 DELETE（next-key 锁）× mint 复合事务（ref_seq 热点行+FOR UPDATE）跨 worker
+    # 死锁 → victim 整事务回滚、SteadyDB 单句重放 → uk_ref 撞号连环红（1062，机理详见
+    # ontology/store.py::_begin）。store 审计还跨库写 fuling_operation.agent_audit_log，
+    # 与 agent 真库族同表——必须并入同一 group 串行，独立成组仍会跨组死锁。
+    "test_ontology_store.py",
+    "test_ontology_link_semantics.py",
+    "test_ontology_sem.py",
 }
 
 

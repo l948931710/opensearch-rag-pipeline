@@ -59,8 +59,10 @@ if not _RDS_OK and os.environ.get("RAG_ONTOLOGY_TESTS_REQUIRE_RDS", "").strip() 
         "RAG_ONTOLOGY_TESTS_REQUIRE_RDS=1 但本地 MySQL/ontology 表不可用——"
         "真库契约族不许静默 skip（P0-08）；检查 ci_load_schema 与连接配置")
 
-# 独立打标前缀：xdist loadgroup 按文件分 worker，本文件与 test_ontology_store 会并行
-# 跑同一本地库——各扫各的标（__pys_ vs __pyt_），跨 worker 不互删在飞数据。
+# 独立打标前缀（__pys_ vs __pyt_/__pyl_）：各扫各的标，跨文件不互删数据。
+# ⚠️ 打标只隔离数据、隔不开 InnoDB 锁——本文件已随 ontology 真库族并入 conftest
+# 的 local-db-stack 串行组（2026-07-17 flake 根治），与其余真库模块同 worker 串行；
+# 切勿再假设可与 test_ontology_store 并行跑同一本地库。
 _MARK = "__pys_"
 
 

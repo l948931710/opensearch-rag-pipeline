@@ -180,6 +180,20 @@ def _dump(obj: Any) -> Optional[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 # RDS 后端
 # ══════════════════════════════════════════════════════════════════════════════
+def _begin(conn) -> None:
+    """写事务前显式 begin()：钉住池化 SteadyDB 连接，禁「断连/死锁 → 透明重连+单句重放」
+    （dbutils tough_method 在 _transaction 位未置时的默认行为；1213/1205 也映射为
+    OperationalError，一并命中）。不钉的实锤现场（2026-07-17，xdist 并行 ontology 测试）：
+    mint 的 INSERT 与他 worker 清扫 DELETE 死锁，victim 整事务被服务端回滚（ref_seq 进位
+    一并蒸发），SteadyDB 却在新连接重放该条 INSERT 并随 commit 落库 → 对象在、计数器回退，
+    此后每次铸号都撞 uk_ref 1062 连环红，直到该行被清扫才解砖。begin() 后错误如实上抛走
+    rollback，多语句事务原子性（P0-05/06 契约）才真正成立。同款纪律（批次1）：
+    agent_runtime/run_store._begin、spot_checker、cost_breaker。桩连接无 begin 则跳过。"""
+    fn = getattr(conn, "begin", None)
+    if fn is not None:
+        fn()
+
+
 class RDSOntologyStore:
     """ontology_*（schema/027–029）的 RDS 实现。DB 访问沿 registry_store 惯例：
     `db._get_db_conn()`、`%s` 占位、f-string 库前缀、显式 commit/rollback/close。"""
@@ -250,6 +264,7 @@ class RDSOntologyStore:
         _check_golden_provenance(set(golden or {}), provenance,
                                  allow_missing=allow_missing_provenance, where="mint_object")
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT type_code FROM {db}.ontology_ref_seq "
@@ -432,6 +447,7 @@ class RDSOntologyStore:
         属性的溯源行随值一并剪除（不留陈旧来源）。CAS 语义不变：UPDATE 仍带 version
         谓词，diff 只在 expected_version 快照上成立，竞态输家照旧返回 False。"""
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT golden_json FROM {db}.ontology_object "
@@ -478,6 +494,7 @@ class RDSOntologyStore:
         + 其双向 active link→retired。退役后不留任何仍指向它的 active 引用（resolve/sem 双闸兜底）。
         audit 同事务落 agent_audit_log（P0-06 fail-closed）。"""
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT status FROM {db}.ontology_object "
@@ -515,6 +532,7 @@ class RDSOntologyStore:
         if object_id == merged_into:
             raise ValueError("merged_into 不能指向自身")
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 first, second = sorted((object_id, merged_into))
@@ -617,6 +635,7 @@ class RDSOntologyStore:
         _check_caller(_caller, "insert_identifier")
         _check_confidence(confidence)
         db, conn = self._db(), self._conn()
+        _begin(conn)
         identifier_id = new_ulid()
         try:
             with conn.cursor() as cur:
@@ -648,6 +667,7 @@ class RDSOntologyStore:
         if status not in _IDENTIFIER_END_STATES:
             raise ValueError(f"非法终态 {status!r}（合法：{_IDENTIFIER_END_STATES}）")
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"UPDATE {db}.ontology_identifier SET status=%s "
@@ -669,6 +689,7 @@ class RDSOntologyStore:
         """S3 原子改指：同一事务内 旧行 active→superseded(+superseded_by) + 插新 active 行。
         返回新行 identifier_id；旧行非 active → ValueError（先查明现状再纠错）。"""
         db, conn = self._db(), self._conn()
+        _begin(conn)
         new_id = new_ulid()
         try:
             with conn.cursor() as cur:
@@ -733,6 +754,7 @@ class RDSOntologyStore:
                                  allow_missing=allow_missing_provenance,
                                  where="mint_object_with_alias")
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT type_code FROM {db}.ontology_ref_seq "
@@ -807,6 +829,7 @@ class RDSOntologyStore:
         case 不存在/非 open → ValueError；别名撞 uk → DuplicateActiveIdentifier。"""
         _check_confidence(confidence)
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT * FROM {db}.ontology_resolution_case "
@@ -865,6 +888,7 @@ class RDSOntologyStore:
         (identifier_id, closed_case_id)。"""
         _check_confidence(confidence)
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT case_id FROM {db}.ontology_resolution_case "
@@ -938,6 +962,7 @@ class RDSOntologyStore:
             raise ValueError("link 端点不得自指")
         spec = LINK_TYPE_SPECS[link_type]
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             link_id = new_ulid()
             dup = False
@@ -1131,6 +1156,7 @@ class RDSOntologyStore:
         无 → 新建。刻意不用 SELECT … FOR UPDATE（空行取间隙锁，并发首插会 1213 死锁）——
         乐观路径 + 撞 uk_ns_norm_open(1062) 回退聚合。"""
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT case_id FROM {db}.ontology_resolution_case "
@@ -1162,6 +1188,7 @@ class RDSOntologyStore:
                     conn.commit()
                     return case_id
             conn.rollback()
+            _begin(conn)   # commit/rollback 复位 _transaction 位——第二轮聚合事务重新钉
             with conn.cursor() as cur:
                 cur.execute(f"UPDATE {db}.ontology_resolution_case "
                             "SET seen_count=seen_count+1, last_seen_at=NOW(3) "
@@ -1187,6 +1214,7 @@ class RDSOntologyStore:
         """候选幂等：同 (case, target, method) 重复提出 → 置信取大、依据取新。返回现行 candidate_id。"""
         _check_confidence(confidence)
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1375,6 +1403,7 @@ class RDSOntologyStore:
                          note: Optional[str], identifier_id: Optional[str] = None,
                          audit: Optional[Dict[str, Any]] = None) -> bool:
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1397,6 +1426,7 @@ class RDSOntologyStore:
     # ── 溯源目录 / stewardship（种子经 upsert，代码即声明）──────────────────
     def upsert_attribute_sources(self, rows: List[Dict[str, Any]]) -> int:
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 for r in rows:
@@ -1429,6 +1459,7 @@ class RDSOntologyStore:
 
     def upsert_stewardship(self, rows: List[Dict[str, Any]]) -> int:
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 for r in rows:
@@ -1461,6 +1492,7 @@ class RDSOntologyStore:
     def delete_stewardship(self, scope_type: str, scope_key: str) -> bool:
         """撤销一条 scope（PR-G desired-state：代码声明移除=显式撤权，不再永久残留）。"""
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"DELETE FROM {db}.ontology_stewardship "
@@ -1479,6 +1511,7 @@ class RDSOntologyStore:
                                    source: str = "seeding") -> int:
         """PR-F：源快照分母登记（seeding/backfill 真跑时按 namespace upsert）。"""
         db, conn = self._db(), self._conn()
+        _begin(conn)
         try:
             with conn.cursor() as cur:
                 for ns, n in namespace_counts.items():

@@ -54,7 +54,8 @@ if not _RDS_OK and os.environ.get("RAG_ONTOLOGY_TESTS_REQUIRE_RDS", "").strip() 
         "RAG_ONTOLOGY_TESTS_REQUIRE_RDS=1 但本地 MySQL/ontology 表不可用——"
         "真库契约族不许静默 skip（P0-08）；检查 ci_load_schema 与连接配置")
 
-_MARK = "__pyt_"           # RDS 测试数据统一打标，teardown 按标清扫
+_MARK = "__pyt_"           # RDS 测试数据统一打标，teardown 按标清扫（打标只隔数据不隔
+                           # InnoDB 锁——本文件在 conftest local-db-stack 串行组，2026-07-17）
 
 
 def _cleanup_rds(_retry: bool = True):
@@ -420,6 +421,60 @@ def test_list_candidates_for_cases_is_single_query_rds(monkeypatch):
     calls.clear()
     assert RDSOntologyStore().list_candidates_for_cases([]) == {}   # 空入参不发查询
     assert calls == []
+
+
+def test_rds_write_tx_pins_connection_with_begin(monkeypatch):
+    """2026-07-17 flake 根治回归闸：写事务第一动作必须是 begin()——钉住 SteadyDB
+    `_transaction` 位，禁「断连/死锁 → 透明重连+单句重放」劈事务（机理与实锤现场见
+    store._begin docstring；实害=mint victim 回滚后 INSERT 被重放，对象落库而 ref_seq
+    进位蒸发 → 后续铸号连环 1062）。spy 连接不依赖真库/不依赖死锁时序，谁删钉谁红。"""
+    import opensearch_pipeline.db as _db
+
+    events = []
+
+    class _Cur:
+        def __init__(self):
+            self._last = ""
+
+        def execute(self, sql, params=None):
+            self._last = sql
+            events.append("execute")
+
+        def fetchone(self):
+            if "type_code" in self._last:
+                return ("P",)
+            if "LAST_INSERT_ID()" in self._last:
+                return (7,)
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def begin(self):
+            events.append("begin")
+
+        def cursor(self):
+            return _Cur()
+
+        def commit(self):
+            events.append("commit")
+
+        def rollback(self):
+            events.append("rollback")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_db, "_get_db_conn", lambda *a, **k: _Conn())
+    out = RDSOntologyStore().mint_object("product", "钉连接品", owner_dept="pmc",
+                                         _caller="test")
+    assert out["canonical_ref"] == "FLP-P-000007"      # 走完整条铸号路径（非短路跳过）
+    assert events[0] == "begin"                        # begin 先于一切 SQL
+    assert "execute" in events and events[-1] == "commit"
 
 
 # ── 溯源目录 / stewardship 种子 ───────────────────────────────────────────────────
