@@ -625,7 +625,8 @@ class ThreadedRunExecutor:
         - 事务成功 → 先跑缓存性回调（_notify_complete：会话记忆/conversation 增强，
           fail-open——commit 后的副作用失败不再影响真值）再发 done 帧；
         - extra_writer/事务异常 → **落 failed，绝不发 done**（费用已发生也不谎报成功；
-          retryable=True，用户重问即可）；
+          retryable=True，用户重问即可）。store 侧已对 1213/1205 锁竞争做单次全新事务
+          重放（complete_run_atomic，灰度 2026-07-17）——走到本分支 = 非锁异常或连续两撞；
         - CAS False = 失去所有权（收尸/取消/排水抢先）→ 结果作废（原 fencing 语义，
           见 2026-07 重审计 §1——CAS 先于答案落库不是缺陷而是所有权证明，本修复把
           答案写**并入** CAS 事务而非调换顺序）。

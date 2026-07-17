@@ -68,6 +68,26 @@ def _is_thread_busy_error(exc: BaseException) -> bool:
     return "uk_thread_active" in str(exc)
 
 
+def _is_lock_contention_error(exc: BaseException) -> bool:
+    """事务级锁竞争：1213（死锁，victim 事务已被 InnoDB **整体回滚**）/1205（锁等待
+    超时，语句已回滚、事务余部由调用方显式 rollback 收干净）。错误码在 args[0]
+    （pymysql 惯例，_is_thread_busy_error 同式）；两码之外一律不算——断连族（2013 等）
+    另有 _begin 钉连接纪律与 P0-03 消歧收口，不混入重放面。"""
+    args = getattr(exc, "args", None) or ()
+    return bool(args) and args[0] in (1213, 1205)
+
+
+class _CompleteLockContention(Exception):
+    """complete_run_atomic **语句阶段（commit 前）** 撞 1213/1205 的内部重放信号。
+    该窗口「事务确定未生效」成立（COMMIT 从未发出，victim 已回滚/显式 rollback 已清），
+    全新事务重放恰一次安全。绝不出方法边界：重放仍撞 → 还原 original 走 P0-01 诚实
+    failed；commit 阶段异常（两将军，归 P0-03 消歧）不裹本信号、不进重放面。"""
+
+    def __init__(self, original: BaseException):
+        super().__init__(str(original))
+        self.original = original
+
+
 @dataclass
 class AgentStep:
     kind: str                              # ∈ _STEP_KINDS
@@ -324,7 +344,31 @@ class RDSRunStore:
           调用方沿用完成侧 fencing 语义（结果作废）；
         - extra_writer 异常 → 整体回滚后原样抛出——调用方落 failed，绝不发 done；
         - commit 异常但 read-after-write 证实已提交（P0-03，外审核查 2026-07-16）→
-          返回 True（照常发 done）；证实不了 → 原样抛（保守失败语义）。"""
+          返回 True（照常发 done）；证实不了 → 原样抛（保守失败语义）。
+
+        锁竞争单次重放（staging 灰度 2026-07-17：3 并发 run 完成事务撞 1213，答案被
+        打成 AGENT_ERROR）：**语句阶段**撞 1213/1205 → **全新事务重放一次**——新连接、
+        _begin 重钉、FOR UPDATE→extra_writer→CAS→commit 整段重走，绝非 SteadyDB 式
+        单句重试。安全性：该窗口 COMMIT 从未发出、victim 已被 InnoDB 回滚（1205 由
+        显式 rollback 收干净），「事务确定未生效」成立 → 重放即恰一次；幂等由 CAS
+        兜底——间隙期他方收口（取消/收尸）→ 重放 FOR UPDATE 读到非 running → False，
+        沿用 fencing 语义（重试输家自然 CAS 失败）。commit 阶段异常**不在重放面**
+        （结果未知，归 P0-03 消歧；此时重放会把「未知」误判成失去所有权）。重放仍撞
+        锁 → 还原原始异常，维持 P0-01 诚实 failed。"""
+        try:
+            return self._complete_run_txn(run_id, extra_writer)
+        except _CompleteLockContention as first:
+            logger.warning("run %s 完成事务撞锁竞争（%s）——全新事务重放一次"
+                           "（commit 前，事务确定未生效）", run_id, first.original)
+            try:
+                return self._complete_run_txn(run_id, extra_writer)
+            except _CompleteLockContention as second:
+                raise second.original from None   # 连续两撞：还原原异常走 P0-01 诚实 failed
+
+    def _complete_run_txn(self, run_id: str, extra_writer=None) -> bool:
+        """complete_run_atomic 的单次事务尝试（语义与异常契约见公开方法 docstring）。
+        唯一私有约定：语句阶段撞 1213/1205 → 回滚后抛 _CompleteLockContention 重放信号；
+        其余异常与返回值原样。"""
         db = _op_db()
         conn = self._conn()
         _begin(conn)            # 原子性承诺的前提：钉住连接（禁 SteadyDB 断连单句重试劈事务）
@@ -346,11 +390,13 @@ class RDSRunStore:
                 if not ok:
                     conn.rollback()
                     return False
-            except Exception:
+            except Exception as stmt_exc:
                 try:
                     conn.rollback()         # commit 前异常：事务确定未生效，维持原失败语义
                 except Exception:   # noqa: BLE001 — 连接已死时 rollback 也抛，别掩盖原异常
                     pass
+                if _is_lock_contention_error(stmt_exc):
+                    raise _CompleteLockContention(stmt_exc) from stmt_exc
                 raise
             # P0-03（外审核查 2026-07-16）：commit 异常 ≠ 未提交（两将军——服务端可能已
             # 提交、ACK 丢在断连里）。此前与 commit 前异常同路上抛 → 调用方发 RunFailed

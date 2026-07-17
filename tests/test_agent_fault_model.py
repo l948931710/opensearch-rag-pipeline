@@ -9,9 +9,15 @@ docs/audits/enterprise_agent_review_verification_2026-07-16.md）固化成 block
 - P0-03 commit ACK 丢失 → store 层 read-after-write 消歧（已提交按成功返回）；
 - P0-04 拒绝终止 CAS 失败 → 不编造终态帧（durable 已 cancelled 才宣告）；
 - P1-01 事件队列 maxsize=1 → clamp ≥2，终态帧不被收尾哨兵挤掉。
+
+追加（staging 灰度 2026-07-17）：完成事务 1213/1205 锁竞争单次全新事务重放——
+恰重放一次、整段重走（非单句）、每次尝试各自 _begin 钉连接、重试输家 CAS False、
+commit 阶段异常不进重放面（仍归 P0-03 消歧）。
 """
 import threading
 import time
+
+from pymysql.err import OperationalError
 
 import pytest
 
@@ -425,13 +431,155 @@ def test_p0_03_transactional_methods_pin_transaction(monkeypatch):
 
 
 def test_p0_03_precommit_failure_unchanged(monkeypatch):
-    """commit 前异常（extra_writer 抛）语义不变：回滚后原样上抛，无消歧读。"""
+    """commit 前异常（extra_writer 抛）语义不变：回滚后原样上抛，无消歧读。
+    （兼作锁重放的负向门：非锁异常零重试——序列仅 1 条连接，误重放即 IndexError 现形。）"""
     from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
 
     _patch_conns(monkeypatch, [_FakeConn(status_answer="running")])
     with pytest.raises(RuntimeError, match="qa 行写失败"):
         RDSRunStore().complete_run_atomic(
             "r1", extra_writer=lambda cur: (_ for _ in ()).throw(RuntimeError("qa 行写失败")))
+
+
+# ── 完成事务锁竞争单次重放（staging 灰度 2026-07-17：单次 1213 打成 AGENT_ERROR） ──
+
+
+class _RetryProbeConn(_FakeConn):
+    """重放探针：计数 begin/commit/rollback——断言「全新事务重放」而非单句重试
+    （每次尝试各自 begin 钉连接；失败尝试只回滚零提交）。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.begun = 0
+        self.committed = 0
+        self.rolled_back = 0
+
+    def begin(self):
+        self.begun += 1
+
+    def commit(self):
+        super().commit()
+        self.committed += 1
+
+    def rollback(self):
+        try:
+            super().rollback()
+        finally:
+            self.rolled_back += 1
+
+
+def _deadlock_exc():
+    return OperationalError(
+        1213, "Deadlock found when trying to get lock; try restarting transaction")
+
+
+def test_complete_stmt_deadlock_retries_once_fresh_txn(monkeypatch):
+    """语句阶段撞 1213 → 全新事务重放一次成功：首连接零提交纯回滚，第二连接**各自
+    begin 钉连接**（SteadyDB 纪律不因重放松动）后整段重走并 commit——用户拿 done，
+    不再被单次死锁打成 AGENT_ERROR。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    c1 = _RetryProbeConn(select_exc=_deadlock_exc(), status_answer="running")
+    c2 = _RetryProbeConn(status_answer="running")
+    _patch_conns(monkeypatch, [c1, c2])
+    assert RDSRunStore().complete_run_atomic("r1") is True
+    assert (c1.begun, c1.committed) == (1, 0) and c1.rolled_back >= 1
+    assert (c2.begun, c2.committed) == (1, 1)
+
+
+def test_complete_deadlock_in_answer_write_replays_whole_txn(monkeypatch):
+    """答案写（extra_writer）内撞 1213——灰度现场形态：重放跑**整段事务**
+    （FOR UPDATE→答案写→CAS），writer 被完整重调一次；首次尝试已整体回滚，
+    答案行恰落一次。绝非对死语句的单句重试。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    calls = {"n": 0}
+
+    def writer(cur):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _deadlock_exc()
+        cur.execute("INSERT INTO qa_session_log (message_id) VALUES ('m1')")
+
+    c1 = _RetryProbeConn(status_answer="running")
+    c2 = _RetryProbeConn(status_answer="running")
+    _patch_conns(monkeypatch, [c1, c2])
+    assert RDSRunStore().complete_run_atomic("r1", extra_writer=writer) is True
+    assert calls["n"] == 2
+    assert (c1.committed, c2.committed) == (0, 1)
+
+
+def test_complete_lock_wait_timeout_1205_retries(monkeypatch):
+    """1205 锁等待超时与 1213 同窗：语句已回滚+显式 rollback 收干净 → 同样重放一次。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    c1 = _RetryProbeConn(
+        select_exc=OperationalError(
+            1205, "Lock wait timeout exceeded; try restarting transaction"),
+        status_answer="running")
+    c2 = _RetryProbeConn(status_answer="running")
+    _patch_conns(monkeypatch, [c1, c2])
+    assert RDSRunStore().complete_run_atomic("r1") is True
+    assert c2.committed == 1
+
+
+def test_complete_double_deadlock_restores_original_error(monkeypatch):
+    """连续两撞：重放**恰一次**（序列仅 2 条连接，第三次取连接会 IndexError 现形），
+    还原原始 1213 上抛——executor 沿 P0-01 诚实落 failed，错误面貌与现状一致。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    boom2 = _deadlock_exc()
+    _patch_conns(monkeypatch, [
+        _RetryProbeConn(select_exc=_deadlock_exc(), status_answer="running"),
+        _RetryProbeConn(select_exc=boom2, status_answer="running"),
+    ])
+    with pytest.raises(OperationalError) as exc_info:
+        RDSRunStore().complete_run_atomic("r1")
+    assert exc_info.value is boom2
+    assert exc_info.value.args[0] == 1213
+
+
+def test_complete_retry_loser_cas_false_no_write(monkeypatch):
+    """重放间隙他方收口（取消/收尸）：重放 FOR UPDATE 读到非 running → False 且零提交
+    ——重试输家自然 CAS 失败，沿用完成侧 fencing 语义，绝不覆盖他方终态。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    c1 = _RetryProbeConn(select_exc=_deadlock_exc(), status_answer="running")
+    c2 = _RetryProbeConn(status_answer="cancelled")
+    _patch_conns(monkeypatch, [c1, c2])
+    assert RDSRunStore().complete_run_atomic("r1") is False
+    assert c2.committed == 0
+
+
+def test_complete_commit_phase_deadlock_not_retried(monkeypatch):
+    """commit 阶段异常即便带锁码也**不进重放面**——结果未知归 P0-03 消歧（重放会把
+    「未知」误判成失去所有权→False→结果作废，比诚实 failed 更糟）。消歧读不出
+    succeeded → 原异常上抛；若误重放，序列第 5 条连接会被取用（IndexError 现形）。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    boom = OperationalError(1213, "Deadlock found when trying to get lock (commit)")
+    _patch_conns(monkeypatch, [
+        _FakeConn(commit_exc=boom, status_answer="running"),
+        _FakeConn(status_answer="running"),
+        _FakeConn(status_answer="running"),
+        _FakeConn(status_answer="running"),
+    ])
+    with pytest.raises(OperationalError) as exc_info:
+        RDSRunStore().complete_run_atomic("r1")
+    assert exc_info.value is boom
+
+
+def test_complete_connection_lost_stmt_phase_not_retried(monkeypatch):
+    """语句阶段断连（2013 等 connection-lost 族）不重放：票面仅 1213/1205 两码——
+    断连族另有 _begin 钉连接纪律与 P0-03 消歧收口，混入重放面反而引回单句重放风险。
+    序列仅 1 条连接，误重放即 IndexError 现形。"""
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    boom = OperationalError(2013, "Lost connection to MySQL server during query")
+    _patch_conns(monkeypatch, [_FakeConn(select_exc=boom, status_answer="running")])
+    with pytest.raises(OperationalError) as exc_info:
+        RDSRunStore().complete_run_atomic("r1")
+    assert exc_info.value is boom
 
 
 # ── P0-04：拒绝终止 CAS 失败不编造终态 ──────────────────────────────────────
