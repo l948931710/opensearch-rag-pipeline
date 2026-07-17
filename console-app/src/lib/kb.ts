@@ -22,6 +22,7 @@ export const GROUP_LABEL: Record<string, string> = {
   finance: '财务', it: '信息技术', marketing: '营销', production: '生产', pmc: '生产计划部',
   admin: '行政', hr: '人力资源', rd: '研发', quality: '品质技术', supply: '资材供应',
   overseas: '海外', audit: '审计', legal: '法务', engineering: '工程', corn_eco: '玉米环保',
+  sales: '销售', logistics: '物流',
 }
 // 生产子线是合法 owner_dept（永不归并回 production）——只做展示映射，
 // 不并入 GROUP_LABEL：CONTRIB_DEPT_OPTS 以 GROUP_LABEL 的键为贡献归属选项，子线不应出现在下拉里。
