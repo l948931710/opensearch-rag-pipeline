@@ -559,6 +559,14 @@ class _SuspendedStore(_FakeStore):
         return True
 
 
+class _RecordingCursor:
+    """decide 同事务的 audit_writer/outbox_writer 用假游标（execute no-op）——
+    验证回调被调用即可，SQL 落库由真 store 的 DB 集成测试覆盖。"""
+
+    def execute(self, sql, params=None):
+        pass
+
+
 class _FakeApprovalStore:
     def __init__(self, areq=None):
         self.areq = areq
@@ -568,11 +576,18 @@ class _FakeApprovalStore:
         return dict(self.areq) if self.areq and self.areq["run_id"] == run_id else None
 
     def decide(self, request_id, *, decision, decided_by, reason=None,
-               edited_args=None, idempotency_key=None, audit_writer=None):
-        # P1-13 契约：真实 store 在同事务经 audit_writer(cur) 写审计；内存桩记录传入即可
+               edited_args=None, idempotency_key=None, audit_writer=None, outbox_writer=None):
+        # P1-13/PR-3 Stage B 契约：真实 store 在同事务经 audit_writer/outbox_writer(cur)
+        # 写审计+命令；内存桩用假游标驱动它们（验证被调）后记录
+        _fake_cur = _RecordingCursor()
+        if audit_writer is not None:
+            audit_writer(_fake_cur)
+        if outbox_writer is not None:
+            outbox_writer(_fake_cur)
         self.decisions.append({"request_id": request_id, "decision": decision,
                                "decided_by": decided_by,
-                               "audit_writer_passed": audit_writer is not None})
+                               "audit_writer_passed": audit_writer is not None,
+                               "outbox_writer_passed": outbox_writer is not None})
         self.areq["status"] = decision
         return "accepted"
 

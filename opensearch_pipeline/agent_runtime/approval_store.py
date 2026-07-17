@@ -214,7 +214,8 @@ class RDSApprovalStore:
     # ── 决策侧 ───────────────────────────────────────────────────
     def decide(self, request_id: str, *, decision: str, decided_by: str,
                reason: Optional[str] = None, edited_args: Optional[Dict[str, Any]] = None,
-               idempotency_key: Optional[str] = None, audit_writer=None) -> str:
+               idempotency_key: Optional[str] = None, audit_writer=None,
+               outbox_writer=None) -> str:
         """FOR UPDATE + pending CAS 决出处置。返回 DECIDE_ACCEPTED / DECIDE_DUPLICATE /
         DECIDE_ALREADY_DECIDED / DECIDE_EXPIRED。decision ∈ approved/edited/rejected_feedback/
         rejected_terminate。同事务写 approval_decision（重复 idempotency_key → 幂等 DUPLICATE）。
@@ -288,6 +289,10 @@ class RDSApprovalStore:
                 # 回滚（调用方 503 重试），决定与审计要么都在、要么都不在。
                 if audit_writer is not None:
                     audit_writer(cur)
+                # PR-3 Stage B：resume 命令与决定同事务（dispatch_outbox.insert_command_tx）
+                # ——决定 commit ⇒ 命令 durable，「decide 后崩溃」升级为命令消费。
+                if outbox_writer is not None:
+                    outbox_writer(cur)
             conn.commit()
             return DECIDE_ACCEPTED
         except Exception:

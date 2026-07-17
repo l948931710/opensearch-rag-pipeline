@@ -92,8 +92,10 @@ def test_dry_run_counts_without_deleting(monkeypatch, live_db):
     rep = retention.purge_subject("u1")
     assert rep["ok"] and rep["dry_run"]
     assert set(rep["tables"]) == {
-        # agent 表族（schema/022/023，深度审查治理组）——checkpoint 明文擦除覆盖
-        "agent_checkpoint", "agent_step", "tool_invocation", "llm_call_log", "agent_run",
+        # agent 表族（schema/022/023，深度审查治理组）——checkpoint 明文擦除覆盖；
+        # agent_dispatch_command（schema/043，PR-3 Stage B）payload 含问题原文，user_id 直删
+        "agent_checkpoint", "agent_step", "tool_invocation", "llm_call_log",
+        "agent_dispatch_command", "agent_run",
         "qa_retrieved_doc", "user_feedback", "escalation_ticket",
         "qa_conversation", "qa_session_log"}
     assert all(t["affected"] == 42 and t["dry_run"] for t in rep["tables"].values())
@@ -108,15 +110,16 @@ def test_commit_requires_enable_flag(monkeypatch, live_db):
 
 def test_commit_deletes_fact_rows_before_session_log(monkeypatch, live_db):
     monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
-    # 10 表链：agent 5 表（checkpoint/step/invocation/llm_call/run）在前，qa 5 表在后
-    conn = _Conn(affected=3, act_rowcounts=[0, 0, 0, 0, 0, 3, 0, 0, 0, 3])
+    # 11 表链：agent 6 表（checkpoint/step/invocation/llm_call/dispatch_command/run）在前，
+    # qa 5 表在后（PR-3 Stage B 加 agent_dispatch_command，索引 4）
+    conn = _Conn(affected=3, act_rowcounts=[0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3])
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.purge_subject("u1", commit=True, batch=100)
     assert rep["ok"]
     assert rep["tables"]["qa_retrieved_doc"]["deleted"] == 3
     assert rep["tables"]["qa_session_log"]["deleted"] == 3
     deletes = [s for s, _ in conn.executed if s.strip().startswith("DELETE")]
-    assert len(deletes) == 10
+    assert len(deletes) == 11
     # ⚠️ 顺序不可倒：事实表（经 message_id 关联）必须先于 qa_session_log 本体
     idx_fact = next(i for i, s in enumerate(deletes) if "qa_retrieved_doc" in s)
     idx_log = next(i for i, s in enumerate(deletes)

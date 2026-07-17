@@ -68,6 +68,9 @@ class MemOutbox:
         for r in self.rows.values():
             expired = (r["status"] == "claimed"
                        and (r["lease_expires_at"] or 0) < now)
+            # kind-aware（Stage B）：已绑 run 的 submit 绝不重认领；resume 照常
+            if r["run_id"] is not None and r["kind"] == "submit":
+                continue
             if (r["status"] == "queued" or expired) and r["attempts"] < max_attempts:
                 r.update(status="claimed", lease_holder=holder,
                          lease_expires_at=now + lease_s)
@@ -114,6 +117,7 @@ class MemOutbox:
         now = time.time()
         return [dict(r) for r in self.rows.values()
                 if r["status"] == "claimed" and r["run_id"] is not None
+                and r["kind"] == "submit"                  # Stage B：resume 命令排除
                 and (r["lease_expires_at"] or 0) < now][:limit]
 
     def backlog_count(self):
@@ -361,6 +365,9 @@ def pr3_wired(monkeypatch):
     monkeypatch.setattr(agent_route, "_get_dispatch_outbox", lambda: ob)
     monkeypatch.setattr(agent_route, "_DISPATCHER", None)    # 每测新建（绑定本 ob）
     monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
+    # 关投机检索：本组测命令生命周期/命名空间，投机预取的共享 _SPEC_POOL 背景线程
+    # 会越过测试边界污染其它测的 _RETRIEVE 计数（与本组无关，显式关掉）
+    monkeypatch.setenv("RAG_AGENT_SPEC_RETRIEVAL", "false")
     yield ob, store
     executor.shutdown()
 
@@ -495,3 +502,174 @@ def test_p3_recover_missing_question_unrecoverable(recover_wired):
     cmd["payload"]["question"] = ""
     with pytest.raises(ValueError, match="question"):
         agent_route._dispatch_recovered_submit(cmd)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage B：resume 命令入 outbox
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_p3b_claim_next_skips_bound_submit_takes_resume():
+    """kind-aware 认领（顺修 Stage A 缺口）：已绑 run 的 submit 绝不重认领（at-most-once）；
+    resume 命令 run_id 恒有值仍照常认领（重驱幂等）。"""
+    ob = MemOutbox()
+    # 已绑 run 的 submit（模拟 bound-expired 漏网）
+    s = ob.enqueue(thread_id="t", user_id="u", channel="console", payload={"question": "q"})
+    ob.claim_specific(s, holder="dead", lease_s=60)
+    ob.rows[s]["run_id"] = "run-s"
+    ob.rows[s]["lease_expires_at"] = time.time() - 10
+    # resume 命令（run_id 恒有值）
+    r = ob.enqueue(thread_id="t", user_id="u", channel="console",
+                   payload={"decision": "approved", "request_id": "req1"})
+    ob.rows[r]["run_id"] = "run-r"
+    ob.rows[r]["kind"] = "resume"
+    claimed = ob.claim_next(holder="h", lease_s=60)
+    assert claimed and claimed["command_id"] == r          # 跳过已绑 submit，认领 resume
+
+
+def test_p3b_recover_resume_suspended_redrives(monkeypatch):
+    """恢复重驱 resume 命令：run 仍 suspended → 走 _redrive_resume_run 返回 run_id。"""
+    called = {}
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (None, None, None, SimpleNamespace(
+                            get_run=lambda rid: {"run_id": rid, "status": "suspended",
+                                                 "thread_id": "t", "user_id": "u"})))
+    monkeypatch.setattr(agent_route, "_get_approval_store", lambda: object())
+    monkeypatch.setattr(agent_route, "_redrive_resume_run",
+                        lambda *a, **k: called.setdefault("kind", a[1]) or "ok")
+    cmd = {"command_id": "c1", "kind": "resume", "run_id": "run9",
+           "payload": {"decision": "approved", "request_id": "req1"}}
+    assert agent_route._dispatch_recovered_resume(cmd) == "run9"
+    assert called["kind"] == "approved"
+
+
+def test_p3b_recover_resume_terminal_closes_done(monkeypatch):
+    """run 已终态 → 返回 run_id 让 dispatcher 收口 done（幂等，不重驱）。"""
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (None, None, None, SimpleNamespace(
+                            get_run=lambda rid: {"run_id": rid, "status": "succeeded"})))
+    cmd = {"command_id": "c1", "kind": "resume", "run_id": "run9",
+           "payload": {"decision": "approved", "request_id": "req1"}}
+    assert agent_route._dispatch_recovered_resume(cmd) == "run9"
+
+
+def test_p3b_recover_resume_running_retry_later(monkeypatch):
+    """run 已被认领在跑（running/resuming）→ DispatchRetryLater（等其收尾）。"""
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (None, None, None, SimpleNamespace(
+                            get_run=lambda rid: {"run_id": rid, "status": "running"})))
+    cmd = {"command_id": "c1", "kind": "resume", "run_id": "run9",
+           "payload": {"decision": "approved", "request_id": "req1"}}
+    with pytest.raises(DispatchRetryLater):
+        agent_route._dispatch_recovered_resume(cmd)
+
+
+def test_p3b_recover_resume_pool_full_retry_later(monkeypatch):
+    """_redrive_resume_run 返回 retry（池满/身份瞬断）→ DispatchRetryLater。"""
+    monkeypatch.setattr(agent_route, "_get_runtime",
+                        lambda: (None, None, None, SimpleNamespace(
+                            get_run=lambda rid: {"run_id": rid, "status": "suspended",
+                                                 "thread_id": "t", "user_id": "u"})))
+    monkeypatch.setattr(agent_route, "_get_approval_store", lambda: object())
+    monkeypatch.setattr(agent_route, "_redrive_resume_run", lambda *a, **k: "retry")
+    cmd = {"command_id": "c1", "kind": "resume", "run_id": "run9",
+           "payload": {"decision": "approved", "request_id": "req1"}}
+    with pytest.raises(DispatchRetryLater):
+        agent_route._dispatch_recovered_resume(cmd)
+
+
+def test_p3b_dispatch_recover_routes_by_kind(monkeypatch):
+    """_dispatch_recover 按 kind 分流：submit→submit 恢复，resume→resume 恢复。"""
+    seen = []
+    monkeypatch.setattr(agent_route, "_dispatch_recovered_submit",
+                        lambda cmd: seen.append("submit") or "rs")
+    monkeypatch.setattr(agent_route, "_dispatch_recovered_resume",
+                        lambda cmd: seen.append("resume") or "rr")
+    assert agent_route._dispatch_recover({"kind": "submit"}) == "rs"
+    assert agent_route._dispatch_recover({"kind": "resume"}) == "rr"
+    assert agent_route._dispatch_recover({}) == "rs"        # 缺 kind 默认 submit
+    assert seen == ["submit", "resume", "submit"]
+
+
+def test_p3b_insert_command_tx_shape(monkeypatch):
+    """insert_command_tx：单条 INSERT，run_id 随命令写（resume 命令 enqueue 即绑 run）。"""
+    from opensearch_pipeline.agent_runtime.dispatch_outbox import insert_command_tx
+
+    captured = {}
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            captured["sql"] = " ".join(sql.split())
+            captured["params"] = params
+
+    cid = insert_command_tx(_Cur(), command_id="c1", kind="resume", thread_id="t",
+                            user_id="u", channel="console",
+                            payload={"decision": "approved"}, run_id="run9")
+    assert cid == "c1"
+    assert "INSERT INTO" in captured["sql"] and "agent_dispatch_command" in captured["sql"]
+    assert "c1" in captured["params"] and "run9" in captured["params"]
+    assert "resume" in captured["params"]
+
+
+def test_p3b_decide_writes_resume_command_in_tx(monkeypatch):
+    """approval_store.decide 的 outbox_writer 在决定同事务被调（写 resume 命令）。"""
+    from opensearch_pipeline.agent_runtime.approval_store import RDSApprovalStore
+
+    class _DecCur:
+        def __init__(self, conn):
+            self._conn = conn
+            self.rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            self._conn.sqls.append(s)
+            if "FROM" in s and "approval_request" in s and "FOR UPDATE" in s:
+                self._conn.row = ("pending", "d0", 0)
+
+        def fetchone(self):
+            return self._conn.row
+
+    class _DecConn:
+        def __init__(self):
+            self.sqls = []
+            self.row = None
+            self.committed = 0
+
+        def begin(self):
+            pass
+
+        def cursor(self):
+            return _DecCur(self)
+
+        def commit(self):
+            self.committed += 1
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    conn = _DecConn()
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: conn)
+    calls = []
+    RDSApprovalStore().decide("req1", decision="approved", decided_by="admin",
+                              outbox_writer=lambda cur: calls.append(cur))
+    assert calls and conn.committed == 1                   # outbox_writer 在 commit 前被调
+
+
+def test_p3b_close_done_claims_then_completes():
+    """close_done（resume 命令 fast-path 收口）：queued → claimed → done。"""
+    ob = MemOutbox()
+    d = _mk(ob, lambda cmd: None)
+    cid = ob.enqueue(thread_id="t", user_id="u", channel="console",
+                     payload={"decision": "approved"})
+    ob.rows[cid]["run_id"] = "run9"                        # resume 命令 enqueue 即绑 run
+    d.close_done(cid)
+    assert ob.rows[cid]["status"] == "done"

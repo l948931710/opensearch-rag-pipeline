@@ -90,6 +90,9 @@ _JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_fa
               # 游离于留存与主体擦除之外）。顺序 load-bearing：子表在前、agent_run 殿后。
               "agent_checkpoints", "agent_steps", "tool_invocations", "llm_calls",
               "agent_audit", "approval_decisions", "approval_requests", "agent_runs",
+              # PR-3 Stage B（schema/043）：dispatch 命令表——payload_json 含用户问题原文
+              # （敏感级=qa_session_log）。终态命令（done/failed/cancelled）到期整行删。
+              "dispatch_commands",
               # 本体表族（schema/027-028，PR-G/P1「数据与证据无保留策略」）：case evidence
               # 与候选 features 携源观测快照（可能含员工查询上下文）——处置后到期擦除
               # （行留审计骨架，只 NULL 掉证据 blob）。open case 的证据是活依据，永不动。
@@ -98,7 +101,7 @@ _JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_fa
 # 可选迁移的作业（表未建的环境 1146 → skip 不算失败；基础表缺失仍按事故上报）
 _OPTIONAL_JOBS = frozenset({"qa_facts", "agent_checkpoints", "agent_steps", "tool_invocations",
                             "llm_calls", "agent_audit", "approval_decisions",
-                            "approval_requests", "agent_runs",
+                            "approval_requests", "agent_runs", "dispatch_commands",
                             "ontology_case_evidence", "ontology_candidate_features"})
 
 _AGENT_RUN_TERMINAL = "('succeeded','failed','cancelled','expired')"
@@ -143,6 +146,9 @@ def _retention_windows() -> Dict[str, int]:
         "approval_decisions": _months("RAG_RETENTION_APPROVAL_MONTHS", 24),
         "approval_requests": _months("RAG_RETENTION_APPROVAL_MONTHS", 24),
         "agent_runs": _months("RAG_RETENTION_AGENT_RUN_MONTHS", 18),
+        # PR-3 Stage B dispatch 命令（含问题原文）：与 qa_blobs 同短窗——纯执行控制面，
+        # 终态后无长期价值，问题原文已在 qa_session_log 按其窗口治理。
+        "dispatch_commands": _months("RAG_RETENTION_DISPATCH_COMMAND_MONTHS", 6),
         # 本体证据擦除（同一窗口 env 管两个作业，与 AGENT_TRACE 同款）：evidence/features
         # 是源观测快照（PII 面），处置后 6 月擦 blob；identifier/case 行本体=审计骨架不删。
         "ontology_case_evidence": _months("RAG_RETENTION_ONTOLOGY_EVIDENCE_MONTHS", 6),
@@ -253,6 +259,13 @@ def _job_sqls(job: str) -> Dict[str, str]:
         pred = ("FROM {op}.agent_run "
                 "WHERE status IN " + _AGENT_RUN_TERMINAL + " "
                 "AND ended_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "dispatch_commands":
+        # PR-3 Stage B（schema/043）：终态命令（done/failed/cancelled）到期删。queued/claimed
+        # 是在途执行控制面，永不删（活命令）；created_at 计龄（无独立 ended 列，收口即近末态）。
+        pred = ("FROM {op}.agent_dispatch_command "
+                "WHERE status IN ('done','failed','cancelled') "
+                "AND created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
         return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
     if job == "ontology_case_evidence":
         # 已处置 case 的证据快照到期擦除（open=活依据永不动；行留审计骨架）
@@ -493,6 +506,9 @@ def _purge_jobs(user_id: str) -> List[dict]:
         {"table": "llm_call_log", "optional": True,       # schema/023；user_id 直删（含 null-run 行）
          "count": f"SELECT COUNT(*) FROM {op}.llm_call_log WHERE user_id = %s",
          "act": f"DELETE FROM {op}.llm_call_log WHERE user_id = %s LIMIT %s"},
+        {"table": "agent_dispatch_command", "optional": True,   # schema/043；payload 含问题原文，user_id 直删
+         "count": f"SELECT COUNT(*) FROM {op}.agent_dispatch_command WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.agent_dispatch_command WHERE user_id = %s LIMIT %s"},
         {"table": "agent_run", "optional": True,          # 最后删（子表的 run_id 锚点）
          "count": f"SELECT COUNT(*) FROM {op}.agent_run WHERE user_id = %s",
          "act": f"DELETE FROM {op}.agent_run WHERE user_id = %s LIMIT %s"},

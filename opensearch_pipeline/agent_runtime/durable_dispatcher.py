@@ -76,6 +76,17 @@ class DurableDispatcher:
             logger.warning("dispatch 命令 %s 收口失败（run %s 已起跑，恢复扫描将按已绑收敛）",
                            command_id, run_id, exc_info=True)
 
+    def close_done(self, command_id: str) -> None:
+        """fast path 已完成动作后的命令收口（Stage B resume 命令：run_id 在 enqueue 时
+        已写，无 bind 步）。fail-open——收口失败由恢复扫描按 run 现状收敛。"""
+        try:
+            if self._outbox.claim_specific(command_id, holder=self.holder,
+                                           lease_s=self.lease_s):
+                self._outbox.complete(command_id, status="done", holder=self.holder)
+        except Exception:   # noqa: BLE001
+            logger.warning("dispatch 命令 %s fast-path 收口失败（恢复扫描按 run 状态收敛）",
+                           command_id, exc_info=True)
+
     def fail_fast(self, command_id: str, reason: str) -> None:
         """dispatch 被拒（容量 429/会话忙 409）：命令诚实收口 failed（UX 与直通路径一致，
         不做排队重试——那是后续 knob）。fail-open。"""

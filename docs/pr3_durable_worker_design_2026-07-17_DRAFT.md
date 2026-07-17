@@ -75,8 +75,21 @@ inline dispatch + 后台恢复扫描（随既有 reaper 线程节奏）。灰度
 
 ## 3. 后续分期
 
-- **Stage B**：resume 命令入 outbox（/approve decide 事务同写命令行，B6 reconcile
-  收敛为 worker 消费）；`agent_dispatch_command` retention 纳入 F-36。
+- **Stage B ✅ 已落地（2026-07-17）**：
+  - schema/044 命令 kind 扩 `resume`（ENUM INSTANT 加值）；
+  - `dispatch_outbox.insert_command_tx` 供 `approval_store.decide` 的 `outbox_writer`
+    游标回调——**resume 命令与审批决定同事务**（决定 commit ⇒ 恢复命令 durable）；
+    edited **不入队**（脱敏参数不可自动重驱，P1-07 不变）；
+  - `claim_next`/`list_bound_expired` **kind-aware**（顺修 Stage A 缺口：已绑 run 的
+    submit 命令绝不被 claim_next 捡走重执行=双答案；resume 命令 run_id 恒有值仍照常
+    认领——重驱幂等）；
+  - `durable_dispatcher.close_done`（resume fast-path 收口，无 bind 步）+ 恢复按 kind
+    分流（`_dispatch_recover`）：resume 按 run 现状收敛（suspended→重驱 /
+    running→retry / 终态→done）；
+  - **B6 对账与 Stage B 恢复共用单引擎 `_redrive_resume_run`**（语义一致；对账保留为
+    兜底——覆盖 Stage B 之前的历史决定、edited 人工流、flag off 环境）；
+  - `agent_dispatch_command` 纳入 F-36 retention（终态命令 6 月删）+ purge_subject
+    主体擦除（user_id 直删，payload 含问题原文）。
 - **Stage C**：HIGH_WRITE tool task ledger——operation_id 透传下游 + 回执查询协议
   （`check_operation`），uncertain 对账从人工升级为自动查证；per-tool worker 隔离。
 - **Stage D**：多副本形态（dispatcher 拆独立部署、distributed admission、durable

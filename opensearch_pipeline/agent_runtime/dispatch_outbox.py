@@ -34,6 +34,22 @@ def _op_db() -> str:
     return get_config().rds.operation_database
 
 
+def insert_command_tx(cur, *, command_id: str, kind: str, thread_id: str, user_id: str,
+                      channel: str, payload: Dict[str, Any],
+                      run_id: Optional[str] = None) -> str:
+    """PR-3 Stage B：命令与主事实**同事务**落库（approval_store.decide 的 outbox_writer
+    游标回调用）——决定 commit ⇒ resume 命令必然存在，「decide 后进程崩溃」从 B6
+    周期对账推断升级为 durable 命令消费。抛错=调用方事务整体回滚（决定与命令同生共死）。
+    resume 命令的 run_id 在 enqueue 时即写（恢复按 run 现状收敛，见 durable_dispatcher）。"""
+    cur.execute(
+        f"INSERT INTO {_op_db()}.agent_dispatch_command "
+        "(command_id, kind, status, thread_id, user_id, channel, payload_json, run_id) "
+        "VALUES (%s,%s,'queued',%s,%s,%s,%s,%s)",
+        (command_id, kind, thread_id, user_id, channel,
+         json.dumps(payload, ensure_ascii=False), run_id))
+    return command_id
+
+
 def _row_to_dict(row) -> Dict[str, Any]:
     d = dict(zip((c.strip() for c in _COLS.split(",")), row))
     if d.get("payload_json"):
@@ -103,7 +119,11 @@ class RDSDispatchOutbox:
                    max_attempts: int = 3) -> Optional[Dict[str, Any]]:
         """恢复扫描认领：queued 或 lease 已过期的 claimed（持有者已死）中最老的一条。
         SKIP LOCKED：并发扫描（未来多副本）各拿各的，绝不双认领。
-        attempts 已达上限的行不再认领（由 sweep_exhausted 收口 failed）。"""
+        attempts 已达上限的行不再认领（由 sweep_exhausted 收口 failed）。
+        Stage B kind-aware（顺修 Stage A 缺口）：**已绑 run 的 submit 命令绝不再认领**
+        （at-most-once——此前 list_bound_expired 单批漏网的已绑 submit 会被本查询捡走
+        重执行=双答案）；resume 命令 run_id 恒有值，重驱天然幂等（CAS first-claim-wins），
+        照常认领。"""
         db = _op_db()
         conn = self._conn()
         _begin(conn)                        # SELECT FOR UPDATE + UPDATE：钉连接
@@ -113,6 +133,7 @@ class RDSDispatchOutbox:
                     f"SELECT {_COLS} FROM {db}.agent_dispatch_command "
                     "WHERE (status='queued' OR (status='claimed' AND lease_expires_at < NOW(3))) "
                     "  AND attempts < %s "
+                    "  AND (run_id IS NULL OR kind='resume') "
                     "ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
                     (int(max_attempts),))
                 row = cur.fetchone()
@@ -232,7 +253,9 @@ class RDSDispatchOutbox:
 
     # ── 读侧 ─────────────────────────────────────────────────────
     def list_bound_expired(self, limit: int = 20) -> "list":
-        """已绑 run 但 lease 过期的命令（持有者死于执行中）——dispatcher 按 run 终态收口。"""
+        """已绑 run 但 lease 过期的 **submit** 命令（持有者死于执行中）——dispatcher 无条件
+        收口 done（dispatch 已成功，run 生死归 run 机器）。resume 命令有意排除：run_id
+        恒有值不代表 dispatch 成功，须按 run 现状收敛（claim_next→recover_fn 处理）。"""
         db = _op_db()
         conn = self._conn()
         try:
@@ -240,7 +263,7 @@ class RDSDispatchOutbox:
                 cur.execute(
                     f"SELECT {_COLS} FROM {db}.agent_dispatch_command "
                     "WHERE status='claimed' AND lease_expires_at < NOW(3) "
-                    "  AND run_id IS NOT NULL ORDER BY id LIMIT %s",
+                    "  AND run_id IS NOT NULL AND kind='submit' ORDER BY id LIMIT %s",
                     (int(limit),))
                 rows = cur.fetchall() or []
             return [_row_to_dict(r) for r in rows]

@@ -166,7 +166,7 @@ def _get_dispatcher():
     global _DISPATCHER
     if _DISPATCHER is None:
         from opensearch_pipeline.agent_runtime.durable_dispatcher import DurableDispatcher
-        _DISPATCHER = DurableDispatcher(_get_dispatch_outbox(), _dispatch_recovered_submit)
+        _DISPATCHER = DurableDispatcher(_get_dispatch_outbox(), _dispatch_recover)
     return _DISPATCHER
 
 
@@ -979,6 +979,7 @@ def agent_approve(req: ApproveRequest, request: Request,
     # 一致 + decided_by/reason 以库为准）；不同向/改参/已过期 → 409。
     decided_by_effective = identity.user_id
     audited_in_tx = False
+    resume_cmd_id = None          # PR-3 Stage B：本次 decide 同事务写的 resume 命令（inline resume 成功后收口）
     if areq is not None:
         from opensearch_pipeline.agent_runtime.approval_store import (
             DECIDE_ALREADY_DECIDED, DECIDE_EXPIRED)
@@ -996,13 +997,36 @@ def agent_approve(req: ApproveRequest, request: Request,
                     decision=_aud_kind, run_id=_aud_rid,
                     detail={"kind": _aud_kind, "approver": _aud_by, "request_id": _aud_req})
 
+            # PR-3 Stage B（RAG_AGENT_DURABLE_DISPATCH）：approved/rejected_* 的 resume
+            # 命令与决定**同事务**入 outbox——决定 commit ⇒ 恢复命令 durable，「decide 后
+            # 崩溃」从 B6 周期对账推断升级为命令消费。edited **不入队**（脱敏参数不可
+            # 自动重驱，P1-07 不变，走人工/对账兜底）；outbox_writer 失败=决定回滚 503。
+            _outbox_writer = None
+            from opensearch_pipeline.agent_runtime.durable_dispatcher import (
+                durable_dispatch_enabled)
+            if durable_dispatch_enabled() and outcome.kind != "edited":
+                from opensearch_pipeline.agent_runtime.dispatch_outbox import (
+                    insert_command_tx)
+                import uuid as _uuid
+                _cmd_id = _uuid.uuid4().hex
+                resume_cmd_id = _cmd_id
+                _resume_payload = {"decision": outcome.kind, "request_id": areq["request_id"],
+                                   "decided_by": identity.user_id,
+                                   "reason": getattr(outcome, "reason", None)}
+
+                def _outbox_writer(cur):
+                    insert_command_tx(cur, command_id=_cmd_id, kind="resume",
+                                      thread_id=run.get("thread_id") or req.run_id,
+                                      user_id=run.get("user_id") or "", channel="console",
+                                      payload=_resume_payload, run_id=req.run_id)
+
             try:
                 res = approval_store.decide(
                     areq["request_id"], decision=outcome.kind, decided_by=identity.user_id,
                     reason=getattr(outcome, "reason", None),
                     edited_args=getattr(outcome, "edited_args", None),
                     idempotency_key=req.idempotency_key,
-                    audit_writer=_audit_decision)
+                    audit_writer=_audit_decision, outbox_writer=_outbox_writer)
             except Exception:   # noqa: BLE001 — 决策落库失败：宁拒不续（无 decision 行不放行执行）
                 logger.error("approval_decision 写失败，拒绝续跑", exc_info=True)
                 raise HTTPException(status_code=503, detail="审批决定落库失败，请重试")
@@ -1094,7 +1118,13 @@ def agent_approve(req: ApproveRequest, request: Request,
                                  approval_meta=approval_meta,
                                  on_complete_durable=_persist_answer)
     except RunRejected as e:
+        # PR-3 Stage B：inline resume 被拒（并发认领/池满）——run 仍 suspended，resume
+        # 命令留 queued 让恢复扫描接手（decide 已 commit，命令 durable）。409 回执不变。
         raise HTTPException(status_code=409, detail=str(e) or "run 非挂起或已被认领")
+    if resume_cmd_id is not None:
+        # inline resume 已交棒（run 进 resuming/running）——resume 命令使命完成，收口 done
+        # （fail-open：收口失败恢复扫描按 run 现状收敛，run 非 suspended 即认已处理）。
+        _get_dispatcher().close_done(resume_cmd_id)
 
     # P0-A（审批答案回流审批人）：/approve 是**审批动作回执**，不是答案通道——审批人的
     # 审批权 ≠ 发起人所属部门知识的读权，续跑答案以发起人 ACL 生成，绝不 SSE 回流给
@@ -1245,6 +1275,47 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
     return message_id, _remember, _report_failure, _persist_answer
 
 
+def _dispatch_recover(cmd: dict):
+    """PR-3 恢复扫描回调（dispatcher 注入）：按 kind 路由。返回 run_id（dispatcher
+    bind+done）/ None（收口 failed）；抛 DispatchRetryLater=本轮不可重建，留 claimed。"""
+    kind = cmd.get("kind") or "submit"
+    if kind == "resume":
+        return _dispatch_recovered_resume(cmd)
+    return _dispatch_recovered_submit(cmd)
+
+
+def _dispatch_recovered_resume(cmd: dict):
+    """PR-3 Stage B：恢复重驱一条 resume 命令（/approve decide 事务同写、resume 未跑完
+    进程即崩）。按 run 现状收敛（与 B6 对账同引擎——_redrive_resume_run）：
+    - suspended → 重驱 resume（CAS first-claim-wins，与人工 /approve 重试赛跑安全）；
+    - running/resuming（已被认领在跑）→ DispatchRetryLater（等它自己走完/reaper 收尸）；
+    - 终态 → 已完成，返回 run_id 让 dispatcher 收口 done（幂等）。"""
+    from opensearch_pipeline.agent_runtime.durable_dispatcher import DispatchRetryLater
+    payload = cmd.get("payload") or {}
+    run_id = cmd.get("run_id")
+    kindd = payload.get("decision")
+    if not run_id or not kindd:
+        raise ValueError("resume 命令缺 run_id/decision（不可重建）")
+    registry, gateway, executor, run_store = _get_runtime()
+    run = run_store.get_run(run_id)
+    if not run:
+        raise ValueError(f"resume 命令的 run {run_id} 不存在（不可重建）")
+    status = run.get("status")
+    if status in ("succeeded", "failed", "cancelled", "expired"):
+        return run_id                                   # 已完成 → dispatcher 收口 done（幂等）
+    if status != "suspended":
+        raise DispatchRetryLater(f"run {run_id} 现 {status}（已被认领在跑）——等其收尾")
+    approval_store = _get_approval_store()
+    ok = _redrive_resume_run(run_id, kindd, run, registry, gateway, executor, run_store,
+                             approval_store, request_id=payload.get("request_id"),
+                             decided_by=payload.get("decided_by"), reason=payload.get("reason"))
+    if ok == "retry":
+        raise DispatchRetryLater(f"run {run_id} 重驱被拒（池满/身份瞬断）")
+    if ok == "skip":
+        raise ValueError(f"run {run_id} resume 不可重驱（edited/身份停用）")
+    return run_id
+
+
 def _dispatch_recovered_submit(cmd: dict):
     """PR-3 Stage A：恢复重驱一条 submit 命令（进程崩溃/滚动发布留下的欠账）。
     返回 run_id（dispatcher 据此 bind+done）；抛 DispatchRetryLater=本轮不可重建
@@ -1350,85 +1421,84 @@ def _dispatch_recovered_submit(cmd: dict):
     return handle.run_id
 
 
-def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -> int:
-    """B6 对账：**决定已落库但 run 仍 suspended** 的死单重驱（resume 在 decide 后失败/进程
-    崩溃，含 reaper 把 stale resuming 回边 suspended 的场景）。返回重驱数。
-
-    - approved / rejected_feedback / rejected_terminate → 按 approval_decision 重建 outcome
-      重发 executor.resume（CAS suspended→resuming 认领，与人工 /approve 重试赛跑安全——
-      first-claim-wins）；
-    - **edited 不自动重驱**：库里只有脱敏后的 edited_args（022 契约），掩码参数绝不能拿去
-      执行——告警留人工（审批人在 console 重提同向决定，/approve 已决同向重放路径接住）；
-    - 池满（RunRejected）→ 本轮跳过，下轮再来；单轮限量由 list_decided_unresumed LIMIT 兜。
-    """
-    import threading
-
+def _redrive_resume_run(run_id, kind, run, registry, gateway, executor, run_store,
+                        approval_store, *, request_id=None, decided_by=None, reason=None):
+    """resume 重驱单引擎（B6 对账 与 PR-3 Stage B 恢复共用）：以已落库决定重发
+    executor.resume（CAS suspended→resuming 认领，与人工 /approve 重试赛跑安全——
+    first-claim-wins）。run 须已确认 suspended。返回：
+    - "ok"     成功交棒（起 daemon 排空事件队列）；
+    - "retry"  池满/身份瞬断（调用方下轮/租约到期重试）；
+    - "skip"   edited（脱敏参数不可自动重驱）/身份停用（留 suspended 等 TTL）。
+    审计**有意 fail-open**（P1-13 拍板：重驱不产生新治理事实，决定行审计已在 decide 事务）。"""
     from opensearch_pipeline.agent_runtime import DefaultAgentLoop, make_model_fn
     from opensearch_pipeline.agent_runtime.approval import (
         Approved, RejectedFeedback, RejectedTerminate)
     from opensearch_pipeline.agent_runtime.executor import RunRejected
 
+    if kind == "edited":
+        logger.warning("resume 重驱：run %s 的 EDITED 决定无法自动重驱（库存参数已脱敏），"
+                       "请审批人在 console 重试", run_id)
+        return "skip"
+    outcome = (Approved() if kind == "approved"
+               else RejectedFeedback(reason=reason or "审批未通过")
+               if kind == "rejected_feedback" else RejectedTerminate())
+    thread_id = run.get("thread_id") or run_id
+    try:
+        # P1-08：approved 向身份不可解析/停用即让位（瞬断可重试，停用终局）
+        ctx, requester_id, req_groups = _requester_ctx(
+            run, thread_id, fail_closed_on_error=(kind == "approved"))
+    except IdentityUnresolvable as e:
+        (logger.warning if e.retryable else logger.error)(
+            "resume 重驱：run %s 发起人身份 fail-closed（%s）——%s", run_id,
+            "瞬断，下轮重试" if e.retryable else "已停用，留 suspended 等 TTL 过期", e)
+        return "retry" if e.retryable else "skip"
+    loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light",
+                                          tokens_used_seed=int(run.get("tokens_used") or 0)))
+    tools = registry.list_specs(ctx)
+    _mid, _remember, _report_failure, _persist_answer = _resume_callbacks(
+        run_store, run, thread_id, requester_id, req_groups)
+    try:
+        handle = executor.resume(run_id, ctx, outcome, loop, tools,
+                                 on_complete=_remember, on_failure=_report_failure,
+                                 approval_meta={"request_id": request_id,
+                                                "decided_by": decided_by},
+                                 on_complete_durable=_persist_answer)
+    except RunRejected:
+        logger.warning("resume 重驱：run %s 被拒（池满/已被认领），下轮再试", run_id)
+        return "retry"
+    threading.Thread(target=lambda h=handle: [None for _ in h.events()],
+                     name=f"resume-drain-{run_id[:8]}", daemon=True).start()
+    try:
+        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
+        RDSAuditLog().record(
+            None, event_type="approval_reconcile", action=f"run:{run_id}",
+            decision=kind, run_id=run_id,
+            detail={"request_id": request_id, "decided_by": decided_by})
+    except Exception:   # noqa: BLE001
+        logger.warning("resume 重驱审计写失败（fail-open）", exc_info=True)
+    logger.warning("resume 重驱：run %s（decision=%s，decided_by=%s）", run_id, kind, decided_by)
+    return "ok"
+
+
+def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -> int:
+    """B6 对账：**决定已落库但 run 仍 suspended** 的死单重驱（resume 在 decide 后失败/进程
+    崩溃，含 reaper 把 stale resuming 回边 suspended 的场景）。返回重驱数。
+
+    PR-3 Stage B 后：resume 命令入 outbox 是主恢复通道（decide 同事务），本对账保留为
+    **兜底**——覆盖 Stage B 之前的历史决定、edited 人工流、以及 flag off 环境。重驱逻辑
+    与 Stage B 恢复共用 _redrive_resume_run（单引擎，语义一致）。
+    """
     grace = int(os.environ.get("RAG_AGENT_RECONCILE_GRACE_S", "120"))
     driven = 0
     for c in approval_store.list_decided_unresumed(grace_s=grace):
         run_id = c["run_id"]
-        kind = c["decision"]
-        if kind == "edited":
-            logger.warning("B6 对账：run %s 的 EDITED 决定无法自动重驱（库存参数已脱敏），"
-                           "请审批人在 console 重试", run_id)
-            continue
         run = run_store.get_run(run_id)
         if not run or run.get("status") != "suspended":
-            continue                                    # 已被人工重试/过期收尸，让位
-        outcome = (Approved() if kind == "approved"
-                   else RejectedFeedback(reason=c.get("reason") or "审批未通过")
-                   if kind == "rejected_feedback" else RejectedTerminate())
-        thread_id = run.get("thread_id") or run_id
-        try:
-            # P1-08：对账重驱同 /approve 语义——approved 向身份不可解析/停用即跳过本轮
-            ctx, requester_id, req_groups = _requester_ctx(
-                run, thread_id, fail_closed_on_error=(kind == "approved"))
-        except IdentityUnresolvable as e:
-            (logger.warning if e.retryable else logger.error)(
-                "B6 对账：run %s 发起人身份 fail-closed（%s）——%s", run_id,
-                "瞬断，下轮重试" if e.retryable else "已停用，留 suspended 等 TTL 过期", e)
-            continue
-        # P1-05：resume 段预算闸从 durable tokens_used 播种
-        loop = DefaultAgentLoop(make_model_fn(gateway, ctx, ctx.model_profile or "light",
-                                              tokens_used_seed=int(run.get("tokens_used") or 0)))
-        tools = registry.list_specs(ctx)
-        _mid, _remember, _report_failure, _persist_answer = _resume_callbacks(
-            run_store, run, thread_id, requester_id, req_groups)
-        try:
-            handle = executor.resume(run_id, ctx, outcome, loop, tools,
-                                     on_complete=_remember, on_failure=_report_failure,
-                                     approval_meta={"request_id": c.get("request_id"),
-                                                    "decided_by": c.get("decided_by")},
-                                     on_complete_durable=_persist_answer)
-        except RunRejected:
-            logger.warning("B6 对账：run %s 重驱被拒（池满/已被认领），下轮再试", run_id)
-            continue
-        except Exception:   # noqa: BLE001 — 单条失败不拖垮整轮对账
-            logger.warning("B6 对账：run %s 重驱失败（下轮重试）", run_id, exc_info=True)
-            continue
-        # 无 SSE 消费者：起 daemon 线程排空事件队列（否则事件在队列里堆到 run 结束）
-        threading.Thread(target=lambda h=handle: [None for _ in h.events()],
-                         name=f"b6-drain-{run_id[:8]}", daemon=True).start()
-        try:
-            # 对账重驱入合规审计——**有意维持 fail-open**（P1-13 拍板）：重驱不产生新治理
-            # 事实（决定行在 decide 事务已带审计，run 状态迁移由 executor CAS 记录），
-            # 本条只是运维可观测，没有可折入的主事务。
-            from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
-            RDSAuditLog().record(
-                None, event_type="approval_reconcile", action=f"run:{run_id}",
-                decision=kind, run_id=run_id,
-                detail={"request_id": c.get("request_id"), "decided_by": c.get("decided_by"),
-                        "decided_at": c.get("decided_at")})
-        except Exception:   # noqa: BLE001
-            logger.warning("B6 对账审计写失败（fail-open）", exc_info=True)
-        logger.warning("B6 对账：重驱 run %s（decision=%s，decided_by=%s）",
-                       run_id, kind, c.get("decided_by"))
-        driven += 1
+            continue                                    # 已被人工/命令重试/过期收尸，让位
+        if _redrive_resume_run(run_id, c["decision"], run, registry, gateway, executor,
+                               run_store, approval_store, request_id=c.get("request_id"),
+                               decided_by=c.get("decided_by"), reason=c.get("reason")) == "ok":
+            driven += 1
     return driven
 
 
