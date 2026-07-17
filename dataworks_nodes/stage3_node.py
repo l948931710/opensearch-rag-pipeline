@@ -58,6 +58,12 @@ os.environ["RAG_ENVIRONMENT"] = "production"
 os.environ.setdefault("RAG_STAGE3_PARITY_VERIFY", "true")
 os.environ.setdefault("RAG_STAGE3_PARITY_DRIFT", "true")
 
+# ── PR-4 摄取台账租约/fencing（2026-07-17，schema/048 三环境已 apply）──
+# 存活运行按时续租不再被 2h 失效清扫/接管抢占；被接管的僵尸写回原子性失败（弃单文档）。
+# 摄取并发开关（RAG_EXTRACT/PUBLISH/HA3_PUSH/LOADER_FETCH_CONCURRENCY）的正确性前置——
+# 必须先于并发开启。setdefault → 可被节点环境变量 'false' 覆盖（kill switch=回 2h 年龄现状）。
+os.environ.setdefault("RAG_INGEST_LEASE_ENABLE", "true")
+
 if not SIMULATE:
     # 生产凭证：由 DataWorks 调度参数注入
     required_vars = [
