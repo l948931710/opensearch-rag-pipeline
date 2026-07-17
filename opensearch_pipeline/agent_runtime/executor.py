@@ -64,12 +64,16 @@ class RunHandle:
         # P1-05（unknown-unknowns 批次1）：事件队列**有界**——慢客户端/断连后 run 仍在
         # 产出 delta，无界队列 = 每 run 一个内存放大器（×max_concurrent）。上限内正常
         # 缓冲；满则丢 ModelDelta（断流恢复走 durable 轮询，答案本体在完成侧落库）；
-        # 非 delta 事件（终态/审批/工具帧）挤掉最旧事件也要入队。<=0 回退无界（历史行为）。
+        # 非 delta 事件（终态/审批/工具帧）挤掉最旧事件也要入队。<=0 回退无界（历史行为）；
+        # 正值下限 2（P1-01，外审核查 2026-07-16）：maxsize=1 时 _finish 的哨兵**必然**挤掉
+        # 队列里唯一的终态帧（消费者一帧看不到就收流）；≥2 时哨兵挤掉的通常是更旧帧——
+        # 仍有极窄的「消费者并发取走后挤位误弹终态」竞态窗（durable 轮询兜底），但
+        # maxsize=1 的必然丢终态被收掉。
         try:
             _qmax = int(os.environ.get("RAG_AGENT_EVENT_QUEUE_MAX", "10000") or 10000)
         except ValueError:
             _qmax = 10000
-        self._q: "queue.Queue" = queue.Queue(maxsize=max(0, _qmax))
+        self._q: "queue.Queue" = queue.Queue(maxsize=(0 if _qmax <= 0 else max(2, _qmax)))
         self._dropped_deltas = 0
         self._cancel = threading.Event()
         self._done = threading.Event()
@@ -181,6 +185,7 @@ class ThreadedRunExecutor:
                on_complete_durable=None) -> RunHandle:
         self._acquire()
         run_id = None
+        dispatch_maybe_scheduled = False   # P0-02 复查修正：pool.submit 异常≠必未入队
         try:
             # F1：投机检索在**准入成功后**才起跑（构造在 serving 层、零成本）——放在
             # _acquire 之后、任何 DB 写之前：被 429 拒的 submit 零检索负载，接纳的 run
@@ -204,12 +209,25 @@ class ThreadedRunExecutor:
             with self._lock:
                 self._live[run_id] = handle
             gen = loop.run(ctx, messages, tools)
-            self._pool.submit(self._drive_gen, ctx, gen, handle)
+            try:
+                self._pool.submit(self._drive_gen, ctx, gen, handle)
+            except Exception:
+                dispatch_maybe_scheduled = not self._dispatch_certainly_rejected()
+                raise
             return handle
         except Exception:
             if run_id:
                 with self._lock:
                     self._live.pop(run_id, None)
+                # P0-02（外审核查 2026-07-16）：run 行已 durable 落 'running'（create_run 即
+                # 写），而交棒失败（典型：drain 已 shutdown 线程池 → pool.submit 抛
+                # RuntimeError）后无人驱动——不诚实收口就是无人持有的孤儿（只能等 reaper
+                # ~15min 收尸，期间 uk_thread_active 占坑）。CAS 门控：已被他方迁移则不动。
+                # 复查修正：线程创建失败类 submit 异常条目**可能已入队**（warm worker 仍会
+                # 驱动）——误标 failed 会让 fenced 驱动器把真答案作废，那种情况维持旧行为
+                # 只上抛（见 _dispatch_certainly_rejected）。
+                if not dispatch_maybe_scheduled:
+                    self._transition_checked(run_id, "running", "failed")
             self._release()
             raise
 
@@ -222,8 +240,10 @@ class ThreadedRunExecutor:
         返回续跑 run 的 handle。outcome ∈ Approved/Edited/RejectedFeedback/RejectedTerminate。
 
         ⚠️ 死态防护（深度审查 B 组 P1）：**先 _acquire 再认领**——池满时认领已发生而无人续跑，
-        run 会被永久钉死在 resuming（/approve 只认 suspended → 409，无回边无对账）。认领后任何
-        失败（checkpoint 解码/版本不兼容/交棒失败）都回滚 resuming→suspended，保住可重试性。
+        run 会被永久钉死在 resuming（/approve 只认 suspended → 409，无回边无对账）。认领后、
+        接手前的失败（checkpoint 解码/版本不兼容）回滚 resuming→suspended 保住可重试性；
+        **接手 running 后**交棒失败则诚实落 failed（P0-02，外审核查 2026-07-16——running→
+        suspended 非合法边，与「接手后进程崩溃」同语义，不再滞留 running 等 reaper）。
         """
         from opensearch_pipeline.agent_runtime.approval import (
             ApprovalGrant, Approved, Edited, RejectedTerminate)
@@ -231,6 +251,9 @@ class ThreadedRunExecutor:
         from opensearch_pipeline.agent_runtime.tool_executor import digest
         self._acquire()                                   # ① 先占槽：占不到就不动状态机
         claimed = False
+        running_owned = False   # P0-02：resuming→running 已接手（交棒失败须诚实落 failed）
+        dispatch_maybe_scheduled = False   # P0-02 复查修正：pool.submit 异常≠必未入队
+        handle = None
         try:
             if not self._store.transition(run_id, "suspended", "resuming"):    # ② 认领
                 raise RunRejected(f"run {run_id} 非 suspended 或已被认领")
@@ -240,10 +263,33 @@ class ThreadedRunExecutor:
                 # 硬终止：resuming→cancelled（非 failed——是有意停止非错误），不续跑。
                 # B3 顺手修：裸建 handle 也要挂中继——否则拒绝终止的终态帧只进本地队列，
                 # 跨实例回放端点在挂起帧后空等到超时，永远看不到「已被拒绝」。
-                self._store.transition(run_id, "resuming", "cancelled")
+                # P0-04（外审核查 2026-07-16）：终态帧以 CAS 成功（或读到等价 durable 终态）
+                # 为前置——全文件终态迁移唯此处曾裸调不查结果，路由据返回值答 202
+                # status=cancelled，CAS 失败即对外编造终态。False（reaper 回边/purge/并发
+                # 抢先）时：本地只收流、中继**不写 __end__**（B3 语义——未收敛非终态，真
+                # 终态帧留给对账段发），抛 RunRejected → 路由 409，收敛交 B6 对账
+                # （_reconcile_decided 按已落库的 rejected_terminate 决定重驱）。
+                # 复查修正：这里用**裸 transition**——DB 异常≠CAS 失败：异常时 claimed 仍
+                # True，由 except 处理器立即回边 resuming→suspended 保住可重试性（撤回类
+                # 场景可能无 approval_decision 行、B6 对账无从收敛，绝不能钉死在 resuming
+                # 等 ~15min reaper）；只有真 CAS False 才走下面的 durable 现状消歧。
+                cancelled = bool(self._store.transition(run_id, "resuming", "cancelled"))
                 claimed = False
                 handle = RunHandle(run_id)
                 self._attach_relay(handle)
+                if not cancelled:
+                    getter = getattr(self._store, "get_run", None)
+                    try:
+                        cancelled = (getter is not None
+                                     and (getter(run_id) or {}).get("status") == "cancelled")
+                    except Exception:   # noqa: BLE001 — 读不出按未收敛处理（保守不宣告）
+                        cancelled = False
+                if not cancelled:
+                    logger.error("run %s 拒绝终止 CAS resuming→cancelled 失败（reaper 回边/"
+                                 "并发抢先），不发终态帧，交对账收敛", run_id)
+                    handle._finish(end_relay=False)
+                    raise RunRejected(
+                        f"run {run_id} 拒绝终止时状态已被并发迁移，稍后由对账收敛")
                 handle._emit(RunFailed(error="审批拒绝并终止", retryable=False))
                 handle._finish()
                 self._release()
@@ -276,6 +322,7 @@ class ThreadedRunExecutor:
             if not self._store.transition(run_id, "resuming", "running"):      # ③ 接手
                 raise RunRejected(f"run {run_id} resuming→running 失败（并发/迟到）")
             claimed = False                               # 已交棒 running：失败恢复归驱动器
+            running_owned = True                          # P0-02：此后失败诚实落 failed
             handle = RunHandle(run_id)
             handle._on_complete = on_complete
             handle._on_failure = on_failure
@@ -285,13 +332,29 @@ class ThreadedRunExecutor:
                 self._live[run_id] = handle
             gen = loop.resume(ctx, state, outcome, tools)
             base = self._budget_snapshot(run_id, fallback_turns=int(state.get("turn", 0)) + 1)
-            self._pool.submit(self._drive_gen, ctx, gen, handle, base)
+            try:
+                self._pool.submit(self._drive_gen, ctx, gen, handle, base)
+            except Exception:
+                dispatch_maybe_scheduled = not self._dispatch_certainly_rejected()
+                raise
             return handle
         except Exception:
             with self._lock:
                 self._live.pop(run_id, None)
             if claimed:
                 self._safe_transition(run_id, "resuming", "suspended")   # 回边：保住可重试
+            elif running_owned and not dispatch_maybe_scheduled:
+                # P0-02（外审核查 2026-07-16）：resuming→running 已接手后交棒失败（典型：
+                # drain 已 shutdown 线程池 → pool.submit 抛）——run 行停在 'running' 而无人
+                # 驱动。running→suspended 非合法边，诚实落 failed（与「接手后进程崩溃」同
+                # 语义，此前只能等 reaper ~15min 收尸）；handle 已建则发终态帧+收流
+                # （中继消费者不空等）。审批凭据已消费属已知折衷（durable worker=PR-3）。
+                # 复查修正：条目可能已入队（线程创建失败类）时不反标——warm worker 仍会驱动。
+                self._transition_checked(run_id, "running", "failed")
+                if handle is not None:
+                    handle._emit(RunFailed(error="续跑交棒失败（执行器不可用），请重试",
+                                           retryable=True))
+                    handle._finish()
             self._release()
             raise
 
@@ -510,7 +573,19 @@ class ThreadedRunExecutor:
                     break
                 ev = next(gen)
         except StopIteration:
-            pass
+            # P0-01（外审核查 2026-07-16）：loop 生成器**未发终态事件**即耗尽——协议违约
+            # （shipped DefaultAgentLoop 所有退出路径都先发终态帧再 return，此处只防未来
+            # loop bug / 第三方 loop）。此前直接 pass：durable 停在 running（只能等 reaper
+            # ~15min 收尸，期间 uk_thread_active 占坑 409）、SSE 只见 [DONE] 无终态帧。
+            # 所有 break 路径都已各自收口终态，能走到这里必然无终态 → 与异常路径同构
+            # 诚实落 failed（D3 fencing：失去所有权不落失败侧回调）。
+            handle._emit(RunFailed(error="loop 生成器未发终态事件即结束（协议违约）",
+                                   retryable=True))
+            if self._transition_checked(run_id, "running", "failed"):
+                self._notify_failure(handle, "loop 生成器未发终态事件即结束")
+            else:
+                logger.error("run %s 生成器意外结束收尾时已失去所有权（purge/收尸/取消抢先），"
+                             "跳过失败侧落库", run_id)
         except Exception as e:   # noqa: BLE001 — run 内部异常不外泄，落 failed + 事件
             handle._emit(RunFailed(error=str(e), retryable=False))
             # D3 失败侧 fencing（同 RunFailed 分支）：失去所有权不再落失败侧回调
@@ -569,7 +644,9 @@ class ThreadedRunExecutor:
                 if self._transition_checked(run_id, "running", "failed"):
                     self._notify_failure(handle, f"answer_persist_failed: {e}")
                 else:
-                    logger.error("run %s 答案落库失败收尾时已失去所有权，跳过失败侧落库", run_id)
+                    logger.error("run %s 答案落库失败收尾时已失去所有权或结果未知（commit ACK "
+                                 "丢失且消歧读也失败时 durable 可能已 succeeded——P0-03 消歧在 "
+                                 "store 层，见 complete_run_atomic），跳过失败侧落库", run_id)
                 return
             if ok:
                 self._notify_complete(handle, ev, retrieved)
@@ -811,6 +888,15 @@ class ThreadedRunExecutor:
         except Exception:   # noqa: BLE001
             logger.warning("事件中继挂载失败（降级进程内）", exc_info=True)
 
+    def _dispatch_certainly_rejected(self) -> bool:
+        """pool.submit 抛异常后判定条目是否**必未入队**（P0-02 复查修正）：CPython 的
+        shutdown/broken 检查先于 _work_queue.put——这两态下抛出时条目必未入队，可诚实
+        CAS failed；线程创建失败（can't start new thread）时条目**已入队**、warm worker
+        仍可能驱动——误标 failed 会让 fenced 驱动器把真答案作废。私有属性拿不到时按
+        「可能已入队」保守处理（退回旧行为：只上抛不反标，交 reaper 兜底）。"""
+        return bool(getattr(self._pool, "_shutdown", False)
+                    or getattr(self._pool, "_broken", False))
+
     def _transition_checked(self, run_id: Optional[str], frm: str, to: str) -> bool:
         """关键迁移（如 running→suspended）：CAS False 或 DB 异常都返回 False，由调用方处置。"""
         try:
@@ -861,6 +947,15 @@ class ThreadedRunExecutor:
         for _run_id, h in live.items():
             if h.wait(max(0.0, deadline - time.monotonic())):
                 waited += 1
+        # P0-02（外审核查 2026-07-16）：_live 只见「已注册句柄」——admitted（_acquire 已计数）
+        # 但尚在 create_run/交棒途中的 submit/resume 对两次快照都不可见，径直 shutdown 会让
+        # 它们撞上已关的池。等 _active 归零（覆盖该窗口：成功收尾与交棒失败侧都 _release）
+        # 再关池；超时未归零按原语义走 leftovers 兜底，交棒失败侧已各自诚实落 failed。
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._active <= 0:
+                    break
+            time.sleep(0.05)
         with self._lock:
             leftovers = list(self._live)
         force_failed = 0

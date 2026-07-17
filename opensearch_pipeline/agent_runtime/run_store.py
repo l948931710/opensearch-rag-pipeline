@@ -17,6 +17,8 @@ DB 访问沿用 serving 惯例：`db._get_db_conn()`（元组游标）、`%s` �
 from __future__ import annotations
 
 import json
+import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol
@@ -25,6 +27,8 @@ from opensearch_pipeline.config import get_config
 
 if TYPE_CHECKING:  # 运行期不导入：context.py 由 Task 8 落地
     from opensearch_pipeline.agent_runtime.context import ExecutionContext
+
+logger = logging.getLogger(__name__)
 
 # 状态机（报告 §6 + B1(b)/B3：resuming 中间态）
 # resuming = 审批已批、执行宿主尚未接手续跑的中间态。resume 两步：
@@ -95,6 +99,18 @@ def _op_db() -> str:
     return get_config().rds.operation_database
 
 
+def _begin(conn) -> None:
+    """把事务边界显式告知连接（外审复查 P1，2026-07-16）：db._get_db_conn 的池化
+    SteadyDB 连接不 begin() 时，断连触发 OperationalError 会被 DBUtils 透明重连+
+    **单句重试**——多语句事务被悄悄劈成两半（FOR UPDATE 锁/前置写全丢，却 rowcount=1
+    照常 commit），complete_run_atomic/suspend_run_atomic 的原子性承诺整体作废。
+    begin() 置 _transaction 位后 tough 重试关闭，断连如实抛错走回滚路径。
+    仓内先例：spot_checker/cost_breaker 事务方法同款前置。桩连接无 begin 则跳过。"""
+    fn = getattr(conn, "begin", None)
+    if fn is not None:
+        fn()
+
+
 class RDSRunStore:
     """RunStore 的 RDS（fuling_operation）实现。"""
 
@@ -143,6 +159,7 @@ class RDSRunStore:
             raise ValueError(f"未知 step.kind={step.kind!r}（合法：{_STEP_KINDS}）")
         db = _op_db()
         conn = self._conn()
+        _begin(conn)                        # 多语句事务：钉住连接（禁 SteadyDB 单句重试）
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -173,6 +190,7 @@ class RDSRunStore:
         executor 侧包 fail-open 并回退分段写，预算强制仍走本地计数。"""
         db = _op_db()
         conn = self._conn()
+        _begin(conn)                        # 多语句事务：钉住连接（禁 SteadyDB 单句重试）
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -250,6 +268,7 @@ class RDSRunStore:
         cp_id = uuid.uuid4().hex
         db = _op_db()
         conn = self._conn()
+        _begin(conn)            # 原子性承诺的前提：钉住连接（禁 SteadyDB 断连单句重试劈事务）
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT status FROM {db}.agent_run WHERE run_id=%s FOR UPDATE",
@@ -298,33 +317,88 @@ class RDSRunStore:
         全部读空）。与 suspend_run_atomic 同构：
         - 返回 False = run 已不在 running（收尸/取消/排水抢先），**未提交任何写**——
           调用方沿用完成侧 fencing 语义（结果作废）；
-        - extra_writer 异常 → 整体回滚后原样抛出——调用方落 failed，绝不发 done。"""
+        - extra_writer 异常 → 整体回滚后原样抛出——调用方落 failed，绝不发 done；
+        - commit 异常但 read-after-write 证实已提交（P0-03，外审核查 2026-07-16）→
+          返回 True（照常发 done）；证实不了 → 原样抛（保守失败语义）。"""
         db = _op_db()
         conn = self._conn()
+        _begin(conn)            # 原子性承诺的前提：钉住连接（禁 SteadyDB 断连单句重试劈事务）
         try:
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT status FROM {db}.agent_run WHERE run_id=%s FOR UPDATE",
-                            (run_id,))
-                row = cur.fetchone()
-                if not row or row[0] != "running":
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT status FROM {db}.agent_run WHERE run_id=%s FOR UPDATE",
+                                (run_id,))
+                    row = cur.fetchone()
+                    if not row or row[0] != "running":
+                        conn.rollback()
+                        return False
+                    if extra_writer is not None:
+                        extra_writer(cur)
+                    cur.execute(
+                        f"UPDATE {db}.agent_run SET status='succeeded', heartbeat_at=NOW(3), "
+                        "ended_at=NOW(3) WHERE run_id=%s AND status='running'", (run_id,))
+                    ok = cur.rowcount == 1
+                if not ok:
                     conn.rollback()
                     return False
-                if extra_writer is not None:
-                    extra_writer(cur)
-                cur.execute(
-                    f"UPDATE {db}.agent_run SET status='succeeded', heartbeat_at=NOW(3), "
-                    "ended_at=NOW(3) WHERE run_id=%s AND status='running'", (run_id,))
-                ok = cur.rowcount == 1
-            if ok:
+            except Exception:
+                try:
+                    conn.rollback()         # commit 前异常：事务确定未生效，维持原失败语义
+                except Exception:   # noqa: BLE001 — 连接已死时 rollback 也抛，别掩盖原异常
+                    pass
+                raise
+            # P0-03（外审核查 2026-07-16）：commit 异常 ≠ 未提交（两将军——服务端可能已
+            # 提交、ACK 丢在断连里）。此前与 commit 前异常同路上抛 → 调用方发 RunFailed
+            # (answer_persist_failed)，而 durable 已 succeeded+答案已落——客户端被告知
+            # 「失败请重试」，DB 却是成功，真假分裂。收口：开**新连接** read-after-write
+            # 消歧，读到 succeeded 即整个事务（含答案行）已落地 → 按成功返回；读到其他/
+            # 读不出 → 保守维持失败语义原样上抛（调用方 CAS running→failed 在已提交时
+            # 必 False，绝不会用 failed 覆盖 succeeded）。
+            try:
                 conn.commit()
-            else:
-                conn.rollback()
-            return ok
-        except Exception:
-            conn.rollback()
-            raise
+            except Exception as commit_exc:   # noqa: BLE001 — commit 结果未知，先消歧再定
+                try:
+                    conn.rollback()           # 连接多半已死：best-effort，绝不掩盖原异常
+                except Exception:   # noqa: BLE001
+                    pass
+                if self._completed_despite_commit_error(run_id):
+                    logger.warning("run %s complete commit ACK 丢失，read-after-write 证实"
+                                   "已提交（status=succeeded）——按成功返回（P0-03）", run_id)
+                    return True
+                raise commit_exc
+            return True
         finally:
             conn.close()
+
+    def _completed_despite_commit_error(self, run_id: str) -> bool:
+        """P0-03 消歧读：commit ACK 丢失后开**新连接**读 run status。succeeded 只能由
+        complete_run_atomic 的 CAS（running FOR UPDATE 下）写入，读到即证明整个事务
+        （含 extra_writer 的答案行）已落地。非 succeeded / 消歧读也失败 → False
+        （结果仍未知时宁按失败保守收口，绝不谎报成功）。
+        复查修正：典型丢 ACK 面是「客户端读超时、commit 仍在服务端收尾」——立即读会看到
+        提交前版本 running；短暂重试（3 次 / ~1s）再定论，收窄慢收尾被误判失败的残窗。
+        读到其他终态（failed/cancelled…）= 他方已收口 → 本事务确定未生效，提前定论。"""
+        for attempt in range(3):
+            if attempt:
+                time.sleep(0.5)
+            try:
+                conn = self._conn()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"SELECT status FROM {_op_db()}.agent_run WHERE run_id=%s",
+                            (run_id,))
+                        row = cur.fetchone()
+                finally:
+                    conn.close()
+                if row and row[0] == "succeeded":
+                    return True
+                if row and row[0] != "running":
+                    return False            # 他方终态在座：本事务不可能再生效
+            except Exception:   # noqa: BLE001 — 消歧读失败：重试；全失败按未知保守收口
+                logger.error("run %s commit 结果消歧读失败（第 %s 次）",
+                             run_id, attempt + 1, exc_info=True)
+        return False
 
     def transition(self, run_id: str, from_status: str, to_status: str) -> bool:
         """单向状态机迁移（CAS）。合法且当前==from → 迁移并 True；否则 False；非法 pair → 抛。"""
@@ -333,6 +407,7 @@ class RDSRunStore:
         db = _op_db()
         set_ended = ", ended_at=NOW(3)" if to_status in _TERMINAL else ""
         conn = self._conn()
+        _begin(conn)                        # FOR UPDATE+UPDATE 两语句：钉住连接
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT status FROM {db}.agent_run WHERE run_id=%s FOR UPDATE", (run_id,))
