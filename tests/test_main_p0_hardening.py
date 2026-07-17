@@ -128,9 +128,12 @@ def test_revalidate_strict_keeps_public_only(monkeypatch):
 # ── P0-02 RDS SSL 字段 ────────────────────────────────────────────────────────
 
 
-def test_rds_ssl_args_default_empty():
+def test_rds_ssl_args_default_explicit_plaintext():
+    """未配 CA = 显式明文（ssl_disabled=True），不能是空 kwargs：
+    pymysql 2.x PREFERRED 模式会在服务端广播 SSL 能力位（RDS 2026-07-17 开通）后
+    按客户端库/OpenSSL 版本自动尝试 TLS 且失败不回退——行为必须由配置决定。"""
     from opensearch_pipeline.config import RDSConfig
-    assert RDSConfig().pymysql_ssl_args() == {}
+    assert RDSConfig().pymysql_ssl_args() == {"ssl_disabled": True}
 
 
 def test_rds_ssl_args_with_ca(tmp_path):

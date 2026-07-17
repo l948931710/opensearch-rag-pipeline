@@ -66,12 +66,16 @@ def load_prod_env(overlay: str = None) -> dict:
 
 def _connect(env: dict, *, init_command: str = None, dict_cursor: bool = True):
     import pymysql
-    # P0-02：RDS 传输加密——env 里配了 RAG_RDS_SSL_CA 才传 ssl（默认空=行为不变）
-    ssl_kwargs = {}
+    # P0-02：RDS 传输加密——env 里配了 RAG_RDS_SSL_CA 才传 ssl；未配=【显式明文】。
+    # 不能传空 kwargs：pymysql 2.x 默认 PREFERRED，RDS 开通 SSL（2026-07-17）后服务端
+    # 广播能力位，客户端会按自身 OpenSSL 版本自动尝试 TLS 且失败不回退（conda OpenSSL3
+    # 实测拒 RSA-kx 套件直接断连）。行为由配置决定，不由客户端库版本决定。
     ca = (env.get("RAG_RDS_SSL_CA") or "").strip()
     if ca:
         verify = str(env.get("RAG_RDS_SSL_VERIFY_CERT", "true")).lower() in ("1", "true", "yes")
         ssl_kwargs = {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+    else:
+        ssl_kwargs = {"ssl_disabled": True}
     return pymysql.connect(
         host=env["RAG_RDS_HOST"], port=int(env.get("RAG_RDS_PORT", "3306")),
         user=env["RAG_RDS_USER"], password=env["RAG_RDS_PASSWORD"],
