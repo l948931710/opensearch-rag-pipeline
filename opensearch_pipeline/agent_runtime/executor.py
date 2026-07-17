@@ -442,7 +442,8 @@ class ThreadedRunExecutor:
         max_turns = ctx.budget.max_turns
         max_tool_calls = ctx.budget.max_tool_calls
         token_budget = ctx.budget.token_budget
-        hb_stop = self._start_heartbeat_ticker(run_id, ctx)   # R2：秒级后台心跳（见方法注）
+        # R2：秒级后台心跳 + Stage D durable cancel 轮询（见方法注）
+        hb_stop = self._start_heartbeat_ticker(run_id, ctx, handle=handle)
         turns_counted = int((base or {}).get("turns_used", 0))       # turn_index 去重，同批多 call 只计一次
         tool_calls_used = int((base or {}).get("tool_calls_used", 0))
         tokens_used = int((base or {}).get("tokens_used", 0))
@@ -846,13 +847,19 @@ class ThreadedRunExecutor:
         except Exception:   # noqa: BLE001
             pass
 
-    def _start_heartbeat_ticker(self, run_id: Optional[str], ctx) -> threading.Event:
+    def _start_heartbeat_ticker(self, run_id: Optional[str], ctx,
+                                handle: Optional[RunHandle] = None) -> threading.Event:
         """R2（重审计 §1）：per-run 后台心跳 ticker。此前心跳只在模型轮边界刷——长工具
         调用/长最终生成超过 reaper stale 阈值（默认 900s）时，**活着的持有者被误判僵尸**
         → running→failed，随后完成侧 CAS 失败、结果作废。ticker 让「进程活着」与
         「模型轮节奏」解耦（默认 30s ≪ 900s）。deadline 之后停止续命：真僵死（挂死在
         无超时调用里）的 run 不被永久续命，最终仍交还 reaper 收尸。
-        RAG_AGENT_HEARTBEAT_INTERVAL_S<=0 显式关闭（回到轮边界心跳的历史行为）。"""
+        RAG_AGENT_HEARTBEAT_INTERVAL_S<=0 显式关闭（回到轮边界心跳的历史行为）。
+
+        Stage D（PR-3，schema/047）：每拍顺带轮询 durable cancel 标记——别的副本
+        （或本实例重启前的请求）经 run_store.request_cancel 落的取消意愿在这里转成
+        进程内协作旗标（handle.request_cancel），沿既有轮边界收口。命中一次即停查
+        （旗标单向）；读失败 fail-open（下拍再试，绝不影响心跳主职）。"""
         stop = threading.Event()
         if not run_id:
             return stop
@@ -862,6 +869,7 @@ class ThreadedRunExecutor:
             interval = 30.0
         if interval <= 0:
             return stop
+        cancel_seen = threading.Event()
 
         def _tick():
             while not stop.wait(interval):
@@ -871,9 +879,25 @@ class ThreadedRunExecutor:
                 except Exception:   # noqa: BLE001 — deadline 读不出不阻断续命
                     pass
                 self._heartbeat(run_id)
+                if handle is not None and not cancel_seen.is_set():
+                    self._poll_durable_cancel(run_id, handle, cancel_seen)
 
         threading.Thread(target=_tick, name=f"agent-hb-{run_id[:8]}", daemon=True).start()
         return stop
+
+    def _poll_durable_cancel(self, run_id: str, handle: RunHandle,
+                             seen: threading.Event) -> None:
+        """Stage D：durable cancel 标记 → 进程内协作旗标（心跳 ticker 每拍一次的
+        PK 点查；store 无此方法（旧桩）/读失败一律 fail-open）。"""
+        try:
+            checker = getattr(self._store, "cancel_requested", None)
+            if checker is not None and checker(run_id):
+                seen.set()
+                handle.request_cancel()
+                logger.warning("run %s 收到 durable 取消标记（跨实例/重启前请求）——"
+                               "已转协作旗标，轮边界收口", run_id)
+        except Exception:   # noqa: BLE001
+            logger.warning("run %s durable cancel 轮询失败（下拍再试）", run_id, exc_info=True)
 
     def _persist_midrun_checkpoint(self, run_id: Optional[str], ev: RunCheckpointReady) -> None:
         """R4（重审计 §1「无运行中 checkpoint」）：模型轮边界持久化对话状态——此前

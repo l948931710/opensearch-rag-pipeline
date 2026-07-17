@@ -10,9 +10,10 @@
 **目标**：run 的接受、执行归属、恢复全部成为 durable、可租约、可对账的事实——
 进程崩溃/滚动发布不再丢命令；HIGH_WRITE 开闸的结构前置就位。
 
-**非目标（本立项不做）**：多副本全量语义（distributed admission/跨实例 cancel——外审
-P1-10 已按「多副本前置条件」记录）；钉钉/miniapp 通道改造（console agent 先行）；
-把 LLM 流式换成轮询（SSE UX 不动）。
+**非目标（Stage A 立项时不做；Stage D 已回收多副本范围——见 §3）**：钉钉/miniapp
+通道改造（console agent 先行）；把 LLM 流式换成轮询（SSE UX 不动）。
+（原「多副本全量语义（distributed admission/跨实例 cancel）」已由 Stage D 落地，
+与外审 P1-10 前置条件合流。）
 
 ## 1. 关键决策（Stage A 拍板，可复议）
 
@@ -118,8 +119,32 @@ inline dispatch + 后台恢复扫描（随既有 reaper 线程节奏）。灰度
     （默认 on，纯进程内资源编排无语义变化）；
   - **retention/purge**：`tool_operations` 作业（12 月，随 RAG_RETENTION_AGENT_TRACE_MONTHS
     与 tool_invocation 同窗）+ purge_subject 12 表链覆盖（run_id 归属链）。
-- **Stage D**：多副本形态（dispatcher 拆独立部署、distributed admission、durable
-  cancel、事件 durable log）——与外审 P1-10 前置条件合流。
+- **Stage D ✅ 已落地（2026-07-17）**：多副本形态——
+  - **durable cancel**（schema/047，纯增量两列）：`agent_run.cancel_requested_at/by`
+    ——任何副本可标记（CAS：仅 running/resuming、仅首标）；驱动副本的 per-run 心跳
+    ticker（默认 30s）每拍顺带 PK 点查，命中即转进程内协作旗标沿既有轮边界收口。
+    cancel 端点：本地句柄=即时旗标+标记同落（202 与轮边界之间重启意愿不丢）；句柄
+    不在本实例（多副本/重启/resuming 认领窗）=标记+202（文案如实：持有者已死交
+    reaper 收尸，标记 ≠ 承诺）；store 无标记方法=501 历史兜底。此前该分支是 501
+    占位（「跨实例 cancel 标记留 v2」——本项即 v2）；
+  - **distributed admission**：`RAG_AGENT_GLOBAL_MAX_RUNNING`（默认 0=off）——ask
+    受理点全库 COUNT(running+resuming) ≥ 上限即 429（先于 enqueue，被拒零 durable
+    痕迹）；恢复重驱同过闸（满 → DispatchRetryLater 留 claimed 自然退避）。**软上限**
+    如实声明：计数读与受理无原子性，并发越线 ≤ 副本数-1；每实例线程池仍是硬界；
+    计数读失败/旧 store fail-open。resume/replay 是已受理 run 的续跑，不重复过闸；
+  - **dispatcher 拆独立部署**：`python -m opensearch_pipeline.agent_worker`
+    （make agent-worker）——复用 routes/agent 单例与 `_dispatch_recover`（代码零分叉），
+    前台恢复循环 + reaper + SIGTERM 排水（`_drain_runtime` 同款）；flag 前置
+    fail-fast（RAG_AGENT_ENABLE + RAG_AGENT_DURABLE_DISPATCH）。web 副本可设
+    `RAG_AGENT_DISPATCH_LOOP=off` 把恢复职责集中到 worker（fast-path 不受影响；
+    SKIP LOCKED 下并存本就安全）。部署形态（SAE 第二应用）user-gated；
+  - **事件 durable log**：由既有 event_relay（R5，Redis Stream 镜像 + /events 回放，
+    默认 off）承担——Stage D 无新增，纳入拓扑守卫清单即为合流；
+  - **拓扑守卫（P1-10 合流）**：`RAG_EXPECTED_REPLICAS>1` + agent 开 ⇒
+    `RAG_AGENT_DURABLE_DISPATCH` 必开（滚动发布是多副本常态，无 outbox 的「受理即
+    内存」=每次发布静默丢在途命令），与 memory 后端清单同一硬断。
+  多副本残余（如实记录，非本立项范围）：session_store 换 Redis 后端才能撤
+  `--workers 1`（拓扑守卫已列）；HA3/RDS 跨云 2PC 与本立项无关。
 
 ## 4. 验收门（Stage A）
 

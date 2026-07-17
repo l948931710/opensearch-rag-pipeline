@@ -455,6 +455,61 @@ class RDSRunStore:
         finally:
             conn.close()
 
+    # ── durable cancel（PR-3 Stage D，schema/047）───────────────────────────────
+    def request_cancel(self, run_id: str, *, requested_by: str = "") -> bool:
+        """跨实例取消标记（CAS：仅活动态、仅首标——重复请求不覆写首标，幂等语义由
+        调用方按「已标记」处理）。标记 ≠ 承诺：持有者已死的 run 仍由 reaper 按心跳
+        收尸；活持有者的 per-run 心跳 ticker（executor）拾取后转进程内协作旗标，
+        沿既有轮边界收口为 cancelled。返回 True=本次完成首标。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.agent_run "
+                    "SET cancel_requested_at=NOW(3), cancel_requested_by=%s "
+                    "WHERE run_id=%s AND status IN ('running','resuming') "
+                    "AND cancel_requested_at IS NULL",
+                    ((requested_by or "")[:64] or None, run_id))
+                ok = cur.rowcount == 1
+            conn.commit()
+            return ok
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def cancel_requested(self, run_id: str) -> bool:
+        """durable 取消标记读侧（驱动副本心跳 ticker 轮询；PK 点查，30s/run 一次）。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT cancel_requested_at FROM {db}.agent_run WHERE run_id=%s",
+                    (run_id,))
+                row = cur.fetchone()
+            return bool(row and row[0] is not None)
+        finally:
+            conn.close()
+
+    def count_active_runs(self) -> int:
+        """distributed admission（PR-3 Stage D）：全库在跑 run 数（running+resuming——
+        suspended 不占执行容量不计）。idx_status_hb 前缀扫，近似值语义：受理点读到的
+        计数与并发受理之间无原子性，全局上限是**软上限**（成本护栏），每实例线程池
+        仍是硬界。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {db}.agent_run "
+                            "WHERE status IN ('running','resuming')")
+                row = cur.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
     def reap_stale_runs(self, *, running_stale_s: int = 900,
                         suspended_ttl_s: int = 259200) -> Dict[str, int]:
         """收尸（对齐主仓 stage-3 的 2h stale-lock takeover 纪律）：

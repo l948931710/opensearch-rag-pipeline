@@ -349,8 +349,11 @@ def test_p1_10_multireplica_agent_on_requires_event_relay():
 
 
 def test_p1_10_multireplica_agent_on_relay_redis_passes():
+    # PR-3 Stage D 合流：该拓扑另须 durable dispatch（新要求的正反面在
+    # test_agent_pr3_stage_d.TestTopologyGuardStageD 专测）
     cfg = _fresh_load(RAG_EXPECTED_REPLICAS="2", RAG_AGENT_ENABLE="true",
-                      RAG_AGENT_EVENT_RELAY="redis", **_TOPO_BASE)
+                      RAG_AGENT_EVENT_RELAY="redis",
+                      RAG_AGENT_DURABLE_DISPATCH="true", **_TOPO_BASE)
     assert cfg.environment == "production"
 
 

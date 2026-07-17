@@ -53,3 +53,4 @@
 044_agent_dispatch_resume.sql operation
 045_agent_tool_operation.sql operation
 046_tool_invocation_operation_id.sql operation
+047_agent_run_cancel_request.sql operation

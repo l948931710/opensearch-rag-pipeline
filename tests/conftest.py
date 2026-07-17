@@ -185,6 +185,8 @@ _LOCAL_STACK_SERIAL_MODULES = {
     # PR-3 Stage C：真库段对 fuling_operation.tool_invocation/agent_tool_operation 真实
     # DML（含刻意 1062 撞主键）——与 agent 真库族同表，并入同组串行
     "test_agent_pr3_operation_ledger.py",
+    # PR-3 Stage D：真库段对 agent_run 真实 DML（durable cancel 标记往返）——同上
+    "test_agent_pr3_stage_d.py",
 }
 
 

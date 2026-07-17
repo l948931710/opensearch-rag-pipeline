@@ -128,6 +128,29 @@ def _agent_enabled() -> bool:
     return os.environ.get("RAG_AGENT_ENABLE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _global_admission_full(run_store) -> bool:
+    """PR-3 Stage D distributed admission：全局在跑上限（RAG_AGENT_GLOBAL_MAX_RUNNING，
+    默认 0=off）。跨副本成本护栏——每实例线程池（RunRejected→429）仍是硬界，本闸拦
+    「N 副本 × 每实例上限」的总量失控。**软上限**：计数读与受理之间无原子性，并发
+    受理可小幅越线（越线幅度 ≤ 副本数-1，可接受）；计数读失败/旧 store 无计数方法
+    一律 fail-open（可用性优先，绝不因护栏读不出而拒答）。只拦**新提交**：resume/
+    replay 是已受理 run 的续跑，不重复过闸。"""
+    try:
+        cap = int(os.environ.get("RAG_AGENT_GLOBAL_MAX_RUNNING", "0") or 0)
+    except ValueError:
+        cap = 0
+    if cap <= 0:
+        return False
+    counter = getattr(run_store, "count_active_runs", None)
+    if counter is None:
+        return False
+    try:
+        return int(counter()) >= cap
+    except Exception:   # noqa: BLE001
+        logger.warning("全局并发计数读取失败（fail-open 放行，每实例池仍硬界）", exc_info=True)
+        return False
+
+
 def _get_approval_store():
     """审批持久化单例（schema/025）。独立于 _RUNTIME 四元组：既有测试 monkeypatch
     _get_runtime 返回 4-tuple 的契约不动，审批相关测试单独 patch 本函数。"""
@@ -256,12 +279,21 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
 _DISPATCHER_STARTED = False
 
 
+def _dispatch_loop_enabled() -> bool:
+    """PR-3 Stage D：web 副本的进程内恢复扫描线程开关（默认 on=今日行为）。部署独立
+    worker（`python -m opensearch_pipeline.agent_worker`）后 web 副本可设
+    RAG_AGENT_DISPATCH_LOOP=off 让路——fast-path enqueue+inline dispatch 不受影响
+    （SKIP LOCKED 认领下多消费者本就安全，off 只是把恢复职责集中到 worker）。"""
+    return os.environ.get("RAG_AGENT_DISPATCH_LOOP", "on").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
 def _start_dispatcher() -> None:
     """PR-3 Stage A：durable dispatch 恢复扫描线程（flag 开时随 runtime 启动，每进程一条
     daemon）。启动即先跑一轮——把进程重启前的欠账（queued/lease 过期命令）先补上。"""
     global _DISPATCHER_STARTED
     from opensearch_pipeline.agent_runtime.durable_dispatcher import durable_dispatch_enabled
-    if _DISPATCHER_STARTED or not durable_dispatch_enabled():
+    if _DISPATCHER_STARTED or not durable_dispatch_enabled() or not _dispatch_loop_enabled():
         return
     _DISPATCHER_STARTED = True
     dispatcher = _get_dispatcher()
@@ -769,6 +801,11 @@ def agent_ask(req: AskRequest, request: Request,
                        user_dept=getattr(identity, "dept", None), query_text=req.question,
                        answer_text=None, conversation_id=conv, answer_status="AGENT_ERROR",
                        model_name="agent", error_message=(err or "")[:500])
+
+    # PR-3 Stage D distributed admission：全局在跑上限（软上限，默认 off）。
+    # 拒绝先于 enqueue——被拒的 ask 零 durable 痕迹，UX 与本地容量 429 同型。
+    if _global_admission_full(_run_store):
+        raise HTTPException(status_code=429, detail="Agent 全局并发已满，请稍后再试")
 
     # PR-3 Stage A（RAG_AGENT_DURABLE_DISPATCH，默认 off）：受理即落 durable 命令
     # （command-as-truth）——API 返回后进程崩溃/滚动发布，恢复扫描按命令重驱，用户
@@ -1358,6 +1395,11 @@ def _dispatch_recovered_submit(cmd: dict):
     message_id = payload.get("message_id") or generate_message_id()
     registry, gateway, executor, _run_store = _get_runtime()
 
+    # PR-3 Stage D：恢复重驱同过全局并发闸——留 claimed 等租约到期自然退避
+    # （attempts 封顶兜底），不与在线流量抢容量。
+    if _global_admission_full(_run_store):
+        raise DispatchRetryLater("全局并发已满（重驱退避）")
+
     groups: list = []
     role = "employee"
     try:
@@ -1722,12 +1764,14 @@ def agent_run_cancel(run_id: str, request: Request,
     阻塞中的模型/工具调用**不被中断**（线程无法安全杀死，语义与工具 timeout 一致）。
 
     门禁与 run 详情一致：本人或 kb_admin，他人 404（不可见==不存在）。语义分支：
-    - running 且句柄在本实例 → 202 cancel_requested（轮边界生效）
+    - running 且句柄在本实例 → 202 cancel_requested（轮边界生效；durable 标记同落）
     - suspended（等审批）→ 409：无驱动线程可协作，请走审批中心拒绝/撤回
-    - resuming（认领中瞬态）→ 409 稍后重试
+    - running/resuming 且句柄不在本实例（多副本/实例重启/恢复认领中）→ **durable
+      cancel（PR-3 Stage D，schema/047）**：标记落 agent_run，驱动副本的 per-run
+      心跳 ticker（默认 30s）拾取后沿同一轮边界机制收口 → 202；持有者已死的 run
+      标记不被拾取，最终仍由 reaper 按心跳收尸（标记 ≠ 承诺，文案如实）。
+      store 不支持标记（降级面）→ 501（历史行为兜底）。
     - 终态 → 409 已结束
-    - running 但句柄不在本实例（多副本/实例已重启）→ 501（跨实例 cancel 标记留 v2；
-      此类 run 最终由 reaper 按心跳收尸）
     准入不计 LLM 配额（治理动作恒可达，与 /approve 同理）。SSE 断连**不**自动触发本端点。"""
     if not _agent_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
@@ -1749,17 +1793,40 @@ def agent_run_cancel(run_id: str, request: Request,
     if status == "suspended":
         raise HTTPException(status_code=409,
                             detail="run 等待审批中：请在审批中心拒绝/撤回，不走 cancel")
-    if status == "resuming":
-        raise HTTPException(status_code=409, detail="run 正在恢复中，请稍后重试")
     handle = (_executor.get_live_handle(run_id)
               if hasattr(_executor, "get_live_handle") else None)
-    if handle is None:
+    if handle is not None:
+        # 本实例在跑：进程内旗标即时生效；durable 标记 best-effort 同落——
+        # cancel_requested_by 留档，且实例在 202 与轮边界之间重启时意愿不丢。
+        handle.request_cancel()
+        try:
+            if hasattr(run_store, "request_cancel"):
+                run_store.request_cancel(run_id, requested_by=identity.user_id)
+        except Exception:   # noqa: BLE001 — 进程内旗标已置，标记失败不影响本地取消
+            logger.warning("run %s durable cancel 标记落库失败（本地取消不受影响）",
+                           run_id, exc_info=True)
+        return JSONResponse(status_code=202, content={
+            "status": "cancel_requested", "run_id": run_id,
+            "note": "取消在轮边界生效：进行中的模型/工具调用完成后收口为 cancelled"})
+    # PR-3 Stage D（schema/047）：句柄不在本实例（多副本/实例重启/恢复认领中瞬态）——
+    # durable 标记，驱动副本心跳 ticker（默认 30s）拾取后沿同一轮边界机制收口。
+    if not hasattr(run_store, "request_cancel"):
         raise HTTPException(status_code=501,
                             detail="run 不在本实例（跨实例取消暂不支持，将由系统心跳回收）")
-    handle.request_cancel()
+    try:
+        marked = run_store.request_cancel(run_id, requested_by=identity.user_id)
+    except Exception:   # noqa: BLE001 — 标记写失败：诚实 503 可重试
+        logger.error("run %s durable cancel 标记落库失败", run_id, exc_info=True)
+        raise HTTPException(status_code=503, detail="取消标记落库失败，请重试")
+    if not marked:
+        # CAS 未中：已有在途取消请求（幂等 202），或 run 恰在并发窗口进了终态（409）
+        current = (run_store.get_run(run_id) or {}).get("status")
+        if current in ("succeeded", "failed", "cancelled", "expired"):
+            raise HTTPException(status_code=409, detail=f"run 已结束（{current}），无可取消")
     return JSONResponse(status_code=202, content={
         "status": "cancel_requested", "run_id": run_id,
-        "note": "取消在轮边界生效：进行中的模型/工具调用完成后收口为 cancelled"})
+        "note": "取消标记已落库：驱动实例心跳周期（默认 30s）内拾取并在轮边界收口；"
+                "若持有实例已失联，run 将由系统按心跳超时回收"})
 
 
 @router.get("/api/agent/runs/{run_id}/events")

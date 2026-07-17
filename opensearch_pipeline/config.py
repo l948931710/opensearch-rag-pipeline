@@ -1077,16 +1077,25 @@ def load_config() -> PipelineConfig:
             # P1-10 增量（外审核查 2026-07-16）：agent 开着时事件中继也必须 redis——
             # 多副本下 SSE/回放挂在单实例本地队列上，另一副本的消费者永远收不到帧
             # （审批帧丢失=审批黑洞）。agent off 不要求（中继无消费面）。
-            if os.environ.get("RAG_AGENT_ENABLE", "").strip().lower() in (
-                    "1", "true", "yes", "on") and \
+            _agent_on = os.environ.get("RAG_AGENT_ENABLE", "").strip().lower() in (
+                "1", "true", "yes", "on")
+            if _agent_on and \
                     os.environ.get("RAG_AGENT_EVENT_RELAY", "").strip().lower() != "redis":
                 _mem_backends.append("RAG_AGENT_EVENT_RELAY")
+            # PR-3 Stage D（P1-10 合流）：多副本 + agent 开 ⇒ durable dispatch 必开——
+            # 滚动发布是多副本常态，无 outbox 的「受理即内存」意味着每次发布都静默丢
+            # 在途命令（用户以为在答）。同属「进程内真相 × 多副本」类目，一并硬断。
+            if _agent_on and os.environ.get(
+                    "RAG_AGENT_DURABLE_DISPATCH", "").strip().lower() not in (
+                    "1", "true", "yes", "on"):
+                _mem_backends.append("RAG_AGENT_DURABLE_DISPATCH")
             if _mem_backends:
                 raise ValueError(
                     f"🚨 [PRODUCTION SECURITY GUARD] RAG_EXPECTED_REPLICAS={_replicas}>1 "
-                    f"而 {_mem_backends} 仍为内存后端——多副本下会话/限流/去重/token/事件流"
-                    f"语义将按副本分裂。请切换 redis 后端（配 RAG_REDIS_URL 同出）或移除"
-                    f"副本声明（unknown-unknowns 批次5 P1-10 + 外审核查增量）。")
+                    f"而 {_mem_backends} 仍为内存后端/进程内真相——多副本下会话/限流/去重/"
+                    f"token/事件流/受理命令语义将按副本分裂。请切换 redis 后端（配 "
+                    f"RAG_REDIS_URL 同出）/开启 durable dispatch，或移除副本声明"
+                    f"（unknown-unknowns 批次5 P1-10 + 外审核查增量 + PR-3 Stage D）。")
 
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、

@@ -29,6 +29,9 @@ api-install: ## 安装 API 依赖 (FastAPI + uvicorn)
 api: ## 启动 RAG 问答 API 服务（端口可用 RAG_API_PORT 覆盖，默认 8000）
 	python -m uvicorn opensearch_pipeline.api:app --host 0.0.0.0 --port $${RAG_API_PORT:-8000} --reload
 
+agent-worker: ## PR-3 Stage D：durable dispatch 独立 worker（需 RAG_AGENT_ENABLE + RAG_AGENT_DURABLE_DISPATCH）
+	python -m opensearch_pipeline.agent_worker
+
 # ── Simulation ──
 
 sim: ## 运行 normal 场景模拟
