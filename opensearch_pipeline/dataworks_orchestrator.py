@@ -459,7 +459,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                           AND cm.is_active = 1
                           AND (
                               dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
-                              OR dv.updated_at < NOW() - INTERVAL 2 HOUR
+                              OR {ingest_lease.takeover_where_sql("dv.")}
                           )
                         ORDER BY cm.created_at ASC
                         LIMIT 1000
@@ -678,7 +678,7 @@ def _count_pending_rows(stage: int) -> int:
             WHERE cm.index_status IN ({sql_in_list(STAGE3_CHUNK_RESELECT_INDEX_STATUS)})
               AND cm.is_active = 1
               AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
-                   OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
+                   OR {ingest_lease.takeover_where_sql("dv.")})
         """,
     }
     conn = None

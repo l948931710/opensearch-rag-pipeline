@@ -254,6 +254,25 @@ class LeaseSet:
             self.discard(key)
             raise LeaseLost("fenced write rejected: doc=%s v=%s" % (key[0], key[1]))
 
+    def verify_still_held(self, cursor, key: DocVersionKey) -> bool:
+        """无锁快照验租（不 FOR UPDATE、不 raise）：True=仍持有；False=已失（并本地丢弃）。
+        用于不可逆外部副作用（HA3 删除）前的归属过滤——那里不能抱着行锁跨网络调用。
+        off/未登记 ⇒ True（不介入，语义=现状放行）。"""
+        if not lease_enabled():
+            return True
+        ep = self.epoch(key)
+        if ep is None:
+            return True
+        cursor.execute(
+            "SELECT lease_holder, lease_epoch FROM document_version"
+            " WHERE doc_id = %s AND version_no = %s",
+            (key[0], key[1]))
+        row = cursor.fetchone()
+        if row is not None and row[0] == holder_id() and int(row[1] or 0) == ep:
+            return True
+        self.discard(key)
+        return False
+
     def verify_for_update(self, cursor, key: DocVersionKey) -> None:
         """多语句破坏性写回（write_chunk_meta 的 DELETE→INSERT、deactivate 的
         is_active=0）前，在**同一事务**内 FOR UPDATE 锁 dv 行并验租——通过后
