@@ -62,6 +62,9 @@ def scratch_env(monkeypatch):
         host, port = real.rds.host, real.rds.port
         user, password = real.rds.user, real.rds.password
         ontology_database = _SCRATCH_DB
+        # 34802fe 起 apply_migration._connect_rw 走 cfg.rds.pymysql_ssl_args()（P0-02）——
+        # shim 直接借真配置的绑定方法（本地无 ssl_ca → {"ssl_disabled": True}）
+        pymysql_ssl_args = real.rds.pymysql_ssl_args
 
     class _Cfg:
         rds = _Rds()
