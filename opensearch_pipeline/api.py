@@ -393,6 +393,10 @@ class DingtalkAuthResponse(BaseModel):
     managed_owner_depts: List[str] = Field(
         default_factory=list,
         description="可上传/升版/退役的 owner_dept（kb_admin=全量写白名单；仅 UI 提示，特权接口仍服务端再裁决）")
+    # 两条免登路径(本响应 + /api/kb/whoami)字段必须同源齐全——81a25d1 免登下拉恒空的教训。
+    upload_target_depts: List[str] = Field(
+        default_factory=list,
+        description="上传「归属部门」下拉选项(= managed + 生产子线细化,2026-07-17;仅 UI 提示,服务端 authorize_upload 再裁决)")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -658,7 +662,7 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
     groups = ident.get("dept") or []  # _resolve_user_identity 现返回 ACL 组列表
     # 知识库写授权角色（DB 现查；写入令牌仅作入口可见性 UI 提示，特权接口仍会再现查裁决）
     from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
-    from opensearch_pipeline.kb_authz import can_access_console, managed_owner_depts
+    from opensearch_pipeline.kb_authz import can_access_console, managed_owner_depts, upload_target_depts
     kb_ident = resolve_kb_identity(userid)
     token = issue_session_token(userid, dept=groups, name=ident.get("name"), role=kb_ident.role)
     return DingtalkAuthResponse(
@@ -670,6 +674,7 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
         role=kb_ident.role,
         can_manage_kb=can_access_console(kb_ident),
         managed_owner_depts=managed_owner_depts(kb_ident),
+        upload_target_depts=upload_target_depts(kb_ident),
     )
 
 

@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
@@ -762,10 +762,18 @@ async function loadApprovals(force = false) {
 }
 
 // ── 升版态 ──
+// 台账「升版」按钮在页面下方,而 UploadCard 在「上传入库」区(台账上方)——不滚动过去,
+// 模式切换发生在屏幕外,点击处零反馈=「点了没反应」(与 77e5f97 筛选钳底同族视口问题)。
+function scrollToUploadCard() {
+  if (typeof document === 'undefined') return
+  void nextTick(() => document.getElementById('kb-sec-upload')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+}
+
 function enterVersionMode(d: DocItem) {
   verCtx.value = { doc_id: d.doc_id, title: d.title, owner_dept: d.owner_dept, permission_level: d.permission_level, current_version_no: d.current_version_no }
   newTitle.value = ''; dupWarn.value = ''; contentDupMsg.value = ''; uploadErr.value = ''; uploadMsg.value = ''
   selectedFiles = []; selectedNames.value = []
+  scrollToUploadCard()
 }
 function exitVersionMode() { verCtx.value = null }
 
@@ -780,6 +788,7 @@ function applyPendingVersion(p: { docId: string; owner: string; title: string })
   verCtx.value = { doc_id: p.docId, title: p.title || p.docId, owner_dept: p.owner, permission_level: '', current_version_no: 0 }
   newTitle.value = ''; dupWarn.value = ''; contentDupMsg.value = ''; uploadErr.value = ''; uploadMsg.value = ''
   selectedFiles = []; selectedNames.value = []
+  scrollToUploadCard()
 }
 
 // ── 选文件：预检 + 文件名级查重 ──
@@ -1519,6 +1528,11 @@ async function restore(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
 export function useKb() {
   const session = useSession()
   const ownerDepts = computed(() => session.identity?.managedOwnerDepts ?? [])
+  // 上传目标选项(含生产子线);toIdentity 已做旧后端回退,此处仅兜底空值。
+  const uploadTargetDepts = computed(() => {
+    const u = session.identity?.uploadTargetDepts
+    return u && u.length ? u : (session.identity?.managedOwnerDepts ?? [])
+  })
   const isKbAdmin = computed(() => session.role === 'kb_admin')
   const isDeptAdmin = computed(() => session.role === 'dept_admin')
   // 待你审核的数量（红点/角标单一来源）：kb_admin = 待审批上传 + 授权申请；dept_admin = 授权申请（其本部门文档的）。
@@ -1539,7 +1553,7 @@ export function useKb() {
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
-    ownerDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, kbOpsMetrics, maxUploadMb, verHistory, loadErrors,
+    ownerDepts, uploadTargetDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, kbOpsMetrics, maxUploadMb, verHistory, loadErrors,
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, openHistory, closeHistory, openDocPreview, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,

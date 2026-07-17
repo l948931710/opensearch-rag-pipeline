@@ -59,6 +59,8 @@ class KbWhoamiResponse(BaseModel):
     role: str = "employee"
     can_manage_kb: bool = False
     managed_owner_depts: List[str] = Field(default_factory=list)
+    # 上传「归属部门」下拉选项(= managed + 生产子线细化,2026-07-17)。前端缺省回退 managed。
+    upload_target_depts: List[str] = Field(default_factory=list)
     # 用户所属 ACL 读权限组（仅展示/审计，写授权不据此推导）。与 /api/auth/dingtalk 的 acl_groups 同源，
     # 补齐后 web-view ?token= 直登路径也能拿到部门信息（员工概览「我的部门」依赖它）。
     acl_groups: List[str] = Field(default_factory=list)
@@ -72,11 +74,12 @@ def kb_whoami(request: Request, identity: Optional[Identity] = Depends(current_i
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
     from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
-    from opensearch_pipeline.kb_authz import can_access_console, managed_owner_depts
+    from opensearch_pipeline.kb_authz import can_access_console, managed_owner_depts, upload_target_depts
     kb = resolve_kb_identity(identity.user_id)
     return KbWhoamiResponse(
         user_id=kb.user_id, display_name=kb.name or "", role=kb.role,
         can_manage_kb=can_access_console(kb), managed_owner_depts=managed_owner_depts(kb),
+        upload_target_depts=upload_target_depts(kb),
         acl_groups=list(kb.acl_groups),
     )
 
