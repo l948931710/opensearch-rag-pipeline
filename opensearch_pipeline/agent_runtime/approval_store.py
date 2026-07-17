@@ -214,7 +214,7 @@ class RDSApprovalStore:
     # ── 决策侧 ───────────────────────────────────────────────────
     def decide(self, request_id: str, *, decision: str, decided_by: str,
                reason: Optional[str] = None, edited_args: Optional[Dict[str, Any]] = None,
-               idempotency_key: Optional[str] = None) -> str:
+               idempotency_key: Optional[str] = None, audit_writer=None) -> str:
         """FOR UPDATE + pending CAS 决出处置。返回 DECIDE_ACCEPTED / DECIDE_DUPLICATE /
         DECIDE_ALREADY_DECIDED / DECIDE_EXPIRED。decision ∈ approved/edited/rejected_feedback/
         rejected_terminate。同事务写 approval_decision（重复 idempotency_key → 幂等 DUPLICATE）。
@@ -228,12 +228,14 @@ class RDSApprovalStore:
           args_digest / edited→人工改后参数原文 sha256（digest 无 PII）/ rejected_*→NULL。
           已决重放（routes 对非 pending 的重试）只认与该摘要一致的参数，堵改参重放。
         """
+        from opensearch_pipeline.agent_runtime.run_store import _begin
         from opensearch_pipeline.agent_runtime.sanitize import sanitize_args_json
         from opensearch_pipeline.agent_runtime.tool_executor import digest
 
         idem = (idempotency_key or uuid.uuid4().hex)[:64]
         db = _op_db()
         conn = self._conn()
+        _begin(conn)        # 多语句事务（FOR UPDATE+UPDATE+INSERT）：钉连接禁 SteadyDB 单句重试
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -281,6 +283,11 @@ class RDSApprovalStore:
                     (uuid.uuid4().hex, request_id, decision,
                      sanitize_args_json(edited_args) if edited_args is not None else None,
                      final_digest, (reason or None), (decided_by or "-")[:64], idem))
+                # P1-13（外审核查 2026-07-16）：审批决定的合规审计与决定行**同事务**——
+                # 此前 decide 提交后路由 best-effort 补审计，审计缺口静默。写失败=整体
+                # 回滚（调用方 503 重试），决定与审计要么都在、要么都不在。
+                if audit_writer is not None:
+                    audit_writer(cur)
             conn.commit()
             return DECIDE_ACCEPTED
         except Exception:

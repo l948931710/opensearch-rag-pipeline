@@ -1029,21 +1029,36 @@ def load_config() -> PipelineConfig:
     # 【批次5 P0-07d，unknown-unknowns 外审】生产安全姿态断言：强制认证与 ACL fail-closed
     # 是 main P0 加固（0cbb0f8）的两根梁，代码默认 off 是「代码先行、部署后开」的过渡态——
     # production/staging 启动时必须显式表态：要么把两个 flag 打开，要么设
-    # RAG_ALLOW_LEGACY_OPEN_PROD=ack 显式承认延续旧开放姿态（过渡逃生口，环境变量到位后
+    # RAG_ALLOW_LEGACY_OPEN_PROD 显式承认延续旧开放姿态（过渡逃生口，环境变量到位后
     # 应删除）。「部署漏配安全变量 → 告警后继续」到此收口为 fail-closed。
+    # P1-14（外审核查 2026-07-16）：ack 绑当日日期——`ack:<YYYY-MM-DD>`（仿 env_guard
+    # RAG_DESTRUCTIVE_PROD_ACK 惯例，午夜过期）。无日期的裸 `ack` 会变成永久逃生口：
+    # 设完就忘、逐渐制度化，正是外审点名的形态。每次重启/重部署都要求当日重签，
+    # 姿态缺口不可能被遗忘；启用即 critical 日志（可告警特征）。
     # ⚠️ RDS TLS（RAG_RDS_SSL_CA）维持告警不阻断——记录在案的用户决策（本文件 P0-02 注），
     # CA 证书到位后再升硬断言，不在本断言范围。
     if _env_label_prod:
         _posture_missing = [
             env for env in ("RAG_REQUIRE_AUTH", "RAG_ACL_FAIL_CLOSED")
             if os.environ.get(env, "").strip().lower() not in ("1", "true", "yes", "on")]
-        if _posture_missing and \
-                os.environ.get("RAG_ALLOW_LEGACY_OPEN_PROD", "").strip().lower() != "ack":
-            raise ValueError(
-                f"🚨 [PRODUCTION SECURITY GUARD] '{config.environment}' 环境未开启 "
-                f"{'/'.join(_posture_missing)}（强制认证 / ACL fail-closed）。"
-                f"请在部署环境变量中开启它们；确需延续旧开放姿态（过渡期）须显式设 "
-                f"RAG_ALLOW_LEGACY_OPEN_PROD=ack（unknown-unknowns 批次5 P0-07d）。")
+        if _posture_missing:
+            from datetime import datetime as _dt
+            _ack_raw = os.environ.get("RAG_ALLOW_LEGACY_OPEN_PROD", "").strip().lower()
+            _today = _dt.now().strftime("%Y-%m-%d")
+            if _ack_raw == f"ack:{_today}":
+                logging.getLogger(__name__).critical(
+                    "🚨 [LEGACY-OPEN POSTURE] '%s' 环境以 RAG_ALLOW_LEGACY_OPEN_PROD=%s "
+                    "延续旧开放姿态运行（%s 未开启）——当日有效，明日重启需重签；"
+                    "环境变量到位后请删除该逃生口（P1-14）。",
+                    config.environment, _ack_raw, "/".join(_posture_missing))
+            else:
+                _hint = ("旧格式 `ack` 已失效（无期限逃生口会被遗忘）；" if _ack_raw else "")
+                raise ValueError(
+                    f"🚨 [PRODUCTION SECURITY GUARD] '{config.environment}' 环境未开启 "
+                    f"{'/'.join(_posture_missing)}（强制认证 / ACL fail-closed）。"
+                    f"请在部署环境变量中开启它们；{_hint}确需延续旧开放姿态（过渡期）须"
+                    f"显式设 **当日** RAG_ALLOW_LEGACY_OPEN_PROD=ack:{_today}"
+                    f"（P1-14 日期绑定，午夜过期；unknown-unknowns 批次5 P0-07d）。")
 
     # 【批次5 P1-10，unknown-unknowns 外审】拓扑防呆：单 worker + 进程内内存态是隐藏
     # 约束（Dockerfile 钉 --workers 1）——声明多副本（RAG_EXPECTED_REPLICAS>1）而
@@ -1059,12 +1074,19 @@ def load_config() -> PipelineConfig:
                 k for k in ("RAG_SESSION_BACKEND", "RAG_RATE_LIMIT_BACKEND",
                             "RAG_MSG_DEDUP_BACKEND", "RAG_TOKEN_CACHE_BACKEND")
                 if os.environ.get(k, "memory").strip().lower() != "redis"]
+            # P1-10 增量（外审核查 2026-07-16）：agent 开着时事件中继也必须 redis——
+            # 多副本下 SSE/回放挂在单实例本地队列上，另一副本的消费者永远收不到帧
+            # （审批帧丢失=审批黑洞）。agent off 不要求（中继无消费面）。
+            if os.environ.get("RAG_AGENT_ENABLE", "").strip().lower() in (
+                    "1", "true", "yes", "on") and \
+                    os.environ.get("RAG_AGENT_EVENT_RELAY", "").strip().lower() != "redis":
+                _mem_backends.append("RAG_AGENT_EVENT_RELAY")
             if _mem_backends:
                 raise ValueError(
                     f"🚨 [PRODUCTION SECURITY GUARD] RAG_EXPECTED_REPLICAS={_replicas}>1 "
-                    f"而 {_mem_backends} 仍为内存后端——多副本下会话/限流/去重/token 语义"
-                    f"将按副本分裂。请切换 redis 后端（配 RAG_REDIS_URL 三件同出）或移除"
-                    f"副本声明（unknown-unknowns 批次5 P1-10）。")
+                    f"而 {_mem_backends} 仍为内存后端——多副本下会话/限流/去重/token/事件流"
+                    f"语义将按副本分裂。请切换 redis 后端（配 RAG_REDIS_URL 同出）或移除"
+                    f"副本声明（unknown-unknowns 批次5 P1-10 + 外审核查增量）。")
 
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、

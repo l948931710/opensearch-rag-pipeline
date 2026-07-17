@@ -568,9 +568,11 @@ class _FakeApprovalStore:
         return dict(self.areq) if self.areq and self.areq["run_id"] == run_id else None
 
     def decide(self, request_id, *, decision, decided_by, reason=None,
-               edited_args=None, idempotency_key=None):
+               edited_args=None, idempotency_key=None, audit_writer=None):
+        # P1-13 契约：真实 store 在同事务经 audit_writer(cur) 写审计；内存桩记录传入即可
         self.decisions.append({"request_id": request_id, "decision": decision,
-                               "decided_by": decided_by})
+                               "decided_by": decided_by,
+                               "audit_writer_passed": audit_writer is not None})
         self.areq["status"] = decision
         return "accepted"
 
@@ -727,7 +729,8 @@ class _FakeRegistryStore:
     def disabled_names(self):
         return {r["tool_name"] for r in self.rows if r["status"] == "disabled"}
 
-    def set_status(self, name, status):
+    def set_status(self, name, status, audit_writer=None):
+        # P1-13 契约：真实 store 在同事务经 audit_writer(cur) 写审计；内存桩忽略
         n = 0
         for r in self.rows:
             if r["tool_name"] == name:
@@ -1018,7 +1021,9 @@ class _RunCenterStore(_SuspendedStore):
             return [dict(r) for r in self.uncertain]
         return []
 
-    def resolve_uncertain_invocation(self, invocation_id, *, to_status, note, resolved_by):
+    def resolve_uncertain_invocation(self, invocation_id, *, to_status, note, resolved_by,
+                                     audit_writer=None):
+        # P1-13 契约：真实 store 在同事务经 audit_writer(cur) 写审计；内存桩忽略
         if any(r["invocation_id"] == invocation_id for r in self.uncertain):
             self.resolved.append((invocation_id, to_status, note, resolved_by))
             self.uncertain = [r for r in self.uncertain if r["invocation_id"] != invocation_id]

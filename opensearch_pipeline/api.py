@@ -662,6 +662,9 @@ def readiness_check():
     checks["schema_contract"] = _readiness.schema_contract_status()
     checks["kill_switch"] = _readiness.kill_switch_status()
     checks["ontology_backfill"] = _readiness.ontology_backfill_status()
+    # P1-14（外审核查 2026-07-16）：LEGACY-OPEN 逃生口自报（report-only）——设了 ack 的
+    # 实例在就绪面持续可见，姿态缺口不被遗忘（启动断言另在 config，当日 ack 才放行）
+    checks["security_posture"] = _readiness.legacy_open_posture_status()
 
     # WS0 状态外置：任一状态后端切了 redis → Redis PING 纳入就绪判定（此前 redis_client.ping
     # 是死代码，深度审查多实例运维组）。判据：限流 redis 后端是 fail-closed（Redis 挂 → ask

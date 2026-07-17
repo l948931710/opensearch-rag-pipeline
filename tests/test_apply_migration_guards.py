@@ -41,17 +41,19 @@ def test_classify_target_fingerprint_first(host, dbname, expect):
     assert mod.classify_target(host, dbname) == expect
 
 
-# ── ci_load_schema.sh MANIFEST 一致性（P0-08 配套）────────────────────────────
+# ── MIGRATION_MANIFEST.tsv 一致性（P0-08 配套；P1-09 后单一来源在 schema/ 下）────
 
 
 def _parse_manifest():
-    text = open(os.path.join(_REPO, "scripts", "ci_load_schema.sh"), encoding="utf-8").read()
-    m = re.search(r'MANIFEST="\n(.*?)"\n', text, re.S)
-    assert m, "ci_load_schema.sh 里找不到 MANIFEST 块"
+    path = os.path.join(_REPO, "schema", "MIGRATION_MANIFEST.tsv")
     entries = {}
-    for line in m.group(1).strip().splitlines():
-        fn, target = line.split()
+    for line in open(path, encoding="utf-8").read().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fn, target = line.split()[:2]
         entries[fn] = target
+    assert entries, "schema/MIGRATION_MANIFEST.tsv 为空/缺失"
     return entries
 
 

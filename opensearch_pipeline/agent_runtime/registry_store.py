@@ -153,18 +153,26 @@ class RDSToolRegistryStore:
             self._cached_at = 0.0
 
     # ── 管理写侧 ─────────────────────────────────────────────────
-    def set_status(self, tool_name: str, status: str) -> int:
-        """置某工具（全部版本）status。返回受影响行数（0 = 表内无此工具）。"""
+    def set_status(self, tool_name: str, status: str, audit_writer=None) -> int:
+        """置某工具（全部版本）status。返回受影响行数（0 = 表内无此工具）。
+        P1-13（外审核查 2026-07-16）：拉闸审计经 audit_writer(cur) **同事务**写——
+        kill switch 是四处治理动作里唯一无 durable 操作者记录的（tool_registry 无
+        disabled_by 列），审计行就是唯一证据。原子失败时的「先关闸」回退在路由层。"""
         if status not in _VALID_STATUS:
             raise ValueError(f"非法 status={status!r}（合法：{_VALID_STATUS}）")
         db = _op_db()
         conn = self._conn()
+        if audit_writer is not None:
+            from opensearch_pipeline.agent_runtime.run_store import _begin
+            _begin(conn)                    # 多语句事务（UPDATE+审计 INSERT）：钉住连接
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {db}.tool_registry SET status=%s WHERE tool_name=%s",
                     (status, tool_name))
                 n = cur.rowcount
+                if n and audit_writer is not None:
+                    audit_writer(cur)
             conn.commit()
             self.invalidate_cache()          # 本实例即时生效；其他实例等 TTL
             return int(n)

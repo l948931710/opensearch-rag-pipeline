@@ -77,6 +77,33 @@ class _NullAudit:
 NULL_AUDIT: AuditLog = _NullAudit()
 
 
+def insert_audit_row_tx(cur, ctx: "Optional[ExecutionContext]", *, event_type: str,
+                        action: str, decision: str, risk_level: Optional[str] = None,
+                        policy_id: Optional[str] = None, args_digest: Optional[str] = None,
+                        detail: Optional[Dict[str, Any]] = None, run_id: Optional[str] = None,
+                        step_no: Optional[int] = None) -> str:
+    """P1-13（外审核查 2026-07-16）：治理事实同事务审计——用**调用方事务的游标**写
+    agent_audit_log 行，与主事实（approval_decision / tool_invocation 人工对账 /
+    tool_registry kill switch）一次 commit（同 fuling_operation 库，零跨库成本）。
+    抛错=调用方事务整体回滚：治理事实与审计从此要么都在、要么都不在；回退策略由
+    调用方定（kill switch 有「先关闸」回退，见 routes/agent 拉闸端点）。"""
+    audit_id = uuid.uuid4().hex
+    user_id, roles_csv, acl_json, channel, request_id = _actor(ctx)
+    rid = run_id if run_id is not None else getattr(ctx, "run_id", None)
+    detail_json = json.dumps(detail, ensure_ascii=False) if detail else None
+    cur.execute(
+        f"INSERT INTO {_op_db()}.agent_audit_log "
+        "(audit_id, run_id, step_no, request_id, event_type, action, risk_level, "
+        " decision, policy_id, user_id, roles, acl_groups_snapshot, channel, "
+        " args_digest, detail_json, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
+        (audit_id, rid, step_no, request_id, event_type, action, risk_level,
+         decision, policy_id, user_id, roles_csv, acl_json, channel,
+         args_digest, detail_json),
+    )
+    return audit_id
+
+
 class RDSAuditLog:
     """agent_audit_log 的 RDS（fuling_operation）实现。append-only。"""
 
@@ -89,26 +116,16 @@ class RDSAuditLog:
                args_digest: Optional[str] = None, detail: Optional[Dict[str, Any]] = None,
                run_id: Optional[str] = None, step_no: Optional[int] = None,
                fail_closed: bool = False) -> Optional[str]:
-        """写一条审计。成功→audit_id；fail-open 失败→None；fail-closed 失败→抛 AuditWriteError。"""
-        audit_id = uuid.uuid4().hex
-        user_id, roles_csv, acl_json, channel, request_id = _actor(ctx)
-        rid = run_id if run_id is not None else getattr(ctx, "run_id", None)
-        detail_json = json.dumps(detail, ensure_ascii=False) if detail else None
-        db = _op_db()
+        """写一条审计。成功→audit_id；fail-open 失败→None；fail-closed 失败→抛 AuditWriteError。
+        单条 INSERT 语义收敛到 insert_audit_row_tx（P1-13 单一定义点）。"""
         conn = None
         try:
             conn = self._conn()                         # 放 try 内：DB 不可达也走 fail-closed/open 分流
             with conn.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO {db}.agent_audit_log "
-                    "(audit_id, run_id, step_no, request_id, event_type, action, risk_level, "
-                    " decision, policy_id, user_id, roles, acl_groups_snapshot, channel, "
-                    " args_digest, detail_json, created_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
-                    (audit_id, rid, step_no, request_id, event_type, action, risk_level,
-                     decision, policy_id, user_id, roles_csv, acl_json, channel,
-                     args_digest, detail_json),
-                )
+                audit_id = insert_audit_row_tx(
+                    cur, ctx, event_type=event_type, action=action, decision=decision,
+                    risk_level=risk_level, policy_id=policy_id, args_digest=args_digest,
+                    detail=detail, run_id=run_id, step_no=step_no)
             conn.commit()
             return audit_id
         except Exception as e:                          # noqa: BLE001

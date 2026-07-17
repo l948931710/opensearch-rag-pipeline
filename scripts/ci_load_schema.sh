@@ -66,56 +66,14 @@ CREATE DATABASE IF NOT EXISTS fuling_operation CHARACTER SET utf8mb4 COLLATE utf
 CREATE DATABASE IF NOT EXISTS fuling_ontology CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 SQL
 
-# ── 3. file→目标库清单（权威矩阵见 schema/README.md）─────────────────────────
-#   knowledge/operation = 整文件灌对应库；both = 整文件对两库各跑一遍（011 台账表）；
-#   split = 双库混排，按文件内 `-- @DB <db>` 标记分段（目前仅 004）。
-MANIFEST="
-001_opensearch_pipeline.sql knowledge
-002_feedback_system.sql operation
-002_step_card_enhancement.sql knowledge
-003_provenance_lineage.sql knowledge
-003_user_role_unique.sql knowledge
-004_observability_metrics.sql split
-005_cross_doc_dedup_index.sql knowledge
-006_conversation_history.sql operation
-006_kb_admin_authz.sql knowledge
-007_kb_etag_dedup_index.sql knowledge
-008_kb_access_request.sql knowledge
-009_acl_projection_outbox.sql knowledge
-010_kb_contribution.sql operation
-011_schema_migrations.sql both
-012_qa_session_log_perf_index.sql operation
-013_qa_retrieved_doc_fact.sql operation
-014_document_version_raw_key_hash_index.sql knowledge
-015_kb_audit_log_history_index.sql knowledge
-016_user_feedback_dedup_unique.sql operation
-017_qa_admission_reject.sql operation
-018_gen_meta_runtime_contract.sql split
-019_chunk_meta_index_retry.sql knowledge
-020_document_version_simhash.sql knowledge
-021_ingest_quality_metrics.sql knowledge
-022_agent_runtime.sql operation
-023_llm_call_log.sql operation
-024_agent_audit_log.sql operation
-025_approval_workflow.sql operation
-026_agent_family_collation_request_id.sql operation
-027_ontology_core.sql ontology
-028_ontology_identity.sql ontology
-029_ontology_link.sql ontology
-030_sem_views.sql ontology
-031_agent_approval_execution_hardening.sql operation
-032_schema_migrations_checksum.sql both
-033_ontology_link_invariants.sql ontology
-034_sem_views_product_acl.sql ontology
-035_agent_checkpoint_digest_hmac.sql operation
-036_agent_run_message_id.sql operation
-037_agent_run_serialization.sql operation
-038_ontology_object_normalized_title.sql ontology
-039_qa_question_hash.sql operation
-040_qa_gap_semantic_group.sql operation
-041_qa_gap_dismissal.sql operation
-042_agent_run_user_index.sql operation
-"
+# ── 3. file→目标库清单（P1-09 外审核查 2026-07-16：抽成 schema/MIGRATION_MANIFEST.tsv
+#   机器可读单一来源——readiness 逐库校验 applied 台账与本脚本共用；权威矩阵见
+#   schema/README.md）。目标语义：knowledge/operation/ontology = 整文件灌对应库；
+#   both = 三库各跑一遍（011/032 台账表）；split = 按文件内 `-- @DB <db>` 标记分段。
+MANIFEST_FILE="$SCHEMA_DIR/MIGRATION_MANIFEST.tsv"
+[ -f "$MANIFEST_FILE" ] || die "缺 $MANIFEST_FILE（file→DB 单一来源，P1-09）"
+MANIFEST="$(grep -Ev '^[[:space:]]*(#|$)' "$MANIFEST_FILE")"
+[ -n "$MANIFEST" ] || die "$MANIFEST_FILE 为空"
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }
 
@@ -123,7 +81,7 @@ db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fulin
 for f in "$SCHEMA_DIR"/[0-9]*.sql; do
   base="$(basename "$f")"
   echo "$MANIFEST" | grep -q "^$base " \
-    || die "schema/$base 不在 loader 清单里——新迁移需同步更新 scripts/ci_load_schema.sh（file→DB 见 schema/README.md）"
+    || die "schema/$base 不在清单里——新迁移需同步更新 schema/MIGRATION_MANIFEST.tsv（file→DB 见 schema/README.md）"
 done
 
 tmpdir="$(mktemp -d)"

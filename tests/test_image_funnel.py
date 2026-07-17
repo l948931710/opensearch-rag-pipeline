@@ -348,7 +348,8 @@ class TestGeminiFallbackSafeguard:
 
         try:
             # 批次5 P0-07d：本测试测的是供应商守卫——姿态断言给过渡 ack 让路
-            os.environ["RAG_ALLOW_LEGACY_OPEN_PROD"] = "ack"
+            from datetime import datetime as _dt
+            os.environ["RAG_ALLOW_LEGACY_OPEN_PROD"] = f"ack:{_dt.now():%Y-%m-%d}"
             # 1. 模拟 staging 环境下没配 DashScope KEY，直接报错
             os.environ["RAG_ENVIRONMENT"] = "staging"
             if "RAG_DASHSCOPE_API_KEY" in os.environ:

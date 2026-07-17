@@ -53,7 +53,9 @@ for _p in (_REPO_ROOT, _SCRIPTS_DIR):
 import apply_migration as _am  # noqa: E402 — 守卫/切分/连接全部复用，单一事实源
 
 SCHEMA_DIR = os.path.join(_REPO_ROOT, "schema")
-CI_LOADER = os.path.join(_SCRIPTS_DIR, "ci_load_schema.sh")
+# P1-09（外审核查 2026-07-16）：MANIFEST 权威来源移到 schema/MIGRATION_MANIFEST.tsv
+# （机器可读单一来源，ci_load_schema.sh / readiness / 本工具共用）。
+MANIFEST_FILE = os.path.join(SCHEMA_DIR, "MIGRATION_MANIFEST.tsv")
 # 台账基建：011 建 schema_migrations 表、032 补 checksum 列——MANIFEST 里 target=both，
 # 本体库同样各一份（ci_load_schema.sh 的 both 语义），故固定纳入本工具的重放序列。
 LEDGER_FILES = ("011_schema_migrations.sql", "032_schema_migrations_checksum.sql")
@@ -69,24 +71,27 @@ def _numeric_key(fn):
 
 
 def discover_ontology_migrations():
-    """从 ci_load_schema.sh 的 MANIFEST 自动发现本体迁移族 + 台账基建，按编号排序。
+    """从 schema/MIGRATION_MANIFEST.tsv 自动发现本体迁移族 + 台账基建，按编号排序
+    （P1-09：MANIFEST 单一来源从 ci_load_schema.sh 内嵌块移到 schema/ 下机器可读文件）。
 
-    fail-closed：loader 不存在 / MANIFEST 解析不出 / 台账基建文件缺登记或 target 不是
+    fail-closed：manifest 不存在 / 解析不出 / 台账基建文件缺登记或 target 不是
     both / 发现的文件在 schema/ 里不存在——一律 RuntimeError（绝不静默按空集跑）。
     """
     try:
-        text = open(CI_LOADER, encoding="utf-8").read()
+        text = open(MANIFEST_FILE, encoding="utf-8").read()
     except OSError as e:
-        raise RuntimeError("读不到 %s（MANIFEST 权威来源）：%s" % (CI_LOADER, e))
-    m = re.search(r'MANIFEST="\n(.*?)"\n', text, re.S)
-    if not m:
-        raise RuntimeError("ci_load_schema.sh 里找不到 MANIFEST 块——loader 结构变了？")
+        raise RuntimeError("读不到 %s（MANIFEST 权威来源）：%s" % (MANIFEST_FILE, e))
     entries = {}
-    for line in m.group(1).strip().splitlines():
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
         parts = line.split()
         if len(parts) != 2:
             raise RuntimeError("MANIFEST 行解析失败: %r" % line)
         entries[parts[0]] = parts[1]
+    if not entries:
+        raise RuntimeError("%s 为空——MANIFEST 权威来源缺失，中止。" % MANIFEST_FILE)
 
     files = [fn for fn, target in entries.items() if target == "ontology"]
     if not files:

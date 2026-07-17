@@ -562,6 +562,23 @@ def agent_ask(req: AskRequest, request: Request,
     conv = getattr(req, "conversation_id", None)
     # 多轮记忆键：有 conversation_id → f"{conv}:{user}"（钉钉一致）；否则用 client session_id（缺则新建）。
     thread_key = f"{conv}:{identity.user_id}" if conv else getattr(req, "session_id", None)
+    # P1-11（外审核查 2026-07-16）：console session_id-only 分支统一按用户命名空间
+    # `sid:{user}:{sid}`——裸客户端值做键时，内存所有权元数据 30min 过期/LRU 逐出后
+    # 他人可抢占已知键（fixation/DoS/回调归属异常）；键含 owner 后抢占在键层面不可能。
+    # 幂等：本人 `sid:` 前缀原样保留（服务端回填值下轮回传不叠前缀）；他人 `sid:` 前缀
+    # 403；miniapp:/钉钉 conv 命名空间不动（已用户绑定，跨模块依赖）；缺 session_id 直接
+    # 发新命名空间键。存量裸 sid 会话一次性孤儿化（内存 30min 短命 + durable 历史按
+    # user_id 过滤，接受——台账已记）。
+    if not conv:
+        _sid_ns = f"sid:{identity.user_id}:"
+        if not thread_key:
+            import uuid as _uuid
+            thread_key = f"{_sid_ns}{_uuid.uuid4().hex}"
+        elif thread_key.startswith("sid:"):
+            if not thread_key.startswith(_sid_ns):
+                raise HTTPException(status_code=403, detail="会话不属于当前用户")
+        elif not thread_key.startswith("miniapp:"):
+            thread_key = f"{_sid_ns}{thread_key}"
     # miniapp 前缀归属（对齐 api.py /api/ask）：'miniapp:<staffId>' 是可预测命名空间，
     # 不校验则认证用户可抢注他人 miniapp 会话键
     if thread_key and thread_key.startswith("miniapp:") and thread_key != f"miniapp:{identity.user_id}":
@@ -621,6 +638,11 @@ def agent_ask(req: AskRequest, request: Request,
         channel="console", thread_id=thread_id, conversation_id=conv,
         model_profile=tier,   # 档位落 ctx → create_run 记 agent_run.model_profile（运行中心可见）
         speculative_search=speculative, search_session=search_session)
+    # P1-12（外审核查 2026-07-16）：message_id 随 ctx 进 create_run **同事务**写入——
+    # 此前 submit 后才回填 UPDATE，交棒与回填之间进程崩溃留下 message_id 为空的 run 行
+    # （答案锚点丢失，读回退化）。与 run_id 同类：建 run 相关性字段、非身份/ACL，
+    # 就地 setattr 不违 frozen 初衷（executor 对 run_id 同款）。
+    object.__setattr__(ctx, "message_id", message_id)
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))   # 档位随深度思考：light/high
     tools = registry.list_specs(ctx)
     # 多轮：system + 历史快照（前几轮 Q&A + summary）+ 本轮 user
@@ -700,7 +722,9 @@ def agent_ask(req: AskRequest, request: Request,
                             detail="该会话已有回答在进行中（或有待审批任务未收尾），请稍后再试")
 
     # U1/U2（重审计 §5，schema/036）：message_id 落 agent_run——审批续跑复用它落库
-    # （反馈投票不悬空），run 详情经它从 qa_session_log 取回最终答案。fail-open。
+    # （反馈投票不悬空），run 详情经它从 qa_session_log 取回最终答案。
+    # P1-12 后主路径已随 create_run 同事务写入（ctx.message_id）；此处回填保留为
+    # **兼容兜底**（不认 ctx.message_id 的旧/简化 store 桩），幂等 UPDATE 同值。fail-open。
     try:
         if hasattr(_run_store, "set_message_id"):
             _run_store.set_message_id(handle.run_id, message_id)
@@ -878,19 +902,35 @@ def agent_approve(req: ApproveRequest, request: Request,
     # 时刻原子裁决**，P0-C）；已决 → 只允许重放**数据库里那个不可变决定**（同向 + digest
     # 一致 + decided_by/reason 以库为准）；不同向/改参/已过期 → 409。
     decided_by_effective = identity.user_id
+    audited_in_tx = False
     if areq is not None:
         from opensearch_pipeline.agent_runtime.approval_store import (
             DECIDE_ALREADY_DECIDED, DECIDE_EXPIRED)
         if areq.get("status") == "pending":
+            # P1-13（外审核查 2026-07-16）：审批决定的合规审计与 approval_decision 行
+            # **同事务**（audit_writer 游标回调）——此前 decide 提交后 best-effort 补记，
+            # 审计缺口静默。审计写失败=决定整体回滚 → 503 重试（宁拒不留无审计决定）。
+            from opensearch_pipeline.agent_runtime.audit import insert_audit_row_tx
+            _aud_kind, _aud_rid = outcome.kind, req.run_id
+            _aud_req, _aud_by = areq["request_id"], identity.user_id
+
+            def _audit_decision(cur):
+                insert_audit_row_tx(
+                    cur, None, event_type="approval_decision", action=f"run:{_aud_rid}",
+                    decision=_aud_kind, run_id=_aud_rid,
+                    detail={"kind": _aud_kind, "approver": _aud_by, "request_id": _aud_req})
+
             try:
                 res = approval_store.decide(
                     areq["request_id"], decision=outcome.kind, decided_by=identity.user_id,
                     reason=getattr(outcome, "reason", None),
                     edited_args=getattr(outcome, "edited_args", None),
-                    idempotency_key=req.idempotency_key)
+                    idempotency_key=req.idempotency_key,
+                    audit_writer=_audit_decision)
             except Exception:   # noqa: BLE001 — 决策落库失败：宁拒不续（无 decision 行不放行执行）
                 logger.error("approval_decision 写失败，拒绝续跑", exc_info=True)
                 raise HTTPException(status_code=503, detail="审批决定落库失败，请重试")
+            audited_in_tx = True   # ACCEPTED 已同事务入审计；DUPLICATE 原决定已审计过
             if res == DECIDE_EXPIRED:
                 raise HTTPException(status_code=409,
                                     detail="该审批请求已过期（过期即拒绝，不接受迟到批准）")
@@ -931,16 +971,19 @@ def agent_approve(req: ApproveRequest, request: Request,
         rid = (get_request_id() or "")[:64]   # llm_call_log/agent_audit_log.request_id VARCHAR(64)（026 加宽；钳制防未迁移环境 1406）
     except Exception:   # noqa: BLE001
         rid = ""
-    # 审批决定入合规审计（fail-open）：谁、对哪个 run/request、何种处置。只记 kind 不记原文。
-    try:
-        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
-        RDSAuditLog().record(
-            None, event_type="approval_decision", action=f"run:{req.run_id}",
-            decision=outcome.kind, run_id=req.run_id,
-            detail={"kind": outcome.kind, "approver": identity.user_id,
-                    "request_id": (areq or {}).get("request_id")})
-    except Exception:   # noqa: BLE001
-        logger.warning("审批决定审计写失败（fail-open）", exc_info=True)
+    # 审批决定入合规审计：新决定已在 decide 事务内同库同 commit（P1-13，见上）；此处只
+    # 覆盖**非新决定**路径（已决同向重放/无请求行的发起人撤回）——重放不产生新治理事实，
+    # 维持 fail-open 补记（原决定行的审计已在其 decide 事务里）。
+    if not audited_in_tx:
+        try:
+            from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
+            RDSAuditLog().record(
+                None, event_type="approval_decision", action=f"run:{req.run_id}",
+                decision=outcome.kind, run_id=req.run_id,
+                detail={"kind": outcome.kind, "approver": identity.user_id,
+                        "request_id": (areq or {}).get("request_id"), "replay": True})
+        except Exception:   # noqa: BLE001
+            logger.warning("审批决定审计写失败（fail-open）", exc_info=True)
     # 铁律 5：resume 重建 ctx——以**发起人**（run.user_id）身份现解 ACL 续跑（共享助手，
     # /approve 与 B6 对账同一套语义：绝不套审批人/对账进程的权限组）。
     # P1-08：Approved/Edited（写操作将执行）身份不可解析/已停用 → fail-closed。
@@ -1190,7 +1233,10 @@ def _reconcile_decided(registry, gateway, executor, run_store, approval_store) -
         # 无 SSE 消费者：起 daemon 线程排空事件队列（否则事件在队列里堆到 run 结束）
         threading.Thread(target=lambda h=handle: [None for _ in h.events()],
                          name=f"b6-drain-{run_id[:8]}", daemon=True).start()
-        try:                                            # 对账重驱入合规审计（fail-open）
+        try:
+            # 对账重驱入合规审计——**有意维持 fail-open**（P1-13 拍板）：重驱不产生新治理
+            # 事实（决定行在 decide 事务已带审计，run 状态迁移由 executor CAS 记录），
+            # 本条只是运维可观测，没有可折入的主事务。
             from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
             RDSAuditLog().record(
                 None, event_type="approval_reconcile", action=f"run:{run_id}",
@@ -1254,22 +1300,36 @@ def agent_tool_toggle(req: ToolToggleRequest, request: Request,
     _get_runtime()                                   # 确保 sync_specs 已跑（表内有行可置）
     store = _get_registry_store()
     status = "disabled" if req.disabled else "active"
+    # P1-13（外审核查 2026-07-16）：拉闸审计与 status UPDATE **同事务**（kill switch 是
+    # 四处治理动作里唯一无 durable 操作者记录的——审计行就是唯一证据）。原子失败
+    # （典型：审计表故障连带回滚）→ **先关闸回退**：紧急停用绝不被审计表故障阻塞，
+    # 单独重放 UPDATE，审计缺口响亮告警 + 响应体承认（audit_recorded=false，可告警）。
+    from opensearch_pipeline.agent_runtime.audit import insert_audit_row_tx
+
+    def _audit_toggle(cur):
+        insert_audit_row_tx(
+            cur, None, event_type="tool_kill_switch", action=req.tool_name, decision=status,
+            detail={"by": identity.user_id, "reason": (req.reason or "")[:500]})
+
+    audit_recorded = True
     try:
-        n = store.set_status(req.tool_name, status)
+        n = store.set_status(req.tool_name, status, audit_writer=_audit_toggle)
     except ValueError:
         raise HTTPException(status_code=400, detail="非法 status")
+    except Exception:   # noqa: BLE001 — 原子写失败：先关闸回退（禁用必须落地）
+        logger.error("kill switch 原子写（status+审计）失败——回退先关闸（无审计行），"
+                     "请排查 agent_audit_log", exc_info=True)
+        try:
+            n = store.set_status(req.tool_name, status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="非法 status")
+        audit_recorded = False
     if n == 0:
         raise HTTPException(status_code=404, detail=f"tool_registry 无工具 {req.tool_name}")
-    try:                                             # 拉闸是高风险治理动作：谁在何时停了什么
-        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
-        RDSAuditLog().record(
-            None, event_type="tool_kill_switch", action=req.tool_name, decision=status,
-            detail={"by": identity.user_id, "reason": (req.reason or "")[:500]})
-    except Exception:   # noqa: BLE001
-        logger.warning("kill switch 审计写失败（fail-open）", exc_info=True)
-    logger.warning("kill switch：%s → %s（by %s，reason=%s）",
-                   req.tool_name, status, identity.user_id, req.reason)
-    return {"tool_name": req.tool_name, "status": status, "rows": n}
+    logger.warning("kill switch：%s → %s（by %s，reason=%s，audit_recorded=%s）",
+                   req.tool_name, status, identity.user_id, req.reason, audit_recorded)
+    return {"tool_name": req.tool_name, "status": status, "rows": n,
+            "audit_recorded": audit_recorded}
 
 
 # ── P0-F run center（重评报告 §8「运行中心」后端）───────────────────────────────
@@ -1552,18 +1612,26 @@ def agent_invocation_resolve(req: InvocationResolveRequest, request: Request,
     _registry, _gateway, _executor, run_store = _get_runtime()
     if not hasattr(run_store, "resolve_uncertain_invocation"):
         raise HTTPException(status_code=501, detail="当前 run_store 不支持对账处置")
-    ok = run_store.resolve_uncertain_invocation(
-        req.invocation_id, to_status=to_status, note=req.note.strip(), resolved_by=identity.user_id)
-    if not ok:
-        raise HTTPException(status_code=409, detail="该调用不在 uncertain 态（已被处置或状态已变）")
-    try:                                             # 对账是高风险治理动作：谁核实了什么
-        from opensearch_pipeline.agent_runtime.audit import RDSAuditLog
-        RDSAuditLog().record(
-            None, event_type="invocation_reconcile", action=req.invocation_id,
+    # P1-13（外审核查 2026-07-16）：对账是高风险治理动作（把 uncertain 翻成 succeeded/
+    # failed 直接决定「同键能否重发」）——审计与状态翻转**同事务**：审计写不进则状态
+    # 不翻（503 重试），绝不再有「已翻转、无证据」的静默缺口。
+    from opensearch_pipeline.agent_runtime.audit import insert_audit_row_tx
+
+    def _audit_resolve(cur):
+        insert_audit_row_tx(
+            cur, None, event_type="invocation_reconcile", action=req.invocation_id,
             decision=to_status,
             detail={"by": identity.user_id, "note": req.note.strip()[:500]})
-    except Exception:   # noqa: BLE001
-        logger.warning("对账处置审计写失败（fail-open）", exc_info=True)
+
+    try:
+        ok = run_store.resolve_uncertain_invocation(
+            req.invocation_id, to_status=to_status, note=req.note.strip(),
+            resolved_by=identity.user_id, audit_writer=_audit_resolve)
+    except Exception:   # noqa: BLE001 — 原子写失败：状态未翻，诚实 503 可重试
+        logger.error("对账处置原子写（状态+审计）失败（状态未翻转，可重试）", exc_info=True)
+        raise HTTPException(status_code=503, detail="对账处置落库失败（状态未翻转），请重试")
+    if not ok:
+        raise HTTPException(status_code=409, detail="该调用不在 uncertain 态（已被处置或状态已变）")
     return {"invocation_id": req.invocation_id, "status": to_status}
 
 

@@ -86,7 +86,13 @@
   2. **P1-06**：`_union_invocation_doc_ids`——completion 事务同游标把本 run 全部成功检索回执的 doc_ids 并进 retrieved_docs（只补 doc_id 级条目不复制 chunk 载荷，checkpoint 不存 chunk 的 P0-A 决定不动；fail-open）。已知残留：回执补差条目无 title（历史 UI 渲染朴素）。
   3. **P1-07**：`/approve` 已受理命令的 HTTP 重试幂等回放——run 已离开 suspended 且库内决定同 idempotency_key 或同向 → 202 回放（get_decision 补返 idempotency_key），其余维持 409；**不做** edited executable envelope（维持拒绝）。
   4. **P1-08**：Approved/Edited 续跑身份 fail-closed——解析异常→503 可重试（decided 重放接住）、墓碑→403 终局（留 suspended 等 TTL）；对账同语义（approved 向跳过+告警）；**墓碑用既有 user_role.is_active 列零 schema 变更**（有行且全 0=显式停用）：api strict 分支令牌立即失效（此前只能等 2h TTL），真无行维持文档化保留令牌组语义。authz-version-in-token 按核查建议不做（TTL+墓碑+跨部门实时拒已覆盖撤销目标）。已知残留：停用发起人的 decided run 在 TTL 前每轮对账各一条 error 日志（可告警特征，有意保留）。
-- 批次 4：未动工。
+- **批次 4：✅ 已落地（2026-07-17，ontology-p0）**。六项全修 + `tests/test_agent_batch4_fixes.py` 19 项回归（17 项在旧代码上必红）+ batch5 姿态测试就地升级；全量 3876 绿 + lint 绿：
+  1. **P1-09**：`schema/MIGRATION_MANIFEST.tsv` 机器可读单一来源（ci_load_schema.sh / readiness / apply_ontology_dbs 三消费方全部切换，双向一致性钉子在 test_apply_migration_guards）；readiness `_schema_drift_once` 逐库校验 applied 台账（迁移记错库=unapplied 并点名 misplaced；manifest 缺失/split 回退全局并集不误红）；`_AGENT_TABLES` 补 llm_call_log/agent_audit_log；`uk_thread_active` 唯一索引探针入 schema_contract。核查拍板不做：exact DDL hash（脆）、写探针（违 RO 纪律）、强制 strict（记录在案的降级决策）。
+  2. **P1-13**：治理审计同事务——`approval_store.decide` / `run_store.resolve_uncertain_invocation` / `registry_store.set_status` 各加 `audit_writer(cur)` 游标回调（audit.insert_audit_row_tx 单一定义点），审计与主事实同 commit 同回滚；kill switch 原子优先、失败**先关闸回退**（响应带 audit_recorded=false 可告警）；对账处置审计写不进则状态不翻（503 重试）；B6 重驱审计有意维持 fail-open（无主事务可折）。顺手把 approval_store.decide 补上 `_begin` 钉连接（批次1 SteadyDB 面的遗漏）。
+  3. **P1-14**：`RAG_ALLOW_LEGACY_OPEN_PROD=ack:<YYYY-MM-DD>` 当日有效（裸 ack/过期日期拒绝启动，报错给出当日格式；仿 env_guard 惯例）；启用即 critical 日志；readiness `security_posture` 自报（report-only）。三个测试 harness 的裸 ack 默认同步升级为当日格式。
+  4. **P1-10 增量**：多副本守卫在 RAG_AGENT_ENABLE 开时要求 `RAG_AGENT_EVENT_RELAY=redis`（审批帧跨副本丢失=审批黑洞）；downward-API 拓扑感知维持不做（SAE 不暴露副本数）。
+  5. **P1-11**：console session_id-only 分支 thread key 统一 `sid:{user}:{sid}`（幂等——服务端回填复合键回传不叠前缀；他人 `sid:` 前缀 403；缺 sid 直发命名空间新键；钉钉 conv/miniapp 命名空间不动）。存量裸 sid 会话一次性孤儿化（内存 30min 短命+durable 历史按 user_id 过滤，接受）。
+  6. **P1-12**：message_id 随 ctx 进 `create_run` **同事务** INSERT（与 run_id 同款 setattr；旧调用方/桩落 NULL 由既有 set_message_id 兜底，回填保留为兼容幂等 UPDATE）。依赖 agent_run.message_id 列（schema/036，readiness contract 已把它列为 CRITICAL——运行 agent 的环境必然有）。
 
 ## 评审建议中被拒绝/修正的部分（核查结论）
 - "不可绕过的 production profile"（P1-14）：**拒绝**——ack 存在正是因为现网 SAE 包先于 flag 存在，硬断言会 brick 重部署/回滚；改为日期绑定。

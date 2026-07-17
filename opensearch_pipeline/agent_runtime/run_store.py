@@ -131,16 +131,21 @@ class RDSRunStore:
         conn = self._conn()
         try:
             with conn.cursor() as cur:
+                # P1-12（外审核查 2026-07-16）：message_id 随建 run 同事务写入（ctx 携带，
+                # routes 建 ctx 时 setattr）——此前 submit 后才回填 UPDATE，交棒与回填
+                # 之间崩溃留下空 message_id（答案锚点丢失）。无值（旧调用方/桩）落 NULL，
+                # 由既有 set_message_id 回填兜底，语义不变。
                 cur.execute(
                     f"INSERT INTO {db}.agent_run "
                     "(run_id, thread_id, conversation_id, user_id, channel, agent_profile, status, "
-                    " acl_groups_snapshot, model_profile, prompt_version, git_sha, heartbeat_at, started_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,NOW(3),NOW(3))",
+                    " acl_groups_snapshot, model_profile, prompt_version, git_sha, message_id, "
+                    " heartbeat_at, started_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,NOW(3),NOW(3))",
                     (run_id, ctx.thread_id, getattr(ctx, "conversation_id", None), ctx.user_id,
                      ctx.channel, agent_profile,
                      json.dumps(list(ctx.acl_groups), ensure_ascii=False),
                      getattr(ctx, "model_profile", None), getattr(ctx, "prompt_version", None),
-                     getattr(ctx, "git_sha", None)),
+                     getattr(ctx, "git_sha", None), getattr(ctx, "message_id", None)),
                 )
             conn.commit()
             return run_id
@@ -816,14 +821,17 @@ class RDSRunStore:
             conn.close()
 
     def resolve_uncertain_invocation(self, invocation_id: str, *, to_status: str,
-                                     note: str, resolved_by: str) -> bool:
+                                     note: str, resolved_by: str, audit_writer=None) -> bool:
         """人工对账处置：uncertain → succeeded（业务侧核实副作用已生效）/ failed（核实未生效，
-        放行同键重试）。CAS 单向、审计信息进 error_text（[人工对账] 前缀），路由层另记
-        agent_audit_log。"""
+        放行同键重试）。CAS 单向、审计信息进 error_text（[人工对账] 前缀）。
+        P1-13（外审核查 2026-07-16）：agent_audit_log 行经 audit_writer(cur) **同事务**写——
+        此前先改状态后路由 best-effort 补审计，「uncertain→succeeded 已翻、审计缺失」
+        静默发生。审计写失败=整体回滚（状态不翻），处置与审计要么都在、要么都不在。"""
         if to_status not in ("succeeded", "failed"):
             raise ValueError(f"uncertain 只能对账为 succeeded/failed，收到 {to_status!r}")
         db = _op_db()
         conn = self._conn()
+        _begin(conn)                        # 多语句事务（UPDATE+审计 INSERT）：钉住连接
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -831,7 +839,12 @@ class RDSRunStore:
                     "error_text=%s WHERE invocation_id=%s AND status='uncertain'",
                     (to_status, f"[人工对账 by {resolved_by}] {note}"[:500], invocation_id))
                 ok = cur.rowcount == 1
-            conn.commit()
+                if ok and audit_writer is not None:
+                    audit_writer(cur)
+            if ok:
+                conn.commit()
+            else:
+                conn.rollback()
             return ok
         except Exception:
             conn.rollback()

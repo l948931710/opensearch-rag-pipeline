@@ -38,10 +38,26 @@ class TestProdPostureAssertion:
         assert cfg.environment == "production"
 
     def test_legacy_ack_is_transitional_escape(self):
+        """P1-14（外审核查 2026-07-16）：ack 绑当日日期（ack:<YYYY-MM-DD>，午夜过期）。"""
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
         cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
                           RAG_DASHSCOPE_API_KEY="x",
-                          RAG_ALLOW_LEGACY_OPEN_PROD="ack")
+                          RAG_ALLOW_LEGACY_OPEN_PROD=f"ack:{today}")
         assert cfg.environment == "production"
+
+    def test_legacy_bare_ack_rejected(self):
+        """裸 `ack`（旧格式，无期限逃生口）→ 拒绝启动，报错给出当日格式。"""
+        with pytest.raises(ValueError, match="ack:"):
+            _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                        RAG_DASHSCOPE_API_KEY="x", RAG_ALLOW_LEGACY_OPEN_PROD="ack")
+
+    def test_legacy_stale_dated_ack_rejected(self):
+        """过期日期的 ack → 拒绝（每次重启/重部署要求当日重签，缺口不被遗忘）。"""
+        with pytest.raises(ValueError, match="ack:"):
+            _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                        RAG_DASHSCOPE_API_KEY="x",
+                        RAG_ALLOW_LEGACY_OPEN_PROD="ack:2020-01-01")
 
     def test_development_unaffected(self):
         cfg = _fresh_load(RAG_SIMULATE="true", RAG_ALLOW_LEGACY_OPEN_PROD="")
@@ -199,7 +215,9 @@ class TestReadinessBatch5:
         assert st.startswith("missing:") and "agent_run.message_id" in st
 
     def test_schema_contract_ok(self, monkeypatch):
-        r = _wire(monkeypatch, {"information_schema.columns": [(1,)]})
+        # P1-09（外审核查 2026-07-16）后契约含索引探针（information_schema.statistics）
+        r = _wire(monkeypatch, {"information_schema.columns": [(1,)],
+                                "information_schema.statistics": [(1,)]})
         monkeypatch.setenv("RAG_AGENT_ENABLE", "true")
         monkeypatch.setenv("RAG_ONTOLOGY_ENABLE", "true")
         assert r.schema_contract_status() == "ok"
