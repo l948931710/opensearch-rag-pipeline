@@ -14,6 +14,9 @@ from datetime import datetime, timedelta, timezone
 # 🔧 模式开关：默认生产（False）。冒烟测试设环境变量 RAG_NODE_SIMULATE=true。
 #    旧写法硬编码 True，部署忘改 → 整阶段跑 mock 却 exit 0（DataWorks 绿），语料静默停更。
 # ═══════════════════════════════════════════════════════════════
+# ⚠️ 冒烟开关:临时取消下一行注释 = 干跑(全 mock,不碰真实 RDS/OSS/HA3/LLM)。
+# ⚠️ 测完必须重新注释掉,否则每日调度永远跑 mock 且 DataWorks 全绿(语料静默停更事故)!
+# os.environ["RAG_NODE_SIMULATE"] = "true"
 SIMULATE = os.environ.get("RAG_NODE_SIMULATE", "false").strip().lower() in ("true", "1", "yes")
 
 # ═══════════════════════════════════════════════════════════════
@@ -64,25 +67,45 @@ current_dir = os.path.abspath(".")
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# 安装 PDF 提取依赖
-# stage 2 也需要：unified_extractor._pages_needing_ocr 在 page_count<=0 时
-# 走 pypdf→PyPDF2→pdfplumber 三阶 recovery (2026-06-15 fix for RD 61D861)。
-# 如果 stage 1 已生成 page_count=0 的 canonical 残次品, stage 2 重读时仍会进 OCR fallback。
-print("=== 2.5 安装 PDF 提取依赖（pdfplumber + pypdf）===")
+# 安装依赖（按运行时 Python 版本选择；2026-07-17 发现 serverless 资源组执行器 = py3.7）
+# py3.7 陷阱: pypdf 5.0.0 / python-docx 1.1.2 元数据谎报兼容实则要求 3.8+ → 必须钉真兼容版
+# （钉版集经 linux/cp37 全依赖解析 + 节点冒烟实证）。镜像恢复 3.8+ 后自动走现代分支。
+print("=== 2.5 安装依赖（Python %d.%d 运行时）===" % sys.version_info[:2])
 import subprocess
+if sys.version_info >= (3, 8):
+    _DEPS = [
+        "PyMySQL", "DBUtils", "oss2", "requests",
+        "pdfplumber", "pypdf>=4.0", "PyMuPDF",
+        "python-docx", "openpyxl", "python-pptx>=0.6",
+        "jieba", "Pillow",
+    ]
+else:
+    _DEPS = [
+        "PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2", "requests==2.31.0",
+        "typing_extensions",
+        "pypdf==3.17.4", "pdfplumber==0.9.0", "PyMuPDF==1.22.5",
+        "python-docx==1.1.0", "openpyxl==3.1.3", "python-pptx==0.6.23",
+        "jieba", "Pillow==9.5.0",
+    ]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install",
-    "--force-reinstall", "--no-cache-dir", "-q",
-    "pdfplumber", "pypdf>=4.0",
+    "--force-reinstall", "--no-cache-dir", "-q", *_DEPS,
 ])
 
+# 强校验：装完必须能 import, 否则 fail-fast (避免再次重蹈 RD 61D861 / pptx 静默坑)
 try:
     import pypdf
     import pdfplumber
-    print(f"✅ pypdf={pypdf.__version__}  pdfplumber={pdfplumber.__version__}")
+    import pptx as _pptx_check  # noqa: F401  (python-pptx)
+    import docx as _docx_check  # noqa: F401  (python-docx)
+    import openpyxl as _xlsx_check  # noqa: F401
+    import pymysql as _db_check  # noqa: F401
+    import oss2 as _oss_check  # noqa: F401
+    print(f"✅ pypdf={pypdf.__version__}  pdfplumber={pdfplumber.__version__}  pptx/docx/openpyxl/pymysql/oss2 OK")
 except ImportError as e:
     raise RuntimeError(
-        f"❌ PDF 依赖安装后仍无法 import: {e}. sys.path={sys.path}."
+        f"❌ 依赖安装后仍无法 import: {e}. "
+        f"sys.path={sys.path}. 检查 DataWorks 资源组 Python env."
     ) from e
 
 # ═══════════════════════════════════════════════════════════════
