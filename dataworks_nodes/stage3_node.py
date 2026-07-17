@@ -12,14 +12,22 @@ import subprocess
 import zipfile
 from datetime import datetime, timedelta, timezone
 
-# ═══════════════════════════════════════════════════════════════
-# 📦 安装 Stage 3 依赖
-# ═══════════════════════════════════════════════════════════════
-DEPS = [
-    "PyMySQL", "DBUtils", "oss2", "requests",
-    "alibabacloud_ha3engine_vector",
-    "pdfplumber", "pypdf",
-]
+# 📦 安装 Stage 3 依赖（按运行时 Python 版本选择；2026-07-17 发现 serverless 执行器 = py3.7）
+# py3.7 陷阱: pypdf 5.0.0 元数据谎报支持 3.7 实则用 typing.Protocol(3.8+) → 必须钉真兼容版。
+# 镜像恢复 3.8+ 后自动走现代分支，本段无需再改。
+if sys.version_info >= (3, 8):
+    DEPS = [
+        "PyMySQL", "DBUtils", "oss2", "requests",
+        "alibabacloud_ha3engine_vector",
+        "pdfplumber", "pypdf",
+    ]
+else:
+    DEPS = [
+        "PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2", "requests==2.31.0",
+        "alibabacloud_ha3engine_vector",
+        "typing_extensions",
+        "pypdf==3.17.4", "pdfplumber==0.9.0", "Pillow==9.5.0",
+    ]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install",
     *DEPS, "-t", "/tmp/pydeps", "-q"
@@ -31,6 +39,9 @@ if "/tmp/pydeps" not in sys.path:
 # 🔧 模式开关：默认生产（False）。冒烟测试设环境变量 RAG_NODE_SIMULATE=true。
 #    旧写法硬编码 True，部署忘改 → 整阶段跑 mock 却 exit 0（DataWorks 绿），语料静默停更。
 # ═══════════════════════════════════════════════════════════════
+# ⚠️ 冒烟开关:临时取消下一行注释 = 干跑(全 mock,不碰真实 RDS/OSS/HA3/LLM)。
+# ⚠️ 测完必须重新注释掉,否则每日调度永远跑 mock 且 DataWorks 全绿(语料静默停更事故)!
+# os.environ["RAG_NODE_SIMULATE"] = "true"
 SIMULATE = os.environ.get("RAG_NODE_SIMULATE", "false").strip().lower() in ("true", "1", "yes")
 
 # ═══════════════════════════════════════════════════════════════
