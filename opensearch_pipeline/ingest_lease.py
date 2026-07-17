@@ -110,9 +110,19 @@ def takeover_where_sql(alias: str = "") -> str:
 
 # ── 租约集（每次 DAG/stage 运行一个，挂 ctx）────────────────────────────────
 
+_NOOP_LEASE_SET = None  # off 臂共享空实例——不写入 ctx（零足迹；见 get_lease_set）
+
+
 def get_lease_set(ctx: dict) -> "LeaseSet":
+    """flag off：返回模块级空实例且**不写 ctx**——off 臂对 ctx 零足迹（测试/工具对
+    ctx 做 deepcopy 不受影响）。flag on：ctx 内单例（dag.run 浅拷贝共享同一对象）。"""
+    global _NOOP_LEASE_SET
+    if not lease_enabled():
+        if _NOOP_LEASE_SET is None:
+            _NOOP_LEASE_SET = LeaseSet()
+        return _NOOP_LEASE_SET
     ls = ctx.get("ingest_lease_set")
-    if ls is None:
+    if not isinstance(ls, LeaseSet):
         ls = LeaseSet()
         ctx["ingest_lease_set"] = ls
     return ls
@@ -126,6 +136,14 @@ class LeaseSet:
         self._epochs = {}       # type: Dict[DocVersionKey, int]
         self._last_renew = {}   # type: Dict[DocVersionKey, float]
         self._last_renew_all = 0.0
+
+    def __deepcopy__(self, memo):
+        # 进程域资源句柄（内含线程锁，代表「本进程当前持有的租约」）：ctx 被 deepcopy
+        # 时共享同一实例——复制一份「持有中的锁」无意义且 threading.Lock 不可 pickle。
+        return self
+
+    def __copy__(self):
+        return self
 
     # -- 注册 --------------------------------------------------------------
     def fetch_and_register(self, cursor, keys: Iterable[DocVersionKey]) -> int:
