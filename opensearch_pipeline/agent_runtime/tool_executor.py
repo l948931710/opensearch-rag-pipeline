@@ -11,6 +11,9 @@ tool_executor.py — 工具执行中间件栈（v2 报告 §4⑥/§9.3 模块 I�
 **有副作用的工具超时不再谎报 failed**（副作用可能已发生）——invocation 落 **uncertain**，
 同幂等键的自动重试被阻断，走人工对账（/api/agent/invocations）后方可重发；进程崩溃留下的
 stale executing 行由 reaper（mark_stale_invocations_uncertain）收进同一对账通道。
+P1-03（外审核查 2026-07-16）把该语义扩到**任何耗尽的异常**（普通异常 ≠ 确定未生效），
+并禁掉副作用工具的 in-loop 自动重试；P1-02 过渡加固补 per-tool 并发舱壁
+（RAG_AGENT_TOOL_MAX_CONCURRENCY，默认 4）+ 池大小可配（RAG_AGENT_TOOL_TIMEOUT_POOL_SIZE）。
 HIGH_WRITE 迁独立 durable worker（lease+outbox）是重评报告 PR-3 的范围，不在本层。
 
 audit 中间件（agent_audit_log）已挂：ALLOW 执行前写一条合规审计（write-ahead）——HIGH_WRITE
@@ -48,12 +51,22 @@ _TIMEOUT_POOL: Optional[ThreadPoolExecutor] = None
 _POOL_LOCK = threading.Lock()
 
 
+def _timeout_pool_size() -> int:
+    """P1-02 过渡加固（外审核查 2026-07-16）：共享超时池大小可配（此前硬编码 8）。"""
+    try:
+        n = int(os.environ.get("RAG_AGENT_TOOL_TIMEOUT_POOL_SIZE", "8") or 8)
+    except ValueError:
+        n = 8
+    return max(1, n)
+
+
 def _get_timeout_pool() -> ThreadPoolExecutor:
     global _TIMEOUT_POOL
     if _TIMEOUT_POOL is None:
         with _POOL_LOCK:
             if _TIMEOUT_POOL is None:
-                _TIMEOUT_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool-timeout")
+                _TIMEOUT_POOL = ThreadPoolExecutor(
+                    max_workers=_timeout_pool_size(), thread_name_prefix="tool-timeout")
     return _TIMEOUT_POOL
 
 
@@ -196,6 +209,11 @@ class _ToolBreaker:
             self._open_until[name] = time.monotonic() + self._cd
 
 
+class _BulkheadFull(RuntimeError):
+    """per-tool 并发舱壁满（P1-02 过渡加固）：拒绝发生在提交执行**之前**——确定无副作用，
+    按普通 failed 收口（可立即重试），绝不进 uncertain 对账通道。"""
+
+
 class ToolExecutor:
     """执行中间件栈 + tool_invocation 落库。ALLOW 裁决后由 adjudicator 调 execute。"""
 
@@ -203,6 +221,25 @@ class ToolExecutor:
         self._store = run_store
         self._breaker = breaker or _ToolBreaker()
         self._audit = audit or NULL_AUDIT           # 未注入=无操作（既有测试/降级零副作用）
+        # P1-02 过渡加固（外审核查 2026-07-16）：per-tool 并发舱壁——共享超时池没有配额时
+        # 单个慢挂工具即可蚕食整池（熔断只按失败计数，慢而不败不触发），后续无关工具排队
+        # 后一起超时。配额在 future **真正完成**时才释放（挂死线程持续占用本工具配额，
+        # 这正是舱壁语义：最多吃掉本工具的额度，绝不外溢）。HIGH_WRITE 迁独立 durable
+        # worker 仍是 PR-3 的活，本层只做进程内隔离。
+        self._tool_sems: Dict[str, threading.Semaphore] = {}
+        self._sems_lock = threading.Lock()
+
+    def _tool_sem(self, name: str) -> threading.Semaphore:
+        with self._sems_lock:
+            sem = self._tool_sems.get(name)
+            if sem is None:
+                try:
+                    quota = int(os.environ.get("RAG_AGENT_TOOL_MAX_CONCURRENCY", "4") or 4)
+                except ValueError:
+                    quota = 4
+                sem = threading.Semaphore(max(1, quota))
+                self._tool_sems[name] = sem
+            return sem
 
     def execute(self, ctx, tool: EnterpriseTool, args: Dict[str, Any], *,
                 run_id: str, step_no: int, policy_decision: str, policy_id: str,
@@ -248,7 +285,12 @@ class ToolExecutor:
                     "拒绝复用回执，按内容派生新键执行",
                     spec.name, idempotency_key, hit["args_digest"], digest(args))
                 idempotency_key = f"{idempotency_key}:a{digest(args)[:16]}"
-                hit = None
+                # P1-04（外审核查 2026-07-16）：派生键也要查 succeeded——碰撞过的调用被
+                # **真重放**时，此前直落 INSERT 撞 uk_tool_idem 转「同幂等键并发执行冲突」
+                # 误导模型（回执其实就在库里）。派生键内嵌参数摘要，命中即同参重放。
+                hit = self._store.find_succeeded_invocation(spec.name, idempotency_key)
+                if hit and hit.get("args_digest") and hit["args_digest"] != digest(args):
+                    hit = None                      # 派生键仍不同参（理论角落）：走残行裁决
             if hit:
                 logger.info("工具 %s 幂等命中，复用回执", spec.name)
                 receipt = json.loads(hit["receipt_json"]) if hit.get("receipt_json") else None
@@ -257,7 +299,22 @@ class ToolExecutor:
                 text = "（幂等命中）该操作此前已成功执行，本次未重复执行。"
                 if receipt:
                     text += f" 回执: {json.dumps(receipt, ensure_ascii=False)}"
-                return ToolResult.ok(content=[ContentBlock.of_text(text)], receipt=receipt)
+                result = ToolResult.ok(content=[ContentBlock.of_text(text)], receipt=receipt)
+                # P1-04（外审核查 2026-07-16）：命中路径是机读回执唯一被渲染进模型可见
+                # 文本的地方，此前零后处理——首执时模型只见义务处理过的 content、从不见
+                # 回执原文，命中却把回执未掩码原样入文（义务一旦挂上即成旁路）。收口：
+                # ① 回执过**当前** output_schema（版本漂移的旧回执拒绝复用，宁停不错；
+                #    无回执的历史行不适用，跳过）；
+                # ② 统一走当前决策的 obligations（apply-on-hit：策略收紧后回放按新姿态
+                #    处理，绝不固化写入时姿态）。
+                if receipt is not None and self._validate_output(spec, result):
+                    logger.warning(
+                        "工具 %s 幂等回执不符当前 output_schema（键=%s，疑似版本漂移）——"
+                        "拒绝复用，交人工核对", spec.name, idempotency_key)
+                    return ToolResult.fail(
+                        f"工具 {spec.name} 幂等回执与当前输出契约不符（工具版本漂移？），"
+                        "拒绝复用——请人工核对后处置")
+                return self._apply_obligations_safe(obligations, result)
             # 1b. P0-E 状态机护栏：uk_tool_idem 下同键 ≤1 行——任何非 succeeded 残行都会让
             # 直接 INSERT 撞 IntegrityError（=「stale 行阻塞重试且无对账」的根）。按残行状态裁决：
             finder = getattr(self._store, "find_invocation_by_key", None)
@@ -341,6 +398,8 @@ class ToolExecutor:
         last_exc: Optional[Exception] = None
         result: Optional[ToolResult] = None
         timed_out = False
+        bulkhead_full = False
+        has_side_effects = spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY
         for i in range(attempts):
             try:
                 result = self._run_with_timeout(tool, ctx, args, idempotency_key, spec.timeout_s)
@@ -350,10 +409,17 @@ class ToolExecutor:
                 timed_out = True
                 self._breaker.record_fail(spec.name)
                 break                                  # 超时不重试（线程仍挂，重试雪上加霜）
+            except _BulkheadFull as e:
+                last_exc = e
+                bulkhead_full = True
+                break                                  # 满载不是工具故障：不计熔断不重试
             except Exception as e:                     # noqa: BLE001
                 last_exc = e
                 self._breaker.record_fail(spec.name)
-                if i < attempts - 1 and _is_retryable(e):
+                # P1-03（外审核查 2026-07-16）：副作用工具禁 in-loop 自动重试——"可重试"
+                # 白名单（connection reset/timeout 类）恰是「下游可能已提交、响应阶段抛」
+                # 的经典形态，in-loop 立刻重放与同键回收重试同罪（重复副作用）。
+                if i < attempts - 1 and _is_retryable(e) and not has_side_effects:
                     logger.warning("工具 %s 可重试错误，重试 %d/%d: %s", spec.name, i + 1, attempts - 1, e)
                     continue
                 break
@@ -371,7 +437,6 @@ class ToolExecutor:
             if result.status == "succeeded":
                 schema_err = self._validate_output(spec, result)
                 if schema_err:
-                    has_side_effects = spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY
                     st = "uncertain" if has_side_effects else "failed"
                     self._finish(inv_id, status=st,
                                  error_text=f"output schema 违约: {schema_err}"[:500])
@@ -379,19 +444,9 @@ class ToolExecutor:
                         return ToolResult.fail(
                             f"工具 {spec.name} 输出不符合契约且副作用可能已发生（已标记待对账）")
                     return ToolResult.fail(f"工具 {spec.name} 输出不符合契约: {schema_err}")
-                # 义务后处理（limit_rows/mask_output）：预检已保证全部有执行器；执行器异常
-                # fail-closed——内容扣留（绝不把未兑现义务的原文放给模型），回执保留供对账。
-                if obligations:
-                    try:
-                        for ob in obligations:
-                            name, _, param = ob.partition(":")
-                            result = _OBLIGATION_HANDLERS[name](param, result)
-                    except Exception as e:   # noqa: BLE001
-                        logger.error("义务执行失败（输出扣留）：%s", obligations, exc_info=True)
-                        result = ToolResult(
-                            status=result.status,
-                            content=[ContentBlock.of_text("[策略义务执行失败，输出已扣留]")],
-                            receipt=result.receipt, error=f"obligation-error: {e}"[:200])
+                # 义务后处理（limit_rows/mask_output）：见 _apply_obligations_safe——
+                # 与幂等命中路径共用同一强制点（P1-04）。
+                result = self._apply_obligations_safe(obligations, result)
             st = "succeeded" if result.status == "succeeded" else "failed"
             self._finish(
                 inv_id, status=st,
@@ -400,14 +455,24 @@ class ToolExecutor:
                 error_text=result.error)
             return result
         err = (str(last_exc)[:500] if last_exc else "unknown")
+        if bulkhead_full:
+            # 舱壁拒绝发生在提交执行之前——确定无副作用，普通 failed（可立即重试），
+            # 绝不进 uncertain 对账通道。
+            self._finish(inv_id, status="failed", error_text=err)
+            return ToolResult.fail(err)
         # P0-E：有副作用的工具超时 → **uncertain**（副作用可能已发生，failed 是谎报——
-        # 下游会盲目重试造成重复副作用）。uncertain 阻断同键自动重试，走人工对账。
-        if timed_out and (spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY):
-            self._finish(inv_id, status="uncertain",
-                         error_text=f"超时 {spec.timeout_s}s（线程无法中止，副作用不可知）")
+        # 下游会盲目重试造成重复副作用）。P1-03（外审核查 2026-07-16）扩面：**任何**耗尽
+        # 的异常同收 uncertain——普通异常 ≠ 确定未生效（requests.ReadTimeout/connection
+        # reset 等正是「下游已提交、响应读取阶段抛」的经典形态，且不是 FuturesTimeout）。
+        # uncertain 阻断同键自动重试，走人工对账。工具的**预边界失败**（参数校验等）应以
+        # ToolResult.fail 表达（唯一写工具的全部预提交路径已如此），不受本收口影响。
+        if has_side_effects:
+            reason = (f"超时 {spec.timeout_s}s（线程无法中止，副作用不可知）" if timed_out
+                      else f"执行异常且副作用不可知: {err}"[:500])
+            self._finish(inv_id, status="uncertain", error_text=reason)
             return ToolResult.fail(
-                f"工具 {spec.name} 执行超时且结果不确定（副作用可能已发生）——"
-                "已标记待对账，请勿假定失败后重试")
+                f"工具 {spec.name} 执行{'超时' if timed_out else '异常'}且结果不确定"
+                "（副作用可能已发生）——已标记待对账，请勿假定失败后重试")
         self._finish(inv_id, status="failed", error_text=err)
         return ToolResult.fail(f"工具执行失败: {err}")
 
@@ -447,6 +512,25 @@ class ToolExecutor:
             logger.warning("读工具审计异步写失败（fail-open）", exc_info=True)
 
     @staticmethod
+    def _apply_obligations_safe(obligations: Tuple[str, ...], result: ToolResult) -> ToolResult:
+        """义务后处理（limit_rows/mask_output）：预检已保证全部有执行器；执行器异常
+        fail-closed——内容扣留（绝不把未兑现义务的原文放给模型），回执保留供对账。
+        首执成功路径与幂等命中路径共用本强制点（P1-04 apply-on-hit）。"""
+        if not obligations:
+            return result
+        try:
+            for ob in obligations:
+                name, _, param = ob.partition(":")
+                result = _OBLIGATION_HANDLERS[name](param, result)
+            return result
+        except Exception as e:   # noqa: BLE001
+            logger.error("义务执行失败（输出扣留）：%s", obligations, exc_info=True)
+            return ToolResult(
+                status=result.status,
+                content=[ContentBlock.of_text("[策略义务执行失败，输出已扣留]")],
+                receipt=result.receipt, error=f"obligation-error: {e}"[:200])
+
+    @staticmethod
     def _validate_output(spec, result: ToolResult) -> Optional[str]:
         """成功结果的 receipt 过 output_schema（宽 schema 如 {"type":"object"} 自然全过）。
         返回违约信息或 None。校验器自身异常 fail-open（契约校验的基础设施故障不该杀掉
@@ -464,7 +548,27 @@ class ToolExecutor:
             return None
 
     def _run_with_timeout(self, tool, ctx, args, idempotency_key, timeout_s):
-        fut = _get_timeout_pool().submit(tool.run, ctx, args, idempotency_key)
+        # P1-02 舱壁：拿不到本工具配额即 fail-fast（绝不排队——排队等待会被算进调用超时，
+        # 而队列堆积正是共享池被蚕食的形态）。
+        sem = self._tool_sem(tool.spec.name)
+        if not sem.acquire(blocking=False):
+            raise _BulkheadFull(
+                f"工具 {tool.spec.name} 并发额度已满（舱壁保护共享线程池），请稍后重试")
+        released = threading.Event()
+
+        def _release_once(_fut=None):
+            if not released.is_set():          # submit 失败与 done 回调互斥，无并发竞争
+                released.set()
+                sem.release()
+
+        try:
+            fut = _get_timeout_pool().submit(tool.run, ctx, args, idempotency_key)
+        except Exception:
+            _release_once()
+            raise
+        # 配额随 future **真正完成**释放（含排队被 cancel）：超时返回调用方后，挂死线程
+        # 仍占本工具配额直到自身 socket 超时兜底——这正是舱壁要的占用语义。
+        fut.add_done_callback(_release_once)
         try:
             return fut.result(timeout=timeout_s)       # 超时抛 FuturesTimeout
         except FuturesTimeout:

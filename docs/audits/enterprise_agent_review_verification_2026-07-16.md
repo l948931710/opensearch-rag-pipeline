@@ -77,7 +77,11 @@
   3. P0-04 的 CAS 改回裸 `transition`：DB 异常 ≠ CAS False，异常时立即回边 resuming→suspended（撤回无决定行子场景 B6 无从收敛，不能钉死 resuming 等 reaper）；
   4. 消歧读对 running 有界重试（3 次/~1s）收窄「commit 慢收尾被误判失败」残窗；两处 mutation 缺口补 spy 帧观测断言。
   遗留不修（评级 nit/pre-existing，已记录）：`_put_local` 挤位与消费者的极窄竞态窗（durable 轮询兜底）；submit 异常与驱动器的双 `_release`（预先存在，负计数仅放宽上限，随 PR-3 一并收）。
-- 批次 2/3/4：未动工。
+- **批次 2：✅ 已落地（2026-07-16，ontology-p0）**。三项全修 + `tests/test_agent_tool_executor_batch2.py` 13 项回归（8 项在旧代码上必红，5 项为不变语义守卫）；全量 3837 绿 + lint 绿：
+  1. **P1-03**：副作用工具**任何**耗尽异常收 uncertain（不只 timeout/schema 违约——requests.ReadTimeout/connection reset 正是「下游已提交、响应阶段抛」形态），并禁 in-loop 自动重试（核查发现的加码项：可重试白名单恰与已提交形态重合）；`ToolResult.fail` 维持 failed（工具作者预边界声明，有意不变）。
+  2. **P1-04**：幂等命中 apply-on-hit——回执渲染进模型可见文本前过当前决策 obligations（策略收紧后回放按新姿态，不固化写入时姿态）+ 当前 output_schema 复验（版本漂移拒绝复用并告警；无回执历史行跳过不误伤）；派生键真重放复用回执（不再误报「同幂等键并发执行冲突」）；义务强制点抽 `_apply_obligations_safe` 两路共用。
+  3. **P1-02 过渡**：per-tool 并发舱壁（`RAG_AGENT_TOOL_MAX_CONCURRENCY` 默认 4，满则 fail-fast=确定无副作用绝不进对账；配额随 future 真正完成才释放——挂死线程持续占本工具配额不外溢）+ 超时池大小可配（`RAG_AGENT_TOOL_TIMEOUT_POOL_SIZE` 默认 8）。durable worker 全量迁移维持 PR-3。
+- 批次 3/4：未动工。
 
 ## 评审建议中被拒绝/修正的部分（核查结论）
 - "不可绕过的 production profile"（P1-14）：**拒绝**——ack 存在正是因为现网 SAE 包先于 flag 存在，硬断言会 brick 重部署/回滚；改为日期绑定。
