@@ -57,10 +57,16 @@ DEPT_MAP = {
     "raw/hr/": "HR",
     "raw/it/": "IT",
     "raw/production/": "PRODUCTION",
-    "raw/production_thermoforming/": "PRODUCTION",
-    "raw/production_injection/": "PRODUCTION",
-    "raw/production_papercup/": "PRODUCTION",
-    "raw/production_paper_cup/": "PRODUCTION",  # OSS 实际目录拼写（带下划线），与上行双拼写并存
+    # ── production 家族：子线目录 → 子线值（2026-07-17 落地「增量分流」拍板）──
+    # owner_dept 永不归一到伞值；读侧由 production 伞形白名单展开放行（retriever）。
+    # 未来新子线目录（吹膜/纸箱/纸浆等）无需加映射：resolve_dept fallback 取第二级
+    # 目录名即得子线值；此处显式列出仅为双拼写归一与可读性。
+    "raw/production_mold/": "PRODUCTION_MOLD",
+    "raw/production_thermoforming/": "PRODUCTION_THERMOFORMING",
+    "raw/production_injection/": "PRODUCTION_INJECTION",
+    "raw/production_straw/": "PRODUCTION_STRAW",
+    "raw/production_paper_cup/": "PRODUCTION_PAPER_CUP",
+    "raw/production_papercup/": "PRODUCTION_PAPER_CUP",  # OSS 双拼写目录归一到规范子线值
     "raw/marketing/": "MARKETING",
     "raw/pmc/": "PMC",
     "raw/rd/": "RD",
