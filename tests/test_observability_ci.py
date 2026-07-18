@@ -235,3 +235,87 @@ def test_eval2_strict_fails_on_manifest_drift_error():
     assert any("manifest_drift" in f for f in fails)
     # no drift → no failure
     assert _strict_failures({}, {"l4": {"ingestion": {"deterministic": {"errors": []}}}}) == []
+
+# ── 批次7（ultra api:593）：/api/ready 探针 TTL 缓存 + single-flight ─────────────
+
+
+def test_api_ready_probe_cache_serves_within_ttl(monkeypatch):
+    """TTL>0 时窗口内重复命中不再真打 RDS/HA3——匿名洪泛的真实探针成本≤每 TTL 一组。"""
+    import opensearch_pipeline.retriever as rt
+    from fastapi.testclient import TestClient
+    from opensearch_pipeline import api as api_mod
+    from opensearch_pipeline.api import app
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(rt, "_get_ha3_client", lambda: "MOCK_HA3_CLIENT")
+    monkeypatch.setenv("RAG_READY_CACHE_TTL_S", "30")
+    api_mod._READY_CACHE.update({"t": 0.0, "body": None, "ok": True})
+    probes = {"n": 0}
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a):
+            probes["n"] += 1
+
+        def fetchone(self):
+            return (1,)
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: _Conn())
+    r1 = TestClient(app).get("/api/ready")
+    r2 = TestClient(app).get("/api/ready")
+    assert r1.status_code == r2.status_code == 200
+    assert probes["n"] == 1, "TTL 窗口内第二次命中必须走缓存（零真实 RDS 探针）"
+    assert r1.json() == r2.json()
+
+
+def test_api_ready_probe_cache_disabled_by_zero_ttl(monkeypatch):
+    """TTL=0 恢复逐请求真探（旧行为逃生口；测试套件默认即此态）。"""
+    import opensearch_pipeline.retriever as rt
+    from fastapi.testclient import TestClient
+    from opensearch_pipeline import api as api_mod
+    from opensearch_pipeline.api import app
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(rt, "_get_ha3_client", lambda: "MOCK_HA3_CLIENT")
+    monkeypatch.setenv("RAG_READY_CACHE_TTL_S", "0")
+    api_mod._READY_CACHE.update({"t": 0.0, "body": None, "ok": True})
+    probes = {"n": 0}
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a):
+            probes["n"] += 1
+
+        def fetchone(self):
+            return (1,)
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: _Conn())
+    TestClient(app).get("/api/ready")
+    TestClient(app).get("/api/ready")
+    assert probes["n"] == 2

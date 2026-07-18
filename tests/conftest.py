@@ -187,3 +187,17 @@ def pytest_collection_modifyitems(config, items):
         base = _os.path.basename(mod)
         group = "local-db-stack" if base in _LOCAL_STACK_SERIAL_MODULES else mod
         item.add_marker(pytest.mark.xdist_group(group))
+
+
+@pytest.fixture(autouse=True)
+def _reset_ready_probe_cache():
+    """批次7（ultra api:593）：/api/ready 探针结果进程级 TTL 缓存——非 sim 的 readiness
+    测试各自 monkeypatch 探针并断言当次结果，缓存跨测试残留会串台。仅在 api 已导入时
+    重置（sys.modules 探测，零 import 成本）。"""
+    import os as _os
+    import sys as _sys
+    _os.environ.setdefault("RAG_READY_CACHE_TTL_S", "0")   # 套件默认关缓存（专项测试显式覆盖）
+    _mod = _sys.modules.get("opensearch_pipeline.api")
+    if _mod is not None and hasattr(_mod, "_READY_CACHE"):
+        _mod._READY_CACHE.update({"t": 0.0, "body": None, "ok": True})
+    yield

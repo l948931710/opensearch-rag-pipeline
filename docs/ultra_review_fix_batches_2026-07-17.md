@@ -106,11 +106,20 @@
 ## 批次7 — 服务/配置/告警 P2
 | 状态 | 条目 | 位置 | 修法 |
 |---|---|---|---|
-| ⬜ | P2 send_ops_alert 只看 HTTP 200,errcode 失败静默丢告警 | `alerting.py:73` | 解析 body,errcode!=0 记 error 返 False |
-| ⬜ | P2 /api/ready 无认证无限流却每次打真 RDS+HA3 | `api.py:593` | 探针结果短 TTL 缓存(single-flight)±aux IP 限流 |
-| ⬜ | P2 环境标签开放集+大小写归一不一致,未知标签跳过全部交叉校验 | `config.py:632` | load_config 归一(strip+lower)一次,未知标签 fail-fast |
-| ⬜ | P2 maxcached=5 vs maxconnections=20,TLS 后重连抖动放大 | `db.py:195` | maxcached 对齐上限(或随 RAG_DB_POOL_MAX 暴露) |
-| ⬜ | P2 is_stream_active 报线程活性非 WSS 连通,重连窗丢点击 | `dingtalk_stream_runner.py:140` | 用 SDK 连接回调置/清 active 标志 |
+| ✅ | P2 send_ops_alert 只看 HTTP 200,errcode 失败静默丢告警 | `alerting.py:73` | 解析 body,errcode!=0 记 error 返 False |
+| ✅ | P2 /api/ready 无认证无限流却每次打真 RDS+HA3 | `api.py:593` | 探针结果短 TTL 缓存(single-flight)±aux IP 限流 |
+| ✅ | P2 环境标签开放集+大小写归一不一致,未知标签跳过全部交叉校验 | `config.py:632` | load_config 归一(strip+lower)一次,未知标签 fail-fast |
+| ✅ | P2 maxcached=5 vs maxconnections=20,TLS 后重连抖动放大 | `db.py:195` | maxcached 对齐上限(或随 RAG_DB_POOL_MAX 暴露) |
+| ✅ | P2 is_stream_active 报线程活性非 WSS 连通,重连窗丢点击 | `dingtalk_stream_runner.py:140` | 用 SDK 连接回调置/清 active 标志 |
+
+**批次7 落地记录(2026-07-17)**,as-built 与修法的差异及关键决策:
+- **alerting errcode**:2xx 也读 body 解析 errcode(310000 签名不符/关键词过滤、130101 机器人限流)——errcode!=0 记 ERROR 返 False;**body 非 JSON 保守按已送达**(旧行为,不新增误报面);失败也进 dedup 窗(坏 webhook 不被告警风暴反复打)。
+- **/api/ready 缓存**:探针主体抽成 `_compute_readiness`,端点加 **TTL 缓存(RAG_READY_CACHE_TTL_S 默认 5s,0=关)+ threading.Lock single-flight**——洪泛真实探针成本≤每 TTL 一组。**刻意不套 aux 限流**(修法的 ± 部分):LB/SAE 探针源地址未知,误 429 探针=健康实例自摘,缓存已消化洪泛成本。测试套件 conftest 默认 TTL=0+每测重置缓存态(非 sim readiness 测试常单测内两连调断言不同状态);生产默认 5s 不受影响。
+- **环境标签闭集**:`_normalize_environment`(strip+lower+闭集 {development,local,staging,test,production,空})在 load_config 单点归一,未知标签 EnvironmentMismatchError fail-fast(**simulate 也拦**——配置错误必须立刻可见);'Production' 从「过 prod 交叉校验却跳过全部生产姿态守卫」变为规范化后全守卫生效。validator 内自 lower 保留(直构 config 的测试路径仍稳)。
+- **db maxcached**:新 `_pool_max_cached`(默认=池上限,RAG_DB_POOL_MAXCACHED 显式收小逃生口;≤0/非法回默认);dbutils cache() 的空闲帽硬 close 不再让 >5 并发振荡逐请求重付 TCP+认证+TLS 握手;陈旧 docstring("maxcached=5 不变")同步更正。
+- **is_stream_active**:未采审计建议的「SDK 连接回调」——装机 dingtalk-stream SDK **无 on-connect/on-disconnect 回调面**;改探 `client.websocket`(SDK 在 WSS 建连后才赋值、断线残留已关闭对象):None(首连未成)/closed(旧版属性)/close_code 非 None(新版)都判不活 → 卡片回退 HTTP 回调(保守方向:宁走 HTTP 不丢点击);SDK 内部形态变化探不出属性 → 按不活处理(同保守向)。runner 假件补 websocket 形态。
+
+每批验证:新回归 13 条(alerting 3+ready 缓存 2+config 3+db 3+runner 断线窗 2)+1 既有假件补形态;`make test` 全量+`make lint` 绿(2026-07-17)。未验证声明:真实钉钉机器人 errcode 形态(按官方文档 310000/130101)、真实 LB 探针在 5s 缓存下的摘除时延(最坏多 5s 发现降级,可调)、真实 WSS 断线窗的 websocket 属性行为(按装机 SDK 源码 self.websocket 赋值点推证)。生效面:全部无 flag、随 SAE 重打包生效;行为变化需知——①未知 RAG_ENVIRONMENT 标签从静默跳校验改为**拒绝启动**(现网三值 development/staging/production 均合法不受影响);②/ready 摘除发现时延最坏+5s;③重连窗内新发卡片将走 HTTP 回调(点击不再丢,但需 HTTP 回调端点保持注册——现网本就双模)。
 
 ## 批次8 — 前端/小程序/schema/CI/测试门(续跑新增 P2)
 | 状态 | 条目 | 位置 | 修法 |

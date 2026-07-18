@@ -67,3 +67,23 @@ def test_get_db_conn_killswitch_no_begin(monkeypatch):
                         lambda conn, host: guarded)
     db._get_db_conn()
     assert guarded.begins == 0
+
+
+# ── 批次7（ultra db:195）：空闲连接帽对齐池上限 ────────────────────────────────
+
+
+def test_pool_max_cached_defaults_to_pool_max(monkeypatch):
+    """默认=池上限——旧帽 5 让 >5 并发振荡时归还连接被硬 close，每个超额请求重付
+    TCP+认证+TLS 握手（P0-02 开 RDS TLS 后抖动放大）。"""
+    monkeypatch.delenv("RAG_DB_POOL_MAXCACHED", raising=False)
+    assert db._pool_max_cached(20) == 20
+    assert db._pool_max_cached(32) == 32
+
+
+def test_pool_max_cached_env_override_and_fallback(monkeypatch):
+    monkeypatch.setenv("RAG_DB_POOL_MAXCACHED", "6")
+    assert db._pool_max_cached(20) == 6          # 显式收小（逃生口）
+    monkeypatch.setenv("RAG_DB_POOL_MAXCACHED", "0")
+    assert db._pool_max_cached(20) == 20         # ≤0 回默认
+    monkeypatch.setenv("RAG_DB_POOL_MAXCACHED", "abc")
+    assert db._pool_max_cached(20) == 20         # 非法值回默认

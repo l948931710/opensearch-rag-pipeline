@@ -40,11 +40,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 运行态：守护线程 + "已进入运行循环"标记。
+# 运行态：守护线程 + "已进入运行循环"标记 + 客户端引用（真实 WSS 连通探针用）。
 # is_stream_active() 被 dingtalk_card 用来决定卡片 callbackType（STREAM/HTTP）——
 # 客户端没起来时卡片必须回退 HTTP 回调，否则反馈按钮点击丢失。
 _thread: Optional[threading.Thread] = None
 _running = threading.Event()
+_client = None   # dingtalk_stream.DingTalkStreamClient（start_stream_client 内赋值）
 
 
 def stream_mode_enabled() -> bool:
@@ -53,8 +54,24 @@ def stream_mode_enabled() -> bool:
 
 
 def is_stream_active() -> bool:
-    """Stream 客户端线程是否在运行（供卡片 callbackType 路由判断）。"""
-    return _running.is_set() and _thread is not None and _thread.is_alive()
+    """Stream 通道是否**真实连通**（供卡片 callbackType 路由判断）。
+
+    批次7（ultra dingtalk_stream_runner:140）：此前只看线程活性——_running 在
+    start_forever 建立 WSS **之前**就已置位，且 start_forever 内部 3s 退避重连的
+    断线窗里线程照样存活：这些窗口里按 STREAM 发出的卡片，按钮点击会静默丢失
+    （_assemble_delivery_payload 自己的注释警告过）。SDK 的 client.websocket 在
+    连接建立后才赋值（断线后残留已关闭对象）——据此探真实连通：
+    websocket 为 None（首连未成）或已关闭（重连窗）都判不活 → 卡片回退 HTTP 回调
+    （保守方向：宁走 HTTP 也不丢点击）。SDK 内部形态变化时探不出属性 → 按不活处理。"""
+    if not (_running.is_set() and _thread is not None and _thread.is_alive()):
+        return False
+    ws = getattr(_client, "websocket", None) if _client is not None else None
+    if ws is None:
+        return False                       # 尚未完成首次 WSS 建连（或 SDK 形态变化）
+    closed = getattr(ws, "closed", None)   # websockets 旧版属性
+    if closed is not None:
+        return not bool(closed)
+    return getattr(ws, "close_code", None) is None   # 新版：close_code 非 None=已关
 
 
 def start_stream_client() -> bool:
@@ -65,7 +82,7 @@ def start_stream_client() -> bool:
         False —— 未启动（开关关闭 / 凭证缺失 / SDK 未安装），服务继续以
                  HTTP 回调模式工作，不影响其余功能。
     """
-    global _thread
+    global _thread, _client
 
     if not stream_mode_enabled():
         logger.debug("DINGTALK_STREAM_MODE 未开启，跳过 Stream 客户端启动")
@@ -129,6 +146,7 @@ def start_stream_client() -> bool:
 
     credential = dingtalk_stream.Credential(client_id, client_secret)
     client = dingtalk_stream.DingTalkStreamClient(credential)
+    _client = client   # 批次7：暴露给 is_stream_active 做真实 WSS 连通探针
     client.register_callback_handler(
         dingtalk_stream.ChatbotMessage.TOPIC, _BotMessageHandler()
     )

@@ -167,7 +167,9 @@ def _pool_max_connections() -> int:
     背景：固定 10 时（blocking=True 无超时），serving 侧看板类长查询 + AnyIO 线程池（默认 120 令牌）
     并发 >10 即让其余请求无限期静默等连接（『问答莫名卡住』尾延迟，无日志线索）；摄取侧
     classify 并发（默认 8）逼近上限后，调大 RAG_CLASSIFY_CONCURRENCY 会被池上限静默串行化。
-    20 只是上限不是常驻——mincached=2/maxcached=5 不变，空闲连接照旧回收，RDS 侧成本≈0。"""
+    20 只是上限不是常驻——mincached=2 不变；maxcached 批次7 起默认对齐池上限
+    （见 _pool_max_cached：此前 5 的空闲帽让 >5 并发振荡时归还连接被硬 close，
+    每个超额请求付整套 TCP+认证+TLS 握手），空闲连接的 RDS 侧成本仍≈0（内存级）。"""
     try:
         classify_conc = int(os.environ.get("RAG_CLASSIFY_CONCURRENCY", "8") or 8)
     except ValueError:
@@ -182,6 +184,19 @@ def _pool_max_connections() -> int:
         print(f"    ⚠️ [Pool] RAG_CLASSIFY_CONCURRENCY={classify_conc} > 池上限 {maxconn}——"
               f"blocking=True 下超出部分将串行等连接，调参无效果；请同步调大 RAG_DB_POOL_MAX。")
     return maxconn
+
+
+def _pool_max_cached(max_conn: int) -> int:
+    """空闲连接帽（批次7，ultra db:195）：默认对齐池上限。dbutils PooledDB.cache() 在空闲数
+    已达 maxcached 时对归还连接直接 close——并发在旧帽 5 以上振荡时，每个超额请求都重付
+    整套 TCP+MySQL 认证握手（P0-02 开 RDS TLS 后再加一次 TLS 握手），serving 热路径重连
+    抖动放大。空闲连接的 RDS 侧成本≈0（内存级），缓存到上限是纯收益。
+    RAG_DB_POOL_MAXCACHED 可显式收小（逃生口；≤0/非法值回默认）。"""
+    try:
+        v = int(os.environ.get("RAG_DB_POOL_MAXCACHED", "") or max_conn)
+        return v if v > 0 else max_conn
+    except ValueError:
+        return max_conn
 
 
 def _init_db_pool():
@@ -219,13 +234,14 @@ def _init_db_pool():
     pool_readonly = _pool_readonly_declared(full_cfg)
 
     _max_conn = _pool_max_connections()
+    _max_cached = _pool_max_cached(_max_conn)
     # P1-07：timeout>0 时以 blocking=False 建池，由 _acquire_pool_connection 做「有上限的等待」；
     # ≤0 恢复旧的 blocking=True 无限等待（逃生口）。
     _blocking = _db_acquire_timeout() <= 0
     pool_kwargs = dict(
         creator=pymysql,
         mincached=2,           # 池中保持的最小空闲连接数
-        maxcached=5,           # 池中保持的最大空闲连接数
+        maxcached=_max_cached,  # 空闲帽默认=池上限（批次7，见 _pool_max_cached）
         maxconnections=_max_conn,  # 池上限（perf#13/#14 可配+联动，见 _pool_max_connections）
         blocking=_blocking,    # P1-07：默认 False（有超时轮询）；RAG_DB_ACQUIRE_TIMEOUT≤0 恢复无限阻塞
         ping=1,                # 每次取连接时 ping 一次，自动重连 (应对 MySQL wait_timeout)

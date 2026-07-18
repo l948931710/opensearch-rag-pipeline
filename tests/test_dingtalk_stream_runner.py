@@ -38,12 +38,16 @@ class _FakeClient:
         # （perf F#48 并行化后暴露；放宽上限只影响慢路径余量，不拖慢正常用例）。
         self.started = threading.Event()
         self.release = threading.Event()
+        # 批次7：真实 SDK 在 WSS 建连后才赋值 websocket（is_stream_active 据此探连通）；
+        # 假件模拟"已连接"形态，断线窗用例自行改写本属性。
+        self.websocket = None
         _FakeClient.instances.append(self)
 
     def register_callback_handler(self, topic, handler):
         self.handlers[topic] = handler
 
     def start_forever(self):
+        self.websocket = types.SimpleNamespace(closed=False)   # 模拟 WSS 建连成功
         self.started.set()
         self.release.wait(timeout=10)
 
@@ -264,3 +268,36 @@ class TestCardCallbackType:
         payload = self._assemble(monkeypatch, enabled=False, active=False)
         assert payload["callbackType"] == "HTTP"
         assert payload["callbackRouteKey"] == "rag_feedback_callback"
+
+
+class TestStreamActiveProbesRealConnection:
+    """批次7（ultra dingtalk_stream_runner:140）：is_stream_active 探真实 WSS 连通——
+    线程活着 ≠ 连接活着（首连前/3s 退避重连窗按 STREAM 发卡=按钮点击静默丢失）。"""
+
+    def test_inactive_before_first_wss_established(self, monkeypatch, fake_sdk):
+        _enable(monkeypatch)
+        # 首连未成形态：start_forever 不赋 websocket
+        class _NeverConnect(_FakeClient):
+            def start_forever(self):
+                self.started.set()          # 线程已进循环但 WSS 未建立
+                self.release.wait(timeout=10)
+
+        monkeypatch.setattr(fake_sdk, "DingTalkStreamClient", _NeverConnect)
+        assert runner.start_stream_client() is True
+        client = _NeverConnect.instances[-1]
+        assert client.started.wait(timeout=30)
+        assert runner.is_stream_active() is False, \
+            "WSS 未建连（websocket=None）必须判不活 → 卡片回退 HTTP 回调"
+
+    def test_inactive_during_reconnect_window(self, monkeypatch, fake_sdk):
+        _enable(monkeypatch)
+        assert runner.start_stream_client() is True
+        client = _FakeClient.instances[-1]
+        assert client.started.wait(timeout=30)
+        assert runner.is_stream_active() is True            # 已连
+        client.websocket.closed = True                      # 断线：旧属性形态
+        assert runner.is_stream_active() is False
+        client.websocket = types.SimpleNamespace(close_code=None)   # 重连成功：新属性形态
+        assert runner.is_stream_active() is True
+        client.websocket = types.SimpleNamespace(close_code=1006)   # 再断（异常关闭码）
+        assert runner.is_stream_active() is False
