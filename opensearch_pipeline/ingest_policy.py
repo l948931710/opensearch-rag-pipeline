@@ -65,6 +65,21 @@ def stage1_ext_exclusion_sql() -> str:
     return "(" + ", ".join(f"'{e}'" for e in STAGE1_SQL_EXCLUDED_EXTS) + ")"
 
 
+# raw_key 中的隔离暂存段标记（scanner 的 Python 过滤与下方 SQL 谓词共用语义）。
+STAGE1_QUARANTINE_KEY_MARKER = "_quarantine/"
+
+
+def stage1_quarantine_like_pattern() -> str:
+    """stage-1 SQL 排除隔离暂存行的 LIKE 参数（批次5，ultra dataworks_orchestrator:661）。
+
+    scanner 此前只在 Python 侧过滤 `_quarantine/` 行（SQL 照选照占 LIMIT 名额），而
+    drain 计数把它们算进 pending —— 只剩隔离行时计数恒 >0、认领批过滤后零产出 →
+    「无进展」守卫误杀 stage-1（同上方 ext 清单的镜像纪律：认领 SELECT 与计数 SQL
+    必须共用本模式）。'_' 在 LIKE 里是单字符通配，用反斜杠转义成字面下划线
+    （MySQL 默认转义符；参数化传值，pymysql 会正确转义反斜杠本身）。"""
+    return "%\\_quarantine/%"
+
+
 def should_ingest_raw_key(key: str) -> Tuple[bool, str]:
     """raw/ 对象是否应纳入摄取。
 

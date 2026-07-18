@@ -87,11 +87,20 @@
 ## 批次5 — 摄取/编排 P2 同族
 | 状态 | 条目 | 位置 | 修法 |
 |---|---|---|---|
-| ⬜ | P2 DAG-3 失败回滚无 lease 栅栏且不清租约列 | `dataworks_orchestrator.py:587` | 回滚 WHERE 加 fence_where_sql,SET 加 clear_set_sql |
-| ⬜ | P2 分类成功路径落库无 lease 栅栏 | `pipeline_nodes.py:1878` | CONTENT_CLASSIFIED/冻结维护/贡献三路径补 fenced-write |
-| ⬜ | P2 HA3 delete 把真 SDK 2xx 当成功不解析 per-doc 错误 | `pipeline_nodes.py:6690` | 对齐 _push_chunks_to_ha3 的 str body 解析;幂等匹配收紧到精确码 |
-| ⬜ | P2 parity 失败后 dv 卡 PROCESSING 2 小时 | `pipeline_nodes.py:7544` | raise 前同事务 CAS PROCESSING→FAILED+清租约 |
-| ⬜ | P3 stage-1 no-progress 计数含 _quarantine 行误中止 | `dataworks_orchestrator.py:661` | drain 计数排除 scanner 不认领的行 |
+| ✅ | P2 DAG-3 失败回滚无 lease 栅栏且不清租约列 | `dataworks_orchestrator.py:587` | 回滚 WHERE 加 fence_where_sql,SET 加 clear_set_sql |
+| ✅ | P2 分类成功路径落库无 lease 栅栏 | `pipeline_nodes.py:1878` | CONTENT_CLASSIFIED/冻结维护/贡献三路径补 fenced-write |
+| ✅ | P2 HA3 delete 把真 SDK 2xx 当成功不解析 per-doc 错误 | `pipeline_nodes.py:6690` | 对齐 _push_chunks_to_ha3 的 str body 解析;幂等匹配收紧到精确码 |
+| ✅ | P2 parity 失败后 dv 卡 PROCESSING 2 小时 | `pipeline_nodes.py:7544` | raise 前同事务 CAS PROCESSING→FAILED+清租约 |
+| ✅ | P3 stage-1 no-progress 计数含 _quarantine 行误中止 | `dataworks_orchestrator.py:661` | drain 计数排除 scanner 不认领的行 |
+
+**批次5 落地记录(2026-07-17)**,as-built 与修法的差异及关键决策:
+- **DAG-3 回滚**:epoch 栅栏+clear_set_sql 逐字对齐节点内 FAILED 路径;**节点内已判 LeaseLost 的 key(epoch 已丢弃)整个跳过**——文档归新持有者收敛,绝不无栅栏覆盖其在跑 PROCESSING 锁。LeaseSet 经 result_ctx 取(dag.run 浅拷贝共享对象,与 preempted 集同源)。flag off 时栅栏/清列均空串=字节级旧 SQL。
+- **分类三路径 fenced-write**:**dv 先写带栅栏并 check_fenced_write,过验才写 document_meta**(同事务;此前 meta 先写,栅栏挡不住 meta 分道扬镳)。LeaseLost ⇒ **弃单文档继续批**(return False→failed_doc_ids→canonicals 剔除,PR-4 语义),不 abort 节点;LeaseLost 显式 except 置于泛 except **之前**(LeaseLost 是 RuntimeError 子类,否则会被成功路径的 DB-error re-raise 误吞成整节点 abort)。冻结维护/贡献 FAQ 两路径同款。
+- **HA3 delete 2xx 解析**:对齐 push 侧(str body→json.loads,失败保守按无 doc 级错误);doc 级错误**逐条**判幂等——精确码 DocumentNotFound/7504 或该条 message 含 not_found/no_op,其余 raise 交调用方失败路径(FAILED CAS+旧版本排 PENDING_DELETE)。**非 2xx 分支(仅 mock/sim 可达)的宽底 combined_msg 扫描有意保留**——既有测试钉住其语义,真实 SDK 永不走它;收紧只做在真正的生产可达面(2xx per-doc)。
+- **parity dv CAS**:受影响 (doc_id,version_no) 去重后同事务 CAS PROCESSING→FAILED+清租约;CAS miss(已 FAILED/PENDING_DELETE)合法故**不 check_fenced_write**;**不 discard** epoch——随后 orchestrator 回滚对同 key 的栅栏 CAS 因行已离开 PROCESSING 安静 no-op(discard 反而触发误导性 skip 日志)。
+- **stage-1 隔离行**:谓词收进 ingest_policy 单一来源(`stage1_quarantine_like_pattern`,'\_' 转义——LIKE 里 '_' 是单字符通配),scanner 认领 SELECT 与 `_count_pending_rows(1)` 同步启用(计数↔认领镜像纪律);顺带修隔离行占 LIMIT 100 名额的队头挤占。`process_quarantine=True` 未来通道保留(SQL 谓词随之关闭,Python 过滤同门)。
+
+每批验证:新回归 12 条(HA3 2xx 解析 4+新文件 test_batch5_ingest_fences.py 8:谓词/scanner/计数/回滚源检/classify 栅栏×2/parity CAS);`make test` 全量+`make lint` 绿(2026-07-17)。未验证声明:真实 HA3 SDK 的 2xx body 形态(按 _push_chunks_to_ha3 的 96 例实测形态对齐)、真实 RDS 上 NOT LIKE 转义行为(标准 MySQL 8 语义)、真实 TTL 接管窗口的栅栏竞态(PR-4 故障注入族已覆盖同机制)。生效前置:lease 相关三项仅 RAG_INGEST_LEASE_ENABLE=on 时改变行为(off=字节级现状);HA3 解析与 stage-1 计数无 flag、随下一次 DataWorks 包部署生效。
 
 ## 批次6 — 抽取/多模态 P2
 | 状态 | 条目 | 位置 | 修法 |

@@ -436,3 +436,39 @@ class TestHA3DeleteIdempotency:
         # RuntimeError 可能被包装，检查任何 RuntimeError
         with pytest.raises(RuntimeError, match="deactivate old chunks"):
             node_deactivate_old_chunks(ctx)
+
+
+class TestB5HA3Delete2xxBodyParsing:
+    """批次5（ultra pipeline_nodes:6690）：真实 SDK 响应无 status_code（恒兜底 2xx），
+    doc 级拒绝藏在 2xx 的 str body errors 里——必须解析并对非幂等错误 raise，
+    否则被拒删除计成功 → 旧版本以旧 ACL 永久留在 HA3 且无 PENDING_DELETE 对账。"""
+
+    def _call(self, body):
+        from types import SimpleNamespace
+
+        from opensearch_pipeline.config import get_config
+        from opensearch_pipeline.pipeline_nodes import _ha3_push_delete_request
+        resp = SimpleNamespace(body=body)          # 真实 SDK 形态：无 status_code/text
+        client = SimpleNamespace(push_documents=lambda t, pk, req: resp)
+        _ha3_push_delete_request(client, get_config(), [101, 102])
+
+    def test_2xx_str_body_hard_doc_error_raises(self):
+        import pytest
+        with pytest.raises(RuntimeError, match="2xx body"):
+            self._call('{"errors": [{"code": "PERMISSION_DENIED", "message": "write blocked"}]}')
+
+    def test_2xx_str_body_idempotent_errors_pass(self):
+        # 精确码 + 逐条 message 幂等指示：删除目标本就不存在 = 成功
+        self._call('{"errors": [{"code": "DocumentNotFound", "message": "pk 101 absent"},'
+                   ' {"code": "E", "message": "doc not_found in segment"}]}')
+
+    def test_2xx_unparseable_or_clean_body_passes(self):
+        self._call("OK")                                       # 非 JSON：保守按无 doc 级错误
+        self._call('{"errors": []}')                           # 空 errors
+        self._call('{"result": "done"}')                       # 无 errors 键
+
+    def test_2xx_mixed_errors_still_raises(self):
+        import pytest
+        with pytest.raises(RuntimeError, match="rejected 1/2"):
+            self._call('{"errors": [{"code": "DocumentNotFound", "message": "gone"},'
+                       ' {"code": "QUOTA", "message": "table write quota exceeded"}]}')

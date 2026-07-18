@@ -579,14 +579,29 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                 print(f"[Orchestrator] DAG 3 failed. Rolling back PROCESSING locks for {len(preempted)} doc versions...")
                 try:
                     from opensearch_pipeline.pipeline_nodes import _get_db_conn
+                    # 批次5（ultra P2 orchestrator:587）：回滚补 PR-4 租约纪律——此前
+                    # WHERE 只 CAS PROCESSING：本 run 停滞超 TTL 被接管后，回滚会把新持有
+                    # 者的在跑 PROCESSING 锁改写成 FAILED（文档被第三个 run 中途再认领）；
+                    # 良性路径也留下 lease 列残留在 FAILED 行上（破坏「租约列非空⇔有人自认
+                    # 在跑」不变量，正是 takeover 残留租约地雷的孵化源）。修法与节点内
+                    # FAILED 路径同款：epoch 栅栏 + clear_set_sql；节点内已判 LeaseLost 的
+                    # key（epoch 已丢弃）直接跳过——文档归新持有者收敛。LeaseSet 在 dag.run
+                    # 的内部 ctx 副本里（对象共享，经 result_ctx 取）。flag off 时栅栏/清列
+                    # 均为空串 = 字节级旧 SQL。
+                    _rls = ingest_lease.get_lease_set(result_ctx)
                     conn_rb = _get_db_conn(select_db=True)
                     with conn_rb.cursor() as cursor:
                         for doc_id, ver in preempted:
+                            _rk = (doc_id, int(ver))
+                            if ingest_lease.lease_enabled() and _rls.epoch(_rk) is None:
+                                print(f"[Orchestrator]   ├─ skip rollback {doc_id} v{ver} "
+                                      f"(lease already lost — owned by new holder)")
+                                continue
                             cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = '{DocVersionIndexStatus.FAILED}'
-                                WHERE doc_id = %s AND version_no = %s AND index_status = '{DocVersionIndexStatus.PROCESSING}'
-                            """, (doc_id, ver))
+                                SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
+                                WHERE doc_id = %s AND version_no = %s AND index_status = '{DocVersionIndexStatus.PROCESSING}'{_rls.fence_where_sql(_rk)}
+                            """, (doc_id, ver) + _rls.fence_where_params(_rk))
                         conn_rb.commit()
                 except Exception as e:
                     if 'conn_rb' in locals() and conn_rb:
@@ -649,29 +664,33 @@ def _count_pending_rows(stage: int) -> int:
       Stage 1: NOT_STARTED & canonical_json_key IS NULL
                & file_ext ∉ ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（与认领 SQL 同一常量；
                不一致 = 计数器看得到、认领挑不走 → 无进展守卫永久判死 stage-1）& active
+               & raw_key 不含 `_quarantine/`（批次5：scanner 从不处理隔离暂存行——
+               此前计数含它们，只剩隔离行时 remaining 恒 >0 → 无进展守卫误杀 stage-1）
       Stage 2: (NOT_STARTED 或 FAILED&retry_count<3) & active & canonical_json_key IS NOT NULL
       Stage 3: chunk_meta NOT_INDEXED/FAILED & is_active & (dv 非 PROCESSING 或 已过 2h 失效锁)
     """
-    from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
+    from opensearch_pipeline.ingest_policy import (
+        stage1_ext_exclusion_sql, stage1_quarantine_like_pattern)
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
 
     queries = {
-        1: f"""
+        1: (f"""
             SELECT COUNT(*) FROM document_version
             WHERE content_process_status = 'NOT_STARTED'
               AND canonical_json_key IS NULL
               AND file_ext NOT IN {stage1_ext_exclusion_sql()}
+              AND raw_key NOT LIKE %s
               AND status = 'active'
-        """,
-        2: """
+        """, (stage1_quarantine_like_pattern(),)),
+        2: ("""
             SELECT COUNT(*) FROM document_version
             WHERE (content_process_status = 'NOT_STARTED'
                    OR (content_process_status = 'FAILED' AND retry_count < 3))
               AND status = 'active'
               AND canonical_json_key IS NOT NULL
               AND (publish_status IS NULL OR publish_status != 'QUARANTINED')
-        """,
-        3: f"""
+        """, ()),
+        3: (f"""
             SELECT COUNT(*) FROM chunk_meta cm
             JOIN document_version dv
               ON cm.doc_id = dv.doc_id AND cm.version_no = dv.version_no
@@ -679,13 +698,14 @@ def _count_pending_rows(stage: int) -> int:
               AND cm.is_active = 1
               AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
                    OR {ingest_lease.takeover_where_sql("dv.")})
-        """,
+        """, ()),
     }
     conn = None
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cur:
-            cur.execute(queries[stage])
+            _sql, _params = queries[stage]
+            cur.execute(_sql, _params)
             return int(cur.fetchone()[0])
     finally:
         if conn:

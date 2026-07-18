@@ -125,13 +125,22 @@ def node_scan_raw_files(ctx: dict):
             tasks = []
             conn = None
             try:
-                from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
+                from opensearch_pipeline.ingest_policy import (
+                    stage1_ext_exclusion_sql, stage1_quarantine_like_pattern)
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
                     # 查询未开始内容处理的所有活跃文档版本，并关联 document_meta 获取文件名和部门。
                     # 扩展名排除片段来自 ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（单一来源）——
                     # 必须与 dataworks_orchestrator._count_pending_rows 的 stage-1 计数完全一致，
                     # 否则排空守卫会因"计得到却领不走"误判 stage-1 无进展而中止。
+                    # 批次5（ultra P3 orchestrator:661）：`_quarantine/` 行改在 SQL 侧排除
+                    # （同一单一来源谓词，计数侧同步）——此前只靠下方 Python 过滤：隔离行
+                    # 照选照占 LIMIT 100 名额（混批时真实行被队头挤占、纯隔离批零产出），
+                    # 计数器又算它 pending → 无进展守卫误杀。process_quarantine=True 的
+                    # 未来通道保留（SQL 谓词随之关闭，Python 过滤同门）。
+                    _pq_on = ctx.get("process_quarantine", False)
+                    _q_pred = "" if _pq_on else "AND dv.raw_key NOT LIKE %s\n                          "
+                    _q_params = () if _pq_on else (stage1_quarantine_like_pattern(),)
                     cursor.execute(f"""
                         SELECT
                             dv.doc_id,
@@ -146,10 +155,10 @@ def node_scan_raw_files(ctx: dict):
                         WHERE dv.content_process_status = 'NOT_STARTED'
                           AND dv.canonical_json_key IS NULL
                           AND dv.file_ext NOT IN {stage1_ext_exclusion_sql()}
-                          AND dv.status = 'active'
+                          {_q_pred}AND dv.status = 'active'
                         ORDER BY dv.created_at ASC
                         LIMIT 100
-                    """)
+                    """, _q_params)
                     rows = cursor.fetchall()
                     for row in rows:
                         tasks.append({
@@ -1826,15 +1835,26 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     _cm = _get_db_conn(select_db=True)
                     with _cm.cursor() as _cur:
+                        # 批次5：冻结维护路径同补 fenced-write（dv 先写带栅栏，见成功路径注释）
+                        _fk = (doc["doc_id"], doc["version_no"])
+                        _ffs = ingest_lease.get_lease_set(ctx)
+                        _cur.execute(
+                            "UPDATE document_version SET classification_method='FROZEN_MAINTENANCE', "
+                            "classification_status='CONTENT_CLASSIFIED' WHERE doc_id=%s AND version_no=%s"
+                            + _ffs.fence_where_sql(_fk),
+                            (doc["doc_id"], doc["version_no"]) + _ffs.fence_where_params(_fk))
+                        _ffs.check_fenced_write(_cur, _fk)
                         _cur.execute(
                             "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s "
                             "WHERE doc_id=%s",
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]))
-                        _cur.execute(
-                            "UPDATE document_version SET classification_method='FROZEN_MAINTENANCE', "
-                            "classification_status='CONTENT_CLASSIFIED' WHERE doc_id=%s AND version_no=%s",
-                            (doc["doc_id"], doc["version_no"]))
                         _cm.commit()
+                except ingest_lease.LeaseLost:
+                    try: _cm.rollback()
+                    except Exception: pass
+                    print(f"    ⚠️ Lease lost on {doc['doc_id']} v{doc['version_no']} — "
+                          f"frozen classification persist skipped (preempted)")
+                    return False
                 finally:
                     if _cm:
                         _cm.close()
@@ -1858,17 +1878,27 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     _cm = _get_db_conn(select_db=True)
                     with _cm.cursor() as _cur:
+                        # 批次5：贡献 FAQ 路径同补 fenced-write（dv 先写带栅栏，见成功路径注释）
+                        _bk = (doc["doc_id"], doc["version_no"])
+                        _bfs = ingest_lease.get_lease_set(ctx)
+                        _cur.execute(
+                            "UPDATE document_version SET classification_method='CONTRIBUTION_FAQ', "
+                            "faq_eligible=1, classification_status='CONTENT_CLASSIFIED' "
+                            "WHERE doc_id=%s AND version_no=%s" + _bfs.fence_where_sql(_bk),
+                            (doc["doc_id"], doc["version_no"]) + _bfs.fence_where_params(_bk))
+                        _bfs.check_fenced_write(_cur, _bk)
                         _cur.execute(
                             "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s, "
                             "permission_level=%s, kb_type=%s WHERE doc_id=%s",
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"],
                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
-                        _cur.execute(
-                            "UPDATE document_version SET classification_method='CONTRIBUTION_FAQ', "
-                            "faq_eligible=1, classification_status='CONTENT_CLASSIFIED' "
-                            "WHERE doc_id=%s AND version_no=%s",
-                            (doc["doc_id"], doc["version_no"]))
                         _cm.commit()
+                except ingest_lease.LeaseLost:
+                    try: _cm.rollback()
+                    except Exception: pass
+                    print(f"    ⚠️ Lease lost on {doc['doc_id']} v{doc['version_no']} — "
+                          f"contribution classification persist skipped (preempted)")
+                    return False
                 finally:
                     if _cm:
                         _cm.close()
@@ -2031,6 +2061,27 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     conn = _get_db_conn(select_db=True)
                     with conn.cursor() as cursor:
+                        # 批次5（ultra pipeline_nodes:1878）：成功路径也走 fenced-write——
+                        # 此前只有 FAILED 终态带栅栏，TTL 接管后停滞僵尸的迟到分类照样
+                        # last-writer-wins 落库，document_meta 的 category/permission 与新持有
+                        # 者实际切块入索引的 chunk 集分道扬镳（LLM 分类 run-to-run 非确定，
+                        # 79-vs-47 家族翻面的同类）。**dv 先写带栅栏并验**，通过才动
+                        # document_meta（同事务）；LeaseLost ⇒ 弃单文档继续批（PR-4 语义）。
+                        # flag off 时栅栏为空串 = 字节级旧行为。
+                        _ck = (doc["doc_id"], doc["version_no"])
+                        _cfs = ingest_lease.get_lease_set(ctx)
+                        cursor.execute(f"""
+                            UPDATE document_version
+                            SET classification_method = 'LLM',
+                                classification_confidence = %s,
+                                risk_level = %s,
+                                faq_eligible = %s,
+                                classification_status = 'CONTENT_CLASSIFIED'
+                            WHERE doc_id = %s AND version_no = %s{_cfs.fence_where_sql(_ck)}
+                        """, (confidence, doc["llm_risk_level"], doc["faq_eligible"],
+                              doc["doc_id"], doc["version_no"]) + _cfs.fence_where_params(_ck))
+                        _cfs.check_fenced_write(cursor, _ck)
+
                         cursor.execute("""
                             UPDATE document_meta
                             SET category_l1 = %s,
@@ -2042,17 +2093,14 @@ def node_classify_and_risk_assess(ctx: dict):
                             WHERE doc_id = %s
                         """, (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
                               doc["permission_level"], doc["kb_type"], doc["doc_id"]))
-
-                        cursor.execute("""
-                            UPDATE document_version
-                            SET classification_method = 'LLM',
-                                classification_confidence = %s,
-                                risk_level = %s,
-                                faq_eligible = %s,
-                                classification_status = 'CONTENT_CLASSIFIED'
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (confidence, doc["llm_risk_level"], doc["faq_eligible"], doc["doc_id"], doc["version_no"]))
                         conn.commit()
+                except ingest_lease.LeaseLost:
+                    if conn:
+                        try: conn.rollback()
+                        except Exception: pass
+                    print(f"    ⚠️ Lease lost on {doc['doc_id']} v{doc['version_no']} — "
+                          f"classification persist skipped (preempted; doc abandoned this run)")
+                    return False   # 弃单文档继续批（归新持有者），不 abort 节点
                 except Exception as db_err:
                     if conn: conn.rollback()
                     print(f"    ⚠️ Failed to persist metadata to RDS: {db_err}")
@@ -5836,6 +5884,15 @@ def _ha3_push_delete_request(client, config, chunk_ids: list) -> None:
 
     _search_delete_old_chunks（逐 doc）与 node_deactivate_old_chunks 的跨 doc 合并批
     （E#45）共用，防两份幂等判定漂移。幂等：not_found/no_op 视为成功。失败抛异常。
+
+    批次5（ultra pipeline_nodes:6690）：真实 SDK 的 PushDocumentsResponse **没有
+    status_code**（getattr 恒兜底 200），doc 级拒绝藏在 2xx 的 str body errors 里——
+    与 _push_chunks_to_ha3 同一课（96 例静默丢失）。此前 2xx 直接放行不读 body：
+    被拒的删除计成功 → chunk_meta 翻 is_active=0/DELETED、dv 落 SUCCESS，旧版本
+    以旧 permission 永久留在 HA3 且无 PENDING_DELETE 对账。现在 2xx 也解析 body：
+    doc 级错误中仅幂等类（精确码 DocumentNotFound/7504，或该条目 message 含
+    not_found/no_op——**逐条**匹配，不再对整个 body 做宽底扫描）放行，其余 raise
+    交调用方失败路径（FAILED CAS + 旧版本排 PENDING_DELETE）。
     """
     from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
     cfg = config.alibaba_vector
@@ -5849,6 +5906,32 @@ def _ha3_push_delete_request(client, config, chunk_ids: list) -> None:
     combined_msg = (body_msg + " | " + text_msg).lower()
 
     is_success = (200 <= status_code < 300)
+    if is_success:
+        _raw_body = getattr(resp, 'body', None)
+        if isinstance(_raw_body, str) and _raw_body.strip():
+            try:
+                _raw_body = json.loads(_raw_body)
+            except (ValueError, TypeError):
+                _raw_body = None    # 解析失败保守按无 doc 级错误（与 push 侧同姿态）
+        if isinstance(_raw_body, dict):
+            _errs = _raw_body.get("errors", [])
+            if isinstance(_errs, list) and _errs:
+                _idempotent_tokens = ("not_found", "not found", "no_op", "no-op")
+                _hard = []
+                for _e in _errs:
+                    if not isinstance(_e, dict):
+                        _hard.append(str(_e)[:120])
+                        continue
+                    _code = str(_e.get("code", ""))
+                    _emsg = str(_e.get("message", ""))
+                    if _code in ("DocumentNotFound", "7504") or any(
+                            t in _emsg.lower() for t in _idempotent_tokens):
+                        continue    # 幂等：删除目标本就不存在
+                    _hard.append(f"code={_code} msg={_emsg[:120]}")
+                if _hard:
+                    raise RuntimeError(
+                        f"HA3 pushDocuments delete rejected {len(_hard)}/{len(_errs)} doc(s) "
+                        f"inside a 2xx body: " + " ; ".join(_hard[:5]))
     if not is_success:
         try:
             if hasattr(resp, "json") and callable(resp.json):
@@ -7687,6 +7770,30 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
                     if c.chunk_id in set(_dead):
                         c.index_status = ChunkIndexStatus.DEAD
             _mark_docs_needs_review_for_dead(cursor, _all_dead)
+            # 批次5（ultra pipeline_nodes:7544）：同事务把受影响 dv 从 PROCESSING CAS 回
+            # FAILED + 清租约——此前只写 chunk_meta 就 raise，dv 卡 PROCESSING：stage-3
+            # loader 排除 PROCESSING 行、acquire 只认 NOT_INDEXED/FAILED，刚标 FAILED 的
+            # chunk 要等 2h 失效锁接管（或租约 TTL）才能重选，与 7320 注释宣称的「下轮
+            # 重选」不符。CAS on PROCESSING 保住控制台 PENDING_DELETE 握手（对齐
+            # deactivate 失败路径/7340 语义）；epoch 栅栏防覆盖新持有者（已判 LeaseLost
+            # 的 key 跳过，归新持有者收敛）。flag off 时栅栏/清列为空串=纯 CAS。
+            _pls = ingest_lease.get_lease_set(ctx)
+            _dv_keys = sorted({(c.doc_id, int(c.version_no))
+                               for chunks, _cd, _m in buckets for c in chunks})
+            for _dk in _dv_keys:
+                if ingest_lease.lease_enabled() and _pls.epoch(_dk) is None:
+                    print(f"    ⚠️ parity: lease lost on {_dk[0]} v{_dk[1]} — "
+                          f"dv FAILED rollback skipped (owned by new holder)")
+                    continue
+                cursor.execute(f"""
+                    UPDATE document_version
+                    SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
+                    WHERE doc_id = %s AND version_no = %s
+                      AND index_status = '{DocVersionIndexStatus.PROCESSING}'{_pls.fence_where_sql(_dk)}
+                """, (_dk[0], _dk[1]) + _pls.fence_where_params(_dk))
+                # 刻意不 check_fenced_write：CAS miss（行已 FAILED/PENDING_DELETE）是
+                # 合法情形；也不 discard——随后的 orchestrator 回滚对同 key 的栅栏 CAS
+                # 会因行已离开 PROCESSING 安静 no-op。
         conn.commit()
     except Exception:
         if conn:
