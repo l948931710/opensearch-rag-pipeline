@@ -162,3 +162,30 @@ def test_resolve_stale_employee_api_failure_falls_back_to_cache(monkeypatch):
     expected = di._normalize_dept_to_codes("行政部")
     out = di._resolve_user_dept("U1")
     assert out == expected, "API 失败应退回旧缓存组，不丢已知部门"
+
+
+# ══ 第三部分：外部星号防投毒（2026-07-17 ultra P2）══
+def test_resolve_drops_external_star_dept(monkeypatch):
+    """钉钉侧恰好命名为 "*" 的部门不再撞全组哨兵——授权组不展开（fail-closed 仅 public），
+    且缓存写入的 dept_code 绝不含 "*"（防投毒后续读侧按缓存行契约展开为全量白名单）。"""
+    conn = _FakeConn(cache_row=None)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
+                        lambda sid: {"user_name": "u", "dept_name": "*", "is_partial": False})
+    out = di._resolve_user_dept("U-STAR")
+    assert out == [], "外部 '*' 绝不展开为全量组"
+    for sql, params in conn.calls:
+        if "INSERT INTO" in sql and "user_role" in sql:
+            assert "*" not in (params[2] or ""), "dept_code 缓存位不得写入外部 '*'"
+
+
+def test_resolve_star_mixed_with_real_depts_keeps_real_only(monkeypatch):
+    """CSV 混入 "*"（如 '行政部,*'）→ 星号项按未知丢弃，真实部门照常归组并缓存。"""
+    conn = _FakeConn(cache_row=None)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
+                        lambda sid: {"user_name": "u", "dept_name": "行政部,*", "is_partial": False})
+    out = di._resolve_user_dept("U-STAR2")
+    assert out == ["admin"]
+    ins = [p for s, p in conn.calls if "INSERT INTO" in s and "user_role" in s]
+    assert ins and ins[0][2] == "行政部", "缓存净值：星号项被剥离"

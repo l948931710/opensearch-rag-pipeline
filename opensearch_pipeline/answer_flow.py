@@ -247,6 +247,14 @@ def history_answer_text(answer_text: str) -> str:
         return answer_text   # fail-open：清洗失败不阻塞入史
 
 
+def _clip(value: Optional[str], limit: int) -> Optional[str]:
+    """审计标识列防御性截断（2026-07-17 ultra P1）：qa_session_log 各 VARCHAR 列在 MySQL
+    strict（RDS 默认）下超长直接 1406，而 qa_logger 的兜底阶梯只吞不救——整行审计静默丢失，
+    等于调用方可用超长 id 自选逃离溯源/反馈归属/缺口挖掘。截断保行优于丢行；
+    合规值逐字节不变（载荷零漂移承诺不受影响）。"""
+    return value if value is None or len(value) <= limit else value[:limit]
+
+
 def build_qa_log_kwargs(
     *,
     session_id: str,
@@ -302,12 +310,14 @@ def build_qa_log_kwargs(
     只多 intent_type 标签。
     """
     return dict(
-        session_id=session_id,
-        message_id=message_id,
-        user_id=user_id,
-        user_name=user_name,
-        # 多组：list → CSV（qa_session_log.user_dept 仍 VARCHAR，无迁移）；str/None 原样
-        user_dept=",".join(user_dept) if isinstance(user_dept, list) else user_dept,
+        # 标识列按 schema/001 列宽截断（session/message/user_id/user_name=128，user_dept=64）
+        session_id=_clip(session_id, 128),
+        message_id=_clip(message_id, 128),
+        user_id=_clip(user_id, 128),
+        user_name=_clip(user_name, 128),
+        # 多组：list → CSV（qa_session_log.user_dept 仍 VARCHAR，无迁移）；str/None 原样。
+        # 全组用户（总经办 15 组）CSV=104 字符同样超 VARCHAR(64)——不截断则 strict 模式整行丢
+        user_dept=_clip(",".join(user_dept) if isinstance(user_dept, list) else user_dept, 64),
         query_text=question,
         answer_text=answer_text or None,
         retrieved_docs=chunks or None,
@@ -322,7 +332,7 @@ def build_qa_log_kwargs(
         top_score=top_score_of(chunks),
         conversation_type=conversation_type,
         content_blocks_json=content_blocks_json or None,
-        conversation_id=conversation_id,
+        conversation_id=_clip(conversation_id, 128),
         gen_meta_json=gen_meta_to_json(gen_meta),
         intent_type=intent_type,
         risk_level=risk_level,

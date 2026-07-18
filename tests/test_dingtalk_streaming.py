@@ -661,11 +661,13 @@ def test_register_card_callback_skips_without_url(monkeypatch):
 
 
 def test_register_card_callback_posts_when_configured(monkeypatch):
-    """配置齐全时 POST /card/callbacks/register，载荷含正确的 callbackUrl/routeKey，200→True。"""
+    """配置齐全时 POST /card/callbacks/register，载荷含正确的 callbackUrl/routeKey，200→True。
+    2026-07-17 起 secret 必须显式配置（不再回退内置字面量），载荷 apiSecret=环境值。"""
     from opensearch_pipeline import dingtalk_card
 
     monkeypatch.setenv("DINGTALK_CARD_CALLBACK_URL", "https://sae.example.com/dingtalk/card/callback")
     monkeypatch.setenv("DINGTALK_CARD_CALLBACK_ROUTE_KEY", "rag_feedback_callback")
+    monkeypatch.setenv("DINGTALK_CARD_CALLBACK_API_SECRET", "reg-secret")
     monkeypatch.delenv("DINGTALK_CARD_CALLBACK_FORCE_UPDATE", raising=False)
 
     resp = MagicMock()
@@ -681,5 +683,6 @@ def test_register_card_callback_posts_when_configured(monkeypatch):
         assert payload["callbackUrl"] == "https://sae.example.com/dingtalk/card/callback"
         assert payload["callbackRouteKey"] == "rag_feedback_callback"
         assert payload["forceUpdate"] is False
+        assert payload["apiSecret"] == "reg-secret"   # 环境值直达载荷，绝无字面量回退
         # access-token 走 Header
         assert mock_post.call_args.kwargs["headers"]["x-acs-dingtalk-access-token"] == "tok-xyz"

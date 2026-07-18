@@ -189,6 +189,16 @@ def register_card_callback(*, force_update: Optional[bool] = None) -> bool:
         )
         return False
 
+    # apiSecret：钉钉用它对回调请求签名（/card/callback 验签同源）。不再回退内置字面量
+    # （2026-07-17 ultra P1）：仓库曾公开，用已知值注册 = 回调签名可伪造。未配置即拒绝注册；
+    # 部署侧设真实 secret 并配 DINGTALK_CARD_CALLBACK_FORCE_UPDATE=true 轮换后重启生效。
+    api_secret = os.environ.get("DINGTALK_CARD_CALLBACK_API_SECRET", "").strip()
+    if not api_secret:
+        logger.warning(
+            "未设置 DINGTALK_CARD_CALLBACK_API_SECRET，拒绝注册卡片回调——历史内置默认值已随"
+            "公开仓泄露，不可再用（答案/打字机不受影响，仅反馈按钮回调暂不可用）")
+        return False
+
     token = _get_access_token()
     if not token:
         logger.warning("无 access_token，卡片回调注册跳过")
@@ -196,8 +206,6 @@ def register_card_callback(*, force_update: Optional[bool] = None) -> bool:
 
     if force_update is None:
         force_update = os.environ.get("DINGTALK_CARD_CALLBACK_FORCE_UPDATE", "").lower() in ("true", "1", "yes")
-    # apiSecret：钉钉用它对回调请求签名；当前 /card/callback 处理器未校验来源，可自定义任意值。
-    api_secret = os.environ.get("DINGTALK_CARD_CALLBACK_API_SECRET", "fuling_card_cb")
 
     payload = {
         "apiSecret": api_secret,
@@ -413,7 +421,10 @@ def _post_card_deliver(token: str, payload: Dict[str, Any], message_id: str) -> 
     """POST createAndDeliver 并校验投递结果（200 不代表投递成功）。"""
     try:
         print(f"[CARD DEBUG] openSpaceId={payload.get('openSpaceId')}", flush=True)
-        print(f"[CARD DEBUG] cardParamMap={json.dumps(payload.get('cardData', {}).get('cardParamMap', {}), ensure_ascii=False)[:800]}", flush=True)
+        # 只打字段名不打值（2026-07-17 ultra P1）：cardParamMap 含明文 question/answer，
+        # 整包 dump 违反 _q_for_log 脱敏红线（SAE 日志长留存，问题可能含身份证/手机号）。
+        # 排障要看的是模板字段齐不齐——键名足够。
+        print(f"[CARD DEBUG] cardParamMap keys={sorted(payload.get('cardData', {}).get('cardParamMap', {}))}", flush=True)
         resp = requests.post(
             "https://api.dingtalk.com/v1.0/card/instances/createAndDeliver",
             json=payload,

@@ -166,6 +166,14 @@ class _FakeBucket:
     def sign_url(self, method, key, expires):
         return f"https://signed/{key}"
 
+    def copy_object(self, source_bucket_name, source_key, target_key):
+        self.calls.append(("copy", target_key))
+        return "copy-ok"
+
+    def init_multipart_upload(self, key):
+        self.calls.append(("init-mp", key))
+        return "init-mp-ok"
+
 
 def test_guarded_bucket_blocks_prod_writes(patch_cfg, monkeypatch):
     patch_cfg(_cfg())
@@ -187,6 +195,28 @@ def test_guarded_bucket_non_prod_bucket_writes_allowed(patch_cfg):
     patch_cfg(_cfg(environment="staging", oss_bucket="fuling-knowledge-base-staging"))
     gb = GuardedBucket(_FakeBucket(), "fuling-knowledge-base-staging")
     assert gb.put_object("rag-ready/x/content.md", b"data") == "put-ok"
+
+
+def test_guarded_bucket_blocks_prod_copy_and_multipart(patch_cfg, monkeypatch):
+    """P1 回归（2026-07-17 ultra 评审）：copy_object 是真实归档路径的写法（copy+delete 搬移），
+    曾不在 _WRITE_METHODS 内直通——PROD-RO/配置漂移下写穿生产桶且相邻 delete 被拦、归档半完成。
+    multipart 族同拦。"""
+    patch_cfg(_cfg())
+    monkeypatch.delenv("RAG_DESTRUCTIVE_PROD_ACK", raising=False)
+    fb = _FakeBucket()
+    gb = GuardedBucket(fb, "fuling-knowledge-base")
+    with pytest.raises(DestructiveOpBlocked):
+        gb.copy_object("fuling-knowledge-base", "raw/src.pdf", "archive/src.pdf")
+    with pytest.raises(DestructiveOpBlocked):
+        gb.init_multipart_upload("rag-ready/x/content.md")
+    assert fb.calls == [], "被拦调用绝不能触达真实 bucket"
+
+
+def test_guarded_bucket_copy_allowed_on_non_prod_bucket(patch_cfg):
+    """守卫不误伤：非指纹桶 copy 照常放行（op 标签取目标 key，与 put/delete 同构）。"""
+    patch_cfg(_cfg(environment="staging", oss_bucket="fuling-knowledge-base-staging"))
+    gb = GuardedBucket(_FakeBucket(), "fuling-knowledge-base-staging")
+    assert gb.copy_object("fuling-knowledge-base-staging", "raw/a.pdf", "archive/a.pdf") == "copy-ok"
 
 
 # ── P4: 连接层裸 cursor 写守卫（GuardedDBConnection / GuardedDBCursor） ──

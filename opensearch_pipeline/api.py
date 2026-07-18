@@ -287,11 +287,13 @@ class AskRequest(BaseModel):
     history: Optional[List[ChatMessage]] = Field(
         None, max_length=40, description="对话历史（最多 40 条 = 20 轮）",
     )
-    session_id: Optional[str] = Field(None, description="会话 ID，用于追踪对话")
+    # max_length 对齐 qa_session_log.session_id VARCHAR(128)：超长 id 在 MySQL strict 下
+    # 让审计 INSERT 1406、被 qa_logger 兜底吞掉——任何调用方可自选逃审计（2026-07-17 P1）
+    session_id: Optional[str] = Field(None, max_length=128, description="会话 ID，用于追踪对话")
     conversation_id: Optional[str] = Field(None, max_length=128, description="客户端会话 ID（控制台会话历史归属；仅 RAG_CONVERSATION_HISTORY 开启时落库）")
     temperature: Optional[float] = Field(DEFAULT_TEMPERATURE, ge=0.0, le=2.0, description="生成温度")
     max_tokens: Optional[int] = Field(DEFAULT_MAX_TOKENS, ge=100, le=8192, description="最大生成 token 数")
-    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
+    user_id: Optional[str] = Field(None, max_length=128, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
     user_dept: Optional[str] = Field(
         None,
         description="[已废弃·服务端忽略] 部门一律由服务端按 Bearer 令牌/user_id 解析（防越权）",
@@ -312,7 +314,7 @@ class AskRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="搜索查询")
     top_k: int = Field(5, ge=1, le=50, description="返回结果数")
-    user_id: Optional[str] = Field(None, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
+    user_id: Optional[str] = Field(None, max_length=128, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
     user_dept: Optional[str] = Field(
         None,
         description="[已废弃·服务端忽略] 部门一律由服务端按 Bearer 令牌/user_id 解析（防越权）",

@@ -126,3 +126,52 @@ class TestBuildQaLogKwargs:
         assert kw["error_message"] == "[trace=x] boom"
         assert kw["conversation_type"] == "2"
         assert kw["content_blocks_json"] == '[{"type":"image"}]'
+
+
+class TestIdentifierClipping:
+    """P1 回归（2026-07-17 ultra 评审）：标识列超长在 MySQL strict（RDS 默认）下 1406、
+    被 qa_logger 兜底吞掉——整行审计静默丢失 = 调用方可自选逃审计。截断保行优于丢行。"""
+
+    def test_oversize_identifiers_clipped_to_schema_widths(self):
+        kw = build_qa_log_kwargs(
+            session_id="s" * 300, message_id="m" * 200, question="q",
+            user_id="u" * 200, user_name="n" * 200,
+            conversation_id="c" * 200,
+        )
+        assert kw["session_id"] == "s" * 128
+        assert kw["message_id"] == "m" * 128
+        assert kw["user_id"] == "u" * 128
+        assert kw["user_name"] == "n" * 128
+        assert kw["conversation_id"] == "c" * 128
+
+    def test_user_dept_csv_clipped_to_64(self):
+        # 全组用户（总经办 15 组）CSV=104 字符同样超 qa_session_log.user_dept VARCHAR(64)
+        kw = build_qa_log_kwargs(session_id="s", message_id="m", question="q",
+                                 user_dept=["dept%02d" % i for i in range(15)])
+        assert len(kw["user_dept"]) == 64
+
+    def test_normal_values_byte_identical(self):
+        # 载荷零漂移承诺：合规长度的值绝不被改写
+        kw = build_qa_log_kwargs(session_id="sid-1", message_id="mid-1", question="q",
+                                 user_id="U01", user_dept=["hr", "finance"],
+                                 conversation_id="conv-1")
+        assert kw["session_id"] == "sid-1"
+        assert kw["user_dept"] == "hr,finance"
+        assert kw["conversation_id"] == "conv-1"
+        assert kw["user_name"] is None
+
+
+class TestAskRequestIdentifierLimits:
+    """入口侧同一 P1 的第一道闸：AskRequest.session_id/user_id 上限 128（对齐
+    SessionClearRequest 与 qa_session_log 列宽），超长直接 422 而非静默丢审计。"""
+
+    def test_session_id_over_128_rejected(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from opensearch_pipeline.api import AskRequest
+        with pytest.raises(ValidationError):
+            AskRequest(question="q", session_id="s" * 129)
+        with pytest.raises(ValidationError):
+            AskRequest(question="q", user_id="u" * 129)
+        assert AskRequest(question="q", session_id="s" * 128).session_id == "s" * 128
