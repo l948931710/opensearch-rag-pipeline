@@ -591,6 +591,18 @@ async def version_info():
     }
 
 
+_READY_CACHE: dict = {"t": 0.0, "body": None, "ok": True}
+_READY_LOCK = threading.Lock()
+
+
+def _ready_cache_ttl_s() -> float:
+    """批次7（ultra api:593）：/api/ready 探针结果缓存 TTL（默认 5s；0=关闭恢复逐请求真探）。"""
+    try:
+        return float(os.environ.get("RAG_READY_CACHE_TTL_S", "5") or 0)
+    except ValueError:
+        return 5.0
+
+
 @app.get("/api/ready")
 def readiness_check():
     """OBS-1 deep readiness probe: RDS + HA3 (critical) + DashScope (config-only, no live cost).
@@ -604,12 +616,37 @@ def readiness_check():
     SELECT 1、HA3 client.query）。async 下这些阻塞会冻住唯一事件循环（workers=1）——且恰在
     RDS/HA3 降级、探针最需要工作时冻得最久（connect/read 超时全程）。def 走线程池，与
     /api/ask 同一理由。
-    """
+
+    批次7（ultra api:593）：探针结果短 TTL 缓存 + single-flight——本端点无认证无限流
+    （LB/SAE 探针必须永远可达，套 429 会把健康实例自己摘掉），此前每次命中都真打
+    RDS SELECT 1 + HA3 向量查询：公网匿名洪泛可绕过 ask 侧的匿名成本闸，耗干 DB 池与
+    AnyIO 线程池、把 LB 自己的探针挤成 503。缓存后任意洪泛的真实探针成本≤每 TTL 一组；
+    刻意**不**套 aux 限流（LB 源地址未知，误 429 探针=自残摘除）。"""
     from fastapi.responses import JSONResponse
     cfg = get_config()
     if getattr(cfg, "simulate", False):
         return {"status": "ok", "mode": "simulate", "rds": "skipped", "ha3": "skipped", "dashscope": "skipped"}
+    ttl = _ready_cache_ttl_s()
+    if ttl <= 0:
+        body, ok = _compute_readiness(cfg)
+        return body if ok else JSONResponse(status_code=503, content=body)
+    now = time.monotonic()
+    if _READY_CACHE["body"] is not None and now - _READY_CACHE["t"] < ttl:
+        body, ok = _READY_CACHE["body"], _READY_CACHE["ok"]
+        return body if ok else JSONResponse(status_code=503, content=body)
+    with _READY_LOCK:   # single-flight：并发未命中只有一个真探，其余等待复用
+        now = time.monotonic()
+        if _READY_CACHE["body"] is not None and now - _READY_CACHE["t"] < ttl:
+            body, ok = _READY_CACHE["body"], _READY_CACHE["ok"]
+        else:
+            body, ok = _compute_readiness(cfg)
+            _READY_CACHE["body"], _READY_CACHE["ok"] = body, ok
+            _READY_CACHE["t"] = time.monotonic()
+    return body if ok else JSONResponse(status_code=503, content=body)
 
+
+def _compute_readiness(cfg):
+    """真实探针全文（原 readiness_check 主体）。返回 (body, critical_ok)。"""
     # P2-05：对外只报组件 up/down（ok/error/skipped），绝不回灌异常原文（DB host / 驱动错误 /
     # 索引错误经 str(e) 泄露内部拓扑）。完整异常写内部日志，响应带 trace_id 供运维对账。
     trace_id = get_request_id()
@@ -723,7 +760,7 @@ def readiness_check():
                    and (not _readiness.schema_strict()
                         or checks.get("schema_migrations") == "ok"))
     body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
-    return body if critical_ok else JSONResponse(status_code=503, content=body)
+    return body, critical_ok
 
 
 @app.post("/api/auth/dingtalk", response_model=DingtalkAuthResponse)

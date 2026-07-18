@@ -618,13 +618,32 @@ def _require_ack(var: str) -> bool:
     return v == _ACK_VALUE
 
 
+# 批次7（ultra config:632）：环境标签闭集。此前标签是开放集且各守卫层归一不一致——
+# 交叉校验自行 lower() 而生产安全守卫（本文件 ~1005）与 env_guard 用**原值精确匹配**：
+# 'Production' 能过 prod 交叉校验却静默跳过 PII-redact/self-approval/REQUIRE_AUTH 全部
+# 生产姿态守卫；未知标签（'dev'/'prod'/拼写错误）不匹配任何分支 = 跳过全部标签↔目标
+# 交叉校验，一台 'dev' 标签的机器可静默读生产 RDS。load_config 归一（strip+lower）一次
+# + 闭集 fail-fast，config.environment 此后恒为规范值，各守卫的精确匹配全部成立。
+_KNOWN_ENVIRONMENTS = ("", "development", "local", "staging", "test", "production")
+
+
+def _normalize_environment(raw: str) -> str:
+    env = (raw or "").strip().lower()
+    if env not in _KNOWN_ENVIRONMENTS:
+        raise EnvironmentMismatchError(
+            f"[ENV GUARD] 未知环境标签 RAG_ENVIRONMENT={raw!r}——合法值："
+            f"development / local / staging / test / production（空=development 语义）。"
+            f"未知标签会跳过全部环境↔目标交叉校验与生产姿态守卫，fail-fast 拒绝启动。")
+    return env
+
+
 def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
     """环境标签 ↔ 物理目标交叉校验（fail-fast，发生在任何连接建立之前）。
 
     规则前置条件：仅当对应子系统 simulate=False 时才评估（make sim / 单测天然跳过）。
     规则表与豁免变量语义见 docs/environment_design.md。
     """
-    env = (config.environment or "development").lower()
+    env = (config.environment or "development").lower()   # 直构 config 的测试路径仍自归一（带）
     search_targets = " ".join(filter(None, (
         config.alibaba_vector.endpoint, config.alibaba_vector.instance_id,
         config.opensearch.host)))
@@ -825,7 +844,7 @@ def load_config() -> PipelineConfig:
         simulate_opensearch=rag_simulate_opensearch,
         simulate_oss=rag_simulate_oss,
         simulate_api=rag_simulate_api,
-        environment=_env("ENVIRONMENT", "development"),
+        environment=_normalize_environment(_env("ENVIRONMENT", "development")),
         readonly=_env_bool("READONLY", False),
         log_level=_env("LOG_LEVEL", "INFO"),
         max_concurrent_tasks=_env_int("MAX_CONCURRENT_TASKS", 5),

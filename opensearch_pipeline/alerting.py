@@ -71,10 +71,30 @@ def send_ops_alert(title: str, text: str, *, severity: str = "warning",
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             ok = 200 <= resp.status < 300
-        _LAST_SENT[key] = now
+            status = resp.status
+            raw = b""
+            try:
+                raw = resp.read()
+            except Exception:   # noqa: BLE001 — body 读失败按不可解析处理（不新增失败面）
+                raw = b""
+        _LAST_SENT[key] = now   # 失败也进 dedup 窗：坏 webhook 不该被告警风暴反复打
         if not ok:
-            logger.warning("ops-alert HTTP %s: %s", resp.status, title)
-        return ok
+            logger.warning("ops-alert HTTP %s: %s", status, title)
+            return False
+        # 批次7（ultra alerting:73）：钉钉自定义机器人在 **HTTP 200** 里用 errcode 报失败
+        # （310000 签名不符/关键词过滤、130101 机器人限流 20 条/分）——只看 HTTP 状态时，
+        # RAG_OPS_ALERT_SECRET 配错或突发超限会让全部运维告警（parity 漂移/SLO/熔断，
+        # 15+ 调用点）静默蒸发且本函数还返回 True。解析 body，errcode!=0 记 ERROR 返 False。
+        try:
+            bj = json.loads(raw.decode("utf-8"))
+            errcode = int(bj.get("errcode", 0))
+        except Exception:   # noqa: BLE001 — body 非 JSON：保守按已送达（旧行为，不误报）
+            return True
+        if errcode != 0:
+            logger.error("ops-alert DingTalk errcode=%s errmsg=%s: %s",
+                         errcode, bj.get("errmsg"), title)
+            return False
+        return True
     except Exception as e:
         # fail-open: an alert send failure must never abort the operation that triggered it
         logger.warning("ops-alert send failed (non-fatal): %s err=%s", title, e)

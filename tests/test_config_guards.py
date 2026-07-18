@@ -296,3 +296,38 @@ class TestNoModelResolutionFlag:
                           RAG_OPENSEARCH_HOST="localhost",
                           RAG_NO_MODEL_RESOLUTION="ack")
         assert cfg.embedding.model == "model-resolution-disabled"
+
+
+# ── 批次7（ultra config:632）：环境标签闭集 + 单点归一 ─────────────────────────
+
+
+def test_environment_label_normalized_once():
+    """'Production'/带空白 → 规范值——此前交叉校验自行 lower 而生产安全守卫用原值精确匹配，
+    'Production' 能过 prod 交叉校验却静默跳过全部生产姿态守卫。"""
+    from opensearch_pipeline.config import _normalize_environment
+    assert _normalize_environment("Production") == "production"
+    assert _normalize_environment("  STAGING ") == "staging"
+    assert _normalize_environment("development") == "development"
+    assert _normalize_environment("") == ""          # 空=development 语义（validator dev 分支）
+
+
+def test_unknown_environment_label_fails_fast():
+    """未知标签（'dev'/'prod'/拼写错误）此前不匹配任何交叉校验分支=静默跳过全部
+    标签↔目标校验（'dev' 标签机器可静默读生产 RDS）→ 现在 fail-fast 拒绝启动。"""
+    import pytest
+
+    from opensearch_pipeline.config import EnvironmentMismatchError, _normalize_environment
+    for bad in ("dev", "prod", "produciton", "stg"):
+        with pytest.raises(EnvironmentMismatchError, match="未知环境标签"):
+            _normalize_environment(bad)
+
+
+def test_load_config_rejects_unknown_label(monkeypatch):
+    """load_config 级：归一发生在任何守卫/连接之前，simulate 也拦（配置错误必须立刻可见）。"""
+    import pytest
+
+    from opensearch_pipeline.config import EnvironmentMismatchError, load_config
+    monkeypatch.setenv("RAG_SIMULATE", "true")
+    monkeypatch.setenv("RAG_ENVIRONMENT", "prod")
+    with pytest.raises(EnvironmentMismatchError, match="未知环境标签"):
+        load_config()
