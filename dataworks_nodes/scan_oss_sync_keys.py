@@ -250,13 +250,22 @@ if not DRY_RUN and needs_update:
             
             if existing:
                 # 目标路径已有记录 → 当前记录是重复的，停用
+                # 批次8（ultra scan_oss_sync_keys:253）：status-only 退役留双活——本记录的
+                # chunk_meta 仍 is_active=1/INDEXED、HA3 PK 仍在线，检索永远同时返回两个
+                # doc_id 且无任何 reconciler 覆盖此形态。复用 spot_checker 的 PENDING_DELETE
+                # 握手：index_status 置 PENDING_DELETE（已在终态删除链上的不动），由
+                # reconcile_pending_deletes（spot-check 启动自动跑/可独立调）删 HA3 PK +
+                # 灭活 chunk_meta + dv 落 DELETED——与控制台退役同一条收敛路径。
                 cursor.execute("""
                     UPDATE document_version
-                    SET status = 'superseded'
+                    SET status = 'superseded',
+                        index_status = CASE WHEN index_status IN ('DELETED', 'PENDING_DELETE')
+                                            THEN index_status ELSE 'PENDING_DELETE' END
                     WHERE doc_id = %s AND version_no = %s
                 """, (doc_id, version_no))
                 deactivated += 1
-                print(f"  🔄 {doc_id} → 停用 (与 {existing[0]} 重复)")
+                print(f"  🔄 {doc_id} → 停用+排 HA3 PENDING_DELETE (与 {existing[0]} 重复；"
+                      f"reconcile_pending_deletes 收敛索引与 chunk_meta)")
             else:
                 # 正常更新路径
                 cursor.execute("""

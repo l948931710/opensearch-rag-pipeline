@@ -6,7 +6,8 @@ name: Frontend
 
 on:
   push:
-    branches: [main]
+    # 批次8（ultra ci.yml:12 同族）：前端门同样覆盖实际出包的工作分支
+    branches: [main, "claude/**"]
     paths:
       - "console-app/**"
       - "fuling-rag-miniapp/**"

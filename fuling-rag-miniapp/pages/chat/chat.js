@@ -157,21 +157,20 @@ Page({
     this._serverConvs = [];     // 最近一次 /api/conversations 结果（仅内存，抽屉合并用）
     this._loadingConvId = '';   // 正在懒加载的云端会话（防重复点击）
 
-    // 先本地恢复（不等登录网络往返，首屏即见上次会话）；登录归属校验在
-    // ensureLogin 回来后补做，换号即清空重置。
-    this._restoreLast();
+    // 批次8（ultra chat.js:166）：本地恢复移到 ensureOwner **之后**——此前先渲染再校验
+    // 归属，共享设备上第二个账号在登录往返期间会看到（并可能续写进）前一个账号的本地
+    // 会话缓存。现在登录成功→ensureOwner（换号即清空）→再恢复；登录失败不恢复任何
+    // 缓存（页面保持全新会话可用，重试发送时 _ask 路径会补登录+归属校验）。
+    this.setData({ convId: genConvId(), startTimeLabel: nowLabel() });
 
     ensureLogin()
       .then((g) => {
         ensureOwner(g.userId || 'anon');
-        // 换号清空后当前会话已不在索引里 → 重置为全新会话
-        const idx = loadIndex();
-        if (this.data.messages.length && !idx.some((c) => c.id === this.data.convId)) {
-          this._freshConversation();
-        }
+        this._restoreLast();
       })
       .catch(() => {
         // ensureLogin already toasted; leave the page usable so a retry on send works.
+        // 刻意不 ensureOwner('anon')：网络抖动的登录失败绝不能把单人设备的本地缓存清掉。
       });
 
     // 「猜你想问」：服务端近 30 天高频问题；失败保持静态兜底（fail open）
@@ -233,6 +232,14 @@ Page({
       this._serverConvs = [];
       this._freshConversation();
       this.setData({ lastResetAt: resetAt });
+      // 批次8（ultra chat.js:232）：处理完即移除 marker——lastResetAt 每次冷启动重置为 0，
+      // marker 不清则 resetAt!==0 永真，「清空会话」之后每次冷启动都会把刚恢复的会话
+      // 再静默清一遍。settings 只写不读本键，移除安全；移除失败最坏=下次冷启动多清一次。
+      try {
+        dd.removeStorageSync({ key: 'session_reset_at' });
+      } catch (e) {
+        // 忽略：见上
+      }
     }
   },
 
@@ -310,7 +317,13 @@ Page({
     }, 30);
     // 服务端会话列表合并（RAG_CONVERSATION_HISTORY 开启时才有数据；匿名/失败静默）
     ensureLogin()
-      .then(() => getConversations())
+      .then((g) => {
+        // 批次8：owner 复查——换号后本地索引即清，抽屉只按新身份的本地+服务端列表构建
+        if (g && g.userId) {
+          ensureOwner(g.userId);
+        }
+        return getConversations();
+      })
       .then((resp) => {
         this._serverConvs = (resp && resp.items) || [];
         if (this.data.drawerMounted) {
@@ -703,13 +716,20 @@ Page({
     // 后端无 token = 仅 public 语料，免登抖动不应塞死问答（IDE 模拟器中免登必失败）。
     ensureLogin()
       .catch(() => null)
-      .then(() => ask(question, this.data.sessionId, {
+      .then((g) => {
+        // 批次8：owner 复查——冷启动登录失败后经此路径首次拿到身份时，换号即清他人缓存
+        //（此时屏上是全新未落盘会话，清空不影响可见状态）。
+        if (g && g.userId) {
+          ensureOwner(g.userId);
+        }
+        return ask(question, this.data.sessionId, {
         thinking,
         conversationId: convId,
         onTask: (t) => {
           this._reqTask = t;
         },
-      }))
+        });
+      })
       .then((resp) => {
         this._clearStageTimer(aiId);
         this._reqTask = null;

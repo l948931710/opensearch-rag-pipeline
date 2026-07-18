@@ -212,12 +212,26 @@ def enqueue_acl_projection(cursor, doc_id: str, reason: str = "") -> None:
     """
     if not doc_id:
         return
-    cursor.execute(
-        f"INSERT INTO {_kb_db()}.kb_acl_projection_outbox (doc_id, reason) VALUES (%s, %s) "
-        "ON DUPLICATE KEY UPDATE done_at=NULL, attempts=0, last_error=NULL, "
-        "reason=VALUES(reason), updated_at=NOW()",
-        (doc_id, (reason or "")[:64]),
-    )
+    # 批次8（ultra schema/009:34）：复活时 generation+1——drain 的 done/attempts 标记按
+    # (id, generation) CAS，mid-drain 落库的撤销（复活了同一行）不再被旧一轮的 done 标记
+    # 擦掉。049 未 apply（1054 Unknown column）时回退旧语句（🔒 apply user-gated，
+    # 代码可先部署；MySQL 语句级错误不终止调用方事务，同事务重试合法）。
+    try:
+        cursor.execute(
+            f"INSERT INTO {_kb_db()}.kb_acl_projection_outbox (doc_id, reason) VALUES (%s, %s) "
+            "ON DUPLICATE KEY UPDATE done_at=NULL, attempts=0, last_error=NULL, "
+            "generation=generation+1, reason=VALUES(reason), updated_at=NOW()",
+            (doc_id, (reason or "")[:64]),
+        )
+    except Exception as e:   # noqa: BLE001 — 仅 1054（列未 apply）回退；其余照抛（持久保证不吞）
+        if "1054" not in str(e) and "Unknown column" not in str(e):
+            raise
+        cursor.execute(
+            f"INSERT INTO {_kb_db()}.kb_acl_projection_outbox (doc_id, reason) VALUES (%s, %s) "
+            "ON DUPLICATE KEY UPDATE done_at=NULL, attempts=0, last_error=NULL, "
+            "reason=VALUES(reason), updated_at=NOW()",
+            (doc_id, (reason or "")[:64]),
+        )
 
 
 def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
@@ -242,15 +256,36 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
     except Exception as e:   # noqa: BLE001
         result["errors"].append(f"DB connect failed: {e}")
         return result
+    # 批次8（ultra schema/009:34）：SELECT 带走 generation，done/attempts 标记按
+    # (id, generation) CAS——drain 物化与标记之间落库的撤销会复活同一行并 generation+1，
+    # CAS 落空即视为「行已被更新代次接管」：不标 done（撤销意图保留，下轮按新代次重物化）。
+    # 049 未 apply（1054）→ 回退旧无代次语义（🔒 apply user-gated，代码可先部署）。
+    _gen_col = True
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT id, doc_id FROM {_kb_db()}.kb_acl_projection_outbox "
-                "WHERE done_at IS NULL ORDER BY enqueued_at LIMIT %s",
-                (int(limit),),
-            )
-            rows = [(r[0], r[1]) for r in cur.fetchall() if r and r[1]]
-        for row_id, doc_id in rows:
+            try:
+                cur.execute(
+                    f"SELECT id, doc_id, generation FROM {_kb_db()}.kb_acl_projection_outbox "
+                    "WHERE done_at IS NULL ORDER BY enqueued_at LIMIT %s",
+                    (int(limit),),
+                )
+            except Exception as _ge:   # noqa: BLE001 — 仅列缺失回退
+                if "1054" not in str(_ge) and "Unknown column" not in str(_ge):
+                    raise
+                _gen_col = False
+                cur.execute(
+                    f"SELECT id, doc_id, 0 FROM {_kb_db()}.kb_acl_projection_outbox "
+                    "WHERE done_at IS NULL ORDER BY enqueued_at LIMIT %s",
+                    (int(limit),),
+                )
+            rows = [(r[0], r[1], r[2]) for r in cur.fetchall() if r and r[1]]
+
+        def _mark_where(row_id, gen):
+            if _gen_col:
+                return " WHERE id=%s AND generation=%s", (row_id, gen)
+            return " WHERE id=%s", (row_id,)
+
+        for row_id, doc_id, gen in rows:
             result["processed"] += 1
             try:
                 with conn.cursor() as cur:
@@ -258,33 +293,38 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
                     if not commit:
                         conn.rollback()          # 预览：不改 outbox/不落标脏
                         continue
+                    _w, _wp = _mark_where(row_id, gen)
                     if outcome["status"] == "skipped_locked":
                         # current version 正在 stage-3 跑 → 本轮跳过、下轮再 drain（留 done_at=NULL）
                         cur.execute(
                             f"UPDATE {_kb_db()}.kb_acl_projection_outbox "
-                            "SET attempts=attempts+1, last_error='skipped_locked', updated_at=NOW() WHERE id=%s",
-                            (row_id,),
+                            "SET attempts=attempts+1, last_error='skipped_locked', updated_at=NOW()"
+                            + _w, _wp,
                         )
                         result["locked"] += 1
                     else:
                         # unchanged / materialized / retracted / skipped → 投影意图已落实 → 标 done
                         cur.execute(
                             f"UPDATE {_kb_db()}.kb_acl_projection_outbox "
-                            "SET done_at=NOW(), last_error=NULL, updated_at=NOW() WHERE id=%s",
-                            (row_id,),
+                            "SET done_at=NOW(), last_error=NULL, updated_at=NOW()" + _w, _wp,
                         )
-                        result["done"] += 1
+                        if _gen_col and cur.rowcount == 0:
+                            # mid-drain 复活（generation 已 +1）：不标 done，撤销意图保留待下轮
+                            result["raced"] = result.get("raced", 0) + 1
+                        else:
+                            result["done"] += 1
                 conn.commit()
             except Exception as e:   # noqa: BLE001 — 单文档失败不抛、记 errors、attempts++ 待重试
                 result["errors"].append(f"{doc_id}: {e}")
                 result["failed"] += 1
                 try:
                     conn.rollback()
+                    _w, _wp = _mark_where(row_id, gen)
                     with conn.cursor() as cur:
                         cur.execute(
                             f"UPDATE {_kb_db()}.kb_acl_projection_outbox "
-                            "SET attempts=attempts+1, last_error=%s, updated_at=NOW() WHERE id=%s",
-                            (str(e)[:512], row_id),
+                            "SET attempts=attempts+1, last_error=%s, updated_at=NOW()" + _w,
+                            (str(e)[:512],) + _wp,
                         )
                     conn.commit()
                 except Exception:   # noqa: BLE001 — 连记错误都失败 → 下轮 reconcile 兜底

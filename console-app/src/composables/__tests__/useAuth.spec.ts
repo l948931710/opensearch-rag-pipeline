@@ -214,6 +214,37 @@ describe('桌面 ?token 刷新续存（sessionStorage，tab 级）', () => {
     expect(ok).toBe(false)
     expect(sessionStorage.getItem(KEY)).toBeNull()
   })
+
+  it('批次8：reauth 单飞——并发 401 共享同一次重登（不各自换证互踩身份域）', async () => {
+    let calls = 0
+    ;(window as any).dd = {
+      ready: (cb: () => void) => cb(),
+      error: () => {},
+      runtime: { permission: { requestAuthCode: (o: any) => { calls++; o.onSuccess({ code: 'C' }) } } },
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonRes({
+      token: 'T1', user: { userId: 'u1', name: 'N', dept: 'it' }, role: 'employee', can_manage: false,
+    })))
+    const { reauth } = useAuth()
+    const [a, b, c] = await Promise.all([reauth(), reauth(), reauth()])
+    expect(a && b && c).toBe(true)
+    expect(calls).toBe(1)                                    // N 路并发只打一次 requestAuthCode
+    delete (window as any).dd
+  })
+})
+
+describe('批次8：畸形 deep-link 参数降级（boot 期绝不 URIError 白屏）', () => {
+  it('qs：坏转义（token=abc%）→ 空串降级，不抛', () => {
+    setUrl('?token=abc%')
+    expect(() => qs('token')).not.toThrow()
+    expect(qs('token')).toBe('')
+  })
+
+  it('hashParam：坏转义同样降级', () => {
+    window.history.replaceState({}, '', '/console/#token=abc%FF%')
+    expect(() => hashParam('token')).not.toThrow()
+    expect(hashParam('token')).toBe('')
+  })
 })
 
 describe('init — 钉钉容器内 requestAuthCode 换证路径', () => {

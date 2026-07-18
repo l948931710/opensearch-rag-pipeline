@@ -116,10 +116,13 @@ def test_enqueue_acl_projection_skips_empty():
 
 
 class _DrainCur:
-    """drain 用桩游标：SELECT 待处理行返回预置；其余（UPDATE）记入 store['writes']。"""
+    """drain 用桩游标：SELECT 待处理行返回预置（批次8 起 3 列含 generation）；
+    其余（UPDATE）记入 store['writes']，rowcount 可按 store['rowcount_zero_for'] 脚本化
+    （命中子串的 UPDATE 返回 rowcount=0，模拟 mid-drain 复活的 CAS 落空）。"""
     def __init__(self, store):
         self.store = store
         self._fetch = []
+        self.rowcount = 1
 
     def __enter__(self):
         return self
@@ -130,10 +133,15 @@ class _DrainCur:
     def execute(self, sql, params=None):
         self.store["sql"].append((sql, params))
         if sql.lstrip().startswith("SELECT") and "kb_acl_projection_outbox" in sql:
+            if self.store.get("no_gen_col") and "generation" in sql:
+                raise RuntimeError("(1054, \"Unknown column 'generation' in 'field list'\")")
             self._fetch = list(self.store["pending"])
+            self.rowcount = len(self._fetch)
         else:
             self._fetch = []
             self.store["writes"].append((sql, params))
+            zero_for = self.store.get("rowcount_zero_for") or ()
+            self.rowcount = 0 if any(t in sql for t in zero_for) else 1
 
     def fetchall(self):
         return self._fetch
@@ -156,8 +164,11 @@ class _DrainConn:
         pass
 
 
-def _stub_drain(monkeypatch, *, flag=True, pending=(), status_by_doc=None, materialize_raises=()):
-    store = {"sql": [], "writes": [], "pending": list(pending), "commits": 0, "rollbacks": 0}
+def _stub_drain(monkeypatch, *, flag=True, pending=(), status_by_doc=None, materialize_raises=(),
+                rowcount_zero_for=(), no_gen_col=False):
+    _pending = [tuple(r) + (0,) * (3 - len(r)) for r in pending]   # 2 元组旧调用点补 generation=0
+    store = {"sql": [], "writes": [], "pending": _pending, "commits": 0, "rollbacks": 0,
+             "rowcount_zero_for": tuple(rowcount_zero_for), "no_gen_col": bool(no_gen_col)}
 
     class _Rag:
         allowed_depts_acl = flag
@@ -258,3 +269,47 @@ def test_decide_enqueues_outbox_same_transaction_after_status_change():
     assert "enqueue_acl_projection(cur" in body, "decide 应同游标入队投影 outbox"
     assert body.index("SET status=%s") < body.index("enqueue_acl_projection(cur"), \
         "enqueue 必须在 status 变更之后（同事务原子入队，读己写）"
+
+
+# ── 批次8（ultra schema/009:34）：代次 CAS——mid-drain 复活的撤销不再被擦掉 ─────
+
+
+def test_enqueue_bumps_generation_on_resurrect():
+    from opensearch_pipeline import access_grants
+    cur = _Cur([])
+    access_grants.enqueue_acl_projection(cur, "D1", reason="revoked")
+    assert "generation=generation+1" in cur.sql, "复活必须 +1 代次（drain CAS 的判据）"
+
+
+def test_drain_done_mark_is_cas_by_generation(monkeypatch):
+    """done 标记必须带 (id, generation) CAS——无代次时任何 mid-drain 复活都会被无条件
+    done 覆盖（撤销静默丢失，HA3 残留陈旧 allowed_depts 直到全扫 reconcile）。"""
+    from opensearch_pipeline import access_grants
+    store = _stub_drain(monkeypatch, pending=[(1, "D1", 5)], status_by_doc={"D1": "retracted"})
+    res = access_grants.drain_acl_projection_outbox()
+    assert res["done"] == 1
+    done = [w for w in store["writes"] if "done_at=NOW()" in w[0]]
+    assert done and "AND generation=%s" in done[0][0]
+    assert done[0][1] == (1, 5)
+
+
+def test_drain_raced_resurrection_left_pending(monkeypatch):
+    """CAS 落空（done UPDATE rowcount=0 = 撤销在物化与标记之间复活了该行）→ 不计 done、
+    行保持待处理，下轮按新代次重新物化（撤销必达）。"""
+    from opensearch_pipeline import access_grants
+    store = _stub_drain(monkeypatch, pending=[(1, "D1", 5)], status_by_doc={"D1": "retracted"},
+                        rowcount_zero_for=("done_at=NOW()",))
+    res = access_grants.drain_acl_projection_outbox()
+    assert res["done"] == 0 and res.get("raced") == 1
+    assert any("done_at=NOW()" in w[0] for w in store["writes"])   # 尝试过但 CAS 落空
+
+
+def test_drain_falls_back_when_generation_column_absent(monkeypatch):
+    """049 未 apply（1054 Unknown column）→ 回退旧无代次语义（代码可先部署，🔒 apply user-gated）。"""
+    from opensearch_pipeline import access_grants
+    store = _stub_drain(monkeypatch, pending=[(1, "D1", 0)], status_by_doc={"D1": "unchanged"},
+                        no_gen_col=True)
+    res = access_grants.drain_acl_projection_outbox()
+    assert res["done"] == 1
+    done = [w for w in store["writes"] if "done_at=NOW()" in w[0]]
+    assert done and "generation" not in done[0][0] and done[0][1] == (1,)
