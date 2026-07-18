@@ -1194,17 +1194,30 @@ class DocumentChunker:
                 final_chunk_text = "\n".join(parts)
 
                 # ── step_card 超长保护：超过 max_chunk_chars 时拆分 ──
-                if len(final_chunk_text) > self.max_chunk_chars and len(parts) > 1:
-                    # 策略：主 chunk 保留 step_text + annotation，
-                    # 补充内容（图片描述、OCR）拆分为 step_card_continued
-                    core_parts = [parts[0]]  # step_text 始终保留
-                    supplement_parts = []
-                    for p in parts[1:]:
-                        candidate = "\n".join(core_parts + [p])
-                        if len(candidate) <= self.max_chunk_chars:
-                            core_parts.append(p)
-                        else:
-                            supplement_parts.append(p)
+                if len(final_chunk_text) > self.max_chunk_chars:
+                    # 两种超长形态分治：
+                    if len(parts[0]) > self.max_chunk_chars:
+                        # (a) step_text 本体单独就超长——单步吞并多页（next anchor 缺失时内容
+                        #     被并进上一步，见 line-855 注释）。旧代码的 `len(parts) > 1` 门 +
+                        #     「core_parts 始终整块保留 step_text」双双失效：整块超 2000-token
+                        #     校验被 node_validate_chunks 丢弃，该步内容从索引蒸发（ultra P1
+                        #     2026-07-17）。故把 step_text 本体也过 _split_long_text（每段
+                        #     ≤max_chunk_chars≈533 token，远低于 2000 上限），首段作主块核心，
+                        #     其余正文段 + 补充内容一并降级为 step_card 续接块（保正文顺序）。
+                        step_segments = self._split_long_text(parts[0])
+                        core_parts = [step_segments[0]]
+                        supplement_parts = step_segments[1:] + parts[1:]
+                    else:
+                        # (b) step_text 可容纳、只是叠加补充后超长——原策略：主块保 step_text，
+                        #     贪心塞下放得进的补充，其余（图片描述/OCR）降级为续接块（行为不变）。
+                        core_parts = [parts[0]]
+                        supplement_parts = []
+                        for p in parts[1:]:
+                            candidate = "\n".join(core_parts + [p])
+                            if len(candidate) <= self.max_chunk_chars:
+                                core_parts.append(p)
+                            else:
+                                supplement_parts.append(p)
 
                     final_chunk_text = "\n".join(core_parts)
 

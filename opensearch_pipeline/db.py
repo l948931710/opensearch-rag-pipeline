@@ -50,7 +50,40 @@ def _get_db_conn(select_db=True):
     if _db_pool is None:
         _init_db_pool()
     from opensearch_pipeline.env_guard import GuardedDBConnection
-    return GuardedDBConnection(_acquire_pool_connection(), get_config().rds.host)
+    conn = GuardedDBConnection(_acquire_pool_connection(), get_config().rds.host)
+    _begin_txn(conn)   # ultra P1：显式事务边界，关闭 SteadyDB 单句重放（见 _begin_txn）
+    return conn
+
+
+def _txn_begin_enabled() -> bool:
+    """取连接是否显式 begin()（默认 on=修复生效）。RAG_DB_TXN_BEGIN=false 恢复旧无-begin 语义（逃生口）。"""
+    return os.environ.get("RAG_DB_TXN_BEGIN", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _begin_txn(conn) -> None:
+    """取连接即开启显式事务边界（ultra P1，2026-07-17）。
+
+    池以 autocommit=False 建立却从不 begin() 时，DBUtils SteadyDB 视每条语句可独立重放：
+    多语句事务中途断连（pymysql 把死锁 1213 映射 OperationalError、1205 落 InternalError，
+    均在 SteadyDB 默认失败类）被 tough cursor 透明重连 + **只重执行失败那一句**，而服务端
+    已回滚在途事务的所有前置语句——调用方随后 commit() 只落下尾句，账本被撕成两半
+    （如 document_meta 更新了但 document_version 行丢失）。begin() 置 _transaction 位后
+    tough 重放关闭，断连如实抛错走回滚路径，原子性恢复。对齐 agent_runtime.run_store._begin
+    与 spot_checker/cost_breaker 的同款前置。
+
+    读路径代价：单句 SELECT 中途断连不再静默重放，改为抛错（serving 侧映射 503 快速失败，
+    优于静默错误答案）；取连接时的 ping=1 重连不受影响（发生在 begin 之前）。桩连接无 begin
+    则跳过；begin 本身抛错不阻断取连接（退化为旧无-begin 语义，保读路径可用性）。
+    RAG_DB_TXN_BEGIN=false 整体恢复旧行为。"""
+    if not _txn_begin_enabled():
+        return
+    fn = getattr(conn, "begin", None)
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 — begin 失败极罕见（连接刚取、健康）；绝不阻断读路径
+        print(f"    ⚠️ [Pool] conn.begin() 失败（退化为无-begin 语义，不阻断）: {e}")
 
 
 def _db_acquire_timeout() -> float:

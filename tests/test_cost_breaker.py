@@ -244,3 +244,50 @@ def test_drain_loop_shares_one_breaker_and_budget_accumulates(monkeypatch):
         "0.60 放行后，第二批 0.60+0.60 > 1.00 必须被运行级预算拒绝（旧行为每批归零会双双放行）"
     )
     assert breakers[0].run_total_rmb == pytest.approx(0.60)
+
+
+# ── ultra P1（2026-07-17）：瞬态共享预算拒绝不封存健康文档 ──────────────────
+def test_gate_transient_run_budget_deny_does_not_quarantine(monkeypatch):
+    """RUN 预算瞬态耗尽（共享状态）拒绝**不**封存——文档保持可重认领，下一 run 预算清零后正常
+    处理。此前对任何 deny 都 quarantine（retry_count=3 永久隔离 + kb_type=private），一次预算
+    打满就永久剔除一批只含空白/封面页的健康 PDF。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    calls = []
+    monkeypatch.setattr(cb, "quarantine_for_cost", lambda *a, **k: calls.append(a) or True)
+    cfg = make_cfg(run_budget_rmb=0.04, doc_budget_rmb=5.0)
+    br = CostBreaker(cfg)
+    seed = estimate_doc_cost("pdf", unit_count=1, cached_count=0, cfg=cfg)  # 0.04 → 打满 run 预算
+    assert br.try_reserve("seed", seed)[0] and br.tripped
+    doc = {"doc_id": "healthy", "version_no": 1, "file_ext": "pdf", "owner_dept": "production",
+           "unit_count": 1, "cached_count": 0, "ocr_page_count": 0}
+    allowed, _ = gate_vlm_rebuild(br, doc, simulate_db=True)
+    assert not allowed
+    assert calls == [], "RUN 预算瞬态耗尽绝不封存健康文档"
+
+
+def test_gate_doc_intrinsic_deny_still_quarantines(monkeypatch):
+    """对照：文档自身超 per-doc 预算（doc-intrinsic）仍封存——文档确实不可提取。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    calls = []
+    monkeypatch.setattr(cb, "quarantine_for_cost", lambda *a, **k: calls.append(a) or True)
+    cfg = make_cfg(doc_budget_rmb=0.5)
+    br = CostBreaker(cfg)
+    doc = {"doc_id": "toobig", "version_no": 1, "file_ext": "pdf", "owner_dept": "production",
+           "unit_count": 100, "cached_count": 0, "ocr_page_count": 0}  # est 4.0 > 0.5
+    allowed, _ = gate_vlm_rebuild(br, doc, simulate_db=True)
+    assert not allowed
+    assert len(calls) == 1, "doc-intrinsic 超限必须封存"
+
+
+def test_is_transient_cost_deny_classification():
+    """分类函数与 try_reserve 各 return 文案的耦合契约锁定。"""
+    from opensearch_pipeline.extraction.cost_breaker import _is_transient_cost_deny
+    # 瞬态（共享预算）
+    assert _is_transient_cost_deny("RUN budget exhausted: cumulative 200.00 RMB >= run cap 200.00")
+    assert _is_transient_cost_deny("would exceed RUN budget: cumulative 199 + 5 > run cap 200")
+    assert _is_transient_cost_deny("DAILY budget exhausted (shared ledger): today 50 + 5 > cap 50")
+    # doc-intrinsic（文档自身）
+    assert not _is_transient_cost_deny("per-doc budget exceeded for d: reserved 4 + 2 > 5.00 RMB")
+    assert not _is_transient_cost_deny("unit count 100 exceeds per-doc hard cap 50")
+    assert not _is_transient_cost_deny("VLM rebuild est 4.00 RMB > per-doc budget 0.50 RMB")
+    assert not _is_transient_cost_deny(None)

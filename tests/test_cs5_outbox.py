@@ -70,3 +70,18 @@ def test_reconcile_pending_deletes_returns_shape_on_no_rows(monkeypatch):
     monkeypatch.setattr(spot_checker, "_get_db_conn", lambda **k: _Conn())
     out = spot_checker.reconcile_pending_deletes()
     assert out == {"total": 0, "success": 0, "failed": 0, "errors": []}
+
+
+def test_deactivate_failure_path_cas_guards_pending_delete():
+    """ultra P1（2026-07-17）：HA3 删除失败路径写 document_version='FAILED' 必须 CAS on PROCESSING
+    + 清租约（对齐成功路径 6208 / node_update_index_status 7340）。此前无谓词无条件写 FAILED，
+    会覆盖控制台中途置的 PENDING_DELETE 握手 → 受限文档以旧 permission 被 stage-3 重推 HA3。"""
+    from opensearch_pipeline import pipeline_nodes
+    src = inspect.getsource(pipeline_nodes.node_deactivate_old_chunks)
+    # 失败路径 FAILED 写带清租约（成功路径是参数化 `%s`，故这段是失败路径独有印记）
+    marker = "SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}"
+    assert marker in src, "失败路径 FAILED 写应带 clear_set_sql（清租约）"
+    # 紧随其后是 PROCESSING CAS 谓词
+    tail = src[src.index(marker): src.index(marker) + 400]
+    assert "AND index_status = '{DocVersionIndexStatus.PROCESSING}'" in tail, \
+        "失败路径 FAILED 写必须 CAS on PROCESSING，保住 PENDING_DELETE 握手"
