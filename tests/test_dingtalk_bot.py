@@ -359,7 +359,7 @@ class TestBackgroundRAGProcessing:
         assert "年假" in md_text
         assert "员工手册" in md_text
 
-    @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
+    @patch("opensearch_pipeline.dingtalk_bot._send_terminal_text")
     @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich")
     def test_rag_no_results_sends_fallback_text(self, mock_search, mock_reply):
         """检索无结果 → 发送 '未找到相关信息' 文本回复。"""
@@ -371,7 +371,7 @@ class TestBackgroundRAGProcessing:
         reply_text = mock_reply.call_args[0][1]
         assert "未找到" in reply_text
 
-    @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
+    @patch("opensearch_pipeline.dingtalk_bot._send_terminal_text")
     @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich")
     def test_rag_exception_sends_error_with_trace_id(self, mock_search, mock_reply):
         """search_chunks 抛出异常 → 发送包含 trace ID 的错误回复。"""
@@ -384,7 +384,7 @@ class TestBackgroundRAGProcessing:
         assert "出错" in reply_text
         assert "trace:" in reply_text
 
-    @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
+    @patch("opensearch_pipeline.dingtalk_bot._send_terminal_text")
     @patch("opensearch_pipeline.dingtalk_bot._send_reply")
     @patch("opensearch_pipeline.dingtalk_bot.generate_answer")
     @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich")

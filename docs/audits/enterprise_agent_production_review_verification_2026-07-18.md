@@ -232,6 +232,18 @@
 
 main → ontology-p0 吸收合并（方向=同步非发布；发布合并 op0→main 仍 user-gated）：main 自分叉点 94 提交中 47 个 patch 等价已消化，44 个非等价（适配孪生/收编版/dependabot），50 个冲突文件**全部取 op0 侧**——逐类核验：main 内联 schema 清单 29 条 ⊆ op0 MIGRATION_MANIFEST.tsv 53 条；三个 AA 台账文档 ours 均为超集；`11197c0` 版本级 supersede / `e08fb91` 钉钉三根因 / `admit_general` / api 限流别名四组关键符号反查全命中（main 无 op0 缺失的独有 hunk）。净带入 main-only：ui-iterate skill 三文件、SAE 盘点台账、dependabot 三 bump（lock 重锁 16 包）。合并后 **merge-tree vs main = 0 冲突**（评审时 25 → 合并前 50 → 0），未来发布合并退化为快进+push。全链验证绿（pytest 4187 + 全仓 ruff + vitest + build）。
 
+### P2-04b ✅（2026-07-18，外部复审收口）——ACK/Delivery 状态机端到端闭环
+
+外部复审指控「状态机没有真正端到端闭环」经逐条核查**三组证据全部属实（零纠偏）**，本批收口：
+
+- **证据 A（终答旁路）**：前置路由答复/引导拒答/NO_RESULT/LLM_ERROR 四个终答点此前走 fire-and-forget 的 `_send_text_reply`（吞异常、无 msg_id）→ 发送静默失败后状态停 processing、重投被按在途吞。修复=新 `_send_terminal_text`（与 `_send_reply` 共用分类引擎 `_post_webhook_classified`），四点全部带 msg_id 入状态机；`_send_text_reply` 降级为提示语专用（问候/收到反馈/新会话/正在查询），调用点白名单由源扫描测试锁死（新增调用不在白名单即红）。
+- **证据 B（RDS 认领非原子）**：原 SELECT-then-INSERT + ODKU no-op 不看 rowcount → 并发双赢家。修复=单赢家协议：INSERT..ODKU **rowcount==1（真插入）唯一赢家**；撞键读行判新鲜；陈旧行**条件接管** UPDATE 带新鲜度 WHERE + 显式 `updated_at=NOW(3)`（防值全同时 affected-rows=0 无人能赢），rowcount 判接管赢家、输家重读 meta。**真库并发实证**：本地 MySQL 8 上 20 线程同 msgId 认领/陈旧接管各严格 1 赢家（`test_msg_dedup_rds_integration.py`，conftest 串行组）。
+- **证据 C（200+errcode 误判 sent）**：HTTP 200 后现在解析业务 errcode——0=sent；瞬态（-1 系统忙/130101 限流）按 5xx 退避重试、耗尽 retryable_failed；其余非零=业务永久失败 final_failed（log body）。200+body 不可解析按 sent（钉钉域 200 恒回 JSON，按不确定报警会制造 never-case 假警报——记录在案取舍）。
+- **残余风险台账分离（closure 8）**：已接受残余=「memory/redis 主层 × RDS 兜底双层同故障时 fail-open 放行可重复回答」（有测试钉住该语义 `test_both_layers_down_is_accepted_residual`）；本批修掉的四处是实现缺陷，不属残余。
+- 测试 +17（errcode 契约/终答发送/原子认领四态/崩溃重投/双层 failover/真库并发 3 条）；closure 7 按校准范围落地（线程级并发+认领后崩溃模拟，多进程编排随真实多副本议程）。
+
+未验证声明：钉钉真机端到端（限流 errcode 实回包形态、Stream 重投链路）仍在 B7；main 摘取孪生随后跟进。
+
 ## 3. 与评审验收条款的映射备注
 
 - 评审 RB-04 验收"durable enqueue 失败返回 503"=批次1-1;"为每个 flag 建条件探针"=批次2-6;"strict=true"=批次7。
