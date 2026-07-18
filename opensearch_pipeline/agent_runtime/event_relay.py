@@ -119,9 +119,18 @@ def has_stream(run_id: str) -> bool:
 
 
 def stream_run_events(run_id: str, *, block_ms: int = 15000,
-                      overall_timeout_s: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+                      overall_timeout_s: Optional[int] = None,
+                      is_terminal_fn=None) -> Iterator[Dict[str, Any]]:
     """从头（0-0）回放 + XREAD 阻塞尾随，直到 __end__ / 终态帧 / 总超时。
-    Redis 客户端 decode_responses=True → fields 均为 str。"""
+    Redis 客户端 decode_responses=True → fields 均为 str。
+
+    is_terminal_fn（批次4，ultra event_relay:132）：可选的「durable run 已终态」探针
+    （routes 层注入 run_store 读，本模块不 import serving）。中继存在恰为其兜底的两类
+    崩溃场景里**终态帧永远不会出现在流上**：(a) 执行方被 SIGKILL → reaper 只做 DB 侧
+    running→failed，不碰 Redis；(b) 中途 publish 失败 _dead=True 后一切后续帧（含终态帧
+    与 __end__）静默丢弃。此前消费者回放完残帧后 XREAD 空等到 1800s。现在：每次 XREAD
+    空转（安静 block_ms 无新帧）时查一次终态——已终态则再做一次 500ms 短读 drain 赛跑帧
+    后收流；活跃流帧不触发探针（零 DB 额外读）。不传 = 旧行为。"""
     from opensearch_pipeline import redis_client
     cli = redis_client.get_client()
     key = _stream_key(run_id)
@@ -129,9 +138,20 @@ def stream_run_events(run_id: str, *, block_ms: int = 15000,
     timeout_s = overall_timeout_s if overall_timeout_s is not None else \
         _int_env("RAG_AGENT_EVENT_RELAY_READ_TIMEOUT_S", 1800)
     deadline = time.monotonic() + max(1, timeout_s)
+    draining = False    # 终态已观测：本轮短读后无新帧即收流
     while time.monotonic() < deadline:
-        resp = cli.xread({key: last_id}, count=256, block=block_ms)
+        resp = cli.xread({key: last_id}, count=256,
+                         block=500 if draining else block_ms)
         if not resp:
+            if draining:
+                return
+            if is_terminal_fn is not None:
+                try:
+                    _term = bool(is_terminal_fn())
+                except Exception:   # noqa: BLE001 — 探针失败按未终态处理（保守继续尾随）
+                    _term = False
+                if _term:
+                    draining = True   # 短宽限 drain（终态帧可能正在赛跑写入）
             continue
         for _k, entries in resp:
             for eid, fields in entries:

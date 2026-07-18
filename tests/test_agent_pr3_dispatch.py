@@ -63,7 +63,9 @@ class MemOutbox:
         r["attempts"] += 1
         return True
 
-    def claim_next(self, *, holder, lease_s, max_attempts=3):
+    def claim_next(self, *, holder, lease_s, max_attempts=3, min_age_s=0):
+        # min_age_s（批次4 认领宽限）：内存桩不建模 created_at，签名兼容即可——
+        # 宽限的 SQL 语义由 RDS 实现的专项测试覆盖。
         now = time.time()
         for r in self.rows.values():
             expired = (r["status"] == "claimed"
@@ -673,3 +675,107 @@ def test_p3b_close_done_claims_then_completes():
     ob.rows[cid]["run_id"] = "run9"                        # resume 命令 enqueue 即绑 run
     d.close_done(cid)
     assert ob.rows[cid]["status"] == "done"
+
+# ── 批次4（ultra 评审）：认领竞态/CAS 静默/resume 僵尸 ─────────────────────────
+
+
+def test_b4_bind_cas_miss_skips_complete_and_stays_loud(caplog):
+    """批次4（ultra durable_dispatcher:73）：租约被他方偷走后 bind CAS 落空——响亮 ERROR
+    + 跳过 complete（命令归窃取方收敛），绝不静默把他人持有的命令越权收口 done。"""
+    import logging
+
+    ob = MemOutbox()
+    d = _mk(ob, lambda cmd: None)
+    cid = ob.enqueue(thread_id="t", user_id="u", channel="console", payload={"question": "q"})
+    assert d.claim_for_request(cid)
+    ob.rows[cid]["lease_holder"] = "thief"          # 模拟他方偷租约（dispatch 超时未续）
+    with caplog.at_level(logging.ERROR):
+        d.bind_and_done(cid, "runX")                # 不抛
+    assert ob.rows[cid]["status"] == "claimed"      # 未被越权收口 done
+    assert ob.rows[cid]["run_id"] is None           # bind 未落
+    assert any("bind CAS 落空" in r.message for r in caplog.records)
+
+
+def test_b4_tick_closes_exhausted_resume_zombies():
+    """批次4（ultra dispatch_outbox:242）：tick 接线 sweep_exhausted_resumes——
+    attempts 封顶的 resume 命令按 run 现状收口，计数进返回值（观测面）。"""
+    class _Outbox(MemOutbox):
+        def __init__(self):
+            super().__init__()
+            self.swept_with = None
+
+        def sweep_exhausted_resumes(self, *, max_attempts=3):
+            self.swept_with = max_attempts
+            return 2
+
+    ob = _Outbox()
+    d = _mk(ob, lambda cmd: None, max_attempts=5)
+    rep = d.tick()
+    assert ob.swept_with == 5
+    assert rep["resume_closed"] == 2
+
+
+def test_b4_claim_next_receives_min_age_grace(monkeypatch):
+    """批次4（ultra dispatch_outbox:134）：扫描认领必须带最小年龄宽限——挡住
+    「fast-path enqueue 与 claim_specific 之间毫秒窗被扫描抢单 → 双跑」的竞态。"""
+    seen = {}
+
+    class _Outbox(MemOutbox):
+        def claim_next(self, *, holder, lease_s, max_attempts=3, min_age_s=0):
+            seen["min_age_s"] = min_age_s
+            return None
+
+    monkeypatch.setenv("RAG_AGENT_DISPATCH_CLAIM_GRACE_S", "45")
+    d = DurableDispatcher(_Outbox(), lambda cmd: None, holder="h-test", lease_s=60)
+    d.tick()
+    assert seen["min_age_s"] == 45
+
+
+def test_b4_rds_claim_next_sql_carries_age_grace(monkeypatch):
+    """RDS 实现的 SQL 面：min_age_s>0 时 queued 臂带 created_at 宽限谓词；=0 字节级旧 SQL。"""
+    from opensearch_pipeline.agent_runtime.dispatch_outbox import RDSDispatchOutbox
+
+    conn = _Conn()
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: conn)
+    RDSDispatchOutbox().claim_next(holder="h", lease_s=60, min_age_s=30)
+    sel = [s for s in conn.sqls if s.strip().upper().startswith("SELECT")][0]
+    assert "created_at < DATE_SUB(NOW(3), INTERVAL %s SECOND)" in sel
+    conn2 = _Conn()
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: conn2)
+    RDSDispatchOutbox().claim_next(holder="h", lease_s=60)
+    sel2 = [s for s in conn2.sqls if s.strip().upper().startswith("SELECT")][0]
+    assert "DATE_SUB" not in sel2 and "status='queued'" in sel2
+
+
+def test_b4_rds_sweep_exhausted_resumes_sql_shape(monkeypatch):
+    """RDS 实现的 SQL 面：resume 僵尸收口按 run 现状分派 failed/done，LEFT JOIN 兜住
+    run 行已清除的孤儿。"""
+    from opensearch_pipeline.agent_runtime.dispatch_outbox import RDSDispatchOutbox
+
+    conn = _Conn()
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda: conn)
+    RDSDispatchOutbox().sweep_exhausted_resumes(max_attempts=3)
+    sql = " ".join(" ".join(s.split()) for s in conn.sqls)
+    assert "kind='resume'" in sql and "attempts >= %s" in sql
+    assert "LEFT JOIN" in sql and "r.status='suspended'" in sql
+
+
+def test_b4_lost_claim_does_not_direct_dispatch(pr3_wired, monkeypatch):
+    """批次4（ultra dispatch_outbox:134 后半）：认领被他方抢走后**不再直通执行**——
+    此前直通 + 抢单方稍后重驱 = 同一问题双 run 双答案双计费；现在 409 受理提示
+    （恰一次执行归命令持有方），零 run 创建。"""
+    _ob, store = pr3_wired
+    monkeypatch.setenv("RAG_AGENT_DURABLE_DISPATCH", "true")
+
+    class _StolenOutbox(MemOutbox):
+        def claim_specific(self, command_id, *, holder, lease_s):
+            return False        # 他方已抢先持有
+
+    monkeypatch.setattr(agent_route, "_get_dispatch_outbox", lambda: _StolenOutbox())
+    monkeypatch.setattr(agent_route, "_DISPATCHER", None)
+    try:
+        r = _ask({"question": "问题", "session_id": "s1"})
+        assert r.status_code == 409
+        assert store.transitions == []               # 未直通执行：零状态迁移零 run
+    finally:
+        api.app.dependency_overrides.clear()

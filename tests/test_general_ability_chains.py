@@ -350,3 +350,55 @@ class TestDingtalkAdapters:
         BOT = self._cfg(monkeypatch, mode="off", guided=False)
         assert BOT._bot_failure_outcome("任意问题", [], sender_staff_id="S1",
                                         history=None, conversation_type="1") is None
+
+
+class TestCalcQuotaExemption:
+    """批次4（ultra general_answerer:203）：确定性计算器先于配额——calc 命中零 LLM 成本
+    免配额（此前先 admit_general 再进 calc 分支：算术题白烧配额格，配额用尽后连
+    「3+5」都吃配额拒答话术）。api 侧与 dingtalk_bot 侧同源修复。"""
+
+    def test_calc_bypasses_quota_even_when_exhausted(self, monkeypatch):
+        import opensearch_pipeline.api as API
+        import opensearch_pipeline.rate_limiter as RL
+        calls = []
+
+        def _deny(actor, is_user):
+            calls.append(actor)
+            return Denial(429, "x", 60, "general_quota")
+
+        monkeypatch.setattr(RL.LIMITER, "admit_general", _deny)
+        ident = types.SimpleNamespace(user_id="U1", acl_groups=["it"], name="张")
+        out = API._execute_general_llm("3+5", history=None, tier="office", identity=ident)
+        assert out is not None and out["model"] == "calc"
+        assert "8" in out["answer"]
+        assert calls == [], "calc 命中免配额：admit_general 不得被调用"
+        assert out["answer_status"] == "SUCCESS" and out["source"] == "general"
+
+    def test_non_calc_still_goes_through_quota(self, monkeypatch):
+        import opensearch_pipeline.api as API
+        import opensearch_pipeline.rate_limiter as RL
+        calls = []
+
+        def _admit(actor, is_user):
+            calls.append(actor)
+            return Denial(429, "x", 60, "general_quota")
+
+        monkeypatch.setattr(RL.LIMITER, "admit_general", _admit)
+        ident = types.SimpleNamespace(user_id="U1", acl_groups=["it"], name="张")
+        out = API._execute_general_llm("帮我翻译一句话", history=None, tier="office",
+                                       identity=ident)
+        assert calls, "非 calc 问题仍须过配额"
+        assert out["intent_type"] == "refuse_quota"
+
+    def test_bot_side_calc_bypasses_quota(self, monkeypatch):
+        import opensearch_pipeline.dingtalk_bot as BOT
+
+        def _deny(actor, is_user):
+            raise AssertionError("calc 命中不得触达配额")
+
+        monkeypatch.setattr(BOT, "LIMITER",
+                            types.SimpleNamespace(admit_general=_deny))
+        out = BOT._bot_execute_general_llm("12*3", history=None, tier="office",
+                                           sender_staff_id="s1")
+        assert out is not None and out["model"] == "calc"
+        assert "36" in out["answer"]

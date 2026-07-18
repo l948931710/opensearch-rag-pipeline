@@ -812,6 +812,7 @@ def agent_ask(req: AskRequest, request: Request,
     # 的问题不再静默蒸发。enqueue/认领失败回退直通路径（可用性优先，最常见原因=
     # 043 未 apply，响亮告警）；容量/会话忙沿用 429/409（命令诚实收口 failed，UX 零变化）。
     durable_cmd = None
+    _claim_lost_cmd = None
     from opensearch_pipeline.agent_runtime.durable_dispatcher import durable_dispatch_enabled
     if durable_dispatch_enabled():
         try:
@@ -824,10 +825,19 @@ def agent_ask(req: AskRequest, request: Request,
             if _dispatcher.claim_for_request(_cmd_id):
                 durable_cmd = (_dispatcher, _cmd_id)
             else:
-                logger.warning("durable dispatch 命令 %s 认领失败（他方抢先？）——直通执行",
-                               _cmd_id)
+                # 批次4（ultra dispatch_outbox:134 后半）：失去认领后**不再直通执行**——
+                # 命令已归他方（恢复扫描/他副本）持有，他方必然重建执行；本方再直通就是
+                # 同一问题双 run 双答案双计费。claim_next 已加最小年龄宽限，这里理论上
+                # 只剩防御性角落（如本请求线程在 enqueue 后停顿超过宽限）。
+                _claim_lost_cmd = _cmd_id
+                logger.warning("durable dispatch 命令 %s 认领失败（他方抢先持有）——"
+                               "不直通执行，由持有方重建执行", _cmd_id)
         except Exception:   # noqa: BLE001 — 受理面故障不拦 ask（检查 043 是否已 apply）
             logger.error("durable dispatch 受理失败——回退直通路径", exc_info=True)
+    if _claim_lost_cmd is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="该问题已受理并正在处理中，请稍后在会话历史查看回答（请勿重复提交）")
 
     try:
         handle = executor.submit(ctx, loop, messages, tools,
@@ -1002,6 +1012,28 @@ def agent_approve(req: ApproveRequest, request: Request,
     run = run_store.get_run(req.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run 不存在")
+    # 批次4（ultra routes/agent:1005）：**授权前不泄露 run 状态/审批决定**——此前非挂起
+    # 分支（幂等回放 202 带决定内容、409 detail 内嵌实时 status）先于任何归属检查执行，
+    # 任何持有 run_id 的登录员工都能探知 run 存在性/状态/审批方向。这里先过**可见性门**
+    # （放行集合刻意比 _authorize_approver 宽：发起人 / kb_admin / 快照 scope 覆盖的
+    # dept_admin——他们本就该看到审批上下文），其余一律 404（不可见==不存在，对齐
+    # run 详情端点）；真正的裁决权（职责分离 403）仍由下方 _authorize_approver 决定。
+    if run.get("user_id") != identity.user_id:
+        from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
+        from opensearch_pipeline.kb_authz import (
+            ROLE_DEPT_ADMIN, ROLE_KB_ADMIN, managed_owner_depts)
+        _kb_vis = resolve_kb_identity(identity.user_id)
+        _visible = _kb_vis.role == ROLE_KB_ADMIN
+        if not _visible and _kb_vis.role == ROLE_DEPT_ADMIN:
+            try:
+                _areq_vis = _get_approval_store().get_latest_by_run(req.run_id)
+            except Exception:   # noqa: BLE001 — 可见性事实读不出 → 按不可见处理（fail-closed）
+                _areq_vis = None
+            _scope_vis = (_areq_vis or {}).get("approver_scope") or ""
+            _visible = bool(_scope_vis) and _scope_covers(
+                _scope_vis, set(managed_owner_depts(_kb_vis)))
+        if not _visible:
+            raise HTTPException(status_code=404, detail="run 不存在")   # 不可见==不存在
     if run.get("status") != "suspended":
         # P1-07（外审核查 2026-07-16）：已受理命令的 HTTP 重试 → 幂等回放 202 而非 409
         replay = _replay_decided_response(req, run)
@@ -1865,9 +1897,21 @@ def agent_run_events(run_id: str, request: Request,
         return StreamingResponse(_expired(), media_type="text/event-stream",
                                  headers=_SSE_HEADERS)
 
+    # 批次4（ultra event_relay:132）：durable 终态探针注入——崩溃收尸（reaper 只写 DB）
+    # 或中继降级（_dead 停发）时流上永远不会出现终态帧，此前重连消费者回放完残帧后
+    # XREAD 空等到 30 分钟；探针只在流安静（XREAD 空转）时查一次，活跃流零额外读。
+    def _run_is_terminal() -> bool:
+        try:
+            _r = run_store.get_run_status(run_id) if hasattr(run_store, "get_run_status") \
+                else run_store.get_run(run_id)
+            return bool(_r and _r.get("status") in
+                        ("succeeded", "failed", "cancelled", "expired"))
+        except Exception:   # noqa: BLE001 — 探针失败按未终态（保守继续尾随）
+            return False
+
     def _gen():
         try:
-            for d in stream_run_events(run_id):
+            for d in stream_run_events(run_id, is_terminal_fn=_run_is_terminal):
                 t = d.get("type")
                 if t == "model_delta":
                     if d.get("text"):   # A7：空 delta 不回放（与 /ask 实时流同 guard）

@@ -474,7 +474,14 @@ class RDSApprovalStore:
         由 reconcile 按 approval_decision 重建 outcome 重发 resume。
 
         grace_s：决定落库后的静默期——避免与正在进行的 resume 赛跑（decide→resume 是
-        同请求内的两步，正常间隔毫秒级；默认 120s 只捞真死单）。"""
+        同请求内的两步，正常间隔毫秒级；默认 120s 只捞真死单）。
+
+        批次4（ultra P1 approval_store:488）：只捞该 run 的**最新**请求——已决请求永远
+        停在 approved/... 终态（无 consumed 迁移），多审批周期 run（批过 request 1、
+        resume、再挂起 request 2）里旧决定会永久满足本扫描，被对账重放到新挂起调用：
+        同工具同参时 = 批一次、同参调用永放行；异参时 = 每周期无谓抢跑真实审批人。
+        NOT EXISTS 按 (created_at, request_id) 排除存在更新请求的行（executor 侧另有
+        call_id 锚定双保险，见 _verify_persisted_decision）。"""
         db = _op_db()
         conn = self._conn()
         try:
@@ -487,6 +494,11 @@ class RDSApprovalStore:
                     f"JOIN {db}.approval_decision d ON d.request_id = ar.request_id "
                     "WHERE ar.status IN ('approved','edited','rejected_feedback','rejected_terminate') "
                     "AND ar.decided_at < DATE_SUB(NOW(3), INTERVAL %s SECOND) "
+                    f"AND NOT EXISTS (SELECT 1 FROM {db}.approval_request ar2 "
+                    "                 WHERE ar2.run_id = ar.run_id "
+                    "                   AND (ar2.created_at > ar.created_at "
+                    "                        OR (ar2.created_at = ar.created_at "
+                    "                            AND ar2.request_id > ar.request_id))) "
                     "ORDER BY ar.decided_at ASC LIMIT %s",
                     (int(grace_s), int(limit)))
                 rows = cur.fetchall() or []

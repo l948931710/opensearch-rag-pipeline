@@ -59,6 +59,11 @@ class DurableDispatcher:
         self.lease_s = lease_s if lease_s is not None else _int_env("RAG_AGENT_DISPATCH_LEASE_S", 120)
         self.max_attempts = (max_attempts if max_attempts is not None
                              else _int_env("RAG_AGENT_DISPATCH_MAX_ATTEMPTS", 3))
+        # 批次4（ultra dispatch_outbox:134）：扫描认领 queued 行的最小落地年龄——挡住
+        # 「fast path enqueue commit 与 claim_specific 之间的毫秒窗被扫描 tick 抢单 →
+        # 直通+重驱双跑」的竞态。真孤儿（fast path 进程死于两步之间）最多多等一个宽限
+        # 即被下轮扫描收走；0 = 旧行为。
+        self.claim_min_age_s = _int_env("RAG_AGENT_DISPATCH_CLAIM_GRACE_S", 30)
 
     # ── fast path（请求线程内）────────────────────────────────────
     def claim_for_request(self, command_id: str) -> bool:
@@ -68,10 +73,25 @@ class DurableDispatcher:
 
     def bind_and_done(self, command_id: str, run_id: str) -> None:
         """执行已起跑：绑 run（at-most-once 分界）+ 收口 done。fail-open——
-        这里任何失败都不碰已起跑的 run（恢复扫描会按「已绑/未绑」正确收敛）。"""
+        这里任何失败都不碰已起跑的 run（恢复扫描会按「已绑/未绑」正确收敛）。
+
+        批次4（ultra durable_dispatcher:73）：bind_run/complete 都是 holder-CAS（返回
+        bool），此前返回值被丢弃、只有异常才出日志——dispatch 超过租约未续、他方偷走
+        claim 时，本方 bind 静默落空、本方 run 照跑、窃取方重执行 = **无任何日志的双跑**。
+        CAS 落空必须响亮记 ERROR；bind 落空还必须**跳过 complete**（此时命令归窃取方，
+        无 holder 权收口，且窃取方执行中——由其自行 bind+done 收敛）。"""
         try:
-            self._outbox.bind_run(command_id, run_id, holder=self.holder)
-            self._outbox.complete(command_id, status="done", holder=self.holder)
+            if not self._outbox.bind_run(command_id, run_id, holder=self.holder):
+                logger.error(
+                    "dispatch 命令 %s bind CAS 落空（lease 已被他方偷走；本方 run %s 已起跑，"
+                    "他方可能重执行同一命令=重复回答）——跳过 complete，命令由现持有者收敛；"
+                    "若成规律出现请检查租约时长 RAG_AGENT_DISPATCH_LEASE_S 与执行耗时",
+                    command_id, run_id)
+                return
+            if not self._outbox.complete(command_id, status="done", holder=self.holder):
+                logger.error(
+                    "dispatch 命令 %s bind 后 complete CAS 落空（租约在两步之间被偷走）——"
+                    "run %s 已绑，恢复扫描将按「已绑」收口 done", command_id, run_id)
         except Exception:   # noqa: BLE001
             logger.warning("dispatch 命令 %s 收口失败（run %s 已起跑，恢复扫描将按已绑收敛）",
                            command_id, run_id, exc_info=True)
@@ -101,6 +121,7 @@ class DurableDispatcher:
     def tick(self) -> Dict[str, int]:
         """跑一轮恢复。返回计数（观测用）。每步独立 fail-open——单步故障不拖垮整轮。"""
         closed = failed = redriven = 0
+        resume_closed = 0
         try:
             for cmd in self._outbox.list_bound_expired():
                 # 已绑 run=dispatch 已成功（run 的生死归 run 机器/reaper）→ 越权收口
@@ -117,10 +138,22 @@ class DurableDispatcher:
                              "需人工关注 agent_dispatch_command.last_error）", failed)
         except Exception:   # noqa: BLE001
             logger.warning("恢复扫描：attempts 封顶收口失败（下轮再试）", exc_info=True)
+        # 批次4（ultra dispatch_outbox:242）：attempts 封顶的 resume 命令按 run 现状收口
+        # ——此前三个收口路径全够不着，永久非终态僵尸挂在 backlog_count 上。
+        try:
+            _sweep_r = getattr(self._outbox, "sweep_exhausted_resumes", None)
+            if _sweep_r is not None:
+                resume_closed = _sweep_r(max_attempts=self.max_attempts)
+                if resume_closed:
+                    logger.error("恢复扫描：%s 条 resume 命令重驱封顶按 run 现状收口"
+                                 "（详见 agent_dispatch_command.last_error）", resume_closed)
+        except Exception:   # noqa: BLE001
+            logger.warning("恢复扫描：resume 封顶收口失败（下轮再试）", exc_info=True)
         while True:
             try:
                 cmd = self._outbox.claim_next(holder=self.holder, lease_s=self.lease_s,
-                                              max_attempts=self.max_attempts)
+                                              max_attempts=self.max_attempts,
+                                              min_age_s=self.claim_min_age_s)
             except Exception:   # noqa: BLE001
                 logger.warning("恢复扫描：claim_next 失败（下轮再试）", exc_info=True)
                 break
@@ -147,7 +180,8 @@ class DurableDispatcher:
                                cmd["command_id"], run_id)
             else:
                 self.fail_fast(cmd["command_id"], "recover_fn 未返回 run_id")
-        return {"closed": closed, "failed": int(failed), "redriven": redriven}
+        return {"closed": closed, "failed": int(failed), "redriven": redriven,
+                "resume_closed": int(resume_closed)}
 
     def run_forever(self, stop: threading.Event, interval_s: Optional[float] = None) -> None:
         """后台循环（daemon 线程体）：启动即先跑一轮（补进程重启前的欠账），随后按间隔。"""

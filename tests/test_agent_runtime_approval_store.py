@@ -167,3 +167,56 @@ def test_list_pending_scoping():
         assert store.list_pending([]) == []                                           # 空 scope 空结果
     finally:
         _cleanup(rid)
+
+
+@skipif_no_approval_db
+def test_b4_list_decided_unresumed_only_latest_request():
+    """批次4（ultra P1 approval_store:488）：对账扫描只捞 run 的**最新**请求——多审批周期
+    run（request1 已批、resume、又挂起 request2）里旧决定不再永久满足扫描（此前会被
+    B6 对账重放到新挂起调用：同工具同参 = 批一次、同参调用永放行）。"""
+    import json as _json
+    import time as _time
+
+    from opensearch_pipeline.agent_runtime.approval_store import (
+        DECIDE_ACCEPTED, RDSApprovalStore)
+    store = RDSApprovalStore()
+    run_id = uuid.uuid4().hex
+    conn = _local_operation_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO agent_run (run_id, thread_id, user_id, channel, agent_profile, "
+            "status, acl_groups_snapshot, started_at) "
+            "VALUES (%s,%s,%s,'console','default','suspended',%s,NOW(3))",
+            (run_id, f"t-{run_id[:8]}", "appr-u1", _json.dumps(["production"])))
+    conn.close()
+    rid1 = store.create_request(run_id, _ctx(), _pending_call())
+    rid2 = None
+    try:
+        assert store.decide(rid1, decision="approved", decided_by="admin-1",
+                            idempotency_key="b4k1") == DECIDE_ACCEPTED
+        _time.sleep(0.02)
+        hits = store.list_decided_unresumed(grace_s=0, limit=100)
+        assert any(h["request_id"] == rid1 for h in hits), "最新且已决：应命中（重发 resume）"
+
+        _time.sleep(0.02)                                    # created_at(3) 拉开毫秒差
+        pc2 = dict(_pending_call())
+        pc2["call_id"] = "c2"
+        rid2 = store.create_request(run_id, _ctx(), pc2)     # 更新的 pending 请求
+        hits2 = store.list_decided_unresumed(grace_s=0, limit=100)
+        assert not any(h["request_id"] == rid1 for h in hits2), \
+            "存在更新请求：旧决定必须退出扫描（不得重放到新挂起调用）"
+
+        assert store.decide(rid2, decision="rejected_feedback", decided_by="admin-1",
+                            idempotency_key="b4k2") == DECIDE_ACCEPTED
+        _time.sleep(0.02)
+        hits3 = store.list_decided_unresumed(grace_s=0, limit=100)
+        assert any(h["request_id"] == rid2 for h in hits3)   # 最新已决 → 照常命中
+        assert not any(h["request_id"] == rid1 for h in hits3)
+    finally:
+        _cleanup(rid1)
+        if rid2:
+            _cleanup(rid2)
+        conn2 = _local_operation_conn()
+        with conn2.cursor() as cur:
+            cur.execute("DELETE FROM agent_run WHERE run_id=%s", (run_id,))
+        conn2.close()

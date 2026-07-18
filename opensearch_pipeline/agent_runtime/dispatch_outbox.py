@@ -116,26 +116,38 @@ class RDSDispatchOutbox:
             conn.close()
 
     def claim_next(self, *, holder: str, lease_s: int,
-                   max_attempts: int = 3) -> Optional[Dict[str, Any]]:
+                   max_attempts: int = 3, min_age_s: int = 0) -> Optional[Dict[str, Any]]:
         """恢复扫描认领：queued 或 lease 已过期的 claimed（持有者已死）中最老的一条。
         SKIP LOCKED：并发扫描（未来多副本）各拿各的，绝不双认领。
         attempts 已达上限的行不再认领（由 sweep_exhausted 收口 failed）。
         Stage B kind-aware（顺修 Stage A 缺口）：**已绑 run 的 submit 命令绝不再认领**
         （at-most-once——此前 list_bound_expired 单批漏网的已绑 submit 会被本查询捡走
         重执行=双答案）；resume 命令 run_id 恒有值，重驱天然幂等（CAS first-claim-wins），
-        照常认领。"""
+        照常认领。
+
+        min_age_s（批次4，ultra dispatch_outbox:134）：>0 时 **queued** 行须落地满该秒数
+        才可被扫描认领——fast path 的 enqueue commit → claim_specific 之间存在毫秒级窗口，
+        扫描 tick 恰好落进去会抢走新单：fast path 直通执行 + 扫描方 ThreadBusy 留 claimed
+        稍后重驱 = 同一问题双 run 双答案双计费。宽限只作用于 queued 臂（lease 过期臂
+        本身已含时间语义）；=0 为字节级旧行为。"""
         db = _op_db()
         conn = self._conn()
         _begin(conn)                        # SELECT FOR UPDATE + UPDATE：钉连接
+        _queued_arm = "status='queued'"
+        _age_params: tuple = ()
+        if int(min_age_s) > 0:
+            _queued_arm = ("(status='queued' AND created_at < "
+                           "DATE_SUB(NOW(3), INTERVAL %s SECOND))")
+            _age_params = (int(min_age_s),)
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT {_COLS} FROM {db}.agent_dispatch_command "
-                    "WHERE (status='queued' OR (status='claimed' AND lease_expires_at < NOW(3))) "
+                    f"WHERE ({_queued_arm} OR (status='claimed' AND lease_expires_at < NOW(3))) "
                     "  AND attempts < %s "
                     "  AND (run_id IS NULL OR kind='resume') "
                     "ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
-                    (int(max_attempts),))
+                    _age_params + (int(max_attempts),))
                 row = cur.fetchone()
                 if not row:
                     conn.rollback()
@@ -241,6 +253,38 @@ class RDSDispatchOutbox:
                     "SET status='failed', last_error='重驱次数封顶（attempts 上限）' "
                     "WHERE run_id IS NULL AND attempts >= %s "
                     "  AND (status='queued' OR (status='claimed' AND lease_expires_at < NOW(3)))",
+                    (int(max_attempts),))
+                n = cur.rowcount
+            conn.commit()
+            return int(n)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def sweep_exhausted_resumes(self, *, max_attempts: int = 3) -> int:
+        """批次4（ultra dispatch_outbox:242）：attempts 封顶的 **resume** 命令此前三个收口
+        路径全部够不着——claim_next 滤 attempts<max、sweep_exhausted 滤 run_id IS NULL、
+        list_bound_expired 只收 kind='submit'——永久停在非终态：backlog_count 恒计入
+        （readiness/告警面漂移），retention 只删终态行，「每条命令必达终态」不变量被破。
+        按 run 现状收口：run 仍 suspended = resume 从未送达 → failed（留因）；run 行已
+        不存在（purge/清除）→ failed；其余（running/终态）= resume 已生效或已无意义 → done。"""
+        db = _op_db()
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.agent_dispatch_command c "
+                    f"LEFT JOIN {db}.agent_run r ON r.run_id = c.run_id "
+                    "SET c.status = IF(r.run_id IS NULL OR r.status='suspended', "
+                    "                  'failed', 'done'), "
+                    "    c.last_error = CASE "
+                    "        WHEN r.run_id IS NULL THEN '重驱次数封顶（run 行已不存在/已清除）' "
+                    "        WHEN r.status='suspended' THEN '重驱次数封顶（resume 未送达，run 仍挂起）' "
+                    "        ELSE c.last_error END "
+                    "WHERE c.kind='resume' AND c.run_id IS NOT NULL AND c.attempts >= %s "
+                    "  AND (c.status='queued' OR (c.status='claimed' AND c.lease_expires_at < NOW(3)))",
                     (int(max_attempts),))
                 n = cur.rowcount
             conn.commit()

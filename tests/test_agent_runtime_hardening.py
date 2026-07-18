@@ -720,3 +720,176 @@ def test_driver_emits_tool_result_after_adjudication():
         assert not hasattr(trs[0], "arguments")            # 帧上无参数/内容（敏感面不外发）
     finally:
         ex.shutdown()
+
+
+# ═════════════════ 批次4（ultra 评审）executor 三修 ═════════════════
+
+
+class _CallIdDecisionStore(_DecisionStore):
+    """_DecisionStore + 请求行（含 call_id）——旧决定重放锚定校验用。"""
+
+    def __init__(self, decision, req_call_id):
+        super().__init__(decision=decision)
+        self._req_call_id = req_call_id
+
+    def get_request(self, request_id):
+        return {"request_id": self.request_id, "call_id": self._req_call_id}
+
+
+def test_b4_grant_rejects_stale_decision_for_other_call():
+    """批次4（ultra approval_store:488 联动）：决定锚定的请求 call_id ≠ 当前挂起调用
+    （多审批周期的旧决定被重放到新调用）→ RunRejected，同工具同参也不放行。"""
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.executor import RunRejected
+    from opensearch_pipeline.agent_runtime.tool_executor import digest as _digest
+    astore = _CallIdDecisionStore(
+        {"decision": "approved", "final_args_digest": _digest({"qty": 7}),
+         "request_id": "req1"}, req_call_id="c-OLD")
+    with pytest.raises(RunRejected, match="另一次调用"):
+        _resume_with(astore)
+
+
+def test_b4_grant_accepts_decision_anchored_to_current_call():
+    """对照：请求行 call_id == checkpoint pending call_id（c1）→ 照常放行续跑。"""
+    from opensearch_pipeline.agent_runtime.tool_executor import digest as _digest
+    astore = _CallIdDecisionStore(
+        {"decision": "approved", "final_args_digest": _digest({"qty": 7}),
+         "request_id": "req1"}, req_call_id="c1")
+    store = _resume_with(astore)
+    assert ("resuming", "running") in store.transitions
+
+
+def _digestless_cp_store():
+    """state_digest=None 的 checkpoint store（合法可解码 blob，只抹摘要）。"""
+    blob, _dig = encode_checkpoint([{"role": "user", "content": "q"}],
+                                   pending_call=None, turn=0)
+
+    class _S:
+        def __init__(self):
+            self.transitions = []
+
+        def transition(self, run_id, frm, to):
+            self.transitions.append((frm, to))
+            return True
+
+        def load_latest_checkpoint(self, run_id):
+            return SimpleNamespace(checkpoint_id="cp1", state_blob=blob, state_digest=None)
+
+        def consume_budget(self, run_id, **kw):
+            return {}
+
+    return _S()
+
+
+def test_b4_missing_digest_rejected_when_require_hmac_on(monkeypatch):
+    """批次4（ultra executor:410）：REQUIRE_HMAC 开时缺 digest → 拒绝续跑（能写表的
+    攻击者置空 digest 列即可绕过全部校验——正是 HMAC 的威胁模型），run 回滚 suspended。"""
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.executor import RunRejected, ThreadedRunExecutor
+    monkeypatch.delenv("RAG_AGENT_CHECKPOINT_KEY", raising=False)
+    monkeypatch.delenv("RAG_SESSION_SIGNING_KEY", raising=False)
+    monkeypatch.setenv("RAG_AGENT_CHECKPOINT_REQUIRE_HMAC", "true")
+    store = _digestless_cp_store()
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("x"), max_concurrent=2)
+    try:
+        with pytest.raises(RunRejected, match="无完整性摘要"):
+            ex.resume("run1", _ctx(), Approved(),
+                      DefaultAgentLoop(lambda m, t: ModelTurn(text="a")), [])
+        assert ("resuming", "suspended") in store.transitions    # 回边保住可重试
+    finally:
+        ex.shutdown(wait=False)
+
+
+def test_b4_missing_digest_rejected_when_key_present(monkeypatch):
+    """批次4：密钥在场（即便 REQUIRE_HMAC 未开）缺 digest 同样拒绝——密钥在场即表示
+    完整性校验已启用，摘要被抹=可疑。"""
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.executor import RunRejected, ThreadedRunExecutor
+    monkeypatch.setenv("RAG_AGENT_CHECKPOINT_KEY", "unit-test-key-material")
+    monkeypatch.delenv("RAG_AGENT_CHECKPOINT_REQUIRE_HMAC", raising=False)
+    store = _digestless_cp_store()
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("x"), max_concurrent=2)
+    try:
+        with pytest.raises(RunRejected, match="无完整性摘要"):
+            ex.resume("run1", _ctx(), Approved(),
+                      DefaultAgentLoop(lambda m, t: ModelTurn(text="a")), [])
+    finally:
+        ex.shutdown(wait=False)
+
+
+def test_b4_missing_digest_still_skipped_without_key(monkeypatch):
+    """对照（无密钥环境旧语义）：digest 缺失 + 无密钥无 flag → 跳过校验照常续跑
+    （直驱单测/简化桩/未启用 HMAC 的部署零回归）。"""
+    from opensearch_pipeline.agent_runtime.executor import ThreadedRunExecutor
+    monkeypatch.delenv("RAG_AGENT_CHECKPOINT_KEY", raising=False)
+    monkeypatch.delenv("RAG_SESSION_SIGNING_KEY", raising=False)
+    monkeypatch.delenv("RAG_AGENT_CHECKPOINT_REQUIRE_HMAC", raising=False)
+    store = _digestless_cp_store()
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("x"), max_concurrent=2)
+    try:
+        h = ex.resume("run1", _ctx(), Approved(),
+                      DefaultAgentLoop(lambda m, t: ModelTurn(text="a")), [])
+        list(h.events())
+        assert ("resuming", "running") in store.transitions
+    finally:
+        ex.shutdown(wait=True)
+
+
+def test_b4_pool_failure_maybe_scheduled_keeps_slot():
+    """批次4（ultra executor:231）：pool.submit 抛错但条目**可能已入队**（非 shutdown/
+    broken，如线程创建失败）→ 并发槽不释放（所有权随条目交给可能在跑的驱动器，其
+    finally 释放同一份 _acquire；双释放会让 _active 欠计、max_concurrent 闸被侵蚀）；
+    certainly-rejected（shutdown/broken 态）→ 必未入队，照旧诚实释放。"""
+    import pytest
+
+    from opensearch_pipeline.agent_runtime.executor import ThreadedRunExecutor
+
+    class _Store:
+        def __init__(self):
+            self.transitions = []
+
+        def create_run(self, ctx, profile):
+            return "runP"
+
+        def transition(self, run_id, frm, to):
+            self.transitions.append((run_id, frm, to))
+            return True
+
+    class _BoomPool:
+        _shutdown = False
+        _broken = False
+
+        def submit(self, *a, **k):
+            raise RuntimeError("can't start new thread")
+
+        def shutdown(self, *a, **k):
+            pass
+
+    store = _Store()
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("x"), max_concurrent=2)
+    ex._pool.shutdown(wait=False)
+    ex._pool = _BoomPool()
+    with pytest.raises(RuntimeError):
+        ex.submit(_ctx(), DefaultAgentLoop(lambda m, t: ModelTurn(text="a")),
+                  [{"role": "user", "content": "q"}], [])
+    assert ex._active == 1, "可能已入队：槽所有权移交驱动器，不得在 except 路径重复释放"
+    assert ("runP", "running", "failed") not in store.transitions   # 不反标（真答案不作废）
+
+    class _DeadPool(_BoomPool):
+        _shutdown = True
+
+        def submit(self, *a, **k):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+    store2 = _Store()
+    ex2 = ThreadedRunExecutor(store2, lambda ctx, ev: ToolResult.text_ok("x"), max_concurrent=2)
+    ex2._pool.shutdown(wait=False)
+    ex2._pool = _DeadPool()
+    with pytest.raises(RuntimeError):
+        ex2.submit(_ctx(), DefaultAgentLoop(lambda m, t: ModelTurn(text="a")),
+                   [{"role": "user", "content": "q"}], [])
+    assert ex2._active == 0, "certainly-rejected：条目必未入队，槽诚实释放"
+    assert ("runP", "running", "failed") in store2.transitions      # 诚实收口

@@ -228,7 +228,13 @@ class ThreadedRunExecutor:
                 # 只上抛（见 _dispatch_certainly_rejected）。
                 if not dispatch_maybe_scheduled:
                     self._transition_checked(run_id, "running", "failed")
-            self._release()
+            # 批次4（ultra executor:231）：条目可能已入队时**不释放并发槽**——warm worker
+            # 驱动 _drive_gen 的 finally 会释放同一份 _acquire；这里再释放=一次准入两次归还，
+            # _active 永久欠计、max_concurrent 闸被侵蚀（drain 也会在 run 仍在跑时提前判空）。
+            # 槽所有权随条目移交给（可能在跑的）驱动器；真未入队的罕见角落宁可漏一个槽
+            # （容量自限，保守），绝不欠计（放大并发，危险）。
+            if not dispatch_maybe_scheduled:
+                self._release()
             raise
 
     def resume(self, run_id: str, ctx: ExecutionContext, outcome, loop: AgentLoop,
@@ -312,7 +318,8 @@ class ThreadedRunExecutor:
                 # 记录缺失时 kb_admin 一批准即产生无落库决策支撑的 grant」。
                 dec = self._verify_persisted_decision(
                     run_id, outcome, args_digest=digest(args),
-                    request_id=meta.get("request_id"))
+                    request_id=meta.get("request_id"),
+                    pending_call_id=pending.get("call_id"))
                 self._approvals[f"{run_id}:{pending['call_id']}"] = ApprovalGrant(
                     outcome=outcome, tool_name=pending["tool_name"], args_digest=digest(args),
                     request_id=meta.get("request_id") or (dec or {}).get("request_id"),
@@ -358,11 +365,15 @@ class ThreadedRunExecutor:
                     handle._emit(RunFailed(error="续跑交棒失败（执行器不可用），请重试",
                                            retryable=True))
                     handle._finish()
-            self._release()
+            # 批次4（ultra executor:231 同族）：条目可能已入队时不释放槽（同 submit 注释——
+            # 驱动器 finally 会释放同一份 _acquire，双释放侵蚀并发闸）。
+            if not dispatch_maybe_scheduled:
+                self._release()
             raise
 
     def _verify_persisted_decision(self, run_id: str, outcome, *, args_digest: str,
-                                   request_id: Optional[str] = None) -> Optional[dict]:
+                                   request_id: Optional[str] = None,
+                                   pending_call_id: Optional[str] = None) -> Optional[dict]:
         """P0-B「无落库决策的 grant」：接了 approval_store 时，Approved/Edited 续跑必须能
         锚定一行**已持久化的 approval_decision**——同向（decision==outcome.kind）且
         final_args_digest 与将执行参数摘要完全一致。任何一环失败（读库异常/请求行缺失/
@@ -373,6 +384,7 @@ class ThreadedRunExecutor:
             return None
         try:
             rid = request_id
+            latest = None
             if not rid:
                 latest = self._approval_store.get_latest_by_run(run_id)
                 rid = (latest or {}).get("request_id")
@@ -390,6 +402,29 @@ class ThreadedRunExecutor:
             raise RunRejected("审批决定缺最终参数摘要（早于 schema/031），拒绝自动续跑")
         if dec["final_args_digest"] != args_digest:
             raise RunRejected("将执行参数与已落库审批决定不一致，拒绝续跑（改参重放被拒）")
+        # 批次4（ultra approval_store:488 联动）：决定还必须锚定**当前挂起的调用**——
+        # 请求行 call_id ≡ checkpoint pending_call.call_id。多审批周期 run（批过 request 1、
+        # resume、再挂起 request 2）中旧请求永远停在 approved：不锚定 call_id 时，同工具
+        # 同参的旧决定会被重放到新挂起调用上=「批一次、同参调用永放行」。真实存储行恒含
+        # call_id（schema/025 NOT NULL），行内无 call_id 键的简化测试桩沿用旧语义跳过。
+        if pending_call_id:
+            areq = None
+            try:
+                # latest 捷径仅当其自带 call_id（真实存储行恒有）；否则回落 get_request
+                if latest is not None and latest.get("request_id") == rid \
+                        and latest.get("call_id") is not None:
+                    areq = latest
+                else:
+                    _get_req = getattr(self._approval_store, "get_request", None)
+                    if _get_req is not None:
+                        areq = _get_req(rid)
+            except Exception as e:   # noqa: BLE001 — 锚定事实读不出 → 宁停不批
+                raise RunRejected(f"审批请求行读取失败，拒绝续跑（fail-closed）: {e}")
+            if areq is not None and areq.get("call_id") is not None \
+                    and str(areq["call_id"]) != str(pending_call_id):
+                raise RunRejected(
+                    "审批决定锚定的请求对应另一次调用（call_id 与当前挂起调用不符——"
+                    "旧决定重放被拒），拒绝续跑")
         return dec
 
     @staticmethod
@@ -408,7 +443,17 @@ class ThreadedRunExecutor:
         from opensearch_pipeline.agent_runtime.loop import checkpoint_hmac_key
         digest = getattr(cp, "state_digest", None)
         if not digest:
-            return                                   # 旧行/简化测试桩无 digest：跳过
+            # 批次4（ultra executor:410）：密钥在场或 REQUIRE_HMAC 开启时缺摘要=可疑——
+            # HMAC 的威胁模型正是「能写 agent_checkpoint 表的攻击者」，其可把 digest 列
+            # 置 NULL + 篡改 blob 绕过全部校验（连 REQUIRE_HMAC 反降级检查都短路）。
+            # 仅无密钥环境（直驱单测/简化桩、未启用 HMAC 的部署）保留跳过语义。
+            if checkpoint_hmac_key() is not None or os.environ.get(
+                    "RAG_AGENT_CHECKPOINT_REQUIRE_HMAC", "").strip().lower() in (
+                    "1", "true", "yes", "on"):
+                raise RunRejected(
+                    f"checkpoint {getattr(cp, 'checkpoint_id', '?')} 无完整性摘要而校验已启用"
+                    f"（密钥在场/REQUIRE_HMAC），拒绝续跑（防摘要抹除绕过）")
+            return                                   # 无密钥环境旧行/简化测试桩：跳过
         blob = cp.state_blob
         if isinstance(blob, str):
             blob = blob.encode("utf-8", "surrogateescape")
@@ -526,9 +571,16 @@ class ThreadedRunExecutor:
                     # 成为无驱动僵尸而用户以为在等审批（深度审查 B 组）。
                     cp_id, aid, transitioned = self._persist_suspend(ctx, run_id, ev)
                     if not transitioned and not self._transition_checked(run_id, "running", "suspended"):
-                        self._safe_transition(run_id, "running", "failed")
                         handle._emit(RunFailed(error="挂起状态落库失败，请重试", retryable=True))
-                        self._notify_failure(handle, "挂起状态落库失败")
+                        # 批次4（ultra executor:531）：失败侧回调补 D3 归属栅栏（对齐 567-571/
+                        # 588-592/596-600）——running→failed CAS 成立才证明本线程仍持有 run；
+                        # 挂起落库失败常因所有权已失（purge/收尸/取消抢先），此前 _safe_transition
+                        # 吞结果 + 无条件 _notify_failure，会在主体擦除后重插 qa_session_log 行。
+                        if self._transition_checked(run_id, "running", "failed"):
+                            self._notify_failure(handle, "挂起状态落库失败")
+                        else:
+                            logger.error("run %s 挂起落库失败收尾时已失去所有权（purge/收尸/"
+                                         "取消抢先），跳过失败侧落库", run_id)
                         break
                     handle._emit(RunSuspended(approval_request_id=aid, checkpoint_id=cp_id,
                                               pending_call=ev.pending_call, turn_index=ev.turn_index))

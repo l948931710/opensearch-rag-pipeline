@@ -286,3 +286,52 @@ def test_redis_concurrent_admission_exact(monkeypatch):
     for t in threads:
         t.join()
     assert len(admitted) == 50
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 批次4（ultra P1 rate_limiter:718）：admit_general 双后端契约
+# redis 后端此前缺本方法——redis 后端 + RAG_GENERAL_ABILITY_MODE 开启（均在 workers>1
+# 铺开路径上）时 api.py/dingtalk_bot 直调 → AttributeError → 500。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_general_quota_admit_then_deny_parity(make_backend):
+    lim = make_backend(FakeClock(), RAG_GENERAL_DAILY_QUOTA=2)
+    assert lim.admit_general("u:a", is_user=True) is None
+    assert lim.admit_general("u:a", is_user=True) is None
+    d = lim.admit_general("u:a", is_user=True)
+    assert d is not None and d.status_code == 429 and d.reason == "general_quota"
+    assert d.retry_after > 0                                  # 北京次日零点
+    assert lim.admit_general("u:b", is_user=True) is None     # per-actor 独立
+
+
+def test_general_anon_and_off_parity(make_backend):
+    lim = make_backend(FakeClock(), RAG_GENERAL_DAILY_QUOTA=5)
+    d = lim.admit_general("ip:1.2.3.4", is_user=False)
+    assert d is not None and d.status_code == 403 and d.reason == "general_anon"
+    lim0 = make_backend(FakeClock(), RAG_GENERAL_DAILY_QUOTA=0)
+    d0 = lim0.admit_general("u:a", is_user=True)
+    assert d0 is not None and d0.status_code == 403 and d0.reason == "general_off"
+
+
+def test_general_quota_beijing_day_rollover_parity(make_backend):
+    clock = FakeClock()
+    lim = make_backend(clock, RAG_GENERAL_DAILY_QUOTA=1)
+    assert lim.admit_general("u:a", is_user=True) is None
+    assert lim.admit_general("u:a", is_user=True) is not None   # 当日打满
+    clock.advance(2 * 86400)                                    # 跨北京日（键按日滚动）
+    assert lim.admit_general("u:a", is_user=True) is None       # 新的一天恢复
+
+
+def test_general_redis_backend_fail_open(monkeypatch):
+    """redis 专项：配额层 Redis 故障 fail-open（ask 主闸 fail-closed 已挡成本面；
+    与 aux/charge 同一爆炸半径姿态）。"""
+    monkeypatch.setenv("RAG_RATE_LIMIT_ENABLE", "true")
+    monkeypatch.setenv("RAG_GENERAL_DAILY_QUOTA", "5")
+    lim = _redis_limiter(FakeClock())
+
+    def _boom(keys, args):
+        raise ConnectionError("redis down")
+
+    lim._gen_script = _boom
+    assert lim.admit_general("u:a", is_user=True) is None

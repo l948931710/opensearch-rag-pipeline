@@ -59,17 +59,30 @@
 ## 批次4 — flag 翻开前置(agent/durable/general-ability;flag 默认 off 但在铺开路径)
 | 状态 | 条目 | 位置 | 修法 |
 |---|---|---|---|
-| ⬜ | P1 旧审批决定被 reconcile 重放到新挂起调用 | `agent_runtime/approval_store.py:488` | 扫描限最新 request;_verify_persisted_decision 加 call_id 匹配 |
-| ⬜ | P2 恢复扫描与快路径竞态→双跑 | `agent_runtime/dispatch_outbox.py:134` | claim_next 加最小年龄宽限;快路径失 claim 不再直通执行 |
-| ⬜ | P2 attempts 耗尽的 resume 命令三个 closer 都够不着(永久僵尸) | `agent_runtime/dispatch_outbox.py:242` | 恢复扫描补 resume 分支,按 run 终态收口 |
-| ⬜ | P2 bind_and_done 吞 CAS 失败(被偷 lease 双跑无日志) | `agent_runtime/durable_dispatcher.py:73` | 检查 bind_run 返回值,CAS miss 记 ERROR 并跳过 complete |
-| ⬜ | P2 pool.submit 失败但已入队→双 _release 侵蚀并发闸 | `agent_runtime/executor.py:231` | dispatch_maybe_scheduled 时 except 路径不 _release |
-| ⬜ | P2 suspend 落库失败路径无 D3 归属栅栏 | `agent_runtime/executor.py:531` | _notify_failure 门在 running→failed CAS 成功上,对齐 567-571 |
-| ⬜ | P2 空 state_digest 绕过 REQUIRE_HMAC 校验 | `agent_runtime/executor.py:410` | 有 key/REQUIRE_HMAC 时缺 digest 直接拒绝 |
-| ⬜ | P2 崩溃收割的 run 不关事件流,跨副本 SSE 挂 30 分钟 | `agent_runtime/event_relay.py:132` | 终态 durable status 时限界 tail(replay-only/短宽限) |
-| ⬜ | P1 RedisRateLimiter 缺 admit_general→redis 后端 500 | `rate_limiter.py:718` | 实现 admit_general(Lua INCR+北京午夜 TTL),对齐 memory 语义 |
-| ⬜ | P2 /api/agent/approve 授权前泄露 run 状态与决定 | `routes/agent.py:1005` | 挂起分支前先过 owner-or-kb_admin 门,未授权 404 |
-| ⬜ | P2 确定性计算免配额有文档无实现 | `general_answerer.py:203` | calc 先行判定再 admit_general,或 model=="calc"/异常时退还 |
+| ✅ | P1 旧审批决定被 reconcile 重放到新挂起调用 | `agent_runtime/approval_store.py:488` | 扫描限最新 request;_verify_persisted_decision 加 call_id 匹配 |
+| ✅ | P2 恢复扫描与快路径竞态→双跑 | `agent_runtime/dispatch_outbox.py:134` | claim_next 加最小年龄宽限;快路径失 claim 不再直通执行 |
+| ✅ | P2 attempts 耗尽的 resume 命令三个 closer 都够不着(永久僵尸) | `agent_runtime/dispatch_outbox.py:242` | 恢复扫描补 resume 分支,按 run 终态收口 |
+| ✅ | P2 bind_and_done 吞 CAS 失败(被偷 lease 双跑无日志) | `agent_runtime/durable_dispatcher.py:73` | 检查 bind_run 返回值,CAS miss 记 ERROR 并跳过 complete |
+| ✅ | P2 pool.submit 失败但已入队→双 _release 侵蚀并发闸 | `agent_runtime/executor.py:231` | dispatch_maybe_scheduled 时 except 路径不 _release |
+| ✅ | P2 suspend 落库失败路径无 D3 归属栅栏 | `agent_runtime/executor.py:531` | _notify_failure 门在 running→failed CAS 成功上,对齐 567-571 |
+| ✅ | P2 空 state_digest 绕过 REQUIRE_HMAC 校验 | `agent_runtime/executor.py:410` | 有 key/REQUIRE_HMAC 时缺 digest 直接拒绝 |
+| ✅ | P2 崩溃收割的 run 不关事件流,跨副本 SSE 挂 30 分钟 | `agent_runtime/event_relay.py:132` | 终态 durable status 时限界 tail(replay-only/短宽限) |
+| ✅ | P1 RedisRateLimiter 缺 admit_general→redis 后端 500 | `rate_limiter.py:718` | 实现 admit_general(Lua INCR+北京午夜 TTL),对齐 memory 语义 |
+| ✅ | P2 /api/agent/approve 授权前泄露 run 状态与决定 | `routes/agent.py:1005` | 挂起分支前先过 owner-or-kb_admin 门,未授权 404 |
+| ✅ | P2 确定性计算免配额有文档无实现 | `general_answerer.py:203` | calc 先行判定再 admit_general,或 model=="calc"/异常时退还 |
+
+**批次4 落地记录(2026-07-17)**,as-built 与修法的差异及关键决策:
+- **approval_store:488 双保险**:①扫描 NOT EXISTS 排除「存在更新请求」的行(按 created_at+request_id 排序,executor 侧无关);②`_verify_persisted_decision` 新增 `pending_call_id` 锚定——请求行 call_id ≡ checkpoint pending_call.call_id,不符即 RunRejected(锚定行优先取 latest 捷径,**行内无 call_id 键的简化测试桩沿用旧语义跳过**——真实存储行恒含 call_id/schema NOT NULL,生产不可绕)。
+- **dispatch_outbox:134**:①`claim_next` 加 `min_age_s` 参数(queued 臂 `created_at < NOW-宽限`;=0 字节级旧 SQL),dispatcher 经 **`RAG_AGENT_DISPATCH_CLAIM_GRACE_S`(默认 30s)** 传入——未采审计建议的 lease_s(120s):防护窗口是毫秒级,30s 余量巨大且孤儿恢复少等一拍;②fast path 失认领**改 409**(「已受理正在处理中」),不再直通执行——命令归持有方恰一次执行;enqueue 成功但 claim 抛异常的子角落维持「可用性优先直通」旧档(有意,台账留痕)。
+- **dispatch_outbox:242**:新增 `sweep_exhausted_resumes`(单条 UPDATE LEFT JOIN agent_run):run 仍 suspended→failed 留因、run 行已清除→failed、其余(running/终态)→done;tick 经 getattr 接线(桩无此法跳过),计数入返回值 `resume_closed`。
+- **durable_dispatcher:73**:bind_run CAS 落空→ERROR+**跳过 complete**(命令归窃取方收敛);complete 落空→ERROR(恢复扫描按已绑收口)。审计建议的「recover_fn 前后续租」**有意不做**:claim_next 同事务刚铸新租约,再续租是毫秒级冗余;租约不足的真对策是调 RAG_AGENT_DISPATCH_LEASE_S(日志已指路)。
+- **executor 三修**:231/361 双 release 按 `dispatch_maybe_scheduled` 门控(可能已入队→槽随条目移交驱动器;宁漏一槽自限容量,绝不欠计放大并发);531 失败侧回调补 D3 栅栏(running→failed CAS 成立才 _notify_failure,对齐 567-571,RunFailed 帧照发);410 缺 digest 且(密钥在场 或 REQUIRE_HMAC 开)→拒绝续跑(防「置空 digest 列」绕过——正是 HMAC 威胁模型),无密钥环境零回归。
+- **event_relay:132**:`stream_run_events` 加可选 `is_terminal_fn` 探针(routes 注入 run_store 读,模块不 import serving)——**只在 XREAD 空转时**查终态(活跃流零额外 DB 读),终态则 500ms 短读 drain 赛跑帧后收流;/events 端点已接线。中继降级(_dead)与崩溃收尸两形态都被兜住。
+- **rate_limiter:718**:`RedisRateLimiter.admit_general` 落地(_GEN_LUA:INCR-then-check 原子+首建键 EXPIRE 到北京次日零点;>quota 的 INCR 不回退——只作 >配额 比较,与 memory「恰放行 quota 次」等价);anon/off 判定在 Python 对齐 memory 版。**fail 姿态=fail-open**(对齐 aux/charge:请求已过 ask 主闸的 fail-closed,配额层抖动不该打死通用问答;charge 全局帽后判兜底)。
+- **routes/agent:1005**:approve 在任何状态分支前过**可见性门**——发起人/kb_admin/快照 scope 覆盖的 dept_admin 可见,其余 404(不可见==不存在,对齐 run 详情);裁决权(职责分离 403)仍归 _authorize_approver。**行为变化**:无关员工/scope 不覆盖的 dept_admin 从 403 改 404(两条既有测试相应更名改断言)。
+- **general_answerer:203**:calc **先于** admit_general(api 与 dingtalk_bot 两调用点同源修)——算术命中零 LLM 零配额;LLM 异常仍耗一格的次要面**有意不做退还**(审计"或"语义,退还机制两后端新增面不成比例)。
+
+每批验证:新回归 19 条(pr3 dispatch 6+hardening 7+cancel/relay 2+redis limiter 4+general 3+approval 真库 1,含两条 403→404 改判);`make test` 全量 + `make lint` 绿(2026-07-17)。未验证声明:真实 RDS 上 NOT EXISTS 扫描与 LEFT JOIN 收口的执行计划(本地 MySQL 8 真库测试绿)、真实 Redis 的 _GEN_LUA(fakeredis+lupa 覆盖)、多副本真实竞态窗口、SAE 部署。所有修复都在默认 off 的 flag 后(除 approve 404 门与 calc 免配额——前者现网 RAG_AGENT_ENABLE off 不可达,后者 RAG_GENERAL_ABILITY_MODE off 不可达)。
 
 ## 批次5 — 摄取/编排 P2 同族
 | 状态 | 条目 | 位置 | 修法 |

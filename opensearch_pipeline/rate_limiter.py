@@ -714,6 +714,17 @@ end
 return {over, edge}
 """
 
+# 批次4（ultra P1 rate_limiter:718）：通用能力日配额（gen: 键）——INCR-then-check 原子
+# 判定 + 首次建键 EXPIRE 到北京次日零点。>quota 的 INCR 不回退：计数只用于「>配额」比较，
+# 拒绝期间的多累不改变判定，键到点整体过期（与 memory 版「恰放行 quota 次」等价）。
+# KEYS: 1=gen day 键   ARGV: 1=quota 2=ttl_day   返回 {outcome, cnt}
+_GEN_LUA = """
+local quota=tonumber(ARGV[1]); local ttl_day=tonumber(ARGV[2])
+local n=redis.call('INCR',KEYS[1]); if n==1 then redis.call('EXPIRE',KEYS[1],ttl_day) end
+if n>quota then return {'general_quota',n} end
+return {'admit',n}
+"""
+
 
 class RedisRateLimiter:
     """Redis 后端：四层计数**跨实例共享**（全局熔断因此才真正全局，而非每实例各 2000/日
@@ -742,6 +753,7 @@ class RedisRateLimiter:
         self._ask_script = client.register_script(_ASK_LUA)   # 客户端侧建 Script，不连服务器
         self._aux_script = client.register_script(_AUX_LUA)
         self._charge_script = client.register_script(_CHARGE_LUA)
+        self._gen_script = client.register_script(_GEN_LUA)
         # 拒绝聚合（每实例缓冲 → RDS UPSERT 合并；与 memory 版同构）
         self._reject_lock = threading.Lock()
         self._rejected: Dict[Tuple[str, str], int] = {}
@@ -858,6 +870,38 @@ class RedisRateLimiter:
         if outcome == "aux_per_min":
             retry = max(1, int((bucket + 1) * _MINUTE_WINDOW_S - now) + 1)
             return self._deny(Denial(429, "操作太频繁，请稍后再试", retry, "aux_per_min"), now)
+        return None
+
+    def admit_general(self, actor: str, *, is_user: bool) -> Optional[Denial]:
+        """通用能力层每日配额准入——**与 ServingRateLimiter.admit_general 同一契约**
+        （批次4，ultra P1 rate_limiter:718：redis 后端此前缺本方法，api.py:877 与
+        dingtalk_bot 均无守护直调 → redis 后端 + 通用能力开启即 AttributeError/500，
+        而这两个 flag 恰是 workers>1 铺开路径的组合）。
+
+        anon/off 判定在 Python（对齐 memory 版）；gen: 日计数 INCR+EXPIRE Lua 单往返，
+        键按北京日滚动。fail 姿态：**fail-open**（对齐 aux/charge 的爆炸半径控制——
+        本方法发生在已过 admit_ask 的请求内部，ask 成本主闸 fail-closed 已挡住
+        「Redis 全挂仍无限烧钱」；charge_llm_call 的全局帽后判兜底）。"""
+        lim = self.limits()
+        if not lim.enabled:
+            return None
+        now = self._now()
+        if not is_user:
+            return self._deny(Denial(403, "通用问答需登录后使用", 0, "general_anon"), now)
+        if lim.general_daily_quota <= 0:
+            return self._deny(Denial(403, "通用问答未开放", 0, "general_off"), now)
+        day = _beijing_day(now)
+        key = redis_client.key("rl", "d", "gen", actor, day)
+        try:
+            outcome, _cnt = self._gen_script(
+                keys=[key], args=[lim.general_daily_quota, _secs_to_beijing_midnight(now)])
+        except Exception as e:   # noqa: BLE001 — 配额层 fail-open（见 docstring）
+            logger.warning("限流 Redis 后端故障，admit_general fail-open: %s", e)
+            return None
+        if outcome == "general_quota":
+            return self._deny(Denial(
+                429, f"今日通用问答次数已用完（{lim.general_daily_quota} 次/天）",
+                _secs_to_beijing_midnight(now), "general_quota"), now)
         return None
 
     def charge_llm_call(self, actor: str, *, weight: int = 1, thinking: bool = False) -> bool:

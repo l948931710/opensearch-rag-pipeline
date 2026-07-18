@@ -309,3 +309,68 @@ def test_relay_expire_throttled_to_non_delta_frames(relay_env):
     assert len(fake.streams[key]) == 7                  # XADD 每帧照发（零丢帧）
     assert n_expire["n"] == 4                           # 首帧 + tool_result + 终态 + __end__
     assert fake.ttls.get(key) is not None               # TTL 始终在
+
+
+# ═══════════════════════════════════════════════════════════════
+# 批次4（ultra 评审）：挂起失败栅栏 + 终态探针限界尾随
+# ═══════════════════════════════════════════════════════════════
+
+
+class _EdgeDenyStore(_CheckpointStore):
+    """指定边 CAS False 的 store（其余照常）——模拟所有权已失（purge/收尸/取消抢先）。"""
+
+    def __init__(self, deny_edges):
+        super().__init__()
+        self._deny = set(deny_edges)
+
+    def transition(self, run_id, frm, to):
+        if (frm, to) in self._deny:
+            return False
+        return super().transition(run_id, frm, to)
+
+
+def test_b4_suspend_persist_failure_fenced_failure_callback():
+    """批次4（ultra executor:531）：挂起落库失败路径的失败侧回调必须 D3 栅栏——
+    running→failed CAS 不成立（所有权已失）时绝不触发 on_failure（防 purge 后
+    qa_session_log 重插）；CAS 成立则照常回调（行为保真）。"""
+    failures = []
+    store = _EdgeDenyStore({("running", "suspended"), ("running", "failed")})
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("r"), max_concurrent=2)
+    h = ex.submit(_ctx(), _StubLoop(run_events=[_suspend_ev()]),
+                  [{"role": "user", "content": "q"}], [],
+                  on_failure=lambda err: failures.append(err))
+    evs = list(h.events())
+    ex.shutdown()
+    assert any(isinstance(e, RunFailed) for e in evs)        # 对外仍诚实报失败帧
+    assert failures == [], "所有权已失（双边 CAS 拒）：失败侧落库回调必须被栅栏挡住"
+
+    failures2 = []
+    store2 = _EdgeDenyStore({("running", "suspended")})       # failed 边放行=仍持有
+    ex2 = ThreadedRunExecutor(store2, lambda ctx, ev: ToolResult.text_ok("r"), max_concurrent=2)
+    h2 = ex2.submit(_ctx(), _StubLoop(run_events=[_suspend_ev()]),
+                    [{"role": "user", "content": "q"}], [],
+                    on_failure=lambda err: failures2.append(err))
+    list(h2.events())
+    ex2.shutdown()
+    assert failures2 and "挂起状态落库失败" in failures2[0]   # 仍持有：照常失败侧落库
+
+
+def test_b4_terminal_probe_bounds_tail_without_terminal_frame(relay_env):
+    """批次4（ultra event_relay:132）：崩溃收尸的 run 流上永远没有终态帧/__end__——
+    is_terminal_fn 探针在 XREAD 空转时判终态，短宽限 drain 后收流，不再挂满
+    overall_timeout（默认 30 分钟）。"""
+    import json as _json
+    import time as _time
+
+    from opensearch_pipeline.agent_runtime import event_relay as er
+    rid = "dead-run-1"
+    key = er._stream_key(rid)
+    relay_env.xadd(key, {"data": _json.dumps({"type": "model_delta", "text": "半截"})})
+    relay_env.xadd(key, {"data": _json.dumps({"type": "tool_result", "call_id": "c1",
+                                              "tool_name": "w", "status": "succeeded"})})
+    t0 = _time.monotonic()
+    out = list(er.stream_run_events(rid, block_ms=100, overall_timeout_s=30,
+                                    is_terminal_fn=lambda: True))
+    elapsed = _time.monotonic() - t0
+    assert [d["type"] for d in out] == ["model_delta", "tool_result"]   # 残帧完整回放
+    assert elapsed < 10, f"终态探针须限界收流（{elapsed:.1f}s），绝不挂满 overall_timeout"

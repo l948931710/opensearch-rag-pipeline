@@ -671,27 +671,30 @@ def test_approve_self_terminate_allowed(approval_wired):
         api.app.dependency_overrides.clear()
 
 
-def test_approve_other_employee_403(approval_wired):
-    """非发起人 + 非管理员（DB 现查 employee）→ 403。"""
+def test_approve_other_employee_404(approval_wired):
+    """非发起人 + 非管理员（DB 现查 employee）→ **404**（批次4，ultra routes/agent:1005：
+    授权前不泄露 run 状态/决定——无关员工连 run 的存在性都不可见，对齐 run 详情端点的
+    「不可见==不存在」；此前 403 本身即泄露 run 存在且挂起）。"""
     _, _, _, mp = approval_wired
     import opensearch_pipeline.dingtalk_identity as di
     mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("employee"))
     try:
         other = Identity(user_id="u2", acl_groups=["production"], role="kb_admin")  # 令牌 role 是提示，不可信
         r = _post_approve(other, kind="approved")
-        assert r.status_code == 403
+        assert r.status_code == 404
     finally:
         api.app.dependency_overrides.clear()
 
 
-def test_approve_dept_admin_scope_mismatch_403(approval_wired):
-    """dept_admin 但 approver_scope 不在其 managed 集合 → 403。"""
+def test_approve_dept_admin_scope_mismatch_404(approval_wired):
+    """dept_admin 但 approver_scope 不在其 managed 集合 → **404**（批次4 可见性门：
+    scope 不覆盖的 dept_admin 与无关员工同级——run 不可见==不存在）。"""
     _, _, _, mp = approval_wired
     import opensearch_pipeline.dingtalk_identity as di
     mp.setattr(di, "resolve_kb_identity", lambda uid: _kb_ident("dept_admin", granted=("hr",)))
     try:
         r = _post_approve(Identity(user_id="u2", acl_groups=["hr"], role="employee"))
-        assert r.status_code == 403
+        assert r.status_code == 404
     finally:
         api.app.dependency_overrides.clear()
 
