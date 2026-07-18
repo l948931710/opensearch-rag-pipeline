@@ -176,3 +176,34 @@ jobs:
           python -m pip install --upgrade pip pip-audit "setuptools>=83"
           pip install -e ".[production,api,ocr]"
           python -m pip_audit --desc
+      # 供应链补链（2026-07-11 重审计 §6）：lock 审计 + SBOM + trivy。
+      # ① SAE 镜像装的是 requirements-prod.lock（Dockerfile --require-hashes），
+      #    对 lock 再跑一遍 pip-audit——上面那步 fresh resolve 审计的是"最新可解析集"，
+      #    与镜像实际烤入的钉死集可能不同（钉死集才是现网真实暴露面）。【阻塞】。
+      - name: Lockfile CVE audit (pip-audit on requirements-prod.lock — BLOCKING)
+        run: python -m pip_audit -r requirements-prod.lock --desc
+      # ② SBOM（SPDX，syft）：覆盖 Python lock + console-app/package-lock.json，
+      #    产物上传 artifact（供应链事件时按 SBOM 反查暴露面，此前全仓无 SBOM）。
+      - name: Generate SBOM (syft — SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: sbom-spdx.json
+      # ③ trivy fs 扫描【阻塞，HIGH/CRITICAL 且有修复版才红】：npm lock + Python lock +
+      #    Dockerfile 配置面（digest 固定/USER 非 root 等）。与 pip-audit 互补：trivy 管
+      #    npm 侧与镜像配置，pip-audit 管 Python 侧语义更细。
+      # ⚠️ step name 含「冒号+空格」必须整体加引号——未引号的 `fs:` 会把 name 解析成
+      # 嵌套映射 → 整个 workflow 无效 → 每次 push 0 秒 startup failure（2026-07-12..15 实翻）
+      - name: "Trivy scan (fs: lockfiles + Dockerfile config — BLOCKING on fixable HIGH/CRITICAL)"
+        # 批次8 热修：上游把裸号 tag（0.28.0）全删改 v 前缀 → 旧引用解析失败、security
+        # 作业 setup 即红（发布分支首跑 CI 当场暴露）。按 SHA 钉死（=v0.36.0 的 commit，
+        # 与 Dockerfile digest-pinning 同一供应链纪律，tag 再被动也不受影响）。
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
