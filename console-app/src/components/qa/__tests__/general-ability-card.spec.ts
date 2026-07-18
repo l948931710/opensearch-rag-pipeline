@@ -16,7 +16,7 @@ vi.mock('@/composables/useAsk', async () => {
   const { ref } = await import('vue')
   return {
     useAsk: () => ({
-      retry: vi.fn(), handoff: vi.fn(), fillInput,
+      retry: vi.fn(), fillInput,
       vote: vi.fn(), copyAns: vi.fn(),
       resignImage: vi.fn(), imgFailed: vi.fn(), preview: vi.fn(),
       asking: ref(false), draft: ref(''), messages: ref([]),

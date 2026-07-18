@@ -11,7 +11,7 @@
 
 import { ensureLogin } from '../../utils/auth';
 import {
-  ask, feedback as postFeedback, getHotQuestions,
+  ask, getHotQuestions,
   getConversations, getConversationMessages, deleteConversation,
 } from '../../utils/api';
 import {
@@ -66,7 +66,7 @@ function reviveMessage(m) {
       id: nextId(), role: 'ai', noResult: true,
       answer: m.answer || '', nrLines: splitNrLines(m.answer),
       rephrase: m.rephrase || [], messageId: m.messageId || '',
-      question: m.question || '', handoffDone: !!m.handoffDone,
+      question: m.question || '',
     };
   }
   return {
@@ -114,7 +114,7 @@ Page({
   data: {
     // { id, role:'user'|'ai', text?, blocks?, guard?, sources?, sourcesOpen?,
     //   messageId?, copyText?, question?, loading?, error?, errorText?,
-    //   noResult?, handoffDone?, instant? }
+    //   noResult?, instant? }
     messages: [],
     draft: '',        // 仅程序化写值（发送清空/chip 回填）；输入过程非受控，见 onInput
     hasDraft: false,  // 发送按钮可用态（空↔非空翻转才 setData）
@@ -644,25 +644,6 @@ Page({
       this._draft = q;
       this.setData({ draft: q, hasDraft: true });
     }
-  },
-
-  // NO_RESULT 卡内转人工：死胡同必须留出口（无来源、无赞踩，只有这一条路）
-  onNrHandoff(e) {
-    const id = e.currentTarget.dataset.id;
-    const msg = this.data.messages.find((m) => m.id === id);
-    if (!msg || msg.handoffDone || !msg.messageId) {
-      return;
-    }
-    postFeedback({ message_id: msg.messageId, feedback_type: 'handoff' })
-      .then(() => {
-        this._updateMessage(id, { handoffDone: true });
-        this._persistCurrent();
-        this._toast('已转交管理员跟进，请留意钉钉消息');
-      })
-      .catch((err) => {
-        console.error('[chat.onNrHandoff]', err);
-        this._toast('提交失败，请重试');
-      });
   },
 
   // 骨架阶段文案：先「检索」，约 2.2s 后切「生成/深思」。定时器在响应/失败/取消时清理；

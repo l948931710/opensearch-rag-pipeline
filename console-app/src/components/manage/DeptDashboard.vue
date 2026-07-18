@@ -8,7 +8,6 @@ import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
 import LoadError from './LoadError.vue'
 import FeedbackReviewList from './FeedbackReviewList.vue'
-import EscalationQueue from './EscalationQueue.vue'
 
 // 部门管理员「概览看板」= 本部门视角。/api/kb/stats 已按 managed owner_dept 作用域聚合，
 // 故资产/状态口径只覆盖本部门。「待审核」用 by_badge（= 我提交、待 kb_admin 放行的版本）。
@@ -113,12 +112,6 @@ const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用�
       <div v-if="!loadErrors['insights']" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         使用成效与知识缺口数据加载中（需后端 <code class="font-mono text-[11.5px]">/api/kb/insights</code>）；稍后自动呈现。
       </div>
-    </section>
-
-    <!-- 转人工工单：用户点「转人工」的求助（涉本部门文档；独立加载，组件自带空态/错误态） -->
-    <section :class="SECTION">
-      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>转人工工单 · 待人工答复的求助（涉本部门文档）</header>
-      <EscalationQueue />
     </section>
   </div>
 </template>

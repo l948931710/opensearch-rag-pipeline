@@ -11,7 +11,7 @@ import MessageBubble from '@/components/qa/MessageBubble.vue'
 const retry = vi.fn()
 vi.mock('@/composables/useAsk', () => ({
   useAsk: () => ({
-    retry, handoff: vi.fn(), fillInput: vi.fn(),
+    retry, fillInput: vi.fn(),
     vote: vi.fn(), copyAns: vi.fn(),
     resignImage: vi.fn(), imgFailed: vi.fn(), preview: vi.fn(),
   }),

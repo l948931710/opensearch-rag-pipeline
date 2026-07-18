@@ -468,35 +468,6 @@
   color: var(--text-2);
 }
 
-.nr-handoff {
-  display: inline-flex;
-  flex-direction: row;
-  align-items: center;
-  background: var(--brand-soft);
-  border-radius: 999rpx;
-  padding: 18rpx 36rpx;
-}
-
-.nr-handoff:active {
-  transform: scale(0.96);
-}
-
-.nr-handoff-done {
-  opacity: 0.55;
-}
-
-.nr-handoff-ico {
-  font-size: 32rpx;
-  color: var(--brand);
-  margin-right: 12rpx;
-}
-
-.nr-handoff-label {
-  font-size: 25rpx;
-  font-weight: 500;
-  color: var(--brand);
-}
-
 /* ---------- sources（参考来源） ---------- */
 .sources {
   border-top: 1px solid var(--line);

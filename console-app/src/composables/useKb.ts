@@ -91,7 +91,6 @@ export interface KbGovernance {
   effective_rate: number
   feedback_up: number; feedback_down: number; feedback_total: number; helpful_rate: number
   feedback_last7: number; feedback_daily: KbFeedbackDay[]; downvote_reasons: KbDownvoteReason[]
-  escalations: number
   dept_coverage: KbDeptCoverage[]
 }
 export interface KbConfig { max_upload_bytes: number; accepted_exts: string[] }
@@ -188,10 +187,6 @@ const visErr = ref('')
 const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
 const showResolvedFeedback = ref(false)   // 「显示已处理」切换：默认只看未处置（收件箱语义）
 const feedbackResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 message_id）
-// 转人工工单队列（盲区审计 P1-2：escalation_ticket 补消费端）。null=尚未加载。
-const escalations = ref<EscalationItem[] | null>(null)
-const showClosedEscalations = ref(false)
-const escalationResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 ticket_id）
 // 入库复审任务队列（盲区审计 P2-33：review_task 补消费端，kb_admin 专属）。
 const reviewTasks = ref<ReviewTaskItem[] | null>(null)
 const showClosedReviewTasks = ref(false)
@@ -616,7 +611,7 @@ async function loadGovernance() {
       answer_total: 902, answer_success: 790, answer_refusal: 112, answer_no_result: 15, answer_error: 25,
       effective_rate: 0.876,
       feedback_up: 64, feedback_down: 44, feedback_total: 108, helpful_rate: 0.593,
-      feedback_last7: 5, escalations: 19,
+      feedback_last7: 5,
       feedback_daily: [
         { day: '2026-06-15', up: 4, down: 4 }, { day: '2026-06-16', up: 9, down: 0 },
         { day: '2026-06-17', up: 1, down: 7 }, { day: '2026-06-18', up: 3, down: 21 },
@@ -1125,95 +1120,8 @@ async function resolveFeedback(messageId: string, action: FeedbackResolveAction)
   finally { const n = new Set(feedbackResolveBusy.value); n.delete(messageId); feedbackResolveBusy.value = n }
 }
 
-// 转人工工单（与后端 KbEscalationItem 对齐；question/ai_answer_excerpt 已服务端 PII 脱敏）。
-export interface EscalationItem {
-  ticket_id: string; message_id: string
-  question: string; ai_answer_excerpt: string
-  user_name: string; user_dept: string
-  created_at: string; age_days: number
-  status: string; closed: boolean
-  expert_answer: string; assigned_user_name: string
-  docs: FeedbackDocRef[]
-}
+// 处置动作类型（历史上与转人工工单共用；转人工已下线 2026-07，现仅入库复审使用）。
 export type EscalationResolveAction = 'resolve' | 'dismiss' | 'reopen'
-
-/** 拉转人工工单队列：默认只列未处置（不设时间窗、老单先出——工单是承诺不是日志）；
- *  「显示已处理」切换后连已处置一并返回。失败静默兜底空 + loadErrors 显错可重试。 */
-async function loadEscalations() {
-  const s = useSession()
-  if (!s.identity?.canManage) { escalations.value = []; return }
-  if (import.meta.env.DEV && s.token === 'dev-preview') {
-    const all: EscalationItem[] = [
-      { ticket_id: 'esc1', message_id: 'm1', question: '注塑机换模后首件检验要做哪些项目？',
-        ai_answer_excerpt: '首件检验一般包含外观、尺寸……', user_name: '王强', user_dept: '生产部',
-        created_at: '2026-06-28 09:12', age_days: 6, status: 'PENDING', closed: false,
-        expert_answer: '', assigned_user_name: '',
-        docs: [{ doc_id: 'D1', title: '注塑首件检验 SOP', owner_dept: 'production' }] },
-      { ticket_id: 'esc2', message_id: 'm2', question: '出口欧盟的 PLA 吸管需要哪些认证？',
-        ai_answer_excerpt: '', user_name: '李敏', user_dept: '外贸部',
-        created_at: '2026-07-02 15:40', age_days: 2, status: 'PENDING', closed: false,
-        expert_answer: '', assigned_user_name: '', docs: [] },
-      { ticket_id: 'esc3', message_id: 'm3', question: 'U8 里怎么冲销错误的入库单？',
-        ai_answer_excerpt: '可在库存管理模块……', user_name: '张伟', user_dept: '财务部',
-        created_at: '2026-06-20 11:03', age_days: 14, status: 'RESOLVED', closed: true,
-        expert_answer: '在「库存管理→入库单列表」选中该单据点「弃审」后红字冲销，注意先确认当月未结账。',
-        assigned_user_name: '陈管理员',
-        docs: [{ doc_id: 'D5', title: 'U8 库存操作手册', owner_dept: 'finance' }] },
-    ]
-    escalations.value = showClosedEscalations.value ? all : all.filter((x) => !x.closed)
-    return
-  }
-  clearLoadError('escalations')
-  try {
-    const qs = showClosedEscalations.value ? '?include_closed=true' : ''
-    const r = await apiJson<{ items: EscalationItem[] }>(`/api/kb/escalations${qs}`, { auth: true })
-    escalations.value = r.items || []
-  } catch (e) { escalations.value = escalations.value ?? []; noteLoadError('escalations', e) }
-}
-
-/** 切换「显示已处理」并重载。 */
-function toggleShowClosedEscalations() {
-  showClosedEscalations.value = !showClosedEscalations.value
-  void loadEscalations()
-}
-
-/** 工单处置：resolve（答复并关闭；expertAnswer 非空 → 后端推回提问者钉钉）/ dismiss / reopen。
- *  成功后收件箱视图移出已处置条目；按 ticket_id 在途互斥防连点。 */
-async function resolveEscalation(ticketId: string, action: EscalationResolveAction,
-                                 expertAnswer = ''): Promise<boolean> {
-  if (escalationResolveBusy.value.has(ticketId)) return false
-  escalationResolveBusy.value = new Set(escalationResolveBusy.value).add(ticketId)
-  try {
-    const s = useSession()
-    const done = action !== 'reopen'
-    let userNotified = false
-    if (import.meta.env.DEV && s.token === 'dev-preview') { userNotified = !!expertAnswer }
-    else {
-      const r = await apiJson<{ user_notified?: boolean }>('/api/kb/escalations/resolve', {
-        method: 'POST', auth: true,
-        body: JSON.stringify({ ticket_id: ticketId, action, expert_answer: expertAnswer }),
-      })
-      userNotified = !!r.user_notified
-    }
-    const list = escalations.value || []
-    if (done && !showClosedEscalations.value) {
-      escalations.value = list.filter((x) => x.ticket_id !== ticketId)   // 收件箱：处置即移出
-    } else {
-      escalations.value = list.map((x) => x.ticket_id === ticketId
-        ? { ...x, closed: done, status: action === 'resolve' ? 'RESOLVED' : action === 'dismiss' ? 'DISMISSED' : 'PENDING',
-            expert_answer: expertAnswer || x.expert_answer } : x)
-    }
-    if (action === 'resolve' && expertAnswer) {
-      void notice({
-        title: '已答复',
-        message: userNotified ? '人工答复已通过钉钉消息发给提问者。'
-          : '工单已关闭，但钉钉推送未成功——如有需要请线下告知提问者。',
-      })
-    }
-    return true
-  } catch (e: any) { void notice({ title: '处置失败', message: uploadErrText(e), danger: true }); return false }
-  finally { const n = new Set(escalationResolveBusy.value); n.delete(ticketId); escalationResolveBusy.value = n }
-}
 
 // 入库复审任务（与后端 KbReviewTaskItem 对齐；P2-33 spot_checker 权限泄露安全网等的消费端）。
 export interface ReviewTaskItem {
@@ -1563,7 +1471,6 @@ export function useKb() {
     openShare, closeShare, submitShare, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
-    escalations, loadEscalations, showClosedEscalations, toggleShowClosedEscalations, resolveEscalation, escalationResolveBusy,
     reviewTasks, loadReviewTasks, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
@@ -1584,7 +1491,6 @@ export function __resetKb() {
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []
   inflight.value = new Set(); retireBusy.value = false
   feedbackReview.value = null; showResolvedFeedback.value = false; feedbackResolveBusy.value = new Set()
-  escalations.value = null; showClosedEscalations.value = false; escalationResolveBusy.value = new Set()
   reviewTasks.value = null; showClosedReviewTasks.value = false; reviewTaskResolveBusy.value = new Set()
   selectedFiles = []; docsOffset = 0; docsSeq = 0; trackSeq = 0
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）

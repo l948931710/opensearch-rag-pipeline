@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import {
   Database, CheckCircle2, Archive, Clock, GitBranch, Timer, Cpu,
-  ShieldAlert, ShieldCheck, ThumbsUp, ThumbsDown, Headset, Percent, Quote, MessageSquare, Ban,
+  ShieldAlert, ShieldCheck, ThumbsUp, ThumbsDown, Percent, Quote, MessageSquare, Ban,
   Search, AlertTriangle,
 } from 'lucide-vue-next'
 import { useKb, type KbDeptCoverage } from '@/composables/useKb'
@@ -17,7 +17,6 @@ import DonutChart from './DonutChart.vue'
 import MiniTrend from './MiniTrend.vue'
 import LoadError from './LoadError.vue'
 import FeedbackReviewList from './FeedbackReviewList.vue'
-import EscalationQueue from './EscalationQueue.vue'
 import ReviewTaskQueue from './ReviewTaskQueue.vue'
 
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
@@ -120,7 +119,6 @@ const riskCards = computed<Card[]>(() => {
   return [
     { label: 'PII 已脱敏', value: g?.pii_redacted_docs ?? 0, icon: ShieldCheck, tone: 'text-st-busy', hint: '含敏感信息文档' },
     { label: 'PII 隔离', value: g?.pii_quarantined_docs ?? 0, icon: ShieldAlert, tone: g?.pii_quarantined_docs ? 'text-st-warn' : 'text-st-muted', hint: '高风险未入库' },
-    { label: '转人工', value: g?.escalations ?? 0, icon: Headset, tone: 'text-foreground', hint: '用户求助工单 · 累计' },
   ]
 })
 
@@ -333,9 +331,6 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       <!-- 差评复核：逐条被点踩回答 + 涉及文档（全库；与上方聚合互补——这里能落到具体该修哪篇） -->
       <p :class="SUBHEAD" class="mt-4">差评复核 · 逐条（引用了库内文档）</p>
       <FeedbackReviewList />
-      <!-- 转人工工单：全库队列（含无引用文档的 NO_RESULT 求助 = 语料缺口，本就归 kb_admin） -->
-      <p :class="SUBHEAD" class="mt-4">转人工工单 · 待人工答复（全库）</p>
-      <EscalationQueue />
       <!-- 入库复审任务：spot_checker 权限抽查等安全网登记（P2-33 消费端，kb_admin 专属） -->
       <p :class="SUBHEAD" class="mt-4">入库复审 · 安全网登记的人工任务</p>
       <ReviewTaskQueue />

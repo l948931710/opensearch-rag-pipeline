@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { RotateCw, Headset, FileText, Sprout } from 'lucide-vue-next'
+import { RotateCw, FileText, Sprout } from 'lucide-vue-next'
 import { useAsk, type ChatMessage } from '@/composables/useAsk'
 import AnswerBlocks from './AnswerBlocks.vue'
 import SourceList from './SourceList.vue'
@@ -8,7 +8,7 @@ import ThinkingDisclosure from './ThinkingDisclosure.vue'
 
 // 一条消息：用户气泡 / AI 多态（思考过程披露条 · 加载骨架 · 错误重试 · 无结果卡 · 正常答案）。
 const props = defineProps<{ message: ChatMessage }>()
-const { retry, handoff, fillInput } = useAsk()
+const { retry, fillInput } = useAsk()
 const m = props.message
 
 // 等待态来源预览的档位点颜色（与 SourceList 同口径）。
@@ -24,7 +24,7 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
   </div>
 
   <!-- AI（Atlas 式：左侧 30px 星标头像 + 内容列） -->
-  <div v-else class="msg-row group/msg flex gap-3.5">
+  <div v-else class="msg-row flex gap-3.5">
     <span class="mt-px grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-accent-strong" aria-hidden="true">
       <Sprout :size="16" :stroke-width="1.75" class="text-primary-foreground" aria-hidden="true" />
     </span>
@@ -101,20 +101,12 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
           </button>
         </div>
       </div>
-      <button
-        type="button"
-        class="mt-3 flex h-7 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground disabled:opacity-60"
-        :class="{ '!text-st-live': m.handoffDone }" :disabled="m.handoffDone"
-        @click="handoff(m)"
-      >
-        <Headset :size="15" :stroke-width="1.75" /> {{ m.handoffDone ? '已转交管理员' : '转人工' }}
-      </button>
     </div>
 
     <!-- 正常答案（答案有内容才渲染；思考独占阶段只显披露条，不露空答案区） -->
     <template v-else-if="m.html != null || m.viewBlocks">
       <div v-if="m.guard" class="mb-2 rounded-lg border border-st-busy/30 bg-st-busy/10 px-3 py-2 text-xs text-st-busy">
-        ⚠️ 相关资料匹配度较低，以下回答仅供参考，请核对原文或转人工确认。
+        ⚠️ 相关资料匹配度较低，以下回答仅供参考，请核对原文确认。
       </div>
       <!-- 通用回答来源徽标（弱样式，比 guard 警示条更淡——免责尾注已在正文，徽标只作快速识别） -->
       <div
