@@ -428,14 +428,36 @@ def node_extract_text_with_ocr(ctx: dict):
                 # 保留原始文件名（含中文）以便提取器识别类型
                 filename = os.path.basename(raw_key)
                 local_path = os.path.join(task_tmp_dir, f"{doc_id}_{filename}")
-                try:
-                    bucket.get_object_to_file(raw_key, local_path)
-                    file_size = os.path.getsize(local_path)
-                    task["local_path"] = local_path
-                    print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)")
-                except Exception as e:
-                    print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
+                # B4（生产级外审 2026-07-17 P1-03）：下载前大小闸——超大对象拒下载
+                # （磁盘/内存/OCR 预算；自助上传有 50MB 闸但本路径此前无任何上限）。
+                # doc-intrinsic（重试无意义）：经 oversize_note → partial_loss_notes
+                # 通道收 NEEDS_REVIEW。HEAD 失败 fail-open（OSS 不可达时下载分支自己
+                # 会失败并走既有告警路径）。
+                _max_bytes = int(os.environ.get("RAG_EXTRACT_MAX_BYTES",
+                                                str(200 * 1024 * 1024)) or 0)
+                _osize = 0
+                if _max_bytes > 0:
+                    try:
+                        _osize = int(getattr(bucket.head_object(raw_key),
+                                             "content_length", 0) or 0)
+                    except Exception:
+                        _osize = 0
+                if _max_bytes > 0 and _osize > _max_bytes:
+                    print(f"    🛑 {doc_id}: {raw_key} {_osize} bytes 超过 "
+                          f"RAG_EXTRACT_MAX_BYTES={_max_bytes}——拒绝下载，转 NEEDS_REVIEW")
                     task["local_path"] = ""
+                    task["oversize_note"] = (
+                        f"[OVERSIZE] {raw_key} {_osize} bytes > cap {_max_bytes}："
+                        "未下载未提取；确需摄取请调高 RAG_EXTRACT_MAX_BYTES 或人工拆分文档")
+                else:
+                    try:
+                        bucket.get_object_to_file(raw_key, local_path)
+                        file_size = os.path.getsize(local_path)
+                        task["local_path"] = local_path
+                        print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)")
+                    except Exception as e:
+                        print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
+                        task["local_path"] = ""
         elif simulate_oss and "mock_text" not in task and not task.get("local_path"):
             # 本地零 OSS 形态（LOCAL-DEV，见 docs/environment_design.md）：
             # 真实文档由 scripts/sample_corpus.py 预先采样到 scratch/sample_corpus/<raw_key>，
@@ -460,6 +482,16 @@ def node_extract_text_with_ocr(ctx: dict):
                 pass  # checksum is auxiliary; absence → NULL → "process" (never blocks extraction)
 
         result = extractor.extract(task)
+
+        # B4：oversize 拒下载注记并进 partial_loss_notes（批次6 NEEDS_REVIEW 收尾通道，
+        # 不静默 DONE 也不 FAILED 空转重试——doc-intrinsic 缺口留人工裁决）
+        if task.get("oversize_note"):
+            _ov_notes = list(getattr(result, "partial_loss_notes", []) or [])
+            _ov_notes.append(task["oversize_note"])
+            try:
+                result.partial_loss_notes = _ov_notes
+            except Exception:   # noqa: BLE001 — 旧 result 形态无该属性时不阻断提取
+                pass
 
         # 日志
         block_types = {}

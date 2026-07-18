@@ -112,17 +112,22 @@ def test_tracked_cache_hit_semantics_and_incremental_persist(_no_oss, tmp_path):
     assert cache.get("miss:pub") is None
 
     # _vlm_cache_lookup 的遗留裸 key 迁移经 []= 记脏，save 后持久化（旧契约：
-    # 「真实运行随 _save_vlm_cache 持久化」）
-    from opensearch_pipeline.extraction.unified_extractor import _vlm_cache_lookup
+    # 「真实运行随 _save_vlm_cache 持久化」）。B4 P2-03 后迁移键带默认版本（:pub:2），
+    # 断言动态取 ns——版本再升不再改判。
+    from opensearch_pipeline.extraction.unified_extractor import (
+        _vlm_cache_lookup,
+        _vlm_cache_ns,
+    )
+    _migrated = f"bare123:{_vlm_cache_ns(True)}"
     cache["bare123"] = _entry("遗留裸条目")
     hit = _vlm_cache_lookup(cache, "bare123", is_public=True)
-    assert hit is not None and "bare123:pub" in cache
+    assert hit is not None and _migrated in cache
     cache.save()
 
     store._conn.close()
     reopened = VlmCacheStore(path)
-    got = reopened.get_many(["bare123", "bare123:pub"])
-    assert got["bare123:pub"]["visual_summary"] == "遗留裸条目", "迁移键随 save 落盘"
+    got = reopened.get_many(["bare123", _migrated])
+    assert got[_migrated]["visual_summary"] == "遗留裸条目", "迁移键随 save 落盘"
 
 
 def test_concurrent_writes_under_funnel_concurrency(_no_oss, tmp_path):

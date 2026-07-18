@@ -187,6 +187,18 @@
 
 未验证声明：真实 TLS 链路的 cipher 实测（本地 MySQL 无 CA 配置形态）、DataWorks 节点在真实执行器上的 TLS 连接、SAE 部署包——接线与状态机在本地测试栈验证。
 
+### 批次4 ✅ 已落地（2026-07-18，ontology-p0；as-built 注记如下）
+
+13. **统一安全解压**：九个解压点（stage1/2/3、ops、retention、gap_groups、ontology×2、cleanup 脚本）全部内嵌同文 `_safe_extractall`（Zip-Slip+加密成员+成员数≤4000+单成员≤200MB+总量≤500MB+压缩比≤200:1），ontology 两节点的旧「仅 Zip-Slip」版本一并升级；零裸 `extractall` 残留。
+14. **制品完整性**：九点同文 `_verify_zip_integrity`——算 zip sha256 留痕 + sidecar 资源 `<zip>.sha256` 在场时硬比对（不匹配拒执行）、暂缺过渡期放行（旧包不误伤）；**新增打包脚本 `deploy/build_dataworks_zip.sh`**（此前 DW zip 一直手工打包无脚本）：git archive HEAD + 注入 build_info.json（git SHA/时间/dirty 标记）+ 生成 sidecar，dirty 工作区响亮告警。⚠️ 部署注意：**重传 zip 必须同步重传 sidecar**（File 资源），只换 zip 会被节点拒掉。
+15. **XML 硬化+大小闸**：`_safe_xml_fromstring`（拒 DOCTYPE/ENTITY+20MB 预算）替换 image_extraction_utils 全部 5 处裸 `ET.fromstring`，配 `_zip_member_bytes`（读前按 infolist 校验单成员+压缩比）。**as-built 偏离**：不引 defusedxml——Office 内部 XML 永远不该含 DTD/ENTITY，全拒即等效防护且零新增依赖/不动 lock/py3.7 兼容。摄取路径大小闸：`node_extract_text_with_ocr` 下载前 OSS HEAD，超 `RAG_EXTRACT_MAX_BYTES`（默认 200MB）拒下载 → oversize 注记并进 partial_loss_notes（批次6 NEEDS_REVIEW 通道，doc-intrinsic 不空转重试）；HEAD 失败 fail-open。恶意样本回归（zip-slip/成员洪泛/单成员/比率炸弹/总量/加密项/billion-laughs/DOCTYPE/超大部件）全绿。
+16. **P2-03**：VLM 安全缓存主键 MD5→SHA-256 + `RAG_VLM_CACHE_VERSION` 默认 ""→"2"（存量 md5 键整体干净失效，构造碰撞继承 CLEAN 结论的通道关闭；成本=存量图下次触碰重审计，增量按再摄取面）。设 "" 可显式还原历史裸键形。三处既有键形测试（test_ocr_sanitize 裸 key 迁移×2、test_vlm_cache_sqlite 增量持久化）改判为动态取 `_vlm_cache_ns()`——版本再升不再改判。
+17. **P2-11**：19 处 mutable tag 全部 SHA 钉死（git ls-remote 取 peeled commit，`@<sha>  # vN` 注释），三个 workflow 零残留；新增测试锁「uses 必须 40-hex」。
+18. **P2-13 残留**：py3.7 分支补钉 `oss2==2.19.1`/`alibabacloud_ha3engine_vector==1.1.19`（镜像 requirements.txt，pypi requires_python 核验 3.7 兼容）/`jieba==0.42.1`/`typing_extensions==4.7.1`（4.8 起弃 3.7——此前浮动随时可能装挂）；钉版测试从 1 节点扩到 **11 个文件全量**（AST 定位 `sys.version_info` 分支、py3.7 侧清单必须全员 `==`）。py3.8+ 分支维持有意浮动（镜像恢复后走现代解析）。
+
+新增 env：`RAG_EXTRACT_MAX_BYTES`（默认 200MB）；注册表重生成至 433 名。
+未验证声明：DataWorks 真实执行器上的钉版安装与 sidecar 校验（下次 DW 包上传后生效——B7）、SAE 部署包；本批在本地测试栈验证（py_compile + 恶意样本回归 + AST 同构锁）。
+
 ## 3. 与评审验收条款的映射备注
 
 - 评审 RB-04 验收"durable enqueue 失败返回 503"=批次1-1;"为每个 flag 建条件探针"=批次2-6;"strict=true"=批次7。

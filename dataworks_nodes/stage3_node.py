@@ -23,9 +23,9 @@ if sys.version_info >= (3, 8):
     ]
 else:
     DEPS = [
-        "PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2", "requests==2.31.0",
-        "alibabacloud_ha3engine_vector",
-        "typing_extensions",
+        "PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2==2.19.1", "requests==2.31.0",
+        "alibabacloud_ha3engine_vector==1.1.19",
+        "typing_extensions==4.7.1",
         "pypdf==3.17.4", "pdfplumber==0.9.0", "Pillow==9.5.0",
     ]
 subprocess.check_call([
@@ -88,8 +88,61 @@ print("=== 2. 解压代码包 ===")
 if not os.path.exists('opensearch_pipeline_production.zip'):
     raise RuntimeError("❌ 未能下载 opensearch_pipeline_production.zip")
 
+def _safe_extractall(zf, dest):
+    """B4（生产级外审 2026-07-17 P1-02/P1-03）安全解压：Zip-Slip 越界 + 加密成员 +
+    成员数/单成员/总量/压缩比预算——资源包被替换成恶意 archive 时，不能借解压写任意
+    路径或耗尽磁盘/内存。预算≈生产包实测 10×：成员≤4000、单成员≤200MB、总量≤500MB、
+    压缩比≤200:1。"""
+    dest_root = os.path.abspath(dest)
+    infos = zf.infolist()
+    if len(infos) > 4000:
+        raise RuntimeError("zip 成员数超预算: %d > 4000" % len(infos))
+    total = 0
+    for info in infos:
+        name = info.filename
+        target = os.path.abspath(os.path.join(dest_root, name))
+        if not (target == dest_root or target.startswith(dest_root + os.sep)):
+            raise RuntimeError("zip 成员越界（Zip-Slip）: %r" % name)
+        if info.flag_bits & 0x1:
+            raise RuntimeError("zip 加密成员（拒绝）: %r" % name)
+        if info.file_size > 200 * 1024 * 1024:
+            raise RuntimeError("zip 单成员超预算: %r（%d bytes）" % (name, info.file_size))
+        if info.compress_size and info.file_size / float(info.compress_size) > 200:
+            raise RuntimeError("zip 压缩比异常（疑似 zip-bomb）: %r" % name)
+        total += info.file_size
+    if total > 500 * 1024 * 1024:
+        raise RuntimeError("zip 总解压量超预算: %d bytes" % total)
+    zf.extractall(dest_root)
+
+
+def _verify_zip_integrity(zip_name):
+    """B4（P1-02）制品完整性：算 zip sha256 并留痕（运行结果可溯源到构建）；有
+    sidecar 资源 <zip_name>.sha256 时硬比对（不匹配=资源被替换，拒绝执行）；暂缺=
+    过渡期放行（旧包无 sidecar 不误伤；打包侧 deploy/build_dataworks_zip.sh 随包生成）。"""
+    import hashlib
+    h = hashlib.sha256()
+    with open(zip_name, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    digest = h.hexdigest()
+    print("[B4] %s sha256=%s" % (zip_name, digest))
+    try:
+        _sc = odps.get_resource(zip_name + '.sha256')  # noqa: F821 — DataWorks 运行时注入
+        with _sc.open(mode='r') as r:
+            expected = (r.read() or '').strip().split()[0].lower()
+    except Exception as e:  # noqa: BLE001 — 过渡期：sidecar 未上传时放行
+        print("[B4] ⚠️ sidecar %s.sha256 不存在/不可读（过渡期放行）: %s" % (zip_name, e))
+        return digest
+    if expected != digest:
+        raise RuntimeError("[B4] 制品完整性校验失败: sha256=%s != sidecar=%s"
+                           % (digest, expected))
+    print("[B4] ✅ 制品完整性校验通过（sidecar 匹配）")
+    return digest
+
+
+_verify_zip_integrity('opensearch_pipeline_production.zip')
 with zipfile.ZipFile('opensearch_pipeline_production.zip', 'r') as zip_ref:
-    zip_ref.extractall('.')
+    _safe_extractall(zip_ref, '.')
 print("✅ 解压成功")
 
 current_dir = os.path.abspath(".")

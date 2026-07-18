@@ -107,7 +107,9 @@ def test_legacy_bare_key_hits_for_public():
     cache = {"abc123": _legacy_entry()}
     hit = _vlm_cache_lookup(cache, "abc123", is_public=True)
     assert hit is not None and hit["status"] == "ROUTE_TO_VECTOR"
-    assert "abc123:pub" in cache, "命中后应迁移到带后缀 key（裸 key 自然老化）"
+    # B4 P2-03 后命名空间带默认版本（pub:2）——断言动态取 ns，版本再升不再改判
+    from opensearch_pipeline.extraction.unified_extractor import _vlm_cache_ns
+    assert f"abc123:{_vlm_cache_ns(True)}" in cache, "命中后应迁移到带后缀 key（裸 key 自然老化）"
 
 
 def test_legacy_bare_key_never_used_for_sec():
@@ -117,8 +119,9 @@ def test_legacy_bare_key_never_used_for_sec():
 
 
 def test_suffixed_key_preferred_over_legacy():
+    from opensearch_pipeline.extraction.unified_extractor import _vlm_cache_ns
     cache = {"abc123": _legacy_entry(visual_summary="旧条目"),
-             "abc123:pub": _legacy_entry(visual_summary="新条目")}
+             f"abc123:{_vlm_cache_ns(True)}": _legacy_entry(visual_summary="新条目")}
     assert _vlm_cache_lookup(cache, "abc123", True)["visual_summary"] == "新条目"
 
 
