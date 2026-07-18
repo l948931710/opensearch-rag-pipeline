@@ -178,7 +178,7 @@ class ComparisonReport:
             lines.append("")
         if self.per_case:
             lines += [f"## Per-case ({len(self.per_case)} rows)", "",
-                      f"_dumped to per_case.json_"]
+                      "_dumped to per_case.json_"]
         return "\n".join(lines)
 
     def save(self, out_dir: Path) -> Path:
@@ -221,10 +221,12 @@ def _chunk_to_sig(c: Any) -> Tuple[Tuple, SemanticChunkSig]:
     顺序无关(后续放 dict 里),同 D8 改动允许 image_refs 差异.
     """
     if isinstance(c, dict):
-        gv = lambda k, d=None: c.get(k, d)
+        def gv(k, d=None):
+            return c.get(k, d)
         extra = c.get("extra") or {}
     else:
-        gv = lambda k, d=None: getattr(c, k, d)
+        def gv(k, d=None):
+            return getattr(c, k, d)
         extra = getattr(c, "extra", None) or {}
     chunk_type = gv("chunk_type") or "?"
     step_no = extra.get("step_no")
@@ -392,7 +394,7 @@ def _produce_chunks_for_anchor_metric(arm: "Arm",
     task = {
         "op": "produce_chunks",
         "arm": arm.name,
-        "doc_pool": [{"label": l, "fmt": f, "path": p} for l, f, p in doc_pool],
+        "doc_pool": [{"label": lbl, "fmt": f, "path": p} for lbl, f, p in doc_pool],
     }
     env = {**os.environ, **arm.env, "RAG_EVAL_MODE": "1"}
     res = subprocess.run(
@@ -400,7 +402,7 @@ def _produce_chunks_for_anchor_metric(arm: "Arm",
         capture_output=True, text=True, check=True,
         cwd=Path(__file__).parent.parent,
     )
-    lines = [l for l in res.stdout.strip().split("\n") if l.strip()]
+    lines = [ln for ln in res.stdout.strip().split("\n") if ln.strip()]
     if not lines:
         raise RuntimeError(f"worker arm={arm.name} 无 stdout 输出")
     result = json.loads(lines[-1])
@@ -802,7 +804,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                   "未给则用 eval_image_binding_pdf.py 默认值(~/Downloads/...).")
 
     print(f"[chunker_ab] mode={mode.value} arms={[a.name for a in arms]} seed={args.seed}")
-    print(f"[chunker_ab] arm.env:")
+    print("[chunker_ab] arm.env:")
     for a in arms:
         print(f"  {a.name}: {a.env or '(empty)'}")
 

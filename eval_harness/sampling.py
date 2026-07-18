@@ -11,12 +11,10 @@
 """
 from __future__ import annotations
 
-import os
 import random
-import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 
 # ── 文档类型从 goldset 题目推断 ──

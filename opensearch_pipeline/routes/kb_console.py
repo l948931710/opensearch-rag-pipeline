@@ -937,6 +937,24 @@ _KB_REVIEW_ACTIONS = {"resolve": "RESOLVED", "dismiss": "DISMISSED", "reopen": "
 _MONITOR_STALE_ALERT_DAY = ""
 
 
+def _heartbeat_expected() -> bool:
+    """B6（P2-15）：运维声明「本环境应有 ops_monitor 心跳」。默认 off——本地/staging
+    没有监控作业属正常，不该误红。"""
+    return os.environ.get("RAG_OPS_HEARTBEAT_EXPECTED",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _monitor_dead(age_h, expected: bool) -> bool:
+    """B6（P2-15）死人开关判定（纯函数，单测锚点）：
+    · 有心跳且 >26h → 死（原语义）；
+    · **期望有心跳而完全缺席（None）→ 死**——核查实测的失效形态：心跳写被 PROD-RO
+      只读守卫挡死 → 读侧恒 None → 原 `is not None and >26` 永不触发、看板恒绿。
+    · 未声明期望时 None 维持「未知」不红（零误伤）。"""
+    if age_h is not None and age_h > 26:
+        return True
+    return expected and age_h is None
+
+
 @router.get("/api/kb/review-tasks", response_model=KbReviewTasksResponse)
 def kb_review_tasks(request: Request, limit: int = 20, include_closed: bool = False,
                     identity: Optional[Identity] = Depends(current_identity)):
@@ -1101,6 +1119,11 @@ class KbGovernanceResponse(BaseModel):
     # 凭据过期），前端亮红。serving 是全系统最活的组件，让它当被动监工。
     monitor_heartbeat_age_h: Optional[float] = None
     monitor_stale: bool = False
+    # B6（P2-15）：RAG_OPS_HEARTBEAT_EXPECTED 开时 None 也判 stale（缺席=更早期死人信号）
+    monitor_heartbeat_expected: bool = False
+    # B6（P2-15）：本进程被压制的告警计数（webhook 未配/域被拒；跨进程压制归 B7 配置根治）
+    alerts_suppressed: int = 0
+    alerts_suppressed_last: str = ""
     # 资产构成
     file_types: List[KbFileType] = Field(default_factory=list)   # 文件类型分布（按扩展名归类）
     # 运行健康
@@ -1158,10 +1181,15 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
     out = KbGovernanceResponse(window_days=win)
     # P2-14：监控心跳（fail-open；表未建 → None 前端显「未知」）。>26h → stale 亮红 +
     # 兜底告警（serving 作被动死人开关；每进程每日至多一次防刷）。
+    # B6（生产级外审 2026-07-17 P2-15）：核查实测发现「恒 None」形态——launchd 监控以
+    # PROD-RO 跑、心跳写被只读守卫挡死 → `is not None and >26` 永不触发，被动死人开关
+    # 名存实亡。新增 RAG_OPS_HEARTBEAT_EXPECTED（运维声明「本环境应有心跳」）：开着时
+    # None 直接判 stale（缺席=比超时更早期的死人信号：写路径被挡/表未建/作业没跑）。
     try:
         from opensearch_pipeline.queue_monitor import read_heartbeat_age_hours
         out.monitor_heartbeat_age_h = read_heartbeat_age_hours()
-        if out.monitor_heartbeat_age_h is not None and out.monitor_heartbeat_age_h > 26:
+        out.monitor_heartbeat_expected = _heartbeat_expected()
+        if _monitor_dead(out.monitor_heartbeat_age_h, out.monitor_heartbeat_expected):
             out.monitor_stale = True
             global _MONITOR_STALE_ALERT_DAY
             import datetime as _dt
@@ -1169,12 +1197,26 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             if _MONITOR_STALE_ALERT_DAY != _today:
                 _MONITOR_STALE_ALERT_DAY = _today
                 from opensearch_pipeline.alerting import send_ops_alert
+                _age_txt = (f"心跳已 {out.monitor_heartbeat_age_h}h 未刷新"
+                            if out.monitor_heartbeat_age_h is not None
+                            else "心跳完全缺席（RAG_OPS_HEARTBEAT_EXPECTED=期望有）")
                 send_ops_alert("监控链路心跳超时",
-                               f"ops_monitor 心跳已 {out.monitor_heartbeat_age_h}h 未刷新——"
-                               "笔记本 crontab/凭据/网络可能失效，所有 parity/SLO 检查处于停摆。",
+                               f"ops_monitor {_age_txt}——"
+                               "笔记本 crontab/凭据/网络/只读守卫可能失效，"
+                               "所有 parity/SLO 检查处于停摆。",
                                severity="critical", dedup_key="monitor-heartbeat")
     except Exception:   # noqa: BLE001
         logger.debug("monitor heartbeat 读取失败（忽略）", exc_info=True)
+    # B6（P2-15）：本进程「该发未发」告警计数上浮（webhook 未配/域被拒时 send_ops_alert
+    # 静默压制——SUPPRESSED-CRITICAL 只活在日志里，看板应可见）。仅本进程口径：
+    # launchd/DataWorks 侧的压制要靠把 webhook 配上（B7）根治，不靠计数。
+    try:
+        from opensearch_pipeline.alerting import suppressed_stats
+        _sup = suppressed_stats()
+        out.alerts_suppressed = int(_sup.get("count", 0))
+        out.alerts_suppressed_last = str(_sup.get("last_title", ""))[:80]
+    except Exception:   # noqa: BLE001
+        pass
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()

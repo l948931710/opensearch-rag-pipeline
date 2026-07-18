@@ -52,8 +52,6 @@ def recommend(results: dict) -> dict:
                    if q["kind"] == "positive" and q.get("live_scorable")
                    and q.get("publicly_retrievable") and q.get("gold_rank") == 1
                    and q.get("top1_score") is not None]
-    pos_all = [q["top1_score"] for q in pq
-               if q["kind"] == "positive" and q.get("top1_score") is not None]
     neg = [q["top1_score"] for q in pq if q["kind"] == "negative" and q.get("top1_score") is not None]
 
     cur = results.get("l2", {}).get("thresholds", {})

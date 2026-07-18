@@ -6,7 +6,10 @@ Output: oss://fuling-knowledge-base/opensearch/fuling-kb-chunks-v2-<ts>/data.jso
 
 Run AFTER tier1_preflight.py has confirmed cache complete + drift OK.
 """
-import os, sys, json, hashlib, datetime
+import os
+import json
+import hashlib
+import datetime
 def _load(p):
     if os.path.exists(p):
         for ln in open(p, encoding="utf-8"):
@@ -15,7 +18,8 @@ def _load(p):
                 k, v = ln.split("=", 1); os.environ[k.strip()] = v.strip().strip('"').strip("'")
 _load(".env"); _load(".env.production")
 
-import pymysql, oss2
+import pymysql
+import oss2
 TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 OSS_DIR = f"opensearch/fuling-kb-chunks-v2-{TS}"
 OSS_KEY = f"{OSS_DIR}/data.json"
@@ -103,6 +107,6 @@ ak=os.environ["RAG_OSS_ACCESS_KEY_ID"]; sk=os.environ["RAG_OSS_ACCESS_KEY_SECRET
 bucket=oss2.Bucket(oss2.Auth(ak,sk), "oss-cn-hangzhou.aliyuncs.com", os.environ["RAG_OSS_BUCKET_NAME"])
 print(f"uploading -> oss://{os.environ['RAG_OSS_BUCKET_NAME']}/{OSS_KEY}")
 bucket.put_object_from_file(OSS_KEY, LOCAL)
-print(f"DONE.\n\nWhen creating fuling_kb_chunks_v2 in the HA3 console, set the OSS data source path to:")
+print("DONE.\n\nWhen creating fuling_kb_chunks_v2 in the HA3 console, set the OSS data source path to:")
 print(f"  bucket:  {os.environ['RAG_OSS_BUCKET_NAME']}")
 print(f"  ossPath: /{OSS_KEY}")

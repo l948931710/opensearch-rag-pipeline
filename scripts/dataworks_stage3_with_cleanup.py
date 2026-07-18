@@ -1,4 +1,6 @@
-import subprocess, sys, os
+import subprocess
+import sys
+import os
 # py3.7 陷阱（批次9 S5/S6，同 stage3_node）: serverless 执行器实为 Python 3.7，
 # pypdf 5.0.0 元数据谎报支持 3.7 实则用 typing.Protocol(3.8+) → 必须钉真兼容版。
 # 镜像恢复 3.8+ 后自动走现代分支，本段无需再改。
@@ -32,7 +34,6 @@ DataWorks PyODPS 3 节点 — Stage 3: Chunks → OpenSearch Index
   - .env.local 文件（本地测试）
   - 绝不在源代码中硬编码密钥
 """
-import os
 import sys
 import zipfile
 

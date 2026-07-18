@@ -52,8 +52,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,production,ocr,api]"
-      - name: Lint (ruff — BLOCKING; 存量债 2026-07-04 清零，此后新增即红)
-        run: python -m ruff check opensearch_pipeline/ tests/
+      - name: Lint (ruff — BLOCKING; 核心 2026-07-04 清零、全仓 2026-07-18 纳管清零(B6 P2-16)，新增即红)
+        run: python -m ruff check .
       - name: General-ability eval gate (sim — 门2防劫持+门3分级路由，离线零网络)
         # RB-05：金集在仓（goldset/general_ability_set.json）、默认 RAG_SIMULATE=true、
         # 零 API 费用——sim 可跑的效果门没有理由留在部署前手工跑。live 档（--live）仍手工。
@@ -61,12 +61,13 @@ jobs:
       - name: Test (simulate mode — no external services)
         # perf F#48：xdist 并行（ubuntu runner 4 vCPU）；--dist loadgroup + conftest 分组钩子
         # 复刻 loadfile 语义并把共享本地栈的模块钉到同一 worker（CI 无本地 DB，该组多为 skip）。
-        # 覆盖率只在 3.11 腿收集（与生产 serving 版本一致；避免 matrix 双跑重复产物），
-        # 先做可见性不设 fail-under 门槛——有基线可看之后再谈守住。
+        # 覆盖率只在 3.11 腿收集（与生产 serving 版本一致；避免 matrix 双跑重复产物）。
+        # B6（P2-12）：可见期已过（基线 79%）——立 fail-under=75 全局保底（关键模块
+        # 风险加权门=后续二期；阈值只防「大幅裸奔下坠」，不追基线数字）。
         run: >-
           python -m pytest tests/ -q -p no:cacheprovider -n auto --dist loadgroup
           --junitxml=pytest-junit.xml
-          ${{ matrix.python-version == '3.11' && '--cov=opensearch_pipeline --cov-report=xml --cov-report=term' || '' }}
+          ${{ matrix.python-version == '3.11' && '--cov=opensearch_pipeline --cov-report=xml --cov-report=term --cov-fail-under=75' || '' }}
       - name: Upload junit (failure only — 排障用，红了才值得留)
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7

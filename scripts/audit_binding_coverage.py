@@ -14,7 +14,6 @@ audit_binding_coverage.py — 生产 step_card binding 覆盖率仪表板(只读
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime
@@ -77,7 +76,7 @@ def main():
         with conn.cursor() as cur:
             # 良绑:step_card_with_refs >= 3 ORDER BY DESC LIMIT 1
             cur.execute(
-                f"""
+                """
                 SELECT dm.doc_id, dm.original_filename, dm.title,
                        SUM(CASE WHEN cm.chunk_type='step_card' THEN 1 ELSE 0 END) AS step_cards,
                        SUM(CASE WHEN cm.chunk_type='step_card'
@@ -98,7 +97,7 @@ def main():
 
             # 差绑:有 step_card 但全无 image_refs
             cur.execute(
-                f"""
+                """
                 SELECT dm.doc_id, dm.original_filename, dm.title,
                        SUM(CASE WHEN cm.chunk_type='step_card' THEN 1 ELSE 0 END) AS step_cards,
                        SUM(CASE WHEN cm.chunk_type='step_card'
@@ -119,7 +118,7 @@ def main():
 
             # 零 step_card:有 chunk 但完全没走 step 模式
             cur.execute(
-                f"""
+                """
                 SELECT dm.doc_id, dm.original_filename, dm.title, COUNT(*) AS chunks
                 FROM fuling_knowledge.document_meta dm
                 JOIN fuling_knowledge.document_version dv
@@ -145,9 +144,9 @@ def main():
     L: list[str] = []
     L.append("# 生产 binding 覆盖率仪表板（Day 1 Step 1）\n")
     L.append(f"- **生成时间:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    L.append(f"- **形态:** 只读,直连生产 RDS(rm-bp15j7wekd5738f093o…)")
-    L.append(f"- **口径:** document_meta JOIN document_version(当前生效版本) LEFT JOIN chunk_meta(is_active=1)")
-    L.append(f"- **筛选:** document_meta.status='active'(已退役不计)\n")
+    L.append("- **形态:** 只读,直连生产 RDS(rm-bp15j7wekd5738f093o…)")
+    L.append("- **口径:** document_meta JOIN document_version(当前生效版本) LEFT JOIN chunk_meta(is_active=1)")
+    L.append("- **筛选:** document_meta.status='active'(已退役不计)\n")
 
     # 表 1:逐格式
     L.append("## 1) 逐格式覆盖率\n")

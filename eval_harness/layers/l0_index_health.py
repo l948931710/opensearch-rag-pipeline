@@ -19,7 +19,7 @@ from typing import Dict
 from .. import envboot  # noqa: F401
 from ..ha3live import (status_and_stats, query_vector, fields_of, cosine,
                        sample_active_chunks, total_active_chunks, table)
-from ..metrics import mean, percentiles
+from ..metrics import mean
 
 
 def _stored_vector(item: Dict):

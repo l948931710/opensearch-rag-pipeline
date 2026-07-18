@@ -71,6 +71,9 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+# B6（P2-16）：odps 是 DataWorks PyODPS 节点的运行时注入全局（非 import 可得），
+# 按 builtins 声明——评审点名的 per-file F821 之 ruff 原生解法。
+builtins = ["odps"]
 
 [tool.ruff.lint]
 # E701/E702（单行冒号/分号复合语句）：仓库既有紧凑风格（`if conn: conn.rollback()` 等
@@ -83,3 +86,13 @@ ignore = ["E701", "E702"]
 # bootstrap 后才能 import 包（E402 刻意）；脚本间复制演化保留了备用 import/变量，
 # 逐个清理无收益。包代码与正式测试不在豁免之列。
 "tests/eval/*" = ["E402", "F401", "F841", "E731"]
+# B6（P2-16 全仓纳管）：DataWorks 粘贴脚本按「凭证/依赖/下载/解压」分段布局，
+# import 天然穿插各段（E402 结构性豁免）；下列 scripts 为 env-bootstrap 一次性
+# 脚本（先设 os.environ 再 import 包，同 tests/eval 既例）。新脚本默认不豁免。
+"dataworks_nodes/*.py" = ["E402"]
+"scripts/dataworks_stage3_with_cleanup.py" = ["E402"]
+"scripts/validate_v2.py" = ["E402"]
+"scripts/eval_image_binding_accuracy.py" = ["E402"]
+"scripts/online_eval.py" = ["E402"]
+"scripts/export_full_to_oss_for_v2.py" = ["E402"]
+"scripts/diagnose_image_chunks.py" = ["E402"]

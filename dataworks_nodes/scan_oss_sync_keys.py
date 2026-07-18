@@ -10,7 +10,9 @@ OSS → RDS raw_key 同步脚本 (PyODPS 节点)
 
 安全模式：DRY_RUN = True 时只报告不修改
 """
-import subprocess, sys, os
+import subprocess
+import sys
+import os
 
 # ═══════════════════════════════════════════════════════════════
 # 0. 安装依赖
@@ -24,7 +26,8 @@ else:
 def ensure_deps():
     dep_dir = "/tmp/pydeps"
     try:
-        import pymysql, oss2
+        import pymysql  # noqa: F401  仅探测依赖是否可用
+        import oss2     # noqa: F401
         return
     except ImportError:
         pass
@@ -240,7 +243,7 @@ if not_found:
         print(f"  ... 还有 {len(not_found) - 20} 条")
 
 if new_files:
-    print(f"\n── OSS 新文件 (未注册) 前 20 条 ──")
+    print("\n── OSS 新文件 (未注册) 前 20 条 ──")
     for key in sorted(new_files)[:20]:
         print(f"  🆕 {key}")
     if len(new_files) > 20:
@@ -295,7 +298,7 @@ if not DRY_RUN and needs_update:
     print(f"\n   ✅ 更新路径: {updated} 条")
     print(f"   🔄 停用重复: {deactivated} 条")
 elif DRY_RUN and needs_update:
-    print(f"\n💡 DRY_RUN 模式，未执行修改。改为 DRY_RUN = False 后重跑即可实际更新。")
+    print("\n💡 DRY_RUN 模式，未执行修改。改为 DRY_RUN = False 后重跑即可实际更新。")
 
 conn.close()
 print("\n✅ 完成！")

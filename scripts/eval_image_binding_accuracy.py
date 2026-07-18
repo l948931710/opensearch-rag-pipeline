@@ -11,7 +11,6 @@ Ground truth:
   Chunker 产出的 step_card.chunk_text 如果包含该步骤文本的核心内容 → 绑定正确。
 """
 
-import json
 import os
 import sys
 import glob

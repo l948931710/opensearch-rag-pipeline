@@ -654,6 +654,9 @@ def security_posture_report() -> Dict[str, object]:
         # B3 P2-01：上传签名密钥独立性（fallback=回退会话密钥，一钥两用）
         "upload_signing_key": ("dedicated" if os.environ.get(
             "RAG_UPLOAD_SIGNING_KEY", "").strip() else "fallback_session_key"),
+        # B6 P2-15：告警出口配置态（missing=本进程告警全被压制，只活在日志）
+        "ops_alert_webhook": ("configured" if os.environ.get(
+            "RAG_OPS_ALERT_WEBHOOK", "").strip() else "missing"),
         "legacy_open_ack": legacy_open_posture_status(),
         "config_digest": _config_digest(),
     }

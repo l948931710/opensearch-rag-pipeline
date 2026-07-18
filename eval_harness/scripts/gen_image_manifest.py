@@ -46,9 +46,6 @@ import argparse
 import hashlib
 import json
 import os
-import sys
-import tempfile
-from collections import defaultdict
 from datetime import datetime
 
 

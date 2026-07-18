@@ -14,7 +14,7 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("RAG_ENVIRONMENT", "production")
 
-from opensearch_pipeline.config import get_config, load_config
+from opensearch_pipeline.config import load_config
 import opensearch_pipeline.config as _cfg
 _cfg._config = load_config()
 

@@ -211,6 +211,16 @@
 新增 env：`RAG_SECURITY_HEADERS`（默认 on）/`RAG_FRAME_ANCESTORS_EXTRA`/`RAG_OPS_ALERT_WEBHOOK_ALLOW`；注册表重生成至 436 名。
 未验证声明：真实钉钉 PC 工作台内嵌下的 frame-ancestors 行为（需 SAE 部署后真机验证——若内嵌形态是 webview 顶层加载则该头天然不拦）、CSP Report-Only 的真实违规面（部署后观察期收集）；本批在本地测试栈（pytest TestClient+vitest+vue-tsc 构建）验证。
 
+### 批次6 ✅ 已落地（2026-07-18，ontology-p0；as-built 注记如下）——代码批次收官
+
+25. **P2-15 死人开关复活**：新 `RAG_OPS_HEARTBEAT_EXPECTED`（默认 off，本地/staging 零误伤）——开着时心跳 **None 直接判 stale**（缺席=比超时更早期的死人信号；核查实测的失效形态正是「PROD-RO 挡心跳写→读侧恒 None→旧 `>26h` 判定永不触发」），判定抽成纯函数 `_monitor_dead` 四象限单测锚定；stale 告警文案区分「超时」vs「完全缺席」。**SUPPRESSED 计数上浮**：alerting 进程内压制统计（webhook 未配+域被拒两路径都入账），governance 响应新增 `alerts_suppressed`/`alerts_suppressed_last` 字段、posture 新增 `ops_alert_webhook: configured/missing`。**as-built 范围注记**：计数是本进程口径（governance 面板显示的是 SAE serving 进程的压制）；launchd 监控/DataWorks 侧的压制跨进程不可见——那要靠 B7 把 `RAG_OPS_ALERT_WEBHOOK` 配进 launchd env 根治，不靠计数。前端渲染新字段未加（响应字段已在，UI 展示留后续 console 迭代）。
+26. **P2-12 coverage 保底门**：ci.yml 3.11 腿加 `--cov-fail-under=75`（基线 79%，阈值防「大幅裸奔下坠」不追基线数字）；「先看后守」注释改判「保底已立」。关键模块风险加权门=二期（维持评审建议的分层路线）。
+27. **P2-16 全仓 lint 清零+纳管**：85 项归零——`odps` 走 ruff `builtins` 声明（评审点名 per-file 声明的 ruff 原生解法，4×F821）；DataWorks 粘贴脚本+6 个 env-bootstrap 一次性 scripts 按既例（tests/eval/*）给 E402 结构性豁免（**新脚本默认不豁免**）；scan 节点 probe import 拆行+noqa（删除会破坏依赖探测——autofix 的一个陷阱）；F541×21/E401×6/F811/真死 F401 autofix（percentiles/bootstrap_ci 等经 re-export 消费核验后删）；E731×3 改真 def、E741×2 重命名、F841×2（一处删死变量、一处 online_r5 改真用）、E722 改 `except Exception`。**Makefile 与 CI lint 面翻 `ruff check .`**——scripts/dataworks_nodes/deploy/stress_harness/eval_harness 全部纳管，新增违规即红。
+28. **P2-04（拍板项，未动码）**：Stream 异常 ACK 语义变更方案——**发送前失败**（claim 后、答案未出钉钉）→ 返回可重试 ACK 让钉钉重投，幂等由既有两阶段 dedup（claim→confirm/release）兜住：异常路径本就 `_release_msg`，重投会重新 claim 重新处理，用户从「静默无答」变「延迟有答」；**发送后失败**（答案已出、卡片更新等尾部异常）→ 维持 ACK OK（重投=重复回答）。**风险面如实**：dedup 默认 memory 后端在单进程 Stream 下可用，但 redis 后端故障时 dedup fail-open 放行=重复回答残余窗口；「发送前/后」边界需要在 handler 里显式标记（当前 try 块粒度分不开）。因有用户可见的重复回答风险面，**等 Sam 拍板后动工**（拍板即入下一批）。
+
+新增 env：`RAG_OPS_HEARTBEAT_EXPECTED`（默认 off）；注册表重生成至 437 名。
+未验证声明：GitHub CI 上 fail-under 与全仓 lint 步的实际首跑（推送后见）；governance 新字段在真实 SAE 进程的取值——本批在本地测试栈验证。
+
 ## 3. 与评审验收条款的映射备注
 
 - 评审 RB-04 验收"durable enqueue 失败返回 503"=批次1-1;"为每个 flag 建条件探针"=批次2-6;"strict=true"=批次7。

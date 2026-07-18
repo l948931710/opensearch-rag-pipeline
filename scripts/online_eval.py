@@ -10,7 +10,6 @@ online_eval.py — 28 条评测查询在线 HA3 端到端评测
 import json
 import os
 import re
-import sys
 import time
 
 # 加载 .env
@@ -143,7 +142,7 @@ def find_best_rank(results: list, keyword_expr: str, top_k: int = 10) -> int:
 def run_evaluation():
     print("=" * 70)
     print("  HA3 在线检索端到端评测 (28 Queries)")
-    print(f"  Search: DashScope native API (dense+sparse) → HA3 Vector Search")
+    print("  Search: DashScope native API (dense+sparse) → HA3 Vector Search")
     print("=" * 70)
     print()
 
@@ -245,7 +244,7 @@ def run_evaluation():
     online_r5 = hit_at_5 / total * 100
 
     print(f"  {'Strict R@1':<25} {online_r1:>6.2f}%        {offline_r1:>6.2f}%        {online_r1 - offline_r1:>+.2f}%")
-    print(f"  {'Strict R@5':<25} {hit_at_5/total*100:>6.2f}%        {offline_r5:>6.2f}%        {hit_at_5/total*100 - offline_r5:>+.2f}%")
+    print(f"  {'Strict R@5':<25} {online_r5:>6.2f}%        {offline_r5:>6.2f}%        {online_r5 - offline_r5:>+.2f}%")
     print(f"  {'Strict R@10':<25} {hit_at_10/total*100:>6.2f}%        {'100.00':>6}%        {hit_at_10/total*100 - 100:>+.2f}%")
     print(f"  {'MRR':<25} {mrr:>6.4f}         {offline_mrr:>6.4f}         {mrr - offline_mrr:>+.4f}")
     print()

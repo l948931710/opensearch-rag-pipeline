@@ -10,7 +10,12 @@ PASS criteria (all must hold):
 
 No mutating ops. Live fuling_kb_chunks is read-only-compared, not modified.
 """
-import os, sys, json, math, random, hashlib, datetime
+import os
+import sys
+import json
+import random
+import hashlib
+import datetime
 def _load(p):
     if os.path.exists(p):
         for ln in open(p, encoding="utf-8"):
@@ -44,7 +49,7 @@ def tomap(r):
     b = getattr(r,"body",r)
     if isinstance(b,str):
         try: return json.loads(b)
-        except: return b
+        except Exception: return b
     return b.to_map() if hasattr(b,"to_map") else b
 def parse(resp):
     b=tomap(resp)
@@ -146,7 +151,7 @@ print(f"  bm25: {bm25_ok}/{SAMPLE_BM25} match live top-1")
 if bm25_fails[:3]: print(f"  sample diffs: {bm25_fails[:3]}")
 
 # 5. Stats sanity
-print(f"\n=== stats sanity ===")
+print("\n=== stats sanity ===")
 stats_v2 = tomap(cli.stats(V2)).get("result", {})
 print(f"  v2 stats: {json.dumps(stats_v2, ensure_ascii=False)[:300]}")
 parts = stats_v2.get("partitions") or []

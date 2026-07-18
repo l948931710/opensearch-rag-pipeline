@@ -135,7 +135,7 @@ if __name__ == "__main__":
     print(f"2. 开始从 HA3 表 '{HA3_TABLE_NAME}' 批量删除...")
     deleted, errors = delete_from_ha3(rds_ids)
 
-    print(f"\n=== 清理完成 ===")
+    print("\n=== 清理完成 ===")
     print(f"   删除成功: {deleted}")
     print(f"   删除失败: {errors}")
 

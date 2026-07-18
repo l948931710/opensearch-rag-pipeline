@@ -51,7 +51,7 @@ def main():
     # 按真实出现频次取 top
     top = counter.most_common(120)
 
-    print(f"\n── '图' 附近 8 字窗口 top 120 (按频次) ──")
+    print("\n── '图' 附近 8 字窗口 top 120 (按频次) ──")
     not_covered = []
     covered = []
     for phrase, n in top:
