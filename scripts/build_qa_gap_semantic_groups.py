@@ -28,7 +28,7 @@ def main() -> int:
     args = ap.parse_args()
 
     from opensearch_pipeline.config import get_config
-    from opensearch_pipeline.contribution import question_hash
+    from opensearch_pipeline.contribution import is_junk_question, question_hash
     from opensearch_pipeline.db import _get_db_conn
     from opensearch_pipeline.qa_logger import _op_db
     from opensearch_pipeline.qa_gap_groups import greedy_group, semantic_threshold
@@ -44,6 +44,9 @@ def main() -> int:
                 " WHERE answer_status IN ('NO_RESULT','REFUSAL') AND query_text IS NOT NULL"
                 "   AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)", (args.days,))
             for (qtext,) in cur.fetchall() or []:
+                # 确定性垃圾（纯标点/单字/纯数字）不进归组——省 embedding，也免垃圾组污染映射表
+                if is_junk_question(qtext):
+                    continue
                 h = question_hash(qtext or "")
                 if not h or not (qtext or "").strip():
                     continue
