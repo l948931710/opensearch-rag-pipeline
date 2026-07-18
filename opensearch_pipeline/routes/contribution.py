@@ -824,7 +824,10 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             # 可修订 / 存量行可能带标记——防「先提交干净、采纳前改回」的绕过）。
             final_q = C.strip_img_markers(final_q).strip()
             final_c = C.strip_img_markers(final_c).strip()
-            final_dept = (req.category_dept or cur_dept or "").strip()
+            # P0(2026-07-17)：必须净化——尾斜杠 'marketing/' 会通过 authorize_upload（其校验
+            # 净化副本）却把原值编进 raw_key，权限段错位 → perm_from_raw_key 读回 public，
+            # dept_admin 绕过 kb_admin 审批直发全员。授权/raw_key/落库全用同一净值。
+            final_dept = kb_authz.sanitize_owner_dept(req.category_dept or cur_dept or "")
             verr = C.validate_contribution_text(final_q, final_c)
             if verr:
                 conn.rollback()

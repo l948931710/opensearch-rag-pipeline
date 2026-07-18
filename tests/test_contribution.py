@@ -316,6 +316,32 @@ def test_accept_default_is_dept_internal_internal_path(monkeypatch):
     assert "dept_internal" in meta and "private" in meta
 
 
+def test_accept_slash_injected_dept_cannot_escalate_to_public(monkeypatch):
+    """P0 回归(2026-07-17 ultra 评审)：category_dept='marketing/' 曾通过 authorize_upload
+    (校验净化副本)却把原值编进 raw_key,权限段错位 → perm_from_raw_key 读回 public,
+    dept_admin 绕过 kb_admin 审批直发全员。修后:净值贯穿授权/raw_key/落库,物化 dept_internal。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    sink = []
+    _capture_put(monkeypatch, ok=True, sink=sink)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        contrib_row=("pending", "none", None, None, None, "q", "a", "marketing"),
+        claim_rowcount=1, dv_exists=None))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_accept(
+        cid="C_SLASH", req=api.KbContributionAcceptRequest(category_dept="marketing/"),
+        request=None, identity=_ident())
+    assert resp.ok is True
+    # raw_key 无双斜杠、权限段(第 3 段)完好
+    assert sink and "//" not in sink[0][0] and "raw/marketing/internal/" in sink[0][0]
+    # 物化 permission_level=dept_internal,绝非 public
+    meta = [p for s, p in conn.calls if "INSERT INTO" in s and "document_meta" in s][0]
+    assert "dept_internal" in meta and "public" not in meta
+    # kb_contribution 落库的 category_dept 是净值 'marketing'
+    upd = [p for s, p in conn.calls if "SET review_status='accepted'" in s][0]
+    assert "marketing" in upd and "marketing/" not in upd
+
+
 def test_accept_public_by_dept_admin_gated_pending_approval(monkeypatch):
     """P2-16（2026-07-04 拍板「kb_admin 只管入库」）：dept_admin 选「全员公开」不再直通——
     物化登记为 PENDING_APPROVAL/PENDING 进 kb_admin 既有待审批队列；raw_key 仍扁平、meta 仍 public。"""

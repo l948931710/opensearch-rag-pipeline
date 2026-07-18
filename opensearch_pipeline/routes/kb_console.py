@@ -2252,7 +2252,9 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
                "no_extension": "文件缺少扩展名"}.get(reason, "文件名非法")
         raise HTTPException(status_code=400, detail=msg)
 
-    owner = (req.owner_dept or "").strip()
+    # P0 同族(2026-07-17)：授权/raw_key/token/落库全用同一净值——authorize_upload 只校验净化
+    # 副本,原值直通 build_raw_key 会让注入分隔符的 owner_dept 挤错路径段(validate-one-use-another)。
+    owner = kb_authz.sanitize_owner_dept(req.owner_dept)
     perm = req.permission_level
 
     if req.action == "version":
