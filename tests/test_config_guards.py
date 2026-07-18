@@ -265,6 +265,37 @@ class TestAgentSelfApprovalGuard:
         assert cfg.environment == "production"
 
 
+class TestAgentInjectionGuardPosture:
+    """【B1 P1-06，生产级外审 2026-07-17】production/staging 开 RAG_AGENT_ENABLE
+    必须连带开 RAG_PROMPT_INJECTION_GUARD（此前只在工具注册时 warning）。"""
+
+    def test_production_agent_on_guard_off_raises(self):
+        with pytest.raises(ValueError, match="RAG_PROMPT_INJECTION_GUARD"):
+            _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                        RAG_DASHSCOPE_API_KEY="sk-test", RAG_AGENT_ENABLE="true")
+
+    def test_staging_agent_on_guard_off_raises(self):
+        with pytest.raises(ValueError, match="RAG_PROMPT_INJECTION_GUARD"):
+            _fresh_load(RAG_ENVIRONMENT="staging", RAG_SIMULATE="true",
+                        RAG_DASHSCOPE_API_KEY="sk-test", RAG_AGENT_ENABLE="1")
+
+    def test_production_agent_on_guard_on_passes(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                          RAG_DASHSCOPE_API_KEY="sk-test", RAG_AGENT_ENABLE="true",
+                          RAG_PROMPT_INJECTION_GUARD="true")
+        assert cfg.rag.prompt_injection_guard is True
+
+    def test_production_agent_off_guard_off_passes(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                          RAG_DASHSCOPE_API_KEY="sk-test")
+        assert cfg.environment == "production"
+
+    def test_development_agent_on_guard_off_passes(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="true",
+                          RAG_AGENT_ENABLE="true")
+        assert cfg.environment == "development"
+
+
 class TestNoModelResolutionFlag:
     """【P1-15】RAG_NO_MODEL_RESOLUTION=ack：纯 RDS 作业豁免模型解析。
     llm/ocr/vlm/embedding 全为惰性哨兵（无端点无 key，意外调用立刻失败）；

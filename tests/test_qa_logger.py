@@ -347,3 +347,48 @@ def test_rewritten_1054_uses_ttl_negative_cache(mock_get_conn, monkeypatch, capl
                    rewritten_query="U8 第二步怎么操作")
     assert "rewritten_query" in cur2.execute.call_args[0][0]
     monkeypatch.setattr(QL, "_REWRITTEN_COL_MISSING_UNTIL", 0.0)   # 还原进程态
+
+
+# ═══════════════════ B1 P1-09：掩码异常 fail-closed ═══════════════════
+
+
+class TestRedactFailClosed:
+    """B1 P1-09（生产级外审 2026-07-17，行为更替）：_redact_for_log 掩码异常不再退回
+    原文——改写不可逆占位（sha256 前 16 位+长度）；逃生口 RAG_QA_LOG_REDACT_FAILOPEN
+    还原旧行为。"""
+
+    @staticmethod
+    def _boom(*_a, **_k):
+        raise RuntimeError("regex engine exploded")
+
+    def test_redact_exception_writes_irreversible_placeholder(self, monkeypatch):
+        import hashlib
+
+        import opensearch_pipeline.redaction as redaction
+        from opensearch_pipeline import qa_logger
+
+        monkeypatch.delenv("RAG_QA_LOG_REDACT_FAILOPEN", raising=False)
+        monkeypatch.setattr(redaction, "redact_text", self._boom)
+        original = "我的手机号是 13800138000，身份证 110101199001011234"
+        out = qa_logger._redact_for_log(original)
+        assert out is not None and original not in out
+        assert "13800138000" not in out and "110101199001011234" not in out
+        assert out.startswith("[PII_REDACT_FAILED sha256:")
+        digest = hashlib.sha256(original.encode("utf-8", errors="replace")).hexdigest()[:16]
+        assert digest in out and f"len:{len(original)}" in out   # 可对账、不可还原
+
+    def test_failopen_escape_restores_original(self, monkeypatch):
+        import opensearch_pipeline.redaction as redaction
+        from opensearch_pipeline import qa_logger
+
+        monkeypatch.setenv("RAG_QA_LOG_REDACT_FAILOPEN", "true")
+        monkeypatch.setattr(redaction, "redact_text", self._boom)
+        assert qa_logger._redact_for_log("原文含 13800138000") == "原文含 13800138000"
+
+    def test_normal_mask_path_unchanged(self, monkeypatch):
+        from opensearch_pipeline import qa_logger
+
+        monkeypatch.delenv("RAG_QA_LOG_REDACT_FAILOPEN", raising=False)
+        out = qa_logger._redact_for_log("联系 13800138000")
+        assert "13800138000" not in out                      # 正常掩码仍生效
+        assert "PII_REDACT_FAILED" not in out                # 未误入占位分支

@@ -407,9 +407,13 @@ def test_p3_flag_on_full_command_lifecycle(pr3_wired, monkeypatch):
         api.app.dependency_overrides.clear()
 
 
-def test_p3_enqueue_failure_falls_back_to_direct(pr3_wired, monkeypatch):
+def test_b1_enqueue_failure_fail_closed_503(pr3_wired, monkeypatch):
+    """B1 P1-01（生产级外审 2026-07-17，行为更替改判）：flag 开启时 enqueue 失败=受理
+    失败——503+Retry-After，不再回退直通（旧行为=零 durable 痕迹，进程死亡问题蒸发；
+    对齐 dispatch_outbox「enqueue 失败=受理失败（fail-closed）」模块契约）。"""
     ob, store = pr3_wired
     monkeypatch.setenv("RAG_AGENT_DURABLE_DISPATCH", "true")
+    monkeypatch.delenv("RAG_AGENT_DISPATCH_ACCEPT_FAILOPEN", raising=False)
 
     class _BrokenOutbox(MemOutbox):
         def enqueue(self, **kw):
@@ -419,8 +423,54 @@ def test_p3_enqueue_failure_falls_back_to_direct(pr3_wired, monkeypatch):
     monkeypatch.setattr(agent_route, "_DISPATCHER", None)
     try:
         r = _ask({"question": "问题", "session_id": "s1"})
-        assert r.status_code == 200 and '"type": "done"' in r.text   # 可用性优先
+        assert r.status_code == 503
+        assert r.headers.get("retry-after") == "5"
+        assert store.transitions == []                       # 未直通执行：零 run
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_b1_enqueue_failure_failopen_escape_restores_direct(pr3_wired, monkeypatch):
+    """B1 P1-01 逃生口：RAG_AGENT_DISPATCH_ACCEPT_FAILOPEN=true 还原旧「回退直通」
+    行为（043 未 apply 的过渡窗口专用）。"""
+    ob, store = pr3_wired
+    monkeypatch.setenv("RAG_AGENT_DURABLE_DISPATCH", "true")
+    monkeypatch.setenv("RAG_AGENT_DISPATCH_ACCEPT_FAILOPEN", "true")
+
+    class _BrokenOutbox(MemOutbox):
+        def enqueue(self, **kw):
+            raise RuntimeError("043 未 apply")
+
+    monkeypatch.setattr(agent_route, "_get_dispatch_outbox", lambda: _BrokenOutbox())
+    monkeypatch.setattr(agent_route, "_DISPATCHER", None)
+    try:
+        r = _ask({"question": "问题", "session_id": "s1"})
+        assert r.status_code == 200 and '"type": "done"' in r.text   # 旧可用性优先行为
         assert ("run1", "running", "succeeded") in store.transitions
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_b1_claim_exception_after_enqueue_returns_409(pr3_wired, monkeypatch):
+    """B1 P1-01：enqueue 已 durable、claim 中途异常——命令在案（queued）交恢复扫描
+    重驱，本方 409 不直通（直通=双执行双答案）。"""
+    ob, store = pr3_wired
+    monkeypatch.setenv("RAG_AGENT_DURABLE_DISPATCH", "true")
+    monkeypatch.delenv("RAG_AGENT_DISPATCH_ACCEPT_FAILOPEN", raising=False)
+
+    class _ClaimBoomOutbox(MemOutbox):
+        def claim_specific(self, command_id, *, holder, lease_s):
+            raise RuntimeError("DB timeout during claim")
+
+    boom = _ClaimBoomOutbox()
+    monkeypatch.setattr(agent_route, "_get_dispatch_outbox", lambda: boom)
+    monkeypatch.setattr(agent_route, "_DISPATCHER", None)
+    try:
+        r = _ask({"question": "问题", "session_id": "s1"})
+        assert r.status_code == 409
+        assert store.transitions == []                       # 未直通执行
+        assert len(boom.rows) == 1                           # 命令已受理在案
+        assert list(boom.rows.values())[0]["status"] == "queued"   # 恢复扫描可重驱
     finally:
         api.app.dependency_overrides.clear()
 

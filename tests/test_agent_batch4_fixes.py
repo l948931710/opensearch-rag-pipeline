@@ -339,7 +339,9 @@ _TOPO_BASE = dict(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
                   RAG_DASHSCOPE_API_KEY="x", RAG_REQUIRE_AUTH="true",
                   RAG_ACL_FAIL_CLOSED="true", RAG_ALLOW_LEGACY_OPEN_PROD="",
                   RAG_SESSION_BACKEND="redis", RAG_RATE_LIMIT_BACKEND="redis",
-                  RAG_MSG_DEDUP_BACKEND="redis", RAG_TOKEN_CACHE_BACKEND="redis")
+                  RAG_MSG_DEDUP_BACKEND="redis", RAG_TOKEN_CACHE_BACKEND="redis",
+                  # B1 P1-06 后：prod+agent-on 形态须连带开 guard（本组专测拓扑守卫）
+                  RAG_PROMPT_INJECTION_GUARD="true")
 
 
 def test_p1_10_multireplica_agent_on_requires_event_relay():

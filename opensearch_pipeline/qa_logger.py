@@ -74,8 +74,13 @@ def _redact_for_log(text: Optional[str]) -> Optional[str]:
 
     复用入库侧 redaction.redact_text（纯本地正则，不传 name_llm_fn → 无 LLM/网络/延迟），
     把身份证/手机号/邮箱/银行卡/地址/密钥及标注式姓名替换为占位符。flag 关或空文本时原样
-    返回。掩码失败退回原文并 warning：此处属辅助治理，绝不阻断主写入；且真实失败模式下
-    （pipeline_nodes 不可导入）整条写库本就先一步失败，不会造成静默泄漏。"""
+    返回。
+
+    B1 P1-09（生产级外审 2026-07-17，行为更替）：掩码异常**不再退回原文**——待掩码文本
+    恰是可能含 PII 的那份，「掩码坏了」的窗口期把明文写库与同文件 content_blocks 的
+    丢弃策略（_redact_content_blocks_for_log 异常→None）相悖。改为写不可逆占位
+    （sha256 前 16 位 + 长度：可对账/去重，不可还原），error 级留痕不阻断主写入；
+    逃生口 RAG_QA_LOG_REDACT_FAILOPEN=true 还原旧「退回原文」行为（默认 fail-closed）。"""
     if not text or not _qa_log_pii_redact_on():
         return text
     try:
@@ -83,8 +88,16 @@ def _redact_for_log(text: Optional[str]) -> Optional[str]:
         masked, _counts = redact_text(text)
         return masked
     except Exception as e:
-        logger.warning("qa_session_log PII 掩码失败，退回原文 (non-fatal): %s", e)
-        return text
+        import hashlib as _hl
+        import os as _os
+        if _os.environ.get("RAG_QA_LOG_REDACT_FAILOPEN",
+                           "").strip().lower() in ("1", "true", "yes", "on"):
+            logger.error("qa_session_log PII 掩码失败——FAILOPEN 逃生口开启，退回原文: %s", e)
+            return text
+        digest = _hl.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        logger.error("qa_session_log PII 掩码失败——正文以不可逆占位落库 "
+                     "(sha256:%s len:%d): %s", digest, len(text), e, exc_info=True)
+        return f"[PII_REDACT_FAILED sha256:{digest} len:{len(text)}]"
 
 
 def _redact_content_blocks_for_log(cbj: Optional[str]) -> Optional[str]:

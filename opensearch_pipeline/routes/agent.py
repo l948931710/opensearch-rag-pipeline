@@ -193,6 +193,13 @@ def _get_dispatcher():
     return _DISPATCHER
 
 
+def _dispatch_accept_failopen() -> bool:
+    """B1 P1-01 逃生口（默认 off=fail-closed）：true 时还原旧「受理失败回退直通」行为。
+    仅用于 043 尚未 apply 的过渡窗口——直通执行零 durable 痕迹，进程死亡问题即蒸发。"""
+    return os.environ.get("RAG_AGENT_DISPATCH_ACCEPT_FAILOPEN",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
     """后台收尸+对账线程（每进程一条，daemon），每轮三步：
     ①run_store.reap_stale_runs——stale running→failed、**stale resuming→回边 suspended**
@@ -809,12 +816,18 @@ def agent_ask(req: AskRequest, request: Request,
 
     # PR-3 Stage A（RAG_AGENT_DURABLE_DISPATCH，默认 off）：受理即落 durable 命令
     # （command-as-truth）——API 返回后进程崩溃/滚动发布，恢复扫描按命令重驱，用户
-    # 的问题不再静默蒸发。enqueue/认领失败回退直通路径（可用性优先，最常见原因=
-    # 043 未 apply，响亮告警）；容量/会话忙沿用 429/409（命令诚实收口 failed，UX 零变化）。
+    # 的问题不再静默蒸发。容量/会话忙沿用 429/409（命令诚实收口 failed，UX 零变化）。
+    # B1 P1-01（生产级外审 2026-07-17）：受理面 fail-closed——flag 开启即声明「命令
+    # 不 durable 就不算接单」（对齐 dispatch_outbox 模块契约「enqueue 失败=受理失败」）：
+    # enqueue 失败 → 503+Retry-After 让客户端重试（旧行为回退直通=看似接单实则零
+    # durable 痕迹，最常见原因=043 未 apply）；enqueue 成功后 claim 异常 → 命令已在案、
+    # 恢复扫描必然重驱，按认领失败同口径 409。逃生口 RAG_AGENT_DISPATCH_ACCEPT_FAILOPEN
+    # =true 还原旧直通回退（过渡窗口专用）。flag off 路径零变化。
     durable_cmd = None
     _claim_lost_cmd = None
     from opensearch_pipeline.agent_runtime.durable_dispatcher import durable_dispatch_enabled
     if durable_dispatch_enabled():
+        _cmd_id = None
         try:
             _dispatcher = _get_dispatcher()
             _cmd_id = _get_dispatch_outbox().enqueue(
@@ -832,8 +845,23 @@ def agent_ask(req: AskRequest, request: Request,
                 _claim_lost_cmd = _cmd_id
                 logger.warning("durable dispatch 命令 %s 认领失败（他方抢先持有）——"
                                "不直通执行，由持有方重建执行", _cmd_id)
-        except Exception:   # noqa: BLE001 — 受理面故障不拦 ask（检查 043 是否已 apply）
-            logger.error("durable dispatch 受理失败——回退直通路径", exc_info=True)
+        except Exception:   # noqa: BLE001 — 受理面故障分流（B1 P1-01），HTTP 异常在分支内 raise
+            if _dispatch_accept_failopen():
+                logger.error("durable dispatch 受理失败——FAILOPEN 逃生口开启，按旧行为"
+                             "回退直通路径", exc_info=True)
+            elif _cmd_id is not None:
+                # enqueue 已 commit、claim 中途异常：命令 durable 在案，本方再直通=与
+                # 恢复扫描重驱双执行双答案，收 409（用户稍后在会话历史看到回答）。
+                logger.error("durable dispatch 命令 %s 认领异常（命令已受理在案）——"
+                             "不直通，交恢复扫描重驱", _cmd_id, exc_info=True)
+                _claim_lost_cmd = _cmd_id
+            else:
+                logger.error("durable dispatch enqueue 失败——受理失败返回 503"
+                             "（检查 043 是否已 apply）", exc_info=True)
+                raise HTTPException(
+                    status_code=503,
+                    detail="服务暂时无法受理请求，请稍后重试",
+                    headers={"Retry-After": "5"})
     if _claim_lost_cmd is not None:
         raise HTTPException(
             status_code=409,

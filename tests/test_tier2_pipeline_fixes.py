@@ -345,7 +345,10 @@ def test_g8_daily_ledger_failopen(monkeypatch):
     import opensearch_pipeline.extraction.cost_breaker as cb
     from opensearch_pipeline.extraction.cost_breaker import estimate_doc_cost
     br = _breaker(monkeypatch, daily_cap=10.0)
-    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)  # 账本不可用 → fail-open
+    # B1 P2-10 后语义收窄：账本不可用只在 simulate（账本本就不存在）/逃生口下跳闸；
+    # 非模拟环境改走瞬态拒绝（见 test_cost_breaker.py B1 组）。此处显式钉 simulate。
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)  # 账本不可用
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: True)  # 模拟 → 跳过日闸
     added = []
     monkeypatch.setattr(cb, "_ledger_add", lambda amt: added.append(amt))
     est = estimate_doc_cost("pdf", unit_count=10, cached_count=0, cfg=br.cfg)

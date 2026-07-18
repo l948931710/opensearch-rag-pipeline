@@ -1047,6 +1047,24 @@ def load_config() -> PipelineConfig:
             f"请移除该环境变量。"
         )
 
+    # 【B1 P1-06，生产级外审 2026-07-17】只读 Agent 的不可信数据边界不是可选项：
+    # 检索片段/文档内容/Ontology 描述都是不可信输入，即使工具只读也可能诱导模型
+    # 泄露上下文/越权检索/错误建议。此前只在工具注册时 warning（routes/agent.py），
+    # 姿态缺口可被长期忽略——production/staging 开启 RAG_AGENT_ENABLE 必须连带开启
+    # RAG_PROMPT_INJECTION_GUARD，与 self-approval 同级 fail-fast。
+    # ⚠️ guard 翻转会改变 L7 注入评测 regime（prompt 变 → prompt_sha16 变）——生产开启
+    # 前须随 RB-05/B2 的 agent 基线 refreeze 一并做
+    # （docs/rb05_scorecard_realignment_2026-07-18_DRAFT.md §2 B2）。
+    if _env_label_prod and os.environ.get("RAG_AGENT_ENABLE",
+                                          "").strip().lower() in ("1", "true", "yes", "on") \
+            and not config.rag.prompt_injection_guard:
+        raise ValueError(
+            f"🚨 [PRODUCTION SECURITY GUARD] '{config.environment}' 环境开启了 RAG_AGENT_ENABLE "
+            f"但未开启 RAG_PROMPT_INJECTION_GUARD——Agent 工具结果/检索内容是不可信输入，"
+            f"生产/预演必须启用注入防护（B1 P1-06）。请设 RAG_PROMPT_INJECTION_GUARD=true"
+            f"（注意：guard 改变 L7 评测 regime，生产开启需随 agent 基线 refreeze 一并生效）。"
+        )
+
     # 【批次5 P0-07d，unknown-unknowns 外审】生产安全姿态断言：强制认证与 ACL fail-closed
     # 是 main P0 加固（0cbb0f8）的两根梁，代码默认 off 是「代码先行、部署后开」的过渡态——
     # production/staging 启动时必须显式表态：要么把两个 flag 打开，要么设
