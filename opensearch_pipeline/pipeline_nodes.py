@@ -6106,10 +6106,10 @@ def node_deactivate_old_chunks(ctx: dict):
                                 # 中途置的 PENDING_DELETE 删除握手（set-visibility→restricted / retire）
                                 # 覆盖掉；FAILED 是 stage-3 可认领态，下批 loader 遂把受限文档以旧
                                 # permission 重推 HA3，且基于 reconcile 的删除永不触发（ultra P1
-                                # 2026-07-17）。clear_set_sql() 顺手清租约（flag off 时空串，现网零副作用）。
+                                # 2026-07-17）。（分支版此处还清 ingest 租约；main 无租约列，仅 CAS。）
                                 cur.execute(f"""
                                     UPDATE document_version
-                                    SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
+                                    SET index_status = '{DocVersionIndexStatus.FAILED}'
                                     WHERE doc_id = %s AND version_no = %s
                                       AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                                 """, (doc_id, ver))

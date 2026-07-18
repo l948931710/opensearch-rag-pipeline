@@ -78,9 +78,10 @@ def test_deactivate_failure_path_cas_guards_pending_delete():
     会覆盖控制台中途置的 PENDING_DELETE 握手 → 受限文档以旧 permission 被 stage-3 重推 HA3。"""
     from opensearch_pipeline import pipeline_nodes
     src = inspect.getsource(pipeline_nodes.node_deactivate_old_chunks)
-    # 失败路径 FAILED 写带清租约（成功路径是参数化 `%s`，故这段是失败路径独有印记）
-    marker = "SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}"
-    assert marker in src, "失败路径 FAILED 写应带 clear_set_sql（清租约）"
+    # 失败路径 FAILED 写印记（成功路径是参数化 `%s`，故这段是失败路径独有印记；
+    # 分支版此处还拼 ingest_lease.clear_set_sql()——main 无租约模块，摘取适配仅保 CAS）
+    marker = "SET index_status = '{DocVersionIndexStatus.FAILED}'"
+    assert marker in src, "失败路径应写 FAILED"
     # 紧随其后是 PROCESSING CAS 谓词
     tail = src[src.index(marker): src.index(marker) + 400]
     assert "AND index_status = '{DocVersionIndexStatus.PROCESSING}'" in tail, \
