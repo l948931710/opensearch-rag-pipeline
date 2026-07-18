@@ -129,11 +129,24 @@ print(f"   ✅ 发现 {len(oss_files)} 个文件")
 # ═══════════════════════════════════════════════════════════════
 import pymysql
 
+
+def _rds_ssl_kwargs():
+    """P0-02/B3：显式 TLS 语义——配 RAG_RDS_SSL_CA 即验证 TLS，未配显式明文。
+    不能留空 kwargs：RDS 服务端开 SSL 后 pymysql 2.x PREFERRED 会自动试握手且
+    失败不回退，行为随客户端 OpenSSL 漂移（与 prod_access._connect 同语义）。"""
+    ca = (os.environ.get("RAG_RDS_SSL_CA") or "").strip()
+    if not ca:
+        return {"ssl_disabled": True}
+    verify = (os.environ.get("RAG_RDS_SSL_VERIFY_CERT", "true").strip().lower()
+              not in ("0", "false", "no"))
+    return {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+
+
 print("\n📋 查询 RDS document_version 记录...")
 conn = pymysql.connect(
     host=RDS_HOST, port=RDS_PORT,
     user=RDS_USER, password=RDS_PASSWORD,
-    database=RDS_DATABASE, charset="utf8mb4"
+    database=RDS_DATABASE, charset="utf8mb4", **_rds_ssl_kwargs()
 )
 
 with conn.cursor() as cursor:

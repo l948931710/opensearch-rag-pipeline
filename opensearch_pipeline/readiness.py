@@ -505,6 +505,42 @@ def acl_outbox_generation_status() -> str:
     return _cached("acl_outbox_generation", 300, _compute)
 
 
+def rds_tls_cipher_status() -> str:
+    """B3（生产级外审 2026-07-17 RB-02）：TLS 生效实测——SHOW STATUS LIKE 'Ssl_cipher'
+    读**本连接**的会话级密码套件（池内连接同构，可代表接线状态）。
+    状态词：simulate → skipped；未配 CA → plaintext（配置态明文，P0-02 告警拍板管辖）；
+    CA+cipher 非空 → tls_verified(<套件>)；CA+cipher 空 → **ca_configured_but_plaintext**
+    （配了 CA 还明文=某条连接路径丢了 pymysql_ssl_args，api 启动在 prod/staging 对此
+    fail-fast）；探针失败 → error（只报告——DB 瞬断自会在 rds 主探针响）。"""
+
+    def _compute() -> str:
+        try:
+            from opensearch_pipeline.config import get_config
+            cfg = get_config()
+            if cfg.simulate_db:
+                return "skipped"
+            if not (cfg.rds.ssl_ca or "").strip():
+                return "plaintext"
+            from opensearch_pipeline.db import _get_db_conn
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SHOW STATUS LIKE 'Ssl_cipher'")
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+            val = ""
+            if row is not None:
+                vals = list(row.values()) if isinstance(row, dict) else list(row)
+                val = str(vals[1] if len(vals) > 1 else "") or ""
+            return f"tls_verified({val})" if val else "ca_configured_but_plaintext"
+        except Exception as e:   # noqa: BLE001
+            logger.warning("readiness: Ssl_cipher 探针失败: %s", e)
+            return "error"
+
+    return _cached("rds_tls_cipher", 300, _compute)
+
+
 def kill_switch_status() -> str:
     """DB 驱动 kill switch 的读路径健康（批次5 P0-06b）：绕缓存直读一次——
     「表在但读退化」（权限被收/行损坏）此前只活在 warning 日志，readiness 恒绿。
@@ -612,7 +648,12 @@ def security_posture_report() -> Dict[str, object]:
         "schema_strict": _onoff("RAG_READY_SCHEMA_STRICT"),
         "card_callback_secret": ("configured" if os.environ.get(
             "DINGTALK_CARD_CALLBACK_API_SECRET", "").strip() else "missing"),
-        "rds_tls": "ca_configured" if _ssl_ca else "plaintext",
+        # B3：配置态升级为实测态（skipped/plaintext/tls_verified(...)/
+        # ca_configured_but_plaintext/error，见 rds_tls_cipher_status）
+        "rds_tls": rds_tls_cipher_status() if _ssl_ca else "plaintext",
+        # B3 P2-01：上传签名密钥独立性（fallback=回退会话密钥，一钥两用）
+        "upload_signing_key": ("dedicated" if os.environ.get(
+            "RAG_UPLOAD_SIGNING_KEY", "").strip() else "fallback_session_key"),
         "legacy_open_ack": legacy_open_posture_status(),
         "config_digest": _config_digest(),
     }

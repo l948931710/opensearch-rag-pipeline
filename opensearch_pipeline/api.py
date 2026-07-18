@@ -170,7 +170,34 @@ async def _lifespan(_app: FastAPI):
             )
     except Exception:
         logger.warning("embedding 契约比对失败（忽略，不影响启动）", exc_info=True)
+    # B3（生产级外审 2026-07-17 RB-02）：TLS 接线自检——配了 CA 却明文=接线缺陷，
+    # production/staging fail-fast（未配 CA 维持 P0-02 告警拍板；探针 error 只告警）
+    _rds_tls_startup_check()
     yield
+
+
+def _rds_tls_startup_check() -> None:
+    """B3（RB-02）：启动期 TLS 接线自检。仅当 production/staging + 非模拟 + 已配
+    RAG_RDS_SSL_CA 时实测 Ssl_cipher：**ca_configured_but_plaintext ⇒ RuntimeError**
+    （配了 CA 还明文=某条连接路径丢了 pymysql_ssl_args 或服务端 TLS 被关，带病
+    服务比拒绝启动更糟）；tls_verified 记 info；error（DB 瞬断）只告警不 brick
+    ——连接真不可用会在别处以更明确的方式失败。"""
+    try:
+        cfg = get_config()
+        if cfg.environment not in ("production", "staging") or cfg.simulate_db \
+                or not (cfg.rds.ssl_ca or "").strip():
+            return
+        from opensearch_pipeline import readiness as _rdn
+        st = _rdn.rds_tls_cipher_status()
+        if st == "ca_configured_but_plaintext":
+            raise RuntimeError(
+                "[B3 RB-02] RAG_RDS_SSL_CA 已配置但 RDS 连接为明文（Ssl_cipher 空）——"
+                "存在未接 pymysql_ssl_args 的连接路径或服务端 TLS 被关闭，拒绝启动。")
+        logger.info("RDS TLS 自检：%s", st)
+    except RuntimeError:
+        raise
+    except Exception:   # noqa: BLE001
+        logger.warning("RDS TLS 自检失败（忽略，不影响启动）", exc_info=True)
 
 
 def _docs_urls(environment: str, enable_override: bool) -> dict:

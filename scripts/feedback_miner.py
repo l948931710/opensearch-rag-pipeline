@@ -32,11 +32,23 @@ from eval_harness import envboot  # noqa: F401,E402
 import pymysql  # noqa: E402
 
 
+def _rds_ssl_kwargs():
+    """P0-02/B3：显式 TLS 语义——配 RAG_RDS_SSL_CA 即验证 TLS，未配显式明文。
+    不能留空 kwargs：RDS 服务端开 SSL 后 pymysql 2.x PREFERRED 会自动试握手且
+    失败不回退，行为随客户端 OpenSSL 漂移（与 prod_access._connect 同语义）。"""
+    ca = (os.environ.get("RAG_RDS_SSL_CA") or "").strip()
+    if not ca:
+        return {"ssl_disabled": True}
+    verify = (os.environ.get("RAG_RDS_SSL_VERIFY_CERT", "true").strip().lower()
+              not in ("0", "false", "no"))
+    return {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+
+
 def _conn():
     return pymysql.connect(
         host=os.environ["RAG_RDS_HOST"], port=int(os.environ.get("RAG_RDS_PORT", 3306)),
         user=os.environ["RAG_RDS_USER"], password=os.environ["RAG_RDS_PASSWORD"],
-        charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor)
+        charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor, **_rds_ssl_kwargs())
 
 
 def _score_band(score):

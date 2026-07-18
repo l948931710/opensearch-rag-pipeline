@@ -179,6 +179,14 @@
 
 未验证声明：真实三环境 /api/ready 响应（新探针在 staging/prod 的实际状态词）、SAE 部署包——本批在本地测试栈验证。
 
+### 批次3 ✅ 已落地（2026-07-18，ontology-p0；as-built 注记如下）
+
+10. **连接位点接线**：台账列的 8 个位点全部接线，且 sweep 又抓出**台账外两个漏网**——`eval_harness/ha3live.py`（笔记本连 prod-ro，必须吃 CA）与 `stress_harness/dbprobe.py`（本地钉死，显式 `ssl_disabled=True`）——共 **10 处**。分两式：`corpus_cleanup` 走 `cfg.rds.pymysql_ssl_args()`（连接参数本就来自 cfg）；其余 8 个自包含脚本内联同文 `_rds_ssl_kwargs()`（env 读 `RAG_RDS_SSL_CA`/`RAG_RDS_SSL_VERIFY_CERT`，镜像 prod_access 语义：未配显式明文、配了验证 TLS）。新 `tests/test_rds_ssl_wiring.py` 三道门：全仓 pymysql.connect 位点 sweep（新增位点忘接线即红）+ 八份内联拷贝 AST 结构一致性（去 docstring 同构）+ helper 行为三象限。
+11. **Ssl_cipher 自检**：`readiness.rds_tls_cipher_status()`（SHOW STATUS 会话级实测，状态词 skipped/plaintext/tls_verified(套件)/ca_configured_but_plaintext/error，TTL 300s）；`api._rds_tls_startup_check()` 接进 lifespan——production/staging + 配 CA + 实测明文 ⇒ **RuntimeError 拒绝启动**（配了 CA 还明文=接线缺陷，不违「未配 CA 告警不阻断」拍板）；探针 error 只告警不 brick（DB 瞬断在 rds 主探针响）。posture 的 `rds_tls` 字段从配置态升级为实测态。
+12. **文案与姿态**：P0-02 告警文案更新（服务端 SSL 已开+CA 已随包+设 env 即启用+自检兜底；硬断随 SAE env 落地=B7）；P2-01 production/staging 未配 `RAG_UPLOAD_SIGNING_KEY` ⇒ 启动 warning + posture 新字段 `upload_signing_key: dedicated/fallback_session_key`（硬断同留 B7）。
+
+未验证声明：真实 TLS 链路的 cipher 实测（本地 MySQL 无 CA 配置形态）、DataWorks 节点在真实执行器上的 TLS 连接、SAE 部署包——接线与状态机在本地测试栈验证。
+
 ## 3. 与评审验收条款的映射备注
 
 - 评审 RB-04 验收"durable enqueue 失败返回 503"=批次1-1;"为每个 flag 建条件探针"=批次2-6;"strict=true"=批次7。

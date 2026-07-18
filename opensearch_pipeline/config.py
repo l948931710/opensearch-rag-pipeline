@@ -707,12 +707,17 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
         if not config.simulate_opensearch and not search_targets.strip():
             raise EnvironmentMismatchError(
                 "[ENV GUARD] environment=production 但未配置任何检索后端（HA3/OpenSearch 均为空）")
-        # P0-02（报告1）：生产 RDS 传输加密自检——**告警不阻断**（用户选「先不强制」，
-        # 拿到阿里云 RDS CA 证书配好 RAG_RDS_SSL_CA 后可把本告警升为硬断言）。
+        # P0-02（报告1）：生产 RDS 传输加密自检——**告警不阻断**（记录在案的用户决策；
+        # B3 更新语境：RDS 服务端 SSL 已开通（2026-07-17）、CA 已随包
+        # opensearch_pipeline/certs/aliyun-rds-ca.pem——「CA 到位后升硬断言」的前提
+        # 已满足，硬断随 SAE env 落地一并翻（B7，避免重部署 brick）。配了 CA 的
+        # 实例另有 api._rds_tls_startup_check 的 Ssl_cipher 实测 fail-fast。）
         if not config.simulate_db and not (config.rds.ssl_ca or "").strip():
             logging.getLogger(__name__).warning(
                 "[P0-02] environment=production 但 RDS 未启用 TLS（RAG_RDS_SSL_CA 未配）——"
-                "RDS 链路承载身份/权限/日志，明文传输是审计缺口；请尽快配 CA 证书。")
+                "RDS 链路承载身份/权限/日志，明文传输是审计缺口。CA 已随包"
+                "（opensearch_pipeline/certs/aliyun-rds-ca.pem），部署环境设 "
+                "RAG_RDS_SSL_CA 指向即启用验证 TLS（B3 自检会实测 Ssl_cipher）。")
 
     # D7：production/staging 实际启用 HA3 时表名必须显式声明（消除历史双标默认值）
     if env in ("production", "staging") and not config.simulate_opensearch \
@@ -1064,6 +1069,16 @@ def load_config() -> PipelineConfig:
             f"生产/预演必须启用注入防护（B1 P1-06）。请设 RAG_PROMPT_INJECTION_GUARD=true"
             f"（注意：guard 改变 L7 评测 regime，生产开启需随 agent 基线 refreeze 一并生效）。"
         )
+
+    # 【B3 P2-01，生产级外审 2026-07-17】上传签名密钥独立性：未配 RAG_UPLOAD_SIGNING_KEY
+    # 时 auth_token 回退会话密钥（一钥两用扩大泄漏半径）。typ 双向拒斥已闭环跨型伪造，
+    # 故**告警不阻断**（硬断随 SAE env 落地=B7，避免重部署 brick）；readiness
+    # security_posture.upload_signing_key 同步自报 fallback_session_key。
+    if _env_label_prod and not os.environ.get("RAG_UPLOAD_SIGNING_KEY", "").strip():
+        logging.getLogger(__name__).warning(
+            "⚠️ [P2-01] '%s' 环境未配置独立 RAG_UPLOAD_SIGNING_KEY——上传签名回退会话"
+            "密钥（一钥两用）。建议随下次 SAE 重打包配置独立密钥并纳入轮换。",
+            config.environment)
 
     # 【批次5 P0-07d，unknown-unknowns 外审】生产安全姿态断言：强制认证与 ACL fail-closed
     # 是 main P0 加固（0cbb0f8）的两根梁，代码默认 off 是「代码先行、部署后开」的过渡态——

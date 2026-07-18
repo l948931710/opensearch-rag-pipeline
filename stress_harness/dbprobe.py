@@ -14,8 +14,10 @@ try:
 except ImportError:   # pragma: no cover — production extra 未装时降级
     pymysql = None
 
+# ssl_disabled：本探针钉死本地 MySQL（host-pin），显式明文——MySQL 8 Docker 默认带
+# SSL 能力位，pymysql 2.x PREFERRED 会自动协商，显式声明消除客户端版本漂移（P0-02/B3）
 _CONN = dict(host="127.0.0.1", port=3306, user="root", password="your_password",
-             charset="utf8mb4", autocommit=True)
+             charset="utf8mb4", autocommit=True, ssl_disabled=True)
 
 
 class DBProbe:
