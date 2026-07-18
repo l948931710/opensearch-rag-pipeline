@@ -657,19 +657,63 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
                 return asset
         return None
 
+    def _drawing_to_sheet_order(z):
+        """批次6（ultra image_extraction_utils:672）：解析 drawing 文件 → workbook 顺序
+        sheet_idx（0-based）的**真实**映射。OOXML 的 drawingN.xml 按「有图 sheet 的创建序」
+        编号，不是按 sheet 序——首 sheet 无图（封面/目录页）时 sheet2 的 drawing 是
+        drawing1.xml，旧的 drawing_num-1 假定令 sheet_idx=0 而资产 page_num=2，
+        _find_asset_by_md5 的 page_num 闸全数落空 → 标注绑定静默全丢（①②③ 显式绑定
+        降级为弱位置启发）。真实链条：workbook.xml 的 <sheet> 顺序（page_num 与
+        openpyxl wb.worksheets 同源）→ r:id → workbook.xml.rels → worksheets/sheetN.xml
+        → 其 _rels → ../drawings/drawingM.xml。任何一环缺失/解析失败 → 返回 {}，
+        调用方回退旧假定（fail-open，常规文件两者一致时零行为变化）。"""
+        _R_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
+        _MAIN_NS = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        mapping = {}
+        names = set(z.namelist())
+        wb_root = ET.fromstring(z.read('xl/workbook.xml'))
+        rels_root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+        rid_to_target = {rel.get('Id'): rel.get('Target', '') or '' for rel in rels_root}
+        sheets = wb_root.findall('.//x:sheets/x:sheet', _MAIN_NS)
+        for order_idx, sheet_el in enumerate(sheets):
+            target = rid_to_target.get(sheet_el.get(_R_NS), '')
+            if not target:
+                continue
+            sheet_file = target.lstrip('/').split('/')[-1]        # sheet3.xml
+            ws_rels = f'xl/worksheets/_rels/{sheet_file}.rels'
+            if ws_rels not in names:
+                continue
+            try:
+                ws_rels_root = ET.fromstring(z.read(ws_rels))
+            except ET.ParseError:
+                continue
+            for rel in ws_rels_root:
+                m2 = re.search(r'drawing(\d+)\.xml$', rel.get('Target', '') or '')
+                if m2:
+                    mapping[f'xl/drawings/drawing{m2.group(1)}.xml'] = order_idx
+        return mapping
+
+    import re
     with zipfile.ZipFile(xlsx_path) as z:
         drawing_files = sorted([n for n in z.namelist()
                                 if n.startswith('xl/drawings/drawing') and n.endswith('.xml')])
         rels_files = {n for n in z.namelist()
                       if n.startswith('xl/drawings/_rels/') and n.endswith('.rels')}
+        try:
+            _sheet_order_map = _drawing_to_sheet_order(z)
+        except Exception as _me:
+            print(f"      ⚠️ [xlsx-img] drawing↔sheet rels 解析失败，回退 drawingN→sheetN 假定: {_me}")
+            _sheet_order_map = {}
 
         for drawing_path in drawing_files:
-            import re
             m = re.search(r'drawing(\d+)\.xml$', drawing_path)
             if not m:
                 continue
             drawing_num = int(m.group(1))
-            sheet_idx = drawing_num - 1
+            if drawing_path in _sheet_order_map:
+                sheet_idx = _sheet_order_map[drawing_path]
+            else:
+                sheet_idx = drawing_num - 1   # 回退旧假定（rels 链解析不出该 drawing）
 
             # 解析 rels → rId → media filename
             rels_path = f'xl/drawings/_rels/drawing{drawing_num}.xml.rels'

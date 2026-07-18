@@ -67,16 +67,28 @@ class TestVlmRebuilderSafeLevel:
         texts = [b.text for b in out.blocks if getattr(b, "source", "") == "multimodal"]
         assert "第一章" in texts and "正文内容描述" in texts, "both blocks must survive; no crash"
 
-    def test_rebuild_refunds_when_no_blocks_produced(self, monkeypatch):
-        # gate allowed but VLM returns nothing → reservation must be refunded
+    def test_rebuild_no_refund_when_pages_were_billed(self, monkeypatch):
+        """批次6（ultra vlm_rebuilder:472）语义更替：VLM 已被调用（哪怕返回空 blocks，
+        如图形页/拒答页的 200 响应）= 已真实计费——**不退款**。此前零产出全额退款让真实
+        DashScope 花费逃出 run/daily 预算帽（refund 还解除熔断+回冲共享日账本）。"""
         cfg = _rebuild_cfg(enabled=True)
         br = CostBreaker(cfg)
         monkeypatch.setattr(vlmr, "_page_char_counts", lambda p: [0, 0])
         monkeypatch.setattr(vlmr, "_render_page_image", lambda p, i, **k: (b"img", "image/png"))
-        monkeypatch.setattr(vlmr, "_vlm_reconstruct_page", lambda *a, **k: [])  # nothing rebuilt
+        monkeypatch.setattr(vlmr, "_vlm_reconstruct_page", lambda *a, **k: [])  # 空产出但已计费
         task = {"local_path": "/tmp/x.pdf", "doc_id": "D", "version_no": 1}
         vlmr.maybe_rebuild_pdf(task, _pdf_result(), cfg, breaker=br)
-        assert br.run_total_rmb == 0.0, "unspent reservation must be refunded when no blocks produced"
+        assert br.run_total_rmb > 0.0, "已发请求的页不退款——否则真实花费逃出预算帽"
+
+    def test_rebuild_refunds_unbilled_render_failures(self, monkeypatch):
+        """对照：渲染失败（请求从未发出=真未花钱）→ 照旧全额退款，勿空耗运行预算。"""
+        cfg = _rebuild_cfg(enabled=True)
+        br = CostBreaker(cfg)
+        monkeypatch.setattr(vlmr, "_page_char_counts", lambda p: [0, 0])
+        monkeypatch.setattr(vlmr, "_render_page_image", lambda p, i, **k: (None, None))
+        task = {"local_path": "/tmp/x.pdf", "doc_id": "D", "version_no": 1}
+        vlmr.maybe_rebuild_pdf(task, _pdf_result(), cfg, breaker=br)
+        assert br.run_total_rmb == 0.0, "未发请求（渲染失败）的页必须退款"
 
 
 # ─────────────────────────────────────────────────────────────────────

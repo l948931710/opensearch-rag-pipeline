@@ -1696,6 +1696,11 @@ class DocumentChunker:
         pending_image_refs: List[dict] = []  # 暂存 image_ref 块（尾部兜底用）
         image_marks: List[Tuple[int, dict]] = []  # (full_text 偏移, 图元) #F-clause-img
         full_len = 0  # 已累积 full_text 长度，记录图片文档位置 #F-clause-img
+        # 批次6（ultra chunker:1847）：逐段落记 (offset, page_num, source) 溯源——此前
+        # clause_chunk 一律无 page_num（HA3 落 0）、source 恒 "native"（OCR 文本也算原生），
+        # 制度/法规类文档全体丢页级引用与 OCR 溯源；step 路径早已保留两者，且本函数本就
+        # 为图片跟踪同一偏移（#F-clause-img），块级页码信息在手却被丢弃。
+        para_marks: List[Tuple[int, Optional[int], str]] = []  # (offset, page_num, source)
 
         for block in blocks:
             if isinstance(block, dict):
@@ -1749,8 +1754,18 @@ class DocumentChunker:
             # 非首段落前有一个 "\n" 分隔符。 #F-clause-img
             if all_para_texts:
                 full_len += 1
+            para_marks.append((full_len, page_num, source or "native"))  # 段起始偏移的溯源
             full_len += len(text)
             all_para_texts.append(text)
+
+        def _prov_at(offset: int) -> Tuple[Optional[int], str]:
+            """offset 处（full_text 坐标）所覆盖段落的 (page_num, source)。#批次6 溯源"""
+            page, src = None, "native"
+            for m_off, m_page, m_src in para_marks:
+                if m_off > offset:
+                    break
+                page, src = m_page, m_src
+            return page, src
 
         # 2. Join all paragraphs and split by clause boundaries
         full_text = "\n".join(all_para_texts)
@@ -1765,17 +1780,25 @@ class DocumentChunker:
         if not matches:
             # No clause boundaries found — fallback to standard text splitting
             sub_texts = self._split_long_text(full_text.strip())
+            _cursor = 0  # 批次6：sub 是 full_text 连续窗口的子串，游标 find 得到精确偏移
             for sub in sub_texts:
+                _pos = full_text.find(sub[:80], _cursor)
+                if _pos < 0:
+                    _pos = _cursor
+                _cursor = max(_cursor, _pos + 1)
                 if len(sub.strip()) < self.min_chunk_chars:
                     continue
+                _pg, _src = _prov_at(_pos)
                 chunks.append(self._create_chunk(
                     doc_id=doc_id,
                     version_no=version_no,
                     chunk_index=chunk_index,
                     chunk_type="text_chunk",
                     chunk_text=sub.strip(),
+                    page_num=_pg,
                     section_title=current_section,
                     metadata=meta,
+                    source=_src,
                 ))
                 chunk_index += 1
             return self._finalize_clause_with_images(
@@ -1838,6 +1861,7 @@ class DocumentChunker:
         # _create_chunk 内的 Fix B 解析。
         chunk_spans: List[int] = []  # 与 chunks 一一对应的段起始偏移 #F-clause-img
         for seg_start, seg in merged_segments:
+            _pg, _src = _prov_at(seg_start)   # 批次6：按段起始偏移的覆盖块盖溯源章
             if len(seg) > self.max_chunk_chars:
                 sub_texts = self._split_long_text(seg)
                 for sub in sub_texts:
@@ -1849,8 +1873,10 @@ class DocumentChunker:
                         chunk_index=chunk_index,
                         chunk_type="clause_chunk",
                         chunk_text=sub.strip(),
+                        page_num=_pg,
                         section_title=current_section,
                         metadata=meta,
+                        source=_src,
                     ))
                     chunk_spans.append(seg_start)
                     chunk_index += 1
@@ -1863,8 +1889,10 @@ class DocumentChunker:
                     chunk_index=chunk_index,
                     chunk_type="clause_chunk",
                     chunk_text=seg.strip(),
+                    page_num=_pg,
                     section_title=current_section,
                     metadata=meta,
+                    source=_src,
                 ))
                 chunk_spans.append(seg_start)
                 chunk_index += 1

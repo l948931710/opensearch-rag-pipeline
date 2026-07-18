@@ -727,8 +727,10 @@ class TestOCRClient:
             client._call_ocr_api("b64", "image/png")
 
     @patch("requests.post")
-    def test_dashscope_ocr_empty_response(self, mock_post):
-        """DashScope 返回空/畸形响应 → 返回空字符串而非崩溃。"""
+    def test_dashscope_ocr_empty_response_raises(self, mock_post):
+        """批次6（ultra ocr_client:477）语义更替：200 但响应体缺预期内容路径（空 choices/
+        错误载荷形态）→ **raise**（页 FAILED、不入页缓存），不再返回空字符串——旧行为会把
+        "" 当成功 DONE 永久写入页缓存，一次形态异常变成该页跨重灌的永久静默丢失。"""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"output": {"choices": []}}
@@ -739,8 +741,8 @@ class TestOCRClient:
             api_base_url="https://dashscope.aliyuncs.com/api/v1",
             simulate=False,
         )
-        text = client._call_ocr_api("b64", "image/png")
-        assert text == ""
+        with pytest.raises(RuntimeError, match="unparseable body"):
+            client._call_ocr_api("b64", "image/png")
 
     @patch("requests.post")
     def test_gemini_url_construction_with_models_in_base(self, mock_post):

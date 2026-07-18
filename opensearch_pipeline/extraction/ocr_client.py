@@ -296,6 +296,15 @@ class OCRClient:
             # 下游 node_write_chunk_meta 把它当"真空"以 DONE 收尾）。仅当所有页都 FAILED 时翻成
             # FAILED（最小改动，不引入 PARTIAL 枚举，避免改动有文本的部分失败语义）。
             agg_status = "FAILED" if (pages and all(p.status == "FAILED" for p in pages)) else "DONE"
+            # 批次6（ultra ocr_client:298）：部分页失败此前零信号——失败页 text="" 被
+            # to_blocks 丢弃、状态又是 DONE，缺页永久静默。这里 loud log；消费方
+            # （unified_extractor）按 pages 派生失败页清单落 partial_loss_notes →
+            # 文档收尾 NEEDS_REVIEW（可服务、重灌自愈），不再假装完整。
+            _failed_pgs = [p.page_num for p in pages if p.status == "FAILED"]
+            if _failed_pgs and agg_status == "DONE":
+                print(f"    ⚠️ [ocr] partial page failure: {len(_failed_pgs)}/{len(pages)} "
+                      f"page(s) FAILED (pages {_failed_pgs[:10]}) — kept successful pages; "
+                      f"doc will close NEEDS_REVIEW", flush=True)
             return OCRResult(pages=pages, combined_text=combined, status=agg_status)
 
         except Exception as e:
@@ -384,7 +393,10 @@ class OCRClient:
                 page_text = self._call_ocr_api(b64_data, mime_type)
                 # 反幻觉修剪（不传尺寸：整页渲染只修剪重复，绝不整体丢弃）
                 page_text, _ = sanitize_ocr_text(page_text)
-                if cache is not None:
+                # 批次6：空结果不入缓存——空文本可能是瞬态异常残留（或 sanitize 全剪），
+                # 缓存它会把一次性问题固化成该页跨重灌的永久空文本；真空白页重付一次
+                # OCR 的代价可接受（罕见且单页）。
+                if cache is not None and page_text.strip():
                     try:  # 存 sanitize 后文本；缓存写失败绝不影响 OCR 结果
                         cache.put_many({self._page_cache_key(b64_data): page_text})
                     except Exception:
@@ -474,8 +486,12 @@ class OCRClient:
 
             try:
                 return extract_vlm_text(resp.json(), use_compat).strip()
-            except (KeyError, IndexError):
-                return ""
+            except (KeyError, IndexError) as e:
+                # 批次6（ultra ocr_client:477）：200 但响应体缺预期内容路径（错误/拒答载荷
+                # 形态）≠ 空页成功。此前返 "" 被当 DONE 并永久写入页缓存——一次响应形态
+                # 异常变成该页永久静默丢失（后续重灌全部命中空缓存、零 API 调用、无重试
+                # 路径）。raise → 该页 FAILED 且不入缓存，下次运行重试。
+                raise RuntimeError(f"DashScope OCR 200 with unparseable body: {e!r}")
         else:
             # Default: Gemini API format
             # P0-2 Fix: API key 通过 header 传递，避免暴露在 URL 中被代理/日志记录
