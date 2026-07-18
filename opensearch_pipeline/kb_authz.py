@@ -95,6 +95,15 @@ def normalize_permission_level(raw: Optional[str]) -> str:
     return v if v in _VALID_PERMISSION_LEVELS else PERM_RESTRICTED
 
 
+def sanitize_owner_dept(value: Optional[str]) -> str:
+    """单值净化（与 authorize_upload 内部规则同源）：strip + 剥离非 [\\w\\-中文] 字符。
+
+    授权裁决、build_raw_key、落库必须用同一净值——「净值授权、原值落库/编路径」的分叉
+    曾让尾斜杠 category_dept 把权限段挤出位、发布为 public（2026-07-17 P0）。
+    不做白名单校验（那是 authorize_upload 的职责），只保证值不含路径/注入字符。"""
+    return _SANITIZE_RE.sub("", (value or "").strip())
+
+
 def sanitize_owner_depts(values: Union[str, Iterable[str], None]) -> List[str]:
     """把任意形态的 owner_dept 入参净化为【白名单内、去重、有序】列表（fail-closed）。
 
@@ -285,7 +294,7 @@ def authorize_upload(
     if not is_admin(identity):
         return AuthzDecision(False, False, "not_admin")
 
-    owner = _SANITIZE_RE.sub("", (owner_dept or "").strip())
+    owner = sanitize_owner_dept(owner_dept)
     # 合法目标 = 读组白名单 ∪ 生产子线(2026-07-17 写目标细化;子线永不归一回伞值)
     if not owner or (owner not in _valid_owner_depts() and owner not in _production_sublines()):
         return AuthzDecision(False, False, "invalid_owner_dept")

@@ -98,13 +98,26 @@ def expected_mime(ext: str) -> str:
 _PERM_PATH_SEG = {"dept_internal": "internal", "internal": "internal", "restricted": "restricted"}
 
 
+def _require_clean_seg(name: str, value: str) -> str:
+    """key 段硬校验：非空且不含 '/'。含分隔符的段会让后续所有段错位,
+    perm_from_raw_key 读错可见范围段——尾斜杠 category_dept 越权发 public 的机制根(2026-07-17 P0)。"""
+    v = (value or "").strip()
+    if not v or "/" in v:
+        raise ValueError(f"raw_key 段非法({name}={value!r})：不得为空或含 '/'")
+    return v
+
+
 def build_raw_key(owner_dept: str, doc_id: str, upload_id: str, filename: str,
                   permission_level: Optional[str] = None) -> str:
     """raw/<owner_dept>[/<perm_seg>]/<doc_id>/<upload_id>/<filename>。
 
     owner_dept 始终第 2 段（_dept_from_raw_key 依赖）；可见范围段（internal/restricted）是第 3 段,
     不影响部门解析。permission_level 省略/public → 扁平（= 旧行为,向后兼容）。
+    各段拒绝空值/内嵌 '/'（调用方须先过 kb_authz.sanitize_owner_dept 等净化）。
     """
+    owner_dept = _require_clean_seg("owner_dept", owner_dept)
+    doc_id = _require_clean_seg("doc_id", doc_id)
+    upload_id = _require_clean_seg("upload_id", upload_id)
     seg = _PERM_PATH_SEG.get((permission_level or "").strip().lower())
     head = f"{owner_dept}/{seg}" if seg else owner_dept
     return f"raw/{head}/{doc_id}/{upload_id}/{safe_filename(filename)}"
@@ -112,15 +125,20 @@ def build_raw_key(owner_dept: str, doc_id: str, upload_id: str, filename: str,
 
 def perm_from_raw_key(raw_key: str) -> str:
     """从已固定的 raw_key 反推可见范围（路径即权威,retry/对账/续跑用）：
-    第 3 段 internal/dept_internal→dept_internal · restricted→restricted · 否则 public。"""
+    扁平 5 段→public · 第 3 段 internal/dept_internal→dept_internal · restricted→restricted。
+
+    结构畸形（段数不对/空段/未知第 3 段）一律返 restricted——此处曾失效开放 return "public",
+    是尾斜杠越权 P0 的机制根；与 retriever/normalize_permission_level 的 fail-closed 约定对齐。"""
     parts = (raw_key or "").split("/")
-    if len(parts) >= 3 and parts[0] == "raw":
+    if parts[:1] == ["raw"] and len(parts) in (5, 6) and all(p.strip() for p in parts[1:]):
+        if len(parts) == 5:
+            return "public"
         seg = parts[2].strip().lower()
         if seg in ("internal", "dept_internal"):
             return "dept_internal"
         if seg == "restricted":
             return "restricted"
-    return "public"
+    return "restricted"
 
 
 def sign_upload_token(payload: dict, ttl: int = UPLOAD_TOKEN_TTL) -> str:

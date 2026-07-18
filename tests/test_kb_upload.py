@@ -64,6 +64,36 @@ def test_perm_from_raw_key_roundtrip():
     assert ku.perm_from_raw_key("raw/marketing/DOC_X/UP1/f.pdf") == "public"   # 扁平 → public
 
 
+# ── P0 根因回归(2026-07-17 ultra 评审)：段注入 fail-closed ──────────
+def test_build_raw_key_rejects_dirty_segments():
+    """含 '/' 或空的段直接 ValueError——段错位曾让 perm_from_raw_key 把 dept_internal 读成 public。"""
+    import pytest
+    for bad in ("marketing/", "/marketing", "mark/eting", "", "   "):
+        with pytest.raises(ValueError):
+            ku.build_raw_key(bad, "DOC_X", "UP1", "f.pdf", permission_level="dept_internal")
+    with pytest.raises(ValueError):
+        ku.build_raw_key("marketing", "DOC/X", "UP1", "f.pdf")
+    with pytest.raises(ValueError):
+        ku.build_raw_key("marketing", "DOC_X", "", "f.pdf")
+
+
+def test_perm_from_raw_key_fail_closed_on_malformed():
+    """结构畸形一律 restricted,绝不落 public——失效开放曾是尾斜杠越权 P0 的机制根。"""
+    # P0 原始形态:尾斜杠 dept 挤出的双斜杠 key(7 段)
+    assert ku.perm_from_raw_key("raw/marketing//internal/DOC_X/UP1/f.md") == "restricted"
+    # 6 段但第 3 段不是已知可见段
+    assert ku.perm_from_raw_key("raw/marketing/whatever/DOC_X/UP1/f.md") == "restricted"
+    # 空/太短/不以 raw 开头/空段
+    assert ku.perm_from_raw_key("") == "restricted"
+    assert ku.perm_from_raw_key("raw/a/b") == "restricted"
+    assert ku.perm_from_raw_key("canonical/marketing/DOC_X/UP1/f.md") == "restricted"
+    assert ku.perm_from_raw_key("raw//DOC_X/UP1/f.md") == "restricted"
+    # 合法形态不受影响
+    assert ku.perm_from_raw_key("raw/marketing/DOC_X/UP1/f.pdf") == "public"
+    assert ku.perm_from_raw_key("raw/marketing/internal/DOC_X/UP1/f.pdf") == "dept_internal"
+    assert ku.perm_from_raw_key("raw/marketing/restricted/DOC_X/UP1/f.pdf") == "restricted"
+
+
 # ── 签名 upload token：往返 / 篡改 / 过期 ──────────────────────────
 def test_upload_token_roundtrip(monkeypatch):
     monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
