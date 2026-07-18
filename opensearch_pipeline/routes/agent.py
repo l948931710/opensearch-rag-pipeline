@@ -348,9 +348,10 @@ def _drain_runtime() -> None:
         logger.warning("read-trace 排水失败（继续关停）", exc_info=True)
 
 
-@router.on_event("shutdown")
 def _agent_shutdown_drain() -> None:
-    """uvicorn 收 SIGTERM 后进入 lifespan shutdown 时触发（SAE 滚动发布的优雅窗口）。"""
+    """uvicorn 收 SIGTERM 后进入 lifespan shutdown 时触发（SAE 滚动发布的优雅窗口）。
+    B5（P2-18）：由 api._lifespan 关停侧显式调用（router.on_event 已弃用且本模块是
+    仓内最后一处用法）；atexit 兜底保留（_drain_runtime 幂等，先到者执行）。"""
     _drain_runtime()
     try:   # perf 批次 C §4.5：llm 账本 outbox 冲干净再关（flag off 时为 no-op）
         from opensearch_pipeline.agent_runtime.llm_log_outbox import drain_llm_log

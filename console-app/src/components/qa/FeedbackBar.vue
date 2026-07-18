@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ThumbsUp, ThumbsDown, Copy, Check } from 'lucide-vue-next'
+import { ThumbsUp, ThumbsDown, Copy, Check } from '@lucide/vue'
 import { useAsk, type ChatMessage } from '@/composables/useAsk'
 
 // 内嵌式反馈条：复制、赞/踩（一次性互斥），全部常驻可见。统一调 /api/feedback，靠 message_id 关联。

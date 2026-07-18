@@ -199,6 +199,18 @@
 新增 env：`RAG_EXTRACT_MAX_BYTES`（默认 200MB）；注册表重生成至 433 名。
 未验证声明：DataWorks 真实执行器上的钉版安装与 sidecar 校验（下次 DW 包上传后生效——B7）、SAE 部署包；本批在本地测试栈验证（py_compile + 恶意样本回归 + AST 同构锁）。
 
+### 批次5 ✅ 已落地（2026-07-18，ontology-p0；as-built 注记如下）
+
+19. **安全响应头**（`http_hardening.SecurityHeadersMiddleware`，api 全局挂载）：nosniff/Referrer-Policy(same-origin，对齐 console meta)/Permissions-Policy 全局；**frame 控制走「强制 CSP 只含 frame-ancestors」**——console 被钉钉 PC 工作台内嵌，X-Frame-Options 表达不了 allowlist（DENY 打死现网入口）、且 frame-ancestors 在 Report-Only 头会被浏览器忽略 ⇒ 必须拆两头：强制头只带 `frame-ancestors 'self' https://*.dingtalk.com https://*.dingtalkapps.com`（`RAG_FRAME_ANCESTORS_EXTRA` 可追加），其余策略（default/script/style/img/connect/font-src）全走 Report-Only 观察零破坏。端点已设同名头不覆盖；`RAG_SECURITY_HEADERS=false` 整组关闭。404 等错误响应同样附头（测试锁定）。
+20. **alerting allowlist**（`alerting._webhook_allowed`）：https + 钉钉官方域默认白名单、`RAG_OPS_ALERT_WEBHOOK_ALLOW` 追加自建网关域；file:///http/内网 IP/仿冒域（evildingtalk.com）负样本全拒。既有测试的 `example.invalid` webhook 统一换 `oapi.dingtalk.com`（urlopen 全 mock，语义不变）。
+21. **hot-questions cohort 复活**：console 调用去掉 `{auth:false}` 走默认 auth（有 token 带 Bearer→部门 cohort；无 token 自然匿名→静态兜底保留）；api.ts 注释改判「auth:false 仅用于必须匿名的调用」；api.spec 的匿名语义测试换中性路径 `/api/version`。
+22. **localStorage TTL**：14 天（`LS_TTL_MS`），load 时过滤过期会话并回写收缩存量；30 上限与 uid 戳跨用户清除保留。**as-built 偏离**：台账写「注销清除」——console 无独立 logout 流（钉钉内嵌身份），清除语义由既有身份切换钩（registerIdentityScopedStore+syncHistoryForUser）+TTL 兜底承担。新增 `__loadPersistedForTest` 测试钩（仿 `__resetAsk` 惯例）+3 条 TTL 测试（含「缺 updatedAt 旧格式按过期清」）。
+23. **五小刀**：session.ts:18 过时注释改判（sessionStorage 镜像=有意决策+指回 #F-console-urltoken）；README 三处（CLAUDE.md 有意 gitignore 说明/「SAE 单实例」改默认态vs能力态/workers 1 段落补多副本能力已备；顺带把 B4 打包脚本与 sidecar 铁律写进打包表并把脚本布局对齐「仅 opensearch_pipeline/」既定铁律）；stress README↔dbprobe 模块头互引（断言降级≠服务可缺库）；annotation_parser 纯标点正则改单一 raw 串（原 ASCII 引号截断 raw 串产生 invalid escape——字符集经 regex 语义核验零变化）；routes/agent 的 `@router.on_event("shutdown")`（仓内最后一处弃用用法）挪进 api._lifespan 关停侧显式调用（atexit 兜底保留）。
+24. **lucide 迁移完成**（非降级记录）：`lucide-vue-next@1.0.0`（deprecated）→ `@lucide/vue@^1.25.0`，24 个组件 import 全量切换，npm lock 干净换包（+1/-1）；glob 为传递依赖随上游不动。
+
+新增 env：`RAG_SECURITY_HEADERS`（默认 on）/`RAG_FRAME_ANCESTORS_EXTRA`/`RAG_OPS_ALERT_WEBHOOK_ALLOW`；注册表重生成至 436 名。
+未验证声明：真实钉钉 PC 工作台内嵌下的 frame-ancestors 行为（需 SAE 部署后真机验证——若内嵌形态是 webview 顶层加载则该头天然不拦）、CSP Report-Only 的真实违规面（部署后观察期收集）；本批在本地测试栈（pytest TestClient+vitest+vue-tsc 构建）验证。
+
 ## 3. 与评审验收条款的映射备注
 
 - 评审 RB-04 验收"durable enqueue 失败返回 503"=批次1-1;"为每个 flag 建条件探针"=批次2-6;"strict=true"=批次7。

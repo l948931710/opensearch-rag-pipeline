@@ -28,8 +28,10 @@ printf '{"git_sha": "%s", "built_at": "%s", "dirty_worktree": %s}\n' \
     "$GIT_SHA" "$(date -u +%FT%TZ)" "$([ "$DIRTY" -gt 0 ] && echo true || echo false)" \
     > "$TMP/build_info.json"
 
+# 布局对齐既定铁律（README「打包与部署」）：zip 根 = 仅 opensearch_pipeline/
+#（节点内联 pip，无 requirements.txt）+ build_info.json 溯源戳
 git archive --format=zip -o "$ZIP" --add-file="$TMP/build_info.json" HEAD \
-    opensearch_pipeline schema requirements.txt
+    opensearch_pipeline
 
 shasum -a 256 "$ZIP" | awk '{print $1}' > "$ZIP.sha256"
 

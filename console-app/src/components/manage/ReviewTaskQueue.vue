@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { ShieldAlert, Check, Ban, RotateCcw, CheckCircle2 } from 'lucide-vue-next'
+import { ShieldAlert, Check, Ban, RotateCcw, CheckCircle2 } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 import { useDialog } from '@/composables/useDialog'

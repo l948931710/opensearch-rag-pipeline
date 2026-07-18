@@ -27,7 +27,8 @@ describe('apiFetch — Bearer + auth 开关', () => {
     useSession().setToken('TKN')
     const fetchMock = vi.fn().mockResolvedValue(jsonRes({ ok: true }))
     vi.stubGlobal('fetch', fetchMock)
-    await apiFetch('/api/hot-questions', { auth: false })
+    // B5/P2-09 后 hot-questions 改走默认 auth（cohort 复活）——这里换个中性路径测语义
+    await apiFetch('/api/version', { auth: false })
     const headers = fetchMock.mock.calls[0][1].headers as Headers
     expect(headers.has('Authorization')).toBe(false)
   })

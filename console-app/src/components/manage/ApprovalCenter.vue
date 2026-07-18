@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { ClipboardCheck, Lightbulb } from 'lucide-vue-next'
+import { ClipboardCheck, Lightbulb } from '@lucide/vue'
 import { useKb } from '@/composables/useKb'
 import { useAgentApprovals } from '@/composables/useAgentApprovals'
 import { useContribute } from '@/composables/useContribute'

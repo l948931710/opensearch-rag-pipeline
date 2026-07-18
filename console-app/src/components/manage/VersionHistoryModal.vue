@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue'
-import { History, X } from 'lucide-vue-next'
+import { History, X } from '@lucide/vue'
 import { useKb } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 

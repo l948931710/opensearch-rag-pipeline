@@ -25,7 +25,7 @@ def test_send_noop_when_webhook_unset(monkeypatch, caplog):
 def test_send_fail_open_on_http_error(monkeypatch, caplog):
     import logging
     import urllib.request
-    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://example.invalid/robot/send?access_token=x")
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://oapi.dingtalk.com/robot/send?access_token=x")
     monkeypatch.delenv("RAG_OPS_ALERT_SECRET", raising=False)
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("net down")))
@@ -56,7 +56,7 @@ def test_send_dedupes_within_window(monkeypatch):
         calls.append(req.full_url if hasattr(req, "full_url") else str(req))
         return _R()
 
-    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://example.invalid/robot/send?access_token=x")
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://oapi.dingtalk.com/robot/send?access_token=x")
     monkeypatch.delenv("RAG_OPS_ALERT_SECRET", raising=False)
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
     from opensearch_pipeline import alerting
@@ -84,7 +84,7 @@ def test_signs_when_secret_set(monkeypatch):
         captured["url"] = req.full_url if hasattr(req, "full_url") else str(req)
         return _R()
 
-    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://example.invalid/robot/send?access_token=x")
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://oapi.dingtalk.com/robot/send?access_token=x")
     monkeypatch.setenv("RAG_OPS_ALERT_SECRET", "shhh")
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
     from opensearch_pipeline import alerting
@@ -124,7 +124,7 @@ def _mk_resp(body: bytes, status: int = 200):
 
 def _wire(monkeypatch, body: bytes):
     import urllib.request
-    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://example.invalid/robot/send?access_token=x")
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://oapi.dingtalk.com/robot/send?access_token=x")
     monkeypatch.delenv("RAG_OPS_ALERT_SECRET", raising=False)
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _mk_resp(body))
     from opensearch_pipeline import alerting
@@ -152,3 +152,93 @@ def test_unparseable_200_body_stays_true(monkeypatch):
     """body 非 JSON（代理页/空响应）→ 保守按已送达（旧行为，不误报失败）。"""
     alerting = _wire(monkeypatch, b"<html>proxy</html>")
     assert alerting.send_ops_alert("raw-test", "x", dedup_key="ec3") is True
+
+
+# ── B5（生产级外审 2026-07-17 P2-08）：webhook allowlist（SSRF 防线）──────────
+
+
+def _assert_rejected(monkeypatch, caplog, url):
+    import logging
+    import urllib.request
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", url)
+    monkeypatch.delenv("RAG_OPS_ALERT_SECRET", raising=False)
+    monkeypatch.delenv("RAG_OPS_ALERT_WEBHOOK_ALLOW", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("SSRF: 不得外呼")))
+    from opensearch_pipeline import alerting
+    alerting._LAST_SENT.clear()
+    with caplog.at_level(logging.ERROR, logger="opensearch_pipeline.alerting"):
+        ok = alerting.send_ops_alert("t", "x", dedup_key=f"allow-{url}")
+    assert ok is False
+    assert any("不在允许域" in r.getMessage() for r in caplog.records)
+
+
+def test_webhook_file_scheme_rejected(monkeypatch, caplog):
+    _assert_rejected(monkeypatch, caplog, "file:///etc/passwd")
+
+
+def test_webhook_plain_http_rejected(monkeypatch, caplog):
+    _assert_rejected(monkeypatch, caplog, "http://oapi.dingtalk.com/robot/send?access_token=x")
+
+
+def test_webhook_internal_host_rejected(monkeypatch, caplog):
+    _assert_rejected(monkeypatch, caplog, "https://100.100.100.200/latest/meta-data/")
+
+
+def test_webhook_lookalike_host_rejected(monkeypatch, caplog):
+    _assert_rejected(monkeypatch, caplog, "https://evildingtalk.com/robot/send")
+
+
+def test_webhook_official_domain_allowed(monkeypatch):
+    import urllib.request
+
+    sent = []
+
+    class _R:
+        status = 200
+
+        def read(self):
+            return b'{"errcode": 0}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK",
+                       "https://oapi.dingtalk.com/robot/send?access_token=x")
+    monkeypatch.delenv("RAG_OPS_ALERT_SECRET", raising=False)
+    monkeypatch.delenv("RAG_OPS_ALERT_WEBHOOK_ALLOW", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (sent.append(1), _R())[1])
+    from opensearch_pipeline import alerting
+    alerting._LAST_SENT.clear()
+    assert alerting.send_ops_alert("t", "x", dedup_key="allow-official") is True
+    assert sent
+
+
+def test_webhook_extra_allow_env(monkeypatch):
+    import urllib.request
+
+    sent = []
+
+    class _R:
+        status = 200
+
+        def read(self):
+            return b'{"errcode": 0}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK", "https://alerts.fuling.internal/hook")
+    monkeypatch.setenv("RAG_OPS_ALERT_WEBHOOK_ALLOW", "alerts.fuling.internal")
+    monkeypatch.delenv("RAG_OPS_ALERT_SECRET", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (sent.append(1), _R())[1])
+    from opensearch_pipeline import alerting
+    alerting._LAST_SENT.clear()
+    assert alerting.send_ops_alert("t", "x", dedup_key="allow-extra") is True
+    assert sent

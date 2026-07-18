@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, ClipboardCheck, Lightbulb, Fingerprint, ShieldCheck, Gauge } from 'lucide-vue-next'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, ClipboardCheck, Lightbulb, Fingerprint, ShieldCheck, Gauge } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'

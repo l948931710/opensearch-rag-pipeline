@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Lock, FileText, Loader2 } from 'lucide-vue-next'
+import { Lock, FileText, Loader2 } from '@lucide/vue'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessRequestItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'

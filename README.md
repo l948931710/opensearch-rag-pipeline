@@ -8,13 +8,15 @@
 > `alibabacloud_ha3engine_vector`），非 Elastic/AWS OpenSearch；标准 OpenSearch 仅作本地开发
 > 回退。模型全家桶 = DashScope/百炼（Qwen LLM · text-embedding-v4 · Qwen-VL OCR/VLM）。
 > 开发者向的权威文档是 **[CLAUDE.md](CLAUDE.md)**（架构、不变量、gotchas），本 README 是导览。
+> ⚠️ CLAUDE.md **有意不入库**（.gitignore 屏蔽——内含 RDS 端点等内部细节）：clone 后本地
+> 不存在属预期，协作开发向仓库维护者索取副本。
 
 ## 系统全景
 
 | 层 | 跑在哪 | 入口 | 干什么 |
 |---|---|---|---|
 | **摄取**（批） | DataWorks 每日调度 | `dataworks_orchestrator.py --stage {1,2,3}` | OSS raw/ → 提取(+OCR/VLM 图片漏斗) → 分类/PII 脱敏 → 切分(step 卡片) → embedding → 推 HA3 |
-| **服务**（在线） | SAE 单实例 | `api.py`(FastAPI :8000) + `dingtalk_bot.py`(Stream) | 3 路混合检索 → 邻居拼接/步骤扩展 → Qwen 生成 → 图文卡片；会话/反馈/限流/QA 落库 |
+| **服务**（在线） | SAE 单实例（默认态；Redis/durable 多副本能力已备） | `api.py`(FastAPI :8000) + `dingtalk_bot.py`(Stream) | 3 路混合检索 → 邻居拼接/步骤扩展 → Qwen 生成 → 图文卡片；会话/反馈/限流/QA 落库 |
 | **前端** | 钉钉 + 浏览器 | 小程序 `fuling-rag-miniapp/` · 控制台 `console-app/`(Vue3+Vite) | 问答、来源溯源、知识库管理（上传/审批/授权/看板/知识贡献） |
 | **评测** | 本地 | `eval_harness/` + `make release-gate` | 251 题金集端到端评测、L4/L6 质量层、发布门 |
 
@@ -91,11 +93,13 @@ docs/            # 环境设计 / 架构审查 / 性能 backlog 等
 | 包 | 用途 | 打法 |
 |---|---|---|
 | `opensearch_sae_rag.zip` | SAE 服务侧 | zip 根 = `requirements.txt`(必须) + `opensearch_pipeline/`(含 webconsole/next-dist，**打包前先 `cd console-app && npm run build`**) + `Dockerfile` + `pyproject.toml` + `.dockerignore`；无 pyc/.env/tests |
-| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装） |
+| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装）。**B4 起用 `deploy/build_dataworks_zip.sh` 构建**：自动附 build_info.json + 生成 `.zip.sha256` sidecar（上传为同名 File 资源，节点硬校验——**换 zip 必须同步换 sidecar**） |
 
 **铁律**：一律打到 `~/Downloads/dw_upload_<YYYYMMDD>[_<purpose>]/`（勿打 repo 根）；部署时
 **按 SIZE/SHA-256 认包，别按文件名**（每个日期目录里文件名都一样，选错目录 = 静默部署旧版）。
-SAE 启动命令在应用配置里（保持 `--workers 1`：会话/限流是进程内状态）。
+SAE 启动命令在应用配置里（**默认态**保持 `--workers 1`：会话/限流默认进程内。多副本
+**能力已备**——Redis 四态后端 + durable dispatch（PR-3）+ `RAG_EXPECTED_REPLICAS` 声明，
+配置不完整会被拓扑守卫启动拦截）。
 
 ## 更多
 

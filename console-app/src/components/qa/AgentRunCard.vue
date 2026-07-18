@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
-import { Activity, AlertTriangle, Check, Loader2, ShieldAlert, XCircle } from 'lucide-vue-next'
+import { Activity, AlertTriangle, Check, Loader2, ShieldAlert, XCircle } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
 import type { ChatMessage } from '@/composables/useAsk'

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { Ban, Check, Hourglass, Loader2, X } from 'lucide-vue-next'
+import { Ban, Check, Hourglass, Loader2, X } from '@lucide/vue'
 import type { ChatMessage } from '@/composables/useAsk'
 import { RUN_TERMINAL, agentArgsPreview, agentToolLabel } from '@/composables/useAgentAsk'
 

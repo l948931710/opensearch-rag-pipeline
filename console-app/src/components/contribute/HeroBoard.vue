@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Trophy } from 'lucide-vue-next'
+import { Trophy } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useContribute } from '@/composables/useContribute'
 

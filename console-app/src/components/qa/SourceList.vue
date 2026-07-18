@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { ChevronDown, ChevronUp, FileText } from 'lucide-vue-next'
+import { ChevronDown, ChevronUp, FileText } from '@lucide/vue'
 import type { SourceRow } from '@/composables/useAsk'
 
 // Atlas 式来源：一排「来源」chip（文件图标 + 标题 + 章节 + 相关度点）；点击展开该来源详情卡

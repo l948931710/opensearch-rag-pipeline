@@ -3,6 +3,8 @@
 
 原则：**不 truncate 共享表**——按时间水位切片（本场景开始时刻之后的行），
 场景之间无破坏性清理，报告可溯源。DB 不可达时所有断言降级为 skipped（报告如实标注）。
+⚠️ 降级只覆盖**断言层**：被测服务的 agent 请求本身落库 fail-closed——缺 MySQL 起服务
+跑压测，ask 会 500（见 stress_harness/README.md「快速开始」的 MySQL 前置，P3-04 互引）。
 """
 from __future__ import annotations
 

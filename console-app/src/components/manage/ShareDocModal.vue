@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { X, Loader2, Lock } from 'lucide-vue-next'
+import { X, Loader2, Lock } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem, type DocItem } from '@/composables/useKb'
 import { useDialog } from '@/composables/useDialog'

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Fingerprint, Loader2, Search, X } from 'lucide-vue-next'
+import { Fingerprint, Loader2, Search, X } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useOntology, type OntologyCandidate, type OntologyCase, type OntologyObjectHit } from '@/composables/useOntology'
 import { useDialog } from '@/composables/useDialog'

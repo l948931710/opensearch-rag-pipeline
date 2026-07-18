@@ -7,6 +7,8 @@
 ```bash
 pip install -e ".[api,dev,production]"
 # 本地 MySQL（三库 + 全量 schema；agent run 落库 fail-closed，必须可达）
+# ——dbprobe 的「DB 不可达断言降级 skipped」只指**断言层**：被测服务本身缺库时
+#   agent ask 会 500、压测成绩无效（P3-04 互引，另见 dbprobe.py 模块头）
 bash scripts/ci_load_schema.sh
 
 make stress-smoke                 # mock 单测 + S0 基线（~1 分钟）

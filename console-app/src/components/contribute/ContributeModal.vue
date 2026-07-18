@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { X, Plus } from 'lucide-vue-next'
+import { X, Plus } from '@lucide/vue'
 import { useContribute } from '@/composables/useContribute'
 
 // 贡献弹窗：问题 / 你的答案·知识内容 / 归属分类。提交后需部门管理员采纳才会入库。

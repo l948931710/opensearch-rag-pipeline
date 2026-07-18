@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Database, CheckCircle2, Loader, Clock, Percent, UserCheck, Quote } from 'lucide-vue-next'
+import { Database, CheckCircle2, Loader, Clock, Percent, UserCheck, Quote } from '@lucide/vue'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
 import StatusDistBar from './StatusDistBar.vue'

@@ -5,7 +5,7 @@
 -->
 <script setup lang="ts">
 import { computed } from 'vue'
-import { CheckCircle2, RefreshCw } from 'lucide-vue-next'
+import { CheckCircle2, RefreshCw } from '@lucide/vue'
 import type { AccessState } from '@/composables/useKb'
 
 const props = defineProps<{ state: Extract<AccessState, 'approved_pending_sync' | 'projected'> }>()

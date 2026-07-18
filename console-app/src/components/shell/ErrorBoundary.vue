@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onErrorCaptured, watch } from 'vue'
-import { RotateCw } from 'lucide-vue-next'
+import { RotateCw } from '@lucide/vue'
 
 // 视图渲染错误兜底：任一子组件渲染/setup 抛错 → 只把主内容区换成兜底提示，
 // 不再让整页(含侧栏)白屏。同时把错误栈显给用户(可截图定位根因)并 console.error。

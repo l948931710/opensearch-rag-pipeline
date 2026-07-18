@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
-import { Activity, ArrowLeft, Bot, Brain, Loader2, MessageSquare, RefreshCw, ShieldAlert, Wrench, X } from 'lucide-vue-next'
+import { Activity, ArrowLeft, Bot, Brain, Loader2, MessageSquare, RefreshCw, ShieldAlert, Wrench, X } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
 import { useAsk } from '@/composables/useAsk'

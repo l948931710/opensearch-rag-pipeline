@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Bot, Loader2, ShieldAlert, Timer } from 'lucide-vue-next'
+import { Bot, Loader2, ShieldAlert, Timer } from '@lucide/vue'
 import { storeToRefs } from 'pinia'
 import { useSession } from '@/stores/session'
 import { deptLabel } from '@/lib/kb'

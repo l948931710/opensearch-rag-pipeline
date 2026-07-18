@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { UploadCloud, FileUp, X } from 'lucide-vue-next'
+import { UploadCloud, FileUp, X } from '@lucide/vue'
 import { UPLOAD_ACCEPT, PERM_LABEL, deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'

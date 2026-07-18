@@ -15,7 +15,9 @@ export interface Identity {
   uploadTargetDepts?: string[]
 }
 
-/** 会话单一事实来源：token + 身份 + 就绪/错误态。token 只存内存（不落 localStorage，避免持久泄露）。 */
+/** 会话单一事实来源：token + 身份 + 就绪/错误态。token 不落 localStorage（避免持久泄露）；
+ *  桌面 URL-token 登录会镜像到 **sessionStorage**（tab 级、关 tab 即清、401 即清——
+ *  #F-console-urltoken 的有意决策，威胁模型见 useAuth.ts；B5/P2-06 修正本行过时表述）。 */
 export const useSession = defineStore('session', () => {
   const token = ref<string>('')
   const identity = ref<Identity | null>(null)

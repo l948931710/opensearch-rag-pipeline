@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Activity, Coins, Gauge, RefreshCw, Users } from 'lucide-vue-next'
+import { Activity, Coins, Gauge, RefreshCw, Users } from '@lucide/vue'
 import { useKb } from '@/composables/useKb'
 import { admissionReasonLabel, deptLabel } from '@/lib/kb'
 import LoadError from './LoadError.vue'

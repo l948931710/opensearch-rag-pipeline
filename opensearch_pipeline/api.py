@@ -174,6 +174,13 @@ async def _lifespan(_app: FastAPI):
     # production/staging fail-fast（未配 CA 维持 P0-02 告警拍板；探针 error 只告警）
     _rds_tls_startup_check()
     yield
+    # B5（P2-18）：router.on_event("shutdown") 弃用面清零——agent 排水挪进 app lifespan
+    # 关停侧（routes/agent 的 atexit 兜底保留，「先到者执行」幂等）。
+    try:
+        from opensearch_pipeline.routes.agent import _agent_shutdown_drain
+        _agent_shutdown_drain()
+    except Exception:   # noqa: BLE001 — 排水失败不阻断进程关停
+        logger.warning("agent shutdown 排水失败（忽略，继续关停）", exc_info=True)
 
 
 def _rds_tls_startup_check() -> None:
@@ -263,6 +270,12 @@ _force_https_hosts = _resolve_force_https_hosts(
 )
 if _force_https_hosts:
     app.add_middleware(HttpsRedirectMiddleware, hosts=_force_https_hosts)
+
+# B5（生产级外审 2026-07-17 P2-07）：统一安全响应头——nosniff/Referrer/Permissions +
+# 强制 frame-ancestors（self+钉钉域，console 被 PC 工作台内嵌不能 DENY）+ 其余 CSP
+# Report-Only 观察。RAG_SECURITY_HEADERS=false 整组关闭。
+from opensearch_pipeline.http_hardening import SecurityHeadersMiddleware  # noqa: E402 — 与本文件其余中间件同款注册期导入
+app.add_middleware(SecurityHeadersMiddleware)
 
 # 请求级 correlation id（统一 trace，OBS-trace）：纯 ASGI 中间件，入站读/生成 X-Request-Id 存入
 # ContextVar（端点与嵌套 retriever/llm_generator 调用可见）、响应头回写。最后 add → 最外层 → 最先跑。

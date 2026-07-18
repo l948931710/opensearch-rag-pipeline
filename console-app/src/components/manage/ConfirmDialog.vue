@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
-import { AlertTriangle } from 'lucide-vue-next'
+import { AlertTriangle } from '@lucide/vue'
 import { useDialog } from '@/composables/useDialog'
 
 // 全局自定义 确认/输入/告知 对话框（替代原生 confirm/prompt/alert）。在 ManageView 挂一份即可。

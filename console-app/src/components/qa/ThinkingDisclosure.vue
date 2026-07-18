@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
-import { Brain, ChevronRight } from 'lucide-vue-next'
+import { Brain, ChevronRight } from '@lucide/vue'
 import type { ChatMessage } from '@/composables/useAsk'
 
 // 「深度思考」思考过程 —— 设计立意：这是模型在你的 SOP 之间推敲的【内心独白】，应当轻盈、流动、转瞬：

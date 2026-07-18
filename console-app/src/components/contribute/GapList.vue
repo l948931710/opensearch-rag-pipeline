@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { HelpCircle, Clock, ChevronRight } from 'lucide-vue-next'
+import { HelpCircle, Clock, ChevronRight } from '@lucide/vue'
 import { deptLabel, fmtTs, fmtWindowDays, gapKindLabel } from '@/lib/kb'
 import { useContribute, type GapItem } from '@/composables/useContribute'
 import { useDialog } from '@/composables/useDialog'

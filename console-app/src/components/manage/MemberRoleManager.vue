@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { UserCog, ShieldCheck, Plus, X } from 'lucide-vue-next'
+import { UserCog, ShieldCheck, Plus, X } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AdminItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'

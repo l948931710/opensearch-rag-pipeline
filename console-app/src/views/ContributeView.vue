@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
-import { HelpCircle, Sparkles, CheckCircle2, Users, Plus } from 'lucide-vue-next'
+import { HelpCircle, Sparkles, CheckCircle2, Users, Plus } from '@lucide/vue'
 import { useContribute } from '@/composables/useContribute'
 import StatCard from '@/components/manage/StatCard.vue'
 import GapList from '@/components/contribute/GapList.vue'

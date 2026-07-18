@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
-import { ArrowUp, Square, Brain, Bot, Activity } from 'lucide-vue-next'
+import { ArrowUp, Square, Brain, Bot, Activity } from '@lucide/vue'
 
 // 输入框：内嵌发送/停止按钮 + 深度思考开关；Enter 发送 / Shift+Enter 换行；单行自增高到上限。
 // Agent canary：agentAvailable（能力探测通过）才渲染「Agent 模式」开关与「运行」入口——

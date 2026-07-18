@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { AlertTriangle, Loader2, RefreshCw, ShieldCheck, Wrench } from 'lucide-vue-next'
+import { AlertTriangle, Loader2, RefreshCw, ShieldCheck, Wrench } from '@lucide/vue'
 import { useAgentGovernance, type AgentInvocationRow, type AgentToolRow } from '@/composables/useAgentGovernance'
 import { useAgentAsk } from '@/composables/useAgentAsk'
 import { useDialog } from '@/composables/useDialog'

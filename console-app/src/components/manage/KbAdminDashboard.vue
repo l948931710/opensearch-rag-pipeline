@@ -4,7 +4,7 @@ import {
   Database, CheckCircle2, Archive, Clock, GitBranch, Timer, Cpu,
   ShieldAlert, ShieldCheck, ThumbsUp, ThumbsDown, Percent, Quote, MessageSquare, Ban,
   Search, AlertTriangle,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { useKb, type KbDeptCoverage } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
 import StatusDistBar from './StatusDistBar.vue'
