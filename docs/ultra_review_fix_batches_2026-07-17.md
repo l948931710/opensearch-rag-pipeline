@@ -202,7 +202,7 @@
 
 **真实栈探针(2026-07-17,PROD-RO 只读+小额生成)**:C3 在真实 HA3+RDS 上证据闭合——「扫码报检」召回 18 chunks(prod HA3 三路混合+RDS 邻居拼接),max_context_chars=1500 逼出截断 included=[1..5];真实 generate_answer result 携带 `included_doc_indices=[1,2,3,4,5]` 且与 sources 同口径;注入出局带图块标记 `<<IMG:7>>`:**旧口径实渲 2 图(LLM 没见过的文档),新口径 0 图**。钉钉端到端不可在部署前验证(卡片回调打线上 SAE)——待重打包+secret 轮换后真机点反馈按钮。
 
-**schema/049 apply(2026-07-17,Sam 授权)**:本地 ✅(容器为重建后新库,台账仅 048——顺带补 apply 009 建表后上 049,generation 列实查存在)+staging ✅(fuling_knowledge_stg 列+台账行实查)+**prod ⏳ 待 Sam 亲跑**(分类器拦截 Claude 侧 PROD-RW 令牌构造,与「ack 令牌 Sam 之手」红线一致;只读预检:列未加、outbox 0 行=双路径回退无在途压力)。access_grants 双路径在列到位后自动走 (id,generation) CAS 索引路径,无需开关。
+**schema/049 apply(2026-07-17,Sam 授权)——三环境全 apply ✅**:本地 ✅(容器为重建后新库,台账仅 048——顺带补 apply 009 建表后上 049,generation 列实查存在)+staging ✅(fuling_knowledge_stg 列+台账行实查)+**prod ✅(Sam 显式授权后 apply,PROD-RW:2026-07-17;读回验证 generation BIGINT UNSIGNED DEFAULT 0+台账 049 行+outbox 0 行=additive 零回填)**。access_grants 双路径在列到位后自动走 (id,generation) CAS 索引路径,无需开关。
 
 ## 有意不修 / 移交
 | 条目 | 处置 |
