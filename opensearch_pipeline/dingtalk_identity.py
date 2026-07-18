@@ -369,6 +369,14 @@ def _resolve_user_dept_live(staff_id: str) -> "tuple[List[str], bool]":
             # 2. cache-miss 或 过期 employee 行穿透：调钉钉 API 获取（dept_name 为全部部门名 CSV）
             user_info = _fetch_dingtalk_user_info(staff_id)
             if user_info:
+                # 外部星号防投毒（2026-07-17 ultra P2）：恰好命名为 "*" 的钉钉部门会撞
+                # 全组哨兵——_normalize_dept_to_codes 展开为全量白名单，且随下方缓存写进
+                # user_role.dept_code 持久化。"*" 只允许两个内部来源（_DEPT_NAME_TO_GROUPS
+                # 映射表值 / 下方祖先压缩回写），API 名字口径的星号项按未知丢弃（fail-closed）。
+                _names = [p.strip() for p in (user_info.get("dept_name") or "").split(",")]
+                if "*" in _names:
+                    user_info = dict(user_info, dept_name=",".join(
+                        s for s in _names if s and s != "*"))
                 # —— 最近祖先制（RAG_ACL_ANCESTRY，默认关）——非 partial 即权威：
                 # 组码 CSV 顶替 dept_name 走下方同一缓存/返回路径（_normalize_dept_to_codes
                 # 对组码幂等读回；且不受名字口径 is_partial 影响——id 父链是独立的完整解析）。

@@ -248,15 +248,24 @@ def assert_metadata_write_allowed(op: str, target: str, *, kind: str = "rds") ->
 
 
 class GuardedBucket:
-    """OSS Bucket 写守卫代理：拦截 put_*/delete_*，读与签名透传。
+    """OSS Bucket 写守卫代理：拦截 put/delete/copy/multipart 写法，读与签名透传。
 
     正常的本地形态是 simulate_oss=true（根本不会构造真实 bucket）——
     本代理只防"本地误设 simulate_oss=false + 指向生产桶"的配置漂移。
     staging 桶（-staging 后缀）与其他非指纹桶不受影响。
     """
 
+    # copy_object 也向本桶写入目标对象——真实归档路径（bulk-job 的 copy+delete 搬移）用它，
+    # 曾不在拦截面内：PROD-RO/配置漂移会话可绕过防线写生产桶，且相邻 delete 被拦、
+    # 归档半完成（2026-07-17 ultra P1）。multipart 族同为写面一并拦。
     _WRITE_METHODS = ("put_object", "put_object_from_file", "delete_object",
-                      "batch_delete_objects", "append_object")
+                      "batch_delete_objects", "append_object",
+                      "copy_object", "init_multipart_upload", "upload_part",
+                      "upload_part_copy", "complete_multipart_upload",
+                      "abort_multipart_upload")
+    # copy 族签名是 (source_bucket_name, source_key, target_key, ...)：op 标签取目标 key，
+    # 让 RAG_DESTRUCTIVE_PROD_ACK=<op>:<date> 的 op 命名与 put/delete 同构可预测。
+    _TARGET_KEY_ARG = {"copy_object": 2, "upload_part_copy": 2}
 
     def __init__(self, bucket, bucket_name: str):
         self._bucket = bucket
@@ -266,7 +275,9 @@ class GuardedBucket:
         attr = getattr(self._bucket, name)
         if name in self._WRITE_METHODS:
             def _guarded(*args, **kwargs):
-                key = str(args[0]) if args else ""
+                idx = self._TARGET_KEY_ARG.get(name, 0)
+                key = (str(args[idx]) if len(args) > idx
+                       else str(kwargs.get("target_key") or kwargs.get("key") or ""))
                 assert_destructive_write_allowed(
                     f"oss_write:{key.split('/', 1)[0] or 'root'}",
                     self._bucket_name, kind="oss")

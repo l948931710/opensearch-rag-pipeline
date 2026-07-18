@@ -244,15 +244,18 @@ def _verify_card_callback_signature(headers) -> Optional[bool]:
     """卡片回调验签（P1-3 Track-1：此前 /card/callback 无任何签名校验）。
 
     密钥 = 注册时上送的 apiSecret（DINGTALK_CARD_CALLBACK_API_SECRET，与
-    dingtalk_card.register 同源；未配置回退同一注册默认值）；算法 = 钉钉标准
-    timestamp+secret HMAC（与 webhook 同构、密钥不同）。头名兼容多形态
+    dingtalk_card.register 同源）；算法 = 钉钉标准 timestamp+secret HMAC
+    （与 webhook 同构、密钥不同）。头名兼容多形态
     （x-ddpaas-signature / sign；x-ddpaas-signature-timestamp / timestamp）。
 
     返回三态：True=验签通过；False=带签名但校验失败/时间戳出窗；None=请求不带签名头
-    （存量 HTTP 卡/头名与钉钉实发不符）。**enforcement 分档**在调用方：
+    或未配置 secret（无密钥无法验签）。**enforcement 分档**在调用方：
     RAG_DINGTALK_CARD_SIG_REQUIRED=true → 非 True 一律 403；默认 off → shadow 模式
     只记日志不拒（先在 staging 用真实回调核对头名/算法，再开强制——Track-1 拍板流程）。"""
-    secret = os.environ.get("DINGTALK_CARD_CALLBACK_API_SECRET", "fuling_card_cb").strip()
+    # 不再回退内置字面量默认值（2026-07-17 ultra P1）：仓库曾公开，"fuling_card_cb" 是
+    # 已知值——用它验签 = 任何人可铸造合法 HMAC（算法只含 ts+secret），required 模式沦为
+    # 安全剧场。未配置 → None：shadow 记日志放行，required 一律 403 直到配好真实 secret。
+    secret = os.environ.get("DINGTALK_CARD_CALLBACK_API_SECRET", "").strip()
     if not secret:
         return None
     sign = (headers.get("x-ddpaas-signature") or headers.get("sign") or "").strip()

@@ -124,6 +124,17 @@ def test_new_units_20260703_decisions():
     assert _normalize_dept_to_codes("办公室") == []
 
 
+def test_star_cache_row_roundtrip_still_expands():
+    """缓存行契约锁定（2026-07-17 ultra P2 修复的不回归面）：seed 行与祖先压缩回写
+    （15 组 CSV 超 VARCHAR(64)，压缩存 "*"）都依赖读侧把裸 "*" 展开为全量白名单——
+    外部星号防投毒改在 _resolve_user_dept 的 API 入口丢弃，本函数行为必须原样保留。"""
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    star = _normalize_dept_to_codes("*")
+    assert sorted(star) == sorted(_VALID_ACL_GROUPS) and "*" not in star
+    # CSV 中混入 "*"（缓存行形态）同样展开
+    assert sorted(_normalize_dept_to_codes("财务部,*")) == sorted(_VALID_ACL_GROUPS)
+
+
 def test_unknown_workshop_name_fail_closed():
     # 形似生产但不在快照里的名字 → fail-closed（仅 public，绝不误授予 production）
     for name in ("注塑五车间", "模具C", "不存在的车间", "生产某部"):

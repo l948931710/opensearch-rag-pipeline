@@ -109,6 +109,33 @@ def test_card_sig_shadow_mode_allows_unsigned(client, monkeypatch, _authorized_n
     assert client.post("/dingtalk/card/callback", json=_cb_body()).status_code == 200
 
 
+def test_card_sig_required_no_secret_rejects_leaked_default(client, _authorized_noop, monkeypatch):
+    """P1 回归（2026-07-17 ultra 评审）：未配置 secret 不再回退内置字面量 "fuling_card_cb"
+    （随公开仓泄露）——用旧默认值签出的"合法"HMAC 在 required 模式必须 403，而非验签通过。"""
+    monkeypatch.setenv("RAG_DINGTALK_CARD_SIG_REQUIRED", "true")
+    # _clean fixture 已确保 DINGTALK_CARD_CALLBACK_API_SECRET 未设
+    ts = int(time.time() * 1000)
+    r = client.post("/dingtalk/card/callback", json=_cb_body(),
+                    headers={"x-ddpaas-signature": _card_sign("fuling_card_cb", ts),
+                             "x-ddpaas-signature-timestamp": str(ts)})
+    assert r.status_code == 403
+
+
+def test_register_card_callback_refuses_without_secret(monkeypatch):
+    """同 P1 注册侧：未设 secret 拒绝把已知字面量注册给钉钉当签名密钥（不发任何网络请求）。"""
+    from opensearch_pipeline import dingtalk_card
+    monkeypatch.setenv("DINGTALK_CARD_CALLBACK_URL", "https://example.com/cb")
+    monkeypatch.setenv("DINGTALK_CARD_CALLBACK_ROUTE_KEY", "rk")
+    monkeypatch.delenv("DINGTALK_CARD_CALLBACK_API_SECRET", raising=False)
+    calls = {"n": 0}
+    monkeypatch.setattr(dingtalk_card, "_get_access_token",
+                        lambda: calls.__setitem__("n", calls["n"] + 1) or "tok")
+    monkeypatch.setattr(dingtalk_card.requests, "post",
+                        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+    assert dingtalk_card.register_card_callback() is False
+    assert calls["n"] == 0, "缺 secret 时不应取 token 也不应发注册请求"
+
+
 # ── ③ card 路径 replay 去重 ─────────────────────────────────────────────────────
 
 
