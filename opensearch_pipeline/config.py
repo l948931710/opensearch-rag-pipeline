@@ -1248,6 +1248,21 @@ def load_config() -> PipelineConfig:
             "RAG_SCORE_THRESHOLD_HIGH/MEDIUM（标定参考 0.65/0.60）或开启 rerank/客户端融合。"
         )
 
+    # 【B2，生产级外审 2026-07-17 P1-08/P2-17】未知 RAG_* 变量检测（report-only）：
+    # 拼错安全关键 flag（如 RAG_REQUIRE_AUTH 的 REQUIRE 打成 REQUIRED）此前静默失效。
+    # 与 opensearch_pipeline/rag_env_registry.py 冻结清单比对（清单由测试锁与源码
+    # 双向一致），未知名响亮告警；/api/ready 的 security_posture 同步自报。
+    try:
+        from opensearch_pipeline.rag_env_registry import unknown_rag_vars
+        _unknown_vars = sorted(unknown_rag_vars())
+        if _unknown_vars:
+            logging.getLogger(__name__).warning(
+                "⚠️ [CONFIG] 检测到未知 RAG_* 环境变量（不被任何代码消费，疑似拼写"
+                "错误，不会生效）：%s——若为新变量请重新生成注册表"
+                "（python -m opensearch_pipeline.rag_env_registry）。", _unknown_vars)
+    except Exception:   # noqa: BLE001 — 检测面绝不阻断启动
+        pass
+
     return config
 
 

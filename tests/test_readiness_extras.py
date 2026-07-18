@@ -19,6 +19,10 @@ def _fresh(monkeypatch):
     monkeypatch.delenv("RAG_AGENT_ENABLE", raising=False)
     monkeypatch.delenv("RAG_ONTOLOGY_ENABLE", raising=False)
     monkeypatch.delenv("RAG_READY_DASHSCOPE_LIVE", raising=False)
+    # B2 flag-conditional 契约探针的 flag（隔离外部 env 泄漏）
+    monkeypatch.delenv("RAG_AGENT_DURABLE_DISPATCH", raising=False)
+    monkeypatch.delenv("RAG_INGEST_LEASE_ENABLE", raising=False)
+    monkeypatch.delenv("RAG_FOLLOWUP_REWRITE", raising=False)
     yield
     readiness._reset_cache()
 
@@ -170,3 +174,90 @@ def test_ttl_cache_prevents_probe_amplification(monkeypatch):
     assert readiness.agent_tables_status() == "ok"
     assert readiness.agent_tables_status() == "ok"
     assert calls["n"] == 1                            # 第二次命中 TTL 缓存，不再触库
+
+
+# ═══════════ B2（生产级外审 2026-07-17 RB-04/RB-06b）：flag-conditional 契约 + 姿态自报 ═══════════
+
+
+def test_b2_flag_off_contracts_skipped():
+    assert readiness.durable_dispatch_contract_status() == "skipped"
+    assert readiness.ingest_lease_contract_status() == "skipped"
+    assert readiness.followup_rewrite_contract_status() == "skipped"
+    assert readiness.write_tool_contract_status() == "skipped"   # 写工具默认关
+
+
+def test_b2_durable_dispatch_contract(monkeypatch):
+    monkeypatch.setenv("RAG_AGENT_DURABLE_DISPATCH", "true")
+    _wire_db(monkeypatch, {"COLUMN_TYPE": [("enum('submit','resume')",)],
+                           "information_schema.tables": [(1,)]})
+    assert readiness.durable_dispatch_contract_status() == "ok"
+    readiness._reset_cache()
+    # 043 表在、044 ENUM 未扩 resume（MODIFY 未 apply 的蓝绿窗口）
+    _wire_db(monkeypatch, {"COLUMN_TYPE": [("enum('submit')",)],
+                           "information_schema.tables": [(1,)]})
+    st = readiness.durable_dispatch_contract_status()
+    assert st.startswith("missing:") and "044" in st
+    readiness._reset_cache()
+    # 043 表整体缺失
+    _wire_db(monkeypatch, {"information_schema.tables": [(0,)]})
+    assert readiness.durable_dispatch_contract_status() == \
+        "missing:agent_dispatch_command(schema/043)"
+
+
+def test_b2_ingest_lease_contract(monkeypatch):
+    monkeypatch.setenv("RAG_INGEST_LEASE_ENABLE", "true")
+    _wire_db(monkeypatch, {"information_schema.columns": [(1,)],
+                           "information_schema.statistics": [(1,)]})
+    assert readiness.ingest_lease_contract_status() == "ok"
+    readiness._reset_cache()
+    _wire_db(monkeypatch, {"information_schema.columns": [(0,)]})
+    st = readiness.ingest_lease_contract_status()
+    assert st.startswith("missing:") and "048" in st
+    readiness._reset_cache()
+    # 列在、索引缺（048 的 ADD KEY 半途）
+    _wire_db(monkeypatch, {"information_schema.columns": [(1,)],
+                           "information_schema.statistics": [(0,)]})
+    assert "idx_lease_expiry" in readiness.ingest_lease_contract_status()
+
+
+def test_b2_write_tool_contract(monkeypatch):
+    monkeypatch.setattr("opensearch_pipeline.agent_tools.ontology_write_tools_enabled",
+                        lambda: True)
+    _wire_db(monkeypatch, {"information_schema.tables": [(1,)],
+                           "information_schema.columns": [(1,)]})
+    assert readiness.write_tool_contract_status() == "ok"
+    readiness._reset_cache()
+    _wire_db(monkeypatch, {"information_schema.tables": [(0,)]})
+    assert readiness.write_tool_contract_status() == \
+        "missing:agent_tool_operation(schema/045)"
+
+
+def test_b2_followup_and_acl_generation_report_only(monkeypatch):
+    monkeypatch.setenv("RAG_FOLLOWUP_REWRITE", "true")
+    _wire_db(monkeypatch, {"information_schema.columns": [(0,)]})
+    assert "050" in readiness.followup_rewrite_contract_status()
+    assert "049" in readiness.acl_outbox_generation_status()
+
+
+def test_b2_security_posture_report(monkeypatch):
+    monkeypatch.setenv("RAG_REQUIRE_AUTH", "true")
+    monkeypatch.delenv("RAG_ACL_FAIL_CLOSED", raising=False)
+    monkeypatch.setenv("RAG_ALLOW_LEGACY_OPEN_PROD", "ack:2026-07-18")
+    monkeypatch.delenv("DINGTALK_CARD_CALLBACK_API_SECRET", raising=False)
+    rep = readiness.security_posture_report()
+    assert rep["require_auth"] == "on"
+    assert rep["acl_fail_closed"] == "off"
+    assert str(rep["legacy_open_ack"]).startswith("legacy_open(")
+    assert rep["card_callback_secret"] == "missing"
+    assert "rds_tls" in rep and "schema_strict" in rep
+    d1 = rep["config_digest"]
+    assert isinstance(d1, str) and len(d1) == 16
+    assert all(c in "0123456789abcdef" for c in d1)
+    # 值不外泄但可比对：任一 RAG_ 值变化 ⇒ digest 变化
+    monkeypatch.setenv("RAG_REQUIRE_AUTH", "false")
+    rep2 = readiness.security_posture_report()
+    assert rep2["config_digest"] != d1 and rep2["require_auth"] == "off"
+    # 明文值绝不出现在报告里
+    monkeypatch.setenv("RAG_DASHSCOPE_API_KEY", "sk-super-secret-value")
+    rep3 = readiness.security_posture_report()
+    assert "sk-super-secret-value" not in str(rep3)

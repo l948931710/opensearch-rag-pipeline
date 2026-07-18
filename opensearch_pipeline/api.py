@@ -701,9 +701,17 @@ def _compute_readiness(cfg):
     checks["schema_contract"] = _readiness.schema_contract_status()
     checks["kill_switch"] = _readiness.kill_switch_status()
     checks["ontology_backfill"] = _readiness.ontology_backfill_status()
-    # P1-14（外审核查 2026-07-16）：LEGACY-OPEN 逃生口自报（report-only）——设了 ack 的
-    # 实例在就绪面持续可见，姿态缺口不被遗忘（启动断言另在 config，当日 ack 才放行）
-    checks["security_posture"] = _readiness.legacy_open_posture_status()
+    # B2（生产级外审 2026-07-17 RB-04）：flag-conditional schema 契约——flag 开=已声明
+    # 依赖该 schema，契约缺失即 critical（不依赖 RAG_READY_SCHEMA_STRICT）；off→skipped。
+    # followup(050)/acl_generation(049) 为 report-only（运行时有 1054/双路径优雅降级）。
+    checks["durable_dispatch_contract"] = _readiness.durable_dispatch_contract_status()
+    checks["ingest_lease_contract"] = _readiness.ingest_lease_contract_status()
+    checks["write_tool_contract"] = _readiness.write_tool_contract_status()
+    checks["followup_rewrite_contract"] = _readiness.followup_rewrite_contract_status()
+    checks["acl_outbox_generation"] = _readiness.acl_outbox_generation_status()
+    # B2（RB-06b）：安全姿态逐 flag 自报 + 配置 digest（report-only attestation；
+    # 原 legacy-open 单项自报升级为全量 dict，旧语义保留在 legacy_open_ack 键）
+    checks["security_posture"] = _readiness.security_posture_report()
 
     # WS0 状态外置：任一状态后端切了 redis → Redis PING 纳入就绪判定（此前 redis_client.ping
     # 是死代码，深度审查多实例运维组）。判据：限流 redis 后端是 fail-closed（Redis 挂 → ask
@@ -754,6 +762,13 @@ def _compute_readiness(cfg):
                    and checks.get("schema_contract") in ("ok", "skipped")
                    and (checks.get("kill_switch") in ("ok", "skipped")
                         or not _readiness.kill_switch_critical())
+                   # B2（RB-04）flag-conditional 契约：flag 开而 043/044、048、045/046
+                   # 契约缺 ⇒ critical not-ready（B1 后 durable enqueue 缺表=每 ask 503；
+                   # 租约缺列=摄取批全红；写台账缺表=写工具全阻断）。error 同摘（与
+                   # schema_contract 同语义——探针挂而 rds ok 属异常形态，宁摘不假绿）
+                   and checks.get("durable_dispatch_contract") in ("ok", "skipped")
+                   and checks.get("ingest_lease_contract") in ("ok", "skipped")
+                   and checks.get("write_tool_contract") in ("ok", "skipped")
                    # schema 台账健康默认只报告（台账抖动不该全量摘流量）；
                    # RAG_READY_SCHEMA_STRICT=true 后要求 **ok**——drift/unapplied/
                    # unavailable/no_local_files 一律不就绪（批次5 P0-06d 收紧）

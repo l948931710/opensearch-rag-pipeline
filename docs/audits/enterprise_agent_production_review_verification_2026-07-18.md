@@ -170,6 +170,15 @@
 
 未验证声明：真实 HA3/RDS 上的 enqueue 故障注入、钉钉端到端、SAE 部署包——本批全部在本地测试栈验证（simulate + 本地 MySQL）。
 
+### 批次2 ✅ 已落地（2026-07-18，ontology-p0；as-built 注记如下）
+
+5. **契约探针 038→050**（`readiness.py`）：基础 agent 契约列补 047 `cancel_requested_at`（跨实例 cancel 裸调 UPDATE=500，蓝绿窗口假健康）；新增 flag-conditional 探针组——043 表+044 kind ENUM（新 `_enum_contains` 探针，MODIFY COLUMN 无新表新列可探只能读 COLUMN_TYPE）、048 三 lease 列+idx_lease_expiry（**knowledge 库探针集**，此前探针全在 operation/ontology 库）、045 表+046 列（写工具门）、050、049。**as-built 偏离两处**：①042 `idx_user_started`（纯性能索引）有意不进契约探针——缺失=慢而非坏，由台账层 unapplied 检测覆盖；②050 探针 **report-only** 而非台账定义的 critical——qa_logger 对缺列有 1054 降级+TTL 负缓存（改写功能照常、仅溯源列不落），摘流量过度。049 同为 report-only（drain 双路径优雅降级）。
+6. **flag-conditional critical**（`api.py` critical_ok）：`RAG_AGENT_DURABLE_DISPATCH`⇒043/044、`RAG_INGEST_LEASE_ENABLE`⇒048、写工具启用⇒045/046——flag 开而契约缺（或探针 error）⇒ critical not-ready，**不依赖 RAG_READY_SCHEMA_STRICT**（strict 默认翻转仍留批次7）。
+7. **security_posture 全量自报**（`readiness.security_posture_report`）：auth/ACL/guard/agent/durable/HIGH_WRITE/ingest-lease/strict 开关态 + 卡回调 secret 与 RDS CA 的 configured/missing（**不含任何 secret 值**）+ legacy-ack（旧字符串语义保留在 `legacy_open_ack` 键）+ **聚合配置 digest**（排序的 name=sha256(value)[:12] 逐行拼接再整体 sha256[:16]——同配置同 digest 可跨副本比对，逐变量哈希不外泄）+ 未知变量清单。cipher 实测=B3。
+8. **未知 RAG_* 检测**（新 `rag_env_registry.py` + `config.load_config` 钩子）：432 名冻结清单（六根 *.py 字面量 + config.py `_env*()` 裸名两模式；排除注册表自身防「自证存在」；tests/ 有意不扫）；`tests/test_rag_env_registry.py` 双向新鲜度门（漏登记/悬空条目即红——首跑就抓到我自己注释里的拼错示例）；启动未知名响亮 warning + posture 自报，report-only 不拦启动。重生成：`python -m opensearch_pipeline.rag_env_registry`。
+
+未验证声明：真实三环境 /api/ready 响应（新探针在 staging/prod 的实际状态词）、SAE 部署包——本批在本地测试栈验证。
+
 ## 3. 与评审验收条款的映射备注
 
 - 评审 RB-04 验收"durable enqueue 失败返回 503"=批次1-1;"为每个 flag 建条件探针"=批次2-6;"strict=true"=批次7。

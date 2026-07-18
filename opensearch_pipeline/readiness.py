@@ -277,6 +277,10 @@ _AGENT_CONTRACT_COLUMNS = [   # (table, column, 来源迁移)
     ("agent_run", "active_thread", "037"),
     ("approval_decision", "final_args_digest", "031"),
     ("agent_checkpoint", "state_digest", "022"),
+    # B2（生产级外审 2026-07-17 RB-04）：durable cancel 标记列——跨实例 cancel 端点
+    # 裸调 UPDATE（run_store.request_cancel raise 上抛=500）、执行侧 30s ticker 轮询
+    # 读同列；缺列=cancel 面持续报错，属「表在列不在」蓝绿/回滚窗口假健康（047）。
+    ("agent_run", "cancel_requested_at", "047"),
 ]
 _ONTOLOGY_CONTRACT_COLUMNS = [
     ("ontology_object", "normalized_title", "038"),
@@ -367,6 +371,140 @@ def schema_contract_status() -> str:
     return _cached("schema_contract", 60, _compute)
 
 
+# ── B2（生产级外审 2026-07-17 RB-04）：flag-conditional schema 契约探针 ─────────
+# 台账层（schema_migrations）默认 report-only、契约探针层此前止步 038——043+ 的
+# 「flag 开而契约缺」只在首个真实请求 500 时暴露。本组按「flag 开=运营者已声明
+# 依赖该 schema」把对应契约升为 critical（**不依赖 RAG_READY_SCHEMA_STRICT**）；
+# flag off → skipped（不依赖就不判）。042 idx_user_started（纯性能索引）有意不进
+# 契约探针——缺失=慢而非坏，由台账层 unapplied 检测覆盖。
+_DURABLE_DISPATCH_TABLES = ["agent_dispatch_command"]              # schema/043
+_INGEST_LEASE_COLUMNS = [                                          # schema/048（knowledge 库）
+    ("document_version", "lease_holder", "048"),
+    ("document_version", "lease_expires_at", "048"),
+    ("document_version", "lease_epoch", "048"),
+]
+_INGEST_LEASE_INDEXES = [("document_version", "idx_lease_expiry", "048")]
+_WRITE_TOOL_TABLES = ["agent_tool_operation"]                      # schema/045
+_WRITE_TOOL_COLUMNS = [("tool_invocation", "operation_id", "046")]
+_FOLLOWUP_COLUMNS = [("qa_session_log", "rewritten_query", "050")]
+_ACL_OUTBOX_COLUMNS = [("kb_acl_projection_outbox", "generation", "049")]
+
+
+def _enum_contains(dbname: str, table: str, column: str, member: str, mig: str) -> str:
+    """ENUM 成员契约探针（044「kind 扩 'resume'」这类 MODIFY COLUMN 无新表新列可探，
+    只能读 COLUMN_TYPE 判成员）→ ok / missing:... / error。"""
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COLUMN_TYPE FROM information_schema.columns "
+                    "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
+                    (dbname, table, column))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        coltype = ""
+        if row is not None:
+            coltype = str((row[0] if not isinstance(row, dict)
+                           else list(row.values())[0]) or "")
+        if f"'{member}'" in coltype:
+            return "ok"
+        logger.error("readiness: ENUM 契约缺失（%s）：%s.%s 不含 '%s'（schema/%s）",
+                     dbname, table, column, member, mig)
+        return f"missing:{table}.{column}~{member}(schema/{mig})"
+    except Exception as e:   # noqa: BLE001
+        logger.warning("readiness: ENUM 契约探针失败（%s）: %s", dbname, e)
+        return "error"
+
+
+def durable_dispatch_contract_status() -> str:
+    """RAG_AGENT_DURABLE_DISPATCH 开 ⇒ 043 命令表 + 044 kind ENUM 含 'resume' 必须
+    在位——B1 P1-01 后 enqueue 失败=每个 ask 503，契约缺失的实例不该接流量（critical）。"""
+    if not _flag_on("RAG_AGENT_DURABLE_DISPATCH"):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        t = _tables_exist(db, _DURABLE_DISPATCH_TABLES)
+        if t == "missing":
+            return "missing:agent_dispatch_command(schema/043)"
+        if t != "ok":
+            return t
+        return _enum_contains(db, "agent_dispatch_command", "kind", "resume", "044")
+
+    return _cached("durable_dispatch_contract", 60, _compute)
+
+
+def ingest_lease_contract_status() -> str:
+    """RAG_INGEST_LEASE_ENABLE 开 ⇒ 048 三 lease 列 + idx_lease_expiry（knowledge 库）
+    必须在位——租约 stamping SQL 缺列即炸、摄取批全红（critical）。"""
+    if not _flag_on("RAG_INGEST_LEASE_ENABLE"):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.database
+        c = _columns_exist(db, _INGEST_LEASE_COLUMNS)
+        if c != "ok":
+            return c
+        return _indexes_exist(db, _INGEST_LEASE_INDEXES)
+
+    return _cached("ingest_lease_contract", 60, _compute)
+
+
+def write_tool_contract_status() -> str:
+    """HIGH_WRITE 工具启用 ⇒ 045 操作台账表 + 046 对账资格章列必须在位——写前台账
+    fail-closed 意味着缺表时写工具首次执行即全阻断（与 kill_switch_critical 同门，
+    critical）。只读窗口 skipped（045/046 面未被触碰）。"""
+    try:
+        from opensearch_pipeline.agent_tools import ontology_write_tools_enabled
+        enabled = ontology_write_tools_enabled()
+    except Exception:   # noqa: BLE001
+        enabled = False
+    if not enabled:
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        t = _tables_exist(db, _WRITE_TOOL_TABLES)
+        if t == "missing":
+            return "missing:agent_tool_operation(schema/045)"
+        if t != "ok":
+            return t
+        return _columns_exist(db, _WRITE_TOOL_COLUMNS)
+
+    return _cached("write_tool_contract", 60, _compute)
+
+
+def followup_rewrite_contract_status() -> str:
+    """RAG_FOLLOWUP_REWRITE 开时探 050 rewritten_query（operation 库）。**report-only**
+    （as-built 偏离台账「050 critical」定级）：qa_logger 对缺列有 1054 降级+TTL 负缓存
+    ——改写功能照常、仅溯源列不落，摘流量过度；但缺口须在就绪面可见。"""
+    if not _flag_on("RAG_FOLLOWUP_REWRITE"):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        return _columns_exist(get_config().rds.operation_database, _FOLLOWUP_COLUMNS)
+
+    return _cached("followup_rewrite_contract", 300, _compute)
+
+
+def acl_outbox_generation_status() -> str:
+    """049 generation 列（knowledge 库，无 flag 常开面）。**report-only**：drain 双路径
+    代码缺列走非 CAS 旧路（功能在），但 mid-drain 复活防护缺位应可见。"""
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        return _columns_exist(get_config().rds.database, _ACL_OUTBOX_COLUMNS)
+
+    return _cached("acl_outbox_generation", 300, _compute)
+
+
 def kill_switch_status() -> str:
     """DB 驱动 kill switch 的读路径健康（批次5 P0-06b）：绕缓存直读一次——
     「表在但读退化」（权限被收/行损坏）此前只活在 warning 日志，readiness 恒绿。
@@ -432,6 +570,60 @@ def legacy_open_posture_status() -> str:
     config 启动断言已把无效/过期 ack 挡在启动前，这里只保证「姿态缺口不被遗忘」）。"""
     ack = os.environ.get("RAG_ALLOW_LEGACY_OPEN_PROD", "").strip().lower()
     return f"legacy_open({ack})" if ack else "off"
+
+
+def _config_digest() -> str:
+    """RAG_* 环境的聚合配置指纹（B2，RB-06b attestation）：对排序后的
+    「name=sha256(value) 前 12 位」逐行拼接再整体 sha256 取前 16 位。响应中**不含任何
+    明文值、也不含逐变量哈希**——同配置 ⇒ 同 digest，跨副本/跨部署可比对「配置是否
+    一致/是否变过」，值不可从 digest 还原。"""
+    try:
+        lines = []
+        for k in sorted(k for k in os.environ if k.startswith("RAG_")):
+            v = hashlib.sha256(os.environ[k].encode("utf-8", "replace")).hexdigest()[:12]
+            lines.append(f"{k}={v}")
+        return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+    except Exception:   # noqa: BLE001 — 自报面绝不抛出
+        return "error"
+
+
+def security_posture_report() -> Dict[str, object]:
+    """B2（生产级外审 2026-07-17 RB-06b）：安全姿态逐 flag 自报 + 配置 digest。
+    **report-only**（不参与 critical_ok）：启动断言已在 config fail-fast，这里是
+    「机器可验证的运行时 attestation」——部署后核对 posture 与预期 profile 一致、
+    digest 与打包记录一致。不含任何 secret 值（只报 configured/missing 与开关态）。
+    rds_tls 的 cipher 实测探针属 B3（此处只报配置态）。"""
+    def _onoff(name: str) -> str:
+        return "on" if _flag_on(name) else "off"
+
+    try:
+        from opensearch_pipeline.config import get_config
+        _ssl_ca = (get_config().rds.ssl_ca or "").strip()
+    except Exception:   # noqa: BLE001
+        _ssl_ca = (os.environ.get("RAG_RDS_SSL_CA", "") or "").strip()
+    posture: Dict[str, object] = {
+        "require_auth": _onoff("RAG_REQUIRE_AUTH"),
+        "acl_fail_closed": _onoff("RAG_ACL_FAIL_CLOSED"),
+        "prompt_injection_guard": _onoff("RAG_PROMPT_INJECTION_GUARD"),
+        "agent_enable": _onoff("RAG_AGENT_ENABLE"),
+        "durable_dispatch": _onoff("RAG_AGENT_DURABLE_DISPATCH"),
+        "high_write_tools": _onoff("RAG_ONTOLOGY_WRITE_TOOLS_ENABLE"),
+        "ingest_lease": _onoff("RAG_INGEST_LEASE_ENABLE"),
+        "schema_strict": _onoff("RAG_READY_SCHEMA_STRICT"),
+        "card_callback_secret": ("configured" if os.environ.get(
+            "DINGTALK_CARD_CALLBACK_API_SECRET", "").strip() else "missing"),
+        "rds_tls": "ca_configured" if _ssl_ca else "plaintext",
+        "legacy_open_ack": legacy_open_posture_status(),
+        "config_digest": _config_digest(),
+    }
+    try:
+        from opensearch_pipeline.rag_env_registry import unknown_rag_vars
+        _unknown = sorted(unknown_rag_vars())
+        if _unknown:
+            posture["unknown_rag_vars"] = _unknown[:10]
+    except Exception:   # noqa: BLE001
+        pass
+    return posture
 
 
 # ── DashScope 模型在线 ─────────────────────────────────────────────────────────
