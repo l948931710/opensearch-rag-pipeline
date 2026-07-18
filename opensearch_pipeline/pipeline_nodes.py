@@ -571,6 +571,7 @@ def node_build_canonical(ctx: dict):
     extractions = ctx["extractions"]
     canonicals = []
     env_dep_failures = []  # ENV-DEP 守卫命中清单（doc 级；循环后统一 raise 炸红本次运行）
+    cost_defer_docs = []   # COST-DEFER 守卫命中清单（瞬态预算顺延；同 ENV-DEP 循环后 raise）
 
     # perf#92：simulate 判定与 OSS bucket 客户端是循环不变量，提升到循环外一次构造
     # （原先每篇文档各构造一次 oss2.Auth+Bucket）。extractions 为空时不触碰 OSS，
@@ -601,6 +602,9 @@ def node_build_canonical(ctx: dict):
                 "assets": result.assets,
                 # 成本封存标记：VLM-rebuild 成本闸拒绝 → node_redact_or_quarantine 据此跳过
                 "cost_quarantined": getattr(result, "cost_quarantined", False),
+                # 成本顺延标记（瞬态 RUN/DAILY 预算）：下方 COST-DEFER 守卫消费——本篇不定稿，
+                # 下一 run 预算滚动后 stage-1 重捡重过闸（ultra P1 纠偏 2026-07-17）
+                "cost_deferred": getattr(result, "cost_deferred", False),
                 # DAG1 的 xlsx layout 判定（用真实 filename）→ 持久化供 DAG2 直接消费，不再重分类 (P0-3)
                 "xlsx_layout_type": getattr(result, "xlsx_layout_type", None),
                 # P2-32：VLM degraded 兜底图片数（供应商故障）→ 持久化进 canonical JSON 跨 stage
@@ -681,6 +685,38 @@ def node_build_canonical(ctx: dict):
                         _f_conn.close()
             env_dep_failures.append(
                 f"{canonical['doc_id']} v{canonical['version_no']}: {_env_reason}")
+            continue
+
+        # ── COST-DEFER 守卫（ultra P1 纠偏 2026-07-17）：瞬态共享预算耗尽 → 本 run 不定稿 ──
+        # vlm_rebuilder 因 RUN/DAILY 预算瞬态耗尽被拒时标 cost_deferred（区别于 doc-intrinsic
+        # 的 cost_quarantined）。若照常定稿，canonical keys 一写 stage-1 就永不重跑（扫描谓词
+        # 要求 keys IS NULL），文档在 stage-2 按 QUARANTINE 跳过落 EMPTY/DONE——健康文档静默
+        # 终态。处置与上方 ENV-DEP 同型：不写 canonical 文件/keys，extraction_status='FAILED'
+        # + [COST-DEFER] 留痕，content_process_status 保持 NOT_STARTED → 下一 run/次日预算
+        # 滚动后 stage-1 按既有谓词自动重捡、重新过闸。循环后统一 raise 炸红本次运行——预算
+        # 耗尽必须可见，也顺带终止 drain-loop 对同批文档的无进展空转。
+        if canonical.get("cost_deferred"):
+            _defer_reason = ("[COST-DEFER] transient VLM budget (RUN/DAILY) exhausted; "
+                            "canonical withheld, will be re-picked next run")
+            print(f"    ⏸️ DEFER {canonical['doc_id']} v{canonical['version_no']}: {_defer_reason}")
+            if not simulate_db:
+                _f_conn = None
+                try:
+                    _f_conn = _get_db_conn(select_db=True)
+                    with _f_conn.cursor() as _f_cur:
+                        _f_cur.execute(
+                            "UPDATE document_version SET extraction_status='FAILED', "
+                            "content_process_error=%s, processed_at=NOW() "
+                            "WHERE doc_id=%s AND version_no=%s",
+                            (_defer_reason, canonical["doc_id"], canonical["version_no"]))
+                    _f_conn.commit()
+                except Exception as _f_err:
+                    # 留痕失败不吞守卫本身——canonical 已被扣住（不写 keys），重捡语义不受影响
+                    print(f"    ⚠️ failed to mark COST-DEFER in RDS: {_f_err}")
+                finally:
+                    if _f_conn is not None:
+                        _f_conn.close()
+            cost_defer_docs.append(f"{canonical['doc_id']} v{canonical['version_no']}")
             continue
 
         # ── G20：版本化文本归一（哈希/持久化之前；默认 ON，RAG_TEXT_NORMALIZE=false 直通）──
@@ -1000,6 +1036,19 @@ def node_build_canonical(ctx: dict):
             f"[ENV-DEP] {len(env_dep_failures)} doc(s) produced EMPTY canonical due to missing "
             f"python modules (marked extraction_status=FAILED, canonical withheld). "
             f"Fix the environment (pip install the missing modules) and re-run stage-1: {_shown}")
+
+    # COST-DEFER 收尾：同 ENV-DEP 形态——受影响 doc 已逐条标 FAILED 且 canonical 被扣住
+    # （健康文档已逐篇落库，不受影响）；统一 raise 让 DataWorks 任务变红。与 ENV-DEP 的差别
+    # 只在自愈条件：预算次日/下一 run 滚动即自动重捡，无须人工干预。
+    if cost_defer_docs:
+        _shown = " | ".join(cost_defer_docs[:10])
+        if len(cost_defer_docs) > 10:
+            _shown += f" | ...(+{len(cost_defer_docs) - 10} more)"
+        raise RuntimeError(
+            f"[COST-DEFER] {len(cost_defer_docs)} doc(s) deferred — transient VLM budget "
+            f"(RUN/DAILY) exhausted mid-run (extraction_status=FAILED, canonical withheld, "
+            f"content_process_status stays NOT_STARTED). They will be re-picked automatically "
+            f"once the budget rolls over (next run / next day); no manual action needed: {_shown}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1444,8 +1493,14 @@ def _partition_prior_rechunk(prior_pairs):
     crash-resume（ultra P1 2026-07-17）：node_write_chunk_meta 在 chunk 行提交（成功、5293）后、
     每文档 content_process_status='DONE' 收口（5474）前崩溃 → 文档卡 PROCESSING → orchestrator 的
     stale sweep 置 content_process_status='FAILED' + retry_count+1。而 deliberate 的 reset_for_rechunk
-    走 rechunk_reset_state() = content_process_status='NOT_STARTED' + retry_count=0——两种状态互斥，
-    可精准区分。crash-resume 是同一次 ingest 的续跑（canonical 未变），必须复用**已存**分类
+    走 rechunk_reset_state() = content_process_status='NOT_STARTED' + retry_count=0——retry_count
+    是互斥判据。**状态列必须同时接受 LOADING**（2026-07-17 核查纠偏）：生产 orchestrator 的
+    stage-2 loader 在 DAG-2 启动前就把认领行 FAILED→LOADING（只改状态、retry_count 原样保留），
+    guard 在 DAG-2 内运行时看到的是 LOADING+retry>0 而非 FAILED——只认 FAILED 会让本分区在
+    真正发生楔死的生产路径上永不命中。LOADING+retry>0 ⟺ 本轮从 FAILED&retry<3 认领（loader 谓词
+    只收 NOT_STARTED / FAILED&retry<3），与 deliberate（认领后 LOADING+retry=0）互斥性不变；
+    裸跑（无 loader 认领）仍以 FAILED+retry>0 呈现，两态都收。
+    crash-resume 是同一次 ingest 的续跑（canonical 未变），必须复用**已存**分类
     （document_meta.category_l1/l2）续跑，绝不能重跑 LLM 分类（re-roll category→翻 chunk family=
     PRODUCTION_14DFDF 79-vs-47）。此前对二者一律整批 raise，crash-resume 的 re-claim 遂楔死整批
     stage-2、把 co-batched 健康文档拖到 retry_count=3 永久 FAILED。
@@ -1493,7 +1548,9 @@ def _partition_prior_rechunk(prior_pairs):
                     deliberate.append(key)   # document_meta 缺失等异常 → fail-closed
                     continue
                 cps, rc, cat1, cat2 = row
-                if str(cps) == "FAILED" and int(rc or 0) > 0 and cat1:
+                # FAILED=裸跑未认领；LOADING=orchestrator loader 已认领（从 FAILED&retry<3 迁入，
+                # retry_count 保留）——两态都是 crash-resume 呈现（见 docstring 纠偏说明）。
+                if str(cps) in ("FAILED", "LOADING") and int(rc or 0) > 0 and cat1:
                     crash_resume[key[0]] = {"category_l1": cat1, "category_l2": cat2 or "others"}
                 else:
                     deliberate.append(key)

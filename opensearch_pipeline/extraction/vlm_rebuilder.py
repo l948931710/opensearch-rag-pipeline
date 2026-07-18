@@ -201,8 +201,21 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
         "file_ext": "pdf", "owner_dept": task.get("owner_dept", "unknown"),
         "unit_count": 0, "cached_count": 0, "ocr_page_count": len(escalate),
     }
-    allowed, est = gate_vlm_rebuild(breaker, gate_doc, simulate_db=simulate_db)
+    _deny_info = {}
+    allowed, est = gate_vlm_rebuild(breaker, gate_doc, simulate_db=simulate_db,
+                                    deny_out=_deny_info)
     if not allowed:
+        if _deny_info.get("transient"):
+            # 瞬态共享预算（RUN/DAILY）耗尽（ultra P1 纠偏 2026-07-17）：不封存也不定稿。
+            # 若沿用 cost_quarantined，canonical 照常定稿 → stage-1 不再重跑（扫描谓词要求
+            # canonical_json_key IS NULL）、stage-2 按 QUARANTINE 跳过落 EMPTY/DONE——健康
+            # 文档静默终态，「可重认领」名存实亡。标 cost_deferred → node_build_canonical
+            # 扣住本篇 canonical（不写 keys、保持 NOT_STARTED），下一 run 预算滚动后重捡重过闸。
+            print(f"    [vlm_rebuilder] cost gate DEFERRED rebuild of {len(escalate)} pages "
+                  f"(transient shared budget; retry next run): {_deny_info.get('reason')}",
+                  flush=True)
+            result.cost_deferred = True
+            return result
         print(f"    [vlm_rebuilder] cost gate DENIED rebuild of {len(escalate)} pages "
               f"(est {est.est_cost_rmb} RMB); falling back to rule output", flush=True)
         # 成本封存：标记结果，让下游 (node_redact_or_quarantine → chunk/publish) 跳过本文档，

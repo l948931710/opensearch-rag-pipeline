@@ -359,6 +359,35 @@ def test_mixed_fresh_plus_crash_resume_both_proceed(mock_db, mock_llm, llm_key_p
 
 @patch(LLM_PATH)
 @patch(DB_PATH)
+def test_crash_resume_loading_state_orchestrator_path(mock_db, mock_llm):
+    """核查纠偏（2026-07-17）：生产 orchestrator 的 stage-2 loader 在 DAG-2 前已把认领行
+    FAILED→LOADING（retry_count 保留）——guard 分区时看到的是 LOADING+retry>0，不是 FAILED。
+    只认 FAILED 时本分区在真正发生楔死的生产路径上永不命中（整批照旧 raise）。"""
+    factory, _ = _crash_factory({("d1", 1)}, {("d1", 1): ("LOADING", 1, "sop", "safety_sop")})
+    mock_db.side_effect = factory
+    docs = [_doc("d1")]
+    ctx = {"canonicals": docs, "simulate_db": False, "simulate_api": False}
+    node_classify_and_risk_assess(ctx)   # 不抛
+    assert mock_llm.call_count == 0, "LOADING+retry>0 = loader 已认领的 crash-resume，须 auto-freeze"
+    assert docs[0]["category_l1"] == "sop"
+    assert docs[0]["classification_status"] == "FROZEN_MAINTENANCE"
+
+
+@patch(LLM_PATH)
+@patch(DB_PATH)
+def test_deliberate_rechunk_claimed_loading_retry0_still_blocks(mock_db, mock_llm):
+    """deliberate reset（NOT_STARTED+retry=0）被 loader 认领后呈现 LOADING+retry=0 →
+    仍不是 crash-resume，整批 fail-closed 不动摇（互斥判据是 retry_count，不是状态列）。"""
+    factory, _ = _crash_factory({("d1", 1)}, {("d1", 1): ("LOADING", 0, "sop", "safety_sop")})
+    mock_db.side_effect = factory
+    ctx = {"canonicals": [_doc("d1")], "simulate_db": False, "simulate_api": False}
+    with pytest.raises(RuntimeError, match="unfrozen re-chunk blocked"):
+        node_classify_and_risk_assess(ctx)
+    assert mock_llm.call_count == 0
+
+
+@patch(LLM_PATH)
+@patch(DB_PATH)
 def test_crash_resume_killswitch_reverts_to_block(mock_db, mock_llm, monkeypatch):
     """kill switch：RAG_CRASH_RESUME_AUTOFREEZE=false → crash-resume 也回退旧整批 raise 行为。"""
     monkeypatch.setenv("RAG_CRASH_RESUME_AUTOFREEZE", "false")

@@ -286,3 +286,37 @@ def test_env_dep_guard_raises_in_simulate_db_without_db_write(monkeypatch, tmp_p
     with pytest.raises(RuntimeError, match=r"ENV-DEP"):
         pn.node_build_canonical(ctx)
     assert ctx["canonicals"] == []
+
+# ── COST-DEFER 守卫（与 ENV-DEP 同型；ultra P1 纠偏 2026-07-17）─────────────────
+# 瞬态共享预算（RUN/DAILY）耗尽被成本闸拒绝的文档（cost_deferred）本 run 不定稿：
+# 不写 canonical keys（stage-1 谓词 keys IS NULL → 下一 run 自动重捡重过闸），
+# extraction_status='FAILED' + [COST-DEFER] 留痕，循环后统一 raise 炸红运行。
+
+
+def test_cost_deferred_doc_withheld_marks_failed_and_raises(monkeypatch, tmp_path):
+    res = _mk_result(doc_id="DOC_DEFER", text="正文内容", text_length=4, cost_deferred=True)
+    ctx, store = _canon_ctx(monkeypatch, tmp_path, [res])
+    with pytest.raises(RuntimeError, match=r"COST-DEFER.*DOC_DEFER"):
+        pn.node_build_canonical(ctx)
+    joined = " ".join(s for s, _p in store if isinstance(s, str))
+    assert "extraction_status='FAILED'" in joined
+    # 顺延文档绝不写 canonical keys / COMPLETED：keys 保持 NULL → 下一 run stage-1 重捡
+    assert "canonical_json_key" not in joined
+    assert "COMPLETED" not in joined
+    failed_params = [p for s, p in store if isinstance(s, str) and "FAILED" in s]
+    assert failed_params and "COST-DEFER" in str(failed_params[0])
+    assert ctx["canonicals"] == []
+
+
+def test_cost_deferred_doc_does_not_wedge_healthy_sibling(monkeypatch, tmp_path):
+    """整批不被顺延文档楔死：健康文档照常定稿（COMPLETED+keys），随后统一 raise 让运行可见。"""
+    res_defer = _mk_result(doc_id="DOC_DEFER", text="正文", text_length=2, cost_deferred=True)
+    res_ok = _mk_result(doc_id="DOC_OK", text="健康文档正文", text_length=6,
+                        warnings=["some benign note"])
+    ctx, store = _canon_ctx(monkeypatch, tmp_path, [res_defer, res_ok])
+    with pytest.raises(RuntimeError, match=r"COST-DEFER"):
+        pn.node_build_canonical(ctx)
+    assert [c["doc_id"] for c in ctx["canonicals"]] == ["DOC_OK"]
+    ok_sqls = " ".join(s for s, p in store
+                       if isinstance(s, str) and p and "DOC_OK" in str(p))
+    assert "COMPLETED" in ok_sqls, "健康文档必须照常 COMPLETED 落库"

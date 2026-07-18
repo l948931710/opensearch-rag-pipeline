@@ -291,3 +291,32 @@ def test_is_transient_cost_deny_classification():
     assert not _is_transient_cost_deny("unit count 100 exceeds per-doc hard cap 50")
     assert not _is_transient_cost_deny("VLM rebuild est 4.00 RMB > per-doc budget 0.50 RMB")
     assert not _is_transient_cost_deny(None)
+
+
+def test_gate_deny_out_reports_transient_and_reason(monkeypatch):
+    """deny_out 出参契约（ultra P1 纠偏 2026-07-17）：拒绝路径回填 reason 原文 + transient 定性，
+    供 vlm_rebuilder 分流 cost_deferred（瞬态）/cost_quarantined（doc-intrinsic）。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.setattr(cb, "quarantine_for_cost", lambda *a, **k: True)
+    # 瞬态：RUN 预算被 seed 打满
+    cfg = make_cfg(run_budget_rmb=0.04, doc_budget_rmb=5.0)
+    br = CostBreaker(cfg)
+    seed = estimate_doc_cost("pdf", unit_count=1, cached_count=0, cfg=cfg)
+    assert br.try_reserve("seed", seed)[0] and br.tripped
+    info = {}
+    allowed, _ = gate_vlm_rebuild(
+        br, {"doc_id": "h", "version_no": 1, "file_ext": "pdf", "owner_dept": "production",
+             "unit_count": 1, "cached_count": 0, "ocr_page_count": 0},
+        simulate_db=True, deny_out=info)
+    assert not allowed
+    assert info["transient"] is True and "RUN budget exhausted" in info["reason"]
+    # doc-intrinsic：超 per-doc 预算
+    cfg2 = make_cfg(doc_budget_rmb=0.5)
+    info2 = {}
+    allowed2, _ = gate_vlm_rebuild(
+        CostBreaker(cfg2),
+        {"doc_id": "big", "version_no": 1, "file_ext": "pdf", "owner_dept": "production",
+         "unit_count": 100, "cached_count": 0, "ocr_page_count": 0},
+        simulate_db=True, deny_out=info2)
+    assert not allowed2
+    assert info2["transient"] is False
