@@ -1,6 +1,10 @@
-# agent 压测（非阻断）：手动触发 workflow_dispatch。零成本 mock 档全矩阵（smoke 规模），
-# MySQL 走 service container + ci_load_schema。不进 required checks——压测门的裁决在
-# 上线手册（docs/agent_stress_test_launch_plan_2026-07-12.md），不在 PR CI。
+# agent 压测：零成本 mock 档全矩阵，MySQL 走 service container + ci_load_schema。
+# 三通道（RB-05）：
+#   1) pull_request（paths 限 agent runtime/压测面）→ smoke 档，**进 required checks 硬门**
+#      ——硬门只含功能正确性断言（gates.py hard_fail 判据），G1-G9 容量门保持 draft 非阻断；
+#   2) schedule 每周日 → full 档（含 30min 浸泡）非阻断，失败靠通知；
+#   3) workflow_dispatch → 手工任意档。
+# staging 真实计费档不进 CI（上线手册裁决，docs/agent_stress_test_launch_plan_2026-07-12.md）。
 name: stress
 
 on:
@@ -10,11 +14,24 @@ on:
         description: "smoke | full（full 含 30min 浸泡）"
         default: "smoke"
         required: false
+  pull_request:
+    paths:
+      - "stress_harness/**"
+      - "opensearch_pipeline/agent_runtime/**"
+      - "opensearch_pipeline/agent_tools/**"
+      - "opensearch_pipeline/routes/agent*"
+  schedule:
+    - cron: "0 20 * * 0"   # 周日 20:00 UTC（周一 04:00 北京）full 档周检
+
+concurrency:
+  group: stress-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   stress-local:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # full（schedule）含 30min 浸泡；PR/dispatch smoke 档 45min 内绰绰有余
+    timeout-minutes: ${{ github.event_name == 'schedule' && 90 || 45 }}
     services:
       mysql:
         image: mysql:8.0
@@ -39,9 +56,11 @@ jobs:
       - name: Harness unit smoke
         run: python -m pytest tests/test_stress_harness_smoke.py -q
       - name: Stress matrix
+        # PR=smoke（硬门）；schedule=full（周检）；dispatch=按输入
         run: |
-          python -m stress_harness.runner --scenario matrix --tier local \
-            --scale "${{ github.event.inputs.scale || 'smoke' }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then SCALE=full; \
+          else SCALE="${{ github.event.inputs.scale || 'smoke' }}"; fi
+          python -m stress_harness.runner --scenario matrix --tier local --scale "$SCALE"
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4

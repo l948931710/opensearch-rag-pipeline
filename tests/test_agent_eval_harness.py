@@ -87,6 +87,60 @@ def test_cli_scripted_and_freeze_baseline(tmp_path, capsys):
         R.REPORTS_DIR = orig
 
 
+def test_freeze_writes_regime_fingerprint(tmp_path):
+    """RB-05：冻结产物必须带 regime 指纹（金集/模型/臂/prompt/provider + git 信息）。"""
+    rep_dir = tmp_path / "reports"
+    R.REPORTS_DIR, orig = rep_dir, R.REPORTS_DIR
+    try:
+        assert R.main(["--provider", "scripted"]) == 0
+        report = next(iter(rep_dir.glob("agent_eval_*.json")))
+        baseline = tmp_path / "baseline.json"
+        assert R.main(["--freeze-baseline", str(report), "--baseline", str(baseline)]) == 0
+        regime = json.loads(baseline.read_text(encoding="utf-8"))["regime"]
+        for k in R.REGIME_MATCH_KEYS:
+            assert regime.get(k) is not None, f"regime 缺匹配键 {k}"
+        assert regime["provider"] == "scripted"
+        assert len(regime["cases_sha16"]) == 16 and len(regime["prompt_sha16"]) == 16
+    finally:
+        R.REPORTS_DIR = orig
+
+
+def test_gate_regime_mismatch_fails_closed(tmp_path):
+    """基线 regime 与本次运行不一致（如 prompt 变了）→ gate 拒比对 exit 2。"""
+    rep_dir = tmp_path / "reports"
+    R.REPORTS_DIR, orig = rep_dir, R.REPORTS_DIR
+    try:
+        assert R.main(["--provider", "scripted"]) == 0
+        report = next(iter(rep_dir.glob("agent_eval_*.json")))
+        baseline = tmp_path / "baseline.json"
+        assert R.main(["--freeze-baseline", str(report), "--baseline", str(baseline)]) == 0
+        base = json.loads(baseline.read_text(encoding="utf-8"))
+        base["regime"]["prompt_sha16"] = "0" * 16          # 模拟：冻结后 prompt 已变
+        baseline.write_text(json.dumps(base, ensure_ascii=False), encoding="utf-8")
+        assert R.main(["--provider", "scripted", "--gate", "--baseline", str(baseline)]) == 2
+    finally:
+        R.REPORTS_DIR = orig
+
+
+def test_legacy_baseline_and_report_rejected(tmp_path):
+    """旧格式（无 regime）基线 gate 必拒；旧格式 report 冻结必拒——过期成绩单不再静默可比。"""
+    rep_dir = tmp_path / "reports"
+    R.REPORTS_DIR, orig = rep_dir, R.REPORTS_DIR
+    try:
+        legacy_baseline = tmp_path / "legacy_baseline.json"
+        legacy_baseline.write_text(json.dumps(
+            {"frozen_at": "2026-07-12", "metrics": {"tool_trigger_rate": 1.0}}), encoding="utf-8")
+        assert R.main(["--provider", "scripted", "--gate",
+                       "--baseline", str(legacy_baseline)]) == 2
+        legacy_report = tmp_path / "legacy_report.json"
+        legacy_report.write_text(json.dumps(
+            {"provider": "live", "metrics": {"tool_trigger_rate": 1.0}}), encoding="utf-8")
+        assert R.main(["--freeze-baseline", str(legacy_report),
+                       "--baseline", str(tmp_path / "b.json")]) == 2
+    finally:
+        R.REPORTS_DIR = orig
+
+
 def test_cases_file_well_formed():
     data = json.loads(Path(R.DEFAULT_CASES).read_text(encoding="utf-8"))
     fams = {}

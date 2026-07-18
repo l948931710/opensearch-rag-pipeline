@@ -54,6 +54,10 @@ jobs:
           pip install -e ".[dev,production,ocr,api]"
       - name: Lint (ruff — BLOCKING; 存量债 2026-07-04 清零，此后新增即红)
         run: python -m ruff check opensearch_pipeline/ tests/
+      - name: General-ability eval gate (sim — 门2防劫持+门3分级路由，离线零网络)
+        # RB-05：金集在仓（goldset/general_ability_set.json）、默认 RAG_SIMULATE=true、
+        # 零 API 费用——sim 可跑的效果门没有理由留在部署前手工跑。live 档（--live）仍手工。
+        run: python -m eval_harness.general_ability_eval
       - name: Test (simulate mode — no external services)
         # perf F#48：xdist 并行（ubuntu runner 4 vCPU）；--dist loadgroup + conftest 分组钩子
         # 复刻 loadfile 语义并把共享本地栈的模块钉到同一 worker（CI 无本地 DB，该组多为 skip）。
@@ -232,3 +236,25 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+
+  # 成绩单新鲜度门（RB-05）：冻结基线的金集 SHA / 模型 / prompt 指纹与当前代码比对——
+  # 「基线过期」从此是 CI 红灯，不再靠部署前手工 release-gate 才 FATAL、或压根无人发现。
+  # 两阶段上线：refreeze（RAG live + agent live，user-gated）落地前 continue-on-error
+  # 先亮红叉不阻塞；refreeze 后删掉 continue-on-error 翻硬门（RB-05 E2）。
+  baseline-freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true   # E2 翻硬门时删除本行
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[production,api]"
+      - name: Check baseline freshness (RB-05)
+        run: python scripts/check_baseline_freshness.py

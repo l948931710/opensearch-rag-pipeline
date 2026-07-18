@@ -7,6 +7,7 @@ json 保全量原始指标（含 S3 soak 的 RSS/线程时间线数组）。
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -14,6 +15,23 @@ from typing import Any, Dict, List
 from stress_harness.gates import ScenarioResult
 
 REPORTS_DIR = Path(__file__).resolve().parent / "reports"
+
+
+def _git_fingerprint() -> Dict[str, Any]:
+    """报告↔提交绑定（RB-05）：没有 git 指纹的压测成绩无法证明测的是哪个版本。
+    local/staging 两档共用（write_report 是唯一落盘口）；git 不可用降级 unknown 不炸压测。"""
+    try:
+        root = Path(__file__).resolve().parent.parent
+
+        def _git(*args: str) -> str:
+            return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                                  text=True, timeout=10).stdout.strip()
+
+        return {"git_sha": _git("rev-parse", "--short", "HEAD") or "unknown",
+                "git_branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "unknown",
+                "git_dirty": bool(_git("status", "--porcelain"))}
+    except Exception:   # noqa: BLE001
+        return {"git_sha": "unknown", "git_branch": "unknown", "git_dirty": False}
 
 
 def _md_gate_table(results: List[ScenarioResult]) -> str:
@@ -36,7 +54,8 @@ def write_report(results: List[ScenarioResult], tag: str, scope_notes: List[str]
     outdir = REPORTS_DIR / f"run_{ts}_{tag}"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    payload = {"generated_at": ts, "tag": tag, "env": env_summary,
+    git = _git_fingerprint()
+    payload = {"generated_at": ts, "tag": tag, "git": git, "env": env_summary,
                "scope_notes": scope_notes,
                "scenarios": [r.as_dict() for r in results],
                "hard_fail": any(r.hard_fail for r in results)}
@@ -47,6 +66,8 @@ def write_report(results: List[ScenarioResult], tag: str, scope_notes: List[str]
     md = ["# Agent 压测报告 — " + tag,
           "",
           f"- 生成时间（UTC）: {ts}",
+          f"- 代码指纹: {git['git_sha']}@{git['git_branch']}"
+          f"{'（工作树 dirty，结果不可复现）' if git['git_dirty'] else ''}",
           f"- 硬性门失败: {'是' if payload['hard_fail'] else '否'}"
           "（draft 门 FAIL 不计入，见设计文档 §4）",
           "",

@@ -27,7 +27,9 @@ Policy/幂等/审批语义已有全套单测守护，不重复测）：
   provider 供 harness 自检/CI（见 tests/test_agent_eval_harness.py）；
 - 判分全部**确定性关键词**（不用 LLM judge——judge 校准是另一层，v1 不引入其方差）。
 
-已知基线解读（首冻 2026-07-09，qwen3.7-plus light）：write_propose_rate=0.33 **不是缺陷是事实**——
+基线绑定的模型/金集/prompt 以 `baseline.json` 的 `regime` 指纹为准（RB-05 起 freeze 自动
+写入、gate 强制比对，此前靠注释人肉记录）。已知基线解读（首冻 2026-07-09 light 档）：
+write_propose_rate=0.33 **不是缺陷是事实**——
 生产系统提示词是「知识库助手」框架（检索导向），祈使式改单（调整/修改）能触发写提案、
 「下单/开票/提交」多被带去检索。P3 接真写型工具时必须**同步改系统提示词并重冻基线**
 （评测门届时应把该指标顶上去）；在那之前该指标只护「不再恶化」。其余族满分。
@@ -40,11 +42,13 @@ Policy/幂等/审批语义已有全套单测守护，不重复测）：
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _HERE = Path(__file__).resolve().parent
 DEFAULT_CASES = _HERE / "agent_cases.json"
@@ -56,6 +60,56 @@ HARD_INVARIANTS = ("approval_suspend_rate",)
 GATED_METRICS = ("tool_trigger_rate", "tool_query_relevance", "no_tool_rate",
                  "write_propose_rate", "grounded_rate")
 DEFAULT_DELTA = 0.10          # 族样本 n≈6-10，1 例波动 ≈0.1-0.17；δ=0.10 容 1 例内漂移
+
+# ── regime 指纹（RB-05）：基线只有在「同金集/同模型/同臂/同 prompt」下才可比 ──────
+# 对齐 eval_harness/baseline.py 的 _REGIME_KEYS/regime_matches 模式：freeze 时写入
+# 当次运行的 regime，gate 时任一匹配键不一致 → 拒绝比对（fail-closed，exit 2），
+# 杜绝「换模型/改 prompt/换金集后仍拿旧成绩单过闸」。code_commit/git_dirty 仅记录
+# 不进匹配键——否则每个 commit 都作废基线，制度无法运转（与 RAG 侧同一取舍）。
+REGIME_MATCH_KEYS = ("cases_sha16", "model", "tier", "ontology_flag_on",
+                     "prompt_sha16", "provider")
+
+
+def _git_info() -> Tuple[str, bool]:
+    """(short_sha, dirty)；git 不可用时降级 ("unknown", False)，不炸评测。"""
+    try:
+        root = _HERE.parent.parent
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        porcelain = subprocess.run(["git", "status", "--porcelain"], cwd=root,
+                                   capture_output=True, text=True, timeout=10).stdout
+        return (sha or "unknown"), bool(porcelain.strip())
+    except Exception:   # noqa: BLE001
+        return "unknown", False
+
+
+def _regime(cases_path: Path, provider: str, tier: str) -> Dict[str, Any]:
+    """现算本次运行的 regime。cases/prompt 哈希失败直接抛——它们是匹配键的根基，
+    静默 unknown 会让 mismatch 检测形同虚设；只有 git 指纹允许降级。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import _DEFAULT_ROUTES
+    from opensearch_pipeline.agent_tools import ontology_tools_enabled
+    from opensearch_pipeline.routes.agent import _agent_system_prompt
+
+    cases_sha16 = hashlib.sha256(cases_path.read_bytes()).hexdigest()[:16]
+    prompt_sha16 = hashlib.sha256(
+        _agent_system_prompt().encode("utf-8")).hexdigest()[:16]
+    model = "→".join(m for _, m in _DEFAULT_ROUTES.get(tier, ()))
+    sha, dirty = _git_info()
+    return {"cases_sha16": cases_sha16, "cases_file": cases_path.name,
+            "model": model, "tier": tier,
+            "ontology_flag_on": ontology_tools_enabled(),
+            "prompt_sha16": prompt_sha16, "provider": provider,
+            "code_commit": sha, "git_dirty": dirty}
+
+
+def _regime_matches(base_regime: Dict[str, Any],
+                    cur_regime: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """匹配键逐一比对；老基线整体缺 regime 也算不匹配（B2 refreeze 前 gate 就该响）。"""
+    if not base_regime:
+        return False, ["<baseline 无 regime 指纹（旧格式）——refreeze 后才可比对>"]
+    diffs = [f"{k}: baseline={base_regime.get(k)!r} current={cur_regime.get(k)!r}"
+             for k in REGIME_MATCH_KEYS if base_regime.get(k) != cur_regime.get(k)]
+    return not diffs, diffs
 
 
 # ── mock 写型工具（评测专用；语义对齐未来真 u8_writeback：HIGH_WRITE → 必审批）────
@@ -442,6 +496,7 @@ def run(cases_path: Path = DEFAULT_CASES, provider: str = "live",
         print(f"  [{i:2d}/{len(cases)}] {flag} {c['id']} ({c['family']}) {out['latency_s']}s")
     metrics = _aggregate(scores)
     return {"provider": provider, "model_tier": tier, "cases": len(cases),
+            "regime": _regime(cases_path, provider, tier),
             "metrics": metrics, "scores": scores}
 
 
@@ -465,8 +520,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.freeze_baseline:
         rep = json.loads(Path(args.freeze_baseline).read_text(encoding="utf-8"))
+        regime = rep.get("regime")
+        if not regime:
+            print("⛔ report 无 regime 指纹（旧格式）——用当前 runner 重跑评测后再冻结")
+            return 2
+        if regime.get("git_dirty"):
+            print("⚠️  report 出自 dirty 工作树（code_commit 不可复现）——允许冻结但请知悉")
         base = {"frozen_from": args.freeze_baseline, "frozen_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "provider": rep.get("provider"), "metrics": rep["metrics"]}
+                "provider": rep.get("provider"), "regime": regime, "metrics": rep["metrics"]}
         Path(args.baseline).write_text(json.dumps(base, ensure_ascii=False, indent=2),
                                        encoding="utf-8")
         print(f"✅ 基线已冻结 → {args.baseline}")
@@ -494,7 +555,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not bp.exists():
             print("⛔ 无冻结基线（先跑一次可接受的 live 评测，再 --freeze-baseline <report>）")
             return 2
-        breaches = _gate(m, json.loads(bp.read_text(encoding="utf-8")), args.delta)
+        baseline = json.loads(bp.read_text(encoding="utf-8"))
+        ok, diffs = _regime_matches(baseline.get("regime") or {}, report["regime"])
+        if not ok:
+            print("⛔ REGIME MISMATCH——基线与本次运行不在同一 regime，成绩不可比：")
+            for d in diffs:
+                print(f"  - {d}")
+            print("  处置：人工裁决本次 report 可接受后 refreeze："
+                  "python -m eval_harness.agent.runner --freeze-baseline <report.json>")
+            return 2
+        breaches = _gate(m, baseline, args.delta)
         if breaches:
             print("⛔ 破门：")
             for b in breaches:
