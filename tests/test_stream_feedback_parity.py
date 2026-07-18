@@ -41,7 +41,7 @@ def _fake_stream(*args, **kwargs):
     yield 'data: {"type": "sources", "sources": []}\n\n'
     yield 'data: {"type": "chunk", "content": "住宿申请"}\n\n'
     yield 'data: {"type": "chunk", "content": "见 <<IMG:1>> 图示"}\n\n'
-    yield 'data: {"type": "done", "model": "qwen3.6-plus", "usage": {"total_tokens": 10}}\n\n'
+    yield 'data: {"type": "done", "model": "qwen3.7-plus", "usage": {"total_tokens": 10}}\n\n'
     yield "data: [DONE]\n\n"
 
 
@@ -100,7 +100,7 @@ def test_stream_emits_message_id_logs_and_content_blocks(
     log_kwargs = mock_log.call_args.kwargs
     assert log_kwargs["message_id"] == message_id
     assert log_kwargs["answer_status"] == "SUCCESS"
-    assert log_kwargs["model_name"] == "qwen3.6-plus"
+    assert log_kwargs["model_name"] == "qwen3.7-plus"
     assert log_kwargs["opensearch_hit_count"] == 1
 
 

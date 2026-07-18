@@ -993,9 +993,12 @@ def kb_review_tasks(request: Request, limit: int = 20, include_closed: bool = Fa
     except HTTPException:
         raise
     except Exception as e:
+        # fail-open：复审任务是只读看板聚合，review_task 表缺失/查询失败返回空列表而非拖垮
+        # 整个管理台（与 governance/insights 等 dashboard 接口一致；2026-07-15 现网：生产漏建
+        # 001 权威 review_task 表，1146 冒泡把 kb_admin 管理台整页打 500）。
         trace_id = get_request_id()
-        logger.error("kb_review_tasks 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"复审任务查询失败 (trace: {trace_id})")
+        logger.warning("kb_review_tasks 查询失败（空列表，non-fatal）[trace=%s]: %s", trace_id, e)
+        return KbReviewTasksResponse()
     out = KbReviewTasksResponse()
     for (tid, doc_id, title, ver, rtype, reason, owner, sperm, st, rname, created, age) in rows:
         st = str(st or "PENDING").upper() or "PENDING"

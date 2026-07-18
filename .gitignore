@@ -69,8 +69,11 @@ CLAUDE.md
 /*_slide[0-9]*_img*.jpeg
 /*_slide[0-9]*_img*.png
 
-# Claude Code 本地工作区 (skills/launch.json 等,不入远程)
-.claude/
+# Claude Code 本地工作区 (settings/launch.json/worktrees 等,不入远程)
+# 例外:ui-iterate 流程资产(commands/agents)纳入 git —— 版本化 + worktree 共享,2026-07-14
+**/.claude/*
+!.claude/commands/
+!.claude/agents/
 
 # 评测模板/数据 — 本地素材,不入远程
 一期模型评测集和评测模板_v2.0(1).xlsx

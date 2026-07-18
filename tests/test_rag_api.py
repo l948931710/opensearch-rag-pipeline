@@ -235,7 +235,7 @@ class TestLLMGenerator:
         mock_cfg = MagicMock()
         mock_cfg.llm.api_key = "test-key"
         mock_cfg.llm.api_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        mock_cfg.llm.model = "qwen3.6-plus"
+        mock_cfg.llm.model = "qwen3.7-plus"
         mock_cfg.rag.score_threshold_high = 8.0
         mock_cfg.rag.score_threshold_medium = 5.0
         mock_cfg.rag.serving_model_gateway = False
@@ -253,7 +253,7 @@ class TestLLMGenerator:
         result = generate_answer("怎么申请住宿", chunks)
 
         assert result["answer"] == "住宿申请需要填写申请表..."
-        assert result["model"] == "qwen3.6-plus"
+        assert result["model"] == "qwen3.7-plus"
         assert len(result["sources"]) == 1
 
 
@@ -308,7 +308,7 @@ class TestAPI:
         mock_gen.return_value = {
             "answer": "根据手册...",
             "sources": [{"doc_id": "D1", "title": "手册", "section": "", "score": 0.9}],
-            "model": "qwen3.6-plus",
+            "model": "qwen3.7-plus",
             "usage": {"prompt_tokens": 500, "completion_tokens": 100},
         }
 
@@ -328,7 +328,7 @@ class TestAPI:
         mock_gen.return_value = {
             "answer": "第一轮回答",
             "sources": [{"doc_id": "D1", "title": "手册", "section": "", "score": 0.9}],
-            "model": "qwen3.6-plus",
+            "model": "qwen3.7-plus",
             "usage": {},
         }
 
@@ -365,7 +365,7 @@ class TestAPI:
         def mock_generator(*args, **kwargs):
             yield 'data: {"type": "sources", "sources": []}\n\n'
             yield 'data: {"type": "chunk", "content": "回答"}\n\n'
-            yield 'data: {"type": "done", "model": "qwen3.6-plus", "usage": {}}\n\n'
+            yield 'data: {"type": "done", "model": "qwen3.7-plus", "usage": {}}\n\n'
             yield "data: [DONE]\n\n"
 
         mock_stream.return_value = mock_generator()
