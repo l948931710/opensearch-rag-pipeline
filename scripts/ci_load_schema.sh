@@ -78,9 +78,11 @@ MANIFEST="$(grep -Ev '^[[:space:]]*(#|$)' "$MANIFEST_FILE")"
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; ontology) echo fuling_ontology ;; *) die "未知目标 '$1'";; esac; }
 
 # 完整性闸：schema/ 里出现清单外的编号文件 = 有人加了迁移没更新本脚本 → 直接红
+# （按空白符匹配分隔：清单虽名 .tsv 实为空格分隔——051 首推曾因 TAB 行被旧的
+#   空格锚定漏认而 CI 红；Python 钉子 test_apply_migration_guards 空白容忍，此处对齐）
 for f in "$SCHEMA_DIR"/[0-9]*.sql; do
   base="$(basename "$f")"
-  echo "$MANIFEST" | grep -q "^$base " \
+  echo "$MANIFEST" | grep -Eq "^$base[[:space:]]" \
     || die "schema/$base 不在清单里——新迁移需同步更新 schema/MIGRATION_MANIFEST.tsv（file→DB 见 schema/README.md）"
 done
 
