@@ -185,17 +185,19 @@ class TestVerifyZipIntegrity:
         make, zip_path, digest = verify_zip
         assert make({})(zip_path) == digest            # 过渡期放行，返回 digest 留痕
 
-    def test_sidecar_match_passes(self, verify_zip):
+    def test_sidecar_match_passes(self, verify_zip, monkeypatch):
         make, zip_path, digest = verify_zip
         fn = make({os.path.basename(zip_path) + ".sha256": digest + "\n"})
-        # 节点内 sidecar 资源名 = zip 文件名 + .sha256（节点工作目录即 '.'）
-        os.chdir(os.path.dirname(zip_path))
+        # 节点内 sidecar 资源名 = zip 文件名 + .sha256（节点工作目录即 '.'）；
+        # monkeypatch.chdir 自动还原——裸 os.chdir 会污染同 worker 后续用例的相对路径
+        # （main 摘取时 g6 模板 open 实撞，2026-07-18 双分支同修）
+        monkeypatch.chdir(os.path.dirname(zip_path))
         assert fn(os.path.basename(zip_path)) == digest
 
-    def test_sidecar_mismatch_rejects(self, verify_zip):
+    def test_sidecar_mismatch_rejects(self, verify_zip, monkeypatch):
         make, zip_path, digest = verify_zip
         fn = make({os.path.basename(zip_path) + ".sha256": "0" * 64})
-        os.chdir(os.path.dirname(zip_path))
+        monkeypatch.chdir(os.path.dirname(zip_path))
         with pytest.raises(RuntimeError, match="制品完整性校验失败"):
             fn(os.path.basename(zip_path))
 
