@@ -77,7 +77,8 @@
               </view>
             </view>
 
-            <!-- NO_RESULT 空结果卡：死胡同留出口（换个说法 chips + 转人工）；无来源、无赞踩 -->
+            <!-- NO_RESULT 空结果卡：死胡同留出口（换个说法 chips；引导话术含知识贡献指引）；
+                 无来源、无赞踩（转人工已下线 2026-07） -->
             <view a:elif="{{item.noResult}}" class="ai-card">
               <view class="nr-body">
                 <text class="ico ico-search nr-ico"></text>
@@ -94,10 +95,6 @@
                   <view class="nr-chip" a:for="{{item.rephrase}}" a:key="*this" data-q="{{item}}" onTap="onNrChipTap">
                     <text class="nr-chip-text">{{item}}</text>
                   </view>
-                </view>
-                <view class="nr-handoff {{item.handoffDone ? 'nr-handoff-done' : ''}}" data-id="{{item.id}}" onTap="onNrHandoff">
-                  <text class="ico ico-headset nr-handoff-ico"></text>
-                  <text class="nr-handoff-label">{{item.handoffDone ? '已转交管理员' : '转人工协助'}}</text>
                 </view>
               </view>
             </view>

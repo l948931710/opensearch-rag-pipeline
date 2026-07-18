@@ -55,7 +55,6 @@ export interface ChatMessage {
   source?: string          // 回答来源 kb|smalltalk|general|guard（done 帧 source；
                            // general/smalltalk 时正常答案区显示「通用回答·非公司口径」徽标）
   voted?: '' | 'up' | 'down'
-  handoffDone?: boolean
   copied?: boolean
   error?: boolean
   errorText?: string
@@ -530,15 +529,6 @@ async function vote(m: ChatMessage, type: 'upvote' | 'downvote'): Promise<void> 
   } catch { m.voted = ''; schedulePersist() }   // 回滚
 }
 
-async function handoff(m: ChatMessage): Promise<void> {
-  if (m.handoffDone || !m.messageId) return
-  try {
-    await apiJson('/api/feedback', { method: 'POST', auth: true, body: JSON.stringify({ message_id: m.messageId, feedback_type: 'handoff' }) })
-    m.handoffDone = true
-    schedulePersist()
-  } catch { /* 失败保持可重试 */ }
-}
-
 function copyAns(m: ChatMessage): void {
   const txt = m.copyText || m.answer || ''
   const done = () => { m.copied = true; schedulePersist(); setTimeout(() => { m.copied = false; schedulePersist() }, 1500) }
@@ -652,7 +642,7 @@ function schedulePersist(): void {
 // 模块初始化：从 localStorage 恢复（仅浏览器环境）。
 // H#69：持久化不再走 `watch([conversations, activeId], …, { deep: true })`——那会在流式期每 tick
 // 深遍历整棵会话树。改为在每个会话变更点手动 schedulePersist()（ask 发起 / finishStream 收尾 /
-// ask 异常 / stop / retry / newConversation / switchTo / removeConversation / vote 及回滚 / handoff /
+// ask 异常 / stop / retry / newConversation / switchTo / removeConversation / vote 及回滚 /
 // copyAns / resignImage / imgFailed / loadConversationMessages 回灌 / syncHistoryForUser 清残留）。
 // persist 本身延迟 400ms 读【实时】状态，故触发点只需落在同一轮同步变更的任意位置。
 if (typeof window !== 'undefined') {
@@ -735,7 +725,7 @@ export function useAsk() {
     messages, asking, draft, thinking, hotQuestions,
     conversations, activeId,
     ask, stop, retry, resetThread, newConversation, switchTo, removeConversation, searchConversations,
-    vote, handoff, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions, hydrateConversations,
+    vote, copyAns, resignImage, imgFailed, preview, fillInput, loadHotQuestions, hydrateConversations,
   }
 }
 

@@ -2,7 +2,7 @@
   <!-- 低匹配 guard 提示条：低置信回答不能和高置信长得一样权威 -->
   <view a:if="{{guard}}" class="guard-note">
     <text class="ico ico-warn guard-ico"></text>
-    <text class="guard-text">相关资料匹配度较低，以下回答仅供参考，请核对原文或转人工确认。</text>
+    <text class="guard-text">相关资料匹配度较低，以下回答仅供参考，请核对原文确认。</text>
   </view>
 
   <!-- 通用回答来源徽标（中性弱样式，刻意比 guard 警示条更淡） -->

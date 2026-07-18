@@ -159,7 +159,7 @@ export function leanMessages(messages) {
         // 不落盘 —— 省 200KB 本地存储配额）
         role: 'ai', noResult: true, answer: m.answer || '',
         rephrase: m.rephrase || [], messageId: m.messageId || '',
-        question: m.question || '', handoffDone: !!m.handoffDone,
+        question: m.question || '',
       });
       return;
     }

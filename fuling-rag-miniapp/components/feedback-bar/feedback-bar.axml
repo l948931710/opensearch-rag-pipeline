@@ -1,6 +1,6 @@
 <view class="feedback-bar">
-  <!-- 嵌入式图标按钮条：赞/踩一次性互斥锁定；复制、转人工独立可用
-       （评价答案 ≠ 放弃升级人工） -->
+  <!-- 嵌入式图标按钮条：赞/踩一次性互斥锁定；复制独立可用
+       （转人工已下线 2026-07：语料缺口由知识贡献系统兜底） -->
   <view class="fb">
     <view
       class="fb-ico fb-up {{voted === 'up' ? 'fb-up-on' : ''}} {{voteLocked && voted !== 'up' ? 'fb-locked' : ''}}"
@@ -19,10 +19,6 @@
     </view>
     <view class="fb-spacer">
       <text class="fb-done" a:if="{{voteLocked}}">已反馈</text>
-    </view>
-    <view class="fb-handoff {{handoffDone ? 'fb-handoff-done' : ''}}" onTap="onHandoff">
-      <text class="ico ico-headset fb-handoff-ico"></text>
-      <text class="fb-handoff-label">转人工</text>
     </view>
   </view>
 
@@ -64,9 +60,4 @@
     </view>
   </view>
 
-  <!-- 转人工后的持久确认行（toast 1.7s 即逝，滚回来要还能看到） -->
-  <view class="handoff-note" a:if="{{handoffDone}}">
-    <text class="ico ico-check hn-ico"></text>
-    <text class="hn-text">已转交管理员跟进，请留意钉钉消息</text>
-  </view>
 </view>

@@ -244,7 +244,7 @@ test('leanMessages：丢 loading/error 瞬态，保最终答案/NO_RESULT，AI �
     { role: 'ai', blocks: [{ type: 'text', text: '答案' }], sources: [{ idx: 1 }],
       messageId: 'mid1', copyText: '答案', question: '问题一', guard: true, general: true },
     { role: 'ai', noResult: true, rephrase: ['换个说法'], messageId: 'mid2',
-      question: '问题二', handoffDone: true,
+      question: '问题二',
       answer: '抱歉，知识库中暂时没有找到能直接回答这个问题的资料。\n您是不是想问：\n· 《考勤管理制度》' },
     { role: 'ai' },                                                  // 无 blocks 无 noResult：丢
   ]);
@@ -255,7 +255,7 @@ test('leanMessages：丢 loading/error 瞬态，保最终答案/NO_RESULT，AI �
   assert.equal(lean[1].general, true);   // 通用回答徽标随会话落盘往返
   assert.equal(lean[1].messageId, 'mid1');
   assert.equal(lean[2].noResult, true);
-  assert.equal(lean[2].handoffDone, true);
+  assert.equal(lean[2].handoffDone, undefined);   // 转人工已下线：不再落盘
   // 引导式拒答话术原文随 NO_RESULT 卡落盘（nrLines 不落盘，恢复时重算）
   assert.ok(lean[2].answer.includes('《考勤管理制度》'));
   assert.equal(lean[2].nrLines, undefined);

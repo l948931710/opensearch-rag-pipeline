@@ -230,7 +230,7 @@ test.describe('UX 硬门 — AI 助手交互', () => {
   });
 
   test('检索为空不是死胡同', async ({ page }) => {
-    // 固定返回 no_result + 改写建议 → 无结果卡(未找到/试试这样问/转人工)即「前进路径」。
+    // 固定返回 no_result + 改写建议 → 无结果卡(未找到/试试这样问)即「前进路径」（转人工已下线）。
     await page.route('**/api/ask/stream', (route) => route.fulfill({
       contentType: 'text/event-stream',
       body: sse([
@@ -245,7 +245,6 @@ test.describe('UX 硬门 — AI 助手交互', () => {
     await assertHasWayForward(page, [
       page.getByText('未找到相关内容'),
       page.getByText('试试这样问'),
-      page.getByRole('button', { name: /转人工/ }),
     ]);
   });
 });

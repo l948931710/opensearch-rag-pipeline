@@ -15,7 +15,7 @@ vi.mock('@/composables/useAsk', async () => {
   const { ref } = await import('vue')
   return {
     useAsk: () => ({
-      retry, handoff: vi.fn(), fillInput: vi.fn(),
+      retry, fillInput: vi.fn(),
       vote: vi.fn(), copyAns: vi.fn(),
       resignImage: vi.fn(), imgFailed: vi.fn(), preview: vi.fn(),
       // useAgentAsk 顶层解构的状态源（本 spec 不驱动 agent 路径，给稳定空值）

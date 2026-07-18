@@ -1,9 +1,8 @@
-// feedback-bar: 👍 / 👎 / 复制 / 转人工 under each AI answer (v1.1 semantics).
+// feedback-bar: 👍 / 👎 / 复制 under each AI answer (v1.1 semantics).
 //
 // 反馈语义：赞/踩一次性互斥锁定（已选中的那一票保持饱和 —— 否则"已记录"看起来
-// 像"坏了"）；复制、转人工独立可用。后端 user_feedback 按 (message_id, user_id)
-// 覆盖更新，先赞后转人工时库里保留 handoff —— 与钉钉卡片侧行为一致。
-// toast 文案与原型文案基准表逐字一致；转人工只承诺已发生的事，不承诺回电时限。
+// 像"坏了"）；复制独立可用。后端 user_feedback 按 (message_id, user_id) 覆盖更新。
+// toast 文案与原型文案基准表逐字一致。（转人工已下线 2026-07：由知识贡献系统兜底。）
 
 import { feedback as postFeedback } from '../../utils/api';
 
@@ -28,11 +27,10 @@ Component({
   data: {
     reasons: REASONS.map((r) => ({ code: r.code, label: r.label, sel: false })),
     voted: '',        // '' | 'up' | 'down'
-    voteLocked: false, // 赞踩已提交（不影响复制/转人工）
+    voteLocked: false, // 赞踩已提交（不影响复制）
     panelOpen: false,
     hasReason: false,
     comment: '',
-    handoffDone: false,
   },
 
   methods: {
@@ -135,23 +133,6 @@ Component({
           self._toast('已复制回答');
         },
       });
-    },
-
-    // 转人工：独立于赞踩，一次性；持久确认行在 AXML 里随 handoffDone 渲染
-    onHandoff() {
-      if (this.data.handoffDone || !this._ready()) {
-        return;
-      }
-      this.setData({ handoffDone: true });
-      this._send({ feedback_type: 'handoff' })
-        .then(() => {
-          this._toast('已转交管理员跟进，请留意钉钉消息');
-        })
-        .catch((err) => {
-          console.error('[feedback-bar.handoff]', err);
-          this.setData({ handoffDone: false });
-          this._toast('提交失败，请重试');
-        });
     },
   },
 });

@@ -44,7 +44,7 @@ const GOV: KbGovernance = {
   pii_redacted_docs: 475, pii_quarantined_docs: 3,
   answer_total: 902, answer_success: 790, answer_refusal: 112, answer_no_result: 15, answer_error: 25,
   effective_rate: 0.876,
-  feedback_up: 64, feedback_down: 44, feedback_total: 108, helpful_rate: 0.593, escalations: 19,
+  feedback_up: 64, feedback_down: 44, feedback_total: 108, helpful_rate: 0.593,
   feedback_last7: 5,
   feedback_daily: [{ day: '2026-06-18', up: 3, down: 21 }, { day: '2026-06-26', up: 1, down: 1 }],
   downvote_reasons: [{ reason: '其他', count: 14 }, { reason: '不准确', count: 12 }],
@@ -87,7 +87,6 @@ describe('KbAdminDashboard — 全库真实口径，无造数', () => {
     expect(w.text()).toContain('近期入库趋势')        // 入库改为趋势图
     expect(w.text()).toContain('治理风险')           // 并入运行健康下面
     expect(w.text()).toContain('475')                // PII 已脱敏文档
-    expect(w.text()).toContain('19')                 // 转人工
     // 服务可用性（独立区）
     expect(w.text()).toContain('服务可用性')
     expect(w.text()).toContain('问答 API 成功率')

@@ -1,4 +1,4 @@
-/* feedback-bar — 原型 .fb / .fb-panel / .handoff-note 的 1:1 移植（px×2=rpx）。
+/* feedback-bar — 原型 .fb / .fb-panel 的 1:1 移植（px×2=rpx）。
    位于 ai-card 内部（卡片外壳在 chat.acss .ai-card），自带 border-top 分隔。 */
 @import "../../styles/icons.acss";
 
@@ -66,39 +66,6 @@
 .fb-done {
   font-size: 22rpx;
   color: var(--text-3);
-}
-
-.fb-handoff {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  padding: 14rpx 20rpx;
-  border-radius: 20rpx;
-  min-height: 80rpx;
-}
-
-.fb-handoff:active {
-  background: var(--surface-3);
-}
-
-.fb-handoff-ico {
-  font-size: 36rpx;
-  color: var(--text-3);
-  margin-right: 10rpx;
-}
-
-.fb-handoff-label {
-  font-size: 25rpx;
-  color: var(--text-3);
-}
-
-.fb-handoff-done {
-  opacity: 1;
-}
-
-.fb-handoff-done .fb-handoff-ico,
-.fb-handoff-done .fb-handoff-label {
-  color: var(--brand);
 }
 
 /* ---------- downvote reason panel ---------- */
@@ -210,25 +177,4 @@
   font-size: 25rpx;
   font-weight: 500;
   color: #ffffff;
-}
-
-/* ---------- 转人工持久确认行 ---------- */
-.handoff-note {
-  background: var(--success-bg);
-  padding: 16rpx 28rpx;
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-}
-
-.hn-ico {
-  font-size: 28rpx;
-  color: var(--success);
-  margin-right: 12rpx;
-  flex-shrink: 0;
-}
-
-.hn-text {
-  font-size: 25rpx;
-  color: var(--success);
 }

@@ -30,7 +30,7 @@ import OpsMetricsPanel from '@/components/manage/OpsMetricsPanel.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadEscalations, loadReviewTasks, applyPendingVersion } = useKb()
+const { isKbAdmin, reviewCount, accessGrants, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadReviewTasks, applyPendingVersion } = useKb()
 const { loadAgentApprovals } = useAgentApprovals()
 const { ontologySupported, loadOntology } = useOntology()
 const { agentGovSupported, loadAgentGovernance } = useAgentGovernance()
@@ -129,7 +129,7 @@ function ensureTabLoaded(t: Tab): Promise<unknown> {
   _loadedTabs.add(t)
   const jobs: unknown[] = []
   if (t === 'dash') {
-    jobs.push(loadStats(), loadInsights(), loadFeedbackReview(), loadEscalations())
+    jobs.push(loadStats(), loadInsights(), loadFeedbackReview())
     if (isKbAdmin.value) jobs.push(loadGovernance(), loadReviewTasks())
   } else if (t === 'docs') {
     // stats 兼供台账（归属下拉全库口径）；accessGrants=台账底部「授权治理」区
