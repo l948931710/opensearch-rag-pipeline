@@ -747,7 +747,9 @@ def load_config() -> PipelineConfig:
         return int(val) if val else default
 
     def _env_bool(key: str, default: bool = True) -> bool:
-        val = os.environ.get(f"RAG_{key}", "").lower()
+        # 批次9（ultra P3 config:750）：strip——`RAG_READONLY=true `（尾随空白，SAE 控制台
+        # 粘贴/YAML 常见）此前静默落回 default：PROD-RO 的只读声明 fail-open 成可写。
+        val = os.environ.get(f"RAG_{key}", "").strip().lower()
         if val in ("false", "0", "no"):
             return False
         if val in ("true", "1", "yes"):

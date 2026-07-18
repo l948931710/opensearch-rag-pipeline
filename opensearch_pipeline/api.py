@@ -1208,7 +1208,9 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
     # 小程序图文渲染块（复用 build_content_blocks 核心；纯文字/未引用图片时为 []）。
     # 先于落库构建：实际下发给客户端的块也要进 qa_session_log（latency 已在 t_llm 定格，不受影响）。
     try:
-        blocks = build_mini_program_blocks(result["answer"], chunks)
+        blocks = build_mini_program_blocks(
+            result["answer"], chunks,
+            included_indices=result.get("included_doc_indices"))
     except Exception:
         logger.warning("mini-program blocks 构建失败 (non-fatal)", exc_info=True)
         blocks = []
@@ -1404,6 +1406,7 @@ def ask_stream(req: AskRequest, request: Request,
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'message_id': message_id}, ensure_ascii=False)}\n\n"
 
         collected_answer: List[str] = []
+        included_doc_indices = None  # 批次9：sources 帧携带的进-context 文档号（图渲染同口径）
         model_name: Optional[str] = None
         answer_status = "SUCCESS"
         error_message: Optional[str] = None
@@ -1496,6 +1499,7 @@ def ask_stream(req: AskRequest, request: Request,
                         # visual_summary、chunk_type 泄给任意 SSE 客户端（两前端响应契约也不一致）。
                         if frame is not None and frame.get("type") == "sources":
                             stream_sources = frame.get("sources") or None
+                            included_doc_indices = frame.get("included_doc_indices")
                             _fields = set(SourceInfo.model_fields)
                             frame["sources"] = [
                                 {k: v for k, v in (s or {}).items() if k in _fields}
@@ -1538,7 +1542,8 @@ def ask_stream(req: AskRequest, request: Request,
                     full_answer = strip_doc_citations("".join(collected_answer))
                     if full_answer and not _pure:
                         try:
-                            blocks = build_content_blocks(full_answer, chunks)
+                            blocks = build_content_blocks(
+                                full_answer, chunks, included_indices=included_doc_indices)
                             if blocks:
                                 yield f"data: {json.dumps({'type': 'content_blocks', 'content_blocks': blocks}, ensure_ascii=False)}\n\n"
                                 content_blocks_json_str = content_blocks_to_json(blocks)

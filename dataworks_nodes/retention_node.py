@@ -31,7 +31,11 @@ import zipfile
 # ═══════════════════════════════════════════════════════════════
 # 0. 安装依赖（PyODPS 3.7 pod 无 pymysql/dbutils；纯 RDS 作业，不装 oss2/ha3）
 # ═══════════════════════════════════════════════════════════════
-DEPS = ["PyMySQL", "DBUtils", "requests"]
+# py3.7 serverless 执行器钉真兼容版（批次9 同族清扫，同 stage3_node 分支法）
+if sys.version_info >= (3, 8):
+    DEPS = ["PyMySQL", "DBUtils", "requests"]
+else:
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "requests==2.31.0"]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", *DEPS, "-t", "/tmp/pydeps", "-q"
 ])

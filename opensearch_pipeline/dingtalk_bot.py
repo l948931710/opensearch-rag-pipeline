@@ -1003,7 +1003,9 @@ def _process_rag_query(
 
         # 4. 构建 content_blocks（图文穿插）；纯文本模式下不展示图片
         from opensearch_pipeline.content_blocks_builder import build_content_blocks, content_blocks_to_json
-        content_blocks = [] if pure_text else build_content_blocks(result["answer"], chunks)
+        content_blocks = [] if pure_text else build_content_blocks(
+            result["answer"], chunks,
+            included_indices=result.get("included_doc_indices"))
         content_blocks_json_str = content_blocks_to_json(content_blocks)
 
         # 5. 落库（包含 content_blocks_json 供回调重建）。拒答型标 REFUSAL
@@ -1384,7 +1386,13 @@ def _process_card_callback_body(body: dict):
     except Exception:
         _release_msg(key)          # 处理失败释放领用，重投可重试（不永久吞回调）
         raise
-    _confirm_msg(key)
+    # 批次9（ultra P3 dingtalk_bot:1436）：inner 内被吞掉的落库失败（fail-open ACK 哲学）
+    # 不能 confirm——否则用户同参重试点击被 replay 去重永久吞、反馈/工单静默丢失。
+    # 失败标记 → release（重试点击可重新处理）；标记键 pop 掉不进 ACK 响应体。
+    if isinstance(result, dict) and result.pop("_write_failed", False):
+        _release_msg(key)
+    else:
+        _confirm_msg(key)
     return result
 
 
@@ -1455,6 +1463,7 @@ def _process_card_callback_inner(body: dict):
                                            "答复后会通过钉钉消息回复你～")
         except Exception as e:
             logger.error("handoff 处理失败: %s", e, exc_info=True)
+            _ACK["_write_failed"] = True   # 批次9：释放 replay 键，重试点击可重新开工单
         return _ACK
 
     # ── 「补充原因」自由文本：标记待补充 + 提示用户直接回复 ──
@@ -1466,6 +1475,7 @@ def _process_card_callback_inner(body: dict):
                 send_text_to_user(user_id, "📝 想补充具体原因？直接【回复本条消息】发给我就行，我会记录下来～")
         except Exception as e:
             logger.error("add_reason 处理失败: %s", e, exc_info=True)
+            _ACK["_write_failed"] = True   # 批次9：同上
         return _ACK
 
     # ── 赞 / 踩（自定义按钮 或 钉钉原生赞踩回调）──
@@ -1484,6 +1494,7 @@ def _process_card_callback_inner(body: dict):
                   f"reason={_reason}, has_comment={bool(comment)}", flush=True)
         except Exception as e:
             logger.error("赞踩落库失败: %s", e, exc_info=True)
+            _ACK["_write_failed"] = True   # 批次9：释放 replay 键，重试点击的反馈不再被吞
         return _ACK
 
     # 其它/未识别动作：已 ACK，不更新卡片（[CALLBACK RAW] 已记录原始 body 供排查 + 补别名）

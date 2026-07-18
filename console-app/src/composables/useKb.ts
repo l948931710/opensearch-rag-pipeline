@@ -720,6 +720,9 @@ function closeHistory() { verHistory.value = null }
 async function openDocPreview(docId: string, version = 0): Promise<void> {
   const s = useSession()
   const w = typeof window !== 'undefined' ? window.open('', '_blank') : null
+  // 批次9 S4：占位标签立即断 opener——签名 URL 指向的文档域（OSS，内容可由上传者影响）
+  // 否则持有本页 window.opener，可反向 tabnabbing 重定向控制台页。兜底分支已是 noopener。
+  if (w) w.opener = null
   if (import.meta.env.DEV && s.token === 'dev-preview') { w?.close(); void notice({ title: '预览原件', message: '演示环境无真实文件。' }); return }
   try {
     const qs = version ? `&version=${version}` : ''

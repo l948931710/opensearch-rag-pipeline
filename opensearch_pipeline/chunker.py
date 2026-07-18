@@ -1194,6 +1194,7 @@ class DocumentChunker:
                 final_chunk_text = "\n".join(parts)
 
                 # ── step_card 超长保护：超过 max_chunk_chars 时拆分 ──
+                supplement_parts = []
                 if len(final_chunk_text) > self.max_chunk_chars:
                     # 两种超长形态分治：
                     if len(parts[0]) > self.max_chunk_chars:
@@ -1211,7 +1212,6 @@ class DocumentChunker:
                         # (b) step_text 可容纳、只是叠加补充后超长——原策略：主块保 step_text，
                         #     贪心塞下放得进的补充，其余（图片描述/OCR）降级为续接块（行为不变）。
                         core_parts = [parts[0]]
-                        supplement_parts = []
                         for p in parts[1:]:
                             candidate = "\n".join(core_parts + [p])
                             if len(candidate) <= self.max_chunk_chars:
@@ -1220,33 +1220,6 @@ class DocumentChunker:
                                 supplement_parts.append(p)
 
                     final_chunk_text = "\n".join(core_parts)
-
-                    # 生成补充 chunks（如有溢出内容）
-                    if supplement_parts:
-                        supplement_text = "\n".join(supplement_parts)
-                        # 进一步拆分超长补充文本
-                        supp_sub_texts = self._split_long_text(supplement_text) if len(supplement_text) > self.max_chunk_chars else [supplement_text]
-                        for supp_sub in supp_sub_texts:
-                            supp_sub = supp_sub.strip()
-                            if len(supp_sub) < self.min_chunk_chars:
-                                continue
-                            supp_chunk = self._create_chunk(
-                                doc_id=doc_id, version_no=version_no,
-                                chunk_index=chunk_index, chunk_type="step_card",
-                                chunk_text=supp_sub, page_num=sg["page_num"],
-                                section_title=sg["section"], metadata=meta,
-                                source=sg.get("source", "native"),
-                            )
-                            supp_chunk.extra["step_no"] = sg["step_no"]
-                            supp_chunk.extra["is_step_continuation"] = True
-                            # 不复制 image_refs 到续接块：图片只绑定到主 step chunk，
-                            # 避免一张图被复制到同一步骤的多个续接块（图文重复 / over-attachment）。
-                            # 续接块通过 step_no / prev_next 链回主块的图片。
-                            if annotation_map:
-                                supp_chunk.extra["annotation_map"] = annotation_map
-                            step_card_chunks_sec.append(supp_chunk)
-                            step_card_ids_sec.append(supp_chunk.chunk_id)
-                            chunk_index += 1
 
                 step_chunk = self._create_chunk(
                     doc_id=doc_id, version_no=version_no,
@@ -1275,6 +1248,36 @@ class DocumentChunker:
                 step_card_chunks_sec.append(step_chunk)
                 step_card_ids_sec.append(step_chunk.chunk_id)
                 chunk_index += 1
+
+                # 续接块在主卡【之后】生成（批次9 C4，ultra P3 chunker:1234）：旧序先
+                # supp 后主卡，chunk_index 与 prev/next 链均倒挂——邻居拼接（±1）和
+                # prev/next 阅读顺序先见「补充图示/OCR 尾巴」再见步骤正文。现为
+                # 主卡 → 续接块，链向自然（续接块 prev 即主块，图片经 prev 链回）。
+                if supplement_parts:
+                    supplement_text = "\n".join(supplement_parts)
+                    # 进一步拆分超长补充文本
+                    supp_sub_texts = self._split_long_text(supplement_text) if len(supplement_text) > self.max_chunk_chars else [supplement_text]
+                    for supp_sub in supp_sub_texts:
+                        supp_sub = supp_sub.strip()
+                        if len(supp_sub) < self.min_chunk_chars:
+                            continue
+                        supp_chunk = self._create_chunk(
+                            doc_id=doc_id, version_no=version_no,
+                            chunk_index=chunk_index, chunk_type="step_card",
+                            chunk_text=supp_sub, page_num=sg["page_num"],
+                            section_title=sg["section"], metadata=meta,
+                            source=sg.get("source", "native"),
+                        )
+                        supp_chunk.extra["step_no"] = sg["step_no"]
+                        supp_chunk.extra["is_step_continuation"] = True
+                        # 不复制 image_refs 到续接块：图片只绑定到主 step chunk，
+                        # 避免一张图被复制到同一步骤的多个续接块（图文重复 / over-attachment）。
+                        # 续接块通过 step_no / prev_next 链回主块的图片。
+                        if annotation_map:
+                            supp_chunk.extra["annotation_map"] = annotation_map
+                        step_card_chunks_sec.append(supp_chunk)
+                        step_card_ids_sec.append(supp_chunk.chunk_id)
+                        chunk_index += 1
 
             # Phase 4: 设置 prev/next 链表（section 内）
             for i, sc in enumerate(step_card_chunks_sec):

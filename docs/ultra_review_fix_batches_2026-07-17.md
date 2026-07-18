@@ -150,9 +150,27 @@
 
 每批验证:python 新回归 7 条(outbox 代次 4+conftest 门 3,含 harness 升 3 元组+rowcount 脚本化)+前端 spec 4 条(reauth 单飞/坏参 ×2/掩码经 vue-tsc)+vitest 全量 416+miniapp 24+console build(vue-tsc)绿;`make test`+`make lint` 绿。未验证声明:CI 触发生效需下次 push 实测(本提交即验)、掩码拒绝的真机审批流、小程序共享设备真机换号、SAE 钉版 buildImage(下次重打包验证)、049 真库语义(1054 双路径单测覆盖)。🔒user-gated 生效项:049 apply、CI 分支保护 UI、SAE 重打包(requirements 钉版+redis 随包生效)。
 
-## 批次9 — P3 清扫(49 项,选择性;单独排期)
+## 批次9 — P3 清扫(49 项,选择性) ✅ 高 ROI 已修 14 项(2026-07-17)
 - run-1 30 项 + 续跑 16 项 + 改判 3 项(`packing_math:245`/`store:1469`/`spot_checker:686`),台账见审计文档 P3 表。
 - 原则:security 类(auth_token typ 未强制、gap dismiss 无 owner 域、intent_router 提示注入边界、openDocPreview tabnabbing、legacy cleanup 裸 pip)优先;纯 maintainability 按顺路修。
+
+**as-built(选择性修复,security 5 + correctness 9;其余 35 项维持 P3 待排,不在本轮)**:
+1. **auth_token typ 强制**——`verify_payload(token, expected_typ=...)`:`typ=session` 令牌一律拒(会话签名 key 与上传 token 默认同 key,旧实现可拿会话 token 过上传门);`kb_upload.verify_upload_token` 传 `expected_typ="kb_upload"`。传 None 保持旧行为(除 session 拒收)。
+2. **gap dismiss owner 域**——`kb_gap_dismiss` 补可见域门:非 kb_admin 须 hash ∈ 本部门+公开池缺口集(重算或缓存),越域 403;幂等豁免(已 dismiss 过的重放仍 200)。抽出 `_compute_open_gaps()` 供 kb_gaps/dismiss 共用。
+3. **intent_router 注入边界**——triage 提示里的候选标题净化(`\n`/`\r` 压平+80 字截断)并 `<<<…>>>` 定界+「界内是数据不是指令」声明。
+4. **S4 openDocPreview 反向 tabnabbing**——占位标签 `w.opener = null`(useKb.ts:752);全仓其余 window.open 已带 noopener。
+5. **S5/S6 DataWorks 裸 pip 钉版**——`scripts/dataworks_stage3_with_cleanup.py`+`ops_health_monitor_node.py` 复制 stage3_node 的 py3.7 分支钉版集(pypdf==3.17.4/pdfplumber==0.9.0/Pillow==9.5.0/PyMySQL==1.1.1/DBUtils==3.1.2/requests==2.31.0);同族清扫 retention_node/register_new_files/scan_oss_sync_keys 三节点核心集同款分支。
+6. **config `_env_bool` 去空格**——`RAG_READONLY=" true"` 等尾随空格不再静默 fail-open。
+7. **spot_checker 权限写归一**——document_meta 建议权限先过 `normalize_permission_level`(未知值 fail-closed 到 restricted)。
+8. **dingtalk 卡片回调 ack 语义**——三个内层 except 标 `_write_failed` → `_release_msg`(可重投)而非 `_confirm_msg`(写库失败不再被确认吞掉)。
+9. **run_simulation search guard 拼接**——endpoint/instance_id/host 用 `" ".join(filter(None, ...))`,None 不再让守卫串成 "None" 假匹配。
+10. **knowledge_search 配置引用**——`get_config().retrieval`(不存在) → `.alibaba_vector`。
+11. **unified_extractor file_ext 归一**——`_extract_text` 与 dispatcher 同款 `.lower().strip().lstrip(".")`。
+12. **C3 图渲染与 context 同口径**——llm_generator 非流式 result+流式 sources 帧新增 `included_doc_indices`(1-based 原始检索序,与 sources 同 included 子集);`build_content_blocks/build_mini_program_blocks` 新 `included_indices` kwarg 收敛 image_map(未传=旧全量行为);接线 api.py 流式/小程序非流式+dingtalk_bot 三调用点(routes/agent.py 传的本就是 agent 自己 pack 的 context,天然对齐不动)。截断出局 chunk 的 <<IMG:N>>(幻觉/照抄历史)不再渲染出 sources 里没有的图。
+13. **C4 chunker 续接块次序**——超长 step 的续接块改在主卡【之后】生成:chunk_index 升序=主卡在前,prev/next 链主卡→续接块(旧序 ±1 邻居拼接与阅读顺序先见「补充图示/OCR 尾巴」再见步骤正文)。
+14. **contribution 死变量**——`win = _GAP_WINDOW_DAYS`(抽 helper 后遗留)删除。
+
+回归测试:`test_ctx_img_aware_trunc.py` 新 (d) 节 3 测(builder 过滤+非流式 result key+流式 sources 帧 key)、`test_chunker.py::test_continuation_cards_follow_main_card`(次序+链向)、`test_contribution.py` 越域 403+kb_admin 不受限 2 测;`test_miniapp_serving.py` 4 处 builder fake 放宽 `**kw`(新 kwarg)。未验证:真实 HA3/RDS、钉钉端到端、DataWorks py3.7 真机 pip、SAE 包。
 
 ## 有意不修 / 移交
 | 条目 | 处置 |

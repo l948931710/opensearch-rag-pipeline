@@ -357,6 +357,28 @@ class TestStepCardLengthLimit:
         for c in step_cards:
             assert c.token_count <= 2000, f"step_card 仍超 2000-token 校验上限: {c.token_count}"
 
+    def test_continuation_cards_follow_main_card(self):
+        """批次9 C4（ultra P3 chunker:1234）：主卡先于续接块。旧序 supp 在前，
+        chunk_index 与 prev/next 链倒挂——±1 邻居拼接和 prev/next 阅读顺序先见
+        「补充图示/OCR 尾巴」再见步骤正文。现钉死：主卡 → 续接块，链向自然。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=200, min_chunk_chars=10, overlap_chars=0, split_mode="step")
+        long_body = "操作人员必须严格按照规程执行每一个动作并如实记录数据。" * 20
+        blocks = [
+            ExtractedBlock(block_type="paragraph", text="步骤1. " + long_body),
+            ExtractedBlock(block_type="paragraph", text="步骤2. 收尾清场"),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_STEP_ORDER", 1)
+        step1 = [c for c in chunks
+                 if c.chunk_type == "step_card" and c.extra.get("step_no") == 1]
+        main = [c for c in step1 if not c.extra.get("is_step_continuation")]
+        conts = [c for c in step1 if c.extra.get("is_step_continuation")]
+        assert len(main) == 1 and conts
+        assert all(main[0].chunk_index < c.chunk_index for c in conts)
+        # prev/next 链：主卡 next → 第一续接块；第一续接块 prev → 主卡
+        assert main[0].extra["next_chunk_id"] == conts[0].chunk_id
+        assert conts[0].extra["prev_chunk_id"] == main[0].chunk_id
+
     def test_short_step_card_not_split(self):
         """短步骤不应拆分。"""
         chunker = DocumentChunker(

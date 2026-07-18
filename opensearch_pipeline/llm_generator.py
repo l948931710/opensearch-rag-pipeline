@@ -866,6 +866,10 @@ def generate_answer(
     answer = strip_doc_citations(data["choices"][0]["message"]["content"])
     usage = data.get("usage", {})
     sources = _extract_sources(_included_chunks)
+    # 批次9：进过 context 的文档号（1-based 原始检索序）——content_blocks 图渲染据此
+    # 拒绝「LLM 没见过的文档」的 <<IMG:N>>（与 sources 同一 included 口径）。
+    _included_doc_indices = [i + 1 for i, c in enumerate(context_chunks)
+                             if any(c is x for x in _included_chunks)]
 
     logger.info("Answer generated: model=%s, tokens=%s", llm.model, usage)
     return {
@@ -874,6 +878,7 @@ def generate_answer(
         "model": llm.model,
         "usage": usage,
         "gen_meta": gen_meta,
+        "included_doc_indices": _included_doc_indices,
     }
 
 
@@ -976,9 +981,13 @@ def generate_answer_stream(
         "enable_thinking": _think,
     }
 
-    # 先 yield sources 信息
+    # 先 yield sources 信息（批次9：随帧携带 included 文档号，流式收集端转交 blocks 构建）
     sources = _extract_sources(_included_chunks)
-    yield f"data: {json.dumps({'type': 'sources', 'sources': sources}, ensure_ascii=False)}\n\n"
+    _included_doc_indices = [i + 1 for i, c in enumerate(context_chunks)
+                             if any(c is x for x in _included_chunks)]
+    yield ("data: " + json.dumps({'type': 'sources', 'sources': sources,
+                                  'included_doc_indices': _included_doc_indices},
+                                 ensure_ascii=False) + "\n\n")
 
     # 流式请求
     with _http_post(

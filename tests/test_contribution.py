@@ -71,6 +71,8 @@ class _FakeCur:
             return c.funnel_row
         if "SELECT group_id" in s and "qa_gap_semantic_group" in s:   # 忽略联动：查组头
             return c.gap_group_head_row
+        if "qa_gap_dismissal" in s and "LIMIT 1" in s:   # 批次9 裁权：幂等豁免探针
+            return (1,) if c.gap_dismissal_rows else None
         return None
 
     def fetchall(self):
@@ -732,7 +734,9 @@ def test_gap_dismiss_then_gaps_excluded(monkeypatch):
     monkeypatch.delenv("RAG_QA_GAP_SEMANTIC", raising=False)
     from opensearch_pipeline import api, contribution as C
     h1 = C.question_hash("怎么开发票")
-    conn = _install_conn(monkeypatch, _FakeConn())
+    # 批次9 裁权：dept_admin 只能忽略可见集内的 hash——夹具给可见的 NO_RESULT 行
+    conn = _install_conn(monkeypatch, _FakeConn(
+        no_result_rows=[("怎么开发票", "n1", 2, "marketing")]))
     resp = api.kb_gap_dismiss(
         req=api.KbGapDismissRequest(question_hash=h1, question="怎么开发票", reason="闲聊噪音"),
         request=None, identity=_ident())
@@ -762,8 +766,10 @@ def test_gap_dismiss_semantic_expansion(monkeypatch):
     monkeypatch.setenv("RAG_QA_GAP_SEMANTIC", "true")
     from opensearch_pipeline import api
     h1, h2, h3 = "1" * 64, "2" * 64, "3" * 64
+    # 批次9 裁权：合成 hash 不可见——走「已处 active 忽略态」的幂等豁免路径过闸
     conn = _install_conn(monkeypatch, _FakeConn(
-        gap_group_head_row=(h1,), gap_group_member_rows=[(h1,), (h2,), (h3,)]))
+        gap_group_head_row=(h1,), gap_group_member_rows=[(h1,), (h2,), (h3,)],
+        gap_dismissal_rows=[(h1,)]))
     resp = api.kb_gap_dismiss(req=api.KbGapDismissRequest(question_hash=h1),
                               request=None, identity=_ident())
     assert resp.affected == 3
@@ -1417,3 +1423,32 @@ def test_gaps_coverage_in_placeholders_match_params(monkeypatch):
     assert len(cov) == 1
     sql, params = cov[0]
     assert sql.count("%s") == len(params) == 60
+
+
+def test_gap_dismiss_scope_denied_outside_visibility(monkeypatch):
+    """批次9（ultra P3 contribution:1422）：dept_admin 不能忽略可见范围外的 hash——
+    忽略台账是全局排除，此前任何 dept_admin 可离线算 hash 全局压掉别部门缺口。"""
+    import pytest
+    from fastapi import HTTPException
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch, managed="marketing")
+    monkeypatch.delenv("RAG_QA_GAP_SEMANTIC", raising=False)
+    from opensearch_pipeline import api
+    _install_conn(monkeypatch, _FakeConn())    # 可见集为空 + 无既往忽略
+    with pytest.raises(HTTPException) as ei:
+        api.kb_gap_dismiss(req=api.KbGapDismissRequest(question_hash="a" * 64),
+                           request=None, identity=_ident())
+    assert ei.value.status_code == 403
+
+
+def test_gap_dismiss_kb_admin_unrestricted(monkeypatch):
+    """kb_admin 不受可见范围限制（全局治理权保留）。"""
+    _skip_if_not_sim()
+    _kb_admin(monkeypatch)
+    monkeypatch.delenv("RAG_QA_GAP_SEMANTIC", raising=False)
+    from opensearch_pipeline import api
+    conn = _install_conn(monkeypatch, _FakeConn())
+    resp = api.kb_gap_dismiss(req=api.KbGapDismissRequest(question_hash="b" * 64),
+                              request=None, identity=_ident())
+    assert resp.ok is True
+    assert any("qa_gap_dismissal" in s and "INSERT" in s for s, _ in conn.calls)

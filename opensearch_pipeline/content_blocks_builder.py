@@ -373,6 +373,7 @@ def build_content_blocks(
     max_images: Optional[int] = None,
     url_expires: Optional[int] = None,
     max_caption_len: Optional[int] = 100,
+    included_indices: Optional[List[int]] = None,
 ) -> List[Dict[str, str]]:
     """
     将 LLM 回答拆分为 content_blocks（图文穿插格式）。
@@ -428,6 +429,17 @@ def build_content_blocks(
 
     # 1. 提取所有携带图片的 chunk（doc_index → [img dicts]）
     image_map = _extract_image_chunks(chunks)
+    # 批次9（ultra P3 content_blocks_builder:321）：image_map 收敛到【进过 context 的
+    # 文档号】（included_indices=llm_generator 截断后的 included 子集，编号=原始检索序）。
+    # 此前按全量检索列表建映射，而 context/sources 只含截断子集：LLM 幻觉/照抄历史的
+    # <<IMG:N>> 能渲染出它根本没见过的 chunk 的图，且该文档不在 sources——图文出处断裂。
+    # 未传（旧调用方/评测脚本）保持全量映射（零行为变化）。
+    if included_indices is not None:
+        _inc = set(included_indices)
+        _excluded = {k for k in image_map if k not in _inc}
+        if _excluded:
+            stats["n_excluded_not_in_context"] = len(_excluded)
+            image_map = {k: v for k, v in image_map.items() if k in _inc}
     stats["n_chunks_with_images"] = len(image_map)
     stats["n_images_available"] = sum(len(v) for v in image_map.values())
     if not image_map:
@@ -659,6 +671,7 @@ def build_mini_program_blocks(
     chunks: List[Dict[str, Any]],
     max_images: int = 3,
     url_expires: Optional[int] = None,
+    included_indices: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """为钉钉小程序生成图文 blocks（供 <text>/<image> 原生渲染）。
 
@@ -670,7 +683,8 @@ def build_mini_program_blocks(
     纯文字答案 / 未引用图片时返回 []（与 build_content_blocks 行为一致）。
     """
     raw = build_content_blocks(
-        answer, chunks, max_images=max_images, url_expires=url_expires, max_caption_len=None
+        answer, chunks, max_images=max_images, url_expires=url_expires, max_caption_len=None,
+        included_indices=included_indices,
     )
     out: List[Dict[str, Any]] = []
     for b in raw:
