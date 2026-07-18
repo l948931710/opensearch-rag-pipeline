@@ -27,9 +27,13 @@ def _git_fingerprint() -> Dict[str, Any]:
             return subprocess.run(["git", *args], cwd=root, capture_output=True,
                                   text=True, timeout=10).stdout.strip()
 
+        # dirty 判定排除 harness 自身输出目录：上一轮落盘的 reports/ 会把后续每轮
+        # 都误标 dirty（空目录 porcelain 不显示，首轮恰好逃过——实翻于 2026-07-18 C2）。
+        dirty_lines = [ln for ln in _git("status", "--porcelain").splitlines()
+                       if "stress_harness/reports/" not in ln]
         return {"git_sha": _git("rev-parse", "--short", "HEAD") or "unknown",
                 "git_branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "unknown",
-                "git_dirty": bool(_git("status", "--porcelain"))}
+                "git_dirty": bool(dirty_lines)}
     except Exception:   # noqa: BLE001
         return {"git_sha": "unknown", "git_branch": "unknown", "git_dirty": False}
 
