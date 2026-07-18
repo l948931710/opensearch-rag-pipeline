@@ -98,6 +98,7 @@ MANIFEST="
 041_qa_gap_dismissal.sql operation
 049_acl_outbox_generation.sql knowledge
 050_qa_rewritten_query.sql operation
+051_dingtalk_msg_dedup.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }

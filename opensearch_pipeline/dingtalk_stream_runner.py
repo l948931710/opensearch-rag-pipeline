@@ -22,9 +22,14 @@ clientId 的所有在线连接共同分担消息推送。本地连上后会把�
 "吃走"并用本地配置作答（HTTP 回调模式不存在此问题，钉钉只推注册的 URL）。
 本地调试请使用独立的测试应用 clientId/Secret。
 
-ack 语义：一律 ACK OK（即使处理异常）。非 OK ack 会触发钉钉重投，而问答
-处理重复执行 = 用户收到两份回答；处理内部本就 fail-open（落库失败不阻断
-回复），与 webhook 路径"绝不把 500 回给钉钉"的哲学一致。
+ack 语义（B7-P2-04，Sam 拍板 2026-07-18 二维分类=可重试性×发送确定性）：
+  · 同步窗瞬态失败（TransientMessageError，attempts 未封顶）→ 返回
+    STATUS_SYSTEM_EXCEPTION 请求钉钉重投——幂等由 dedup 四态机兜住
+    （processing/sent/retryable_failed/final_failed + delivery_unknown）；
+  · 永久错误/重试耗尽/发送后内部错误 → ACK OK（终态已收口，重投=空转或重复回答）；
+  · 其余未知异常保守 ACK OK（旧哲学兜底：宁可静默有告警，不重复回答）。
+答案计算在后台线程（ACK 早已返回）：发送层失败的主重试引擎=进程内自重试；
+钉钉重投只在 ack 丢包时机会性出现，届时按 retryable_failed 复用已算答案重发。
 
 环境变量：
   DINGTALK_STREAM_MODE     — true/1/yes 启用（默认关闭）
@@ -51,6 +56,14 @@ _client = None   # dingtalk_stream.DingTalkStreamClient（start_stream_client �
 def stream_mode_enabled() -> bool:
     """DINGTALK_STREAM_MODE 开关（默认关闭）。"""
     return os.environ.get("DINGTALK_STREAM_MODE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _retry_ack_status(sdk_mod):
+    """B7-P2-04：请求钉钉重投的 ack 状态。SDK 无专用 LATER——用 STATUS_SYSTEM_EXCEPTION
+    （服务端瞬态语义，非 OK 即触发重投）；SDK 形态变化取不到时保守退回 STATUS_OK
+    （宁可放弃这次重投也不 AttributeError 打断事件循环）。"""
+    return getattr(sdk_mod.AckMessage, "STATUS_SYSTEM_EXCEPTION",
+                   sdk_mod.AckMessage.STATUS_OK)
 
 
 def is_stream_active() -> bool:
@@ -111,6 +124,7 @@ def start_stream_client() -> bool:
 
     # 延迟导入：避免 runner ↔ dingtalk_card 的环（card 按 is_stream_active 选 callbackType）
     from opensearch_pipeline.dingtalk_bot import (
+        TransientMessageError,
         _process_card_callback_body,
         _process_webhook_body,
     )
@@ -127,8 +141,13 @@ def start_stream_client() -> bool:
                 await asyncio.get_event_loop().run_in_executor(
                     None, _process_webhook_body, callback.data
                 )
+            except TransientMessageError as e:
+                # B7-P2-04：同步窗瞬态（attempts 未封顶）→ 非 OK ack 请求钉钉重投；
+                # 幂等由 dedup 四态机兜住（重投按 retryable_failed 路由，不重复回答）
+                logger.warning("Stream 消息瞬态失败——请求钉钉重投: %s", e)
+                return _retry_ack_status(dingtalk_stream), "RETRY"
             except Exception as e:
-                # fail-open：处理失败也 ACK OK，杜绝重投导致的重复回答
+                # 永久/耗尽/未知兜底：终态已在 dedup 收口，ACK OK 不空转重投
                 logger.error("Stream 机器人消息处理异常: %s", e, exc_info=True)
             return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 

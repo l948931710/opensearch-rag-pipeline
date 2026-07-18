@@ -163,36 +163,268 @@ def _is_dingtalk_webhook(url: str) -> bool:
 _seen_msg_ids: Dict[str, float] = {}
 _seen_msg_lock = threading.Lock()
 _SEEN_MSG_MAX = 20000
+# C4 两阶段去重（redis 后端）：claim「领用」态最长存活；短于此崩溃即由钉钉重投恢复，
+# 成功后 _confirm_msg 升级为 done+完整去重窗（_TIMESTAMP_TOLERANCE）。
+_MSG_DEDUP_CLAIM_TTL_S = int(os.environ.get("RAG_MSG_DEDUP_CLAIM_TTL", "60"))
+
+
+# ═══════════════════════════════════════════════════════════════
+# B7-P2-04（Sam 拍板 2026-07-18）：消息 ACK/发送结果状态机
+# 二维分类 = 错误可重试性 × 发送结果确定性：
+#   · 临时故障/明确发送失败 → 可重试（ACK 层请求钉钉重投；发送层进程内自重试）
+#   · 永久错误（解析/缺关键字段/签名权限/4xx）→ ACK OK + final_failed 终态收口
+#   · 确认发送成功后的内部错误 → ACK OK（答案已达，重投=重复回答）
+#   · 结果不确定（发送 ReadTimeout）→ DELIVERY_UNKNOWN：卡片路径有 outTrackId 幂等键
+#     可重发；sessionWebhook 文本无幂等键 → 不盲重发，标记+告警/对账
+# dedup 状态：processing / sent / retryable_failed / final_failed / delivery_unknown。
+# 架构注记：答案计算+发送在后台线程（ACK 早已返回）——发送层失败的主重试引擎是
+# 进程内自重试；钉钉重投只在 ack 丢包时机会性到达，届时 retryable_failed+复用答案
+# （fetch_answer_by_message_id）恰好接住。
+# ═══════════════════════════════════════════════════════════════
+
+
+class PermanentMessageError(Exception):
+    """消息级永久错误——重投必然同败，ACK OK 终态收口（final_failed），不空转重投。"""
+
+
+class TransientMessageError(Exception):
+    """同步窗瞬态失败——ACK 层返回 STATUS_SYSTEM_EXCEPTION 请求钉钉重投（attempts 封顶）。"""
+
+
+def _msg_max_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("RAG_MSG_MAX_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
+
+
+def _meta_decode(raw) -> dict:
+    """dedup 值 → 状态 meta。兼容三代：JSON dict（现行）/ 旧字符串 processing|done /
+    memory 旧裸 float（无 meta）。解不出 → 按在途 processing。"""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("{"):
+            try:
+                d = json.loads(s)
+                if isinstance(d, dict):
+                    return d
+            except Exception:   # noqa: BLE001
+                pass
+        if s == "done":
+            return {"st": "sent"}
+        return {"st": "processing"}
+    return {"st": "processing"}
+
+
+def _msg_claim(msg_id: str):
+    """领用或返回既有状态：(claimed, prior_meta)。fail-open → (True, None)。
+    两层：主层=配置后端（memory/redis，既有语义）；第二层=RDS msgId 唯一键兜底
+    （Sam 拍板：Redis fail-open 窗口的重复回答残余风险由它压缩；双层都 fail-open，
+    仅同时故障才可能漏重）。"""
+    if not msg_id or msg_id == "?":
+        return True, None
+    prior = None
+    claimed = True
+    if _msg_dedup_backend() == "redis":
+        try:
+            from opensearch_pipeline import redis_client
+            cli = redis_client.get_client()
+            ok = cli.set(_redis_msg_key(msg_id),
+                         json.dumps({"st": "processing", "att": 1}),
+                         nx=True, px=_MSG_DEDUP_CLAIM_TTL_S * 1000)
+            if not ok:
+                claimed = False
+                try:
+                    prior = _meta_decode(cli.get(_redis_msg_key(msg_id)))
+                except Exception:   # noqa: BLE001
+                    prior = {"st": "processing"}
+        except Exception as e:   # noqa: BLE001
+            logger.warning("Redis 去重领用失败，fail-open 放行: %s", e)
+    else:
+        now = time.time()
+        with _seen_msg_lock:
+            ent = _seen_msg_ids.get(msg_id)
+            exp = ent[0] if isinstance(ent, tuple) else ent
+            if exp is not None and exp > now:
+                claimed = False
+                prior = _meta_decode(ent[1] if isinstance(ent, tuple) else None)
+            else:
+                if len(_seen_msg_ids) >= _SEEN_MSG_MAX:
+                    for k in [k for k, v in _seen_msg_ids.items()
+                              if (v[0] if isinstance(v, tuple) else v) <= now]:
+                        _seen_msg_ids.pop(k, None)
+                    if len(_seen_msg_ids) >= _SEEN_MSG_MAX:
+                        _seen_msg_ids.clear()
+                _seen_msg_ids[msg_id] = (now + _TIMESTAMP_TOLERANCE,
+                                         {"st": "processing", "att": 1})
+    # 第二层：RDS 兜底（主层 claim 成功也要过——主层 fail-open/被清空时由它接住）
+    rds_claimed, rds_meta = _rds_dedup_claim(msg_id)
+    if claimed and not rds_claimed:
+        claimed, prior = False, (rds_meta or prior)
+    elif not claimed and prior is None:
+        prior = rds_meta
+    return claimed, prior
+
+
+def _msg_mark(msg_id: str, st: str, *, ttl: Optional[int] = None,
+              att: Optional[int] = None, mid: Optional[str] = None) -> None:
+    """写状态（merge 语义：att/mid 未给则保留旧值）。全程 fail-open。"""
+    if not msg_id or msg_id == "?":
+        return
+    ttl = int(ttl or _TIMESTAMP_TOLERANCE)
+    if _msg_dedup_backend() == "redis":
+        try:
+            from opensearch_pipeline import redis_client
+            cli = redis_client.get_client()
+            old = _meta_decode(cli.get(_redis_msg_key(msg_id)))
+            meta = {"st": st,
+                    "att": int(att if att is not None else old.get("att") or 1)}
+            _mid = mid if mid is not None else old.get("mid")
+            if _mid:
+                meta["mid"] = _mid
+            cli.set(_redis_msg_key(msg_id), json.dumps(meta), ex=ttl)
+        except Exception as e:   # noqa: BLE001
+            logger.warning("Redis 去重状态写入失败（忽略）: %s", e)
+    else:
+        with _seen_msg_lock:
+            ent = _seen_msg_ids.get(msg_id)
+            old = _meta_decode(ent[1] if isinstance(ent, tuple) else None)
+            meta = {"st": st,
+                    "att": int(att if att is not None else old.get("att") or 1)}
+            _mid = mid if mid is not None else old.get("mid")
+            if _mid:
+                meta["mid"] = _mid
+            _seen_msg_ids[msg_id] = (time.time() + ttl, meta)
+    _rds_dedup_mark(msg_id, st, att=att, mid=mid)
+
+
+# ── RDS msgId 唯一键兜底（B7-P2-04；schema/051，operation 库）───────────────────
+_RDS_DEDUP_MISSING_UNTIL = 0.0   # 051 未 apply 的 TTL 负缓存（同 qa_logger 050 模式）
+
+
+def _rds_dedup_on() -> bool:
+    """kill switch RAG_MSG_DEDUP_RDS_FALLBACK（默认 on）；simulate 恒 off。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        if get_config().simulate_db:
+            return False
+    except Exception:   # noqa: BLE001
+        return False
+    return os.environ.get("RAG_MSG_DEDUP_RDS_FALLBACK",
+                          "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _rds_dedup_claim(msg_id: str):
+    """(claimed, meta)。行较新（去重窗内）即视为已领用；陈旧行重置复用。
+    表缺失（1146）负缓存 1h；任何失败 fail-open (True, None)。"""
+    global _RDS_DEDUP_MISSING_UNTIL
+    if not _rds_dedup_on() or time.time() < _RDS_DEDUP_MISSING_UNTIL:
+        return True, None
+    try:
+        from opensearch_pipeline.config import get_config
+        from opensearch_pipeline.db import _get_db_conn
+        db = get_config().rds.operation_database
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT state, attempts, message_id, "
+                    f"(updated_at > NOW(3) - INTERVAL %s SECOND) AS fresh "
+                    f"FROM {db}.dingtalk_msg_dedup WHERE msg_id=%s",
+                    (_TIMESTAMP_TOLERANCE + 60, msg_id))
+                row = cur.fetchone()
+                if row is not None:
+                    vals = list(row.values()) if isinstance(row, dict) else list(row)
+                    if int(vals[3] or 0):
+                        return False, {"st": str(vals[0] or "processing"),
+                                       "att": int(vals[1] or 1),
+                                       "mid": vals[2] or None}
+                    cur.execute(
+                        f"UPDATE {db}.dingtalk_msg_dedup SET state='processing', "
+                        f"attempts=1, message_id=NULL WHERE msg_id=%s", (msg_id,))
+                else:
+                    cur.execute(
+                        f"INSERT INTO {db}.dingtalk_msg_dedup (msg_id, state, attempts) "
+                        f"VALUES (%s, 'processing', 1) "
+                        f"ON DUPLICATE KEY UPDATE msg_id=msg_id", (msg_id,))
+            conn.commit()
+            return True, None
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001
+        if "1146" in str(e) or "doesn't exist" in str(e):
+            _RDS_DEDUP_MISSING_UNTIL = time.time() + 3600
+            logger.warning("dingtalk_msg_dedup 表缺失（schema/051 未 apply）——RDS 兜底"
+                           "降级 1h，仅主层去重: %s", e)
+        else:
+            logger.warning("RDS 去重兜底失败（fail-open）: %s", e)
+        return True, None
+
+
+def _rds_dedup_mark(msg_id: str, st: str, *, att=None, mid=None) -> None:
+    if not _rds_dedup_on() or time.time() < _RDS_DEDUP_MISSING_UNTIL:
+        return
+    try:
+        from opensearch_pipeline.config import get_config
+        from opensearch_pipeline.db import _get_db_conn
+        db = get_config().rds.operation_database
+        conn = _get_db_conn()
+        try:
+            sets = ["state=%s"]
+            args = [st]
+            if att is not None:
+                sets.append("attempts=%s")
+                args.append(int(att))
+            if mid:
+                sets.append("message_id=%s")
+                args.append(mid)
+            args.append(msg_id)
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE {db}.dingtalk_msg_dedup SET {', '.join(sets)} "
+                            f"WHERE msg_id=%s", args)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001
+        logger.debug("RDS 去重状态镜像失败（忽略）: %s", e)
+
+
+def _msg_dedup_backend() -> str:
+    return os.environ.get("RAG_MSG_DEDUP_BACKEND", "memory").strip().lower()
+
+
+def _redis_msg_key(msg_id: str) -> str:
+    from opensearch_pipeline import redis_client
+    return redis_client.key("dt", "msg", msg_id)
 
 
 def _is_duplicate_msg(msg_id: str) -> bool:
-    """msgId 在防重放窗口内是否已处理过。空 / 缺失 msgId 无法去重 → 一律按新消息放行。
+    """msgId 在防重放窗口内是否已处理过（= claim 领用）。空 / 缺失 → 一律按新消息放行。
 
-    首次见到即登记（now+TTL 过期）并返回 False；窗口内二次见到返回 True。TTL 对齐签名时间窗
-    （_TIMESTAMP_TOLERANCE）。粗粒度防胀：条目超 _SEEN_MSG_MAX 先清过期，仍超则整表清空。"""
-    if not msg_id or msg_id == "?":
-        return False
-    now = time.time()
-    ttl = _TIMESTAMP_TOLERANCE
-    with _seen_msg_lock:
-        exp = _seen_msg_ids.get(msg_id)
-        if exp is not None and exp > now:
-            return True
-        if len(_seen_msg_ids) >= _SEEN_MSG_MAX:
-            for k in [k for k, v in _seen_msg_ids.items() if v <= now]:
-                _seen_msg_ids.pop(k, None)
-            if len(_seen_msg_ids) >= _SEEN_MSG_MAX:
-                _seen_msg_ids.clear()
-        _seen_msg_ids[msg_id] = now + ttl
-        return False
+    memory 后端（默认，行为不变）：首见即登记（now+TTL），窗口内二次见到 True。TTL 对齐
+      签名时间窗（_TIMESTAMP_TOLERANCE）；粗粒度防胀：超 _SEEN_MSG_MAX 先清过期，仍超则清空。
+    redis 后端：SET NX「领用」（短 claim TTL）→ 领用成功=新消息(False)，键已存在
+      (processing/done)=重复(True)。处理成功由 _confirm_msg 升级 done+完整窗，失败由
+      _release_msg 释放（评审 C4：先占位后崩溃不永久吞消息）。
+    redis 故障 fail-open（返回 False 放行）：去重是辅助防护，宁可重复处理不丢/不阻断
+      （评审 C4「丢消息 > 重复处理」）。
+    """
+    claimed, _prior = _msg_claim(msg_id)   # B7-P2-04：委托状态机（语义不变，meta 增强）
+    return not claimed
 
 
 # cherry-pick 适配（e4de9b4→main）：分支版带 Redis 去重后端（_msg_dedup_backend/redis_client，
 # 分支专属基建），main 仅有上面的进程内 _seen_msg_ids 表——此处按 memory 后端语义落地同一对
 # 接缝函数；ontology-p0 合并时以分支版（双后端）收敛。
 def _confirm_msg(msg_id: str) -> None:
-    """处理成功确认（评审 C4 接缝）。memory 后端首见登记即占满去重窗，成功无需升级——空操作。"""
-    return
+    """处理成功 → 升级 sent + 完整去重窗（评审 C4；B7-P2-04 后两后端同语义并镜像 RDS）。"""
+    if not msg_id or msg_id == "?":
+        return
+    _msg_mark(msg_id, "sent", ttl=_TIMESTAMP_TOLERANCE)
 
 
 def _release_msg(msg_id: str) -> None:
@@ -202,8 +434,33 @@ def _release_msg(msg_id: str) -> None:
     首见登记永久吞掉。现失败即释放。"""
     if not msg_id or msg_id == "?":
         return
-    with _seen_msg_lock:
-        _seen_msg_ids.pop(msg_id, None)
+    if _msg_dedup_backend() != "redis":
+        with _seen_msg_lock:
+            _seen_msg_ids.pop(msg_id, None)
+    else:
+        try:
+            from opensearch_pipeline import redis_client
+            redis_client.get_client().delete(_redis_msg_key(msg_id))
+        except Exception as e:   # noqa: BLE001
+            logger.warning("Redis 去重释放失败（忽略）: %s", e)
+    # B7-P2-04：RDS 兜底行同步释放——否则主层释放后重投仍被新鲜兜底行按重复吞掉
+    if _rds_dedup_on() and time.time() >= _RDS_DEDUP_MISSING_UNTIL:
+        try:
+            from opensearch_pipeline.config import get_config
+            from opensearch_pipeline.db import _get_db_conn
+            db = get_config().rds.operation_database
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"DELETE FROM {db}.dingtalk_msg_dedup WHERE msg_id=%s",
+                                (msg_id,))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:   # noqa: BLE001
+            logger.debug("RDS 去重兜底释放失败（忽略）: %s", e)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 签名验证
 # ═══════════════════════════════════════════════════════════════
@@ -388,28 +645,80 @@ def _get_conversation_type(body: Dict[str, Any]) -> str:
 # 回复发送
 # ═══════════════════════════════════════════════════════════════
 
-def _send_reply(session_webhook: str, markdown_title: str, markdown_text: str):
-    """通过 sessionWebhook 发送 Markdown 格式回复。"""
+def _classify_send_exc(e: Exception) -> str:
+    """B7-P2-04 传输层分界：ReadTimeout=请求已出门未回音（结果不确定，文本路径无幂等
+    键不可盲重发）；ConnectionError 族（含 ConnectTimeout）=请求没出门（明确未送达，
+    可安全重试）；其余按不确定保守处理。"""
+    try:
+        import requests as _rq
+        if isinstance(e, _rq.exceptions.ReadTimeout):
+            return "unknown"
+        if isinstance(e, _rq.exceptions.ConnectionError):
+            return "undelivered"
+    except Exception:   # noqa: BLE001
+        pass
+    return "unknown"
+
+
+def _send_reply(session_webhook: str, markdown_title: str, markdown_text: str,
+                *, msg_id: str = "") -> bool:
+    """通过 sessionWebhook 发送 Markdown 回复（B7-P2-04 分类发送）：
+    明确未送达 → 进程内自重试（钉钉重投帮不上：ACK 早已返回）；重试尽 →
+    retryable_failed（ack 丢包重投可复用答案）；4xx=永久 → final_failed；
+    ReadTimeout=结果不确定 → delivery_unknown+告警对账（文本无幂等键不盲重发）；
+    2xx → sent。msg_id 空=非终答场景（提示语等），零状态副作用。"""
     payload = {
         "msgtype": "markdown",
-        "markdown": {
-            "title": markdown_title,
-            "text": markdown_text,
-        },
+        "markdown": {"title": markdown_title, "text": markdown_text},
     }
-    try:
-        resp = http_requests.post(
-            session_webhook,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            logger.error("钉钉回复失败: status=%s, body=%s", resp.status_code, resp.text)
-        else:
+    for attempt in (1, 2, 3):
+        try:
+            resp = http_requests.post(
+                session_webhook, json=payload,
+                headers={"Content-Type": "application/json"}, timeout=10)
+        except Exception as e:   # noqa: BLE001
+            kind = _classify_send_exc(e)
+            if kind == "undelivered":
+                if attempt < 3:
+                    time.sleep(0.5 * attempt)
+                    continue
+                logger.error("钉钉回复明确未送达且重试尽: %s", e)
+                if msg_id:
+                    _msg_mark(msg_id, "retryable_failed", ttl=_MSG_DEDUP_CLAIM_TTL_S)
+                return False
+            logger.error("钉钉回复结果不确定(DELIVERY_UNKNOWN): %s", e)
+            if msg_id:
+                _msg_mark(msg_id, "delivery_unknown", ttl=_TIMESTAMP_TOLERANCE)
+                try:
+                    from opensearch_pipeline.alerting import send_ops_alert
+                    send_ops_alert("钉钉回复结果不确定",
+                                   f"msgId={msg_id} 发送超时无回音——已标 DELIVERY_UNKNOWN，"
+                                   "不盲重发（防重复回答），需人工对账",
+                                   severity="warning", dedup_key=f"delivery-unknown:{msg_id}")
+                except Exception:   # noqa: BLE001
+                    pass
+            return False
+        if resp.status_code == 200:
             logger.info("钉钉回复成功")
-    except Exception as e:
-        logger.error("钉钉回复异常: %s", e, exc_info=True)
+            if msg_id:
+                _msg_mark(msg_id, "sent", ttl=_TIMESTAMP_TOLERANCE)
+            return True
+        if 400 <= resp.status_code < 500:
+            # 签名/权限/格式类=永久：重发必同败，终态收口
+            logger.error("钉钉回复永久失败(4xx): status=%s, body=%s",
+                         resp.status_code, resp.text[:200])
+            if msg_id:
+                _msg_mark(msg_id, "final_failed", ttl=_TIMESTAMP_TOLERANCE)
+            return False
+        # 5xx=明确失败，可重试
+        logger.warning("钉钉回复 5xx(attempt %d): status=%s", attempt, resp.status_code)
+        if attempt < 3:
+            time.sleep(0.5 * attempt)
+            continue
+        if msg_id:
+            _msg_mark(msg_id, "retryable_failed", ttl=_MSG_DEDUP_CLAIM_TTL_S)
+        return False
+    return False
 
 
 def _send_text_reply(session_webhook: str, text: str):
@@ -814,6 +1123,7 @@ def _process_rag_query(
     sender_staff_id: str = "",
     conversation_type: str = "1",
     request_id: str = "",
+    dingtalk_msg_id: str = "",
 ):
     """
     后台线程：执行 RAG 检索 + LLM 生成，通过 sessionWebhook 回复。
@@ -830,6 +1140,11 @@ def _process_rag_query(
         ensure_request_id()
     t0 = time.time()
     message_id = generate_message_id()
+    # B7-P2-04：把内部 message_id 锚进 dedup meta——ack 丢包重投到达时可按它读回
+    # 已算答案直接重发（不重算不重计费）。
+    if dingtalk_msg_id:
+        _msg_mark(dingtalk_msg_id, "processing", mid=message_id,
+                  ttl=_TIMESTAMP_TOLERANCE)
 
     # 构建 session key：群聊中按用户隔离，单聊中按会话隔离。
     # owner 绑定（P3-6）：staffId 来自已验签钉钉回调 = 权威身份，trusted 使抢注
@@ -1086,8 +1401,12 @@ def _process_rag_query(
                 model=result["model"],
                 images=md_images,
             )
-            _send_reply(session_webhook, f"回答：{question[:20]}", md_text)
+            _send_reply(session_webhook, f"回答：{question[:20]}", md_text,
+                        msg_id=dingtalk_msg_id)
             print("[DEBUG] Markdown 回复已发送", flush=True)
+        elif dingtalk_msg_id:
+            # B7-P2-04：卡片路径投放成功=答案已达（outTrackId 天然幂等键），标 sent
+            _msg_mark(dingtalk_msg_id, "sent", ttl=_TIMESTAMP_TOLERANCE)
 
     except Exception as e:
         trace_id = ensure_request_id()   # P3-9：与入口/检索/生成日志同一 trace（不再另铸本地 id）
@@ -1186,12 +1505,81 @@ def _process_webhook_body(body: dict):
         body.get("msgId", "?"),
     )
 
-    # 事件级幂等（P2-09）：同一 msgId 在签名时间窗内二次投递（重放/网络重试）→ 直接忽略，
-    # 不再触发一次 RAG/LLM 调用与重复回复。放在问题提取/「补充原因」回收/ack 之前。
-    if _is_duplicate_msg(str(body.get("msgId") or "")):
-        logger.info("钉钉消息重复投递已忽略（幂等）: msgId=%s", body.get("msgId", "?"))
-        return {"msgtype": "duplicate"}
+    # 事件级幂等（P2-09 + 评审 C4 两阶段 → B7-P2-04 四态机）：claim 领用 → 按二维分类
+    # （可重试性×发送确定性）走异常阶梯；重投按既有状态路由（复用答案/重算/吞掉/对账）。
+    msg_id = str(body.get("msgId") or "")
+    claimed, prior = _msg_claim(msg_id)
+    if not claimed:
+        return _handle_redelivery(msg_id, prior or {}, body)
+    return _run_claimed(msg_id, body, att=int((prior or {}).get("att") or 1))
 
+
+def _run_claimed(msg_id: str, body: dict, att: int):
+    """B7-P2-04 异常阶梯：永久 → final_failed 终态收口（ACK OK，不空转重投）；
+    瞬态 → attempts 封顶内标 retryable_failed 并上抛 TransientMessageError（Stream ACK
+    层据此请求钉钉重投）、封顶即 final_failed+告警；成功 → processing 完整窗
+    （答案在后台线程，sent 由发送层标）。"""
+    try:
+        result = _process_claimed_body(body)
+    except PermanentMessageError as pe:
+        _msg_mark(msg_id, "final_failed", ttl=_TIMESTAMP_TOLERANCE)
+        logger.error("消息永久错误，终态收口(final_failed): msgId=%s err=%s", msg_id, pe)
+        return {"msgtype": "final_failed"}
+    except HTTPException:
+        # 结构性 4xx（缺 sessionWebhook/非钉钉域）=永久：重投必同败（B7-P2-04）
+        _msg_mark(msg_id, "final_failed", ttl=_TIMESTAMP_TOLERANCE)
+        raise
+    except Exception:
+        if att >= _msg_max_attempts():
+            _msg_mark(msg_id, "final_failed", att=att, ttl=_TIMESTAMP_TOLERANCE)
+            logger.error("消息瞬态失败达重试上限(%d)，终态收口: msgId=%s",
+                         att, msg_id, exc_info=True)
+            try:
+                from opensearch_pipeline.alerting import send_ops_alert
+                send_ops_alert("钉钉消息重试耗尽",
+                               f"msgId={msg_id} attempts={att}——已终态收口，需人工对账",
+                               severity="warning", dedup_key=f"msg-exhausted:{msg_id}")
+            except Exception:   # noqa: BLE001 — 告警失败不影响收口
+                pass
+            return {"msgtype": "retries_exhausted"}
+        _msg_mark(msg_id, "retryable_failed", att=att + 1, ttl=_MSG_DEDUP_CLAIM_TTL_S)
+        raise TransientMessageError(
+            f"msgId={msg_id} attempt={att} 同步窗瞬态失败——请求钉钉重投")
+    _msg_mark(msg_id, "processing", ttl=_TIMESTAMP_TOLERANCE)   # 在途：sent 由发送层标
+    return result
+
+
+def _handle_redelivery(msg_id: str, prior: dict, body: dict):
+    """重投按状态路由（B7-P2-04）：retryable_failed → 优先复用已算答案重发（同一
+    msgId/message_id 锚定，不重算不重计费）、无则重算（att 传承）；delivery_unknown →
+    不自动重发（防重复回答）留对账；processing/sent/final_failed → 吞掉（现状语义）。"""
+    st = str(prior.get("st") or "processing")
+    if st == "retryable_failed":
+        mid = prior.get("mid")
+        if mid:
+            try:
+                from opensearch_pipeline.qa_logger import fetch_answer_by_message_id
+                row = fetch_answer_by_message_id(mid)
+            except Exception:   # noqa: BLE001 — 读回失败退化为重算
+                row = None
+            ans = (row or {}).get("answer_text")
+            sw = str(body.get("sessionWebhook") or "")
+            if ans and _is_dingtalk_webhook(sw):
+                logger.info("重投复用已算答案重发: msgId=%s mid=%s", msg_id, mid)
+                _send_reply(sw, "回答（重发）", ans, msg_id=msg_id)
+                return {"msgtype": "resend"}
+        logger.info("重投重算（无可复用答案）: msgId=%s att=%s", msg_id, prior.get("att"))
+        return _run_claimed(msg_id, body, att=int(prior.get("att") or 1))
+    if st == "delivery_unknown":
+        logger.warning("DELIVERY_UNKNOWN 消息重投到达——不自动重发（防重复回答），"
+                       "留人工对账: msgId=%s", msg_id)
+        return {"msgtype": "delivery_unknown"}
+    logger.info("钉钉消息重复投递已忽略（幂等）: msgId=%s state=%s", msg_id, st)
+    return {"msgtype": "duplicate"}
+
+
+def _process_claimed_body(body: dict):
+    """去重领用通过后的实际处理（问题提取 /「补充原因」回收 / 新会话 / ack / 起 RAG 线程）。"""
     # 3. 提取问题文本
     question = _extract_question(body)
     session_webhook = body.get("sessionWebhook", "")
@@ -1251,7 +1639,8 @@ def _process_webhook_body(body: dict):
     thread = threading.Thread(
         target=_process_rag_query,
         args=(question, session_webhook, sender_nick, conversation_id, sender_staff_id, conv_type,
-              get_request_id()),   # P3-9：显式跨线程传 rid（Thread 不复制 ContextVar）
+              get_request_id(),                    # P3-9：显式跨线程传 rid（Thread 不复制 ContextVar）
+              str(body.get("msgId") or "")),       # B7-P2-04：msgId 入后台，发送层标 sent/unknown
         daemon=True,
     )
     thread.start()
