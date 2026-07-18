@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { RotateCw, FileText, Sprout } from 'lucide-vue-next'
+import { RotateCw, FileText, Sprout } from '@lucide/vue'
 import { useAsk, type ChatMessage } from '@/composables/useAsk'
 import AnswerBlocks from './AnswerBlocks.vue'
 import SourceList from './SourceList.vue'

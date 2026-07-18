@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, RotateCw } from 'lucide-vue-next'
+import { AlertTriangle, RotateCw } from '@lucide/vue'
 
 // 分区加载失败提示条：仅在 message 非空（5xx/网络，非 404 未上线）时显示，带「重试」回调。
 defineProps<{ message?: string }>()

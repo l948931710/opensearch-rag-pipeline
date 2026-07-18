@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { ArrowDown, Sprout } from 'lucide-vue-next'
+import { ArrowDown, Sprout } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useAsk } from '@/composables/useAsk'
 import Thread from '@/components/qa/Thread.vue'

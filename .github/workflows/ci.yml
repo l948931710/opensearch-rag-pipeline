@@ -40,8 +40,8 @@ jobs:
       RAG_SIMULATE_OSS: "true"
       RAG_SIMULATE_OPENSEARCH: "true"
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: ${{ matrix.python-version }}
           # perf#21：缓存 pip 下载目录（PyMuPDF/opensearch-py/oss2/dashscope/ha3-sdk 等重依赖树），
@@ -70,13 +70,13 @@ jobs:
           ${{ matrix.python-version == '3.11' && '--cov=opensearch_pipeline --cov-report=xml --cov-report=term --cov-fail-under=75' || '' }}
       - name: Upload junit (failure only — 排障用，红了才值得留)
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: pytest-junit-${{ matrix.python-version }}
           path: pytest-junit.xml
       - name: Upload coverage report (3.11)
         if: matrix.python-version == '3.11'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: coverage-xml
           path: coverage.xml
@@ -120,8 +120,8 @@ jobs:
       RAG_RDS_DATABASE: fuling_knowledge
       RAG_RDS_OPERATION_DATABASE: fuling_operation
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: "3.10"
           cache: pip
@@ -155,16 +155,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
         with:
           fetch-depth: 0   # 全历史：gitleaks 既扫工作树也扫历史提交
       # 【阻塞】secret 扫描：默认规则 + .gitleaks.toml 白名单（测试合成假 key + 生产指纹非密钥）。
       # 价值主要在【防未来误提交】真凭证——当前 .mcp.json/.env.* 均 gitignored，工作树本就干净。
       - name: Secret scan (gitleaks)
-        uses: gitleaks/gitleaks-action@v3
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e  # v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           # 批次8 热修②：security 作业须与 requirements-prod.lock 的编译目标一致（uv compile
           # --python-version 3.11，生产 serving 同版）——3.10 下 lock 内 ≥3.11-only 轮子
@@ -195,7 +195,7 @@ jobs:
       # ② SBOM（SPDX，syft）：覆盖 Python lock + console-app/package-lock.json，
       #    产物上传 artifact（供应链事件时按 SBOM 反查暴露面，此前全仓无 SBOM）。
       - name: Generate SBOM (syft — SPDX JSON)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0
         with:
           path: .
           format: spdx-json
@@ -227,8 +227,8 @@ jobs:
     timeout-minutes: 10
     continue-on-error: true   # E2 翻硬门时删除本行
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: "3.11"
           cache: pip

@@ -287,14 +287,16 @@ _VLM_CACHE_VALID_STATUSES = {"DISCARD_DECORATIVE", "ROUTE_TO_TEXT", "ROUTE_TO_VE
 
 
 def _vlm_cache_ns(is_public):
-    """缓存命名空间：pub/sec [+ 可选模型/prompt 版本标签]。
+    """缓存命名空间：pub/sec [+ 版本标签]。
 
-    RAG_VLM_CACHE_VERSION 默认空 → key 与历史完全一致（零行为变化、不强制重打缓存）。升级 VLM
-    模型或改 funnel prompt 后，把它设成一个新值（如新模型名）即可让旧缓存整体【干净失效】、按新
-    模型重打，而无需手动清 scratch/OSS 缓存——修复"模型升级后旧标注被永久复用"的陈旧问题。
+    升级 VLM 模型或改 funnel prompt 后，把 RAG_VLM_CACHE_VERSION 设成新值即可让旧缓存
+    整体【干净失效】、按新模型重打，而无需手动清 scratch/OSS 缓存。
+    B4（生产级外审 2026-07-17 P2-03）：默认版本 "2"——配合 file_hash MD5→SHA-256 切换
+    让存量条目整体失效（构造 MD5 碰撞继承他图 CLEAN 结论的通道关闭）。代价=存量图下次
+    被触碰时重过 VLM 审计（增量、按再摄取面，非一次性全量）。设 "" 可还原历史裸键形。
     """
     ns = "pub" if is_public else "sec"
-    ver = os.environ.get("RAG_VLM_CACHE_VERSION", "").strip()
+    ver = os.environ.get("RAG_VLM_CACHE_VERSION", "2").strip()
     return f"{ns}:{ver}" if ver else ns
 
 
@@ -1811,17 +1813,20 @@ class UnifiedExtractor:
         if not candidates:
             return [], [], 0
 
-        # ── Phase 1.5: MD5 Hash 去重 + 跨文档缓存查询 ──
+        # ── Phase 1.5: 内容 Hash 去重 + 跨文档缓存查询 ──
+        # B4（P2-03）：MD5→SHA-256——此 hash 兼任 VLM **安全判定**缓存主键（CLEAN/
+        # QUARANTINE 结论按键复用），MD5 构造碰撞可让恶意图继承他图的 CLEAN 结论；
+        # 配合 _vlm_cache_ns 默认版本 "2"，存量 md5 键整体失效不被误命中。
         vlm_cache = self._load_vlm_cache()
 
-        hash_to_candidates = {}   # md5 -> [img_asset, ...]
-        hash_to_representative = {}  # md5 -> 第一张图片（代表）
-        hash_to_cached_result = {}   # md5 -> funnel_res（来自持久缓存）
+        hash_to_candidates = {}   # sha256 -> [img_asset, ...]
+        hash_to_representative = {}  # sha256 -> 第一张图片（代表）
+        hash_to_cached_result = {}   # sha256 -> funnel_res（来自持久缓存）
 
         for img_asset in candidates:
             try:
                 with open(img_asset.local_path, "rb") as f:
-                    file_hash = hashlib.md5(f.read()).hexdigest()
+                    file_hash = hashlib.sha256(f.read()).hexdigest()
             except Exception:
                 file_hash = f"fallback_{id(img_asset)}"
 

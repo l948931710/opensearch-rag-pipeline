@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { History } from 'lucide-vue-next'
+import { History } from '@lucide/vue'
 import { useKb, type ApprovalHistoryItem } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
 import LoadError from './LoadError.vue'

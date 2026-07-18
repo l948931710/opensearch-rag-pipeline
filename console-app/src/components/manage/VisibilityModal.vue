@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onUnmounted, watch } from 'vue'
-import { Eye, Loader2, ShieldAlert, X } from 'lucide-vue-next'
+import { Eye, Loader2, ShieldAlert, X } from '@lucide/vue'
 import { deptLabel, permLabel, viaLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 

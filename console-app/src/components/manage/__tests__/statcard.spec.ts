@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { mount } from '@vue/test-utils'
-import { Database } from 'lucide-vue-next'
+import { Database } from '@lucide/vue'
 import StatCard from '@/components/manage/StatCard.vue'
 
 // 回归守卫：概览指标卡的加载态。修复「stats 返回前闪 0」——loading=true 显骨架而非 0；

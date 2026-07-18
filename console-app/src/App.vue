@@ -2,7 +2,7 @@
 import { onMounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
-import { Sprout } from 'lucide-vue-next'
+import { Sprout } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useAuth, hasPendingVersion } from '@/composables/useAuth'
 import { useAsk } from '@/composables/useAsk'

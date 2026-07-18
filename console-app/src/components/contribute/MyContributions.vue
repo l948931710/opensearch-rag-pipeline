@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { FileText, RefreshCw, PencilLine } from 'lucide-vue-next'
+import { FileText, RefreshCw, PencilLine } from '@lucide/vue'
 import { useContribute, type ContributionItem } from '@/composables/useContribute'
 import { fmtTs } from '@/lib/kb'
 import LoadError from '@/components/manage/LoadError.vue'

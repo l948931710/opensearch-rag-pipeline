@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { ClipboardCheck, User, Loader2, PencilLine } from 'lucide-vue-next'
+import { ClipboardCheck, User, Loader2, PencilLine } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { deptLabel, fmtTs } from '@/lib/kb'
 import { useContribute, CONTRIB_DEPT_OPTS, type ContributionItem, type ContributionRevision } from '@/composables/useContribute'

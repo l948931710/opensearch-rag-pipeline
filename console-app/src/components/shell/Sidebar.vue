@@ -2,7 +2,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Library, Lightbulb, Sun, Moon, Trash2, Sprout } from 'lucide-vue-next'
+import { Plus, Search, Library, Lightbulb, Sun, Moon, Trash2, Sprout } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useTheme } from '@/composables/useTheme'
 import { useAsk } from '@/composables/useAsk'

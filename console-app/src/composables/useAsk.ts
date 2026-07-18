@@ -593,13 +593,20 @@ function fillInput(t: string): void { draft.value = t }
 async function loadHotQuestions(): Promise<void> {
   const fb = ['U8+ 如何登录？', '请假流程是什么？', '访客 WiFi 密码是多少？']
   try {
-    const r = await apiJson<{ questions: string[] }>('/api/hot-questions', { auth: false })
+    // B5（P2-09）：走默认 auth——有 token 带 Bearer（后端按部门出 cohort 热问），无 token
+    // 自然匿名拿静态兜底。此前 {auth:false} 把 cohort 功能钉死在静态六问（两侧各自有意、
+    // 叠加成死功能的评审实锤）。
+    const r = await apiJson<{ questions: string[] }>('/api/hot-questions')
     hotQuestions.value = (r && r.questions && r.questions.length) ? r.questions : fb
   } catch { hotQuestions.value = fb }
 }
 
 // ── localStorage 持久化（防御式：失败不影响功能；debounce 防流式期间狂写）──
 const LS_KEY = 'fl-conversations'
+// B5（P2-05）：本地会话 TTL——共享终端/浏览器扩展可长期读取 localStorage 里的内部
+// 答案与来源摘录，按会话 updatedAt 过期（14 天），load 时过滤+回写收缩。上限 30 保留；
+// 跨用户清除已有 uid 戳（syncHistoryForUser）。
+const LS_TTL_MS = 14 * 24 * 3600 * 1000
 
 function persist(): void {
   try {
@@ -640,7 +647,15 @@ function loadPersisted(): void {
     if (!raw) return
     const d = JSON.parse(raw)
     if (!d || !Array.isArray(d.conversations)) return
-    conversations.value = d.conversations.map((c: any) => reactive({
+    // B5（P2-05）：过期会话不回灌（TTL 见 LS_TTL_MS）；有淘汰时立即回写收缩存量
+    const fresh = d.conversations.filter(
+      (c: any) => (c.updatedAt || 0) > Date.now() - LS_TTL_MS)
+    if (fresh.length !== d.conversations.length) {
+      try {
+        localStorage.setItem(LS_KEY, JSON.stringify({ ...d, conversations: fresh }))
+      } catch { /* 回写失败不影响加载 */ }
+    }
+    conversations.value = fresh.map((c: any) => reactive({
       id: c.id || uuid(),
       title: c.title || '新对话',
       qaSession: '',   // 服务端会话已失效，下次提问重建
@@ -740,7 +755,12 @@ export function __incrRenderTestkit() {
   return { newState, stripImgIncr, renderMdIncr }
 }
 
-/** 仅供测试：重置单例状态。 */
+/** 仅供测试：重跑 localStorage 恢复（模块初始化仅一次，TTL 过滤等 load 行为需重入口）。 */
+export function __loadPersistedForTest(): void {
+  loadPersisted()
+}
+
+/** 仅供测试：重置单例状态（顺带忘掉 identityScope 已观测身份，下次 sync 首见采纳）。 */
 export function __resetAsk(): void {
   conversations.value = []
   activeId.value = ''

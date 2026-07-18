@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Clock, FileText, Loader2, ExternalLink } from 'lucide-vue-next'
+import { Clock, FileText, Loader2, ExternalLink } from '@lucide/vue'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'

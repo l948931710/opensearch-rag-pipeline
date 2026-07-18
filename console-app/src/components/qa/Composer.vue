@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
-import { ArrowUp, Square, Brain } from 'lucide-vue-next'
+import { ArrowUp, Square, Brain } from '@lucide/vue'
 
 // 输入框：内嵌发送/停止按钮 + 深度思考开关；Enter 发送 / Shift+Enter 换行；单行自增高到上限。
 const props = defineProps<{ modelValue: string; asking: boolean; hasMessages: boolean; thinking: boolean }>()

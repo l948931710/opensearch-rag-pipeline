@@ -17,7 +17,9 @@ let _reauth: Reauth | null = null
 export function setReauthHandler(fn: Reauth | null) { _reauth = fn }
 
 interface ApiOpts extends RequestInit {
-  /** 默认 true：附带 Bearer。明确 false 时匿名（如 /api/hot-questions）。 */
+  /** 默认 true：有 token 即附 Bearer、无 token 自然匿名（后端各端点自带匿名兜底）。
+   *  明确 false 仅用于**必须**匿名的调用（B5/P2-09 后 hot-questions 已改默认——
+   *  带身份才有部门 cohort，auth:false 会把功能钉死在静态兜底）。 */
   auth?: boolean
 }
 

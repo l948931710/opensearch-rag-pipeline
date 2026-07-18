@@ -605,6 +605,35 @@ def extract_images_from_xlsx(
     return assets
 
 
+_XLSX_XML_MAX_BYTES = 20 * 1024 * 1024   # 单个内部 XML 部件预算（正常 workbook/rels/drawing <1MB）
+
+
+def _zip_member_bytes(z, name):
+    """B4（生产级外审 2026-07-17 P1-03）：读 xlsx 内部部件前按 infolist 预算校验
+    （单成员解压大小 + 压缩比）——小体积高压缩比的解压炸弹在 read() 之前拒掉。"""
+    info = z.getinfo(name)
+    if info.file_size > _XLSX_XML_MAX_BYTES:
+        raise ValueError(f"xlsx 部件超预算: {name} {info.file_size} bytes")
+    if info.compress_size and info.file_size / float(info.compress_size) > 200:
+        raise ValueError(f"xlsx 部件压缩比异常（疑似 zip-bomb）: {name}")
+    return z.read(name)
+
+
+def _safe_xml_fromstring(data):
+    """B4（P1-03）Office 内部 XML 硬化：workbook/rels/drawing 部件**永远不该**含
+    DOCTYPE/ENTITY——出现即拒（billion-laughs/外部实体在 py3.7 旧 expat 上无放大上限），
+    超预算拒（quadratic blowup）。defusedxml 的等效窄化替代：零新增依赖、py3.7 兼容
+    （as-built 偏离台账「defusedxml 进依赖」，理由见核查台账 B4 注记）。"""
+    import xml.etree.ElementTree as ET
+    if isinstance(data, str):
+        data = data.encode("utf-8", "replace")
+    if len(data) > _XLSX_XML_MAX_BYTES:
+        raise ValueError(f"XML 部件超预算: {len(data)} bytes")
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        raise ValueError("XML 部件含 DOCTYPE/ENTITY（Office 部件不该有，拒绝解析）")
+    return ET.fromstring(data)
+
+
 def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basename: str):
     """从 XLSX Drawing XML 解析标注编号，绑定到对应图片。
 
@@ -613,7 +642,7 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
       B) standalone：图片和标注是独立的 <xdr:twoCellAnchor>（按坐标邻近配对）
     """
     import zipfile
-    import xml.etree.ElementTree as ET
+    import xml.etree.ElementTree as ET   # noqa: F401 — ParseError 类型引用；解析走 _safe_xml_fromstring
 
     ns = {
         'xdr': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing',
@@ -671,8 +700,8 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
         _MAIN_NS = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
         mapping = {}
         names = set(z.namelist())
-        wb_root = ET.fromstring(z.read('xl/workbook.xml'))
-        rels_root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+        wb_root = _safe_xml_fromstring(_zip_member_bytes(z, 'xl/workbook.xml'))
+        rels_root = _safe_xml_fromstring(_zip_member_bytes(z, 'xl/_rels/workbook.xml.rels'))
         rid_to_target = {rel.get('Id'): rel.get('Target', '') or '' for rel in rels_root}
         sheets = wb_root.findall('.//x:sheets/x:sheet', _MAIN_NS)
         for order_idx, sheet_el in enumerate(sheets):
@@ -684,8 +713,8 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
             if ws_rels not in names:
                 continue
             try:
-                ws_rels_root = ET.fromstring(z.read(ws_rels))
-            except ET.ParseError:
+                ws_rels_root = _safe_xml_fromstring(_zip_member_bytes(z, ws_rels))
+            except (ET.ParseError, ValueError):
                 continue
             for rel in ws_rels_root:
                 m2 = re.search(r'drawing(\d+)\.xml$', rel.get('Target', '') or '')
@@ -719,7 +748,11 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
             rels_path = f'xl/drawings/_rels/drawing{drawing_num}.xml.rels'
             rid_to_media = {}
             if rels_path in rels_files:
-                rels_root = ET.fromstring(z.read(rels_path))
+                try:
+                    rels_root = _safe_xml_fromstring(_zip_member_bytes(z, rels_path))
+                except ValueError as _ve:
+                    print(f"      ⚠️ [xlsx-img] {rels_path} 被 XML 硬化拒绝（跳过该 drawing）: {_ve}")
+                    continue
                 for rel in rels_root:
                     rid = rel.get('Id', '')
                     target = rel.get('Target', '')
@@ -729,7 +762,11 @@ def _enrich_xlsx_annotations(xlsx_path: str, assets: List[ImageAsset], doc_basen
             if not rid_to_media:
                 continue
 
-            root = ET.fromstring(z.read(drawing_path))
+            try:
+                root = _safe_xml_fromstring(_zip_member_bytes(z, drawing_path))
+            except ValueError as _ve:
+                print(f"      ⚠️ [xlsx-img] {drawing_path} 被 XML 硬化拒绝（跳过该 drawing）: {_ve}")
+                continue
 
             # ── 方式 A: grpSp 分组配对 ──
             grp_matched = set()  # 已通过 grpSp 配对的 asset id

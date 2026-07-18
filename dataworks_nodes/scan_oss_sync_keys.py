@@ -21,7 +21,7 @@ import os
 if sys.version_info >= (3, 8):
     DEPS = ["PyMySQL", "DBUtils", "oss2"]
 else:
-    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2"]
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2==2.19.1"]
 
 def ensure_deps():
     dep_dir = "/tmp/pydeps"

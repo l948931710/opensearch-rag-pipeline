@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onUnmounted, watch } from 'vue'
-import { Lock } from 'lucide-vue-next'
+import { Lock } from '@lucide/vue'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 

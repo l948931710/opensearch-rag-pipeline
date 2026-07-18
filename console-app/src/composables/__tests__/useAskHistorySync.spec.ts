@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { syncHistoryForUser, __resetAsk } from '@/composables/useAsk'
+import { syncHistoryForUser, __loadPersistedForTest, __resetAsk } from '@/composables/useAsk'
 
 const LS_KEY = 'fl-conversations'
 
@@ -41,5 +41,44 @@ describe('syncHistoryForUser — 共享设备防跨用户残留', () => {
   it('无缓存 → 安全 no-op', () => {
     syncHistoryForUser('userB')
     expect(localStorage.getItem(LS_KEY)).toBeNull()
+  })
+})
+
+describe('loadPersisted TTL — B5/P2-05 本地会话过期淘汰', () => {
+  it('超过 14 天的会话不回灌且回写收缩，新会话保留', () => {
+    const now = Date.now()
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      uid: 'userA', activeId: '',
+      conversations: [
+        { id: 'old', title: '过期对话', updatedAt: now - 15 * 24 * 3600 * 1000,
+          messages: [{ role: 'ai', answer: '部门内部旧答案' }] },
+        { id: 'fresh', title: '近期对话', updatedAt: now - 3600 * 1000,
+          messages: [{ role: 'ai', answer: '近期答案' }] },
+      ],
+    }))
+    __loadPersistedForTest()
+    const stored = JSON.parse(localStorage.getItem(LS_KEY) || '{}')
+    expect(stored.conversations.map((c: any) => c.id)).toEqual(['fresh'])   // 存量已收缩
+    expect(stored.conversations.some((c: any) => c.id === 'old')).toBe(false)
+  })
+
+  it('缺 updatedAt 的旧格式会话按过期处理（宁清不留）', () => {
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      uid: 'userA', activeId: '',
+      conversations: [{ id: 'legacy', title: '无戳会话', messages: [] }],
+    }))
+    __loadPersistedForTest()
+    const stored = JSON.parse(localStorage.getItem(LS_KEY) || '{}')
+    expect(stored.conversations).toEqual([])
+  })
+
+  it('全部在 TTL 内 → 不动存量', () => {
+    const blob = JSON.stringify({
+      uid: 'userA', activeId: '',
+      conversations: [{ id: 'c1', title: 'x', updatedAt: Date.now(), messages: [] }],
+    })
+    localStorage.setItem(LS_KEY, blob)
+    __loadPersistedForTest()
+    expect(localStorage.getItem(LS_KEY)).toBe(blob)   // 无淘汰不回写
   })
 })

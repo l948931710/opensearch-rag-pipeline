@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { ShieldCheck, FileText, Loader2, Hourglass } from 'lucide-vue-next'
+import { ShieldCheck, FileText, Loader2, Hourglass } from '@lucide/vue'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ThumbsDown, Check, Ban, RotateCcw, CheckCircle2, MessageSquareText, AlertTriangle, RotateCw } from 'lucide-vue-next'
+import { ThumbsDown, Check, Ban, RotateCcw, CheckCircle2, MessageSquareText, AlertTriangle, RotateCw } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
