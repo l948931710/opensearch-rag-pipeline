@@ -37,7 +37,7 @@ apply 脚本落库并记台账。
 | 文件 | 库 | 内容 |
 |---|---|---|
 | 001_opensearch_pipeline.sql | fuling_knowledge | 基础管线：document_meta/version、chunk_meta、kb_audit_log、document_sensitive_finding、qa_session_log(初版) 等 |
-| 002_feedback_system.sql | fuling_operation | user_feedback、escalation_ticket；qa_session_log 现行定义（含 message_id/延迟列） |
+| 002_feedback_system.sql | fuling_operation | user_feedback、escalation_ticket（转人工已下线 2026-07：表保留存量数据，不再有写入端）；qa_session_log 现行定义（含 message_id/延迟列） |
 | 002_step_card_enhancement.sql | fuling_knowledge | chunk_meta 步骤卡列（parent_chunk_id/step_no/image_refs_json）⚠️ 编号冲突（002b） |
 | 003_provenance_lineage.sql | fuling_knowledge | document_version.canonical_sha256、pipeline_run |
 | 003_user_role_unique.sql | fuling_knowledge | user_role UNIQUE(user_id) ⚠️ 编号冲突（003b） |

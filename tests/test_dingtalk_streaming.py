@@ -326,12 +326,16 @@ def test_card_callback_acks_without_carddata():
     with patch("opensearch_pipeline.dingtalk_bot.handle_feedback", return_value=True) as mock_hf, \
          patch("opensearch_pipeline.dingtalk_bot.mark_awaiting_comment", return_value=True) as mock_mark, \
          patch("opensearch_pipeline.dingtalk_bot._card_callback_authorized", return_value=True), \
-         patch("opensearch_pipeline.dingtalk_bot.send_text_to_user", return_value=True):
+         patch("opensearch_pipeline.dingtalk_bot.send_text_to_user", return_value=True) as mock_send:
         for action in ("handoff", "upvote", "downvote", "add_reason", "some_native_like"):
             resp = asyncio.run(dingtalk_bot.card_callback(_req(action)))
             assert "cardData" not in resp, f"action={action} 不应返回 cardData（会白屏）"
 
-    assert mock_hf.called          # 转人工 + 赞踩 落库
+    assert mock_hf.called          # 赞踩 落库
+    # 转人工已下线（2026-07）：存量卡片按钮回调不建单不落库，只回下线提示
+    assert all(c.kwargs.get("action") != "handoff" and "handoff" not in c.args
+               for c in mock_hf.call_args_list)
+    assert any("转人工已下线" in str(c.args) for c in mock_send.call_args_list)
     assert mock_mark.called        # 补充原因 标记待补充
 
 

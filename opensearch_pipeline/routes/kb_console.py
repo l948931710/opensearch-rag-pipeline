@@ -494,7 +494,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
 #   GET /api/kb/governance  —— 全库运行健康 / 治理风险 / 部门覆盖（仅 kb_admin）
 #
 # 关键事实（scratch/phase_e_data_probe.py 实测 + qa-log-analytics-gotchas）：
-#  · qa_session_log / user_feedback / escalation_ticket 在 fuling_operation；document_meta /
+#  · qa_session_log / user_feedback 在 fuling_operation；document_meta /
 #    chunk_meta / pipeline_run / document_sensitive_finding 在 fuling_knowledge —— 同实例可跨库 JOIN。
 #  · retrieved_docs_json 元素只留 doc_id 等 7 键、**不含 owner_dept** → 必须 JOIN document_meta 取归属。
 #    JSON_TABLE 抽出的串默认 utf8mb4_0900_ai_ci，与 document_meta.doc_id(unicode_ci) 直接 JOIN 报
@@ -902,225 +902,6 @@ def kb_feedback_resolve(req: KbFeedbackResolveRequest, request: Request,
     return {"status": "ok", "message_id": req.message_id, "handled_status": new_status, "updated": n}
 
 
-# ═══ 转人工工单队列（盲区审计 P1-2）═══════════════════════════════════════════
-# escalation_ticket 此前是"只写不读"：钉钉「转人工」INSERT 一条 PENDING 后全仓无人出队、
-# assigned_*/expert_answer/closed_at 零写入，用户却被告知"相关同事会尽快跟进"。这里补上
-# 消费端：按龄列队（老单先出）→ 答复/忽略处置 → 带答复的处置把人工答案推回提问者钉钉。
-# 可见性与差评复核同源：dept_admin 只见【实际引用】了其作用域文档的工单（谁的文档谁跟进），
-# kb_admin 全库（含无引用文档的 NO_RESULT 工单 = 语料缺口，本就归入库管理员）。
-
-class KbEscalationItem(BaseModel):
-    ticket_id: str = ""
-    message_id: str = ""
-    question: str = ""                  # 已 PII 脱敏（他人原始提问，与差评复核同纪律）
-    ai_answer_excerpt: str = ""         # AI 原答案节选（已脱敏；判断哪里没答好的上下文）
-    user_name: str = ""                 # 提问者显示名（答复要回到真人，是工作流数据非泄露）
-    user_dept: str = ""
-    created_at: str = ""
-    age_days: int = 0                   # 工单龄（天）——按龄列队的 SLA 视角
-    status: str = "PENDING"             # PENDING / RESOLVED / DISMISSED
-    closed: bool = False
-    expert_answer: str = ""             # 人工答复（已处置视图回显）
-    assigned_user_name: str = ""        # 处置人
-    docs: List[KbFeedbackDocRef] = Field(default_factory=list)   # 该回答引用的作用域内文档
-
-
-class KbEscalationsResponse(BaseModel):
-    scope: str = "dept"
-    items: List[KbEscalationItem] = Field(default_factory=list)
-
-
-_KB_ESCALATION_DONE = ("RESOLVED", "DISMISSED")
-_KB_ESCALATION_ACTIONS = {"resolve": "RESOLVED", "dismiss": "DISMISSED", "reopen": "PENDING"}
-_KB_ESCALATION_ANSWER_MAX = 4000
-
-
-def _kb_escalation_scope_exists(scope_clause: str) -> str:
-    """dept_admin 作用域：工单对应回答【实际引用】了调用者管辖 owner_dept 的文档。
-    与差评复核同一条归属链（qa_docs_join cited=1）；kb_admin scope 为空 → 不加此谓词。"""
-    from opensearch_pipeline.qa_facts import qa_docs_join_sql
-    return (f" AND EXISTS (SELECT 1 FROM {_op_db()}.qa_session_log q"
-            + qa_docs_join_sql(cited=True)
-            + " WHERE q.message_id = e.message_id " + scope_clause + ")")
-
-
-@router.get("/api/kb/escalations", response_model=KbEscalationsResponse)
-def kb_escalations(request: Request, limit: int = 20, include_closed: bool = False,
-                   identity: Optional[Identity] = Depends(current_identity)):
-    """转人工工单队列（只读）。默认只列未处置（收件箱），**不设时间窗**且按龄升序——
-    工单是承诺不是日志，挂 40 天的老单必须顶在最上面而不是滚出窗口；include_closed=True
-    时连已处置一并返回（近 90 天，新的在前，供「显示已处理」切换）。空=无工单；
-    连接级失败诚实 500。"""
-    _enforce_rate_limit(request, identity, scope="aux")
-    kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
-    limit = max(1, min(limit, 50))
-    cache_key = ("escalations",
-                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL",
-                 limit, include_closed)
-    cached = _dashboard_cache_get(cache_key)
-    if cached is not None:
-        return cached
-    open_pred = f"(e.ticket_status IS NULL OR e.ticket_status NOT IN ({sql_in_list(_KB_ESCALATION_DONE)}))"
-    if include_closed:
-        where = f"(({open_pred}) OR e.created_at >= DATE_SUB(NOW(), INTERVAL 90 DAY))"
-        order = "ORDER BY (" + open_pred + ") DESC, e.created_at DESC"   # 未处置置顶，其余新在前
-    else:
-        where = open_pred
-        order = "ORDER BY e.created_at ASC"                              # 按龄：老单先出
-    scoped = "" if kb.role == ROLE_KB_ADMIN else _kb_escalation_scope_exists(scope_clause)
-    try:
-        from opensearch_pipeline.db import _get_db_conn
-        from opensearch_pipeline.qa_facts import qa_docs_join_sql
-        conn = _get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT e.ticket_id, e.message_id, e.user_name, e.user_dept, e.query_text,"
-                    " e.ai_answer, e.ticket_status, e.expert_answer, e.assigned_user_name,"
-                    " e.created_at, DATEDIFF(NOW(), e.created_at)"
-                    f" FROM {_op_db()}.escalation_ticket e"
-                    f" WHERE {where}{scoped} {order} LIMIT %s",
-                    tuple(([] if kb.role == ROLE_KB_ADMIN else scope_params) + [limit]))
-                rows = cur.fetchall() or []
-                # 引用文档 chips（第二查：按 message_id 批取；dept_admin 只回其作用域内文档）
-                doc_map: Dict[str, List[KbFeedbackDocRef]] = {}
-                mids = [str(r[1]) for r in rows if r[1]]
-                if mids:
-                    ph = ",".join(["%s"] * len(mids))
-                    cur.execute(
-                        "SELECT q.message_id, m.doc_id, m.title, m.owner_dept"
-                        f" FROM {_op_db()}.qa_session_log q"
-                        + qa_docs_join_sql(cited=True)
-                        + f" WHERE q.message_id IN ({ph})"
-                        + (" " + scope_clause if scope_clause else ""),
-                        tuple(mids + scope_params))
-                    for mid, doc_id, title, owner in cur.fetchall() or []:
-                        lst = doc_map.setdefault(str(mid), [])
-                        if doc_id and all(d.doc_id != str(doc_id) for d in lst):
-                            lst.append(KbFeedbackDocRef(doc_id=str(doc_id), title=str(title or ""),
-                                                        owner_dept=str(owner or "")))
-        finally:
-            conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        trace_id = get_request_id()
-        logger.error("kb_escalations 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"转人工工单查询失败 (trace: {trace_id})")
-
-    from opensearch_pipeline import contribution as _C
-    out = KbEscalationsResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"))
-    for (tid, mid, uname, udept, qtext, ans, st, expert, assigned, created, age) in rows:
-        st = str(st or "PENDING").upper() or "PENDING"
-        excerpt = _C.redact_query_text(str(ans or ""))[:300]
-        out.items.append(KbEscalationItem(
-            ticket_id=str(tid), message_id=str(mid or ""),
-            question=_C.redact_query_text(str(qtext or "")),
-            ai_answer_excerpt=excerpt,
-            user_name=str(uname or ""), user_dept=str(udept or ""),
-            created_at=str(created or ""), age_days=max(0, int(age or 0)),
-            status=st, closed=st in _KB_ESCALATION_DONE,
-            expert_answer=str(expert or ""), assigned_user_name=str(assigned or ""),
-            docs=doc_map.get(str(mid or ""), [])))
-    _dashboard_cache_put(cache_key, out)
-    return out
-
-
-class KbEscalationResolveRequest(BaseModel):
-    ticket_id: str
-    action: Literal["resolve", "dismiss", "reopen"] = "resolve"
-    expert_answer: str = ""     # resolve 时可选：人工答复内容（非空 → 推回提问者钉钉）
-
-
-@router.post("/api/kb/escalations/resolve")
-def kb_escalation_resolve(req: KbEscalationResolveRequest, request: Request,
-                          identity: Optional[Identity] = Depends(current_identity)):
-    """转人工工单处置：resolve（已答复/已跟进，expert_answer 非空则钉钉 1 对 1 推回提问者——
-    信任恢复闭环的最后一步）/ dismiss（忽略）/ reopen（重开）。
-
-    授权（现查 DB）：kb_admin 任意；dept_admin 仅当该工单回答【实际引用】了其 managed
-    owner_dept 的文档（与队列可见性同源，防越权处置他部门工单）。写 ticket_status/
-    assigned_*/expert_answer/answered_at/closed_at；reopen 清 closed_at 但保留已有答复痕迹。
-    """
-    _enforce_rate_limit(request, identity, scope="aux")
-    kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
-    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
-    if not req.ticket_id:
-        raise HTTPException(status_code=400, detail="缺少 ticket_id")
-    new_status = _KB_ESCALATION_ACTIONS.get(req.action)
-    if not new_status:
-        raise HTTPException(status_code=400, detail="非法处置动作")
-    answer = (req.expert_answer or "").strip()[:_KB_ESCALATION_ANSWER_MAX] \
-        if req.action == "resolve" else ""
-    assert_metadata_write_allowed("kb_escalation_resolve", get_config().rds.host, kind="rds")
-    trace_id = get_request_id()
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
-    try:
-        from opensearch_pipeline.db import _get_db_conn
-        conn = _get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT message_id, user_id, query_text FROM {_op_db()}.escalation_ticket"
-                    " WHERE ticket_id=%s LIMIT 1", (req.ticket_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="工单不存在")
-                t_mid, t_uid, t_query = str(row[0] or ""), str(row[1] or ""), str(row[2] or "")
-                # dept_admin 越权守卫：工单回答须引用调用者作用域内文档（与队列可见性同源）
-                if kb.role != ROLE_KB_ADMIN:
-                    from opensearch_pipeline.qa_facts import qa_docs_join_sql
-                    cur.execute(
-                        f"SELECT 1 FROM {_op_db()}.qa_session_log q"
-                        + qa_docs_join_sql(cited=True)
-                        + " WHERE q.message_id=%s"
-                        + (" " + scope_clause if scope_clause else "")
-                        + " LIMIT 1",
-                        tuple([t_mid] + scope_params))
-                    if not cur.fetchone():
-                        conn.rollback()
-                        raise HTTPException(status_code=403, detail="无权处置该工单（不在管理范围内）")
-                sets = ["ticket_status=%s", "assigned_user_id=%s", "assigned_user_name=%s",
-                        "assigned_at=COALESCE(assigned_at, NOW())", "updated_at=NOW()"]
-                params: List = [new_status, kb.user_id, kb.name or kb.user_id]
-                if req.action == "reopen":
-                    sets.append("closed_at=NULL")
-                else:
-                    sets.append("closed_at=NOW()")
-                if answer:
-                    sets += ["expert_answer=%s", "answered_at=NOW()"]
-                    params.append(answer)
-                params.append(req.ticket_id)
-                n = cur.execute(
-                    f"UPDATE {_op_db()}.escalation_ticket SET {', '.join(sets)}"
-                    " WHERE ticket_id=%s", tuple(params))
-            conn.commit()
-        finally:
-            conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("kb_escalation_resolve 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"处置失败 (trace: {trace_id})")
-    # 人工答复推回提问者钉钉（best-effort：推送失败不回滚处置，只如实报 user_notified=false）
-    user_notified = False
-    if req.action == "resolve" and answer and t_uid:
-        try:
-            from opensearch_pipeline.dingtalk_card import send_text_to_user
-            q = t_query.strip()
-            q = q[:40] + ("…" if len(q) > 40 else "")
-            user_notified = bool(send_text_to_user(
-                t_uid, f"🙋 你转人工的问题「{q}」已有人工答复：\n\n{answer}"))
-        except Exception as e:   # noqa: BLE001
-            logger.warning("工单答复推送用户失败（忽略）: %s", e)
-    _dashboard_cache_clear()   # 处置改变了收件箱与已处理集，缓存作废重算
-    return {"status": "ok", "ticket_id": req.ticket_id, "ticket_status": new_status,
-            "updated": n, "user_notified": user_notified}
-
-
 # ═══ 入库复审任务队列（盲区审计 P2-33）══════════════════════════════════════
 # review_task 此前"只写不读"：三个生产者（spot_checker 权限泄露安全网 / classify 失败 /
 # cost_breaker 隔离登记）INSERT PENDING，全仓无任何端点/worker 出队——被标记为"实时权限比
@@ -1351,7 +1132,6 @@ class KbGovernanceResponse(BaseModel):
     feedback_last7: int = 0              # 近 7 天反馈数
     feedback_daily: List[KbFeedbackDay] = Field(default_factory=list)   # 近 30 北京日 up/down 趋势
     downvote_reasons: List[KbDownvoteReason] = Field(default_factory=list)  # 点踩原因分布
-    escalations: int = 0
     # 部门覆盖 / 使用失衡
     dept_coverage: List[KbDeptCoverageItem] = Field(default_factory=list)
 
@@ -1553,13 +1333,7 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     key=lambda x: x.count, reverse=True)
             except Exception as e:
                 fails += 1; logger.warning("kb_governance downvote_reasons 失败: %s", e)
-            # 8) 转人工工单数
-            try:
-                cur.execute(f"SELECT COUNT(*) FROM {_op_db()}.escalation_ticket")
-                out.escalations = int((cur.fetchone() or (0,))[0] or 0)
-            except Exception as e:
-                fails += 1; logger.warning("kb_governance escalations 失败: %s", e)
-            # 9) 部门覆盖与失衡：已上线 / 本月新增 / 使用量(命中提问数) / 无答案率(refusal占比) / 风险(PII文档)。
+            # 8) 部门覆盖与失衡：已上线 / 本月新增 / 使用量(命中提问数) / 无答案率(refusal占比) / 风险(PII文档)。
             #    qa_hits + refusal 用 COUNT(DISTINCT message_id) 去 chunk 扇出；PII JOIN 同样需 collation-cast。
             try:
                 from datetime import date as _date

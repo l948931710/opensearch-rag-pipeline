@@ -40,5 +40,5 @@
 1. 在卡片搭建台保留这套自定义按钮（👍/👎/输入框/提交/取消），把正文 Markdown 绑到 `content`。
 2. 把 `DINGTALK_STREAM_CARD_TEMPLATE_ID` 换成这张模版的 schema id，重新发布。
 3. 后端**无需再改**（`card_callback` 已认 `feedback`/`comment`）。
-4. 想要「转人工」就再加一个 `SingleButton`：`actionType=request`、参数 `action="handoff"`（现有回调已处理）。
-   —— 这张官方模版本身**没有转人工**，需要的话单独加一个按钮即可。
+4. 「转人工」已下线（2026-07）：不要再加 `action="handoff"` 按钮——后端只回下线提示，不建单；
+   语料缺口由控制台「知识贡献」兜底。

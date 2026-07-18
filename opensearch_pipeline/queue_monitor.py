@@ -4,8 +4,9 @@
 ops_monitor 此前只覆盖 reconcile + qa_rollup，结构性省略了每个人工协同队列与
 「从未成功过的文档」：
 
-  * run_queue_aging_check（P2-34）：escalation_ticket（转人工）/ review_task（spot_checker
-    权限泄露安全网等）/ user_feedback 未处置差评——三条队列的积压量与最老 PENDING 龄。
+  * run_queue_aging_check（P2-34）：review_task（spot_checker 权限泄露安全网等）/
+    user_feedback 未处置差评——两条队列的积压量与最老 PENDING 龄（转人工已下线 2026-07，
+    escalation_ticket 探针随之移除）。
     超 SLA（RAG_QUEUE_SLA_DAYS，默认 7 天）或积压超阈（RAG_QUEUE_BACKLOG_MAX，默认 50）
     → OBS-4 告警。没有这一层，人机协同面可静默停摆数月而 ops 全绿（P1-2 的复盘场景）。
   * run_ingest_funnel_check（P2-15）：所有 reconciler 都从 active-INDEXED 起算，从未到达
@@ -55,7 +56,7 @@ def _one(cur, sql: str, params=()) -> tuple:
 
 
 def run_queue_aging_check(*, alert: bool = True) -> Dict[str, Any]:
-    """三条人工队列的积压/最老龄检查（P2-34）。返回 {ok, queues, breaches}。"""
+    """人工队列的积压/最老龄检查（P2-34）。返回 {ok, queues, breaches}。"""
     from opensearch_pipeline.config import get_config
     cfg = get_config()
     if cfg.simulate or cfg.simulate_db:
@@ -66,9 +67,6 @@ def run_queue_aging_check(*, alert: bool = True) -> Dict[str, Any]:
     kb_db, op_db = _dbs()
     # 队列名 → (SQL, 库说明)：COUNT + 最老龄（天）。open 语义与各自消费端一致。
     probes = {
-        "escalation_ticket": (
-            f"SELECT COUNT(*), MAX(DATEDIFF(NOW(), created_at)) FROM {op_db}.escalation_ticket"
-            " WHERE ticket_status IS NULL OR ticket_status NOT IN ('RESOLVED','DISMISSED')"),
         "review_task": (
             f"SELECT COUNT(*), MAX(DATEDIFF(NOW(), created_at)) FROM {kb_db}.review_task"
             " WHERE review_status = 'PENDING'"),

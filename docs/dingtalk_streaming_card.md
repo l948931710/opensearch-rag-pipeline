@@ -34,7 +34,7 @@ RAG_PURE_TEXT=true                          # 钉钉只出纯文本
 |---|---|---|---|
 | 喜欢 | 普通按钮 FixedSingleButton | `btn_upvote` | action=`upvote`, message_id |
 | 不喜欢 | 下拉菜单 DropdownButton | `feedback_downvote` | 见下方菜单 |
-| 转人工 | 普通按钮 FixedSingleButton | `handoff` | action=`handoff`, message_id |
+| 转人工（**已下线 2026-07**：后端只回下线提示不建单；平台侧模板更新时应移除该按钮） | 普通按钮 FixedSingleButton | `handoff` | action=`handoff`, message_id |
 
 不喜欢下拉菜单项（每项 action=`downvote` + reason + message_id）：
 `答案不准确`→inaccurate · `答非所问`→irrelevant · `回答不完整`→incomplete · `内容已过时`→outdated · `未找到答案`→not_found ·

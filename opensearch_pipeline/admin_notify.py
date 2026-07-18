@@ -165,24 +165,6 @@ def _doc_title(doc_id: str) -> str:
         conn.close()
 
 
-def _cited_owner_depts(message_id: str) -> List[str]:
-    """该回答【实际引用】文档的 owner_dept 列表（qa_docs_join 与差评复核/工单队列同源——
-    通知谁与谁在控制台看得见该工单保持一致）。"""
-    from opensearch_pipeline.db import _get_db_conn
-    from opensearch_pipeline.qa_facts import qa_docs_join_sql
-    op_db = get_config().rds.operation_database
-    conn = _get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT DISTINCT m.owner_dept FROM {op_db}.qa_session_log q"
-                + qa_docs_join_sql(cited=True)
-                + " WHERE q.message_id = %s", (message_id,))
-            return [r[0] for r in (cur.fetchall() or []) if r and r[0]]
-    finally:
-        conn.close()
-
-
 # ── 公开挂点（全部 no-raise；调用点在业务 commit 之后）──────────────────────────
 
 def notify_access_request(owner_dept: str, doc_id: str, requester_depts: str) -> None:
@@ -204,8 +186,7 @@ def notify_contribution(category_dept: str, question: str) -> None:
     """新知识贡献待审核 → 通知归属部门管理员；孤儿部门（无 dept_admin）→ kb_admin 兜底。
 
     批次δ-3 顺带修复的既有缺口：此前孤儿部门收件人为空即静默跳过——兜底审核队列既已
-    归 kb_admin（contributions/pending 的孤儿作用域），新单必须有人被叫到，与
-    notify_escalation 的 kb_admin 兜底同款。"""
+    归 kb_admin（contributions/pending 的孤儿作用域），新单必须有人被叫到。"""
     if not _enabled():
         return
     try:
@@ -272,23 +253,3 @@ def notify_upload_approval(owner_dept: str, title: str) -> None:
                        f"（归属 {_dept_label(owner_dept)}）。请到控制台「待审批」处理。")
     except Exception as e:   # noqa: BLE001
         logger.warning("admin_notify: upload_approval 通知失败（忽略）: %s", e)
-
-
-def notify_escalation(message_id: str, question: str) -> None:
-    """转人工工单已建 → 通知被引用文档归属部门的管理员；无引用文档（NO_RESULT 转人工 =
-    语料缺口）→ kb_admin 兜底（盲区审计 P1-2：工单此前只写不读，用户被告知"会有人跟进"
-    但没有任何人被通知）。收件人与控制台「转人工工单」队列的可见性同源。"""
-    if not _enabled():
-        return
-    try:
-        ids: List[str] = []
-        for dept in _cited_owner_depts(message_id):
-            ids.extend(_dept_admin_ids(dept))
-        if not ids:
-            ids = _kb_admin_ids()
-        q = (question or "").strip()
-        q = q[:40] + ("…" if len(q) > 40 else "")
-        _dispatch(ids, f"【富岭知识库】转人工工单：用户对「{q}」的回答需要人工跟进。"
-                       "请到知识库控制台「转人工工单」答复处理。")
-    except Exception as e:   # noqa: BLE001
-        logger.warning("admin_notify: escalation 通知失败（忽略）: %s", e)
