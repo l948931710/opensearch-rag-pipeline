@@ -178,7 +178,7 @@
 3. `fa3ce1d`——三跑后扫描面全绿(gitleaks 全史 ✓/pip-audit fresh+lock ✓/npm 0/requirements.txt 钉版后 0/主 Dockerfile 0),唯一**真发现** trivy DS-0002 HIGH:deploy/dataworks_monitor.Dockerfile 无 USER 以 root 跑;补 raguser(对齐主 Dockerfile appuser 纪律;镜像尚为模板,DataWorks pod 运行时若要求 root 的豁免路径已注释)。
 四跑(fa3ce1d)= 分支门下首个全绿基线(test 3.10/3.11+db-integration+Frontend 一直绿)。
 
-## 批次9 — P3 清扫(49 项,选择性) ✅ 高 ROI 已修 14 项(2026-07-17)
+## 批次9 — P3 清扫(49 项,选择性) ✅ 高 ROI 已修 14 项(2026-07-17, b028a65)
 - run-1 30 项 + 续跑 16 项 + 改判 3 项(`packing_math:245`/`store:1469`/`spot_checker:686`),台账见审计文档 P3 表。
 - 原则:security 类(auth_token typ 未强制、gap dismiss 无 owner 域、intent_router 提示注入边界、openDocPreview tabnabbing、legacy cleanup 裸 pip)优先;纯 maintainability 按顺路修。
 
