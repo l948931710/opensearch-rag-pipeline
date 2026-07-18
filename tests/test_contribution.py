@@ -1528,6 +1528,8 @@ def test_gaps_incomplete_layering(monkeypatch):
     assert by_hash[C.question_hash("然后呢")].has_context is True
     assert C.question_hash("上面那个") not in by_hash      # 无上文：低质量隐藏
     assert C.question_hash("怎么开发票") in by_hash        # 有效问题不受影响
+    # has_context 收窄（2026-07-18）：独立完整问题不给上下文按钮（前几轮多为无关主题）
+    assert by_hash[C.question_hash("怎么开发票")].has_context is False
     # 独立 flag 关闭 → 无上文的短缺主体问题也回来
     monkeypatch.setenv("RAG_QA_GAP_HIDE_INCOMPLETE", "false")
     from opensearch_pipeline.routes import contribution as RC
@@ -1589,16 +1591,20 @@ def test_gap_context_endpoint_visibility_and_cursor(monkeypatch):
     with pytest.raises(HTTPException) as ei:
         api.kb_gap_context(request=None, message_id="M1", identity=_ident(groups=("marketing",)))
     assert ei.value.status_code == 403
-    # 200：NO_RESULT 本部门可见；前序行（DESC 给桩）→ 响应时间正序；SUCCESS 才带节选
+    # 200：NO_RESULT 本部门可见；前序行（DESC 给桩）→ 响应时间正序；SUCCESS 才带节选；
+    # 噪音轮（「5」「hi」垃圾/寒暄）被过滤不展示（2026-07-18）；超长问题截 120 字
     conn = _install_conn(monkeypatch, _FakeConn(
         ctx_msg_row=(30, "S1", "2026-07-18 10:00:00", "NO_RESULT", "marketing", "M1"),
         ctx_prior_rows=[
+            ("5", "REFUSAL", None, "2026-07-18 09:40:00", 25),          # 垃圾轮：滤
+            ("hi", "SUCCESS", "您好！我是助手", "2026-07-18 09:35:00", 22),  # 寒暄轮：滤
             ("第二个问题", "NO_RESULT", None, "2026-07-18 09:30:00", 20),
-            ("第一个问题，手机 13800138000", "SUCCESS", "答案正文", "2026-07-18 09:00:00", 10),
+            ("长" * 300, "SUCCESS", "答案正文", "2026-07-18 09:00:00", 10),
         ]))
     resp = api.kb_gap_context(request=None, message_id="M1", identity=_ident(groups=("marketing",)))
-    assert [t.question for t in resp.items][0].startswith("第一个问题")   # 正序（旧→新）
-    assert "13800138000" not in resp.items[0].question                   # 他人提问脱敏
+    assert len(resp.items) == 2                                          # 噪音轮不出现
+    assert all("hi" != t.question and "5" != t.question for t in resp.items)
+    assert len(resp.items[0].question) == 120                            # 超长问题截断
     assert resp.items[0].answer_excerpt == "答案正文"                     # SUCCESS 带节选
     assert resp.items[1].answer_excerpt == "" and resp.items[1].answer_status == "NO_RESULT"
     # (created_at,id) 复合游标进了 SQL（同时间戳不漏不乱）

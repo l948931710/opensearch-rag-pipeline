@@ -1237,13 +1237,16 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
             rid_i = None
         # 行级完整性：有改写 = 已是独立问题；否则按「短且缺主体」判定
         row_complete = bool(rewritten) or not C.is_incomplete_question(display)
+        # 追问型（2026-07-18 Sam：上下文只对追问型有意义）：原文短缺主体或发生过改写——
+        # 独立完整问题的"前几轮"往往是别的主题，不给上下文按钮
+        row_followup = bool(rewritten) or C.is_incomplete_question(qtext)
         e = agg.get(h)
         if e is None:
             e = {"hash": h, "raw": display or "", "msgs": set(), "days": int(days_ago or 0),
                  "dept": dept or "", "kind": kind,
                  # 代表行 = 首见行（NO_RESULT 源按 created_at DESC，首见即最新）
                  "msg": msg_id or "", "rep": (sid or "", rid_i),
-                 "complete": row_complete, "ctx": []}
+                 "complete": row_complete, "followup": row_followup, "ctx": []}
             agg[h] = e
         if msg_id:
             e["msgs"].add(msg_id)
@@ -1251,6 +1254,7 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
         if not e["dept"] and dept:
             e["dept"] = dept
         e["complete"] = e["complete"] or row_complete
+        e["followup"] = e["followup"] or row_followup
         if sid and rid_i is not None and len(e["ctx"]) < 5:
             e["ctx"].append((sid, rid_i))
         # REFUSAL（有文档没答好）信号优先于纯 NO_RESULT 展示 kind
@@ -1421,7 +1425,8 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
             "hash": h, "raw": e["raw"], "asks": len(e["msgs"]) or 1, "days": e["days"],
             "dept": e["dept"], "kind": e["kind"], "msg": e["msg"],
             "pending": h in covered_pending,
-            "has_context": _has_ctx(rep_sid, rep_rid),
+            # 收窄（2026-07-18）：仅追问型缺口给上下文按钮——独立问题的前几轮多为无关主题
+            "has_context": e["followup"] and _has_ctx(rep_sid, rep_rid),
         })
     # 语义组归并（纯函数；关闭判定已按 exact hash 在上方逐成员完成，归并只影响展示）：
     # 同组开放成员并为一张卡（asks 求和/days 取 min/refusal 优先），卡片 hash 恒为真实
@@ -1506,13 +1511,16 @@ def kb_gap_context(request: Request, message_id: str,
                 if not _gap_message_visible(cur, row, depts):
                     raise HTTPException(status_code=403, detail="无权查看该缺口上下文")
                 rid, sid, created = int(row[0]), row[1], row[2]
+                # 多取（8）再滤噪音轮（垃圾/寒暄，2026-07-18）后取最近 3——「问：5」「问：hi」
+                # 这类轮对理解追问语境零价值，不展示
                 cur.execute(
                     "SELECT query_text, answer_status, answer_text, created_at, id"
                     f" FROM {_op_db()}.qa_session_log"
                     " WHERE session_id=%s AND (created_at < %s OR (created_at = %s AND id < %s))"
-                    " ORDER BY created_at DESC, id DESC LIMIT 3",
+                    " ORDER BY created_at DESC, id DESC LIMIT 8",
                     (sid, created, created, rid))
-                prior = list(cur.fetchall() or [])
+                prior = [r for r in (cur.fetchall() or [])
+                         if not C.is_noise_turn(r[0])][:3]
         finally:
             conn.close()
     except HTTPException:
@@ -1533,7 +1541,8 @@ def kb_gap_context(request: Request, message_id: str,
             except Exception:   # noqa: BLE001 — 脱敏失败宁可不给节选
                 excerpt = ""
         items.append(KbGapContextTurn(
-            question=C.redact_query_text(str(qtext or "")),
+            # 长度防线：脱敏后截 120 字（用户可能贴一大段）；答案节选已在上方截 200
+            question=C.redact_query_text(str(qtext or ""))[:120],
             answer_status=str(status or ""), answer_excerpt=excerpt,
             created_at=str(cat or "")))
     return KbGapContextResponse(message_id=message_id, items=items)

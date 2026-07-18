@@ -95,7 +95,7 @@ async function onDismiss(g: GapItem) {
             </button>
           </div>
           <!-- 上下文展开区（懒加载；他人问答已服务端脱敏） -->
-          <div v-if="g.ctxOpen" class="mt-2 rounded-lg bg-panel/60 px-3 py-2" data-testid="gap-ctx-panel">
+          <div v-if="g.ctxOpen" class="mt-2 max-h-56 overflow-y-auto rounded-lg bg-panel/60 px-3 py-2" data-testid="gap-ctx-panel">
             <p v-if="g.ctxLoading" class="text-[11.5px] text-faint">上下文加载中…</p>
             <template v-else-if="g.ctxTurns && g.ctxTurns.length">
               <div v-for="(t, ti) in g.ctxTurns" :key="ti" class="py-1 text-[11.5px] leading-relaxed" :class="ti > 0 && 'border-t border-border/60'">
