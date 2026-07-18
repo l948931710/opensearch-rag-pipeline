@@ -62,7 +62,7 @@
 
 ```json
 {
-  "message_id": "uuid", "session_id": "uuid", "model": "qwen3.6-plus",
+  "message_id": "uuid", "session_id": "uuid", "model": "qwen3.7-plus",
   "answer": "（向后兼容的纯文本）",
   "blocks": [
     { "type": "text",  "format": "markdown", "text": "第一步，打开 U8+ 系统设置…" },
