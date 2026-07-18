@@ -67,7 +67,9 @@ def _rewrite_timeout() -> float:
 
 
 def _rewrite_model() -> str:
-    return (os.environ.get("RAG_FOLLOWUP_REWRITE_MODEL") or "qwen-flash").strip() or "qwen-flash"
+    """默认 qwen3.7-plus（2026-07-18 Sam 拍板：与现网主 LLM 同源，质量优先——改写只在
+    疑似追问时触发，频次低,延迟可接受）。qwen3.6-plus 已退役，勿配。"""
+    return (os.environ.get("RAG_FOLLOWUP_REWRITE_MODEL") or "qwen3.7-plus").strip() or "qwen3.7-plus"
 
 
 def looks_followup(query: str, history: Optional[List[Dict[str, Any]]]) -> bool:
