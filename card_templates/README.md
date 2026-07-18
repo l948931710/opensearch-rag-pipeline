@@ -24,12 +24,12 @@ streaming + a feedback action area.
 
 **Feedback button actions** (what the callback handler `/dingtalk/card/callback` expects in
 `cardPrivateData.params`): `action` ∈ `upvote` · `downvote` (+ `reason` ∈ `inaccurate`/`incomplete`/
-`irrelevant`/`outdated`/`not_found`) · `handoff` · `downvote_other_start` · `downvote_other_submit` —
+`irrelevant`/`outdated`/`not_found`) · `handoff`（**已下线 2026-07**：后端只回下线提示，不再建单——平台侧模板更新时应移除该按钮） · `downvote_other_start` · `downvote_other_submit` —
 plus `message_id`. (不喜欢 dropdown reasons: 答案不准确/答非所问/回答不完整/内容已过时/**未找到答案**/其他原因.)
 
 **Native like/dislike is disabled** in this template (`enableLikeDislike: false`). The native `Feedback`
 component has no action/callback config, so it only feeds DingTalk's internal feedback and does **not**
-reach this backend — backend-logged feedback comes only from the custom 喜欢/不喜欢/转人工 buttons above.
+reach this backend — backend-logged feedback comes only from the custom 喜欢/不喜欢 buttons above（转人工按钮已下线，见上）.
 
 ### Enable it
 1. Import this JSON in the card builder; `is_answer_done` is already declared; publish.

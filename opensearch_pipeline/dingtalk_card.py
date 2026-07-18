@@ -644,7 +644,7 @@ def send_text_to_user(staff_id: str, text: str) -> bool:
     """机器人主动给某个用户发一条纯文本（1 对 1）。
 
     用于卡片【回调】里给用户发提示（回调请求里没有 sessionWebhook，无法走 _send_text_reply）。
-    例如：点「转人工」后回「已为你转人工」、点「补充原因」后回「请直接回复本条消息」。
+    例如：点「补充原因」后回「请直接回复本条消息」。
     需应用具备「机器人发送单聊消息」权限（Robot.Message.Send / 单聊消息）；失败 fail open，不抛。
     """
     token = _get_access_token()

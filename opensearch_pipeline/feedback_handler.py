@@ -4,7 +4,8 @@ feedback_handler.py — RAG 反馈处理模块
 
 处理用户对 RAG 回答的反馈：
   - upvote / downvote → 写入 user_feedback（ON DUPLICATE KEY UPDATE 覆盖）
-  - handoff → 写入 escalation_ticket
+  - handoff → 已下线（2026-07），仅为旧端（小程序 v0.3 / 存量钉钉卡片）保留优雅降级：
+    不建单、不通知，语料缺口由知识贡献系统兜底。存量 escalation_ticket 表保留不动。
 
 供钉钉卡片回调和 REST API 端点共用。
 """
@@ -23,12 +24,12 @@ logger = logging.getLogger(__name__)
 _FEEDBACK_STATUS_MAP = {
     "upvote": "✅ 已反馈：有帮助",
     "downvote": "📝 已反馈：没帮助",
-    "handoff": "🙋 已转人工处理",
+    "handoff": "ℹ️ 转人工已下线，可通过控制台「知识贡献」提交问题",
 }
 
 
 def _op_db() -> str:
-    """问答运营库名（qa_session_log/user_feedback/escalation_ticket 所在库）。
+    """问答运营库名（qa_session_log/user_feedback 所在库）。
     经 RAG_RDS_OPERATION_DATABASE 配置（STAGING 用 fuling_operation_stg）。"""
     from opensearch_pipeline.config import get_config
     return get_config().rds.operation_database
@@ -108,11 +109,12 @@ def handle_feedback(
                 qa_context=qa_context,
             )
         elif action == "handoff":
-            return _create_escalation(
-                message_id=message_id,
-                user_id=user_id,
-                user_name=user_name,
+            # 转人工已下线（2026-07）：旧端按钮仍会发 handoff，优雅降级为 no-op——
+            # 不建单不通知，返回 True 让旧端不报错；文案见 _FEEDBACK_STATUS_MAP。
+            logger.info(
+                "handoff 已下线，降级 no-op: message_id=%s, user_id=%s", message_id, user_id,
             )
+            return True
     except Exception as e:
         logger.error(
             "handle_feedback 异常: message_id=%s, action=%s, error=%s",
@@ -225,92 +227,6 @@ def _save_feedback(
         conn.rollback()
         logger.error(
             "user_feedback 写入失败: message_id=%s, error=%s",
-            message_id, e, exc_info=True,
-        )
-        return False
-    finally:
-        conn.close()
-
-
-# ═══════════════════════════════════════════════════════════════
-# 转人工（handoff）
-# ═══════════════════════════════════════════════════════════════
-
-def _create_escalation(
-    *,
-    message_id: str,
-    user_id: str,
-    user_name: Optional[str],
-) -> bool:
-    """
-    写入 escalation_ticket 表。
-
-    转人工不写 user_feedback 表（它们是不同的业务语义）。
-    """
-    from opensearch_pipeline.db import _get_db_conn
-
-    conn = _get_db_conn()
-    try:
-        # 查询原始问答上下文
-        session_id = ""
-        query_text = ""
-        ai_answer = ""
-        user_dept = None
-
-        with conn.cursor() as cursor:
-            cursor.execute(
-                f"""
-                SELECT session_id, query_text, answer_text, user_dept
-                FROM {_op_db()}.qa_session_log
-                WHERE message_id = %s
-                LIMIT 1
-                """,
-                (message_id,),
-            )
-            row = cursor.fetchone()
-            if row:
-                session_id = row[0] or ""
-                query_text = row[1] or ""
-                ai_answer = row[2] or ""
-                user_dept = row[3]
-
-        # 写入 escalation_ticket
-        ticket_id = str(uuid.uuid4())
-        with conn.cursor() as cursor:
-            cursor.execute(
-                f"""
-                INSERT INTO {_op_db()}.escalation_ticket (
-                    ticket_id, session_id, message_id, user_id, user_name, user_dept,
-                    query_text, ai_answer, trigger_reason, ticket_status
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s
-                )
-                """,
-                (
-                    ticket_id, session_id, message_id, user_id, user_name, user_dept,
-                    query_text, ai_answer, "USER_HANDOFF", "PENDING",
-                ),
-            )
-        conn.commit()
-
-        logger.info(
-            "escalation_ticket 创建成功: ticket_id=%s, message_id=%s, user_id=%s",
-            ticket_id, message_id, user_id,
-        )
-        # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise，commit 之后）：
-        # 盲区审计 P1-2——工单不能只写不读，被引用文档归属部门的管理员要即时知晓。
-        try:
-            from opensearch_pipeline.admin_notify import notify_escalation
-            notify_escalation(message_id, query_text)
-        except Exception as notify_err:   # noqa: BLE001
-            logger.warning("escalation 通知失败（忽略）: %s", notify_err)
-        return True
-
-    except Exception as e:
-        conn.rollback()
-        logger.error(
-            "escalation_ticket 创建失败: message_id=%s, error=%s",
             message_id, e, exc_info=True,
         )
         return False

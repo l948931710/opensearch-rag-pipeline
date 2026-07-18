@@ -624,7 +624,7 @@ def _stream_answer_to_card(
             key=stream_key, is_full=True, is_finalize=True,
         )
         # 可选「白屏保险」：把定稿全文也写进 cardData[stream_key]，让【完成态卡片在 cardData 里自洽】。
-        # 背景：自定义「回传请求」按钮(👍/👎/转人工)被点击时，钉钉客户端可能从 cardData 重渲染卡片；
+        # 背景：自定义「回传请求」按钮(👍/👎等)被点击时，钉钉客户端可能从 cardData 重渲染卡片；
         # 而 create 时 stream_key 置空、流式正文只在「流式通道」→ 重渲染读 cardData 就是空 → 白屏。
         # 本模板(原生2)完成态正文绑定的恰是 stream_key(content)，故把全文持久化进 cardData 后，
         # 重渲染即自洽、不白屏。默认【关闭】：保持"纯流式定稿、不调 update_card_data"的现状，避免对
@@ -1269,7 +1269,7 @@ async def card_callback(request: Request):
     """
     钉钉互动卡片 HTTP 回调端点。
 
-    当用户点击卡片上的按钮（有帮助/没帮助/转人工）时，
+    当用户点击卡片上的按钮（有帮助/没帮助；存量卡片还有已下线的转人工）时，
     钉钉 POST 到此端点。处理反馈后更新卡片状态。
 
     回调请求体格式：
@@ -1320,7 +1320,7 @@ def _card_callback_authorized(message_id: str, user_id: str,
     """Track-2 防伪造：写反馈/工单前校验卡片回调的 message_id 归属。
 
     公网 POST /dingtalk/card/callback 无签名校验、可被任意 POST 伪造（Stream 模式下合法回调走
-    出站 WSS、根本不经此 HTTP 路由）。攻击者可凭伪造 body 灌反馈/开转人工工单/把他人会话标
+    出站 WSS、根本不经此 HTTP 路由）。攻击者可凭伪造 body 灌反馈/把他人会话标
     AWAITING_COMMENT。落库前必须确认：
       1) message_id 是【真实存在】的问答消息（杜绝喷洒/捏造 id —— message_id 是 128 位不可枚举 id）；
       2) 若该消息有【明确归属用户】(qa_session_log.user_id 非空)，回调 userId 必须一致（防跨用户伪造）；
@@ -1449,7 +1449,7 @@ def _process_card_callback_inner(body: dict):
         return {}  # ACK-only（不带 cardData）→ 不更新卡片
 
     # ⚠️ 回调一律 ACK-only：响应里【绝不放 cardData】→ 钉钉不重渲染卡片 → 不会冲掉流式写入的正文
-    # （白屏根因，已三次实证）。赞踩的视觉由钉钉【原生 Feedback 组件】自己呈现；转人工/补充原因的
+    # （白屏根因，已三次实证）。赞踩的视觉由钉钉【原生 Feedback 组件】自己呈现；补充原因的
     # 提示走机器人 1 对 1 文本消息（回调请求里没有 sessionWebhook）。落库失败 fail open，不影响 ACK。
     _ACK: dict = {}
 
@@ -1461,18 +1461,16 @@ def _process_card_callback_inner(body: dict):
     if not _card_callback_authorized(message_id, user_id, prefetch=_prefetch):
         return _ACK
 
-    # ── 转人工 ──
+    # ── 转人工（已下线 2026-07）──
+    #    存量卡片上的按钮无法撤回，仍会回调 handoff：不建单不通知，只回诚实的下线提示，
+    #    语料缺口由知识贡献系统兜底。
     if action == "handoff":
         try:
-            handle_feedback(message_id=message_id, user_id=user_id, user_name=user_name, action="handoff")
             if user_id:
-                # 文案与真实机制对齐（盲区审计 P1-2）：工单进控制台队列 + 管理员钉钉通知，
-                # 管理员答复后由 kb_escalation_resolve 1 对 1 推回提问者。
-                send_text_to_user(user_id, "🙋 已为你转人工：问题已进入人工工单队列并通知管理员，"
-                                           "答复后会通过钉钉消息回复你～")
+                send_text_to_user(user_id, "ℹ️ 转人工已下线：如答案未解决问题，"
+                                           "可到知识库控制台「知识贡献」提交你的问题，管理员会跟进补充。")
         except Exception as e:
-            logger.error("handoff 处理失败: %s", e, exc_info=True)
-            _ACK["_write_failed"] = True   # 批次9：释放 replay 键，重试点击可重新开工单
+            logger.error("handoff 下线提示发送失败: %s", e, exc_info=True)
         return _ACK
 
     # ── 「补充原因」自由文本：标记待补充 + 提示用户直接回复 ──

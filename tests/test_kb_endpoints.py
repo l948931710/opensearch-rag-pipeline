@@ -870,113 +870,6 @@ def test_feedback_review_sql_columns_exist_in_authoritative_ddl(monkeypatch):
         assert "q.query_text" in sql   # 问题文本必须取自 query_text（本 bug 的直接钉子）
 
 
-# ── GET /api/kb/escalations + POST resolve：转人工工单队列（盲区审计 P1-2）──────
-def test_escalations_dept_scope_age_and_redaction(monkeypatch):
-    """dept_admin 作用域=引用文档归属（EXISTS + owner IN）；收件箱按龄升序且不设时间窗；
-    他人提问/AI 答案过 PII 脱敏；工单龄/文档 chips 正确落 item。"""
-    _skip_if_not_sim()
-    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
-    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "production")
-    # 11 列：ticket_id, message_id, user_name, user_dept, query_text, ai_answer,
-    #        ticket_status, expert_answer, assigned_user_name, created_at, age_days
-    rows = [("T1", "M1", "王强", "生产部", "换模流程？手机 13812345678",
-             "AI 曾答 13812345678", None, None, None, "2026-06-28 09:12:00", 6)]
-    chips = [("M1", "D1", "注塑首件检验 SOP", "production")]
-    sink = _stub_multi(monkeypatch, [rows, chips])
-    from opensearch_pipeline import api
-    resp = api.kb_escalations(request=None, limit=20, identity=api.Identity(user_id="da1"))
-    assert resp.scope == "dept"
-    it = resp.items[0]
-    assert it.ticket_id == "T1" and it.status == "PENDING" and it.closed is False
-    assert it.age_days == 6 and it.user_name == "王强"
-    assert "13812345678" not in it.question                 # 他人提问必须脱敏
-    assert "13812345678" not in it.ai_answer_excerpt        # AI 答案节选同纪律
-    assert [d.doc_id for d in it.docs] == ["D1"]
-    list_sql = sink["calls"][0][0]
-    assert "EXISTS" in list_sql and "owner_dept IN" in list_sql   # 作用域=引用文档归属
-    assert "ORDER BY e.created_at ASC" in list_sql                # 按龄：老单先出
-    assert "INTERVAL" not in list_sql                             # 收件箱不设时间窗
-
-
-def test_escalations_kb_admin_include_closed(monkeypatch):
-    """kb_admin 全库（无 EXISTS 作用域——含无引用文档的 NO_RESULT 工单）；
-    include_closed=True → 带 90 天窗 + 未处置置顶。"""
-    _skip_if_not_sim()
-    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    rows = [("T2", "M2", "李敏", "外贸部", "认证？", "", "RESOLVED",
-             "已答复内容", "陈管理员", "2026-06-20 11:03:00", 14)]
-    sink = _stub_multi(monkeypatch, [rows, []])
-    from opensearch_pipeline import api
-    resp = api.kb_escalations(request=None, limit=20, include_closed=True,
-                              identity=api.Identity(user_id="adm1"))
-    assert resp.scope == "global"
-    assert resp.items[0].closed is True and resp.items[0].expert_answer == "已答复内容"
-    assert resp.items[0].assigned_user_name == "陈管理员"
-    list_sql = sink["calls"][0][0]
-    assert "EXISTS" not in list_sql
-    assert "INTERVAL 90 DAY" in list_sql
-
-
-def test_escalation_resolve_answer_updates_and_notifies_user(monkeypatch):
-    """resolve + expert_answer：写终态（RESOLVED/expert_answer/answered_at/closed_at）
-    并把人工答复 1 对 1 推回提问者钉钉（信任恢复闭环的最后一步）。"""
-    _skip_if_not_sim()
-    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    sink = _stub_multi(monkeypatch, [("M9", "staff9", "怎么冲销入库单？")])
-    sent = []
-    monkeypatch.setattr("opensearch_pipeline.dingtalk_card.send_text_to_user",
-                        lambda uid, text: (sent.append((uid, text)), True)[1])
-    from opensearch_pipeline import api
-    r = api.kb_escalation_resolve(
-        api.KbEscalationResolveRequest(ticket_id="T9", action="resolve",
-                                       expert_answer="弃审后红字冲销，注意当月未结账"),
-        request=None, identity=api.Identity(user_id="adm1"))
-    assert r["ticket_status"] == "RESOLVED" and r["user_notified"] is True
-    assert sent and sent[0][0] == "staff9" and "弃审后红字冲销" in sent[0][1]
-    upd = [s for s, _ in sink["calls"] if "UPDATE" in s][0]
-    assert "expert_answer=%s" in upd and "answered_at=NOW()" in upd and "closed_at=NOW()" in upd
-    assert sink.get("committed")
-
-
-def test_escalation_resolve_dept_admin_out_of_scope_403(monkeypatch):
-    """dept_admin 越权守卫：工单回答未引用其作用域文档 → 403（与队列可见性同源）。"""
-    _skip_if_not_sim()
-    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
-    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "production")
-    from fastapi import HTTPException
-    _stub_multi(monkeypatch, [("M9", "staff9", "q")])   # 作用域校验 fetchone → None
-    from opensearch_pipeline import api
-    with pytest.raises(HTTPException) as ei:
-        api.kb_escalation_resolve(
-            api.KbEscalationResolveRequest(ticket_id="T9", action="resolve"),
-            request=None, identity=api.Identity(user_id="da1"))
-    assert ei.value.status_code == 403
-
-
-def test_escalation_resolve_reopen_and_missing_ticket(monkeypatch):
-    """reopen 清 closed_at 且不推钉钉消息；工单不存在 → 404。"""
-    _skip_if_not_sim()
-    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    from fastapi import HTTPException
-    sink = _stub_multi(monkeypatch, [("M9", "staff9", "q")])
-    sent = []
-    monkeypatch.setattr("opensearch_pipeline.dingtalk_card.send_text_to_user",
-                        lambda uid, text: (sent.append(uid), True)[1])
-    from opensearch_pipeline import api
-    r = api.kb_escalation_resolve(
-        api.KbEscalationResolveRequest(ticket_id="T9", action="reopen"),
-        request=None, identity=api.Identity(user_id="adm1"))
-    assert r["ticket_status"] == "PENDING" and r["user_notified"] is False and sent == []
-    upd = [s for s, _ in sink["calls"] if "UPDATE" in s][0]
-    assert "closed_at=NULL" in upd and "expert_answer" not in upd
-    _stub_multi(monkeypatch, [])                        # fetchone → None
-    with pytest.raises(HTTPException) as ei:
-        api.kb_escalation_resolve(
-            api.KbEscalationResolveRequest(ticket_id="TX", action="resolve"),
-            request=None, identity=api.Identity(user_id="adm1"))
-    assert ei.value.status_code == 404
-
-
 # ── GET /api/kb/visibility-explain：「谁能看到这篇文档」解释器（只读）──────────
 def test_visibility_explain_dept_internal_with_grants(monkeypatch):
     """dept_internal：owner 组 + 授权部门；与检索同源（marketing 无伞/共享 → 只有自身）。"""
@@ -1461,7 +1354,6 @@ def test_governance_kb_admin_shape_and_queries(monkeypatch):
     assert "document_sensitive_finding" in sqls                   # PII 风险
     assert "user_feedback" in sqls                                # 反馈好评率
     assert "PERCENT_RANK()" in sqls                               # 延迟 p50/p95
-    assert "escalation_ticket" in sqls                            # 转人工
     # 嵌入失败率两列都判非空（NULL 失败数绝不当 0% 完美率）
     assert "embedding_failed_chunks IS NOT NULL" in sqls
 

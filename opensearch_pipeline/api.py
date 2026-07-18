@@ -347,7 +347,7 @@ class AskResponse(BaseModel):
     usage: Dict[str, Any] = {}
     latency_ms: int = 0
     # 知识库未命中：检索为空 或 LLM 拒答（answer_flow.is_refusal_answer，可伴随弱相关来源）。
-    # 客户端据此渲染"未找到"空结果卡（隐藏来源/赞踩，保留转人工出口）。
+    # 客户端据此渲染"未找到"空结果卡（隐藏来源/赞踩，保留换个说法出口）。
     no_result: bool = False
     # 低置信带：top 检索分 < medium 阈值（llm_generator.is_low_confidence_band，
     # 与 RAG_LOW_CONFIDENCE_GUARD 开关无关）。客户端据此渲染低匹配提示条。
@@ -1383,7 +1383,7 @@ def ask_stream(req: AskRequest, request: Request,
                     yield f"data: {json.dumps(done_frame, ensure_ascii=False)}\n\n"
                 else:
                     yield f"data: {json.dumps({'type': 'chunk', 'content': NO_RESULT_MESSAGE}, ensure_ascii=False)}\n\n"
-                    # done 帧带 no_result + rephrase：让流式前端也能渲染结构化空结果卡（换个说法 + 转人工）
+                    # done 帧带 no_result + rephrase：让流式前端也能渲染结构化空结果卡（换个说法 chips）
                     yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(req.question, user_dept=user_dept)}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
@@ -1636,7 +1636,7 @@ def ask_stream(req: AskRequest, request: Request,
 class FeedbackRequest(BaseModel):
     message_id: str = Field(..., description="关联的 qa_session_log.message_id")
     user_id: str = Field("", description="反馈用户 ID")
-    feedback_type: str = Field(..., description="upvote / downvote / handoff")
+    feedback_type: str = Field(..., description="upvote / downvote（handoff 已下线，仅兼容旧端降级）")
     feedback_reason: Optional[str] = Field(None, description="反馈原因代码")
     feedback_comment: Optional[str] = Field(None, description="反馈备注")
 
@@ -2680,11 +2680,6 @@ KbFeedbackReviewResponse = _routes_kb_console.KbFeedbackReviewResponse
 kb_feedback_review = _routes_kb_console.kb_feedback_review
 KbFeedbackResolveRequest = _routes_kb_console.KbFeedbackResolveRequest
 kb_feedback_resolve = _routes_kb_console.kb_feedback_resolve
-KbEscalationItem = _routes_kb_console.KbEscalationItem
-KbEscalationsResponse = _routes_kb_console.KbEscalationsResponse
-kb_escalations = _routes_kb_console.kb_escalations
-KbEscalationResolveRequest = _routes_kb_console.KbEscalationResolveRequest
-kb_escalation_resolve = _routes_kb_console.kb_escalation_resolve
 KbReviewTaskItem = _routes_kb_console.KbReviewTaskItem
 KbReviewTasksResponse = _routes_kb_console.KbReviewTasksResponse
 kb_review_tasks = _routes_kb_console.kb_review_tasks

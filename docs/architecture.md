@@ -33,7 +33,7 @@
 | 文档存储 | 阿里云 OSS（`raw/` → `canonical/` → `rag-ready/` 三级目录） |
 | 元数据/审计 | 阿里云 RDS MySQL（`fuling_knowledge` + `fuling_operation` 两库） |
 | 向量索引 | 阿里云 HA3 向量检索版（Dense + Sparse + BM25 三路混合） |
-| 模型服务 | DashScope/百炼：Qwen LLM（`qwen3.6-plus`）、`text-embedding-v4`、Qwen-VL（OCR/VLM）、`qwen3-rerank` / `qwen3-vl-rerank` |
+| 模型服务 | DashScope/百炼：Qwen LLM（`qwen3.7-plus`）、`text-embedding-v4`、Qwen-VL（OCR/VLM）、`qwen3-rerank` / `qwen3-vl-rerank` |
 | 批处理调度 | 阿里云 DataWorks（每日调度 stage 1/2/3） |
 | 在线服务 | 阿里云 SAE（FastAPI + 钉钉机器人，单容器） |
 | 前端 | 钉钉机器人卡片（流式 typewriter）+ 钉钉小程序（`fuling-rag-miniapp/`） |
@@ -348,7 +348,7 @@ flowchart LR
 
 - **接收**：Webhook POST 回调，验签（app secret + timestamp），区分群聊/单聊/stream 模式；
 - **回复**：经 `session_webhook` 以**交互卡片**回复；流式路径 `_stream_answer_to_card()` 分片 PATCH 更新卡片，端上呈现 typewriter 效果；
-- **卡片回调**：处理反馈按钮点击（赞/踩/转人工）；卡片模板在 [card_templates/](../card_templates/)（`native_feedback_card.json` / `streaming_rag_feedback_card.json`）。
+- **卡片回调**：处理反馈按钮点击（赞/踩；转人工已下线 2026-07，存量卡片按钮降级为下线提示）；卡片模板在 [card_templates/](../card_templates/)（`native_feedback_card.json` / `streaming_rag_feedback_card.json`）。
 
 ### 7.3 钉钉小程序（fuling-rag-miniapp/）
 
@@ -391,7 +391,7 @@ SAE 公网 EIP（HTTP 测试期形态）已被扫描器探到端口，匿名直�
 
 † `faq_review_queue` 是**死表**（盲区审计 P3-19 如实标注）：schema 为「升级工单→专家答→FAQ→语料回灌」闭环预留，但全仓无任何生产者/消费者，`escalation_ticket.converted_to_faq` 也从不被置位。该闭环**从未实现**——现有的人工知识回灌路径是知识贡献入口（`contribution.py`：员工投稿→管理员采纳→合成 .md 走管线入库）。若将来实现工单转 FAQ，优先复用 contribution 管线而非激活此表；若确认不做，应随下一次 schema 变更删表。
 | 敏感发现 | `document_sensitive_finding`（仅哈希+掩码） |
-| 问答运营（fuling_operation） | `qa_session_log`（所有问答的唯一审计流水）、`user_feedback`、`escalation_ticket` |
+| 问答运营（fuling_operation） | `qa_session_log`（所有问答的唯一审计流水）、`user_feedback`、`escalation_ticket`（转人工已下线 2026-07，仅存量） |
 
 ### 8.2 OSS 目录布局
 
@@ -426,7 +426,7 @@ quarantine/   高风险隔离区
   | PROD-RO | `.env.prod_ro`（`RAG_ENV=test` 为其**弃用别名**） | 只读生产；`RAG_READONLY=true` |
   | PROD | （生产不设 `RAG_ENV`，SAE/DataWorks 直接注入） | DataWorks 正式 pipeline + 钉钉服务 |
 
-- **模型名在运行时解析**，不是 dataclass 默认值：有 DashScope key 时 LLM→`qwen3.6-plus`、OCR→`qwen-vl-ocr-latest`、VLM→`qwen3-vl-plus`、embedding→`text-embedding-v4`。dataclass 里的 Gemini 名仅是回退。**读 `load_config()` 工厂逻辑，别信字段默认值。**
+- **模型名在运行时解析**，不是 dataclass 默认值：有 DashScope key 时 LLM→`qwen3.7-plus`、OCR→`qwen-vl-ocr-latest`、VLM→`qwen3-vl-plus`、embedding→`text-embedding-v4`。dataclass 里的 Gemini 名仅是回退。**读 `load_config()` 工厂逻辑，别信字段默认值。**
 
 ### 9.2 Simulate 模式（本地零依赖运行）
 

@@ -72,28 +72,26 @@ def test_queue_aging_breaches_and_alerts(real_mode, monkeypatch):
     monkeypatch.setattr("opensearch_pipeline.alerting.send_ops_alert",
                         lambda *a, **k: alerts.append((a, k)) or True)
     _wire(monkeypatch, {
-        "escalation_ticket": (3, 12),      # 12 天 > SLA 7
-        "review_task": (99, 2),            # 99 > backlog 50
-        "user_feedback": (1, 1),           # 干净
+        "review_task": (3, 12),            # 12 天 > SLA 7
+        "user_feedback": (99, 2),          # 99 > backlog 50
     })
     rep = qm.run_queue_aging_check(alert=True)
     assert rep["ok"] is False
     kinds = {(b["queue"], b["kind"]) for b in rep["breaches"]}
-    assert kinds == {("escalation_ticket", "sla_age"), ("review_task", "backlog")}
-    assert rep["queues"]["user_feedback_unhandled"] == {"backlog": 1, "oldest_days": 1}
+    assert kinds == {("review_task", "sla_age"), ("user_feedback_unhandled", "backlog")}
+    assert rep["queues"]["review_task"] == {"backlog": 3, "oldest_days": 12}
     assert len(alerts) == 1 and alerts[0][1]["severity"] == "warning"
 
 
 def test_queue_aging_single_probe_failure_isolated(real_mode, monkeypatch):
     """单队列查询炸 → 该队列记 error，其余照常，无告警级 breach 则 ok。"""
     _wire(monkeypatch, {
-        "escalation_ticket": RuntimeError("table missing"),
-        "review_task": (0, None),
+        "review_task": RuntimeError("table missing"),
         "user_feedback": (0, None),
     })
     rep = qm.run_queue_aging_check(alert=False)
     assert rep["ok"] is True
-    assert "error" in rep["queues"]["escalation_ticket"]
+    assert "error" in rep["queues"]["review_task"]
 
 
 def test_ingest_funnel_flags_stuck_and_unindexed(real_mode, monkeypatch):
