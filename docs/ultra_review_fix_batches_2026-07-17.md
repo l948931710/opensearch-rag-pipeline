@@ -37,11 +37,20 @@
 ## 批次3 — 摄取链路 P1(现网 correctness/concurrency)
 | 状态 | 条目 | 位置 | 修法 |
 |---|---|---|---|
-| ⬜ | P1 超长 step_card 不切分被验证器整块丢弃 | `chunker.py:1197` | step_text 本体过 _split_long_text(is_step_continuation),对齐 1800-token parent 预算 |
-| ⬜ | P1 池连接不进事务模式→死锁中 SteadyDB 单句重放撕裂账本 | `db.py:207` | _get_db_conn 调 begin()(对齐 agent_runtime `_begin()` 已有模式) |
-| ⬜ | P1 deactivate 失败路径无 CAS 清掉 PENDING_DELETE 握手(两条重复计一) | `pipeline_nodes.py:6082` | 失败 UPDATE 补 `AND index_status='PROCESSING'` + lease clear,对齐 6208/7340 |
-| ⬜ | P1 chunk_meta 提交与状态收口间崩溃→unfrozen-rechunk 守卫楔死整批 | `pipeline_nodes.py:5472` | crash-resume 豁免:_chunk_set_hash 相同自动放行或按 doc 跳过而非整批 raise |
-| ⬜ | P1 run/daily 预算瞬态耗尽→健康文档被终态隔离 | `extraction/cost_breaker.py:463` | 仅 doc 自身原因(gate1/2/2b)才 quarantine;run/daily 预算拒绝保持可重捡 |
+| ✅ | P1 超长 step_card 不切分被验证器整块丢弃 | `chunker.py:1197` | step_text 本体过 _split_long_text(is_step_continuation),对齐 1800-token parent 预算 |
+| ✅ | P1 池连接不进事务模式→死锁中 SteadyDB 单句重放撕裂账本 | `db.py:207` | _get_db_conn 调 begin()(对齐 agent_runtime `_begin()` 已有模式) |
+| ✅ | P1 deactivate 失败路径无 CAS 清掉 PENDING_DELETE 握手(两条重复计一) | `pipeline_nodes.py:6082` | 失败 UPDATE 补 `AND index_status='PROCESSING'` + lease clear,对齐 6208/7340 |
+| ✅ | P1 chunk_meta 提交与状态收口间崩溃→unfrozen-rechunk 守卫楔死整批 | `pipeline_nodes.py:5472` | crash-resume 豁免:_chunk_set_hash 相同自动放行或按 doc 跳过而非整批 raise |
+| ✅ | P1 run/daily 预算瞬态耗尽→健康文档被终态隔离 | `extraction/cost_breaker.py:463` | 仅 doc 自身原因(gate1/2/2b)才 quarantine;run/daily 预算拒绝保持可重捡 |
+
+**批次3 落地记录(2026-07-17)**,as-built 与修法的差异及关键决策:
+- **超长 step_card**:分治两形态——(a) step_text 本体单独超长(单步吞并多页,parts 仅 `[step_text]`)时把本体过 `_split_long_text`,首段作主块、其余正文段+补充降级续接块;(b) step_text 可容纳、仅叠加补充超长时**完全保留原贪心塞补充行为**(零回归)。max_chunk_chars 默认 800≈533 token,切后远低于 2000-token 校验上限。
+- **db.py begin()**:未采「无条件 begin() 改所有路径」的字面最简法。新增防御式 `_begin_txn`(对齐 `run_store._begin`:getattr 桩跳过 + **try/except 保读路径可用性**——begin 抛错不阻断取连接),在 `_get_db_conn` **事务开头**调用(保 FOR UPDATE 锁语义)。**读路径代价**:单句 SELECT 中途断连不再 SteadyDB 静默重放,改抛错(serving 映射 503 快速失败);ping=1 取连接重连不受影响。**kill switch `RAG_DB_TXN_BEGIN=false`** 恢复旧无-begin 语义(逃生口)。
+- **deactivate 失败 CAS**:失败路径 `SET index_status='FAILED'{clear_set_sql()}` + `AND index_status='PROCESSING'`,逐字对齐 7340(FAILED 是复位型终态,只清租约不拼 epoch 栅栏)。clear_set_sql() 现网 flag off 为空串→纯 PENDING_DELETE 保护、零租约副作用。
+- **crash-resume 豁免**:采「精准区分」而非「全 _prior 放行」。关键区分点=**状态互斥**:crash-resume(sweep 转 `FAILED`+`retry>0`)vs deliberate reset_for_rechunk(`NOT_STARTED`+`retry=0`)。新增 `_partition_prior_rechunk`(JOIN document_version+document_meta):crash-resume 目标 **auto-freeze 复用 document_meta 存储分类**续跑(zero-LLM,family 保持),category 丢失则降级 deliberate(fail-closed);deliberate 仍整批 raise。override(`RAG_ALLOW_UNFROZEN_RECHUNK`)docset_hash 现只按 deliberate 子集算(crash-resume 不需 override)。**kill switch `RAG_CRASH_RESUME_AUTOFREEZE=false`** 回退旧整批 raise。**行为变化**:此前有 chunk 的目标一律整批 raise,现 crash-resume 自动续跑——请 review。
+- **cost_breaker 瞬态**:新增 `_is_transient_cost_deny`(短语契约:`RUN budget exhausted`/`would exceed RUN budget`/`DAILY budget exhausted`=瞬态);gate_vlm_rebuild 仅对非瞬态(doc-intrinsic 闸1/2/2b)才 quarantine,RUN/DAILY 预算瞬态耗尽保持文档可重认领。
+
+每批验证:`make test` 4008 passed/1 skipped + `make lint` 绿(2026-07-17,一处测试断言因 6082 SQL 换行而更新,已加强验证 CAS)。未验证声明:真实 RDS 死锁下 begin() 的重放阻断(纯机制,单测覆盖 helper)、真实 crash 窗口的 stage-2 续跑(状态机+分区逻辑单测覆盖)、真实 HA3/DataWorks 端到端。两个新 kill switch(`RAG_DB_TXN_BEGIN`/`RAG_CRASH_RESUME_AUTOFREEZE`)默认 on=修复生效。
 
 ## 批次4 — flag 翻开前置(agent/durable/general-ability;flag 默认 off 但在铺开路径)
 | 状态 | 条目 | 位置 | 修法 |
