@@ -833,6 +833,19 @@ def _execute_general_llm(question: str, *, history, tier: str,
       answer/model/usage · answer_status（None=调用方维持原状态）· intent_type ·
       risk_level/risk_blocked · no_result（响应 flag）· source（AskResponse.source）
     """
+    # 批次4（ultra general_answerer:203）：确定性计算器**先于配额**（tier=office）——
+    # calc 命中零 LLM 成本，文档契约即「免配额」（general_answerer 注释/answer_flow 话术
+    # 均如此承诺），但此前先 admit_general 再进 answer_general 的 calc 分支：算术题白烧
+    # 配额格，配额用尽后连零成本的「3+5=?」都吃配额拒答话术。calc 命中直接返回，
+    # 不经 admit_general；未命中照常走配额 + 通用 LLM。
+    if tier == "office":
+        from opensearch_pipeline.general_answerer import try_deterministic_calc
+        _calc = try_deterministic_calc((question or "").strip())
+        if _calc is not None:
+            return {"answer": _calc, "model": "calc", "usage": {},
+                    "answer_status": "SUCCESS", "intent_type": "office",
+                    "risk_level": None, "risk_blocked": False,
+                    "no_result": False, "source": "general"}
     actor = f"u:{identity.user_id}" if identity else "ip:anon"
     # 本文件铁律（见头部注释）：限流器按模块属性访问，不 from-import 按值绑定
     denial = _rate_limiter.LIMITER.admit_general(actor, is_user=bool(identity))

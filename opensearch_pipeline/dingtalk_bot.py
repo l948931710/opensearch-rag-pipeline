@@ -711,6 +711,15 @@ def _bot_general_flags(conversation_type: str = "1"):
 
 def _bot_execute_general_llm(question: str, *, history, tier: str, sender_staff_id: str):
     """T2/T3 通用回答执行（含日配额）。LLM 异常 → None（回落今日拒答行为）。"""
+    # 批次4（ultra general_answerer:203）：确定性计算器先于配额（与 api 侧同源修复）——
+    # calc 命中零 LLM 成本免配额，配额用尽也不拒零成本算术。
+    if tier == "office":
+        from opensearch_pipeline.general_answerer import try_deterministic_calc
+        _calc = try_deterministic_calc((question or "").strip())
+        if _calc is not None:
+            return {"answer": _calc, "model": "calc", "answer_status": "SUCCESS",
+                    "intent_type": "office", "risk_level": None, "risk_blocked": False,
+                    "source": "general"}
     actor = f"u:{sender_staff_id}" if sender_staff_id else "ip:anon"
     denial = LIMITER.admit_general(actor, is_user=bool(sender_staff_id))
     if denial is not None:
