@@ -56,3 +56,4 @@
 047_agent_run_cancel_request.sql operation
 048_ingest_lease.sql knowledge
 049_acl_outbox_generation.sql knowledge
+050_qa_rewritten_query.sql operation

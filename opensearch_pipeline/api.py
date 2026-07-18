@@ -870,10 +870,22 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
     (t0, session_id, merged_history, uid, user_dept) = _prepare_session(
         req, identity, request=request)
 
+    # 1.5 多轮追问改写（RAG_FOLLOWUP_REWRITE 默认关；query_rewriter 自带门控与 fail-open）：
+    #     「那第二步呢」类指代追问在检索前改写成独立问题——检索/失败分诊用改写后
+    #     effective_query，生成端仍用原始问题（history 本就注入 LLM，零行为漂移）；
+    #     rewritten 随返回值透传给落库（schema/050 列 + hash 按真实意图）。
+    rewritten_query: Optional[str] = None
+    try:
+        from opensearch_pipeline.query_rewriter import maybe_rewrite
+        rewritten_query = maybe_rewrite(req.question, merged_history)
+    except Exception as _rw_err:   # noqa: BLE001 — 改写链路任何异常都不碰主流程
+        logger.warning("追问改写异常（回退原问题，non-fatal）: %s", _rw_err)
+    effective_query = rewritten_query or req.question
+
     # 2. 检索
     try:
         chunks = retrieve_and_enrich(
-            req.question, top_k=req.top_k, user_dept=user_dept,
+            effective_query, top_k=req.top_k, user_dept=user_dept,
             cosurface_images=cosurface_images,
         )
     except Exception as e:
@@ -883,7 +895,8 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
 
     t_retrieval = time.time()
     retrieval_latency_ms = int((t_retrieval - t0) * 1000)
-    return t0, session_id, merged_history, uid, user_dept, chunks, t_retrieval, retrieval_latency_ms
+    return (t0, session_id, merged_history, uid, user_dept, chunks, t_retrieval,
+            retrieval_latency_ms, rewritten_query)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1129,11 +1142,14 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         )
 
     (t0, session_id, merged_history, uid, user_dept,
-     chunks, t_retrieval, retrieval_latency_ms) = _prepare_ask(req, identity, request=request)
+     chunks, t_retrieval, retrieval_latency_ms, rewritten_query) = _prepare_ask(
+        req, identity, request=request)
+    effective_query = rewritten_query or req.question
 
     if not chunks:
-        # 统一失败序列（检索为空）：分诊 → 通用回答 / 引导式拒答；flag 全关 → None（现状）
-        outcome = _general_failure_outcome(req.question, [], identity=identity,
+        # 统一失败序列（检索为空）：分诊 → 通用回答 / 引导式拒答；flag 全关 → None（现状）。
+        # 分诊用 effective_query（追问已改写为独立问题，分诊/引导语义才对得上）。
+        outcome = _general_failure_outcome(effective_query, [], identity=identity,
                                            user_dept=user_dept, history=merged_history)
         latency = int((time.time() - t0) * 1000)
         msg_id = generate_message_id()
@@ -1160,6 +1176,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
                 intent_type=outcome["intent_type"],
                 risk_level=outcome["risk_level"],
                 risk_blocked=outcome["risk_blocked"],
+                rewritten_query=rewritten_query,
             ))
             return AskResponse(
                 answer=outcome["answer"],
@@ -1170,7 +1187,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
                 usage=outcome["usage"],
                 latency_ms=int((time.time() - t0) * 1000),
                 no_result=outcome["no_result"],
-                rephrase=(_suggest_rephrase(req.question, user_dept=user_dept)
+                rephrase=(_suggest_rephrase(effective_query, user_dept=user_dept)
                           if outcome["no_result"] else []),
                 source=outcome["source"],
             )
@@ -1186,6 +1203,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
             latency_ms=latency,
             retrieval_latency_ms=retrieval_latency_ms,
             answer_status="NO_RESULT",
+            rewritten_query=rewritten_query,
         ))
         return AskResponse(
             answer=NO_RESULT_MESSAGE,
@@ -1196,7 +1214,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
             usage={},
             latency_ms=latency,
             no_result=True,
-            rephrase=_suggest_rephrase(req.question, user_dept=user_dept),
+            rephrase=_suggest_rephrase(effective_query, user_dept=user_dept),
         )
 
     # 3. LLM 生成。深度思考（req.thinking）走流式通道服务端攒流：DashScope qwen3
@@ -1241,6 +1259,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
             retrieval_latency_ms=retrieval_latency_ms,
             answer_status="LLM_ERROR",
             error_message=f"[trace={trace_id}] {str(e)[:500]}",
+            rewritten_query=rewritten_query,
         ))
         raise HTTPException(status_code=500, detail=f"回答生成失败，请联系管理员 (trace: {trace_id})")
 
@@ -1259,8 +1278,9 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
     _log_risk_level = None
     _log_risk_blocked = False
     if resp_no_result:
-        # 统一失败序列（LLM 拒答）：分诊 → 通用回答 / 引导式拒答替换；flag 全关 → None
-        outcome = _general_failure_outcome(req.question, chunks, identity=identity,
+        # 统一失败序列（LLM 拒答）：分诊 → 通用回答 / 引导式拒答替换；flag 全关 → None。
+        # 分诊用 effective_query（追问已改写为独立问题）。
+        outcome = _general_failure_outcome(effective_query, chunks, identity=identity,
                                            user_dept=user_dept, history=merged_history)
         if outcome is not None:
             result["answer"] = outcome["answer"]     # 替换文本均为纯文本（无 <<IMG>> 标记）
@@ -1332,6 +1352,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         # P2-20/21/22：LLM 成功路径透传生成元数据（generate_answer[_via_stream] 返回 dict
         # 里的 "gen_meta"；测试 mock 不带该键 → .get 得 None，不炸）
         gen_meta=result.get("gen_meta"),
+        rewritten_query=rewritten_query,
         intent_type=_log_intent,
         risk_level=_log_risk_level,
         risk_blocked=_log_risk_blocked,
@@ -1348,7 +1369,7 @@ def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks,
         latency_ms=latency,
         no_result=resp_no_result,
         guard=resp_guard,
-        rephrase=_suggest_rephrase(req.question, user_dept=user_dept) if resp_no_result else [],
+        rephrase=_suggest_rephrase(effective_query, user_dept=user_dept) if resp_no_result else [],
         source=resp_source,
     )
 
@@ -1432,14 +1453,16 @@ def ask_stream(req: AskRequest, request: Request,
 
     # 前置段与 /api/ask 共用；检索失败在返回 StreamingResponse 之前即抛 500
     (t0, session_id, merged_history, uid, user_dept,
-     chunks, _t_retrieval, retrieval_latency_ms) = _prepare_ask(
+     chunks, _t_retrieval, retrieval_latency_ms, rewritten_query) = _prepare_ask(
         req, identity, request=request, cosurface_images=not _pure)
+    effective_query = rewritten_query or req.question
     message_id = generate_message_id()
 
     # 无结果：仍发出 message_id 并落库（NO_RESULT），与 /api/ask 空结果分支保持一致
     if not chunks:
-        # 统一失败序列（检索为空）：分诊 → 通用回答 / 引导式拒答；flag 全关 → None（现状）
-        _empty_outcome = _general_failure_outcome(req.question, [], identity=identity,
+        # 统一失败序列（检索为空）：分诊 → 通用回答 / 引导式拒答；flag 全关 → None（现状）。
+        # 分诊用 effective_query（追问已改写为独立问题）。
+        _empty_outcome = _general_failure_outcome(effective_query, [], identity=identity,
                                                   user_dept=user_dept, history=merged_history)
 
         def empty_gen():
@@ -1457,12 +1480,12 @@ def ask_stream(req: AskRequest, request: Request,
                                   "no_result": _empty_outcome["no_result"],
                                   "source": _empty_outcome["source"]}
                     if _empty_outcome["no_result"]:
-                        done_frame["rephrase"] = _suggest_rephrase(req.question, user_dept=user_dept)
+                        done_frame["rephrase"] = _suggest_rephrase(effective_query, user_dept=user_dept)
                     yield f"data: {json.dumps(done_frame, ensure_ascii=False)}\n\n"
                 else:
                     yield f"data: {json.dumps({'type': 'chunk', 'content': NO_RESULT_MESSAGE}, ensure_ascii=False)}\n\n"
                     # done 帧带 no_result + rephrase：让流式前端也能渲染结构化空结果卡（换个说法 chips）
-                    yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(req.question, user_dept=user_dept)}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'model': 'N/A', 'usage': {}, 'no_result': True, 'rephrase': _suggest_rephrase(effective_query, user_dept=user_dept)}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 if _empty_outcome is not None and should_append_history(
@@ -1487,6 +1510,7 @@ def ask_stream(req: AskRequest, request: Request,
                     intent_type=(_empty_outcome["intent_type"] if _empty_outcome is not None else None),
                     risk_level=(_empty_outcome["risk_level"] if _empty_outcome is not None else None),
                     risk_blocked=bool(_empty_outcome and _empty_outcome["risk_blocked"]),
+                    rewritten_query=rewritten_query,
                 ))
 
         return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
@@ -1546,7 +1570,7 @@ def ask_stream(req: AskRequest, request: Request,
                     _verdict, _held_events, _llm_events = _gate_probe(_llm_events)
                     if _verdict:
                         _replaced = _general_failure_outcome(
-                            req.question, chunks, identity=identity,
+                            effective_query, chunks, identity=identity,
                             user_dept=user_dept, history=merged_history)
                         if _replaced is not None:
                             for _ev in _llm_events:   # 吞掉剩余拒答流（不下发）
@@ -1574,7 +1598,7 @@ def ask_stream(req: AskRequest, request: Request,
                             done_frame["suggest_titles"] = _ts
                         else:
                             done_frame["rephrase"] = _suggest_rephrase(
-                                req.question, user_dept=user_dept)
+                                effective_query, user_dept=user_dept)
                     yield f"data: {json.dumps(done_frame, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     completed = True
@@ -1614,7 +1638,7 @@ def ask_stream(req: AskRequest, request: Request,
                                         frame["suggest_titles"] = _ts
                                     else:
                                         frame["rephrase"] = _suggest_rephrase(
-                                            req.question, user_dept=user_dept)
+                                            effective_query, user_dept=user_dept)
                             yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
                             continue
                         # 思考过程帧只下发给【显式请求 thinking】的调用方：防 RAG_STREAM_REASONING 全局 flag
@@ -1695,6 +1719,7 @@ def ask_stream(req: AskRequest, request: Request,
                 error_message=error_message,
                 content_blocks_json=content_blocks_json_str,
                 gen_meta=gen_meta_out.get("gen_meta"),
+                rewritten_query=rewritten_query,
                 intent_type=intent_type_out,
                 risk_level=risk_level_out,
                 risk_blocked=risk_blocked_out,
@@ -2870,6 +2895,9 @@ kb_contribution_reject = _routes_contribution.kb_contribution_reject
 kb_contribution_retry = _routes_contribution.kb_contribution_retry
 kb_contribution_heroes = _routes_contribution.kb_contribution_heroes
 kb_gaps = _routes_contribution.kb_gaps
+KbGapContextTurn = _routes_contribution.KbGapContextTurn
+KbGapContextResponse = _routes_contribution.KbGapContextResponse
+kb_gap_context = _routes_contribution.kb_gap_context
 KbGapDismissRequest = _routes_contribution.KbGapDismissRequest
 KbGapDismissResponse = _routes_contribution.KbGapDismissResponse
 KbGapDismissedItem = _routes_contribution.KbGapDismissedItem

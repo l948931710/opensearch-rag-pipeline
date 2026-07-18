@@ -73,10 +73,20 @@ class _FakeCur:
             return c.gap_group_head_row
         if "qa_gap_dismissal" in s and "LIMIT 1" in s:   # 批次9 裁权：幂等豁免探针
             return (1,) if c.gap_dismissal_rows else None
+        if "WHERE message_id=" in s and "session_id" in s:   # 缺口上下文：单 message 行
+            return c.ctx_msg_row
+        if "hit_mine" in s and "WHERE q.message_id=" in s:   # 缺口上下文：REFUSAL 可见性
+            return c.ctx_vis_row
         return None
 
     def fetchall(self):
         s, c = self._last, self.conn
+        if "MIN(id)" in s and "GROUP BY session_id" in s:   # 会话上下文批查（2026-07-18）
+            if c.boom_session_min:
+                raise Exception("simulated session-min failure")
+            return c.session_min_rows
+        if "ORDER BY created_at DESC, id DESC" in s:        # 缺口上下文：前序行游标查询
+            return c.ctx_prior_rows
         if "answer_status='NO_RESULT'" in s:
             return c.no_result_rows
         if "t.hit_mine=1 OR t.all_public=1" in s:
@@ -145,6 +155,11 @@ class _FakeConn:
         self.boom_dismissal = kw.get("boom_dismissal", False)
         self.gap_group_head_row = kw.get("gap_group_head_row")
         self.gap_group_member_rows = kw.get("gap_group_member_rows", [])
+        self.session_min_rows = kw.get("session_min_rows", [])     # (session_id, min_id)
+        self.boom_session_min = kw.get("boom_session_min", False)
+        self.ctx_msg_row = kw.get("ctx_msg_row")                   # 上下文端点：单 message 行
+        self.ctx_vis_row = kw.get("ctx_vis_row")                   # (hit_mine, all_public)
+        self.ctx_prior_rows = kw.get("ctx_prior_rows", [])         # 前序行（DESC 序）
         self.list_rows = kw.get("list_rows", [])
         self.summary = kw.get("summary", {})
         self.calls = []
@@ -1452,3 +1467,140 @@ def test_gap_dismiss_kb_admin_unrestricted(monkeypatch):
                               request=None, identity=_ident())
     assert resp.ok is True
     assert any("qa_gap_dismissal" in s and "INSERT" in s for s, _ in conn.calls)
+
+
+# ── 10) 无效问题分层过滤 + 缺口上下文（2026-07-18）──────────────────────────
+def test_junk_and_incomplete_pure_functions():
+    """分层判定纯函数边界：junk 只认确定性垃圾；incomplete 只认短缺主体；
+    「怎么请假/如何报销/库存多少」两者都不命中（绝不误杀有效短问题）。"""
+    from opensearch_pipeline.contribution import is_incomplete_question, is_junk_question
+    # 确定性垃圾
+    for q in ("", "   ", "？？？", "。。。", "!!!", "😀😀", "5", "12345", "假"):
+        assert is_junk_question(q), q
+        assert not is_incomplete_question(q), q   # 两类互斥：junk 不再算 incomplete
+    # 短缺主体（追问形态）
+    for q in ("那第二步呢", "然后呢", "上面那个", "还有吗", "这个呢", "继续", "第3步呢"):
+        assert not is_junk_question(q), q
+        assert is_incomplete_question(q), q
+    # 有效短问题：两者都不命中
+    for q in ("怎么请假", "如何报销", "库存多少", "访客WiFi密码", "请假流程", "怎么开发票"):
+        assert not is_junk_question(q), q
+        assert not is_incomplete_question(q), q
+    # 长句即便含指代词也不算 incomplete（内容自足）
+    assert not is_incomplete_question("那台注塑机的换模流程第二步的审批人是谁")
+
+
+def test_gaps_junk_filtered_and_flag_off_restores(monkeypatch):
+    """确定性垃圾（纯标点/单字/纯数字）默认不进缺口；RAG_QA_GAP_JUNK_FILTER=false 逃生阀恢复。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from opensearch_pipeline import api, contribution as C
+    rows = [("？？？", "j1", 1, "marketing"),
+            ("7", "j2", 1, "marketing"),
+            ("怎么开发票", "n1", 2, "marketing")]
+    _install_conn(monkeypatch, _FakeConn(no_result_rows=rows))
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert [it.question_hash for it in resp.items] == [C.question_hash("怎么开发票")]
+    # 逃生阀：关掉过滤 → 垃圾行回来（现状行为）
+    monkeypatch.setenv("RAG_QA_GAP_JUNK_FILTER", "false")
+    from opensearch_pipeline.routes import contribution as RC
+    RC._gaps_cache_clear()
+    _install_conn(monkeypatch, _FakeConn(no_result_rows=rows))
+    resp2 = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert len(resp2.items) == 3
+
+
+def test_gaps_incomplete_layering(monkeypatch):
+    """分层第 2/3 层：短缺主体+有会话上文 → 保留（has_context=True）；
+    短缺主体+无上文 → 低质量隐藏；RAG_QA_GAP_HIDE_INCOMPLETE=false 恢复。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from opensearch_pipeline import api, contribution as C
+    # 6 列行：(query_text, message_id, days, dept, session_id, id)
+    rows = [("然后呢", "m1", 1, "marketing", "S1", 30),        # S1 min_id=10 → 有上文
+            ("上面那个", "m2", 1, "marketing", "S2", 5),       # S2 min_id=5 → 自己是首行=无上文
+            ("怎么开发票", "m3", 2, "marketing", "S3", 8)]     # 完整问题不受分层影响
+    conn_kw = dict(no_result_rows=rows, session_min_rows=[("S1", 10), ("S2", 5), ("S3", 8)])
+    _install_conn(monkeypatch, _FakeConn(**conn_kw))
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    by_hash = {it.question_hash: it for it in resp.items}
+    assert C.question_hash("然后呢") in by_hash            # 有上文：保留
+    assert by_hash[C.question_hash("然后呢")].has_context is True
+    assert C.question_hash("上面那个") not in by_hash      # 无上文：低质量隐藏
+    assert C.question_hash("怎么开发票") in by_hash        # 有效问题不受影响
+    # 独立 flag 关闭 → 无上文的短缺主体问题也回来
+    monkeypatch.setenv("RAG_QA_GAP_HIDE_INCOMPLETE", "false")
+    from opensearch_pipeline.routes import contribution as RC
+    RC._gaps_cache_clear()
+    _install_conn(monkeypatch, _FakeConn(**conn_kw))
+    resp2 = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert C.question_hash("上面那个") in {it.question_hash for it in resp2.items}
+
+
+def test_gaps_incomplete_session_probe_fails_open(monkeypatch):
+    """会话批查失败 → fail-open：不隐藏任何缺口（宁噪音不丢真缺口），has_context=False。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from opensearch_pipeline import api, contribution as C
+    rows = [("然后呢", "m1", 1, "marketing", "S1", 30)]
+    _install_conn(monkeypatch, _FakeConn(no_result_rows=rows, boom_session_min=True))
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert [it.question_hash for it in resp.items] == [C.question_hash("然后呢")]
+    assert resp.items[0].has_context is False
+
+
+def test_gaps_rewritten_query_display_and_hash(monkeypatch):
+    """追问改写行（第 7 列 rewritten_query 非空）：展示与归并都按改写后的独立问题。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from opensearch_pipeline import api, contribution as C
+    rows = [("那第二步呢", "m1", 1, "marketing", "S1", 30, "U8 采购入库的第二步怎么操作"),
+            ("U8 采购入库的第二步怎么操作", "m2", 3, "marketing", "S2", 7, None)]
+    _install_conn(monkeypatch, _FakeConn(no_result_rows=rows))
+    resp = api.kb_gaps(request=None, limit=20, offset=0, identity=_ident(groups=("marketing",)))
+    assert len(resp.items) == 1                       # 改写后与独立问法同 hash → 归并
+    it = resp.items[0]
+    assert it.question_hash == C.question_hash("U8 采购入库的第二步怎么操作")
+    assert "第二步怎么操作" in it.question and it.asks == 2
+
+
+def test_gap_context_endpoint_visibility_and_cursor(monkeypatch):
+    """上下文端点：不存在/非缺口行 404；REFUSAL 不可见 403；可见时前序行按
+    (created_at,id) 游标返回、时间正序、SUCCESS 轮才带节选。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    from fastapi import HTTPException
+    from opensearch_pipeline import api
+    # 404：无此 message
+    _install_conn(monkeypatch, _FakeConn(ctx_msg_row=None))
+    with pytest.raises(HTTPException) as ei:
+        api.kb_gap_context(request=None, message_id="MX", identity=_ident(groups=("marketing",)))
+    assert ei.value.status_code == 404
+    # 404：存在但非缺口行（SUCCESS）
+    _install_conn(monkeypatch, _FakeConn(
+        ctx_msg_row=(30, "S1", "2026-07-18 10:00:00", "SUCCESS", "marketing", "M1")))
+    with pytest.raises(HTTPException) as ei:
+        api.kb_gap_context(request=None, message_id="M1", identity=_ident(groups=("marketing",)))
+    assert ei.value.status_code == 404
+    # 403：REFUSAL 且命中文档不在我部门、非全公开
+    _install_conn(monkeypatch, _FakeConn(
+        ctx_msg_row=(30, "S1", "2026-07-18 10:00:00", "REFUSAL", "finance", "M1"),
+        ctx_vis_row=(0, 0)))
+    with pytest.raises(HTTPException) as ei:
+        api.kb_gap_context(request=None, message_id="M1", identity=_ident(groups=("marketing",)))
+    assert ei.value.status_code == 403
+    # 200：NO_RESULT 本部门可见；前序行（DESC 给桩）→ 响应时间正序；SUCCESS 才带节选
+    conn = _install_conn(monkeypatch, _FakeConn(
+        ctx_msg_row=(30, "S1", "2026-07-18 10:00:00", "NO_RESULT", "marketing", "M1"),
+        ctx_prior_rows=[
+            ("第二个问题", "NO_RESULT", None, "2026-07-18 09:30:00", 20),
+            ("第一个问题，手机 13800138000", "SUCCESS", "答案正文", "2026-07-18 09:00:00", 10),
+        ]))
+    resp = api.kb_gap_context(request=None, message_id="M1", identity=_ident(groups=("marketing",)))
+    assert [t.question for t in resp.items][0].startswith("第一个问题")   # 正序（旧→新）
+    assert "13800138000" not in resp.items[0].question                   # 他人提问脱敏
+    assert resp.items[0].answer_excerpt == "答案正文"                     # SUCCESS 带节选
+    assert resp.items[1].answer_excerpt == "" and resp.items[1].answer_status == "NO_RESULT"
+    # (created_at,id) 复合游标进了 SQL（同时间戳不漏不乱）
+    prior_sql = next(s for s, _ in conn.calls if "ORDER BY created_at DESC, id DESC" in s)
+    assert "created_at < %s OR (created_at = %s AND id < %s)" in prior_sql

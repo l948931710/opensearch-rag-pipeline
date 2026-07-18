@@ -133,7 +133,7 @@ def _print_env_banner(rag_env: str, shadowed: Optional[list] = None):
         label = "LOCAL (本地开发)"
     elif rag_env.startswith("local_ab_"):
         icon = "⚖️"
-        label = f"LOCAL-EVAL ({rag_env.removeprefix('local_ab_')} 臂)"
+        label = f"LOCAL-EVAL ({rag_env[len('local_ab_'):]} 臂)"   # py3.7 兼容（DW 执行器）：不用 removeprefix
     else:
         icon = "⚙️"
         label = f"DEFAULT ({env_label})"

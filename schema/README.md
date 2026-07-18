@@ -81,6 +81,7 @@ apply 脚本落库并记台账。
 | 040_qa_gap_semantic_group.sql | fuling_operation | 缺口语义去重 Layer-2：qa_gap_semantic_group 相似问法语义组映射表——生成=scripts/build_qa_gap_semantic_groups.py（embedding 贪心归组，阈值 0.90 保守）；读侧 RAG_QA_GAP_SEMANTIC 默认关且 fail-open；**预注册边界：仅展示层归并，绝不驱动缺口自动关闭** |
 | 041_qa_gap_dismissal.sql | fuling_operation | 「忽略此缺口」台账（ε-4 遗留，2026-07-15 拍板交 dept_admin）：question_hash 主键 + revoked_at 可撤销留痕——dismiss/restore 端点写入（语义组开时联动全组成员），kb_gaps 读侧排除 active 行（fail-open）；员工 403 |
 | 042_agent_run_user_index.sql | fuling_operation | agent_run 复合索引 idx_user_started (user_id, started_at)（perf 批次 A）：run_store.list_runs_by_user 反向索引扫描免 filesort + retention 主体擦除等值前缀——此前 agent_run 无任何 user_id 前缀索引；纯加索引（online DDL），apply=scratch/apply_migration_042.py |
+| 050_qa_rewritten_query.sql | fuling_operation | 多轮追问检索前改写（RAG_FOLLOWUP_REWRITE 默认关，2026-07-18）：qa_session_log.rewritten_query 存改写后的独立问题（脱敏后）——写侧 qa_logger 落列（1054 **TTL** 负缓存降级，apply 后无须重启恢复；改写行 question_hash 改按改写后文本计算）；读侧 kb_gaps 对本列 1054 回退无列 SQL（**代码可先行**）；无存量 backfill |
 
 ## 台账（schema_migrations）
 

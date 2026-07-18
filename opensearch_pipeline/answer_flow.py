@@ -279,6 +279,7 @@ def build_qa_log_kwargs(
     intent_type: Optional[str] = None,
     risk_level: Optional[str] = None,
     risk_blocked: bool = False,
+    rewritten_query: Optional[str] = None,
 ) -> Dict[str, Any]:
     """qa_session_log 载荷的单一组装点。永远返回【全字段】（未知处显式 None，
     与 qa_logger.log_qa_session 的参数缺省一致）。
@@ -337,4 +338,7 @@ def build_qa_log_kwargs(
         intent_type=intent_type,
         risk_level=risk_level,
         risk_blocked=risk_blocked,
+        # 追问改写（RAG_FOLLOWUP_REWRITE，schema/050）：非空=检索实际用的独立问题；
+        # None=未改写（flag 关/门控未命中/改写失败），qa_logger 不携带该列，载荷零漂移。
+        rewritten_query=_clip(rewritten_query, 1000),
     )

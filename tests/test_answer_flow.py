@@ -73,7 +73,7 @@ class TestBuildQaLogKwargs:
             "answer_status", "model_name", "error_message",
             "opensearch_hit_count", "top_score", "conversation_type",
             "content_blocks_json", "conversation_id", "gen_meta_json",
-            "intent_type", "risk_level", "risk_blocked",
+            "intent_type", "risk_level", "risk_blocked", "rewritten_query",
         }
 
     def test_keys_match_log_qa_session_signature(self):

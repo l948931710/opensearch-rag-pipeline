@@ -10,6 +10,7 @@ qa_logger.py — RAG 问答日志写入模块
 
 import json
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -316,6 +317,10 @@ def qa_answer_post_commit(
 _GEN_META_COL_MISSING = False
 # schema/039 未 apply 时的进程内负缓存（question_hash 可选列，与 gen_meta 同款纪律）
 _QUESTION_HASH_COL_MISSING = False
+# schema/050 未 apply 时的 **TTL** 负缓存（rewritten_query 可选列）：与上两个永久布尔
+# 不同——到期自动重试探测，schema apply 后无须重启进程即恢复携带（约束 10）。
+_REWRITTEN_COL_MISSING_UNTIL = 0.0
+_REWRITTEN_COL_RETRY_SECONDS = 600.0
 
 
 def log_qa_session(
@@ -344,6 +349,7 @@ def log_qa_session(
     content_blocks_json: Optional[str] = None,
     conversation_id: Optional[str] = None,
     gen_meta_json: Optional[str] = None,
+    rewritten_query: Optional[str] = None,
 ) -> None:
     """
     写入一条 qa_session_log 记录。
@@ -373,6 +379,9 @@ def log_qa_session(
         conversation_type: '1'=单聊, '2'=群聊
         gen_meta_json: 生成元数据 JSON 快照（P2-20/21/22，schema/018 可选列；
             未 apply 时 1054 自动降级不携带，审计行绝不丢）
+        rewritten_query: 追问改写后的独立问题（RAG_FOLLOWUP_REWRITE；schema/050 可选列，
+            未 apply 时 1054 TTL 负缓存降级）。非空时 question_hash 改按它计算（脱敏后）
+            ——该行「实际所问」是改写后的独立形式；原始 query_text 原样保留。
     """
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -382,6 +391,7 @@ def log_qa_session(
         # 自掩码后的 query_text（见下方 _upsert_conversation），故标题同样不含 PII。
         query_text = _redact_for_log(query_text)
         answer_text = _redact_for_log(answer_text)
+        rewritten_query = _redact_for_log(rewritten_query) if rewritten_query else None
         # content_blocks_json 同为 PII sink（图文块里可能复述号码），结构感知掩码后再落库。
         content_blocks_json = _redact_content_blocks_for_log(content_blocks_json)
 
@@ -484,9 +494,12 @@ def log_qa_session(
             #   gen_meta_json（P2-20/21/22，schema/018）
             #   question_hash（缺口语义去重 Layer-1，schema/039）——对【脱敏后落库文本】
             #     计算 contribution.question_hash（与 kb_gaps Python 归并/asks 平查同口径，
-            #     绝不能挪到 _redact_for_log 之前）。
-            global _GEN_META_COL_MISSING, _QUESTION_HASH_COL_MISSING
-            _OPT_SCHEMA = {"gen_meta_json": "018", "question_hash": "039"}
+            #     绝不能挪到 _redact_for_log 之前）。改写发生时（rewritten_query 非空）
+            #     改按脱敏后的 rewritten 计算——该行实际所问是改写后的独立形式。
+            #   rewritten_query（追问改写，schema/050）——TTL 负缓存（非永久布尔）。
+            global _GEN_META_COL_MISSING, _QUESTION_HASH_COL_MISSING, _REWRITTEN_COL_MISSING_UNTIL
+            _OPT_SCHEMA = {"gen_meta_json": "018", "question_hash": "039",
+                           "rewritten_query": "050"}
             opt_cols: List[str] = []
             opt_vals: List[Any] = []
             if gen_meta_json and not _GEN_META_COL_MISSING:
@@ -496,9 +509,12 @@ def log_qa_session(
                 try:
                     from opensearch_pipeline.contribution import question_hash as _qhash_fn
                     opt_cols.append("question_hash")
-                    opt_vals.append(_qhash_fn(query_text))
+                    opt_vals.append(_qhash_fn(rewritten_query or query_text))
                 except Exception:   # noqa: BLE001 — 哈希派生绝不拖垮审计行
                     pass
+            if rewritten_query and time.time() >= _REWRITTEN_COL_MISSING_UNTIL:
+                opt_cols.append("rewritten_query")
+                opt_vals.append(rewritten_query)
             while True:
                 try:
                     _write_row(base_cols + opt_cols, base_vals + opt_vals)
@@ -517,6 +533,9 @@ def log_qa_session(
                     if cname in msg:
                         if cname == "gen_meta_json":
                             _GEN_META_COL_MISSING = True
+                        elif cname == "rewritten_query":
+                            # TTL 负缓存：到期自动重试，schema/050 apply 后无须重启恢复携带
+                            _REWRITTEN_COL_MISSING_UNTIL = time.time() + _REWRITTEN_COL_RETRY_SECONDS
                         else:
                             _QUESTION_HASH_COL_MISSING = True
                     logger.warning(
