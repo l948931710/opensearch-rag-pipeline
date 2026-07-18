@@ -154,6 +154,22 @@ def is_incomplete_question(raw: Optional[str]) -> bool:
     return len(_strip_referential(norm)) < 2
 
 
+# 寒暄/试探短语（归一化后精确等值；上下文展开的噪音轮过滤用——「hi」「你好」「测试」
+# 这类轮对理解追问语境零价值，且 is_junk_question 按长度/形态判不掉它们）
+_SMALLTALK_NORMALIZED = frozenset((
+    "hi", "hello", "hey", "你好", "您好", "在吗", "在么", "在不在", "哈喽", "嗨",
+    "谢谢", "谢谢你", "thanks", "thankyou", "ok", "好的", "test", "测试", "ping",
+    "早上好", "下午好", "晚上好", "辛苦了", "再见", "拜拜",
+))
+
+
+def is_noise_turn(raw: Optional[str]) -> bool:
+    """会话上下文展开中应跳过的噪音轮：确定性垃圾 或 寒暄/试探短语。"""
+    if is_junk_question(raw):
+        return True
+    return normalize_question(raw) in _SMALLTALK_NORMALIZED
+
+
 def has_referential_token(raw: Optional[str]) -> bool:
     """归一化后是否命中指代/接续词或序数指代（query_rewriter 门控用，词表单一来源）。"""
     norm = normalize_question(raw)
