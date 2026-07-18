@@ -1133,7 +1133,6 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
         raise HTTPException(status_code=401, detail="需要登录")
     from opensearch_pipeline import contribution as C, kb_authz
     limit = max(1, min(int(limit or 20), 100)); offset = max(0, int(offset or 0))
-    win = _GAP_WINDOW_DAYS
     depts = kb_authz.sanitize_owner_depts(identity.acl_groups)
     trace_id = get_request_id()
 
@@ -1157,6 +1156,17 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
     cached = _gaps_cache_get(cache_key)
     if cached is not None:
         return _page_response(cached[0], cached[1])
+    open_gaps, summary = _compute_open_gaps(depts, trace_id)
+    return _page_response(open_gaps, summary)
+
+
+def _compute_open_gaps(depts: List[str], trace_id: str):
+    """开放缺口全集 (open_gaps, summary)——kb_gaps 列表与 kb_gap_dismiss 可见性裁权共用
+    （批次9，ultra P3 contribution:1422：单一实现防两处谓词漂移）。fails==0 才写缓存
+    （降级结果不缓存，语义与抽取前一致）；聚合面 ≥4 路失败抛 HTTPException(500)。"""
+    from opensearch_pipeline import contribution as C
+    win = _GAP_WINDOW_DAYS
+    cache_key = tuple(sorted(depts))
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -1312,7 +1322,7 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
     summary.unanswered = len(open_gaps)
     if fails == 0:   # 降级结果（部分子查询失败）不缓存——下一请求重试取全量
         _gaps_cache_put(cache_key, (open_gaps, summary))
-    return _page_response(open_gaps, summary)
+    return open_gaps, summary
 
 
 # ── 「忽略此缺口」（schema/041，ε-4 遗留；2026-07-15 用户拍板：交给 dept_admin）────
@@ -1406,11 +1416,38 @@ def kb_gap_dismiss(req: KbGapDismissRequest, request: Request,
     重复忽略幂等复活同一行（last action wins）。"""
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline import contribution as C
+    from opensearch_pipeline import contribution as C, kb_authz
     h = (req.question_hash or "").strip().lower()
     if not _valid_gap_hash(h):
         raise HTTPException(status_code=400, detail="question_hash 非法")
     trace_id = get_request_id()
+    # 批次9（ultra P3 contribution:1422）：忽略动作按可见范围裁权——忽略台账是【全局排除】
+    # （列表 3.6 段按 hash 排除，不分部门），而此前 dismiss 不校归属：任何 dept_admin 可对
+    # 任意问题文本离线算 hash、全局静默压掉别部门的缺口。现 dept_admin 只能忽略自己缺口
+    # 视图（本部门归属 + 全公开池，与列表同一 _compute_open_gaps 谓词）内的 hash；
+    # kb_admin 不受限。重试幂等：已处 active 忽略态的 hash 放行（重复忽略=复活同一行）。
+    if kb.role != kb_authz.ROLE_KB_ADMIN:
+        _depts = kb_authz.sanitize_owner_depts(identity.acl_groups)
+        _cached = _gaps_cache_get(tuple(sorted(_depts)))
+        _visible = _cached[0] if _cached is not None else _compute_open_gaps(_depts, trace_id)[0]
+        if not any(g["hash"] == h for g in _visible):
+            _already = False
+            try:
+                from opensearch_pipeline.db import _get_db_conn as _gdc
+                _vc = _gdc()
+                try:
+                    with _vc.cursor() as _cur:
+                        _cur.execute(
+                            f"SELECT 1 FROM {_op_db()}.qa_gap_dismissal"
+                            " WHERE question_hash=%s AND revoked_at IS NULL LIMIT 1", (h,))
+                        _already = _cur.fetchone() is not None
+                finally:
+                    _vc.close()
+            except Exception:   # noqa: BLE001 — 幂等豁免查不出按不可见处理（fail-closed）
+                _already = False
+            if not _already:
+                raise HTTPException(status_code=403,
+                                    detail="该缺口不在你的可见范围（本部门+公开池），无法忽略")
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()

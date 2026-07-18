@@ -224,7 +224,7 @@ def test_ask_uses_token_dept_not_body(monkeypatch):
     monkeypatch.setattr(api, "retrieve_and_enrich", fake_retrieve)
     monkeypatch.setattr(api, "generate_answer", fake_generate)
     monkeypatch.setattr(api, "build_mini_program_blocks",
-                        lambda ans, chunks: [{"type": "text", "format": "plain", "text": ans}])
+                        lambda ans, chunks, **kw: [{"type": "text", "format": "plain", "text": ans}])
     monkeypatch.setattr(api, "log_qa_session", lambda **kw: None)
 
     tok = auth_token.issue_session_token("U9", dept="行政部", name="李四")
@@ -257,7 +257,7 @@ def _stub_ask_pipeline(monkeypatch, captured):
 
     monkeypatch.setattr(api, "retrieve_and_enrich", fake_retrieve)
     monkeypatch.setattr(api, "generate_answer", fake_generate)
-    monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks: [])
+    monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks, **kw: [])
     monkeypatch.setattr(api, "log_qa_session", lambda **kw: None)
     monkeypatch.setattr(api, "_append_to_history", lambda *a, **kw: None)
 
@@ -519,7 +519,7 @@ def test_ask_no_token_is_anonymous_public_only(monkeypatch):
     monkeypatch.setattr(api, "retrieve_and_enrich", fake_retrieve)
     monkeypatch.setattr(api, "generate_answer",
                         lambda *a, **k: {"answer": "x", "sources": [], "model": "m", "usage": {}})
-    monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks: [])
+    monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks, **kw: [])
     monkeypatch.setattr(api, "log_qa_session", lambda **kw: None)
 
     c = TestClient(api.app)
@@ -542,7 +542,7 @@ def test_ask_token_dept_marketing_center(monkeypatch):
     monkeypatch.setattr(api, "retrieve_and_enrich", fake_retrieve)
     monkeypatch.setattr(api, "generate_answer",
                         lambda *a, **k: {"answer": "x", "sources": [], "model": "m", "usage": {}})
-    monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks: [])
+    monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks, **kw: [])
     monkeypatch.setattr(api, "log_qa_session", lambda **kw: None)
 
     # 令牌签发多组（国际贸易部 → marketing+production 的解析结果），检索按列表收到

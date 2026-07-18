@@ -154,7 +154,8 @@ def verify_upload_token(token: str) -> Optional[dict]:
     """校验 upload token；有效且 typ 正确 → payload dict，否则 None。"""
     from opensearch_pipeline.auth_token import verify_payload
 
-    payload = verify_payload(token)
+    # 批次9：expected_typ 下推到验签层强制（本地判别保留为带）
+    payload = verify_payload(token, expected_typ=_UPLOAD_TOKEN_TYP)
     if not payload or payload.get("typ") != _UPLOAD_TOKEN_TYP:
         return None
     return payload

@@ -250,10 +250,16 @@ def sign_payload(payload: dict, ttl: int = _DEFAULT_TTL_SECONDS) -> str:
     return f"{payload_b64}.{_b64url_encode(sig)}"
 
 
-def verify_payload(token: str) -> Optional[dict]:
+def verify_payload(token: str, expected_typ: Optional[str] = None) -> Optional[dict]:
     """校验 sign_payload 颁发的载荷；有效返回 dict，否则 None（签名不符 / 格式错 / 过期）。
 
-    P2-04：用【上传密钥】验签（RAG_UPLOAD_SIGNING_KEY，未配置回退会话密钥）——与 sign_payload 同源。"""
+    P2-04：用【上传密钥】验签（RAG_UPLOAD_SIGNING_KEY，未配置回退会话密钥）——与 sign_payload 同源。
+
+    批次9（ultra P3 auth_token:113）：typ 判别在验签层强制。默认密钥共享（上传密钥未配置
+    时回退会话密钥）下，会话令牌与任何 sign_payload 凭证互为合法签名——跨型伪造此前只被
+    「调用方记得查 typ」挡住（与 perm_from_raw_key fail-open 同类的调用方依赖）。现在：
+    ① typ=session 的载荷一律拒绝（会话令牌绝不能当通用签名凭证消费）；
+    ② expected_typ 给定时精确匹配（调用点显式声明预期类型，新调用点忘查也不开洞）。"""
     if not token or "." not in token:
         return None
     try:
@@ -271,5 +277,10 @@ def verify_payload(token: str) -> Optional[dict]:
     if not isinstance(payload, dict):
         return None
     if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    typ = payload.get("typ")
+    if typ == "session":
+        return None
+    if expected_typ is not None and typ != expected_typ:
         return None
     return payload

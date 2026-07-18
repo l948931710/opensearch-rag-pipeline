@@ -679,12 +679,17 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                             WHERE doc_id = %s AND version_no = %s
                         """, (f"[SPOT CHECK MISMATCH] Spot-check recommends tightening permission to {suggested_perm}", doc_id, version_no))
 
+                        # 批次9（ultra P3 spot_checker:686 改判）：LLM 的 suggested_perm 过
+                        # normalize_permission_level 再落库——词表外值（如 'internal'）原样写入
+                        # 会让检索过滤两个分支都不命中（历史 internal≠dept_internal 事故同类）；
+                        # 归一后别名收敛、未知值 fail-closed 到 restricted。
+                        from opensearch_pipeline.kb_authz import normalize_permission_level
                         cursor.execute("""
                             UPDATE document_meta
                             SET permission_level = %s,
                                 kb_type = 'private'
                             WHERE doc_id = %s
-                        """, (suggested_perm, doc_id))
+                        """, (normalize_permission_level(suggested_perm), doc_id))
 
                         cursor.execute("""
                             UPDATE chunk_meta

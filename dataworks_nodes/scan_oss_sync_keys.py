@@ -15,7 +15,11 @@ import subprocess, sys, os
 # ═══════════════════════════════════════════════════════════════
 # 0. 安装依赖
 # ═══════════════════════════════════════════════════════════════
-DEPS = ["PyMySQL", "DBUtils", "oss2"]
+# py3.7 serverless 执行器钉真兼容版（批次9 同族清扫，同 stage3_node 分支法）
+if sys.version_info >= (3, 8):
+    DEPS = ["PyMySQL", "DBUtils", "oss2"]
+else:
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2"]
 
 def ensure_deps():
     dep_dir = "/tmp/pydeps"

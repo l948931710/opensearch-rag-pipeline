@@ -32,11 +32,22 @@ import zipfile
 #    reconcile_oss → oss2；_get_db_conn → PyMySQL+DBUtils；embedding 走 requests（非 SDK）。
 #    pdfplumber/pypdf 监控本身不用，保留以镜像 stage3 已验证集、规避 retriever 传递 import。
 # ═══════════════════════════════════════════════════════════════
-DEPS = [
-    "PyMySQL", "DBUtils", "oss2", "requests",
-    "alibabacloud_ha3engine_vector",
-    "pdfplumber", "pypdf",
-]
+# py3.7 陷阱（批次9 S5/S6，同 stage3_node）: serverless 执行器实为 Python 3.7，
+# pypdf 5.0.0 元数据谎报支持 3.7 实则用 typing.Protocol(3.8+) → 必须钉真兼容版。
+# 镜像恢复 3.8+ 后自动走现代分支，本段无需再改。
+if sys.version_info >= (3, 8):
+    DEPS = [
+        "PyMySQL", "DBUtils", "oss2", "requests",
+        "alibabacloud_ha3engine_vector",
+        "pdfplumber", "pypdf",
+    ]
+else:
+    DEPS = [
+        "PyMySQL==1.1.1", "DBUtils==3.1.2", "oss2", "requests==2.31.0",
+        "alibabacloud_ha3engine_vector",
+        "typing_extensions",
+        "pypdf==3.17.4", "pdfplumber==0.9.0", "Pillow==9.5.0",
+    ]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", *DEPS, "-t", "/tmp/pydeps", "-q"
 ])

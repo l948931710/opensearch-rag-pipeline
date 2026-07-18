@@ -1669,7 +1669,10 @@ class UnifiedExtractor:
     def _extract_text(self, task: dict) -> ExtractionResult:
         """纯文本/Markdown/HTML/CSV 提取。"""
         local_path = task.get("local_path", "")
-        file_ext = task.get("file_ext", "txt").lower()
+        # 批次9（ultra P3 unified_extractor:1658）：与 dispatcher（extract:819）同一归一
+        # （strip+lstrip('.')）——此前只 lower：file_ext=".html"/" csv " 会错过 HTML 去标签
+        # /CSV 解析分支，原始标签/逗号流直接进切块。
+        file_ext = task.get("file_ext", "txt").lower().strip().lstrip(".")
 
         try:
             raw_text, warnings = _read_text_with_fallback(local_path)

@@ -555,10 +555,15 @@ def main():
             f"  - 本机 dev：unset RAG_ENV，并在 .env 用 docker-compose 配置（localhost）。\n"
             f"  - 想读 prod 看效果：用 prod_access.get_prod_readonly_conn() 写独立脚本。"
         )
-    if is_prod_target("search", _cfg.alibaba_vector.endpoint or _cfg.opensearch.host or ""):
+    # 批次9（ultra P3 run_simulation:558）：`or` 只查第一个真值——endpoint 空而 instance_id
+    # 指向生产（生产指纹正是实例 id）时守卫失明。三目标拼接全查（对齐 config/conftest 写法）。
+    _search_targets = " ".join(filter(None, (
+        _cfg.alibaba_vector.endpoint, _cfg.alibaba_vector.instance_id, _cfg.opensearch.host)))
+    if is_prod_target("search", _search_targets):
         raise RuntimeError(
-            f"[RUN_SIMULATION GUARD] 拒绝运行：检索 endpoint 命中生产指纹。\n"
-            f"  HA3={_cfg.alibaba_vector.endpoint!r} / OpenSearch={_cfg.opensearch.host!r}"
+            f"[RUN_SIMULATION GUARD] 拒绝运行：检索目标命中生产指纹。\n"
+            f"  HA3={_cfg.alibaba_vector.endpoint!r} / instance={_cfg.alibaba_vector.instance_id!r}"
+            f" / OpenSearch={_cfg.opensearch.host!r}"
         )
 
     parser = argparse.ArgumentParser(description="OpenSearch Pipeline Simulation")

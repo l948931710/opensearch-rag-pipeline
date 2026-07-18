@@ -274,7 +274,23 @@ def test_layer3_run_simulation_main_refuses_prod_search(monkeypatch):
                         f"{PROD_FINGERPRINTS['search'][0]}.public.ha.aliyuncs.com")
 
     monkeypatch.setattr("sys.argv", ["run_simulation"])
-    with pytest.raises(RuntimeError, match=r"RUN_SIMULATION GUARD.*检索 endpoint.*生产指纹"):
+    # 批次9：守卫改三目标拼接全查（endpoint/instance_id/host），文案「检索目标」
+    with pytest.raises(RuntimeError, match=r"RUN_SIMULATION GUARD.*检索目标.*生产指纹"):
+        run_simulation.main()
+
+
+def test_layer3_guard_catches_prod_instance_id_with_empty_endpoint(monkeypatch):
+    """批次9 回归（ultra P3 run_simulation:558）：endpoint 空、instance_id 命中生产指纹时
+    守卫也必须 raise——旧 `or` 拼接只查第一个真值,endpoint 为空即失明。"""
+    from opensearch_pipeline import run_simulation
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg.rds, "host", "localhost")
+    monkeypatch.setattr(cfg.alibaba_vector, "endpoint", "")
+    monkeypatch.setattr(cfg.alibaba_vector, "instance_id", PROD_FINGERPRINTS["search"][0])
+
+    monkeypatch.setattr("sys.argv", ["run_simulation"])
+    with pytest.raises(RuntimeError, match=r"检索目标.*生产指纹"):
         run_simulation.main()
 
 

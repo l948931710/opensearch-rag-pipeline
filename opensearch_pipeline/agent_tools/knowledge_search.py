@@ -276,7 +276,9 @@ def _spec_arms_estimate() -> int:
     是否在场按 query 定，此处取上界；dense 臂失败会静默回退 server hybrid=1（故为估算）。"""
     try:
         from opensearch_pipeline.config import get_config
-        cfg = get_config().retrieval
+        # 批次9（ultra P3 knowledge_search:279）：字段在 alibaba_vector 段——此前读不存在的
+        # get_config().retrieval，AttributeError 被兜底吞成恒 1 臂，投机检索成本遥测失真。
+        cfg = get_config().alibaba_vector
         return 3 if (getattr(cfg, "client_fusion_enable", False)
                      and getattr(cfg, "enable_hybrid", False)) else 1
     except Exception:   # noqa: BLE001 — 观测辅助绝不抛进检索路径

@@ -163,3 +163,105 @@ def test_included_is_full_list_without_truncation(monkeypatch):
                "score": 8.0, "doc_id": f"d{i}"} for i in range(3)]
     _ctx, included = G._format_context_ex(chunks, max_chars=100000)
     assert len(included) == 3
+
+
+# ═══════════════ (d) 图渲染与 context 同口径（批次9 C3, ultra P3） ═══════════════
+# 漏洞：image_map 按全量检索列表构建，而 context/sources 只含截断后子集——LLM 幻觉或
+# 照抄历史里的 <<IMG:N>> 能渲染出它从未见过的 chunk 的图，且该文档不在 sources。
+# 修复：llm_generator 输出 included_doc_indices（1-based 原始检索序，与 sources 同一
+# included 口径），content_blocks 构建按它收敛 image_map。
+
+def _img_doc(title, oss_key, n_chars=400):
+    return {"chunk_type": "step_card", "title": title, "chunk_text": "字" * n_chars,
+            "score": 8.0, "doc_id": title, "step_no": 1,
+            "image_refs": [{"oss_key": oss_key, "caption": title + "图"}]}
+
+
+def _c3_cut_after_first(chunks):
+    """max_chars 恰好只放得下第 1 条（其余 remaining<100 整体出局，salvage 关）。"""
+    entry = _chunk_header(0, chunks[0], pure_text=False) + "\n" + chunks[0]["chunk_text"] + "\n"
+    return len(entry) + 20
+
+
+def test_c3_truncated_out_doc_images_never_render(monkeypatch):
+    """出局 chunk 的 <<IMG:N>> 不再渲染其图片；未传 included_indices 保持旧全量行为。"""
+    _cfg(monkeypatch, False)
+    import opensearch_pipeline.content_blocks_builder as cb
+    monkeypatch.setattr(cb, "generate_signed_url", lambda key, expires=None: "https://oss/" + key)
+    chunks = [_img_doc("甲操作.docx", "a.png"), _img_doc("乙操作.docx", "b.png")]
+    _ctx, included = G._format_context_ex(chunks, max_chars=_c3_cut_after_first(chunks))
+    idx = [i + 1 for i, c in enumerate(chunks) if any(c is x for x in included)]
+    assert idx == [1]
+
+    answer = "第一步 <<IMG:1>>，第二步 <<IMG:2>>。"
+    blocks = cb.build_content_blocks(answer, chunks, included_indices=idx)
+    urls = [b.get("url", "") for b in blocks if b.get("type") == "image"]
+    assert any("a.png" in u for u in urls)
+    assert not any("b.png" in u for u in urls)   # 出局块的图绝不渲染（sources 也没有它）
+    # 旧调用方（不传）＝全量映射，行为零变化
+    legacy = [b.get("url", "") for b in cb.build_content_blocks(answer, chunks)
+              if b.get("type") == "image"]
+    assert any("b.png" in u for u in legacy)
+    # 小程序包装层透传同一口径
+    mini = [b.get("url", "") for b in cb.build_mini_program_blocks(answer, chunks,
+                                                                  included_indices=idx)
+            if b.get("type") == "image"]
+    assert mini and not any("b.png" in u for u in mini)
+
+
+def _c3_llm_cfg(monkeypatch):
+    from opensearch_pipeline.config import LLMConfig
+    cfg = types.SimpleNamespace(
+        rag=RAGConfig(ctx_img_aware_trunc=False),
+        llm=LLMConfig(api_key="sk-test", api_base_url="https://example.invalid/v1",
+                      model="qwen-test"),
+    )
+    monkeypatch.setattr(G, "get_config", lambda: cfg)
+
+
+def test_c3_generate_answer_result_carries_included_doc_indices(monkeypatch):
+    """非流式 result 携带 included_doc_indices：截断时=进 context 子集，不截断=全量。"""
+    _c3_llm_cfg(monkeypatch)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "答"}}], "usage": {}}
+
+    monkeypatch.setattr(G, "_http_post", lambda *a, **k: _Resp())
+    chunks = [_img_doc("甲操作.docx", "a.png"), _img_doc("乙操作.docx", "b.png")]
+    r = G.generate_answer("问", chunks, max_context_chars=_c3_cut_after_first(chunks))
+    assert r["included_doc_indices"] == [1]
+    assert {s["title"] for s in r["sources"]} == {"甲操作.docx"}  # 与 sources 同口径
+    r_full = G.generate_answer("问", chunks, max_context_chars=100000)
+    assert r_full["included_doc_indices"] == [1, 2]
+
+
+def test_c3_stream_sources_frame_carries_included_doc_indices(monkeypatch):
+    """流式 sources 帧携带 included_doc_indices（api.py 流式收集端据此收敛 blocks）。"""
+    import json as _json
+    from unittest.mock import MagicMock
+    _c3_llm_cfg(monkeypatch)
+
+    def _fake_post(*_a, **_k):
+        m = MagicMock()
+        m.__enter__.return_value = m
+        m.__exit__.return_value = False
+        m.raise_for_status.return_value = None
+        m.iter_lines.return_value = iter([
+            'data: {"choices": [{"delta": {"content": "答"}}]}', "data: [DONE]"])
+        return m
+
+    monkeypatch.setattr(G, "_http_post", _fake_post)
+    chunks = [_img_doc("甲操作.docx", "a.png"), _img_doc("乙操作.docx", "b.png")]
+    frames = []
+    for ev in G.generate_answer_stream("问", chunks,
+                                       max_context_chars=_c3_cut_after_first(chunks)):
+        p = ev.strip()[6:].strip()
+        if p and p != "[DONE]":
+            frames.append(_json.loads(p))
+    src = next(f for f in frames if f.get("type") == "sources")
+    assert src["included_doc_indices"] == [1]
+    assert {s["title"] for s in src["sources"]} == {"甲操作.docx"}
