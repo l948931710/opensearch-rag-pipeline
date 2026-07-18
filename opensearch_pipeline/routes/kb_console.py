@@ -700,11 +700,14 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
                     " GROUP BY d.query_text ORDER BY COUNT(*) DESC LIMIT 10", args)
                 # 跨用户展示：gap_queries 是【他人】的原始提问，必须无条件 PII 脱敏（与 /api/kb/gaps
                 # 一致），否则 admin 面板泄露他人身份证/手机号/姓名。
+                # 确定性垃圾（纯标点/单字/纯数字）读出侧过滤，与 kb_gaps 同闸（RAG_QA_GAP_JUNK_FILTER）。
                 from opensearch_pipeline import contribution as _C
+                _jf = _C.junk_filter_on()
                 out.gap_queries = [
                     KbGapQueryItem(query=_C.redact_query_text(row[0] or ""), count=int(row[1] or 0),
                                    avg_top=float(row[2]) if row[2] is not None else 0.0)
-                    for row in cur.fetchall()]
+                    for row in cur.fetchall()
+                    if not (_jf and _C.is_junk_question(row[0] or ""))]
             except Exception as e:
                 fails += 1; logger.warning("kb_insights gap_queries 失败: %s", e)
     finally:

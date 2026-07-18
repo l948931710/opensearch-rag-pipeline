@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import unicodedata
 from typing import Optional
@@ -69,6 +70,96 @@ def normalize_question(s: Optional[str]) -> str:
 def question_hash(s: Optional[str]) -> str:
     """sha256(normalize_question(s))。空问题→空串的 hash（稳定）。"""
     return hashlib.sha256(normalize_question(s).encode("utf-8")).hexdigest()
+
+
+# ── 无效问题分层判定（缺口读出侧过滤 + 追问改写门控共用，2026-07-18）──────────
+# 分层纪律（拍板）：确定性垃圾（is_junk_question）与「短且缺主体」（is_incomplete_question）
+# 严格分离——前者读出侧直接过滤；后者有会话上下文时走追问改写/上下文展开，仅在毫无上下文
+# 时按低质量隐藏（独立 flag）。绝不只按长度过滤：「怎么请假」「如何报销」「库存多少」等
+# 有效短问题两个判定都不得命中。
+
+# 指代/接续词典（单一来源：is_incomplete_question 与 query_rewriter.looks_followup 共用）。
+# 归一化后匹配（normalize_question 已去空白标点、小写），按长词优先剥离。
+REFERENTIAL_TOKENS = (
+    "还有", "然后", "继续", "接着", "刚才", "刚刚", "上面", "下面", "之后", "另外",
+    "别的", "其他", "其它", "上一个", "下一个", "这个", "那个", "这些", "那些",
+    "这里", "那里", "上一步", "下一步",
+    "那", "这", "它", "他", "她",
+)
+# 语气/助词（剥离后不计入实义内容；单字，避免误剥实义词）
+_PARTICLE_CHARS = "呢吗嘛么呀啊吧哦哈了的地得个"
+# 「第X步/条/项/点/章/节」序数指代（数字或中文数字）
+_ORDINAL_REF_RE = re.compile(r"第[0-9一二三四五六七八九十百]+[步条项点章节个]")
+
+
+def _strip_referential(norm: str) -> str:
+    """从归一化文本中剥掉指代词/接续词/序数指代/语气助词，返回剩余实义内容。"""
+    s = _ORDINAL_REF_RE.sub("", norm)
+    for tok in REFERENTIAL_TOKENS:
+        s = s.replace(tok, "")
+    return s.translate({ord(c): None for c in _PARTICLE_CHARS})
+
+
+def junk_filter_on() -> bool:
+    """RAG_QA_GAP_JUNK_FILTER 默认【开】：确定性垃圾读出侧过滤（false=逃生阀恢复现状）。"""
+    return (os.environ.get("RAG_QA_GAP_JUNK_FILTER") or "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def hide_incomplete_on() -> bool:
+    """RAG_QA_GAP_HIDE_INCOMPLETE 默认【开】：短缺主体且毫无会话上下文的低质量缺口隐藏
+    （与 junk 独立分层，绝不混同）。"""
+    return (os.environ.get("RAG_QA_GAP_HIDE_INCOMPLETE") or "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _gap_min_qlen() -> int:
+    try:
+        v = int((os.environ.get("RAG_QA_GAP_MIN_QLEN") or "2").strip())
+    except ValueError:
+        return 2
+    return v if 1 <= v <= 8 else 2
+
+
+def _incomplete_max_len() -> int:
+    """「短」的上限（归一化后字符数），与追问改写门控 RAG_FOLLOWUP_MAX_LEN 同源。"""
+    try:
+        v = int((os.environ.get("RAG_FOLLOWUP_MAX_LEN") or "12").strip())
+    except ValueError:
+        return 12
+    return v if 4 <= v <= 64 else 12
+
+
+def is_junk_question(raw: Optional[str]) -> bool:
+    """确定性垃圾：归一化后为空（纯标点/空白/emoji）、短于下限（默认仅单字）、或纯数字。
+
+    只判「确定不可能是问题」的形态；「短但可能有意义」的交给 is_incomplete_question 分层。
+    """
+    norm = normalize_question(raw)
+    if not norm:
+        return True
+    if len(norm) < _gap_min_qlen():
+        return True
+    return norm.isdigit()
+
+
+def is_incomplete_question(raw: Optional[str]) -> bool:
+    """短且缺主体（如「那第二步呢」「然后呢」「上面那个」）：非垃圾、归一化短、且剥掉
+    指代/接续/序数/语气词后实义内容不足 2 字。长问题即便含指代词也不算（内容自足）。"""
+    norm = normalize_question(raw)
+    if not norm or is_junk_question(raw):
+        return False
+    if len(norm) > _incomplete_max_len():
+        return False
+    return len(_strip_referential(norm)) < 2
+
+
+def has_referential_token(raw: Optional[str]) -> bool:
+    """归一化后是否命中指代/接续词或序数指代（query_rewriter 门控用，词表单一来源）。"""
+    norm = normalize_question(raw)
+    if not norm:
+        return False
+    return bool(_ORDINAL_REF_RE.search(norm)) or any(t in norm for t in REFERENTIAL_TOKENS)
 
 
 # ── P2-17：图片占位符注入防护 ────────────────────────────────────────────────
