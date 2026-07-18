@@ -137,6 +137,12 @@ class ExtractionResult:
     # 文档留在可复查集合，VLM 恢复后重灌自愈；文本抽取/切块/索引照常（graceful degradation）。
     vlm_degraded_count: int = 0
 
+    # 批次6（ultra ocr_client:298 / unified_extractor:1343）：部分内容丢失留痕——
+    # OCR 部分页失败（文本保留已成功页）、XLSX/PPTX 中途异常（保留已抽取 sheet/slide）等
+    # 「有产出但不完整」形态。非空时 stage-2 收尾同走 NEEDS_REVIEW 通道（与 vlm_degraded
+    # 同型：可服务、留在可复查集合、重灌自愈），绝不再静默定稿 DONE。
+    partial_loss_notes: List[str] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "doc_id": self.doc_id,
@@ -157,6 +163,7 @@ class ExtractionResult:
             "assets": self.assets,
             "cost_quarantined": self.cost_quarantined,
             "cost_deferred": self.cost_deferred,
+            "partial_loss_notes": self.partial_loss_notes,
             "xlsx_layout_type": self.xlsx_layout_type,
             "vlm_degraded_count": self.vlm_degraded_count,
         }

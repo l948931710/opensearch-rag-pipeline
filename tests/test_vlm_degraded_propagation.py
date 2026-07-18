@@ -141,7 +141,7 @@ class _CaptureConn:
         pass
 
 
-def _run_closure(monkeypatch, vlm_degraded_count):
+def _run_closure(monkeypatch, vlm_degraded_count, partial_notes=None):
     from opensearch_pipeline.chunker import Chunk
     store = []
     monkeypatch.setattr(pn, "_get_db_conn", lambda **kw: _CaptureConn(store))
@@ -153,6 +153,8 @@ def _run_closure(monkeypatch, vlm_degraded_count):
     canon = {"doc_id": "d", "version_no": 1, "rag_ready_key": "processing/x"}
     if vlm_degraded_count:
         canon["vlm_degraded_count"] = vlm_degraded_count
+    if partial_notes:
+        canon["partial_loss_notes"] = list(partial_notes)
     ctx = {"valid_chunks": [chunk], "canonicals": [canon], "simulate_db": False}
     pn.node_write_chunk_meta(ctx)
     return store
@@ -175,3 +177,34 @@ def test_write_chunk_meta_stays_done_without_degraded(monkeypatch):
     joined = " ".join(s for s, _ in store if isinstance(s, str))
     assert "content_process_status = 'DONE'" in joined
     assert "NEEDS_REVIEW" not in joined, "无降级图片的文档绝不误标 NEEDS_REVIEW"
+
+
+# ── 批次6（ultra 评审）：partial_loss_notes 走同一 NEEDS_REVIEW 通道 ───────────
+
+
+def test_write_chunk_meta_marks_needs_review_on_partial_loss(monkeypatch):
+    """OCR 部分页失败/XLSX/PPTX 中途异常的留痕（partial_loss_notes）→ 收尾 NEEDS_REVIEW，
+    「有产出但不完整」绝不静默定稿 DONE（重灌自愈通道与 vlm_degraded 同型）。"""
+    store = _run_closure(monkeypatch, vlm_degraded_count=0,
+                         partial_notes=["ocr_partial: 2/10 page(s) failed (pages [3, 7])"])
+    sqls = [(s, p) for s, p in store if isinstance(s, str) and s.strip().startswith("UPDATE")]
+    joined = " ".join(s for s, _ in sqls)
+    assert "content_process_status = 'DONE'" in joined      # 可服务：DONE 收尾仍发生
+    assert "NEEDS_REVIEW" in joined
+    note_params = [p for s, p in sqls if "NEEDS_REVIEW" in s]
+    assert note_params and "ocr_partial" in str(note_params[0])
+
+
+def test_partial_loss_notes_survive_stage_boundaries():
+    """canonical 构建与 orchestrator stage-2 重载都必须携带 partial_loss_notes——
+    任一边界丢键，留痕静默蒸发、文档照样 DONE 终态（与 P2-32 同类缺陷形态）。"""
+    import inspect
+
+    from opensearch_pipeline import dataworks_orchestrator as dw
+    from opensearch_pipeline.extraction.schema import ExtractionResult
+    assert "partial_loss_notes" in inspect.getsource(pn.node_build_canonical)
+    assert "partial_loss_notes" in inspect.getsource(dw)
+    r = ExtractionResult(doc_id="d", version_no=1, source_key="", file_ext="xlsx",
+                         extract_method="openpyxl", title="", text="t", text_length=1,
+                         partial_loss_notes=["xlsx_partial: boom"])
+    assert r.to_dict()["partial_loss_notes"] == ["xlsx_partial: boom"]

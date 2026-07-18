@@ -1136,6 +1136,7 @@ class UnifiedExtractor:
         file_ext = task.get("file_ext", "xlsx").lower()
         blocks = []
         warnings = []
+        partial_notes = []  # 批次6：中途异常留痕（有产出但不完整 → NEEDS_REVIEW 收尾）
         all_part_candidates: set = set()  # 跨 sheet 收集所有部位名称
 
         _img_wb = None  # perf#62：普通模式 workbook 供图片提取复用（read_only 无 _images，不可共享）
@@ -1342,6 +1343,12 @@ class UnifiedExtractor:
             wb.close()
         except Exception as e:
             warnings.append(f"Failed to extract Excel file: {e}")
+            # 批次6（ultra unified_extractor:1343）：中途异常保留了已抽取 sheet 的 blocks——
+            # 有产出时 0-chunk 疑似失败守卫不查 warnings，文档会以"完整"定稿 DONE、余下
+            # sheet 永久缺失。留痕 → 收尾 NEEDS_REVIEW（可服务、重灌自愈）。零产出时
+            # 0-chunk 守卫照旧接管（FAILED+retry），本留痕不参与该分支。
+            partial_notes.append(f"xlsx_partial: extraction aborted mid-workbook ({e}); "
+                                 f"sheets after the failure point are missing")
 
         # 提取嵌入图片 → 三阶段过滤漏斗
         # perf#62：普通模式 wb 直接传给 extract_images_from_xlsx 复用，省第三次 zip 解包；
@@ -1464,6 +1471,7 @@ class UnifiedExtractor:
             # 持久化 DAG1 的 layout 判定（用真实 task filename 分类），DAG2 直接消费，不再重分类。
             xlsx_layout_type=_layout_type,
             vlm_degraded_count=vlm_degraded,
+            partial_loss_notes=partial_notes,
         )
 
     # ── PPTX ──
@@ -1492,6 +1500,7 @@ class UnifiedExtractor:
         local_path = task.get("local_path", "")
         blocks = []
         warnings = []
+        partial_notes = []  # 批次6：中途异常留痕（有产出但不完整 → NEEDS_REVIEW 收尾）
         slide_count = 0
 
         try:
@@ -1620,6 +1629,10 @@ class UnifiedExtractor:
 
         except Exception as e:
             warnings.append(f"Failed to extract PPTX text: {e}")
+            # 批次6（同 xlsx）：中途异常保留已抽取 slide 的 blocks——有产出时会以"完整"
+            # 定稿 DONE、余下 slide 永久缺失。留痕 → NEEDS_REVIEW 收尾（重灌自愈）。
+            partial_notes.append(f"pptx_partial: extraction aborted mid-deck ({e}); "
+                                 f"slides after the failure point are missing")
 
         # 提取嵌入图片 → 三阶段过滤漏斗
         img_stats: dict = {}
@@ -1648,6 +1661,7 @@ class UnifiedExtractor:
             warnings=warnings,
             assets=assets,
             vlm_degraded_count=vlm_degraded,
+            partial_loss_notes=partial_notes,
         )
 
     # ── Plain text / Markdown ──
@@ -1848,7 +1862,13 @@ class UnifiedExtractor:
             _funnel_cap = int(os.environ.get("RAG_FUNNEL_MAX_IMAGES", "0"))
         except ValueError:
             _funnel_cap = 0
+        # 批次6（ultra unified_extractor:1945）：cap/DENY 跳过的唯一图片计入文档级降级数——
+        # 被跳过的 hash 不进 hash_to_result，Phase 3 直接丢（无 asset、无 OCR 块），此前又不
+        # 计入 vlm_degraded_count → 文档定稿 DONE，调高预算后无任何重扫信号，图片永久缺失。
+        # 计入后文档收尾 NEEDS_REVIEW（与 degraded/漏斗异常同一自愈通道）。
+        _budget_skipped_count = 0
         if _funnel_cap > 0 and len(need_vlm_hashes) > _funnel_cap:
+            _budget_skipped_count += len(need_vlm_hashes) - _funnel_cap
             print(f"    🚨 [img-funnel] {doc_id}: {len(need_vlm_hashes)} unique images exceed "
                   f"RAG_FUNNEL_MAX_IMAGES={_funnel_cap} → capping; "
                   f"{len(need_vlm_hashes) - _funnel_cap} image(s) skipped (no VLM/OCR)", flush=True)
@@ -1873,6 +1893,7 @@ class UnifiedExtractor:
                     print(f"    🚨 [CostBreaker] funnel DENY {doc_id}: {_reason} "
                           f"→ skipping VLM for {len(need_vlm_hashes)} image(s) this doc", flush=True)
                     _breaker.maybe_alert_run_tripped()
+                    _budget_skipped_count += len(need_vlm_hashes)   # 批次6：DENY 跳过同样计降级
                     need_vlm_hashes = []
             except Exception as _ce:
                 print(f"    ⚠️ [CostBreaker] funnel reserve skipped (non-fatal): {_ce}", flush=True)
@@ -2032,12 +2053,14 @@ class UnifiedExtractor:
             print(f"      [img-funnel] ⚡ VLM calls={vlm_calls}, cache_hits={cache_hit_count}, "
                   f"dedup={dup_count}, time={elapsed:.1f}s ({avg_ms:.0f}ms/call, workers={max_workers})")
 
-        # P2-32：文档级降级数 = degraded asset 张数 + 漏斗异常整张丢失的唯一图片数。
-        vlm_degraded_count = degraded_asset_count + funnel_exception_count
+        # P2-32：文档级降级数 = degraded asset 张数 + 漏斗异常整张丢失的唯一图片数
+        # + 批次6：预算 cap/DENY 跳过的唯一图片数（同一 NEEDS_REVIEW 自愈通道）。
+        vlm_degraded_count = degraded_asset_count + funnel_exception_count + _budget_skipped_count
         if vlm_degraded_count:
-            print(f"      🚨 [img-funnel] {doc_id}: {vlm_degraded_count} 张图片为 VLM 降级兜底结论"
+            print(f"      🚨 [img-funnel] {doc_id}: {vlm_degraded_count} 张图片为 VLM 降级/缺失"
                   f"（degraded assets={degraded_asset_count}, funnel exceptions="
-                  f"{funnel_exception_count}）→ 文档将收尾 NEEDS_REVIEW，供应商恢复后重扫自愈")
+                  f"{funnel_exception_count}, budget skipped={_budget_skipped_count}）"
+                  f"→ 文档将收尾 NEEDS_REVIEW，供应商恢复/预算调高后重扫自愈")
 
         return assets, ocr_blocks, vlm_degraded_count
 
@@ -2362,5 +2385,16 @@ class UnifiedExtractor:
         result.ocr_required = True
         result.ocr_status = ocr_result.status
         result.extract_method = f"{result.extract_method}+ocr_fallback"
+
+        # 批次6（ultra ocr_client:298）：部分页 OCR 失败 → 留痕驱动 NEEDS_REVIEW 收尾。
+        # 失败页 text="" 会被 to_blocks 丢弃、聚合状态仍 DONE——不留痕的话缺页内容永久
+        # 静默缺失且无重扫信号；文本照常可服务（graceful degradation），只是不定稿 DONE。
+        _failed_pgs = [p.page_num for p in getattr(ocr_result, "pages", []) or []
+                       if getattr(p, "status", "") == "FAILED"]
+        if _failed_pgs and ocr_result.status != "FAILED":
+            _note = (f"ocr_partial: {len(_failed_pgs)}/{len(ocr_result.pages)} page(s) failed "
+                     f"(pages {_failed_pgs[:10]}) — content of failed pages missing")
+            result.partial_loss_notes.append(_note)
+            result.warnings.append(_note)
 
         return result

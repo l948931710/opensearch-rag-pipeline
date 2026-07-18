@@ -83,14 +83,25 @@
 ## 批次6 — 抽取/多模态 P2
 | 状态 | 条目 | 位置 | 修法 |
 |---|---|---|---|
-| ⬜ | P2 部分页 OCR 失败仍报 DONE,页面内容静默丢失 | `extraction/ocr_client.py:298` | 记 failed page 清单/计数,门 DONE |
-| ⬜ | P2 200 无法解析的 OCR 响应返 "" 并永久缓存 | `extraction/ocr_client.py:477` | 解析失败 raise(页 FAILED 不缓存);空结果不入缓存 |
-| ⬜ | P2 预算 cap/DENY 跳过的图片无 NEEDS_REVIEW 信号 | `extraction/unified_extractor.py:1945` | 计入 vlm_degraded_count(或专用 skipped 计数)驱动 NEEDS_REVIEW |
-| ⬜ | P2 XLSX/PPTX 整层 except 把部分抽取定稿为 DONE | `extraction/unified_extractor.py:1343` | 中途异常打 partial 标记→NEEDS_REVIEW |
-| ⬜ | P2 refund() 让真实计费逃出预算上限 | `extraction/vlm_rebuilder.py:472` | 仅未发生计费调用的页可退款,按 doc 记 billed 计数 |
-| ⬜ | P2 _vlm_reconstruct_page 裸 requests.post 无重试 | `extraction/vlm_rebuilder.py:149` | 走 post_json_with_retry(对齐 ocr_client) |
-| ⬜ | P2 XLSX drawingN.xml 假定映射 sheet N,批注绑定静默丢失 | `extraction/image_extraction_utils.py:672` | 经 worksheet .rels 解析真实 sheet↔drawing 映射 |
-| ⬜ | P2 clause_chunk 丢 page_num/source 溯源 | `chunker.py:1847` | 按段落跟踪 (offset,page_num,source),对齐 step 路径 |
+| ✅ | P2 部分页 OCR 失败仍报 DONE,页面内容静默丢失 | `extraction/ocr_client.py:298` | 记 failed page 清单/计数,门 DONE |
+| ✅ | P2 200 无法解析的 OCR 响应返 "" 并永久缓存 | `extraction/ocr_client.py:477` | 解析失败 raise(页 FAILED 不缓存);空结果不入缓存 |
+| ✅ | P2 预算 cap/DENY 跳过的图片无 NEEDS_REVIEW 信号 | `extraction/unified_extractor.py:1945` | 计入 vlm_degraded_count(或专用 skipped 计数)驱动 NEEDS_REVIEW |
+| ✅ | P2 XLSX/PPTX 整层 except 把部分抽取定稿为 DONE | `extraction/unified_extractor.py:1343` | 中途异常打 partial 标记→NEEDS_REVIEW |
+| ✅ | P2 refund() 让真实计费逃出预算上限 | `extraction/vlm_rebuilder.py:472` | 仅未发生计费调用的页可退款,按 doc 记 billed 计数 |
+| ✅ | P2 _vlm_reconstruct_page 裸 requests.post 无重试 | `extraction/vlm_rebuilder.py:149` | 走 post_json_with_retry(对齐 ocr_client) |
+| ✅ | P2 XLSX drawingN.xml 假定映射 sheet N,批注绑定静默丢失 | `extraction/image_extraction_utils.py:672` | 经 worksheet .rels 解析真实 sheet↔drawing 映射 |
+| ✅ | P2 clause_chunk 丢 page_num/source 溯源 | `chunker.py:1847` | 按段落跟踪 (offset,page_num,source),对齐 step 路径 |
+
+**批次6 落地记录(2026-07-17)**,as-built 与修法的差异及关键决策:
+- **统一「不完整不定稿」通道**:新增 `ExtractionResult.partial_loss_notes`(schema→canonical→orchestrator 回读→closure 三跳与 P2-32 同型),closure 的 NEEDS_REVIEW 门扩为 `vlm_degraded_count>0 或 partial_notes 非空`(chunk/索引照常,graceful degradation 不破)。OCR 部分页失败(消费侧从 OCRResult.pages 派生失败页清单,聚合仍 DONE 保留成功页文本)与 XLSX/PPTX 中途异常(有产出时)走此通道;**零产出仍归 0-chunk 疑似失败守卫**(FAILED+retry,更强,互不干扰)。
+- **cap/DENY 跳过**:按审计原建议计入 `vlm_degraded_count`(同一 NEEDS_REVIEW 自愈通道,print 注明 budget skipped 分量)——预算调高后重扫即自愈。
+- **OCR 200 不可解析**:DashScope 分支 raise RuntimeError(页 FAILED、raise 天然跳过缓存写);**空文本页不入页缓存**(真空白页重付一次 OCR 的代价换掉「一次形态异常固化为永久空页」;Gemini dev 分支未动)。
+- **refund 计费泄漏**:两路径(rebuild/refine)按 `_billed_pages` 只退未发请求页的份额(`dataclasses.replace(est, est_cost_rmb=share)`);**「请求已发出即计费」保守判定**(连接级失败不可区分,账本只多不少);refined>0 时照旧不退(维持保守超记)。**行为更替**:零产出但已计费不再全额退款——既有测试 test_rebuild_refunds_when_no_blocks_produced 改判为两条新语义用例。
+- **重建重试**:`_vlm_reconstruct_page` 改走 `post_json_with_retry`(label=VLM(rebuild),timeout 元组透传);外层 catch→[] 的最终失败语义不变(有界重试后仍失败才丢页)。
+- **xlsx drawing↔sheet**:新增 `_drawing_to_sheet_order`(workbook.xml sheet 顺序→r:id→workbook rels→worksheet rels→drawing,与资产 page_num 的 openpyxl wb.worksheets 同源);**任何一环缺失/解析失败回退旧 drawingN→sheetN 假定**(fail-open,常规文件两者一致零变化;封面页工作簿从「标注全丢」变为正确绑定)。
+- **clause 溯源**:逐段落记 `(offset,page_num,source)`(与 #F-clause-img 图片偏移同一坐标系),clause_chunk 按 seg_start 覆盖块盖章;无边界 fallback 路径用游标 find 精确定位(sub 是 full_text 连续窗口子串,find 必中)。合并段跨页时取起始块溯源(审计原建议粒度)。
+
+每批验证:新回归 15 条(batch6 文件 10+degraded 传播文件 3+dormant 改判 2);`make test` 全量+`make lint` 绿(2026-07-17)。未验证声明:真实 DashScope 429 重试行为(共享 helper 已有生产案底)、真实封面页 xlsx 工作簿语料(夹具为手工最小 OOXML)、NEEDS_REVIEW 状态在真实 RDS 的运维查询面。生效面:全部无 flag、随下一次 DataWorks 包部署生效;**行为变化两处需知**——①部分丢失文档从静默 DONE 改 NEEDS_REVIEW(存量已定稿的不回溯,重灌时生效);②rebuild/refine 零产出不再全额退款(预算消耗会更快到帽,这正是修复目的)。
 
 ## 批次7 — 服务/配置/告警 P2
 | 状态 | 条目 | 位置 | 修法 |

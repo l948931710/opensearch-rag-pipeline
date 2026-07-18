@@ -610,6 +610,9 @@ def node_build_canonical(ctx: dict):
                 # P2-32：VLM degraded 兜底图片数（供应商故障）→ 持久化进 canonical JSON 跨 stage
                 # 边界传递；>0 时 node_write_chunk_meta 收尾落 NEEDS_REVIEW（不 DONE）。
                 "vlm_degraded_count": getattr(result, "vlm_degraded_count", 0),
+                # 批次6：部分内容丢失留痕（OCR 部分页失败/XLSX/PPTX 中途异常）——同一
+                # NEEDS_REVIEW 收尾通道，跨 stage 边界随 canonical JSON 传递。
+                "partial_loss_notes": list(getattr(result, "partial_loss_notes", []) or []),
                 # G20：文本归一版本标记（canonical_sha256 建立在归一后文本上；规则变更须
                 # bump NORMALIZATION_VERSION，否则 skip-unchanged/去重把规则漂移误判为内容变更）
                 "normalization_version": None,
@@ -5569,12 +5572,21 @@ def node_write_chunk_meta(ctx: dict):
                         (_canon_by_dv.get((doc_id, ver), {}) or {}).get("vlm_degraded_count") or 0)
                 except (TypeError, ValueError):
                     _vlm_degraded_n = 0
-                if _vlm_degraded_n > 0:
-                    _vlm_note = (f"vlm_degraded: {_vlm_degraded_n} image(s) got degraded VLM "
-                                 f"fallback (vendor outage/timeouts) — re-ingest after VLM "
-                                 f"recovers")[:255]
-                    print(f"    🚨 {doc_id} v{ver}: {_vlm_degraded_n} 张图片为 VLM 降级兜底 → "
-                          f"content_process_status=NEEDS_REVIEW（chunk/索引照常，VLM 恢复后重灌自愈）")
+                # 批次6：部分内容丢失留痕（OCR 部分页失败/XLSX/PPTX 中途异常）走同一
+                # NEEDS_REVIEW 通道——「有产出但不完整」绝不静默定稿 DONE。
+                _partial_notes = list(
+                    (_canon_by_dv.get((doc_id, ver), {}) or {}).get("partial_loss_notes") or [])
+                if _vlm_degraded_n > 0 or _partial_notes:
+                    _note_parts = []
+                    if _vlm_degraded_n > 0:
+                        _note_parts.append(
+                            f"vlm_degraded: {_vlm_degraded_n} image(s) got degraded VLM "
+                            f"fallback (vendor outage/timeouts) — re-ingest after VLM recovers")
+                    _note_parts.extend(_partial_notes)
+                    _vlm_note = "; ".join(_note_parts)[:255]
+                    print(f"    🚨 {doc_id} v{ver}: VLM 降级 {_vlm_degraded_n} 张 / 部分丢失留痕 "
+                          f"{len(_partial_notes)} 条 → content_process_status=NEEDS_REVIEW"
+                          f"（chunk/索引照常，恢复后重灌自愈）")
                     if not simulate_db:
                         try:
                             if _closure_conn is None:

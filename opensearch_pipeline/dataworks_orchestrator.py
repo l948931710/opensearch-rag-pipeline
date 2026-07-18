@@ -343,6 +343,8 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             # node_write_chunk_meta 据此把文档收尾改走 NEEDS_REVIEW（不 DONE），
                             # 丢弃它 = degraded 标志在 DAG1→DAG2 边界静默蒸发、文档照样 INDEXED 终态。
                             "vlm_degraded_count": content_json.get("vlm_degraded_count", 0),
+                            # 批次6：部分内容丢失留痕（OCR 部分页/中途异常）→ 同一 NEEDS_REVIEW 通道
+                            "partial_loss_notes": content_json.get("partial_loss_notes", []) or [],
                             "filename": content_json.get("filename") or title,
                             "canonical_status": "DONE",
                             "canonical_key": canonical_json_key,

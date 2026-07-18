@@ -146,8 +146,13 @@ def _vlm_reconstruct_page(img_bytes: bytes, cfg, doc_title: str = "",
     url = resolve_vlm_url(base_url, use_compat)
     payload = build_image_chat_payload(model, prompt, b64, mime, use_compat, temperature=0)
     try:
-        r = requests.post(url, json=payload, headers=auth_headers(api_key),
-                          timeout=(15, 150) if use_compat else (10, 120))
+        # 批次6（ultra vlm_rebuilder:149）：裸 requests.post → post_json_with_retry（对齐
+        # ocr_client）——本账户 429 脆弱有案底且与漏斗共享 QPS，逐页背靠背调用下单次瞬时
+        # 429/5xx 就静默丢一页重建内容（返 [] 且文档看似成功）。瞬时错误有界重试。
+        from opensearch_pipeline.vlm_retry import post_json_with_retry
+        r = post_json_with_retry(url, json=payload, headers=auth_headers(api_key),
+                                 timeout=(15, 150) if use_compat else (10, 120),
+                                 label="VLM(rebuild)", post_fn=requests.post)
         r.raise_for_status()
         content = extract_vlm_text(r.json(), use_compat)
         # strip markdown fences
@@ -226,6 +231,7 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
     from opensearch_pipeline.extraction.schema import ExtractedBlock
     doc_title = task.get("doc_title", "") or task.get("filename", "")
     added = 0
+    _billed_pages = 0   # 批次6（ultra vlm_rebuilder:472）：真实发出过 VLM 请求的页数
     new_blocks_by_page = {}
     # perf#66：整个升级循环只 open 一次 PDF（大 PDF 每次 open 数百 ms，逐页重开 ×N）；
     # open 失败则 _doc=None → _render_page_image 逐页自行 open（行为同旧版，优雅降级）。
@@ -241,6 +247,7 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
             img, mime = _render_page_image(local_path, pidx, doc=_doc)
             if not img:
                 continue
+            _billed_pages += 1   # 批次6：请求已发出即视为计费（保守——账本只多不少）
             recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime)
             page_blocks = []
             for b in recon:
@@ -271,8 +278,15 @@ def maybe_rebuild_pdf(task: dict, result, cfg, breaker=None):
                 pass
 
     if not added:
-        # 放行但实际未产生任何重建块 (渲染/VLM 全失败) → 退还预留，勿空耗运行预算
-        breaker.refund(gate_doc["doc_id"], est)
+        # 批次6（ultra vlm_rebuilder:472）：只退**未计费**页的份额。此前零产出时全额退款——
+        # 但空 blocks 的 200 响应照样计费（图形页/拒答页），全退让真实 DashScope 花费逃出
+        # run/daily 预算帽（refund 还会解除熔断+回冲共享日账本），一批病态 PDF 可无上限
+        # 烧钱。渲染失败/未发请求的页照旧退（真未花钱）；已发请求的页保守按已计费不退。
+        _unbilled = max(0, len(escalate) - _billed_pages)
+        if _unbilled > 0:
+            import dataclasses as _dc
+            _share = est.est_cost_rmb * _unbilled / max(1, len(escalate))
+            breaker.refund(gate_doc["doc_id"], _dc.replace(est, est_cost_rmb=round(_share, 6)))
         return result
 
     # 先算 recovered 文本（在拼回消费 new_blocks_by_page 之前）
@@ -430,6 +444,7 @@ def maybe_refine_tables(task: dict, result, cfg, breaker=None):
     doc_title = task.get("doc_title", "") or task.get("filename", "")
     page_tables = {}  # page_num → [vlm table markdown, ...]（每页渲染+重建一次）
     refined = rejected = 0
+    _billed_pages = 0   # 批次6：真实发出过 VLM 请求的页数（渲染失败页不计）
     # perf#66：精修循环同样只 open 一次 PDF；失败回退逐页自行 open（优雅降级）。
     _doc = None
     try:
@@ -445,6 +460,8 @@ def maybe_refine_tables(task: dict, result, cfg, breaker=None):
                 continue
             if pg not in page_tables:
                 img, mime = _render_page_image(local_path, pg - 1, doc=_doc)
+                if img:
+                    _billed_pages += 1   # 批次6：请求已发出即视为计费（保守）
                 recon = _vlm_reconstruct_page(img, cfg, doc_title, mime=mime) if img else []
                 page_tables[pg] = [(rb.get("text") or "").strip() for rb in recon
                                    if rb.get("type") == "table" and (rb.get("text") or "").strip()]
@@ -481,6 +498,12 @@ def maybe_refine_tables(task: dict, result, cfg, breaker=None):
         print(f"    [table_refine] refined {refined} table(s), rejected {rejected} "
               f"(number-fidelity), across {len(pages)} page(s)", flush=True)
     else:
-        # 放行但无一张表通过数字保真闸 → 退还预留，勿空耗运行预算
-        breaker.refund(gate_doc["doc_id"], est)
+        # 批次6（ultra vlm_rebuilder:472）：只退未计费页份额——精修的每次页级 VLM 调用都
+        # 真实计费，闸拒（数字保真/对应性）不改变已花的钱；全退会让病态表格 PDF 的真实
+        # 花费逃出预算帽（refund 还解除熔断+回冲日账本）。渲染失败/未发请求的页照旧退。
+        _unbilled = max(0, len(pages) - _billed_pages)
+        if _unbilled > 0:
+            import dataclasses as _dc
+            _share = est.est_cost_rmb * _unbilled / max(1, len(pages))
+            breaker.refund(gate_doc["doc_id"], _dc.replace(est, est_cost_rmb=round(_share, 6)))
     return result
