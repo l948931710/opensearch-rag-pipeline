@@ -90,6 +90,40 @@ def _gaps_cache_ttl() -> float:
         return 60.0
 
 
+# ── 无效问题分层过滤（2026-07-18 拍板）：判定纯函数与 flag 单一来源都在
+# opensearch_pipeline/contribution.py（junk_filter_on / hide_incomplete_on /
+# is_junk_question / is_incomplete_question）；本模块只做读侧挂点。
+from opensearch_pipeline.contribution import (   # noqa: E402
+    hide_incomplete_on as _hide_incomplete_on,
+    junk_filter_on as _junk_filter_on,
+)
+
+
+# schema/050（rewritten_query 列）未 apply 时的 TTL 负缓存：到期自动重试探测，
+# apply 后无须重启即恢复带列查询；**仅 errno 1054 走降级**，其他 SQL 错误照抛。
+_GAP_REWRITTEN_MISSING_UNTIL = 0.0
+_GAP_REWRITTEN_RETRY_SECONDS = 600.0
+
+
+def _exec_gap_sql(cur, sql_with_rw: str, sql_without_rw: str, params) -> bool:
+    """执行缺口候选 SQL：优先带 rewritten_query 列的版本，1054（列缺失）→ TTL 负缓存
+    并回退无列版本。返回 True=行尾带 rewritten 列。"""
+    global _GAP_REWRITTEN_MISSING_UNTIL
+    if time.time() >= _GAP_REWRITTEN_MISSING_UNTIL:
+        try:
+            cur.execute(sql_with_rw, params)
+            return True
+        except Exception as e:   # noqa: BLE001 — 仅 1054 降级，其余照抛
+            errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
+            if errno != 1054:
+                raise
+            _GAP_REWRITTEN_MISSING_UNTIL = time.time() + _GAP_REWRITTEN_RETRY_SECONDS
+            logger.info("kb_gaps rewritten_query 列缺失（schema/050 未 apply），"
+                        "%.0fs 内回退无列查询", _GAP_REWRITTEN_RETRY_SECONDS)
+    cur.execute(sql_without_rw, params)
+    return False
+
+
 def _gaps_cache_clear() -> None:
     with _gaps_cache_lock:
         _gaps_cache.clear()
@@ -117,7 +151,7 @@ def _gaps_cache_put(key, value) -> None:
 
 
 class KbGapItem(BaseModel):
-    question: str = ""             # 已脱敏的提问原文（展示用）
+    question: str = ""             # 已脱敏的提问（展示用；追问改写发生时优先展示改写后的独立问题）
     asks: int = 0                  # COUNT(DISTINCT message_id)
     last_days: int = 0             # 距最近一次提问的天数
     dept: str = ""                 # 建议归属（NO_RESULT=提问部门 / REFUSAL=命中文档部门），仅展示
@@ -126,6 +160,11 @@ class KbGapItem(BaseModel):
     source_message_id: str = ""    # 代表性 message_id（「回答」预填溯源）
     has_pending_contribution: bool = False   # 已有贡献待入库（缺口仍开放，标「等待入库」）
     phrasings: int = 1             # 语义组归并后的成员问法数（RAG_QA_GAP_SEMANTIC 关时恒 1；additive）
+    # 缺口卡上下文展开（2026-07-18；additive）：representative_message_id 与
+    # source_message_id 同值（语义显名，前端上下文展开用它）；has_context=该代表提问
+    # 所在会话有前序问答（前端仅 true 时渲染「查看上下文」）。
+    representative_message_id: str = ""
+    has_context: bool = False
 
 
 class KbGapsSummary(BaseModel):
@@ -1148,7 +1187,9 @@ def kb_gaps(request: Request, limit: int = 20, offset: int = 0,
             question=C.redact_query_text(g["raw"]), asks=g["asks"], last_days=g["days"],
             dept=g["dept"], kind=g["kind"], question_hash=g["hash"],
             source_message_id=g["msg"], has_pending_contribution=g["pending"],
-            phrasings=int(g.get("phrasings") or 1)) for g in page]
+            phrasings=int(g.get("phrasings") or 1),
+            representative_message_id=g["msg"],
+            has_context=bool(g.get("has_context"))) for g in page]
         funnel = _gaps_review_funnel(identity)
         if funnel:
             summary = summary.model_copy(update=funnel)
@@ -1179,21 +1220,39 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
     # hash → 聚合体
     agg: Dict[str, Dict[str, Any]] = {}
     fails = 0
+    _junk_on = _junk_filter_on()
 
-    def _accumulate(qtext, msg_id, days_ago, dept, kind):
-        h = C.question_hash(qtext)
+    def _accumulate(qtext, msg_id, days_ago, dept, kind, sid=None, rid=None, rewritten=None):
+        # 展示/归并口径：改写发生的行按改写后的独立问题（与写侧 question_hash 语义一致）
+        display = rewritten or qtext
+        # 分层第 1 层：确定性垃圾（纯标点/单字/纯数字）读出侧直接过滤（逃生阀 flag）
+        if _junk_on and C.is_junk_question(display):
+            return
+        h = C.question_hash(display)
         if not h:
             return
+        try:
+            rid_i = int(rid) if rid is not None else None
+        except (TypeError, ValueError):
+            rid_i = None
+        # 行级完整性：有改写 = 已是独立问题；否则按「短且缺主体」判定
+        row_complete = bool(rewritten) or not C.is_incomplete_question(display)
         e = agg.get(h)
         if e is None:
-            e = {"hash": h, "raw": qtext or "", "msgs": set(), "days": int(days_ago or 0),
-                 "dept": dept or "", "kind": kind}
+            e = {"hash": h, "raw": display or "", "msgs": set(), "days": int(days_ago or 0),
+                 "dept": dept or "", "kind": kind,
+                 # 代表行 = 首见行（NO_RESULT 源按 created_at DESC，首见即最新）
+                 "msg": msg_id or "", "rep": (sid or "", rid_i),
+                 "complete": row_complete, "ctx": []}
             agg[h] = e
         if msg_id:
             e["msgs"].add(msg_id)
         e["days"] = min(e["days"], int(days_ago or 0))
         if not e["dept"] and dept:
             e["dept"] = dept
+        e["complete"] = e["complete"] or row_complete
+        if sid and rid_i is not None and len(e["ctx"]) < 5:
+            e["ctx"].append((sid, rid_i))
         # REFUSAL（有文档没答好）信号优先于纯 NO_RESULT 展示 kind
         if kind == "refusal":
             e["kind"] = "refusal"
@@ -1206,16 +1265,23 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
             if depts:
                 try:
                     ph = ",".join(["%s"] * len(depts))
-                    cur.execute(
-                        "SELECT q.query_text, q.message_id, DATEDIFF(NOW(), q.created_at), q.user_dept"
+                    _nr_base = (
+                        "SELECT q.query_text, q.message_id, DATEDIFF(NOW(), q.created_at),"
+                        " q.user_dept, q.session_id, q.id{rw}"
                         f" FROM {_op_db()}.qa_session_log q"
                         " WHERE q.answer_status='NO_RESULT'"
                         "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                         f"   AND q.user_dept IN ({ph})"
-                        " ORDER BY q.created_at DESC LIMIT %s",
-                        tuple([win] + depts + [_GAP_CANDIDATE_CAP]))
+                        " ORDER BY q.created_at DESC LIMIT %s")
+                    _params = tuple([win] + depts + [_GAP_CANDIDATE_CAP])
+                    _has_rw = _exec_gap_sql(cur, _nr_base.format(rw=", q.rewritten_query"),
+                                            _nr_base.format(rw=""), _params)
                     for r in cur.fetchall() or []:
-                        _accumulate(r[0], r[1], r[2], r[3], "no_result")
+                        # len 护栏：真实 SQL 恒 ≥6 列；只兜测试桩/驱动差异的短行
+                        _accumulate(r[0], r[1], r[2], r[3], "no_result",
+                                    sid=(r[4] if len(r) > 4 else None),
+                                    rid=(r[5] if len(r) > 5 else None),
+                                    rewritten=(r[6] if (_has_rw and len(r) > 6) else None))
                 except Exception as e:
                     fails += 1; logger.warning("kb_gaps NO_RESULT 失败: %s", e)
             # 2) REFUSAL（有文档没答好）：本部门命中 OR 全部命中为 public（最保守）
@@ -1229,23 +1295,32 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
                     params.extend(depts)
                 params.append(win)
                 from opensearch_pipeline.qa_facts import qa_docs_join_sql
-                cur.execute(
-                    "SELECT t.query_text, t.message_id, t.days_ago, t.any_dept FROM ("
+                _rf_base = (
+                    "SELECT t.query_text, t.message_id, t.days_ago, t.any_dept, t.sid, t.rid{rw_o}"
+                    " FROM ("
                     " SELECT q.message_id,"
                     "   MAX(q.query_text) query_text, DATEDIFF(NOW(), MAX(q.created_at)) days_ago,"
                     f"   {mine_expr} hit_mine,"
                     "   MIN(CASE WHEN m.permission_level='public' THEN 1 ELSE 0 END) all_public,"
-                    "   MIN(m.owner_dept) any_dept"
+                    "   MIN(m.owner_dept) any_dept,"
+                    "   MAX(q.session_id) sid, MAX(q.id) rid{rw_i}"
                     f" FROM {_op_db()}.qa_session_log q"
                     + qa_docs_join_sql()
                     + " WHERE q.answer_status='REFUSAL' AND q.retrieved_docs_json IS NOT NULL"
                     "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                     " GROUP BY q.message_id"
                     ") t WHERE t.hit_mine=1 OR t.all_public=1"
-                    " ORDER BY t.days_ago ASC LIMIT %s",
-                    tuple(params + [_GAP_CANDIDATE_CAP]))
+                    " ORDER BY t.days_ago ASC LIMIT %s")
+                _rf_params = tuple(params + [_GAP_CANDIDATE_CAP])
+                _has_rw = _exec_gap_sql(
+                    cur,
+                    _rf_base.format(rw_o=", t.rw", rw_i=", MAX(q.rewritten_query) rw"),
+                    _rf_base.format(rw_o="", rw_i=""), _rf_params)
                 for r in cur.fetchall() or []:
-                    _accumulate(r[0], r[1], r[2], r[3], "refusal")
+                    _accumulate(r[0], r[1], r[2], r[3], "refusal",
+                                sid=(r[4] if len(r) > 4 else None),
+                                rid=(r[5] if len(r) > 5 else None),
+                                rewritten=(r[6] if (_has_rw and len(r) > 6) else None))
             except Exception as e:
                 fails += 1; logger.warning("kb_gaps REFUSAL 失败: %s", e)
             # 3) 贡献覆盖：同 hash 已 searchable→关闭；pending/accepted-未searchable→标等待入库
@@ -1289,6 +1364,27 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
                         group_map = load_group_map(cur, _op_db(), list(agg.keys()))
                     except Exception as e:
                         logger.info("kb_gaps 语义组映射不可用（不归并，non-fatal）: %s", e)
+            # 3.7) 会话上下文批查（2026-07-18）：每 session 一次 MIN(id)——某行 id > 该
+            # session 最小 id 即「有前序问答」。供 ① has_context（前端「查看上下文」门）
+            # ② incomplete 低质量隐藏判定（无任何上下文才隐藏）。独立降级不进 fails：
+            # 查询失败 → session_min 缺项按「未知」处理（不隐藏、不显上下文按钮，fail-open）。
+            session_min: Dict[str, int] = {}
+            if agg:
+                need_sessions = {s for e in agg.values()
+                                 for (s, r) in ([e["rep"]] + e["ctx"]) if s and r is not None}
+                try:
+                    sess_list = sorted(need_sessions)[:1500]
+                    for i in range(0, len(sess_list), 500):
+                        chunk = sess_list[i:i + 500]
+                        ph = ",".join(["%s"] * len(chunk))
+                        cur.execute(
+                            f"SELECT session_id, MIN(id) FROM {_op_db()}.qa_session_log"
+                            f" WHERE session_id IN ({ph}) GROUP BY session_id", tuple(chunk))
+                        for sid, mid in cur.fetchall() or []:
+                            if sid and mid is not None:
+                                session_min[str(sid)] = int(mid)
+                except Exception as e:
+                    logger.info("kb_gaps 会话上下文批查不可用（fail-open）: %s", e)
             # 4) summary（各自独立降级）
             try:
                 cur.execute(f"SELECT COUNT(*) FROM {_op_db()}.kb_contribution WHERE ingestion_status='searchable'")
@@ -1306,14 +1402,26 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
     if fails >= 4:
         raise HTTPException(status_code=500, detail=f"缺口查询失败 (trace: {trace_id})")
     # 组装：去掉已 searchable 覆盖的缺口；排序 asks desc, days asc；脱敏 + 分页
+    def _has_ctx(sid: str, rid) -> bool:
+        return bool(sid) and rid is not None and sid in session_min and int(rid) > session_min[sid]
+
+    _hide_on = _hide_incomplete_on()
     open_gaps = []
     for h, e in agg.items():
         if h in covered_closed or h in dismissed:
             continue
+        # 分层第 3 层：短缺主体（全部成员 incomplete、无改写）且【毫无会话上下文】
+        # → 低质量隐藏（独立 flag；session_min 缺项=未知，按有上下文处理，绝不误隐）
+        if _hide_on and not e["complete"]:
+            known = [(s, r) for (s, r) in e["ctx"] if s in session_min]
+            if known and not any(_has_ctx(s, r) for (s, r) in known):
+                continue
+        rep_sid, rep_rid = e["rep"]
         open_gaps.append({
             "hash": h, "raw": e["raw"], "asks": len(e["msgs"]) or 1, "days": e["days"],
-            "dept": e["dept"], "kind": e["kind"], "msg": next(iter(e["msgs"]), ""),
+            "dept": e["dept"], "kind": e["kind"], "msg": e["msg"],
             "pending": h in covered_pending,
+            "has_context": _has_ctx(rep_sid, rep_rid),
         })
     # 语义组归并（纯函数；关闭判定已按 exact hash 在上方逐成员完成，归并只影响展示）：
     # 同组开放成员并为一张卡（asks 求和/days 取 min/refusal 优先），卡片 hash 恒为真实
@@ -1326,6 +1434,109 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
     if fails == 0:   # 降级结果（部分子查询失败）不缓存——下一请求重试取全量
         _gaps_cache_put(cache_key, (open_gaps, summary))
     return open_gaps, summary
+
+
+# ── 缺口卡会话上下文展开（2026-07-18）：多轮追问沉淀的缺口单看是无上下文短问题，
+#    认领者展开该提问所在会话的前几轮问答才能看懂。可见性与 /api/kb/gaps 同源
+#    （轻量单 message EXISTS 谓词，不重跑聚合）；他人问答全程脱敏。────────────────
+class KbGapContextTurn(BaseModel):
+    question: str = ""             # 前序用户提问（redact_query_text 脱敏）
+    answer_status: str = ""        # 该轮回答状态（SUCCESS/REFUSAL/NO_RESULT/…）
+    answer_excerpt: str = ""       # 回答节选（仅 SUCCESS 轮给；审计级脱敏后截断 200 字）
+    created_at: str = ""
+
+
+class KbGapContextResponse(BaseModel):
+    message_id: str = ""
+    items: List[KbGapContextTurn] = Field(default_factory=list)   # 时间正序（旧→新）
+
+
+def _gap_message_visible(cur, row, depts: List[str]) -> bool:
+    """单 message 的缺口可见性谓词——与 _compute_open_gaps 两条候选 SQL 的部门口径
+    同源：NO_RESULT=提问部门∈depts；REFUSAL=命中文档归属∈depts 或全部命中为 public。
+    row=(id, session_id, created_at, answer_status, user_dept, message_id)。"""
+    status, user_dept = row[3], row[4]
+    if status == "NO_RESULT":
+        return bool(depts) and (user_dept or "") in depts
+    # REFUSAL：轻量单 message 聚合（与列表 SQL 同一 hit_mine/all_public 口径）
+    from opensearch_pipeline.qa_facts import qa_docs_join_sql
+    mine_expr = "0"
+    params: List[Any] = []
+    if depts:
+        ph = ",".join(["%s"] * len(depts))
+        mine_expr = f"MAX(CASE WHEN m.owner_dept IN ({ph}) THEN 1 ELSE 0 END)"
+        params.extend(depts)
+    cur.execute(
+        f"SELECT {mine_expr} hit_mine,"
+        "   MIN(CASE WHEN m.permission_level='public' THEN 1 ELSE 0 END) all_public"
+        f" FROM {_op_db()}.qa_session_log q"
+        + qa_docs_join_sql()
+        + " WHERE q.message_id=%s AND q.retrieved_docs_json IS NOT NULL"
+        " GROUP BY q.message_id",
+        tuple(params + [row[5]]))
+    vis = cur.fetchone()
+    return bool(vis) and (int(vis[0] or 0) == 1 or int(vis[1] or 0) == 1)
+
+
+@router.get("/api/kb/gaps/context", response_model=KbGapContextResponse)
+def kb_gap_context(request: Request, message_id: str,
+                   identity: Optional[Identity] = Depends(current_identity)):
+    """缺口代表提问的会话上文（前 ≤3 轮）。message 不存在/非缺口行 → 404；
+    存在但不在调用者可见缺口池 → 403。(created_at, id) 复合游标——同时间戳不漏不乱。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="需要登录")
+    from opensearch_pipeline import contribution as C, kb_authz
+    depts = kb_authz.sanitize_owner_depts(identity.acl_groups)
+    trace_id = get_request_id()
+    if not message_id or len(message_id) > 128:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, session_id, created_at, answer_status, user_dept, message_id"
+                    f" FROM {_op_db()}.qa_session_log WHERE message_id=%s LIMIT 1",
+                    (message_id,))
+                row = cur.fetchone()
+                if not row or row[3] not in ("NO_RESULT", "REFUSAL"):
+                    raise HTTPException(status_code=404, detail="记录不存在")
+                if not _gap_message_visible(cur, row, depts):
+                    raise HTTPException(status_code=403, detail="无权查看该缺口上下文")
+                rid, sid, created = int(row[0]), row[1], row[2]
+                cur.execute(
+                    "SELECT query_text, answer_status, answer_text, created_at, id"
+                    f" FROM {_op_db()}.qa_session_log"
+                    " WHERE session_id=%s AND (created_at < %s OR (created_at = %s AND id < %s))"
+                    " ORDER BY created_at DESC, id DESC LIMIT 3",
+                    (sid, created, created, rid))
+                prior = list(cur.fetchall() or [])
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_gap_context 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"上下文查询失败 (trace: {trace_id})")
+    items: List[KbGapContextTurn] = []
+    for (qtext, status, ans, cat, _pid) in reversed(prior):   # 时间正序（旧→新）
+        excerpt = ""
+        if (status or "") == "SUCCESS" and ans:
+            # 约束 8：回答是审计级文本，redact_query_text（面向短查询）不够——用
+            # redaction.redact_text（feedback_comment 同款），**脱敏后**再截断。
+            try:
+                from opensearch_pipeline.redaction import redact_text
+                masked, _cnt = redact_text(str(ans))
+                excerpt = masked[:200]
+            except Exception:   # noqa: BLE001 — 脱敏失败宁可不给节选
+                excerpt = ""
+        items.append(KbGapContextTurn(
+            question=C.redact_query_text(str(qtext or "")),
+            answer_status=str(status or ""), answer_excerpt=excerpt,
+            created_at=str(cat or "")))
+    return KbGapContextResponse(message_id=message_id, items=items)
 
 
 # ── 「忽略此缺口」（schema/041，ε-4 遗留；2026-07-15 用户拍板：交给 dept_admin）────
