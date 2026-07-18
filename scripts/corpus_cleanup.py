@@ -46,9 +46,11 @@ def _conn(database=None):
     import pymysql
     from opensearch_pipeline.config import get_config
     cfg = get_config()
+    # P0-02/B3：显式 TLS 语义（配 CA 验证 / 未配显式明文，堵 pymysql 2.x PREFERRED 漂移）
     return pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
                            password=cfg.rds.password, database=database or cfg.rds.database,
-                           charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor)
+                           charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
+                           **cfg.rds.pymysql_ssl_args())
 
 
 # ═══════════════════════════ B1 注册卫生 ═══════════════════════════

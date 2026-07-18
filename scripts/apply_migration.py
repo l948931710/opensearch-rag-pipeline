@@ -180,8 +180,12 @@ def _connect_rw(cfg, prod_ack, is_prod):
         # prod_access 默认 DictCursor 会 KeyError 0（首次真跑 prod 路径踩中，2026-07-11）
         return get_prod_rw_conn(prod_ack, dict_cursor=False)   # ack + 四账号纪律在 prod_access 内
     import pymysql
+    # P0-02 对齐 db.py：RDS 开 SSL 后 pymysql 2.x 默认 PREFERRED 会试 TLS——未配 CA
+    # 显式 ssl_disabled（配了则带 CA 校验），否则对 TLS-enabled 实例握手即断
+    # （2026-07-17 staging 实撞：SSLV3_ALERT_HANDSHAKE_FAILURE）。
     return pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
-                           password=cfg.rds.password, charset="utf8mb4", connect_timeout=10)
+                           password=cfg.rds.password, charset="utf8mb4", connect_timeout=10,
+                           **cfg.rds.pymysql_ssl_args())
 
 
 def _connect_ro(cfg, is_prod):
@@ -194,7 +198,7 @@ def _connect_ro(cfg, is_prod):
         import pymysql
         return pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
                                password=cfg.rds.password, charset="utf8mb4",
-                               connect_timeout=10)
+                               connect_timeout=10, **cfg.rds.pymysql_ssl_args())
     except Exception as e:   # noqa: BLE001
         print(f"（只读连接不可用，降级为纯解析预览：{e}）")
         return None

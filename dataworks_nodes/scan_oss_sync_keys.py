@@ -10,7 +10,9 @@ OSS → RDS raw_key 同步脚本 (PyODPS 节点)
 
 安全模式：DRY_RUN = True 时只报告不修改
 """
-import subprocess, sys, os
+import subprocess
+import sys
+import os
 
 # ═══════════════════════════════════════════════════════════════
 # 0. 安装依赖
@@ -24,7 +26,8 @@ else:
 def ensure_deps():
     dep_dir = "/tmp/pydeps"
     try:
-        import pymysql, oss2
+        import pymysql  # noqa: F401  仅探测依赖是否可用
+        import oss2     # noqa: F401
         return
     except ImportError:
         pass
@@ -129,11 +132,24 @@ print(f"   ✅ 发现 {len(oss_files)} 个文件")
 # ═══════════════════════════════════════════════════════════════
 import pymysql
 
+
+def _rds_ssl_kwargs():
+    """P0-02/B3：显式 TLS 语义——配 RAG_RDS_SSL_CA 即验证 TLS，未配显式明文。
+    不能留空 kwargs：RDS 服务端开 SSL 后 pymysql 2.x PREFERRED 会自动试握手且
+    失败不回退，行为随客户端 OpenSSL 漂移（与 prod_access._connect 同语义）。"""
+    ca = (os.environ.get("RAG_RDS_SSL_CA") or "").strip()
+    if not ca:
+        return {"ssl_disabled": True}
+    verify = (os.environ.get("RAG_RDS_SSL_VERIFY_CERT", "true").strip().lower()
+              not in ("0", "false", "no"))
+    return {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+
+
 print("\n📋 查询 RDS document_version 记录...")
 conn = pymysql.connect(
     host=RDS_HOST, port=RDS_PORT,
     user=RDS_USER, password=RDS_PASSWORD,
-    database=RDS_DATABASE, charset="utf8mb4"
+    database=RDS_DATABASE, charset="utf8mb4", **_rds_ssl_kwargs()
 )
 
 with conn.cursor() as cursor:
@@ -227,7 +243,7 @@ if not_found:
         print(f"  ... 还有 {len(not_found) - 20} 条")
 
 if new_files:
-    print(f"\n── OSS 新文件 (未注册) 前 20 条 ──")
+    print("\n── OSS 新文件 (未注册) 前 20 条 ──")
     for key in sorted(new_files)[:20]:
         print(f"  🆕 {key}")
     if len(new_files) > 20:
@@ -282,7 +298,7 @@ if not DRY_RUN and needs_update:
     print(f"\n   ✅ 更新路径: {updated} 条")
     print(f"   🔄 停用重复: {deactivated} 条")
 elif DRY_RUN and needs_update:
-    print(f"\n💡 DRY_RUN 模式，未执行修改。改为 DRY_RUN = False 后重跑即可实际更新。")
+    print("\n💡 DRY_RUN 模式，未执行修改。改为 DRY_RUN = False 后重跑即可实际更新。")
 
 conn.close()
 print("\n✅ 完成！")

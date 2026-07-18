@@ -84,3 +84,70 @@ class HttpsRedirectMiddleware:
 
         # 头缺失或非法值：无法信任 scheme，放行（直连 IP 的小程序/钉钉回调走这里）
         await self.app(scope, receive, send)
+
+
+# ── B5（生产级外审 2026-07-17 P2-07）：统一安全响应头 ─────────────────────────
+import os as _os   # noqa: E402 — 仅本段使用；顶部无 os 依赖，保持原模块极简
+
+
+def _security_headers() -> list:
+    """每请求惰性计算（读 env，monkeypatch 可测；字符串拼接开销可忽略）。
+
+    设计要点：
+    · **frame 控制走「强制 CSP 只含 frame-ancestors」**：console 被钉钉 PC 工作台
+      内嵌，X-Frame-Options 表达不了 allowlist（DENY/SAMEORIGIN 都会打死现网入口）；
+      而 frame-ancestors 在 Report-Only 头里会被浏览器忽略——所以必须拆两个头：
+      强制头只带 frame-ancestors（self+钉钉域），其余策略全走 Report-Only 观察，
+      观察期零破坏（G 排查后续再逐条转强制）。
+    · RAG_FRAME_ANCESTORS_EXTRA=host1,host2 追加祖先（如未来别的门户内嵌）；
+      RAG_SECURITY_HEADERS=false 整组关闭（排障逃生口）。"""
+    if _os.environ.get("RAG_SECURITY_HEADERS", "true").strip().lower() in (
+            "0", "false", "no", "off"):
+        return []
+    ancestors = ["'self'", "https://*.dingtalk.com", "https://*.dingtalkapps.com"]
+    extra = (_os.environ.get("RAG_FRAME_ANCESTORS_EXTRA") or "").strip()
+    for e in extra.split(","):
+        e = e.strip()
+        if e:
+            ancestors.append(e)
+    csp_enforced = "frame-ancestors " + " ".join(ancestors)
+    csp_report_only = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob: https:; connect-src 'self' https:; "
+        "font-src 'self' data:")
+    return [
+        (b"x-content-type-options", b"nosniff"),
+        (b"referrer-policy", b"same-origin"),
+        (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+        (b"content-security-policy", csp_enforced.encode("latin-1", "ignore")),
+        (b"content-security-policy-report-only",
+         csp_report_only.encode("latin-1", "ignore")),
+    ]
+
+
+class SecurityHeadersMiddleware:
+    """纯 ASGI（同 HttpsRedirectMiddleware 挂法）：给每个 HTTP 响应补安全头；
+    端点已显式设置的同名头不覆盖（尊重更具体的策略）。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        pending = _security_headers()
+        if not pending:
+            await self.app(scope, receive, send)
+            return
+
+        async def _send(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                existing = {k.lower() for k, _ in headers}
+                for k, v in pending:
+                    if k not in existing:
+                        headers.append((k, v))
+            await send(message)
+
+        await self.app(scope, receive, _send)

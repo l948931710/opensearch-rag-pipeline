@@ -27,6 +27,22 @@ logger = logging.getLogger(__name__)
 
 _LAST_SENT: dict = {}  # dedup_key -> last send timestamp (process-local; fine for single-instance)
 _DEDUP_WINDOW_S = 60
+# B6（生产级外审 2026-07-17 P2-15）：进程内「该发未发」压制统计——webhook 未配 /
+# 不在允许域时告警只活在日志里（核查实测：监控当天 critical 全部 SUPPRESSED），
+# governance 看板与 security_posture 消费本计数让压制可见。
+_SUPPRESSED = {"count": 0, "last_title": "", "last_ts": 0.0}
+
+
+def suppressed_stats() -> dict:
+    """本进程被压制（该发未发）的告警统计快照。跨进程（launchd 监控/DataWorks 节点）
+    的压制不在此列——那要靠把 RAG_OPS_ALERT_WEBHOOK 配上（B7）根治，不靠计数。"""
+    return dict(_SUPPRESSED)
+
+
+def _note_suppressed(title: str) -> None:
+    _SUPPRESSED["count"] += 1
+    _SUPPRESSED["last_title"] = title
+    _SUPPRESSED["last_ts"] = time.time()
 
 
 def _sign_url(webhook: str, secret: str) -> str:
@@ -37,6 +53,29 @@ def _sign_url(webhook: str, secret: str) -> str:
     return f"{webhook}{'&' if '?' in webhook else '?'}timestamp={ts}&sign={urllib.parse.quote_plus(sig)}"
 
 
+def _webhook_allowed(url: str) -> bool:
+    """B5（生产级外审 2026-07-17 P2-08）SSRF 防线：webhook 仅 https + 域白名单
+    （默认钉钉官方域；`RAG_OPS_ALERT_WEBHOOK_ALLOW=host1,host2` 追加自建告警网关域）。
+    套 dingtalk_bot._is_dingtalk_webhook（#F-dingtalk-ssrf）同款范式——env 被污染时
+    file:// 与 VPC 内网/元数据地址不再可达。解析失败一律拒。"""
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.scheme != "https" or not p.hostname:
+            return False
+        host = p.hostname.lower()
+        suffixes = [".dingtalk.com"]
+        exacts = {"dingtalk.com"}
+        extra = (os.environ.get("RAG_OPS_ALERT_WEBHOOK_ALLOW") or "").strip()
+        for e in extra.split(","):
+            e = e.strip().lower().lstrip(".")
+            if e:
+                exacts.add(e)
+                suffixes.append("." + e)
+        return host in exacts or any(host.endswith(s) for s in suffixes)
+    except Exception:   # noqa: BLE001 — 解析不了的 URL 不值得信任
+        return False
+
+
 def send_ops_alert(title: str, text: str, *, severity: str = "warning",
                    dedup_key: Optional[str] = None, timeout: float = 5.0) -> bool:
     """Post a Markdown alert. Returns True on a 2xx HTTP send; False otherwise (or no-op).
@@ -44,6 +83,12 @@ def send_ops_alert(title: str, text: str, *, severity: str = "warning",
     """
     webhook = (os.environ.get("RAG_OPS_ALERT_WEBHOOK") or "").strip()
     secret = (os.environ.get("RAG_OPS_ALERT_SECRET") or "").strip()
+    if webhook and not _webhook_allowed(webhook):
+        # B5（P2-08）：env 污染 → file:///内网 SSRF 的通道关闭（拒发+响亮留痕）。
+        logger.error("ops-alert 拒发：webhook 不在允许域（须 https + *.dingtalk.com；"
+                     "自建网关用 RAG_OPS_ALERT_WEBHOOK_ALLOW 追加域名）：%s", webhook[:80])
+        _note_suppressed(title)
+        return False
     if not webhook:
         # P0-05（报告1）：webhook 未配时不再静默 no-op——critical 升到 logger.error（运维日志
         # 至少能看到"本该告警但发不出去"），其余 severity 保持 info。真正的常在线调度/dead-man
@@ -51,6 +96,7 @@ def send_ops_alert(title: str, text: str, *, severity: str = "warning",
         (logger.error if severity == "critical" else logger.info)(
             "ops-alert %s (RAG_OPS_ALERT_WEBHOOK unset): [%s] %s",
             "SUPPRESSED-CRITICAL" if severity == "critical" else "no-op", severity, title)
+        _note_suppressed(title)   # B6 P2-15：压制可见化（governance/posture 消费）
         return False
 
     # rate-limit identical alerts to prevent storms

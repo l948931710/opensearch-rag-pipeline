@@ -6,7 +6,10 @@ Output: oss://fuling-knowledge-base/opensearch/fuling-kb-chunks-v2-<ts>/data.jso
 
 Run AFTER tier1_preflight.py has confirmed cache complete + drift OK.
 """
-import os, sys, json, hashlib, datetime
+import os
+import json
+import hashlib
+import datetime
 def _load(p):
     if os.path.exists(p):
         for ln in open(p, encoding="utf-8"):
@@ -15,7 +18,8 @@ def _load(p):
                 k, v = ln.split("=", 1); os.environ[k.strip()] = v.strip().strip('"').strip("'")
 _load(".env"); _load(".env.production")
 
-import pymysql, oss2
+import pymysql
+import oss2
 TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 OSS_DIR = f"opensearch/fuling-kb-chunks-v2-{TS}"
 OSS_KEY = f"{OSS_DIR}/data.json"
@@ -26,9 +30,22 @@ cache = json.load(open("scratch/embedding_cache.json"))
 EMB_MODEL = "text-embedding-v4"
 def ckey(t): return hashlib.md5(f"{EMB_MODEL}_{t}".encode()).hexdigest()
 
+
+def _rds_ssl_kwargs():
+    """P0-02/B3：显式 TLS 语义——配 RAG_RDS_SSL_CA 即验证 TLS，未配显式明文
+    （堵 pymysql 2.x PREFERRED 随客户端 OpenSSL 漂移；与 prod_access 同语义）。"""
+    ca = (os.environ.get("RAG_RDS_SSL_CA") or "").strip()
+    if not ca:
+        return {"ssl_disabled": True}
+    verify = (os.environ.get("RAG_RDS_SSL_VERIFY_CERT", "true").strip().lower()
+              not in ("0", "false", "no"))
+    return {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+
+
 conn = pymysql.connect(host=os.environ["RAG_RDS_HOST"], port=int(os.environ.get("RAG_RDS_PORT","3306")),
     user=os.environ["RAG_RDS_USER"], password=os.environ["RAG_RDS_PASSWORD"],
-    database=os.environ.get("RAG_RDS_DATABASE","fuling_knowledge"), connect_timeout=8, charset="utf8mb4")
+    database=os.environ.get("RAG_RDS_DATABASE","fuling_knowledge"), connect_timeout=8, charset="utf8mb4",
+    **_rds_ssl_kwargs())
 with conn.cursor() as c:
     c.execute("""SELECT cm.id, cm.chunk_id, cm.doc_id, cm.version_no, cm.chunk_index, cm.page_num,
                         cm.section_title, cm.chunk_type, cm.chunk_text, cm.permission_level, cm.owner_dept,
@@ -90,6 +107,6 @@ ak=os.environ["RAG_OSS_ACCESS_KEY_ID"]; sk=os.environ["RAG_OSS_ACCESS_KEY_SECRET
 bucket=oss2.Bucket(oss2.Auth(ak,sk), "oss-cn-hangzhou.aliyuncs.com", os.environ["RAG_OSS_BUCKET_NAME"])
 print(f"uploading -> oss://{os.environ['RAG_OSS_BUCKET_NAME']}/{OSS_KEY}")
 bucket.put_object_from_file(OSS_KEY, LOCAL)
-print(f"DONE.\n\nWhen creating fuling_kb_chunks_v2 in the HA3 console, set the OSS data source path to:")
+print("DONE.\n\nWhen creating fuling_kb_chunks_v2 in the HA3 console, set the OSS data source path to:")
 print(f"  bucket:  {os.environ['RAG_OSS_BUCKET_NAME']}")
 print(f"  ossPath: /{OSS_KEY}")

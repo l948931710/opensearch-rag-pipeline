@@ -21,7 +21,7 @@ from typing import Dict, List
 
 from .. import envboot  # noqa: F401
 from ..matching import gold_doc_rank, relevance_vector, keyword_coverage
-from ..metrics import ranking_summary, score_distribution, percentiles, mean, bootstrap_ci
+from ..metrics import ranking_summary, score_distribution, percentiles, mean
 
 
 def _publicly_retrievable(case: Dict) -> bool:

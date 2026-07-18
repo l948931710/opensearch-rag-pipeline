@@ -1,4 +1,6 @@
-import subprocess, sys, os
+import subprocess
+import sys
+import os
 # py3.7 陷阱（批次9 S5/S6，同 stage3_node）: serverless 执行器实为 Python 3.7，
 # pypdf 5.0.0 元数据谎报支持 3.7 实则用 typing.Protocol(3.8+) → 必须钉真兼容版。
 # 镜像恢复 3.8+ 后自动走现代分支，本段无需再改。
@@ -32,7 +34,6 @@ DataWorks PyODPS 3 节点 — Stage 3: Chunks → OpenSearch Index
   - .env.local 文件（本地测试）
   - 绝不在源代码中硬编码密钥
 """
-import os
 import sys
 import zipfile
 
@@ -70,13 +71,26 @@ if not SIMULATE:
 print("=== 0. 清理 HA3 旧 chunk ===")
 import pymysql
 
+
+def _rds_ssl_kwargs():
+    """P0-02/B3：显式 TLS 语义——配 RAG_RDS_SSL_CA 即验证 TLS，未配显式明文。
+    不能留空 kwargs：RDS 服务端开 SSL 后 pymysql 2.x PREFERRED 会自动试握手且
+    失败不回退，行为随客户端 OpenSSL 漂移（与 prod_access._connect 同语义）。"""
+    ca = (os.environ.get("RAG_RDS_SSL_CA") or "").strip()
+    if not ca:
+        return {"ssl_disabled": True}
+    verify = (os.environ.get("RAG_RDS_SSL_VERIFY_CERT", "true").strip().lower()
+              not in ("0", "false", "no"))
+    return {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+
+
 conn = pymysql.connect(
     host=os.environ["RAG_RDS_HOST"],
     port=int(os.environ.get("RAG_RDS_PORT", "3306")),
     user=os.environ["RAG_RDS_USER"],
     password=os.environ["RAG_RDS_PASSWORD"],
     database=os.environ["RAG_RDS_DATABASE"],
-    charset="utf8mb4"
+    charset="utf8mb4", **_rds_ssl_kwargs()
 )
 try:
     with conn.cursor() as cur:

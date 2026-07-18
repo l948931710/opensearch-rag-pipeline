@@ -25,7 +25,6 @@ import argparse
 import json
 import os
 import sys
-from collections import Counter
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -22,7 +22,6 @@ import sys
 import argparse
 import zipfile
 import tempfile
-from pathlib import Path
 from typing import List, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -254,7 +253,7 @@ def main():
 
     elif args.online and args.quick:
         print(f"\n{'='*70}")
-        print(f"  线上 RDS 文档格式统计 (快速模式)")
+        print("  线上 RDS 文档格式统计 (快速模式)")
         print(f"{'='*70}\n")
 
         rows = scan_online_quick()
@@ -278,11 +277,11 @@ def main():
             print()
 
         print(f"  总计: {len(rows)} 个 PDF/DOCX/XLSX 文档")
-        print(f"  ⚠️ 这些文档可能包含嵌入图片，需要用 --online (不带 --quick) 下载检测")
+        print("  ⚠️ 这些文档可能包含嵌入图片，需要用 --online (不带 --quick) 下载检测")
 
     elif args.online:
         print(f"\n{'='*70}")
-        print(f"  线上 OSS 文档图片扫描 (完整模式)")
+        print("  线上 OSS 文档图片扫描 (完整模式)")
         print(f"{'='*70}\n")
 
         results = scan_online_full()

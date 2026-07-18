@@ -171,7 +171,46 @@ async def _lifespan(_app: FastAPI):
             )
     except Exception:
         logger.warning("embedding 契约比对失败（忽略，不影响启动）", exc_info=True)
+    # B3（生产级外审 2026-07-17 RB-02，摘自 ontology-p0）：TLS 接线自检——配了 CA 却
+    # 明文=接线缺陷，production/staging fail-fast（未配 CA 维持 P0-02 告警拍板；
+    # 探针 error 只告警）
+    _rds_tls_startup_check()
     yield
+
+
+def _rds_tls_startup_check() -> None:
+    """B3（RB-02）：启动期 TLS 接线自检。仅当 production/staging + 非模拟 + 已配
+    RAG_RDS_SSL_CA 时实测 `SHOW STATUS LIKE 'Ssl_cipher'`（会话级，池内连接同构可代表
+    接线状态）：**cipher 为空 ⇒ RuntimeError**（配了 CA 还明文=某条连接路径丢了
+    pymysql_ssl_args 或服务端 TLS 被关，带病服务比拒绝启动更糟）；非空记 info；
+    探针异常（DB 瞬断）只告警不 brick——连接真不可用会在别处以更明确的方式失败。
+    （分支版走 readiness.rds_tls_cipher_status；main 无 readiness 层，此处自包含内联。）"""
+    try:
+        cfg = get_config()
+        if cfg.environment not in ("production", "staging") or cfg.simulate_db \
+                or not (cfg.rds.ssl_ca or "").strip():
+            return
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW STATUS LIKE 'Ssl_cipher'")
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        val = ""
+        if row is not None:
+            vals = list(row.values()) if isinstance(row, dict) else list(row)
+            val = str(vals[1] if len(vals) > 1 else "") or ""
+        if not val:
+            raise RuntimeError(
+                "[B3 RB-02] RAG_RDS_SSL_CA 已配置但 RDS 连接为明文（Ssl_cipher 空）——"
+                "存在未接 pymysql_ssl_args 的连接路径或服务端 TLS 被关闭，拒绝启动。")
+        logger.info("RDS TLS 自检：tls_verified(%s)", val)
+    except RuntimeError:
+        raise
+    except Exception:   # noqa: BLE001
+        logger.warning("RDS TLS 自检失败（忽略，不影响启动）", exc_info=True)
 
 
 def _docs_urls(environment: str, enable_override: bool) -> dict:
@@ -237,6 +276,12 @@ _force_https_hosts = _resolve_force_https_hosts(
 )
 if _force_https_hosts:
     app.add_middleware(HttpsRedirectMiddleware, hosts=_force_https_hosts)
+
+# B5（生产级外审 2026-07-17 P2-07，摘自 ontology-p0）：统一安全响应头——nosniff/Referrer/
+# Permissions + 强制 frame-ancestors（self+钉钉域，console 被 PC 工作台内嵌不能 DENY）+
+# 其余 CSP Report-Only 观察。RAG_SECURITY_HEADERS=false 整组关闭。
+from opensearch_pipeline.http_hardening import SecurityHeadersMiddleware  # noqa: E402 — 与本文件其余中间件同款注册期导入
+app.add_middleware(SecurityHeadersMiddleware)
 
 # 请求级 correlation id（统一 trace，OBS-trace）：纯 ASGI 中间件，入站读/生成 X-Request-Id 存入
 # ContextVar（端点与嵌套 retriever/llm_generator 调用可见）、响应头回写。最后 add → 最外层 → 最先跑。

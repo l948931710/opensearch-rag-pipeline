@@ -82,10 +82,10 @@ miniapp-test: ## 小程序纯函数单测（markdown/typewriter，node 内置 ru
 # ── Quality ──
 
 lint: ## 代码检查
-	python -m ruff check opensearch_pipeline/ tests/
+	python -m ruff check .
 
 lint-fix: ## 自动修复
-	python -m ruff check --fix opensearch_pipeline/ tests/
+	python -m ruff check --fix .
 
 # ── Clean ──
 

@@ -432,7 +432,7 @@ def render_markdown(payload: Dict[str, Any]) -> str:
     L: List[str] = []
     L.append("# HA3 step_card 覆盖率审计\n")
     L.append(f"- **生成时间**: {payload['generated_at']}")
-    L.append(f"- **形态**: 只读 — `RAG_ENV=prod_ro`, `SET SESSION TRANSACTION READ ONLY`")
+    L.append("- **形态**: 只读 — `RAG_ENV=prod_ro`, `SET SESSION TRANSACTION READ ONLY`")
     L.append(f"- **RDS**: `{payload.get('rds_host_hint','(see banner)')}` / db=`fuling_knowledge`")
     L.append(f"- **HA3 table**: `{payload.get('ha3_table_name','(see banner)')}`")
     L.append("")
@@ -477,7 +477,7 @@ def render_markdown(payload: Dict[str, Any]) -> str:
     # ── D3 ──
     d3 = payload["D3"]
     L.append(section("D3 — SOP 路由命中但 0 step_card 的候选漏 chunk"))
-    L.append(f"- **限制**：SQL 只复刻了 `_detect_step_patterns` 的 cat/title 关键字侧，"
+    L.append("- **限制**：SQL 只复刻了 `_detect_step_patterns` 的 cat/title 关键字侧，"
              "未复刻 `_STEP_DETECT_RE >=2` 文本侧检查 → 候选名单 ≠ 定罪名单。")
     L.append(f"- 路由命中: **{d3['routed_total']}** doc")
     L.append(f"- 其中产 ≥1 step_card: **{d3['routed_with_step']}**（{pct(d3['routed_with_step'], d3['routed_total'])}）")

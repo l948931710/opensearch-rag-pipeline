@@ -690,12 +690,17 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
         if not config.simulate_opensearch and not search_targets.strip():
             raise EnvironmentMismatchError(
                 "[ENV GUARD] environment=production 但未配置任何检索后端（HA3/OpenSearch 均为空）")
-        # P0-02（报告1）：生产 RDS 传输加密自检——**告警不阻断**（用户选「先不强制」，
-        # 拿到阿里云 RDS CA 证书配好 RAG_RDS_SSL_CA 后可把本告警升为硬断言）。
+        # P0-02（报告1）：生产 RDS 传输加密自检——**告警不阻断**（记录在案的用户决策；
+        # B3 更新语境：RDS 服务端 SSL 已开通（2026-07-17）、CA 已随包
+        # opensearch_pipeline/certs/aliyun-rds-ca.pem——「CA 到位后升硬断言」的前提
+        # 已满足，硬断随 SAE env 落地一并翻（B7，避免重部署 brick）。配了 CA 的
+        # 实例另有 api._rds_tls_startup_check 的 Ssl_cipher 实测 fail-fast。）
         if not config.simulate_db and not (config.rds.ssl_ca or "").strip():
             logging.getLogger(__name__).warning(
                 "[P0-02] environment=production 但 RDS 未启用 TLS（RAG_RDS_SSL_CA 未配）——"
-                "RDS 链路承载身份/权限/日志，明文传输是审计缺口；请尽快配 CA 证书。")
+                "RDS 链路承载身份/权限/日志，明文传输是审计缺口。CA 已随包"
+                "（opensearch_pipeline/certs/aliyun-rds-ca.pem），部署环境设 "
+                "RAG_RDS_SSL_CA 指向即启用验证 TLS（B3 自检会实测 Ssl_cipher）。")
 
     # D7：production/staging 实际启用 HA3 时表名必须显式声明（消除历史双标默认值）
     if env in ("production", "staging") and not config.simulate_opensearch \
@@ -999,6 +1004,14 @@ def load_config() -> PipelineConfig:
             f"明文落盘 qa_session_log。请移除该环境变量（默认即 True=掩码）。"
         )
 
+    # 【B3 P2-01，生产级外审 2026-07-17，摘自 ontology-p0】上传签名密钥独立性：未配
+    # RAG_UPLOAD_SIGNING_KEY 时 auth_token 回退会话密钥（一钥两用扩大泄漏半径）。
+    # typ 双向拒斥已闭环跨型伪造，故**告警不阻断**（硬断随 SAE env 落地=B7，避免重部署 brick）。
+    if _env_label_prod and not os.environ.get("RAG_UPLOAD_SIGNING_KEY", "").strip():
+        logging.getLogger(__name__).warning(
+            "⚠️ [P2-01] '%s' 环境未配置独立 RAG_UPLOAD_SIGNING_KEY——上传签名回退会话"
+            "密钥（一钥两用）。建议随下次 SAE 重打包配置独立密钥并纳入轮换。",
+            config.environment)
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
     # 且只配 GEMINI key 时，模型解析全路由 Google，生产 chunk_text/查询内容会被 POST 到 Google。

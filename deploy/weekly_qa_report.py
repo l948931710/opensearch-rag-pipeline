@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import date
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -145,7 +145,8 @@ def build():
     L.append("|---|--:|--:|--:|")
     def row(label, k, pct=False, fmt=None):
         cv, pv = cur_a.get(k), (prev_a.get(k) if prev_a else None)
-        f = (lambda x: "—" if x is None else (fmt(x) if fmt else x))
+        def f(x):
+            return "—" if x is None else (fmt(x) if fmt else x)
         L.append(f"| {label} | {f(cv)} | {f(pv)} | {_delta(cv, pv, pct)} |")
     row("提问总数", "total", fmt=lambda x: f"{x:,}")
     row("成功应答", "success", fmt=lambda x: f"{x:,}")

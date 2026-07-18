@@ -320,3 +320,59 @@ def test_gate_deny_out_reports_transient_and_reason(monkeypatch):
         simulate_db=True, deny_out=info2)
     assert not allowed2
     assert info2["transient"] is False
+
+
+# ── B1 P2-10（生产级外审 2026-07-17）：日账本不可用 fail-closed ──────────────
+
+
+def _est_small(cfg):
+    return estimate_doc_cost("pdf", unit_count=1, cached_count=0, cfg=cfg)  # 0.04 RMB
+
+
+def test_b1_daily_ledger_unavailable_fail_closed_transient(monkeypatch):
+    """日预算已配置 + 账本不可用（非模拟）→ 瞬态拒绝（cost_deferred 顺延，不封存），
+    不再静默跳过日闸。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.delenv("RAG_COST_DAILY_LEDGER_FAILOPEN", raising=False)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: False)
+    breaker = CostBreaker(make_cfg(daily_budget_rmb=10.0))
+    ok, reason = breaker.try_reserve("D-b1a", _est_small(breaker.cfg))
+    assert ok is False and "DAILY budget ledger unavailable" in reason
+    assert cb._is_transient_cost_deny(reason) is True        # → cost_deferred，不封存
+
+
+def test_b1_daily_ledger_unavailable_failopen_escape(monkeypatch):
+    """逃生口 RAG_COST_DAILY_LEDGER_FAILOPEN=true 还原旧「跳过日闸」行为。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.setenv("RAG_COST_DAILY_LEDGER_FAILOPEN", "true")
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: False)
+    monkeypatch.setattr(cb, "_ledger_add", lambda amt: None)
+    breaker = CostBreaker(make_cfg(daily_budget_rmb=10.0))
+    ok, reason = breaker.try_reserve("D-b1b", _est_small(breaker.cfg))
+    assert ok is True and reason is None
+
+
+def test_b1_daily_ledger_unavailable_simulate_still_skips(monkeypatch):
+    """simulate（账本本就不存在）维持跳闸——本地 make sim / 单测零回归。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.delenv("RAG_COST_DAILY_LEDGER_FAILOPEN", raising=False)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: True)
+    monkeypatch.setattr(cb, "_ledger_add", lambda amt: None)
+    breaker = CostBreaker(make_cfg(daily_budget_rmb=10.0))
+    ok, reason = breaker.try_reserve("D-b1c", _est_small(breaker.cfg))
+    assert ok is True and reason is None
+
+
+def test_b1_no_daily_cap_ledger_error_ignored(monkeypatch):
+    """daily_budget=0（默认关）时日闸整体不评估——账本故障零影响。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.delenv("RAG_COST_DAILY_LEDGER_FAILOPEN", raising=False)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: False)
+    monkeypatch.setattr(cb, "_ledger_add", lambda amt: None)
+    breaker = CostBreaker(make_cfg())          # daily_budget_rmb 默认 0
+    ok, reason = breaker.try_reserve("D-b1d", _est_small(breaker.cfg))
+    assert ok is True and reason is None

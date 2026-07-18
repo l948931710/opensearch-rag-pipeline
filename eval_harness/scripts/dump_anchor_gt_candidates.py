@@ -20,7 +20,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 import subprocess
 import sys
 import time
@@ -156,7 +155,7 @@ def main():
         print(f"⚠️  widget_data.js ({js_size/1024:.1f} KB) 超 500KB,可能超 widget 嵌入上限")
         print("    考虑缩短 chunk_text_excerpt / visual_summary 字段长度")
     else:
-        print(f"   widget 嵌入空间充足(<500KB / 512KB 限制)")
+        print("   widget 嵌入空间充足(<500KB / 512KB 限制)")
 
     print("\n══ 逐 doc step/sub/sec 表 ══")
     for label, dd in out["documents"].items():

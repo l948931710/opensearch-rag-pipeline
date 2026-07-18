@@ -18,12 +18,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 
 class ManifestError(RuntimeError):

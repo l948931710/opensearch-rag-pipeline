@@ -97,6 +97,23 @@ def _ledger_add(amount_rmb: float) -> None:
         logger.debug("[CostBreaker] daily ledger add skipped (fail-open): %s", e)
 
 
+def _daily_ledger_failopen() -> bool:
+    """B1 P2-10 逃生口（默认 off=fail-closed）：true 时还原旧「账本不可用→跳过日闸」。"""
+    import os
+    return os.environ.get("RAG_COST_DAILY_LEDGER_FAILOPEN",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _simulate_db_active() -> bool:
+    """模拟模式判定（B1 P2-10）：simulate 下账本本就不存在，日闸跳过是语义而非故障。
+    config 不可读按非模拟处理——宁可 defer 也不放行。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return bool(get_config().simulate_db)
+    except Exception:   # noqa: BLE001
+        return False
+
+
 @dataclass
 class CostEstimate:
     """单文档成本预估结果 (纯数据，无副作用)。"""
@@ -207,7 +224,11 @@ class CostBreaker:
         rb = self.cfg.rebuild
 
         # 闸 4（G8）：跨进程日累计预算（共享账本，锁外读——账本本就是跨实例弱一致，
-        # 轻微超冲可接受；账本不可用 → 跳过本闸，进程内三道闸照常）。
+        # 轻微超冲可接受）。B1 P2-10（生产级外审 2026-07-17，行为更替）：日预算已配置
+        # 而账本不可用时**不再静默跳闸**（RDS 抖动窗口内日预算可被无限突破）——按共享
+        # 预算瞬态拒绝处理（_TRANSIENT_DENY_MARKERS 命中 → cost_deferred 顺延，不封存），
+        # 账本恢复后下一 run 重捡；simulate（账本本就不存在）与逃生口
+        # RAG_COST_DAILY_LEDGER_FAILOPEN=true 维持旧跳闸行为。进程内三道闸不受影响。
         daily_cap = float(getattr(rb, "daily_budget_rmb", 0.0) or 0.0)
         if daily_cap > 0:
             spent_today = _ledger_read_today()
@@ -217,6 +238,13 @@ class CostBreaker:
                 return False, (
                     f"DAILY budget exhausted (shared ledger): today {spent_today:.2f} "
                     f"+ {est.est_cost_rmb:.2f} > daily cap {daily_cap:.2f} RMB")
+            if spent_today is None and not _simulate_db_active() and not _daily_ledger_failopen():
+                with self._lock:
+                    self._doc_denied += 1
+                return False, (
+                    f"DAILY budget ledger unavailable (fail-closed): daily cap "
+                    f"{daily_cap:.2f} RMB configured but shared ledger unreadable; "
+                    f"deferring doc to next run")
         with self._lock:
             if self._run_tripped:
                 self._doc_denied += 1
@@ -353,9 +381,10 @@ class CostBreaker:
 #     清零、DAILY 共享账本次日滚动——健康文档届时可正常处理。对后者封存 = 把只因预算瞬态打满
 #     而被拒的健康文档终态隔离（quarantine_for_cost 置 retry_count=3 永不重认领 + kb_type=private），
 #     一次预算打满就永久剔除一批仅含空白/封面页的正常 PDF。故 transient 拒绝不封存、保持可重认领。
+# B1 P2-10：「账本不可用 fail-closed」拒绝同属瞬态（账本恢复即可重处理），一并顺延不封存。
 # 契约：以下短语与 try_reserve 内对应 return 的文案耦合，改文案须同步本判定。
 _TRANSIENT_DENY_MARKERS = ("RUN budget exhausted", "would exceed RUN budget",
-                           "DAILY budget exhausted")
+                           "DAILY budget exhausted", "DAILY budget ledger unavailable")
 
 
 def _is_transient_cost_deny(reason: Optional[str]) -> bool:
