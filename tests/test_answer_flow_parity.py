@@ -446,7 +446,7 @@ class TestBotSyncBookkeeping:
         mock_append.assert_called_once()
         assert mock_append.call_args.args[0] == "cid1:staff9"
 
-    @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
+    @patch("opensearch_pipeline.dingtalk_bot._send_terminal_text")
     @patch("opensearch_pipeline.dingtalk_bot._resolve_user_dept", return_value="生产中心")
     @patch("opensearch_pipeline.dingtalk_bot.log_qa_session")
     @patch("opensearch_pipeline.dingtalk_bot.retrieve_and_enrich", return_value=[])
@@ -466,7 +466,7 @@ class TestBotSyncBookkeeping:
         assert kw["user_dept"] == "生产中心"
         assert kw["opensearch_hit_count"] == 0
 
-    @patch("opensearch_pipeline.dingtalk_bot._send_text_reply")
+    @patch("opensearch_pipeline.dingtalk_bot._send_terminal_text")
     @patch("opensearch_pipeline.dingtalk_bot._resolve_user_dept", return_value="生产中心")
     @patch("opensearch_pipeline.dingtalk_bot.log_qa_session")
     @patch("opensearch_pipeline.dingtalk_bot.generate_answer", side_effect=RuntimeError("boom"))

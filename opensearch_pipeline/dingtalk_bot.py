@@ -319,8 +319,16 @@ def _rds_dedup_on() -> bool:
 
 
 def _rds_dedup_claim(msg_id: str):
-    """(claimed, meta)。行较新（去重窗内）即视为已领用；陈旧行重置复用。
-    表缺失（1146）负缓存 1h；任何失败 fail-open (True, None)。"""
+    """(claimed, meta)。行较新（去重窗内）即视为已领用；陈旧行条件接管复用。
+    表缺失（1146）负缓存 1h；任何失败 fail-open (True, None)。
+
+    P2-04b（评审证据 B 收口）：原 SELECT-then-INSERT 两步 + ODKU no-op 不看
+    rowcount——并发认领双双 (True, None)。改单赢家协议：
+    ① INSERT ... ODKU no-op，**rowcount==1（真插入）= 唯一赢家**（撞键 no-op=0）；
+    ② 输了读行判新鲜：fresh → (False, meta)；
+    ③ 陈旧 → 条件接管 UPDATE ... WHERE updated_at<=阈值，**显式 SET
+       updated_at=NOW(3) 保证真实变更**（否则值全同时 affected-rows=0 无人能赢），
+       rowcount==1=接管赢家、0=别人先接管 → 重读 meta 返回 (False, meta)。"""
     global _RDS_DEDUP_MISSING_UNTIL
     if not _rds_dedup_on() or time.time() < _RDS_DEDUP_MISSING_UNTIL:
         return True, None
@@ -328,31 +336,54 @@ def _rds_dedup_claim(msg_id: str):
         from opensearch_pipeline.config import get_config
         from opensearch_pipeline.db import _get_db_conn
         db = get_config().rds.operation_database
+        window_s = _TIMESTAMP_TOLERANCE + 60
+
+        def _read_meta(cur):
+            cur.execute(
+                f"SELECT state, attempts, message_id "
+                f"FROM {db}.dingtalk_msg_dedup WHERE msg_id=%s", (msg_id,))
+            r = cur.fetchone()
+            if r is None:
+                return {"st": "processing"}
+            v = list(r.values()) if isinstance(r, dict) else list(r)
+            return {"st": str(v[0] or "processing"), "att": int(v[1] or 1),
+                    "mid": v[2] or None}
+
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
+                    f"INSERT INTO {db}.dingtalk_msg_dedup (msg_id, state, attempts) "
+                    f"VALUES (%s, 'processing', 1) "
+                    f"ON DUPLICATE KEY UPDATE msg_id=msg_id", (msg_id,))
+                if cur.rowcount == 1:          # 真插入=唯一赢家
+                    conn.commit()
+                    return True, None
+                cur.execute(
                     f"SELECT state, attempts, message_id, "
                     f"(updated_at > NOW(3) - INTERVAL %s SECOND) AS fresh "
                     f"FROM {db}.dingtalk_msg_dedup WHERE msg_id=%s",
-                    (_TIMESTAMP_TOLERANCE + 60, msg_id))
+                    (window_s, msg_id))
                 row = cur.fetchone()
                 if row is not None:
                     vals = list(row.values()) if isinstance(row, dict) else list(row)
                     if int(vals[3] or 0):
+                        conn.commit()
                         return False, {"st": str(vals[0] or "processing"),
                                        "att": int(vals[1] or 1),
                                        "mid": vals[2] or None}
-                    cur.execute(
-                        f"UPDATE {db}.dingtalk_msg_dedup SET state='processing', "
-                        f"attempts=1, message_id=NULL WHERE msg_id=%s", (msg_id,))
-                else:
-                    cur.execute(
-                        f"INSERT INTO {db}.dingtalk_msg_dedup (msg_id, state, attempts) "
-                        f"VALUES (%s, 'processing', 1) "
-                        f"ON DUPLICATE KEY UPDATE msg_id=msg_id", (msg_id,))
-            conn.commit()
-            return True, None
+                # 陈旧（或行消失竞态）：条件接管——WHERE 带新鲜度阈值，赢家唯一
+                cur.execute(
+                    f"UPDATE {db}.dingtalk_msg_dedup SET state='processing', "
+                    f"attempts=1, message_id=NULL, updated_at=NOW(3) "
+                    f"WHERE msg_id=%s AND updated_at <= NOW(3) - INTERVAL %s SECOND",
+                    (msg_id, window_s))
+                if cur.rowcount == 1:          # 条件命中=接管赢家
+                    conn.commit()
+                    return True, None
+                meta = _read_meta(cur)         # 输了接管：把赢家状态带回去
+                conn.commit()
+                return False, meta
         finally:
             conn.close()
     except Exception as e:   # noqa: BLE001
@@ -660,17 +691,32 @@ def _classify_send_exc(e: Exception) -> str:
     return "unknown"
 
 
-def _send_reply(session_webhook: str, markdown_title: str, markdown_text: str,
-                *, msg_id: str = "") -> bool:
-    """通过 sessionWebhook 发送 Markdown 回复（B7-P2-04 分类发送）：
+# P2-04b（评审收口 2026-07-18）：HTTP 200 + 非零 errcode 的业务失败分类——钉钉这族
+# webhook 的失败常态就是 200+errcode（合同测试钉在 test_msg_ack_taxonomy）。
+# 限流/系统忙=瞬态可重试；其余非零（签名/关键词/参数类）=永久。
+_DINGTALK_TRANSIENT_ERRCODES = {-1, 130101}
+
+
+def _dingtalk_errcode(resp) -> int:
+    """解析钉钉业务返回码；缺 errcode 键按 0（成功）。body 不可解析（钉钉域 200 恒回
+    JSON，实际不发生）→ 0 + warning：按不确定报警会在 never-case 上制造假警报，
+    200 已是强送达信号——记录在案的务实取舍。"""
+    try:
+        return int((resp.json() or {}).get("errcode", 0))
+    except Exception:   # noqa: BLE001
+        logger.warning("钉钉响应 body 不可解析（HTTP 200，按成功处理）: %s",
+                       getattr(resp, "text", "")[:120])
+        return 0
+
+
+def _post_webhook_classified(session_webhook: str, payload: dict, *,
+                             msg_id: str = "") -> bool:
+    """B7-P2-04(b) 分类发送核心（Markdown 终答与文本终答共用）：
     明确未送达 → 进程内自重试（钉钉重投帮不上：ACK 早已返回）；重试尽 →
-    retryable_failed（ack 丢包重投可复用答案）；4xx=永久 → final_failed；
-    ReadTimeout=结果不确定 → delivery_unknown+告警对账（文本无幂等键不盲重发）；
-    2xx → sent。msg_id 空=非终答场景（提示语等），零状态副作用。"""
-    payload = {
-        "msgtype": "markdown",
-        "markdown": {"title": markdown_title, "text": markdown_text},
-    }
+    retryable_failed（ack 丢包重投可复用答案）；4xx / 200+永久 errcode=永久 →
+    final_failed；ReadTimeout=结果不确定 → delivery_unknown+告警对账（文本无幂等键
+    不盲重发）；200+errcode=0 → sent；200+瞬态 errcode（限流）→ 按 5xx 重试。
+    msg_id 空=非终答场景（提示语等），零状态副作用。"""
     for attempt in (1, 2, 3):
         try:
             resp = http_requests.post(
@@ -699,10 +745,28 @@ def _send_reply(session_webhook: str, markdown_title: str, markdown_text: str,
                     pass
             return False
         if resp.status_code == 200:
-            logger.info("钉钉回复成功")
+            code = _dingtalk_errcode(resp)
+            if code == 0:
+                logger.info("钉钉回复成功")
+                if msg_id:
+                    _msg_mark(msg_id, "sent", ttl=_TIMESTAMP_TOLERANCE)
+                return True
+            if code in _DINGTALK_TRANSIENT_ERRCODES:
+                # 限流/系统忙：与 5xx 同治——退避重试，耗尽标 retryable_failed
+                logger.warning("钉钉业务瞬态失败(attempt %d): errcode=%s", attempt, code)
+                if attempt < 3:
+                    time.sleep(0.5 * attempt)
+                    continue
+                if msg_id:
+                    _msg_mark(msg_id, "retryable_failed", ttl=_MSG_DEDUP_CLAIM_TTL_S)
+                return False
+            # 200 + 非零非瞬态 errcode（签名/关键词/参数类）=业务永久失败——评审证据 C：
+            # 此前被裸 status==200 误标 sent（不重试、遥测污染），现终态收口
+            logger.error("钉钉回复业务永久失败: errcode=%s, body=%s",
+                         code, resp.text[:200])
             if msg_id:
-                _msg_mark(msg_id, "sent", ttl=_TIMESTAMP_TOLERANCE)
-            return True
+                _msg_mark(msg_id, "final_failed", ttl=_TIMESTAMP_TOLERANCE)
+            return False
         if 400 <= resp.status_code < 500:
             # 签名/权限/格式类=永久：重发必同败，终态收口
             logger.error("钉钉回复永久失败(4xx): status=%s, body=%s",
@@ -721,8 +785,31 @@ def _send_reply(session_webhook: str, markdown_title: str, markdown_text: str,
     return False
 
 
+def _send_reply(session_webhook: str, markdown_title: str, markdown_text: str,
+                *, msg_id: str = "") -> bool:
+    """Markdown 终答（B7-P2-04 分类发送——引擎见 _post_webhook_classified）。"""
+    return _post_webhook_classified(
+        session_webhook,
+        {"msgtype": "markdown",
+         "markdown": {"title": markdown_title, "text": markdown_text}},
+        msg_id=msg_id)
+
+
+def _send_terminal_text(session_webhook: str, text: str, *, msg_id: str = "") -> bool:
+    """纯文本**终答**（P2-04b 评审证据 A 收口）：前置路由答复/引导拒答/无结果/错误回执
+    这类最终回复此前走 fire-and-forget 的 _send_text_reply——发送静默失败后状态停
+    processing、重投被按在途吞掉、用户无答案。终答一律走分类引擎+状态机（传 msg_id）。"""
+    return _post_webhook_classified(
+        session_webhook,
+        {"msgtype": "text", "text": {"content": text}},
+        msg_id=msg_id)
+
+
 def _send_text_reply(session_webhook: str, text: str):
-    """通过 sessionWebhook 发送纯文本回复。"""
+    """纯文本**提示语**（fire-and-forget，仅限非终答：问候/收到反馈/新会话/正在查询）。
+    ⚠️ 终答（用户等的那条答复）必须走 _send_terminal_text/_send_reply 进状态机——
+    误用本函数=发送失败后状态停 processing、重投被吞（P2-04b 评审证据 A）；
+    调用点白名单由 test_msg_ack_taxonomy 源扫描锁定。"""
     payload = {
         "msgtype": "text",
         "text": {"content": text},
@@ -1189,7 +1276,7 @@ def _process_rag_query(
                 risk_level=pre["risk_level"],
                 risk_blocked=pre["risk_blocked"],
             ))
-            _send_text_reply(session_webhook, pre["answer"])
+            _send_terminal_text(session_webhook, pre["answer"], msg_id=dingtalk_msg_id)
             return
 
         # 1. 统一检索 + 邻居拼接（top_k=7, stitch window=±1）
@@ -1227,7 +1314,8 @@ def _process_rag_query(
                     risk_level=outcome["risk_level"],
                     risk_blocked=outcome["risk_blocked"],
                 ))
-                _send_text_reply(session_webhook, outcome["answer"])
+                _send_terminal_text(session_webhook, outcome["answer"],
+                                    msg_id=dingtalk_msg_id)
                 return
             # 无结果也要落库
             log_qa_session(**build_qa_log_kwargs(
@@ -1243,9 +1331,10 @@ def _process_rag_query(
                 answer_status="NO_RESULT",
                 conversation_type=conversation_type,
             ))
-            _send_text_reply(
+            _send_terminal_text(
                 session_webhook,
                 f"🤷 {NO_RESULT_MESSAGE}",
+                msg_id=dingtalk_msg_id,
             )
             return
 
@@ -1437,9 +1526,10 @@ def _process_rag_query(
             error_message=f"[trace={trace_id}] {str(e)[:500]}",
             conversation_type=conversation_type,
         ))
-        _send_text_reply(
+        _send_terminal_text(
             session_webhook,
             f"❌ 处理您的问题时出错，请稍后重试。(trace: {trace_id})",
+            msg_id=dingtalk_msg_id,
         )
 
 

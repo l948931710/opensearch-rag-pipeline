@@ -178,6 +178,7 @@ def llm_key_present(monkeypatch):
 _LOCAL_STACK_SERIAL_MODULES = {
     "test_pipeline.py",       # reset_db_state 整表清空 + 真实写 chunk_meta/bulk_job
     "test_concurrency.py",    # 真实并发认领互斥（行锁语义）
+    "test_msg_dedup_rds_integration.py",  # P2-04b 钉钉去重真库并发（fuling_operation DML）
     "test_classification.py", # RDS 集成用例
     "test_image_funnel.py",   # RDS 集成用例
     "test_simulate_prod_guard.py",  # 操纵 prod-guard/config 全局态
