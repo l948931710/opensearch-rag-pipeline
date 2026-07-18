@@ -97,6 +97,7 @@ MANIFEST="
 040_qa_gap_semantic_group.sql operation
 041_qa_gap_dismissal.sql operation
 049_acl_outbox_generation.sql knowledge
+050_qa_rewritten_query.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }

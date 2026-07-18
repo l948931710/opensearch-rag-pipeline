@@ -269,3 +269,81 @@ def test_gen_meta_and_question_hash_independent_fallback(mock_get_conn, monkeypa
     assert "gen_meta_json" not in retry_sql
     assert "question_hash" in retry_sql              # 未受牵连
     monkeypatch.setattr(QL, "_GEN_META_COL_MISSING", False)
+
+
+# ── 追问改写落库（schema/050 rewritten_query 可选列，2026-07-18）──────────────
+@patch("opensearch_pipeline.db._get_db_conn")
+def test_rewritten_query_carried_and_hash_switches(mock_get_conn, monkeypatch):
+    """改写发生：INSERT 携带 rewritten_query（脱敏后），question_hash 改按改写后文本
+    计算（该行实际所问的独立问题）；query_text 原样保留。"""
+    import opensearch_pipeline.qa_logger as QL
+    from opensearch_pipeline.contribution import question_hash as qh
+    monkeypatch.setattr(QL, "_QUESTION_HASH_COL_MISSING", False)
+    monkeypatch.setattr(QL, "_REWRITTEN_COL_MISSING_UNTIL", 0.0)
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    log_qa_session(session_id="s1", message_id="m1", query_text="那第二步呢",
+                   rewritten_query="U8 采购入库的第二步怎么操作")
+    sql, params = cur.execute.call_args[0]
+    assert "rewritten_query" in sql and "question_hash" in sql
+    assert "U8 采购入库的第二步怎么操作" in params
+    assert "那第二步呢" in params                                  # 原文保真
+    assert qh("U8 采购入库的第二步怎么操作") in params              # hash 按改写后
+    assert qh("那第二步呢") not in params
+
+
+@patch("opensearch_pipeline.db._get_db_conn")
+def test_rewritten_absent_hash_unchanged(mock_get_conn, monkeypatch):
+    """未改写（None，flag 关/门控未命中）：不携带 rewritten_query 列，hash 按原文——
+    载荷与改写特性上线前逐字节一致。"""
+    import opensearch_pipeline.qa_logger as QL
+    from opensearch_pipeline.contribution import question_hash as qh
+    monkeypatch.setattr(QL, "_QUESTION_HASH_COL_MISSING", False)
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    log_qa_session(session_id="s1", message_id="m1", query_text="那第二步呢")
+    sql, params = cur.execute.call_args[0]
+    assert "rewritten_query" not in sql
+    assert qh("那第二步呢") in params
+
+
+@patch("opensearch_pipeline.db._get_db_conn")
+def test_rewritten_1054_uses_ttl_negative_cache(mock_get_conn, monkeypatch, caplog):
+    """schema/050 未 apply：1054 点名 rewritten_query → 摘除重试 + **TTL** 负缓存
+    （非永久布尔——到期自动重试，apply 后无须重启即恢复携带）；仅 1054 降级。"""
+    import time as _time
+    import opensearch_pipeline.qa_logger as QL
+    monkeypatch.setattr(QL, "_QUESTION_HASH_COL_MISSING", False)
+    monkeypatch.setattr(QL, "_REWRITTEN_COL_MISSING_UNTIL", 0.0)
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.execute.side_effect = [
+        Exception(1054, "Unknown column 'rewritten_query' in 'field list'"),
+        None,
+    ]
+    conn.cursor.return_value.__enter__.return_value = cur
+    mock_get_conn.return_value = conn
+
+    with caplog.at_level(logging.DEBUG, logger="opensearch_pipeline.qa_logger"):
+        log_qa_session(session_id="s1", message_id="m1", query_text="那第二步呢",
+                       rewritten_query="U8 第二步怎么操作")   # 必须不 raise
+    retry_sql = cur.execute.call_args[0][0]
+    assert "rewritten_query" not in retry_sql
+    assert "question_hash" in retry_sql                       # hash 列不受牵连（仍按改写后值）
+    assert QL._REWRITTEN_COL_MISSING_UNTIL > _time.time()     # TTL 负缓存已武装
+    assert QL._REWRITTEN_COL_MISSING_UNTIL < _time.time() + 3600   # 有限 TTL 而非永久
+    assert any("schema/050" in r.getMessage() for r in caplog.records)
+    # TTL 过期后自动恢复携带（apply 后无须重启）
+    monkeypatch.setattr(QL, "_REWRITTEN_COL_MISSING_UNTIL", _time.time() - 1)
+    cur2 = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur2
+    log_qa_session(session_id="s1", message_id="m2", query_text="那第二步呢",
+                   rewritten_query="U8 第二步怎么操作")
+    assert "rewritten_query" in cur2.execute.call_args[0][0]
+    monkeypatch.setattr(QL, "_REWRITTEN_COL_MISSING_UNTIL", 0.0)   # 还原进程态
