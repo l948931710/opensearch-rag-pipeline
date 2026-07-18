@@ -52,6 +52,10 @@
 
 每批验证:`make test` 4008 passed/1 skipped + `make lint` 绿(2026-07-17,一处测试断言因 6082 SQL 换行而更新,已加强验证 CAS)。未验证声明:真实 RDS 死锁下 begin() 的重放阻断(纯机制,单测覆盖 helper)、真实 crash 窗口的 stage-2 续跑(状态机+分区逻辑单测覆盖)、真实 HA3/DataWorks 端到端。两个新 kill switch(`RAG_DB_TXN_BEGIN`/`RAG_CRASH_RESUME_AUTOFREEZE`)默认 on=修复生效。
 
+**批次3 独立核查(2026-07-17,第二会话)**:五项逐项对照周边代码复核。**3 项通过**:chunker 分治(续接块机制/图只绑主块契约/`_split_long_text` 每段≤max 均验证)、db begin(转发链 GuardedDBConnection→PooledDB→SteadyDB 成立、池 autocommit=False 确认、READ ONLY 走建连期 init_command 无 1568 冲突)、6082 CAS(deactivate 失败点新版本行确在 PROCESSING,PENDING_DELETE 握手被保住)。**2 项核查纠偏**:
+- **crash-resume 分区生产路径失效**:分区只认 `FAILED`,但 orchestrator 的 stage-2 loader 在 DAG-2 启动前已把认领行 FAILED→**LOADING**(retry_count 保留)——guard 时看到 LOADING+retry>0,分区永不命中、整批照旧 raise,恰好在真正发生楔死的生产路径上白修(原 5 条测试全部直喂 FAILED,未建模认领后状态)。纠偏:状态列接受 `('FAILED','LOADING')`,互斥判据不变(retry_count;deliberate 认领后=LOADING+retry=0),补 LOADING 两态回归测试。
+- **cost 瞬态拒绝残余链路**:瞬态虽不再写 RDS 隔离,但 `cost_quarantined=True` 仍烙进 canonical JSON → stage-2 按 QUARANTINE 跳过 → 0-chunk 收口落 **EMPTY+DONE 静默终态**(且 stage-1 因 keys 已写永不重跑)——「保持可重认领」名存实亡,还比旧行为少 review_task 可见性。纠偏:`gate_vlm_rebuild` 加 `deny_out` 出参暴露瞬态定性;瞬态改标新字段 `cost_deferred`(schema);`node_build_canonical` 增 **COST-DEFER 守卫**(与 ENV-DEP 同型:不写 canonical keys、extraction_status='FAILED' 留痕、NOT_STARTED 保持 → 下一 run/次日预算滚动后 stage-1 按既有谓词自动重捡重过闸;循环后统一 raise 炸红——预算耗尽必须可见,并终止 drain-loop 无进展空转)。doc-intrinsic 路径(quarantine+review_task)不变;可选表格精修路径(quarantine_on_deny=False)不变。新回归 5 条(deny_out 契约/rebuilder 分流/守卫扣稿/健康同批不楔死/LOADING 分区)。
+
 ## 批次4 — flag 翻开前置(agent/durable/general-ability;flag 默认 off 但在铺开路径)
 | 状态 | 条目 | 位置 | 修法 |
 |---|---|---|---|

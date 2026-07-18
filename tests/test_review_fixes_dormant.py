@@ -91,6 +91,20 @@ class TestCostQuarantineSkip:
         out = vlmr.maybe_rebuild_pdf(task, _pdf_result(), cfg, breaker=CostBreaker(cfg))
         assert out.cost_quarantined is True
 
+    def test_rebuild_transient_deny_defers_not_quarantines(self, monkeypatch):
+        """ultra P1 纠偏（2026-07-17）：RUN 预算瞬态耗尽（共享状态、非 doc 自身原因）→
+        cost_deferred（本 run 不定稿、下一 run 重捡重过闸），绝不 cost_quarantined。"""
+        from opensearch_pipeline.extraction.cost_breaker import estimate_doc_cost
+        cfg = _rebuild_cfg(enabled=True, run_budget_rmb=0.04, doc_budget_rmb=5.0)
+        br = CostBreaker(cfg)
+        seed = estimate_doc_cost("pdf", unit_count=1, cached_count=0, cfg=cfg)
+        assert br.try_reserve("seed", seed)[0] and br.tripped  # RUN 预算被 seed 打满
+        monkeypatch.setattr(vlmr, "_page_char_counts", lambda p: [0, 0, 0])
+        task = {"local_path": "/tmp/x.pdf", "doc_id": "D", "version_no": 1, "owner_dept": "sales"}
+        out = vlmr.maybe_rebuild_pdf(task, _pdf_result(), cfg, breaker=br)
+        assert out.cost_deferred is True, "瞬态预算拒绝须走 defer（可重认领），不封存"
+        assert out.cost_quarantined is False
+
     def test_redact_node_quarantines_cost_flagged_doc(self):
         ctx = {"canonicals": [{"doc_id": "D", "text": "内容", "risk_level": "low",
                                "cost_quarantined": True}]}

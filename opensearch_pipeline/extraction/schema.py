@@ -120,6 +120,13 @@ class ExtractionResult:
     # 成本封存：VLM-rebuild 成本闸拒绝本文档 → 下游应跳过切块/索引 (避免裂脑状态)
     cost_quarantined: bool = False
 
+    # 成本顺延（ultra P1 纠偏 2026-07-17）：瞬态共享预算（RUN/DAILY）耗尽被拒 → 本 run 不定稿：
+    # node_build_canonical 扣住 canonical（不写 keys），下一 run/次日预算滚动后 stage-1 按既有
+    # 谓词（NOT_STARTED 且 keys IS NULL）重捡、重新过闸。与 cost_quarantined（doc-intrinsic，
+    # 终态封存）互斥——瞬态拒绝若烙 quarantined，canonical 定稿后文档在 stage-2 落 EMPTY/DONE
+    # 静默终态，「可重认领」名存实亡。
+    cost_deferred: bool = False
+
     # XLSX 版面分类结果：DAG1 用真实 filename 分类一次后持久化到 canonical，供 DAG2 直接消费，
     # 避免 DAG2 用（重载后丢失的）空 filename 重新分类 → layout 漂移 → step_card 结构静默丢失 (P0-3)。
     xlsx_layout_type: Optional[str] = None
@@ -149,6 +156,7 @@ class ExtractionResult:
             "warnings": self.warnings,
             "assets": self.assets,
             "cost_quarantined": self.cost_quarantined,
+            "cost_deferred": self.cost_deferred,
             "xlsx_layout_type": self.xlsx_layout_type,
             "vlm_degraded_count": self.vlm_degraded_count,
         }

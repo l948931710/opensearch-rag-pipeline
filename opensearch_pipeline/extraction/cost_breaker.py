@@ -452,7 +452,8 @@ def quarantine_for_cost(
 
 
 def gate_vlm_rebuild(breaker: CostBreaker, doc: dict, simulate_db: bool = True,
-                     *, quarantine_on_deny: bool = True) -> Tuple[bool, CostEstimate]:
+                     *, quarantine_on_deny: bool = True,
+                     deny_out: Optional[dict] = None) -> Tuple[bool, CostEstimate]:
     """VLM-rebuild 升级前置闸 —— 未来的 rebuilder 在做任何 OCR/VLM 之前调用此函数。
 
     doc 需含: doc_id, version_no, file_ext, owner_dept, 及预先统计好的
@@ -462,6 +463,10 @@ def gate_vlm_rebuild(breaker: CostBreaker, doc: dict, simulate_db: bool = True,
       True  (默认，用于 rebuild 升级) → 拒绝即封存文档 (该文档不可提取，回退规则输出近乎为空)。
       False (用于可选的表格精修) → 拒绝只是跳过这次"锦上添花"的精修、保留原生表格，
             **不**封存文档 (文档本身可用，绝不因可选精修被否决而丢弃)。
+
+    deny_out: 传 dict 时，拒绝路径回填 {"reason": <原文>, "transient": <bool>}——调用方
+      （vlm_rebuilder）据此分流：瞬态（RUN/DAILY 共享预算）→ cost_deferred（本 run 不定稿、
+      下一 run 重捡重过闸）；doc-intrinsic → cost_quarantined（终态封存）。不传时行为不变。
 
     Returns (allowed, est)。allowed=False 时调用方必须回退到确定性规则输出 (绝不丢弃文档)。
     """
@@ -477,9 +482,13 @@ def gate_vlm_rebuild(breaker: CostBreaker, doc: dict, simulate_db: bool = True,
     # 调用方 (vlm_rebuilder) 须 breaker.refund(doc_id, est) 退还本次预留。
     allowed, reason = breaker.try_reserve(doc["doc_id"], est)
     if not allowed:
+        _transient = _is_transient_cost_deny(reason)
+        if deny_out is not None:
+            deny_out["reason"] = reason
+            deny_out["transient"] = _transient
         # 仅 doc-intrinsic 拒绝才封存；RUN/DAILY 预算瞬态耗尽不封存（保持文档可重认领，
         # 下一 run/次日预算滚动后正常处理）——见 _is_transient_cost_deny 上方契约注释。
-        if quarantine_on_deny and not _is_transient_cost_deny(reason):
+        if quarantine_on_deny and not _transient:
             quarantine_for_cost(
                 doc["doc_id"], int(doc.get("version_no", 1)),
                 doc.get("owner_dept", "unknown"), reason or "cost ceiling exceeded",
