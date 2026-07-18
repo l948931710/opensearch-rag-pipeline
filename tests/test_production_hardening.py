@@ -454,9 +454,12 @@ def test_f_deactivate_failure_marks_failed(mock_get_client, mock_get_db_conn):
     chunk_failed_called = False
     
     for call in mock_cursor.execute.call_args_list:
-        sql = call[0][0]
+        sql = " ".join((call[0][0] or "").split())   # normalize 跨多行 SQL 的空白
         if "UPDATE document_version SET index_status = 'FAILED'" in sql:
             doc_failed_called = True
+            # ultra P1（2026-07-17）：失败路径也必须 CAS on PROCESSING（保 PENDING_DELETE 握手不被覆盖）
+            assert "AND index_status = 'PROCESSING'" in sql, \
+                "失败路径 document_version FAILED 写必须 CAS on PROCESSING"
         if "UPDATE chunk_meta SET index_status = 'FAILED'" in sql:
             chunk_failed_called = True
 

@@ -347,6 +347,23 @@ class CostBreaker:
             return self._run_tripped
 
 
+# 瞬态（共享预算）拒绝标记（ultra P1 2026-07-17）：try_reserve 的拒绝分两类——
+#   doc-intrinsic（闸 1/2 单文档 unit/预算 cap、闸 2b per-doc budget）：文档自身不可提取，封存正确；
+#   transient shared（闸 3/_run_tripped RUN budget、闸 4 DAILY budget）：进程内 RUN 计数下一 run
+#     清零、DAILY 共享账本次日滚动——健康文档届时可正常处理。对后者封存 = 把只因预算瞬态打满
+#     而被拒的健康文档终态隔离（quarantine_for_cost 置 retry_count=3 永不重认领 + kb_type=private），
+#     一次预算打满就永久剔除一批仅含空白/封面页的正常 PDF。故 transient 拒绝不封存、保持可重认领。
+# 契约：以下短语与 try_reserve 内对应 return 的文案耦合，改文案须同步本判定。
+_TRANSIENT_DENY_MARKERS = ("RUN budget exhausted", "would exceed RUN budget",
+                           "DAILY budget exhausted")
+
+
+def _is_transient_cost_deny(reason: Optional[str]) -> bool:
+    """拒绝理由是否为共享预算瞬态耗尽（run/daily）——是则不应封存文档（见上方注释）。"""
+    r = reason or ""
+    return any(m in r for m in _TRANSIENT_DENY_MARKERS)
+
+
 def quarantine_for_cost(
     doc_id: str,
     version_no: int,
@@ -460,7 +477,9 @@ def gate_vlm_rebuild(breaker: CostBreaker, doc: dict, simulate_db: bool = True,
     # 调用方 (vlm_rebuilder) 须 breaker.refund(doc_id, est) 退还本次预留。
     allowed, reason = breaker.try_reserve(doc["doc_id"], est)
     if not allowed:
-        if quarantine_on_deny:
+        # 仅 doc-intrinsic 拒绝才封存；RUN/DAILY 预算瞬态耗尽不封存（保持文档可重认领，
+        # 下一 run/次日预算滚动后正常处理）——见 _is_transient_cost_deny 上方契约注释。
+        if quarantine_on_deny and not _is_transient_cost_deny(reason):
             quarantine_for_cost(
                 doc["doc_id"], int(doc.get("version_no", 1)),
                 doc.get("owner_dept", "unknown"), reason or "cost ceiling exceeded",

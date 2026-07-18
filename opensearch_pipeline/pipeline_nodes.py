@@ -1459,6 +1459,88 @@ def _unfrozen_rechunk_acked(ctx, prior) -> bool:
     return bool(ok)
 
 
+def _crash_resume_autofreeze_enabled() -> bool:
+    """crash-resume 目标是否 auto-freeze 复用存储分类续跑（默认 on=修复生效）。
+    RAG_CRASH_RESUME_AUTOFREEZE=false 回退旧行为（有 chunk 的目标一律整批 fail-closed raise）。"""
+    return os.environ.get("RAG_CRASH_RESUME_AUTOFREEZE",
+                          "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _partition_prior_rechunk(prior_pairs):
+    """把「已有 chunk_meta 的当前版本目标」分成 crash-resume（可安全续跑）与 deliberate re-chunk。
+
+    crash-resume（ultra P1 2026-07-17）：node_write_chunk_meta 在 chunk 行提交（成功、5293）后、
+    每文档 content_process_status='DONE' 收口（5474）前崩溃 → 文档卡 PROCESSING → orchestrator 的
+    stale sweep 置 content_process_status='FAILED' + retry_count+1。而 deliberate 的 reset_for_rechunk
+    走 rechunk_reset_state() = content_process_status='NOT_STARTED' + retry_count=0——两种状态互斥，
+    可精准区分。crash-resume 是同一次 ingest 的续跑（canonical 未变），必须复用**已存**分类
+    （document_meta.category_l1/l2）续跑，绝不能重跑 LLM 分类（re-roll category→翻 chunk family=
+    PRODUCTION_14DFDF 79-vs-47）。此前对二者一律整批 raise，crash-resume 的 re-claim 遂楔死整批
+    stage-2、把 co-batched 健康文档拖到 retry_count=3 永久 FAILED。
+
+    返回 (crash_resume, deliberate)：
+      crash_resume: {doc_id: {"category_l1","category_l2"}} —— auto-freeze 复用存储分类。
+        category_l1 缺失（分类记录损坏/丢失）的 crash-resume 目标降级并入 deliberate（fail-closed，
+        宁可整批停下等人工，绝不盲目续跑一个丢了分类的文档）。
+      deliberate: [(doc_id, version_no), ...] —— 真正的 unfrozen re-chunk（NOT_STARTED 复位或
+        非 crash-resume 特征），仍受下方 unfrozen-rechunk guard 的整批 fail-closed 约束。
+
+    FAIL CLOSED：DB 不可验证时 raise（同 _docs_with_existing_chunks，initial + 1 retry）。"""
+    import time as _t
+
+    if not prior_pairs:
+        return {}, []
+    clause = " OR ".join(["(dv.doc_id=%s AND dv.version_no=%s)"] * len(prior_pairs))
+    params = tuple(p for pr in prior_pairs for p in pr)
+    last_err = None
+    for _attempt in range(2):
+        conn = None
+        try:
+            conn = _get_db_conn(select_db=True)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""SELECT dv.doc_id, dv.version_no, dv.content_process_status, dv.retry_count,
+                               dm.category_l1, dm.category_l2
+                        FROM document_version dv
+                        JOIN document_meta dm ON dm.doc_id = dv.doc_id
+                        WHERE {clause}""", params)
+                rows = cur.fetchall()
+            _by_key = {}
+            for r in (rows or []):
+                if isinstance(r, dict):
+                    _by_key[(r["doc_id"], r["version_no"])] = (
+                        r["content_process_status"], r["retry_count"],
+                        r.get("category_l1"), r.get("category_l2"))
+                else:
+                    _by_key[(r[0], r[1])] = (r[2], r[3], r[4], r[5])
+            crash_resume, deliberate = {}, []
+            for pr in prior_pairs:
+                key = (pr[0], pr[1])
+                row = _by_key.get(key)
+                if row is None:
+                    deliberate.append(key)   # document_meta 缺失等异常 → fail-closed
+                    continue
+                cps, rc, cat1, cat2 = row
+                if str(cps) == "FAILED" and int(rc or 0) > 0 and cat1:
+                    crash_resume[key[0]] = {"category_l1": cat1, "category_l2": cat2 or "others"}
+                else:
+                    deliberate.append(key)
+            return crash_resume, deliberate
+        except Exception as e:  # noqa: BLE001 — 无法验证必须 fail-closed
+            last_err = e
+            if _attempt == 0:
+                _t.sleep(2)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RuntimeError(
+        f"crash-resume 分区无法验证 document_version（DB 错误重试后仍失败）: {last_err} — "
+        f"拒绝继续（fail closed）")
+
+
 def _safe_classification_fields(classification: dict, text: str) -> dict:
     """从（可能缺键的）LLM 分类结果取字段，缺键用保守默认 —— 绝不 KeyError。
 
@@ -1517,18 +1599,31 @@ def node_classify_and_risk_assess(ctx: dict):
         # WHOLE run if ANY target qualifies (mixed fresh+re-chunk batch = ambiguous intent → stop and
         # force an explicit choice). Runs BEFORE the preempt UPDATE so nothing is stranded in PROCESSING.
         _prior = _docs_with_existing_chunks(canonicals)
-        if _prior and not _unfrozen_rechunk_acked(ctx, _prior):
-            from datetime import date as _date
+        if _prior:
+            # crash-resume 与 deliberate re-chunk 分区（ultra P1 2026-07-17）：前者（chunk 已写、
+            # DONE 收口前崩溃被 sweep 转 FAILED-retry）auto-freeze 复用存储分类续跑；后者仍受整批
+            # fail-closed 约束。此前不分区、一律整批 raise，crash-resume 的 re-claim 楔死整批
+            # stage-2、连累 co-batched 健康文档（见 _partition_prior_rechunk）。
+            if _crash_resume_autofreeze_enabled():
+                _crash_resume, _deliberate = _partition_prior_rechunk(_prior)
+                if _crash_resume:
+                    ctx["_crash_resume_frozen"] = _crash_resume
+                    print(f"    [crash-resume] auto-freeze {len(_crash_resume)} 个续跑文档的存储分类"
+                          f"（chunk 已写、崩溃在 DONE 收口前）：{list(_crash_resume)[:3]}")
+            else:
+                _crash_resume, _deliberate = {}, list(_prior)   # kill switch：回退旧整批行为
+            if _deliberate and not _unfrozen_rechunk_acked(ctx, _deliberate):
+                from datetime import date as _date
 
-            from opensearch_pipeline.reindex_states import docset_hash
-            _h = docset_hash(d for d, _ in _prior)
-            raise RuntimeError(
-                f"unfrozen re-chunk blocked: {len(_prior)} target doc(s) already have chunks for their "
-                f"current (doc_id,version_no), e.g. {_prior[:3]}, but no frozen routing is set. "
-                f"Re-running the LLM classifier would re-roll category->chunk mode and can flip the "
-                f"chunk family (the 79-vs-47 incident). For a maintenance re-chunk, set "
-                f"RAG_MAINTENANCE_ROUTING=<manifest>. To DELIBERATELY re-classify (route-v2 family "
-                f"migration), set RAG_ALLOW_UNFROZEN_RECHUNK=<op>:{_date.today().isoformat()}:{_h}")
+                from opensearch_pipeline.reindex_states import docset_hash
+                _h = docset_hash(d for d, _ in _deliberate)
+                raise RuntimeError(
+                    f"unfrozen re-chunk blocked: {len(_deliberate)} target doc(s) already have chunks for "
+                    f"their current (doc_id,version_no), e.g. {_deliberate[:3]}, but no frozen routing is "
+                    f"set. Re-running the LLM classifier would re-roll category->chunk mode and can flip "
+                    f"the chunk family (the 79-vs-47 incident). For a maintenance re-chunk, set "
+                    f"RAG_MAINTENANCE_ROUTING=<manifest>. To DELIBERATELY re-classify (route-v2 family "
+                    f"migration), set RAG_ALLOW_UNFROZEN_RECHUNK=<op>:{_date.today().isoformat()}:{_h}")
 
     if not simulate_db:
         conn = None
@@ -1653,9 +1748,13 @@ def node_classify_and_risk_assess(ctx: dict):
         doc["permission_level"] = permission_level
         doc["kb_type"] = kb_type
 
-        # 1.5 maintenance re-chunk：复用冻结分类，绝不调用 LLM classifier（presence 已由上方 fail-closed 保证）
-        if frozen_routing is not None:
-            fr = frozen_routing[doc["doc_id"]]
+        # 1.5 冻结分类复用（maintenance freeze 或 crash-resume 续跑，ultra P1）：绝不调 LLM classifier。
+        #     frozen_routing（整批 maintenance freeze，presence 由上方 fail-closed 保证）优先；否则查
+        #     crash-resume auto-freeze 映射（本文档若是崩溃续跑则复用其 document_meta 存储分类，family 保持）。
+        _doc_frozen = (frozen_routing[doc["doc_id"]] if frozen_routing is not None
+                       else (ctx.get("_crash_resume_frozen") or {}).get(doc["doc_id"]))
+        if _doc_frozen is not None:
+            fr = _doc_frozen
             doc["category_l1"] = fr["category_l1"]
             doc["category_l2"] = fr.get("category_l2") or "others"
             doc["owner_dept"] = doc.get("owner_dept") or "unknown"
@@ -6079,9 +6178,17 @@ def node_deactivate_old_chunks(ctx: dict):
                         conn_fail = _get_db_conn(select_db=True)
                         with conn_fail.cursor() as cur:
                             for doc_id, ver in current_versions.items():
+                                # CAS 收尾（对齐成功路径 6208 / node_update_index_status 7340）：
+                                # 只允许 PROCESSING→FAILED。此前无谓词无条件写 FAILED，会把控制台
+                                # 中途置的 PENDING_DELETE 删除握手（set-visibility→restricted / retire）
+                                # 覆盖掉；FAILED 是 stage-3 可认领态，下批 loader 遂把受限文档以旧
+                                # permission 重推 HA3，且基于 reconcile 的删除永不触发（ultra P1
+                                # 2026-07-17）。clear_set_sql() 顺手清租约（flag off 时空串，现网零副作用）。
                                 cur.execute(f"""
-                                    UPDATE document_version SET index_status = '{DocVersionIndexStatus.FAILED}'
+                                    UPDATE document_version
+                                    SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
                                     WHERE doc_id = %s AND version_no = %s
+                                      AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                                 """, (doc_id, ver))
                                 new_chunks = [c for c in chunks if getattr(c, "doc_id", "") == doc_id and getattr(c, "version_no", 0) == ver]
                                 new_chunk_ids = [c.chunk_id for c in new_chunks]

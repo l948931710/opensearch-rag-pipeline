@@ -337,6 +337,26 @@ class TestStepCardLengthLimit:
         for c in step_cards:
             assert len(c.chunk_text) <= 300, f"step_card too long: {len(c.chunk_text)} chars"
 
+    def test_oversized_step_body_itself_splits(self):
+        """ultra P1（2026-07-17）：step_text 本体单独就超长（单步吞并多页、无补充部分）时也必须切分。
+        旧的 `len(parts) > 1` 门 + core_parts 始终整块保留 step_text 双双失效 → 整块超 2000-token
+        校验被 node_validate_chunks 丢弃 → 该步内容从索引蒸发。修后：本体过 _split_long_text，首段
+        作主块、其余降级续接块，每块远低于 2000-token 上限。"""
+        chunker = DocumentChunker(
+            max_chunk_chars=200, min_chunk_chars=10, overlap_chars=0, split_mode="step")
+        long_body = "操作人员必须严格按照规程执行每一个动作并如实记录数据。" * 20  # ~600 字，无图无补充
+        blocks = [
+            ExtractedBlock(block_type="paragraph", text="步骤1. " + long_body),
+            ExtractedBlock(block_type="paragraph", text="步骤2. 收尾清场"),
+        ]
+        chunks = chunker.chunk_from_blocks(blocks, "DOC_STEP_BODY", 1)
+        step_cards = [c for c in chunks if c.chunk_type == "step_card"]
+        step1 = [c for c in step_cards if c.extra.get("step_no") == 1]
+        assert len(step1) >= 2, f"step_text 本体超长必须切分为多块，got {len(step1)}"
+        assert any(c.extra.get("is_step_continuation") for c in step1), "溢出段应标记续接块"
+        for c in step_cards:
+            assert c.token_count <= 2000, f"step_card 仍超 2000-token 校验上限: {c.token_count}"
+
     def test_short_step_card_not_split(self):
         """短步骤不应拆分。"""
         chunker = DocumentChunker(
