@@ -580,3 +580,59 @@ describe('GapList — 已忽略折叠区', () => {
     expect(w.find('[data-testid="gap-dismissed-row"]').exists()).toBe(false)   // 默认收起
   })
 })
+
+// 2026-07-18：语义归组 chip + 缺口卡会话上下文展开
+describe('GapList — phrasings chip 与上下文展开', () => {
+  const BASE_GAP = {
+    question: '如何申请密钥？', asks: 5, last_days: 2, dept: 'it', kind: 'no_result',
+    question_hash: 'hg1', source_message_id: 'mg1', has_pending_contribution: false,
+  }
+  function seedOne(extra: Record<string, unknown>) {
+    withSession()
+    const c = useContribute()
+    c.gaps.value = [{ ...BASE_GAP, ...extra }] as never
+    c.gapsSummary.value = { unanswered: 1, answered: 0, this_month: 0, contributors: 0 } as never
+    return mount(GapList)
+  }
+
+  it('phrasings>1 → 显「N 种问法」chip；缺省/1（flag 关或老后端）→ 零节点', () => {
+    let w = seedOne({ phrasings: 3 })
+    expect(w.find('[data-testid="gap-phrasings"]').text()).toContain('3 种问法')
+    w = seedOne({ phrasings: 1 })
+    expect(w.find('[data-testid="gap-phrasings"]').exists()).toBe(false)
+    w = seedOne({})
+    expect(w.find('[data-testid="gap-phrasings"]').exists()).toBe(false)
+  })
+
+  it('仅 has_context=true 显「查看上下文」；点击懒加载并渲染前几轮（脱敏由服务端）', async () => {
+    let w = seedOne({})
+    expect(w.find('[data-testid="gap-ctx-toggle"]').exists()).toBe(false)   // 缺省不显
+    w = seedOne({ has_context: true, representative_message_id: 'mg1' })
+    const btn = w.find('[data-testid="gap-ctx-toggle"]')
+    expect(btn.exists()).toBe(true)
+    stubFetch({ items: [
+      { question: '第一个问题', answer_status: 'SUCCESS', answer_excerpt: '答案节选', created_at: '2026-07-18 09:00' },
+      { question: '第二个问题', answer_status: 'NO_RESULT', answer_excerpt: '', created_at: '2026-07-18 09:30' },
+    ] })
+    await btn.trigger('click')
+    await new Promise((r) => setTimeout(r))
+    await w.vm.$nextTick()
+    const panel = w.find('[data-testid="gap-ctx-panel"]')
+    expect(panel.exists()).toBe(true)
+    expect(panel.text()).toContain('第一个问题')
+    expect(panel.text()).toContain('答案节选')
+    expect(panel.text()).toContain('未找到答案')      // NO_RESULT 轮显状态不显节选
+    // 再点折叠
+    await btn.trigger('click')
+    expect(w.find('[data-testid="gap-ctx-panel"]').exists()).toBe(false)
+  })
+
+  it('上下文接口失败/空 → 显「无会话上文」，不打断认领流', async () => {
+    const w = seedOne({ has_context: true, representative_message_id: 'mg1' })
+    stubFetch({ items: [] })
+    await w.find('[data-testid="gap-ctx-toggle"]').trigger('click')
+    await new Promise((r) => setTimeout(r))
+    await w.vm.$nextTick()
+    expect(w.find('[data-testid="gap-ctx-panel"]').text()).toContain('无会话上文')
+  })
+})

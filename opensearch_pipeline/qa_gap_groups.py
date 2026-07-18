@@ -134,5 +134,7 @@ def merge_semantic_gaps(open_gaps: List[Dict[str, Any]],
             "dept": next((m["dept"] for m in members if m.get("dept")), ""),
             "pending": any(m.get("pending") for m in members),
             "phrasings": len(members),
+            # 上下文随主成员走（卡片 msg=head 的 message_id，「查看上下文」查的正是它）
+            "has_context": bool(head.get("has_context")),
         })
     return merged

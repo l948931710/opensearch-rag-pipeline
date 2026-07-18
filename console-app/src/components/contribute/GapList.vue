@@ -13,8 +13,8 @@ import LoadError from '@/components/manage/LoadError.vue'
 // MyContributions 重试钮范式）；成功后行内原地翻转「已忽略·撤销」——不重拉列表（误点
 // 有当场回路；撤销窗口=至下次 loadGaps，刷新后被读侧排除属预期）。非破坏性可撤销软删
 // → 弹窗不用 danger 红色态（区别于撤销授权类终态动作），原因可空、记录台账。
-const { gaps, gapsSummary, loadingGaps, loadErrors, gapsWindowDays, loadGaps, openModal,
-        canManage, isBusy, dismissGap, restoreGap,
+const { gaps, gapsSummary, loadingGaps, loadErrors, gapsWindowDays, loadGaps, toggleGapContext,
+        openModal, canManage, isBusy, dismissGap, restoreGap,
         dismissedGaps, loadDismissed, restoreDismissed } = useContribute()
 const { promptText } = useDialog()
 
@@ -78,6 +78,33 @@ async function onDismiss(g: GapItem) {
             <span v-if="g.dept">· {{ deptLabel(g.dept) }}</span>
             <span class="inline-flex items-center gap-1"><Clock :size="11" :stroke-width="2" /> {{ g.last_days }} 天未回答</span>
             <span v-if="gapKindLabel(g.kind)" class="rounded px-1.5 py-px text-[10.5px] font-medium" :class="KIND_PILL[g.kind] || 'bg-panel text-muted-foreground'">{{ gapKindLabel(g.kind) }}</span>
+            <!-- 语义归组（RAG_QA_GAP_SEMANTIC）：>1 = 卡片背后归并了 N 种相似问法 -->
+            <span
+              v-if="(g.phrasings || 1) > 1" data-testid="gap-phrasings"
+              class="rounded bg-panel px-1.5 py-px text-[10.5px] font-medium tabular-nums text-muted-foreground"
+            >{{ g.phrasings }} 种问法</span>
+            <!-- 会话上下文（仅 has_context 才渲染——追问型缺口单看问题看不懂，展开前几轮） -->
+            <button
+              v-if="g.has_context" type="button" data-testid="gap-ctx-toggle"
+              class="inline-flex items-center gap-0.5 rounded px-1 py-px text-[10.5px] font-medium text-accent-text transition hover:bg-accent-soft"
+              :aria-expanded="!!g.ctxOpen"
+              @click="toggleGapContext(g)"
+            >
+              <ChevronRight :size="10" :stroke-width="2" class="transition-transform" :class="g.ctxOpen && 'rotate-90'" />
+              查看上下文
+            </button>
+          </div>
+          <!-- 上下文展开区（懒加载；他人问答已服务端脱敏） -->
+          <div v-if="g.ctxOpen" class="mt-2 rounded-lg bg-panel/60 px-3 py-2" data-testid="gap-ctx-panel">
+            <p v-if="g.ctxLoading" class="text-[11.5px] text-faint">上下文加载中…</p>
+            <template v-else-if="g.ctxTurns && g.ctxTurns.length">
+              <div v-for="(t, ti) in g.ctxTurns" :key="ti" class="py-1 text-[11.5px] leading-relaxed" :class="ti > 0 && 'border-t border-border/60'">
+                <div class="text-foreground">问：{{ t.question }}</div>
+                <div v-if="t.answer_excerpt" class="mt-0.5 truncate text-muted-foreground">答：{{ t.answer_excerpt }}</div>
+                <div v-else class="mt-0.5 text-faint">（该轮{{ t.answer_status === 'NO_RESULT' ? '未找到答案' : t.answer_status === 'REFUSAL' ? '未答好' : '无回答快照' }}）</div>
+              </div>
+            </template>
+            <p v-else class="text-[11.5px] text-faint">该提问无会话上文。</p>
           </div>
         </div>
         <!-- 已忽略态（仅本会话内出现）：末尾动作位整体切换——沿用本文件既有互斥切换惯例 -->

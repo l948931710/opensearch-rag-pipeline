@@ -22,10 +22,23 @@ export interface GapItem {
   question_hash: string
   source_message_id: string
   has_pending_contribution: boolean // 已有贡献待入库（缺口仍开放）
+  // 语义归组（RAG_QA_GAP_SEMANTIC；additive，老后端缺字段自隐）：>1 = 卡片背后有 N 种问法
+  phrasings?: number
+  // 缺口卡上下文（2026-07-18；additive）：representative_message_id=代表提问（上下文查询键，
+  // 与 source_message_id 同值）；has_context=true 才渲染「查看上下文」
+  representative_message_id?: string
+  has_context?: boolean
   // 本地 UI 态（非 API 字段）：本会话内刚被管理员忽略——行内原地翻转出「撤销」出路，
   // 有意不重拉列表（reload 摘除会让误点永久不可寻回：读侧排除且后端无已忽略列表端点）。
   // 撤销窗口=至下次 loadGaps()（刷新后被读侧排除自然消失，预期语义）。
   dismissed?: boolean
+  // 本地 UI 态：上下文展开（懒加载缓存；null=已请求但无上文/失败）
+  ctxOpen?: boolean
+  ctxLoading?: boolean
+  ctxTurns?: GapContextTurn[] | null
+}
+export interface GapContextTurn {
+  question: string; answer_status: string; answer_excerpt: string; created_at: string
 }
 export interface GapsSummary {
   unanswered: number; answered: number; this_month: number; contributors: number
@@ -108,7 +121,7 @@ function clearLoadError(key: string) { delete loadErrors.value[key] }
 function _previewGaps(): GapsResp {
   return {
     items: [
-      { question: '如何申请生产环境的访问密钥？', asks: 5, last_days: 2, dept: 'it', kind: 'no_result', question_hash: 'h1', source_message_id: 'm1', has_pending_contribution: false },
+      { question: '如何申请生产环境的访问密钥？', asks: 5, last_days: 2, dept: 'it', kind: 'no_result', question_hash: 'h1', source_message_id: 'm1', has_pending_contribution: false, phrasings: 3, has_context: true, representative_message_id: 'm1' },
       { question: '2oz PP 杯在龙盛机上的标准速度是多少？', asks: 3, last_days: 6, dept: 'production', kind: 'refusal', question_hash: 'h2', source_message_id: 'm2', has_pending_contribution: true },
       { question: '差旅报销的发票抬头怎么填？', asks: 2, last_days: 1, dept: 'finance', kind: 'no_result', question_hash: 'h3', source_message_id: 'm3', has_pending_contribution: false },
     ],
@@ -162,6 +175,23 @@ async function loadGaps() {
   }
   // finally 不设指纹门：身份切换路径上 reset 已把 loadingGaps 置 false，这里再置一次无冲突
   finally { loadingGaps.value = false }
+}
+
+/** 缺口卡上下文展开（2026-07-18）：懒加载该代表提问所在会话的前几轮问答。
+ *  仅 has_context=true 的行会被调用；结果缓存在行上（ctxTurns），再点即折叠。 */
+async function toggleGapContext(g: GapItem) {
+  if (g.ctxOpen) { g.ctxOpen = false; return }
+  g.ctxOpen = true
+  if (g.ctxTurns !== undefined || g.ctxLoading) return   // 已加载过（含空）/在途
+  const mid = g.representative_message_id || g.source_message_id
+  if (!mid) { g.ctxTurns = null; return }
+  g.ctxLoading = true
+  try {
+    const r = await apiJson<{ items: GapContextTurn[] }>(
+      `/api/kb/gaps/context?message_id=${encodeURIComponent(mid)}`, { auth: true })
+    g.ctxTurns = r.items?.length ? r.items : null
+  } catch { g.ctxTurns = null }   // 403/404/网络失败一律显「无上文」，不打断认领流
+  finally { g.ctxLoading = false }
 }
 
 async function loadMine() {
@@ -368,7 +398,7 @@ export function useContribute() {
     gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
     modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
-    loadGaps, loadMine, loadPending, loadHeroes,
+    loadGaps, toggleGapContext, loadMine, loadPending, loadHeroes,
     openModal, closeModal, submitContribution, acceptContribution, rejectContribution, retryContribution,
     dismissGap, restoreGap, dismissedGaps, loadDismissed, restoreDismissed,
   }
