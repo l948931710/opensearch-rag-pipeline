@@ -170,7 +170,13 @@
 - **DW 节点**:两个 ontology 节点补 `sys.version_info` 分支(py3.7 钉 requests==2.31.0,对齐 07-17 stage 节点;镜像恢复 3.8+ 自动走现代钉版)。**dedup 退役**:superseded 同时把 dv index_status CAS 进 PENDING_DELETE(已在删除链上的不动)→ reconcile_pending_deletes 删 HA3 PK+灭活 chunk_meta(与控制台退役同一收敛路径,不内联灭活防 reconciler 找不到 PK)。
 - **SAE 安装路径定性=REAL**:requirements.txt 自述即 SAE 两路径(buildpack+启动命令)唯一安装源,floor-only 无哈希,而全部完整性门指向 SAE 不用的 lock/Dockerfile。第一步收敛:顶层依赖 **== 精确钉版对齐 lock 审计版本** + **补 redis==8.0.1**(workers>1 翻 redis 后端时 serving 直接 import,此前缺席=翻 flag 即启动失败);完整 --require-hashes 需展开全量锁、会改 SAE 构建行为,🔒随下次 SAE 重打包先过 staging buildImage 验证。
 
-每批验证:python 新回归 7 条(outbox 代次 4+conftest 门 3,含 harness 升 3 元组+rowcount 脚本化)+前端 spec 4 条(reauth 单飞/坏参 ×2/掩码经 vue-tsc)+vitest 全量 416+miniapp 24+console build(vue-tsc)绿;`make test`+`make lint` 绿。未验证声明:CI 触发生效需下次 push 实测(本提交即验)、掩码拒绝的真机审批流、小程序共享设备真机换号、SAE 钉版 buildImage(下次重打包验证)、049 真库语义(1054 双路径单测覆盖)。🔒user-gated 生效项:049 apply、CI 分支保护 UI、SAE 重打包(requirements 钉版+redis 随包生效)。
+每批验证:python 新回归 7 条(outbox 代次 4+conftest 门 3,含 harness 升 3 元组+rowcount 脚本化)+前端 spec 4 条(reauth 单飞/坏参 ×2/掩码经 vue-tsc)+vitest 全量 415+miniapp 24+console build(vue-tsc)绿;`make test`+`make lint` 绿。未验证声明:掩码拒绝的真机审批流、小程序共享设备真机换号、SAE 钉版 buildImage(下次重打包验证)、049 真库语义(1054 双路径单测覆盖)。🔒user-gated 生效项:049 apply、CI 分支保护 UI、SAE 重打包(requirements 钉版+redis 随包生效)。
+
+**发布分支 CI 首启排障(2026-07-17/18,分支门生效即连暴三处潜伏基建损坏+1 真发现)**:
+1. `caabfd3`——trivy-action 裸号 tag(0.28.0)被上游删除改 v 前缀 → security 作业 Set up 即红(gitleaks/pip-audit/SBOM/trivy 其实全没执行);按 v0.36.0 的 commit SHA 钉死(供应链纪律同 Dockerfile digest-pinning)。**main 上一次 push 后上游删 tag,期间零触发,坏损一直隐形——正是本批「CI 必须跑在出包分支」要抓的形态**。
+2. `1fa4038`——security 作业 setup-python 3.10 vs requirements-prod.lock 编译目标 3.11:lock 内 rpds-py==2026.6.3 等 ≥3.11-only 轮子解析失败,pip-audit 装依赖阶段退出 1(非 CVE 发现);对齐 3.11。同为 lock 升版后 main 无 push 的潜伏损坏。
+3. `fa3ce1d`——三跑后扫描面全绿(gitleaks 全史 ✓/pip-audit fresh+lock ✓/npm 0/requirements.txt 钉版后 0/主 Dockerfile 0),唯一**真发现** trivy DS-0002 HIGH:deploy/dataworks_monitor.Dockerfile 无 USER 以 root 跑;补 raguser(对齐主 Dockerfile appuser 纪律;镜像尚为模板,DataWorks pod 运行时若要求 root 的豁免路径已注释)。
+四跑(fa3ce1d)= 分支门下首个全绿基线(test 3.10/3.11+db-integration+Frontend 一直绿)。
 
 ## 批次9 — P3 清扫(49 项,选择性;单独排期)
 - run-1 30 项 + 续跑 16 项 + 改判 3 项(`packing_math:245`/`store:1469`/`spot_checker:686`),台账见审计文档 P3 表。
