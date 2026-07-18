@@ -217,7 +217,10 @@ jobs:
       # ⚠️ step name 含「冒号+空格」必须整体加引号——未引号的 `fs:` 会把 name 解析成
       # 嵌套映射 → 整个 workflow 无效 → 每次 push 0 秒 startup failure（2026-07-12..15 实翻）
       - name: "Trivy scan (fs: lockfiles + Dockerfile config — BLOCKING on fixable HIGH/CRITICAL)"
-        uses: aquasecurity/trivy-action@0.28.0
+        # 批次8 热修：上游把裸号 tag（0.28.0）全删改 v 前缀 → 旧引用解析失败、security
+        # 作业 setup 即红（发布分支首跑 CI 当场暴露）。按 SHA 钉死（=v0.36.0 的 commit，
+        # 与 Dockerfile digest-pinning 同一供应链纪律，tag 再被动也不受影响）。
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
