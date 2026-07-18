@@ -40,5 +40,12 @@ RUN pip install --no-cache-dir -i ${PIP_INDEX} \
 COPY opensearch_pipeline /opt/rag/opensearch_pipeline
 ENV PYTHONPATH=/opt/rag
 
+# ── NON-ROOT USER（批次8 CI 首扫 DS-0002 HIGH；对齐主 Dockerfile 的 appuser 纪律）────────────
+# 监控作业是纯出站读写（RDS/HA3/OSS/钉钉 API），无任何需要 root 的本地副作用。
+# ⚠️ 若 DataWorks 任务 pod 运行时组件要求以 root 启动（构建/注册后首次调度即可验证），
+# 删除下面两行并在此记录豁免理由——届时给 CI trivy 加 AVD 白名单而不是静默忍受红灯。
+RUN useradd -m raguser
+USER raguser
+
 # NOTE: do NOT bake prod creds into the image. RAG_RDS_* / RAG_OSS_* / HA3 / RAG_OPS_ALERT_* are set
 # as node/workspace env vars (or a secret) in the DataWorks scheduling config — see the runbook.
