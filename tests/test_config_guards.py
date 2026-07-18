@@ -331,3 +331,47 @@ def test_load_config_rejects_unknown_label(monkeypatch):
     monkeypatch.setenv("RAG_ENVIRONMENT", "prod")
     with pytest.raises(EnvironmentMismatchError, match="未知环境标签"):
         load_config()
+
+
+# ── 批次8（ultra conftest:34）：prod-write 测试门补 OSS 桶 + 标准 OpenSearch ────
+
+
+def _gate_cfg(monkeypatch, **over):
+    from types import SimpleNamespace
+    base = dict(
+        simulate_db=True, simulate_opensearch=True, simulate_oss=True,
+        rds=SimpleNamespace(host="localhost"),
+        alibaba_vector=SimpleNamespace(endpoint=""),
+        oss=SimpleNamespace(bucket_name="local-test-bucket"),
+        opensearch=SimpleNamespace(host="localhost"),
+    )
+    base.update(over)
+    cfg = SimpleNamespace(**base)
+    monkeypatch.setattr("opensearch_pipeline.config.get_config", lambda: cfg)
+    return cfg
+
+
+def test_prod_gate_flags_prod_oss_bucket(monkeypatch):
+    """RAG_SIMULATE_OSS=false + 生产桶此前双闸全过（夹具 put/delete 直打生产 OSS）。"""
+    from tests.conftest import _prod_target_violations
+    _gate_cfg(monkeypatch, simulate_oss=False,
+              oss=__import__("types").SimpleNamespace(bucket_name="fuling-knowledge-base"))
+    v = _prod_target_violations()
+    assert any("OSS bucket" in x for x in v)
+
+
+def test_prod_gate_flags_remote_opensearch_host(monkeypatch):
+    from tests.conftest import _prod_target_violations
+    _gate_cfg(monkeypatch, simulate_opensearch=False,
+              opensearch=__import__("types").SimpleNamespace(host="es.some-remote.example.com"))
+    v = _prod_target_violations()
+    assert any("OpenSearch host" in x for x in v)
+
+
+def test_prod_gate_allows_local_stack_and_staging_bucket(monkeypatch):
+    """本地栈（localhost OpenSearch）与 staging 桶（生产桶名前缀，精确匹配不误伤）照常放行。"""
+    from tests.conftest import _prod_target_violations
+    _gate_cfg(monkeypatch, simulate_oss=False, simulate_opensearch=False,
+              oss=__import__("types").SimpleNamespace(bucket_name="fuling-knowledge-base-staging"),
+              opensearch=__import__("types").SimpleNamespace(host="localhost"))
+    assert _prod_target_violations() == []

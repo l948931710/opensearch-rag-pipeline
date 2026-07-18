@@ -26,7 +26,12 @@ import zipfile
 # ═══════════════════════════════════════════════════════════════
 # 0. 安装依赖（锁版本——PR-D 供应链纪律）
 # ═══════════════════════════════════════════════════════════════
-DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.32.3"]
+# 批次8（ultra ontology_backfill_node:41 同族）：serverless 执行器实为 py3.7——
+# requests==2.32.3 要求 ≥3.8，pip 第 0 步就死。对齐 stage 节点版本分支。
+if sys.version_info >= (3, 8):
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.32.3"]
+else:
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.31.0"]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", *DEPS, "-t", "/tmp/pydeps", "-q"
 ])

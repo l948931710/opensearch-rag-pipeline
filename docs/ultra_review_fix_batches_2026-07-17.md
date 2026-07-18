@@ -146,18 +146,31 @@
 ## 批次8 — 前端/小程序/schema/CI/测试门(续跑新增 P2)
 | 状态 | 条目 | 位置 | 修法 |
 |---|---|---|---|
-| ⬜ | P2 阻断 CI 从不在发布分支跑(gitleaks/CVE 全豁免) | `.github/workflows/ci.yml:12` | push 触发加 `claude/ontology-p0`(或 `claude/**`) |
-| ⬜ | P2 prod-write 测试门漏 OSS bucket/远程 OpenSearch | `tests/conftest.py:34` | _prod_target_violations 补 OSS bucket+opensearch host 检查 |
-| ⬜ | P2 改参并批准把服务端脱敏值当真参执行 | `console-app/.../AgentApprovalQueue.vue:73` | 编辑值与 checkpoint 原参合并/或含掩码占位即拒绝 |
-| ⬜ | P2 401 reauth 风暴(无 in-flight 去重) | `console-app/src/composables/useAuth.ts:229` | reauth 单飞(共享 in-flight promise) |
-| ⬜ | P2 畸形 deep-link decodeURIComponent 顶层抛→白屏 | `console-app/src/composables/useAuth.ts:20` | try/catch 包 decode,坏参降级忽略 |
-| ⬜ | P2 会话切换调 legacy stop() 误终结 agent 消息→重试双跑 | `console-app/src/composables/useAsk.ts:433` | stop() 加 m.agent 守卫走 agent 取消路径 |
-| ⬜ | P2 共享设备会话串号(登录前渲染他人缓存) | `fuling-rag-miniapp/pages/chat/chat.js:166` | _restoreLast 前先 ensureOwner;_ask/抽屉/设置登录路径补 owner 复查 |
-| ⬜ | P2 「清空会话」后每次冷启动都静默清空恢复 | `fuling-rag-miniapp/pages/chat/chat.js:232` | reset 处理后持久化 lastResetAt(或清 marker) |
-| ⬜ | P2 ACL 撤销可被 drain 竞态静默吞掉(无 generation 列) | `schema/009` + `access_grants.py:273` | outbox 加 generation/epoch 列(新 schema 文件🔒apply),drain 按代次 CAS 收口 |
-| ⬜ | P2 ontology DataWorks 节点 py3.7 装不上 requests==2.32.3 | `dataworks_nodes/ontology_backfill_node.py:41`(×2 文件) | 补 sys.version_info 钉版分支(对齐 07-17 stage 节点) |
-| ⬜ | P2 dedup fix 模式 status-only 退役留双活文档 | `dataworks_nodes/scan_oss_sync_keys.py:253` | 退役同时灭活 chunk_meta+排 HA3 PENDING_DELETE(复用 spot_checker 模式) |
-| ⬜ | PLAUSIBLE SAE 安装路径到底走 requirements.txt 还是 lock | `requirements.txt:13` | 查 SAE 部署配置定性;若 zip/buildpack 路径→给 requirements.txt 上 hash 或改指 lock |
+| ✅ | P2 阻断 CI 从不在发布分支跑(gitleaks/CVE 全豁免) | `.github/workflows/ci.yml:12` | push 触发加 `claude/ontology-p0`(或 `claude/**`) |
+| ✅ | P2 prod-write 测试门漏 OSS bucket/远程 OpenSearch | `tests/conftest.py:34` | _prod_target_violations 补 OSS bucket+opensearch host 检查 |
+| ✅ | P2 改参并批准把服务端脱敏值当真参执行 | `console-app/.../AgentApprovalQueue.vue:73` | 编辑值与 checkpoint 原参合并/或含掩码占位即拒绝 |
+| ✅ | P2 401 reauth 风暴(无 in-flight 去重) | `console-app/src/composables/useAuth.ts:229` | reauth 单飞(共享 in-flight promise) |
+| ✅ | P2 畸形 deep-link decodeURIComponent 顶层抛→白屏 | `console-app/src/composables/useAuth.ts:20` | try/catch 包 decode,坏参降级忽略 |
+| ✅ | P2 会话切换调 legacy stop() 误终结 agent 消息→重试双跑 | `console-app/src/composables/useAsk.ts:433` | stop() 加 m.agent 守卫走 agent 取消路径 |
+| ✅ | P2 共享设备会话串号(登录前渲染他人缓存) | `fuling-rag-miniapp/pages/chat/chat.js:166` | _restoreLast 前先 ensureOwner;_ask/抽屉/设置登录路径补 owner 复查 |
+| ✅ | P2 「清空会话」后每次冷启动都静默清空恢复 | `fuling-rag-miniapp/pages/chat/chat.js:232` | reset 处理后持久化 lastResetAt(或清 marker) |
+| ✅ | P2 ACL 撤销可被 drain 竞态静默吞掉(无 generation 列) | `schema/009` + `access_grants.py:273` | outbox 加 generation/epoch 列(新 schema 文件🔒apply),drain 按代次 CAS 收口 |
+| ✅ | P2 ontology DataWorks 节点 py3.7 装不上 requests==2.32.3 | `dataworks_nodes/ontology_backfill_node.py:41`(×2 文件) | 补 sys.version_info 钉版分支(对齐 07-17 stage 节点) |
+| ✅ | P2 dedup fix 模式 status-only 退役留双活文档 | `dataworks_nodes/scan_oss_sync_keys.py:253` | 退役同时灭活 chunk_meta+排 HA3 PENDING_DELETE(复用 spot_checker 模式) |
+| ✅ | PLAUSIBLE SAE 安装路径到底走 requirements.txt 还是 lock | `requirements.txt:13` | 查 SAE 部署配置定性;若 zip/buildpack 路径→给 requirements.txt 上 hash 或改指 lock |
+
+**批次8 落地记录(2026-07-17)**,as-built 与修法的差异及关键决策:
+- **CI 分支**:ci.yml+frontend.yml push 触发加 `claude/**`(覆盖全部工作分支,非仅 ontology-p0);🔒分支保护 UI 设置仍 user-gated。
+- **conftest 门**:补 OSS 桶(`is_prod_target("oss")` 精确匹配——staging 桶名是生产桶前缀,子串会误伤)+ 标准 OpenSearch host 非本地即拒(search 指纹只覆盖 HA3 形态,标准 OS 按 _LOCAL_HOSTS 白名单;local_stack 的 localhost 照常放行)。
+- **掩码参**:取「含掩码占位即拒绝」路线(合并 checkpoint 原参无法区分"审批人想改的字段"与"掩码未动的字段",歧义即危险):`findMaskedFields` 递归检 3+ 星号(对应 REDACTION_MAP 的 138****5678/ab***@/前缀**** 形态)→ 拒绝提交并指路(填真值或删字段);编辑弹窗文案同步预警。
+- **reauth 单飞**:模块级 in-flight promise(对齐 _initPromise 模式),并发 401 共享一次 requestAuthCode+换证;__resetInitGuard 同步清。**deep-link**:safeDecode(try/catch→空串降级)包 qs/hashParam——boot/capture.ts 在 Vue 挂载前顶层执行,坏参不再 URIError 白屏。
+- **stop 守卫**:经 agentChatBridge 新增 `registerAgentStop` 注入(避免 useAsk→useAgentAsk 反向 import 成环;**可选调用**——组件测试的 bridge mock 只实现最小面,缺方法静默跳过);stop() 对 agent 尾消息委托 stopAgent 断视图语义(run 照跑+轮询兜底,与 activeId watcher 同约定;用户显式停止在 QaView.onStop 早已分流 cancelRun:true)。
+- **小程序串号**:`_restoreLast` 移到 ensureOwner **之后**(登录成功才恢复;登录失败不渲染任何缓存、**刻意不 ensureOwner('anon')**——网络抖动绝不清单人设备本地缓存);_ask/抽屉/设置三登录路径补 owner 复查。**清空标记**:onShow 处理后 `removeStorageSync('session_reset_at')`(settings 只写不读该键;不清则 lastResetAt 每次冷启动归 0 → 永真 → 每次冷启动都静默清空恢复)。
+- **outbox 代次**:新 **schema/049**(generation BIGINT 默认 0,🔒apply user-gated)+MANIFEST 行;enqueue 复活 generation+1、drain SELECT 带走代次、done/attempts 标记按 (id,generation) CAS(落空=mid-drain 复活→不标 done 计 raced,撤销必达);**1054 双路径**——049 未 apply 自动回退旧语义,代码可先部署。
+- **DW 节点**:两个 ontology 节点补 `sys.version_info` 分支(py3.7 钉 requests==2.31.0,对齐 07-17 stage 节点;镜像恢复 3.8+ 自动走现代钉版)。**dedup 退役**:superseded 同时把 dv index_status CAS 进 PENDING_DELETE(已在删除链上的不动)→ reconcile_pending_deletes 删 HA3 PK+灭活 chunk_meta(与控制台退役同一收敛路径,不内联灭活防 reconciler 找不到 PK)。
+- **SAE 安装路径定性=REAL**:requirements.txt 自述即 SAE 两路径(buildpack+启动命令)唯一安装源,floor-only 无哈希,而全部完整性门指向 SAE 不用的 lock/Dockerfile。第一步收敛:顶层依赖 **== 精确钉版对齐 lock 审计版本** + **补 redis==8.0.1**(workers>1 翻 redis 后端时 serving 直接 import,此前缺席=翻 flag 即启动失败);完整 --require-hashes 需展开全量锁、会改 SAE 构建行为,🔒随下次 SAE 重打包先过 staging buildImage 验证。
+
+每批验证:python 新回归 7 条(outbox 代次 4+conftest 门 3,含 harness 升 3 元组+rowcount 脚本化)+前端 spec 4 条(reauth 单飞/坏参 ×2/掩码经 vue-tsc)+vitest 全量 416+miniapp 24+console build(vue-tsc)绿;`make test`+`make lint` 绿。未验证声明:CI 触发生效需下次 push 实测(本提交即验)、掩码拒绝的真机审批流、小程序共享设备真机换号、SAE 钉版 buildImage(下次重打包验证)、049 真库语义(1054 双路径单测覆盖)。🔒user-gated 生效项:049 apply、CI 分支保护 UI、SAE 重打包(requirements 钉版+redis 随包生效)。
 
 ## 批次9 — P3 清扫(49 项,选择性;单独排期)
 - run-1 30 项 + 续跑 16 项 + 改判 3 项(`packing_math:245`/`store:1469`/`spot_checker:686`),台账见审计文档 P3 表。

@@ -40,6 +40,22 @@ def _prod_target_violations():
         ep = getattr(getattr(cfg, "alibaba_vector", None), "endpoint", "") or ""
         if is_prod_target("search", ep):
             violations.append(f"HA3 endpoint={ep!r}")
+    # OSS：simulate_oss 关闭时 bucket 不得命中生产桶（批次8，ultra conftest:34——此前只查
+    # RDS+HA3：RAG_SIMULATE_OSS=false + 生产桶凭证可双闸全过，夹具 put/delete 直打生产 OSS；
+    # 唯一兜底 GuardedBucket 曾漏 copy_object。精确匹配语义见 is_prod_target("oss")：
+    # staging 桶名以生产桶名为前缀，子串匹配会误判）。
+    if not getattr(cfg, "simulate_oss", True):
+        _bucket = getattr(getattr(cfg, "oss", None), "bucket_name", "") or ""
+        if is_prod_target("oss", _bucket):
+            violations.append(f"OSS bucket={_bucket!r}")
+    # 标准 OpenSearch（本地 dev 回退）：simulate_opensearch 关闭时 host 非本地即拒——
+    # 远端写风险与 HA3 同级，而 search 指纹只覆盖 HA3 端点形态，标准 OpenSearch 按本地
+    # 白名单判（local_stack 接线的本地栈 host=localhost 照常放行）。
+    if not cfg.simulate_opensearch:
+        _osh = getattr(getattr(cfg, "opensearch", None), "host", "") or ""
+        _osh_bare = _osh.split("://")[-1].split(":")[0]
+        if _osh and _osh_bare not in _LOCAL_HOSTS:
+            violations.append(f"OpenSearch host={_osh!r}")
     return violations
 
 

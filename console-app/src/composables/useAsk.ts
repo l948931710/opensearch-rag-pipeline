@@ -417,7 +417,21 @@ async function ask(preset?: string, skipUser = false): Promise<void> {
   }
 }
 
+// 批次8（ultra useAsk:433）：agent transport 注册的取消入口（避免 useAsk→useAgentAsk 反向
+// import 成环；useAgentAsk 经 agentChatBridge().registerAgentStop 注入 stopAgent）。
+let _agentStop: ((opts?: { cancelRun?: boolean }) => void) | null = null
+
 function stop(): void {
+  const tail = messages.value[messages.value.length - 1]
+  if (tail && tail.role === 'ai' && tail.agent && _agentStop) {
+    // 批次8：agent 消息归 agent transport（独立 seq/abort/run 状态机）。legacy stop 的
+    // 收尾会把仍在服务端执行的 run 涂成「已取消」错误卡（它的 askSeq/abortCtl 都是
+    // legacy 流的，根本断不掉 agent fetch），用户点重试 = 同问双 run 双答案双计费。
+    // 委托 stopAgent 的断视图语义（run 照跑、转轮询兜底，与 activeId watcher 同一约定；
+    // 用户显式停止按钮在 QaView.onStop 早已分流 cancelRun:true，不经此处）。
+    _agentStop()
+    return
+  }
   askSeq++   // 作废在途流回调
   if (abortCtl) { try { abortCtl.abort() } catch { /* noop */ } abortCtl = null }
   asking.value = false
@@ -737,6 +751,9 @@ export function agentChatBridge() {
     thinking,
     /** 旧路径回退入口（agent 404 时同问重发；skipUser=true 复用已推的用户气泡）。 */
     askLegacy: (q: string) => ask(q, true),
+    /** 批次8：注册 agent 取消入口——useAsk.stop() 对 agent 消息委托它（断视图语义），
+     *  不再用 legacy 收尾把在跑 run 涂成取消错误卡。 */
+    registerAgentStop: (fn: (opts?: { cancelRun?: boolean }) => void) => { _agentStop = fn },
   }
 }
 
@@ -756,6 +773,7 @@ export function __resetAsk(): void {
   hotQuestions.value = []
   askSeq = 0
   abortCtl = null
+  _agentStop = null
   if (_persistTimer) { clearTimeout(_persistTimer); _persistTimer = null }
   __resetIdentityScope()
 }

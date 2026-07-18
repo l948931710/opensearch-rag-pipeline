@@ -12,18 +12,30 @@
 # 恢复全集：git show c411d65:requirements.txt。
 -i https://mirrors.aliyun.com/pypi/simple/
 
+# 批次8（ultra requirements.txt:13 定性）：本文件是**生产 SAE 的真实安装源**（buildpack/
+# 启动命令 pip），而全部完整性门（--require-hashes lock、pip-audit、SBOM、trivy）都指向
+# SAE 不用的 requirements-prod.lock/Dockerfile 路径。第一步收敛：顶层依赖 == 精确钉版并
+# 与 requirements-prod.lock 的审计版本对齐（构建可复现、装的是被审计过的版本）；
+# 传递依赖仍浮动——完整 --require-hashes 需把本文件展开成全量锁（会改变 SAE 构建行为，
+# 须先过一次 staging buildImage 验证，🔒 随下次 SAE 重打包一并做）。升级版本先改 lock
+# 再同步这里。
+
 # HTTP / API Runtime
-requests>=2.31
-fastapi>=0.115
-uvicorn[standard]>=0.30
+requests==2.34.2
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
 
 # 数据面（RDS / OSS / 检索）
-pymysql[rsa]>=1.1       # [rsa]=cryptography：MySQL 8 caching_sha2_password 非 TLS 连接需 RSA 密钥交换
-DBUtils>=3.0
-oss2>=2.18
-alibabacloud-ha3engine-vector>=1.1.18
-opensearch-py>=2.4      # 标准 OpenSearch 后端兜底路径（retriever/clients 懒加载），体积小保留
+pymysql[rsa]==1.2.0     # [rsa]=cryptography：MySQL 8 caching_sha2_password 非 TLS 连接需 RSA 密钥交换
+DBUtils==3.1.2
+oss2==2.19.1
+alibabacloud-ha3engine-vector==1.1.19
+opensearch-py==3.2.0    # 标准 OpenSearch 后端兜底路径（retriever/clients 懒加载），体积小保留
+
+# 状态外置（workers>1 前置）：RAG_SESSION/RATE_LIMIT/MSG_DEDUP/TOKEN_CACHE_BACKEND=redis
+# 时 serving 直接 import redis——此前缺席=多副本 rollout 翻 flag 即启动失败（纯 py 轮子，体积可忽略）
+redis==8.0.1
 
 # DingTalk Stream 模式（出站 WSS 收机器人消息/卡片回调，免公网回调端点；
 # 由 DINGTALK_STREAM_MODE=true 启用，见 dingtalk_stream_runner.py）
-dingtalk-stream>=0.24
+dingtalk-stream==0.24.3

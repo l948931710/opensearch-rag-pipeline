@@ -9,7 +9,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # 批次8（ultra ci.yml:12）：阻断门必须跑在**实际出包的分支**上——生产工作直推
+    # claude/ontology-p0（SAE/DataWorks 包从它切）且无 PR，此前 main-only 触发让
+    # 测试/lint/gitleaks/CVE 审计对 shipped 代码全豁免。claude/** 覆盖全部工作分支。
+    branches: [main, "claude/**"]
   pull_request:
 
 permissions:

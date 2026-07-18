@@ -1,6 +1,7 @@
 // Settings / 我的: read-only profile + 清空会话列表.
 
 import { ensureLogin } from '../../utils/auth';
+import { ensureOwner } from '../../utils/conversations';
 import { clearSession, deleteConversation } from '../../utils/api';
 import { loadIndex, clearAllLocal } from '../../utils/conversations';
 
@@ -48,7 +49,14 @@ Page({
     // trigger login so the profile is populated.
     if (!getApp().globalData.token) {
       ensureLogin()
-        .then(() => this._refreshFromGlobal())
+        .then((g) => {
+          // 批次8：冷启动直落设置页也stamp归属——换号即清他人本地会话缓存，
+          // 之后切到聊天页恢复的一定是本人数据。
+          if (g && g.userId) {
+            ensureOwner(g.userId);
+          }
+          this._refreshFromGlobal();
+        })
         .catch(() => {});
     } else {
       this._refreshFromGlobal();

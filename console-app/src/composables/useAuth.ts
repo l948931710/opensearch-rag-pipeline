@@ -14,10 +14,24 @@ declare global {
 
 /** 单次 init 守卫（修正#6）：App.vue 唯一触发，store/router-guard 不再各自打 authCode（防重复烧配额）。 */
 let _initPromise: Promise<void> | null = null
+/** 批次8：reauth 单飞（并发 401 共享同一次重登）。 */
+let _reauthPromise: Promise<boolean> | null = null
+
+/** 批次8（ultra useAuth:20）：safe decode——畸形转义（?token=abc% 等）会让
+ *  decodeURIComponent 抛 URIError，而 qs/hashParam 经 boot/capture.ts 在 Vue 挂载前的
+ *  模块顶层执行：一个坏 deep-link 参数 = 整个应用 import 期炸掉、永久白屏无错误 UI。
+ *  坏参按「无此参」降级（空串），应用照常走无 token 免登流程。 */
+function safeDecode(v: string): string {
+  try {
+    return decodeURIComponent(v)
+  } catch {
+    return ''
+  }
+}
 
 export function qs(name: string): string {
   const m = new RegExp('[?&]' + name + '=([^&]+)').exec(window.location.search)
-  return m ? decodeURIComponent(m[1]) : ''
+  return m ? safeDecode(m[1]) : ''
 }
 
 /**
@@ -28,7 +42,7 @@ export function qs(name: string): string {
 export function hashParam(name: string): string {
   const h = window.location.hash.replace(/^#/, '')
   const m = new RegExp('(?:^|[&#])' + name + '=([^&]+)').exec(h)
-  return m ? decodeURIComponent(m[1]) : ''
+  return m ? safeDecode(m[1]) : ''
 }
 
 /** 从 fragment 抹除敏感参数（与 scrubUrl 同一防线：不进历史/截图/Referer）。 */
@@ -225,24 +239,33 @@ export function useAuth() {
     return _initPromise
   }
 
-  /** 401 重登：清旧 token，强制重走容器免登一次。成功返回 true。 */
+  /** 401 重登：清旧 token，强制重走容器免登一次。成功返回 true。
+   *  批次8（ultra useAuth:229）单飞：N 路并发 401（App.vue 5 路预载/ManageView 3 路轮询）
+   *  此前各自触发 requestAuthCode + 换 token + 全量身份域清空，互相踩掉刚重载的数据；
+   *  现共享同一 in-flight promise，一次重登所有等待方复用结果。 */
   async function reauth(): Promise<boolean> {
     // dev-preview 哨兵：无钉钉容器，重登必失败，且【绝不能】清掉哨兵 token——否则各 loader 的预览 mock 分支
     //（判 token==='dev-preview'）失效、?preview 数据区段全空。直接返回 false，不清不重登。
     // import.meta.env.DEV 前缀：prod 构建 DEV=false → 整句死代码消除（与 apiFetch 短路一致，不进发布包）。
     if (import.meta.env.DEV && session.token === 'dev-preview') return false
-    try {
-      session.setToken('')
-      clearPersistedToken()   // 旧 token 已证失效：续存一并清，防刷新捡回死 token
-      // P0-D：登出时点先对账——旧身份的注册 store（审批队列/台账/看板等）此刻同步清空，
-      // 重登失败也不残留（fail-closed）；重登成功后 doLogin 内部会再对账一次落定新身份。
-      syncIdentityScope()
-      await doLogin(true)
-      syncHistoryForUser(session.identity?.userId || '')   // 重登为不同用户时清掉前者残留
-      return !!session.token
-    } catch {
-      return false
-    }
+    if (_reauthPromise) return _reauthPromise
+    _reauthPromise = (async () => {
+      try {
+        session.setToken('')
+        clearPersistedToken()   // 旧 token 已证失效：续存一并清，防刷新捡回死 token
+        // P0-D：登出时点先对账——旧身份的注册 store（审批队列/台账/看板等）此刻同步清空，
+        // 重登失败也不残留（fail-closed）；重登成功后 doLogin 内部会再对账一次落定新身份。
+        syncIdentityScope()
+        await doLogin(true)
+        syncHistoryForUser(session.identity?.userId || '')   // 重登为不同用户时清掉前者残留
+        return !!session.token
+      } catch {
+        return false
+      } finally {
+        _reauthPromise = null
+      }
+    })()
+    return _reauthPromise
   }
 
   return { init, reauth }
@@ -251,6 +274,7 @@ export function useAuth() {
 /** 仅供测试：重置单次守卫 + 早捕获暂存 + tab 级 token 续存 + identityScope 已观测身份。 */
 export function __resetInitGuard() {
   _initPromise = null
+  _reauthPromise = null
   _captured = false
   _stashedToken = ''
   _capturedName = ''

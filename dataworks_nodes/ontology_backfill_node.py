@@ -38,7 +38,13 @@ import zipfile
 # ═══════════════════════════════════════════════════════════════
 # PR-D（P0-09）：依赖锁版本——公网未锁版本安装 = 供应链面（构建不可复现 +
 # 上游投毒直进生产 pod）。版本对齐 pyproject 生产档；升级须改这里并重跑 staging。
-DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.32.3"]
+# 批次8（ultra ontology_backfill_node:41）：serverless 执行器实为 py3.7（2026-07-17
+# stage 节点实证），requests==2.32.3 要求 ≥3.8 → pip 第 0 步就死。对齐 stage 节点的
+# 版本分支：py3.7 钉 2.31.0（cp37 实证集），镜像恢复 3.8+ 自动走现代钉版。
+if sys.version_info >= (3, 8):
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.32.3"]
+else:
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.31.0"]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", *DEPS, "-t", "/tmp/pydeps", "-q"
 ])

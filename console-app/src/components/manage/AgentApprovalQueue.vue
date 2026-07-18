@@ -61,6 +61,23 @@ async function onApprove(d: AgentApprovalItem) {
   void decideAgentApproval(d, 'approved')
 }
 
+/** 批次8（ultra AgentApprovalQueue:73）：递归找出仍含脱敏掩码占位（3+ 个 *，对应
+ *  REDACTION_MAP 的 138****5678 / ab***@ / 前缀**** 形态）的字段路径。 */
+function findMaskedFields(obj: Record<string, unknown>, prefix = ''): string[] {
+  const hits: string[] = []
+  for (const [k, v] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${k}` : k
+    if (typeof v === 'string' && /\*{3,}/.test(v)) hits.push(path)
+    else if (Array.isArray(v)) {
+      v.forEach((x, i) => {
+        if (typeof x === 'string' && /\*{3,}/.test(x)) hits.push(`${path}[${i}]`)
+        else if (x && typeof x === 'object') hits.push(...findMaskedFields(x as Record<string, unknown>, `${path}[${i}]`))
+      })
+    } else if (v && typeof v === 'object') hits.push(...findMaskedFields(v as Record<string, unknown>, path))
+  }
+  return hits
+}
+
 /** 第四处置「修改后批准」：编辑脱敏参数 JSON 后以 kind=edited 放行——服务端重过
  *  jsonschema+Policy、按改后参数算 digest（重放安全），执行的就是你看到的这份参数。 */
 async function onEdited(d: AgentApprovalItem) {
@@ -68,7 +85,7 @@ async function onEdited(d: AgentApprovalItem) {
   const { notice } = useDialog()
   const raw = await promptText({
     title: '修改参数后批准',
-    message: `编辑「${d.tool_name}」的执行参数（JSON 对象）。提交即批准执行改后参数：会重新过参数校验与策略，操作不可撤回。`,
+    message: `编辑「${d.tool_name}」的执行参数（JSON 对象）。提交即批准执行改后参数：会重新过参数校验与策略，操作不可撤回。注意：预填值是脱敏后的展示值（*** 为掩码）——请为要保留的敏感字段填入真实值，或删除该字段。`,
     placeholder: '{ "qty": 100 }',
     initial: JSON.stringify(d.proposed_args ?? {}, null, 2),
     maxlength: 2000,
@@ -82,6 +99,18 @@ async function onEdited(d: AgentApprovalItem) {
     parsed = v as Record<string, unknown>
   } catch {
     void notice({ title: '参数格式错误', message: '需要合法的 JSON 对象（如 {"qty": 100}），本次未提交。', danger: true })
+    return
+  }
+  // 批次8：预填来自服务端**脱敏后**的 proposed_args（原文不出库），kind=edited 按提交值
+  // 原样执行——若保留 "138****5678" 这类掩码占位，高危写操作会把掩码当真参跑。
+  // 含掩码字段一律拒绝提交（填真实值或删掉该字段后重试）。
+  const masked = findMaskedFields(parsed)
+  if (masked.length) {
+    void notice({
+      title: '参数仍含脱敏占位符',
+      message: `字段 ${masked.slice(0, 5).join('、')} 仍是脱敏掩码值（含 ***）。改参会按提交值原样执行——请填入真实值，或删除不需要修改的字段后重试。`,
+      danger: true,
+    })
     return
   }
   void decideAgentApproval(d, 'edited', undefined, parsed)

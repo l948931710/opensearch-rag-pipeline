@@ -179,6 +179,11 @@ const _runMsgIndex = new Map<string, ChatMessage>()
 const _runStateKeys = new Map<string, string>()
 
 const bridge = agentChatBridge()
+// 批次8（ultra useAsk:433）：把本模块的 stopAgent 注入 legacy stop()——会话切换/新建/删除
+// 同步调的 legacy stop 不再把在跑 agent run 涂成取消错误卡（function 声明提升，此处可引用）。
+// 可选调用：组件测试对 agentChatBridge 的 mock 只实现最小面（useAsk mock 集成缝，见 memory），
+// 缺该方法时静默跳过（等价旧行为，绝不让 mock 面扩张成硬契约）。
+bridge.registerAgentStop?.(stopAgent)
 const { asking, draft, messages, conversations, activeId } = useAsk()
 
 function isAgentBusy(key: string): boolean { return inflight.value.has(key) }
