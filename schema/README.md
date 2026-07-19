@@ -84,6 +84,7 @@ apply 脚本落库并记台账。
 | 050_qa_rewritten_query.sql | fuling_operation | 多轮追问检索前改写（RAG_FOLLOWUP_REWRITE 默认关，2026-07-18）：qa_session_log.rewritten_query 存改写后的独立问题（脱敏后）——写侧 qa_logger 落列（1054 **TTL** 负缓存降级，apply 后无须重启恢复；改写行 question_hash 改按改写后文本计算）；读侧 kb_gaps 对本列 1054 回退无列 SQL（**代码可先行**）；无存量 backfill |
 | 051_dingtalk_msg_dedup.sql | fuling_operation | 钉钉消息 msgId 去重 RDS 兜底（B7-P2-04 四态机，2026-07-18）：msg_id 主键+state/attempts/message_id——主层（memory/redis）失效时的第二层幂等；写侧 dingtalk_bot（1146 负缓存 1h 降级，**先部署后 apply 安全**）；kill switch RAG_MSG_DEDUP_RDS_FALLBACK（默认开、simulate 关）；无存量 backfill |
 | 052_agent_run_dispatch_bind.sql | fuling_operation | command→run 反向锚（R1 RB-RT-01，2026-07-18）：agent_run.dispatch_command_id + UNIQUE——建 run 事务内原子绑定，恢复扫描先查后建（rebind 不重驱）、并发双建由 1062 裁决单赢家；create_run 对 1054 容错回退（**代码可先行**）；RAG_AGENT_DURABLE_DISPATCH 开启前必须 apply（readiness 契约探针含本列） |
+| 053_tool_invocation_reconcile.sql | fuling_operation | uncertain 对账退避/隔离（R3 P1-RT-09，2026-07-18）：tool_invocation.reconcile_attempts + next_reconcile_at + 复合索引——毒头阻塞根治（unknown 指数退避 30s..1h、达上限 20 隔离出扫描面）；lister/更新 1054 容错（**代码可先行**）；无存量 backfill |
 
 ## 台账（schema_migrations）
 

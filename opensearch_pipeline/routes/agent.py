@@ -222,6 +222,22 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
                         "agent run 收尸：stale-running→failed %s · suspended→expired %s · "
                         "stale-resuming→suspended %s（B6 可重驱）",
                         rep.get("failed"), rep.get("expired"), rep.get("resuming_reset"))
+                # R3（P1-RT-08 合同显式化）：mid-run crash 的**书面 SLO**=「in-flight run
+                # 判失败、用户重试」——检测上限 = 心跳 stale（RAG_AGENT_STALE_RUNNING_S，
+                # 默认 15min）+ reaper 周期（默认 5min）≈ **20 分钟内必收尸**；不做
+                # checkpoint 自动 replay（重放语义与工具副作用 fence 未建，宣称 durable
+                # execution 前不越界——ARR P1-RT-08 修法二+SLA）。收尸即 ops 告警。
+                if rep.get("failed"):
+                    try:
+                        from opensearch_pipeline.alerting import send_ops_alert
+                        send_ops_alert(
+                            "agent mid-run 崩溃收尸",
+                            f"{rep['failed']} 个 run 心跳超时判 failed（进程崩溃/滚动"
+                            f"发布中断）——用户侧表现为无响应后失败，需重试；"
+                            f"频发请查 SAE 实例稳定性",
+                            severity="warning", dedup_key="agent-reap-failed")
+                    except Exception:   # noqa: BLE001 — 告警失败不影响收尸
+                        pass
             except Exception:   # noqa: BLE001
                 logger.warning("agent run 收尸失败（下轮重试）", exc_info=True)
             # P0-E：stale executing invocation → uncertain（进程崩溃僵尸进人工对账通道，
@@ -1963,7 +1979,7 @@ def agent_run_events(run_id: str, request: Request,
     if identity is None:
         raise HTTPException(status_code=401, detail="需要登录")
     from opensearch_pipeline.agent_runtime.event_relay import (
-        has_stream, relay_enabled, stream_run_events)
+        has_stream, relay_enabled, resolve_start_id, stream_run_events)
     if not relay_enabled():
         raise HTTPException(status_code=404, detail="事件中继未启用")
     _enforce_rate_limit(request, identity, scope="ask", thinking=False, count_llm=False)
@@ -1998,33 +2014,50 @@ def agent_run_events(run_id: str, request: Request,
         except Exception:   # noqa: BLE001 — 探针失败按未终态（保守继续尾随）
             return False
 
+    # R3（P1-RT-05）：断线续读游标——消费标准 Last-Event-ID（或 ?last_event_id=，
+    # EventSource polyfill 场景）；游标被 MAXLEN 截掉/流缺失 → reset 协议（先发
+    # event: reset，客户端清屏后按 id 去重收全量重放，杜绝「既重复又缺字」拼接）。
+    _leid = (request.headers.get("last-event-id")
+             or request.query_params.get("last_event_id") or "")
+    _start_id, _reset = resolve_start_id(run_id, _leid.strip() or None)
+
+    def _emit(d: dict, payload: dict):
+        rid = d.get("_relay_id")
+        prefix = f"id: {rid}\n" if rid else ""
+        return prefix + _sse(payload)
+
     def _gen():
         try:
-            for d in stream_run_events(run_id, is_terminal_fn=_run_is_terminal):
+            for d in stream_run_events(run_id, is_terminal_fn=_run_is_terminal,
+                                       start_id=_start_id, announce_reset=_reset):
                 t = d.get("type")
+                if t == "__reset__":
+                    yield "event: reset\ndata: {}\n\n"
+                    continue
                 if t == "model_delta":
                     if d.get("text"):   # A7：空 delta 不回放（与 /ask 实时流同 guard）
-                        yield _sse({"type": "chunk", "content": d["text"]})
+                        yield _emit(d, {"type": "chunk", "content": d["text"]})
                 elif t == "tool_call_proposed":
-                    yield _sse({"type": "tool_call", "call_id": d.get("call_id"),
-                                "tool_name": d.get("tool_name"),
-                                "arguments": d.get("arguments")})
+                    yield _emit(d, {"type": "tool_call", "call_id": d.get("call_id"),
+                                   "tool_name": d.get("tool_name"),
+                                   "arguments": d.get("arguments")})
                 elif t == "tool_result":
-                    yield _sse({"type": "tool_result", "call_id": d.get("call_id"),
-                                "tool_name": d.get("tool_name"), "status": d.get("status"),
-                                "elapsed_ms": d.get("elapsed_ms", 0)})
+                    yield _emit(d, {"type": "tool_result", "call_id": d.get("call_id"),
+                                   "tool_name": d.get("tool_name"),
+                                   "status": d.get("status"),
+                                   "elapsed_ms": d.get("elapsed_ms", 0)})
                 elif t == "run_suspended":
-                    yield _sse({"type": "approval",
-                                "approval_request_id": d.get("approval_request_id"),
-                                "checkpoint_id": d.get("checkpoint_id"),
-                                "pending_call": d.get("pending_call")})
+                    yield _emit(d, {"type": "approval",
+                                   "approval_request_id": d.get("approval_request_id"),
+                                   "checkpoint_id": d.get("checkpoint_id"),
+                                   "pending_call": d.get("pending_call")})
                 elif t == "run_completed":
                     if d.get("final_text") and not d.get("streamed"):
-                        yield _sse({"type": "chunk", "content": d["final_text"]})
-                    yield _sse({"type": "done", "usage": d.get("usage") or {}})
+                        yield _emit(d, {"type": "chunk", "content": d["final_text"]})
+                    yield _emit(d, {"type": "done", "usage": d.get("usage") or {}})
                 elif t == "run_failed":
-                    yield _sse({"type": "error",
-                                "message": f"Agent 运行失败: {(d.get('error') or '')[:200]}"})
+                    yield _emit(d, {"type": "error",
+                                   "message": f"Agent 运行失败: {(d.get('error') or '')[:200]}"})
         except GeneratorExit:
             raise
         except Exception:   # noqa: BLE001

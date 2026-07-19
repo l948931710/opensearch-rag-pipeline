@@ -475,7 +475,11 @@ def test_list_uncertain_for_reconcile_sql_shape(monkeypatch):
     assert store.list_uncertain_invocations_for_reconcile(min_age_s=120, limit=7) == []
     sql, params = log[0]
     assert "status='uncertain'" in sql and "INTERVAL %s SECOND" in sql
-    assert params == (120, 7)
+    # R3（P1-RT-09）：退避门——attempts 上限 + next_reconcile_at 到期排序（毒头不阻塞）
+    assert "reconcile_attempts < %s" in sql
+    assert "next_reconcile_at IS NULL OR next_reconcile_at <= NOW(3)" in sql
+    assert "COALESCE(next_reconcile_at, ended_at)" in sql
+    assert params == (120, 20, 7)
 
 
 # ── 真库契约（本地 MySQL；无库/无表整体 skip，host-pin 绝不写 staging/prod）────────

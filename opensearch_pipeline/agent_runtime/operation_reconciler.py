@@ -49,7 +49,28 @@ def reconcile_uncertain_invocations(run_store, registry, *,
     """跑一轮自动对账。返回计数（观测/测试用）：
     succeeded/failed=已处置；unknown=查证不能（留人工）；skipped=工具无 check_operation
     或已不在 registry；lost=CAS 输给并发处置（人工先手）——皆非错误。"""
-    counts = {"succeeded": 0, "failed": 0, "unknown": 0, "skipped": 0, "lost": 0}
+    counts = {"succeeded": 0, "failed": 0, "unknown": 0, "skipped": 0, "lost": 0,
+              "deferred": 0, "quarantined": 0}
+    _max_att = _int_env("RAG_AGENT_RECONCILE_MAX_ATTEMPTS", 20)
+    _defer = getattr(run_store, "defer_reconcile", None)
+
+    def _backoff_row(row, why):
+        """R3（P1-RT-09）：查不清/不支持的行指数退避（30s..1h），达上限即隔离出
+        扫描面（quarantined 上浮，人工通道兜底）——毒头不再永久霸占最老 LIMIT 批。"""
+        if _defer is None:
+            return
+        att = int(row.get("reconcile_attempts") or 0) + 1
+        delay = min(3600, 30 * (2 ** min(att, 7)))
+        try:
+            _defer(row.get("invocation_id"), attempts=att, delay_s=delay)
+            counts["deferred"] += 1
+            if att >= _max_att:
+                counts["quarantined"] += 1
+                logger.error("对账隔离：invocation %s（%s，%s）尝试 %d 次仍不可判——"
+                             "移出自动扫描面，转人工通道",
+                             row.get("invocation_id"), row.get("tool_name"), why, att)
+        except Exception:   # noqa: BLE001
+            pass
     lister = getattr(run_store, "list_uncertain_invocations_for_reconcile", None)
     resolver = getattr(run_store, "resolve_uncertain_invocation", None)
     if lister is None or resolver is None or registry is None:
@@ -69,6 +90,7 @@ def reconcile_uncertain_invocations(run_store, registry, *,
             op_id = row.get("operation_id")
             if not callable(checker) or not op_id:
                 counts["skipped"] += 1
+                _backoff_row(row, "无 checker/资格章")
                 continue
             probe: Dict[str, Any] = checker(op_id) or {}
             outcome = probe.get("outcome")
@@ -78,6 +100,7 @@ def reconcile_uncertain_invocations(run_store, registry, *,
                 to_status = "failed"
             else:
                 counts["unknown"] += 1
+                _backoff_row(row, f"outcome={outcome}")
                 continue
             note = f"自动查证 {outcome}: {probe.get('detail') or '-'}"
             receipt = probe.get("receipt")

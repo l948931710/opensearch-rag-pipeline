@@ -59,3 +59,4 @@
 050_qa_rewritten_query.sql operation
 051_dingtalk_msg_dedup.sql operation
 052_agent_run_dispatch_bind.sql operation
+053_tool_invocation_reconcile.sql operation

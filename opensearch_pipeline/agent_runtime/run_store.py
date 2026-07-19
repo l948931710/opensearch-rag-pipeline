@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -1092,19 +1093,65 @@ class RDSRunStore:
         db = _op_db()
         conn = self._conn()
         try:
+            # R3（P1-RT-09）：退避门——到期行优先、隔离行（attempts 达上限）出扫描面，
+            # 毒头不再霸占批次；053 未 apply（1054）回退旧「最老 LIMIT」语义。
+            _max_att = 20
+            try:
+                _max_att = int(os.environ.get("RAG_AGENT_RECONCILE_MAX_ATTEMPTS", "20") or 20)
+            except ValueError:
+                pass
             with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT invocation_id, tool_name, run_id, operation_id "
-                    f"FROM {db}.tool_invocation "
-                    "WHERE status='uncertain' AND operation_id IS NOT NULL "
-                    "AND ended_at < DATE_SUB(NOW(3), INTERVAL %s SECOND) "
-                    "ORDER BY ended_at LIMIT %s",
-                    (int(min_age_s), max(1, min(int(limit), 200))))
-                rows = cur.fetchall() or []
+                try:
+                    cur.execute(
+                        f"SELECT invocation_id, tool_name, run_id, operation_id, "
+                        f"reconcile_attempts FROM {db}.tool_invocation "
+                        "WHERE status='uncertain' AND operation_id IS NOT NULL "
+                        "AND ended_at < DATE_SUB(NOW(3), INTERVAL %s SECOND) "
+                        "AND reconcile_attempts < %s "
+                        "AND (next_reconcile_at IS NULL OR next_reconcile_at <= NOW(3)) "
+                        "ORDER BY COALESCE(next_reconcile_at, ended_at) LIMIT %s",
+                        (int(min_age_s), _max_att, max(1, min(int(limit), 200))))
+                    rows = cur.fetchall() or []
+                    return [{"invocation_id": r[0], "tool_name": r[1], "run_id": r[2],
+                             "operation_id": r[3], "reconcile_attempts": int(r[4] or 0)}
+                            for r in rows]
+                except Exception as e:   # noqa: BLE001
+                    if not _is_unknown_column_error(e):
+                        raise
+                    cur.execute(
+                        f"SELECT invocation_id, tool_name, run_id, operation_id "
+                        f"FROM {db}.tool_invocation "
+                        "WHERE status='uncertain' AND operation_id IS NOT NULL "
+                        "AND ended_at < DATE_SUB(NOW(3), INTERVAL %s SECOND) "
+                        "ORDER BY ended_at LIMIT %s",
+                        (int(min_age_s), max(1, min(int(limit), 200))))
+                    rows = cur.fetchall() or []
             return [{"invocation_id": r[0], "tool_name": r[1], "run_id": r[2],
-                     "operation_id": r[3]} for r in rows]
+                     "operation_id": r[3], "reconcile_attempts": 0} for r in rows]
         finally:
             conn.close()
+
+
+    def defer_reconcile(self, invocation_id: str, *, attempts: int, delay_s: int) -> None:
+        """R3（P1-RT-09）：unknown/unsupported 行退避——记尝试数+下次可扫时间
+        （达上限即被 lister 的 attempts 门隔离出扫描面）。053 未 apply（1054）静默 no-op
+        （回退旧行为）；其余失败 fail-open（对账是辅助通道）。"""
+        db = _op_db()
+        try:
+            conn = self._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE {db}.tool_invocation SET reconcile_attempts=%s, "
+                        "next_reconcile_at=DATE_ADD(NOW(3), INTERVAL %s SECOND) "
+                        "WHERE invocation_id=%s AND status='uncertain'",
+                        (int(attempts), int(delay_s), invocation_id))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:   # noqa: BLE001
+            if not _is_unknown_column_error(e):
+                logger.warning("对账退避写入失败（忽略）: %s", e)
 
     def list_invocations(self, *, status: Optional[str] = None, run_id: Optional[str] = None,
                          limit: int = 50) -> "list":
