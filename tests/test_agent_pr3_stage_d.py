@@ -333,7 +333,11 @@ class TestTopologyGuardStageD:
                  RAG_SESSION_BACKEND="redis", RAG_RATE_LIMIT_BACKEND="redis",
                  RAG_MSG_DEDUP_BACKEND="redis", RAG_TOKEN_CACHE_BACKEND="redis",
                  # B1 P1-06 后：prod+agent-on 形态须连带开 guard（本组专测拓扑守卫）
-                 RAG_PROMPT_INJECTION_GUARD="true")
+                 RAG_PROMPT_INJECTION_GUARD="true",
+                 # R2 P1-RT-07 后：prod+agent-on 另须 checkpoint 安全三件
+                 RAG_AGENT_CHECKPOINT_KEY="ck-test-key",
+                 RAG_AGENT_CHECKPOINT_REQUIRE_HMAC="true",
+                 RAG_AGENT_CHECKPOINT_ENCRYPT="true")
 
     def test_multireplica_agent_without_durable_dispatch_raises(self):
         with pytest.raises(ValueError, match="RAG_AGENT_DURABLE_DISPATCH"):

@@ -570,7 +570,11 @@ class ThreadedRunExecutor:
                     # 状态迁移收进**同一事务**（suspend_run_atomic）——不再有半态。
                     # ⚠️ 迁移必须成功才发 approval 帧：迁移被吞时 run 行仍 running、审批端从此 409，
                     # 成为无驱动僵尸而用户以为在等审批（深度审查 B 组）。
-                    cp_id, aid, transitioned = self._persist_suspend(ctx, run_id, ev)
+                    cp_id, aid, transitioned = self._persist_suspend(
+                        ctx, run_id, ev,
+                        budget_counts={"turns": turns_counted,
+                                       "tool_calls": tool_calls_used,
+                                       "tokens": tokens_used})
                     if not transitioned and not self._transition_checked(run_id, "running", "suspended"):
                         handle._emit(RunFailed(error="挂起状态落库失败，请重试", retryable=True))
                         # 批次4（ultra executor:531）：失败侧回调补 D3 归属栅栏（对齐 567-571/
@@ -762,7 +766,8 @@ class ThreadedRunExecutor:
             logging.getLogger(__name__).warning("run on_failure 回调失败", exc_info=True)
 
     def _persist_suspend(self, ctx: ExecutionContext, run_id: Optional[str],
-                         ev: RunSuspended) -> tuple:
+                         ev: RunSuspended,
+                         budget_counts: Optional[dict] = None) -> tuple:
         """挂起持久化：encode loop 带来的状态（messages+pending_call+remaining_calls）；
         写 approval_request（schema/025，接了 approval_store 时 **fail-closed**——写不成即抛，
         调用方把 run 落 failed，绝不产生审批队列不可见的黑洞 run）；记 approval agent_step
@@ -794,10 +799,17 @@ class ThreadedRunExecutor:
                     approval_store.insert_request(cur, run_id, ctx, pending_call,
                                                   request_id=aid)
                 extra = _extra
-            cp_id, ok = self._store.suspend_run_atomic(
-                run_id, blob, digest,
-                step_payload={"pending_call": pc, "approval_request_id": aid},
-                extra_writer=extra)
+            try:
+                cp_id, ok = self._store.suspend_run_atomic(
+                    run_id, blob, digest,
+                    step_payload={"pending_call": pc, "approval_request_id": aid},
+                    extra_writer=extra,
+                    budget_counts=budget_counts)   # R2 P1-RT-06：权威计数随挂起同事务
+            except TypeError:                      # 旧签名 store（测试桩）：无预算参数
+                cp_id, ok = self._store.suspend_run_atomic(
+                    run_id, blob, digest,
+                    step_payload={"pending_call": pc, "approval_request_id": aid},
+                    extra_writer=extra)
             return cp_id, aid, ok
 
         cp_id = self._store.save_checkpoint(run_id, blob, digest)

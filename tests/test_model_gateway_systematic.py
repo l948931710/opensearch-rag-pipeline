@@ -197,15 +197,28 @@ def test_generic_exception_retries_then_falls_back():
 
 
 def test_deadline_expiry_between_retries_stops_retrying(monkeypatch):
-    """重试间隙 deadline 过期 → 停止重试沿链收尾（fail-closed 不止在进门处生效）。"""
+    """重试间隙 deadline 过期 → 停止重试（R2 P1-RT-03 后判定点有两处）：
+    ① attempt 顶部（睡醒重查）过期 → BudgetExceeded，注定失败的请求不出门；
+    ② 重试分支判定过期 → 沿链收尾 ModelUnavailable（旧语义保留）。"""
+    from opensearch_pipeline.agent_runtime.model_gateway import BudgetExceeded
+    # ① 睡醒重查：入口F · attempt1顶F · 重试判F(睡) · attempt2顶T ⇒ 第 2 枪不出门
     p = _P("a", errors=[ModelError("x", retryable=True)] * 10)
     gw = ModelGateway({"a": p}, routes={"default": [("a", "m")]},
                       max_retries=3, sleep_fn=lambda s: None)
-    gates = iter([False, False, True])             # 进门放行 · 重试1放行 · 重试2拒绝
+    gates = iter([False, False, False, True])
     monkeypatch.setattr(gw, "_deadline_exceeded", lambda ctx, now=None: next(gates, True))
-    with pytest.raises(ModelUnavailable):
+    with pytest.raises(BudgetExceeded):
         gw.complete(_ctx(), "default", ChatRequest(messages=[]))
-    assert p.calls == 2, "deadline 过期后不得再发起第 3 次尝试"
+    assert p.calls == 1, "deadline 过期后第 2 枪不得出门（attempt 前重查）"
+    # ② 重试分支判定：入口F · a1顶F · 重试判T ⇒ 不再重试、沿链收尾
+    p2 = _P("a", errors=[ModelError("x", retryable=True)] * 10)
+    gw2 = ModelGateway({"a": p2}, routes={"default": [("a", "m")]},
+                       max_retries=3, sleep_fn=lambda s: None)
+    gates2 = iter([False, False, True])
+    monkeypatch.setattr(gw2, "_deadline_exceeded", lambda ctx, now=None: next(gates2, True))
+    with pytest.raises(ModelUnavailable):
+        gw2.complete(_ctx(), "default", ChatRequest(messages=[]))
+    assert p2.calls == 1
 
 
 def test_tier_params_empty_dict_injects_nothing():
@@ -213,7 +226,9 @@ def test_tier_params_empty_dict_injects_nothing():
     p = _P("a")
     gw = ModelGateway({"a": p}, routes={"serving": [("a", "m")]}, tier_params={})
     gw.complete(_ctx(), "serving", ChatRequest(messages=[], extra={"stream": False}))
-    assert p.reqs[0].extra == {"stream": False}
+    # R2 后 _transport_timeout_s 等下划线传输键由 gateway 注入（不进 provider 请求体）
+    assert {k: v for k, v in p.reqs[0].extra.items()
+            if not k.startswith("_")} == {"stream": False}
 
 
 # ═══ 流式边界 ═══════════════════════════════════════════════════

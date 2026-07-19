@@ -144,8 +144,21 @@ class DashScopeProvider:
         if req.tools:
             body["tools"] = req.tools
             body["tool_choice"] = "auto"
-        body.update(req.extra)
+        # R2（P1-RT-03）：下划线前缀 extras=传输层参数（如 _transport_timeout_s），
+        # 只给客户端消费，绝不进 provider 请求体
+        body.update({k: v for k, v in req.extra.items() if not str(k).startswith("_")})
         return body
+
+    def _effective_timeout(self, req: ChatRequest) -> float:
+        """R2（P1-RT-03）：HTTP 超时钳到 run 剩余 deadline（gateway 注入
+        _transport_timeout_s）——deadline 只剩 5s 时不再挂 60s 连接白等。地板 1s。"""
+        try:
+            rem = req.extra.get("_transport_timeout_s")
+            if rem is not None:
+                return max(1.0, min(self._timeout, float(rem)))
+        except Exception:   # noqa: BLE001
+            pass
+        return self._timeout
 
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
@@ -154,7 +167,7 @@ class DashScopeProvider:
         url = f"{self._base}/chat/completions"
         try:
             resp = _http_post(url, json=self._body(model, req), headers=self._headers(),
-                              timeout=self._timeout)
+                              timeout=self._effective_timeout(req))
         except Exception as e:   # 连接/超时 → 可重试
             raise ModelError(f"dashscope 传输失败: {e}", retryable=True) from e
         if resp.status_code != 200:
@@ -177,7 +190,7 @@ class DashScopeProvider:
         body["stream_options"] = {"include_usage": True}
         try:
             resp = _http_post(url, json=body, headers=self._headers(),
-                              timeout=self._timeout, stream=True)
+                              timeout=self._effective_timeout(req), stream=True)
         except Exception as e:
             raise ModelError(f"dashscope 传输失败: {e}", retryable=True) from e
         if resp.status_code != 200:
@@ -387,8 +400,24 @@ class ModelGateway:
         cur = now if isinstance(now, _dt.datetime) else _dt.datetime.now(_dt.timezone.utc)
         return ctx.budget.is_past_deadline(cur)
 
+    def _attempt_req(self, ctx: ExecutionContext, req: ChatRequest,
+                     now: Optional[Any] = None) -> ChatRequest:
+        """R2（P1-RT-03）：每次 provider attempt 前把**剩余** deadline 注入传输参数
+        （provider 的 HTTP timeout 钳到 min(配置, 剩余)）。无 deadline → 原样。"""
+        if ctx.budget.deadline is None:
+            return req
+        import dataclasses
+        import datetime as _dt
+        cur = now if isinstance(now, _dt.datetime) else _dt.datetime.now(_dt.timezone.utc)
+        try:
+            rem = (ctx.budget.deadline - cur).total_seconds()
+        except Exception:   # noqa: BLE001 — tz/类型异常不碍调用
+            return req
+        return dataclasses.replace(
+            req, extra={**req.extra, "_transport_timeout_s": max(1.0, rem)})
+
     def complete(self, ctx: ExecutionContext, category: str, req: ChatRequest,
-                 now: Optional[float] = None) -> ChatResponse:
+                 now: Optional[float] = None, *, on_attempt=None) -> ChatResponse:
         if self._deadline_exceeded(ctx, now):
             raise BudgetExceeded(f"run {ctx.run_id} 已超 deadline")
 
@@ -409,9 +438,16 @@ class ModelGateway:
                 continue
             # 同一 provider **退避重试**（瞬时 429/5xx/传输）；耗尽才沿链 fallback。
             for attempt in range(self._max_retries + 1):
+                # R2（P1-RT-03）：**每次 attempt 前**重查 deadline——退避睡醒/换链后
+                # 预算可能已过期，注定不该发的请求不再出门（评审探针 provider_calls=2 翻绿）
+                if self._deadline_exceeded(ctx, now):
+                    raise BudgetExceeded(
+                        f"run {ctx.run_id} 已超 deadline（attempt 前重查）")
+                if on_attempt is not None:
+                    on_attempt()   # R2（P1-RT-04）：按实际 provider attempt 计量/限流
                 t0 = time.monotonic()
                 try:
-                    resp = provider.chat(model, req)
+                    resp = provider.chat(model, self._attempt_req(ctx, req, now))
                     self._breaker.record_success(key)
                     self._record_call(ctx, category, provider_name, model, resp.usage,
                                       int((time.monotonic() - t0) * 1000), "ok")
@@ -443,7 +479,7 @@ class ModelGateway:
         raise ModelUnavailable(f"category={category} 整条链不可用: {last_err}")
 
     def complete_stream(self, ctx: ExecutionContext, category: str, req: ChatRequest,
-                        now: Optional[float] = None):
+                        now: Optional[float] = None, *, on_attempt=None):
         """真流式：生成器 yield StreamDelta，return 最终 ChatResponse。
 
         与 complete() 同一套 deadline/熔断/退避/记账语义，唯一分叉在重试边界：
@@ -479,13 +515,21 @@ class ModelGateway:
                 # 同步退化：本链路项无流式能力 → 走 chat（沿用 complete 的单项重试语义）
                 stream_fn = None
             for attempt in range(self._max_retries + 1):
+                # R2（P1-RT-03/04）：每 attempt 前重查 deadline + 按 attempt 计量
+                # （与 complete 同款；仅首增量前的 attempt 会走到这里）
+                if self._deadline_exceeded(ctx, now):
+                    raise BudgetExceeded(
+                        f"run {ctx.run_id} 已超 deadline（attempt 前重查）")
+                if on_attempt is not None:
+                    on_attempt()
                 t0 = time.monotonic()
                 emitted = False
+                _areq = self._attempt_req(ctx, req, now)
                 try:
                     if stream_fn is None:
-                        resp = provider.chat(model, req)
+                        resp = provider.chat(model, _areq)
                     else:
-                        gen = stream_fn(model, req)
+                        gen = stream_fn(model, _areq)
                         resp = None
                         while True:
                             try:
@@ -683,21 +727,47 @@ def make_model_fn(gateway: ModelGateway, ctx: ExecutionContext,
             except Exception:   # noqa: BLE001 — 记数失败不碍调用（post-call 复判仍在）
                 pass
 
+    # R2（P1-RT-04）：计量从「每逻辑轮 1 次」改为「每实际 provider attempt 1 次」——
+    # retry/fallback 的 HTTP 尝试逐次过限流/成本闸（此前记账 1 次、供应商可被打 2-4 次，
+    # cap 被重试放大绕过）。经 gateway on_attempt 钩子注入；旧签名 gateway（测试桩）
+    # 按签名探测回退「每逻辑轮 1 次」旧语义（不双扣）。
+    def _supports_on_attempt(fn) -> bool:
+        try:
+            import inspect
+            return "on_attempt" in inspect.signature(fn).parameters
+        except Exception:   # noqa: BLE001
+            return False
+
+    _attempt_hook = (lambda: _charge_model_call(ctx, category)) if charge_llm else None
+
     if not use_stream:
+        _per_attempt = _supports_on_attempt(gateway.complete)
+
         def _model_fn(msgs: List[Msg], tools: List[ToolSpec]) -> ModelTurn:
-            if charge_llm:
-                _charge_model_call(ctx, category)
-            resp = gateway.complete(ctx, category, _precall_guard(_req(msgs, tools)))
+            if _per_attempt:
+                resp = gateway.complete(ctx, category, _precall_guard(_req(msgs, tools)),
+                                        on_attempt=_attempt_hook)
+            else:
+                if charge_llm:
+                    _charge_model_call(ctx, category)
+                resp = gateway.complete(ctx, category, _precall_guard(_req(msgs, tools)))
             _track(resp)
             return _resp_to_turn(resp)
         return _model_fn
 
+    _per_attempt_s = _supports_on_attempt(gateway.complete_stream)
+
     def _model_stream_fn(msgs: List[Msg], tools: List[ToolSpec]):
         def _gen():
-            if charge_llm:
-                _charge_model_call(ctx, category)   # 生成器体：首个 next() 时（即真调用前）扣
-            resp = yield from gateway.complete_stream(ctx, category,
-                                                      _precall_guard(_req(msgs, tools)))
+            if _per_attempt_s:
+                resp = yield from gateway.complete_stream(
+                    ctx, category, _precall_guard(_req(msgs, tools)),
+                    on_attempt=_attempt_hook)
+            else:
+                if charge_llm:
+                    _charge_model_call(ctx, category)   # 旧桩：首个 next() 时扣（每逻辑轮）
+                resp = yield from gateway.complete_stream(ctx, category,
+                                                          _precall_guard(_req(msgs, tools)))
             _track(resp)
             return _resp_to_turn(resp)
         return _gen()

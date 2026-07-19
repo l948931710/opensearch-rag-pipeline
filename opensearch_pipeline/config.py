@@ -1070,6 +1070,29 @@ def load_config() -> PipelineConfig:
             f"（注意：guard 改变 L7 评测 regime，生产开启需随 agent 基线 refreeze 一并生效）。"
         )
 
+    # 【R2 P1-RT-07，ARR 外审 2026-07-18】checkpoint 含完整对话+工具载荷（高 PII 明文
+    # blob，保留可达 3 个月）——生产开 agent 必须三件齐：专用 HMAC 密钥（不许从会话
+    # 密钥派生：一钥两用扩大泄漏半径）+ 强制验签（防篡改旧 checkpoint 注入 HIGH_WRITE
+    # resume）+ 静态加密。与 P1-06 同级 fail-fast；loop 层另有「生产加密失败不退明文」
+    # 运行时硬化（双保险）。
+    if _env_label_prod and os.environ.get("RAG_AGENT_ENABLE",
+                                          "").strip().lower() in ("1", "true", "yes", "on"):
+        _ckpt_missing = []
+        if not os.environ.get("RAG_AGENT_CHECKPOINT_KEY", "").strip():
+            _ckpt_missing.append("RAG_AGENT_CHECKPOINT_KEY（专用密钥）")
+        if os.environ.get("RAG_AGENT_CHECKPOINT_REQUIRE_HMAC",
+                          "").strip().lower() not in ("1", "true", "yes", "on"):
+            _ckpt_missing.append("RAG_AGENT_CHECKPOINT_REQUIRE_HMAC=true")
+        if os.environ.get("RAG_AGENT_CHECKPOINT_ENCRYPT",
+                          "").strip().lower() not in ("1", "true", "yes", "on"):
+            _ckpt_missing.append("RAG_AGENT_CHECKPOINT_ENCRYPT=true")
+        if _ckpt_missing:
+            raise ValueError(
+                f"🚨 [PRODUCTION SECURITY GUARD] '{config.environment}' 环境开启了 "
+                f"RAG_AGENT_ENABLE 但 checkpoint 安全三件未齐：{'; '.join(_ckpt_missing)}"
+                f"——checkpoint 是高 PII 明文 blob，生产必须专用密钥+强制验签+静态加密"
+                f"（R2 P1-RT-07）。")
+
     # 【B3 P2-01，生产级外审 2026-07-17】上传签名密钥独立性：未配 RAG_UPLOAD_SIGNING_KEY
     # 时 auth_token 回退会话密钥（一钥两用扩大泄漏半径）。typ 双向拒斥已闭环跨型伪造，
     # 故**告警不阻断**（硬断随 SAE env 落地=B7，避免重部署 brick）；readiness

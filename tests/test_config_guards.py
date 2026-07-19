@@ -282,8 +282,48 @@ class TestAgentInjectionGuardPosture:
     def test_production_agent_on_guard_on_passes(self):
         cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
                           RAG_DASHSCOPE_API_KEY="sk-test", RAG_AGENT_ENABLE="true",
-                          RAG_PROMPT_INJECTION_GUARD="true")
+                          RAG_PROMPT_INJECTION_GUARD="true",
+                          RAG_AGENT_CHECKPOINT_KEY="ck-test-key",
+                          RAG_AGENT_CHECKPOINT_REQUIRE_HMAC="true",
+                          RAG_AGENT_CHECKPOINT_ENCRYPT="true")
         assert cfg.rag.prompt_injection_guard is True
+
+
+class TestAgentCheckpointPosture:
+    """【R2 P1-RT-07，ARR 外审 2026-07-18】prod/staging 开 agent ⇒ checkpoint
+    专用密钥+强制验签+静态加密三件必须齐（高 PII blob 不许明文/可篡改）。"""
+
+    _OK = dict(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+               RAG_DASHSCOPE_API_KEY="sk-test", RAG_AGENT_ENABLE="true",
+               RAG_PROMPT_INJECTION_GUARD="true")
+
+    def test_missing_all_three_raises_and_names_them(self):
+        with pytest.raises(ValueError) as ei:
+            _fresh_load(**self._OK)
+        msg = str(ei.value)
+        assert "RAG_AGENT_CHECKPOINT_KEY" in msg
+        assert "REQUIRE_HMAC" in msg and "ENCRYPT" in msg
+
+    def test_partial_missing_names_the_gap(self):
+        with pytest.raises(ValueError, match="ENCRYPT"):
+            _fresh_load(RAG_AGENT_CHECKPOINT_KEY="k",
+                        RAG_AGENT_CHECKPOINT_REQUIRE_HMAC="true", **self._OK)
+
+    def test_all_three_passes(self):
+        cfg = _fresh_load(RAG_AGENT_CHECKPOINT_KEY="k",
+                          RAG_AGENT_CHECKPOINT_REQUIRE_HMAC="true",
+                          RAG_AGENT_CHECKPOINT_ENCRYPT="true", **self._OK)
+        assert cfg.environment == "production"
+
+    def test_agent_off_not_required(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                          RAG_DASHSCOPE_API_KEY="sk-test")
+        assert cfg.environment == "production"
+
+    def test_development_not_required(self):
+        cfg = _fresh_load(RAG_ENVIRONMENT="development", RAG_SIMULATE="true",
+                          RAG_AGENT_ENABLE="true")
+        assert cfg.environment == "development"
 
     def test_production_agent_off_guard_off_passes(self):
         cfg = _fresh_load(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",

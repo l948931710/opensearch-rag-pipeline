@@ -372,7 +372,8 @@ class RDSRunStore:
 
     def suspend_run_atomic(self, run_id: str, state_blob: bytes, state_digest: str,
                            step_payload: Optional[Dict[str, Any]] = None,
-                           extra_writer=None) -> "tuple":
+                           extra_writer=None,
+                           budget_counts: Optional[Dict[str, int]] = None) -> "tuple":
         """P0-E（重评报告 §5E）：挂起持久化**单事务**——checkpoint + approval_request
         （extra_writer 游标回调，approval_store.insert_request）+ approval agent_step +
         running→suspended CAS 一次 commit。此前四段分事务：中途崩溃留下「有 checkpoint 无
@@ -407,6 +408,18 @@ class RDSRunStore:
                         "(run_id, step_no, kind, payload_json, created_at) "
                         "VALUES (%s,%s,'approval',%s,NOW(3))",
                         (run_id, step_no, json.dumps(step_payload, ensure_ascii=False)))
+                # R2（P1-RT-06）：Executor 权威预算计数随挂起**同一事务**持久化——
+                # 此前段内计数只靠 record_turn（fail-open 可被吞），挂起后 resume 从
+                # durable 播种即可能「回血」。GREATEST 防旧值回写（record_turn 已落的更大值优先）。
+                if budget_counts:
+                    cur.execute(
+                        f"UPDATE {db}.agent_run SET "
+                        "turns_used=GREATEST(turns_used,%s), "
+                        "tool_calls_used=GREATEST(tool_calls_used,%s), "
+                        "tokens_used=GREATEST(tokens_used,%s) WHERE run_id=%s",
+                        (int(budget_counts.get("turns") or 0),
+                         int(budget_counts.get("tool_calls") or 0),
+                         int(budget_counts.get("tokens") or 0), run_id))
                 cur.execute(
                     f"UPDATE {db}.agent_run SET status='suspended', heartbeat_at=NOW(3) "
                     "WHERE run_id=%s AND status='running'", (run_id,))

@@ -91,12 +91,28 @@ _ENC_PREFIX = b"enc1:"
 _ENC_AAD = b"agent-checkpoint-v1"
 
 
+def _prod_like_env() -> bool:
+    """R2（P1-RT-07）：生产/预演判定（config 读不出按 False——SIM/单测零影响）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return get_config().environment in ("production", "staging")
+    except Exception:   # noqa: BLE001
+        return False
+
+
 def _encrypt_blob(blob: bytes, key: bytes) -> Optional[bytes]:
     """AES-256-GCM（AEAD）：密钥 = sha256(hmac_key||":aes")（域分离）；输出
-    enc1: + base64(nonce||ct)——纯 ASCII，任何 str/bytes 往返都安全。失败回退明文。"""
+    enc1: + base64(nonce||ct)——纯 ASCII，任何 str/bytes 往返都安全。
+    失败回退：dev/SIM 明文（完整性仍有 HMAC）；**production/staging 直接抛**
+    （R2 P1-RT-07：加密硬门下静默退明文=把高 PII blob 裸写库，run 落 failed
+    比带病持久化诚实）。"""
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    except Exception:   # noqa: BLE001
+    except Exception as e:   # noqa: BLE001
+        if _prod_like_env():
+            raise RuntimeError(
+                "[R2 P1-RT-07] RAG_AGENT_CHECKPOINT_ENCRYPT 开启但 cryptography 不可用"
+                "——生产不许退明文，拒绝持久化 checkpoint") from e
         logger.warning("RAG_AGENT_CHECKPOINT_ENCRYPT 开启但 cryptography 不可用——"
                        "回退明文（完整性仍有 HMAC）")
         return None
@@ -106,7 +122,10 @@ def _encrypt_blob(blob: bytes, key: bytes) -> Optional[bytes]:
         nonce = _os.urandom(12)
         ct = AESGCM(hashlib.sha256(key + b":aes").digest()).encrypt(nonce, blob, _ENC_AAD)
         return _ENC_PREFIX + base64.b64encode(nonce + ct)
-    except Exception:   # noqa: BLE001
+    except Exception as e:   # noqa: BLE001
+        if _prod_like_env():
+            raise RuntimeError(
+                "[R2 P1-RT-07] checkpoint 加密失败——生产不许退明文，拒绝持久化") from e
         logger.warning("checkpoint 加密失败——回退明文（完整性仍有 HMAC）", exc_info=True)
         return None
 

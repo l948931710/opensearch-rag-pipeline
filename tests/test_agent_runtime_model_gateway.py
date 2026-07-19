@@ -119,7 +119,9 @@ def test_thinking_tier_params_merged_into_request():
             return ModelCapabilities(True, True, False, 8192, True)
 
         def chat(self, model, req):
-            seen["extra"] = dict(req.extra)
+            # R2 后 gateway 注入下划线传输键（如 _transport_timeout_s）——断言只看业务键
+            seen["extra"] = {k: v for k, v in req.extra.items()
+                             if not str(k).startswith("_")}
             return _resp("ok")
 
     gw = ModelGateway({"a": _P()}, routes={"light": [("a", "m")], "high": [("a", "m")]})

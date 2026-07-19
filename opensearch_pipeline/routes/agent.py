@@ -1323,6 +1323,27 @@ def _requester_ctx(run: dict, thread_id: str, rid: str = "", conversation_id=Non
         roles=(req_role,), channel=channel, thread_id=thread_id,
         conversation_id=run.get("conversation_id") or conversation_id,
         model_profile=run.get("model_profile"))   # 续跑沿用 submit 时的模型档
+    # R2（P1-RT-06）：总 run 墙钟 ≠ 活跃段窗口——每段新窗口是记录在案语义（审批可等
+    # 数小时），但逻辑 run 不该经无限次 suspend/resume 永生。段 deadline 钳到
+    # started_at + RAG_AGENT_MAX_RUN_WALL_S（默认 24h，覆盖审批隔夜；0=关）。fail-open。
+    try:
+        _wall_s = int(os.environ.get("RAG_AGENT_MAX_RUN_WALL_S", "86400") or 0)
+        _started = run.get("started_at")
+        if _wall_s > 0 and _started is not None and ctx.budget.deadline is not None:
+            import dataclasses as _dc
+            from datetime import datetime as _dt
+            from datetime import timedelta as _td
+            from datetime import timezone as _tz
+            if isinstance(_started, str):
+                _started = _dt.fromisoformat(_started.replace("Z", "+00:00"))
+            if _started.tzinfo is None:
+                _started = _started.replace(tzinfo=_tz.utc)
+            _ceiling = _started + _td(seconds=_wall_s)
+            if _ceiling < ctx.budget.deadline:
+                object.__setattr__(ctx, "budget",
+                                   _dc.replace(ctx.budget, deadline=_ceiling))
+    except Exception:   # noqa: BLE001 — 钳制失败维持段窗口（fail-open）
+        logger.warning("resume 总墙钟钳制失败（维持段窗口）", exc_info=True)
     return ctx, requester_id, req_groups
 
 
