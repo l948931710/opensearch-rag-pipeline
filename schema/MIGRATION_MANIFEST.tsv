@@ -58,3 +58,4 @@
 049_acl_outbox_generation.sql knowledge
 050_qa_rewritten_query.sql operation
 051_dingtalk_msg_dedup.sql operation
+052_agent_run_dispatch_bind.sql operation

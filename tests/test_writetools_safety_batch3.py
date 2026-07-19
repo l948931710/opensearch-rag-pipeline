@@ -178,5 +178,7 @@ def test_d3_failure_callback_suppressed_when_ownership_lost():
                        on_failure=failures.append)
     evs = list(handle.events())
     ex.shutdown()
-    assert any(isinstance(e, RunFailed) for e in evs)          # 本地事件仍收流（UX 不变）
+    # R1（RB-RT-02 改判）：失去所有权且真相未知（store 无 get_run）→ **不发终态帧**
+    # ——旧断言「本地事件仍收流」正是评审探针抓的双真相（客户端见 failed、库仍 running）
+    assert not any(isinstance(e, RunFailed) for e in evs)
     assert failures == []                                      # 失去所有权：不落失败侧

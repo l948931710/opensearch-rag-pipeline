@@ -420,8 +420,10 @@ def _enum_contains(dbname: str, table: str, column: str, member: str, mig: str) 
 
 
 def durable_dispatch_contract_status() -> str:
-    """RAG_AGENT_DURABLE_DISPATCH 开 ⇒ 043 命令表 + 044 kind ENUM 含 'resume' 必须
-    在位——B1 P1-01 后 enqueue 失败=每个 ask 503，契约缺失的实例不该接流量（critical）。"""
+    """RAG_AGENT_DURABLE_DISPATCH 开 ⇒ 043 命令表 + 044 kind ENUM 含 'resume' +
+    052 agent_run.dispatch_command_id 反向锚必须在位——B1 P1-01 后 enqueue 失败=每个
+    ask 503；缺 052 时 command→run 交接回退两步 bind（RB-RT-01 双 run 窗口重开），
+    契约缺失的实例不该接流量（critical）。"""
     if not _flag_on("RAG_AGENT_DURABLE_DISPATCH"):
         return "skipped"
 
@@ -433,6 +435,9 @@ def durable_dispatch_contract_status() -> str:
             return "missing:agent_dispatch_command(schema/043)"
         if t != "ok":
             return t
+        c = _columns_exist(db, [("agent_run", "dispatch_command_id", "052")])
+        if c != "ok":
+            return c
         return _enum_contains(db, "agent_dispatch_command", "kind", "resume", "044")
 
     return _cached("durable_dispatch_contract", 60, _compute)

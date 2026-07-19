@@ -189,14 +189,22 @@ def test_b2_flag_off_contracts_skipped():
 def test_b2_durable_dispatch_contract(monkeypatch):
     monkeypatch.setenv("RAG_AGENT_DURABLE_DISPATCH", "true")
     _wire_db(monkeypatch, {"COLUMN_TYPE": [("enum('submit','resume')",)],
-                           "information_schema.tables": [(1,)]})
+                           "information_schema.tables": [(1,)],
+                           "information_schema.columns": [(1,)]})   # R1：052 反向锚列
     assert readiness.durable_dispatch_contract_status() == "ok"
     readiness._reset_cache()
-    # 043 表在、044 ENUM 未扩 resume（MODIFY 未 apply 的蓝绿窗口）
+    # 043 表在、052 列在、044 ENUM 未扩 resume（MODIFY 未 apply 的蓝绿窗口）
     _wire_db(monkeypatch, {"COLUMN_TYPE": [("enum('submit')",)],
-                           "information_schema.tables": [(1,)]})
+                           "information_schema.tables": [(1,)],
+                           "information_schema.columns": [(1,)]})
     st = readiness.durable_dispatch_contract_status()
     assert st.startswith("missing:") and "044" in st
+    readiness._reset_cache()
+    # R1（RB-RT-01）：043 表在、052 反向锚列缺——两步 bind 双 run 窗口重开 ⇒ missing
+    _wire_db(monkeypatch, {"information_schema.tables": [(1,)],
+                           "information_schema.columns": [(0,)]})
+    st = readiness.durable_dispatch_contract_status()
+    assert st.startswith("missing:") and "052" in st
     readiness._reset_cache()
     # 043 表整体缺失
     _wire_db(monkeypatch, {"information_schema.tables": [(0,)]})

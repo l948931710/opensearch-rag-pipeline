@@ -30,6 +30,9 @@ if TYPE_CHECKING:  # 运行期不导入：context.py 由 Task 8 落地
 
 logger = logging.getLogger(__name__)
 
+# R1（RB-RT-01）：052 未 apply 的一次性告警闸（进程级）
+_WARNED_052_MISSING = False
+
 # 状态机（报告 §6 + B1(b)/B3：resuming 中间态）
 # resuming = 审批已批、执行宿主尚未接手续跑的中间态。resume 两步：
 #   ① 审批回调 CAS suspended→resuming（认领，防两回调并发重入）+ 立即 ACK；
@@ -66,6 +69,30 @@ def _is_thread_busy_error(exc: BaseException) -> bool:
     if not args or args[0] != 1062:
         return False
     return "uk_thread_active" in str(exc)
+
+
+class DispatchCommandBound(RuntimeError):
+    """R1（RB-RT-01）：该 dispatch 命令已有 run——uk_run_dispatch_cmd（schema/052）撞
+    1062。恢复扫描与快路径并发双建时由 DB 裁决单赢家；输家凭
+    find_run_by_dispatch_command 取既有 run 收口（rebind），绝不产生第二个 run。"""
+
+    def __init__(self, command_id: str):
+        super().__init__(f"dispatch 命令 {command_id} 已绑定 run（uk_run_dispatch_cmd）")
+        self.command_id = command_id
+
+
+def _is_dispatch_bound_error(exc: BaseException) -> bool:
+    """1062 且撞的是 uk_run_dispatch_cmd（052 反向锚唯一键）。"""
+    args = getattr(exc, "args", None) or ()
+    if not args or args[0] != 1062:
+        return False
+    return "uk_run_dispatch_cmd" in str(exc)
+
+
+def _is_unknown_column_error(exc: BaseException) -> bool:
+    """1054 未知列——052 未 apply 的旧库（代码可先行：回退无锚 INSERT/查询）。"""
+    args = getattr(exc, "args", None) or ()
+    return bool(args) and args[0] == 1054
 
 
 def _is_lock_contention_error(exc: BaseException) -> bool:
@@ -148,6 +175,11 @@ class RDSRunStore:
         """
         run_id = uuid.uuid4().hex
         db = _op_db()
+        # R1（RB-RT-01）：durable dispatch 命令锚随建 run **同一 INSERT** 原子落——
+        # 绑定不再依赖 submit 后的第二步 bind UPDATE；uk_run_dispatch_cmd（052）保证
+        # 每命令至多一个 run。锚经 ctx 携带（routes claim 后 setattr，P1-12 message_id
+        # 同款先例）；未 apply 052 的旧库撞 1054 → 回退无锚 INSERT + 一次性 warning。
+        dispatch_cmd = getattr(ctx, "dispatch_command_id", None)
         conn = self._conn()
         try:
             with conn.cursor() as cur:
@@ -155,18 +187,44 @@ class RDSRunStore:
                 # routes 建 ctx 时 setattr）——此前 submit 后才回填 UPDATE，交棒与回填
                 # 之间崩溃留下空 message_id（答案锚点丢失）。无值（旧调用方/桩）落 NULL，
                 # 由既有 set_message_id 回填兜底，语义不变。
-                cur.execute(
-                    f"INSERT INTO {db}.agent_run "
-                    "(run_id, thread_id, conversation_id, user_id, channel, agent_profile, status, "
-                    " acl_groups_snapshot, model_profile, prompt_version, git_sha, message_id, "
-                    " heartbeat_at, started_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,NOW(3),NOW(3))",
-                    (run_id, ctx.thread_id, getattr(ctx, "conversation_id", None), ctx.user_id,
-                     ctx.channel, agent_profile,
-                     json.dumps(list(ctx.acl_groups), ensure_ascii=False),
-                     getattr(ctx, "model_profile", None), getattr(ctx, "prompt_version", None),
-                     getattr(ctx, "git_sha", None), getattr(ctx, "message_id", None)),
-                )
+                base_cols = ("run_id, thread_id, conversation_id, user_id, channel, "
+                             "agent_profile, status, acl_groups_snapshot, model_profile, "
+                             "prompt_version, git_sha, message_id, heartbeat_at, started_at")
+                base_vals = (run_id, ctx.thread_id, getattr(ctx, "conversation_id", None),
+                             ctx.user_id, ctx.channel, agent_profile,
+                             json.dumps(list(ctx.acl_groups), ensure_ascii=False),
+                             getattr(ctx, "model_profile", None),
+                             getattr(ctx, "prompt_version", None),
+                             getattr(ctx, "git_sha", None), getattr(ctx, "message_id", None))
+                if dispatch_cmd:
+                    try:
+                        cur.execute(
+                            f"INSERT INTO {db}.agent_run "
+                            f"({base_cols}, dispatch_command_id) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,"
+                            "NOW(3),NOW(3),%s)",
+                            base_vals + (dispatch_cmd,))
+                    except Exception as e_col:   # noqa: BLE001
+                        if not _is_unknown_column_error(e_col):
+                            raise
+                        global _WARNED_052_MISSING
+                        if not _WARNED_052_MISSING:
+                            _WARNED_052_MISSING = True
+                            logger.warning(
+                                "agent_run 无 dispatch_command_id 列（schema/052 未 apply）——"
+                                "命令锚回退旧两步 bind 语义；RAG_AGENT_DURABLE_DISPATCH "
+                                "开启前请先 apply 052")
+                        conn.rollback()
+                        cur.execute(
+                            f"INSERT INTO {db}.agent_run ({base_cols}) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,"
+                            "NOW(3),NOW(3))",
+                            base_vals)
+                else:
+                    cur.execute(
+                        f"INSERT INTO {db}.agent_run ({base_cols}) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,NOW(3),NOW(3))",
+                        base_vals)
             conn.commit()
             return run_id
         except Exception as e:
@@ -174,9 +232,39 @@ class RDSRunStore:
             if _is_thread_busy_error(e):
                 raise ThreadBusy(
                     f"thread {ctx.thread_id!r} 已有进行中的 run（uk_thread_active 串行化）") from e
+            if _is_dispatch_bound_error(e):
+                # R1：命令已有 run（恢复扫描/快路径并发双建，DB 裁决本方输）——调用方
+                # 凭 find_run_by_dispatch_command 取既有 run 收口，绝不重复执行
+                raise DispatchCommandBound(str(dispatch_cmd)) from e
             raise
         finally:
             conn.close()
+
+    def find_run_by_dispatch_command(self, command_id: str) -> Optional[Dict[str, Any]]:
+        """R1（RB-RT-01）：按命令锚查既有 run——恢复扫描**先查后建**的依据。
+        返回 {run_id, status} 或 None；查询失败/052 未 apply（1054）→ None
+        （fail-open 回退旧重驱语义，与 create_run 的 1054 回退同一过渡窗）。"""
+        if not command_id:
+            return None
+        db = _op_db()
+        try:
+            conn = self._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT run_id, status FROM {db}.agent_run "
+                        "WHERE dispatch_command_id=%s LIMIT 1", (command_id,))
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+            if not row:
+                return None
+            vals = list(row.values()) if isinstance(row, dict) else list(row)
+            return {"run_id": vals[0], "status": vals[1]}
+        except Exception as e:   # noqa: BLE001
+            if not _is_unknown_column_error(e):
+                logger.warning("按命令锚查 run 失败（回退旧重驱语义）: %s", e)
+            return None
 
     def append_step(self, run_id: str, step: AgentStep) -> int:
         """追加一步 trace，返回 step_no。同 run 由 executor 单线程串行驱动（step_no=MAX+1）。"""

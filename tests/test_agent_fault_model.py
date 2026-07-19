@@ -140,8 +140,8 @@ def test_p0_01_bare_return_lands_failed_terminal(loop):
 
 
 def test_p0_01_bare_return_ownership_lost_skips_failure_callback():
-    """D3 fencing 对齐：裸 return 收尾时 CAS 失败（收尸/取消抢先）→ 终态帧照发，
-    失败侧回调**不跑**（绝不在他方已持有终态后再写失败侧落库）。"""
+    """D3 fencing + R1 RB-RT-02：裸 return 收尾时 CAS 失败（收尸/取消抢先）→
+    终态帧**不发**（durable-first：真相未知不宣告）、失败侧回调不跑。"""
 
     class _CasLostStore(_FaultStore):
         def transition(self, run_id, frm, to):
@@ -154,7 +154,9 @@ def test_p0_01_bare_return_ownership_lost_skips_failure_callback():
     h = ex.submit(_ctx(), _BareLoop(), [], [], on_failure=lambda e: fails.append(e))
     events = list(h.events())
     ex.shutdown()
-    assert any(isinstance(e, RunFailed) for e in events)
+    # R1（RB-RT-02 改判）：CAS 失败且真相未知 → 不发终态帧（durable-first；
+    # 旧「终态帧照发」=对外宣告库中不存在的终态）
+    assert not any(isinstance(e, RunFailed) for e in events)
     assert fails == []
 
 

@@ -523,8 +523,9 @@ class ThreadedRunExecutor:
                     handle._emit(ev)                                    # trace/SSE tool_call 帧
                     if handle.cancelled():
                         gen.close()
-                        self._safe_transition(run_id, "running", "cancelled")
-                        handle._emit(RunFailed(error="用户取消", retryable=False))
+                        # R1（RB-RT-02）：durable-first（同主循环取消位点）
+                        self._terminal_fail_durable(run_id, handle, "用户取消",
+                                                    to="cancelled", notify=False)
                         break
                     # tool_calls 预算：消费后超限即 fail-closed（在 adjudicate 执行副作用**之前**拦住）
                     tool_calls_used += 1
@@ -611,21 +612,21 @@ class ThreadedRunExecutor:
                         break
                     self._complete_run(run_id, handle, ev, retrieved_chunks)
                     break
-                handle._emit(ev)
                 if isinstance(ev, RunFailed):
-                    # D3（复核批次3）失败侧 fencing：与完成侧对齐——CAS 成立才证明本线程
-                    # 仍持有 run；失败迁移不成立（已被 purge 删行/收尸/取消抢先）时**不调**
-                    # 失败侧回调，否则 qa_session_log 会在主体擦除后再 INSERT 该用户新行。
-                    if self._transition_checked(run_id, "running", "failed"):
-                        self._notify_failure(handle, ev.error)
-                    else:
-                        logger.error("run %s 失败收尾时已失去所有权（purge/收尸/取消抢先），"
-                                     "跳过失败侧落库", run_id)
+                    # R1（RB-RT-02）durable-first：先赢 CAS 再对外宣告——emit 挪进
+                    # _terminal_fail_durable（此前先 emit 后 CAS，落空即双真相）。
+                    # D3 fencing 语义保留：失去所有权不落失败侧回调（helper 内 notify 门控）。
+                    self._terminal_fail_durable(
+                        run_id, handle, ev.error,
+                        retryable=bool(getattr(ev, "retryable", False)))
                     break
+                handle._emit(ev)
                 if handle.cancelled():
                     gen.close()
-                    self._safe_transition(run_id, "running", "cancelled")
-                    handle._emit(RunFailed(error="用户取消", retryable=False))
+                    # R1（RB-RT-02）：取消同走 durable-first（此前 _safe_transition 吞错
+                    # 后无条件 emit）。cancel 事件历来不走失败侧回调 → notify=False。
+                    self._terminal_fail_durable(run_id, handle, "用户取消",
+                                                to="cancelled", notify=False)
                     break
                 ev = next(gen)
         except StopIteration:
@@ -634,22 +635,12 @@ class ThreadedRunExecutor:
             # loop bug / 第三方 loop）。此前直接 pass：durable 停在 running（只能等 reaper
             # ~15min 收尸，期间 uk_thread_active 占坑 409）、SSE 只见 [DONE] 无终态帧。
             # 所有 break 路径都已各自收口终态，能走到这里必然无终态 → 与异常路径同构
-            # 诚实落 failed（D3 fencing：失去所有权不落失败侧回调）。
-            handle._emit(RunFailed(error="loop 生成器未发终态事件即结束（协议违约）",
-                                   retryable=True))
-            if self._transition_checked(run_id, "running", "failed"):
-                self._notify_failure(handle, "loop 生成器未发终态事件即结束")
-            else:
-                logger.error("run %s 生成器意外结束收尾时已失去所有权（purge/收尸/取消抢先），"
-                             "跳过失败侧落库", run_id)
-        except Exception as e:   # noqa: BLE001 — run 内部异常不外泄，落 failed + 事件
-            handle._emit(RunFailed(error=str(e), retryable=False))
-            # D3 失败侧 fencing（同 RunFailed 分支）：失去所有权不再落失败侧回调
-            if self._transition_checked(run_id, "running", "failed"):
-                self._notify_failure(handle, str(e))
-            else:
-                logger.error("run %s 异常收尾时已失去所有权（purge/收尸/取消抢先），"
-                             "跳过失败侧落库", run_id)
+            # 诚实落 failed（R1 RB-RT-02：durable-first，先 CAS 后宣告）。
+            self._terminal_fail_durable(run_id, handle,
+                                        "loop 生成器未发终态事件即结束（协议违约）",
+                                        retryable=True)
+        except Exception as e:   # noqa: BLE001 — run 内部异常不外泄，durable-first 落 failed
+            self._terminal_fail_durable(run_id, handle, str(e))
         finally:
             hb_stop.set()
             if run_id:
@@ -991,18 +982,56 @@ class ThreadedRunExecutor:
         except Exception:   # noqa: BLE001
             return False
 
+    def _read_run_status(self, run_id: Optional[str]) -> Optional[str]:
+        """read-after-write 读现状（RB-RT-02）：读不到返回 None（真相未知）。"""
+        try:
+            fn = getattr(self._store, "get_run", None)
+            if fn is None:
+                return None
+            return ((fn(run_id) or {}).get("status")) or None
+        except Exception:   # noqa: BLE001
+            return None
+
+    def _terminal_fail_durable(self, run_id: Optional[str], handle: RunHandle, error: str,
+                               *, to: str = "failed", retryable: bool = False,
+                               notify: bool = True) -> bool:
+        """R1（RB-RT-02）终态 durable-first 统一协议：**先赢 CAS 再对外宣告**——
+        此前失败/取消/预算路径先 emit 后落库（与成功路径 P0-01 的 durable-first
+        不对称），CAS 落空/写失败被吞时客户端已见终态、库里还是 running（双真相；
+        探针实证「event=run_failed 而 transition=false」）。协议：
+        - CAS 赢 → 发事件（notify=True 再走失败侧回调），返回 True；
+        - CAS 输 → read-after-write：现状=succeeded ⇒ 完成侧胜者已自发 RunCompleted，
+          **闭嘴**；现状=其它终态 ⇒ 按 DB 事实幂等宣告（SSE 不悬挂、内容与库一致）；
+          现状=非终态/读不到 ⇒ **不宣告任何终态**（critical 留痕，交 reaper/对账——
+          「没消息」诚实于「假终态」），返回 False。"""
+        if self._transition_checked(run_id, "running", to):
+            handle._emit(RunFailed(error=error, retryable=retryable))
+            if notify:
+                self._notify_failure(handle, error)
+            return True
+        actual = self._read_run_status(run_id)
+        if actual == "succeeded":
+            logger.info("run %s 终态(%s)落库落空——完成侧已胜出（succeeded），不再宣告",
+                        run_id, to)
+            return False
+        if actual in ("failed", "cancelled", "expired"):
+            handle._emit(RunFailed(error=f"run 已收尾为 {actual}", retryable=False))
+            logger.warning("run %s 终态(%s)落库落空——按库中事实(%s)幂等宣告",
+                           run_id, to, actual)
+            return False
+        logger.critical("run %s 终态(%s: %s)无法落库且现状=%s——**不对外宣告终态**"
+                        "（假终态比无消息更糟），交收尸/对账收敛",
+                        run_id, to, (error or "")[:120], actual or "unknown")
+        return False
+
     def _fail_over_budget(self, run_id: Optional[str], gen, handle: RunHandle, msg: str) -> None:
-        """预算超限 fail-closed：关生成器 + 落 failed + 发 RunFailed 事件。
+        """预算超限 fail-closed：关生成器 + durable-first 落 failed（RB-RT-02 统一协议）。
         D3：失败侧回调经 checked CAS 门控（失去所有权=purge/收尸/取消抢先 → 不落库）。"""
         try:
             gen.close()
         except Exception:   # noqa: BLE001
             pass
-        handle._emit(RunFailed(error=msg, retryable=False))
-        if self._transition_checked(run_id, "running", "failed"):
-            self._notify_failure(handle, msg)
-        else:
-            logger.error("run %s 预算超限收尾时已失去所有权，跳过失败侧落库", run_id)
+        self._terminal_fail_durable(run_id, handle, msg)
 
     def _safe_transition(self, run_id: Optional[str], frm: str, to: str) -> None:
         try:

@@ -711,7 +711,7 @@ def agent_ask(req: AskRequest, request: Request,
     registry, gateway, executor, _run_store = _get_runtime()
     from opensearch_pipeline.agent_runtime import DefaultAgentLoop, ExecutionContext, make_model_fn
     from opensearch_pipeline.agent_runtime.executor import RunRejected
-    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
+    from opensearch_pipeline.agent_runtime.run_store import DispatchCommandBound, ThreadBusy
 
     try:
         from opensearch_pipeline.request_context import get_request_id
@@ -838,6 +838,10 @@ def agent_ask(req: AskRequest, request: Request,
                          "request_id": rid})
             if _dispatcher.claim_for_request(_cmd_id):
                 durable_cmd = (_dispatcher, _cmd_id)
+                # R1（RB-RT-01）：命令锚上 ctx——create_run 的 INSERT 同事务原子落
+                # dispatch_command_id（uk_run_dispatch_cmd 兜底每命令至多一 run），
+                # 绑定不再依赖 submit 后第二步 bind UPDATE（P1-12 message_id 同款先例）。
+                object.__setattr__(ctx, "dispatch_command_id", _cmd_id)
             else:
                 # 批次4（ultra dispatch_outbox:134 后半）：失去认领后**不再直通执行**——
                 # 命令已归他方（恢复扫描/他副本）持有，他方必然重建执行；本方再直通就是
@@ -884,9 +888,18 @@ def agent_ask(req: AskRequest, request: Request,
             durable_cmd[0].fail_fast(durable_cmd[1], "会话忙（409）")
         raise HTTPException(status_code=409,
                             detail="该会话已有回答在进行中（或有待审批任务未收尾），请稍后再试")
+    except DispatchCommandBound:
+        # R1（RB-RT-01）：本命令已有 run（uk_run_dispatch_cmd 裁决本方输）——恢复扫描
+        # 抢先重建了执行（防御性角落：本线程在 claim 后停顿超租约）。绝不再直通第二个
+        # run；命令归赢家收口，用户从会话历史/运行中心取回该 run 的答案。
+        raise HTTPException(
+            status_code=409,
+            detail="该问题已受理并正在处理中，请稍后在会话历史查看回答（请勿重复提交）")
     if durable_cmd:
-        # 绑 run（at-most-once 分界）+ 收口 done——此后崩溃由 run 机器（心跳/reaper/
-        # 完成事务）负责，命令绝不重执行。fail-open：收口失败恢复扫描按已绑收敛。
+        # 绑 run（正向指针，供恢复扫描/看板反查；**真绑定已随 create_run 的
+        # dispatch_command_id 原子落**，R1 RB-RT-01）+ 收口 done——此后崩溃由 run 机器
+        # （心跳/reaper/完成事务）负责。fail-open：这里任何失败，恢复扫描都会按反向锚
+        # 查到既有 run 并 rebind 收敛，绝不重驱第二个 run。
         durable_cmd[0].bind_and_done(durable_cmd[1], handle.run_id)
 
     # U1/U2（重审计 §5，schema/036）：message_id 落 agent_run——审批续跑复用它落库
@@ -1444,7 +1457,8 @@ def _dispatch_recovered_submit(cmd: dict):
         DefaultAgentLoop, ExecutionContext, make_model_fn)
     from opensearch_pipeline.agent_runtime.durable_dispatcher import DispatchRetryLater
     from opensearch_pipeline.agent_runtime.executor import RunRejected
-    from opensearch_pipeline.agent_runtime.run_store import ThreadBusy
+    from opensearch_pipeline.agent_runtime.run_store import (
+        DispatchCommandBound, ThreadBusy)
 
     payload = cmd.get("payload") or {}
     question = (payload.get("question") or "").strip()
@@ -1455,6 +1469,20 @@ def _dispatch_recovered_submit(cmd: dict):
     conv = payload.get("conversation_id")
     message_id = payload.get("message_id") or generate_message_id()
     registry, gateway, executor, _run_store = _get_runtime()
+
+    # R1（RB-RT-01）：**先查后建**——按反向锚（agent_run.dispatch_command_id，052）查
+    # 既有 run：命中=前次交接已过 create_run（bind UPDATE 未落/进程崩在 bind 前），
+    # 原 run 在跑或已收尾，返回其 run_id 让 dispatcher rebind+done 收敛，**绝不重驱
+    # 第二个 run**（评审探针「original run 存活 + redriven=1」的正解）。未 apply 052
+    # / 查询失败 → None 回退旧重驱语义（过渡窗）。
+    _find = getattr(_run_store, "find_run_by_dispatch_command", None)
+    if _find is not None:
+        _bound = _find(cmd.get("command_id"))
+        if _bound and _bound.get("run_id"):
+            logger.warning("恢复扫描：命令 %s 已有 run %s（status=%s，bind 未落的交接残留）"
+                           "——rebind 收敛，不重驱", cmd.get("command_id"),
+                           _bound["run_id"], _bound.get("status"))
+            return _bound["run_id"]
 
     # PR-3 Stage D：恢复重驱同过全局并发闸——留 claimed 等租约到期自然退避
     # （attempts 封顶兜底），不与在线流量抢容量。
@@ -1485,6 +1513,8 @@ def _dispatch_recovered_submit(cmd: dict):
         acl_groups=groups, roles=(role,), channel=cmd.get("channel") or "console",
         thread_id=snapshot.thread_id, conversation_id=conv, model_profile=tier)
     object.__setattr__(ctx, "message_id", message_id)   # P1-12：随 create_run 同事务
+    # R1（RB-RT-01）：重驱建的 run 同样落命令锚——uk 兜底与并发恢复者/快路径单赢家
+    object.__setattr__(ctx, "dispatch_command_id", cmd.get("command_id"))
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))
     tools = registry.list_specs(ctx)
     messages = ([{"role": "system", "content": _agent_system_prompt()}]
@@ -1535,6 +1565,15 @@ def _dispatch_recovered_submit(cmd: dict):
                                  on_complete_durable=_persist_answer)
     except (RunRejected, ThreadBusy) as e:
         raise DispatchRetryLater(f"执行器暂不可用: {str(e)[:120]}")
+    except DispatchCommandBound:
+        # R1（RB-RT-01）：并发恢复者/快路径抢先为本命令建了 run（uk 裁决本方输）——
+        # 取赢家 run 收敛，绝不重驱第二个 run
+        _bound2 = (_find(cmd.get("command_id")) or {}) if _find is not None else {}
+        if _bound2.get("run_id"):
+            logger.warning("恢复扫描：命令 %s 并发建 run 输给赢家 %s——rebind 收敛",
+                           cmd.get("command_id"), _bound2["run_id"])
+            return _bound2["run_id"]
+        raise DispatchRetryLater("命令已被他方绑定 run 但反查未见（复制延迟）——下轮收敛")
     threading.Thread(target=lambda h=handle: [None for _ in h.events()],
                      name=f"pr3-drain-{handle.run_id[:8]}", daemon=True).start()
     return handle.run_id
