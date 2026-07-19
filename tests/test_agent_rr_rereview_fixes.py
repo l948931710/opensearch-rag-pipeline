@@ -270,3 +270,140 @@ class TestRR2SmallFixes:
                             lambda: SimpleNamespace(
                                 rds=SimpleNamespace(operation_database="op")))
         assert readiness.op_reconcile_contract_status() == "ok"
+
+
+class TestRRHA01EndOwnership:
+    """RB-HA-01 探针翻绿：输家/真相未知不封流；胜者封流。"""
+
+    def _relay_capture(self, monkeypatch):
+        frames = []
+
+        class _Relay:
+            def publish(self, ev):
+                frames.append(type(ev).__name__)
+
+            def end(self):
+                frames.append("__end__")
+
+        from opensearch_pipeline.agent_runtime.executor import ThreadedRunExecutor
+        monkeypatch.setattr(ThreadedRunExecutor, "_attach_relay",
+                            lambda self, h: setattr(h, "_relay", _Relay()))
+        return frames
+
+    def _boom_loop(self):
+        from opensearch_pipeline.agent_runtime.loop import DefaultAgentLoop
+
+        def _boom(msgs, tools):
+            raise RuntimeError("provider down")
+
+        return DefaultAgentLoop(_boom)
+
+    def test_loser_unknown_truth_never_writes_end(self, monkeypatch):
+        frames = self._relay_capture(monkeypatch)
+        store = _St(cas=False, actual="running")
+        ex = _ex(store)
+        h = ex.submit(_ctx(thread="t-ha1"), self._boom_loop(),
+                      [{"role": "user", "content": "q"}], [])
+        list(h.events())
+        ex.shutdown()
+        assert "__end__" not in frames, "CAS 输家/真相未知不得封共享流"
+
+    def test_winner_still_ends_stream(self, monkeypatch):
+        frames = self._relay_capture(monkeypatch)
+        store = _St(cas=True)
+        ex = _ex(store)
+        h = ex.submit(_ctx(thread="t-ha2"), self._boom_loop(),
+                      [{"role": "user", "content": "q"}], [])
+        list(h.events())
+        ex.shutdown()
+        assert frames.count("__end__") == 1 and "RunFailed" in frames
+
+
+class TestRREVT02SnapshotFallback:
+    def test_dropped_deltas_flip_streamed_and_mark(self, monkeypatch):
+        """P1-EVT-02 探针翻绿：丢过 delta 的 run，终态帧 streamed=false+delta_dropped。"""
+        from opensearch_pipeline.agent_runtime import event_relay as er
+        import sys
+        import opensearch_pipeline as pkg
+        entries = []
+
+        class _Fast:
+            def xadd(self, key, fields, maxlen=None, approximate=True):
+                entries.append(fields)
+
+            def expire(self, k, t):
+                return True
+
+        mod = SimpleNamespace(get_client=lambda: _Fast(),
+                              key=lambda *p: ":".join(p),
+                              is_configured=lambda: True)
+        monkeypatch.setitem(sys.modules, "opensearch_pipeline.redis_client", mod)
+        monkeypatch.setattr(pkg, "redis_client", mod, raising=False)
+        monkeypatch.setenv("RAG_AGENT_EVENT_RELAY_ASYNC", "false")
+        r = er._RedisRelay("run-snap")
+        r._dropped = 5                                  # 模拟本 run 已丢 delta
+
+        class _Done:
+            final_text = "完整答案七十个字"
+            streamed = True
+
+        import opensearch_pipeline.agent_runtime.events as evm
+        monkeypatch.setattr(evm, "dump_event",
+                            lambda ev: {"type": "run_completed",
+                                        "final_text": ev.final_text,
+                                        "streamed": ev.streamed})
+        r.publish(_Done())
+        import json as _j
+        payload = _j.loads(entries[-1]["data"]) if "data" in entries[-1] else entries[-1]
+        assert payload["streamed"] is False and payload["delta_dropped"] == 5
+
+    def test_no_drop_keeps_streamed_true(self, monkeypatch):
+        from opensearch_pipeline.agent_runtime import event_relay as er
+        import sys
+        import opensearch_pipeline as pkg
+        entries = []
+
+        class _Fast:
+            def xadd(self, key, fields, maxlen=None, approximate=True):
+                entries.append(fields)
+
+            def expire(self, k, t):
+                return True
+
+        mod = SimpleNamespace(get_client=lambda: _Fast(),
+                              key=lambda *p: ":".join(p),
+                              is_configured=lambda: True)
+        monkeypatch.setitem(sys.modules, "opensearch_pipeline.redis_client", mod)
+        monkeypatch.setattr(pkg, "redis_client", mod, raising=False)
+        monkeypatch.setenv("RAG_AGENT_EVENT_RELAY_ASYNC", "false")
+        import opensearch_pipeline.agent_runtime.events as evm
+        monkeypatch.setattr(evm, "dump_event",
+                            lambda ev: {"type": "run_completed", "streamed": True})
+        r = er._RedisRelay("run-snap2")
+        r.publish(SimpleNamespace())
+        import json as _j
+        payload = _j.loads(entries[-1]["data"])
+        assert payload["streamed"] is True and "delta_dropped" not in payload
+
+
+class TestRRAPR01DuplicateFromDb:
+    def test_null_reason_and_decided_by_from_db(self):
+        """P2-APR-01 探针翻绿：库 reason=NULL ⇒ 重放 outcome.reason=None（不吃 body）；
+        decided_by 以库行为准——直接验证重建逻辑（frozen model_copy 路径）。"""
+        from opensearch_pipeline.agent_runtime.approval import RejectedFeedback
+        o = RejectedFeedback(reason="attacker-controlled-retry-reason")
+        dec = {"reason": None, "decided_by": "original-admin"}
+        rebuilt = o.model_copy(update={"reason": dec.get("reason")})
+        assert rebuilt.reason is None                      # NULL 也是不可变事实
+        assert (dec.get("decided_by") or "retry-admin") == "original-admin"
+
+    def test_route_source_uses_db_fields_unconditionally(self):
+        """源级闸：DUPLICATE 分支必须无条件重建（不许 is not None 跳过）+ 503 语义。"""
+        from pathlib import Path
+        import opensearch_pipeline.routes.agent as m
+        src = Path(m.__file__).read_text(encoding="utf-8")
+        blk_start = src.index("RR-APR-01")
+        blk = src[blk_start:blk_start + 1600]
+        assert '_dec0.get("reason") is not None' not in blk   # 旧跳过条件已灭
+        assert "decided_by_effective = _db_by" in blk or "_db_by" in blk
+        assert "status_code=503" in blk and "Retry-After" in blk

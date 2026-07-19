@@ -78,6 +78,10 @@ class RunHandle:
         self._cancel = threading.Event()
         self._done = threading.Event()
         self._on_complete = None            # Callable[[str], None]，由 submit/resume 注入
+        # RR-HA-01：终态所有权——本执行 attempt 是否已向流写入 durable 背书的终态帧。
+        # 共享 run stream 的 __end__ 封流资格随它走：CAS 输家/真相未知路径不封流
+        # （回放器遇首个 __end__ 即收流，输家先封=赢家终态永不可见）。
+        self._relay_terminal = False
         self._on_failure = None             # Callable[[str], None]，失败侧回调（运维可观测，深度审查治理组）
         # P0-01：durable 完成写回调 Callable[[cursor, str, Optional[list]], None]——
         # complete_run_atomic 在 running→succeeded 同一事务内调用（写 qa_session_log 行）。
@@ -297,6 +301,7 @@ class ThreadedRunExecutor:
                     raise RunRejected(
                         f"run {run_id} 拒绝终止时状态已被并发迁移，稍后由对账收敛")
                 handle._emit(RunFailed(error="审批拒绝并终止", retryable=False))
+                handle._relay_terminal = True      # RR-HA-01：CAS 已胜（上方 checked）
                 handle._finish()
                 self._release()
                 return handle
@@ -658,7 +663,10 @@ class ThreadedRunExecutor:
                     logger.info("spec_retrieval run=%s %s", run_id, _fin())
                 except Exception:   # noqa: BLE001 — 观测绝不抛进 run 收尾
                     pass
-            handle._finish(end_relay=not suspended)
+            # RR-HA-01：__end__ 封流资格=「本 attempt 已写 durable 背书终态帧」——
+            # CAS 输家/真相未知路径不封流（消费侧靠终态帧或 is_terminal_fn 探针收流）。
+            handle._finish(end_relay=(not suspended)
+                           and getattr(handle, "_relay_terminal", False))
             self._release()
 
     def _complete_run(self, run_id: Optional[str], handle: RunHandle,
@@ -701,6 +709,7 @@ class ThreadedRunExecutor:
                 # 会话记忆/rolling summary（可能触发一次 LLM 调用）此前挡在终态 SSE 前，
                 # Redis/LLM 慢即用户白等；回调只做缓存性工作，后置零语义损失。
                 handle._emit(ev)
+                handle._relay_terminal = True      # RR-HA-01：durable succeeded=封流资格
                 self._notify_complete(handle, ev, retrieved)
             else:
                 logger.error(
@@ -719,6 +728,7 @@ class ThreadedRunExecutor:
                                    run_id, exc_info=True)
             self._notify_complete(handle, ev, retrieved)
             handle._emit(ev)
+            handle._relay_terminal = True          # RR-HA-01（桩路径同款）
         else:
             logger.error(
                 "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库", run_id)
@@ -735,6 +745,7 @@ class ThreadedRunExecutor:
             handle._emit(RunFailed(
                 error=f"run 已被系统收尾为 {actual}（完成结果作废，请重试）",
                 retryable=True))
+            handle._relay_terminal = True          # RR-HA-01：事实帧亦是终态
             return
         logger.critical("run %s 完成输家且现状=%s——不合成终态帧，交对账收敛",
                         run_id, actual or "unknown")
@@ -1030,6 +1041,7 @@ class ThreadedRunExecutor:
           「没消息」诚实于「假终态」），返回 False。"""
         if self._transition_checked(run_id, frm, to):
             handle._emit(RunFailed(error=error, retryable=retryable))
+            handle._relay_terminal = True          # RR-HA-01：CAS 胜者获封流资格
             if notify:
                 self._notify_failure(handle, error)
             return True
@@ -1040,6 +1052,7 @@ class ThreadedRunExecutor:
             return False
         if actual in ("failed", "cancelled", "expired"):
             handle._emit(RunFailed(error=f"run 已收尾为 {actual}", retryable=False))
+            handle._relay_terminal = True          # 事实帧=终态已 durable，封流无害
             logger.warning("run %s 终态(%s)落库落空——按库中事实(%s)幂等宣告",
                            run_id, to, actual)
             return False

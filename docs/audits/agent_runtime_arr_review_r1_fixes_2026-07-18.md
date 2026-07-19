@@ -111,7 +111,24 @@ reason）；egress 盖章前置到写型 ctx 副本替换之前（原 ctx 可见
 非本批范围）：trim 后全文快照与客户端 reset/replace 实现（console 侧工程）、双副本
 断线 E2E、当前 SHA stress/attestation——均归 B7/Gate C。
 
-## 5. 遗留（全部 user-gated）
+## 5. 第三轮复审三条（RB-HA-01/P1-EVT-02/P2-APR-01）核查+修复 as-built
+
+三条核查全属实。修复：
+- **RB-HA-01**：`__end__` 封流资格改随「终态所有权」走——handle._relay_terminal 只在
+  durable 背书终态帧写入后置位（helper CAS 胜/事实帧/完成成功/审批拒绝），finally 的
+  `_finish(end_relay=...)` 按其门控；CAS 输家与真相未知路径**不封流**（消费侧靠终态帧
+  或 is_terminal_fn 探针收流）。探针「__end__→run_completed 不可见」翻绿。
+- **P1-EVT-02**：relay 检测到本 run 丢过 delta 时终态帧翻 `streamed=false` +
+  `delta_dropped` 计数；回放端点见 delta_dropped 先发 `event: reset`（replace 语义）
+  再补完整 final_text。无丢弃零改动（同实例真流式不重复答案）。console 侧 reset
+  消费实现仍为待办（在案）。
+- **P2-APR-01**：DUPLICATE **无条件**以库行重建（reason 含 NULL——「无理由」也是
+  不可变事实；decided_by_effective 取库行原审批人）；决定行瞬时读不出 ⇒
+  503+Retry-After（可重试存储语义，弃 409）。
+验证：4293 passed+全仓 ruff 绿；+6 探针测试（三探针全翻绿）+源级闸（DUPLICATE 分支
+禁 is-not-None 跳过）。
+
+## 6. 遗留（全部 user-gated）
 
 Gate C（当前 SHA 压测/staging/多副本演练/052+053 apply/真机断线续读 E2E）归 B7
 user-gated；R1/R2/R3 代码面已全部落地。

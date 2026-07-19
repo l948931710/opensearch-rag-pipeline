@@ -180,6 +180,13 @@ class _RedisRelay:
                     payload["pending_call"] = pc
             except Exception:   # noqa: BLE001 — 脱敏失败不阻断中继（宁可少发不改语义）
                 pass
+            # RR-EVT-02：本 run 丢过 delta 时，终态帧翻 streamed=false + 带丢弃计数——
+            # 「delta 可丢」的前提是有再生方：回放端点见 streamed=false 会补发完整
+            # final_text，见 delta_dropped 先发 reset（客户端 replace 语义，防
+            # 残缺增量+全文拼接）。无丢弃时零改动（同实例真流式不重复答案）。
+            if payload.get("type") == "run_completed" and self._dropped:
+                payload["streamed"] = False
+                payload["delta_dropped"] = int(self._dropped)
             self._xadd(payload)
         except Exception:   # noqa: BLE001 — dump 失败同样只降级
             self._dead = True

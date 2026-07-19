@@ -1183,25 +1183,31 @@ def agent_approve(req: ApproveRequest, request: Request,
             # R3（P2-RT-19）：DUPLICATE 的 reason/decided_by 以库内不可变决定行为准——
             # 第二次请求体可携不同 reason，直接用会改变模型看到的拒绝反馈（重放不吃 body）
             if res == "duplicate":   # DECIDE_DUPLICATE 字面量（局部导入面窄）
-                # RR-2（P2-RR-05）：ApprovalOutcome 是 frozen pydantic——此前 setattr
-                # 必抛被吞=修复空操作。正解：按库内不可变决定行**重建**outcome
-                # （model_copy 绕 frozen）；决定行读不出 ⇒ **拒绝续跑**（重放绝不吃
-                # 请求体的 reason——第二次 body 可携不同反馈，喂给模型即改写审批语义）。
+                # RR-2→RR-APR-01：DUPLICATE **无条件**以库内不可变决定行重建——
+                # reason 含 NULL（「无理由」也是不可变事实，重放绝不吃第二次 body 的
+                # 注入值）；decided_by 取库行（confirmed_by/审计记原审批人，不是重试人）。
+                # 决定行瞬时读不出 ⇒ 503+Retry-After（可重试存储故障语义，非 409 冲突）。
                 try:
                     _dec0 = approval_store.get_decision(areq["request_id"])
                 except Exception:   # noqa: BLE001
                     _dec0 = None
                 if not _dec0:
                     raise HTTPException(
-                        status_code=409,
-                        detail="重复决定的库内决定行读取失败，拒绝按本次请求体续跑"
-                               "（请稍后重试）")
-                if _dec0.get("reason") is not None and hasattr(outcome, "reason")                         and getattr(outcome, "reason", None) != _dec0["reason"]:
+                        status_code=503,
+                        detail="重复决定的库内决定行暂不可读，拒绝按本次请求体续跑，"
+                               "请稍后重试",
+                        headers={"Retry-After": "3"})
+                _db_by = _dec0.get("decided_by")
+                if _db_by:
+                    decided_by_effective = _db_by
+                if hasattr(outcome, "reason") \
+                        and getattr(outcome, "reason", None) != _dec0.get("reason"):
                     try:
-                        outcome = outcome.model_copy(update={"reason": _dec0["reason"]})
+                        outcome = outcome.model_copy(
+                            update={"reason": _dec0.get("reason")})
                     except Exception:   # noqa: BLE001 — 非 pydantic 桩：dataclass replace
                         import dataclasses as _dc0
-                        outcome = _dc0.replace(outcome, reason=_dec0["reason"])
+                        outcome = _dc0.replace(outcome, reason=_dec0.get("reason"))
         else:
             # P0-C「edited decision 未绑定」：已决重放不吃 HTTP body 的语义——kind 必须同向，
             # edited 参数必须与 approval_decision.final_args_digest（决策时刻按原文算的
@@ -2082,6 +2088,10 @@ def agent_run_events(run_id: str, request: Request,
                                    "checkpoint_id": d.get("checkpoint_id"),
                                    "pending_call": d.get("pending_call")})
                 elif t == "run_completed":
+                    # RR-EVT-02：中继丢过 delta 的 run——先发 reset（客户端清屏
+                    # replace），再补完整全文（终态帧已被 relay 翻 streamed=false）
+                    if d.get("delta_dropped"):
+                        yield "event: reset\ndata: {}\n\n"
                     if d.get("final_text") and not d.get("streamed"):
                         yield _emit(d, {"type": "chunk", "content": d["final_text"]})
                     yield _emit(d, {"type": "done", "usage": d.get("usage") or {}})
