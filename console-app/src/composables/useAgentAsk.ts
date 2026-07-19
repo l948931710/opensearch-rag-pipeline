@@ -423,11 +423,8 @@ function finishAgentStream(ai: ChatMessage, seq: number): void {
     meta.disconnected = true
     pushStage(ai, 'reconnecting', '连接中断，转后台跟踪')
     ensureRunPolling(meta.runId)
-    void attachRunEvents(meta.runId, meta, ai, (m) => {   // RR-EVT-02：游标续读
-      m.html = renderMd(stripImg(m.raw || ''))
-      m.copyText = stripImg(m.raw || '')
-      bridge.schedulePersist()
-    })
+    void attachRunEvents(meta.runId, meta, ai,
+                         () => bridge.schedulePersist())   // 修断线续流：终态才持久化
     bridge.schedulePersist()
     return
   }
@@ -543,11 +540,8 @@ async function askAgent(preset?: string, skipUser = false): Promise<void> {
       meta.disconnected = true
       pushStage(ai, 'reconnecting', '连接中断，转后台跟踪')
       ensureRunPolling(meta.runId)
-      void attachRunEvents(meta.runId, meta, ai, (m) => {  // RR-EVT-02：游标续读
-        m.html = renderMd(stripImg(m.raw || ''))
-        m.copyText = stripImg(m.raw || '')
-        bridge.schedulePersist()
-      })
+      void attachRunEvents(meta.runId, meta, ai,
+                           () => bridge.schedulePersist())  // 修断线续流：终态才持久化
       bridge.schedulePersist()
       return
     }
@@ -802,13 +796,20 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
  *  网络失败指数退避；state_key 未变的拍只打轻量 /status）。
  *  挂起卡挂载/断流/运行中心聚焦时调用。 */
 // ── RR-EVT-02 消费端：断线后经 /api/agent/runs/{id}/events 游标续读 ──────────
-// 协议：帧携 id:（Redis stream 游标）→ 重连带 Last-Event-ID 只收新帧；
-// event: reset（游标被 trim / relay 丢过 delta）→ **清空已积累答案 replace 重建**，
-// 杜绝「残缺增量+全文」拼接。404/异常回退既有 5s 轮询（relay 未开=旧行为）。
+// 修断线续流（2026-07-19 复审三条）：①事件流接管即 stopRunPolling（失败退出才恢复
+// 轮询——不再双消费）；②渲染走 _agentRender* 增量内核（回放突发百帧不再全文 O(n²)）、
+// 持久化只在终态一次；③无游标首挂 = 全量回放 → **先清旧 partial 再回放**（replace，
+// 杜绝半截答案+回放追加的重复）。event: reset 同款清屏。
 async function attachRunEvents(runId: string, meta: any, ai: any,
-                               render: (m: any) => void): Promise<boolean> {
+                               persist: () => void): Promise<boolean> {
   if (meta.eventsAttached) return true
   meta.eventsAttached = true
+  let pollingSuppressed = false
+  const clearPartial = () => {
+    ai.raw = ''
+    _agentPumpStates.delete(ai)                       // 增量态随内容作废
+    _agentRenderNow(ai)
+  }
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       const headers: Record<string, string> = {}
@@ -817,6 +818,9 @@ async function attachRunEvents(runId: string, meta: any, ai: any,
         `/api/agent/runs/${encodeURIComponent(runId)}/events`, { headers })
       if (res.status === 404) return false            // relay 未启用：轮询兜底
       if (!res.ok || !res.body) throw new ApiError('events 不可用', res.status)
+      stopRunPolling(runId)                           // ①接管：暂停轮询（退出未终态再恢复）
+      pollingSuppressed = true
+      if (!meta.lastEventId) clearPartial()           // ③无游标=全量回放：先清旧 partial
       const dec = createSseDecoder()
       const reader = res.body.getReader()
       for (;;) {
@@ -825,17 +829,20 @@ async function attachRunEvents(runId: string, meta: any, ai: any,
         for (const ev of evs) {
           if ((ev as any).__id) meta.lastEventId = (ev as any).__id
           if (ev.type === '__reset') {                // replace：清屏重建
-            ai.raw = ''
-            render(ai)
+            clearPartial()
           } else if (ev.type === 'chunk') {
             ai.raw = (ai.raw || '') + String((ev as any).content || '')
-            render(ai)
+            _agentRenderNow(ai)     // ②增量内核（每帧只 strip/render 新增片段）
           } else if (ev.type === 'done') {
             meta.gotTerminal = true
             meta.status = 'succeeded'
-            render(ai)
+            ai.html = renderMd(stripImg(ai.raw || ''))  // 收尾全量权威定稿（主路径同款）
+            ai.copyText = stripImg(ai.raw || '')
+            persist()                                 // ②持久化只在终态一次
+            void refreshRunDetail(runId)              // 终态拉一次详情（回执/来源水合）
             return true
           } else if (ev.type === 'error' || ev.type === '__done') {
+            persist()
             return true                               // 终局（error 文案轮询水合）
           }
         }
@@ -846,6 +853,10 @@ async function attachRunEvents(runId: string, meta: any, ai: any,
     }
   } catch { /* 回退轮询 */ } finally {
     meta.eventsAttached = false
+    if (pollingSuppressed && !meta.gotTerminal
+        && !RUN_TERMINAL.has(meta.status || '')) {
+      ensureRunPolling(runId)                         // ①流失败/中断未终态：恢复轮询兜底
+    }
   }
   return false
 }
