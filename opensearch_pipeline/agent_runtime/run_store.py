@@ -741,6 +741,7 @@ class RDSRunStore:
         """
         db = _op_db()
         conn = self._conn()
+        _begin(conn)   # R3（P2-RT-12）：UPDATE+SELECT 两语句——显式事务钉连接
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -888,18 +889,27 @@ class RDSRunStore:
 
     def finish_invocation(self, invocation_id: str, *, status: str,
                           result_digest: Optional[str] = None, receipt_json: Optional[str] = None,
-                          error_text: Optional[str] = None) -> None:
-        """收尾一条工具调用（executing → succeeded/failed/compensated + 回执/摘要）。"""
+                          error_text: Optional[str] = None) -> bool:
+        """收尾一条工具调用（executing → succeeded/failed/compensated + 回执/摘要）。
+        R3（P2-RT-11）：**条件 CAS**——WHERE 带 status='executing'，旧持有线程迟到的
+        收尾不再覆盖 reconciler/人工已写的 uncertain→终态；返回是否赢得收尾权
+        （False=行已被他方推进，调用方按失去所有权处理）。"""
         db = _op_db()
         conn = self._conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {db}.tool_invocation SET status=%s, result_digest=%s, receipt_json=%s, "
-                    "error_text=%s, ended_at=NOW(3) WHERE invocation_id=%s",
+                    "error_text=%s, ended_at=NOW(3) "
+                    "WHERE invocation_id=%s AND status='executing'",
                     (status, result_digest, receipt_json, error_text, invocation_id),
                 )
+                won = cur.rowcount == 1
             conn.commit()
+            if not won:
+                logger.warning("invocation %s 收尾 CAS 落空（已被 reconciler/人工推进）"
+                               "——本次结果不写入", invocation_id)
+            return won
         except Exception:
             conn.rollback()
             raise

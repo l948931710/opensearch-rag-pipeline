@@ -1180,6 +1180,20 @@ def agent_approve(req: ApproveRequest, request: Request,
             if res == DECIDE_ALREADY_DECIDED:
                 raise HTTPException(status_code=409, detail="该审批请求已被处置或已过期")
             # ACCEPTED / DUPLICATE（同键同向重放）→ 继续 resume
+            # R3（P2-RT-19）：DUPLICATE 的 reason/decided_by 以库内不可变决定行为准——
+            # 第二次请求体可携不同 reason，直接用会改变模型看到的拒绝反馈（重放不吃 body）
+            if res == "duplicate":   # DECIDE_DUPLICATE 字面量（局部导入面窄）
+                try:
+                    _dec0 = approval_store.get_decision(areq["request_id"])
+                    if _dec0:
+                        if _dec0.get("reason") is not None and hasattr(outcome, "reason"):
+                            try:
+                                outcome.reason = _dec0["reason"]
+                            except Exception:   # noqa: BLE001 — frozen 类型：保持原值
+                                pass
+                except Exception:   # noqa: BLE001 — 读失败沿用本次 body（原行为）
+                    logger.warning("DUPLICATE 决定行读取失败（reason 沿用本次请求）",
+                                   exc_info=True)
         else:
             # P0-C「edited decision 未绑定」：已决重放不吃 HTTP body 的语义——kind 必须同向，
             # edited 参数必须与 approval_decision.final_args_digest（决策时刻按原文算的
@@ -1631,6 +1645,14 @@ def _redrive_resume_run(run_id, kind, run, registry, gateway, executor, run_stor
     from opensearch_pipeline.agent_runtime.executor import RunRejected
 
     if kind == "edited":
+        try:
+            from opensearch_pipeline.alerting import send_ops_alert
+            send_ops_alert("agent EDITED 决定待人工重试",
+                           f"run {run_id} 的 EDITED 审批已落库但续跑中断——库存参数已脱敏"
+                           f"无法自动重驱，请审批人在 console 重新提交（P2-RT-20）",
+                           severity="warning", dedup_key=f"edited-redrive:{run_id}")
+        except Exception:   # noqa: BLE001 — 告警失败不影响 skip 语义
+            pass
         logger.warning("resume 重驱：run %s 的 EDITED 决定无法自动重驱（库存参数已脱敏），"
                        "请审批人在 console 重试", run_id)
         return "skip"

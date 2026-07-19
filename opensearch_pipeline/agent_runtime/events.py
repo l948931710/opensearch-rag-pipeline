@@ -106,11 +106,13 @@ class RunSuspended(AgentEvent):
     checkpoint_id: str = ""
     pending_call: Optional[Dict[str, Any]] = None       # {call_id, tool_name, arguments}——审批 UI + resume
     turn_index: int = 0
-    state_messages: Optional[List[Dict[str, Any]]] = None   # loop→driver 内部载荷，driver 存后置 None
+    # R3（P2-RT-16）：exclude=True 皮带——driver 契约是存后置 None 再对外，但未来
+    # 直接 dump 本事件的新调用点不该能泄出完整内部状态（对齐 artifacts 先例）
+    state_messages: Optional[List[Dict[str, Any]]] = Field(default=None, exclude=True)
     # P1「一轮多 tool call 挂起丢调用」：同批中排在待批 call 之后、尚未处理的 calls——
     # 随 checkpoint 持久化，resume 处置完 pending 后逐个续处理（保证 assistant 消息里的
     # 每个 tool_call 最终都有 tool response，OpenAI 消息序合法）。同为内部载荷不外泄。
-    remaining_calls: Optional[List[Dict[str, Any]]] = None
+    remaining_calls: Optional[List[Dict[str, Any]]] = Field(default=None, exclude=True)
 
 
 class RunCompleted(AgentEvent):

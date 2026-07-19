@@ -128,7 +128,9 @@ def default_policy_engine() -> PolicyEngine:
     ontology.identity.resolve 是 HIGH_WRITE + approval_policy=always：授予只意味着
     「可提案」，结构性必挂起走 steward 审批（门 A），绝无免批执行路径。"""
     rules = [
-        PolicyRule(effect="allow", scopes=("kb.search", "sql.readonly.*"),
+        # R3（P2-RT-22）：撤 sql.readonly.* 预授——对应工具尚未存在，预授=未来一接入
+        # 即全员放权（无行列级义务前不给）；真正上线时按最小权限单独授
+        PolicyRule(effect="allow", scopes=("kb.search",),
                    policy_id="baseline.readonly"),
     ]
     from opensearch_pipeline.agent_tools import (

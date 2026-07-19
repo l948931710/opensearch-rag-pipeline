@@ -75,6 +75,11 @@ def main() -> int:
     finally:
         from opensearch_pipeline.routes import agent as agent_route
         agent_route._drain_runtime()          # 幂等：在跑 run 限时等/兜底标失败
+        try:                                  # R3（P2-RT-17）：账本 outbox 同排空
+            from opensearch_pipeline.agent_runtime.llm_log_outbox import drain_llm_log
+            drain_llm_log(timeout=5.0)
+        except Exception:   # noqa: BLE001 — 排空失败不阻关停
+            pass
         logger.warning("agent_worker 已退出（排水完成）")
     return 0
 

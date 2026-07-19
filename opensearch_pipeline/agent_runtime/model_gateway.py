@@ -329,8 +329,10 @@ RouteEntry = Tuple[str, str]     # (provider_name, model)
 # 大写 Qwen3.7-* 与旧 qwen3.6-turbo 均 404 model_not_found）。高阶档 429/5xx 退 plus。
 _DEFAULT_TIER = "light"
 _DEFAULT_ROUTES: Dict[str, List[RouteEntry]] = {
+    # R3（P2-RT-23）：现网用户流量只映 light/high——high 补链内 fallback（plus 故障
+    # 升档 max 保可用，成本可控：仅故障时走）；light 有意单模型快败（廉价档不升档）。
     "light": [("dashscope", "qwen3.7-plus")],
-    "high":  [("dashscope", "qwen3.7-plus")],
+    "high":  [("dashscope", "qwen3.7-plus"), ("dashscope", "qwen3.7-max-2026-06-08")],
     "xhigh": [("dashscope", "qwen3.7-max-2026-06-08"), ("dashscope", "qwen3.7-plus")],
     "max":   [("dashscope", "qwen3.7-max-2026-06-08"), ("dashscope", "qwen3.7-plus")],
 }
@@ -416,10 +418,27 @@ class ModelGateway:
         return dataclasses.replace(
             req, extra={**req.extra, "_transport_timeout_s": max(1.0, rem)})
 
+    def _egress_guard(self, ctx: ExecutionContext) -> None:
+        """R3（P2-RT-25 scaffold）：数据密级模型出口策略——tool_executor 把本 run 已见
+        最高密级盖到 ctx（max_data_classification），配置 RAG_AGENT_EGRESS_MAX_CLASS
+        （如 internal）后，超过上限的上下文禁止再出模型（fail-closed 拒调用）。
+        未配置=不启用（当前唯一 provider 为境内 DashScope，密级→provider 白名单细分
+        随多 provider 议程）。"""
+        ceiling = os.environ.get("RAG_AGENT_EGRESS_MAX_CLASS", "").strip().lower()
+        if not ceiling:
+            return
+        rank = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+        seen = str(getattr(ctx, "max_data_classification", "") or "").lower()
+        if seen and rank.get(seen, 0) > rank.get(ceiling, 99):
+            raise ModelError(
+                f"run {ctx.run_id} 上下文含 {seen} 密级数据，超过模型出口上限 "
+                f"{ceiling}（RAG_AGENT_EGRESS_MAX_CLASS）——拒绝外发", retryable=False)
+
     def complete(self, ctx: ExecutionContext, category: str, req: ChatRequest,
                  now: Optional[float] = None, *, on_attempt=None) -> ChatResponse:
         if self._deadline_exceeded(ctx, now):
             raise BudgetExceeded(f"run {ctx.run_id} 已超 deadline")
+        self._egress_guard(ctx)
 
         chain = self._routes.get(category) or self._routes.get(_DEFAULT_TIER) or []
         # 合并该思考深度档的 thinking 参数进请求体（req.extra 优先，允许调用方覆盖）
@@ -492,6 +511,7 @@ class ModelGateway:
         """
         if self._deadline_exceeded(ctx, now):
             raise BudgetExceeded(f"run {ctx.run_id} 已超 deadline")
+        self._egress_guard(ctx)
         chain = self._routes.get(category) or self._routes.get(_DEFAULT_TIER) or []
         tp = self._tier_params.get(category)
         if tp:

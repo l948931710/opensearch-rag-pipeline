@@ -334,6 +334,16 @@ class ToolExecutor:
                     hit = None                      # 派生键仍不同参（理论角落）：走残行裁决
             if hit:
                 logger.info("工具 %s 幂等命中，复用回执", spec.name)
+                # R3（P2-RT-15）：命中留审计痕——原 invocation 与当前 run 关联，
+                # 「为什么这个 run 没有新副作用却拿到回执」可回放（fail-open）
+                try:
+                    self._audit.record(
+                        ctx, event_type="tool_replay", action=spec.name,
+                        decision="reuse", run_id=getattr(ctx, "run_id", None),
+                        detail={"idempotency_key": idempotency_key,
+                                "original_invocation": hit.get("invocation_id")})
+                except Exception:   # noqa: BLE001 — 审计失败不碍复用（读侧 fail-open）
+                    pass
                 receipt = json.loads(hit["receipt_json"]) if hit.get("receipt_json") else None
                 # 命中必须回**有内容**的 tool 结果——空 content 让模型收到空 tool 消息，
                 # 不知道操作其实已成功，会道歉/重试/编造。
@@ -441,6 +451,16 @@ class ToolExecutor:
         # audit（write-ahead）：执行前记合规审计。HIGH_WRITE fail-closed=审计不可写则阻断执行
         # （绝不产生无审计的高风险副作用）；READ_ONLY/LOW_WRITE fail-open（写失败仅告警不阻断）。
         # async_trace（恒 READ_ONLY ⇒ fail_closed=False）时审计入队伍随 FIFO 尾随 record。
+        # R3（P2-RT-25）：把本 run 已见最高数据密级盖到 ctx——model_gateway._egress_guard
+        # 据此在下一次模型调用前裁决（配 RAG_AGENT_EGRESS_MAX_CLASS 才生效）
+        try:
+            _rank = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+            _cls = str(spec.data_classification or "").lower()
+            _prev = str(getattr(ctx, "max_data_classification", "") or "").lower()
+            if _rank.get(_cls, 0) > _rank.get(_prev, -1):
+                object.__setattr__(ctx, "max_data_classification", _cls)
+        except Exception:   # noqa: BLE001 — 盖章失败不碍执行（门未启用时零语义）
+            pass
         fail_closed = spec.risk_level == RiskLevel.HIGH_WRITE
         audit_kw = dict(
             event_type="tool_call", action=spec.qualified_name, decision="authorized",
@@ -583,10 +603,16 @@ class ToolExecutor:
         首执成功路径与幂等命中路径共用本强制点（P1-04 apply-on-hit）。"""
         if not obligations:
             return result
+        _arts = getattr(result, "artifacts", None)
         try:
             for ob in obligations:
                 name, _, param = ob.partition(":")
                 result = _OBLIGATION_HANDLERS[name](param, result)
+            # R3（P2-RT-14）：义务执行器重建 ToolResult 时会丢 artifacts（exclude 字段
+            # 不随 copy 走）——sources/图片旁路静默消失。成功路径回挂原 artifacts
+            # （义务只约束 content/receipt，不裁旁路）；扣留路径有意不带（fail-closed）。
+            if _arts is not None and getattr(result, "artifacts", None) is None:
+                result.artifacts = _arts
             return result
         except Exception as e:   # noqa: BLE001
             logger.error("义务执行失败（输出扣留）：%s", obligations, exc_info=True)

@@ -59,8 +59,34 @@
 未验证声明：真实多副本/kill-9 矩阵（Gate C 族，B7）；052 staging/prod apply 未做
 （user-gated）；main 不摘（agent 面留分支拍板）。
 
-## 3. 未修清单（R2/R3 待口令）
+## 3. R2/R3 修复 as-built（Sam 口令「开始R2+R3」，2026-07-18）
 
-R2=P1-RT-03/04/06/07（gateway deadline 每 attempt 重查、按 provider attempt 计量、
-resume 权威预算、checkpoint 生产硬门）；R3=P1-RT-05（多副本前提 SSE cursor）/08/09/10
-+ P2 台账 15 条。Gate C（当前 SHA 压测/staging/多副本演练）归 B7 user-gated。
+**R2（P1-RT-03/04/06/07）**：gateway 每 provider attempt 前重查 deadline+HTTP 超时钳剩余
+（`_transport_timeout_s` 下划线传输键约定）；计量改每实际 attempt（on_attempt 钩子，
+旧桩签名探测回退不双扣）；Executor 权威预算随 suspend_run_atomic 同事务持久化
+（GREATEST）+ 总墙钟 RAG_AGENT_MAX_RUN_WALL_S（默认 24h）钳段窗口；prod+agent ⇒
+checkpoint 专用密钥/强制验签/静态加密三件硬断 + loop 生产加密失败不退明文。
+
+**R3-P1（05/08/09/10）**：SSE Last-Event-ID 游标续读+trim reset 协议（帧携 _relay_id）；
+relay publish 有界异步（delta 队满丢+计数、控制帧短等必达、RAG_AGENT_EVENT_RELAY_ASYNC
+开关）；schema/053 对账退避/隔离（指数 30s..1h、上限 20 隔离，1054 代码可先行）；
+mid-run crash 合同书面化（SLO≈20min 内收尸=修法二+SLA）+收尸 ops 告警。
+
+**R3-P2（11..25 十五条）**：11 finish_invocation 条件 CAS（rowcount 回报）；12
+consume_budget 显式 _begin；13 sanitizer 键感知+11 位数字标量掩码；14 义务链保留
+artifacts；15 幂等命中写 tool_replay 审计；16 RunSuspended 内部载荷 exclude 皮带；
+17 outbox drain 改 task_done 账本+agent_worker 关停排空；18 **核查结论**=CI
+db-integration 全量跑+preflight 防假绿（reviewer 观察到的 skip 为本地无库形态；当前
+SHA attestation 归 B7）；19 DUPLICATE 重放 reason 以库内决定行为准；20 EDITED 不可
+重驱→ops 告警；21 终态帧先于缓存性回调（summary 不再挡 SSE）；22 撤 sql.readonly.*
+预授；23 high 档补链内 fallback（light 有意快败）；24 relay 副本工具参数脱敏；25
+模型出口密级门 scaffold（RAG_AGENT_EGRESS_MAX_CLASS，tool_executor 盖章）。
+
+验证：分支全量 4275 passed + 全仓 ruff 绿；R2/R3 新增 ~29 测试；新 env 6 个全保守默认。
+未验证声明：多副本/kill-9 矩阵与当前 SHA 压测（Gate C=B7）；052/053 apply（user-gated）；
+钉钉/console 真机断线续读 E2E。
+
+## 4. 遗留（全部 user-gated）
+
+Gate C（当前 SHA 压测/staging/多副本演练/052+053 apply/真机断线续读 E2E）归 B7
+user-gated；R1/R2/R3 代码面已全部落地。

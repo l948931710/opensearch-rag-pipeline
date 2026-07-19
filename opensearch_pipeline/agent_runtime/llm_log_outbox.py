@@ -21,6 +21,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,16 @@ def wrap_call_logger(store) -> Callable:
 
 
 def drain_llm_log(timeout: float = 5.0) -> bool:
-    """等待已入队账本行全部落库（测试断言/优雅退出前用）。返回是否清空。"""
+    """等待已入队账本行全部落库（测试断言/优雅退出前用）。返回是否清空。
+    R3（P2-RT-17）：改按 Queue 的 task_done 账本（unfinished_tasks）轮询——旧 _idle
+    事件在「producer put 后迟到 clear」与「worker 写入中」两窗口有竞态（假阳=还有
+    在途行就放行退出，假阴=已清空却报 False）。账本口径：put +1 / task_done -1，
+    归零=队列空且在途批已写完，无竞态窗。"""
     if _q is None:
         return True
-    return _idle.wait(timeout=timeout) and _q.empty()
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if getattr(_q, "unfinished_tasks", 0) == 0:
+            return True
+        time.sleep(0.02)
+    return getattr(_q, "unfinished_tasks", 0) == 0

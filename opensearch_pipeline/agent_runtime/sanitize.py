@@ -19,12 +19,31 @@ import json
 from typing import Any, Dict
 
 
-def _scrub_value(v: Any) -> Any:
+# R3（P2-RT-13）：敏感键名（命中即整值掩码，含数字标量——正则只扫字符串值时，
+# {"phone": 13812345678} 的 int 手机号会漏出）
+_SENSITIVE_KEYS = ("phone", "mobile", "id_card", "idcard", "id_number", "passport",
+                   "bank_card", "bankcard", "password", "secret", "token", "api_key",
+                   "手机", "电话", "身份证", "银行卡", "密码", "密钥")
+
+
+def _key_sensitive(k: Any) -> bool:
+    kl = str(k).lower()
+    return any(s in kl for s in _SENSITIVE_KEYS)
+
+
+def _scrub_value(v: Any, key: Any = None) -> Any:
+    if key is not None and _key_sensitive(key):
+        return "***"                                  # 键感知：命中即整值掩码
     if isinstance(v, str):
         from opensearch_pipeline.pii_patterns import scrub_image_text
         return scrub_image_text(v)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        # 数字标量：11+ 位纯数字（手机号/证件号量级）掩码——正则层只见字符串
+        if len(str(abs(int(v)))) >= 11:
+            return "***"
+        return v
     if isinstance(v, dict):
-        return {k: _scrub_value(x) for k, x in v.items()}
+        return {k: _scrub_value(x, key=k) for k, x in v.items()}
     if isinstance(v, (list, tuple)):
         return [_scrub_value(x) for x in v]
     return v

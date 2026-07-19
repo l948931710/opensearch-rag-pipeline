@@ -149,7 +149,22 @@ class _RedisRelay:
     def publish(self, ev: Any) -> None:
         try:
             from opensearch_pipeline.agent_runtime.events import dump_event
-            self._xadd(dump_event(ev))
+            payload = dump_event(ev)
+            # R3（P2-RT-24）：中继是 SSE 之外的**额外敏感副本**（Redis TTL 窗内可读）——
+            # 工具参数/待批参数入流前过 sanitize（进程内 SSE 主路径不动，权限门在端点）
+            try:
+                if isinstance(payload.get("arguments"), dict):
+                    from opensearch_pipeline.agent_runtime.sanitize import sanitize_args
+                    payload["arguments"] = sanitize_args(payload["arguments"])
+                pc = payload.get("pending_call")
+                if isinstance(pc, dict) and isinstance(pc.get("arguments"), dict):
+                    from opensearch_pipeline.agent_runtime.sanitize import sanitize_args
+                    pc = dict(pc)
+                    pc["arguments"] = sanitize_args(pc["arguments"])
+                    payload["pending_call"] = pc
+            except Exception:   # noqa: BLE001 — 脱敏失败不阻断中继（宁可少发不改语义）
+                pass
+            self._xadd(payload)
         except Exception:   # noqa: BLE001 — dump 失败同样只降级
             self._dead = True
             logger.warning("run %s 事件序列化失败（中继停发）", self._run_id, exc_info=True)

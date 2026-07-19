@@ -701,8 +701,11 @@ class ThreadedRunExecutor:
                                  "store 层，见 complete_run_atomic），跳过失败侧落库", run_id)
                 return
             if ok:
-                self._notify_complete(handle, ev, retrieved)
+                # R3（P2-RT-21）：durable 已 commit → **先发终态帧再跑缓存性回调**——
+                # 会话记忆/rolling summary（可能触发一次 LLM 调用）此前挡在终态 SSE 前，
+                # Redis/LLM 慢即用户白等；回调只做缓存性工作，后置零语义损失。
                 handle._emit(ev)
+                self._notify_complete(handle, ev, retrieved)
             else:
                 logger.error(
                     "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库",
