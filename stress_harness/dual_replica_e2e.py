@@ -192,7 +192,8 @@ def main() -> int:
         import pymysql
         while time.monotonic() < deadline:
             conn = pymysql.connect(host="localhost", port=3306, user="root",
-                                   password="your_password", database="fuling_operation")
+                                   password="your_password", database="fuling_operation",
+                                   ssl_disabled=True)   # 本地栈显式明文（B3 sweep 语义）
             try:
                 with conn.cursor() as cur:
                     cur.execute("SELECT run_id, status FROM agent_run "
