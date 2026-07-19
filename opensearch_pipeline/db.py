@@ -82,6 +82,13 @@ def _begin_txn(conn) -> None:
         return
     try:
         fn()
+        try:
+            # PERF-1（2026-07-19）：标记「本连接已 begin」——run_store 等下游多语句方法
+            # 的 _begin 探到即跳过（双 BEGIN 归一：每借出恰一次往返；flag off 时标记
+            # 缺席，下游照旧自 begin，两种姿态下都恰好一次）。
+            conn._rag_txn_begun = True
+        except Exception:   # noqa: BLE001 — 桩连接禁 setattr：退双 begin 旧行为（无害）
+            pass
     except Exception as e:  # noqa: BLE001 — begin 失败极罕见（连接刚取、健康）；绝不阻断读路径
         print(f"    ⚠️ [Pool] conn.begin() 失败（退化为无-begin 语义，不阻断）: {e}")
 

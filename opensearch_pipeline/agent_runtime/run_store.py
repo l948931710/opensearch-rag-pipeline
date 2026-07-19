@@ -154,6 +154,9 @@ def _begin(conn) -> None:
     照常 commit），complete_run_atomic/suspend_run_atomic 的原子性承诺整体作废。
     begin() 置 _transaction 位后 tough 重试关闭，断连如实抛错走回滚路径。
     仓内先例：spot_checker/cost_breaker 事务方法同款前置。桩连接无 begin 则跳过。"""
+    if getattr(conn, "_rag_txn_begun", False):
+        return          # PERF-1：db._get_db_conn 已 begin（唯一负责人）——免第二次往返；
+                        # RAG_DB_TXN_BEGIN=false 时标记缺席，本处照旧 begin（恰好一次）
     fn = getattr(conn, "begin", None)
     if fn is not None:
         fn()
@@ -296,7 +299,7 @@ class RDSRunStore:
 
     def record_turn(self, run_id: str, *, turn_index: int, tokens_prompt=None,
                     tokens_completion=None, tokens_total: int = 0,
-                    final: bool = False) -> None:
+                    final: bool = False, llm_rows=None) -> None:
         """原子记一个模型轮（perf 批次 C §4.5）：model_call step + 预算累加 + 心跳，
         **单连接单事务**——取代此前 heartbeat / append_step / consume_budget 三次
         连接+提交（每轮 4-5 次往返 → 1 次）。step_no 取号与 append_step 同式
@@ -322,6 +325,51 @@ class RDSRunStore:
                     f"UPDATE {db}.agent_run SET turns_used=turns_used+1, "
                     "tokens_used=tokens_used+%s, heartbeat_at=NOW(3) WHERE run_id=%s",
                     (int(tokens_total), run_id))
+                # PERF-3（2026-07-19）：成功模型调用的 llm_call_log 并入本事务——
+                # 记账离开用户等待路径的独立 INSERT+COMMIT（gateway 折叠缓冲注入）。
+                for row in (llm_rows or []):
+                    cur.execute(
+                        f"INSERT INTO {db}.llm_call_log "
+                        "(call_id, run_id, request_id, provider, model, category, "
+                        " prompt_version, tokens_prompt, tokens_completion, cost_estimate, "
+                        " latency_ms, status, user_id, dept_group, created_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
+                        (row.get("call_id") or uuid.uuid4().hex, run_id,
+                         row.get("request_id"), row.get("provider"), row.get("model"),
+                         row.get("category"), row.get("prompt_version"),
+                         row.get("tokens_prompt"), row.get("tokens_completion"),
+                         row.get("cost_estimate"), row.get("latency_ms"),
+                         row.get("status"), row.get("user_id"), row.get("dept_group")))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_tool_call(self, run_id: str, *, payload=None) -> None:
+        """PERF-2（2026-07-19）：工具轮记账单事务——tool_calls_used+1 + 心跳 +
+        tool_call agent_step 一次 commit（对齐 record_turn 先例：两事务两借还 → 一次；
+        「预算 +1 但步骤没记」的半态同时消失）。失败整体回滚，调用方 fail-open 回退
+        分段写（预算强制恒走 executor 本地计数）。"""
+        db = _op_db()
+        conn = self._conn()
+        _begin(conn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.agent_run SET tool_calls_used=tool_calls_used+1, "
+                    "heartbeat_at=NOW(3) WHERE run_id=%s", (run_id,))
+                cur.execute(
+                    f"SELECT COALESCE(MAX(step_no),0)+1 FROM {db}.agent_step WHERE run_id=%s",
+                    (run_id,))
+                step_no = int(cur.fetchone()[0])
+                cur.execute(
+                    f"INSERT INTO {db}.agent_step "
+                    "(run_id, step_no, kind, payload_json, created_at) "
+                    "VALUES (%s,%s,'tool_call',%s,NOW(3))",
+                    (run_id, step_no,
+                     json.dumps(payload or {}, ensure_ascii=False)))
             conn.commit()
         except Exception:
             conn.rollback()

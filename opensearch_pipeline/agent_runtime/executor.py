@@ -500,6 +500,10 @@ class ThreadedRunExecutor:
         token_budget = ctx.budget.token_budget
         # R2：秒级后台心跳 + Stage D durable cancel 轮询（见方法注）
         hb_stop = self._start_heartbeat_ticker(run_id, ctx, handle=handle)
+        try:
+            object.__setattr__(ctx, "_llm_fold", [])   # PERF-3：gateway 成功日志折叠缓冲
+        except Exception:   # noqa: BLE001 — 简化桩 ctx 禁 setattr：gateway 走同步旧路径
+            pass
         turns_counted = int((base or {}).get("turns_used", 0))       # turn_index 去重，同批多 call 只计一次
         tool_calls_used = int((base or {}).get("tool_calls_used", 0))
         tokens_used = int((base or {}).get("tokens_used", 0))
@@ -518,7 +522,7 @@ class ThreadedRunExecutor:
                         turns_counted = ev.turn_index + 1
                         tokens_used += ev.usage.total
                         # perf 批次 C §4.5：心跳+step+预算 单事务合并（fail-open，回退分段写）
-                        self._record_turn(run_id, ev.turn_index, usage=ev.usage)
+                        self._record_turn(run_id, ev.turn_index, usage=ev.usage, ctx=ctx)
                         if turns_counted > max_turns:
                             self._fail_over_budget(run_id, gen, handle, f"turns 预算超限（>{max_turns}）")
                             break
@@ -540,7 +544,18 @@ class ThreadedRunExecutor:
                         break
                     # tool_calls 预算：消费后超限即 fail-closed（在 adjudicate 执行副作用**之前**拦住）
                     tool_calls_used += 1
-                    self._budget_used(run_id, tool_calls=1)
+                    # PERF-2：预算+心跳+tool_call trace step 单事务（旧=裸 UPDATE 一笔；
+                    # 新=同一笔里补上词表里一直缺写手的 tool_call step，事务数不变）
+                    _rtc = getattr(self._store, "record_tool_call", None)
+                    if _rtc is not None:
+                        try:
+                            _rtc(run_id, payload={
+                                "tool_name": getattr(ev, "tool_name", None),
+                                "call_id": getattr(ev, "call_id", None)})
+                        except Exception:   # noqa: BLE001 — 单事务失败回退分段写
+                            self._budget_used(run_id, tool_calls=1)
+                    else:
+                        self._budget_used(run_id, tool_calls=1)
                     if tool_calls_used > max_tool_calls:
                         self._fail_over_budget(run_id, gen, handle, f"tool_calls 预算超限（>{max_tool_calls}）")
                         break
@@ -606,7 +621,7 @@ class ThreadedRunExecutor:
                 if isinstance(ev, RunCompleted):
                     # 最终答案也是一个模型轮 → 记 model_call step + 计 turn + 记 tokens。
                     # perf 批次 C §4.5：step+预算(+心跳)单事务合并（fail-open，回退分段写）
-                    self._record_turn(run_id, turns_counted, usage=ev.usage, final=True)
+                    self._record_turn(run_id, turns_counted, usage=ev.usage, final=True, ctx=ctx)
                     # P0-02（unknown-unknowns 批次1）：最终模型轮此前完全绕过强制——
                     # token_budget/deadline 不是硬上限。费用已发生 → 诚实记账（上一行）后
                     # post-call 复判：超限落 failed，绝不发 done。turns 语义**有意**维持
@@ -668,6 +683,13 @@ class ThreadedRunExecutor:
                     pass
             # RR-HA-01：__end__ 封流资格=「本 attempt 已写 durable 背书终态帧」——
             # CAS 输家/真相未知路径不封流（消费侧靠终态帧或 is_terminal_fn 探针收流）。
+            self._flush_llm_rows(getattr(ctx, "_llm_fold", None) or [])  # PERF-3 残留兜底
+            try:
+                _lf = getattr(ctx, "_llm_fold", None)
+                if _lf:
+                    del _lf[:]
+            except Exception:   # noqa: BLE001
+                pass
             handle._finish(end_relay=(not suspended)
                            and getattr(handle, "_relay_terminal", False))
             self._release()
@@ -865,24 +887,52 @@ class ThreadedRunExecutor:
             pass
 
     def _record_turn(self, run_id: Optional[str], turn_index: int,
-                     usage=None, final: bool = False) -> None:
+                     usage=None, final: bool = False, ctx=None) -> None:
         """每模型轮 durable 记账（perf 批次 C §4.5）：优先 store.record_turn 单事务
         （step+预算+心跳 1 次连接，取代 3 次）；store 无此法（测试桩/旧实现）或单事务
         失败 → 回退老三样（各自 fail-open）。预算强制恒走 _drive_gen 本地计数。"""
+        # PERF-3：把 gateway 折叠缓冲里的成功 LLM 日志并入本轮事务（一次 commit）
+        _fold = getattr(ctx, "_llm_fold", None) if ctx is not None else None
+        _rows = list(_fold) if _fold else []
+        if _fold:
+            del _fold[:]
         rt = getattr(self._store, "record_turn", None)
         if rt is not None:
             try:
-                rt(run_id, turn_index=turn_index,
-                   tokens_prompt=(usage.tokens_prompt if usage else None),
-                   tokens_completion=(usage.tokens_completion if usage else None),
-                   tokens_total=(usage.total if usage else 0), final=final)
+                try:
+                    rt(run_id, turn_index=turn_index,
+                       tokens_prompt=(usage.tokens_prompt if usage else None),
+                       tokens_completion=(usage.tokens_completion if usage else None),
+                       tokens_total=(usage.total if usage else 0), final=final,
+                       llm_rows=_rows)
+                except TypeError:               # 旧桩无 llm_rows：老签名 + 日志批量补写
+                    rt(run_id, turn_index=turn_index,
+                       tokens_prompt=(usage.tokens_prompt if usage else None),
+                       tokens_completion=(usage.tokens_completion if usage else None),
+                       tokens_total=(usage.total if usage else 0), final=final)
+                    self._flush_llm_rows(_rows)
                 return
             except Exception:   # noqa: BLE001 — 单事务失败 → 回退分段写（不阻断 run）
                 logger.warning("record_turn 单事务失败（回退分段写）", exc_info=True)
+                self._flush_llm_rows(_rows)
+                _rows = []
+        if _rows:
+            self._flush_llm_rows(_rows)
         if not final:
             self._heartbeat(run_id)   # 轮边界活跃心跳；final 轮沿旧行为不单发（transition 随即刷）
         self._record_model_step(run_id, turn_index, usage=usage, final=final)
         self._budget_used(run_id, turns=1, tokens=(usage.total if usage else 0))
+
+    def _flush_llm_rows(self, rows) -> None:
+        """PERF-3 兜底：折叠缓冲未能随轮事务落库时批量补写（fail-open——记账绝不阻断 run）。"""
+        if not rows:
+            return
+        try:
+            fn = getattr(self._store, "record_llm_calls", None)
+            if fn is not None:
+                fn(list(rows))
+        except Exception:   # noqa: BLE001
+            logger.warning("llm 折叠日志补写失败（丢弃 %d 行）", len(rows), exc_info=True)
 
     def _budget_used(self, run_id: Optional[str], **kw) -> dict:
         """durable 预算累加的容错包装（记账失败→{}，fail-open——**强制**不依赖它，

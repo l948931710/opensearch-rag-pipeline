@@ -382,6 +382,27 @@ class ModelGateway:
             return
         try:
             groups = getattr(ctx, "acl_groups", None)
+            # PERF-3（2026-07-19）：成功调用的日志**折叠进 ctx 缓冲**，随 executor 的
+            # record_turn 同事务落库——纯记账 INSERT+COMMIT 离开用户等待路径。
+            # 失败 attempt 维持同步直写（罕见+天然 durable——比引入新 outbox 简单且不丢）；
+            # RAG_AGENT_LLM_LOG_TURN_FOLD=false 或桩 ctx 无缓冲 → 旧同步路径。
+            _fold = getattr(ctx, "_llm_fold", None)
+            if (status == "ok" and _fold is not None
+                    and os.environ.get("RAG_AGENT_LLM_LOG_TURN_FOLD",
+                                       "true").strip().lower()
+                    in ("1", "true", "yes", "on")):
+                import uuid as _uuid
+                _fold.append({
+                    "call_id": _uuid.uuid4().hex,
+                    "request_id": getattr(ctx, "request_id", None),
+                    "provider": provider, "model": model, "category": category,
+                    "prompt_version": getattr(ctx, "prompt_version", None),
+                    "tokens_prompt": usage.tokens_prompt if usage else None,
+                    "tokens_completion": usage.tokens_completion if usage else None,
+                    "cost_estimate": None, "latency_ms": latency_ms, "status": status,
+                    "user_id": getattr(ctx, "user_id", None),
+                    "dept_group": (groups[0] if groups else None)})
+                return
             self._call_logger(
                 run_id=getattr(ctx, "run_id", None), request_id=getattr(ctx, "request_id", None),
                 provider=provider, model=model, category=category,
