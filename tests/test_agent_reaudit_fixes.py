@@ -251,6 +251,9 @@ def relay_env(monkeypatch):
     fake = _FakeRedis()
     monkeypatch.setenv("RAG_AGENT_EVENT_RELAY", "redis")
     monkeypatch.setenv("RAG_REDIS_URL", "redis://unit-test:6379/0")
+    # R3-P1 后 publish 默认异步（writer 线程）——本组断言流内容/顺序语义，钉回同步
+    # 保确定性（异步性能/丢帧语义在 test_agent_r3_relay_reconcile 专测）
+    monkeypatch.setenv("RAG_AGENT_EVENT_RELAY_ASYNC", "false")
     from opensearch_pipeline import redis_client
     monkeypatch.setattr(redis_client, "get_client", lambda: fake)
     return fake
