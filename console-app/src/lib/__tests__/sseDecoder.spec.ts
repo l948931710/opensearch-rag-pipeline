@@ -70,3 +70,22 @@ describe('createSseDecoder（refinement#7 流式边界）', () => {
     expect(seen).toEqual(['session', 'sources', 'chunk', 'done', '__done'])
   })
 })
+
+describe('RR-EVT-02 回放协议：event:/id: 帧', () => {
+  it('event: reset → __reset；id: 附着 __id（游标）', () => {
+    const d = createSseDecoder()
+    const enc = new TextEncoder()
+    const evs = d.push(enc.encode(
+      'event: reset\ndata: {}\n\n' +
+      'id: 123-0\ndata: {"type":"chunk","content":"全"}\n\n'))
+    expect(evs[0].type).toBe('__reset')
+    expect(evs[1].type).toBe('chunk')
+    expect((evs[1] as any).__id).toBe('123-0')
+  })
+
+  it('纯 data 帧行为不变（主 /ask 流零回归）', () => {
+    const d = createSseDecoder()
+    const evs = d.push(new TextEncoder().encode('data: {"type":"chunk","content":"x"}\n\n'))
+    expect(evs).toEqual([{ type: 'chunk', content: 'x' }])
+  })
+})

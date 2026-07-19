@@ -17,13 +17,26 @@ export interface SseDecoder {
   flush(): SseEvent[]
 }
 
-function parseFrame(rawLine: string): SseEvent | null {
-  const line = rawLine.trim()
-  if (line.indexOf('data:') !== 0) return null            // 只认 data: 行（无 event:/id:/retry:/心跳）
-  const payload = line.slice(5).trim()
+function parseFrame(rawFrame: string): SseEvent | null {
+  // RR-EVT-02 消费端：一帧可含 event:/id:/data: 多行（/runs/{id}/events 回放协议）。
+  // event: reset → {type:'__reset'}（客户端清屏 replace）；id: 附着为 __id（游标续读）。
+  let event = ''
+  let id = ''
+  let payload = ''
+  for (const rawLine of rawFrame.split('\n')) {
+    const line = rawLine.trim()
+    if (line.indexOf('event:') === 0) event = line.slice(6).trim()
+    else if (line.indexOf('id:') === 0) id = line.slice(3).trim()
+    else if (line.indexOf('data:') === 0) payload = line.slice(5).trim()
+  }
+  if (event === 'reset') return { type: '__reset' }
   if (!payload) return null
   if (payload === '[DONE]') return { type: '__done' }      // 字面量哨兵，非 JSON
-  try { return JSON.parse(payload) as SseEvent } catch { return null }  // 坏帧跳过，不打断流
+  try {
+    const ev = JSON.parse(payload) as SseEvent
+    if (id) (ev as any).__id = id
+    return ev
+  } catch { return null }                                  // 坏帧跳过，不打断流
 }
 
 export function createSseDecoder(): SseDecoder {

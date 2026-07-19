@@ -423,6 +423,11 @@ function finishAgentStream(ai: ChatMessage, seq: number): void {
     meta.disconnected = true
     pushStage(ai, 'reconnecting', '连接中断，转后台跟踪')
     ensureRunPolling(meta.runId)
+    void attachRunEvents(meta.runId, meta, ai, (m) => {   // RR-EVT-02：游标续读
+      m.html = renderMd(stripImg(m.raw || ''))
+      m.copyText = stripImg(m.raw || '')
+      bridge.schedulePersist()
+    })
     bridge.schedulePersist()
     return
   }
@@ -538,6 +543,11 @@ async function askAgent(preset?: string, skipUser = false): Promise<void> {
       meta.disconnected = true
       pushStage(ai, 'reconnecting', '连接中断，转后台跟踪')
       ensureRunPolling(meta.runId)
+      void attachRunEvents(meta.runId, meta, ai, (m) => {  // RR-EVT-02：游标续读
+        m.html = renderMd(stripImg(m.raw || ''))
+        m.copyText = stripImg(m.raw || '')
+        bridge.schedulePersist()
+      })
       bridge.schedulePersist()
       return
     }
@@ -791,6 +801,55 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
 /** 确保某 run 在轮询（终态自动停；隐藏页暂停、恢复可见立即补拍；suspended 慢拍；
  *  网络失败指数退避；state_key 未变的拍只打轻量 /status）。
  *  挂起卡挂载/断流/运行中心聚焦时调用。 */
+// ── RR-EVT-02 消费端：断线后经 /api/agent/runs/{id}/events 游标续读 ──────────
+// 协议：帧携 id:（Redis stream 游标）→ 重连带 Last-Event-ID 只收新帧；
+// event: reset（游标被 trim / relay 丢过 delta）→ **清空已积累答案 replace 重建**，
+// 杜绝「残缺增量+全文」拼接。404/异常回退既有 5s 轮询（relay 未开=旧行为）。
+async function attachRunEvents(runId: string, meta: any, ai: any,
+                               render: (m: any) => void): Promise<boolean> {
+  if (meta.eventsAttached) return true
+  meta.eventsAttached = true
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const headers: Record<string, string> = {}
+      if (meta.lastEventId) headers['Last-Event-ID'] = String(meta.lastEventId)
+      const res = await apiFetch(
+        `/api/agent/runs/${encodeURIComponent(runId)}/events`, { headers })
+      if (res.status === 404) return false            // relay 未启用：轮询兜底
+      if (!res.ok || !res.body) throw new ApiError('events 不可用', res.status)
+      const dec = createSseDecoder()
+      const reader = res.body.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        const evs = done ? dec.flush() : dec.push(value!)
+        for (const ev of evs) {
+          if ((ev as any).__id) meta.lastEventId = (ev as any).__id
+          if (ev.type === '__reset') {                // replace：清屏重建
+            ai.raw = ''
+            render(ai)
+          } else if (ev.type === 'chunk') {
+            ai.raw = (ai.raw || '') + String((ev as any).content || '')
+            render(ai)
+          } else if (ev.type === 'done') {
+            meta.gotTerminal = true
+            meta.status = 'succeeded'
+            render(ai)
+            return true
+          } else if (ev.type === 'error' || ev.type === '__done') {
+            return true                               // 终局（error 文案轮询水合）
+          }
+        }
+        if (done) break
+      }
+      if (meta.gotTerminal || RUN_TERMINAL.has(meta.status || '')) return true
+      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)))
+    }
+  } catch { /* 回退轮询 */ } finally {
+    meta.eventsAttached = false
+  }
+  return false
+}
+
 function ensureRunPolling(runId: string): void {
   if (!runId) return
   const known = runDetails.value[runId]?.run?.status
