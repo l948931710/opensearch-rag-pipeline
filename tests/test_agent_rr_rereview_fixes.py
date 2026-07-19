@@ -407,3 +407,40 @@ class TestRRAPR01DuplicateFromDb:
         assert '_dec0.get("reason") is not None' not in blk   # 旧跳过条件已灭
         assert "decided_by_effective = _db_by" in blk or "_db_by" in blk
         assert "status_code=503" in blk and "Retry-After" in blk
+
+
+class TestRRHA01bFinishOwnership:
+    """RB-HA-01b 探针翻绿：封流所有权收进 RunHandle._finish 本体——裸默认不再危险。"""
+
+    def _handle_with_relay(self):
+        from opensearch_pipeline.agent_runtime.executor import RunHandle
+        frames = []
+        h = RunHandle("r-ha1b")
+        h._relay = SimpleNamespace(end=lambda: frames.append("__end__"),
+                                   publish=lambda ev: None)
+        return h, frames
+
+    def test_bare_finish_without_ownership_never_ends(self):
+        h, frames = self._handle_with_relay()
+        h._finish()                                    # 裸默认（resume 交棒分支形态）
+        assert frames == []                            # 无所有权=不封流
+
+    def test_finish_with_ownership_ends_once(self):
+        h, frames = self._handle_with_relay()
+        h._relay_terminal = True
+        h._finish()
+        assert frames == ["__end__"]
+
+    def test_resume_handoff_loser_probe(self):
+        """复审探针翻绿：交棒失败 + CAS 输（durable 已 succeeded）⇒ 零 __end__——
+        与 373 行分支逐语句等价（helper 输 → 裸 _finish()）。"""
+        frames = []
+        from opensearch_pipeline.agent_runtime.executor import RunHandle
+        ex = _ex(_St(cas=False, actual="succeeded"))   # CAS 输且 durable 已成功
+        h = RunHandle("r-probe")
+        h._relay = SimpleNamespace(end=lambda: frames.append("__end__"),
+                                   publish=lambda ev: None)
+        ex._terminal_fail_durable("r-probe", h, "续跑交棒失败", retryable=True,
+                                  notify=False)
+        h._finish()                                    # 373 行的裸默认调用
+        assert frames == []                            # 输家不封流(探针原值=['__end__'])

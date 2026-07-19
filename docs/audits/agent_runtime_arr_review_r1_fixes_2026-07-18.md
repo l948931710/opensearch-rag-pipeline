@@ -128,6 +128,15 @@ reason）；egress 盖章前置到写型 ctx 副本替换之前（原 ctx 可见
 验证：4293 passed+全仓 ruff 绿；+6 探针测试（三探针全翻绿）+源级闸（DUPLICATE 分支
 禁 is-not-None 跳过）。
 
+### RB-HA-01b（第四刀）：封流所有权收进 RunHandle._finish 本体
+
+resume 交棒分支的裸 `_finish()`（默认 end_relay=True）在 helper CAS 输后仍封流——
+同轮修复内即回归，证明调用点纪律不够。修法照评审建议：`_finish` 本体加
+`_relay_terminal` 门（end_relay 之外还须所有权），不安全默认从此不存在，四个调用点
+统一被护；668 行调用点条件降级为无害冗余。+3 探针测试（裸 finish 无所有权=零 __end__/
+有所有权=恰一次/交棒输家场景翻绿）+1 旧协议测试改判（手工 handle 须显式持有所有权）。
+验证：4296 passed+全仓 ruff 绿。
+
 ## 6. 遗留（全部 user-gated）
 
 Gate C（当前 SHA 压测/staging/多副本演练/052+053 apply/真机断线续读 E2E）归 B7

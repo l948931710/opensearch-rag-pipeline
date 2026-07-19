@@ -276,6 +276,7 @@ def test_relay_publishes_events_and_end_sentinel(relay_env):
     assert h._relay is not None
     h._emit(ModelDelta(text="你好"))
     h._emit(RunCompleted(final_text="答案", streamed=True))
+    h._relay_terminal = True     # RR-HA-01b：封流所有权由 executor 在 durable 终态后授予
     h._finish()
     key = [k for k in relay_env.streams if "rid2" in k][0]
     payloads = [json.loads(f["data"]) for _eid, f in relay_env.streams[key]]

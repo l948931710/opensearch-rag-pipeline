@@ -143,7 +143,10 @@ class RunHandle:
         与挂起段共用同一 run_id 流，挂起点写 ``__end__`` 会让 /runs/{id}/events 回放在
         审批处永久收流——续跑段全部事件（含最终答案帧）经中继永不可达。"""
         self._put_local(_SENTINEL)          # P1-05：满队列也绝不阻塞收尾（挤最旧事件入哨兵）
-        if self._relay is not None and end_relay:
+        # RR-HA-01b：封流所有权收进本体——end_relay=True 之外还须 _relay_terminal
+        # （本 attempt 已写 durable 背书终态帧）。调用点纪律被证明不够（同轮修复内
+        # resume 交棒分支即回归）：不安全默认从此不存在，未来新分支想漏都漏不了。
+        if self._relay is not None and end_relay                 and getattr(self, "_relay_terminal", False):
             self._relay.end()               # __end__ 哨兵帧：消费侧据此收流
         self._done.set()
 
