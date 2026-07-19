@@ -202,7 +202,6 @@ def main() -> int:
                     rows = cur.fetchall()
             finally:
                 conn.close()
-            kill_rows = [x for x in rows if x[1] in ("running", "failed", "succeeded")]
             n_runs = len(rows)
             final_status = rows[0][1] if rows else None
             if final_status in ("failed", "succeeded"):
