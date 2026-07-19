@@ -816,9 +816,16 @@ def default_gateway(call_logger: Optional[Callable] = None) -> ModelGateway:
             return default
 
     plus, mx = "qwen3.7-plus", "qwen3.7-max-2026-06-08"
+    # RR-2（P2-RR-04）：high 档在**生产工厂**补链内 fallback（此前只改了 _DEFAULT_ROUTES
+    # 常量=死代码，工厂手写单模型）。plus 故障升档 mx 保可用（仅故障路径走，成本可控）；
+    # light 有意单模型快败；env 覆盖模型与 fallback 同模型时去重。
+    _high = os.environ.get("RAG_AGENT_MODEL_HIGH", plus)
+    _high_chain: List[RouteEntry] = [("dashscope", _high)]
+    if _high != mx:
+        _high_chain.append(("dashscope", mx))
     routes: Dict[str, List[RouteEntry]] = {
         "light": [("dashscope", os.environ.get("RAG_AGENT_MODEL_LIGHT", plus))],
-        "high":  [("dashscope", os.environ.get("RAG_AGENT_MODEL_HIGH", plus))],
+        "high":  _high_chain,
         "xhigh": [("dashscope", os.environ.get("RAG_AGENT_MODEL_XHIGH", mx)), ("dashscope", plus)],
         "max":   [("dashscope", os.environ.get("RAG_AGENT_MODEL_MAX", mx)), ("dashscope", plus)],
     }

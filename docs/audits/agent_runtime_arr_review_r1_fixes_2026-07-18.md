@@ -75,9 +75,8 @@ mid-run crash 合同书面化（SLO≈20min 内收尸=修法二+SLA）+收尸 op
 **R3-P2（11..25 十五条）**：11 finish_invocation 条件 CAS（rowcount 回报）；12
 consume_budget 显式 _begin；13 sanitizer 键感知+11 位数字标量掩码；14 义务链保留
 artifacts；15 幂等命中写 tool_replay 审计；16 RunSuspended 内部载荷 exclude 皮带；
-17 outbox drain 改 task_done 账本+agent_worker 关停排空；18 **核查结论**=CI
-db-integration 全量跑+preflight 防假绿（reviewer 观察到的 skip 为本地无库形态；当前
-SHA attestation 归 B7）；19 DUPLICATE 重放 reason 以库内决定行为准；20 EDITED 不可
+17 outbox drain 改 task_done 账本+agent_worker 关停排空；18 **核查结论已被复审推翻并纠正**（RR-2）：ci 的 agent 真库步骤实为**点名清单**
+（非全量），已扩入 dispatch_bind_db/operation_ledger/stage_d 三文件；attestation 仍归 B7；19 DUPLICATE 重放 reason 以库内决定行为准；20 EDITED 不可
 重驱→ops 告警；21 终态帧先于缓存性回调（summary 不再挡 SSE）；22 撤 sql.readonly.*
 预授；23 high 档补链内 fallback（light 有意快败）；24 relay 副本工具参数脱敏；25
 模型出口密级门 scaffold（RAG_AGENT_EGRESS_MAX_CLASS，tool_executor 盖章）。
@@ -86,7 +85,33 @@ SHA attestation 归 B7）；19 DUPLICATE 重放 reason 以库内决定行为准�
 未验证声明：多副本/kill-9 矩阵与当前 SHA 压测（Gate C=B7）；052/053 apply（user-gated）；
 钉钉/console 真机断线续读 E2E。
 
-## 4. 遗留（全部 user-gated）
+## 4. 复审（ARR-ReReview @e15fa8d，3.8/5.0）核查 + RR-1/RR-2 修复 as-built
+
+**核查裁决：七条全属实（0 纠偏）**——其中 P2-RR-04（改常量没接工厂=死代码）、
+P2-RR-05（frozen setattr 被自己的 except 吞=空操作）两条抓的是 R3 修复本身；
+P2-RR-06 推翻本台账 18 号核查结论（已上方纠正）。教训=验证深度：改常量必查消费方、
+setattr 必查 frozen、断言 CI 行为必读 job 定义——本轮起修复验收一律探针驱动。
+
+**RR-1（Sam 口令）**：①终态**全**收编——complete 异常/挂起失败/resume 交棒（原忽略
+CAS 返回值）/complete 输家×2 统一进 `_terminal_fail_durable`（加 frm 参数）与新
+`_declare_terminal_lost`（read-after-write：有事实按事实、succeeded/未知闭嘴）；
+源级闸测试锁「helper 之外不得 emit 终态」。②relay 控制帧**绝不丢**（writer 存活
+切片阻塞保序、死亡/60s 兜底同步直写乱序保达）+ `end()` 改 task_done 账本 flush
+（与 llm_log_outbox P2-RT-17 同款修法——同一天在两处犯同一竞态）。
+
+**RR-2**：reconciler 异常分支同退避（checker timeout=最常见查不清形态）；
+default_gateway 工厂 high 档真接 fallback（env 同模型去重）；DUPLICATE 经
+model_copy 按库内决定行**重建** outcome、决定行读不出**拒绝续跑**（绝不吃请求体
+reason）；egress 盖章前置到写型 ctx 副本替换之前（原 ctx 可见）；CI 点名清单+3
+真库文件；053 flag-conditional readiness critical（RAG_AGENT_OP_RECONCILE_ENABLE
+开 ⇒ 两列必在）+ api 接线。
+
+验证：4287 passed + 全仓 ruff 绿；12 条探针驱动新测试（复审 5 个探针场景全部翻绿）
++ 4 条旧断言改判（「真相未知仍发帧/合成作废帧」=双真相本体）。未收面（复审在案、
+非本批范围）：trim 后全文快照与客户端 reset/replace 实现（console 侧工程）、双副本
+断线 E2E、当前 SHA stress/attestation——均归 B7/Gate C。
+
+## 5. 遗留（全部 user-gated）
 
 Gate C（当前 SHA 压测/staging/多副本演练/052+053 apply/真机断线续读 E2E）归 B7
 user-gated；R1/R2/R3 代码面已全部落地。

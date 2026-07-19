@@ -106,17 +106,33 @@ class _RedisRelay:
 
     def _enqueue(self, payload: Dict[str, Any]) -> None:
         self._ensure_writer()
-        is_delta = payload.get("type") == "model_delta"
-        try:
-            if is_delta:
+        if payload.get("type") == "model_delta":
+            try:
                 self._q.put_nowait(payload)         # delta：队满即丢（可再生内容）
-            else:
-                self._q.put(payload, timeout=2.0)   # 控制帧：短等必达；仍满=Redis 长瘫
-        except queue.Full:
-            self._dropped += 1
-            if self._dropped in (1, 100) or self._dropped % 1000 == 0:
-                logger.warning("run %s 中继队列满，累计丢弃 %d 帧（delta 优先丢；"
-                               "Redis 延迟异常）", self._run_id, self._dropped)
+            except queue.Full:
+                self._dropped += 1
+                if self._dropped in (1, 100) or self._dropped % 1000 == 0:
+                    logger.warning("run %s 中继队列满，累计丢弃 %d 帧 delta"
+                                   "（Redis 延迟异常）", self._run_id, self._dropped)
+            return
+        # RR-1（RB-RR-02）：控制帧（tool/审批/终态/__end__）**绝不丢**——writer 存活
+        # 且未死标时切片阻塞等空位（保序；writer 在推进，等待有界）；writer 死亡/
+        # 超 60s 兜底**同步直写**（乱序优于丢失，响亮留痕）。_dead 后队列会被 writer
+        # 秒排空（_xadd_now 直接 return），不会死等。
+        deadline = time.monotonic() + 60.0
+        while True:
+            try:
+                self._q.put(payload, timeout=1.0)
+                return
+            except queue.Full:
+                if self._dead:
+                    return
+                if (self._writer is None or not self._writer.is_alive()
+                        or time.monotonic() >= deadline):
+                    logger.error("run %s 控制帧(%s)越过满队同步直写（乱序保达）",
+                                 self._run_id, payload.get("type"))
+                    self._xadd_now(payload)
+                    return
 
     def _xadd(self, payload: Dict[str, Any]) -> None:
         if self._dead:
@@ -172,9 +188,13 @@ class _RedisRelay:
     def end(self) -> None:
         self._xadd({"type": _END_TYPE})
         if self._async and self._q is not None:
-            try:                                     # 尽力排空（≤3s），进程退出不悬挂
+            try:
+                # RR-1（RB-RR-02）：flush 改 task_done 账本（unfinished_tasks）——
+                # 旧 empty() 轮询在「writer 已取走、XADD 未完成」窗口假装排空
+                # （与 P2-RT-17 llm_log_outbox 同款竞态，同款修法）。≤3s 不悬挂收尾线程。
                 _deadline = time.monotonic() + 3.0
-                while not self._q.empty() and time.monotonic() < _deadline:
+                while (getattr(self._q, "unfinished_tasks", 0) > 0
+                       and time.monotonic() < _deadline):
                     time.sleep(0.02)
                 self._q.put_nowait(None)             # 关闭 writer
             except Exception:   # noqa: BLE001

@@ -360,11 +360,14 @@ class ThreadedRunExecutor:
                 # 语义，此前只能等 reaper ~15min 收尸）；handle 已建则发终态帧+收流
                 # （中继消费者不空等）。审批凭据已消费属已知折衷（durable worker=PR-3）。
                 # 复查修正：条目可能已入队（线程创建失败类）时不反标——warm worker 仍会驱动。
-                self._transition_checked(run_id, "running", "failed")
+                # RR-1（RB-RR-01）：CAS 结果不再忽略——赢了才发终态帧（durable-first）
                 if handle is not None:
-                    handle._emit(RunFailed(error="续跑交棒失败（执行器不可用），请重试",
-                                           retryable=True))
+                    self._terminal_fail_durable(run_id, handle,
+                                                "续跑交棒失败（执行器不可用），请重试",
+                                                retryable=True, notify=False)
                     handle._finish()
+                else:
+                    self._transition_checked(run_id, "running", "failed")
             # 批次4（ultra executor:231 同族）：条目可能已入队时不释放槽（同 submit 注释——
             # 驱动器 finally 会释放同一份 _acquire，双释放侵蚀并发闸）。
             if not dispatch_maybe_scheduled:
@@ -576,16 +579,11 @@ class ThreadedRunExecutor:
                                        "tool_calls": tool_calls_used,
                                        "tokens": tokens_used})
                     if not transitioned and not self._transition_checked(run_id, "running", "suspended"):
-                        handle._emit(RunFailed(error="挂起状态落库失败，请重试", retryable=True))
-                        # 批次4（ultra executor:531）：失败侧回调补 D3 归属栅栏（对齐 567-571/
-                        # 588-592/596-600）——running→failed CAS 成立才证明本线程仍持有 run；
-                        # 挂起落库失败常因所有权已失（purge/收尸/取消抢先），此前 _safe_transition
-                        # 吞结果 + 无条件 _notify_failure，会在主体擦除后重插 qa_session_log 行。
-                        if self._transition_checked(run_id, "running", "failed"):
-                            self._notify_failure(handle, "挂起状态落库失败")
-                        else:
-                            logger.error("run %s 挂起落库失败收尾时已失去所有权（purge/收尸/"
-                                         "取消抢先），跳过失败侧落库", run_id)
+                        # RR-1（RB-RR-01）：durable-first（此前 emit-first）——D3 归属栅栏
+                        # 语义由 helper 承接（CAS 赢才 emit+notify；落空按事实/闭嘴）。
+                        self._terminal_fail_durable(run_id, handle,
+                                                    "挂起状态落库失败，请重试",
+                                                    retryable=True)
                         break
                     handle._emit(RunSuspended(approval_request_id=aid, checkpoint_id=cp_id,
                                               pending_call=ev.pending_call, turn_index=ev.turn_index))
@@ -690,15 +688,13 @@ class ThreadedRunExecutor:
             except Exception as e:   # noqa: BLE001 — durable 答案写失败：诚实落 failed
                 logger.error("run %s 最终答案落库失败——落 failed，绝不发 done（P0-01）",
                              run_id, exc_info=True)
-                handle._emit(RunFailed(
-                    error=f"最终答案落库失败，请重试（answer_persist_failed）: {str(e)[:200]}",
-                    retryable=True))
-                if self._transition_checked(run_id, "running", "failed"):
-                    self._notify_failure(handle, f"answer_persist_failed: {e}")
-                else:
-                    logger.error("run %s 答案落库失败收尾时已失去所有权或结果未知（commit ACK "
-                                 "丢失且消歧读也失败时 durable 可能已 succeeded——P0-03 消歧在 "
-                                 "store 层，见 complete_run_atomic），跳过失败侧落库", run_id)
+                # RR-1（RB-RR-01）：durable-first——此前先 emit 后 CAS，CAS 落空（commit
+                # ACK 丢失时 durable 可能已 succeeded，P0-03 消歧在 store 层）仍对外宣告
+                # 失败=双真相。统一走 helper：赢了才宣告，落空按库中事实/闭嘴。
+                self._terminal_fail_durable(
+                    run_id, handle,
+                    f"最终答案落库失败，请重试（answer_persist_failed）: {str(e)[:200]}",
+                    retryable=True)
                 return
             if ok:
                 # R3（P2-RT-21）：durable 已 commit → **先发终态帧再跑缓存性回调**——
@@ -710,8 +706,7 @@ class ThreadedRunExecutor:
                 logger.error(
                     "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库",
                     run_id)
-                handle._emit(RunFailed(
-                    error="run 已被系统收尸或取消（完成结果作废，请重试）", retryable=True))
+                self._declare_terminal_lost(run_id, handle)
             return
         # 旧路径（测试桩）：CAS 成立后 durable 回调降级为 best-effort（无事务缝可用）
         if self._transition_checked(run_id, "running", "succeeded"):
@@ -727,8 +722,22 @@ class ThreadedRunExecutor:
         else:
             logger.error(
                 "run %s 完成时已失去所有权（收尸/取消/排水抢先迁移），结果作废不落库", run_id)
+            self._declare_terminal_lost(run_id, handle)
+
+
+    def _declare_terminal_lost(self, run_id: Optional[str], handle: RunHandle) -> None:
+        """RR-1（RB-RR-01d）：完成侧输家（running→succeeded CAS 落空=run 已被他方迁移）
+        的对外宣告——read-after-write 按库中事实：cancelled/failed/expired ⇒ 事实帧
+        （SSE 不悬挂且与库一致）；succeeded/未知 ⇒ **不宣告**（durable 可能已有答案，
+        合成失败帧即说谎；critical 留痕交对账）。"""
+        actual = self._read_run_status(run_id)
+        if actual in ("cancelled", "failed", "expired"):
             handle._emit(RunFailed(
-                error="run 已被系统收尸或取消（完成结果作废，请重试）", retryable=True))
+                error=f"run 已被系统收尾为 {actual}（完成结果作废，请重试）",
+                retryable=True))
+            return
+        logger.critical("run %s 完成输家且现状=%s——不合成终态帧，交对账收敛",
+                        run_id, actual or "unknown")
 
     @staticmethod
     def _notify_complete(handle: RunHandle, ev: RunCompleted,
@@ -1009,7 +1018,7 @@ class ThreadedRunExecutor:
 
     def _terminal_fail_durable(self, run_id: Optional[str], handle: RunHandle, error: str,
                                *, to: str = "failed", retryable: bool = False,
-                               notify: bool = True) -> bool:
+                               notify: bool = True, frm: str = "running") -> bool:
         """R1（RB-RT-02）终态 durable-first 统一协议：**先赢 CAS 再对外宣告**——
         此前失败/取消/预算路径先 emit 后落库（与成功路径 P0-01 的 durable-first
         不对称），CAS 落空/写失败被吞时客户端已见终态、库里还是 running（双真相；
@@ -1019,7 +1028,7 @@ class ThreadedRunExecutor:
           **闭嘴**；现状=其它终态 ⇒ 按 DB 事实幂等宣告（SSE 不悬挂、内容与库一致）；
           现状=非终态/读不到 ⇒ **不宣告任何终态**（critical 留痕，交 reaper/对账——
           「没消息」诚实于「假终态」），返回 False。"""
-        if self._transition_checked(run_id, "running", to):
+        if self._transition_checked(run_id, frm, to):
             handle._emit(RunFailed(error=error, retryable=retryable))
             if notify:
                 self._notify_failure(handle, error)

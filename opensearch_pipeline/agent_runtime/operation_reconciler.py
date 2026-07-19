@@ -123,7 +123,11 @@ def reconcile_uncertain_invocations(run_store, registry, *,
                                inv_id, row.get("tool_name"), outcome, to_status)
             else:
                 counts["lost"] += 1        # 并发处置（人工先手）＝正常
-        except Exception:   # noqa: BLE001 — 单行故障不拖垮整轮（下轮重试）
+        except Exception as e:   # noqa: BLE001 — 单行故障不拖垮整轮（退避后下轮重试）
             counts["unknown"] += 1
-            logger.warning("自动对账：invocation %s 处置失败（下轮重试）", inv_id, exc_info=True)
+            # RR-2（P1-RR-03）：异常分支同样退避——checker 持续 timeout 是最常见的
+            # 「查不清」形态，此前不退避=老记录每轮立即回到最老批次（毒头修一半）
+            _backoff_row(row, f"处置异常:{type(e).__name__}")
+            logger.warning("自动对账：invocation %s 处置失败（已退避，下轮重试）",
+                           inv_id, exc_info=True)
     return counts

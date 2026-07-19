@@ -27,7 +27,7 @@ def test_default_gateway_full_routing_matrix(monkeypatch):
     plus, mx = "qwen3.7-plus", "qwen3.7-max-2026-06-08"
     assert gw._routes == {
         "light": [("dashscope", plus)],
-        "high":  [("dashscope", plus)],
+        "high":  [("dashscope", plus), ("dashscope", mx)],   # RR-2：工厂 high 补 fallback
         "xhigh": [("dashscope", mx), ("dashscope", plus)],   # 高阶档 429/5xx 退 plus
         "max":   [("dashscope", mx), ("dashscope", plus)],
     }

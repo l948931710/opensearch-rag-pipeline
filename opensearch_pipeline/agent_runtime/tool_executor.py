@@ -429,6 +429,17 @@ class ToolExecutor:
         # fencing——僵尸线程与对账放行后的重试并发提交至多一个 commit。ctx=None /
         # 简化 ctx（测试 SimpleNamespace 等，replace 抛 TypeError）静默跳过（fail-open：
         # 未注入=工具不写台账，回落人工对账，行为与 Stage C 之前一致）。
+        # RR-2（P2-RR-07，改自 R3 P2-RT-25）：密级盖章必须打在**原 ctx**上——下面写型
+        # 分支会 dataclasses.replace 出本地副本（注入 operation_id），盖在副本上时
+        # gateway 闭包持有的原 ctx 看不到（恰好写型工具最需要这道门）。故盖章前置。
+        try:
+            _rank = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+            _cls = str(spec.data_classification or "").lower()
+            _prev = str(getattr(ctx, "max_data_classification", "") or "").lower()
+            if ctx is not None and _rank.get(_cls, 0) > _rank.get(_prev, -1):
+                object.__setattr__(ctx, "max_data_classification", _cls)
+        except Exception:   # noqa: BLE001 — 盖章失败不碍执行（门未启用时零语义）
+            pass
         has_side_effects = spec.side_effects or spec.risk_level != RiskLevel.READ_ONLY
         if has_side_effects and ctx is not None and isinstance(inv_id, str):
             try:
@@ -451,16 +462,6 @@ class ToolExecutor:
         # audit（write-ahead）：执行前记合规审计。HIGH_WRITE fail-closed=审计不可写则阻断执行
         # （绝不产生无审计的高风险副作用）；READ_ONLY/LOW_WRITE fail-open（写失败仅告警不阻断）。
         # async_trace（恒 READ_ONLY ⇒ fail_closed=False）时审计入队伍随 FIFO 尾随 record。
-        # R3（P2-RT-25）：把本 run 已见最高数据密级盖到 ctx——model_gateway._egress_guard
-        # 据此在下一次模型调用前裁决（配 RAG_AGENT_EGRESS_MAX_CLASS 才生效）
-        try:
-            _rank = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
-            _cls = str(spec.data_classification or "").lower()
-            _prev = str(getattr(ctx, "max_data_classification", "") or "").lower()
-            if _rank.get(_cls, 0) > _rank.get(_prev, -1):
-                object.__setattr__(ctx, "max_data_classification", _cls)
-        except Exception:   # noqa: BLE001 — 盖章失败不碍执行（门未启用时零语义）
-            pass
         fail_closed = spec.risk_level == RiskLevel.HIGH_WRITE
         audit_kw = dict(
             event_type="tool_call", action=spec.qualified_name, decision="authorized",

@@ -104,7 +104,8 @@ def test_completion_cas_failure_suppresses_side_effects():
     ex.shutdown()
     assert completed == []                                   # 完成侧副作用被抑制
     assert not any(isinstance(e, RunCompleted) for e in events)
-    assert any(isinstance(e, RunFailed) and "作废" in e.error for e in events)
+    # RR-1 改判：输家不再无条件合成「作废」帧（真相未知闭嘴；有事实按事实）
+    assert not any(isinstance(e, RunFailed) and "作废" in e.error for e in events)
 
 
 def test_completion_cas_success_keeps_normal_path():

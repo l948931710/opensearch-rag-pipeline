@@ -344,7 +344,9 @@ def test_b4_suspend_persist_failure_fenced_failure_callback():
                   on_failure=lambda err: failures.append(err))
     evs = list(h.events())
     ex.shutdown()
-    assert any(isinstance(e, RunFailed) for e in evs)        # 对外仍诚实报失败帧
+    # RR-1 改判：双边 CAS 拒且真相未知（store 无终态事实）⇒ **不发终态帧**——
+    # 旧「对外仍诚实报失败帧」正是复审探针抓的双真相（客户端见 failed、库仍 running）
+    assert not any(isinstance(e, RunFailed) for e in evs)
     assert failures == [], "所有权已失（双边 CAS 拒）：失败侧落库回调必须被栅栏挡住"
 
     failures2 = []

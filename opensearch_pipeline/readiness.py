@@ -443,6 +443,22 @@ def durable_dispatch_contract_status() -> str:
     return _cached("durable_dispatch_contract", 60, _compute)
 
 
+def op_reconcile_contract_status() -> str:
+    """RR-2（P2-RR-06）：RAG_AGENT_OP_RECONCILE_ENABLE 开 ⇒ 053 两列必须在位——
+    缺列时退避/隔离整体回退旧「最老 LIMIT」语义（毒头阻塞重开），开着 flag 跑旧
+    语义的实例不该自以为有退避（critical）。"""
+    if not _flag_on("RAG_AGENT_OP_RECONCILE_ENABLE"):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        return _columns_exist(db, [("tool_invocation", "reconcile_attempts", "053"),
+                                   ("tool_invocation", "next_reconcile_at", "053")])
+
+    return _cached("op_reconcile_contract", 60, _compute)
+
+
 def ingest_lease_contract_status() -> str:
     """RAG_INGEST_LEASE_ENABLE 开 ⇒ 048 三 lease 列 + idx_lease_expiry（knowledge 库）
     必须在位——租约 stamping SQL 缺列即炸、摄取批全红（critical）。"""

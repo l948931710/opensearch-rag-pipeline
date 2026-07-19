@@ -142,7 +142,8 @@ def test_cas_lost_voids_result_writer_never_runs():
     events = _run(store, [ModelTurn(text="答案")], writer=writer)
     assert not any(isinstance(e, RunCompleted) for e in events)
     fails = [e for e in events if isinstance(e, RunFailed)]
-    assert fails and "作废" in fails[0].error
+    # RR-1 改判：完成输家 read-after-write——store 无终态事实 ⇒ 不合成「作废」帧
+    assert fails == []
     assert calls["writer"] == 0 and store.writer_ran == 0
     assert ("run1", "running", "succeeded") not in store.transitions
 

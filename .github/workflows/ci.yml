@@ -169,6 +169,9 @@ jobs:
           tests/test_agent_runtime_registry_store.py
           tests/test_agent_runtime_approval_store.py
           tests/test_agent_approval_integrity_db.py
+          tests/test_agent_dispatch_bind_db.py
+          tests/test_agent_pr3_operation_ledger.py
+          tests/test_agent_pr3_stage_d.py
           -q --tb=short -p no:cacheprovider
 
   # 供应链/密钥门（P2-03）：secret 扫描 + 依赖 CVE 审计。此前 CI 完全无安全门。
