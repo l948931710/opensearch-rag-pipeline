@@ -47,6 +47,13 @@ if "/tmp/pydeps" not in sys.path:
 # ═══════════════════════════════════════════════════════════════
 os.environ["RAG_SIMULATE"] = "false"
 os.environ["RAG_ENVIRONMENT"] = "production"
+
+# ── 生产安全姿态断言(批次5 P0-07d)——不设这两行,节点在 load_config() 就 ValueError 崩 ──
+# DataWorks 代码包从 claude/ontology-p0 打(≠main),production 启动须显式表态。
+# 这两个 flag 只被 api/retriever/readiness 读(服务侧),摄取与运维脚本零读取,设 true 无行为影响。
+# 2026-07-21 stage3 实地踩过;另一条路 RAG_ALLOW_LEGACY_OPEN_PROD=ack:<当日> 午夜过期,不适合调度任务。
+os.environ["RAG_REQUIRE_AUTH"] = "true"
+os.environ["RAG_ACL_FAIL_CLOSED"] = "true"
 # retention 是纯 RDS 作业，不碰检索后端/OSS。显式声明这两路走 mock：
 #   ① 短路 config 的 production 完整性守卫 R5（config.py:501「production 必须有检索后端，
 #      否则 EnvironmentMismatchError」）——2026-07-02 首跑即撞它；

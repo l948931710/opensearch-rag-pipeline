@@ -60,6 +60,13 @@ if "/tmp/pydeps" not in sys.path:
 os.environ["RAG_SIMULATE"] = "false"
 os.environ["RAG_ENVIRONMENT"] = "production"
 
+
+# ── 生产安全姿态断言(批次5 P0-07d)——不设这两行,节点在 load_config() 就 ValueError 崩 ──
+# DataWorks 代码包从 claude/ontology-p0 打(≠main),production 启动须显式表态。
+# 这两个 flag 只被 api/retriever/readiness 读(服务侧),摄取与运维脚本零读取,设 true 无行为影响。
+# 2026-07-21 stage3 实地踩过;另一条路 RAG_ALLOW_LEGACY_OPEN_PROD=ack:<当日> 午夜过期,不适合调度任务。
+os.environ["RAG_REQUIRE_AUTH"] = "true"
+os.environ["RAG_ACL_FAIL_CLOSED"] = "true"
 # ── 凭据：粘贴【清理stage3】顶部的 RAG_* 赋值（取消注释并填真值，或直接整段拷过来）──────
 # os.environ["DASHSCOPE_API_KEY"]         = "..."  # 监控不调 LLM，但 config 守卫 R5 要求 production 必须配
 # os.environ["RAG_RDS_HOST"]              = "..."

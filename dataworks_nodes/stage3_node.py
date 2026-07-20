@@ -50,6 +50,17 @@ SIMULATE = os.environ.get("RAG_NODE_SIMULATE", "false").strip().lower() in ("tru
 os.environ["RAG_SIMULATE"] = str(SIMULATE).lower()
 os.environ["RAG_ENVIRONMENT"] = "production"
 
+# ── 生产安全姿态断言(批次5 P0-07d)——不设这两行,节点在 load_config() 就 ValueError 崩 ──
+# DataWorks 的代码包是从 claude/ontology-p0 打的(≠ main),其 config.py 要求 production
+# 环境启动时【显式表态】:要么开这两个 flag,要么签当日 RAG_ALLOW_LEGACY_OPEN_PROD=ack:<YYYY-MM-DD>
+# (午夜过期,不适合偶发手动重跑)。2026-07-21 蒸发补推时实地踩过:节点 61.9s 后 exit 1。
+# 安全性说明:这两个 flag 只被 api.py / retriever.py / readiness.py 读取(服务侧);
+# 摄取侧 pipeline_nodes / dataworks_orchestrator / dag_definitions 【零读取】——已 grep 核实,
+# 故在批处理节点上设为 true 对管线行为无任何影响,纯粹满足启动表态。
+# 用 [] 直赋而非 setdefault:守卫要的是"确定为真",setdefault 在外部注入 false 时会失守。
+os.environ["RAG_REQUIRE_AUTH"] = "true"
+os.environ["RAG_ACL_FAIL_CLOSED"] = "true"
+
 # ── Robustness features (validated GO 2026-06-23; default-OFF in code, enabled here for prod) ──
 # Stage-3 node 04b. setdefault → overridable (set the env var to 'false' to disable).
 # Parity-verify: re-read HA3 after push + bounded re-push of silent drops (first prod runs healed
