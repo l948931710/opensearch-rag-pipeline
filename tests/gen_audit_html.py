@@ -16,7 +16,7 @@ from opensearch_pipeline.extraction.docx_extractor import extract_docx_with_imag
 from opensearch_pipeline.chunker import DocumentChunker
 import docx
 
-OUT_DIR = "/Users/laijunchen/Downloads/opensearch-rag-pipeline/tests/step_card_audit"
+OUT_DIR = "/Users/laijunchen/Projects/opensearch-rag-pipeline/tests/step_card_audit"
 if os.path.exists(OUT_DIR):
     shutil.rmtree(OUT_DIR)
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -76,7 +76,7 @@ def extract_image_blobs(docx_path, image_assets):
 
 
 for doc_path in DOCS:
-    full = os.path.join("/Users/laijunchen/Downloads/opensearch-rag-pipeline", doc_path)
+    full = os.path.join("/Users/laijunchen/Projects/opensearch-rag-pipeline", doc_path)
     if not os.path.exists(full):
         continue
     bn = os.path.basename(full)

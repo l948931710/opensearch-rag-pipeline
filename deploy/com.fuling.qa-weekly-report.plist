@@ -17,13 +17,13 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/Users/laijunchen/Downloads/opensearch-rag-pipeline/deploy/weekly_qa_report.py</string>
+    <string>/Users/laijunchen/Projects/opensearch-rag-pipeline/deploy/weekly_qa_report.py</string>
   </array>
-  <key>WorkingDirectory</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+  <key>WorkingDirectory</key><string>/Users/laijunchen/Projects/opensearch-rag-pipeline</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>RAG_ENV</key><string>metrics</string>
-    <key>PYTHONPATH</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+    <key>PYTHONPATH</key><string>/Users/laijunchen/Projects/opensearch-rag-pipeline</string>
     <key>RAG_REPORTS_DIR</key><string>/Users/laijunchen/fuling-rag-reports</string>
   </dict>
   <key>StartCalendarInterval</key>

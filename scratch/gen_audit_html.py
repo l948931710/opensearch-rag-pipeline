@@ -7,7 +7,7 @@ import os, sys, json, tempfile, shutil, html, math
 from collections import Counter
 from typing import List, Dict, Any
 
-sys.path.insert(0, '/Users/laijunchen/Downloads/opensearch-rag-pipeline')
+sys.path.insert(0, '/Users/laijunchen/Projects/opensearch-rag-pipeline')
 os.environ['RAG_ENV'] = 'test'
 from opensearch_pipeline.config import load_config
 import opensearch_pipeline.config as m; m._config = load_config()
@@ -15,7 +15,7 @@ from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
 from opensearch_pipeline.chunker import DocumentChunker
 from opensearch_pipeline.pipeline_nodes import _inject_image_ref_blocks
 
-SAMPLES_DIR = '/Users/laijunchen/Downloads/opensearch-rag-pipeline/scratch/eval_samples'
+SAMPLES_DIR = '/Users/laijunchen/Projects/opensearch-rag-pipeline/scratch/eval_samples'
 
 TEST_CASES = [
     ('pdf_sop.pdf',     'pdf',  'FL-ZS-WI-005《注塑收货报检》作业指导书-成品仓管.pdf', 'step'),

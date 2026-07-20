@@ -6,7 +6,7 @@ export const meta = {
 
 // args (object or JSON string): { shard_dir, n_shards, n_judges?:3 }
 const A = (typeof args === 'string') ? JSON.parse(args) : (args || {})
-const SHARD_DIR = A.shard_dir || '/Users/laijunchen/Downloads/opensearch-rag-pipeline/eval_harness/reports/shards'
+const SHARD_DIR = A.shard_dir || '/Users/laijunchen/Projects/opensearch-rag-pipeline/eval_harness/reports/shards'
 const N_SHARDS = A.n_shards || 0
 const N_JUDGES = A.n_judges || 3
 const pad = (n) => String(n).padStart(3, '0')

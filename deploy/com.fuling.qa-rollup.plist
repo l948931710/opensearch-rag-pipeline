@@ -23,11 +23,11 @@
     <string>--only</string>
     <string>qa_rollup</string>
   </array>
-  <key>WorkingDirectory</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+  <key>WorkingDirectory</key><string>/Users/laijunchen/Projects/opensearch-rag-pipeline</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>RAG_ENV</key><string>metrics</string>
-    <key>PYTHONPATH</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+    <key>PYTHONPATH</key><string>/Users/laijunchen/Projects/opensearch-rag-pipeline</string>
     <!-- OBS-4 SLO-breach alerts (optional): same webhook as the read-only agent
     <key>RAG_OPS_ALERT_WEBHOOK</key><string>https://oapi.dingtalk.com/robot/send?access_token=…</string>
     <key>RAG_OPS_ALERT_SECRET</key><string>SEC…</string> -->

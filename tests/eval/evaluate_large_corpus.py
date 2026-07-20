@@ -933,7 +933,7 @@ def main():
     client = _get_opensearch_client()
     
     base_dir = "/Users/laijunchen/fuling_raw_for_chunk_test"
-    faq_dir = "/Users/laijunchen/Downloads/opensearch-rag-pipeline/fuling_chunk_exp"
+    faq_dir = "/Users/laijunchen/Projects/opensearch-rag-pipeline/fuling_chunk_exp"
 
     # 1. 定义大批量MB级别的测试目标文档 (共21个)
     raw_tasks = [
