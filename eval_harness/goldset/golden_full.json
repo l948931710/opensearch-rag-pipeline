@@ -6782,10 +6782,12 @@
   "query": "公司发现童工后有哪些补救措施？",
   "kind": "positive",
   "expected_docs": [
-   "A4禁用童工与童工拯救程序"
+   "A4禁用童工与童工拯救程序",
+   "员工手册"
   ],
   "expected_doc_ids": [
-   "DOC_HR_20260514123024_B2D39E"
+   "DOC_HR_20260514123024_B2D39E",
+   "DOC_HR_20260513120631_D097E9"
   ],
   "resolution": [
    {
@@ -6795,9 +6797,17 @@
     "sim": 1.0,
     "permission_level": "public",
     "owner_dept": "hr"
+   },
+   {
+    "expected": "员工手册",
+    "title": "员工手册202108月.docx",
+    "doc_id": "DOC_HR_20260513120631_D097E9",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
    }
   ],
-  "answer_points": "答案需准确标注来源为《A4禁用童工与童工拯救程序》",
+  "answer_points": "答案需准确标注来源为《A4禁用童工与童工拯救程序》或《员工手册202108月》(手册汇编了同款补救条款)",
   "pass_criteria": "来源文档级标注正确",
   "keyword_gt": [],
   "difficulty": null,
@@ -6806,7 +6816,10 @@
   "expected_permission": [
    "public"
   ],
-  "live_scorable": true
+  "live_scorable": true,
+  "_audit": [
+   "2026-07-20 gold 扩 accept:补《员工手册202108月》D097E9——refreeze_20260720 排第1的手册 chunk 原文即含补救措施(已完成义务教育→送医体检+提报劳动局办手续;未完成→联系当地政府送回学校完成学业),汇编性文档真实覆盖本题;A4 仍为正主,命中任一算对(matching.py accept-any)"
+  ]
  },
  {
   "qid": "SRC-12",
@@ -6817,10 +6830,12 @@
   "query": "员工申诉的处理时效和委员会构成是什么？",
   "kind": "positive",
   "expected_docs": [
-   "A16员工申诉(抱怨)管理制度"
+   "A16员工申诉(抱怨)管理制度",
+   "员工手册"
   ],
   "expected_doc_ids": [
-   "DOC_HR_20260514123017_E44093"
+   "DOC_HR_20260514123017_E44093",
+   "DOC_HR_20260513120631_D097E9"
   ],
   "resolution": [
    {
@@ -6830,9 +6845,17 @@
     "sim": 1.0,
     "permission_level": "public",
     "owner_dept": "hr"
+   },
+   {
+    "expected": "员工手册",
+    "title": "员工手册202108月.docx",
+    "doc_id": "DOC_HR_20260513120631_D097E9",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
    }
   ],
-  "answer_points": "答案需准确标注来源为《A16员工申诉(抱怨)管理制度》",
+  "answer_points": "答案需准确标注来源为《A16员工申诉(抱怨)管理制度》或《员工手册202108月》(手册汇编了申诉章节)",
   "pass_criteria": "来源文档级标注正确",
   "keyword_gt": [],
   "difficulty": null,
@@ -6841,7 +6864,10 @@
   "expected_permission": [
    "public"
   ],
-  "live_scorable": true
+  "live_scorable": true,
+  "_audit": [
+   "2026-07-20 gold 扩 accept:补《员工手册202108月》D097E9——refreeze_20260720 排第1的手册 chunk 同时含委员会全构成名单与『申诉时效为10日(法定节假日顺延,延长不超过10日)』,完整覆盖本题两问;A16 仍为正主"
+  ]
  },
  {
   "qid": "SRC-13",
@@ -9052,5 +9078,152 @@
   "expected_images": [],
   "expected_permission": [],
   "live_scorable": true
+ },
+ {
+  "qid": "OFF-stockcode",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "subtype": "负例-离题拒答",
+  "dept": "边界控制",
+  "query": "富岭塑胶在哪个交易所上市,股票代码是多少?",
+  "kind": "negative",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "resolution": [],
+  "answer_points": "系统应拒答或返回无结果——该主题不在知识库覆盖范围内",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [],
+  "live_scorable": true,
+  "neg_type": "off_topic"
+ },
+ {
+  "qid": "OFF-competitor",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "subtype": "负例-离题拒答",
+  "dept": "边界控制",
+  "query": "竞争对手一次性纸杯的出厂报价是多少?",
+  "kind": "negative",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "resolution": [],
+  "answer_points": "系统应拒答或返回无结果——该主题不在知识库覆盖范围内",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [],
+  "live_scorable": true,
+  "neg_type": "off_topic"
+ },
+ {
+  "qid": "OFF-eustd",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "subtype": "负例-离题拒答",
+  "dept": "边界控制",
+  "query": "欧盟对可降解餐具的最新准入标准是什么?",
+  "kind": "negative",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "resolution": [],
+  "answer_points": "系统应拒答或返回无结果——该主题不在知识库覆盖范围内",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [],
+  "live_scorable": true,
+  "neg_type": "off_topic"
+ },
+ {
+  "qid": "OFF-ppfuture",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "subtype": "负例-离题拒答",
+  "dept": "边界控制",
+  "query": "PP 原料这个月的国际期货价格走势如何?",
+  "kind": "negative",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "resolution": [],
+  "answer_points": "系统应拒答或返回无结果——该主题不在知识库覆盖范围内",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [],
+  "live_scorable": true,
+  "neg_type": "off_topic"
+ },
+ {
+  "qid": "OFF-benchmark",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "subtype": "负例-离题拒答",
+  "dept": "边界控制",
+  "query": "同行业上市公司的平均毛利率大概是多少?",
+  "kind": "negative",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "resolution": [],
+  "answer_points": "系统应拒答或返回无结果——该主题不在知识库覆盖范围内",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [],
+  "live_scorable": true,
+  "neg_type": "off_topic"
+ },
+ {
+  "qid": "OFF-citypop",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "subtype": "负例-离题拒答",
+  "dept": "边界控制",
+  "query": "台州市的常住人口是多少?",
+  "kind": "negative",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "resolution": [],
+  "answer_points": "系统应拒答或返回无结果——该主题不在知识库覆盖范围内",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [],
+  "live_scorable": true,
+  "neg_type": "off_topic"
+ },
+ {
+  "qid": "OFF-logistics",
+  "source": "json_text",
+  "module": "rag_retrieval",
+  "subtype": "负例-离题拒答",
+  "dept": "边界控制",
+  "query": "从台州发一个集装箱到洛杉矶的海运费大概多少?",
+  "kind": "negative",
+  "expected_docs": [],
+  "expected_doc_ids": [],
+  "resolution": [],
+  "answer_points": "系统应拒答或返回无结果——该主题不在知识库覆盖范围内",
+  "pass_criteria": "应拒答 / 无结果",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [],
+  "live_scorable": true,
+  "neg_type": "off_topic"
  }
 ]
