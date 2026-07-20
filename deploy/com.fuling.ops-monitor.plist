@@ -31,11 +31,11 @@
            RAG_ENV=prod_ro /usr/bin/python3 -m opensearch_pipeline.reconcile --check raw
          (or add a separate weekly agent once that 1 doc's raw is triaged). -->
   </array>
-  <key>WorkingDirectory</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+  <key>WorkingDirectory</key><string>/Users/laijunchen/Projects/opensearch-rag-pipeline</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>RAG_ENV</key><string>prod_ro</string>
-    <key>PYTHONPATH</key><string>/Users/laijunchen/Downloads/opensearch-rag-pipeline</string>
+    <key>PYTHONPATH</key><string>/Users/laijunchen/Projects/opensearch-rag-pipeline</string>
     <!-- set these to deliver OBS-4 alerts on drift (else the alert path is a logged no-op):
     <key>RAG_OPS_ALERT_WEBHOOK</key><string>https://oapi.dingtalk.com/robot/send?access_token=…</string>
     <key>RAG_OPS_ALERT_SECRET</key><string>SEC…</string> -->

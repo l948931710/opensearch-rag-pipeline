@@ -44,7 +44,7 @@ STEP_RE = re.compile(
     re.MULTILINE,
 )
 
-docx_dir = "/Users/laijunchen/Downloads/opensearch-rag-pipeline/fuling_chunk_exp"
+docx_dir = "/Users/laijunchen/Projects/opensearch-rag-pipeline/fuling_chunk_exp"
 docx_files = sorted(glob.glob(os.path.join(docx_dir, "*.docx")))
 
 chunker_step = DocumentChunker(

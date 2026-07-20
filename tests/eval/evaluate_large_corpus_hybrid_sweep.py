@@ -1100,7 +1100,7 @@ def main():
     print("=======================================================\n")
     
     base_dir = "/Users/laijunchen/fuling_raw_for_chunk_test"
-    chunk_exp_dir = "/Users/laijunchen/Downloads/opensearch-rag-pipeline/fuling_chunk_exp"
+    chunk_exp_dir = "/Users/laijunchen/Projects/opensearch-rag-pipeline/fuling_chunk_exp"
 
     raw_tasks = [
         {"doc_id": "eval_it_finance_u8", "local_path": os.path.join(base_dir, "it/富岭U8+财务部操作手册.docx"), "category": "manual"},
@@ -1158,7 +1158,7 @@ def main():
                 dept = task["local_path"].split("/")[-2]
             
             # Try canonical JSON first, fallback to direct docx extraction
-            canon_file = os.path.join("/Users/laijunchen/Downloads/opensearch-rag-pipeline/processing/canonical", dept, doc_id, "v1", "content.canonical.json")
+            canon_file = os.path.join("/Users/laijunchen/Projects/opensearch-rag-pipeline/processing/canonical", dept, doc_id, "v1", "content.canonical.json")
             
             if os.path.exists(canon_file):
                 with open(canon_file, "r") as f:

@@ -42,7 +42,7 @@ SLEEP_S = 0.05            # 温和限速（topapi QPS 富裕，纯保险）
 def _load_env() -> None:
     # worktree 里没有 .env（gitignored）→ 兜底读主 checkout 的（凭证单一来源）。
     candidates = [_REPO_ROOT / ".env",
-                  Path("/Users/laijunchen/Downloads/opensearch-rag-pipeline/.env")]
+                  Path("/Users/laijunchen/Projects/opensearch-rag-pipeline/.env")]
     env = next((p for p in candidates if p.exists()), None)
     if env is None:
         return
