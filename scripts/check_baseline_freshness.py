@@ -91,6 +91,21 @@ def check_rag(cfg) -> None:
         cur_rr = f"{getattr(av, 'rerank_text_model', None)}/{getattr(av, 'rerank_vl_model', None)}"
         _check("rag.reranker_models", regime.get("reranker_models") == cur_rr,
                f"冻结 {regime.get('reranker_models')} vs 当前 {cur_rr}；{RAG_REFREEZE_HINT}")
+    # VLM 指纹哨兵(2026-07-20 P2)：visual_summary 是 l4ing 绑定分的输入,VLM 换代/缓存
+    # 版本提升 = caption 全体重掷,L4 分数不可与冻结值直接比较(0.8917→0.7167 曾烧一晚
+    # 二分)。仅当冻结基线已带指纹时比较（老基线宽容,与 baseline._LENIENT_REGIME_KEYS 同款）。
+    if regime.get("vlm_model") is not None:
+        ocr_cfg = getattr(cfg, "ocr", None)
+        cur_vlm = (getattr(ocr_cfg, "vlm_model", None)
+                   or getattr(ocr_cfg, "model", None)) if ocr_cfg is not None else None
+        _check("rag.vlm_model", regime.get("vlm_model") == cur_vlm,
+               f"冻结 vlm_model={regime.get('vlm_model')} vs 当前 {cur_vlm}——VLM 换代后 "
+               f"L4 图文绑定分不可比；{RAG_REFREEZE_HINT}")
+    if regime.get("vlm_cache_version") is not None:
+        cur_ns = os.environ.get("RAG_VLM_CACHE_VERSION", "2").strip() or "bare"
+        _check("rag.vlm_cache_version", regime.get("vlm_cache_version") == cur_ns,
+               f"冻结 vlm_cache_version={regime.get('vlm_cache_version')} vs 当前 {cur_ns}——"
+               f"缓存版本提升=存量 caption 整体重掷,L4 分数不可比；{RAG_REFREEZE_HINT}")
 
     # 文档漂移防复发（RB-05 D 层）：.env.example 示例模型必须跟 config 默认走
     if ENV_EXAMPLE.exists():

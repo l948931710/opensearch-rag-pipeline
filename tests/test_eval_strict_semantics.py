@@ -555,6 +555,44 @@ def test_regime_judge_keys_lenient_for_legacy_baseline():
     assert not ok2 and "judge_model" in diffs2                      # 新基线严格:judge 升级=换 regime
 
 
+def test_regime_includes_vlm_fingerprint(monkeypatch):
+    """VLM 指纹哨兵(2026-07-20 P2)：_regime() 记 vlm_model + vlm_cache_version;
+    _REGIME_KEYS 同步纳入——VLM 换代/缓存版本提升即换 regime,l4ing.* 拒绝跨代对比。"""
+    from types import SimpleNamespace
+    from eval_harness import baseline
+    import eval_harness.run_eval as rev
+    assert "vlm_model" in baseline._REGIME_KEYS
+    assert "vlm_cache_version" in baseline._REGIME_KEYS
+    monkeypatch.setenv("RAG_VLM_CACHE_VERSION", "7")
+    cfg = SimpleNamespace(llm=SimpleNamespace(model="q"), embedding=SimpleNamespace(model="e"),
+                          rag=SimpleNamespace(), alibaba_vector=None,
+                          ocr=SimpleNamespace(vlm_model="qwen3-vl-plus", model="qwen-vl-ocr"))
+    regime = rev._regime(cfg, "/nonexistent/goldset.json")
+    assert regime["vlm_model"] == "qwen3-vl-plus"
+    assert regime["vlm_cache_version"] == "7"
+    # vlm_model 为空时回退 ocr.model;ns 空串还原裸键形记 "bare"
+    monkeypatch.setenv("RAG_VLM_CACHE_VERSION", "")
+    cfg2 = SimpleNamespace(llm=SimpleNamespace(model="q"), embedding=SimpleNamespace(model="e"),
+                           rag=SimpleNamespace(), alibaba_vector=None,
+                           ocr=SimpleNamespace(vlm_model="", model="qwen-vl-ocr"))
+    regime2 = rev._regime(cfg2, "/nonexistent/goldset.json")
+    assert regime2["vlm_model"] == "qwen-vl-ocr"
+    assert regime2["vlm_cache_version"] == "bare"
+
+
+def test_regime_vlm_keys_lenient_for_legacy_baseline():
+    """VLM 键沿用 judge 键的宽容窗口：老基线缺键宽容,新基线有值严格。"""
+    from eval_harness.baseline import regime_matches
+    base_old = {"fusion": "weighted", "eval_set_sha": "x"}
+    cur = {"fusion": "weighted", "eval_set_sha": "x",
+           "vlm_model": "qwen3-vl-plus", "vlm_cache_version": "2"}
+    ok, diffs = regime_matches(base_old, cur)
+    assert ok and diffs == []
+    base_new = dict(cur, vlm_cache_version="1")                     # 缓存版本提升(1→2)
+    ok2, diffs2 = regime_matches(base_new, cur)
+    assert not ok2 and "vlm_cache_version" in diffs2                # 换 regime:分数不可比,逼 refreeze
+
+
 # ── P2-25：baseline 覆盖 l0/l2/l5/l6/judge 负例族 + coverage informational ────────
 
 
