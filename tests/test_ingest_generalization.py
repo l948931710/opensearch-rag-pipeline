@@ -566,6 +566,116 @@ def test_xlsx_procedure_autogen_figure_no_does_not_force_step_n():
         "anchor=15 的图必须走 step3（行号兜底），不应因 figure_no=图1 被劫持到 step1")
 
 
+def test_xlsx_procedure_evidence_scoring_rejects_junk_bigram():
+    """P0 证据评分(2026-07-20):杂词唯一共现不得竞价抢步骤。
+
+    旧单侧 IDF 下,「操作」只在 step2 文本出现(df_steps=1)→ 任何 caption 带「操作」
+    的图都能对 step2 打出 ≥0.8 强分;xlsx_sop 真实事故:电源图凭「上的+操作」抢走
+    step4,把真信号「归零」(img2)挤出局。新评分 weight=1/df_steps×1/df_pool:
+    「操作」出现在两张图 caption 里 → 权重减半 → 不足门槛;「归零」两侧唯一 → 满分绑定。"""
+    steps = [
+        "1\t接通电源启动设备并预热十分钟等待稳定。",
+        "2\t在操作面板按归零键完成调零后确认示值。",
+        "3\t取出样品放回原位并整理记录表单存档。",
+    ]
+    blocks = [{"block_type": "paragraph", "text": s, "page_num": 1, "source": "openpyxl",
+               "extra": {"step_no": i + 1, "row_role": "step",
+                         "row_num": 10 + i, "sheet_idx": 0}}
+              for i, s in enumerate(steps)]
+    assets = [
+        # 「操作」同时出现在 imgP/imgJ 两张图里(df_pool=2) → 对 step2 只值 0.5,骗不到强绑
+        _totext_asset(0, "ev_img0000.png",
+                      "操作人员手持黑色适配器插入墙壁电源插座", "", anchor_row=11,
+                      status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "ev_img0001.png",
+                      "显示屏示值已经归零，手指按压面板按键", "", anchor_row=12,
+                      status="ROUTE_TO_VECTOR"),
+        _totext_asset(2, "ev_img0002.png",
+                      "现场操作人员整理场地器具摆放", "", anchor_row=13,
+                      status="ROUTE_TO_VECTOR"),
+    ]
+    doc = _xlsx_doc("证据评分示例作业指导书.xlsx", blocks, assets, text="\n".join(steps))
+    chunks = _chunk_doc(doc)
+
+    step_cards = {c.extra.get("step_no"): c for c in chunks if c.chunk_type == "step_card"}
+    refs2 = [r["filename"] for r in (step_cards[2].extra.get("image_refs") or [])]
+    assert refs2 == ["ev_img0001.png"], (
+        f"step2 必须绑真信号「归零」图,不能被「操作」杂词图抢位: {refs2}")
+    refs1 = [r["filename"] for r in (step_cards[1].extra.get("image_refs") or [])]
+    assert refs1 == ["ev_img0000.png"], f"电源图应绑 step1: {refs1}"
+    refs3 = [r["filename"] for r in (step_cards[3].extra.get("image_refs") or [])]
+    assert refs3 == ["ev_img0002.png"], f"杂词图应走位置兜底落 step3: {refs3}"
+
+
+def test_xlsx_procedure_sibling_low_threshold_with_ratio_guard():
+    """兄弟附着(2026-07-20):raw Jaccard 0.235 的真兄弟对(qwen3-vl 换代后实测水位
+    0.195-0.209)必须能作为第二张图附着——旧 0.30 一刀切会拒绝;比例守卫(≥1.5× 次优)
+    保证低阈值不误粘无关图(次优 ~0.04)。"""
+    steps = [
+        "1\t接通电源启动设备并预热十分钟等待稳定。",
+        "2\t按归零键完成调零后确认示值稳定无漂移。",
+        "3\t把样品放上称量盘读取数值并记录归档。",
+    ]
+    blocks = [{"block_type": "paragraph", "text": s, "page_num": 1, "source": "openpyxl",
+               "extra": {"step_no": i + 1, "row_role": "step",
+                         "row_num": 10 + i, "sheet_idx": 0}}
+              for i, s in enumerate(steps)]
+    assets = [
+        _totext_asset(0, "sib_img0000.png",
+                      "一只手正在把黑色电源适配器插入白色墙壁插座，背景为深色台面",
+                      "", anchor_row=11, status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "sib_img0001.png",
+                      "一台白色电子天平放在实验台上，不锈钢称量盘正中放着样品",
+                      "", anchor_row=13, status="ROUTE_TO_VECTOR"),
+        # 与 img0000 同景不同措辞(raw jacc 0.235):必须兄弟附着到 step1 成第二张图
+        _totext_asset(2, "sib_img0002.png",
+                      "一只手正将黑色电源适配器插头插进墙上的白色多孔插座，旁边是金属台架和灰色外壳",
+                      "", anchor_row=15, status="ROUTE_TO_VECTOR"),
+    ]
+    doc = _xlsx_doc("兄弟附着示例作业指导书.xlsx", blocks, assets, text="\n".join(steps))
+    chunks = _chunk_doc(doc)
+
+    step_cards = {c.extra.get("step_no"): c for c in chunks if c.chunk_type == "step_card"}
+    refs1 = [r["filename"] for r in (step_cards[1].extra.get("image_refs") or [])]
+    assert refs1 == ["sib_img0000.png", "sib_img0002.png"], (
+        f"措辞漂移后的真兄弟图(jacc≈0.235)应附着 step1 为第二张图: {refs1}")
+    refs3 = [r["filename"] for r in (step_cards[3].extra.get("image_refs") or [])]
+    assert refs3 == ["sib_img0001.png"], f"天平图应留在 step3,不被误粘: {refs3}"
+
+
+def test_xlsx_procedure_same_anchor_dynamic_redirect():
+    """动态 redirect(2026-07-20):naturals 轮内先落位的图占掉 anchor 后,同 anchor
+    的下一张不得按位置公式硬塞相邻步骤——必须远端前向派位。静态 redirect 判定只看
+    进 P2 前的快照,接不住这种轮内新冲突(xlsx_sop era-A:img2 落 s3 后 img4 必须
+    避让到 s6,而不是塞进相邻的 s4)。"""
+    steps = [
+        "1\t第一道工序完成来料检查并确认无误。",
+        "2\t第二道工序装夹固定并对准基准线。",
+        "3\t第三道工序启动加工循环并巡检状态。",
+        "4\t第四道工序卸料清点并做好台账登记。",
+    ]
+    blocks = [{"block_type": "paragraph", "text": s, "page_num": 1, "source": "openpyxl",
+               "extra": {"step_no": i + 1, "row_role": "step",
+                         "row_num": 10 + i, "sheet_idx": 0}}
+              for i, s in enumerate(steps)]
+    # 无任何内容信号(空 caption) → 全走结构:z(a10)→s1,x(a12)→s2,
+    # y 与 x 同 anchor → 动态 redirect 远端前向 → s4(跳过与 s2 相邻的 s3)
+    assets = [
+        _totext_asset(0, "dr_img0000.png", "", "", anchor_row=10, status="ROUTE_TO_VECTOR"),
+        _totext_asset(1, "dr_img0001.png", "", "", anchor_row=12, status="ROUTE_TO_VECTOR"),
+        _totext_asset(2, "dr_img0002.png", "", "", anchor_row=12, status="ROUTE_TO_VECTOR"),
+    ]
+    doc = _xlsx_doc("动态避让示例作业指导书.xlsx", blocks, assets, text="\n".join(steps))
+    chunks = _chunk_doc(doc)
+
+    step_cards = {c.extra.get("step_no"): c for c in chunks if c.chunk_type == "step_card"}
+    refs4 = [r["filename"] for r in (step_cards[4].extra.get("image_refs") or [])]
+    assert refs4 == ["dr_img0002.png"], (
+        f"同 anchor 第二张图应远端前向到 step4,不得塞相邻 step3: {refs4}")
+    refs3 = step_cards[3].extra.get("image_refs") or []
+    assert not refs3, f"step3 应保持无图: {[r['filename'] for r in refs3]}"
+
+
 def test_docx_totext_fallback_unchanged():
     """非 XLSX 路径行为保持不变：非 step 的 DOCX 嵌入 TO_TEXT 图片不建独立
     image chunk（既有 [ref-enrich] 行为，避免本修复扩大爆炸半径）。"""

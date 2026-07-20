@@ -2804,6 +2804,53 @@ def _content_match_steps(img_text: str, candidates: list) -> tuple:
     return best_key, best_score, second
 
 
+_EVIDENCE_GRAM_CHARS = set("的了是在为与及或其该得着过")
+
+
+def _evidence_toks(s: str) -> set:
+    """P0 证据 token(2026-07-20):剔除含语法字的 bigram 与纯数字串。
+
+    「上的/按了」这类黏连 bigram 和「3098/12345」这类设备读数串会随机与某个步骤
+    唯一共现,在 IDF 评分下冒充强信号——它们不是动作语义,不算绑定证据。
+    """
+    import re
+
+    s = (s or "").lower()
+    cjk = re.findall(r'[一-鿿]', s)
+    bigrams = {cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1)}
+    bigrams = {t for t in bigrams if not (set(t) & _EVIDENCE_GRAM_CHARS)}
+    alnum = {t for t in re.findall(r'[a-z0-9]{2,}', s) if not t.isdigit()}
+    return bigrams | alnum
+
+
+def _evidence_match_steps(img_toks: set, step_toks_map: dict,
+                          df_steps: dict, df_pool: dict) -> tuple:
+    """把图片证据 token 匹配到最相关步骤——互斥稀有度评分(取代 P0 的单侧 IDF)。
+
+    weight(t) = 1/df_steps(t) × 1/df_pool(t):token 必须"步骤侧唯一 × 图片池侧唯一"
+    才能拿满权重(归零/读数/水平);在多张图 caption 里都出现的杂词(操作/设备)被
+    池侧分母压到 0.8 门槛之下。单侧 IDF 的教训:xlsx_sop 的电源图凭「上的+操作」
+    对 step4 打出全场最高分抢位,把真信号「归零」挤出局,VLM 措辞每重掷一次就换
+    一个杂词命中(docs/xlsx_binding_vlm_drift_2026-07-20_DRAFT.md)。
+
+    Returns: (best_key | None, best_score, second_score)。求和走 sorted(),与
+    _content_match_steps 同因:锁 bit-exact 跨运行恒定。
+    """
+    if not step_toks_map:
+        return None, 0.0, 0.0
+    if len(step_toks_map) < 2:
+        return next(iter(step_toks_map)), 0.0, 0.0
+    scored = sorted(
+        ((sum((1.0 / df_steps[t]) * (1.0 / df_pool.get(t, 1))
+              for t in sorted(img_toks & toks)), k)
+         for k, toks in step_toks_map.items()),
+        key=lambda x: (-x[0], x[1] if x[1] is not None else float("inf")),
+    )
+    best_score, best_key = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    return best_key, best_score, second
+
+
 def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
     """
     启发式图片注入 — 按 page_num 匹配 → 步骤边界 fallback → 末尾追加。
@@ -4330,6 +4377,22 @@ def node_chunk_documents(ctx: dict):
                             if _rn is not None:
                                 step_row_map[_ex["step_no"]] = _rn
 
+                    # P0 证据基建(两轮共用):步骤侧 token 集 + 步骤侧/全 asset 池侧 df。
+                    # 池侧 df 用全部 assets(含 TO_TEXT)——"这个词是不是多张图都在说"
+                    # 与路由无关,且保证两轮评分一致。
+                    _ev_step_toks = {c.extra.get("step_no"): _evidence_toks(c.chunk_text)
+                                     for c in step_cards}
+                    _ev_df_steps: Dict[str, int] = {}
+                    for _tks in _ev_step_toks.values():
+                        for _t in _tks:
+                            _ev_df_steps[_t] = _ev_df_steps.get(_t, 0) + 1
+                    _ev_df_pool: Dict[str, int] = {}
+                    for _a in assets:
+                        _atxt = ((_a.get("visual_summary") or "") + " "
+                                 + (_a.get("ocr_text") or "")).strip()
+                        for _t in _evidence_toks(_atxt):
+                            _ev_df_pool[_t] = _ev_df_pool.get(_t, 0) + 1
+
                     def _bind_pool(pool):
                         bound_nos = set()  # 本轮内 step_no already assigned an image
 
@@ -4350,11 +4413,14 @@ def node_chunk_documents(ctx: dict):
                         # 「操作示图」列的 figure_no（图N）多为按提取顺序自动编号、anchor_row 也常不可靠，
                         # 而图片描述里的动作关键词（归零/读数/电源）能更准地定位步骤。仅在强且唯一匹配时
                         # 按内容绑定；其余回退到 figure_no / anchor 顺序（保护描述稀疏的图片不被误绑）。
+                        # 评分走 _evidence_match_steps(互斥稀有度),不再用单侧 IDF 的
+                        # _content_match_steps——杂词唯一共现骗分是 VLM 措辞漂移放大器
+                        # (l4ing.jaccard.xlsx 0.89→0.72 的根因链之一)。
                         cms = []  # (margin, score, step_no, asset)
                         for a in pool:
                             it = ((a.get("visual_summary") or "") + " " + (a.get("ocr_text") or "")).strip()
-                            cands = [(c.extra.get("step_no"), c.chunk_text) for c in step_cards]
-                            sno, sc, sec = _content_match_steps(it, cands)
+                            sno, sc, sec = _evidence_match_steps(
+                                _evidence_toks(it), _ev_step_toks, _ev_df_steps, _ev_df_pool)
                             cms.append((sc - sec, sc, sno, a))
                         # 置信度（分差）高的先绑。当 (margin, score) 都相等时，按 asset 的
                         # 物理位置（anchor_row → image_index → filename）做兜底 tiebreaker，
@@ -4453,7 +4519,12 @@ def node_chunk_documents(ctx: dict):
                                 # backward：max_prev-sr 越大越好（离 prev 越远）
                                 return (is_forward, sr if is_forward else -(max_prev - sr), sr)
 
-                            # 1) Redirected 优先派位——claim 远端 slot
+                            # 1) Redirected 优先派位——claim 远端 slot。
+                            # _placed_redirects 记录已在本预派位轮落位的 asset id:naturals
+                            # 循环顶只能跳"确实已派位"的——anchor 登记(2026-07-20)让
+                            # _is_redirect 变成动态判定后,若仍按分类跳过,轮内新冲突的
+                            # 同 anchor 图会被静默丢进独立 image chunk 兜底。
+                            _placed_redirects = set()
                             for a in unbound:
                                 if not _is_redirect(a):
                                     continue
@@ -4466,16 +4537,21 @@ def node_chunk_documents(ctx: dict):
                                 target_idx, _ = max(cands, key=lambda ic: _far_score(ic, prev_steps))
                                 open_steps[target_idx].extra.setdefault("image_refs", []).append(_img_entry(a))
                                 consumed.add(target_idx)
+                                _placed_redirects.add(id(a))
+                                if ar is not None:
+                                    anchor_taken_steps.setdefault(ar, []).append(
+                                        open_steps[target_idx].extra.get("step_no"))
 
                             # 2) Naturals 走旧位置分配——保留 si=idx 的"位置对位"语义。
                             #    被 redirect 占用的位置：找未 consumed 中距离 nat_si 最近的位
                             #    （与旧"step_no 顺序"的兜底接近，避免 pack-from-front 错绑）。
                             # 2a) 兄弟图相似度优先：分配到 nat_si 之前，先看该 asset 是否与某个
-                            #     已绑图（任意 step）视觉描述+OCR bigram Jaccard ≥ 0.30 — 是则把
-                            #     它绑到那个 step（同 step 多图但分布在不同 anchor 的场景：
-                            #     xlsx_sop step2 = anchor=11 电源插入 + anchor=15 电源握持，
-                            #     两图 Jaccard=0.316；同 anchor 不同内容的 step4/step6
-                            #     img0002↔img0004 Jaccard=0.108 远低于阈值，不会误粘连）。
+                            #     已绑图（任意 step）视觉描述+OCR bigram Jaccard 构成强兄弟
+                            #     （≥0.15 且比其它步骤最高分高 1.5×）— 是则把它绑到那个 step
+                            #     （同 step 多图但分布在不同 anchor 的场景：xlsx_sop step2 =
+                            #     anchor=11 电源插入 + anchor=15 电源握持，qwen3-vl 措辞下两图
+                            #     Jaccard 0.195-0.209；同一台天平不同动作的假兄弟对 0.08-0.12，
+                            #     靠比例守卫拒绝，不会误粘连）。
                             #     必须在 naturals 循环中做（不能在 P1 后做）：sibling 图常自己也
                             #     是 unbound，要 naturals 把 orig_idx 较小的兄弟先按位置兜进 step
                             #     后，orig_idx 较大的同源图才能识别到 sibling。
@@ -4490,7 +4566,7 @@ def node_chunk_documents(ctx: dict):
                                 return ((r.get("visual_summary") or "") + " "
                                         + (r.get("ocr_text") or "")).strip()
                             for orig_idx, a in enumerate(unbound):
-                                if _is_redirect(a):
+                                if id(a) in _placed_redirects:
                                     continue
                                 # 2a sibling pass
                                 a_text = ((a.get("visual_summary") or "") + " "
@@ -4498,6 +4574,7 @@ def node_chunk_documents(ctx: dict):
                                 a_toks = _toks_for_sim(a_text)
                                 sib_step = None
                                 sib_jacc = 0.0
+                                sib_second = 0.0  # 其它步骤的最高相似度(比例守卫用)
                                 if a_toks:
                                     for c in step_cards:
                                         sno = c.extra.get("step_no")
@@ -4506,16 +4583,27 @@ def node_chunk_documents(ctx: dict):
                                         refs = c.extra.get("image_refs") or []
                                         if not refs or len(refs) >= P0_IMG_CAP:
                                             continue
+                                        step_best = 0.0
                                         for r in refs:
                                             r_toks = _toks_for_sim(_ref_text(r))
                                             if not r_toks:
                                                 continue
                                             jacc = len(a_toks & r_toks) / max(len(a_toks | r_toks), 1)
-                                            if jacc > sib_jacc:
-                                                sib_jacc = jacc
-                                                sib_step = sno
+                                            if jacc > step_best:
+                                                step_best = jacc
+                                        if step_best > sib_jacc:
+                                            sib_second = sib_jacc
+                                            sib_jacc = step_best
+                                            sib_step = sno
+                                        elif step_best > sib_second:
+                                            sib_second = step_best
                                 sib_bound = False
-                                if sib_step is not None and sib_jacc >= 0.30:
+                                # 阈值 0.30→0.15 + 跨步骤 1.5× 比例守卫(2026-07-20):VLM 换代后
+                                # 真兄弟对(xlsx_sop 两张电源图)实测 raw 0.195-0.209,0.30 一刀切
+                                # 已接不住;假兄弟对(同一台天平的不同动作照)0.08-0.12。低阈值
+                                # 必须配比例守卫——真兄弟对的次优候选 ~0.05(4×),假对彼此接近。
+                                if (sib_step is not None and sib_jacc >= 0.15
+                                        and (sib_second == 0.0 or sib_jacc >= 1.5 * sib_second)):
                                     # 邻接守卫：anchor 已被占用 且 target 与已占 step 相邻 → 让 nat_si 接管
                                     ar = a.get("anchor_row")
                                     skip_sib = False
@@ -4542,6 +4630,24 @@ def node_chunk_documents(ctx: dict):
                                         sib_bound = True
                                 if sib_bound:
                                     continue
+                                # 动态 redirect 复检(2026-07-20):本轮更早落位的图(P0/兄弟/
+                                # naturals)把同 anchor 占掉后,本图不能再按位置公式硬塞相邻位
+                                # ——同 anchor 第二张图走远端前向派位(与静态 redirect 同款
+                                # _far_score)。静态判定只看进 P2 前的快照,漏掉 naturals 轮内
+                                # 新产生的同 anchor 冲突(xlsx_sop:img2 落位后 img4 必须避让)。
+                                if _is_redirect(a):
+                                    _cands = [(i, c) for i, c in enumerate(open_steps)
+                                              if i not in consumed]
+                                    if not _cands:
+                                        break
+                                    _ti, _ = max(_cands, key=lambda ic: _far_score(
+                                        ic, anchor_taken_steps[a.get("anchor_row")]))
+                                    open_steps[_ti].extra.setdefault("image_refs", []).append(_img_entry(a))
+                                    consumed.add(_ti)
+                                    if a.get("anchor_row") is not None:
+                                        anchor_taken_steps.setdefault(a["anchor_row"], []).append(
+                                            open_steps[_ti].extra.get("step_no"))
+                                    continue
                                 if n_un == n_open:
                                     nat_si = orig_idx
                                 else:
@@ -4553,6 +4659,11 @@ def node_chunk_documents(ctx: dict):
                                     nat_si = min(free, key=lambda i: (abs(i - nat_si), i))
                                 open_steps[nat_si].extra.setdefault("image_refs", []).append(_img_entry(a))
                                 consumed.add(nat_si)
+                                # naturals 落位也登记 anchor——否则后续同 anchor 图看不到冲突,
+                                # 动态 redirect 永不触发。
+                                if a.get("anchor_row") is not None:
+                                    anchor_taken_steps.setdefault(a["anchor_row"], []).append(
+                                        open_steps[nat_si].extra.get("step_no"))
 
                     _bind_pool([a for a in assets if a.get("status") == "ROUTE_TO_VECTOR"])
                     _bind_pool([a for a in assets if a.get("status") == "ROUTE_TO_TEXT"])
