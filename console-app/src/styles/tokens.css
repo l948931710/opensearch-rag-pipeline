@@ -214,10 +214,10 @@ body {
 .led-head, .led-row {
   display: grid;
   /* 归属列 110px：容得下「生产·纸杯」等生产子线中文名（原 96px 会挤换行）；
-     更新列 118px = 16 字符等宽时间戳的贴身宽度；操作列 200px：hover 态 6 个【图标】操作
-     （可见/权限/预览/历史/升版/退役，size-7 方形，共约 178px）一行放下、不压更新列、不竖排。
-     （曾用 icon+文字，6 个约 330px 溢出本列、盖住更新时间——故改纯图标 + tooltip。） */
-  grid-template-columns: minmax(0, 1fr) 110px 56px 92px 118px 200px;
+     更新列 118px = 16 字符等宽时间戳的贴身宽度；操作列 110px（2026-07-19 重设计定案，原 200px
+     放 6 个悬停图标）：操作已收敛为 3 控件（版本历史/下载原始文件/更多操作菜单，size-7 方形 ×3
+     + 2×2px gap = 88px）；外部门只读行的文本徽标中最长的「已驳回 · 重新申请」允许换行（见下）。 */
+  grid-template-columns: minmax(0, 1fr) 110px 56px 92px 118px 110px;
   align-items: center;
   gap: 12px;
 }
@@ -229,15 +229,20 @@ body {
 .led-row[data-selected="1"], .led-row[data-selected="1"]:hover { background: color-mix(in srgb, var(--accent-soft) 70%, transparent); }
 .led-row[data-retired="1"] { opacity: .5; }
 .led-row[data-retired="1"]:hover { opacity: .85; }
+/* 台账容器不再 overflow-hidden（「更多操作」菜单弹层要外溢容器）：末行 hover/选中底色的
+   圆角由此兜底（容器 rounded-xl=12px，扣 1px 边框后 11px）。 */
+.led-row:last-child { border-radius: 0 0 11px 11px; }
 .led-sort { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; user-select: none; }
 .led-sort:hover { color: var(--text); }
 .led-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
-.led-actions button, .led-actions span { white-space: nowrap; }
+/* 操作列 110px 内不强制 nowrap：外部门行「已驳回 · 重新申请」徽标两行显示优于溢出压住更新列；
+   「更多操作」弹层的菜单项各自带 whitespace-nowrap（弹层按内容撑开，不受本列宽限制）。 */
 /* 行操作可见性：默认半透明常显（静态浏览/截图/新用户可感知入口），hover/focus 升满。
    原 opacity:0 纯 hover-reveal 有两个盲区——桌面新用户不知道要悬停；768–1024px 触屏
    （hover:none）既无悬停又不命中 ≤680px 卡片态媒体查询，操作与「审批中」等状态恒不可见。 */
 .doc-actions { opacity: .45; transition: opacity .13s; }
 .led-row:hover .doc-actions, .led-row:focus-within .doc-actions { opacity: 1; }
+.doc-actions[data-open="1"] { opacity: 1; }   /* 「更多操作」菜单展开中恒亮（不依赖 hover/focus） */
 @media (hover: none) { .doc-actions { opacity: 1; } }
 
 /* 会话历史行：hover 显删除 + 当前会话高亮（Atlas） */

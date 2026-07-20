@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { History } from '@lucide/vue'
+import { History, ArrowDownWideNarrow } from '@lucide/vue'
 import { useKb, type ApprovalHistoryItem } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
 import LoadError from './LoadError.vue'
+import QueuePager from './QueuePager.vue'
 
 // 审批历史（只读时间线）：四条审批流的历史决策合并展示，数据来自 /api/kb/approval-history。
 // 后端已按角色作用域（dept_admin 本部门 access+contribution、kb_admin 全库四类）+ PII 脱敏；
@@ -39,6 +40,22 @@ const chips = computed(() => {
 const activeKind = ref('all')
 const rows = computed(() =>
   activeKind.value === 'all' ? approvalHistory.value : approvalHistory.value.filter((r) => r.kind === activeKind.value))
+function pickKind(key: string) { activeKind.value = key; pageReq.value = 1 }
+
+// ── 前端分页 + 时间排序（设计稿 2026-07-19 §2：历史时间线 3 条/页；按决策时间 decided_at，默认新→旧）──
+// 分页作用于类型筛选后的 rows；筛选/排序切换回第 1 页，页码经 computed 收敛不越界。
+const PER_PAGE = 3
+const sortDesc = ref(true)
+const pageReq = ref(1)
+const sorted = computed(() =>
+  [...rows.value].sort((a, b) => {
+    const cmp = (a.decided_at || '').localeCompare(b.decided_at || '')
+    return sortDesc.value ? -cmp : cmp
+  }))
+const pages = computed(() => Math.max(1, Math.ceil(sorted.value.length / PER_PAGE)))
+const page = computed(() => Math.min(pageReq.value, pages.value))
+const paged = computed(() => sorted.value.slice((page.value - 1) * PER_PAGE, page.value * PER_PAGE))
+function toggleSort() { sortDesc.value = !sortDesc.value; pageReq.value = 1 }
 
 // 元信息行：申请人/作者/目标 · 归属部门 · 决策人（缺失项自动省略）。
 function subjectLabel(r: ApprovalHistoryItem): string {
@@ -65,6 +82,11 @@ function metaOf(r: ApprovalHistoryItem): string {
         <History :size="16" :stroke-width="1.75" class="shrink-0 text-accent-text" />
         <span class="text-sm font-semibold text-foreground">审批历史</span>
         <span class="rounded-full bg-accent-strong px-2 py-px text-[11px] font-bold text-white">{{ approvalHistory.length }}</span>
+        <button
+          type="button" data-testid="queue-sort"
+          class="inline-flex items-center gap-1 rounded-full border border-border px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground transition hover:bg-panel"
+          title="按决策时间排序，点击切换" @click="toggleSort"
+        ><ArrowDownWideNarrow :size="11" :stroke-width="1.75" /> <span class="tabular-nums">{{ sortDesc ? '新→旧' : '旧→新' }}</span></button>
         <div class="flex-1" />
         <div class="flex flex-wrap gap-1" role="tablist" aria-label="审批类型筛选">
           <button
@@ -72,7 +94,7 @@ function metaOf(r: ApprovalHistoryItem): string {
             :aria-selected="activeKind === c.key"
             class="rounded-full border px-2.5 py-1 text-[12px] font-medium transition"
             :class="activeKind === c.key ? 'border-accent-strong bg-card text-accent-text' : 'border-border text-muted-foreground hover:text-foreground'"
-            @click="activeKind = c.key"
+            @click="pickKind(c.key)"
           >{{ c.label }}</button>
         </div>
       </div>
@@ -85,16 +107,16 @@ function metaOf(r: ApprovalHistoryItem): string {
         当前筛选无记录。
       </div>
 
-      <!-- 时间线 -->
+      <!-- 时间线（当前页切片，3 条/页） -->
       <div v-else class="px-[18px] py-4">
         <div
-          v-for="(r, i) in rows" :key="i"
+          v-for="(r, i) in paged" :key="i"
           class="flex gap-3.5 pb-4 last:pb-0"
         >
-          <!-- 时间线轴（点色随决策动作） -->
+          <!-- 时间线轴（点色随决策动作；连线只连到本页最后一条） -->
           <div class="flex shrink-0 flex-col items-center pt-1">
             <span class="size-2.5 rounded-full" :class="act(r.action).dot" />
-            <span v-if="i < rows.length - 1" class="mt-1 w-px flex-1 bg-border" />
+            <span v-if="i < paged.length - 1" class="mt-1 w-px flex-1 bg-border" />
           </div>
           <!-- 该条内容 -->
           <div class="min-w-0 flex-1 pb-1">
@@ -111,6 +133,8 @@ function metaOf(r: ApprovalHistoryItem): string {
           </div>
         </div>
       </div>
+      <!-- 翻页脚（作用于筛选后的行；单页自隐） -->
+      <QueuePager v-if="rows.length" :total="sorted.length" :page="page" :per-page="PER_PAGE" @update:page="pageReq = $event" />
     </div>
   </section>
 </template>

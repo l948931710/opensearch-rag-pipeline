@@ -62,12 +62,16 @@ describe('AccessRequestQueue', () => {
     expect(mountQueue([]).find('section').exists()).toBe(false)
   })
 
-  it('有数据 → 行 + 绿头计数 + 授权/驳回', () => {
+  it('有数据 → 行 + 橙头计数 + 授权/驳回（待处理=琥珀，设计稿 2026-07-19 §1）', () => {
     const w = mountQueue([REQ])
     expect(w.text()).toContain('授权申请')
     expect(w.text()).toContain('申请访问《营销规范》')
     expect(w.text()).toContain('授权')
     expect(w.text()).toContain('驳回')
+    // 头部语义：st-busy 底 + st-busy 计数（原绿头改橙）
+    expect(w.find('[class*="bg-st-busy/"]').exists()).toBe(true)
+    expect(w.find('span[class*="rounded-full"][class*="bg-st-busy"]').text()).toBe('1')
+    expect(w.find('[class*="bg-accent-soft"][class*="border-b"]').exists()).toBe(false)
   })
 
   it('approveAccess（DEV preview）→ 本地移除该行', async () => {
@@ -76,6 +80,38 @@ describe('AccessRequestQueue', () => {
     ;(kb as any).accessRequests.value = [REQ, { ...REQ, id: 'ar2' }]
     await kb.approveAccess(REQ)
     expect(kb.accessRequests.value.map((r) => r.id)).toEqual(['ar2'])
+  })
+
+  // ── 分页 + 排序（设计稿 2026-07-19 §2：队列 2 条/页，按申请时间默认新→旧）──
+  const reqAt = (id: string, created_at: string): AccessRequestItem => ({ ...REQ, id, doc_title: `文档${id}`, created_at })
+
+  it('分页：5 条 → 2 条/页；默认新→旧；翻页脚「第 x–y 条 · 共 N 条」', async () => {
+    const w = mountQueue([
+      reqAt('r1', '2026-07-01 09:00'), reqAt('r2', '2026-07-02 09:00'), reqAt('r3', '2026-07-03 09:00'),
+      reqAt('r4', '2026-07-04 09:00'), reqAt('r5', '2026-07-05 09:00'),
+    ])
+    expect(w.text()).toContain('文档r5')
+    expect(w.text()).toContain('文档r4')
+    expect(w.text()).not.toContain('文档r1')
+    expect(w.find('[data-testid="pager-info"]').text()).toBe('第 1–2 条 · 共 5 条')
+    await w.find('[aria-label="下一页"]').trigger('click')
+    expect(w.text()).toContain('文档r3')
+    expect(w.find('[data-testid="pager-info"]').text()).toBe('第 3–4 条 · 共 5 条')
+  })
+
+  it('排序切换 → 旧→新 + 回第 1 页；审批后变短 → 页码收敛不越界', async () => {
+    const w = mountQueue([reqAt('r1', '2026-07-01 09:00'), reqAt('r2', '2026-07-02 09:00'), reqAt('r3', '2026-07-03 09:00')], 'dev-preview')
+    const kb = useKb()
+    await w.find('[data-testid="queue-sort"]').trigger('click')
+    expect(w.find('[data-testid="queue-sort"]').text()).toContain('旧→新')
+    expect(w.text()).toContain('文档r1')                          // 旧→新第 1 页 = 最旧两条
+    expect(w.text()).not.toContain('文档r3')
+    // 到第 2 页后审批掉一条 → 只剩 2 条 = 单页，翻页脚自隐、行不丢
+    await w.find('[aria-label="下一页"]').trigger('click')
+    await kb.approveAccess(kb.accessRequests.value[0])            // DEV preview 本地移除
+    await vi.waitFor(() => expect(w.find('[data-testid="queue-pager"]').exists()).toBe(false))
+    expect(w.text()).toContain('文档r2')
+    expect(w.text()).toContain('文档r3')
   })
 })
 

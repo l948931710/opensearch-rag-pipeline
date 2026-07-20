@@ -118,4 +118,36 @@ describe('ApprovalHistory', () => {
     await chip.trigger('click')
     expect(w.text()).toContain('当前筛选无记录')
   })
+
+  // ── 分页 + 排序（设计稿 2026-07-19 §2：历史时间线 3 条/页，按决策时间默认新→旧）──
+  const histAt = (i: number, decided_at: string): ApprovalHistoryItem => ({ ...ACCESS, title: `记录${i}`, decided_at })
+
+  it('分页：5 条 → 3 条/页；默认新→旧；翻页脚「第 x–y 条 · 共 N 条」', async () => {
+    const w = mountView([1, 2, 3, 4, 5].map((i) => histAt(i, `2026-07-0${i} 10:00:00`)))
+    // 第 1 页 = 最新三条（05/04/03）
+    expect(w.text()).toContain('记录5')
+    expect(w.text()).toContain('记录3')
+    expect(w.text()).not.toContain('记录2')
+    expect(w.find('[data-testid="pager-info"]').text()).toBe('第 1–3 条 · 共 5 条')
+    await w.find('[aria-label="下一页"]').trigger('click')
+    expect(w.text()).toContain('记录2')
+    expect(w.text()).toContain('记录1')
+    expect(w.find('[data-testid="pager-info"]').text()).toBe('第 4–5 条 · 共 5 条')
+    // 排序切换 → 旧→新 + 回第 1 页
+    await w.find('[data-testid="queue-sort"]').trigger('click')
+    expect(w.find('[data-testid="queue-sort"]').text()).toContain('旧→新')
+    expect(w.text()).toContain('记录1')
+    expect(w.text()).not.toContain('记录4')
+  })
+
+  it('类型筛选切换 → 回第 1 页（翻页后再筛选不残留越界页码）；≤3 条单页自隐翻页脚', async () => {
+    const items = [1, 2, 3, 4].map((i) => histAt(i, `2026-07-0${i} 10:00:00`))
+    const w = mountView([...items, { ...CONTRIB, decided_at: '2026-06-01 09:00:00' }])
+    await w.find('[aria-label="下一页"]').trigger('click')                          // 第 2 页
+    const chip = w.findAll('button').find((b) => b.text() === '知识贡献')!
+    await chip.trigger('click')                                                     // 筛选 → 回第 1 页
+    expect(w.text()).toContain('龙盛机速度是多少')
+    expect(w.text()).not.toContain('记录4')
+    expect(w.find('[data-testid="queue-pager"]').exists()).toBe(false)              // 1 条 = 单页自隐
+  })
 })

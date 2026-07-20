@@ -209,6 +209,11 @@ const retireBusy = ref(false)
 // File 真身【绝不进响应式】（Vue3 Proxy 会破坏 xhr.send(file)）——留模块闭包。
 let selectedFiles: File[] = []
 const DOCS_PAGE = 50                  // 台账翻页页大小（= 后端 limit 上限）
+// 服务端 offset 上界镜像（api.py::_KB_MAX_OFFSET=10000，防深分页扫表）：超界的深页服务端会
+// 钳到上界（同一页数据反复返回），前端在此之前就禁掉——loadDocsPage 兜底不发请求，UI 层提示。
+const KB_MAX_OFFSET = 10000
+const DOCS_MAX_PAGE = Math.floor(KB_MAX_OFFSET / DOCS_PAGE) + 1   // 可达最深页（offset=10000 → 第 201 页）
+const docsPage = ref(1)               // 当前页号（1 起；页码翻页器口径，loadDocsPage 落地时更新）
 let docsOffset = 0                    // 当前已加载到的 offset（首屏 0；每翻一页 +DOCS_PAGE）
 let docsSeq = 0
 let trackSeq = 0
@@ -434,13 +439,18 @@ function clearLedgerFilters() {
   applyLedgerFilter()
 }
 
-async function loadDocs() {
+// 按页号拉取并【替换】docs（设计稿页码翻页器语义；loadDocs = loadDocsPage(1)，筛选/搜索/scope
+// 变化沿用既有 loadDocs 重置路径 → 自动回第 1 页）。复用 docsUrl 构造 + docsSeq 竞态守卫。
+async function loadDocsPage(page: number) {
+  const target = Math.max(1, Math.floor(page) || 1)
+  const offset = (target - 1) * DOCS_PAGE
+  if (offset > KB_MAX_OFFSET) return       // 深页兜底：超出服务端 offset 上界不发请求（UI 层已提示）
   const seq = ++docsSeq
   loadingDocs.value = true
-  docsOffset = 0
   clearLoadError('docs')
   try {
     // DEV ?preview：注入 mock（含外部门 can_manage=false 行）以可视化全部门只读浏览；prod 死代码消除。
+    // mock 不足一页 → 恒第 1 页（翻页器单页自隐，误调 loadDocsPage(n>1) 也不崩）。
     if (import.meta.env.DEV && useSession().token === 'dev-preview') {
       const mine: DocItem[] = [
         { doc_id: 'm1', title: '营销物料使用规范 v3', original_filename: 'guideline.pdf', owner_dept: 'marketing', permission_level: 'dept_internal', current_version_no: 3, status: 'active', status_badge: '已上线', updated_at: '2026-06-26 10:00', can_manage: true, cited_count: 12, last_cited_at: '2026-07-02 09:12' },
@@ -455,16 +465,27 @@ async function loadDocs() {
       docs.value = docScope.value === 'all' ? [...mine, ...foreign] : mine
       hasMoreDocs.value = false
       serverBadgeCounts.value = null   // 预览 mock 无 faceted 计数 → 页派生口径
+      docsOffset = 0; docsPage.value = 1
       return
     }
     // 作用域分流：全部门走只读 browse（排除 restricted、带 can_manage），本部门走 my-docs。
-    const r = await apiJson<MyDocsResp>(docsUrl(0), { auth: true })
+    const r = await apiJson<MyDocsResp>(docsUrl(offset), { auth: true })
     if (seq !== docsSeq) return            // 竞态守卫：仅最新结果落地
-    docs.value = r.items || []
-    hasMoreDocs.value = !!r.has_more       // 服务端探测到下一页 → 显「加载更多」
+    docs.value = r.items || []             // 替换（不是追加）：页码翻页语义
+    hasMoreDocs.value = !!r.has_more       // 服务端探测到下一页
     serverBadgeCounts.value = r.badge_counts || null   // faceted 计数（旧后端无此键 → 回退口径）
+    docsOffset = offset
+    docsPage.value = target                // 成功落地才更新页号（失败保留旧页旧表）
   } catch (e) { if (seq === docsSeq) noteLoadError('docs', e) /* 保留旧表 */ } finally { if (seq === docsSeq) loadingDocs.value = false }
 }
+
+async function loadDocs() { await loadDocsPage(1) }
+
+// 台账总条数（翻页器口径）：faceted ledgerTotal（跟随当前筛选的真实总数）优先；无 faceted
+// （旧后端/预览 mock）→ 已知下界 = 当前页起点 + 本页行数（还有下一页则至少再一页——「下一页」
+// 可点、页码随翻页增长的诚实降级，不伪造总数）。
+const docsTotal = computed<number>(() =>
+  ledgerTotal.value ?? ((docsPage.value - 1) * DOCS_PAGE + docs.value.length + (hasMoreDocs.value ? DOCS_PAGE : 0)))
 
 // 加载下一页并【追加】到当前列表（不自增 docsSeq：追加属于当前列表；期间若 loadDocs/换 scope/搜索
 // 触发，docsSeq 变化 → 本页结果作废丢弃，避免错插到新列表）。
@@ -1458,6 +1479,8 @@ export function useKb() {
     // #7 全库口径 + 服务端筛选 setter
     ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, anomalyCount, ledgerTotal,
     setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
+    // 页码翻页器（DocTable 尾部 QueuePager）
+    docsPage, docsTotal, docsPerPage: DOCS_PAGE, docsMaxPage: DOCS_MAX_PAGE, loadDocsPage,
     // 多选 / 批量
     selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
     newTitle, newOwner, newPerm, newShareDepts, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
@@ -1492,7 +1515,7 @@ export function __resetKb() {
   inflight.value = new Set(); retireBusy.value = false
   feedbackReview.value = null; showResolvedFeedback.value = false; feedbackResolveBusy.value = new Set()
   reviewTasks.value = null; showClosedReviewTasks.value = false; reviewTaskResolveBusy.value = new Set()
-  selectedFiles = []; docsOffset = 0; docsSeq = 0; trackSeq = 0
+  selectedFiles = []; docsOffset = 0; docsPage.value = 1; docsSeq = 0; trackSeq = 0
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (trackTimer) { clearTimeout(trackTimer); trackTimer = null }

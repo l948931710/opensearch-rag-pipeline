@@ -72,7 +72,9 @@ test.describe('硬门 — 上传归属可选生产子线', () => {
       }),
     }));
     await gotoUploadCard(page);
-    await page.getByRole('button', { name: '上传新版本' }).first().click();
+    // 升版入口已收进行级「更多操作」菜单(2026-07-19 操作列收敛):先开菜单再点菜单项
+    await page.getByTestId('doc-more').first().click();
+    await page.getByRole('menuitem', { name: '上传新版本' }).click();
     // 修复点：enterVersionMode 现在滚动 #kb-sec-upload 进视口——否则模式切换发生在屏幕外
     await expect(page.locator('#kb-sec-upload')).toBeInViewport();
     await expect(page.getByText('升版模式')).toBeVisible();

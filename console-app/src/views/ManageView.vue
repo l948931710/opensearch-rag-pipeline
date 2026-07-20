@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, History, Lightbulb, Gauge } from '@lucide/vue'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, Stamp, Lightbulb, Gauge } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
@@ -27,57 +27,80 @@ import OpsMetricsPanel from '@/components/manage/OpsMetricsPanel.vue'
 // 普通员工 → 只读基本概览（只用可访问数据：whoami + hot-questions，不打 admin-gated 接口）。
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
-const { isKbAdmin, reviewCount, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadReviewTasks, applyPendingVersion } = useKb()
+// reviewCount（侧栏红点口径）不再在本视图使用——「审批」tab 角标改用 approvalsBadge（见下）。
+const { isKbAdmin, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadReviewTasks, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
 
-// ── 「文档管理」信息架构：待办摘要条 + 分区（待办审批 → 上传 → 台账 → 授权治理）──
+// ── 「文档管理」信息架构（方案 B 瘦身后）：待办摘要条 + 分区（上传 → 台账）──
+// 审批队列 / 授权治理已整体迁入「审批」tab（审批生命周期一页收拢：待处理 → 生效中 → 历史）。
 // 分区眉标与看板 HEADER 同一视觉语言；各队列组件自带空态自隐，眉标随内容一起隐藏。
 const ZONE = 'mb-3 ml-0.5 text-[11px] font-bold uppercase tracking-[0.08em] text-faint'
 // 异常文档数取自 useKb 的全库口径（/api/kb/stats by_badge），不再只数已加载页（#7）。
 const hasQueues = computed(() => (isKbAdmin.value && approvals.value.length > 0) || accessRequests.value.length > 0)
-interface TodoChip { key: string; label: string; n: number; anchor: string; tone: string }
+interface TodoChip { key: string; label: string; n: number; tone: string }
 const todoChips = computed<TodoChip[]>(() => {
   const chips: TodoChip[] = []
-  if (isKbAdmin.value && approvals.value.length) chips.push({ key: 'appr', label: '待审批上传', n: approvals.value.length, anchor: 'kb-sec-queues', tone: 'text-st-busy' })
-  if (accessRequests.value.length) chips.push({ key: 'req', label: '授权申请', n: accessRequests.value.length, anchor: 'kb-sec-queues', tone: 'text-accent-text' })
-  if (anomalyCount.value) chips.push({ key: 'anom', label: '异常文档', n: anomalyCount.value, anchor: 'kb-sec-ledger', tone: 'text-st-fail' })
+  if (isKbAdmin.value && approvals.value.length) chips.push({ key: 'appr', label: '待审批上传', n: approvals.value.length, tone: 'text-st-busy' })
+  if (accessRequests.value.length) chips.push({ key: 'req', label: '授权申请', n: accessRequests.value.length, tone: 'text-accent-text' })
+  if (anomalyCount.value) chips.push({ key: 'anom', label: '异常文档', n: anomalyCount.value, tone: 'text-st-fail' })
   return chips
 })
 function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
-// 异常 chip：滚动 + 顺带设「异常」聚合筛选（原先只滚动，还得自己再挑一个坏徽章点）
-function onTodoChip(c: TodoChip) { if (c.key === 'anom') setBadgeFilter('异常'); scrollToSec(c.anchor) }
+// 审批类 chip（appr/req）：队列已迁「审批」tab → 点击直达该 tab（activeTab watcher 会同步 URL）；
+// 异常 chip 仍留台账：滚动 + 顺带设「异常」聚合筛选（原先只滚动，还得自己再挑一个坏徽章点）。
+function onTodoChip(c: TodoChip) {
+  if (c.key === 'anom') { setBadgeFilter('异常'); scrollToSec('kb-sec-ledger'); return }
+  activeTab.value = 'approvals'
+}
 
 // ── 管理台子 tab（成员管理仅 kb_admin 可见）──
-type Tab = 'dash' | 'docs' | 'history' | 'ops' | 'members'
-const VALID_TABS = ['dash', 'docs', 'history', 'ops', 'members'] as const
+type Tab = 'dash' | 'docs' | 'approvals' | 'ops' | 'members'
+const VALID_TABS = ['dash', 'docs', 'approvals', 'ops', 'members'] as const
 // kb_admin 专属 tab 名单：深链门与 tab bar 渲染门共用一张表——此前是手写字面量排除
 // 表达式（t !== 'members'），每加一个 kb_admin tab 都要人肉同步，漏一处 = 非管理员
 // 深链直达空白页（批次γ 审计风险 1）。收敛成单一名单。
 const KB_ADMIN_TABS: readonly Tab[] = ['members', 'ops'] as const
 const activeTab = ref<Tab>('dash')
+// 深链解析（含旧 IA 兼容）：'history'（原独立「审批历史」tab，方案 B 起并入「审批」）一律视为
+// 'approvals'——旧收藏/分享链接不落空白页。非法值 / 无权限 kb_admin tab → null（调用方落回默认）。
+function resolveTab(t: unknown): Tab | null {
+  const key = t === 'history' ? 'approvals' : t
+  if (typeof key !== 'string' || !(VALID_TABS as readonly string[]).includes(key)) return null
+  if ((KB_ADMIN_TABS as readonly string[]).includes(key) && !isKbAdmin.value) return null
+  return key as Tab
+}
 // tab ←→ URL（P2：刷新/深链不再落回默认 tab）。身份在 AppShell ready 后已解析，可安全校验 members。
 // route?. 可选链 = 单测无 router 环境的既有约定（同 Sidebar）。
 {
-  const t = route?.query?.tab
-  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (!(KB_ADMIN_TABS as readonly string[]).includes(t) || isKbAdmin.value)) activeTab.value = t as Tab
+  const raw = route?.query?.tab
+  const t = resolveTab(raw)
+  if (t) activeTab.value = t
+  // 旧链接归一化：URL 上的 tab=history 就地重写为 approvals（初始赋值不触发 activeTab watcher）
+  if (raw === 'history' && t) void router?.replace({ query: { ...(route?.query || {}), tab: t } })
 }
 watch(activeTab, (t) => { void router?.replace({ query: { ...(route?.query || {}), tab: t === 'dash' ? undefined : t } }) })
 // 反向：URL tab 变化 → 切 tab（差评复核「定位文档」等站内导航靠它；同值 no-op 防回环）
-watch(() => route?.query?.tab, (t) => {
-  if (typeof t === 'string' && (VALID_TABS as readonly string[]).includes(t) && (!(KB_ADMIN_TABS as readonly string[]).includes(t) || isKbAdmin.value) && t !== activeTab.value) activeTab.value = t as Tab
+watch(() => route?.query?.tab, (raw) => {
+  const t = resolveTab(raw)
+  if (!t) return
+  // 站内导航也可能带旧值 history：先归一化 URL，replace 触发的下一轮 watch 再完成切 tab
+  if (raw === 'history') { void router?.replace({ query: { ...(route?.query || {}), tab: t } }); return }
+  if (t !== activeTab.value) activeTab.value = t
 })
 const tabs = computed<{ key: Tab; label: string; icon: any }[]>(() => [
   { key: 'dash', label: '概览看板', icon: LayoutDashboard },
   { key: 'docs', label: '文档管理', icon: FolderOpen },
-  { key: 'history', label: '审批历史', icon: History },
+  { key: 'approvals', label: '审批', icon: Stamp },
   // 运营指标（批次γ）：members 档纯角色门（端点无 flag 语义，三块 available 是业务降级非功能开关）。
   // 只读观测面板——绝不并入「待你处理」chip/reviewCount 的行动语义。
   ...(isKbAdmin.value ? [{ key: 'ops' as Tab, label: '运营指标', icon: Gauge }] : []),
   ...(isKbAdmin.value ? [{ key: 'members' as Tab, label: '成员管理', icon: UserCog }] : []),
 ])
-// 「文档管理」tab 角标 = 待你审核数（reviewCount，与侧栏入口红点同一来源）。
+// 「审批」tab 角标 = tab 内「待处理」区条数（kb_admin 的上传审批 + 授权申请），与区内卡头计数
+// 对账一致。不复用 useKb.reviewCount——那是侧栏红点口径（含贡献待审），侧栏仍依赖它。
+const approvalsBadge = computed(() => (isKbAdmin.value ? approvals.value.length : 0) + accessRequests.value.length)
 
 // ── 员工概览（只读，可访问数据）──
 const myDeptChips = computed(() => (identity.value?.aclGroups || []).map(deptLabel))
@@ -102,10 +125,10 @@ function ensureTabLoaded(t: Tab): Promise<unknown> {
     jobs.push(loadStats(), loadInsights(), loadFeedbackReview())
     if (isKbAdmin.value) jobs.push(loadGovernance(), loadReviewTasks())
   } else if (t === 'docs') {
-    // stats 兼供台账（归属下拉全库口径）；accessGrants=台账底部「授权治理」区
-    jobs.push(loadDocs(), loadConfig(), loadStats(), loadAccessGrants())
-  } else if (t === 'history') {                      // main 旧 IA：独立「审批历史」tab
-    jobs.push(loadApprovalHistory())                 // 待办队列已全局预载+轮询
+    // stats 兼供台账（归属下拉全库口径）
+    jobs.push(loadDocs(), loadConfig(), loadStats())
+  } else if (t === 'approvals') {                    // 审批 tab：历史 + 已授权存量
+    jobs.push(loadApprovalHistory(), loadAccessGrants())   // 待办队列已全局预载+轮询
   } else if (t === 'ops') {
     if (isKbAdmin.value) jobs.push(loadOpsMetrics())
   } else if (t === 'members') {
@@ -217,9 +240,9 @@ onMounted(async () => {
         <component :is="t.icon" :size="15" :stroke-width="1.75" />
         {{ t.label }}
         <span
-          v-if="t.key === 'docs' && reviewCount"
+          v-if="t.key === 'approvals' && approvalsBadge"
           class="grid h-[17px] min-w-[17px] place-items-center rounded-full bg-st-busy px-1.5 text-[10px] font-bold tabular-nums text-white"
-        >{{ reviewCount }}</span>
+        >{{ approvalsBadge }}</span>
       </button>
     </div>
 
@@ -227,7 +250,7 @@ onMounted(async () => {
     <KbAdminDashboard v-if="activeTab === 'dash' && isKbAdmin" />
     <DeptDashboard v-else-if="activeTab === 'dash'" />
 
-    <!-- 文档管理：待办摘要条 → 待办审批（自隐）→ 上传 → 台账（主体）→ 授权治理（存量参考置底） -->
+    <!-- 文档管理（方案 B 瘦身后）：待办摘要条 → 上传 → 台账（主体）；审批队列/授权治理已迁「审批」tab -->
     <template v-else-if="activeTab === 'docs'">
       <!-- 待办摘要条：一眼看清今天要处理什么；点击滚动到对应区块。有待办时台账被推下首屏 →
            条尾常备「跳到台账」一键直达；全空且队列已拉取过 → 一行确认文案（区分「处理完了」与「功能没开」）。 -->
@@ -250,14 +273,8 @@ onMounted(async () => {
         >跳到台账 ↓</button>
       </div>
       <p v-else-if="queuesSettled" class="ml-0.5 text-[12px] text-faint">
-        当前无待办 —— 新的{{ isKbAdmin ? '上传审批 / ' : '' }}授权申请会先出现在这里。
+        当前无待办 —— 新的{{ isKbAdmin ? '上传审批 / ' : '' }}授权申请会出现在「审批」tab。
       </p>
-
-      <section v-if="hasQueues" id="kb-sec-queues" class="space-y-4 scroll-mt-4">
-        <p :class="ZONE">待办审批</p>
-        <ApprovalQueue />
-        <AccessRequestQueue />
-      </section>
 
       <section id="kb-sec-upload" class="scroll-mt-4">
         <p :class="ZONE">上传入库</p>
@@ -268,15 +285,29 @@ onMounted(async () => {
         <p :class="ZONE">文档台账</p>
         <DocTable />
       </section>
-
-      <section v-if="accessGrants.length" id="kb-sec-grants" class="scroll-mt-4">
-        <p :class="ZONE">授权治理 · 已放行的跨部门检索</p>
-        <AccessGrantList />
-      </section>
     </template>
 
-    <!-- 审批历史（两角色）：四条审批流的历史决策合并时间线（只读） -->
-    <ApprovalHistory v-else-if="activeTab === 'history'" />
+    <!-- 审批（两角色，方案 B）：审批生命周期一页收拢——待处理 → 生效中·已授权 → 历史 -->
+    <template v-else-if="activeTab === 'approvals'">
+      <section v-if="hasQueues" class="space-y-4">
+        <p :class="ZONE">待处理</p>
+        <ApprovalQueue />
+        <AccessRequestQueue />
+      </section>
+      <p v-else-if="queuesSettled" class="ml-0.5 text-[12px] text-faint">
+        当前无待处理 —— 新的{{ isKbAdmin ? '上传审批 / ' : '' }}授权申请会先出现在这里。
+      </p>
+
+      <section v-if="accessGrants.length">
+        <p :class="ZONE">生效中 · 已授权</p>
+        <AccessGrantList />
+      </section>
+
+      <section>
+        <p :class="ZONE">历史</p>
+        <ApprovalHistory />
+      </section>
+    </template>
 
     <!-- 运营指标（仅 kb_admin，批次γ）：LLM 用量/SLO 日趋势/限流准入——只读观测，独立于看板行动区 -->
     <OpsMetricsPanel v-else-if="activeTab === 'ops' && isKbAdmin" />

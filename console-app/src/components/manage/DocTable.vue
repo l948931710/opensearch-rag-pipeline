@@ -1,24 +1,37 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, ExternalLink, Loader2 } from '@lucide/vue'
+import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, Download, Settings, Loader2 } from '@lucide/vue'
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
 import LoadError from './LoadError.vue'
+import QueuePager from './QueuePager.vue'
 import { useDialog } from '@/composables/useDialog'
 
 const { confirm, notice } = useDialog()
 
 const {
-  docs, filtered, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, sortKey, sortDir, isDeptAdmin, isKbAdmin,
+  docs, filtered, loadingDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, sortKey, sortDir, isDeptAdmin, isKbAdmin,
   ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, ledgerTotal, setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
+  docsPage, docsTotal, docsPerPage, docsMaxPage, loadDocsPage,
   setQuery, sortBy, setScope, enterVersionMode, retire, restore, openHistory, openDocPreview,
-  openAccessRequest, accessStateOf, accessNoteOf, loadMoreDocs, loadDocs, loadErrors,
+  openAccessRequest, accessStateOf, accessNoteOf, loadDocs, loadErrors,
   openShare, grantedLabelsByDoc, openVisibility,
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
 } = useKb()
+
+// 页码翻页（设计稿 doc-table.html 尾部 pager）：加载中不受理（防连点竞态，useKb 侧 docsSeq 是
+// 第二道闸）；超出服务端深分页上界（api.py _KB_MAX_OFFSET 镜像 docsMaxPage）→ 如实提示不发请求。
+function onPage(p: number) {
+  if (loadingDocs.value) return
+  if (p > docsMaxPage) {
+    void notice({ message: `最多可翻到第 ${docsMaxPage} 页（服务端深分页上界）。请用搜索或筛选缩小范围。` })
+    return
+  }
+  void loadDocsPage(p)
+}
 
 // 「权限」入口条件：可管理 + 非退役 + 非隔离。弹窗内含 基础可见范围（改级别）+ 跨部门共享。
 // 放宽到全部可见级别（不再只 dept_internal）：public 文档也要能被改回本部门/受限。
@@ -119,6 +132,28 @@ function arrow(k: SortKey) { return sortKey.value === k ? (sortDir.value === 1 ?
 // 退役/恢复的行级在途态：useKb 侧 retireBusy 只做全局互斥不进模板，此前按钮点了没任何
 // 反馈（网络慢时用户会疑惑再点）。失败提示走 notice()——原生 alert 样式脱节且不可访问。
 const retireRowId = ref('')
+
+// ── 「更多操作」行菜单（2026-07-19 重设计：6 悬停图标收敛为 3 控件）──
+// reka-ui 在依赖里但 src/ 尚无 DropdownMenu 用例 → 按本文件 bulkVisMenu 的手写下拉惯例实现，
+// 补齐点击外部关闭 + Esc 关闭 + aria-haspopup/expanded。同一时刻至多展开一行的菜单。
+const menuDocId = ref('')
+function toggleMenu(id: string) { menuDocId.value = menuDocId.value === id ? '' : id }
+function closeMenu() { menuDocId.value = '' }
+function menuAct(fn: () => void) { closeMenu(); fn() }
+function onGlobalPointerDown(e: Event) {
+  if (!menuDocId.value) return
+  const t = e.target as Element | null
+  if (!t?.closest?.('[data-act-menu]')) closeMenu()   // 点在任一菜单锚点/弹层内不关（切换行由 toggle 处理）
+}
+function onGlobalKeydown(e: KeyboardEvent) { if (e.key === 'Escape') closeMenu() }
+onMounted(() => {
+  document.addEventListener('pointerdown', onGlobalPointerDown)
+  document.addEventListener('keydown', onGlobalKeydown)
+})
+onUnmounted(() => {
+  document.removeEventListener('pointerdown', onGlobalPointerDown)
+  document.removeEventListener('keydown', onGlobalKeydown)
+})
 
 async function onRetire(d: DocItem) {
   const okGo = await confirm({
@@ -274,8 +309,9 @@ async function onRestore(d: DocItem) {
       ><X :size="13" :stroke-width="2" /></button>
     </div>
 
-    <!-- Atlas 台账网格（< 680px 自动卡片化，由 .led-* 媒体查询接管） -->
-    <div class="mt-4 overflow-hidden rounded-xl border border-border bg-card">
+    <!-- Atlas 台账网格（< 680px 自动卡片化，由 .led-* 媒体查询接管）。
+         不再 overflow-hidden：行内「更多操作」菜单弹层需外溢容器（末行圆角由 .led-row:last-child 兜底）。 -->
+    <div class="mt-4 rounded-xl border border-border bg-card">
       <div class="led-head">
         <span class="inline-flex items-center gap-2">
           <button
@@ -341,48 +377,64 @@ async function onRestore(d: DocItem) {
           :title="d.status_badge === '未入索引' || d.status_badge === '处理失败' ? '上传新版本（升版）可重灌；失败原因见「版本历史」' : undefined"
         ><StatusPill :badge="d.status_badge" /></div>
         <div class="led-cell font-mono text-xs text-muted-foreground" data-label="更新">{{ (d.updated_at || '').slice(0, 16) }}</div>
-        <div class="led-cell led-actions doc-actions" data-label="操作">
-          <!-- 可操作（本部门 / kb_admin）：可见 / 权限 / 预览 / 历史 / 升版 / 退役。
-               6 个操作 → 图标按钮 + tooltip（原 icon+文字 6 个会溢出 200px 操作列、压到「更新」列上）。 -->
+        <div class="led-cell led-actions doc-actions" data-label="操作" :data-open="menuDocId === d.doc_id ? '1' : '0'">
+          <!-- 可操作（本部门 / kb_admin）收敛为 3 控件（2026-07-19 重设计定案，操作列 200px→110px）：
+               版本历史 / 下载原始文件 / 「更多操作」菜单（可见范围 · 共享权限 · 升版 · 退役/恢复）。 -->
           <template v-if="d.can_manage !== false">
-            <button
-              type="button" data-testid="doc-visibility" aria-label="谁能看到这篇文档"
-              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
-              title="谁能看到这篇文档" @click="openVisibility(d)"
-            ><Eye :size="14" :stroke-width="1.75" /></button>
-            <button
-              v-if="canManagePerm(d)"
-              type="button" data-testid="doc-share" aria-label="跨部门共享 / 权限"
-              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-accent-soft hover:text-accent-text"
-              title="跨部门共享 / 权限" @click="openShare(d)"
-            ><Share2 :size="14" :stroke-width="1.75" /></button>
-            <button
-              type="button" data-testid="doc-preview" aria-label="预览原始上传文件"
-              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
-              title="预览原始上传文件" @click="openDocPreview(d.doc_id)"
-            ><ExternalLink :size="14" :stroke-width="1.75" /></button>
             <button
               type="button" aria-label="版本历史"
               class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
               title="版本历史" @click="openHistory(d)"
             ><History :size="14" :stroke-width="1.75" /></button>
             <button
-              type="button" aria-label="上传新版本"
+              type="button" data-testid="doc-preview" aria-label="下载原始文件"
               class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
-              title="上传新版本（升版）" @click="enterVersionMode(d)"
-            ><FilePlus2 :size="14" :stroke-width="1.75" /></button>
-            <button
-              v-if="d.status_badge !== '已退役'"
-              type="button" aria-label="退役下线" :disabled="retireRowId === d.doc_id"
-              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-st-fail/10 hover:text-st-fail disabled:opacity-50"
-              title="退役下线" @click="onRetire(d)"
-            ><Loader2 v-if="retireRowId === d.doc_id" :size="14" :stroke-width="1.75" class="animate-spin" /><Archive v-else :size="14" :stroke-width="1.75" /></button>
-            <button
-              v-else
-              type="button" aria-label="恢复上线" :disabled="retireRowId === d.doc_id"
-              class="grid size-7 place-items-center rounded-md text-st-live transition hover:bg-st-live/10 disabled:opacity-50"
-              title="恢复上线" @click="onRestore(d)"
-            ><Loader2 v-if="retireRowId === d.doc_id" :size="14" :stroke-width="1.75" class="animate-spin" /><ArchiveRestore v-else :size="14" :stroke-width="1.75" /></button>
+              title="下载原始文件" @click="openDocPreview(d.doc_id)"
+            ><Download :size="14" :stroke-width="1.75" /></button>
+            <div class="relative" data-act-menu>
+              <button
+                type="button" data-testid="doc-more" aria-label="更多操作" aria-haspopup="menu"
+                :aria-expanded="menuDocId === d.doc_id"
+                class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
+                title="更多操作" @click="toggleMenu(d.doc_id)"
+              ><Loader2 v-if="retireRowId === d.doc_id" :size="14" :stroke-width="1.75" class="animate-spin" /><Settings v-else :size="14" :stroke-width="1.75" /></button>
+              <!-- 弹层（设计稿 .menu-pop/.mi）：≤680px 卡片态锚点靠左 → 改左对齐防溢出屏幕左缘 -->
+              <div
+                v-if="menuDocId === d.doc_id" role="menu"
+                class="absolute right-0 top-full z-20 mt-1 flex min-w-[148px] flex-col rounded-[10px] border border-border bg-card p-1 shadow-lg max-[680px]:left-0 max-[680px]:right-auto"
+              >
+                <button
+                  type="button" role="menuitem" data-testid="doc-visibility"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground transition hover:bg-panel"
+                  @click="menuAct(() => openVisibility(d))"
+                ><Eye :size="14" :stroke-width="1.75" class="text-muted-foreground" /> 可见范围</button>
+                <!-- 已退役/已隔离不给共享·权限入口（canManagePerm，权限语义保持不变） -->
+                <button
+                  v-if="canManagePerm(d)"
+                  type="button" role="menuitem" data-testid="doc-share"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground transition hover:bg-panel"
+                  @click="menuAct(() => openShare(d))"
+                ><Share2 :size="14" :stroke-width="1.75" class="text-muted-foreground" /> 跨部门共享 / 权限</button>
+                <button
+                  type="button" role="menuitem"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground transition hover:bg-panel"
+                  @click="menuAct(() => enterVersionMode(d))"
+                ><FilePlus2 :size="14" :stroke-width="1.75" class="text-muted-foreground" /> 上传新版本</button>
+                <div class="mx-1.5 my-1 h-px bg-border" role="separator" />
+                <button
+                  v-if="d.status_badge !== '已退役'"
+                  type="button" role="menuitem" :disabled="retireRowId === d.doc_id"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-st-fail transition hover:bg-st-fail/10 disabled:opacity-50"
+                  @click="menuAct(() => onRetire(d))"
+                ><Archive :size="14" :stroke-width="1.75" /> 退役下线</button>
+                <button
+                  v-else
+                  type="button" role="menuitem" :disabled="retireRowId === d.doc_id"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-st-live transition hover:bg-st-live/10 disabled:opacity-50"
+                  @click="menuAct(() => onRestore(d))"
+                ><ArchiveRestore :size="14" :stroke-width="1.75" /> 恢复上线</button>
+              </div>
+            </div>
           </template>
           <!-- 其他部门（只读）：申请授权 / 审批中 / 同步中 / 已放行 -->
           <template v-else>
@@ -421,15 +473,14 @@ async function onRestore(d: DocItem) {
       <div v-if="!filtered.length" class="px-4 py-10 text-center text-sm text-muted-foreground">
         {{ loadingDocs ? '加载中…' : (q ? '无匹配文档' : (docScope === 'all' ? '暂无可浏览的文档' : '暂无文档，先上传一篇吧')) }}
       </div>
-    </div>
 
-    <!-- 分页：服务端还有下一页时显「加载更多」（单页 50 条；管理大量文档时尾部不再被静默截断） -->
-    <div v-if="hasMoreDocs" class="mt-3 flex items-center justify-center gap-2">
-      <button
-        type="button" :disabled="loadingMoreDocs"
-        class="rounded-lg border border-border px-4 py-1.5 text-xs font-medium text-muted-foreground transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-60"
-        @click="loadMoreDocs()"
-      >{{ loadingMoreDocs ? '加载中…' : `加载更多（已显示 ${docs.length} 条）` }}</button>
+      <!-- 尾部页码翻页器（设计稿 doc-table.html .pager）：「第 x–y 条 · 共 N 条」+ 页码。
+           单页自隐（QueuePager 内建）；加载中禁点（onPage 守卫 + 视觉降透明）；翻页替换整页数据。 -->
+      <QueuePager
+        :total="docsTotal" :page="docsPage" :per-page="docsPerPage"
+        :class="loadingDocs ? 'pointer-events-none opacity-60' : ''"
+        @update:page="onPage"
+      />
     </div>
   </section>
 </template>

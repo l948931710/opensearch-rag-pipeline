@@ -29,9 +29,17 @@ function jsonResp(body: unknown, { ok = true, status = 200 } = {}) {
   return { ok, status, json: async () => body, text: async () => JSON.stringify(body) }
 }
 
+// 反馈时间用「相对现在」生成：组件默认按近 30 天过滤（设计稿 2026-07-19 §4），
+// 写死日期会随时间流逝被滤掉导致测试腐烂。
+function tsAgo(days: number): string {
+  const d = new Date(Date.now() - days * 86400000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 function fb(id: string, over: Partial<FeedbackReviewItem> = {}): FeedbackReviewItem {
   return {
-    message_id: id, question: `模具冷却水路怎么排查-${id}`, created_at: '2026-07-10 10:00',
+    message_id: id, question: `模具冷却水路怎么排查-${id}`, created_at: tsAgo(1),
     reasons: ['不准确'], comment: '', handled: false, handled_status: 'PENDING', docs: [],
     ...over,
   }
@@ -106,6 +114,49 @@ describe('FeedbackReviewList — 接口失败显式降级，绝不伪装成「�
     expect(w.text()).toContain('模具冷却水路怎么排查-m1')
     expect(w.text()).toContain('加载失败，请重试')                     // LoadError 错误条
     expect(w.find('[data-testid="feedback-review-error"]').exists()).toBe(false)
+  })
+})
+
+describe('FeedbackReviewList — 红头卡 + 时间范围 + 分页/排序（设计稿 2026-07-19 §1/§2/§4）', () => {
+  function mountList(items: FeedbackReviewItem[]) {
+    const pinia = activePinia(identity())
+    const kb = useKb()
+    kb.feedbackReview.value = items
+    return { w: mount(FeedbackReviewList, { global: { plugins: [pinia], stubs } }), kb }
+  }
+
+  it('红头语义：卡边框 st-fail 混合 + 头 st-fail 底 + 计数 st-fail', () => {
+    const { w } = mountList([fb('m1')])
+    expect(w.text()).toContain('差评复核')
+    expect(w.find('[class*="border-st-fail/30"][class*="bg-card"]').exists()).toBe(true)   // 卡边框
+    expect(w.find('[class*="bg-st-fail/"][class*="border-b"]').exists()).toBe(true)         // 红头底
+    expect(w.find('span[class*="rounded-full"][class*="bg-st-fail"]').text()).toBe('1')     // 计数
+  })
+
+  it('时间范围下拉：默认近 30 天滤掉 40 天前的行；切「全部时间」找回', async () => {
+    const { w } = mountList([fb('recent', { created_at: tsAgo(2) }), fb('old', { created_at: tsAgo(40) })])
+    expect(w.text()).toContain('模具冷却水路怎么排查-recent')
+    expect(w.text()).not.toContain('模具冷却水路怎么排查-old')
+    await w.find('[data-testid="feedback-range"]').setValue('all')
+    expect(w.text()).toContain('模具冷却水路怎么排查-old')
+    // 缺时间戳的行不因过滤而消失（graceful degradation）
+    const { w: w2 } = mountList([fb('nots', { created_at: '' })])
+    expect(w2.text()).toContain('模具冷却水路怎么排查-nots')
+  })
+
+  it('分页：3 条 → 2 条/页；默认新→旧；排序切换回第 1 页', async () => {
+    const { w } = mountList([fb('m1', { created_at: tsAgo(1) }), fb('m2', { created_at: tsAgo(2) }), fb('m3', { created_at: tsAgo(3) })])
+    expect(w.text()).toContain('模具冷却水路怎么排查-m1')
+    expect(w.text()).toContain('模具冷却水路怎么排查-m2')
+    expect(w.text()).not.toContain('模具冷却水路怎么排查-m3')
+    expect(w.find('[data-testid="pager-info"]').text()).toBe('第 1–2 条 · 共 3 条')
+    await w.find('[aria-label="下一页"]').trigger('click')
+    expect(w.text()).toContain('模具冷却水路怎么排查-m3')
+    // 排序切旧→新 → 回第 1 页，最旧在前
+    await w.find('[data-testid="queue-sort"]').trigger('click')
+    expect(w.find('[data-testid="queue-sort"]').text()).toContain('旧→新')
+    expect(w.text()).toContain('模具冷却水路怎么排查-m3')
+    expect(w.text()).not.toContain('模具冷却水路怎么排查-m1')
   })
 })
 

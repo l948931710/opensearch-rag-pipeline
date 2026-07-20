@@ -1,14 +1,31 @@
 <script setup lang="ts">
-import { Clock, FileText, Loader2, ExternalLink } from '@lucide/vue'
+import { computed, ref } from 'vue'
+import { Clock, FileText, Loader2, Download, ArrowDownWideNarrow } from '@lucide/vue'
 import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
+import QueuePager from './QueuePager.vue'
 import { useDialog } from '@/composables/useDialog'
 
 // 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
 const { approvals, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors, openDocPreview } = useKb()
 const { promptText } = useDialog()
 const rowKey = (d: PendingItem) => `appr:${d.doc_id}/${d.version_no}`
+
+// ── 前端分页 + 时间排序（设计稿 2026-07-19 §2：一切列表可分页可排序；队列 2 条/页）──
+// 页码经 computed 收敛：审批通过/驳回后列表变短，当前页自动回落不越界（无需 watcher）。
+const PER_PAGE = 2
+const sortDesc = ref(true)   // 默认 新→旧（按提交时间 created_at）
+const pageReq = ref(1)
+const sorted = computed(() =>
+  [...approvals.value].sort((a, b) => {
+    const cmp = (a.created_at || '').localeCompare(b.created_at || '')
+    return sortDesc.value ? -cmp : cmp
+  }))
+const pages = computed(() => Math.max(1, Math.ceil(sorted.value.length / PER_PAGE)))
+const page = computed(() => Math.min(pageReq.value, pages.value))
+const paged = computed(() => sorted.value.slice((page.value - 1) * PER_PAGE, page.value * PER_PAGE))
+function toggleSort() { sortDesc.value = !sortDesc.value; pageReq.value = 1 }
 
 async function onReject(d: PendingItem) {
   const reason = await promptText({ title: '驳回上传', message: `驳回《${d.title || d.original_filename || d.doc_id}》的上传？`, placeholder: '驳回原因（可空）', confirmText: '驳回', danger: true })
@@ -23,16 +40,21 @@ async function onReject(d: PendingItem) {
     <LoadError class="mb-2.5" :message="loadErrors['approvals']" @retry="loadApprovals()" />
     <div v-if="approvals.length" class="overflow-hidden rounded-[15px] border border-border bg-card">
       <!-- 橙头 -->
-      <div class="flex items-center gap-2.5 border-b border-border bg-st-busy/[0.07] px-[18px] py-3">
+      <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2 border-b border-border bg-st-busy/[0.07] px-[18px] py-3">
         <Clock :size="16" :stroke-width="1.75" class="text-st-busy" />
         <span class="text-sm font-semibold text-foreground">待审批队列</span>
         <span class="rounded-full bg-st-busy px-2 py-px text-[11px] font-bold text-white">{{ approvals.length }}</span>
+        <button
+          type="button" data-testid="queue-sort"
+          class="inline-flex items-center gap-1 rounded-full border border-border px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground transition hover:bg-panel"
+          title="按提交时间排序，点击切换" @click="toggleSort"
+        ><ArrowDownWideNarrow :size="11" :stroke-width="1.75" /> <span class="tabular-nums">{{ sortDesc ? '新→旧' : '旧→新' }}</span></button>
         <div class="flex-1" />
         <span class="hidden text-xs text-muted-foreground sm:inline">公开 / 跨组上传，需放行后入库</span>
       </div>
-      <!-- 行 -->
+      <!-- 行（当前页切片） -->
       <div
-        v-for="d in approvals" :key="d.doc_id + '/' + d.version_no"
+        v-for="d in paged" :key="d.doc_id + '/' + d.version_no"
         class="flex flex-wrap items-center gap-x-3.5 gap-y-2 border-t border-border px-[18px] py-3 first:border-t-0"
       >
         <span class="grid size-8 shrink-0 place-items-center rounded-lg bg-accent-soft text-accent-text">
@@ -43,14 +65,16 @@ async function onReject(d: PendingItem) {
           <div class="truncate text-[11.5px] text-faint">
             {{ deptLabel(d.owner_dept) }} · {{ permLabel(d.permission_level) }} · v{{ d.version_no }}
             <span v-if="d.owner_name"> · 上传人 {{ d.owner_name }}</span>
+            <!-- 提交时间戳（设计稿 qsub 尾部；仅数据有该字段才显） -->
+            <span v-if="d.created_at" class="tabular-nums"> · {{ d.created_at }}</span>
           </div>
         </div>
-        <!-- 预览原件：放行到全公司/跨组前先看一眼实物，别凭标题盲批 -->
+        <!-- 下载原件预览：放行到全公司/跨组前先看一眼实物，别凭标题盲批（图标下载语义，行为不变） -->
         <button
           type="button" data-testid="approval-preview"
           class="inline-flex items-center justify-center gap-1 rounded-lg border border-border px-3 py-[7px] text-[12.5px] font-medium text-muted-foreground transition hover:border-border-strong hover:text-foreground"
-          title="预览原始上传文件" @click="openDocPreview(d.doc_id, d.version_no)"
-        ><ExternalLink :size="13" :stroke-width="1.75" /> 预览</button>
+          title="下载原始文件" @click="openDocPreview(d.doc_id, d.version_no)"
+        ><Download :size="13" :stroke-width="1.75" /> 预览</button>
         <button
           type="button"
           class="inline-flex items-center justify-center gap-1 rounded-lg border border-border px-3.5 py-[7px] text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
@@ -62,6 +86,8 @@ async function onReject(d: PendingItem) {
           :disabled="isBusy(rowKey(d))" @click="approve(d)"
         ><Loader2 v-if="isBusy(rowKey(d))" :size="13" :stroke-width="2" class="animate-spin" />{{ isBusy(rowKey(d)) ? '通过中…' : '通过' }}</button>
       </div>
+      <!-- 翻页脚（单页自隐） -->
+      <QueuePager :total="sorted.length" :page="page" :per-page="PER_PAGE" @update:page="pageReq = $event" />
     </div>
   </section>
 </template>
