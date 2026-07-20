@@ -89,6 +89,18 @@ def _regime(cfg, goldset_path: str) -> dict:
         from .judge import JUDGE_RUBRIC_VERSION as judge_rubric_version
     except Exception:
         judge_rubric_version = None
+    # VLM 指纹哨兵(2026-07-20 xlsx 绑定漂移 P2):visual_summary 是 L4-ing 绑定与 L6 图
+    # 指标的输入,VLM 模型或缓存版本变更 = 全部图 caption 重掷,l4ing.* 分数不可与前次
+    # 直接比较(0.8917→0.7167 那次烧了一晚二分才定位到缓存失效)。入 regime 后,跨 VLM
+    # 代对比在 baseline.compare 处直接 N/A 报「refreeze」,不再伪装成分数回归。
+    # 老 baseline 缺这两键 → baseline._LENIENT_REGIME_KEYS 宽容窗口(与 judge 键同款)。
+    try:
+        ocr_cfg = getattr(cfg, "ocr", None)
+        vlm_model = (getattr(ocr_cfg, "vlm_model", None)
+                     or getattr(ocr_cfg, "model", None)) if ocr_cfg is not None else None
+    except Exception:
+        vlm_model = None
+    vlm_cache_version = os.environ.get("RAG_VLM_CACHE_VERSION", "2").strip() or "bare"
     return {
         "eval_set_sha": sha,
         "fusion": _cfg_get(cfg, "hybrid_fusion", None),
@@ -100,6 +112,8 @@ def _regime(cfg, goldset_path: str) -> dict:
         "threshold_version": thr,
         "judge_model": judge_model,
         "judge_rubric_version": judge_rubric_version,
+        "vlm_model": vlm_model,
+        "vlm_cache_version": vlm_cache_version,
         "code_commit": commit,
     }
 

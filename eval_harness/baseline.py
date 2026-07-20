@@ -150,14 +150,20 @@ def regime_of(results: Dict) -> Dict:
 
 # P2-24：judge 指纹入 regime——judge 是 faithfulness/correctness/completeness/fabrication
 # 四个答案质量硬门的产出者,judge 模型/rubric 升级即换 regime,差量比较必须拒绝跨 judge 对比。
+# VLM 指纹哨兵(2026-07-20 xlsx 绑定漂移 P2)：vlm_model / vlm_cache_version 同理——
+# visual_summary 是 l4ing.jaccard.* 与 l6.image_binding 的输入,VLM 换代或缓存版本提升
+# = 全部图 caption 重掷,分数不可与前次直接比较(0.8917→0.7167 曾烧一晚二分定位)。
 _REGIME_KEYS = ("eval_set_sha", "fusion", "rerank_enable", "llm_model",
                 "embedding_model", "reranker_models", "threshold_version",
-                "judge_model", "judge_rubric_version")
+                "judge_model", "judge_rubric_version",
+                "vlm_model", "vlm_cache_version")
 # P2-24 向后兼容宽容窗口：judge_model / judge_rubric_version 是 2026-07 新增 regime 键,
 # 存量 baseline.json 里没有——老基线缺该键（None）视为匹配,新 freeze 起自动带上;
 # 一旦 baseline 里有值,就按普通键严格比较。refreeze 需在用户机器上跑 live eval
 # （沙箱 403 打不到生产 HA3）,所以不能因新键让存量基线立即失效。
-_LENIENT_REGIME_KEYS = frozenset({"judge_model", "judge_rubric_version"})
+# vlm_model / vlm_cache_version(2026-07-20)沿用同一窗口。
+_LENIENT_REGIME_KEYS = frozenset({"judge_model", "judge_rubric_version",
+                                  "vlm_model", "vlm_cache_version"})
 
 
 def regime_matches(base_regime: Dict, cur_regime: Dict) -> Tuple[bool, List[str]]:
