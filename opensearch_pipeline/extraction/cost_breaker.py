@@ -424,7 +424,16 @@ def quarantine_for_cost(
         conn = _get_db_conn(select_db=True)
         conn.begin()
         with conn.cursor() as cur:
-            # a. 封存 flip (terminal)
+            # F3 锁序纪律：同事务多表写一律 document_meta 先行（meta→dv，与 console/
+            # reconciler/quarantine 统一），杜绝 dv→meta 反序与 meta-first 写方成环死锁。
+            # 语义不变（单次 commit 原子）。
+            # a. 从公共 KB 撤出
+            cur.execute(
+                "UPDATE document_meta SET kb_type = 'private' WHERE doc_id = %s",
+                (doc_id,),
+            )
+
+            # b. 封存 flip (terminal)
             cur.execute("""
                 UPDATE document_version
                 SET risk_level             = 'high',
@@ -435,12 +444,6 @@ def quarantine_for_cost(
                     content_process_error  = %s
                 WHERE doc_id = %s AND version_no = %s
             """, (review_reason, doc_id, version_no))
-
-            # b. 从公共 KB 撤出
-            cur.execute(
-                "UPDATE document_meta SET kb_type = 'private' WHERE doc_id = %s",
-                (doc_id,),
-            )
 
             # c. 人工审核任务 (新 review_type='cost_ceiling_exceeded'，幂等)
             task_id = f"cost_brk_{doc_id}_v{version_no}"

@@ -709,7 +709,8 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
             rec = reconcile_stranded_versions()
             if rec["total"]:
                 print(f"[Orchestrator] Stranded-version reconcile: {rec['success']}/{rec['total']} "
-                      f"healed, {rec['failed']} failed")
+                      f"healed, {rec['failed']} failed, "
+                      f"{rec.get('skipped_stale', 0)} skipped-stale")
         except Exception as e:
             print(f"[Orchestrator] WARNING: stranded-version reconcile failed (non-fatal): {e}",
                   file=sys.stderr)
@@ -720,7 +721,8 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
             pd = reconcile_pending_deletes()
             if pd["total"]:
                 print(f"[Orchestrator] Pending-delete outbox drain: {pd['success']}/{pd['total']} "
-                      f"deleted, {pd['failed']} failed")
+                      f"deleted, {pd['failed']} failed, "
+                      f"{pd.get('skipped_stale', 0)} skipped-stale")
         except Exception as e:
             print(f"[Orchestrator] WARNING: pending-delete reconcile failed (non-fatal): {e}",
                   file=sys.stderr)
