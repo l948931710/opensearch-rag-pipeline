@@ -108,27 +108,39 @@ def test_content_blocks_pii_masked_urls_preserved(mock_get_conn):
 
 
 def test_insert_columns_all_exist_in_schema_files():
-    """结构漂移防回归：log_qa_session 写入的每一列都必须出现在 schema/ DDL 里
+    """结构漂移防回归：写入 qa_session_log 的每一列都必须出现在 schema/ DDL 里
     （正是这条护栏缺失让 content_blocks_json 静默丢了所有问答日志）。
 
-    INSERT 现为动态构造（base_cols 恒定列 + 可选增强列 conversation_id）：
-    base_cols 校验 001/002，conversation_id 作为增强列校验 006。"""
+    评审F11（2026-07-21）：列清单提为模块常量 QA_SESSION_MANDATORY_COLS（单一事实源，
+    log_qa_session + insert_qa_row_tx 两写方 + /api/ready 探针共同消费）。本测试改为：
+    ① 校验常量对 002 中 qa_session_log 段的 DDL（**表段限定**，杜绝拼接全文误命中
+    其他表同名列/注释）；② 源码巡检两写方与 readiness 探针都引用该常量。"""
     import inspect
     from opensearch_pipeline import qa_logger
 
-    source = inspect.getsource(qa_logger.log_qa_session)
-    m = re.search(r"base_cols\s*=\s*\[(.*?)\]", source, re.S)
-    assert m, "找不到 base_cols 列清单"
-    columns = [c.strip().strip('"').strip("'") for c in m.group(1).split(",") if c.strip()]
+    columns = list(qa_logger.QA_SESSION_MANDATORY_COLS)
     assert "content_blocks_json" in columns  # sanity
-    assert "conversation_id" not in columns  # 增强列不在 base_cols，避免污染 legacy INSERT
+    assert "conversation_id" not in columns  # 增强列不在强制列，避免污染 legacy INSERT
 
-    legacy_ddl = "".join(
-        (SCHEMA_DIR / f).read_text(encoding="utf-8")
-        for f in ("001_opensearch_pipeline.sql", "002_feedback_system.sql")
-    )
-    missing = [c for c in columns if c not in legacy_ddl]
-    assert not missing, f"base_cols 用到了 001/002 DDL 里不存在的列: {missing}"
+    # ① 表段限定 DDL 校验：qa_session_log 建表段（002）+ 后续 ALTER qa_session_log 段
+    full_002 = (SCHEMA_DIR / "002_feedback_system.sql").read_text(encoding="utf-8")
+    m = re.search(r"CREATE TABLE[^;]*?\bqa_session_log\b\s*\((.*?)\)\s*ENGINE", full_002, re.S)
+    assert m, "002 里找不到 qa_session_log 建表段"
+    table_ddl = m.group(1)
+    # content_blocks_json 等后补列可能来自 001/002 的 ALTER qa_session_log 段
+    alter_ddl = "\n".join(re.findall(
+        r"ALTER TABLE\s+`?qa_session_log`?[^;]*;",
+        full_002 + (SCHEMA_DIR / "001_opensearch_pipeline.sql").read_text(encoding="utf-8"),
+        re.S))
+    scoped_ddl = table_ddl + alter_ddl
+    missing = [c for c in columns if c not in scoped_ddl]
+    assert not missing, f"QA_SESSION_MANDATORY_COLS 用到了 qa_session_log DDL 段不存在的列: {missing}"
+
+    # ② 两写方 + readiness 探针必须消费同一常量（防再度分叉）
+    assert "QA_SESSION_MANDATORY_COLS" in inspect.getsource(qa_logger.log_qa_session)
+    assert "QA_SESSION_MANDATORY_COLS" in inspect.getsource(qa_logger.insert_qa_row_tx)
+    from opensearch_pipeline import api as _api
+    assert "QA_SESSION_MANDATORY_COLS" in inspect.getsource(_api._probe_operation_schema)
 
     # 增强列 conversation_id 必须落在 006 DDL（开关开时进主 INSERT）。
     conv_ddl = (SCHEMA_DIR / "006_conversation_history.sql").read_text(encoding="utf-8")
