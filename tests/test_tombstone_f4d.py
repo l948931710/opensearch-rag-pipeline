@@ -4,7 +4,9 @@
 修复前：所有身份查询带 AND is_active=1 过滤 → 墓碑行等同「从未见过」→ 回钉钉 API
 刷新出全组（撤销完全失效），且 RAG_ACL_FAIL_CLOSED 开着也拦不住（无在册行=保留令牌组）。
 修复后：is_active=0 = 显式撤读权 → live/cached 双路径返回权威空组 []（≠None），
-不回 API、不经 upsert 复活；api.py 零改动即在默认与 strict 两模式下同时收紧。
+不回 API、不经 upsert 复活。2026-07-21 迁移批A2/B2 统一契约（两树同文）：strict 下
+live=[] 再经 user_row_revoked 确认 → 令牌整体失效（None→401）；确认读失败
+fail-open 回退权威空组（public-only）；default 维持权威空组。
 
 时延契约（有意保留，测试钉死）：bot 层 90s / live-ACL 层 45s 暖缓存窗内旧组仍可能
 被复用；RAG_LIVE_ACL_REREAD=false 时收敛点=下次发令牌（≈TTL 2h）。应急即时撤权
@@ -123,7 +125,8 @@ def test_cached_absent_row_still_none(monkeypatch):
 # ── api.py current_identity 集成（零改动收紧）────────────────────────────────
 
 
-def _identity_groups(monkeypatch, *, live, strict, db_ok=True, reread=True):
+def _identity_obj(monkeypatch, *, live, strict, db_ok=True, reread=True, revoked=False):
+    """返回 current_identity 结果（统一契约下 strict 墓碑可为 None=401）。"""
     if strict:
         monkeypatch.setenv("RAG_ACL_FAIL_CLOSED", "true")
     else:
@@ -132,18 +135,48 @@ def _identity_groups(monkeypatch, *, live, strict, db_ok=True, reread=True):
     monkeypatch.setattr(
         "opensearch_pipeline.dingtalk_identity._resolve_user_dept_cached",
         lambda uid, with_status=False: (live, db_ok) if with_status else live)
+    monkeypatch.setattr(
+        "opensearch_pipeline.dingtalk_identity.user_row_revoked", lambda uid: revoked)
     token = issue_session_token("U1", dept="行政部", name="测试")
-    return api.current_identity(authorization="Bearer " + token).acl_groups
+    return api.current_identity(authorization="Bearer " + token)
+
+
+def _identity_groups(monkeypatch, **kw):
+    ident = _identity_obj(monkeypatch, **kw)
+    assert ident is not None
+    return ident.acl_groups
 
 
 def test_identity_tombstone_denies_default_mode(monkeypatch):
-    """默认（fail-open）模式：live=[]（墓碑权威空）→ 令牌内嵌组被清空。"""
-    assert _identity_groups(monkeypatch, live=[], strict=False) == []
+    """默认（fail-open）模式：live=[]（墓碑权威空）→ 令牌内嵌组被清空（public-only）。"""
+    assert _identity_groups(monkeypatch, live=[], strict=False, revoked=True) == []
 
 
-def test_identity_tombstone_denies_strict_mode(monkeypatch):
-    """strict 模式同样清空——修复前 strict 也拦不住墓碑（无在册行腿保留令牌组）。"""
-    assert _identity_groups(monkeypatch, live=[], strict=True) == []
+def test_identity_tombstone_strict_mode_invalidates_token(monkeypatch):
+    """F4d×P1-08 统一契约（2026-07-21 迁移批A2）：strict 下墓碑经 user_row_revoked 确认
+    → 令牌整体失效（None→401），而非降级 public-only。"""
+    assert _identity_obj(monkeypatch, live=[], strict=True, revoked=True) is None
+
+
+def test_identity_tombstone_strict_revoke_read_fail_falls_back_public_only(monkeypatch):
+    """确认读失败（user_row_revoked fail-open 返 False）→ 回退权威空组（public-only），
+    不误伤真空组用户，也不因确认失败放大为 401。"""
+    assert _identity_groups(monkeypatch, live=[], strict=True, revoked=False) == []
+
+
+def test_identity_tombstone_strict_full_chain_401(monkeypatch):
+    """组合面（统一契约收口）：墓碑用户免登侧仍会被签出空组令牌——strict 下该令牌经
+    current_identity 判 None，再经 require_identity（RAG_REQUIRE_AUTH 开）整链 401，
+    覆盖「签发端不拦、校验端拦」的既定分工。"""
+    import pytest
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("RAG_REQUIRE_AUTH", "true")
+    ident = _identity_obj(monkeypatch, live=[], strict=True, revoked=True)
+    assert ident is None
+    with pytest.raises(HTTPException) as ei:
+        api.require_identity(identity=ident)
+    assert ei.value.status_code == 401
 
 
 def test_identity_absent_row_keeps_token_groups(monkeypatch):

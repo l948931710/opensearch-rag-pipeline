@@ -535,17 +535,26 @@ def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Id
     # 读时实时重查 acl（默认 ON）：令牌内嵌组仅作兜底，实时以 DB user_role 为准（部门变更即时生效）。
     # 无在册行 / DB 失败 → live 为 None → 保留令牌组（绝不因瞬时抖动降级）。
     if uid and os.environ.get("RAG_LIVE_ACL_REREAD", "true").lower() in ("1", "true", "yes"):
-        from opensearch_pipeline.dingtalk_identity import _resolve_user_dept_cached
+        from opensearch_pipeline.dingtalk_identity import _resolve_user_dept_cached, user_row_revoked
         strict = os.environ.get("RAG_ACL_FAIL_CLOSED", "").strip().lower() in (
             "1", "true", "yes", "on")
         if strict:
             live, db_ok = _resolve_user_dept_cached(uid, with_status=True)
             if live is not None:
                 groups = live
+                # F4d×P1-08 统一契约（2026-07-21 迁移批A2/B2，两树同文）：resolver 现把墓碑
+                # （行全停用）解析为权威空组 []（≠None），strict 下经 user_row_revoked 确认
+                # 后令牌整体失效（401），而非降级 public-only；确认读失败 fail-open 返
+                # False → 维持权威空组（public-only）。语义=撤销内部文档读权，账号级封禁
+                # 归钉钉侧；签名 bot 通道无 401 可言，同一墓碑在 bot 侧表现为 public-only。
+                if not groups and user_row_revoked(uid):
+                    logger.warning("已停用用户 %s 持有效令牌访问——拒绝（tombstone）", uid)
+                    return None
             elif not db_ok:
                 # P0-04 fail-closed：DB **失败**时不信任令牌内嵌组，降级到仅 public
                 # （无在册行 db_ok=True → 保留令牌组，短 TTL 兜底，不因未缓存降级）。
                 groups = []
+            # else：查询成功但无在册行 → 保留令牌组（未缓存 ≠ 停用）。
         else:
             live = _resolve_user_dept_cached(uid)
             if live is not None:

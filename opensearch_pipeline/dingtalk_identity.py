@@ -547,6 +547,34 @@ def _resolve_user_dept_cached(staff_id: str, *, with_status: bool = False):
         return _ret(None, db_ok=False)         # DB 失败：db_ok=False（strict 据此 fail-closed）
 
 
+def user_row_revoked(user_id: str) -> bool:
+    """P1-08（外审核查 2026-07-16；2026-07-21 迁移批B2 自 claude/ontology-p0 移植）
+    墓碑判定：user_role **有行但全部 is_active=0** = 该用户被显式停用——区别于
+    「从未缓存」的无行（那是文档化的保留令牌组+短 TTL 兜底语义，本判定不碰）。
+    用既有 is_active 列做 tombstone，零 schema 变更。
+    读失败 → False（fail-open 到既有 TTL 语义：DB 抖动绝不误判成停用）。"""
+    if not user_id or str(user_id).startswith("$:"):
+        return False                           # 群聊/空 uid：无账号概念
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT MAX(is_active) FROM {_kb_db()}.user_role WHERE user_id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        # NULL=无行（非停用）；0=有行且全部停用（墓碑）；1=仍有活跃行
+        return bool(row) and row[0] is not None and int(row[0]) == 0
+    except Exception as e:   # noqa: BLE001
+        logger.warning("user_role 墓碑判定失败 user_id=%s（按未停用处理）: %s", user_id, e)
+        return False
+
+
 def _fetch_dingtalk_user_info(user_id: str) -> Optional[dict]:
     """
     通过钉钉 API 获取用户信息（姓名、部门等）。
