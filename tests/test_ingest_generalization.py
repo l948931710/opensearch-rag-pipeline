@@ -676,6 +676,94 @@ def test_xlsx_procedure_same_anchor_dynamic_redirect():
     assert not refs3, f"step3 应保持无图: {[r['filename'] for r in refs3]}"
 
 
+def _ce_doc(blocks, assets):
+    d = _xlsx_doc("设备清扫基准书A3.xlsx", blocks, assets, text="\n".join(
+        b["text"] for b in blocks if b.get("block_type") == "paragraph"))
+    return d
+
+
+def _ce_row_block(sheet_idx, ordn, cells, row_num=None):
+    return {"block_type": "paragraph", "text": "\t".join([str(ordn)] + cells), "page_num": sheet_idx + 1,
+            "source": "openpyxl", "section_path": "Sheet",
+            "extra": {"sheet_idx": sheet_idx, "row_num": row_num or (10 + ordn)}}
+
+
+def _ce_asset(idx, filename, sheet_idx, part_labels, visual_summary, annotation_num=None):
+    a = _totext_asset(idx, filename, visual_summary, "", anchor_row=5 + idx,
+                      status="ROUTE_TO_VECTOR")
+    a["page_num"] = sheet_idx + 1
+    a["part_labels"] = part_labels
+    a["annotation_num"] = annotation_num
+    return a
+
+
+def _ce_header_block(sheet_idx, part_col_cells):
+    """表头行(部位名称列解析用):first cell 序号,再跟列名。"""
+    return {"block_type": "paragraph", "text": "\t".join(part_col_cells), "page_num": sheet_idx + 1,
+            "source": "openpyxl", "section_path": "Sheet",
+            "extra": {"sheet_idx": sheet_idx, "row_num": 1, "row_role": "header"}}
+
+
+def test_equipment_cleaning_annotation_num_redirects_overattached_ref():
+    """phase 2.5(2026-07-20):多挂行里带圆圈编号的图,编号指向同 sheet 另一同 label 行
+    → 改绑过去(xlsx_clean:⑯ 链条图从 链条总成 行归位 润滑系统·链条 行)。
+    单挂行绝不触碰(编号与 GT 不全局一致,盲目 redirect 会拆散正确单挂)。"""
+    from opensearch_pipeline.pipeline_nodes import _bind_equipment_cleaning_images
+
+    class _C:
+        def __init__(self, text, section=None):
+            self.chunk_text = text
+            self.chunk_type = "text_chunk"
+            self.section_title = section
+            self.extra = {}
+
+    blocks = [
+        _ce_row_block(0, 4, ["链条总成", "丝杆，链条，链轨", "目测松紧"]),
+        _ce_row_block(0, 16, ["润滑系统", "链条", "无干锈，吹扫"]),
+    ]
+    rows = [_C("4\t链条总成\t丝杆，链条，链轨\t目测松紧"),
+            _C("16\t润滑系统\t链条\t无干锈，吹扫")]
+    assets = [
+        _ce_asset(0, "ce_img0000.jpeg", 0, ["链条"], "黑色链轮与金属链条啮合传动，紫标齿轮黄标链条"),
+        _ce_asset(1, "ce_img0001.jpeg", 0, ["链条"], "黑色链条环绕在两个齿轮上，油污磨损明显，配左侧导轨与张紧轮特写",
+                  annotation_num=16),
+    ]
+    bound, _ = _bind_equipment_cleaning_images(rows, assets, "it", "CEDOC", 1, blocks=blocks)
+    refs0 = [r["filename"] for r in (rows[0].extra.get("image_refs") or [])]
+    refs1 = [r["filename"] for r in (rows[1].extra.get("image_refs") or [])]
+    assert refs0 == ["ce_img0000.jpeg"], f"链条总成 行应只留无编号图: {refs0}"
+    assert refs1 == ["ce_img0001.jpeg"], f"⑯ 图应改绑到 序号16 润滑链条 行: {refs1}"
+    assert "_ce_sheet" not in (rows[1].extra["image_refs"][0]), "内部键必须清理,不入契约"
+
+
+def test_equipment_cleaning_near_dup_keeps_first_only():
+    """phase 2.6(2026-07-20):多挂行内近重复对(bigram Jaccard≥0.40)只留 image_index
+    最小的一张;非近重复的合法多图保留。"""
+    from opensearch_pipeline.pipeline_nodes import _bind_equipment_cleaning_images
+
+    class _C:
+        def __init__(self, text):
+            self.chunk_text = text
+            self.chunk_type = "text_chunk"
+            self.section_title = None
+            self.extra = {}
+
+    vs_a = "不锈钢外壳工业设备局部，正面有三列横向散热槽，顶部带提手，右侧灰色电机本体与红色部件，气泡标注电机"
+    vs_b = "一台不锈钢外壳的工业设备，侧面有通风槽，顶部带提手，右侧连接红色部件与灰色电机，气泡标注电机部件"
+    vs_c = "工业电机安装于白色金属支架上，支架底部绿色减震垫，菱形防滑钢板地面"
+    rows = [_C("8\t点检\t电机螺丝\t电机无晃动\t目视")]
+    assets = [
+        _ce_asset(0, "nd_img0000.jpeg", 0, ["电机"], vs_a),
+        _ce_asset(1, "nd_img0001.jpeg", 0, ["电机"], vs_b),   # 与 0 近重复 → 丢
+        _ce_asset(2, "nd_img0002.jpeg", 0, ["电机"], vs_c),   # 不同景 → 留
+    ]
+    bound, _ = _bind_equipment_cleaning_images(rows, assets, "it", "CEDOC", 1, blocks=[])
+    refs = [r["filename"] for r in (rows[0].extra.get("image_refs") or [])]
+    assert refs == ["nd_img0000.jpeg", "nd_img0002.jpeg"], (
+        f"近重复跟拍应只留首张、异景图保留: {refs}")
+    assert "nd_img0001.jpeg" not in bound, "被丢弃的近重复图不进 ce_bound_fns(走兜底 image chunk)"
+
+
 def test_docx_totext_fallback_unchanged():
     """非 XLSX 路径行为保持不变：非 step 的 DOCX 嵌入 TO_TEXT 图片不建独立
     image chunk（既有 [ref-enrich] 行为，避免本修复扩大爆炸半径）。"""
