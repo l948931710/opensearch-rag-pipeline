@@ -339,13 +339,25 @@ def _resolve_user_dept_live(staff_id: str) -> "tuple[List[str], bool]":
             #    （SQL 侧 TIMESTAMPDIFF，避免应用/DB 时区不一致——项目已知 tz=Pacific 陷阱）。
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT dept_code, role, TIMESTAMPDIFF(SECOND, updated_at, NOW()) "
+                    f"SELECT dept_code, role, TIMESTAMPDIFF(SECOND, updated_at, NOW()), is_active "
                     f"FROM {_kb_db()}.user_role "
-                    "WHERE user_id = %s AND is_active = 1 "
+                    "WHERE user_id = %s "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (staff_id,),
                 )
                 row = cur.fetchone()
+                # 评审F4d（2026-07-21）：is_active=0 = 权威墓碑（显式撤读权），不再被
+                # is_active=1 过滤成「等同未见」→ 回钉钉 API 刷新出全组（撤销完全失效）。
+                # 墓碑 → 权威空组、跳过 API、绝不经下方 upsert 复活。时延契约：bot 层
+                # 90s / live-ACL 层 45s 暖缓存窗内旧组仍可能被复用（≤90s 收敛，仅
+                # RAG_LIVE_ACL_REREAD=true 默认态下成立；关闭 reread 时收敛点=下次发令牌，
+                # ≈令牌 TTL 2h + ≤90s）。应急即时撤权走 RAG_REVOKED_USER_IDS /
+                # RAG_SESSION_TOKEN_MIN_IAT（钉钉侧移出组织**不是**应急路径——employee
+                # 缓存行 6h 信任 + API miss 退回旧缓存）。注：当前无任何代码写 is_active=0
+                # （kb_access 撤管理权只降 role），本语义为控制台/运维手工墓碑预留。
+                if row is not None and not row[3]:
+                    logger.info("用户已被墓碑（is_active=0）→ 权威空组: staff_id=%s", staff_id)
+                    return [], True
                 if row and row[0]:
                     # 缓存里存的可能是中文名(CSV) 或组代码(CSV)；归一化为组列表再返回。
                     # 未知项经白名单丢弃 = fail-closed（仅 public）。
@@ -505,15 +517,20 @@ def _resolve_user_dept_cached(staff_id: str, *, with_status: bool = False):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT dept_code FROM {_kb_db()}.user_role "
-                    "WHERE user_id = %s AND is_active = 1 "
+                    f"SELECT dept_code, is_active FROM {_kb_db()}.user_role "
+                    "WHERE user_id = %s "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (staff_id,),
                 )
                 row = cur.fetchone()
         finally:
             conn.close()
-        if row and row[0]:
+        if row is not None and not row[1]:
+            # 评审F4d：墓碑（is_active=0）= 权威空组 []（≠None）——api.py 的
+            # `live is not None → groups=live` 在默认与 strict 两模式下都会应用 []，
+            # strict 模式「无在册行保留令牌组」的既有语义不受影响（那是 None 腿）。
+            groups = []
+        elif row and row[0]:
             groups = _normalize_dept_to_codes(row[0])
         else:
             groups = None   # 无在册行：可能只是未缓存，不收紧到 public；保留令牌组，短 TTL 兜底
