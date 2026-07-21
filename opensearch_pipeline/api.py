@@ -695,7 +695,8 @@ def readiness_check():
     from fastapi.responses import JSONResponse
     cfg = get_config()
     if getattr(cfg, "simulate", False):
-        return {"status": "ok", "mode": "simulate", "rds": "skipped", "ha3": "skipped", "dashscope": "skipped"}
+        return {"status": "ok", "mode": "simulate", "rds": "skipped", "ha3": "skipped",
+                "dashscope": "skipped", "operation_db": "skipped", "dingtalk_stream": "skipped"}
     ttl = _ready_cache_ttl_s()
     if ttl <= 0:
         body, ok = _compute_readiness(cfg)
@@ -715,12 +716,46 @@ def readiness_check():
     return body if ok else JSONResponse(status_code=503, content=body)
 
 
+def _probe_operation_schema(conn, trace_id) -> str:
+    """评审F11（2026-07-21）：运营库 schema 探针——qa_session_log/user_feedback 表存在 +
+    qa_session_log 强制列完整（单一事实源 = qa_logger.QA_SESSION_MANDATORY_COLS，与
+    log_qa_session/insert_qa_row_tx 两写方同步；此前 readiness 绿 ≠ 审计/反馈活着）。
+    复用 RDS 探针的同一连接（information_schema 跨库可查）。返回 ok/missing/drift/error。
+    **默认只报告不判死**（辅助功能 fail-open 哲学；qa_logger 侧 1054/1146 已升
+    critical+ops 告警），RAG_READY_REQUIRE_OP_SCHEMA=true 才计入 critical。"""
+    try:
+        from opensearch_pipeline.qa_logger import QA_SESSION_MANDATORY_COLS, _op_db
+        _odb = _op_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema=%s AND table_name IN ('qa_session_log', 'user_feedback')",
+                (_odb,))
+            present = {r[0] for r in cur.fetchall()}
+            if present != {"qa_session_log", "user_feedback"}:
+                return "missing"
+            ph = ",".join(["%s"] * len(QA_SESSION_MANDATORY_COLS))
+            cur.execute(
+                f"SELECT COUNT(*) FROM information_schema.columns "
+                f"WHERE table_schema=%s AND table_name='qa_session_log' "
+                f"AND column_name IN ({ph})",
+                tuple([_odb] + list(QA_SESSION_MANDATORY_COLS)))
+            n = int(cur.fetchone()[0])
+            return "ok" if n == len(QA_SESSION_MANDATORY_COLS) else "drift"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("readiness: operation_db 探针失败 [trace=%s]: %s", trace_id, e)
+        return "error"
+
+
 def _compute_readiness(cfg):
     """真实探针全文（原 readiness_check 主体）。返回 (body, critical_ok)。"""
     # P2-05：对外只报组件 up/down（ok/error/skipped），绝不回灌异常原文（DB host / 驱动错误 /
     # 索引错误经 str(e) 泄露内部拓扑）。完整异常写内部日志，响应带 trace_id 供运维对账。
     trace_id = get_request_id()
     checks: Dict[str, str] = {}
+    # RDS + operation_db 两探针共用一次池签出（评审F11；也保证「一次 compute = 一次
+    # 真实 RDS 签出」的既有缓存成本模型不变）。
+    checks["operation_db"] = "error"
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -729,6 +764,7 @@ def _compute_readiness(cfg):
                 cur.execute("SELECT 1")
                 cur.fetchone()
             checks["rds"] = "ok"
+            checks["operation_db"] = _probe_operation_schema(conn, trace_id)
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 - readiness must report, not raise
@@ -759,8 +795,26 @@ def _compute_readiness(cfg):
     # 不可信，必须被负载均衡摘出）。失配详情已在启动日志 CRITICAL，此处只报状态词。
     checks["embedding_contract"] = "mismatch" if _EMBEDDING_CONTRACT_MISMATCH else "ok"
 
+    # 评审F11：钉钉 Stream 真实连通（is_stream_active=真 websocket 探针，此前只喂卡片
+    # 回调路由不进 readiness——Stream 死 + HTTP 未配 = 主通道全聋仍 ready 200）。
+    # 默认只报告；RAG_READY_REQUIRE_STREAM=true 时严格要求 active（显式要求下
+    # disabled 也算失败——要求了 Stream 却没开 = 配置错误）。
+    try:
+        from opensearch_pipeline.dingtalk_stream_runner import is_stream_active, stream_mode_enabled
+        if not stream_mode_enabled():
+            checks["dingtalk_stream"] = "disabled"
+        else:
+            checks["dingtalk_stream"] = "active" if is_stream_active() else "inactive"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("readiness: dingtalk_stream 探针失败 [trace=%s]: %s", trace_id, e)
+        checks["dingtalk_stream"] = "error"
+
     critical_ok = (checks.get("rds") == "ok" and checks.get("ha3") in ("ok", "skipped")
                    and not _EMBEDDING_CONTRACT_MISMATCH)
+    if os.environ.get("RAG_READY_REQUIRE_OP_SCHEMA", "").strip().lower() in ("1", "true", "yes", "on"):
+        critical_ok = critical_ok and checks.get("operation_db") == "ok"
+    if os.environ.get("RAG_READY_REQUIRE_STREAM", "").strip().lower() in ("1", "true", "yes", "on"):
+        critical_ok = critical_ok and checks.get("dingtalk_stream") == "active"
     body = {"status": "ok" if critical_ok else "degraded", "trace_id": trace_id, **checks}
     return body, critical_ok
 

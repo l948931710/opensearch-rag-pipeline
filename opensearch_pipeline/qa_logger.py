@@ -10,11 +10,50 @@ qa_logger.py — RAG 问答日志写入模块
 
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# 评审F11（2026-07-21）：qa_session_log 强制写契约列——单一事实源，三方共同消费：
+#   ① log_qa_session（serving 主写方）② insert_qa_row_tx（Agent 原子事务写方）
+#   ③ /api/ready 的 operation_db 列漂移探针（api.py::_compute_readiness）
+# 顺序即 INSERT 列序（两写方的 vals 列表按位对应）；改列必须三处同步。
+QA_SESSION_MANDATORY_COLS = (
+    "session_id", "message_id", "user_id", "user_name", "user_dept",
+    "query_text", "answer_text", "intent_type", "risk_level", "risk_blocked",
+    "retrieved_docs_json", "cited_docs_json",
+    "latency_ms", "retrieval_latency_ms", "llm_latency_ms",
+    "answer_status", "model_name", "error_message",
+    "opensearch_hit_count", "top_score", "conversation_type",
+    "content_blocks_json",
+)
+
+# 评审F11：表结构漂移（1054/1146）ops 告警——进程内至多一次【尝试】（检查即置位：
+# 并发首失只发一枚；发送失败不重试——logger.critical 每次照记、alerting 自带 fail-open）。
+_SCHEMA_DRIFT_ALERTED = False
+_SCHEMA_DRIFT_ALERT_LOCK = threading.Lock()
+
+
+def _alert_schema_drift_once(errno, exc) -> None:
+    """qa_session_log 表结构漂移 → send_ops_alert(critical)（至多一次；绝不抛）。"""
+    global _SCHEMA_DRIFT_ALERTED
+    try:
+        with _SCHEMA_DRIFT_ALERT_LOCK:
+            if _SCHEMA_DRIFT_ALERTED:
+                return
+            _SCHEMA_DRIFT_ALERTED = True
+        from opensearch_pipeline.alerting import send_ops_alert
+        send_ops_alert(
+            "qa_session_log 表结构漂移——问答日志静默丢失中",
+            f"errno={errno}: {exc}。修复前每一条问答日志都在丢、反馈无法按 message_id "
+            "关联（readiness 默认不因此翻红）。请立即 apply 对应 schema 迁移。",
+            severity="critical",
+        )
+    except Exception:  # noqa: BLE001 — 告警失败绝不外溢到答案主路径
+        logger.warning("schema-drift ops 告警发送失败（fail-open）", exc_info=True)
 
 
 def _op_db() -> str:
@@ -240,15 +279,7 @@ def insert_qa_row_tx(
     PII 掩码与主路径同口径（_redact_for_log）。"""
     query_text = _redact_for_log(query_text)
     answer_text = _redact_for_log(answer_text)
-    base_cols = [
-        "session_id", "message_id", "user_id", "user_name", "user_dept",
-        "query_text", "answer_text", "intent_type", "risk_level", "risk_blocked",
-        "retrieved_docs_json", "cited_docs_json",
-        "latency_ms", "retrieval_latency_ms", "llm_latency_ms",
-        "answer_status", "model_name", "error_message",
-        "opensearch_hit_count", "top_score", "conversation_type",
-        "content_blocks_json",
-    ]
+    base_cols = list(QA_SESSION_MANDATORY_COLS)   # 单一事实源（评审F11）
     base_vals: List[Any] = [
         session_id, message_id, user_id or "", None, user_dept,
         query_text, answer_text, None, None, 0,
@@ -417,15 +448,7 @@ def log_qa_session(
 
         conn = _get_db_conn()
         try:
-            base_cols = [
-                "session_id", "message_id", "user_id", "user_name", "user_dept",
-                "query_text", "answer_text", "intent_type", "risk_level", "risk_blocked",
-                "retrieved_docs_json", "cited_docs_json",
-                "latency_ms", "retrieval_latency_ms", "llm_latency_ms",
-                "answer_status", "model_name", "error_message",
-                "opensearch_hit_count", "top_score", "conversation_type",
-                "content_blocks_json",
-            ]
+            base_cols = list(QA_SESSION_MANDATORY_COLS)   # 单一事实源（评审F11）
             base_vals = [
                 session_id, message_id, user_id or "", user_name, user_dept,
                 query_text, answer_text, intent_type, risk_level,
@@ -591,6 +614,7 @@ def log_qa_session(
                 "反馈无法按 message_id 关联。message_id=%s, error=%s",
                 errno, message_id, e,
             )
+            _alert_schema_drift_once(errno, e)   # 评审F11：光 log 不 page 没人看见
         else:
             logger.error(
                 "qa_session_log 写入失败 (non-fatal): message_id=%s, error=%s",

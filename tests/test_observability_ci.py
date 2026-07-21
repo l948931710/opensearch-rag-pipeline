@@ -266,6 +266,9 @@ def test_api_ready_probe_cache_serves_within_ttl(monkeypatch):
         def fetchone(self):
             return (1,)
 
+        def fetchall(self):          # 评审F11：operation_db 探针（表存在查询）
+            return [("qa_session_log",), ("user_feedback",)]
+
     class _Conn:
         def cursor(self):
             return _Cur()
@@ -275,9 +278,11 @@ def test_api_ready_probe_cache_serves_within_ttl(monkeypatch):
 
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: _Conn())
     r1 = TestClient(app).get("/api/ready")
+    n_after_first = probes["n"]
+    assert n_after_first >= 1
     r2 = TestClient(app).get("/api/ready")
     assert r1.status_code == r2.status_code == 200
-    assert probes["n"] == 1, "TTL 窗口内第二次命中必须走缓存（零真实 RDS 探针）"
+    assert probes["n"] == n_after_first, "TTL 窗口内第二次命中必须走缓存（零真实 RDS 探针）"
     assert r1.json() == r2.json()
 
 
@@ -308,6 +313,9 @@ def test_api_ready_probe_cache_disabled_by_zero_ttl(monkeypatch):
         def fetchone(self):
             return (1,)
 
+        def fetchall(self):          # 评审F11：operation_db 探针（表存在查询）
+            return [("qa_session_log",), ("user_feedback",)]
+
     class _Conn:
         def cursor(self):
             return _Cur()
@@ -317,5 +325,6 @@ def test_api_ready_probe_cache_disabled_by_zero_ttl(monkeypatch):
 
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda **kw: _Conn())
     TestClient(app).get("/api/ready")
+    n_after_first = probes["n"]
     TestClient(app).get("/api/ready")
-    assert probes["n"] == 2
+    assert probes["n"] == 2 * n_after_first, "TTL=0 每请求都真探（探针数翻倍）"
