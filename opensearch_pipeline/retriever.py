@@ -792,7 +792,8 @@ def _client_fusion_search(
     client,
     cfg,
 ) -> Optional[List[Dict[str, Any]]]:
-    """三路客户端融合检索（RAG_HA3_CLIENT_FUSION，默认关）。
+    """三路客户端融合检索（RAG_HA3_CLIENT_FUSION，**默认开**——config.py 默认 True
+    随包生效，=false 为逃生舱；本 docstring 曾写"默认关"系 2026-07-13 灰度期旧话）。
 
     /search 不支持 sparse 参数（522 盲行事故根因，docs/ha3_sparse_rootcause_and_ab_2026-07-13.md）
     之后「既救盲行又保 sparse」的正确路径（金集 A/B 判决 w3_s10，
@@ -1013,7 +1014,8 @@ def search_chunks(
 
     client = _get_ha3_client()
 
-    # 3a. 三路客户端融合（RAG_HA3_CLIENT_FUSION，默认关；生产开启走 SAE env）。
+    # 3a. 三路客户端融合（RAG_HA3_CLIENT_FUSION，默认开——config 默认 True 随包生效，
+    # =false 为 kill switch；旧注释"默认关；生产开启走 SAE env"已过时）。
     # 注意：S 臂走 /query（sparse 官方支持路径），与上面 RAG_HA3_KNN_SPARSE_ENABLE
     # （只管 /search 的 knn 臂）互不相干——融合开启时 sparse 信号总是可用。
     # degraded（零向量嵌入）不走融合：D/S 两臂无意义，沿用纯 BM25 降级形态。
