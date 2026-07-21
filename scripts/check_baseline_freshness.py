@@ -106,6 +106,19 @@ def check_rag(cfg) -> None:
         _check("rag.vlm_cache_version", regime.get("vlm_cache_version") == cur_ns,
                f"冻结 vlm_cache_version={regime.get('vlm_cache_version')} vs 当前 {cur_ns}——"
                f"缓存版本提升=存量 caption 整体重掷,L4 分数不可比；{RAG_REFREEZE_HINT}")
+    # L4-GT 指纹(2026-07-20):GT 在 repo 外数据仓,重标会静默移动 l4ing.*。仅当冻结基线
+    # 已带指纹时比较;本机数据仓不可达(CI)→ advisory 跳过,不误红。
+    if regime.get("l4_gt_sha") is not None:
+        try:
+            from eval_harness.run_eval import _l4_gt_sha
+            cur_gt = _l4_gt_sha()
+        except Exception:
+            cur_gt = None
+        _check("rag.l4_gt_sha",
+               (None if cur_gt is None else regime.get("l4_gt_sha") == cur_gt),
+               ("L4 GT 数据仓不可达,跳过比对(advisory)" if cur_gt is None else
+                f"冻结 l4_gt_sha={regime.get('l4_gt_sha')} vs 当前 {cur_gt}——L4 绑定 GT "
+                f"已重标,l4ing.* 不可与冻结值直接比较；{RAG_REFREEZE_HINT}"))
 
     # 文档漂移防复发（RB-05 D 层）：.env.example 示例模型必须跟 config 默认走
     if ENV_EXAMPLE.exists():

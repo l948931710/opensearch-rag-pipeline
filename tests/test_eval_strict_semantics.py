@@ -580,6 +580,25 @@ def test_regime_includes_vlm_fingerprint(monkeypatch):
     assert regime2["vlm_cache_version"] == "bare"
 
 
+def test_regime_l4_gt_sha_bilateral_lenient():
+    """L4-GT 指纹(2026-07-20):入 _REGIME_KEYS;双向宽容——老基线缺键宽容(单向窗),
+    CI 无数据仓现值 None 也宽容(双向窗,否则整个差量网被 N/A);两侧都有值且不同 → mismatch
+    (GT 重标=换 regime,l4ing.* 拒绝跨代对比)。"""
+    from eval_harness.baseline import _REGIME_KEYS, regime_matches
+    assert "l4_gt_sha" in _REGIME_KEYS
+    base_old = {"fusion": "weighted", "eval_set_sha": "x"}
+    cur = {"fusion": "weighted", "eval_set_sha": "x", "l4_gt_sha": "abcd1234abcd1234"}
+    ok, diffs = regime_matches(base_old, cur)
+    assert ok and diffs == []                                     # 老基线缺键宽容
+    base_new = dict(cur)
+    cur_ci = {"fusion": "weighted", "eval_set_sha": "x", "l4_gt_sha": None}
+    ok2, diffs2 = regime_matches(base_new, cur_ci)
+    assert ok2 and diffs2 == []                                   # CI 现值 None 宽容(双向)
+    cur_restamped = dict(cur, l4_gt_sha="ffff0000ffff0000")
+    ok3, diffs3 = regime_matches(base_new, cur_restamped)
+    assert not ok3 and "l4_gt_sha" in diffs3                      # GT 重标=换 regime
+
+
 def test_regime_vlm_keys_lenient_for_legacy_baseline():
     """VLM 键沿用 judge 键的宽容窗口：老基线缺键宽容,新基线有值严格。"""
     from eval_harness.baseline import regime_matches

@@ -156,19 +156,27 @@ def regime_of(results: Dict) -> Dict:
 _REGIME_KEYS = ("eval_set_sha", "fusion", "rerank_enable", "llm_model",
                 "embedding_model", "reranker_models", "threshold_version",
                 "judge_model", "judge_rubric_version",
-                "vlm_model", "vlm_cache_version")
+                "vlm_model", "vlm_cache_version", "l4_gt_sha")
 # P2-24 向后兼容宽容窗口：judge_model / judge_rubric_version 是 2026-07 新增 regime 键,
 # 存量 baseline.json 里没有——老基线缺该键（None）视为匹配,新 freeze 起自动带上;
 # 一旦 baseline 里有值,就按普通键严格比较。refreeze 需在用户机器上跑 live eval
 # （沙箱 403 打不到生产 HA3）,所以不能因新键让存量基线立即失效。
 # vlm_model / vlm_cache_version(2026-07-20)沿用同一窗口。
+# l4_gt_sha(2026-07-20):L4 GT 在 repo 外数据仓,GT 重标对基线网原本隐形(clean 战役
+# 当天实证);CI 无数据仓时现值为 None——lenient 窗口双向覆盖(老基线缺键 / 现值不可算)。
 _LENIENT_REGIME_KEYS = frozenset({"judge_model", "judge_rubric_version",
-                                  "vlm_model", "vlm_cache_version"})
+                                  "vlm_model", "vlm_cache_version", "l4_gt_sha"})
+
+
+# 双向宽容键:任一侧为 None 即视为匹配——l4_gt_sha 在无数据仓的机器(CI)上现值恒 None,
+# 单向宽容会让"基线有值+CI 现值 None"误判 mismatch,整个差量网被 N/A 掉。
+_BILATERAL_LENIENT_KEYS = frozenset({"l4_gt_sha"})
 
 
 def regime_matches(base_regime: Dict, cur_regime: Dict) -> Tuple[bool, List[str]]:
     diffs = [k for k in _REGIME_KEYS
              if not (k in _LENIENT_REGIME_KEYS and base_regime.get(k) is None)
+             and not (k in _BILATERAL_LENIENT_KEYS and cur_regime.get(k) is None)
              and base_regime.get(k) != cur_regime.get(k)]
     return (not diffs, diffs)
 
