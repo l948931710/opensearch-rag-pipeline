@@ -340,6 +340,165 @@ def test_scan_ha3_pks_loops_until_stable(monkeypatch):
     assert calls["n"] >= 2                      # 首轮不完整 → 至少又扫了一轮
 
 
+# ── 07-21 fetch 二次定性：missing_confirmed vs query_invisible ──
+
+def _ensure_ha3_fetch_request():
+    """确保 alibabacloud_ha3engine_vector.models 有 FetchRequest。xdist 同 worker 内
+    test_ha3_engine/test_rrf_hybrid_search 可能先注入了无 FetchRequest 的 SDK stub
+    （导入顺序不定），缺则按仓库惯例（_ensure_ha3_mock_modules 的就地补属性）补一个
+    kwargs 直存的 mock；真 SDK 在场则天然有、no-op。"""
+    import sys
+    import types
+    try:
+        from alibabacloud_ha3engine_vector import models as ha3_models
+    except ImportError:   # 无 SDK 环境（CI）且尚无 stub → 建 stub（含 client，防下游炸）
+        from unittest.mock import MagicMock
+        ha3_pkg = sys.modules.get("alibabacloud_ha3engine_vector",
+                                  types.ModuleType("alibabacloud_ha3engine_vector"))
+        ha3_models = sys.modules.get("alibabacloud_ha3engine_vector.models",
+                                     types.ModuleType("alibabacloud_ha3engine_vector.models"))
+        ha3_client = sys.modules.get("alibabacloud_ha3engine_vector.client",
+                                     types.ModuleType("alibabacloud_ha3engine_vector.client"))
+        if not hasattr(ha3_client, "Client"):
+            ha3_client.Client = MagicMock
+        sys.modules["alibabacloud_ha3engine_vector"] = ha3_pkg
+        sys.modules["alibabacloud_ha3engine_vector.models"] = ha3_models
+        sys.modules["alibabacloud_ha3engine_vector.client"] = ha3_client
+    if not hasattr(ha3_models, "FetchRequest"):
+        class MockFetchRequest:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+        ha3_models.FetchRequest = MockFetchRequest
+
+
+_ensure_ha3_fetch_request()
+
+
+def _missing(*ids):
+    return [{"id": i, "chunk_id": f"c{i}", "doc_id": "d1"} for i in ids]
+
+
+class _FetchResp:
+    def __init__(self, body):
+        self.body = body
+
+
+def test_fetch_reclassify_splits_confirmed_and_invisible():
+    """fetch 可取回的判 query_invisible（查询链路失明），fetch 也无的判 missing_confirmed。"""
+    import json
+
+    class _Cli:
+        def __init__(self):
+            self.reqs = []
+
+        def fetch(self, req):
+            self.reqs.append(req)
+            docs = [{"id": "2", "chunk_id": "c2"}] if "2" in req.ids else []
+            return _FetchResp(json.dumps({"result": docs}))
+
+    cli = _Cli()
+    out = reconcile._fetch_reclassify_missing(cli, "tbl", _missing(1, 2, 3))
+    assert out["ok"] is True
+    assert out["query_invisible"] == [2]
+    assert out["missing_confirmed"] == [1, 3]
+    assert out["unclassified"] == [] and out["fetch_errors"] == []
+    assert cli.reqs[0].table_name == "tbl" and cli.reqs[0].include_vector is False
+
+
+def test_fetch_reclassify_batches_le_100_ids():
+    """250 个判缺 PK → 3 批（100/100/50），每批 ids ≤100。"""
+    import json
+
+    class _Cli:
+        def __init__(self):
+            self.batches = []
+
+        def fetch(self, req):
+            self.batches.append(list(req.ids))
+            return _FetchResp(json.dumps({"result": []}))
+
+    cli = _Cli()
+    out = reconcile._fetch_reclassify_missing(cli, "tbl", _missing(*range(250)))
+    assert [len(b) for b in cli.batches] == [100, 100, 50]
+    assert len(out["missing_confirmed"]) == 250
+
+
+def test_fetch_reclassify_batch_error_leaves_batch_unclassified():
+    """单批 fetch 异常 → 该批 ids 未定性（绝不误判为 confirmed），其余批照常分类，不 raise。"""
+    import json
+
+    class _Cli:
+        def __init__(self):
+            self.n = 0
+
+        def fetch(self, req):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("boom")
+            return _FetchResp(json.dumps({"result": [{"id": str(req.ids[0])}]}))
+
+    out = reconcile._fetch_reclassify_missing(_Cli(), "tbl", _missing(*range(150)))
+    assert out["ok"] is True
+    assert set(out["unclassified"]) == set(range(100))          # 第一批 0..99 全未定性
+    assert out["query_invisible"] == [100]                       # 第二批首 id fetch 可取回
+    assert set(out["missing_confirmed"]) == set(range(101, 150))
+    assert out["fetch_errors"] and "boom" in out["fetch_errors"][0]
+
+
+def test_fetch_reclassify_errorcode_body_counts_as_batch_error():
+    """响应体带 errorCode → 该批按异常处理（unclassified），不误读为空结果 confirmed。"""
+    import json
+
+    class _Cli:
+        def fetch(self, req):
+            return _FetchResp(json.dumps({"errorCode": 403, "errorMsg": "denied"}))
+
+    out = reconcile._fetch_reclassify_missing(_Cli(), "tbl", _missing(1))
+    assert out["ok"] is False                # 全部批失败 → 等同整体失败，维持 query 单口径
+    assert "fetch batches failed" in out["error"]
+
+
+def test_fetch_reclassify_total_failure_fail_open():
+    """client 根本没有 fetch 能力（AttributeError）→ ok=False，绝不 raise。"""
+    out = reconcile._fetch_reclassify_missing(object(), "tbl", _missing(1, 2))
+    assert out["ok"] is False and out.get("error")
+
+
+def test_alert_on_drift_text_carries_fetch_classification(monkeypatch):
+    """定性成功 → 告警文案分类展示两计数；等级维持 critical（检索面损失真实）。"""
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+    report = {"ok": False, "complete": True,
+              "counts": {"rds_active_missing": 3, "vanished_docs": 0, "ha3_stale": 0,
+                         "missing_confirmed": 1, "query_invisible": 2, "missing_unclassified": 0},
+              "fetch_reclassify": {"ok": True, "query_invisible": [2, 3],
+                                   "missing_confirmed": [1], "unclassified": [],
+                                   "fetch_errors": []}}
+    reconcile._alert_on_drift(report)
+    (_, text, kw) = sent[0]
+    assert kw["severity"] == "critical"
+    assert "missing_confirmed" in text and "**1**" in text
+    assert "query_invisible" in text and "**2**" in text
+    assert "查询链路失明" in text
+
+
+def test_alert_on_drift_falls_back_when_reclassify_failed(monkeypatch):
+    """定性失败 → 旧文案（query 单口径）+ 失败注记；等级仍 critical。"""
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+    report = {"ok": False, "complete": True,
+              "counts": {"rds_active_missing": 5, "vanished_docs": 1, "ha3_stale": 0},
+              "fetch_reclassify": {"ok": False, "error": "RuntimeError: down"}}
+    reconcile._alert_on_drift(report)
+    (_, text, kw) = sent[0]
+    assert kw["severity"] == "critical"
+    assert "**5**" in text and "missing_confirmed" not in text
+    assert "二次定性失败" in text and "down" in text
+
 # ── CS4c compute_unregistered_raw（2026-07-16 扫描停摆调查）──
 
 _NOW = 1_700_000_000.0
