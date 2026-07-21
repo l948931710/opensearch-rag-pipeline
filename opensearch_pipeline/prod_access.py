@@ -73,7 +73,7 @@ def _connect(env: dict, *, init_command: str = None, dict_cursor: bool = True):
     ca = (env.get("RAG_RDS_SSL_CA") or "").strip()
     if ca:
         verify = str(env.get("RAG_RDS_SSL_VERIFY_CERT", "true")).lower() in ("1", "true", "yes")
-        ssl_kwargs = {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+        ssl_kwargs = {"ssl_ca": ca, "ssl_verify_cert": verify, "ssl_verify_identity": verify}
     else:
         ssl_kwargs = {"ssl_disabled": True}
     return pymysql.connect(
