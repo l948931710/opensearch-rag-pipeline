@@ -12,7 +12,9 @@ from opensearch_pipeline import retriever as R
 # the APPROVED umbrella owners (matches _PRODUCTION_UMBRELLA_OWNERS; injection+straw
 # approved 2026-07-16 — both OSS dirs exist with registered docs)
 SUBLINES = ["production", "production_injection", "production_mold",
-            "production_paper_cup", "production_straw", "production_thermoforming"]
+            "production_paper_cup", "production_straw", "production_thermoforming",
+            # 2026-07-20 Sam 拍板开通(07-16 全景缓办项)
+            "production_blown_film", "production_carton", "production_pulp_molding"]
 # production_papercup double-spelling etc. are NOT approved → must fail closed
 UNAPPROVED = ["production_papercup", "production_secret", "production_"]
 
@@ -45,7 +47,8 @@ def test_unknown_subline_not_in_umbrella_fail_closed():
         assert unknown not in owners, f"fail-closed breach: {unknown} granted"
 
 
-def test_umbrella_owner_set_is_exactly_approved_six():
+def test_umbrella_owner_set_is_exactly_approved_nine():
+    # 伞值 + 8 子线(2026-07-20 拍板:+吹膜/纸箱/纸浆模塑;包装归伞/三级归伞/海外未拍板)
     assert set(R._PRODUCTION_UMBRELLA_OWNERS) == set(SUBLINES)
 
 

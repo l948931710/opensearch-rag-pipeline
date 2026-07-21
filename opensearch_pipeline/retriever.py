@@ -367,6 +367,13 @@ _PRODUCTION_UMBRELLA_OWNERS = frozenset({
     "production_paper_cup",
     "production_straw",
     "production_thermoforming",
+    # 2026-07-20 Sam 拍板开通(07-16 全景缓办项;目录随首篇上传自动落位,不预建 OSS):
+    "production_blown_film",      # 吹膜车间(172 人)
+    "production_carton",          # 纸箱车间(169 人)
+    "production_pulp_molding",    # 纸浆模塑事业部(92 人)
+    # 同批拍板【不】开通的(记录在案,防止后人当遗漏):包装车间→归伞值 production
+    # (横跨产品线);三级部门(车间下属机修/班组长/料房等)一律归伞;海外产线归属
+    # 口径仍未拍板(overseas 用户组已可叠读 production)。
 })
 # user-facing group -> owner_dept set it grants. Absent group => exact {group}.
 #
