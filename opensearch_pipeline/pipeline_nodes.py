@@ -3809,10 +3809,14 @@ def _bind_equipment_cleaning_images(chunks, assets, dept_code, d_id, version, bl
             "ocr_text": a.get("ocr_text", ""),
             "_ce_tier": tier,
             "_ce_exact": exact,
+            # 图所在 sheet(page_num=sheet_idx+1,extract_images_from_xlsx 赋值)——
+            # phase 2.5 标注号改绑要求编号在图自己的 sheet 内解析
+            "_ce_sheet": (a.get("page_num") - 1) if a.get("page_num") else None,
         })
 
     # phase 2（驱逐）+ phase 3（强者归并），仅作用于本函数新加的带标签 ref；
     # 任何已存在的无标签 ref（其它路径可能预先挂载）原样保留。
+    pending = {}   # id(c) -> (chunk, pre, new)：先算完全部行,2.5/2.6 才有全局视角
     for c in rows:
         all_refs = c.extra.get("image_refs")
         if not all_refs:
@@ -3826,9 +3830,67 @@ def _bind_equipment_cleaning_images(chunks, assets, dept_code, d_id, version, bl
                 exacts = [r for r in new if r.get("_ce_exact")]
                 if exacts and len(exacts) < len(new):
                     new = exacts
-            for r in new:
-                r.pop("_ce_tier", None)
-                r.pop("_ce_exact", None)
+        pending[id(c)] = (c, pre, new)
+
+    # phase 2.5（2026-07-20 多挂行消歧·其一）：标注号改绑——工作簿的圆圈编号(⑯)是
+    # 作者亲手写的图↔行对应,比 part_label 词面强。**只在"证据等强多挂"的行上生效**
+    # （单挂行绝不触碰——盲目全局 redirect 实测会把主机温度/控制面板等正确单挂行
+    # 拆散,GT 的图↔行选择并不全局跟随编号）。改绑条件全部满足才动:
+    #   ① ref 带 annotation_num;② 同 sheet 存在行首序号==该编号的行;③ 目标行的
+    #   身份列命中该 ref 的某个 part_label(编号+词面双证);④ 目标 ≠ 当前行。
+    ordinals = _ce_row_ordinals(rows, blocks or [])   # id(chunk) -> (sheet_idx, 行首序号)
+    ord_lookup = {v: cid for cid, v in ordinals.items() if v is not None}
+    for cid, (c, pre, new) in list(pending.items()):
+        if len(new) <= 1:
+            continue
+        kept = []
+        for r in new:
+            ann = r.get("annotation_num")
+            sheet = r.get("_ce_sheet")
+            tgt_id = ord_lookup.get((sheet, ann)) if (ann is not None and sheet is not None) else None
+            if tgt_id is not None and tgt_id != cid:
+                tgt_c = next((rc for rc in rows if id(rc) == tgt_id), None)
+                ident_t = regions.get(tgt_id, ("", "", None))[0]
+                if tgt_c is not None and any(
+                        lbl and lbl in ident_t for lbl in (r.get("part_labels") or [])):
+                    _, tpre, tnew = pending.get(tgt_id, (tgt_c, [], []))
+                    tnew.append(r)
+                    pending[tgt_id] = (tgt_c, tpre, tnew)
+                    continue
+            kept.append(r)
+        pending[cid] = (c, pre, kept)
+
+    # phase 2.6（多挂行消歧·其二）：近重复对只留首张(image_index 最小)。同一部位
+    # 连拍两张近似照(bigram Jaccard ≥ 0.40;实测真对 0.463、异物对 ≤0.04,分离显著)
+    # 只留第一张;非近重复的多图(不同角度/不同部件合法多图)原样保留。
+    # ⚠️ 短 caption 豁免:token 集 <15 时 Jaccard 是高方差噪声(「齿轮箱左视图/右视图」
+    # 这类 6 字合法多视角对会打出 0.43 假高分),两侧不够富一律视为不相似——绝不在
+    # 贫证据上武断单选(与 06-18「证据等强保留全部」拍板同精神)。
+    def _ce_sim(r1, r2):
+        t1 = ((r1.get("visual_summary") or "") + " " + (r1.get("ocr_text") or "")).strip()
+        t2 = ((r2.get("visual_summary") or "") + " " + (r2.get("ocr_text") or "")).strip()
+        s1, s2 = _toks_for_ce_sim(t1), _toks_for_ce_sim(t2)
+        if len(s1) < 15 or len(s2) < 15:
+            return 0.0
+        return len(s1 & s2) / max(len(s1 | s2), 1)
+
+    for cid, (c, pre, new) in pending.items():
+        if len(new) <= 1:
+            continue
+        new_sorted = sorted(new, key=lambda r: (r.get("image_index")
+                                                if r.get("image_index") is not None else 10**9))
+        survivors = []
+        for r in new_sorted:
+            if any(_ce_sim(r, s) >= 0.40 for s in survivors):
+                continue   # 近重复跟拍,丢弃(走兜底独立 image chunk,serving 可达性不丢)
+            survivors.append(r)
+        pending[cid] = (c, pre, survivors)
+
+    for cid, (c, pre, new) in pending.items():
+        for r in new:
+            r.pop("_ce_tier", None)
+            r.pop("_ce_exact", None)
+            r.pop("_ce_sheet", None)
         merged = pre + new
         if merged:
             c.extra["image_refs"] = merged
@@ -3838,6 +3900,45 @@ def _bind_equipment_cleaning_images(chunks, assets, dept_code, d_id, version, bl
             if r.get("filename"):
                 ce_bound_fns.add(r["filename"])
     return ce_bound_fns, diag
+
+
+def _toks_for_ce_sim(s: str) -> set:
+    import re as _re
+
+    s = (s or "").lower()
+    cjk = _re.findall(r'[一-鿿]', s)
+    bigrams = {cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1)}
+    alnum = set(_re.findall(r'[a-z0-9]{2,}', s))
+    return bigrams | alnum
+
+
+def _ce_row_ordinals(rows, blocks):
+    """row chunk → (sheet_idx, 行首序号)。row_card 行 chunk 由块 1:1 生成,chunk_text=
+    前缀+块文本;用块文本头 20 字符做包含匹配回查 sheet_idx,序号取块文本首个 \\t 前的整数。
+    解析不出的行返回 None(消歧器对其不生效——fail-open,绝不因解析失败误改绑)。"""
+    import re as _re
+
+    sig = []
+    for b in blocks:
+        ex = b.get("extra") if isinstance(b, dict) else (getattr(b, "extra", {}) or {})
+        t = (b.get("text") if isinstance(b, dict) else getattr(b, "text", "")) or ""
+        si = (ex or {}).get("sheet_idx")
+        if si is None or not t:
+            continue
+        m = _re.match(r"\s*(\d+)\s*\t", t)
+        if not m:
+            continue
+        sig.append((t[:20], si, int(m.group(1))))
+    out = {}
+    for c in rows:
+        txt = c.chunk_text or ""
+        found = None
+        for head, si, ordn in sig:
+            if head and head in txt:
+                found = (si, ordn)
+                break
+        out[id(c)] = found
+    return out
 
 
 def _chunk_explosion_verdict(chunks):
