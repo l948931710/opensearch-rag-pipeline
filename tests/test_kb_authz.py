@@ -208,12 +208,14 @@ def test_upload_target_depts_production_sublines():
     kb_admin = KbIdentity(user_id="k1", role=ka.ROLE_KB_ADMIN)
     employee = KbIdentity(user_id="e1", role=ka.ROLE_EMPLOYEE)
 
-    # 下拉选项 = 伞值 + 5 个已批准子线(与 retriever 伞形白名单单一来源)
+    # 下拉选项 = 伞值 + 8 个已批准子线(与 retriever 伞形白名单单一来源;
+    # 2026-07-20 拍板 +吹膜/纸箱/纸浆模塑)
     opts = ka.upload_target_depts(prod_admin)
     assert opts[0] == "production"
     assert set(o for o in opts if o.startswith("production_")) == {
         "production_mold", "production_paper_cup", "production_thermoforming",
-        "production_injection", "production_straw"}
+        "production_injection", "production_straw",
+        "production_blown_film", "production_carton", "production_pulp_molding"}
     # 非 production 管理员:无子线
     assert all(not o.startswith("production_") for o in ka.upload_target_depts(hr_admin))
     # kb_admin:全量写白名单 + 子线
