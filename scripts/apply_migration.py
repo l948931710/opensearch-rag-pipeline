@@ -213,6 +213,51 @@ def _ledger_has_checksum_col(conn, dbname) -> bool:
         return int(cur.fetchone()[0]) == 1
 
 
+_ADD_COLUMN_RE = re.compile(
+    r"^ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+COLUMN\s+`?(\w+)`?", re.IGNORECASE)
+_CREATE_INDEX_RE = re.compile(
+    r"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+`?(\w+)`?\s+ON\s+`?(\w+)`?", re.IGNORECASE)
+
+
+def _statement_skip_reason(conn, dbname, stmt):
+    """已应用形态的 information_schema 预检（评审F9，2026-07-21）——049:20 头注声称
+    「重复执行由本脚本预检跳过（同 031/048 约定）」的守卫**本体**（此前并不存在，
+    重跑裸 ADD COLUMN 必 1060 崩）。
+
+    保守闭集，只识别两种单一形态，其余语句一律照跑（fail-loud 姿态不变）：
+      · 单列 `ALTER TABLE t ADD COLUMN c ...`（语句内恰一个 ADD）——列已存在 → skip。
+        004 那类多列复合 ALTER **刻意不支持**（含多个 ADD 子句不匹配；重跑仍响亮失败）；
+      · `CREATE [UNIQUE] INDEX i ON t ...`——同名索引已存在 → skip（012/014/015 形态）。
+    预检自身失败 → None（照跑；绝不因守卫故障吞掉真错误）。
+    返回：跳过原因字符串，或 None（正常执行）。"""
+    try:
+        m = _ADD_COLUMN_RE.match(stmt)
+        if m and len(re.findall(r"\bADD\b", stmt, re.IGNORECASE)) == 1:
+            table, column = m.group(1), m.group(2)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
+                    (dbname, table, column))
+                if int(cur.fetchone()[0]) >= 1:
+                    return f"列已存在：{table}.{column}（幂等重跑，ADD COLUMN 跳过）"
+            return None
+        m = _CREATE_INDEX_RE.match(stmt)
+        if m:
+            index, table = m.group(1), m.group(2)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.statistics "
+                    "WHERE table_schema=%s AND table_name=%s AND index_name=%s",
+                    (dbname, table, index))
+                if int(cur.fetchone()[0]) >= 1:
+                    return f"索引已存在：{table}.{index}（幂等重跑，CREATE INDEX 跳过）"
+            return None
+    except Exception as e:   # noqa: BLE001 — 预检失败绝不拦执行
+        print(f"（预检不可用，语句照跑：{e}）")
+    return None
+
+
 def _ledger_conflict(conn, dbname, fn, checksum):
     """台账已有同名记录：checksum 一致/无 checksum 列史前记录 → None（幂等重跑）；
     不一致 → 返回旧值（调用方中止）。"""
@@ -294,7 +339,11 @@ def main():
             print("\n[DRY-RUN] 不写库。语句预览：")
             for i, s in enumerate(statements, 1):
                 head = s.splitlines()[0][:100]
-                print(f"  {i:>2}. {head}{'…' if len(s) > 100 else ''}")
+                skip = _statement_skip_reason(conn, dbname, s) if conn is not None else None
+                tag = "[将跳过] " if skip else ""
+                print(f"  {i:>2}. {tag}{head}{'…' if len(s) > 100 else ''}")
+                if skip:
+                    print(f"       └─ {skip}")
             print(f"\n[DRY-RUN] --commit 将：执行以上 {len(statements)} 条 + 向 "
                   f"{dbname}.schema_migrations 记 ({fn}, {version}, sha256)。")
         finally:
@@ -328,6 +377,10 @@ def main():
         with conn.cursor() as cur:
             cur.execute(f"USE `{dbname}`")
             for s in statements:
+                skip = _statement_skip_reason(conn, dbname, s)
+                if skip:
+                    print(f"  [skip] {skip}")
+                    continue
                 cur.execute(s)
         conn.commit()
         after = _existing_tables(conn, dbname, tables)

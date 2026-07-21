@@ -93,6 +93,7 @@ MANIFEST="
 019_chunk_meta_index_retry.sql knowledge
 020_document_version_simhash.sql knowledge
 021_ingest_quality_metrics.sql knowledge
+032_schema_migrations_checksum.sql both
 039_qa_question_hash.sql operation
 040_qa_gap_semantic_group.sql operation
 041_qa_gap_dismissal.sql operation
