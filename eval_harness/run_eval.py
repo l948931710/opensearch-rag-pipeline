@@ -60,6 +60,36 @@ def _cfg_get(cfg, name, default=None):
     return default
 
 
+def _l4_gt_files() -> list:
+    """L4-ingestion GT 文件解析——run 流程与 regime 指纹共用同一来源,保证指纹
+    覆盖的就是 L4 实际消费的文件(EVAL_L4_GT_FILES 覆盖 → 指纹跟着覆盖走)。"""
+    env = os.environ.get("EVAL_L4_GT_FILES")
+    if env:
+        return [p for p in env.split(",") if p.strip()]
+    data = os.path.expanduser("~/Downloads/opensearch-rag-data/eval_samples")
+    return [p for p in [
+        os.path.join(data, "ground_truth", "gt_pdf_analysis.json"),
+        os.path.join(data, "ground_truth", "gt_xlsx_pptx_analysis.json"),
+        os.path.join(data, "ground_truth", "gt_docx_analysis.json"),
+    ] if os.path.exists(p)]
+
+
+def _l4_gt_sha() -> "str | None":
+    """L4 GT 组合指纹:basename+内容,按名排序(顺序无关)。数据仓不可达 → None
+    (CI 无数据仓;走 baseline._LENIENT_REGIME_KEYS 宽容窗口)。"""
+    import hashlib
+    try:
+        blobs = sorted((os.path.basename(p), open(p, "rb").read()) for p in _l4_gt_files())
+    except Exception:
+        return None
+    if not blobs:
+        return None
+    h = hashlib.sha256()
+    for name, blob in blobs:
+        h.update(name.encode("utf-8")); h.update(b"\0"); h.update(blob); h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
 def _regime(cfg, goldset_path: str) -> dict:
     """Run-condition fingerprint stamped into meta + the baseline, so deltas are never compared across
     different eval-set / code / model / reranker / fusion / threshold conditions."""
@@ -114,6 +144,10 @@ def _regime(cfg, goldset_path: str) -> dict:
         "judge_rubric_version": judge_rubric_version,
         "vlm_model": vlm_model,
         "vlm_cache_version": vlm_cache_version,
+        # L4-GT 指纹哨兵(2026-07-20):L4-ing 绑定分的 GT 在 repo 外数据仓,不在金集
+        # sha 覆盖面内——GT 重标会静默移动 l4ing.* 而基线网无感知(clean 战役当天实证:
+        # 液压泵/电机螺丝两行 GT 修正对基线完全隐形)。老 baseline 缺键走宽容窗口。
+        "l4_gt_sha": _l4_gt_sha(),
         "code_commit": commit,
     }
 
@@ -250,15 +284,7 @@ def phase_run(args):
         # L4-ingestion 触发:env EVAL_L4_GT_FILES(逗号分隔)+ EVAL_L4_DOCS_DIR
         # 默认指向 eval_samples/ground_truth + documents(repo 外仓)
         _data = os.path.expanduser("~/Downloads/opensearch-rag-data/eval_samples")
-        gt_files_env = os.environ.get("EVAL_L4_GT_FILES")
-        if gt_files_env:
-            gt_files = [p for p in gt_files_env.split(",") if p.strip()]
-        else:
-            gt_files = [p for p in [
-                os.path.join(_data, "ground_truth", "gt_pdf_analysis.json"),
-                os.path.join(_data, "ground_truth", "gt_xlsx_pptx_analysis.json"),
-                os.path.join(_data, "ground_truth", "gt_docx_analysis.json"),
-            ] if os.path.exists(p)]
+        gt_files = _l4_gt_files()   # 与 regime 指纹同源(l4_gt_sha)
         docs_dir = os.environ.get("EVAL_L4_DOCS_DIR") or os.path.join(_data, "documents")
         # EVAL-2: image-manifest dir for GT preflight; default mirrors the existing CLI heuristic
         manifest_dir = os.environ.get("EVAL_L4_MANIFEST_DIR") or os.path.join(_data, "scratch", "eval_manifest")
