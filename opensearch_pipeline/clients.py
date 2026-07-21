@@ -33,7 +33,7 @@ def _resolve_simulate(ctx: dict, kind: str, default=None) -> bool:
     return ctx.get(f"simulate_{kind}", ctx.get("simulate", default))
 
 
-def _get_opensearch_client(ctx: dict = None):
+def _get_opensearch_client(ctx: dict = None, *, bounded: bool = False):
     from opensearch_pipeline.config import get_config
     config = get_config()
 
@@ -58,26 +58,51 @@ def _get_opensearch_client(ctx: dict = None):
         # 去除 endpoint 中的 http:// 或 https:// 前缀保护
         clean_endpoint = cfg.endpoint.replace("http://", "").replace("https://", "")
 
-        # 2026-07-16(100 条丢件重推现场):SDK 不传 runtime_options 时默认读超时过短,
-        # pushDocuments 的大 payload(百级 chunk×dense1024+sparse ≈ MB 级)在公网/家宽
-        # 稳定超时→整批 failed(查询 API 小响应不受影响,故检索一直正常)。显式给足
-        # 读超时;env 可调,单位毫秒。查询路径共用此客户端,读超时放宽无副作用
-        # (真挂死由重试层兜底)。
-        _read_to = int(os.environ.get("RAG_HA3_READ_TIMEOUT_MS", "60000"))
-        _conn_to = int(os.environ.get("RAG_HA3_CONNECT_TIMEOUT_MS", "10000"))
+        if bounded:
+            # F3（对账竞态根治，2026-07-21 自 main 9e87131 迁移）：reconciler 持 RDS 行锁跨
+            # HA3 网络 I/O，必须有确定的单请求上界。SDK 默认 max_attempts=2 且 autoretry 恒被
+            # 置 True（client.py 源码自注："如果想要关闭重试，可以手动设置maxAttempts=0"）——
+            # 0 = 恰好一次尝试。
+            runtime_options = RuntimeOptions(
+                max_attempts=0, connect_timeout=5000, read_timeout=10000)
+        else:
+            # 2026-07-16(100 条丢件重推现场):SDK 不传 runtime_options 时默认读超时过短,
+            # pushDocuments 的大 payload(百级 chunk×dense1024+sparse ≈ MB 级)在公网/家宽
+            # 稳定超时→整批 failed(查询 API 小响应不受影响,故检索一直正常)。显式给足
+            # 读超时;env 可调,单位毫秒。查询路径共用此客户端,读超时放宽无副作用
+            # (真挂死由重试层兜底)。
+            _read_to = int(os.environ.get("RAG_HA3_READ_TIMEOUT_MS", "60000"))
+            _conn_to = int(os.environ.get("RAG_HA3_CONNECT_TIMEOUT_MS", "10000"))
+            runtime_options = RuntimeOptions(read_timeout=_read_to, connect_timeout=_conn_to)
         ha3_config = Config(
             endpoint=clean_endpoint,
             instance_id=cfg.instance_id,
             access_user_name=cfg.access_user_name,
             access_pass_word=cfg.access_pass_word,
-            runtime_options=RuntimeOptions(read_timeout=_read_to, connect_timeout=_conn_to),
+            runtime_options=runtime_options,
         )
-        return Client(ha3_config)
+        client = Client(ha3_config)
+        if bounded:
+            # 能力断言（fail-closed）：SDK 形态变化悄悄丢掉 runtime_options 时，绝不能
+            # 让 reconciler 以为持锁时长有界。构造后核验【客户端生效值】而非入参。
+            ro = getattr(client, "_runtime_options", None)
+            if (ro is None or getattr(ro, "max_attempts", None) != 0
+                    or getattr(ro, "connect_timeout", None) != 5000
+                    or getattr(ro, "read_timeout", None) != 10000):
+                raise RuntimeError(
+                    "HA3 SDK 未生效 bounded runtime options（max_attempts=0/5s/10s）——"
+                    "持锁对账拒绝在无超时上界下运行（fail-closed）。effective=%r" % ro)
+        return client
     else:
         # Fallback to standard OpenSearch for local development / testing
         from opensearchpy import OpenSearch
         os_cfg = config.opensearch
         auth = (os_cfg.auth_user, os_cfg.auth_password) if os_cfg.auth_user and os_cfg.auth_password else None
+        extra_kwargs = {}
+        if bounded:
+            # bounded（F3 对账路径）：与 HA3 分支同款确定上界；非 bounded 不传参，
+            # 保持 opensearchpy 默认超时语义逐字不变（显式 None 会被当"无超时"）。
+            extra_kwargs["timeout"] = 10
         client = OpenSearch(
             hosts=[{'host': os_cfg.host, 'port': os_cfg.port}],
             http_compress=True,
@@ -85,7 +110,8 @@ def _get_opensearch_client(ctx: dict = None):
             use_ssl=os_cfg.use_ssl,
             verify_certs=os_cfg.verify_certs,
             ssl_assert_hostname=False,
-            ssl_show_warn=False
+            ssl_show_warn=False,
+            **extra_kwargs,
         )
         return client
 

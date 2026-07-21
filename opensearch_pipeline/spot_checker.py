@@ -5,10 +5,11 @@ spot_checker.py — 定时安全抽检任务 (Spot-Check Safety Daemon)
 import logging
 import os
 import random
+import time
 import requests
 import json
 from opensearch_pipeline.config import get_config
-from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus
+from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus, sql_in_list
 from opensearch_pipeline.pipeline_nodes import (
     _clean_llm_json_response,
     _get_db_conn,
@@ -17,6 +18,46 @@ from opensearch_pipeline.pipeline_nodes import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _lock_doc(cursor, doc_id: str) -> bool:
+    """F3 逐文档串行化原语：document_meta 行 FOR UPDATE。
+
+    锁序纪律（本文件 + cost_breaker + stage-2 duplicate-skip 已归一）：任何同事务
+    触碰 ≥2 张 {document_meta, chunk_meta, document_version} 的写方，必须【先】取本锁，
+    此后 chunk_meta 先于 document_version。console 端点（restore/retire/visibility）
+    天然 meta-first（内部 dv→chunk 顺序被 meta 锁串行化掩护）；stage-3 是唯一不取
+    meta 锁的写方（chunk→dv），与本纪律的 post-meta 顺序兼容——这不是全仓全序声明，
+    只覆盖此处列名的写方族。返回 False = document_meta 行不存在。"""
+    cursor.execute("SELECT doc_id FROM document_meta WHERE doc_id = %s FOR UPDATE", (doc_id,))
+    return cursor.fetchone() is not None
+
+
+def _reconcile_ha3_deadline_s() -> float:
+    """F3：持锁跨 HA3 网络 I/O 的总时限（批间墙钟检查用）。
+
+    钳位 [5, 25]s、默认 20——配合 bounded 客户端单请求 ≤15s（connect 5 + read 10、
+    max_attempts=0 恰一次尝试），最坏持锁 ≈ 25+15=40s < innodb_lock_wait_timeout
+    默认 50s。越界值钳位并告警，不允许配置出破坏锁时长上界的值。"""
+    raw = os.environ.get("RAG_RECONCILE_HA3_DEADLINE_S", "20")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = 20.0
+    clamped = min(max(val, 5.0), 25.0)
+    if clamped != val:
+        logger.warning(
+            "[RECONCILE] RAG_RECONCILE_HA3_DEADLINE_S=%r 越界，钳位到 %.0fs（允许区间 [5,25]）",
+            raw, clamped)
+    return clamped
+
+
+def _get_bounded_search_client():
+    """F3：持锁对账专用搜索客户端（clients.py bounded=True：HA3 max_attempts=0 +
+    connect 5s/read 10s 并构造后核验生效值；OpenSearch 本地分支 timeout=10）。
+    能力缺失（SDK 形态变化吞掉 runtime options）在 clients.py 抛 RuntimeError——
+    调用方必须 fail-closed（整批拒跑、零 HA3/RDS 写），绝不回退无界老路径。"""
+    return _get_opensearch_client(bounded=True)
 
 # 权限严重等级： public(0) < internal/dept_internal(1) < restricted(2)
 _PERM_ORDER = {"public": 0, "internal": 1, "dept_internal": 1, "restricted": 2}
@@ -148,12 +189,21 @@ def _safety_review_llm(title, doc_text, *, api_key, model_name, api_base_url):
     return json.loads(cleaned_content)
 
 
-def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config) -> None:
+def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config,
+                              client=None, deadline_ts: float = None) -> None:
     """从搜索索引中删除指定文档的所有 chunks。
 
     成功时静默返回，失败时抛出异常由调用方处理。
+
+    client（F3）：调用方传入 bounded 客户端时用之（持锁对账路径）；None = 自取
+    默认客户端（quarantine 路径——它在 RDS 事务【外】先删 HA3，不持行锁跨网络）。
+    deadline_ts：time.monotonic() 截止时刻，批间超限即抛（调用方回滚重试）。
+
+    ⚠️ 有意不带 is_active 过滤：正常 retire/visibility 流程先把 chunk 停成
+    is_active=0 再喂 PENDING_DELETE——按 (doc_id, version_no) 枚举全部 PK 是主路径
+    的正确语义（加 is_active=1 过滤会让主路径一行都删不掉）。
     """
-    os_client = _get_opensearch_client()
+    os_client = client if client is not None else _get_opensearch_client()
     if os_client == "MOCK_HA3_CLIENT":
         # simulate 开关错配时绝不静默：mock 字符串会掉进 delete_by_query 分支炸出晦涩的
         # AttributeError；这里换成明确错误，由调用方按删除失败处理（PENDING_DELETE 重试）
@@ -185,6 +235,10 @@ def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config) -> Non
             ]
             ha3_batch_size = 100
             for i in range(0, len(delete_docs), ha3_batch_size):
+                if deadline_ts is not None and time.monotonic() > deadline_ts:
+                    raise RuntimeError(
+                        f"HA3 delete deadline exceeded for {doc_id} v{version_no} "
+                        f"after {i} of {len(delete_docs)} deletes (F3 bounded reconcile)")
                 batch = delete_docs[i:i + ha3_batch_size]
                 request = PushDocumentsRequest(body=batch)
                 resp = os_client.push_documents(ha3_cfg.table_name, ha3_cfg.pk_field, request)
@@ -222,10 +276,18 @@ def reconcile_pending_deletes() -> dict:
     在每次 spot-check 启动时自动调用，确保之前失败的索引删除最终完成。
     也可以独立调用（如 DataWorks 定时任务）。
 
+    F3（2026-07-21 评审共识）竞态根治：批扫描只是【提示】；逐 doc 事务内先取
+    document_meta 行锁（_lock_doc，console restore/retire/visibility 全被串行化在锁外）、
+    锁内重验仍是 PENDING_DELETE，才执行不可逆的 HA3 删除；随后 chunk 停用【先于】
+    版本 CAS（锁序对齐 stage-3 的 chunk→dv），CAS 落空 = 锁下不可能的未建模写方
+    → 整笔回滚（chunk 写一并撤销）按 failed 上报。HA3 删除全程 bounded（单请求
+    max_attempts=0 + 批间 deadline），持锁时长有确定上界。
+
     Returns:
-        {"total": int, "success": int, "failed": int, "errors": [str]}
+        {"total": int, "success": int, "failed": int, "skipped_stale": int, "errors": [str]}
+        skipped_stale = 锁内重验发现已被并发恢复/终态化而放弃的文档数。
     """
-    result = {"total": 0, "success": 0, "failed": 0, "errors": []}
+    result = {"total": 0, "success": 0, "failed": 0, "skipped_stale": 0, "errors": []}
     config = get_config()
 
     try:
@@ -248,26 +310,84 @@ def reconcile_pending_deletes() -> dict:
 
         logger.info("[RECONCILE] Found %d documents with PENDING_DELETE", len(rows))
 
+        # fail-closed：bounded 客户端能力缺失 → 整批拒跑，零 HA3/RDS 写（绝不回退
+        # 无界老路径——那正是被根治的竞态本体）。行保持 PENDING_DELETE 可重试。
+        try:
+            os_client = _get_bounded_search_client()
+        except Exception as cap_err:
+            result["failed"] = len(rows)
+            result["errors"].append(
+                f"bounded search client unavailable (fail-closed, no mutations): {cap_err}")
+            logger.error("[RECONCILE] bounded 客户端不可用——fail-closed 整批拒跑: %s", cap_err)
+            return result
+
+        deadline_s = _reconcile_ha3_deadline_s()
+
         for doc_id, version_no in rows:
             try:
-                _delete_chunks_from_index(doc_id, version_no, conn, config)
+                # 事务边界：结束上一笔（rollback 从不落任何东西），锁内读拿新鲜读视图
+                # （autocommit=False + REPEATABLE READ 下沿用批扫描快照会看不见并发恢复）
+                conn.rollback()
+                with conn.cursor() as cursor:
+                    if not _lock_doc(cursor, doc_id):
+                        conn.rollback()
+                        result["failed"] += 1
+                        result["errors"].append(f"document_meta row missing for {doc_id}")
+                        continue
+                    cursor.execute(
+                        "SELECT index_status FROM document_version "
+                        "WHERE doc_id = %s AND version_no = %s", (doc_id, version_no))
+                    vrow = cursor.fetchone()
+                if not vrow or vrow[0] != DocVersionIndexStatus.PENDING_DELETE:
+                    conn.rollback()
+                    result["skipped_stale"] += 1
+                    logger.info(
+                        "[RECONCILE] %s v%s 已非 PENDING_DELETE（现 %s）——并发恢复/终态化，跳过",
+                        doc_id, version_no, vrow[0] if vrow else None)
+                    continue
 
-                # 删除成功 → 标记为 DELETED + 停用 chunk_meta（CS5：自洽——无论是谁喂的
+                _delete_chunks_from_index(
+                    doc_id, version_no, conn, config,
+                    client=os_client, deadline_ts=time.monotonic() + deadline_s)
+
+                # 删除成功 → 停用 chunk_meta + 标记 DELETED（CS5：自洽——无论是谁喂的
                 # PENDING_DELETE（spot-check 退役 / node_deactivate 失败兜底），对账成功后都把
                 # chunk_meta 落到 is_active=0，避免留下 RDS-active 但 HA3 已删的孤儿（CS3 会报）。
-                # 幂等：再跑命中 0 行。
+                # 幂等：再跑命中 0 行。锁序：chunk 先于 dv（对齐 stage-3）。
                 with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                        UPDATE chunk_meta
+                        SET is_active = FALSE, index_status = '{ChunkIndexStatus.DELETED}'
+                        WHERE doc_id = %s AND version_no = %s AND is_active = 1
+                    """, (doc_id, version_no))
                     cursor.execute(f"""
                         UPDATE document_version
                         SET index_status = '{DocVersionIndexStatus.DELETED}'
                         WHERE doc_id = %s AND version_no = %s
                           AND index_status = '{DocVersionIndexStatus.PENDING_DELETE}'
                     """, (doc_id, version_no))
-                    cursor.execute(f"""
-                        UPDATE chunk_meta
-                        SET is_active = FALSE, index_status = '{ChunkIndexStatus.DELETED}'
-                        WHERE doc_id = %s AND version_no = %s AND is_active = 1
-                    """, (doc_id, version_no))
+                    cas_rows = cursor.rowcount
+                if cas_rows != 1:
+                    # meta 锁下本 CAS 不可能输给任何已建模写方——落空即异常：整笔回滚
+                    # （chunk 停用一并撤销），观测现值入错误记录，下轮重试（HA3 删除幂等）。
+                    conn.rollback()
+                    observed = None
+                    try:
+                        with conn.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT index_status FROM document_version "
+                                "WHERE doc_id = %s AND version_no = %s", (doc_id, version_no))
+                            _r = cursor.fetchone()
+                            observed = _r[0] if _r else None
+                    except Exception:  # noqa: BLE001 — 观测尽力而为
+                        pass
+                    conn.rollback()
+                    result["failed"] += 1
+                    err = (f"version CAS missed UNDER document_meta lock for {doc_id} "
+                           f"v{version_no} (observed={observed}) — unmodeled writer, rolled back")
+                    result["errors"].append(err)
+                    logger.error("[RECONCILE] %s", err)
+                    continue
                 conn.commit()
                 result["success"] += 1
                 logger.info("[RECONCILE] Successfully deleted index for %s v%s", doc_id, version_no)
@@ -296,10 +416,23 @@ def reconcile_stranded_versions() -> dict:
     chunk 并把 document_version 修成 SUCCESS —— 索引删除失败时 RDS 不动，文档保持可
     检测，下次运行重试。逐文档提交，单文档失败不影响其余。本函数绝不抛异常。
 
+    F3（2026-07-21 评审共识）竞态根治：批扫描只是【提示】；逐 doc 事务内先取
+    document_meta 行锁（_lock_doc），锁内以 FOR UPDATE 锁住该 doc 全部 active chunk
+    行（含范围/间隙锁，封同 doc 幻影插入）并在 Python 侧重验完整候选事实（当前版本
+    仍是最新 active、≥1 INDEXED 且 0 非 INDEXED、旧版本仍有 active chunk、未隔离、
+    PROCESSING 陈旧判据以 SQL NOW() 重施），全部成立才执行不可逆 HA3 删除。版本收尾
+    按锁内观测态分派（对 stage-3 这一唯一不取 meta 锁的写方 CAS 兜底）：
+      · SUCCESS → 已终态，无需写（同值 UPDATE 的 changed-rows=0 不可判赢输，故不写）；
+      · FAILED/NOT_INDEXED → 精确观测态 CAS → SUCCESS；
+      · 陈旧 PROCESSING → (index_status='PROCESSING' AND updated_at=观测值) 时间戳绑定
+        CAS——takeover/live worker 刷新 updated_at 必使本 CAS 落空（healer 认输）；
+    CAS 落空 → 旧 chunk 停用保留（与胜者的 node_deactivate 语义一致、幂等）、
+    supersede 跳过（success-before-supersede 不变量）、计 skipped_stale。
+
     Returns:
-        {"total": int, "success": int, "failed": int, "errors": [str]}
+        {"total": int, "success": int, "failed": int, "skipped_stale": int, "errors": [str]}
     """
-    result = {"total": 0, "success": 0, "failed": 0, "errors": []}
+    result = {"total": 0, "success": 0, "failed": 0, "skipped_stale": 0, "errors": []}
     config = get_config()
 
     try:
@@ -321,6 +454,8 @@ def reconcile_stranded_versions() -> dict:
                   ON dv.doc_id = cm_new.doc_id AND dv.version_no = cm_new.version_no
                 WHERE dv.status = 'active'
                   AND (dv.publish_status IS NULL OR dv.publish_status != 'QUARANTINED')
+                  AND dv.index_status NOT IN ({sql_in_list((DocVersionIndexStatus.PENDING_DELETE,
+                                                            DocVersionIndexStatus.DELETED))})
                   AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
                        OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
                   AND EXISTS (SELECT 1 FROM chunk_meta o
@@ -337,7 +472,9 @@ def reconcile_stranded_versions() -> dict:
                 LIMIT 200
             """)
             # 谓词解读：最新 active 版本的 chunk【全部】INDEXED（≥1 条，"已验证索引成功"）、
-            # 旧版本仍有 active chunk（搁浅特征）、未被隔离、且不与 2h 内在跑的 stage-3 抢锁。
+            # 旧版本仍有 active chunk（搁浅特征）、未被隔离、未进删除队列（PENDING_DELETE/
+            # DELETED = retire/visibility 正在下线，修回 SUCCESS 恒错）、且不与 2h 内在跑的
+            # stage-3 抢锁。此扫描只产【提示】，权威判定在下方逐 doc 的 meta 锁内重验。
             rows = cursor.fetchall()
 
         result["total"] = len(rows)
@@ -349,46 +486,136 @@ def reconcile_stranded_versions() -> dict:
             len(rows),
         )
 
-        os_client = _get_opensearch_client()
+        # fail-closed：bounded 客户端能力缺失 → 整批拒跑，候选停留原搁浅态（可重试），
+        # 零 HA3/RDS 写。绝不回退无界老路径。
+        try:
+            os_client = _get_bounded_search_client()
+        except Exception as cap_err:
+            result["failed"] = len(rows)
+            result["errors"].append(
+                f"bounded search client unavailable (fail-closed, no mutations): {cap_err}")
+            logger.error("[RECONCILE] bounded 客户端不可用——fail-closed 整批拒跑: %s", cap_err)
+            return result
+
         index_name = getattr(config.opensearch, "index_name", "fuling_knowledge_v1")
+        deadline_s = _reconcile_ha3_deadline_s()
 
         for doc_id, version_no in rows:
             try:
+                # 事务边界：rollback 结束上一笔（绝不落东西），锁内读拿新鲜读视图
+                conn.rollback()
                 with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT id FROM chunk_meta
-                        WHERE doc_id = %s AND version_no < %s AND is_active = 1
+                    if not _lock_doc(cursor, doc_id):
+                        conn.rollback()
+                        result["failed"] += 1
+                        result["errors"].append(f"document_meta row missing for {doc_id}")
+                        continue
+                    # 权威重验 ①：版本行观测（陈旧判据以 SQL NOW() 重施——等 meta 锁期间
+                    # stage-3 可能装入了【新鲜】PROCESSING，绝不能拿新时间戳当陈旧候选）
+                    cursor.execute(f"""
+                        SELECT index_status, updated_at, status, publish_status,
+                               (index_status != '{DocVersionIndexStatus.PROCESSING}'
+                                OR updated_at < NOW() - INTERVAL 2 HOUR) AS proc_stale_ok
+                        FROM document_version WHERE doc_id = %s AND version_no = %s
                     """, (doc_id, version_no))
-                    old_ids = [r[0] for r in cursor.fetchall()]
+                    vrow = cursor.fetchone()
+                    if (not vrow
+                            or str(vrow[2] or "").lower() != "active"
+                            or str(vrow[3] or "").upper() == "QUARANTINED"
+                            or vrow[0] in (DocVersionIndexStatus.PENDING_DELETE,
+                                           DocVersionIndexStatus.DELETED)
+                            or not vrow[4]):
+                        conn.rollback()
+                        result["skipped_stale"] += 1
+                        logger.info(
+                            "[RECONCILE] %s v%s 候选重验不成立（版本态变化/新鲜 PROCESSING/隔离/下线中），跳过",
+                            doc_id, version_no)
+                        continue
+                    observed_status, observed_ts = vrow[0], vrow[1]
+                    # 权威重验 ②：锁住该 doc 全部 active chunk 行（FOR UPDATE 含间隙锁，
+                    # 封同 doc 幻影插入直到提交），Python 侧验证完整性事实。
+                    cursor.execute("""
+                        SELECT id, version_no, index_status FROM chunk_meta
+                        WHERE doc_id = %s AND is_active = 1
+                        FOR UPDATE
+                    """, (doc_id,))
+                    all_chunks = cursor.fetchall()
+                cur_statuses = [r[2] for r in all_chunks if r[1] == version_no]
+                old_ids = [r[0] for r in all_chunks if r[1] < version_no]
+                max_active_ver = max((r[1] for r in all_chunks), default=None)
+                if (max_active_ver != version_no
+                        or not cur_statuses
+                        or any(s != ChunkIndexStatus.INDEXED for s in cur_statuses)
+                        or not old_ids):
+                    conn.rollback()
+                    result["skipped_stale"] += 1
+                    logger.info(
+                        "[RECONCILE] %s v%s chunk 完整性重验不成立（重分块/可见度标脏/已收敛），跳过",
+                        doc_id, version_no)
+                    continue
 
-                # 先删索引、成功后才动 RDS（与 node_deactivate_old_chunks 同序）
-                _search_delete_old_chunks(os_client, config, index_name, doc_id, version_no, old_ids)
+                # 先删索引、成功后才动 RDS（与 node_deactivate_old_chunks 同序）；bounded
+                _search_delete_old_chunks(os_client, config, index_name, doc_id, version_no,
+                                          old_ids, deadline_ts=time.monotonic() + deadline_s)
 
+                finalized = False
                 with conn.cursor() as cursor:
+                    # 锁序：chunk 先于 dv（对齐 stage-3）
                     cursor.execute(f"""
                         UPDATE chunk_meta
                         SET is_active = FALSE, index_status = '{ChunkIndexStatus.DELETED}'
                         WHERE doc_id = %s AND version_no < %s AND is_active = 1
                     """, (doc_id, version_no))
-                    cursor.execute(f"""
-                        UPDATE document_version
-                        SET index_status = '{DocVersionIndexStatus.SUCCESS}'
-                        WHERE doc_id = %s AND version_no = %s
-                    """, (doc_id, version_no))
-                    # 版本级 supersede 兜底（与 node_deactivate_old_chunks 收尾同语义，2026-07-12
-                    # 双 active 审计缺口）：新版本确证全量 INDEXED、旧 chunk 已停用后，同事务把
-                    # 更旧的 active 版本行降级 superseded。CAS on status='active' 幂等、不碰 retired。
-                    cursor.execute("""
-                        UPDATE document_version
-                        SET status = 'superseded'
-                        WHERE doc_id = %s AND version_no < %s AND status = 'active'
-                    """, (doc_id, version_no))
+                    # 版本收尾分派（docstring §F3）
+                    if observed_status == DocVersionIndexStatus.SUCCESS:
+                        cursor.execute("""
+                            SELECT index_status FROM document_version
+                            WHERE doc_id = %s AND version_no = %s
+                            FOR UPDATE
+                        """, (doc_id, version_no))
+                        _cur = cursor.fetchone()
+                        finalized = bool(_cur) and _cur[0] == DocVersionIndexStatus.SUCCESS
+                    elif observed_status == DocVersionIndexStatus.PROCESSING:
+                        cursor.execute(f"""
+                            UPDATE document_version
+                            SET index_status = '{DocVersionIndexStatus.SUCCESS}'
+                            WHERE doc_id = %s AND version_no = %s
+                              AND index_status = '{DocVersionIndexStatus.PROCESSING}'
+                              AND updated_at = %s
+                        """, (doc_id, version_no, observed_ts))
+                        finalized = cursor.rowcount == 1
+                    else:
+                        cursor.execute(f"""
+                            UPDATE document_version
+                            SET index_status = '{DocVersionIndexStatus.SUCCESS}'
+                            WHERE doc_id = %s AND version_no = %s
+                              AND index_status = %s
+                        """, (doc_id, version_no, observed_status))
+                        finalized = cursor.rowcount == 1
+                    if finalized:
+                        # 版本级 supersede 兜底（与 node_deactivate_old_chunks 收尾同语义，
+                        # 2026-07-12 双 active 审计缺口）：仅在当前版本 SUCCESS 已锁定成立时
+                        # 执行（success-before-supersede 不变量）。CAS on status='active'
+                        # 幂等、不碰 retired。
+                        cursor.execute("""
+                            UPDATE document_version
+                            SET status = 'superseded'
+                            WHERE doc_id = %s AND version_no < %s AND status = 'active'
+                        """, (doc_id, version_no))
                 conn.commit()
-                result["success"] += 1
-                logger.info(
-                    "[RECONCILE] Healed stranded version %s v%s (deactivated %d old chunks)",
-                    doc_id, version_no, len(old_ids),
-                )
+                if finalized:
+                    result["success"] += 1
+                    logger.info(
+                        "[RECONCILE] Healed stranded version %s v%s (deactivated %d old chunks)",
+                        doc_id, version_no, len(old_ids),
+                    )
+                else:
+                    # 收尾 CAS 落空 = stage-3 胜出（claim/takeover 刷新）：旧 chunk 停用保留
+                    # （胜者终态化时本来也会做，幂等），supersede 交胜者自己的收尾路径。
+                    result["skipped_stale"] += 1
+                    logger.warning(
+                        "[RECONCILE] %s v%s 版本收尾 CAS 落空（stage-3 并发接管），"
+                        "旧 chunk 停用保留、supersede 跳过", doc_id, version_no)
             except Exception as e:
                 conn.rollback()
                 result["failed"] += 1
@@ -446,14 +673,16 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
     reconcile_result = reconcile_pending_deletes()
     if reconcile_result["total"] > 0:
         print(f"    └─ [RECONCILE] Retried {reconcile_result['total']} pending deletes: "
-              f"{reconcile_result['success']} success, {reconcile_result['failed']} failed")
+              f"{reconcile_result['success']} success, {reconcile_result['failed']} failed, "
+              f"{reconcile_result.get('skipped_stale', 0)} skipped-stale")
         report["errors"].extend(reconcile_result["errors"])
 
     # 再对账：修复搁浅的双版本文档（orchestrator stage-3 启动前也会跑，这里是独立兜底）
     stranded_result = reconcile_stranded_versions()
     if stranded_result["total"] > 0:
         print(f"    └─ [RECONCILE] Healed {stranded_result['success']}/{stranded_result['total']} "
-              f"stranded doc versions, {stranded_result['failed']} failed")
+              f"stranded doc versions, {stranded_result['failed']} failed, "
+              f"{stranded_result.get('skipped_stale', 0)} skipped-stale")
         report["errors"].extend(stranded_result["errors"])
     # 三对账：清理重灌残留的孤儿 PK（同 chunk_id 双 PK / chunk_meta 已不认账的旧 id）
     from opensearch_pipeline.ha3_reconcile import reconcile_ha3_orphan_pks
@@ -665,20 +894,10 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                 try:
                     conn.begin()
                     with conn.cursor() as cursor:
-                        # ⚠️ content_process_status 必须是终态 'QUARANTINED'，不能用 'FAILED'：
-                        # 'FAILED' 正好命中 stage-2 的抢占谓词（FAILED AND retry_count<3），
-                        # 下一次日跑会重新分块/重新发布，把隔离悄悄撤销掉。
-                        cursor.execute(f"""
-                            UPDATE document_version
-                            SET risk_level = 'high',
-                                publish_status = 'QUARANTINED',
-                                gate_status = 'quarantined',
-                                content_process_status = 'QUARANTINED',
-                                content_process_error = %s,
-                                index_status = '{DocVersionIndexStatus.DELETED}'
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (f"[SPOT CHECK MISMATCH] Spot-check recommends tightening permission to {suggested_perm}", doc_id, version_no))
-
+                        # F3 锁序纪律：meta 先行（document_meta → chunk_meta → document_version，
+                        # 与 reconciler/_lock_doc 族统一）——原 dv→meta→chunk 序与 meta-first
+                        # 写方、以及 stage-3 的 chunk→dv 序都可能成环死锁。单次 commit 原子性
+                        # 不变，写序纯粹是锁获取顺序问题。
                         # 批次9（ultra P3 spot_checker:686 改判）：LLM 的 suggested_perm 过
                         # normalize_permission_level 再落库——词表外值（如 'internal'）原样写入
                         # 会让检索过滤两个分支都不命中（历史 internal≠dept_internal 事故同类）；
@@ -696,6 +915,20 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                             SET is_active = FALSE
                             WHERE doc_id = %s AND version_no = %s
                         """, (doc_id, version_no))
+
+                        # ⚠️ content_process_status 必须是终态 'QUARANTINED'，不能用 'FAILED'：
+                        # 'FAILED' 正好命中 stage-2 的抢占谓词（FAILED AND retry_count<3），
+                        # 下一次日跑会重新分块/重新发布，把隔离悄悄撤销掉。
+                        cursor.execute(f"""
+                            UPDATE document_version
+                            SET risk_level = 'high',
+                                publish_status = 'QUARANTINED',
+                                gate_status = 'quarantined',
+                                content_process_status = 'QUARANTINED',
+                                content_process_error = %s,
+                                index_status = '{DocVersionIndexStatus.DELETED}'
+                            WHERE doc_id = %s AND version_no = %s
+                        """, (f"[SPOT CHECK MISMATCH] Spot-check recommends tightening permission to {suggested_perm}", doc_id, version_no))
 
                         cursor.execute(_review_sql, _review_params)
                     conn.commit()

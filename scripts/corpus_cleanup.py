@@ -111,9 +111,10 @@ def hygiene(commit: bool):
             cur.execute("SELECT COUNT(*) AS c FROM chunk_meta WHERE doc_id=%s AND is_active=1",
                         (t["doc_id"],))
             assert cur.fetchone()["c"] == 0, f"active chunks appeared for {t['doc_id']} — abort"
-            cur.execute("UPDATE document_version SET status='inactive' WHERE doc_id=%s",
-                        (t["doc_id"],))
+            # F3 锁序纪律：meta 先于 dv（与 console/reconciler/quarantine 统一），防反序死锁
             cur.execute("UPDATE document_meta SET status='inactive' WHERE doc_id=%s",
+                        (t["doc_id"],))
+            cur.execute("UPDATE document_version SET status='inactive' WHERE doc_id=%s",
                         (t["doc_id"],))
             manifest.append({k: t[k] for k in ("doc_id", "title", "raw_key", "reason")})
     conn.commit()

@@ -69,7 +69,7 @@ def test_reconcile_pending_deletes_returns_shape_on_no_rows(monkeypatch):
 
     monkeypatch.setattr(spot_checker, "_get_db_conn", lambda **k: _Conn())
     out = spot_checker.reconcile_pending_deletes()
-    assert out == {"total": 0, "success": 0, "failed": 0, "errors": []}
+    assert out == {"total": 0, "success": 0, "failed": 0, "skipped_stale": 0, "errors": []}
 
 
 def test_deactivate_failure_path_cas_guards_pending_delete():

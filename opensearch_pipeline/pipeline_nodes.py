@@ -858,16 +858,19 @@ def node_build_canonical(ctx: dict):
                             (canonical["doc_id"], canonical["version_no"]))
                         _prior = _sk_cur.fetchone()
                         if _prior and _prior[1] == _canonical_sha256:
+                            # F3 锁序纪律：同事务多表写一律 document_meta 先行（与 console/
+                            # reconciler/quarantine 的 meta→…→dv 统一），杜绝 dv→meta 反序
+                            # 与 meta-first 写方成环死锁。语义不变（单次 commit 原子）。
+                            # revert the version pointer to the still-served prior version
+                            _sk_cur.execute(
+                                "UPDATE document_meta SET current_version_no=%s WHERE doc_id=%s",
+                                (_prior[0], canonical["doc_id"]))
                             _sk_cur.execute(
                                 "UPDATE document_version SET content_process_status='SKIPPED_DUPLICATE', "
                                 "chunk_status='SKIPPED', extraction_status='COMPLETED', "
                                 "canonical_sha256=%s, processed_at=NOW() "
                                 "WHERE doc_id=%s AND version_no=%s",
                                 (_canonical_sha256, canonical["doc_id"], canonical["version_no"]))
-                            # revert the version pointer to the still-served prior version
-                            _sk_cur.execute(
-                                "UPDATE document_meta SET current_version_no=%s WHERE doc_id=%s",
-                                (_prior[0], canonical["doc_id"]))
                             _do_skip = True
                             _prior_v = _prior[0]
                     # perf#92：仅 skip 短路路径 commit（写了状态行）；未命中不提交——skip 判定
@@ -6212,12 +6215,16 @@ def _ha3_push_delete_request(client, config, chunk_ids: list) -> None:
 
 
 def _search_delete_old_chunks(client, config, index_name: str, doc_id: str, ver: int,
-                              old_chunk_ids: list) -> None:
+                              old_chunk_ids: list, deadline_ts: float = None) -> None:
     """从搜索索引删除某文档 version_no < ver 的旧 chunk（node_deactivate_old_chunks 与
     搁浅版本对账 reconcile_stranded_versions 共用，防两份实现漂移）。
 
     HA3 按 chunk_meta.id（INT64 主键，与 to_ha3_doc 的 rds_id 同源）delete；
     标准 OpenSearch 用 delete_by_query。幂等：not_found/no_op 视为成功。失败抛异常。
+
+    deadline_ts（F3，仅持锁对账方传）：time.monotonic() 截止时刻——reconciler 持
+    document_meta 行锁跨本调用，批间超截止即抛（调用方回滚重试）；None=不限（stage-3
+    终态路径不持行锁跨网络，行为逐字不变）。
     """
     if client == "MOCK_HA3_CLIENT":
         # 真实删除路径绝不接受 mock 客户端：继续会"假装删了索引、真停用 RDS 旧版本"→ 裂脑
@@ -6231,6 +6238,11 @@ def _search_delete_old_chunks(client, config, index_name: str, doc_id: str, ver:
         "search_delete",
         config.alibaba_vector.endpoint or config.alibaba_vector.instance_id or config.opensearch.host,
         kind="search")
+    if deadline_ts is not None:
+        import time as _time
+        if _time.monotonic() > deadline_ts:
+            raise RuntimeError(
+                f"search delete deadline exceeded before dispatch for {doc_id} (F3 bounded reconcile)")
     if hasattr(client, "push_documents"):
         if not old_chunk_ids:
             print(f"    ├─ [HA3 Engine] No older chunks found in RDS to deactivate for '{doc_id}'")

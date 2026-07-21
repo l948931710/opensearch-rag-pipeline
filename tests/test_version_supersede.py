@@ -268,9 +268,15 @@ def test_reconcile_stranded_supersedes_old_versions(mock_get_db_conn, mock_get_c
     conn = MagicMock()
     cursor = MagicMock()
     cursor.fetchall.side_effect = [
-        [("doc1", 2)],        # 检测查询：一条搁浅 (doc1, v2)
-        [(101,), (102,)],     # 旧版本 active chunk 的 RDS 主键
+        [("doc1", 2)],        # 提示扫描：一条搁浅 (doc1, v2)
+        # 锁内 chunk 全量锁读 (id, version_no, index_status)：旧 v1 两条 + 新 v2 全量 INDEXED
+        [(101, 1, "INDEXED"), (102, 1, "INDEXED"), (201, 2, "INDEXED")],
     ]
+    cursor.fetchone.side_effect = [
+        ("doc1",),                                              # _lock_doc
+        ("FAILED", "2026-07-21 00:00:00", "active", None, 1),   # 版本行重验五元组
+    ]
+    cursor.rowcount = 1                                         # 收尾 CAS 胜出
     conn.cursor.return_value.__enter__.return_value = cursor
     mock_get_db_conn.return_value = conn
     mock_get_client.return_value = _ha3_client()
@@ -304,7 +310,11 @@ def test_reconcile_failure_path_no_supersede(mock_get_db_conn, mock_get_client):
     cursor = MagicMock()
     cursor.fetchall.side_effect = [
         [("doc1", 2)],
-        [(101,)],
+        [(101, 1, "INDEXED"), (201, 2, "INDEXED")],
+    ]
+    cursor.fetchone.side_effect = [
+        ("doc1",),
+        ("FAILED", "2026-07-21 00:00:00", "active", None, 1),
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
     mock_get_db_conn.return_value = conn
