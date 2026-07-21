@@ -1,8 +1,8 @@
 # opensearch-rag-pipeline
 
-浙江富岭塑胶的**阿里云原生企业 RAG 知识库**：把内部文档（SOP/作业指导书、U8+ ERP 手册、行政
+一家制造企业的**阿里云原生企业 RAG 知识库**：把内部文档（SOP/作业指导书、U8+ ERP 手册、行政
 制度、FAQ）变成员工自助问答服务——钉钉机器人 + 钉钉小程序 + PC 网页控制台三端提问，后端从
-富岭自己的文档里检索作答，带**部门级权限过滤**与**图文混排**（答案内嵌截图）。
+企业自有文档里检索作答，带**部门级权限过滤**与**图文混排**（答案内嵌截图）。
 
 > 项目名带 "opensearch"，但检索实际跑在**阿里 HA3 向量引擎**（"OpenSearch 向量检索版"，SDK
 > `alibabacloud_ha3engine_vector`），非 Elastic/AWS OpenSearch；标准 OpenSearch 仅作本地开发
@@ -18,7 +18,7 @@
 | **摄取**（批） | DataWorks 每日调度 | `dataworks_orchestrator.py --stage {1,2,3}` | OSS raw/ → 提取(+OCR/VLM 图片漏斗) → 分类/PII 脱敏 → 切分(step 卡片) → embedding → 推 HA3 |
 | **服务**（在线） | SAE 单实例（默认态；Redis/durable 多副本能力已备） | `api.py`(FastAPI :8000) + `dingtalk_bot.py`(Stream) | 3 路混合检索 → 邻居拼接/步骤扩展 → Qwen 生成 → 图文卡片；会话/反馈/限流/QA 落库 |
 | **前端** | 钉钉 + 浏览器 | 小程序 `fuling-rag-miniapp/` · 控制台 `console-app/`(Vue3+Vite) | 问答、来源溯源、知识库管理（上传/审批/授权/看板/知识贡献） |
-| **评测** | 本地 | `eval_harness/` + `make release-gate` | 251 题金集端到端评测、L4/L6 质量层、发布门 |
+| **评测** | 本地 | `eval_harness/` + `make release-gate` | 258 题金集端到端评测、L4/L6 质量层、发布门 |
 
 ## 摄取管线（4 DAG）
 
