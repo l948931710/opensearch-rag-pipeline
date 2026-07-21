@@ -286,6 +286,7 @@ class TestSplitterDelimiterFailClosed:
                 assert all(s.strip() for s in stmts), f
         assert "002_feedback_system.sql" in delim_files   # 正则没瞎匹配的哨兵
         assert "027_ontology_core.sql" in clean_files
+        assert "013_qa_retrieved_doc_fact.sql" in clean_files
 
 
 # ── P1-14：apply_ontology_dbs 可重放编排（守卫复用 apply_migration）──────────
@@ -397,3 +398,111 @@ def test_aodb_prod_commit_requires_ack(aodb, monkeypatch, capsys):
 def test_aodb_dry_run_commit_mutually_exclusive(aodb):
     with pytest.raises(SystemExit):
         aodb.main(["--dry-run", "--commit"])
+
+
+# ── 评审F9（2026-07-21）：已应用形态的 information_schema 预检跳过 ────────────
+
+
+class TestStatementSkipGuard:
+    """_statement_skip_reason：单列 ADD COLUMN / CREATE INDEX 的幂等预检——049:20 头注
+    声称的守卫本体；保守闭集，多列 004 形态刻意不识别（fail-loud 不变）。"""
+
+    @staticmethod
+    def _conn(count):
+        from unittest.mock import MagicMock
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (count,)
+        conn.cursor.return_value.__enter__.return_value = cursor
+        return conn, cursor
+
+    def test_add_column_skipped_when_exists(self, am):
+        conn, cursor = self._conn(1)
+        reason = am._statement_skip_reason(
+            conn, "fuling_knowledge",
+            "ALTER TABLE kb_acl_projection_outbox ADD COLUMN generation BIGINT UNSIGNED "
+            "NOT NULL DEFAULT 0 AFTER attempts")
+        assert reason and "列已存在" in reason
+        sql, params = cursor.execute.call_args[0]
+        assert "information_schema.columns" in sql
+        assert params == ("fuling_knowledge", "kb_acl_projection_outbox", "generation")
+
+    def test_add_column_runs_when_absent(self, am):
+        conn, _ = self._conn(0)
+        assert am._statement_skip_reason(
+            conn, "db", "ALTER TABLE t ADD COLUMN c INT") is None
+
+    def test_real_049_alter_is_guarded(self, am):
+        """真实 049 文件的 ALTER 必须命中守卫（重跑 1060 事故的直接回归）。"""
+        text = open(os.path.join(_REPO, "schema", "049_acl_outbox_generation.sql"),
+                    encoding="utf-8").read()
+        stmts = am._split_statements(text)
+        alters = [s for s in stmts if s.upper().startswith("ALTER TABLE")]
+        assert len(alters) == 1
+        conn, _ = self._conn(1)
+        reason = am._statement_skip_reason(conn, "fuling_knowledge", alters[0])
+        assert reason and "kb_acl_projection_outbox.generation" in reason
+
+    def test_multi_column_alter_004_intentionally_unsupported(self, am):
+        """004 的多列复合 ALTER 刻意不识别——列已存在也照跑（fail-loud，绝不猜半截）。"""
+        text = open(os.path.join(_REPO, "schema", "004_observability_metrics.sql"),
+                    encoding="utf-8").read()
+        stmts = am._split_statements(text)
+        multi = [s for s in stmts
+                 if s.upper().startswith("ALTER TABLE")
+                 and len(re.findall(r"\bADD\b", s, re.IGNORECASE)) > 1]
+        assert multi, "004 应含多列复合 ALTER（前提变了请同步本测试）"
+        conn, cursor = self._conn(1)
+        assert am._statement_skip_reason(conn, "db", multi[0]) is None
+        cursor.execute.assert_not_called()   # 不识别 → 连探针都不打
+
+    def test_create_index_skipped_when_exists(self, am):
+        conn, cursor = self._conn(1)
+        reason = am._statement_skip_reason(
+            conn, "fuling_operation",
+            "CREATE INDEX idx_qa_created_dept ON qa_session_log (created_at, user_dept)")
+        assert reason and "索引已存在" in reason
+        sql, params = cursor.execute.call_args[0]
+        assert "information_schema.statistics" in sql
+        assert params == ("fuling_operation", "qa_session_log", "idx_qa_created_dept")
+
+    def test_unique_index_recognized(self, am):
+        conn, _ = self._conn(1)
+        reason = am._statement_skip_reason(
+            conn, "db", "CREATE UNIQUE INDEX uk_x ON t (a, b)")
+        assert reason and "t.uk_x" in reason
+
+    def test_probe_failure_fails_open_to_execution(self, am):
+        """预检自身失败 → None（语句照跑）——守卫故障绝不吞真错误。"""
+        from unittest.mock import MagicMock
+        conn = MagicMock()
+        conn.cursor.side_effect = Exception("information_schema unreachable")
+        assert am._statement_skip_reason(
+            conn, "db", "ALTER TABLE t ADD COLUMN c INT") is None
+
+    def test_other_statements_untouched(self, am):
+        conn, cursor = self._conn(1)
+        for stmt in ("CREATE TABLE IF NOT EXISTS t (id INT)",
+                     "INSERT INTO t VALUES (1)",
+                     "UPDATE t SET a=1",
+                     "ALTER TABLE t DROP COLUMN c"):
+            assert am._statement_skip_reason(conn, "db", stmt) is None
+        cursor.execute.assert_not_called()
+
+
+def test_032_lands_on_main_byte_identical_to_branch():
+    """评审F9：schema/032 必须存在且与 claude/ontology-p0 逐字节一致（跨分支同
+    sha256——台账 checksum/漂移检测两分支一致；本地无该分支时跳过比对只验存在）。"""
+    import hashlib
+    import subprocess
+    path = os.path.join(_REPO, "schema", "032_schema_migrations_checksum.sql")
+    assert os.path.exists(path), "main 缺 schema/032——checksum 漂移检测整体惰化（评审F9）"
+    local = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    try:
+        branch_bytes = subprocess.run(
+            ["git", "show", "claude/ontology-p0:schema/032_schema_migrations_checksum.sql"],
+            capture_output=True, cwd=_REPO, timeout=10, check=True).stdout
+    except Exception:
+        pytest.skip("本地无 claude/ontology-p0 分支——跳过跨分支一致性比对")
+    assert hashlib.sha256(branch_bytes).hexdigest() == local, (
+        "schema/032 与 ontology-p0 版本发生字节漂移——两分支必须同 sha256")
