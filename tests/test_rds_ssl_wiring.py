@@ -131,9 +131,20 @@ class _Cur:
         return False
 
 
+class _PlainSock:
+    """无 cipher() 的裸 socket——客户端腿明文。"""
+
+
+class _TlsSock:
+    def cipher(self):
+        return ("AES256-GCM-SHA384", "TLSv1.2", 256)
+
+
 class _Conn:
-    def __init__(self, row):
+    def __init__(self, row, sock=None):
         self._row = row
+        if sock is not None:
+            self._sock = sock
 
     def cursor(self):
         return _Cur(self._row)
@@ -142,28 +153,58 @@ class _Conn:
         pass
 
 
-def _wire(monkeypatch, *, ssl_ca, simulate, row):
+def _wire(monkeypatch, *, ssl_ca, simulate, row, sock=None):
     from opensearch_pipeline import readiness
     readiness._reset_cache()
     fake_cfg = SimpleNamespace(simulate_db=simulate,
                                rds=SimpleNamespace(ssl_ca=ssl_ca))
     monkeypatch.setattr("opensearch_pipeline.config.get_config", lambda: fake_cfg)
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn",
-                        lambda *a, **k: _Conn(row))
+                        lambda *a, **k: _Conn(row, sock=sock))
     return readiness
 
 
 def test_cipher_probe_states(monkeypatch):
+    # socket 不可达 → 回退 SHOW STATUS(非空=verified;空=代理语义不可裁决,放行可见)
     r = _wire(monkeypatch, ssl_ca="/x/ca.pem", simulate=False,
               row=("Ssl_cipher", "ECDHE-RSA-AES128-GCM-SHA256"))
     assert r.rds_tls_cipher_status() == "tls_verified(ECDHE-RSA-AES128-GCM-SHA256)"
     r = _wire(monkeypatch, ssl_ca="/x/ca.pem", simulate=False, row=("Ssl_cipher", ""))
-    assert r.rds_tls_cipher_status() == "ca_configured_but_plaintext"
+    assert r.rds_tls_cipher_status() == "tls_unverifiable(proxy_status_empty)"
     r = _wire(monkeypatch, ssl_ca="", simulate=False, row=None)
     assert r.rds_tls_cipher_status() == "plaintext"
     r = _wire(monkeypatch, ssl_ca="/x/ca.pem", simulate=True, row=None)
     assert r.rds_tls_cipher_status() == "skipped"
     r._reset_cache()
+
+
+def test_cipher_probe_client_socket_is_the_verdict(monkeypatch):
+    """2026-07-21 rwlb 实弹坑锁死:客户端腿 TLS 实证时 SHOW STATUS 为空(代理报后端腿)
+    【不得】判明文;socket 可达且非 TLS 才是真接线缺陷。"""
+    r = _wire(monkeypatch, ssl_ca="/x/ca.pem", simulate=False,
+              row=("Ssl_cipher", ""), sock=_TlsSock())
+    assert r.rds_tls_cipher_status() == "tls_verified(client-leg AES256-GCM-SHA384/TLSv1.2)"
+    r = _wire(monkeypatch, ssl_ca="/x/ca.pem", simulate=False,
+              row=("Ssl_cipher", "whatever"), sock=_PlainSock())
+    assert r.rds_tls_cipher_status() == "ca_configured_but_plaintext"
+    r._reset_cache()
+
+
+def test_pool_wrapper_chain_is_penetrable():
+    """锁包装链可穿透性:_rds_socket_of 必须能从 Guarded/DBUtils 包装挖到 _sock——
+    链条变动时此测试先红,防探针静默退化成 fallback 分支。"""
+    from opensearch_pipeline.readiness import _rds_socket_of
+
+    class _Raw:
+        _sock = _TlsSock()
+
+    class _Steady:
+        _con = _Raw()
+
+    class _Guarded:
+        _con = _Steady()
+
+    assert isinstance(_rds_socket_of(_Guarded()), _TlsSock)
 
 
 # ── api 启动自检 ──────────────────────────────────────────────────────────────

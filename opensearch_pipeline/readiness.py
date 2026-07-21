@@ -526,13 +526,35 @@ def acl_outbox_generation_status() -> str:
     return _cached("acl_outbox_generation", 300, _compute)
 
 
+def _rds_socket_of(conn):
+    """穿透 Guarded/DBUtils 包装取底层 pymysql socket（客户端腿真相）。
+    实测包装链：GuardedDBConnection._con → SteadyDBConnection._con → pymysql
+    Connection._sock（DBUtils Pooled* 层同用 _con，通用步进覆盖）。"""
+    obj = conn
+    for _ in range(6):
+        sock = getattr(obj, "_sock", None)
+        if sock is not None:
+            return sock
+        nxt = getattr(obj, "_con", None) or getattr(obj, "_conn", None)
+        if nxt is None:
+            return None
+        obj = nxt
+    return None
+
+
 def rds_tls_cipher_status() -> str:
-    """B3（生产级外审 2026-07-17 RB-02）：TLS 生效实测——SHOW STATUS LIKE 'Ssl_cipher'
-    读**本连接**的会话级密码套件（池内连接同构，可代表接线状态）。
-    状态词：simulate → skipped；未配 CA → plaintext（配置态明文，P0-02 告警拍板管辖）；
-    CA+cipher 非空 → tls_verified(<套件>)；CA+cipher 空 → **ca_configured_but_plaintext**
-    （配了 CA 还明文=某条连接路径丢了 pymysql_ssl_args，api 启动在 prod/staging 对此
-    fail-fast）；探针失败 → error（只报告——DB 瞬断自会在 rds 主探针响）。"""
+    """B3（RB-02）：TLS 生效实测——裁决证据=**客户端 socket**（2026-07-21 换）。
+
+    ⚠️ 2026-07-21 生产实弹坑：`SHOW STATUS LIKE 'Ssl_cipher'` 在 RDS **rwlb 读写分离
+    代理**后返回「代理→后端」腿状态（明文恒空），不是「客户端→代理」腿——旧版据此把
+    TLS 实际生效的健康实例判成 ca_configured_but_plaintext 拒启动（实证：同一连接
+    客户端 socket=SSLSocket AES256-GCM-SHA384/TLSv1.2，SHOW STATUS 空串）。
+    状态词：simulate → skipped；未配 CA → plaintext（P0-02 告警拍板管辖）；
+    socket 有 cipher() 非空 → tls_verified(client-leg <套件>/<版本>)；
+    socket 可达但非 TLS → **ca_configured_but_plaintext**（真接线缺陷，api fail-fast）；
+    socket 不可达 → 回退 SHOW STATUS：非空 tls_verified(<套件>)、空
+    tls_unverifiable(proxy_status_empty)（代理语义不可裁决，放行但可见）；
+    探针失败 → error。包装链穿透性由测试锁死防漂移。"""
 
     def _compute() -> str:
         try:
@@ -545,6 +567,13 @@ def rds_tls_cipher_status() -> str:
             from opensearch_pipeline.db import _get_db_conn
             conn = _get_db_conn()
             try:
+                sock = _rds_socket_of(conn)
+                if sock is not None:
+                    cipher_fn = getattr(sock, "cipher", None)
+                    cipher = cipher_fn() if callable(cipher_fn) else None
+                    if not cipher:
+                        return "ca_configured_but_plaintext"
+                    return f"tls_verified(client-leg {cipher[0]}/{cipher[1]})"
                 with conn.cursor() as cur:
                     cur.execute("SHOW STATUS LIKE 'Ssl_cipher'")
                     row = cur.fetchone()
@@ -554,7 +583,8 @@ def rds_tls_cipher_status() -> str:
             if row is not None:
                 vals = list(row.values()) if isinstance(row, dict) else list(row)
                 val = str(vals[1] if len(vals) > 1 else "") or ""
-            return f"tls_verified({val})" if val else "ca_configured_but_plaintext"
+            return (f"tls_verified({val})" if val
+                    else "tls_unverifiable(proxy_status_empty)")
         except Exception as e:   # noqa: BLE001
             logger.warning("readiness: Ssl_cipher 探针失败: %s", e)
             return "error"
