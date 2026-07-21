@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import opensearch_pipeline.dingtalk_identity as di
 
 
-# ── 桩 DB：SELECT 返回可配 cache_row=(dept_code, role, age_seconds)；记录所有 execute ──
+# ── 桩 DB：SELECT 返回可配 cache_row=(dept_code, role, age_seconds, is_active)；记录所有 execute ──
 class _FakeCur:
     def __init__(self, conn):
         self.conn = conn
@@ -34,7 +34,7 @@ class _FakeCur:
 
 class _FakeConn:
     def __init__(self, cache_row=None):
-        self.cache_row = cache_row     # (dept_code, role, age_seconds) 或 None=cache-miss
+        self.cache_row = cache_row     # (dept_code, role, age_seconds, is_active) 或 None=cache-miss
         self.calls = []
 
     def cursor(self):
@@ -118,7 +118,7 @@ def test_resolve_complete_result_is_cached(monkeypatch):
 
 def test_resolve_employee_row_stale_passes_through_to_api(monkeypatch):
     """自动 employee 行过期（age > TTL）→ 穿透重查 API 并刷新缓存。"""
-    conn = _FakeConn(cache_row=("行政部", "employee", 999999))   # 远超默认 6h TTL
+    conn = _FakeConn(cache_row=("行政部", "employee", 999999, 1))   # 远超默认 6h TTL
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     called = {"n": 0}
 
@@ -133,7 +133,7 @@ def test_resolve_employee_row_stale_passes_through_to_api(monkeypatch):
 
 def test_resolve_seeded_row_stale_never_refetched(monkeypatch):
     """seeded 行（role≠employee）即使过期也永远缓存优先，绝不穿透重查（H3 不被破坏）。"""
-    conn = _FakeConn(cache_row=("行政部", "admin", 999999))   # 过期但 role=admin=seeded
+    conn = _FakeConn(cache_row=("行政部", "admin", 999999, 1))   # 过期但 role=admin=seeded
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     called = {"n": 0}
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
@@ -145,7 +145,7 @@ def test_resolve_seeded_row_stale_never_refetched(monkeypatch):
 
 def test_resolve_employee_row_fresh_returns_cache(monkeypatch):
     """自动 employee 行未过期（age < TTL）→ 直接返回缓存，不打 API。"""
-    conn = _FakeConn(cache_row=("行政部", "employee", 100))   # 100s < 默认 TTL
+    conn = _FakeConn(cache_row=("行政部", "employee", 100, 1))   # 100s < 默认 TTL
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     called = {"n": 0}
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info",
@@ -156,7 +156,7 @@ def test_resolve_employee_row_fresh_returns_cache(monkeypatch):
 
 def test_resolve_stale_employee_api_failure_falls_back_to_cache(monkeypatch):
     """过期 employee 行穿透重查但 API 失败 → 退回旧缓存，绝不 fail-closed 掉已知部门到 public。"""
-    conn = _FakeConn(cache_row=("行政部", "employee", 999999))
+    conn = _FakeConn(cache_row=("行政部", "employee", 999999, 1))
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     monkeypatch.setattr(di, "_fetch_dingtalk_user_info", lambda sid: None)   # API 失败
     expected = di._normalize_dept_to_codes("行政部")

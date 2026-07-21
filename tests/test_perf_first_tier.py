@@ -129,7 +129,7 @@ def test_live_acl_cache_hits_within_ttl(monkeypatch):
     import opensearch_pipeline.dingtalk_identity as di
     queries = []
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn",
-                        lambda *a, **k: _RowConn(("quality",), queries))
+                        lambda *a, **k: _RowConn(("quality", 1), queries))
     di._live_acl_cache_clear()
 
     g1 = di._resolve_user_dept_cached("staff001")
@@ -167,7 +167,7 @@ def test_live_acl_cache_disabled_by_env(monkeypatch):
     import opensearch_pipeline.dingtalk_identity as di
     queries = []
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn",
-                        lambda *a, **k: _RowConn(("hr",), queries))
+                        lambda *a, **k: _RowConn(("hr", 1), queries))
     monkeypatch.setenv("RAG_LIVE_ACL_TTL_SECONDS", "0")
     di._live_acl_cache_clear()
 

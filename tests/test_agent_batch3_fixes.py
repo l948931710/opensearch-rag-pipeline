@@ -385,8 +385,10 @@ def test_p1_08_user_row_revoked_semantics(monkeypatch):
 
 
 def test_p1_08_api_identity_rejects_revoked(monkeypatch):
-    """strict + 无活跃行 + 墓碑 → 令牌立即失效（401 语义：current_identity 返回 None）；
-    真无行维持保留令牌组（文档化语义不动，test_main_p0_hardening 原测继续守卫）。"""
+    """strict + 墓碑（F4d resolver 语义：live=[] 权威空组）+ user_row_revoked 确认
+    → 令牌立即失效（401 语义：current_identity 返回 None）；确认读失败（False）
+    → 回退权威空组 public-only（2026-07-21 迁移批A2 统一契约）；真无行维持保留
+    令牌组（文档化语义不动，test_main_p0_hardening 原测继续守卫）。"""
     from opensearch_pipeline import api
     from opensearch_pipeline.api import issue_session_token
 
@@ -394,7 +396,7 @@ def test_p1_08_api_identity_rejects_revoked(monkeypatch):
     monkeypatch.setenv("RAG_LIVE_ACL_REREAD", "true")
     monkeypatch.setattr(
         "opensearch_pipeline.dingtalk_identity._resolve_user_dept_cached",
-        lambda uid, with_status=False: (None, True) if with_status else None)
+        lambda uid, with_status=False: ([], True) if with_status else [])
     monkeypatch.setattr("opensearch_pipeline.dingtalk_identity.user_row_revoked",
                         lambda uid: True)
     token = issue_session_token("U1", dept="行政部", name="测试")
@@ -402,5 +404,12 @@ def test_p1_08_api_identity_rejects_revoked(monkeypatch):
 
     monkeypatch.setattr("opensearch_pipeline.dingtalk_identity.user_row_revoked",
                         lambda uid: False)
+    ident = api.current_identity(authorization="Bearer " + token)
+    assert ident is not None and ident.acl_groups == []
+
+    # 真无行（未在册，live=None + db_ok=True）在 strict 下维持保留令牌组
+    monkeypatch.setattr(
+        "opensearch_pipeline.dingtalk_identity._resolve_user_dept_cached",
+        lambda uid, with_status=False: (None, True) if with_status else None)
     ident = api.current_identity(authorization="Bearer " + token)
     assert ident is not None and "行政部" in ident.acl_groups
