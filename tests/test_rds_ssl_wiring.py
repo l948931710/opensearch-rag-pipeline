@@ -133,9 +133,20 @@ class _Cur:
         return False
 
 
+class _PlainSock:
+    """无 cipher() 的裸 socket——客户端腿明文。"""
+
+
+class _TlsSock:
+    def cipher(self):
+        return ("AES256-GCM-SHA384", "TLSv1.2", 256)
+
+
 class _Conn:
-    def __init__(self, row):
+    def __init__(self, row, sock=None):
         self._row = row
+        if sock is not None:
+            self._sock = sock
 
     def cursor(self):
         return _Cur(self._row)
@@ -145,7 +156,7 @@ class _Conn:
 
 
 def _wire_startup(monkeypatch, *, env, row, ssl_ca="/x/ca.pem", simulate=False,
-                  conn_raises=False):
+                  conn_raises=False, sock=None):
     from opensearch_pipeline import api
     fake_cfg = SimpleNamespace(environment=env, simulate_db=simulate,
                                rds=SimpleNamespace(ssl_ca=ssl_ca))
@@ -154,22 +165,53 @@ def _wire_startup(monkeypatch, *, env, row, ssl_ca="/x/ca.pem", simulate=False,
     def _mk_conn(*a, **k):
         if conn_raises:
             raise OSError("db down")
-        return _Conn(row)
+        return _Conn(row, sock=sock)
 
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _mk_conn)
     return api
 
 
-def test_startup_check_fails_fast_on_configured_plaintext(monkeypatch):
-    api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""))
-    with pytest.raises(RuntimeError, match="Ssl_cipher"):
+def test_startup_check_fails_fast_on_plaintext_client_socket(monkeypatch):
+    """客户端 socket 可达且非 TLS = 真接线缺陷 → 拒启动(裁决证据换客户端腿,2026-07-21)。"""
+    api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""),
+                        sock=_PlainSock())
+    with pytest.raises(RuntimeError, match="非 TLS"):
         api._rds_tls_startup_check()
 
+
+def test_startup_check_passes_tls_socket_despite_empty_proxy_status(monkeypatch):
+    """2026-07-21 rwlb 实弹坑锁死:客户端腿 TLS 实证通过时,SHOW STATUS 为空(代理报
+    后端腿)【不得】拒启动——旧版据此 brick 了健康实例。"""
+    api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""),
+                        sock=_TlsSock())
+    api._rds_tls_startup_check()                      # 不抛
+
+def test_startup_check_socket_unreachable_falls_back_warn_not_brick(monkeypatch):
+    """包装链不可穿透 → 回退 SHOW STATUS;空值只告警放行(代理语义不可靠)。"""
+    api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""))
+    api._rds_tls_startup_check()                      # 不抛
 
 def test_startup_check_passes_on_verified_cipher(monkeypatch):
     api = _wire_startup(monkeypatch, env="production",
                         row=("Ssl_cipher", "ECDHE-RSA-AES128-GCM-SHA256"))
     api._rds_tls_startup_check()                      # 不抛
+
+
+def test_pool_wrapper_chain_is_penetrable():
+    """锁包装链可穿透性:_rds_socket_of 必须能从 Guarded/DBUtils 包装挖到 _sock——
+    链条变动时此测试先红,防自检静默退化成 fallback 分支。"""
+    from opensearch_pipeline.api import _rds_socket_of
+
+    class _Raw:
+        _sock = _TlsSock()
+
+    class _Steady:
+        _con = _Raw()
+
+    class _Guarded:
+        _con = _Steady()
+
+    assert isinstance(_rds_socket_of(_Guarded()), _TlsSock)
 
 
 def test_startup_check_scope_and_probe_error_tolerance(monkeypatch):

@@ -178,13 +178,34 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
+def _rds_socket_of(conn):
+    """穿透 Guarded/DBUtils 包装取底层 pymysql socket（客户端腿真相）。
+    实测包装链：GuardedDBConnection._con → SteadyDBConnection._con → pymysql
+    Connection._sock（DBUtils Pooled* 层同用 _con，通用步进覆盖）。"""
+    obj = conn
+    for _ in range(6):
+        sock = getattr(obj, "_sock", None)
+        if sock is not None:
+            return sock
+        nxt = getattr(obj, "_con", None) or getattr(obj, "_conn", None)
+        if nxt is None:
+            return None
+        obj = nxt
+    return None
+
+
 def _rds_tls_startup_check() -> None:
-    """B3（RB-02）：启动期 TLS 接线自检。仅当 production/staging + 非模拟 + 已配
-    RAG_RDS_SSL_CA 时实测 `SHOW STATUS LIKE 'Ssl_cipher'`（会话级，池内连接同构可代表
-    接线状态）：**cipher 为空 ⇒ RuntimeError**（配了 CA 还明文=某条连接路径丢了
-    pymysql_ssl_args 或服务端 TLS 被关，带病服务比拒绝启动更糟）；非空记 info；
-    探针异常（DB 瞬断）只告警不 brick——连接真不可用会在别处以更明确的方式失败。
-    （分支版走 readiness.rds_tls_cipher_status；main 无 readiness 层，此处自包含内联。）"""
+    """B3（RB-02）：启动期 TLS 接线自检——以**客户端 socket** 为裁决证据。
+
+    ⚠️ 2026-07-21 生产实弹坑：`SHOW STATUS LIKE 'Ssl_cipher'` 在 RDS **rwlb 读写分离
+    代理**后返回的是「代理→后端 MySQL」那条腿的状态（明文，恒空），不是「客户端→代理」
+    腿——旧版以它裁决，把 TLS 实际已生效的健康实例拒之门外（实证：同一连接客户端
+    socket=SSLSocket AES256-GCM-SHA384/TLSv1.2，SHOW STATUS 却返回空串）。
+    现裁决顺序：① 池内连接的底层 socket 有 cipher() 且非空 ⇒ TLS 实证通过；
+    ② socket 可达但无 cipher/为空 ⇒ 真明文接线缺陷，RuntimeError 拒启动；
+    ③ socket 不可达（包装层变动）⇒ 回退 SHOW STATUS 仅作参考——空值告警放行
+    （代理语义下不可靠，不再 brick），测试锁住包装链可穿透性防漂移。
+    探针异常（DB 瞬断）只告警不 brick。"""
     try:
         cfg = get_config()
         if cfg.environment not in ("production", "staging") or cfg.simulate_db \
@@ -193,6 +214,16 @@ def _rds_tls_startup_check() -> None:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
+            sock = _rds_socket_of(conn)
+            if sock is not None:
+                cipher_fn = getattr(sock, "cipher", None)
+                cipher = cipher_fn() if callable(cipher_fn) else None
+                if not cipher:
+                    raise RuntimeError(
+                        "[B3 RB-02] RAG_RDS_SSL_CA 已配置但客户端连接 socket 非 TLS"
+                        "（明文）——存在未接 pymysql_ssl_args 的连接路径，拒绝启动。")
+                logger.info("RDS TLS 自检：tls_verified(client-leg %s/%s)",
+                            cipher[0], cipher[1])
             with conn.cursor() as cur:
                 cur.execute("SHOW STATUS LIKE 'Ssl_cipher'")
                 row = cur.fetchone()
@@ -202,11 +233,15 @@ def _rds_tls_startup_check() -> None:
         if row is not None:
             vals = list(row.values()) if isinstance(row, dict) else list(row)
             val = str(vals[1] if len(vals) > 1 else "") or ""
-        if not val:
-            raise RuntimeError(
-                "[B3 RB-02] RAG_RDS_SSL_CA 已配置但 RDS 连接为明文（Ssl_cipher 空）——"
-                "存在未接 pymysql_ssl_args 的连接路径或服务端 TLS 被关闭，拒绝启动。")
-        logger.info("RDS TLS 自检：tls_verified(%s)", val)
+        if sock is None:
+            if not val:
+                logger.warning(
+                    "RDS TLS 自检：包装链不可穿透且 Ssl_cipher 为空——rwlb 代理下该状态"
+                    "反映后端腿、不可作裁决，放行但无法实证客户端腿 TLS（检查包装层变动）")
+            else:
+                logger.info("RDS TLS 自检：tls_verified(status %s)", val)
+        elif val:
+            logger.info("RDS TLS 自检：代理视角 Ssl_cipher=%s（参考）", val)
     except RuntimeError:
         raise
     except Exception:   # noqa: BLE001
