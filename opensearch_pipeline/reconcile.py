@@ -42,6 +42,7 @@ def _kb_db() -> str:
     return get_config().rds.database
 
 _DEFAULT_BUCKET = 500
+_FETCH_BATCH = 100  # /vector-service/fetch 单批 id 上限（与 07-21 工单探针口径一致）
 _HI_HEADROOM = 1000  # scan past max(rds.id) so freshly-pushed-but-unrecorded rows still surface
 _OSS_IMAGE_PREFIX = "processing/assets/"  # where active-chunk image_refs[].oss_key live
 _OSS_RAW_PREFIX = "raw/"                  # where document_version.raw_key source files live (CS4b)
@@ -287,6 +288,69 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
     return {"rows": rows, "truncated": truncated}
 
 
+def _fetch_reclassify_missing(cli, table_name: str,
+                              missing: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """对 query 口径判缺的 PK 用官方主键接口 /vector-service/fetch 做二次定性。
+
+    07-21 实证（scratch/fetch_probe_20260721.py）：HA3 存在 fetch 按主键可取回、但零向量
+    +id 过滤 query 不可见的行——query 口径的 "missing" 无法区分数据真丢失 vs 查询链路失明。
+    分类（均不改变 missing 判定本身，检索面损失是真实的）：
+      query_invisible    fetch 有、query 无 → 查询链路失明（数据仍在）
+      missing_confirmed  fetch 也没有       → 数据真丢失
+      unclassified       所在 fetch 批次异常 → 本轮无法定性
+    fail-open 契约：本函数绝不 raise。单批异常只废该批 ids（计入 unclassified，绝不误判
+    为 confirmed）；全部批失败或整体异常返回 {"ok": False, "error": ...}，调用方维持
+    query 单口径旧行为——二次定性不能成为新故障面。
+    """
+    try:
+        import json as _json
+        from alibabacloud_ha3engine_vector.models import FetchRequest
+
+        ids: List[int] = []
+        for m in missing:
+            try:
+                ids.append(int(m["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        present: set = set()
+        failed: set = set()
+        errors: List[str] = []
+        for i in range(0, len(ids), _FETCH_BATCH):
+            batch = ids[i:i + _FETCH_BATCH]
+            try:
+                resp = cli.fetch(FetchRequest(table_name=table_name,
+                                              ids=[str(x) for x in batch],
+                                              include_vector=False,
+                                              output_fields=["chunk_id"]))
+                body = resp.body
+                if isinstance(body, (str, bytes)):
+                    body = _json.loads(body)
+                if body.get("errorCode"):
+                    raise RuntimeError(f"errorCode={body.get('errorCode')} "
+                                       f"errorMsg={body.get('errorMsg')}")
+                for doc in body.get("result") or []:
+                    try:
+                        present.add(int(doc.get("id")))
+                    except (TypeError, ValueError):
+                        continue
+            except Exception as e:  # noqa: BLE001 — 单批失败只废该批定性，不染全局
+                failed.update(batch)
+                errors.append(f"batch@{i}: {type(e).__name__}: {e}"[:200])
+        query_invisible = [x for x in ids if x in present]
+        unclassified = [x for x in ids if x in failed and x not in present]
+        confirmed = [x for x in ids if x not in present and x not in failed]
+        if ids and len(unclassified) == len(ids):   # 全军覆没 → 等同整体失败，维持旧口径
+            return {"ok": False, "error": f"all {len(errors)} fetch batches failed",
+                    "fetch_errors": errors[:10]}
+        return {"ok": True, "query_invisible": query_invisible,
+                "missing_confirmed": confirmed, "unclassified": unclassified,
+                "fetch_errors": errors[:10]}
+    except Exception as e:  # noqa: BLE001 — fail-open：定性失败只丢分类，绝不影响对账本体
+        logger.warning("reconcile: fetch reclassify failed (fail-open, keep query-only verdict)",
+                       exc_info=True)
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def _rds_batch_width() -> int:
     """P2-30：RDS↔HA3 对齐分桶宽度（服务端 id-range 分页）。RAG_RECONCILE_RDS_BATCH，默认 5000。"""
     try:
@@ -427,6 +491,10 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
     （报告标 stale_scan_curtailed）。耗时超 RAG_RECONCILE_DURATION_ALERT_S（默认 1800s）
     → 一条 warning 级 ops 告警。
 
+    07-21（fetch 二次定性）：query 口径判缺的 PK 追加一轮官方 /vector-service/fetch
+    （批 ≤100），counts 增 missing_confirmed / query_invisible / missing_unclassified，
+    报告挂 fetch_reclassify；定性失败 fail-open 维持 query 单口径，等级不变。
+
     Returns the parity report enriched with `complete` (False if any HA3 bucket truncated)
     and, on failure, `error`. Never raises. When alert=True and drift (recall-loss) is detected — or
     the run errors — fires a single OBS-4 ops alert (itself fail-open / config-gated).
@@ -505,6 +573,18 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
         if scan_lo:
             report["stale_scan_curtailed"] = True   # 低于 min_id 的 stale/orphan 本轮未检
         report["rds_batch"] = step
+
+        # 07-21 二次定性：query 口径判缺的 PK 再走官方 /vector-service/fetch，区分数据
+        # 真丢失（missing_confirmed）与查询链路失明（query_invisible）。helper 自身
+        # fail-open 绝不 raise；失败只丢分类，missing 判定与告警等级不变。
+        if report.get("rds_active_missing"):
+            fr = _fetch_reclassify_missing(cli, cfg.alibaba_vector.table_name,
+                                           report["rds_active_missing"])
+            report["fetch_reclassify"] = fr
+            if fr.get("ok"):
+                report["counts"]["missing_confirmed"] = len(fr["missing_confirmed"])
+                report["counts"]["query_invisible"] = len(fr["query_invisible"])
+                report["counts"]["missing_unclassified"] = len(fr["unclassified"])
     except Exception as e:  # noqa: BLE001 — fail-open by contract
         logger.exception("reconcile: parity check failed")
         report = {"ok": False, "complete": False, "error": f"{type(e).__name__}: {e}", "counts": {}}
@@ -796,10 +876,28 @@ def _alert_on_drift(report: Dict[str, Any]) -> None:
         if report.get("error"):
             text = f"parity check errored: {report['error']}"
         else:
-            text = (f"RDS-active missing from HA3: **{c.get('rds_active_missing', 0)}** chunks; "
-                    f"fully-vanished docs: **{c.get('vanished_docs', 0)}**; "
-                    f"HA3 stale: {c.get('ha3_stale', 0)}; "
-                    f"complete={report.get('complete')}")
+            fr = report.get("fetch_reclassify") or {}
+            if fr.get("ok"):
+                # fetch 二次定性可用：分类展示，但等级维持 critical——query 不可见的行
+                # 检索面损失是真实的，query_invisible 不降级。
+                cls = (f"其中 missing_confirmed(fetch 也无，数据真丢失)="
+                       f"**{c.get('missing_confirmed', 0)}**；"
+                       f"query_invisible(fetch 可取回/query 不可见，查询链路失明)="
+                       f"**{c.get('query_invisible', 0)}**")
+                if c.get("missing_unclassified"):
+                    cls += f"；未定性(fetch 批次异常)={c['missing_unclassified']}"
+                text = (f"RDS-active missing from HA3 (query 口径): "
+                        f"**{c.get('rds_active_missing', 0)}** chunks — {cls}; "
+                        f"fully-vanished docs: **{c.get('vanished_docs', 0)}**; "
+                        f"HA3 stale: {c.get('ha3_stale', 0)}; "
+                        f"complete={report.get('complete')}")
+            else:
+                text = (f"RDS-active missing from HA3: **{c.get('rds_active_missing', 0)}** chunks; "
+                        f"fully-vanished docs: **{c.get('vanished_docs', 0)}**; "
+                        f"HA3 stale: {c.get('ha3_stale', 0)}; "
+                        f"complete={report.get('complete')}")
+                if fr:   # 二次定性尝试过但失败 → 注记维持 query 单口径（fail-open 可观测）
+                    text += f"（fetch 二次定性失败，维持 query 单口径: {fr.get('error')}）"
         send_ops_alert("RDS↔HA3 parity drift", text, severity="critical",
                        dedup_key="reconcile:rds-ha3-parity")
     except Exception:  # noqa: BLE001
@@ -824,6 +922,13 @@ def _print_ha3(report: Dict[str, Any]) -> None:
     print(f"  RDS rows={c.get('rds_rows')} active={c.get('rds_active')} "
           f"active_indexed={c.get('rds_active_indexed')} | HA3 pks={c.get('ha3_pks')}")
     print(f"  ⚠️ RDS-active MISSING from HA3 = {c.get('rds_active_missing')} (recall loss)")
+    fr = report.get("fetch_reclassify") or {}
+    if fr.get("ok"):
+        print(f"     ↳ fetch 二次定性: missing_confirmed={c.get('missing_confirmed')} "
+              f"query_invisible={c.get('query_invisible')} "
+              f"unclassified={c.get('missing_unclassified')}")
+    elif fr:
+        print(f"     ↳ fetch 二次定性失败（维持 query 单口径）: {fr.get('error')}")
     print(f"  ⚠️ fully-VANISHED docs = {c.get('vanished_docs')}")
     print(f"  stale HA3 rows = {c.get('ha3_stale')} {report.get('stale_subtypes', {})}")
     print(f"  orphan HA3 docs = {c.get('orphan_docs')}")

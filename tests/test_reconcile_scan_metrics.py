@@ -136,6 +136,39 @@ def test_parity_report_carries_scan_metrics(live_stores):
     assert rep["rds_batch"] >= 500
 
 
+def test_streaming_parity_fetch_reclassify_flows_to_counts(live_stores, monkeypatch):
+    """07-21 fetch 二次定性：判缺 id=2 fetch 可取回 → query_invisible=1 / confirmed=0
+    进 counts；ok 仍 False（检索面损失真实，等级维持 CRITICAL 判定不变）。"""
+    import json as _json
+    from opensearch_pipeline import retriever
+    from tests.test_reconcile import _ensure_ha3_fetch_request
+    _ensure_ha3_fetch_request()   # xdist 同 worker 的 SDK stub 可能缺 FetchRequest
+
+    class _Cli:
+        def fetch(self, req):
+            docs = [{"id": "2"}] if "2" in list(req.ids) else []
+            return type("R", (), {"body": _json.dumps({"result": docs})})()
+
+    monkeypatch.setattr(retriever, "_get_ha3_client", lambda: _Cli())
+    rep = reconcile.run_parity_check(hi=20)
+    assert rep["counts"]["rds_active_missing"] == 1
+    assert rep["counts"]["query_invisible"] == 1
+    assert rep["counts"]["missing_confirmed"] == 0
+    assert rep["counts"]["missing_unclassified"] == 0
+    assert rep["fetch_reclassify"]["ok"] is True
+    assert rep["ok"] is False
+
+
+def test_streaming_parity_reclassify_failure_keeps_query_verdict(live_stores):
+    """fixture 的 HA3 client 无 fetch 能力 → 定性 fail-open：counts 不加分类键，
+    报告其余部分与 query 单口径完全一致（旧行为）。"""
+    rep = reconcile.run_parity_check(hi=20)
+    assert rep["fetch_reclassify"]["ok"] is False
+    assert "missing_confirmed" not in rep["counts"]
+    assert "query_invisible" not in rep["counts"]
+    assert rep["counts"]["rds_active_missing"] == 1 and rep["ok"] is False
+
+
 def test_duration_alert_fires_when_over_threshold(live_stores, monkeypatch):
     monkeypatch.setenv("RAG_RECONCILE_DURATION_ALERT_S", "1e-9")
     sent = []
