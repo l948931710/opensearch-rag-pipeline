@@ -29,6 +29,9 @@ export const GROUP_LABEL: Record<string, string> = {
 export const SUBDEPT_LABEL: Record<string, string> = {
   production_mold: '生产·模具', production_paper_cup: '生产·纸杯', production_thermoforming: '生产·吸塑',
   production_injection: '生产·注塑', production_straw: '生产·吸管',
+  // 2026-07-20 拍板开通的三条子线(retriever._PRODUCTION_UMBRELLA_OWNERS 6→9 同批)
+  production_blown_film: '生产·吹膜', production_carton: '生产·纸箱',
+  production_pulp_molding: '生产·纸浆模塑',
 }
 export const deptLabel = (code: string) => GROUP_LABEL[code] || SUBDEPT_LABEL[code] || code
 
