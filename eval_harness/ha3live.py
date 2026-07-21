@@ -130,7 +130,10 @@ def _rds_ssl_kwargs():
         return {"ssl_disabled": True}
     verify = (os.environ.get("RAG_RDS_SSL_VERIFY_CERT", "true").strip().lower()
               not in ("0", "false", "no"))
-    return {"ssl": {"ca": ca, "check_hostname": verify}, "ssl_verify_cert": verify}
+    return {"ssl_ca": ca, "ssl_verify_cert": verify, "ssl_verify_identity": verify}
+    # ⚠️ 只用顶层 ssl_* 参数,绝不与 ssl={...} 字典混传:pymysql 见任一顶层参数为真即用
+    # 顶层参数【重建】ssl 配置并丢弃字典(ca 变 None→退到系统信任库,ApsaraDB 链必挂
+    # "unable to get local issuer";2026-07-21 SAE 首开 CA 实弹踩坑)。
 
 
 def rds_conn():

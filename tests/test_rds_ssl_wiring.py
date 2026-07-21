@@ -95,14 +95,22 @@ class TestInlineHelperBehavior:
         monkeypatch.setenv("RAG_RDS_SSL_CA", "/x/aliyun-rds-ca.pem")
         monkeypatch.delenv("RAG_RDS_SSL_VERIFY_CERT", raising=False)
         out = inline_helper()
-        assert out["ssl"]["ca"] == "/x/aliyun-rds-ca.pem"
-        assert out["ssl"]["check_hostname"] is True and out["ssl_verify_cert"] is True
+        assert out["ssl_ca"] == "/x/aliyun-rds-ca.pem"
+        assert out["ssl_verify_cert"] is True and out["ssl_verify_identity"] is True
 
     def test_verify_off_relaxes_hostname(self, inline_helper, monkeypatch):
         monkeypatch.setenv("RAG_RDS_SSL_CA", "/x/ca.pem")
         monkeypatch.setenv("RAG_RDS_SSL_VERIFY_CERT", "false")
         out = inline_helper()
-        assert out["ssl"]["check_hostname"] is False and out["ssl_verify_cert"] is False
+        assert out["ssl_verify_cert"] is False and out["ssl_verify_identity"] is False
+
+    def test_never_mixes_dict_and_toplevel_ssl_kwargs(self, inline_helper, monkeypatch):
+        """2026-07-21 生产实弹坑:pymysql 见任一顶层 ssl_* 参数为真即重建 ssl 配置并丢弃
+        ssl={...} 字典(ca→None 退系统信任库,check_hostname 被关)。锁死:带 CA 时输出
+        只允许顶层参数形态,永不携带 'ssl' 字典键。"""
+        monkeypatch.setenv("RAG_RDS_SSL_CA", "/x/ca.pem")
+        monkeypatch.delenv("RAG_RDS_SSL_VERIFY_CERT", raising=False)
+        assert "ssl" not in inline_helper()
 
 
 # ── api 启动自检（自包含探针） ────────────────────────────────────────────────

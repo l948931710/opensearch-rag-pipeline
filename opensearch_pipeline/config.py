@@ -196,8 +196,14 @@ class RDSConfig:
         ca = (self.ssl_ca or "").strip()
         if not ca:
             return {"ssl_disabled": True}
-        return {"ssl": {"ca": ca, "check_hostname": bool(self.ssl_verify_cert)},
-                "ssl_verify_cert": bool(self.ssl_verify_cert)}
+        # ⚠️ 只用顶层 ssl_* 参数,绝不与 ssl={...} 字典混传:pymysql __init__ 见任一顶层
+        # 参数(ssl_verify_cert 等)为真,就用顶层参数【重建】ssl 配置并整体丢弃字典——
+        # ca 变 None → 退到系统信任库 → ApsaraDB 链必挂 "unable to get local issuer",
+        # 且 check_hostname 被悄悄关掉。2026-07-21 SAE 生产首开 CA 验证实弹踩坑
+        # (B3 接线此前只过 mock 单测,从未真握手)。
+        return {"ssl_ca": ca,
+                "ssl_verify_cert": bool(self.ssl_verify_cert),
+                "ssl_verify_identity": bool(self.ssl_verify_cert)}
 
 
 @dataclass

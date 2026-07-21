@@ -140,6 +140,8 @@ def test_rds_ssl_args_with_ca(tmp_path):
     from opensearch_pipeline.config import RDSConfig
     ca = str(tmp_path / "ca.pem")
     args = RDSConfig(ssl_ca=ca, ssl_verify_cert=True).pymysql_ssl_args()
-    assert args["ssl"]["ca"] == ca and args["ssl"]["check_hostname"] is True
+    assert args["ssl_ca"] == ca and args["ssl_verify_identity"] is True
+    # 2026-07-21 实弹坑:绝不与 ssl={...} 字典混传(pymysql 会重建配置丢弃字典)
+    assert "ssl" not in args
     args2 = RDSConfig(ssl_ca=ca, ssl_verify_cert=False).pymysql_ssl_args()
-    assert args2["ssl"]["check_hostname"] is False and args2["ssl_verify_cert"] is False
+    assert args2["ssl_verify_identity"] is False and args2["ssl_verify_cert"] is False
