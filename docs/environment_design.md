@@ -40,6 +40,21 @@
 
 **现状恰好倒置**：①完全缺失（一把全权 AK 走天下）、②局部缺失（OSS 共桶、HA3 双标）、只有③的雏形（simulate 开关 + Gemini 禁令）。simulate 是"要不要连真实服务"的开关，不是"连的是谁"的守卫——它一关，后面一马平川。本方案补齐前两道、把第三道从"单开关"升级为"标签↔目标交叉校验 + 按操作粒度的 ack"。
 
+### 2.1 生产安全姿态断言（批次5 P0-07d，2026-07-21 迁移批B1 落 main）
+
+`config.environment ∈ {production, staging}` 的进程在 `load_config()` 即断言
+`RAG_REQUIRE_AUTH` 与 `RAG_ACL_FAIL_CLOSED` 双开，缺任一 → `ValueError` 拒绝启动；
+过渡逃生口 = **当日** `RAG_ALLOW_LEGACY_OPEN_PROD=ack:<YYYY-MM-DD>`（P1-14 日期绑定，
+午夜过期，启用即 critical 日志；裸 `ack` 无效）。RDS TLS 刻意不在断言范围（P0-02
+记录在案，CA 到位随 B7 升硬断）。**部署面清单**（两 flag 对批处理/诊断进程零行为
+影响，仅 api/retriever/readiness 读取）：
+
+| 面 | 状态 |
+|---|---|
+| DataWorks 五节点 | 已内联 `os.environ[...]="true"`（cab9d4f，2026-07-21 stage3 实地踩过后补） |
+| SAE 应用 env | **重打包/重部署前必须在控制台补 `RAG_REQUIRE_AUTH=true` + `RAG_ACL_FAIL_CLOSED=true`**，否则实例启动即崩（唯一替代=当日 ack，不适合常驻） |
+| 本地 `.env.prod_ro` / `.env.staging` / `.env.metrics`（launchd） | 2026-07-21 已补两 flag（gitignored，本表即台账；op0 worktree 的 `.env.prod_ro` 是指向 main 文件的 symlink） |
+
 ---
 
 ## 3. 六层环境矩阵（核心表）

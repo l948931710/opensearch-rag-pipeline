@@ -1019,6 +1019,42 @@ def load_config() -> PipelineConfig:
             "⚠️ [P2-01] '%s' 环境未配置独立 RAG_UPLOAD_SIGNING_KEY——上传签名回退会话"
             "密钥（一钥两用）。建议随下次 SAE 重打包配置独立密钥并纳入轮换。",
             config.environment)
+
+    # 【批次5 P0-07d，unknown-unknowns 外审；2026-07-21 迁移批B1 自 claude/ontology-p0 移植】
+    # 生产安全姿态断言：强制认证与 ACL fail-closed 是 main P0 加固的两根梁，代码默认 off 是
+    # 「代码先行、部署后开」的过渡态——production/staging 启动时必须显式表态：要么把两个
+    # flag 打开，要么设 RAG_ALLOW_LEGACY_OPEN_PROD 显式承认延续旧开放姿态（过渡逃生口，
+    # 环境变量到位后应删除）。「部署漏配安全变量 → 告警后继续」到此收口为 fail-closed。
+    # P1-14（外审核查 2026-07-16）：ack 绑当日日期——`ack:<YYYY-MM-DD>`（仿 env_guard
+    # RAG_DESTRUCTIVE_PROD_ACK 惯例，午夜过期）。无日期的裸 `ack` 会变成永久逃生口：
+    # 设完就忘、逐渐制度化，正是外审点名的形态。每次重启/重部署都要求当日重签，
+    # 姿态缺口不可能被遗忘；启用即 critical 日志（可告警特征）。
+    # ⚠️ RDS TLS（RAG_RDS_SSL_CA）维持告警不阻断——记录在案的用户决策（本文件 P0-02 注），
+    # CA 证书到位后再升硬断言，不在本断言范围。DataWorks 五节点已内联两 flag（cab9d4f），
+    # 本地 prod_ro/staging/metrics overlay 需同步补（部署清单见 docs/environment_design.md）。
+    if _env_label_prod:
+        _posture_missing = [
+            env for env in ("RAG_REQUIRE_AUTH", "RAG_ACL_FAIL_CLOSED")
+            if os.environ.get(env, "").strip().lower() not in ("1", "true", "yes", "on")]
+        if _posture_missing:
+            from datetime import datetime as _dt
+            _ack_raw = os.environ.get("RAG_ALLOW_LEGACY_OPEN_PROD", "").strip().lower()
+            _today = _dt.now().strftime("%Y-%m-%d")
+            if _ack_raw == f"ack:{_today}":
+                logging.getLogger(__name__).critical(
+                    "🚨 [LEGACY-OPEN POSTURE] '%s' 环境以 RAG_ALLOW_LEGACY_OPEN_PROD=%s "
+                    "延续旧开放姿态运行（%s 未开启）——当日有效，明日重启需重签；"
+                    "环境变量到位后请删除该逃生口（P1-14）。",
+                    config.environment, _ack_raw, "/".join(_posture_missing))
+            else:
+                _hint = ("旧格式 `ack` 已失效（无期限逃生口会被遗忘）；" if _ack_raw else "")
+                raise ValueError(
+                    f"🚨 [PRODUCTION SECURITY GUARD] '{config.environment}' 环境未开启 "
+                    f"{'/'.join(_posture_missing)}（强制认证 / ACL fail-closed）。"
+                    f"请在部署环境变量中开启它们；{_hint}确需延续旧开放姿态（过渡期）须"
+                    f"显式设 **当日** RAG_ALLOW_LEGACY_OPEN_PROD=ack:{_today}"
+                    f"（P1-14 日期绑定，午夜过期；unknown-unknowns 批次5 P0-07d）。")
+
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
     # 且只配 GEMINI key 时，模型解析全路由 Google，生产 chunk_text/查询内容会被 POST 到 Google。
