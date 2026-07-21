@@ -76,6 +76,15 @@ def _webhook_allowed(url: str) -> bool:
         return False
 
 
+def _wh_tag(webhook: str) -> str:
+    """webhook 的可日志指纹:access_token 前 8 位(区分机器人,不泄整个 token)。"""
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(webhook).query)
+        return (q.get("access_token", [""])[0][:8] or "?") + "…"
+    except Exception:   # noqa: BLE001
+        return "?"
+
+
 def send_ops_alert(title: str, text: str, *, severity: str = "warning",
                    dedup_key: Optional[str] = None, timeout: float = 5.0) -> bool:
     """Post a Markdown alert. Returns True on a 2xx HTTP send; False otherwise (or no-op).
@@ -135,11 +144,15 @@ def send_ops_alert(title: str, text: str, *, severity: str = "warning",
             bj = json.loads(raw.decode("utf-8"))
             errcode = int(bj.get("errcode", 0))
         except Exception:   # noqa: BLE001 — body 非 JSON：保守按已送达（旧行为，不误报）
+            logger.info("ops-alert sent (body unparsed): %s -> %s", title, _wh_tag(webhook))
             return True
         if errcode != 0:
             logger.error("ops-alert DingTalk errcode=%s errmsg=%s: %s",
                          errcode, bj.get("errmsg"), title)
             return False
+        # 成功也留痕(2026-07-21):此前成功静默——「发了但进错群」(节点配了旧机器人 token)
+        # 与「压根没发」在日志上无法区分,烧了一轮诊断。带 token 前 8 位定位是哪个机器人。
+        logger.info("ops-alert sent: %s -> %s", title, _wh_tag(webhook))
         return True
     except Exception as e:
         # fail-open: an alert send failure must never abort the operation that triggered it
