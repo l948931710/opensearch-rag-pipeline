@@ -221,7 +221,7 @@ def _wire_startup(monkeypatch, *, env, status, ssl_ca="/x/ca.pem"):
 
 def test_startup_check_fails_fast_on_configured_plaintext(monkeypatch):
     api = _wire_startup(monkeypatch, env="production", status="ca_configured_but_plaintext")
-    with pytest.raises(RuntimeError, match="Ssl_cipher"):
+    with pytest.raises(RuntimeError, match="非 TLS"):
         api._rds_tls_startup_check()
 
 
