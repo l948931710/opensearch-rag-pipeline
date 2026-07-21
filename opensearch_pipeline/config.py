@@ -191,7 +191,8 @@ class RDSConfig:
 
     def pymysql_ssl_args(self) -> dict:
         """P0-02：pymysql.connect 的 ssl 关键字。
-        配了 ssl_ca → {"ssl": {"ca": <path>, "check_hostname"/"verify_cert": ...}}；
+        配了 ssl_ca → {"ssl_ca": <path>, "ssl_verify_cert": ..., "ssl_verify_identity": ...}
+        （纯顶层参数形态,2026-07-21 起）；
         未配 → {"ssl_disabled": True}【显式明文】。不能返回 {}：pymysql 2.x 默认
         PREFERRED 模式——RDS 实例开通 SSL（2026-07-17）后服务端广播能力位，未显式
         禁用的客户端会按自身 pymysql/OpenSSL 版本自动尝试 TLS，握手失败不回退直接
