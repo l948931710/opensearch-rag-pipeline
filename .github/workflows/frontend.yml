@@ -48,6 +48,45 @@ jobs:
       - name: Build (vue-tsc 类型检查 + vite build)
         run: npm run build
 
+  # δ4a（M14，Majors 批次 δ，codex 共识 2026-07-21）：Playwright UX 硬门进 CI——
+  # 三视口 projects 全跑（playwright.config.ts 硬门口径：1440/1280/1024）；trace 用
+  # CLI 传 retain-on-failure（不动 config retries:0 的本地不容 flake 纪律）；失败双上传
+  # playwright-report/ + test-results/（HTML 报告 + trace/video/error-context 离线归因）。
+  # dev server 由 playwright.config webServer 自起（:5177 严格端口，绝不复用外部 server）。
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: console-app
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console-app/package-lock.json
+      - name: Install (npm ci)
+        run: npm ci
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+      - name: E2E (Playwright 三视口硬门)
+        run: npm run e2e -- --trace=retain-on-failure
+      - name: Upload playwright-report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: playwright-report
+          path: console-app/playwright-report/
+          retention-days: 14
+      - name: Upload test-results (trace/video/error-context)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: playwright-test-results
+          path: console-app/test-results/
+          retention-days: 14
+
   # 小程序纯函数单测（markdown/typewriter）：node 内置 runner，零依赖零安装，
   # 与本地 `make miniapp-test` 完全同款——此前完全不在 CI。
   miniapp:
