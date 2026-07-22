@@ -27,7 +27,7 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 _JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "unregistered_raw",
-         "qa_rollup", "queue_aging", "ingest_funnel")
+         "qa_rollup", "queue_aging", "ingest_funnel", "agent_health")
 
 
 def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
@@ -60,6 +60,12 @@ def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
     if "ingest_funnel" in sel:
         from opensearch_pipeline.queue_monitor import run_ingest_funnel_check
         out["ingest_funnel"] = run_ingest_funnel_check(alert=alert)
+    # γ3（M9.3/9.4+M6.iii，codex 共识 2026-07-21）：agent 权威监控面——八维+可用率
+    # 按日 UPSERT 进 agent_daily_metrics（056）。RAG_AGENT_HEALTH_ENABLE 默认 off →
+    # skipped/exit 0（056 未 apply 也零触碰）。
+    if "agent_health" in sel:
+        from opensearch_pipeline.agent_health import run_agent_health_check
+        out["agent_health"] = run_agent_health_check(alert=alert)
     # P2-14：监控链路存活证明（fail-open；schema/018 未 apply 时 no-op）。
     # 心跳随任意子集运行刷新——只要调度还活着，rag_runtime_contract 里就有新鲜时间戳。
     try:

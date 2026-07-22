@@ -501,6 +501,22 @@ def approval_quota_contract_status() -> str:
     return _cached("approval_quota_contract", 60, _compute)
 
 
+def agent_health_contract_status() -> str:
+    """γ3（M9，codex 共识 2026-07-21）：RAG_AGENT_HEALTH_ENABLE 开 ⇒ 056
+    agent_daily_metrics 表必须在位——缺表时作业 UPSERT 必炸（exit 3，权威面零累积）。
+    off → skipped（报告面契约，ask_idem_contract 同款先例）。"""
+    if not _flag_on("RAG_AGENT_HEALTH_ENABLE"):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        t = _tables_exist(db, ["agent_daily_metrics"])
+        return t if t != "missing" else "missing:agent_daily_metrics(schema/056)"
+
+    return _cached("agent_health_contract", 60, _compute)
+
+
 def price_table_contract_status() -> str:
     """γ4（M15 价表，codex 共识 2026-07-21）：RAG_MODEL_PRICE_TABLE_JSON 非空 ⇒ 057
     llm_call_log.price_table_version 必须在位——缺列时写侧 1054 warn-once 降级

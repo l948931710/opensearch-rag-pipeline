@@ -62,5 +62,6 @@
 053_tool_invocation_reconcile.sql operation
 054_agent_run_request_identity.sql operation
 055_agent_step_bookkeeping.sql operation
+056_agent_daily_metrics.sql operation
 057_llm_call_log_price_version.sql operation
 058_agent_quota_lock.sql operation

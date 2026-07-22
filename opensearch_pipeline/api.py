@@ -807,6 +807,8 @@ def _compute_readiness(cfg):
     checks["approval_quota_contract"] = _readiness.approval_quota_contract_status()
     # γ4（M15）：价表非空 ⇒ 057 版本列在位（报告面；写侧对缺列有 1054 warn-once 降级）
     checks["price_table_contract"] = _readiness.price_table_contract_status()
+    # γ3（M9）：health flag 开 ⇒ 056 权威面表在位（报告面；作业缺表=exit 3 自会响）
+    checks["agent_health_contract"] = _readiness.agent_health_contract_status()
     checks["op_reconcile_contract"] = _readiness.op_reconcile_contract_status()
     checks["ingest_lease_contract"] = _readiness.ingest_lease_contract_status()
     checks["write_tool_contract"] = _readiness.write_tool_contract_status()

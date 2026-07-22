@@ -192,5 +192,30 @@ class DurableDispatcher:
                 self.tick()
             except Exception:   # noqa: BLE001 — 循环永不因单轮异常退出
                 logger.warning("durable dispatch 恢复扫描单轮异常（继续）", exc_info=True)
+            self._write_worker_heartbeat()      # γ3（M9）：逐轮心跳（fail-open）
             if stop.wait(max(1.0, interval)):
                 return
+
+    def _write_worker_heartbeat(self) -> None:
+        """γ3（M9.3，codex 共识 2026-07-21）：dispatcher 存活证明——逐轮 UPSERT
+        rag_runtime_contract（operation 库，key=agent_dispatcher_heartbeat，value=holder；
+        updated_at ON UPDATE 由服务端走表，agent_health 读 TIMESTAMPDIFF 龄免时钟漂移）。
+        fail-open：心跳写失败绝不影响恢复扫描（018 未 apply/瞬断只 debug 留痕）。"""
+        try:
+            from opensearch_pipeline.config import get_config
+            from opensearch_pipeline.db import _get_db_conn
+            db = get_config().rds.operation_database
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"INSERT INTO {db}.rag_runtime_contract (contract_key, contract_value) "
+                        "VALUES ('agent_dispatcher_heartbeat', %s) "
+                        "ON DUPLICATE KEY UPDATE contract_value=VALUES(contract_value), "
+                        "updated_at=CURRENT_TIMESTAMP",
+                        (self.holder[:255],))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:   # noqa: BLE001 — 观测心跳绝不阻断调度
+            logger.debug("dispatcher 心跳写入失败（忽略）: %s", e)

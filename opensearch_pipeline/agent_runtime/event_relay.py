@@ -159,6 +159,7 @@ class _RedisRelay:
                 self._ttl_set = True
         except Exception:   # noqa: BLE001
             self._dead = True
+            _note_publish_failure()
             logger.warning("run %s 事件中继发布失败（本 run 降级单副本，进程内 SSE 不受影响）",
                            self._run_id, exc_info=True)
 
@@ -190,6 +191,7 @@ class _RedisRelay:
             self._xadd(payload)
         except Exception:   # noqa: BLE001 — dump 失败同样只降级
             self._dead = True
+            _note_publish_failure()
             logger.warning("run %s 事件序列化失败（中继停发）", self._run_id, exc_info=True)
 
     def end(self) -> None:
@@ -206,6 +208,21 @@ class _RedisRelay:
                 self._q.put_nowait(None)             # 关闭 writer
             except Exception:   # noqa: BLE001
                 pass
+
+
+def _note_publish_failure() -> None:
+    """γ3（M9.3，codex 共识 2026-07-21）：发布失败 best-effort 计数（agent_health
+    relay 维消费）。⚠️ **下界**语义如实标注：失败主因通常是 Redis 不可达——此时对
+    Redis 的 INCR 同样失败被吞，计数只能捕捉「Redis 活着但单流发布失败」的形态；
+    权威判定=agent_health 的近窗终态 run 终局帧缺失率，本计数仅辅助归因。"""
+    try:
+        from opensearch_pipeline import redis_client
+        cli = redis_client.get_client()
+        k = redis_client.key("agent", "relay", "publish_failures")
+        cli.incr(k)
+        cli.expire(k, 172800)          # 48h 滚动窗口（观测计数，无需长存）
+    except Exception:   # noqa: BLE001 — 计数失败静默（见 docstring 下界语义）
+        pass
 
 
 def attach_relay(handle) -> None:

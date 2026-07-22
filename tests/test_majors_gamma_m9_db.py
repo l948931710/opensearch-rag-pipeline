@@ -209,3 +209,94 @@ def test_g4_record_llm_call_roundtrips_price_version():
                 ph = ",".join(["%s"] * len(ids))
                 cur.execute(f"DELETE FROM llm_call_log WHERE call_id IN ({ph})", ids)
         conn.close()
+
+
+# ── γ3（agent_health）真库：056 UPSERT 日界幂等 + dispatcher 心跳 ────────────────
+
+
+def _health_table_ready():
+    try:
+        conn = _local_operation_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM information_schema.tables "
+                        "WHERE table_schema=DATABASE() AND table_name='agent_daily_metrics'")
+            ok = cur.fetchone()[0] == 1
+        conn.close()
+        return ok
+    except Exception:
+        return False
+
+
+@skipif_no_db
+def test_g3_health_execute_upserts_day_row_idempotently():
+    """当日窗种 2 终态 run → _execute UPSERT 出当日行（北京日界）；重跑=同一行更新
+    （PK=metric_date）；活跃延迟分位来自 054 累计。"""
+    if not _health_table_ready():
+        pytest.skip("agent_daily_metrics 缺表（先 apply schema/056）")
+    from opensearch_pipeline import agent_health
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+
+    store, runs = RDSRunStore(), []
+    day = agent_health._beijing_today()
+    conn = _local_operation_conn()
+    try:
+        r1 = store.create_run(_ctx(f"g3a-{uuid.uuid4().hex[:8]}"), "default")
+        r2 = store.create_run(_ctx(f"g3b-{uuid.uuid4().hex[:8]}"), "default")
+        runs += [r1, r2]
+        assert store.complete_run_atomic(r1, active_ms=400)
+        assert store.transition(r2, "running", "failed", active_ms=800)
+        rep = agent_health._execute(day, alert=False)
+        assert "error" not in rep, rep
+        assert rep["runs_total"] >= 2 and rep["runs_succeeded"] >= 1 \
+            and rep["runs_failed"] >= 1
+        with conn.cursor() as cur:
+            cur.execute("SELECT runs_total, slo_verdict FROM agent_daily_metrics "
+                        "WHERE metric_date=%s", (day,))
+            row1 = cur.fetchone()
+        assert row1 is not None and int(row1[0]) == rep["runs_total"]
+        rep2 = agent_health._execute(day, alert=False)      # 幂等重跑：同 PK 更新
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*), MAX(runs_total) FROM agent_daily_metrics "
+                        "WHERE metric_date=%s", (day,))
+            n, total2 = cur.fetchone()
+        assert int(n) == 1 and int(total2) == rep2["runs_total"]
+    finally:
+        _cleanup(runs)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM agent_daily_metrics WHERE metric_date=%s", (day,))
+        conn.close()
+
+
+@skipif_no_db
+def test_g3_dispatcher_heartbeat_roundtrip():
+    """dispatcher._write_worker_heartbeat → rag_runtime_contract 行可读、服务端龄≈0；
+    同 holder 重写仍刷新 updated_at（ON DUPLICATE 显式置 CURRENT_TIMESTAMP）。
+    表缺失（018 operation 侧未 apply）→ skip **在 try 外**判（finally 清理不撞 1146）。"""
+    conn = _local_operation_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM information_schema.tables "
+                    "WHERE table_schema=DATABASE() AND table_name='rag_runtime_contract'")
+        table_ok = cur.fetchone()[0] == 1
+    if not table_ok:
+        conn.close()
+        pytest.skip("fuling_operation.rag_runtime_contract 缺表（先 apply schema/018 operation 侧）")
+    try:
+        from opensearch_pipeline.agent_runtime.dispatch_outbox import RDSDispatchOutbox
+        from opensearch_pipeline.agent_runtime.durable_dispatcher import DurableDispatcher
+        d = DurableDispatcher(RDSDispatchOutbox(), lambda cmd: None, holder="g3-hb-test")
+        d._write_worker_heartbeat()
+        with conn.cursor() as cur:
+            cur.execute("SELECT contract_value, TIMESTAMPDIFF(SECOND, updated_at, NOW()) "
+                        "FROM rag_runtime_contract WHERE contract_key='agent_dispatcher_heartbeat'")
+            row = cur.fetchone()
+        assert row is not None and row[0] == "g3-hb-test" and int(row[1]) <= 5
+        d._write_worker_heartbeat()                      # 同值重写：updated_at 仍刷新
+        with conn.cursor() as cur:
+            cur.execute("SELECT TIMESTAMPDIFF(SECOND, updated_at, NOW()) "
+                        "FROM rag_runtime_contract WHERE contract_key='agent_dispatcher_heartbeat'")
+            assert int(cur.fetchone()[0]) <= 5
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM rag_runtime_contract "
+                        "WHERE contract_key='agent_dispatcher_heartbeat'")
+        conn.close()
