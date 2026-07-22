@@ -120,10 +120,17 @@ def main() -> None:
     ap.add_argument("--batch-wait", default="300", help="BatchWaitTime 秒（批间人工观察窗）")
     ap.add_argument("--commit", action="store_true", help="真执行（默认 dry-run 只打印命令）")
     ap.add_argument("--yes", action="store_true", help="跳过交互确认（仅限演练）")
+    ap.add_argument("--require-digest", action="store_true",
+                    help="δ2（M12.3，默认 off）：要求 --image 含 @sha256:<manifest digest>——"
+                         "tag 可被 registry 端重推（mutable），digest 不可变；digest 取"
+                         " image.yml promotion 产的 attestation-v2.manifest_digest")
     args = ap.parse_args()
 
     if args.commit and not args.app_id:
         ap.error("--commit 需要 --app-id / SAE_APP_ID")
+    if args.require_digest and "@sha256:" not in args.image:
+        ap.error("--require-digest 开启时 --image 必须按 digest 引用"
+                 "（<registry>/<repo>@sha256:…，见 attestation-v2.manifest_digest）")
 
     mode = "COMMIT（真发布）" if args.commit else "DRY-RUN（只打印命令）"
     print(f"══ SAE 灰度发布 ══  app={args.app_id or '<未设>'}  image={args.image}\n"
