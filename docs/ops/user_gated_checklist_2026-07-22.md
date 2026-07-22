@@ -58,8 +58,12 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
    （私有；代码源=**本地仓库**，绝不绑源码自动构建——build 必须走 CI smoke+attestation；
    **镜像版本不可变=开**：tag→digest 映射钉死，同 commit 重推被拒是 feature）；
    **公网入口=开、白名单 0.0.0.0/0**（GH Actions push 只能走公网且 runner IP 段不可白名单化；
-   防护面=私有仓+强密码+不可变 tag+digest 部署；SAE 拉取仍走 VPC 不受影响）；
-   `ACR_PASSWORD` 入 RB-06 轮换族（与钉钉机器人 secret 同批）
+   防护面=私有仓+强密码+不可变 tag+digest 部署；泄凭证最坏面≈读到本就 PUBLIC 的仓+塞可删
+   垃圾 tag，上线被 digest 链堵死；SAE 拉取仍走 VPC 不受影响）；
+   `ACR_PASSWORD` 入 RB-06 轮换族（与钉钉机器人 secret 同批）。
+   **可选收紧（首推跑通后再做，勿今天叠变量）**：①窗口式——平时关公网，promotion 前开
+   绿后关（稀发手工 dispatch 场景代价≈两下点击）；②CI 凭证换 ACR 推拉权限的专用 RAM
+   子用户，主账号凭证不进 GitHub（RAM 分层纪律）
    ——**image.yml promotion 推的是 `${ACR_REGISTRY}/fuling/rag-serving:<sha>`**；若命名空间/仓库
    想用别的名字，告知 Claude 改 image.yml 后再配 secrets。
 2. 控制台「访问凭证」处设固定密码（或用临时 token，注意时效）。
