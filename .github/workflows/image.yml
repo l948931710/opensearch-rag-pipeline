@@ -118,13 +118,21 @@ jobs:
           name: rag-serving-image
           path: out/
       - name: Load + push ACR
+        # secrets 一律经 env 注入（2026-07-22 首推实弹坑）：`${{ secrets.X }}` 内联展开是
+        # **先替换明文再交 shell 解析**——密码含 $/引号/反引号即被 shell 改写，登录送出的
+        # 不是原值（本地 docker login 同凭证成功、CI 恒 401 的形态）。env 变量不经 shell
+        # 二次解析；printf '%s' 免 echo 附加换行歧义。
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: |
           docker load -i out/rag-serving-image.tar
-          test -n "${{ secrets.ACR_REGISTRY }}" || { echo "::error::缺 ACR_REGISTRY secret（user-gated 未配）"; exit 1; }
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ secrets.ACR_REGISTRY }}" \
-            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+          test -n "$ACR_REGISTRY" || { echo "::error::缺 ACR_REGISTRY secret（user-gated 未配）"; exit 1; }
+          printf '%s' "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" \
+            -u "$ACR_USERNAME" --password-stdin
           GIT_SHA=$(python3 -c "import json;print(json.load(open('out/attestation.json'))['git_sha'][:12])")
-          TARGET="${{ secrets.ACR_REGISTRY }}/fuling/rag-serving:${GIT_SHA}"
+          TARGET="$ACR_REGISTRY/fuling/rag-serving:${GIT_SHA}"
           docker tag rag-serving:ci "$TARGET"
           docker push "$TARGET"
           DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$TARGET")
