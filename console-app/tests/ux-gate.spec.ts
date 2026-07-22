@@ -6,95 +6,153 @@ import {
   assertHasWayForward,
   assertBackPreservesData,
   assertDestructiveConfirmed,
-  assertAsyncFeedbackAndNoDoubleSubmit,
   assertErrorHasRecovery,
 } from './ux-gate.helpers';
 
 /**
  * UX 硬门。对应 dispatcher 第 4 步——pass/fail 只由这里判定。
  * 路由已按本项目预填(应用基址 /console/):管理页 = /console/manage,问答页 = /console/。
- * ‼️ 仍需把 getByTestId(...) 换成应用里真实存在的 data-testid,并按注释构造空/错误等状态。
- *    建议给关键元素加稳定的 data-testid,别依赖文案或样式类。
+ * δ4b（M14，2026-07-21）起三组全部真实接线（管理页占位组已替换）——选择器只用源码
+ * 真实存在的 role/label/placeholder/data-testid，全部用例零真后端（page.route mock）。
  */
 
-const ROUTE = '/console/manage'; // 知识库管理页(文档列表 / 删除 / 表单 / 提交)
+// ─────────────────────────────────────────────────────────────────────────────
+// 管理页组（δ4b/M14，Majors 批次 δ，codex 共识 2026-07-21）：原「待管理页 testid
+// 接线」占位组的真实接线替换。进入方式与下方两组同款：?token= 离线登录 + mock
+// /api/kb/whoami（不用 ?preview——authed 请求会被合成 503，page.route 截不到）。
+// 选择器全部用源码真实存在的无障碍 role/label/placeholder 与既有 data-testid，
+// 不再有占位 TODO；全组零真后端（docs 台账走 /api/kb/my-docs mock）。
+// ─────────────────────────────────────────────────────────────────────────────
+test.describe('UX 硬门 — 管理页（文档台账 / 上传）', () => {
+  const DOCS_ROUTE = '/console/manage?token=e2e-fake-token&tab=docs';
 
-// ⚠️ 暂跳过:本组的 getByTestId('primary-action'/'doc-row'/'submit-btn' …) 仍是未接线的 TODO 占位,
-//    且未用 ?token= 离线登录入口 → 会卡「正在登录」。待"管理页 testid 接线"那一轮做完再 .skip→.describe 打开。
-//    现状下 `npm run e2e` 只跑下方已接线的「AI 助手」组(12/12 绿),避免占位用例produce 假红。
-test.describe.skip('UX 硬门 — 目标页面（待管理页 testid 接线）', () => {
-  test('页面打开且控制台/网络干净', async ({ page }) => {
-    const guard = attachConsoleGuard(page, [
-      // /\/api\/health/  // 例:放行已知探针
+  const DOC = (over: Record<string, unknown> = {}) => ({
+    doc_id: 'd1', title: '注塑车间作业指导书', original_filename: 'sop.docx',
+    owner_dept: 'production', permission_level: 'dept_internal',
+    current_version_no: 3, status: 'active', status_badge: '已上线',
+    updated_at: '2026-07-20 10:00', can_manage: true, cited_count: 5, ...over,
+  });
+
+  interface DocsOpts {
+    docs?: object[];            // /api/kb/my-docs items（缺省一行可管理文档）
+    docsStatus?: number;        // 非 2xx 时以该状态码失败（错误态用例）
+  }
+  function mockDocsPage(page: import('@playwright/test').Page, o: DocsOpts = {}) {
+    // catch-all 兜底其余 loaders（形状同批次γ组约定）；专属 mock 后注册者优先。
+    return Promise.all([
+      page.route('**/api/**', (r) => r.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ items: [], questions: [], docs: [], total: 0 }),
+      })),
+      page.route('**/api/kb/whoami', (r) => r.fulfill({
+        contentType: 'application/json', body: JSON.stringify({
+          user_id: 'admin1', display_name: '生产部管理员', role: 'dept_admin',
+          can_manage_kb: true, acl_groups: ['production'], managed_owner_depts: ['production'],
+        }),
+      })),
+      page.route('**/api/kb/my-docs*', (r) => (
+        o.docsStatus
+          ? r.fulfill({ status: o.docsStatus, contentType: 'application/json', body: '{}' })
+          : r.fulfill({ contentType: 'application/json',
+                        body: JSON.stringify({ items: o.docs ?? [DOC()], has_more: false }) })
+      )),
     ]);
-    await page.goto(ROUTE);
+  }
+
+  // 上传 dropzone（整块是一个 button，取其中稳定文案）与台账搜索框
+  const dropzone = (page: import('@playwright/test').Page) =>
+    page.getByRole('button', { name: /点击选择/ });
+
+  test('页面打开且控制台/网络干净', async ({ page }) => {
+    const guard = attachConsoleGuard(page);
+    await mockDocsPage(page);
+    await page.goto(DOCS_ROUTE);
     await page.waitForLoadState('networkidle');
+    await expect(dropzone(page)).toBeVisible();
     guard.assertClean();
   });
 
   test('无整页横向滚动(三个视口都跑)', async ({ page }) => {
-    await page.goto(ROUTE);
+    await mockDocsPage(page);
+    await page.goto(DOCS_ROUTE);
     await page.waitForLoadState('networkidle');
     await assertNoHorizontalScroll(page);
   });
 
   test('关键操作首屏可见', async ({ page }) => {
-    await page.goto(ROUTE);
+    await mockDocsPage(page);
+    await page.goto(DOCS_ROUTE);
     await assertKeyActionsVisible([
-      page.getByTestId('primary-action'), // TODO: 本页最重要的 1~3 个操作
-      // page.getByTestId('pending-items'),
+      dropzone(page),                                        // 本页首要动作：上传入库
+      page.locator('[aria-label="管理台分区"]').getByRole('tab', { name: /文档管理/ }),
     ]);
   });
 
   test('空状态不是死胡同', async ({ page }) => {
-    // TODO: 导航或注入到空数据状态
-    await page.goto(`${ROUTE}?state=empty`);
-    await assertHasWayForward(page, [
-      page.getByRole('button', { name: /新建|创建|去添加|add|create/i }),
-      page.getByRole('link', { name: /返回|back/i }),
-    ]);
+    await mockDocsPage(page, { docs: [] });
+    await page.goto(DOCS_ROUTE);
+    await expect(page.getByText('暂无文档，先上传一篇吧')).toBeVisible();
+    await assertHasWayForward(page, [dropzone(page)]);       // 空台账 → 上传入口就在同屏
   });
 
   test('请求错误态有恢复路径', async ({ page }) => {
-    // TODO: 用 route mock 制造一次接口失败
-    await page.route('**/api/**', (r) => r.fulfill({ status: 500, body: '{}' }));
-    await page.goto(ROUTE);
+    await mockDocsPage(page, { docsStatus: 500 });
+    await page.goto(DOCS_ROUTE);
     await assertErrorHasRecovery({
-      errorRegion: page.getByTestId('error-state'),
-      recoveryAction: page.getByRole('button', { name: /重试|retry/i }),
+      errorRegion: page.getByRole('alert').filter({ hasText: '加载失败' }),
+      recoveryAction: page.getByRole('button', { name: '重试' }),
     });
   });
 
   test('表单返回不丢数据', async ({ page }) => {
-    await page.goto(ROUTE);
-    // TODO: 打开你的表单/抽屉
+    await mockDocsPage(page);
+    await page.goto(DOCS_ROUTE);
+    const zone = page.locator('[aria-label="管理台分区"]');
     await assertBackPreservesData({
-      field: page.getByTestId('doc-name-input'),
+      field: page.getByPlaceholder('如：货代发票审批作业指导书'),
       value: '季度合规审查-临时草稿',
       leaveAndReturn: async () => {
-        await page.getByRole('button', { name: /取消|返回/i }).click();
-        await page.getByTestId('open-form').click(); // 再次打开
+        // 离开 = 切到概览看板（docs 模板整体卸载）；返回 = 切回文档管理。
+        // useKb 表单态是模块级 ref——卸载重挂必须不丢已填内容。
+        await zone.getByRole('tab', { name: /概览看板/ }).click();
+        await zone.getByRole('tab', { name: /文档管理/ }).click();
       },
     });
   });
 
-  test('删除有二次确认且可取消', async ({ page }) => {
-    await page.goto(ROUTE);
-    const firstRow = page.getByTestId('doc-row').first();
+  test('删除（退役）有二次确认且可取消', async ({ page }) => {
+    await mockDocsPage(page);
+    await page.goto(DOCS_ROUTE);
+    // 行操作收敛在「更多操作」菜单（2026-07-19 重设计）——先展开再点退役
+    await page.getByTestId('doc-more').first().click();
     await assertDestructiveConfirmed({
       page,
-      trigger: firstRow.getByRole('button', { name: /删除|移除/i }),
-      rowStillThere: firstRow,
+      trigger: page.getByRole('menuitem', { name: '退役下线' }),
+      rowStillThere: page.getByText('注塑车间作业指导书'),
     });
   });
 
   test('提交有反馈且防重复提交', async ({ page }) => {
-    await page.goto(ROUTE);
-    // TODO: 定位你的提交按钮与 loading 指示
-    await assertAsyncFeedbackAndNoDoubleSubmit({
-      submit: page.getByTestId('submit-btn'),
-      loadingIndicator: page.locator('[aria-busy="true"], [data-loading="true"]'),
+    await mockDocsPage(page);
+    // 上传链首跳 /api/kb/upload-url 慢响应：uploadBusy 窗口内按钮必须切「上传中…」并禁用
+    //（防双击重复提交）；随后 500 收尾——按钮回可用（用户可改后重试，反馈闭环）。
+    await page.route('**/api/kb/upload-url', async (route) => {
+      await new Promise((r) => setTimeout(r, 1500));
+      await route.fulfill({ status: 500, contentType: 'application/json', body: '{}' });
     });
+    await page.goto(DOCS_ROUTE);
+    await page.locator('input[type=file]').setInputFiles({
+      name: 'sop-v4.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 e2e'),
+    });
+    // 归属下拉限定在上传区（#kb-sec-upload）内取——包裹式 <label> 的可及名携带选项文本，
+    // getByLabel 文本匹配对它不稳定；台账筛选区另有「按归属部门筛选」下拉会撞子串。
+    await page.locator('#kb-sec-upload').getByRole('combobox').first()
+      .selectOption('production');
+    await page.getByRole('button', { name: /^上传$/ }).click();
+    await expect(page.getByRole('button', { name: '上传中…' }),
+      '异步提交应有 loading 反馈且按钮禁用（防重复提交）').toBeDisabled();
+    await expect(page.getByRole('button', { name: /^上传$/ }),
+      '失败收尾后按钮应恢复可用（可重试，非死胡同）').toBeEnabled({ timeout: 10000 });
   });
 });
 
