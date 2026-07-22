@@ -42,10 +42,22 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
 
 | # | 项 | 做什么 | 验证 |
 |---|---|---|---|
-| D1 | push 时点拍板 | main（origin+11）/ op0（origin+27）推送 | push 后 **image / stress(push) / frontend-e2e** 三 workflow 首跑绿（M12/M11/M14 的 CI 实跑验证正是此刻） |
-| D2 | ACR secrets | repo secrets：`ACR_REGISTRY`/`ACR_USERNAME`/`ACR_PASSWORD` | promotion job 缺 secret 会显式红（不静默） |
-| D3 | environment 保护 | GitHub Settings→Environments→`acr-promotion` 加 required reviewers | 无保护规则时 promotion 仍需手工 dispatch+push_acr=true，但少一道人审门 |
+| D1 | ~~push 时点拍板~~ | ✅ 07-22 完成：main=dc6f54c / op0=793dc89 | ✅ 七 workflow 全绿（stress 首跑抓出 S7 门自 B5 失效→793dc89 修复重跑绿） |
+| D2 | ACR secrets | **前置：ACR 实例还没建**（仓内无 registry 记录、aliyun CLI 凭证未配）。runbook 见下方 D2 附注 | promotion job 缺 secret 会显式红（不静默） |
+| D3 | ~~environment 保护~~ | ✅ 07-22 完成：`acr-promotion` 已建，required_reviewers=l948931710（prevent_self_review=false——单人仓须能自批，有意） | ✅ `gh api .../environments/acr-promotion` 回读 rules 确认 |
 | D4 | branch protection | main 分支保护 UI（B7 族遗留） | — |
+
+**D2 附注（Sam 亲手 runbook，凭证绝不经聊天/仓库）**：
+1. 阿里云容器镜像服务控制台 → 建实例（个人版免费够用）→ 命名空间 `fuling` → 仓库 `rag-serving`
+   ——**image.yml promotion 推的是 `${ACR_REGISTRY}/fuling/rag-serving:<sha>`**；若命名空间/仓库
+   想用别的名字，告知 Claude 改 image.yml 后再配 secrets。
+2. 控制台「访问凭证」处设固定密码（或用临时 token，注意时效）。
+3. 本机终端逐条执行（`gh` 会交互式提示输入值，值不进 shell 历史也不进对话记录）：
+   `gh secret set ACR_REGISTRY`（值=实例公网域名，形如 `crpi-xxx.cn-chengdu.personal.cr.aliyuncs.com`）、
+   `gh secret set ACR_USERNAME`、`gh secret set ACR_PASSWORD`。
+4. 验证：`gh secret list` 见三条 → workflow_dispatch image.yml 勾 `push_acr=true` → environment
+   审批放行 → promotion 绿 + attestation-v2 工件含 manifest digest（顺手把 digest 记进
+   canary `--require-digest` 首用）。
 
 ## E. Agent 面（op0 部署形态；组织 gate 未签前不动播种）
 
