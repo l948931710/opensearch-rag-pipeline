@@ -93,13 +93,16 @@ docs/            # 环境设计 / 架构审查 / 性能 backlog 等
 | 包 | 用途 | 打法 |
 |---|---|---|
 | `opensearch_sae_rag.zip` | SAE 服务侧 | zip 根 = `requirements.txt`(必须) + `opensearch_pipeline/`(含 webconsole/next-dist，**打包前先 `cd console-app && npm run build`**) + `Dockerfile` + `pyproject.toml` + `.dockerignore`；无 pyc/.env/tests |
-| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装）。**B4 起用 `deploy/build_dataworks_zip.sh` 构建**：自动附 build_info.json + 生成 `.zip.sha256` sidecar（上传为同名 File 资源，节点硬校验——**换 zip 必须同步换 sidecar**） |
+| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装）。**B4 起用 `deploy/build_dataworks_zip.sh` 构建**：自动附 build_info.json + 生成 `.zip.sha256` sidecar（上传为同名 File 资源，节点做 sha256 校验——**摘要不一致才阻断；sidecar 缺失/不可读则过渡期放行 fail-open**，见 `tests/test_dataworks_supply_chain.py`；换 zip 请同步换 sidecar） |
 
 **铁律**：一律打到 `~/Downloads/dw_upload_<YYYYMMDD>[_<purpose>]/`（勿打 repo 根）；部署时
 **按 SIZE/SHA-256 认包，别按文件名**（每个日期目录里文件名都一样，选错目录 = 静默部署旧版）。
-SAE 启动命令在应用配置里（**默认态**保持 `--workers 1`：会话/限流默认进程内。多副本
-**能力已备**——Redis 四态后端 + durable dispatch（PR-3）+ `RAG_EXPECTED_REPLICAS` 声明，
-配置不完整会被拓扑守卫启动拦截）。
+SAE 启动命令在应用配置里（`--workers 1`：会话/限流/去重/token 缓存均进程内内存，**本分支
+（main）无 Redis 后端、无 durable dispatch、无 `RAG_EXPECTED_REPLICAS` 拓扑守卫——单副本部署**。
+多副本能力（Redis 四态后端 + durable dispatch + 拓扑守卫启动拦截）在 agent 分支
+`claude/ontology-p0`，随该分支上生产时才生效）。**注**：production/staging 启动强制
+`RAG_REQUIRE_AUTH` + `RAG_ACL_FAIL_CLOSED`（缺则拒启，过渡逃生口=当日
+`RAG_ALLOW_LEGACY_OPEN_PROD=ack:<YYYY-MM-DD>`；见 `docs/environment_design.md` §2.1）。
 
 ## 更多
 
