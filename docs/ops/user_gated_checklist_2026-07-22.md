@@ -43,7 +43,7 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
 | # | 项 | 做什么 | 验证 |
 |---|---|---|---|
 | D1 | ~~push 时点拍板~~ | ✅ 07-22 完成：main=dc6f54c / op0=793dc89 | ✅ 七 workflow 全绿（stress 首跑抓出 S7 门自 B5 失效→793dc89 修复重跑绿） |
-| D2 | ACR secrets | **前置：ACR 实例还没建**（仓内无 registry 记录、aliyun CLI 凭证未配）。runbook 见下方 D2 附注 | promotion job 缺 secret 会显式红（不静默） |
+| D2 | ~~ACR secrets~~ | ✅ 07-22 完成：经济版实例 `fuling`（杭州）+命名空间/仓库+三 secrets；**首次 promotion 端到端成功**（run 29964943326，git 589149a）。首镜像 digest=`sha256:2bf08ef21d0ebfac4c36dba7175ab25de76f6a292c80b46bc17f05e080feaf62`（attestation-v2 归档于该 run 工件，canary `--require-digest` 首用即引它） | ✅ 四段实弹排障史（白名单 /0 拒→两 /1；-vpc 域名→公网；secrets 内联展开→env 注入；密码粘贴错值→剪贴板同源法）全记 D2 附注 |
 | D3 | ~~environment 保护~~ | ✅ 07-22 完成：`acr-promotion` 已建，required_reviewers=l948931710（prevent_self_review=false——单人仓须能自批，有意） | ✅ `gh api .../environments/acr-promotion` 回读 rules 确认 |
 | D4 | branch protection | main 分支保护 UI（B7 族遗留）；⚠️ Free 档仅公开仓可用——若 D5 转私有须随 Pro 一起解 | — |
 | D5 | 仓库转私有（Sam 决策 pending，07-22 重提） | **一揽子做，缺一不可**：①买 GitHub Pro（否则 acr-promotion environment 审批门在私有仓**静默失效**、D4 也做不了）②Claude 改 image.yml 工件策略（docker tar 几百 MB×14 天按公开仓免费额度设计，私有仓配额会爆——改按需产出/短 retention）③首月盯 Actions 分钟用量（私有仓设限，stress 单跑 11min）。如实注记：转私有不追溯，公开期副本/缓存收不回 | 转后 dispatch 一次 promotion 验证审批门仍拦人 |
@@ -76,6 +76,10 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
    必超时/401**；页面上方「专有网络｜公网｜经典网络」切到**公网**才拿到对的域名）、
    `gh secret set ACR_USERNAME`（=登录名 `LaiJunchen@1418897636821379`）、`gh secret set ACR_PASSWORD`。
    自证凭证：本机 `docker login <公网域名>` 出 `Login Succeeded` 再配 secret。
+   ⚠️ 07-22 又一实测坑：**手输能登 ≠ 剪贴板/secret 里是同一串**——最终 401 根因就是 secret
+   粘贴了错值。**剪贴板同源法**闭环：`pbpaste | docker login … --password-stdin` 绿了之后
+   **同一份剪贴板** `pbpaste | gh secret set ACR_PASSWORD`（两命令读同一字节，杜绝手输漂移）；
+   密码轮换（RB-06）时照此流程。
 4. 验证：`gh secret list` 见三条 → workflow_dispatch image.yml 勾 `push_acr=true` → environment
    审批放行 → promotion 绿 + attestation-v2 工件含 manifest digest（顺手把 digest 记进
    canary `--require-digest` 首用）。
