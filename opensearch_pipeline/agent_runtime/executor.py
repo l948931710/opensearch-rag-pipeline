@@ -339,6 +339,14 @@ class ThreadedRunExecutor:
             # fail-closed（_budget_snapshot 抛 RunRejected），此时 claimed 仍 True，走回边
             # suspended 保住可重试；接手后才抛会把已批 run 打成 failed（审批凭据白耗）。
             base = self._budget_snapshot(run_id, fallback_turns=int(state.get("turn", 0)) + 1)
+            # γ1（M9.1）：播种既有活跃耗时累计（失败侧 QA 行的累计口径用；成功侧由完成
+            # 事务锁内权威计算不依赖它）。fail-open：读不到按 0，QA 行退化本腿 monotonic。
+            try:
+                _ral = getattr(self._store, "read_active_latency", None)
+                if _ral is not None:
+                    base["active_latency_ms"] = int(_ral(run_id) or 0)
+            except Exception:   # noqa: BLE001 — 观测播种绝不阻断 resume
+                pass
             if not self._store.transition(run_id, "resuming", "running"):      # ③ 接手
                 raise RunRejected(f"run {run_id} resuming→running 失败（并发/迟到）")
             claimed = False                               # 已交棒 running：失败恢复归驱动器
@@ -499,6 +507,16 @@ class ThreadedRunExecutor:
         max_turns = ctx.budget.max_turns
         max_tool_calls = ctx.budget.max_tool_calls
         token_budget = ctx.budget.token_budget
+        # γ1（M9.1，Majors 批次 γ，codex 共识 2026-07-21）：本执行腿活跃计时——腿结束
+        # （挂起/全部终态）把 delta 随各自 CAS 同事务累进 agent_run.active_latency_ms
+        # （054）。_base_active=resume 播种的既有累计（submit 腿=0），仅供失败侧 QA 行
+        # 的累计口径（成功侧累计由完成事务锁内权威计算）。
+        _leg_t0 = time.monotonic()
+        _base_active = int((base or {}).get("active_latency_ms") or 0)
+
+        def _leg_ms() -> int:
+            return max(0, int((time.monotonic() - _leg_t0) * 1000))
+
         # R2：秒级后台心跳 + Stage D durable cancel 轮询（见方法注）
         hb_stop = self._start_heartbeat_ticker(run_id, ctx, handle=handle)
         try:
@@ -525,23 +543,28 @@ class ThreadedRunExecutor:
                         # perf 批次 C §4.5：心跳+step+预算 单事务合并（fail-open，回退分段写）
                         self._record_turn(run_id, ev.turn_index, usage=ev.usage, ctx=ctx)
                         if turns_counted > max_turns:
-                            self._fail_over_budget(run_id, gen, handle, f"turns 预算超限（>{max_turns}）")
+                            self._fail_over_budget(run_id, gen, handle, f"turns 预算超限（>{max_turns}）",
+                                               active_ms=_leg_ms(), base_active_ms=_base_active)
                             break
                         if tokens_used > token_budget:
                             self._fail_over_budget(run_id, gen, handle,
-                                                   f"token 预算超限（>{token_budget}）")
+                                                   f"token 预算超限（>{token_budget}）",
+                                                   active_ms=_leg_ms(),
+                                                   base_active_ms=_base_active)
                             break
                         # deadline 真比较（此前 is_past_deadline 全链零调用点=deadline 形同虚设；
                         # resume 语义=每个活跃执行段一个新窗口，见 routes._requester_ctx 注）
                         if ctx.budget.is_past_deadline(datetime.now(timezone.utc)):
-                            self._fail_over_budget(run_id, gen, handle, "run deadline 超时")
+                            self._fail_over_budget(run_id, gen, handle, "run deadline 超时",
+                                               active_ms=_leg_ms(), base_active_ms=_base_active)
                             break
                     handle._emit(ev)                                    # trace/SSE tool_call 帧
                     if handle.cancelled():
                         gen.close()
                         # R1（RB-RT-02）：durable-first（同主循环取消位点）
                         self._terminal_fail_durable(run_id, handle, "用户取消",
-                                                    to="cancelled", notify=False)
+                                                    to="cancelled", notify=False,
+                                                    active_ms=_leg_ms())
                         break
                     # tool_calls 预算：消费后超限即 fail-closed（在 adjudicate 执行副作用**之前**拦住）
                     tool_calls_used += 1
@@ -616,13 +639,15 @@ class ThreadedRunExecutor:
                         ctx, run_id, ev,
                         budget_counts={"turns": turns_counted,
                                        "tool_calls": tool_calls_used,
-                                       "tokens": tokens_used})
+                                       "tokens": tokens_used},
+                        active_ms=_leg_ms())   # γ1：挂起腿延迟随同一事务累计
                     if not transitioned and not self._transition_checked(run_id, "running", "suspended"):
                         # RR-1（RB-RR-01）：durable-first（此前 emit-first）——D3 归属栅栏
                         # 语义由 helper 承接（CAS 赢才 emit+notify；落空按事实/闭嘴）。
                         self._terminal_fail_durable(run_id, handle,
                                                     "挂起状态落库失败，请重试",
-                                                    retryable=True)
+                                                    retryable=True, active_ms=_leg_ms(),
+                                                    base_active_ms=_base_active)
                         break
                     handle._emit(RunSuspended(approval_request_id=aid, checkpoint_id=cp_id,
                                               pending_call=ev.pending_call, turn_index=ev.turn_index))
@@ -646,12 +671,15 @@ class ThreadedRunExecutor:
                     tokens_used += ev.usage.total
                     if tokens_used > token_budget:
                         self._fail_over_budget(run_id, gen, handle,
-                                               f"token 预算超限（>{token_budget}，最终轮后判）")
+                                               f"token 预算超限（>{token_budget}，最终轮后判）",
+                                               active_ms=_leg_ms(), base_active_ms=_base_active)
                         break
                     if ctx.budget.is_past_deadline(datetime.now(timezone.utc)):
-                        self._fail_over_budget(run_id, gen, handle, "run deadline 超时（最终轮后判）")
+                        self._fail_over_budget(run_id, gen, handle, "run deadline 超时（最终轮后判）",
+                                               active_ms=_leg_ms(), base_active_ms=_base_active)
                         break
-                    self._complete_run(run_id, handle, ev, retrieved_chunks)
+                    self._complete_run(run_id, handle, ev, retrieved_chunks,
+                                       active_ms=_leg_ms(), base_active_ms=_base_active)
                     break
                 if isinstance(ev, RunFailed):
                     # R1（RB-RT-02）durable-first：先赢 CAS 再对外宣告——emit 挪进
@@ -659,7 +687,8 @@ class ThreadedRunExecutor:
                     # D3 fencing 语义保留：失去所有权不落失败侧回调（helper 内 notify 门控）。
                     self._terminal_fail_durable(
                         run_id, handle, ev.error,
-                        retryable=bool(getattr(ev, "retryable", False)))
+                        retryable=bool(getattr(ev, "retryable", False)),
+                        active_ms=_leg_ms(), base_active_ms=_base_active)
                     break
                 handle._emit(ev)
                 if handle.cancelled():
@@ -667,7 +696,8 @@ class ThreadedRunExecutor:
                     # R1（RB-RT-02）：取消同走 durable-first（此前 _safe_transition 吞错
                     # 后无条件 emit）。cancel 事件历来不走失败侧回调 → notify=False。
                     self._terminal_fail_durable(run_id, handle, "用户取消",
-                                                to="cancelled", notify=False)
+                                                to="cancelled", notify=False,
+                                                active_ms=_leg_ms())
                     break
                 ev = next(gen)
         except StopIteration:
@@ -679,9 +709,11 @@ class ThreadedRunExecutor:
             # 诚实落 failed（R1 RB-RT-02：durable-first，先 CAS 后宣告）。
             self._terminal_fail_durable(run_id, handle,
                                         "loop 生成器未发终态事件即结束（协议违约）",
-                                        retryable=True)
+                                        retryable=True, active_ms=_leg_ms(),
+                                        base_active_ms=_base_active)
         except Exception as e:   # noqa: BLE001 — run 内部异常不外泄，durable-first 落 failed
-            self._terminal_fail_durable(run_id, handle, str(e))
+            self._terminal_fail_durable(run_id, handle, str(e),
+                                        active_ms=_leg_ms(), base_active_ms=_base_active)
         finally:
             hb_stop.set()
             if run_id:
@@ -711,7 +743,8 @@ class ThreadedRunExecutor:
             self._release()
 
     def _complete_run(self, run_id: Optional[str], handle: RunHandle,
-                      ev: RunCompleted, retrieved: Optional[list]) -> None:
+                      ev: RunCompleted, retrieved: Optional[list],
+                      active_ms: Optional[int] = None, base_active_ms: int = 0) -> None:
         """P0-01（unknown-unknowns 批次1）完成真值：durable 答案写与 running→succeeded
         **同一事务**（run_store.complete_run_atomic + handle._on_complete_durable 游标回调），
         此前 succeeded 先 commit、答案写在回调里 best-effort 被吞——durable 说「成功」而
@@ -725,15 +758,25 @@ class ThreadedRunExecutor:
           见 2026-07 重审计 §1——CAS 先于答案落库不是缺陷而是所有权证明，本修复把
           答案写**并入** CAS 事务而非调换顺序）。
         store 无 complete_run_atomic（简化测试桩）→ 回退旧序：CAS → durable 回调以
-        cur=None 调用（best-effort，桩环境无原子性可言）→ 缓存回调。"""
+        cur=None 调用（best-effort，桩环境无原子性可言）→ 缓存回调。
+        γ1（M9.1）：active_ms=本腿活跃毫秒——传 store 随完成事务累计；writer 收
+        store 锁内算出的累计值（None=054 未 apply/旧 store → 回退 base+本腿）。"""
         if hasattr(self._store, "complete_run_atomic"):
             writer = handle._on_complete_durable
             extra = None
             if writer is not None:
-                def extra(cur):   # noqa: E306
-                    writer(cur, ev.final_text, retrieved)
+                _fallback_total = int(base_active_ms) + int(active_ms or 0)
+
+                def extra(cur, active_total_ms=None):   # noqa: E306
+                    _total = (active_total_ms if active_total_ms is not None
+                              else _fallback_total)
+                    self._call_durable_writer(writer, cur, ev.final_text, retrieved, _total)
             try:
-                ok = self._store.complete_run_atomic(run_id, extra_writer=extra)
+                try:
+                    ok = self._store.complete_run_atomic(run_id, extra_writer=extra,
+                                                         active_ms=active_ms)
+                except TypeError:      # 旧签名 store（测试桩）：无 active_ms——维持旧语义
+                    ok = self._store.complete_run_atomic(run_id, extra_writer=extra)
             except Exception as e:   # noqa: BLE001 — durable 答案写失败：诚实落 failed
                 logger.error("run %s 最终答案落库失败——落 failed，绝不发 done（P0-01）",
                              run_id, exc_info=True)
@@ -743,7 +786,7 @@ class ThreadedRunExecutor:
                 self._terminal_fail_durable(
                     run_id, handle,
                     f"最终答案落库失败，请重试（answer_persist_failed）: {str(e)[:200]}",
-                    retryable=True)
+                    retryable=True, active_ms=active_ms, base_active_ms=base_active_ms)
                 return
             if ok:
                 # R3（P2-RT-21）：durable 已 commit → **先发终态帧再跑缓存性回调**——
@@ -759,11 +802,12 @@ class ThreadedRunExecutor:
                 self._declare_terminal_lost(run_id, handle)
             return
         # 旧路径（测试桩）：CAS 成立后 durable 回调降级为 best-effort（无事务缝可用）
-        if self._transition_checked(run_id, "running", "succeeded"):
+        if self._transition_checked(run_id, "running", "succeeded", active_ms=active_ms):
             writer = handle._on_complete_durable
             if writer is not None:
                 try:
-                    writer(None, ev.final_text, retrieved)
+                    self._call_durable_writer(writer, None, ev.final_text, retrieved,
+                                              int(base_active_ms) + int(active_ms or 0))
                 except Exception:   # noqa: BLE001
                     logger.warning("run %s durable 完成回调失败（桩路径 best-effort）",
                                    run_id, exc_info=True)
@@ -792,6 +836,23 @@ class ThreadedRunExecutor:
                         run_id, actual or "unknown")
 
     @staticmethod
+    def _call_durable_writer(writer, cur, final_text, retrieved, active_total_ms) -> None:
+        """γ1：durable 完成写手四参兼容——能收 (cur, final_text, retrieved, active_total_ms)
+        的给四参；既有三参写手照旧。签名探测失败按三参处理（_notify_complete 先例）。"""
+        four_arg = False
+        try:
+            import inspect
+            params = inspect.signature(writer).parameters
+            four_arg = (len(params) >= 4
+                        or any(p.kind == p.VAR_POSITIONAL for p in params.values()))
+        except (TypeError, ValueError):
+            four_arg = False
+        if four_arg:
+            writer(cur, final_text, retrieved, active_total_ms)
+        else:
+            writer(cur, final_text, retrieved)
+
+    @staticmethod
     def _notify_complete(handle: RunHandle, ev: RunCompleted,
                          retrieved: Optional[list] = None) -> None:
         """retrieved=本执行段各检索批次的 chunks artifacts（P0-A sources 落库）。
@@ -818,20 +879,35 @@ class ThreadedRunExecutor:
             logging.getLogger(__name__).warning("run on_complete 回调失败", exc_info=True)
 
     @staticmethod
-    def _notify_failure(handle: RunHandle, error: str) -> None:
-        """失败侧回调（qa_session_log AGENT_ERROR 行等运维可观测挂点）。fail-open。"""
+    def _notify_failure(handle: RunHandle, error: str,
+                        active_total_ms: Optional[int] = None) -> None:
+        """失败侧回调（qa_session_log AGENT_ERROR 行等运维可观测挂点）。fail-open。
+        γ1：能收第二参（active_total_ms 累计口径）的给两参；既有单参回调照旧
+        （_notify_complete 同款签名探测）。"""
         cb = handle._on_failure
         if cb is None:
             return
         try:
-            cb(error)
+            two_arg = False
+            try:
+                import inspect
+                params = inspect.signature(cb).parameters
+                two_arg = (len(params) >= 2
+                           or any(p.kind == p.VAR_POSITIONAL for p in params.values()))
+            except (TypeError, ValueError):
+                two_arg = False
+            if two_arg:
+                cb(error, active_total_ms)
+            else:
+                cb(error)
         except Exception:   # noqa: BLE001
             import logging
             logging.getLogger(__name__).warning("run on_failure 回调失败", exc_info=True)
 
     def _persist_suspend(self, ctx: ExecutionContext, run_id: Optional[str],
                          ev: RunSuspended,
-                         budget_counts: Optional[dict] = None) -> tuple:
+                         budget_counts: Optional[dict] = None,
+                         active_ms: Optional[int] = None) -> tuple:
         """挂起持久化：encode loop 带来的状态（messages+pending_call+remaining_calls）；
         写 approval_request（schema/025，接了 approval_store 时 **fail-closed**——写不成即抛，
         调用方把 run 落 failed，绝不产生审批队列不可见的黑洞 run）；记 approval agent_step
@@ -868,12 +944,21 @@ class ThreadedRunExecutor:
                     run_id, blob, digest,
                     step_payload={"pending_call": pc, "approval_request_id": aid},
                     extra_writer=extra,
-                    budget_counts=budget_counts)   # R2 P1-RT-06：权威计数随挂起同事务
-            except TypeError:                      # 旧签名 store（测试桩）：无预算参数
-                cp_id, ok = self._store.suspend_run_atomic(
-                    run_id, blob, digest,
-                    step_payload={"pending_call": pc, "approval_request_id": aid},
-                    extra_writer=extra)
+                    budget_counts=budget_counts,   # R2 P1-RT-06：权威计数随挂起同事务
+                    active_ms=active_ms)           # γ1：挂起腿延迟同事务累计
+            except TypeError:
+                # 旧签名 store（测试桩）逐级降参：先去 active_ms，再去 budget_counts
+                try:
+                    cp_id, ok = self._store.suspend_run_atomic(
+                        run_id, blob, digest,
+                        step_payload={"pending_call": pc, "approval_request_id": aid},
+                        extra_writer=extra,
+                        budget_counts=budget_counts)
+                except TypeError:
+                    cp_id, ok = self._store.suspend_run_atomic(
+                        run_id, blob, digest,
+                        step_payload={"pending_call": pc, "approval_request_id": aid},
+                        extra_writer=extra)
             return cp_id, aid, ok
 
         cp_id = self._store.save_checkpoint(run_id, blob, digest)
@@ -1106,9 +1191,17 @@ class ThreadedRunExecutor:
         return bool(getattr(self._pool, "_shutdown", False)
                     or getattr(self._pool, "_broken", False))
 
-    def _transition_checked(self, run_id: Optional[str], frm: str, to: str) -> bool:
-        """关键迁移（如 running→suspended）：CAS False 或 DB 异常都返回 False，由调用方处置。"""
+    def _transition_checked(self, run_id: Optional[str], frm: str, to: str,
+                            active_ms: Optional[int] = None) -> bool:
+        """关键迁移（如 running→suspended）：CAS False 或 DB 异常都返回 False，由调用方处置。
+        γ1：active_ms 只在真 store（新签名）转发——终态 CAS 同事务累计；旧桩 TypeError
+        降级无参调用。"""
         try:
+            if active_ms is not None:
+                try:
+                    return bool(self._store.transition(run_id, frm, to, active_ms=active_ms))
+                except TypeError:
+                    pass                      # 旧签名桩：退无 active_ms 调用
             return bool(self._store.transition(run_id, frm, to))
         except Exception:   # noqa: BLE001
             return False
@@ -1125,7 +1218,9 @@ class ThreadedRunExecutor:
 
     def _terminal_fail_durable(self, run_id: Optional[str], handle: RunHandle, error: str,
                                *, to: str = "failed", retryable: bool = False,
-                               notify: bool = True, frm: str = "running") -> bool:
+                               notify: bool = True, frm: str = "running",
+                               active_ms: Optional[int] = None,
+                               base_active_ms: int = 0) -> bool:
         """R1（RB-RT-02）终态 durable-first 统一协议：**先赢 CAS 再对外宣告**——
         此前失败/取消/预算路径先 emit 后落库（与成功路径 P0-01 的 durable-first
         不对称），CAS 落空/写失败被吞时客户端已见终态、库里还是 running（双真相；
@@ -1135,11 +1230,15 @@ class ThreadedRunExecutor:
           **闭嘴**；现状=其它终态 ⇒ 按 DB 事实幂等宣告（SSE 不悬挂、内容与库一致）；
           现状=非终态/读不到 ⇒ **不宣告任何终态**（critical 留痕，交 reaper/对账——
           「没消息」诚实于「假终态」），返回 False。"""
-        if self._transition_checked(run_id, frm, to):
+        if self._transition_checked(run_id, frm, to, active_ms=active_ms):
             handle._emit(RunFailed(error=error, retryable=retryable))
             handle._relay_terminal = True          # RR-HA-01：CAS 胜者获封流资格
             if notify:
-                self._notify_failure(handle, error)
+                # γ1：失败侧 QA 行传累计口径（base=resume 播种既有累计；054 缺列时
+                # base=0 ⇒ 本腿 monotonic，仍>0）
+                self._notify_failure(handle, error,
+                                     int(base_active_ms) + int(active_ms or 0)
+                                     if active_ms is not None else None)
             return True
         actual = self._read_run_status(run_id)
         if actual == "succeeded":
@@ -1157,14 +1256,16 @@ class ThreadedRunExecutor:
                         run_id, to, (error or "")[:120], actual or "unknown")
         return False
 
-    def _fail_over_budget(self, run_id: Optional[str], gen, handle: RunHandle, msg: str) -> None:
+    def _fail_over_budget(self, run_id: Optional[str], gen, handle: RunHandle, msg: str,
+                          active_ms: Optional[int] = None, base_active_ms: int = 0) -> None:
         """预算超限 fail-closed：关生成器 + durable-first 落 failed（RB-RT-02 统一协议）。
         D3：失败侧回调经 checked CAS 门控（失去所有权=purge/收尸/取消抢先 → 不落库）。"""
         try:
             gen.close()
         except Exception:   # noqa: BLE001
             pass
-        self._terminal_fail_durable(run_id, handle, msg)
+        self._terminal_fail_durable(run_id, handle, msg,
+                                    active_ms=active_ms, base_active_ms=base_active_ms)
 
     def _safe_transition(self, run_id: Optional[str], frm: str, to: str) -> None:
         try:

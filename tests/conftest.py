@@ -182,6 +182,7 @@ _LOCAL_STACK_SERIAL_MODULES = {
     "test_agent_dispatch_bind_db.py",     # R1 反向锚真库并发（agent_run DML+幂等 ALTER）
     "test_majors_alpha_m4_db.py",         # α3 幂等键真库并发（agent_run DML，uk_run_client_req）
     "test_majors_alpha_m6_db.py",         # α5 配额哨兵真库并发（approval_request DML+行锁）
+    "test_majors_gamma_m9_db.py",         # γ1 延迟累计真库契约（agent_run DML+CAS 事务）
     "test_classification.py", # RDS 集成用例
     "test_image_funnel.py",   # RDS 集成用例
     "test_simulate_prod_guard.py",  # 操纵 prod-guard/config 全局态

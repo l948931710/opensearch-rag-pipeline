@@ -109,6 +109,47 @@ def _note_bookkeeping_col_missing() -> None:
                        "降级 legacy 无列路径（warn-once；apply 后重启进程恢复）")
 
 
+# ── γ1（M9.1，Majors 批次 γ，codex 共识 2026-07-21）：活跃执行耗时累计（schema/054）──
+
+_ACTIVE_LATENCY_COL_MISSING = False   # 054 未 apply 的进程内负缓存（warn-once）
+
+
+def _is_active_latency_unknown_col(exc: BaseException) -> bool:
+    """054 未 apply：1054 且错误文本点名 active_latency_ms 才算——其余 1054 原样上抛
+    （α2 _is_bookkeeping_unknown_col 同款精度约束）。"""
+    txt = str(exc)
+    if "active_latency_ms" not in txt:
+        return False
+    args = getattr(exc, "args", None) or ()
+    return (bool(args) and args[0] == 1054) or "Unknown column" in txt
+
+
+def _note_active_latency_col_missing() -> None:
+    global _ACTIVE_LATENCY_COL_MISSING
+    if not _ACTIVE_LATENCY_COL_MISSING:
+        _ACTIVE_LATENCY_COL_MISSING = True
+        logger.warning("agent_run.active_latency_ms 缺列（schema/054 未 apply）——延迟累计"
+                       "跳过（warn-once；QA 行回退本腿 monotonic，apply 后重启进程恢复）")
+
+
+def _call_extra_writer(writer, cur, active_total_ms) -> None:
+    """γ1：完成回调双形态兼容——能收第二参（(cur, active_total_ms)）的给两参；既有
+    单参回调（历史测试/简化桩）照旧只给 cur。签名探测失败按单参处理
+    （executor._notify_complete 先例）。"""
+    two_arg = False
+    try:
+        import inspect
+        params = inspect.signature(writer).parameters
+        two_arg = (len(params) >= 2
+                   or any(p.kind == p.VAR_POSITIONAL for p in params.values()))
+    except (TypeError, ValueError):
+        two_arg = False
+    if two_arg:
+        writer(cur, active_total_ms)
+    else:
+        writer(cur)
+
+
 class DispatchCommandBound(RuntimeError):
     """R1（RB-RT-01）：该 dispatch 命令已有 run——uk_run_dispatch_cmd（schema/052）撞
     1062。恢复扫描与快路径并发双建时由 DB 裁决单赢家；输家凭
@@ -593,12 +634,16 @@ class RDSRunStore:
     def suspend_run_atomic(self, run_id: str, state_blob: bytes, state_digest: str,
                            step_payload: Optional[Dict[str, Any]] = None,
                            extra_writer=None,
-                           budget_counts: Optional[Dict[str, int]] = None) -> "tuple":
+                           budget_counts: Optional[Dict[str, int]] = None,
+                           active_ms: Optional[int] = None) -> "tuple":
         """P0-E（重评报告 §5E）：挂起持久化**单事务**——checkpoint + approval_request
         （extra_writer 游标回调，approval_store.insert_request）+ approval agent_step +
         running→suspended CAS 一次 commit。此前四段分事务：中途崩溃留下「有 checkpoint 无
         审批行」「有审批行 run 仍 running」等半态。返回 (checkpoint_id, ok)——ok=False 表示
-        run 已不在 running（并发取消/失败），**未提交任何写**；任何一步异常整体回滚后抛出。"""
+        run 已不在 running（并发取消/失败），**未提交任何写**；任何一步异常整体回滚后抛出。
+        γ1（M9.1）：active_ms=本执行腿活跃毫秒——随 CAS 同事务
+        `active_latency_ms=COALESCE(...)+delta` 累计（054 未 apply → 1054 摘除重试，
+        语句级错误不劈 InnoDB 事务，qa_logger 1054 阶梯同理）。"""
         cp_id = uuid.uuid4().hex
         db = _op_db()
         conn = self._conn()
@@ -640,9 +685,23 @@ class RDSRunStore:
                         (int(budget_counts.get("turns") or 0),
                          int(budget_counts.get("tool_calls") or 0),
                          int(budget_counts.get("tokens") or 0), run_id))
-                cur.execute(
-                    f"UPDATE {db}.agent_run SET status='suspended', heartbeat_at=NOW(3) "
-                    "WHERE run_id=%s AND status='running'", (run_id,))
+                _al_delta = (int(active_ms) if (active_ms and not _ACTIVE_LATENCY_COL_MISSING)
+                             else None)
+                if _al_delta is not None:
+                    try:
+                        cur.execute(
+                            f"UPDATE {db}.agent_run SET status='suspended', heartbeat_at=NOW(3), "
+                            "active_latency_ms=COALESCE(active_latency_ms,0)+%s "
+                            "WHERE run_id=%s AND status='running'", (_al_delta, run_id))
+                    except Exception as _ae:   # noqa: BLE001 — 仅 054 缺列摘除重试
+                        if not _is_active_latency_unknown_col(_ae):
+                            raise
+                        _note_active_latency_col_missing()
+                        _al_delta = None
+                if _al_delta is None:
+                    cur.execute(
+                        f"UPDATE {db}.agent_run SET status='suspended', heartbeat_at=NOW(3) "
+                        "WHERE run_id=%s AND status='running'", (run_id,))
                 ok = cur.rowcount == 1
             if ok:
                 conn.commit()
@@ -655,7 +714,8 @@ class RDSRunStore:
         finally:
             conn.close()
 
-    def complete_run_atomic(self, run_id: str, extra_writer=None) -> bool:
+    def complete_run_atomic(self, run_id: str, extra_writer=None,
+                            active_ms: Optional[int] = None) -> bool:
         """P0-01（unknown-unknowns 批次1）：完成持久化**单事务**——最终答案落库
         （extra_writer 游标回调，serving 层写 qa_session_log 行）+ running→succeeded CAS
         一次 commit。此前两段分事务：succeeded 先 commit、答案写在回调里 best-effort——
@@ -675,18 +735,24 @@ class RDSRunStore:
         兜底——间隙期他方收口（取消/收尸）→ 重放 FOR UPDATE 读到非 running → False，
         沿用 fencing 语义（重试输家自然 CAS 失败）。commit 阶段异常**不在重放面**
         （结果未知，归 P0-03 消歧；此时重放会把「未知」误判成失去所有权）。重放仍撞
-        锁 → 还原原始异常，维持 P0-01 诚实 failed。"""
+        锁 → 还原原始异常，维持 P0-01 诚实 failed。
+
+        γ1（M9.1，codex 共识 2026-07-21）：active_ms=本执行腿活跃毫秒。锁内算
+        stored+delta → 累计值传 extra_writer（能收二参的，QA 行 latency 与 durable 同值
+        同事务）→ CAS UPDATE 带 `COALESCE(active_latency_ms,0)+delta`。054 未 apply →
+        warn-once 跳过累计、writer 收 None（调用方回退本腿 monotonic）。"""
         try:
-            return self._complete_run_txn(run_id, extra_writer)
+            return self._complete_run_txn(run_id, extra_writer, active_ms=active_ms)
         except _CompleteLockContention as first:
             logger.warning("run %s 完成事务撞锁竞争（%s）——全新事务重放一次"
                            "（commit 前，事务确定未生效）", run_id, first.original)
             try:
-                return self._complete_run_txn(run_id, extra_writer)
+                return self._complete_run_txn(run_id, extra_writer, active_ms=active_ms)
             except _CompleteLockContention as second:
                 raise second.original from None   # 连续两撞：还原原异常走 P0-01 诚实 failed
 
-    def _complete_run_txn(self, run_id: str, extra_writer=None) -> bool:
+    def _complete_run_txn(self, run_id: str, extra_writer=None,
+                          active_ms: Optional[int] = None) -> bool:
         """complete_run_atomic 的单次事务尝试（语义与异常契约见公开方法 docstring）。
         唯一私有约定：语句阶段撞 1213/1205 → 回滚后抛 _CompleteLockContention 重放信号；
         其余异常与返回值原样。"""
@@ -702,11 +768,32 @@ class RDSRunStore:
                     if not row or row[0] != "running":
                         conn.rollback()
                         return False
+                    # γ1：锁内算 stored+delta（行已 FOR UPDATE，读到的必是最终前值）；
+                    # 054 缺列 → 负缓存+None（语句级 1054 不劈事务，行锁保持）
+                    active_total = None
+                    _al_delta = (int(active_ms) if (active_ms is not None
+                                                    and not _ACTIVE_LATENCY_COL_MISSING)
+                                 else None)
+                    if _al_delta is not None:
+                        try:
+                            cur.execute(
+                                f"SELECT COALESCE(active_latency_ms,0) FROM {db}.agent_run "
+                                "WHERE run_id=%s", (run_id,))
+                            _al_row = cur.fetchone()
+                            active_total = int(_al_row[0] if _al_row else 0) + _al_delta
+                        except Exception as _ae:   # noqa: BLE001 — 仅 054 缺列降级
+                            if not _is_active_latency_unknown_col(_ae):
+                                raise
+                            _note_active_latency_col_missing()
+                            _al_delta = None
                     if extra_writer is not None:
-                        extra_writer(cur)
+                        _call_extra_writer(extra_writer, cur, active_total)
+                    _set_al = (", active_latency_ms=COALESCE(active_latency_ms,0)+%s"
+                               if _al_delta is not None else "")
                     cur.execute(
                         f"UPDATE {db}.agent_run SET status='succeeded', heartbeat_at=NOW(3), "
-                        "ended_at=NOW(3) WHERE run_id=%s AND status='running'", (run_id,))
+                        f"ended_at=NOW(3){_set_al} WHERE run_id=%s AND status='running'",
+                        ((_al_delta, run_id) if _al_delta is not None else (run_id,)))
                     ok = cur.rowcount == 1
                 if not ok:
                     conn.rollback()
@@ -772,12 +859,18 @@ class RDSRunStore:
                              run_id, attempt + 1, exc_info=True)
         return False
 
-    def transition(self, run_id: str, from_status: str, to_status: str) -> bool:
-        """单向状态机迁移（CAS）。合法且当前==from → 迁移并 True；否则 False；非法 pair → 抛。"""
+    def transition(self, run_id: str, from_status: str, to_status: str,
+                   active_ms: Optional[int] = None) -> bool:
+        """单向状态机迁移（CAS）。合法且当前==from → 迁移并 True；否则 False；非法 pair → 抛。
+        γ1（M9.1）：active_ms=本执行腿活跃毫秒——仅终态迁移随 CAS 同事务累计
+        `active_latency_ms=COALESCE(...)+delta`（失败/取消/超预算腿的延迟不丢）；
+        054 未 apply → 1054 摘除重试（warn-once）。"""
         if to_status not in _ALLOWED_TRANSITIONS.get(from_status, frozenset()):
             raise InvalidTransition(f"agent_run 状态迁移非法: {from_status} → {to_status}")
         db = _op_db()
         set_ended = ", ended_at=NOW(3)" if to_status in _TERMINAL else ""
+        _al_delta = (int(active_ms) if (active_ms and to_status in _TERMINAL
+                                        and not _ACTIVE_LATENCY_COL_MISSING) else None)
         conn = self._conn()
         _begin(conn)                        # FOR UPDATE+UPDATE 两语句：钉住连接
         try:
@@ -790,11 +883,24 @@ class RDSRunStore:
                 if row[0] != from_status:
                     conn.rollback()
                     return False                       # CAS 失败（并发/迟到/已迁移）
-                cur.execute(
-                    f"UPDATE {db}.agent_run SET status=%s, heartbeat_at=NOW(3){set_ended} "
-                    "WHERE run_id=%s AND status=%s",
-                    (to_status, run_id, from_status),
-                )
+                if _al_delta is not None:
+                    try:
+                        cur.execute(
+                            f"UPDATE {db}.agent_run SET status=%s, heartbeat_at=NOW(3)"
+                            f"{set_ended}, active_latency_ms=COALESCE(active_latency_ms,0)+%s "
+                            "WHERE run_id=%s AND status=%s",
+                            (to_status, _al_delta, run_id, from_status))
+                    except Exception as _ae:   # noqa: BLE001 — 仅 054 缺列摘除重试
+                        if not _is_active_latency_unknown_col(_ae):
+                            raise
+                        _note_active_latency_col_missing()
+                        _al_delta = None
+                if _al_delta is None:
+                    cur.execute(
+                        f"UPDATE {db}.agent_run SET status=%s, heartbeat_at=NOW(3){set_ended} "
+                        "WHERE run_id=%s AND status=%s",
+                        (to_status, run_id, from_status),
+                    )
                 ok = cur.rowcount == 1
             conn.commit()
             return ok
@@ -803,6 +909,29 @@ class RDSRunStore:
             raise
         finally:
             conn.close()
+
+    def read_active_latency(self, run_id: str) -> Optional[int]:
+        """γ1（M9.1）：读既有累计（resume 播种，供 QA 失败行的累计口径）。054 未 apply /
+        读失败 → None（调用方按 0 处理，QA 行退化为本腿 monotonic——与 1054 回退同义）。
+        fail-open：观测读绝不阻断 resume。"""
+        if _ACTIVE_LATENCY_COL_MISSING:
+            return None
+        db = _op_db()
+        try:
+            conn = self._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT COALESCE(active_latency_ms,0) FROM {db}.agent_run "
+                        "WHERE run_id=%s", (run_id,))
+                    row = cur.fetchone()
+                return int(row[0]) if row else None
+            finally:
+                conn.close()
+        except Exception as e:   # noqa: BLE001 — fail-open
+            if _is_active_latency_unknown_col(e):
+                _note_active_latency_col_missing()
+            return None
 
     def heartbeat(self, run_id: str) -> None:
         """刷新活动 run 的心跳（僵尸回收判据）。running/resuming 视为活动态。"""

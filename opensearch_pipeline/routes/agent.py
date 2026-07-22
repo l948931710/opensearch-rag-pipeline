@@ -852,14 +852,17 @@ def agent_ask(req: AgentAskRequest, request: Request,
     #    qa_retrieved_doc 物化），fail-open——它们失败绝不影响已成真的 run。
     _persisted_tx = {"v": False}
 
-    def _persist_answer(cur, final_text: str, retrieved=None) -> None:
+    def _persist_answer(cur, final_text: str, retrieved=None, active_total_ms=None) -> None:
+        # γ1（M9.1）：active_total_ms=完成事务锁内算出的活跃耗时累计（054；桩路径=
+        # executor 回退 base+本腿）——QA 行 latency 与 durable 同值同事务
         final_text = _clean_final(final_text)
         if cur is None:
             from opensearch_pipeline.qa_logger import log_qa_session
             log_qa_session(session_id=thread_id, message_id=message_id, user_id=identity.user_id,
                            user_dept=getattr(identity, "dept", None), query_text=req.question,
                            answer_text=final_text, conversation_id=conv, answer_status="SUCCESS",
-                           model_name="agent", retrieved_docs=_flatten_retrieved(retrieved))
+                           model_name="agent", retrieved_docs=_flatten_retrieved(retrieved),
+                           latency_ms=int(active_total_ms or 0))
             return
         _persisted_tx["v"] = True
         from opensearch_pipeline.qa_logger import insert_qa_row_tx
@@ -867,7 +870,8 @@ def agent_ask(req: AgentAskRequest, request: Request,
                          user_id=identity.user_id, user_dept=getattr(identity, "dept", None),
                          query_text=req.question, answer_text=final_text, conversation_id=conv,
                          answer_status="SUCCESS", model_name="agent",
-                         retrieved_docs=_flatten_retrieved(retrieved))
+                         retrieved_docs=_flatten_retrieved(retrieved),
+                         latency_ms=int(active_total_ms or 0))
 
     def _remember(final_text: str, retrieved=None) -> None:
         """run 完成侧缓存回调（executor 在 durable commit 之后调，非 SSE 消费侧）。"""
@@ -883,15 +887,16 @@ def agent_ask(req: AgentAskRequest, request: Request,
                                   query_text=req.question,
                                   retrieved_docs=_flatten_retrieved(retrieved))
 
-    def _report_failure(err: str) -> None:
+    def _report_failure(err: str, active_total_ms=None) -> None:
         """run 失败侧回调：落 AGENT_ERROR 行（此前只记 SUCCESS——agent 失败对运维零可见、
         看板成功率虚高，深度审查治理组）。归 '%ERROR%' 错误族口径，model_name='agent' 可分段。
-        失败不进会话记忆（不污染多轮历史）。"""
+        失败不进会话记忆（不污染多轮历史）。γ1：latency 传累计口径（base+本腿）。"""
         from opensearch_pipeline.qa_logger import log_qa_session
         log_qa_session(session_id=thread_id, message_id=message_id, user_id=identity.user_id,
                        user_dept=getattr(identity, "dept", None), query_text=req.question,
                        answer_text=None, conversation_id=conv, answer_status="AGENT_ERROR",
-                       model_name="agent", error_message=(err or "")[:500])
+                       model_name="agent", error_message=(err or "")[:500],
+                       latency_ms=int(active_total_ms or 0))
 
     # PR-3 Stage D distributed admission：全局在跑上限（软上限，默认 off）。
     # 拒绝先于 enqueue——被拒的 ask 零 durable 痕迹，UX 与本地容量 429 同型。
@@ -1553,7 +1558,8 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
     # 从会话历史/看板核对答案依据的唯一通道）。
     _persisted_tx = {"v": False}
 
-    def _persist_answer(cur, final_text: str, retrieved=None) -> None:
+    def _persist_answer(cur, final_text: str, retrieved=None, active_total_ms=None) -> None:
+        # γ1（M9.1）：active_total_ms=完成事务锁内累计（含挂起前各腿——审批等待不计）
         if cur is None:
             from opensearch_pipeline.qa_logger import log_qa_session
             log_qa_session(session_id=thread_id, message_id=message_id, user_id=requester_id,
@@ -1561,7 +1567,8 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
                            query_text=cp_question, answer_text=final_text,
                            conversation_id=run.get("conversation_id"),
                            answer_status="SUCCESS", model_name="agent",
-                           retrieved_docs=_flatten_retrieved(retrieved))
+                           retrieved_docs=_flatten_retrieved(retrieved),
+                           latency_ms=int(active_total_ms or 0))
             return
         _persisted_tx["v"] = True
         from opensearch_pipeline.qa_logger import insert_qa_row_tx
@@ -1572,7 +1579,8 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
                          user_dept=(req_groups[0] if req_groups else None),
                          query_text=cp_question, answer_text=final_text,
                          conversation_id=run.get("conversation_id"), answer_status="SUCCESS",
-                         model_name="agent", retrieved_docs=docs)
+                         model_name="agent", retrieved_docs=docs,
+                         latency_ms=int(active_total_ms or 0))
 
     def _remember(final_text: str, retrieved=None) -> None:
         try:
@@ -1589,13 +1597,14 @@ def _resume_callbacks(run_store, run: dict, thread_id: str, requester_id: str,
                                   query_text=cp_question,
                                   retrieved_docs=_flatten_retrieved(retrieved))
 
-    def _report_failure(err: str) -> None:
+    def _report_failure(err: str, active_total_ms=None) -> None:
         from opensearch_pipeline.qa_logger import log_qa_session
         log_qa_session(session_id=thread_id, message_id=message_id, user_id=requester_id,
                        user_dept=(req_groups[0] if req_groups else None), query_text=cp_question,
                        answer_text=None, conversation_id=run.get("conversation_id"),
                        answer_status="AGENT_ERROR", model_name="agent",
-                       error_message=(err or "")[:500])
+                       error_message=(err or "")[:500],
+                       latency_ms=int(active_total_ms or 0))
 
     return message_id, _remember, _report_failure, _persist_answer
 
@@ -1727,21 +1736,23 @@ def _dispatch_recovered_submit(cmd: dict):
     user_dept = groups[0] if groups else None
     _persisted_tx = {"v": False}
 
-    def _persist_answer(cur, final_text: str, retrieved=None) -> None:
-        final_text = _clean_answer_text(final_text)
+    def _persist_answer(cur, final_text: str, retrieved=None, active_total_ms=None) -> None:
+        final_text = _clean_answer_text(final_text)   # γ1：latency 同款累计口径
         if cur is None:
             from opensearch_pipeline.qa_logger import log_qa_session
             log_qa_session(session_id=thread_id, message_id=message_id, user_id=user_id,
                            user_dept=user_dept, query_text=question, answer_text=final_text,
                            conversation_id=conv, answer_status="SUCCESS", model_name="agent",
-                           retrieved_docs=_flatten_retrieved(retrieved))
+                           retrieved_docs=_flatten_retrieved(retrieved),
+                           latency_ms=int(active_total_ms or 0))
             return
         _persisted_tx["v"] = True
         from opensearch_pipeline.qa_logger import insert_qa_row_tx
         insert_qa_row_tx(cur, session_id=thread_id, message_id=message_id, user_id=user_id,
                          user_dept=user_dept, query_text=question, answer_text=final_text,
                          conversation_id=conv, answer_status="SUCCESS", model_name="agent",
-                         retrieved_docs=_flatten_retrieved(retrieved))
+                         retrieved_docs=_flatten_retrieved(retrieved),
+                         latency_ms=int(active_total_ms or 0))
 
     def _remember(final_text: str, retrieved=None) -> None:
         final_text = _clean_answer_text(final_text)
@@ -1755,12 +1766,13 @@ def _dispatch_recovered_submit(cmd: dict):
                                   query_text=question,
                                   retrieved_docs=_flatten_retrieved(retrieved))
 
-    def _report_failure(err: str) -> None:
+    def _report_failure(err: str, active_total_ms=None) -> None:
         from opensearch_pipeline.qa_logger import log_qa_session
         log_qa_session(session_id=thread_id, message_id=message_id, user_id=user_id,
                        user_dept=user_dept, query_text=question, answer_text=None,
                        conversation_id=conv, answer_status="AGENT_ERROR", model_name="agent",
-                       error_message=(err or "")[:500])
+                       error_message=(err or "")[:500],
+                       latency_ms=int(active_total_ms or 0))
 
     try:
         handle = executor.submit(ctx, loop, messages, tools, on_complete=_remember,
