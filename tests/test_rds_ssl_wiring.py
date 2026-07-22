@@ -226,3 +226,37 @@ def test_startup_check_scope_and_probe_error_tolerance(monkeypatch):
 
     api = _wire_startup(monkeypatch, env="staging", row=None, conn_raises=True)
     api._rds_tls_startup_check()                      # 探针 error 不 brick
+
+
+class TestRequireTlsFailClosed:
+    """γ5（M8，Majors 批次 γ）：RAG_RDS_REQUIRE_TLS=on 时探针对「无法实证客户端腿
+    TLS」fail-closed；off（默认）维持上方告警放行契约。"""
+
+    def test_unprovable_socket_and_empty_status_raises(self, monkeypatch):
+        monkeypatch.setenv("RAG_RDS_REQUIRE_TLS", "true")
+        api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""))
+        with pytest.raises(RuntimeError, match="RAG_RDS_REQUIRE_TLS"):
+            api._rds_tls_startup_check()
+
+    def test_probe_exception_raises(self, monkeypatch):
+        monkeypatch.setenv("RAG_RDS_REQUIRE_TLS", "true")
+        api = _wire_startup(monkeypatch, env="staging", row=None, conn_raises=True)
+        with pytest.raises(RuntimeError, match="RAG_RDS_REQUIRE_TLS"):
+            api._rds_tls_startup_check()
+
+    def test_verified_client_socket_still_passes(self, monkeypatch):
+        monkeypatch.setenv("RAG_RDS_REQUIRE_TLS", "true")
+        api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""),
+                            sock=_TlsSock())
+        api._rds_tls_startup_check()                  # 实证通过，不抛
+
+    def test_status_value_still_passes(self, monkeypatch):
+        monkeypatch.setenv("RAG_RDS_REQUIRE_TLS", "true")
+        api = _wire_startup(monkeypatch, env="production",
+                            row=("Ssl_cipher", "ECDHE-RSA-AES128-GCM-SHA256"))
+        api._rds_tls_startup_check()                  # SHOW STATUS 有值=TLS 已证
+
+    def test_flag_off_unprovable_keeps_warn_and_pass(self, monkeypatch):
+        monkeypatch.delenv("RAG_RDS_REQUIRE_TLS", raising=False)
+        api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""))
+        api._rds_tls_startup_check()                  # off：维持告警放行（既有拍板）

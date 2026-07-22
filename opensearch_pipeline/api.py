@@ -194,6 +194,14 @@ def _rds_socket_of(conn):
     return None
 
 
+def _rds_tls_require_on() -> bool:
+    """γ5（M8，Majors 批次 γ，codex 共识 2026-07-21）：RAG_RDS_REQUIRE_TLS——on 时
+    启动探针对「无法实证客户端腿 TLS」fail-closed（配套 config 姿态断言：CA 非空+
+    文件存在+verify 开；默认 off=维持告警放行）。无 ack 逃生口，回滚=关 flag。"""
+    return os.environ.get("RAG_RDS_REQUIRE_TLS",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _rds_tls_startup_check() -> None:
     """B3（RB-02）：启动期 TLS 接线自检——以**客户端 socket** 为裁决证据。
 
@@ -235,6 +243,11 @@ def _rds_tls_startup_check() -> None:
             val = str(vals[1] if len(vals) > 1 else "") or ""
         if sock is None:
             if not val:
+                if _rds_tls_require_on():
+                    # γ5（M8）：flag on 时「实证不了」=fail-closed（此前仅告警放行）
+                    raise RuntimeError(
+                        "[γ5 M8] RAG_RDS_REQUIRE_TLS=on：包装链不可穿透且 Ssl_cipher 为空"
+                        "——无法实证客户端腿 TLS，拒绝启动（回滚=关闭该 flag）。")
                 logger.warning(
                     "RDS TLS 自检：包装链不可穿透且 Ssl_cipher 为空——rwlb 代理下该状态"
                     "反映后端腿、不可作裁决，放行但无法实证客户端腿 TLS（检查包装层变动）")
@@ -244,7 +257,12 @@ def _rds_tls_startup_check() -> None:
             logger.info("RDS TLS 自检：代理视角 Ssl_cipher=%s（参考）", val)
     except RuntimeError:
         raise
-    except Exception:   # noqa: BLE001
+    except Exception as probe_exc:   # noqa: BLE001
+        if _rds_tls_require_on():
+            # γ5（M8）：探针异常（DB 瞬断等）同属「无法实证」——fail-closed。
+            raise RuntimeError(
+                "[γ5 M8] RAG_RDS_REQUIRE_TLS=on：TLS 自检探针异常，无法实证客户端腿 "
+                f"TLS，拒绝启动（回滚=关闭该 flag）: {probe_exc}") from probe_exc
         logger.warning("RDS TLS 自检失败（忽略，不影响启动）", exc_info=True)
 
 

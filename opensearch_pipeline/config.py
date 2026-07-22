@@ -687,6 +687,15 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
                     f"[ENV GUARD] environment={env} 指向生产检索实例"
                     f"（table={config.alibaba_vector.table_name!r}，非 _stg/_s 表）。"
                     f"PROD-RO 会话请 export RAG_ALLOW_REMOTE_SEARCH={_ACK_VALUE}")
+        # P0-02 同文（γ5/M8，Majors 批次 γ，codex 共识 2026-07-21）：staging/test 此前
+        # 无 TLS 自检——staging 连的是同一生产 RDS 实例（_stg 库），明文面与生产等价。
+        # 告警不阻断（与生产分支同拍板；硬断走下方 RAG_RDS_REQUIRE_TLS 姿态断言）。
+        if not config.simulate_db and not (config.rds.ssl_ca or "").strip():
+            logging.getLogger(__name__).warning(
+                "[P0-02] environment=%s 但 RDS 未启用 TLS（RAG_RDS_SSL_CA 未配）——"
+                "RDS 链路承载身份/权限/日志，明文传输是审计缺口。CA 已随包"
+                "（opensearch_pipeline/certs/aliyun-rds-ca.pem），部署环境设 "
+                "RAG_RDS_SSL_CA 指向即启用验证 TLS（B3 自检会实测 Ssl_cipher）。", env)
 
     if env == "production":
         # R4：生产标签指 localhost 必为配错，无豁免
@@ -708,6 +717,28 @@ def _validate_environment_target_consistency(config: "PipelineConfig") -> None:
                 "RDS 链路承载身份/权限/日志，明文传输是审计缺口。CA 已随包"
                 "（opensearch_pipeline/certs/aliyun-rds-ca.pem），部署环境设 "
                 "RAG_RDS_SSL_CA 指向即启用验证 TLS（B3 自检会实测 Ssl_cipher）。")
+
+    # γ5（M8，Majors 批次 γ，codex 共识 2026-07-21）：RDS TLS 姿态硬断言。
+    # RAG_RDS_REQUIRE_TLS 默认 off=维持「P0-02 告警不阻断」的记录在案拍板（byte-identical）；
+    # on 且 env∈{production,staging} 且真连 RDS 时：ssl_ca 非空+文件存在+ssl_verify_cert=True，
+    # 缺一拒绝启动。**无当日 ack 逃生口**（回滚=关掉该 flag；与 REQUIRE_AUTH 断言的 ack 形态
+    # 刻意不同——TLS 是链路事实，不存在「显式承认延续旧姿态」的过渡语义）。探针面配套：
+    # api._rds_tls_startup_check 在 flag on 时对「无法实证客户端腿 TLS」同步 fail-closed。
+    if (os.environ.get("RAG_RDS_REQUIRE_TLS", "").strip().lower() in ("1", "true", "yes", "on")
+            and env in ("production", "staging") and not config.simulate_db):
+        _tls_ca = (config.rds.ssl_ca or "").strip()
+        _tls_problems = []
+        if not _tls_ca:
+            _tls_problems.append("RAG_RDS_SSL_CA 未配")
+        elif not os.path.isfile(_tls_ca):
+            _tls_problems.append(f"CA 文件不存在: {_tls_ca}")
+        if not config.rds.ssl_verify_cert:
+            _tls_problems.append("RAG_RDS_SSL_VERIFY_CERT 被关（必须保持 true）")
+        if _tls_problems:
+            raise EnvironmentMismatchError(
+                "[ENV GUARD] RAG_RDS_REQUIRE_TLS=on 但 TLS 姿态不满足: "
+                + "; ".join(_tls_problems)
+                + "。修复 CA/验证配置后重启；回滚=关闭 RAG_RDS_REQUIRE_TLS（无 ack 逃生口）。")
 
     # D7：production/staging 实际启用 HA3 时表名必须显式声明（消除历史双标默认值）
     if env in ("production", "staging") and not config.simulate_opensearch \
@@ -1054,6 +1085,33 @@ def load_config() -> PipelineConfig:
                     f"请在部署环境变量中开启它们；{_hint}确需延续旧开放姿态（过渡期）须"
                     f"显式设 **当日** RAG_ALLOW_LEGACY_OPEN_PROD=ack:{_today}"
                     f"（P1-14 日期绑定，午夜过期；unknown-unknowns 批次5 P0-07d）。")
+
+    # γ7（M10，Majors 批次 γ，codex 共识 2026-07-21）：ops 告警 webhook 姿态断言。
+    # RAG_OPS_ALERT_REQUIRE 默认 off=零行为变化；on 且 production/staging 时
+    # RAG_OPS_ALERT_WEBHOOK 必须非空且过 alerting._webhook_allowed 域校验
+    # （https + *.dingtalk.com / RAG_OPS_ALERT_WEBHOOK_ALLOW 白名单域），否则拒绝启动——
+    # 「告警链看似在配、实则全部 SUPPRESSED」的静默缺口（B6 只计数可见、不阻断）到此收口。
+    # ⚠️ 配置存在 ≠ 送达证明：本断言只证「有合法收件地址」；端到端送达（对的群、对的
+    # 机器人）仍以 Sam 的现网 attestation 为准（ε 批 docs/ops/alerting_chain_attestation）。
+    if _env_label_prod and os.environ.get(
+            "RAG_OPS_ALERT_REQUIRE", "").strip().lower() in ("1", "true", "yes", "on"):
+        _ops_wh = (os.environ.get("RAG_OPS_ALERT_WEBHOOK") or "").strip()
+        _ops_wh_ok = False
+        if _ops_wh:
+            try:
+                from opensearch_pipeline.alerting import _webhook_allowed
+                _ops_wh_ok = _webhook_allowed(_ops_wh)
+            except Exception:   # noqa: BLE001 — 校验器不可用按不合法处理（姿态 fail-closed）
+                _ops_wh_ok = False
+        if not _ops_wh_ok:
+            _wh_why = ("未配置" if not _ops_wh
+                       else "未过域校验（须 https + *.dingtalk.com，自建网关用 "
+                            "RAG_OPS_ALERT_WEBHOOK_ALLOW 追加域）")
+            raise ValueError(
+                f"🚨 [PRODUCTION SECURITY GUARD] RAG_OPS_ALERT_REQUIRE=on 但 "
+                f"'{config.environment}' 环境的 RAG_OPS_ALERT_WEBHOOK {_wh_why}——"
+                f"该姿态下告警链整体 SUPPRESSED（只活在日志）。配好 webhook 或关闭该 flag；"
+                f"配置存在≠送达证明，送达以现网 attestation 为准（γ7/M10）。")
 
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
