@@ -185,13 +185,18 @@ jobs:
           python -m pip install --upgrade pip pip-audit "setuptools>=83"
           pip install -e ".[production,api,ocr]"
           python -m pip_audit --desc
-      # 供应链补链（2026-07-11 重审计 §6；main 摘取适配 2026-07-18）：钉版审计 + SBOM + trivy。
-      # ① main 无 requirements-prod.lock（供应链 lock 族按 07-15 裁决未迁）；main 的
-      #    生产 SAE 真实安装源=requirements.txt（批次8 起顶层 == 钉版）——直接对它跑
-      #    pip-audit，审计的即现网真实暴露面。上面那步 fresh resolve 审计的是 extras
-      #    最新可解析集，两者互补。【阻塞】。
+      # 供应链补链（2026-07-11 重审计 §6；main 摘取适配 2026-07-18；lock 审计 2026-07-21 迁移批B3）：
+      # 钉版审计 + SBOM + trivy。两条真实安装源都审：
+      # ① requirements.txt = SAE zip/buildpack 真实安装源（批次8 起顶层 == 钉版；a64aa86 起
+      #    刻意保留浮动/顶层钉版，不切 lock 以免 buildImage exit 1）——直接对它跑 pip-audit，
+      #    审计的即 SAE 现网暴露面。上面 fresh-resolve 步审计的是 extras 最新可解析集，互补。【阻塞】。
       - name: Pinned requirements CVE audit (pip-audit on requirements.txt — BLOCKING)
         run: python -m pip_audit -r requirements.txt --desc
+      # ①b requirements-prod.lock = Docker 镜像真实安装源（迁移批B3：uv 生成 + --require-hashes）。
+      #    与 ①互补——镜像路径按 hash 锁全量闭包，此步审的是该闭包的 CVE 暴露面。锁更新须重跑
+      #    lock 头部的 uv 命令并复审。【阻塞】。
+      - name: Hashed lock CVE audit (pip-audit on requirements-prod.lock — BLOCKING)
+        run: python -m pip_audit -r requirements-prod.lock --desc
       # ② SBOM（SPDX，syft）：覆盖 Python lock + console-app/package-lock.json，
       #    产物上传 artifact（供应链事件时按 SBOM 反查暴露面，此前全仓无 SBOM）。
       - name: Generate SBOM (syft — SPDX JSON)

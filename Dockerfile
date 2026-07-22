@@ -2,7 +2,10 @@
 # OpenSearch RAG Pipeline — SAE Production Image
 # ═══════════════════════════════════════════════════════════════
 
-FROM python:3.11-slim AS base
+# 基础镜像 digest 钉版（2026-07-21 迁移批B3，供应链硬化）：浮动 tag 会被上游静默重推，
+# 破坏可复现构建；@sha256 锁定精确 manifest。升级须先 `docker buildx imagetools inspect
+# python:3.11-slim` 取新 digest 再改此处（与 claude/ontology-p0 同 digest）。
+FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3 AS base
 
 # 部署版本指纹（canary 校验 / 回滚确认）：构建期烤入 git 短 SHA，运行期经 RAG_GIT_SHA 暴露给
 # versions.git_commit() → /api/version。打包步骤传 --build-arg GIT_SHA=$(git rev-parse --short HEAD)；
@@ -16,11 +19,13 @@ ENV RAG_GIT_SHA=$GIT_SHA
 
 WORKDIR /app
 
-# 先拷贝依赖描述文件，利用 Docker 层缓存
-COPY pyproject.toml ./
-
-# 安装 api + production 依赖（不装 dev/test/ocr）
-RUN pip install --no-cache-dir ".[api,production]"
+# 哈希锁安装（迁移批B3）：requirements-prod.lock 由 uv 从 pyproject [api,production] extras
+# 生成并带 --generate-hashes；--require-hashes 拒绝任何 hash 不符的包（供应链完整性）。
+# 注意此路径**仅约束 Docker 镜像**；SAE zip/buildpack 仍消费浮动 requirements.txt（README §
+# 部署清单，a64aa86 曾因精确钉版致 buildImage exit 1 而对该路径保留浮动）。锁更新=重跑
+# 头部命令。--no-deps：lock 已含全量闭包，禁 pip 再解析。
+COPY requirements-prod.lock ./
+RUN pip install --no-cache-dir --require-hashes --no-deps -r requirements-prod.lock
 
 # 拷贝应用代码
 COPY opensearch_pipeline/ ./opensearch_pipeline/
