@@ -1635,7 +1635,11 @@ def _run_claimed(msg_id: str, body: dict, att: int):
         _msg_mark(msg_id, "retryable_failed", att=att + 1, ttl=_MSG_DEDUP_CLAIM_TTL_S)
         raise TransientMessageError(
             f"msgId={msg_id} attempt={att} 同步窗瞬态失败——请求钉钉重投")
-    _msg_mark(msg_id, "processing", ttl=_TIMESTAMP_TOLERANCE)   # 在途：sent 由发送层标
+    # β（M2）：忙/准入拒绝已由 _send_terminal_text 走发送状态机（sent/delivery_unknown
+    # 由发送层标）——这里再标 processing 会把已收口的发送态覆盖回在途；仅「后台已启动/
+    # 同步提示」形态维持既有 processing 语义。
+    if not str((result or {}).get("msgtype", "")).startswith("rejected_"):
+        _msg_mark(msg_id, "processing", ttl=_TIMESTAMP_TOLERANCE)   # 在途：sent 由发送层标
     return result
 
 
@@ -1666,6 +1670,62 @@ def _handle_redelivery(msg_id: str, prior: dict, body: dict):
         return {"msgtype": "delivery_unknown"}
     logger.info("钉钉消息重复投递已忽略（幂等）: msgId=%s state=%s", msg_id, st)
     return {"msgtype": "duplicate"}
+
+
+# ── β（M2，codex 共识 2026-07-21）：主链有界并发 + admission ────────────────────
+# 评审 M2：钉钉主 RAG 路径每消息裸起 daemon 线程且不经任何 admission——线程无界
+# （消息风暴=线程/内存失控），配额面被绕过（/api/ask 有全套准入，钉钉零准入）。
+# 两护栏默认 off=行为逐字节等价，SAE 部署批次翻闸：
+#   RAG_DT_MAX_WORKERS>0 → BoundedSemaphore 封顶在飞 RAG 线程，饱和即忙话术终答；
+#   RAG_DT_ADMISSION_ENABLE=true → claim 后 spawn 前过 LIMITER.admit_ask
+#   （count_llm=True 镜像 /api/ask 与 /api/ask/stream——同一稀缺资源不因走钉钉绕开），
+#   denial.message 即话术终答；限流器自身异常按 ask 档 fail-closed 精神回忙话术。
+# 拒绝回复走 _send_terminal_text（进发送状态机，sent 由发送层标）；_run_claimed 对
+# rejected_* 形态**不标 processing**（否则把已收口的发送态覆盖回在途）。
+
+_DT_RAG_SEMAPHORE: Optional[threading.BoundedSemaphore] = None
+_DT_SEM_CAP = 0
+_DT_SEM_LOCK = threading.Lock()
+
+
+def _dt_max_workers() -> int:
+    try:
+        return max(0, int(os.environ.get("RAG_DT_MAX_WORKERS", "0") or "0"))
+    except ValueError:
+        return 0
+
+
+def _dt_admission_enabled() -> bool:
+    return (os.environ.get("RAG_DT_ADMISSION_ENABLE", "").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+def _dt_semaphore() -> Optional[threading.BoundedSemaphore]:
+    """cap>0 时返回进程级信号量（cap 运行中变更 → 重建取新值，旧在飞线程释放旧对象
+    自然收敛）；cap=0（默认）→ None=不启用，spawn 路径与既有行为等价。"""
+    global _DT_RAG_SEMAPHORE, _DT_SEM_CAP
+    cap = _dt_max_workers()
+    if cap <= 0:
+        return None
+    with _DT_SEM_LOCK:
+        if _DT_RAG_SEMAPHORE is None or _DT_SEM_CAP != cap:
+            _DT_RAG_SEMAPHORE = threading.BoundedSemaphore(cap)
+            _DT_SEM_CAP = cap
+        return _DT_RAG_SEMAPHORE
+
+
+def _dt_admission_denial(sender_staff_id: str) -> Optional[str]:
+    """β2：None=放行；str=拒绝话术（Denial.message 直出，与小程序错误卡同文案）。
+    限流器自身异常 → fail-closed 忙话术（镜像 api._enforce_rate_limit ask 档语义：
+    准入器坏了宁拒不放，雪崩时不留敞口）。"""
+    actor = f"u:{sender_staff_id}" if sender_staff_id else "ip:anon"
+    try:
+        denial = LIMITER.admit_ask(actor, is_user=bool(sender_staff_id),
+                                   thinking=False, count_llm=True)
+    except Exception:   # noqa: BLE001
+        logger.error("钉钉 admission 限流器异常（fail-closed 拒绝）", exc_info=True)
+        return "系统繁忙，请稍后再试。"
+    return denial.message if denial is not None else None
 
 
 def _process_claimed_body(body: dict):
@@ -1726,14 +1786,38 @@ def _process_claimed_body(body: dict):
 
     # 5. 后台线程处理 RAG 问答
     conv_type = str(body.get("conversationType", "1"))
-    thread = threading.Thread(
-        target=_process_rag_query,
-        args=(question, session_webhook, sender_nick, conversation_id, sender_staff_id, conv_type,
-              get_request_id(),                    # P3-9：显式跨线程传 rid（Thread 不复制 ContextVar）
-              str(body.get("msgId") or "")),       # B7-P2-04：msgId 入后台，发送层标 sent/unknown
-        daemon=True,
-    )
-    thread.start()
+    msg_id_str = str(body.get("msgId") or "")
+    # β2（M2）：主链 admission（flag off=零调用零行为差；denial 话术终答走状态机）
+    if _dt_admission_enabled():
+        deny_text = _dt_admission_denial(sender_staff_id)
+        if deny_text is not None:
+            _send_terminal_text(session_webhook, f"😥 {deny_text}", msg_id=msg_id_str)
+            return {"msgtype": "rejected_admission"}
+    # β1（M2）：有界并发（cap=0 默认走原样裸线程；饱和=忙话术终答，不排队不静默丢）
+    sem = _dt_semaphore()
+    if sem is not None and not sem.acquire(blocking=False):
+        _send_terminal_text(session_webhook,
+                            "😥 当前咨询人数较多，请稍后再试。", msg_id=msg_id_str)
+        return {"msgtype": "rejected_busy"}
+    _rag_args = (question, session_webhook, sender_nick, conversation_id, sender_staff_id,
+                 conv_type,
+                 get_request_id(),                 # P3-9：显式跨线程传 rid（Thread 不复制 ContextVar）
+                 msg_id_str)                       # B7-P2-04：msgId 入后台，发送层标 sent/unknown
+    if sem is not None:
+        def _bounded_rag(args=_rag_args, s=sem):
+            try:
+                _process_rag_query(*args)
+            finally:
+                s.release()
+        thread = threading.Thread(target=_bounded_rag, daemon=True)
+    else:
+        thread = threading.Thread(target=_process_rag_query, args=_rag_args, daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        if sem is not None:
+            sem.release()                          # β1：start 自身抛错也不泄漏槽位
+        raise
 
     # 6. 立即返回 200
     return {"msgtype": "empty"}
