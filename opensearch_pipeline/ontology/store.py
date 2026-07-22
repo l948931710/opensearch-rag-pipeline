@@ -168,6 +168,16 @@ class DuplicateActiveIdentifier(Exception):
     """同 (namespace, norm_value) 已有 active 别名——撞 uk_ns_norm_active。"""
 
 
+class CommitAmbiguous(Exception):
+    """受治理写事务的 **commit 段**异常——结果不可知（服务端可能已提交/在途/未提交），
+    绝不可按「确定失败」分类（Majors α1/M3.1，codex 共识 2026-07-21）。
+
+    工具层唯一可判凭据=与副作用同事务写入的操作台账（agent_tool_operation）三态：
+    applied → 幂等成功收口；not_applied/unknown → 原样上抛由 executor 归 uncertain
+    （053 对账器收敛）。uk_ns_norm_active 读回**不能**当凭据——identifier 行无
+    operation_id 无法归属到本次操作，且慢提交窗口内「无行」≠未提交。"""
+
+
 class LinkCardinalityViolation(Exception):
     """single 基数 link 已有指向其他对象的 active 行（P1-8）——先 retire 旧关系
     （S3 纠错）再建新，绝不静默双活。"""
@@ -896,6 +906,7 @@ class RDSOntologyStore:
         _check_confidence(confidence)
         db, conn = self._db(), self._conn()
         _begin(conn)
+        _committing = False
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT case_id FROM {db}.ontology_resolution_case "
@@ -926,9 +937,20 @@ class RDSOntologyStore:
                 self._audit_in_tx(cur, audit)
                 if operation_writer is not None:
                     operation_writer(cur, identifier_id, case_id)
+            _committing = True
             conn.commit()
             return identifier_id, case_id
         except Exception as e:
+            if _committing:
+                # α1（M3.1）：commit 段异常=结果不可知。rollback 仅 best-effort（连接
+                # 多半已坏，且若服务端已提交它也无可回滚），绝不掩盖原异常、绝不落进
+                # 下方「确定失败」分类——上抛 CommitAmbiguous 由工具层按台账三态收口。
+                try:
+                    conn.rollback()
+                except Exception:   # noqa: BLE001 — best-effort
+                    pass
+                raise CommitAmbiguous(
+                    f"identifier 铸号事务 commit 结果不可知（{namespace}:{norm_value}）") from e
             conn.rollback()
             if self._is_dup(e):
                 raise DuplicateActiveIdentifier(f"{namespace}:{norm_value} 已有 active 别名")

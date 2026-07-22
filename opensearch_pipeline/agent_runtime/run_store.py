@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 # R1（RB-RT-01）：052 未 apply 的一次性告警闸（进程级）
 _WARNED_052_MISSING = False
 
+# α3（M4）：054 未 apply 的一次性告警闸（进程级；apply 后重启恢复）
+_WARNED_054_MISSING = False
+
 # 状态机（报告 §6 + B1(b)/B3：resuming 中间态）
 # resuming = 审批已批、执行宿主尚未接手续跑的中间态。resume 两步：
 #   ① 审批回调 CAS suspended→resuming（认领，防两回调并发重入）+ 立即 ACK；
@@ -72,10 +75,59 @@ def _is_thread_busy_error(exc: BaseException) -> bool:
     return "uk_thread_active" in str(exc)
 
 
+# ── α2（M3.2，codex 共识 2026-07-21）：记账幂等键（schema/055）──────────────────
+
+_BOOKKEEPING_COL_MISSING = False   # 055 未 apply 的进程内负缓存（warn-once；apply 后重启恢复）
+
+
+def is_bookkeeping_dup(exc: BaseException) -> bool:
+    """异常是否「撞 agent_step.uk_step_bookkeeping」=同 bookkeeping_id 的记账事务
+    **已提交**（commit-ACK 丢失后同键重放的判定凭据）。限定索引名——非目标 1062
+    （agent_step PK / 其它唯一键）绝不误判成功。"""
+    txt = str(exc)
+    if "uk_step_bookkeeping" not in txt:
+        return False
+    args = getattr(exc, "args", None) or ()
+    return (bool(args) and args[0] == 1062) or "Duplicate entry" in txt
+
+
+def _is_bookkeeping_unknown_col(exc: BaseException) -> bool:
+    """055 未 apply：1054 且错误文本点名 bookkeeping_id 才算——其余 1054 原样上抛，
+    绝不把别的缺列误判成「055 未 apply」（codex v3 posture 精度要求）。"""
+    txt = str(exc)
+    if "bookkeeping_id" not in txt:
+        return False
+    args = getattr(exc, "args", None) or ()
+    return (bool(args) and args[0] == 1054) or "Unknown column" in txt
+
+
+def _note_bookkeeping_col_missing() -> None:
+    global _BOOKKEEPING_COL_MISSING
+    if not _BOOKKEEPING_COL_MISSING:
+        _BOOKKEEPING_COL_MISSING = True
+        logger.warning("agent_step.bookkeeping_id 缺列（schema/055 未 apply）——记账幂等键"
+                       "降级 legacy 无列路径（warn-once；apply 后重启进程恢复）")
+
+
 class DispatchCommandBound(RuntimeError):
     """R1（RB-RT-01）：该 dispatch 命令已有 run——uk_run_dispatch_cmd（schema/052）撞
     1062。恢复扫描与快路径并发双建时由 DB 裁决单赢家；输家凭
     find_run_by_dispatch_command 取既有 run 收口（rebind），绝不产生第二个 run。"""
+
+
+class ClientRequestBound(RuntimeError):
+    """α3（M4，codex 共识 2026-07-21）：同 (user_id, client_request_id) 已有 run——
+    uk_run_client_req（schema/054）撞 1062。响应丢失重试/并发双 POST 由 DB 裁决单
+    赢家；输家凭 find_run_by_client_request 取既有 run 回放收口（202/200 replayed），
+    绝不产生第二个 run 第二次副作用。"""
+
+
+def _is_client_request_dup_error(exc: BaseException) -> bool:
+    """1062 且撞的是 uk_run_client_req 才算（与 _is_thread_busy_error 同款键名限定）。"""
+    args = getattr(exc, "args", None) or ()
+    if not args or args[0] != 1062:
+        return False
+    return "uk_run_client_req" in str(exc)
 
     def __init__(self, command_id: str):
         super().__init__(f"dispatch 命令 {command_id} 已绑定 run（uk_run_dispatch_cmd）")
@@ -184,6 +236,11 @@ class RDSRunStore:
         # 每命令至多一个 run。锚经 ctx 携带（routes claim 后 setattr，P1-12 message_id
         # 同款先例）；未 apply 052 的旧库撞 1054 → 回退无锚 INSERT + 一次性 warning。
         dispatch_cmd = getattr(ctx, "dispatch_command_id", None)
+        # α3（M4，schema/054）：客户端业务幂等键随建 run 同 INSERT 原子落——
+        # uk_run_client_req 并发裁决单赢家；未 apply 054（1054 点名本列族）→ warn-once
+        # 回退无键 INSERT（flag-on 必须先 apply 由 readiness 契约检查钉住）。
+        client_key = getattr(ctx, "client_request_id", None)
+        q_digest = getattr(ctx, "question_digest", None)
         conn = self._conn()
         try:
             with conn.cursor() as cur:
@@ -200,7 +257,51 @@ class RDSRunStore:
                              getattr(ctx, "model_profile", None),
                              getattr(ctx, "prompt_version", None),
                              getattr(ctx, "git_sha", None), getattr(ctx, "message_id", None))
-                if dispatch_cmd:
+                global _WARNED_052_MISSING, _WARNED_054_MISSING
+                _client_done = False
+                if client_key and not _WARNED_054_MISSING:
+                    _d_col = ", dispatch_command_id" if dispatch_cmd else ""
+                    _d_ph = ",%s" if dispatch_cmd else ""
+                    _d_val = (dispatch_cmd,) if dispatch_cmd else ()
+                    try:
+                        cur.execute(
+                            f"INSERT INTO {db}.agent_run "
+                            f"({base_cols}, client_request_id, question_digest{_d_col}) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,"
+                            f"NOW(3),NOW(3),%s,%s{_d_ph})",
+                            base_vals + (client_key, q_digest) + _d_val)
+                        _client_done = True
+                    except Exception as e_col:   # noqa: BLE001
+                        if (_is_unknown_column_error(e_col)
+                                and ("client_request_id" in str(e_col)
+                                     or "question_digest" in str(e_col))):
+                            if not _WARNED_054_MISSING:
+                                _WARNED_054_MISSING = True
+                                logger.warning(
+                                    "agent_run 无 client_request_id/question_digest 列"
+                                    "（schema/054 未 apply）——ask 幂等键回退无键 INSERT；"
+                                    "RAG_AGENT_ASK_IDEM_ENABLE 开启前请先 apply 054")
+                            conn.rollback()
+                        elif (_is_unknown_column_error(e_col) and dispatch_cmd
+                                and "dispatch_command_id" in str(e_col)):
+                            # 052 缺列但 054 在：退「幂等键在、无命令锚」组合（各自过渡窗独立）
+                            if not _WARNED_052_MISSING:
+                                _WARNED_052_MISSING = True
+                                logger.warning(
+                                    "agent_run 无 dispatch_command_id 列（schema/052 未 apply）——"
+                                    "命令锚回退旧两步 bind 语义；RAG_AGENT_DURABLE_DISPATCH "
+                                    "开启前请先 apply 052")
+                            conn.rollback()
+                            cur.execute(
+                                f"INSERT INTO {db}.agent_run "
+                                f"({base_cols}, client_request_id, question_digest) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,"
+                                "NOW(3),NOW(3),%s,%s)",
+                                base_vals + (client_key, q_digest))
+                            _client_done = True
+                        else:
+                            raise
+                if not _client_done and dispatch_cmd:
                     try:
                         cur.execute(
                             f"INSERT INTO {db}.agent_run "
@@ -208,10 +309,10 @@ class RDSRunStore:
                             "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,"
                             "NOW(3),NOW(3),%s)",
                             base_vals + (dispatch_cmd,))
+                        _client_done = True
                     except Exception as e_col:   # noqa: BLE001
                         if not _is_unknown_column_error(e_col):
                             raise
-                        global _WARNED_052_MISSING
                         if not _WARNED_052_MISSING:
                             _WARNED_052_MISSING = True
                             logger.warning(
@@ -219,12 +320,7 @@ class RDSRunStore:
                                 "命令锚回退旧两步 bind 语义；RAG_AGENT_DURABLE_DISPATCH "
                                 "开启前请先 apply 052")
                         conn.rollback()
-                        cur.execute(
-                            f"INSERT INTO {db}.agent_run ({base_cols}) "
-                            "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,"
-                            "NOW(3),NOW(3))",
-                            base_vals)
-                else:
+                if not _client_done:
                     cur.execute(
                         f"INSERT INTO {db}.agent_run ({base_cols}) "
                         "VALUES (%s,%s,%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,NOW(3),NOW(3))",
@@ -233,6 +329,10 @@ class RDSRunStore:
             return run_id
         except Exception as e:
             conn.rollback()
+            if _is_client_request_dup_error(e):
+                # α3（M4）：同 (user, client_request_id) 已有 run（重试/并发双 POST，DB
+                # 裁决本方输）——调用方凭 find_run_by_client_request 回放收口，绝不双执行
+                raise ClientRequestBound(str(client_key)) from e
             if _is_thread_busy_error(e):
                 raise ThreadBusy(
                     f"thread {ctx.thread_id!r} 已有进行中的 run（uk_thread_active 串行化）") from e
@@ -270,6 +370,37 @@ class RDSRunStore:
                 logger.warning("按命令锚查 run 失败（回退旧重驱语义）: %s", e)
             return None
 
+    def find_run_by_client_request(self, user_id: str,
+                                   client_request_id: str) -> Optional[Dict[str, Any]]:
+        """α3（M4）：按 (user_id, client_request_id) 查既有 run——回放/竞态输家收口的
+        依据。返回 {run_id,status,question_digest,message_id,thread_id} 或 None；
+        054 未 apply（1054）/查询失败 → None（fail-open=幂等未启用语义；flag-on 必须
+        先 apply 由 readiness 契约检查钉住）。"""
+        if not (user_id and client_request_id):
+            return None
+        db = _op_db()
+        try:
+            conn = self._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT run_id, status, question_digest, message_id, thread_id "
+                        f"FROM {db}.agent_run "
+                        "WHERE user_id=%s AND client_request_id=%s LIMIT 1",
+                        (user_id, client_request_id))
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+            if not row:
+                return None
+            vals = list(row.values()) if isinstance(row, dict) else list(row)
+            return {"run_id": vals[0], "status": vals[1], "question_digest": vals[2],
+                    "message_id": vals[3], "thread_id": vals[4]}
+        except Exception as e:   # noqa: BLE001
+            if not _is_unknown_column_error(e):
+                logger.warning("按 client_request_id 查 run 失败（按无既有 run 处理）: %s", e)
+            return None
+
     def append_step(self, run_id: str, step: AgentStep) -> int:
         """追加一步 trace，返回 step_no。同 run 由 executor 单线程串行驱动（step_no=MAX+1）。"""
         if step.kind not in _STEP_KINDS:
@@ -299,13 +430,20 @@ class RDSRunStore:
 
     def record_turn(self, run_id: str, *, turn_index: int, tokens_prompt=None,
                     tokens_completion=None, tokens_total: int = 0,
-                    final: bool = False, llm_rows=None) -> None:
+                    final: bool = False, llm_rows=None,
+                    bookkeeping_id: Optional[str] = None) -> None:
         """原子记一个模型轮（perf 批次 C §4.5）：model_call step + 预算累加 + 心跳，
         **单连接单事务**——取代此前 heartbeat / append_step / consume_budget 三次
         连接+提交（每轮 4-5 次往返 → 1 次）。step_no 取号与 append_step 同式
-        （MAX+1；同 run 由 executor 单线程驱动，无并发取号）。失败整体回滚——
-        executor 侧包 fail-open 并回退分段写，预算强制仍走本地计数。"""
+        （MAX+1；同 run 由 executor 单线程驱动，无并发取号）。失败整体回滚。
+
+        α2（M3.2，codex 共识 2026-07-21）：bookkeeping_id 随 step INSERT 落
+        uk_step_bookkeeping（055）——commit-ACK 丢失后调用方**同键整事务重放**，
+        1062（限定该索引名）=原事务已落=幂等成功；分段回退双计从此可判定地消失。
+        055 未 apply（1054 且点名本列）→ warn-once 进程内负缓存，legacy 无列重试。"""
+        global _BOOKKEEPING_COL_MISSING
         db = _op_db()
+        _bid = bookkeeping_id if (bookkeeping_id and not _BOOKKEEPING_COL_MISSING) else None
         conn = self._conn()
         _begin(conn)                        # 多语句事务：钉住连接（禁 SteadyDB 单句重试）
         try:
@@ -314,13 +452,25 @@ class RDSRunStore:
                     f"SELECT COALESCE(MAX(step_no),0)+1 FROM {db}.agent_step WHERE run_id=%s",
                     (run_id,))
                 step_no = int(cur.fetchone()[0])
-                cur.execute(
-                    f"INSERT INTO {db}.agent_step "
-                    "(run_id, step_no, kind, payload_json, tokens_prompt, tokens_completion, created_at) "
-                    "VALUES (%s,%s,'model_call',%s,%s,%s,NOW(3))",
-                    (run_id, step_no,
-                     json.dumps({"turn_index": turn_index, "final": final}, ensure_ascii=False),
-                     tokens_prompt, tokens_completion))
+                if _bid is not None:
+                    cur.execute(
+                        f"INSERT INTO {db}.agent_step "
+                        "(run_id, step_no, kind, payload_json, tokens_prompt, tokens_completion, "
+                        " bookkeeping_id, created_at) "
+                        "VALUES (%s,%s,'model_call',%s,%s,%s,%s,NOW(3))",
+                        (run_id, step_no,
+                         json.dumps({"turn_index": turn_index, "final": final},
+                                    ensure_ascii=False),
+                         tokens_prompt, tokens_completion, _bid))
+                else:
+                    cur.execute(
+                        f"INSERT INTO {db}.agent_step "
+                        "(run_id, step_no, kind, payload_json, tokens_prompt, tokens_completion, created_at) "
+                        "VALUES (%s,%s,'model_call',%s,%s,%s,NOW(3))",
+                        (run_id, step_no,
+                         json.dumps({"turn_index": turn_index, "final": final},
+                                    ensure_ascii=False),
+                         tokens_prompt, tokens_completion))
                 cur.execute(
                     f"UPDATE {db}.agent_run SET turns_used=turns_used+1, "
                     "tokens_used=tokens_used+%s, heartbeat_at=NOW(3) WHERE run_id=%s",
@@ -341,18 +491,27 @@ class RDSRunStore:
                          row.get("cost_estimate"), row.get("latency_ms"),
                          row.get("status"), row.get("user_id"), row.get("dept_group")))
             conn.commit()
-        except Exception:
+        except Exception as e:
             conn.rollback()
+            if _bid is not None and _is_bookkeeping_unknown_col(e):
+                _note_bookkeeping_col_missing()
+                self.record_turn(run_id, turn_index=turn_index, tokens_prompt=tokens_prompt,
+                                 tokens_completion=tokens_completion, tokens_total=tokens_total,
+                                 final=final, llm_rows=llm_rows, bookkeeping_id=None)
+                return
             raise
         finally:
             conn.close()
 
-    def record_tool_call(self, run_id: str, *, payload=None) -> None:
+    def record_tool_call(self, run_id: str, *, payload=None,
+                         bookkeeping_id: Optional[str] = None) -> None:
         """PERF-2（2026-07-19）：工具轮记账单事务——tool_calls_used+1 + 心跳 +
         tool_call agent_step 一次 commit（对齐 record_turn 先例：两事务两借还 → 一次；
-        「预算 +1 但步骤没记」的半态同时消失）。失败整体回滚，调用方 fail-open 回退
-        分段写（预算强制恒走 executor 本地计数）。"""
+        「预算 +1 但步骤没记」的半态同时消失）。失败整体回滚。
+        α2（M3.2）：bookkeeping_id 幂等键语义与 record_turn 同（见彼处 docstring）。"""
+        global _BOOKKEEPING_COL_MISSING
         db = _op_db()
+        _bid = bookkeeping_id if (bookkeeping_id and not _BOOKKEEPING_COL_MISSING) else None
         conn = self._conn()
         _begin(conn)
         try:
@@ -364,15 +523,27 @@ class RDSRunStore:
                     f"SELECT COALESCE(MAX(step_no),0)+1 FROM {db}.agent_step WHERE run_id=%s",
                     (run_id,))
                 step_no = int(cur.fetchone()[0])
-                cur.execute(
-                    f"INSERT INTO {db}.agent_step "
-                    "(run_id, step_no, kind, payload_json, created_at) "
-                    "VALUES (%s,%s,'tool_call',%s,NOW(3))",
-                    (run_id, step_no,
-                     json.dumps(payload or {}, ensure_ascii=False)))
+                if _bid is not None:
+                    cur.execute(
+                        f"INSERT INTO {db}.agent_step "
+                        "(run_id, step_no, kind, payload_json, bookkeeping_id, created_at) "
+                        "VALUES (%s,%s,'tool_call',%s,%s,NOW(3))",
+                        (run_id, step_no,
+                         json.dumps(payload or {}, ensure_ascii=False), _bid))
+                else:
+                    cur.execute(
+                        f"INSERT INTO {db}.agent_step "
+                        "(run_id, step_no, kind, payload_json, created_at) "
+                        "VALUES (%s,%s,'tool_call',%s,NOW(3))",
+                        (run_id, step_no,
+                         json.dumps(payload or {}, ensure_ascii=False)))
             conn.commit()
-        except Exception:
+        except Exception as e:
             conn.rollback()
+            if _bid is not None and _is_bookkeeping_unknown_col(e):
+                _note_bookkeeping_col_missing()
+                self.record_tool_call(run_id, payload=payload, bookkeeping_id=None)
+                return
             raise
         finally:
             conn.close()

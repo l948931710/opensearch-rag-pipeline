@@ -211,7 +211,7 @@ class OntologyIdentityResolveTool:
         relation = args.get("relation") or "alias"
 
         from opensearch_pipeline.ontology.normalize import normalize
-        from opensearch_pipeline.ontology.store import DuplicateActiveIdentifier
+        from opensearch_pipeline.ontology.store import CommitAmbiguous, DuplicateActiveIdentifier
         try:
             norm = normalize(namespace, raw)
         except ValueError as e:
@@ -306,8 +306,34 @@ class OntologyIdentityResolveTool:
                     "（操作台账确认）该操作已由先前执行提交，本次未重复执行。"
                     + (f" 回执: {json.dumps(receipt, ensure_ascii=False)}" if receipt else ""))],
                 receipt=receipt)
+        except CommitAmbiguous:
+            # α1（M3.1，codex 共识 2026-07-21）：commit-ACK 不可知——唯一可判凭据=与
+            # 副作用同事务的操作台账三态。applied → 幂等成功收口（副作用已提交，绝不
+            # 重复铸号也绝不谎报失败）；not_applied（慢提交窗口内不可信「未提交」）/
+            # unknown（台账不可达/错配）/operation_id 未注入（flag-off 直调形态，无台账
+            # 可查）→ 原样上抛，由 executor 按 has_side_effects 归 uncertain，053 对账
+            # 器收敛——把该 uncertain 的从「确定失败」里救出来正是本分支的全部意义。
+            if operation_id:
+                verdict = None
+                try:
+                    verdict = self._get_ledger().check(self.spec.name, operation_id)
+                except Exception:   # noqa: BLE001 — 查证自身失败=仍不可知
+                    logger.warning("commit 歧义台账查证失败（op=%s），维持不可知上抛",
+                                   operation_id, exc_info=True)
+                if verdict is not None and verdict.get("outcome") == "applied":
+                    receipt = verdict.get("receipt")
+                    return ToolResult.ok(
+                        content=[ContentBlock.of_text(
+                            "（操作台账确认）落库已提交（commit 回执丢失后查证），未重复执行。"
+                            + (f" 回执: {json.dumps(receipt, ensure_ascii=False)}"
+                               if receipt else ""))],
+                        receipt=receipt)
+            logger.exception("身份确认落库 commit 结果不可知（进入 uncertain 对账）")
+            raise
         except Exception:   # noqa: BLE001 — 存储失败以 ToolResult 表达；
             # PR-I（P2）：异常原文不回模型（可能携 SQL/主机名/驱动细节），详情进日志
+            # α1 语境：能走到这里=commit **之前**的异常（store 已整体回滚，确定零副作用）
+            # ——commit 段歧义已由上方 CommitAmbiguous 分支接走，本分支的 fail 是诚实的。
             logger.exception("身份确认落库失败（详情见日志，不回模型）")
             return ToolResult.fail("身份确认落库失败（存储异常，已记录日志；请稍后重试或联系管理员）")
 

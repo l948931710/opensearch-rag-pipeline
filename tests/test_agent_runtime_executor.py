@@ -297,11 +297,15 @@ def test_record_turn_single_txn_replaces_per_turn_triple_write():
     assert [k for _, k, _ in store.steps].count("model_call") == 2
 
 
-def test_record_turn_failure_falls_back_to_segmented_writes():
-    """record_turn 单事务失败 → 回退老三样（step/budget 仍落齐，run 不受影响）。"""
+def test_record_turn_persistent_failure_no_segmented_double_write():
+    """α2（M3.2，2026-07-21 契约更新）：支持 bookkeeping_id 的 store 持续失败 →
+    同键重放一次后**放弃 durable 回退写**（旧「回退老三样」在原事务实际已提交时
+    =双计——本地计数权威，挂起时 GREATEST 纠偏）。run 不受影响照常完成。"""
     store = _TurnStore()
+    calls = []
 
     def _boom(run_id, **kw):
+        calls.append(kw.get("bookkeeping_id"))
         raise RuntimeError("txn 失败")
 
     store.record_turn = _boom
@@ -312,6 +316,28 @@ def test_record_turn_failure_falls_back_to_segmented_writes():
     events = list(handle.events())
     ex.shutdown()
     assert any(isinstance(e, RunCompleted) for e in events)
-    # 回退路径：model_call step 照记，预算经 increment_budget 落齐（budget 不缺账）
+    # 同键重放恰一次（两次调用同 bookkeeping_id），且零 durable 回退写
+    assert len(calls) == 2 and calls[0] and calls[0] == calls[1]
+    assert [k for _, k, _ in store.steps].count("model_call") == 0
+    assert store.budget["turns_used"] == 0 and store.budget["tokens_used"] == 0
+
+
+def test_record_turn_legacy_stub_keeps_segmented_fallback():
+    """旧桩（老签名，不识 bookkeeping_id/llm_rows）失败 → 维持 legacy 分段回退
+    （stub 无 commit 歧义，旧契约 byte-compatible）。"""
+    store = _TurnStore()
+
+    def _boom_old_sig(run_id, *, turn_index, tokens_prompt=None, tokens_completion=None,
+                      tokens_total=0, final=False):
+        raise RuntimeError("txn 失败")
+
+    store.record_turn = _boom_old_sig
+    ex = ThreadedRunExecutor(store, lambda ctx, ev: ToolResult.text_ok("r"), max_concurrent=2)
+    loop = DefaultAgentLoop(_scripted([ModelTurn(text="答案", usage=Usage(tokens_prompt=1,
+                                                                          tokens_completion=1))]))
+    handle = ex.submit(_ctx(), loop, [{"role": "user", "content": "q"}], [])
+    events = list(handle.events())
+    ex.shutdown()
+    assert any(isinstance(e, RunCompleted) for e in events)
     assert [k for _, k, _ in store.steps].count("model_call") == 1
     assert store.budget["turns_used"] == 1 and store.budget["tokens_used"] == 2

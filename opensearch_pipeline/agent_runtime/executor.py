@@ -20,6 +20,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterator, List, Optional
@@ -36,7 +37,7 @@ from opensearch_pipeline.agent_runtime.events import (
     ToolResultEmitted,
 )
 from opensearch_pipeline.agent_runtime.loop import AgentLoop
-from opensearch_pipeline.agent_runtime.run_store import RunStore
+from opensearch_pipeline.agent_runtime.run_store import RunStore, is_bookkeeping_dup
 from opensearch_pipeline.agent_runtime.tool import ToolResult
 
 # 裁决+执行一次工具调用（Policy 裁决 → Executor 中间件执行）。WS1 注入真实实现。
@@ -545,15 +546,30 @@ class ThreadedRunExecutor:
                     # tool_calls 预算：消费后超限即 fail-closed（在 adjudicate 执行副作用**之前**拦住）
                     tool_calls_used += 1
                     # PERF-2：预算+心跳+tool_call trace step 单事务（旧=裸 UPDATE 一笔；
-                    # 新=同一笔里补上词表里一直缺写手的 tool_call step，事务数不变）
+                    # 新=同一笔里补上词表里一直缺写手的 tool_call step，事务数不变）。
+                    # α2（M3.2）：同 _record_turn——幂等键重放；重放仍败不再分段回退
+                    # durable 预算（本地 tool_calls_used 已 +1 权威，挂起 GREATEST 纠偏）。
                     _rtc = getattr(self._store, "record_tool_call", None)
                     if _rtc is not None:
+                        _tc_payload = {"tool_name": getattr(ev, "tool_name", None),
+                                       "call_id": getattr(ev, "call_id", None)}
+                        _tc_bid = uuid.uuid4().hex
                         try:
-                            _rtc(run_id, payload={
-                                "tool_name": getattr(ev, "tool_name", None),
-                                "call_id": getattr(ev, "call_id", None)})
-                        except Exception:   # noqa: BLE001 — 单事务失败回退分段写
-                            self._budget_used(run_id, tool_calls=1)
+                            _rtc(run_id, payload=_tc_payload, bookkeeping_id=_tc_bid)
+                        except TypeError:       # 旧桩不识 bookkeeping_id——legacy 语义
+                            try:
+                                _rtc(run_id, payload=_tc_payload)
+                            except Exception:   # noqa: BLE001 — 旧桩失败维持 legacy 分段预算
+                                self._budget_used(run_id, tool_calls=1)
+                        except Exception as _e1:   # noqa: BLE001
+                            if not is_bookkeeping_dup(_e1):
+                                try:
+                                    _rtc(run_id, payload=_tc_payload, bookkeeping_id=_tc_bid)
+                                except Exception as _e2:   # noqa: BLE001
+                                    if not is_bookkeeping_dup(_e2):
+                                        logger.warning(
+                                            "record_tool_call 同键重放仍失败——放弃 durable "
+                                            "回退写（α2 本地计数权威）", exc_info=True)
                     else:
                         self._budget_used(run_id, tool_calls=1)
                     if tool_calls_used > max_tool_calls:
@@ -889,8 +905,15 @@ class ThreadedRunExecutor:
     def _record_turn(self, run_id: Optional[str], turn_index: int,
                      usage=None, final: bool = False, ctx=None) -> None:
         """每模型轮 durable 记账（perf 批次 C §4.5）：优先 store.record_turn 单事务
-        （step+预算+心跳 1 次连接，取代 3 次）；store 无此法（测试桩/旧实现）或单事务
-        失败 → 回退老三样（各自 fail-open）。预算强制恒走 _drive_gen 本地计数。"""
+        （step+预算+心跳 1 次连接，取代 3 次）。
+
+        α2（M3.2，codex 共识 2026-07-21）：真实 store 路径带 bookkeeping_id 幂等键——
+        **任何 DB 写前**生成；commit-ACK 丢失（事务异常但可能已提交）→ 同键新连接整
+        事务重放一次：撞 uk_step_bookkeeping = 原事务已落（幂等成功）；重放仍失败 →
+        **放弃全部 durable 回退写**（旧「回退老三样」在原事务实际已提交时=step 双行/
+        预算虚胖/llm 行重复——本地计数（_drive_gen）仍权威，durable 欠账由
+        suspend_run_atomic 的 GREATEST(budget_counts) 同事务纠偏，终态后无意义）。
+        旧桩（TypeError 探测）维持 legacy 语义：老签名 + 分段补写。"""
         # PERF-3：把 gateway 折叠缓冲里的成功 LLM 日志并入本轮事务（一次 commit）
         _fold = getattr(ctx, "_llm_fold", None) if ctx is not None else None
         _rows = list(_fold) if _fold else []
@@ -898,24 +921,44 @@ class ThreadedRunExecutor:
             del _fold[:]
         rt = getattr(self._store, "record_turn", None)
         if rt is not None:
-            try:
-                try:
-                    rt(run_id, turn_index=turn_index,
-                       tokens_prompt=(usage.tokens_prompt if usage else None),
-                       tokens_completion=(usage.tokens_completion if usage else None),
-                       tokens_total=(usage.total if usage else 0), final=final,
-                       llm_rows=_rows)
-                except TypeError:               # 旧桩无 llm_rows：老签名 + 日志批量补写
-                    rt(run_id, turn_index=turn_index,
+            _kw = dict(turn_index=turn_index,
                        tokens_prompt=(usage.tokens_prompt if usage else None),
                        tokens_completion=(usage.tokens_completion if usage else None),
                        tokens_total=(usage.total if usage else 0), final=final)
-                    self._flush_llm_rows(_rows)
+            _bid = uuid.uuid4().hex          # α2：DB 写前生成（同键重放的前提）
+            _legacy_stub = False
+            try:
+                rt(run_id, llm_rows=_rows, bookkeeping_id=_bid, **_kw)
                 return
-            except Exception:   # noqa: BLE001 — 单事务失败 → 回退分段写（不阻断 run）
-                logger.warning("record_turn 单事务失败（回退分段写）", exc_info=True)
-                self._flush_llm_rows(_rows)
-                _rows = []
+            except TypeError:
+                _legacy_stub = True          # 旧桩不识 bookkeeping_id——走 legacy 探测链
+            except Exception as e1:   # noqa: BLE001
+                if is_bookkeeping_dup(e1):
+                    return                   # 原事务已落（幂等）
+                try:
+                    rt(run_id, llm_rows=_rows, bookkeeping_id=_bid, **_kw)
+                    return
+                except Exception as e2:   # noqa: BLE001
+                    if is_bookkeeping_dup(e2):
+                        return               # 重放撞键=原事务已落
+                    logger.warning("record_turn 同键重放仍失败——放弃 durable 回退写"
+                                   "（α2：本地计数权威，挂起 GREATEST 纠偏）", exc_info=True)
+                    if not final:
+                        self._heartbeat(run_id)   # 幂等无害；其余 durable 回退写全部放弃
+                    return
+            if _legacy_stub:
+                try:
+                    try:
+                        rt(run_id, llm_rows=_rows, **_kw)
+                    except TypeError:       # 更旧桩无 llm_rows：老签名 + 日志批量补写
+                        rt(run_id, **_kw)
+                        self._flush_llm_rows(_rows)
+                    return
+                except Exception:   # noqa: BLE001 — 旧桩失败 → 维持 legacy 分段回退
+                    logger.warning("record_turn 单事务失败（旧桩 legacy 回退分段写）",
+                                   exc_info=True)
+                    self._flush_llm_rows(_rows)
+                    _rows = []
         if _rows:
             self._flush_llm_rows(_rows)
         if not final:
