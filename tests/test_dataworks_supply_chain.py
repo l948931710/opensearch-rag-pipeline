@@ -37,7 +37,7 @@ _DEP_FILES = _EXTRACT_FILES + [
     "dataworks_nodes/scan_oss_sync_keys.py",
 ]
 _WORKFLOWS = [".github/workflows/ci.yml", ".github/workflows/frontend.yml",
-              ".github/workflows/stress.yml"]
+              ".github/workflows/stress.yml", ".github/workflows/image.yml"]
 
 
 def test_no_bare_extractall_and_verify_wired():
