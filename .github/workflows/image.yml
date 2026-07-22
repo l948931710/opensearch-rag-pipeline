@@ -33,8 +33,12 @@ on:
 permissions:
   contents: read
 
+# 并发组按 event 维度隔离（2026-07-22 首次 promotion 实弹坑）：原 group 只按 ref——
+# 等审批中的 dispatch run 会被任意一次 push 触发的新 run cancel-in-progress 顶掉
+# （审批门直接蒸发）。拆开后：push 之间仍互相取消（省 runner），dispatch（promotion）
+# 自成一组不受 push 影响；连续两次 dispatch 互相取消属合理（后者代表最新意图）。
 concurrency:
-  group: image-${{ github.ref }}
+  group: image-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
