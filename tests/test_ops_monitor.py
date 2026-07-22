@@ -15,9 +15,12 @@ def test_run_all_sequences_selected_jobs(monkeypatch):
     monkeypatch.setattr(qr, "run_rollup", lambda **k: calls.append("rollup") or {"ok": True, "slo_ok": 1})
     out = ops_monitor.run_all(alert=False)
     # P2-34/P2-15 起作业集含 queue_aging/ingest_funnel（模拟态 no-op skipped）；
-    # CS4c（2026-07-16）起含 unregistered_raw
+    # CS4c（2026-07-16）起含 unregistered_raw；Majors γ（2026-07-21）起含
+    # agent_health/audit_digest（双 flag 默认 off → skipped/exit 0）
     assert set(out) == {"reconcile_ha3", "reconcile_oss", "reconcile_raw", "unregistered_raw",
-                        "qa_rollup", "queue_aging", "ingest_funnel"}
+                        "qa_rollup", "queue_aging", "ingest_funnel",
+                        "agent_health", "audit_digest"}
+    assert out["agent_health"].get("skipped") and out["audit_digest"].get("skipped")
     assert calls == ["ha3", "oss", "raw", "unreg", "rollup"]
 
 

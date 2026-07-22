@@ -12,9 +12,9 @@ apply 脚本落库并记台账。
    `schema_migrations` INSERT 一行。跳过任何一步都是事故预备役——010 漂移
    （生产有 `normalized_gap_query`、权威 DDL 没有，重建环境提交贡献必 1054）就是这么来的。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
-3. **编号严格单调递增**，下一个可用号 = 059——056/057 已预订给 Majors γ 批
-   （agent_daily_metrics / llm_call_log 价表版本列，见
-   `docs/majors_remediation_plan_2026-07-21_DRAFT.md`），落地前是有意空号
+3. **编号严格单调递增**，下一个可用号 = 059——056/057 已随 Majors γ 批落地
+   （agent_daily_metrics / llm_call_log 价表版本列，2026-07-21，矩阵有行），
+   历史空号先例
    （031=agent 审批/执行硬化【2026-07-11 占用——
    原「本体事件」的 P2 预订作废顺延，落地时取当时最新号】、032=台账 checksum、033=本体
    link 不变量、034=sem 视图 product ACL 列、035=checkpoint 摘要 HMAC 加宽、036=agent_run
@@ -90,7 +90,9 @@ apply 脚本落库并记台账。
 | 053_tool_invocation_reconcile.sql | fuling_operation | uncertain 对账退避/隔离（R3 P1-RT-09，2026-07-18）：tool_invocation.reconcile_attempts + next_reconcile_at + 复合索引——毒头阻塞根治（unknown 指数退避 30s..1h、达上限 20 隔离出扫描面）；lister/更新 1054 容错（**代码可先行**）；无存量 backfill |
 | 054_agent_run_request_identity.sql | fuling_operation | ask 业务域幂等+活跃执行耗时（Majors α3/γ1，2026-07-21）：agent_run.client_request_id + question_digest + active_latency_ms + uk_run_client_req——响应丢失重试不再双 run；latency 各腿累计不含审批等待；写侧 1054 容错（**代码可先行**）；RAG_AGENT_ASK_IDEM_ENABLE 开启前必须 apply（readiness 钉住）；全单动作语句 |
 | 055_agent_step_bookkeeping.sql | fuling_operation | 记账幂等键（Majors α2/M3.2，2026-07-21）：agent_step.bookkeeping_id + uk_step_bookkeeping——合并记账事务 commit-ACK 丢失后同键重放，1062=已落，根治分段回退双计；1054（错误文本含列名）warn-once 回退 legacy（**代码可先行**） |
-| 058_agent_quota_lock.sql | fuling_operation | 审批入场配额哨兵锁+配额向索引（Majors α5/M6，2026-07-21）：agent_quota_lock 哨兵表（FOR UPDATE 串行化三层配额裁决）+ approval_request idx_approval_quota——任一 cap>0 而表/哨兵缺 = ApprovalQuotaUnavailable **fail-closed**，caps 全 0 零接触；全语句自幂等；056/057 为 γ 批预订空号 |
+| 056_agent_daily_metrics.sql | fuling_operation | Agent 权威监控面（Majors γ3/M9，2026-07-21）：agent_daily_metrics 按北京日一行——可用率事实（终态计数/success_rate）+active/TTR 分位+八维瞬时快照+SLO 裁决；agent_health 作业（RAG_AGENT_HEALTH_ENABLE 默认 off）UPSERT，flag-on 前置 apply（readiness agent_health_contract）；CREATE TABLE IF NOT EXISTS 自幂等 |
+| 057_llm_call_log_price_version.sql | fuling_operation | LLM 成本回算价表版本列（Majors γ4/M15，2026-07-21）：llm_call_log.price_table_version——RAG_MODEL_PRICE_TABLE_JSON 回算 cost_estimate 时同行落值（成本可审计/换版可追溯）；写侧 1054 负缓存降级（**代码可先行**）；价表非空前置 apply（readiness price_table_contract） |
+| 058_agent_quota_lock.sql | fuling_operation | 审批入场配额哨兵锁+配额向索引（Majors α5/M6，2026-07-21）：agent_quota_lock 哨兵表（FOR UPDATE 串行化三层配额裁决）+ approval_request idx_approval_quota——任一 cap>0 而表/哨兵缺 = ApprovalQuotaUnavailable **fail-closed**，caps 全 0 零接触；全语句自幂等 |
 
 ## 台账（schema_migrations）
 
