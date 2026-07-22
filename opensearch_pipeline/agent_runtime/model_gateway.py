@@ -382,6 +382,17 @@ class ModelGateway:
             return
         try:
             groups = getattr(ctx, "acl_groups", None)
+            # γ4（M15 价表，codex 共识 2026-07-21）：行构造单点回算——同步与折叠两条
+            # 写路径同落 cost_estimate+price_table_version（057）；价表未配/未知 model
+            # → (None, None) 维持既有 NULL（023 拍板不破）。回算失败绝不影响记账。
+            _cost, _ptv = None, None
+            try:
+                from opensearch_pipeline.llm_pricing import estimate_cost
+                _cost, _ptv = estimate_cost(
+                    model, usage.tokens_prompt if usage else None,
+                    usage.tokens_completion if usage else None)
+            except Exception:   # noqa: BLE001 — 价表回算辅助面 fail-open
+                logger.warning("llm 价表回算失败（cost_estimate 落 NULL）", exc_info=True)
             # PERF-3（2026-07-19）：成功调用的日志**折叠进 ctx 缓冲**，随 executor 的
             # record_turn 同事务落库——纯记账 INSERT+COMMIT 离开用户等待路径。
             # 失败 attempt 维持同步直写（罕见+天然 durable——比引入新 outbox 简单且不丢）；
@@ -392,26 +403,32 @@ class ModelGateway:
                                        "true").strip().lower()
                     in ("1", "true", "yes", "on")):
                 import uuid as _uuid
-                _fold.append({
+                _row = {
                     "call_id": _uuid.uuid4().hex,
                     "request_id": getattr(ctx, "request_id", None),
                     "provider": provider, "model": model, "category": category,
                     "prompt_version": getattr(ctx, "prompt_version", None),
                     "tokens_prompt": usage.tokens_prompt if usage else None,
                     "tokens_completion": usage.tokens_completion if usage else None,
-                    "cost_estimate": None, "latency_ms": latency_ms, "status": status,
+                    "cost_estimate": _cost, "latency_ms": latency_ms, "status": status,
                     "user_id": getattr(ctx, "user_id", None),
-                    "dept_group": (groups[0] if groups else None)})
+                    "dept_group": (groups[0] if groups else None)}
+                if _ptv is not None:      # 价表未配=零新键（旧消费面 byte-identical）
+                    _row["price_table_version"] = _ptv
+                _fold.append(_row)
                 return
-            self._call_logger(
+            _kw = dict(
                 run_id=getattr(ctx, "run_id", None), request_id=getattr(ctx, "request_id", None),
                 provider=provider, model=model, category=category,
                 prompt_version=getattr(ctx, "prompt_version", None),
                 tokens_prompt=usage.tokens_prompt if usage else None,
                 tokens_completion=usage.tokens_completion if usage else None,
-                cost_estimate=None, latency_ms=latency_ms, status=status,
+                cost_estimate=_cost, latency_ms=latency_ms, status=status,
                 user_id=getattr(ctx, "user_id", None),
                 dept_group=(groups[0] if groups else None))
+            if _ptv is not None:          # 同上：默认路径不传新 kwarg（旧桩 logger 不炸）
+                _kw["price_table_version"] = _ptv
+            self._call_logger(**_kw)
         except Exception:   # noqa: BLE001 — 记账失败绝不影响模型调用
             logger.warning("llm_call_log 记账失败（fail-open）", exc_info=True)
 

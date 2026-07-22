@@ -165,3 +165,47 @@ def test_no_active_ms_leaves_null_and_zero_is_noop():
         assert al2 is None
     finally:
         _cleanup(runs)
+
+
+# ── γ4（M15 价表）真库回读——γ 批真库契约共用本串行模块（agent 真库族同表）─────
+
+
+@skipif_no_db
+def test_g4_record_llm_call_roundtrips_price_version():
+    """057 已 apply（本地）：record_llm_call 带 price_table_version 落库可回读；
+    不带=NULL（byte-identical）。"""
+    from decimal import Decimal
+
+    from opensearch_pipeline.agent_runtime.run_store import RDSRunStore
+    store, ids = RDSRunStore(), []
+    conn = _local_operation_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema=DATABASE() AND table_name='llm_call_log' "
+                        "AND column_name='price_table_version'")
+            if cur.fetchone()[0] != 1:
+                pytest.skip("llm_call_log 缺 price_table_version（先 apply schema/057）")
+        c1 = store.record_llm_call(
+            run_id=None, request_id="g4", provider="dashscope", model="qwen3.6-plus",
+            category="agent", prompt_version=None, tokens_prompt=1000, tokens_completion=500,
+            cost_estimate=Decimal("0.0100"), latency_ms=5, status="ok",
+            user_id="g4-tester", dept_group="production", price_table_version="2026-07-v1")
+        c2 = store.record_llm_call(
+            run_id=None, request_id="g4", provider="dashscope", model="qwen3.6-plus",
+            category="agent", prompt_version=None, tokens_prompt=1, tokens_completion=1,
+            cost_estimate=None, latency_ms=5, status="ok",
+            user_id="g4-tester", dept_group="production")
+        ids = [c1, c2]
+        with conn.cursor() as cur:
+            cur.execute("SELECT call_id, cost_estimate, price_table_version "
+                        "FROM llm_call_log WHERE call_id IN (%s,%s)", (c1, c2))
+            rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        assert rows[c1][1] == "2026-07-v1" and rows[c1][0] is not None
+        assert rows[c2] == (None, None)
+    finally:
+        if ids:
+            with conn.cursor() as cur:
+                ph = ",".join(["%s"] * len(ids))
+                cur.execute(f"DELETE FROM llm_call_log WHERE call_id IN ({ph})", ids)
+        conn.close()

@@ -1239,6 +1239,18 @@ def load_config() -> PipelineConfig:
                 f"该姿态下告警链整体 SUPPRESSED（只活在日志）。配好 webhook 或关闭该 flag；"
                 f"配置存在≠送达证明，送达以现网 attestation 为准（γ7/M10）。")
 
+    # γ4（M15 价表，Majors 批次 γ，codex 共识 2026-07-21）：RAG_MODEL_PRICE_TABLE_JSON
+    # 契约校验——非空非法 fail-fast（价表是成本审计输入，静默吞坏配置=成本回算悄悄停摆）；
+    # 默认空=不启用（cost_estimate 维持 NULL，023 拍板不破）。消费在 llm_pricing.estimate_cost；
+    # 非空前置=schema/057 已 apply（readiness price_table_contract 探针）。
+    if (os.environ.get("RAG_MODEL_PRICE_TABLE_JSON") or "").strip():
+        from opensearch_pipeline.llm_pricing import parse_price_table
+        try:
+            parse_price_table(os.environ["RAG_MODEL_PRICE_TABLE_JSON"])
+        except ValueError as _pe:
+            raise ValueError(f"🚨 [CONFIG GUARD] RAG_MODEL_PRICE_TABLE_JSON 非法：{_pe}"
+                             f"（γ4/M15——修好价表或清空该变量）") from _pe
+
     # 【P2-28/P2-6】供应商守卫触发条件 = 自报标签 OR 生产物理指纹（is_prod_target）：
     # 此前只键于标签——dev 标签经 RAG_ALLOW_REMOTE_DB/SEARCH=read_only_ack 实连生产 RDS/HA3、
     # 且只配 GEMINI key 时，模型解析全路由 Google，生产 chunk_text/查询内容会被 POST 到 Google。

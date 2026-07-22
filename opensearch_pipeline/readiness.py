@@ -501,6 +501,22 @@ def approval_quota_contract_status() -> str:
     return _cached("approval_quota_contract", 60, _compute)
 
 
+def price_table_contract_status() -> str:
+    """γ4（M15 价表，codex 共识 2026-07-21）：RAG_MODEL_PRICE_TABLE_JSON 非空 ⇒ 057
+    llm_call_log.price_table_version 必须在位——缺列时写侧 1054 warn-once 降级
+    （cost_estimate 落值而价表版本不可溯，成本审计口径残缺）。未配价表 → skipped
+    （报告面契约，ask_idem_contract 同款先例）。"""
+    if not (os.environ.get("RAG_MODEL_PRICE_TABLE_JSON") or "").strip():
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        return _columns_exist(db, [("llm_call_log", "price_table_version", "057")])
+
+    return _cached("price_table_contract", 60, _compute)
+
+
 def op_reconcile_contract_status() -> str:
     """RR-2（P2-RR-06）：RAG_AGENT_OP_RECONCILE_ENABLE 开 ⇒ 053 两列必须在位——
     缺列时退避/隔离整体回退旧「最老 LIMIT」语义（毒头阻塞重开），开着 flag 跑旧

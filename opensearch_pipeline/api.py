@@ -805,6 +805,8 @@ def _compute_readiness(cfg):
     checks["durable_dispatch_contract"] = _readiness.durable_dispatch_contract_status()
     checks["ask_idem_contract"] = _readiness.ask_idem_contract_status()
     checks["approval_quota_contract"] = _readiness.approval_quota_contract_status()
+    # γ4（M15）：价表非空 ⇒ 057 版本列在位（报告面；写侧对缺列有 1054 warn-once 降级）
+    checks["price_table_contract"] = _readiness.price_table_contract_status()
     checks["op_reconcile_contract"] = _readiness.op_reconcile_contract_status()
     checks["ingest_lease_contract"] = _readiness.ingest_lease_contract_status()
     checks["write_tool_contract"] = _readiness.write_tool_contract_status()

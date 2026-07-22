@@ -132,6 +132,60 @@ def _note_active_latency_col_missing() -> None:
                        "跳过（warn-once；QA 行回退本腿 monotonic，apply 后重启进程恢复）")
 
 
+# ── γ4（M15 价表，codex 共识 2026-07-21）：llm_call_log.price_table_version（057）────
+
+_PRICE_VERSION_COL_MISSING = False   # 057 未 apply 的进程内负缓存（warn-once）
+
+
+def _is_price_version_unknown_col(exc: BaseException) -> bool:
+    txt = str(exc)
+    if "price_table_version" not in txt:
+        return False
+    args = getattr(exc, "args", None) or ()
+    return (bool(args) and args[0] == 1054) or "Unknown column" in txt
+
+
+def _note_price_version_col_missing() -> None:
+    global _PRICE_VERSION_COL_MISSING
+    if not _PRICE_VERSION_COL_MISSING:
+        _PRICE_VERSION_COL_MISSING = True
+        logger.warning("llm_call_log.price_table_version 缺列（schema/057 未 apply）——"
+                       "价表版本落值跳过（warn-once；readiness price_table_contract 会红，"
+                       "apply 后重启进程恢复）")
+
+
+def _insert_llm_row(cur, db: str, run_id, row: dict) -> None:
+    """γ4：llm_call_log 单行 INSERT 的**语句级**降级封装——row 带 price_table_version
+    且 057 在位 → 16 列形态；缺列 1054 → 负缓存+同语句无列重试（绝不让 057 观测列
+    炸掉宿主事务——record_turn 的记账幂等重放不该为它触发）。价表未配（无该键/None）
+    → 15 列旧形态 byte-identical。"""
+    _ptv = row.get("price_table_version") if not _PRICE_VERSION_COL_MISSING else None
+    base_cols = ("call_id, run_id, request_id, provider, model, category, "
+                 "prompt_version, tokens_prompt, tokens_completion, cost_estimate, "
+                 "latency_ms, status, user_id, dept_group")
+    base_vals = (row.get("call_id") or uuid.uuid4().hex, run_id,
+                 row.get("request_id"), row.get("provider"), row.get("model"),
+                 row.get("category"), row.get("prompt_version"),
+                 row.get("tokens_prompt"), row.get("tokens_completion"),
+                 row.get("cost_estimate"), row.get("latency_ms"),
+                 row.get("status"), row.get("user_id"), row.get("dept_group"))
+    if _ptv is not None:
+        try:
+            cur.execute(
+                f"INSERT INTO {db}.llm_call_log ({base_cols}, price_table_version, created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
+                (*base_vals, _ptv))
+            return
+        except Exception as _pe:   # noqa: BLE001 — 仅 057 缺列降级
+            if not _is_price_version_unknown_col(_pe):
+                raise
+            _note_price_version_col_missing()
+    cur.execute(
+        f"INSERT INTO {db}.llm_call_log ({base_cols}, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
+        base_vals)
+
+
 def _call_extra_writer(writer, cur, active_total_ms) -> None:
     """γ1：完成回调双形态兼容——能收第二参（(cur, active_total_ms)）的给两参；既有
     单参回调（历史测试/简化桩）照旧只给 cur。签名探测失败按单参处理
@@ -518,19 +572,10 @@ class RDSRunStore:
                     (int(tokens_total), run_id))
                 # PERF-3（2026-07-19）：成功模型调用的 llm_call_log 并入本事务——
                 # 记账离开用户等待路径的独立 INSERT+COMMIT（gateway 折叠缓冲注入）。
+                # γ4：经 _insert_llm_row 落 price_table_version（057 缺列语句级降级，
+                # 绝不触发本事务的记账幂等重放）。
                 for row in (llm_rows or []):
-                    cur.execute(
-                        f"INSERT INTO {db}.llm_call_log "
-                        "(call_id, run_id, request_id, provider, model, category, "
-                        " prompt_version, tokens_prompt, tokens_completion, cost_estimate, "
-                        " latency_ms, status, user_id, dept_group, created_at) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
-                        (row.get("call_id") or uuid.uuid4().hex, run_id,
-                         row.get("request_id"), row.get("provider"), row.get("model"),
-                         row.get("category"), row.get("prompt_version"),
-                         row.get("tokens_prompt"), row.get("tokens_completion"),
-                         row.get("cost_estimate"), row.get("latency_ms"),
-                         row.get("status"), row.get("user_id"), row.get("dept_group")))
+                    _insert_llm_row(cur, db, run_id, row)
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -1609,22 +1654,22 @@ class RDSRunStore:
                         model: str, category: Optional[str], prompt_version: Optional[str],
                         tokens_prompt: Optional[int], tokens_completion: Optional[int],
                         cost_estimate: Optional[float], latency_ms: Optional[int], status: str,
-                        user_id: Optional[str], dept_group: Optional[str]) -> str:
+                        user_id: Optional[str], dept_group: Optional[str],
+                        price_table_version: Optional[str] = None) -> str:
+        """γ4（M15）：price_table_version=回算 cost_estimate 的价表版本（057）——
+        价表未配（None，默认）零变化；057 未 apply → _insert_llm_row 语句级降级。"""
         call_id = uuid.uuid4().hex
         db = _op_db()
         conn = self._conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO {db}.llm_call_log "
-                    "(call_id, run_id, request_id, provider, model, category, prompt_version, "
-                    " tokens_prompt, tokens_completion, cost_estimate, latency_ms, status, "
-                    " user_id, dept_group, created_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
-                    (call_id, run_id, request_id, provider, model, category, prompt_version,
-                     tokens_prompt, tokens_completion, cost_estimate, latency_ms, status,
-                     user_id, dept_group),
-                )
+                _insert_llm_row(cur, db, run_id, {
+                    "call_id": call_id, "request_id": request_id, "provider": provider,
+                    "model": model, "category": category, "prompt_version": prompt_version,
+                    "tokens_prompt": tokens_prompt, "tokens_completion": tokens_completion,
+                    "cost_estimate": cost_estimate, "latency_ms": latency_ms,
+                    "status": status, "user_id": user_id, "dept_group": dept_group,
+                    "price_table_version": price_table_version})
             conn.commit()
             return call_id
         except Exception:
@@ -1639,22 +1684,19 @@ class RDSRunStore:
 
     def record_llm_calls(self, rows: "list") -> int:
         """llm_call_log **批量**落库（perf 批次 C §4.5：llm_log_outbox 冲刷用）：
-        单连接单事务 executemany。rows = record_llm_call 同名 kwargs 的 dict 列表；
-        created_at 取冲刷时刻（账本按日对账，亚秒偏移无关紧要）。返回写入行数。"""
+        单连接单事务、逐行 _insert_llm_row（γ4：行内可携 price_table_version，057
+        缺列语句级降级；此前 executemany 无法混合两种列形态，批量收益本就以事务为主）。
+        rows = record_llm_call 同名 kwargs 的 dict 列表；created_at 取冲刷时刻
+        （账本按日对账，亚秒偏移无关紧要）。返回写入行数。"""
         if not rows:
             return 0
         db = _op_db()
         conn = self._conn()
+        _begin(conn)                     # 多语句同事务：钉住连接（与 record_turn 同款）
         try:
             with conn.cursor() as cur:
-                cur.executemany(
-                    f"INSERT INTO {db}.llm_call_log "
-                    "(call_id, run_id, request_id, provider, model, category, prompt_version, "
-                    " tokens_prompt, tokens_completion, cost_estimate, latency_ms, status, "
-                    " user_id, dept_group, created_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(3))",
-                    [(uuid.uuid4().hex, *[r.get(c) for c in self._LLM_CALL_COLS])
-                     for r in rows])
+                for r in rows:
+                    _insert_llm_row(cur, db, r.get("run_id"), r)
             conn.commit()
             return len(rows)
         except Exception:
