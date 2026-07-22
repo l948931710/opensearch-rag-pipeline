@@ -35,6 +35,7 @@ def ensure_deps():
         sys.executable, "-m", "pip", "install",
         *DEPS, "-t", dep_dir, "-q"
     ])
+    subprocess.call([sys.executable, "-m", "pip", "freeze", "--path", dep_dir])   # δ3（M13）：传递闭包可见化（冻结回填 user-gated）
     if dep_dir not in sys.path:
         sys.path.insert(0, dep_dir)
 

@@ -249,3 +249,112 @@ def test_workflows_all_actions_sha_pinned():
                 if not re.fullmatch(r"[0-9a-f]{40}", ref):
                     offenders.append(f"{wf}: {s}")
     assert not offenders, f"workflows 存在未按 SHA 钉死的 action: {offenders}"
+
+
+# ── δ3（M13，Majors 批次 δ，codex 共识 2026-07-21）：STRICT + HMAC 信任边界 ──────
+
+
+@pytest.fixture(autouse=True)
+def _dw_env_clean(monkeypatch):
+    monkeypatch.delenv("RAG_DW_SIDECAR_STRICT", raising=False)
+    monkeypatch.delenv("RAG_DW_ZIP_HMAC_KEY", raising=False)
+
+
+def _hmac_of(key: str, digest: str) -> str:
+    import hmac
+    return hmac.new(key.encode("utf-8"), digest.encode("ascii"),
+                    hashlib.sha256).hexdigest()
+
+
+class TestSidecarStrictMode:
+    def test_strict_without_key_rejects(self, verify_zip, monkeypatch):
+        """STRICT on 而调度 env 无 key → 无从硬验，直接拒（缺 sidecar 与否无关）。"""
+        make, zip_path, digest = verify_zip
+        monkeypatch.setenv("RAG_DW_SIDECAR_STRICT", "true")
+        monkeypatch.chdir(os.path.dirname(zip_path))
+        with pytest.raises(RuntimeError, match="RAG_DW_ZIP_HMAC_KEY"):
+            make({})(os.path.basename(zip_path))
+
+    def test_strict_missing_sidecar_rejects(self, verify_zip, monkeypatch):
+        make, zip_path, digest = verify_zip
+        monkeypatch.setenv("RAG_DW_SIDECAR_STRICT", "on")
+        monkeypatch.setenv("RAG_DW_ZIP_HMAC_KEY", "k1")
+        monkeypatch.chdir(os.path.dirname(zip_path))
+        with pytest.raises(RuntimeError, match="STRICT"):
+            make({})(os.path.basename(zip_path))
+
+    def test_strict_full_chain_passes(self, verify_zip, monkeypatch):
+        make, zip_path, digest = verify_zip
+        monkeypatch.setenv("RAG_DW_SIDECAR_STRICT", "1")
+        monkeypatch.setenv("RAG_DW_ZIP_HMAC_KEY", "k1")
+        monkeypatch.chdir(os.path.dirname(zip_path))
+        base = os.path.basename(zip_path)
+        fn = make({base + ".sha256": digest + "\n",
+                   base + ".sha256.hmac": _hmac_of("k1", digest) + "\n"})
+        assert fn(base) == digest
+
+
+class TestHmacTrustBoundary:
+    def test_key_with_valid_hmac_passes(self, verify_zip, monkeypatch):
+        """默认（非 STRICT）+ key：sha256 对 + 签名对 → 放行。"""
+        make, zip_path, digest = verify_zip
+        monkeypatch.setenv("RAG_DW_ZIP_HMAC_KEY", "prod-key")
+        monkeypatch.chdir(os.path.dirname(zip_path))
+        base = os.path.basename(zip_path)
+        fn = make({base + ".sha256": digest,
+                   base + ".sha256.hmac": _hmac_of("prod-key", digest)})
+        assert fn(base) == digest
+
+    def test_key_with_forged_sidecar_rejects(self, verify_zip, monkeypatch):
+        """核心威胁：攻击者换 zip+同步伪造 .sha256（sha256 面自洽）——签名对不上
+        调度 env key → 拒。"""
+        make, zip_path, digest = verify_zip
+        monkeypatch.setenv("RAG_DW_ZIP_HMAC_KEY", "prod-key")
+        monkeypatch.chdir(os.path.dirname(zip_path))
+        base = os.path.basename(zip_path)
+        fn = make({base + ".sha256": digest,
+                   base + ".sha256.hmac": _hmac_of("attacker-key", digest)})
+        with pytest.raises(RuntimeError, match="HMAC 校验失败"):
+            fn(base)
+
+    def test_key_missing_hmac_sidecar_rejects(self, verify_zip, monkeypatch):
+        """key 已配而 .hmac 资源缺失（只传了两份旧资源）→ 硬拒（不静默降级回 sha256-only）。"""
+        make, zip_path, digest = verify_zip
+        monkeypatch.setenv("RAG_DW_ZIP_HMAC_KEY", "prod-key")
+        monkeypatch.chdir(os.path.dirname(zip_path))
+        base = os.path.basename(zip_path)
+        fn = make({base + ".sha256": digest})
+        with pytest.raises(RuntimeError, match="sha256.hmac"):
+            fn(base)
+
+    def test_no_key_keeps_legacy_behavior(self, verify_zip, monkeypatch):
+        """无 key（默认）：hmac 面零接触——与 B4 现状 byte-identical（off 契约）。"""
+        make, zip_path, digest = verify_zip
+        monkeypatch.chdir(os.path.dirname(zip_path))
+        base = os.path.basename(zip_path)
+        assert make({base + ".sha256": digest})(base) == digest    # 不需要 .hmac 资源
+
+
+def test_py37_requirements_mirror_parity():
+    """δ3：requirements-dataworks-py37.txt 必须 == 节点 py3.7 分支钉版并集
+    （改任一侧不改另一侧即红；文件是 ci pip-audit 的审计面）。"""
+    union = set()
+    for rel in _DEP_FILES:
+        for deps in _py37_dep_lists(rel):
+            union.update(d for d in deps if "==" in d)
+    req = REPO / "requirements-dataworks-py37.txt"
+    lines = {ln.strip() for ln in req.read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.strip().startswith("#")}
+    assert lines == union, (
+        f"钉版镜像与节点 DEPS 漂移：文件多 {sorted(lines - union)}，缺 {sorted(union - lines)}")
+
+
+def test_audit_baseline_file_shape():
+    """基线文件可被 ci.yml 的 grep|sed 拼接消费：非注释行全部形如漏洞 ID。"""
+    import re
+    base = REPO / "deploy" / "dataworks_py37_audit_baseline.txt"
+    ids = [ln.strip() for ln in base.read_text(encoding="utf-8").splitlines()
+           if ln.strip() and not ln.strip().startswith("#")]
+    assert len(ids) >= 50                      # 快照基线量级 sanity
+    bad = [i for i in ids if not re.fullmatch(r"[A-Z]+-[A-Za-z0-9-]+", i)]
+    assert not bad, f"基线含非 ID 行（会拼进 --ignore-vuln 弄坏命令）: {bad}"

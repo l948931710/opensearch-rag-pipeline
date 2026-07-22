@@ -1,0 +1,26 @@
+# requirements-dataworks-py37.txt — DataWorks py3.7 节点钉版集的**镜像**（Majors δ3/M13，
+# codex 共识 2026-07-21）。
+#
+# 真源 = 各节点 py3.7 分支的 DEPS 列表（节点是控制台粘贴的自包含脚本，无法 import 共享
+# 文件）；本文件是它们的并集镜像，唯一用途：
+#   ① ci security job 对其跑 pip-audit（新 CVE 进入即红——基线见
+#      deploy/dataworks_py37_audit_baseline.txt，逐条评估先例 ci-green-gotchas）；
+#   ② tests/test_dataworks_supply_chain.py parity 测试锁「节点 DEPS ↔ 本文件」同步
+#      （改任一侧不改另一侧即红）。
+# ⚠️ 不是安装清单：节点运行时 pip install 现场解析传递闭包（未冻结——冻结回填=
+#    user-gated，节点日志已加 pip freeze 打印，Sam 跑一次 DW 后取日志回填）。
+# ⚠️ 版本是 py3.7 serverless pod 的兼容上限（升版=节点当场炸），不是任性旧钉。
+alibabacloud_ha3engine_vector==1.1.19
+DBUtils==3.1.2
+jieba==0.42.1
+openpyxl==3.1.3
+oss2==2.19.1
+pdfplumber==0.9.0
+Pillow==9.5.0
+PyMuPDF==1.22.5
+PyMySQL==1.1.1
+pypdf==3.17.4
+python-docx==1.1.0
+python-pptx==0.6.23
+requests==2.31.0
+typing_extensions==4.7.1

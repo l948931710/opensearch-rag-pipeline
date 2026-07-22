@@ -1,0 +1,80 @@
+# dataworks_py37_audit_baseline.txt — requirements-dataworks-py37.txt 的 pip-audit
+# 已知漏洞基线（Majors δ3/M13，2026-07-22 快照；逐条评估纪律=ci-green-gotchas 先例）。
+#
+# 逐条评估结论（按包）：全部源于 **py3.7 pod 兼容上限钉版**——修复版本一律要求
+# python>=3.8，升版=节点当场 ImportError，不可修。接受依据（威胁模型）：
+#   · pypdf/Pillow/PyMuPDF/pdfplumber/pdfminer-six：解析面漏洞（恶意 PDF/图片触发
+#     DoS/信息泄露）。节点只解析**富岭自家 OSS 桶**的内部文档（上传面有登录+ACL+
+#     审批门），不接受任意外部输入；单次运行的 pod 是一次性的。
+#   · requests：Proxy-Authorization 泄漏/verify 绕过类——节点仅访问阿里云内网
+#     RDS/OSS/DashScope 固定端点，无代理配置。
+#   · cryptography（oss2 传递）：pod 现场解析装**当前最新兼容版**，其上的新告示会随
+#     上游修复自然消失；出现在基线仅因快照时点。
+# 复评触发：①任何新 ID（不在本文件）→ ci 红，逐条评估后才准入列；②SAE/DataWorks
+# 侧 py3.8+ 迁移完成 → 本基线整体作废、钉版升级；③传递闭包冻结回填（user-gated）后
+# 改为对冻结清单审计。
+# 格式：# 包名==版本 分节，下面每行一个漏洞 ID（ci.yml 读本文件拼 --ignore-vuln）。
+# cryptography==45.0.7
+GHSA-537c-gmf6-5ccf
+PYSEC-2026-2141
+PYSEC-2026-35
+PYSEC-2026-36
+# pdfminer-six==20221105
+PYSEC-2026-1761
+PYSEC-2026-1762
+# pillow==9.5.0
+CVE-2026-54058
+CVE-2026-59197
+CVE-2026-59198
+CVE-2026-59200
+CVE-2026-59204
+PYSEC-2023-175
+PYSEC-2023-227
+PYSEC-2026-165
+PYSEC-2026-1793
+PYSEC-2026-1794
+PYSEC-2026-2253
+PYSEC-2026-2254
+PYSEC-2026-2255
+PYSEC-2026-2256
+PYSEC-2026-2257
+PYSEC-2026-2874
+PYSEC-2026-3451
+PYSEC-2026-3453
+PYSEC-2026-457
+# pypdf==3.17.4
+GHSA-jm82-fx9c-mx94
+PYSEC-2026-1827
+PYSEC-2026-1828
+PYSEC-2026-1829
+PYSEC-2026-1830
+PYSEC-2026-1831
+PYSEC-2026-1832
+PYSEC-2026-1833
+PYSEC-2026-3004
+PYSEC-2026-3005
+PYSEC-2026-3006
+PYSEC-2026-3007
+PYSEC-2026-3009
+PYSEC-2026-3010
+PYSEC-2026-3011
+PYSEC-2026-3012
+PYSEC-2026-3013
+PYSEC-2026-3014
+PYSEC-2026-3015
+PYSEC-2026-3016
+PYSEC-2026-3017
+PYSEC-2026-3018
+PYSEC-2026-3019
+PYSEC-2026-3020
+PYSEC-2026-3021
+PYSEC-2026-3022
+PYSEC-2026-3023
+PYSEC-2026-3024
+PYSEC-2026-3025
+PYSEC-2026-3026
+PYSEC-2026-3027
+# requests==2.31.0
+PYSEC-2026-1872
+PYSEC-2026-1873
+PYSEC-2026-2275
