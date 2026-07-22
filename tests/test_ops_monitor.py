@@ -41,6 +41,24 @@ def test_job_exit_codes():
     assert ops_monitor._job_exit("qa_rollup", {"ok": True, "slo_ok": 0}) == 2
 
 
+def test_job_exit_fetch_verdict_contract():
+    """终局裁决（2026-07-21）与退出码的契约：纯枚举盲区报告 ok=True → 绿灯 0；
+    fetch 证实真丢失 / 无法定性 → ok=False → 2；扫描不完整恒 3（先于 ok 判定）。"""
+    blind = {"ok": True, "complete": True, "verdict_basis": "fetch",
+             "counts": {"rds_active_missing": 113, "query_invisible": 113,
+                        "missing_confirmed": 0, "missing_unclassified": 0,
+                        "vanished_at_risk": 0}}
+    assert ops_monitor._job_exit("reconcile_ha3", blind) == 0
+    confirmed = {"ok": False, "complete": True, "verdict_basis": "fetch",
+                 "counts": {"missing_confirmed": 1}}
+    assert ops_monitor._job_exit("reconcile_ha3", confirmed) == 2
+    fetch_down = {"ok": False, "complete": True, "verdict_basis": "query_only",
+                  "counts": {"rds_active_missing": 5}}
+    assert ops_monitor._job_exit("reconcile_ha3", fetch_down) == 2
+    truncated = {"ok": True, "complete": False, "verdict_basis": "fetch", "counts": {}}
+    assert ops_monitor._job_exit("reconcile_ha3", truncated) == 3
+
+
 def test_main_worst_exit_code(monkeypatch):
     monkeypatch.setattr(ops_monitor, "run_all", lambda **k: {
         "reconcile_ha3": {"ok": True, "complete": True},          # 0

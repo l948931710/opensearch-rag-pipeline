@@ -137,8 +137,9 @@ def test_parity_report_carries_scan_metrics(live_stores):
 
 
 def test_streaming_parity_fetch_reclassify_flows_to_counts(live_stores, monkeypatch):
-    """07-21 fetch 二次定性：判缺 id=2 fetch 可取回 → query_invisible=1 / confirmed=0
-    进 counts；ok 仍 False（检索面损失真实，等级维持 CRITICAL 判定不变）。"""
+    """07-21 fetch 二次定性 + 终局裁决：判缺 id=2 fetch 可取回 → query_invisible=1 /
+    confirmed=0；但 fixture 的 docY 是纯 NOT_INDEXED vanished（无判缺 PK 覆盖，fetch
+    管不到）→ at_risk 保守留红：ok 仍 False，红的原因从「missing」转为「vanished at_risk」。"""
     import json as _json
     from opensearch_pipeline import retriever
     from tests.test_reconcile import _ensure_ha3_fetch_request
@@ -156,17 +157,66 @@ def test_streaming_parity_fetch_reclassify_flows_to_counts(live_stores, monkeypa
     assert rep["counts"]["missing_confirmed"] == 0
     assert rep["counts"]["missing_unclassified"] == 0
     assert rep["fetch_reclassify"]["ok"] is True
+    assert rep["verdict_basis"] == "fetch"
+    assert rep["counts"]["vanished_at_risk"] == 1
+    assert rep["vanished_fetch_verdicts"] == {"docY": "at_risk:no_indexed_coverage"}
     assert rep["ok"] is False
 
 
 def test_streaming_parity_reclassify_failure_keeps_query_verdict(live_stores):
     """fixture 的 HA3 client 无 fetch 能力 → 定性 fail-open：counts 不加分类键，
-    报告其余部分与 query 单口径完全一致（旧行为）。"""
+    ok 维持 query 单口径（方向朝红），basis 注记 query_only。"""
     rep = reconcile.run_parity_check(hi=20)
     assert rep["fetch_reclassify"]["ok"] is False
     assert "missing_confirmed" not in rep["counts"]
     assert "query_invisible" not in rep["counts"]
     assert rep["counts"]["rds_active_missing"] == 1 and rep["ok"] is False
+    assert rep["verdict_basis"] == "query_only"
+    assert rep["counts"]["vanished_at_risk"] == 1   # 无 fetch 依据 → vanished 全按 at_risk
+
+
+def test_streaming_parity_pure_blindspot_green_and_info_alert(monkeypatch):
+    """终局裁决 e2e：全部判缺 fetch 在场且无 vanished at_risk → ok=True（夜检绿灯、
+    _job_exit=0），且必须仍可观测——发一条 info 级「query 枚举盲区」告警，绝不静默。"""
+    import json as _json
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "simulate", False)
+    monkeypatch.setattr(cfg, "simulate_db", False)
+    monkeypatch.setattr(cfg, "simulate_opensearch", False)
+    rows = [_rds(1, "cA", "docX"), _rds(2, "cB", "docX")]     # 无 vanished
+    ha3 = {1: _ha3("cA", "docX")}                             # id=2 枚举判缺（盲区）
+    conn = _FakeConn(rows)
+    import opensearch_pipeline.prod_access as pa
+    monkeypatch.setattr(pa, "get_prod_readonly_conn", lambda *a, **k: conn)
+    from tests.test_reconcile import _ensure_ha3_fetch_request
+    _ensure_ha3_fetch_request()
+
+    class _Cli:
+        def fetch(self, req):
+            docs = [{"id": "2"}] if "2" in list(req.ids) else []
+            return type("R", (), {"body": _json.dumps({"result": docs})})()
+
+    from opensearch_pipeline import retriever
+    monkeypatch.setattr(retriever, "_get_ha3_client", lambda: _Cli())
+    monkeypatch.setattr(
+        reconcile, "_scan_ha3_pks",
+        lambda cli, table, hi, *, lo=0, bucket=500, client_factory=None, **kw:
+        {"rows": {pk: h for pk, h in ha3.items() if lo <= pk < hi}, "truncated": []})
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+
+    rep = reconcile.run_parity_check(hi=10, alert=True)
+    assert rep["ok"] is True and rep["verdict_basis"] == "fetch"
+    assert rep["counts"]["vanished_at_risk"] == 0
+    from opensearch_pipeline.ops_monitor import _job_exit
+    assert _job_exit("reconcile_ha3", rep) == 0
+    assert sent, "纯盲区必须仍发 info 告警，不能静默"
+    (title, _, kw) = sent[0]
+    assert kw["severity"] == "info"
+    assert kw["dedup_key"] == "reconcile:rds-ha3-query-blind"
+    assert "枚举盲区" in title
 
 
 def test_duration_alert_fires_when_over_threshold(live_stores, monkeypatch):
