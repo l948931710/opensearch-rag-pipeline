@@ -215,6 +215,15 @@ jobs:
       #    与镜像实际烤入的钉死集可能不同（钉死集才是现网真实暴露面）。【阻塞】。
       - name: Lockfile CVE audit (pip-audit on requirements-prod.lock — BLOCKING)
         run: python -m pip_audit -r requirements-prod.lock --desc
+      # ①c requirements-dataworks-py37.txt = DataWorks py3.7 节点钉版集镜像（Majors δ3/M13）。
+      #    节点每次运行 pip install 现场解析传递闭包 → 本步带解析审计=pod 真实暴露面。
+      #    基线（59 条，py3.7 兼容上限不可升版，逐条评估见 deploy/dataworks_py37_audit_baseline.txt）
+      #    拼 --ignore-vuln 放行；**新 ID 仍红**（先逐条评估补基线才准过——勿 continue-on-error）。
+      - name: DataWorks py3.7 pins CVE audit (pip-audit — BLOCKING beyond baseline)
+        run: |
+          IGNORES=$(grep -vE '^\s*(#|$)' deploy/dataworks_py37_audit_baseline.txt \
+                    | sed 's/^/--ignore-vuln /' | tr '\n' ' ')
+          python -m pip_audit -r requirements-dataworks-py37.txt --desc $IGNORES
       # ② SBOM（SPDX，syft）：覆盖 Python lock + console-app/package-lock.json，
       #    产物上传 artifact（供应链事件时按 SBOM 反查暴露面，此前全仓无 SBOM）。
       - name: Generate SBOM (syft — SPDX JSON)
