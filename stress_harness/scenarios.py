@@ -700,9 +700,33 @@ async def s7(rig: Rig) -> ScenarioResult:
         tripped = 503 in cap_hits
         res.gates.append(gate("S7-global-cap", "触顶后 503（服务对外全拒）", "出现 503",
                               tripped, tripped))
-        # 告警 webhook（dedup 一次）+ qa_admission_reject 台账（60s 批量落）
-        hooks = rig.mock.counts_since(t0)["webhook"]
-        res.gates.append(gate("S7-alert-once", "全局熔断钉钉告警恰好 1 次（dedup）",
+        # 告警恰一次（day-latch）——口径重定（2026-07-22，δ1 push 通道首跑暴露）：
+        # B5（生产级外审 07-17 P2-08）起 send_ops_alert 仅放行 https+钉钉域，rig 的
+        # http mock 被**拒发是产品正确姿态**（07-18 后 S7 未再实跑，对 mock 计数自 B5
+        # 起恒 0 而无人知）。本门改证「触顶告警 dispatch 恰一次」：数本场景 server 日志
+        # 的「ops-alert 拒发」行——它是 rate_limiter 日闩（_maybe_cap_alert）单次触发的
+        # 直接观测，日闩回归（风暴/静默）时行数≠1 照样红。发送在 daemon 线程
+        # （fire-and-forget 不阻塞 503 是设计）→ 有界等待吸收异步；真 HTTP 送达面归
+        # tests/test_alerting.py 单测 + 生产 attestation（docs/ops/alerting_chain_*）。
+        def _dispatch_lines() -> int:
+            try:
+                if rig.server is None:
+                    return 0
+                text = rig.server.log_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:   # noqa: BLE001 — 日志读不到按 0（门自然红，不掩盖）
+                return 0
+            return text.count("ops-alert 拒发")
+        hooks = 0
+        for _ in range(20):
+            hooks = _dispatch_lines()
+            if hooks >= 1:
+                break
+            await asyncio.sleep(0.5)
+        if hooks:
+            await asyncio.sleep(2.0)            # 双发暴露窗：恰一次语义完整保留
+            hooks = _dispatch_lines()
+        res.gates.append(gate("S7-alert-once",
+                              "全局熔断告警 dispatch 恰一次（day-latch；B5 下 http mock 拒发=正确）",
                               "== 1", hooks, hooks == 1))
         # 台账 60s 批量 flush 只在**后续限流检查**里触发——触顶后停止发请求 flush 永不发生
         # （首轮 shakedown 教训）：等待期每 5s 补一发（其 503 同样计入台账并推动 flush）
