@@ -376,3 +376,82 @@ def test_b1_no_daily_cap_ledger_error_ignored(monkeypatch):
     breaker = CostBreaker(make_cfg())          # daily_budget_rmb 默认 0
     ok, reason = breaker.try_reserve("D-b1d", _est_small(breaker.cfg))
     assert ok is True and reason is None
+
+
+# ── γ2（M15，Majors 批次 γ，codex 共识 2026-07-21）：熔断接 ops 告警 ──────────
+
+
+def _spy_ops_alert(monkeypatch):
+    """替换 alerting.send_ops_alert 为 spy（_maybe_ops_alert lazy import 该模块名）。"""
+    import opensearch_pipeline.alerting as alerting
+    calls = []
+    monkeypatch.setattr(alerting, "send_ops_alert",
+                        lambda title, text, **kw: calls.append((title, text, kw)) or True)
+    return calls
+
+
+def test_g2_alert_flag_off_by_default(monkeypatch):
+    """默认（RAG_COST_ALERT_ENABLE 未设）：任何触发点零 ops 调用——byte-identical。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.delenv("RAG_COST_ALERT_ENABLE", raising=False)
+    calls = _spy_ops_alert(monkeypatch)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: 999.0)   # DAILY 必打满
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: False)
+    breaker = CostBreaker(make_cfg(daily_budget_rmb=10.0))
+    ok, reason = breaker.try_reserve("D-g2a", _est_small(breaker.cfg))
+    assert ok is False and "DAILY budget exhausted" in reason
+    # RUN 触发面同验
+    cfg = make_cfg(run_budget_rmb=0.04)
+    br = CostBreaker(cfg)
+    assert br.try_reserve("seed", _est_small(cfg))[0] and br.tripped
+    assert br.maybe_alert_run_tripped() is True
+    assert calls == []
+
+
+def test_g2_run_trip_alert_on(monkeypatch):
+    """flag on：RUN 熔断首触 → warning + dedup_key=cost-breaker-run，恰一次。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.setenv("RAG_COST_ALERT_ENABLE", "true")
+    monkeypatch.setattr(cb, "_ledger_add", lambda amt: None)
+    calls = _spy_ops_alert(monkeypatch)
+    cfg = make_cfg(run_budget_rmb=0.04)
+    br = CostBreaker(cfg)
+    assert br.try_reserve("seed", _est_small(cfg))[0] and br.tripped
+    assert br.maybe_alert_run_tripped() is True
+    assert br.maybe_alert_run_tripped() is False        # 二触恒 False，不重发
+    assert len(calls) == 1
+    _title, _text, kw = calls[0]
+    assert kw["severity"] == "warning" and kw["dedup_key"] == "cost-breaker-run"
+
+
+def test_g2_daily_exhausted_alert_critical(monkeypatch):
+    """flag on：DAILY 打满 → critical + dedup_key=cost-breaker-daily。"""
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.setenv("RAG_COST_ALERT_ENABLE", "1")
+    calls = _spy_ops_alert(monkeypatch)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: 999.0)
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: False)
+    breaker = CostBreaker(make_cfg(daily_budget_rmb=10.0))
+    ok, _ = breaker.try_reserve("D-g2c", _est_small(breaker.cfg))
+    assert ok is False
+    assert len(calls) == 1
+    _title, _text, kw = calls[0]
+    assert kw["severity"] == "critical" and kw["dedup_key"] == "cost-breaker-daily"
+
+
+def test_g2_daily_ledger_unavailable_alert_and_failopen_send(monkeypatch):
+    """flag on：账本不可读 fail-closed 同发 critical；告警自身抛异常绝不改变拒绝判定。"""
+    import opensearch_pipeline.alerting as alerting
+    import opensearch_pipeline.extraction.cost_breaker as cb
+    monkeypatch.setenv("RAG_COST_ALERT_ENABLE", "yes")
+    monkeypatch.delenv("RAG_COST_DAILY_LEDGER_FAILOPEN", raising=False)
+    monkeypatch.setattr(cb, "_ledger_read_today", lambda: None)
+    monkeypatch.setattr(cb, "_simulate_db_active", lambda: False)
+
+    def _boom(title, text, **kw):
+        raise RuntimeError("webhook down")
+
+    monkeypatch.setattr(alerting, "send_ops_alert", _boom)
+    breaker = CostBreaker(make_cfg(daily_budget_rmb=10.0))
+    ok, reason = breaker.try_reserve("D-g2d", _est_small(breaker.cfg))
+    assert ok is False and "DAILY budget ledger unavailable" in reason   # 判定不受告警异常影响

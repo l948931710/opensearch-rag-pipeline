@@ -114,6 +114,30 @@ def _simulate_db_active() -> bool:
         return False
 
 
+def _cost_alert_enabled() -> bool:
+    """γ2（M15，Majors 批次 γ，codex 共识 2026-07-21）：熔断接 ops 告警的总闸，
+    默认 off=零行为变化（纯观测接线也守「默认 off」纪律，翻闸=Sam 部署决策）。"""
+    import os
+    return os.environ.get("RAG_COST_ALERT_ENABLE",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_ops_alert(title: str, text: str, *, severity: str, dedup_key: str) -> None:
+    """RUN/DAILY 熔断触发点 → OBS-4 ops 告警（RAG_COST_ALERT_ENABLE 门控）。
+
+    此前熔断只喊在 logger/print——DataWorks 节点日志无人盯，日预算被打满/账本
+    不可用这类「烧钱面事件」对运维零推送（M15）。lazy import + 全吞：告警链任何
+    异常绝不影响熔断判定本身（alerting.send_ops_alert 自身 fail-open+60s dedup，
+    这里再包一层防 import/环境面）。调用方必须在 breaker 锁外调（HTTP 5s 超时）。"""
+    if not _cost_alert_enabled():
+        return
+    try:
+        from opensearch_pipeline.alerting import send_ops_alert
+        send_ops_alert(title, text, severity=severity, dedup_key=dedup_key)
+    except Exception:   # noqa: BLE001
+        logger.warning("[CostBreaker] ops 告警发送异常（忽略，不影响熔断判定）", exc_info=True)
+
+
 @dataclass
 class CostEstimate:
     """单文档成本预估结果 (纯数据，无副作用)。"""
@@ -235,12 +259,26 @@ class CostBreaker:
             if spent_today is not None and spent_today + est.est_cost_rmb > daily_cap + _BUDGET_EPS:
                 with self._lock:
                     self._doc_denied += 1
+                # γ2（M15）：DAILY 打满=烧钱面事件，critical 推送（send_ops_alert 自带
+                # 60s dedup，逐文档触发不成风暴；锁外调用）
+                _maybe_ops_alert(
+                    "CostBreaker DAILY 预算打满",
+                    f"今日已花 {spent_today:.2f} + 本单预估 {est.est_cost_rmb:.2f} "
+                    f"> 日预算 {daily_cap:.2f} RMB——后续文档本 run 顺延（transient，不封存）。",
+                    severity="critical", dedup_key="cost-breaker-daily")
                 return False, (
                     f"DAILY budget exhausted (shared ledger): today {spent_today:.2f} "
                     f"+ {est.est_cost_rmb:.2f} > daily cap {daily_cap:.2f} RMB")
             if spent_today is None and not _simulate_db_active() and not _daily_ledger_failopen():
                 with self._lock:
                     self._doc_denied += 1
+                # γ2（M15）：账本不可读 fail-closed 同属日闸触发面（RDS 故障窗口内摄取
+                # 静默停摆，与打满同 dedup_key、文案区分）
+                _maybe_ops_alert(
+                    "CostBreaker DAILY 账本不可读（fail-closed）",
+                    f"已配置日预算 {daily_cap:.2f} RMB 但共享账本读不到——文档按瞬态"
+                    f"顺延至下一 run（账本恢复即重捡）。检查 RDS/rag_runtime_contract。",
+                    severity="critical", dedup_key="cost-breaker-daily")
                 return False, (
                     f"DAILY budget ledger unavailable (fail-closed): daily cap "
                     f"{daily_cap:.2f} RMB configured but shared ledger unreadable; "
@@ -347,22 +385,31 @@ class CostBreaker:
     def maybe_alert_run_tripped(self) -> bool:
         """运行级熔断首次触发时返回 True (供调用方发一次告警)；之后恒 False。"""
         with self._lock:
-            if self._run_tripped and not self._run_alert_sent:
-                self._run_alert_sent = True
-                logger.warning(
-                    "[CostBreaker] RUN budget tripped: cumulative=%.2f RMB cap=%.2f RMB "
-                    "denied=%d allowed=%d — VLM rebuild disabled for remainder of run",
-                    self._run_total_rmb, self.cfg.rebuild.run_budget_rmb,
-                    self._doc_denied, self._doc_allowed,
-                )
-                print(
-                    f"🚨 [CostBreaker] RUN budget tripped "
-                    f"({self._run_total_rmb:.2f}/{self.cfg.rebuild.run_budget_rmb:.2f} RMB). "
-                    f"VLM rebuild OFF for rest of run.",
-                    flush=True,
-                )
-                return True
-            return False
+            if not (self._run_tripped and not self._run_alert_sent):
+                return False
+            self._run_alert_sent = True
+            logger.warning(
+                "[CostBreaker] RUN budget tripped: cumulative=%.2f RMB cap=%.2f RMB "
+                "denied=%d allowed=%d — VLM rebuild disabled for remainder of run",
+                self._run_total_rmb, self.cfg.rebuild.run_budget_rmb,
+                self._doc_denied, self._doc_allowed,
+            )
+            print(
+                f"🚨 [CostBreaker] RUN budget tripped "
+                f"({self._run_total_rmb:.2f}/{self.cfg.rebuild.run_budget_rmb:.2f} RMB). "
+                f"VLM rebuild OFF for rest of run.",
+                flush=True,
+            )
+            _total, _cap = self._run_total_rmb, self.cfg.rebuild.run_budget_rmb
+            _denied, _allowed = self._doc_denied, self._doc_allowed
+        # γ2（M15）：ops 推送在**锁外**发（HTTP 5s 超时绝不占 breaker 锁；
+        # _run_alert_sent 已置位，进程内恰一次）
+        _maybe_ops_alert(
+            "CostBreaker RUN 预算熔断",
+            f"本 run 累计 {_total:.2f}/{_cap:.2f} RMB，VLM rebuild 本 run 剩余部分已停"
+            f"（denied={_denied} allowed={_allowed}）。健康文档下一 run 重捡。",
+            severity="warning", dedup_key="cost-breaker-run")
+        return True
 
     @property
     def run_total_rmb(self) -> float:
