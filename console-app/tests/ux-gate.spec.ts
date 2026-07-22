@@ -123,11 +123,11 @@ test.describe('UX 硬门 — 管理页（文档台账 / 上传）', () => {
   test('删除（退役）有二次确认且可取消', async ({ page }) => {
     await mockDocsPage(page);
     await page.goto(DOCS_ROUTE);
-    // 行操作收敛在「更多操作」菜单（2026-07-19 重设计）——先展开再点退役
-    await page.getByTestId('doc-more').first().click();
+    // 分支形态适配：本分支行操作是扁平图标按钮（main 07-19「更多操作」菜单重设计
+    // 未随分支）——直点行内退役按钮；孪生有意分叉，随 console 吸收时对齐 main 版。
     await assertDestructiveConfirmed({
       page,
-      trigger: page.getByRole('menuitem', { name: '退役下线' }),
+      trigger: page.getByRole('button', { name: '退役下线' }).first(),
       rowStillThere: page.getByText('注塑车间作业指导书'),
     });
   });
