@@ -25,7 +25,11 @@ Metric families:
   F   image-binding         — corpus-wide per-chunk image-ref duplication (over-attach)
   G   retrievability        — sampled dense self-query (reuses L0 machinery; informational)
   H   RDS<->HA3 id-set       — all-type missing_in_ha3/extra_in_ha3/Jaccard (extra ⇒
-                              incomplete purge)
+                              incomplete purge)。铁律(2026-07-21 终局)：query 枚举有随
+                              build/merge 漂移的确定性盲区，**存在性判定唯官方 fetch 为准**
+                              ——query 判缺经 fetch 复核，只有 fetch 也无(missing_confirmed)
+                              或无法定性(unclassified/fetch 失败)才影响门；纯 query_invisible
+                              (盲区伪影，数据在场)不 NO_GO。extra 是 query 实返行，恒为缺陷。
 
 Three-state gate verdict (no fail-open on missing data):
   GO                      — every hard-gate input measured AND passes
@@ -511,9 +515,36 @@ def build_gates_and_verdict(fam: Dict, d7: Optional[Dict], h: Dict) -> Dict:
          f.get("malformed_json") == 0, "= 0 malformed")
 
     # HARD: RDS↔HA3 all-type id-set (extra ⇒ incomplete purge). Truncated enum = unmeasured.
+    # 终局(2026-07-21)四级判定，顺序固定：
+    #   1) extra>0 恒 FAIL——extra 是 query 实际返回行，不受枚举盲区影响，是确凿缺陷；
+    #   2) fetch_ok=True → 按 fetch 分类：confirmed>0=FAIL；unclassified>0=unmeasured
+    #      (INCOMPLETE)；纯 query_invisible(盲区伪影，数据在场)=PASS；
+    #   3) fetch 尝试过但整体失败(fetch_ok=False) → unmeasured——无法定性绝不误判 DEFECT；
+    #   4) 无 fetch_ok 字段(miss==0 未触发 fetch，或合成/历史 h dict) → 旧语义。
     if h.get("truncated"):
         hard("RDS↔HA3 all-type id-set (H)", "TRUNCATED", None,
              "missing=0 ∧ extra=0 (HA3 enum truncated — unmeasured)")
+    elif "fetch_ok" in h:
+        miss, extra = h.get("missing_in_ha3"), h.get("extra_in_ha3")
+        mc, mu = h.get("missing_confirmed"), h.get("missing_unclassified")
+        value = {"missing_query_scope": miss, "missing_confirmed": mc,
+                 "query_invisible": h.get("query_invisible"),
+                 "unclassified": mu, "extra": extra}
+        if h.get("fetch_error"):
+            value["fetch_error"] = h["fetch_error"]   # defect/incomplete 并存时证据都留
+        if extra:
+            ok_h = False
+        elif h["fetch_ok"] is not True:
+            ok_h = None            # fetch 尝试过但失败 → 存在性无法定性
+        elif mc:
+            ok_h = False
+        elif mu:
+            ok_h = None            # 部分批未定性 → 证据不完整
+        else:
+            ok_h = True            # 纯 query_invisible：盲区伪影，数据在场
+        hard("RDS↔HA3 all-type id-set (H)", value, ok_h,
+             "fetch-confirmed missing=0 ∧ extra=0（query 枚举盲区不阻断；"
+             "unclassified/fetch 失败 → INCOMPLETE）")
     else:
         miss, extra = h.get("missing_in_ha3"), h.get("extra_in_ha3")
         hard("RDS↔HA3 all-type id-set (H)", {"missing": miss, "extra": extra},
@@ -628,7 +659,11 @@ def _ha3_all_active_chunk_ids(bucket: int = 5000, max_rounds: int = 3) -> Dict:
     zero-vector scan is non-deterministic/incomplete, so each window re-scans until a round
     adds nothing new (or max_rounds). `truncated` is True only if the PK ceiling is unknown
     or a single window saturated its top_k (window too small) — i.e. coverage is NOT full.
-    Assert `not truncated` before trusting the idset for exact-parity GO."""
+
+    铁律(2026-07-21 终局)：即使 not truncated、逐窗收敛，query 枚举仍有随 build/merge
+    漂移的**确定性盲区**(loop-until-stable 对确定性欠返回无效；07-21 实证零向量恒缺 113、
+    eps 向量恒缺另 220)。本枚举只产生判缺**候选**——存在性判定唯官方 /vector-service/fetch
+    为准(见 family_idset_reconciliation 的 fetch 复核)。"""
     from ..ha3live import query_vector, rds_conn
     from opensearch_pipeline.config import get_config
     dim = get_config().embedding.dimension or 1024
@@ -669,27 +704,90 @@ def _fld(item: Dict, key: str):
     return f.get(key) if isinstance(f, dict) else None
 
 
+def _pk_map_for_chunk_ids(chunk_ids: List[str], batch: int = 500) -> Dict[str, int]:
+    """chunk_id → chunk_meta.id(=HA3 主键)映射，批量 IN 查询（只读；chunk_id 有唯一键）。"""
+    from ..ha3live import rds_conn
+    out: Dict[str, int] = {}
+    if not chunk_ids:
+        return out
+    conn = rds_conn()
+    try:
+        with conn.cursor() as c:
+            for i in range(0, len(chunk_ids), batch):
+                sub = chunk_ids[i:i + batch]
+                ph = ",".join(["%s"] * len(sub))
+                c.execute("SELECT chunk_id, id FROM chunk_meta"
+                          f" WHERE is_active=1 AND chunk_id IN ({ph})", tuple(sub))
+                for r in c.fetchall():
+                    cid = r["chunk_id"] if isinstance(r, dict) else r[0]
+                    pk = r["id"] if isinstance(r, dict) else r[1]
+                    out[cid] = int(pk)
+    finally:
+        conn.close()
+    return out
+
+
+def _fetch_reclassify_idset(missing_chunk_ids: List[str]) -> Dict:
+    """铁律(2026-07-21)：存在性判定唯官方 /vector-service/fetch 为准——query 枚举判缺的
+    chunk_id 经 fetch 复核，只有 fetch 也无才算真缺失。
+
+    复用生产侧 reconcile._fetch_reclassify_missing（同一 fail-open 契约），此处只补
+    chunk_id↔pk 双向映射；映射不到 pk 的 chunk_id（corpus 拉取与枚举窗口间的 rechunk race）
+    保守计入 unclassified。fail-open：任何异常 → fetch_ok=False（门侧按 INCOMPLETE 处理，
+    绝不误判 GO 也不误判 DEFECT）。"""
+    try:
+        from opensearch_pipeline import reconcile as _rec
+        from .. import ha3live
+        pk_by_cid = _pk_map_for_chunk_ids(missing_chunk_ids)
+        unmapped = [c for c in missing_chunk_ids if c not in pk_by_cid]
+        cid_by_pk = {pk: cid for cid, pk in pk_by_cid.items()}
+        fr = _rec._fetch_reclassify_missing(
+            ha3live.client(), ha3live.table(),
+            [{"id": pk} for pk in pk_by_cid.values()])
+        if not fr.get("ok"):
+            return {"fetch_ok": False, "fetch_error": str(fr.get("error"))[:160],
+                    "fetch_errors": (fr.get("fetch_errors") or [])[:10]}
+        confirmed = sorted(cid_by_pk[p] for p in fr["missing_confirmed"])
+        uncls = sorted([cid_by_pk[p] for p in fr["unclassified"]] + unmapped)
+        return {
+            "fetch_ok": True,
+            "missing_confirmed": len(confirmed),
+            "query_invisible": len(fr["query_invisible"]),
+            "missing_unclassified": len(uncls),
+            "missing_confirmed_sample": confirmed[:10],
+            "fetch_errors": (fr.get("fetch_errors") or [])[:10],
+        }
+    except Exception as e:  # noqa: BLE001 — fail-open：定性失败只降级为 INCOMPLETE
+        return {"fetch_ok": False, "fetch_error": f"{type(e).__name__}: {e}"[:160]}
+
+
 def family_idset_reconciliation(rds_chunk_ids: set) -> Dict:
     try:
         ha3 = _ha3_all_active_chunk_ids()
     except Exception as e:  # fail-open layer; gate sees truncated/None
         return {"error": f"{type(e).__name__}: {e}"[:160], "truncated": True}
     ha3_ids = ha3["ids"]
-    miss = rds_chunk_ids - ha3_ids       # in RDS active, absent from HA3 — data loss
-    extra = ha3_ids - rds_chunk_ids      # in HA3, not RDS active — incomplete purge
+    miss = rds_chunk_ids - ha3_ids       # in RDS active, absent from query enum — 判缺候选
+    extra = ha3_ids - rds_chunk_ids      # in HA3, not RDS active — incomplete purge（确凿）
     union = rds_chunk_ids | ha3_ids
     jac = round(len(rds_chunk_ids & ha3_ids) / len(union), 4) if union else None
-    return {
+    out = {
         "rds_active": len(rds_chunk_ids),
         "ha3_returned": ha3["returned"],
         "ha3_unique": len(ha3_ids),
         "truncated": ha3["truncated"],
         "missing_in_ha3": len(miss),
         "extra_in_ha3": len(extra),
+        # query-observability 指标（枚举覆盖率），不再解释为存在性 parity——盲区会压低它。
         "idset_jaccard": jac,
         "missing_sample": sorted(miss)[:10],
         "extra_sample": sorted(extra)[:10],
     }
+    # 终局(2026-07-21)：query 判缺只是候选，经官方 fetch 复核定性；truncated 时枚举本身
+    # 不完整（候选集不可信），维持 unmeasured 语义、不做 fetch。
+    if miss and not ha3["truncated"]:
+        out.update(_fetch_reclassify_idset(sorted(miss)))
+    return out
 
 
 # ── corpus pull + orchestration ───────────────────────────────────────────

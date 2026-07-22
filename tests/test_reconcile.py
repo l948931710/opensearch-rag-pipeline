@@ -498,3 +498,126 @@ def test_alert_on_drift_falls_back_when_reclassify_failed(monkeypatch):
     assert kw["severity"] == "critical"
     assert "**5**" in text and "missing_confirmed" not in text
     assert "二次定性失败" in text and "down" in text
+
+
+# ── 终局裁决（2026-07-21「存在性判定唯 fetch 为准」）：_finalize_verdict + 告警分级 ──
+
+def _vrep(missing=(), vanished=()):
+    """最小 parity 报告：missing=[(pk, doc_id)…] vanished=[doc_id…]（query 口径 ok）。"""
+    m = [{"id": pk, "chunk_id": f"c{pk}", "doc_id": d, "version_no": 1,
+          "chunk_type": "text_chunk"} for pk, d in missing]
+    v = [{"doc_id": d, "rds_active": 1, "ha3_kept": 0} for d in vanished]
+    return {"ok": not m and not v, "complete": True,
+            "counts": {"rds_active_missing": len(m), "vanished_docs": len(v),
+                       "vanished_at_risk": len(v), "ha3_stale": 0},
+            "rds_active_missing": m, "vanished_docs": v}
+
+
+def _fr(confirmed=(), invisible=(), unclassified=()):
+    return {"ok": True, "missing_confirmed": list(confirmed),
+            "query_invisible": list(invisible), "unclassified": list(unclassified),
+            "fetch_errors": []}
+
+
+def test_finalize_verdict_pure_invisible_flips_ok_true():
+    """全部判缺行 fetch 在场（枚举盲区伪影）→ 最终 ok=True，夜检不再红灯。"""
+    rep = _vrep(missing=[(2, "docX"), (3, "docX")])
+    reconcile._finalize_verdict(rep, _fr(invisible=[2, 3]))
+    assert rep["ok"] is True and rep["verdict_basis"] == "fetch"
+    assert rep["counts"]["vanished_at_risk"] == 0
+
+
+def test_finalize_verdict_confirmed_or_unclassified_keeps_red():
+    rep = _vrep(missing=[(2, "docX"), (3, "docX")])
+    reconcile._finalize_verdict(rep, _fr(confirmed=[2], invisible=[3]))
+    assert rep["ok"] is False and rep["verdict_basis"] == "fetch"
+    rep2 = _vrep(missing=[(2, "docX")])
+    reconcile._finalize_verdict(rep2, _fr(unclassified=[2]))
+    assert rep2["ok"] is False
+
+
+def test_finalize_verdict_vanished_all_invisible_is_artifact():
+    """vanished doc 的全部判缺 PK fetch 在场 → artifact（伪影，非真消失），不留红。"""
+    rep = _vrep(missing=[(5, "docV"), (6, "docV")], vanished=["docV"])
+    reconcile._finalize_verdict(rep, _fr(invisible=[5, 6]))
+    assert rep["vanished_fetch_verdicts"] == {"docV": "artifact"}
+    assert rep["counts"]["vanished_at_risk"] == 0 and rep["ok"] is True
+
+
+def test_finalize_verdict_vanished_without_indexed_coverage_stays_at_risk():
+    """纯 NOT_INDEXED vanished（无判缺 PK 覆盖，fetch 管不到）→ at_risk 保守留红。"""
+    rep = _vrep(missing=[(2, "docX")], vanished=["docY"])
+    reconcile._finalize_verdict(rep, _fr(invisible=[2]))
+    assert rep["vanished_fetch_verdicts"]["docY"] == "at_risk:no_indexed_coverage"
+    assert rep["counts"]["vanished_at_risk"] == 1 and rep["ok"] is False
+
+
+def test_finalize_verdict_no_fetch_basis_leaves_ok_untouched():
+    """fr 未跑（无判缺候选）/ fr 失败 → ok 维持 query 单口径（方向朝红），basis 注记区分。"""
+    rep = _vrep(vanished=["docY"])           # 纯 NOT_INDEXED vanished，missing 为空
+    reconcile._finalize_verdict(rep, None)
+    assert rep["ok"] is False and rep["verdict_basis"] == "query_enum"
+    assert rep["counts"]["vanished_at_risk"] == 1
+    rep2 = _vrep(missing=[(2, "docX")])
+    reconcile._finalize_verdict(rep2, {"ok": False, "error": "down"})
+    assert rep2["ok"] is False and rep2["verdict_basis"] == "query_only"
+
+
+def test_alert_pure_blindspot_downgrades_to_info(monkeypatch):
+    """纯枚举盲区（fetch 全在场、无 at_risk、扫描完整）→ info + 独立标题/dedup_key。"""
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+    report = {"ok": True, "complete": True, "verdict_basis": "fetch",
+              "counts": {"rds_active_missing": 3, "vanished_docs": 0, "vanished_at_risk": 0,
+                         "ha3_stale": 0, "missing_confirmed": 0, "query_invisible": 3,
+                         "missing_unclassified": 0},
+              "fetch_reclassify": _fr(invisible=[1, 2, 3])}
+    reconcile._alert_on_drift(report)
+    (title, text, kw) = sent[0]
+    assert kw["severity"] == "info"
+    assert kw["dedup_key"] == "reconcile:rds-ha3-query-blind"
+    assert "枚举盲区" in title and "数据无缺失" in text
+
+
+def test_alert_blindspot_incomplete_scan_stays_critical(monkeypatch):
+    """complete=False 时即使全 invisible 也 critical——与 _job_exit 的 3 一致，
+    绝不出现「info 告警 + 红退出码」的矛盾组合。"""
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+    report = {"ok": True, "complete": False, "verdict_basis": "fetch",
+              "counts": {"rds_active_missing": 3, "vanished_docs": 0, "vanished_at_risk": 0,
+                         "ha3_stale": 0, "missing_confirmed": 0, "query_invisible": 3,
+                         "missing_unclassified": 0},
+              "fetch_reclassify": _fr(invisible=[1, 2, 3])}
+    reconcile._alert_on_drift(report)
+    (_, _, kw) = sent[0]
+    assert kw["severity"] == "critical"
+    assert kw["dedup_key"] == "reconcile:rds-ha3-parity"
+
+
+def test_alert_vanished_at_risk_or_unclassified_stays_critical(monkeypatch):
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+    base_counts = {"rds_active_missing": 3, "vanished_docs": 1, "ha3_stale": 0,
+                   "missing_confirmed": 0, "query_invisible": 3, "missing_unclassified": 0}
+    report = {"ok": False, "complete": True, "verdict_basis": "fetch",
+              "counts": dict(base_counts, vanished_at_risk=1),
+              "fetch_reclassify": _fr(invisible=[1, 2, 3])}
+    reconcile._alert_on_drift(report)
+    assert sent[0][2]["severity"] == "critical"
+    assert "at_risk=1" in sent[0][1]
+
+    sent.clear()
+    report2 = {"ok": False, "complete": True, "verdict_basis": "fetch",
+               "counts": dict(base_counts, vanished_docs=0, vanished_at_risk=0,
+                              missing_unclassified=2),
+               "fetch_reclassify": _fr(invisible=[1], unclassified=[2, 3])}
+    reconcile._alert_on_drift(report2)
+    assert sent[0][2]["severity"] == "critical"
+    assert "未定性" in sent[0][1]

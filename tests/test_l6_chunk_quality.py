@@ -160,6 +160,215 @@ def test_verdict_no_go_defect_on_extra_in_ha3():
     assert out["state"] == "NO_GO_DEFECT"
 
 
+# ── H 门 fetch 二次定性（终局 2026-07-21：存在性唯 fetch 为准）────────────────
+
+_H_GATE = "RDS↔HA3 all-type id-set (H)"
+_ONE_CHUNK = [_chunk("c1", "D1", text="完整的一句话内容已经结束并且足够长以通过校验。")]
+
+
+def _h_fetch(**kw):
+    h = {"rds_active": 100, "ha3_unique": 97, "truncated": False,
+         "missing_in_ha3": 3, "extra_in_ha3": 0, "idset_jaccard": 0.97}
+    h.update(kw)
+    return h
+
+
+def test_verdict_go_on_pure_query_invisible():
+    """枚举盲区伪影（fetch 复核全部在场）→ H 门 PASS → GO——release-gate strict
+    恒带 idset+NO_GO 两红的解药。"""
+    h = _h_fetch(fetch_ok=True, missing_confirmed=0, query_invisible=3,
+                 missing_unclassified=0, missing_confirmed_sample=[])
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    assert out["gates"][_H_GATE]["pass"] is True
+    assert out["state"] == "GO"
+
+
+def test_verdict_defect_on_fetch_confirmed_missing():
+    h = _h_fetch(fetch_ok=True, missing_confirmed=2, query_invisible=1,
+                 missing_unclassified=0, missing_confirmed_sample=["cX", "cY"])
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    assert out["gates"][_H_GATE]["pass"] is False
+    assert out["state"] == "NO_GO_DEFECT"
+
+
+def test_verdict_incomplete_on_unclassified():
+    """fetch 部分批未定性 → 证据不完整（保守不 GO，也不误判 DEFECT）。"""
+    h = _h_fetch(fetch_ok=True, missing_confirmed=0, query_invisible=2,
+                 missing_unclassified=1, missing_confirmed_sample=[])
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    assert out["gates"][_H_GATE]["pass"] is None
+    assert out["state"] == "NO_GO_INCOMPLETE_EVIDENCE"
+
+
+def test_verdict_incomplete_on_fetch_failure_not_defect():
+    """fetch 尝试过但整体失败 → INCOMPLETE 而非 DEFECT（codex 共识 blocker：无法定性
+    绝不能读成「实测数据丢失」）。"""
+    h = _h_fetch(fetch_ok=False, fetch_error="RuntimeError: down")
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    g = out["gates"][_H_GATE]
+    assert g["pass"] is None
+    assert g["value"]["fetch_error"] == "RuntimeError: down"
+    assert out["state"] == "NO_GO_INCOMPLETE_EVIDENCE"
+
+
+def test_verdict_extra_beats_fetch_failure():
+    """extra 是 query 实际返回行（不受盲区影响）、确凿缺陷——即使 fetch 失败也 DEFECT，
+    且 value 同时保留 extra 与 fetch_error 两份证据。"""
+    h = _h_fetch(fetch_ok=False, fetch_error="down", extra_in_ha3=7)
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    g = out["gates"][_H_GATE]
+    assert g["pass"] is False
+    assert g["value"]["extra"] == 7 and g["value"]["fetch_error"] == "down"
+    assert out["state"] == "NO_GO_DEFECT"
+
+
+def test_verdict_legacy_h_without_fetch_keeps_old_semantics():
+    """无 fetch_ok 字段（历史/合成 h dict）→ 旧语义：query missing>0 即 DEFECT。"""
+    h = {"truncated": False, "missing_in_ha3": 5, "extra_in_ha3": 0, "idset_jaccard": 0.99}
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    assert out["gates"][_H_GATE]["pass"] is False
+    assert out["state"] == "NO_GO_DEFECT"
+
+
+# ── H fetch 复核的 I/O 缝（sys.modules 级打桩，无真连接）──────────────────────
+
+def _stub_ha3live(monkeypatch, *, rds_conn):
+    """拦截 l6 惰性 `from .. import ha3live` / `from ..ha3live import rds_conn` 两种形态：
+    同时盖 sys.modules 与父包属性（父包属性在真模块曾被导入时优先生效）。"""
+    import sys
+    import types
+
+    import eval_harness
+    mod = types.ModuleType("eval_harness.ha3live")
+    mod.client = lambda: object()
+    mod.table = lambda: "tbl"
+    mod.rds_conn = rds_conn
+    monkeypatch.setitem(sys.modules, "eval_harness.ha3live", mod)
+    monkeypatch.setattr(eval_harness, "ha3live", mod, raising=False)
+    return mod
+
+
+class _MapCursor:
+    """把 IN (…) 的 chunk_id 参数映射回 {chunk_id, id}（'c<pk>' → pk）；可裁剪映射面。"""
+
+    def __init__(self, mapped=None, calls=None):
+        self._mapped = mapped
+        self._calls = calls
+        self._p = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params):
+        self._p = params
+        if self._calls is not None:
+            self._calls.append(len(params))
+
+    def fetchall(self):
+        return [{"chunk_id": c, "id": int(c[1:])} for c in self._p
+                if self._mapped is None or c in self._mapped]
+
+
+class _MapConn:
+    def __init__(self, mapped=None, calls=None):
+        self._mapped, self._calls = mapped, calls
+
+    def cursor(self):
+        return _MapCursor(self._mapped, self._calls)
+
+    def close(self):
+        pass
+
+
+def test_fetch_reclassify_idset_maps_and_classifies(monkeypatch):
+    """chunk_id↔pk 双向映射 + 分类回写：confirmed/invisible/unclassified 各就其位。"""
+    _stub_ha3live(monkeypatch, rds_conn=lambda: _MapConn())
+    from opensearch_pipeline import reconcile as rec
+    monkeypatch.setattr(rec, "_fetch_reclassify_missing",
+                        lambda cli, tbl, missing: {"ok": True, "missing_confirmed": [11],
+                                                   "query_invisible": [12], "unclassified": [13],
+                                                   "fetch_errors": []})
+    out = L6._fetch_reclassify_idset(["c11", "c12", "c13"])
+    assert out["fetch_ok"] is True
+    assert (out["missing_confirmed"], out["query_invisible"], out["missing_unclassified"]) \
+        == (1, 1, 1)
+    assert out["missing_confirmed_sample"] == ["c11"]
+
+
+def test_fetch_reclassify_idset_unmapped_chunkid_counts_unclassified(monkeypatch):
+    """corpus 拉取与枚举窗口间的 rechunk race：映射不到 pk 的 chunk_id 保守计 unclassified。"""
+    _stub_ha3live(monkeypatch, rds_conn=lambda: _MapConn(mapped={"c11"}))
+    from opensearch_pipeline import reconcile as rec
+    monkeypatch.setattr(rec, "_fetch_reclassify_missing",
+                        lambda cli, tbl, missing: {"ok": True, "missing_confirmed": [],
+                                                   "query_invisible": [11], "unclassified": [],
+                                                   "fetch_errors": []})
+    out = L6._fetch_reclassify_idset(["c11", "cGone99"])
+    assert out["fetch_ok"] is True
+    assert out["query_invisible"] == 1 and out["missing_unclassified"] == 1
+    assert out["missing_confirmed"] == 0
+
+
+def test_fetch_reclassify_idset_total_fetch_failure_fail_open(monkeypatch):
+    _stub_ha3live(monkeypatch, rds_conn=lambda: _MapConn())
+    from opensearch_pipeline import reconcile as rec
+    monkeypatch.setattr(rec, "_fetch_reclassify_missing",
+                        lambda cli, tbl, missing: {"ok": False,
+                                                   "error": "all 2 fetch batches failed",
+                                                   "fetch_errors": ["batch@0: boom"]})
+    out = L6._fetch_reclassify_idset(["c1", "c2"])
+    assert out["fetch_ok"] is False
+    assert "batches failed" in out["fetch_error"]
+
+
+def test_fetch_reclassify_idset_exception_fail_open(monkeypatch):
+    def _boom():
+        raise RuntimeError("db down")
+
+    _stub_ha3live(monkeypatch, rds_conn=_boom)
+    out = L6._fetch_reclassify_idset(["c1"])
+    assert out["fetch_ok"] is False and "db down" in out["fetch_error"]
+
+
+def test_pk_map_batches_in_query(monkeypatch):
+    """501 个 chunk_id → 两次 IN 查询（批 500），映射齐全。"""
+    calls = []
+    _stub_ha3live(monkeypatch, rds_conn=lambda: _MapConn(calls=calls))
+    ids = [f"c{i}" for i in range(501)]
+    out = L6._pk_map_for_chunk_ids(ids)
+    assert calls == [500, 1]
+    assert len(out) == 501 and out["c500"] == 500
+
+
+def test_family_idset_triggers_fetch_only_when_missing(monkeypatch):
+    """miss 非空且未截断才触发 fetch 复核；miss 空/截断均不触发（截断=候选源不可信）。"""
+    seen = []
+
+    def _fake_reclassify(miss):
+        seen.append(list(miss))
+        return {"fetch_ok": True, "missing_confirmed": 0, "query_invisible": len(miss),
+                "missing_unclassified": 0, "missing_confirmed_sample": []}
+
+    monkeypatch.setattr(L6, "_fetch_reclassify_idset", _fake_reclassify)
+    monkeypatch.setattr(L6, "_ha3_all_active_chunk_ids",
+                        lambda: {"ids": {"c1"}, "returned": 1, "truncated": False, "windows": 1})
+    h = L6.family_idset_reconciliation({"c1", "c2"})
+    assert h["missing_in_ha3"] == 1 and seen == [["c2"]]
+    assert h["fetch_ok"] is True and h["query_invisible"] == 1
+
+    seen.clear()
+    h2 = L6.family_idset_reconciliation({"c1"})
+    assert "fetch_ok" not in h2 and seen == []
+
+    monkeypatch.setattr(L6, "_ha3_all_active_chunk_ids",
+                        lambda: {"ids": set(), "returned": 0, "truncated": True, "windows": 0})
+    h3 = L6.family_idset_reconciliation({"c1"})
+    assert "fetch_ok" not in h3 and h3["truncated"] is True and seen == []
+
+
 # ── fingerprint ───────────────────────────────────────────────────────────
 
 def test_fingerprint_stable_and_sensitive():

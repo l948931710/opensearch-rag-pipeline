@@ -70,11 +70,36 @@ def _targets_from_parity_report(report: Dict[str, Any]) -> Tuple[List[int], List
 
     兼容两种形态：reconcile CLI --json 的顶层 {"ha3": {...}, "oss": ..., "raw": ...}，
     或 run_parity_check 返回的裸报告。error/skipped 报告返回空目标集。
+
+    终局(2026-07-21「存在性判定唯 fetch 为准」)：报告带 fetch 二次定性且成功时，目标 =
+    missing_confirmed ∪ unclassified 的 **PK 精确集**，坚决排除 query_invisible（fetch 已
+    证实在场，重推是安慰剂——历次"疗法"即此）；doc 级扩张一律不用——confirmed PK 已精确
+    命名丢失面，纯 NOT_INDEXED 的 vanished 行本就处于 stage-3 可认领状态，整篇扩张只会把
+    盲区伪影行也复位重推。无 fetch 定性（旧版报告 / fetch 失败）→ 维持 query 单口径目标
+    （含 doc 扩张）+ 醒目 WARNING——这是 fetch 端点不可用且真丢失时的灾备路径，写入仍受
+    dry-run 默认 + PROD_RW_ACK 双门保护。
     """
     if isinstance(report.get("ha3"), dict):
         report = report["ha3"]
     if report.get("error") or report.get("skipped"):
         return [], []
+    fr = report.get("fetch_reclassify") or {}
+    if fr.get("ok"):
+        pks = sorted({int(x) for x in (fr.get("missing_confirmed") or [])}
+                     | {int(x) for x in (fr.get("unclassified") or [])})
+        n_uncls = len(fr.get("unclassified") or [])
+        if n_uncls:
+            print(f"[rebuild] ⚠️ 目标含 {n_uncls} 个 fetch 未定性 PK（fetch 批次异常，"
+                  f"无法证实在场）——复核 fetch_errors 后再 --commit。")
+        n_inv = len(fr.get("query_invisible") or [])
+        if n_inv:
+            print(f"[rebuild] ℹ️ 已排除 {n_inv} 个 query 枚举盲区 PK（fetch 复核在场，"
+                  f"数据无缺失，无需重推）。")
+        return pks, []
+    if report.get("rds_active_missing") or report.get("vanished_docs"):
+        print("[rebuild] ⚠️ 报告无 fetch 二次定性（旧版报告或 fetch 失败）——以下目标为 "
+              "query 单口径，可能包含枚举盲区伪影（数据实际在场）；仅在确认 fetch 不可用"
+              "且需灾备恢复时 --commit。")
     pks = sorted({int(m["id"]) for m in (report.get("rds_active_missing") or [])
                   if isinstance(m, dict) and m.get("id") is not None})
     docs = sorted({v["doc_id"] for v in (report.get("vanished_docs") or [])

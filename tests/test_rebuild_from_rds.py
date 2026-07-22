@@ -39,6 +39,43 @@ def test_targets_empty_on_error_or_skipped_report():
     assert rb._targets_from_parity_report({"skipped": "simulate"}) == ([], [])
 
 
+def test_targets_fetch_mode_pk_precise_no_doc_expansion(capsys):
+    """终局（2026-07-21）：fetch 定性成功 → 目标 = confirmed∪unclassified 的 PK 精确集；
+    query_invisible（fetch 证实在场）坚决排除；doc 级扩张一律不用——1 confirmed 不得把
+    同文档 99 个在场行拖下水整篇重推（codex 共识 blocker 2）。"""
+    rep = {"rds_active_missing": [{"id": 1, "doc_id": "dA"}, {"id": 2, "doc_id": "dA"},
+                                  {"id": 3, "doc_id": "dB"}],
+           "vanished_docs": [{"doc_id": "dA", "rds_active": 3, "ha3_kept": 0}],
+           "fetch_reclassify": {"ok": True, "missing_confirmed": [3], "unclassified": [2],
+                                "query_invisible": [1], "fetch_errors": []}}
+    pks, docs = rb._targets_from_parity_report(rep)
+    assert pks == [2, 3] and docs == []
+    out = capsys.readouterr().out
+    assert "未定性" in out            # unclassified 目标必须先警告
+    assert "已排除 1 个" in out       # invisible 排除可见
+
+
+def test_targets_fetch_mode_pure_invisible_yields_nothing(capsys):
+    """全部判缺 fetch 在场 → 无目标（重推是安慰剂）。"""
+    rep = {"rds_active_missing": [{"id": 7, "doc_id": "dA"}],
+           "vanished_docs": [],
+           "fetch_reclassify": {"ok": True, "missing_confirmed": [], "unclassified": [],
+                                "query_invisible": [7], "fetch_errors": []}}
+    assert rb._targets_from_parity_report(rep) == ([], [])
+
+
+def test_targets_query_fallback_warns_loudly(capsys):
+    """无 fr（旧版报告）/ fr 失败 → 维持 query 单口径目标（灾备路径，写侧仍双门），
+    但必须先醒目 WARNING。"""
+    bare = {"rds_active_missing": [{"id": 5, "doc_id": "dV"}],
+            "vanished_docs": [{"doc_id": "dV", "rds_active": 2, "ha3_kept": 0}]}
+    assert rb._targets_from_parity_report(bare) == ([5], ["dV"])
+    assert "query 单口径" in capsys.readouterr().out
+    failed = dict(bare, fetch_reclassify={"ok": False, "error": "down"})
+    assert rb._targets_from_parity_report(failed) == ([5], ["dV"])
+    assert "query 单口径" in capsys.readouterr().out
+
+
 # ── 资格闸分类 ──
 
 def test_classify_eligibility_gates():
