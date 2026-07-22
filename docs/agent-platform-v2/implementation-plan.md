@@ -1,5 +1,12 @@
 # 实施改造计划（implementation-plan.md）
 
+> ⚠️ **冻结声明（2026-07-21 迁移批C，核查 M16.2）**：本计划冻结于 `7c704ce`（2026-07-03），
+> 相对评审快照 `9d7a631` 已隔 `7c704ce..9d7a631` = 499 提交。文件级清单/行号已大面积漂移，
+> **仅供追溯原始拆解意图，不作现状依据**。两处点名不落地项需纠偏：WS0-4 许诺的
+> `.github/workflows/deploy.yml`（build→ACR→审批→SAE 灰度）**未创建**，部署仍走手工 zip +
+> `deploy/sae_canary_deploy.py`；`--workers` 改 `${RAG_UVICORN_WORKERS:-1}` **未落地**，
+> Dockerfile 仍硬编码 `--workers 1`。现状以代码、`docs/audits/` 与 execution-model.md 状态注为准。
+
 > 对象：`opensearch-rag-pipeline` @ `7c704ce`。粒度：文件级改动清单 + 迁移编号 + flag + 测试 + 回滚 + 验收。
 > 六个工作流（WS0–WS5）对应 v2 报告 P0–P4；WS 内条目按依赖排序，可直接拆 issue。
 > 纪律沿用仓库既有惯例：**所有新功能挂 flag 且默认 off；迁移 staging 先行 dry-run；每批改动带回归（golden 251 基线门）**。

@@ -93,7 +93,7 @@ docs/            # 环境设计 / 架构审查 / 性能 backlog 等
 | 包 | 用途 | 打法 |
 |---|---|---|
 | `opensearch_sae_rag.zip` | SAE 服务侧 | zip 根 = `requirements.txt`(必须) + `opensearch_pipeline/`(含 webconsole/next-dist，**打包前先 `cd console-app && npm run build`**) + `Dockerfile` + `pyproject.toml` + `.dockerignore`；无 pyc/.env/tests |
-| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装）。**B4 起用 `deploy/build_dataworks_zip.sh` 构建**：自动附 build_info.json + 生成 `.zip.sha256` sidecar（上传为同名 File 资源，节点硬校验——**换 zip 必须同步换 sidecar**） |
+| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装）。**B4 起用 `deploy/build_dataworks_zip.sh` 构建**：自动附 build_info.json + 生成 `.zip.sha256` sidecar（上传为同名 File 资源，节点做 sha256 校验——**摘要不一致才阻断；sidecar 缺失/不可读则过渡期放行 fail-open**，见 `tests/test_dataworks_supply_chain.py`；换 zip 请同步换 sidecar） |
 
 **铁律**：一律打到 `~/Downloads/dw_upload_<YYYYMMDD>[_<purpose>]/`（勿打 repo 根）；部署时
 **按 SIZE/SHA-256 认包，别按文件名**（每个日期目录里文件名都一样，选错目录 = 静默部署旧版）。

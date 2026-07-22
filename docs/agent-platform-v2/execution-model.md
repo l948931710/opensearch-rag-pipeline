@@ -1,5 +1,16 @@
 # 执行模型（B1）· 报告 §3 补节 / 评审 §7-P0-2 gate 交付
 
+> ⚠️ **实现状态更新（2026-07-21 迁移批C，核查 M16.1）**：本文是 2026-07-07 冻结的**设计
+> 决策**文档，下列冻结正文（§4/§5「尚待实现」）已被实现追上，阅读时以代码为准：
+> - `loop.py::DefaultAgentLoop`、`executor.py::ThreadedRunExecutor`（含 `drain()` 排水 E3）、
+>   `event_relay.py::_RedisRelay`（SSE 跨实例中继 XADD/XREAD）、per-thread 串行化
+>   （schema/037 `uk_thread_active`）**均已落地**——§5 不再是「尚待实现」。
+> - §4「无独立 agent worker 层」需修正为：**默认仍是嵌入式有界执行器（选项 b）**，但另有
+>   **可选的独立 worker**（`agent_worker.py`，durable dispatch）——受 `RAG_AGENT_ENABLE` +
+>   `RAG_AGENT_DURABLE_DISPATCH` 双 flag（默认关）+ 独立部署 gate 约束，非默认形态、非统一
+>   worker 化。冷启动 recovery owner 缺口见生产就绪评审 B9。
+> 下方正文保留冻结原样以存决策脉络，不逐句改写。
+
 > 状态：**已拍板（2026-07-07）**。这是评审要求"先于 loop 接口冻结"的运行时执行模型。
 > 决策口径：plan/报告的多实例模型 + 评审推荐 + 已建底座三者收敛。
 > 关联代码：`agent_runtime/{context,events,run_store}.py`（已建）；`loop.py`/`executor.py`（按本节冻结的接口后续实现）。
