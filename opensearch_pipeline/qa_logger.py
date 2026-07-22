@@ -265,6 +265,7 @@ def insert_qa_row_tx(
     model_name: Optional[str] = None,
     error_message: Optional[str] = None,
     retrieved_docs: Optional[List[Dict[str, Any]]] = None,
+    latency_ms: int = 0,
 ) -> None:
     """qa_session_log 行的**事务内**写入变体（P0-01，unknown-unknowns 批次1）。
 
@@ -276,6 +277,9 @@ def insert_qa_row_tx(
       那些是增强，commit 后由 qa_answer_post_commit best-effort 补。
     - 可选列（conversation_id / question_hash）沿用 1054 摘除重试阶梯（语句级错误不
       终止 InnoDB 事务，行锁与已写语句保持）——列缺失绝不让整个 run 失败。
+    - latency_ms（γ1/M9.1，Majors 批次 γ，codex 共识 2026-07-21）：agent 完成事务
+      传入累计活跃执行耗时（active_latency_ms 口径，不含审批等待）——此前恒 0，
+      agent 行在通用延迟 p95 里全体隐形。既有调用不传维持 0。
     PII 掩码与主路径同口径（_redact_for_log）。"""
     query_text = _redact_for_log(query_text)
     answer_text = _redact_for_log(answer_text)
@@ -284,7 +288,7 @@ def insert_qa_row_tx(
         session_id, message_id, user_id or "", None, user_dept,
         query_text, answer_text, None, None, 0,
         _serialize_retrieved(retrieved_docs), None,
-        0, None, None,
+        int(latency_ms or 0), None, None,
         answer_status, model_name, error_message,
         None, None, None,
         None,

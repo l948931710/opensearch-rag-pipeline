@@ -404,3 +404,18 @@ class TestRedactFailClosed:
         out = qa_logger._redact_for_log("联系 13800138000")
         assert "13800138000" not in out                      # 正常掩码仍生效
         assert "PII_REDACT_FAILED" not in out                # 未误入占位分支
+
+
+def test_insert_qa_row_tx_latency_param():
+    """γ1（M9.1，Majors 批次 γ，codex 共识 2026-07-21）：insert_qa_row_tx 支持
+    latency_ms 关键字参数（agent 完成事务传累计活跃执行耗时）；不传维持 0。"""
+    from opensearch_pipeline.qa_logger import QA_SESSION_MANDATORY_COLS, insert_qa_row_tx
+
+    cur = MagicMock()
+    idx = list(QA_SESSION_MANDATORY_COLS).index("latency_ms")
+    insert_qa_row_tx(cur, session_id="s", message_id="m", query_text="q",
+                     answer_text="a", latency_ms=1234)
+    assert cur.execute.call_args[0][1][idx] == 1234
+    cur.reset_mock()
+    insert_qa_row_tx(cur, session_id="s", message_id="m2", query_text="q", answer_text="a")
+    assert cur.execute.call_args[0][1][idx] == 0        # 既有调用不变
