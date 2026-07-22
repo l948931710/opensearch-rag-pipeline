@@ -45,7 +45,8 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
 | D1 | ~~push 时点拍板~~ | ✅ 07-22 完成：main=dc6f54c / op0=793dc89 | ✅ 七 workflow 全绿（stress 首跑抓出 S7 门自 B5 失效→793dc89 修复重跑绿） |
 | D2 | ACR secrets | **前置：ACR 实例还没建**（仓内无 registry 记录、aliyun CLI 凭证未配）。runbook 见下方 D2 附注 | promotion job 缺 secret 会显式红（不静默） |
 | D3 | ~~environment 保护~~ | ✅ 07-22 完成：`acr-promotion` 已建，required_reviewers=l948931710（prevent_self_review=false——单人仓须能自批，有意） | ✅ `gh api .../environments/acr-promotion` 回读 rules 确认 |
-| D4 | branch protection | main 分支保护 UI（B7 族遗留） | — |
+| D4 | branch protection | main 分支保护 UI（B7 族遗留）；⚠️ Free 档仅公开仓可用——若 D5 转私有须随 Pro 一起解 | — |
+| D5 | 仓库转私有（Sam 决策 pending，07-22 重提） | **一揽子做，缺一不可**：①买 GitHub Pro（否则 acr-promotion environment 审批门在私有仓**静默失效**、D4 也做不了）②Claude 改 image.yml 工件策略（docker tar 几百 MB×14 天按公开仓免费额度设计，私有仓配额会爆——改按需产出/短 retention）③首月盯 Actions 分钟用量（私有仓设限，stress 单跑 11min）。如实注记：转私有不追溯，公开期副本/缓存收不回 | 转后 dispatch 一次 promotion 验证审批门仍拦人 |
 
 **D2 附注（Sam 亲手 runbook，凭证绝不经聊天/仓库）**：
 1. 阿里云容器镜像服务控制台 → **建企业版实例（经济版即可**，07-22 评估：拉取 QPS 30 对
