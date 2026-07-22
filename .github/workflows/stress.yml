@@ -1,9 +1,11 @@
 # agent 压测：零成本 mock 档全矩阵，MySQL 走 service container + ci_load_schema。
-# 三通道（RB-05）：
+# 四通道（RB-05 + Majors δ1/M11）：
 #   1) pull_request（paths 限 agent runtime/压测面）→ smoke 档，**进 required checks 硬门**
 #      ——硬门只含功能正确性断言（gates.py hard_fail 判据），G1-G9 容量门保持 draft 非阻断；
-#   2) schedule 每周日 → full 档（含 30min 浸泡）非阻断，失败靠通知；
-#   3) workflow_dispatch → 手工任意档。
+#   2) push（本分支，无 paths 限定）→ smoke 档非阻断——日常提交多为直接 push 而非 PR，
+#      此前压测面在 push 流上零覆盖（M11）；
+#   3) schedule 每周日 → full 档（含 30min 浸泡）非阻断，失败靠通知；
+#   4) workflow_dispatch → 手工任意档。
 # staging 真实计费档不进 CI（上线手册裁决，docs/agent_stress_test_launch_plan_2026-07-12.md）。
 name: stress
 
@@ -20,7 +22,15 @@ on:
       - "opensearch_pipeline/agent_runtime/**"
       - "opensearch_pipeline/agent_tools/**"
       - "opensearch_pipeline/routes/agent*"
+  push:
+    # δ1（M11，Majors 批次 δ，codex 共识 2026-07-21）：**无 paths 限定**——压测护的是
+    # 整机行为（config/db/serving 共享件改动同样能撕开 agent 面），smoke 档分钟级、
+    # runner 额度内；时长超预算再收窄 paths 并在此记录取舍。
+    branches: [claude/ontology-p0]
   schedule:
+    # ⚠️ schedule 在本仓是死项：GitHub 只对**默认分支（main）**评估 cron，而本工作流
+    # 只存在于 claude/ontology-p0（agent 域仅落分支的拍板）——保留此节仅为「分支若成为
+    # 默认/被合并时自动复活」，当前实际无人值守通道 = 上方 push 触发（δ1/M11 如实注记）。
     - cron: "0 20 * * 0"   # 周日 20:00 UTC（周一 04:00 北京）full 档周检
 
 concurrency:
