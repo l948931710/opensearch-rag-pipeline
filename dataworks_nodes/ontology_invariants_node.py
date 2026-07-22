@@ -29,12 +29,13 @@ import zipfile
 # 批次8（ultra ontology_backfill_node:41 同族）：serverless 执行器实为 py3.7——
 # requests==2.32.3 要求 ≥3.8，pip 第 0 步就死。对齐 stage 节点版本分支。
 if sys.version_info >= (3, 8):
-    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.32.3"]
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "requests==2.32.3"]
 else:
-    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.0", "requests==2.31.0"]
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "requests==2.31.0"]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", *DEPS, "-t", "/tmp/pydeps", "-q"
 ])
+subprocess.call([sys.executable, "-m", "pip", "freeze", "--path", "/tmp/pydeps"])   # δ3（M13）：传递闭包可见化（冻结回填 user-gated）
 if "/tmp/pydeps" not in sys.path:
     sys.path.insert(0, "/tmp/pydeps")
 
@@ -93,26 +94,57 @@ def _safe_extractall(zf, dest):
 
 
 def _verify_zip_integrity(zip_name):
-    """B4（P1-02）制品完整性：算 zip sha256 并留痕（运行结果可溯源到构建）；有
-    sidecar 资源 <zip_name>.sha256 时硬比对（不匹配=资源被替换，拒绝执行）；暂缺=
-    过渡期放行（旧包无 sidecar 不误伤；打包侧 deploy/build_dataworks_zip.sh 随包生成）。"""
+    """B4（P1-02）+δ3（M13，Majors 批次 δ，codex 共识 2026-07-21）制品完整性：算 zip
+    sha256 并留痕；有 sidecar 资源 <zip_name>.sha256 时硬比对（不匹配=资源被替换，拒绝
+    执行）；暂缺=默认过渡期放行（打包侧 deploy/build_dataworks_zip.sh 随包生成）。
+    δ3 增量：①RAG_DW_SIDECAR_STRICT=on（调度 env）→ 缺 sidecar/不可读/无 HMAC key 均
+    raise（默认 off=现状放行+显著警告）；②调度 env 配 RAG_DW_ZIP_HMAC_KEY → 对
+    <zip_name>.sha256.hmac 硬验（信任边界分离：能替换资源者可连 sidecar 一起换，但读
+    不到调度 env 就伪造不了签名；打包侧 --hmac 产第三份资源）。威胁模型边界（如实）：
+    能改节点代码本身或能读调度 env 的攻击者不在本防护面。"""
     import hashlib
+    import hmac as _hmac
+    _strict = (os.environ.get('RAG_DW_SIDECAR_STRICT', '') or '').strip().lower() \
+        in ('1', 'true', 'yes', 'on')
+    _key = (os.environ.get('RAG_DW_ZIP_HMAC_KEY', '') or '').strip()
     h = hashlib.sha256()
     with open(zip_name, 'rb') as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b''):
             h.update(chunk)
     digest = h.hexdigest()
     print("[B4] %s sha256=%s" % (zip_name, digest))
+    if _strict and not _key:
+        raise RuntimeError("[δ3 M13] RAG_DW_SIDECAR_STRICT=on 但调度 env 缺 "
+                           "RAG_DW_ZIP_HMAC_KEY——无 key 无从硬验，拒绝执行")
     try:
         _sc = odps.get_resource(zip_name + '.sha256')  # noqa: F821 — DataWorks 运行时注入
         with _sc.open(mode='r') as r:
             expected = (r.read() or '').strip().split()[0].lower()
-    except Exception as e:  # noqa: BLE001 — 过渡期：sidecar 未上传时放行
-        print("[B4] ⚠️ sidecar %s.sha256 不存在/不可读（过渡期放行）: %s" % (zip_name, e))
+    except Exception as e:  # noqa: BLE001 — 默认过渡期放行；STRICT 硬拒
+        if _strict:
+            raise RuntimeError("[δ3 M13] STRICT：sidecar %s.sha256 不存在/不可读"
+                               "（重新上传 zip+sidecar 三份资源）: %s" % (zip_name, e))
+        print("[B4] ⚠️ sidecar %s.sha256 不存在/不可读（过渡期放行；"
+              "RAG_DW_SIDECAR_STRICT=on 将硬拒）: %s" % (zip_name, e))
         return digest
     if expected != digest:
         raise RuntimeError("[B4] 制品完整性校验失败: sha256=%s != sidecar=%s"
                            % (digest, expected))
+    if _key:
+        try:
+            _hc = odps.get_resource(zip_name + '.sha256.hmac')  # noqa: F821 — 同上注入
+            with _hc.open(mode='r') as r:
+                _sig = (r.read() or '').strip().split()[0].lower()
+        except Exception as e:  # noqa: BLE001 — key 已配则 hmac sidecar 必须在场
+            raise RuntimeError("[δ3 M13] 调度 env 已配 HMAC key 但 %s.sha256.hmac 缺失/"
+                               "不可读（打包侧用 --hmac 重产并三份同批上传）: %s"
+                               % (zip_name, e))
+        _want = _hmac.new(_key.encode('utf-8'), digest.encode('ascii'),
+                          hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(_sig, _want):
+            raise RuntimeError("[δ3 M13] HMAC 校验失败：sha256 sidecar 可被连带伪造，"
+                               "签名对不上调度 env key，拒绝执行")
+        print("[δ3] ✅ HMAC 校验通过（信任边界=调度 env key）")
     print("[B4] ✅ 制品完整性校验通过（sidecar 匹配）")
     return digest
 
