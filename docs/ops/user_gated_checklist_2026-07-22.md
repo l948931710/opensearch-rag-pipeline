@@ -48,7 +48,9 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
 | D4 | branch protection | main 分支保护 UI（B7 族遗留） | — |
 
 **D2 附注（Sam 亲手 runbook，凭证绝不经聊天/仓库）**：
-1. 阿里云容器镜像服务控制台 → 建实例（个人版免费够用）→ 命名空间 `fuling` → 仓库 `rag-serving`
+1. 阿里云容器镜像服务控制台 → **建企业版实例（基础版最低档）**——⚠️ 个人版仅限「个人类型」
+   实名账号，本账号企业实名开不了（2026-07-22 实探纠偏，原「个人版免费」指引作废）；
+   **地域选成都**（与 SAE 同地域，拉镜像走 VPC 内网）→ 命名空间 `fuling` → 仓库 `rag-serving`
    ——**image.yml promotion 推的是 `${ACR_REGISTRY}/fuling/rag-serving:<sha>`**；若命名空间/仓库
    想用别的名字，告知 Claude 改 image.yml 后再配 secrets。
 2. 控制台「访问凭证」处设固定密码（或用临时 token，注意时效）。
