@@ -58,9 +58,11 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
    `oss-cn-hangzhou` 为证）→ 命名空间 `fuling`（默认私有+关自动建仓）→ 仓库 `rag-serving`
    （私有；代码源=**本地仓库**，绝不绑源码自动构建——build 必须走 CI smoke+attestation；
    **镜像版本不可变=开**：tag→digest 映射钉死，同 commit 重推被拒是 feature）；
-   **公网入口=开、白名单 0.0.0.0/0**（GH Actions push 只能走公网且 runner IP 段不可白名单化；
-   防护面=私有仓+强密码+不可变 tag+digest 部署；泄凭证最坏面≈读到本就 PUBLIC 的仓+塞可删
-   垃圾 tag，上线被 digest 链堵死；SAE 拉取仍走 VPC 不受影响）；
+   **公网入口=开、白名单填两条 `0.0.0.0/1`+`128.0.0.0/1`**（⚠️ 07-22 首推实测坑：ACR 拒
+   `0.0.0.0/0`，报 `INSTANCE_ACCESS_ACL_ENTRY_INVALID`——`/0` 全网掩码不收，须拆两个 `/1`
+   等效全 IPv4，只填一条 `/1` 会 half-flaky。GH Actions push 只能走公网且 runner IP 段不可
+   白名单化；防护面=私有仓+强密码+不可变 tag+digest 部署；泄凭证最坏面≈读到本就 PUBLIC 的仓
+   +塞可删垃圾 tag，上线被 digest 链堵死；SAE 拉取仍走 VPC 不受影响）；
    `ACR_PASSWORD` 入 RB-06 轮换族（与钉钉机器人 secret 同批）。
    **可选收紧（首推跑通后再做，勿今天叠变量）**：①窗口式——平时关公网，promotion 前开
    绿后关（稀发手工 dispatch 场景代价≈两下点击）；②CI 凭证换 ACR 推拉权限的专用 RAM
@@ -69,9 +71,11 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
    想用别的名字，告知 Claude 改 image.yml 后再配 secrets。
 2. 控制台「访问凭证」处设固定密码（或用临时 token，注意时效）。
 3. 本机终端逐条执行（`gh` 会交互式提示输入值，值不进 shell 历史也不进对话记录）：
-   `gh secret set ACR_REGISTRY`（值=企业版实例域名，形如 `<实例名>-registry.cn-hangzhou.cr.aliyuncs.com`，
-   控制台实例详情页照抄）、
-   `gh secret set ACR_USERNAME`、`gh secret set ACR_PASSWORD`。
+   `gh secret set ACR_REGISTRY`（值=**公网域名**，07-22 实测=`fuling-registry.cn-hangzhou.cr.aliyuncs.com`
+   ——⚠️「访问凭证」页 docker login 示例**默认显示专有网络 `-vpc` 域名，GH runner 在公网连它
+   必超时/401**；页面上方「专有网络｜公网｜经典网络」切到**公网**才拿到对的域名）、
+   `gh secret set ACR_USERNAME`（=登录名 `LaiJunchen@1418897636821379`）、`gh secret set ACR_PASSWORD`。
+   自证凭证：本机 `docker login <公网域名>` 出 `Login Succeeded` 再配 secret。
 4. 验证：`gh secret list` 见三条 → workflow_dispatch image.yml 勾 `push_acr=true` → environment
    审批放行 → promotion 绿 + attestation-v2 工件含 manifest digest（顺手把 digest 记进
    canary `--require-digest` 首用）。
