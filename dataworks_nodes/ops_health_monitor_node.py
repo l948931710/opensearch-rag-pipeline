@@ -175,7 +175,11 @@ from opensearch_pipeline.ops_monitor import main  # noqa: E402
 # 那只眼睛;可摄取+超24h 未注册才告警,旧格式/隔离区/自助上传形状不驱动红）。
 # ⚠️ unregistered_raw 需要 opensearch_pipeline_production.zip ≥ 2026-07-16(含 CS4c)——
 #    旧 zip 下该作业名会被静默忽略(不报错),重打包后自动生效。
+# γ3+γ6（Majors 批次 γ，2026-07-21）：agent_health（056 权威面）与 audit_digest
+# （审计摘要封存）入巡检集——两 flag 默认 off ⇒ skipped/exit 0 零行为变化，翻闸随
+# 调度 env（user-gated）。⚠️ 本 --only 名单要求 zip ≥ 含 Majors γ 的重打包（现行
+# argparse choices 会拒识新作业名直接报错）——节点重贴与 zip 重打包必须同窗。
 sys.exit(main(["--only", "reconcile_ha3", "reconcile_oss", "unregistered_raw",
-               "queue_aging", "ingest_funnel"]))
+               "queue_aging", "ingest_funnel", "agent_health", "audit_digest"]))
 # 阶段2（验稳后换成全量，含 qa_rollup 写 qa_daily_metrics + reconcile_raw）：
 # sys.exit(main([]))
