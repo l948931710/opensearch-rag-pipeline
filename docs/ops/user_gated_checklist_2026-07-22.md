@@ -54,7 +54,9 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
    实名账号，本账号企业实名开不了（2026-07-22 实探纠偏，原「个人版免费」指引作废）；
    **地域选杭州 cn-hangzhou**（与 SAE/OSS 同地域，拉镜像走 VPC 内网；07-22 Sam 确认——
    config.py docstring 的 chengdu 只是示例，生产真地域以 DataWorks 节点默认
-   `oss-cn-hangzhou` 为证）→ 命名空间 `fuling` → 仓库 `rag-serving`
+   `oss-cn-hangzhou` 为证）→ 命名空间 `fuling`（默认私有+关自动建仓）→ 仓库 `rag-serving`
+   （私有；代码源=**本地仓库**，绝不绑源码自动构建——build 必须走 CI smoke+attestation；
+   **镜像版本不可变=开**：tag→digest 映射钉死，同 commit 重推被拒是 feature）
    ——**image.yml promotion 推的是 `${ACR_REGISTRY}/fuling/rag-serving:<sha>`**；若命名空间/仓库
    想用别的名字，告知 Claude 改 image.yml 后再配 secrets。
 2. 控制台「访问凭证」处设固定密码（或用临时 token，注意时效）。
