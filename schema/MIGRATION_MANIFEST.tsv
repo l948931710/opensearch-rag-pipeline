@@ -60,3 +60,6 @@
 051_dingtalk_msg_dedup.sql operation
 052_agent_run_dispatch_bind.sql operation
 053_tool_invocation_reconcile.sql operation
+054_agent_run_request_identity.sql operation
+055_agent_step_bookkeeping.sql operation
+058_agent_quota_lock.sql operation
