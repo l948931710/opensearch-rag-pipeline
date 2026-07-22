@@ -240,6 +240,37 @@ def test_startup_check_passes_on_verified_and_tolerates_probe_error(monkeypatch)
     api._rds_tls_startup_check()                      # 未配 CA 归 P0-02 告警拍板，不在此断
 
 
+class TestRequireTlsFailClosed:
+    """γ5（M8，Majors 批次 γ，codex 共识 2026-07-21）：RAG_RDS_REQUIRE_TLS=on 时
+    探针对「无法实证客户端腿 TLS」fail-closed（分支形态：readiness 状态词裁决）；
+    off（默认）维持上方告警放行契约。"""
+
+    def test_unverifiable_status_raises(self, monkeypatch):
+        monkeypatch.setenv("RAG_RDS_REQUIRE_TLS", "true")
+        api = _wire_startup(monkeypatch, env="production",
+                            status="tls_unverifiable(proxy_status_empty)")
+        with pytest.raises(RuntimeError, match="RAG_RDS_REQUIRE_TLS"):
+            api._rds_tls_startup_check()
+
+    def test_probe_error_status_raises(self, monkeypatch):
+        monkeypatch.setenv("RAG_RDS_REQUIRE_TLS", "true")
+        api = _wire_startup(monkeypatch, env="staging", status="error")
+        with pytest.raises(RuntimeError, match="RAG_RDS_REQUIRE_TLS"):
+            api._rds_tls_startup_check()
+
+    def test_verified_still_passes(self, monkeypatch):
+        monkeypatch.setenv("RAG_RDS_REQUIRE_TLS", "true")
+        api = _wire_startup(monkeypatch, env="production",
+                            status="tls_verified(client-leg AES256-GCM-SHA384/TLSv1.2)")
+        api._rds_tls_startup_check()                  # 实证通过，不抛
+
+    def test_flag_off_unverifiable_keeps_pass(self, monkeypatch):
+        monkeypatch.delenv("RAG_RDS_REQUIRE_TLS", raising=False)
+        api = _wire_startup(monkeypatch, env="production",
+                            status="tls_unverifiable(proxy_status_empty)")
+        api._rds_tls_startup_check()                  # off：维持放行（既有拍板）
+
+
 # ── posture 字段 ─────────────────────────────────────────────────────────────
 
 

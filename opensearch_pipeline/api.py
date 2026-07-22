@@ -183,6 +183,14 @@ async def _lifespan(_app: FastAPI):
         logger.warning("agent shutdown 排水失败（忽略，继续关停）", exc_info=True)
 
 
+def _rds_tls_require_on() -> bool:
+    """γ5（M8，Majors 批次 γ，codex 共识 2026-07-21）：RAG_RDS_REQUIRE_TLS——on 时
+    启动探针对「无法实证客户端腿 TLS」fail-closed（配套 config 姿态断言：CA 非空+
+    文件存在+verify 开；默认 off=维持告警放行）。无 ack 逃生口，回滚=关 flag。"""
+    return os.environ.get("RAG_RDS_REQUIRE_TLS",
+                          "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _rds_tls_startup_check() -> None:
     """B3（RB-02）：启动期 TLS 接线自检。仅当 production/staging + 非模拟 + 已配
     RAG_RDS_SSL_CA 时实测：**ca_configured_but_plaintext ⇒ RuntimeError**。裁决证据
@@ -200,10 +208,22 @@ def _rds_tls_startup_check() -> None:
             raise RuntimeError(
                 "[B3 RB-02] RAG_RDS_SSL_CA 已配置但客户端连接 socket 非 TLS（明文）——"
                 "存在未接 pymysql_ssl_args 的连接路径，拒绝启动。")
+        # γ5（M8，Majors 批次 γ，codex 共识 2026-07-21）：RAG_RDS_REQUIRE_TLS=on 时
+        # 「无法实证客户端腿 TLS」（tls_unverifiable 代理语义不可裁决 / error 探针失败）
+        # 同 fail-closed——此前仅可见不阻断。回滚=关闭该 flag，无 ack 逃生口。
+        if _rds_tls_require_on() and not st.startswith("tls_verified"):
+            raise RuntimeError(
+                f"[γ5 M8] RAG_RDS_REQUIRE_TLS=on：TLS 自检状态={st}——无法实证客户端腿 "
+                "TLS，拒绝启动（回滚=关闭该 flag）。")
         logger.info("RDS TLS 自检：%s", st)
     except RuntimeError:
         raise
-    except Exception:   # noqa: BLE001
+    except Exception as probe_exc:   # noqa: BLE001
+        if _rds_tls_require_on():
+            # γ5（M8）：探针异常（DB 瞬断等）同属「无法实证」——fail-closed。
+            raise RuntimeError(
+                "[γ5 M8] RAG_RDS_REQUIRE_TLS=on：TLS 自检探针异常，无法实证客户端腿 "
+                f"TLS，拒绝启动（回滚=关闭该 flag）: {probe_exc}") from probe_exc
         logger.warning("RDS TLS 自检失败（忽略，不影响启动）", exc_info=True)
 
 

@@ -86,6 +86,126 @@ class TestTopologyGuard:
         assert cfg.environment == "production"
 
 
+# ── γ5（M8，Majors 批次 γ，codex 共识 2026-07-21）：RDS TLS 姿态断言 ─────────────
+class TestRdsTlsPosture:
+    """RAG_RDS_REQUIRE_TLS 默认 off=维持 P0-02 告警不阻断；on 且 prod/staging 真连
+    RDS 时 CA 非空+文件在+verify 开，缺一拒启动，**无 ack 逃生口**（回滚=关 flag）。"""
+
+    _PROD_BASE = dict(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                      RAG_SIMULATE_DB="false",
+                      RAG_RDS_HOST="rm-fake-nonprod.mysql.rds.aliyuncs.com",
+                      RAG_ALLOW_REMOTE_DB="read_only_ack",
+                      RAG_DASHSCOPE_API_KEY="x",
+                      RAG_REQUIRE_AUTH="true", RAG_ACL_FAIL_CLOSED="true")
+
+    def test_flag_off_no_ca_warns_only(self):
+        cfg = _fresh_load(**self._PROD_BASE)
+        assert cfg.environment == "production" and not cfg.rds.ssl_ca
+
+    def test_flag_on_no_ca_raises(self):
+        from opensearch_pipeline.config import EnvironmentMismatchError
+        with pytest.raises(EnvironmentMismatchError, match="RAG_RDS_REQUIRE_TLS"):
+            _fresh_load(RAG_RDS_REQUIRE_TLS="true", **self._PROD_BASE)
+
+    def test_flag_on_ca_file_missing_raises(self):
+        from opensearch_pipeline.config import EnvironmentMismatchError
+        with pytest.raises(EnvironmentMismatchError, match="CA 文件不存在"):
+            _fresh_load(RAG_RDS_REQUIRE_TLS="true",
+                        RAG_RDS_SSL_CA="/nonexistent/ca.pem", **self._PROD_BASE)
+
+    def test_flag_on_verify_off_raises(self, tmp_path):
+        from opensearch_pipeline.config import EnvironmentMismatchError
+        ca = tmp_path / "ca.pem"
+        ca.write_text("dummy")
+        with pytest.raises(EnvironmentMismatchError, match="VERIFY_CERT"):
+            _fresh_load(RAG_RDS_REQUIRE_TLS="true", RAG_RDS_SSL_CA=str(ca),
+                        RAG_RDS_SSL_VERIFY_CERT="false", **self._PROD_BASE)
+
+    def test_flag_on_full_posture_passes(self, tmp_path):
+        ca = tmp_path / "ca.pem"
+        ca.write_text("dummy")
+        cfg = _fresh_load(RAG_RDS_REQUIRE_TLS="true", RAG_RDS_SSL_CA=str(ca),
+                          **self._PROD_BASE)
+        assert cfg.rds.ssl_ca == str(ca) and cfg.rds.ssl_verify_cert is True
+
+    def test_flag_on_simulate_db_skips(self):
+        cfg = _fresh_load(RAG_RDS_REQUIRE_TLS="true", RAG_ENVIRONMENT="production",
+                          RAG_SIMULATE="true", RAG_DASHSCOPE_API_KEY="x",
+                          RAG_REQUIRE_AUTH="true", RAG_ACL_FAIL_CLOSED="true")
+        assert cfg.environment == "production"
+
+    def test_flag_on_development_unaffected(self):
+        cfg = _fresh_load(RAG_RDS_REQUIRE_TLS="true", RAG_SIMULATE="true")
+        assert cfg.environment not in ("production", "staging")
+
+    def test_staging_no_ca_warns_p002(self, caplog):
+        """γ5 前半：staging/test 分支补 P0-02 同文告警（无条件 warning-only）。"""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="opensearch_pipeline.config"):
+            _fresh_load(RAG_ENVIRONMENT="staging", RAG_SIMULATE="true",
+                        RAG_SIMULATE_DB="false",
+                        RAG_RDS_HOST="rm-fake-nonprod.mysql.rds.aliyuncs.com",
+                        RAG_ALLOW_REMOTE_DB="read_only_ack",
+                        RAG_DASHSCOPE_API_KEY="x",
+                        RAG_REQUIRE_AUTH="true", RAG_ACL_FAIL_CLOSED="true")
+        assert any("[P0-02]" in r.message for r in caplog.records)
+
+
+# ── γ7（M10，Majors 批次 γ）：ops 告警 webhook 姿态断言 ──────────────────────────
+class TestOpsAlertWebhookPosture:
+    """RAG_OPS_ALERT_REQUIRE on 且 prod/staging → webhook 非空且过 _webhook_allowed
+    域校验；配置存在≠送达证明（送达=现网 attestation）。"""
+
+    _BASE = dict(RAG_ENVIRONMENT="production", RAG_SIMULATE="true",
+                 RAG_DASHSCOPE_API_KEY="x",
+                 RAG_REQUIRE_AUTH="true", RAG_ACL_FAIL_CLOSED="true")
+
+    def test_flag_off_no_webhook_passes(self):
+        cfg = _fresh_load(**self._BASE)
+        assert cfg.environment == "production"
+
+    def test_flag_on_missing_webhook_raises(self):
+        with pytest.raises(ValueError, match="RAG_OPS_ALERT_WEBHOOK 未配置"):
+            _fresh_load(RAG_OPS_ALERT_REQUIRE="true", **self._BASE)
+
+    def test_flag_on_bad_domain_raises(self):
+        with pytest.raises(ValueError, match="未过域校验"):
+            _fresh_load(RAG_OPS_ALERT_REQUIRE="true",
+                        RAG_OPS_ALERT_WEBHOOK="https://evil.example.com/robot/send?access_token=x",
+                        **self._BASE)
+
+    def test_flag_on_http_scheme_raises(self):
+        with pytest.raises(ValueError, match="未过域校验"):
+            _fresh_load(RAG_OPS_ALERT_REQUIRE="true",
+                        RAG_OPS_ALERT_WEBHOOK="http://oapi.dingtalk.com/robot/send?access_token=x",
+                        **self._BASE)
+
+    def test_flag_on_dingtalk_webhook_passes(self):
+        cfg = _fresh_load(
+            RAG_OPS_ALERT_REQUIRE="true",
+            RAG_OPS_ALERT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=x",
+            **self._BASE)
+        assert cfg.environment == "production"
+
+    def test_flag_on_allowlisted_gateway_passes(self):
+        cfg = _fresh_load(
+            RAG_OPS_ALERT_REQUIRE="true",
+            RAG_OPS_ALERT_WEBHOOK="https://alerts.corp.internal/hook",
+            RAG_OPS_ALERT_WEBHOOK_ALLOW="alerts.corp.internal",
+            **self._BASE)
+        assert cfg.environment == "production"
+
+    def test_flag_on_development_unaffected(self):
+        cfg = _fresh_load(RAG_OPS_ALERT_REQUIRE="true", RAG_SIMULATE="true")
+        assert cfg.environment not in ("production", "staging")
+
+    def test_flag_on_staging_also_guarded(self):
+        with pytest.raises(ValueError, match="RAG_OPS_ALERT_WEBHOOK"):
+            _fresh_load(RAG_OPS_ALERT_REQUIRE="true", RAG_ENVIRONMENT="staging",
+                        RAG_SIMULATE="true", RAG_DASHSCOPE_API_KEY="x",
+                        RAG_REQUIRE_AUTH="true", RAG_ACL_FAIL_CLOSED="true")
+
+
 # ── P1-08：审批 TTL 单源派生 ─────────────────────────────────────────────────────
 class TestApprovalTtlSingleSource:
     def test_follows_suspended_when_unset(self, monkeypatch):
