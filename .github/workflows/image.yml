@@ -1,0 +1,146 @@
+# image.yml — SAE 服务镜像工件线（Majors δ2/M12.3，codex 共识 2026-07-21）。
+#
+# 两 job 拆分（共识承重墙：ACR push 不得因 secret 存在就自动发——deploy=Sam 明确触发）：
+#   job1 build-smoke（push/dispatch，**零外部写**）：build（amd64+GIT_SHA 烤入）→ B3 留验
+#     （非 root/amd64 断言）→ 同镜像 smoke（RAG_SIMULATE=true 起 uvicorn，curl /api/health）
+#     → docker save 工件 + attestation v1（git/Dockerfile/lock sha、image id；digest=null
+#     ——manifest digest 只有 registry push 才存在，v1 不编造）上传 artifact。
+#   job2 promotion（**仅** workflow_dispatch + push_acr=true + GitHub environment 保护）：
+#     下载 job1 同 run 工件 tar → load → push ACR（**逐字节同工件**，绝不重 build）→
+#     attestation v2（v1 全字段 + manifest digest）作第二份 immutable artifact（v1 不改）。
+#
+# M12 状态=PARTIAL：ACR secrets（ACR_REGISTRY/ACR_USERNAME/ACR_PASSWORD）与
+# environment `acr-promotion` 的保护规则（required reviewers）=user-gated（ε 清单）；
+# 镜像=唯一正式 SAE 工件路线，ZIP=break-glass（截止=SAE 镜像化迁移），见 README。
+
+name: image
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "Dockerfile"
+      - "requirements-prod.lock"
+      - "opensearch_pipeline/**"
+      - ".github/workflows/image.yml"
+  workflow_dispatch:
+    inputs:
+      push_acr:
+        description: "true = build 后把同 run 工件推 ACR（走 environment 保护）"
+        default: "false"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+      - name: Build (amd64, GIT_SHA baked)
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          docker build --platform linux/amd64 \
+            --build-arg GIT_SHA="$GIT_SHA" \
+            -t rag-serving:ci .
+      - name: Assert non-root user + amd64 (B3 迁移批留验收口)
+        run: |
+          USER_IN_IMAGE=$(docker inspect --format '{{.Config.User}}' rag-serving:ci)
+          ARCH=$(docker inspect --format '{{.Architecture}}' rag-serving:ci)
+          echo "User=$USER_IN_IMAGE Arch=$ARCH"
+          test "$USER_IN_IMAGE" = "appuser" || { echo "::error::镜像非 appuser 运行"; exit 1; }
+          test "$ARCH" = "amd64" || { echo "::error::镜像非 amd64（SAE 要求）"; exit 1; }
+      - name: Smoke (同镜像起服 → /api/health)
+        run: |
+          docker run -d --name smoke -p 8000:8000 -e RAG_SIMULATE=true rag-serving:ci
+          ok=""
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:8000/api/health >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::/api/health 90s 未就绪"; docker logs smoke; exit 1
+          fi
+          curl -fsS http://127.0.0.1:8000/api/health
+          docker rm -f smoke
+      - name: Save artifact + attestation v1
+        run: |
+          mkdir -p out
+          docker save rag-serving:ci -o out/rag-serving-image.tar
+          IMAGE_ID=$(docker inspect --format '{{.Id}}' rag-serving:ci)
+          export IMAGE_ID
+          python3 - << 'PYEOF'
+          import hashlib, json, os, subprocess
+          sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+          att = {
+              "schema": 1,
+              "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip(),
+              "dockerfile_sha256": sha("Dockerfile"),
+              "lock_sha256": sha("requirements-prod.lock"),
+              "image_id": os.environ["IMAGE_ID"],
+              "image_tar_sha256": sha("out/rag-serving-image.tar"),
+              # manifest digest 只有 registry push 才产生——v1 诚实置 null，v2（promotion）补
+              "manifest_digest": None,
+              "workflow_run": os.environ.get("GITHUB_RUN_ID"),
+          }
+          json.dump(att, open("out/attestation.json", "w"), indent=2)
+          print(json.dumps(att, indent=2))
+          PYEOF
+      - name: Upload image artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rag-serving-image
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
+
+  promotion:
+    # 仅显式 dispatch + push_acr=true；environment 保护规则（required reviewers）=user-gated 配置
+    if: github.event_name == 'workflow_dispatch' && inputs.push_acr == 'true'
+    needs: build-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: acr-promotion
+    steps:
+      - name: Download build artifact (同 run，逐字节同工件)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: rag-serving-image
+          path: out/
+      - name: Load + push ACR
+        run: |
+          docker load -i out/rag-serving-image.tar
+          test -n "${{ secrets.ACR_REGISTRY }}" || { echo "::error::缺 ACR_REGISTRY secret（user-gated 未配）"; exit 1; }
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ secrets.ACR_REGISTRY }}" \
+            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+          GIT_SHA=$(python3 -c "import json;print(json.load(open('out/attestation.json'))['git_sha'][:12])")
+          TARGET="${{ secrets.ACR_REGISTRY }}/fuling/rag-serving:${GIT_SHA}"
+          docker tag rag-serving:ci "$TARGET"
+          docker push "$TARGET"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$TARGET")
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+      - name: Attestation v2 (immutable second artifact; v1 不改)
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+          att = json.load(open("out/attestation.json"))
+          att2 = {**att, "schema": 2,
+                  "manifest_digest": os.environ.get("DIGEST"),
+                  "promotion_run": os.environ.get("GITHUB_RUN_ID")}
+          os.makedirs("out2", exist_ok=True)
+          json.dump(att2, open("out2/attestation-v2.json", "w"), indent=2)
+          print(json.dumps(att2, indent=2))
+          PYEOF
+      - name: Upload attestation v2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rag-serving-attestation-v2
+          path: out2/
+          retention-days: 90
+          if-no-files-found: error

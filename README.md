@@ -90,10 +90,18 @@ docs/            # 环境设计 / 架构审查 / 性能 backlog 等
 
 ## 部署（两个包，勿混）
 
+**SAE 服务侧正式工件路线 = 镜像**（Majors δ2/M12.3，2026-07-21）：`.github/workflows/image.yml`
+job1 build+smoke 产 `docker save` 工件与 attestation（零外部写）；推 ACR 走 job2 promotion
+（仅 workflow_dispatch + `push_acr=true` + environment 保护，**逐字节同工件**）。下表的
+SAE **ZIP 是 break-glass 备援**，带截止条件：SAE 应用完成镜像化迁移（user-gated）后退役。
+δ2b 实况核查结论：SAE zip **不自装依赖**——buildpack 远端 `pip install -r requirements.txt`
+（浮动；a64aa86 记录在案：精确钉版会致 buildImage exit 1，故该路径不切
+requirements-prod.lock/--require-hashes；哈希锁供应链保证只在镜像路线成立——又一条弃 ZIP 的理由）。
+
 | 包 | 用途 | 打法 |
 |---|---|---|
-| `opensearch_sae_rag.zip` | SAE 服务侧 | zip 根 = `requirements.txt`(必须) + `opensearch_pipeline/`(含 webconsole/next-dist，**打包前先 `cd console-app && npm run build`**) + `Dockerfile` + `pyproject.toml` + `.dockerignore`；无 pyc/.env/tests |
-| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装）。**B4 起用 `deploy/build_dataworks_zip.sh` 构建**：自动附 build_info.json + 生成 `.zip.sha256` sidecar（上传为同名 File 资源，节点做 sha256 校验——**摘要不一致才阻断；sidecar 缺失/不可读则过渡期放行 fail-open**，见 `tests/test_dataworks_supply_chain.py`；换 zip 请同步换 sidecar） |
+| `opensearch_sae_rag.zip` | SAE 服务侧（**break-glass**） | zip 根 = `requirements.txt`(必须) + `opensearch_pipeline/`(含 webconsole/next-dist，**打包前先 `cd console-app && npm run build`**) + `Dockerfile` + `pyproject.toml` + `.dockerignore`；无 pyc/.env/tests |
+| `opensearch_pipeline_production.zip` | DataWorks 摄取侧 | zip 根 = 仅 `opensearch_pipeline/`，**排除 webconsole/** + pyc；无 requirements.txt（节点内联 pip + pod 预装）。**B4 起用 `deploy/build_dataworks_zip.sh` 构建**：自动附 build_info.json + 生成 `.zip.sha256` sidecar（上传为同名 File 资源，节点做 sha256 校验——**摘要不一致才阻断；sidecar 缺失/不可读默认过渡期放行**，`RAG_DW_SIDECAR_STRICT=on` 硬拒；δ3 起支持 `--hmac` 产 `.sha256.hmac` 第三份资源，调度 env 配 `RAG_DW_ZIP_HMAC_KEY` 的节点硬验，见 `tests/test_dataworks_supply_chain.py`；换 zip 请同步换全部 sidecar） |
 
 **铁律**：一律打到 `~/Downloads/dw_upload_<YYYYMMDD>[_<purpose>]/`（勿打 repo 根）；部署时
 **按 SIZE/SHA-256 认包，别按文件名**（每个日期目录里文件名都一样，选错目录 = 静默部署旧版）。

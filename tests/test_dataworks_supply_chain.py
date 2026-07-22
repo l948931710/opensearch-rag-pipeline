@@ -35,7 +35,8 @@ _DEP_FILES = _EXTRACT_FILES + [
     "dataworks_nodes/scan_oss_sync_keys.py",
 ]
 # stress.yml 随压测线只在分支
-_WORKFLOWS = [".github/workflows/ci.yml", ".github/workflows/frontend.yml"]
+_WORKFLOWS = [".github/workflows/ci.yml", ".github/workflows/frontend.yml",
+              ".github/workflows/image.yml"]
 
 
 def test_no_bare_extractall_and_verify_wired():
