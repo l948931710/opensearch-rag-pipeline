@@ -17,11 +17,14 @@ DB 访问沿用 run_store 惯例：`db._get_db_conn()`、`%s` 占位、NOW(3)、
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac as _hmac
 import json
 import logging
 import os
 import uuid
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from opensearch_pipeline.config import get_config
 
@@ -148,6 +151,80 @@ def _resolve_scope(tool_name: str, ctx: "ExecutionContext", args: Dict[str, Any]
         return ""
 
 
+# ── α5（M6，codex 共识 2026-07-21）：审批入场三层配额 ────────────────────────
+
+
+class ApprovalQuotaExceeded(RuntimeError):
+    """三层配额（global / per-requester / per-requester-tool）任一超限——在
+    suspend_run_atomic 同一事务内裁决，整体回滚零副作用，run 得明确可重试错误。"""
+
+
+class ApprovalQuotaUnavailable(RuntimeError):
+    """任一 cap>0 而 agent_quota_lock 表/哨兵行不可用（schema/058 未 apply）——
+    **fail-closed**：配置了的护栏绝不静默降级为无限额（codex v4 blocker）；
+    readiness approval_quota_contract 在 cap>0 时同步红灯。"""
+
+
+def _quota_caps() -> Tuple[int, int, int]:
+    """(global, per-requester, per-requester-tool)；默认全 0=off（byte-identical，
+    caps 全 0 时完全不触 058）。"""
+    def _i(name: str) -> int:
+        try:
+            return max(0, int(os.environ.get(name, "0") or "0"))
+        except ValueError:
+            return 0
+    return (_i("RAG_AGENT_APPROVAL_GLOBAL_CAP"),
+            _i("RAG_AGENT_APPROVAL_PENDING_CAP"),
+            _i("RAG_AGENT_APPROVAL_PER_TOOL_CAP"))
+
+
+def _is_unknown_table_error(exc: BaseException) -> bool:
+    args = getattr(exc, "args", None) or ()
+    return (bool(args) and args[0] == 1146) or "doesn't exist" in str(exc)
+
+
+# ── α4（M5）：分页游标——不透明+版本化+HMAC 签名 ─────────────────────────────
+# 键=进程内随机（单副本形态；重启键轮换 → 旧游标失效，客户端从首页重拉，列表轮询
+# 场景可接受）。严格校验：版本/签名/结构任一不符 → ValueError（路由层 400）。
+
+_CURSOR_KEY: Optional[bytes] = None
+
+
+def _cursor_key() -> bytes:
+    global _CURSOR_KEY
+    if _CURSOR_KEY is None:
+        _CURSOR_KEY = os.urandom(32)
+    return _CURSOR_KEY
+
+
+def _encode_cursor(created_at: Any, request_id: str) -> str:
+    ca = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"v": 1, "ca": ca, "id": request_id},
+                   ensure_ascii=False).encode("utf-8")).decode("ascii").rstrip("=")
+    sig = _hmac.new(_cursor_key(), payload.encode("ascii"), hashlib.sha256).hexdigest()[:32]
+    return f"v1.{payload}.{sig}"
+
+
+def _decode_cursor(cursor: str) -> Tuple[Any, str]:
+    try:
+        ver, payload, sig = str(cursor).split(".", 2)
+    except ValueError:
+        raise ValueError("游标格式非法")
+    if ver != "v1":
+        raise ValueError("游标版本不支持")
+    want = _hmac.new(_cursor_key(), payload.encode("ascii"), hashlib.sha256).hexdigest()[:32]
+    if not _hmac.compare_digest(want, sig):
+        raise ValueError("游标签名不符（或服务已重启，请从首页重拉）")
+    try:
+        pad = "=" * (-len(payload) % 4)
+        obj = json.loads(base64.urlsafe_b64decode(payload + pad).decode("utf-8"))
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(str(obj["ca"])), str(obj["id"])
+    except Exception as e:
+        raise ValueError("游标载荷非法") from e
+
+
 class RDSApprovalStore:
     """approval_request / approval_decision 的 RDS（fuling_operation）实现。"""
 
@@ -179,6 +256,16 @@ class RDSApprovalStore:
         requested_dept = derive_approver_scope(ctx)
         scope = _resolve_scope(tool_name, ctx, args)
         db = _op_db()
+        # α5（M6）：三层入场配额——与本 INSERT **同一事务**（suspend_run_atomic）内裁决。
+        # caps 全 0（默认）→ 零 058 接触（byte-identical）；任一 cap>0 → 哨兵行 FOR
+        # UPDATE 显式串行化（单锁无死锁面，不赌隐式 gap-lock）→ 三 COUNT（走
+        # idx_approval_quota）→ 超限抛 ApprovalQuotaExceeded（整事务回滚零副作用）；
+        # 058 缺失/哨兵缺行 → ApprovalQuotaUnavailable **fail-closed**。
+        g_cap, u_cap, t_cap = _quota_caps()
+        if g_cap or u_cap or t_cap:
+            self._enforce_admission_quota(
+                cur, db, requested_by=(ctx.user_id or "-")[:64], tool_name=tool_name,
+                caps=(g_cap, u_cap, t_cap))
         cur.execute(
             f"INSERT INTO {db}.approval_request "
             "(request_id, run_id, call_id, tool_name, tool_version, proposed_args_json, "
@@ -192,6 +279,44 @@ class RDSApprovalStore:
              (requested_dept or None), scope[:160], int(ttl_s)),
         )
         return request_id
+
+    @staticmethod
+    def _enforce_admission_quota(cur, db: str, *, requested_by: str, tool_name: str,
+                                 caps: Tuple[int, int, int]) -> None:
+        """α5（M6）：哨兵串行化 + global→user→user-tool 三层 COUNT。锁随调用方事务
+        commit/rollback 释放。真库双连接穿透测试见 test_majors_alpha_m6_db.py。"""
+        g_cap, u_cap, t_cap = caps
+        try:
+            cur.execute(f"SELECT lock_name FROM {db}.agent_quota_lock "
+                        "WHERE lock_name='approval_admission' FOR UPDATE")
+            row = cur.fetchone()
+        except Exception as e:   # noqa: BLE001
+            if _is_unknown_table_error(e):
+                raise ApprovalQuotaUnavailable(
+                    "agent_quota_lock 表缺失（schema/058 未 apply）——配额已配置，"
+                    "fail-closed 拒绝提案；请先 apply 058 或清零配额 env") from e
+            raise
+        if not row:
+            raise ApprovalQuotaUnavailable(
+                "agent_quota_lock 哨兵行缺失（058 的 INSERT IGNORE 未跑）——fail-closed")
+        if g_cap:
+            cur.execute(f"SELECT COUNT(*) FROM {db}.approval_request WHERE status='pending'")
+            if int(cur.fetchone()[0]) >= g_cap:
+                raise ApprovalQuotaExceeded(
+                    f"审批积压已达全局上限（{g_cap}），请稍后再提交需审批的操作")
+        if u_cap:
+            cur.execute(f"SELECT COUNT(*) FROM {db}.approval_request "
+                        "WHERE status='pending' AND requested_by=%s", (requested_by,))
+            if int(cur.fetchone()[0]) >= u_cap:
+                raise ApprovalQuotaExceeded(
+                    f"你的待审批请求已达上限（{u_cap}），请等待处置或撤回后再提交")
+        if t_cap:
+            cur.execute(f"SELECT COUNT(*) FROM {db}.approval_request "
+                        "WHERE status='pending' AND requested_by=%s AND tool_name=%s",
+                        (requested_by, tool_name))
+            if int(cur.fetchone()[0]) >= t_cap:
+                raise ApprovalQuotaExceeded(
+                    f"你在工具 {tool_name} 上的待审批请求已达上限（{t_cap}）")
 
     def create_request(self, run_id: str, ctx: "ExecutionContext",
                        pending_call: Dict[str, Any], *, tool_version: str = "",
@@ -396,8 +521,14 @@ class RDSApprovalStore:
 
     def list_pending(self, scopes: Optional[List[str]] = None, *, requested_by: Optional[str] = None,
                      limit: int = 100) -> List[Dict[str, Any]]:
-        """审批队列。scopes=None → 全部（kb_admin）；否则按 approver_scope 覆盖匹配（dept_admin）。
-        requested_by 给「我的申请」视图。
+        """审批队列（存量 scope 过滤形态）。scopes=None → 全部（kb_admin）；否则按
+        approver_scope 覆盖匹配（dept_admin）。requested_by 给「我的申请」视图。
+
+        ⚠️ α4（M5，codex 共识 2026-07-21）：**scope 可见性裁决不再走本方法**——注册了
+        per-tool 解析器的工具以 live scope 为唯一权威（快照过滤会让轮换后的旧 steward
+        继续看到参数、新 steward 永远看不到），审批人视角一律走 list_pending_page。
+        本方法保留给 ?mine（requested_by 视角，无 scope 语义）与 kb_admin 全量等
+        无需 live 裁决的调用方。
 
         P1-11 backup steward：approver_scope 可为 CSV（"steward,backup"，schema/031 加宽）——
         队列过滤按**分量**匹配（FIND_IN_SET），managed 覆盖任一分量即入待办；此前 IN 精确
@@ -424,6 +555,146 @@ class RDSApprovalStore:
             return [self._row_to_dict(r) for r in rows]
         finally:
             conn.close()
+
+    # ── α4（M5，codex 共识 2026-07-21）：live 权威分页 + scope 轮换收敛 ─────────
+
+    def list_pending_page(self, viewer_depts: Optional[List[str]], *,
+                          limit: int = 50, cursor: Optional[str] = None) -> Dict[str, Any]:
+        """审批人视角分页（live scope 唯一权威）。
+
+        与 list_pending 的本质差异：**不做 approver_scope 的 SQL 预过滤**——按
+        (created_at, request_id) keyset 扫描 pending 候选，逐行以 live resolver 判可见
+        （registered 工具：resolve_scope_live 现算；unregistered：快照回退），填满一页。
+        轮换后新 steward **立即**在列表看到请求、旧 steward 立即看不到，与裁决口径一致。
+
+        - viewer_depts=None → kb_admin（全可见，零 resolve 开销）；
+        - next_cursor 指向最后一个**已扫描候选**（非最后可见项——否则被隐藏行反复重扫），
+          版本化+HMAC 签名不透明编码；进程重启签名键轮换 → 旧游标失效，客户端从首页重拉
+          （列表轮询场景可接受）；伪造/损坏游标 → ValueError（路由层 400）。
+        - 授权路径零缓存（codex v2 blocker：轮换后旧 scope 不得有缓存授权窗口）。"""
+        anchor: Optional[Tuple[Any, str]] = _decode_cursor(cursor) if cursor else None
+        db = _op_db()
+        out: List[Dict[str, Any]] = []
+        last_scanned: Optional[Dict[str, Any]] = None
+        exhausted = False
+        batch = 200
+        conn = self._conn()
+        try:
+            while len(out) < limit and not exhausted:
+                conds, params = ["status='pending'"], []
+                if anchor is not None:
+                    conds.append("(created_at > %s OR (created_at = %s AND request_id > %s))")
+                    params.extend([anchor[0], anchor[0], anchor[1]])
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT {self._COLS} FROM {db}.approval_request "
+                        f"WHERE {' AND '.join(conds)} "
+                        "ORDER BY created_at ASC, request_id ASC LIMIT %s",
+                        tuple(params) + (batch,))
+                    rows = cur.fetchall() or []
+                for r in rows:
+                    d = self._row_to_dict(r)
+                    last_scanned = d
+                    anchor = (d.get("created_at"), d.get("request_id"))
+                    if self._visible_live(d, viewer_depts):
+                        out.append(d)
+                        if len(out) >= limit:
+                            break
+                if len(rows) < batch and len(out) < limit:
+                    exhausted = True
+        finally:
+            conn.close()
+        next_cursor = None
+        if not exhausted and last_scanned is not None:
+            next_cursor = _encode_cursor(last_scanned.get("created_at"),
+                                         str(last_scanned.get("request_id")))
+        return {"items": out, "next_cursor": next_cursor}
+
+    @staticmethod
+    def _visible_live(d: Dict[str, Any], viewer_depts: Optional[List[str]]) -> bool:
+        """单行可见性：kb_admin（None）恒可见；registered 工具 live 唯一权威（''=仅
+        kb_admin，dept_admin 不可见）；unregistered（resolve 返回 None）→ 快照回退。"""
+        if viewer_depts is None:
+            return True
+        live = resolve_scope_live(d.get("tool_name"), d.get("proposed_args"))
+        scope = live if live is not None else (d.get("approver_scope") or "")
+        if not scope:
+            return False
+        viewer = {v for v in viewer_depts if v}
+        return any(p.strip() in viewer for p in str(scope).split(",") if p.strip())
+
+    def refresh_scope(self, request_id: str, old_scope: str, new_scope: str, *,
+                      run_id: Optional[str] = None, actor: str = "system") -> bool:
+        """scope 轮换落库（CAS + 同事务 old→new 审计）。
+
+        WHERE status='pending' AND approver_scope=<old> ——并发裁决/重复刷新恰一次生效
+        （codex v3：rowcount=1 才写审计，绝不产生「审计说改了、行没改」的错位）。
+        存量列此后仅作展示/审计事实；可见性与裁决均以 live 为权威（本方法只是让
+        存量面追上事实，FIND_IN_SET 的历史消费方不再被旧 scope 误导）。"""
+        from opensearch_pipeline.agent_runtime.run_store import _begin
+        db = _op_db()
+        conn = self._conn()
+        _begin(conn)        # 多语句事务（UPDATE+审计 INSERT）：钉连接禁 SteadyDB 单句重试
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {db}.approval_request SET approver_scope=%s "
+                    "WHERE request_id=%s AND status='pending' AND approver_scope=%s",
+                    (str(new_scope)[:160], request_id, old_scope))
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return False
+                from opensearch_pipeline.agent_runtime.audit import insert_audit_row_tx
+                insert_audit_row_tx(
+                    cur, None, event_type="approval_scope_refreshed",
+                    action="approval.scope_refresh", decision="updated",
+                    run_id=run_id,
+                    detail={"request_id": request_id, "old_scope": old_scope,
+                            "new_scope": str(new_scope)[:160], "actor": actor})
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def refresh_stale_scopes(self, *, older_than_s: int = 1800, limit: int = 50) -> int:
+        """轮换收敛的进程外兜底腿（reaper tick 调用；γ 批 agent_health 复用）：对挂起
+        超过 older_than_s 的 pending 行批量 live 现算，漂移则 CAS 刷新+审计——彻底消除
+        「无人点击审批则新 steward 永远看不到」的死角（live 列表已消可见性死角，本腿
+        消的是存量列漂移的展示/审计口径）。返回刷新行数；单行失败不拖垮整批。"""
+        db = _op_db()
+        conn = self._conn()
+        rows: List[Any] = []
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT request_id, run_id, tool_name, proposed_args_json, approver_scope "
+                    f"FROM {db}.approval_request "
+                    "WHERE status='pending' AND created_at < DATE_SUB(NOW(3), INTERVAL %s SECOND) "
+                    "ORDER BY created_at ASC LIMIT %s",
+                    (int(older_than_s), int(limit)))
+                rows = list(cur.fetchall() or [])
+        finally:
+            conn.close()
+        refreshed = 0
+        for r in rows:
+            try:
+                request_id, run_id, tool_name, args_json, stored = r[0], r[1], r[2], r[3], r[4]
+                try:
+                    args = json.loads(args_json) if isinstance(args_json, (str, bytes)) else (args_json or {})
+                except Exception:   # noqa: BLE001
+                    args = {}
+                live = resolve_scope_live(tool_name, args)
+                if live is None or live == (stored or ""):
+                    continue
+                if self.refresh_scope(request_id, stored or "", live,
+                                      run_id=run_id, actor="reaper"):
+                    refreshed += 1
+            except Exception:   # noqa: BLE001 — 单行失败不拖垮整批
+                logger.warning("scope 轮换收敛单行失败（下轮重试）", exc_info=True)
+        return refreshed
 
     # ── 对账/收尸 ────────────────────────────────────────────────
     def expire_stale(self) -> int:

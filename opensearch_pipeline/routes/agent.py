@@ -128,6 +128,36 @@ def _agent_enabled() -> bool:
     return os.environ.get("RAG_AGENT_ENABLE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _ask_idem_enabled() -> bool:
+    """α3（M4，codex 共识 2026-07-21）：ask 业务域幂等键（RAG_AGENT_ASK_IDEM_ENABLE，
+    默认 off=byte-identical）。开启前置=schema/054 已 apply（readiness
+    ask_idem_contract 钉住，未 apply 时 create_run 侧 1054 warn-once 降级无键）。"""
+    return (os.environ.get("RAG_AGENT_ASK_IDEM_ENABLE", "").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+class AgentAskRequest(AskRequest):
+    """α3（M4）：console agent 专用请求形态——在共享 AskRequest 上加客户端业务幂等键
+    （不动 api.py 共享件；仅本路由消费）。client_request_id：客户端每次**逻辑提交**
+    生成 uuid，网络级重试复用同值——响应丢失后的重试凭 uk_run_client_req（054）
+    回放既有 run，不再双执行双计费。"""
+
+    client_request_id: Optional[str] = None
+
+
+_RUN_TERMINAL_STATES = ("succeeded", "failed", "cancelled", "expired")
+
+
+def _replay_response(row: Dict[str, Any]) -> JSONResponse:
+    """α3：幂等回放（JSON 非 SSE，前端按 content-type 分流）——非终态 202（前端转
+    轮询/运行中心水合），终态 200（前端拉 run detail 水合答案）。"""
+    status = str(row.get("status") or "")
+    code = 200 if status in _RUN_TERMINAL_STATES else 202
+    return JSONResponse(status_code=code, content={
+        "run_id": row.get("run_id"), "status": status, "replayed": True,
+        "session_id": row.get("thread_id"), "message_id": row.get("message_id")})
+
+
 def _global_admission_full(run_store) -> bool:
     """PR-3 Stage D distributed admission：全局在跑上限（RAG_AGENT_GLOBAL_MAX_RUNNING，
     默认 0=off）。跨副本成本护栏——每实例线程池（RunRejected→429）仍是硬界，本闸拦
@@ -257,6 +287,17 @@ def _start_reaper(run_store, approval_store=None, runtime=None) -> None:
                         logger.warning("agent 审批请求过期收尸：pending→expired %s", n)
                 except Exception:   # noqa: BLE001
                     logger.warning("审批请求过期收尸失败（下轮重试）", exc_info=True)
+                # α4（M5）：scope 轮换收敛兜底腿——挂起超 30min 的 pending 批量 live
+                # 现算，漂移则 CAS 刷新+审计（live 列表已消可见性死角，这里收敛存量列
+                # 的展示/审计口径；γ 批 agent_health 提供进程外第二兜底）。
+                try:
+                    _rs = getattr(approval_store, "refresh_stale_scopes", None)
+                    if _rs is not None:
+                        nr = _rs()
+                        if nr:
+                            logger.warning("approver_scope 轮换收敛：%s 行已刷新（audit 在案）", nr)
+                except Exception:   # noqa: BLE001
+                    logger.warning("scope 轮换收敛失败（下轮重试）", exc_info=True)
                 # 批次5 cross-heal（unknown-unknowns P1-08）：双 TTL 漂移的两类半状态互收——
                 # run 终态而审批仍 pending（队列幽灵）/ 审批已过期而 run 仍 suspended
                 # （active_thread 占坑到自身 TTL）。已决待重驱的归 B6，不在此列。
@@ -668,12 +709,32 @@ def _stream_events(handle, session_id: str, message_id: str):
 
 
 @router.post("/api/agent/ask")
-def agent_ask(req: AskRequest, request: Request,
+def agent_ask(req: AgentAskRequest, request: Request,
               identity: Optional[Identity] = Depends(current_identity)):
     if not _agent_enabled():
         raise HTTPException(status_code=404, detail="Not Found")   # 隐藏入口
     if identity is None:
         raise HTTPException(status_code=401, detail="需要登录")
+    # α3（M4）：客户端业务幂等键——回放查询位于 admission **之前**（codex v2 major：
+    # 回放命中不是新工作，不计 admission、不建 durable 命令、不建 run）。
+    # question_digest=原始 UTF-8 问题 SHA-256（不 trim 不规范化，与落库口径一字不差）。
+    client_key = (getattr(req, "client_request_id", None) or "").strip() or None
+    q_digest = None
+    if client_key:
+        if len(client_key) > 64:
+            raise HTTPException(status_code=422, detail="client_request_id 过长（≤64）")
+        import hashlib as _hashlib
+        q_digest = _hashlib.sha256((req.question or "").encode("utf-8")).hexdigest()
+        if _ask_idem_enabled():
+            _rs0 = _get_runtime()[3]
+            _find0 = getattr(_rs0, "find_run_by_client_request", None)
+            prior = _find0(identity.user_id, client_key) if _find0 is not None else None
+            if prior is not None:
+                if (prior.get("question_digest") or "") != q_digest:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="client_request_id 已用于不同问题（客户端幂等键复用错误）")
+                return _replay_response(prior)
     # 「深度思考」→ 模型档映射：console 复用普通问答的同一开关；档位在服务端定
     # （ON=high：qwen3.7-plus+思考预算 · OFF=light：不思考/快/省），端上不暴露模型名。
     # 深思计入与 /api/ask 相同的每日深思配额（同一稀缺资源，不因走 agent 而绕开）。
@@ -727,7 +788,8 @@ def agent_ask(req: AskRequest, request: Request,
     registry, gateway, executor, _run_store = _get_runtime()
     from opensearch_pipeline.agent_runtime import DefaultAgentLoop, ExecutionContext, make_model_fn
     from opensearch_pipeline.agent_runtime.executor import RunRejected
-    from opensearch_pipeline.agent_runtime.run_store import DispatchCommandBound, ThreadBusy
+    from opensearch_pipeline.agent_runtime.run_store import (
+        ClientRequestBound, DispatchCommandBound, ThreadBusy)
 
     try:
         from opensearch_pipeline.request_context import get_request_id
@@ -768,6 +830,11 @@ def agent_ask(req: AskRequest, request: Request,
     # （答案锚点丢失，读回退化）。与 run_id 同类：建 run 相关性字段、非身份/ACL，
     # 就地 setattr 不违 frozen 初衷（executor 对 run_id 同款）。
     object.__setattr__(ctx, "message_id", message_id)
+    if client_key and _ask_idem_enabled():
+        # α3（M4）：幂等键随 create_run 同 INSERT 原子落（message_id/dispatch_command_id
+        # 同款先例）——uk_run_client_req 并发裁决单赢家
+        object.__setattr__(ctx, "client_request_id", client_key)
+        object.__setattr__(ctx, "question_digest", q_digest)
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))   # 档位随深度思考：light/high
     tools = registry.list_specs(ctx)
     # 多轮：system + 历史快照（前几轮 Q&A + summary）+ 本轮 user
@@ -851,7 +918,11 @@ def agent_ask(req: AskRequest, request: Request,
                 thread_id=thread_id, user_id=identity.user_id, channel="console",
                 payload={"question": req.question, "thinking": thinking,
                          "conversation_id": conv, "message_id": message_id,
-                         "request_id": rid})
+                         "request_id": rid,
+                         # α3（M4）：幂等键随命令 durable——重驱重建的 run 同样落键，
+                         # 客户端重试仍能回放命中，绝不双 run
+                         **({"client_request_id": client_key, "question_digest": q_digest}
+                            if (client_key and _ask_idem_enabled()) else {})})
             if _dispatcher.claim_for_request(_cmd_id):
                 durable_cmd = (_dispatcher, _cmd_id)
                 # R1（RB-RT-01）：命令锚上 ctx——create_run 的 INSERT 同事务原子落
@@ -900,10 +971,49 @@ def agent_ask(req: AskRequest, request: Request,
         # A1（schema/037）：同 thread 已有非终态 run（含 suspended 等审批）——DB 唯一键
         # 裁决的串行化，并发双 submit 恰一个到这里。409 与 429 语义分开：不是容量满，
         # 是该会话上一问未收尾。
+        # α3（M4，codex v4）：带幂等键时先按键回读——同键同题=响应丢失后的重试撞上
+        # 自己已建的 run（uk_thread_active 先于 uk_run_client_req 报出的形态），回放
+        # 而非 409；异键/异题才是真会话忙。
+        if client_key and _ask_idem_enabled():
+            _find_prior = getattr(_run_store, "find_run_by_client_request", None)
+            prior = (_find_prior(identity.user_id, client_key)
+                     if _find_prior is not None else None)
+            if prior is not None and (prior.get("question_digest") or "") == q_digest:
+                if durable_cmd:
+                    try:
+                        durable_cmd[0].bind_and_done(durable_cmd[1], prior["run_id"])
+                        logger.info("α3 幂等回放：命令 %s 收口 done（deduplicated-to-run:%s）",
+                                    durable_cmd[1], prior["run_id"])
+                    except Exception:   # noqa: BLE001 — 恢复扫描 bound-expired 兜底
+                        logger.warning("幂等回放命令 %s 绑定既有 run 失败（恢复扫描兜底）",
+                                       durable_cmd[1], exc_info=True)
+                return _replay_response(prior)
         if durable_cmd:
             durable_cmd[0].fail_fast(durable_cmd[1], "会话忙（409）")
         raise HTTPException(status_code=409,
                             detail="该会话已有回答在进行中（或有待审批任务未收尾），请稍后再试")
+    except ClientRequestBound:
+        # α3（M4）：并发双 POST/重试竞态，uk_run_client_req 裁决本方输——回读赢家回放；
+        # 本方已受理的 durable 命令绑到赢家 run 收口 done（既有 done 状态，不新增枚举；
+        # 绝不留孤儿命令被恢复线程重驱成第二个 run）。
+        _find_prior = getattr(_run_store, "find_run_by_client_request", None)
+        prior = (_find_prior(identity.user_id, client_key)
+                 if _find_prior is not None else None)
+        if prior is not None and (prior.get("question_digest") or "") == q_digest:
+            if durable_cmd:
+                try:
+                    durable_cmd[0].bind_and_done(durable_cmd[1], prior["run_id"])
+                    logger.info("α3 幂等竞态输家：命令 %s 收口 done（deduplicated-to-run:%s）",
+                                durable_cmd[1], prior["run_id"])
+                except Exception:   # noqa: BLE001 — 恢复扫描 bound-expired 兜底
+                    logger.warning("竞态输家命令 %s 绑定赢家 run 失败（恢复扫描兜底）",
+                                   durable_cmd[1], exc_info=True)
+            return _replay_response(prior)
+        if durable_cmd:
+            durable_cmd[0].fail_fast(durable_cmd[1], "幂等键竞态（赢家回读失败）")
+        raise HTTPException(
+            status_code=409,
+            detail="该问题已受理并正在处理中，请稍后在会话历史查看回答（请勿重复提交）")
     except DispatchCommandBound:
         # R1（RB-RT-01）：本命令已有 run（uk_run_dispatch_cmd 裁决本方输）——恢复扫描
         # 抢先重建了执行（防御性角落：本线程在 claim 后停顿超租约）。绝不再直通第二个
@@ -1016,15 +1126,28 @@ def _authorize_approver(identity: Identity, run: dict, areq: Optional[dict],
     - 请求行缺失（approval_store 故障/历史挂起）→ scope 未知 → 只有 kb_admin 可审（fail-closed）。
     """
     requester = run.get("user_id")
-    scope = (areq or {}).get("approver_scope") or ""
+    snapshot_scope = (areq or {}).get("approver_scope") or ""
+    scope = snapshot_scope
     # PR-C（P0-06 #4）：注册了 per-tool 解析器的工具在**审批时现算** scope——
     # 提案后 stewardship 变更即时生效（旧 steward 部门不再能凭快照批准）。
     # 未注册工具返回 None → 沿用快照（默认推导语义零变化）；现算异常 '' fail-closed。
+    _rotated = False
     if areq is not None:
         from opensearch_pipeline.agent_runtime.approval_store import resolve_scope_live
         live = resolve_scope_live(areq.get("tool_name"), areq.get("proposed_args"))
         if live is not None:
             scope = live
+            # α4（M5）：检出漂移即把存量列追上事实（CAS+同事务审计；fail-open——刷新
+            # 失败不影响裁决，reaper 腿兜底）。无论本次裁决放行与否都刷：403 的旧
+            # steward 触达也应让正确 steward 的存量面立即收敛。
+            if live != snapshot_scope:
+                _rotated = True
+                try:
+                    _get_approval_store().refresh_scope(
+                        areq.get("request_id"), snapshot_scope, live,
+                        run_id=areq.get("run_id"), actor=identity.user_id)
+                except Exception:   # noqa: BLE001
+                    logger.warning("approver_scope 轮换落库失败（reaper 腿兜底）", exc_info=True)
     if identity.user_id == requester:
         if outcome_kind == "rejected_terminate" or _self_approval_allowed():
             return scope                               # 撤回自己的申请恒允许
@@ -1037,8 +1160,10 @@ def _authorize_approver(identity: Identity, run: dict, areq: Optional[dict],
     # P1-11：scope 支持 CSV（steward,backup）——backup steward 的 dept_admin 也可审
     if kb.role == ROLE_DEPT_ADMIN and scope and _scope_covers(scope, set(managed_owner_depts(kb))):
         return scope
-    raise HTTPException(status_code=403,
-                        detail="无权审批该请求（需 kb_admin 或 approver_scope 覆盖的 dept_admin）")
+    raise HTTPException(
+        status_code=403,
+        detail="无权审批该请求（需 kb_admin 或 approver_scope 覆盖的 dept_admin）"
+               + ("；提示：该请求的审批 scope 已在提案后轮换" if _rotated else ""))
 
 
 @router.post("/api/agent/approve")
@@ -1087,7 +1212,15 @@ def agent_approve(req: ApproveRequest, request: Request,
                 _areq_vis = _get_approval_store().get_latest_by_run(req.run_id)
             except Exception:   # noqa: BLE001 — 可见性事实读不出 → 按不可见处理（fail-closed）
                 _areq_vis = None
+            # α4（M5）：registered 工具 live scope 唯一权威（快照会让轮换后的旧 steward
+            # 继续可见、新 steward 404）；unregistered（live=None）→ 快照回退。
             _scope_vis = (_areq_vis or {}).get("approver_scope") or ""
+            if _areq_vis is not None:
+                from opensearch_pipeline.agent_runtime.approval_store import resolve_scope_live
+                _live_vis = resolve_scope_live(_areq_vis.get("tool_name"),
+                                               _areq_vis.get("proposed_args"))
+                if _live_vis is not None:
+                    _scope_vis = _live_vis
             _visible = bool(_scope_vis) and _scope_covers(
                 _scope_vis, set(managed_owner_depts(_kb_vis)))
         if not _visible:
@@ -1523,7 +1656,7 @@ def _dispatch_recovered_submit(cmd: dict):
     from opensearch_pipeline.agent_runtime.durable_dispatcher import DispatchRetryLater
     from opensearch_pipeline.agent_runtime.executor import RunRejected
     from opensearch_pipeline.agent_runtime.run_store import (
-        DispatchCommandBound, ThreadBusy)
+        ClientRequestBound, DispatchCommandBound, ThreadBusy)
 
     payload = cmd.get("payload") or {}
     question = (payload.get("question") or "").strip()
@@ -1580,6 +1713,11 @@ def _dispatch_recovered_submit(cmd: dict):
     object.__setattr__(ctx, "message_id", message_id)   # P1-12：随 create_run 同事务
     # R1（RB-RT-01）：重驱建的 run 同样落命令锚——uk 兜底与并发恢复者/快路径单赢家
     object.__setattr__(ctx, "dispatch_command_id", cmd.get("command_id"))
+    # α3（M4）：payload 携幂等键则重驱 run 同样落键——重建后客户端重试仍回放命中，
+    # uk_run_client_req 兜底「重驱 vs 客户端重试」并发单赢家
+    if payload.get("client_request_id"):
+        object.__setattr__(ctx, "client_request_id", payload.get("client_request_id"))
+        object.__setattr__(ctx, "question_digest", payload.get("question_digest"))
     loop = DefaultAgentLoop(make_model_fn(gateway, ctx, tier))
     tools = registry.list_specs(ctx)
     messages = ([{"role": "system", "content": _agent_system_prompt()}]
@@ -1630,6 +1768,18 @@ def _dispatch_recovered_submit(cmd: dict):
                                  on_complete_durable=_persist_answer)
     except (RunRejected, ThreadBusy) as e:
         raise DispatchRetryLater(f"执行器暂不可用: {str(e)[:120]}")
+    except ClientRequestBound:
+        # α3（M4）：客户端重试抢先建了同幂等键的 run（uk_run_client_req 裁决本方输）
+        # ——命令绑到赢家 run 收敛，绝不重驱第二个 run
+        _find_ck = getattr(_run_store, "find_run_by_client_request", None)
+        _prior = (_find_ck(user_id, payload.get("client_request_id"))
+                  if _find_ck is not None else None)
+        if _prior and _prior.get("run_id"):
+            logger.warning("恢复扫描：命令 %s 重驱输给客户端重试 run %s"
+                           "（deduplicated-to-run）——rebind 收敛",
+                           cmd.get("command_id"), _prior["run_id"])
+            return _prior["run_id"]
+        raise DispatchRetryLater("幂等键已绑 run 但反查未见（复制延迟）——下轮收敛")
     except DispatchCommandBound:
         # R1（RB-RT-01）：并发恢复者/快路径抢先为本命令建了 run（uk 裁决本方输）——
         # 取赢家 run 收敛，绝不重驱第二个 run
@@ -2177,12 +2327,15 @@ def agent_invocation_resolve(req: InvocationResolveRequest, request: Request,
 
 @router.get("/api/agent/approvals")
 def agent_approvals(request: Request, mine: bool = False, limit: int = 50,
+                    cursor: Optional[str] = None,
                     identity: Optional[Identity] = Depends(current_identity)):
     """审批队列（console ManageView；报告 §N）。
 
-    - 默认：审批人视角——kb_admin 见全部 pending；dept_admin 见 approver_scope ∈ managed
-      的 pending（resolve_kb_identity DB 现查，与 kb_access 队列同纪律）；普通员工 403。
-    - `?mine=1`：发起人视角——本人提交的 pending 请求（撤回入口用）。
+    - 默认：审批人视角——kb_admin 见全部 pending；dept_admin 见 **live** approver_scope
+      覆盖 managed 的 pending（α4/M5：registered 工具 live 唯一权威——轮换后新 steward
+      立即可见、旧 steward 立即不可见；unregistered 回退快照）。keyset 游标分页
+      （cursor 入参 + 响应 next_cursor；伪造/过期游标 400）。普通员工 403。
+    - `?mine=1`：发起人视角——本人提交的 pending 请求（撤回入口用），无 scope 语义。
     条目为脱敏后参数（proposed_args）+ render_summary，原文不出库。"""
     if not _agent_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
@@ -2196,8 +2349,14 @@ def agent_approvals(request: Request, mine: bool = False, limit: int = 50,
     from opensearch_pipeline.dingtalk_identity import resolve_kb_identity
     from opensearch_pipeline.kb_authz import ROLE_DEPT_ADMIN, ROLE_KB_ADMIN, managed_owner_depts
     kb = resolve_kb_identity(identity.user_id)
-    if kb.role == ROLE_KB_ADMIN:
-        return {"items": store.list_pending(None, limit=limit)}
-    if kb.role == ROLE_DEPT_ADMIN:
-        return {"items": store.list_pending(list(managed_owner_depts(kb)), limit=limit)}
-    raise HTTPException(status_code=403, detail="无权查看审批队列（需 dept_admin / kb_admin）")
+    if kb.role not in (ROLE_KB_ADMIN, ROLE_DEPT_ADMIN):
+        raise HTTPException(status_code=403, detail="无权查看审批队列（需 dept_admin / kb_admin）")
+    viewer = None if kb.role == ROLE_KB_ADMIN else list(managed_owner_depts(kb))
+    _page = getattr(store, "list_pending_page", None)
+    if _page is None:                      # 旧/简化桩 store：回退存量语义（快照过滤）
+        items = store.list_pending(viewer, limit=limit)
+        return {"items": items, "next_cursor": None}
+    try:
+        return _page(viewer, limit=limit, cursor=cursor)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"分页游标无效：{e}")

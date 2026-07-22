@@ -443,6 +443,64 @@ def durable_dispatch_contract_status() -> str:
     return _cached("durable_dispatch_contract", 60, _compute)
 
 
+def ask_idem_contract_status() -> str:
+    """α3（M4，codex 共识 2026-07-21）：RAG_AGENT_ASK_IDEM_ENABLE 开 ⇒ 054
+    agent_run.client_request_id/question_digest 必须在位——缺列时 create_run 侧
+    1054 warn-once 降级无键 INSERT（幂等 API 面宣称生效实则不设防），开着 flag 跑
+    降级语义的实例不该接流量（critical）。off → skipped。"""
+    if not _flag_on("RAG_AGENT_ASK_IDEM_ENABLE"):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        return _columns_exist(db, [("agent_run", "client_request_id", "054"),
+                                   ("agent_run", "question_digest", "054")])
+
+    return _cached("ask_idem_contract", 60, _compute)
+
+
+def approval_quota_contract_status() -> str:
+    """α5（M6，codex 共识 2026-07-21）：任一审批配额 cap>0 ⇒ 058 agent_quota_lock
+    表+哨兵行必须在位——缺失时 insert_request **fail-closed** 拒绝全部提案（配置了的
+    护栏绝不静默失效），契约缺失的实例不该接流量（critical）。caps 全 0 → skipped。"""
+    def _cap(name: str) -> int:
+        try:
+            return int(os.environ.get(name, "0") or "0")
+        except ValueError:
+            return 0
+    if not any(_cap(n) > 0 for n in ("RAG_AGENT_APPROVAL_GLOBAL_CAP",
+                                     "RAG_AGENT_APPROVAL_PENDING_CAP",
+                                     "RAG_AGENT_APPROVAL_PER_TOOL_CAP")):
+        return "skipped"
+
+    def _compute() -> str:
+        from opensearch_pipeline.config import get_config
+        db = get_config().rds.operation_database
+        t = _tables_exist(db, ["agent_quota_lock"])
+        if t == "missing":
+            return "missing:agent_quota_lock(schema/058)"
+        if t != "ok":
+            return t
+        try:
+            from opensearch_pipeline.db import _get_db_conn
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM `{db}`.agent_quota_lock "
+                                "WHERE lock_name='approval_admission'")
+                    row = cur.fetchone()
+                    n = row[0] if not isinstance(row, dict) else list(row.values())[0]
+            finally:
+                conn.close()
+            return "ok" if int(n) == 1 else "missing:sentinel(approval_admission)"
+        except Exception as e:   # noqa: BLE001 — 探针报告不抛出
+            logger.warning("readiness: 审批配额哨兵探针失败: %s", e)
+            return "error"
+
+    return _cached("approval_quota_contract", 60, _compute)
+
+
 def op_reconcile_contract_status() -> str:
     """RR-2（P2-RR-06）：RAG_AGENT_OP_RECONCILE_ENABLE 开 ⇒ 053 两列必须在位——
     缺列时退避/隔离整体回退旧「最老 LIMIT」语义（毒头阻塞重开），开着 flag 跑旧

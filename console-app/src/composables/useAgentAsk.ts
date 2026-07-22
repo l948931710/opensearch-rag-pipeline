@@ -479,9 +479,24 @@ async function askAgent(preset?: string, skipUser = false): Promise<void> {
   if (conv.qaSession) body.session_id = conv.qaSession
   body.conversation_id = conv.id
   if (bridge.thinking.value) body.thinking = true   // 深度思考→服务端模型档 high（仅 true 时带）
+  // α3（M4）：客户端业务幂等键——本次逻辑提交生成一次，网络级重试复用同值；后端
+  // RAG_AGENT_ASK_IDEM_ENABLE 开启时凭 uk_run_client_req 回放既有 run（响应丢失后的
+  // 重试不再双执行双计费）；flag off 时服务端忽略本字段（零行为差）。
+  const clientReqId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+    ? crypto.randomUUID().replace(/-/g, '')
+    : `cr${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`
+  body.client_request_id = clientReqId
 
   try {
-    const res = await apiFetch('/api/agent/ask', { method: 'POST', body: JSON.stringify(body), signal: ctl?.signal })
+    let res
+    try {
+      res = await apiFetch('/api/agent/ask', { method: 'POST', body: JSON.stringify(body), signal: ctl?.signal })
+    } catch (netErr: any) {
+      // α3：网络级失败（fetch 抛错=请求可能已达服务端）且非用户取消 → 同键重试一次；
+      // 幂等键保证服务端至多一 run（重试撞上已建 run 时后端回 JSON 回放）。
+      if (netErr?.name === 'AbortError') throw netErr
+      res = await apiFetch('/api/agent/ask', { method: 'POST', body: JSON.stringify(body), signal: ctl?.signal })
+    }
     if (res.status === 404) {
       // flag 未开/被关：标记不可用（探测态一并翻转，入口自隐）+ 本问回退旧路径
       supported.value = false
@@ -503,6 +518,35 @@ async function askAgent(preset?: string, skipUser = false): Promise<void> {
       e.status = res.status
       e._friendly = !!friendly
       throw e
+    }
+    const ctype = ((res.headers && typeof res.headers.get === 'function')
+      ? (res.headers.get('content-type') || '') : '').toLowerCase()
+    if (ctype.includes('application/json')) {
+      // α3 幂等回放（202 运行中 / 200 终态，非 SSE）：run 已存在（响应丢失后的重试/
+      // 并发双击撞上自己）——不开新流，转断线恢复同款形态（轮询+续流水合终态答案）。
+      const j = await res.json().catch(() => null) as
+        { run_id?: string; status?: string; session_id?: string; replayed?: boolean } | null
+      asking.value = false
+      agentStreamActive.value = false
+      abortCtl = null
+      const meta = ai.agent as AgentMsgMeta
+      if (j?.session_id && !conv.qaSession) conv.qaSession = j.session_id
+      if (j?.run_id) {
+        meta.runId = j.run_id
+        if (j.status) meta.status = j.status as AgentMsgMeta['status']
+        meta.disconnected = true
+        _runMsgIndex.set(j.run_id, ai)
+        pushStage(ai, 'replayed', '已受理（回放既有运行）')
+        ensureRunPolling(j.run_id)
+        void attachRunEvents(j.run_id, meta, ai, () => bridge.schedulePersist())
+      } else {
+        ai.error = true
+        ai.errorText = 'Agent 回答失败，请检查网络后重试。'
+        pushStage(ai, 'error', '失败')
+      }
+      ai.streaming = false
+      bridge.schedulePersist()
+      return
     }
     if (!res.body || !res.body.getReader) throw new Error('浏览器不支持流式读取')
 

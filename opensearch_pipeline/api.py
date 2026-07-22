@@ -783,6 +783,8 @@ def _compute_readiness(cfg):
     # 依赖该 schema，契约缺失即 critical（不依赖 RAG_READY_SCHEMA_STRICT）；off→skipped。
     # followup(050)/acl_generation(049) 为 report-only（运行时有 1054/双路径优雅降级）。
     checks["durable_dispatch_contract"] = _readiness.durable_dispatch_contract_status()
+    checks["ask_idem_contract"] = _readiness.ask_idem_contract_status()
+    checks["approval_quota_contract"] = _readiness.approval_quota_contract_status()
     checks["op_reconcile_contract"] = _readiness.op_reconcile_contract_status()
     checks["ingest_lease_contract"] = _readiness.ingest_lease_contract_status()
     checks["write_tool_contract"] = _readiness.write_tool_contract_status()
