@@ -20,8 +20,11 @@ on:
     branches: [main, "claude/**"]
     paths:
       - "Dockerfile"
+      - ".dockerignore"    # 镜像内容承重输入（决定 next-dist 唯一来源）：单改它也须重验镜像
       - "requirements-prod.lock"
       - "opensearch_pipeline/**"
+      - "console-app/**"   # 镜像内嵌 console 构建（2026-07-22 切换窗）：前端改动也要重出镜像
+      - "schema/**"        # op0 镜像内嵌 schema/（readiness checksum 探针）：DDL 改动须重出镜像
       - ".github/workflows/image.yml"
   workflow_dispatch:
     inputs:
@@ -72,6 +75,25 @@ jobs:
             echo "::error::/api/health 90s 未就绪"; docker logs smoke; exit 1
           fi
           curl -fsS http://127.0.0.1:8000/api/health
+          # console 探针（2026-07-22）：next-dist 是 gitignore 产物，曾在 CI 检出里整目录缺失
+          # 而 /api/health 探不出来（首镜像 589149ac3af3 即无前端）。两段式：index.html 必须
+          # 引用 assets/，且实际拉取首个 hashed JS（只查 HTML 会漏「有 index 无资产」假绿）。
+          # 不用 `curl | grep -q`：pipefail 下 grep -q 早退触发 curl SIGPIPE 假红。
+          CONSOLE_HTML=$(curl -fsS http://127.0.0.1:8000/console/)
+          ASSET_PATH=$(printf '%s' "$CONSOLE_HTML" | grep -oE '[^"]*assets/[^"]+\.js' | sed -n '1p')
+          test -n "$ASSET_PATH" || { echo "::error::/console/ 未含前端资产引用（console-builder 产物缺失？）"; exit 1; }
+          case "$ASSET_PATH" in
+            /*) ASSET_URL="http://127.0.0.1:8000${ASSET_PATH}" ;;
+            *)  ASSET_URL="http://127.0.0.1:8000/console/${ASSET_PATH}" ;;
+          esac
+          # 资产必须以 JS 类型返回：缺失时 SPA 回退把任意路径 200 成 index.html（text/html），
+          # 仅看状态码会假绿（codex 评审点）。
+          ASSET_TYPE=$(curl -fsS -o /dev/null -w '%{content_type}' "$ASSET_URL") \
+            || { echo "::error::前端资产拉取失败: ${ASSET_URL}"; exit 1; }
+          case "$ASSET_TYPE" in
+            *javascript*) ;;
+            *) echo "::error::资产返回非 JS（命中 SPA fallback？）: ${ASSET_TYPE} @ ${ASSET_URL}"; exit 1 ;;
+          esac
           docker rm -f smoke
       - name: Save artifact + attestation v1
         run: |
@@ -87,6 +109,8 @@ jobs:
               "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip(),
               "dockerfile_sha256": sha("Dockerfile"),
               "lock_sha256": sha("requirements-prod.lock"),
+              # 镜像自 2026-07-22 起内嵌 console 构建 → 第二套依赖锁一并列入指纹
+              "console_lock_sha256": sha("console-app/package-lock.json"),
               "image_id": os.environ["IMAGE_ID"],
               "image_tar_sha256": sha("out/rag-serving-image.tar"),
               # manifest digest 只有 registry push 才产生——v1 诚实置 null，v2（promotion）补

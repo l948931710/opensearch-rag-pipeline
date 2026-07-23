@@ -27,3 +27,11 @@ scratch.py
 console-app/node_modules/
 console-app/dist/
 opensearch_pipeline/webconsole/next-dist/
+# ── 镜像切换窗补充（2026-07-22，自 main b86a81a 并集）──
+console-app/test-results/
+console-app/playwright-report/
+node_modules/
+# 本地代理工作区（与 pyproject ruff 排除同口径）
+.agents/
+.claude/
+.codex/

@@ -7,9 +7,10 @@
 
 # ── Stage 1: console 前端构建（Vite/Vue3 → opensearch_pipeline/webconsole/next-dist）──
 # 基础镜像按 digest 固定（2026-07-11 重审计 §6 供应链：tag 可被上游改写，digest 不可）。
-# 升级基础镜像：docker buildx imagetools inspect node:20-slim 取新 digest，连同下方
+# 2026-07-22 切换窗（自 main b86a81a 对齐）：node 20→22，与 frontend.yml node-version 22 同轨。
+# 升级基础镜像：docker buildx imagetools inspect node:22-slim 取新 digest，连同下方
 # python digest 一起换、一起过 make test + 镜像冒烟。
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS console-build
+FROM node:22-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS console-build
 
 WORKDIR /build/console-app
 # 依赖清单先拷（层缓存：lock 不变不重装）
@@ -47,7 +48,7 @@ COPY requirements-prod.lock ./
 #（与旧「空包 + extras」形态运行语义一致）。
 RUN pip install --no-cache-dir --require-hashes --no-deps -r requirements-prod.lock
 
-# 拷贝应用代码 + 前端产物（来自 node 构建阶段）
+# 拷贝应用代码 + 前端产物（来自 node 构建阶段；本地 next-dist 被 .dockerignore 排除不混入）
 COPY opensearch_pipeline/ ./opensearch_pipeline/
 COPY --from=console-build /build/opensearch_pipeline/webconsole/next-dist \
      ./opensearch_pipeline/webconsole/next-dist
