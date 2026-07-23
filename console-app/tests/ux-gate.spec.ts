@@ -305,6 +305,50 @@ test.describe('UX 硬门 — AI 助手交互', () => {
       page.getByText('试试这样问'),
     ]);
   });
+
+  test('点踩原因面板：失败恢复后重试成功（载荷与小程序同契约）', async ({ page }) => {
+    await page.route('**/api/ask/stream', (route) => route.fulfill({
+      contentType: 'text/event-stream',
+      body: sse([
+        { type: 'session', message_id: 'm-fb', session_id: 's1' },
+        { type: 'chunk', content: '这是一段示例答案。' },
+        { type: 'done' },
+      ]),
+    }));
+    // /api/feedback：首次 500（守「失败恢复」语义）、二次 200；顺带捕获两次载荷
+    const payloads: Record<string, unknown>[] = [];
+    await page.route('**/api/feedback', (route) => {
+      payloads.push(route.request().postDataJSON());
+      if (payloads.length === 1) return route.fulfill({ status: 500, contentType: 'application/json', body: '{}' });
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ status: 'ok' }) });
+    });
+    await page.goto(CHAT_ROUTE);
+    await page.getByTestId('chat-input').fill('测一次不满意反馈');
+    await page.getByTestId('chat-send').click();
+    const down = page.getByRole('button', { name: '没用' });
+    await expect(down, '答案定稿后反馈条可用').toBeVisible();
+    await down.click();
+    // 面板出现：逆序选两个原因 + 填说明（断言序列化按固定 REASONS 顺序、说明被 trim）
+    await page.getByRole('button', { name: '信息过时' }).click();
+    await page.getByRole('button', { name: '内容不准确' }).click();
+    await page.getByLabel('其他原因说明（选填）').fill('  答案引用的是旧版制度  ');
+    await page.getByRole('button', { name: /^提交$/ }).click();
+    // 第一次 500：面板保持、草稿未丢、就地报错（不得静默失败）
+    await expect(page.getByRole('alert'), '失败必须就地报错').toContainText('提交失败');
+    await expect(page.getByRole('button', { name: '内容不准确' })).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.getByLabel('其他原因说明（选填）')).toHaveValue(/旧版制度/);
+    // 重试成功：面板收起、锁票、宣告已反馈
+    await page.getByRole('button', { name: /^提交$/ }).click();
+    await expect(page.getByRole('status')).toContainText('已反馈');
+    await expect(page.getByRole('button', { name: '没用' })).toBeDisabled();
+    expect(payloads).toHaveLength(2);
+    const want = {
+      message_id: 'm-fb', feedback_type: 'downvote',
+      feedback_reason: 'inaccurate,outdated', feedback_comment: '答案引用的是旧版制度',
+    };
+    expect(payloads[0], '两次提交载荷应完全一致且已规范化').toEqual(want);
+    expect(payloads[1]).toEqual(want);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -203,6 +203,82 @@ describe('useAsk.vote — 乐观置态 + 失败回滚', () => {
   })
 })
 
+describe('useAsk.vote — 点踩原因载荷（downvote-only extra + 规范化防线）', () => {
+  // 跑一条正常回答拿到带 messageId 的 AI 消息（多次调用取最新一条）
+  async function askOnce() {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp([
+      frame({ type: 'session', session_id: 's', message_id: 'mR' }),
+      frame({ type: 'chunk', content: 'ok' }),
+      frame({ type: 'done', model: 'q', usage: {}, guard: false }), DONE,
+    ])))
+    const ctx = useAsk()
+    await ctx.ask('问')
+    return { vote: ctx.vote, ai: ctx.messages.value[ctx.messages.value.length - 1] }
+  }
+  const okFetch = () => vi.fn().mockResolvedValue(jsonResp({ status: 'ok' }))
+  const sentBody = (fn: ReturnType<typeof vi.fn>) => JSON.parse(fn.mock.calls[0][1].body)
+
+  it('reason+comment 都有：trim 后随载荷，成功返回 true', async () => {
+    const { vote, ai } = await askOnce()
+    const f = okFetch(); vi.stubGlobal('fetch', f)
+    const ret = await vote(ai, 'downvote', { reason: 'inaccurate,not_found', comment: '  答案是旧版制度  ' })
+    expect(ret).toBe(true)
+    expect(ai.voted).toBe('down')
+    expect(sentBody(f)).toEqual({
+      message_id: 'mR', feedback_type: 'downvote',
+      feedback_reason: 'inaccurate,not_found', feedback_comment: '答案是旧版制度',
+    })
+  })
+
+  it('只勾原因 / 只填说明：空的一侧不发键', async () => {
+    let got = await askOnce()
+    let f = okFetch(); vi.stubGlobal('fetch', f)
+    await got.vote(got.ai, 'downvote', { reason: 'outdated', comment: '   ' })
+    expect(sentBody(f)).toEqual({ message_id: 'mR', feedback_type: 'downvote', feedback_reason: 'outdated' })
+
+    got = await askOnce()
+    f = okFetch(); vi.stubGlobal('fetch', f)
+    await got.vote(got.ai, 'downvote', { reason: '', comment: '图挂了' })
+    expect(sentBody(f)).toEqual({ message_id: 'mR', feedback_type: 'downvote', feedback_comment: '图挂了' })
+  })
+
+  it('comment 程序化超长 → 载荷截到 200 字（maxlength 之外的最终防线）', async () => {
+    const { vote, ai } = await askOnce()
+    const f = okFetch(); vi.stubGlobal('fetch', f)
+    await vote(ai, 'downvote', { comment: '长'.repeat(300) })
+    expect(sentBody(f).feedback_comment).toHaveLength(200)
+  })
+
+  it('upvote 防御性忽略 extra：原因永不进点赞载荷', async () => {
+    const { vote, ai } = await askOnce()
+    const f = okFetch(); vi.stubGlobal('fetch', f)
+    const ret = await vote(ai, 'upvote', { reason: 'inaccurate', comment: '误传' })
+    expect(ret).toBe(true)
+    expect(sentBody(f)).toEqual({ message_id: 'mR', feedback_type: 'upvote' })
+  })
+
+  it('守卫路径显式返回 false：已锁票 / 无 messageId，均不发请求', async () => {
+    const { vote, ai } = await askOnce()
+    const f = okFetch(); vi.stubGlobal('fetch', f)
+    expect(await vote(ai, 'downvote', { reason: 'outdated' })).toBe(true)
+    expect(await vote(ai, 'downvote', { reason: 'outdated' })).toBe(false)   // 已锁票
+    expect(f).toHaveBeenCalledTimes(1)
+
+    const got = await askOnce()
+    got.ai.messageId = undefined
+    const f2 = okFetch(); vi.stubGlobal('fetch', f2)
+    expect(await got.vote(got.ai, 'downvote', { reason: 'outdated' })).toBe(false)
+    expect(f2).not.toHaveBeenCalled()
+  })
+
+  it('downvote 失败：回滚 + 返回 false（面板据此恢复）', async () => {
+    const { vote, ai } = await askOnce()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResp({ detail: 'x' }, { ok: false, status: 500 })))
+    expect(await vote(ai, 'downvote', { reason: 'inaccurate' })).toBe(false)
+    expect(ai.voted).toBe('')
+  })
+})
+
 describe('useAsk — 深度思考（parity-5）', () => {
   it('开启时请求体带 thinking:true；关闭时不带', async () => {
     const mk = () => streamResp([

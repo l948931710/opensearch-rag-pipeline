@@ -520,13 +520,26 @@ function searchConversations(q: string): Conversation[] {
   return list.filter((c) => convSearchText(c).includes(k))
 }
 
-async function vote(m: ChatMessage, type: 'upvote' | 'downvote'): Promise<void> {
-  if (m.voted || !m.messageId) return
+async function vote(
+  m: ChatMessage, type: 'upvote' | 'downvote',
+  extra?: { reason?: string; comment?: string },
+): Promise<boolean> {
+  if (m.voted || !m.messageId) return false
+  const body: Record<string, string> = { message_id: m.messageId, feedback_type: type }
+  // 规范化唯一防线：仅点踩可携带原因/说明；trim+200 上限与小程序端一致（feedback_comment
+  // 落库前后端另有脱敏），空串不发键。
+  if (type === 'downvote' && extra) {
+    const reason = (extra.reason || '').trim()
+    const comment = (extra.comment || '').trim().slice(0, 200)
+    if (reason) body.feedback_reason = reason
+    if (comment) body.feedback_comment = comment
+  }
   m.voted = type === 'upvote' ? 'up' : 'down'   // 乐观置态
   schedulePersist()
   try {
-    await apiJson('/api/feedback', { method: 'POST', auth: true, body: JSON.stringify({ message_id: m.messageId, feedback_type: type }) })
-  } catch { m.voted = ''; schedulePersist() }   // 回滚
+    await apiJson('/api/feedback', { method: 'POST', auth: true, body: JSON.stringify(body) })
+    return true
+  } catch { m.voted = ''; schedulePersist(); return false }   // 回滚，调用方（点踩面板）据 false 恢复
 }
 
 function copyAns(m: ChatMessage): void {
