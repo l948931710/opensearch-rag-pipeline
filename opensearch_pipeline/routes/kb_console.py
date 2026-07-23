@@ -511,7 +511,8 @@ _KB_INSIGHTS_WINDOW_DAYS = 30
 # feedback_reason 是逗号拼接的多选码（见 feedback_handler 写侧）。
 _KB_DOWNVOTE_REASON_LABELS = {
     "inaccurate": "不准确", "irrelevant": "不相关", "incomplete": "不完整",
-    "outdated": "已过时", "not_found": "未找到", "other": "其他",
+    "outdated": "已过时", "not_found": "未找到", "wrong_image": "图片不对",
+    "other": "其他",
 }
 
 
