@@ -22,3 +22,16 @@ README.md
 recover.py
 recovered_pipeline_nodes.py
 scratch.py
+# ── 镜像切换窗补充（2026-07-22）──
+# console 依赖与本地测试产物：CI 干净检出本就没有；本地构建时不排除会拖爆 context
+console-app/node_modules/
+console-app/test-results/
+console-app/playwright-report/
+node_modules/
+# 本地 build 的 next-dist 绝不允许混入镜像：镜像内唯一来源=Dockerfile console-builder 阶段
+# （不排除的话本地构建会带旧产物、掩盖 CI 构建缺前端的差异）
+opensearch_pipeline/webconsole/next-dist/
+# 本地代理工作区（与 pyproject ruff 排除同口径）
+.agents/
+.claude/
+.codex/
