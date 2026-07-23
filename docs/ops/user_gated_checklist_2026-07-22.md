@@ -115,7 +115,7 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
 | M9 agent 可观测 | **代码侧关闭**（γ1+γ3） | B3/B6 → E2 开闸 |
 | M10 webhook 姿态 | **代码侧关闭**（γ7） | A1 翻 `RAG_OPS_ALERT_REQUIRE`；attestation 去 _DRAFT |
 | M11 压测触发 | **PARTIAL**（δ1 push 通道） | E1 ratification+硬门翻转；CI 实跑随 D1 |
-| M12 镜像工件 | **PARTIAL**（δ2 两 job 线） | D2/D3 + 首跑随 D1；SAE 镜像化迁移后 ZIP 退役 |
+| M12 镜像工件 | **PARTIAL**（δ2 两 job 线；**07-23 镜像应用建成+七探针全绿**） | 剩=切流窗（runbook 待写）；SAE 镜像化迁移后 ZIP 退役。07-23 进展：SAE 镜像应用 `rag-serving-image`（tag `885aef633400`，实例1/1C2G/临时 CLB 47.110.131.221 验证入口）ready 全绿含 RDS TLS；姿态四联+`RAG_COST_ALERT_ENABLE` **已在镜像应用生效**（A1/A3 对现网 zip 仍待切流接管）；三坑实录=①镜像缺 console（Dockerfile 多阶段修复 b86a81a）②Stream 抢生产消息（验证期必须 `DINGTALK_STREAM_MODE=false`，切流窗才交接）③**rwlb 代理仅静态 RSA×CPython≥3.10 PFS-only → 恒握手失败**（`RAG_RDS_SSL_CIPHERS` 旋钮 885aef6，值=PFS 优先+静态 RSA-GCM 兜底）。**新长期项：RDS 代理升级支持 ECDHE 后以实际协商 cipher 为证撤静态 RSA 兜底**（并入 RB-02 族）。临时 CLB 验证完删（勿留匿名公网口） |
 | M13 DW 供应链 | **PARTIAL**（δ3 HMAC/STRICT/审计面） | C1-C5 全串 |
 | M14 Playwright CI | **代码侧关闭**（δ4，本地硬门 main 159/op0 213 全绿） | CI 首跑随 D1 |
 | M15 成本可见性 | **代码侧关闭**（γ2+γ4） | A3 翻闸；价表 JSON 配置（B4 前置）；历史回填=另行 scratch 脚本 |
