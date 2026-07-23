@@ -74,6 +74,11 @@ target-version = "py39"
 # B6（P2-16）：odps 是 DataWorks PyODPS 节点的运行时注入全局（非 import 可得），
 # 按 builtins 声明——评审点名的 per-file F821 之 ruff 原生解法。
 builtins = ["odps"]
+# 本地代理/工具产物目录（未跟踪、非交付面）：.agents 是 agent skill 的脚本快照、
+# .claude/.codex 是会话工作区（含嵌套 worktree）——扫进来会让 make lint 因仓外噪声
+# 假红（2026-07-22 实测 .agents 69 错全非交付代码）。CI 检出树不含它们，此排除只
+# 影响本地 done-bar 口径。
+extend-exclude = [".agents", ".claude", ".codex"]
 
 [tool.ruff.lint]
 # E701/E702（单行冒号/分号复合语句）：仓库既有紧凑风格（`if conn: conn.rollback()` 等
