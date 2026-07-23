@@ -184,6 +184,13 @@ class RDSConfig:
     # （用户选「先不强制」——拿到 CA 配好后再把告警升为硬断言）。
     ssl_ca: str = ""
     ssl_verify_cert: bool = True
+    # ssl_ciphers（RAG_RDS_SSL_CIPHERS，2026-07-22 镜像切换窗）：RDS 连接专用套件白名单。
+    # 由来：rwlb 代理只支持静态 RSA 密钥交换（ECDHE 一律 alert 40），而 CPython≥3.10 的
+    # create_default_context 只留 PFS 族（ECDH+/DHE+）→ 交集为空恒握手失败（py3.9 buildpack
+    # 老默认含静态 RSA 故现网 zip 不中招；下方 docstring「conda OpenSSL3 拒 RSA-kx」同因）。
+    # 空（默认）=行为不变；镜像部署设 PFS 优先+静态 RSA-GCM 兜底串（见 user-gated 清单）。
+    # 注意「PFS 优先」只是客户端偏好序，代理升级后须以实际协商 cipher 为证再撤兜底。
+    ssl_ciphers: str = ""
 
     def pymysql_ssl_args(self) -> dict:
         """P0-02：pymysql.connect 的 ssl 关键字。
@@ -202,9 +209,19 @@ class RDSConfig:
         # ca 变 None → 退到系统信任库 → ApsaraDB 链必挂 "unable to get local issuer",
         # 且 check_hostname 被悄悄关掉。2026-07-21 SAE 生产首开 CA 验证实弹踩坑
         # (B3 接线此前只过 mock 单测,从未真握手)。
-        return {"ssl_ca": ca,
-                "ssl_verify_cert": bool(self.ssl_verify_cert),
-                "ssl_verify_identity": bool(self.ssl_verify_cert)}
+        ciphers = (self.ssl_ciphers or "").strip()
+        if not ciphers:
+            return {"ssl_ca": ca,
+                    "ssl_verify_cert": bool(self.ssl_verify_cert),
+                    "ssl_verify_identity": bool(self.ssl_verify_cert)}
+        # 配了套件白名单 → 改走【字典单一形态】(pymysql 顶层参数不收 cipher):逐键与顶层
+        # 形态等价——check_hostname/verify_mode 双 bool 同源 ssl_verify_cert,加 cipher 进
+        # _create_ssl_ctx.set_ciphers。绝不混传(见上);已核 pymysql 1.2.0(镜像 lock)与
+        # 2.2.8(本机)字典语义一致(cipher 键+bool verify_mode 两版本均支持,codex 共识)。
+        return {"ssl": {"ca": ca,
+                        "check_hostname": bool(self.ssl_verify_cert),
+                        "verify_mode": bool(self.ssl_verify_cert),
+                        "cipher": ciphers}}
 
 
 @dataclass
@@ -881,6 +898,7 @@ def load_config() -> PipelineConfig:
             operation_database=_env("RDS_OPERATION_DATABASE", "fuling_operation"),
             ssl_ca=_env("RDS_SSL_CA", ""),
             ssl_verify_cert=_env_bool("RDS_SSL_VERIFY_CERT", True),
+            ssl_ciphers=_env("RDS_SSL_CIPHERS", ""),
         ),
 
         opensearch=OpenSearchConfig(

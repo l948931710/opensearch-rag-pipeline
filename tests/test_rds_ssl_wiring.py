@@ -260,3 +260,56 @@ class TestRequireTlsFailClosed:
         monkeypatch.delenv("RAG_RDS_REQUIRE_TLS", raising=False)
         api = _wire_startup(monkeypatch, env="production", row=("Ssl_cipher", ""))
         api._rds_tls_startup_check()                  # off：维持告警放行（既有拍板）
+
+
+class TestRdsSslCiphersKnob:
+    """RAG_RDS_SSL_CIPHERS（2026-07-22 镜像切换窗）：rwlb 代理仅支持静态 RSA 密钥交换 ×
+    CPython≥3.10 create_default_context 的 PFS-only 套件清单 → 交集为空恒握手失败（镜像
+    py3.11 中招、buildpack py3.9 幸免）。旋钮只对 RDS 这条连接注入套件白名单。
+    锁四点（codex 共识 2026-07-22）：默认零行为差 / 空白串不触发 / 无 CA 仍显式明文 /
+    字典单一形态绝不混传顶层 ssl_*。"""
+
+    def _cfg(self, **kw):
+        from opensearch_pipeline.config import RDSConfig
+        return RDSConfig(**kw)
+
+    def test_default_branch_byte_equal(self):
+        """CA 有、ciphers 空 → 与旋钮引入前逐键相等的顶层形态（完整相等断言守零行为差）。"""
+        args = self._cfg(ssl_ca="/x/ca.pem").pymysql_ssl_args()
+        assert args == {"ssl_ca": "/x/ca.pem", "ssl_verify_cert": True,
+                        "ssl_verify_identity": True}
+
+    def test_blank_ciphers_stays_toplevel(self):
+        """空白串（strip 后空）不触发字典形态。"""
+        args = self._cfg(ssl_ca="/x/ca.pem", ssl_ciphers="   ").pymysql_ssl_args()
+        assert "ssl" not in args
+        assert args["ssl_ca"] == "/x/ca.pem"
+
+    def test_ciphers_without_ca_still_plaintext(self):
+        """无 CA 时 ciphers 不改变显式明文语义（TLS 的开关唯 RAG_RDS_SSL_CA）。"""
+        args = self._cfg(ssl_ciphers="AES256-GCM-SHA384").pymysql_ssl_args()
+        assert args == {"ssl_disabled": True}
+
+    def test_ciphers_branch_dict_only_no_toplevel_mix(self):
+        """字典单一形态：返回值只许 {"ssl": {...}}——任何顶层 ssl_* 键混入都会让
+        pymysql 整体重建 ssl 配置丢弃字典（丢 CA + 关 hostname 校验的既知雷）。"""
+        args = self._cfg(ssl_ca="/x/ca.pem",
+                         ssl_ciphers="ECDHE+AESGCM:AES256-GCM-SHA384").pymysql_ssl_args()
+        assert set(args) == {"ssl"}
+        assert args["ssl"] == {"ca": "/x/ca.pem", "check_hostname": True,
+                               "verify_mode": True,
+                               "cipher": "ECDHE+AESGCM:AES256-GCM-SHA384"}
+
+    def test_ciphers_branch_verify_off_maps_both_false(self):
+        """ssl_verify_cert=False → 字典两键同为 False（与顶层形态语义等价）。"""
+        args = self._cfg(ssl_ca="/x/ca.pem", ssl_verify_cert=False,
+                         ssl_ciphers="AES256-GCM-SHA384").pymysql_ssl_args()
+        assert args["ssl"]["check_hostname"] is False
+        assert args["ssl"]["verify_mode"] is False
+
+    def test_load_config_env_wiring(self, monkeypatch):
+        """RAG_RDS_SSL_CIPHERS 从环境变量真接线（不只测直构 dataclass）。"""
+        monkeypatch.setenv("RAG_RDS_SSL_CIPHERS", "AES256-GCM-SHA384:AES128-GCM-SHA256")
+        from opensearch_pipeline.config import load_config
+        cfg = load_config()
+        assert cfg.rds.ssl_ciphers == "AES256-GCM-SHA384:AES128-GCM-SHA256"
