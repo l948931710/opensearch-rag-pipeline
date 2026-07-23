@@ -381,6 +381,7 @@ KNOWN_RAG_ENV_VARS: frozenset = frozenset({
     "RAG_RDS_PORT",
     "RAG_RDS_REQUIRE_TLS",
     "RAG_RDS_SSL_CA",
+    "RAG_RDS_SSL_CIPHERS",
     "RAG_RDS_SSL_VERIFY_CERT",
     "RAG_RDS_USER",
     "RAG_READONLY",
