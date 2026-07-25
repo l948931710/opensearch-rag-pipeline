@@ -1646,7 +1646,14 @@ def _run_claimed(msg_id: str, body: dict, att: int):
 def _handle_redelivery(msg_id: str, prior: dict, body: dict):
     """重投按状态路由（B7-P2-04）：retryable_failed → 优先复用已算答案重发（同一
     msgId/message_id 锚定，不重算不重计费）、无则重算（att 传承）；delivery_unknown →
-    不自动重发（防重复回答）留对账；processing/sent/final_failed → 吞掉（现状语义）。"""
+    不自动重发（防重复回答）留对账；processing/sent/final_failed → 吞掉（现状语义）。
+
+    ⚠️ 复用**只认逐字节原文**（评审 2026-07-24）：qa_session_log 存的是掩码派生件
+    （生产强制 qa_log_pii_redact），照发等于把 "[手机号已脱敏]" 当答案发给员工；
+    掩码失败时那行更是 "[PII_REDACT_FAILED …]" 占位。故 verbatim=False（含读回侧
+    判不出保真度时的保守 False）一律落到既有重算腿——多一次模型调用换答案正确，
+    在「重投」这条低频路上是对的取舍。占位行已由 fetch_answer_by_message_id 判死为
+    None，本函数只需守 verbatim。"""
     st = str(prior.get("st") or "processing")
     if st == "retryable_failed":
         mid = prior.get("mid")
@@ -1657,8 +1664,13 @@ def _handle_redelivery(msg_id: str, prior: dict, body: dict):
             except Exception:   # noqa: BLE001 — 读回失败退化为重算
                 row = None
             ans = (row or {}).get("answer_text")
+            # 缺键=来源不明（旧桩/未来实现）→ 按非原文处理，绝不猜成可发
+            verbatim = bool((row or {}).get("verbatim"))
             sw = str(body.get("sessionWebhook") or "")
-            if ans and _is_dingtalk_webhook(sw):
+            if ans and not verbatim:
+                logger.info("重投放弃复用（读回件经掩码改写，非逐字节原文）——改走重算: "
+                            "msgId=%s mid=%s", msg_id, mid)
+            elif ans and _is_dingtalk_webhook(sw):
                 logger.info("重投复用已算答案重发: msgId=%s mid=%s", msg_id, mid)
                 _send_reply(sw, "回答（重发）", ans, msg_id=msg_id)
                 return {"msgtype": "resend"}

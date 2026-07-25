@@ -419,3 +419,62 @@ def test_insert_qa_row_tx_latency_param():
     cur.reset_mock()
     insert_qa_row_tx(cur, session_id="s", message_id="m2", query_text="q", answer_text="a")
     assert cur.execute.call_args[0][1][idx] == 0        # 既有调用不变
+
+
+class TestAnswerReadbackFidelity:
+    """评审 2026-07-24：qa_session_log 存的是掩码派生件，不是答案本身。
+
+    读回侧必须把两件事说清楚：掩码失败占位不是答案（判 None），被掩码改写过的
+    读回件不是逐字节原文（verbatim=False）——否则钉钉重投会把
+    "[手机号已脱敏]" / "[PII_REDACT_FAILED …]" 当答案发给员工。
+    """
+
+    @staticmethod
+    def _conn_returning(row):
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchone.return_value = row
+        conn.cursor.return_value.__enter__.return_value = cur
+        return conn
+
+    @patch("opensearch_pipeline.db._get_db_conn")
+    def test_redact_failed_placeholder_is_not_an_answer(self, mock_conn, caplog):
+        from opensearch_pipeline.qa_logger import (
+            PII_REDACT_FAILED_PREFIX, fetch_answer_by_message_id)
+
+        mock_conn.return_value = self._conn_returning(
+            (f"{PII_REDACT_FAILED_PREFIX}sha256:deadbeef12345678 len:412]", None))
+        with caplog.at_level(logging.DEBUG, logger="opensearch_pipeline.qa_logger"):
+            assert fetch_answer_by_message_id("m1") is None
+        assert any("掩码失败" in r.getMessage() for r in caplog.records)
+
+    @patch("opensearch_pipeline.db._get_db_conn")
+    def test_masked_readback_flagged_non_verbatim(self, mock_conn):
+        from opensearch_pipeline.qa_logger import fetch_answer_by_message_id
+
+        mock_conn.return_value = self._conn_returning(("请联系 [手机号已脱敏] 办理", None))
+        row = fetch_answer_by_message_id("m1")
+        assert row["answer_text"] == "请联系 [手机号已脱敏] 办理"
+        assert row["verbatim"] is False
+
+    @patch("opensearch_pipeline.db._get_db_conn")
+    def test_clean_answer_stays_verbatim(self, mock_conn):
+        """无 PII 的答案掩码是恒等变换 → 仍判原文（重投复用优化不被误伤）。"""
+        from opensearch_pipeline.qa_logger import fetch_answer_by_message_id
+
+        mock_conn.return_value = self._conn_returning(("按 SOP 第 3 步操作即可。", None))
+        assert fetch_answer_by_message_id("m1")["verbatim"] is True
+
+    def test_placeholder_prefix_is_single_source(self, monkeypatch):
+        """写侧占位必须用同一常量拼（改一处两侧同步），且格式与历史逐字节一致。"""
+        import opensearch_pipeline.redaction as redaction
+        from opensearch_pipeline import qa_logger
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("redaction broken")
+
+        monkeypatch.delenv("RAG_QA_LOG_REDACT_FAILOPEN", raising=False)
+        monkeypatch.setattr(redaction, "redact_text", _boom)
+        out = qa_logger._redact_for_log("联系 13800138000")
+        assert out.startswith(qa_logger.PII_REDACT_FAILED_PREFIX)
+        assert re.fullmatch(r"\[PII_REDACT_FAILED sha256:[0-9a-f]{16} len:\d+\]", out)
