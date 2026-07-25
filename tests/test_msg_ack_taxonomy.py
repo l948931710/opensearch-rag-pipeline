@@ -109,12 +109,33 @@ class TestRedeliveryRouting:
         sent = []
         bot._msg_mark("m1", "retryable_failed", att=2, mid="MSG-X")
         monkeypatch.setattr("opensearch_pipeline.qa_logger.fetch_answer_by_message_id",
-                            lambda mid: {"message_id": mid, "answer_text": "已算答案"})
+                            lambda mid: {"message_id": mid, "answer_text": "已算答案",
+                                         "verbatim": True})
         monkeypatch.setattr(bot, "_send_reply",
                             lambda sw, t, x, msg_id="": sent.append((sw, x, msg_id)) or True)
         out = bot._process_webhook_body(dict(BODY))
         assert out == {"msgtype": "resend"}
         assert sent and sent[0][1] == "已算答案" and sent[0][2] == "m1"   # 不重算不重计费
+
+    @pytest.mark.parametrize("row", [
+        # 掩码改写过的读回件：照发等于把 "[手机号已脱敏]" 当答案发给员工
+        {"message_id": "MSG-X", "answer_text": "联系 [手机号已脱敏]", "verbatim": False},
+        # 缺 verbatim 键（旧桩/未知来源）→ 按非原文保守处理
+        {"message_id": "MSG-X", "answer_text": "来源不明"},
+    ])
+    def test_non_verbatim_readback_never_resent(self, monkeypatch, row):
+        """评审 2026-07-24：非逐字节原文一律不重发，落既有重算腿。"""
+        sent, recomputed = [], []
+        bot._msg_mark("m1", "retryable_failed", att=2, mid="MSG-X")
+        monkeypatch.setattr("opensearch_pipeline.qa_logger.fetch_answer_by_message_id",
+                            lambda mid: row)
+        monkeypatch.setattr(bot, "_send_reply",
+                            lambda sw, t, x, msg_id="": sent.append(x) or True)
+        monkeypatch.setattr(bot, "_process_claimed_body",
+                            lambda b: recomputed.append(b) or {"msgtype": "empty"})
+        out = bot._process_webhook_body(dict(BODY))
+        assert out == {"msgtype": "empty"}          # 走重算，不是 resend
+        assert recomputed and not sent
 
     def test_delivery_unknown_never_auto_resends(self, monkeypatch):
         bot._msg_mark("m1", "delivery_unknown")

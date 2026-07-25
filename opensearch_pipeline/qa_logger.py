@@ -68,13 +68,44 @@ def generate_message_id() -> str:
     return str(uuid.uuid4())
 
 
+# qa_session_log.answer_text 的「掩码失败占位」前缀——_redact_for_log 写、
+# fetch_answer_by_message_id 读，单一事实源（改一处即两侧同步）。
+PII_REDACT_FAILED_PREFIX = "[PII_REDACT_FAILED "
+
+
+def _answer_is_verbatim(text: str) -> bool:
+    """读回的 answer_text 是否与当初发给用户的那份**逐字节一致**。
+
+    qa_session_log 存的是掩码后的派生件（生产强制 qa_log_pii_redact，config 对
+    「生产 + flag 关」直接 fail-fast）——掩码命中过的答案，读回件已不是原答案。
+    判据取「文中是否出现 redaction 的不可逆占位」：绝大多数 SOP/ERP 答案不含 PII、
+    掩码是恒等变换 → 仍判 verbatim（复用优化保住）；真被掩过的才判 False。
+    flag 关时存的就是原文，恒 True。占位判据的假阳（源文档原样引用了
+    「[手机号已脱敏]」）只会让调用方多算一次，方向安全。"""
+    if not _qa_log_pii_redact_on():
+        return True
+    try:
+        from opensearch_pipeline.redaction import PLACEHOLDERS
+        return not any(ph in text for ph in set(PLACEHOLDERS.values()))
+    except Exception:   # noqa: BLE001 — 判不了就按「不是原文」保守收（宁可重算）
+        logger.warning("答案保真度判定失败（按非原文处理）", exc_info=True)
+        return False
+
+
 def fetch_answer_by_message_id(message_id: str) -> Optional[Dict[str, Any]]:
     """按 message_id 取回最终答案（U1 答案读回，重审计 §5：审批续跑/断线后发起人经
     run 详情拿到答案文本——agent_run.message_id(schema/036) → 本函数）。
 
     只取 SUCCESS 行（AGENT_ERROR 行同 id 复用，读回只要答案）；同 id 多行取最新
     （message_id 无 UNIQUE 约束）。读失败/simulate 无库 → None（fail-open，调用方
-    引导用户走会话历史）。"""
+    引导用户走会话历史）。
+
+    ⚠️ 出参含 `verbatim`（评审 2026-07-24）：本表存的是**掩码派生件**，不是答案本身。
+    - 掩码失败占位（PII_REDACT_FAILED_PREFIX）→ 直接 **None**：那不是答案，任何
+      调用方都不该把它当答案投递或展示（钉钉重发曾会原样发给员工）。
+    - `verbatim=False` = 读回件被掩码改写过。要把它**发回给用户**的调用方必须据此
+      改走重算（见 dingtalk_bot._handle_redelivery）；只做展示/审计的调用方
+      （routes/agent 的 run 详情）可照用，语义是「留痕副本」。"""
     if not message_id:
         return None
     try:
@@ -92,7 +123,13 @@ def fetch_answer_by_message_id(message_id: str) -> Optional[Dict[str, Any]]:
             conn.close()
         if not row or not row[0]:
             return None
-        return {"message_id": message_id, "answer_text": row[0],
+        text = row[0]
+        if str(text).startswith(PII_REDACT_FAILED_PREFIX):
+            logger.warning("message_id=%s 的答案在落库时掩码失败（占位行）——不作为答案"
+                           "读回（调用方按无答案处理）", message_id)
+            return None
+        return {"message_id": message_id, "answer_text": text,
+                "verbatim": _answer_is_verbatim(str(text)),
                 "answered_at": str(row[1]) if row[1] is not None else None}
     except Exception:   # noqa: BLE001 — 读回是辅助路径，绝不外泄异常
         logger.warning("按 message_id 读回答案失败（忽略）", exc_info=True)
@@ -136,7 +173,8 @@ def _redact_for_log(text: Optional[str]) -> Optional[str]:
         digest = _hl.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
         logger.error("qa_session_log PII 掩码失败——正文以不可逆占位落库 "
                      "(sha256:%s len:%d): %s", digest, len(text), e, exc_info=True)
-        return f"[PII_REDACT_FAILED sha256:{digest} len:{len(text)}]"
+        # 前缀取自单一事实源：读回侧（fetch_answer_by_message_id）据此拒绝把占位当答案
+        return f"{PII_REDACT_FAILED_PREFIX}sha256:{digest} len:{len(text)}]"
 
 
 def _redact_content_blocks_for_log(cbj: Optional[str]) -> Optional[str]:
