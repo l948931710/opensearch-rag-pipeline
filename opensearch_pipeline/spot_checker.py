@@ -686,7 +686,10 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
         report["errors"].extend(stranded_result["errors"])
     # 三对账：清理重灌残留的孤儿 PK（同 chunk_id 双 PK / chunk_meta 已不认账的旧 id）
     from opensearch_pipeline.ha3_reconcile import reconcile_ha3_orphan_pks
-    orphan_pk_result = reconcile_ha3_orphan_pks()
+    # 显式 dry_run=True（2026-07-22）：此前是无参调用，而该函数当时默认 dry_run=False
+    # ——spot-check 会**静默执行不可逆 HA3 删除**。删除入口统一收敛到 orchestrator 的
+    # RAG_STAGE3_ORPHAN_PURGE gate；这里只报告，不删。
+    orphan_pk_result = reconcile_ha3_orphan_pks(dry_run=True)
     if orphan_pk_result["stale"] > 0 or orphan_pk_result["errors"]:
         print(f"    └─ [RECONCILE] HA3 orphan PKs: checked={orphan_pk_result['checked']} "
               f"stale={orphan_pk_result['stale']} deleted={orphan_pk_result['deleted']}")

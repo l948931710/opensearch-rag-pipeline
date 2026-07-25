@@ -102,7 +102,7 @@ def live_stores(monkeypatch):
 
     def _fake_scan(cli, table, hi, *, lo=0, bucket=500, client_factory=None, **kw):
         return {"rows": {pk: h for pk, h in _HA3_ROWS.items() if lo <= pk < hi},
-                "truncated": []}
+                "truncated": [], "unhealthy": {}}
 
     monkeypatch.setattr(reconcile, "_scan_ha3_pks", _fake_scan)
     return conn
@@ -114,7 +114,9 @@ def test_streaming_parity_matches_pure_compute_parity(live_stores):
     pure = reconcile.compute_parity(_RDS_ROWS, _HA3_ROWS)
 
     assert streamed["ok"] == pure["ok"] is False
-    assert streamed["counts"] == pure["counts"]
+    # 流式报告在 compute_parity 的 counts 之上叠加了 fetch 二次定性分类键（本 fixture 的
+    # HA3 client 无 fetch 能力 → 定性失败、不加键）；核心计数必须逐键一致。
+    assert {k: streamed["counts"][k] for k in pure["counts"]} == pure["counts"]
     assert streamed["stale_subtypes"] == pure["stale_subtypes"]
     _key = lambda x: x["id"]  # noqa: E731
     assert sorted(streamed["rds_active_missing"], key=_key) == \
@@ -123,7 +125,11 @@ def test_streaming_parity_matches_pure_compute_parity(live_stores):
     assert sorted(streamed["vanished_docs"], key=_dkey) == \
         sorted(pure["vanished_docs"], key=_dkey)
     assert streamed["orphan_docs_sample"] == pure["orphan_docs_sample"]
-    assert streamed["complete"] is True
+    # 枚举侧完整（无饱和桶/无不健康桶）；但本 fixture 的 HA3 client 无 fetch 能力，
+    # 而报告里有判缺行 → 二次定性整体失败 → 按状态表落 enum_health=unknown +
+    # complete=False（拿不到 fetch 就无法区分「真丢失」与「枚举伪影」，证据不完整）。
+    assert streamed["truncated_buckets"] == [] and streamed["unhealthy_buckets"] == {}
+    assert streamed["enum_health"] == "unknown" and streamed["complete"] is False
     assert live_stores.closed, "流式读完必须归还只读连接"
 
 
@@ -137,8 +143,8 @@ def test_parity_report_carries_scan_metrics(live_stores):
 
 
 def test_streaming_parity_fetch_reclassify_flows_to_counts(live_stores, monkeypatch):
-    """07-21 fetch 二次定性 + 终局裁决：判缺 id=2 fetch 可取回 → query_invisible=1 /
-    confirmed=0；但 fixture 的 docY 是纯 NOT_INDEXED vanished（无判缺 PK 覆盖，fetch
+    """fetch 二次定性 + 终局裁决：判缺 id=2 fetch 可取回 → enum_invisible=1 /
+    confirmed=0；且 fixture 的 docY 是纯 NOT_INDEXED vanished（无判缺 PK 覆盖，fetch
     管不到）→ at_risk 保守留红：ok 仍 False，红的原因从「missing」转为「vanished at_risk」。"""
     import json as _json
     from opensearch_pipeline import retriever
@@ -153,7 +159,8 @@ def test_streaming_parity_fetch_reclassify_flows_to_counts(live_stores, monkeypa
     monkeypatch.setattr(retriever, "_get_ha3_client", lambda: _Cli())
     rep = reconcile.run_parity_check(hi=20)
     assert rep["counts"]["rds_active_missing"] == 1
-    assert rep["counts"]["query_invisible"] == 1
+    assert rep["counts"]["enum_invisible"] == 1
+    assert rep["counts"]["query_invisible"] == 1     # 兼容别名同值双写
     assert rep["counts"]["missing_confirmed"] == 0
     assert rep["counts"]["missing_unclassified"] == 0
     assert rep["fetch_reclassify"]["ok"] is True
@@ -175,9 +182,10 @@ def test_streaming_parity_reclassify_failure_keeps_query_verdict(live_stores):
     assert rep["counts"]["vanished_at_risk"] == 1   # 无 fetch 依据 → vanished 全按 at_risk
 
 
-def test_streaming_parity_pure_blindspot_green_and_info_alert(monkeypatch):
-    """终局裁决 e2e：全部判缺 fetch 在场且无 vanished at_risk → ok=True（夜检绿灯、
-    _job_exit=0），且必须仍可观测——发一条 info 级「query 枚举盲区」告警，绝不静默。"""
+def test_streaming_parity_enum_invisible_is_degraded_and_critical(monkeypatch):
+    """终局 e2e（倒排枚举语境）：全部判缺 fetch 在场 → 数据在场故 ok=True，
+    但枚举漏了它 ⇒ enum_health=degraded + complete=False ⇒ **_job_exit=3 + critical**。
+    ⚠️ 这与零向量时代（13116d2 判 info/绿）相反,是有意的语义翻转。"""
     import json as _json
     cfg = get_config()
     monkeypatch.setattr(cfg, "simulate", False)
@@ -210,13 +218,13 @@ def test_streaming_parity_pure_blindspot_green_and_info_alert(monkeypatch):
     rep = reconcile.run_parity_check(hi=10, alert=True)
     assert rep["ok"] is True and rep["verdict_basis"] == "fetch"
     assert rep["counts"]["vanished_at_risk"] == 0
+    assert rep["enum_health"] == "degraded" and rep["complete"] is False
     from opensearch_pipeline.ops_monitor import _job_exit
-    assert _job_exit("reconcile_ha3", rep) == 0
-    assert sent, "纯盲区必须仍发 info 告警，不能静默"
-    (title, _, kw) = sent[0]
-    assert kw["severity"] == "info"
-    assert kw["dedup_key"] == "reconcile:rds-ha3-query-blind"
-    assert "枚举盲区" in title
+    assert _job_exit("reconcile_ha3", rep) == 3, "枚举失效 → 红灯，绝不放绿"
+    assert sent, "绝不静默"
+    (_, text, kw) = sent[0]
+    assert kw["severity"] == "critical"
+    assert "锚点不完整" in text
 
 
 def test_duration_alert_fires_when_over_threshold(live_stores, monkeypatch):

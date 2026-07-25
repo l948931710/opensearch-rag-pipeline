@@ -184,6 +184,201 @@ HA3_PARITY_OUTPUT_FIELDS = [
 ]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# HA3 确定性枚举 + 权威 fetch（2026-07-22 终局，见 memory ha3-inverted-enumeration）
+#
+# 背景：零向量 + id 范围 filter 的 QueryRequest **不是全集枚举**——零向量与任何向量
+# 内积恒为 0，全部文档得分并列，返回哪个子集由 ANN 遍历/剪枝路径决定，是「任意但确定
+# 的子集」且随 build/merge 漂移（实测零向量恒缺 113 行、eps 常数向量恒缺另 220 行，
+# 交集仅 5）。历次「行蒸发」全是该枚举伪影，数据从未丢失。
+#
+# 本节提供两条替代原语，**批处理/对账/校验一律走这里，禁止再用零向量枚举**：
+#   ha3_enumerate_bucket —— 纯倒排单桶枚举（发现未知 PK，fetch 做不到的方向）
+#   ha3_fetch_by_pks     —— 官方主键 fetch（已知 PK 的权威存在性判定）
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 倒排枚举锚点：双态覆盖（HA3 侧 is_active=0 的僵尸行也要被发现）。
+# ⚠️ 借业务字段作 match-all 锚点是我方 2026-07-22 实测所得、**非官方文档写法**
+# （官方 match-all 三种写法均 errorCode=2000；`id:'[lo, hi]'` 范围语法在本表恒返 0，
+# 范围只能走 filter）。阿里尚未确认其为受支持的全集原语 ⇒ 任何「完整」结论都只在
+# 「双态 is_active 锚点契约内」成立，不得宣称物理全表无条件完整。
+HA3_ENUM_ANCHOR = "is_active:'1' OR is_active:'0'"
+HA3_ENUM_BUCKET = 500     # 桶宽：必须 ≤ 此值，保证单页装得下
+HA3_ENUM_SIZE = 1000      # size：桶宽 2 倍余量；返回数达此值即判饱和（不可信）
+_HA3_FETCH_BATCH = 100    # /vector-service/fetch 单批 id 上限
+
+
+def _ha3_body(resp) -> Any:
+    """统一 HA3 响应体三种形态（str / bytes / 带 to_map 的 SDK 对象）。"""
+    b = getattr(resp, "body", resp)
+    if isinstance(b, (str, bytes)):
+        return json.loads(b)
+    return b.to_map() if hasattr(b, "to_map") else b
+
+
+def _ha3_error_code(body: Dict[str, Any]):
+    """返回失败用的 errorCode（0/None/空 均视为无错），否则返回原值。"""
+    ec = body.get("errorCode")
+    if ec in (None, 0, "0", ""):
+        return None
+    return ec
+
+
+def ha3_enumerate_bucket(client, table_name: str, lo: int, hi: int,
+                         output_fields: List[str] = None) -> Dict[str, Any]:
+    """单桶**倒排**枚举（纯 SearchRequest，无 knn/vector，单页、绝不翻页）。
+
+    为什么不翻页：纯倒排下全部 score=0.0、无稳定排序，`from`/`size` 深分页会跨页重复
+    ——实测某窗 3 页共返 2504 条但唯一值仅 2169，**漏 335 == 重 335**。故桶宽必须窄到
+    单页装得下（≤HA3_ENUM_BUCKET），返回数达 size 即判饱和不可信。
+
+    返回 {"rows": {pk: {...parse_ha3_response 标准字段..., "is_active": "0"|"1"}},
+          "healthy": bool, "reason": str|None}。
+
+    **绝不 raise**（SDK 异常转成 healthy=False + reason）；**绝不回退零向量**——
+    枚举不可用时由调用方 fail-closed，不是换一个已知有盲区的口径继续。
+
+    健康判据（任一为真 → healthy=False）：桶宽非法 / body errorCode 非零 /
+    coveredPercent 缺失或不可解析或 ≠1.0 / 返回数达 size（饱和）/ result 非 list /
+    PK 缺失或不可解析或越桶 / 同桶重复 PK / is_active 缺失或不在 {"0","1"} /
+    raw 与 parsed 的 PK 集不一致。
+    """
+    from alibabacloud_ha3engine_vector.models import SearchRequest, TextQuery
+
+    def _bad(reason):
+        return {"rows": {}, "healthy": False, "reason": reason}
+
+    if not (0 < hi - lo <= HA3_ENUM_BUCKET):
+        return _bad(f"桶宽非法 [{lo},{hi}) 宽={hi - lo}（须 0<宽≤{HA3_ENUM_BUCKET}）")
+    fields = list(output_fields or HA3_PARITY_OUTPUT_FIELDS)
+    for must in ("id", "is_active"):    # 两者都是健康判据的输入，漏传则自动补
+        if must not in fields:
+            fields.append(must)
+    try:
+        resp = client.search(SearchRequest(
+            table_name=table_name, size=HA3_ENUM_SIZE, output_fields=fields,
+            text=TextQuery(query_string=HA3_ENUM_ANCHOR,
+                           query_params={"default_op": "OR"},
+                           filter=f"id>={lo} AND id<{hi}")))
+        body = _ha3_body(resp)
+    except Exception as e:  # noqa: BLE001 — 契约：绝不外抛，转 unhealthy
+        return _bad(f"search 异常 {type(e).__name__}: {str(e)[:160]}")
+
+    if not isinstance(body, dict):
+        return _bad(f"响应体形态异常: {type(body).__name__}")
+    ec = _ha3_error_code(body)
+    if ec is not None:
+        return _bad(f"errorCode={ec} errorMsg={str(body.get('errorMsg'))[:120]}")
+    raw = body.get("result")
+    if not isinstance(raw, list):
+        return _bad(f"result 非 list: {type(raw).__name__}")
+    # ⚠️ 不读 totalCount：实测它被 size 截顶（size=3→3 / 10→10 / 100→34 / 1000→34，
+    # 真实命中 34），是本次返回条数而非命中总数，用它计数会得到假结论。
+    if len(raw) >= HA3_ENUM_SIZE:
+        return _bad(f"桶饱和 returned={len(raw)} >= size={HA3_ENUM_SIZE}（桶太宽，结果不完整）")
+    cp = body.get("coveredPercent")
+    try:
+        if cp is None or float(cp) != 1.0:
+            return _bad(f"coveredPercent={cp}（分片未全覆盖，枚举不完整）")
+    except (TypeError, ValueError):
+        return _bad(f"coveredPercent 不可解析: {cp!r}")
+
+    # is_active 按 **PK 关联**（不按响应位置）——parse_ha3_response 会重塑字段且不透传它。
+    raw_by_pk: Dict[int, Any] = {}
+    for it in raw:
+        f = it.get("fields", it) if isinstance(it, dict) else {}
+        try:
+            pk = int(it.get("id", f.get("id")))
+        except (TypeError, ValueError, AttributeError):
+            return _bad(f"PK 缺失或不可解析: {str(it)[:120]}")
+        if pk in raw_by_pk:
+            return _bad(f"同桶重复 PK={pk}（响应异常，枚举不可信）")
+        if not (lo <= pk < hi):
+            return _bad(f"PK={pk} 越出请求桶 [{lo},{hi})（filter 未生效）")
+        act = f.get("is_active")
+        act = act[0] if isinstance(act, list) and act else act
+        act = str(act) if act is not None else None
+        if act not in ("0", "1"):
+            return _bad(f"PK={pk} 的 is_active={act!r} 缺失或非法（锚点契约破裂）")
+        raw_by_pk[pk] = act
+
+    rows: Dict[int, Dict[str, Any]] = {}
+    for r in parse_ha3_response(resp):
+        try:
+            pk = int(r.get("id"))
+        except (TypeError, ValueError):
+            return _bad(f"parsed PK 不可解析: {str(r)[:120]}")
+        rows[pk] = dict(r, is_active=raw_by_pk.get(pk))
+    if set(rows) != set(raw_by_pk):
+        return _bad(f"raw 与 parsed 的 PK 集不一致 raw={len(raw_by_pk)} parsed={len(rows)}")
+    return {"rows": rows, "healthy": True, "reason": None}
+
+
+def ha3_fetch_by_pks(client, table_name: str, pks, output_fields: List[str] = None,
+                     batch: int = _HA3_FETCH_BATCH) -> Dict[str, Any]:
+    """官方主键 fetch（/vector-service/fetch）——**已知 PK 的权威存在性判定**。
+
+    2026-07-22 终局定性：存在性判定唯 fetch 为准（query 枚举无论什么向量都只是候选源）。
+    注意 fetch **只能验证已知 id 是否在场，无法发现未知 id**——orphan/extra 方向必须
+    用 ha3_enumerate_bucket。
+
+    返回 {"rows_by_pk": {pk: {...}}, "missing_pks": [...], "unknown_pks": [...],
+          "errors": [str]}。批异常/畸形整批归 unknown（**绝不误判为 missing**）。
+    绝不 raise。
+    """
+    from alibabacloud_ha3engine_vector.models import FetchRequest
+
+    fields = list(output_fields or HA3_PARITY_OUTPUT_FIELDS)
+    if "id" not in fields:
+        fields.append("id")
+    ids: List[int] = []
+    for p in pks:
+        try:
+            ids.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    rows_by_pk: Dict[int, Dict[str, Any]] = {}
+    unknown: List[int] = []
+    errors: List[str] = []
+    for i in range(0, len(ids), max(1, batch)):
+        sub = ids[i:i + max(1, batch)]
+        try:
+            body = _ha3_body(client.fetch(FetchRequest(
+                table_name=table_name, ids=[str(x) for x in sub],
+                include_vector=False, output_fields=fields)))
+            if not isinstance(body, dict):
+                raise RuntimeError(f"响应体形态异常: {type(body).__name__}")
+            ec = _ha3_error_code(body)
+            if ec is not None:
+                raise RuntimeError(f"errorCode={ec} errorMsg={str(body.get('errorMsg'))[:120]}")
+            res = body.get("result")
+            if res is None:
+                res = []
+            if not isinstance(res, list):
+                raise RuntimeError(f"result 非 list: {type(res).__name__}")
+            want = set(sub)
+            seen_batch = set()
+            for it in res:
+                f = it.get("fields", it) if isinstance(it, dict) else {}
+                try:
+                    pk = int(it.get("id", f.get("id")))
+                except (TypeError, ValueError, AttributeError):
+                    raise RuntimeError(f"PK 不可解析: {str(it)[:120]}")
+                if pk not in want:
+                    raise RuntimeError(f"返回 PK={pk} 不在请求集合内")
+                if pk in seen_batch:
+                    raise RuntimeError(f"同批重复 PK={pk}")
+                seen_batch.add(pk)
+                rows_by_pk[pk] = dict(f, id=str(pk))
+        except Exception as e:  # noqa: BLE001 — 单批失败只废该批，绝不染成 missing
+            unknown.extend(sub)
+            errors.append(f"batch@{i}: {type(e).__name__}: {e}"[:200])
+    unknown_set = set(unknown)
+    missing = [p for p in ids if p not in rows_by_pk and p not in unknown_set]
+    return {"rows_by_pk": rows_by_pk, "missing_pks": missing,
+            "unknown_pks": sorted(unknown_set), "errors": errors[:10]}
+
+
 def _get_oss_bucket(ctx: dict = None):
     """获取阿里云 OSS Bucket 客户端。"""
     from opensearch_pipeline.config import get_config

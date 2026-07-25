@@ -11,13 +11,15 @@ chunks but ZERO HA3 rows = fully vanished from search).
 Design contract (mirrors qa_logger / audit_log / alerting):
   - **Read-only.** RDS access goes through prod_access.get_prod_readonly_conn (fuling_ro). HA3 is
     queried with include_vector=False, no writes. This module NEVER deletes or deactivates.
-  - **Query enumeration is best-effort, never authoritative.** HA3 is scanned by PK range
-    (`id>=lo AND id<hi`, ≤bucket per call) — far better than a zero-vector ANN top_k (the scratch v1
-    incident) — but 2026-07-21 终局定性:query 枚举存在随 build/merge 漂移的**确定性盲区**
-    (fetch 全在而 query 恒缺;不同查询向量盲区不同且互不重叠)。**存在性判定唯官方
-    /vector-service/fetch 为准**:query 判缺只产生候选,经 _fetch_reclassify_missing 复核、
-    _finalize_verdict 裁决(missing_confirmed=真丢失 / query_invisible=盲区伪影 / unclassified)。
-    A bucket that returns ≥ its cap is flagged `truncated` → report.complete=False.
+  - **枚举走倒排,存在性判定唯 fetch 为准(2026-07-22 终局)。** 旧实现用零向量 + id 范围
+    filter 枚举——已证伪:零向量与任何向量内积恒为 0 ⇒ 全部得分并列 ⇒ 返回哪个子集由 ANN
+    遍历/剪枝路径决定,是**任意但确定的子集**且随 build/merge 漂移(零向量恒缺 113 行、
+    eps 常数向量恒缺另 220 行,交集仅 5)。历次「行蒸发」全是该伪影,数据从未丢失。
+    现在:枚举 = `clients.ha3_enumerate_bucket`(纯倒排、单页、锚点 is_active 双态,实测
+    全表 27,484/27,484);已知 PK 的存在性 = `clients.ha3_fetch_by_pks`(官方主键接口)。
+    两者分工不可互换——fetch 无法发现未知 id(orphan 方向),枚举不作最终存在性裁决。
+    桶协议不健康(errorCode/coveredPercent<1/饱和/越桶/重复 PK/is_active 契约破裂)
+    → `unhealthy_buckets` → report.complete=False,**绝不回退零向量**。
   - **Fail-open.** run_parity_check never raises to its caller; on any error it returns a report with
     ok=False + error set, and (if alert=True) fires one OBS-4 ops alert. Simulate → skipped no-op.
 
@@ -47,6 +49,12 @@ def _kb_db() -> str:
 
 _DEFAULT_BUCKET = 500
 _FETCH_BATCH = 100  # /vector-service/fetch 单批 id 上限（与 07-21 工单探针口径一致）
+_SCAN_ROUNDS_DEPRECATED = False   # max_rounds 弃用日志只打一次（见 _scan_ha3_pks）
+
+
+def _mark_scan_rounds_deprecated() -> None:
+    global _SCAN_ROUNDS_DEPRECATED
+    _SCAN_ROUNDS_DEPRECATED = True
 _HI_HEADROOM = 1000  # scan past max(rds.id) so freshly-pushed-but-unrecorded rows still surface
 _OSS_IMAGE_PREFIX = "processing/assets/"  # where active-chunk image_refs[].oss_key live
 _OSS_RAW_PREFIX = "raw/"                  # where document_version.raw_key source files live (CS4b)
@@ -204,66 +212,51 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
                   lo: int = 0, bucket: int = _DEFAULT_BUCKET,
                   max_rounds: int = 3, concurrency: Optional[int] = None,
                   client_factory=None) -> Dict[str, Any]:
-    """HA3 PK-range enumeration with G30 mitigation. Returns {"rows": {pk: {...}}, "truncated": [...]}.
+    """HA3 PK-range enumeration（**倒排**，2026-07-22 起）。
 
-    ⚠️ G30: a single zero-vector range scan is non-deterministic — it can under-return BELOW the cap
-    (a different partial subset each call, ~nothing right after a realtime push). Trusting one pass
-    surfaces phantom 'missing'/'vanished' rows → false OBS-4 recall-loss alerts for chunks that are in
-    fact indexed and serving. So we **loop each bucket until stable** — re-scan and union the rows until
-    a round adds nothing new (or max_rounds), the same fix ha3_reconcile._enumerate_ha3_pks uses.
-    Unioning is safe: the consumer only diffs vs RDS, so more-complete enumeration removes false
-    positives, never invents rows. A bucket whose single query reaches its cap is still flagged
-    truncated (genuinely > cap rows → caller marks the report incomplete).
+    Returns {"rows": {pk: {...}}, "truncated": [...], "unhealthy": {start: reason}}。
+
+    ⚠️ 旧实现用零向量 + id 范围 filter，并靠 loop-until-stable「补齐」G30 的欠返回。
+    2026-07-22 终局定性推翻了该模型:零向量与任何向量内积恒为 0 ⇒ 全部得分并列 ⇒ 返回
+    哪个子集由 ANN 遍历/剪枝路径决定,是**任意但确定的子集**(重扫恒缺同一批,换向量换
+    另一批)。**loop-until-stable 对确定性欠返回完全无效**——历次「行蒸发」即此伪影。
+    现改用 clients.ha3_enumerate_bucket(纯倒排、单页、不翻页、锚点 is_active 双态),
+    实测全表 27,484/27,484、missing=0、extra=0。`max_rounds` 保留仅为签名兼容并被忽略。
+
+    完整性语义:`truncated` 保留旧义(饱和桶,倒排路已由 helper 判定,故恒为空);
+    新增 `unhealthy` = {桶起点: 原因}——协议不健康(errorCode/coveredPercent<1/饱和/
+    越桶/重复 PK/is_active 契约破裂)。**两者任一非空 ⇒ 报告 complete=False**。
+    枚举不可用时绝不回退零向量(那是已知有盲区的口径),由调用方 fail-closed。
 
     perf F#51：桶间无数据依赖 → RAG_RECONCILE_SCAN_CONCURRENCY（默认 4）线程并发扫桶，
     每线程经 client_factory 建独立 HA3 client（factory 缺失/失败退回共享 cli——MOCK/测试
-    路径照跑）；桶内 loop-until-stable 仍严格串行，rows 按桶分片后在主线程合并（PK 范围
-    互斥，无锁）。concurrency<=1 或单桶时与旧实现逐字节等价。
+    路径照跑）；rows 按桶分片后在主线程合并（PK 范围互斥，无锁）。
     """
-    from alibabacloud_ha3engine_vector.models import QueryRequest
-    # 解析器仍经 retriever 模块动态取名：这是既有测试的 monkeypatch 席位
-    # （test_reconcile.py::test_scan_ha3_pks_loops_until_stable patch 的是
-    # retriever._parse_ha3_response）。该名如今是 clients.parse_ha3_response 的 re-export
-    # 别名（绑定恒等由 tests/test_ha3_client_coupling.py 看住），不再是 serving 私有实现
-    # ——保留此间接层只为 patch 席位，不构成对 serving 内部的语义依赖。
-    from opensearch_pipeline import retriever as _retriever
-    from opensearch_pipeline.clients import HA3_PARITY_OUTPUT_FIELDS
-    from opensearch_pipeline.config import get_config
+    from opensearch_pipeline.clients import (
+        HA3_ENUM_BUCKET, HA3_PARITY_OUTPUT_FIELDS, ha3_enumerate_bucket,
+    )
 
-    # #F-recon-vecdim 向量维度读配置、勿硬编码 1024：EMBEDDING_DIMENSION 可设 768/512，
-    # 写死 1024 会让维度不匹配的 HA3 query 报错 → CS3 对账整体 fail-open，召回丢失探针失效
-    # （与 ha3_reconcile._enumerate_ha3_pks 的 get_config().embedding.dimension 单一来源对齐）。
-    _dim = get_config().embedding.dimension
-
-    cap = bucket + 100
+    # 2026-07-22：桶宽钳到 HA3_ENUM_BUCKET——倒排单页枚举的完整性依赖「桶窄到单页装得下」。
+    bucket = min(int(bucket or HA3_ENUM_BUCKET), HA3_ENUM_BUCKET)
     starts = list(range(lo, hi, bucket))
+    if max_rounds not in (None, 1) and not _SCAN_ROUNDS_DEPRECATED:
+        logger.info("reconcile: max_rounds 已弃用并忽略——倒排枚举是确定性的，"
+                    "loop-until-stable 对确定性欠返回本就无效（G30 定性作废）")
+        _mark_scan_rounds_deprecated()
 
     def _scan_bucket(bcli, start: int) -> Dict[str, Any]:
-        """单桶 loop-until-stable（G30 语义不变）；返回本桶 rows 分片 + truncated 标记。"""
-        brows: Dict[int, Dict[str, Any]] = {}
-        btrunc = False
-        for _ in range(max(1, max_rounds)):
-            before = len(brows)
-            req = QueryRequest(table_name=table_name, vector=[0.0] * _dim, top_k=cap,
-                               include_vector=False,
-                               # 对账扫描 pin 死自己的最小字段集（消费 id/chunk_id/doc_id/
-                               # chunk_type/version_no），serving 调默认清单不影响对账口径。
-                               output_fields=HA3_PARITY_OUTPUT_FIELDS,
-                               filter=f"id>={start} AND id<{start + bucket}")
-            parsed = _retriever._parse_ha3_response(bcli.query(req))
-            if len(parsed) >= cap:
-                btrunc = True
-            for r in parsed:
-                try:
-                    pk = int(r.get("id"))
-                except (TypeError, ValueError):
-                    continue
-                brows[pk] = {"chunk_id": r.get("chunk_id", ""), "doc_id": r.get("doc_id", ""),
-                             "chunk_type": r.get("chunk_type", ""),
-                             "version_no": r.get("version_no")}
-            if len(brows) == before:   # round surfaced nothing new → bucket stable
-                break
-        return {"start": start, "rows": brows, "truncated": btrunc}
+        """单桶**倒排**枚举（clients.ha3_enumerate_bucket，单页不翻页、不回退零向量）。
+
+        原 loop-until-stable 已废：那是为零向量 ANN 的非确定性欠返回设计的，而实测盲区
+        是**确定性**的（重扫恒缺同一批），多轮重扫只是白花钱。桶不健康 → 记 reason。"""
+        end = min(start + bucket, hi)     # 严格半开，末桶不越出外层扫描区间
+        out = ha3_enumerate_bucket(bcli, table_name, start, end, HA3_PARITY_OUTPUT_FIELDS)
+        brows = {pk: {"chunk_id": r.get("chunk_id", ""), "doc_id": r.get("doc_id", ""),
+                      "chunk_type": r.get("chunk_type", ""),
+                      "version_no": r.get("version_no")}
+                 for pk, r in out["rows"].items()}
+        return {"start": start, "rows": brows, "truncated": False,
+                "unhealthy": None if out["healthy"] else out["reason"]}
 
     conc = concurrency if concurrency is not None else _scan_concurrency()
     conc = max(1, min(int(conc), len(starts) or 1))
@@ -290,11 +283,14 @@ def _scan_ha3_pks(cli, table_name: str, hi: int, *,
 
     rows: Dict[int, Dict[str, Any]] = {}
     truncated: List[int] = []
+    unhealthy: Dict[int, str] = {}
     for sh in shards:                    # 主线程合并：桶 PK 范围互斥，顺序=桶序（确定性）
         rows.update(sh["rows"])
         if sh["truncated"]:
             truncated.append(sh["start"])
-    return {"rows": rows, "truncated": truncated}
+        if sh.get("unhealthy"):
+            unhealthy[sh["start"]] = sh["unhealthy"]
+    return {"rows": rows, "truncated": truncated, "unhealthy": unhealthy}
 
 
 def _fetch_reclassify_missing(cli, table_name: str,
@@ -313,8 +309,7 @@ def _fetch_reclassify_missing(cli, table_name: str,
     query 单口径旧行为——二次定性不能成为新故障面。
     """
     try:
-        import json as _json
-        from alibabacloud_ha3engine_vector.models import FetchRequest
+        from opensearch_pipeline.clients import ha3_fetch_by_pks
 
         ids: List[int] = []
         for m in missing:
@@ -322,37 +317,22 @@ def _fetch_reclassify_missing(cli, table_name: str,
                 ids.append(int(m["id"]))
             except (KeyError, TypeError, ValueError):
                 continue
-        present: set = set()
-        failed: set = set()
-        errors: List[str] = []
-        for i in range(0, len(ids), _FETCH_BATCH):
-            batch = ids[i:i + _FETCH_BATCH]
-            try:
-                resp = cli.fetch(FetchRequest(table_name=table_name,
-                                              ids=[str(x) for x in batch],
-                                              include_vector=False,
-                                              output_fields=["chunk_id"]))
-                body = resp.body
-                if isinstance(body, (str, bytes)):
-                    body = _json.loads(body)
-                if body.get("errorCode"):
-                    raise RuntimeError(f"errorCode={body.get('errorCode')} "
-                                       f"errorMsg={body.get('errorMsg')}")
-                for doc in body.get("result") or []:
-                    try:
-                        present.add(int(doc.get("id")))
-                    except (TypeError, ValueError):
-                        continue
-            except Exception as e:  # noqa: BLE001 — 单批失败只废该批定性，不染全局
-                failed.update(batch)
-                errors.append(f"batch@{i}: {type(e).__name__}: {e}"[:200])
-        query_invisible = [x for x in ids if x in present]
+        # 单一 fetch 权威实现（clients.ha3_fetch_by_pks）：批 ≤100、errorCode/形状/越集/
+        # 重复 PK 校验、批异常整批归 unknown（绝不误判为 missing）。
+        fr = ha3_fetch_by_pks(cli, table_name, ids, output_fields=["chunk_id"])
+        present = set(fr["rows_by_pk"])
+        failed = set(fr["unknown_pks"])
+        errors = fr["errors"]
+        enum_invisible = [x for x in ids if x in present]
         unclassified = [x for x in ids if x in failed and x not in present]
         confirmed = [x for x in ids if x not in present and x not in failed]
         if ids and len(unclassified) == len(ids):   # 全军覆没 → 等同整体失败，维持旧口径
             return {"ok": False, "error": f"all {len(errors)} fetch batches failed",
                     "fetch_errors": errors[:10]}
-        return {"ok": True, "query_invisible": query_invisible,
+        return {"ok": True,
+                # enum_invisible 是规范名（枚举没看见但 fetch 在场）；query_invisible 为
+                # 兼容别名同值双写——2026-07-22 起枚举走倒排，"query 不可见"已非本义。
+                "enum_invisible": enum_invisible, "query_invisible": enum_invisible,
                 "missing_confirmed": confirmed, "unclassified": unclassified,
                 "fetch_errors": errors[:10]}
     except Exception as e:  # noqa: BLE001 — fail-open：定性失败只丢分类，绝不影响对账本体
@@ -369,22 +349,41 @@ def _finalize_verdict(report: Dict[str, Any], fr: Optional[Dict[str, Any]]) -> N
       含 confirmed/unclassified 的 → at_risk；**无任何 INDEXED 判缺 PK 覆盖的**（纯
       NOT_INDEXED 在途导致的 vanished，fetch 管不到）→ at_risk 保守留红。
       ok = confirmed==0 ∧ unclassified==0 ∧ vanished_at_risk==0。
-    - fr 失败/未跑：`ok` 不动（query 单口径，方向朝红），vanished 全部按 at_risk 计
+    - fr 失败/未跑：`ok` 不动（枚举单口径，方向朝红），vanished 全部按 at_risk 计
       （compute_parity/finalize 已写同值，此处幂等）。
     - verdict_basis 恒有值："fetch"（fr.ok）/ "query_only"（fr 尝试但失败）/
       "query_enum"（无判缺候选，fetch 未触发）。
     判定平行放在 report["vanished_fetch_verdicts"]（doc_id → 判定字符串），不改
     vanished_docs 条目本身——保住「finalize 与 compute_parity 完全同构」契约。
+
+    **enum_health / complete 状态表（2026-07-22 倒排枚举起，不允许自相矛盾组合）**：
+      桶全健康 ∧ 无 fetch 异常 ∧ 无 unclassified ∧ 无 enum_invisible
+                                              → healthy  / complete 不变（True）
+      任一不健康桶 ∨ fetch 证实 enum_invisible → degraded / complete=False
+      fetch 全败 ∨ 存在 unclassified            → unknown  / complete=False
+    ⚠️ 语义变更：零向量时代 enum_invisible 是**预期伪影**（故 13116d2 降 info/放绿）；
+    倒排枚举下它意味着**枚举或 is_active 锚点失效**——extra/orphan 方向已不可测，
+    必须 complete=False（→ exit 3 + critical），绝不再降级为 info。
     """
     counts = report.get("counts")
     if counts is None:
         return
     vanished = report.get("vanished_docs") or []
+    # 桶协议不健康（helper 判定）→ 枚举本身不可信，先行置 degraded。
+    if report.get("unhealthy_buckets"):
+        report["enum_health"] = "degraded"
+        report["complete"] = False
     if not (fr and fr.get("ok")):
         counts["vanished_at_risk"] = len(vanished)
         report["verdict_basis"] = "query_only" if fr else "query_enum"
+        if fr:      # fetch 尝试过但整体失败 → 无法判断锚点，不冤枉它
+            report["enum_health"] = "unknown"
+            report["complete"] = False
+        else:
+            report.setdefault("enum_health",
+                              "healthy" if not report.get("unhealthy_buckets") else "degraded")
         return
-    invisible = set(fr.get("query_invisible") or [])
+    invisible = set(fr.get("enum_invisible") or fr.get("query_invisible") or [])
     pks_by_doc: Dict[str, List[int]] = defaultdict(list)
     for m in report.get("rds_active_missing") or []:
         try:
@@ -407,6 +406,15 @@ def _finalize_verdict(report: Dict[str, Any], fr: Optional[Dict[str, Any]]) -> N
     counts["vanished_at_risk"] = at_risk
     report["ok"] = (not fr["missing_confirmed"] and not fr["unclassified"] and at_risk == 0)
     report["verdict_basis"] = "fetch"
+    # 健康状态表（unknown 优先于 degraded：fetch 自身有异常时不冤枉锚点）
+    if fr.get("unclassified"):
+        report["enum_health"] = "unknown"
+        report["complete"] = False
+    elif invisible or report.get("unhealthy_buckets"):
+        report["enum_health"] = "degraded"
+        report["complete"] = False
+    else:
+        report.setdefault("enum_health", "healthy")
 
 
 def _rds_batch_width() -> int:
@@ -600,12 +608,23 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
                     active_doc_counts[r["doc_id"]] += 1
                 p += step
 
-        scan_hi = hi if hi is not None else (max_id + _HI_HEADROOM)
+        # 扫描上界：优先 AUTO_INCREMENT 高水位——若最高位 RDS 行被硬删而 HA3 行仍在，
+        # 孤儿 PK 会高于 MAX(id)+headroom（失败方向=漏检，不是误删，但"全表完整"不成立）。
+        ceiling_basis = "explicit_hi"
+        if hi is None:
+            auto_inc = _auto_increment_hi(conn)
+            if auto_inc:
+                scan_hi, ceiling_basis = auto_inc + _HI_HEADROOM, "auto_increment"
+            else:
+                scan_hi, ceiling_basis = max_id + _HI_HEADROOM, "max_id_fallback"
+        else:
+            scan_hi = hi
         scan_lo = min_id if (_scan_from_min() and min_id) else 0
 
         cli = _get_ha3_client()
         acc = _ParityAccumulator(active_ids, active_chunkids, active_doc_counts)
         truncated: List[int] = []
+        unhealthy_buckets: Dict[int, str] = {}
 
         start = scan_lo
         while start < scan_hi:
@@ -624,14 +643,19 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
                                  bucket=bucket, client_factory=_new_ha3_client)
             acc.add_bucket(bucket_rds, scan["rows"])
             truncated.extend(scan["truncated"])
+            unhealthy_buckets.update(scan.get("unhealthy") or {})
             buckets_scanned += len(range(start, end, bucket))
             start = end
 
         report = acc.finalize()
-        report["complete"] = not truncated
+        # 完整性 = 无饱和桶 ∧ 无协议不健康桶。⚠️ complete=True 仅表示「在双态 is_active
+        # 锚点契约内、且仅覆盖 [scan_lo, scan_hi) 区间」完整，不宣称物理全表无条件完整。
+        report["complete"] = not truncated and not unhealthy_buckets
         report["truncated_buckets"] = truncated
+        report["unhealthy_buckets"] = unhealthy_buckets
         report["scan_hi"] = scan_hi
         report["scan_lo"] = scan_lo
+        report["scan_ceiling_basis"] = ceiling_basis
         if scan_lo:
             report["stale_scan_curtailed"] = True   # 低于 min_id 的 stale/orphan 本轮未检
         report["rds_batch"] = step
@@ -646,7 +670,8 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
             report["fetch_reclassify"] = fr
             if fr.get("ok"):
                 report["counts"]["missing_confirmed"] = len(fr["missing_confirmed"])
-                report["counts"]["query_invisible"] = len(fr["query_invisible"])
+                report["counts"]["enum_invisible"] = len(fr["enum_invisible"])
+                report["counts"]["query_invisible"] = len(fr["enum_invisible"])  # 兼容别名
                 report["counts"]["missing_unclassified"] = len(fr["unclassified"])
         # 终局裁决：fetch 口径重算 ok + vanished 判定（fr 失败/未跑则只补注记，ok 不动）。
         _finalize_verdict(report, fr)
@@ -668,12 +693,29 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
     if thr > 0 and elapsed > thr:
         _alert_on_duration("rds-ha3-parity", elapsed, buckets_scanned)
 
-    # 纯枚举盲区（fetch 证实全部在场 → ok=True）也要可观测：发一条 info，绝不静默。
-    blind_note = (report.get("verdict_basis") == "fetch" and report.get("ok")
-                  and bool((report.get("counts") or {}).get("query_invisible")))
-    if alert and (not report.get("ok") or report.get("error") or blind_note):
+    # 触发条件必须显式含 complete=False / enum_health≠healthy：否则「桶不健康但本轮 diff
+    # 恰好为零」会得到 ok=True + complete=False —— 退出码 3 却不发告警（红灯无声）。
+    if alert and (not report.get("ok") or report.get("error")
+                  or report.get("complete") is False
+                  or (report.get("enum_health") or "healthy") != "healthy"):
         _alert_on_drift(report)
     return report
+
+
+def _auto_increment_hi(conn) -> Optional[int]:
+    """chunk_meta 的 AUTO_INCREMENT 高水位（扫描上界优先取它，见 run_parity_check）。
+    读不到返回 None → 调用方回退 MAX(id)+headroom 并在报告标 scan_ceiling_basis。"""
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT AUTO_INCREMENT FROM information_schema.TABLES"
+                      " WHERE TABLE_SCHEMA=%s AND TABLE_NAME='chunk_meta'", (_kb_db(),))
+            row = c.fetchone()
+            if not row:
+                return None
+            vals = list(row.values()) if isinstance(row, dict) else list(row)
+            return int(vals[0]) if vals and vals[0] else None
+    except Exception:  # noqa: BLE001 — fail-open：拿不到高水位不影响对账本体
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -939,10 +981,10 @@ def _alert_on_raw_drift(report: Dict[str, Any]) -> None:
 def _alert_on_drift(report: Dict[str, Any]) -> None:
     """Fire one OBS-4 ops alert for the parity outcome (fail-open).
 
-    分级（2026-07-21 终局「存在性唯 fetch 为准」）：fetch 复核证实全部判缺行在场、vanished
-    全为 artifact 且扫描完整 → **info**（枚举盲区可观测但不吵醒人，独立 dedup_key）；
-    missing_confirmed / unclassified / vanished at_risk / fetch 失败 / 扫描不完整 / error
-    → **critical** 不变。
+    分级（2026-07-22 倒排枚举起）：**恒 critical**。此前 13116d2 的「纯盲区降 info」分支
+    已移除——那是零向量时代的产物（盲区是预期伪影）；倒排枚举下 enum_invisible 意味着
+    枚举或 is_active 锚点失效，`_finalize_verdict` 会置 complete=False，info 分支本就不
+    可达。留着只会用「查询链路失明」的旧文案误导排障。
     """
     try:
         from opensearch_pipeline.alerting import send_ops_alert
@@ -951,39 +993,30 @@ def _alert_on_drift(report: Dict[str, Any]) -> None:
         if report.get("error"):
             text = f"parity check errored: {report['error']}"
         elif fr.get("ok"):
-            blind_only = (report.get("complete") is not False
-                          and not c.get("missing_confirmed")
-                          and not c.get("missing_unclassified")
-                          and not c.get("vanished_at_risk")
-                          and (c.get("query_invisible") or 0) > 0)
-            if blind_only:
-                text = (f"query 枚举判缺 **{c.get('rds_active_missing', 0)}** 行，fetch 复核"
-                        f"全部在场——判定为 query 枚举盲区（数据无缺失；盲区本身不构成 "
-                        f"serving 损失证据）。vanished(query 口径)={c.get('vanished_docs', 0)} "
-                        f"全为 artifact; HA3 stale: {c.get('ha3_stale', 0)}; "
-                        f"complete={report.get('complete')}")
-                send_ops_alert("RDS↔HA3 query 枚举盲区（数据在场）", text, severity="info",
-                               dedup_key="reconcile:rds-ha3-query-blind")
-                return
             cls = (f"其中 missing_confirmed(fetch 也无，数据真丢失)="
                    f"**{c.get('missing_confirmed', 0)}**；"
-                   f"query_invisible(fetch 可取回/query 不可见，查询链路失明)="
-                   f"**{c.get('query_invisible', 0)}**")
+                   f"enum_invisible(fetch 可取回但倒排枚举未见 ⇒ **枚举/is_active 锚点不完整**，"
+                   f"extra/orphan 方向本轮不可测)=**{c.get('enum_invisible', 0)}**")
             if c.get("missing_unclassified"):
                 cls += f"；未定性(fetch 批次异常)={c['missing_unclassified']}"
-            text = (f"RDS-active missing from HA3 (query 口径): "
+            text = (f"RDS-active missing from HA3 (倒排枚举口径): "
                     f"**{c.get('rds_active_missing', 0)}** chunks — {cls}; "
                     f"fully-vanished docs: **{c.get('vanished_docs', 0)}** "
                     f"(at_risk={c.get('vanished_at_risk', 0)}); "
                     f"HA3 stale: {c.get('ha3_stale', 0)}; "
+                    f"enum_health={report.get('enum_health')}; "
                     f"complete={report.get('complete')}")
+            if report.get("unhealthy_buckets"):
+                text += f"; 不健康桶={list(report['unhealthy_buckets'].items())[:3]}"
         else:
             text = (f"RDS-active missing from HA3: **{c.get('rds_active_missing', 0)}** chunks; "
                     f"fully-vanished docs: **{c.get('vanished_docs', 0)}**; "
                     f"HA3 stale: {c.get('ha3_stale', 0)}; "
                     f"complete={report.get('complete')}")
-            if fr:   # 二次定性尝试过但失败 → 注记维持 query 单口径（fail-open 可观测）
-                text += f"（fetch 二次定性失败，维持 query 单口径: {fr.get('error')}）"
+            if fr:   # 二次定性尝试过但失败 → 注记维持枚举单口径（fail-open 可观测）
+                text += f"（fetch 二次定性失败，维持枚举单口径: {fr.get('error')}）"
+            if report.get("unhealthy_buckets"):
+                text += f"; 不健康桶={list(report['unhealthy_buckets'].items())[:3]}"
         send_ops_alert("RDS↔HA3 parity drift", text, severity="critical",
                        dedup_key="reconcile:rds-ha3-parity")
     except Exception:  # noqa: BLE001
@@ -1008,17 +1041,21 @@ def _print_ha3(report: Dict[str, Any]) -> None:
     print(f"  RDS rows={c.get('rds_rows')} active={c.get('rds_active')} "
           f"active_indexed={c.get('rds_active_indexed')} | HA3 pks={c.get('ha3_pks')}")
     print(f"  ⚠️ RDS-active MISSING from HA3 = {c.get('rds_active_missing')} "
-          f"(query 判缺，以 fetch 定性为准)")
+          f"(倒排枚举判缺，以 fetch 定性为准)")
     fr = report.get("fetch_reclassify") or {}
     if fr.get("ok"):
         print(f"     ↳ fetch 二次定性: missing_confirmed={c.get('missing_confirmed')} "
-              f"query_invisible={c.get('query_invisible')} "
+              f"enum_invisible={c.get('enum_invisible')} "
               f"unclassified={c.get('missing_unclassified')}")
     elif fr:
-        print(f"     ↳ fetch 二次定性失败（维持 query 单口径）: {fr.get('error')}")
+        print(f"     ↳ fetch 二次定性失败（维持枚举单口径）: {fr.get('error')}")
     print(f"  ⚠️ fully-VANISHED docs = {c.get('vanished_docs')} "
           f"(at_risk={c.get('vanished_at_risk')})")
-    print(f"  verdict: ok={report.get('ok')} basis={report.get('verdict_basis')}")
+    print(f"  verdict: ok={report.get('ok')} basis={report.get('verdict_basis')} "
+          f"enum_health={report.get('enum_health')} "
+          f"ceiling={report.get('scan_ceiling_basis')}")
+    if report.get("unhealthy_buckets"):
+        print(f"  ⚠️ 不健康桶 = {report['unhealthy_buckets']}")
     print(f"  stale HA3 rows = {c.get('ha3_stale')} {report.get('stale_subtypes', {})}")
     print(f"  orphan HA3 docs = {c.get('orphan_docs')}")
     if report.get("error"):

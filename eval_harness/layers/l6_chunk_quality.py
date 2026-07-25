@@ -521,30 +521,37 @@ def build_gates_and_verdict(fam: Dict, d7: Optional[Dict], h: Dict) -> Dict:
     #      (INCOMPLETE)；纯 query_invisible(盲区伪影，数据在场)=PASS；
     #   3) fetch 尝试过但整体失败(fetch_ok=False) → unmeasured——无法定性绝不误判 DEFECT；
     #   4) 无 fetch_ok 字段(miss==0 未触发 fetch，或合成/历史 h dict) → 旧语义。
-    if h.get("truncated"):
-        hard("RDS↔HA3 all-type id-set (H)", "TRUNCATED", None,
-             "missing=0 ∧ extra=0 (HA3 enum truncated — unmeasured)")
+    # 枚举不完整 = 饱和(truncated) ∨ 任一桶协议不健康(errorCode/coveredPercent<1/越桶/
+    # 重复 PK/is_active 契约破裂)。⚠️ 只查 truncated 会漏掉后者 → 破枚举也可能 PASS。
+    enum_incomplete = bool(h.get("truncated") or h.get("unhealthy_buckets"))
+    if enum_incomplete:
+        hard("RDS↔HA3 all-type id-set (H)",
+             {"truncated": h.get("truncated"),
+              "unhealthy_buckets": dict(list((h.get("unhealthy_buckets") or {}).items())[:5])},
+             None, "missing=0 ∧ extra=0（HA3 倒排枚举不完整 — unmeasured）")
     elif "fetch_ok" in h:
         miss, extra = h.get("missing_in_ha3"), h.get("extra_in_ha3")
         mc, mu = h.get("missing_confirmed"), h.get("missing_unclassified")
-        value = {"missing_query_scope": miss, "missing_confirmed": mc,
-                 "query_invisible": h.get("query_invisible"),
-                 "unclassified": mu, "extra": extra}
+        ei = h.get("enum_invisible", h.get("query_invisible"))
+        value = {"missing_enum_scope": miss, "missing_confirmed": mc,
+                 "enum_invisible": ei, "unclassified": mu, "extra": extra}
         if h.get("fetch_error"):
             value["fetch_error"] = h["fetch_error"]   # defect/incomplete 并存时证据都留
         if extra:
-            ok_h = False
+            ok_h = False           # extra 是枚举实返行，确凿缺陷，优先于一切
         elif h["fetch_ok"] is not True:
             ok_h = None            # fetch 尝试过但失败 → 存在性无法定性
         elif mc:
-            ok_h = False
-        elif mu:
-            ok_h = None            # 部分批未定性 → 证据不完整
+            ok_h = False           # fetch 也取不回 → 数据真丢失
+        elif mu or ei:
+            # ⚠️ 语义变更(2026-07-22)：零向量时代 enum_invisible 是**预期伪影**故放绿；
+            # 倒排枚举下它意味着枚举或 is_active 锚点失效 → extra/orphan 方向不可测。
+            ok_h = None
         else:
-            ok_h = True            # 纯 query_invisible：盲区伪影，数据在场
+            ok_h = True
         hard("RDS↔HA3 all-type id-set (H)", value, ok_h,
-             "fetch-confirmed missing=0 ∧ extra=0（query 枚举盲区不阻断；"
-             "unclassified/fetch 失败 → INCOMPLETE）")
+             "fetch-confirmed missing=0 ∧ extra=0（extra/confirmed → DEFECT；"
+             "enum_invisible/unclassified/fetch 失败 → INCOMPLETE）")
     else:
         miss, extra = h.get("missing_in_ha3"), h.get("extra_in_ha3")
         hard("RDS↔HA3 all-type id-set (H)", {"missing": miss, "extra": extra},
@@ -650,53 +657,65 @@ def build_chunk_judge_bundle(chunks: List[Dict], risk_ids: set, *,
 
 # ── Family H — RDS↔HA3 all-type id-set ────────────────────────────────────
 
-def _ha3_all_active_chunk_ids(bucket: int = 5000, max_rounds: int = 3) -> Dict:
-    """All chunk_ids present in HA3 via PAGED zero-vector PK-range scans.
+def _ha3_all_active_chunk_ids(bucket: int = None, max_rounds: int = 3) -> Dict:
+    """All chunk_ids present in HA3 via **倒排**分桶枚举（2026-07-22 起）。
 
-    A single zero-vector query is capped (top_k) — at 12000 it truncated on the ~28k corpus
-    and could NEVER reach GO. We instead page the full PK range [0, MAX(chunk_meta.id)] in
-    `bucket`-sized id-windows (HA3 PK = chunk_meta.id), unioning chunk_ids. Per G30 a
-    zero-vector scan is non-deterministic/incomplete, so each window re-scans until a round
-    adds nothing new (or max_rounds). `truncated` is True only if the PK ceiling is unknown
-    or a single window saturated its top_k (window too small) — i.e. coverage is NOT full.
+    ⚠️ 旧实现是零向量 PK-range 扫描 + loop-until-stable。2026-07-22 终局定性推翻该模型：
+    零向量与任何向量内积恒为 0 ⇒ 全部得分并列 ⇒ 返回哪个子集由 ANN 遍历/剪枝路径决定，
+    是**任意但确定的子集**（重扫恒缺同一批 113 行，换 eps 向量恒缺另一批 220 行，交集仅
+    5）——loop-until-stable 对确定性欠返回完全无效，历次 idset 判缺全是该伪影。
+    现改用 clients.ha3_enumerate_bucket（纯倒排、单页不翻页、锚点 is_active 双态、
+    桶宽 ≤500）。`bucket`/`max_rounds` 保留仅为签名兼容：桶宽恒钳到 HA3_ENUM_BUCKET，
+    max_rounds 被忽略。
 
-    铁律(2026-07-21 终局)：即使 not truncated、逐窗收敛，query 枚举仍有随 build/merge
-    漂移的**确定性盲区**(loop-until-stable 对确定性欠返回无效；07-21 实证零向量恒缺 113、
-    eps 向量恒缺另 220)。本枚举只产生判缺**候选**——存在性判定唯官方 /vector-service/fetch
-    为准(见 family_idset_reconciliation 的 fetch 复核)。"""
-    from ..ha3live import query_vector, rds_conn
-    from opensearch_pipeline.config import get_config
-    dim = get_config().embedding.dimension or 1024
-    # PK ceiling from RDS (HA3 PK = chunk_meta.id)
-    conn = rds_conn()
+    Returns {"ids": set, "returned": int, "truncated": bool, "windows": int,
+             "unhealthy_buckets": {start: reason}}。
+    **`truncated` 或 `unhealthy_buckets` 任一为真 ⇒ 枚举不完整**，H 门必须判 INCOMPLETE
+    （见 build_gates_and_verdict）。绝不回退零向量。"""
+    from opensearch_pipeline.clients import (
+        HA3_ENUM_BUCKET, ha3_enumerate_bucket,
+    )
+    from .. import ha3live
+    # PK ceiling from RDS (HA3 PK = chunk_meta.id)。优先 AUTO_INCREMENT 高水位——最高位
+    # RDS 行被硬删而 HA3 行仍在时，孤儿 PK 会高于 MAX(id)（失败方向=漏检）。
+    conn = ha3live.rds_conn()
     cur = conn.cursor()
-    cur.execute("SELECT MAX(id) FROM chunk_meta")
-    row = cur.fetchone()
-    id_hi = (list(row.values())[0] if isinstance(row, dict) else row[0]) or 0
+    id_hi = 0
+    try:
+        cur.execute("SELECT AUTO_INCREMENT FROM information_schema.TABLES"
+                    " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='chunk_meta'")
+        row = cur.fetchone()
+        if row:
+            v = list(row.values())[0] if isinstance(row, dict) else row[0]
+            id_hi = int(v or 0)
+    except Exception:  # noqa: BLE001 — 拿不到高水位就回退 MAX(id)
+        id_hi = 0
+    if not id_hi:
+        cur.execute("SELECT MAX(id) FROM chunk_meta")
+        row = cur.fetchone()
+        id_hi = (list(row.values())[0] if isinstance(row, dict) else row[0]) or 0
     cur.close()
     conn.close()
     if not id_hi:
-        return {"ids": set(), "returned": 0, "truncated": True, "windows": 0}
-    cap = bucket + 200
-    ids, windows, saturated = set(), 0, False
+        return {"ids": set(), "returned": 0, "truncated": True, "windows": 0,
+                "unhealthy_buckets": {}}
+    bk = min(int(bucket or HA3_ENUM_BUCKET), HA3_ENUM_BUCKET)
+    cli, tbl = ha3live.client(), ha3live.table()
+    ids, windows, unhealthy = set(), 0, {}
     start = 0
     while start <= id_hi:
-        for _ in range(max(1, max_rounds)):
-            before = len(ids)
-            items = query_vector([0.0] * dim, top_k=cap,
-                                 filter=f"id>={start} AND id<{start + bucket}",
-                                 output_fields=["chunk_id", "id"])
-            if len(items) >= cap:
-                saturated = True  # window saturated its cap → would miss ids; shrink bucket
-            for it in items:
-                cid = _fld(it, "chunk_id")
-                if cid:
-                    ids.add(cid)
-            if len(ids) == before:   # window stable → next
-                break
+        end = min(start + bk, id_hi + 1)
+        res = ha3_enumerate_bucket(cli, tbl, start, end, ["chunk_id", "id", "is_active"])
+        if not res["healthy"]:
+            unhealthy[start] = res["reason"]
+        for r in res["rows"].values():
+            cid = r.get("chunk_id")
+            if cid:
+                ids.add(cid)
         windows += 1
-        start += bucket
-    return {"ids": ids, "returned": len(ids), "truncated": saturated, "windows": windows}
+        start = end
+    return {"ids": ids, "returned": len(ids), "truncated": False, "windows": windows,
+            "unhealthy_buckets": unhealthy}
 
 
 def _fld(item: Dict, key: str):
@@ -749,10 +768,13 @@ def _fetch_reclassify_idset(missing_chunk_ids: List[str]) -> Dict:
                     "fetch_errors": (fr.get("fetch_errors") or [])[:10]}
         confirmed = sorted(cid_by_pk[p] for p in fr["missing_confirmed"])
         uncls = sorted([cid_by_pk[p] for p in fr["unclassified"]] + unmapped)
+        n_inv = len(fr.get("enum_invisible") or fr.get("query_invisible") or [])
         return {
             "fetch_ok": True,
             "missing_confirmed": len(confirmed),
-            "query_invisible": len(fr["query_invisible"]),
+            # enum_invisible 规范名；query_invisible 兼容别名（同值双写）
+            "enum_invisible": n_inv,
+            "query_invisible": n_inv,
             "missing_unclassified": len(uncls),
             "missing_confirmed_sample": confirmed[:10],
             "fetch_errors": (fr.get("fetch_errors") or [])[:10],
@@ -776,16 +798,17 @@ def family_idset_reconciliation(rds_chunk_ids: set) -> Dict:
         "ha3_returned": ha3["returned"],
         "ha3_unique": len(ha3_ids),
         "truncated": ha3["truncated"],
+        "unhealthy_buckets": ha3.get("unhealthy_buckets") or {},
         "missing_in_ha3": len(miss),
         "extra_in_ha3": len(extra),
-        # query-observability 指标（枚举覆盖率），不再解释为存在性 parity——盲区会压低它。
+        # 枚举覆盖率指标，不是存在性 parity——枚举不健康时会被压低。
         "idset_jaccard": jac,
         "missing_sample": sorted(miss)[:10],
         "extra_sample": sorted(extra)[:10],
     }
-    # 终局(2026-07-21)：query 判缺只是候选，经官方 fetch 复核定性；truncated 时枚举本身
-    # 不完整（候选集不可信），维持 unmeasured 语义、不做 fetch。
-    if miss and not ha3["truncated"]:
+    # 终局(2026-07-22)：枚举判缺只是候选，经官方 fetch 复核定性；枚举不完整时
+    # （truncated 或有不健康桶）候选集本身不可信，维持 unmeasured 语义、**不做 fetch**。
+    if miss and not ha3["truncated"] and not out["unhealthy_buckets"]:
         out.update(_fetch_reclassify_idset(sorted(miss)))
     return out
 

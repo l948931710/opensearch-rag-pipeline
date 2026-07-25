@@ -310,34 +310,75 @@ def test_cli_all_takes_worst_exit_code(monkeypatch):
     assert reconcile.main(["--check", "all"]) == 2
 
 
-# ── _scan_ha3_pks: G30 loop-until-stable ──
-def test_scan_ha3_pks_loops_until_stable(monkeypatch):
-    """G30：单次零向量扫描会 under-return；逐桶 loop-until-stable 并集直到稳定，
-    避免把"本轮没扫到但实际在库"的 PK 误判为 missing/vanished（误报 OBS-4 召回丢失）。"""
-    from opensearch_pipeline import retriever
-    # 同一桶三次查询各返回不同部分子集（非确定）：第1轮见 {1}，第2轮见 {1,2}，第3轮无新增
-    rounds = [
-        [{"id": 1, "chunk_id": "c1", "doc_id": "d1"}],
-        [{"id": 2, "chunk_id": "c2", "doc_id": "d1"}, {"id": 1, "chunk_id": "c1", "doc_id": "d1"}],
-        [{"id": 1, "chunk_id": "c1", "doc_id": "d1"}],
-    ]
-    calls = {"n": 0}
+# ── _scan_ha3_pks：倒排单页枚举（2026-07-22 替换零向量 loop-until-stable）──
 
-    def fake_parse(resp):
-        i = min(calls["n"], len(rounds) - 1)
-        calls["n"] += 1
-        return rounds[i]
+def _inv_resp(rows, covered=1.0, error=None):
+    """构造一条 /search 响应体（倒排路：result 为裸 list、id 在顶层、score=0.0）。"""
+    import json as _json
+    body = {"totalCount": len(rows), "totalTime": 1.0, "coveredPercent": covered,
+            "result": [{"id": r["id"], "score": 0.0,
+                        "fields": {k: v for k, v in r.items() if k != "id"}} for r in rows]}
+    if error is not None:
+        body["errorCode"] = error
+    return type("R", (), {"body": _json.dumps(body)})()
 
-    monkeypatch.setattr(retriever, "_parse_ha3_response", fake_parse)
 
-    class _Cli:
+class _InvCli:
+    """记录 SearchRequest 形状的假客户端（每桶恰好一次 search）。"""
+
+    def __init__(self, by_bucket, covered=1.0, error=None):
+        self.by_bucket, self.covered, self.error = by_bucket, covered, error
+        self.reqs = []
+
+    def search(self, req):
+        self.reqs.append(req)
+        lo = int(str(req.text.filter).split("id>=")[1].split(" ")[0])
+        return _inv_resp(self.by_bucket.get(lo, []), self.covered, self.error)
+
+
+def _row(pk, active="1"):
+    return {"id": pk, "chunk_id": f"c{pk}", "doc_id": "d1", "chunk_type": "text_chunk",
+            "version_no": 1, "is_active": active}
+
+
+def test_scan_ha3_pks_uses_single_page_inverted_request():
+    """契约：每桶恰好一次 client.search；请求无 vector/knn、size=1000、无 from_、
+    锚点与 filter 逐字正确。零向量 QueryRequest 与 loop-until-stable 均已废除。"""
+    cli = _InvCli({0: [_row(1), _row(2)]})
+    out = reconcile._scan_ha3_pks(cli, "tbl", hi=500, lo=0, bucket=500, max_rounds=3)
+    assert set(out["rows"]) == {1, 2}
+    assert out["truncated"] == [] and out["unhealthy"] == {}
+    assert len(cli.reqs) == 1, "单页枚举：每桶恰好一次 search（max_rounds 已被忽略）"
+    req = cli.reqs[0]
+    assert getattr(req, "knn", None) is None and not hasattr(req.text, "vector")
+    assert req.size == 1000 and getattr(req, "from_", None) in (None, 0)
+    assert req.text.query_string == "is_active:'1' OR is_active:'0'"
+    assert req.text.filter == "id>=0 AND id<500"
+
+
+def test_scan_ha3_pks_bucket_clamped_and_half_open():
+    """桶宽被钳到 500（防调用方重开宽桶导致翻页/饱和），末桶严格半开不越界。"""
+    cli = _InvCli({0: [_row(1)], 500: [_row(600)], 1000: [_row(1100)]})
+    reconcile._scan_ha3_pks(cli, "tbl", hi=1200, lo=0, bucket=5000)
+    filters = [r.text.filter for r in cli.reqs]
+    assert filters == ["id>=0 AND id<500", "id>=500 AND id<1000", "id>=1000 AND id<1200"]
+
+
+def test_scan_ha3_pks_unhealthy_bucket_recorded_not_silently_empty():
+    """coveredPercent<1 → 该桶 unhealthy 并带 reason（绝不当成"这桶就是空的"）。"""
+    cli = _InvCli({0: [_row(1)]}, covered=0.5)
+    out = reconcile._scan_ha3_pks(cli, "tbl", hi=500, lo=0, bucket=500)
+    assert out["rows"] == {} and out["unhealthy"] and "coveredPercent" in out["unhealthy"][0]
+
+
+def test_scan_ha3_pks_never_falls_back_to_zero_vector():
+    """枚举异常时绝不回退零向量 query——client 只有 query 没有 search ⇒ 判 unhealthy。"""
+    class _OnlyQuery:
         def query(self, req):
-            return None
+            raise AssertionError("绝不允许回退零向量 query 枚举")
 
-    out = reconcile._scan_ha3_pks(_Cli(), "tbl", hi=100, lo=0, bucket=1000, max_rounds=3)
-    assert set(out["rows"].keys()) == {1, 2}   # 并集完整：首轮漏掉的 id=2 被后续轮补齐
-    assert out["truncated"] == []
-    assert calls["n"] >= 2                      # 首轮不完整 → 至少又扫了一轮
+    out = reconcile._scan_ha3_pks(_OnlyQuery(), "tbl", hi=500, lo=0, bucket=500)
+    assert out["rows"] == {} and 0 in out["unhealthy"]
 
 
 # ── 07-21 fetch 二次定性：missing_confirmed vs query_invisible ──
@@ -465,23 +506,23 @@ def test_fetch_reclassify_total_failure_fail_open():
 
 
 def test_alert_on_drift_text_carries_fetch_classification(monkeypatch):
-    """定性成功 → 告警文案分类展示两计数；等级维持 critical（检索面损失真实）。"""
+    """定性成功 → 告警文案分类展示两计数；等级恒 critical。"""
     sent = []
     import opensearch_pipeline.alerting as al
     monkeypatch.setattr(al, "send_ops_alert",
                         lambda title, text, **k: sent.append((title, text, k)) or True)
     report = {"ok": False, "complete": True,
               "counts": {"rds_active_missing": 3, "vanished_docs": 0, "ha3_stale": 0,
-                         "missing_confirmed": 1, "query_invisible": 2, "missing_unclassified": 0},
-              "fetch_reclassify": {"ok": True, "query_invisible": [2, 3],
+                         "missing_confirmed": 1, "enum_invisible": 2, "missing_unclassified": 0},
+              "fetch_reclassify": {"ok": True, "enum_invisible": [2, 3],
                                    "missing_confirmed": [1], "unclassified": [],
                                    "fetch_errors": []}}
     reconcile._alert_on_drift(report)
     (_, text, kw) = sent[0]
     assert kw["severity"] == "critical"
     assert "missing_confirmed" in text and "**1**" in text
-    assert "query_invisible" in text and "**2**" in text
-    assert "查询链路失明" in text
+    assert "enum_invisible" in text and "**2**" in text
+    assert "锚点不完整" in text
 
 
 def test_alert_on_drift_falls_back_when_reclassify_failed(monkeypatch):
@@ -515,16 +556,42 @@ def _vrep(missing=(), vanished=()):
 
 def _fr(confirmed=(), invisible=(), unclassified=()):
     return {"ok": True, "missing_confirmed": list(confirmed),
-            "query_invisible": list(invisible), "unclassified": list(unclassified),
-            "fetch_errors": []}
+            "enum_invisible": list(invisible), "query_invisible": list(invisible),
+            "unclassified": list(unclassified), "fetch_errors": []}
 
 
-def test_finalize_verdict_pure_invisible_flips_ok_true():
-    """全部判缺行 fetch 在场（枚举盲区伪影）→ 最终 ok=True，夜检不再红灯。"""
+def test_finalize_verdict_enum_invisible_marks_degraded_incomplete():
+    """倒排枚举下 enum_invisible>0 = 枚举/锚点失效（不再是良性伪影）：
+    数据仍在场故 ok=True，但 enum_health=degraded + complete=False
+    ⇒ extra/orphan 方向不可测 ⇒ 退出码 3 + critical 告警。"""
     rep = _vrep(missing=[(2, "docX"), (3, "docX")])
     reconcile._finalize_verdict(rep, _fr(invisible=[2, 3]))
     assert rep["ok"] is True and rep["verdict_basis"] == "fetch"
+    assert rep["enum_health"] == "degraded"
+    assert rep["complete"] is False
     assert rep["counts"]["vanished_at_risk"] == 0
+
+
+def test_finalize_verdict_clean_run_is_healthy_and_complete():
+    """无判缺候选 → healthy，complete 不被动过（保持 True）。"""
+    rep = _vrep()
+    reconcile._finalize_verdict(rep, None)
+    assert rep["enum_health"] == "healthy" and rep["complete"] is True
+
+
+def test_finalize_verdict_unclassified_is_unknown_not_degraded():
+    """fetch 有未定性批 → enum_health=unknown（不冤枉锚点）+ complete=False。"""
+    rep = _vrep(missing=[(2, "docX")])
+    reconcile._finalize_verdict(rep, _fr(unclassified=[2]))
+    assert rep["enum_health"] == "unknown" and rep["complete"] is False
+
+
+def test_finalize_verdict_unhealthy_buckets_force_degraded():
+    """桶协议不健康 → degraded + complete=False，即便本轮 diff 恰好为零。"""
+    rep = _vrep()
+    rep["unhealthy_buckets"] = {0: "coveredPercent=0.5"}
+    reconcile._finalize_verdict(rep, None)
+    assert rep["enum_health"] == "degraded" and rep["complete"] is False
 
 
 def test_finalize_verdict_confirmed_or_unclassified_keeps_red():
@@ -537,11 +604,13 @@ def test_finalize_verdict_confirmed_or_unclassified_keeps_red():
 
 
 def test_finalize_verdict_vanished_all_invisible_is_artifact():
-    """vanished doc 的全部判缺 PK fetch 在场 → artifact（伪影，非真消失），不留红。"""
+    """vanished doc 的全部判缺 PK fetch 在场 → artifact（数据在场，非真消失）：
+    ok 不因它转红；但枚举本身失效仍使 complete=False。"""
     rep = _vrep(missing=[(5, "docV"), (6, "docV")], vanished=["docV"])
     reconcile._finalize_verdict(rep, _fr(invisible=[5, 6]))
     assert rep["vanished_fetch_verdicts"] == {"docV": "artifact"}
     assert rep["counts"]["vanished_at_risk"] == 0 and rep["ok"] is True
+    assert rep["complete"] is False and rep["enum_health"] == "degraded"
 
 
 def test_finalize_verdict_vanished_without_indexed_coverage_stays_at_risk():
@@ -563,40 +632,38 @@ def test_finalize_verdict_no_fetch_basis_leaves_ok_untouched():
     assert rep2["ok"] is False and rep2["verdict_basis"] == "query_only"
 
 
-def test_alert_pure_blindspot_downgrades_to_info(monkeypatch):
-    """纯枚举盲区（fetch 全在场、无 at_risk、扫描完整）→ info + 独立标题/dedup_key。"""
-    sent = []
-    import opensearch_pipeline.alerting as al
-    monkeypatch.setattr(al, "send_ops_alert",
-                        lambda title, text, **k: sent.append((title, text, k)) or True)
-    report = {"ok": True, "complete": True, "verdict_basis": "fetch",
-              "counts": {"rds_active_missing": 3, "vanished_docs": 0, "vanished_at_risk": 0,
-                         "ha3_stale": 0, "missing_confirmed": 0, "query_invisible": 3,
-                         "missing_unclassified": 0},
-              "fetch_reclassify": _fr(invisible=[1, 2, 3])}
-    reconcile._alert_on_drift(report)
-    (title, text, kw) = sent[0]
-    assert kw["severity"] == "info"
-    assert kw["dedup_key"] == "reconcile:rds-ha3-query-blind"
-    assert "枚举盲区" in title and "数据无缺失" in text
-
-
-def test_alert_blindspot_incomplete_scan_stays_critical(monkeypatch):
-    """complete=False 时即使全 invisible 也 critical——与 _job_exit 的 3 一致，
-    绝不出现「info 告警 + 红退出码」的矛盾组合。"""
+def test_alert_enum_invisible_is_critical_not_info(monkeypatch):
+    """13116d2 的「纯盲区降 info」在倒排枚举下**有意翻回 critical**：
+    零向量时代盲区是预期伪影，倒排下它意味着枚举/锚点失效，必须叫醒人。"""
     sent = []
     import opensearch_pipeline.alerting as al
     monkeypatch.setattr(al, "send_ops_alert",
                         lambda title, text, **k: sent.append((title, text, k)) or True)
     report = {"ok": True, "complete": False, "verdict_basis": "fetch",
+              "enum_health": "degraded",
               "counts": {"rds_active_missing": 3, "vanished_docs": 0, "vanished_at_risk": 0,
-                         "ha3_stale": 0, "missing_confirmed": 0, "query_invisible": 3,
+                         "ha3_stale": 0, "missing_confirmed": 0, "enum_invisible": 3,
                          "missing_unclassified": 0},
               "fetch_reclassify": _fr(invisible=[1, 2, 3])}
     reconcile._alert_on_drift(report)
-    (_, _, kw) = sent[0]
+    (_, text, kw) = sent[0]
     assert kw["severity"] == "critical"
     assert kw["dedup_key"] == "reconcile:rds-ha3-parity"
+    assert "锚点不完整" in text and "enum_health=degraded" in text
+
+
+def test_alert_unhealthy_buckets_surface_reason(monkeypatch):
+    """不健康桶原因必须进告警正文，否则排障只看到"缺了 N 行"无从下手。"""
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+    report = {"ok": True, "complete": False, "verdict_basis": "query_enum",
+              "enum_health": "degraded", "counts": {"rds_active_missing": 0},
+              "unhealthy_buckets": {0: "coveredPercent=0.5（分片未全覆盖）"}}
+    reconcile._alert_on_drift(report)
+    (_, text, kw) = sent[0]
+    assert kw["severity"] == "critical" and "coveredPercent" in text
 
 
 def test_alert_vanished_at_risk_or_unclassified_stays_critical(monkeypatch):

@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for the G30 harness fix: authoritative self-query presence + loop-until-stable enum."""
+import pytest
+
 from opensearch_pipeline.ha3_verify import verify_chunks_present
 from opensearch_pipeline.ha3_reconcile import _enumerate_ha3_pks
 
@@ -73,35 +75,62 @@ def test_foreign_doc_surfaced_recorded():
     assert r["foreign_ids"] == [999]
 
 
-# ── enumerator loop-until-stable (G30 mitigation) ───────────────
+# ── enumerator：倒排单页（2026-07-22 替换零向量 loop-until-stable）───────────────
 class _Cfg:
     table_name = "t"
 
 
+def _inv_body(pks, covered=1.0, error=None):
+    import json as _json
+    body = {"totalCount": len(pks), "coveredPercent": covered,
+            "result": [{"id": p, "score": 0.0,
+                        "fields": {"chunk_id": f"c{p}", "doc_id": "D", "is_active": 1}}
+                       for p in pks]}
+    if error is not None:
+        body["errorCode"] = error
+    return type("R", (), {"body": _json.dumps(body)})()
+
+
 class _FakeClient:
-    """Returns a different partial subset per call (simulates G30 non-determinism)."""
-    def __init__(self, rounds): self.rounds = rounds; self.i = 0
-    def query(self, req):
-        out = self.rounds[min(self.i, len(self.rounds) - 1)]; self.i += 1; return out
+    """倒排路假客户端：按桶起点返回 PK；记录每次 search 的请求。"""
+
+    def __init__(self, by_bucket, covered=1.0, error=None):
+        self.by_bucket, self.covered, self.error = by_bucket, covered, error
+        self.reqs = []
+
+    def search(self, req):
+        self.reqs.append(req)
+        lo = int(str(req.text.filter).split("id>=")[1].split(" ")[0])
+        return _inv_body(self.by_bucket.get(lo, []), self.covered, self.error)
+
+    def query(self, req):   # 绝不应被调用：零向量枚举已废除
+        raise AssertionError("不得回退零向量 query 枚举")
 
 
 def _parse(resp):
-    return [{"id": i, "chunk_id": f"c{i}", "doc_id": "D"} for i in resp]
+    return []      # 已弃用参数，保留仅为签名兼容
 
 
 class _QReq:
     def __init__(self, **kw): self.kw = kw
 
 
-def test_enumerate_loops_until_stable_unions_partial_scans():
-    # round1 sees {1,2}; round2 sees {2,3}; round3 sees {1,2,3} (nothing new → stop)
-    client = _FakeClient([[1, 2], [2, 3], [1, 2, 3]])
-    out = _enumerate_ha3_pks(client, _Cfg(), _parse, ["id"], _QReq, id_hi=50, bucket=100, max_rounds=3)
-    assert set(out) == {1, 2, 3}            # union across non-deterministic rounds
-    assert client.i >= 2                    # it re-scanned the bucket
+def test_enumerate_uses_single_page_inverted_search():
+    """每桶恰好一次 search、无翻页；max_rounds 传入即被忽略（倒排是确定性的）。"""
+    client = _FakeClient({0: [1, 2], 500: [600]})
+    out = _enumerate_ha3_pks(client, _Cfg(), _parse, ["id"], _QReq,
+                             id_hi=800, bucket=500, max_rounds=5)
+    assert set(out) == {1, 2, 600}
+    assert len(client.reqs) == 2, "两个桶 → 恰好两次 search（max_rounds 被忽略）"
+    assert client.reqs[0].text.query_string == "is_active:'1' OR is_active:'0'"
+    assert client.reqs[0].text.filter == "id>=0 AND id<500"
+    assert client.reqs[1].text.filter == "id>=500 AND id<800"   # 末桶严格半开
 
 
-def test_enumerate_stops_early_when_stable():
-    client = _FakeClient([[5, 6], [5, 6]])  # second round adds nothing → stop after 2
-    out = _enumerate_ha3_pks(client, _Cfg(), _parse, ["id"], _QReq, id_hi=10, bucket=100, max_rounds=5)
-    assert set(out) == {5, 6} and client.i == 2
+def test_enumerate_raises_on_unhealthy_bucket():
+    """桶不健康 → 抛 Ha3EnumerationUnhealthy（而非静默返回缺失结果）。
+    契约刻意选异常：DAG-3 用 `set(seen)` 直接消费返回值，改结构体会把键当 PK。"""
+    from opensearch_pipeline.ha3_reconcile import Ha3EnumerationUnhealthy
+    client = _FakeClient({0: [1]}, covered=0.5)
+    with pytest.raises(Ha3EnumerationUnhealthy):
+        _enumerate_ha3_pks(client, _Cfg(), _parse, ["id"], _QReq, id_hi=100, bucket=500)

@@ -173,14 +173,34 @@ def _h_fetch(**kw):
     return h
 
 
-def test_verdict_go_on_pure_query_invisible():
-    """枚举盲区伪影（fetch 复核全部在场）→ H 门 PASS → GO——release-gate strict
-    恒带 idset+NO_GO 两红的解药。"""
-    h = _h_fetch(fetch_ok=True, missing_confirmed=0, query_invisible=3,
+def test_verdict_go_on_clean_fetch_recheck():
+    """枚举健康 + fetch 复核零缺 → H 门 PASS → GO。"""
+    h = _h_fetch(missing_in_ha3=0, fetch_ok=True, missing_confirmed=0, enum_invisible=0,
                  missing_unclassified=0, missing_confirmed_sample=[])
     out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
     assert out["gates"][_H_GATE]["pass"] is True
     assert out["state"] == "GO"
+
+
+def test_verdict_incomplete_on_enum_invisible():
+    """⚠️ 语义翻转(2026-07-22)：倒排枚举下 enum_invisible>0 = 枚举/is_active 锚点失效
+    （extra/orphan 方向不可测）→ INCOMPLETE。零向量时代它是预期伪影、判 PASS。"""
+    h = _h_fetch(fetch_ok=True, missing_confirmed=0, enum_invisible=3,
+                 missing_unclassified=0, missing_confirmed_sample=[])
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    assert out["gates"][_H_GATE]["pass"] is None
+    assert out["state"] == "NO_GO_INCOMPLETE_EVIDENCE"
+
+
+def test_verdict_incomplete_on_unhealthy_buckets_even_without_truncation():
+    """只查 truncated 会漏掉协议不健康桶（coveredPercent<1/越桶/重复 PK…）→ 破枚举
+    也可能 PASS。enum_incomplete 必须是 truncated ∨ unhealthy_buckets。"""
+    h = _h_fetch(missing_in_ha3=0, truncated=False,
+                 unhealthy_buckets={0: "coveredPercent=0.5"})
+    out = L6.analyze_corpus(_ONE_CHUNK, _GOOD_D7, h, code_commit="t")
+    g = out["gates"][_H_GATE]
+    assert g["pass"] is None and g["value"]["unhealthy_buckets"]
+    assert out["state"] == "NO_GO_INCOMPLETE_EVIDENCE"
 
 
 def test_verdict_defect_on_fetch_confirmed_missing():

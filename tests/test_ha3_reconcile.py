@@ -144,3 +144,46 @@ def test_reconcile_still_deletes_genuine_orphan(monkeypatch):
     rep = reconcile_ha3_orphan_pks(simulate=False, dry_run=False)
     assert client.deleted == [9]
     assert rep["deleted"] == 1
+
+
+# ── 2026-07-22：删除面 fail-closed + 默认 dry-run ──
+
+def test_dry_run_defaults_to_true_no_arg_call_never_deletes(monkeypatch):
+    """无参调用**绝不删除**。此前默认 dry_run=False，spot_checker 的无参调用会静默执行
+    不可逆 HA3 删除；HA3 删不可逆 ⇒ 安全默认必须是只预览。"""
+    import inspect
+    assert inspect.signature(reconcile_ha3_orphan_pks).parameters["dry_run"].default is True
+
+    client = _FakeHa3Client()
+    conn = _make_conn([(1, "c1", 1)], [(1, "c1")], max_id=1)
+    _patch_reconcile_deps(monkeypatch, conn, client, {1: ("c1", "d1"), 9: ("cX", "dead")})
+    rep = reconcile_ha3_orphan_pks(simulate=False)      # 无参 → dry_run 默认
+    assert client.deleted == [] and rep["deleted"] == 0
+    assert rep["stale"] == 1                            # 仍报数，只是不删
+
+
+def test_enumeration_unhealthy_forces_zero_delete(monkeypatch):
+    """枚举协议不健康 → **零删除** + error 留痕：不可信的候选集 × 不可逆删除 = 绝不允许。"""
+    import opensearch_pipeline.ha3_reconcile as hr
+    client = _FakeHa3Client()
+    conn = _make_conn([(1, "c1", 1)], [(1, "c1")], max_id=1)
+    _patch_reconcile_deps(monkeypatch, conn, client, {})
+
+    def _unhealthy(*a, **k):
+        raise hr.Ha3EnumerationUnhealthy("bucket [0,500): coveredPercent=0.5")
+
+    monkeypatch.setattr(hr, "_enumerate_ha3_pks", _unhealthy)
+    rep = reconcile_ha3_orphan_pks(simulate=False, dry_run=False)   # 显式真删也不许删
+    assert client.deleted == [] and rep["deleted"] == 0
+    assert rep.get("enum_health") == "unhealthy"
+    assert any("零删除" in e for e in rep["errors"])
+
+
+def test_spot_checker_calls_orphan_reconcile_in_dry_run():
+    """spot_checker 必须显式 dry_run=True——删除入口统一收敛到 orchestrator 的
+    RAG_STAGE3_ORPHAN_PURGE gate，巡检本身只报告。"""
+    import inspect
+    from opensearch_pipeline import spot_checker
+    src = inspect.getsource(spot_checker)
+    assert "reconcile_ha3_orphan_pks(dry_run=True)" in src
+    assert "reconcile_ha3_orphan_pks()" not in src, "无参调用会依赖默认值，必须显式表态"

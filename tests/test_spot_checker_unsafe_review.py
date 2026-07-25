@@ -95,8 +95,10 @@ def _patch_common(monkeypatch, conn, verdict):
                         lambda: {"total": 0, "success": 0, "failed": 0, "errors": []})
     monkeypatch.setattr(spot_checker, "reconcile_stranded_versions",
                         lambda: {"total": 0, "success": 0, "failed": 0, "errors": []})
+    # 2026-07-22：spot_checker 改为显式 reconcile_ha3_orphan_pks(dry_run=True)（此前无参
+    # 调用 + 函数默认 dry_run=False = 静默真删）→ 桩必须收 kwargs。
     monkeypatch.setattr(ha3_reconcile, "reconcile_ha3_orphan_pks",
-                        lambda: {"checked": 0, "stale": 0, "deleted": 0, "errors": []})
+                        lambda **kw: {"checked": 0, "stale": 0, "deleted": 0, "errors": []})
     # 安全复审 LLM：直接返回既定裁决 dict（纯只读，替换后无任何 HTTP/SDK）
     monkeypatch.setattr(spot_checker, "_safety_review_llm",
                         lambda title, txt, **k: dict(verdict))

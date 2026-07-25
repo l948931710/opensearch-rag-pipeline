@@ -85,48 +85,62 @@ def _classify_stale(ha3_map: dict, rds_active_ids: set, rds_active_chunkid: dict
     return sorted(delete_pks), skipped
 
 
+class Ha3EnumerationUnhealthy(RuntimeError):
+    """倒排枚举协议不健康（见 clients.ha3_enumerate_bucket 的健康判据）。
+
+    **故意抛异常而非返回结构体**：本函数的返回契约（普通 dict）被 DAG-3 的
+    `suspects = expected_pks - set(seen)` 直接消费（pipeline_nodes.py），改成结构体会
+    把 dict 的键当 PK 用。抛异常则命中该调用点现成的 `except` → 降级为全量 point-read
+    （保守方向）。删除侧 reconcile_ha3_orphan_pks 捕获后 **零删除**。"""
+
+
 def _enumerate_ha3_pks(client, cfg, parse, output_fields, query_cls, id_hi: int,
                        bucket: int = _ID_SCAN_BUCKET, max_rounds: int = 3,
                        id_lo: int = 0) -> dict:
-    """PK 区间扫描 → {pk:int -> (chunk_id, doc_id)}。零向量 + 小区间 filter。
+    """PK 区间扫描 → {pk:int -> (chunk_id, doc_id)}。**纯倒排单页枚举**（2026-07-22 起）。
 
-    ⚠️ G30: a single zero-vector scan is **non-deterministic / incomplete** — it can
-    return a different partial subset each call (and right after a realtime push it may
-    return nothing at all). So we **loop each bucket until stable**: re-scan and union
-    the ids until a round adds nothing new (or max_rounds). Unioning is safe because the
-    only consumer (reconcile) deletes PKs absent from chunk_meta(active) under G1/G3
-    guards — more-complete enumeration finds more true orphans, never an active id.
+    ⚠️ 旧实现是零向量 + 小区间 filter，并靠 loop-until-stable 兜 G30 的欠返回。
+    2026-07-22 终局定性推翻：零向量与任何向量内积恒为 0 ⇒ 全部得分并列 ⇒ 返回哪个子集
+    由 ANN 遍历/剪枝路径决定，是**任意但确定的子集**（重扫恒缺同一批）——loop-until-stable
+    对确定性欠返回完全无效。现改用 clients.ha3_enumerate_bucket（锚点 is_active 双态、
+    单页不翻页、桶宽 ≤500）。`parse`/`query_cls`/`max_rounds` 保留仅为签名兼容并被忽略。
 
-    NOTE for *verification* (confirming a doc IS present), do NOT rely on this scan —
-    use a per-PK point-read (filter id=<pk>), which is authoritative.
+    **存在性判定**：确认某行 IS present 一律用官方 `/vector-service/fetch`
+    （clients.ha3_fetch_by_pks）——**不要用零向量 point-read**：实测 `id=28681` 零向量
+    +filter 返回 0 命中而 fetch 正常取回，那种 point-read 会把在场行误判为缺失。
+    （原注释称 point-read "authoritative" 是错的，已按实证更正。）
 
     id_lo: 起始 PK（默认 0）。Stage-3 推送后校验只需扫本批 [min_pk, max_pk] 窗口，
     传 id_lo=min(expected) 避免从 0 扫整个 id 空间（"廉价 hint" 才真的廉价）。
+
+    Raises: Ha3EnumerationUnhealthy —— 任一桶协议不健康。**绝不回退零向量**。
     """
-    from opensearch_pipeline.config import get_config
-    dim = get_config().embedding.dimension   # 向量维度读配置，勿硬编码 1024
+    from opensearch_pipeline.clients import HA3_ENUM_BUCKET, ha3_enumerate_bucket
+
+    bucket = min(int(bucket or HA3_ENUM_BUCKET), HA3_ENUM_BUCKET)
     out = {}
     start = id_lo
     while start < id_hi:
-        for _ in range(max(1, max_rounds)):
-            before = len(out)
-            req = query_cls(table_name=cfg.table_name, vector=[0.0] * dim, top_k=bucket + 100,
-                            include_vector=False, output_fields=output_fields,
-                            filter=f"id>={start} AND id<{start + bucket}")
-            for r in parse(client.query(req)):
-                try:
-                    out[int(r.get("id"))] = (r.get("chunk_id", ""), r.get("doc_id", ""))
-                except (TypeError, ValueError):
-                    pass
-            if len(out) == before:   # this round surfaced nothing new → bucket stable
-                break
-        start += bucket
+        end = min(start + bucket, id_hi)      # 严格半开，末桶不越界
+        res = ha3_enumerate_bucket(client, cfg.table_name, start, end, output_fields)
+        if not res["healthy"]:
+            raise Ha3EnumerationUnhealthy(f"bucket [{start},{end}): {res['reason']}")
+        for pk, r in res["rows"].items():
+            out[pk] = (r.get("chunk_id", ""), r.get("doc_id", ""))
+        start = end
     return out
 
 
-def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = False,
+def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = True,
                              batch: int = DEFAULT_BATCH) -> dict:
     """对账 HA3 物理行 vs chunk_meta.id(is_active=1)，删除过时 PK。**永不抛异常**。
+
+    ⚠️ `dry_run` 默认 **True**（2026-07-22 起，此前是 False）：HA3 删除不可逆，无参调用
+    绝不能真删——任何删除入口必须**显式**传 `dry_run=False`，且经既有 gate
+    `RAG_STAGE3_ORPHAN_PURGE`（orchestrator 入口）授权。
+
+    枚举 fail-closed：底层倒排枚举任一桶协议不健康 → `Ha3EnumerationUnhealthy` →
+    本函数捕获后 **deleted=0** 并记 error，绝不在不可信的枚举结果上执行不可逆删除。
 
     Returns: {"checked": int, "stale": int, "deleted": int, "skipped": dict, "errors": [str]}
     """
@@ -191,6 +205,13 @@ def reconcile_ha3_orphan_pks(simulate: bool = None, dry_run: bool = False,
     try:
         ha3_map = _enumerate_ha3_pks(client, cfg, _parse_ha3_response, _PARITY_OUTPUT_FIELDS,
                                      QueryRequest, id_hi=_id_hi)
+    except Ha3EnumerationUnhealthy as e:
+        # fail-closed：枚举不可信时**零删除**（不可信的候选集 × 不可逆删除 = 绝不允许）
+        result["errors"].append(f"HA3 enumerate unhealthy → 本轮零删除: {e}")
+        result["enum_health"] = "unhealthy"
+        result["elapsed_s"] = round(time.monotonic() - _t0, 3)
+        conn.close()
+        return result
     except Exception as e:
         result["errors"].append(f"HA3 enumerate failed: {e}")
         result["elapsed_s"] = round(time.monotonic() - _t0, 3)

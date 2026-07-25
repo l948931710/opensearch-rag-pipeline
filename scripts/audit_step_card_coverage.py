@@ -81,45 +81,60 @@ def d1_rds_count_and_ids(conn) -> Tuple[int, set, int, int]:
     return active_count, chunk_id_set, indexed_count, version_success_count
 
 
-def d1_ha3_step_card_ids(top_k: int = 10000) -> Tuple[set, int, Optional[str]]:
+def d1_ha3_step_card_ids(top_k: int = None) -> Tuple[set, int, Optional[str]]:
     """从 HA3 拉所有 chunk_type='step_card' 的 chunk_id 集合。
 
-    策略：用零向量 + filter 一次性 top_k 大查（HA3 滤前剪枝，分数不重要）。
-    若返回 == top_k，提示可能截断；这时回退到按 doc_id 前缀分桶或采样。
+    ⚠️ 旧实现是「零向量 + filter 一次性大 top_k」。2026-07-22 终局定性：零向量与任何向量
+    内积恒为 0 ⇒ 全部得分并列 ⇒ 返回任意但确定的子集（有盲区）——那样拿到的 D1 集合会
+    **系统性偏小**，进而造出假的 RDS↔HA3 drift 证据。现改用 clients.ha3_enumerate_bucket
+    （纯倒排、单页、桶宽 500）扫全表再本地筛 step_card。
+
+    锚点是 is_active 双态，故这里显式只保留 is_active=='1'，维持原 active-only 语义。
+    `top_k` 参数已弃用（倒排单页 helper 不消费该语义），传入将被忽略。
     返回 (chunk_id_set, total_returned, warning_or_None)。
     """
-    from opensearch_pipeline.retriever import _get_ha3_client, _parse_ha3_response
+    from opensearch_pipeline.clients import HA3_ENUM_BUCKET, ha3_enumerate_bucket
+    from opensearch_pipeline.retriever import _get_ha3_client
     from opensearch_pipeline.config import get_config
-    from alibabacloud_ha3engine_vector.models import QueryRequest
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+    if top_k is not None:
+        print("[D1] ⚠️ --ha3-top-k 已弃用并忽略（倒排单页枚举不消费 top_k 语义）")
 
     cfg = get_config().alibaba_vector
     client = _get_ha3_client()
+    conn = _get_db_conn(select_db=True)
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT MAX(id) FROM chunk_meta")
+            row = c.fetchone()
+            id_hi = int((list(row.values())[0] if isinstance(row, dict) else row[0]) or 0)
+    finally:
+        conn.close()
 
-    # 1024 维零向量 — 配合 filter，HA3 滤前剪枝，分数不重要
-    zero_vec = [0.0] * 1024
+    t0 = time.time()
+    chunk_ids, returned, unhealthy = set(), 0, []
+    start = 0
+    while start <= id_hi:
+        end = min(start + HA3_ENUM_BUCKET, id_hi + 1)
+        res = ha3_enumerate_bucket(client, cfg.table_name, start, end,
+                                   ["chunk_id", "id", "chunk_type", "is_active"])
+        if not res["healthy"]:
+            unhealthy.append((start, res["reason"]))
+        for r in res["rows"].values():
+            if str(r.get("is_active")) != "1" or r.get("chunk_type") != "step_card":
+                continue
+            returned += 1
+            if r.get("chunk_id"):
+                chunk_ids.add(r["chunk_id"])
+        start = end
+    dt = time.time() - t0
+    print(f"[D1] HA3 step_card 倒排枚举: returned={returned}, dt={dt:.1f}s")
 
     warning = None
-    req = QueryRequest(
-        table_name=cfg.table_name,
-        vector=zero_vec,
-        top_k=top_k,
-        include_vector=False,
-        output_fields=["chunk_id", "doc_id", "version_no", "chunk_type", "is_active"],
-        filter='chunk_type="step_card"',
-    )
-    t0 = time.time()
-    resp = client.query(req)
-    results = _parse_ha3_response(resp)
-    dt = time.time() - t0
-
-    chunk_ids = {r.get("chunk_id") for r in results if r.get("chunk_id")}
-    returned = len(results)
-    print(f"[D1] HA3 step_card query: top_k={top_k}, returned={returned}, dt={dt:.1f}s")
-
-    if returned >= top_k:
-        warning = (f"HA3 returned {returned} >= top_k {top_k} — 可能截断！"
-                   f"建议改用分桶/采样策略。本次结果仅作下界。")
-
+    if unhealthy:
+        warning = (f"倒排枚举有 {len(unhealthy)} 个不健康桶（首个: {unhealthy[0]}）——"
+                   f"本次 D1 集合不完整，drift 结论不可信。")
     return chunk_ids, returned, warning
 
 

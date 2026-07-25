@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Authoritative HA3 presence verification — immune to the G30 enumeration defect.
+"""HA3 **serving 可检索性**探针（self-query）—— 不是物理存在性判据。
 
 Problem (cost a false-FAIL on 2026-06-20): the zero-vector range-scan
 `client.query(vector=[0]*1024, filter="id>=lo AND id<hi")` is **non-deterministic
@@ -7,11 +7,16 @@ and incomplete** (G30). Right after a realtime push it can return 0 rows even th
 every chunk is indexed and serving — so using it to confirm "is this doc in HA3?"
 produces false negatives (and could wrongly trigger a rollback).
 
-Authoritative method = **per-chunk self-query**: take each chunk's own text, run it
-through the real serving path (`retrieve_and_enrich`, which uses a query vector +
-hybrid + the ACL filter), and confirm the chunk returns *itself*. If a chunk can be
-retrieved by its own content under its owner's ACL, it is provably indexed + served.
-This is the same dense self-query idea as the rebuild G29 gate, generalized.
+Method = **per-chunk self-query**: take each chunk's own text, run it through the real
+serving path (`retrieve_and_enrich`, which uses a query vector + hybrid + the ACL
+filter), and confirm the chunk returns *itself*. 命中 ⇒ 该 chunk 在真实服务路径下可被
+自身内容召回（这正是本模块要证明的东西）。
+
+⚠️ 定位更正（2026-07-22）：本模块此前自称 "Authoritative presence verification"，
+**该说法已作废**。self-query 走 ANN + 融合 + ACL 过滤，未命中的原因可能是排序、阈值、
+权限或 ANN 行为，**不足以否定物理存在**。物理存在性判定唯官方 `/vector-service/fetch`
+（`clients.ha3_fetch_by_pks`）为准；发现未知 PK（orphan 方向）唯倒排枚举
+（`clients.ha3_enumerate_bucket`）为准。本模块只回答「serving 能否召回它」。
 
 Pure/injectable: `retrieve_fn` and the RDS cursor source are passed in, so this is
 unit-testable without network and reusable by spot_checker / rebuild / 上线 verifies.

@@ -31,17 +31,45 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 
-def _ha3_count(client, cfg, chunk_type: str, top_k: int = 10000) -> tuple[int, bool]:
-    """HA3 按 chunk_type 计数（无 native count，用零向量 + filter + top_k）。"""
-    from alibabacloud_ha3engine_vector.models import QueryRequest
-    from opensearch_pipeline.retriever import _parse_ha3_response
-    req = QueryRequest(
-        table_name=cfg.table_name, vector=[0.0] * 1024, top_k=top_k,
-        include_vector=False, output_fields=["chunk_id"],
-        filter=f'chunk_type="{chunk_type}" AND is_active=1',
-    )
-    res = _parse_ha3_response(client.query(req))
-    return len(res), len(res) >= top_k
+def _ha3_counts_by_type(client, cfg) -> tuple[dict, bool]:
+    """HA3 按 chunk_type 计数——**倒排全表枚举一次后本地分组**（2026-07-22 起）。
+
+    ⚠️ 旧实现是「零向量 + filter + 大 top_k」逐类型各扫一遍：①零向量枚举有确定性盲区
+    （得分全并列，返回任意但确定的子集）会**低报**计数；②四个类型扫四遍纯属浪费。
+    现走 clients.ha3_enumerate_bucket（纯倒排、单页、桶宽 500）扫一遍全表再分组。
+
+    注意锚点是 is_active 双态，会带回 HA3 侧 is_active=0 的僵尸行 →
+    **这里显式只统计 is_active=='1'**，保持本快照原有的 active-only 语义。
+
+    返回 ({chunk_type: count}, complete: bool)。complete=False 表示有桶不健康，计数不可信。
+    """
+    from opensearch_pipeline.clients import HA3_ENUM_BUCKET, ha3_enumerate_bucket
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+    conn = _get_db_conn(select_db=True)
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT MAX(id) FROM chunk_meta")
+            row = c.fetchone()
+            id_hi = int((list(row.values())[0] if isinstance(row, dict) else row[0]) or 0)
+    finally:
+        conn.close()
+
+    counts: dict = {}
+    complete = True
+    start = 0
+    while start <= id_hi:
+        end = min(start + HA3_ENUM_BUCKET, id_hi + 1)
+        res = ha3_enumerate_bucket(client, cfg.table_name, start, end,
+                                   ["chunk_id", "id", "chunk_type", "is_active"])
+        if not res["healthy"]:
+            complete = False
+        for r in res["rows"].values():
+            if str(r.get("is_active")) != "1":
+                continue
+            counts[r.get("chunk_type") or "?"] = counts.get(r.get("chunk_type") or "?", 0) + 1
+        start = end
+    return counts, complete
 
 
 def main() -> None:
@@ -109,10 +137,10 @@ def main() -> None:
             from opensearch_pipeline.retriever import _get_ha3_client
             cfg = get_config().alibaba_vector
             client = _get_ha3_client()
-            snap["ha3"] = {}
-            for ct in ("step_card", "procedure_parent", "text_chunk", "image"):
-                n, truncated = _ha3_count(client, cfg, ct)
-                snap["ha3"][ct] = {"count": n, "truncated": truncated}
+            counts, complete = _ha3_counts_by_type(client, cfg)
+            snap["ha3"] = {ct: {"count": counts.get(ct, 0), "truncated": not complete}
+                           for ct in ("step_card", "procedure_parent", "text_chunk", "image")}
+            snap["ha3_enum_complete"] = complete   # False ⇒ 有不健康桶，本快照计数不可信
         except Exception as e:
             snap["ha3_error"] = str(e)
 
