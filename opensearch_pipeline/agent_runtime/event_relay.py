@@ -84,25 +84,41 @@ class _RedisRelay:
         self._async = _async_enabled()
         self._q: Optional[queue.Queue] = None
         self._writer: Optional[threading.Thread] = None
+        self._q_lock = threading.Lock()
         self._dropped = 0
 
     def _ensure_writer(self) -> None:
+        """建队列 + 起 writer（幂等、线程安全）。
+
+        ⚠️ 必须持锁双检：帧不止来自 executor 单驱动线程——`__end__` 哨兵由
+        RunHandle._finish 发，完成/排水路径可能在另一线程。无锁的 check-then-act
+        会建出两个队列两个 writer：先落的 Q1 被覆盖后其中的帧永不 XADD，且旧
+        writer 的 task_done 打到新队列上抛 ValueError 把自己打死——回放端因此拿到
+        一条没有 `__end__` 的截断流，消费侧挂到 TTL。
+        队列**按值**交给 _drain（绝不让 writer 回读 self._q），是这条不变量的另一半。
+        起线程失败时不落 self._q（保持可重试），异常上抛由 publish 的 fail-open 收口。
+        """
         if self._q is not None:
             return
-        self._q = queue.Queue(maxsize=_int_env("RAG_AGENT_EVENT_RELAY_QUEUE", 1024))
-        self._writer = threading.Thread(target=self._drain, daemon=True,
-                                        name=f"relay-{self._run_id[:8]}")
-        self._writer.start()
+        with self._q_lock:
+            if self._q is not None:
+                return
+            q = queue.Queue(maxsize=_int_env("RAG_AGENT_EVENT_RELAY_QUEUE", 1024))
+            t = threading.Thread(target=self._drain, args=(q,), daemon=True,
+                                 name=f"relay-{self._run_id[:8]}")
+            t.start()
+            self._q, self._writer = q, t
 
-    def _drain(self) -> None:
+    def _drain(self, q: "queue.Queue") -> None:
+        # 队列按值持有，绝不读 self._q（见 _ensure_writer 注释）
         while True:
-            item = self._q.get()
+            item = q.get()
             try:
                 if item is None:                    # 关闭哨兵
                     return
                 self._xadd_now(item)
             finally:
-                self._q.task_done()
+                q.task_done()
 
     def _enqueue(self, payload: Dict[str, Any]) -> None:
         self._ensure_writer()

@@ -408,6 +408,26 @@ class RedisSessionStore:
             self._degraded("get_or_create", e)
             return session_id or str(uuid.uuid4()), []
 
+    def _precompute_summary(self, hkey: str, mkey: str, umsg: str, amsg: str,
+                            max_messages: int) -> Optional[str]:
+        """事务外算本轮溢出摘要；无溢出返回 None（=不写 summary 字段）。
+
+        **允许抛**——调用方 append 有 fail-open 护栏统一收（见那里的注释）；本方法
+        只负责语义，不负责容错。坏行按跳过处理：一条历史消息不是合法 JSON 时，
+        不该让该会话此后每轮都算不出摘要。"""
+        existing = list(self._r.lrange(mkey, 0, -1))
+        combined = existing + [umsg, amsg]
+        if len(combined) <= max_messages:
+            return None
+        overflow = []
+        for raw in combined[:-max_messages]:
+            try:
+                overflow.append(json.loads(raw))
+            except Exception:       # noqa: BLE001 — 坏行不进摘要（读侧同样解析不出）
+                logger.warning("会话历史存在非 JSON 行，滚动摘要跳过该条")
+        prev = self._r.hget(hkey, "summary") or ""
+        return _roll_summary(prev, overflow)
+
     def append(
         self, session_id: str, user_msg: str, assistant_msg: str, *, owner: Optional[str] = None
     ) -> None:
@@ -418,17 +438,16 @@ class RedisSessionStore:
 
         # rolling summary：summarizer 是外部（LLM）调用不能进 MULTI，故事务外先算（读现有→算溢出→摘要）。
         # 与写事务间的小竞态只会让摘要近似（可接受）；核心 rpush/ltrim/owner 校验仍在事务内原子。
+        # ⚠️ 整段**必须**在 fail-open 护栏内（评审 2026-07-24）：这里是事务外的裸 Redis
+        # 调用 + json 解析，下方 try 只护住写事务护不到它——一次 hget 抖动/一条坏行就能
+        # 把异常抛出 append_to_history，在答案已生成之后炸掉 /api/ask，正是本类
+        # 「Redis 挂掉绝不能拖垮主回答链路」契约要禁的形态。摘要是增强：算不出就按截断走。
         rolled_summary = None
         if _rolling_enabled():
             try:
-                existing = list(self._r.lrange(mkey, 0, -1))
-            except Exception:       # noqa: BLE001
-                existing = []
-            combined = existing + [umsg, amsg]
-            if len(combined) > max_messages:
-                overflow = [json.loads(x) for x in combined[:-max_messages]]
-                prev = self._r.hget(hkey, "summary") or ""
-                rolled_summary = _roll_summary(prev, overflow)
+                rolled_summary = self._precompute_summary(hkey, mkey, umsg, amsg, max_messages)
+            except Exception as e:      # noqa: BLE001 — 增强失败绝不外溢到主答案路径
+                logger.error("RedisSessionStore.append 滚动摘要预算失败，本轮按截断处理：%s", e)
 
         def _op(pipe):
             exists = pipe.exists(hkey)

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """R3-P1（ARR 外审 P1-RT-05/09/10）回归：SSE 游标/异步中继/对账退避。"""
+import json
 import time
 from types import SimpleNamespace
 
@@ -181,3 +182,54 @@ class TestReconcileBackoff:
         reg = SimpleNamespace(get=lambda name: None)          # 工具已不在 registry
         counts = orc.reconcile_uncertain_invocations(_Store(), reg)
         assert counts["skipped"] == 1 and deferred == [("i3", 3)]
+
+
+class TestEnsureWriterRace:
+    """评审 2026-07-24：_ensure_writer 的 check-then-act 竞态。
+
+    帧不止来自 executor 单驱动线程——`__end__` 由 RunHandle._finish 发，可能在
+    完成/排水路径的另一线程。无锁时会建出两个队列两个 writer：先落的队列里的帧
+    永不 XADD，且旧 writer 的 task_done 打到新队列上抛 ValueError 自杀 →
+    回放端拿到一条没有 `__end__` 的截断流。
+    """
+
+    def test_concurrent_first_emit_creates_single_writer(self, monkeypatch):
+        import threading
+
+        fake = _FakeRedis()
+        _wire_redis(monkeypatch, fake)
+        monkeypatch.setenv("RAG_AGENT_EVENT_RELAY_ASYNC", "true")
+        relay = er._RedisRelay("run-race")
+
+        seen_queues, barrier = [], threading.Barrier(8)
+
+        def _emit(i):
+            barrier.wait()                       # 尽量把 8 线程挤进同一窗口
+            relay._xadd({"type": "model_delta", "text": f"d{i}"})
+            seen_queues.append(id(relay._q))
+
+        threads = [threading.Thread(target=_emit, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+
+        assert len(set(seen_queues)) == 1, "并发首发不得建出第二个队列"
+        assert threading.active_count() >= 1
+        relay.end()                              # 控制帧必达 + 关 writer
+        assert relay._writer is not None
+        relay._writer.join(5)
+        assert not relay._writer.is_alive(), "writer 不得因 task_done 打错队列而中途死亡"
+        types = [json.loads(f["data"])["type"] for _id, f in fake.entries]
+        assert types.count(er._END_TYPE) == 1, "__end__ 必须恰好送达一次"
+        assert types.count("model_delta") == 8, "并发首发的 delta 不得因换队列丢失"
+
+    def test_drain_holds_its_own_queue(self):
+        """_drain 必须按值收队列（而非回读 self._q）——这是不变量的另一半。"""
+        import inspect
+
+        sig = inspect.signature(er._RedisRelay._drain)
+        assert len(sig.parameters) == 2, "_drain(self, q)：队列须按值传入"
+        code = "\n".join(ln.split("#", 1)[0]           # 注释里提 self._q 是解释，不算读
+                         for ln in inspect.getsource(er._RedisRelay._drain).splitlines())
+        assert "self._q" not in code, "_drain 不得回读 self._q（换队列后会打错 task_done）"

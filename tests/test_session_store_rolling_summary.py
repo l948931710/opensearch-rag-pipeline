@@ -121,3 +121,76 @@ def test_summarizer_failure_fail_open_truncates(small_store, monkeypatch):
     _append_turns(small_store, sid, "u", 3)          # summarizer 抛错→按截断处理
     hist = small_store.get_history(sid, owner="u")
     assert len(hist) == 4 and all(m["role"] != "system" for m in hist)   # 无摘要、未崩
+
+
+# ── 评审 2026-07-24：摘要预算段的 fail-open 护栏（redis 专属：事务外裸调用） ──────
+class TestSummaryPrecomputeFailOpen:
+    """摘要是增强，绝不能把 /api/ask 主答案链路炸掉。
+
+    被修的形态：滚动摘要的「读现有→算溢出→摘要」整段在写事务的 try 之外，
+    一次 hget 抖动或一条坏行就直接抛出 append_to_history——而此时答案已经生成，
+    用户拿到 500。类 docstring 承诺的是相反的事（写丢弃本轮，不破主答案）。
+    """
+
+    @staticmethod
+    def _store(client):
+        return RedisSessionStore(client, max_turns=2)
+
+    def _wire_on(self, monkeypatch):
+        monkeypatch.setenv(_FLAG, "true")
+        ss.set_summarizer(_fake_summarizer)
+
+    def test_hget_failure_degrades_to_truncation(self, monkeypatch, caplog):
+        """摘要 hget 抛错 → 本轮按截断处理，append 正常返回、历史照常写入。"""
+        import logging
+
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        store = self._store(client)
+        self._wire_on(monkeypatch)
+        sid, _ = store.get_or_create("s", owner="u")
+        _append_turns(store, sid, "u", 2)                 # 填到 cap（4 条）
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("redis down mid-flight")
+
+        monkeypatch.setattr(client, "hget", _boom)
+        with caplog.at_level(logging.DEBUG, logger="opensearch_pipeline.session_store"):
+            store.append(sid, "Q3", "A3", owner="u")      # 必须不 raise
+        assert any("滚动摘要" in r.getMessage() for r in caplog.records)
+
+        monkeypatch.undo()                                # 放开 hget 再读回
+        ss.set_summarizer(None)
+        hist = store.get_history(sid, owner="u")
+        assert [m["content"] for m in hist] == ["Q2", "A2", "Q3", "A3"]   # 截断语义完好
+        assert all(m["role"] != "system" for m in hist)                   # 没有半截摘要
+
+    def test_corrupt_history_row_skipped_not_fatal(self, monkeypatch):
+        """历史里混进非 JSON 行 → 该条跳过，摘要照常滚，append 不抛。"""
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        store = self._store(client)
+        self._wire_on(monkeypatch)
+        sid, _ = store.get_or_create("s", owner="u")
+        _append_turns(store, sid, "u", 2)
+        client.lset(store._mkey(sid), 0, "}{ not json")   # 污染最老一条
+
+        store.append(sid, "Q3", "A3", owner="u")          # 必须不 raise
+
+        ss.set_summarizer(None)
+        hist = store.get_history(sid, owner="u")
+        # 溢出的是最老两条（被污染的 Q1 + 好行 A1）：坏行跳过，好行仍进摘要
+        assert hist and hist[0]["role"] == "system"
+        assert "S[A1]" in hist[0]["content"]
+        assert [m["content"] for m in hist[1:]] == ["Q2", "A2", "Q3", "A3"]
+
+    def test_append_never_raises_when_lrange_dies(self, monkeypatch):
+        """lrange 抛错（原内层 try 的形态）同样只降级——护栏收口在同一处。"""
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        store = self._store(client)
+        self._wire_on(monkeypatch)
+        sid, _ = store.get_or_create("s", owner="u")
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("lrange down")
+
+        monkeypatch.setattr(client, "lrange", _boom)
+        store.append(sid, "Q1", "A1", owner="u")          # 必须不 raise
